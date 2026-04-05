@@ -1,0 +1,656 @@
+# agnos.cyr — AGNOS kernel
+# Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
+
+kernel;
+
+# === Kernel data ===
+var gdt[64];
+var gdt_ptr[16];
+var idt[4096];
+var idt_ptr[16];
+var isr_stub[16];
+var timer_ticks = 0;
+var timer_isr[64];
+var kb_isr[64];
+var kb_buf[256];
+var kb_head = 0;
+var kb_tail = 0;
+
+# === Serial I/O ===
+
+fn serial_putc(c) {
+    var ch = c;
+    asm { 0xBA; 0xFD; 0x03; 0x00; 0x00; 0xEC; 0xA8; 0x20; 0x74; 0xFB; }
+    asm { 0x8A; 0x45; 0xF0; 0xBA; 0xF8; 0x03; 0x00; 0x00; 0xEE; }
+    return 0;
+}
+
+fn serial_print(msg, len) {
+    for (var i = 0; i < len; i = i + 1) {
+        serial_putc(load8(msg + i));
+    }
+    return 0;
+}
+
+fn serial_println(msg, len) {
+    serial_print(msg, len);
+    serial_putc(13);
+    serial_putc(10);
+    return 0;
+}
+
+# === GDT ===
+
+fn gdt_init() {
+    store64(&gdt, 0);
+    store64(&gdt + 8, 0x00AF9A000000FFFF);
+    store64(&gdt + 16, 0x00CF92000000FFFF);
+    store16(&gdt_ptr, 23);
+    store64(&gdt_ptr + 2, &gdt);
+    var gp = &gdt_ptr;
+    asm { lgdt [rax]; }
+    # Reload segments
+    asm {
+        0x6A; 0x08;
+        0x48; 0x8D; 0x05; 0x03; 0x00; 0x00; 0x00;
+        0x50;
+        0x48; 0xCB;
+    }
+    asm {
+        0x48; 0xC7; 0xC0; 0x10; 0x00; 0x00; 0x00;
+        0x8E; 0xD8; 0x8E; 0xC0; 0x8E; 0xD0;
+    }
+    return 0;
+}
+
+# === IDT ===
+
+fn idt_set_gate(base, handler, selector, attr) {
+    # IDT entry = 16 bytes:
+    # [0-1] offset low, [2-3] selector, [4] IST=0, [5] type_attr
+    # [6-7] offset mid, [8-11] offset high, [12-15] reserved
+    store16(base, handler & 0xFFFF);
+    store16(base + 2, selector);
+    store8(base + 4, 0);
+    store8(base + 5, attr);
+    store16(base + 6, (handler >> 16) & 0xFFFF);
+    store32(base + 8, (handler >> 32) & 0xFFFFFFFF);
+    store32(base + 12, 0);
+    return 0;
+}
+
+fn idt_init() {
+    # Build a tiny ISR stub: iretq (48 CF) at a known address
+    # The stub is just 2 bytes but we need it at a fixed location
+    store8(&isr_stub, 0x48);
+    store8(&isr_stub + 1, 0xCF);
+    var handler = &isr_stub;
+    # Set all 256 entries to the default handler
+    # attr 0x8E = present(1) + DPL(00) + gate type(1110 = 64-bit interrupt)
+    for (var v = 0; v < 256; v = v + 1) {
+        idt_set_gate(&idt + v * 16, handler, 0x08, 0x8E);
+    }
+    # Load IDTR
+    store16(&idt_ptr, 4095);
+    store64(&idt_ptr + 2, &idt);
+    var ip = &idt_ptr;
+    asm { lidt [rax]; }
+    return 0;
+}
+
+# === PIC + Timer ===
+
+fn pic_init() {
+    # Remap PIC: IRQ 0-7 → INT 32-39, IRQ 8-15 → INT 40-47
+    # ICW1: init + ICW4 needed
+    asm { 0xB0; 0x11; 0xBA; 0x20; 0x00; 0x00; 0x00; 0xEE; }  # out 0x20, 0x11
+    asm { 0xB0; 0x11; 0xBA; 0xA0; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA0, 0x11
+    # ICW2: vector offsets
+    asm { 0xB0; 0x20; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0x20 (IRQ0=INT32)
+    asm { 0xB0; 0x28; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0x28 (IRQ8=INT40)
+    # ICW3: master has slave on IRQ2, slave ID=2
+    asm { 0xB0; 0x04; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0x04
+    asm { 0xB0; 0x02; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0x02
+    # ICW4: 8086 mode
+    asm { 0xB0; 0x01; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0x01
+    asm { 0xB0; 0x01; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0x01
+    # Mask all IRQs except IRQ0 (timer) + IRQ1 (keyboard)
+    asm { 0xB0; 0xFC; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0xFC
+    asm { 0xB0; 0xFF; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0xFF
+    # Program PIT channel 0: mode 2 (rate generator), ~100 Hz
+    # Command: channel 0, lobyte/hibyte, mode 2, binary
+    # out 0x43, 0x34
+    asm { 0xB0; 0x34; 0xBA; 0x43; 0x00; 0x00; 0x00; 0xEE; }
+    # Divisor = 1193180 / 100 = 11932 = 0x2E9C
+    # out 0x40, low byte
+    asm { 0xB0; 0x9C; 0xBA; 0x40; 0x00; 0x00; 0x00; 0xEE; }
+    # out 0x40, high byte
+    asm { 0xB0; 0x2E; 0xBA; 0x40; 0x00; 0x00; 0x00; 0xEE; }
+    return 0;
+}
+
+fn timer_isr_build() {
+    # Build timer ISR in data buffer: save regs, inc ticks, EOI, restore, iretq
+    var p = &timer_isr;
+    var ta = &timer_ticks;
+    var off = 0;
+    # Save all caller-saved registers: rax rcx rdx rsi rdi r8 r9 r10 r11
+    store8(p + off, 0x50); off = off + 1;  # push rax
+    store8(p + off, 0x51); off = off + 1;  # push rcx
+    store8(p + off, 0x52); off = off + 1;  # push rdx
+    store8(p + off, 0x56); off = off + 1;  # push rsi
+    store8(p + off, 0x57); off = off + 1;  # push rdi
+    # push r8-r11 (41 50, 41 51, 41 52, 41 53)
+    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;
+    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;
+    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;
+    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;
+    # mov rcx, tick_addr (48 B9 imm64)
+    store8(p + off, 0x48); store8(p + off + 1, 0xB9); off = off + 2;
+    store64(p + off, ta); off = off + 8;
+    # mov rax, [rcx]; inc rax; mov [rcx], rax
+    store8(p + off, 0x48); store8(p + off + 1, 0x8B); store8(p + off + 2, 0x01); off = off + 3;
+    store8(p + off, 0x48); store8(p + off + 1, 0xFF); store8(p + off + 2, 0xC0); off = off + 3;
+    store8(p + off, 0x48); store8(p + off + 1, 0x89); store8(p + off + 2, 0x01); off = off + 3;
+    # EOI: mov al,0x20; mov edx,0x20; out dx,al
+    store8(p + off, 0xB0); store8(p + off + 1, 0x20); off = off + 2;
+    store8(p + off, 0xBA); store64(p + off + 1, 0x20); off = off + 5;
+    store8(p + off, 0xEE); off = off + 1;
+    # Restore r11-r8, rdi, rsi, rdx, rcx, rax (reverse order)
+    store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;  # pop r11
+    store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;  # pop r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x59); off = off + 2;  # pop r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x58); off = off + 2;  # pop r8
+    store8(p + off, 0x5F); off = off + 1;  # pop rdi
+    store8(p + off, 0x5E); off = off + 1;  # pop rsi
+    store8(p + off, 0x5A); off = off + 1;  # pop rdx
+    store8(p + off, 0x59); off = off + 1;  # pop rcx
+    store8(p + off, 0x58); off = off + 1;  # pop rax
+    # iretq
+    store8(p + off, 0x48); store8(p + off + 1, 0xCF);
+    return 0;
+}
+
+# === Keyboard ===
+
+fn kb_isr_build() {
+    # Keyboard ISR: save regs, read scancode, store in ring buf, EOI, restore, iretq
+    var p = &kb_isr;
+    var ba = &kb_buf;
+    var ha = &kb_head;
+    var off = 0;
+    # Save all caller-saved registers
+    store8(p + off, 0x50); off = off + 1;  # push rax
+    store8(p + off, 0x51); off = off + 1;  # push rcx
+    store8(p + off, 0x52); off = off + 1;  # push rdx
+    store8(p + off, 0x56); off = off + 1;  # push rsi
+    store8(p + off, 0x57); off = off + 1;  # push rdi
+    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;  # push r8
+    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;  # push r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;  # push r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;  # push r11
+    # mov edx, 0x60; in al, dx (read scancode from keyboard port)
+    store8(p + off, 0xBA); store8(p + off + 1, 0x60); store8(p + off + 2, 0x00);
+    store8(p + off + 3, 0x00); store8(p + off + 4, 0x00); off = off + 5;
+    store8(p + off, 0xEC); off = off + 1;  # in al, dx
+    # movzx ecx, al (save scancode in cl)
+    store8(p + off, 0x0F); store8(p + off + 1, 0xB6); store8(p + off + 2, 0xC8); off = off + 3;
+    # mov rax, [head_addr] — load head index
+    store8(p + off, 0x48); store8(p + off + 1, 0xA1); off = off + 2;
+    store64(p + off, ha); off = off + 8;
+    # mov rdx, buf_addr
+    store8(p + off, 0x48); store8(p + off + 1, 0xBA); off = off + 2;
+    store64(p + off, ba); off = off + 8;
+    # mov [rdx + rax], cl — store scancode at buf[head]
+    store8(p + off, 0x88); store8(p + off + 1, 0x0C); store8(p + off + 2, 0x02); off = off + 3;
+    # inc rax; and al, 0xFF (wrap at 256)
+    store8(p + off, 0x48); store8(p + off + 1, 0xFF); store8(p + off + 2, 0xC0); off = off + 3;
+    store8(p + off, 0x24); store8(p + off + 1, 0xFF); off = off + 2;
+    # mov [head_addr], rax — store new head
+    store8(p + off, 0x48); store8(p + off + 1, 0xA3); off = off + 2;
+    store64(p + off, ha); off = off + 8;
+    # EOI: mov al,0x20; mov edx,0x20; out dx,al
+    store8(p + off, 0xB0); store8(p + off + 1, 0x20); off = off + 2;
+    store8(p + off, 0xBA); store64(p + off + 1, 0x20); off = off + 5;
+    store8(p + off, 0xEE); off = off + 1;
+    # Restore r11-r8, rdi, rsi, rdx, rcx, rax
+    store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;  # pop r11
+    store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;  # pop r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x59); off = off + 2;  # pop r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x58); off = off + 2;  # pop r8
+    store8(p + off, 0x5F); off = off + 1;  # pop rdi
+    store8(p + off, 0x5E); off = off + 1;  # pop rsi
+    store8(p + off, 0x5A); off = off + 1;  # pop rdx
+    store8(p + off, 0x59); off = off + 1;  # pop rcx
+    store8(p + off, 0x58); off = off + 1;  # pop rax
+    # iretq
+    store8(p + off, 0x48); store8(p + off + 1, 0xCF);
+    return 0;
+}
+
+fn kb_has_key() {
+    if (kb_head != kb_tail) { return 1; }
+    return 0;
+}
+
+fn kb_read_scancode() {
+    var sc = load8(&kb_buf + kb_tail);
+    kb_tail = (kb_tail + 1) & 0xFF;
+    return sc;
+}
+
+# Simple scancode-to-ASCII for printable keys (US QWERTY, set 1)
+fn scancode_to_ascii(sc) {
+    # Only handle key press (bit 7 = 0), skip releases
+    if (sc > 127) { return 0; }
+    # Row by row mapping of common keys
+    if (sc == 2) { return 49; }   # 1
+    if (sc == 3) { return 50; }   # 2
+    if (sc == 4) { return 51; }   # 3
+    if (sc == 5) { return 52; }   # 4
+    if (sc == 16) { return 113; } # q
+    if (sc == 17) { return 119; } # w
+    if (sc == 18) { return 101; } # e
+    if (sc == 19) { return 114; } # r
+    if (sc == 20) { return 116; } # t
+    if (sc == 21) { return 121; } # y
+    if (sc == 30) { return 97; }  # a
+    if (sc == 31) { return 115; } # s
+    if (sc == 32) { return 100; } # d
+    if (sc == 33) { return 102; } # f
+    if (sc == 44) { return 122; } # z
+    if (sc == 45) { return 120; } # x
+    if (sc == 46) { return 99; }  # c
+    if (sc == 57) { return 32; }  # space
+    if (sc == 28) { return 10; }  # enter
+    return 0;
+}
+
+# === Page Tables ===
+# PML4 at 0x1000, PDPT at 0x2000, PD at 0x3000 (set up by shim)
+# Each PD entry maps 2MB. PD has 512 entries = 1GB max.
+
+fn pt_map_2mb(pd_base, idx, phys_addr) {
+    # PD entry: phys_addr | 0x83 (present + writable + 2MB page)
+    store64(pd_base + idx * 8, (phys_addr & 0xFFFFFFFFFFE00000) | 0x83);
+    return 0;
+}
+
+fn pt_init() {
+    # Identity map first 16MB (8 x 2MB pages)
+    # PD at 0x3000 already has entries 0-1 from the shim
+    for (var i = 0; i < 8; i = i + 1) {
+        pt_map_2mb(0x3000, i, i * 0x200000);
+    }
+    # Reload CR3 to flush TLB
+    asm { mov rax, cr3; }
+    asm { mov cr3, rax; }
+    return 0;
+}
+
+fn pt_get_mapped_mb() {
+    # Count how many 2MB PD entries are present
+    var count: i64 = 0;
+    for (var i = 0; i < 512; i = i + 1) {
+        var entry = load64(0x3000 + i * 8);
+        if (entry & 1 == 1) { count = count + 1; }
+    }
+    return count * 2;
+}
+
+# === Physical Memory Manager ===
+# Bitmap allocator: 1 bit per 4KB page
+# 16MB = 4096 pages = 512 bytes bitmap
+var pmm_bitmap[512];
+var pmm_total = 0;
+var pmm_used = 0;
+
+fn pmm_set(page) {
+    if (page >= 4096) { return 0 - 1; }
+    var byte = page / 8;
+    var bit = page % 8;
+    store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) | (1 << bit));
+    return 0;
+}
+
+fn pmm_clear(page) {
+    if (page >= 4096) { return 0 - 1; }
+    var byte = page / 8;
+    var bit = page % 8;
+    store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) & (~(1 << bit) & 0xFF));
+    return 0;
+}
+
+fn pmm_test(page) {
+    if (page >= 4096) { return 0; }
+    var byte = page / 8;
+    var bit = page % 8;
+    return (load8(&pmm_bitmap + byte) >> bit) & 1;
+}
+
+fn pmm_init() {
+    # Zero bitmap (all free)
+    for (var i = 0; i < 512; i = i + 1) { store8(&pmm_bitmap + i, 0); }
+    pmm_total = 4096;
+    pmm_used = 0;
+    # Mark first 2MB as used (kernel + page tables + stack)
+    # 2MB / 4KB = 512 pages = pages 0-511
+    for (var p = 0; p < 512; p = p + 1) {
+        pmm_set(p);
+        pmm_used = pmm_used + 1;
+    }
+    return 0;
+}
+
+fn pmm_alloc() {
+    # Find first free page
+    for (var i = 0; i < 4096; i = i + 1) {
+        if (pmm_test(i) == 0) {
+            pmm_set(i);
+            pmm_used = pmm_used + 1;
+            return i * 0x1000;
+        }
+    }
+    return 0;
+}
+
+fn pmm_free(addr) {
+    var page = addr / 0x1000;
+    if (pmm_test(page) == 1) {
+        pmm_clear(page);
+        pmm_used = pmm_used - 1;
+    }
+    return 0;
+}
+
+fn pmm_free_count() {
+    return pmm_total - pmm_used;
+}
+
+# === Virtual Memory Manager ===
+# Maps virtual addresses to physical pages using the existing page tables.
+# Uses PML4 at 0x1000, PDPT at 0x2000, PD at 0x3000.
+# For now: 2MB huge pages only (PD entries).
+
+fn vmm_map(virt, phys, flags) {
+    var pd_idx = (virt >> 21) & 0x1FF;
+    store64(0x3000 + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | flags | 0x83);
+    # Flush TLB — load virt into rax then invlpg
+    var flush = virt;
+    asm { invlpg [rax]; }
+    return 0;
+}
+
+fn vmm_unmap(virt) {
+    var pd_idx = (virt >> 21) & 0x1FF;
+    store64(0x3000 + pd_idx * 8, 0);
+    var flush = virt;
+    asm { invlpg [rax]; }
+    return 0;
+}
+
+fn vmm_is_mapped(virt) {
+    var pd_idx = (virt >> 21) & 0x1FF;
+    var entry = load64(0x3000 + pd_idx * 8);
+    return entry & 1;
+}
+
+# Allocate a physical page and map it at a virtual address
+fn vmm_alloc_at(virt) {
+    var phys = pmm_alloc();
+    if (phys == 0) { return 0; }
+    vmm_map(virt, phys, 0x03);
+    return phys;
+}
+
+# === Process Abstraction ===
+# Minimal process table: ID, state, stack pointer, instruction pointer
+
+struct Process { pid; state; rsp; rip; }
+
+var proc_table[512];
+var proc_count = 0;
+var proc_current = 0;
+
+var PROC_MAX = 16;
+
+fn proc_create(entry) {
+    if (proc_count >= PROC_MAX) { return 0 - 1; }
+    var idx = proc_count;
+    var p = &proc_table + idx * 32;
+    store64(p, idx);         # pid
+    store64(p + 8, 1);       # state: 1=ready
+    store64(p + 16, 0);      # rsp (would be allocated stack)
+    store64(p + 24, entry);  # rip (entry point)
+    proc_count = proc_count + 1;
+    return idx;
+}
+
+fn proc_get_state(pid) {
+    if (pid >= proc_count) { return 0 - 1; }
+    return load64(&proc_table + pid * 32 + 8);
+}
+
+fn proc_set_state(pid, st) {
+    if (pid >= proc_count) { return 0 - 1; }
+    store64(&proc_table + pid * 32 + 8, st);
+    return 0;
+}
+
+fn proc_count_by_state(st) {
+    var n: i64 = 0;
+    for (var i = 0; i < proc_count; i = i + 1) {
+        if (proc_get_state(i) == st) { n = n + 1; }
+    }
+    return n;
+}
+
+# === Syscall Interface ===
+# Minimal syscall dispatcher. In a real kernel, this would be
+# triggered by the SYSCALL instruction. For now, it's a function
+# that kernel code calls to simulate the interface.
+# Syscall numbers: 0=exit, 1=write, 2=getpid
+
+var sys_exit_code = 0;
+
+fn ksyscall(num, arg1, arg2, arg3) {
+    if (num == 0) {
+        # exit — validate proc_current
+        sys_exit_code = arg1;
+        if (proc_current < proc_count) {
+            proc_set_state(proc_current, 0);
+        }
+        return 0;
+    }
+    if (num == 1) {
+        # write (buf=arg1, len=arg2) — serial output
+        # Clamp length to prevent unbounded reads
+        var wlen = arg2;
+        if (wlen > 4096) { wlen = 4096; }
+        if (wlen < 0) { wlen = 0; }
+        if (arg1 == 0) { return 0 - 1; }
+        serial_print(arg1, wlen);
+        return wlen;
+    }
+    if (num == 2) {
+        # getpid
+        return proc_current;
+    }
+    return 0 - 1;
+}
+
+# === Print number helper for kernel ===
+fn kprint_num(n: i64) {
+    var nb[24];
+    var ni = 23;
+    if (n < 0) { serial_putc(45); n = 0 - n; }
+    if (n == 0) { store8(&nb + ni, 48); ni = ni - 1; }
+    while (n > 0) { store8(&nb + ni, 48 + n % 10); ni = ni - 1; n = n / 10; }
+    serial_print(&nb + ni + 1, 23 - ni);
+    return 0;
+}
+
+# === 32-bit boot shim ===
+
+asm {
+    0xBC; 0x00; 0x00; 0x20; 0x00;
+    0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;
+    0xBA; 0xFB; 0x03; 0x00; 0x00; 0xB0; 0x80; 0xEE;
+    0xBA; 0xF8; 0x03; 0x00; 0x00; 0xB0; 0x01; 0xEE;
+    0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;
+    0xBA; 0xFB; 0x03; 0x00; 0x00; 0xB0; 0x03; 0xEE;
+    0xBA; 0xFA; 0x03; 0x00; 0x00; 0xB0; 0xC7; 0xEE;
+    0xBA; 0xFC; 0x03; 0x00; 0x00; 0xB0; 0x0B; 0xEE;
+    0xBF; 0x00; 0x10; 0x00; 0x00; 0xB9; 0x00; 0x0C; 0x00; 0x00;
+    0x31; 0xC0; 0xFC; 0xF3; 0xAB;
+    0xC7; 0x05; 0x00; 0x10; 0x00; 0x00; 0x03; 0x20; 0x00; 0x00;
+    0xC7; 0x05; 0x00; 0x20; 0x00; 0x00; 0x03; 0x30; 0x00; 0x00;
+    0xC7; 0x05; 0x00; 0x30; 0x00; 0x00; 0x83; 0x00; 0x00; 0x00;
+    0xC7; 0x05; 0x08; 0x30; 0x00; 0x00; 0x83; 0x00; 0x20; 0x00;
+    0x0F; 0x20; 0xE0; 0x0D; 0x20; 0x00; 0x00; 0x00; 0x0F; 0x22; 0xE0;
+    0xB8; 0x00; 0x10; 0x00; 0x00; 0x0F; 0x22; 0xD8;
+    0xB9; 0x80; 0x00; 0x00; 0xC0; 0x0F; 0x32;
+    0x0D; 0x00; 0x01; 0x00; 0x00; 0x0F; 0x30;
+    0x0F; 0x20; 0xC0; 0x0D; 0x01; 0x00; 0x00; 0x80; 0x0F; 0x22; 0xC0;
+    0xBF; 0x00; 0x40; 0x00; 0x00;
+    0x31; 0xC0; 0x89; 0x07; 0x89; 0x47; 0x04;
+    0xC7; 0x47; 0x08; 0xFF; 0xFF; 0x00; 0x00;
+    0xC7; 0x47; 0x0C; 0x00; 0x9A; 0xAF; 0x00;
+    0xC7; 0x47; 0x10; 0xFF; 0xFF; 0x00; 0x00;
+    0xC7; 0x47; 0x14; 0x00; 0x92; 0xCF; 0x00;
+    0x66; 0xC7; 0x47; 0x20; 0x17; 0x00;
+    0xC7; 0x47; 0x22; 0x00; 0x40; 0x00; 0x00;
+    0x0F; 0x01; 0x57; 0x20;
+    0xE8; 0x00; 0x00; 0x00; 0x00; 0x58; 0x83; 0xC0; 0x15; 0x50;
+    0x6A; 0x08; 0x89; 0x04; 0x24;
+    0xC7; 0x44; 0x24; 0x04; 0x08; 0x00; 0x00; 0x00;
+    0xFF; 0x2C; 0x24;
+    0x66; 0xB8; 0x10; 0x00; 0x8E; 0xD8; 0x8E; 0xC0; 0x8E; 0xD0;
+    0x48; 0xBC; 0x00; 0x00; 0x20; 0x00; 0x00; 0x00; 0x00; 0x00;
+    0x48; 0x89; 0xE5;
+}
+
+# === 64-bit Cyrius kernel code ===
+
+serial_println("AGNOS kernel v0.1", 17);
+serial_println("64-bit long mode", 16);
+
+gdt_init();
+serial_println("GDT loaded", 10);
+
+idt_init();
+serial_println("IDT loaded", 10);
+
+pic_init();
+serial_println("PIC remapped", 12);
+
+timer_ticks = 0;
+timer_isr_build();
+idt_set_gate(&idt + 32 * 16, &timer_isr, 0x08, 0x8E);
+serial_println("Timer ISR installed", 19);
+
+kb_head = 0;
+kb_tail = 0;
+kb_isr_build();
+idt_set_gate(&idt + 33 * 16, &kb_isr, 0x08, 0x8E);
+serial_println("Keyboard ISR installed", 22);
+
+pt_init();
+serial_print("Page tables: ", 13);
+kprint_num(pt_get_mapped_mb());
+serial_println("MB mapped", 9);
+
+pmm_init();
+serial_print("PMM: ", 5);
+kprint_num(pmm_free_count());
+serial_print(" free / ", 8);
+kprint_num(pmm_total);
+serial_println(" pages", 6);
+
+# Test: allocate 3 pages, free 1, check count
+var pg1 = pmm_alloc();
+var pg2 = pmm_alloc();
+var pg3 = pmm_alloc();
+pmm_free(pg2);
+serial_print("Alloc test: ", 12);
+kprint_num(pmm_free_count());
+serial_println(" free (expect 3582)", 19);
+
+# VMM test: map a new 2MB region at 16MB (0x1000000)
+var vtest = 0x1000000;
+vmm_alloc_at(vtest);
+# Write a value to the mapped memory
+store64(vtest, 0xDEAD);
+var readback = load64(vtest);
+serial_print("VMM: mapped 16MB, readback=", 27);
+kprint_num(readback);
+serial_print(" (expect ", 9);
+kprint_num(0xDEAD);
+serial_println(")", 1);
+
+# Process table test
+proc_count = 0;
+proc_current = 0;
+var p0 = proc_create(0x100000);
+var p1 = proc_create(0x200000);
+var p2 = proc_create(0x300000);
+serial_print("Processes: ", 11);
+kprint_num(proc_count);
+serial_print(" created, ", 10);
+kprint_num(proc_count_by_state(1));
+serial_println(" ready", 6);
+
+# Syscall test
+var pid = ksyscall(2, 0, 0, 0);
+serial_print("Syscall getpid=", 15);
+kprint_num(pid);
+serial_println("", 0);
+
+ksyscall(1, "Syscall write works!\n", 21, 0);
+
+ksyscall(0, 42, 0, 0);
+serial_print("Exit code: ", 11);
+kprint_num(sys_exit_code);
+serial_println("", 0);
+
+asm { sti; }
+serial_println("Interrupts enabled", 18);
+
+# Wait for a few timer ticks
+asm { hlt; }
+asm { hlt; }
+asm { hlt; }
+
+# Check for keyboard input
+serial_print("Keys: ", 6);
+while (kb_has_key() == 1) {
+    var sc = kb_read_scancode();
+    var ch = scancode_to_ascii(sc);
+    if (ch > 0) { serial_putc(ch); }
+}
+serial_println("", 0);
+
+# Report timer ticks
+serial_print("Timer ticks: ", 13);
+kprint_num(timer_ticks);
+serial_println("", 0);
+
+serial_println("AGNOS ready. Type keys (q to halt):", 36);
+
+# Interactive keyboard loop
+var running = 1;
+while (running == 1) {
+    asm { hlt; }
+    while (kb_has_key() == 1) {
+        var sc = kb_read_scancode();
+        var ch = scancode_to_ascii(sc);
+        if (ch > 0) {
+            serial_putc(ch);
+            if (ch == 113) { running = 0; }
+        }
+    }
+}
+
+serial_println("", 0);
+serial_println("Halted.", 7);
+asm { cli; hlt; 0xEB; 0xFE; }

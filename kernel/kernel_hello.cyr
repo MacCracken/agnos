@@ -1,0 +1,32 @@
+# kernel_hello — bare metal kernel that writes to VGA text buffer
+# Exercises: kernel; directive, inline asm, store8, bare metal ELF
+# This produces a bootable ELF with multiboot2 header.
+# To test: qemu-system-x86_64 -kernel build/kernel_hello
+# (Won't work in userspace — just verifies ELF structure)
+
+kernel;
+
+# VGA text buffer is at physical address 0xB8000
+# Each character = 2 bytes: [ascii, attribute]
+# Attribute 0x0F = white on black
+
+fn vga_putchar(pos, ch) {
+    var vga = 0xB8000;
+    store8(vga + pos * 2, ch);
+    store8(vga + pos * 2 + 1, 0x0F);
+    return 0;
+}
+
+fn vga_print(msg, len) {
+    for (var i = 0; i < len; i = i + 1) {
+        vga_putchar(i, load8(msg + i));
+    }
+    return 0;
+}
+
+# Write "Hello from Cyrius!" to VGA
+vga_print("Hello from Cyrius!", 18);
+
+# Halt
+asm { cli; }
+asm { hlt; }

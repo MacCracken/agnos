@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ['*']
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify VERSION matches tag
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "ERROR: VERSION ($VERSION) does not match tag ($TAG)"
+            exit 1
+          fi
+
+      - name: Clone Cyrius compiler
+        run: |
+          git clone --depth 1 https://github.com/MacCracken/cyrius.git ../cyrius
+          cd ../cyrius && sh bootstrap/bootstrap.sh
+          cat stage1/cc2.cyr | ./build/stage1f > ./build/cc2 2>/dev/null || \
+            cat stage1/cc2.cyr | ./build/cc > ./build/cc2 2>/dev/null
+          chmod +x ./build/cc2
+
+      - name: Build kernel
+        run: |
+          sh scripts/build.sh
+          cp build/agnos agnos-x86_64
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            agnos-x86_64

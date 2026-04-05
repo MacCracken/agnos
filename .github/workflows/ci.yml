@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone Cyrius compiler
+        run: |
+          git clone --depth 1 https://github.com/MacCracken/cyrius.git ../cyrius
+          cd ../cyrius && sh bootstrap/bootstrap.sh
+          # Build cc2 (x86_64 compiler)
+          cat stage1/cc2.cyr | ./build/stage1f > ./build/cc2 2>/dev/null || \
+            cat stage1/cc2.cyr | ./build/cc > ./build/cc2 2>/dev/null
+          chmod +x ./build/cc2
+          # Build cc2_aarch64 (cross-compiler)
+          cat stage1/cc2_aarch64.cyr | ./build/cc2 > ./build/cc2_aarch64 2>/dev/null || true
+          chmod +x ./build/cc2_aarch64 2>/dev/null || true
+          # Build cyrb (builder)
+          cat stage1/programs/cyrb.cyr | ./build/cc2 > ./build/cyrb 2>/dev/null || true
+          chmod +x ./build/cyrb 2>/dev/null || true
+
+      - name: Test x86_64
+        run: sh scripts/test.sh
+
+      - name: Test aarch64 (compile only)
+        run: sh scripts/test.sh --aarch64
+
+      - name: Verify VERSION
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "Version: $VERSION"
+          test -n "$VERSION"
