@@ -1315,10 +1315,79 @@ fn vfs_close(fd_idx) {
     return 0;
 }
 
+# === RAM Disk (initrd) ===
+# Format: [magic:4][count:4][entries...][data...]
+# Entry: [name:16][offset:8][size:8] = 32 bytes
+# Magic: 0x52444E49 ("INDR")
+var initrd_base = 0;
+var initrd_count = 0;
+
+fn initrd_init(base) {
+    if (load32(base) != 0x52444E49) { return 0 - 1; }
+    initrd_base = base;
+    initrd_count = load32(base + 4);
+    return initrd_count;
+}
+
+fn initrd_name_match(ent, name, namelen) {
+    for (var j = 0; j < namelen; j = j + 1) {
+        if (load8(ent + j) != load8(name + j)) { return 0; }
+    }
+    if (load8(ent + namelen) != 0) { return 0; }
+    return 1;
+}
+
+fn initrd_find(name, namelen) {
+    var entries = initrd_base + 8;
+    for (var i = 0; i < initrd_count; i = i + 1) {
+        var ent = entries + i * 32;
+        if (initrd_name_match(ent, name, namelen) == 1) { return i; }
+    }
+    return 0 - 1;
+}
+
+fn initrd_open(name, namelen) {
+    var idx = initrd_find(name, namelen);
+    if (idx < 0) { return 0 - 1; }
+    var ent = initrd_base + 8 + idx * 32;
+    var data_off = load64(ent + 16);
+    var data_sz = load64(ent + 24);
+    return vfs_create_memfile(initrd_base + data_off, data_sz);
+}
+
+# Build a test initrd in memory at a given address
+fn initrd_build_test(base) {
+    # Header
+    store32(base, 0x52444E49);  # magic
+    store32(base + 4, 2);       # 2 files
+    # Entry 0: "hello.txt" at offset 72 (8 + 2*32), size 14
+    var e0 = base + 8;
+    store8(e0, 104); store8(e0+1, 101); store8(e0+2, 108); store8(e0+3, 108);
+    store8(e0+4, 111); store8(e0+5, 46); store8(e0+6, 116); store8(e0+7, 120);
+    store8(e0+8, 116); store8(e0+9, 0);
+    store64(e0 + 16, 72);   # data offset
+    store64(e0 + 24, 14);   # data size
+    # Entry 1: "test" at offset 86, size 5
+    var e1 = base + 40;
+    store8(e1, 116); store8(e1+1, 101); store8(e1+2, 115); store8(e1+3, 116);
+    store8(e1+4, 0);
+    store64(e1 + 16, 86);
+    store64(e1 + 24, 5);
+    # Data for "hello.txt": "Hello, AGNOS!\n"
+    var d0 = base + 72;
+    store8(d0,72); store8(d0+1,101); store8(d0+2,108); store8(d0+3,108);
+    store8(d0+4,111); store8(d0+5,44); store8(d0+6,32); store8(d0+7,65);
+    store8(d0+8,71); store8(d0+9,78); store8(d0+10,79); store8(d0+11,83);
+    store8(d0+12,33); store8(d0+13,10);
+    # Data for "test": "PASS\n"
+    var d1 = base + 86;
+    store8(d1,80); store8(d1+1,65); store8(d1+2,83); store8(d1+3,83);
+    store8(d1+4,10);
+    return 91;  # total size
+}
+
 # === Syscall Interface ===
-# rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3
-# Return value in rax.
-# Syscall numbers: 0=exit, 1=write, 2=getpid
+# Syscall#: 0=exit 1=write 2=getpid 3=spawn 4=waitpid 5=read 6=close 7=open
 
 var sys_exit_code = 0;
 
@@ -1383,6 +1452,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 5) { return vfs_read(arg1, arg2, arg3); }
     if (num == 6) { return vfs_close(arg1); }
+    if (num == 7) { return initrd_open(arg1, arg2); }
     return 0 - 1;
 }
 
@@ -1880,9 +1950,32 @@ kprint_num(timer_ticks);
 serial_println("", 0);
 
 # === Memory Isolation Test ===
-# VFS test
+# VFS + initrd test
 serial_print("VFS write: ", 11);
 vfs_write(0, "OK\n", 3);
+
+# Build and mount test initrd at 0x6000 (free page table area)
+initrd_build_test(0x6000);
+var nfiles = initrd_init(0x6000);
+serial_print("Initrd: ", 8);
+kprint_num(nfiles);
+serial_println(" files", 6);
+
+# Open and read hello.txt
+var hfd = initrd_open("hello.txt", 9);
+var hbuf[16];
+var hn = vfs_read(hfd, &hbuf, 14);
+serial_print("initrd hello.txt: ", 18);
+serial_print(&hbuf, hn);
+vfs_close(hfd);
+
+# Open and read test
+var tfd = initrd_open("test", 4);
+var tbuf[8];
+var tn = vfs_read(tfd, &tbuf, 5);
+serial_print("initrd test: ", 13);
+serial_print(&tbuf, tn);
+vfs_close(tfd);
 var mf = vfs_create_memfile("HELLO", 5);
 var rbuf[8];
 var rn = vfs_read(mf, &rbuf, 5);
