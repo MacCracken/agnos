@@ -77,18 +77,7 @@ fn gdt_init() {
 }
 
 # === TSS (Task State Segment) ===
-# Required for ring transitions. When an interrupt fires in ring 3,
-# the CPU loads RSP0 from the TSS to switch to the kernel stack.
-# TSS layout (64-bit): 104 bytes minimum
-#   Offset 0:  reserved (4 bytes)
-#   Offset 4:  RSP0 (8 bytes) — kernel stack for ring 0
-#   Offset 12: RSP1 (8 bytes)
-#   Offset 20: RSP2 (8 bytes)
-#   Offset 28: reserved (8 bytes)
-#   Offset 36: IST1-IST7 (7 x 8 bytes = 56 bytes)
-#   Offset 92: reserved (8 bytes)
-#   Offset 100: IOPB offset (2 bytes)
-#   Offset 102: reserved (2 bytes)
+# RSP0 at offset 4, IOPB at offset 100. 104 bytes total.
 
 var tss_kernel_stack = 0x200000;
 
@@ -777,7 +766,7 @@ var PROC_SIZE = 168;
 
 struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9; r10; r11; r12; r13; r14; r15; rflags; cr3; }
 
-var proc_table[2688];
+var proc_table[336];
 var proc_count = 0;
 var proc_current = 0;
 var sched_active = 0;
@@ -848,6 +837,10 @@ fn elf_load(elf_addr, elf_size) {
     # Read program header count (e_phnum at offset 56)
     var phnum = load16(elf_addr + 56);
 
+    # Create per-process address space
+    var new_cr3 = proc_create_address_space();
+    if (new_cr3 == 0) { return 0 - 1; }
+
     # Process each program header
     for (var phi = 0; phi < phnum; phi = phi + 1) {
         var ph = elf_addr + phoff + phi * phentsize;
@@ -859,16 +852,28 @@ fn elf_load(elf_addr, elf_size) {
             var p_filesz = load64(ph + 32);
             var p_memsz = load64(ph + 40);
 
-            # Allocate pages for this segment
+            # Allocate 2MB pages for this segment in the process's address space
             var page_start = p_vaddr & 0xFFFFFFFFFFE00000;
             var page_end = (p_vaddr + p_memsz + 0x1FFFFF) & 0xFFFFFFFFFFE00000;
             var pg = page_start;
             while (pg < page_end) {
-                if (vmm_is_mapped(pg) == 0) {
-                    vmm_alloc_at(pg);
+                # Allocate a physical 2MB region and map in both kernel + process
+                var phys = pmm_alloc();
+                if (phys != 0) {
+                    # Map in kernel space for copying data
+                    if (vmm_is_mapped(phys) == 0) {
+                        vmm_map(phys, phys, 0x83);
+                    }
+                    # Map in process address space (user-accessible)
+                    proc_map_page(new_cr3, pg, phys);
                 }
                 pg = pg + 0x200000;
             }
+
+            # Switch to process page tables to copy data
+            var old_cr3_val = 0x1000;
+            var new_cr3_load = new_cr3;
+            asm { mov cr3, rax; }
 
             # Copy segment data
             var ci = 0;
@@ -881,19 +886,31 @@ fn elf_load(elf_addr, elf_size) {
                 store8(p_vaddr + ci, 0);
                 ci = ci + 1;
             }
+
+            # Switch back to kernel page tables
+            var kern_cr3 = 0x1000;
+            asm { mov cr3, rax; }
         }
     }
 
-    # Allocate a 4KB stack for the process (at 0x800000 + pid * 0x10000)
+    # Allocate user stack (2MB page at 0x7FFE00000 or simpler: 0x800000 + pid * 0x10000)
     var pid = proc_count;
-    var stack_base = 0x800000 + pid * 0x10000;
-    if (vmm_is_mapped(stack_base) == 0) {
-        vmm_alloc_at(stack_base);
+    var stack_base = 0x800000 + pid * 0x200000;
+    var stack_phys = pmm_alloc();
+    if (stack_phys != 0) {
+        if (vmm_is_mapped(stack_phys) == 0) {
+            vmm_map(stack_phys, stack_phys, 0x83);
+        }
+        proc_map_page(new_cr3, stack_base, stack_phys);
     }
     var stack_top = stack_base + 0x4000;
 
-    # Create process
-    return proc_create_full(entry, stack_top);
+    # Create process with its own page tables
+    var new_pid = proc_create_full(entry, stack_top);
+    if (new_pid >= 0) {
+        proc_set_cr3(new_pid, new_cr3);
+    }
+    return new_pid;
 }
 
 # Extended process creation with stack
@@ -1095,36 +1112,48 @@ fn do_context_switch(isr_rsp) {
 }
 
 # === Ring 3 Transition ===
-# Jump to user mode via iretq. Sets up the interrupt return frame
-# with ring 3 CS/SS selectors.
-# User CS = 0x20 | 3 = 0x23, User SS = 0x18 | 3 = 0x1B
 
-# Run a function in ring 3. Saves kernel context so exit syscall returns here.
-fn run_in_ring3(entry, user_rsp) {
-    # Save our return context: when exit syscall fires, kernel_resume
-    # will restore RSP to our frame and RIP to our return address.
-    # [rbp+8] = return address (pushed by call instruction)
-    # rbp = saved frame pointer
-    # We need to save a stack state that makes "ret" from this function work.
-    var save_rsp = 0;  # [rbp-0x08]
-    var save_rip = 0;  # [rbp-0x10]
-    # Get current RSP and the return address
+# Globals for exec_and_wait to pass to enter_ring3 without param clobbering
+var exec_entry_g = 0;
+var exec_rsp_g = 0;
+var exec_cr3_g = 0;
+
+# Execute a user process and wait for it to exit.
+# Saves kernel return context so exit syscall returns here.
+fn exec_and_wait(entry, rsp, cr3) {
+    # Save params to globals (avoid param clobber in asm)
+    exec_entry_g = entry;
+    exec_rsp_g = rsp;
+    exec_cr3_g = cr3;
+
+    # Save return context: kernel_resume will restore rbp and jump to return addr
+    # We read [rbp+8] = return address and save rbp as the stack to restore.
+    # But we can't use asm [rbp+N] safely with params. Instead, use a nested
+    # function with no params to capture the frame.
+    # Actually — we just need kernel_return_rsp and kernel_return_rip set.
+    # kernel_resume does: mov rsp, [rbp-0x08]; jmp [rbp-0x10]
+    # So it restores a saved rbp as rsp and jumps to a saved rip.
+    # We want it to "return" from exec_and_wait normally.
+    # The trick: save the CALLER's rbp and return address.
+    # In exec_and_wait(entry, rsp, cr3): params at rbp-0x08, -0x10, -0x18
+    # Then new locals start at rbp-0x20.
+    var save_rbp = 0;     # [rbp-0x20]
+    var save_retaddr = 0; # [rbp-0x28]
     asm {
-        0x48; 0x89; 0x6D; 0xF8;   # mov [rbp-0x08], rbp  (save frame pointer as RSP target)
-        0x48; 0x8B; 0x45; 0x08;   # mov rax, [rbp+0x08]   (return address)
-        0x48; 0x89; 0x45; 0xF0;   # mov [rbp-0x10], rax
+        0x48; 0x8B; 0x45; 0x00;   # mov rax, [rbp] (saved caller rbp)
+        0x48; 0x89; 0x45; 0xE0;   # mov [rbp-0x20], rax
+        0x48; 0x8B; 0x45; 0x08;   # mov rax, [rbp+0x08] (return address)
+        0x48; 0x89; 0x45; 0xD8;   # mov [rbp-0x28], rax
     }
-    kernel_return_rsp = save_rsp;
-    kernel_return_rip = save_rip;
+    kernel_return_rsp = save_rbp;
+    kernel_return_rip = save_retaddr;
 
-    # Now enter ring 3 (this doesn't return)
-    enter_ring3(entry, user_rsp);
+    # Switch CR3 and enter ring 3
+    var cr3_load = exec_cr3_g;
+    asm { mov cr3, rax; }
+    enter_ring3(exec_entry_g, exec_rsp_g);
     return 0;
 }
-
-# Enter ring 3 by directly writing the iretq frame to a known memory location
-# and switching RSP to point at it.
-var iretq_frame[64];
 
 fn enter_ring3(entry, user_rsp) {
     # Set TSS RSP0 so interrupts/syscalls come back to kernel stack
@@ -1269,20 +1298,30 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # getpid
         return proc_current;
     }
+    if (num == 3) {
+        # spawn(elf_addr, elf_size) — load ELF and create user process
+        # Returns new pid or -1 on error
+        var new_pid = elf_load(arg1, arg2);
+        if (new_pid >= 0) {
+            # Mark as ready; will be scheduled on next timer tick
+            proc_set_state(new_pid, 1);
+        }
+        return new_pid;
+    }
+    if (num == 4) {
+        # waitpid(pid) — wait for a process to exit (state=0)
+        # Simple busy-wait for now; returns exit code
+        if (arg1 >= proc_count) { return 0 - 1; }
+        while (proc_get_state(arg1) != 0) {
+            asm { hlt; }
+        }
+        return sys_exit_code;
+    }
     return 0 - 1;
 }
 
 # === SYSCALL/SYSRET Hardware Interface ===
-# The SYSCALL instruction enters the kernel from user (or kernel) mode.
-# On SYSCALL:
-#   RCX = saved RIP (return address)
-#   R11 = saved RFLAGS
-#   CS  = STAR[47:32] (kernel CS = 0x08)
-#   SS  = STAR[47:32]+8 (kernel DS = 0x10)
-# Register convention (Linux-style):
-#   rax = syscall number
-#   rdi = arg1, rsi = arg2, rdx = arg3
-# Return: rax = result, then SYSRET restores RIP from RCX, RFLAGS from R11
+# SYSCALL: RCX=retRIP, R11=retRFLAGS, rax=num, rdi=a1, rsi=a2, rdx=a3
 
 var syscall_entry_buf[128];
 var kernel_rsp_save = 0;
@@ -1474,6 +1513,51 @@ fn syscall_init() {
 }
 
 # === Print number helper for kernel ===
+# === Test ELF Builder ===
+# Build a minimal static 64-bit ELF in memory for testing userland exec.
+# The program: write "USERLAND OK\n" via syscall, then exit(0).
+#
+# ELF layout:
+#   0x000: ELF header (64 bytes)
+#   0x040: Program header (56 bytes)
+#   0x078: Code + data
+#
+# Virtual load address: 0x400000 (standard user base)
+
+# spawn_user_proc: create a user process from a kernel function address.
+# Allocates per-process address space, maps code+stack pages, returns pid.
+fn spawn_user_proc(entry_fn) {
+    var new_cr3 = proc_create_address_space();
+    if (new_cr3 == 0) { return 0 - 1; }
+    # Map kernel code pages as user-accessible in new address space
+    # (code lives in kernel binary at 0x100000-0x200000)
+    var pml4e = load64(new_cr3);
+    var pdpt_a = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_a);
+    var pd_a = pdpte & 0xFFFFFFFFF000;
+    # Set U/S bit on first 2 PD entries (0-4MB) for code access
+    var pde0 = load64(pd_a);
+    store64(pd_a, pde0 | 0x04);
+    var pde1 = load64(pd_a + 8);
+    store64(pd_a + 8, pde1 | 0x04);
+    # Allocate user stack
+    var pid = proc_count;
+    var stack_base = 0x800000 + pid * 0x200000;
+    var stack_phys = pmm_alloc();
+    if (stack_phys != 0) {
+        if (vmm_is_mapped(stack_phys) == 0) {
+            vmm_map(stack_phys, stack_phys, 0x83);
+        }
+        proc_map_page(new_cr3, stack_base, stack_phys);
+    }
+    var stack_top = stack_base + 0x4000;
+    var new_pid = proc_create_full(entry_fn, stack_top);
+    if (new_pid >= 0) {
+        proc_set_cr3(new_pid, new_cr3);
+    }
+    return new_pid;
+}
+
 fn kprint_num(n: i64) {
     var nb[24];
     var ni = 23;
@@ -1794,43 +1878,22 @@ if (val_as1_check == 0xAAAA) {
     serial_println("Memory isolation: FAIL (AS1 clobbered)", 38);
 }
 
-# === Ring 3 Test ===
-# Mark kernel code/data pages (0x0-0x200000) as user-accessible
-# so user_test_proc (compiled into kernel binary) can execute from ring 3.
-# Also mark the user process's stack pages as user-accessible.
-serial_println("Ring 3 test...", 14);
-
-# Make first 2MB page user-accessible (contains kernel code where user_test_proc lives)
-var pd_entry_0 = load64(0x3000);
-store64(0x3000, pd_entry_0 | 0x04);  # Set U/S bit
-# Make second 2MB page user-accessible too (0x200000-0x3FFFFF)
-var pd_entry_1 = load64(0x3000 + 8);
-store64(0x3000 + 8, pd_entry_1 | 0x04);
-
-# Allocate user stack at 0xA00000 (10MB), user-accessible
-var user_stack_base = 0xA00000;
-vmm_alloc_user(user_stack_base);
-# Make user stack page user-accessible
-var us_pd_idx = (user_stack_base >> 21) & 0x1FF;
-var us_entry = load64(0x3000 + us_pd_idx * 8);
-store64(0x3000 + us_pd_idx * 8, us_entry | 0x04);
-
-# Flush TLB
-asm { mov rax, cr3; }
-asm { mov cr3, rax; }
-
-var user_stack_top = user_stack_base + 0x4000;
-serial_print("Entering ring 3 at ", 19);
-kprint_num(&user_test_proc);
-serial_print(" stack=", 7);
-kprint_num(user_stack_top);
+# === Userland Exec Test ===
+# Spawn user_test_proc as a proper isolated process with its own address space
+serial_println("Userland exec test...", 21);
+var exec_pid = spawn_user_proc(&user_test_proc);
+serial_print("Spawned pid=", 12);
+kprint_num(exec_pid);
 serial_println("", 0);
 
-# Enter ring 3 directly. Exit syscall will halt the process;
-# for now we won't return from this (ring 3 process loops or halts).
-kernel_return_rsp = 0;
-kernel_return_rip = 0;
-enter_ring3(&user_test_proc, user_stack_top);
+if (exec_pid >= 0) {
+    var ep = &proc_table + exec_pid * 168;
+    var exec_entry = load64(ep + 24);
+    var exec_rsp = load64(ep + 16);
+    var exec_cr3 = load64(ep + 160);
+    exec_and_wait(exec_entry, exec_rsp, exec_cr3);
+    serial_println("Userland exec complete", 22);
+}
 
 # Keyboard loop
 serial_println("AGNOS ready. Type keys (q to halt):", 36);
