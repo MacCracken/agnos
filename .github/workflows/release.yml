@@ -23,13 +23,16 @@ jobs:
             exit 1
           fi
 
-      - name: Clone Cyrius toolchain
+      - name: Install Cyrius toolchain
+        env:
+          CYRIUS_VERSION: "1.5.2"
         run: |
-          git clone --depth 1 https://github.com/MacCracken/cyrius.git ../cyrius
-          cd ../cyrius
-          sh bootstrap/bootstrap.sh
-          cat src/compiler.cyr | ./build/stage1f > ./build/cc2 && chmod +x ./build/cc2
-          cat src/compiler_aarch64.cyr | ./build/cc2 > ./build/cc2_aarch64 && chmod +x ./build/cc2_aarch64
+          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          mkdir -p ../cyrius/build
+          cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" ../cyrius/build/cc2
+          cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb" ../cyrius/build/cyrb
+          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb
 
       - name: Build x86_64 kernel
         run: |

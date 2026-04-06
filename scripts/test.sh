@@ -23,12 +23,22 @@ test_x86() {
     echo "=== AGNOS Kernel Tests [x86_64] ==="
 
     # Build kernel (use cyrb if available, fallback to cc2)
+    rm -f /tmp/agnos_test
     if [ -x "$CYRB" ]; then
         "$CYRB" build "$ROOT/kernel/agnos.cyr" /tmp/agnos_test > /dev/null 2>&1
-    else
-        cat "$ROOT/kernel/agnos.cyr" | "$CC" > /tmp/agnos_test 2>/dev/null
     fi
-    check "x86 kernel builds" "0" "$?"
+    # Fallback: if cyrb failed or missing, try cc2
+    if [ ! -f /tmp/agnos_test ] || [ ! -s /tmp/agnos_test ]; then
+        cat "$ROOT/kernel/agnos.cyr" | "$CC" > /tmp/agnos_test 2>/dev/null || true
+    fi
+    # Check build produced a valid file
+    if [ -f /tmp/agnos_test ] && [ -s /tmp/agnos_test ]; then
+        check "x86 kernel builds" "0" "0"
+    else
+        check "x86 kernel builds" "0" "1"
+        # Skip remaining tests if build failed
+        return
+    fi
 
     # Validate ELF
     python3 -c "
@@ -42,7 +52,7 @@ exit(0 if ok else 1)
     check "x86 valid multiboot ELF" "0" "$?"
 
     # Size check
-    SZ=$(wc -c < /tmp/agnos_test)
+    SZ=$(wc -c < /tmp/agnos_test 2>/dev/null || echo 0)
     if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 150000 ]; then
         check "x86 size reasonable (${SZ}B)" "0" "0"
     else
