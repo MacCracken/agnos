@@ -1,0 +1,4 @@
+# aarch64 boot data
+# Stack and basic state are set up by the ELF patcher (scripts/patch_aarch64.py)
+# which inserts SP initialization before the Cyrius entry point.
+# QEMU virt: RAM at 0x40000000, PL011 UART at 0x09000000

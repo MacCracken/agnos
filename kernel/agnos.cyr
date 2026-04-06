@@ -19,7 +19,13 @@ include "arch/x86_64/syscall_hw.cyr"
 include "arch/x86_64/ring3.cyr"
 #endif
 
-# Architecture-independent core
+#ifdef ARCH_AARCH64
+include "arch/aarch64/boot_data.cyr"
+include "arch/aarch64/serial.cyr"
+#endif
+
+# Architecture-independent core (requires arch layer above)
+#ifdef ARCH_X86_64
 include "core/pmm.cyr"
 include "core/vmm.cyr"
 include "core/heap.cyr"
@@ -34,14 +40,13 @@ include "core/net.cyr"
 include "core/initrd.cyr"
 include "core/syscall.cyr"
 include "core/kprint.cyr"
-
-# Userland
 include "user/shell.cyr"
 include "user/init.cyr"
 include "user/test_procs.cyr"
-
-# Boot sequence
-#ifdef ARCH_X86_64
 include "arch/x86_64/boot_shim.cyr"
-#endif
 include "core/main.cyr"
+#endif
+
+#ifdef ARCH_AARCH64
+include "arch/aarch64/main.cyr"
+#endif

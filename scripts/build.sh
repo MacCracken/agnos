@@ -33,13 +33,18 @@ if [ "$ARCH" = "aarch64" ]; then
     fi
     echo "Building AGNOS kernel [aarch64]..."
     if [ -x "$CYRB" ]; then
-        (cd "$ROOT/kernel" && "$CYRB" build --aarch64 -D ARCH_AARCH64 "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos-aarch64")
+        (cd "$ROOT/kernel" && "$CYRB" build --aarch64 -D ARCH_AARCH64 "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos-aarch64.raw")
     else
-        cat "$ROOT/kernel/agnos.cyr" | "$CC_ARM" > "$ROOT/build/agnos-aarch64"
-        chmod +x "$ROOT/build/agnos-aarch64"
+        cat "$ROOT/kernel/agnos.cyr" | "$CC_ARM" > "$ROOT/build/agnos-aarch64.raw"
     fi
+    chmod +x "$ROOT/build/agnos-aarch64.raw"
+    # Patch: insert SP setup trampoline (Cyrius aarch64 doesn't set SP in kernel mode)
+    python3 "$ROOT/scripts/patch_aarch64.py" "$ROOT/build/agnos-aarch64.raw" "$ROOT/build/agnos-aarch64"
+    chmod +x "$ROOT/build/agnos-aarch64"
+    rm -f "$ROOT/build/agnos-aarch64.raw"
     SZ=$(wc -c < "$ROOT/build/agnos-aarch64")
     echo "  -> build/agnos-aarch64 ($SZ bytes)"
+    echo "Boot: qemu-system-aarch64 -M virt -cpu cortex-a57 -kernel build/agnos-aarch64 -serial stdio -display none"
 else
     echo "Building AGNOS kernel [x86_64]..."
     if [ -x "$CYRB" ]; then

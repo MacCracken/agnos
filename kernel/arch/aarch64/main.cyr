@@ -1,0 +1,4 @@
+# aarch64 main — minimal boot to serial
+serial_println("AGNOS kernel v1.0 [aarch64]", 27);
+serial_println("64-bit ARM, PL011 UART", 22);
+serial_println("Halted.", 7);

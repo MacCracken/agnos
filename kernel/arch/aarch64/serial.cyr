@@ -1,0 +1,20 @@
+# aarch64 serial I/O — PL011 UART at 0x09000000 (QEMU virt)
+
+fn serial_putc(c) {
+    store8(0x09000000, c);
+    return 0;
+}
+
+fn serial_print(msg, len) {
+    for (var i = 0; i < len; i = i + 1) {
+        serial_putc(load8(msg + i));
+    }
+    return 0;
+}
+
+fn serial_println(msg, len) {
+    serial_print(msg, len);
+    serial_putc(13);
+    serial_putc(10);
+    return 0;
+}
