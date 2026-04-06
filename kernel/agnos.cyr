@@ -344,6 +344,174 @@ fn apic_send_sipi(target, vector) {
     return 0;
 }
 
+# === SMP (Multi-Core) ===
+var cpu_count = 1;
+var ap_ready = 0;
+var smp_lock = 0;
+
+fn spin_lock() {
+    # Simple spinlock: test-and-set via xchg
+    # xchg [smp_lock], 1 — returns old value. Loop while old == 1.
+    var old = 1;
+    while (old == 1) {
+        var addr = &smp_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;  # mov rcx, 1
+            0x48; 0x87; 0x08;              # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;       # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+
+fn spin_unlock() {
+    smp_lock = 0;
+    return 0;
+}
+
+# AP entry point — called after trampoline transitions to long mode.
+# Each AP sets up its APIC and enters idle loop.
+fn ap_entry() {
+    # Enable this AP's local APIC
+    store32(0xFEE000F0, 0x1FF);
+    # Set up APIC timer (same vector and rate as BSP)
+    store32(0xFEE003E0, 0x0B);
+    store32(0xFEE00320, 0x20020);
+    store32(0xFEE00380, 10000000);
+    # Read our APIC ID
+    var my_id = (load32(0xFEE00020) >> 24) & 0xFF;
+    # Increment CPU count (with spinlock)
+    spin_lock();
+    cpu_count = cpu_count + 1;
+    ap_ready = my_id;
+    spin_unlock();
+    # Idle loop — hlt until timer fires
+    asm { sti; }
+    while (1 == 1) { asm { hlt; } }
+    return 0;
+}
+
+fn smp_build_trampoline() {
+    # AP trampoline at 0x8000. SIPI vector=0x08 -> APs start here in real mode.
+    # Layout: 0x8000=16-bit code, 0x8040=32-bit code, 0x8080=64-bit code
+    # 0x80E0=GDT16 ptr, 0x80F0=GDT64 ptr, 0x8100=IDT64 ptr
+    var t = 0x8000;
+    # Zero the page
+    for (var i = 0; i < 512; i = i + 8) { store64(t + i, 0); }
+
+    # --- Data structures at known offsets ---
+    # GDT pointer for 16/32-bit (6 bytes: limit16 + base32) at 0x80E0
+    store16(0x80E0, 55);
+    store32(0x80E2, &gdt & 0xFFFFFFFF);
+    # GDT pointer for 64-bit (10 bytes: limit16 + base64) at 0x80F0
+    store16(0x80F0, 55);
+    store64(0x80F2, &gdt);
+    # IDT pointer for 64-bit at 0x8100
+    store16(0x8100, 4095);
+    store64(0x8102, &idt);
+
+    # --- 16-bit real mode at 0x8000 ---
+    var off = 0;
+    store8(t+off, 0xFA); off = off + 1;                    # cli
+    store8(t+off, 0x31); store8(t+off+1, 0xC0); off = off + 2;  # xor ax, ax
+    store8(t+off, 0x8E); store8(t+off+1, 0xD8); off = off + 2;  # mov ds, ax
+    store8(t+off, 0x8E); store8(t+off+1, 0xD0); off = off + 2;  # mov ss, ax
+    # lgdt [ds:0x80E0] — in real mode with DS=0, address = 0x80E0
+    store8(t+off, 0x0F); store8(t+off+1, 0x01); store8(t+off+2, 0x16); off = off + 3;
+    store16(t+off, 0x80E0); off = off + 2;                 # lgdt [0x80E0]
+    # Enable PE
+    store8(t+off, 0x0F); store8(t+off+1, 0x20); store8(t+off+2, 0xC0); off = off + 3;
+    store8(t+off, 0x0C); store8(t+off+1, 0x01); off = off + 2;
+    store8(t+off, 0x0F); store8(t+off+1, 0x22); store8(t+off+2, 0xC0); off = off + 3;
+    # jmp far 0x08:0x8040 (enter 32-bit protected mode)
+    store8(t+off, 0x66); store8(t+off+1, 0xEA); off = off + 2;
+    store32(t+off, 0x8040); off = off + 4;
+    store16(t+off, 0x08); off = off + 2;
+
+    # --- 32-bit protected mode at 0x8040 ---
+    var p = 0x8040;
+    off = 0;
+    # mov ax,0x10; mov ds/es/ss,ax
+    store8(p+off, 0x66); store8(p+off+1, 0xB8); store16(p+off+2, 0x10); off = off + 4;
+    store8(p+off, 0x8E); store8(p+off+1, 0xD8); off = off + 2;
+    store8(p+off, 0x8E); store8(p+off+1, 0xC0); off = off + 2;
+    store8(p+off, 0x8E); store8(p+off+1, 0xD0); off = off + 2;
+    # Enable PAE: CR4 |= 0x20
+    store8(p+off, 0x0F); store8(p+off+1, 0x20); store8(p+off+2, 0xE0); off = off + 3;
+    store8(p+off, 0x0D); store32(p+off+1, 0x20); off = off + 5;
+    store8(p+off, 0x0F); store8(p+off+1, 0x22); store8(p+off+2, 0xE0); off = off + 3;
+    # CR3 = 0x1000 (shared PML4)
+    store8(p+off, 0xB8); store32(p+off+1, 0x1000); off = off + 5;
+    store8(p+off, 0x0F); store8(p+off+1, 0x22); store8(p+off+2, 0xD8); off = off + 3;
+    # Enable LME in EFER
+    store8(p+off, 0xB9); store32(p+off+1, 0xC0000080); off = off + 5;
+    store8(p+off, 0x0F); store8(p+off+1, 0x32); off = off + 2;
+    store8(p+off, 0x0D); store32(p+off+1, 0x100); off = off + 5;
+    store8(p+off, 0x0F); store8(p+off+1, 0x30); off = off + 2;
+    # Enable paging: CR0 |= 0x80000000
+    store8(p+off, 0x0F); store8(p+off+1, 0x20); store8(p+off+2, 0xC0); off = off + 3;
+    store8(p+off, 0x0D); store32(p+off+1, 0x80000000); off = off + 5;
+    store8(p+off, 0x0F); store8(p+off+1, 0x22); store8(p+off+2, 0xC0); off = off + 3;
+    # jmp far 0x08:0x8080 (enter 64-bit)
+    store8(p+off, 0xEA); store32(p+off+1, 0x8080); store16(p+off+5, 0x08); off = off + 7;
+
+    # --- 64-bit long mode at 0x8080 ---
+    p = 0x8080;
+    off = 0;
+    # lgdt [0x80F0] (64-bit GDT pointer) — 0F 01 14 25 F0 80 00 00
+    store8(p+off, 0x0F); store8(p+off+1, 0x01); store8(p+off+2, 0x14); store8(p+off+3, 0x25); off = off + 4;
+    store32(p+off, 0x80F0); off = off + 4;
+    # lidt [0x8100] — 0F 01 1C 25 00 81 00 00
+    store8(p+off, 0x0F); store8(p+off+1, 0x01); store8(p+off+2, 0x1C); store8(p+off+3, 0x25); off = off + 4;
+    store32(p+off, 0x8100); off = off + 4;
+    # mov ax, 0x10; mov ds/es/ss, ax
+    store8(p+off, 0x66); store8(p+off+1, 0xB8); store16(p+off+2, 0x10); off = off + 4;
+    store8(p+off, 0x8E); store8(p+off+1, 0xD8); off = off + 2;
+    store8(p+off, 0x8E); store8(p+off+1, 0xC0); off = off + 2;
+    store8(p+off, 0x8E); store8(p+off+1, 0xD0); off = off + 2;
+    # Set per-CPU stack: read APIC ID, compute stack = 0x300000 + id*0x10000 + 0x10000
+    # mov rax, 0xFEE00020
+    store8(p+off, 0x48); store8(p+off+1, 0xB8); off = off + 2;
+    store64(p+off, 0xFEE00020); off = off + 8;
+    # mov eax, [rax]
+    store8(p+off, 0x8B); store8(p+off+1, 0x00); off = off + 2;
+    # shr eax, 24
+    store8(p+off, 0xC1); store8(p+off+1, 0xE8); store8(p+off+2, 24); off = off + 3;
+    # and eax, 0xFF
+    store8(p+off, 0x25); store32(p+off+1, 0xFF); off = off + 5;
+    # imul eax, eax, 0x10000
+    store8(p+off, 0x69); store8(p+off+1, 0xC0); store32(p+off+2, 0x10000); off = off + 6;
+    # add eax, 0x310000 (stack top = base + 64KB)
+    store8(p+off, 0x05); store32(p+off+1, 0x310000); off = off + 5;
+    # mov rsp, rax; mov rbp, rsp
+    store8(p+off, 0x48); store8(p+off+1, 0x89); store8(p+off+2, 0xC4); off = off + 3;
+    store8(p+off, 0x48); store8(p+off+1, 0x89); store8(p+off+2, 0xE5); off = off + 3;
+    # mov rax, ap_entry; call rax
+    store8(p+off, 0x48); store8(p+off+1, 0xB8); off = off + 2;
+    store64(p+off, &ap_entry); off = off + 8;
+    store8(p+off, 0xFF); store8(p+off+1, 0xD0); off = off + 2;
+    # halt loop
+    store8(p+off, 0xEB); store8(p+off+1, 0xFE); off = off + 2;
+
+    return 0;
+}
+
+fn smp_start_aps() {
+    smp_build_trampoline();
+    for (var i = 1; i < 4; i = i + 1) {
+        var stack_addr = 0x300000 + i * 0x10000;
+        if (vmm_is_mapped(stack_addr) == 0) { vmm_alloc_at(stack_addr); }
+    }
+    # INIT-SIPI-SIPI sequence to wake APs.
+    # NOTE: QEMU multiboot does not support standard AP wakeup via SIPI.
+    # On real hardware or with a proper BIOS/UEFI boot, this would wake APs.
+    # The infrastructure (trampoline, per-CPU stacks, APIC IPI functions) is
+    # ready for when we switch to a GRUB/UEFI boot path.
+    # For now, skip SIPI to avoid AP triple faults in QEMU multiboot mode.
+    return cpu_count;
+}
+
 # === Keyboard ===
 
 fn kb_isr_build() {
@@ -2270,6 +2438,12 @@ fn sh_exec(buf, len) {
         }
         return 0;
     }
+    if (sh_streq(buf, clen, "cpus", 4) == 1) {
+        serial_print("Online: ", 8);
+        kprint_num(cpu_count);
+        serial_println(" CPUs", 5);
+        return 0;
+    }
     if (sh_streq(buf, clen, "net", 3) == 1) {
         if (vnet_active == 0) { serial_println("no network", 10); return 0; }
         serial_print("IP: 10.0.2.15  MAC: ", 20);
@@ -2420,6 +2594,15 @@ apic_timer_init(32, 10000000);
 serial_print("APIC: id=", 9);
 kprint_num(cpu_id);
 serial_println(" timer active", 13);
+
+# Start Application Processors
+cpu_count = 1;
+ap_ready = 0;
+smp_lock = 0;
+smp_start_aps();
+serial_print("SMP: ", 5);
+kprint_num(cpu_count);
+serial_println(" CPUs online", 12);
 
 kb_head = 0;
 kb_tail = 0;

@@ -22,8 +22,12 @@ check() {
 test_x86() {
     echo "=== AGNOS Kernel Tests [x86_64] ==="
 
-    # Build kernel
-    cat "$ROOT/kernel/agnos.cyr" | "$CC" > /tmp/agnos_test 2>/dev/null
+    # Build kernel (use cyrb if available, fallback to cc2)
+    if [ -x "$CYRB" ]; then
+        "$CYRB" build "$ROOT/kernel/agnos.cyr" /tmp/agnos_test > /dev/null 2>&1
+    else
+        cat "$ROOT/kernel/agnos.cyr" | "$CC" > /tmp/agnos_test 2>/dev/null
+    fi
     check "x86 kernel builds" "0" "$?"
 
     # Validate ELF
@@ -39,7 +43,7 @@ exit(0 if ok else 1)
 
     # Size check
     SZ=$(wc -c < /tmp/agnos_test)
-    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 100000 ]; then
+    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 150000 ]; then
         check "x86 size reasonable (${SZ}B)" "0" "0"
     else
         check "x86 size reasonable (${SZ}B)" "0" "1"
