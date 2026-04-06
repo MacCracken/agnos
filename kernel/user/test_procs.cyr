@@ -1,0 +1,51 @@
+# === Test Processes ===
+# Simple loop functions for context switch testing.
+# Each prints its ID to serial, then halts until next timer tick.
+
+fn test_proc_a() {
+    while (1 == 1) {
+        serial_print("A", 1);
+        asm { hlt; }
+    }
+    return 0;
+}
+
+fn test_proc_b() {
+    while (1 == 1) {
+        serial_print("B", 1);
+        asm { hlt; }
+    }
+    return 0;
+}
+
+# Test the SYSCALL interface via direct kernel call (not the instruction).
+fn test_hw_syscall() {
+    ksyscall(1, 0, "HW-OK\n", 6);
+    serial_print("HW getpid=", 11);
+    kprint_num(ksyscall(2, 0, 0, 0));
+    serial_println("", 0);
+    return 0;
+}
+
+# User-mode test process. Runs in ring 3.
+# Uses the SYSCALL instruction to communicate with the kernel.
+# Prints "U" repeatedly via syscall write, then exits.
+fn user_test_proc() {
+    # Ring 3. write(1, fd=0, buf, len)
+    var msg = "U";
+    var count = 0;
+    while (count < 10) {
+        # rax=1(write), rdi=0(fd serial), rsi=msg, rdx=1(len)
+        asm {
+            0x48; 0xC7; 0xC0; 0x01; 0x00; 0x00; 0x00;
+            0x48; 0x31; 0xFF;
+            0x48; 0x8B; 0x75; 0xF8;
+            0x48; 0xC7; 0xC2; 0x01; 0x00; 0x00; 0x00;
+            0x0F; 0x05;
+        }
+        count = count + 1;
+    }
+    asm { 0x48; 0x31; 0xC0; 0x48; 0x31; 0xFF; 0x0F; 0x05; }
+    asm { 0xEB; 0xFE; }
+    return 0;
+}

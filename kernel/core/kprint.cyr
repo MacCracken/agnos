@@ -1,0 +1,21 @@
+fn kprint_num(n: i64) {
+    var nb[24];
+    var ni = 23;
+    if (n < 0) { serial_putc(45); n = 0 - n; }
+    if (n == 0) { store8(&nb + ni, 48); ni = ni - 1; }
+    while (n > 0) { store8(&nb + ni, 48 + n % 10); ni = ni - 1; n = n / 10; }
+    serial_print(&nb + ni + 1, 23 - ni);
+    return 0;
+}
+
+fn rdtsc() {
+    # rdtsc: EDX:EAX = timestamp. No params, result at [rbp-0x08].
+    var result = 0;
+    asm {
+        0x0F; 0x31;                    # rdtsc
+        0x48; 0xC1; 0xE2; 0x20;       # shl rdx, 32
+        0x48; 0x09; 0xD0;              # or rax, rdx
+        0x48; 0x89; 0x45; 0xF8;       # mov [rbp-0x08], rax (result)
+    }
+    return result;
+}

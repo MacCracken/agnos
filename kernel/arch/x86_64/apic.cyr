@@ -1,0 +1,71 @@
+# === Local APIC ===
+# LAPIC base: 0xFEE00000 (default, from IA32_APIC_BASE MSR 0x1B)
+# Must be identity-mapped for MMIO access.
+var apic_base = 0xFEE00000;
+var apic_enabled = 0;
+var cpu_id = 0;
+
+fn apic_read(off) { return load32(0xFEE00000 + off); }
+fn apic_write(off, val) { store32(0xFEE00000 + off, val); return 0; }
+
+fn apic_init() {
+    # Map LAPIC at 0xFEE00000 (~4GB). Needs PDPT[3] -> new PD.
+    # PDPT[3] covers 3GB-4GB. PD index = (0xFEE00000 >> 21) & 0x1FF = 503
+    var apic_pd = pmm_alloc();
+    for (var i = 0; i < 4096; i = i + 8) { store64(apic_pd + i, 0); }
+    store64(0x2000 + 3 * 8, apic_pd | 0x03);
+    var apic_phys = 0xFEE00000 & 0xFFFFFFFFFFE00000;
+    store64(apic_pd + 503 * 8, apic_phys | 0x83);
+    # Flush TLB
+    asm { mov rax, cr3; }
+    asm { mov cr3, rax; }
+    apic_base = 0xFEE00000;
+
+    # Enable APIC: spurious vector register at 0xF0
+    store32(0xFEE000F0, 0x1FF);
+
+    # Read APIC ID
+    cpu_id = (apic_read(0x20) >> 24) & 0xFF;
+
+    # Set task priority to 0 (accept all interrupts)
+    apic_write(0x80, 0);
+
+    apic_enabled = 1;
+    return 0;
+}
+
+fn apic_eoi() {
+    apic_write(0xB0, 0);
+    return 0;
+}
+
+fn apic_timer_init(vector, count) {
+    # Divide config: 0x0B = divide by 1
+    apic_write(0x3E0, 0x0B);
+    # LVT Timer: periodic mode (bit 17), vector
+    apic_write(0x320, 0x20000 | vector);
+    # Initial count — determines frequency
+    # ~100Hz with divide-by-1: count depends on bus frequency
+    # QEMU default bus ~1GHz, so count ~10000000 for ~100Hz
+    apic_write(0x380, count);
+    return 0;
+}
+
+fn apic_send_init(target) {
+    apic_write(0x310, target << 24);
+    # INIT: delivery=5, level=assert, trigger=level
+    apic_write(0x300, 0x00C500);
+    while ((apic_read(0x300) & 0x1000) != 0) { }
+    # Deassert
+    apic_write(0x300, 0x008500);
+    while ((apic_read(0x300) & 0x1000) != 0) { }
+    return 0;
+}
+
+fn apic_send_sipi(target, vector) {
+    apic_write(0x310, target << 24);
+    # SIPI: delivery=6, vector = page number (e.g., 0x08 -> AP starts at 0x8000)
+    apic_write(0x300, 0x000600 | vector);
+    while ((apic_read(0x300) & 0x1000) != 0) { }
+    return 0;
+}

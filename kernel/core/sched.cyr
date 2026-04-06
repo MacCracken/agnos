@@ -1,0 +1,114 @@
+# === Context Switch + Scheduler ===
+# Real context switching: save/restore full register state via process table.
+# The timer ISR saves registers to the stack. context_switch reads them from
+# the ISR stack frame into the old process's slot, then loads the new process's
+# saved state onto the stack for iretq to restore.
+
+fn sched_next() {
+    # Round-robin: find next ready (1) or running (2) process after current
+    var start = proc_current + 1;
+    var si = 0;
+    while (si < proc_count) {
+        var idx = start + si;
+        if (idx >= proc_count) { idx = idx - proc_count; }
+        if (proc_get_state(idx) == 1) {
+            return idx;
+        }
+        si = si + 1;
+    }
+    return proc_current;
+}
+
+# Save current process register state from ISR stack frame.
+# Called after ISR pushes: rax rcx rdx rsi rdi r8 r9 r10 r11
+# Plus hardware-pushed: RIP CS RFLAGS RSP SS (on interrupt frame)
+# We save these into the process table for later restoration.
+fn proc_save_context(pid, isr_rsp) {
+    if (pid >= proc_count) { return 0; }
+    var p = &proc_table + pid * 168;
+    # ISR stack layout (top to bottom, growing down):
+    # [isr_rsp+0]  = rax (pushed last by our ISR)
+    # [isr_rsp+8]  = rcx
+    # [isr_rsp+16] = rdx
+    # [isr_rsp+24] = rsi
+    # [isr_rsp+32] = rdi
+    # [isr_rsp+40] = r8
+    # [isr_rsp+48] = r9
+    # [isr_rsp+56] = r10
+    # [isr_rsp+64] = r11
+    # [isr_rsp+72] = RIP   (hardware pushed)
+    # [isr_rsp+80] = CS
+    # [isr_rsp+88] = RFLAGS
+    # [isr_rsp+96] = RSP   (hardware pushed — interrupted code's RSP)
+    # [isr_rsp+104]= SS
+    store64(p + 32, load64(isr_rsp));       # rax
+    store64(p + 48, load64(isr_rsp + 8));   # rcx
+    store64(p + 56, load64(isr_rsp + 16));  # rdx
+    store64(p + 64, load64(isr_rsp + 24));  # rsi
+    store64(p + 72, load64(isr_rsp + 32));  # rdi
+    store64(p + 88, load64(isr_rsp + 40));  # r8
+    store64(p + 96, load64(isr_rsp + 48));  # r9
+    store64(p + 104, load64(isr_rsp + 56)); # r10
+    store64(p + 112, load64(isr_rsp + 64)); # r11
+    store64(p + 24, load64(isr_rsp + 72));  # rip
+    store64(p + 152, load64(isr_rsp + 88)); # rflags
+    store64(p + 16, load64(isr_rsp + 96));  # rsp
+    return 0;
+}
+
+# Load a process's register state onto the ISR stack frame.
+# When iretq executes, it will restore RIP/CS/RFLAGS/RSP/SS from the stack,
+# and our ISR pops will restore the GPRs.
+fn proc_restore_context(pid, isr_rsp) {
+    if (pid >= proc_count) { return 0; }
+    var p = &proc_table + pid * 168;
+    store64(isr_rsp, load64(p + 32));       # rax
+    store64(isr_rsp + 8, load64(p + 48));   # rcx
+    store64(isr_rsp + 16, load64(p + 56));  # rdx
+    store64(isr_rsp + 24, load64(p + 64));  # rsi
+    store64(isr_rsp + 32, load64(p + 72));  # rdi
+    store64(isr_rsp + 40, load64(p + 88));  # r8
+    store64(isr_rsp + 48, load64(p + 96));  # r9
+    store64(isr_rsp + 56, load64(p + 104)); # r10
+    store64(isr_rsp + 64, load64(p + 112)); # r11
+    store64(isr_rsp + 72, load64(p + 24));  # rip
+    # CS = 0x08 (kernel code segment)
+    store64(isr_rsp + 80, 0x08);
+    store64(isr_rsp + 88, load64(p + 152)); # rflags
+    store64(isr_rsp + 96, load64(p + 16));  # rsp
+    # SS = 0x10 (kernel data segment)
+    store64(isr_rsp + 104, 0x10);
+    return 0;
+}
+
+# High-level context switch called from timer ISR handler.
+# isr_rsp = stack pointer after ISR has pushed all caller-saved regs.
+fn do_context_switch(isr_rsp) {
+    if (sched_active == 0) { return 0; }
+    if (proc_count < 2) { return 0; }
+
+    var old = proc_current;
+    var new_pid = sched_next();
+    if (new_pid == old) { return 0; }
+
+    # Save old process state
+    proc_save_context(old, isr_rsp);
+    if (proc_get_state(old) == 2) {
+        proc_set_state(old, 1);  # running → ready
+    }
+
+    # Load new process state
+    proc_current = new_pid;
+    proc_set_state(new_pid, 2);  # → running
+    proc_restore_context(new_pid, isr_rsp);
+
+    # Switch page tables if different
+    var new_cr3 = proc_get_cr3(new_pid);
+    var old_cr3 = proc_get_cr3(old);
+    if (new_cr3 != old_cr3) {
+        var cr3_load = new_cr3;
+        asm { mov cr3, rax; }
+    }
+
+    return 0;
+}

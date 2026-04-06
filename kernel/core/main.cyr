@@ -1,0 +1,326 @@
+# === 64-bit Cyrius kernel code ===
+
+serial_println("AGNOS kernel v1.0", 17);
+serial_println("64-bit long mode", 16);
+
+gdt_init();
+serial_println("GDT loaded", 10);
+
+tss_init();
+serial_println("TSS loaded (ring 3 ready)", 25);
+
+idt_init();
+serial_println("IDT loaded", 10);
+
+pic_init();
+serial_println("PIC remapped", 12);
+
+timer_ticks = 0;
+timer_isr_build();
+idt_set_gate(&idt + 32 * 16, &timer_isr, 0x08, 0x8E);
+serial_println("Timer ISR installed", 19);
+
+# Initialize Local APIC (keeps PIC for keyboard IRQ1)
+apic_init();
+# Start APIC timer on vector 32 (same as PIT), ~100Hz
+# QEMU bus freq varies; 10000000 gives roughly 100Hz
+apic_timer_init(32, 10000000);
+serial_print("APIC: id=", 9);
+kprint_num(cpu_id);
+serial_println(" timer active", 13);
+
+# Start Application Processors
+cpu_count = 1;
+ap_ready = 0;
+smp_lock = 0;
+smp_start_aps();
+serial_print("SMP: ", 5);
+kprint_num(cpu_count);
+serial_println(" CPUs online", 12);
+
+kb_head = 0;
+kb_tail = 0;
+kb_shift = 0;
+kb_caps = 0;
+kb_ctrl = 0;
+kb_init_tables();
+kb_isr_build();
+idt_set_gate(&idt + 33 * 16, &kb_isr, 0x08, 0x8E);
+serial_println("Keyboard ISR installed (full US QWERTY)", 40);
+
+pt_init();
+serial_print("Page tables: ", 13);
+kprint_num(pt_get_mapped_mb());
+serial_println("MB mapped", 9);
+
+pmm_init();
+serial_print("PMM: ", 5);
+kprint_num(pmm_free_count());
+serial_print(" free / ", 8);
+kprint_num(pmm_total);
+serial_println(" pages", 6);
+
+var pg1 = pmm_alloc();
+pmm_free(pg1);
+serial_print("PMM test: ", 10);
+kprint_num(pmm_free_count());
+serial_println(" free", 5);
+
+vmm_alloc_at(0x1000000);
+store64(0x1000000, 0xDEAD);
+serial_print("VMM: ", 5);
+kprint_num(load64(0x1000000));
+serial_println(" (expect 57005)", 15);
+
+# Initialize kernel heap
+heap_init();
+serial_println("Heap initialized", 16);
+dev_init();
+serial_println("Devices registered", 18);
+pci_scan();
+serial_print("PCI: ", 5);
+kprint_num(pci_count);
+serial_println(" devices", 8);
+if (pci_find(0x1AF4, 0x1000) >= 0) {
+    if (virtio_net_init() == 0) {
+        serial_print("VirtIO-net: MAC=", 16);
+        for (var mi = 0; mi < 6; mi = mi + 1) {
+            kprint_num(load8(&vnet_mac + mi));
+            if (mi < 5) { serial_print(":", 1); }
+        }
+        serial_println("", 0);
+        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
+        serial_println("Net: 10.0.2.15/24 gw 10.0.2.2", 30);
+    }
+}
+vfs_init();
+serial_println("VFS initialized", 15);
+
+var h1 = kmalloc(16);
+var h2 = kmalloc(100);
+var h3 = kmalloc(4096);
+serial_print("Heap: ", 6);
+kprint_num(h1);
+serial_print(" ", 1);
+kprint_num(h2);
+serial_print(" ", 1);
+kprint_num(h3);
+serial_println("", 0);
+kfree_sized(h2, 100);
+
+# Initialize SYSCALL/SYSRET
+syscall_init();
+serial_println("SYSCALL/SYSRET initialized", 26);
+
+# Syscall test (direct call — still works)
+kernel_return_rsp = 0;
+kernel_return_rip = 0;
+proc_count = 0;
+proc_current = 0;
+var p0 = proc_create(0x100000);
+proc_set_state(0, 2);  # kernel "process" is running
+
+var pid = ksyscall(2, 0, 0, 0);
+serial_print("Syscall getpid=", 15);
+kprint_num(pid);
+serial_println("", 0);
+
+ksyscall(1, 0, "Syscall write works!\n", 21);
+
+ksyscall(0, 42, 0, 0);
+serial_print("Exit code: ", 11);
+kprint_num(sys_exit_code);
+serial_println("", 0);
+
+# Hardware SYSCALL test (from kernel mode — same privilege, tests the plumbing)
+serial_print("HW syscall test: ", 18);
+test_hw_syscall();
+
+# === Context Switch Test ===
+# Create two test processes with dedicated stacks.
+# Process stacks at 0x800000 + pid * 0x10000, 64KB apart.
+# Stack grows down, so stack_top is base + size.
+serial_println("Creating test processes...", 25);
+
+proc_count = 0;
+proc_current = 0;
+
+# Process 0: kernel idle (the code running right now)
+var kern_pid = proc_create(0);
+proc_set_state(0, 2);  # running
+
+# Process 1: test_proc_a
+var stack_a = 0x800000 + 1 * 0x10000;
+if (vmm_is_mapped(stack_a) == 0) { vmm_alloc_at(stack_a); }
+var pa = proc_create_full(&test_proc_a, stack_a + 0x4000);
+serial_print("Process A (pid=", 16);
+kprint_num(pa);
+serial_println(") created", 9);
+
+# Process 2: test_proc_b
+var stack_b = 0x800000 + 2 * 0x10000;
+if (vmm_is_mapped(stack_b) == 0) { vmm_alloc_at(stack_b); }
+var pb = proc_create_full(&test_proc_b, stack_b + 0x4000);
+serial_print("Process B (pid=", 16);
+kprint_num(pb);
+serial_println(") created", 9);
+
+serial_print("Processes: ", 11);
+kprint_num(proc_count);
+serial_print(" total, ", 8);
+kprint_num(proc_count_by_state(1));
+serial_println(" ready", 6);
+
+# Enable interrupts and activate scheduler
+asm { sti; }
+serial_println("Interrupts enabled", 18);
+
+# Wait a few ticks before activating scheduler
+asm { hlt; }
+asm { hlt; }
+serial_print("Timer ticks before sched: ", 26);
+kprint_num(timer_ticks);
+serial_println("", 0);
+
+serial_println("Activating scheduler...", 23);
+sched_active = 1;
+
+# Kernel idle loop: halts, wakes on timer, scheduler switches to A or B
+# After enough ticks, deactivate and report
+var idle_count = 0;
+while (idle_count < 50) {
+    asm { hlt; }
+    idle_count = idle_count + 1;
+}
+
+# Deactivate scheduler, report results
+sched_active = 0;
+serial_println("", 0);
+serial_print("Scheduler test done. Timer ticks: ", 34);
+kprint_num(timer_ticks);
+serial_println("", 0);
+
+# === Memory Isolation Test ===
+# VFS + initrd test
+serial_print("VFS write: ", 11);
+vfs_write(0, "OK\n", 3);
+
+# Build and mount test initrd at 0x6000 (free page table area)
+initrd_build_test(0x6000);
+var nfiles = initrd_init(0x6000);
+serial_print("Initrd: ", 8);
+kprint_num(nfiles);
+serial_println(" files", 6);
+
+# Open and read hello.txt
+var hfd = initrd_open("hello.txt", 9);
+var hbuf[16];
+var hn = vfs_read(hfd, &hbuf, 14);
+serial_print("initrd hello.txt: ", 18);
+serial_print(&hbuf, hn);
+vfs_close(hfd);
+
+# Open and read test
+var tfd = initrd_open("test", 4);
+var tbuf[8];
+var tn = vfs_read(tfd, &tbuf, 5);
+serial_print("initrd test: ", 13);
+serial_print(&tbuf, tn);
+vfs_close(tfd);
+var mf = vfs_create_memfile("HELLO", 5);
+var rbuf[8];
+var rn = vfs_read(mf, &rbuf, 5);
+serial_print("VFS memfile read: ", 18);
+serial_print(&rbuf, rn);
+serial_println("", 0);
+vfs_close(mf);
+
+serial_println("Memory isolation test...", 23);
+
+# Create two address spaces
+var as1 = proc_create_address_space();
+var as2 = proc_create_address_space();
+
+# Map virtual address 0xC00000 (12MB) in each, to different 2MB physical regions.
+# We need 2MB-aligned physical addresses since we use huge pages.
+# Use PMM to allocate 512 contiguous 4KB pages (= 2MB) for each.
+# Simpler: just use known free 2MB-aligned regions.
+# First 16MB is identity-mapped. Regions 0xE00000 (14MB) and 0x1000000 (16MB) should be free.
+var phys1 = 0xE00000;
+var phys2 = 0x1000000;
+# Mark these PMM pages as used
+for (var pi = 0; pi < 512; pi = pi + 1) {
+    pmm_set(phys1 / 0x1000 + pi);
+    pmm_set(phys2 / 0x1000 + pi);
+}
+# Ensure phys2 region is mapped in kernel page tables
+if (vmm_is_mapped(phys2) == 0) {
+    vmm_map(phys2, phys2, 0x83);
+}
+proc_map_page(as1, 0xC00000, phys1);
+proc_map_page(as2, 0xC00000, phys2);
+
+# Write different values via each address space.
+# Switch to AS1, write 0xAAAA to 0xC00000
+var switch1 = as1;
+asm { mov cr3, rax; }
+store64(0xC00000, 0xAAAA);
+var val_as1 = load64(0xC00000);
+
+# Switch to AS2, write 0xBBBB to same virtual address
+var switch2 = as2;
+asm { mov cr3, rax; }
+store64(0xC00000, 0xBBBB);
+var val_as2 = load64(0xC00000);
+
+# Switch back to AS1, read again — should still be 0xAAAA
+var switch1b = as1;
+asm { mov cr3, rax; }
+var val_as1_check = load64(0xC00000);
+
+# Restore kernel page tables
+var kern_cr3_restore = 0x1000;
+asm { mov cr3, rax; }
+
+serial_print("AS1 wrote 0xAAAA, read=", 22);
+kprint_num(val_as1);
+serial_print(" recheck=", 9);
+kprint_num(val_as1_check);
+serial_println("", 0);
+serial_print("AS2 wrote 0xBBBB, read=", 22);
+kprint_num(val_as2);
+serial_println("", 0);
+
+if (val_as1_check == 0xAAAA) {
+    if (val_as2 == 0xBBBB) {
+        serial_println("Memory isolation: PASS", 22);
+    } else {
+        serial_println("Memory isolation: FAIL (AS2)", 28);
+    }
+} else {
+    serial_println("Memory isolation: FAIL (AS1 clobbered)", 38);
+}
+
+# === Userland Exec Test ===
+# Spawn user_test_proc as a proper isolated process with its own address space
+serial_println("Userland exec test...", 21);
+var exec_pid = spawn_user_proc(&user_test_proc);
+serial_print("Spawned pid=", 12);
+kprint_num(exec_pid);
+serial_println("", 0);
+
+if (exec_pid >= 0) {
+    var ep = &proc_table + exec_pid * 168;
+    var exec_entry = load64(ep + 24);
+    var exec_rsp = load64(ep + 16);
+    var exec_cr3 = load64(ep + 160);
+    exec_and_wait(exec_entry, exec_rsp, exec_cr3);
+    serial_println("Userland exec complete", 22);
+}
+
+# Launch kybernet (PID 1)
+serial_println("Launching kybernet...", 21);
+kybernet();
+
+serial_println("Halted.", 7);
+asm { cli; hlt; 0xEB; 0xFE; }

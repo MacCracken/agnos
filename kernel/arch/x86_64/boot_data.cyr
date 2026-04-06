@@ -1,0 +1,13 @@
+# === Kernel data ===
+var gdt[8];
+var gdt_ptr[16];
+var tss[16];
+var idt[512];
+var idt_ptr[16];
+var isr_stub[16];
+var timer_ticks = 0;
+var timer_isr[64];
+var kb_isr[64];
+var kb_buf[256];
+var kb_head = 0;
+var kb_tail = 0;

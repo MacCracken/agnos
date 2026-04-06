@@ -1,0 +1,250 @@
+# === Shell ===
+var sh_buf[16];
+var sh_len = 0;
+
+fn sh_streq(a, alen, b, blen) {
+    if (alen != blen) { return 0; }
+    for (var i = 0; i < alen; i = i + 1) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+    }
+    return 1;
+}
+
+fn sh_cmd_help() {
+    serial_println("AGNOS Shell commands:", 21);
+    serial_println("  help    - this message", 24);
+    serial_println("  echo    - print text", 22);
+    serial_println("  ps      - process list", 24);
+    serial_println("  free    - memory info", 23);
+    serial_println("  cat     - read file", 21);
+    serial_println("  uptime  - timer ticks", 23);
+    serial_println("  lspci   - PCI devices", 23);
+    serial_println("  net     - network info", 24);
+    serial_println("  send    - send UDP msg", 24);
+    serial_println("  bench   - run benchmarks", 26);
+    serial_println("  halt    - shutdown", 20);
+    return 0;
+}
+
+fn sh_cmd_ps() {
+    serial_println("PID  STATE", 11);
+    for (var i = 0; i < proc_count; i = i + 1) {
+        kprint_num(i);
+        serial_print("    ", 4);
+        var st = proc_get_state(i);
+        if (st == 0) { serial_println("halted", 6); }
+        if (st == 1) { serial_println("ready", 5); }
+        if (st == 2) { serial_println("running", 7); }
+    }
+    return 0;
+}
+
+fn sh_cmd_free() {
+    serial_print("PMM: ", 5);
+    kprint_num(pmm_free_count());
+    serial_print("/", 1);
+    kprint_num(pmm_total);
+    serial_println(" pages (4KB each)", 17);
+    serial_print("Heap: ", 6);
+    kprint_num(heap_allocs);
+    serial_print(" allocs, ", 9);
+    kprint_num(heap_frees);
+    serial_println(" frees", 6);
+    return 0;
+}
+
+fn sh_cmd_bench() {
+    serial_println("=== AGNOS Benchmarks ===", 24);
+
+    # PMM: alloc+free x1000
+    var t0 = rdtsc();
+    for (var i = 0; i < 1000; i = i + 1) {
+        var pg = pmm_alloc();
+        pmm_free(pg);
+    }
+    var t1 = rdtsc();
+    serial_print("PMM alloc+free x1000: ", 22);
+    kprint_num((t1 - t0) / 1000);
+    serial_println(" cycles/op", 10);
+
+    # Syscall: getpid x10000
+    t0 = rdtsc();
+    for (var i = 0; i < 10000; i = i + 1) {
+        ksyscall(2, 0, 0, 0);
+    }
+    t1 = rdtsc();
+    serial_print("Syscall getpid x10000: ", 23);
+    kprint_num((t1 - t0) / 10000);
+    serial_println(" cycles/op", 10);
+
+    # Memory: write 1MB
+    var mem_pg = pmm_alloc();
+    t0 = rdtsc();
+    for (var i = 0; i < 256; i = i + 1) {
+        for (var j = 0; j < 4096; j = j + 8) {
+            store64(mem_pg + j, 0xDEADBEEF);
+        }
+    }
+    t1 = rdtsc();
+    pmm_free(mem_pg);
+    serial_print("Memwrite 1MB: ", 14);
+    kprint_num((t1 - t0) / 1000);
+    serial_println(" Kcycles", 8);
+
+    # Heap: kmalloc+kfree x1000
+    t0 = rdtsc();
+    for (var i = 0; i < 1000; i = i + 1) {
+        var p = kmalloc(64);
+        kfree_sized(p, 64);
+    }
+    t1 = rdtsc();
+    serial_print("Heap alloc+free x1000: ", 23);
+    kprint_num((t1 - t0) / 1000);
+    serial_println(" cycles/op", 10);
+
+    # Serial: write 1000 chars
+    t0 = rdtsc();
+    for (var i = 0; i < 1000; i = i + 1) {
+        serial_putc(46);
+    }
+    t1 = rdtsc();
+    serial_println("", 0);
+    serial_print("Serial putc x1000: ", 19);
+    kprint_num((t1 - t0) / 1000);
+    serial_println(" cycles/op", 10);
+
+    serial_println("=== done ===", 13);
+    return 0;
+}
+
+fn sh_cmd_cat(arg, arglen) {
+    if (arglen < 1) { serial_println("usage: cat <file>", 17); return 0; }
+    var fd = initrd_open(arg, arglen);
+    if (fd < 0) { serial_println("file not found", 14); return 0; }
+    var cbuf[64];
+    var n = vfs_read(fd, &cbuf, 512);
+    while (n > 0) {
+        serial_print(&cbuf, n);
+        n = vfs_read(fd, &cbuf, 512);
+    }
+    vfs_close(fd);
+    return 0;
+}
+
+fn sh_exec(buf, len) {
+    if (len < 1) { return 0; }
+    # Find command end (first space or end)
+    var cmd_end = 0;
+    while (cmd_end < len) {
+        if (load8(buf + cmd_end) == 32) { cmd_end = cmd_end + 1; break; }
+        cmd_end = cmd_end + 1;
+    }
+    # Trim the command (before space)
+    var clen = cmd_end;
+    if (clen > 0) {
+        if (load8(buf + clen - 1) == 32) { clen = clen - 1; }
+    }
+    # Arg = everything after the space
+    var arg = buf + cmd_end;
+    var arglen = len - cmd_end;
+
+    if (sh_streq(buf, clen, "help", 4) == 1) { return sh_cmd_help(); }
+    if (sh_streq(buf, clen, "ps", 2) == 1) { return sh_cmd_ps(); }
+    if (sh_streq(buf, clen, "free", 4) == 1) { return sh_cmd_free(); }
+    if (sh_streq(buf, clen, "uptime", 6) == 1) {
+        kprint_num(timer_ticks);
+        serial_println(" ticks", 6);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "cat", 3) == 1) { return sh_cmd_cat(arg, arglen); }
+    if (sh_streq(buf, clen, "echo", 4) == 1) {
+        serial_print(arg, arglen);
+        serial_println("", 0);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "lspci", 5) == 1) {
+        for (var i = 0; i < pci_count; i = i + 1) {
+            var base = &pci_devs + i * 32;
+            serial_print("  slot ", 6);
+            kprint_num(load64(base));
+            serial_print(": vendor=", 9);
+            kprint_num(load64(base + 8));
+            serial_print(" device=", 8);
+            kprint_num(load64(base + 16));
+            serial_print(" bar0=", 6);
+            kprint_num(load64(base + 24));
+            serial_println("", 0);
+        }
+        return 0;
+    }
+    if (sh_streq(buf, clen, "cpus", 4) == 1) {
+        serial_print("Online: ", 8);
+        kprint_num(cpu_count);
+        serial_println(" CPUs", 5);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "net", 3) == 1) {
+        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
+        serial_print("IP: 10.0.2.15  MAC: ", 20);
+        for (var i = 0; i < 6; i = i + 1) {
+            kprint_num(load8(&vnet_mac + i));
+            if (i < 5) { serial_putc(58); }
+        }
+        serial_println("", 0);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "send", 4) == 1) {
+        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
+        if (arglen < 1) { serial_println("usage: send <msg>", 17); return 0; }
+        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
+        var r = udp_send(ip4(10,0,2,2), 1234, 5555, arg, arglen);
+        serial_print("sent ", 5);
+        kprint_num(r);
+        serial_println(" bytes", 6);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "bench", 5) == 1) { return sh_cmd_bench(); }
+    if (sh_streq(buf, clen, "halt", 4) == 1) { return 0 - 99; }
+    serial_print("unknown: ", 9);
+    serial_print(buf, clen);
+    serial_println("", 0);
+    return 0;
+}
+
+fn shell() {
+    serial_println("AGNOS shell v1.0 (type 'help')", 30);
+    var sh_running = 1;
+    while (sh_running == 1) {
+        serial_print("agnos> ", 7);
+        sh_len = 0;
+        # Read line character by character
+        var reading = 1;
+        while (reading == 1) {
+            if (kb_has_key() == 0) { asm { hlt; } }
+            else {
+                var sc = kb_read_scancode();
+                var ch = scancode_to_ascii(sc);
+                if (ch == 10) {
+                    serial_println("", 0);
+                    reading = 0;
+                }
+                if (ch == 8) {
+                    if (sh_len > 0) {
+                        sh_len = sh_len - 1;
+                        serial_putc(8); serial_putc(32); serial_putc(8);
+                    }
+                }
+                if (ch > 31) {
+                    if (sh_len < 126) {
+                        store8(&sh_buf + sh_len, ch);
+                        sh_len = sh_len + 1;
+                        serial_putc(ch);
+                    }
+                }
+            }
+        }
+        var result = sh_exec(&sh_buf, sh_len);
+        if (result == 0 - 99) { sh_running = 0; }
+    }
+    return 0;
+}

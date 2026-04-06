@@ -1,0 +1,55 @@
+# === Virtual Memory Manager ===
+# Maps virtual addresses to physical pages using the existing page tables.
+# Uses PML4 at 0x1000, PDPT at 0x2000, PD at 0x3000.
+# For now: 2MB huge pages only (PD entries).
+# Page flags: 0x01=Present, 0x02=Writable, 0x04=User, 0x80=2MB page
+# Kernel pages: 0x83 (Present+Writable+2MB)
+# User pages:   0x87 (Present+Writable+User+2MB)
+
+fn vmm_map(virt, phys, flags) {
+    var pd_idx = (virt >> 21) & 0x1FF;
+    # NOTE: Forces Present (0x01) and 2MB page (0x80) bits via OR with 0x81.
+    # This means vmm_map always creates 2MB huge pages. Callers should pass
+    # 0x83 (kernel) or 0x87 (user) — the 2MB bit is enforced regardless.
+    # For future 4KB page support, use a different function with PT-level mapping.
+    store64(0x3000 + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | flags | 0x81);
+    # Flush TLB
+    var flush = virt;
+    asm { invlpg [rax]; }
+    return 0;
+}
+
+# Map a page as user-accessible (ring 3 can read/write)
+fn vmm_map_user(virt, phys) {
+    return vmm_map(virt, phys, 0x87);
+}
+
+fn vmm_unmap(virt) {
+    var pd_idx = (virt >> 21) & 0x1FF;
+    store64(0x3000 + pd_idx * 8, 0);
+    var flush = virt;
+    asm { invlpg [rax]; }
+    return 0;
+}
+
+fn vmm_is_mapped(virt) {
+    var pd_idx = (virt >> 21) & 0x1FF;
+    var entry = load64(0x3000 + pd_idx * 8);
+    return entry & 1;
+}
+
+# Allocate a physical page and map it at a virtual address (kernel-only)
+fn vmm_alloc_at(virt) {
+    var phys = pmm_alloc();
+    if (phys == 0) { return 0; }
+    vmm_map(virt, phys, 0x83);
+    return phys;
+}
+
+# Allocate a physical page and map it as user-accessible
+fn vmm_alloc_user(virt) {
+    var phys = pmm_alloc();
+    if (phys == 0) { return 0; }
+    vmm_map_user(virt, phys);
+    return phys;
+}

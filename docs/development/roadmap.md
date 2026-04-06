@@ -70,10 +70,17 @@ kernel/
 └── agnos.cyr             # main: includes arch/<ARCH>/* + core/* + user/*
 ```
 
-**Blocker**: Cyrius `include` doesn't work in `kernel;` mode. Options:
-1. Build script concatenates files before compiling (`cat arch/x86_64/*.cyr core/*.cyr | cc2`)
-2. Cyrius adds `include` support for kernel mode
-3. `cyrb build` gains multi-file kernel support
+**Blockers** (tracked on Cyrius roadmap as Tooling Issues):
+1. ~~`include` in kernel mode~~ — **Fixed** in Cyrius v1.6.1. `kernel; include "lib/..."` now works.
+2. ~~`cyrb --aarch64` path resolution~~ — **Fixed** in Cyrius v1.6.1.
+3. **Release tarball missing cc2_aarch64** — x86_64 release doesn't bundle cross-compiler.
+
+**All major blockers resolved.** Multi-arch split can proceed with Cyrius >= 1.6.1.
+
+**Interim workaround**: `scripts/build.sh` concatenates arch + core files before piping to `cyrb build`:
+```sh
+cat kernel/arch/$ARCH/*.cyr kernel/core/*.cyr kernel/user/*.cyr | cyrb build - build/agnos
+```
 
 **Step 2: Define arch interface** — each arch must provide:
 - `arch_init()` — hardware init (GDT/IDT/APIC or GIC/UART)

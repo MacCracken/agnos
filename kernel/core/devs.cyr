@@ -1,0 +1,65 @@
+# === Device Drivers ===
+# Device table: 16 entries x 32 bytes = {type, read_fn, write_fn, data}
+# type: 0=unused, 1=chardev
+var dev_table[64];
+var dev_count = 0;
+
+fn dev_register(read_fn, write_fn) {
+    if (dev_count >= 16) { return 0 - 1; }
+    var idx = dev_count;
+    var base = &dev_table + idx * 32;
+    store64(base, 1);
+    store64(base + 8, read_fn);
+    store64(base + 16, write_fn);
+    store64(base + 24, 0);
+    dev_count = dev_count + 1;
+    return idx;
+}
+
+fn dev_read(dev_idx, buf, count) {
+    if (dev_idx >= dev_count) { return 0 - 1; }
+    var base = &dev_table + dev_idx * 32;
+    if (load64(base) == 0) { return 0 - 1; }
+    if (dev_idx == 0) { return serial_dev_read(buf, count); }
+    return 0 - 1;
+}
+
+fn dev_write(dev_idx, buf, count) {
+    if (dev_idx >= dev_count) { return 0 - 1; }
+    var base = &dev_table + dev_idx * 32;
+    if (load64(base) == 0) { return 0 - 1; }
+    if (dev_idx == 0) { return serial_dev_write(buf, count); }
+    return 0 - 1;
+}
+
+fn serial_dev_read(buf, count) {
+    var n = 0;
+    while (n < count) {
+        if (kb_has_key() == 0) {
+            if (n > 0) { return n; }
+            asm { hlt; }
+        } else {
+            var sc = kb_read_scancode();
+            var ch = scancode_to_ascii(sc);
+            if (ch > 0) {
+                store8(buf + n, ch);
+                n = n + 1;
+                if (ch == 10) { return n; }
+            }
+        }
+    }
+    return n;
+}
+
+fn serial_dev_write(buf, count) {
+    if (count > 4096) { count = 4096; }
+    serial_print(buf, count);
+    return count;
+}
+
+fn dev_init() {
+    for (var i = 0; i < 64; i = i + 1) { store64(&dev_table + i * 8, 0); }
+    dev_count = 0;
+    dev_register(&serial_dev_read, &serial_dev_write);
+    return 0;
+}

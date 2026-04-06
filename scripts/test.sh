@@ -25,7 +25,7 @@ test_x86() {
     # Build kernel (use cyrb if available, fallback to cc2)
     rm -f /tmp/agnos_test
     if [ -x "$CYRB" ]; then
-        "$CYRB" build "$ROOT/kernel/agnos.cyr" /tmp/agnos_test > /dev/null 2>&1
+        (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" /tmp/agnos_test) > /dev/null 2>&1
     fi
     # Fallback: if cyrb failed or missing, try cc2
     if [ ! -f /tmp/agnos_test ] || [ ! -s /tmp/agnos_test ]; then

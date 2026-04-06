@@ -1,0 +1,82 @@
+# === Physical Memory Manager ===
+# Bitmap allocator: 1 bit per 4KB page
+# 16MB = 4096 pages = 512 bytes bitmap
+var pmm_bitmap[512];
+var pmm_total = 0;
+var pmm_used = 0;
+var pmm_next_free = 0;
+
+fn pmm_set(page) {
+    if (page >= 4096) { return 0 - 1; }
+    var byte = page / 8;
+    var bit = page % 8;
+    store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) | (1 << bit));
+    return 0;
+}
+
+fn pmm_clear(page) {
+    if (page >= 4096) { return 0 - 1; }
+    var byte = page / 8;
+    var bit = page % 8;
+    store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) & (~(1 << bit) & 0xFF));
+    return 0;
+}
+
+fn pmm_test(page) {
+    if (page >= 4096) { return 0; }
+    var byte = page / 8;
+    var bit = page % 8;
+    return (load8(&pmm_bitmap + byte) >> bit) & 1;
+}
+
+fn pmm_init() {
+    # Zero bitmap (all free)
+    for (var i = 0; i < 512; i = i + 1) { store8(&pmm_bitmap + i, 0); }
+    pmm_total = 4096;
+    pmm_used = 0;
+    # Mark first 2MB as used (kernel + page tables + stack)
+    # 2MB / 4KB = 512 pages = pages 0-511 = 64 bytes of bitmap, all 0xFF
+    for (var i = 0; i < 64; i = i + 1) {
+        store8(&pmm_bitmap + i, 0xFF);
+    }
+    pmm_used = 512;
+    pmm_next_free = 512;
+    return 0;
+}
+
+fn pmm_alloc() {
+    # Find first free page, starting from hint for O(1) best-case
+    for (var i = pmm_next_free; i < 4096; i = i + 1) {
+        if (pmm_test(i) == 0) {
+            pmm_set(i);
+            pmm_used = pmm_used + 1;
+            pmm_next_free = i + 1;
+            return i * 0x1000;
+        }
+    }
+    # Wrap around and search from beginning (fragmentation case)
+    for (var i = 0; i < pmm_next_free; i = i + 1) {
+        if (pmm_test(i) == 0) {
+            pmm_set(i);
+            pmm_used = pmm_used + 1;
+            pmm_next_free = i + 1;
+            return i * 0x1000;
+        }
+    }
+    return 0;
+}
+
+fn pmm_free(addr) {
+    var page = addr / 0x1000;
+    if (pmm_test(page) == 1) {
+        pmm_clear(page);
+        pmm_used = pmm_used - 1;
+        # Update hint so next alloc finds this freed page quickly
+        if (page < pmm_next_free) { pmm_next_free = page; }
+    }
+    return 0;
+}
+
+fn pmm_free_count() {
+    return pmm_total - pmm_used;
+}

@@ -1,0 +1,138 @@
+# === Process Abstraction ===
+# Full process context for real context switching.
+# Layout per process (168 bytes = 21 fields x 8 bytes):
+#   0: pid       8: state     16: rsp      24: rip
+#  32: rax      40: rbx       48: rcx      56: rdx
+#  64: rsi      72: rdi       80: rbp      88: r8
+#  96: r9      104: r10      112: r11     120: r12
+# 128: r13     136: r14      144: r15     152: rflags
+# 160: cr3 (page table root physical address)
+
+struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9; r10; r11; r12; r13; r14; r15; rflags; cr3; }
+
+var proc_table[336];
+var proc_count = 0;
+var proc_current = 0;
+var sched_active = 0;
+
+fn proc_create(entry) {
+    if (proc_count >= 16) { return 0 - 1; }
+    var idx = proc_count;
+    var p = &proc_table + idx * 168;
+    store64(p, idx);          # pid
+    store64(p + 8, 1);        # state: 1=ready
+    store64(p + 16, 0);       # rsp (set by proc_create_full)
+    store64(p + 24, entry);   # rip (entry point)
+    # Zero all register fields
+    for (var r = 32; r < 160; r = r + 8) {
+        store64(p + r, 0);
+    }
+    # Set initial RFLAGS: IF=1 (interrupts enabled)
+    store64(p + 152, 0x200);
+    # Default: use kernel page tables
+    store64(p + 160, 0x1000);
+    proc_count = proc_count + 1;
+    return idx;
+}
+
+fn proc_get_state(pid) {
+    if (pid >= proc_count) { return 0 - 1; }
+    return load64(&proc_table + pid * 168 + 8);
+}
+
+fn proc_set_state(pid, st) {
+    if (pid >= proc_count) { return 0 - 1; }
+    store64(&proc_table + pid * 168 + 8, st);
+    return 0;
+}
+
+fn proc_count_by_state(st) {
+    var n: i64 = 0;
+    for (var i = 0; i < proc_count; i = i + 1) {
+        if (proc_get_state(i) == st) { n = n + 1; }
+    }
+    return n;
+}
+
+# Extended process creation with stack
+fn proc_create_full(entry, stack_top) {
+    if (proc_count >= 16) { return 0 - 1; }
+    var idx = proc_count;
+    var p = &proc_table + idx * 168;
+    store64(p, idx);          # pid
+    store64(p + 8, 1);        # state: 1=ready
+    store64(p + 16, stack_top); # rsp
+    store64(p + 24, entry);   # rip
+    # Zero all register fields
+    for (var r = 32; r < 160; r = r + 8) {
+        store64(p + r, 0);
+    }
+    # Set initial RFLAGS: IF=1 (interrupts enabled)
+    store64(p + 152, 0x200);
+    # Set rbp = stack_top (frame pointer)
+    store64(p + 80, stack_top);
+    # Default: use kernel page tables
+    store64(p + 160, 0x1000);
+    proc_count = proc_count + 1;
+    return idx;
+}
+
+# Set a process's CR3 (page table root)
+fn proc_set_cr3(pid, cr3_val) {
+    if (pid >= proc_count) { return 0 - 1; }
+    store64(&proc_table + pid * 168 + 160, cr3_val);
+    return 0;
+}
+
+fn proc_get_cr3(pid) {
+    if (pid >= proc_count) { return 0; }
+    return load64(&proc_table + pid * 168 + 160);
+}
+
+# === Per-Process Address Space ===
+# Create a new set of page tables for a process.
+# Copies kernel mappings (first 16MB) from the shared kernel PD.
+# Returns the physical address of the new PML4.
+
+fn proc_create_address_space() {
+    # Allocate 3 pages: PML4, PDPT, PD
+    var new_pml4 = pmm_alloc();
+    if (new_pml4 == 0) { return 0; }
+    var new_pdpt = pmm_alloc();
+    if (new_pdpt == 0) { return 0; }
+    var new_pd = pmm_alloc();
+    if (new_pd == 0) { return 0; }
+
+    # Zero all three pages
+    for (var i = 0; i < 4096; i = i + 8) {
+        store64(new_pml4 + i, 0);
+        store64(new_pdpt + i, 0);
+        store64(new_pd + i, 0);
+    }
+
+    # PML4[0] → PDPT (present + writable + user)
+    store64(new_pml4, new_pdpt | 0x07);
+    # PDPT[0] → PD (present + writable + user)
+    store64(new_pdpt, new_pd | 0x07);
+
+    # Copy kernel PD entries (first 16MB = entries 0-7) from kernel PD at 0x3000
+    for (var i = 0; i < 8; i = i + 1) {
+        var entry = load64(0x3000 + i * 8);
+        store64(new_pd + i * 8, entry);
+    }
+
+    return new_pml4;
+}
+
+# Map a 2MB page in a process's page directory (user-accessible)
+fn proc_map_page(cr3, virt, phys) {
+    # Get PD address from PML4 → PDPT → PD chain
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    # Write PD entry
+    var pd_idx = (virt >> 21) & 0x1FF;
+    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
+    return 0;
+}

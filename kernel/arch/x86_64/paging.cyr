@@ -1,0 +1,37 @@
+# === Page Tables ===
+# PML4 at 0x1000, PDPT at 0x2000, PD at 0x3000 (set up by shim)
+# Each PD entry maps 2MB. PD has 512 entries = 1GB max.
+
+fn pt_map_2mb(pd_base, idx, phys_addr) {
+    # PD entry: phys_addr | 0x83 (present + writable + 2MB page)
+    store64(pd_base + idx * 8, (phys_addr & 0xFFFFFFFFFFE00000) | 0x83);
+    return 0;
+}
+
+fn pt_init() {
+    # Identity map first 16MB (8 x 2MB pages)
+    # PD at 0x3000 already has entries 0-1 from the shim
+    for (var i = 0; i < 8; i = i + 1) {
+        pt_map_2mb(0x3000, i, i * 0x200000);
+    }
+    # Set U/S bit on PML4[0] and PDPT[0] so user-mode pages work
+    # PML4 at 0x1000, PDPT at 0x2000 — need bit 2 (User) set
+    var pml4e = load64(0x1000);
+    store64(0x1000, pml4e | 0x04);
+    var pdpte = load64(0x2000);
+    store64(0x2000, pdpte | 0x04);
+    # Reload CR3 to flush TLB
+    asm { mov rax, cr3; }
+    asm { mov cr3, rax; }
+    return 0;
+}
+
+fn pt_get_mapped_mb() {
+    # Count how many 2MB PD entries are present
+    var count: i64 = 0;
+    for (var i = 0; i < 512; i = i + 1) {
+        var entry = load64(0x3000 + i * 8);
+        if (entry & 1 == 1) { count = count + 1; }
+    }
+    return count * 2;
+}

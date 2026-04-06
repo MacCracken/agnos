@@ -1,0 +1,36 @@
+# === IDT ===
+
+fn idt_set_gate(base, handler, selector, attr) {
+    # IDT entry = 16 bytes:
+    # [0-1] offset low, [2-3] selector, [4] IST=0, [5] type_attr
+    # [6-7] offset mid, [8-11] offset high, [12-15] reserved
+    store16(base, handler & 0xFFFF);
+    store16(base + 2, selector);
+    store8(base + 4, 0);
+    store8(base + 5, attr);
+    store16(base + 6, (handler >> 16) & 0xFFFF);
+    store32(base + 8, (handler >> 32) & 0xFFFFFFFF);
+    store32(base + 12, 0);
+    return 0;
+}
+
+fn idt_init() {
+    # Build a tiny ISR stub: iretq (48 CF) at a known address
+    # The stub is just 2 bytes but we need it at a fixed location
+    # NOTE: This default handler silently returns on any unexpected interrupt.
+    # For debugging, install vector-specific handlers that log to serial.
+    store8(&isr_stub, 0x48);
+    store8(&isr_stub + 1, 0xCF);
+    var handler = &isr_stub;
+    # Set all 256 entries to the default handler
+    # attr 0x8E = present(1) + DPL(00) + gate type(1110 = 64-bit interrupt)
+    for (var v = 0; v < 256; v = v + 1) {
+        idt_set_gate(&idt + v * 16, handler, 0x08, 0x8E);
+    }
+    # Load IDTR
+    store16(&idt_ptr, 4095);
+    store64(&idt_ptr + 2, &idt);
+    var ip = &idt_ptr;
+    asm { lidt [rax]; }
+    return 0;
+}

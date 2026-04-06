@@ -1,0 +1,98 @@
+# === Ring 3 Transition ===
+
+# Globals for exec_and_wait to pass to enter_ring3 without param clobbering
+var exec_entry_g = 0;
+var exec_rsp_g = 0;
+var exec_cr3_g = 0;
+
+# Execute a user process and wait for it to exit.
+# Saves kernel return context so exit syscall returns here.
+fn exec_and_wait(entry, rsp, cr3) {
+    # Save params to globals (avoid param clobber in asm)
+    exec_entry_g = entry;
+    exec_rsp_g = rsp;
+    exec_cr3_g = cr3;
+
+    # Save return context: kernel_resume will restore rbp and jump to return addr
+    # We read [rbp+8] = return address and save rbp as the stack to restore.
+    # But we can't use asm [rbp+N] safely with params. Instead, use a nested
+    # function with no params to capture the frame.
+    # Actually — we just need kernel_return_rsp and kernel_return_rip set.
+    # kernel_resume does: mov rsp, [rbp-0x08]; jmp [rbp-0x10]
+    # So it restores a saved rbp as rsp and jumps to a saved rip.
+    # We want it to "return" from exec_and_wait normally.
+    # The trick: save the CALLER's rbp and return address.
+    # In exec_and_wait(entry, rsp, cr3): params at rbp-0x08, -0x10, -0x18
+    # Then new locals start at rbp-0x20.
+    var save_rbp = 0;     # [rbp-0x20]
+    var save_retaddr = 0; # [rbp-0x28]
+    asm {
+        0x48; 0x8B; 0x45; 0x00;   # mov rax, [rbp] (saved caller rbp)
+        0x48; 0x89; 0x45; 0xE0;   # mov [rbp-0x20], rax
+        0x48; 0x8B; 0x45; 0x08;   # mov rax, [rbp+0x08] (return address)
+        0x48; 0x89; 0x45; 0xD8;   # mov [rbp-0x28], rax
+    }
+    kernel_return_rsp = save_rbp;
+    kernel_return_rip = save_retaddr;
+
+    # Switch CR3 and enter ring 3
+    var cr3_load = exec_cr3_g;
+    asm { mov cr3, rax; }
+    enter_ring3(exec_entry_g, exec_rsp_g);
+    return 0;
+}
+
+fn enter_ring3(entry, user_rsp) {
+    # Set TSS RSP0 so interrupts/syscalls come back to kernel stack
+    tss_set_rsp0(tss_kernel_stack);
+
+    # Write the iretq frame directly at 0x7000 using the function params.
+    # Layout: [0]=RIP [8]=CS [16]=RFLAGS [24]=RSP [32]=SS
+    store64(0x7000, entry);
+    store64(0x7008, 0x23);
+    store64(0x7010, 0x202);
+    store64(0x7018, user_rsp);
+    store64(0x7020, 0x1B);
+
+    # Set RSP to 0x7000 and iretq
+    asm {
+        0x48; 0xC7; 0xC4; 0x00; 0x70; 0x00; 0x00;  # mov rsp, 0x7000
+        0x48; 0xCF;                                    # iretq
+    }
+
+    return 0;
+}
+
+# spawn_user_proc: create a user process from a kernel function address.
+# Allocates per-process address space, maps code+stack pages, returns pid.
+fn spawn_user_proc(entry_fn) {
+    var new_cr3 = proc_create_address_space();
+    if (new_cr3 == 0) { return 0 - 1; }
+    # Map kernel code pages as user-accessible in new address space
+    # (code lives in kernel binary at 0x100000-0x200000)
+    var pml4e = load64(new_cr3);
+    var pdpt_a = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_a);
+    var pd_a = pdpte & 0xFFFFFFFFF000;
+    # Set U/S bit on first 2 PD entries (0-4MB) for code access
+    var pde0 = load64(pd_a);
+    store64(pd_a, pde0 | 0x04);
+    var pde1 = load64(pd_a + 8);
+    store64(pd_a + 8, pde1 | 0x04);
+    # Allocate user stack
+    var pid = proc_count;
+    var stack_base = 0x800000 + pid * 0x200000;
+    var stack_phys = pmm_alloc();
+    if (stack_phys != 0) {
+        if (vmm_is_mapped(stack_phys) == 0) {
+            vmm_map(stack_phys, stack_phys, 0x83);
+        }
+        proc_map_page(new_cr3, stack_base, stack_phys);
+    }
+    var stack_top = stack_base + 0x4000;
+    var new_pid = proc_create_full(entry_fn, stack_top);
+    if (new_pid >= 0) {
+        proc_set_cr3(new_pid, new_cr3);
+    }
+    return new_pid;
+}

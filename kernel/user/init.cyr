@@ -1,0 +1,14 @@
+# === kybernet (PID 1 init) ===
+fn kybernet() {
+    serial_println("kybernet: starting init", 23);
+    serial_print("kybernet: ", 10);
+    kprint_num(proc_count);
+    serial_println(" processes", 10);
+    serial_print("kybernet: ", 10);
+    kprint_num(pmm_free_count());
+    serial_println(" free pages", 11);
+    serial_println("kybernet: launching shell", 25);
+    shell();
+    serial_println("kybernet: shell exited", 22);
+    return 0;
+}

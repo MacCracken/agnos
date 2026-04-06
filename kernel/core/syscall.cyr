@@ -1,0 +1,69 @@
+# === Syscall Interface ===
+# Syscall#: 0=exit 1=write 2=getpid 3=spawn 4=waitpid 5=read 6=close 7=open
+
+var sys_exit_code = 0;
+
+# Resume kernel execution after a user process exits.
+# Restores saved kernel RSP and jumps to saved RIP.
+fn kernel_resume() {
+    var ret_rsp = kernel_return_rsp;   # [rbp - 0x08]
+    var ret_rip = kernel_return_rip;   # [rbp - 0x10]
+    kernel_return_rsp = 0;
+    kernel_return_rip = 0;
+    # Switch back to kernel segments (CS=0x08, SS=0x10)
+    # and restore kernel stack, then jump to return point
+    asm {
+        0x48; 0xC7; 0xC0; 0x10; 0x00; 0x00; 0x00;  # mov rax, 0x10
+        0x8E; 0xD8;  # mov ds, ax
+        0x8E; 0xC0;  # mov es, ax
+        0x8E; 0xD0;  # mov ss, ax (not needed since we're already ring 0 from syscall entry)
+    }
+    asm {
+        0x48; 0x8B; 0x65; 0xF8;  # mov rsp, [rbp-0x08] (ret_rsp)
+        0xFF; 0x65; 0xF0;         # jmp [rbp-0x10] (ret_rip)
+    }
+    return 0;
+}
+
+fn ksyscall(num, arg1, arg2, arg3) {
+    if (num == 0) {
+        # exit — halt current process, return to kernel if context saved
+        sys_exit_code = arg1;
+        if (proc_current < proc_count) {
+            proc_set_state(proc_current, 0);
+        }
+        # If we have a saved kernel return point, jump back to it
+        if (kernel_return_rsp != 0) {
+            kernel_resume();
+        }
+        return 0;
+    }
+    if (num == 1) {
+        # write(fd=arg1, buf=arg2, len=arg3)
+        return vfs_write(arg1, arg2, arg3);
+    }
+    if (num == 2) { return proc_current; }
+    if (num == 3) {
+        # spawn(elf_addr, elf_size) — load ELF and create user process
+        # Returns new pid or -1 on error
+        var new_pid = elf_load(arg1, arg2);
+        if (new_pid >= 0) {
+            # Mark as ready; will be scheduled on next timer tick
+            proc_set_state(new_pid, 1);
+        }
+        return new_pid;
+    }
+    if (num == 4) {
+        # waitpid(pid) — wait for a process to exit (state=0)
+        # Simple busy-wait for now; returns exit code
+        if (arg1 >= proc_count) { return 0 - 1; }
+        while (proc_get_state(arg1) != 0) {
+            asm { hlt; }
+        }
+        return sys_exit_code;
+    }
+    if (num == 5) { return vfs_read(arg1, arg2, arg3); }
+    if (num == 6) { return vfs_close(arg1); }
+    if (num == 7) { return initrd_open(arg1, arg2); }
+    return 0 - 1;
+}

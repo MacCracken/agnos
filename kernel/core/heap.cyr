@@ -1,0 +1,109 @@
+# === Kernel Heap (Slab Allocator) ===
+# 8 size classes: 32, 64, 128, 256, 512, 1024, 2048, 4096 bytes.
+# Each class maintains a free list. New slabs allocated from PMM (4KB pages).
+# Free blocks store a next-pointer in their first 8 bytes.
+
+# Slab class sizes (index 0-7)
+# Free list heads for each class (8 pointers)
+var slab_free[64];
+# Class sizes stored for lookup
+var slab_sizes[64];
+# Stats
+var heap_allocs = 0;
+var heap_frees = 0;
+
+fn heap_init() {
+    # Initialize free lists to null
+    for (var i = 0; i < 8; i = i + 1) {
+        store64(&slab_free + i * 8, 0);
+    }
+    # Store class sizes: 32, 64, 128, 256, 512, 1024, 2048, 4096
+    store64(&slab_sizes, 32);
+    store64(&slab_sizes + 8, 64);
+    store64(&slab_sizes + 16, 128);
+    store64(&slab_sizes + 24, 256);
+    store64(&slab_sizes + 32, 512);
+    store64(&slab_sizes + 40, 1024);
+    store64(&slab_sizes + 48, 2048);
+    store64(&slab_sizes + 56, 4096);
+    heap_allocs = 0;
+    heap_frees = 0;
+    return 0;
+}
+
+# Find the slab class index for a given size (0-7, or -1 if too large)
+fn slab_class_for(size) {
+    for (var i = 0; i < 8; i = i + 1) {
+        var class_size = load64(&slab_sizes + i * 8);
+        if (size < class_size + 1) {
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+# Allocate a new slab page for a given class and add all blocks to free list
+fn slab_grow(class_idx) {
+    var block_size = load64(&slab_sizes + class_idx * 8);
+    # Allocate a 4KB page from PMM
+    var page = pmm_alloc();
+    if (page == 0) { return 0 - 1; }
+    # Ensure it's mapped (0x83 = Present+Writable+2MB page)
+    if (vmm_is_mapped(page) == 0) {
+        vmm_map(page, page, 0x83);
+    }
+    # Divide page into blocks, chain them as a free list
+    var blocks_per_page = 4096 / block_size;
+    if (blocks_per_page < 1) { blocks_per_page = 1; }
+    var head = load64(&slab_free + class_idx * 8);
+    for (var i = 0; i < blocks_per_page; i = i + 1) {
+        var block = page + i * block_size;
+        # Each free block's first 8 bytes = pointer to next free block
+        store64(block, head);
+        head = block;
+    }
+    store64(&slab_free + class_idx * 8, head);
+    return 0;
+}
+
+# Allocate size bytes from the kernel heap. Returns pointer or 0 on failure.
+fn kmalloc(size) {
+    if (size <= 0) { return 0; }
+    var class_idx = slab_class_for(size);
+    if (class_idx < 0) { return 0; }
+
+    # Check free list
+    var head = load64(&slab_free + class_idx * 8);
+    if (head == 0) {
+        # No free blocks — grow the slab
+        if (slab_grow(class_idx) < 0) { return 0; }
+        head = load64(&slab_free + class_idx * 8);
+        if (head == 0) { return 0; }
+    }
+
+    # Pop first free block
+    var next = load64(head);
+    store64(&slab_free + class_idx * 8, next);
+    # Zero only the requested size (security: don't leak old data)
+    # Round up to 8-byte boundary for store64 alignment
+    var zero_len = (size + 7) & (~7);
+    for (var i = 0; i < zero_len; i = i + 8) {
+        store64(head + i, 0);
+    }
+    heap_allocs = heap_allocs + 1;
+    return head;
+}
+
+# Free a pointer back to the heap. Caller must provide the original alloc size
+# (or we scan — but for now, require size for simplicity).
+fn kfree_sized(ptr, size) {
+    if (ptr == 0) { return 0; }
+    var class_idx = slab_class_for(size);
+    if (class_idx < 0) { return 0 - 1; }
+    # Push onto free list
+    var head = load64(&slab_free + class_idx * 8);
+    store64(ptr, head);
+    store64(&slab_free + class_idx * 8, ptr);
+    heap_frees = heap_frees + 1;
+    return 0;
+}

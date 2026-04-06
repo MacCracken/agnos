@@ -1,0 +1,112 @@
+# === VirtIO-Net Driver ===
+# Legacy (transitional) virtio PCI interface
+# BAR0 = I/O base. Registers at offsets from BAR0.
+var vnet_iobase = 0;
+var vnet_mac[8];
+var vnet_tx_desc[64];
+var vnet_tx_avail[8];
+var vnet_tx_used[8];
+var vnet_rx_desc[64];
+var vnet_rx_avail[8];
+var vnet_rx_used[8];
+var vnet_tx_buf[256];
+var vnet_rx_buf[256];
+var vnet_tx_idx = 0;
+var vnet_rx_idx = 0;
+var vnet_active = 0;
+
+fn virtio_net_init() {
+    var idx = pci_find(0x1AF4, 0x1000);
+    if (idx < 0) { return 0 - 1; }
+    var bar0 = load64(&pci_devs + idx * 32 + 24);
+    vnet_iobase = bar0 & 0xFFFC;
+
+    # Reset device
+    outb(vnet_iobase + 18, 0);
+    # Set ACKNOWLEDGE (1)
+    outb(vnet_iobase + 18, 1);
+    # Set DRIVER (2)
+    outb(vnet_iobase + 18, 3);
+
+    # Read device features, accept MAC feature (bit 5) + any others
+    var features = inl(vnet_iobase);
+    outl(vnet_iobase + 4, features);
+
+    # Set up TX queue (queue 0)
+    outw(vnet_iobase + 14, 0);
+    var tx_qsz = inw(vnet_iobase + 12);
+    # Queue address = physical page number of descriptor table
+    # We use vnet_tx_desc as the queue memory (already in identity-mapped space)
+    var tx_addr = &vnet_tx_desc;
+    outl(vnet_iobase + 8, tx_addr / 4096);
+
+    # Set up RX queue (queue 1)
+    outw(vnet_iobase + 14, 1);
+    var rx_qsz = inw(vnet_iobase + 12);
+    var rx_addr = &vnet_rx_desc;
+    outl(vnet_iobase + 8, rx_addr / 4096);
+
+    # Populate RX descriptors (1 descriptor pointing to rx_buf)
+    store64(&vnet_rx_desc, &vnet_rx_buf);
+    store32(&vnet_rx_desc + 8, 2048);
+    store16(&vnet_rx_desc + 12, 2);
+    store16(&vnet_rx_desc + 14, 0);
+    # RX avail ring: flags=0, idx=1, ring[0]=0
+    store16(&vnet_rx_avail, 0);
+    store16(&vnet_rx_avail + 2, 1);
+    store16(&vnet_rx_avail + 4, 0);
+
+    vnet_tx_idx = 0;
+    vnet_rx_idx = 0;
+
+    # Set DRIVER_OK — legacy: status = ACKNOWLEDGE | DRIVER | DRIVER_OK = 7
+    outb(vnet_iobase + 18, 7);
+
+    # Read MAC address (device-specific config at offset 20 in legacy mode)
+    # Only valid if VIRTIO_NET_F_MAC (bit 5) is in features
+    if ((features & 0x20) != 0) {
+        for (var i = 0; i < 6; i = i + 1) {
+            store8(&vnet_mac + i, inb(vnet_iobase + 20 + i));
+        }
+    }
+
+    # Notify RX queue to start receiving
+    outw(vnet_iobase + 16, 1);
+
+    vnet_active = 1;
+    return 0;
+}
+
+fn virtio_net_send(buf, len) {
+    if (vnet_active == 0) { return 0 - 1; }
+    if (len > 1500) { return 0 - 1; }
+    # Virtio net header (10 bytes for legacy): all zeros
+    var hdr_len = 10;
+    for (var i = 0; i < hdr_len; i = i + 1) {
+        store8(&vnet_tx_buf + i, 0);
+    }
+    # Copy packet data after header
+    for (var i = 0; i < len; i = i + 1) {
+        store8(&vnet_tx_buf + hdr_len + i, load8(buf + i));
+    }
+    # Set up TX descriptor
+    store64(&vnet_tx_desc, &vnet_tx_buf);
+    store32(&vnet_tx_desc + 8, hdr_len + len);
+    store16(&vnet_tx_desc + 12, 0);
+    store16(&vnet_tx_desc + 14, 0);
+    # TX avail ring
+    store16(&vnet_tx_avail, 0);
+    store16(&vnet_tx_avail + 2, vnet_tx_idx + 1);
+    store16(&vnet_tx_avail + 4, 0);
+    vnet_tx_idx = vnet_tx_idx + 1;
+    # Notify TX queue
+    outw(vnet_iobase + 16, 0);
+    return len;
+}
+
+fn virtio_net_mac(dst) {
+    for (var i = 0; i < 6; i = i + 1) {
+        store8(dst + i, load8(&vnet_mac + i));
+    }
+    return 0;
+}

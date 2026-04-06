@@ -1,0 +1,22 @@
+# === Serial I/O ===
+
+fn serial_putc(c) {
+    var ch = c;
+    asm { 0xBA; 0xFD; 0x03; 0x00; 0x00; 0xEC; 0xA8; 0x20; 0x74; 0xFB; }
+    asm { 0x8A; 0x45; 0xF0; 0xBA; 0xF8; 0x03; 0x00; 0x00; 0xEE; }
+    return 0;
+}
+
+fn serial_print(msg, len) {
+    for (var i = 0; i < len; i = i + 1) {
+        serial_putc(load8(msg + i));
+    }
+    return 0;
+}
+
+fn serial_println(msg, len) {
+    serial_print(msg, len);
+    serial_putc(13);
+    serial_putc(10);
+    return 0;
+}

@@ -1,0 +1,72 @@
+# === VFS ===
+var vfs_table[128];
+
+fn vfs_init() {
+    for (var i = 0; i < 128; i = i + 1) { store64(&vfs_table + i * 8, 0); }
+    # FD 0 = serial device (type=1, data=device index 0)
+    store64(&vfs_table, 1);
+    store64(&vfs_table + 24, 0);
+    return 0;
+}
+
+fn vfs_alloc() {
+    for (var i = 1; i < 32; i = i + 1) {
+        if (load64(&vfs_table + i * 32) == 0) { return i; }
+    }
+    return 0 - 1;
+}
+
+fn vfs_create_memfile(data, size) {
+    var idx = vfs_alloc();
+    if (idx < 0) { return 0 - 1; }
+    var base = &vfs_table + idx * 32;
+    store64(base, 2);
+    store64(base + 8, 0);
+    store64(base + 16, size);
+    store64(base + 24, data);
+    return idx;
+}
+
+fn vfs_read(fd_idx, buf, count) {
+    if (fd_idx < 0) { return 0 - 1; }
+    if (fd_idx >= 32) { return 0 - 1; }
+    var base = &vfs_table + fd_idx * 32;
+    var ftype = load64(base);
+    if (ftype == 0) { return 0 - 1; }
+    if (ftype == 1) {
+        # Device: data field = device index
+        return dev_read(load64(base + 24), buf, count);
+    }
+    if (ftype == 2) {
+        var pos = load64(base + 8);
+        var fsize = load64(base + 16);
+        var data = load64(base + 24);
+        var avail = fsize - pos;
+        if (avail < 1) { return 0; }
+        if (count > avail) { count = avail; }
+        for (var i = 0; i < count; i = i + 1) {
+            store8(buf + i, load8(data + pos + i));
+        }
+        store64(base + 8, pos + count);
+        return count;
+    }
+    return 0 - 1;
+}
+
+fn vfs_write(fd_idx, buf, count) {
+    if (fd_idx < 0) { return 0 - 1; }
+    if (fd_idx >= 32) { return 0 - 1; }
+    var base = &vfs_table + fd_idx * 32;
+    var ftype = load64(base);
+    if (ftype == 1) {
+        return dev_write(load64(base + 24), buf, count);
+    }
+    return 0 - 1;
+}
+
+fn vfs_close(fd_idx) {
+    if (fd_idx < 0) { return 0 - 1; }
+    if (fd_idx >= 32) { return 0 - 1; }
+    store64(&vfs_table + fd_idx * 32, 0);
+    return 0;
+}

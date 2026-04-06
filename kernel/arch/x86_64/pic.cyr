@@ -1,0 +1,92 @@
+# === PIC + Timer ===
+
+fn pic_init() {
+    # Remap PIC: IRQ 0-7 → INT 32-39, IRQ 8-15 → INT 40-47
+    # ICW1: init + ICW4 needed
+    asm { 0xB0; 0x11; 0xBA; 0x20; 0x00; 0x00; 0x00; 0xEE; }  # out 0x20, 0x11
+    asm { 0xB0; 0x11; 0xBA; 0xA0; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA0, 0x11
+    # ICW2: vector offsets
+    asm { 0xB0; 0x20; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0x20 (IRQ0=INT32)
+    asm { 0xB0; 0x28; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0x28 (IRQ8=INT40)
+    # ICW3: master has slave on IRQ2, slave ID=2
+    asm { 0xB0; 0x04; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0x04
+    asm { 0xB0; 0x02; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0x02
+    # ICW4: 8086 mode
+    asm { 0xB0; 0x01; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0x01
+    asm { 0xB0; 0x01; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0x01
+    # Mask all IRQs except IRQ0 (timer) + IRQ1 (keyboard)
+    asm { 0xB0; 0xFC; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0xFC
+    asm { 0xB0; 0xFF; 0xBA; 0xA1; 0x00; 0x00; 0x00; 0xEE; }  # out 0xA1, 0xFF
+    # Program PIT channel 0: mode 2 (rate generator), ~100 Hz
+    # Command: channel 0, lobyte/hibyte, mode 2, binary
+    # out 0x43, 0x34
+    asm { 0xB0; 0x34; 0xBA; 0x43; 0x00; 0x00; 0x00; 0xEE; }
+    # Divisor = 1193180 / 100 = 11932 = 0x2E9C
+    # out 0x40, low byte
+    asm { 0xB0; 0x9C; 0xBA; 0x40; 0x00; 0x00; 0x00; 0xEE; }
+    # out 0x40, high byte
+    asm { 0xB0; 0x2E; 0xBA; 0x40; 0x00; 0x00; 0x00; 0xEE; }
+    return 0;
+}
+
+# Timer ISR handler — called from the ISR bytecode after regs are pushed.
+# rsp_after_push is the stack pointer with all 9 regs + hardware frame on it.
+fn timer_handler(rsp_after_push) {
+    timer_ticks = timer_ticks + 1;
+    do_context_switch(rsp_after_push);
+    # EOI: APIC if enabled, otherwise legacy PIC
+    if (apic_enabled == 1) {
+        apic_eoi();
+    } else {
+        asm { 0xB0; 0x20; 0xBA; 0x20; 0x00; 0x00; 0x00; 0xEE; }
+    }
+    return 0;
+}
+
+fn timer_isr_build() {
+    # Build timer ISR in data buffer.
+    # Strategy: push all caller-saved regs, also push rbx/rbp/r12-r15 (callee-saved)
+    # so we have full state. Then call timer_handler(rsp) which may modify
+    # the stack frame for context switching. Then pop everything and iretq.
+    var p = &timer_isr;
+    var handler_addr = &timer_handler;
+    var off = 0;
+
+    # Save ALL general-purpose registers (not just caller-saved)
+    # Order: rax rcx rdx rsi rdi r8 r9 r10 r11 (9 regs = caller-saved)
+    # We save these so the ISR stack frame matches what proc_save/restore expect
+    store8(p + off, 0x50); off = off + 1;  # push rax
+    store8(p + off, 0x51); off = off + 1;  # push rcx
+    store8(p + off, 0x52); off = off + 1;  # push rdx
+    store8(p + off, 0x56); off = off + 1;  # push rsi
+    store8(p + off, 0x57); off = off + 1;  # push rdi
+    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;  # push r8
+    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;  # push r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;  # push r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;  # push r11
+
+    # rdi = rsp (pass stack pointer as first arg to timer_handler)
+    # mov rdi, rsp (48 89 E7)
+    store8(p + off, 0x48); store8(p + off + 1, 0x89); store8(p + off + 2, 0xE7); off = off + 3;
+
+    # call timer_handler: mov rax, imm64; call rax
+    # mov rax, handler_addr (48 B8 imm64)
+    store8(p + off, 0x48); store8(p + off + 1, 0xB8); off = off + 2;
+    store64(p + off, handler_addr); off = off + 8;
+    # call rax (FF D0)
+    store8(p + off, 0xFF); store8(p + off + 1, 0xD0); off = off + 2;
+
+    # Restore r11-r8, rdi, rsi, rdx, rcx, rax (reverse order)
+    store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;  # pop r11
+    store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;  # pop r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x59); off = off + 2;  # pop r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x58); off = off + 2;  # pop r8
+    store8(p + off, 0x5F); off = off + 1;  # pop rdi
+    store8(p + off, 0x5E); off = off + 1;  # pop rsi
+    store8(p + off, 0x5A); off = off + 1;  # pop rdx
+    store8(p + off, 0x59); off = off + 1;  # pop rcx
+    store8(p + off, 0x58); off = off + 1;  # pop rax
+    # iretq
+    store8(p + off, 0x48); store8(p + off + 1, 0xCF);
+    return 0;
+}
