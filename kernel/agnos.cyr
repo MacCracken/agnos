@@ -129,33 +129,50 @@ fn pic_init() {
     return 0;
 }
 
+# Timer ISR handler — called from the ISR bytecode after regs are pushed.
+# rsp_after_push is the stack pointer with all 9 regs + hardware frame on it.
+fn timer_handler(rsp_after_push) {
+    timer_ticks = timer_ticks + 1;
+    # Context switch if scheduler is active
+    do_context_switch(rsp_after_push);
+    # EOI to PIC
+    asm { 0xB0; 0x20; 0xBA; 0x20; 0x00; 0x00; 0x00; 0xEE; }
+    return 0;
+}
+
 fn timer_isr_build() {
-    # Build timer ISR in data buffer: save regs, inc ticks, EOI, restore, iretq
+    # Build timer ISR in data buffer.
+    # Strategy: push all caller-saved regs, also push rbx/rbp/r12-r15 (callee-saved)
+    # so we have full state. Then call timer_handler(rsp) which may modify
+    # the stack frame for context switching. Then pop everything and iretq.
     var p = &timer_isr;
-    var ta = &timer_ticks;
+    var handler_addr = &timer_handler;
     var off = 0;
-    # Save all caller-saved registers: rax rcx rdx rsi rdi r8 r9 r10 r11
+
+    # Save ALL general-purpose registers (not just caller-saved)
+    # Order: rax rcx rdx rsi rdi r8 r9 r10 r11 (9 regs = caller-saved)
+    # We save these so the ISR stack frame matches what proc_save/restore expect
     store8(p + off, 0x50); off = off + 1;  # push rax
     store8(p + off, 0x51); off = off + 1;  # push rcx
     store8(p + off, 0x52); off = off + 1;  # push rdx
     store8(p + off, 0x56); off = off + 1;  # push rsi
     store8(p + off, 0x57); off = off + 1;  # push rdi
-    # push r8-r11 (41 50, 41 51, 41 52, 41 53)
-    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;
-    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;
-    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;
-    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;
-    # mov rcx, tick_addr (48 B9 imm64)
-    store8(p + off, 0x48); store8(p + off + 1, 0xB9); off = off + 2;
-    store64(p + off, ta); off = off + 8;
-    # mov rax, [rcx]; inc rax; mov [rcx], rax
-    store8(p + off, 0x48); store8(p + off + 1, 0x8B); store8(p + off + 2, 0x01); off = off + 3;
-    store8(p + off, 0x48); store8(p + off + 1, 0xFF); store8(p + off + 2, 0xC0); off = off + 3;
-    store8(p + off, 0x48); store8(p + off + 1, 0x89); store8(p + off + 2, 0x01); off = off + 3;
-    # EOI: mov al,0x20; mov edx,0x20; out dx,al
-    store8(p + off, 0xB0); store8(p + off + 1, 0x20); off = off + 2;
-    store8(p + off, 0xBA); store64(p + off + 1, 0x20); off = off + 5;
-    store8(p + off, 0xEE); off = off + 1;
+    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;  # push r8
+    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;  # push r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;  # push r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;  # push r11
+
+    # rdi = rsp (pass stack pointer as first arg to timer_handler)
+    # mov rdi, rsp (48 89 E7)
+    store8(p + off, 0x48); store8(p + off + 1, 0x89); store8(p + off + 2, 0xE7); off = off + 3;
+
+    # call timer_handler: mov rax, imm64; call rax
+    # mov rax, handler_addr (48 B8 imm64)
+    store8(p + off, 0x48); store8(p + off + 1, 0xB8); off = off + 2;
+    store64(p + off, handler_addr); off = off + 8;
+    # call rax (FF D0)
+    store8(p + off, 0xFF); store8(p + off + 1, 0xD0); off = off + 2;
+
     # Restore r11-r8, rdi, rsi, rdx, rcx, rax (reverse order)
     store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;  # pop r11
     store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;  # pop r10
@@ -404,36 +421,53 @@ fn vmm_alloc_at(virt) {
 }
 
 # === Process Abstraction ===
-# Minimal process table: ID, state, stack pointer, instruction pointer
+# Full process context for real context switching.
+# Layout per process (160 bytes = 20 fields x 8 bytes):
+#   0: pid       8: state     16: rsp      24: rip
+#  32: rax      40: rbx       48: rcx      56: rdx
+#  64: rsi      72: rdi       80: rbp      88: r8
+#  96: r9      104: r10      112: r11     120: r12
+# 128: r13     136: r14      144: r15     152: rflags
 
-struct Process { pid; state; rsp; rip; }
+var PROC_SIZE = 160;
 
-var proc_table[128];
+struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9; r10; r11; r12; r13; r14; r15; rflags; }
+
+var proc_table[2560];
 var proc_count = 0;
 var proc_current = 0;
+var sched_active = 0;
 
 var PROC_MAX = 16;
+
+# Process states: 0=halted, 1=ready, 2=running
 
 fn proc_create(entry) {
     if (proc_count >= PROC_MAX) { return 0 - 1; }
     var idx = proc_count;
-    var p = &proc_table + idx * 32;
-    store64(p, idx);         # pid
-    store64(p + 8, 1);       # state: 1=ready
-    store64(p + 16, 0);      # rsp (would be allocated stack)
-    store64(p + 24, entry);  # rip (entry point)
+    var p = &proc_table + idx * PROC_SIZE;
+    store64(p, idx);          # pid
+    store64(p + 8, 1);        # state: 1=ready
+    store64(p + 16, 0);       # rsp (set by proc_create_full)
+    store64(p + 24, entry);   # rip (entry point)
+    # Zero all register fields
+    for (var r = 32; r < PROC_SIZE; r = r + 8) {
+        store64(p + r, 0);
+    }
+    # Set initial RFLAGS: IF=1 (interrupts enabled)
+    store64(p + 152, 0x200);
     proc_count = proc_count + 1;
     return idx;
 }
 
 fn proc_get_state(pid) {
     if (pid >= proc_count) { return 0 - 1; }
-    return load64(&proc_table + pid * 32 + 8);
+    return load64(&proc_table + pid * PROC_SIZE + 8);
 }
 
 fn proc_set_state(pid, st) {
     if (pid >= proc_count) { return 0 - 1; }
-    store64(&proc_table + pid * 32 + 8, st);
+    store64(&proc_table + pid * PROC_SIZE + 8, st);
     return 0;
 }
 
@@ -520,36 +554,147 @@ fn elf_load(elf_addr, elf_size) {
 fn proc_create_full(entry, stack_top) {
     if (proc_count >= PROC_MAX) { return 0 - 1; }
     var idx = proc_count;
-    var p = &proc_table + idx * 32;
-    store64(p, idx);
-    store64(p + 8, 1);
-    store64(p + 16, stack_top);
-    store64(p + 24, entry);
+    var p = &proc_table + idx * PROC_SIZE;
+    store64(p, idx);          # pid
+    store64(p + 8, 1);        # state: 1=ready
+    store64(p + 16, stack_top); # rsp
+    store64(p + 24, entry);   # rip
+    # Zero all register fields
+    for (var r = 32; r < PROC_SIZE; r = r + 8) {
+        store64(p + r, 0);
+    }
+    # Set initial RFLAGS: IF=1 (interrupts enabled)
+    store64(p + 152, 0x200);
+    # Set rbp = stack_top (frame pointer)
+    store64(p + 80, stack_top);
     proc_count = proc_count + 1;
     return idx;
 }
 
-# === Context Switch ===
-# Save current process state, load next process state.
-# Called from timer ISR.
-
 # === Context Switch + Scheduler ===
-# Stub implementation: tracks state, actual register save/restore is TODO.
+# Real context switching: save/restore full register state via process table.
+# The timer ISR saves registers to the stack. context_switch reads them from
+# the ISR stack frame into the old process's slot, then loads the new process's
+# saved state onto the stack for iretq to restore.
 
 fn sched_next() {
-    # Round-robin: find next ready process after current
+    # Round-robin: find next ready (1) or running (2) process after current
     var start = proc_current + 1;
     var si = 0;
     while (si < proc_count) {
         var idx = start + si;
         if (idx >= proc_count) { idx = idx - proc_count; }
         if (proc_get_state(idx) == 1) {
-            proc_current = idx;
             return idx;
         }
         si = si + 1;
     }
     return proc_current;
+}
+
+# Save current process register state from ISR stack frame.
+# Called after ISR pushes: rax rcx rdx rsi rdi r8 r9 r10 r11
+# Plus hardware-pushed: RIP CS RFLAGS RSP SS (on interrupt frame)
+# We save these into the process table for later restoration.
+fn proc_save_context(pid, isr_rsp) {
+    if (pid >= proc_count) { return 0; }
+    var p = &proc_table + pid * PROC_SIZE;
+    # ISR stack layout (top to bottom, growing down):
+    # [isr_rsp+0]  = rax (pushed last by our ISR)
+    # [isr_rsp+8]  = rcx
+    # [isr_rsp+16] = rdx
+    # [isr_rsp+24] = rsi
+    # [isr_rsp+32] = rdi
+    # [isr_rsp+40] = r8
+    # [isr_rsp+48] = r9
+    # [isr_rsp+56] = r10
+    # [isr_rsp+64] = r11
+    # [isr_rsp+72] = RIP   (hardware pushed)
+    # [isr_rsp+80] = CS
+    # [isr_rsp+88] = RFLAGS
+    # [isr_rsp+96] = RSP   (hardware pushed — interrupted code's RSP)
+    # [isr_rsp+104]= SS
+    store64(p + 32, load64(isr_rsp));       # rax
+    store64(p + 48, load64(isr_rsp + 8));   # rcx
+    store64(p + 56, load64(isr_rsp + 16));  # rdx
+    store64(p + 64, load64(isr_rsp + 24));  # rsi
+    store64(p + 72, load64(isr_rsp + 32));  # rdi
+    store64(p + 88, load64(isr_rsp + 40));  # r8
+    store64(p + 96, load64(isr_rsp + 48));  # r9
+    store64(p + 104, load64(isr_rsp + 56)); # r10
+    store64(p + 112, load64(isr_rsp + 64)); # r11
+    store64(p + 24, load64(isr_rsp + 72));  # rip
+    store64(p + 152, load64(isr_rsp + 88)); # rflags
+    store64(p + 16, load64(isr_rsp + 96));  # rsp
+    return 0;
+}
+
+# Load a process's register state onto the ISR stack frame.
+# When iretq executes, it will restore RIP/CS/RFLAGS/RSP/SS from the stack,
+# and our ISR pops will restore the GPRs.
+fn proc_restore_context(pid, isr_rsp) {
+    if (pid >= proc_count) { return 0; }
+    var p = &proc_table + pid * PROC_SIZE;
+    store64(isr_rsp, load64(p + 32));       # rax
+    store64(isr_rsp + 8, load64(p + 48));   # rcx
+    store64(isr_rsp + 16, load64(p + 56));  # rdx
+    store64(isr_rsp + 24, load64(p + 64));  # rsi
+    store64(isr_rsp + 32, load64(p + 72));  # rdi
+    store64(isr_rsp + 40, load64(p + 88));  # r8
+    store64(isr_rsp + 48, load64(p + 96));  # r9
+    store64(isr_rsp + 56, load64(p + 104)); # r10
+    store64(isr_rsp + 64, load64(p + 112)); # r11
+    store64(isr_rsp + 72, load64(p + 24));  # rip
+    # CS = 0x08 (kernel code segment)
+    store64(isr_rsp + 80, 0x08);
+    store64(isr_rsp + 88, load64(p + 152)); # rflags
+    store64(isr_rsp + 96, load64(p + 16));  # rsp
+    # SS = 0x10 (kernel data segment)
+    store64(isr_rsp + 104, 0x10);
+    return 0;
+}
+
+# High-level context switch called from timer ISR handler.
+# isr_rsp = stack pointer after ISR has pushed all caller-saved regs.
+fn do_context_switch(isr_rsp) {
+    if (sched_active == 0) { return 0; }
+    if (proc_count < 2) { return 0; }
+
+    var old = proc_current;
+    var new_pid = sched_next();
+    if (new_pid == old) { return 0; }
+
+    # Save old process state
+    proc_save_context(old, isr_rsp);
+    if (proc_get_state(old) == 2) {
+        proc_set_state(old, 1);  # running → ready
+    }
+
+    # Load new process state
+    proc_current = new_pid;
+    proc_set_state(new_pid, 2);  # → running
+    proc_restore_context(new_pid, isr_rsp);
+    return 0;
+}
+
+# === Test Processes ===
+# Simple loop functions for context switch testing.
+# Each prints its ID to serial, then halts until next timer tick.
+
+fn test_proc_a() {
+    while (1 == 1) {
+        serial_print("A", 1);
+        asm { hlt; }
+    }
+    return 0;
+}
+
+fn test_proc_b() {
+    while (1 == 1) {
+        serial_print("B", 1);
+        asm { hlt; }
+    }
+    return 0;
 }
 
 # === Syscall Interface ===
@@ -695,19 +840,12 @@ serial_print(" (expect ", 9);
 kprint_num(0xDEAD);
 serial_println(")", 1);
 
-# Process table test
+# Syscall test
 proc_count = 0;
 proc_current = 0;
 var p0 = proc_create(0x100000);
-var p1 = proc_create(0x200000);
-var p2 = proc_create(0x300000);
-serial_print("Processes: ", 11);
-kprint_num(proc_count);
-serial_print(" created, ", 10);
-kprint_num(proc_count_by_state(1));
-serial_println(" ready", 6);
+proc_set_state(0, 2);  # kernel "process" is running
 
-# Syscall test
 var pid = ksyscall(2, 0, 0, 0);
 serial_print("Syscall getpid=", 15);
 kprint_num(pid);
@@ -720,37 +858,72 @@ serial_print("Exit code: ", 11);
 kprint_num(sys_exit_code);
 serial_println("", 0);
 
-# Scheduler test
-serial_print("Scheduler: next=", 17);
-var next = sched_next();
-kprint_num(next);
-serial_println("", 0);
+# === Context Switch Test ===
+# Create two test processes with dedicated stacks.
+# Process stacks at 0x800000 + pid * 0x10000, 64KB apart.
+# Stack grows down, so stack_top is base + size.
+serial_println("Creating test processes...", 25);
 
+proc_count = 0;
+proc_current = 0;
+
+# Process 0: kernel idle (the code running right now)
+var kern_pid = proc_create(0);
+proc_set_state(0, 2);  # running
+
+# Process 1: test_proc_a
+var stack_a = 0x800000 + 1 * 0x10000;
+if (vmm_is_mapped(stack_a) == 0) { vmm_alloc_at(stack_a); }
+var pa = proc_create_full(&test_proc_a, stack_a + 0x4000);
+serial_print("Process A (pid=", 16);
+kprint_num(pa);
+serial_println(") created", 9);
+
+# Process 2: test_proc_b
+var stack_b = 0x800000 + 2 * 0x10000;
+if (vmm_is_mapped(stack_b) == 0) { vmm_alloc_at(stack_b); }
+var pb = proc_create_full(&test_proc_b, stack_b + 0x4000);
+serial_print("Process B (pid=", 16);
+kprint_num(pb);
+serial_println(") created", 9);
+
+serial_print("Processes: ", 11);
+kprint_num(proc_count);
+serial_print(" total, ", 8);
+kprint_num(proc_count_by_state(1));
+serial_println(" ready", 6);
+
+# Enable interrupts and activate scheduler
 asm { sti; }
 serial_println("Interrupts enabled", 18);
 
-# Wait for a few timer ticks
+# Wait a few ticks before activating scheduler
 asm { hlt; }
 asm { hlt; }
-asm { hlt; }
-
-# Check for keyboard input
-serial_print("Keys: ", 6);
-while (kb_has_key() == 1) {
-    var sc = kb_read_scancode();
-    var ch = scancode_to_ascii(sc);
-    if (ch > 0) { serial_putc(ch); }
-}
-serial_println("", 0);
-
-# Report timer ticks
-serial_print("Timer ticks: ", 13);
+serial_print("Timer ticks before sched: ", 26);
 kprint_num(timer_ticks);
 serial_println("", 0);
 
-serial_println("AGNOS ready. Type keys (q to halt):", 36);
+serial_println("Activating scheduler...", 23);
+sched_active = 1;
 
-# Interactive keyboard loop
+# Kernel idle loop: halts, wakes on timer, scheduler switches to A or B
+# After enough ticks, deactivate and report
+var idle_count = 0;
+while (idle_count < 50) {
+    asm { hlt; }
+    idle_count = idle_count + 1;
+}
+
+# Deactivate scheduler, report results
+sched_active = 0;
+serial_println("", 0);
+serial_print("Scheduler test done. Timer ticks: ", 34);
+kprint_num(timer_ticks);
+serial_println("", 0);
+
+# Keyboard loop
+serial_println("AGNOS ready. Type keys (q to halt):", 36);
 var running = 1;
 while (running == 1) {
     asm { hlt; }
