@@ -152,6 +152,8 @@ fn idt_set_gate(base, handler, selector, attr) {
 fn idt_init() {
     # Build a tiny ISR stub: iretq (48 CF) at a known address
     # The stub is just 2 bytes but we need it at a fixed location
+    # NOTE: This default handler silently returns on any unexpected interrupt.
+    # For debugging, install vector-specific handlers that log to serial.
     store8(&isr_stub, 0x48);
     store8(&isr_stub + 1, 0xCF);
     var handler = &isr_stub;
@@ -314,17 +316,6 @@ fn apic_timer_init(vector, count) {
     return 0;
 }
 
-fn apic_send_ipi(target_apic_id, vector, delivery) {
-    # ICR high: destination APIC ID in bits 31:24
-    apic_write(0x310, target_apic_id << 24);
-    # ICR low: vector + delivery mode + level assert + dest mode
-    # delivery: 0=fixed, 5=INIT, 6=SIPI
-    apic_write(0x300, vector | (delivery << 8) | 0x4000);
-    # Wait for delivery (bit 12 of ICR low = delivery status)
-    while ((apic_read(0x300) & 0x1000) != 0) { }
-    return 0;
-}
-
 fn apic_send_init(target) {
     apic_write(0x310, target << 24);
     # INIT: delivery=5, level=assert, trigger=level
@@ -346,7 +337,7 @@ fn apic_send_sipi(target, vector) {
 
 # === SMP (Multi-Core) ===
 var cpu_count = 1;
-var ap_ready = 0;
+var ap_ready = 0;  # Set by APs on wakeup; read by BSP to confirm AP APIC ID
 var smp_lock = 0;
 
 fn spin_lock() {
@@ -771,6 +762,7 @@ fn pt_get_mapped_mb() {
 var pmm_bitmap[512];
 var pmm_total = 0;
 var pmm_used = 0;
+var pmm_next_free = 0;
 
 fn pmm_set(page) {
     if (page >= 4096) { return 0 - 1; }
@@ -801,20 +793,31 @@ fn pmm_init() {
     pmm_total = 4096;
     pmm_used = 0;
     # Mark first 2MB as used (kernel + page tables + stack)
-    # 2MB / 4KB = 512 pages = pages 0-511
-    for (var p = 0; p < 512; p = p + 1) {
-        pmm_set(p);
-        pmm_used = pmm_used + 1;
+    # 2MB / 4KB = 512 pages = pages 0-511 = 64 bytes of bitmap, all 0xFF
+    for (var i = 0; i < 64; i = i + 1) {
+        store8(&pmm_bitmap + i, 0xFF);
     }
+    pmm_used = 512;
+    pmm_next_free = 512;
     return 0;
 }
 
 fn pmm_alloc() {
-    # Find first free page
-    for (var i = 0; i < 4096; i = i + 1) {
+    # Find first free page, starting from hint for O(1) best-case
+    for (var i = pmm_next_free; i < 4096; i = i + 1) {
         if (pmm_test(i) == 0) {
             pmm_set(i);
             pmm_used = pmm_used + 1;
+            pmm_next_free = i + 1;
+            return i * 0x1000;
+        }
+    }
+    # Wrap around and search from beginning (fragmentation case)
+    for (var i = 0; i < pmm_next_free; i = i + 1) {
+        if (pmm_test(i) == 0) {
+            pmm_set(i);
+            pmm_used = pmm_used + 1;
+            pmm_next_free = i + 1;
             return i * 0x1000;
         }
     }
@@ -826,6 +829,8 @@ fn pmm_free(addr) {
     if (pmm_test(page) == 1) {
         pmm_clear(page);
         pmm_used = pmm_used - 1;
+        # Update hint so next alloc finds this freed page quickly
+        if (page < pmm_next_free) { pmm_next_free = page; }
     }
     return 0;
 }
@@ -844,7 +849,10 @@ fn pmm_free_count() {
 
 fn vmm_map(virt, phys, flags) {
     var pd_idx = (virt >> 21) & 0x1FF;
-    # flags should include all needed bits; ensure Present+2MB minimum
+    # NOTE: Forces Present (0x01) and 2MB page (0x80) bits via OR with 0x81.
+    # This means vmm_map always creates 2MB huge pages. Callers should pass
+    # 0x83 (kernel) or 0x87 (user) — the 2MB bit is enforced regardless.
+    # For future 4KB page support, use a different function with PT-level mapping.
     store64(0x3000 + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | flags | 0x81);
     # Flush TLB
     var flush = virt;
@@ -937,9 +945,9 @@ fn slab_grow(class_idx) {
     # Allocate a 4KB page from PMM
     var page = pmm_alloc();
     if (page == 0) { return 0 - 1; }
-    # Ensure it's mapped
+    # Ensure it's mapped (0x83 = Present+Writable+2MB page)
     if (vmm_is_mapped(page) == 0) {
-        vmm_map(page, page, 0x03);
+        vmm_map(page, page, 0x83);
     }
     # Divide page into blocks, chain them as a free list
     var blocks_per_page = 4096 / block_size;
@@ -973,9 +981,10 @@ fn kmalloc(size) {
     # Pop first free block
     var next = load64(head);
     store64(&slab_free + class_idx * 8, next);
-    # Zero the block (security: don't leak old data)
-    var block_size = load64(&slab_sizes + class_idx * 8);
-    for (var i = 0; i < block_size; i = i + 8) {
+    # Zero only the requested size (security: don't leak old data)
+    # Round up to 8-byte boundary for store64 alignment
+    var zero_len = (size + 7) & (~7);
+    for (var i = 0; i < zero_len; i = i + 8) {
         store64(head + i, 0);
     }
     heap_allocs = heap_allocs + 1;
@@ -2347,6 +2356,7 @@ fn sh_cmd_help() {
     serial_println("  lspci   - PCI devices", 23);
     serial_println("  net     - network info", 24);
     serial_println("  send    - send UDP msg", 24);
+    serial_println("  bench   - run benchmarks", 26);
     serial_println("  halt    - shutdown", 20);
     return 0;
 }
@@ -2375,6 +2385,82 @@ fn sh_cmd_free() {
     serial_print(" allocs, ", 9);
     kprint_num(heap_frees);
     serial_println(" frees", 6);
+    return 0;
+}
+
+fn rdtsc() {
+    # rdtsc: EDX:EAX = timestamp. No params, result at [rbp-0x08].
+    var result = 0;
+    asm {
+        0x0F; 0x31;                    # rdtsc
+        0x48; 0xC1; 0xE2; 0x20;       # shl rdx, 32
+        0x48; 0x09; 0xD0;              # or rax, rdx
+        0x48; 0x89; 0x45; 0xF8;       # mov [rbp-0x08], rax (result)
+    }
+    return result;
+}
+
+fn sh_cmd_bench() {
+    serial_println("=== AGNOS Benchmarks ===", 24);
+
+    # PMM: alloc+free x1000
+    var t0 = rdtsc();
+    for (var i = 0; i < 1000; i = i + 1) {
+        var pg = pmm_alloc();
+        pmm_free(pg);
+    }
+    var t1 = rdtsc();
+    serial_print("PMM alloc+free x1000: ", 22);
+    kprint_num((t1 - t0) / 1000);
+    serial_println(" cycles/op", 10);
+
+    # Syscall: getpid x10000
+    t0 = rdtsc();
+    for (var i = 0; i < 10000; i = i + 1) {
+        ksyscall(2, 0, 0, 0);
+    }
+    t1 = rdtsc();
+    serial_print("Syscall getpid x10000: ", 23);
+    kprint_num((t1 - t0) / 10000);
+    serial_println(" cycles/op", 10);
+
+    # Memory: write 1MB
+    var mem_pg = pmm_alloc();
+    t0 = rdtsc();
+    for (var i = 0; i < 256; i = i + 1) {
+        for (var j = 0; j < 4096; j = j + 8) {
+            store64(mem_pg + j, 0xDEADBEEF);
+        }
+    }
+    t1 = rdtsc();
+    pmm_free(mem_pg);
+    serial_print("Memwrite 1MB: ", 14);
+    kprint_num((t1 - t0) / 1000);
+    serial_println(" Kcycles", 8);
+
+    # Heap: kmalloc+kfree x1000
+    t0 = rdtsc();
+    for (var i = 0; i < 1000; i = i + 1) {
+        var p = kmalloc(64);
+        kfree_sized(p, 64);
+    }
+    t1 = rdtsc();
+    serial_print("Heap alloc+free x1000: ", 23);
+    kprint_num((t1 - t0) / 1000);
+    serial_println(" cycles/op", 10);
+
+    # Serial: write 1000 chars
+    t0 = rdtsc();
+    for (var i = 0; i < 1000; i = i + 1) {
+        serial_putc(46);
+    }
+    t1 = rdtsc();
+    serial_println("", 0);
+    serial_print("Serial putc x1000: ", 19);
+    kprint_num((t1 - t0) / 1000);
+    serial_println(" cycles/op", 10);
+
+    serial_println("=== done ===", 13);
     return 0;
 }
 
@@ -2464,6 +2550,7 @@ fn sh_exec(buf, len) {
         serial_println(" bytes", 6);
         return 0;
     }
+    if (sh_streq(buf, clen, "bench", 5) == 1) { return sh_cmd_bench(); }
     if (sh_streq(buf, clen, "halt", 4) == 1) { return 0 - 99; }
     serial_print("unknown: ", 9);
     serial_print(buf, clen);
@@ -2472,7 +2559,7 @@ fn sh_exec(buf, len) {
 }
 
 fn shell() {
-    serial_println("AGNOS shell v0.9 (type 'help')", 30);
+    serial_println("AGNOS shell v1.0 (type 'help')", 30);
     var sh_running = 1;
     while (sh_running == 1) {
         serial_print("agnos> ", 7);
@@ -2566,7 +2653,7 @@ asm {
 
 # === 64-bit Cyrius kernel code ===
 
-serial_println("AGNOS kernel v0.9", 17);
+serial_println("AGNOS kernel v1.0", 17);
 serial_println("64-bit long mode", 16);
 
 gdt_init();

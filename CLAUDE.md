@@ -6,7 +6,7 @@
 
 - **Type**: Bare-metal kernel binary (Cyrius language)
 - **License**: GPL-3.0-only
-- **Version**: 0.9.0
+- **Version**: 1.0.0
 - **Language**: Cyrius (self-hosting, zero external dependencies)
 - **Target**: x86_64 + aarch64 (cross-compilation supported)
 
@@ -98,20 +98,36 @@ agnos/
 
 ## Kernel Subsystems
 
-| Subsystem | Status | Functions |
-|-----------|--------|-----------|
-| Boot (multiboot1, 32→64 shim) | Complete | 2 |
-| Serial I/O | Complete | serial_init, serial_putc, serial_print, serial_println |
-| GDT | Complete | gdt_init (64-bit flat segments) |
-| IDT | Complete | idt_set_gate, idt_init (256 vectors) |
-| PIC | Complete | pic_init (ICW1-4, remap to 32+) |
-| Timer (PIT) | Complete | timer_isr_build (100Hz, bytecode ISR) |
-| Keyboard | Complete | kb_isr_build (scancode ring buffer, ASCII map) |
-| Page Tables | Complete | pt_map_2mb, pt_init (16MB identity map) |
-| PMM | Complete | pmm_init/set/clear/test/alloc/free (bitmap) |
-| VMM | Complete | vmm_map/unmap/is_mapped/alloc_at (2MB pages) |
-| Process Table | Complete | proc_create/get_state/set_state (16 slots) |
-| Syscalls | Complete | ksyscall: exit(0), write(1), getpid(2) |
+| Subsystem | Status | Description |
+|-----------|--------|-------------|
+| Boot (multiboot1, 32→64 shim) | Complete | 32-bit ELF entry, long mode transition |
+| Serial I/O | Complete | COM1 (0x3F8), init/putc/print/println |
+| GDT | Complete | 5 segments + TSS descriptor |
+| TSS | Complete | Ring 3 transitions, RSP0 |
+| IDT | Complete | 256 vectors, default iretq handler |
+| PIC | Complete | 8259A, ICW1-4, remap to INT 32+ |
+| Local APIC | Complete | MMIO at 0xFEE00000, timer, IPI |
+| Timer (APIC) | Complete | Periodic ~100Hz |
+| Keyboard | Complete | PS/2, full US QWERTY, shift/caps/ctrl |
+| Page Tables | Complete | 2MB huge pages, 16MB identity map, per-process |
+| PMM | Complete | Bitmap, 4096 pages, next-free hint optimization |
+| VMM | Complete | map/unmap/alloc, user-accessible pages |
+| Kernel Heap | Complete | Slab allocator, 8 size classes (32-4096B) |
+| Process Table | Complete | 16 slots, 168B context, CR3 per-process |
+| Context Switch | Complete | Full register save/restore, CR3 switch |
+| Scheduler | Complete | Round-robin |
+| SYSCALL/SYSRET | Complete | MSR setup, ring 3 transition |
+| ELF Loader | Complete | Static ELF64, per-process address space |
+| VFS | Complete | File table, device/memfile types |
+| Device Drivers | Complete | Serial char device |
+| Initrd | Complete | Flat format, name lookup |
+| PCI Bus | Complete | Config space scan, device discovery |
+| VirtIO-Net | Complete | Legacy PCI, virtqueues, Ethernet frames |
+| IP/UDP Stack | Complete | ARP, IPv4, UDP send |
+| SMP Infrastructure | Complete | APIC, IPI, trampoline, per-CPU stacks |
+| Shell | Complete | 12 commands: help echo ps free cat uptime lspci cpus net send bench halt |
+| kybernet Init | Complete | PID 1 |
+| Syscalls | Complete | exit(0), write(1), getpid(2), spawn(3), waitpid(4), read(5), close(6), open(7) |
 
 ## DO NOT
 
