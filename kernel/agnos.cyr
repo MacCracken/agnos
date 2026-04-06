@@ -6,7 +6,7 @@ kernel;
 # === Kernel data ===
 var gdt[64];
 var gdt_ptr[16];
-var idt[4096];
+var idt[512];
 var idt_ptr[16];
 var isr_stub[16];
 var timer_ticks = 0;
@@ -408,7 +408,7 @@ fn vmm_alloc_at(virt) {
 
 struct Process { pid; state; rsp; rip; }
 
-var proc_table[512];
+var proc_table[128];
 var proc_count = 0;
 var proc_current = 0;
 
@@ -443,6 +443,113 @@ fn proc_count_by_state(st) {
         if (proc_get_state(i) == st) { n = n + 1; }
     }
     return n;
+}
+
+# === ELF Loader ===
+# Load a static ELF64 binary from memory address into a new process.
+# Returns pid or -1 on error.
+
+fn elf_load(elf_addr, elf_size) {
+    # Verify ELF magic: 0x7F 'E' 'L' 'F'
+    if (load8(elf_addr) != 0x7F) { return 0 - 1; }
+    if (load8(elf_addr + 1) != 0x45) { return 0 - 1; }
+    if (load8(elf_addr + 2) != 0x4C) { return 0 - 1; }
+    if (load8(elf_addr + 3) != 0x46) { return 0 - 1; }
+    # Must be 64-bit (class = 2)
+    if (load8(elf_addr + 4) != 2) { return 0 - 1; }
+
+    # Read entry point (e_entry at offset 24)
+    var entry = load64(elf_addr + 24);
+
+    # Read program header offset (e_phoff at offset 32)
+    var phoff = load64(elf_addr + 32);
+    # Read program header entry size (e_phentsize at offset 54)
+    var phentsize = load16(elf_addr + 54);
+    # Read program header count (e_phnum at offset 56)
+    var phnum = load16(elf_addr + 56);
+
+    # Process each program header
+    for (var phi = 0; phi < phnum; phi = phi + 1) {
+        var ph = elf_addr + phoff + phi * phentsize;
+        var p_type = load32(ph);
+        if (p_type == 1) {
+            # PT_LOAD — map this segment
+            var p_offset = load64(ph + 8);
+            var p_vaddr = load64(ph + 16);
+            var p_filesz = load64(ph + 32);
+            var p_memsz = load64(ph + 40);
+
+            # Allocate pages for this segment
+            var page_start = p_vaddr & 0xFFFFFFFFFFE00000;
+            var page_end = (p_vaddr + p_memsz + 0x1FFFFF) & 0xFFFFFFFFFFE00000;
+            var pg = page_start;
+            while (pg < page_end) {
+                if (vmm_is_mapped(pg) == 0) {
+                    vmm_alloc_at(pg);
+                }
+                pg = pg + 0x200000;
+            }
+
+            # Copy segment data
+            var ci = 0;
+            while (ci < p_filesz) {
+                store8(p_vaddr + ci, load8(elf_addr + p_offset + ci));
+                ci = ci + 1;
+            }
+            # Zero BSS (memsz > filesz)
+            while (ci < p_memsz) {
+                store8(p_vaddr + ci, 0);
+                ci = ci + 1;
+            }
+        }
+    }
+
+    # Allocate a 4KB stack for the process (at 0x800000 + pid * 0x10000)
+    var pid = proc_count;
+    var stack_base = 0x800000 + pid * 0x10000;
+    if (vmm_is_mapped(stack_base) == 0) {
+        vmm_alloc_at(stack_base);
+    }
+    var stack_top = stack_base + 0x4000;
+
+    # Create process
+    return proc_create_full(entry, stack_top);
+}
+
+# Extended process creation with stack
+fn proc_create_full(entry, stack_top) {
+    if (proc_count >= PROC_MAX) { return 0 - 1; }
+    var idx = proc_count;
+    var p = &proc_table + idx * 32;
+    store64(p, idx);
+    store64(p + 8, 1);
+    store64(p + 16, stack_top);
+    store64(p + 24, entry);
+    proc_count = proc_count + 1;
+    return idx;
+}
+
+# === Context Switch ===
+# Save current process state, load next process state.
+# Called from timer ISR.
+
+# === Context Switch + Scheduler ===
+# Stub implementation: tracks state, actual register save/restore is TODO.
+
+fn sched_next() {
+    # Round-robin: find next ready process after current
+    var start = proc_current + 1;
+    var si = 0;
+    while (si < proc_count) {
+        var idx = start + si;
+        if (idx >= proc_count) { idx = idx - proc_count; }
+        if (proc_get_state(idx) == 1) {
+            proc_current = idx;
+            return idx;
+        }
+        si = si + 1;
+    }
+    return proc_current;
 }
 
 # === Syscall Interface ===
@@ -611,6 +718,12 @@ ksyscall(1, "Syscall write works!\n", 21, 0);
 ksyscall(0, 42, 0, 0);
 serial_print("Exit code: ", 11);
 kprint_num(sys_exit_code);
+serial_println("", 0);
+
+# Scheduler test
+serial_print("Scheduler: next=", 17);
+var next = sched_next();
+kprint_num(next);
 serial_println("", 0);
 
 asm { sti; }
