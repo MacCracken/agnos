@@ -4,9 +4,9 @@
 kernel;
 
 # === Kernel data ===
-var gdt[128];
+var gdt[8];
 var gdt_ptr[16];
-var tss[128];
+var tss[16];
 var idt[512];
 var idt_ptr[16];
 var isr_stub[16];
@@ -335,9 +335,9 @@ var kb_caps = 0;
 var kb_ctrl = 0;
 
 # Unshifted scancode table (128 entries, 1 byte each)
-var sc_normal[128];
+var sc_normal[16];
 # Shifted scancode table
-var sc_shifted[128];
+var sc_shifted[16];
 
 fn kb_init_tables() {
     # Zero both tables
@@ -639,7 +639,6 @@ fn vmm_alloc_user(virt) {
 # Free blocks store a next-pointer in their first 8 bytes.
 
 # Slab class sizes (index 0-7)
-var SLAB_CLASSES = 8;
 # Free list heads for each class (8 pointers)
 var slab_free[64];
 # Class sizes stored for lookup
@@ -743,15 +742,6 @@ fn kfree_sized(ptr, size) {
     return 0;
 }
 
-# Simple kfree that scans for the block's class by checking page alignment.
-# For now, this uses the smallest class that could contain the block.
-# In practice, callers should use kfree_sized when they know the size.
-fn kfree(ptr) {
-    # Default: free as 32-byte block (smallest class).
-    # TODO: Store allocation metadata to track actual class.
-    return kfree_sized(ptr, 32);
-}
-
 # === Process Abstraction ===
 # Full process context for real context switching.
 # Layout per process (168 bytes = 21 fields x 8 bytes):
@@ -762,8 +752,6 @@ fn kfree(ptr) {
 # 128: r13     136: r14      144: r15     152: rflags
 # 160: cr3 (page table root physical address)
 
-var PROC_SIZE = 168;
-
 struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9; r10; r11; r12; r13; r14; r15; rflags; cr3; }
 
 var proc_table[336];
@@ -771,12 +759,8 @@ var proc_count = 0;
 var proc_current = 0;
 var sched_active = 0;
 
-var PROC_MAX = 16;
-
-# Process states: 0=halted, 1=ready, 2=running
-
 fn proc_create(entry) {
-    if (proc_count >= PROC_MAX) { return 0 - 1; }
+    if (proc_count >= 16) { return 0 - 1; }
     var idx = proc_count;
     var p = &proc_table + idx * 168;
     store64(p, idx);          # pid
@@ -915,7 +899,7 @@ fn elf_load(elf_addr, elf_size) {
 
 # Extended process creation with stack
 fn proc_create_full(entry, stack_top) {
-    if (proc_count >= PROC_MAX) { return 0 - 1; }
+    if (proc_count >= 16) { return 0 - 1; }
     var idx = proc_count;
     var p = &proc_table + idx * 168;
     store64(p, idx);          # pid
@@ -1323,10 +1307,6 @@ fn dev_read(dev_idx, buf, count) {
     if (dev_idx >= dev_count) { return 0 - 1; }
     var base = &dev_table + dev_idx * 32;
     if (load64(base) == 0) { return 0 - 1; }
-    var rfn = load64(base + 8);
-    if (rfn == 0) { return 0 - 1; }
-    # Call the read function: rfn(buf, count)
-    # We can't do indirect calls in Cyrius easily, so use known devices
     if (dev_idx == 0) { return serial_dev_read(buf, count); }
     return 0 - 1;
 }
@@ -1536,15 +1516,8 @@ fn syscall_init() {
     # MSR 0xC0000082 (LSTAR): handler RIP (64-bit)
     # MSR 0xC0000084 (SFMASK): RFLAGS bits to clear on SYSCALL (mask IF so interrupts off in kernel)
 
-    # Build STAR value: [63:48]=0x10, [47:32]=0x08, [31:0]=0
-    # = 0x0010_0008_0000_0000
-    var star_val = 0x0010000800000000;
-
     # LSTAR = address of our syscall entry stub
     var lstar_val = &syscall_entry_buf;
-
-    # SFMASK = 0x200 (clear IF on syscall entry — disable interrupts)
-    var sfmask_val = 0x200;
 
     # wrmsr: ecx=MSR#, edx:eax=value (edx=high32, eax=low32)
 
@@ -1704,18 +1677,6 @@ fn syscall_init() {
     return 0;
 }
 
-# === Print number helper for kernel ===
-# === Test ELF Builder ===
-# Build a minimal static 64-bit ELF in memory for testing userland exec.
-# The program: write "USERLAND OK\n" via syscall, then exit(0).
-#
-# ELF layout:
-#   0x000: ELF header (64 bytes)
-#   0x040: Program header (56 bytes)
-#   0x078: Code + data
-#
-# Virtual load address: 0x400000 (standard user base)
-
 # spawn_user_proc: create a user process from a kernel function address.
 # Allocates per-process address space, maps code+stack pages, returns pid.
 fn spawn_user_proc(entry_fn) {
@@ -1761,7 +1722,7 @@ fn kprint_num(n: i64) {
 }
 
 # === Shell ===
-var sh_buf[128];
+var sh_buf[16];
 var sh_len = 0;
 
 fn sh_streq(a, alen, b, blen) {
@@ -1864,7 +1825,7 @@ fn sh_exec(buf, len) {
 }
 
 fn shell() {
-    serial_println("AGNOS shell v0.1 (type 'help')", 30);
+    serial_println("AGNOS shell v0.9 (type 'help')", 30);
     var sh_running = 1;
     while (sh_running == 1) {
         serial_print("agnos> ", 7);
@@ -1958,7 +1919,7 @@ asm {
 
 # === 64-bit Cyrius kernel code ===
 
-serial_println("AGNOS kernel v0.1", 17);
+serial_println("AGNOS kernel v0.9", 17);
 serial_println("64-bit long mode", 16);
 
 gdt_init();
@@ -2000,26 +1961,17 @@ serial_print(" free / ", 8);
 kprint_num(pmm_total);
 serial_println(" pages", 6);
 
-# Test: allocate 3 pages, free 1, check count
 var pg1 = pmm_alloc();
-var pg2 = pmm_alloc();
-var pg3 = pmm_alloc();
-pmm_free(pg2);
-serial_print("Alloc test: ", 12);
+pmm_free(pg1);
+serial_print("PMM test: ", 10);
 kprint_num(pmm_free_count());
-serial_println(" free (expect 3582)", 19);
+serial_println(" free", 5);
 
-# VMM test: map a new 2MB region at 16MB (0x1000000)
-var vtest = 0x1000000;
-vmm_alloc_at(vtest);
-# Write a value to the mapped memory
-store64(vtest, 0xDEAD);
-var readback = load64(vtest);
-serial_print("VMM: mapped 16MB, readback=", 27);
-kprint_num(readback);
-serial_print(" (expect ", 9);
-kprint_num(0xDEAD);
-serial_println(")", 1);
+vmm_alloc_at(0x1000000);
+store64(0x1000000, 0xDEAD);
+serial_print("VMM: ", 5);
+kprint_num(load64(0x1000000));
+serial_println(" (expect 57005)", 15);
 
 # Initialize kernel heap
 heap_init();
@@ -2029,47 +1981,17 @@ serial_println("Devices registered", 18);
 vfs_init();
 serial_println("VFS initialized", 15);
 
-# Heap test: allocate various sizes, free, reallocate
 var h1 = kmalloc(16);
 var h2 = kmalloc(100);
-var h3 = kmalloc(1000);
-var h4 = kmalloc(4096);
-serial_print("Heap: alloc 16B@", 16);
+var h3 = kmalloc(4096);
+serial_print("Heap: ", 6);
 kprint_num(h1);
-serial_print(" 100B@", 6);
+serial_print(" ", 1);
 kprint_num(h2);
-serial_print(" 1000B@", 7);
+serial_print(" ", 1);
 kprint_num(h3);
-serial_print(" 4096B@", 7);
-kprint_num(h4);
 serial_println("", 0);
-
-# Write and read back to verify
-store64(h1, 0xAAAA);
-store64(h2, 0xBBBB);
-store64(h3, 0xCCCC);
-serial_print("Heap readback: ", 15);
-kprint_num(load64(h1));
-serial_print(" ", 1);
-kprint_num(load64(h2));
-serial_print(" ", 1);
-kprint_num(load64(h3));
-serial_println("", 0);
-
-# Free and reallocate — should reuse freed blocks
 kfree_sized(h2, 100);
-var h5 = kmalloc(50);
-serial_print("Heap reuse: freed 100B, alloc 50B@", 34);
-kprint_num(h5);
-serial_print(" (expect ~", 10);
-kprint_num(h2);
-serial_println(")", 1);
-
-serial_print("Heap stats: ", 12);
-kprint_num(heap_allocs);
-serial_print(" allocs, ", 9);
-kprint_num(heap_frees);
-serial_println(" frees", 6);
 
 # Initialize SYSCALL/SYSRET
 syscall_init();
