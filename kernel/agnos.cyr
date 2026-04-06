@@ -22,26 +22,34 @@ include "arch/x86_64/ring3.cyr"
 #ifdef ARCH_AARCH64
 include "arch/aarch64/boot_data.cyr"
 include "arch/aarch64/serial.cyr"
+include "arch/aarch64/gic.cyr"
+include "arch/aarch64/timer.cyr"
+include "arch/aarch64/exceptions.cyr"
+include "arch/aarch64/keyboard.cyr"
+include "arch/aarch64/paging.cyr"
+include "arch/aarch64/stubs.cyr"
 #endif
 
-# Architecture-independent core (requires arch layer above)
-#ifdef ARCH_X86_64
+# Architecture-independent core
 include "core/pmm.cyr"
-include "core/vmm.cyr"
 include "core/heap.cyr"
 include "core/proc.cyr"
-include "core/sched.cyr"
-include "core/elf.cyr"
 include "core/vfs.cyr"
 include "core/devs.cyr"
-include "core/pci.cyr"
-include "core/virtio_net.cyr"
-include "core/net.cyr"
 include "core/initrd.cyr"
-include "core/syscall.cyr"
 include "core/kprint.cyr"
 include "user/shell.cyr"
 include "user/init.cyr"
+
+# Architecture-specific extensions + boot
+#ifdef ARCH_X86_64
+include "core/vmm.cyr"
+include "core/sched.cyr"
+include "core/elf.cyr"
+include "core/pci.cyr"
+include "core/virtio_net.cyr"
+include "core/net.cyr"
+include "core/syscall.cyr"
 include "user/test_procs.cyr"
 include "arch/x86_64/boot_shim.cyr"
 include "core/main.cyr"

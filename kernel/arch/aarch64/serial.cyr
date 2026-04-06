@@ -1,7 +1,13 @@
 # aarch64 serial I/O — PL011 UART at 0x09000000 (QEMU virt)
+# Registers: DR(0x00), FR(0x18), IBRD(0x24), FBRD(0x28), LCR(0x2C), CR(0x30)
+# FR bit 5 = TXFF (TX FIFO full), bit 4 = RXFE (RX FIFO empty)
+
+var uart_base = 0x09000000;
 
 fn serial_putc(c) {
-    store8(0x09000000, c);
+    # Wait for TX FIFO not full (FR bit 5 = 0)
+    while ((load32(0x09000018) & 0x20) != 0) { }
+    store32(0x09000000, c);
     return 0;
 }
 

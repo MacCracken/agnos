@@ -1,0 +1,57 @@
+# aarch64 ARM generic timer
+# Uses virtual timer (EL1): CNTV_TVAL_EL0, CNTV_CTL_EL0
+# Timer IRQ: PPI 27 (GIC IRQ 27)
+var timer_ticks = 0;
+var timer_interval = 0;
+
+fn timer_read_freq() {
+    # MRS x0, CNTFRQ_EL0 = D5 3B E0 00 (LE: 00 E0 3B D5)
+    var freq = 0;
+    asm {
+        0x00; 0xE0; 0x3B; 0xD5;
+        0xE0; 0x03; 0x00; 0xF9;
+    }
+    return freq;
+}
+
+fn timer_read_count() {
+    # MRS x0, CNTVCT_EL0 = D5 3B E0 42 (LE: 42 E0 3B D5)
+    var count = 0;
+    asm {
+        0x42; 0xE0; 0x3B; 0xD5;
+        0xE0; 0x03; 0x00; 0xF9;
+    }
+    return count;
+}
+
+fn timer_init(hz) {
+    var freq = timer_read_freq();
+    if (freq == 0) { freq = 62500000; }
+    timer_interval = freq / hz;
+    # Set timer value: MSR CNTV_TVAL_EL0, x0 = D5 1B E3 00 (LE: 00 E3 1B D5)
+    var tval = timer_interval;
+    asm {
+        0xE0; 0x03; 0x40; 0xF9;
+        0x00; 0xE3; 0x1B; 0xD5;
+    }
+    # Enable timer: MSR CNTV_CTL_EL0, x0 = D5 1B E3 20 (LE: 20 E3 1B D5)
+    var ctl = 1;
+    asm {
+        0xE0; 0x03; 0x40; 0xF9;
+        0x20; 0xE3; 0x1B; 0xD5;
+    }
+    # Enable timer IRQ in GIC (PPI 27)
+    gic_enable_irq(27);
+    return 0;
+}
+
+fn timer_handler_arm() {
+    timer_ticks = timer_ticks + 1;
+    # Reload timer
+    var tval = timer_interval;
+    asm {
+        0xE0; 0x03; 0x40; 0xF9;
+        0x00; 0xE3; 0x1B; 0xD5;
+    }
+    return 0;
+}

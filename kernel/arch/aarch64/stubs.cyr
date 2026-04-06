@@ -1,0 +1,92 @@
+# aarch64 stubs — provide interfaces that core/ expects from arch layer
+# These are no-ops or minimal implementations until full subsystems are built
+
+# Variables that core/ references
+var apic_enabled = 0;
+var sched_active = 0;
+var tss_kernel_stack = 0x40800000;
+var smp_lock = 0;
+var cpu_count = 1;
+var cpu_id = 0;
+
+# Timer (referenced by core/sched.cyr via timer_handler)
+fn apic_eoi() { return 0; }
+
+# Context switch stubs (x86-specific register save/restore)
+fn proc_save_context(pid, isr_rsp) { return 0; }
+fn proc_restore_context(pid, isr_rsp) { return 0; }
+fn do_context_switch(isr_rsp) { return 0; }
+
+# Ring 3 stubs
+fn enter_ring3(entry, user_rsp) { return 0; }
+fn exec_and_wait(entry, rsp, cr3) { return 0; }
+fn spawn_user_proc(entry_fn) { return 0 - 1; }
+fn tss_set_rsp0(rsp0) { return 0; }
+
+# SYSCALL/SYSRET stubs
+var syscall_entry_buf[8];
+var kernel_rsp_save = 0;
+var kernel_return_rsp = 0;
+var kernel_return_rip = 0;
+fn syscall_handler(a, b, c, d, e) { return 0; }
+fn syscall_init() { return 0; }
+
+# Kernel resume (x86-specific stack manipulation)
+fn kernel_resume() { return 0; }
+var sys_exit_code = 0;
+
+# Minimal syscall dispatch for shell
+fn ksyscall(num, arg1, arg2, arg3) {
+    if (num == 0) { sys_exit_code = arg1; return 0; }
+    if (num == 1) { return vfs_write(arg1, arg2, arg3); }
+    if (num == 2) { return proc_current; }
+    if (num == 5) { return vfs_read(arg1, arg2, arg3); }
+    if (num == 6) { return vfs_close(arg1); }
+    if (num == 7) { return initrd_open(arg1, arg2); }
+    return 0 - 1;
+}
+
+# SMP stubs
+fn spin_lock() { return 0; }
+fn spin_unlock() { return 0; }
+fn smp_start_aps() { return 0; }
+
+# PCI + VirtIO stubs (x86 port I/O based, not available on aarch64)
+var pci_devs[64];
+var pci_count = 0;
+var vnet_active = 0;
+var vnet_mac[8];
+var vnet_iobase = 0;
+fn pci_scan() { return 0; }
+fn pci_find(v, d) { return 0 - 1; }
+fn virtio_net_init() { return 0 - 1; }
+fn net_init(a, b, c) { return 0; }
+fn ip4(a, b, c, d) { return 0; }
+fn udp_send(a, b, c, d, e) { return 0 - 1; }
+
+# Port I/O (x86-only)
+fn outb(port, val) { return 0; }
+fn outw(port, val) { return 0; }
+fn outl(port, val) { return 0; }
+fn inb(port) { return 0; }
+fn inw(port) { return 0; }
+fn inl(port) { return 0; }
+
+# Page table helpers
+fn pt_map_2mb(base, idx, addr) { return 0; }
+fn proc_create_address_space() { return 0; }
+fn proc_map_page(cr3, virt, phys) { return 0; }
+
+# x86 test procs (not applicable)
+fn test_proc_a() { return 0; }
+fn test_proc_b() { return 0; }
+fn test_hw_syscall() { return 0; }
+fn user_test_proc() { return 0; }
+
+# rdtsc equivalent — use ARM counter
+fn rdtsc() {
+    var count = 0;
+    # MRS x0, CNTVCT_EL0
+    asm { 0x42; 0xE0; 0x3B; 0xD5; 0xE0; 0x03; 0x00; 0xF9; }
+    return count;
+}

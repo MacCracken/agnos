@@ -1,0 +1,31 @@
+# aarch64 exception vectors
+# ARM64 exception vector table: 16 entries x 128 bytes = 2KB, aligned to 2KB
+# We use a simple polling model for now (no async exception handling)
+# Future: build proper vector table in memory
+
+fn exceptions_init() {
+    # For now, we rely on polling (no async interrupts)
+    # The timer and UART are polled in the main loop
+    # TODO: set up VBAR_EL1 with proper exception vector table
+    return 0;
+}
+
+fn interrupts_enable() {
+    # Clear DAIF interrupt masks: MSR DAIFClr, #0xF
+    # Encoding: D5 03 42 1F (LE: 1F 42 03 D5)
+    asm { 0x1F; 0x42; 0x03; 0xD5; }
+    return 0;
+}
+
+fn interrupts_disable() {
+    # Set DAIF interrupt masks: MSR DAIFSet, #0xF
+    # Encoding: D5 03 42 DF (LE: DF 42 03 D5)
+    asm { 0xDF; 0x42; 0x03; 0xD5; }
+    return 0;
+}
+
+fn wfi() {
+    # Wait For Interrupt: WFI = D5 03 20 7F (LE: 7F 20 03 D5)
+    asm { 0x7F; 0x20; 0x03; 0xD5; }
+    return 0;
+}

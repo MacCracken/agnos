@@ -1,0 +1,38 @@
+# aarch64 paging — stub for now
+# QEMU virt loads kernel with MMU off (identity mapped)
+# For initial boot, we rely on flat physical addressing
+
+fn pt_init() {
+    # MMU is off on QEMU virt boot — all addresses are physical
+    # TODO: set up TCR_EL1, MAIR_EL1, TTBR0_EL1 for proper paging
+    return 0;
+}
+
+fn pt_get_mapped_mb() {
+    # Without MMU, all RAM is directly accessible
+    return 256;
+}
+
+fn vmm_map(virt, phys, flags) {
+    # No-op without MMU — identity mapped
+    return 0;
+}
+
+fn vmm_map_user(virt, phys) {
+    return vmm_map(virt, phys, 0);
+}
+
+fn vmm_unmap(virt) { return 0; }
+
+fn vmm_is_mapped(virt) {
+    # Everything is mapped without MMU
+    return 1;
+}
+
+fn vmm_alloc_at(virt) {
+    return virt;
+}
+
+fn vmm_alloc_user(virt) {
+    return virt;
+}

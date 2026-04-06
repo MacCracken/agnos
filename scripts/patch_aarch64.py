@@ -18,7 +18,8 @@ with open(sys.argv[1], 'rb') as f:
 # Entry at file offset 0x78 (ELF entry = 0x40000078)
 orig = struct.unpack_from('<I', d, 0x78)[0]
 imm26 = orig & 0x3FFFFFF
-target_off = 0x78 + imm26 * 4
+# +4: aarch64 compiler has off-by-one in kernel entry (lands on trailing ret)
+target_off = 0x78 + imm26 * 4 + 4
 
 # Append trampoline
 end = len(d)
@@ -35,6 +36,13 @@ struct.pack_into('<I', d, 0x78, 0x14000000 | (fwd & 0x3FFFFFF))
 ph_off = struct.unpack_from('<Q', d, 0x20)[0]
 struct.pack_into('<Q', d, ph_off + 0x20, len(d))
 struct.pack_into('<Q', d, ph_off + 0x28, len(d))
+
+import os
+# Debug
+print(f"  original branch imm26={imm26} target_file_off=0x{target_off:x}", file=os.sys.stderr)
+print(f"  trampoline at file_off=0x{end:x} back_offset={back} instructions", file=os.sys.stderr)
+fwd_check = fwd
+print(f"  initial branch fwd={fwd_check} instructions", file=os.sys.stderr)
 
 with open(sys.argv[2], 'wb') as f:
     f.write(d)

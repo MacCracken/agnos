@@ -1,4 +1,46 @@
-# aarch64 main — minimal boot to serial
+# aarch64 main — boot sequence for QEMU virt
+
 serial_println("AGNOS kernel v1.0 [aarch64]", 27);
 serial_println("64-bit ARM, PL011 UART", 22);
+
+gic_init();
+serial_println("GIC initialized", 15);
+
+timer_init(100);
+serial_print("Timer: freq=", 12);
+kprint_num(timer_read_freq());
+serial_println("Hz", 2);
+
+exceptions_init();
+serial_println("Exceptions ready", 16);
+
+pt_init();
+serial_println("MMU: flat physical (no paging)", 30);
+
+pmm_init();
+serial_print("PMM: ", 5);
+kprint_num(pmm_free_count());
+serial_print("/", 1);
+kprint_num(pmm_total);
+serial_println(" pages", 6);
+
+heap_init();
+serial_println("Heap initialized", 16);
+
+dev_init();
+vfs_init();
+serial_println("VFS + devices ready", 19);
+
+initrd_build_test(0x40700000);
+initrd_init(0x40700000);
+serial_println("Initrd mounted", 14);
+
+# Initialize process table
+proc_count = 0;
+proc_current = 0;
+var p0 = proc_create(0);
+
+serial_println("Launching kybernet...", 21);
+kybernet();
+
 serial_println("Halted.", 7);

@@ -1,0 +1,40 @@
+# aarch64 GIC v2 — Generic Interrupt Controller
+# QEMU virt: distributor 0x08000000, CPU interface 0x08010000
+var gicd_base = 0x08000000;
+var gicc_base = 0x08010000;
+var gic_enabled = 0;
+
+fn gic_init() {
+    # Distributor: enable group 0
+    store32(0x08000000, 1);
+    # CPU interface: enable, priority mask = 0xFF (all priorities)
+    store32(0x08010000, 1);
+    store32(0x08010004, 0xFF);
+    gic_enabled = 1;
+    return 0;
+}
+
+fn gic_enable_irq(irq) {
+    # GICD_ISENABLER: each bit enables one IRQ
+    # Register = 0x100 + (irq/32)*4, bit = irq%32
+    var reg = 0x08000100 + (irq / 32) * 4;
+    store32(reg, 1 << (irq % 32));
+    # Set priority to 0 (highest)
+    var preg = 0x08000400 + irq;
+    store8(preg, 0);
+    # Target CPU 0
+    var treg = 0x08000800 + irq;
+    store8(treg, 1);
+    return 0;
+}
+
+fn gic_ack() {
+    # Read IAR to acknowledge (returns IRQ ID)
+    return load32(0x0801000C);
+}
+
+fn gic_eoi(irq) {
+    # Write EOIR to signal end of interrupt
+    store32(0x08010010, irq);
+    return 0;
+}

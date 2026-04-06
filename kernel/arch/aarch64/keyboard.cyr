@@ -1,0 +1,37 @@
+# aarch64 keyboard input — reads from PL011 UART RX
+# On QEMU virt, serial console is the only input device
+
+var kb_head = 0;
+var kb_tail = 0;
+var kb_buf[256];
+
+fn kb_poll() {
+    # Check PL011 FR register bit 4 (RXFE = RX FIFO empty)
+    while ((load32(0x09000018) & 0x10) == 0) {
+        var ch = load32(0x09000000) & 0xFF;
+        store8(&kb_buf + kb_head, ch);
+        kb_head = (kb_head + 1) & 0xFF;
+    }
+    return 0;
+}
+
+fn kb_has_key() {
+    kb_poll();
+    if (kb_head != kb_tail) { return 1; }
+    return 0;
+}
+
+fn kb_read_char() {
+    var ch = load8(&kb_buf + kb_tail);
+    kb_tail = (kb_tail + 1) & 0xFF;
+    return ch;
+}
+
+# aarch64 doesn't need scancode translation — UART gives ASCII directly
+fn scancode_to_ascii(sc) {
+    return sc;
+}
+
+fn kb_read_scancode() {
+    return kb_read_char();
+}
