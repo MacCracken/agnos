@@ -1760,6 +1760,162 @@ fn kprint_num(n: i64) {
     return 0;
 }
 
+# === Shell ===
+var sh_buf[128];
+var sh_len = 0;
+
+fn sh_streq(a, alen, b, blen) {
+    if (alen != blen) { return 0; }
+    for (var i = 0; i < alen; i = i + 1) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+    }
+    return 1;
+}
+
+fn sh_cmd_help() {
+    serial_println("AGNOS Shell commands:", 21);
+    serial_println("  help    - this message", 24);
+    serial_println("  echo    - print text", 22);
+    serial_println("  ps      - process list", 24);
+    serial_println("  free    - memory info", 23);
+    serial_println("  cat     - read file", 21);
+    serial_println("  uptime  - timer ticks", 23);
+    serial_println("  halt    - shutdown", 20);
+    return 0;
+}
+
+fn sh_cmd_ps() {
+    serial_println("PID  STATE", 11);
+    for (var i = 0; i < proc_count; i = i + 1) {
+        kprint_num(i);
+        serial_print("    ", 4);
+        var st = proc_get_state(i);
+        if (st == 0) { serial_println("halted", 6); }
+        if (st == 1) { serial_println("ready", 5); }
+        if (st == 2) { serial_println("running", 7); }
+    }
+    return 0;
+}
+
+fn sh_cmd_free() {
+    serial_print("PMM: ", 5);
+    kprint_num(pmm_free_count());
+    serial_print("/", 1);
+    kprint_num(pmm_total);
+    serial_println(" pages (4KB each)", 17);
+    serial_print("Heap: ", 6);
+    kprint_num(heap_allocs);
+    serial_print(" allocs, ", 9);
+    kprint_num(heap_frees);
+    serial_println(" frees", 6);
+    return 0;
+}
+
+fn sh_cmd_cat(arg, arglen) {
+    if (arglen < 1) { serial_println("usage: cat <file>", 17); return 0; }
+    var fd = initrd_open(arg, arglen);
+    if (fd < 0) { serial_println("file not found", 14); return 0; }
+    var cbuf[64];
+    var n = vfs_read(fd, &cbuf, 512);
+    while (n > 0) {
+        serial_print(&cbuf, n);
+        n = vfs_read(fd, &cbuf, 512);
+    }
+    vfs_close(fd);
+    return 0;
+}
+
+fn sh_exec(buf, len) {
+    if (len < 1) { return 0; }
+    # Find command end (first space or end)
+    var cmd_end = 0;
+    while (cmd_end < len) {
+        if (load8(buf + cmd_end) == 32) { cmd_end = cmd_end + 1; break; }
+        cmd_end = cmd_end + 1;
+    }
+    # Trim the command (before space)
+    var clen = cmd_end;
+    if (clen > 0) {
+        if (load8(buf + clen - 1) == 32) { clen = clen - 1; }
+    }
+    # Arg = everything after the space
+    var arg = buf + cmd_end;
+    var arglen = len - cmd_end;
+
+    if (sh_streq(buf, clen, "help", 4) == 1) { return sh_cmd_help(); }
+    if (sh_streq(buf, clen, "ps", 2) == 1) { return sh_cmd_ps(); }
+    if (sh_streq(buf, clen, "free", 4) == 1) { return sh_cmd_free(); }
+    if (sh_streq(buf, clen, "uptime", 6) == 1) {
+        kprint_num(timer_ticks);
+        serial_println(" ticks", 6);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "cat", 3) == 1) { return sh_cmd_cat(arg, arglen); }
+    if (sh_streq(buf, clen, "echo", 4) == 1) {
+        serial_print(arg, arglen);
+        serial_println("", 0);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "halt", 4) == 1) { return 0 - 99; }
+    serial_print("unknown: ", 9);
+    serial_print(buf, clen);
+    serial_println("", 0);
+    return 0;
+}
+
+fn shell() {
+    serial_println("AGNOS shell v0.1 (type 'help')", 30);
+    var sh_running = 1;
+    while (sh_running == 1) {
+        serial_print("agnos> ", 7);
+        sh_len = 0;
+        # Read line character by character
+        var reading = 1;
+        while (reading == 1) {
+            if (kb_has_key() == 0) { asm { hlt; } }
+            else {
+                var sc = kb_read_scancode();
+                var ch = scancode_to_ascii(sc);
+                if (ch == 10) {
+                    serial_println("", 0);
+                    reading = 0;
+                }
+                if (ch == 8) {
+                    if (sh_len > 0) {
+                        sh_len = sh_len - 1;
+                        serial_putc(8); serial_putc(32); serial_putc(8);
+                    }
+                }
+                if (ch > 31) {
+                    if (sh_len < 126) {
+                        store8(&sh_buf + sh_len, ch);
+                        sh_len = sh_len + 1;
+                        serial_putc(ch);
+                    }
+                }
+            }
+        }
+        var result = sh_exec(&sh_buf, sh_len);
+        if (result == 0 - 99) { sh_running = 0; }
+    }
+    return 0;
+}
+
+# === kybernet (PID 1 init) ===
+fn kybernet() {
+    serial_println("kybernet: starting init", 23);
+    serial_print("kybernet: ", 10);
+    kprint_num(proc_count);
+    serial_println(" processes", 10);
+    serial_print("kybernet: ", 10);
+    kprint_num(pmm_free_count());
+    serial_println(" free pages", 11);
+    serial_println("kybernet: launching shell", 25);
+    shell();
+    serial_println("kybernet: shell exited", 22);
+    return 0;
+}
+
 # === 32-bit boot shim ===
 
 asm {
@@ -2125,21 +2281,9 @@ if (exec_pid >= 0) {
     serial_println("Userland exec complete", 22);
 }
 
-# Keyboard loop
-serial_println("AGNOS ready. Type keys (q to halt):", 36);
-var running = 1;
-while (running == 1) {
-    asm { hlt; }
-    while (kb_has_key() == 1) {
-        var sc = kb_read_scancode();
-        var ch = scancode_to_ascii(sc);
-        if (ch > 0) {
-            serial_putc(ch);
-            if (ch == 113) { running = 0; }
-        }
-    }
-}
+# Launch kybernet (PID 1)
+serial_println("Launching kybernet...", 21);
+kybernet();
 
-serial_println("", 0);
 serial_println("Halted.", 7);
 asm { cli; hlt; 0xEB; 0xFE; }
