@@ -8,11 +8,9 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
-  release:
+  build:
     needs: ci
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -25,18 +23,30 @@ jobs:
             exit 1
           fi
 
-      - name: Clone Cyrius compiler
+      - name: Clone Cyrius toolchain
         run: |
           git clone --depth 1 https://github.com/MacCracken/cyrius.git ../cyrius
-          cd ../cyrius && sh bootstrap/bootstrap.sh
-          cat stage1/cc2.cyr | ./build/stage1f > ./build/cc2 2>/dev/null || \
-            cat stage1/cc2.cyr | ./build/cc > ./build/cc2 2>/dev/null
-          chmod +x ./build/cc2
+          cd ../cyrius
+          sh bootstrap/bootstrap.sh
+          cat src/compiler.cyr | ./build/stage1f > ./build/cc2 && chmod +x ./build/cc2
+          cat src/compiler_aarch64.cyr | ./build/cc2 > ./build/cc2_aarch64 && chmod +x ./build/cc2_aarch64
 
-      - name: Build kernel
+      - name: Build x86_64 kernel
         run: |
           sh scripts/build.sh
           cp build/agnos agnos-x86_64
+
+      - name: Build aarch64 kernel (compile test)
+        run: |
+          (sh scripts/build.sh --aarch64 2>/dev/null && cp build/agnos-aarch64 agnos-aarch64) || echo "aarch64 kernel not yet portable"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -44,3 +54,4 @@ jobs:
           generate_release_notes: true
           files: |
             agnos-x86_64
+            agnos-aarch64

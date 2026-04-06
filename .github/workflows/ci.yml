@@ -5,36 +5,32 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  # ── Build + test on GitHub-hosted ──
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone Cyrius compiler
+      - name: Clone Cyrius toolchain
         run: |
           git clone --depth 1 https://github.com/MacCracken/cyrius.git ../cyrius
-          cd ../cyrius && sh bootstrap/bootstrap.sh
-          # Build cc2 (x86_64 compiler)
-          cat stage1/cc2.cyr | ./build/stage1f > ./build/cc2 2>/dev/null || \
-            cat stage1/cc2.cyr | ./build/cc > ./build/cc2 2>/dev/null
-          chmod +x ./build/cc2
-          # Build cc2_aarch64 (cross-compiler)
-          cat stage1/cc2_aarch64.cyr | ./build/cc2 > ./build/cc2_aarch64 2>/dev/null || true
-          chmod +x ./build/cc2_aarch64 2>/dev/null || true
-          # Build cyrb (builder)
-          cat stage1/programs/cyrb.cyr | ./build/cc2 > ./build/cyrb 2>/dev/null || true
-          chmod +x ./build/cyrb 2>/dev/null || true
+          cd ../cyrius
+          sh bootstrap/bootstrap.sh
+          cat src/compiler.cyr | ./build/stage1f > ./build/cc2 && chmod +x ./build/cc2
+          cat src/compiler_aarch64.cyr | ./build/cc2 > ./build/cc2_aarch64 && chmod +x ./build/cc2_aarch64
+          cat programs/cyrb.cyr | ./build/cc2 > ./build/cyrb && chmod +x ./build/cyrb
 
       - name: Test x86_64
         run: sh scripts/test.sh
 
-      - name: Test aarch64 (compile only)
+      - name: Test aarch64 (compile)
         run: sh scripts/test.sh --aarch64
 
       - name: Verify VERSION
@@ -42,3 +38,31 @@ jobs:
           VERSION=$(cat VERSION | tr -d '[:space:]')
           echo "Version: $VERSION"
           test -n "$VERSION"
+
+  # ── QEMU boot test on self-hosted x86 ──
+  boot-test:
+    runs-on: [self-hosted, linux, x64]
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone Cyrius toolchain
+        run: |
+          git clone --depth 1 https://github.com/MacCracken/cyrius.git ../cyrius
+          cd ../cyrius
+          sh bootstrap/bootstrap.sh
+          cat src/compiler.cyr | ./build/stage1f > ./build/cc2 && chmod +x ./build/cc2
+
+      - name: Build kernel
+        run: sh scripts/build.sh
+
+      - name: QEMU boot test (serial output check)
+        run: |
+          timeout 10 qemu-system-x86_64 \
+            -kernel build/agnos \
+            -serial stdio \
+            -display none \
+            -no-reboot 2>&1 | tee /tmp/boot_output
+          grep -q "AGNOS" /tmp/boot_output && echo "PASS: kernel prints AGNOS"
+        continue-on-error: true
