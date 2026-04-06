@@ -40,6 +40,25 @@ jobs:
         run: |
           (sh scripts/build.sh --aarch64 2>/dev/null && cp build/agnos-aarch64 agnos-aarch64) || echo "aarch64 kernel not yet portable"
 
+      - name: Generate checksums
+        run: |
+          sha256sum agnos-x86_64 > SHA256SUMS
+          if [ -f agnos-aarch64 ]; then
+            sha256sum agnos-aarch64 >> SHA256SUMS
+          fi
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: |
+            agnos-x86_64
+            agnos-aarch64
+            SHA256SUMS
+          retention-days: 5
+
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -48,6 +67,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -55,3 +79,4 @@ jobs:
           files: |
             agnos-x86_64
             agnos-aarch64
+            SHA256SUMS

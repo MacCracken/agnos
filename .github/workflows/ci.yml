@@ -39,6 +39,33 @@ jobs:
           echo "Version: $VERSION"
           test -n "$VERSION"
 
+  # ── Verify required documentation ──
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required docs exist
+        run: |
+          MISSING=0
+          for doc in README.md CHANGELOG.md VERSION CONTRIBUTING.md SECURITY.md LICENSE; do
+            if [ -f "$doc" ]; then
+              echo "  OK: $doc"
+            else
+              echo "  MISSING: $doc"
+              MISSING=1
+            fi
+          done
+          exit $MISSING
+
+      - name: Verify version consistency
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "VERSION file: $VERSION"
+          grep -q "$VERSION" kernel/agnos.cyr || { echo "FAIL: version not in kernel"; exit 1; }
+          grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in changelog"; exit 1; }
+          echo "Version consistent across files"
+
   # ── QEMU boot test on self-hosted x86 ──
   boot-test:
     runs-on: [self-hosted, linux, x64]
@@ -66,3 +93,33 @@ jobs:
             -no-reboot 2>&1 | tee /tmp/boot_output
           grep -q "AGNOS" /tmp/boot_output && echo "PASS: kernel prints AGNOS"
         continue-on-error: true
+
+  # ── Benchmarks on self-hosted with QEMU ──
+  benchmarks:
+    runs-on: [self-hosted, linux, x64]
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone Cyrius toolchain
+        run: |
+          git clone --depth 1 https://github.com/MacCracken/cyrius.git ../cyrius
+          cd ../cyrius
+          sh bootstrap/bootstrap.sh
+          cat src/compiler.cyr | ./build/stage1f > ./build/cc2 && chmod +x ./build/cc2
+          cat programs/cyrb.cyr | ./build/cc2 > ./build/cyrb && chmod +x ./build/cyrb
+
+      - name: Run benchmarks
+        run: sh scripts/bench.sh
+        continue-on-error: true
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmarks
+          path: |
+            BENCHMARKS.md
+            bench-history.csv
+          retention-days: 90
