@@ -35,13 +35,63 @@ For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 | 4 | Signals | POSIX-style signal delivery to userland |
 | 5 | Pipes | IPC between processes |
 
+## Pre-requisite: Multi-Architecture Readiness
+
+Before the aarch64 port, restructure the kernel for multi-arch support.
+Currently everything is in a single `kernel/agnos.cyr` (~3000 lines).
+
+**Step 1: Split arch-dependent from arch-independent code**
+
+```
+kernel/
+├── arch/x86_64/          # Everything with inline asm or x86 hardware
+│   ├── boot.cyr          # multiboot shim, GDT, IDT, TSS
+│   ├── apic.cyr          # LAPIC, PIC, PIT, timer ISR
+│   ├── paging.cyr        # x86 page tables (PML4/PDPT/PD)
+│   ├── syscall.cyr       # SYSCALL/SYSRET MSR setup, entry stub
+│   ├── smp.cyr           # AP trampoline, IPI
+│   └── io.cyr            # inb/outb/inw/outw/inl/outl, serial
+├── arch/aarch64/          # ARM64 equivalents (future)
+│   ├── boot.cyr          # DTB, EL2→EL1 transition
+│   ├── gic.cyr           # GIC-400 interrupt controller
+│   ├── paging.cyr        # ARM 4KB granule page tables
+│   ├── syscall.cyr       # SVC handler
+│   └── uart.cyr          # PL011 UART
+├── core/                  # Pure Cyrius, no inline asm
+│   ├── proc.cyr          # process table, context layout, scheduler
+│   ├── pmm.cyr           # bitmap allocator
+│   ├── heap.cyr          # slab allocator
+│   ├── vfs.cyr           # VFS + device drivers + initrd
+│   ├── net.cyr           # IP/UDP stack (arch-independent)
+│   └── syscall.cyr       # syscall dispatch table
+├── user/                  # Userland (pure Cyrius)
+│   ├── shell.cyr         # shell commands
+│   └── init.cyr          # kybernet
+└── agnos.cyr             # main: includes arch/<ARCH>/* + core/* + user/*
+```
+
+**Blocker**: Cyrius `include` doesn't work in `kernel;` mode. Options:
+1. Build script concatenates files before compiling (`cat arch/x86_64/*.cyr core/*.cyr | cc2`)
+2. Cyrius adds `include` support for kernel mode
+3. `cyrb build` gains multi-file kernel support
+
+**Step 2: Define arch interface** — each arch must provide:
+- `arch_init()` — hardware init (GDT/IDT/APIC or GIC/UART)
+- `arch_timer_init()` — periodic timer
+- `arch_serial_putc(c)` / `arch_serial_print(msg, len)`
+- `arch_map_page(virt, phys, flags)` — page table manipulation
+- `arch_context_switch(old, new)` — register save/restore
+- `arch_enter_user(entry, rsp)` — ring transition
+- `arch_eoi()` — interrupt acknowledgment
+
 ## Planned
 
 | # | Item | Prerequisite |
 |---|------|-------------|
-| 6 | aarch64 port | Cyrius Phase 9 complete |
-| 7 | Real filesystem (ext2) | Disk I/O |
-| 8 | mmap | VMM + filesystem |
-| 9 | Shared memory | SMP + VMM |
-| 10 | Preemptive scheduling | Timer + SMP stable |
-| 11 | USB support | PCI + device driver framework |
+| 6 | Multi-arch split (see above) | Build script or Cyrius include support |
+| 7 | aarch64 port | Multi-arch split complete |
+| 8 | Real filesystem (ext2) | Disk I/O |
+| 9 | mmap | VMM + filesystem |
+| 10 | Shared memory | SMP + VMM |
+| 11 | Preemptive scheduling | Timer + SMP stable |
+| 12 | USB support | PCI + device driver framework |
