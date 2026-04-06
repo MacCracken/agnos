@@ -50,6 +50,34 @@ fn vfs_read(fd_idx, buf, count) {
         store64(base + 8, pos + count);
         return count;
     }
+    if (ftype == 3) {
+        # signalfd: return next pending signal matching mask
+        var sigmask = load64(base + 24);
+        var pending = load64(&proc_signals + proc_current * 8);
+        var matched = pending & sigmask;
+        if (matched == 0) { return 0; }
+        for (var s = 1; s < 32; s = s + 1) {
+            if ((matched & (1 << s)) != 0) {
+                store64(&proc_signals + proc_current * 8, pending & (~(1 << s)));
+                store32(buf, s);
+                return 4;
+            }
+        }
+        return 0;
+    }
+    if (ftype == 5) {
+        # timerfd: return expiry count if timer fired
+        var next_fire = load64(base + 16);
+        if (timer_ticks >= next_fire) {
+            var interval = load64(base + 8);
+            if (interval > 0) {
+                store64(base + 16, timer_ticks + interval);
+            }
+            store64(buf, 1);
+            return 8;
+        }
+        return 0;
+    }
     return 0 - 1;
 }
 

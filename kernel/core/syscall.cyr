@@ -65,5 +65,125 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 5) { return vfs_read(arg1, arg2, arg3); }
     if (num == 6) { return vfs_close(arg1); }
     if (num == 7) { return initrd_open(arg1, arg2); }
+    # Tier 1: stubs
+    if (num == 8) { return arg1; }           # dup(fd) -> return same fd
+    if (num == 9) { return 0; }              # mkdir
+    if (num == 10) { return 0; }             # rmdir
+    if (num == 12) { return 0; }             # sync
+    if (num == 15) { return 0; }             # getuid (root)
+    if (num == 24) { return 0; }             # umount
+    # Tier 2: simple
+    if (num == 11) { return 0; }             # mount (noop for now)
+    if (num == 13) {                          # reboot
+        serial_println("AGNOS: reboot", 13);
+        asm { cli; hlt; 0xEB; 0xFE; }
+        return 0;
+    }
+    if (num == 14) { asm { hlt; } return 0; } # pause
+    # Tier 3: signals
+    if (num == 16) {
+        # kill(pid=arg1, sig=arg2)
+        if (arg1 >= proc_count) { return 0 - 1; }
+        var sig_pending = load64(&proc_signals + arg1 * 8);
+        store64(&proc_signals + arg1 * 8, sig_pending | (1 << arg2));
+        return 0;
+    }
+    if (num == 17) {
+        # sigprocmask(how=arg1, set=arg2, oldset=arg3)
+        var old_mask = load64(&proc_sigmask + proc_current * 8);
+        if (arg3 != 0) { store64(arg3, old_mask); }
+        var new_bits = load64(arg2);
+        if (arg1 == 0) { new_bits = old_mask | new_bits; }
+        if (arg1 == 1) { new_bits = old_mask & (~new_bits); }
+        store64(&proc_sigmask + proc_current * 8, new_bits);
+        return 0;
+    }
+    if (num == 18) {
+        # signalfd(fd=arg1, mask_ptr=arg2, flags=arg3)
+        var sfd = vfs_alloc();
+        if (sfd < 0) { return 0 - 1; }
+        var sbase = &vfs_table + sfd * 32;
+        store64(sbase, 3);
+        store64(sbase + 24, load64(arg2));
+        return sfd;
+    }
+    # Tier 4: epoll + timerfd
+    if (num == 19) {
+        # epoll_create
+        var efd = vfs_alloc();
+        if (efd < 0) { return 0 - 1; }
+        var ebase = &vfs_table + efd * 32;
+        store64(ebase, 4);
+        store64(ebase + 8, 0);
+        var wl = kmalloc(128);
+        store64(ebase + 24, wl);
+        return efd;
+    }
+    if (num == 20) {
+        # epoll_ctl(epfd=arg1, op=arg2, fd=arg3)
+        # arg3 is the fd to watch. Event struct passed via... simplified: store fd+data
+        var ebase = &vfs_table + arg1 * 32;
+        var wl = load64(ebase + 24);
+        var wc = load64(ebase + 8);
+        if (arg2 == 1) {
+            store64(wl + wc * 16, arg3);
+            store64(wl + wc * 16 + 8, arg3);
+            store64(ebase + 8, wc + 1);
+        }
+        if (arg2 == 2) {
+            store64(ebase + 8, 0);
+        }
+        return 0;
+    }
+    if (num == 21) {
+        # epoll_wait(epfd=arg1, events=arg2, max=arg3)
+        var ebase = &vfs_table + arg1 * 32;
+        var wl = load64(ebase + 24);
+        var wc = load64(ebase + 8);
+        var found = 0;
+        for (var wi = 0; wi < wc; wi = wi + 1) {
+            var wfd = load64(wl + wi * 16);
+            var wdata = load64(wl + wi * 16 + 8);
+            var wbase = &vfs_table + wfd * 32;
+            var wtype = load64(wbase);
+            var rdy = 0;
+            if (wtype == 3) {
+                var smask = load64(wbase + 24);
+                var spend = load64(&proc_signals + proc_current * 8);
+                if ((spend & smask) != 0) { rdy = 1; }
+            }
+            if (wtype == 5) {
+                if (timer_ticks >= load64(wbase + 16)) { rdy = 1; }
+            }
+            if (rdy == 1) {
+                if (found < arg3) {
+                    store32(arg2 + found * 12, 1);
+                    store64(arg2 + found * 12 + 4, wdata);
+                    found = found + 1;
+                }
+            }
+        }
+        if (found == 0) { asm { hlt; } }
+        return found;
+    }
+    if (num == 22) {
+        # timerfd_create
+        var tfd = vfs_alloc();
+        if (tfd < 0) { return 0 - 1; }
+        var tbase = &vfs_table + tfd * 32;
+        store64(tbase, 5);
+        store64(tbase + 8, 0);
+        store64(tbase + 16, 0);
+        return tfd;
+    }
+    if (num == 23) {
+        # timerfd_settime(fd=arg1, flags=arg2, new_value=arg3)
+        var tbase = &vfs_table + arg1 * 32;
+        var int_sec = load64(arg3);
+        var init_sec = load64(arg3 + 16);
+        store64(tbase + 8, int_sec * 100);
+        store64(tbase + 16, timer_ticks + init_sec * 100);
+        return 0;
+    }
     return 0 - 1;
 }
