@@ -1198,7 +1198,7 @@ fn test_proc_b() {
 
 # Test the SYSCALL interface via direct kernel call (not the instruction).
 fn test_hw_syscall() {
-    ksyscall(1, "HW-OK\n", 6, 0);
+    ksyscall(1, 0, "HW-OK\n", 6);
     serial_print("HW getpid=", 11);
     kprint_num(ksyscall(2, 0, 0, 0));
     serial_println("", 0);
@@ -1209,41 +1209,114 @@ fn test_hw_syscall() {
 # Uses the SYSCALL instruction to communicate with the kernel.
 # Prints "U" repeatedly via syscall write, then exits.
 fn user_test_proc() {
-    # This function runs in ring 3!
-    # All kernel access must go through syscall.
-    # syscall convention: rax=num, rdi=arg1, rsi=arg2, rdx=arg3
-    #
-    # Variable layout (no params):
-    #   [rbp-0x08] = msg (pointer to "U" string literal)
-    #   [rbp-0x10] = count
-    var msg = "U";       # [rbp-0x08] — pointer to string literal
-    var count = 0;       # [rbp-0x10]
+    # Ring 3. write(1, fd=0, buf, len)
+    var msg = "U";
+    var count = 0;
     while (count < 10) {
-        # syscall write(1): rax=1, rdi=msg, rsi=1, rdx=0
-        # msg is the string pointer directly (not &msg)
+        # rax=1(write), rdi=0(fd serial), rsi=msg, rdx=1(len)
         asm {
-            0x48; 0xC7; 0xC0; 0x01; 0x00; 0x00; 0x00;  # mov rax, 1 (write)
-            0x48; 0x8B; 0x7D; 0xF8;                      # mov rdi, [rbp-0x08] (msg ptr)
-            0x48; 0xC7; 0xC6; 0x01; 0x00; 0x00; 0x00;  # mov rsi, 1 (len)
-            0x48; 0x31; 0xD2;                              # xor rdx, rdx
-            0x0F; 0x05;                                    # syscall
+            0x48; 0xC7; 0xC0; 0x01; 0x00; 0x00; 0x00;
+            0x48; 0x31; 0xFF;
+            0x48; 0x8B; 0x75; 0xF8;
+            0x48; 0xC7; 0xC2; 0x01; 0x00; 0x00; 0x00;
+            0x0F; 0x05;
         }
         count = count + 1;
     }
-    # Exit via syscall #0: rax=0, rdi=0
-    asm {
-        0x48; 0x31; 0xC0;  # xor rax, rax (syscall 0 = exit)
-        0x48; 0x31; 0xFF;  # xor rdi, rdi (exit code 0)
-        0x0F; 0x05;         # syscall
-    }
-    # Halt if exit syscall returns
+    asm { 0x48; 0x31; 0xC0; 0x48; 0x31; 0xFF; 0x0F; 0x05; }
     asm { 0xEB; 0xFE; }
     return 0;
 }
 
+# === VFS ===
+var vfs_table[128];
+
+fn vfs_init() {
+    for (var i = 0; i < 128; i = i + 1) { store64(&vfs_table + i * 8, 0); }
+    store64(&vfs_table, 1);
+    return 0;
+}
+
+fn vfs_alloc() {
+    for (var i = 1; i < 32; i = i + 1) {
+        if (load64(&vfs_table + i * 32) == 0) { return i; }
+    }
+    return 0 - 1;
+}
+
+fn vfs_create_memfile(data, size) {
+    var idx = vfs_alloc();
+    if (idx < 0) { return 0 - 1; }
+    var base = &vfs_table + idx * 32;
+    store64(base, 2);
+    store64(base + 8, 0);
+    store64(base + 16, size);
+    store64(base + 24, data);
+    return idx;
+}
+
+fn vfs_read(fd_idx, buf, count) {
+    if (fd_idx < 0) { return 0 - 1; }
+    if (fd_idx >= 32) { return 0 - 1; }
+    var base = &vfs_table + fd_idx * 32;
+    var ftype = load64(base);
+    if (ftype == 0) { return 0 - 1; }
+    if (ftype == 1) {
+        var n = 0;
+        while (n < count) {
+            if (kb_has_key() == 0) {
+                if (n > 0) { return n; }
+                asm { hlt; }
+            } else {
+                var sc = kb_read_scancode();
+                var ch = scancode_to_ascii(sc);
+                if (ch > 0) {
+                    store8(buf + n, ch);
+                    n = n + 1;
+                    if (ch == 10) { return n; }
+                }
+            }
+        }
+        return n;
+    }
+    if (ftype == 2) {
+        var pos = load64(base + 8);
+        var fsize = load64(base + 16);
+        var data = load64(base + 24);
+        var avail = fsize - pos;
+        if (avail < 1) { return 0; }
+        if (count > avail) { count = avail; }
+        for (var i = 0; i < count; i = i + 1) {
+            store8(buf + i, load8(data + pos + i));
+        }
+        store64(base + 8, pos + count);
+        return count;
+    }
+    return 0 - 1;
+}
+
+fn vfs_write(fd_idx, buf, count) {
+    if (fd_idx < 0) { return 0 - 1; }
+    if (fd_idx >= 32) { return 0 - 1; }
+    var base = &vfs_table + fd_idx * 32;
+    var ftype = load64(base);
+    if (ftype == 1) {
+        if (count > 4096) { count = 4096; }
+        serial_print(buf, count);
+        return count;
+    }
+    return 0 - 1;
+}
+
+fn vfs_close(fd_idx) {
+    if (fd_idx < 0) { return 0 - 1; }
+    if (fd_idx >= 32) { return 0 - 1; }
+    store64(&vfs_table + fd_idx * 32, 0);
+    return 0;
+}
+
 # === Syscall Interface ===
-# Dispatches syscalls from both direct calls and SYSCALL instruction.
-# Convention: rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3
+# rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3
 # Return value in rax.
 # Syscall numbers: 0=exit, 1=write, 2=getpid
 
@@ -1285,19 +1358,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return 0;
     }
     if (num == 1) {
-        # write (buf=arg1, len=arg2) — serial output
-        # Clamp length to prevent unbounded reads
-        var wlen = arg2;
-        if (wlen > 4096) { wlen = 4096; }
-        if (wlen < 0) { wlen = 0; }
-        if (arg1 == 0) { return 0 - 1; }
-        serial_print(arg1, wlen);
-        return wlen;
+        # write(fd=arg1, buf=arg2, len=arg3)
+        return vfs_write(arg1, arg2, arg3);
     }
-    if (num == 2) {
-        # getpid
-        return proc_current;
-    }
+    if (num == 2) { return proc_current; }
     if (num == 3) {
         # spawn(elf_addr, elf_size) — load ELF and create user process
         # Returns new pid or -1 on error
@@ -1317,6 +1381,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         }
         return sys_exit_code;
     }
+    if (num == 5) { return vfs_read(arg1, arg2, arg3); }
+    if (num == 6) { return vfs_close(arg1); }
     return 0 - 1;
 }
 
@@ -1675,7 +1741,9 @@ serial_println(")", 1);
 
 # Initialize kernel heap
 heap_init();
-serial_println("Heap initialized (slab allocator)", 33);
+serial_println("Heap initialized", 16);
+vfs_init();
+serial_println("VFS initialized", 15);
 
 # Heap test: allocate various sizes, free, reallocate
 var h1 = kmalloc(16);
@@ -1736,7 +1804,7 @@ serial_print("Syscall getpid=", 15);
 kprint_num(pid);
 serial_println("", 0);
 
-ksyscall(1, "Syscall write works!\n", 21, 0);
+ksyscall(1, 0, "Syscall write works!\n", 21);
 
 ksyscall(0, 42, 0, 0);
 serial_print("Exit code: ", 11);
@@ -1812,6 +1880,17 @@ kprint_num(timer_ticks);
 serial_println("", 0);
 
 # === Memory Isolation Test ===
+# VFS test
+serial_print("VFS write: ", 11);
+vfs_write(0, "OK\n", 3);
+var mf = vfs_create_memfile("HELLO", 5);
+var rbuf[8];
+var rn = vfs_read(mf, &rbuf, 5);
+serial_print("VFS memfile read: ", 18);
+serial_print(&rbuf, rn);
+serial_println("", 0);
+vfs_close(mf);
+
 serial_println("Memory isolation test...", 23);
 
 # Create two address spaces
