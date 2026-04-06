@@ -40,12 +40,20 @@ fn serial_println(msg, len) {
 }
 
 # === GDT ===
+# Segment layout (required for SYSCALL/SYSRET):
+#   0x00: null
+#   0x08: kernel CS (DPL 0, 64-bit code)
+#   0x10: kernel DS (DPL 0, data)
+#   0x18: user DS   (DPL 3, data)  — SYSRET loads SS from STAR[63:48]+8
+#   0x20: user CS   (DPL 3, 64-bit code) — SYSRET loads CS from STAR[63:48]+16
 
 fn gdt_init() {
-    store64(&gdt, 0);
-    store64(&gdt + 8, 0x00AF9A000000FFFF);
-    store64(&gdt + 16, 0x00CF92000000FFFF);
-    store16(&gdt_ptr, 23);
+    store64(&gdt, 0);                        # 0x00: null
+    store64(&gdt + 8, 0x00AF9A000000FFFF);   # 0x08: kernel CS (64-bit, DPL0)
+    store64(&gdt + 16, 0x00CF92000000FFFF);  # 0x10: kernel DS (DPL0)
+    store64(&gdt + 24, 0x00CFF2000000FFFF);  # 0x18: user DS (DPL3)
+    store64(&gdt + 32, 0x00AFFA000000FFFF);  # 0x20: user CS (64-bit, DPL3)
+    store16(&gdt_ptr, 39);                   # 5 entries * 8 bytes - 1
     store64(&gdt_ptr + 2, &gdt);
     var gp = &gdt_ptr;
     asm { lgdt [rax]; }
@@ -697,10 +705,95 @@ fn test_proc_b() {
     return 0;
 }
 
+# Test the hardware SYSCALL instruction from kernel mode.
+# Uses a function so we have predictable stack frame layout.
+fn test_hw_syscall() {
+    # Issue syscall #1 (write) to print "HW-OK\n" via SYSCALL instruction
+    # In this function: param none, locals from var declarations
+    # var a = value puts it at [rbp - 0x08], next at [rbp - 0x10], etc.
+    var sc_num = 1;        # [rbp - 0x08]
+    var sc_msg = "HW-OK\n"; # [rbp - 0x10]  (pointer to string literal)
+    var sc_len = 6;         # [rbp - 0x18]
+    asm {
+        # mov rax, [rbp-0x08]  — syscall number
+        0x48; 0x8B; 0x45; 0xF8;
+        # mov rdi, [rbp-0x10]  — msg pointer
+        0x48; 0x8B; 0x7D; 0xF0;
+        # mov rsi, [rbp-0x18]  — length
+        0x48; 0x8B; 0x75; 0xE8;
+        # xor rdx, rdx
+        0x48; 0x31; 0xD2;
+        # syscall
+        0x0F; 0x05;
+    }
+    serial_println("", 0);
+
+    # Test syscall #2 (getpid)
+    var sc_num2 = 2;  # [rbp - 0x20]
+    asm {
+        0x48; 0x8B; 0x45; 0xE0;   # mov rax, [rbp-0x20]
+        0x48; 0x31; 0xFF;          # xor rdi, rdi
+        0x48; 0x31; 0xF6;          # xor rsi, rsi
+        0x48; 0x31; 0xD2;          # xor rdx, rdx
+        0x0F; 0x05;                # syscall
+    }
+    # rax should contain the pid — move it to a local to print
+    # The return value is in rax after syscall returns via sysret
+    # But the Cyrius function prologue may have clobbered it...
+    # Actually after the asm block, rax holds the syscall return value.
+    # We need to capture it. Let's use a store trick:
+    var sc_result = 0;  # [rbp - 0x28]
+    asm {
+        0x48; 0x89; 0x45; 0xD8;   # mov [rbp-0x28], rax
+    }
+    serial_print("HW getpid=", 11);
+    kprint_num(sc_result);
+    serial_println("", 0);
+
+    return 0;
+}
+
+# Test process that uses the SYSCALL instruction for write.
+# syscall convention: rax=num, rdi=arg1, rsi=arg2, rdx=arg3
+fn test_proc_syscall() {
+    # Use syscall #1 (write) to print "S" via hardware SYSCALL instruction
+    # rax=1, rdi=ptr to "S", rsi=1 (len), rdx=0
+    var msg = "S";
+    var count = 0;
+    while (count < 10) {
+        # syscall: rax=1(write), rdi=msg, rsi=1(len), rdx=0
+        var sn = 1;
+        var sa1 = &msg;
+        var sa2 = 1;
+        asm {
+            # mov rax, [rbp-8] (sn)
+            0x48; 0x8B; 0x45; 0xF8;
+            # mov rdi, [rbp-16] (sa1)
+            0x48; 0x8B; 0x7D; 0xF0;
+            # mov rsi, [rbp-24] (sa2)
+            0x48; 0x8B; 0x75; 0xE8;
+            # xor rdx, rdx
+            0x48; 0x31; 0xD2;
+            # syscall
+            0x0F; 0x05;
+        }
+        count = count + 1;
+        asm { hlt; }
+    }
+    # Exit via syscall #0
+    var exit_num = 0;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;
+        0x48; 0x31; 0xFF;
+        0x0F; 0x05;
+    }
+    return 0;
+}
+
 # === Syscall Interface ===
-# Minimal syscall dispatcher. In a real kernel, this would be
-# triggered by the SYSCALL instruction. For now, it's a function
-# that kernel code calls to simulate the interface.
+# Dispatches syscalls from both direct calls and SYSCALL instruction.
+# Convention: rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3
+# Return value in rax.
 # Syscall numbers: 0=exit, 1=write, 2=getpid
 
 var sys_exit_code = 0;
@@ -729,6 +822,213 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return proc_current;
     }
     return 0 - 1;
+}
+
+# === SYSCALL/SYSRET Hardware Interface ===
+# The SYSCALL instruction enters the kernel from user (or kernel) mode.
+# On SYSCALL:
+#   RCX = saved RIP (return address)
+#   R11 = saved RFLAGS
+#   CS  = STAR[47:32] (kernel CS = 0x08)
+#   SS  = STAR[47:32]+8 (kernel DS = 0x10)
+# Register convention (Linux-style):
+#   rax = syscall number
+#   rdi = arg1, rsi = arg2, rdx = arg3
+# Return: rax = result, then SYSRET restores RIP from RCX, RFLAGS from R11
+
+var syscall_entry_buf[128];
+var kernel_rsp_save = 0;
+
+# C-level handler called from the syscall entry stub.
+# user_rsp = the caller's RSP (saved before switching to kernel stack)
+fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3) {
+    var result = ksyscall(sc_num, sc_arg1, sc_arg2, sc_arg3);
+    return result;
+}
+
+fn syscall_init() {
+    # Program the MSRs for SYSCALL/SYSRET.
+    # MSR 0xC0000081 (STAR): segment selectors
+    #   Bits 47:32 = kernel CS selector (0x08) — for SYSCALL entry
+    #   Bits 63:48 = user CS base (0x10) — SYSRET: CS=base+16=0x20|3, SS=base+8=0x18|3
+    # MSR 0xC0000082 (LSTAR): handler RIP (64-bit)
+    # MSR 0xC0000084 (SFMASK): RFLAGS bits to clear on SYSCALL (mask IF so interrupts off in kernel)
+
+    # Build STAR value: [63:48]=0x10, [47:32]=0x08, [31:0]=0
+    # = 0x0010_0008_0000_0000
+    var star_val = 0x0010000800000000;
+
+    # LSTAR = address of our syscall entry stub
+    var lstar_val = &syscall_entry_buf;
+
+    # SFMASK = 0x200 (clear IF on syscall entry — disable interrupts)
+    var sfmask_val = 0x200;
+
+    # wrmsr: ecx=MSR#, edx:eax=value (edx=high32, eax=low32)
+
+    # Write STAR (MSR 0xC0000081)
+    # mov ecx, 0xC0000081; mov eax, low32(star); mov edx, high32(star); wrmsr
+    asm {
+        0xB9; 0x81; 0x00; 0x00; 0xC0;
+        0xB8; 0x00; 0x00; 0x00; 0x00;
+        0xBA; 0x08; 0x00; 0x10; 0x00;
+        0x0F; 0x30;
+    }
+
+    # Write LSTAR (MSR 0xC0000082) — handler address
+    # Need to split lstar_val into low32 and high32
+    var lstar_lo = lstar_val & 0xFFFFFFFF;
+    var lstar_hi = (lstar_val >> 32) & 0xFFFFFFFF;
+
+    # mov ecx, 0xC0000082
+    # mov eax, lstar_lo
+    # mov edx, lstar_hi
+    # wrmsr
+    # We build this as bytecode since we need runtime values
+    var msrbuf[32];
+    var mp = &msrbuf;
+    var mo = 0;
+    # mov ecx, 0xC0000082
+    store8(mp + mo, 0xB9); mo = mo + 1;
+    store32(mp + mo, 0xC0000082); mo = mo + 4;
+    # mov eax, imm32 (lstar_lo)
+    store8(mp + mo, 0xB8); mo = mo + 1;
+    store32(mp + mo, lstar_lo); mo = mo + 4;
+    # mov edx, imm32 (lstar_hi)
+    store8(mp + mo, 0xBA); mo = mo + 1;
+    store32(mp + mo, lstar_hi); mo = mo + 4;
+    # wrmsr
+    store8(mp + mo, 0x0F); store8(mp + mo + 1, 0x30); mo = mo + 2;
+    # ret
+    store8(mp + mo, 0xC3); mo = mo + 1;
+    # Execute the bytecode buffer (call rax = FF D0)
+    var mfn = &msrbuf;
+    asm { 0xFF; 0xD0; }
+
+    # Write SFMASK (MSR 0xC0000084) = 0x200 (clear IF)
+    asm {
+        0xB9; 0x84; 0x00; 0x00; 0xC0;
+        0xB8; 0x00; 0x02; 0x00; 0x00;
+        0xBA; 0x00; 0x00; 0x00; 0x00;
+        0x0F; 0x30;
+    }
+
+    # Also enable SCE (System Call Extensions) in IA32_EFER (MSR 0xC0000080)
+    # Read current EFER, set bit 0 (SCE), write back
+    asm {
+        0xB9; 0x80; 0x00; 0x00; 0xC0;
+        0x0F; 0x32;
+        0x0D; 0x01; 0x00; 0x00; 0x00;
+        0x0F; 0x30;
+    }
+
+    # Build the SYSCALL entry stub in syscall_entry_buf.
+    # On entry from SYSCALL:
+    #   RCX = user RIP (return addr)
+    #   R11 = user RFLAGS
+    #   RAX = syscall number
+    #   RDI = arg1, RSI = arg2, RDX = arg3
+    #   RSP = still user RSP (SYSCALL doesn't switch stack!)
+    #
+    # We need to:
+    #   1. Save user RSP to kernel_rsp_save
+    #   2. Switch to kernel stack
+    #   3. Push RCX (user RIP) and R11 (user RFLAGS) for later SYSRET
+    #   4. Push user RSP
+    #   5. Call syscall_handler(user_rsp, num, arg1, arg2, arg3)
+    #   6. Restore user RSP, RCX, R11
+    #   7. SYSRET
+
+    var ep = &syscall_entry_buf;
+    var eoff = 0;
+    var krs = &kernel_rsp_save;
+    var handler = &syscall_handler;
+
+    # Save user RSP into kernel_rsp_save
+    # mov [kernel_rsp_save], rsp  — 48 89 24 25 [addr32] won't work for 64-bit addr
+    # Use: mov rbx, imm64(krs); mov [rbx], rsp
+    # But we can't clobber rbx freely... actually SYSCALL clobbers RCX and R11.
+    # We can use the stack trick: save via absolute address encoding.
+    # Simpler: mov r10, imm64(krs); mov [r10], rsp; mov rsp, imm64(kernel_stack)
+    # r10 is caller-saved and not used for syscall args
+
+    # mov r10, imm64(kernel_rsp_save addr)  — 49 BA imm64
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
+    store64(ep + eoff, krs); eoff = eoff + 8;
+    # mov [r10], rsp — 49 89 22
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x22); eoff = eoff + 3;
+
+    # Switch to kernel stack (use 0x1F0000 as dedicated syscall kernel stack)
+    # mov rsp, 0x1F0000  — 48 BC imm64
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0xBC); eoff = eoff + 2;
+    store64(ep + eoff, 0x1F0000); eoff = eoff + 8;
+
+    # Push preserved values for SYSRET
+    # push rcx (user RIP)  — 51
+    store8(ep + eoff, 0x51); eoff = eoff + 1;
+    # push r11 (user RFLAGS) — 41 53
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x53); eoff = eoff + 2;
+
+    # Set up args for syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3)
+    # Current regs: rax=syscall#, rdi=arg1, rsi=arg2, rdx=arg3
+    # Need: rdi=user_rsp, rsi=sc_num, rdx=sc_arg1, rcx=sc_arg2, r8=sc_arg3
+    # Shuffle carefully:
+    #   r8 = rdx (arg3)  — but rdx is arg2 in user convention...
+    # Wait — let me use Linux convention: rax=num, rdi=arg1, rsi=arg2, rdx=arg3
+    # syscall_handler(user_rsp, num, arg1, arg2, arg3)
+    # ABI: rdi=user_rsp, rsi=num, rdx=arg1, rcx=arg2, r8=arg3
+
+    # Save rdx (arg3) to r8 first (before we clobber it)
+    # Actually rdx=arg3 in our convention. Let me be precise:
+    # User passes: rax=num, rdi=arg1, rsi=arg2, rdx=arg3
+    # We need: rdi=user_rsp, rsi=num, rdx=arg1, rcx=arg2, r8=arg3
+
+    # mov r8, rdx    — 49 89 D0  (save arg3)
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xD0); eoff = eoff + 3;
+    # mov rcx, rsi   — 48 89 F1  (arg2 → rcx)
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xF1); eoff = eoff + 3;
+    # mov rdx, rdi   — 48 89 FA  (arg1 → rdx)
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xFA); eoff = eoff + 3;
+    # mov rsi, rax   — 48 89 C6  (num → rsi)
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xC6); eoff = eoff + 3;
+    # mov rdi, [r10] — 49 8B 3A  (user_rsp from kernel_rsp_save → rdi)
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x3A); eoff = eoff + 3;
+
+    # call syscall_handler  — mov rax, imm64; call rax
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0xB8); eoff = eoff + 2;
+    store64(ep + eoff, handler); eoff = eoff + 8;
+    store8(ep + eoff, 0xFF); store8(ep + eoff + 1, 0xD0); eoff = eoff + 2;
+
+    # rax now has return value
+
+    # Restore r11 (saved RFLAGS) and rcx (return RIP)
+    # pop r11 — 41 5B
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x5B); eoff = eoff + 2;
+    # pop rcx — 59
+    store8(ep + eoff, 0x59); eoff = eoff + 1;
+
+    # Restore caller RSP
+    # mov r10, imm64(kernel_rsp_save addr)
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
+    store64(ep + eoff, krs); eoff = eoff + 8;
+    # mov rsp, [r10] — 49 8B 22
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x22); eoff = eoff + 3;
+
+    # Restore RFLAGS from R11: push r11; popfq
+    # push r11 — 41 53
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x53); eoff = eoff + 2;
+    # popfq — 9D
+    store8(ep + eoff, 0x9D); eoff = eoff + 1;
+
+    # Return to caller via RCX (works from any ring)
+    # jmp rcx — FF E1
+    store8(ep + eoff, 0xFF); store8(ep + eoff + 1, 0xE1); eoff = eoff + 2;
+
+    # NOTE: When ring 3 is implemented (Step 5), replace the above
+    # jmp rcx + popfq with sysretq (48 0F 07) which atomically
+    # restores RIP from RCX, RFLAGS from R11, and transitions to ring 3.
+
+    return 0;
 }
 
 # === Print number helper for kernel ===
@@ -840,7 +1140,11 @@ serial_print(" (expect ", 9);
 kprint_num(0xDEAD);
 serial_println(")", 1);
 
-# Syscall test
+# Initialize SYSCALL/SYSRET
+syscall_init();
+serial_println("SYSCALL/SYSRET initialized", 26);
+
+# Syscall test (direct call — still works)
 proc_count = 0;
 proc_current = 0;
 var p0 = proc_create(0x100000);
@@ -857,6 +1161,10 @@ ksyscall(0, 42, 0, 0);
 serial_print("Exit code: ", 11);
 kprint_num(sys_exit_code);
 serial_println("", 0);
+
+# Hardware SYSCALL test (from kernel mode — same privilege, tests the plumbing)
+serial_print("HW syscall test: ", 18);
+test_hw_syscall();
 
 # === Context Switch Test ===
 # Create two test processes with dedicated stacks.
