@@ -4,8 +4,9 @@
 kernel;
 
 # === Kernel data ===
-var gdt[64];
+var gdt[128];
 var gdt_ptr[16];
+var tss[128];
 var idt[512];
 var idt_ptr[16];
 var isr_stub[16];
@@ -40,12 +41,13 @@ fn serial_println(msg, len) {
 }
 
 # === GDT ===
-# Segment layout (required for SYSCALL/SYSRET):
+# Segment layout (required for SYSCALL/SYSRET + TSS):
 #   0x00: null
 #   0x08: kernel CS (DPL 0, 64-bit code)
 #   0x10: kernel DS (DPL 0, data)
 #   0x18: user DS   (DPL 3, data)  — SYSRET loads SS from STAR[63:48]+8
 #   0x20: user CS   (DPL 3, 64-bit code) — SYSRET loads CS from STAR[63:48]+16
+#   0x28: TSS descriptor (16 bytes — spans 0x28 and 0x30)
 
 fn gdt_init() {
     store64(&gdt, 0);                        # 0x00: null
@@ -53,7 +55,10 @@ fn gdt_init() {
     store64(&gdt + 16, 0x00CF92000000FFFF);  # 0x10: kernel DS (DPL0)
     store64(&gdt + 24, 0x00CFF2000000FFFF);  # 0x18: user DS (DPL3)
     store64(&gdt + 32, 0x00AFFA000000FFFF);  # 0x20: user CS (64-bit, DPL3)
-    store16(&gdt_ptr, 39);                   # 5 entries * 8 bytes - 1
+    # TSS descriptor at 0x28 (filled in by tss_init)
+    store64(&gdt + 40, 0);
+    store64(&gdt + 48, 0);
+    store16(&gdt_ptr, 55);                   # 7 slots * 8 bytes - 1
     store64(&gdt_ptr + 2, &gdt);
     var gp = &gdt_ptr;
     asm { lgdt [rax]; }
@@ -68,6 +73,74 @@ fn gdt_init() {
         0x48; 0xC7; 0xC0; 0x10; 0x00; 0x00; 0x00;
         0x8E; 0xD8; 0x8E; 0xC0; 0x8E; 0xD0;
     }
+    return 0;
+}
+
+# === TSS (Task State Segment) ===
+# Required for ring transitions. When an interrupt fires in ring 3,
+# the CPU loads RSP0 from the TSS to switch to the kernel stack.
+# TSS layout (64-bit): 104 bytes minimum
+#   Offset 0:  reserved (4 bytes)
+#   Offset 4:  RSP0 (8 bytes) — kernel stack for ring 0
+#   Offset 12: RSP1 (8 bytes)
+#   Offset 20: RSP2 (8 bytes)
+#   Offset 28: reserved (8 bytes)
+#   Offset 36: IST1-IST7 (7 x 8 bytes = 56 bytes)
+#   Offset 92: reserved (8 bytes)
+#   Offset 100: IOPB offset (2 bytes)
+#   Offset 102: reserved (2 bytes)
+
+var tss_kernel_stack = 0x200000;
+
+fn tss_init() {
+    # Zero the TSS
+    for (var i = 0; i < 104; i = i + 8) {
+        store64(&tss + i, 0);
+    }
+    # Set RSP0 = kernel stack (used when transitioning from ring 3 to ring 0)
+    store64(&tss + 4, tss_kernel_stack);
+    # IOPB offset = 104 (no I/O bitmap, offset past end of TSS)
+    store16(&tss + 100, 104);
+
+    # Build TSS descriptor in GDT at offset 0x28
+    # TSS descriptor is 16 bytes (system segment in 64-bit mode):
+    #   Bytes 0-7:  limit[15:0], base[23:0], type=0x9 (avail TSS), DPL=0, P=1, limit[19:16], base[31:24]
+    #   Bytes 8-15: base[63:32], reserved
+    var tss_addr = &tss;
+    var tss_limit = 103;  # 104 bytes - 1
+
+    # Low 8 bytes of TSS descriptor
+    var lo = 0;
+    lo = lo | (tss_limit & 0xFFFF);                        # limit[15:0]
+    lo = lo | ((tss_addr & 0xFFFF) << 16);                 # base[15:0]
+    lo = lo | ((tss_addr & 0xFF0000) << 16);               # base[23:16] at bit 32
+    lo = lo | (0x89 << 40);                                 # type=9 (avail TSS 64-bit), P=1
+    # limit[19:16] = 0 (limit < 64KB), G=0
+    lo = lo | (((tss_addr >> 24) & 0xFF) << 56);           # base[31:24]
+    store64(&gdt + 40, lo);
+
+    # High 8 bytes: base[63:32], reserved=0
+    store32(&gdt + 48, (tss_addr >> 32) & 0xFFFFFFFF);
+    store32(&gdt + 52, 0);
+
+    # Reload GDT (already loaded, but with new limit including TSS)
+    var gp = &gdt_ptr;
+    asm { lgdt [rax]; }
+
+    # Load Task Register: ltr 0x28
+    # ltr ax: 0x0F 0x00 /3 (0F 00 D8 with ax=0x28)
+    # mov ax, 0x28; ltr ax
+    asm {
+        0x66; 0xB8; 0x28; 0x00;
+        0x0F; 0x00; 0xD8;
+    }
+
+    return 0;
+}
+
+# Update TSS RSP0 (called on context switch to set per-process kernel stack)
+fn tss_set_rsp0(rsp0) {
+    store64(&tss + 4, rsp0);
     return 0;
 }
 
@@ -427,6 +500,12 @@ fn pt_init() {
     for (var i = 0; i < 8; i = i + 1) {
         pt_map_2mb(0x3000, i, i * 0x200000);
     }
+    # Set U/S bit on PML4[0] and PDPT[0] so user-mode pages work
+    # PML4 at 0x1000, PDPT at 0x2000 — need bit 2 (User) set
+    var pml4e = load64(0x1000);
+    store64(0x1000, pml4e | 0x04);
+    var pdpte = load64(0x2000);
+    store64(0x2000, pdpte | 0x04);
     # Reload CR3 to flush TLB
     asm { mov rax, cr3; }
     asm { mov cr3, rax; }
@@ -516,14 +595,23 @@ fn pmm_free_count() {
 # Maps virtual addresses to physical pages using the existing page tables.
 # Uses PML4 at 0x1000, PDPT at 0x2000, PD at 0x3000.
 # For now: 2MB huge pages only (PD entries).
+# Page flags: 0x01=Present, 0x02=Writable, 0x04=User, 0x80=2MB page
+# Kernel pages: 0x83 (Present+Writable+2MB)
+# User pages:   0x87 (Present+Writable+User+2MB)
 
 fn vmm_map(virt, phys, flags) {
     var pd_idx = (virt >> 21) & 0x1FF;
-    store64(0x3000 + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | flags | 0x83);
-    # Flush TLB — load virt into rax then invlpg
+    # flags should include all needed bits; ensure Present+2MB minimum
+    store64(0x3000 + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | flags | 0x81);
+    # Flush TLB
     var flush = virt;
     asm { invlpg [rax]; }
     return 0;
+}
+
+# Map a page as user-accessible (ring 3 can read/write)
+fn vmm_map_user(virt, phys) {
+    return vmm_map(virt, phys, 0x87);
 }
 
 fn vmm_unmap(virt) {
@@ -540,11 +628,19 @@ fn vmm_is_mapped(virt) {
     return entry & 1;
 }
 
-# Allocate a physical page and map it at a virtual address
+# Allocate a physical page and map it at a virtual address (kernel-only)
 fn vmm_alloc_at(virt) {
     var phys = pmm_alloc();
     if (phys == 0) { return 0; }
-    vmm_map(virt, phys, 0x03);
+    vmm_map(virt, phys, 0x83);
+    return phys;
+}
+
+# Allocate a physical page and map it as user-accessible
+fn vmm_alloc_user(virt) {
+    var phys = pmm_alloc();
+    if (phys == 0) { return 0; }
+    vmm_map_user(virt, phys);
     return phys;
 }
 
@@ -924,6 +1020,59 @@ fn do_context_switch(isr_rsp) {
     return 0;
 }
 
+# === Ring 3 Transition ===
+# Jump to user mode via iretq. Sets up the interrupt return frame
+# with ring 3 CS/SS selectors.
+# User CS = 0x20 | 3 = 0x23, User SS = 0x18 | 3 = 0x1B
+
+# Run a function in ring 3. Saves kernel context so exit syscall returns here.
+fn run_in_ring3(entry, user_rsp) {
+    # Save our return context: when exit syscall fires, kernel_resume
+    # will restore RSP to our frame and RIP to our return address.
+    # [rbp+8] = return address (pushed by call instruction)
+    # rbp = saved frame pointer
+    # We need to save a stack state that makes "ret" from this function work.
+    var save_rsp = 0;  # [rbp-0x08]
+    var save_rip = 0;  # [rbp-0x10]
+    # Get current RSP and the return address
+    asm {
+        0x48; 0x89; 0x6D; 0xF8;   # mov [rbp-0x08], rbp  (save frame pointer as RSP target)
+        0x48; 0x8B; 0x45; 0x08;   # mov rax, [rbp+0x08]   (return address)
+        0x48; 0x89; 0x45; 0xF0;   # mov [rbp-0x10], rax
+    }
+    kernel_return_rsp = save_rsp;
+    kernel_return_rip = save_rip;
+
+    # Now enter ring 3 (this doesn't return)
+    enter_ring3(entry, user_rsp);
+    return 0;
+}
+
+# Enter ring 3 by directly writing the iretq frame to a known memory location
+# and switching RSP to point at it.
+var iretq_frame[64];
+
+fn enter_ring3(entry, user_rsp) {
+    # Set TSS RSP0 so interrupts/syscalls come back to kernel stack
+    tss_set_rsp0(tss_kernel_stack);
+
+    # Write the iretq frame directly at 0x7000 using the function params.
+    # Layout: [0]=RIP [8]=CS [16]=RFLAGS [24]=RSP [32]=SS
+    store64(0x7000, entry);
+    store64(0x7008, 0x23);
+    store64(0x7010, 0x202);
+    store64(0x7018, user_rsp);
+    store64(0x7020, 0x1B);
+
+    # Set RSP to 0x7000 and iretq
+    asm {
+        0x48; 0xC7; 0xC4; 0x00; 0x70; 0x00; 0x00;  # mov rsp, 0x7000
+        0x48; 0xCF;                                    # iretq
+    }
+
+    return 0;
+}
+
 # === Test Processes ===
 # Simple loop functions for context switch testing.
 # Each prints its ID to serial, then halts until next timer tick.
@@ -944,88 +1093,48 @@ fn test_proc_b() {
     return 0;
 }
 
-# Test the hardware SYSCALL instruction from kernel mode.
-# Uses a function so we have predictable stack frame layout.
+# Test the SYSCALL interface via direct kernel call (not the instruction).
 fn test_hw_syscall() {
-    # Issue syscall #1 (write) to print "HW-OK\n" via SYSCALL instruction
-    # In this function: param none, locals from var declarations
-    # var a = value puts it at [rbp - 0x08], next at [rbp - 0x10], etc.
-    var sc_num = 1;        # [rbp - 0x08]
-    var sc_msg = "HW-OK\n"; # [rbp - 0x10]  (pointer to string literal)
-    var sc_len = 6;         # [rbp - 0x18]
-    asm {
-        # mov rax, [rbp-0x08]  — syscall number
-        0x48; 0x8B; 0x45; 0xF8;
-        # mov rdi, [rbp-0x10]  — msg pointer
-        0x48; 0x8B; 0x7D; 0xF0;
-        # mov rsi, [rbp-0x18]  — length
-        0x48; 0x8B; 0x75; 0xE8;
-        # xor rdx, rdx
-        0x48; 0x31; 0xD2;
-        # syscall
-        0x0F; 0x05;
-    }
-    serial_println("", 0);
-
-    # Test syscall #2 (getpid)
-    var sc_num2 = 2;  # [rbp - 0x20]
-    asm {
-        0x48; 0x8B; 0x45; 0xE0;   # mov rax, [rbp-0x20]
-        0x48; 0x31; 0xFF;          # xor rdi, rdi
-        0x48; 0x31; 0xF6;          # xor rsi, rsi
-        0x48; 0x31; 0xD2;          # xor rdx, rdx
-        0x0F; 0x05;                # syscall
-    }
-    # rax should contain the pid — move it to a local to print
-    # The return value is in rax after syscall returns via sysret
-    # But the Cyrius function prologue may have clobbered it...
-    # Actually after the asm block, rax holds the syscall return value.
-    # We need to capture it. Let's use a store trick:
-    var sc_result = 0;  # [rbp - 0x28]
-    asm {
-        0x48; 0x89; 0x45; 0xD8;   # mov [rbp-0x28], rax
-    }
+    ksyscall(1, "HW-OK\n", 6, 0);
     serial_print("HW getpid=", 11);
-    kprint_num(sc_result);
+    kprint_num(ksyscall(2, 0, 0, 0));
     serial_println("", 0);
-
     return 0;
 }
 
-# Test process that uses the SYSCALL instruction for write.
-# syscall convention: rax=num, rdi=arg1, rsi=arg2, rdx=arg3
-fn test_proc_syscall() {
-    # Use syscall #1 (write) to print "S" via hardware SYSCALL instruction
-    # rax=1, rdi=ptr to "S", rsi=1 (len), rdx=0
-    var msg = "S";
-    var count = 0;
+# User-mode test process. Runs in ring 3.
+# Uses the SYSCALL instruction to communicate with the kernel.
+# Prints "U" repeatedly via syscall write, then exits.
+fn user_test_proc() {
+    # This function runs in ring 3!
+    # All kernel access must go through syscall.
+    # syscall convention: rax=num, rdi=arg1, rsi=arg2, rdx=arg3
+    #
+    # Variable layout (no params):
+    #   [rbp-0x08] = msg (pointer to "U" string literal)
+    #   [rbp-0x10] = count
+    var msg = "U";       # [rbp-0x08] — pointer to string literal
+    var count = 0;       # [rbp-0x10]
     while (count < 10) {
-        # syscall: rax=1(write), rdi=msg, rsi=1(len), rdx=0
-        var sn = 1;
-        var sa1 = &msg;
-        var sa2 = 1;
+        # syscall write(1): rax=1, rdi=msg, rsi=1, rdx=0
+        # msg is the string pointer directly (not &msg)
         asm {
-            # mov rax, [rbp-8] (sn)
-            0x48; 0x8B; 0x45; 0xF8;
-            # mov rdi, [rbp-16] (sa1)
-            0x48; 0x8B; 0x7D; 0xF0;
-            # mov rsi, [rbp-24] (sa2)
-            0x48; 0x8B; 0x75; 0xE8;
-            # xor rdx, rdx
-            0x48; 0x31; 0xD2;
-            # syscall
-            0x0F; 0x05;
+            0x48; 0xC7; 0xC0; 0x01; 0x00; 0x00; 0x00;  # mov rax, 1 (write)
+            0x48; 0x8B; 0x7D; 0xF8;                      # mov rdi, [rbp-0x08] (msg ptr)
+            0x48; 0xC7; 0xC6; 0x01; 0x00; 0x00; 0x00;  # mov rsi, 1 (len)
+            0x48; 0x31; 0xD2;                              # xor rdx, rdx
+            0x0F; 0x05;                                    # syscall
         }
         count = count + 1;
-        asm { hlt; }
     }
-    # Exit via syscall #0
-    var exit_num = 0;
+    # Exit via syscall #0: rax=0, rdi=0
     asm {
-        0x48; 0x8B; 0x45; 0xF8;
-        0x48; 0x31; 0xFF;
-        0x0F; 0x05;
+        0x48; 0x31; 0xC0;  # xor rax, rax (syscall 0 = exit)
+        0x48; 0x31; 0xFF;  # xor rdi, rdi (exit code 0)
+        0x0F; 0x05;         # syscall
     }
+    # Halt if exit syscall returns
+    asm { 0xEB; 0xFE; }
     return 0;
 }
 
@@ -1037,12 +1146,38 @@ fn test_proc_syscall() {
 
 var sys_exit_code = 0;
 
+# Resume kernel execution after a user process exits.
+# Restores saved kernel RSP and jumps to saved RIP.
+fn kernel_resume() {
+    var ret_rsp = kernel_return_rsp;   # [rbp - 0x08]
+    var ret_rip = kernel_return_rip;   # [rbp - 0x10]
+    kernel_return_rsp = 0;
+    kernel_return_rip = 0;
+    # Switch back to kernel segments (CS=0x08, SS=0x10)
+    # and restore kernel stack, then jump to return point
+    asm {
+        0x48; 0xC7; 0xC0; 0x10; 0x00; 0x00; 0x00;  # mov rax, 0x10
+        0x8E; 0xD8;  # mov ds, ax
+        0x8E; 0xC0;  # mov es, ax
+        0x8E; 0xD0;  # mov ss, ax (not needed since we're already ring 0 from syscall entry)
+    }
+    asm {
+        0x48; 0x8B; 0x65; 0xF8;  # mov rsp, [rbp-0x08] (ret_rsp)
+        0xFF; 0x65; 0xF0;         # jmp [rbp-0x10] (ret_rip)
+    }
+    return 0;
+}
+
 fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 0) {
-        # exit — validate proc_current
+        # exit — halt current process, return to kernel if context saved
         sys_exit_code = arg1;
         if (proc_current < proc_count) {
             proc_set_state(proc_current, 0);
+        }
+        # If we have a saved kernel return point, jump back to it
+        if (kernel_return_rsp != 0) {
+            kernel_resume();
         }
         return 0;
     }
@@ -1077,6 +1212,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
 
 var syscall_entry_buf[128];
 var kernel_rsp_save = 0;
+# Saved kernel context for returning from user mode on exit
+var kernel_return_rsp = 0;
+var kernel_return_rip = 0;
 
 # C-level handler called from the syscall entry stub.
 # user_rsp = the caller's RSP (saved before switching to kernel stack)
@@ -1253,19 +1391,10 @@ fn syscall_init() {
     # mov rsp, [r10] — 49 8B 22
     store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x22); eoff = eoff + 3;
 
-    # Restore RFLAGS from R11: push r11; popfq
-    # push r11 — 41 53
-    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x53); eoff = eoff + 2;
-    # popfq — 9D
-    store8(ep + eoff, 0x9D); eoff = eoff + 1;
-
-    # Return to caller via RCX (works from any ring)
-    # jmp rcx — FF E1
-    store8(ep + eoff, 0xFF); store8(ep + eoff + 1, 0xE1); eoff = eoff + 2;
-
-    # NOTE: When ring 3 is implemented (Step 5), replace the above
-    # jmp rcx + popfq with sysretq (48 0F 07) which atomically
-    # restores RIP from RCX, RFLAGS from R11, and transitions to ring 3.
+    # sysretq: atomically restores RIP from RCX, RFLAGS from R11,
+    # CS = STAR[63:48]+16 | 3 = 0x23 (user CS), SS = STAR[63:48]+8 | 3 = 0x1B (user SS)
+    # sysretq (48 0F 07)
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x07); eoff = eoff + 3;
 
     return 0;
 }
@@ -1328,6 +1457,9 @@ serial_println("64-bit long mode", 16);
 
 gdt_init();
 serial_println("GDT loaded", 10);
+
+tss_init();
+serial_println("TSS loaded (ring 3 ready)", 25);
 
 idt_init();
 serial_println("IDT loaded", 10);
@@ -1434,6 +1566,8 @@ syscall_init();
 serial_println("SYSCALL/SYSRET initialized", 26);
 
 # Syscall test (direct call — still works)
+kernel_return_rsp = 0;
+kernel_return_rip = 0;
 proc_count = 0;
 proc_current = 0;
 var p0 = proc_create(0x100000);
@@ -1518,6 +1652,44 @@ serial_println("", 0);
 serial_print("Scheduler test done. Timer ticks: ", 34);
 kprint_num(timer_ticks);
 serial_println("", 0);
+
+# === Ring 3 Test ===
+# Mark kernel code/data pages (0x0-0x200000) as user-accessible
+# so user_test_proc (compiled into kernel binary) can execute from ring 3.
+# Also mark the user process's stack pages as user-accessible.
+serial_println("Ring 3 test...", 14);
+
+# Make first 2MB page user-accessible (contains kernel code where user_test_proc lives)
+var pd_entry_0 = load64(0x3000);
+store64(0x3000, pd_entry_0 | 0x04);  # Set U/S bit
+# Make second 2MB page user-accessible too (0x200000-0x3FFFFF)
+var pd_entry_1 = load64(0x3000 + 8);
+store64(0x3000 + 8, pd_entry_1 | 0x04);
+
+# Allocate user stack at 0xA00000 (10MB), user-accessible
+var user_stack_base = 0xA00000;
+vmm_alloc_user(user_stack_base);
+# Make user stack page user-accessible
+var us_pd_idx = (user_stack_base >> 21) & 0x1FF;
+var us_entry = load64(0x3000 + us_pd_idx * 8);
+store64(0x3000 + us_pd_idx * 8, us_entry | 0x04);
+
+# Flush TLB
+asm { mov rax, cr3; }
+asm { mov cr3, rax; }
+
+var user_stack_top = user_stack_base + 0x4000;
+serial_print("Entering ring 3 at ", 19);
+kprint_num(&user_test_proc);
+serial_print(" stack=", 7);
+kprint_num(user_stack_top);
+serial_println("", 0);
+
+# Enter ring 3 directly. Exit syscall will halt the process;
+# for now we won't return from this (ring 3 process loops or halts).
+kernel_return_rsp = 0;
+kernel_return_rip = 0;
+enter_ring3(&user_test_proc, user_stack_top);
 
 # Keyboard loop
 serial_println("AGNOS ready. Type keys (q to halt):", 36);
