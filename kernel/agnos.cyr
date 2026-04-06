@@ -1233,7 +1233,9 @@ var vfs_table[128];
 
 fn vfs_init() {
     for (var i = 0; i < 128; i = i + 1) { store64(&vfs_table + i * 8, 0); }
+    # FD 0 = serial device (type=1, data=device index 0)
     store64(&vfs_table, 1);
+    store64(&vfs_table + 24, 0);
     return 0;
 }
 
@@ -1262,22 +1264,8 @@ fn vfs_read(fd_idx, buf, count) {
     var ftype = load64(base);
     if (ftype == 0) { return 0 - 1; }
     if (ftype == 1) {
-        var n = 0;
-        while (n < count) {
-            if (kb_has_key() == 0) {
-                if (n > 0) { return n; }
-                asm { hlt; }
-            } else {
-                var sc = kb_read_scancode();
-                var ch = scancode_to_ascii(sc);
-                if (ch > 0) {
-                    store8(buf + n, ch);
-                    n = n + 1;
-                    if (ch == 10) { return n; }
-                }
-            }
-        }
-        return n;
+        # Device: data field = device index
+        return dev_read(load64(base + 24), buf, count);
     }
     if (ftype == 2) {
         var pos = load64(base + 8);
@@ -1301,9 +1289,7 @@ fn vfs_write(fd_idx, buf, count) {
     var base = &vfs_table + fd_idx * 32;
     var ftype = load64(base);
     if (ftype == 1) {
-        if (count > 4096) { count = 4096; }
-        serial_print(buf, count);
-        return count;
+        return dev_write(load64(base + 24), buf, count);
     }
     return 0 - 1;
 }
@@ -1312,6 +1298,76 @@ fn vfs_close(fd_idx) {
     if (fd_idx < 0) { return 0 - 1; }
     if (fd_idx >= 32) { return 0 - 1; }
     store64(&vfs_table + fd_idx * 32, 0);
+    return 0;
+}
+
+# === Device Drivers ===
+# Device table: 16 entries x 32 bytes = {type, read_fn, write_fn, data}
+# type: 0=unused, 1=chardev
+var dev_table[64];
+var dev_count = 0;
+
+fn dev_register(read_fn, write_fn) {
+    if (dev_count >= 16) { return 0 - 1; }
+    var idx = dev_count;
+    var base = &dev_table + idx * 32;
+    store64(base, 1);
+    store64(base + 8, read_fn);
+    store64(base + 16, write_fn);
+    store64(base + 24, 0);
+    dev_count = dev_count + 1;
+    return idx;
+}
+
+fn dev_read(dev_idx, buf, count) {
+    if (dev_idx >= dev_count) { return 0 - 1; }
+    var base = &dev_table + dev_idx * 32;
+    if (load64(base) == 0) { return 0 - 1; }
+    var rfn = load64(base + 8);
+    if (rfn == 0) { return 0 - 1; }
+    # Call the read function: rfn(buf, count)
+    # We can't do indirect calls in Cyrius easily, so use known devices
+    if (dev_idx == 0) { return serial_dev_read(buf, count); }
+    return 0 - 1;
+}
+
+fn dev_write(dev_idx, buf, count) {
+    if (dev_idx >= dev_count) { return 0 - 1; }
+    var base = &dev_table + dev_idx * 32;
+    if (load64(base) == 0) { return 0 - 1; }
+    if (dev_idx == 0) { return serial_dev_write(buf, count); }
+    return 0 - 1;
+}
+
+fn serial_dev_read(buf, count) {
+    var n = 0;
+    while (n < count) {
+        if (kb_has_key() == 0) {
+            if (n > 0) { return n; }
+            asm { hlt; }
+        } else {
+            var sc = kb_read_scancode();
+            var ch = scancode_to_ascii(sc);
+            if (ch > 0) {
+                store8(buf + n, ch);
+                n = n + 1;
+                if (ch == 10) { return n; }
+            }
+        }
+    }
+    return n;
+}
+
+fn serial_dev_write(buf, count) {
+    if (count > 4096) { count = 4096; }
+    serial_print(buf, count);
+    return count;
+}
+
+fn dev_init() {
+    for (var i = 0; i < 64; i = i + 1) { store64(&dev_table + i * 8, 0); }
+    dev_count = 0;
+    dev_register(&serial_dev_read, &serial_dev_write);
     return 0;
 }
 
@@ -1812,6 +1868,8 @@ serial_println(")", 1);
 # Initialize kernel heap
 heap_init();
 serial_println("Heap initialized", 16);
+dev_init();
+serial_println("Devices registered", 18);
 vfs_init();
 serial_println("VFS initialized", 15);
 
