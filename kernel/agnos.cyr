@@ -765,18 +765,19 @@ fn kfree(ptr) {
 
 # === Process Abstraction ===
 # Full process context for real context switching.
-# Layout per process (160 bytes = 20 fields x 8 bytes):
+# Layout per process (168 bytes = 21 fields x 8 bytes):
 #   0: pid       8: state     16: rsp      24: rip
 #  32: rax      40: rbx       48: rcx      56: rdx
 #  64: rsi      72: rdi       80: rbp      88: r8
 #  96: r9      104: r10      112: r11     120: r12
 # 128: r13     136: r14      144: r15     152: rflags
+# 160: cr3 (page table root physical address)
 
-var PROC_SIZE = 160;
+var PROC_SIZE = 168;
 
-struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9; r10; r11; r12; r13; r14; r15; rflags; }
+struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9; r10; r11; r12; r13; r14; r15; rflags; cr3; }
 
-var proc_table[2560];
+var proc_table[2688];
 var proc_count = 0;
 var proc_current = 0;
 var sched_active = 0;
@@ -788,29 +789,31 @@ var PROC_MAX = 16;
 fn proc_create(entry) {
     if (proc_count >= PROC_MAX) { return 0 - 1; }
     var idx = proc_count;
-    var p = &proc_table + idx * PROC_SIZE;
+    var p = &proc_table + idx * 168;
     store64(p, idx);          # pid
     store64(p + 8, 1);        # state: 1=ready
     store64(p + 16, 0);       # rsp (set by proc_create_full)
     store64(p + 24, entry);   # rip (entry point)
     # Zero all register fields
-    for (var r = 32; r < PROC_SIZE; r = r + 8) {
+    for (var r = 32; r < 160; r = r + 8) {
         store64(p + r, 0);
     }
     # Set initial RFLAGS: IF=1 (interrupts enabled)
     store64(p + 152, 0x200);
+    # Default: use kernel page tables
+    store64(p + 160, 0x1000);
     proc_count = proc_count + 1;
     return idx;
 }
 
 fn proc_get_state(pid) {
     if (pid >= proc_count) { return 0 - 1; }
-    return load64(&proc_table + pid * PROC_SIZE + 8);
+    return load64(&proc_table + pid * 168 + 8);
 }
 
 fn proc_set_state(pid, st) {
     if (pid >= proc_count) { return 0 - 1; }
-    store64(&proc_table + pid * PROC_SIZE + 8, st);
+    store64(&proc_table + pid * 168 + 8, st);
     return 0;
 }
 
@@ -897,21 +900,83 @@ fn elf_load(elf_addr, elf_size) {
 fn proc_create_full(entry, stack_top) {
     if (proc_count >= PROC_MAX) { return 0 - 1; }
     var idx = proc_count;
-    var p = &proc_table + idx * PROC_SIZE;
+    var p = &proc_table + idx * 168;
     store64(p, idx);          # pid
     store64(p + 8, 1);        # state: 1=ready
     store64(p + 16, stack_top); # rsp
     store64(p + 24, entry);   # rip
     # Zero all register fields
-    for (var r = 32; r < PROC_SIZE; r = r + 8) {
+    for (var r = 32; r < 160; r = r + 8) {
         store64(p + r, 0);
     }
     # Set initial RFLAGS: IF=1 (interrupts enabled)
     store64(p + 152, 0x200);
     # Set rbp = stack_top (frame pointer)
     store64(p + 80, stack_top);
+    # Default: use kernel page tables
+    store64(p + 160, 0x1000);
     proc_count = proc_count + 1;
     return idx;
+}
+
+# Set a process's CR3 (page table root)
+fn proc_set_cr3(pid, cr3_val) {
+    if (pid >= proc_count) { return 0 - 1; }
+    store64(&proc_table + pid * 168 + 160, cr3_val);
+    return 0;
+}
+
+fn proc_get_cr3(pid) {
+    if (pid >= proc_count) { return 0; }
+    return load64(&proc_table + pid * 168 + 160);
+}
+
+# === Per-Process Address Space ===
+# Create a new set of page tables for a process.
+# Copies kernel mappings (first 16MB) from the shared kernel PD.
+# Returns the physical address of the new PML4.
+
+fn proc_create_address_space() {
+    # Allocate 3 pages: PML4, PDPT, PD
+    var new_pml4 = pmm_alloc();
+    if (new_pml4 == 0) { return 0; }
+    var new_pdpt = pmm_alloc();
+    if (new_pdpt == 0) { return 0; }
+    var new_pd = pmm_alloc();
+    if (new_pd == 0) { return 0; }
+
+    # Zero all three pages
+    for (var i = 0; i < 4096; i = i + 8) {
+        store64(new_pml4 + i, 0);
+        store64(new_pdpt + i, 0);
+        store64(new_pd + i, 0);
+    }
+
+    # PML4[0] → PDPT (present + writable + user)
+    store64(new_pml4, new_pdpt | 0x07);
+    # PDPT[0] → PD (present + writable + user)
+    store64(new_pdpt, new_pd | 0x07);
+
+    # Copy kernel PD entries (first 16MB = entries 0-7) from kernel PD at 0x3000
+    for (var i = 0; i < 8; i = i + 1) {
+        var entry = load64(0x3000 + i * 8);
+        store64(new_pd + i * 8, entry);
+    }
+
+    return new_pml4;
+}
+
+# Map a 2MB page in a process's page directory (user-accessible)
+fn proc_map_page(cr3, virt, phys) {
+    # Get PD address from PML4 → PDPT → PD chain
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    # Write PD entry
+    var pd_idx = (virt >> 21) & 0x1FF;
+    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
+    return 0;
 }
 
 # === Context Switch + Scheduler ===
@@ -941,7 +1006,7 @@ fn sched_next() {
 # We save these into the process table for later restoration.
 fn proc_save_context(pid, isr_rsp) {
     if (pid >= proc_count) { return 0; }
-    var p = &proc_table + pid * PROC_SIZE;
+    var p = &proc_table + pid * 168;
     # ISR stack layout (top to bottom, growing down):
     # [isr_rsp+0]  = rax (pushed last by our ISR)
     # [isr_rsp+8]  = rcx
@@ -977,7 +1042,7 @@ fn proc_save_context(pid, isr_rsp) {
 # and our ISR pops will restore the GPRs.
 fn proc_restore_context(pid, isr_rsp) {
     if (pid >= proc_count) { return 0; }
-    var p = &proc_table + pid * PROC_SIZE;
+    var p = &proc_table + pid * 168;
     store64(isr_rsp, load64(p + 32));       # rax
     store64(isr_rsp + 8, load64(p + 48));   # rcx
     store64(isr_rsp + 16, load64(p + 56));  # rdx
@@ -1017,6 +1082,15 @@ fn do_context_switch(isr_rsp) {
     proc_current = new_pid;
     proc_set_state(new_pid, 2);  # → running
     proc_restore_context(new_pid, isr_rsp);
+
+    # Switch page tables if different
+    var new_cr3 = proc_get_cr3(new_pid);
+    var old_cr3 = proc_get_cr3(old);
+    if (new_cr3 != old_cr3) {
+        var cr3_load = new_cr3;
+        asm { mov cr3, rax; }
+    }
+
     return 0;
 }
 
@@ -1652,6 +1726,73 @@ serial_println("", 0);
 serial_print("Scheduler test done. Timer ticks: ", 34);
 kprint_num(timer_ticks);
 serial_println("", 0);
+
+# === Memory Isolation Test ===
+serial_println("Memory isolation test...", 23);
+
+# Create two address spaces
+var as1 = proc_create_address_space();
+var as2 = proc_create_address_space();
+
+# Map virtual address 0xC00000 (12MB) in each, to different 2MB physical regions.
+# We need 2MB-aligned physical addresses since we use huge pages.
+# Use PMM to allocate 512 contiguous 4KB pages (= 2MB) for each.
+# Simpler: just use known free 2MB-aligned regions.
+# First 16MB is identity-mapped. Regions 0xE00000 (14MB) and 0x1000000 (16MB) should be free.
+var phys1 = 0xE00000;
+var phys2 = 0x1000000;
+# Mark these PMM pages as used
+for (var pi = 0; pi < 512; pi = pi + 1) {
+    pmm_set(phys1 / 0x1000 + pi);
+    pmm_set(phys2 / 0x1000 + pi);
+}
+# Ensure phys2 region is mapped in kernel page tables
+if (vmm_is_mapped(phys2) == 0) {
+    vmm_map(phys2, phys2, 0x83);
+}
+proc_map_page(as1, 0xC00000, phys1);
+proc_map_page(as2, 0xC00000, phys2);
+
+# Write different values via each address space.
+# Switch to AS1, write 0xAAAA to 0xC00000
+var switch1 = as1;
+asm { mov cr3, rax; }
+store64(0xC00000, 0xAAAA);
+var val_as1 = load64(0xC00000);
+
+# Switch to AS2, write 0xBBBB to same virtual address
+var switch2 = as2;
+asm { mov cr3, rax; }
+store64(0xC00000, 0xBBBB);
+var val_as2 = load64(0xC00000);
+
+# Switch back to AS1, read again — should still be 0xAAAA
+var switch1b = as1;
+asm { mov cr3, rax; }
+var val_as1_check = load64(0xC00000);
+
+# Restore kernel page tables
+var kern_cr3_restore = 0x1000;
+asm { mov cr3, rax; }
+
+serial_print("AS1 wrote 0xAAAA, read=", 22);
+kprint_num(val_as1);
+serial_print(" recheck=", 9);
+kprint_num(val_as1_check);
+serial_println("", 0);
+serial_print("AS2 wrote 0xBBBB, read=", 22);
+kprint_num(val_as2);
+serial_println("", 0);
+
+if (val_as1_check == 0xAAAA) {
+    if (val_as2 == 0xBBBB) {
+        serial_println("Memory isolation: PASS", 22);
+    } else {
+        serial_println("Memory isolation: FAIL (AS2)", 28);
+    }
+} else {
+    serial_println("Memory isolation: FAIL (AS1 clobbered)", 38);
+}
 
 # === Ring 3 Test ===
 # Mark kernel code/data pages (0x0-0x200000) as user-accessible
