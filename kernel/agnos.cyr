@@ -264,31 +264,151 @@ fn kb_read_scancode() {
     return sc;
 }
 
-# Simple scancode-to-ASCII for printable keys (US QWERTY, set 1)
-fn scancode_to_ascii(sc) {
-    # Only handle key press (bit 7 = 0), skip releases
-    if (sc > 127) { return 0; }
-    # Row by row mapping of common keys
-    if (sc == 2) { return 49; }   # 1
-    if (sc == 3) { return 50; }   # 2
-    if (sc == 4) { return 51; }   # 3
-    if (sc == 5) { return 52; }   # 4
-    if (sc == 16) { return 113; } # q
-    if (sc == 17) { return 119; } # w
-    if (sc == 18) { return 101; } # e
-    if (sc == 19) { return 114; } # r
-    if (sc == 20) { return 116; } # t
-    if (sc == 21) { return 121; } # y
-    if (sc == 30) { return 97; }  # a
-    if (sc == 31) { return 115; } # s
-    if (sc == 32) { return 100; } # d
-    if (sc == 33) { return 102; } # f
-    if (sc == 44) { return 122; } # z
-    if (sc == 45) { return 120; } # x
-    if (sc == 46) { return 99; }  # c
-    if (sc == 57) { return 32; }  # space
-    if (sc == 28) { return 10; }  # enter
+# === Scancode-to-ASCII (US QWERTY, Set 1) ===
+# Full keyboard map with shift support.
+# Lookup tables: 128 bytes each, indexed by scancode.
+
+var kb_shift = 0;
+var kb_caps = 0;
+var kb_ctrl = 0;
+
+# Unshifted scancode table (128 entries, 1 byte each)
+var sc_normal[128];
+# Shifted scancode table
+var sc_shifted[128];
+
+fn kb_init_tables() {
+    # Zero both tables
+    for (var i = 0; i < 128; i = i + 1) {
+        store8(&sc_normal + i, 0);
+        store8(&sc_shifted + i, 0);
+    }
+    # Escape (0x01)
+    store8(&sc_normal + 1, 27);    store8(&sc_shifted + 1, 27);
+    # Number row: 1-9, 0 (scancodes 0x02-0x0B)
+    store8(&sc_normal + 2, 49);    store8(&sc_shifted + 2, 33);    # 1 !
+    store8(&sc_normal + 3, 50);    store8(&sc_shifted + 3, 64);    # 2 @
+    store8(&sc_normal + 4, 51);    store8(&sc_shifted + 4, 35);    # 3 #
+    store8(&sc_normal + 5, 52);    store8(&sc_shifted + 5, 36);    # 4 $
+    store8(&sc_normal + 6, 53);    store8(&sc_shifted + 6, 37);    # 5 %
+    store8(&sc_normal + 7, 54);    store8(&sc_shifted + 7, 94);    # 6 ^
+    store8(&sc_normal + 8, 55);    store8(&sc_shifted + 8, 38);    # 7 &
+    store8(&sc_normal + 9, 56);    store8(&sc_shifted + 9, 42);    # 8 *
+    store8(&sc_normal + 10, 57);   store8(&sc_shifted + 10, 40);   # 9 (
+    store8(&sc_normal + 11, 48);   store8(&sc_shifted + 11, 41);   # 0 )
+    # - = (0x0C-0x0D)
+    store8(&sc_normal + 12, 45);   store8(&sc_shifted + 12, 95);   # - _
+    store8(&sc_normal + 13, 61);   store8(&sc_shifted + 13, 43);   # = +
+    # Backspace (0x0E), Tab (0x0F)
+    store8(&sc_normal + 14, 8);    store8(&sc_shifted + 14, 8);    # backspace
+    store8(&sc_normal + 15, 9);    store8(&sc_shifted + 15, 9);    # tab
+    # QWERTY row (0x10-0x1B)
+    store8(&sc_normal + 16, 113);  store8(&sc_shifted + 16, 81);   # q Q
+    store8(&sc_normal + 17, 119);  store8(&sc_shifted + 17, 87);   # w W
+    store8(&sc_normal + 18, 101);  store8(&sc_shifted + 18, 69);   # e E
+    store8(&sc_normal + 19, 114);  store8(&sc_shifted + 19, 82);   # r R
+    store8(&sc_normal + 20, 116);  store8(&sc_shifted + 20, 84);   # t T
+    store8(&sc_normal + 21, 121);  store8(&sc_shifted + 21, 89);   # y Y
+    store8(&sc_normal + 22, 117);  store8(&sc_shifted + 22, 85);   # u U
+    store8(&sc_normal + 23, 105);  store8(&sc_shifted + 23, 73);   # i I
+    store8(&sc_normal + 24, 111);  store8(&sc_shifted + 24, 79);   # o O
+    store8(&sc_normal + 25, 112);  store8(&sc_shifted + 25, 80);   # p P
+    store8(&sc_normal + 26, 91);   store8(&sc_shifted + 26, 123);  # [ {
+    store8(&sc_normal + 27, 93);   store8(&sc_shifted + 27, 125);  # ] }
+    # Enter (0x1C)
+    store8(&sc_normal + 28, 10);   store8(&sc_shifted + 28, 10);   # enter
+    # ASDF row (0x1E-0x28)
+    store8(&sc_normal + 30, 97);   store8(&sc_shifted + 30, 65);   # a A
+    store8(&sc_normal + 31, 115);  store8(&sc_shifted + 31, 83);   # s S
+    store8(&sc_normal + 32, 100);  store8(&sc_shifted + 32, 68);   # d D
+    store8(&sc_normal + 33, 102);  store8(&sc_shifted + 33, 70);   # f F
+    store8(&sc_normal + 34, 103);  store8(&sc_shifted + 34, 71);   # g G
+    store8(&sc_normal + 35, 104);  store8(&sc_shifted + 35, 72);   # h H
+    store8(&sc_normal + 36, 106);  store8(&sc_shifted + 36, 74);   # j J
+    store8(&sc_normal + 37, 107);  store8(&sc_shifted + 37, 75);   # k K
+    store8(&sc_normal + 38, 108);  store8(&sc_shifted + 38, 76);   # l L
+    store8(&sc_normal + 39, 59);   store8(&sc_shifted + 39, 58);   # ; :
+    store8(&sc_normal + 40, 39);   store8(&sc_shifted + 40, 34);   # ' "
+    # Backtick (0x29)
+    store8(&sc_normal + 41, 96);   store8(&sc_shifted + 41, 126);  # ` ~
+    # Backslash (0x2B)
+    store8(&sc_normal + 43, 92);   store8(&sc_shifted + 43, 124);  # \ |
+    # ZXCV row (0x2C-0x35)
+    store8(&sc_normal + 44, 122);  store8(&sc_shifted + 44, 90);   # z Z
+    store8(&sc_normal + 45, 120);  store8(&sc_shifted + 45, 88);   # x X
+    store8(&sc_normal + 46, 99);   store8(&sc_shifted + 46, 67);   # c C
+    store8(&sc_normal + 47, 118);  store8(&sc_shifted + 47, 86);   # v V
+    store8(&sc_normal + 48, 98);   store8(&sc_shifted + 48, 66);   # b B
+    store8(&sc_normal + 49, 110);  store8(&sc_shifted + 49, 78);   # n N
+    store8(&sc_normal + 50, 109);  store8(&sc_shifted + 50, 77);   # m M
+    store8(&sc_normal + 51, 44);   store8(&sc_shifted + 51, 60);   # , <
+    store8(&sc_normal + 52, 46);   store8(&sc_shifted + 52, 62);   # . >
+    store8(&sc_normal + 53, 47);   store8(&sc_shifted + 53, 63);   # / ?
+    # Space (0x39)
+    store8(&sc_normal + 57, 32);   store8(&sc_shifted + 57, 32);   # space
     return 0;
+}
+
+# Process a raw scancode: handle modifier keys, return ASCII or 0.
+fn scancode_to_ascii(sc) {
+    # Key release (bit 7 set)
+    if (sc > 127) {
+        var release = sc & 0x7F;
+        # Left/right shift release
+        if (release == 42) { kb_shift = 0; return 0; }
+        if (release == 54) { kb_shift = 0; return 0; }
+        # Left/right ctrl release
+        if (release == 29) { kb_ctrl = 0; return 0; }
+        return 0;
+    }
+    # Modifier key press
+    if (sc == 42) { kb_shift = 1; return 0; }   # left shift
+    if (sc == 54) { kb_shift = 1; return 0; }   # right shift
+    if (sc == 29) { kb_ctrl = 1; return 0; }    # left ctrl
+    if (sc == 58) {                              # caps lock toggle
+        if (kb_caps == 0) { kb_caps = 1; }
+        else { kb_caps = 0; }
+        return 0;
+    }
+
+    # Bounds check
+    if (sc >= 128) { return 0; }
+
+    # Look up in table
+    var ch = 0;
+    if (kb_shift == 1) {
+        ch = load8(&sc_shifted + sc);
+    } else {
+        ch = load8(&sc_normal + sc);
+    }
+
+    # Apply caps lock (only affects a-z / A-Z)
+    if (kb_caps == 1) {
+        if (ch >= 97) {
+            if (ch <= 122) {
+                # lowercase → uppercase
+                ch = ch - 32;
+            }
+        } else {
+            if (ch >= 65) {
+                if (ch <= 90) {
+                    # uppercase → lowercase (shift+caps = lower)
+                    ch = ch + 32;
+                }
+            }
+        }
+    }
+
+    # Ctrl combinations: Ctrl+C = 3, Ctrl+D = 4, Ctrl+Z = 26, etc.
+    if (kb_ctrl == 1) {
+        if (ch >= 97) {
+            if (ch <= 122) {
+                return ch - 96;  # ctrl+a=1, ctrl+b=2, ... ctrl+z=26
+            }
+        }
+    }
+
+    return ch;
 }
 
 # === Page Tables ===
@@ -1103,9 +1223,13 @@ serial_println("Timer ISR installed", 19);
 
 kb_head = 0;
 kb_tail = 0;
+kb_shift = 0;
+kb_caps = 0;
+kb_ctrl = 0;
+kb_init_tables();
 kb_isr_build();
 idt_set_gate(&idt + 33 * 16, &kb_isr, 0x08, 0x8E);
-serial_println("Keyboard ISR installed", 22);
+serial_println("Keyboard ISR installed (full US QWERTY)", 40);
 
 pt_init();
 serial_print("Page tables: ", 13);
