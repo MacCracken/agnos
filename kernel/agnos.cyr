@@ -1581,6 +1581,125 @@ fn virtio_net_mac(dst) {
     return 0;
 }
 
+# === Network Stack (IP/UDP) ===
+var net_ip = 0;
+var net_gateway = 0;
+var net_netmask = 0;
+var net_pkt[256];
+var arp_cache_ip = 0;
+var arp_cache_mac[8];
+
+fn net_init(ip, gw, mask) {
+    net_ip = ip;
+    net_gateway = gw;
+    net_netmask = mask;
+    arp_cache_ip = 0;
+    return 0;
+}
+
+fn ip4(a, b, c, d) {
+    return (a << 24) | (b << 16) | (c << 8) | d;
+}
+
+fn ip_checksum(buf, len) {
+    var sum = 0;
+    var i = 0;
+    while (i < len) {
+        sum = sum + (load8(buf + i) << 8);
+        if (i + 1 < len) { sum = sum + load8(buf + i + 1); }
+        i = i + 2;
+    }
+    while (sum > 0xFFFF) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (~sum) & 0xFFFF;
+}
+
+fn eth_build(pkt, dst_mac, src_mac, ethertype) {
+    for (var i = 0; i < 6; i = i + 1) {
+        store8(pkt + i, load8(dst_mac + i));
+        store8(pkt + 6 + i, load8(src_mac + i));
+    }
+    store8(pkt + 12, (ethertype >> 8) & 0xFF);
+    store8(pkt + 13, ethertype & 0xFF);
+    return 14;
+}
+
+fn ip_build(pkt, src_ip, dst_ip, proto, payload_len) {
+    var total = 20 + payload_len;
+    store8(pkt, 0x45);
+    store8(pkt + 1, 0);
+    store8(pkt + 2, (total >> 8) & 0xFF);
+    store8(pkt + 3, total & 0xFF);
+    store16(pkt + 4, 0);
+    store16(pkt + 6, 0);
+    store8(pkt + 8, 64);
+    store8(pkt + 9, proto);
+    store16(pkt + 10, 0);
+    store8(pkt + 12, (src_ip >> 24) & 0xFF);
+    store8(pkt + 13, (src_ip >> 16) & 0xFF);
+    store8(pkt + 14, (src_ip >> 8) & 0xFF);
+    store8(pkt + 15, src_ip & 0xFF);
+    store8(pkt + 16, (dst_ip >> 24) & 0xFF);
+    store8(pkt + 17, (dst_ip >> 16) & 0xFF);
+    store8(pkt + 18, (dst_ip >> 8) & 0xFF);
+    store8(pkt + 19, dst_ip & 0xFF);
+    var cksum = ip_checksum(pkt, 20);
+    store8(pkt + 10, (cksum >> 8) & 0xFF);
+    store8(pkt + 11, cksum & 0xFF);
+    return 20;
+}
+
+fn udp_build(pkt, src_port, dst_port, data, data_len) {
+    var udp_len = 8 + data_len;
+    store8(pkt, (src_port >> 8) & 0xFF);
+    store8(pkt + 1, src_port & 0xFF);
+    store8(pkt + 2, (dst_port >> 8) & 0xFF);
+    store8(pkt + 3, dst_port & 0xFF);
+    store8(pkt + 4, (udp_len >> 8) & 0xFF);
+    store8(pkt + 5, udp_len & 0xFF);
+    store16(pkt + 6, 0);
+    for (var i = 0; i < data_len; i = i + 1) {
+        store8(pkt + 8 + i, load8(data + i));
+    }
+    return udp_len;
+}
+
+fn arp_request(target_ip) {
+    if (vnet_active == 0) { return 0 - 1; }
+    var p = &net_pkt;
+    var bcast[8];
+    for (var i = 0; i < 6; i = i + 1) { store8(&bcast + i, 0xFF); }
+    var off = eth_build(p, &bcast, &vnet_mac, 0x0806);
+    # ARP: htype=1(eth) ptype=0x0800(ipv4) hlen=6 plen=4 oper=1(request)
+    store16(p + off, 0x0001); store16(p + off + 2, 0x0800);
+    store8(p + off + 4, 6); store8(p + off + 5, 4);
+    store16(p + off + 6, 0x0001);
+    for (var i = 0; i < 6; i = i + 1) { store8(p + off + 8 + i, load8(&vnet_mac + i)); }
+    store8(p + off + 14, (net_ip >> 24) & 0xFF);
+    store8(p + off + 15, (net_ip >> 16) & 0xFF);
+    store8(p + off + 16, (net_ip >> 8) & 0xFF);
+    store8(p + off + 17, net_ip & 0xFF);
+    for (var i = 0; i < 6; i = i + 1) { store8(p + off + 18 + i, 0); }
+    store8(p + off + 24, (target_ip >> 24) & 0xFF);
+    store8(p + off + 25, (target_ip >> 16) & 0xFF);
+    store8(p + off + 26, (target_ip >> 8) & 0xFF);
+    store8(p + off + 27, target_ip & 0xFF);
+    return virtio_net_send(p, off + 28);
+}
+
+fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
+    if (vnet_active == 0) { return 0 - 1; }
+    # For now, use broadcast MAC (QEMU user-mode handles it)
+    var dst_mac[8];
+    for (var i = 0; i < 6; i = i + 1) { store8(&dst_mac + i, 0xFF); }
+    var p = &net_pkt;
+    var off = eth_build(p, &dst_mac, &vnet_mac, 0x0800);
+    var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
+    ip_build(p + off, net_ip, dst_ip, 17, udp_len);
+    return virtio_net_send(p, off + 20 + udp_len);
+}
+
 # === RAM Disk (initrd) ===
 # Format: [magic:4][count:4][entries...][data...]
 # Entry: [name:16][offset:8][size:8] = 32 bytes
@@ -1971,6 +2090,9 @@ fn sh_cmd_help() {
     serial_println("  free    - memory info", 23);
     serial_println("  cat     - read file", 21);
     serial_println("  uptime  - timer ticks", 23);
+    serial_println("  lspci   - PCI devices", 23);
+    serial_println("  net     - network info", 24);
+    serial_println("  send    - send UDP msg", 24);
     serial_println("  halt    - shutdown", 20);
     return 0;
 }
@@ -2060,6 +2182,26 @@ fn sh_exec(buf, len) {
             kprint_num(load64(base + 24));
             serial_println("", 0);
         }
+        return 0;
+    }
+    if (sh_streq(buf, clen, "net", 3) == 1) {
+        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
+        serial_print("IP: 10.0.2.15  MAC: ", 20);
+        for (var i = 0; i < 6; i = i + 1) {
+            kprint_num(load8(&vnet_mac + i));
+            if (i < 5) { serial_putc(58); }
+        }
+        serial_println("", 0);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "send", 4) == 1) {
+        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
+        if (arglen < 1) { serial_println("usage: send <msg>", 17); return 0; }
+        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
+        var r = udp_send(ip4(10,0,2,2), 1234, 5555, arg, arglen);
+        serial_print("sent ", 5);
+        kprint_num(r);
+        serial_println(" bytes", 6);
         return 0;
     }
     if (sh_streq(buf, clen, "halt", 4) == 1) { return 0 - 99; }
@@ -2235,6 +2377,8 @@ if (pci_find(0x1AF4, 0x1000) >= 0) {
             if (mi < 5) { serial_print(":", 1); }
         }
         serial_println("", 0);
+        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
+        serial_println("Net: 10.0.2.15/24 gw 10.0.2.2", 30);
     }
 }
 vfs_init();
