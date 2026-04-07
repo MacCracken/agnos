@@ -27,7 +27,11 @@ jobs:
         env:
           CYRIUS_VERSION: "1.8.2"
         run: |
-          curl -sSf "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh" | CYRIUS_VERSION=$CYRIUS_VERSION sh
+          export CYRIUS_VERSION=$CYRIUS_VERSION
+          curl -sSf "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh" -o /tmp/install-cyrius.sh
+          sh /tmp/install-cyrius.sh
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
+          ls $HOME/.cyrius/bin/cc2 $HOME/.cyrius/bin/cyrb
 
       - name: Build x86_64 kernel
         run: |
