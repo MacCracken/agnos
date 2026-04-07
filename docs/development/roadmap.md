@@ -1,8 +1,19 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.0.0 — x86_64 kernel, 106KB, boots to interactive shell with networking and SMP
+> **Current**: v1.1.0 — x86_64 + aarch64, 97KB/43KB, 25 syscalls, multi-arch, kybernet-ready
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
+
+## Completed (v1.1.0)
+
+| # | Item | Version |
+|---|------|---------|
+| 17 | Multi-arch split (33 files) | v1.1.0 |
+| 18 | aarch64 port (serial, GIC, timer, PMM) | v1.1.0 |
+| 19 | 17 new syscalls (signals, epoll, timerfd) | v1.1.0 |
+| 20 | kybernet dual-backend (Linux/AGNOS) | v1.1.0 |
+| 21 | Benchmarks + CI parity | v1.1.0 |
+| 22 | SP patch trampoline eliminated | v1.1.0 |
 
 ## Completed (v1.0.0)
 
@@ -70,16 +81,19 @@ kernel/
 └── agnos.cyr             # main: includes arch/<ARCH>/* + core/* + user/*
 ```
 
-**Blockers** (tracked on Cyrius roadmap as Tooling Issues):
-1. ~~`include` in kernel mode~~ — **Fixed** in Cyrius v1.6.1. `kernel; include "lib/..."` now works.
-2. ~~`cyrb --aarch64` path resolution~~ — **Fixed** in Cyrius v1.6.1.
-3. **Release tarball missing cc2_aarch64** — x86_64 release doesn't bundle cross-compiler.
+**All blockers resolved** (Cyrius 1.7.0):
+1. ~~`include` in kernel mode~~ — **Fixed** v1.6.1
+2. ~~`cyrb --aarch64` path resolution~~ — **Fixed** v1.6.1
+3. ~~Release tarball missing cc2_aarch64~~ — **Fixed** v1.7.0 (included in x86_64 tarball)
+4. ~~aarch64 kernel SP setup~~ — **Fixed** v1.6.2 (compiler emits preamble)
+5. ~~aarch64 string fixups~~ — **Fixed** v1.6.2
+6. ~~Nested for-loops with var~~ — **Fixed** v1.7.0
+7. ~~ifdef in included files~~ — **Fixed** v1.6.5 (multi-pass preprocessor)
 
-**All major blockers resolved.** Multi-arch split can proceed with Cyrius >= 1.6.1.
-
-**Interim workaround**: `scripts/build.sh` concatenates arch + core files before piping to `cyrb build`:
+Multi-arch split complete (v1.1.0). Build uses `#ifdef ARCH_<NAME>` + `include`:
 ```sh
-cat kernel/arch/$ARCH/*.cyr kernel/core/*.cyr kernel/user/*.cyr | cyrb build - build/agnos
+cyrb build -D ARCH_X86_64 kernel/agnos.cyr build/agnos
+cyrb build -D ARCH_AARCH64 --aarch64 kernel/agnos.cyr build/agnos-aarch64
 ```
 
 **Step 2: Define arch interface** — each arch must provide:

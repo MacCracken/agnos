@@ -212,7 +212,7 @@ fn sh_exec(buf, len) {
 }
 
 fn shell() {
-    serial_println("AGNOS shell v1.0 (type 'help')", 30);
+    serial_println("AGNOS shell v1.1 (type 'help')", 30);
     var sh_running = 1;
     while (sh_running == 1) {
         serial_print("agnos> ", 7);
