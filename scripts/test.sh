@@ -3,15 +3,15 @@
 # Supports: x86_64 (default), aarch64 (--aarch64), both (--all)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CYRIUS="$ROOT/../cyrius"
-# Find toolchain: ~/.cyrius/bin/ (installer) or ../cyrius/build/ (dev)
-if [ -x "$HOME/.cyrius/bin/cyrb" ]; then
-    CC="$HOME/.cyrius/bin/cc2"
-    CC_ARM="$HOME/.cyrius/bin/cc2_aarch64"
-    CYRB="$HOME/.cyrius/bin/cyrb"
-else
+# Find toolchain: ../cyrius/build/ (CI/dev) then ~/.cyrius/bin/ (installer)
+if [ -x "${CYRIUS}/build/cyrb" ]; then
     CC="${CYRIUS}/build/cc2"
     CC_ARM="${CYRIUS}/build/cc2_aarch64"
     CYRB="${CYRIUS}/build/cyrb"
+elif [ -x "$HOME/.cyrius/bin/cyrb" ]; then
+    CC="$HOME/.cyrius/bin/cc2"
+    CC_ARM="$HOME/.cyrius/bin/cc2_aarch64"
+    CYRB="$HOME/.cyrius/bin/cyrb"
 fi
 pass=0
 fail=0

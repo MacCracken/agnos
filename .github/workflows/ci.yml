@@ -30,6 +30,7 @@ jobs:
           cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 kernel/build/cc2
           chmod +x $HOME/.cyrius/bin/* kernel/build/cc2
           $HOME/.cyrius/bin/cyrb --help | head -1
+          echo "cc2: $(file $HOME/.cyrius/bin/cc2 | grep -o 'x86-64\|aarch64')"
 
       - name: Test x86_64
         run: sh scripts/test.sh
@@ -84,6 +85,7 @@ jobs:
           cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 kernel/build/cc2
           chmod +x $HOME/.cyrius/bin/* kernel/build/cc2
           $HOME/.cyrius/bin/cyrb --help | head -1
+          echo "cc2: $(file $HOME/.cyrius/bin/cc2 | grep -o 'x86-64\|aarch64')"
 
       - name: Build kernel
         run: sh scripts/build.sh
@@ -115,6 +117,7 @@ jobs:
           cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 kernel/build/cc2
           chmod +x $HOME/.cyrius/bin/* kernel/build/cc2
           $HOME/.cyrius/bin/cyrb --help | head -1
+          echo "cc2: $(file $HOME/.cyrius/bin/cc2 | grep -o 'x86-64\|aarch64')"
 
       - name: Run benchmarks
         run: sh scripts/bench.sh
