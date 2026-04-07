@@ -12,7 +12,7 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
     env:
-      CYRIUS_VERSION: "1.8.5"
+      CYRIUS_VERSION: "1.9.0"
     steps:
       - uses: actions/checkout@v4
 

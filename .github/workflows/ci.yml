@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CYRIUS_VERSION: "1.8.5"
+  CYRIUS_VERSION: "1.9.0"
 
 jobs:
   validate:

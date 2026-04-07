@@ -35,5 +35,5 @@ rm -rf "$SRC"
 
 # Verify
 [ -x "$DEST/cc2" ] && echo "  cc2:  ok" || { echo "  error: cc2 not found"; exit 1; }
-[ -x "$DEST/cyrb" ] && echo "  cyrb: ok" || echo "  warn: cyrb not in release"
+[ -x "$DEST/cyrb" ] && echo "  cyrb: ok" || echo "  warn: cyrb not found"
 echo "  done"

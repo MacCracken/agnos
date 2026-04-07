@@ -16,6 +16,7 @@ elif [ -x "${CYRIUS}/build/cyrb" ]; then
     CC="${CYRIUS}/build/cc2"
     CC_ARM="${CYRIUS}/build/cc2_aarch64"
 fi
+echo "  toolchain: CYRB=$CYRB CC=$CC" >&2
 ARCH="x86_64"
 
 # Parse args
