@@ -37,7 +37,7 @@ fn serial_dev_read(buf, count) {
     while (n < count) {
         if (kb_has_key() == 0) {
             if (n > 0) { return n; }
-            asm { hlt; }
+            arch_wait();
         } else {
             var sc = kb_read_scancode();
             var ch = scancode_to_ascii(sc);

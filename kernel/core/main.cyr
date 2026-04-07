@@ -176,8 +176,8 @@ asm { sti; }
 serial_println("Interrupts enabled", 18);
 
 # Wait a few ticks before activating scheduler
-asm { hlt; }
-asm { hlt; }
+arch_wait();
+arch_wait();
 serial_print("Timer ticks before sched: ", 26);
 kprint_num(timer_ticks);
 serial_println("", 0);
@@ -189,7 +189,7 @@ sched_active = 1;
 # After enough ticks, deactivate and report
 var idle_count = 0;
 while (idle_count < 50) {
-    asm { hlt; }
+    arch_wait();
     idle_count = idle_count + 1;
 }
 
@@ -323,4 +323,4 @@ serial_println("Launching kybernet...", 21);
 kybernet();
 
 serial_println("Halted.", 7);
-asm { cli; hlt; 0xEB; 0xFE; }
+arch_halt();

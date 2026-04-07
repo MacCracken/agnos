@@ -90,3 +90,6 @@ fn rdtsc() {
     asm { 0x42; 0xE0; 0x3B; 0xD5; 0xE0; 0x03; 0x00; 0xF9; }
     return count;
 }
+
+fn arch_wait() { wfi(); return 0; }
+fn arch_halt() { wfi(); return 0; }

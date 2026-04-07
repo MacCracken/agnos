@@ -71,3 +71,6 @@ fn rdtsc() {
     }
     return result;
 }
+
+fn arch_wait() { asm { hlt; } return 0; }
+fn arch_halt() { asm { cli; hlt; 0xEB; 0xFE; } return 0; }

@@ -58,7 +58,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # Simple busy-wait for now; returns exit code
         if (arg1 >= proc_count) { return 0 - 1; }
         while (proc_get_state(arg1) != 0) {
-            asm { hlt; }
+            arch_wait();
         }
         return sys_exit_code;
     }
@@ -76,10 +76,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 11) { return 0; }             # mount (noop for now)
     if (num == 13) {                          # reboot
         serial_println("AGNOS: reboot", 13);
-        asm { cli; hlt; 0xEB; 0xFE; }
+        arch_halt();
         return 0;
     }
-    if (num == 14) { asm { hlt; } return 0; } # pause
+    if (num == 14) { arch_wait(); return 0; } # pause
     # Tier 3: signals
     if (num == 16) {
         # kill(pid=arg1, sig=arg2)
@@ -163,7 +163,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 }
             }
         }
-        if (found == 0) { asm { hlt; } }
+        if (found == 0) { arch_wait(); }
         return found;
     }
     if (num == 22) {

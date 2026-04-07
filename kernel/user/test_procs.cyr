@@ -5,7 +5,7 @@
 fn test_proc_a() {
     while (1 == 1) {
         serial_print("A", 1);
-        asm { hlt; }
+        arch_wait();
     }
     return 0;
 }
@@ -13,7 +13,7 @@ fn test_proc_a() {
 fn test_proc_b() {
     while (1 == 1) {
         serial_print("B", 1);
-        asm { hlt; }
+        arch_wait();
     }
     return 0;
 }

@@ -220,7 +220,7 @@ fn shell() {
         # Read line character by character
         var reading = 1;
         while (reading == 1) {
-            if (kb_has_key() == 0) { asm { hlt; } }
+            if (kb_has_key() == 0) { arch_wait(); }
             else {
                 var sc = kb_read_scancode();
                 var ch = scancode_to_ascii(sc);
