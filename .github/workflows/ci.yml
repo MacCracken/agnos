@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CYRIUS_VERSION: "1.7.1"
+  CYRIUS_VERSION: "1.8.2"
 
 jobs:
   # ── Build + test on GitHub-hosted ──
@@ -25,7 +25,7 @@ jobs:
         run: |
           curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          mkdir -p ../cyrius/build
+          mkdir -p ../cyrius/build build
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" ../cyrius/build/cc2
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb" ../cyrius/build/cyrb
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" build/cc2
@@ -80,7 +80,7 @@ jobs:
         run: |
           curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          mkdir -p ../cyrius/build
+          mkdir -p ../cyrius/build build
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" ../cyrius/build/cc2
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb" ../cyrius/build/cyrb
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" build/cc2
@@ -111,7 +111,7 @@ jobs:
         run: |
           curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          mkdir -p ../cyrius/build
+          mkdir -p ../cyrius/build build
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" ../cyrius/build/cc2
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb" ../cyrius/build/cyrb
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" build/cc2
