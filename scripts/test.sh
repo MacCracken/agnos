@@ -33,7 +33,10 @@ test_x86() {
     # cyrb looks for cc2 at ./build/cc2 relative to CWD
     rm -f /tmp/agnos_test
     if [ -x "$CYRB" ]; then
-        (cd "$ROOT" && cd kernel && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" /tmp/agnos_test) 2>&1
+        PREPPED="/tmp/agnos_prepped.cyr"
+        (echo '#define ARCH_X86_64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
+        (cd "$ROOT" && cd kernel && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build "$PREPPED" /tmp/agnos_test) 2>&1
+        rm -f "$PREPPED"
     else
         echo "ERROR: cyrb not found at $CYRB" >&2
     fi

@@ -41,7 +41,10 @@ if [ "$ARCH" = "aarch64" ]; then
     fi
     echo "Building AGNOS kernel [aarch64]..."
     if [ -x "$CYRB" ]; then
-        (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build --aarch64 -D ARCH_AARCH64 "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos-aarch64")
+        PREPPED_ARM="/tmp/agnos_arm.cyr"
+        (echo '#define ARCH_AARCH64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
+        (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build --aarch64 "$PREPPED_ARM" "$ROOT/build/agnos-aarch64")
+        rm -f "$PREPPED_ARM"
     else
         cat "$ROOT/kernel/agnos.cyr" | "$CC_ARM" > "$ROOT/build/agnos-aarch64"
     fi
@@ -51,12 +54,16 @@ if [ "$ARCH" = "aarch64" ]; then
     echo "Boot: qemu-system-aarch64 -M virt -cpu cortex-a57 -kernel build/agnos-aarch64 -serial stdio -display none"
 else
     echo "Building AGNOS kernel [x86_64]..."
+    # Prepend #define so it works regardless of cyrb -D support
+    PREPPED="/tmp/agnos_x86.cyr"
+    (echo '#define ARCH_X86_64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
     if [ -x "$CYRB" ]; then
-        (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos")
+        (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build "$PREPPED" "$ROOT/build/agnos")
     else
-        cat "$ROOT/kernel/agnos.cyr" | "$CC" > "$ROOT/build/agnos"
+        cat "$PREPPED" | "$CC" > "$ROOT/build/agnos"
         chmod +x "$ROOT/build/agnos"
     fi
+    rm -f "$PREPPED"
     SZ=$(wc -c < "$ROOT/build/agnos")
     echo "  -> build/agnos ($SZ bytes)"
 

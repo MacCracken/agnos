@@ -70,6 +70,19 @@ jobs:
           sh scripts/ci-cyrius.sh $CYRIUS_VERSION
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
 
+      - name: Debug toolchain
+        run: |
+          echo "cyrb: $(file $HOME/.cyrius/bin/cyrb)"
+          echo "cc2: $(file $HOME/.cyrius/bin/cc2)"
+          echo "cyrb size: $(wc -c < $HOME/.cyrius/bin/cyrb)"
+          echo "cc2 size: $(wc -c < $HOME/.cyrius/bin/cc2)"
+          $HOME/.cyrius/bin/cyrb --help | head -1
+          echo "=== Direct cc2 test ==="
+          echo 'kernel; var x = 42; asm { cli; hlt; 0xEB; 0xFE; }' | $HOME/.cyrius/bin/cc2 > /tmp/cc2_test && echo "cc2 direct: OK ($(wc -c < /tmp/cc2_test) bytes)" || echo "cc2 direct: FAIL"
+          echo "=== cyrb -D test ==="
+          echo 'kernel; #ifdef T var x = 1; #endif asm { cli; hlt; 0xEB; 0xFE; }' > /tmp/dtest.cyr
+          (cd kernel && mkdir -p build && cp $HOME/.cyrius/bin/cc2 build/cc2 && $HOME/.cyrius/bin/cyrb build -D T /tmp/dtest.cyr /tmp/dtest_out 2>&1) && echo "cyrb -D: OK ($(wc -c < /tmp/dtest_out) bytes)" || echo "cyrb -D: FAIL"
+
       - name: Build kernel
         run: sh scripts/build.sh
 
