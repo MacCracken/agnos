@@ -6,9 +6,16 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CYRIUS="$ROOT/../cyrius"
-CYRB="${CYRIUS}/build/cyrb"
-CC="${CYRIUS}/build/cc2"
-CC_ARM="${CYRIUS}/build/cc2_aarch64"
+# Find toolchain: ~/.cyrius/bin/ (installer) or ../cyrius/build/ (dev)
+if [ -x "$HOME/.cyrius/bin/cyrb" ]; then
+    CYRB="$HOME/.cyrius/bin/cyrb"
+    CC="$HOME/.cyrius/bin/cc2"
+    CC_ARM="$HOME/.cyrius/bin/cc2_aarch64"
+else
+    CYRB="${CYRIUS}/build/cyrb"
+    CC="${CYRIUS}/build/cc2"
+    CC_ARM="${CYRIUS}/build/cc2_aarch64"
+fi
 ARCH="x86_64"
 
 # Parse args
