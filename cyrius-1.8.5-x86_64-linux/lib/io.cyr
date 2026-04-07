@@ -1,0 +1,83 @@
+# io.cyr — file I/O library
+# Usage: include "lib/io.cyr"
+# Wraps Linux syscalls for file operations.
+
+# Open flags
+var O_RDONLY = 0;
+var O_WRONLY = 1;
+var O_RDWR = 2;
+var O_CREAT = 64;
+var O_TRUNC = 512;
+var O_APPEND = 1024;
+
+# File descriptors
+var STDIN = 0;
+var STDOUT = 1;
+var STDERR = 2;
+
+# Open a file with given flags and mode, return fd
+fn file_open(path, flags, mode) {
+    return syscall(2, path, flags, mode);
+}
+
+# Close a file descriptor
+fn file_close(fd) {
+    return syscall(3, fd);
+}
+
+# Read up to len bytes from fd into buf
+fn file_read(fd, buf, len) {
+    return syscall(0, fd, buf, len);
+}
+
+# Write len bytes from buf to fd
+fn file_write(fd, buf, len) {
+    return syscall(1, fd, buf, len);
+}
+
+# Read entire file into buffer. Returns bytes read.
+fn file_read_all(path, buf, maxlen) {
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) { return fd; }
+    var total: i64 = 0;
+    var rgo: i64 = 1;
+    while (rgo == 1) {
+        var n = file_read(fd, buf + total, maxlen - total);
+        if (n <= 0) { rgo = 0; }
+        else {
+            total = total + n;
+            if (total >= maxlen) { rgo = 0; }
+        }
+    }
+    file_close(fd);
+    return total;
+}
+
+# Write buffer to file. Returns bytes written or error.
+fn file_write_all(path, buf, len) {
+    var fd = file_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0x1A4);
+    if (fd < 0) { return fd; }
+    var written = file_write(fd, buf, len);
+    file_close(fd);
+    return written;
+}
+
+# Check if file exists (try to open read-only)
+fn file_exists(path) {
+    var fd = file_open(path, 0, 0);
+    if (fd < 0) { return 0; }
+    file_close(fd);
+    return 1;
+}
+
+# Write string to stdout
+fn print(msg, len) {
+    file_write(STDOUT, msg, len);
+    return 0;
+}
+
+# Write string to stderr
+fn eprint(msg, len) {
+    file_write(STDERR, msg, len);
+    return 0;
+}
