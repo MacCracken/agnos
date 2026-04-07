@@ -29,9 +29,10 @@ jobs:
         run: |
           curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          mkdir -p $HOME/.cyrius/bin
+          mkdir -p $HOME/.cyrius/bin kernel/build
           cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/* $HOME/.cyrius/bin/
-          chmod +x $HOME/.cyrius/bin/*
+          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 kernel/build/cc2
+          chmod +x $HOME/.cyrius/bin/* kernel/build/cc2
           $HOME/.cyrius/bin/cyrb --help | head -1
 
       - name: Build x86_64 kernel
