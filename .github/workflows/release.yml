@@ -32,7 +32,8 @@ jobs:
           mkdir -p ../cyrius/build
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" ../cyrius/build/cc2
           cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb" ../cyrius/build/cyrb
-          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb
+          cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" build/cc2
+          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb build/cc2
 
       - name: Build x86_64 kernel
         run: |

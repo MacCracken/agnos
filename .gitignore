@@ -19,3 +19,4 @@ Thumbs.db
 *.tmp
 /tmp/
 *.tar.gz
+kernel/build/

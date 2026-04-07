@@ -23,9 +23,10 @@ test_x86() {
     echo "=== AGNOS Kernel Tests [x86_64] ==="
 
     # Build kernel (requires cyrb for multi-file includes)
+    # cyrb looks for cc2 at ./build/cc2 relative to CWD
     rm -f /tmp/agnos_test
     if [ -x "$CYRB" ]; then
-        (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" /tmp/agnos_test) 2>&1
+        (cd "$ROOT" && cd kernel && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" /tmp/agnos_test) 2>&1
     else
         echo "ERROR: cyrb not found at $CYRB" >&2
     fi

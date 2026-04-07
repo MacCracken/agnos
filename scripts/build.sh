@@ -33,7 +33,7 @@ if [ "$ARCH" = "aarch64" ]; then
     fi
     echo "Building AGNOS kernel [aarch64]..."
     if [ -x "$CYRB" ]; then
-        (cd "$ROOT/kernel" && "$CYRB" build --aarch64 -D ARCH_AARCH64 "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos-aarch64")
+        (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build --aarch64 -D ARCH_AARCH64 "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos-aarch64")
     else
         cat "$ROOT/kernel/agnos.cyr" | "$CC_ARM" > "$ROOT/build/agnos-aarch64"
     fi
@@ -44,7 +44,7 @@ if [ "$ARCH" = "aarch64" ]; then
 else
     echo "Building AGNOS kernel [x86_64]..."
     if [ -x "$CYRB" ]; then
-        (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos")
+        (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos")
     else
         cat "$ROOT/kernel/agnos.cyr" | "$CC" > "$ROOT/build/agnos"
         chmod +x "$ROOT/build/agnos"
