@@ -8,17 +8,32 @@ CYRB="$ROOT/../cyrius/build/cyrb"
 BENCH_KERNEL="/tmp/agnos_bench.cyr"
 
 echo "Building AGNOS with benchmarks..."
-sed 's/serial_println("Launching kybernet/sh_cmd_bench();\nserial_println("Launching kybernet/' \
-    "$ROOT/kernel/agnos.cyr" > "$BENCH_KERNEL"
+MAIN_CYR="$ROOT/kernel/core/main.cyr"
+MAIN_BAK="$MAIN_CYR.bak"
+cp "$MAIN_CYR" "$MAIN_BAK"
+# Replace kybernet() with bench + halt; skip exec_and_wait
+# Make test procs exit immediately so scheduler doesn't block
+TPROC_CYR="$ROOT/kernel/user/test_procs.cyr"
+TPROC_BAK="$TPROC_CYR.bak"
+cp "$TPROC_CYR" "$TPROC_BAK"
+sed -i 's/while (1 == 1) {/if (0 == 1) {/' "$TPROC_CYR"
+sed -i 's/exec_and_wait(exec_entry, exec_rsp, exec_cr3);/# skipped/' "$MAIN_CYR"
+sed -i 's/kybernet();/sh_cmd_bench(); arch_halt();/' "$MAIN_CYR"
 
 if [ -x "$CYRB" ]; then
-    (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$BENCH_KERNEL" /tmp/agnos_bench) 2>&1
+    (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" /tmp/agnos_bench) 2>&1
+    RESULT=$?
+    mv "$MAIN_BAK" "$MAIN_CYR"
+    mv "$TPROC_BAK" "$TPROC_CYR"
+    if [ $RESULT -ne 0 ]; then exit 1; fi
 else
+    mv "$MAIN_BAK" "$MAIN_CYR"
+    mv "$TPROC_BAK" "$TPROC_CYR"
     echo "ERROR: cyrb required" >&2; exit 1
 fi
 
 echo "Booting on QEMU (15s timeout)..."
-OUTPUT=$(timeout 15 qemu-system-x86_64 -kernel /tmp/agnos_bench -serial stdio -display none -no-reboot 2>/dev/null || true)
+OUTPUT=$(timeout 15 qemu-system-x86_64 -kernel /tmp/agnos_bench -serial stdio -display none -no-reboot 2>/dev/null | tr -d '\0' || true)
 
 COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -26,7 +41,7 @@ VERSION=$(cat "$ROOT/VERSION" 2>/dev/null || echo "dev")
 
 echo ""
 echo "=== AGNOS Benchmarks v$VERSION ($COMMIT) ==="
-echo "$OUTPUT" | strings | grep -E "cycles/op|Kcycles|\[tier"
+echo "$OUTPUT" | grep -E "cycles/op|Kcycles|\[tier"
 
 # Generate BENCHMARKS.md
 cat > "$ROOT/BENCHMARKS.md" << HEADER
@@ -48,7 +63,7 @@ cat > "$ROOT/BENCHMARKS.md" << HEADER
 |---|---|
 HEADER
 
-echo "$OUTPUT" | strings | sed -n '/\[tier1\]/,/\[tier2\]/p' | grep ":" | grep -v "tier" | while IFS= read -r line; do
+echo "$OUTPUT" | sed -n '/\[tier1\]/,/\[tier2\]/p' | grep ":" | grep -v "tier" | while IFS= read -r line; do
     name=$(echo "$line" | sed 's/:.*//' | tr -d ' ')
     val=$(echo "$line" | sed 's/.*: //')
     echo "| $name | $val |" >> "$ROOT/BENCHMARKS.md"
@@ -62,7 +77,7 @@ cat >> "$ROOT/BENCHMARKS.md" << MID
 |---|---|
 MID
 
-echo "$OUTPUT" | strings | sed -n '/\[tier2\]/,/\[tier3\]/p' | grep ":" | grep -v "tier" | while IFS= read -r line; do
+echo "$OUTPUT" | sed -n '/\[tier2\]/,/\[tier3\]/p' | grep ":" | grep -v "tier" | while IFS= read -r line; do
     name=$(echo "$line" | sed 's/:.*//' | tr -d ' ')
     val=$(echo "$line" | sed 's/.*: //')
     echo "| $name | $val |" >> "$ROOT/BENCHMARKS.md"
@@ -76,7 +91,7 @@ cat >> "$ROOT/BENCHMARKS.md" << END
 |---|---|
 END
 
-echo "$OUTPUT" | strings | sed -n '/\[tier3\]/,/=== done/p' | grep ":" | grep -v "tier\|done" | while IFS= read -r line; do
+echo "$OUTPUT" | sed -n '/\[tier3\]/,/=== done/p' | grep ":" | grep -v "tier\|done" | while IFS= read -r line; do
     name=$(echo "$line" | sed 's/:.*//' | tr -d ' ')
     val=$(echo "$line" | sed 's/.*: //')
     echo "| $name | $val |" >> "$ROOT/BENCHMARKS.md"
@@ -90,12 +105,12 @@ if [ ! -f "$ROOT/bench-history.csv" ]; then
     echo "date,commit,version,tier,benchmark,value,unit" > "$ROOT/bench-history.csv"
 fi
 
-echo "$OUTPUT" | strings | grep "cycles/op\|Kcycles" | while IFS= read -r line; do
+echo "$OUTPUT" | grep "cycles/op\|Kcycles" | while IFS= read -r line; do
     name=$(echo "$line" | sed 's/:.*//' | tr -d ' ')
     val=$(echo "$line" | sed 's/.*: //; s/ .*//')
     unit=$(echo "$line" | sed 's/.* //')
     echo "$DATE,$COMMIT,$VERSION,,$name,$val,$unit" >> "$ROOT/bench-history.csv"
 done
 
-rm -f /tmp/agnos_bench "$BENCH_KERNEL"
+rm -f /tmp/agnos_bench
 echo "Appended to bench-history.csv"
