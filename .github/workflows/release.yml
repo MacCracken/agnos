@@ -27,7 +27,7 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          curl -sSf "https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/ci.sh" | sh -s $CYRIUS_VERSION
+          sh scripts/ci-cyrius.sh $CYRIUS_VERSION
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
 
       - name: Build x86_64 kernel
