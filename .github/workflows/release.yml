@@ -11,6 +11,8 @@ jobs:
   build:
     needs: ci
     runs-on: ubuntu-latest
+    env:
+      CYRIUS_VERSION: "1.8.5"
     steps:
       - uses: actions/checkout@v4
 
@@ -24,17 +26,9 @@ jobs:
           fi
 
       - name: Install Cyrius toolchain
-        env:
-          CYRIUS_VERSION: "1.8.5"
         run: |
-          curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          rm -rf ../cyrius/build
-          mkdir -p ../cyrius/build kernel/build
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 ../cyrius/build/cc2
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb ../cyrius/build/cyrb
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 kernel/build/cc2
-          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb kernel/build/cc2
+          curl -sSf "https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/ci.sh" | sh -s $CYRIUS_VERSION
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
 
       - name: Build x86_64 kernel
         run: |
@@ -43,15 +37,12 @@ jobs:
 
       - name: Build aarch64 kernel (compile test)
         run: |
-          (sh scripts/build.sh --aarch64 2>/dev/null && cp build/agnos-aarch64 agnos-aarch64) || echo "aarch64 kernel not yet portable"
+          (sh scripts/build.sh --aarch64 2>/dev/null && cp build/agnos-aarch64 agnos-aarch64) || echo "aarch64 not yet portable"
 
       - name: Generate checksums
         run: |
           sha256sum agnos-x86_64 > SHA256SUMS
-          if [ -f agnos-aarch64 ]; then
-            sha256sum agnos-aarch64 >> SHA256SUMS
-          fi
-          echo "=== SHA256SUMS ==="
+          if [ -f agnos-aarch64 ]; then sha256sum agnos-aarch64 >> SHA256SUMS; fi
           cat SHA256SUMS
 
       - name: Upload build artifacts

@@ -15,7 +15,6 @@ env:
   CYRIUS_VERSION: "1.8.5"
 
 jobs:
-  # ── Build + test on GitHub-hosted ──
   validate:
     runs-on: ubuntu-latest
     steps:
@@ -23,14 +22,8 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          rm -rf ../cyrius/build
-          mkdir -p ../cyrius/build kernel/build
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 ../cyrius/build/cc2
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb ../cyrius/build/cyrb
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 kernel/build/cc2
-          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb kernel/build/cc2
+          curl -sSf "https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/ci.sh" | sh -s $CYRIUS_VERSION
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
 
       - name: Test x86_64
         run: sh scripts/test.sh
@@ -41,7 +34,6 @@ jobs:
           echo "Version: $VERSION"
           test -n "$VERSION"
 
-  # ── Verify required documentation ──
   docs:
     runs-on: ubuntu-latest
     steps:
@@ -49,26 +41,16 @@ jobs:
 
       - name: Check required docs exist
         run: |
-          MISSING=0
           for doc in README.md CHANGELOG.md VERSION CONTRIBUTING.md SECURITY.md LICENSE; do
-            if [ -f "$doc" ]; then
-              echo "  OK: $doc"
-            else
-              echo "  MISSING: $doc"
-              MISSING=1
-            fi
+            test -f "$doc" && echo "  OK: $doc" || { echo "  MISSING: $doc"; exit 1; }
           done
-          exit $MISSING
 
       - name: Verify version consistency
         run: |
           VERSION=$(cat VERSION | tr -d '[:space:]')
-          echo "VERSION file: $VERSION"
           grep -q "$VERSION" kernel/agnos.cyr || { echo "FAIL: version not in kernel"; exit 1; }
           grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in changelog"; exit 1; }
-          echo "Version consistent across files"
 
-  # ── QEMU boot test on self-hosted x86 ──
   boot-test:
     runs-on: [self-hosted, linux, x64]
     needs: validate
@@ -78,29 +60,22 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          rm -rf ../cyrius/build
-          mkdir -p ../cyrius/build kernel/build
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 ../cyrius/build/cc2
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb ../cyrius/build/cyrb
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 kernel/build/cc2
-          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb kernel/build/cc2
+          curl -sSf "https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/ci.sh" | sh -s $CYRIUS_VERSION
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
 
       - name: Build kernel
         run: sh scripts/build.sh
 
-      - name: QEMU boot test (serial output check)
+      - name: QEMU boot test
         run: |
           timeout 10 qemu-system-x86_64 \
             -kernel build/agnos \
             -serial stdio \
             -display none \
             -no-reboot 2>&1 | tee /tmp/boot_output
-          grep -q "AGNOS" /tmp/boot_output && echo "PASS: kernel prints AGNOS"
+          grep -q "AGNOS" /tmp/boot_output && echo "PASS: kernel boots"
         continue-on-error: true
 
-  # ── Benchmarks on self-hosted with QEMU ──
   benchmarks:
     runs-on: [self-hosted, linux, x64]
     needs: validate
@@ -110,14 +85,8 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
-          rm -rf ../cyrius/build
-          mkdir -p ../cyrius/build kernel/build
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 ../cyrius/build/cc2
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb ../cyrius/build/cyrb
-          cp -f cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2 kernel/build/cc2
-          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb kernel/build/cc2
+          curl -sSf "https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/ci.sh" | sh -s $CYRIUS_VERSION
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
 
       - name: Run benchmarks
         run: sh scripts/bench.sh
