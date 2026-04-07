@@ -57,6 +57,13 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Clean stale state
+        run: |
+          rm -rf ../cyrius ~/.cyrius/bin
+          rm -rf build kernel/build
 
       - name: Install Cyrius toolchain
         run: |
@@ -82,6 +89,13 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Clean stale state
+        run: |
+          rm -rf ../cyrius ~/.cyrius/bin
+          rm -rf build kernel/build
 
       - name: Install Cyrius toolchain
         run: |
