@@ -22,14 +22,12 @@ check() {
 test_x86() {
     echo "=== AGNOS Kernel Tests [x86_64] ==="
 
-    # Build kernel (use cyrb if available, fallback to cc2)
+    # Build kernel (requires cyrb for multi-file includes)
     rm -f /tmp/agnos_test
     if [ -x "$CYRB" ]; then
-        (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" /tmp/agnos_test) > /dev/null 2>&1
-    fi
-    # Fallback: if cyrb failed or missing, try cc2
-    if [ ! -f /tmp/agnos_test ] || [ ! -s /tmp/agnos_test ]; then
-        cat "$ROOT/kernel/agnos.cyr" | "$CC" > /tmp/agnos_test 2>/dev/null || true
+        (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" /tmp/agnos_test) 2>&1
+    else
+        echo "ERROR: cyrb not found at $CYRB" >&2
     fi
     # Check build produced a valid file
     if [ -f /tmp/agnos_test ] && [ -s /tmp/agnos_test ]; then
