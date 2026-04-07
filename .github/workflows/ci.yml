@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CYRIUS_VERSION: "1.8.2"
+  CYRIUS_VERSION: "1.8.5"
 
 jobs:
   # ── Build + test on GitHub-hosted ──

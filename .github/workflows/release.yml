@@ -25,7 +25,7 @@ jobs:
 
       - name: Install Cyrius toolchain
         env:
-          CYRIUS_VERSION: "1.8.2"
+          CYRIUS_VERSION: "1.8.5"
         run: |
           curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
