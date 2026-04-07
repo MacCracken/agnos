@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CYRIUS_VERSION: "1.7.0"
+  CYRIUS_VERSION: "1.7.1"
 
 jobs:
   # ── Build + test on GitHub-hosted ──
@@ -23,10 +23,12 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION=$CYRIUS_VERSION curl -sSf https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh | sh
+          curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           mkdir -p ../cyrius/build
-          ln -sf ~/.cyrius/bin/cc2 ../cyrius/build/cc2
-          ln -sf ~/.cyrius/bin/cyrb ../cyrius/build/cyrb
+          cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" ../cyrius/build/cc2
+          cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb" ../cyrius/build/cyrb
+          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb
           ../cyrius/build/cyrb --help | head -1
 
       - name: Test x86_64
@@ -75,10 +77,12 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION=$CYRIUS_VERSION curl -sSf https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh | sh
+          curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           mkdir -p ../cyrius/build
-          ln -sf ~/.cyrius/bin/cc2 ../cyrius/build/cc2
-          ln -sf ~/.cyrius/bin/cyrb ../cyrius/build/cyrb
+          cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" ../cyrius/build/cc2
+          cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb" ../cyrius/build/cyrb
+          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb
 
       - name: Build kernel
         run: sh scripts/build.sh
@@ -103,10 +107,12 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION=$CYRIUS_VERSION curl -sSf https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh | sh
+          curl -fLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           mkdir -p ../cyrius/build
-          ln -sf ~/.cyrius/bin/cc2 ../cyrius/build/cc2
-          ln -sf ~/.cyrius/bin/cyrb ../cyrius/build/cyrb
+          cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cc2" ../cyrius/build/cc2
+          cp "cyrius-$CYRIUS_VERSION-x86_64-linux/bin/cyrb" ../cyrius/build/cyrb
+          chmod +x ../cyrius/build/cc2 ../cyrius/build/cyrb
 
       - name: Run benchmarks
         run: sh scripts/bench.sh

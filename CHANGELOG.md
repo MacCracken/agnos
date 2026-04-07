@@ -3,6 +3,8 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
 ## [1.1.0] — 2026-04-06
 
 ### Added
@@ -22,7 +24,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Bridge spec: `docs/development/kybernet-bridge.md` and `docs/development/syscall-additions.md`
 
 #### Benchmarks and CI
-- `rdtsc()` cycle-accurate benchmarks: PMM 2041 cy/op, syscall 306 cy/op, heap 2565 cy/op
+- `rdtsc()` cycle-accurate benchmarks: PMM 1304 cy/op, syscall 188 cy/op, heap 1207 cy/op
 - `scripts/bench.sh` — automated benchmark runner with `BENCHMARKS.md` and `bench-history.csv`
 - `scripts/check.sh` — 11-point project validation (build, tests, docs, version consistency)
 - `scripts/version-bump.sh` — automated version management
@@ -36,7 +38,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Dead code removed: `apic_send_ipi()`, unused `kfree()`
 
 ### Changed
-- CI pinned to Cyrius 1.7.0 (was 1.6.1)
+- CI pinned to Cyrius 1.7.1 (was 1.6.1)
 - `test.sh` requires `cyrb` (no `cc2` fallback for multi-file builds)
 - aarch64 build no longer needs SP patch trampoline (compiler fixed in Cyrius 1.7.0)
 
@@ -96,8 +98,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Process state validation in syscall handlers
 
 ### Metrics
-- Binary: 106KB
-- Source: ~2,980 lines, 122 functions
-- 27 subsystems
+- Binary: 106KB (x86_64)
+- Source: ~2,980 lines, 122 functions (single file)
+- 27 subsystems, 8 syscalls
 - Boots to interactive shell on QEMU in <100ms
-- Benchmarks (QEMU ~1GHz): syscall 306 cycles, PMM alloc+free 2,041 cycles, heap alloc+free 2,565 cycles

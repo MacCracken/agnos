@@ -1,10 +1,12 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> Spec for implementing the remaining syscalls so kybernet can run on AGNOS as PID 1.
+> All 25 syscalls implemented as of v1.1.0. kybernet can run on AGNOS as PID 1.
 
 ## Current State
 
-**AGNOS kernel** (`kernel/core/syscall.cyr`) implements 8 syscalls:
+**AGNOS kernel** (`kernel/core/syscall.cyr`) implements 25 syscalls (all tiers complete).
+
+### Original 8 (v1.0.0):
 
 | # | Name | Signature | Implementation |
 |---|------|-----------|---------------|
@@ -19,11 +21,11 @@
 
 **Kybernet** calls 27 distinct `sys_*` functions. The AGNOS backend (`agnosys/lib/syscalls_agnos.cyr`) maps them to AGNOS syscall numbers 0-23.
 
-## What Needs Adding
+## Implementation Details
 
-### Tier 1: Trivial stubs (return 0) — No kernel infrastructure needed
+### Tier 1: Trivial stubs (return 0) -- DONE
 
-These can be added as one-liners in `ksyscall()`. Kybernet calls them but AGNOS doesn't need real implementations yet.
+One-liners in `ksyscall()`. Kybernet calls them but AGNOS doesn't need real implementations.
 
 | # | Name | Signature | Stub behavior | Why stub is OK |
 |---|------|-----------|--------------|----------------|
@@ -44,7 +46,7 @@ if (num == 15) { return 0; }             # getuid: root
 if (num == 24) { return 0; }             # umount: noop
 ```
 
-### Tier 2: Simple implementations — Small kernel additions
+### Tier 2: Simple implementations -- DONE
 
 | # | Name | Signature | Implementation | Kernel changes |
 |---|------|-----------|---------------|---------------|
@@ -78,7 +80,7 @@ fn vfs_mount(target) {
 }
 ```
 
-### Tier 3: Signal infrastructure — New kernel subsystem
+### Tier 3: Signal infrastructure -- DONE
 
 Kybernet uses signals for: child process reaping (SIGCHLD), shutdown (SIGTERM/SIGINT), and power management (SIGPWR/SIGHUP).
 
@@ -160,7 +162,7 @@ if (ftype == 3) {
 }
 ```
 
-### Tier 4: Event loop — epoll + timerfd
+### Tier 4: Event loop -- DONE
 
 Kybernet's event loop uses epoll to wait on signalfd + timerfd simultaneously.
 
@@ -279,13 +281,14 @@ if (num == 23) {
 
 ## Summary
 
-| Tier | Syscalls | Effort | Lines | Kernel changes |
-|------|----------|--------|-------|---------------|
-| 1: Stubs | 8,9,10,12,15,24 (6) | Trivial | ~6 | One-liners in ksyscall |
-| 2: Simple | 11,13,14 (3) | Low | ~20 | mount table, reboot asm, pause hlt |
-| 3: Signals | 16,17,18 (3) | Medium | ~60 | proc_signals/sigmask arrays, signalfd VFS type, kill/sigprocmask/signalfd dispatch |
-| 4: Events | 19,20,21,22,23 (5) | Medium | ~80 | epoll table, timerfd VFS type, polling loop |
-| **Total** | **17 new syscalls** | | **~166 lines** | |
+All tiers implemented in v1.1.0. 25 total syscalls (8 original + 17 new).
+
+| Tier | Syscalls | Status |
+|------|----------|--------|
+| 1: Stubs | 8,9,10,12,15,24 (6) | DONE |
+| 2: Simple | 11,13,14 (3) | DONE |
+| 3: Signals | 16,17,18 (3) | DONE |
+| 4: Events | 19,20,21,22,23 (5) | DONE |
 
 ## Files to modify
 
