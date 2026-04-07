@@ -1,57 +1,39 @@
 #!/bin/sh
-# ci.sh — install Cyrius from latest release for CI pipelines
-# Usage: sh scripts/ci.sh [version]
-# Pulls the release tarball, extracts to ~/.cyrius, adds to PATH.
-
+# Install Cyrius toolchain for CI
+# Usage: sh scripts/ci-cyrius.sh [version]
 set -e
 
-VERSION="${1:-$(curl -sf https://api.github.com/repos/MacCracken/cyrius/releases/latest | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": "//;s/".*//')}"
-
-if [ -z "$VERSION" ]; then
-    echo "error: could not determine version"
-    exit 1
+VERSION="${1:-latest}"
+if [ "$VERSION" = "latest" ]; then
+    VERSION=$(curl -sf https://api.github.com/repos/MacCracken/cyrius/releases/latest | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": "//;s/".*//')
 fi
 
-CYRIUS_HOME="${CYRIUS_HOME:-$HOME/.cyrius}"
 TARBALL="cyrius-${VERSION}-x86_64-linux.tar.gz"
 URL="https://github.com/MacCracken/cyrius/releases/download/${VERSION}/${TARBALL}"
+DEST="$HOME/.cyrius/bin"
 
 echo "=== Cyrius CI Setup ==="
 echo "  version: $VERSION"
-echo "  target:  $CYRIUS_HOME"
+echo "  target:  $DEST"
 
-mkdir -p "$CYRIUS_HOME/bin"
+mkdir -p "$DEST"
 
 echo "  fetching $TARBALL..."
-curl -sfL "$URL" -o "/tmp/$TARBALL" || {
-    echo "error: failed to download $URL"
-    exit 1
-}
+curl -sfL "$URL" -o "/tmp/$TARBALL" || { echo "  error: download failed"; exit 1; }
 
-tar xzf "/tmp/$TARBALL" -C "$CYRIUS_HOME"
+tar xzf "/tmp/$TARBALL" -C /tmp/
 rm -f "/tmp/$TARBALL"
 
-# Symlink binaries
-for bin in "$CYRIUS_HOME"/versions/"$VERSION"/bin/*; do
-    [ -f "$bin" ] && ln -sf "$bin" "$CYRIUS_HOME/bin/$(basename "$bin")"
+# Copy binaries — handle both flat and bin/ layouts
+SRC="/tmp/cyrius-${VERSION}-x86_64-linux"
+for f in cc2 cc2_aarch64 cc2-native-aarch64 cyrb asm ark cyrfmt cyrlint cyrdoc cyrc; do
+    [ -f "$SRC/$f" ] && cp -f "$SRC/$f" "$DEST/$f" && chmod +x "$DEST/$f"
+    [ -f "$SRC/bin/$f" ] && cp -f "$SRC/bin/$f" "$DEST/$f" && chmod +x "$DEST/$f"
 done
-echo "$VERSION" > "$CYRIUS_HOME/current"
+[ -d "$SRC/lib" ] && cp -rf "$SRC/lib" "$HOME/.cyrius/lib"
+rm -rf "$SRC"
 
 # Verify
-if [ -x "$CYRIUS_HOME/bin/cc2" ]; then
-    echo "  cc2:  ok"
-else
-    echo "  error: cc2 not found"
-    exit 1
-fi
-
-if [ -x "$CYRIUS_HOME/bin/cyrb" ]; then
-    echo "  cyrb: $("$CYRIUS_HOME/bin/cyrb" version 2>/dev/null || echo 'ok')"
-else
-    echo "  error: cyrb not found"
-    exit 1
-fi
-
-echo ""
-echo "Add to PATH:"
-echo "  export PATH=\"$CYRIUS_HOME/bin:\$PATH\""
+[ -x "$DEST/cc2" ] && echo "  cc2:  ok" || { echo "  error: cc2 not found"; exit 1; }
+[ -x "$DEST/cyrb" ] && echo "  cyrb: ok" || echo "  warn: cyrb not in release"
+echo "  done"
