@@ -22,7 +22,11 @@ fn sh_cmd_help() {
     serial_println("  net     - network info", 24);
     serial_println("  send    - send UDP msg", 24);
     serial_println("  recv    - recv UDP pkt", 24);
+    serial_println("  tcp     - TCP connect test", 28);
     serial_println("  pipe    - test pipe IPC", 25);
+    serial_println("  blkread - read disk sector", 28);
+    serial_println("  ls      - list disk files", 27);
+    serial_println("  disk    - disk info", 21);
     serial_println("  bench   - run benchmarks", 26);
     serial_println("  halt    - shutdown", 20);
     return 0;
@@ -255,6 +259,76 @@ fn sh_exec(buf, len) {
         serial_println("", 0);
         vfs_close(rfd);
         vfs_close(wfd);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "tcp", 3) == 1) {
+        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
+        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
+        serial_println("TCP: connecting to 10.0.2.2:80...", 32);
+        var conn = tcp_connect(ip4(10,0,2,2), 80, 49152);
+        if (conn < 0) {
+            serial_println("TCP: connect failed (RST or timeout)", 36);
+        } else {
+            serial_print("TCP: connected, conn_id=", 24);
+            kprint_num(conn);
+            serial_println("", 0);
+            tcp_close(conn);
+            serial_println("TCP: closed", 11);
+        }
+        return 0;
+    }
+    if (sh_streq(buf, clen, "blkread", 7) == 1) {
+        if (vblk_active == 0) { serial_println("no block device", 15); return 0; }
+        # Parse sector number from arg (simple decimal)
+        var sector = 0;
+        for (var i = 0; i < arglen; i = i + 1) {
+            var digit = load8(arg + i) - 48;
+            if (digit >= 0) { if (digit <= 9) { sector = sector * 10 + digit; } }
+        }
+        serial_print("Reading sector ", 15);
+        kprint_num(sector);
+        serial_println(":", 1);
+        var rbuf[64];
+        var r = blk_read(sector, &rbuf);
+        if (r != 0) { serial_println("read failed", 11); return 0; }
+        # Hexdump first 64 bytes
+        for (var i = 0; i < 64; i = i + 1) {
+            var b = load8(&rbuf + i);
+            var hi = (b >> 4) & 0x0F;
+            var lo = b & 0x0F;
+            if (hi < 10) { serial_putc(48 + hi); } else { serial_putc(87 + hi); }
+            if (lo < 10) { serial_putc(48 + lo); } else { serial_putc(87 + lo); }
+            serial_putc(32);
+            if ((i & 15) == 15) { serial_println("", 0); }
+        }
+        return 0;
+    }
+    if (sh_streq(buf, clen, "ls", 2) == 1) {
+        if (fatfs_active == 0) { serial_println("no filesystem", 13); return 0; }
+        fatfs_ls();
+        return 0;
+    }
+    if (sh_streq(buf, clen, "disk", 4) == 1) {
+        if (vblk_active == 0) { serial_println("no block device", 15); return 0; }
+        serial_print("VirtIO-blk: ", 12);
+        kprint_num(vblk_capacity);
+        serial_print(" sectors (", 10);
+        kprint_num(vblk_capacity / 2);
+        serial_println(" KB)", 4);
+        if (fatfs_active != 0) {
+            serial_println("Filesystem: FAT16", 17);
+            serial_print("  bytes/sector: ", 16);
+            kprint_num(fatfs_bytes_per_sector);
+            serial_println("", 0);
+            serial_print("  sectors/cluster: ", 19);
+            kprint_num(fatfs_sectors_per_cluster);
+            serial_println("", 0);
+            serial_print("  root entries: ", 16);
+            kprint_num(fatfs_root_entry_count);
+            serial_println("", 0);
+        } else {
+            serial_println("Filesystem: none", 16);
+        }
         return 0;
     }
     if (sh_streq(buf, clen, "bench", 5) == 1) { return sh_cmd_bench(); }

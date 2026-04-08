@@ -93,6 +93,16 @@ if (pci_find(0x1AF4, 0x1000) >= 0) {
         serial_println("Net: 10.0.2.15/24 gw 10.0.2.2", 30);
     }
 }
+if (pci_find(0x1AF4, 0x1001) >= 0) {
+    if (virtio_blk_init() == 0) {
+        serial_print("VirtIO-blk: ", 12);
+        kprint_num(vblk_capacity);
+        serial_println(" sectors", 8);
+        if (fatfs_init() == 0) {
+            serial_println("FAT16 filesystem mounted", 24);
+        }
+    }
+}
 vfs_init();
 serial_println("VFS initialized", 15);
 

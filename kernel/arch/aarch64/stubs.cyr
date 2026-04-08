@@ -59,10 +59,43 @@ var vnet_mac[8];
 var vnet_iobase = 0;
 fn pci_scan() { return 0; }
 fn pci_find(v, d) { return 0 - 1; }
+fn pci_write32(a, b, c, d, e) { return 0; }
+fn pci_enable_bus_master(s) { return 0; }
 fn virtio_net_init() { return 0 - 1; }
 fn net_init(a, b, c) { return 0; }
 fn ip4(a, b, c, d) { return 0; }
 fn udp_send(a, b, c, d, e) { return 0 - 1; }
+fn net_recv_udp(a, b) { return 0; }
+fn net_poll() { return 0; }
+fn virtio_net_send(a, b) { return 0 - 1; }
+fn virtio_net_poll(a, b) { return 0; }
+
+# TCP stubs
+var tcp_conns[80];
+var tcp_conn_count = 0;
+var tcp_rx_tmpbuf[256];
+fn tcp_connect(a, b, c) { return 0 - 1; }
+fn tcp_send(a, b, c) { return 0 - 1; }
+fn tcp_recv(a, b, c) { return 0; }
+fn tcp_close(a) { return 0 - 1; }
+
+# VirtIO-blk stubs
+var vblk_active = 0;
+var vblk_capacity = 0;
+fn virtio_blk_init() { return 0 - 1; }
+fn blk_read(a, b) { return 0 - 1; }
+fn blk_write(a, b) { return 0 - 1; }
+fn blk_read_sectors(a, b, c) { return 0 - 1; }
+
+# FAT16 filesystem stubs
+var fatfs_active = 0;
+var fatfs_bytes_per_sector = 0;
+var fatfs_sectors_per_cluster = 0;
+var fatfs_root_entry_count = 0;
+fn fatfs_init() { return 0 - 1; }
+fn fatfs_ls() { return 0; }
+fn fatfs_open(a, b) { return 0 - 1; }
+fn fatfs_read(a, b, c) { return 0 - 1; }
 
 # Port I/O (x86-only)
 fn outb(port, val) { return 0; }

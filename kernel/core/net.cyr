@@ -169,10 +169,16 @@ fn net_poll() {
         var ip_ihl = (load8(ip_hdr) & 0x0F) * 4;
         var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
         var ip_proto = load8(ip_hdr + 9);
+        var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
         if (ip_proto == 17) {
             # UDP
             net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_total - ip_ihl);
             return 2;
+        }
+        if (ip_proto == 6) {
+            # TCP
+            net_handle_tcp(&net_rx_pkt, 14 + ip_ihl, ip_total - ip_ihl, ip_src);
+            return 3;
         }
     }
     return 0;
@@ -188,4 +194,303 @@ fn net_recv_udp(buf, maxlen) {
     var result = net_udp_buf_len;
     net_udp_buf_len = 0;
     return result;
+}
+
+# === TCP Stack ===
+# States: 0=CLOSED, 1=SYN_SENT, 2=ESTABLISHED, 3=FIN_WAIT, 4=CLOSE_WAIT
+# Connection table: 8 entries, each 80 bytes:
+#   offset 0:  state (8 bytes)
+#   offset 8:  src_port (8 bytes)
+#   offset 16: dst_port (8 bytes)
+#   offset 24: dst_ip (8 bytes)
+#   offset 32: seq_num (8 bytes)
+#   offset 40: ack_num (8 bytes)
+#   offset 48: rx_buf pointer (8 bytes)
+#   offset 56: rx_buf_len (8 bytes)
+#   offset 64: rx_buf_head (8 bytes)  - write position
+#   offset 72: flags (8 bytes) - last received flags
+
+var tcp_conns[80];
+var tcp_conn_count = 0;
+var tcp_rx_tmpbuf[256];
+
+fn tcp_conn_base(conn_id) {
+    return &tcp_conns + conn_id * 80;
+}
+
+fn tcp_checksum_compute(src_ip, dst_ip, tcp_buf, tcp_len) {
+    # Pseudo-header: src_ip(4) + dst_ip(4) + zero(1) + proto(1) + tcp_len(2)
+    var sum = 0;
+    # src_ip
+    sum = sum + ((src_ip >> 16) & 0xFFFF);
+    sum = sum + (src_ip & 0xFFFF);
+    # dst_ip
+    sum = sum + ((dst_ip >> 16) & 0xFFFF);
+    sum = sum + (dst_ip & 0xFFFF);
+    # zero + proto=6
+    sum = sum + 6;
+    # tcp_len
+    sum = sum + tcp_len;
+    # TCP header + data
+    var i = 0;
+    while (i < tcp_len) {
+        var hi = load8(tcp_buf + i) << 8;
+        var lo = 0;
+        if (i + 1 < tcp_len) { lo = load8(tcp_buf + i + 1); }
+        sum = sum + hi + lo;
+        i = i + 2;
+    }
+    while (sum > 0xFFFF) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (0 - 1 - sum) & 0xFFFF;
+}
+
+fn tcp_build_header(pkt, src_port, dst_port, seq, ack, flags, window) {
+    # src_port (2)
+    store8(pkt, (src_port >> 8) & 0xFF);
+    store8(pkt + 1, src_port & 0xFF);
+    # dst_port (2)
+    store8(pkt + 2, (dst_port >> 8) & 0xFF);
+    store8(pkt + 3, dst_port & 0xFF);
+    # seq (4)
+    store8(pkt + 4, (seq >> 24) & 0xFF);
+    store8(pkt + 5, (seq >> 16) & 0xFF);
+    store8(pkt + 6, (seq >> 8) & 0xFF);
+    store8(pkt + 7, seq & 0xFF);
+    # ack (4)
+    store8(pkt + 8, (ack >> 24) & 0xFF);
+    store8(pkt + 9, (ack >> 16) & 0xFF);
+    store8(pkt + 10, (ack >> 8) & 0xFF);
+    store8(pkt + 11, ack & 0xFF);
+    # data offset (5 = 20 bytes, shift left 4) + reserved + flags
+    # data_offset_and_flags: high byte = (5 << 4) = 0x50, low byte = flags
+    store8(pkt + 12, 0x50);
+    store8(pkt + 13, flags & 0xFF);
+    # window (2)
+    store8(pkt + 14, (window >> 8) & 0xFF);
+    store8(pkt + 15, window & 0xFF);
+    # checksum (2) - filled later
+    store8(pkt + 16, 0);
+    store8(pkt + 17, 0);
+    # urgent pointer (2)
+    store8(pkt + 18, 0);
+    store8(pkt + 19, 0);
+    return 20;
+}
+
+fn tcp_send_pkt(conn_id, flags, data, data_len) {
+    if (vnet_active == 0) { return 0 - 1; }
+    var cb = tcp_conn_base(conn_id);
+    var src_port = load64(cb + 8);
+    var dst_port = load64(cb + 16);
+    var dst_ip = load64(cb + 24);
+    var seq = load64(cb + 32);
+    var ack = load64(cb + 40);
+    var dst_mac[8];
+    for (var i = 0; i < 6; i = i + 1) { store8(&dst_mac + i, 0xFF); }
+    var p = &net_pkt;
+    var off = eth_build(p, &dst_mac, &vnet_mac, 0x0800);
+    # Build TCP header after IP header space (20 bytes)
+    var tcp_off = off + 20;
+    var tcp_hdr_len = tcp_build_header(p + tcp_off, src_port, dst_port, seq, ack, flags, 8192);
+    # Copy data after TCP header
+    for (var i = 0; i < data_len; i = i + 1) {
+        store8(p + tcp_off + tcp_hdr_len + i, load8(data + i));
+    }
+    var tcp_total = tcp_hdr_len + data_len;
+    # Compute TCP checksum
+    var cksum = tcp_checksum_compute(net_ip, dst_ip, p + tcp_off, tcp_total);
+    store8(p + tcp_off + 16, (cksum >> 8) & 0xFF);
+    store8(p + tcp_off + 17, cksum & 0xFF);
+    # Build IP header (proto=6 for TCP)
+    ip_build(p + off, net_ip, dst_ip, 6, tcp_total);
+    return virtio_net_send(p, off + 20 + tcp_total);
+}
+
+fn tcp_connect(dst_ip, dst_port, src_port) {
+    if (tcp_conn_count >= 8) { return 0 - 1; }
+    var conn_id = tcp_conn_count;
+    tcp_conn_count = tcp_conn_count + 1;
+    var cb = tcp_conn_base(conn_id);
+    store64(cb, 1);             # state = SYN_SENT
+    store64(cb + 8, src_port);
+    store64(cb + 16, dst_port);
+    store64(cb + 24, dst_ip);
+    store64(cb + 32, 1000);     # initial seq
+    store64(cb + 40, 0);        # ack_num
+    store64(cb + 48, 0);        # rx_buf (none yet)
+    store64(cb + 56, 0);        # rx_buf_len
+    store64(cb + 64, 0);        # rx_buf_head
+    store64(cb + 72, 0);        # flags
+    # Send SYN (flags = 0x02)
+    tcp_send_pkt(conn_id, 0x02, 0, 0);
+    # Advance seq by 1 (SYN consumes a sequence number)
+    store64(cb + 32, 1001);
+    # Wait for SYN-ACK (poll a few times)
+    for (var i = 0; i < 200; i = i + 1) {
+        net_poll();
+        var state = load64(cb);
+        if (state == 2) { return conn_id; }
+        if (state == 0) { return 0 - 1; }
+        arch_wait();
+    }
+    # Timeout
+    store64(cb, 0);
+    return 0 - 1;
+}
+
+fn tcp_send(conn_id, data, len) {
+    if (conn_id < 0) { return 0 - 1; }
+    if (conn_id >= tcp_conn_count) { return 0 - 1; }
+    var cb = tcp_conn_base(conn_id);
+    var state = load64(cb);
+    if (state != 2) { return 0 - 1; }
+    # Send PSH+ACK (flags = 0x18)
+    var r = tcp_send_pkt(conn_id, 0x18, data, len);
+    # Advance seq
+    var seq = load64(cb + 32);
+    store64(cb + 32, seq + len);
+    return r;
+}
+
+fn tcp_recv(conn_id, buf, maxlen) {
+    if (conn_id < 0) { return 0; }
+    if (conn_id >= tcp_conn_count) { return 0; }
+    # Poll for packets
+    net_poll();
+    var cb = tcp_conn_base(conn_id);
+    var rx_len = load64(cb + 56);
+    if (rx_len == 0) { return 0; }
+    var rx_buf = load64(cb + 48);
+    if (rx_buf == 0) { return 0; }
+    var copy_len = rx_len;
+    if (copy_len > maxlen) { copy_len = maxlen; }
+    net_copy_buf(buf, rx_buf, copy_len);
+    store64(cb + 56, 0);
+    store64(cb + 64, 0);
+    return copy_len;
+}
+
+fn tcp_close(conn_id) {
+    if (conn_id < 0) { return 0 - 1; }
+    if (conn_id >= tcp_conn_count) { return 0 - 1; }
+    var cb = tcp_conn_base(conn_id);
+    var state = load64(cb);
+    if (state == 2) {
+        # Send FIN+ACK (flags = 0x11)
+        tcp_send_pkt(conn_id, 0x11, 0, 0);
+        store64(cb, 3);  # FIN_WAIT
+        # Advance seq by 1 (FIN consumes a sequence number)
+        var seq = load64(cb + 32);
+        store64(cb + 32, seq + 1);
+    }
+    if (state == 4) {
+        # CLOSE_WAIT: send FIN+ACK
+        tcp_send_pkt(conn_id, 0x11, 0, 0);
+        store64(cb, 0);  # CLOSED
+    }
+    return 0;
+}
+
+fn tcp_find_conn(src_port, dst_port, src_ip) {
+    for (var i = 0; i < tcp_conn_count; i = i + 1) {
+        var cb = tcp_conn_base(i);
+        var state = load64(cb);
+        if (state != 0) {
+            if (load64(cb + 8) == dst_port) {
+                if (load64(cb + 16) == src_port) {
+                    if (load64(cb + 24) == src_ip) {
+                        return i;
+                    }
+                }
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
+    if (ip_payload_len < 20) { return 0; }
+    var tcp = pkt + ip_off;
+    var src_port = (load8(tcp) << 8) | load8(tcp + 1);
+    var dst_port = (load8(tcp + 2) << 8) | load8(tcp + 3);
+    var seq = (load8(tcp + 4) << 24) | (load8(tcp + 5) << 16) | (load8(tcp + 6) << 8) | load8(tcp + 7);
+    var ack = (load8(tcp + 8) << 24) | (load8(tcp + 9) << 16) | (load8(tcp + 10) << 8) | load8(tcp + 11);
+    var data_off_byte = load8(tcp + 12);
+    var tcp_hdr_len = ((data_off_byte >> 4) & 0x0F) * 4;
+    var flags = load8(tcp + 13);
+    var conn_id = tcp_find_conn(src_port, dst_port, src_ip);
+    if (conn_id < 0) { return 0; }
+    var cb = tcp_conn_base(conn_id);
+    var state = load64(cb);
+    var data_len = ip_payload_len - tcp_hdr_len;
+    if (data_len < 0) { data_len = 0; }
+    # SYN_SENT: expect SYN-ACK (flags & 0x12 == 0x12)
+    if (state == 1) {
+        if ((flags & 0x12) == 0x12) {
+            store64(cb + 40, seq + 1);
+            store64(cb, 2);  # ESTABLISHED
+            # Send ACK (flags = 0x10)
+            tcp_send_pkt(conn_id, 0x10, 0, 0);
+            return 1;
+        }
+        if ((flags & 0x04) != 0) {
+            # RST received
+            store64(cb, 0);  # CLOSED
+            return 1;
+        }
+    }
+    # ESTABLISHED: handle data, ACK, FIN, RST
+    if (state == 2) {
+        if ((flags & 0x04) != 0) {
+            store64(cb, 0);  # RST -> CLOSED
+            return 1;
+        }
+        if (data_len > 0) {
+            # Store data in rx buffer
+            net_copy_buf(&tcp_rx_tmpbuf, tcp + tcp_hdr_len, data_len);
+            store64(cb + 48, &tcp_rx_tmpbuf);
+            store64(cb + 56, data_len);
+            # Update ack
+            store64(cb + 40, seq + data_len);
+            # Send ACK
+            tcp_send_pkt(conn_id, 0x10, 0, 0);
+        }
+        if ((flags & 0x01) != 0) {
+            # FIN received
+            store64(cb + 40, seq + 1);
+            tcp_send_pkt(conn_id, 0x10, 0, 0);
+            store64(cb, 4);  # CLOSE_WAIT
+        }
+        store64(cb + 72, flags);
+        return 1;
+    }
+    # FIN_WAIT: expect ACK or FIN-ACK
+    if (state == 3) {
+        if ((flags & 0x04) != 0) {
+            store64(cb, 0);  # RST -> CLOSED
+            return 1;
+        }
+        if ((flags & 0x01) != 0) {
+            store64(cb + 40, seq + 1);
+            tcp_send_pkt(conn_id, 0x10, 0, 0);
+            store64(cb, 0);  # CLOSED
+        }
+        if ((flags & 0x10) != 0) {
+            store64(cb, 0);  # ACK of FIN -> CLOSED
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn tcp_state_name(state, buf) {
+    if (state == 0) { net_copy_buf(buf, "CLOSED", 6); return 6; }
+    if (state == 1) { net_copy_buf(buf, "SYN_SENT", 8); return 8; }
+    if (state == 2) { net_copy_buf(buf, "ESTAB", 5); return 5; }
+    if (state == 3) { net_copy_buf(buf, "FIN_WAIT", 8); return 8; }
+    if (state == 4) { net_copy_buf(buf, "CLOSE_W", 7); return 7; }
+    net_copy_buf(buf, "?", 1);
+    return 1;
 }

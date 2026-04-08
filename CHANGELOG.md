@@ -5,6 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-04-07
+
+### Added
+- VirtIO net receive path: `virtio_net_poll`, `net_poll`, `net_recv_udp`, ARP cache updates
+- Signal delivery: SIGCHLD sent on process exit, pending signal check in scheduler
+- Pipes: VFS type 6 with 4KB circular buffer, `pipe` syscall (#25), `pipe_read`/`pipe_write`
+- Shell commands: `recv` (show received UDP), `pipe` (pipe read/write test)
+- `proc_send_signal`, `proc_check_pending_signals`, `proc_get_ppid` helpers
+- `net_handle_arp`, `net_handle_udp` factored helpers for packet dispatch
+
+### Changed
+- CI pinned to Cyrius 1.9.0
+- Build scripts prepend `#define ARCH_X86_64` directly (no dependency on cyrb `-D` flag)
+- CI uses local `scripts/ci-cyrius.sh` for reliable toolchain install
+
+### Metrics
+- Binary: 115KB (was 98KB)
+- Syscalls: 26 (was 25)
+- Shell commands: 14 (was 12)
+
 ## [1.1.0] — 2026-04-06
 
 ### Added

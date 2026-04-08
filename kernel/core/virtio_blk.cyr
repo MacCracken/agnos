@@ -1,0 +1,170 @@
+# === VirtIO Block Device Driver ===
+# Legacy (transitional) virtio PCI interface for block devices
+# Device ID: vendor=0x1AF4, device=0x1001
+var vblk_iobase = 0;
+var vblk_active = 0;
+var vblk_qbase = 0;
+var vblk_qsize = 0;
+var vblk_idx = 0;
+var vblk_used_last = 0;
+var vblk_capacity = 0;
+# Request structures must be in DMA-accessible memory
+# Use static globals in kernel BSS (identity-mapped)
+var vblk_req_hdr[4];
+var vblk_req_status[2];
+var vblk_dma_buf[64];  # 512-byte DMA buffer for sector data
+
+fn virtio_blk_init() {
+    var idx = pci_find(0x1AF4, 0x1001);
+    if (idx < 0) { return 0 - 1; }
+    var bar0 = load64(&pci_devs + idx * 32 + 24);
+    vblk_iobase = bar0 & 0xFFFC;
+    # Enable PCI bus mastering for DMA
+    var slot = load64(&pci_devs + idx * 32);
+    pci_enable_bus_master(slot);
+
+    # Reset device
+    outb(vblk_iobase + 18, 0);
+    # Set ACKNOWLEDGE
+    outb(vblk_iobase + 18, 1);
+    # Set DRIVER
+    outb(vblk_iobase + 18, 3);
+
+    # Read and accept features (mask off EVENT_IDX)
+    var features = inl(vblk_iobase);
+    features = features & (0 - 1 - (1 << 29));
+    outl(vblk_iobase + 4, features);
+
+    # Select queue 0
+    outw(vblk_iobase + 14, 0);
+    vblk_qsize = inw(vblk_iobase + 12);
+    if (vblk_qsize == 0) { return 0 - 1; }
+
+    # Allocate contiguous pages for the virtqueue
+    # For qsz up to 256: need 3 pages (desc+avail + padding + used ring)
+    var page = pmm_alloc();
+    if (page == 0) { return 0 - 1; }
+    # Allocate 2 more consecutive pages (pmm gives sequential pages)
+    pmm_alloc();
+    pmm_alloc();
+    # Ensure all 3 pages are mapped
+    if (vmm_is_mapped(page) == 0) { vmm_map(page, page, 0x83); }
+    if (vmm_is_mapped(page + 0x1000) == 0) { vmm_map(page + 0x1000, page + 0x1000, 0x83); }
+    if (vmm_is_mapped(page + 0x2000) == 0) { vmm_map(page + 0x2000, page + 0x2000, 0x83); }
+    vblk_qbase = page;
+
+    # Zero all 3 pages
+    for (var i = 0; i < 512; i = i + 1) { store64(page + i * 8, 0); }
+    for (var i = 0; i < 512; i = i + 1) { store64(page + 0x1000 + i * 8, 0); }
+    for (var i = 0; i < 512; i = i + 1) { store64(page + 0x2000 + i * 8, 0); }
+
+    # Set queue PFN
+    outl(vblk_iobase + 8, page / 4096);
+
+    vblk_idx = 0;
+    vblk_used_last = 0;
+
+    # Set DRIVER_OK
+    outb(vblk_iobase + 18, 7);
+
+    # Read capacity
+    var cap_lo = inl(vblk_iobase + 20);
+    var cap_hi = inl(vblk_iobase + 24);
+    vblk_capacity = cap_lo | (cap_hi << 32);
+
+    vblk_active = 1;
+    return 0;
+}
+
+fn vblk_do_request(req_type, sector, buf) {
+    if (vblk_active == 0) { return 0 - 1; }
+
+    var qb = vblk_qbase;
+    var qsz = vblk_qsize;
+    var desc_base = qb;
+    var avail_base = qb + qsz * 16;
+    # used ring at next page boundary after avail
+    var used_base = (avail_base + 4 + qsz * 2 + 4095) & (0 - 4096);
+
+    # Request header: type(4) + reserved(4) + sector(8) = 16 bytes
+    store32(&vblk_req_hdr, req_type);
+    store32(&vblk_req_hdr + 4, 0);
+    store64(&vblk_req_hdr + 8, sector);
+
+    # Status byte: init to 0xFF
+    store8(&vblk_req_status, 0xFF);
+
+    # Build 3-descriptor chain
+    # Desc 0: header (device-readable)
+    store64(desc_base, &vblk_req_hdr);       # addr
+    store32(desc_base + 8, 16);               # len
+    store16(desc_base + 12, 1);               # flags: NEXT
+    store16(desc_base + 14, 1);               # next
+
+    # Desc 1: data buffer (512 bytes)
+    store64(desc_base + 16, buf);             # addr
+    store32(desc_base + 24, 512);             # len
+    if (req_type == 0) {
+        store16(desc_base + 28, 3);           # flags: WRITE|NEXT (device writes data)
+    } else {
+        store16(desc_base + 28, 1);           # flags: NEXT (device reads data)
+    }
+    store16(desc_base + 30, 2);               # next
+
+    # Desc 2: status (1 byte, device-writable)
+    store64(desc_base + 32, &vblk_req_status); # addr
+    store32(desc_base + 40, 1);               # len
+    store16(desc_base + 44, 2);               # flags: WRITE
+    store16(desc_base + 46, 0);               # next (unused)
+
+    # Update available ring
+    var ring_slot = vblk_idx % qsz;
+    store16(avail_base + 4 + ring_slot * 2, 0);  # ring[slot] = desc 0
+    # Memory barrier equivalent: ensure writes are visible
+    store16(avail_base + 2, (vblk_idx + 1) & 0xFFFF);  # idx (must be written AFTER ring entry)
+    vblk_idx = vblk_idx + 1;
+
+    # Notify device (queue 0)
+    outw(vblk_iobase + 16, 0);
+
+    # Poll for completion
+    var timeout = 0;
+    while (timeout < 2000000) {
+        var used_idx = load16(used_base + 2);
+        if (used_idx != (vblk_used_last & 0xFFFF)) {
+            vblk_used_last = vblk_used_last + 1;
+            var status = load8(&vblk_req_status);
+            if (status == 0) { return 0; }
+            return 0 - 1;
+        }
+        timeout = timeout + 1;
+    }
+    return 0 - 1;
+}
+
+fn blk_read(sector, buf) {
+    # Use DMA-safe static buffer, then copy to caller's buffer
+    var r = vblk_do_request(0, sector, &vblk_dma_buf);
+    if (r == 0) {
+        for (var i = 0; i < 64; i = i + 1) {
+            store64(buf + i * 8, load64(&vblk_dma_buf + i * 8));
+        }
+    }
+    return r;
+}
+
+fn blk_write(sector, buf) {
+    # Copy caller's buffer to DMA-safe static buffer
+    for (var i = 0; i < 64; i = i + 1) {
+        store64(&vblk_dma_buf + i * 8, load64(buf + i * 8));
+    }
+    return vblk_do_request(1, sector, &vblk_dma_buf);
+}
+
+fn blk_read_sectors(start, count, buf) {
+    for (var i = 0; i < count; i = i + 1) {
+        var r = blk_read(start + i, buf + i * 512);
+        if (r != 0) { return 0 - 1; }
+    }
+    return 0;
+}
