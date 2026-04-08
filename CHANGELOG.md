@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-04-07
+
+### Added
+- GRUB bootable ISO (`scripts/iso.sh`, `boot/grub/grub.cfg`)
+- ELF fixup for GRUB compatibility (`scripts/elf-fixup.py`)
+- TCP/IP stack: connect, send, recv, close, connection table, 3-way handshake
+- VirtIO-blk driver: sector read/write, DMA-safe buffers, PCI bus mastering
+- FAT16 filesystem reader: boot sector, directory listing, file open/read
+- Shell commands: `tcp`, `blkread`, `ls`, `disk`
+- SMP trampoline layout fixed (no section overlaps, data at 0x8180+)
+
+### Changed
+- CI uses `$HOME/.cyrius/` instead of `/tmp` (self-hosted runner compatibility)
+- Build scripts write temp files to `$ROOT/build/` not `/tmp`
+- Preprocessed source (`#define ARCH_X86_64`) prepended by build script
+
+### Fixed
+- 6 tilde operator (`~`) replacements with two's complement
+- 7 string length off-by-one fixes
+- Shell help lists all 18 commands
+- SMP trampoline 32-bit code no longer overruns 64-bit section
+
+### Metrics
+- Binary: 143KB (x86_64), 57KB (aarch64)
+- Syscalls: 26
+- Shell commands: 18
+
 ## [1.2.0] — 2026-04-07
 
 ### Added

@@ -5,7 +5,7 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CYRB="$ROOT/../cyrius/build/cyrb"
-BENCH_KERNEL="/tmp/agnos_bench.cyr"
+BENCH_KERNEL="$ROOT/build/agnos_bench.cyr"
 
 echo "Building AGNOS with benchmarks..."
 MAIN_CYR="$ROOT/kernel/core/main.cyr"
@@ -21,7 +21,7 @@ sed -i 's/exec_and_wait(exec_entry, exec_rsp, exec_cr3);/# skipped/' "$MAIN_CYR"
 sed -i 's/kybernet();/sh_cmd_bench(); arch_halt();/' "$MAIN_CYR"
 
 if [ -x "$CYRB" ]; then
-    (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" /tmp/agnos_bench) 2>&1
+    (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" $ROOT/build/agnos_bench) 2>&1
     RESULT=$?
     mv "$MAIN_BAK" "$MAIN_CYR"
     mv "$TPROC_BAK" "$TPROC_CYR"
@@ -33,7 +33,7 @@ else
 fi
 
 echo "Booting on QEMU (15s timeout)..."
-OUTPUT=$(timeout 15 qemu-system-x86_64 -kernel /tmp/agnos_bench -serial stdio -display none -no-reboot 2>/dev/null | tr -d '\0' || true)
+OUTPUT=$(timeout 15 qemu-system-x86_64 -kernel $ROOT/build/agnos_bench -serial stdio -display none -no-reboot 2>/dev/null | tr -d '\0' || true)
 
 COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -112,5 +112,5 @@ echo "$OUTPUT" | grep "cycles/op\|Kcycles" | while IFS= read -r line; do
     echo "$DATE,$COMMIT,$VERSION,,$name,$val,$unit" >> "$ROOT/bench-history.csv"
 done
 
-rm -f /tmp/agnos_bench
+rm -f $ROOT/build/agnos_bench
 echo "Appended to bench-history.csv"
