@@ -24,6 +24,8 @@ jobs:
         run: |
           sh scripts/ci-cyrius.sh $CYRIUS_VERSION
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
+          mkdir -p kernel/build
+          cp -f $HOME/.cyrius/bin/cc2 kernel/build/cc2
 
       - name: Test x86_64
         run: sh scripts/test.sh
@@ -62,7 +64,7 @@ jobs:
 
       - name: Clean stale state
         run: |
-          rm -rf ../cyrius ~/.cyrius/bin
+          rm -rf ../cyrius $HOME/.cyrius
           rm -rf build kernel/build
 
       - name: Install Cyrius toolchain
@@ -71,7 +73,6 @@ jobs:
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           mkdir -p kernel/build
           cp -f $HOME/.cyrius/bin/cc2 kernel/build/cc2
-          chmod +x kernel/build/cc2
 
       - name: Build kernel
         run: sh scripts/build.sh
@@ -91,8 +92,8 @@ jobs:
             -kernel build/agnos \
             -serial stdio \
             -display none \
-            -no-reboot 2>&1 | tee /tmp/boot_output
-          grep -q "AGNOS" /tmp/boot_output && echo "PASS: kernel boots"
+            -no-reboot 2>&1 | tee build/boot_output.log
+          grep -q "AGNOS" build/boot_output.log && echo "PASS: kernel boots"
         continue-on-error: true
 
   benchmarks:
@@ -106,13 +107,15 @@ jobs:
 
       - name: Clean stale state
         run: |
-          rm -rf ../cyrius ~/.cyrius/bin
+          rm -rf ../cyrius $HOME/.cyrius
           rm -rf build kernel/build
 
       - name: Install Cyrius toolchain
         run: |
           sh scripts/ci-cyrius.sh $CYRIUS_VERSION
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
+          mkdir -p kernel/build
+          cp -f $HOME/.cyrius/bin/cc2 kernel/build/cc2
 
       - name: Run benchmarks
         run: sh scripts/bench.sh

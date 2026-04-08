@@ -11,27 +11,28 @@ fi
 TARBALL="cyrius-${VERSION}-x86_64-linux.tar.gz"
 URL="https://github.com/MacCracken/cyrius/releases/download/${VERSION}/${TARBALL}"
 DEST="$HOME/.cyrius/bin"
+WORKDIR="$HOME/.cyrius/staging"
 
 echo "=== Cyrius CI Setup ==="
 echo "  version: $VERSION"
 echo "  target:  $DEST"
 
-mkdir -p "$DEST"
+mkdir -p "$DEST" "$WORKDIR"
 
 echo "  fetching $TARBALL..."
-curl -sfL "$URL" -o "/tmp/$TARBALL" || { echo "  error: download failed"; exit 1; }
+curl -sfL "$URL" -o "$WORKDIR/$TARBALL" || { echo "  error: download failed"; exit 1; }
 
-tar xzf "/tmp/$TARBALL" -C /tmp/
-rm -f "/tmp/$TARBALL"
+tar xzf "$WORKDIR/$TARBALL" -C "$WORKDIR/"
+rm -f "$WORKDIR/$TARBALL"
 
 # Copy binaries — handle both flat and bin/ layouts
-SRC="/tmp/cyrius-${VERSION}-x86_64-linux"
+SRC="$WORKDIR/cyrius-${VERSION}-x86_64-linux"
 for f in cc2 cc2_aarch64 cc2-native-aarch64 cyrb asm ark cyrfmt cyrlint cyrdoc cyrc; do
     [ -f "$SRC/$f" ] && cp -f "$SRC/$f" "$DEST/$f" && chmod +x "$DEST/$f"
     [ -f "$SRC/bin/$f" ] && cp -f "$SRC/bin/$f" "$DEST/$f" && chmod +x "$DEST/$f"
 done
 [ -d "$SRC/lib" ] && cp -rf "$SRC/lib" "$HOME/.cyrius/lib"
-rm -rf "$SRC"
+rm -rf "$SRC" "$WORKDIR"
 
 # Verify
 [ -x "$DEST/cc2" ] && echo "  cc2:  ok" || { echo "  error: cc2 not found"; exit 1; }
