@@ -110,5 +110,8 @@ fn do_context_switch(isr_rsp) {
         asm { mov cr3, rax; }
     }
 
+    # Check for pending unmasked signals on the new process
+    proc_check_pending_signals(new_pid);
+
     return 0;
 }

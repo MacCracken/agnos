@@ -5,6 +5,9 @@ var net_netmask = 0;
 var net_pkt[256];
 var arp_cache_ip = 0;
 var arp_cache_mac[8];
+var net_rx_pkt[256];
+var net_udp_buf[256];
+var net_udp_buf_len = 0;
 
 fn net_init(ip, gw, mask) {
     net_ip = ip;
@@ -115,4 +118,74 @@ fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
     var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
     ip_build(p + off, net_ip, dst_ip, 17, udp_len);
     return virtio_net_send(p, off + 20 + udp_len);
+}
+
+fn net_copy_buf(dst, src, len) {
+    for (var i = 0; i < len; i = i + 1) {
+        store8(dst + i, load8(src + i));
+    }
+    return 0;
+}
+
+fn net_handle_arp(pkt, len) {
+    # ARP: eth header (14) + ARP payload
+    # Check operation: offset 14+6 = reply (2)
+    if (len < 42) { return 0; }
+    var oper = load8(pkt + 20) * 256 + load8(pkt + 21);
+    if (oper == 2) {
+        # ARP reply: sender MAC at pkt+22, sender IP at pkt+28
+        var sender_ip = (load8(pkt + 28) << 24) | (load8(pkt + 29) << 16) | (load8(pkt + 30) << 8) | load8(pkt + 31);
+        arp_cache_ip = sender_ip;
+        net_copy_buf(&arp_cache_mac, pkt + 22, 6);
+    }
+    return 0;
+}
+
+fn net_handle_udp(pkt, ip_off, ip_payload_len) {
+    # UDP header at ip_off: src_port(2) dst_port(2) length(2) checksum(2) data...
+    if (ip_payload_len < 8) { return 0; }
+    var udp_data_len = ip_payload_len - 8;
+    if (udp_data_len > 2040) { udp_data_len = 2040; }
+    net_copy_buf(&net_udp_buf, pkt + ip_off + 8, udp_data_len);
+    net_udp_buf_len = udp_data_len;
+    return udp_data_len;
+}
+
+fn net_poll() {
+    if (vnet_active == 0) { return 0; }
+    var pkt_len = virtio_net_poll(&net_rx_pkt, 2048);
+    if (pkt_len < 14) { return 0; }
+    # Parse Ethernet header: dst(6) src(6) ethertype(2)
+    var ethertype = (load8(&net_rx_pkt + 12) << 8) | load8(&net_rx_pkt + 13);
+    if (ethertype == 0x0806) {
+        # ARP
+        net_handle_arp(&net_rx_pkt, pkt_len);
+        return 1;
+    }
+    if (ethertype == 0x0800) {
+        # IPv4: header at offset 14
+        if (pkt_len < 34) { return 0; }
+        var ip_hdr = &net_rx_pkt + 14;
+        var ip_ihl = (load8(ip_hdr) & 0x0F) * 4;
+        var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
+        var ip_proto = load8(ip_hdr + 9);
+        if (ip_proto == 17) {
+            # UDP
+            net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_total - ip_ihl);
+            return 2;
+        }
+    }
+    return 0;
+}
+
+fn net_recv_udp(buf, maxlen) {
+    # Poll once for new packets
+    net_poll();
+    if (net_udp_buf_len == 0) { return 0; }
+    var copy_len = net_udp_buf_len;
+    if (copy_len > maxlen) { copy_len = maxlen; }
+    net_copy_buf(buf, &net_udp_buf, copy_len);
+    var result = net_udp_buf_len;
+    net_udp_buf_len = 0;
+    return result;
 }

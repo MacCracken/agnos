@@ -320,7 +320,7 @@ if (exec_pid >= 0) {
 
 # Launch kybernet (PID 1)
 serial_println("Launching kybernet...", 21);
-sh_cmd_bench(); arch_halt();
+kybernet();
 
 serial_println("Halted.", 7);
 arch_halt();

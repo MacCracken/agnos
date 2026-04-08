@@ -31,6 +31,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         sys_exit_code = arg1;
         if (proc_current < proc_count) {
             proc_set_state(proc_current, 0);
+            # Send SIGCHLD (signal 17) to parent process
+            var ppid = proc_get_ppid(proc_current);
+            if (ppid >= 0) {
+                proc_send_signal(ppid, 17);
+            }
         }
         # If we have a saved kernel return point, jump back to it
         if (kernel_return_rsp != 0) {
@@ -184,6 +189,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         store64(tbase + 8, int_sec * 100);
         store64(tbase + 16, timer_ticks + init_sec * 100);
         return 0;
+    }
+    if (num == 25) {
+        # pipe(fds_ptr=arg1)
+        return vfs_create_pipe(arg1);
     }
     return 0 - 1;
 }

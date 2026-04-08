@@ -104,6 +104,42 @@ fn virtio_net_send(buf, len) {
     return len;
 }
 
+var vnet_rx_last_idx = 0;
+
+fn virtio_net_poll(buf, maxlen) {
+    if (vnet_active == 0) { return 0; }
+    # Check RX used ring for received packets
+    # Used ring layout: flags(2) idx(2) ring entries(id(4)+len(4) each)
+    var used_idx = load16(&vnet_rx_used + 2);
+    if (used_idx == vnet_rx_last_idx) { return 0; }
+    # A packet was received - read used ring entry
+    var entry_off = 4 + (vnet_rx_last_idx & 0xFF) * 8;
+    var desc_id = load32(&vnet_rx_used + entry_off);
+    var pkt_len = load32(&vnet_rx_used + entry_off + 4);
+    vnet_rx_last_idx = vnet_rx_last_idx + 1;
+    # Skip the 10-byte virtio-net header
+    var hdr_len = 10;
+    var data_len = pkt_len - hdr_len;
+    if (data_len < 0) { data_len = 0; }
+    if (data_len > maxlen) { data_len = maxlen; }
+    # Copy packet data (skip virtio header)
+    for (var i = 0; i < data_len; i = i + 1) {
+        store8(buf + i, load8(&vnet_rx_buf + hdr_len + i));
+    }
+    # Re-post the RX descriptor for the next packet
+    store64(&vnet_rx_desc, &vnet_rx_buf);
+    store32(&vnet_rx_desc + 8, 2048);
+    store16(&vnet_rx_desc + 12, 2);
+    store16(&vnet_rx_desc + 14, 0);
+    # Update avail ring
+    var avail_idx = load16(&vnet_rx_avail + 2);
+    store16(&vnet_rx_avail + 4 + (avail_idx & 0xFF) * 2, 0);
+    store16(&vnet_rx_avail + 2, avail_idx + 1);
+    # Notify RX queue (queue 1)
+    outw(vnet_iobase + 16, 1);
+    return data_len;
+}
+
 fn virtio_net_mac(dst) {
     for (var i = 0; i < 6; i = i + 1) {
         store8(dst + i, load8(&vnet_mac + i));

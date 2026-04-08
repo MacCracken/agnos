@@ -21,6 +21,8 @@ fn sh_cmd_help() {
     serial_println("  lspci   - PCI devices", 23);
     serial_println("  net     - network info", 24);
     serial_println("  send    - send UDP msg", 24);
+    serial_println("  recv    - recv UDP pkt", 24);
+    serial_println("  pipe    - test pipe IPC", 25);
     serial_println("  bench   - run benchmarks", 26);
     serial_println("  halt    - shutdown", 20);
     return 0;
@@ -208,6 +210,51 @@ fn sh_exec(buf, len) {
         serial_print("sent ", 5);
         kprint_num(r);
         serial_println(" bytes", 6);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "recv", 4) == 1) {
+        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
+        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
+        var rbuf[64];
+        var rlen = net_recv_udp(&rbuf, 512);
+        if (rlen == 0) {
+            serial_println("no packet received", 18);
+        } else {
+            serial_print("recv UDP (", 10);
+            kprint_num(rlen);
+            serial_print(" bytes): ", 9);
+            serial_print(&rbuf, rlen);
+            serial_println("", 0);
+        }
+        return 0;
+    }
+    if (sh_streq(buf, clen, "pipe", 4) == 1) {
+        var pfds[2];
+        var pr = vfs_create_pipe(&pfds);
+        if (pr < 0) { serial_println("pipe: failed", 12); return 0; }
+        var rfd = load64(&pfds);
+        var wfd = load64(&pfds + 8);
+        serial_print("pipe: rfd=", 10);
+        kprint_num(rfd);
+        serial_print(" wfd=", 5);
+        kprint_num(wfd);
+        serial_println("", 0);
+        # Write test data
+        var tdata = "hello pipe";
+        var wn = vfs_write(wfd, tdata, 10);
+        serial_print("wrote ", 6);
+        kprint_num(wn);
+        serial_println(" bytes", 6);
+        # Read it back
+        var pbuf[16];
+        var rn = vfs_read(rfd, &pbuf, 128);
+        serial_print("read ", 5);
+        kprint_num(rn);
+        serial_print(" bytes: ", 8);
+        serial_print(&pbuf, rn);
+        serial_println("", 0);
+        vfs_close(rfd);
+        vfs_close(wfd);
         return 0;
     }
     if (sh_streq(buf, clen, "bench", 5) == 1) { return sh_cmd_bench(); }
