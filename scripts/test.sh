@@ -31,6 +31,7 @@ test_x86() {
 
     # Build kernel (requires cyrb for multi-file includes)
     # cyrb looks for cc2 at ./build/cc2 relative to CWD
+    mkdir -p $ROOT/build
     rm -f $ROOT/build/agnos_test
     if [ -x "$CYRB" ]; then
         PREPPED="$ROOT/build/agnos_prepped.cyr"
