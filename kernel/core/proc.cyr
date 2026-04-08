@@ -146,7 +146,7 @@ fn proc_check_pending_signals(pid) {
     var sig_pending = load64(&proc_signals + pid * 8);
     var sig_mask = load64(&proc_sigmask + pid * 8);
     # Check for unmasked pending signals
-    var unmasked = sig_pending & (~sig_mask);
+    var unmasked = sig_pending & (0 - 1 - sig_mask);
     if (unmasked != 0) {
         pending_signal_flag = 1;
     }

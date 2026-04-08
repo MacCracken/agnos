@@ -35,7 +35,7 @@ fn vfs_read_signalfd(base, buf) {
     for (var s = 1; s < 32; s = s + 1) {
         var bit = 1 << s;
         if ((matched & bit) != 0) {
-            store64(&proc_signals + proc_current * 8, pending & (~bit));
+            store64(&proc_signals + proc_current * 8, pending & (0 - 1 - bit));
             store32(buf, s);
             return 4;
         }

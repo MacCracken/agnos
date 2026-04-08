@@ -1,5 +1,8 @@
 # === Syscall Interface ===
 # Syscall#: 0=exit 1=write 2=getpid 3=spawn 4=waitpid 5=read 6=close 7=open
+# 8=dup 9=mkdir 10=rmdir 11=mount 12=sync 13=reboot 14=pause 15=getuid
+# 16=kill 17=sigprocmask 18=signalfd 19=epoll_create 20=epoll_ctl
+# 21=epoll_wait 22=timerfd_create 23=timerfd_settime 24=umount 25=pipe
 
 var sys_exit_code = 0;
 
@@ -99,7 +102,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 != 0) { store64(arg3, old_mask); }
         var new_bits = load64(arg2);
         if (arg1 == 0) { new_bits = old_mask | new_bits; }
-        if (arg1 == 1) { new_bits = old_mask & (~new_bits); }
+        if (arg1 == 1) { new_bits = old_mask & (0 - 1 - new_bits); }
         store64(&proc_sigmask + proc_current * 8, new_bits);
         return 0;
     }

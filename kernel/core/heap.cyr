@@ -86,7 +86,7 @@ fn kmalloc(size) {
     store64(&slab_free + class_idx * 8, next);
     # Zero only the requested size (security: don't leak old data)
     # Round up to 8-byte boundary for store64 alignment
-    var zero_len = (size + 7) & (~7);
+    var zero_len = (size + 7) & (0 - 8);
     for (var i = 0; i < zero_len; i = i + 8) {
         store64(head + i, 0);
     }

@@ -6,7 +6,7 @@
 
 - **Type**: Bare-metal kernel binary (Cyrius language)
 - **License**: GPL-3.0-only
-- **Version**: 1.1.0
+- **Version**: 1.2.0
 - **Language**: Cyrius (self-hosting, zero external dependencies)
 - **Target**: x86_64 + aarch64 (cross-compilation supported)
 
@@ -138,14 +138,18 @@ agnos/
 | Initrd | Complete | Flat format, name lookup |
 | PCI Bus | Complete | Config space scan, device discovery |
 | VirtIO-Net | Complete | Legacy PCI, virtqueues, Ethernet frames |
-| IP/UDP Stack | Complete | ARP, IPv4, UDP send |
+| IP/UDP Stack | Complete | ARP, IPv4, UDP send/recv |
+| TCP Stack | Complete | Connect, send, recv, close, SYN/ACK/FIN state machine |
+| VirtIO-Blk | Complete | Legacy PCI, sector read/write, DMA buffers |
+| FAT16 | Complete | Read-only, root directory listing, file open/read |
+| Pipes | Complete | Circular buffer IPC, read/write ends, VFS type 6 |
 | SMP Infrastructure | Complete | APIC, IPI, trampoline, per-CPU stacks |
-| Shell | Complete | 12 commands: help echo ps free cat uptime lspci cpus net send bench halt |
+| Shell | Complete | 18 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench halt |
 | kybernet Init | Complete | PID 1 |
 | Signals | Complete | per-process proc_signals/proc_sigmask, kill, sigprocmask, signalfd |
 | Epoll | Complete | epoll_create, epoll_ctl, epoll_wait |
 | Timerfd | Complete | timerfd_create, timerfd_settime |
-| Syscalls | Complete | 25 syscalls: exit(0), write(1), getpid(2), spawn(3), waitpid(4), read(5), close(6), open(7), dup(8), mkdir(9), rmdir(10), mount(11), sync(12), reboot(13), pause(14), getuid(15), kill(16), sigprocmask(17), signalfd(18), epoll_create(19), epoll_ctl(20), epoll_wait(21), timerfd_create(22), timerfd_settime(23), umount(24) |
+| Syscalls | Complete | 26 syscalls: exit(0), write(1), getpid(2), spawn(3), waitpid(4), read(5), close(6), open(7), dup(8), mkdir(9), rmdir(10), mount(11), sync(12), reboot(13), pause(14), getuid(15), kill(16), sigprocmask(17), signalfd(18), epoll_create(19), epoll_ctl(20), epoll_wait(21), timerfd_create(22), timerfd_settime(23), umount(24), pipe(25) |
 
 ## DO NOT
 

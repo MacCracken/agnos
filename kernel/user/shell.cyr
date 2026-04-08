@@ -19,6 +19,7 @@ fn sh_cmd_help() {
     serial_println("  cat     - read file", 21);
     serial_println("  uptime  - timer ticks", 23);
     serial_println("  lspci   - PCI devices", 23);
+    serial_println("  cpus    - CPU count", 21);
     serial_println("  net     - network info", 24);
     serial_println("  send    - send UDP msg", 24);
     serial_println("  recv    - recv UDP pkt", 24);
@@ -33,7 +34,7 @@ fn sh_cmd_help() {
 }
 
 fn sh_cmd_ps() {
-    serial_println("PID  STATE", 11);
+    serial_println("PID  STATE", 10);
     for (var i = 0; i < proc_count; i = i + 1) {
         kprint_num(i);
         serial_print("    ", 4);
@@ -178,7 +179,7 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "lspci", 5) == 1) {
         for (var i = 0; i < pci_count; i = i + 1) {
             var base = &pci_devs + i * 32;
-            serial_print("  slot ", 6);
+            serial_print("  slot ", 7);
             kprint_num(load64(base));
             serial_print(": vendor=", 9);
             kprint_num(load64(base + 8));
@@ -340,7 +341,7 @@ fn sh_exec(buf, len) {
 }
 
 fn shell() {
-    serial_println("AGNOS shell v1.1 (type 'help')", 30);
+    serial_println("AGNOS shell v1.2 (type 'help')", 30);
     var sh_running = 1;
     while (sh_running == 1) {
         serial_print("agnos> ", 7);

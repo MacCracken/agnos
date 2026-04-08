@@ -18,7 +18,7 @@ fn pmm_clear(page) {
     if (page >= 4096) { return 0 - 1; }
     var byte = page / 8;
     var bit = page % 8;
-    store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) & (~(1 << bit) & 0xFF));
+    store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) & ((0 - 1 - (1 << bit)) & 0xFF));
     return 0;
 }
 

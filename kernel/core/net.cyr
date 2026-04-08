@@ -32,7 +32,7 @@ fn ip_checksum(buf, len) {
     while (sum > 0xFFFF) {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    return (~sum) & 0xFFFF;
+    return (0 - 1 - sum) & 0xFFFF;
 }
 
 fn eth_build(pkt, dst_mac, src_mac, ethertype) {

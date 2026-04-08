@@ -1,6 +1,6 @@
 # === 64-bit Cyrius kernel code ===
 
-serial_println("AGNOS kernel v1.1", 17);
+serial_println("AGNOS kernel v1.2", 17);
 serial_println("64-bit long mode", 16);
 
 gdt_init();
@@ -46,7 +46,7 @@ kb_ctrl = 0;
 kb_init_tables();
 kb_isr_build();
 idt_set_gate(&idt + 33 * 16, &kb_isr, 0x08, 0x8E);
-serial_println("Keyboard ISR installed (full US QWERTY)", 40);
+serial_println("Keyboard ISR installed (full US QWERTY)", 39);
 
 pt_init();
 serial_print("Page tables: ", 13);
@@ -143,7 +143,7 @@ kprint_num(sys_exit_code);
 serial_println("", 0);
 
 # Hardware SYSCALL test (from kernel mode — same privilege, tests the plumbing)
-serial_print("HW syscall test: ", 18);
+serial_print("HW syscall test: ", 17);
 test_hw_syscall();
 
 # === Context Switch Test ===
@@ -163,7 +163,7 @@ proc_set_state(0, 2);  # running
 var stack_a = 0x800000 + 1 * 0x10000;
 if (vmm_is_mapped(stack_a) == 0) { vmm_alloc_at(stack_a); }
 var pa = proc_create_full(&test_proc_a, stack_a + 0x4000);
-serial_print("Process A (pid=", 16);
+serial_print("Process A (pid=", 15);
 kprint_num(pa);
 serial_println(") created", 9);
 
@@ -171,7 +171,7 @@ serial_println(") created", 9);
 var stack_b = 0x800000 + 2 * 0x10000;
 if (vmm_is_mapped(stack_b) == 0) { vmm_alloc_at(stack_b); }
 var pb = proc_create_full(&test_proc_b, stack_b + 0x4000);
-serial_print("Process B (pid=", 16);
+serial_print("Process B (pid=", 15);
 kprint_num(pb);
 serial_println(") created", 9);
 
@@ -292,12 +292,12 @@ var val_as1_check = load64(0xC00000);
 var kern_cr3_restore = 0x1000;
 asm { mov cr3, rax; }
 
-serial_print("AS1 wrote 0xAAAA, read=", 22);
+serial_print("AS1 wrote 0xAAAA, read=", 23);
 kprint_num(val_as1);
 serial_print(" recheck=", 9);
 kprint_num(val_as1_check);
 serial_println("", 0);
-serial_print("AS2 wrote 0xBBBB, read=", 22);
+serial_print("AS2 wrote 0xBBBB, read=", 23);
 kprint_num(val_as2);
 serial_println("", 0);
 
