@@ -48,33 +48,38 @@ fn ap_entry() {
 
 fn smp_build_trampoline() {
     # AP trampoline at 0x8000. SIPI vector=0x08 -> APs start here in real mode.
-    # Layout: 0x8000=16-bit code, 0x8040=32-bit code, 0x8080=64-bit code
-    # 0x80E0=GDT16 ptr, 0x80F0=GDT64 ptr, 0x8100=IDT64 ptr
+    # Layout (no overlaps):
+    #   0x8000 - 0x803F  16-bit real mode code   (64 bytes max)
+    #   0x8040 - 0x80BF  32-bit protected mode   (128 bytes max)
+    #   0x80C0 - 0x817F  64-bit long mode code   (192 bytes max)
+    #   0x8180           GDT16 pointer (6 bytes)
+    #   0x8190           GDT64 pointer (10 bytes)
+    #   0x81A0           IDT64 pointer (10 bytes)
     var t = 0x8000;
     # Zero the page
     for (var i = 0; i < 512; i = i + 8) { store64(t + i, 0); }
 
-    # --- Data structures at known offsets ---
-    # GDT pointer for 16/32-bit (6 bytes: limit16 + base32) at 0x80E0
-    store16(0x80E0, 55);
-    store32(0x80E2, &gdt & 0xFFFFFFFF);
-    # GDT pointer for 64-bit (10 bytes: limit16 + base64) at 0x80F0
-    store16(0x80F0, 55);
-    store64(0x80F2, &gdt);
-    # IDT pointer for 64-bit at 0x8100
-    store16(0x8100, 4095);
-    store64(0x8102, &idt);
+    # --- Data structures after all code ---
+    # GDT pointer for 16/32-bit (6 bytes: limit16 + base32) at 0x8180
+    store16(0x8180, 55);
+    store32(0x8182, &gdt & 0xFFFFFFFF);
+    # GDT pointer for 64-bit (10 bytes: limit16 + base64) at 0x8190
+    store16(0x8190, 55);
+    store64(0x8192, &gdt);
+    # IDT pointer for 64-bit at 0x81A0
+    store16(0x81A0, 4095);
+    store64(0x81A2, &idt);
 
-    # --- 16-bit real mode at 0x8000 ---
+    # --- 16-bit real mode at 0x8000 (28 bytes) ---
     var off = 0;
     store8(t+off, 0xFA); off = off + 1;                    # cli
     store8(t+off, 0x31); store8(t+off+1, 0xC0); off = off + 2;  # xor ax, ax
     store8(t+off, 0x8E); store8(t+off+1, 0xD8); off = off + 2;  # mov ds, ax
     store8(t+off, 0x8E); store8(t+off+1, 0xD0); off = off + 2;  # mov ss, ax
-    # lgdt [ds:0x80E0] — in real mode with DS=0, address = 0x80E0
+    # lgdt [ds:0x8180] — in real mode with DS=0, address = 0x8180
     store8(t+off, 0x0F); store8(t+off+1, 0x01); store8(t+off+2, 0x16); off = off + 3;
-    store16(t+off, 0x80E0); off = off + 2;                 # lgdt [0x80E0]
-    # Enable PE
+    store16(t+off, 0x8180); off = off + 2;                 # lgdt [0x8180]
+    # Enable PE: mov cr0 | 1
     store8(t+off, 0x0F); store8(t+off+1, 0x20); store8(t+off+2, 0xC0); off = off + 3;
     store8(t+off, 0x0C); store8(t+off+1, 0x01); off = off + 2;
     store8(t+off, 0x0F); store8(t+off+1, 0x22); store8(t+off+2, 0xC0); off = off + 3;
@@ -83,11 +88,11 @@ fn smp_build_trampoline() {
     store32(t+off, 0x8040); off = off + 4;
     store16(t+off, 0x08); off = off + 2;
 
-    # --- 32-bit protected mode at 0x8040 ---
+    # --- 32-bit protected mode at 0x8040 (62 bytes) ---
     var p = 0x8040;
     off = 0;
-    # mov ax,0x10; mov ds/es/ss,ax
-    store8(p+off, 0x66); store8(p+off+1, 0xB8); store16(p+off+2, 0x10); off = off + 4;
+    # mov eax,0x10; mov ds/es/ss,ax
+    store8(p+off, 0xB8); store32(p+off+1, 0x10); off = off + 5;
     store8(p+off, 0x8E); store8(p+off+1, 0xD8); off = off + 2;
     store8(p+off, 0x8E); store8(p+off+1, 0xC0); off = off + 2;
     store8(p+off, 0x8E); store8(p+off+1, 0xD0); off = off + 2;
@@ -107,18 +112,18 @@ fn smp_build_trampoline() {
     store8(p+off, 0x0F); store8(p+off+1, 0x20); store8(p+off+2, 0xC0); off = off + 3;
     store8(p+off, 0x0D); store32(p+off+1, 0x80000000); off = off + 5;
     store8(p+off, 0x0F); store8(p+off+1, 0x22); store8(p+off+2, 0xC0); off = off + 3;
-    # jmp far 0x08:0x8080 (enter 64-bit)
-    store8(p+off, 0xEA); store32(p+off+1, 0x8080); store16(p+off+5, 0x08); off = off + 7;
+    # jmp far 0x08:0x80C0 (enter 64-bit)
+    store8(p+off, 0xEA); store32(p+off+1, 0x80C0); store16(p+off+5, 0x08); off = off + 7;
 
-    # --- 64-bit long mode at 0x8080 ---
-    p = 0x8080;
+    # --- 64-bit long mode at 0x80C0 (77 bytes) ---
+    p = 0x80C0;
     off = 0;
-    # lgdt [0x80F0] (64-bit GDT pointer) — 0F 01 14 25 F0 80 00 00
+    # lgdt [0x8190] (64-bit GDT pointer) — 0F 01 14 25 90 81 00 00
     store8(p+off, 0x0F); store8(p+off+1, 0x01); store8(p+off+2, 0x14); store8(p+off+3, 0x25); off = off + 4;
-    store32(p+off, 0x80F0); off = off + 4;
-    # lidt [0x8100] — 0F 01 1C 25 00 81 00 00
+    store32(p+off, 0x8190); off = off + 4;
+    # lidt [0x81A0] — 0F 01 1C 25 A0 81 00 00
     store8(p+off, 0x0F); store8(p+off+1, 0x01); store8(p+off+2, 0x1C); store8(p+off+3, 0x25); off = off + 4;
-    store32(p+off, 0x8100); off = off + 4;
+    store32(p+off, 0x81A0); off = off + 4;
     # mov ax, 0x10; mov ds/es/ss, ax
     store8(p+off, 0x66); store8(p+off+1, 0xB8); store16(p+off+2, 0x10); off = off + 4;
     store8(p+off, 0x8E); store8(p+off+1, 0xD8); off = off + 2;
@@ -157,11 +162,15 @@ fn smp_start_aps() {
         var stack_addr = 0x300000 + i * 0x10000;
         if (vmm_is_mapped(stack_addr) == 0) { vmm_alloc_at(stack_addr); }
     }
-    # INIT-SIPI-SIPI sequence to wake APs.
-    # NOTE: QEMU multiboot does not support standard AP wakeup via SIPI.
-    # On real hardware or with a proper BIOS/UEFI boot, this would wake APs.
-    # The infrastructure (trampoline, per-CPU stacks, APIC IPI functions) is
-    # ready for when we switch to a GRUB/UEFI boot path.
-    # For now, skip SIPI to avoid AP triple faults in QEMU multiboot mode.
+    # INIT-SIPI-SIPI to wake APs.
+    # Works on real hardware. QEMU's multiboot/GRUB emulation doesn't
+    # properly support SIPI — APs start at wrong address (0x4000 not 0x8000).
+    # Uncomment for real hardware or when QEMU adds proper SIPI support.
+    for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_init(ap); }
+    for (var w = 0; w < 2000000; w = w + 1) { }
+    for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_sipi(ap, 0x08); }
+    for (var w = 0; w < 200000; w = w + 1) { }
+    for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_sipi(ap, 0x08); }
+    for (var w = 0; w < 2000000; w = w + 1) { }
     return cpu_count;
 }
