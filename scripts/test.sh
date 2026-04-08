@@ -31,17 +31,17 @@ test_x86() {
 
     # Build kernel (requires cyrb for multi-file includes)
     # cyrb looks for cc2 at ./build/cc2 relative to CWD
-    rm -f /tmp/agnos_test
+    rm -f $ROOT/build/agnos_test
     if [ -x "$CYRB" ]; then
-        PREPPED="/tmp/agnos_prepped.cyr"
+        PREPPED="$ROOT/build/agnos_prepped.cyr"
         (echo '#define ARCH_X86_64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
-        (cd "$ROOT" && cd kernel && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build "$PREPPED" /tmp/agnos_test) 2>&1
+        (cd "$ROOT" && cd kernel && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build "$PREPPED" $ROOT/build/agnos_test) 2>&1
         rm -f "$PREPPED"
     else
         echo "ERROR: cyrb not found at $CYRB" >&2
     fi
     # Check build produced a valid file
-    if [ -f /tmp/agnos_test ] && [ -s /tmp/agnos_test ]; then
+    if [ -f $ROOT/build/agnos_test ] && [ -s $ROOT/build/agnos_test ]; then
         check "x86 kernel builds" "0" "0"
     else
         check "x86 kernel builds" "0" "1"
@@ -52,7 +52,7 @@ test_x86() {
     # Validate ELF
     python3 -c "
 import struct
-with open('/tmp/agnos_test','rb') as f: d=f.read()
+with open('$ROOT/build/agnos_test','rb') as f: d=f.read()
 mb = struct.unpack_from('<I',d,84)[0]
 entry = struct.unpack_from('<I',d,24)[0]
 ok = mb == 0x1badb002 and entry == 0x100060 and len(d) > 1000
@@ -61,7 +61,7 @@ exit(0 if ok else 1)
     check "x86 valid multiboot ELF" "0" "$?"
 
     # Size check
-    SZ=$(wc -c < /tmp/agnos_test 2>/dev/null || echo 0)
+    SZ=$(wc -c < $ROOT/build/agnos_test 2>/dev/null || echo 0)
     if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 150000 ]; then
         check "x86 size reasonable (${SZ}B)" "0" "0"
     else
@@ -70,11 +70,11 @@ exit(0 if ok else 1)
 
     # Build kernel_hello
     if [ -f "$ROOT/kernel/kernel_hello.cyr" ]; then
-        cat "$ROOT/kernel/kernel_hello.cyr" | "$CC" > /tmp/kernel_hello_test 2>/dev/null
+        cat "$ROOT/kernel/kernel_hello.cyr" | "$CC" > $ROOT/build/kernel_hello_test 2>/dev/null
         check "x86 kernel_hello builds" "0" "$?"
     fi
 
-    rm -f /tmp/agnos_test /tmp/kernel_hello_test
+    rm -f $ROOT/build/agnos_test $ROOT/build/kernel_hello_test
 }
 
 test_aarch64() {

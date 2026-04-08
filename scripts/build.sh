@@ -41,7 +41,7 @@ if [ "$ARCH" = "aarch64" ]; then
     fi
     echo "Building AGNOS kernel [aarch64]..."
     if [ -x "$CYRB" ]; then
-        PREPPED_ARM="/tmp/agnos_arm.cyr"
+        PREPPED_ARM="$ROOT/build/agnos_arm.cyr"
         (echo '#define ARCH_AARCH64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
         (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build --aarch64 "$PREPPED_ARM" "$ROOT/build/agnos-aarch64")
         rm -f "$PREPPED_ARM"
@@ -55,7 +55,7 @@ if [ "$ARCH" = "aarch64" ]; then
 else
     echo "Building AGNOS kernel [x86_64]..."
     # Prepend #define so it works regardless of cyrb -D support
-    PREPPED="/tmp/agnos_x86.cyr"
+    PREPPED="$ROOT/build/agnos_x86.cyr"
     (echo '#define ARCH_X86_64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
     if [ -x "$CYRB" ]; then
         (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build "$PREPPED" "$ROOT/build/agnos")
