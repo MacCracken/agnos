@@ -10,12 +10,12 @@
 
 struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9; r10; r11; r12; r13; r14; r15; rflags; cr3; }
 
-var proc_table[336];
+var proc_table[2688];  # 16 processes x 168 bytes each
 var proc_count = 0;
 var proc_current = 0;
 var sched_active = 0;
-var proc_signals[16];
-var proc_sigmask[16];
+var proc_signals[128];  # 16 processes x 8 bytes
+var proc_sigmask[128];  # 16 processes x 8 bytes
 var pending_signal_flag = 0;
 
 fn proc_create(entry) {
@@ -27,9 +27,7 @@ fn proc_create(entry) {
     store64(p + 16, 0);       # rsp (set by proc_create_full)
     store64(p + 24, entry);   # rip (entry point)
     # Zero all register fields
-    for (var r = 32; r < 160; r = r + 8) {
-        store64(p + r, 0);
-    }
+    memset(p + 32, 0, 128);
     # Set initial RFLAGS: IF=1 (interrupts enabled)
     store64(p + 152, 0x200);
     # Default: use kernel page tables
@@ -67,9 +65,7 @@ fn proc_create_full(entry, stack_top) {
     store64(p + 16, stack_top); # rsp
     store64(p + 24, entry);   # rip
     # Zero all register fields
-    for (var r = 32; r < 160; r = r + 8) {
-        store64(p + r, 0);
-    }
+    memset(p + 32, 0, 128);
     # Set initial RFLAGS: IF=1 (interrupts enabled)
     store64(p + 152, 0x200);
     # Set rbp = stack_top (frame pointer)
@@ -107,11 +103,9 @@ fn proc_create_address_space() {
     if (new_pd == 0) { return 0; }
 
     # Zero all three pages
-    for (var i = 0; i < 4096; i = i + 8) {
-        store64(new_pml4 + i, 0);
-        store64(new_pdpt + i, 0);
-        store64(new_pd + i, 0);
-    }
+    memset(new_pml4, 0, 4096);
+    memset(new_pdpt, 0, 4096);
+    memset(new_pd, 0, 4096);
 
     # PML4[0] → PDPT (present + writable + user)
     store64(new_pml4, new_pdpt | 0x07);
@@ -136,6 +130,8 @@ fn proc_get_ppid(pid) {
 
 fn proc_send_signal(pid, sig) {
     if (pid >= proc_count) { return 0 - 1; }
+    if (sig < 0) { return 0 - 1; }
+    if (sig >= 64) { return 0 - 1; }
     var sig_pending = load64(&proc_signals + pid * 8);
     store64(&proc_signals + pid * 8, sig_pending | (1 << sig));
     return 0;

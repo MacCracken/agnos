@@ -1,6 +1,7 @@
 # === Test Processes ===
 # Simple loop functions for context switch testing.
 # Each prints its ID to serial, then halts until next timer tick.
+# NOTE: `if (0 == 1)` is patched to `while (1 == 1)` by bench.sh at build time.
 
 fn test_proc_a() {
     if (0 == 1) {

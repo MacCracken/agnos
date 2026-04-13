@@ -5,33 +5,33 @@
 
 | | Current |
 |---|---|
-| **Date** | `2026-04-08T02:34:56Z` |
-| **Commit** | `c20be88` |
-| **Version** | 1.11.0 |
+| **Date** | `2026-04-13T09:45:04Z` |
+| **Commit** | `fd47313` |
+| **Version** | 1.21.0 |
 | **Environment** | QEMU x86_64, rdtsc cycles |
 
 ## core
 
-| Benchmark | `c20be88` |
+| Benchmark | `fd47313` |
 |---|---|
-| pmm_alloc_free | 1363 cycles/op |
-| heap_32B | 1330 cycles/op |
-| heap_256B | 3128 cycles/op |
-| heap_4096B | 27249 cycles/op |
-| memwrite_1MB | 6371 Kcycles |
+| pmm_alloc_free | 1420 cycles/op |
+| heap_32B | 1293 cycles/op |
+| heap_256B | 3157 cycles/op |
+| heap_4096B | 28005 cycles/op |
+| memwrite_1MB | 6419 Kcycles |
 
 ## subsystems
 
-| Benchmark | `c20be88` |
+| Benchmark | `fd47313` |
 |---|---|
-| syscall_getpid | 234 cycles/op |
-| syscall_getuid | 824 cycles/op |
-| syscall_write1 | 6807 cycles/op |
-| vfs_open_read_close | 6366 cycles/op |
+| syscall_getpid | 254 cycles/op |
+| syscall_getuid | 1024 cycles/op |
+| syscall_write1 | 7152 cycles/op |
+| vfs_open_read_close | 6591 cycles/op |
 
 ## integration
 
-| Benchmark | `c20be88` |
+| Benchmark | `fd47313` |
 |---|---|
-| serial_putc | 5824 cycles/op |
+| serial_putc | 5669 cycles/op |
 

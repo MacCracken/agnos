@@ -92,6 +92,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 16) {
         # kill(pid=arg1, sig=arg2)
         if (arg1 >= proc_count) { return 0 - 1; }
+        if (arg2 < 0) { return 0 - 1; }
+        if (arg2 >= 64) { return 0 - 1; }
         var sig_pending = load64(&proc_signals + arg1 * 8);
         store64(&proc_signals + arg1 * 8, sig_pending | (1 << arg2));
         return 0;
@@ -129,11 +131,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 20) {
         # epoll_ctl(epfd=arg1, op=arg2, fd=arg3)
-        # arg3 is the fd to watch. Event struct passed via... simplified: store fd+data
+        if (arg1 < 0) { return 0 - 1; }
+        if (arg1 >= 32) { return 0 - 1; }
         var ebase = &vfs_table + arg1 * 32;
         var wl = load64(ebase + 24);
+        if (wl == 0) { return 0 - 1; }
         var wc = load64(ebase + 8);
         if (arg2 == 1) {
+            # Max 8 watches (128 bytes / 16 bytes per watch)
+            if (wc >= 8) { return 0 - 1; }
             store64(wl + wc * 16, arg3);
             store64(wl + wc * 16 + 8, arg3);
             store64(ebase + 8, wc + 1);

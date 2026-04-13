@@ -201,7 +201,7 @@ Release flow: `version-bump.sh` → fill CHANGELOG entries → commit → `git t
 | FAT16 | Complete | Read-only, root directory listing, file open/read |
 | Pipes | Complete | Circular buffer IPC, read/write ends, VFS type 6 |
 | SMP Infrastructure | Complete | APIC, IPI, trampoline, per-CPU stacks |
-| Shell | Complete | 18 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench halt |
+| Shell | Complete | 19 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench test halt |
 | kybernet Init | Complete | PID 1 |
 | Signals | Complete | per-process proc_signals/proc_sigmask, kill, sigprocmask, signalfd |
 | Epoll | Complete | epoll_create, epoll_ctl, epoll_wait |

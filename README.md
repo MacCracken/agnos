@@ -81,7 +81,7 @@ Common:
 | Epoll | epoll_create, epoll_ctl, epoll_wait |
 | Timerfd | timerfd_create, timerfd_settime |
 | Scheduler | Round-robin |
-| Shell | 18 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench halt |
+| Shell | 19 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench test halt |
 | kybernet Init | PID 1, 26 kernel syscalls ready |
 
 ## Syscalls (26)
@@ -121,26 +121,26 @@ Common:
 
 | Operation | Cycles |
 |-----------|--------|
-| PMM alloc+free | 1,304 |
-| Heap 32B alloc+free | 1,207 |
-| Heap 256B alloc+free | 3,015 |
-| Heap 4096B alloc+free | 26,077 |
-| Memory write 1MB | 6,133K |
+| PMM alloc+free | 1,391 |
+| Heap 32B alloc+free | 1,460 |
+| Heap 256B alloc+free | 3,316 |
+| Heap 4096B alloc+free | 28,299 |
+| Memory write 1MB | 6,492K |
 
 ### Tier 2: Subsystems
 
 | Operation | Cycles |
 |-----------|--------|
-| Syscall (getpid) | 188 |
-| Syscall (getuid) | 726 |
-| Syscall (write 1B) | 9,725 |
-| VFS open+read+close | 5,912 |
+| Syscall (getpid) | 247 |
+| Syscall (getuid) | 1,005 |
+| Syscall (write 1B) | 5,762 |
+| VFS open+read+close | 6,217 |
 
 ### Tier 3: Integration
 
 | Operation | Cycles |
 |-----------|--------|
-| Serial putc | 7,510 |
+| Serial putc | 4,382 |
 
 ## Metrics
 

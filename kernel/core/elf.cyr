@@ -43,20 +43,19 @@ fn elf_load(elf_addr, elf_size) {
             while (pg < page_end) {
                 # Allocate a physical 2MB region and map in both kernel + process
                 var phys = pmm_alloc();
-                if (phys != 0) {
-                    # Map in kernel space for copying data
-                    if (vmm_is_mapped(phys) == 0) {
-                        vmm_map(phys, phys, 0x83);
-                    }
-                    # Map in process address space (user-accessible)
-                    proc_map_page(new_cr3, pg, phys);
+                if (phys == 0) { return 0 - 1; }
+                # Map in kernel space for copying data
+                if (vmm_is_mapped(phys) == 0) {
+                    vmm_map(phys, phys, 0x83);
                 }
+                # Map in process address space (user-accessible)
+                proc_map_page(new_cr3, pg, phys);
                 pg = pg + 0x200000;
             }
 
             # Switch to process page tables to copy data
-            var old_cr3_val = 0x1000;
-            var new_cr3_load = new_cr3;
+            # (var loads new_cr3 into rax, asm uses rax for CR3 switch)
+            var cr3_switch = new_cr3;
             asm { mov cr3, rax; }
 
             # Copy segment data
@@ -67,7 +66,7 @@ fn elf_load(elf_addr, elf_size) {
             }
 
             # Switch back to kernel page tables
-            var kern_cr3 = 0x1000;
+            var cr3_restore = 0x1000;
             asm { mov cr3, rax; }
         }
     }
@@ -76,12 +75,11 @@ fn elf_load(elf_addr, elf_size) {
     var pid = proc_count;
     var stack_base = 0x800000 + pid * 0x200000;
     var stack_phys = pmm_alloc();
-    if (stack_phys != 0) {
-        if (vmm_is_mapped(stack_phys) == 0) {
-            vmm_map(stack_phys, stack_phys, 0x83);
-        }
-        proc_map_page(new_cr3, stack_base, stack_phys);
+    if (stack_phys == 0) { return 0 - 1; }
+    if (vmm_is_mapped(stack_phys) == 0) {
+        vmm_map(stack_phys, stack_phys, 0x83);
     }
+    proc_map_page(new_cr3, stack_base, stack_phys);
     var stack_top = stack_base + 0x4000;
 
     # Create process with its own page tables

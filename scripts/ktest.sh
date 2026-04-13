@@ -22,7 +22,7 @@ sed -i 's/exec_and_wait(exec_entry, exec_rsp, exec_cr3);/# skipped/' "$MAIN_CYR"
 sed -i 's/sh_cmd_bench(); arch_halt();/sh_cmd_test(); arch_halt();/' "$MAIN_CYR"
 
 if [ -x "$CYRB" ]; then
-    (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos_ktest") 2>&1
+    (cd "$ROOT/kernel" && "$CYRB" build -D ARCH_X86_64 -D TEST "$ROOT/kernel/agnos.cyr" "$ROOT/build/agnos_ktest") 2>&1
     RESULT=$?
     mv "$MAIN_BAK" "$MAIN_CYR"
     mv "$TPROC_BAK" "$TPROC_CYR"

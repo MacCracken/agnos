@@ -2,7 +2,7 @@
 var vfs_table[128];
 
 fn vfs_init() {
-    for (var i = 0; i < 128; i = i + 1) { store64(&vfs_table + i * 8, 0); }
+    memset(&vfs_table, 0, 1024);  # 32 entries x 32 bytes
     # FD 0 = serial device (type=1, data=device index 0)
     store64(&vfs_table, 1);
     store64(&vfs_table + 24, 0);
@@ -82,7 +82,7 @@ fn pipe_read(base, buf, count) {
     while (copied < count) {
         if (read_tail == write_head) { break; }
         # Data starts at pipe_buf + 8 (first 8 bytes = write head)
-        var byte_off = (read_tail & 4087) + 8;
+        var byte_off = (read_tail % 4088) + 8;
         store8(buf + copied, load8(pipe_buf + byte_off));
         read_tail = read_tail + 1;
         copied = copied + 1;
@@ -99,11 +99,11 @@ fn pipe_write(base, buf, count) {
     var written = 0;
     while (written < count) {
         # Check if buffer full (4087 bytes usable, after 8-byte header)
-        var byte_off = (write_head & 4087) + 8;
+        var byte_off = (write_head % 4088) + 8;
         store8(pipe_buf + byte_off, load8(buf + written));
         write_head = write_head + 1;
         written = written + 1;
-        if (written >= 4087) { break; }
+        if (written >= 4088) { break; }
     }
     store64(pipe_buf, write_head);
     return written;
@@ -112,6 +112,8 @@ fn pipe_write(base, buf, count) {
 fn vfs_read(fd_idx, buf, count) {
     if (fd_idx < 0) { return 0 - 1; }
     if (fd_idx >= 32) { return 0 - 1; }
+    if (buf == 0) { return 0 - 1; }
+    if (count < 0) { return 0 - 1; }
     var base = &vfs_table + fd_idx * 32;
     var ftype = load64(base);
     if (ftype == 0) { return 0 - 1; }
@@ -126,9 +128,7 @@ fn vfs_read(fd_idx, buf, count) {
         var avail = fsize - pos;
         if (avail < 1) { return 0; }
         if (count > avail) { count = avail; }
-        for (var i = 0; i < count; i = i + 1) {
-            store8(buf + i, load8(data + pos + i));
-        }
+        memcpy(buf, data + pos, count);
         store64(base + 8, pos + count);
         return count;
     }
@@ -150,6 +150,8 @@ fn vfs_read(fd_idx, buf, count) {
 fn vfs_write(fd_idx, buf, count) {
     if (fd_idx < 0) { return 0 - 1; }
     if (fd_idx >= 32) { return 0 - 1; }
+    if (buf == 0) { return 0 - 1; }
+    if (count < 0) { return 0 - 1; }
     var base = &vfs_table + fd_idx * 32;
     var ftype = load64(base);
     if (ftype == 1) {
@@ -172,7 +174,7 @@ fn vfs_create_pipe(fds_ptr) {
     store64(pipe_buf, 0);
     # Allocate read end fd
     var rfd = vfs_alloc();
-    if (rfd < 0) { return 0 - 1; }
+    if (rfd < 0) { kfree_sized(pipe_buf, 4096); return 0 - 1; }
     var rbase = &vfs_table + rfd * 32;
     store64(rbase, 6);
     store64(rbase + 8, 0);
@@ -180,7 +182,7 @@ fn vfs_create_pipe(fds_ptr) {
     store64(rbase + 24, pipe_buf);
     # Allocate write end fd
     var wfd = vfs_alloc();
-    if (wfd < 0) { return 0 - 1; }
+    if (wfd < 0) { vfs_close(rfd); kfree_sized(pipe_buf, 4096); return 0 - 1; }
     var wbase = &vfs_table + wfd * 32;
     store64(wbase, 6);
     store64(wbase + 8, 0);

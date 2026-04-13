@@ -42,7 +42,9 @@ include "core/vfs.cyr"
 include "core/devs.cyr"
 include "core/initrd.cyr"
 include "core/kprint.cyr"
+#ifdef TEST
 include "user/test.cyr"
+#endif
 include "user/shell.cyr"
 include "user/init.cyr"
 

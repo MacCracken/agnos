@@ -14,9 +14,7 @@ var heap_frees = 0;
 
 fn heap_init() {
     # Initialize free lists to null
-    for (var i = 0; i < 8; i = i + 1) {
-        store64(&slab_free + i * 8, 0);
-    }
+    memset(&slab_free, 0, 64);
     # Store class sizes: 32, 64, 128, 256, 512, 1024, 2048, 4096
     store64(&slab_sizes, 32);
     store64(&slab_sizes + 8, 64);

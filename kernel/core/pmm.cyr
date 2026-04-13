@@ -31,14 +31,12 @@ fn pmm_test(page) {
 
 fn pmm_init() {
     # Zero bitmap (all free)
-    for (var i = 0; i < 512; i = i + 1) { store8(&pmm_bitmap + i, 0); }
+    memset(&pmm_bitmap, 0, 512);
     pmm_total = 4096;
     pmm_used = 0;
     # Mark first 2MB as used (kernel + page tables + stack)
     # 2MB / 4KB = 512 pages = pages 0-511 = 64 bytes of bitmap, all 0xFF
-    for (var i = 0; i < 64; i = i + 1) {
-        store8(&pmm_bitmap + i, 0xFF);
-    }
+    memset(&pmm_bitmap, 0xFF, 64);
     pmm_used = 512;
     pmm_next_free = 512;
     return 0;
