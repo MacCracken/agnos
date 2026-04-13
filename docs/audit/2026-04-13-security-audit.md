@@ -97,16 +97,37 @@ All fixes compile cleanly. QEMU boot verification recommended before release.
 
 ---
 
+## Phase 1 Hardening (2026-04-13, second pass)
+
+5 additional fixes applied (S3, S4, S5, S11, S12 from security roadmap):
+
+| # | Item | File | Fix Applied |
+|---|---|---|---|
+| S3 | **PMM spinlock** — SMP double-allocation race | `kernel/core/pmm.cyr` | Added `pmm_lock` with atomic xchg spinlock around `pmm_alloc`/`pmm_free` |
+| S4 | **Per-process exit codes** — global `sys_exit_code` race | `kernel/core/proc.cyr`, `kernel/core/sched.cyr`, `kernel/core/syscall.cyr`, `kernel/core/main.cyr` | Extended proc_table to 176 bytes (22 fields), added `exit_code` at offset 168, updated all `* 168` → `* 176` references, `waitpid` now returns per-process code |
+| S5 | **Per-connection TCP RX buffers** — shared buffer corruption | `kernel/core/net.cyr` | `tcp_connect` allocates 256-byte heap buffer per connection, `net_handle_tcp` writes to per-connection buffer, `tcp_close` frees it |
+| S11 | **ARP request tracking** — cache poisoning | `kernel/core/net.cyr` | Added `arp_pending_ip`, set before sending request, `net_handle_arp` rejects replies not matching pending request |
+| S12 | **TCP seq/ack validation** — connection hijacking | `kernel/core/net.cyr` | Randomized ISN (timer_ticks-based), validated ACK in SYN-ACK, added receive window check (8192) in ESTABLISHED state |
+
+```
+Build: OK (241592 bytes)
+Tests: 4/4 passed
+```
+
+---
+
 ## Recommended Next Steps (Priority Order)
 
-1. **Fix `ring3.cyr` U/S bit** — stop marking kernel pages as user-accessible (requires mapping user code at a separate virtual address)
-2. **Per-CPU TSS with per-CPU RSP0** — critical for SMP correctness
-3. **PMM spinlock** — wrap bitmap operations in spin_lock/spin_unlock
-4. **Per-process exit codes** — replace global `sys_exit_code`
-5. **KASLR** — randomize kernel base address
-6. **KPTI** — separate user/kernel page tables for Spectre/Meltdown
-7. **Per-connection TCP RX buffers** — prevent data corruption between connections
-8. **Stack guard pages** — unmapped page below each stack
+1. **S1: Fix `ring3.cyr` U/S bit** — stop marking kernel pages as user-accessible (requires mapping user code at a separate virtual address)
+2. **S2: Per-CPU TSS with per-CPU RSP0** — critical for SMP correctness
+3. **S6: Stack guard pages** — unmapped page below each stack
+4. **S8: KPTI** — separate user/kernel page tables for Spectre/Meltdown
+5. **S9: Spectre v2** — IBRS on syscall/interrupt entry
+6. **S7: KASLR** — randomize kernel base address (requires Cyrius relocation support)
+7. **S10: IOMMU** — VT-d DMA restriction (requires ACPI parsing)
+8. **S13: Stack canaries** — overflow detection in critical functions
+
+See `docs/development/security-hardening.md` for full implementation plans.
 
 ---
 

@@ -320,7 +320,7 @@ kprint_num(exec_pid);
 serial_println("", 0);
 
 if (exec_pid >= 0) {
-    var ep = &proc_table + exec_pid * 168;
+    var ep = &proc_table + exec_pid * 176;
     var exec_entry = load64(ep + 24);
     var exec_rsp = load64(ep + 16);
     var exec_cr3 = load64(ep + 160);

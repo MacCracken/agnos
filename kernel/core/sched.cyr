@@ -25,7 +25,7 @@ fn sched_next() {
 # We save these into the process table for later restoration.
 fn proc_save_context(pid, isr_rsp) {
     if (pid >= proc_count) { return 0; }
-    var p = &proc_table + pid * 168;
+    var p = &proc_table + pid * 176;
     # ISR stack layout (top to bottom, growing down):
     # [isr_rsp+0]  = rax (pushed last by our ISR)
     # [isr_rsp+8]  = rcx
@@ -61,7 +61,7 @@ fn proc_save_context(pid, isr_rsp) {
 # and our ISR pops will restore the GPRs.
 fn proc_restore_context(pid, isr_rsp) {
     if (pid >= proc_count) { return 0; }
-    var p = &proc_table + pid * 168;
+    var p = &proc_table + pid * 176;
     store64(isr_rsp, load64(p + 32));       # rax
     store64(isr_rsp + 8, load64(p + 48));   # rcx
     store64(isr_rsp + 16, load64(p + 56));  # rdx

@@ -45,6 +45,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 0) {
         # exit — halt current process, return to kernel if context saved
         sys_exit_code = arg1;
+        proc_set_exit_code(proc_current, arg1);
         if (proc_current < proc_count) {
             proc_set_state(proc_current, 0);
             # Send SIGCHLD (signal 17) to parent process
@@ -79,12 +80,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 4) {
         # waitpid(pid) — wait for a process to exit (state=0)
-        # Simple busy-wait for now; returns exit code
+        # Simple busy-wait for now; returns per-process exit code
+        if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= proc_count) { return 0 - 1; }
         while (proc_get_state(arg1) != 0) {
             arch_wait();
         }
-        return sys_exit_code;
+        return proc_get_exit_code(arg1);
     }
     if (num == 5) {
         # read(fd=arg1, buf=arg2, len=arg3)

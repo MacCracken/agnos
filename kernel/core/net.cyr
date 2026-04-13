@@ -5,6 +5,7 @@ var net_netmask = 0;
 var net_pkt[256];
 var arp_cache_ip = 0;
 var arp_cache_mac[8];
+var arp_pending_ip = 0;  # Security: track which IP we sent an ARP request for
 var net_rx_pkt[256];
 var net_udp_buf[256];
 var net_udp_buf_len = 0;
@@ -83,6 +84,8 @@ fn udp_build(pkt, src_port, dst_port, data, data_len) {
 
 fn arp_request(target_ip) {
     if (vnet_active == 0) { return 0 - 1; }
+    # Security: record pending request BEFORE sending (avoid race with fast reply)
+    arp_pending_ip = target_ip;
     var p = &net_pkt;
     var bcast[8];
     memset(&bcast, 0xFF, 6);
@@ -129,8 +132,12 @@ fn net_handle_arp(pkt, len) {
     if (oper == 2) {
         # ARP reply: sender MAC at pkt+22, sender IP at pkt+28
         var sender_ip = (load8(pkt + 28) << 24) | (load8(pkt + 29) << 16) | (load8(pkt + 30) << 8) | load8(pkt + 31);
+        # Security: only accept replies matching our pending ARP request
+        if (arp_pending_ip == 0) { return 0; }
+        if (sender_ip != arp_pending_ip) { return 0; }
         arp_cache_ip = sender_ip;
         net_copy_buf(&arp_cache_mac, pkt + 22, 6);
+        arp_pending_ip = 0;  # Request fulfilled
     }
     return 0;
 }
@@ -309,20 +316,25 @@ fn tcp_connect(dst_ip, dst_port, src_port) {
     var conn_id = tcp_conn_count;
     tcp_conn_count = tcp_conn_count + 1;
     var cb = tcp_conn_base(conn_id);
+    # Allocate per-connection RX buffer (S5: prevent shared-buffer corruption)
+    var rx_buf = kmalloc(256);
+    if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0 - 1; }
     store64(cb, 1);             # state = SYN_SENT
     store64(cb + 8, src_port);
     store64(cb + 16, dst_port);
     store64(cb + 24, dst_ip);
-    store64(cb + 32, 1000);     # initial seq
+    # Use timer_ticks for initial seq randomization (reduces spoofing risk)
+    store64(cb + 32, (timer_ticks * 64017 + 1) & 0xFFFFFFFF);  # initial seq
     store64(cb + 40, 0);        # ack_num
-    store64(cb + 48, 0);        # rx_buf (none yet)
+    store64(cb + 48, rx_buf);   # per-connection rx_buf
     store64(cb + 56, 0);        # rx_buf_len
     store64(cb + 64, 0);        # rx_buf_head
     store64(cb + 72, 0);        # flags
     # Send SYN (flags = 0x02)
     tcp_send_pkt(conn_id, 0x02, 0, 0);
     # Advance seq by 1 (SYN consumes a sequence number)
-    store64(cb + 32, 1001);
+    var isn = load64(cb + 32);
+    store64(cb + 32, (isn + 1) & 0xFFFFFFFF);
     # Wait for SYN-ACK (poll a few times)
     for (var i = 0; i < 200; i = i + 1) {
         net_poll();
@@ -386,6 +398,12 @@ fn tcp_close(conn_id) {
         tcp_send_pkt(conn_id, 0x11, 0, 0);
         store64(cb, 0);  # CLOSED
     }
+    # Free per-connection RX buffer
+    var rx_buf = load64(cb + 48);
+    if (rx_buf != 0) {
+        kfree_sized(rx_buf, 256);
+        store64(cb + 48, 0);
+    }
     return 0;
 }
 
@@ -427,6 +445,11 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
     # SYN_SENT: expect SYN-ACK (flags & 0x12 == 0x12)
     if (state == 1) {
         if ((flags & 0x12) == 0x12) {
+            # Security: validate ACK matches our SYN seq + 1
+            var our_seq = load64(cb + 32);
+            if (((ack - our_seq) & 0xFFFFFFFF) != 0) {
+                return 0;  # Bad ACK, drop
+            }
             store64(cb + 40, seq + 1);
             store64(cb, 2);  # ESTABLISHED
             # Send ACK (flags = 0x10)
@@ -445,12 +468,22 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
             store64(cb, 0);  # RST -> CLOSED
             return 1;
         }
+        # Security: validate sequence number is within receive window
+        var expected_seq = load64(cb + 40);
+        var seq_diff = (seq - expected_seq) & 0xFFFFFFFF;
+        if (seq_diff >= 8192) {
+            # Outside receive window — drop packet (unless pure ACK with no data)
+            if (data_len > 0) { return 0; }
+            if ((flags & 0x01) != 0) { return 0; }  # FIN outside window
+        }
         if (data_len > 0) {
-            # Security: cap at tcp_rx_tmpbuf size (256 bytes)
+            # Security: cap at per-connection buffer size (256 bytes)
             if (data_len > 248) { data_len = 248; }
-            # Store data in rx buffer
-            net_copy_buf(&tcp_rx_tmpbuf, tcp + tcp_hdr_len, data_len);
-            store64(cb + 48, &tcp_rx_tmpbuf);
+            # Store data in per-connection rx buffer
+            var rx_buf = load64(cb + 48);
+            if (rx_buf != 0) {
+                net_copy_buf(rx_buf, tcp + tcp_hdr_len, data_len);
+            }
             store64(cb + 56, data_len);
             # Update ack
             store64(cb + 40, seq + data_len);

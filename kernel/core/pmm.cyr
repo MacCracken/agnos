@@ -5,6 +5,33 @@ var pmm_bitmap[512];
 var pmm_total = 0;
 var pmm_used = 0;
 var pmm_next_free = 0;
+var pmm_lock = 0;
+
+# SMP-safe spinlock for PMM using atomic xchg.
+# Must NOT be called from interrupt context (deadlock risk).
+fn pmm_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &pmm_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;  # mov rcx, 1
+            0x48; 0x87; 0x08;              # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;       # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+
+fn pmm_spin_unlock() {
+    var addr = &pmm_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
 
 # Security: all bitmap functions validate page index is in [0, 4095]
 # to prevent negative indices and out-of-bounds access.
@@ -51,12 +78,14 @@ fn pmm_init() {
 }
 
 fn pmm_alloc() {
+    pmm_spin_lock();
     # Find first free page, starting from hint for O(1) best-case
     for (var i = pmm_next_free; i < 4096; i = i + 1) {
         if (pmm_test(i) == 0) {
             pmm_set(i);
             pmm_used = pmm_used + 1;
             pmm_next_free = i + 1;
+            pmm_spin_unlock();
             return i * 0x1000;
         }
     }
@@ -66,9 +95,11 @@ fn pmm_alloc() {
             pmm_set(i);
             pmm_used = pmm_used + 1;
             pmm_next_free = i + 1;
+            pmm_spin_unlock();
             return i * 0x1000;
         }
     }
+    pmm_spin_unlock();
     return 0;
 }
 
@@ -76,12 +107,14 @@ fn pmm_free(addr) {
     var page = addr / 0x1000;
     # Security: validate page index
     if (pmm_page_valid(page) == 0) { return 0 - 1; }
+    pmm_spin_lock();
     # Security: detect double-free (page must be allocated to free it)
-    if (pmm_test(page) != 1) { return 0 - 1; }
+    if (pmm_test(page) != 1) { pmm_spin_unlock(); return 0 - 1; }
     pmm_clear(page);
     pmm_used = pmm_used - 1;
     # Update hint so next alloc finds this freed page quickly
     if (page < pmm_next_free) { pmm_next_free = page; }
+    pmm_spin_unlock();
     return 0;
 }
 
