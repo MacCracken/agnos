@@ -42,6 +42,9 @@ fn slab_class_for(size) {
 
 # Allocate a new slab page for a given class and add all blocks to free list
 fn slab_grow(class_idx) {
+    # Security: validate class index
+    if (class_idx < 0) { return 0 - 1; }
+    if (class_idx >= 8) { return 0 - 1; }
     var block_size = load64(&slab_sizes + class_idx * 8);
     # Allocate a 4KB page from PMM
     var page = pmm_alloc();
@@ -98,6 +101,12 @@ fn kfree_sized(ptr, size) {
     if (ptr == 0) { return 0; }
     var class_idx = slab_class_for(size);
     if (class_idx < 0) { return 0 - 1; }
+    # Security: zero the freed block to prevent information leaks
+    var block_size = load64(&slab_sizes + class_idx * 8);
+    var zero_len = (block_size + 7) & (0 - 8);
+    for (var i = 0; i < zero_len; i = i + 8) {
+        store64(ptr + i, 0);
+    }
     # Push onto free list
     var head = load64(&slab_free + class_idx * 8);
     store64(ptr, head);

@@ -4,7 +4,9 @@
 # For now: 2MB huge pages only (PD entries).
 # Page flags: 0x01=Present, 0x02=Writable, 0x04=User, 0x80=2MB page
 # Kernel pages: 0x83 (Present+Writable+2MB)
-# User pages:   0x87 (Present+Writable+User+2MB)
+# User pages:   0x8000000000000087 (Present+Writable+User+2MB+NX)
+# NX (bit 63) set on user data/stack pages to prevent code execution.
+# User code pages should use 0x87 (without NX) for executable segments.
 
 fn vmm_map(virt, phys, flags) {
     var pd_idx = (virt >> 21) & 0x1FF;
@@ -19,8 +21,14 @@ fn vmm_map(virt, phys, flags) {
     return 0;
 }
 
-# Map a page as user-accessible (ring 3 can read/write)
+# Map a page as user-accessible (ring 3 can read/write, non-executable)
+# Security: NX bit (bit 63) prevents code execution on data/stack pages
 fn vmm_map_user(virt, phys) {
+    return vmm_map(virt, phys, 0x8000000000000087);
+}
+
+# Map a page as user-accessible and executable (for code segments)
+fn vmm_map_user_exec(virt, phys) {
     return vmm_map(virt, phys, 0x87);
 }
 
@@ -46,10 +54,18 @@ fn vmm_alloc_at(virt) {
     return phys;
 }
 
-# Allocate a physical page and map it as user-accessible
+# Allocate a physical page and map it as user-accessible (non-executable)
 fn vmm_alloc_user(virt) {
     var phys = pmm_alloc();
     if (phys == 0) { return 0; }
     vmm_map_user(virt, phys);
+    return phys;
+}
+
+# Allocate a physical page and map it as user-accessible + executable
+fn vmm_alloc_user_exec(virt) {
+    var phys = pmm_alloc();
+    if (phys == 0) { return 0; }
+    vmm_map_user_exec(virt, phys);
     return phys;
 }

@@ -20,7 +20,13 @@ fn spin_lock() {
 }
 
 fn spin_unlock() {
-    smp_lock = 0;
+    # Security: use atomic xchg to release lock (plain store is not safe on SMP)
+    var addr = &smp_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
     return 0;
 }
 

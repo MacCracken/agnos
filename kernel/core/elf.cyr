@@ -3,6 +3,8 @@
 # Returns pid or -1 on error.
 
 fn elf_load(elf_addr, elf_size) {
+    # Verify minimum ELF header size (64 bytes for ELF64)
+    if (elf_size < 64) { return 0 - 1; }
     # Verify ELF magic: 0x7F 'E' 'L' 'F'
     if (load8(elf_addr) != 0x7F) { return 0 - 1; }
     if (load8(elf_addr + 1) != 0x45) { return 0 - 1; }
@@ -13,6 +15,8 @@ fn elf_load(elf_addr, elf_size) {
 
     # Read entry point (e_entry at offset 24)
     var entry = load64(elf_addr + 24);
+    # Security: entry must be in userspace, not kernel memory
+    if (entry < 0x200000) { return 0 - 1; }
 
     # Read program header offset (e_phoff at offset 32)
     var phoff = load64(elf_addr + 32);
@@ -20,6 +24,12 @@ fn elf_load(elf_addr, elf_size) {
     var phentsize = load16(elf_addr + 54);
     # Read program header count (e_phnum at offset 56)
     var phnum = load16(elf_addr + 56);
+
+    # Security: validate program header table fits within ELF
+    if (phentsize < 56) { return 0 - 1; }
+    if (phnum > 64) { return 0 - 1; }
+    if (phoff >= elf_size) { return 0 - 1; }
+    if (phoff + phnum * phentsize > elf_size) { return 0 - 1; }
 
     # Create per-process address space
     var new_cr3 = proc_create_address_space();
@@ -35,6 +45,18 @@ fn elf_load(elf_addr, elf_size) {
             var p_vaddr = load64(ph + 16);
             var p_filesz = load64(ph + 32);
             var p_memsz = load64(ph + 40);
+
+            # Security: validate segment bounds within ELF file
+            if (p_offset >= elf_size) { return 0 - 1; }
+            if (p_filesz > elf_size) { return 0 - 1; }
+            if (p_offset + p_filesz > elf_size) { return 0 - 1; }
+            # Security: validate memsz >= filesz and no overflow
+            if (p_memsz < p_filesz) { return 0 - 1; }
+            if (p_vaddr + p_memsz < p_vaddr) { return 0 - 1; }
+            # Security: segment must be in userspace
+            if (p_vaddr < 0x200000) { return 0 - 1; }
+            # Security: cap segment size to prevent exhausting physical memory
+            if (p_memsz > 0x2000000) { return 0 - 1; }
 
             # Allocate 2MB pages for this segment in the process's address space
             var page_start = p_vaddr & 0xFFFFFFFFFFE00000;

@@ -6,8 +6,16 @@ var pmm_total = 0;
 var pmm_used = 0;
 var pmm_next_free = 0;
 
+# Security: all bitmap functions validate page index is in [0, 4095]
+# to prevent negative indices and out-of-bounds access.
+fn pmm_page_valid(page) {
+    if (page < 0) { return 0; }
+    if (page >= 4096) { return 0; }
+    return 1;
+}
+
 fn pmm_set(page) {
-    if (page >= 4096) { return 0 - 1; }
+    if (pmm_page_valid(page) == 0) { return 0 - 1; }
     var byte = page / 8;
     var bit = page % 8;
     store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) | (1 << bit));
@@ -15,7 +23,7 @@ fn pmm_set(page) {
 }
 
 fn pmm_clear(page) {
-    if (page >= 4096) { return 0 - 1; }
+    if (pmm_page_valid(page) == 0) { return 0 - 1; }
     var byte = page / 8;
     var bit = page % 8;
     store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) & ((0 - 1 - (1 << bit)) & 0xFF));
@@ -23,7 +31,7 @@ fn pmm_clear(page) {
 }
 
 fn pmm_test(page) {
-    if (page >= 4096) { return 0; }
+    if (pmm_page_valid(page) == 0) { return 0; }
     var byte = page / 8;
     var bit = page % 8;
     return (load8(&pmm_bitmap + byte) >> bit) & 1;
@@ -66,12 +74,14 @@ fn pmm_alloc() {
 
 fn pmm_free(addr) {
     var page = addr / 0x1000;
-    if (pmm_test(page) == 1) {
-        pmm_clear(page);
-        pmm_used = pmm_used - 1;
-        # Update hint so next alloc finds this freed page quickly
-        if (page < pmm_next_free) { pmm_next_free = page; }
-    }
+    # Security: validate page index
+    if (pmm_page_valid(page) == 0) { return 0 - 1; }
+    # Security: detect double-free (page must be allocated to free it)
+    if (pmm_test(page) != 1) { return 0 - 1; }
+    pmm_clear(page);
+    pmm_used = pmm_used - 1;
+    # Update hint so next alloc finds this freed page quickly
+    if (page < pmm_next_free) { pmm_next_free = page; }
     return 0;
 }
 

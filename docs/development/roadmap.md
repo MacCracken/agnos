@@ -92,6 +92,39 @@ All Cyrius blockers resolved (Cyrius >= 1.7.0):
 6. ~~Nested for-loops with var~~ — **Fixed** v1.7.0
 7. ~~ifdef in included files~~ — **Fixed** v1.6.5
 
+## Security Hardening (from 2026-04-13 audit)
+
+Priority order. See `docs/audit/2026-04-13-security-audit.md` for full findings.
+
+| # | Item | Prerequisite | Severity |
+|---|------|-------------|----------|
+| S1 | **Separate user/kernel page mappings** — stop setting U/S bit on kernel PD entries in `ring3.cyr`; map user code at high virtual address instead of sharing kernel identity map | VMM | HIGH |
+| S2 | **Per-CPU TSS + RSP0** — each AP needs its own TSS with its own kernel stack pointer; current global `tss_kernel_stack` causes stack corruption on SMP | SMP + GDT | HIGH |
+| S3 | **PMM spinlock** — wrap `pmm_alloc`/`pmm_free` in `spin_lock`/`spin_unlock` to prevent double-allocation on SMP | S2 (per-CPU stacks) | MEDIUM |
+| S4 | **Per-process exit codes** — replace global `sys_exit_code` with per-process storage in proc table; current design returns wrong exit code under concurrent exits | Proc table | MEDIUM |
+| S5 | **Per-connection TCP RX buffers** — allocate from heap instead of sharing single `tcp_rx_tmpbuf`; concurrent connections corrupt each other's data | Heap | MEDIUM |
+| S6 | **Stack guard pages** — map an unmapped page below each user stack to trap overflow instead of silently corrupting adjacent memory | VMM (4KB pages) | MEDIUM |
+| S7 | **KASLR** — randomize kernel load address; currently fixed at 0x100000, trivial ROP | Boot shim + relocatable binary | MEDIUM |
+| S8 | **KPTI (Kernel Page Table Isolation)** — separate user/kernel page tables to mitigate Meltdown; switch CR3 on syscall entry/exit | S1 + SYSCALL handler | MEDIUM |
+| S9 | **Spectre v2 mitigations** — set IA32_SPEC_CTRL.IBRS on syscall entry; consider retpoline for indirect calls | SYSCALL handler | MEDIUM |
+| S10 | **IOMMU (VT-d)** — restrict DMA targets so VirtIO devices cannot write arbitrary physical memory | PCI + ACPI/DMAR parsing | MEDIUM |
+| S11 | **ARP request tracking** — only accept ARP replies that match a pending request to prevent cache poisoning | Net stack | LOW |
+| S12 | **TCP window/sequence validation** — verify received seq is within expected window to prevent connection hijacking | Net stack | LOW |
+| S13 | **Stack canaries** — place canary values at stack frame boundaries to detect buffer overflows | Compiler support or manual | LOW |
+
+### Dependency chain
+
+```
+S1 (user/kernel page split)
+├── S8 (KPTI) ── S9 (Spectre)
+└── S6 (guard pages — needs 4KB page support)
+
+S2 (per-CPU TSS)
+└── S3 (PMM spinlock)
+
+S4, S5, S7, S10-S13 are independent
+```
+
 ## Planned
 
 | # | Item | Prerequisite |

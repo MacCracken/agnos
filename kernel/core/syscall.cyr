@@ -6,6 +6,19 @@
 
 var sys_exit_code = 0;
 
+# Security: validate userspace pointer is outside kernel region (0x0-0x200000).
+# Returns 1 if pointer is safe, 0 if it points into kernel memory.
+fn is_user_ptr(ptr) {
+    if (ptr < 0x200000) { return 0; }
+    return 1;
+}
+
+fn is_user_range(ptr, len) {
+    if (ptr < 0x200000) { return 0; }
+    if (ptr + len < ptr) { return 0; }  # overflow check
+    return 1;
+}
+
 # Resume kernel execution after a user process exits.
 # Restores saved kernel RSP and jumps to saved RIP.
 fn kernel_resume() {
@@ -48,6 +61,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 1) {
         # write(fd=arg1, buf=arg2, len=arg3)
+        if (arg3 > 0) {
+            if (is_user_range(arg2, arg3) == 0) { return 0 - 1; }
+        }
         return vfs_write(arg1, arg2, arg3);
     }
     if (num == 2) { return proc_current; }
@@ -70,9 +86,21 @@ fn ksyscall(num, arg1, arg2, arg3) {
         }
         return sys_exit_code;
     }
-    if (num == 5) { return vfs_read(arg1, arg2, arg3); }
+    if (num == 5) {
+        # read(fd=arg1, buf=arg2, len=arg3)
+        if (arg3 > 0) {
+            if (is_user_range(arg2, arg3) == 0) { return 0 - 1; }
+        }
+        return vfs_read(arg1, arg2, arg3);
+    }
     if (num == 6) { return vfs_close(arg1); }
-    if (num == 7) { return initrd_open(arg1, arg2); }
+    if (num == 7) {
+        # open(name=arg1, namelen=arg2)
+        if (arg2 > 0) {
+            if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
+        }
+        return initrd_open(arg1, arg2);
+    }
     # Tier 1: stubs
     if (num == 8) { return arg1; }           # dup(fd) -> return same fd
     if (num == 9) { return 0; }              # mkdir
@@ -91,15 +119,33 @@ fn ksyscall(num, arg1, arg2, arg3) {
     # Tier 3: signals
     if (num == 16) {
         # kill(pid=arg1, sig=arg2)
+        if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= proc_count) { return 0 - 1; }
         if (arg2 < 0) { return 0 - 1; }
         if (arg2 >= 64) { return 0 - 1; }
+        # Security: non-init processes cannot signal PID 0 (init)
+        if (arg1 == 0) {
+            if (proc_current != 0) { return 0 - 1; }
+        }
+        # Security: processes can only signal themselves or children
+        # For now, allow signaling own process or if sender is PID 0 (init)
+        if (proc_current != 0) {
+            if (arg1 != proc_current) {
+                var target_ppid = proc_get_ppid(arg1);
+                if (target_ppid != proc_current) { return 0 - 1; }
+            }
+        }
         var sig_pending = load64(&proc_signals + arg1 * 8);
         store64(&proc_signals + arg1 * 8, sig_pending | (1 << arg2));
         return 0;
     }
     if (num == 17) {
         # sigprocmask(how=arg1, set=arg2, oldset=arg3)
+        # Security: validate userspace pointers
+        if (is_user_ptr(arg2) == 0) { return 0 - 1; }
+        if (arg3 != 0) {
+            if (is_user_ptr(arg3) == 0) { return 0 - 1; }
+        }
         var old_mask = load64(&proc_sigmask + proc_current * 8);
         if (arg3 != 0) { store64(arg3, old_mask); }
         var new_bits = load64(arg2);
@@ -110,6 +156,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 18) {
         # signalfd(fd=arg1, mask_ptr=arg2, flags=arg3)
+        # Security: validate userspace pointer
+        if (is_user_ptr(arg2) == 0) { return 0 - 1; }
         var sfd = vfs_alloc();
         if (sfd < 0) { return 0 - 1; }
         var sbase = &vfs_table + sfd * 32;
@@ -151,6 +199,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 21) {
         # epoll_wait(epfd=arg1, events=arg2, max=arg3)
+        # Security: validate fd bounds and userspace pointer
+        if (arg1 < 0) { return 0 - 1; }
+        if (arg1 >= 32) { return 0 - 1; }
+        if (is_user_ptr(arg2) == 0) { return 0 - 1; }
+        if (arg3 < 0) { return 0 - 1; }
+        if (arg3 > 16) { arg3 = 16; }
         var ebase = &vfs_table + arg1 * 32;
         var wl = load64(ebase + 24);
         var wc = load64(ebase + 8);
@@ -192,6 +246,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 23) {
         # timerfd_settime(fd=arg1, flags=arg2, new_value=arg3)
+        # Security: validate fd bounds and userspace pointer
+        if (arg1 < 0) { return 0 - 1; }
+        if (arg1 >= 32) { return 0 - 1; }
+        if (is_user_range(arg3, 24) == 0) { return 0 - 1; }
         var tbase = &vfs_table + arg1 * 32;
         var int_sec = load64(arg3);
         var init_sec = load64(arg3 + 16);
@@ -201,6 +259,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 25) {
         # pipe(fds_ptr=arg1)
+        # Security: validate userspace pointer for 2x u64
+        if (is_user_range(arg1, 16) == 0) { return 0 - 1; }
         return vfs_create_pipe(arg1);
     }
     return 0 - 1;

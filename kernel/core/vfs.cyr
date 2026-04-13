@@ -125,6 +125,8 @@ fn vfs_read(fd_idx, buf, count) {
         var pos = load64(base + 8);
         var fsize = load64(base + 16);
         var data = load64(base + 24);
+        # Security: check pos <= fsize to prevent underflow in subtraction
+        if (pos >= fsize) { return 0; }
         var avail = fsize - pos;
         if (avail < 1) { return 0; }
         if (count > avail) { count = avail; }

@@ -10,7 +10,7 @@ var vnet_rx_desc[64];
 var vnet_rx_avail[8];
 var vnet_rx_used[8];
 var vnet_tx_buf[256];
-var vnet_rx_buf[256];
+var vnet_rx_buf[2048];
 var vnet_tx_idx = 0;
 var vnet_rx_idx = 0;
 var vnet_active = 0;

@@ -139,7 +139,8 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len) {
     # UDP header at ip_off: src_port(2) dst_port(2) length(2) checksum(2) data...
     if (ip_payload_len < 8) { return 0; }
     var udp_data_len = ip_payload_len - 8;
-    if (udp_data_len > 2040) { udp_data_len = 2040; }
+    # Security: cap at buffer size (256 bytes) to prevent overflow
+    if (udp_data_len > 248) { udp_data_len = 248; }
     net_copy_buf(&net_udp_buf, pkt + ip_off + 8, udp_data_len);
     net_udp_buf_len = udp_data_len;
     return udp_data_len;
@@ -164,14 +165,17 @@ fn net_poll() {
         var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
         var ip_proto = load8(ip_hdr + 9);
         var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
+        # Security: validate IP total length >= header length to prevent underflow
+        if (ip_total < ip_ihl) { return 0; }
+        var ip_payload_len = ip_total - ip_ihl;
         if (ip_proto == 17) {
             # UDP
-            net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_total - ip_ihl);
+            net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len);
             return 2;
         }
         if (ip_proto == 6) {
             # TCP
-            net_handle_tcp(&net_rx_pkt, 14 + ip_ihl, ip_total - ip_ihl, ip_src);
+            net_handle_tcp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
             return 3;
         }
     }
@@ -411,13 +415,15 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
     var ack = (load8(tcp + 8) << 24) | (load8(tcp + 9) << 16) | (load8(tcp + 10) << 8) | load8(tcp + 11);
     var data_off_byte = load8(tcp + 12);
     var tcp_hdr_len = ((data_off_byte >> 4) & 0x0F) * 4;
+    # Security: validate TCP header length
+    if (tcp_hdr_len < 20) { return 0; }
+    if (tcp_hdr_len > ip_payload_len) { return 0; }
     var flags = load8(tcp + 13);
     var conn_id = tcp_find_conn(src_port, dst_port, src_ip);
     if (conn_id < 0) { return 0; }
     var cb = tcp_conn_base(conn_id);
     var state = load64(cb);
     var data_len = ip_payload_len - tcp_hdr_len;
-    if (data_len < 0) { data_len = 0; }
     # SYN_SENT: expect SYN-ACK (flags & 0x12 == 0x12)
     if (state == 1) {
         if ((flags & 0x12) == 0x12) {
@@ -440,6 +446,8 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
             return 1;
         }
         if (data_len > 0) {
+            # Security: cap at tcp_rx_tmpbuf size (256 bytes)
+            if (data_len > 248) { data_len = 248; }
             # Store data in rx buffer
             net_copy_buf(&tcp_rx_tmpbuf, tcp + tcp_hdr_len, data_len);
             store64(cb + 48, &tcp_rx_tmpbuf);

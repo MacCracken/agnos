@@ -185,12 +185,14 @@ fn fatfs_open(name, namelen) {
     for (var s = 0; s < root_sectors; s = s + 1) {
         var found = fatfs_find_inner(fatfs_root_start + s, entries_per_sector, name, namelen, &result);
         if (found == 1) {
-            # Create a VFS memfile-like entry with cluster info
-            # Return the cluster number in high bits, size in a global
-            # Actually, just return a VFS fd with data pointing to a read buffer
             var cluster = load64(&result);
             var fsize = load64(&result + 8);
             if (cluster < 2) { return 0 - 1; }
+            # Security: validate cluster number is within filesystem bounds
+            var max_cluster = (fatfs_total_sectors - fatfs_data_start) / fatfs_sectors_per_cluster + 2;
+            if (cluster >= max_cluster) { return 0 - 1; }
+            # Security: validate file size is reasonable
+            if (fsize > fatfs_total_sectors * 512) { return 0 - 1; }
             # Read first cluster into data_buf
             var data_sector = fatfs_data_start + (cluster - 2) * fatfs_sectors_per_cluster;
             blk_read(data_sector, &fatfs_data_buf);
@@ -208,6 +210,9 @@ fn fatfs_read(cluster, buf, maxlen) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (cluster < 2) { return 0 - 1; }
     if (buf == 0) { return 0 - 1; }
+    # Security: validate cluster bounds
+    var max_cluster = (fatfs_total_sectors - fatfs_data_start) / fatfs_sectors_per_cluster + 2;
+    if (cluster >= max_cluster) { return 0 - 1; }
     var data_sector = fatfs_data_start + (cluster - 2) * fatfs_sectors_per_cluster;
     var r = blk_read(data_sector, buf);
     if (r != 0) { return 0 - 1; }

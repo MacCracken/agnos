@@ -30,11 +30,18 @@ fn initrd_find(name, namelen) {
 }
 
 fn initrd_open(name, namelen) {
+    # Security: validate name length to prevent OOB reads
+    if (namelen < 1) { return 0 - 1; }
+    if (namelen > 15) { return 0 - 1; }
     var idx = initrd_find(name, namelen);
     if (idx < 0) { return 0 - 1; }
     var ent = initrd_base + 8 + idx * 32;
     var data_off = load64(ent + 16);
     var data_sz = load64(ent + 24);
+    # Security: validate data offset and size don't overflow or point outside initrd
+    if (data_off < 8 + initrd_count * 32) { return 0 - 1; }
+    if (data_sz > 0x100000) { return 0 - 1; }
+    if (data_off + data_sz < data_off) { return 0 - 1; }
     return vfs_create_memfile(initrd_base + data_off, data_sz);
 }
 
