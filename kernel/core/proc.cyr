@@ -171,3 +171,14 @@ fn proc_map_page(cr3, virt, phys) {
     store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
     return 0;
 }
+
+# Unmap a 2MB page in a process's page directory (for guard pages)
+fn proc_unmap_page(cr3, virt) {
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pd_idx = (virt >> 21) & 0x1FF;
+    store64(pd_addr + pd_idx * 8, 0);  # Clear entry — access will page fault
+    return 0;
+}

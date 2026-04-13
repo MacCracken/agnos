@@ -99,12 +99,12 @@ Implementation details in `docs/development/security-hardening.md`.
 
 | # | Item | Prerequisite | Severity |
 |---|------|-------------|----------|
-| S1 | **Separate user/kernel page mappings** — stop setting U/S bit on kernel PD entries in `ring3.cyr`; map user code at high virtual address instead of sharing kernel identity map | VMM | HIGH |
-| S2 | **Per-CPU TSS + RSP0** — each AP needs its own TSS with its own kernel stack pointer; current global `tss_kernel_stack` causes stack corruption on SMP | SMP + GDT | HIGH |
+| S1 | ~~**Separate user/kernel page mappings**~~ | Done | HIGH |
+| S2 | ~~**Per-CPU TSS + RSP0**~~ | Done | HIGH |
 | S3 | ~~**PMM spinlock**~~ | Done | MEDIUM |
 | S4 | ~~**Per-process exit codes**~~ | Done | MEDIUM |
 | S5 | ~~**Per-connection TCP RX buffers**~~ | Done | MEDIUM |
-| S6 | **Stack guard pages** — map an unmapped page below each user stack to trap overflow instead of silently corrupting adjacent memory | VMM (4KB pages) | MEDIUM |
+| S6 | ~~**Stack guard pages**~~ | Done | MEDIUM |
 | S7 | **KASLR** — randomize kernel load address; currently fixed at 0x100000, trivial ROP | Boot shim + relocatable binary | MEDIUM |
 | S8 | **KPTI (Kernel Page Table Isolation)** — separate user/kernel page tables to mitigate Meltdown; switch CR3 on syscall entry/exit | S1 + SYSCALL handler | MEDIUM |
 | S9 | **Spectre v2 mitigations** — set IA32_SPEC_CTRL.IBRS on syscall entry; consider retpoline for indirect calls | SYSCALL handler | MEDIUM |

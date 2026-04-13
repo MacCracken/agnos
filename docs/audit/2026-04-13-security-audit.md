@@ -116,16 +116,32 @@ Tests: 4/4 passed
 
 ---
 
-## Recommended Next Steps (Priority Order)
+## Phase 2 Hardening (2026-04-13, third pass)
 
-1. **S1: Fix `ring3.cyr` U/S bit** — stop marking kernel pages as user-accessible (requires mapping user code at a separate virtual address)
-2. **S2: Per-CPU TSS with per-CPU RSP0** — critical for SMP correctness
-3. **S6: Stack guard pages** — unmapped page below each stack
-4. **S8: KPTI** — separate user/kernel page tables for Spectre/Meltdown
-5. **S9: Spectre v2** — IBRS on syscall/interrupt entry
-6. **S7: KASLR** — randomize kernel base address (requires Cyrius relocation support)
-7. **S10: IOMMU** — VT-d DMA restriction (requires ACPI parsing)
-8. **S13: Stack canaries** — overflow detection in critical functions
+3 architectural security fixes applied (S1, S2, S6 from security roadmap):
+
+| # | Item | Files | Fix Applied |
+|---|---|---|---|
+| S1 | **User/kernel page separation** — kernel PD entries exposed to ring-3 | `kernel/arch/x86_64/ring3.cyr`, `kernel/core/proc.cyr` | Removed U/S bit override on kernel PD entries. `spawn_user_proc` now copies function code to a separate physical page, maps at user VA (`0x400000 + pid*0x200000`). Kernel memory no longer accessible from ring-3. Added `proc_unmap_page()`. |
+| S2 | **Per-CPU TSS + RSP0** — global kernel stack for all CPUs | `kernel/arch/x86_64/gdt.cyr`, `kernel/arch/x86_64/smp.cyr` | GDT expanded to 4 TSS descriptors (0x28-0x68). `tss_array[416]` holds 4 TSS structures. `tss_init_cpu(cpu_id)` initializes per-CPU TSS with per-CPU kernel stack. APs call `tss_init_cpu` on boot. `tss_set_rsp0` reads APIC ID to update correct TSS. |
+| S6 | **Stack guard pages** — no overflow detection | `kernel/arch/x86_64/ring3.cyr`, `kernel/core/elf.cyr` | Stack spacing increased to 4MB (`0x400000`). Guard page (unmapped 2MB region) placed below each user stack via `proc_unmap_page`. Stack overflow now triggers page fault instead of silent corruption. |
+
+```
+Build: OK (245984 bytes)
+Tests: 4/4 passed
+```
+
+---
+
+## Remaining Items (Phase 3-4)
+
+| # | Item | Severity | Status |
+|---|---|---|---|
+| S8 | KPTI (separate user/kernel page tables) | MEDIUM | Requires dual CR3 per process, trampoline page |
+| S9 | Spectre v2 (IBRS on syscall entry) | MEDIUM | Requires CPUID check, MSR writes |
+| S13 | Stack canaries | LOW | Manual insertion in critical functions |
+| S7 | KASLR | MEDIUM | Deferred — requires Cyrius compiler relocation support |
+| S10 | IOMMU (VT-d) | MEDIUM | Deferred — requires ACPI/DMAR parsing |
 
 See `docs/development/security-hardening.md` for full implementation plans.
 

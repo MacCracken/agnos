@@ -41,6 +41,8 @@ fn ap_entry() {
     store32(0xFEE00380, 10000000);
     # Read our APIC ID
     var my_id = (load32(0xFEE00020) >> 24) & 0xFF;
+    # Initialize per-CPU TSS (S2: each CPU gets its own kernel stack via TSS)
+    if (my_id < 4) { tss_init_cpu(my_id); }
     # Increment CPU count (with spinlock)
     spin_lock();
     cpu_count = cpu_count + 1;

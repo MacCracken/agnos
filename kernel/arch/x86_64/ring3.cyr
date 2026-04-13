@@ -65,32 +65,40 @@ fn enter_ring3(entry, user_rsp) {
 
 # spawn_user_proc: create a user process from a kernel function address.
 # Allocates per-process address space, maps code+stack pages, returns pid.
+# Security (S1): kernel PD entries stay supervisor-only. User code is copied
+# to a separate physical page mapped at a user-accessible virtual address.
 fn spawn_user_proc(entry_fn) {
     var new_cr3 = proc_create_address_space();
     if (new_cr3 == 0) { return 0 - 1; }
-    # Map kernel code pages as user-accessible in new address space
-    # (code lives in kernel binary at 0x100000-0x200000)
-    var pml4e = load64(new_cr3);
-    var pdpt_a = pml4e & 0xFFFFFFFFF000;
-    var pdpte = load64(pdpt_a);
-    var pd_a = pdpte & 0xFFFFFFFFF000;
-    # Set U/S bit on first 2 PD entries (0-4MB) for code access
-    var pde0 = load64(pd_a);
-    store64(pd_a, pde0 | 0x04);
-    var pde1 = load64(pd_a + 8);
-    store64(pd_a + 8, pde1 | 0x04);
-    # Allocate user stack
-    var pid = proc_count;
-    var stack_base = 0x800000 + pid * 0x200000;
-    var stack_phys = pmm_alloc();
-    if (stack_phys != 0) {
-        if (vmm_is_mapped(stack_phys) == 0) {
-            vmm_map(stack_phys, stack_phys, 0x83);
-        }
-        proc_map_page(new_cr3, stack_base, stack_phys);
+
+    # Allocate a physical page for user code and copy kernel function to it
+    var code_phys = pmm_alloc();
+    if (code_phys == 0) { return 0 - 1; }
+    # Map in kernel space for copying
+    if (vmm_is_mapped(code_phys) == 0) {
+        vmm_map(code_phys, code_phys, 0x83);
     }
+    # Copy up to 4KB of function code from kernel to the new page
+    memcpy(code_phys, entry_fn, 4096);
+    # Map at user-visible VA in process address space (user+exec)
+    var pid = proc_count;
+    var code_va = 0x400000 + pid * 0x200000;
+    proc_map_page(new_cr3, code_va, code_phys);
+
+    # Allocate user stack
+    var stack_base = 0x800000 + pid * 0x400000;
+    var stack_phys = pmm_alloc();
+    if (stack_phys == 0) { return 0 - 1; }
+    if (vmm_is_mapped(stack_phys) == 0) {
+        vmm_map(stack_phys, stack_phys, 0x83);
+    }
+    proc_map_page(new_cr3, stack_base, stack_phys);
+    # S6: unmap guard page below stack to trap overflow
+    proc_unmap_page(new_cr3, stack_base - 0x200000);
     var stack_top = stack_base + 0x4000;
-    var new_pid = proc_create_full(entry_fn, stack_top);
+
+    # Create process with user VA entry point (not kernel address)
+    var new_pid = proc_create_full(code_va, stack_top);
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);
     }
