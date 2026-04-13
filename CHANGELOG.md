@@ -5,6 +5,60 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.22.0] — 2026-04-13
+
+### Added
+- ACPI table parsing (`kernel/core/acpi.cyr`): RSDP scan, RSDT/XSDT walk, DMAR table parsing
+- Intel VT-d IOMMU driver (`kernel/arch/x86_64/iommu.cyr`): DMA remapping, root/context/IO page tables
+- Per-CPU TSS infrastructure: 4 TSS descriptors in GDT, per-CPU kernel stacks, APIC ID-based routing
+- Stack canary framework: RDRAND-seeded secret, canary checks in `ksyscall`, `elf_load`, `net_handle_tcp`
+- KPTI (partial): dual page tables per process, CR3 switching on SYSCALL entry/exit
+- Spectre v2 mitigation: IBRS set/clear on SYSCALL entry/exit (CPUID-gated)
+- Stack guard pages: unmapped 2MB region below each user stack
+- Per-process exit codes in process table (offset 168)
+- Per-connection TCP RX buffers (heap-allocated, freed on close)
+- ARP request tracking (reject unsolicited replies)
+- TCP sequence/ACK validation with receive window check
+- Randomized TCP initial sequence numbers (timer-based)
+- `proc_unmap_page()` for per-process page table manipulation
+- `vmm_map_user_exec()` for executable user code pages
+- Userspace pointer validation (`is_user_ptr`, `is_user_range`) in all syscalls
+- PMM spinlock for SMP-safe page allocation
+- Security audit report (`docs/audit/2026-04-13-security-audit.md`)
+- Security hardening guide (`docs/development/security-hardening.md`)
+
+### Changed
+- Kernel binary size: 239KB -> 260KB (+8.8% for security hardening)
+- Process table stride: 168 -> 176 bytes (added `exit_code` field)
+- VirtIO-net RX buffer: 256 -> 2048 bytes (matches descriptor)
+- SYSCALL entry stub: 128 -> 256 bytes (KPTI + IBRS instructions)
+- GDT: 7 slots -> 13 slots (4 per-CPU TSS descriptors)
+- Boot shim: CR4 enables SMEP+SMAP, EFER enables NXE
+- User pages mapped with NX bit (bit 63) by default
+- Stack spacing: 2MB -> 4MB per process (guard page room)
+- `spawn_user_proc` copies code to separate physical page at user VA (no kernel U/S exposure)
+- `kfree_sized` zeroes freed blocks before returning to free list
+- `spin_unlock` uses atomic `xchg` instead of plain store
+
+### Fixed
+- UDP buffer overflow: 2040-byte copy into 256-byte buffer (remote, unauthenticated)
+- VirtIO RX DMA overflow: descriptor declared 2048 bytes, buffer was 256
+- Arbitrary kernel R/W via unvalidated userspace pointers in 8 syscalls
+- ELF loader accepted unbounded phoff/phnum/p_offset/p_filesz/p_memsz/entry
+- PMM negative page index and double-free vulnerabilities
+- VFS memfile position underflow (fsize - pos when pos > fsize)
+- IP payload length underflow (ip_total < ip_ihl)
+- TCP header length underflow and RX buffer overflow
+- kill() allowed any process to signal any other (including PID 0)
+- initrd data offset not validated against bounds
+- FAT16 cluster number not validated against filesystem geometry
+- Kernel code pages mapped user-accessible in per-process page tables
+
+### Security
+- 31 vulnerability fixes across memory management, syscalls, network stack, I/O drivers, boot
+- 12/13 security roadmap items completed (S1-S6, S8-S13)
+- S7 (KASLR) deferred: blocked on Cyrius compiler v4.4.0 PIE support (tracked as CVE-07)
+
 ## [1.21.0] — 2026-04-13
 
 ### Added
