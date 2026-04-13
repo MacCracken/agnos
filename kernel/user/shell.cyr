@@ -26,6 +26,7 @@ fn sh_cmd_help() {
     serial_println("  ls      - list disk files", 27);
     serial_println("  disk    - disk info", 21);
     serial_println("  bench   - run benchmarks", 26);
+    serial_println("  test    - run test suite", 26);
     serial_println("  halt    - shutdown", 20);
     return 0;
 }
@@ -326,6 +327,7 @@ fn sh_exec(buf, len) {
         return 0;
     }
     if (sh_streq(buf, clen, "bench", 5) == 1) { return sh_cmd_bench(); }
+    if (sh_streq(buf, clen, "test", 4) == 1) { return sh_cmd_test(); }
     if (sh_streq(buf, clen, "halt", 4) == 1) { return 0 - 99; }
     serial_print("unknown: ", 9);
     serial_print(buf, clen);

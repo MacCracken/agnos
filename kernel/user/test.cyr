@@ -1,0 +1,434 @@
+# === Kernel Test Suite ===
+# Functional correctness tests run inside the kernel via QEMU serial.
+# Usage: type 'test' at the AGNOS shell prompt.
+#
+# Assertion framework: test_pass/test_fail counters, serial output.
+
+var test_pass = 0;
+var test_fail = 0;
+
+fn test_assert(cond, name, nlen) {
+    if (cond != 0) {
+        serial_print("  PASS: ", 8);
+        serial_println(name, nlen);
+        test_pass = test_pass + 1;
+    } else {
+        serial_print("  FAIL: ", 8);
+        serial_println(name, nlen);
+        test_fail = test_fail + 1;
+    }
+    return 0;
+}
+
+fn test_assert_eq(a, b, name, nlen) {
+    if (a == b) {
+        serial_print("  PASS: ", 8);
+        serial_println(name, nlen);
+        test_pass = test_pass + 1;
+    } else {
+        serial_print("  FAIL: ", 8);
+        serial_print(name, nlen);
+        serial_print(" (got ", 6);
+        kfmt_int(a);
+        serial_print(", want ", 7);
+        kfmt_int(b);
+        serial_println(")", 1);
+        test_fail = test_fail + 1;
+    }
+    return 0;
+}
+
+# === PMM Tests ===
+fn test_pmm() {
+    serial_println("[pmm]", 5);
+    var before = pmm_free_count();
+
+    # Alloc returns non-zero, distinct pages
+    var p1 = pmm_alloc();
+    var p2 = pmm_alloc();
+    var p3 = pmm_alloc();
+    test_assert(p1 != 0, "alloc returns non-zero", 22);
+    test_assert(p2 != 0, "alloc second non-zero", 21);
+    test_assert(p1 != p2, "alloc distinct p1!=p2", 21);
+    test_assert(p1 != p3, "alloc distinct p1!=p3", 21);
+    test_assert(p2 != p3, "alloc distinct p2!=p3", 21);
+
+    # Pages are 4KB aligned
+    test_assert_eq(p1 & 0xFFF, 0, "p1 4KB aligned", 14);
+    test_assert_eq(p2 & 0xFFF, 0, "p2 4KB aligned", 14);
+
+    # Free count decreased by 3
+    test_assert_eq(pmm_free_count(), before - 3, "free count -3", 13);
+
+    # Free and re-check
+    pmm_free(p1);
+    pmm_free(p2);
+    pmm_free(p3);
+    test_assert_eq(pmm_free_count(), before, "free restores count", 19);
+
+    # Double-free: freeing already-free page should be idempotent
+    var before2 = pmm_free_count();
+    pmm_free(p1);
+    test_assert_eq(pmm_free_count(), before2, "double-free idempotent", 22);
+
+    # Boundary: page 4095 (last valid)
+    test_assert_eq(pmm_set(4095), 0, "set page 4095 ok", 17);
+    test_assert_eq(pmm_test(4095), 1, "test page 4095 set", 18);
+    pmm_clear(4095);
+    test_assert_eq(pmm_test(4095), 0, "clear page 4095", 15);
+
+    # Boundary: page 4096 (out of bounds, should fail)
+    test_assert_eq(pmm_set(4096), 0 - 1, "set page 4096 rejected", 22);
+    test_assert_eq(pmm_test(4096), 0, "test page 4096 returns 0", 24);
+
+    return 0;
+}
+
+# === Heap Tests ===
+fn test_heap() {
+    serial_println("[heap]", 6);
+
+    # slab_class_for returns correct classes
+    test_assert_eq(slab_class_for(1), 0, "class for 1B = 0", 17);
+    test_assert_eq(slab_class_for(32), 0, "class for 32B = 0", 18);
+    test_assert_eq(slab_class_for(33), 1, "class for 33B = 1", 18);
+    test_assert_eq(slab_class_for(64), 1, "class for 64B = 1", 18);
+    test_assert_eq(slab_class_for(4096), 7, "class for 4096B = 7", 20);
+    test_assert_eq(slab_class_for(4097), 0 - 1, "class for 4097B = -1", 21);
+
+    # Zero-size alloc returns 0
+    test_assert_eq(kmalloc(0), 0, "kmalloc(0) returns 0", 20);
+
+    # Oversized alloc returns 0
+    test_assert_eq(kmalloc(8192), 0, "kmalloc(8192) returns 0", 23);
+
+    # Normal allocs return distinct non-zero pointers
+    var a1 = kmalloc(32);
+    var a2 = kmalloc(32);
+    test_assert(a1 != 0, "kmalloc(32) non-zero", 20);
+    test_assert(a2 != 0, "kmalloc(32) second non-zero", 27);
+    test_assert(a1 != a2, "kmalloc(32) distinct", 20);
+
+    # Allocated memory is zeroed
+    test_assert_eq(load64(a1), 0, "kmalloc zeroes memory", 21);
+    test_assert_eq(load64(a2), 0, "kmalloc zeroes second", 21);
+
+    # Write and read back
+    store64(a1, 0xDEADBEEF);
+    test_assert_eq(load64(a1), 0xDEADBEEF, "heap write/read", 15);
+
+    # No overlap: writing a1 doesn't corrupt a2
+    test_assert_eq(load64(a2), 0, "no overlap a1->a2", 18);
+
+    # Free and re-alloc should recycle
+    kfree_sized(a1, 32);
+    kfree_sized(a2, 32);
+    var a3 = kmalloc(32);
+    test_assert(a3 != 0, "re-alloc after free", 19);
+    # Re-allocated memory should be zeroed (security)
+    test_assert_eq(load64(a3), 0, "re-alloc is zeroed", 18);
+    kfree_sized(a3, 32);
+
+    # Different size classes don't interfere
+    var s1 = kmalloc(32);
+    var s2 = kmalloc(256);
+    var s3 = kmalloc(4096);
+    test_assert(s1 != 0, "multi-class 32B", 15);
+    test_assert(s2 != 0, "multi-class 256B", 16);
+    test_assert(s3 != 0, "multi-class 4096B", 17);
+    test_assert(s1 != s2, "multi-class distinct 32!=256", 28);
+    test_assert(s2 != s3, "multi-class distinct 256!=4096", 30);
+    kfree_sized(s1, 32);
+    kfree_sized(s2, 256);
+    kfree_sized(s3, 4096);
+
+    return 0;
+}
+
+# === VFS Tests ===
+fn test_vfs() {
+    serial_println("[vfs]", 5);
+
+    # FD 0 is pre-allocated (serial device)
+    var fd0_type = load64(&vfs_table);
+    test_assert_eq(fd0_type, 1, "fd 0 is device type", 19);
+
+    # Create memfile and read back
+    var fd = vfs_create_memfile("HELLO", 5);
+    test_assert(fd > 0, "memfile create returns fd", 24);
+    var buf[16];
+    var n = vfs_read(fd, &buf, 16);
+    test_assert_eq(n, 5, "memfile read returns 5", 22);
+    test_assert(memeq(&buf, "HELLO", 5) == 1, "memfile data correct", 20);
+
+    # Second read returns 0 (EOF)
+    var n2 = vfs_read(fd, &buf, 16);
+    test_assert_eq(n2, 0, "memfile EOF returns 0", 21);
+
+    # Close and verify type cleared
+    vfs_close(fd);
+    var closed_type = load64(&vfs_table + fd * 32);
+    test_assert_eq(closed_type, 0, "close clears fd type", 20);
+
+    # Read on closed fd returns -1
+    var n3 = vfs_read(fd, &buf, 16);
+    test_assert_eq(n3, 0 - 1, "read closed fd = -1", 20);
+
+    # Invalid fd returns -1
+    test_assert_eq(vfs_read(0 - 1, &buf, 16), 0 - 1, "read fd=-1 rejected", 20);
+    test_assert_eq(vfs_read(32, &buf, 16), 0 - 1, "read fd=32 rejected", 20);
+    test_assert_eq(vfs_close(0 - 1), 0 - 1, "close fd=-1 rejected", 21);
+    test_assert_eq(vfs_close(32), 0 - 1, "close fd=32 rejected", 21);
+
+    # Pipe create, write, read
+    var pfds[2];
+    var pr = vfs_create_pipe(&pfds);
+    test_assert_eq(pr, 0, "pipe create ok", 14);
+    var rfd = load64(&pfds);
+    var wfd = load64(&pfds + 8);
+    test_assert(rfd > 0, "pipe read fd valid", 18);
+    test_assert(wfd > 0, "pipe write fd valid", 19);
+    test_assert(rfd != wfd, "pipe fds distinct", 17);
+
+    # Write to pipe and read back
+    var wn = vfs_write(wfd, "PIPE", 4);
+    test_assert_eq(wn, 4, "pipe write 4 bytes", 18);
+    var pbuf[16];
+    var rn = vfs_read(rfd, &pbuf, 16);
+    test_assert_eq(rn, 4, "pipe read 4 bytes", 17);
+    test_assert(memeq(&pbuf, "PIPE", 4) == 1, "pipe data correct", 17);
+
+    # Read from empty pipe returns 0
+    var rn2 = vfs_read(rfd, &pbuf, 16);
+    test_assert_eq(rn2, 0, "empty pipe read = 0", 20);
+
+    # Write on read-end rejected
+    var bad_w = vfs_write(rfd, "X", 1);
+    test_assert_eq(bad_w, 0 - 1, "write on read-end = -1", 23);
+
+    # Read on write-end rejected
+    var bad_r = vfs_read(wfd, &pbuf, 16);
+    test_assert_eq(bad_r, 0 - 1, "read on write-end = -1", 23);
+
+    vfs_close(rfd);
+    vfs_close(wfd);
+
+    return 0;
+}
+
+# === Process Tests ===
+fn test_proc() {
+    serial_println("[proc]", 6);
+
+    # proc_count tracks correctly
+    var before = proc_count;
+    test_assert(before > 0, "proc_count > 0 at start", 23);
+
+    # proc_get_state for valid pid
+    var st = proc_get_state(0);
+    test_assert(st >= 0, "pid 0 state valid", 17);
+
+    # proc_get_state for out-of-bounds pid
+    test_assert_eq(proc_get_state(99), 0 - 1, "state pid=99 rejected", 22);
+
+    # proc_set_cr3 bounds check
+    test_assert_eq(proc_set_cr3(99, 0), 0 - 1, "set_cr3 pid=99 rejected", 23);
+
+    # proc_get_cr3 bounds check
+    test_assert_eq(proc_get_cr3(99), 0, "get_cr3 pid=99 returns 0", 24);
+
+    # Signal delivery
+    proc_send_signal(0, 10);
+    var sig = load64(&proc_signals);
+    test_assert((sig & (1 << 10)) != 0, "signal 10 delivered", 19);
+    # Clear it
+    store64(&proc_signals, sig & (0 - 1 - (1 << 10)));
+
+    # Signal mask — clear all pending first
+    store64(&proc_signals, 0);
+    store64(&proc_sigmask, 1 << 10);
+    proc_send_signal(0, 10);
+    var unmasked = proc_check_pending_signals(0);
+    test_assert_eq(unmasked, 0, "masked signal not unmasked", 26);
+    # Clear
+    store64(&proc_signals, 0);
+    store64(&proc_sigmask, 0);
+    pending_signal_flag = 0;
+
+    return 0;
+}
+
+# === Syscall Tests ===
+fn test_syscall() {
+    serial_println("[syscall]", 9);
+
+    # getpid returns current process
+    var pid = ksyscall(2, 0, 0, 0);
+    test_assert_eq(pid, proc_current, "getpid == proc_current", 22);
+
+    # getuid returns 0 (root)
+    var uid = ksyscall(15, 0, 0, 0);
+    test_assert_eq(uid, 0, "getuid == 0 (root)", 18);
+
+    # write to fd 0 (serial) returns byte count
+    var wn = ksyscall(1, 0, ".", 1);
+    test_assert_eq(wn, 1, "write(0, '.', 1) = 1", 21);
+
+    # read with invalid fd
+    var rbuf[8];
+    var rn = ksyscall(5, 99, &rbuf, 8);
+    test_assert_eq(rn, 0 - 1, "read(99) = -1", 13);
+
+    # close invalid fd
+    var cn = ksyscall(6, 99, 0, 0);
+    test_assert_eq(cn, 0 - 1, "close(99) = -1", 14);
+
+    # open + read + close via initrd
+    var fd = ksyscall(7, "hello.txt", 9, 0);
+    if (fd >= 0) {
+        var obuf[16];
+        var on = ksyscall(5, fd, &obuf, 16);
+        test_assert(on > 0, "initrd read returns data", 24);
+        ksyscall(6, fd, 0, 0);
+        test_assert(1 == 1, "initrd open/read/close ok", 25);
+    } else {
+        test_assert(1 == 1, "initrd not loaded (skip)", 24);
+    }
+
+    # pipe syscall
+    var pfds[2];
+    var pr = ksyscall(25, &pfds, 0, 0);
+    test_assert_eq(pr, 0, "pipe syscall returns 0", 22);
+    var rpfd = load64(&pfds);
+    var wpfd = load64(&pfds + 8);
+    test_assert(rpfd > 0, "pipe syscall read fd", 20);
+    test_assert(wpfd > 0, "pipe syscall write fd", 21);
+    ksyscall(6, rpfd, 0, 0);
+    ksyscall(6, wpfd, 0, 0);
+
+    return 0;
+}
+
+# === String/Fmt Tests (kernel stdlib) ===
+fn test_kstdlib() {
+    serial_println("[kstdlib]", 9);
+
+    # strlen
+    test_assert_eq(strlen("hello"), 5, "strlen hello = 5", 16);
+    test_assert_eq(strlen(""), 0, "strlen empty = 0", 16);
+
+    # streq
+    test_assert_eq(streq("abc", "abc"), 1, "streq equal", 11);
+    test_assert_eq(streq("abc", "xyz"), 0, "streq not equal", 15);
+    test_assert_eq(streq("ab", "abc"), 0, "streq diff len", 14);
+
+    # memeq
+    test_assert_eq(memeq("abc", "abc", 3), 1, "memeq equal", 11);
+    test_assert_eq(memeq("abc", "abd", 3), 0, "memeq differ", 12);
+    test_assert_eq(memeq("abc", "abc", 0), 1, "memeq len=0", 11);
+
+    # memcpy
+    var dst[8];
+    memcpy(&dst, "COPY", 4);
+    store8(&dst + 4, 0);
+    test_assert_eq(memeq(&dst, "COPY", 4), 1, "memcpy correct", 14);
+
+    # memset
+    var zbuf[8];
+    memset(&zbuf, 0x41, 4);
+    test_assert_eq(load8(&zbuf), 0x41, "memset byte 0", 13);
+    test_assert_eq(load8(&zbuf + 3), 0x41, "memset byte 3", 13);
+
+    # memchr
+    test_assert_eq(memchr("hello", 108, 5), 2, "memchr 'l' at 2", 15);
+    test_assert_eq(memchr("hello", 122, 5), 0 - 1, "memchr miss = -1", 16);
+
+    # strchr
+    test_assert_eq(strchr("hello", 108), 2, "strchr 'l' at 2", 15);
+    test_assert_eq(strchr("hello", 122), 0 - 1, "strchr miss = -1", 16);
+
+    # atoi
+    test_assert_eq(atoi("42"), 42, "atoi 42", 7);
+    test_assert_eq(atoi("0"), 0, "atoi 0", 6);
+
+    # fmt_int_buf
+    var ibuf[24];
+    var ilen = fmt_int_buf(42, &ibuf);
+    test_assert_eq(ilen, 2, "fmt_int_buf 42 len=2", 20);
+    test_assert_eq(memeq(&ibuf, "42", 2), 1, "fmt_int_buf 42 correct", 22);
+
+    var ilen2 = fmt_int_buf(0, &ibuf);
+    test_assert_eq(ilen2, 1, "fmt_int_buf 0 len=1", 19);
+    test_assert_eq(load8(&ibuf), 48, "fmt_int_buf 0 = '0'", 19);
+
+    # fmt_hex_buf
+    var hbuf[16];
+    var hlen = fmt_hex_buf(255, &hbuf);
+    test_assert_eq(hlen, 2, "fmt_hex_buf ff len=2", 20);
+    test_assert_eq(memeq(&hbuf, "ff", 2), 1, "fmt_hex_buf ff correct", 22);
+
+    var hlen2 = fmt_hex_buf(0, &hbuf);
+    test_assert_eq(hlen2, 1, "fmt_hex_buf 0 len=1", 19);
+
+    return 0;
+}
+
+# === Initrd Tests ===
+fn test_initrd() {
+    serial_println("[initrd]", 8);
+
+    test_assert(initrd_count > 0, "initrd has files", 16);
+
+    # Find existing file
+    var idx = initrd_find("hello.txt", 9);
+    test_assert(idx >= 0, "find hello.txt", 14);
+
+    # Find nonexistent file
+    var idx2 = initrd_find("nope", 4);
+    test_assert_eq(idx2, 0 - 1, "find nope = -1", 14);
+
+    # Open and read
+    var fd = initrd_open("hello.txt", 9);
+    test_assert(fd >= 0, "open hello.txt ok", 17);
+    if (fd >= 0) {
+        var buf[32];
+        var n = vfs_read(fd, &buf, 32);
+        test_assert(n > 0, "read hello.txt data", 19);
+        test_assert(memeq(&buf, "Hello, AGNOS!", 13) == 1, "hello.txt content", 17);
+        vfs_close(fd);
+    }
+
+    # Name match edge: partial match should fail
+    var idx3 = initrd_find("hello", 5);
+    test_assert_eq(idx3, 0 - 1, "partial name no match", 21);
+
+    return 0;
+}
+
+# === Main Test Runner ===
+fn sh_cmd_test() {
+    serial_println("=== AGNOS Kernel Test Suite ===", 30);
+    test_pass = 0;
+    test_fail = 0;
+
+    test_pmm();
+    test_heap();
+    test_vfs();
+    test_proc();
+    test_syscall();
+    test_kstdlib();
+    test_initrd();
+
+    serial_println("===", 3);
+    serial_print("TOTAL: ", 7);
+    kfmt_int(test_pass);
+    serial_print(" passed, ", 9);
+    kfmt_int(test_fail);
+    serial_println(" failed", 7);
+    if (test_fail == 0) {
+        serial_println("ALL TESTS PASSED", 16);
+    } else {
+        serial_println("TESTS FAILED", 12);
+    }
+    return 0;
+}

@@ -42,6 +42,7 @@ include "core/vfs.cyr"
 include "core/devs.cyr"
 include "core/initrd.cyr"
 include "core/kprint.cyr"
+include "user/test.cyr"
 include "user/shell.cyr"
 include "user/init.cyr"
 
