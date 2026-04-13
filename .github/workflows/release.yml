@@ -2,26 +2,39 @@ name: Release
 
 on:
   push:
-    tags: ['*']
+    tags: ['[0-9]*']
+
+permissions:
+  contents: write
 
 jobs:
+  # ── CI Gate (must pass before release) ──
   ci:
+    name: CI Gate
     uses: ./.github/workflows/ci.yml
 
+  # ── Build release binaries ──
   build:
-    needs: ci
+    name: Build Release
+    needs: [ci]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify VERSION matches tag
+      - name: Verify version consistency
         run: |
-          VERSION=$(cat VERSION | tr -d '[:space:]')
-          TAG="${GITHUB_REF#refs/tags/}"
-          if [ "$VERSION" != "$TAG" ]; then
-            echo "ERROR: VERSION ($VERSION) does not match tag ($TAG)"
+          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          TOML_VERSION=$(grep '^version' cyrius.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          TAG_VERSION="${GITHUB_REF_NAME}"
+          if [ "$FILE_VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: VERSION ($FILE_VERSION) != tag ($TAG_VERSION)"
             exit 1
           fi
+          if [ "$TOML_VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: cyrius.toml ($TOML_VERSION) != tag ($TAG_VERSION)"
+            exit 1
+          fi
+          echo "Version verified: $TAG_VERSION"
 
       - name: Install Cyrius toolchain
         run: |
@@ -41,15 +54,35 @@ jobs:
         run: |
           sh scripts/build.sh
           cp build/agnos agnos-x86_64
+          echo "agnos-x86_64: $(wc -c < agnos-x86_64) bytes"
 
       - name: Build aarch64 kernel (compile test)
         run: |
           (sh scripts/build.sh --aarch64 2>/dev/null && cp build/agnos-aarch64 agnos-aarch64) || echo "aarch64 not yet portable"
 
+      - name: Run tests
+        run: sh scripts/test.sh
+
+      - name: Extract changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          BODY=$(awk "/^## \\[$VERSION\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
+          if [ -z "$BODY" ]; then
+            BODY="No changelog entry for this release."
+          fi
+          echo "$BODY" > release-body.md
+
+      - name: Create source archive
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          git archive --format=tar.gz --prefix="agnos-${TAG}/" -o "agnos-${TAG}-src.tar.gz" HEAD
+
       - name: Generate checksums
         run: |
+          TAG="${GITHUB_REF_NAME}"
           sha256sum agnos-x86_64 > SHA256SUMS
           if [ -f agnos-aarch64 ]; then sha256sum agnos-aarch64 >> SHA256SUMS; fi
+          sha256sum "agnos-${TAG}-src.tar.gz" >> SHA256SUMS
           cat SHA256SUMS
 
       - name: Upload build artifacts
@@ -59,14 +92,16 @@ jobs:
           path: |
             agnos-x86_64
             agnos-aarch64
+            agnos-*-src.tar.gz
             SHA256SUMS
+            release-body.md
           retention-days: 5
 
+  # ── Create GitHub Release ──
   release:
-    needs: build
+    name: Create GitHub Release
+    needs: [build]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -78,8 +113,11 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          name: "AGNOS ${{ github.ref_name }}"
+          body_path: release-body.md
+          prerelease: ${{ startsWith(github.ref_name, '0.') }}
           files: |
             agnos-x86_64
             agnos-aarch64
+            agnos-${{ github.ref_name }}-src.tar.gz
             SHA256SUMS

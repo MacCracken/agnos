@@ -12,7 +12,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate:
+  # ── Build ──
+  build:
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,35 +33,105 @@ jobs:
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
 
-      - name: Test x86_64
-        run: sh scripts/test.sh
-
-      - name: Verify VERSION
+      - name: Build x86_64 kernel
         run: |
-          VERSION=$(cat VERSION | tr -d '[:space:]')
-          echo "Version: $VERSION"
-          test -n "$VERSION"
+          sh scripts/build.sh
+          echo "agnos: $(wc -c < build/agnos) bytes"
 
-  docs:
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-x86_64
+          path: build/agnos
+          retention-days: 5
+
+  # ── Check & Format ──
+  check:
+    name: Check & Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check required docs exist
+      - name: Install Cyrius toolchain
         run: |
-          for doc in README.md CHANGELOG.md VERSION CONTRIBUTING.md SECURITY.md LICENSE; do
-            test -f "$doc" && echo "  OK: $doc" || { echo "  MISSING: $doc"; exit 1; }
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
+          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
+          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
+          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
+          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
+
+      - name: Format check
+        run: |
+          FAIL=0
+          for f in $(find kernel -name '*.cyr'); do
+            [ -f "$f" ] || continue
+            cyrfmt "$f" > /tmp/fmt_check
+            if ! diff -q "$f" /tmp/fmt_check >/dev/null 2>&1; then
+              echo "  NEEDS FORMAT: $f"
+              FAIL=1
+            fi
           done
+          test $FAIL -eq 0 && echo "PASS: all files formatted"
 
-      - name: Verify version consistency
+  # ── Security ──
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for dangerous patterns
         run: |
-          VERSION=$(cat VERSION | tr -d '[:space:]')
-          grep -q "$VERSION" kernel/agnos.cyr || { echo "FAIL: version not in kernel"; exit 1; }
-          grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in changelog"; exit 1; }
+          WARN=0
+          # Kernel should not call Linux syscalls
+          if grep -rn 'syscall(' kernel/ 2>/dev/null | grep -v '# ' | grep -v 'ksyscall'; then
+            echo "WARN: raw Linux syscall in kernel code"
+            WARN=1
+          fi
+          # Check for unbounded loops without guards
+          if grep -rn 'while (1)' kernel/ 2>/dev/null | grep -v '# '; then
+            echo "WARN: infinite loop without break condition"
+            WARN=1
+          fi
+          # Verify no hardcoded memory addresses outside arch/
+          if grep -rn '0xFEE0\|0xB8000\|0x3F8' kernel/core/ 2>/dev/null | grep -v '# '; then
+            echo "INFO: hardcoded MMIO addresses in core/ (should be in arch/)"
+          fi
+          echo "security scan complete (warnings: $WARN)"
 
+  # ── Tests ──
+  test:
+    name: Test
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Cyrius toolchain
+        run: |
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
+          CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
+          mkdir -p "$HOME/.cyrius/bin" "$HOME/.cyrius/lib"
+          cp "$CYRIUS_DIR/bin/"* "$HOME/.cyrius/bin/" 2>/dev/null || true
+          cp -r "$CYRIUS_DIR/lib/"* "$HOME/.cyrius/lib/" 2>/dev/null || true
+          chmod +x "$HOME/.cyrius/bin/"* 2>/dev/null || true
+          echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
+          echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+
+      - name: Run test suite
+        run: sh scripts/test.sh
+
+  # ── Boot Test ──
   boot-test:
+    name: QEMU Boot Test
     runs-on: [self-hosted, linux, x64]
-    needs: validate
+    needs: [build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -74,7 +146,6 @@ jobs:
       - name: Install Cyrius toolchain
         run: |
           CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
-          echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
@@ -107,9 +178,11 @@ jobs:
           grep -q "AGNOS" build/boot_output.log && echo "PASS: kernel boots"
         continue-on-error: true
 
+  # ── Benchmarks ──
   benchmarks:
+    name: Benchmarks
     runs-on: [self-hosted, linux, x64]
-    needs: validate
+    needs: [build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -124,7 +197,6 @@ jobs:
       - name: Install Cyrius toolchain
         run: |
           CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
-          echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
@@ -148,3 +220,37 @@ jobs:
             BENCHMARKS.md
             bench-history.csv
           retention-days: 90
+
+  # ── Documentation ──
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required docs exist
+        run: |
+          MISSING=0
+          for doc in README.md CHANGELOG.md VERSION CONTRIBUTING.md SECURITY.md LICENSE CLAUDE.md; do
+            if [ -f "$doc" ]; then
+              echo "  OK: $doc"
+            else
+              echo "  MISSING: $doc"
+              MISSING=1
+            fi
+          done
+          exit $MISSING
+
+      - name: Verify version consistency
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          TOML_VERSION=$(grep '^version' cyrius.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "VERSION file:  $VERSION"
+          echo "cyrius.toml:   $TOML_VERSION"
+          if [ "$VERSION" != "$TOML_VERSION" ]; then
+            echo "FAIL: VERSION ($VERSION) != cyrius.toml ($TOML_VERSION)"
+            exit 1
+          fi
+          grep -q "$VERSION" kernel/agnos.cyr || { echo "FAIL: version not in kernel source"; exit 1; }
+          grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in changelog"; exit 1; }
+          echo "Version consistent: $VERSION"

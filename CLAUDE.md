@@ -106,11 +106,36 @@ agnos/
 │   ├── test.sh              # Run kernel tests
 │   ├── bench.sh             # Benchmark runner
 │   ├── check.sh             # 11-point project validation
-│   └── version-bump.sh      # Automated version management
+│   └── version-bump.sh      # Automated version management (9 files)
+├── cyrius.toml              # Project metadata (version, build config)
+├── .cyrius-toolchain        # Pinned toolchain version for CI
 └── .github/workflows/
-    ├── ci.yml               # Build + verify on every push
-    └── release.yml          # Tag → build → release (SHA256 checksums)
+    ├── ci.yml               # 7 jobs: build, check, security, test, boot, bench, docs
+    └── release.yml          # Tag → CI gate → build → changelog → release
 ```
+
+## Versioning
+
+**VERSION** file is the single source of truth. Use `version-bump.sh` for all version changes:
+
+```sh
+sh scripts/version-bump.sh 1.22.0
+```
+
+This updates 9 files atomically:
+1. `VERSION` — source of truth
+2. `cyrius.toml` — package version
+3. `CLAUDE.md` — project identity
+4. `kernel/agnos.cyr` — comment header
+5. `kernel/core/main.cyr` — boot banner `serial_println` (auto-computes byte length)
+6. `kernel/arch/aarch64/main.cyr` — aarch64 boot banner (auto-computes byte length)
+7. `kernel/user/shell.cyr` — shell prompt banner (auto-computes byte length)
+8. `CHANGELOG.md` — adds new version section with date
+9. `docs/development/roadmap.md` — updates Current header
+
+**Never manually edit version strings** — the `serial_println` calls have hardcoded byte lengths that must match the string. The script computes these automatically.
+
+Release flow: `version-bump.sh` → fill CHANGELOG entries → commit → `git tag` → push triggers release workflow.
 
 ## Development Process
 
