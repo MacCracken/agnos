@@ -1,6 +1,6 @@
 # === 64-bit Cyrius kernel code ===
 
-serial_println("AGNOS kernel v1.2", 17);
+serial_println("AGNOS kernel v1.21.0", 20);
 serial_println("64-bit long mode", 16);
 
 gdt_init();
