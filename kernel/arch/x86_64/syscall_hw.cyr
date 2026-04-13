@@ -1,11 +1,12 @@
 # === SYSCALL/SYSRET Hardware Interface ===
 # SYSCALL: RCX=retRIP, R11=retRFLAGS, rax=num, rdi=a1, rsi=a2, rdx=a3
 
-var syscall_entry_buf[128];
+var syscall_entry_buf[256];  # Enlarged for IBRS instructions
 var kernel_rsp_save = 0;
 # Saved kernel context for returning from user mode on exit
 var kernel_return_rsp = 0;
 var kernel_return_rip = 0;
+var ibrs_supported = 0;  # S9: set to 1 if IBRS is available
 
 # C-level handler called from the syscall entry stub.
 # user_rsp = the caller's RSP (saved before switching to kernel stack)
@@ -83,6 +84,19 @@ fn syscall_init() {
         0x0F; 0x30;
     }
 
+    # S9: Check CPUID for IBRS support (leaf 7, subleaf 0, EDX bit 26)
+    ibrs_supported = 0;
+    var cpuid_edx = 0;
+    asm {
+        0xB8; 0x07; 0x00; 0x00; 0x00;   # mov eax, 7
+        0x31; 0xC9;                       # xor ecx, ecx (subleaf 0)
+        0x0F; 0xA2;                       # cpuid
+        0x48; 0x89; 0x55; 0xF8;          # mov [rbp-0x08], rdx (cpuid_edx)
+    }
+    if ((cpuid_edx & (1 << 26)) != 0) {
+        ibrs_supported = 1;
+    }
+
     # Build the SYSCALL entry stub in syscall_entry_buf.
     # On entry from SYSCALL:
     #   RCX = user RIP (return addr)
@@ -104,15 +118,22 @@ fn syscall_init() {
     var eoff = 0;
     var krs = &kernel_rsp_save;
     var handler = &syscall_handler;
+    var kcr3_addr = &kpti_kernel_cr3;
+    var ucr3_addr = &kpti_user_cr3;
+
+    # S8 (KPTI): Switch from user CR3 to kernel CR3 FIRST.
+    # We're ring-0 (SYSCALL changed CPL), user page tables have PD entry 0
+    # mapped supervisor-only, so kernel code at 0-2MB is accessible.
+    # Save rax (syscall number) to kernel_rsp_save temporarily, load kernel CR3.
+    # mov r10, imm64(kpti_kernel_cr3 addr); mov r10, [r10]; mov cr3, r10
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
+    store64(ep + eoff, kcr3_addr); eoff = eoff + 8;
+    # mov r10, [r10] — 4D 8B 12
+    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x12); eoff = eoff + 3;
+    # mov cr3, r10 — 44 0F 22 DA
+    store8(ep + eoff, 0x44); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;
 
     # Save user RSP into kernel_rsp_save
-    # mov [kernel_rsp_save], rsp  — 48 89 24 25 [addr32] won't work for 64-bit addr
-    # Use: mov rbx, imm64(krs); mov [rbx], rsp
-    # But we can't clobber rbx freely... actually SYSCALL clobbers RCX and R11.
-    # We can use the stack trick: save via absolute address encoding.
-    # Simpler: mov r10, imm64(krs); mov [r10], rsp; mov rsp, imm64(kernel_stack)
-    # r10 is caller-saved and not used for syscall args
-
     # mov r10, imm64(kernel_rsp_save addr)  — 49 BA imm64
     store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
     store64(ep + eoff, krs); eoff = eoff + 8;
@@ -123,6 +144,26 @@ fn syscall_init() {
     # mov rsp, 0x1F0000  — 48 BC imm64
     store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0xBC); eoff = eoff + 2;
     store64(ep + eoff, 0x1F0000); eoff = eoff + 8;
+
+    # S9: Set IBRS (Spectre v2 mitigation) if supported
+    # Now on kernel stack so we can use push/pop to preserve regs.
+    # push rax; push rcx; push rdx; mov ecx,0x48; xor edx,edx; mov eax,1; wrmsr; pop rdx; pop rcx; pop rax
+    if (ibrs_supported == 1) {
+        store8(ep + eoff, 0x50); eoff = eoff + 1;  # push rax
+        store8(ep + eoff, 0x51); eoff = eoff + 1;  # push rcx
+        store8(ep + eoff, 0x52); eoff = eoff + 1;  # push rdx
+        # mov ecx, 0x48
+        store8(ep + eoff, 0xB9); store32(ep + eoff + 1, 0x48); eoff = eoff + 5;
+        # xor edx, edx
+        store8(ep + eoff, 0x31); store8(ep + eoff + 1, 0xD2); eoff = eoff + 2;
+        # mov eax, 1
+        store8(ep + eoff, 0xB8); store32(ep + eoff + 1, 1); eoff = eoff + 5;
+        # wrmsr
+        store8(ep + eoff, 0x0F); store8(ep + eoff + 1, 0x30); eoff = eoff + 2;
+        store8(ep + eoff, 0x5A); eoff = eoff + 1;  # pop rdx
+        store8(ep + eoff, 0x59); eoff = eoff + 1;  # pop rcx
+        store8(ep + eoff, 0x58); eoff = eoff + 1;  # pop rax
+    }
 
     # Push preserved values for SYSRET
     # push rcx (user RIP)  — 51
@@ -174,6 +215,35 @@ fn syscall_init() {
     store64(ep + eoff, krs); eoff = eoff + 8;
     # mov rsp, [r10] — 49 8B 22
     store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x22); eoff = eoff + 3;
+
+    # S8 (KPTI): Switch from kernel CR3 back to user CR3 before SYSRET.
+    # rax has return value — save it, load user CR3, switch, restore.
+    # mov r10, imm64(kpti_user_cr3 addr); mov r10, [r10]; mov cr3, r10
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
+    store64(ep + eoff, ucr3_addr); eoff = eoff + 8;
+    # mov r10, [r10]
+    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x12); eoff = eoff + 3;
+    # mov cr3, r10
+    store8(ep + eoff, 0x44); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;
+
+    # S9: Clear IBRS before returning to user mode (avoid user-mode perf hit)
+    if (ibrs_supported == 1) {
+        # Save rax (syscall return value), then wrmsr, then restore
+        store8(ep + eoff, 0x50); eoff = eoff + 1;  # push rax
+        store8(ep + eoff, 0x51); eoff = eoff + 1;  # push rcx (user RIP — save again)
+        store8(ep + eoff, 0x52); eoff = eoff + 1;  # push rdx
+        # mov ecx, 0x48
+        store8(ep + eoff, 0xB9); store32(ep + eoff + 1, 0x48); eoff = eoff + 5;
+        # xor edx, edx
+        store8(ep + eoff, 0x31); store8(ep + eoff + 1, 0xD2); eoff = eoff + 2;
+        # xor eax, eax (IBRS=0 to clear)
+        store8(ep + eoff, 0x31); store8(ep + eoff + 1, 0xC0); eoff = eoff + 2;
+        # wrmsr
+        store8(ep + eoff, 0x0F); store8(ep + eoff + 1, 0x30); eoff = eoff + 2;
+        store8(ep + eoff, 0x5A); eoff = eoff + 1;  # pop rdx
+        store8(ep + eoff, 0x59); eoff = eoff + 1;  # pop rcx
+        store8(ep + eoff, 0x58); eoff = eoff + 1;  # pop rax
+    }
 
     # sysretq: atomically restores RIP from RCX, RFLAGS from R11,
     # CS = STAR[63:48]+16 | 3 = 0x23 (user CS), SS = STAR[63:48]+8 | 3 = 0x1B (user SS)

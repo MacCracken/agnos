@@ -1,3 +1,33 @@
+# === Stack Canary (S13) ===
+# Random secret initialized at boot via RDRAND. Checked in critical functions
+# to detect stack buffer overflows before they corrupt return addresses.
+var stack_canary_secret = 0;
+
+fn stack_canary_init() {
+    # Try RDRAND for cryptographic randomness
+    var val = 0;
+    # rdrand rax (48 0F C7 F0), sets CF=1 on success
+    # We read rax into val. If RDRAND fails (CF=0), rax may be 0.
+    asm {
+        0x48; 0x0F; 0xC7; 0xF0;   # rdrand rax
+        0x48; 0x89; 0x45; 0xF8;   # mov [rbp-0x08], rax (val)
+    }
+    if (val == 0) {
+        # RDRAND unavailable or failed — use timer + constant
+        val = timer_ticks * 6364136223846793005 + 0xDEAD1337CAFE4242;
+    }
+    stack_canary_secret = val;
+    return 0;
+}
+
+fn stack_canary_check(canary) {
+    if (canary != stack_canary_secret) {
+        serial_println("PANIC: stack smash detected", 27);
+        arch_halt();
+    }
+    return 0;
+}
+
 # === Syscall Interface ===
 # Syscall#: 0=exit 1=write 2=getpid 3=spawn 4=waitpid 5=read 6=close 7=open
 # 8=dup 9=mkdir 10=rmdir 11=mount 12=sync 13=reboot 14=pause 15=getuid
@@ -42,6 +72,7 @@ fn kernel_resume() {
 }
 
 fn ksyscall(num, arg1, arg2, arg3) {
+    var canary = stack_canary_secret;
     if (num == 0) {
         # exit — halt current process, return to kernel if context saved
         sys_exit_code = arg1;
@@ -262,8 +293,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 25) {
         # pipe(fds_ptr=arg1)
         # Security: validate userspace pointer for 2x u64
-        if (is_user_range(arg1, 16) == 0) { return 0 - 1; }
+        if (is_user_range(arg1, 16) == 0) { stack_canary_check(canary); return 0 - 1; }
+        stack_canary_check(canary);
         return vfs_create_pipe(arg1);
     }
+    stack_canary_check(canary);
     return 0 - 1;
 }

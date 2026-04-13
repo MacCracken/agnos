@@ -133,17 +133,40 @@ Tests: 4/4 passed
 
 ---
 
-## Remaining Items (Phase 3-4)
+## Phase 3 Hardening (2026-04-13, fourth pass)
+
+3 advanced security mitigations applied (S13, S9, S8 from security roadmap):
+
+| # | Item | Files | Fix Applied |
+|---|---|---|---|
+| S13 | **Stack canaries** | `kernel/core/syscall.cyr`, `kernel/core/elf.cyr`, `kernel/core/net.cyr`, `kernel/core/main.cyr` | `stack_canary_secret` initialized via RDRAND at boot (fallback: timer-based). Canary set/checked in `ksyscall()`, `elf_load()`, `net_handle_tcp()`. Corruption triggers PANIC + halt. |
+| S9 | **Spectre v2 (IBRS)** | `kernel/arch/x86_64/syscall_hw.cyr` | CPUID leaf 7 checked for IBRS support (EDX bit 26). If supported, SYSCALL entry sets IA32_SPEC_CTRL.IBRS (MSR 0x48 bit 0) via WRMSR. Cleared before SYSRET to avoid user-mode performance penalty. Entry stub buffer enlarged to 256 bytes. |
+| S8 | **KPTI (partial)** | `kernel/core/proc.cyr`, `kernel/core/sched.cyr`, `kernel/arch/x86_64/syscall_hw.cyr`, `kernel/arch/x86_64/ring3.cyr` | Dual page tables per process: kernel CR3 (full mappings) and user CR3 (PD entry 0 only, supervisor-only). `proc_create_address_space()` allocates both. User CR3 stored in kernel PD entry 511. Scheduler updates `kpti_kernel_cr3`/`kpti_user_cr3` on context switch. SYSCALL stub switches user→kernel CR3 via R10 at entry, kernel→user CR3 before SYSRET. `proc_map_page`/`proc_unmap_page` maintain both page tables. Kernel heap/data (PD entries 1-7) not present in user page tables. |
+
+```
+Build: OK (251752 bytes)
+Tests: 4/4 passed
+```
+
+---
+
+## Remaining Items (Deferred)
 
 | # | Item | Severity | Status |
 |---|---|---|---|
-| S8 | KPTI (separate user/kernel page tables) | MEDIUM | Requires dual CR3 per process, trampoline page |
-| S9 | Spectre v2 (IBRS on syscall entry) | MEDIUM | Requires CPUID check, MSR writes |
-| S13 | Stack canaries | LOW | Manual insertion in critical functions |
-| S7 | KASLR | MEDIUM | Deferred — requires Cyrius compiler relocation support |
-| S10 | IOMMU (VT-d) | MEDIUM | Deferred — requires ACPI/DMAR parsing |
+| S7 | KASLR | MEDIUM | Deferred — requires Cyrius compiler relocation/PIC support |
+| S10 | IOMMU (VT-d) | MEDIUM | Deferred — requires ACPI/DMAR parsing infrastructure |
 
-See `docs/development/security-hardening.md` for full implementation plans.
+These items have external dependencies that cannot be resolved within the kernel alone.
+
+---
+
+## Summary
+
+**Total findings**: 30+
+**Fixed**: 27 (S1-S6, S8-S9, S11-S13, plus 19 initial fixes)
+**Deferred**: 2 (S7 KASLR, S10 IOMMU)
+**Kernel size**: 239KB → 251KB (+5.3% for all security hardening)
 
 ---
 

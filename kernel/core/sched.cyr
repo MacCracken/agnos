@@ -109,6 +109,9 @@ fn do_context_switch(isr_rsp) {
         var cr3_load = new_cr3;
         asm { mov cr3, rax; }
     }
+    # S8 (KPTI): update global CR3 pair for SYSCALL stub
+    kpti_kernel_cr3 = new_cr3;
+    kpti_user_cr3 = proc_get_user_cr3(new_cr3);
 
     # Check for pending unmasked signals on the new process
     proc_check_pending_signals(new_pid);

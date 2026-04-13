@@ -3,6 +3,7 @@
 # Returns pid or -1 on error.
 
 fn elf_load(elf_addr, elf_size) {
+    var canary = stack_canary_secret;
     # Verify minimum ELF header size (64 bytes for ELF64)
     if (elf_size < 64) { return 0 - 1; }
     # Verify ELF magic: 0x7F 'E' 'L' 'F'
@@ -111,5 +112,6 @@ fn elf_load(elf_addr, elf_size) {
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);
     }
+    stack_canary_check(canary);
     return new_pid;
 }

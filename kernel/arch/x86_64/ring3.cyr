@@ -35,8 +35,12 @@ fn exec_and_wait(entry, rsp, cr3) {
     kernel_return_rsp = save_rbp;
     kernel_return_rip = save_retaddr;
 
-    # Switch CR3 and enter ring 3
-    var cr3_load = exec_cr3_g;
+    # S8 (KPTI): set global CR3 pair for SYSCALL stub before entering ring 3
+    kpti_kernel_cr3 = exec_cr3_g;
+    kpti_user_cr3 = proc_get_user_cr3(exec_cr3_g);
+
+    # Switch CR3 and enter ring 3 (use user CR3 for KPTI)
+    var cr3_load = kpti_user_cr3;
     asm { mov cr3, rax; }
     enter_ring3(exec_entry_g, exec_rsp_g);
     return 0;

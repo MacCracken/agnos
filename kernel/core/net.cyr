@@ -425,6 +425,7 @@ fn tcp_find_conn(src_port, dst_port, src_ip) {
 }
 
 fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
+    var canary = stack_canary_secret;
     if (ip_payload_len < 20) { return 0; }
     var tcp = pkt + ip_off;
     var src_port = (load8(tcp) << 8) | load8(tcp + 1);
@@ -513,8 +514,10 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         if ((flags & 0x10) != 0) {
             store64(cb, 0);  # ACK of FIN -> CLOSED
         }
+        stack_canary_check(canary);
         return 1;
     }
+    stack_canary_check(canary);
     return 0;
 }
 

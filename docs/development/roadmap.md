@@ -106,12 +106,12 @@ Implementation details in `docs/development/security-hardening.md`.
 | S5 | ~~**Per-connection TCP RX buffers**~~ | Done | MEDIUM |
 | S6 | ~~**Stack guard pages**~~ | Done | MEDIUM |
 | S7 | **KASLR** — randomize kernel load address; currently fixed at 0x100000, trivial ROP | Boot shim + relocatable binary | MEDIUM |
-| S8 | **KPTI (Kernel Page Table Isolation)** — separate user/kernel page tables to mitigate Meltdown; switch CR3 on syscall entry/exit | S1 + SYSCALL handler | MEDIUM |
-| S9 | **Spectre v2 mitigations** — set IA32_SPEC_CTRL.IBRS on syscall entry; consider retpoline for indirect calls | SYSCALL handler | MEDIUM |
+| S8 | ~~**KPTI (Kernel Page Table Isolation)**~~ | Done (partial — PD entry 0 kept in user tables for trampoline/ISR; full isolation needs 4KB pages) | MEDIUM |
+| S9 | ~~**Spectre v2 mitigations**~~ | Done (IBRS set/clear on SYSCALL entry/exit; retpoline deferred to compiler) | MEDIUM |
 | S10 | **IOMMU (VT-d)** — restrict DMA targets so VirtIO devices cannot write arbitrary physical memory | PCI + ACPI/DMAR parsing | MEDIUM |
 | S11 | ~~**ARP request tracking**~~ | Done | LOW |
 | S12 | ~~**TCP window/sequence validation**~~ | Done | LOW |
-| S13 | **Stack canaries** — place canary values at stack frame boundaries to detect buffer overflows | Compiler support or manual | LOW |
+| S13 | ~~**Stack canaries**~~ | Done (RDRAND-based secret, manual in ksyscall/elf_load/net_handle_tcp) | LOW |
 
 ### Dependency chain
 

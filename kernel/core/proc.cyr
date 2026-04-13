@@ -100,12 +100,18 @@ fn proc_get_exit_code(pid) {
 }
 
 # === Per-Process Address Space ===
-# Create a new set of page tables for a process.
-# Copies kernel mappings (first 16MB) from the shared kernel PD.
-# Returns the physical address of the new PML4.
+# Create new page tables for a process. Returns kernel CR3.
+# S8 (KPTI): Also creates a separate user CR3 with minimal kernel mappings.
+#   Kernel CR3: full mappings (kernel + user pages)
+#   User CR3:   only PD entry 0 (supervisor-only, for SYSCALL/ISR trampoline)
+#               + user-mapped pages (added later via proc_map_page)
+
+# KPTI globals: current process's CR3 pair (updated by scheduler)
+var kpti_kernel_cr3 = 0x1000;  # Default to boot page tables
+var kpti_user_cr3 = 0x1000;
 
 fn proc_create_address_space() {
-    # Allocate 3 pages: PML4, PDPT, PD
+    # Allocate 3 pages for kernel page tables: PML4, PDPT, PD
     var new_pml4 = pmm_alloc();
     if (new_pml4 == 0) { return 0; }
     var new_pdpt = pmm_alloc();
@@ -129,7 +135,39 @@ fn proc_create_address_space() {
         store64(new_pd + i * 8, entry);
     }
 
+    # S8 (KPTI): Allocate separate user page tables with minimal kernel mappings
+    var u_pml4 = pmm_alloc();
+    if (u_pml4 == 0) { return new_pml4; }  # Fallback: no KPTI for this process
+    var u_pdpt = pmm_alloc();
+    if (u_pdpt == 0) { pmm_free(u_pml4); return new_pml4; }
+    var u_pd = pmm_alloc();
+    if (u_pd == 0) { pmm_free(u_pml4); pmm_free(u_pdpt); return new_pml4; }
+
+    memset(u_pml4, 0, 4096);
+    memset(u_pdpt, 0, 4096);
+    memset(u_pd, 0, 4096);
+
+    store64(u_pml4, u_pdpt | 0x07);
+    store64(u_pdpt, u_pd | 0x07);
+
+    # User PD: only entry 0 (0-2MB) for SYSCALL/ISR trampoline — supervisor-only
+    store64(u_pd, load64(0x3000) & (0 - 1 - 0x04));  # Copy entry 0, clear U/S bit
+
+    # Store user CR3 in the kernel PD at a known offset (entry 511, unused)
+    # so proc_get_user_cr3 can find it from the kernel CR3
+    store64(new_pd + 511 * 8, u_pml4);
+
     return new_pml4;
+}
+
+# Retrieve user CR3 from kernel page tables (stored in PD entry 511)
+fn proc_get_user_cr3(kernel_cr3) {
+    if (kernel_cr3 == 0x1000) { return 0x1000; }  # Boot page tables, no KPTI
+    var pml4e = load64(kernel_cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    return load64(pd_addr + 511 * 8);
 }
 
 # Map a 2MB page in a process's page directory (user-accessible)
@@ -166,9 +204,18 @@ fn proc_map_page(cr3, virt, phys) {
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
     var pdpte = load64(pdpt_addr);
     var pd_addr = pdpte & 0xFFFFFFFFF000;
-    # Write PD entry
+    # Write PD entry in kernel page tables
     var pd_idx = (virt >> 21) & 0x1FF;
     store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
+    # S8 (KPTI): also map in user page tables so ring-3 can access user pages
+    var u_cr3 = load64(pd_addr + 511 * 8);
+    if (u_cr3 != 0) {
+        var u_pml4e = load64(u_cr3);
+        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
+        var u_pdpte = load64(u_pdpt);
+        var u_pd = u_pdpte & 0xFFFFFFFFF000;
+        store64(u_pd + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
+    }
     return 0;
 }
 
@@ -179,6 +226,15 @@ fn proc_unmap_page(cr3, virt) {
     var pdpte = load64(pdpt_addr);
     var pd_addr = pdpte & 0xFFFFFFFFF000;
     var pd_idx = (virt >> 21) & 0x1FF;
-    store64(pd_addr + pd_idx * 8, 0);  # Clear entry — access will page fault
+    store64(pd_addr + pd_idx * 8, 0);
+    # S8 (KPTI): also unmap in user page tables
+    var u_cr3 = load64(pd_addr + 511 * 8);
+    if (u_cr3 != 0) {
+        var u_pml4e = load64(u_cr3);
+        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
+        var u_pdpte = load64(u_pdpt);
+        var u_pd = u_pdpte & 0xFFFFFFFFF000;
+        store64(u_pd + pd_idx * 8, 0);
+    }
     return 0;
 }

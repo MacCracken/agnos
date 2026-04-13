@@ -122,6 +122,10 @@ kfree_sized(h2, 100);
 syscall_init();
 serial_println("SYSCALL/SYSRET initialized", 26);
 
+# Initialize stack canary secret (S13)
+stack_canary_init();
+serial_println("Stack canary initialized", 24);
+
 # Syscall test (direct call — still works)
 kernel_return_rsp = 0;
 kernel_return_rip = 0;
