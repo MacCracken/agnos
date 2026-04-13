@@ -20,7 +20,7 @@ sh scripts/test.sh --all
 
 ## Architecture
 
-Multi-arch kernel: `kernel/arch/x86_64/` (14 files), `kernel/arch/aarch64/` (5 files), `kernel/core/` (15 files), `kernel/user/` (3 files).
+Multi-arch kernel: `kernel/lib/` (2 files), `kernel/arch/x86_64/` (14 files), `kernel/arch/aarch64/` (8 files), `kernel/core/` (17 files), `kernel/user/` (3 files).
 
 ```
 x86_64:
@@ -40,11 +40,11 @@ Common:
   -> ELF loader, VFS, initrd, device drivers
   -> PCI bus, VirtIO-Net, IP/UDP stack
   -> SMP infrastructure (APIC, IPI, trampoline, per-CPU stacks)
-  -> 25 syscalls (signals, epoll, timerfd)
+  -> 26 syscalls (signals, epoll, timerfd, pipes)
   -> kybernet (PID 1) -> interactive shell
 ```
 
-## Subsystems (27)
+## Subsystems (33)
 
 | Subsystem | Description |
 |-----------|-------------|
@@ -66,18 +66,25 @@ Common:
 | Context Switch | Full register save/restore, CR3 switch |
 | SYSCALL/SYSRET | MSR setup, ring 3 transition |
 | ELF Loader | Static ELF64, per-process address space |
-| VFS | File table, device/memfile/signalfd/epoll/timerfd types |
+| VFS | File table, device/memfile/signalfd/epoll/timerfd/pipe types |
 | Device Drivers | Serial char device |
 | Initrd | Flat format, name lookup |
 | PCI Bus | Config space scan, device discovery |
 | VirtIO-Net | Legacy PCI, virtqueues, Ethernet frames |
-| IP/UDP Stack | ARP, IPv4, UDP send |
+| IP/UDP Stack | ARP, IPv4, UDP send/recv |
+| TCP Stack | Connect, send, recv, close, SYN/ACK/FIN state machine |
+| VirtIO-Blk | Legacy PCI, sector read/write, DMA buffers |
+| FAT16 | Read-only, root directory listing, file open/read |
+| Pipes | Circular buffer IPC, read/write ends |
 | SMP Infrastructure | APIC, IPI, trampoline, per-CPU stacks |
+| Signals | per-process signals/sigmask, kill, sigprocmask, signalfd |
+| Epoll | epoll_create, epoll_ctl, epoll_wait |
+| Timerfd | timerfd_create, timerfd_settime |
 | Scheduler | Round-robin |
-| Shell | 12 commands: help echo ps free cat uptime lspci cpus net send bench halt |
-| kybernet Init | PID 1, 25 kernel syscalls ready |
+| Shell | 18 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench halt |
+| kybernet Init | PID 1, 26 kernel syscalls ready |
 
-## Syscalls (25)
+## Syscalls (26)
 
 | Number | Name | Description |
 |--------|------|-------------|
@@ -106,6 +113,7 @@ Common:
 | 22 | timerfd_create | Create timer file descriptor |
 | 23 | timerfd_settime | Set timer interval |
 | 24 | umount | Unmount filesystem |
+| 25 | pipe | Create pipe pair |
 
 ## Benchmarks (QEMU x86_64, rdtsc)
 
@@ -136,13 +144,13 @@ Common:
 
 ## Metrics
 
-- **Binary**: 98KB (x86_64), 43KB (aarch64)
-- **Source**: ~3,000 lines across 33 files
-- **Syscalls**: 25
-- **Subsystems**: 27
-- **Architecture**: Multi-arch (kernel/arch/x86_64/ + kernel/arch/aarch64/ + kernel/core/ + kernel/user/)
+- **Binary**: 143KB (x86_64), 57KB (aarch64)
+- **Source**: ~4,800 lines across 46 files
+- **Syscalls**: 26
+- **Subsystems**: 33
+- **Architecture**: Multi-arch (kernel/lib/ + kernel/arch/x86_64/ + kernel/arch/aarch64/ + kernel/core/ + kernel/user/)
 - **Boot time**: <100ms on QEMU
-- **Dependencies**: Zero (Cyrius compiler only)
+- **Dependencies**: Zero (Cyrius toolchain only, vendored kernel stdlib)
 
 ## Requirements
 

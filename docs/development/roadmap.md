@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.1.0 — x86_64 + aarch64, 98KB/43KB, 25 syscalls, multi-arch, kybernet-ready
+> **Current**: v1.21.0 — x86_64 + aarch64, 143KB/57KB, 26 syscalls, 33 subsystems, kernel stdlib
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 
@@ -36,14 +36,32 @@ For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 | 15 | Local APIC timer | Done — replaces PIT, ~100Hz periodic |
 | 16 | TSS | Done — ring 3 transitions, RSP0 |
 
+## Completed (v1.11.0)
+
+| # | Item | Version |
+|---|------|---------|
+| 23 | VirtIO-blk driver (sector read/write, DMA) | v1.11.0 |
+| 24 | FAT16 read-only filesystem | v1.11.0 |
+| 25 | TCP stack (connect, send, recv, close) | v1.11.0 |
+| 26 | Pipes (circular buffer IPC, VFS type 6) | v1.11.0 |
+| 27 | GRUB bootable ISO support | v1.11.0 |
+
+## Completed (v1.21.0)
+
+| # | Item | Version |
+|---|------|---------|
+| 28 | Kernel stdlib (vendored kstring.cyr, kfmt.cyr) | v1.21.0 |
+| 29 | cyrius.toml + .cyrius-toolchain build modernization | v1.21.0 |
+| 30 | CI/release uses .cyrius-toolchain (no hardcoded version) | v1.21.0 |
+| 31 | Toolchain rename: cyrb→cyrius, cc2→cc3 across all scripts/docs | v1.21.0 |
+
 ## Active
 
 | # | Item | Notes |
 |---|------|-------|
-| 1 | Real disk I/O | AHCI/SATA or VirtIO-blk |
-| 2 | TCP | Complete the network stack beyond UDP |
-| 3 | SMP AP wakeup on real hardware | Currently QEMU-validated only |
-| 4 | Pipes | IPC between processes |
+| 1 | SMP AP wakeup on real hardware | Currently QEMU-validated only |
+| 2 | Tagged unions for VFS entry types | ktagged.cyr kernel stdlib |
+| 3 | Struct refactor with #derive(accessors) | proc_table, vfs_table, pci_devs |
 
 ## Multi-Architecture (Complete)
 

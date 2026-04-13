@@ -6,7 +6,7 @@
 
 - **Type**: Bare-metal kernel binary (Cyrius language)
 - **License**: GPL-3.0-only
-- **Version**: 1.11.0
+- **Version**: 1.21.0
 - **Language**: Cyrius (self-hosting)
 - **Cyrius**: >= 3.9.8 (`cyrius` build tool)
 - **Target**: x86_64 + aarch64 (cross-compilation supported)
@@ -86,13 +86,14 @@ agnos/
 ├── kernel/
 │   ├── agnos.cyr            # Main orchestrator (includes arch + core + user)
 │   ├── kernel_hello.cyr     # Minimal boot test
+│   ├── lib/                 # 2 files: kstring, kfmt (vendored kernel-safe stdlib)
 │   ├── arch/
 │   │   ├── x86_64/          # 14 files: boot, gdt, idt, tss, pic, apic, timer,
 │   │   │                    #   keyboard, paging, serial, syscall, smp, pci, virtio
-│   │   └── aarch64/         # 5 files: boot, gic, timer, serial, paging
-│   ├── core/                # 15 files: pmm, vmm, heap, proc, scheduler, syscall,
-│   │                        #   vfs, initrd, net, elf, signals, epoll, timerfd, etc.
-│   └── user/                # 3 files: shell, init, bench
+│   │   └── aarch64/         # 8 files: boot, gic, timer, serial, paging, stubs, etc.
+│   ├── core/                # 17 files: pmm, vmm, heap, proc, scheduler, syscall,
+│   │                        #   vfs, initrd, net, elf, fatfs, pci, virtio, signals, etc.
+│   └── user/                # 3 files: shell, init, test_procs
 ├── build/                   # Generated binaries (gitignored)
 ├── docs/
 │   ├── architecture/        # System diagrams, subsystem docs
