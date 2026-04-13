@@ -1,10 +1,10 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> All 25 syscalls implemented as of v1.1.0. kybernet can run on AGNOS as PID 1.
+> All 26 syscalls implemented as of v1.21.0. kybernet can run on AGNOS as PID 1.
 
 ## Current State
 
-**AGNOS kernel** (`kernel/core/syscall.cyr`) implements 25 syscalls (all tiers complete).
+**AGNOS kernel** (`kernel/core/syscall.cyr`) implements 26 syscalls (all tiers complete).
 
 ### Original 8 (v1.0.0):
 
@@ -19,7 +19,7 @@
 | 6 | close | close(fd) | VFS close |
 | 7 | open | open(name, namelen) | initrd_open |
 
-**Kybernet** calls 27 distinct `sys_*` functions. The AGNOS backend (`agnosys/lib/syscalls_agnos.cyr`) maps them to AGNOS syscall numbers 0-23.
+**Kybernet** calls 27 distinct `sys_*` functions. The AGNOS backend (`agnosys/lib/syscalls_agnos.cyr`) maps them to AGNOS syscall numbers 0-25.
 
 ## Implementation Details
 
@@ -87,8 +87,8 @@ Kybernet uses signals for: child process reaping (SIGCHLD), shutdown (SIGTERM/SI
 **New data structures** (add to `core/proc.cyr`):
 ```cyrius
 # Per-process signal state (add to Process struct or separate array)
-var proc_signals[16];        # 16 processes x 1 pending signal mask (64-bit)
-var proc_sigmask[16];        # 16 processes x 1 blocked signal mask
+var proc_signals[128];       # 16 processes x 8 bytes (64-bit pending signal mask)
+var proc_sigmask[128];       # 16 processes x 8 bytes (64-bit blocked signal mask)
 ```
 
 | # | Name | Signature | Implementation |
@@ -281,14 +281,15 @@ if (num == 23) {
 
 ## Summary
 
-All tiers implemented in v1.1.0. 25 total syscalls (8 original + 17 new).
+All tiers implemented. 26 total syscalls (8 original + 18 new).
 
 | Tier | Syscalls | Status |
 |------|----------|--------|
-| 1: Stubs | 8,9,10,12,15,24 (6) | DONE |
-| 2: Simple | 11,13,14 (3) | DONE |
-| 3: Signals | 16,17,18 (3) | DONE |
-| 4: Events | 19,20,21,22,23 (5) | DONE |
+| 1: Stubs | 8,9,10,12,15,24 (6) | DONE (v1.1.0) |
+| 2: Simple | 11,13,14 (3) | DONE (v1.1.0) |
+| 3: Signals | 16,17,18 (3) | DONE (v1.1.0) |
+| 4: Events | 19,20,21,22,23 (5) | DONE (v1.1.0) |
+| 5: IPC | 25 (1) | DONE (v1.11.0) |
 
 ## Files to modify
 

@@ -18,7 +18,7 @@ kybernet (PID 1)
 
 ## Syscall Status
 
-All 25 AGNOS syscalls are implemented (v1.1.0). kybernet can run on AGNOS as PID 1.
+All 26 AGNOS syscalls are implemented (v1.21.0). kybernet can run on AGNOS as PID 1.
 
 ### Tier 1: Original (v1.0.0) -- DONE
 | Syscall | AGNOS # | Notes |
@@ -61,6 +61,11 @@ All 25 AGNOS syscalls are implemented (v1.1.0). kybernet can run on AGNOS as PID
 | timerfd_create | 22 | VFS fd type=5, timer state |
 | timerfd_settime | 23 | Set interval in APIC ticks |
 
+### Tier 5: IPC (v1.11.0) -- DONE
+| Syscall | AGNOS # | Notes |
+|---------|---------|-------|
+| pipe | 25 | Create read/write fd pair, 4KB circular buffer |
+
 ### Integration -- READY
 - Build kybernet with `-D AGNOS`
 - Package kybernet ELF in AGNOS initrd
@@ -73,7 +78,7 @@ All 25 AGNOS syscalls are implemented (v1.1.0). kybernet can run on AGNOS as PID
 AGNOS uses its own syscall numbers (not Linux's). The `syscalls_agnos.cyr` backend maps:
 
 ```
-AGNOS syscall table (25 syscalls):
+AGNOS syscall table (26 syscalls):
  0 = exit          8 = dup           16 = kill
  1 = write         9 = mkdir         17 = sigprocmask
  2 = getpid       10 = rmdir         18 = signalfd
@@ -83,4 +88,5 @@ AGNOS syscall table (25 syscalls):
  6 = close        14 = pause         22 = timerfd_create
  7 = open         15 = getuid        23 = timerfd_settime
                                      24 = umount
+                                     25 = pipe
 ```

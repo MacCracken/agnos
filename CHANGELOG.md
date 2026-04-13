@@ -11,33 +11,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Kernel stdlib: vendored `kstring.cyr` (strlen, streq, memeq, memcpy, memset, memchr, strchr, atoi, strstr) and `kfmt.cyr` (fmt_int_buf, fmt_hex_buf, kfmt_int, kfmt_hex, kfmt_hex0x, kfmt_byte)
 - `cyrius.toml` project metadata
 - `.cyrius-toolchain` version pinning (3.9.8)
+- Kernel test suite: 106 assertions across 7 categories (PMM, heap, VFS, proc, syscall, kstdlib, initrd)
+- `scripts/ktest.sh` — automated QEMU test runner with `-D TEST` gating
+- Shell `test` command (gated behind `#ifdef TEST`, excluded from production binary)
 - PCI device IDs displayed in hex (`lspci` shows `vendor=0x1af4` instead of decimal)
 - `kernel/lib/` directory for vendored kernel-safe stdlib modules
+- CI: format check (cyrfmt), security scan, dedicated build/test/docs jobs (4→7 jobs)
+- Release: changelog extraction, source tarball, VERSION+cyrius.toml+tag consistency check
 
 ### Changed
 - All scripts use `~/.cyrius/bin/` toolchain only (no `../cyrius/` fallback)
 - Toolchain references updated: `cyrb`→`cyrius`, `cc2`→`cc3` across all scripts and docs
 - CI/release workflows read toolchain version from `.cyrius-toolchain` (no hardcoded env)
 - CI installs from GitHub release tarball directly (removed `ci-cyrius.sh` dependency)
+- `version-bump.sh` rewritten: updates 9 files atomically with auto-computed `serial_println` byte lengths
 - `kprint_num()` delegates to `kfmt_int()` (stdlib fmt)
-- `initrd_build_test()` uses `memcpy()` for string literals (was 40+ `store8()` calls)
-- `initrd_name_match()` uses `memeq()` (was manual byte loop)
-- `sh_streq()` uses `memeq()` (was manual byte loop)
-- `eth_build()`, `arp_request()`, `udp_build()`, `tcp_send_pkt()` use `memcpy()`/`memset()` (were byte loops)
-- `net_copy_buf()` delegates to `memcpy()`
-- `elf_load()` segment copy uses `memcpy()` + BSS zero uses `memset()`
-- `fatfs_match_name()` uses `memset()` for pad + `memeq()` for compare
-- Shell `blkread` hexdump uses `kfmt_byte()`
-- README.md metrics updated (143KB, 46 files, 26 syscalls, 33 subsystems)
-- Roadmap updated with v1.11.0 and v1.21.0 completions
-- CONTRIBUTING.md install instructions point to `install.sh`
+- All byte-by-byte copy/compare/zero loops replaced with `memcpy()`/`memset()`/`memeq()` across initrd, shell, net, elf, fatfs, pmm, heap, proc, vfs, devs
+- Shell `blkread` hexdump uses `kfmt_byte()`, `lspci` uses `kfmt_hex0x()`
+
+### Fixed (P-1 Hardening — 14 buffer overflows)
+- `proc_table[336]` → `[2688]` (16 procs x 168B, was 2-proc overflow)
+- `proc_signals[16]`/`proc_sigmask[16]` → `[128]` (16 procs x 8B)
+- `idt[512]` → `[4096]` (256 vectors x 16B, was overflowing by 3584 bytes)
+- `gdt[8]` → `[56]`, `tss[16]` → `[104]` (x86_64 descriptor tables)
+- `kb_isr[64]` → `[96]` (83-byte ISR machine code)
+- `sc_normal[16]`/`sc_shifted[16]` → `[128]` (128-entry scancode tables)
+- `vfs_table[128]` → `[1024]` (32 fds x 32B)
+- `dev_table[64]` → `[512]` (16 devs x 32B)
+- `pci_devs[64]` → `[1024]` (32 slots x 32B)
+- `sh_buf[16]` → `[128]` (shell input, was accepting 126 chars into 16 bytes)
+- `tcp_conns[80]` → `[640]` (8 connections x 80B)
+- `vfs_create_pipe()` memory leak on fd alloc failure
+- `proc_create_address_space()` allocation rollback on pmm failure
+- Signal number bounds checks in `kill` syscall and `proc_send_signal`
+- Epoll watch list capacity check (max 8 watches in 128-byte buffer)
+- ELF loader returns error on `pmm_alloc` failure (was silently continuing)
+- VFS `read`/`write` validate `buf != 0` and `count >= 0`
+- FAT16 cluster validation (`cluster < 2` rejected)
+- Initrd file count capped at 256 (prevents OOB reads on malformed initrd)
+- Pipe circular buffer mask `& 4087` → `% 4088` (non-power-of-2 fix)
 
 ### Metrics
-- Binary: 143KB (x86_64), 57KB (aarch64)
+- Binary: 220KB (x86_64), 57KB (aarch64)
 - Source: ~4,800 lines across 46 files
 - Syscalls: 26
 - Subsystems: 33
-- Shell commands: 18
+- Shell commands: 19 (added `test`)
+- Tests: 106 kernel assertions (7 categories)
 
 ## [1.11.0] — 2026-04-07
 
