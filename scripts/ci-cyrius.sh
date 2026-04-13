@@ -27,7 +27,7 @@ rm -f "$WORKDIR/$TARBALL"
 
 # Copy binaries — handle both flat and bin/ layouts
 SRC="$WORKDIR/cyrius-${VERSION}-x86_64-linux"
-for f in cc2 cc2_aarch64 cc2-native-aarch64 cyrb asm ark cyrfmt cyrlint cyrdoc cyrc; do
+for f in cc3 cc3_aarch64 cc3-native-aarch64 cyrius asm ark cyrfmt cyrlint cyrdoc cyrc; do
     [ -f "$SRC/$f" ] && cp -f "$SRC/$f" "$DEST/$f" && chmod +x "$DEST/$f"
     [ -f "$SRC/bin/$f" ] && cp -f "$SRC/bin/$f" "$DEST/$f" && chmod +x "$DEST/$f"
 done
@@ -35,6 +35,6 @@ done
 rm -rf "$SRC" "$WORKDIR"
 
 # Verify
-[ -x "$DEST/cc2" ] && echo "  cc2:  ok" || { echo "  error: cc2 not found"; exit 1; }
-[ -x "$DEST/cyrb" ] && echo "  cyrb: ok" || echo "  warn: cyrb not found"
+[ -x "$DEST/cc3" ] && echo "  cc3:  ok" || { echo "  error: cc3 not found"; exit 1; }
+[ -x "$DEST/cyrius" ] && echo "  cyrius: ok" || echo "  warn: cyrius not found"
 echo "  done"

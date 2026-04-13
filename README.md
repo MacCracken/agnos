@@ -26,12 +26,12 @@ Multi-arch kernel: `kernel/arch/x86_64/` (14 files), `kernel/arch/aarch64/` (5 f
 x86_64:
   multiboot1 header (32-bit ELF)
     -> 32-bit boot shim (identity page tables, enable long mode)
-      -> 64-bit Cyrius kernel (cyrb build -D ARCH_X86_64)
+      -> 64-bit Cyrius kernel (cyrius build -D ARCH_X86_64)
 
 aarch64:
   DTB -> EL2-to-EL1 transition
     -> PL011 UART, GIC, ARM generic timer
-      -> 64-bit Cyrius kernel (cyrb build -D ARCH_AARCH64 --aarch64)
+      -> 64-bit Cyrius kernel (cyrius build -D ARCH_AARCH64 --aarch64)
 
 Common:
   -> serial, GDT+TSS/GIC, IDT, PIC/GIC, Local APIC, timer, keyboard
@@ -147,7 +147,7 @@ Common:
 ## Requirements
 
 - Linux x86_64
-- Cyrius >= 1.7.1 (`cyrb` build tool from `cyrius` repo)
+- Cyrius >= 3.9.8 (`cyrius` build tool from `cyrius` repo)
 - QEMU (`qemu-system-x86_64`, `qemu-system-aarch64`) for testing
 
 ## License

@@ -6,8 +6,9 @@
 
 - **Type**: Bare-metal kernel binary (Cyrius language)
 - **License**: GPL-3.0-only
-- **Version**: 1.2.0
-- **Language**: Cyrius (self-hosting, zero external dependencies)
+- **Version**: 1.11.0
+- **Language**: Cyrius (self-hosting)
+- **Cyrius**: >= 3.9.8 (`cyrius` build tool)
 - **Target**: x86_64 + aarch64 (cross-compilation supported)
 
 ## Goal
@@ -16,22 +17,52 @@ A sovereign kernel written entirely in Cyrius. No C, no Rust, no LLVM. Assembly 
 
 ## Consumers
 
-- kybernet (PID 1 init system) — boots on AGNOS
+- kybernet (v1.0.1) — PID 1 helmsman, boots on AGNOS
+- argonaut (v1.2.0) — init/service manager, 5 boot modes
 - AGNOS userland tools — shell, services
 - Cyrius language project — proves the language handles kernel code
 
+## Ecosystem Dependencies
+
+All Cyrius, all GPL-3.0-only. The kernel itself is standalone (no deps), but the
+userland boot stack is:
+
+```
+kybernet (PID 1)
+├── agnosys v0.97.2   — syscall bindings (20 modules, zero deps)
+├── agnostik v0.97.1  — shared types/primitives (12 modules, zero deps)
+├── argonaut v1.2.0   — service lifecycle, health, seccomp/Landlock
+│   └── libro v1.0.3  — cryptographic audit chain
+└── stdlib x21        — string, fmt, alloc, json, sakshi, etc.
+```
+
+### Cyrius Standard Library (key modules)
+
+- **Core**: alloc, args, fmt, io, string, vec, hashmap, tagged, chrono
+- **Extended**: async, http, json, net, tls, regex, mmap, thread, process, fs, toml
+- **yukti** — hardware/device enumeration
+- **mabda** — GPU foundation layer
+- **sakshi** — error/tracing (minimal + full profiles)
+- **sigil** — cryptographic signatures
+- **patra** — networking primitives
+
+IMPORTANT: Always use `cyrius build` — never raw `cc3`. The `cyrius` tool resolves
+deps from `cyrius.toml` and auto-prepends includes. Raw `cc3` is only for compiler
+self-hosting and bootstrap chain work.
+
 ## Build
 
-Requires Cyrius >= 1.7.1 (`cyrb` build tool) from the `cyrius` repo.
+Requires Cyrius >= 3.9.8 (`cyrius` build tool) from `~/.cyrius/bin/`.
+Install via `install.sh` or manage versions with `cyriusly`.
 
 ```sh
 # x86_64 (default)
 sh scripts/build.sh
-# or: cyrb build -D ARCH_X86_64 kernel/agnos.cyr build/agnos
+# or: cyrius build -D ARCH_X86_64 kernel/agnos.cyr build/agnos
 
 # aarch64 cross-compile
 sh scripts/build.sh --aarch64
-# or: cyrb build -D ARCH_AARCH64 --aarch64 kernel/agnos.cyr build/agnos-aarch64
+# or: cyrius build -D ARCH_AARCH64 --aarch64 kernel/agnos.cyr build/agnos-aarch64
 
 # Boot on QEMU (x86_64)
 qemu-system-x86_64 -kernel build/agnos -serial stdio -display none

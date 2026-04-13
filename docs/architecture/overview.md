@@ -12,7 +12,7 @@ BIOS/UEFI -> GRUB/QEMU multiboot1 loader
     -> Identity page tables (4 levels, 2MB huge pages)
     -> Enable PAE -> set CR3 -> enable LME in EFER -> enable paging
     -> Load 64-bit GDT -> far jump to 64-bit code
-      -> Cyrius kernel main() (cyrb build -D ARCH_X86_64)
+      -> Cyrius kernel main() (cyrius build -D ARCH_X86_64)
         -> Serial I/O (COM1), GDT+TSS, IDT, PIC, Local APIC
         -> Page tables, PMM, VMM, kernel heap
         -> Process table, scheduler, SYSCALL/SYSRET
@@ -31,7 +31,7 @@ qemu-system-aarch64 -M virt
     -> PL011 UART serial init
     -> GIC interrupt controller init
     -> ARM generic timer init
-    -> Cyrius kernel main() (cyrb build -D ARCH_AARCH64 --aarch64)
+    -> Cyrius kernel main() (cyrius build -D ARCH_AARCH64 --aarch64)
       -> PMM, kernel heap
       -> Boots to serial output on QEMU -M virt
 ```

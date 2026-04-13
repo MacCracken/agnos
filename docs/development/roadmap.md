@@ -51,8 +51,8 @@ Multi-arch split complete (v1.1.0). 33 files across `kernel/arch/x86_64/` (14), 
 
 Build uses `#ifdef ARCH_<NAME>` + `include`:
 ```sh
-cyrb build -D ARCH_X86_64 kernel/agnos.cyr build/agnos
-cyrb build -D ARCH_AARCH64 --aarch64 kernel/agnos.cyr build/agnos-aarch64
+cyrius build -D ARCH_X86_64 kernel/agnos.cyr build/agnos
+cyrius build -D ARCH_AARCH64 --aarch64 kernel/agnos.cyr build/agnos-aarch64
 ```
 
 Arch interface — each arch provides:

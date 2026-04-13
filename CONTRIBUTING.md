@@ -2,7 +2,7 @@
 
 ## Development Process
 
-1. Build the Cyrius compiler: `cd ../cyrius && sh bootstrap/bootstrap.sh`
+1. Install the Cyrius toolchain: `curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | sh`
 2. Build the kernel: `sh scripts/build.sh`
 3. Make changes to `kernel/agnos.cyr`
 4. Test: `sh scripts/test.sh`

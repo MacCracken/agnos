@@ -12,8 +12,8 @@ kybernet (PID 1)
     │       └── syscalls_agnos.cyr    # AGNOS kernel ABI
     │
     └── builds with:
-        cyrb build -D LINUX src/main.cyr build/kybernet
-        cyrb build -D AGNOS src/main.cyr build/kybernet-agnos
+        cyrius build -D LINUX src/main.cyr build/kybernet
+        cyrius build -D AGNOS src/main.cyr build/kybernet-agnos
 ```
 
 ## Syscall Status

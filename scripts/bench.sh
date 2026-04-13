@@ -4,7 +4,8 @@
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CYRB="$ROOT/../cyrius/build/cyrb"
+CYRIUS_HOME="${CYRIUS_HOME:-$HOME/.cyrius}"
+CYRB="$CYRIUS_HOME/bin/cyrius"
 BENCH_KERNEL="$ROOT/build/agnos_bench.cyr"
 
 echo "Building AGNOS with benchmarks..."
@@ -29,7 +30,7 @@ if [ -x "$CYRB" ]; then
 else
     mv "$MAIN_BAK" "$MAIN_CYR"
     mv "$TPROC_BAK" "$TPROC_CYR"
-    echo "ERROR: cyrb required" >&2; exit 1
+    echo "ERROR: cyrius required" >&2; exit 1
 fi
 
 echo "Booting on QEMU (15s timeout)..."

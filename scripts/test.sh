@@ -2,17 +2,10 @@
 # Test the AGNOS kernel build
 # Supports: x86_64 (default), aarch64 (--aarch64), both (--all)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CYRIUS="$ROOT/../cyrius"
-# Find toolchain: ~/.cyrius/bin/ (CI/installer) then ../cyrius/build/ (dev)
-if [ -x "$HOME/.cyrius/bin/cyrb" ]; then
-    CC="$HOME/.cyrius/bin/cc2"
-    CC_ARM="$HOME/.cyrius/bin/cc2_aarch64"
-    CYRB="$HOME/.cyrius/bin/cyrb"
-elif [ -x "${CYRIUS}/build/cyrb" ]; then
-    CC="${CYRIUS}/build/cc2"
-    CC_ARM="${CYRIUS}/build/cc2_aarch64"
-    CYRB="${CYRIUS}/build/cyrb"
-fi
+CYRIUS_HOME="${CYRIUS_HOME:-$HOME/.cyrius}"
+CC="$CYRIUS_HOME/bin/cc3"
+CC_ARM="$CYRIUS_HOME/bin/cc3_aarch64"
+CYRB="$CYRIUS_HOME/bin/cyrius"
 pass=0
 fail=0
 
@@ -29,17 +22,17 @@ check() {
 test_x86() {
     echo "=== AGNOS Kernel Tests [x86_64] ==="
 
-    # Build kernel (requires cyrb for multi-file includes)
-    # cyrb looks for cc2 at ./build/cc2 relative to CWD
+    # Build kernel (requires cyrius for multi-file includes)
+    # cyrius looks for cc3 at ./build/cc3 relative to CWD
     mkdir -p $ROOT/build
     rm -f $ROOT/build/agnos_test
     if [ -x "$CYRB" ]; then
         PREPPED="$ROOT/build/agnos_prepped.cyr"
         (echo '#define ARCH_X86_64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
-        (cd "$ROOT" && cd kernel && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build "$PREPPED" $ROOT/build/agnos_test) 2>&1
+        (cd "$ROOT/kernel" && "$CYRB" build "$PREPPED" $ROOT/build/agnos_test) 2>&1
         rm -f "$PREPPED"
     else
-        echo "ERROR: cyrb not found at $CYRB" >&2
+        echo "ERROR: cyrius not found at $CYRB" >&2
     fi
     # Check build produced a valid file
     if [ -f $ROOT/build/agnos_test ] && [ -s $ROOT/build/agnos_test ]; then

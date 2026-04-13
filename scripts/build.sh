@@ -1,22 +1,15 @@
 #!/bin/sh
 # Build the AGNOS kernel
 # Supports: x86_64 (default), aarch64 (--aarch64)
-# Requires: Cyrius toolchain from ../cyrius/build/
+# Requires: Cyrius toolchain (~/.cyrius/bin/)
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CYRIUS="$ROOT/../cyrius"
-# Find toolchain: ~/.cyrius/bin/ (CI/installer) then ../cyrius/build/ (dev)
-if [ -x "$HOME/.cyrius/bin/cyrb" ]; then
-    CYRB="$HOME/.cyrius/bin/cyrb"
-    CC="$HOME/.cyrius/bin/cc2"
-    CC_ARM="$HOME/.cyrius/bin/cc2_aarch64"
-elif [ -x "${CYRIUS}/build/cyrb" ]; then
-    CYRB="${CYRIUS}/build/cyrb"
-    CC="${CYRIUS}/build/cc2"
-    CC_ARM="${CYRIUS}/build/cc2_aarch64"
-fi
-echo "  toolchain: CYRB=$CYRB CC=$CC" >&2
+CYRIUS_HOME="${CYRIUS_HOME:-$HOME/.cyrius}"
+CYRB="$CYRIUS_HOME/bin/cyrius"
+CC="$CYRIUS_HOME/bin/cc3"
+CC_ARM="$CYRIUS_HOME/bin/cc3_aarch64"
+echo "  toolchain: $CYRB" >&2
 ARCH="x86_64"
 
 # Parse args
@@ -27,8 +20,8 @@ fi
 
 # Check toolchain
 if [ ! -x "$CC" ]; then
-    echo "ERROR: Cyrius compiler not found at $CC" >&2
-    echo "Build it: cd ../cyrius && sh bootstrap/bootstrap.sh" >&2
+    echo "ERROR: Cyrius toolchain not found at $CYRIUS_HOME" >&2
+    echo "Install: curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | sh" >&2
     exit 1
 fi
 
@@ -43,7 +36,7 @@ if [ "$ARCH" = "aarch64" ]; then
     if [ -x "$CYRB" ]; then
         PREPPED_ARM="$ROOT/build/agnos_arm.cyr"
         (echo '#define ARCH_AARCH64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
-        (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build --aarch64 "$PREPPED_ARM" "$ROOT/build/agnos-aarch64")
+        (cd "$ROOT/kernel" && "$CYRB" build --aarch64 "$PREPPED_ARM" "$ROOT/build/agnos-aarch64")
         rm -f "$PREPPED_ARM"
     else
         cat "$ROOT/kernel/agnos.cyr" | "$CC_ARM" > "$ROOT/build/agnos-aarch64"
@@ -54,11 +47,11 @@ if [ "$ARCH" = "aarch64" ]; then
     echo "Boot: qemu-system-aarch64 -M virt -cpu cortex-a57 -kernel build/agnos-aarch64 -serial stdio -display none"
 else
     echo "Building AGNOS kernel [x86_64]..."
-    # Prepend #define so it works regardless of cyrb -D support
+    # Prepend #define so it works regardless of cyrius -D support
     PREPPED="$ROOT/build/agnos_x86.cyr"
     (echo '#define ARCH_X86_64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
     if [ -x "$CYRB" ]; then
-        (cd "$ROOT/kernel" && mkdir -p build && ln -sf "$CC" build/cc2 && "$CYRB" build "$PREPPED" "$ROOT/build/agnos")
+        (cd "$ROOT/kernel" && "$CYRB" build "$PREPPED" "$ROOT/build/agnos")
     else
         cat "$PREPPED" | "$CC" > "$ROOT/build/agnos"
         chmod +x "$ROOT/build/agnos"
