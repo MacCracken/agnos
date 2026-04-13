@@ -56,7 +56,7 @@ exit(0 if ok else 1)
 
     # Size check
     SZ=$(wc -c < $ROOT/build/agnos_test 2>/dev/null || echo 0)
-    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 200000 ]; then
+    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 300000 ]; then
         check "x86 size reasonable (${SZ}B)" "0" "0"
     else
         check "x86 size reasonable (${SZ}B)" "0" "1"

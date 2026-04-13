@@ -75,9 +75,9 @@ var kb_caps = 0;
 var kb_ctrl = 0;
 
 # Unshifted scancode table (128 entries, 1 byte each)
-var sc_normal[16];
+var sc_normal[128];
 # Shifted scancode table
-var sc_shifted[16];
+var sc_shifted[128];
 
 fn kb_init_tables() {
     # Zero both tables

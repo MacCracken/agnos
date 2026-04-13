@@ -1,5 +1,5 @@
 # === VFS ===
-var vfs_table[128];
+var vfs_table[1024];  # 32 entries x 32 bytes each
 
 fn vfs_init() {
     memset(&vfs_table, 0, 1024);  # 32 entries x 32 bytes

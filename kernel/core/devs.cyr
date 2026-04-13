@@ -1,7 +1,7 @@
 # === Device Drivers ===
 # Device table: 16 entries x 32 bytes = {type, read_fn, write_fn, data}
 # type: 0=unused, 1=chardev
-var dev_table[64];
+var dev_table[512];  # 16 entries x 32 bytes
 var dev_count = 0;
 
 fn dev_register(read_fn, write_fn) {
@@ -58,7 +58,7 @@ fn serial_dev_write(buf, count) {
 }
 
 fn dev_init() {
-    for (var i = 0; i < 64; i = i + 1) { store64(&dev_table + i * 8, 0); }
+    memset(&dev_table, 0, 512);
     dev_count = 0;
     dev_register(&serial_dev_read, &serial_dev_write);
     return 0;

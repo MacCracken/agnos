@@ -1,5 +1,5 @@
 # === PCI Bus ===
-var pci_devs[64];
+var pci_devs[1024];  # 32 entries x 32 bytes (max 32 PCI slots)
 var pci_count = 0;
 
 fn pci_addr(bus, slot, func, off) {
