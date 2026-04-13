@@ -60,15 +60,10 @@ fn elf_load(elf_addr, elf_size) {
             asm { mov cr3, rax; }
 
             # Copy segment data
-            var ci = 0;
-            while (ci < p_filesz) {
-                store8(p_vaddr + ci, load8(elf_addr + p_offset + ci));
-                ci = ci + 1;
-            }
+            memcpy(p_vaddr, elf_addr + p_offset, p_filesz);
             # Zero BSS (memsz > filesz)
-            while (ci < p_memsz) {
-                store8(p_vaddr + ci, 0);
-                ci = ci + 1;
+            if (p_memsz > p_filesz) {
+                memset(p_vaddr + p_filesz, 0, p_memsz - p_filesz);
             }
 
             # Switch back to kernel page tables

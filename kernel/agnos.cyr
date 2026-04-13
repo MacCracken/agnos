@@ -30,6 +30,10 @@ include "arch/aarch64/paging.cyr"
 include "arch/aarch64/stubs.cyr"
 #endif
 
+# Kernel stdlib (vendored, syscall-free)
+include "lib/kstring.cyr"
+include "lib/kfmt.cyr"
+
 # Architecture-independent core
 include "core/pmm.cyr"
 include "core/heap.cyr"

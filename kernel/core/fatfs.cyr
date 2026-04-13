@@ -124,7 +124,7 @@ fn fatfs_match_name(entry_ptr, name, namelen) {
     # Compare 8.3 name against a simple filename
     # Build 8.3 padded name from input
     var fat_name[16];
-    for (var i = 0; i < 11; i = i + 1) { store8(&fat_name + i, 0x20); }
+    memset(&fat_name, 0x20, 11);
     var dot_pos = 0 - 1;
     for (var i = 0; i < namelen; i = i + 1) {
         if (load8(name + i) == 46) { dot_pos = i; }
@@ -153,10 +153,7 @@ fn fatfs_match_name(entry_ptr, name, namelen) {
         }
     }
     # Compare
-    for (var i = 0; i < 11; i = i + 1) {
-        if (load8(entry_ptr + i) != load8(&fat_name + i)) { return 0; }
-    }
-    return 1;
+    return memeq(entry_ptr, &fat_name, 11);
 }
 
 fn fatfs_find_inner(sector, entries_per_sector, name, namelen, result_ptr) {

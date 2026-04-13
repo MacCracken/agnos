@@ -1,9 +1,1 @@
-fn kprint_num(n: i64) {
-    var nb[24];
-    var ni = 23;
-    if (n < 0) { serial_putc(45); n = 0 - n; }
-    if (n == 0) { store8(&nb + ni, 48); ni = ni - 1; }
-    while (n > 0) { store8(&nb + ni, 48 + n % 10); ni = ni - 1; n = n / 10; }
-    serial_print(&nb + ni + 1, 23 - ni);
-    return 0;
-}
+fn kprint_num(n: i64) { return kfmt_int(n); }

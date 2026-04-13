@@ -4,10 +4,7 @@ var sh_len = 0;
 
 fn sh_streq(a, alen, b, blen) {
     if (alen != blen) { return 0; }
-    for (var i = 0; i < alen; i = i + 1) {
-        if (load8(a + i) != load8(b + i)) { return 0; }
-    }
-    return 1;
+    return memeq(a, b, alen);
 }
 
 fn sh_cmd_help() {
@@ -182,11 +179,11 @@ fn sh_exec(buf, len) {
             serial_print("  slot ", 7);
             kprint_num(load64(base));
             serial_print(": vendor=", 9);
-            kprint_num(load64(base + 8));
+            kfmt_hex0x(load64(base + 8));
             serial_print(" device=", 8);
-            kprint_num(load64(base + 16));
+            kfmt_hex0x(load64(base + 16));
             serial_print(" bar0=", 6);
-            kprint_num(load64(base + 24));
+            kfmt_hex0x(load64(base + 24));
             serial_println("", 0);
         }
         return 0;
@@ -294,11 +291,7 @@ fn sh_exec(buf, len) {
         if (r != 0) { serial_println("read failed", 11); return 0; }
         # Hexdump first 64 bytes
         for (var i = 0; i < 64; i = i + 1) {
-            var b = load8(&rbuf + i);
-            var hi = (b >> 4) & 0x0F;
-            var lo = b & 0x0F;
-            if (hi < 10) { serial_putc(48 + hi); } else { serial_putc(87 + hi); }
-            if (lo < 10) { serial_putc(48 + lo); } else { serial_putc(87 + lo); }
+            kfmt_byte(load8(&rbuf + i));
             serial_putc(32);
             if ((i & 15) == 15) { serial_println("", 0); }
         }
