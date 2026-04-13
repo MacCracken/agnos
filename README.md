@@ -121,36 +121,50 @@ Common:
 
 | Operation | Cycles |
 |-----------|--------|
-| PMM alloc+free | 1,391 |
-| Heap 32B alloc+free | 1,460 |
-| Heap 256B alloc+free | 3,316 |
-| Heap 4096B alloc+free | 28,299 |
-| Memory write 1MB | 6,492K |
+| PMM alloc+free | 1,467 |
+| Heap 32B alloc+free | 1,338 |
+| Heap 256B alloc+free | 3,358 |
+| Heap 4096B alloc+free | 28,097 |
+| Memory write 1MB | 6,976K |
 
 ### Tier 2: Subsystems
 
 | Operation | Cycles |
 |-----------|--------|
-| Syscall (getpid) | 247 |
-| Syscall (getuid) | 1,005 |
-| Syscall (write 1B) | 5,762 |
-| VFS open+read+close | 6,217 |
+| Syscall (getpid) | 261 |
+| Syscall (getuid) | 1,160 |
+| Syscall (write 1B) | 6,800 |
+| VFS open+read+close | 6,543 |
 
 ### Tier 3: Integration
 
 | Operation | Cycles |
 |-----------|--------|
-| Serial putc | 4,382 |
+| Serial putc | 5,046 |
 
 ## Metrics
 
-- **Binary**: 143KB (x86_64), 57KB (aarch64)
+- **Binary**: 220KB (x86_64), 57KB (aarch64)
 - **Source**: ~4,800 lines across 46 files
 - **Syscalls**: 26
 - **Subsystems**: 33
+- **Tests**: 106 kernel assertions (PMM, heap, VFS, proc, syscall, stdlib, initrd)
 - **Architecture**: Multi-arch (kernel/lib/ + kernel/arch/x86_64/ + kernel/arch/aarch64/ + kernel/core/ + kernel/user/)
 - **Boot time**: <100ms on QEMU
 - **Dependencies**: Zero (Cyrius toolchain only, vendored kernel stdlib)
+
+## Size Comparison
+
+| Kernel | Size | Language | Scope |
+|--------|------|----------|-------|
+| **AGNOS** | **220KB** | Cyrius | 33 subsystems, 26 syscalls, TCP/IP, FAT16, VirtIO, SMP, ELF loader, shell |
+| xv6 (MIT) | ~100KB | C | 21 syscalls, no networking, no SMP, no real FS |
+| seL4 (verified) | ~30KB | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
+| MINIX 3 | ~600KB | C | Microkernel + basic drivers |
+| Linux (minimal) | ~1.5MB | C | Barely boots, no drivers |
+| Linux (typical) | 10-30MB | C | Desktop-ready |
+
+220KB for a fully functional kernel with TCP/IP, block I/O, filesystem, SMP, signals, epoll, pipes, and an interactive shell — written entirely in Cyrius. No C, no LLVM, no libc.
 
 ## Requirements
 

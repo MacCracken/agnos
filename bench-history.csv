@@ -123,3 +123,13 @@ date,commit,benchmark,value,unit
 2026-04-13T09:45:04Z,fd47313,1.21.0,,syscall_write1,7152,cycles/op
 2026-04-13T09:45:04Z,fd47313,1.21.0,,vfs_open_read_close,6591,cycles/op
 2026-04-13T09:45:04Z,fd47313,1.21.0,,serial_putc,5669,cycles/op
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,pmm_alloc_free,1467,cycles/op
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,heap_32B,1338,cycles/op
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,heap_256B,3358,cycles/op
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,heap_4096B,28097,cycles/op
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,memwrite_1MB,6976,Kcycles
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,syscall_getpid,261,cycles/op
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,syscall_getuid,1160,cycles/op
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,syscall_write1,6800,cycles/op
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,vfs_open_read_close,6543,cycles/op
+2026-04-13T09:57:58Z,0b5be74,1.21.0,,serial_putc,5046,cycles/op

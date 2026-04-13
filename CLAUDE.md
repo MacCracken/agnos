@@ -6,7 +6,7 @@
 
 - **Type**: Bare-metal kernel binary (Cyrius language)
 - **License**: GPL-3.0-only
-- **Version**: 1.21.0
+- **Version**: 1.22.0
 - **Language**: Cyrius (self-hosting)
 - **Cyrius**: >= 3.9.8 (`cyrius` build tool)
 - **Target**: x86_64 + aarch64 (cross-compilation supported)
