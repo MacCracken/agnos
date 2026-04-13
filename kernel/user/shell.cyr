@@ -1,5 +1,5 @@
 # === Shell ===
-var sh_buf[16];
+var sh_buf[128];
 var sh_len = 0;
 
 fn sh_streq(a, alen, b, blen) {

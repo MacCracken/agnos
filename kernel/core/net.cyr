@@ -204,7 +204,7 @@ fn net_recv_udp(buf, maxlen) {
 #   offset 64: rx_buf_head (8 bytes)  - write position
 #   offset 72: flags (8 bytes) - last received flags
 
-var tcp_conns[80];
+var tcp_conns[640];  # 8 connections x 80 bytes each
 var tcp_conn_count = 0;
 var tcp_rx_tmpbuf[256];
 

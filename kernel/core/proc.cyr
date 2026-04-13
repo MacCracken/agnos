@@ -16,7 +16,7 @@ var proc_current = 0;
 var sched_active = 0;
 var proc_signals[128];  # 16 processes x 8 bytes
 var proc_sigmask[128];  # 16 processes x 8 bytes
-var pending_signal_flag = 0;
+var pending_signal_flag = 0;  # Set by scheduler ISR, read by main — benign race (atomic store on x86_64)
 
 fn proc_create(entry) {
     if (proc_count >= 16) { return 0 - 1; }
@@ -98,9 +98,9 @@ fn proc_create_address_space() {
     var new_pml4 = pmm_alloc();
     if (new_pml4 == 0) { return 0; }
     var new_pdpt = pmm_alloc();
-    if (new_pdpt == 0) { return 0; }
+    if (new_pdpt == 0) { pmm_free(new_pml4); return 0; }
     var new_pd = pmm_alloc();
-    if (new_pd == 0) { return 0; }
+    if (new_pd == 0) { pmm_free(new_pml4); pmm_free(new_pdpt); return 0; }
 
     # Zero all three pages
     memset(new_pml4, 0, 4096);

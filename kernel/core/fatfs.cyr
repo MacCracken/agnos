@@ -190,6 +190,7 @@ fn fatfs_open(name, namelen) {
             # Actually, just return a VFS fd with data pointing to a read buffer
             var cluster = load64(&result);
             var fsize = load64(&result + 8);
+            if (cluster < 2) { return 0 - 1; }
             # Read first cluster into data_buf
             var data_sector = fatfs_data_start + (cluster - 2) * fatfs_sectors_per_cluster;
             blk_read(data_sector, &fatfs_data_buf);
@@ -206,6 +207,7 @@ fn fatfs_open(name, namelen) {
 fn fatfs_read(cluster, buf, maxlen) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (cluster < 2) { return 0 - 1; }
+    if (buf == 0) { return 0 - 1; }
     var data_sector = fatfs_data_start + (cluster - 2) * fatfs_sectors_per_cluster;
     var r = blk_read(data_sector, buf);
     if (r != 0) { return 0 - 1; }

@@ -9,6 +9,8 @@ fn initrd_init(base) {
     if (load32(base) != 0x52444E49) { return 0 - 1; }
     initrd_base = base;
     initrd_count = load32(base + 4);
+    # Sanity check — prevent OOB reads on malformed initrd
+    if (initrd_count > 256) { initrd_count = 256; }
     return initrd_count;
 }
 
