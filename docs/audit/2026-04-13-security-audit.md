@@ -150,23 +150,36 @@ Tests: 4/4 passed
 
 ---
 
-## Remaining Items (Deferred)
+## Phase 4 Hardening (2026-04-13, fifth pass)
+
+ACPI infrastructure + IOMMU (S10) implemented:
+
+| # | Item | Files | Fix Applied |
+|---|---|---|---|
+| S10 | **IOMMU (VT-d)** | `kernel/core/acpi.cyr` (new), `kernel/arch/x86_64/iommu.cyr` (new), `kernel/agnos.cyr`, `kernel/core/main.cyr`, `kernel/core/virtio_blk.cyr` | Full ACPI table parsing: RSDP scan (EBDA + BIOS ROM), RSDT/XSDT walk, DMAR parsing for DRHD register base. VT-d IOMMU driver: MMIO register mapping, root/context/IO page table allocation, per-device context entries, DMA restricted to first 16MB (kernel identity-mapped region). Global + IOTLB invalidation. Translation enabled via GCMD.TE. VirtIO-blk dynamically allocated queue pages registered with IOMMU. Graceful fallback if no DMAR table present. |
+
+```
+Build: OK (260120 bytes)
+Tests: 4/4 passed
+```
+
+---
+
+## Remaining Items
 
 | # | Item | Severity | Status |
 |---|---|---|---|
-| S7 | KASLR | MEDIUM | Deferred — requires Cyrius compiler relocation/PIC support |
-| S10 | IOMMU (VT-d) | MEDIUM | Deferred — requires ACPI/DMAR parsing infrastructure |
-
-These items have external dependencies that cannot be resolved within the kernel alone.
+| S7 | KASLR | MEDIUM | Deferred — Cyrius compiler audit (CVE-07) tracks PIE/PIC for v4.4.0. Partial PIC codegen exists since v3.4.12. |
 
 ---
 
 ## Summary
 
 **Total findings**: 30+
-**Fixed**: 27 (S1-S6, S8-S9, S11-S13, plus 19 initial fixes)
-**Deferred**: 2 (S7 KASLR, S10 IOMMU)
-**Kernel size**: 239KB → 251KB (+5.3% for all security hardening)
+**Fixed**: 31 (S1-S6, S8-S10, S11-S13, plus 19 initial fixes)
+**Deferred**: 1 (S7 KASLR — blocked on Cyrius compiler v4.4.0 PIE support)
+**Kernel size**: 239KB → 260KB (+8.8% for all security hardening)
+**New files**: `kernel/core/acpi.cyr`, `kernel/arch/x86_64/iommu.cyr`
 
 ---
 

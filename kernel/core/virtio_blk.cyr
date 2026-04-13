@@ -52,6 +52,8 @@ fn virtio_blk_init() {
     if (vmm_is_mapped(page + 0x1000) == 0) { vmm_map(page + 0x1000, page + 0x1000, 0x83); }
     if (vmm_is_mapped(page + 0x2000) == 0) { vmm_map(page + 0x2000, page + 0x2000, 0x83); }
     vblk_qbase = page;
+    # S10: Register DMA region with IOMMU
+    iommu_register_dma(page);
 
     # Zero all 3 pages
     for (var i = 0; i < 512; i = i + 1) { store64(page + i * 8, 0); }

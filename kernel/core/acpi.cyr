@@ -1,0 +1,163 @@
+# === ACPI Table Parsing ===
+# Scans for RSDP, walks RSDT/XSDT, finds DMAR (DMA Remapping) table.
+# Used by the IOMMU driver (S10) to locate VT-d hardware units.
+
+var acpi_rsdp_addr = 0;
+var acpi_rsdt_addr = 0;
+var acpi_xsdt_addr = 0;
+var acpi_dmar_addr = 0;
+var acpi_dmar_len = 0;
+var acpi_iommu_base = 0;  # Physical address of first DRHD register set
+
+# Check 16-byte aligned address for RSDP signature "RSD PTR "
+fn acpi_check_rsdp(addr) {
+    if (load8(addr) != 0x52) { return 0; }      # 'R'
+    if (load8(addr + 1) != 0x53) { return 0; }  # 'S'
+    if (load8(addr + 2) != 0x44) { return 0; }  # 'D'
+    if (load8(addr + 3) != 0x20) { return 0; }  # ' '
+    if (load8(addr + 4) != 0x50) { return 0; }  # 'P'
+    if (load8(addr + 5) != 0x54) { return 0; }  # 'T'
+    if (load8(addr + 6) != 0x52) { return 0; }  # 'R'
+    if (load8(addr + 7) != 0x20) { return 0; }  # ' '
+    # Verify checksum (sum of first 20 bytes must be 0 mod 256)
+    var sum = 0;
+    for (var i = 0; i < 20; i = i + 1) {
+        sum = sum + load8(addr + i);
+    }
+    if ((sum & 0xFF) != 0) { return 0; }
+    return 1;
+}
+
+# Scan for RSDP in standard locations
+fn acpi_find_rsdp() {
+    # 1. Check EBDA (Extended BIOS Data Area) — pointer at 0x040E (segment)
+    var ebda_seg = load16(0x040E);
+    var ebda_base = ebda_seg * 16;
+    if (ebda_base > 0x80000) { ebda_base = 0x80000; }
+    if (ebda_base >= 0x1000) {
+        for (var addr = ebda_base; addr < ebda_base + 1024; addr = addr + 16) {
+            if (acpi_check_rsdp(addr) == 1) { return addr; }
+        }
+    }
+    # 2. Scan 0xE0000-0xFFFFF (BIOS ROM area)
+    for (var addr = 0xE0000; addr < 0x100000; addr = addr + 16) {
+        if (acpi_check_rsdp(addr) == 1) { return addr; }
+    }
+    return 0;
+}
+
+# Check if 4-byte ACPI table signature matches
+fn acpi_sig_match(table_addr, c0, c1, c2, c3) {
+    if (load8(table_addr) != c0) { return 0; }
+    if (load8(table_addr + 1) != c1) { return 0; }
+    if (load8(table_addr + 2) != c2) { return 0; }
+    if (load8(table_addr + 3) != c3) { return 0; }
+    return 1;
+}
+
+# Walk RSDT (32-bit pointers) to find a table by signature
+fn acpi_rsdt_find(rsdt, sig0, sig1, sig2, sig3) {
+    var len = load32(rsdt + 4);
+    # Validate length
+    if (len < 36) { return 0; }
+    if (len > 0x10000) { return 0; }
+    var entries = (len - 36) / 4;
+    for (var i = 0; i < entries; i = i + 1) {
+        var entry_addr = load32(rsdt + 36 + i * 4);
+        if (entry_addr != 0) {
+            if (acpi_sig_match(entry_addr, sig0, sig1, sig2, sig3) == 1) {
+                return entry_addr;
+            }
+        }
+    }
+    return 0;
+}
+
+# Walk XSDT (64-bit pointers) to find a table by signature
+fn acpi_xsdt_find(xsdt, sig0, sig1, sig2, sig3) {
+    var len = load32(xsdt + 4);
+    if (len < 36) { return 0; }
+    if (len > 0x10000) { return 0; }
+    var entries = (len - 36) / 8;
+    for (var i = 0; i < entries; i = i + 1) {
+        var entry_addr = load64(xsdt + 36 + i * 8);
+        if (entry_addr != 0) {
+            if (acpi_sig_match(entry_addr, sig0, sig1, sig2, sig3) == 1) {
+                return entry_addr;
+            }
+        }
+    }
+    return 0;
+}
+
+# Parse DMAR table to find first DRHD (DMA Remapping Hardware Unit Definition)
+# DMAR structure: signature(4) length(4) revision(1) checksum(1) oem(6) ...
+#   offset 36: host_address_width(1) flags(1) reserved(10)
+#   offset 48: remapping structures (variable-length entries)
+# DRHD entry: type(2)=0 length(2) flags(1) reserved(1) segment(2) register_base(8)
+fn acpi_parse_dmar(dmar) {
+    var dmar_len = load32(dmar + 4);
+    if (dmar_len < 48) { return 0; }
+    var offset = 48;
+    while (offset + 4 <= dmar_len) {
+        var entry_type = load16(dmar + offset);
+        var entry_len = load16(dmar + offset + 2);
+        if (entry_len < 4) { break; }  # Prevent infinite loop
+        if (entry_type == 0) {
+            # DRHD: DMA Remapping Hardware Unit Definition
+            # offset+4: flags(1), offset+5: reserved(1), offset+6: segment(2)
+            # offset+8: register_base_address(8)
+            var reg_base = load64(dmar + offset + 8);
+            if (reg_base != 0) {
+                return reg_base;
+            }
+        }
+        offset = offset + entry_len;
+    }
+    return 0;
+}
+
+fn acpi_init() {
+    acpi_rsdp_addr = 0;
+    acpi_rsdt_addr = 0;
+    acpi_xsdt_addr = 0;
+    acpi_dmar_addr = 0;
+    acpi_iommu_base = 0;
+
+    # Find RSDP
+    var rsdp = acpi_find_rsdp();
+    if (rsdp == 0) { return 0 - 1; }
+    acpi_rsdp_addr = rsdp;
+
+    # RSDP revision: 0 = ACPI 1.0 (RSDT only), >= 2 = ACPI 2.0+ (XSDT available)
+    var revision = load8(rsdp + 15);
+
+    # Read RSDT address (always present, 32-bit at offset 16)
+    acpi_rsdt_addr = load32(rsdp + 16);
+
+    # Try XSDT first if revision >= 2 (64-bit at offset 24)
+    if (revision >= 2) {
+        acpi_xsdt_addr = load64(rsdp + 24);
+    }
+
+    # Find DMAR table — try XSDT first, fall back to RSDT
+    # DMAR signature: 'D'=0x44, 'M'=0x4D, 'A'=0x41, 'R'=0x52
+    var dmar = 0;
+    if (acpi_xsdt_addr != 0) {
+        dmar = acpi_xsdt_find(acpi_xsdt_addr, 0x44, 0x4D, 0x41, 0x52);
+    }
+    if (dmar == 0) {
+        if (acpi_rsdt_addr != 0) {
+            dmar = acpi_rsdt_find(acpi_rsdt_addr, 0x44, 0x4D, 0x41, 0x52);
+        }
+    }
+
+    if (dmar != 0) {
+        acpi_dmar_addr = dmar;
+        acpi_dmar_len = load32(dmar + 4);
+        # Parse DMAR to find IOMMU register base
+        acpi_iommu_base = acpi_parse_dmar(dmar);
+    }
+
+    return 0;
+}

@@ -108,7 +108,7 @@ Implementation details in `docs/development/security-hardening.md`.
 | S7 | **KASLR** — randomize kernel load address; currently fixed at 0x100000, trivial ROP | Boot shim + relocatable binary | MEDIUM |
 | S8 | ~~**KPTI (Kernel Page Table Isolation)**~~ | Done (partial — PD entry 0 kept in user tables for trampoline/ISR; full isolation needs 4KB pages) | MEDIUM |
 | S9 | ~~**Spectre v2 mitigations**~~ | Done (IBRS set/clear on SYSCALL entry/exit; retpoline deferred to compiler) | MEDIUM |
-| S10 | **IOMMU (VT-d)** — restrict DMA targets so VirtIO devices cannot write arbitrary physical memory | PCI + ACPI/DMAR parsing | MEDIUM |
+| S10 | ~~**IOMMU (VT-d)**~~ | Done (ACPI RSDP/RSDT/DMAR parsing + VT-d root/context/IO page tables + DMA restricted to first 16MB) | MEDIUM |
 | S11 | ~~**ARP request tracking**~~ | Done | LOW |
 | S12 | ~~**TCP window/sequence validation**~~ | Done | LOW |
 | S13 | ~~**Stack canaries**~~ | Done (RDRAND-based secret, manual in ksyscall/elf_load/net_handle_tcp) | LOW |

@@ -77,10 +77,37 @@ heap_init();
 serial_println("Heap initialized", 16);
 dev_init();
 serial_println("Devices registered", 18);
+# Parse ACPI tables (RSDP, RSDT, DMAR) for hardware discovery
+acpi_init();
+if (acpi_rsdp_addr != 0) {
+    serial_print("ACPI: RSDP at ", 14);
+    kprint_num(acpi_rsdp_addr);
+    serial_println("", 0);
+    if (acpi_dmar_addr != 0) {
+        serial_print("ACPI: DMAR at ", 14);
+        kprint_num(acpi_dmar_addr);
+        serial_print(" IOMMU base=", 12);
+        kprint_num(acpi_iommu_base);
+        serial_println("", 0);
+    }
+} else {
+    serial_println("ACPI: no RSDP found", 19);
+}
+
 pci_scan();
 serial_print("PCI: ", 5);
 kprint_num(pci_count);
 serial_println(" devices", 8);
+
+# Initialize IOMMU if DMAR table found (S10: restrict DMA)
+if (acpi_iommu_base != 0) {
+    if (iommu_init() == 0) {
+        serial_println("IOMMU: VT-d enabled, DMA restricted", 36);
+    } else {
+        serial_println("IOMMU: init failed", 18);
+    }
+}
+
 if (pci_find(0x1AF4, 0x1000) >= 0) {
     if (virtio_net_init() == 0) {
         serial_print("VirtIO-net: MAC=", 16);

@@ -1,0 +1,223 @@
+# === Intel VT-d IOMMU (DMA Remapping) ===
+# Restricts DMA so PCI devices can only access explicitly permitted memory regions.
+# Requires ACPI DMAR table (parsed by acpi.cyr) to locate IOMMU hardware.
+#
+# VT-d register layout (MMIO, base from DMAR DRHD):
+#   0x00: VER (version)              0x08: CAP (capability)
+#   0x10: ECAP (extended capability) 0x18: GCMD (global command)
+#   0x1C: GSTS (global status)       0x20: RTADDR (root table address)
+#   0x24: CCMD (context command)     0x28: FSTS (fault status)
+#   0x38: FECTL (fault event ctl)    0x58: IQH (invalidation queue head)
+#   0x60: IQT (invalidation queue tail)
+#
+# Translation structure hierarchy:
+#   Root Table (4KB, 256 entries for buses 0-255)
+#     -> Context Table (4KB, 256 entries for devfn 0-255)
+#       -> IO Page Table (4KB, 512 entries per level, like CPU page tables)
+
+var iommu_base = 0;       # MMIO base address (virtual = physical, identity-mapped)
+var iommu_active = 0;
+var iommu_root_table = 0; # Physical address of root entry table
+var iommu_ctx_table = 0;  # Physical address of context entry table (bus 0)
+var iommu_iot_l2 = 0;     # Level-2 IO page table (like PD)
+
+# VT-d register read/write (32-bit MMIO)
+fn iommu_read32(off) {
+    return load32(iommu_base + off);
+}
+
+fn iommu_write32(off, val) {
+    store32(iommu_base + off, val);
+    return 0;
+}
+
+fn iommu_read64(off) {
+    return load64(iommu_base + off);
+}
+
+fn iommu_write64(off, val) {
+    store64(iommu_base + off, val);
+    return 0;
+}
+
+# Wait for a global status bit to be set/clear
+fn iommu_wait_status(bit, val) {
+    var timeout = 0;
+    while (timeout < 1000000) {
+        var gsts = iommu_read32(0x1C);
+        if (val == 1) {
+            if ((gsts & bit) != 0) { return 0; }
+        } else {
+            if ((gsts & bit) == 0) { return 0; }
+        }
+        timeout = timeout + 1;
+    }
+    return 0 - 1;  # Timeout
+}
+
+# Map the IOMMU MMIO registers into kernel address space.
+# Follows the same pattern as apic_init() — allocate a PD for the high address.
+fn iommu_map_mmio(phys_base) {
+    # IOMMU registers are typically at a high physical address (e.g., 0xFED90000).
+    # We need to map the 2MB region containing this address.
+    var pdpt_idx = (phys_base >> 30) & 0x1FF;
+    var pd_idx = (phys_base >> 21) & 0x1FF;
+
+    # Check if PDPT entry exists for this region
+    var pdpte = load64(0x2000 + pdpt_idx * 8);
+    var pd_addr = 0;
+    if ((pdpte & 1) != 0) {
+        pd_addr = pdpte & 0xFFFFFFFFF000;
+    } else {
+        # Allocate a new PD for this PDPT entry
+        pd_addr = pmm_alloc();
+        if (pd_addr == 0) { return 0 - 1; }
+        memset(pd_addr, 0, 4096);
+        store64(0x2000 + pdpt_idx * 8, pd_addr | 0x03);
+    }
+
+    # Map the 2MB region containing the IOMMU registers
+    var phys_2mb = phys_base & 0xFFFFFFFFFFE00000;
+    store64(pd_addr + pd_idx * 8, phys_2mb | 0x83);  # Present + Writable + 2MB
+
+    # Flush TLB
+    asm { mov rax, cr3; }
+    asm { mov cr3, rax; }
+
+    return 0;
+}
+
+# Build a single IO page table entry allowing DMA to a 4KB-aligned physical region.
+# For simplicity with 2MB pages: we use "large page" entries (bit 7) in the
+# second-level page table, similar to CPU huge pages.
+# VT-d second-level entry format (2MB): phys_addr | 0x83 (Read+Write+SuperPage)
+
+# Allow DMA to a 2MB-aligned physical region
+fn iommu_allow_dma_2mb(phys) {
+    if (iommu_iot_l2 == 0) { return 0 - 1; }
+    var idx = (phys >> 21) & 0x1FF;
+    var phys_2mb = phys & 0xFFFFFFFFFFE00000;
+    # Second-level PDE: Read(0x01) + Write(0x02) + SuperPage(0x80) = 0x83
+    store64(iommu_iot_l2 + idx * 8, phys_2mb | 0x83);
+    return 0;
+}
+
+# Set up context entry for a PCI device (bus:slot:func) pointing to our IO page tables.
+# Context entry: 128 bits (two 64-bit words).
+#   Lo: Present(1) + FPD(1) + Translation Type(2) + reserved + ASR(address space root)
+#   Hi: Address Width(3) + Avail(4) + reserved + Domain ID(16)
+fn iommu_set_context(bus, slot, func) {
+    if (iommu_ctx_table == 0) { return 0 - 1; }
+    if (bus != 0) { return 0 - 1; }  # Only bus 0 supported for now
+    var devfn = (slot << 3) | func;
+    var ctx_entry = iommu_ctx_table + devfn * 16;
+
+    # Lo: Present=1, Translation Type=0 (full translation), ASR = IO page table
+    # The ASR points to the second-level PML4-equivalent. For a 3-level walk
+    # (39-bit AGAW), ASR points to a "PML4" which has a single entry pointing
+    # to our iommu_iot_l2 (the "PD" level).
+    # We use a 2-level walk (30-bit, AGAW=1) for simplicity with 2MB pages.
+    # Lo = ASR | Present(1)
+    # ASR is the 4KB-aligned physical address of the second-level page table root.
+    var asr = iommu_iot_l2;
+    store64(ctx_entry, (asr & 0xFFFFFFFFF000) | 0x01);
+
+    # Hi: Address Width = 1 (30-bit AGAW, 2-level page table), Domain ID = 1
+    # Bits [2:0] = Address Width (1 = 30-bit), Bits [23:8] = Domain ID
+    store64(ctx_entry + 8, 0x0101);  # AW=1, DomainID=1
+
+    return 0;
+}
+
+fn iommu_init() {
+    iommu_active = 0;
+    if (acpi_iommu_base == 0) { return 0 - 1; }
+
+    # Map IOMMU MMIO registers
+    iommu_base = acpi_iommu_base;
+    if (iommu_map_mmio(iommu_base) != 0) { return 0 - 1; }
+
+    # Read version
+    var ver = iommu_read32(0x00);
+    if (ver == 0) { return 0 - 1; }
+    if (ver == 0xFFFFFFFF) { return 0 - 1; }
+
+    # Read capabilities
+    var cap = iommu_read64(0x08);
+
+    # Allocate root entry table (4KB, 256 entries x 16 bytes)
+    iommu_root_table = pmm_alloc();
+    if (iommu_root_table == 0) { return 0 - 1; }
+    memset(iommu_root_table, 0, 4096);
+
+    # Allocate context entry table for bus 0 (4KB, 256 entries x 16 bytes)
+    iommu_ctx_table = pmm_alloc();
+    if (iommu_ctx_table == 0) { return 0 - 1; }
+    memset(iommu_ctx_table, 0, 4096);
+
+    # Root entry [0] (bus 0): Present + pointer to context table
+    store64(iommu_root_table, (iommu_ctx_table & 0xFFFFFFFFF000) | 0x01);
+    store64(iommu_root_table + 8, 0);
+
+    # Allocate second-level IO page table (like a PD for 2MB pages)
+    iommu_iot_l2 = pmm_alloc();
+    if (iommu_iot_l2 == 0) { return 0 - 1; }
+    memset(iommu_iot_l2, 0, 4096);
+
+    # By default, allow DMA to the first 16MB (kernel identity-mapped region).
+    # This covers all static VirtIO DMA buffers in kernel BSS.
+    for (var i = 0; i < 8; i = i + 1) {
+        iommu_allow_dma_2mb(i * 0x200000);
+    }
+
+    # Set context entries for known PCI devices (VirtIO)
+    for (var i = 0; i < pci_count; i = i + 1) {
+        var slot = load64(&pci_devs + i * 32);
+        iommu_set_context(0, slot, 0);
+    }
+
+    # Program root table address register
+    iommu_write64(0x20, iommu_root_table & 0xFFFFFFFFF000);
+
+    # Set root table type in GCMD and flush
+    # GCMD: bit 30 = SRTP (Set Root Table Pointer)
+    iommu_write32(0x18, iommu_read32(0x18) | (1 << 30));
+    iommu_wait_status(1 << 30, 1);  # Wait for RTPS (Root Table Pointer Status)
+
+    # Invalidate context cache (global)
+    # CCMD: bit 63 = ICC (Invalidate Context Cache), bits [62:61] = 01 (global)
+    iommu_write64(0x28, (1 << 63) | (1 << 61));
+    var timeout = 0;
+    while (timeout < 1000000) {
+        if ((iommu_read64(0x28) & (1 << 63)) == 0) { break; }
+        timeout = timeout + 1;
+    }
+
+    # Invalidate IOTLB (global)
+    # ECAP tells us the IOTLB register offset
+    var ecap = iommu_read64(0x10);
+    var iro = ((ecap >> 8) & 0x3FF) * 16;  # IOTLB Register Offset
+    if (iro != 0) {
+        # IOTLB invalidate register at iro+8: bit 63 = IVT, bits [62:60] = 001 (global)
+        iommu_write64(iommu_base + iro + 8, (1 << 63) | (1 << 60));
+        timeout = 0;
+        while (timeout < 1000000) {
+            if ((iommu_read64(iommu_base + iro + 8) & (1 << 63)) == 0) { break; }
+            timeout = timeout + 1;
+        }
+    }
+
+    # Enable translation: GCMD bit 31 = TE (Translation Enable)
+    iommu_write32(0x18, iommu_read32(0x18) | (1 << 31));
+    iommu_wait_status(1 << 31, 1);  # Wait for TES (Translation Enable Status)
+
+    iommu_active = 1;
+    return 0;
+}
+
+# Register a DMA region for a specific PCI slot (for dynamically allocated buffers)
+fn iommu_register_dma(phys) {
+    if (iommu_active == 0) { return 0; }
+    iommu_allow_dma_2mb(phys);
+    return 0;
+}
