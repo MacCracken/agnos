@@ -2,7 +2,11 @@ name: Release
 
 on:
   push:
-    tags: ['[0-9]*']
+    # Accept both `v1.2.3` and `1.2.3` tag styles. The version-verify
+    # step normalizes to `1.2.3` and matches against VERSION.
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
@@ -21,24 +25,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify version consistency
+      - name: Verify version
         run: |
           FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
-          TOML_VERSION=$(grep '^version' cyrius.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          TAG_VERSION="${GITHUB_REF_NAME}"
-          if [ "$FILE_VERSION" != "$TAG_VERSION" ]; then
-            echo "ERROR: VERSION ($FILE_VERSION) != tag ($TAG_VERSION)"
-            exit 1
-          fi
-          if [ "$TOML_VERSION" != "$TAG_VERSION" ]; then
-            echo "ERROR: cyrius.toml ($TOML_VERSION) != tag ($TAG_VERSION)"
-            exit 1
-          fi
-          echo "Version verified: $TAG_VERSION"
+          TAG="${GITHUB_REF_NAME#v}"   # strip optional leading 'v'
+          echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "tag ($TAG) is not semver x.y.z"; exit 1; }
+          [ "$FILE_VERSION" = "$TAG" ] || {
+            echo "VERSION ($FILE_VERSION) != tag ($TAG)"; exit 1; }
+          echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
           echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
@@ -65,8 +64,8 @@ jobs:
 
       - name: Extract changelog
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          BODY=$(awk "/^## \\[$VERSION\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
+          TAG="${GITHUB_REF_NAME#v}"
+          BODY=$(awk "/^## \\[$TAG\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
           if [ -z "$BODY" ]; then
             BODY="No changelog entry for this release."
           fi
@@ -74,12 +73,12 @@ jobs:
 
       - name: Create source archive
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${GITHUB_REF_NAME#v}"
           git archive --format=tar.gz --prefix="agnos-${TAG}/" -o "agnos-${TAG}-src.tar.gz" HEAD
 
       - name: Generate checksums
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${GITHUB_REF_NAME#v}"
           sha256sum agnos-x86_64 > SHA256SUMS
           if [ -f agnos-aarch64 ]; then sha256sum agnos-aarch64 >> SHA256SUMS; fi
           sha256sum "agnos-${TAG}-src.tar.gz" >> SHA256SUMS
@@ -110,14 +109,18 @@ jobs:
         with:
           name: release-binaries
 
+      - name: Resolve clean tag (strip optional 'v')
+        id: tag
+        run: echo "clean=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          name: "AGNOS ${{ github.ref_name }}"
+          name: "AGNOS ${{ steps.tag.outputs.clean }}"
           body_path: release-body.md
-          prerelease: ${{ startsWith(github.ref_name, '0.') }}
+          prerelease: ${{ startsWith(steps.tag.outputs.clean, '0.') }}
           files: |
             agnos-x86_64
             agnos-aarch64
-            agnos-${{ github.ref_name }}-src.tar.gz
+            agnos-${{ steps.tag.outputs.clean }}-src.tar.gz
             SHA256SUMS

@@ -3,9 +3,10 @@
 # Supports: x86_64 (default), aarch64 (--aarch64), both (--all)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CYRIUS_HOME="${CYRIUS_HOME:-$HOME/.cyrius}"
-CC="$CYRIUS_HOME/bin/cc3"
-CC_ARM="$CYRIUS_HOME/bin/cc3_aarch64"
 CYRB="$CYRIUS_HOME/bin/cyrius"
+# cc5_aarch64 existence is the gate for aarch64 cross-compile; cyrius
+# wrapper invokes it internally — we never call cc5/cc5_aarch64 directly.
+CC_ARM="$CYRIUS_HOME/bin/cc5_aarch64"
 pass=0
 fail=0
 
@@ -22,14 +23,15 @@ check() {
 test_x86() {
     echo "=== AGNOS Kernel Tests [x86_64] ==="
 
-    # Build kernel (requires cyrius for multi-file includes)
-    # cyrius looks for cc3 at ./build/cc3 relative to CWD
+    # Build kernel (requires cyrius for multi-file includes).
+    # `-D ARCH_X86_64` does not propagate into nested #ifdef blocks, so
+    # we still prepend `#define ARCH_X86_64` to a temp source.
     mkdir -p $ROOT/build
     rm -f $ROOT/build/agnos_test
     if [ -x "$CYRB" ]; then
         PREPPED="$ROOT/build/agnos_prepped.cyr"
         (echo '#define ARCH_X86_64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
-        (cd "$ROOT/kernel" && "$CYRB" build "$PREPPED" $ROOT/build/agnos_test) 2>&1
+        (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" $ROOT/build/agnos_test) 2>&1
         rm -f "$PREPPED"
     else
         echo "ERROR: cyrius not found at $CYRB" >&2
@@ -62,9 +64,9 @@ exit(0 if ok else 1)
         check "x86 size reasonable (${SZ}B)" "0" "1"
     fi
 
-    # Build kernel_hello
+    # Build kernel_hello via cyrius (cc5 wants a managed entry, not raw stdin)
     if [ -f "$ROOT/kernel/kernel_hello.cyr" ]; then
-        cat "$ROOT/kernel/kernel_hello.cyr" | "$CC" > $ROOT/build/kernel_hello_test 2>/dev/null
+        "$CYRB" build --no-deps "$ROOT/kernel/kernel_hello.cyr" $ROOT/build/kernel_hello_test >/dev/null 2>&1
         check "x86 kernel_hello builds" "0" "$?"
     fi
 
@@ -79,9 +81,14 @@ test_aarch64() {
         return
     fi
 
-    # Build kernel (aarch64 kernel has x86 inline asm — expected to fail until ported)
-    (cat "$ROOT/kernel/agnos.cyr" | "$CC_ARM" > /tmp/agnos_arm_test 2>/dev/null) 2>/dev/null
+    # Build kernel via cyrius wrapper (cross-compile mode). cd into
+    # kernel/ so relative `include "arch/..."` paths resolve.
+    mkdir -p $ROOT/build
+    PREPPED_ARM="$ROOT/build/agnos_arm_prepped.cyr"
+    (echo '#define ARCH_AARCH64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
+    (cd "$ROOT/kernel" && "$CYRB" build --aarch64 --no-deps "$PREPPED_ARM" /tmp/agnos_arm_test >/dev/null 2>&1)
     rc=$?
+    rm -f "$PREPPED_ARM"
     if [ "$rc" = "0" ]; then
         check "aarch64 kernel compiles" "0" "0"
 

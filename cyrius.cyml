@@ -1,0 +1,18 @@
+[package]
+name = "agnos"
+version = "${file:VERSION}"
+description = "Sovereign operating system kernel"
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/agnos"
+language = "cyrius"
+cyrius = "5.7.12"
+
+[build]
+entry = "kernel/agnos.cyr"
+output = "build/agnos"
+
+# AGNOS is a freestanding kernel binary. It vendors a syscall-free kernel
+# stdlib in kernel/lib/ (kstring, kfmt) and links nothing from the host
+# Cyrius stdlib. No external Cyrius deps — `cyrius deps` is a no-op here.
+[deps]
+stdlib = []

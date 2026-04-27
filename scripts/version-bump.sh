@@ -28,29 +28,23 @@ fi
 echo "Bumping $OLD -> $NEW"
 updated=""
 
-# 1. VERSION file (source of truth)
+# 1. VERSION file (source of truth — cyrius.cyml reads this via ${file:VERSION})
 echo "$NEW" > "$ROOT/VERSION"
 updated="$updated  VERSION\n"
 
-# 2. cyrius.toml
-if [ -f "$ROOT/cyrius.toml" ]; then
-    sed -i "s/version = \"$OLD\"/version = \"$NEW\"/" "$ROOT/cyrius.toml"
-    updated="$updated  cyrius.toml\n"
-fi
-
-# 3. CLAUDE.md
+# 2. CLAUDE.md
 if [ -f "$ROOT/CLAUDE.md" ]; then
     sed -i "s/- \*\*Version\*\*: $OLD/- **Version**: $NEW/" "$ROOT/CLAUDE.md"
     updated="$updated  CLAUDE.md\n"
 fi
 
-# 4. kernel/agnos.cyr (comment)
+# 3. kernel/agnos.cyr (comment)
 if [ -f "$ROOT/kernel/agnos.cyr" ]; then
     sed -i "s/AGNOS kernel v$OLD/AGNOS kernel v$NEW/" "$ROOT/kernel/agnos.cyr"
     updated="$updated  kernel/agnos.cyr\n"
 fi
 
-# 5. kernel/core/main.cyr — serial_println with auto-computed length
+# 4. kernel/core/main.cyr — serial_println with auto-computed length
 #    "AGNOS kernel vX.Y.Z" = 15 + len(version)
 if [ -f "$ROOT/kernel/core/main.cyr" ]; then
     KSTR="AGNOS kernel v$NEW"
@@ -59,7 +53,7 @@ if [ -f "$ROOT/kernel/core/main.cyr" ]; then
     updated="$updated  kernel/core/main.cyr ($KSTR, $KLEN)\n"
 fi
 
-# 6. kernel/arch/aarch64/main.cyr — serial_println with auto-computed length
+# 5. kernel/arch/aarch64/main.cyr — serial_println with auto-computed length
 #    "AGNOS kernel vX.Y.Z [aarch64]" = 26 + len(version)
 if [ -f "$ROOT/kernel/arch/aarch64/main.cyr" ]; then
     ASTR="AGNOS kernel v$NEW [aarch64]"
@@ -68,7 +62,7 @@ if [ -f "$ROOT/kernel/arch/aarch64/main.cyr" ]; then
     updated="$updated  kernel/arch/aarch64/main.cyr ($ASTR, $ALEN)\n"
 fi
 
-# 7. kernel/user/shell.cyr — serial_println with auto-computed length
+# 6. kernel/user/shell.cyr — serial_println with auto-computed length
 #    "AGNOS shell vX.Y.Z (type 'help')" = 27 + len(version)
 if [ -f "$ROOT/kernel/user/shell.cyr" ]; then
     SSTR="AGNOS shell v$NEW (type 'help')"
@@ -77,7 +71,7 @@ if [ -f "$ROOT/kernel/user/shell.cyr" ]; then
     updated="$updated  kernel/user/shell.cyr ($SSTR, $SLEN)\n"
 fi
 
-# 8. CHANGELOG.md — add new version section after [Unreleased]
+# 7. CHANGELOG.md — add new version section after [Unreleased]
 if [ -f "$ROOT/CHANGELOG.md" ]; then
     if ! grep -q "## \[$NEW\]" "$ROOT/CHANGELOG.md"; then
         sed -i "/## \[Unreleased\]/a\\
@@ -87,7 +81,7 @@ if [ -f "$ROOT/CHANGELOG.md" ]; then
     updated="$updated  CHANGELOG.md\n"
 fi
 
-# 9. docs/development/roadmap.md — update Current header
+# 8. docs/development/roadmap.md — update Current header
 if [ -f "$ROOT/docs/development/roadmap.md" ]; then
     sed -i -E "s|> \*\*Current\*\*: v[0-9]+\.[0-9]+\.[0-9]+|> **Current**: v$NEW|" "$ROOT/docs/development/roadmap.md"
     updated="$updated  docs/development/roadmap.md\n"
@@ -99,7 +93,7 @@ printf "$updated"
 
 # Verify — check for any remaining OLD version references (excluding CHANGELOG history)
 echo ""
-STALE=$(grep -rn "$OLD" "$ROOT/VERSION" "$ROOT/cyrius.toml" "$ROOT/CLAUDE.md" "$ROOT/kernel/agnos.cyr" "$ROOT/kernel/core/main.cyr" "$ROOT/kernel/arch/aarch64/main.cyr" "$ROOT/kernel/user/shell.cyr" 2>/dev/null || true)
+STALE=$(grep -rn "$OLD" "$ROOT/VERSION" "$ROOT/CLAUDE.md" "$ROOT/kernel/agnos.cyr" "$ROOT/kernel/core/main.cyr" "$ROOT/kernel/arch/aarch64/main.cyr" "$ROOT/kernel/user/shell.cyr" 2>/dev/null || true)
 if [ -n "$STALE" ]; then
     echo "WARNING: stale $OLD references found:"
     echo "$STALE"

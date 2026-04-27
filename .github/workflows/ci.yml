@@ -21,7 +21,9 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          # cyrius.cyml's `cyrius = "..."` line is the toolchain pin
+          # (kybernet convention — there is no separate .cyrius-toolchain).
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
           echo "Installing Cyrius $CYRIUS_VERSION"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
@@ -54,7 +56,7 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
@@ -65,16 +67,16 @@ jobs:
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
 
       - name: Format check
+        # Files with `#ifdef` inside function bodies can't satisfy both
+        # the formatter (wants indentation) and the preprocessor
+        # (needs column 0). Skip those with the SKIP list.
         run: |
           FAIL=0
-          # Files with #ifdef inside function bodies can't satisfy both
-          # cyrfmt (wants indentation) and the preprocessor (needs column 0).
           SKIP="kernel/user/shell.cyr"
           for f in $(find kernel -name '*.cyr'); do
             [ -f "$f" ] || continue
             echo "$SKIP" | grep -q "$(basename $f)" && continue
-            cyrfmt "$f" > /tmp/fmt_check
-            if ! diff -q "$f" /tmp/fmt_check >/dev/null 2>&1; then
+            if ! diff -q <(cyrius fmt "$f" --check 2>/dev/null) "$f" >/dev/null 2>&1; then
               echo "  NEEDS FORMAT: $f"
               FAIL=1
             fi
@@ -117,7 +119,7 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
@@ -149,7 +151,7 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
@@ -200,7 +202,7 @@ jobs:
 
       - name: Install Cyrius toolchain
         run: |
-          CYRIUS_VERSION="${CYRIUS_VERSION:-$(cat .cyrius-toolchain | tr -d '[:space:]')}"
+          CYRIUS_VERSION="${CYRIUS_VERSION:-$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)}"
           curl -sLO "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           tar xzf "cyrius-$CYRIUS_VERSION-x86_64-linux.tar.gz"
           CYRIUS_DIR="cyrius-$CYRIUS_VERSION-x86_64-linux"
@@ -246,15 +248,16 @@ jobs:
           exit $MISSING
 
       - name: Verify version consistency
+        # cyrius.cyml resolves its version from VERSION via `${file:VERSION}`,
+        # so the only authoritative version is the VERSION file. Assert the
+        # kernel source + CHANGELOG carry the same string.
         run: |
           VERSION=$(cat VERSION | tr -d '[:space:]')
-          TOML_VERSION=$(grep '^version' cyrius.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          echo "VERSION file:  $VERSION"
-          echo "cyrius.toml:   $TOML_VERSION"
-          if [ "$VERSION" != "$TOML_VERSION" ]; then
-            echo "FAIL: VERSION ($VERSION) != cyrius.toml ($TOML_VERSION)"
-            exit 1
-          fi
-          grep -q "$VERSION" kernel/agnos.cyr || { echo "FAIL: version not in kernel source"; exit 1; }
-          grep -q "$VERSION" CHANGELOG.md || { echo "FAIL: version not in changelog"; exit 1; }
+          echo "VERSION file: $VERSION"
+          grep -q "version = \"\${file:VERSION}\"" cyrius.cyml || {
+            echo "FAIL: cyrius.cyml does not resolve version from VERSION file"; exit 1; }
+          grep -q "$VERSION" kernel/agnos.cyr || {
+            echo "FAIL: version not in kernel source"; exit 1; }
+          grep -q "$VERSION" CHANGELOG.md || {
+            echo "FAIL: version not in changelog"; exit 1; }
           echo "Version consistent: $VERSION"

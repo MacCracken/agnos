@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.22.0 — x86_64 + aarch64, 260KB/57KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU
+> **Current**: v1.23.0 — x86_64 + aarch64, 260KB/57KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 

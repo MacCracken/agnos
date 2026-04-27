@@ -48,11 +48,13 @@ check "version in kernel" $?
 grep -q "$VERSION" "$ROOT/CHANGELOG.md" 2>/dev/null
 check "version in changelog" $?
 
-# Binary size sanity
+# Binary size sanity. cc5 (cyrius 5.x) emits more code than cc3 did
+# under the previous toolchain (~250KB vs ~110KB at v1.22.0); upper
+# bound widened to 350KB to leave headroom without becoming a no-op.
 echo ""
 echo "--- Binary ---"
 SZ=$(wc -c < "$ROOT/build/agnos")
-test "$SZ" -gt 50000 && test "$SZ" -lt 150000
+test "$SZ" -gt 50000 && test "$SZ" -lt 350000
 check "binary size ($SZ bytes)" $?
 
 echo ""

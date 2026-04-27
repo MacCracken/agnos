@@ -169,7 +169,7 @@ Common:
 ## Requirements
 
 - Linux x86_64
-- Cyrius >= 3.9.8 (`cyrius` build tool from `cyrius` repo)
+- Cyrius 5.7.12 (`cyrius` build tool — toolchain pin in `cyrius.cyml`)
 - QEMU (`qemu-system-x86_64`, `qemu-system-aarch64`) for testing
 
 ## License

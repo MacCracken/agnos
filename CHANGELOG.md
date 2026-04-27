@@ -5,6 +5,48 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.23.0] — 2026-04-27
+
+**Cyrius toolchain bump 3.9.8 → 5.7.12.** Aligns AGNOS with kybernet's
+toolchain pin so the whole base-OS stack tracks one Cyrius release.
+
+### Changed
+- **Toolchain**: Cyrius 3.9.8 → 5.7.12 (skipped 4.x line entirely; cc3 → cc5)
+- **Manifest**: `cyrius.toml` → `cyrius.cyml`. Package version now resolved
+  from `VERSION` via `${file:VERSION}` templating — no in-place version edit
+  needed in the manifest. Toolchain pin lives on the manifest's
+  `cyrius = "5.7.12"` line (kybernet convention).
+- **`scripts/build.sh` / `scripts/test.sh`**: only invoke `cyrius build` —
+  no direct `cc5` / `cc5_aarch64` calls. Existence of `cc5_aarch64` still
+  gates the aarch64 path. `--no-deps` flag passed since `[deps]` is empty.
+- **CI (`ci.yml`)**: format check switched from raw `cyrfmt` to
+  `cyrius fmt --check`; toolchain version read from `cyrius.cyml`.
+  Documentation job no longer cross-checks `cyrius.toml` (file removed) and
+  asserts `version = "${file:VERSION}"` in `cyrius.cyml` instead.
+- **Release (`release.yml`)**: tag matcher accepts `1.2.3` or `v1.2.3`
+  (kybernet shape); release artifacts and changelog use the stripped
+  semver form regardless.
+- **`scripts/version-bump.sh`**: 9 files → 8 files (cyrius.cyml is
+  templated, no edit). Stale-reference grep no longer scans `cyrius.toml`.
+- **`scripts/check.sh`**: kernel binary upper bound 150KB → 350KB. cc5
+  emits more code than cc3 did (~250KB at v1.23.0 vs ~110KB at v1.22.0
+  under cc3); previous bound would have made the gate a no-op.
+- **`README.md`, `CLAUDE.md`**: documented `owl` (.cyr viewer) and `cyim`
+  (.cyr editor) as the canonical .cyr file tools — no `cat`/`sed` on
+  Cyrius sources during development.
+
+### Removed
+- `cyrius.toml` — superseded by `cyrius.cyml`.
+- `.cyrius-toolchain` — toolchain pin now lives only in `cyrius.cyml`
+  (single source of truth, matches kybernet).
+
+### Verified
+- `scripts/build.sh` (x86_64): 248,720 B, multiboot magic 0x1badb002,
+  entry 0x100060.
+- `scripts/build.sh --aarch64`: 95,136 B (ARM aarch64 ELF).
+- `scripts/check.sh`: 11/11 PASS.
+- `scripts/test.sh --all`: 7/7 PASS (4 x86_64 + 3 aarch64).
+
 ## [1.22.0] — 2026-04-13
 
 ### Added

@@ -6,9 +6,9 @@
 
 - **Type**: Bare-metal kernel binary (Cyrius language)
 - **License**: GPL-3.0-only
-- **Version**: 1.22.0
-- **Language**: Cyrius (self-hosting)
-- **Cyrius**: >= 3.9.8 (`cyrius` build tool)
+- **Version**: 1.23.0
+- **Language**: Cyrius 5.7.12 (via `~/.cyrius/bin/cyrius`, `cyriusly use 5.7.12`)
+- **Tools**: `owl` to read .cyr files, `cyim` to write/edit .cyr files
 - **Target**: x86_64 + aarch64 (cross-compilation supported)
 
 ## Goal
@@ -46,23 +46,34 @@ kybernet (PID 1)
 - **sigil** — cryptographic signatures
 - **patra** — networking primitives
 
-IMPORTANT: Always use `cyrius build` — never raw `cc3`. The `cyrius` tool resolves
-deps from `cyrius.toml` and auto-prepends includes. Raw `cc3` is only for compiler
-self-hosting and bootstrap chain work.
+IMPORTANT: Always go through `cyrius build` — never invoke `cc5` / `cc5_aarch64`
+directly. The `cyrius` wrapper resolves includes, manages dep resolution from
+`cyrius.cyml`, and dispatches to the right backend. Direct `cc5` is reserved
+for the Cyrius repo's own bootstrap/self-host work.
+
+Editing rule: read `.cyr` files with `owl` (a watchful viewer that knows
+Cyrius syntax) and write/edit `.cyr` files with `cyim` (atomic edits, batch
+mode, expect-assertions). Never `cat` a `.cyr` directly when reading; never
+`sed` a `.cyr` in place when editing.
 
 ## Build
 
-Requires Cyrius >= 3.9.8 (`cyrius` build tool) from `~/.cyrius/bin/`.
-Install via `install.sh` or manage versions with `cyriusly`.
+Requires Cyrius 5.7.12 (`~/.cyrius/bin/cyrius`). The toolchain pin lives
+in `cyrius.cyml` (`cyrius = "5.7.12"`); switch the active version with
+`cyriusly use 5.7.12`. The kernel is a freestanding binary — `cyrius.cyml`
+declares an empty `[deps]` block, so `cyrius deps` is a no-op (no host
+stdlib is linked into the kernel).
+
+`cyrius build -D NAME` does not propagate into nested `#ifdef` blocks reached
+via `include`, so `scripts/build.sh` prepends `#define ARCH_X86_64` /
+`#define ARCH_AARCH64` to a temp source before invoking `cyrius build`.
 
 ```sh
 # x86_64 (default)
 sh scripts/build.sh
-# or: cyrius build -D ARCH_X86_64 kernel/agnos.cyr build/agnos
 
 # aarch64 cross-compile
 sh scripts/build.sh --aarch64
-# or: cyrius build -D ARCH_AARCH64 --aarch64 kernel/agnos.cyr build/agnos-aarch64
 
 # Boot on QEMU (x86_64)
 qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
@@ -106,9 +117,8 @@ agnos/
 │   ├── test.sh              # Run kernel tests
 │   ├── bench.sh             # Benchmark runner
 │   ├── check.sh             # 11-point project validation
-│   └── version-bump.sh      # Automated version management (9 files)
-├── cyrius.toml              # Project metadata (version, build config)
-├── .cyrius-toolchain        # Pinned toolchain version for CI
+│   └── version-bump.sh      # Automated version management (8 files)
+├── cyrius.cyml              # Project manifest (version=${file:VERSION}, cyrius=5.7.12, build, deps)
 └── .github/workflows/
     ├── ci.yml               # 7 jobs: build, check, security, test, boot, bench, docs
     └── release.yml          # Tag → CI gate → build → changelog → release
@@ -119,19 +129,19 @@ agnos/
 **VERSION** file is the single source of truth. Use `version-bump.sh` for all version changes:
 
 ```sh
-sh scripts/version-bump.sh 1.22.0
+sh scripts/version-bump.sh 1.23.0
 ```
 
-This updates 9 files atomically:
-1. `VERSION` — source of truth
-2. `cyrius.toml` — package version
-3. `CLAUDE.md` — project identity
-4. `kernel/agnos.cyr` — comment header
-5. `kernel/core/main.cyr` — boot banner `serial_println` (auto-computes byte length)
-6. `kernel/arch/aarch64/main.cyr` — aarch64 boot banner (auto-computes byte length)
-7. `kernel/user/shell.cyr` — shell prompt banner (auto-computes byte length)
-8. `CHANGELOG.md` — adds new version section with date
-9. `docs/development/roadmap.md` — updates Current header
+This updates 8 files atomically (cyrius.cyml pulls version via `${file:VERSION}`
+templating, so it doesn't need an in-place edit):
+1. `VERSION` — source of truth (cyrius.cyml reads this via `${file:VERSION}`)
+2. `CLAUDE.md` — project identity
+3. `kernel/agnos.cyr` — comment header
+4. `kernel/core/main.cyr` — boot banner `serial_println` (auto-computes byte length)
+5. `kernel/arch/aarch64/main.cyr` — aarch64 boot banner (auto-computes byte length)
+6. `kernel/user/shell.cyr` — shell prompt banner (auto-computes byte length)
+7. `CHANGELOG.md` — adds new version section with date
+8. `docs/development/roadmap.md` — updates Current header
 
 **Never manually edit version strings** — the `serial_println` calls have hardcoded byte lengths that must match the string. The script computes these automatically.
 
