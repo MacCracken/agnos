@@ -5,11 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.25.1] — 2026-04-27
+
 ## [1.25.0] — 2026-04-27
 
 **ACPI identity-map fix + documentation refresh.** Closes the
 post-`Devices registered` boot stall diagnosed in
-`docs/development/proposals/2026-04-27-acpi-identity-map-ceiling.md`
+`docs/development/proposals/archive/2026-04-27-acpi-identity-map-ceiling.md`
 (Path A). v1.24.2 was abandoned mid-flight — its doc-only changes
 fold into this release alongside the kernel fix.
 

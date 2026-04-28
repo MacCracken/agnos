@@ -166,7 +166,7 @@ jobs:
         # resolved). `-cpu max` is required because the boot shim's
         # CR4 OR-mask (0x300020) sets SMEP+SMAP, which the default
         # qemu64 CPU lacks. Real silicon since Haswell/Ryzen supports
-        # both. See proposals/2026-04-27-cc5-kernel-boot-shim-regression.md.
+        # both. See proposals/archive/2026-04-27-cc5-kernel-boot-shim-regression.md.
         #
         # v1.25.0: assertion tightened from `"AGNOS"` (matches the
         # boot banner from line 1 — useless, the previous `1.24.x`
@@ -175,7 +175,7 @@ jobs:
         # requires ACPI + PCI + IOMMU + syscall + scheduler-test all
         # to run, so any ACPI-class regression like the v1.22.0
         # identity-map-ceiling bug
-        # (proposals/2026-04-27-acpi-identity-map-ceiling.md) cannot
+        # (proposals/archive/2026-04-27-acpi-identity-map-ceiling.md) cannot
         # pass CI green now.
         run: |
           set -e

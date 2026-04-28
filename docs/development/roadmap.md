@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.25.0 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.19.
+> **Current**: v1.25.1 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.19.
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 
@@ -91,7 +91,7 @@ boots clean under cyrius 5.7.19 + `-cpu max`).
 Binary: 248,720 B → 248,848 B (+128 B for the extra PD entries +
 PDPT writes). Boot output now reaches `"Scheduler test done. Timer
 ticks: 154"` past the previous triple-fault point. Closes proposal
-[`2026-04-27-acpi-identity-map-ceiling.md`](proposals/2026-04-27-acpi-identity-map-ceiling.md).
+[`2026-04-27-acpi-identity-map-ceiling.md`](proposals/archive/2026-04-27-acpi-identity-map-ceiling.md).
 
 ## Active
 
@@ -168,7 +168,7 @@ S4, S5, S7, S10-S13 are independent
 ## Hygiene (post-v1.25.0; non-blocking)
 
 Surfaced by the cyrius v5.7.19 build review (closes the
-[boot-shim regression proposal](proposals/2026-04-27-cc5-kernel-boot-shim-regression.md)).
+[boot-shim regression proposal](proposals/archive/2026-04-27-cc5-kernel-boot-shim-regression.md)).
 H1 + H2 shipped in v1.24.1; only H3 remains and is cyrius-side.
 
 | # | Item | Why | Fix |
