@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.24.0 — x86_64 + aarch64, 260KB/57KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU
+> **Current**: v1.24.1 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.19.
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 
@@ -55,6 +55,31 @@ For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 | 30 | CI/release uses .cyrius-toolchain (no hardcoded version) | v1.21.0 |
 | 31 | Toolchain rename: cyrb→cyrius, cc2→cc3 across all scripts/docs | v1.21.0 |
 
+## Completed (v1.24.0)
+
+| # | Item | Version |
+|---|------|---------|
+| 32 | Cyrius toolchain bump 3.9.8 → 5.7.19 (skipped cc4 entirely) | v1.24.0 |
+| 33 | Manifest migration `cyrius.toml` → `cyrius.cyml` (`${file:VERSION}` templating) | v1.24.0 |
+| 34 | Removed `.cyrius-toolchain` — pin lives only in `cyrius.cyml` (kybernet convention) | v1.24.0 |
+| 35 | CI install delegates to upstream `install.sh` release asset (no hand-rolled curl/tar) | v1.24.0 |
+| 36 | Boot regression fixed via cyrius v5.7.19 kmode emit-order swap (top-level asm before gvar inits) | v1.24.0 |
+| 37 | QEMU Boot Test job removed `continue-on-error: true`; asserts on serial banner | v1.24.0 |
+| 38 | `-cpu max` documented as required (boot shim sets SMEP+SMAP in CR4) | v1.24.0 |
+
+Binary size delta vs v1.22.0 peak: **−11 KB** (260 KB → 248,720 B). Same source,
+cc5's pass-2 dead-code reporter eliminates ~24 KB of unreachable functions.
+
+## Completed (v1.24.1)
+
+| # | Item | Version |
+|---|------|---------|
+| 39 | H1: comment on `kernel/agnos.cyr` boot-shim include citing cc5 v5.7.19 kmode invariant | v1.24.1 |
+| 40 | H2: annotated `kernel/arch/x86_64/boot_shim.cyr` raw asm bytes with mnemonics + 12-step boot sequence header | v1.24.1 |
+
+Comments-only patch, zero behavioral change (kernel binary still 248,720 B,
+boots clean under cyrius 5.7.19 + `-cpu max`).
+
 ## Active
 
 | # | Item | Notes |
@@ -62,6 +87,7 @@ For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 | 1 | SMP AP wakeup on real hardware | Currently QEMU-validated only |
 | 2 | Tagged unions for VFS entry types | ktagged.cyr kernel stdlib |
 | 3 | Struct refactor with #derive(accessors) | proc_table, vfs_table, pci_devs |
+| 4 | **Investigate post-"Devices registered" hang** | Boot reaches "Devices registered" then stalls before subsystem init completes. Repros under cyrius v5.7.19 with `-cpu max`. **Don't pre-attribute to cc5** — last cc5 regression biased me to assume codegen, but I never tested 1.22.0 booted past this checkpoint either. Bisect plan: (a) `-d cpu_reset,int` to distinguish fault-loop vs CPU-pegged loop; (b) comment out `acpi_init()` and rebuild to see whether `pci_scan()` runs; (c) repro on cc3-era pre-toolchain-bump code at the 1.22.0 tag if `cyriusly` still has a usable cc3. Only open a cyrius-side investigation if (a–c) localize to a function whose source looks correct but whose codegen is wrong. Tracked separately from H1–H3. |
 
 ## Multi-Architecture (Complete)
 
@@ -126,15 +152,14 @@ S2 (per-CPU TSS)
 S4, S5, S7, S10-S13 are independent
 ```
 
-## Hygiene (post-v1.24.0; non-blocking)
+## Hygiene (post-v1.24.1; non-blocking)
 
 Surfaced by the cyrius v5.7.19 build review (closes the
 [boot-shim regression proposal](proposals/2026-04-27-cc5-kernel-boot-shim-regression.md)).
+H1 + H2 shipped in v1.24.1; only H3 remains and is cyrius-side.
 
 | # | Item | Why | Fix |
 |---|------|-----|-----|
-| H1 | `kernel/agnos.cyr:65` boot-shim include site lacks an explicit comment citing the cyrius v5.7.19 kmode emit-order invariant | The include is inside `#ifdef ARCH_X86_64`. It works post-v5.7.19 but a future reader can't tell from the code alone WHY this placement matters. The proposal called it "documentation-worthy". | Add a one-line comment above the `include "kernel/arch/x86_64/boot_shim.cyr"` referencing the cyrius v5.7.19 kmode swap and gate 4ab. ~3 lines of comment, zero behavioral change. |
-| H2 | `kernel/arch/x86_64/boot_shim.cyr` is hand-encoded raw asm bytes with no inline comments mapping bytes to mnemonics | Hygiene only — the proposal noted "while debugging this regression would have been easier with disassembled comments, that's a hygiene item, not a correctness fix." Future debugging of CPU-mode transitions reads bytes-to-mnemonics; without comments, every reader does the lookup from scratch. | Annotate the byte sequence inline. e.g. `bc 00 00 20 00  # mov esp, 0x200000`, `ba f9 03 00 00  # mov edx, 0x3F9 (UART scratch)`, etc. Validate by re-reading against an Intel SDM Vol 2 reference. |
 | H3 | `~/.cyrius/bin/cyrius` driver shim can fall behind the active version snapshot (e.g. v5.7.19 active but `bin/cyrius` is from an earlier version). cc5 itself stays current via the install-snapshot copy, so builds work, but the driver mismatch is a footgun. | Local-developer hygiene only. The CI workflow always reinstalls fresh from `cyrius.cyml`'s pin so CI is unaffected. | No agnos-side fix — point this at cyrius for a `~/.cyrius/bin/cyrius` symlink-to-current pattern in cyrius's `version-bump.sh` install snapshot. Or document the manual fix: `ln -sf ../versions/$(cat ~/.cyrius/current)/bin/cyrius ~/.cyrius/bin/cyrius`. |
 
 ## Planned

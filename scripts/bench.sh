@@ -34,7 +34,7 @@ else
 fi
 
 echo "Booting on QEMU (15s timeout)..."
-OUTPUT=$(timeout 15 qemu-system-x86_64 -kernel $ROOT/build/agnos_bench -serial stdio -display none -no-reboot 2>/dev/null | tr -d '\0' || true)
+OUTPUT=$(timeout 15 qemu-system-x86_64 -kernel $ROOT/build/agnos_bench -cpu max -serial stdio -display none -no-reboot 2>/dev/null | tr -d '\0' || true)
 
 COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)

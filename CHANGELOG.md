@@ -5,6 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.24.1] — 2026-04-27
+
+Comments-only patch closing H1 + H2 from the post-v1.24.0 hygiene list.
+Kernel binary unchanged at 248,720 B; same `-cpu max` boot path.
+
+### Changed
+- `kernel/agnos.cyr` — added a 6-line comment above the `boot_shim.cyr`
+  include site explaining the cc5 v5.7.19 kmode==1 emit-order invariant
+  (top-level asm before gvar inits) and pointing at the regression
+  proposal. Future readers can tell from the code alone WHY the include
+  must stay where it is.
+- `kernel/arch/x86_64/boot_shim.cyr` — annotated the hand-encoded raw
+  asm bytes with mnemonic comments + a 12-step header walking through
+  the multiboot1-32-bit → 64-bit-long-mode transition (UART init, page
+  tables, CR4/CR3/EFER/CR0, GDT build, far jump, segment reload, 64-bit
+  stack). Each byte sequence is now self-documenting against Intel SDM.
+
+H3 (the `~/.cyrius/bin/cyrius` driver-shim staleness footgun) remains
+open as a cyrius-side ask — not actionable from agnos.
+
 ## [1.24.0] — 2026-04-27
 
 ## [1.23.0] — 2026-04-27
