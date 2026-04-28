@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.24.0] — 2026-04-27
+
 ## [1.23.0] — 2026-04-27
 
 **Cyrius toolchain bump 3.9.8 → 5.7.12.** Aligns AGNOS with kybernet's

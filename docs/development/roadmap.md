@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.23.0 — x86_64 + aarch64, 260KB/57KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU
+> **Current**: v1.24.0 — x86_64 + aarch64, 260KB/57KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 
@@ -125,6 +125,17 @@ S2 (per-CPU TSS)
 
 S4, S5, S7, S10-S13 are independent
 ```
+
+## Hygiene (post-v1.24.0; non-blocking)
+
+Surfaced by the cyrius v5.7.19 build review (closes the
+[boot-shim regression proposal](proposals/2026-04-27-cc5-kernel-boot-shim-regression.md)).
+
+| # | Item | Why | Fix |
+|---|------|-----|-----|
+| H1 | `kernel/agnos.cyr:65` boot-shim include site lacks an explicit comment citing the cyrius v5.7.19 kmode emit-order invariant | The include is inside `#ifdef ARCH_X86_64`. It works post-v5.7.19 but a future reader can't tell from the code alone WHY this placement matters. The proposal called it "documentation-worthy". | Add a one-line comment above the `include "kernel/arch/x86_64/boot_shim.cyr"` referencing the cyrius v5.7.19 kmode swap and gate 4ab. ~3 lines of comment, zero behavioral change. |
+| H2 | `kernel/arch/x86_64/boot_shim.cyr` is hand-encoded raw asm bytes with no inline comments mapping bytes to mnemonics | Hygiene only — the proposal noted "while debugging this regression would have been easier with disassembled comments, that's a hygiene item, not a correctness fix." Future debugging of CPU-mode transitions reads bytes-to-mnemonics; without comments, every reader does the lookup from scratch. | Annotate the byte sequence inline. e.g. `bc 00 00 20 00  # mov esp, 0x200000`, `ba f9 03 00 00  # mov edx, 0x3F9 (UART scratch)`, etc. Validate by re-reading against an Intel SDM Vol 2 reference. |
+| H3 | `~/.cyrius/bin/cyrius` driver shim can fall behind the active version snapshot (e.g. v5.7.19 active but `bin/cyrius` is from an earlier version). cc5 itself stays current via the install-snapshot copy, so builds work, but the driver mismatch is a footgun. | Local-developer hygiene only. The CI workflow always reinstalls fresh from `cyrius.cyml`'s pin so CI is unaffected. | No agnos-side fix — point this at cyrius for a `~/.cyrius/bin/cyrius` symlink-to-current pattern in cyrius's `version-bump.sh` install snapshot. Or document the manual fix: `ln -sf ../versions/$(cat ~/.cyrius/current)/bin/cyrius ~/.cyrius/bin/cyrius`. |
 
 ## Planned
 
