@@ -1,6 +1,6 @@
 # Issue: `cyrius fmt` tracks `{` / `}` inside `#` comment lines, producing false-positive indentation requests
 
-**Status**: open — agnos has a local-workaround; needs upstream fix in cyrius
+**Status**: **resolved** — cyrius v5.7.22 ships the fix (programs/cyrfmt.cyr brace counter now skips `#` comments + `"..."` strings). agnos can revert the local prose-rewrite workaround once toolchain pin bumps to v5.7.22; gate 4ae in cyrius `scripts/check.sh` locks the invariant.
 **Date**: 2026-04-27
 **Affects**: any `.cyr` file whose top-level comments contain literal
             `{` or `}` characters (e.g. quoting an `asm { … }` block

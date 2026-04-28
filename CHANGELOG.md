@@ -5,6 +5,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.26.1] — 2026-04-27
+
+**Cyrius pin 5.7.19 → 5.7.22.** Closes both remaining post-v1.24.0
+hygiene items (formatter brace-in-comments + driver-shim
+symlink staleness). The braces-in-comments fix in particular lets
+agnos restore the natural `# … `var x = y; asm { mov cr3, rax; }`
+…` doc-comment phrasing across `kernel/core/proc.cyr`,
+`kernel/core/main.cyr`, and `kernel/arch/x86_64/keyboard.cyr`.
+
+### Changed
+- **`cyrius.cyml`**: pin 5.7.19 → 5.7.22.
+- **`kernel/core/proc.cyr` + `kernel/core/main.cyr`**: reverted the
+  v1.26.0 prose-rewrite workaround for the formatter braces bug.
+  Comments now describe the historical pattern naturally with
+  `asm { … }` syntax, since cyrius v5.7.22's formatter no longer
+  tracks `{` / `}` characters inside `#` comments.
+- **`kernel/arch/x86_64/keyboard.cyr`**: latent over-indentation on
+  the scancode-table line for `]` `}` (line 119) — caused by the
+  v5.7.21-and-earlier formatter mis-tracking the `{` in the previous
+  line's `# [ {` comment — re-formatted via `cyrius fmt`. The new
+  formatter correctly leaves it at depth-1 (4 spaces).
+- **Resolved issue archived**:
+  `docs/development/issue/2026-04-27-cyrius-fmt-tracks-braces-in-comments.md`
+  → `docs/development/issue/archive/`.
+- **Hygiene H3** (driver-shim symlink staleness) closed upstream in
+  cyrius v5.7.22's `version-bump.sh` install-snapshot — agnos
+  inherits the fix passively via the pin bump.
+
+### Notes
+- `kernel/user/shell.cyr` stays on the format-skip list. It carries
+  `#ifdef … #endif` *inside function bodies* (not comments) — a
+  different family of issue from braces-in-comments. v5.7.22 didn't
+  address that one; tracked separately if/when it surfaces a real
+  problem.
+
+### Verified
+- `scripts/build.sh` (x86_64): 247,816 B (unchanged from v1.26.0 —
+  comments don't affect codegen, scancode-table re-indent doesn't
+  change emitted bytes).
+- Full kernel format scan (`for f in kernel/**/*.cyr; cyrius fmt
+  $f --check`): **PASS** with only `kernel/user/shell.cyr` on the
+  SKIP list.
+- Boot under `-cpu max -serial stdio` reaches `Userland exec
+  complete` and runs through the bench harness to `=== done ===`.
+- `scripts/check.sh`: 11/11 PASS.
+
 ## [1.26.0] — 2026-04-27
 
 **`cr3_load` helper + investigations on residual issues #6 / #7.**

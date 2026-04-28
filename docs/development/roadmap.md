@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.26.0 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.19.
+> **Current**: v1.26.1 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.22.
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 
@@ -191,15 +191,11 @@ S2 (per-CPU TSS)
 S4, S5, S7, S10-S13 are independent
 ```
 
-## Hygiene (post-v1.25.0; non-blocking)
+## Hygiene (post-v1.26.1)
 
-Surfaced by the cyrius v5.7.19 build review (closes the
-[boot-shim regression proposal](proposals/archive/2026-04-27-cc5-kernel-boot-shim-regression.md)).
-H1 + H2 shipped in v1.24.1; only H3 remains and is cyrius-side.
-
-| # | Item | Why | Fix |
-|---|------|-----|-----|
-| H3 | `~/.cyrius/bin/cyrius` driver shim can fall behind the active version snapshot (e.g. v5.7.19 active but `bin/cyrius` is from an earlier version). cc5 itself stays current via the install-snapshot copy, so builds work, but the driver mismatch is a footgun. | Local-developer hygiene only. The CI workflow always reinstalls fresh from `cyrius.cyml`'s pin so CI is unaffected. | No agnos-side fix — point this at cyrius for a `~/.cyrius/bin/cyrius` symlink-to-current pattern in cyrius's `version-bump.sh` install snapshot. Or document the manual fix: `ln -sf ../versions/$(cat ~/.cyrius/current)/bin/cyrius ~/.cyrius/bin/cyrius`. |
+H1 shipped in v1.24.1, H2 shipped in v1.24.1, H3 closed upstream
+in cyrius v5.7.22 and inherited by agnos via the v1.26.1 pin bump.
+No open hygiene items.
 
 ## Planned
 

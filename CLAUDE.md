@@ -6,7 +6,7 @@
 
 - **Type**: Bare-metal kernel binary (Cyrius language)
 - **License**: GPL-3.0-only
-- **Version**: 1.26.0
+- **Version**: 1.26.1
 - **Language**: Cyrius 5.7.19 (via `~/.cyrius/bin/cyrius`, `cyriusly use 5.7.19`)
 - **Tools**: `owl` to read .cyr files, `cyim` to write/edit .cyr files
 - **Target**: x86_64 + aarch64 (cross-compilation supported)

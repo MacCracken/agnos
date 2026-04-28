@@ -1,6 +1,6 @@
 # === 64-bit Cyrius kernel code ===
 
-serial_println("AGNOS kernel v1.26.0", 20);
+serial_println("AGNOS kernel v1.26.1", 20);
 serial_println("64-bit long mode", 16);
 
 gdt_init();
@@ -315,10 +315,9 @@ proc_map_page(as2, 0xC00000, phys2);
 
 # Write different values via each address space. cr3_load() is a helper
 # in proc.cyr that loads its parameter into CR3 via [rbp-8] — robust
-# under cc5's regalloc, unlike the older "assign-then-asm" pattern
-# (assign AS to a local, then inline asm reads RAX to write to CR3),
-# which relied on cc3-era codegen leaving the assigned value in RAX.
-# See docs/development/issue/2026-04-27-cr3-load-helper.md.
+# under cc5's regalloc, unlike the pre-v1.26.0 `var x = y; asm { mov
+# cr3, rax }` pattern which relied on cc3-era codegen leaving the
+# assigned value in RAX. See docs/development/issue/2026-04-27-cr3-load-helper.md.
 
 # Switch to AS1, write 0xAAAA to 0xC00000
 cr3_load(as1);
