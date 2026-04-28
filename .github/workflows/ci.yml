@@ -162,23 +162,39 @@ jobs:
 
       - name: QEMU boot test
         # v1.24.0: drop `continue-on-error: true` (was masking the
-        # 1.23.0 boot regression that the cyrius v5.7.19 kmode-emit
-        # fix resolved). `-cpu max` is required because the boot
-        # shim's CR4 OR-mask (0x300020) sets SMEP+SMAP, which the
-        # default qemu64 CPU model lacks — writing those bits triple-
-        # faults at the cr4 store. Real silicon since Haswell/Ryzen
-        # supports both. See:
-        # docs/development/proposals/2026-04-27-cc5-kernel-boot-shim-regression.md
+        # 1.23.0 boot regression that cyrius v5.7.19 kmode-emit fix
+        # resolved). `-cpu max` is required because the boot shim's
+        # CR4 OR-mask (0x300020) sets SMEP+SMAP, which the default
+        # qemu64 CPU lacks. Real silicon since Haswell/Ryzen supports
+        # both. See proposals/2026-04-27-cc5-kernel-boot-shim-regression.md.
+        #
+        # v1.25.0: assertion tightened from `"AGNOS"` (matches the
+        # boot banner from line 1 — useless, the previous `1.24.x`
+        # banner printed even though the kernel triple-faulted ten
+        # lines later) to `"Scheduler test done"`. That checkpoint
+        # requires ACPI + PCI + IOMMU + syscall + scheduler-test all
+        # to run, so any ACPI-class regression like the v1.22.0
+        # identity-map-ceiling bug
+        # (proposals/2026-04-27-acpi-identity-map-ceiling.md) cannot
+        # pass CI green now.
         run: |
           set -e
-          timeout 10 qemu-system-x86_64 \
+          timeout 12 qemu-system-x86_64 \
             -kernel build/agnos \
             -cpu max \
             -serial stdio \
             -display none \
             -no-reboot 2>&1 | tee build/boot_output.log || true
-          grep -q "AGNOS" build/boot_output.log
-          echo "PASS: kernel boots"
+          # Serial log includes UART init bytes that grep classifies as
+          # binary; -a forces text mode so the assertions actually fire.
+          grep -aq "AGNOS kernel v" build/boot_output.log || {
+            echo "FAIL: kernel did not print boot banner"; exit 1; }
+          grep -aq "Scheduler test done" build/boot_output.log || {
+            echo "FAIL: kernel did not reach scheduler-test checkpoint"
+            echo "--- last 20 lines of serial ---"
+            tail -20 build/boot_output.log
+            exit 1; }
+          echo "PASS: kernel boots through scheduler test"
 
   # ── Benchmarks ──
   benchmarks:

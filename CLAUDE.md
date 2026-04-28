@@ -6,8 +6,8 @@
 
 - **Type**: Bare-metal kernel binary (Cyrius language)
 - **License**: GPL-3.0-only
-- **Version**: 1.24.1
-- **Language**: Cyrius 5.7.12 (via `~/.cyrius/bin/cyrius`, `cyriusly use 5.7.12`)
+- **Version**: 1.25.0
+- **Language**: Cyrius 5.7.19 (via `~/.cyrius/bin/cyrius`, `cyriusly use 5.7.19`)
 - **Tools**: `owl` to read .cyr files, `cyim` to write/edit .cyr files
 - **Target**: x86_64 + aarch64 (cross-compilation supported)
 
@@ -17,8 +17,8 @@ A sovereign kernel written entirely in Cyrius. No C, no Rust, no LLVM. Assembly 
 
 ## Consumers
 
-- kybernet (v1.0.1) — PID 1 helmsman, boots on AGNOS
-- argonaut (v1.2.0) — init/service manager, 5 boot modes
+- kybernet (v1.0.2) — PID 1 helmsman, boots on AGNOS
+- argonaut (v1.5.0) — init/service manager, 5 boot modes
 - AGNOS userland tools — shell, services
 - Cyrius language project — proves the language handles kernel code
 
@@ -29,12 +29,14 @@ userland boot stack is:
 
 ```
 kybernet (PID 1)
-├── agnosys v0.97.2   — syscall bindings (20 modules, zero deps)
-├── agnostik v0.97.1  — shared types/primitives (12 modules, zero deps)
-├── argonaut v1.2.0   — service lifecycle, health, seccomp/Landlock
-│   └── libro v1.0.3  — cryptographic audit chain
+├── agnosys v1.0.2    — syscall bindings (Linux x86_64 wrappers)
+├── agnostik v1.0.0   — shared types/primitives (error/security/agent)
+├── argonaut v1.5.0   — service lifecycle, health, seccomp/Landlock
+│   └── libro v2.0.5  — cryptographic audit chain (8 modules)
 └── stdlib x21        — string, fmt, alloc, json, sakshi, etc.
 ```
+Pinned tags (kybernet's `cyrius.cyml`): agnosys 1.0.2, agnostik 1.0.0,
+libro 2.0.5, argonaut 1.5.0.
 
 ### Cyrius Standard Library (key modules)
 
@@ -58,9 +60,9 @@ mode, expect-assertions). Never `cat` a `.cyr` directly when reading; never
 
 ## Build
 
-Requires Cyrius 5.7.12 (`~/.cyrius/bin/cyrius`). The toolchain pin lives
-in `cyrius.cyml` (`cyrius = "5.7.12"`); switch the active version with
-`cyriusly use 5.7.12`. The kernel is a freestanding binary — `cyrius.cyml`
+Requires Cyrius 5.7.19 (`~/.cyrius/bin/cyrius`). The toolchain pin lives
+in `cyrius.cyml` (`cyrius = "5.7.19"`); switch the active version with
+`cyriusly use 5.7.19`. The kernel is a freestanding binary — `cyrius.cyml`
 declares an empty `[deps]` block, so `cyrius deps` is a no-op (no host
 stdlib is linked into the kernel).
 
@@ -101,16 +103,19 @@ agnos/
 │   ├── arch/
 │   │   ├── x86_64/          # 14 files: boot, gdt, idt, tss, pic, apic, timer,
 │   │   │                    #   keyboard, paging, serial, syscall, smp, pci, virtio
-│   │   └── aarch64/         # 8 files: boot, gic, timer, serial, paging, stubs, etc.
-│   ├── core/                # 17 files: pmm, vmm, heap, proc, scheduler, syscall,
-│   │                        #   vfs, initrd, net, elf, fatfs, pci, virtio, signals, etc.
-│   └── user/                # 3 files: shell, init, test_procs
+│   │   └── aarch64/         # 9 files: boot, gic, timer, serial, paging, stubs, etc.
+│   ├── core/                # 18 files: pmm, vmm, heap, proc, scheduler, syscall,
+│   │                        #   vfs, initrd, net, elf, fatfs, pci, virtio, signals, acpi
+│   └── user/                # 4 files: shell, init, test_procs, test
 ├── build/                   # Generated binaries (gitignored)
 ├── docs/
 │   ├── architecture/        # System diagrams, subsystem docs
+│   ├── audit/               # Security audits (2026-04-13)
 │   └── development/
 │       ├── roadmap.md       # Kernel-specific roadmap
+│       ├── proposals/       # Date-stamped design proposals
 │       ├── kybernet-bridge.md
+│       ├── security-hardening.md
 │       └── syscall-additions.md
 ├── scripts/
 │   ├── build.sh             # Build kernel (multi-arch)
@@ -118,7 +123,7 @@ agnos/
 │   ├── bench.sh             # Benchmark runner
 │   ├── check.sh             # 11-point project validation
 │   └── version-bump.sh      # Automated version management (8 files)
-├── cyrius.cyml              # Project manifest (version=${file:VERSION}, cyrius=5.7.12, build, deps)
+├── cyrius.cyml              # Project manifest (version=${file:VERSION}, cyrius=5.7.19, build, deps)
 └── .github/workflows/
     ├── ci.yml               # 7 jobs: build, check, security, test, boot, bench, docs
     └── release.yml          # Tag → CI gate → build → changelog → release

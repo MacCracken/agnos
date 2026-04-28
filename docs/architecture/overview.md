@@ -1,6 +1,6 @@
 # AGNOS Kernel Architecture
 
-> v1.21.0 — Multi-arch (x86_64 + aarch64), 26 syscalls, 220KB/57KB binary, 106 tests
+> v1.25.0 — Multi-arch (x86_64 + aarch64), 26 syscalls, 243KB/93KB binary, 106 tests. Built with cyrius 5.7.19. Identity-maps 0–4 GB so QEMU's ACPI tables (~0x07FE0000) are reachable.
 
 ## Boot Sequence
 
@@ -12,7 +12,7 @@ BIOS/UEFI -> GRUB/QEMU multiboot1 loader
     -> Identity page tables (4 levels, 2MB huge pages)
     -> Enable PAE -> set CR3 -> enable LME in EFER -> enable paging
     -> Load 64-bit GDT -> far jump to 64-bit code
-      -> Cyrius kernel main() (cyrius build -D ARCH_X86_64)
+      -> Cyrius kernel main() (sh scripts/build.sh — wraps cyrius build with #define ARCH_X86_64)
         -> Serial I/O (COM1), GDT+TSS, IDT, PIC, Local APIC
         -> Page tables, PMM, VMM, kernel heap
         -> Process table, scheduler, SYSCALL/SYSRET
@@ -31,7 +31,7 @@ qemu-system-aarch64 -M virt
     -> PL011 UART serial init
     -> GIC interrupt controller init
     -> ARM generic timer init
-    -> Cyrius kernel main() (cyrius build -D ARCH_AARCH64 --aarch64)
+    -> Cyrius kernel main() (sh scripts/build.sh --aarch64)
       -> PMM, kernel heap
       -> Boots to serial output on QEMU -M virt
 ```
@@ -41,7 +41,7 @@ qemu-system-aarch64 -M virt
 ```
 0x000000 - 0x001000  Real-mode IVT (unused)
 0x001000 - 0x005000  Page tables (PML4, PDPT, PD, PT)
-0x100000 - 0x136000  Kernel code + data (~220KB x86_64)
+0x100000 - 0x13D000  Kernel code + data (~243KB x86_64; 248,848 B at v1.25.0)
 0x200000 - 0x1000000 Available physical memory (2MB - 16MB)
 0xFEE00000           Local APIC MMIO
 ```
@@ -86,7 +86,7 @@ qemu-system-aarch64 -M virt
 │  GDT (5 seg + TSS)            │  Serial (COM1 0x3F8)    │
 ├─────────────────────────────────────────────────────────┤
 │                  Boot Shim (32->64)                      │
-│               Multiboot1 (ELF32, 220KB)                  │
+│               Multiboot1 (ELF32, 243KB)                  │
 └─────────────────────────────────────────────────────────┘
 ```
 

@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.24.1 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.19.
+> **Current**: v1.25.0 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.19.
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 
@@ -80,6 +80,19 @@ cc5's pass-2 dead-code reporter eliminates ~24 KB of unreachable functions.
 Comments-only patch, zero behavioral change (kernel binary still 248,720 B,
 boots clean under cyrius 5.7.19 + `-cpu max`).
 
+## Completed (v1.25.0)
+
+| # | Item | Version |
+|---|------|---------|
+| 41 | Identity-map ceiling 16 MB → 4 GB in `pt_init` (PD covers 0–1 GB at 2 MB granularity, PDPT[1..3] hold 1 GB huge pages for 1–4 GB). Closes the latent v1.22.0 ACPI fault — RSDT walk at QEMU's ~0x07FE0000 region now succeeds | v1.25.0 |
+| 42 | CI QEMU Boot Test assertion tightened from `grep -q "AGNOS"` (line 1, useless) to `grep -q "Scheduler test done"` (post-ACPI/PCI/IOMMU/scheduler checkpoint) | v1.25.0 |
+| 43 | v1.24.2 abandoned — its doc-only edits (README, CLAUDE.md, overview.md) folded into v1.25.0 alongside the kernel fix | v1.25.0 |
+
+Binary: 248,720 B → 248,848 B (+128 B for the extra PD entries +
+PDPT writes). Boot output now reaches `"Scheduler test done. Timer
+ticks: 154"` past the previous triple-fault point. Closes proposal
+[`2026-04-27-acpi-identity-map-ceiling.md`](proposals/2026-04-27-acpi-identity-map-ceiling.md).
+
 ## Active
 
 | # | Item | Notes |
@@ -87,7 +100,7 @@ boots clean under cyrius 5.7.19 + `-cpu max`).
 | 1 | SMP AP wakeup on real hardware | Currently QEMU-validated only |
 | 2 | Tagged unions for VFS entry types | ktagged.cyr kernel stdlib |
 | 3 | Struct refactor with #derive(accessors) | proc_table, vfs_table, pci_devs |
-| 4 | **Investigate post-"Devices registered" hang** | Boot reaches "Devices registered" then stalls before subsystem init completes. Repros under cyrius v5.7.19 with `-cpu max`. **Don't pre-attribute to cc5** — last cc5 regression biased me to assume codegen, but I never tested 1.22.0 booted past this checkpoint either. Bisect plan: (a) `-d cpu_reset,int` to distinguish fault-loop vs CPU-pegged loop; (b) comment out `acpi_init()` and rebuild to see whether `pci_scan()` runs; (c) repro on cc3-era pre-toolchain-bump code at the 1.22.0 tag if `cyriusly` still has a usable cc3. Only open a cyrius-side investigation if (a–c) localize to a function whose source looks correct but whose codegen is wrong. Tracked separately from H1–H3. |
+| 5 | **Memory isolation test triple-faults under live timer interrupts** | New surface exposed by v1.25.0's ACPI fix. `kernel/core/main.cyr` does `mov cr3, rax` to switch into per-process AS1/AS2 page tables that only map a single test page (0xC00000) plus PD[0] for ISR/trampoline (partial KPTI from v1.22.0). With interrupts enabled, the timer ISR fires, runs in the user CR3, and faults dereferencing kernel data at ~0x219C43A9 (well above PD[0]'s 0–2 MB range). Either the test should disable interrupts around the cr3 dance, or the per-process page tables need to mirror more of the kernel's mappings (full KPTI). Pre-existing — was hidden behind the ACPI hang. |
 
 ## Multi-Architecture (Complete)
 
@@ -152,7 +165,7 @@ S2 (per-CPU TSS)
 S4, S5, S7, S10-S13 are independent
 ```
 
-## Hygiene (post-v1.24.1; non-blocking)
+## Hygiene (post-v1.25.0; non-blocking)
 
 Surfaced by the cyrius v5.7.19 build review (closes the
 [boot-shim regression proposal](proposals/2026-04-27-cc5-kernel-boot-shim-regression.md)).

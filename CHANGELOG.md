@@ -5,6 +5,65 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.25.0] — 2026-04-27
+
+**ACPI identity-map fix + documentation refresh.** Closes the
+post-`Devices registered` boot stall diagnosed in
+`docs/development/proposals/2026-04-27-acpi-identity-map-ceiling.md`
+(Path A). v1.24.2 was abandoned mid-flight — its doc-only changes
+fold into this release alongside the kernel fix.
+
+### Fixed
+- **Latent v1.22.0 paging bug — `kernel/arch/x86_64/paging.cyr` `pt_init`**:
+  identity-map ceiling raised from 16 MB (8 × 2 MB PD entries) to 4 GB.
+  PD at 0x3000 now fully populated (512 × 2 MB = 1 GB) via a single-line
+  loop bound change (`i < 8` → `i < 512`). PDPT[1..3] additionally seeded
+  with 1 GB huge pages (PDPE1GB) covering 1–4 GB. ACPI tables that QEMU
+  places at ~0x07FE0000 (~134 MB) — well outside the old 16 MB ceiling
+  and the immediate cause of the `#PF → #GP → #DF → triple fault` chain
+  that 1.22.0–1.24.1 silently shipped — are now reachable. Boot now runs
+  past `acpi_init()` / `pci_scan()` / IOMMU / scheduler-test / VFS / initrd
+  through to the memory-isolation test (which has its own pre-existing
+  bug, filed as Active item #5).
+- The CI QEMU Boot Test grep `"AGNOS"` (line 1 of serial output) was
+  matching the v1.24.x boot banner even though the kernel triple-faulted
+  ten lines later. Tightened to `"Scheduler test done"` — a checkpoint
+  that requires ACPI + PCI + IOMMU + syscall + scheduler all to work.
+
+### Changed (documentation)
+Docs were carrying cc3-era numbers (v1.21.0 / v1.22.0 layout) — these
+edits originally lived in the abandoned v1.24.2 patch and ride along here.
+- **`README.md`**: binary size 220KB → 243KB (x86_64), 57KB → 93KB
+  (aarch64). Source line count 4,800 → 6,228 across 49 files. Subsystem
+  count 33 → 35. Cyrius pin 5.7.12 → 5.7.19. Quick-start boot command
+  includes `-cpu max` with a short comment (qemu64 lacks SMEP+SMAP).
+  Build commands no longer reference `cyrius build -D ARCH_X86_64` —
+  that flag doesn't propagate into nested `#ifdef` blocks;
+  `sh scripts/build.sh` is the supported path. Benchmarks section header
+  notes "last measured at v1.21.0" — re-measurement gated on the
+  memory-isolation test fix.
+- **`CLAUDE.md`**: cyrius pin 5.7.12 → 5.7.19. Aarch64 file count 8 → 9,
+  core 17 → 18, user 3 → 4. Ecosystem dep versions refreshed against
+  kybernet 1.0.2's `cyrius.cyml`: kybernet 1.0.1 → 1.0.2, argonaut
+  1.2.0 → 1.5.0, libro 1.0.3 → 2.0.5, agnosys 0.97.2 → 1.0.2,
+  agnostik 0.97.1 → 1.0.0. Project-tree diagram now lists `docs/audit/`,
+  `docs/development/proposals/`, and `security-hardening.md`.
+- **`docs/architecture/overview.md`**: header v1.21.0 → v1.25.0, sizes
+  and memory map updated. x86_64 + aarch64 build commands now point at
+  `scripts/build.sh` rather than bare `cyrius build` invocations.
+
+### Verified
+- `scripts/build.sh` (x86_64): 248,848 B (previous 248,720 B; +128 B
+  from the extra PD entries and PDPT writes). Multiboot magic
+  0x1badb002, entry 0x100060.
+- `scripts/build.sh --aarch64`: 95,136 B (untouched — fix is x86_64-only).
+- Boot under `qemu-system-x86_64 -kernel build/agnos -cpu max -serial
+  stdio`: serial output reaches `"Scheduler test done. Timer ticks: 154"`
+  (was: triple fault at `"Devices registered"` two lines past the boot
+  banner).
+- `scripts/check.sh`: 11/11 PASS.
+- `scripts/test.sh --all`: 7/7 PASS.
+
 ## [1.24.1] — 2026-04-27
 
 Comments-only patch closing H1 + H2 from the post-v1.24.0 hygiene list.

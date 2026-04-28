@@ -9,11 +9,22 @@ fn pt_map_2mb(pd_base, idx, phys_addr) {
 }
 
 fn pt_init() {
-    # Identity map first 16MB (8 x 2MB pages)
-    # PD at 0x3000 already has entries 0-1 from the shim
-    for (var i = 0; i < 8; i = i + 1) {
+    # Identity-map all 1 GB covered by the PD at 0x3000 (512 x 2 MB).
+    # Boot shim seeded entries 0-1 (0–4 MB); we fill the rest so ACPI
+    # tables (placed by QEMU/SeaBIOS at ~0x07FE0000, ~134 MB) are
+    # reachable. See docs/development/proposals/2026-04-27-acpi-identity-map-ceiling.md.
+    for (var i = 0; i < 512; i = i + 1) {
         pt_map_2mb(0x3000, i, i * 0x200000);
     }
+    # PDPT[1..3] = 1 GB huge pages identity-mapping 1–4 GB. Requires
+    # PDPE1GB (CPUID 0x80000001 EDX bit 26) — guaranteed under `-cpu max`,
+    # standard on Westmere/Phenom-and-newer silicon. If a target CPU
+    # lacks it, the entries are inert (the page-walker only consults
+    # them on accesses ≥1 GB; everything in the 0–1 GB range goes
+    # through the PD above).
+    store64(0x2000 + 1 * 8, 0x40000000 | 0x83);   # 1 GB @ 0x40000000 | P|RW|PS
+    store64(0x2000 + 2 * 8, 0x80000000 | 0x83);   # 1 GB @ 0x80000000 | P|RW|PS
+    store64(0x2000 + 3 * 8, 0xC0000000 | 0x83);   # 1 GB @ 0xC0000000 | P|RW|PS
     # Set U/S bit on PML4[0] and PDPT[0] so user-mode pages work
     # PML4 at 0x1000, PDPT at 0x2000 — need bit 2 (User) set
     var pml4e = load64(0x1000);

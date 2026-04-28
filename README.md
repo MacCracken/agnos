@@ -11,8 +11,11 @@ sh scripts/build.sh
 # Build for aarch64 (cross-compile)
 sh scripts/build.sh --aarch64
 
-# Boot (x86_64) — drops to interactive shell
-qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
+# Boot (x86_64) — drops to interactive shell.
+# `-cpu max` is required: the boot shim sets SMEP+SMAP in CR4, which
+# QEMU's default qemu64 model lacks. Real silicon since Haswell/Ryzen
+# supports both. Without -cpu max the CR4 store triple-faults.
+qemu-system-x86_64 -kernel build/agnos -cpu max -serial stdio -display none
 
 # Test both architectures
 sh scripts/test.sh --all
@@ -20,18 +23,22 @@ sh scripts/test.sh --all
 
 ## Architecture
 
-Multi-arch kernel: `kernel/lib/` (2 files), `kernel/arch/x86_64/` (14 files), `kernel/arch/aarch64/` (8 files), `kernel/core/` (17 files), `kernel/user/` (3 files).
+Multi-arch kernel: `kernel/lib/` (2 files), `kernel/arch/x86_64/` (14 files), `kernel/arch/aarch64/` (9 files), `kernel/core/` (18 files), `kernel/user/` (4 files), plus `kernel/agnos.cyr` orchestrator + `kernel/kernel_hello.cyr` smoke test.
+
+The build script wraps `cyrius build` with a `#define ARCH_X86_64` /
+`#define ARCH_AARCH64` prepend, since `cyrius build -D NAME` doesn't
+propagate into nested `#ifdef` blocks reached via `include`.
 
 ```
 x86_64:
   multiboot1 header (32-bit ELF)
     -> 32-bit boot shim (identity page tables, enable long mode)
-      -> 64-bit Cyrius kernel (cyrius build -D ARCH_X86_64)
+      -> 64-bit Cyrius kernel (sh scripts/build.sh)
 
 aarch64:
   DTB -> EL2-to-EL1 transition
     -> PL011 UART, GIC, ARM generic timer
-      -> 64-bit Cyrius kernel (cyrius build -D ARCH_AARCH64 --aarch64)
+      -> 64-bit Cyrius kernel (sh scripts/build.sh --aarch64)
 
 Common:
   -> serial, GDT+TSS/GIC, IDT, PIC/GIC, Local APIC, timer, keyboard
@@ -44,7 +51,7 @@ Common:
   -> kybernet (PID 1) -> interactive shell
 ```
 
-## Subsystems (33)
+## Subsystems (35)
 
 | Subsystem | Description |
 |-----------|-------------|
@@ -117,6 +124,12 @@ Common:
 
 ## Benchmarks (QEMU x86_64, rdtsc)
 
+> Last measured at v1.21.0 under cc3 / cyrius 3.9.8. The v1.23.0+
+> bench harness is currently blocked on the
+> "post-`Devices registered` boot stall" investigation (Active item
+> #4 in `docs/development/roadmap.md`); numbers will be re-measured
+> once that's resolved.
+
 ### Tier 1: Core
 
 | Operation | Cycles |
@@ -144,33 +157,33 @@ Common:
 
 ## Metrics
 
-- **Binary**: 220KB (x86_64), 57KB (aarch64)
-- **Source**: ~4,800 lines across 46 files
+- **Binary**: 243 KB (x86_64, 248,720 B), 93 KB (aarch64, 95,136 B)
+- **Source**: ~6,228 lines across 49 `.cyr` files
 - **Syscalls**: 26
-- **Subsystems**: 33
+- **Subsystems**: 35
 - **Tests**: 106 kernel assertions (PMM, heap, VFS, proc, syscall, stdlib, initrd)
 - **Architecture**: Multi-arch (kernel/lib/ + kernel/arch/x86_64/ + kernel/arch/aarch64/ + kernel/core/ + kernel/user/)
-- **Boot time**: <100ms on QEMU
+- **Boot time**: <100ms on QEMU (`-cpu max`)
 - **Dependencies**: Zero (Cyrius toolchain only, vendored kernel stdlib)
 
 ## Size Comparison
 
 | Kernel | Size | Language | Scope |
 |--------|------|----------|-------|
-| **AGNOS** | **220KB** | Cyrius | 33 subsystems, 26 syscalls, TCP/IP, FAT16, VirtIO, SMP, ELF loader, shell |
+| **AGNOS** | **243 KB** | Cyrius | 35 subsystems, 26 syscalls, TCP/IP, FAT16, VirtIO, SMP, ELF loader, ACPI, IOMMU, shell |
 | xv6 (MIT) | ~100KB | C | 21 syscalls, no networking, no SMP, no real FS |
 | seL4 (verified) | ~30KB | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
 | MINIX 3 | ~600KB | C | Microkernel + basic drivers |
 | Linux (minimal) | ~1.5MB | C | Barely boots, no drivers |
 | Linux (typical) | 10-30MB | C | Desktop-ready |
 
-220KB for a fully functional kernel with TCP/IP, block I/O, filesystem, SMP, signals, epoll, pipes, and an interactive shell — written entirely in Cyrius. No C, no LLVM, no libc.
+243 KB for a fully functional kernel with TCP/IP, block I/O, filesystem, SMP, signals, epoll, pipes, ACPI/IOMMU, and an interactive shell — written entirely in Cyrius. No C, no LLVM, no libc.
 
 ## Requirements
 
 - Linux x86_64
-- Cyrius 5.7.12 (`cyrius` build tool — toolchain pin in `cyrius.cyml`)
-- QEMU (`qemu-system-x86_64`, `qemu-system-aarch64`) for testing
+- Cyrius 5.7.19 (`cyrius` build tool — toolchain pin in `cyrius.cyml`)
+- QEMU 7.0+ with KVM-class CPU (`qemu-system-x86_64 -cpu max`, `qemu-system-aarch64`) for testing
 
 ## License
 
