@@ -63,21 +63,77 @@ common path.
   invariant is now locked in and any future regression caught at
   cyrius CI time, not at downstream agnos boot time.
 
-**Action items for agnos 1.24.0**:
+**Action items for agnos 1.24.0** (status: ✅ completed 2026-04-27):
 
-1. Bump `cyrius.cyml [package].cyrius` to `5.7.19`.
-2. Remove `continue-on-error: true` from the **QEMU Boot Test** job
-   in `.github/workflows/ci.yml`. Replace with an output assertion:
-   ```yaml
-   - name: Boot test
-     run: |
-       timeout 10 qemu-system-x86_64 -kernel build/agnos -nographic \
-         -serial file:build/boot.log -no-reboot -d cpu_reset 2>&1 || true
-       grep -q "AGNOS kernel v" build/boot.log
-   ```
-3. Cross-check the kernel boots on real hardware (or `qemu-system-i386`
-   with `-cpu max`) — gate 4ab verifies emit ORDER, but agnos's actual
-   shim transition is what reaches long mode. Smoke test required.
+1. ✅ Bumped `cyrius.cyml [package].cyrius` to `5.7.19`.
+2. ✅ Removed `continue-on-error: true` from the **QEMU Boot Test** job
+   in `.github/workflows/ci.yml`; the `grep -q "AGNOS"` assertion now
+   gates the workflow.
+3. ✅ Boot smoke test passes — full subsystem init sequence reaches
+   serial. See *Boot verification* below.
+
+### Boot verification (2026-04-27)
+
+`scripts/build.sh` under cyrius 5.7.19 produces `build/agnos`
+(248,720 B). Entry-jmp at `0x100060` now lands directly on the boot
+shim at VA `0x11976A` (was `0x11976A` = 64-bit gvar-init code
+pre-fix). QEMU `-d in_asm` confirms the shim runs:
+
+```
+0x00100060:  e9 05 97 01 00      jmp     0x11976a
+0x0011976a:  bc 00 00 20 00      mov     esp, 0x200000        ; shim start
+0x0011976f:  ba f9 03 00 00      mov     edx, 0x3f9           ; UART IER
+0x00119776:  ee                  out     dx, al               ; serial init
+…
+0x001197de:  0f 20 e0            mov     eax, cr4             ; PAE/PSE/SMEP/SMAP
+0x001197e1:  0d 20 00 30 00      or      eax, 0x300020
+0x001197e6:  0f 22 e0            mov     cr4, eax
+```
+
+**SMEP/SMAP gotcha.** Step 3 surfaced a *separate* preexisting issue:
+the boot shim's CR4 OR-mask is `0x00300020` (PAE + SMEP + SMAP). On
+QEMU's default `qemu64` CPU model — what `scripts/build.sh`'s
+suggested `qemu-system-x86_64 -kernel build/agnos -serial stdio
+-display none` invocation uses by default — SMEP and SMAP are
+unsupported, so writing those bits to CR4 causes a `#GP` cascade →
+triple fault → reset loop at the very instruction shown above. The
+kernel never reaches long mode on `qemu64`.
+
+The fix is to invoke QEMU with `-cpu max` (or any model that exposes
+SMEP+SMAP, e.g. `Skylake-Client-IBRS`). Verified boot output under
+`-cpu max`:
+
+```
+AGNOS kernel v1.24.0
+64-bit long mode
+GDT loaded
+TSS loaded (ring 3 ready)
+IDT loaded
+PIC remapped
+Timer ISR installed
+APIC: id=0 timer active
+SMP: 1 CPUs online
+Keyboard ISR installed (full US QWERTY)
+Page tables: 16MB mapped
+PMM: 3584 free / 4096 pages
+PMM test: 3584 free
+VMM: 57005 (expect 57005)
+Heap initialized
+Devices registered
+```
+
+This is a CPU-model requirement, not a kernel bug — SMEP+SMAP have
+been part of the v1.22.0 security hardening work
+(`docs/audit/2026-04-13-security-audit.md`) and real Intel/AMD
+silicon since Haswell/Ryzen has both. The action items follow:
+
+1. ✅ `.github/workflows/ci.yml` QEMU Boot Test: invoke with
+   `-cpu max` so the boot assertion actually exercises the kernel.
+2. ✅ `scripts/build.sh` boot-hint line updated to suggest
+   `-cpu max` (or document the CPU-model requirement in
+   `README.md`).
+
+Both edits land in agnos 1.24.0 alongside the cyrius pin bump.
 
 **cyrius-side follow-ups (out of scope here, tracked on cyrius
 roadmap)**:

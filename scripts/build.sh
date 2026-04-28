@@ -64,5 +64,7 @@ print('  multiboot: OK')
 print('  entry: 0x{:x}'.format(entry))
 " 2>/dev/null || echo "  (python3 not available, skipping validation)"
 
-    echo "Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none"
+    # `-cpu max` exposes SMEP+SMAP (set by the boot shim's CR4 OR-mask
+    # 0x300020). Default qemu64 lacks both → triple fault on cr4 store.
+    echo "Boot: qemu-system-x86_64 -kernel build/agnos -cpu max -serial stdio -display none"
 fi
