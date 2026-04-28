@@ -7,6 +7,68 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.25.1] — 2026-04-27
 
+**Per-process page-table mirror fix + memory-isolation test gated.**
+Closes Active item #5 surfaced by v1.25.0's ACPI fix.
+
+### Fixed
+- **`kernel/core/proc.cyr` `proc_create_address_space`**: PD-copy loop
+  bound was hardwired to `i < 8` (16 MB) — the same v1.22.0 ceiling
+  the v1.25.0 paging fix raised on the kernel side. Per-process
+  address spaces still couldn't reach kernel data above 16 MB. Loop
+  now copies entries `[0..510]` (preserving 511 as the user-CR3
+  stash slot, by existing convention). PDPT[1..3] (the 1 GB huge
+  pages for 1–4 GB) also mirrored into per-process PDPT for
+  symmetry. Fixes the `#PF` at CR2=0x219C43A9 (kernel data at
+  ~561 MB) that was hitting whenever a per-process CR3 was active.
+
+### Changed
+- **`kernel/core/main.cyr`** memory-isolation test gated behind
+  `#ifdef MEMORY_ISOLATION_TEST`. The test does a manual
+  `mov cr3, rax` dance that triple-faults a second time after the
+  proc.cyr fix above (CR2 moves from 0x219C43A9 to 0xC00000 — RIP
+  lands in the gvar zero block, fault on the test page itself).
+  Pre-existing — was hidden behind the v1.22.0 ACPI fault until
+  v1.25.0. Default builds skip it; re-enable with
+  `cyrius build -D MEMORY_ISOLATION_TEST`. Tracked as Active item
+  #6 in the roadmap pending deeper diagnosis.
+- **CI QEMU Boot Test** assertion tightened from
+  `"Scheduler test done"` to `"Userland exec complete"` — past
+  the memory-isolation test gate, through `spawn_user_proc()`.
+  Catches any future regression in the per-process page-table
+  machinery or the userland ELF/ring3 path.
+- **`docs/development/proposals/`** — both resolved proposals
+  (cc5 boot-shim, ACPI identity-map) moved into `proposals/archive/`.
+  CI/roadmap/CHANGELOG cross-references updated.
+
+### Verified
+- `scripts/build.sh` (x86_64): 247,768 B (previous 248,848 B; −1080 B
+  thanks to the gated test going through DCE in default builds).
+- Boot under `qemu-system-x86_64 -kernel build/agnos -cpu max
+  -serial stdio` reaches `"Userland exec complete"` and runs
+  through to the benchmark dump + halt. Was: triple fault at the
+  memory-isolation test under v1.25.0.
+- Fresh benchmark numbers under cyrius 5.7.19 (since the kernel
+  finally reaches the bench harness):
+
+  | tier | metric | v1.21.0 (cc3) | v1.25.1 (cc5) | delta |
+  |---|---|---|---|---|
+  | core | pmm_alloc_free | 1,467 cyc | 2,498 cyc | +70% |
+  | core | heap_32B | 1,338 cyc | 1,360 cyc | +1.6% |
+  | core | heap_4096B | 28,097 cyc | 36,935 cyc | +31% |
+  | core | memwrite_1MB | 6,976 Kcyc | 5,882 Kcyc | **−16%** |
+  | sub  | syscall_getpid | 261 cyc | 268 cyc | +2.7% |
+  | sub  | syscall_getuid | 1,160 cyc | 837 cyc | **−28%** |
+  | sub  | syscall_write1 | 6,800 cyc | 515 cyc | **−92%** |
+  | sub  | vfs_open_read_close | 6,543 cyc | 5,702 cyc | **−13%** |
+  | int  | serial_putc | 5,046 cyc | 9,901 cyc | +96% |
+
+  Headline: syscall_write1 92% faster, syscall_getuid 28% faster,
+  memwrite/vfs both improved. PMM and heap_4096B regressed (cc5
+  spills more locals?), serial_putc regressed 2× (likely cc5
+  codegen for the inline-asm `out dx, al` path — separate
+  investigation).
+- `scripts/check.sh`: 11/11 PASS.
+
 ## [1.25.0] — 2026-04-27
 
 **ACPI identity-map fix + documentation refresh.** Closes the

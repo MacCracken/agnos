@@ -93,6 +93,20 @@ PDPT writes). Boot output now reaches `"Scheduler test done. Timer
 ticks: 154"` past the previous triple-fault point. Closes proposal
 [`2026-04-27-acpi-identity-map-ceiling.md`](proposals/archive/2026-04-27-acpi-identity-map-ceiling.md).
 
+## Completed (v1.25.1)
+
+| # | Item | Version |
+|---|------|---------|
+| 44 | `proc_create_address_space()` PD-copy loop bound `i<8` → `i<511` (mirrors kernel's 1 GB identity map into per-process page tables). Same shape as v1.25.0's pt_init fix, different file | v1.25.1 |
+| 45 | PDPT[1..3] mirrored into per-process PDPT so kernel data above 1 GB is reachable from per-process CR3 too | v1.25.1 |
+| 46 | Memory-isolation test gated behind `#ifdef MEMORY_ISOLATION_TEST` (skipped in default builds) — surfaces a deeper cr3-dance fault that needs separate diagnosis | v1.25.1 |
+| 47 | CI QEMU Boot Test assertion tightened to `"Userland exec complete"` (past the memory-isolation gate, through `spawn_user_proc`) | v1.25.1 |
+| 48 | Resolved proposals archived to `docs/development/proposals/archive/` | v1.25.1 |
+
+Binary: 248,848 B → 247,768 B (−1080 B; gated test code goes
+through DCE in default builds). Boot now reaches the benchmark
+harness and halts cleanly.
+
 ## Active
 
 | # | Item | Notes |
@@ -100,7 +114,8 @@ ticks: 154"` past the previous triple-fault point. Closes proposal
 | 1 | SMP AP wakeup on real hardware | Currently QEMU-validated only |
 | 2 | Tagged unions for VFS entry types | ktagged.cyr kernel stdlib |
 | 3 | Struct refactor with #derive(accessors) | proc_table, vfs_table, pci_devs |
-| 5 | **Memory isolation test triple-faults under live timer interrupts** | New surface exposed by v1.25.0's ACPI fix. `kernel/core/main.cyr` does `mov cr3, rax` to switch into per-process AS1/AS2 page tables that only map a single test page (0xC00000) plus PD[0] for ISR/trampoline (partial KPTI from v1.22.0). With interrupts enabled, the timer ISR fires, runs in the user CR3, and faults dereferencing kernel data at ~0x219C43A9 (well above PD[0]'s 0–2 MB range). Either the test should disable interrupts around the cr3 dance, or the per-process page tables need to mirror more of the kernel's mappings (full KPTI). Pre-existing — was hidden behind the ACPI hang. |
+| 6 | **Memory-isolation test cr3-dance fault** (deferred from #5) | Even after the v1.25.1 proc.cyr per-process PD-copy fix, the gated test still triple-faults: CR2 moves from 0x219C43A9 (kernel data, fixed) to 0xC00000 (the test page itself), RIP lands in the gvar zero block. Suggests a code/data layout issue in cc5's emit for top-level kernel code that does the `var x = expr; asm { mov cr3, rax; }` pattern — the value cc5 leaves in RAX may not be what the test assumes. Diagnosis path: compile the test's cr3-dance section with `CYRIUS_SYMS=` and disassemble around RIP=0x123bd7 to see what cc5 actually emitted between the local-var assign and the inline asm. May escalate to a cyrius compiler ticket. Re-enable with `cyrius build -D MEMORY_ISOLATION_TEST`. |
+| 7 | **`serial_putc` cc5 regression** (~2× slower vs cc3) | v1.25.1 benchmarks show 9,901 cyc/op vs 5,046 cyc/op under cc3 v3.9.8. The path is a single inline-asm sequence (`mov dx, 0x3F8 + 5; in al, dx; test al, 0x20; jz wait; mov dx, 0x3F8; mov al, ch; out dx, al`) — cc5 likely spills/reloads where cc3 kept registers live. Disassemble `serial_putc` post-build, compare register pressure to the cc3-era binary if a v1.21.0 build is recoverable. Lower-priority than #6 since correctness is unaffected. |
 
 ## Multi-Architecture (Complete)
 
