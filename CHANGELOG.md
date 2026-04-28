@@ -5,6 +5,62 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.26.0] — 2026-04-27
+
+**`cr3_load` helper + investigations on residual issues #6 / #7.**
+Active items #6 and #7 from the v1.25.1 roadmap both got partial
+progress; neither is fully resolved. Deeper diagnosis docs filed
+under the new `docs/development/issue/` folder.
+
+### Added
+- **`docs/development/issue/`** — new folder for bug-investigation
+  documents (parallel to `proposals/`, which keeps improvement-class
+  designs). Both have an `archive/` sub-folder for closed items.
+  Convention: `<YYYY-MM-DD>-<slug>.md`.
+- **`kernel/core/proc.cyr` `cr3_load(cr3_val)`** — helper that
+  loads a cr3 value into the CR3 register via a stack-relative
+  inline-asm load (`mov rax, [rbp-8]; mov cr3, rax`). Same robust
+  pattern as `kernel/arch/x86_64/io.cyr`'s `outb`/`inb`. Replaces
+  the brittle `var x = expr; asm { mov cr3, rax }` pattern that
+  relied on cc3-era codegen leaving the assigned value in RAX —
+  cc5's regalloc may spill it. Audit confirmed the
+  memory-isolation test was the only consumer.
+  See [`docs/development/issue/2026-04-27-cr3-load-helper.md`](docs/development/issue/2026-04-27-cr3-load-helper.md).
+
+### Investigated (not yet fixed)
+- **Memory-isolation test deeper fault** (Active item #6
+  follow-on) — even with `cr3_load`, the test page-faults on
+  `store64(0xC00000, 0xAAAA)` after the cr3 switch. AS1's PD[6]
+  is verified correct (`0xE00087`); cr3_load demonstrably loads
+  AS1's CR3 (proven by serial-print working post-switch). But the
+  store still produces `#PF (CR2=0xC00000)`. Hypotheses, forensic
+  data, and a 5-step diagnostic plan documented in
+  [`docs/development/issue/2026-04-27-memory-isolation-deep.md`](docs/development/issue/2026-04-27-memory-isolation-deep.md).
+  Test stays gated behind `-D MEMORY_ISOLATION_TEST` in default
+  builds.
+- **`serial_putc` 60–96% regression vs v1.21.0 cc3 baseline**
+  (Active item #7 follow-on) — disassembled the function (65
+  bytes total), identified ~5–6 cycles/call of cc5 codegen
+  overhead (two zero-displacement `jmp +5` instructions + a
+  wasteful `var ch = c` memory round-trip). But that's far less
+  than the 3,000+ cycle delta — bulk of the gap is almost
+  certainly QEMU 7.x → 11.x UART emulation latency, host CPU
+  changes, and `-cpu max` differences from the v1.21.0 measurement
+  conditions. Not a real cc5 regression; the bench-history
+  comparison column claims significance the data doesn't support.
+  Action: **defer** until benchmarks can be re-measured under
+  matched conditions. See
+  [`docs/development/issue/2026-04-27-serial-putc-cc5-regression.md`](docs/development/issue/2026-04-27-serial-putc-cc5-regression.md).
+
+### Verified
+- `scripts/build.sh` (x86_64): 247,816 B (v1.25.1: 247,768 B; +48
+  for the `cr3_load` helper).
+- Boot under `-cpu max -serial stdio` reaches `Userland exec
+  complete` and runs the bench harness through to `=== done ===`.
+- Memory-isolation test gated, prints `"Memory isolation test:
+  SKIPPED (build with -D MEMORY_ISOLATION_TEST)"`.
+- `scripts/check.sh`: 11/11 PASS.
+
 ## [1.25.1] — 2026-04-27
 
 **Per-process page-table mirror fix + memory-isolation test gated.**

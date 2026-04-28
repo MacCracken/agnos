@@ -110,6 +110,21 @@ fn proc_get_exit_code(pid) {
 var kpti_kernel_cr3 = 0x1000;  # Default to boot page tables
 var kpti_user_cr3 = 0x1000;
 
+# Load cr3_val (first param at [rbp-8] per Cyrius calling convention)
+# into RAX, then write to CR3. Replaces the `var x = y; asm { mov cr3,
+# rax; }` pattern — that pattern relied on cc3-era codegen leaving the
+# assigned value in RAX, which cc5's regalloc breaks. Function-shaped
+# helpers using `[rbp-N]` param loads are robust across compiler
+# versions (same approach as kernel/arch/x86_64/io.cyr's outb/inb).
+# See docs/development/issue/2026-04-27-cr3-load-helper.md.
+fn cr3_load(cr3_val) {
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;   # mov rax, [rbp - 8]   (cr3_val)
+        0x0F; 0x22; 0xD8;         # mov cr3, rax
+    }
+    return 0;
+}
+
 fn proc_create_address_space() {
     # Allocate 3 pages for kernel page tables: PML4, PDPT, PD
     var new_pml4 = pmm_alloc();

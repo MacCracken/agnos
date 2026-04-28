@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.25.1 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.19.
+> **Current**: v1.26.0 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.19.
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 
@@ -107,6 +107,17 @@ Binary: 248,848 B → 247,768 B (−1080 B; gated test code goes
 through DCE in default builds). Boot now reaches the benchmark
 harness and halts cleanly.
 
+## Completed (v1.26.0)
+
+| # | Item | Version |
+|---|------|---------|
+| 49 | `kernel/core/proc.cyr` `cr3_load(cr3_val)` helper using stack-relative inline-asm load (same pattern as `outb`). Replaces the brittle `var x = expr; asm { mov cr3, rax }` pattern in the memory-isolation test | v1.26.0 |
+| 50 | `docs/development/issue/` folder convention introduced (parallel to `proposals/`); bugs go in `issue/`, improvements go in `proposals/`. Both have `archive/` sub-folders | v1.26.0 |
+| 51 | Investigation docs filed for residual #6 (memory-isolation deep fault) and #7 (serial_putc benchmark regression) — neither fully resolved, both have detailed forensics + next-step plans | v1.26.0 |
+
+Binary: 247,768 B → 247,816 B (+48 B for the `cr3_load` helper).
+Boot still passes the `Userland exec complete` CI checkpoint.
+
 ## Active
 
 | # | Item | Notes |
@@ -114,8 +125,8 @@ harness and halts cleanly.
 | 1 | SMP AP wakeup on real hardware | Currently QEMU-validated only |
 | 2 | Tagged unions for VFS entry types | ktagged.cyr kernel stdlib |
 | 3 | Struct refactor with #derive(accessors) | proc_table, vfs_table, pci_devs |
-| 6 | **Memory-isolation test cr3-dance fault** (deferred from #5) | Even after the v1.25.1 proc.cyr per-process PD-copy fix, the gated test still triple-faults: CR2 moves from 0x219C43A9 (kernel data, fixed) to 0xC00000 (the test page itself), RIP lands in the gvar zero block. Suggests a code/data layout issue in cc5's emit for top-level kernel code that does the `var x = expr; asm { mov cr3, rax; }` pattern — the value cc5 leaves in RAX may not be what the test assumes. Diagnosis path: compile the test's cr3-dance section with `CYRIUS_SYMS=` and disassemble around RIP=0x123bd7 to see what cc5 actually emitted between the local-var assign and the inline asm. May escalate to a cyrius compiler ticket. Re-enable with `cyrius build -D MEMORY_ISOLATION_TEST`. |
-| 7 | **`serial_putc` cc5 regression** (~2× slower vs cc3) | v1.25.1 benchmarks show 9,901 cyc/op vs 5,046 cyc/op under cc3 v3.9.8. The path is a single inline-asm sequence (`mov dx, 0x3F8 + 5; in al, dx; test al, 0x20; jz wait; mov dx, 0x3F8; mov al, ch; out dx, al`) — cc5 likely spills/reloads where cc3 kept registers live. Disassemble `serial_putc` post-build, compare register pressure to the cc3-era binary if a v1.21.0 build is recoverable. Lower-priority than #6 since correctness is unaffected. |
+| 6 | **Memory-isolation test deeper fault** (rolling from v1.25.1 #6) | v1.26.0 added `cr3_load` and verified AS1 PD[6]=`0xE00087`, but `store64(0xC00000, …)` after `cr3_load(as1)` still page-faults. Forensic data + 5-step diagnostic plan in [`issue/2026-04-27-memory-isolation-deep.md`](issue/2026-04-27-memory-isolation-deep.md). Test stays gated. |
+| 7 | **`serial_putc` benchmark regression vs v1.21.0** (rolling from v1.25.1 #7) | Disassembled — only ~5–6 cycles/call of real cc5 codegen overhead. Bulk of the 3,000+ cyc/op delta is almost certainly QEMU 7.x → 11.x UART-emulation noise + host-CPU drift between bench runs. Filed as [`issue/2026-04-27-serial-putc-cc5-regression.md`](issue/2026-04-27-serial-putc-cc5-regression.md) recommending **defer** pending matched-conditions re-measurement. |
 
 ## Multi-Architecture (Complete)
 

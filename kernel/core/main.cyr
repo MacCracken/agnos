@@ -1,6 +1,6 @@
 # === 64-bit Cyrius kernel code ===
 
-serial_println("AGNOS kernel v1.25.1", 20);
+serial_println("AGNOS kernel v1.26.0", 20);
 serial_println("64-bit long mode", 16);
 
 gdt_init();
@@ -276,15 +276,17 @@ serial_print(&rbuf, rn);
 serial_println("", 0);
 vfs_close(mf);
 
-# Memory isolation test gated behind MEMORY_ISOLATION_TEST. The test
-# does a manual `mov cr3, rax` dance into per-process address spaces
-# and back. Under cc5/v1.25.x it triple-faults inside that section in
-# a way that's not yet diagnosed (RIP lands in the gvar zero block;
-# CR2 alternates between kernel-data and the test page itself depending
-# on the cycle). Pre-existing — was hidden behind the v1.22.0 ACPI
-# identity-map ceiling until v1.25.0. Re-enable with `cyrius build`
-# `-D MEMORY_ISOLATION_TEST` once the underlying issue is investigated.
-# Tracked as Active item #5 in docs/development/roadmap.md.
+# Memory-isolation test stays gated behind MEMORY_ISOLATION_TEST in
+# v1.26.0 too. v1.26.0 added the `cr3_load()` helper (proc.cyr) which
+# fixes the var-then-asm pattern issue, but the test still page-faults
+# on `store64(0xC00000, ...)` after the cr3 switch — even though
+# proc_map_page demonstrably writes AS1's PD[6] = 0xE00087 and
+# cr3_load demonstrably loads CR3 = AS1. The page-walk for VA=0xC00000
+# under AS1's CR3 produces #PF for reasons not yet diagnosed (TLB
+# stale? PML4/PDPT corruption between proc_map_page and cr3_load?
+# CR3 cache effect?). See docs/development/issue/2026-04-27-memory-isolation-deep.md.
+# Re-enable with `cyrius build -D MEMORY_ISOLATION_TEST` once
+# the deeper issue is resolved.
 #ifdef MEMORY_ISOLATION_TEST
 serial_println("Memory isolation test...", 23);
 
@@ -311,27 +313,31 @@ if (vmm_is_mapped(phys2) == 0) {
 proc_map_page(as1, 0xC00000, phys1);
 proc_map_page(as2, 0xC00000, phys2);
 
-# Write different values via each address space.
+# Write different values via each address space. cr3_load() is a helper
+# in proc.cyr that loads its parameter into CR3 via [rbp-8] — robust
+# under cc5's regalloc, unlike the pre-v1.26.0 `var x = y; asm { mov
+# cr3, rax }` pattern which relied on cc3-era codegen leaving the
+# assigned value in RAX. See docs/development/issue/2026-04-27-cr3-load-helper.md.
+
 # Switch to AS1, write 0xAAAA to 0xC00000
-var switch1 = as1;
-asm { mov cr3, rax; }
+cr3_load(as1);
 store64(0xC00000, 0xAAAA);
 var val_as1 = load64(0xC00000);
 
 # Switch to AS2, write 0xBBBB to same virtual address
-var switch2 = as2;
-asm { mov cr3, rax; }
+cr3_load(as2);
 store64(0xC00000, 0xBBBB);
 var val_as2 = load64(0xC00000);
 
 # Switch back to AS1, read again — should still be 0xAAAA
-var switch1b = as1;
-asm { mov cr3, rax; }
+cr3_load(as1);
 var val_as1_check = load64(0xC00000);
 
-# Restore kernel page tables
-var kern_cr3_restore = 0x1000;
-asm { mov cr3, rax; }
+# Restore kernel page tables (literal 0x1000 → mov rax, imm64; mov cr3, rax)
+asm {
+    0x48; 0xB8; 0x00; 0x10; 0x00; 0x00; 0x00; 0x00; 0x00; 0x00;   # mov rax, 0x1000
+    0x0F; 0x22; 0xD8;                                              # mov cr3, rax
+}
 
 serial_print("AS1 wrote 0xAAAA, read=", 23);
 kprint_num(val_as1);
