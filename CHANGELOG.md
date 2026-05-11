@@ -67,10 +67,18 @@ predates the bump but was latent.
   `duplicate fn` warnings at v1.26.1 under 5.10.44).
 
 ### CI/release
-- No workflow changes needed. `.github/workflows/ci.yml` reads the
-  cyrius pin from `cyrius.cyml` via
-  `grep -oP '(?<=^cyrius = ")[^"]+'` and `curl`s
-  `https://github.com/MacCracken/cyrius/releases/download/<pin>/install.sh`
+- **`.github/workflows/ci.yml` — `Format check` step**: cyrius 5.10+
+  changed `cyrius fmt --check` from "print formatted output to stdout"
+  (5.7.x) to "silent, signal via exit code". The pre-1.27.0 check
+  used `diff -q <(cyrius fmt … --check) "$f"`, which under 5.10.44
+  diffs the (now-empty) stdout against the file and always reports
+  every file as `NEEDS FORMAT` — full red CI on green code. Replaced
+  with a direct exit-code check (`cyrius fmt "$f" --check >/dev/null`).
+  Locally re-runs clean across all 47 kernel files (1 skipped per the
+  shell.cyr `#ifdef`-in-fn-body carve-out).
+- No other workflow changes needed. The install step reads the cyrius
+  pin from `cyrius.cyml` via `grep -oP '(?<=^cyrius = ")[^"]+'` and
+  `curl`s `https://github.com/MacCracken/cyrius/releases/download/<pin>/install.sh`
   — the 5.10.44 release asset exists and is reachable. The
   `boot-test` job's `"Userland exec complete"` grep still fires
   cleanly. `release.yml`'s changelog-extract awk targets `## [1.27.0]`
