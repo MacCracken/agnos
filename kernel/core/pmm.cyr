@@ -64,6 +64,20 @@ fn pmm_test(page) {
     return (load8(&pmm_bitmap + byte) >> bit) & 1;
 }
 
+# KASLR (S7) — seed source for the randomized PMM next-free hint.
+# Uses RDRAND on x86_64 (via arch/x86_64/io.cyr) and the ARM generic
+# timer on aarch64 (via arch/aarch64/stubs.cyr). Falls back to a
+# timer-XOR-constant mixer if rdrand returns 0 (Intel SDM zeros the
+# destination on failure). Defeats trivial heap-layout ROP — see
+# docs/development/proposals/2026-05-11-kaslr-scope.md. v1.28.0.
+fn kaslr_seed() {
+    var seed = rdrand_u64();
+    if (seed == 0) {
+        seed = rdtsc() ^ 0xDEAD1337CAFE4242;
+    }
+    return seed;
+}
+
 fn pmm_init() {
     # Zero bitmap (all free)
     memset(&pmm_bitmap, 0, 512);
@@ -73,7 +87,19 @@ fn pmm_init() {
     # 2MB / 4KB = 512 pages = pages 0-511 = 64 bytes of bitmap, all 0xFF
     memset(&pmm_bitmap, 0xFF, 64);
     pmm_used = 512;
-    pmm_next_free = 512;
+
+    # KASLR: seed next-free hint from RDRAND so dynamic allocations
+    # land at a randomized offset within the available 2-16 MB range
+    # (pages 512-4095; 3584 valid pages). pmm_alloc walks forward from
+    # the hint and wraps around the bitmap, so first-fit still works —
+    # the randomization just shifts where "first" is per boot.
+    #
+    # Mask off the sign bit before modulo: cyrius i64 is signed, so
+    # `rdrand_u64() % 3584` can be negative when the high bit is set,
+    # which would land outside the valid page range.
+    var seed = kaslr_seed();
+    if (seed < 0) { seed = 0 - seed; }
+    pmm_next_free = 512 + (seed % 3584);
     return 0;
 }
 

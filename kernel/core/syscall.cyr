@@ -4,16 +4,13 @@
 var stack_canary_secret = 0;
 
 fn stack_canary_init() {
-    # Try RDRAND for cryptographic randomness
-    var val = 0;
-    # rdrand rax (48 0F C7 F0), sets CF=1 on success
-    # We read rax into val. If RDRAND fails (CF=0), rax may be 0.
-    asm {
-        0x48; 0x0F; 0xC7; 0xF0;   # rdrand rax
-        0x48; 0x89; 0x45; 0xF8;   # mov [rbp-0x08], rax (val)
-    }
+    # v1.28.0: use the shared rdrand_u64() helper (arch/x86_64/io.cyr +
+    # arch/aarch64/stubs.cyr). Same entropy source as KASLR's
+    # kaslr_seed() — one helper, two callers. The timer-mixer fallback
+    # is preserved so the canary still gets a varying value if RDRAND
+    # fails this boot.
+    var val = rdrand_u64();
     if (val == 0) {
-        # RDRAND unavailable or failed — use timer + constant
         val = timer_ticks * 6364136223846793005 + 0xDEAD1337CAFE4242;
     }
     stack_canary_secret = val;

@@ -191,6 +191,13 @@ jobs:
         # from CPL=0). This assertion guards both the SMAP brackets
         # and `proc_create_address_space` / `proc_map_page` /
         # `cr3_load` against future regression.
+        #
+        # v1.28.0: KASLR (data-only, Security Hardening S7). Two
+        # consecutive boots must emit different `KASLR: pmm_next_free=N`
+        # values — the randomization probe. If they match, either the
+        # entropy source silently regressed to a fixed seed, or
+        # `pmm_init` stopped consuming `kaslr_seed()`. Guards the
+        # rdrand_u64 / kaslr_seed / pmm_init triple.
         run: |
           set -e
           timeout 12 qemu-system-x86_64 \
@@ -213,7 +220,23 @@ jobs:
             echo "--- last 20 lines of serial ---"
             tail -20 build/boot_output.log
             exit 1; }
+          # KASLR randomization check — boot a second time and compare.
+          KASLR_1=$(grep -aoE "KASLR: pmm_next_free=[0-9-]+" build/boot_output.log | head -1)
+          [ -n "$KASLR_1" ] || { echo "FAIL: no KASLR probe in first boot"; exit 1; }
+          timeout 12 qemu-system-x86_64 \
+            -kernel build/agnos \
+            -cpu max \
+            -serial stdio \
+            -display none \
+            -no-reboot 2>&1 | tee build/boot_output_2.log || true
+          KASLR_2=$(grep -aoE "KASLR: pmm_next_free=[0-9-]+" build/boot_output_2.log | head -1)
+          [ -n "$KASLR_2" ] || { echo "FAIL: no KASLR probe in second boot"; exit 1; }
+          if [ "$KASLR_1" = "$KASLR_2" ]; then
+            echo "FAIL: KASLR randomization not firing — two boots produced identical pmm_next_free ($KASLR_1)"
+            exit 1
+          fi
           echo "PASS: kernel boots through Memory isolation + Userland exec complete"
+          echo "PASS: KASLR varies across boots ($KASLR_1 vs $KASLR_2)"
 
   # ── Benchmarks ──
   benchmarks:

@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-05-11 (v1.27.2 closeout — three 🟡 Stale docs + one 🟠 Read-through promoted to ✅; CODE_OF_CONDUCT.md added to Tier 1; architecture/overview.md refreshed) | **Refresh cadence**: when a doc is touched, update its row. Full-tree sweep at minor-version closeouts.
+> **Last refresh**: 2026-05-11 (v1.28.0 ship — KASLR closes S7; CI boot-test grew the two-boot-diff KASLR assertion. No doc-tree health changes from the kernel work itself; row touched purely to confirm the ledger remains current at the new tag) | **Refresh cadence**: when a doc is touched, update its row. Full-tree sweep at minor-version closeouts.
 >
 > **Scope**: this repo only (`agnos`) — the `docs/` tree plus root-level files (README, CLAUDE.md, CHANGELOG, CONTRIBUTING, SECURITY, LICENSE, VERSION, cyrius.cyml). Sibling-repo docs (kybernet, agnosys, argonaut, agnostik, daimon, libro) are not audited here — each repo carries its own doc-health.md if its size justifies one. Cross-repo Cyrius pin/version drift lives in [`development/state.md`](development/state.md).
 >

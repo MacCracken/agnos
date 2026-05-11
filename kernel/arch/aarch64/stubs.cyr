@@ -124,5 +124,12 @@ fn rdtsc() {
     return count;
 }
 
+# rdrand stub — aarch64 doesn't have a direct RDRAND equivalent; use
+# CNTVCT_EL0 as the entropy source. Lower quality than RDRAND but
+# acceptable for KASLR's "different layout per boot" property. v1.28.0.
+fn rdrand_u64() {
+    return rdtsc();
+}
+
 fn arch_wait() { wfi(); return 0; }
 fn arch_halt() { wfi(); return 0; }

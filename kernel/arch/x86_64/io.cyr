@@ -72,5 +72,19 @@ fn rdtsc() {
     return result;
 }
 
+# Hardware random 64-bit via RDRAND. Returns 0 on failure (Intel SDM
+# specifies destination is zeroed on RDRAND failure); callers should
+# check val==0 and fall back to a mixer. Extracted from the
+# stack_canary_init asm to give KASLR + canary one entropy source.
+# v1.28.0.
+fn rdrand_u64() {
+    var result = 0;
+    asm {
+        0x48; 0x0F; 0xC7; 0xF0;       # rdrand rax
+        0x48; 0x89; 0x45; 0xF8;       # mov [rbp-0x08], rax (result)
+    }
+    return result;
+}
+
 fn arch_wait() { asm { hlt; } return 0; }
 fn arch_halt() { asm { cli; hlt; 0xEB; 0xFE; } return 0; }

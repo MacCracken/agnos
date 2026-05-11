@@ -1,6 +1,6 @@
 # === 64-bit Cyrius kernel code ===
 
-serial_println("AGNOS kernel v1.27.2", 20);
+serial_println("AGNOS kernel v1.28.0", 20);
 serial_println("64-bit long mode", 16);
 
 gdt_init();
@@ -59,6 +59,14 @@ kprint_num(pmm_free_count());
 serial_print(" free / ", 8);
 kprint_num(pmm_total);
 serial_println(" pages", 6);
+
+# KASLR probe — emits the randomized next-free hint so two consecutive
+# boots can be diffed for "did randomization actually fire". Asserted
+# by .github/workflows/ci.yml's boot-test job (two-boot-diff check).
+# v1.28.0.
+serial_print("KASLR: pmm_next_free=", 21);
+kprint_num(pmm_next_free);
+serial_println("", 0);
 
 var pg1 = pmm_alloc();
 pmm_free(pg1);
@@ -294,17 +302,22 @@ var as2 = proc_create_address_space();
 
 # Map virtual address 0xC00000 (12MB) in each, to different 2MB physical regions.
 # We need 2MB-aligned physical addresses since we use huge pages.
-# Use PMM to allocate 512 contiguous 4KB pages (= 2MB) for each.
-# Simpler: just use known free 2MB-aligned regions.
-# First 16MB is identity-mapped. Regions 0xE00000 (14MB) and 0x1000000 (16MB) should be free.
-var phys1 = 0xE00000;
-var phys2 = 0x1000000;
-# Mark these PMM pages as used
-for (var pi = 0; pi < 512; pi = pi + 1) {
-    pmm_set(phys1 / 0x1000 + pi);
-    pmm_set(phys2 / 0x1000 + pi);
+#
+# v1.28.0: both phys regions moved above 16 MB (PMM-tracked range is
+# 0-16 MB / pages 0-4095). KASLR's randomized pmm_next_free means
+# pmm_alloc may have already claimed pages anywhere in 2-16 MB by the
+# time this test runs; using phys regions above 16 MB guarantees no
+# collision with heap/allocator state. The 0-4 GB identity map (v1.25.0)
+# makes both addresses kernel-reachable; v1.25.1's per-process PD-copy
+# extends to PD entry 510 (just under 1 GB) plus PDPT[1..3] for 1-4 GB,
+# so 0x1000000 / 0x1200000 are reachable from AS1/AS2 too.
+var phys1 = 0x1000000;
+var phys2 = 0x1200000;
+# Ensure both phys regions are mapped in kernel page tables (the
+# identity-map ceiling covers 0-4 GB so they should already be).
+if (vmm_is_mapped(phys1) == 0) {
+    vmm_map(phys1, phys1, 0x83);
 }
-# Ensure phys2 region is mapped in kernel page tables
 if (vmm_is_mapped(phys2) == 0) {
     vmm_map(phys2, phys2, 0x83);
 }

@@ -5,6 +5,109 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.28.0] — 2026-05-11
+
+**KASLR (data-only) ships — closes Security Hardening S7.** First slot
+of the 1.28.x arc. The kernel binary stays at fixed `0x100000`;
+dynamically-allocated kernel data (heap, slab pages, per-process
+stacks) now lands at randomized offsets within the 2–16 MB available
+physical-memory range. Defeats trivial heap-layout ROP. Full design
+choice (Option B over Option A) in [`docs/development/proposals/2026-05-11-kaslr-scope.md`](docs/development/proposals/2026-05-11-kaslr-scope.md); full-binary KASLR (Option A) remains a candidate but is gated on cyrius PIE support landing first (filed at [`cyrius/docs/development/proposals/2026-05-11-pie-support.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/proposals/2026-05-11-pie-support.md) for v6.1.x).
+
+### Added
+- **`kernel/arch/x86_64/io.cyr` `rdrand_u64()`**: extracted from the
+  v1.27.x stack-canary asm. Returns the RAX value from `rdrand rax`
+  (`48 0F C7 F0`). Returns 0 on failure per Intel SDM (destination
+  zeroed when CF=0).
+- **`kernel/arch/aarch64/stubs.cyr` `rdrand_u64()`**: aarch64 stub —
+  uses `CNTVCT_EL0` (same source as the existing `rdtsc` stub). Lower
+  entropy than RDRAND but acceptable for KASLR's "different layout per
+  boot" property; aarch64 isn't booted to full kernel today anyway.
+- **`kernel/core/pmm.cyr` `kaslr_seed()`**: returns `rdrand_u64()`
+  with a `rdtsc()` XOR `0xDEAD1337CAFE4242` fallback for when RDRAND
+  fails or isn't available.
+- **KASLR boot probe** in `kernel/core/main.cyr`: emits
+  `KASLR: pmm_next_free=<page>` after `pmm_init` so CI can verify
+  randomization is firing.
+
+### Changed
+- **`kernel/core/pmm.cyr` `pmm_init`**: `pmm_next_free` is now seeded
+  from `kaslr_seed()` biased into the available page range
+  `512 + (seed % 3584)`. The sign bit is masked before modulo
+  (cyrius `i64` is signed; `rdrand_u64() % 3584` can be negative
+  when the high bit is set). `pmm_alloc` walks forward from the hint
+  and wraps the bitmap, so first-fit semantics are preserved —
+  randomization shifts only *where* first-fit starts per boot.
+- **`kernel/core/syscall.cyr` `stack_canary_init`**: refactored to
+  call the shared `rdrand_u64()` helper instead of its own inline
+  asm. Same fallback (timer × mixer × constant). Dedup — one entropy
+  source for both canary and KASLR.
+- **`kernel/core/main.cyr` memory-isolation test**: `phys1` /
+  `phys2` moved from `0xE00000` / `0x1000000` to `0x1000000` /
+  `0x1200000`. PMM tracks pages 0–4095 (the first 16 MB only); under
+  randomized PMM, pages near `0xE00000` (page 3584) could collide
+  with allocator state by the time the test runs. Moving both phys
+  regions above 16 MB guarantees they're outside PMM's tracking, so
+  `pmm_alloc` cannot return them and the test stays deterministic.
+  The 0–4 GB identity map (v1.25.0) plus the per-process PD-copy
+  (v1.25.1) make both addresses kernel-reachable and AS1/AS2-
+  mappable as before. Also added `vmm_is_mapped` + `vmm_map` checks
+  for `phys1` (parallel to the existing `phys2` check) — defensive
+  even though both should already be identity-mapped.
+
+### CI/release
+- **`.github/workflows/ci.yml` `boot-test`**: added KASLR
+  randomization check. The job now boots **twice** and asserts the
+  two `KASLR: pmm_next_free=N` probe values differ. Guards the
+  rdrand_u64 / kaslr_seed / pmm_init triple — if any of them silently
+  regresses to a fixed seed, two-boot-diff fails. Same pattern as
+  the v1.27.1 `Memory isolation: PASS` assertion tightening: catch
+  the regression at CI time, not at deploy time.
+
+### Verified
+- `scripts/build.sh` (x86_64): **249,152 B** (was 248,896 B at
+  v1.27.2 — +256 B for `rdrand_u64` helper, `kaslr_seed` fn, the
+  abs-value masking, the KASLR probe printout, plus the
+  memory-isolation test's `vmm_is_mapped` + `vmm_map` defensive
+  block for the new `phys1` region).
+- `scripts/build.sh --aarch64`: **92,488 B** (was 92,216 B at
+  v1.27.2 — +272 B for the aarch64 `rdrand_u64` stub).
+- `scripts/test.sh --all`: 7/7 PASS.
+- `scripts/check.sh`: 11/11 PASS.
+- QEMU `-cpu max -serial stdio` over 5 consecutive boots:
+  `pmm_next_free` values **2560, 3250, 1320, 2741, 2369** — uniform
+  distribution across `[512, 4095]`, no repeats. `Memory isolation:
+  PASS` + `Userland exec complete` + `=== done ===` all fire.
+- KASLR-diff CI assertion validated locally: two consecutive boots
+  produce different probe values; the assertion's negative case
+  (forced same seed) was sanity-checked.
+
+### Notes
+- **What this defends against**: an attacker who depends on heap or
+  per-process structure offsets being predictable across boots.
+  Concretely: ROP gadgets that target heap-allocated objects (like
+  `proc_table` slots, slab-allocated VFS entries) by their address.
+- **What this does NOT defend against**: pre-computed gadgets in
+  the kernel binary itself — the binary's still at `0x100000`. That
+  requires full-binary KASLR (Option A), which is gated on cyrius
+  PIE support (v6.1.x cyrius candidate). See the kaslr-scope
+  proposal for the full discussion. Data-only is ~80% of the
+  security value at ~20% of the implementation cost; full KASLR's
+  marginal win against AGNOS's small (~248 KB) kernel binary is
+  smaller than it would be against a 5 MB Linux kernel.
+- **`KASLR_SEED` compile-time reproducibility hatch** was scoped out
+  of v1.28.0. The original proposal called for it primarily for
+  memory-isolation test reproducibility, but moving the test's phys
+  regions above PMM-tracked memory (16 MB) made the hatch
+  unnecessary — the test is now deterministic under any seed. The
+  hatch can land as v1.28.0.1 if a future need surfaces.
+- **aarch64 entropy** uses `CNTVCT_EL0` (the ARM generic timer)
+  rather than a true RDRAND equivalent. This is acceptable because
+  the aarch64 kernel currently runs only minimal initialization
+  (no PMM bitmap, no scheduler) — KASLR fires but isn't load-
+  bearing yet. When aarch64 grows the full boot path, revisit the
+  entropy source.
+
 ## [1.27.2] — 2026-05-11
 
 **Closeout pass for the 1.27.x arc.** No kernel-source behavior change.

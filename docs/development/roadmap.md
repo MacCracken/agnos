@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.27.2 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
+> **Current**: v1.28.0 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
 >
 > Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 
@@ -23,12 +23,12 @@ Per-version detail lives in [`CHANGELOG.md`](../../CHANGELOG.md). This is the at
 
 The 1.27.x arc closed at v1.27.2 with an empty Active table modulo #1 (SMP-on-hardware, hardware-gated) and #7 (`serial_putc` regression — methodology gap). 1.28.x is the **closeout-and-feature** arc: ship the last open Security Hardening item (S7 KASLR) as the headline feature in `.0`, then walk down the remaining Active items in tight focused patches.
 
-| Slot | Item | Source | Shape | Risk |
-|------|------|--------|-------|------|
-| **1.28.0** | **KASLR (data-KASLR scope)** | Security Hardening S7 | Feature — boot-shim entropy, randomized kernel-data layout. Defeats trivial heap-layout ROP. See [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md) for the full-vs-data design choice. | Medium — touches boot shim + PMM + heap base. Bounded by staying data-only (kernel binary stays at `0x100000`). |
-| **1.28.1** | **`serial_putc` methodology** | Active #7 | Bench-history schema gains `qemu_version` / `cpu_model` / `host_arch` / `kvm_enabled` columns; re-measure under matched conditions; either confirm "QEMU/host drift, not a real regression" and archive the issue, or apply the codegen micro-opts (drop `var ch = c`, zero-disp jmp collapse) if the matched-conditions baseline shows the v1.21.0 cc3 numbers are still reachable. | Low — measurement infra + maybe a 14-byte source edit. Either outcome closes the issue cleanly. |
-| **1.28.2** | **VFS tagged unions** | Active #2 | New `kernel/lib/ktagged.cyr` (kernel-safe tagged-union helper). Port VFS entry types (currently switch on type code 0–6) to the new pattern. First consumer of `ktagged` — proves the design before broader uptake. | Medium — new kernel stdlib module; VFS is hot path. Boot test + bench-history both gate. |
-| **1.28.3** | **Struct refactor with `#derive(accessors)`** | Active #3 | Sequence: `pci_devs` (smallest blast radius) → `vfs_table` → `proc_table` (largest). One subsystem per commit, all gated by the standard checkpoints. Closes the largest active refactor. | Medium-high — touches many files; depends on cyrius's `#derive(accessors)` machinery being stable at 5.10.44+. |
+| Slot | Item | Source | Status |
+|------|------|--------|--------|
+| **1.28.0** | **KASLR (data-only)** | Security Hardening S7 | ✅ **Shipped 2026-05-11**. `rdrand_u64` helper, `kaslr_seed`, randomized `pmm_next_free`, two-boot-diff CI assertion. See [`CHANGELOG.md`](../../CHANGELOG.md) v1.28.0 entry. |
+| **1.28.1** | **`serial_putc` methodology** | Active #7 | 🟠 Open. Bench-history schema gains `qemu_version` / `cpu_model` / `host_arch` / `kvm_enabled` columns; re-measure under matched conditions; either confirm "QEMU/host drift, not a real regression" and archive the issue, or apply codegen micro-opts. |
+| **1.28.2** | **VFS tagged unions** | Active #2 | 🟠 Open. New `kernel/lib/ktagged.cyr` (kernel-safe tagged-union helper, ported from cyrius stdlib `lib/tagged.cyr`). Port VFS entry types (currently switch on type code 0–6) to the new pattern. |
+| **1.28.3** | **Struct refactor with `#derive(accessors)`** | Active #3 | 🟠 Open. Sequence: `pci_devs` → `vfs_table` → `proc_table` (increasing blast radius). One subsystem per commit. |
 
 After 1.28.3 the Active table is empty modulo SMP-on-hardware (which stays open until hardware-in-the-loop infra exists). 1.28.4 is a P(-1) hardening / closeout patch before tagging 1.29.0.
 
