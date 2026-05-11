@@ -179,12 +179,18 @@ jobs:
         # See proposals/archive/2026-04-27-acpi-identity-map-ceiling.md.
         #
         # v1.25.1: tightened further to `"Userland exec complete"` —
-        # past the memory-isolation test (now gated) and through
+        # past the memory-isolation test (then gated) and through
         # `spawn_user_proc()`. Catches any future regression in the
         # per-process page-table machinery (proc.cyr) or the userland
-        # ELF/ring3 path. Memory-isolation test stays gated behind
-        # `-D MEMORY_ISOLATION_TEST` until the cr3-dance fault is
-        # diagnosed (Active item #5 in the roadmap).
+        # ELF/ring3 path.
+        #
+        # v1.27.1: added `"Memory isolation: PASS"`. The
+        # MEMORY_ISOLATION_TEST gate was dropped after the SMAP root
+        # cause was found (boot_shim.cyr sets CR4.SMAP; the test now
+        # uses stac/clac brackets to access US=1 per-process pages
+        # from CPL=0). This assertion guards both the SMAP brackets
+        # and `proc_create_address_space` / `proc_map_page` /
+        # `cr3_load` against future regression.
         run: |
           set -e
           timeout 12 qemu-system-x86_64 \
@@ -197,12 +203,17 @@ jobs:
           # binary; -a forces text mode so the assertions actually fire.
           grep -aq "AGNOS kernel v" build/boot_output.log || {
             echo "FAIL: kernel did not print boot banner"; exit 1; }
+          grep -aq "Memory isolation: PASS" build/boot_output.log || {
+            echo "FAIL: memory-isolation test did not pass"
+            echo "--- last 20 lines of serial ---"
+            tail -20 build/boot_output.log
+            exit 1; }
           grep -aq "Userland exec complete" build/boot_output.log || {
             echo "FAIL: kernel did not reach Userland exec complete checkpoint"
             echo "--- last 20 lines of serial ---"
             tail -20 build/boot_output.log
             exit 1; }
-          echo "PASS: kernel boots through Userland exec complete"
+          echo "PASS: kernel boots through Memory isolation + Userland exec complete"
 
   # ── Benchmarks ──
   benchmarks:

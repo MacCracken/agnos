@@ -1,12 +1,73 @@
 # Issue: memory-isolation test page-faults on `store64(0xC00000, ...)` even after cr3_load + PD[6] verified correct
 
-**Status**: open — diagnosis incomplete, test stays gated
-**Date**: 2026-04-27
-**Affects**: `kernel/core/main.cyr` memory-isolation test (gated behind
-            `-D MEMORY_ISOLATION_TEST`).
+**Status**: **CLOSED** at v1.27.1. Root cause was SMAP, not page-table corruption. Test now runs in default builds and asserts `Memory isolation: PASS`.
+**Date**: 2026-04-27 → 2026-05-11 (resolved)
+**Affects**: `kernel/core/main.cyr` memory-isolation test (was gated behind
+            `-D MEMORY_ISOLATION_TEST` v1.25.1–v1.27.0; gate dropped v1.27.1).
 **Related**: closes the cr3-load-helper part of the puzzle
-            ([issue/2026-04-27-cr3-load-helper.md](2026-04-27-cr3-load-helper.md))
-            but a deeper page-walk fault remains.
+            ([../2026-04-27-cr3-load-helper.md](../2026-04-27-cr3-load-helper.md));
+            this doc was about the *deeper* fault after the cr3_load fix.
+
+## Resolution (v1.27.1)
+
+**Root cause: SMAP (Supervisor Mode Access Prevention).** The boot
+shim's CR4 OR-mask `0x300020` (boot_shim.cyr line 52) sets SMEP+SMAP.
+`proc_map_page` writes per-process PD entries with `0x87` (P | RW | US
+| PS) because the per-process address space pages must be reachable
+from CPL=3. SMAP traps CPL=0 access to US=1 pages unless `RFLAGS.AC=1`.
+The test runs in CPL=0 (kernel main) but writes to `0xC00000` which
+under AS1 is a US=1 page → SMAP `#PF` → cascade to `#GP` → `#DF` →
+triple fault.
+
+Every observed forensic detail re-reads cleanly under SMAP:
+
+| Observation | SMAP explanation |
+|---|---|
+| Pre-switch PD[6] read works | kernel page tables are US=0 (kernel's own identity map uses `0x83`) |
+| Post-switch `serial_println` works | reads from kernel `.rodata` mapped US=0 via the per-process PD copy of the kernel PD entries (v1.25.1) |
+| `store64(0xC00000, …)` faults | exactly the US=1 access SMAP is supposed to trap |
+| `CR2=0xC00000` matches the literal | SMAP `#PF` reports the faulting linear address per SDM Vol 3 §4.7 |
+| Same fault under cyrius 5.7.22 and 5.10.44 | SMAP is hardware behavior — toolchain-independent |
+
+### Fix
+
+`stac` (`0F 01 CB`) / `clac` (`0F 01 CA`) brackets around each
+access block in the test:
+
+```cyrius
+cr3_load(as1);
+asm { 0x0F; 0x01; 0xCB; }   # stac
+store64(0xC00000, 0xAAAA);
+var val_as1 = load64(0xC00000);
+asm { 0x0F; 0x01; 0xCA; }   # clac
+```
+
+Per Intel SDM Vol 3 §6.12.1.4, interrupt entry clears RFLAGS.AC
+implicitly, so the bracket discipline survives a preempting interrupt.
+
+### Hypotheses that turned out wrong
+
+The 2026-04-27 hypotheses (PML4/PDPT clobber between proc_map_page
+and cr3_load; stack-canary dangling pointer; cc5 codegen mis-emitting
+the store; IDT mapping under AS1) were all reasonable given the
+evidence shape, but every one of them assumed the fault was about
+*page-table state* rather than *access-control hardware bits*. The
+SMAP bit in CR4 was visible in the original fault dump (CR4=`0x300020`)
+but went unread for ~14 days. Calling that out as a process note —
+*read every bit of CR0/CR3/CR4 the next time a page-walk faults
+inexplicably*.
+
+### Diagnostic that solved it
+
+Pattern-matching `proc_map_page`'s `0x87` flag (US=1) against the
+0x300020 CR4 dump (SMAP=1) during the 1.27.1 scoping session. No new
+instrumentation required — the data was already in the original
+forensic capture.
+
+---
+
+# Original (2026-04-27) writeup follows
+
 
 ## Summary
 

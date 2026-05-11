@@ -81,9 +81,17 @@ if [ -f "$ROOT/CHANGELOG.md" ]; then
     updated="$updated  CHANGELOG.md\n"
 fi
 
-# 8. docs/development/roadmap.md — update Current header
+# 8. docs/development/roadmap.md — update Current header version AND
+#    re-sync the trailing "Built with cyrius X.Y.Z" string from
+#    cyrius.cyml so the roadmap doesn't drift after a pin bump.
+#    Pre-v1.27.1, version-bump.sh only touched the version number and
+#    left the trailing toolchain string stale.
 if [ -f "$ROOT/docs/development/roadmap.md" ]; then
     sed -i -E "s|> \*\*Current\*\*: v[0-9]+\.[0-9]+\.[0-9]+|> **Current**: v$NEW|" "$ROOT/docs/development/roadmap.md"
+    CYRIUS_PIN=$(grep -oE '^cyrius = "[^"]+"' "$ROOT/cyrius.cyml" | sed -E 's/.*"([^"]+)".*/\1/')
+    if [ -n "$CYRIUS_PIN" ]; then
+        sed -i -E "s|Built with cyrius [0-9]+\.[0-9]+\.[0-9]+|Built with cyrius $CYRIUS_PIN|" "$ROOT/docs/development/roadmap.md"
+    fi
     updated="$updated  docs/development/roadmap.md\n"
 fi
 

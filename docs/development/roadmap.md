@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.27.0 — x86_64 + aarch64, 243KB/93KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.7.22.
+> **Current**: v1.27.1 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
 
 For language roadmap, see `../cyrius/docs/development/roadmap.md`.
 
@@ -118,6 +118,16 @@ harness and halts cleanly.
 Binary: 247,768 B → 247,816 B (+48 B for the `cr3_load` helper).
 Boot still passes the `Userland exec complete` CI checkpoint.
 
+## Completed (v1.27.1)
+
+| # | Item | Version |
+|---|------|---------|
+| 52 | Memory-isolation deeper-fault root cause: **SMAP**. `proc_map_page` writes US=1 (`0x87`) per-process PD entries; boot shim's `CR4=0x300020` enables SMAP; kernel-mode `store64` to US=1 page → `#PF` → `#GP` → `#DF` → triple fault. Test now uses `stac`/`clac` brackets around each user-page access | v1.27.1 |
+| 53 | `MEMORY_ISOLATION_TEST` `#ifdef` gate removed; test always runs in default builds and asserts `Memory isolation: PASS` | v1.27.1 |
+| 54 | CI QEMU Boot Test assertion tightened to require `"Memory isolation: PASS"` (in addition to `"Userland exec complete"`) | v1.27.1 |
+| 55 | `version-bump.sh` now re-syncs the roadmap's `Built with cyrius X.Y.Z` trailer from `cyrius.cyml`, closing a stale-string class of bug surfaced in v1.27.0 | v1.27.1 |
+| 56 | Resolved issue docs archived: `memory-isolation-deep.md` (closed by SMAP fix), `cr3-load-helper.md` (its v1.26.0 fix was sufficient — test now works fully end-to-end) | v1.27.1 |
+
 ## Active
 
 | # | Item | Notes |
@@ -125,7 +135,6 @@ Boot still passes the `Userland exec complete` CI checkpoint.
 | 1 | SMP AP wakeup on real hardware | Currently QEMU-validated only |
 | 2 | Tagged unions for VFS entry types | ktagged.cyr kernel stdlib |
 | 3 | Struct refactor with #derive(accessors) | proc_table, vfs_table, pci_devs |
-| 6 | **Memory-isolation test deeper fault** (rolling from v1.25.1 #6) | v1.26.0 added `cr3_load` and verified AS1 PD[6]=`0xE00087`, but `store64(0xC00000, …)` after `cr3_load(as1)` still page-faults. Forensic data + 5-step diagnostic plan in [`issue/2026-04-27-memory-isolation-deep.md`](issue/2026-04-27-memory-isolation-deep.md). Test stays gated. |
 | 7 | **`serial_putc` benchmark regression vs v1.21.0** (rolling from v1.25.1 #7) | Disassembled — only ~5–6 cycles/call of real cc5 codegen overhead. Bulk of the 3,000+ cyc/op delta is almost certainly QEMU 7.x → 11.x UART-emulation noise + host-CPU drift between bench runs. Filed as [`issue/2026-04-27-serial-putc-cc5-regression.md`](issue/2026-04-27-serial-putc-cc5-regression.md) recommending **defer** pending matched-conditions re-measurement. |
 
 ## Multi-Architecture (Complete)

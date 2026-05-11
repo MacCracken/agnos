@@ -1,6 +1,6 @@
 # === 64-bit Cyrius kernel code ===
 
-serial_println("AGNOS kernel v1.27.0", 20);
+serial_println("AGNOS kernel v1.27.1", 20);
 serial_println("64-bit long mode", 16);
 
 gdt_init();
@@ -276,18 +276,16 @@ serial_print(&rbuf, rn);
 serial_println("", 0);
 vfs_close(mf);
 
-# Memory-isolation test stays gated behind MEMORY_ISOLATION_TEST in
-# v1.26.0 too. v1.26.0 added the `cr3_load()` helper (proc.cyr) which
-# fixes the var-then-asm pattern issue, but the test still page-faults
-# on `store64(0xC00000, ...)` after the cr3 switch — even though
-# proc_map_page demonstrably writes AS1's PD[6] = 0xE00087 and
-# cr3_load demonstrably loads CR3 = AS1. The page-walk for VA=0xC00000
-# under AS1's CR3 produces #PF for reasons not yet diagnosed (TLB
-# stale? PML4/PDPT corruption between proc_map_page and cr3_load?
-# CR3 cache effect?). See docs/development/issue/2026-04-27-memory-isolation-deep.md.
-# Re-enable with `cyrius build -D MEMORY_ISOLATION_TEST` once
-# the deeper issue is resolved.
-#ifdef MEMORY_ISOLATION_TEST
+# Memory-isolation test. v1.25.1 gated this behind MEMORY_ISOLATION_TEST
+# after `store64(0xC00000, ...)` page-faulted post-cr3-switch despite
+# AS1's PD[6] being verified correct. v1.27.1 identified the root cause
+# as SMAP (CR4.SMAP set in the boot shim, line 52 of boot_shim.cyr):
+# proc_map_page writes per-process PD entries with US=1 (0x87, since
+# the page must be user-accessible from CPL=3), and SMAP traps CPL=0
+# access to US=1 pages. The fix is `stac`/`clac` brackets around the
+# test's user-page accesses, the same pattern userland-accessing
+# kernels use everywhere. Pre-switch diagnostic reads worked because
+# they hit kernel's own US=0 page-table pages.
 serial_println("Memory isolation test...", 23);
 
 # Create two address spaces
@@ -319,19 +317,32 @@ proc_map_page(as2, 0xC00000, phys2);
 # cr3, rax }` pattern which relied on cc3-era codegen leaving the
 # assigned value in RAX. See docs/development/issue/2026-04-27-cr3-load-helper.md.
 
-# Switch to AS1, write 0xAAAA to 0xC00000
+# Switch to AS1, write 0xAAAA to 0xC00000. The page is mapped US=1
+# (proc_map_page emits 0x87 — P | RW | US | PS) because it must be
+# reachable from CPL=3. We're in CPL=0 here, so SMAP would trap the
+# access without RFLAGS.AC=1 — `stac` (0F 01 CB) sets it, `clac`
+# (0F 01 CA) clears it. The bracket discipline is per-access-block:
+# if an interrupt fires between stac and clac, the kernel's interrupt
+# entry stub re-clears AC implicitly (the interrupt gate clears
+# RFLAGS.AC on entry per Intel SDM Vol 3 §6.12.1.4).
 cr3_load(as1);
+asm { 0x0F; 0x01; 0xCB; }   # stac
 store64(0xC00000, 0xAAAA);
 var val_as1 = load64(0xC00000);
+asm { 0x0F; 0x01; 0xCA; }   # clac
 
 # Switch to AS2, write 0xBBBB to same virtual address
 cr3_load(as2);
+asm { 0x0F; 0x01; 0xCB; }   # stac
 store64(0xC00000, 0xBBBB);
 var val_as2 = load64(0xC00000);
+asm { 0x0F; 0x01; 0xCA; }   # clac
 
 # Switch back to AS1, read again — should still be 0xAAAA
 cr3_load(as1);
+asm { 0x0F; 0x01; 0xCB; }   # stac
 var val_as1_check = load64(0xC00000);
+asm { 0x0F; 0x01; 0xCA; }   # clac
 
 # Restore kernel page tables (literal 0x1000 → mov rax, imm64; mov cr3, rax)
 asm {
@@ -357,8 +368,6 @@ if (val_as1_check == 0xAAAA) {
 } else {
     serial_println("Memory isolation: FAIL (AS1 clobbered)", 38);
 }
-#endif
-serial_println("Memory isolation test: SKIPPED (build with -D MEMORY_ISOLATION_TEST)", 67);
 
 # === Userland Exec Test ===
 # Spawn user_test_proc as a proper isolated process with its own address space

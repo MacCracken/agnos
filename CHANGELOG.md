@@ -5,6 +5,102 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.27.1] — 2026-05-11
+
+**Memory isolation: PASS.** Closes the long-running "deeper fault"
+carry-forward (active item #6, v1.25.1 → v1.26.0 → v1.27.0). Root
+cause was **SMAP** — the boot shim sets `CR4.SMAP` (bit 21, part of
+the `0x300020` OR-mask), and `proc_map_page` writes US=1 (`0x87`)
+per-process PD entries because the pages must be reachable from
+CPL=3. SMAP traps CPL=0 access to US=1 pages → the test's
+`store64(0xC00000, …)` from kernel mode → `#PF` (CR2=0xC00000) →
+`#GP` → `#DF` → triple fault. Every detail of the v1.26.0 forensic
+capture re-reads cleanly under this lens (the pre-switch PD-walk
+worked because it hit kernel US=0 pages; the post-switch
+`serial_println` worked for the same reason; only the user-page
+write traps).
+
+The 2026-04-27 hypothesis tree (PML4/PDPT clobber, stack-canary
+dangling pointer, cc5 codegen mis-emit, IDT mapping) all assumed the
+fault was about *page-table state* rather than *access-control
+hardware bits*. The SMAP bit was visible in the original CR4 dump
+(0x300020) but went unread for 14 days — process note in the
+archived issue doc to read every bit of CR0/CR3/CR4 the next time a
+page-walk faults inexplicably.
+
+### Fixed
+- **`kernel/core/main.cyr`** memory-isolation test: each of the
+  three access blocks (`store64+load64` on AS1, `store64+load64` on
+  AS2, `load64` rechecking AS1) is now bracketed by `stac`
+  (`0F 01 CB`) / `clac` (`0F 01 CA`). Per Intel SDM Vol 3 §6.12.1.4,
+  interrupt entry clears `RFLAGS.AC` implicitly, so the bracket
+  discipline survives a preempting interrupt.
+- **`#ifdef MEMORY_ISOLATION_TEST` gate removed** (v1.25.1
+  introduced; v1.27.1 closes). Test always runs at boot in default
+  builds. The "SKIPPED" branch is gone.
+
+### Changed
+- **`docs/development/roadmap.md`**: Active item #6 moved to a new
+  `## Completed (v1.27.1)` section; #7 (serial_putc) remains active
+  per its own issue doc's defer recommendation. Header binary-size
+  metric corrected (`243KB/93KB` → `248KB/92KB`).
+- **`scripts/version-bump.sh`**: now re-syncs the roadmap's
+  `Built with cyrius X.Y.Z` trailer from `cyrius.cyml`'s pin. v1.27.0
+  surfaced the staleness — the version was bumped but the toolchain
+  string wasn't. Closes a small class of drift bug.
+- **`docs/development/issue/`** → `archive/`:
+  - `2026-04-27-memory-isolation-deep.md` — closed by SMAP fix. The
+    archived copy carries a full **Resolution (v1.27.1)** section
+    with the SMAP analysis, observation-to-mechanism mapping table,
+    and a process note on the hypothesis class that misled the
+    original triage.
+  - `2026-04-27-cr3-load-helper.md` — closed. The v1.26.0 helper
+    was a real correctness fix and remains in proc.cyr; it just
+    wasn't the *whole* fix. With SMAP closed the test runs
+    end-to-end and the helper has no further open question.
+
+### CI/release
+- **`.github/workflows/ci.yml` `boot-test`**: assertion tightened to
+  require `"Memory isolation: PASS"` in addition to
+  `"Userland exec complete"`. The progression now reads:
+  v1.24.0 `"AGNOS kernel v"` → v1.25.0 `"Scheduler test done"` →
+  v1.25.1 `"Userland exec complete"` → v1.27.1 `"Memory isolation:
+  PASS"`. Guards the SMAP brackets and the
+  `proc_create_address_space` / `proc_map_page` / `cr3_load` triple
+  against future regression.
+
+### Verified
+- `scripts/build.sh` (x86_64): **248,896 B** (was 247,752 B at
+  v1.27.0 — +1,144 B for the un-gated test code, the three
+  stac/clac asm pairs, and the per-process address-space allocations
+  the test exercises that are now linked in rather than DCE'd away).
+- `scripts/build.sh --aarch64`: **92,216 B** (unchanged — the
+  memory-isolation test is x86-only).
+- `scripts/test.sh --all`: 7/7 PASS.
+- `scripts/check.sh`: 11/11 PASS.
+- QEMU `-cpu max -serial stdio`: boot reaches
+  ```
+  Memory isolation test...
+  AS1 wrote 0xAAAA, read=43690 recheck=43690
+  AS2 wrote 0xBBBB, read=48059
+  Memory isolation: PASS
+  Userland exec complete
+  ```
+  then runs the 3-tier bench to `=== done ===`.
+
+### Notes
+- This closes the v1.25.1 carry-forward #6 entirely. Active item
+  #7 (`serial_putc` regression) stays open per its issue doc's
+  defer recommendation; the methodology gap (bench-history lacks
+  qemu_version/cpu_model/host_arch columns) is the natural next
+  step if/when we want to investigate that one.
+- The `stac`/`clac` brackets pattern is the same one userland-
+  facing kernel paths use everywhere (copy_to_user / copy_from_user
+  shapes in Linux, etc.). If we grow more in-kernel diagnostics
+  that need to touch user pages, factoring this into a
+  `with_user_access(closure)` helper becomes worth doing — for
+  now, three call sites + adjacent comments is fine.
+
 ## [1.27.0] — 2026-05-11
 
 **Cyrius pin 5.7.22 → 5.10.44; ecosystem realignment cut.** Kicks off
