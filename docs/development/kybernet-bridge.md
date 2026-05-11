@@ -1,6 +1,10 @@
 # Kybernet Bridge Plan
 
+> **Last Updated**: 2026-05-11 (v1.27.2 closeout — kybernet pin refreshed to 1.2.0; design unchanged since v1.21.0)
+>
 > Make kybernet run on both Linux and AGNOS via a switchable syscall backend.
+>
+> **Status**: Plan landed in v1.21.0 (kybernet 1.0.2). kybernet is now at v1.2.0 (1.2.x arc — edge-boot machinery). The 26 AGNOS syscalls remain the canonical kybernet → AGNOS interface; see [`../../docs/development/state.md`](state.md) for the live sibling pin and [`docs/development/syscall-additions.md`](syscall-additions.md) for syscall-implementation details.
 
 ## Architecture
 

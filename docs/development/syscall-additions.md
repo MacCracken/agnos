@@ -1,6 +1,10 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> All 26 syscalls implemented as of v1.21.0. kybernet can run on AGNOS as PID 1.
+> **Last Updated**: 2026-05-11 (v1.27.2 closeout — header refresh; surface unchanged since v1.21.0)
+>
+> All 26 syscalls implemented as of v1.21.0. kybernet (currently v1.2.0) can run on AGNOS as PID 1.
+>
+> **Status**: This doc is the implementation reference for the v1.21.0 syscall buildout — historical record of how each syscall got wired in `kernel/core/syscall.cyr`. Current syscall surface lives in [`state.md` § Syscall surface](state.md). No new syscalls have shipped since v1.21.0; the v1.27.x arc has been correctness work, not API expansion.
 
 ## Current State
 

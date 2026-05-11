@@ -1,7 +1,32 @@
 # Security Hardening Implementation Guide
 
-> From the 2026-04-13 audit. See `docs/audit/2026-04-13-security-audit.md` for findings.
-> See `docs/development/roadmap.md` for the tracking table (S1-S13).
+> **Last Updated**: 2026-05-11 (v1.27.2 closeout — status block added; per-item implementation prose unchanged)
+>
+> From the 2026-04-13 audit. See [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md) for findings; [`roadmap.md`](roadmap.md) for the tracking table; [`state.md`](state.md) for live state.
+
+---
+
+## Status (v1.27.1)
+
+12 of 13 items are **Done** as of v1.27.1. Only **S7 (KASLR)** remains open. This guide is the historical implementation reference — what shipped, how, and the dependencies between items. For the current state, see `roadmap.md` § Security Hardening.
+
+| # | Item | Status | Notes |
+|---|------|--------|-------|
+| S1 | Separate user/kernel page mappings | ✅ Done | Per-process address spaces with KPTI-light scheme |
+| S2 | Per-CPU TSS + RSP0 | ✅ Done | Plumbing for ring-3 transition on each CPU |
+| S3 | PMM spinlock | ✅ Done | Lock-protected `pmm_alloc` / `pmm_free` |
+| S4 | Per-process exit codes | ✅ Done | `proc_exit_code` per slot, returned via `waitpid` |
+| S5 | Per-connection TCP RX buffers | ✅ Done | Bounded per-conn ring buffer |
+| S6 | Stack guard pages | ✅ Done | 4 KB unmapped page below each kernel stack |
+| S7 | **KASLR** | 🟠 **Open** | Last item. Needs boot shim + relocatable binary. Candidate for v1.28.0. |
+| S8 | KPTI (Kernel Page Table Isolation) | ✅ Done (partial) | PD entry 0 kept in user tables for trampoline/ISR; full isolation needs 4 KB pages |
+| S9 | Spectre v2 mitigations | ✅ Done | IBRS set/clear on SYSCALL entry/exit; retpoline deferred to compiler |
+| S10 | IOMMU (VT-d) | ✅ Done | ACPI RSDP/RSDT/DMAR parsing + VT-d root/context/IO page tables; DMA restricted to first 16 MB |
+| S11 | ARP request tracking | ✅ Done | Pending-request table with timeout |
+| S12 | TCP sequence/ACK validation | ✅ Done | Window-check on incoming segments |
+| S13 | Stack canaries | ✅ Done | RDRAND-seeded `_canary` secret; manual canary in ksyscall / elf_load / net_handle_tcp |
+
+The v1.27.1 memory-isolation closeout (SMAP root cause + `stac`/`clac` brackets) is downstream of S1+S8 — see [`../../CHANGELOG.md`](../../CHANGELOG.md) for the narrative.
 
 ---
 

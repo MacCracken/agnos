@@ -5,6 +5,104 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.27.2] — 2026-05-11
+
+**Closeout pass for the 1.27.x arc.** No kernel-source behavior change.
+This is the hygiene-and-doc cut that ties off the 1.27.x cleanup-and-
+leverage arc (v1.27.0 toolchain + v1.27.1 memory-isolation closeout)
+before turning to 1.28.0. Per CLAUDE.md's Closeout section: mechanical
+checks, dead-code audit, code review pass, cleanup sweep, security
+re-scan, doc sync. Findings:
+
+- **Mechanical**: `scripts/check.sh` 11/11, `scripts/test.sh --all`
+  7/7, QEMU boot reaches `Memory isolation: PASS` +
+  `Userland exec complete` + `=== done ===`. Both x86_64 and aarch64
+  binaries build clean under cyrius 5.10.44.
+- **Dead-code audit**: 62 fns DCE'd on x86_64, 0 on aarch64. Every
+  entry is intentional infrastructure (kstring/kfmt utilities, shell
+  command handlers, TCP/UDP/FAT16 paths the boot test doesn't
+  exercise). No real dead code to remove.
+- **Code review pass**: v1.27.0/v1.27.1 diffs walked end-to-end. The
+  proc.cyr `#ifdef ARCH_X86_64` guards correctly encompass all four
+  x86-specific page-table fns; the memory-isolation test's three
+  `stac`/`clac` brackets are correctly placed (only around US=1
+  user-page accesses — cr3_load itself walks kernel US=0 page tables
+  and needs no bracket); the version-bump.sh state.md regexes were
+  already verified via dry-run after the ERE-`|`-alternation bug at
+  v1.27.1.
+- **Cleanup sweep**: 5.7.19/5.7.22 references in `kernel/agnos.cyr`,
+  `kernel/arch/x86_64/boot_shim.cyr`, `kernel/core/proc.cyr`,
+  `CLAUDE.md`, `.github/workflows/ci.yml`, and roadmap.md's Completed
+  sections are all **intentional historical context** (citing when a
+  cyrius invariant was introduced, or when a fix shipped) — kept
+  as-is. The one actionable drift was `docs/architecture/overview.md`
+  — refreshed in this cut (see below).
+- **Security re-scan**: zero raw Linux syscalls (CI's `grep
+  'syscall('` would match the `test_hw_syscall` /
+  `test_syscall` function names — false positives), zero unbounded
+  loops, zero MMIO addresses outside `arch/`, every store64 to a
+  literal address is page-table or APIC machinery in `arch/`. Same
+  conclusion as the 2026-04-13 audit baseline.
+
+### Changed (documentation)
+- **`docs/architecture/overview.md`**: header refreshed (v1.25.0 ->
+  v1.27.x; 243KB/93KB -> pointer to `state.md`; cyrius 5.7.19 ->
+  5.10.44; dropped the now-misleading "106 tests" claim). Memory-map
+  table refined to show the 0-4 GB ceiling (v1.25.0) and the IOMMU
+  register window. Process Model section adds the SMAP / `US=1` /
+  stac-clac note so future readers don't repeat the v1.27.1 14-day
+  forensic detour.
+- **`docs/development/security-hardening.md`**: new **Status
+  (v1.27.1)** block at the top summarizing S1-S13. 12/13 are Done;
+  only S7 (KASLR) remains open. Per-item implementation prose
+  unchanged — this doc is now an implementation-history reference,
+  with the live tracking living in roadmap.md.
+- **`docs/development/syscall-additions.md`**: header refresh, status
+  block. No new syscalls since v1.21.0; current surface lives in
+  `state.md` § Syscall surface.
+- **`docs/development/kybernet-bridge.md`**: header refresh. kybernet
+  is now v1.2.0 (was v1.0.2 at v1.21.0). The 26-syscall AGNOS
+  interface is unchanged; pointer added to `state.md`.
+
+### Added
+- **`CODE_OF_CONDUCT.md`**: missing root-level file per
+  first-party-standards required-root-files set. Contributor Covenant
+  v2.1 reference. Flagged by `docs/doc-health.md`'s 2026-05-11 audit
+  as the next root-files gap.
+- **`docs/doc-health.md` § At-a-glance** refreshed after this pass:
+  three 🟡 Stale docs and one 🟠 Read-through promoted to ✅; new
+  Tier-1 row for `CODE_OF_CONDUCT.md`.
+
+### Verified
+- `scripts/build.sh` (x86_64): **248,896 B** (unchanged from v1.27.1
+  — doc-only release).
+- `scripts/build.sh --aarch64`: **92,216 B** (unchanged).
+- `scripts/test.sh --all`: 7/7 PASS.
+- `scripts/check.sh`: 11/11 PASS.
+- QEMU boot: banner v1.27.2 + `Memory isolation: PASS` +
+  `Userland exec complete` + full 3-tier bench to `=== done ===`.
+- `scripts/version-bump.sh` exercised end-to-end on the new
+  `docs/development/state.md` bump path (added v1.27.1) — Kernel row
+  + Last-refresh + Released date all updated by the script with no
+  manual edits.
+
+### Notes
+- 1.27.x arc ledger:
+  - **1.27.0** — toolchain alignment (5.7.22 -> 5.10.44; ecosystem
+    sibling-version refresh; CI fmt-check 5.10.x compat; one latent
+    cross-arch `#ifdef` correctness fix surfaced by the new
+    duplicate-fn warning).
+  - **1.27.1** — memory-isolation deeper-fault closeout (SMAP root
+    cause; gate dropped; CI assertion tightened; doc reshape per
+    first-party-documentation — CLAUDE.md durable-only, new
+    `state.md`, new `doc-health.md`).
+  - **1.27.2** — closeout hygiene + doc staleness sweep. Tied off.
+- **1.28.0 candidates**: KASLR (S7 — last open Security Hardening
+  item), VFS tagged unions (#2), struct refactor with #derive
+  accessors (#3), serial_putc matched-conditions re-measurement
+  (#7). KASLR is the most feature-shaped of the four; the others
+  are quality-of-life or methodology work.
+
 ## [1.27.1] — 2026-05-11
 
 **Memory isolation: PASS.** Closes the long-running "deeper fault"

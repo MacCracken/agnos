@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-05-11 (v1.27.1 cleanup pass — CLAUDE.md split into durable + state.md; README ownership of public reader content; this ledger created) | **Refresh cadence**: when a doc is touched, update its row. Full-tree sweep at minor-version closeouts.
+> **Last refresh**: 2026-05-11 (v1.27.2 closeout — three 🟡 Stale docs + one 🟠 Read-through promoted to ✅; CODE_OF_CONDUCT.md added to Tier 1; architecture/overview.md refreshed) | **Refresh cadence**: when a doc is touched, update its row. Full-tree sweep at minor-version closeouts.
 >
 > **Scope**: this repo only (`agnos`) — the `docs/` tree plus root-level files (README, CLAUDE.md, CHANGELOG, CONTRIBUTING, SECURITY, LICENSE, VERSION, cyrius.cyml). Sibling-repo docs (kybernet, agnosys, argonaut, agnostik, daimon, libro) are not audited here — each repo carries its own doc-health.md if its size justifies one. Cross-repo Cyrius pin/version drift lives in [`development/state.md`](development/state.md).
 >
@@ -16,15 +16,15 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 ---
 
-## At a glance — 2026-05-11 inventory
+## At a glance — 2026-05-11 inventory (v1.27.2 closeout)
 
-**20 markdown files total**: 7 root + 13 under `docs/`. Bucket counts after this pass:
+**21 markdown files total**: 8 root (CODE_OF_CONDUCT.md added in v1.27.2) + 13 under `docs/`. Bucket counts after the v1.27.2 closeout sweep:
 
 | Bucket | Count | What it means |
 |---|---|---|
-| ✅ **Fresh / refreshed in this audit** | 11 | Touched 2026-05-11: root files (README, CLAUDE.md, CHANGELOG, VERSION-related kernel files), `development/{roadmap,state}.md`, `development/issue/`, this ledger. |
-| 🟡 **Stale — refresh in place** | 3 | `docs/development/{kybernet-bridge,security-hardening,syscall-additions}.md` — last touched 2026-04-13 (v1.21.0 cleanup). Pre-date the v1.27.x arc. Need a sweep against the current syscall surface and the kybernet 1.0.2 → 1.2.0 jump. |
-| 🟠 **Read-through outstanding** | 1 | `docs/architecture/overview.md` — last touched 2026-04-27 (v1.26.0). Likely accurate but should be re-skimmed against the v1.27.x kernel surface. |
+| ✅ **Fresh / refreshed in this audit** | 15 | All root files + `architecture/overview.md` + `development/{roadmap,state,kybernet-bridge,security-hardening,syscall-additions}.md` + `development/issue/2026-04-27-serial-putc-cc5-regression.md` + this ledger. The three 🟡 docs and the 🟠 read-through were all promoted in this pass. |
+| 🟡 **Stale — refresh in place** | 0 | Cleared at v1.27.2. The three 2026-04-13-vintage `development/` docs (kybernet-bridge, security-hardening, syscall-additions) each got a "Last Updated" header + status block; per-item prose preserved as implementation-history reference. |
+| 🟠 **Read-through outstanding** | 0 | Cleared at v1.27.2. `architecture/overview.md` header refreshed (v1.27.x), memory-map table refined for the 0-4 GB ceiling and IOMMU window, Process Model section gained the SMAP/`stac`/`clac` note. |
 | 🔵 **Probably evergreen** | 3 | `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE` — standard, re-read pass annually. |
 | 📦 **Archive — frozen by design** | 5 | `docs/development/issue/archive/` (3 files) + `docs/development/proposals/archive/` (2 files). Verified — nothing misclassified. |
 | ❓ **Open question** | 0 | No live strategic ambiguity. |
@@ -41,15 +41,14 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 | `CONTRIBUTING.md` | (pre-v1.27) | 🔵 Evergreen | Standard contribution guide. Re-read on minor closeout. |
 | `SECURITY.md` | (pre-v1.27) | 🔵 Evergreen | Reporting policy. Re-read on minor closeout. |
 | `LICENSE` | (genesis) | 🔵 Evergreen | GPL-3.0-only verbatim. |
-| `VERSION` | 2026-05-11 | ✅ Fresh | `1.27.1`. Bumped by `scripts/version-bump.sh`; sole source of truth (cyrius.cyml resolves via `${file:VERSION}`). |
-
-Note: AGNOS doesn't carry `CODE_OF_CONDUCT.md` — should be added at the next root-files cleanup to match first-party requirements.
+| `VERSION` | 2026-05-11 | ✅ Fresh | `1.27.2`. Bumped by `scripts/version-bump.sh`; sole source of truth (cyrius.cyml resolves via `${file:VERSION}`). |
+| `CODE_OF_CONDUCT.md` | 2026-05-11 | ✅ Fresh | **Added v1.27.2** to match first-party required-root-files set. Contributor Covenant v2.1 reference. |
 
 ## Tier 2 — `docs/architecture/`
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `architecture/overview.md` | 2026-04-27 (v1.26.0) | 🟠 Read-through | Last refresh predates v1.27.0 toolchain bump and v1.27.1 memory-isolation closeout. Skim needed: confirm SMAP/SMEP/KPTI/IOMMU section reflects current state, page-table machinery section reflects per-process PD-copy `i<511` + PDPT[1..3] mirror, mention that `proc_*` fns are x86-only (#ifdef-guarded). |
+| `architecture/overview.md` | 2026-05-11 | ✅ Fresh | **Refreshed v1.27.2**: header bumped (v1.25.0 → v1.27.x, cyrius 5.7.19 → 5.10.44, dropped stale binary-size + test-count claims in favor of state.md pointer). Memory-map table refined to show the 0–4 GB ceiling (v1.25.0) and the IOMMU register window. Process Model section gained the SMAP / `US=1` / `stac` / `clac` note so future page-fault triage doesn't repeat the v1.27.1 14-day detour. |
 
 ## Tier 3 — `docs/audit/`
 
@@ -63,9 +62,9 @@ Note: AGNOS doesn't carry `CODE_OF_CONDUCT.md` — should be added at the next r
 |---|---|---|---|
 | `development/roadmap.md` | 2026-05-11 | ✅ Fresh | v1.27.1 closeout added `## Completed (v1.27.1)` section; Active table reduced to 4 items (#1 SMP-on-hardware, #2 tagged unions, #3 struct refactor, #7 serial_putc methodology). Header re-synced to `v1.27.1` + `cyrius 5.10.44` via `scripts/version-bump.sh`. |
 | `development/state.md` | 2026-05-11 | ✅ Fresh | **Created** in this pass. Live snapshot of version, binary sizes, source rollup, subsystem rollup, syscall surface, sibling pins, test surface, verification hosts. Bump-target for future `version-bump.sh` runs. |
-| `development/kybernet-bridge.md` | 2026-04-13 (v1.21.0) | 🟡 Stale | Pre-dates kybernet's 1.0.2 → 1.2.0 jump + the v1.27.x kernel surface. Likely has stale syscall-number references; needs a sweep against the current 26-syscall list. |
-| `development/security-hardening.md` | 2026-04-13 (v1.21.0) | 🟡 Stale | The S1–S13 security-hardening track in roadmap.md is mostly Done (only S7 KASLR open). This doc may not reflect that. Needs a sweep — or relocate / archive if roadmap.md has subsumed it. |
-| `development/syscall-additions.md` | 2026-04-13 (v1.21.0) | 🟡 Stale | At v1.21.0 the syscall surface was smaller; v1.27.x has 26. Either refresh as the canonical "next syscalls to add" doc, or archive if obsoleted by roadmap.md. |
+| `development/kybernet-bridge.md` | 2026-05-11 | ✅ Fresh | **Refreshed v1.27.2**: header notes kybernet's 1.0.2 → 1.2.0 jump; AGNOS 26-syscall interface unchanged. Per-tier syscall mapping preserved as historical-evolution reference. |
+| `development/security-hardening.md` | 2026-05-11 | ✅ Fresh | **Refreshed v1.27.2**: new Status (v1.27.1) block shows 12/13 items Done — only S7 (KASLR) remains open. Per-item implementation prose unchanged; this doc is now an implementation-history reference (live tracking lives in roadmap.md). |
+| `development/syscall-additions.md` | 2026-05-11 | ✅ Fresh | **Refreshed v1.27.2**: header bumped; status note added. Surface unchanged since v1.21.0 — no new syscalls in the v1.27.x correctness arc. |
 
 ## Tier 5 — `docs/development/issue/`
 
@@ -89,16 +88,15 @@ Live `proposals/` directory is empty — no in-flight design drafts.
 
 ## Next sweep targets
 
-1. **🟡 `development/{kybernet-bridge,security-hardening,syscall-additions}.md`** — date all three to a single refresh pass against the v1.27.x surface. Either bring current or archive into `development/` parent if the content has been subsumed by `roadmap.md`.
-2. **🟠 `architecture/overview.md`** — quick read-through, surface drift. Should pick up the v1.27.1 SMAP / `Memory isolation: PASS` note and the per-process page-table v1.25.1 fix details.
-3. **Root files gap**: add `CODE_OF_CONDUCT.md` to match first-party-required root files.
-4. **`BENCHMARKS.md`** — currently CI-generated artifact, not in repo. Decide whether to also check in the last released numbers as a tagged-state reference (matches what `release.yml` already does) or leave the CI artifact as the only source.
+1. **`BENCHMARKS.md`** — currently CI-generated artifact, not in repo. Decide whether to also check in the last released numbers as a tagged-state reference (matches what `release.yml` already does) or leave the CI artifact as the only source. Carried forward from v1.27.1.
+2. **Eventual archive policy for `development/{kybernet-bridge,security-hardening,syscall-additions}.md`**: each is now flagged as implementation-history reference with a status block, but if any of them drifts again at v1.28.x or later, consider relocating to `archive/` rather than repeatedly bumping headers. The pattern would be: subsumed-by-roadmap → archive with a Resolution-style note. Not actionable yet — all three are still useful in their current form.
+3. **Articles / narrative docs**: AGNOS doesn't currently carry `docs/articles/`. If the project earns a narrative arc (e.g., the v1.27.1 SMAP closeout story is publishable), the first-party-documentation pattern for `docs/articles/` + the "Since This Was Written" footer convention would apply. Not a 1.27.x concern.
 
 ---
 
 ## Forward doc-policy commitments
 
-- **`state.md` is bumped by `scripts/version-bump.sh`** going forward. v1.27.2's release post-hook should touch it; if it doesn't, fix the script.
+- **`state.md` is bumped by `scripts/version-bump.sh`** — exercised end-to-end at v1.27.2 (Kernel row, Last-refresh date, Released date all updated by the script with no manual edits). The sed regexes use `#` as delimiter to avoid the ERE-`|`-alternation bug that surfaced at v1.27.1 — see the comment in `scripts/version-bump.sh`.
 - **Doc-health is refreshed at minor-closeout**, not on every patch. Patches refresh affected rows only.
 - **Issue-doc archive on resolution** — when an issue doc closes, move it into `issue/archive/` with a prepended **Resolution (vX.Y.Z)** section. Never delete; the resolution narrative is the audit trail.
 - **Proposals graduate or die** — a proposal that sits in `proposals/` for more than one minor without progress should be either accepted (promote to a roadmap item with an ADR if the decision is non-obvious) or archived with a `Status: rejected` note.
