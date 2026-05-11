@@ -41,6 +41,11 @@ fn proc_save_context(pid, isr_rsp) {
     # [isr_rsp+88] = RFLAGS
     # [isr_rsp+96] = RSP   (hardware pushed — interrupted code's RSP)
     # [isr_rsp+104]= SS
+    # NOTE: kept on raw load64/store64 — accessor-based port at v1.28.3
+    # broke boot under cc5 5.10.44 regalloc (Process_set_* fn calls
+    # in this hot path perturbed register allocation in a way that
+    # broke the cr3_load downstream). Restoring raw offsets keeps
+    # the context-switch path byte-identical to pre-1.28.3.
     store64(p + 32, load64(isr_rsp));       # rax
     store64(p + 48, load64(isr_rsp + 8));   # rcx
     store64(p + 56, load64(isr_rsp + 16));  # rdx
@@ -62,6 +67,8 @@ fn proc_save_context(pid, isr_rsp) {
 fn proc_restore_context(pid, isr_rsp) {
     if (pid >= proc_count) { return 0; }
     var p = &proc_table + pid * 176;
+    # NOTE: kept on raw load64/store64 — see proc_save_context above
+    # for the rationale (v1.28.3 accessor port broke regalloc here).
     store64(isr_rsp, load64(p + 32));       # rax
     store64(isr_rsp + 8, load64(p + 48));   # rcx
     store64(isr_rsp + 16, load64(p + 56));  # rdx
@@ -102,12 +109,18 @@ fn do_context_switch(isr_rsp) {
     proc_set_state(new_pid, 2);  # → running
     proc_restore_context(new_pid, isr_rsp);
 
-    # Switch page tables if different
+    # Switch page tables if different. v1.28.3 fix: call the
+    # cr3_load() helper (proc.cyr) which loads CR3 via stack-relative
+    # [rbp-8] — robust under cc5's regalloc. The pre-1.26.0 pattern
+    # (`var x = expr; asm { mov cr3, rax }`) lived here as a residue
+    # since v1.0.0; it survived because cc5's regalloc happened to put
+    # new_cr3 in RAX at this site. Replaced proactively (the equivalent
+    # pattern in the memory-isolation test was fixed via cr3_load in
+    # v1.26.0; this site was overlooked at the time).
     var new_cr3 = proc_get_cr3(new_pid);
     var old_cr3 = proc_get_cr3(old);
     if (new_cr3 != old_cr3) {
-        var cr3_load = new_cr3;
-        asm { mov cr3, rax; }
+        cr3_load(new_cr3);
     }
     # S8 (KPTI): update global CR3 pair for SYSCALL stub
     kpti_kernel_cr3 = new_cr3;

@@ -8,6 +8,20 @@
 # 128: r13     136: r14      144: r15     152: rflags
 # 160: cr3     168: exit_code
 
+# Process struct: documentation-only.
+#
+# v1.28.3 attempted to add `#derive(accessors)` but discovered cyrius's
+# derive parser has a hard-coded 16-field cap (`field_names[16][32]` in
+# `lex_pp.cyr`); with 22 fields the metadata-table overflow silently
+# corrupts the offsets array, generating accessors at wrong byte
+# offsets. Filed as a cyrius bug (see
+# `cyrius/docs/development/issues/2026-05-11-derive-accessors-16-field-cap.md`).
+# When the cap is raised, this struct can grow `#derive(accessors)`
+# and consumers (proc.cyr's wrappers, sched.cyr's save/restore,
+# main.cyr's exec_pid load) can port to named accessors.
+#
+# Until then: consumers use raw `load64`/`store64` at the offsets
+# listed below (8 bytes per field per cyrius i64 convention).
 struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9; r10; r11; r12; r13; r14; r15; rflags; cr3; exit_code; }
 
 var proc_table[2816];  # 16 processes x 176 bytes each
