@@ -6,7 +6,7 @@ type: state
 
 # Documentation Health — agnos
 
-> **Last refresh**: 2026-05-11 (v1.28.0 ship — KASLR closes S7; CI boot-test grew the two-boot-diff KASLR assertion. No doc-tree health changes from the kernel work itself; row touched purely to confirm the ledger remains current at the new tag) | **Refresh cadence**: when a doc is touched, update its row. Full-tree sweep at minor-version closeouts.
+> **Last refresh**: 2026-05-11 (v1.28.4 closeout — arc-end sweep. 1.28.x added `kernel/lib/ktagged.cyr` source module (not a doc); `docs/development/proposals/2026-05-11-kaslr-scope.md` was promoted to live and is now archive-eligible (scope decided, A=deferred, B=shipped); serial_putc issue archived; bench-history schema migration noted in CHANGELOG; struct Process port blocked-upstream noted. No new doc-tree entries; the ledger captures the per-tag rolling state.) | **Refresh cadence**: when a doc is touched, update its row. Full-tree sweep at minor-version closeouts.
 >
 > **Scope**: this repo only (`agnos`) — the `docs/` tree plus root-level files (README, CLAUDE.md, CHANGELOG, CONTRIBUTING, SECURITY, LICENSE, VERSION, cyrius.cyml). Sibling-repo docs (kybernet, agnosys, argonaut, agnostik, daimon, libro) are not audited here — each repo carries its own doc-health.md if its size justifies one. Cross-repo Cyrius pin/version drift lives in [`development/state.md`](development/state.md).
 >
@@ -16,9 +16,9 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 ---
 
-## At a glance — 2026-05-11 inventory (v1.27.2 closeout + 1.28.x arc plan)
+## At a glance — 2026-05-11 inventory (v1.28.4 closeout)
 
-**22 markdown files total**: 8 root (CODE_OF_CONDUCT.md added in v1.27.2) + 14 under `docs/` (KASLR scope proposal added at v1.27.2 closeout, alongside the roadmap restructure for 1.28.x). Bucket counts after the v1.27.2 closeout sweep:
+**22 markdown files total**: 8 root + 14 under `docs/`. Unchanged count vs the v1.27.2 sweep — the 1.28.x arc added one proposal (kaslr-scope), archived one issue (serial_putc), and the proposal+archive pair is a wash. The arc's deliverables are mostly source-side (KASLR helpers, ktagged.cyr, PciDev derive, sched.cyr cr3_load hygiene) — those aren't counted here. Bucket counts after the v1.28.4 closeout:
 
 | Bucket | Count | What it means |
 |---|---|---|
@@ -70,7 +70,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `issue/2026-04-27-serial-putc-cc5-regression.md` | 2026-04-27 | ✅ Open / fresh | Active investigation. Recommendation in doc is **defer pending matched-conditions re-measurement**. Tracked as roadmap Active item #7. |
+| `issue/archive/2026-04-27-serial-putc-cc5-regression.md` | 2026-05-11 | 📦 Archive | **Closed at v1.28.1**. Resolution section (matched-conditions re-measurement under cyrius 5.10.44 / QEMU 11.0 / Ryzen 7 5800H / TCG; bench delta table showing cc5 broadly equal-or-better than cc3; `serial_putc` outlier explained by QEMU UART-emulation latency, not codegen) prepended to the original body. Frozen. |
 | `issue/archive/2026-04-27-memory-isolation-deep.md` | 2026-05-11 | 📦 Archive | **Closed at v1.27.1**. Resolution section (SMAP root cause + observation-to-mechanism table + process note on the hypothesis class that misled triage) prepended to the original body. Frozen — refer back but do not edit. |
 | `issue/archive/2026-04-27-cr3-load-helper.md` | 2026-05-11 | 📦 Archive | Closed alongside the memory-isolation fix at v1.27.1 — the v1.26.0 helper was a real fix, just not the whole one. |
 | `issue/archive/2026-04-27-cyrius-fmt-tracks-braces-in-comments.md` | 2026-04-27 | 📦 Archive | Closed at v1.26.1 (cyrius 5.7.22 fmt fix). Frozen. |
@@ -79,7 +79,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `proposals/2026-05-11-kaslr-scope.md` | 2026-05-11 | ✅ Open / fresh | **Created v1.27.2.** Full-binary-relocation vs data-only KASLR design choice for 1.28.0. Recommends data-only as the 1.28.0 scope; full relocation deferred to 1.29+. Promote to an ADR if approved before 1.28.0 implementation begins. |
+| `proposals/2026-05-11-kaslr-scope.md` | 2026-05-11 | 🟢 Live / archive-eligible | Created v1.27.2 closeout; Option B (data-only) shipped at v1.28.0 ✅; Option A (full binary) deferred indefinitely (gated on cyrius PIE — slotted at cyrius v6.1.x). The proposal kept live because Option A is a real future candidate; would archive when full KASLR ships or is permanently abandoned. |
 | `proposals/archive/2026-04-27-acpi-identity-map-ceiling.md` | 2026-04-27 | 📦 Archive | Closed at v1.25.0 (`pt_init` extended to cover 0–4 GB). |
 | `proposals/archive/2026-04-27-cc5-kernel-boot-shim-regression.md` | 2026-04-27 | 📦 Archive | Closed at v1.24.0 (cyrius 5.7.19 kmode emit-order fix). |
 

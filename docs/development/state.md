@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-05-11 (v1.27.1 cut) | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. If a row above goes stale by more than a minor's worth of work, the row is wrong — fix it or move it.
+> **Last refresh**: 2026-05-11 (v1.28.4 closeout) | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. If a row above goes stale by more than a minor's worth of work, the row is wrong — fix it or move it.
 >
 > **Scope**: live snapshot of this repo (`agnos`). Volatile state lives here so [`CLAUDE.md`](../../CLAUDE.md) can stay durable. Historical narrative lives in [`CHANGELOG.md`](../../CHANGELOG.md); the design ledger lives in [`roadmap.md`](roadmap.md).
 
@@ -16,10 +16,10 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.28.3** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.28.4** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **5.10.44** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-11 | [`CHANGELOG.md`](../../CHANGELOG.md) |
-| **Last assertion tightened** | `Memory isolation: PASS` | CI `boot-test` job, v1.27.1 |
+| **Last assertion tightened** | `KASLR: pmm_next_free=N` varies across two boots | CI `boot-test` job, v1.28.0 |
 
 ---
 
@@ -31,13 +31,19 @@ DCE behavior. All sizes are from `wc -c` on `build/agnos*` after
 
 | Arch | Binary | Size | Notes |
 |---|---|---|---|
-| x86_64 | `build/agnos` | **248,896 B** (~243 KB) | Multiboot1 ELF, entry `0x100060`. Boots under `qemu-system-x86_64 -cpu max`. |
-| aarch64 | `build/agnos-aarch64` | **92,216 B** (~90 KB) | Cross-compiled. DTB + EL2→EL1 + PL011 UART + GIC. Compile-tested only — boot harness not yet wired. |
+| x86_64 | `build/agnos` | **250,704 B** (~245 KB) | Multiboot1 ELF, entry `0x100060`. Boots under `qemu-system-x86_64 -cpu max`. |
+| aarch64 | `build/agnos-aarch64` | **93,288 B** (~91 KB) | Cross-compiled. DTB + EL2→EL1 + PL011 UART + GIC. Compile-tested only — boot harness not yet wired. |
 
-x86_64 size moved 247,752 → 248,896 (+1,144 B) at v1.27.1 from un-gating the
-memory-isolation test surface. aarch64 size moved 95,328 → 92,216 (−3,112 B)
-at v1.27.0 from the `#ifdef ARCH_X86_64` guards on x86-specific page-table
-fns in `proc.cyr` (dead-code dropped under DCE).
+Size trajectory across the 1.28.x arc:
+
+| Cut | x86_64 | aarch64 | Delta source |
+|---|---|---|---|
+| v1.27.2 (arc start) | 248,896 B | 92,216 B | — |
+| v1.28.0 | 249,152 B (+256) | 92,488 B (+272) | KASLR (rdrand_u64, kaslr_seed, sign-mask, probe printout, memory-isolation phys-move) |
+| v1.28.1 | 249,152 B (=) | 92,488 B (=) | bench-history schema only (no kernel-source change) |
+| v1.28.2 | 249,984 B (+832) | 93,288 B (+800) | ktagged.cyr + VFS port + VfsType enum + layout comment |
+| v1.28.3 | 250,704 B (+720) | 93,288 B (=) | PciDev `#derive(accessors)` (x86-only) |
+| v1.28.4 | 250,704 B (=) | 93,288 B (=) | Closeout — doc-only changes, no kernel source delta |
 
 ---
 
@@ -58,7 +64,7 @@ fns in `proc.cyr` (dead-code dropped under DCE).
 
 ## Subsystem status (35)
 
-All subsystems are **complete** through v1.27.1. The roadmap's "Active" table
+All subsystems are **complete** through v1.28.4. The roadmap's "Active" table
 is the source of truth for in-flight work; this is the shipped surface.
 
 | Subsystem | Notes |
@@ -137,7 +143,7 @@ for the alignment rationale.
 |---|---|---|
 | `scripts/check.sh` | **11/11** PASS | build, test, doc-exists ×6, version-in-kernel, version-in-changelog, binary-size |
 | `scripts/test.sh --all` | **7/7** PASS | x86 builds, multiboot ELF, size, kernel_hello builds; aarch64 compiles, size, valid ELF |
-| CI `boot-test` (QEMU) | banner + `Memory isolation: PASS` + `Userland exec complete` | `.github/workflows/ci.yml` `boot-test` job |
+| CI `boot-test` (QEMU) | banner + `KASLR: pmm_next_free=N` varies across 2 boots + `Memory isolation: PASS` + `Userland exec complete` | `.github/workflows/ci.yml` `boot-test` job |
 | CI `Format check` | 47/47 fmt-clean (1 skip: `kernel/user/shell.cyr` per `#ifdef`-in-fn-body carve-out) | `ci.yml` `check` job |
 
 CI runs on a self-hosted runner labeled `[self-hosted, linux, x64]` for
@@ -152,15 +158,16 @@ Source: [`docs/development/roadmap.md`](roadmap.md) `## Active` section.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | SMP AP wakeup on real hardware | QEMU-validated only; needs hardware |
-| 2 | Tagged unions for VFS entry types | `ktagged.cyr` design pending |
-| 3 | Struct refactor with `#derive(accessors)` | proc_table, vfs_table, pci_devs |
-| 7 | `serial_putc` benchmark regression (rolling from v1.25.1) | Issue doc recommends defer pending matched-conditions re-measure — methodology gap, not a real bug |
+| 1 | SMP AP wakeup on real hardware | QEMU-validated only; needs hardware-in-the-loop infra (RPi4 / NUC). Stays open across multiple arcs. |
+| 3 | `struct Process` `#derive(accessors)` port | Blocked on cyrius v5.11.x cap-raise — upstream acknowledged the 16-field metadata-table overflow + slotted for repair. Picks up passively at the next cyrius pin bump. |
 
-Recently closed (see [`CHANGELOG.md`](../../CHANGELOG.md) and roadmap §
-"Completed (v1.27.1)"):
-- **v1.27.1** — memory-isolation deeper fault closed (root cause: SMAP); test un-gated; CI assertion tightened
-- **v1.27.0** — cyrius pin 5.7.22 → 5.10.44; ecosystem realignment; CI fmt-check fixed for 5.10.x silent `--check` semantics
+Recently closed (see [`CHANGELOG.md`](../../CHANGELOG.md)):
+- **v1.28.4** — closeout pass for the 1.28.x arc (this cut)
+- **v1.28.3** — struct refactor: `PciDev` `#derive(accessors)` ✅; `vfs_table` counted (ktagged in v1.28.2); `proc_table` blocked (filed upstream). Active #3 partially closed. Plus a v1.27.x-era hygiene fix in `sched.cyr` (cr3_load helper for the CR3-load brittle pattern)
+- **v1.28.2** — VFS tagged unions via new `kernel/lib/ktagged.cyr`. Active #2 closed
+- **v1.28.1** — `serial_putc` methodology: bench-history provenance schema; matched-conditions re-measure showed the "regression" was QEMU drift. Active #7 closed
+- **v1.28.0** — KASLR (data-only); Security Hardening track fully closed (13/13)
+- **v1.27.x arc** — see archived entries in `CHANGELOG.md`
 
 ---
 

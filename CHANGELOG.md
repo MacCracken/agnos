@@ -5,6 +5,95 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.28.4] — 2026-05-11
+
+**Closeout pass for the 1.28.x arc.** No kernel-source behavior change.
+P(-1) hygiene-and-doc cut that ties off the 1.28.x arc before turning
+to 1.29.0. Per CLAUDE.md's Closeout section: mechanical checks,
+dead-code audit, code review pass, cleanup sweep, security re-scan,
+doc sync. Findings:
+
+- **Mechanical**: `scripts/check.sh` 11/11, `scripts/test.sh --all`
+  7/7, QEMU boot reaches all CI checkpoints — banner v1.28.4 +
+  `KASLR: pmm_next_free=N` varying across two boots (1088 / 1369) +
+  `PCI: 4 devices` (validating the v1.28.3 PciDev path) +
+  `Memory isolation: PASS` + `Userland exec complete` + `=== done ===`.
+- **Dead-code audit**: 62 fns DCE'd on x86_64, 0 on aarch64 — same
+  baseline as v1.27.2. Zero new dead code from the 1.28.x arc; every
+  new addition (rdrand_u64, kaslr_seed, ktag/kpayload, VfsType,
+  PciDev_*) is reached from at least one consumer.
+- **Code review pass**: 6 commits across .0/.1/.2/.3 walked end-to-end.
+  Missed `#ifdef` guards: none. Unguarded asm with implicit register
+  contracts: 1 found and fixed in 1.28.3 (sched.cyr cr3_load hygiene).
+  Off-by-ones, silently-ignored errors: none. Specifically vetted:
+  `kaslr_seed`'s sign-mask before modulo; ktagged accessor sites in
+  vfs.cyr + syscall.cyr; PciDev_* sites in pci.cyr / iommu.cyr /
+  virtio_net.cyr / virtio_blk.cyr.
+- **Cleanup sweep**: Every 5.7.x reference in source/docs is
+  intentional historical context (cyrius v5.7.19 kmode invariant,
+  v5.7.22 fmt fix). Removed two orphaned files in `build/`:
+  `agnos_miso` + `agnos_x86_miso.cyr` (v1.27.1-era memory-isolation
+  test temp artifacts).
+- **Security re-scan**: Zero raw Linux syscalls (CI's grep matches
+  `test_hw_syscall` / `test_syscall` — false positives), zero
+  unbounded loops, zero MMIO outside `arch/`, zero ≥ 64 KB buffers.
+  Same baseline as 2026-04-13 audit; arc additions added no new
+  attack surface.
+
+### Changed (documentation + housekeeping)
+- **`docs/development/state.md`**: Build artifacts table gained a
+  per-cut size-trajectory subtable for the 1.28.x arc. In-flight
+  roadmap snapshot pruned to live items only (was carrying stale #2,
+  #3 (full), #7 entries that closed during the arc). Last-refresh
+  bumped; subsystem-status header date updated.
+- **`docs/doc-health.md`**: kaslr-scope proposal status moved
+  Open/fresh → Live/archive-eligible (Option B shipped at 1.28.0;
+  Option A still real candidate gated on cyrius PIE). serial_putc
+  issue archived with Resolution v1.28.1 section.
+
+### Removed
+- **`build/agnos_miso`, `build/agnos_x86_miso.cyr`** — stale v1.27.1
+  memory-isolation test artifacts. No references anywhere.
+
+### Verified
+- `scripts/build.sh` (x86_64): **250,704 B** (unchanged from v1.28.3
+  — closeout is doc-only).
+- `scripts/build.sh --aarch64`: **93,288 B** (unchanged).
+- `scripts/test.sh --all`: 7/7 PASS.
+- `scripts/check.sh`: 11/11 PASS.
+- QEMU boot: banner v1.28.4 + KASLR varies + Memory isolation: PASS
+  + Userland exec complete + `=== done ===`.
+
+### Notes
+- **1.28.x arc ledger** (5 cuts shipped, 4 active items resolved):
+  - **1.28.0** — KASLR (data-only); Security Hardening track fully
+    closed (13/13).
+  - **1.28.1** — `serial_putc` methodology + bench-history schema;
+    Active #7 closed via documented re-measurement, not a code
+    change.
+  - **1.28.2** — VFS tagged unions via new `kernel/lib/ktagged.cyr`;
+    Active #2 closed.
+  - **1.28.3** — Struct refactor with `#derive(accessors)`: PciDev
+    shipped; proc_table blocked on cyrius 16-field cap (filed,
+    acknowledged + slotted for cyrius v5.11.x repair). Plus
+    `sched.cyr` `cr3_load` hygiene fix (v1.27.x-era brittle pattern,
+    fixed proactively before next regalloc perturbation).
+  - **1.28.4** — closeout (this cut).
+- **Active table after this minor**: only **#1 (SMP-on-hardware)**.
+  proc_table derive-port is gated on cyrius v5.11.x — passive pickup
+  at the next pin bump. Full-binary KASLR (Option A) sits on a
+  parallel cyrius dependency (v6.1.x PIE).
+- **1.29.0 candidates** (surface, not commitments):
+  - **`Process` `#derive(accessors)` port** — passive once cyrius
+    v5.11.x cap-raise lands.
+  - **Full-binary KASLR (Option A)** — gated on cyrius v6.1.x PIE.
+  - **ext2 (Planned #5)** — real filesystem, replaces FAT16 floor.
+  - **mmap (Planned #6)** — anonymous mmap is independent of ext2.
+  - **Preemptive scheduling (Planned #8)** — cooperative round-robin
+    is the floor; preemptive needs interrupt-safe context save/restore.
+  - **Hardware-validation infra (SMP item #1)** — RPi4 / NUC harness.
+  - **Bench-history snapshot in repo** (post-1.27.2 carry).
+
 ## [1.28.3] — 2026-05-11
 
 **Struct refactor with `#derive(accessors)` — partial close of Active
