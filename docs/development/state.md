@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-05-11 (v1.28.4 closeout) | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. If a row above goes stale by more than a minor's worth of work, the row is wrong — fix it or move it.
+> **Last refresh**: 2026-05-11 (v1.29.0 closeout) | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. If a row above goes stale by more than a minor's worth of work, the row is wrong — fix it or move it.
 >
 > **Scope**: live snapshot of this repo (`agnos`). Volatile state lives here so [`CLAUDE.md`](../../CLAUDE.md) can stay durable. Historical narrative lives in [`CHANGELOG.md`](../../CHANGELOG.md); the design ledger lives in [`roadmap.md`](roadmap.md).
 
@@ -16,7 +16,7 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.28.4** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.29.0** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **5.10.44** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-11 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Last assertion tightened** | `KASLR: pmm_next_free=N` varies across two boots | CI `boot-test` job, v1.28.0 |
@@ -43,7 +43,7 @@ Size trajectory across the 1.28.x arc:
 | v1.28.1 | 249,152 B (=) | 92,488 B (=) | bench-history schema only (no kernel-source change) |
 | v1.28.2 | 249,984 B (+832) | 93,288 B (+800) | ktagged.cyr + VFS port + VfsType enum + layout comment |
 | v1.28.3 | 250,704 B (+720) | 93,288 B (=) | PciDev `#derive(accessors)` (x86-only) |
-| v1.28.4 | 250,704 B (=) | 93,288 B (=) | Closeout — doc-only changes, no kernel source delta |
+| v1.29.0 | 250,704 B (=) | 93,288 B (=) | Closeout — doc-only changes, no kernel source delta |
 
 ---
 
@@ -64,7 +64,7 @@ Size trajectory across the 1.28.x arc:
 
 ## Subsystem status (35)
 
-All subsystems are **complete** through v1.28.4. The roadmap's "Active" table
+All subsystems are **complete** through v1.29.0. The roadmap's "Active" table
 is the source of truth for in-flight work; this is the shipped surface.
 
 | Subsystem | Notes |
@@ -162,7 +162,7 @@ Source: [`docs/development/roadmap.md`](roadmap.md) `## Active` section.
 | 3 | `struct Process` `#derive(accessors)` port | Blocked on cyrius v5.11.x cap-raise — upstream acknowledged the 16-field metadata-table overflow + slotted for repair. Picks up passively at the next cyrius pin bump. |
 
 Recently closed (see [`CHANGELOG.md`](../../CHANGELOG.md)):
-- **v1.28.4** — closeout pass for the 1.28.x arc (this cut)
+- **v1.29.0** — closeout pass for the 1.28.x arc (this cut)
 - **v1.28.3** — struct refactor: `PciDev` `#derive(accessors)` ✅; `vfs_table` counted (ktagged in v1.28.2); `proc_table` blocked (filed upstream). Active #3 partially closed. Plus a v1.27.x-era hygiene fix in `sched.cyr` (cr3_load helper for the CR3-load brittle pattern)
 - **v1.28.2** — VFS tagged unions via new `kernel/lib/ktagged.cyr`. Active #2 closed
 - **v1.28.1** — `serial_putc` methodology: bench-history provenance schema; matched-conditions re-measure showed the "regression" was QEMU drift. Active #7 closed

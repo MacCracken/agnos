@@ -5,16 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.28.4] — 2026-05-11
+## [1.29.0] — 2026-05-11
 
-**Closeout pass for the 1.28.x arc.** No kernel-source behavior change.
-P(-1) hygiene-and-doc cut that ties off the 1.28.x arc before turning
-to 1.29.0. Per CLAUDE.md's Closeout section: mechanical checks,
-dead-code audit, code review pass, cleanup sweep, security re-scan,
-doc sync. Findings:
+**1.28.x arc gate / 1.29.x arc opens.** No kernel-source behavior
+change. This is the P(-1) gate cut — closes the 1.28.x arc cleanly
+and opens 1.29.x with a fresh Active table and a clear next-arc
+horizon (**1.30.0 is reserved for full-binary KASLR**; see
+[`docs/development/roadmap.md`](docs/development/roadmap.md) `## 1.30.0`).
+
+Versioning note: the closeout work that became this entry was
+originally drafted as `1.28.4` (closeout patch). Reframed as the
+1.29.0 gate per the established "minor.0 = arc-gate / arc-opener"
+pattern in the AGNOS ecosystem — the closeout is the natural arc
+boundary, and bumping the minor signals that boundary to downstreams.
+
+Per CLAUDE.md's Closeout section: mechanical checks, dead-code audit,
+code review pass, cleanup sweep, security re-scan, doc sync. Findings:
 
 - **Mechanical**: `scripts/check.sh` 11/11, `scripts/test.sh --all`
-  7/7, QEMU boot reaches all CI checkpoints — banner v1.28.4 +
+  7/7, QEMU boot reaches all CI checkpoints — banner v1.29.0 +
   `KASLR: pmm_next_free=N` varying across two boots (1088 / 1369) +
   `PCI: 4 devices` (validating the v1.28.3 PciDev path) +
   `Memory isolation: PASS` + `Userland exec complete` + `=== done ===`.
@@ -61,7 +70,7 @@ doc sync. Findings:
 - `scripts/build.sh --aarch64`: **93,288 B** (unchanged).
 - `scripts/test.sh --all`: 7/7 PASS.
 - `scripts/check.sh`: 11/11 PASS.
-- QEMU boot: banner v1.28.4 + KASLR varies + Memory isolation: PASS
+- QEMU boot: banner v1.29.0 + KASLR varies + Memory isolation: PASS
   + Userland exec complete + `=== done ===`.
 
 ### Notes
@@ -78,21 +87,31 @@ doc sync. Findings:
     acknowledged + slotted for cyrius v5.11.x repair). Plus
     `sched.cyr` `cr3_load` hygiene fix (v1.27.x-era brittle pattern,
     fixed proactively before next regalloc perturbation).
-  - **1.28.4** — closeout (this cut).
+  - **1.29.0** — arc gate (this cut). Closes 1.28.x; opens 1.29.x.
 - **Active table after this minor**: only **#1 (SMP-on-hardware)**.
   proc_table derive-port is gated on cyrius v5.11.x — passive pickup
-  at the next pin bump. Full-binary KASLR (Option A) sits on a
-  parallel cyrius dependency (v6.1.x PIE).
-- **1.29.0 candidates** (surface, not commitments):
-  - **`Process` `#derive(accessors)` port** — passive once cyrius
-    v5.11.x cap-raise lands.
-  - **Full-binary KASLR (Option A)** — gated on cyrius v6.1.x PIE.
-  - **ext2 (Planned #5)** — real filesystem, replaces FAT16 floor.
-  - **mmap (Planned #6)** — anonymous mmap is independent of ext2.
-  - **Preemptive scheduling (Planned #8)** — cooperative round-robin
-    is the floor; preemptive needs interrupt-safe context save/restore.
-  - **Hardware-validation infra (SMP item #1)** — RPi4 / NUC harness.
-  - **Bench-history snapshot in repo** (post-1.27.2 carry).
+  at the next pin bump (slated for 1.29.1). Full-binary KASLR
+  (Option A) sits on cyrius v6.1.x PIE and is **reserved for the
+  1.30.0 headline** — explicitly NOT a 1.29.x slot.
+- **1.29.x arc plan** (full table in roadmap.md):
+  - **1.29.1** — `Process` `#derive(accessors)` port (passive, cyrius
+    v5.11.x dep).
+  - **1.29.2** — Bench-history snapshot in repo (post-1.27.2 carry —
+    decide check-in vs CI-artifact-only).
+  - **1.29.3+** — `mmap` (anonymous-only; file-backed waits for
+    ext2).
+  - **1.29.x** — Hardware-validation infra (RPi4 / NUC; unblocks
+    Active #1).
+  - **Explicitly NOT in 1.29.x**: full-KASLR (1.30.0 headline), ext2
+    (its own arc), preemptive scheduling (its own arc).
+- **1.30.0 — Full-Binary KASLR (Option A)**: reserved slot. Hard
+  prerequisite is cyrius v6.1.x PIE codegen. Closes the last ~20% of
+  KASLR security value that data-only KASLR (shipped v1.28.0) doesn't
+  cover. Two-boot-diff CI assertion extends with a `KASLR:
+  kernel_slide=0x<hex>` probe alongside the existing `pmm_next_free`
+  one. Full design in `proposals/2026-05-11-kaslr-scope.md` § Option A;
+  cyrius-side prerequisite tracked at
+  [`cyrius/proposals/2026-05-11-pie-support.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/proposals/2026-05-11-pie-support.md).
 
 ## [1.28.3] — 2026-05-11
 

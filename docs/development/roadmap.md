@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.28.4 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
+> **Current**: v1.29.0 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
 >
 > Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 
@@ -18,34 +18,46 @@ Per-version detail lives in [`CHANGELOG.md`](../../CHANGELOG.md). This is the at
 | **v1.25.x** | Identity-map ceiling 16 MB → 4 GB (`pt_init`) — closes the latent ACPI fault at QEMU's `~0x07FE0000` region; per-process PD-copy loop mirrored to `i<511` so kernel data above 16 MB is reachable under per-process CR3; PDPT[1..3] mirror for 1–4 GB; memory-isolation test gated; CI assertion tightened to `Scheduler test done` then `Userland exec complete`. |
 | **v1.26.x** | `cr3_load(cr3_val)` helper in `proc.cyr` (stack-relative inline-asm load — replaces the brittle `var x = expr; asm { mov cr3, rax }` pattern); `docs/development/issue/` folder convention introduced; cyrius pin 5.7.19 → 5.7.22 (fmt braces-in-comments fix). |
 | **v1.27.x** | Cyrius pin 5.7.22 → 5.10.44 + ecosystem realignment; latent cross-arch `#ifdef` correctness fix in `proc.cyr` (4 x86-only page-table fns); **memory-isolation deeper-fault closed — root cause was SMAP**, fix is `stac`/`clac` brackets, test un-gated, CI assertion tightened to `Memory isolation: PASS`; CLAUDE.md durable-only reshape per first-party-documentation standards; new `docs/development/state.md` (volatile state) + `docs/doc-health.md` (whole-tree currency ledger); `CODE_OF_CONDUCT.md` added. |
+| **v1.28.x** | **KASLR (data-only)** — Security Hardening **track fully closed (13/13)**: `rdrand_u64` helper, `kaslr_seed`, randomized `pmm_next_free`, two-boot-diff CI assertion. **`serial_putc` methodology**: bench-history provenance schema (qemu_version / cpu_model / host_arch / kvm_enabled / cyrius_version) — matched-conditions re-measure showed the "regression" was QEMU UART-emulation drift, not codegen. **VFS tagged unions** via new `kernel/lib/ktagged.cyr` (inline tagged-union helpers, no heap alloc). **Struct refactor** (partial): `PciDev` `#derive(accessors)` ✅, `vfs_table` counted (ktagged port), `proc_table` blocked on cyrius v5.11.x cap-raise (16-field metadata-table overflow filed upstream, acknowledged + slotted). `sched.cyr` `cr3_load` hygiene fix (replaces v1.27.x-era brittle CR3-load pattern). 1.29.0 is the arc gate. |
 
-## 1.28.x Arc Plan
+## 1.29.x Arc Plan
 
-The 1.27.x arc closed at v1.27.2 with an empty Active table modulo #1 (SMP-on-hardware, hardware-gated) and #7 (`serial_putc` regression — methodology gap). 1.28.x is the **closeout-and-feature** arc: ship the last open Security Hardening item (S7 KASLR) as the headline feature in `.0`, then walk down the remaining Active items in tight focused patches.
+The 1.28.x arc closed at v1.29.0 (the gate cut — closeout findings from the 4-slot arc captured there). 1.29.x is a **scoped-feature arc**: pick up the cyrius v5.11.x dependency (proc_table derive port lands passively at pin bump) and walk down the longer-horizon "Planned" items in focused patches. **1.30.0 is reserved for full-binary KASLR (Option A)**; the 1.29.x arc explicitly does *not* try to do that — it builds the runway.
 
-| Slot | Item | Source | Status |
-|------|------|--------|--------|
-| **1.28.0** | **KASLR (data-only)** | Security Hardening S7 | ✅ **Shipped 2026-05-11**. `rdrand_u64` helper, `kaslr_seed`, randomized `pmm_next_free`, two-boot-diff CI assertion. See [`CHANGELOG.md`](../../CHANGELOG.md) v1.28.0 entry. |
-| **1.28.1** | **`serial_putc` methodology** | Active #7 | ✅ **Shipped 2026-05-11**. bench-history schema extended with `qemu_version` / `cpu_model` / `host_arch` / `kvm_enabled` / `cyrius_version`. Matched-conditions re-measurement confirmed the regression was QEMU UART-emulation drift, not codegen. Issue archived with full Resolution section. Active #7 closed. |
-| **1.28.2** | **VFS tagged unions** | Active #2 | ✅ **Shipped 2026-05-11**. New `kernel/lib/ktagged.cyr` (inline tagged-union helpers, no heap allocation — diverges from cyrius stdlib `lib/tagged.cyr` shape). `VfsType` enum + ktag/kpayload accessor port across `vfs.cyr` + `syscall.cyr`. Boot path validates VFS, memfile, initrd, signalfd/epoll/timerfd, and pipe paths preserved. Active #2 closed. |
-| **1.28.3** | **Struct refactor with `#derive(accessors)`** | Active #3 | ✅ **Partially shipped 2026-05-11.** `pci_devs` ported via `#derive(accessors)` (4 fields, clean). `vfs_table` already closed via `ktagged` at v1.28.2 (different mechanism, same goal — magic offsets removed). `proc_table` blocked on cyrius `#derive(accessors)` 16-field cap; filed at [`cyrius/issues/2026-05-11-derive-accessors-16-field-cap.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-11-derive-accessors-16-field-cap.md) — **acknowledged upstream and slotted for v5.11.x repair**. 2 of 3 subsystems closed; proc_table follows when agnos picks up the cyrius cap-raise (passive — pin bump only). Also lands a v1.27.x-era hygiene fix in `sched.cyr` (cr3_load helper replaces the pre-v1.26.0 brittle CR3-load pattern at the context-switch site). |
+| Slot | Item | Source | Notes |
+|------|------|--------|-------|
+| **1.29.0** | **1.28.x closeout gate** | this arc opener | ✅ shipped. Closes the 1.28.x arc cleanly, opens 1.29.x. |
+| **1.29.1** | **`Process` `#derive(accessors)` port** | Active #3 residue | Passive — depends on cyrius v5.11.x cap-raise landing first. Once the cyrius pin bump arrives, re-add `#derive(accessors)` to `struct Process` + port consumers (proc.cyr wrappers, sched.cyr save/restore, main.cyr exec_pid load). Small follow-up. |
+| **1.29.2** | **Bench-history snapshot in repo** | post-1.27.2 carry | Decide: check in last-released `BENCHMARKS.md` + `bench-history.csv` as a tagged-state reference (matches what `release.yml` already attaches as release artifact), or leave the CI artifact as the only source. Small operational item; resolvable in one cut. |
+| **1.29.3+** | **`mmap` (anonymous-only)** | Planned #6 (split) | Anonymous mmap is independent of ext2; can ship without a real filesystem. Adds VMM surface but no fs work — reasonable next bite after the small items. File-backed mmap waits for ext2 (post-1.30). |
+| **1.29.x** | **Hardware-validation infra** | Active #1 unblock | RPi4 / NUC harness on the self-hosted runner. Unblocks SMP-AP-wakeup-on-real-hardware (Active #1). Cross-cuts CI work, not kernel work — slottable any time. |
 
-After 1.28.3 the Active table is empty modulo **SMP-on-hardware** (hardware-gated) and the proc_table derive-port residue (cyrius-gated). 1.28.4 is a P(-1) hardening / closeout patch before tagging 1.29.0.
+Order beyond 1.29.1 is loose — the arc shape will firm up as we ship. Notable items that are **explicitly NOT in 1.29.x**:
 
-### Carried over (not 1.28.x)
+- **Full-binary KASLR (Option A)** — slotted as **1.30.0** (next major-minor headline). Gated on cyrius v6.1.x PIE support per the cyrius proposal. See [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md) and [cyrius/proposals/2026-05-11-pie-support.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/proposals/2026-05-11-pie-support.md).
+- **ext2 (Planned #5)** — too big for a sub-patch slot; would consume an entire minor. Deferred to its own arc (1.31.x candidate; could move earlier if mmap shows the need urgently).
+- **Preemptive scheduling (Planned #8)** — deep rewrite of scheduler + IRQ handlers. Same reasoning as ext2: own-arc territory. The v1.28.3 `sched.cyr` `cr3_load` hygiene is one prerequisite already in place.
+
+### Carried over (not 1.29.x)
 
 | # | Item | Notes |
 |---|------|-------|
-| 1 | SMP AP wakeup on real hardware | Currently QEMU-validated only. Needs hardware-in-the-loop infra (RPi4 / NUC harness on the self-hosted runner). Stays open across 1.28.x; closes when the infra lands. |
+| 1 | SMP AP wakeup on real hardware | QEMU-validated only. Closes once hardware-validation infra lands (a 1.29.x candidate slot — but the kernel-side AP-wakeup work itself is post-infra). |
 
-### Ordering rationale
+## 1.30.0 — Full-Binary KASLR (Option A)
 
-- **KASLR first (.0)** because it's the most feature-shaped of the four — deserves the headline slot and matches the "the .0 ships the headline" pattern across the AGNOS ecosystem (e.g., 1.27.0 = toolchain alignment, 1.27.1 = memory-isolation closeout).
-- **serial_putc next (.1)** because it's the tightest, lowest-risk closeout of a long-running Active item. Symmetric with 1.27.1's pattern (close a long-running carry-forward via focused .1 patch).
-- **VFS tagged unions (.2)** before the struct refactor (.3) because `ktagged.cyr` is *new infrastructure* — it should ship first and prove itself in one consumer (VFS) before becoming the substrate for a broader refactor.
-- **Struct refactor last (.3)** because its blast radius is largest; doing it after the other items means we apply it to a known-good kernel rather than mixing it with feature work.
+Reserved slot for the next major-minor headline. Closes the deferred Option A from `proposals/2026-05-11-kaslr-scope.md` — the data-KASLR shipped at 1.28.0 covers ~80% of the security value; Option A closes the last ~20% (gadgets pre-computed against the kernel binary itself, which currently sits at fixed `0x100000`).
 
-This ordering is a recommendation, not a contract — any of .1/.2/.3 can swap if a finding changes the calculus. .0 should stay KASLR (the feature anchor).
+**Hard prerequisite**: cyrius v6.1.x PIE codegen support. Filed at [cyrius/proposals/2026-05-11-pie-support.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/proposals/2026-05-11-pie-support.md); slotted on the cyrius v6.x track after v6.0.0 (rename + cleanup arc).
+
+If cyrius PIE arrives during 1.29.x, 1.30.0 work can begin in parallel with the late 1.29.x slots. If cyrius PIE doesn't arrive in time, 1.30.0 holds — agnos doesn't kludge a hand-rolled relocation table (rejected in both proposals for the same reasons). 1.30.0's exact slot depends on cyrius's actual ship cadence, not agnos's.
+
+**Work surface (when cyrius PIE is available):** roughly per the original kaslr-scope proposal § "Option A" — boot shim grows ~2× (relocation walk + slid entry), kernel binary rebuilt with `--pie`, slide-aware crash-dump symbolizer, CI assertion rewrite (current `KASLR: pmm_next_free=N` probe stays; new `KASLR: kernel_slide=0x<hex>` probe lands alongside). Two-boot-diff assertion extended to cover the binary base.
+
+Pre-cyrius prep (no-op until PIE lands, but useful to think about):
+- Audit any remaining absolute-address assumptions in source (we already moved `proc_table` accessors, VFS slots, PciDev offsets to named accessors — those are pre-existing wins that reduce the audit surface).
+- Document the slide-aware debug pattern in CLAUDE.md's Architecture Notes ahead of the implementation.
+- Decide whether the slide range stays at 64 MB (boot-shim-friendly) or grows to full 4 GB (more entropy, more page-table work).
 
 ## Multi-Architecture (Complete)
 
@@ -69,7 +81,7 @@ Arch interface — each arch provides:
 
 ## Security Hardening (from 2026-04-13 audit)
 
-All 13 items shipped through v1.28.0 (S7 KASLR data-only landed). Track complete. Full audit at [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md); per-item implementation history at [`security-hardening.md`](security-hardening.md). Full-binary KASLR (Option A) remains deferred to v1.29.x+ pending cyrius PIE support; see [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md).
+All 13 items shipped through v1.28.0 (S7 KASLR data-only landed). Track complete. Full audit at [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md); per-item implementation history at [`security-hardening.md`](security-hardening.md). Full-binary KASLR (Option A) is **slotted for v1.30.0** pending cyrius v6.1.x PIE support; see [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md).
 
 | # | Item | Status | Severity |
 |---|------|--------|----------|
@@ -87,9 +99,9 @@ All 13 items shipped through v1.28.0 (S7 KASLR data-only landed). Track complete
 | S12 | TCP window/sequence validation | ✅ | LOW |
 | S13 | Stack canaries | ✅ (RDRAND-based secret) | LOW |
 
-## Planned (post-1.28.x)
+## Planned (post-1.30.0)
 
-Long-horizon items past the 1.28.x arc. Each is a feature-class lift (1.29.0+ territory).
+Long-horizon items past the 1.30.0 cut. Each is a feature-class lift in its own right.
 
 | # | Item | Prerequisite | Notes |
 |---|------|-------------|-------|
