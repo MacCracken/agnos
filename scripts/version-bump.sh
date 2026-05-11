@@ -32,10 +32,20 @@ updated=""
 echo "$NEW" > "$ROOT/VERSION"
 updated="$updated  VERSION\n"
 
-# 2. CLAUDE.md
-if [ -f "$ROOT/CLAUDE.md" ]; then
-    sed -i "s/- \*\*Version\*\*: $OLD/- **Version**: $NEW/" "$ROOT/CLAUDE.md"
-    updated="$updated  CLAUDE.md\n"
+# 2. docs/development/state.md — live state ledger; bump the Kernel row
+#    of the Version table + the Last refresh + Released header lines.
+#    v1.27.1 split: CLAUDE.md is durable-only (no version line); state.md
+#    is the volatile snapshot bumped per release.
+#    Uses `#` as the sed delimiter — the pattern contains literal `|`
+#    characters that would otherwise collide with the `|` delimiter
+#    AND get parsed as ERE alternation operators after delimiter
+#    unescaping (causing every line to match the empty-alternative).
+if [ -f "$ROOT/docs/development/state.md" ]; then
+    TODAY=$(date +%Y-%m-%d)
+    sed -i -E "s#^(\\| \\*\\*Kernel\\*\\* \\| )\\*\\*[0-9]+\\.[0-9]+\\.[0-9]+\\*\\*( \\|.*)#\\1**$NEW**\\2#" "$ROOT/docs/development/state.md"
+    sed -i -E "s#^(> \\*\\*Last refresh\\*\\*: )[0-9]{4}-[0-9]{2}-[0-9]{2}#\\1$TODAY#" "$ROOT/docs/development/state.md"
+    sed -i -E "s#^(\\| \\*\\*Released\\*\\* \\| )[0-9]{4}-[0-9]{2}-[0-9]{2}( \\|.*)#\\1$TODAY\\2#" "$ROOT/docs/development/state.md"
+    updated="$updated  docs/development/state.md\n"
 fi
 
 # 3. kernel/agnos.cyr (comment)
@@ -101,7 +111,7 @@ printf "$updated"
 
 # Verify — check for any remaining OLD version references (excluding CHANGELOG history)
 echo ""
-STALE=$(grep -rn "$OLD" "$ROOT/VERSION" "$ROOT/CLAUDE.md" "$ROOT/kernel/agnos.cyr" "$ROOT/kernel/core/main.cyr" "$ROOT/kernel/arch/aarch64/main.cyr" "$ROOT/kernel/user/shell.cyr" 2>/dev/null || true)
+STALE=$(grep -rn "$OLD" "$ROOT/VERSION" "$ROOT/kernel/agnos.cyr" "$ROOT/kernel/core/main.cyr" "$ROOT/kernel/arch/aarch64/main.cyr" "$ROOT/kernel/user/shell.cyr" 2>/dev/null || true)
 if [ -n "$STALE" ]; then
     echo "WARNING: stale $OLD references found:"
     echo "$STALE"

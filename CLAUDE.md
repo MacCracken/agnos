@@ -1,235 +1,154 @@
 # AGNOS — Claude Code Instructions
 
+> **Core rule**: this file is **preferences, process, and procedures** — durable rules that change rarely. Volatile state (current version, binary sizes, subsystem rollup, sibling pins, in-flight slots) lives in [`docs/development/state.md`](docs/development/state.md), refreshed every release. Inlined state rots within a minor.
+>
+> Structure per [first-party-documentation § CLAUDE.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md#claudemd). Reference implementation: [cyrius/CLAUDE.md](https://github.com/MacCracken/cyrius/blob/main/CLAUDE.md).
+
+---
+
 ## Project Identity
 
-**AGNOS** (from Greek *agnosis* — unknowing, the blank slate) — Sovereign operating system kernel.
+**AGNOS** (from Greek *agnosis* — unknowing, the blank slate) — sovereign operating system kernel.
 
-- **Type**: Bare-metal kernel binary (Cyrius language)
+- **Type**: Bare-metal kernel binary (Cyrius language, freestanding)
 - **License**: GPL-3.0-only
-- **Version**: 1.27.1
-- **Language**: Cyrius 5.10.44 (via `~/.cyrius/bin/cyrius`, `cyriusly use 5.10.44`)
-- **Tools**: `owl` to read .cyr files, `cyim` to write/edit .cyr files
-- **Target**: x86_64 + aarch64 (cross-compilation supported)
+- **Language**: Cyrius — toolchain pinned in [`cyrius.cyml`](cyrius.cyml) `[package].cyrius`; switch with `cyriusly use <pin>`
+- **Version**: [`VERSION`](VERSION) at the project root is the single source of truth — never inlined here
+- **Target**: x86_64 + aarch64 (cross-compile via `cc5_aarch64`)
+- **Genesis repo**: [agnosticos](https://github.com/MacCracken/agnosticos)
+- **Standards**: [First-Party Standards](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-standards.md) · [First-Party Documentation](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md)
 
 ## Goal
 
-A sovereign kernel written entirely in Cyrius. No C, no Rust, no LLVM. Assembly up. Boots on QEMU via multiboot1. Owns every instruction from power-on to userland.
+Own the kernel. Cyrius writes every instruction from power-on to userland. No C, no Rust, no LLVM, no libc, no linker scripts. Boots on QEMU via multiboot1 and proves the language handles bare-metal correctly.
 
-## Consumers
+## Current State
 
-- kybernet (v1.2.0) — PID 1 helmsman, boots on AGNOS
-- argonaut (v1.6.3) — init/service manager, 5 boot modes
-- daimon (v1.2.3) — agent orchestrator
-- AGNOS userland tools — shell, services
-- Cyrius language project — proves the language handles kernel code
+> Volatile state lives in [`docs/development/state.md`](docs/development/state.md) — current version, binary sizes (x86_64 + aarch64), source rollup, subsystem table, syscall surface, sibling pins (kybernet/agnosys/agnostik/argonaut/daimon/libro), in-flight slots, verification hosts. Refreshed every release.
+>
+> Historical release narrative lives in [`CHANGELOG.md`](CHANGELOG.md). Design ledger + active roadmap items live in [`docs/development/roadmap.md`](docs/development/roadmap.md). Doc-currency ledger lives in [`docs/doc-health.md`](docs/doc-health.md).
 
-## Ecosystem Dependencies
+Do not inline state in this file — see Core rule above.
 
-All Cyrius, all GPL-3.0-only. The kernel itself is standalone (no deps), but the
-userland boot stack is aligned at the cyrius 5.10.44 pin:
-
-```
-kybernet (PID 1) v1.2.0
-├── agnosys v1.2.5    — syscall bindings (Linux x86_64 + aarch64 wrappers)
-├── agnostik v1.2.2   — shared types/primitives (error/security/agent/telemetry)
-├── argonaut v1.6.3   — service lifecycle, health, seccomp/Landlock, PID-1 harness
-│   └── libro v2.6.2  — cryptographic audit chain
-└── stdlib x21        — string, fmt, alloc, json, sakshi, etc.
-```
-Pinned tags (kybernet's `cyrius.cyml`): agnosys 1.2.5, agnostik 1.2.2,
-libro 2.6.2, argonaut 1.6.3. agnosys 1.2.6+ jumped to cyrius 5.11.x; we
-stay on 1.2.5 to keep the whole stack on a single cyrius pin.
-
-### Cyrius Standard Library (key modules)
-
-- **Core**: alloc, args, fmt, io, string, vec, hashmap, tagged, chrono
-- **Extended**: async, http, json, net, tls, regex, mmap, thread, process, fs, toml
-- **yukti** — hardware/device enumeration
-- **mabda** — GPU foundation layer
-- **sakshi** — error/tracing (minimal + full profiles)
-- **sigil** — cryptographic signatures
-- **patra** — networking primitives
-
-IMPORTANT: Always go through `cyrius build` — never invoke `cc5` / `cc5_aarch64`
-directly. The `cyrius` wrapper resolves includes, manages dep resolution from
-`cyrius.cyml`, and dispatches to the right backend. Direct `cc5` is reserved
-for the Cyrius repo's own bootstrap/self-host work.
-
-Editing rule: read `.cyr` files with `owl` (a watchful viewer that knows
-Cyrius syntax) and write/edit `.cyr` files with `cyim` (atomic edits, batch
-mode, expect-assertions). Never `cat` a `.cyr` directly when reading; never
-`sed` a `.cyr` in place when editing.
-
-## Build
-
-Requires Cyrius 5.10.44 (`~/.cyrius/bin/cyrius`). The toolchain pin lives
-in `cyrius.cyml` (`cyrius = "5.10.44"`); switch the active version with
-`cyriusly use 5.10.44`. The kernel is a freestanding binary — `cyrius.cyml`
-declares an empty `[deps]` block, so `cyrius deps` is a no-op (no host
-stdlib is linked into the kernel).
-
-`cyrius build -D NAME` does not propagate into nested `#ifdef` blocks reached
-via `include`, so `scripts/build.sh` prepends `#define ARCH_X86_64` /
-`#define ARCH_AARCH64` to a temp source before invoking `cyrius build`.
+## Quick Start
 
 ```sh
-# x86_64 (default)
-sh scripts/build.sh
+# Build (toolchain pin auto-resolves from cyrius.cyml)
+sh scripts/build.sh                     # x86_64
+sh scripts/build.sh --aarch64           # aarch64 cross-compile
 
-# aarch64 cross-compile
-sh scripts/build.sh --aarch64
+# Boot on QEMU — `-cpu max` is mandatory (boot shim sets SMEP+SMAP in CR4)
+qemu-system-x86_64 -kernel build/agnos -cpu max -serial stdio -display none
 
-# Boot on QEMU (x86_64)
-qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
-
-# Run tests
-sh scripts/test.sh              # x86_64
-sh scripts/test.sh --aarch64    # aarch64 (compile test)
-sh scripts/test.sh --all        # both architectures
+# Verify
+sh scripts/test.sh                      # x86_64 (default)
+sh scripts/test.sh --aarch64            # aarch64 (compile test)
+sh scripts/test.sh --all                # both
+sh scripts/check.sh                     # 11-point project validation
 ```
 
-## Project Structure
+## Scaffolding
 
-```
-agnos/
-├── VERSION                  # Single source of truth
-├── CLAUDE.md                # These instructions
-├── README.md                # Architecture, quick start
-├── CHANGELOG.md             # Keep a Changelog format
-├── BENCHMARKS.md            # Auto-generated by bench.sh
-├── LICENSE                  # GPL-3.0-only
-├── kernel/
-│   ├── agnos.cyr            # Main orchestrator (includes arch + core + user)
-│   ├── kernel_hello.cyr     # Minimal boot test
-│   ├── lib/                 # 2 files: kstring, kfmt (vendored kernel-safe stdlib)
-│   ├── arch/
-│   │   ├── x86_64/          # 14 files: boot, gdt, idt, tss, pic, apic, timer,
-│   │   │                    #   keyboard, paging, serial, syscall, smp, pci, virtio
-│   │   └── aarch64/         # 9 files: boot, gic, timer, serial, paging, stubs, etc.
-│   ├── core/                # 18 files: pmm, vmm, heap, proc, scheduler, syscall,
-│   │                        #   vfs, initrd, net, elf, fatfs, pci, virtio, signals, acpi
-│   └── user/                # 4 files: shell, init, test_procs, test
-├── build/                   # Generated binaries (gitignored)
-├── docs/
-│   ├── architecture/        # System diagrams, subsystem docs
-│   ├── audit/               # Security audits (2026-04-13)
-│   └── development/
-│       ├── roadmap.md       # Kernel-specific roadmap
-│       ├── proposals/       # Date-stamped design proposals
-│       ├── kybernet-bridge.md
-│       ├── security-hardening.md
-│       └── syscall-additions.md
-├── scripts/
-│   ├── build.sh             # Build kernel (multi-arch)
-│   ├── test.sh              # Run kernel tests
-│   ├── bench.sh             # Benchmark runner
-│   ├── check.sh             # 11-point project validation
-│   └── version-bump.sh      # Automated version management (8 files)
-├── cyrius.cyml              # Project manifest (version=${file:VERSION}, cyrius=5.7.19, build, deps)
-└── .github/workflows/
-    ├── ci.yml               # 7 jobs: build, check, security, test, boot, bench, docs
-    └── release.yml          # Tag → CI gate → build → changelog → release
-```
+AGNOS was not generated by `cyrius init` — it predates the scaffolding tool. New first-party Cyrius repos use `cyrius init <name>`; existing repos like this one stay on their hand-rolled structure until/unless the tools earn a re-scaffold. **Do not manually invent new project structure** in this repo — match what's here, and if a convention conflicts with first-party standards, fix the standard or earn an explicit deviation.
 
-## Versioning
+## Tools
 
-**VERSION** file is the single source of truth. Use `version-bump.sh` for all version changes:
-
-```sh
-sh scripts/version-bump.sh 1.23.0
-```
-
-This updates 8 files atomically (cyrius.cyml pulls version via `${file:VERSION}`
-templating, so it doesn't need an in-place edit):
-1. `VERSION` — source of truth (cyrius.cyml reads this via `${file:VERSION}`)
-2. `CLAUDE.md` — project identity
-3. `kernel/agnos.cyr` — comment header
-4. `kernel/core/main.cyr` — boot banner `serial_println` (auto-computes byte length)
-5. `kernel/arch/aarch64/main.cyr` — aarch64 boot banner (auto-computes byte length)
-6. `kernel/user/shell.cyr` — shell prompt banner (auto-computes byte length)
-7. `CHANGELOG.md` — adds new version section with date
-8. `docs/development/roadmap.md` — updates Current header
-
-**Never manually edit version strings** — the `serial_println` calls have hardcoded byte lengths that must match the string. The script computes these automatically.
-
-Release flow: `version-bump.sh` → fill CHANGELOG entries → commit → `git tag` → push triggers release workflow.
-
-## Development Process
-
-### Work Loop
-
-```
-1. RESEARCH    — Check vidya for kernel patterns
-2. BUILD       — ONE subsystem at a time
-3. TEST        — Boot on QEMU after EACH change, check serial output
-4. IF BROKEN   — Revert to last known good, apply ONE change
-5. AUDIT       — Verify multiboot header, ELF structure, memory map
-6. DOCUMENT    — Update roadmap, architecture docs
-```
-
-### Task Sizing
-
-- **Small**: Add a syscall, fix a bounds check → batch freely
-- **Medium**: New subsystem (e.g., scheduler) → small bites, test after each
-- **Large**: Architecture port → plan first, prototype, then implement
+- **`owl`** — watchful viewer that understands Cyrius syntax. Use for **reading** `.cyr` files. Never `cat` a `.cyr` directly when reading — owl handles the syntax-aware view.
+- **`cyim`** — atomic, batch-mode editor with expect-assertions. Use for **writing/editing** `.cyr` files. Never `sed` a `.cyr` in place when editing.
+- **`cyrius`** — the build/test/format wrapper. Always go through `cyrius build` — never invoke `cc5` / `cc5_aarch64` directly. The wrapper resolves includes, manages dep resolution from `cyrius.cyml`, and dispatches to the right backend. Direct `cc5` is reserved for the Cyrius repo's own bootstrap/self-host work.
 
 ## Key Principles
 
-- **Assembly is the cornerstone** — every instruction maps to hardware reality
-- **Own every byte** — no libc, no external runtime, no linker scripts
-- **Multiboot1 boot** — 32-bit ELF for GRUB/QEMU compatibility
-- **Serial console** — all kernel output via COM1 (0x3F8)
-- **ISR correctness** — save ALL caller-saved registers (9 regs: rax, rcx, rdx, rsi, rdi, r8-r11)
-- **Bounds check everything** — PMM, process table, syscall args
-- **Identity map first** — 2MB huge pages, add finer granularity when needed
+- **Assembly is the cornerstone** — every instruction maps to hardware reality. If you can't explain what the CPU is doing, the abstraction is wrong.
+- **Own every byte** — no libc, no external runtime, no linker scripts. The kernel `cyrius.cyml` declares an empty `[deps]` block; `kernel/lib/` is the vendored kernel-safe stdlib (2 files: `kstring`, `kfmt`).
+- **Multiboot1 boot** — 32-bit ELF for GRUB/QEMU compatibility. The boot shim transitions to long mode.
+- **Serial console** — all kernel output via COM1 (`0x3F8` x86_64) / PL011 UART (aarch64).
+- **ISR correctness** — save ALL caller-saved registers (9: rax, rcx, rdx, rsi, rdi, r8–r11).
+- **Bounds check everything** — PMM, process table, syscall args.
+- **Identity map first** — 2 MB huge pages, add finer granularity when needed.
+- **`-cpu max` is required for QEMU x86_64** — the boot shim's CR4 OR-mask sets SMEP+SMAP, which the default `qemu64` model lacks (triple-faults on the CR4 store). Real silicon since Haswell/Ryzen supports both.
+- **Read every bit of CR0/CR3/CR4 the next time a page-walk faults inexplicably** — the v1.27.1 memory-isolation closeout cost 14 days because SMAP=1 was visible in the original fault dump but went unread. Hardware access-control bits matter as much as page-table state.
 
-## Kernel Subsystems
+## Rules (Hard Constraints)
 
-| Subsystem | Status | Description |
-|-----------|--------|-------------|
-| Boot (multiboot1, 32→64 shim) | Complete | 32-bit ELF entry, long mode transition (x86_64) |
-| Boot (aarch64) | Complete | DTB, EL2→EL1, PL011 UART, GIC, ARM timer |
-| Serial I/O | Complete | COM1 0x3F8 (x86_64), PL011 UART (aarch64) |
-| GDT | Complete | 5 segments + TSS descriptor |
-| TSS | Complete | Ring 3 transitions, RSP0 |
-| IDT | Complete | 256 vectors, default iretq handler |
-| PIC | Complete | 8259A, ICW1-4, remap to INT 32+ |
-| Local APIC | Complete | MMIO at 0xFEE00000, timer, IPI |
-| GIC | Complete | ARM GICv2 interrupt controller (aarch64) |
-| Timer (APIC) | Complete | Periodic ~100Hz (x86_64), ARM generic timer (aarch64) |
-| Keyboard | Complete | PS/2 full US QWERTY (x86_64), UART RX (aarch64) |
-| Page Tables | Complete | 2MB huge pages, 16MB identity map, per-process |
-| PMM | Complete | Bitmap, 4096 pages, next-free hint optimization |
-| VMM | Complete | map/unmap/alloc, user-accessible pages |
-| Kernel Heap | Complete | Slab allocator, 8 size classes (32-4096B) |
-| Process Table | Complete | 16 slots, 168B context, CR3 per-process |
-| Context Switch | Complete | Full register save/restore, CR3 switch |
-| Scheduler | Complete | Round-robin |
-| SYSCALL/SYSRET | Complete | MSR setup, ring 3 transition |
-| ELF Loader | Complete | Static ELF64, per-process address space |
-| VFS | Complete | File table, device/memfile/signalfd/epoll/timerfd types |
-| Device Drivers | Complete | Serial char device |
-| Initrd | Complete | Flat format, name lookup |
-| PCI Bus | Complete | Config space scan, device discovery |
-| VirtIO-Net | Complete | Legacy PCI, virtqueues, Ethernet frames |
-| IP/UDP Stack | Complete | ARP, IPv4, UDP send/recv |
-| TCP Stack | Complete | Connect, send, recv, close, SYN/ACK/FIN state machine |
-| VirtIO-Blk | Complete | Legacy PCI, sector read/write, DMA buffers |
-| FAT16 | Complete | Read-only, root directory listing, file open/read |
-| Pipes | Complete | Circular buffer IPC, read/write ends, VFS type 6 |
-| SMP Infrastructure | Complete | APIC, IPI, trampoline, per-CPU stacks |
-| Shell | Complete | 19 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench test halt |
-| kybernet Init | Complete | PID 1 |
-| Signals | Complete | per-process proc_signals/proc_sigmask, kill, sigprocmask, signalfd |
-| Epoll | Complete | epoll_create, epoll_ctl, epoll_wait |
-| Timerfd | Complete | timerfd_create, timerfd_settime |
-| Syscalls | Complete | 26 syscalls: exit(0), write(1), getpid(2), spawn(3), waitpid(4), read(5), close(6), open(7), dup(8), mkdir(9), rmdir(10), mount(11), sync(12), reboot(13), pause(14), getuid(15), kill(16), sigprocmask(17), signalfd(18), epoll_create(19), epoll_ctl(20), epoll_wait(21), timerfd_create(22), timerfd_settime(23), umount(24), pipe(25) |
+- **Do not commit or push** — the user handles all git operations.
+- **NEVER use `gh` CLI** — use `curl` to the GitHub API only.
+- **Do not modify the Cyrius compiler from this repo** — compiler changes belong in `../cyrius/`. Cross-repo work means switching repos, not blurring boundaries.
+- **No C or assembly files** — everything is Cyrius. Inline asm in `.cyr` files is fine; standalone `.c` / `.s` files are not.
+- **Do not skip QEMU verification after kernel changes** — type-check and tests verify *code* correctness; only boot verifies *kernel* correctness.
+- **Do not use inline asm without documenting the register contract** — every `asm { ... }` block gets a comment naming inputs, outputs, and clobbers. The `serial_putc` v1.21.0 → v1.26.0 disassembly investigation was readable only because the asm contracts were documented.
+- **Do not invoke `cc5` / `cc5_aarch64` directly** — go through `cyrius build` (see Tools).
+- **Do not hand-edit version strings** — `scripts/version-bump.sh` is the only correct way to bump the version. The `serial_println` calls have hardcoded byte lengths that must match the string; the script computes them.
+- **Do not invent new project structure** — see Scaffolding.
 
-## DO NOT
+## Process
 
-- **Do not commit or push** — the user handles all git operations
-- **NEVER use `gh` CLI** — use `curl` to GitHub API only
-- Do not modify the Cyrius compiler from this repo — changes go in `../cyrius/`
-- Do not add C or assembly files — everything is Cyrius
-- Do not skip QEMU verification after kernel changes
-- Do not use inline asm without documenting the register contract
+### Work Loop
+
+1. **Research** — check vidya for kernel patterns; read related architecture docs.
+2. **Build** — ONE subsystem at a time. Never bundle.
+3. **Test** — boot on QEMU after EACH change; check serial output. Bench harness runs to `=== done ===`.
+4. **If broken** — revert to last-known-good, apply ONE change at a time.
+5. **Audit** — verify multiboot header, ELF structure, memory map. Confirm `Memory isolation: PASS` + `Userland exec complete` markers fire.
+6. **Document** — update [`CHANGELOG.md`](CHANGELOG.md), [`docs/development/roadmap.md`](docs/development/roadmap.md), [`docs/development/state.md`](docs/development/state.md) if release-worthy.
+
+### Task Sizing
+
+- **Small** — add a syscall, fix a bounds check: batch freely.
+- **Medium** — new subsystem (e.g., scheduler): small bites, boot after each.
+- **Large** — architecture port: plan first, prototype, then implement.
+
+### When Stuck
+
+Never decide to defer, slip, re-slot, or split work mid-execution unprompted. Splits are planned decisions made *before* starting; reactive scope changes when stuck are deferment. Report findings and wait for direction.
+
+### Versioning
+
+[`VERSION`](VERSION) is the single source of truth. Use `scripts/version-bump.sh`:
+
+```sh
+sh scripts/version-bump.sh 1.28.0
+```
+
+Updates `VERSION`, `kernel/agnos.cyr`, the three `serial_println` boot banners (auto-computes byte length), `CHANGELOG.md`, `docs/development/roadmap.md` (including the "Built with cyrius X.Y.Z" trailer, re-synced from `cyrius.cyml`), and `docs/development/state.md`. `cyrius.cyml` pulls the version via `${file:VERSION}` templating — no in-place edit needed.
+
+Release flow: `version-bump.sh` → fill CHANGELOG entries → commit → `git tag` → push triggers `.github/workflows/release.yml`.
+
+### Closeout (before any minor/major bump)
+
+Ship as the last patch of the current minor (e.g., `1.27.2` before `1.28.0`).
+
+1. **Full test sweep** — `scripts/check.sh` 11/11, `scripts/test.sh --all` 7/7.
+2. **Boot sweep** — `qemu-system-x86_64 -kernel build/agnos -cpu max -serial stdio` reaches every named checkpoint (banner / `Memory isolation: PASS` / `Userland exec complete` / `=== done ===`).
+3. **Dead-code audit** — review the `dead: <fn>` list from `cyrius build`; remove anything no longer earned.
+4. **Code review pass** — walk the minor's diffs end-to-end for missed `#ifdef` guards (cross-arch leak class), unguarded asm, off-by-ones in fixup arithmetic, silently-ignored errors.
+5. **Cleanup sweep** — stale comments referencing old version pins, dead `#ifdef` branches, unused includes, orphaned files in `build/`.
+6. **Security re-scan** — quick grep for new raw `syscall(`, unchecked stores near MMIO addresses, unsanitized input paths.
+7. **Doc sync** — `CHANGELOG.md` reflects the minor's arc; `roadmap.md` Active table moves resolved items to `## Completed (vX.Y.Z)`; `state.md` bumped at the release; `doc-health.md` refreshed for any docs touched.
+8. **Version-verify gate** — `VERSION` == `git tag` == CHANGELOG header.
+
+## Architecture Notes (load-bearing constraints)
+
+These are *how the world is*, not *what we chose*. Reading the code alone won't tell you why these are this way.
+
+- **`cyrius build -D NAME` does not propagate into nested `#ifdef` blocks reached via `include`.** Workaround: `scripts/build.sh` prepends `#define ARCH_X86_64` / `#define ARCH_AARCH64` to a temp source before invoking `cyrius build`. Don't try to `-D` the arch; it won't take.
+- **`kernel/lib/` shadows the version-pinned stdlib snapshot** by design. cyrius 5.10+ emits an info `note` about this on every build run; `scripts/build.sh` and `scripts/test.sh` export `CYRIUS_NO_WARN_SHADOW_LIB=1` to silence it. `--no-deps` skips the version-pinned tree anyway, so the note carries no signal — but don't remove `kernel/lib/`; that's our actual kernel-safe stdlib.
+- **`proc.cyr`'s `proc_create_address_space` / `proc_get_user_cr3` / `proc_map_page` / `proc_unmap_page` are x86-specific** (PML4 → PDPT → PD walk, hardcoded `0x3000` kernel-PD address, KPTI entry-511 stash). They're guarded by `#ifdef ARCH_X86_64`; the aarch64 build uses no-op stubs from `arch/aarch64/stubs.cyr`. Pre-1.27.0 they were unguarded and "won" over the stubs under last-definition-wins. Don't drop the guard.
+- **Memory-isolation test uses `stac`/`clac` brackets** around its user-page accesses. `proc_map_page` writes US=1 (`0x87`) per-process PD entries because the pages must be reachable from CPL=3; SMAP traps CPL=0 access to US=1 pages. If you write more kernel-mode code that touches per-process user pages, you need the same bracket discipline (or factor it into a `with_user_access(closure)` helper once there are 3+ sites).
+- **`kernel/user/shell.cyr` is on the format-skip list** (CI `Format check` step). It carries `#ifdef` *inside function bodies*, which can't satisfy both the formatter (wants indentation) and the preprocessor (needs column 0). If you write more code with that shape, add it to the SKIP list; don't try to make the formatter happy.
+- **The boot shim must be the first top-level statement emitted under x86_64** — cyrius v5.7.19+ enforces this via `kmode==1` emit order (PARSE_PROG before EMIT_GVAR_INITS); regression locked by cyrius's `check.sh` gate 4ab. See the `include` ordering in `kernel/agnos.cyr` and the comment above the `arch/x86_64/boot_shim.cyr` include.
+
+## Docs Pointers
+
+- [`docs/architecture/`](docs/architecture/) — system overview, non-obvious invariants.
+- [`docs/audit/`](docs/audit/) — security audit reports (`YYYY-MM-DD-*.md`).
+- [`docs/development/roadmap.md`](docs/development/roadmap.md) — completed, active, planned.
+- [`docs/development/state.md`](docs/development/state.md) — live state snapshot, refreshed every release.
+- [`docs/development/issue/`](docs/development/issue/) — open bug-investigation docs (one file per issue). `archive/` holds resolved ones with resolution notes.
+- [`docs/development/proposals/`](docs/development/proposals/) — pre-decision design drafts.
+- [`docs/development/kybernet-bridge.md`](docs/development/kybernet-bridge.md), [`security-hardening.md`](docs/development/security-hardening.md), [`syscall-additions.md`](docs/development/syscall-additions.md) — long-form design notes.
+- [`docs/doc-health.md`](docs/doc-health.md) — fresh / stale / archive / open-question ledger across this whole repo's docs. Refreshed in place when docs are touched.
+
+New non-obvious invariants land in `docs/architecture/`. New deferred bugs land in `docs/development/issue/` with the date-stamped naming convention. **Never renumber numbered series.**
+
+Full doc-tree convention: [first-party-documentation.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md).

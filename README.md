@@ -122,68 +122,86 @@ Common:
 | 24 | umount | Unmount filesystem |
 | 25 | pipe | Create pipe pair |
 
-## Benchmarks (QEMU x86_64, rdtsc)
+## Benchmarks
 
-> Last measured at v1.21.0 under cc3 / cyrius 3.9.8. The v1.23.0+
-> bench harness is currently blocked on the
-> "post-`Devices registered` boot stall" investigation (Active item
-> #4 in `docs/development/roadmap.md`); numbers will be re-measured
-> once that's resolved.
+The CI `benchmarks` job runs the 3-tier kernel bench harness on every
+push to `main` (self-hosted runner with QEMU + KVM). Per-release numbers
+attach to the GitHub Release as `BENCHMARKS.md` + `bench-history.csv`.
 
-### Tier 1: Core
+The live harness prints under the
+`=== AGNOS Benchmarks (3-tier) ===` header in any
+`qemu-system-x86_64 -kernel build/agnos -cpu max -serial stdio` run.
 
-| Operation | Cycles |
-|-----------|--------|
-| PMM alloc+free | 1,467 |
-| Heap 32B alloc+free | 1,338 |
-| Heap 256B alloc+free | 3,358 |
-| Heap 4096B alloc+free | 28,097 |
-| Memory write 1MB | 6,976K |
+- **Tier 1** — PMM alloc/free, heap (32 B / 256 B / 4,096 B), 1 MB memwrite
+- **Tier 2** — `syscall_getpid` / `getuid` / `write1`, `vfs_open_read_close`
+- **Tier 3** — `serial_putc`, end-to-end shapes
 
-### Tier 2: Subsystems
-
-| Operation | Cycles |
-|-----------|--------|
-| Syscall (getpid) | 261 |
-| Syscall (getuid) | 1,160 |
-| Syscall (write 1B) | 6,800 |
-| VFS open+read+close | 6,543 |
-
-### Tier 3: Integration
-
-| Operation | Cycles |
-|-----------|--------|
-| Serial putc | 5,046 |
-
-## Metrics
-
-- **Binary**: 243 KB (x86_64, 248,720 B), 93 KB (aarch64, 95,136 B)
-- **Source**: ~6,228 lines across 49 `.cyr` files
-- **Syscalls**: 26
-- **Subsystems**: 35
-- **Tests**: 106 kernel assertions (PMM, heap, VFS, proc, syscall, stdlib, initrd)
-- **Architecture**: Multi-arch (kernel/lib/ + kernel/arch/x86_64/ + kernel/arch/aarch64/ + kernel/core/ + kernel/user/)
-- **Boot time**: <100ms on QEMU (`-cpu max`)
-- **Dependencies**: Zero (Cyrius toolchain only, vendored kernel stdlib)
+`rdtsc`-measured (x86_64). `serial_putc` is dominated by QEMU UART
+emulation latency, not codegen — see
+[`docs/development/issue/2026-04-27-serial-putc-cc5-regression.md`](docs/development/issue/2026-04-27-serial-putc-cc5-regression.md)
+for the methodology caveat.
 
 ## Size Comparison
 
 | Kernel | Size | Language | Scope |
 |--------|------|----------|-------|
-| **AGNOS** | **243 KB** | Cyrius | 35 subsystems, 26 syscalls, TCP/IP, FAT16, VirtIO, SMP, ELF loader, ACPI, IOMMU, shell |
-| xv6 (MIT) | ~100KB | C | 21 syscalls, no networking, no SMP, no real FS |
-| seL4 (verified) | ~30KB | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
-| MINIX 3 | ~600KB | C | Microkernel + basic drivers |
-| Linux (minimal) | ~1.5MB | C | Barely boots, no drivers |
-| Linux (typical) | 10-30MB | C | Desktop-ready |
+| **AGNOS** | **~243 KB** | Cyrius | 35 subsystems, 26 syscalls, TCP/IP, FAT16, VirtIO, SMP, ELF loader, ACPI, IOMMU, shell |
+| xv6 (MIT) | ~100 KB | C | 21 syscalls, no networking, no SMP, no real FS |
+| seL4 (verified) | ~30 KB | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
+| MINIX 3 | ~600 KB | C | Microkernel + basic drivers |
+| Linux (minimal) | ~1.5 MB | C | Barely boots, no drivers |
+| Linux (typical) | 10–30 MB | C | Desktop-ready |
 
-243 KB for a fully functional kernel with TCP/IP, block I/O, filesystem, SMP, signals, epoll, pipes, ACPI/IOMMU, and an interactive shell — written entirely in Cyrius. No C, no LLVM, no libc.
+~243 KB for a fully functional kernel with TCP/IP, block I/O, filesystem,
+SMP, signals, epoll, pipes, ACPI/IOMMU, and an interactive shell —
+written entirely in Cyrius. No C, no LLVM, no libc.
+
+For live binary sizes per arch, source line counts, test surface, and
+ecosystem sibling pins, see
+[`docs/development/state.md`](docs/development/state.md) (refreshed every
+release).
 
 ## Requirements
 
-- Linux x86_64
-- Cyrius 5.7.19 (`cyrius` build tool — toolchain pin in `cyrius.cyml`)
-- QEMU 7.0+ with KVM-class CPU (`qemu-system-x86_64 -cpu max`, `qemu-system-aarch64`) for testing
+- Linux x86_64 (dev box) or aarch64 (cross-compile target)
+- Cyrius toolchain — version pinned in [`cyrius.cyml`](cyrius.cyml)
+  `[package].cyrius`. Install via [`cyriusly`](https://github.com/MacCracken/cyrius);
+  the CI install step does this automatically from the pin.
+- QEMU 7.0+ with KVM-class CPU model:
+  - x86_64: `qemu-system-x86_64 -cpu max` (mandatory — boot shim sets SMEP+SMAP in CR4; `qemu64` default triple-faults)
+  - aarch64: `qemu-system-aarch64 -M virt -cpu cortex-a57` (compile-tested; live boot harness not yet wired)
+
+## Project Map
+
+```
+agnos/
+├── kernel/
+│   ├── agnos.cyr            # Main orchestrator (#ifdef + include only)
+│   ├── kernel_hello.cyr     # Minimal smoke test
+│   ├── lib/                 # Vendored kernel-safe stdlib (kstring, kfmt)
+│   ├── arch/x86_64/         # boot_shim, gdt, idt, pic, apic, smp, paging, …
+│   ├── arch/aarch64/        # boot_data, gic, timer, exceptions, paging, …
+│   ├── core/                # pmm, vmm, heap, proc, sched, vfs, net, virtio, fatfs, …
+│   └── user/                # shell, init, test, test_procs
+├── scripts/
+│   ├── build.sh             # Multi-arch wrapper around `cyrius build`
+│   ├── test.sh              # Build assertions (x86_64 / aarch64 / --all)
+│   ├── check.sh             # 11-point project validation
+│   ├── bench.sh             # Bench harness
+│   └── version-bump.sh      # Versions all tracked files atomically
+├── docs/
+│   ├── architecture/        # System overview + non-obvious invariants
+│   ├── audit/               # Security audit reports (YYYY-MM-DD-*)
+│   ├── development/
+│   │   ├── roadmap.md       # Completed, active, planned
+│   │   ├── state.md         # Live state snapshot, bumped every release
+│   │   ├── issue/           # Open bug investigations (archive/ for resolved)
+│   │   └── proposals/       # Pre-decision design drafts
+│   └── doc-health.md        # Doc-currency ledger across the whole tree
+└── .github/workflows/
+    ├── ci.yml               # build, fmt-check, security, test, boot, bench, docs
+    └── release.yml          # tag → CI gate → build → CHANGELOG extract → release
+```
 
 ## License
 
