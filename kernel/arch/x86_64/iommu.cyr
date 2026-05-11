@@ -172,7 +172,7 @@ fn iommu_init() {
 
     # Set context entries for known PCI devices (VirtIO)
     for (var i = 0; i < pci_count; i = i + 1) {
-        var slot = load64(&pci_devs + i * 32);
+        var slot = PciDev_slot(&pci_devs + i * 32);
         iommu_set_context(0, slot, 0);
     }
 

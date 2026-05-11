@@ -17,10 +17,10 @@ var vblk_dma_buf[64];  # 512-byte DMA buffer for sector data
 fn virtio_blk_init() {
     var idx = pci_find(0x1AF4, 0x1001);
     if (idx < 0) { return 0 - 1; }
-    var bar0 = load64(&pci_devs + idx * 32 + 24);
+    var bar0 = PciDev_bar0(&pci_devs + idx * 32);
     vblk_iobase = bar0 & 0xFFFC;
     # Enable PCI bus mastering for DMA
-    var slot = load64(&pci_devs + idx * 32);
+    var slot = PciDev_slot(&pci_devs + idx * 32);
     pci_enable_bus_master(slot);
 
     # Reset device

@@ -18,7 +18,7 @@ var vnet_active = 0;
 fn virtio_net_init() {
     var idx = pci_find(0x1AF4, 0x1000);
     if (idx < 0) { return 0 - 1; }
-    var bar0 = load64(&pci_devs + idx * 32 + 24);
+    var bar0 = PciDev_bar0(&pci_devs + idx * 32);
     vnet_iobase = bar0 & 0xFFFC;
 
     # Reset device

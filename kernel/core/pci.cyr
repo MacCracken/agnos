@@ -1,4 +1,20 @@
 # === PCI Bus ===
+#
+# PCI device table: 32 entries × 32 bytes, layout per PciDev struct
+# below (`#derive(accessors)` emits `PciDev_slot` / `PciDev_set_slot` /
+# `PciDev_vendor` / `PciDev_set_vendor` / `PciDev_device` /
+# `PciDev_set_device` / `PciDev_bar0` / `PciDev_set_bar0`).
+# v1.28.3: ported from raw `load64`/`store64` at fixed offsets.
+#
+# Note: `user/shell.cyr`'s `lspci` command continues to use raw
+# `load64(base + N)` for cross-arch compatibility — shell.cyr is
+# included unconditionally and the struct decl lives only in pci.cyr
+# (x86-only). Restructuring for one shell command isn't worth the
+# include reshuffle.
+
+#derive(accessors)
+struct PciDev { slot; vendor; device; bar0; }
+
 var pci_devs[1024];  # 32 entries x 32 bytes (max 32 PCI slots)
 var pci_count = 0;
 
@@ -50,10 +66,10 @@ fn pci_scan() {
         if (vendor != 0xFFFFFFFF) {
             if (vendor != 0) {
                 var base = &pci_devs + pci_count * 32;
-                store64(base, slot);
-                store64(base + 8, vendor & 0xFFFF);
-                store64(base + 16, (vendor >> 16) & 0xFFFF);
-                store64(base + 24, pci_read32(0, slot, 0, 0x10));
+                PciDev_set_slot(base, slot);
+                PciDev_set_vendor(base, vendor & 0xFFFF);
+                PciDev_set_device(base, (vendor >> 16) & 0xFFFF);
+                PciDev_set_bar0(base, pci_read32(0, slot, 0, 0x10));
                 pci_count = pci_count + 1;
             }
         }
@@ -64,8 +80,8 @@ fn pci_scan() {
 fn pci_find(vendor, device) {
     for (var i = 0; i < pci_count; i = i + 1) {
         var base = &pci_devs + i * 32;
-        if (load64(base + 8) == vendor) {
-            if (load64(base + 16) == device) {
+        if (PciDev_vendor(base) == vendor) {
+            if (PciDev_device(base) == device) {
                 return i;
             }
         }
