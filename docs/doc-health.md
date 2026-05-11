@@ -16,9 +16,9 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 ---
 
-## At a glance — 2026-05-11 inventory (v1.27.2 closeout)
+## At a glance — 2026-05-11 inventory (v1.27.2 closeout + 1.28.x arc plan)
 
-**21 markdown files total**: 8 root (CODE_OF_CONDUCT.md added in v1.27.2) + 13 under `docs/`. Bucket counts after the v1.27.2 closeout sweep:
+**22 markdown files total**: 8 root (CODE_OF_CONDUCT.md added in v1.27.2) + 14 under `docs/` (KASLR scope proposal added at v1.27.2 closeout, alongside the roadmap restructure for 1.28.x). Bucket counts after the v1.27.2 closeout sweep:
 
 | Bucket | Count | What it means |
 |---|---|---|
@@ -60,7 +60,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `development/roadmap.md` | 2026-05-11 | ✅ Fresh | v1.27.1 closeout added `## Completed (v1.27.1)` section; Active table reduced to 4 items (#1 SMP-on-hardware, #2 tagged unions, #3 struct refactor, #7 serial_putc methodology). Header re-synced to `v1.27.1` + `cyrius 5.10.44` via `scripts/version-bump.sh`. |
+| `development/roadmap.md` | 2026-05-11 | ✅ Fresh | **v1.27.2 closeout**: Active table restructured into a versioned **`## 1.28.x Arc Plan`** with .0 KASLR / .1 serial_putc / .2 VFS tagged unions / .3 struct refactor. SMP-on-hardware (#1) moved to "Carried over" as a long-horizon item. Security Hardening S7 row annotated with the v1.28.0 target + proposal pointer. Planned section gained notes per item. Header re-synced to v1.27.2 + cyrius 5.10.44. |
 | `development/state.md` | 2026-05-11 | ✅ Fresh | **Created** in this pass. Live snapshot of version, binary sizes, source rollup, subsystem rollup, syscall surface, sibling pins, test surface, verification hosts. Bump-target for future `version-bump.sh` runs. |
 | `development/kybernet-bridge.md` | 2026-05-11 | ✅ Fresh | **Refreshed v1.27.2**: header notes kybernet's 1.0.2 → 1.2.0 jump; AGNOS 26-syscall interface unchanged. Per-tier syscall mapping preserved as historical-evolution reference. |
 | `development/security-hardening.md` | 2026-05-11 | ✅ Fresh | **Refreshed v1.27.2**: new Status (v1.27.1) block shows 12/13 items Done — only S7 (KASLR) remains open. Per-item implementation prose unchanged; this doc is now an implementation-history reference (live tracking lives in roadmap.md). |
@@ -79,10 +79,9 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
+| `proposals/2026-05-11-kaslr-scope.md` | 2026-05-11 | ✅ Open / fresh | **Created v1.27.2.** Full-binary-relocation vs data-only KASLR design choice for 1.28.0. Recommends data-only as the 1.28.0 scope; full relocation deferred to 1.29+. Promote to an ADR if approved before 1.28.0 implementation begins. |
 | `proposals/archive/2026-04-27-acpi-identity-map-ceiling.md` | 2026-04-27 | 📦 Archive | Closed at v1.25.0 (`pt_init` extended to cover 0–4 GB). |
 | `proposals/archive/2026-04-27-cc5-kernel-boot-shim-regression.md` | 2026-04-27 | 📦 Archive | Closed at v1.24.0 (cyrius 5.7.19 kmode emit-order fix). |
-
-Live `proposals/` directory is empty — no in-flight design drafts.
 
 ---
 

@@ -1,141 +1,51 @@
 # AGNOS Kernel Roadmap
 
 > **Current**: v1.27.2 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
+>
+> Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 
-For language roadmap, see `../cyrius/docs/development/roadmap.md`.
+## Shipped (arc summary)
 
-## Completed (v1.1.0)
+Per-version detail lives in [`CHANGELOG.md`](../../CHANGELOG.md). This is the at-a-glance ledger of which arcs landed what.
 
-| # | Item | Version |
-|---|------|---------|
-| 17 | Multi-arch split (33 files) | v1.1.0 |
-| 18 | aarch64 port (serial, GIC, timer, PMM) | v1.1.0 |
-| 19 | 17 new syscalls (signals, epoll, timerfd) | v1.1.0 |
-| 20 | kybernet dual-backend (Linux/AGNOS) | v1.1.0 |
-| 21 | Benchmarks + CI parity | v1.1.0 |
-| 22 | SP patch trampoline eliminated | v1.1.0 |
+| Arc | Headline |
+|-----|----------|
+| **v1.0.x** | First boot: scheduler (round-robin), kernel heap (slab, 8 classes), VFS, kybernet PID 1, context switch, SYSCALL/SYSRET, ELF loader, device drivers (serial), initrd, PCI bus, VirtIO-Net, IP/UDP, SMP infra (APIC/IPI/trampoline), interactive shell, APIC timer, TSS. |
+| **v1.1.x** | Multi-arch split (33 files); aarch64 port (serial, GIC, timer, PMM); +17 syscalls (signals, epoll, timerfd); kybernet dual-backend (Linux + AGNOS); bench harness + CI parity. |
+| **v1.11.x** | VirtIO-blk (sector R/W, DMA); FAT16 read-only; TCP (SYN/ACK/FIN state machine); pipes (VFS type 6); GRUB bootable ISO. |
+| **v1.21.x** | Kernel stdlib vendored (`kstring.cyr`, `kfmt.cyr`); `cyrius.toml` + `.cyrius-toolchain` build modernization; toolchain rename (`cyrb` → `cyrius`, `cc2` → `cc3`). |
+| **v1.24.x** | Cyrius toolchain bump 3.9.8 → 5.7.19 (skipped cc4 entirely); manifest migration `cyrius.toml` → `cyrius.cyml` with `${file:VERSION}` templating; CI install delegates to upstream `install.sh`; boot-shim emit-order regression fixed via cc5 v5.7.19 kmode invariant; `-cpu max` documented as required (SMEP+SMAP in CR4). |
+| **v1.25.x** | Identity-map ceiling 16 MB → 4 GB (`pt_init`) — closes the latent ACPI fault at QEMU's `~0x07FE0000` region; per-process PD-copy loop mirrored to `i<511` so kernel data above 16 MB is reachable under per-process CR3; PDPT[1..3] mirror for 1–4 GB; memory-isolation test gated; CI assertion tightened to `Scheduler test done` then `Userland exec complete`. |
+| **v1.26.x** | `cr3_load(cr3_val)` helper in `proc.cyr` (stack-relative inline-asm load — replaces the brittle `var x = expr; asm { mov cr3, rax }` pattern); `docs/development/issue/` folder convention introduced; cyrius pin 5.7.19 → 5.7.22 (fmt braces-in-comments fix). |
+| **v1.27.x** | Cyrius pin 5.7.22 → 5.10.44 + ecosystem realignment; latent cross-arch `#ifdef` correctness fix in `proc.cyr` (4 x86-only page-table fns); **memory-isolation deeper-fault closed — root cause was SMAP**, fix is `stac`/`clac` brackets, test un-gated, CI assertion tightened to `Memory isolation: PASS`; CLAUDE.md durable-only reshape per first-party-documentation standards; new `docs/development/state.md` (volatile state) + `docs/doc-health.md` (whole-tree currency ledger); `CODE_OF_CONDUCT.md` added. |
 
-## Completed (v1.0.0)
+## 1.28.x Arc Plan
 
-| # | Item | Status |
-|---|------|--------|
-| 1 | Scheduler | Done — round-robin |
-| 2 | Kernel heap | Done — slab allocator, 8 size classes |
-| 3 | VFS layer | Done — file table, device/memfile types |
-| 4 | Init integration | Done — kybernet as PID 1 |
-| 5 | Context switch | Done — full register save/restore, CR3 switch |
-| 6 | SYSCALL/SYSRET | Done — MSR setup, ring 3 transition |
-| 7 | ELF loader | Done — static ELF64, per-process address space |
-| 8 | Device drivers | Done — serial char device |
-| 9 | Initrd | Done — flat format, name lookup |
-| 10 | PCI bus | Done — config space scan, device discovery |
-| 11 | VirtIO-Net | Done — legacy PCI, virtqueues, Ethernet frames |
-| 12 | IP/UDP stack | Done — ARP, IPv4, UDP send |
-| 13 | SMP infrastructure | Done — APIC, IPI, trampoline, per-CPU stacks |
-| 14 | Interactive shell | Done — 12 commands |
-| 15 | Local APIC timer | Done — replaces PIT, ~100Hz periodic |
-| 16 | TSS | Done — ring 3 transitions, RSP0 |
+The 1.27.x arc closed at v1.27.2 with an empty Active table modulo #1 (SMP-on-hardware, hardware-gated) and #7 (`serial_putc` regression — methodology gap). 1.28.x is the **closeout-and-feature** arc: ship the last open Security Hardening item (S7 KASLR) as the headline feature in `.0`, then walk down the remaining Active items in tight focused patches.
 
-## Completed (v1.11.0)
+| Slot | Item | Source | Shape | Risk |
+|------|------|--------|-------|------|
+| **1.28.0** | **KASLR (data-KASLR scope)** | Security Hardening S7 | Feature — boot-shim entropy, randomized kernel-data layout. Defeats trivial heap-layout ROP. See [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md) for the full-vs-data design choice. | Medium — touches boot shim + PMM + heap base. Bounded by staying data-only (kernel binary stays at `0x100000`). |
+| **1.28.1** | **`serial_putc` methodology** | Active #7 | Bench-history schema gains `qemu_version` / `cpu_model` / `host_arch` / `kvm_enabled` columns; re-measure under matched conditions; either confirm "QEMU/host drift, not a real regression" and archive the issue, or apply the codegen micro-opts (drop `var ch = c`, zero-disp jmp collapse) if the matched-conditions baseline shows the v1.21.0 cc3 numbers are still reachable. | Low — measurement infra + maybe a 14-byte source edit. Either outcome closes the issue cleanly. |
+| **1.28.2** | **VFS tagged unions** | Active #2 | New `kernel/lib/ktagged.cyr` (kernel-safe tagged-union helper). Port VFS entry types (currently switch on type code 0–6) to the new pattern. First consumer of `ktagged` — proves the design before broader uptake. | Medium — new kernel stdlib module; VFS is hot path. Boot test + bench-history both gate. |
+| **1.28.3** | **Struct refactor with `#derive(accessors)`** | Active #3 | Sequence: `pci_devs` (smallest blast radius) → `vfs_table` → `proc_table` (largest). One subsystem per commit, all gated by the standard checkpoints. Closes the largest active refactor. | Medium-high — touches many files; depends on cyrius's `#derive(accessors)` machinery being stable at 5.10.44+. |
 
-| # | Item | Version |
-|---|------|---------|
-| 23 | VirtIO-blk driver (sector read/write, DMA) | v1.11.0 |
-| 24 | FAT16 read-only filesystem | v1.11.0 |
-| 25 | TCP stack (connect, send, recv, close) | v1.11.0 |
-| 26 | Pipes (circular buffer IPC, VFS type 6) | v1.11.0 |
-| 27 | GRUB bootable ISO support | v1.11.0 |
+After 1.28.3 the Active table is empty modulo SMP-on-hardware (which stays open until hardware-in-the-loop infra exists). 1.28.4 is a P(-1) hardening / closeout patch before tagging 1.29.0.
 
-## Completed (v1.21.0)
-
-| # | Item | Version |
-|---|------|---------|
-| 28 | Kernel stdlib (vendored kstring.cyr, kfmt.cyr) | v1.21.0 |
-| 29 | cyrius.toml + .cyrius-toolchain build modernization | v1.21.0 |
-| 30 | CI/release uses .cyrius-toolchain (no hardcoded version) | v1.21.0 |
-| 31 | Toolchain rename: cyrb→cyrius, cc2→cc3 across all scripts/docs | v1.21.0 |
-
-## Completed (v1.24.0)
-
-| # | Item | Version |
-|---|------|---------|
-| 32 | Cyrius toolchain bump 3.9.8 → 5.7.19 (skipped cc4 entirely) | v1.24.0 |
-| 33 | Manifest migration `cyrius.toml` → `cyrius.cyml` (`${file:VERSION}` templating) | v1.24.0 |
-| 34 | Removed `.cyrius-toolchain` — pin lives only in `cyrius.cyml` (kybernet convention) | v1.24.0 |
-| 35 | CI install delegates to upstream `install.sh` release asset (no hand-rolled curl/tar) | v1.24.0 |
-| 36 | Boot regression fixed via cyrius v5.7.19 kmode emit-order swap (top-level asm before gvar inits) | v1.24.0 |
-| 37 | QEMU Boot Test job removed `continue-on-error: true`; asserts on serial banner | v1.24.0 |
-| 38 | `-cpu max` documented as required (boot shim sets SMEP+SMAP in CR4) | v1.24.0 |
-
-Binary size delta vs v1.22.0 peak: **−11 KB** (260 KB → 248,720 B). Same source,
-cc5's pass-2 dead-code reporter eliminates ~24 KB of unreachable functions.
-
-## Completed (v1.24.1)
-
-| # | Item | Version |
-|---|------|---------|
-| 39 | H1: comment on `kernel/agnos.cyr` boot-shim include citing cc5 v5.7.19 kmode invariant | v1.24.1 |
-| 40 | H2: annotated `kernel/arch/x86_64/boot_shim.cyr` raw asm bytes with mnemonics + 12-step boot sequence header | v1.24.1 |
-
-Comments-only patch, zero behavioral change (kernel binary still 248,720 B,
-boots clean under cyrius 5.7.19 + `-cpu max`).
-
-## Completed (v1.25.0)
-
-| # | Item | Version |
-|---|------|---------|
-| 41 | Identity-map ceiling 16 MB → 4 GB in `pt_init` (PD covers 0–1 GB at 2 MB granularity, PDPT[1..3] hold 1 GB huge pages for 1–4 GB). Closes the latent v1.22.0 ACPI fault — RSDT walk at QEMU's ~0x07FE0000 region now succeeds | v1.25.0 |
-| 42 | CI QEMU Boot Test assertion tightened from `grep -q "AGNOS"` (line 1, useless) to `grep -q "Scheduler test done"` (post-ACPI/PCI/IOMMU/scheduler checkpoint) | v1.25.0 |
-| 43 | v1.24.2 abandoned — its doc-only edits (README, CLAUDE.md, overview.md) folded into v1.25.0 alongside the kernel fix | v1.25.0 |
-
-Binary: 248,720 B → 248,848 B (+128 B for the extra PD entries +
-PDPT writes). Boot output now reaches `"Scheduler test done. Timer
-ticks: 154"` past the previous triple-fault point. Closes proposal
-[`2026-04-27-acpi-identity-map-ceiling.md`](proposals/archive/2026-04-27-acpi-identity-map-ceiling.md).
-
-## Completed (v1.25.1)
-
-| # | Item | Version |
-|---|------|---------|
-| 44 | `proc_create_address_space()` PD-copy loop bound `i<8` → `i<511` (mirrors kernel's 1 GB identity map into per-process page tables). Same shape as v1.25.0's pt_init fix, different file | v1.25.1 |
-| 45 | PDPT[1..3] mirrored into per-process PDPT so kernel data above 1 GB is reachable from per-process CR3 too | v1.25.1 |
-| 46 | Memory-isolation test gated behind `#ifdef MEMORY_ISOLATION_TEST` (skipped in default builds) — surfaces a deeper cr3-dance fault that needs separate diagnosis | v1.25.1 |
-| 47 | CI QEMU Boot Test assertion tightened to `"Userland exec complete"` (past the memory-isolation gate, through `spawn_user_proc`) | v1.25.1 |
-| 48 | Resolved proposals archived to `docs/development/proposals/archive/` | v1.25.1 |
-
-Binary: 248,848 B → 247,768 B (−1080 B; gated test code goes
-through DCE in default builds). Boot now reaches the benchmark
-harness and halts cleanly.
-
-## Completed (v1.26.0)
-
-| # | Item | Version |
-|---|------|---------|
-| 49 | `kernel/core/proc.cyr` `cr3_load(cr3_val)` helper using stack-relative inline-asm load (same pattern as `outb`). Replaces the brittle `var x = expr; asm { mov cr3, rax }` pattern in the memory-isolation test | v1.26.0 |
-| 50 | `docs/development/issue/` folder convention introduced (parallel to `proposals/`); bugs go in `issue/`, improvements go in `proposals/`. Both have `archive/` sub-folders | v1.26.0 |
-| 51 | Investigation docs filed for residual #6 (memory-isolation deep fault) and #7 (serial_putc benchmark regression) — neither fully resolved, both have detailed forensics + next-step plans | v1.26.0 |
-
-Binary: 247,768 B → 247,816 B (+48 B for the `cr3_load` helper).
-Boot still passes the `Userland exec complete` CI checkpoint.
-
-## Completed (v1.27.1)
-
-| # | Item | Version |
-|---|------|---------|
-| 52 | Memory-isolation deeper-fault root cause: **SMAP**. `proc_map_page` writes US=1 (`0x87`) per-process PD entries; boot shim's `CR4=0x300020` enables SMAP; kernel-mode `store64` to US=1 page → `#PF` → `#GP` → `#DF` → triple fault. Test now uses `stac`/`clac` brackets around each user-page access | v1.27.1 |
-| 53 | `MEMORY_ISOLATION_TEST` `#ifdef` gate removed; test always runs in default builds and asserts `Memory isolation: PASS` | v1.27.1 |
-| 54 | CI QEMU Boot Test assertion tightened to require `"Memory isolation: PASS"` (in addition to `"Userland exec complete"`) | v1.27.1 |
-| 55 | `version-bump.sh` now re-syncs the roadmap's `Built with cyrius X.Y.Z` trailer from `cyrius.cyml`, closing a stale-string class of bug surfaced in v1.27.0 | v1.27.1 |
-| 56 | Resolved issue docs archived: `memory-isolation-deep.md` (closed by SMAP fix), `cr3-load-helper.md` (its v1.26.0 fix was sufficient — test now works fully end-to-end) | v1.27.1 |
-
-## Active
+### Carried over (not 1.28.x)
 
 | # | Item | Notes |
 |---|------|-------|
-| 1 | SMP AP wakeup on real hardware | Currently QEMU-validated only |
-| 2 | Tagged unions for VFS entry types | ktagged.cyr kernel stdlib |
-| 3 | Struct refactor with #derive(accessors) | proc_table, vfs_table, pci_devs |
-| 7 | **`serial_putc` benchmark regression vs v1.21.0** (rolling from v1.25.1 #7) | Disassembled — only ~5–6 cycles/call of real cc5 codegen overhead. Bulk of the 3,000+ cyc/op delta is almost certainly QEMU 7.x → 11.x UART-emulation noise + host-CPU drift between bench runs. Filed as [`issue/2026-04-27-serial-putc-cc5-regression.md`](issue/2026-04-27-serial-putc-cc5-regression.md) recommending **defer** pending matched-conditions re-measurement. |
+| 1 | SMP AP wakeup on real hardware | Currently QEMU-validated only. Needs hardware-in-the-loop infra (RPi4 / NUC harness on the self-hosted runner). Stays open across 1.28.x; closes when the infra lands. |
+
+### Ordering rationale
+
+- **KASLR first (.0)** because it's the most feature-shaped of the four — deserves the headline slot and matches the "the .0 ships the headline" pattern across the AGNOS ecosystem (e.g., 1.27.0 = toolchain alignment, 1.27.1 = memory-isolation closeout).
+- **serial_putc next (.1)** because it's the tightest, lowest-risk closeout of a long-running Active item. Symmetric with 1.27.1's pattern (close a long-running carry-forward via focused .1 patch).
+- **VFS tagged unions (.2)** before the struct refactor (.3) because `ktagged.cyr` is *new infrastructure* — it should ship first and prove itself in one consumer (VFS) before becoming the substrate for a broader refactor.
+- **Struct refactor last (.3)** because its blast radius is largest; doing it after the other items means we apply it to a known-good kernel rather than mixing it with feature work.
+
+This ordering is a recommendation, not a contract — any of .1/.2/.3 can swap if a finding changes the calculus. .0 should stay KASLR (the feature anchor).
 
 ## Multi-Architecture (Complete)
 
@@ -157,61 +67,34 @@ Arch interface — each arch provides:
 - `arch_eoi()` — interrupt acknowledgment
 - `arch_wait()` / `arch_halt()` — WFI/HLT abstraction
 
-All Cyrius blockers resolved (Cyrius >= 1.7.0):
-1. ~~`include` in kernel mode~~ — **Fixed** v1.6.1
-2. ~~`cyrb --aarch64` path resolution~~ — **Fixed** v1.6.1
-3. ~~Release tarball missing cc2_aarch64~~ — **Fixed** v1.7.0
-4. ~~aarch64 kernel SP setup~~ — **Fixed** v1.6.2
-5. ~~aarch64 string fixups~~ — **Fixed** v1.6.2
-6. ~~Nested for-loops with var~~ — **Fixed** v1.7.0
-7. ~~ifdef in included files~~ — **Fixed** v1.6.5
-
 ## Security Hardening (from 2026-04-13 audit)
 
-Priority order. See `docs/audit/2026-04-13-security-audit.md` for full findings.
-Implementation details in `docs/development/security-hardening.md`.
+12 of 13 items shipped through v1.27.x. Only S7 (KASLR) remains open, targeted for v1.28.0. Full audit at [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md); per-item implementation history at [`security-hardening.md`](security-hardening.md).
 
-| # | Item | Prerequisite | Severity |
-|---|------|-------------|----------|
-| S1 | ~~**Separate user/kernel page mappings**~~ | Done | HIGH |
-| S2 | ~~**Per-CPU TSS + RSP0**~~ | Done | HIGH |
-| S3 | ~~**PMM spinlock**~~ | Done | MEDIUM |
-| S4 | ~~**Per-process exit codes**~~ | Done | MEDIUM |
-| S5 | ~~**Per-connection TCP RX buffers**~~ | Done | MEDIUM |
-| S6 | ~~**Stack guard pages**~~ | Done | MEDIUM |
-| S7 | **KASLR** — randomize kernel load address; currently fixed at 0x100000, trivial ROP | Boot shim + relocatable binary | MEDIUM |
-| S8 | ~~**KPTI (Kernel Page Table Isolation)**~~ | Done (partial — PD entry 0 kept in user tables for trampoline/ISR; full isolation needs 4KB pages) | MEDIUM |
-| S9 | ~~**Spectre v2 mitigations**~~ | Done (IBRS set/clear on SYSCALL entry/exit; retpoline deferred to compiler) | MEDIUM |
-| S10 | ~~**IOMMU (VT-d)**~~ | Done (ACPI RSDP/RSDT/DMAR parsing + VT-d root/context/IO page tables + DMA restricted to first 16MB) | MEDIUM |
-| S11 | ~~**ARP request tracking**~~ | Done | LOW |
-| S12 | ~~**TCP window/sequence validation**~~ | Done | LOW |
-| S13 | ~~**Stack canaries**~~ | Done (RDRAND-based secret, manual in ksyscall/elf_load/net_handle_tcp) | LOW |
+| # | Item | Status | Severity |
+|---|------|--------|----------|
+| S1 | Separate user/kernel page mappings | ✅ | HIGH |
+| S2 | Per-CPU TSS + RSP0 | ✅ | HIGH |
+| S3 | PMM spinlock | ✅ | MEDIUM |
+| S4 | Per-process exit codes | ✅ | MEDIUM |
+| S5 | Per-connection TCP RX buffers | ✅ | MEDIUM |
+| S6 | Stack guard pages | ✅ | MEDIUM |
+| **S7** | **KASLR** — currently fixed at `0x100000`, trivial ROP. Targeted for **v1.28.0** as data-KASLR. See [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md). | 🟠 **Open** | MEDIUM |
+| S8 | KPTI (Kernel Page Table Isolation) | ✅ (partial — PD entry 0 kept in user tables for ISR; full isolation needs 4 KB pages) | MEDIUM |
+| S9 | Spectre v2 mitigations | ✅ (IBRS set/clear on SYSCALL entry/exit) | MEDIUM |
+| S10 | IOMMU (VT-d) | ✅ (ACPI DMAR parsing + VT-d root/context/IO page tables) | MEDIUM |
+| S11 | ARP request tracking | ✅ | LOW |
+| S12 | TCP window/sequence validation | ✅ | LOW |
+| S13 | Stack canaries | ✅ (RDRAND-based secret) | LOW |
 
-### Dependency chain
+## Planned (post-1.28.x)
 
-```
-S1 (user/kernel page split)
-├── S8 (KPTI) ── S9 (Spectre)
-└── S6 (guard pages — needs 4KB page support)
+Long-horizon items past the 1.28.x arc. Each is a feature-class lift (1.29.0+ territory).
 
-S2 (per-CPU TSS)
-└── S3 (PMM spinlock)
-
-S4, S5, S7, S10-S13 are independent
-```
-
-## Hygiene (post-v1.26.1)
-
-H1 shipped in v1.24.1, H2 shipped in v1.24.1, H3 closed upstream
-in cyrius v5.7.22 and inherited by agnos via the v1.26.1 pin bump.
-No open hygiene items.
-
-## Planned
-
-| # | Item | Prerequisite |
-|---|------|-------------|
-| 5 | Real filesystem (ext2) | Disk I/O |
-| 6 | mmap | VMM + filesystem |
-| 7 | Shared memory | SMP + VMM |
-| 8 | Preemptive scheduling | Timer + SMP stable |
-| 9 | USB support | PCI + device driver framework |
+| # | Item | Prerequisite | Notes |
+|---|------|-------------|-------|
+| 5 | Real filesystem (ext2) | Disk I/O (have) | FAT16 read-only at v1.11.0 is the floor; ext2 buys actual fs semantics (inodes, journaling deferrable). |
+| 6 | mmap | VMM + filesystem | Needs (5) for backing files; anonymous mmap is independent and could ship first. |
+| 7 | Shared memory | SMP + VMM | Builds on per-process address spaces. |
+| 8 | Preemptive scheduling | Timer + SMP stable | Round-robin is cooperative today; preemptive needs careful interrupt-safe context save/restore. |
+| 9 | USB support | PCI + device driver framework | XHCI is the modern path; UHCI/EHCI for legacy. Device-framework refactor would precede. |
