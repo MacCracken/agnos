@@ -191,8 +191,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var sfd = vfs_alloc();
         if (sfd < 0) { return 0 - 1; }
         var sbase = &vfs_table + sfd * 32;
-        store64(sbase, 3);
-        store64(sbase + 24, load64(arg2));
+        ktag_set(sbase, VFS_SIGNALFD);
+        kpayload_set(sbase, 2, load64(arg2));   # sigmask
         return sfd;
     }
     # Tier 4: epoll + timerfd
@@ -201,10 +201,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var efd = vfs_alloc();
         if (efd < 0) { return 0 - 1; }
         var ebase = &vfs_table + efd * 32;
-        store64(ebase, 4);
-        store64(ebase + 8, 0);
+        ktag_set(ebase, VFS_EPOLL);
+        kpayload_set(ebase, 0, 0);              # watch count
         var wl = kmalloc(128);
-        store64(ebase + 24, wl);
+        kpayload_set(ebase, 2, wl);             # watch list ptr
         return efd;
     }
     if (num == 20) {
@@ -212,18 +212,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= 32) { return 0 - 1; }
         var ebase = &vfs_table + arg1 * 32;
-        var wl = load64(ebase + 24);
+        var wl = kpayload(ebase, 2);
         if (wl == 0) { return 0 - 1; }
-        var wc = load64(ebase + 8);
+        var wc = kpayload(ebase, 0);
         if (arg2 == 1) {
             # Max 8 watches (128 bytes / 16 bytes per watch)
             if (wc >= 8) { return 0 - 1; }
             store64(wl + wc * 16, arg3);
             store64(wl + wc * 16 + 8, arg3);
-            store64(ebase + 8, wc + 1);
+            kpayload_set(ebase, 0, wc + 1);
         }
         if (arg2 == 2) {
-            store64(ebase + 8, 0);
+            kpayload_set(ebase, 0, 0);
         }
         return 0;
     }
@@ -236,22 +236,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 < 0) { return 0 - 1; }
         if (arg3 > 16) { arg3 = 16; }
         var ebase = &vfs_table + arg1 * 32;
-        var wl = load64(ebase + 24);
-        var wc = load64(ebase + 8);
+        var wl = kpayload(ebase, 2);
+        var wc = kpayload(ebase, 0);
         var found = 0;
         for (var wi = 0; wi < wc; wi = wi + 1) {
             var wfd = load64(wl + wi * 16);
             var wdata = load64(wl + wi * 16 + 8);
             var wbase = &vfs_table + wfd * 32;
-            var wtype = load64(wbase);
+            var wtype = ktag(wbase);
             var rdy = 0;
-            if (wtype == 3) {
-                var smask = load64(wbase + 24);
+            if (wtype == VFS_SIGNALFD) {
+                var smask = kpayload(wbase, 2);
                 var spend = load64(&proc_signals + proc_current * 8);
                 if ((spend & smask) != 0) { rdy = 1; }
             }
-            if (wtype == 5) {
-                if (timer_ticks >= load64(wbase + 16)) { rdy = 1; }
+            if (wtype == VFS_TIMERFD) {
+                if (timer_ticks >= kpayload(wbase, 1)) { rdy = 1; }
             }
             if (rdy == 1) {
                 if (found < arg3) {
@@ -269,9 +269,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var tfd = vfs_alloc();
         if (tfd < 0) { return 0 - 1; }
         var tbase = &vfs_table + tfd * 32;
-        store64(tbase, 5);
-        store64(tbase + 8, 0);
-        store64(tbase + 16, 0);
+        ktag_set(tbase, VFS_TIMERFD);
+        kpayload_set(tbase, 0, 0);              # interval
+        kpayload_set(tbase, 1, 0);              # next_fire
         return tfd;
     }
     if (num == 23) {
@@ -283,8 +283,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var tbase = &vfs_table + arg1 * 32;
         var int_sec = load64(arg3);
         var init_sec = load64(arg3 + 16);
-        store64(tbase + 8, int_sec * 100);
-        store64(tbase + 16, timer_ticks + init_sec * 100);
+        kpayload_set(tbase, 0, int_sec * 100);            # interval
+        kpayload_set(tbase, 1, timer_ticks + init_sec * 100);   # next_fire
         return 0;
     }
     if (num == 25) {

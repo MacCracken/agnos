@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.28.1 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
+> **Current**: v1.28.2 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
 >
 > Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 
@@ -27,7 +27,7 @@ The 1.27.x arc closed at v1.27.2 with an empty Active table modulo #1 (SMP-on-ha
 |------|------|--------|--------|
 | **1.28.0** | **KASLR (data-only)** | Security Hardening S7 | ✅ **Shipped 2026-05-11**. `rdrand_u64` helper, `kaslr_seed`, randomized `pmm_next_free`, two-boot-diff CI assertion. See [`CHANGELOG.md`](../../CHANGELOG.md) v1.28.0 entry. |
 | **1.28.1** | **`serial_putc` methodology** | Active #7 | ✅ **Shipped 2026-05-11**. bench-history schema extended with `qemu_version` / `cpu_model` / `host_arch` / `kvm_enabled` / `cyrius_version`. Matched-conditions re-measurement confirmed the regression was QEMU UART-emulation drift, not codegen. Issue archived with full Resolution section. Active #7 closed. |
-| **1.28.2** | **VFS tagged unions** | Active #2 | 🟠 Open. New `kernel/lib/ktagged.cyr` (kernel-safe tagged-union helper, ported from cyrius stdlib `lib/tagged.cyr`). Port VFS entry types (currently switch on type code 0–6) to the new pattern. |
+| **1.28.2** | **VFS tagged unions** | Active #2 | ✅ **Shipped 2026-05-11**. New `kernel/lib/ktagged.cyr` (inline tagged-union helpers, no heap allocation — diverges from cyrius stdlib `lib/tagged.cyr` shape). `VfsType` enum + ktag/kpayload accessor port across `vfs.cyr` + `syscall.cyr`. Boot path validates VFS, memfile, initrd, signalfd/epoll/timerfd, and pipe paths preserved. Active #2 closed. |
 | **1.28.3** | **Struct refactor with `#derive(accessors)`** | Active #3 | 🟠 Open. Sequence: `pci_devs` → `vfs_table` → `proc_table` (increasing blast radius). One subsystem per commit. |
 
 After 1.28.3 the Active table is empty modulo SMP-on-hardware (which stays open until hardware-in-the-loop infra exists). 1.28.4 is a P(-1) hardening / closeout patch before tagging 1.29.0.

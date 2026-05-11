@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.28.1
+# agnos.cyr — AGNOS kernel v1.28.2
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
@@ -33,6 +33,7 @@ include "arch/aarch64/stubs.cyr"
 # Kernel stdlib (vendored, syscall-free)
 include "lib/kstring.cyr"
 include "lib/kfmt.cyr"
+include "lib/ktagged.cyr"
 
 # Architecture-independent core
 include "core/pmm.cyr"

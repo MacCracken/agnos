@@ -5,6 +5,113 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.28.2] — 2026-05-11
+
+**VFS tagged unions ship — closes Active #2.** Third slot of the 1.28.x
+arc. Introduces `kernel/lib/ktagged.cyr` as a new kernel-safe stdlib
+module, then ports VFS entry-type dispatch from magic-number switches
+(`ftype == 1`, `store64(base, 6)`, etc.) to named-enum + accessor
+patterns. First consumer of `ktagged` — proves the inline-tagged-union
+design before it becomes load-bearing infrastructure for future
+consumers.
+
+### Added
+- **`kernel/lib/ktagged.cyr`** — new kernel-safe stdlib module
+  alongside `kstring.cyr` and `kfmt.cyr`. Inline tagged-union helpers
+  (no heap allocation; caller owns the slot's storage in an array or
+  struct). Exports:
+  - `ktag(slot)` — read the discriminator tag at offset 0
+  - `ktag_set(slot, tag)` — write the discriminator
+  - `kis_tag(slot, expected)` — 1 if tag matches, else 0
+  - `kpayload(slot, idx)` — read 8-byte payload at offset `8 + idx*8`
+  - `kpayload_set(slot, idx, val)` — write payload
+  - `ktag_clear(slot, width_bytes)` — zero the entire slot at close
+
+  Vendored from cyrius stdlib's `lib/tagged.cyr` but heap-allocation
+  removed — kernel data structures already own their backing storage,
+  so a 16-byte `alloc(16)` per fd would be pure overhead. The inline
+  shape keeps the VFS table layout unchanged (32-byte slots in
+  `vfs_table[1024]`).
+- **`VfsType` enum** in `kernel/core/vfs.cyr`: `VFS_FREE=0`,
+  `VFS_DEVICE=1`, `VFS_MEMFILE=2`, `VFS_SIGNALFD=3`, `VFS_EPOLL=4`,
+  `VFS_TIMERFD=5`, `VFS_PIPE=6`. Doesn't consume `gvar_toks` slots
+  per cyrius enum-vs-`var`-globals convention.
+- **Layout comment** at the top of `vfs.cyr` documenting per-tag
+  payload interpretation (DEVICE → payload[2] = device idx;
+  MEMFILE → pos/size/data; PIPE → tail/is_write_end/buf; etc.).
+
+### Changed
+- **`kernel/core/vfs.cyr`**: every magic-number type check converted
+  to a named-enum comparison.
+  - `vfs_init`: `store64(&vfs_table, 1)` → `ktag_set(&vfs_table, VFS_DEVICE)`
+  - `vfs_alloc`: `load64(...) == 0` → `kis_tag(..., VFS_FREE)`
+  - `vfs_create_memfile`: 4 raw `store64(base + N)` calls → `ktag_set` + 3 `kpayload_set`
+  - `vfs_read`: 6 `ftype == N` checks → named-enum comparisons; 9 raw `load64(base + N)` payload reads → `kpayload(base, idx)`
+  - `vfs_write`: same shape — 2 checks + 2 payload reads ported
+  - `vfs_create_pipe`: 8 store64 calls → `ktag_set` + 6 `kpayload_set`
+  - `vfs_close`: `store64(slot, 0)` (cleared tag only) → `ktag_clear(slot, 32)` (zeroes entire 32-byte slot — defense-in-depth against stale payload leak between fd lifetimes)
+- **`kernel/core/syscall.cyr`** — 4 fd-type assignment sites + epoll-wait dispatch:
+  - `signalfd` (num=18): `store64(sbase, 3)` → `ktag_set(sbase, VFS_SIGNALFD)`
+  - `epoll_create` (num=19): `store64(ebase, 4)` → `ktag_set(ebase, VFS_EPOLL)`
+  - `epoll_ctl` (num=20): 4 raw load/store sites → `kpayload`/`kpayload_set`
+  - `epoll_wait` (num=21): `load64(wbase)` discriminator → `ktag(wbase)`; `wtype == 3` / `wtype == 5` → `wtype == VFS_SIGNALFD` / `wtype == VFS_TIMERFD`; payload reads → `kpayload`
+  - `timerfd_create` (num=22): `store64(tbase, 5)` → `ktag_set(tbase, VFS_TIMERFD)`
+  - `timerfd_settime` (num=23): raw store64 → `kpayload_set`
+
+  Net effect: zero remaining `store64(<vfs slot>, <magic int>)` or `load64(<vfs slot>)` in the kernel — every access goes through the named API. Future readers see *what kind* of fd at each site, not what bit-pattern was stored.
+- **`kernel/agnos.cyr`** — `include "lib/ktagged.cyr"` after the existing kstring/kfmt include, before `core/pmm.cyr`. Same tier as the other vendored kernel-safe stdlib modules.
+
+### Verified
+- `scripts/build.sh` (x86_64): **249,984 B** (was 249,152 B at
+  v1.28.1 — +832 B for the new ktagged module, the VFS-layout
+  comment block, and the VfsType enum, partially offset by the
+  ktagged accessor calls being slightly larger than the inlined
+  `load64(base + N)`/`store64` pattern they replace).
+- `scripts/build.sh --aarch64`: **93,288 B** (was 92,488 B at
+  v1.28.1 — +800 B; ktagged.cyr is arch-neutral and gets pulled
+  into both arches' link).
+- `scripts/test.sh --all`: 7/7 PASS.
+- `scripts/check.sh`: 11/11 PASS.
+- QEMU boot under `-cpu max -serial stdio`: banner v1.28.2 +
+  `KASLR: pmm_next_free=N` (varies per boot) + `VFS initialized` +
+  `VFS write: OK` + `initrd test: PASS` + `VFS memfile read: HELLO`
+  + `Memory isolation: PASS` + `Userland exec complete` +
+  `=== done ===`. The VFS-path assertions (initrd open/read,
+  memfile create/read, device write) all fire, validating that the
+  byte-layout preserved correctly across the refactor.
+
+### Notes
+- **No byte-layout change.** The 32-byte VFS slot layout is
+  identical (tag at +0; 8-byte payload slots at +8/+16/+24).
+  `ktagged` is a thin sugar on top of `load64`/`store64` at the
+  same offsets. This was deliberate — porting consumers without
+  changing the underlying storage shape kept the diff bounded and
+  the byte-identical boot path provable. Future ktagged consumers
+  may use different slot widths (16-byte minimal pairs, 64-byte
+  process slots, etc.) — the helpers don't constrain that.
+- **Why `ktag_clear` zeroes the whole slot on `vfs_close`**: pre-
+  1.28.2 the close path only zeroed the tag word, leaving stale
+  payload bytes (e.g. a freed pipe-buf pointer) in the slot. Under
+  fd reuse a future `kpayload(slot, 2)` would see the previous
+  fd's data pointer — a defense-in-depth concern. The full-slot
+  zero is essentially free (4 store64s per close; close is cold)
+  and removes the class.
+- **Performance**: VFS hot paths now call `kpayload(base, idx)` which
+  computes `8 + idx * 8` per call. The constant multiplication folds
+  to an `imm32` add at codegen; net overhead vs the open-coded
+  `load64(base + N)` should be 0-1 cycles. Not measured in this
+  cut — bench-history will show it next time the suite runs.
+- **Active table after this minor**: only #1 (SMP-on-hardware) +
+  1.28.3 of this arc. 1.28.3 (struct refactor with
+  `#derive(accessors)`) is the largest item and closes Active #3,
+  after which 1.28.4 is a P(-1) hardening / closeout pass before
+  1.29.0.
+- **`ktagged` consumer pipeline**: VFS is the first consumer. Future
+  consumers — when 3+ are in production, consider promoting the
+  helpers to cyrius's kernel-stdlib-track distfile so other
+  kernel-mode Cyrius binaries don't re-port the same helpers. Not
+  acted on this cut.
+
 ## [1.28.1] — 2026-05-11
 
 **`serial_putc` regression closed — not a real codegen regression.**

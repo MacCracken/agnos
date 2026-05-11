@@ -1,17 +1,45 @@
 # === VFS ===
+#
+# Per-entry layout (32 bytes, addressed via `kernel/lib/ktagged.cyr`):
+#   +0   tag         — VFS_FREE / DEVICE / MEMFILE / SIGNALFD / EPOLL /
+#                       TIMERFD / PIPE (see enum below)
+#   +8   payload[0]  — interpretation depends on tag:
+#                       MEMFILE: pos  | PIPE: read tail  | TIMERFD: interval
+#                       EPOLL:   watch count
+#   +16  payload[1]  — MEMFILE: size  | PIPE: is_write_end (0/1)
+#                       TIMERFD: next_fire tick
+#   +24  payload[2]  — DEVICE:  device index
+#                       MEMFILE/PIPE/EPOLL: data pointer
+#                       SIGNALFD: sigmask
+#
+# v1.28.2: explicit enum tags + ktagged accessors replace the magic-
+# number `ftype == N` switches and bare-offset `load64(base + N*8)`
+# arithmetic. First consumer of kernel/lib/ktagged.cyr. Active item
+# #2 closed.
+
+enum VfsType {
+    VFS_FREE     = 0;
+    VFS_DEVICE   = 1;
+    VFS_MEMFILE  = 2;
+    VFS_SIGNALFD = 3;
+    VFS_EPOLL    = 4;
+    VFS_TIMERFD  = 5;
+    VFS_PIPE     = 6;
+}
+
 var vfs_table[1024];  # 32 entries x 32 bytes each
 
 fn vfs_init() {
     memset(&vfs_table, 0, 1024);  # 32 entries x 32 bytes
-    # FD 0 = serial device (type=1, data=device index 0)
-    store64(&vfs_table, 1);
-    store64(&vfs_table + 24, 0);
+    # FD 0 = serial device (data=device index 0)
+    ktag_set(&vfs_table, VFS_DEVICE);
+    kpayload_set(&vfs_table, 2, 0);
     return 0;
 }
 
 fn vfs_alloc() {
     for (var i = 1; i < 32; i = i + 1) {
-        if (load64(&vfs_table + i * 32) == 0) { return i; }
+        if (kis_tag(&vfs_table + i * 32, VFS_FREE) == 1) { return i; }
     }
     return 0 - 1;
 }
@@ -20,10 +48,10 @@ fn vfs_create_memfile(data, size) {
     var idx = vfs_alloc();
     if (idx < 0) { return 0 - 1; }
     var base = &vfs_table + idx * 32;
-    store64(base, 2);
-    store64(base + 8, 0);
-    store64(base + 16, size);
-    store64(base + 24, data);
+    ktag_set(base, VFS_MEMFILE);
+    kpayload_set(base, 0, 0);       # pos
+    kpayload_set(base, 1, size);
+    kpayload_set(base, 2, data);
     return idx;
 }
 
@@ -115,35 +143,33 @@ fn vfs_read(fd_idx, buf, count) {
     if (buf == 0) { return 0 - 1; }
     if (count < 0) { return 0 - 1; }
     var base = &vfs_table + fd_idx * 32;
-    var ftype = load64(base);
-    if (ftype == 0) { return 0 - 1; }
-    if (ftype == 1) {
-        # Device: data field = device index
-        return dev_read(load64(base + 24), buf, count);
+    var ftype = ktag(base);
+    if (ftype == VFS_FREE) { return 0 - 1; }
+    if (ftype == VFS_DEVICE) {
+        return dev_read(kpayload(base, 2), buf, count);
     }
-    if (ftype == 2) {
-        var pos = load64(base + 8);
-        var fsize = load64(base + 16);
-        var data = load64(base + 24);
+    if (ftype == VFS_MEMFILE) {
+        var pos = kpayload(base, 0);
+        var fsize = kpayload(base, 1);
+        var data = kpayload(base, 2);
         # Security: check pos <= fsize to prevent underflow in subtraction
         if (pos >= fsize) { return 0; }
         var avail = fsize - pos;
         if (avail < 1) { return 0; }
         if (count > avail) { count = avail; }
         memcpy(buf, data + pos, count);
-        store64(base + 8, pos + count);
+        kpayload_set(base, 0, pos + count);
         return count;
     }
-    if (ftype == 3) {
+    if (ftype == VFS_SIGNALFD) {
         return vfs_read_signalfd(base, buf);
     }
-    if (ftype == 5) {
+    if (ftype == VFS_TIMERFD) {
         return vfs_read_timerfd(base, buf);
     }
-    if (ftype == 6) {
-        # Pipe read
-        var is_write_end = load64(base + 16);
-        if (is_write_end != 0) { return 0 - 1; }
+    if (ftype == VFS_PIPE) {
+        # Read end has is_write_end=0 (payload[1])
+        if (kpayload(base, 1) != 0) { return 0 - 1; }
         return pipe_read(base, buf, count);
     }
     return 0 - 1;
@@ -155,14 +181,13 @@ fn vfs_write(fd_idx, buf, count) {
     if (buf == 0) { return 0 - 1; }
     if (count < 0) { return 0 - 1; }
     var base = &vfs_table + fd_idx * 32;
-    var ftype = load64(base);
-    if (ftype == 1) {
-        return dev_write(load64(base + 24), buf, count);
+    var ftype = ktag(base);
+    if (ftype == VFS_DEVICE) {
+        return dev_write(kpayload(base, 2), buf, count);
     }
-    if (ftype == 6) {
-        # Pipe write
-        var is_write_end = load64(base + 16);
-        if (is_write_end != 1) { return 0 - 1; }
+    if (ftype == VFS_PIPE) {
+        # Write end has is_write_end=1 (payload[1])
+        if (kpayload(base, 1) != 1) { return 0 - 1; }
         return pipe_write(base, buf, count);
     }
     return 0 - 1;
@@ -178,18 +203,18 @@ fn vfs_create_pipe(fds_ptr) {
     var rfd = vfs_alloc();
     if (rfd < 0) { kfree_sized(pipe_buf, 4096); return 0 - 1; }
     var rbase = &vfs_table + rfd * 32;
-    store64(rbase, 6);
-    store64(rbase + 8, 0);
-    store64(rbase + 16, 0);
-    store64(rbase + 24, pipe_buf);
+    ktag_set(rbase, VFS_PIPE);
+    kpayload_set(rbase, 0, 0);       # read tail
+    kpayload_set(rbase, 1, 0);       # is_write_end = 0
+    kpayload_set(rbase, 2, pipe_buf);
     # Allocate write end fd
     var wfd = vfs_alloc();
     if (wfd < 0) { vfs_close(rfd); kfree_sized(pipe_buf, 4096); return 0 - 1; }
     var wbase = &vfs_table + wfd * 32;
-    store64(wbase, 6);
-    store64(wbase + 8, 0);
-    store64(wbase + 16, 1);
-    store64(wbase + 24, pipe_buf);
+    ktag_set(wbase, VFS_PIPE);
+    kpayload_set(wbase, 0, 0);
+    kpayload_set(wbase, 1, 1);       # is_write_end = 1
+    kpayload_set(wbase, 2, pipe_buf);
     # Write fd numbers to user pointer
     store64(fds_ptr, rfd);
     store64(fds_ptr + 8, wfd);
@@ -199,6 +224,9 @@ fn vfs_create_pipe(fds_ptr) {
 fn vfs_close(fd_idx) {
     if (fd_idx < 0) { return 0 - 1; }
     if (fd_idx >= 32) { return 0 - 1; }
-    store64(&vfs_table + fd_idx * 32, 0);
+    # Zero the entire slot (tag → VFS_FREE, payload all 0) so reuse
+    # via vfs_alloc finds a clean entry. ktag_clear zeroes the full
+    # 32-byte slot.
+    ktag_clear(&vfs_table + fd_idx * 32, 32);
     return 0;
 }

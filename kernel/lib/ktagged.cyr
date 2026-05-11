@@ -1,0 +1,66 @@
+# === ktagged — Kernel-Safe Tagged Unions (inline) ===
+#
+# Vendored from the kernel-safe stdlib tier (alongside kstring.cyr and
+# kfmt.cyr). A kernel-safe variant of cyrius's `lib/tagged.cyr`:
+# whereas that module heap-allocates a 16-byte `{tag, value}` pair via
+# `alloc()`, this one operates on caller-owned inline storage — an
+# array slot, a struct field, anywhere with at least 8 bytes for the
+# tag plus N bytes for the payload. Zero heap allocation; appropriate
+# for kernel data structures that already have their own backing.
+#
+# Layout (caller-provided slot):
+#   slot + 0  : i64 tag (the discriminator)
+#   slot + 8  : payload[0]  (first 8-byte payload slot)
+#   slot + 16 : payload[1]
+#   slot + N*8: payload[N-1]
+#
+# Consumer-specific tag constants (e.g. `VFS_DEVICE`, `VFS_PIPE`) live
+# in the consumer module. This module is generic: it manipulates the
+# tag and the 8-byte-indexed payload only.
+#
+# First consumer: kernel/core/vfs.cyr's `vfs_table` (32-byte slots,
+# tag at +0, payload slots at +8/+16/+24 representing pos/size/data).
+# v1.28.2.
+
+# Read the discriminator tag from a tagged slot.
+fn ktag(slot) {
+    return load64(slot);
+}
+
+# Set the discriminator tag.
+fn ktag_set(slot, tag) {
+    store64(slot, tag);
+    return 0;
+}
+
+# Tag check — returns 1 if the slot's tag matches `expected`, else 0.
+# The cyrius stdlib calls this `is_tag`; we prefix with `k` to match
+# the kstring/kfmt/ktag naming convention.
+fn kis_tag(slot, expected) {
+    if (load64(slot) == expected) { return 1; }
+    return 0;
+}
+
+# Read payload slot `idx` (0-based, 8-byte stride).
+# Equivalent to `load64(slot + 8 + idx * 8)`.
+fn kpayload(slot, idx) {
+    return load64(slot + 8 + idx * 8);
+}
+
+# Set payload slot `idx`.
+fn kpayload_set(slot, idx, val) {
+    store64(slot + 8 + idx * 8, val);
+    return 0;
+}
+
+# Zero out the entire slot (tag + N payload words). Use at fd-close
+# time / when freeing a tagged entry. Caller passes the total slot
+# width in bytes (e.g. 32 for vfs_table entries).
+fn ktag_clear(slot, width_bytes) {
+    var i = 0;
+    while (i < width_bytes) {
+        store64(slot + i, 0);
+        i = i + 8;
+    }
+    return 0;
+}
