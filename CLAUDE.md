@@ -6,8 +6,8 @@
 
 - **Type**: Bare-metal kernel binary (Cyrius language)
 - **License**: GPL-3.0-only
-- **Version**: 1.26.1
-- **Language**: Cyrius 5.7.19 (via `~/.cyrius/bin/cyrius`, `cyriusly use 5.7.19`)
+- **Version**: 1.27.0
+- **Language**: Cyrius 5.10.44 (via `~/.cyrius/bin/cyrius`, `cyriusly use 5.10.44`)
 - **Tools**: `owl` to read .cyr files, `cyim` to write/edit .cyr files
 - **Target**: x86_64 + aarch64 (cross-compilation supported)
 
@@ -17,26 +17,28 @@ A sovereign kernel written entirely in Cyrius. No C, no Rust, no LLVM. Assembly 
 
 ## Consumers
 
-- kybernet (v1.0.2) — PID 1 helmsman, boots on AGNOS
-- argonaut (v1.5.0) — init/service manager, 5 boot modes
+- kybernet (v1.2.0) — PID 1 helmsman, boots on AGNOS
+- argonaut (v1.6.3) — init/service manager, 5 boot modes
+- daimon (v1.2.3) — agent orchestrator
 - AGNOS userland tools — shell, services
 - Cyrius language project — proves the language handles kernel code
 
 ## Ecosystem Dependencies
 
 All Cyrius, all GPL-3.0-only. The kernel itself is standalone (no deps), but the
-userland boot stack is:
+userland boot stack is aligned at the cyrius 5.10.44 pin:
 
 ```
-kybernet (PID 1)
-├── agnosys v1.0.2    — syscall bindings (Linux x86_64 wrappers)
-├── agnostik v1.0.0   — shared types/primitives (error/security/agent)
-├── argonaut v1.5.0   — service lifecycle, health, seccomp/Landlock
-│   └── libro v2.0.5  — cryptographic audit chain (8 modules)
+kybernet (PID 1) v1.2.0
+├── agnosys v1.2.5    — syscall bindings (Linux x86_64 + aarch64 wrappers)
+├── agnostik v1.2.2   — shared types/primitives (error/security/agent/telemetry)
+├── argonaut v1.6.3   — service lifecycle, health, seccomp/Landlock, PID-1 harness
+│   └── libro v2.6.2  — cryptographic audit chain
 └── stdlib x21        — string, fmt, alloc, json, sakshi, etc.
 ```
-Pinned tags (kybernet's `cyrius.cyml`): agnosys 1.0.2, agnostik 1.0.0,
-libro 2.0.5, argonaut 1.5.0.
+Pinned tags (kybernet's `cyrius.cyml`): agnosys 1.2.5, agnostik 1.2.2,
+libro 2.6.2, argonaut 1.6.3. agnosys 1.2.6+ jumped to cyrius 5.11.x; we
+stay on 1.2.5 to keep the whole stack on a single cyrius pin.
 
 ### Cyrius Standard Library (key modules)
 
@@ -60,9 +62,9 @@ mode, expect-assertions). Never `cat` a `.cyr` directly when reading; never
 
 ## Build
 
-Requires Cyrius 5.7.19 (`~/.cyrius/bin/cyrius`). The toolchain pin lives
-in `cyrius.cyml` (`cyrius = "5.7.19"`); switch the active version with
-`cyriusly use 5.7.19`. The kernel is a freestanding binary — `cyrius.cyml`
+Requires Cyrius 5.10.44 (`~/.cyrius/bin/cyrius`). The toolchain pin lives
+in `cyrius.cyml` (`cyrius = "5.10.44"`); switch the active version with
+`cyriusly use 5.10.44`. The kernel is a freestanding binary — `cyrius.cyml`
 declares an empty `[deps]` block, so `cyrius deps` is a no-op (no host
 stdlib is linked into the kernel).
 

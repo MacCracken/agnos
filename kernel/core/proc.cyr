@@ -126,6 +126,15 @@ fn cr3_load(cr3_val) {
     return 0;
 }
 
+#ifdef ARCH_X86_64
+# X86-specific page-table layout (PML4 → PDPT → PD). Guarded so the
+# aarch64 build uses the no-op stubs in arch/aarch64/stubs.cyr instead
+# of these x86-specific implementations. Pre-1.27.0 these were unguarded
+# and "won" over the aarch64 stubs under last-definition-wins, which
+# cyrius 5.10.x began emitting as a `duplicate fn` warning. Beyond
+# silencing the warning this also closes a latent aarch64-correctness
+# gap: the aarch64 kernel was carrying x86 page-table code in these
+# slots and would have walked wrong memory if any caller had reached it.
 fn proc_create_address_space() {
     # Allocate 3 pages for kernel page tables: PML4, PDPT, PD
     var new_pml4 = pmm_alloc();
@@ -228,7 +237,7 @@ fn proc_check_pending_signals(pid) {
 }
 
 fn proc_map_page(cr3, virt, phys) {
-    # Get PD address from PML4 → PDPT → PD chain
+    # Get PD address from PML4 → PDPT → PD chain (x86 — see #ifdef above)
     var pml4e = load64(cr3);
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
     var pdpte = load64(pdpt_addr);
@@ -250,6 +259,7 @@ fn proc_map_page(cr3, virt, phys) {
 
 # Unmap a 2MB page in a process's page directory (for guard pages)
 fn proc_unmap_page(cr3, virt) {
+    # x86 page-table walk — see #ifdef ARCH_X86_64 above
     var pml4e = load64(cr3);
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
     var pdpte = load64(pdpt_addr);
@@ -267,3 +277,4 @@ fn proc_unmap_page(cr3, virt) {
     }
     return 0;
 }
+#endif

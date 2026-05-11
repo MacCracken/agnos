@@ -5,6 +5,84 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.27.0] — 2026-05-11
+
+**Cyrius pin 5.7.22 → 5.10.44; ecosystem realignment cut.** Kicks off
+the 1.27.x arc. This `.0` is the update-and-repair release that gets
+AGNOS back onto a current toolchain and re-anchors CLAUDE.md against
+the actual sibling versions; subsequent 1.27.x cuts will spend the
+new toolchain surface on real kernel work.
+
+Skips 30+ patch releases of upstream cyrius (5.7.22 → 5.8.x → 5.9.x →
+5.10.44). Kernel source needed one correctness fix (`#ifdef
+ARCH_X86_64` guards on x86-specific page-table fns) that the new
+toolchain's `duplicate fn` warning surfaced; the underlying issue
+predates the bump but was latent.
+
+### Changed
+- **`cyrius.cyml`**: pin `5.7.22` → `5.10.44`. AGNOS aligns with the
+  rest of the boot stack (kybernet 1.2.0, agnostik 1.2.2, agnosys 1.2.5,
+  argonaut 1.6.3, daimon 1.2.3, libro 2.6.2). agnosys 1.2.6+ jumped to
+  cyrius 5.11.x; the stack stays on agnosys 1.2.5 to keep one pin.
+- **`CLAUDE.md`**: refreshed Consumers + Ecosystem Dependencies blocks
+  against the current sibling versions (was pinned at agnosys 1.0.2 /
+  agnostik 1.0.0 / argonaut 1.5.0 / libro 2.0.5 / kybernet 1.0.2 — a
+  full minor-and-then-some out of date). Added `daimon` to the
+  consumers list. Updated `## Build` toolchain note from
+  `5.7.19` → `5.10.44`.
+
+### Fixed
+- **`kernel/core/proc.cyr`**: `#ifdef ARCH_X86_64` guard around
+  `proc_create_address_space`, `proc_get_user_cr3`, `proc_map_page`,
+  `proc_unmap_page`. Cyrius 5.10.x emits `duplicate fn ... (last
+  definition wins)` when the aarch64 build picks up both
+  `arch/aarch64/stubs.cyr`'s no-op stubs *and* these x86-specific
+  implementations (PML4 → PDPT → PD walk, hardcoded `0x3000` kernel-PD
+  address, KPTI entry-511 stash slot). Pre-1.27.0 the aarch64 build
+  silently linked the x86 implementations in over the stubs under
+  last-definition-wins — which would have walked wrong memory if any
+  caller reached them. The aarch64 binary shrinks 95,328 B → 92,216 B
+  (-3,112 B) now that the x86 page-table fns are correctly dropped.
+
+### Build infrastructure
+- **`scripts/build.sh` + `scripts/test.sh`**: export
+  `CYRIUS_NO_WARN_SHADOW_LIB=1`. cyrius 5.10+ emits an info `note` on
+  every build run when the cwd's `./lib/` shadows the version-pinned
+  stdlib snapshot. Our `kernel/lib/` (vendored kstring/kfmt) is the
+  intentional shadow by design — `--no-deps` skips the version-pinned
+  tree anyway, so the note carries no signal.
+
+### Verified
+- `scripts/build.sh` (x86_64): **247,752 B** (was 247,816 B at v1.26.1
+  — 64-byte shrink under the new codegen).
+- `scripts/build.sh --aarch64`: **92,216 B** (was 95,328 B at v1.26.1
+  — 3,112-byte shrink from the proc.cyr guard dropping dead x86 code).
+- `scripts/test.sh --all`: 7/7 PASS (x86 builds, multiboot ELF, size,
+  kernel_hello builds; aarch64 compiles, size, valid ELF).
+- `scripts/check.sh`: 11/11 PASS.
+- QEMU x86_64 boot under `-cpu max -serial stdio`: reaches the boot
+  banner and `Userland exec complete` (CI's assertions), runs through
+  the full 3-tier bench harness to `=== done ===`.
+- aarch64 build emits no warnings under the new pin (was: two
+  `duplicate fn` warnings at v1.26.1 under 5.10.44).
+
+### CI/release
+- No workflow changes needed. `.github/workflows/ci.yml` reads the
+  cyrius pin from `cyrius.cyml` via
+  `grep -oP '(?<=^cyrius = ")[^"]+'` and `curl`s
+  `https://github.com/MacCracken/cyrius/releases/download/<pin>/install.sh`
+  — the 5.10.44 release asset exists and is reachable. The
+  `boot-test` job's `"Userland exec complete"` grep still fires
+  cleanly. `release.yml`'s changelog-extract awk targets `## [1.27.0]`
+  and runs to the next `## [` — this entry is properly bracketed.
+
+### Notes
+- The 1.27.x arc is the cleanup-and-leverage arc. `.0` is toolchain
+  alignment; `.1+` is where we spend the new surface on the active
+  roadmap items (memory-isolation deeper-fault diagnosis, serial_putc
+  matched-conditions re-measurement, the broader kybernet-bridge /
+  syscall-additions tracks under `docs/development/`).
+
 ## [1.26.1] — 2026-04-27
 
 **Cyrius pin 5.7.19 → 5.7.22.** Closes both remaining post-v1.24.0

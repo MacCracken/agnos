@@ -12,6 +12,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CYRIUS_HOME="${CYRIUS_HOME:-$HOME/.cyrius}"
 CYRB="$CYRIUS_HOME/bin/cyrius"
 CC_ARM="$CYRIUS_HOME/bin/cc5_aarch64"
+# kernel/lib/ (vendored kstring/kfmt) intentionally shadows the
+# version-pinned stdlib snapshot. cyrius 5.10+ emits an info `note`
+# about this on every build run; silence it since the shadow is by
+# design (`--no-deps` skips the version-pinned tree anyway).
+export CYRIUS_NO_WARN_SHADOW_LIB=1
 echo "  toolchain: $CYRB" >&2
 ARCH="x86_64"
 
