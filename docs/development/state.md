@@ -16,7 +16,7 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.28.2** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.28.3** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **5.10.44** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-11 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Last assertion tightened** | `Memory isolation: PASS` | CI `boot-test` job, v1.27.1 |

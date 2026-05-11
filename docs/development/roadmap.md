@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.28.2 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
+> **Current**: v1.28.3 — x86_64 + aarch64, 248KB/92KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU. Built with cyrius 5.10.44.
 >
 > Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 
@@ -28,9 +28,9 @@ The 1.27.x arc closed at v1.27.2 with an empty Active table modulo #1 (SMP-on-ha
 | **1.28.0** | **KASLR (data-only)** | Security Hardening S7 | ✅ **Shipped 2026-05-11**. `rdrand_u64` helper, `kaslr_seed`, randomized `pmm_next_free`, two-boot-diff CI assertion. See [`CHANGELOG.md`](../../CHANGELOG.md) v1.28.0 entry. |
 | **1.28.1** | **`serial_putc` methodology** | Active #7 | ✅ **Shipped 2026-05-11**. bench-history schema extended with `qemu_version` / `cpu_model` / `host_arch` / `kvm_enabled` / `cyrius_version`. Matched-conditions re-measurement confirmed the regression was QEMU UART-emulation drift, not codegen. Issue archived with full Resolution section. Active #7 closed. |
 | **1.28.2** | **VFS tagged unions** | Active #2 | ✅ **Shipped 2026-05-11**. New `kernel/lib/ktagged.cyr` (inline tagged-union helpers, no heap allocation — diverges from cyrius stdlib `lib/tagged.cyr` shape). `VfsType` enum + ktag/kpayload accessor port across `vfs.cyr` + `syscall.cyr`. Boot path validates VFS, memfile, initrd, signalfd/epoll/timerfd, and pipe paths preserved. Active #2 closed. |
-| **1.28.3** | **Struct refactor with `#derive(accessors)`** | Active #3 | 🟠 Open. Sequence: `pci_devs` → `vfs_table` → `proc_table` (increasing blast radius). One subsystem per commit. |
+| **1.28.3** | **Struct refactor with `#derive(accessors)`** | Active #3 | ✅ **Partially shipped 2026-05-11.** `pci_devs` ported via `#derive(accessors)` (4 fields, clean). `vfs_table` already closed via `ktagged` at v1.28.2 (different mechanism, same goal — magic offsets removed). `proc_table` blocked on cyrius `#derive(accessors)` 16-field cap; filed at [`cyrius/issues/2026-05-11-derive-accessors-16-field-cap.md`](https://github.com/MacCracken/cyrius/blob/main/docs/development/issues/2026-05-11-derive-accessors-16-field-cap.md) — **acknowledged upstream and slotted for v5.11.x repair**. 2 of 3 subsystems closed; proc_table follows when agnos picks up the cyrius cap-raise (passive — pin bump only). Also lands a v1.27.x-era hygiene fix in `sched.cyr` (cr3_load helper replaces the pre-v1.26.0 brittle CR3-load pattern at the context-switch site). |
 
-After 1.28.3 the Active table is empty modulo SMP-on-hardware (which stays open until hardware-in-the-loop infra exists). 1.28.4 is a P(-1) hardening / closeout patch before tagging 1.29.0.
+After 1.28.3 the Active table is empty modulo **SMP-on-hardware** (hardware-gated) and the proc_table derive-port residue (cyrius-gated). 1.28.4 is a P(-1) hardening / closeout patch before tagging 1.29.0.
 
 ### Carried over (not 1.28.x)
 
@@ -69,7 +69,7 @@ Arch interface — each arch provides:
 
 ## Security Hardening (from 2026-04-13 audit)
 
-12 of 13 items shipped through v1.27.x. Only S7 (KASLR) remains open, targeted for v1.28.0. Full audit at [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md); per-item implementation history at [`security-hardening.md`](security-hardening.md).
+All 13 items shipped through v1.28.0 (S7 KASLR data-only landed). Track complete. Full audit at [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md); per-item implementation history at [`security-hardening.md`](security-hardening.md). Full-binary KASLR (Option A) remains deferred to v1.29.x+ pending cyrius PIE support; see [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md).
 
 | # | Item | Status | Severity |
 |---|------|--------|----------|
@@ -79,7 +79,7 @@ Arch interface — each arch provides:
 | S4 | Per-process exit codes | ✅ | MEDIUM |
 | S5 | Per-connection TCP RX buffers | ✅ | MEDIUM |
 | S6 | Stack guard pages | ✅ | MEDIUM |
-| **S7** | **KASLR** — currently fixed at `0x100000`, trivial ROP. Targeted for **v1.28.0** as data-KASLR. See [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md). | 🟠 **Open** | MEDIUM |
+| S7 | **KASLR** (data-only scope) — randomized `pmm_next_free` per boot; defeats trivial heap-layout ROP. Full binary relocation deferred (cyrius PIE; v1.29.x+). | ✅ (v1.28.0) | MEDIUM |
 | S8 | KPTI (Kernel Page Table Isolation) | ✅ (partial — PD entry 0 kept in user tables for ISR; full isolation needs 4 KB pages) | MEDIUM |
 | S9 | Spectre v2 mitigations | ✅ (IBRS set/clear on SYSCALL entry/exit) | MEDIUM |
 | S10 | IOMMU (VT-d) | ✅ (ACPI DMAR parsing + VT-d root/context/IO page tables) | MEDIUM |

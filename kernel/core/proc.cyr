@@ -15,10 +15,12 @@
 # `lex_pp.cyr`); with 22 fields the metadata-table overflow silently
 # corrupts the offsets array, generating accessors at wrong byte
 # offsets. Filed as a cyrius bug (see
-# `cyrius/docs/development/issues/2026-05-11-derive-accessors-16-field-cap.md`).
-# When the cap is raised, this struct can grow `#derive(accessors)`
-# and consumers (proc.cyr's wrappers, sched.cyr's save/restore,
-# main.cyr's exec_pid load) can port to named accessors.
+# `cyrius/docs/development/issues/2026-05-11-derive-accessors-16-field-cap.md`)
+# and **acknowledged upstream — slotted for v5.11.x repair**. When
+# agnos picks up the cyrius cap-raise (passively via the pin bump),
+# this struct can grow `#derive(accessors)` and consumers (proc.cyr's
+# wrappers, sched.cyr's save/restore, main.cyr's exec_pid load) port
+# to named accessors as a small follow-up patch.
 #
 # Until then: consumers use raw `load64`/`store64` at the offsets
 # listed below (8 bytes per field per cyrius i64 convention).
