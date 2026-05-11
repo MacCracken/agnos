@@ -40,6 +40,19 @@ COMMIT=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 VERSION=$(cat "$ROOT/VERSION" 2>/dev/null || echo "dev")
 
+# v1.28.1: capture provenance so cross-run comparisons are honest.
+# A serial_putc number under QEMU 7.x + KVM is not comparable to one
+# under QEMU 11.x + TCG. Recording the conditions makes "did codegen
+# regress?" a decidable question instead of a vibes-based one.
+QEMU_VERSION=$(qemu-system-x86_64 --version 2>/dev/null | head -1 | awk '{print $4}' || echo "unknown")
+CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //; s/,/;/g' || echo "unknown")
+HOST_ARCH=$(uname -m 2>/dev/null || echo "unknown")
+KVM_ENABLED=0
+if [ -r /dev/kvm ] && echo "$QEMU_FLAGS" | grep -q '\-enable-kvm'; then
+    KVM_ENABLED=1
+fi
+CYRIUS_VERSION=$(grep -oE '^cyrius = "[^"]+"' "$ROOT/cyrius.cyml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' || echo "unknown")
+
 echo ""
 echo "=== AGNOS Benchmarks v$VERSION ($COMMIT) ==="
 echo "$OUTPUT" | grep -E "cycles/op|Kcycles|\[tier"
@@ -102,15 +115,23 @@ echo "" >> "$ROOT/BENCHMARKS.md"
 echo "Written to BENCHMARKS.md"
 
 # Append to history CSV
+# Schema (v1.28.1+): 7 base columns + 5 provenance columns appended at
+# end. Old rows (pre-1.28.1) have empty trailing cells — CSV-compatible.
+# Order: date,commit,version,tier,benchmark,value,unit,
+#        qemu_version,cpu_model,host_arch,kvm_enabled,cyrius_version
+# Pre-1.28.1 header had only 5 columns ("date,commit,benchmark,value,unit");
+# the body rows were already writing 7 columns (with two empty fields
+# for version+tier). v1.28.1 rewrites the header to match the body and
+# adds the 5 provenance columns.
 if [ ! -f "$ROOT/bench-history.csv" ]; then
-    echo "date,commit,version,tier,benchmark,value,unit" > "$ROOT/bench-history.csv"
+    echo "date,commit,version,tier,benchmark,value,unit,qemu_version,cpu_model,host_arch,kvm_enabled,cyrius_version" > "$ROOT/bench-history.csv"
 fi
 
 echo "$OUTPUT" | grep "cycles/op\|Kcycles" | while IFS= read -r line; do
     name=$(echo "$line" | sed 's/:.*//' | tr -d ' ')
     val=$(echo "$line" | sed 's/.*: //; s/ .*//')
     unit=$(echo "$line" | sed 's/.* //')
-    echo "$DATE,$COMMIT,$VERSION,,$name,$val,$unit" >> "$ROOT/bench-history.csv"
+    echo "$DATE,$COMMIT,$VERSION,,$name,$val,$unit,$QEMU_VERSION,$CPU_MODEL,$HOST_ARCH,$KVM_ENABLED,$CYRIUS_VERSION" >> "$ROOT/bench-history.csv"
 done
 
 rm -f $ROOT/build/agnos_bench

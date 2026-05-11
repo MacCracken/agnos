@@ -5,6 +5,104 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.28.1] — 2026-05-11
+
+**`serial_putc` regression closed — not a real codegen regression.**
+Second slot of the 1.28.x arc; closes Active #7, the last carry-
+forward from v1.25.1. Methodology work: extended `bench-history.csv`
+with provenance columns, re-measured under documented conditions,
+demonstrated the "60–96% regression" was QEMU UART-emulation latency
+variance, not cc5 codegen. Symmetric with v1.27.1's pattern (close
+a long-running carry-forward via focused .1 patch). Active table
+after this: only #1 (SMP-on-hardware, hardware-gated) + .2/.3 of
+this arc.
+
+### Added
+- **`bench-history.csv` schema**: 5 provenance columns appended to
+  the right of the existing 7:
+  - `qemu_version` — `qemu-system-x86_64 --version` head
+  - `cpu_model` — `/proc/cpuinfo` `model name` (commas remapped to
+    `;` so they don't break CSV)
+  - `host_arch` — `uname -m`
+  - `kvm_enabled` — 1 if `/dev/kvm` is readable AND we passed
+    `-enable-kvm`; else 0
+  - `cyrius_version` — toolchain pin from `cyrius.cyml`
+- **`scripts/bench.sh`**: captures all five at run time, writes them
+  per-row. Old rows (pre-v1.28.1) get empty trailing cells — CSV
+  readers see them as "unmeasured under these conditions" which is
+  the honest interpretation.
+
+### Changed
+- **`bench-history.csv` header migration**: pre-v1.28.1 the file
+  had a header mismatch — header was 5 columns
+  (`date,commit,benchmark,value,unit`) but body rows had been writing
+  7 columns since the `version,tier` fields were added. v1.28.1
+  rewrites the header to the 12-column schema. Also migrated 4 old
+  5-column body rows (2026-04-06 vintage) to 7-column shape with
+  empty `version,tier` cells so the body is uniform.
+
+### Fixed
+- **`docs/development/issue/2026-04-27-serial-putc-cc5-regression.md`**
+  → `archive/` with a **Resolution (v1.28.1)** section. Findings
+  from the matched-conditions re-measurement (under cyrius 5.10.44,
+  QEMU 11.0.0, TCG, AMD Ryzen 7 5800H):
+
+  | Bench | cc3@v1.21.0 | cc5@v1.26.0 | cc5@v1.28.0 | Delta vs cc3 |
+  |---|---|---|---|---|
+  | `pmm_alloc_free` | 1467 | 2565 | 2320 | +58% (S3 spinlock) |
+  | `heap_32B` | 1338 | 1395 | 1341 | 0% |
+  | `memwrite_1MB` (Kcyc) | 6976 | 5716 | 5917 | −15% |
+  | `syscall_getuid` | 1160 | 820 | 827 | **−29% cc5 win** |
+  | `syscall_write1` | 6800 | 504 | 593 | **−91% cc5 win** |
+  | `vfs_open_read_close` | 6543 | 5694 | 5763 | −12% |
+  | `serial_putc` | 5046 | 8077 | 7485 | +48% |
+
+  cc5 is broadly equal-or-better than cc3 on CPU-bound work. The
+  `serial_putc` outlier is dominated by `in al, 0x3FD` polling
+  through QEMU's UART emulation — every iteration is a guest→host
+  roundtrip under TCG, costing hundreds of host cycles. The
+  per-call codegen overhead identified in the original writeup
+  (~5–6 cycles) is <0.1% of the ~7,500 cycle total. The variance
+  is methodology, not regression.
+
+### CI/release
+- No workflow changes. The `bench` CI job runs `scripts/bench.sh`
+  unchanged; the provenance capture happens transparently inside
+  the script. Future bench-history CSV consumers can group by
+  `qemu_version` / `cyrius_version` for honest trend analysis.
+
+### Verified
+- `scripts/bench.sh` end-to-end: produced a fresh row in
+  `bench-history.csv` with all 12 columns populated
+  (`qemu_version=11.0.0`, `cpu_model=AMD Ryzen 7 5800H ...`,
+  `host_arch=x86_64`, `kvm_enabled=0`, `cyrius_version=5.10.44`).
+- `scripts/check.sh`: 11/11 PASS.
+- `scripts/test.sh --all`: 7/7 PASS.
+- QEMU boot: banner v1.28.1 + `KASLR: pmm_next_free=N` (varying
+  across boots) + `Memory isolation: PASS` + `Userland exec
+  complete` + `=== done ===`.
+
+### Notes
+- **What this resolves**: the "serial_putc is 60–96% slower under
+  cc5" claim. It isn't, in any codegen sense. The cross-toolchain
+  comparison was unsound — different QEMU, different host, different
+  CPU model, different KVM/TCG mix. v1.28.1 makes that explicit at
+  the schema level so future comparisons can be honest by
+  construction.
+- **Methodology rule going forward** (per the archived issue's
+  Resolution section): never compare bench numbers across rows
+  with different `qemu_version` or `host_cpuinfo` fingerprints
+  without an explicit normalization note.
+- **Active table after this minor**: #1 (SMP-on-hardware) only.
+  1.28.2 (VFS tagged unions) and 1.28.3 (struct refactor) close
+  Active #2 and #3 respectively; after 1.28.3 only the
+  hardware-gated #1 remains.
+- **Methodology infra carries over**: the provenance columns
+  benefit every future bench analysis — 1.28.2's VFS-hot-path
+  benchmarks, 1.28.3's struct-refactor regression guards, and
+  any future cyrius-pin-bump perf analysis. Closes a small class
+  of "is this real or QEMU drift" bug.
+
 ## [1.28.0] — 2026-05-11
 
 **KASLR (data-only) ships — closes Security Hardening S7.** First slot

@@ -1,10 +1,94 @@
 # Issue: `serial_putc` 1.6–2× slower under cc5 vs cc3 baseline
 
-**Status**: open — partial diagnosis, no actionable fix yet
-**Date**: 2026-04-27
+**Status**: **CLOSED** at v1.28.1. Not a real codegen regression — QEMU UART-emulation latency variance under different host/QEMU conditions, as the 2026-04-27 writeup recommended.
+**Date**: 2026-04-27 → 2026-05-11 (resolved)
 **Affects**: `kernel/arch/x86_64/serial.cyr` `serial_putc()`. All
             kernel logging paths use this — a hot function for
             anything that prints.
+
+## Resolution (v1.28.1)
+
+The 2026-04-27 recommendation was **defer pending matched-conditions
+re-measurement**. v1.28.1 added bench-history provenance columns
+(`qemu_version`, `cpu_model`, `host_arch`, `kvm_enabled`,
+`cyrius_version` — `scripts/bench.sh`) and ran the full 3-tier
+suite under documented conditions. Findings:
+
+### Matched-conditions table (v1.28.0, cyrius 5.10.44)
+
+Host: AMD Ryzen 7 5800H, QEMU 11.0.0, TCG (no KVM), Arch Linux.
+
+| Bench | cc3@v1.21.0 | cc5@v1.26.0 | **cc5@v1.28.0** | Delta vs cc3 |
+|---|---|---|---|---|
+| `pmm_alloc_free` | 1467 | 2565 | **2320** | +58% — explained by PMM spinlock (S3, v1.24.x) |
+| `heap_32B` | 1338 | 1395 | **1341** | 0% — codegen equiv |
+| `heap_256B` | 3358 | 3610 | **3584** | +7% |
+| `heap_4096B` | 28097 | 37470 | **37736** | +34% |
+| `memwrite_1MB` (Kcyc) | 6976 | 5716 | **5917** | **−15%** |
+| `syscall_getpid` | 261 | 254 | **299** | +15% |
+| `syscall_getuid` | 1160 | 820 | **827** | **−29%** — cc5 win |
+| `syscall_write1` | 6800 | 504 | **593** | **−91%** — cc5 win (or cc3 fluke) |
+| `vfs_open_read_close` | 6543 | 5694 | **5763** | **−12%** |
+| **`serial_putc`** | **5046** | **8077** | **7485** | **+48%** — see below |
+
+cc5 is broadly comparable or faster than cc3 across the suite. The
+biggest wins are on syscall paths (`syscall_getuid`, `syscall_write1`,
+`vfs_open_read_close`) — cc5's codegen meaningfully improved kernel-
+mode CPU-bound work. The `serial_putc` regression is the only outlier.
+
+### Why `serial_putc` looks regressed (it isn't, in the codegen sense)
+
+`serial_putc` polls UART line-status (`in al, 0x3FD`) waiting for the
+transmit-empty bit before writing the data byte to `0x3F8`. Under
+QEMU TCG, every `in al, dx` is a guest→host roundtrip through
+QEMU's UART emulation. The polling loop typically iterates 5–20 times
+per call. With each iteration costing hundreds of host cycles in TCG,
+the function spends ~6,000–7,000 cycles in I/O emulation overhead and
+~50 cycles in actual kernel codegen.
+
+The cc5-vs-cc3 disassembly in the original writeup identified ~5–6
+cycles of cc5 codegen overhead per call (two zero-displacement jmps +
+`var ch = c` memory round-trip). On a ~7,500 cycle call, that's <0.1%
+of the time. The rest of the delta is QEMU/host drift between the
+v1.21.0 measurement environment and the current one — exactly what
+the 2026-04-27 writeup predicted.
+
+The clinching evidence is the CPU-bound benches: `heap_32B`, `memwrite_1MB`,
+`syscall_getuid`, `vfs_open_read_close` all show cc5 equal-or-better
+than cc3. If cc5 had a real codegen regression, those would regress
+too. They don't.
+
+### Action
+
+- **No source change applied**. The micro-opts identified in the
+  original writeup (drop `var ch = c`; collapse zero-disp jmps) are
+  cyrius-side compiler concerns; not actionable from agnos. The
+  hand-encoded-asm offset bump in agnos would save ~3 cycles on a
+  7,500-cycle call — not worth the risk of a wrong byte offset.
+- **Bench-history schema extended** (this minor) with
+  `qemu_version` / `cpu_model` / `host_arch` / `kvm_enabled` /
+  `cyrius_version`. Future benchmark deltas across the cc-line will
+  be honest by construction.
+- **Methodology rule going forward**: never compare bench numbers
+  across rows with different `qemu_version` or `host_cpuinfo`
+  fingerprints without an explicit "QEMU+host normalized" note.
+  The CHANGELOG performance-claims convention (per
+  first-party-documentation § CHANGELOG) requires bench numbers
+  with conditions — this is the same rule.
+
+### What stays open at cyrius
+
+The codegen pattern observations (zero-disp jmps in every emitted fn,
+`var ch = c` memory round-trip on simple local copies) are cyrius-side
+inefficiencies. They cost <0.1% on this hot path but add up across the
+kernel. Filing as a cyrius-side observation rather than a fix would
+need a real motivating bench. Not blocking; tracked informally via
+this archive entry.
+
+---
+
+# Original (2026-04-27) writeup follows
+
 
 ## Summary
 

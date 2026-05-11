@@ -1,8 +1,8 @@
-date,commit,benchmark,value,unit
-2026-04-06,31a7ed7,PMM_alloc+free_x1000,2061,cycles/op
-2026-04-06,31a7ed7,Syscall_getpid_x10000,308,cycles/op
-2026-04-06,31a7ed7,Heap_alloc+free_x1000,1518,cycles/op
-2026-04-06,31a7ed7,Serial_putc_x1000,5777,cycles/op
+date,commit,version,tier,benchmark,value,unit,qemu_version,cpu_model,host_arch,kvm_enabled,cyrius_version
+2026-04-06,31a7ed7,,,PMM_alloc+free_x1000,2061,cycles/op
+2026-04-06,31a7ed7,,,Syscall_getpid_x10000,308,cycles/op
+2026-04-06,31a7ed7,,,Heap_alloc+free_x1000,1518,cycles/op
+2026-04-06,31a7ed7,,,Serial_putc_x1000,5777,cycles/op
 2026-04-07T03:05:47Z,6c69dd1,1.1.0,,pmm_alloc_free,1364,cycles/op
 2026-04-07T03:05:47Z,6c69dd1,1.1.0,,heap_32B,1211,cycles/op
 2026-04-07T03:05:47Z,6c69dd1,1.1.0,,heap_256B,3028,cycles/op
@@ -133,3 +133,13 @@ date,commit,benchmark,value,unit
 2026-04-13T09:57:58Z,0b5be74,1.21.0,,syscall_write1,6800,cycles/op
 2026-04-13T09:57:58Z,0b5be74,1.21.0,,vfs_open_read_close,6543,cycles/op
 2026-04-13T09:57:58Z,0b5be74,1.21.0,,serial_putc,5046,cycles/op
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,pmm_alloc_free,2320,cycles/op,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,heap_32B,1341,cycles/op,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,heap_256B,3584,cycles/op,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,heap_4096B,37736,cycles/op,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,memwrite_1MB,5917,Kcycles,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,syscall_getpid,299,cycles/op,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,syscall_getuid,827,cycles/op,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,syscall_write1,593,cycles/op,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,vfs_open_read_close,5763,cycles/op,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
+2026-05-11T22:16:31Z,5cdc10a,1.28.0,,serial_putc,7485,cycles/op,11.0.0,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,0,5.10.44
