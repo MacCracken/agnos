@@ -22,12 +22,30 @@ jobs:
       - name: Install Cyrius toolchain
         # Use cyrius's canonical installer (published as a release asset
         # alongside each tarball). Reads CYRIUS_VERSION from cyrius.cyml.
+        #
+        # Smoke-test at the tail: if the install silently produces no
+        # `cyrius` binary (network blip, release not yet propagated,
+        # 404, half-written tarball), fail THIS step with a clear
+        # error. Without this guard, downstream steps run with
+        # `cyrius` missing from PATH — most visibly the Format check,
+        # whose `if ! cyrius fmt "$f" --check` reports every kernel
+        # file as `NEEDS FORMAT` because each `cyrius` call is in
+        # fact `command not found`. (One real occurrence 2026-05-12
+        # right after the 5.11.29 cut; all 48 files flagged.)
         run: |
+          set -e
           export CYRIUS_VERSION="$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)"
           curl -fsSL --retry 5 --retry-all-errors \
             "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh" | sh
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          "$HOME/.cyrius/bin/cyrius" --version || {
+            echo "FAIL: cyrius toolchain install did not produce a working binary"
+            echo "  expected version: $CYRIUS_VERSION"
+            echo "  installed contents:"
+            ls -la "$HOME/.cyrius/bin/" 2>/dev/null || echo "  (no $HOME/.cyrius/bin/ — install never ran)"
+            exit 1
+          }
 
       - name: Build x86_64 kernel
         run: |
@@ -51,12 +69,30 @@ jobs:
       - name: Install Cyrius toolchain
         # Use cyrius's canonical installer (published as a release asset
         # alongside each tarball). Reads CYRIUS_VERSION from cyrius.cyml.
+        #
+        # Smoke-test at the tail: if the install silently produces no
+        # `cyrius` binary (network blip, release not yet propagated,
+        # 404, half-written tarball), fail THIS step with a clear
+        # error. Without this guard, downstream steps run with
+        # `cyrius` missing from PATH — most visibly the Format check,
+        # whose `if ! cyrius fmt "$f" --check` reports every kernel
+        # file as `NEEDS FORMAT` because each `cyrius` call is in
+        # fact `command not found`. (One real occurrence 2026-05-12
+        # right after the 5.11.29 cut; all 48 files flagged.)
         run: |
+          set -e
           export CYRIUS_VERSION="$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)"
           curl -fsSL --retry 5 --retry-all-errors \
             "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh" | sh
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          "$HOME/.cyrius/bin/cyrius" --version || {
+            echo "FAIL: cyrius toolchain install did not produce a working binary"
+            echo "  expected version: $CYRIUS_VERSION"
+            echo "  installed contents:"
+            ls -la "$HOME/.cyrius/bin/" 2>/dev/null || echo "  (no $HOME/.cyrius/bin/ — install never ran)"
+            exit 1
+          }
 
       - name: Format check
         # Files with `#ifdef` inside function bodies can't satisfy both
@@ -118,12 +154,30 @@ jobs:
       - name: Install Cyrius toolchain
         # Use cyrius's canonical installer (published as a release asset
         # alongside each tarball). Reads CYRIUS_VERSION from cyrius.cyml.
+        #
+        # Smoke-test at the tail: if the install silently produces no
+        # `cyrius` binary (network blip, release not yet propagated,
+        # 404, half-written tarball), fail THIS step with a clear
+        # error. Without this guard, downstream steps run with
+        # `cyrius` missing from PATH — most visibly the Format check,
+        # whose `if ! cyrius fmt "$f" --check` reports every kernel
+        # file as `NEEDS FORMAT` because each `cyrius` call is in
+        # fact `command not found`. (One real occurrence 2026-05-12
+        # right after the 5.11.29 cut; all 48 files flagged.)
         run: |
+          set -e
           export CYRIUS_VERSION="$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)"
           curl -fsSL --retry 5 --retry-all-errors \
             "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh" | sh
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          "$HOME/.cyrius/bin/cyrius" --version || {
+            echo "FAIL: cyrius toolchain install did not produce a working binary"
+            echo "  expected version: $CYRIUS_VERSION"
+            echo "  installed contents:"
+            ls -la "$HOME/.cyrius/bin/" 2>/dev/null || echo "  (no $HOME/.cyrius/bin/ — install never ran)"
+            exit 1
+          }
 
       - name: Run test suite
         run: sh scripts/test.sh
@@ -147,12 +201,30 @@ jobs:
       - name: Install Cyrius toolchain
         # Use cyrius's canonical installer (published as a release asset
         # alongside each tarball). Reads CYRIUS_VERSION from cyrius.cyml.
+        #
+        # Smoke-test at the tail: if the install silently produces no
+        # `cyrius` binary (network blip, release not yet propagated,
+        # 404, half-written tarball), fail THIS step with a clear
+        # error. Without this guard, downstream steps run with
+        # `cyrius` missing from PATH — most visibly the Format check,
+        # whose `if ! cyrius fmt "$f" --check` reports every kernel
+        # file as `NEEDS FORMAT` because each `cyrius` call is in
+        # fact `command not found`. (One real occurrence 2026-05-12
+        # right after the 5.11.29 cut; all 48 files flagged.)
         run: |
+          set -e
           export CYRIUS_VERSION="$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)"
           curl -fsSL --retry 5 --retry-all-errors \
             "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh" | sh
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          "$HOME/.cyrius/bin/cyrius" --version || {
+            echo "FAIL: cyrius toolchain install did not produce a working binary"
+            echo "  expected version: $CYRIUS_VERSION"
+            echo "  installed contents:"
+            ls -la "$HOME/.cyrius/bin/" 2>/dev/null || echo "  (no $HOME/.cyrius/bin/ — install never ran)"
+            exit 1
+          }
 
       - name: Build kernel
         run: sh scripts/build.sh
@@ -257,12 +329,30 @@ jobs:
       - name: Install Cyrius toolchain
         # Use cyrius's canonical installer (published as a release asset
         # alongside each tarball). Reads CYRIUS_VERSION from cyrius.cyml.
+        #
+        # Smoke-test at the tail: if the install silently produces no
+        # `cyrius` binary (network blip, release not yet propagated,
+        # 404, half-written tarball), fail THIS step with a clear
+        # error. Without this guard, downstream steps run with
+        # `cyrius` missing from PATH — most visibly the Format check,
+        # whose `if ! cyrius fmt "$f" --check` reports every kernel
+        # file as `NEEDS FORMAT` because each `cyrius` call is in
+        # fact `command not found`. (One real occurrence 2026-05-12
+        # right after the 5.11.29 cut; all 48 files flagged.)
         run: |
+          set -e
           export CYRIUS_VERSION="$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)"
           curl -fsSL --retry 5 --retry-all-errors \
             "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh" | sh
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          "$HOME/.cyrius/bin/cyrius" --version || {
+            echo "FAIL: cyrius toolchain install did not produce a working binary"
+            echo "  expected version: $CYRIUS_VERSION"
+            echo "  installed contents:"
+            ls -la "$HOME/.cyrius/bin/" 2>/dev/null || echo "  (no $HOME/.cyrius/bin/ — install never ran)"
+            exit 1
+          }
 
       - name: Run benchmarks
         run: sh scripts/bench.sh

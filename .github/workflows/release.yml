@@ -36,12 +36,23 @@ jobs:
           echo "Version verified: $TAG (cyrius.cyml pulls from VERSION via \${file:VERSION})"
 
       - name: Install Cyrius toolchain
+        # See ci.yml for the rationale on the post-install smoke test —
+        # without it, a silent install failure cascades into misleading
+        # errors in downstream steps.
         run: |
+          set -e
           export CYRIUS_VERSION="$(grep -oP '(?<=^cyrius = ")[^"]+' cyrius.cyml)"
           curl -fsSL --retry 5 --retry-all-errors \
             "https://github.com/MacCracken/cyrius/releases/download/$CYRIUS_VERSION/install.sh" | sh
           echo "$HOME/.cyrius/bin" >> $GITHUB_PATH
           echo "CYRIUS_HOME=$HOME/.cyrius" >> $GITHUB_ENV
+          "$HOME/.cyrius/bin/cyrius" --version || {
+            echo "FAIL: cyrius toolchain install did not produce a working binary"
+            echo "  expected version: $CYRIUS_VERSION"
+            echo "  installed contents:"
+            ls -la "$HOME/.cyrius/bin/" 2>/dev/null || echo "  (no $HOME/.cyrius/bin/ — install never ran)"
+            exit 1
+          }
 
       - name: Build x86_64 kernel
         run: |
