@@ -7,48 +7,62 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.29.1] — 2026-05-13
 
-**Iron-boot fix — UEFI silent-reset post-handoff.** First patch in the
-1.29.x line, driven directly by the iron-boot campaign on Skytech
-Legacy 4 (see `agnosticos/docs/development/iron-boot-testing-log.md`
-Attempt 3 → 4). No new features; one boot-shim correctness fix.
+**Boot-shim portability fix surfaced during iron-boot triage.** First
+patch in the 1.29.x line. One correctness fix in the boot shim's CR4
+sequence; no new features.
+
+**Important framing:** the iron-boot campaign's primary target is the
+**NUC AMD** (Zen-class — SMEP + SMAP both advertised). On Zen silicon
+this patch is *behaviorally identical* to v1.29.0 (both set CR4 bits
+5 + 20 + 21). The patch is therefore **not** a confirmed causal fix
+for Attempt 3's silent reset on the NUC AMD; that diagnosis is still
+open (see `agnosticos/docs/development/iron-boot-testing-log.md`
+Attempt 4 — serial-cable capture is the recommended next step). The
+patch *does* fix a real portability bug that future Intel hosts
+(queued post-AMD-proof) and older AMD silicon would have hit.
 
 ### Fixed
 
 - **`kernel/arch/x86_64/boot_shim.cyr` (CR4 init, step 5)** — CPUID-gate
-  SMEP (CR4 bit 20) and SMAP (CR4 bit 21). Prior revisions ORed both
+  SMEP (CR4 bit 20) and SMAP (CR4 bit 21). v1.29.0 ORed both
   unconditionally alongside PAE, which triggers `#GP` on any CPU that
   doesn't advertise the feature in CPUID leaf 7 (sub-leaf 0) EBX bits 7
-  (SMEP, Ivy Bridge+) and 20 (SMAP, Broadwell+). The shim has no
-  exception handlers installed at this point, so `#GP` cascades through
-  `#DF` to triple-fault and the platform resets — which on UEFI iron
-  without a serial cable looks like "GRUB shows `WARNING: non console
-  will be available to OS`, then the machine restarts," indistinguishable
-  from any other early-shim failure. PAE (bit 5) remains unconditional
-  — multiboot1 long-mode handoff requires it.
+  (SMEP, Ivy Bridge+ / Zen 1+) and 20 (SMAP, Broadwell+ / Zen 1+). The
+  shim has no exception handlers installed at this point, so `#GP`
+  cascades through `#DF` to triple-fault and the platform resets —
+  which on iron without a serial cable looks identical to any other
+  early-shim failure. PAE (bit 5) remains unconditional — multiboot1
+  long-mode handoff requires it.
 
   Implementation: build the new CR4 value in EBX (so EAX is free to
   hold CPUID features), `push ebx` across `cpuid` to preserve the
   in-flight CR4, then `test`/`jz` each feature bit before ORing the
-  corresponding CR4 bit. Total shim size growth: 41 bytes.
+  corresponding CR4 bit. Total shim size growth: 41 bytes (kernel
+  binary grew 250936 → 250968 bytes after ELF padding).
 
   Behavior on platforms that *do* advertise both bits (QEMU `-cpu max`,
-  every Broadwell-or-newer Intel, every Zen-or-newer AMD): identical
-  to v1.29.0 — PAE + SMEP + SMAP all enabled.
+  every Broadwell-or-newer Intel, every Zen-or-newer AMD including the
+  current iron target): identical to v1.29.0 — PAE + SMEP + SMAP all
+  enabled.
 
   Behavior on platforms that *don't*: keeps PAE, skips the unsupported
   bit(s), continues into long-mode handoff instead of triple-faulting.
-  QEMU `qemu64` (no SMEP, no SMAP) now boots through the shim rather
-  than resetting at the OR — useful for future smoke runs.
+  QEMU `qemu64` (no SMEP, no SMAP) now boots through the shim and
+  reaches the `AGNOS kernel v1.29.1` banner rather than resetting at
+  the OR — direct regression-test proof that the new path handles
+  missing-feature silicon correctly.
 
 ### Notes
 
-- Verification on iron pending Attempt 4 reboot of `/dev/sdb` after
-  `install-usb.sh --update` push of the patched kernel. If Attempt 4
-  also resets, the SMEP/SMAP path is not the culprit and we move to
-  the secondary hypotheses logged in
-  `agnosticos/docs/development/iron-boot-testing-log.md` (low-memory
-  page-table / GDT collision with UEFI runtime regions, or multiboot1
-  + UEFI fundamental handoff gap requiring a multiboot2 retrofit).
+- Iron-side Attempt 3 reset on the NUC AMD is **not** explained by
+  this patch (Zen advertises both feature bits). Open hypotheses
+  (per the iron-boot-testing-log): low-memory page-table / GDT /
+  stack collision with UEFI runtime-reserved regions; multiboot1 +
+  UEFI fundamental handoff gap requiring a multiboot2 retrofit; or
+  shim-level fault in a different early step. Serial-cable capture
+  via the `verbose serial (ttyS0,115200)` GRUB entry is the
+  recommended next diagnostic step before further blind code
+  changes.
 
 ## [1.29.0] — 2026-05-11
 
