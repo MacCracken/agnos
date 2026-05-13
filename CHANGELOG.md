@@ -5,6 +5,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.29.1] — 2026-05-13
+
+**Iron-boot fix — UEFI silent-reset post-handoff.** First patch in the
+1.29.x line, driven directly by the iron-boot campaign on Skytech
+Legacy 4 (see `agnosticos/docs/development/iron-boot-testing-log.md`
+Attempt 3 → 4). No new features; one boot-shim correctness fix.
+
+### Fixed
+
+- **`kernel/arch/x86_64/boot_shim.cyr` (CR4 init, step 5)** — CPUID-gate
+  SMEP (CR4 bit 20) and SMAP (CR4 bit 21). Prior revisions ORed both
+  unconditionally alongside PAE, which triggers `#GP` on any CPU that
+  doesn't advertise the feature in CPUID leaf 7 (sub-leaf 0) EBX bits 7
+  (SMEP, Ivy Bridge+) and 20 (SMAP, Broadwell+). The shim has no
+  exception handlers installed at this point, so `#GP` cascades through
+  `#DF` to triple-fault and the platform resets — which on UEFI iron
+  without a serial cable looks like "GRUB shows `WARNING: non console
+  will be available to OS`, then the machine restarts," indistinguishable
+  from any other early-shim failure. PAE (bit 5) remains unconditional
+  — multiboot1 long-mode handoff requires it.
+
+  Implementation: build the new CR4 value in EBX (so EAX is free to
+  hold CPUID features), `push ebx` across `cpuid` to preserve the
+  in-flight CR4, then `test`/`jz` each feature bit before ORing the
+  corresponding CR4 bit. Total shim size growth: 41 bytes.
+
+  Behavior on platforms that *do* advertise both bits (QEMU `-cpu max`,
+  every Broadwell-or-newer Intel, every Zen-or-newer AMD): identical
+  to v1.29.0 — PAE + SMEP + SMAP all enabled.
+
+  Behavior on platforms that *don't*: keeps PAE, skips the unsupported
+  bit(s), continues into long-mode handoff instead of triple-faulting.
+  QEMU `qemu64` (no SMEP, no SMAP) now boots through the shim rather
+  than resetting at the OR — useful for future smoke runs.
+
+### Notes
+
+- Verification on iron pending Attempt 4 reboot of `/dev/sdb` after
+  `install-usb.sh --update` push of the patched kernel. If Attempt 4
+  also resets, the SMEP/SMAP path is not the culprit and we move to
+  the secondary hypotheses logged in
+  `agnosticos/docs/development/iron-boot-testing-log.md` (low-memory
+  page-table / GDT collision with UEFI runtime regions, or multiboot1
+  + UEFI fundamental handoff gap requiring a multiboot2 retrofit).
+
 ## [1.29.0] — 2026-05-11
 
 **1.28.x arc gate / 1.29.x arc opens.** No kernel-source behavior
