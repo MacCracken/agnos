@@ -1,4 +1,15 @@
-# === 32-bit boot shim ===
+# === Boot shim — entry point for both multiboot1 (ELF32) and
+# === multiboot2 (ELF64) paths ===
+#
+# Path is selected by the build-time macro `ELF64_KERNEL` (set by
+# scripts/build.sh when CYRIUS_ELF64_KERNEL=1). The two paths live
+# side-by-side under #ifndef/#ifdef so the legacy ELF32 multiboot1
+# build stays bit-identical (verified by step 4a sanity check on
+# 2026-05-13: cyrius 5.11.43 build of agnos sha256-matched the
+# 5.11.29 build). See agnosticos/docs/development/path-a-elf64-multiboot2.md.
+
+#ifndef ELF64_KERNEL
+# === 32-bit boot shim (ELF32 multiboot1, legacy path) ===
 #
 # Multiboot1 hands control here in 32-bit protected mode (paging off,
 # A20 enabled, flat 0–4 GB CS/DS, GDT undefined, ESI = mb info, EAX
@@ -122,3 +133,95 @@ asm {
     0x48; 0xBC; 0x00; 0x00; 0x20; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x200000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 }
+#endif
+
+#ifdef ELF64_KERNEL
+# === 64-bit boot shim (ELF64 multiboot2 + EFI64-entry, Path A) ===
+#
+# GRUB-EFI hands control here in 64-bit long mode (paging on, UEFI
+# identity-maps the first 4 GB, GDT inherited from UEFI, CS = 64-bit
+# code segment, interrupts disabled). Per multiboot2 spec § 8.4.3:
+#   RAX = 0x36d76289   (multiboot2 magic — sanity-checkable, but the
+#                       grub-file --is-x86-multiboot2 validation upstream
+#                       already gates this so a runtime check is belt-
+#                       and-braces; deferred to a later iteration)
+#   RBX = physical address of the multiboot2 information structure
+#         (tag stream — see agnosticos/docs/development/path-a-elf64-multiboot2.md
+#         § MBI tag walker for the format)
+#
+# Sequence:
+#   1. Install our 64-bit stack at 0x200000. Done first because the
+#      `mbi_capture_rbx()` call after this asm block uses the stack
+#      (call pushes return addr) and the SysV-callee-save RBX must
+#      still be intact at that call site.
+#   2. Init COM1 UART (verbatim from legacy step 2 — port I/O opcodes
+#      execute identically in 64-bit mode).
+#   3. Build minimal 64-bit GDT at 0x4000 (verbatim from legacy step 9 —
+#      the 32-bit-encoded `mov dword [edi+N], imm32` writes execute
+#      correctly in long mode; the resulting descriptor bytes are
+#      identical, the L=1 bit in the CS descriptor still flags
+#      64-bit code segment).
+#   4. lgdt + far-return to reload CS via our 0x08 selector. Uses the
+#      elegant `push selector; lea rax, [rip+3]; push rax; retfq`
+#      pattern from gdt.cyr:30-33 — bypasses the call/pop/build-far-
+#      jmp-on-stack dance the legacy 32-bit shim needed for mode
+#      transition (we're already in long mode; we just need to switch
+#      to OUR GDT).
+#   5. Reload DS/ES/SS = 0x10 (legacy step 11 verbatim).
+#
+# RBX is preserved through the entire block — audited per-instruction:
+# stack/UART touches RSP/RBP/EDX/EAX, GDT build touches EDI/EAX/ECX,
+# far-ret touches RAX/RSP, segment reload touches RAX. None touch RBX.
+#
+# Skipped vs the 32-bit shim (UEFI/GRUB already did these):
+#   - Page tables (UEFI's identity map of first 4 GB is live)
+#   - CR3 (UEFI's PML4 is loaded)
+#   - CR4.PAE (UEFI set it)
+#   - EFER.LME + NXE (UEFI set them)
+#   - CR0.PG + PE (UEFI set them)
+#   - 32→64 mode transition (we're already in long mode)
+asm {
+    # 1. 64-bit stack at 0x200000; mov rbp, rsp
+    0x48; 0xBC; 0x00; 0x00; 0x20; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x200000
+    0x48; 0x89; 0xE5;                                      # mov rbp, rsp
+
+    # 2. COM1 UART init (port 0x3F8) — verbatim from legacy step 2
+    0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;        # IER  = 0
+    0xBA; 0xFB; 0x03; 0x00; 0x00; 0xB0; 0x80; 0xEE;        # LCR  = DLAB=1
+    0xBA; 0xF8; 0x03; 0x00; 0x00; 0xB0; 0x01; 0xEE;        # DLL  = 1 (115200, low)
+    0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;        # DLM  = 0 (115200, high)
+    0xBA; 0xFB; 0x03; 0x00; 0x00; 0xB0; 0x03; 0xEE;        # LCR  = 8N1, DLAB=0
+    0xBA; 0xFA; 0x03; 0x00; 0x00; 0xB0; 0xC7; 0xEE;        # FCR  = enable+clear FIFOs, 14-byte trigger
+    0xBA; 0xFC; 0x03; 0x00; 0x00; 0xB0; 0x0B; 0xEE;        # MCR  = DTR | RTS | OUT2
+
+    # 3. Build minimal GDT at 0x4000: null + 64-bit CS (0x08) + DS (0x10)
+    0xBF; 0x00; 0x40; 0x00; 0x00;                          # mov edi, 0x4000
+    0x31; 0xC0; 0x89; 0x07; 0x89; 0x47; 0x04;              # null descriptor
+    0xC7; 0x47; 0x08; 0xFF; 0xFF; 0x00; 0x00;              # CS lo: limit=0xFFFF
+    0xC7; 0x47; 0x0C; 0x00; 0x9A; 0xAF; 0x00;              # CS hi: type=code, L=1, P=1, S=1
+    0xC7; 0x47; 0x10; 0xFF; 0xFF; 0x00; 0x00;              # DS lo: limit=0xFFFF
+    0xC7; 0x47; 0x14; 0x00; 0x92; 0xCF; 0x00;              # DS hi: type=data, P=1, S=1
+    0x66; 0xC7; 0x47; 0x20; 0x17; 0x00;                    # GDTR limit = 23 (3 entries × 8 - 1)
+    0xC7; 0x47; 0x22; 0x00; 0x40; 0x00; 0x00;              # GDTR base = 0x4000
+
+    # 4. Load GDTR and far-return to reload CS via our 0x08 selector
+    0x0F; 0x01; 0x57; 0x20;                                # lgdt [rdi+32]
+    0x6A; 0x08;                                            # push 0x08
+    0x48; 0x8D; 0x05; 0x03; 0x00; 0x00; 0x00;              # lea rax, [rip+3]
+    0x50;                                                  # push rax
+    0x48; 0xCB;                                            # retfq → reloads CS, jumps to next insn
+
+    # 5. Reload data segments with 0x10
+    0x48; 0xC7; 0xC0; 0x10; 0x00; 0x00; 0x00;              # mov rax, 0x10
+    0x8E; 0xD8;                                            # mov ds, ax
+    0x8E; 0xC0;                                            # mov es, ax
+    0x8E; 0xD0;                                            # mov ss, ax
+}
+
+# Capture RBX (MBI ptr) into mb_info_ptr. Top-level call — emits a
+# `call <fn>` instruction in source order. SysV ABI: RBX is callee-
+# saved, preserved across the call. Inside the function (mbi.cyr),
+# local `var p = &mb_info_ptr;` loads RAX immediately; then asm
+# `mov [rax], rbx` writes RBX to mb_info_ptr. See mbi.cyr for the why.
+mbi_capture_rbx();
+#endif

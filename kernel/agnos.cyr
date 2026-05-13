@@ -6,6 +6,7 @@ kernel;
 # Architecture-specific code
 #ifdef ARCH_X86_64
 include "arch/x86_64/boot_data.cyr"
+include "arch/x86_64/mbi.cyr"
 include "arch/x86_64/serial.cyr"
 include "arch/x86_64/gdt.cyr"
 include "arch/x86_64/idt.cyr"
