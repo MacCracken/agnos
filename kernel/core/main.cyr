@@ -3,11 +3,21 @@
 serial_println("AGNOS kernel v1.30.0", 20);
 serial_println("64-bit long mode", 16);
 
+# Bisector 0x80: about to call gdt_init. If we see 5 but not 0x80,
+# the fault is in one of the two serial_println calls above.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x80; 0xE6; 0x71; }
+
 gdt_init();
 serial_println("GDT loaded", 10);
 
+# Bisector 0x81: gdt_init returned, about to call tss_init.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x81; 0xE6; 0x71; }
+
 tss_init();
 serial_println("TSS loaded (ring 3 ready)", 25);
+
+# Bisector 0x82: tss_init returned, about to call idt_init.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x82; 0xE6; 0x71; }
 
 idt_init();
 serial_println("IDT loaded", 10);
