@@ -1,10 +1,14 @@
 # === Test Processes ===
 # Simple loop functions for context switch testing.
 # Each prints its ID to serial, then halts until next timer tick.
-# NOTE: `if (0 == 1)` is patched to `while (1 == 1)` by bench.sh at build time.
+# Why busy-loops: the function MUST NOT return — its `ret` would pop an
+# uninitialized stack word and jump to garbage. Iron-boot Attempt 12
+# (2026-05-14) triple-faulted on iter 0 of the scheduler loop with the
+# previous `if (0 == 1) { ... } return 0;` shape. See
+# docs/development/iron-boot-testing-log.md § Attempt 12 for the trace.
 
 fn test_proc_a() {
-    if (0 == 1) {
+    while (1 == 1) {
         serial_print("A", 1);
         arch_wait();
     }
@@ -12,7 +16,7 @@ fn test_proc_a() {
 }
 
 fn test_proc_b() {
-    if (0 == 1) {
+    while (1 == 1) {
         serial_print("B", 1);
         arch_wait();
     }
