@@ -16,10 +16,117 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.29.1** | [`VERSION`](../../VERSION) |
-| **Cyrius toolchain pin** | **5.10.44** | `cyrius.cyml [package].cyrius` |
+| **Kernel** | **1.30.0** | [`VERSION`](../../VERSION) |
+| **Cyrius toolchain pin** | **5.11.53** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-13 | [`CHANGELOG.md`](../../CHANGELOG.md) |
-| **Last assertion tightened** | `KASLR: pmm_next_free=N` varies across two boots | CI `boot-test` job, v1.28.0 |
+| **Last assertion tightened** | `KASLR: pmm_next_free=N` varies across two boots | CI `boot-test` job, v1.28.0 (**currently broken — see "Open investigation" below**) |
+
+## Open investigation — timer-driven context switch under UEFI+gnoboot (2026-05-13)
+
+gnoboot v0.1.0 successfully delivers the sovereign boot-info struct
+to the kernel via Path C (`RDI = &boot_info`, magic `0x41474E4F`).
+**Most of the kernel boot now works under UEFI+gnoboot**; the
+remaining stall is specifically in the timer-driven scheduler loop.
+
+### Resolved 2026-05-13: RDRAND under default qemu64 CPU
+
+Initial diagnosis said the kernel stalled at `Page tables: 1024MB mapped`.
+Root cause was the gnoboot smoke test missing `-cpu max` (the default
+`qemu64` lacks RDRAND, and `pmm_init` → `kaslr_seed` → `rdrand_u64`
+faults silently). agnos's old CI explicitly used `-cpu max` for the
+same reason (CR4 SMEP/SMAP on the legacy `-kernel` path). Real iron
+(NUC AMD / Zen) supports RDRAND natively, so this is a QEMU-only
+config issue.
+
+Fixed in `gnoboot/tests/ovmf_smoke.sh` by adding `-cpu max` to the
+QEMU invocation.
+
+### Open: timer-driven context switch broken — deeper than test_proc alone
+
+Investigation 2026-05-13: hypothesised the root cause was test_proc_a/b
+returning into uninitialized stack memory. Tried the minimal fix —
+adding `while (1 == 1) { arch_wait(); }` after the `if (0 == 1)`
+body so the procs never return. Build clean, but result was **worse**:
+not even the first hlt returned post-`sched_active = 1` (vs. 10 hlts
+returning on the unfixed baseline). Reverted the change.
+
+Conclusion: the kernel-side issue isn't just test_proc returning;
+there are multiple latent interactions between gnoboot's
+pre-handoff state and the kernel's scheduler/page-table/APIC code
+that need focused agnos work, not a probe-and-quick-fix. Likely
+involves at least:
+
+- `pt_init` writing kernel-PML4/PDPT/PD at fixed physical
+  `0x1000/0x2000/0x3000` (works under `-kernel` because the boot
+  shim seeded them; broken under UEFI because UEFI's actual page
+  tables are elsewhere and `0x1000-0x4000` is just random memory).
+- `apic_init` mapping `0xFEE00000` via the same `0x1000`-area page
+  tables that aren't the active CR3.
+- Per-process page tables built off the (broken) kernel PD at
+  `0x3000`, so context switches to per-proc CR3 may corrupt or
+  cycle in unexpected ways.
+
+### Recommendation
+
+Ship agnos CI restructure with **relaxed assertions** (banner +
+KASLR + `Activating scheduler`), file a focused agnos sub-arc for
+the scheduler-under-UEFI work, and let iron Attempt 5 (different
+firmware, different memory layout) speak independently.
+
+### Open (earlier): timer-driven context switch breaks after ~10 iterations
+
+With `-cpu max` in the smoke test, the kernel boots through all 17
+init checkpoints (PMM, KASLR, VMM, Heap, ACPI, PCI, VFS, SYSCALL,
+processes, interrupts enabled) and reaches `Activating scheduler...`.
+DBG-probe bisection (since reverted) showed:
+
+- ✓ Idle loop entered (`DBG: sched_active=1, entering idle`).
+- ✓ First hlt returns (`DBG: first hlt returned`) — timer ISR fires
+  + handler runs + apic_eoi works + iretq returns to idle loop.
+- ✓ 10 hlts done (`DBG: 10 hlts done`) — at least 10 timer-driven
+  context switches complete successfully.
+- ✗ Iteration 50 never reached, even with 60s QEMU timeout. So
+  somewhere after the 10th-or-so iteration, the cycle breaks.
+
+The break is **not** a hard fault (no exception dump from OVMF, no
+silent reset) — it's the timer-context-switch cycle stopping.
+
+Likely root cause: `test_proc_a` and `test_proc_b` in
+`kernel/user/test_procs.cyr` are *2-instruction noops* in the
+default build. The `if (0 == 1) { serial_print("A"); arch_wait(); }`
+body never runs; the fn just `return 0;` immediately. (`bench.sh`
+patches the `if` to `while (1 == 1)` at build time for the bench
+mode — making the procs busy-loops — but standard `scripts/build.sh`
+doesn't.) After test_proc_a's `ret`, RSP pops a return address from
+**uninitialized stack memory** (`stack_a + 0x4000`-relative). Under
+`-kernel`, that memory was somehow consistently zero or otherwise
+benign; under UEFI+gnoboot, after some iterations it lands on an
+address that breaks the timer-context-switch cycle (typically by
+disabling interrupts, masking the APIC LVT, or jumping into
+unmapped space without a #PF cascade).
+
+This is a **latent agnos kernel bug** (test_proc_a/b should never
+have been usable in a context-switch loop given their fast
+`return 0;` shape), exposed by gnoboot's different pre-handoff
+memory contents. Fixes:
+
+1. **Make test_proc_a/b real busy-loops in the default build** —
+   the `if (0 == 1)` → `while (1 == 1)` patch that bench.sh does
+   at build time should be the *default* shape; the fast-exit
+   shape is what bench needs to escape, not what tests need.
+2. OR: **wrap test_proc fns with a busy loop** in `proc_create_full`
+   so any returning process bounces back into a halt loop instead
+   of popping garbage off its own stack.
+3. OR: **switch to dedicated kernel threads** that explicitly
+   `arch_wait()` in a loop, retiring `test_proc_a`/`test_proc_b`.
+
+Slot: agnos 1.30.x, probably as a small follow-up patch. Not iron-
+boot-blocking — iron Attempt 5 doesn't care about the scheduler
+test_procs; if the kernel boots far enough on iron to print its
+banner + reach the scheduler-test point, MVP is cleared.
+
+**Not a gnoboot issue** — handoff is verified correct. Documented
+here as the agnos investigation handoff.
 
 ---
 
