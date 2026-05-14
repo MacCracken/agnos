@@ -5,6 +5,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Boot-time visual canary at kernel entry instruction #1** (Attempt 7
+  bisection; `kernel/arch/x86_64/boot_shim.cyr` ELF64 path). After
+  Attempt 6 on NUC AMD reproduced Attempt 5's blank-screen-and-reset
+  with the gnoboot BSS-zero + EfiLoaderCode fixes shipped (i.e. the
+  two highest-confidence post-EBS hypotheses ruled out), bisection
+  needs visibility into kernel-side execution. No serial cable yet
+  attached; canary paints a 256-pixel white stripe at the top-left
+  of the GOP framebuffer if gnoboot v0.1.0+ captured `fb_phys` into
+  boot_info offset 0x48.
+
+  Signal interpretation:
+    - Stripe appears → kernel executed ≥ 1 instruction; fault is
+      later (page-table W^X, GDT divergence, CR-state).
+    - No stripe → fault is the `jmp rax` itself or the page
+      containing 0x1000A8 isn't executable in the inherited post-EBS
+      page tables.
+
+  26 bytes total prepended to the ELF64 shim asm block:
+  `mov rax, [rdi+0x48]` / `test rax, rax` / `jz +17` / `mov ecx, 256`
+  / paint-loop (`mov dword [rax], 0xFFFFFFFF`, `add rax, 4`, `loop`).
+  Clobbers RAX/RCX; preserves RDI (required by `boot_info_capture_rdi()`
+  below). Failure-safe: if gnoboot left `fb_phys = 0` (no GOP), the
+  JZ skips the paint and the kernel boots without visual signal.
+  `build/agnos` grows 251040 → 251072 bytes (+32, of which 26 are the
+  canary itself + alignment). `tests/ovmf_smoke.sh` (in gnoboot)
+  still PASS — kernel reaches `Activating scheduler...`.
+
+### Changed
+
+- **Boot-info struct version bumped 1 → 2** to consume gnoboot v0.1.0+'s
+  inlined framebuffer fields at offsets 0x48-0x5C (`fb_phys`,
+  `fb_pitch`, `fb_width`, `fb_height`, `fb_pixel_format`). Kernel
+  walkers MUST NOT expect a framebuffer tag (type=1) in the tag
+  stream from v2 onward — those fields were moved out of the tag
+  stream to make them accessible from raw asm at entry instruction #1.
+  Layout spec: agnosticos/docs/development/path-c-sovereign-uefi.md
+  § *Handoff protocol*.
+
 ## [1.30.0] — 2026-05-13
 
 **Kernel ABI break — entry contract switches from multiboot2 to AGNOS
