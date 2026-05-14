@@ -89,6 +89,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Layout spec: agnosticos/docs/development/path-c-sovereign-uefi.md
   § *Handoff protocol*.
 
+### Fixed
+
+- **`tss_init_cpu` loaded null TSS on BSP** (`kernel/arch/x86_64/gdt.cyr`).
+  The `ltr` asm block read `[rbp-0x08]` and called it `selector`, but per
+  Cyrius's frame-layout convention (documented in `ring3.cyr:25-26`:
+  *params at rbp-0x08, -0x10, -0x18; new locals start at rbp-0x20*),
+  `[rbp-0x08]` in `tss_init_cpu(cpu_id)` is the `cpu_id` parameter — `0`
+  for the BSP. So `ltr 0` loaded the null TSS descriptor → **#GP** with
+  IDT not yet installed (`idt_init` is the next call) → triple fault →
+  reset. Matches Attempt 8's CMOS-bisector verdict on iron exactly:
+  kernel reached checkpoint `0x81` (about to call `tss_init`) but not
+  `0x82` (after return). Fix: drop the broken `mov rax, [rbp-0x08]` and
+  rely on `var selector = ...` leaving the value in `rax` (same pattern
+  `gdt_init` uses for `lgdt [rax]` two functions up). Net change:
+  −4 instruction bytes. Credit Attempt-8 CMOS bisector for pinpointing
+  the failure to ~3 lines of asm without a serial cable on the iron
+  target. See `agnosticos/docs/development/iron-boot-testing-log.md`
+  § *Attempt 8*.
+
+- **GDT array undersized — OOB writes stomped `boot_info_ptr`**
+  (`kernel/arch/x86_64/boot_data.cyr`). `var gdt[56]` was sized for
+  the original 1-TSS layout (`null + kCS + kDS + uDS + uCS + TSS lo +
+  TSS hi` = 7 entries × 8 bytes). When `gdt_init` was extended to 4
+  per-CPU TSS slots (with limit=103 → 104 bytes total), the array
+  declaration was not resized. The 4-iteration zero loop in `gdt_init`
+  (`gdt.cyr:20-23`) writes through `&gdt + 96` — 48 bytes past the
+  array end. In BSS this stomped `gdt_ptr` (harmless; immediately
+  rewritten) and then `boot_info_ptr[8]` at offset +72 (the captured
+  `&boot_info` from RDI at kernel entry) → any later code reading
+  `load64(&boot_info_ptr)` for the framebuffer / memory map got NULL.
+  Latent on the BSP-only path (TSS descriptor writes at offsets 40/48
+  stay in-bounds), but corrupted other kernel state. Resize to
+  `var gdt[104]`. Found by code-reading after the `tss_init_cpu` slot
+  fix above.
+
 ## [1.30.0] — 2026-05-13
 
 **Kernel ABI break — entry contract switches from multiboot2 to AGNOS

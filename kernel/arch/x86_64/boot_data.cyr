@@ -1,5 +1,5 @@
 # === Kernel data ===
-var gdt[56];       # 7 entries x 8 bytes (null + kCS + kDS + uDS + uCS + TSS lo + TSS hi)
+var gdt[104];      # 5 segments (null + kCS + kDS + uDS + uCS = 40 bytes) + 4 TSS descriptors (16 bytes each = 64 bytes). Matches gdt_ptr limit=103 in gdt.cyr. Previously sized 56 bytes (1-TSS layout) — caused OOB zero-writes through &gdt+96 during gdt_init's per-CPU TSS slot wipe, which stomped boot_info_ptr in BSS.
 var gdt_ptr[16];
 # AGNOS sovereign boot-info struct pointer (Path C ELF64 path).
 # Populated by boot_shim.cyr's ELF64 branch via boot_info_capture_rdi() —

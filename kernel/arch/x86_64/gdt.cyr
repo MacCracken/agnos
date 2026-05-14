@@ -90,10 +90,12 @@ fn tss_init_cpu(cpu_id) {
     asm { lgdt [rax]; }
 
     # Load Task Register: ltr (selector = 0x28 + cpu_id * 16)
-    # We need a runtime selector value, so build the instruction dynamically
+    # Cyrius leaves the just-assigned value in rax (same pattern as gdt_init's
+    # `var gp = &gdt_ptr; asm { lgdt [rax]; }` above) — so `ltr ax` reads selector.
+    # Earlier code tried `mov rax, [rbp-0x08]` which actually loaded the
+    # `cpu_id` parameter (always 0 for BSP) → null-TSS #GP → triple fault.
     var selector = 0x28 + cpu_id * 16;
     asm {
-        0x48; 0x8B; 0x45; 0xF8;   # mov rax, [rbp-0x08] (selector)
         0x0F; 0x00; 0xD8;          # ltr ax
     }
 
