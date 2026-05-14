@@ -262,7 +262,10 @@ jobs:
         # release tarball is a pre-built BOOTX64.EFI.
         run: |
           set -e
-          GNOBOOT_VERSION="v0.1.0"
+          # gnoboot tags as plain semver (e.g. "0.1.0"), no `v` prefix.
+          # The release.yml tag-filter accepts both but the actual tags
+          # are plain — match exactly what's on GitHub.
+          GNOBOOT_VERSION="0.1.0"
           curl -fsSL --retry 5 --retry-all-errors \
             "https://github.com/MacCracken/gnoboot/releases/download/${GNOBOOT_VERSION}/BOOTX64.EFI" \
             -o build/BOOTX64.EFI
