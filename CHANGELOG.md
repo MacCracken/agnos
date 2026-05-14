@@ -80,6 +80,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **SMP AP-wakeup IPI block gated for Attempt 10 diagnostic**
+  (`kernel/arch/x86_64/smp.cyr:177-189`). Attempt 9 on iron Zen advanced
+  past Attempt 8's `tss_init_cpu` slot-trap and now dies between kernel
+  CMOS checkpoint 0x07 (APIC + timer live) and 0x08 (`pt_init` returned).
+  The four candidate call sites between those checkpoints are
+  `smp_start_aps`, the keyboard-ISR build, the IRQ1 IDT gate install, and
+  `pt_init`. `smp_start_aps` is the strongest suspect — Attempt 9 is the
+  first iron boot to actually fire INIT-SIPI-SIPI at real Zen APs (the
+  in-source comment claiming "works on real hardware" was a prediction,
+  never measured). Three concrete hazards: hardcoded `CR3 = 0x1000` in
+  the AP trampoline's 32-bit stage when `pt_init` has not yet run (APs
+  inherit gnoboot's bootstrap mappings, which may not identity-map
+  `0xFEE00000`); non-volatile empty-loop "delays" that don't meet the
+  SDM's ~10ms INIT quiescence / ~200µs SIPI window; trampoline page
+  writeability depending on gnoboot's bootstrap mappings. Gating the
+  three `apic_send_init` / `apic_send_sipi` for-loops isolates AP wakeup
+  from `smp_build_trampoline` and the AP-stack `vmm_alloc_at` calls,
+  which remain live. `build/agnos` 251616 → 251152 bytes (−464, six call
+  sites eliminated as predicted). Attempt-10 expected: CMOS
+  `kernel checkpt` ≥ 0x08 → AP wakeup is the fault, patch follows; still
+  0x07 → fault is in trampoline build or stack alloc, instrument finer
+  in Attempt 11. See
+  `agnosticos/docs/development/iron-boot-testing-log.md` § *Attempt 9*.
+
 - **Boot-info struct version bumped 1 → 2** to consume gnoboot v0.1.0+'s
   inlined framebuffer fields at offsets 0x48-0x5C (`fb_phys`,
   `fb_pitch`, `fb_width`, `fb_height`, `fb_pixel_format`). Kernel
