@@ -12,11 +12,23 @@ echo "Building AGNOS with benchmarks..."
 MAIN_CYR="$ROOT/kernel/core/main.cyr"
 MAIN_BAK="$MAIN_CYR.bak"
 cp "$MAIN_CYR" "$MAIN_BAK"
-# Replace kybernet() with bench + halt; skip exec_and_wait
-# Make test procs exit immediately so scheduler doesn't block
+# Replace kybernet() with bench + halt; skip exec_and_wait.
+# Convert test procs from default busy-loops to no-ops so the scheduler
+# doesn't keep them alive and block bench's arch_halt. The default source
+# shape MUST be `while (1 == 1) { ... }` — see kernel/user/test_procs.cyr's
+# header comment for why the kernel boot path needs busy-loops. If a
+# future reshape changes that, the sed below fails the match-count guard
+# rather than silently shipping busy-loops into bench builds.
 TPROC_CYR="$ROOT/kernel/user/test_procs.cyr"
 TPROC_BAK="$TPROC_CYR.bak"
 cp "$TPROC_CYR" "$TPROC_BAK"
+TPROC_MATCHES=$(grep -c 'while (1 == 1) {' "$TPROC_CYR")
+if [ "$TPROC_MATCHES" -ne 2 ]; then
+    echo "ERROR: bench.sh expected 2 'while (1 == 1) {' matches in test_procs.cyr, found $TPROC_MATCHES" >&2
+    echo "       test_procs.cyr shape diverged from bench.sh's contract — see file header comment." >&2
+    rm -f "$TPROC_BAK"
+    exit 1
+fi
 sed -i 's/while (1 == 1) {/if (0 == 1) {/' "$TPROC_CYR"
 sed -i 's/exec_and_wait(exec_entry, exec_rsp, exec_cr3);/# skipped/' "$MAIN_CYR"
 sed -i 's/kybernet();/sh_cmd_bench(); arch_halt();/' "$MAIN_CYR"

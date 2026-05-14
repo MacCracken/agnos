@@ -6,16 +6,35 @@
 # (2026-05-14) triple-faulted on iter 0 of the scheduler loop with the
 # previous `if (0 == 1) { ... } return 0;` shape. See
 # docs/development/iron-boot-testing-log.md § Attempt 12 for the trace.
+# Coupled file: scripts/bench.sh inverts `while (1 == 1)` → `if (0 == 1)`
+# for bench builds so the scheduler doesn't keep these alive past
+# arch_halt. bench.sh guards on a match-count of exactly 2 — if you
+# add/remove a test_proc here, update bench.sh's guard accordingly.
 
 fn test_proc_a() {
+    # CMOS CP 0x20: context switch into test_proc_a succeeded (pre-loop reached).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x20; 0xE6; 0x71; }
+    var iter = 0;
     while (1 == 1) {
         serial_print("A", 1);
+        if (iter == 0) {
+            # CMOS CP 0x21: first serial_print in proc context returned.
+            asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x21; 0xE6; 0x71; }
+        }
         arch_wait();
+        if (iter == 0) {
+            # CMOS CP 0x22: first arch_wait round-trip (hlt → timer ISR → resume).
+            asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x22; 0xE6; 0x71; }
+        }
+        iter = iter + 1;
     }
     return 0;
 }
 
 fn test_proc_b() {
+    # CMOS CP 0x23: sched_next rotated from test_proc_a → test_proc_b
+    # (proves the round-robin is alive between user procs).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x23; 0xE6; 0x71; }
     while (1 == 1) {
         serial_print("B", 1);
         arch_wait();
