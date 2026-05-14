@@ -1,10 +1,15 @@
-# === Multiboot information capture (ELF64 multiboot2 path) ===
+# === Boot-info capture (Path C — sovereign UEFI bootloader) ===
 #
+# The AGNOS sovereign UEFI bootloader, `gnoboot`, hands off to the
+# kernel with **RDI = physical address of the AGNOS boot-info
+# struct** (magic `0x41474E4F = 'AGNO'`, layout in
+# agnosticos/docs/development/path-c-sovereign-uefi.md § Handoff).
 # The ELF64 boot shim (boot_shim.cyr `#ifdef ELF64_KERNEL` branch)
-# preserves RBX (the multiboot2 MBI physical address per § 8.4.3)
-# through its entire entry asm block. Immediately after the shim, a
-# top-level call to `mbi_capture_rbx()` captures that register into
-# the kernel global `mb_info_ptr` (declared in boot_data.cyr).
+# preserves RDI through its entire entry asm block (stack setup +
+# UART init touch RSP/RBP/RAX/RDX, not RDI). Immediately after the
+# shim, a top-level call to `boot_info_capture_rdi()` captures that
+# register into the kernel global `boot_info_ptr` (declared in
+# boot_data.cyr).
 #
 # Why a function call instead of inline asm at top level:
 #
@@ -13,19 +18,30 @@
 # kernel image), not in source order. A function CALL, by contrast,
 # emits in source order during PARSE_PROG, and inside the function
 # the `var p = &X;` becomes an immediate local-var init that loads
-# RAX = &X right away. SysV ABI guarantees RBX is preserved across
-# the call (callee-saved register), so the captured MBI ptr survives
-# intact through the call site, the function prologue, and the
-# `var p = &mb_info_ptr;` lookup, until the inline asm stores it.
+# RAX = &X right away.
 #
-# `mov [rax], rbx` encodes as 3 bytes: REX.W (0x48) + opcode 0x89
-# (MOV r/m64, r64) + ModR/M 0x18 (mod=00 reg=RBX rm=RAX).
+# RDI is a SysV scratch register (caller-saved) — cyrius's normal
+# fn-call setup writes to RDI when passing arg 0. So why does it
+# survive into this fn? Because `boot_info_capture_rdi()` takes NO
+# ARGS — cyrius doesn't touch RDI at the call site. RDI from
+# firmware/gnoboot/shim flows through unmolested to the asm below.
+#
+# `mov [rax], rdi` encodes as 3 bytes: REX.W (0x48) + opcode 0x89
+# (MOV r/m64, r64) + ModR/M 0x38 (mod=00 reg=RDI rm=RAX).
+#
+# History: pre-Path-C builds used `mbi_capture_rbx()` and expected
+# RBX = MBI physical address per multiboot2 § 8.4.3. The Path A
+# multiboot2-via-GRUB experiment died under GRUB's strict-W^X EFI
+# relocator (see agnosticos/docs/development/iron-boot-testing-log.md
+# § Diagnosis 2). Path C replaces GRUB with gnoboot entirely and
+# changes the handoff protocol to a sovereign struct addressed
+# through RDI.
 
 #ifdef ELF64_KERNEL
-fn mbi_capture_rbx(): i64 {
-    var p = &mb_info_ptr;           # mov rax, <abs_addr_of_mb_info_ptr>
+fn boot_info_capture_rdi(): i64 {
+    var p = &boot_info_ptr;          # mov rax, <abs_addr_of_boot_info_ptr>
     asm {
-        0x48; 0x89; 0x18;            # mov [rax], rbx
+        0x48; 0x89; 0x38;            # mov [rax], rdi
     }
     return 0;
 }

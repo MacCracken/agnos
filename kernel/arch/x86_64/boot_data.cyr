@@ -1,15 +1,17 @@
 # === Kernel data ===
 var gdt[56];       # 7 entries x 8 bytes (null + kCS + kDS + uDS + uCS + TSS lo + TSS hi)
 var gdt_ptr[16];
-# Multiboot2 information structure pointer (ELF64 path). Populated by
-# boot_shim.cyr's ELF64 branch via mbi_capture_rbx() — the SysV-callee-
-# saved RBX register holds the MBI physical address at kernel entry per
-# multiboot2 § 8.4.3. Declared as a [8]-byte array (not `var X = 0;`)
-# so it stays in .bss-zeroed storage and bypasses EMIT_GVAR_INITS,
-# avoiding any chance of the gvar-init pass overwriting a captured value.
-# Read via `load64(&mb_info_ptr)` once the kernel reaches main code.
+# AGNOS sovereign boot-info struct pointer (Path C ELF64 path).
+# Populated by boot_shim.cyr's ELF64 branch via boot_info_capture_rdi() —
+# RDI holds &boot_info at kernel entry per the Path C handoff contract
+# (magic 0x41474E4F='AGNO'; layout in agnosticos/docs/development/
+# path-c-sovereign-uefi.md § Handoff). Declared as a [8]-byte array
+# (not `var X = 0;`) so it stays in .bss-zeroed storage and bypasses
+# EMIT_GVAR_INITS, avoiding any chance of the gvar-init pass
+# overwriting a captured value.
+# Read via `load64(&boot_info_ptr)` once the kernel reaches main code.
 # Unused in ELF32 multiboot1 builds; the 8 bytes are harmless overhead.
-var mb_info_ptr[8];
+var boot_info_ptr[8];
 var tss[104];      # x86_64 TSS is 104 bytes
 var idt[4096];     # 256 vectors x 16 bytes each
 var idt_ptr[16];

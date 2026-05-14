@@ -136,21 +136,25 @@ asm {
 #endif
 
 #ifdef ELF64_KERNEL
-# === 64-bit boot shim (ELF64 multiboot2 + EFI64-entry, Path A) ===
+# === 64-bit boot shim (ELF64 + sovereign-struct entry, Path C) ===
 #
-# GRUB-EFI hands control here in 64-bit long mode (paging on, UEFI
-# identity-maps the first 4 GB, GDT inherited from UEFI, CS = 64-bit
-# code segment, interrupts disabled). Per multiboot2 spec § 8.4.3:
-#   RAX = 0x36d76289   (multiboot2 magic)
-#   RBX = physical address of the multiboot2 information structure
-#         (tag stream — see agnosticos/docs/development/path-a-elf64-multiboot2.md
-#         § MBI tag walker for the format)
+# Gnoboot (the AGNOS sovereign UEFI bootloader) hands control here
+# in 64-bit long mode (paging on, UEFI identity-maps the first 4 GB,
+# GDT inherited from UEFI, CS = 64-bit code segment, interrupts
+# disabled). Per the AGNOS Path C handoff contract:
+#   RDI = physical address of the AGNOS boot-info struct
+#         (magic 0x41474E4F='AGNO'; layout in
+#         agnosticos/docs/development/path-c-sovereign-uefi.md § Handoff)
+#
+# Pre-Path-C builds expected RAX=0x36d76289 + RBX=MBI per multiboot2
+# § 8.4.3. That path is dead — GRUB's strict-W^X EFI relocator broke
+# it irrecoverably (iron-boot log § Diagnosis 2). Path C drops GRUB
+# entirely; gnoboot is the only thing between UEFI firmware and us.
 #
 # Sequence (minimal — just what's needed before kernel main can run):
 #   1. Install our 64-bit stack at 0x200000. Done first because the
-#      `mbi_capture_rbx()` call after this asm block uses the stack
-#      (call pushes return addr) and the SysV-callee-save RBX must
-#      still be intact at that call site.
+#      `boot_info_capture_rdi()` call after this asm block uses the
+#      stack (call pushes return addr).
 #   2. Init COM1 UART (port I/O — verbatim from legacy step 2).
 #
 # Deliberately NOT done in this shim (let kernel-side init handle it):
@@ -167,9 +171,11 @@ asm {
 #   - Page tables — UEFI's identity map is fine
 #   - CR0/CR3/CR4/EFER — UEFI configured them; kernel re-tunes later
 #
-# RBX is preserved through this minimal shim: stack-setup touches
-# RSP/RBP, UART init touches RDX/RAX (low byte). RBX intact for the
-# mbi_capture_rbx() call that follows.
+# RDI is preserved through this minimal shim: stack-setup touches
+# RSP/RBP, UART init touches RDX/RAX (low byte). RDI intact for the
+# boot_info_capture_rdi() call that follows. (RDI is a SysV scratch
+# register, but `boot_info_capture_rdi()` takes no args, so cyrius
+# doesn't clobber it at the call site.)
 asm {
     # 1. 64-bit stack at 0x200000; mov rbp, rsp
     0x48; 0xBC; 0x00; 0x00; 0x20; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x200000
@@ -185,10 +191,11 @@ asm {
     0xBA; 0xFC; 0x03; 0x00; 0x00; 0xB0; 0x0B; 0xEE;        # MCR  = DTR | RTS | OUT2
 }
 
-# Capture RBX (MBI ptr) into mb_info_ptr. Top-level call — emits a
-# `call <fn>` instruction in source order. SysV ABI: RBX is callee-
-# saved, preserved across the call. Inside the function (mbi.cyr),
-# local `var p = &mb_info_ptr;` loads RAX immediately; then asm
-# `mov [rax], rbx` writes RBX to mb_info_ptr. See mbi.cyr for the why.
-mbi_capture_rbx();
+# Capture RDI (sovereign boot-info ptr) into boot_info_ptr. Top-level
+# call — emits a `call <fn>` instruction in source order. The fn takes
+# no args, so cyrius doesn't touch RDI at the call site, and RDI from
+# gnoboot survives into the body. Inside the function (mbi.cyr), local
+# `var p = &boot_info_ptr;` loads RAX immediately; then asm
+# `mov [rax], rdi` writes RDI to boot_info_ptr. See mbi.cyr for the why.
+boot_info_capture_rdi();
 #endif
