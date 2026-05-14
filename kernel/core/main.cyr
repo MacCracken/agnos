@@ -305,6 +305,8 @@ while (idle_count < 50) {
 
 # Deactivate scheduler, report results
 sched_active = 0;
+# CMOS CP 0x11: post-scheduler idle loop completed
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x11; 0xE6; 0x71; }
 serial_println("", 0);
 serial_print("Scheduler test done. Timer ticks: ", 34);
 kprint_num(timer_ticks);
@@ -344,6 +346,8 @@ serial_print("VFS memfile read: ", 18);
 serial_print(&rbuf, rn);
 serial_println("", 0);
 vfs_close(mf);
+# CMOS CP 0x12: post-VFS / initrd / memfile tests
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
 
 # Memory-isolation test. v1.25.1 gated this behind MEMORY_ISOLATION_TEST
 # after `store64(0xC00000, ...)` page-faulted post-cr3-switch despite
@@ -442,6 +446,8 @@ if (val_as1_check == 0xAAAA) {
 } else {
     serial_println("Memory isolation: FAIL (AS1 clobbered)", 38);
 }
+# CMOS CP 0x13: post-memory-isolation test
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x13; 0xE6; 0x71; }
 
 # === Userland Exec Test ===
 # Spawn user_test_proc as a proper isolated process with its own address space
@@ -459,9 +465,13 @@ if (exec_pid >= 0) {
     # skipped
     serial_println("Userland exec complete", 22);
 }
+# CMOS CP 0x14: post-userland-exec test (spawn done, exec_and_wait still bypassed)
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
 
 # Launch kybernet (PID 1)
 serial_println("Launching kybernet...", 21);
+# CMOS CP 0x15: reached kybernet-launch site (sh_cmd_bench is placeholder)
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x15; 0xE6; 0x71; }
 sh_cmd_bench(); arch_halt();
 
 serial_println("Halted.", 7);

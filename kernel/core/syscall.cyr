@@ -30,6 +30,9 @@ fn stack_canary_check(canary) {
 # 8=dup 9=mkdir 10=rmdir 11=mount 12=sync 13=reboot 14=pause 15=getuid
 # 16=kill 17=sigprocmask 18=signalfd 19=epoll_create 20=epoll_ctl
 # 21=epoll_wait 22=timerfd_create 23=timerfd_settime 24=umount 25=pipe
+# 26=write_boot_checkpoint(byte) — diagnostic-only, writes CMOS[0x50]=arg1.
+#    Added for iron-boot bring-up so userspace (kybernet) can mark progress
+#    in the same CMOS slot the kernel uses. Will likely stay through MVP.
 
 var sys_exit_code = 0;
 
@@ -293,6 +296,17 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (is_user_range(arg1, 16) == 0) { stack_canary_check(canary); return 0 - 1; }
         stack_canary_check(canary);
         return vfs_create_pipe(arg1);
+    }
+    if (num == 26) {
+        # write_boot_checkpoint(byte=arg1) — writes CMOS[0x50] = arg1 & 0xFF.
+        # Diagnostic for iron-boot bring-up: lets PID 1 / kybernet mark its
+        # own progress in the same CMOS slot the kernel uses for kernel-side
+        # checkpoints (0x01..0x1F kernel, 0x20+ ring-3 transitions, 0x30+
+        # userspace). Read back via scripts/read-boot-log.sh after a stall.
+        outb(0x70, 0x50);
+        outb(0x71, arg1 & 0xFF);
+        stack_canary_check(canary);
+        return 0;
     }
     stack_canary_check(canary);
     return 0 - 1;

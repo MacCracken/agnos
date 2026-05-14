@@ -58,6 +58,11 @@ fn enter_ring3(entry, user_rsp) {
     store64(0x7018, user_rsp);
     store64(0x7020, 0x1B);
 
+    # CMOS CP 0x20: about to enter ring 3 via iretq. Last instruction
+    # executed in ring 0 before the userspace transition. If CMOS[0x50]
+    # never reaches 0x20 on iron, no ring-3 transition was attempted.
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x20; 0xE6; 0x71; }
+
     # Set RSP to 0x7000 and iretq
     asm {
         0x48; 0xC7; 0xC4; 0x00; 0x70; 0x00; 0x00;  # mov rsp, 0x7000
