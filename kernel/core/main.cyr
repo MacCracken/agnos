@@ -12,6 +12,12 @@ serial_println("TSS loaded (ring 3 ready)", 25);
 idt_init();
 serial_println("IDT loaded", 10);
 
+# === CMOS kernel checkpoint 6 (arch interrupts ready: GDT+TSS+IDT) ===
+# Pairs with boot_shim CPs 1-5 (early entry) and gnoboot CPs 1-5 (pre-jmp,
+# CMOS[0x42]/[0x43]). Decoded by agnosticos/scripts/read-boot-log.sh.
+# 8 bytes, clobbers AL only.
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x06; 0xE6; 0x71; }
+
 pic_init();
 serial_println("PIC remapped", 12);
 
@@ -28,6 +34,9 @@ apic_timer_init(32, 10000000);
 serial_print("APIC: id=", 9);
 kprint_num(cpu_id);
 serial_println(" timer active", 13);
+
+# === CMOS kernel checkpoint 7 (APIC + timer live) ===
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x07; 0xE6; 0x71; }
 
 # Start Application Processors
 cpu_count = 1;
@@ -53,12 +62,21 @@ serial_print("Page tables: ", 13);
 kprint_num(pt_get_mapped_mb());
 serial_println("MB mapped", 9);
 
+# === CMOS kernel checkpoint 8 (page tables built — historical stall point) ===
+# Pre-RDRAND-fix (cyrius 5.11.x, missing -cpu max in QEMU smoke) this was
+# the visible stall. Iron may surface the same or different geometry —
+# CP 8 == reached, CP 8 not reached == pt_init internals faulted.
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x08; 0xE6; 0x71; }
+
 pmm_init();
 serial_print("PMM: ", 5);
 kprint_num(pmm_free_count());
 serial_print(" free / ", 8);
 kprint_num(pmm_total);
 serial_println(" pages", 6);
+
+# === CMOS kernel checkpoint 9 (physical memory manager up) ===
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x09; 0xE6; 0x71; }
 
 # KASLR probe — emits the randomized next-free hint so two consecutive
 # boots can be diffed for "did randomization actually fire". Asserted
@@ -83,6 +101,10 @@ serial_println(" (expect 57005)", 15);
 # Initialize kernel heap
 heap_init();
 serial_println("Heap initialized", 16);
+
+# === CMOS kernel checkpoint 10 (heap up — kmalloc usable) ===
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x0A; 0xE6; 0x71; }
+
 dev_init();
 serial_println("Devices registered", 18);
 # Parse ACPI tables (RSDP, RSDT, DMAR) for hardware discovery
@@ -106,6 +128,9 @@ pci_scan();
 serial_print("PCI: ", 5);
 kprint_num(pci_count);
 serial_println(" devices", 8);
+
+# === CMOS kernel checkpoint 11 (ACPI + PCI enumerated) ===
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x0B; 0xE6; 0x71; }
 
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
 if (acpi_iommu_base != 0) {
@@ -141,6 +166,9 @@ if (pci_find(0x1AF4, 0x1001) >= 0) {
 vfs_init();
 serial_println("VFS initialized", 15);
 
+# === CMOS kernel checkpoint 12 (VFS up) ===
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x0C; 0xE6; 0x71; }
+
 var h1 = kmalloc(16);
 var h2 = kmalloc(100);
 var h3 = kmalloc(4096);
@@ -160,6 +188,9 @@ serial_println("SYSCALL/SYSRET initialized", 26);
 # Initialize stack canary secret (S13)
 stack_canary_init();
 serial_println("Stack canary initialized", 24);
+
+# === CMOS kernel checkpoint 13 (SYSCALL + stack canary) ===
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x0D; 0xE6; 0x71; }
 
 # Syscall test (direct call — still works)
 kernel_return_rsp = 0;
@@ -220,9 +251,17 @@ serial_print(" total, ", 8);
 kprint_num(proc_count_by_state(1));
 serial_println(" ready", 6);
 
+# === CMOS kernel checkpoint 14 (test procs created) ===
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x0E; 0xE6; 0x71; }
+
 # Enable interrupts and activate scheduler
 asm { sti; }
 serial_println("Interrupts enabled", 18);
+
+# === CMOS kernel checkpoint 15 (interrupts enabled — sti executed) ===
+# CP 15 reached but CP 16 not = scheduler activation faulted, or a flood
+# of interrupts post-sti is preventing forward progress.
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x0F; 0xE6; 0x71; }
 
 # Wait a few ticks before activating scheduler
 arch_wait();
@@ -233,6 +272,14 @@ serial_println("", 0);
 
 serial_println("Activating scheduler...", 23);
 sched_active = 1;
+
+# === CMOS kernel checkpoint 16 (scheduler armed) ===
+# This is the AGNOS MVP closed-beta gate: reaching CP 16 means kernel
+# init succeeded end-to-end through scheduler activation. Subsequent
+# stall (no CP 17 ever emitted, no shell prompt) is a scheduler /
+# context-switch issue, not an init issue. See state.md § "Open:
+# timer-driven context switch broken".
+asm { 0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
 
 # Kernel idle loop: halts, wakes on timer, scheduler switches to A or B
 # After enough ticks, deactivate and report
