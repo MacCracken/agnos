@@ -181,20 +181,26 @@ asm {
     # Attempt 7 (visual canary) returned an ambiguous null-result. Single-
     # machine dev setup (devbox IS the iron target) means serial is wired
     # to nothing. CMOS scratch RAM (battery-backed, survives reset) is
-    # readable from Linux via /dev/nvram after reboot — see
-    # agnosticos/scripts/read-boot-log.sh.
+    # readable from Linux after reboot — see agnosticos/scripts/read-boot-log.sh
+    # (Cyrius binary using iopl(3) + outb/inb; /dev/nvram is unusable on
+    # archaemenid because the BIOS CMOS checksum slot is left at 0x00).
     #
-    # Layout:
-    #   CMOS[0x40] = highest checkpoint reached this boot (1..N)
-    #   CMOS[0x41] = magic (0xAB) — set once at entry to certify "kernel ran"
+    # Layout (post-2026-05-14; slots shifted +0x10 from the original
+    # 0x40-0x43 layout — archaemenid BIOS writes 0x42/0x43/0x44 every
+    # cold boot, so the whole scheme moved into the virgin 0x50-0x7F
+    # CMOS region):
+    #   CMOS[0x50] = highest checkpoint reached this boot (1..N)
+    #   CMOS[0x51] = magic (0xAB) — set once at entry to certify "kernel ran"
+    #   CMOS[0x52] = gnoboot checkpoint (1..5)  — written by gnoboot
+    #   CMOS[0x53] = gnoboot magic (0xCD)       — written by gnoboot
     #
     # Per-checkpoint write is 8 bytes: `mov al, idx; out 0x70, al;
     # mov al, val; out 0x71, al`. Clobbers AL only; RDI / RSP / all GPRs
     # except AL untouched. Bit 7 of port 0x70 controls NMI; we write
-    # 0x40 / 0x41 (bit 7 clear → NMI enabled) — same state UEFI handed
+    # 0x50 / 0x51 (bit 7 clear → NMI enabled) — same state UEFI handed
     # off in, so no behavior change.
-    0xB0; 0x41; 0xE6; 0x70; 0xB0; 0xAB; 0xE6; 0x71;        # CMOS[0x41] = 0xAB (magic)
-    0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x01; 0xE6; 0x71;        # CMOS[0x40] = 1    (entry)
+    0xB0; 0x51; 0xE6; 0x70; 0xB0; 0xAB; 0xE6; 0x71;        # CMOS[0x51] = 0xAB (magic)
+    0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x01; 0xE6; 0x71;        # CMOS[0x50] = 1    (entry)
 
     # 0. Boot-time visual canary (Attempt 7 bisection). Reads gnoboot's
     #    sovereign boot-info struct via RDI (still holds &boot_info per
@@ -204,7 +210,7 @@ asm {
     #    framebuffer.
     #
     #    Now redundant with the CMOS log above for the "did kernel run"
-    #    question (CMOS[0x41] == 0xAB answers it definitively), but kept
+    #    question (CMOS[0x51] == 0xAB answers it definitively), but kept
     #    as a visual backup signal that doesn't require reboot+mount to
     #    inspect. Failure-safe: if fb_phys = 0, JZ skips the paint.
     #
@@ -218,14 +224,14 @@ asm {
     0xE2; 0xF4;                                            # loop -12 (back to mov dword)
 
     # === Checkpoint 2 (past canary) ===
-    0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x02; 0xE6; 0x71;        # CMOS[0x40] = 2
+    0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x02; 0xE6; 0x71;        # CMOS[0x50] = 2
 
     # 1. 64-bit stack at 0x200000; mov rbp, rsp
     0x48; 0xBC; 0x00; 0x00; 0x20; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x200000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 
     # === Checkpoint 3 (past stack setup) ===
-    0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x03; 0xE6; 0x71;        # CMOS[0x40] = 3
+    0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x03; 0xE6; 0x71;        # CMOS[0x50] = 3
 
     # 2. COM1 UART init (port 0x3F8) — verbatim from legacy step 2
     0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;        # IER  = 0
@@ -237,7 +243,7 @@ asm {
     0xBA; 0xFC; 0x03; 0x00; 0x00; 0xB0; 0x0B; 0xEE;        # MCR  = DTR | RTS | OUT2
 
     # === Checkpoint 4 (past COM1 init) ===
-    0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x04; 0xE6; 0x71;        # CMOS[0x40] = 4
+    0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x04; 0xE6; 0x71;        # CMOS[0x50] = 4
 }
 
 # Capture RDI (sovereign boot-info ptr) into boot_info_ptr. Top-level
@@ -249,10 +255,10 @@ asm {
 boot_info_capture_rdi();
 
 # === Checkpoint 5 (boot_info_capture_rdi returned) ===
-# If CMOS[0x40] reads 5 after reset, kernel survived its first call/ret
+# If CMOS[0x50] reads 5 after reset, kernel survived its first call/ret
 # — fault is somewhere later in top-level kernel init (gdt_init,
 # idt_init, paging, scheduler, ...).
 asm {
-    0xB0; 0x40; 0xE6; 0x70; 0xB0; 0x05; 0xE6; 0x71;        # CMOS[0x40] = 5
+    0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x05; 0xE6; 0x71;        # CMOS[0x50] = 5
 }
 #endif
