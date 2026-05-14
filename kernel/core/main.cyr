@@ -300,6 +300,18 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
 var idle_count = 0;
 while (idle_count < 50) {
     arch_wait();
+    if (idle_count == 0) {
+        # CMOS CP 0x12: first hlt returned — timer ISR + first context-switch round-trip OK
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
+    }
+    if (idle_count == 9) {
+        # CMOS CP 0x13: 10 hlts done — matches QEMU's known-good count under gnoboot
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x13; 0xE6; 0x71; }
+    }
+    if (idle_count == 24) {
+        # CMOS CP 0x14: 25 hlts done — between QEMU known-good and loop end
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
+    }
     idle_count = idle_count + 1;
 }
 

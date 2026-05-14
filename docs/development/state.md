@@ -21,12 +21,56 @@ type: state
 | **Released** | 2026-05-13 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Last assertion tightened** | `KASLR: pmm_next_free=N` varies across two boots | CI `boot-test` job, v1.28.0 (**currently broken — see "Open investigation" below**) |
 
-## Open investigation — timer-driven context switch under UEFI+gnoboot (2026-05-13)
+## Open investigation — timer-driven context switch under UEFI+gnoboot (2026-05-13, iron-confirmed 2026-05-14)
 
 gnoboot v0.1.0 successfully delivers the sovereign boot-info struct
 to the kernel via Path C (`RDI = &boot_info`, magic `0x41474E4F`).
 **Most of the kernel boot now works under UEFI+gnoboot**; the
 remaining stall is specifically in the timer-driven scheduler loop.
+
+### Iron-confirmed 2026-05-14: NUC AMD Attempt 11 reaches CP 0x10 (scheduler armed)
+
+Reflashed kernel (251,312 B ELF64, carries Attempt-8 ltr-slot fix,
+Attempt-9 SMP-SIPI gate, current `ce745c7` boot repairs) booted on
+archaemenid (Beelink SER, Zen) with all of:
+
+- gnoboot CMOS CP 0x05 / magic 0xCD → all 5 pre-jump checkpoints
+  reached, ELF64 mapping + `jmp rax` handoff clean.
+- kernel CMOS CP **0x10** / magic 0xAB → `agnos/kernel/core/main.cyr:296`
+  reached, written immediately after `sched_active = 1`. Full init
+  chain executed: `gdt_init` → `tss_init` → `idt_init` → `pic_init`
+  → `apic_init` → `apic_timer_init` → `smp_start_aps` (SIPI gated)
+  → `pt_init` → `pmm_init` → `vmm_init` → `heap_init` → `dev_init`
+  / `acpi_init` / `pci_scan` → `vfs_init` → `syscall_init` → proc
+  creation → `sti` → scheduler activation.
+- **First positive framebuffer signal on iron**: white canary stripe
+  painted at top-left from `boot_shim.cyr:200-206` ELF64 shim asm.
+  `[rdi+0x48]` (fb_phys from gnoboot's GOP capture in boot-info v2)
+  was non-null AND the kernel-side asm wrote 256 white pixels
+  successfully. Retroactively flips the iron Attempt 7 Case-A
+  diagnosis: framebuffer **is** reachable from kernel-side under
+  UEFI+gnoboot+ELF64 on this Zen iron.
+- did NOT reach kernel CP 0x11 (`main.cyr:309`, written after the
+  50-iteration `while (idle_count < 50) { arch_wait(); }` idle loop
+  completes). Reset between scheduler arm and post-loop CP write.
+
+**Iron confirms the QEMU+UEFI investigation independently.** Different
+firmware (AMI BIOS vs. OVMF), different memory layout (real Zen vs.
+emulated), same fault site (post-`sched_active=1` idle/timer loop).
+The hypothesis below — `test_proc_a/b` returning into uninitialized
+stack memory exposed by gnoboot's pre-handoff state — is now backed
+by iron evidence as well as QEMU.
+
+**MVP-relevant.** The kernel-init layer of the AGNOS MVP closed-beta
+gate is cleared on iron. All 17 init checkpoints pass. Boot-to-shell
+on hardware blocks only on the scheduler dispatching a runnable user
+task (kybernet PID 1 / agnoshi).
+
+Iron-side bisector + fix plan: see Attempt 12 in
+`agnosticos/docs/development/iron-boot-testing-log.md` (finer CMOS
+checkpoints around the post-`sched_active=1` loop + the `if (0 == 1)`
+→ `while (1 == 1)` patch on `test_proc_a/b` as the cheapest of the
+three fix paths below).
 
 ### Resolved 2026-05-13: RDRAND under default qemu64 CPU
 
