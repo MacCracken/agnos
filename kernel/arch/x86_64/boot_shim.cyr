@@ -177,6 +177,34 @@ asm {
 # register, but `boot_info_capture_rdi()` takes no args, so cyrius
 # doesn't clobber it at the call site.)
 asm {
+    # 0. Boot-time visual canary (Attempt 7 bisection). FIRST INSTRUCTIONS
+    #    of the kernel. Reads gnoboot's sovereign boot-info struct via
+    #    RDI (still holds &boot_info per Path C handoff contract — nothing
+    #    in this block clobbers RDI), pulls fb_phys from offset 0x48 of
+    #    the struct, and paints 256 white pixels (one 1024-byte stripe)
+    #    at the top-left of the framebuffer.
+    #
+    #    Purpose: bisect "did the kernel execute a single instruction?".
+    #    Attempt 6 on NUC AMD reset post-handoff with no kernel UART
+    #    output (no serial cable). If this stripe appears, the kernel
+    #    ran ≥ 1 instruction and the fault is later (CR-state, GDT, page
+    #    tables). If the stripe never appears, fault is in the `jmp rax`
+    #    itself or the page containing 0x1000A8 isn't executable.
+    #
+    #    Failure-safe: if gnoboot couldn't locate GOP (text-mode firmware,
+    #    headless serial-only board), it leaves fb_phys = 0 and we skip
+    #    the paint via JZ. Zero footprint when fb absent.
+    #
+    #    Clobbers: RAX (loop ptr), RCX (loop counter). Preserves RDI
+    #    (required by boot_info_capture_rdi() below).
+    0x48; 0x8B; 0x47; 0x48;                                # mov  rax, [rdi + 0x48]   ; fb_phys
+    0x48; 0x85; 0xC0;                                      # test rax, rax
+    0x74; 0x11;                                            # jz   +17               ; skip if no fb
+    0xB9; 0x00; 0x01; 0x00; 0x00;                          # mov  ecx, 256          ; pixels to paint
+    0xC7; 0x00; 0xFF; 0xFF; 0xFF; 0xFF;                    # mov  dword [rax], 0xFFFFFFFF
+    0x48; 0x83; 0xC0; 0x04;                                # add  rax, 4
+    0xE2; 0xF4;                                            # loop -12 (back to mov dword)
+
     # 1. 64-bit stack at 0x200000; mov rbp, rsp
     0x48; 0xBC; 0x00; 0x00; 0x20; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x200000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
