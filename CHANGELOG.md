@@ -7,6 +7,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Persistent CMOS boot-log at kernel entry** (Attempt 8 bisection;
+  `kernel/arch/x86_64/boot_shim.cyr` ELF64 path). Attempt 7's visual
+  canary returned an ambiguous null-result on iron — the no-stripe
+  could mean `fb_phys=0` (kernel ran invisibly) or `jmp rax` never
+  landed (kernel never executed). Serial diagnostic was wrongly
+  recommended across Attempts 4-7 — the dev environment IS the iron
+  target (single Beelink SER, no second host to read serial off the
+  COM1 wire), so serial is structurally unavailable.
+
+  CMOS scratch RAM is the right channel: battery-backed, survives the
+  triple-fault reset, two-instruction-per-write from the kernel
+  (`out 0x70` / `out 0x71`), no driver needed in kernel OR Linux
+  (latter reads via `/dev/nvram`).
+
+  Layout (CMOS offsets, readable from Linux via
+  `agnosticos/scripts/read-boot-log.sh`):
+    - `CMOS[0x41]` = magic byte 0xAB, set once at kernel entry to
+      certify "kernel ran this boot" (distinguishes a fresh failure
+      from CMOS containing stale data from a prior boot).
+    - `CMOS[0x40]` = highest checkpoint number reached this boot.
+
+  Checkpoints inserted in the ELF64 boot shim asm block:
+    1. Kernel entry (instruction #1, also sets the 0xAB magic)
+    2. Past visual canary
+    3. Past 64-bit stack setup (`mov rsp, 0x200000`)
+    4. Past COM1 UART init
+    5. Past `boot_info_capture_rdi()` call (post-call site, in a
+       separate asm block — survives the first call+ret pair)
+
+  Six 8-byte writes total = 48 bytes added to the shim (one extra
+  write at checkpoint 1 for the magic). `build/agnos` 251072 → 251120
+  bytes (+48 exact). Clobbers AL only per checkpoint; RDI / RSP /
+  all other GPRs untouched. Bit 7 of port 0x70 (NMI disable) is
+  left at UEFI's handed-off state (clear) — no behavior change.
+  `tests/ovmf_smoke.sh` still reaches `Activating scheduler...` —
+  CMOS writes are silent in QEMU OVMF.
+
+  Diagnostic flow for Attempt 8: re-flash USB → boot NUC AMD →
+  reset → boot back into Arch → `sudo agnosticos/scripts/read-boot-log.sh`
+  → see which checkpoint was the highest the kernel reached. If
+  `CMOS[0x41]` is not 0xAB, kernel never executed at all. Otherwise
+  the value at `CMOS[0x40]` bisects the failure to within ~30 bytes
+  of code.
+
 - **Boot-time visual canary at kernel entry instruction #1** (Attempt 7
   bisection; `kernel/arch/x86_64/boot_shim.cyr` ELF64 path). After
   Attempt 6 on NUC AMD reproduced Attempt 5's blank-screen-and-reset
