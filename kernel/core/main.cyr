@@ -462,6 +462,13 @@ cp_fb(0x17, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post proc_map_page x2
 # entry stub re-clears AC implicitly (the interrupt gate clears
 # RFLAGS.AC on entry per Intel SDM Vol 3 §6.12.1.4).
 cr3_load(as1);
+# Attempt 20 confirmed cp_fb under AS1's CR3 #PFs (FB MMIO not in AS1's PT
+# mirror — proc_create_address_space only mirrors 0..4 GB RAM via PD copy +
+# PDPT[1..3] huge pages; the GOP framebuffer phys on Zen UEFI is above that).
+# Until FB phys is pre-mapped into AS1/AS2 (long-term fix, deferred), the
+# under-AS1 visual cp_fb stamps are dropped; the kcp port-I/O stamps below
+# carry the diagnostic ladder. Visual ladder resumes after kernel CR3
+# restore at cp_fb(0x19) MAGENTA below.
 # CMOS CP 0x18: first cr3 switch (AS1) survived — AS1 has kernel-text mapped.
 # Any post-CP-0x18 stall is in the SMAP'd accesses or subsequent CR3 switches.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x18; 0xE6; 0x71; }
@@ -476,7 +483,6 @@ asm {
     0x48; 0xC1; 0xE8; 0x10;    # shr rax, 16
     0xE6; 0x71;                # out 0x71, al  — write byte 2 of CR4
 }
-cp_fb(0x18, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post first cr3_load(as1)
 
 # Attempt 20: disambiguator for the Attempt-19 reading [0x54]=0x30, [0x55]=0x00.
 # Attempt 19 confirmed CR4.SMEP|SMAP held through cr3_load(as1) — the SMAP fix
@@ -498,6 +504,11 @@ cp_fb(0x18, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post first cr3_load(as
 #                            Open the 0x1B/0x1C/0x1D sub-CPs (already wired).
 #   kcp=0x60 + [0x55]=0x00 → genuine case (b): CR4 actually cleared by
 #                            something downstream of cp_fb. Unexpected.
+#
+# Attempt 20 outcome: kcp=0x18 + [0x55]=0x00 (case 1) — cp_fb-under-AS1 #PF
+# confirmed. cp_fb(0x18) removed above; kcp=0x60 + [0x55] dump kept here as
+# ongoing telemetry that AS1 CR3, port-I/O, and CR4 stay healthy past the
+# (former) cp_fb site.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x60; 0xE6; 0x71; }  # kcp = 0x60
 
 # Re-dump CR4 byte 2 to CMOS[0x55] right before `stac`. If [0x55] = 0x30 (SMEP
@@ -514,17 +525,14 @@ asm {
 asm { 0x0F; 0x01; 0xCB; }   # stac
 # CMOS CP 0x1B: stac executed without faulting under AS1 CR3 (Attempt 18 SMAP bisector).
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x1B; 0xE6; 0x71; }
-cp_fb(0x1B, 0x00FF00FF);  # MAGENTA — SMAP bisector: post-stac, AS1 CR3
 store64(0xC00000, 0xAAAA);
 var val_as1 = load64(0xC00000);
 # CMOS CP 0x1C: SMAP-bracketed store64+load64 succeeded under AS1 (Attempt 18 SMAP bisector).
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x1C; 0xE6; 0x71; }
-cp_fb(0x1C, 0x00FF00FF);  # MAGENTA — SMAP bisector: post-store/load
 asm { 0x0F; 0x01; 0xCA; }   # clac
 # CMOS CP 0x1D: clac executed; AS1 SMAP-bracketed round-trip complete (Attempt 18 SMAP bisector).
 # Any post-0x1D stall is in cr3_load(as2) at line 456 or beyond.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x1D; 0xE6; 0x71; }
-cp_fb(0x1D, 0x00FF00FF);  # MAGENTA — SMAP bisector: post-clac, AS1 done
 
 # Switch to AS2, write 0xBBBB to same virtual address
 cr3_load(as2);
