@@ -478,14 +478,31 @@ asm {
 }
 cp_fb(0x18, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post first cr3_load(as1)
 
-# Attempt 19: re-dump CR4 byte 2 to CMOS[0x55] right before `stac`.
-# Attempt 18's CMOS[0x54] = 0x00 read proved CR4.SMAP = 0 at CP 0x18,
-# which made `stac` below a #UD → triple-fault. v1.30.1 added SMEP+SMAP
-# enable in boot_shim.cyr (Path C, post-CP-5). This second dump confirms
-# the new CR4 value reached the test site — if CMOS[0x55] = 0x30 (SMEP
-# 0x10 | SMAP 0x20), the enable held all the way here. If 0x00 again,
-# something between boot_shim and this site cleared CR4 (investigate
-# any CR3/CR0/CR4 mutation downstream of boot_shim).
+# Attempt 20: disambiguator for the Attempt-19 reading [0x54]=0x30, [0x55]=0x00.
+# Attempt 19 confirmed CR4.SMEP|SMAP held through cr3_load(as1) — the SMAP fix
+# in boot_shim.cyr Path C landed cleanly. But the [0x55] dump (10 lines below)
+# read 0x00, which the pre-bound Attempt-19 outcome table called "CR4 cleared
+# between cr3_load and stac". Reinterpretation: between the [0x54] dump and
+# the [0x55] dump is ONLY cp_fb(0x18) — no CR-mutating call — so case (b)
+# is implausible. Far likelier: cp_fb under AS1's CR3 #PFs (FB phys not in
+# AS1's PT mirror), the kernel hangs in the fault loop without resetting (user
+# observation: "no reset items on screen"), and [0x55] is just virgin-CMOS 0x00
+# because the dump site was never reached.
+#
+# This 8-byte port-I/O write of kcp=0x60 sits BETWEEN cp_fb(0x18) and the
+# [0x55] CR4 dump. After Attempt 20:
+#   kcp=0x18 + [0x55]=0x00 → cp_fb-under-AS1 hung. Triage AS1's PT mirror
+#                            for the FB phys range. Real next bug.
+#   kcp=0x60 + [0x55]=0x30 → cp_fb returned, CR4 still good. Stall is in
+#                            stac/store64/load64/clac sequence (case a).
+#                            Open the 0x1B/0x1C/0x1D sub-CPs (already wired).
+#   kcp=0x60 + [0x55]=0x00 → genuine case (b): CR4 actually cleared by
+#                            something downstream of cp_fb. Unexpected.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x60; 0xE6; 0x71; }  # kcp = 0x60
+
+# Re-dump CR4 byte 2 to CMOS[0x55] right before `stac`. If [0x55] = 0x30 (SMEP
+# 0x10 | SMAP 0x20), the enable held all the way here. If 0x00, see kcp above
+# to disambiguate "dump never reached" vs "CR4 actually cleared".
 asm {
     0xB0; 0x55;                # mov al, 0x55  — select CMOS register 0x55
     0xE6; 0x70;                # out 0x70, al
