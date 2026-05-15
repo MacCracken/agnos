@@ -12,7 +12,10 @@ entry = "kernel/agnos.cyr"
 output = "build/agnos"
 
 # AGNOS is a freestanding kernel binary. It vendors a syscall-free kernel
-# stdlib in kernel/lib/ (kstring, kfmt) and links nothing from the host
-# Cyrius stdlib. No external Cyrius deps — `cyrius deps` is a no-op here.
+# stdlib in kernel/klib/ (kstring, kfmt, ktagged) and links nothing from
+# the host Cyrius stdlib. No external Cyrius deps — `cyrius deps` is a
+# no-op here. (Dir is klib/ not lib/ — cyrius wrapper treats ./lib/ at
+# compile cwd as the stdlib-snapshot location; a distinct name eliminates
+# the shadow warning and any stomp risk from a future `cyrius deps` run.)
 [deps]
 stdlib = []

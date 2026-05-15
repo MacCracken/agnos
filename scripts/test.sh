@@ -7,8 +7,9 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # cc5_aarch64 existence is the gate for aarch64 cross-compile; cyrius
 # wrapper invokes it internally — we never call cc5/cc5_aarch64 directly.
 CC_ARM="$CYRIUS_HOME/bin/cc5_aarch64"
-# kernel/lib/ vendored shadow is intentional (see build.sh).
-export CYRIUS_NO_WARN_SHADOW_LIB=1
+# Kernel-stdlib is at kernel/klib/ (renamed from kernel/lib/ to dodge the
+# cyrius wrapper's ./lib/ shadow contract). No CYRIUS_NO_WARN_SHADOW_LIB
+# needed — the wrapper sees no ./lib/ at compile cwd.
 pass=0
 fail=0
 

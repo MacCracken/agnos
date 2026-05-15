@@ -23,7 +23,7 @@ sh scripts/test.sh --all
 
 ## Architecture
 
-Multi-arch kernel: `kernel/lib/` (2 files), `kernel/arch/x86_64/` (14 files), `kernel/arch/aarch64/` (9 files), `kernel/core/` (18 files), `kernel/user/` (4 files), plus `kernel/agnos.cyr` orchestrator + `kernel/kernel_hello.cyr` smoke test.
+Multi-arch kernel: `kernel/klib/` (3 files, freestanding syscall-free stdlib), `kernel/arch/x86_64/` (15 files), `kernel/arch/aarch64/` (9 files), `kernel/core/` (18 files), `kernel/user/` (4 files), plus `kernel/agnos.cyr` orchestrator + `kernel/kernel_hello.cyr` smoke test.
 
 The build script wraps `cyrius build` with a `#define ARCH_X86_64` /
 `#define ARCH_AARCH64` prepend, since `cyrius build -D NAME` doesn't

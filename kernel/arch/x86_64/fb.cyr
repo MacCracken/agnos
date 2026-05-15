@@ -1,0 +1,64 @@
+# === Framebuffer checkpoint mirror (Phase 1) ===
+#
+# Companion to the existing CMOS checkpoint scheme in main.cyr +
+# boot_shim.cyr. CMOS captures progress across reset (decoded post-mortem
+# by agnosticos/scripts/read-boot-log.sh); cp_fb() paints a colored cell
+# on the UEFI framebuffer at the matching index so iron-boot progress is
+# visible AT BOOT TIME without reboot+mount.
+#
+# Why color-coded cells, not text:
+#   - Phase 1 surface: ~30 lines, no font, no glyph walker — bug-surface
+#     dwarfed by a font + cursor implementation.
+#   - Existing boot_shim canary (256-pixel white stripe at y=0) already
+#     proves that fb_phys + 32-bpp pixel writes work on iron. cp_fb()
+#     extends that proven pattern to a 16×N cell grid.
+#   - At-a-glance diagnostic: stop-point color tells you which layer
+#     stalled (white=boot_shim, yellow=arch, green=subsys, cyan=sched,
+#     magenta=post-sched). Pairs with CMOS read for exact CP index.
+#
+# Layout:
+#   Row 0 (y=0..7)    — boot_shim canary stripe (256 white pixels)
+#   Row 1+ (y=8,16…)  — cp_fb cell grid. 16 cells per row, 8px stride,
+#                       4×4 painted area per cell.
+#   Cell (col, row)   — col = idx & 0xF, row = (idx >> 4) + 1
+#
+# Color palette (callers pick per layer):
+#   WHITE   0x00FFFFFF — boot_shim (already painted by canary)
+#   YELLOW  0x00FFFF00 — early arch (GDT/TSS/IDT)
+#   GREEN   0x0000FF00 — subsystem init (APIC, paging, PMM, heap, …)
+#   CYAN    0x0000FFFF — scheduler arming (closed-beta gate)
+#   MAGENTA 0x00FF00FF — post-scheduler / userland
+#   Note: gnoboot assumes 32-bpp BGRX layout (UEFI GOP default on Zen).
+#   On a swapped-format machine, colors will swap but stop-point geometry
+#   stays correct.
+#
+# Failure modes & guards:
+#   - boot_info_ptr not yet captured  → load64 returns 0 → early return
+#   - fb_phys = 0 (no GOP found)      → early return
+#   - y past framebuffer height       → off-screen guard, early return
+#
+# This file MUST come after boot_data.cyr (declares boot_info_ptr) and
+# before boot_shim.cyr / core/main.cyr (which will call cp_fb).
+# Ordering enforced by include order in kernel/agnos.cyr.
+#
+# Phase 2 (deferred): 8×8 bitmap font + fb_print() mirroring serial_println.
+
+fn cp_fb(idx, color) {
+    var bi = load64(&boot_info_ptr);
+    if (bi == 0) { return 0; }
+    var fb = load64(bi + 0x48);
+    if (fb == 0) { return 0; }
+    var pitch  = load32(bi + 0x50);
+    var height = load32(bi + 0x58);
+    var col = idx & 0xF;
+    var row = (idx >> 4) + 1;
+    var y = row * 8;
+    if (y + 4 > height) { return 0; }
+    var x = col * 8;
+    for (var dy = 0; dy < 4; dy = dy + 1) {
+        for (var dx = 0; dx < 4; dx = dx + 1) {
+            store32(fb + (y + dy) * pitch + (x + dx) * 4, color);
+        }
+    }
+    return 0;
+}

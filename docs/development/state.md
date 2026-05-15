@@ -205,7 +205,7 @@ Size trajectory across the 1.28.x arc:
 | `kernel/` (total) | **49** `.cyr` | 6,306 lines across all kernel sources |
 | `kernel/agnos.cyr` | 1 | Main orchestrator — only `#ifdef` + `include` |
 | `kernel/kernel_hello.cyr` | 1 | Minimal smoke test |
-| `kernel/lib/` | 2 | `kstring.cyr`, `kfmt.cyr` — vendored kernel-safe stdlib |
+| `kernel/klib/` | 3 | `kstring.cyr`, `kfmt.cyr`, `ktagged.cyr` — vendored kernel-safe stdlib (renamed from `kernel/lib/` to dodge cyrius wrapper's `./lib/` shadow contract) |
 | `kernel/arch/x86_64/` | 14 | boot_shim, boot_data, serial, gdt, idt, pic, apic, smp, keyboard, paging, io, syscall_hw, ring3, iommu |
 | `kernel/arch/aarch64/` | 9 | boot_data, serial, gic, timer, exceptions, keyboard, paging, stubs, main |
 | `kernel/core/` | 18 | pmm, vmm, heap, proc, sched, syscall, vfs, devs, initrd, kprint, main, net, virtio_net, virtio_blk, fatfs, pci, acpi, elf |

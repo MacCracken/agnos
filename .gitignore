@@ -1,6 +1,11 @@
 # Build output
 /build/
 
+# cyrius deps target (kernel has [deps] stdlib=[] — wrapper may still
+# create an empty ./lib/ on `cyrius deps`. Root-anchored; the kernel's
+# freestanding stdlib lives at kernel/klib/, not kernel/lib/.)
+/lib/
+
 # IDE
 .idea/
 .vscode/

@@ -1,6 +1,6 @@
 # === VFS ===
 #
-# Per-entry layout (32 bytes, addressed via `kernel/lib/ktagged.cyr`):
+# Per-entry layout (32 bytes, addressed via `kernel/klib/ktagged.cyr`):
 #   +0   tag         — VFS_FREE / DEVICE / MEMFILE / SIGNALFD / EPOLL /
 #                       TIMERFD / PIPE (see enum below)
 #   +8   payload[0]  — interpretation depends on tag:
@@ -14,7 +14,7 @@
 #
 # v1.28.2: explicit enum tags + ktagged accessors replace the magic-
 # number `ftype == N` switches and bare-offset `load64(base + N*8)`
-# arithmetic. First consumer of kernel/lib/ktagged.cyr. Active item
+# arithmetic. First consumer of kernel/klib/ktagged.cyr. Active item
 # #2 closed.
 
 enum VfsType {

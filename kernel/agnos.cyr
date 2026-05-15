@@ -7,6 +7,7 @@ kernel;
 #ifdef ARCH_X86_64
 include "arch/x86_64/boot_data.cyr"
 include "arch/x86_64/mbi.cyr"
+include "arch/x86_64/fb.cyr"
 include "arch/x86_64/serial.cyr"
 include "arch/x86_64/gdt.cyr"
 include "arch/x86_64/idt.cyr"
@@ -31,10 +32,14 @@ include "arch/aarch64/paging.cyr"
 include "arch/aarch64/stubs.cyr"
 #endif
 
-# Kernel stdlib (vendored, syscall-free)
-include "lib/kstring.cyr"
-include "lib/kfmt.cyr"
-include "lib/ktagged.cyr"
+# Kernel stdlib (vendored, syscall-free).
+# Dir name is klib/ (not lib/) — cyrius wrapper reserves ./lib/ at compile
+# cwd for stdlib-snapshot resolution; using a distinct name avoids the
+# shadow-warn + stomp risk if `cyrius deps` ever runs with non-empty
+# [deps] stdlib. See cyrius.cyml.
+include "klib/kstring.cyr"
+include "klib/kfmt.cyr"
+include "klib/ktagged.cyr"
 
 # Architecture-independent core
 include "core/pmm.cyr"
