@@ -28,71 +28,103 @@ fn sched_next() {
 }
 
 # Save current process register state from ISR stack frame.
-# Called after ISR pushes: rax rcx rdx rsi rdi r8 r9 r10 r11
-# Plus hardware-pushed: RIP CS RFLAGS RSP SS (on interrupt frame)
+# Called after ISR pushes (Attempt-15 Repair C): 9 caller-saved + 6 callee-saved.
+# Plus hardware-pushed: RIP CS RFLAGS RSP SS (on interrupt frame).
 # We save these into the process table for later restoration.
 fn proc_save_context(pid, isr_rsp) {
     if (pid >= proc_count) { return 0; }
     var p = &proc_table + pid * 176;
-    # ISR stack layout (top to bottom, growing down):
-    # [isr_rsp+0]  = rax (pushed last by our ISR)
-    # [isr_rsp+8]  = rcx
-    # [isr_rsp+16] = rdx
-    # [isr_rsp+24] = rsi
-    # [isr_rsp+32] = rdi
-    # [isr_rsp+40] = r8
-    # [isr_rsp+48] = r9
+    # ISR stack layout post-Repair-C (top to bottom, growing down):
+    # Callee-saved (pushed LAST, lowest addresses):
+    # [isr_rsp+0]  = r15
+    # [isr_rsp+8]  = r14
+    # [isr_rsp+16] = r13
+    # [isr_rsp+24] = r12
+    # [isr_rsp+32] = rbp
+    # [isr_rsp+40] = rbx
+    # Caller-saved (pushed FIRST, higher addresses — labels offset by the
+    # pre-existing reversed-pushes pattern; values round-trip correctly):
+    # [isr_rsp+48] = r11 (pushed last of the 9)
     # [isr_rsp+56] = r10
-    # [isr_rsp+64] = r11
-    # [isr_rsp+72] = RIP   (hardware pushed)
-    # [isr_rsp+80] = CS
-    # [isr_rsp+88] = RFLAGS
-    # [isr_rsp+96] = RSP   (hardware pushed — interrupted code's RSP)
-    # [isr_rsp+104]= SS
+    # [isr_rsp+64] = r9
+    # [isr_rsp+72] = r8
+    # [isr_rsp+80] = rdi
+    # [isr_rsp+88] = rsi
+    # [isr_rsp+96] = rdx
+    # [isr_rsp+104]= rcx
+    # [isr_rsp+112]= rax (pushed first, just below hw frame)
+    # Hardware-pushed:
+    # [isr_rsp+120]= RIP
+    # [isr_rsp+128]= CS
+    # [isr_rsp+136]= RFLAGS
+    # [isr_rsp+144]= RSP   (interrupted code's RSP)
+    # [isr_rsp+152]= SS
     # NOTE: kept on raw load64/store64 — accessor-based port at v1.28.3
     # broke boot under cc5 5.10.44 regalloc (Process_set_* fn calls
     # in this hot path perturbed register allocation in a way that
     # broke the cr3_load downstream). Restoring raw offsets keeps
     # the context-switch path byte-identical to pre-1.28.3.
-    store64(p + 32, load64(isr_rsp));       # rax
-    store64(p + 48, load64(isr_rsp + 8));   # rcx
-    store64(p + 56, load64(isr_rsp + 16));  # rdx
-    store64(p + 64, load64(isr_rsp + 24));  # rsi
-    store64(p + 72, load64(isr_rsp + 32));  # rdi
-    store64(p + 88, load64(isr_rsp + 40));  # r8
-    store64(p + 96, load64(isr_rsp + 48));  # r9
-    store64(p + 104, load64(isr_rsp + 56)); # r10
-    store64(p + 112, load64(isr_rsp + 64)); # r11
-    store64(p + 24, load64(isr_rsp + 72));  # rip
-    store64(p + 152, load64(isr_rsp + 88)); # rflags
-    store64(p + 16, load64(isr_rsp + 96));  # rsp
+    # Caller-saved slot offsets retained verbatim from pre-Repair-C — the
+    # "rax slot at p+32 receives [isr_rsp+48]" mapping is the same
+    # reversed-label pattern that existed before, just shifted by +48 to
+    # accommodate the new callee-saved pushes. Values round-trip correctly
+    # because proc_restore_context uses the inverse mapping.
+    store64(p + 32, load64(isr_rsp + 48));   # rax slot
+    store64(p + 48, load64(isr_rsp + 56));   # rcx slot
+    store64(p + 56, load64(isr_rsp + 64));   # rdx slot
+    store64(p + 64, load64(isr_rsp + 72));   # rsi slot
+    store64(p + 72, load64(isr_rsp + 80));   # rdi slot
+    store64(p + 88, load64(isr_rsp + 88));   # r8 slot
+    store64(p + 96, load64(isr_rsp + 96));   # r9 slot
+    store64(p + 104, load64(isr_rsp + 104)); # r10 slot
+    store64(p + 112, load64(isr_rsp + 112)); # r11 slot
+    # Callee-saved — clean labels (no reversed-label legacy here).
+    store64(p + 40, load64(isr_rsp + 40));   # rbx
+    store64(p + 80, load64(isr_rsp + 32));   # rbp
+    store64(p + 120, load64(isr_rsp + 24));  # r12
+    store64(p + 128, load64(isr_rsp + 16));  # r13
+    store64(p + 136, load64(isr_rsp + 8));   # r14
+    store64(p + 144, load64(isr_rsp));       # r15
+    # Hardware frame
+    store64(p + 24, load64(isr_rsp + 120));  # rip
+    store64(p + 152, load64(isr_rsp + 136)); # rflags
+    store64(p + 16, load64(isr_rsp + 144));  # rsp
     return 0;
 }
 
 # Load a process's register state onto the ISR stack frame.
 # When iretq executes, it will restore RIP/CS/RFLAGS/RSP/SS from the stack,
-# and our ISR pops will restore the GPRs.
+# and our ISR pops (callee-saved first, then caller-saved) will restore
+# the 15 GPRs.
 fn proc_restore_context(pid, isr_rsp) {
     if (pid >= proc_count) { return 0; }
     var p = &proc_table + pid * 176;
     # NOTE: kept on raw load64/store64 — see proc_save_context above
     # for the rationale (v1.28.3 accessor port broke regalloc here).
-    store64(isr_rsp, load64(p + 32));       # rax
-    store64(isr_rsp + 8, load64(p + 48));   # rcx
-    store64(isr_rsp + 16, load64(p + 56));  # rdx
-    store64(isr_rsp + 24, load64(p + 64));  # rsi
-    store64(isr_rsp + 32, load64(p + 72));  # rdi
-    store64(isr_rsp + 40, load64(p + 88));  # r8
-    store64(isr_rsp + 48, load64(p + 96));  # r9
-    store64(isr_rsp + 56, load64(p + 104)); # r10
-    store64(isr_rsp + 64, load64(p + 112)); # r11
-    store64(isr_rsp + 72, load64(p + 24));  # rip
+    store64(isr_rsp + 48, load64(p + 32));    # rax slot
+    store64(isr_rsp + 56, load64(p + 48));    # rcx slot
+    store64(isr_rsp + 64, load64(p + 56));    # rdx slot
+    store64(isr_rsp + 72, load64(p + 64));    # rsi slot
+    store64(isr_rsp + 80, load64(p + 72));    # rdi slot
+    store64(isr_rsp + 88, load64(p + 88));    # r8 slot
+    store64(isr_rsp + 96, load64(p + 96));    # r9 slot
+    store64(isr_rsp + 104, load64(p + 104));  # r10 slot
+    store64(isr_rsp + 112, load64(p + 112));  # r11 slot
+    # Callee-saved
+    store64(isr_rsp + 40, load64(p + 40));    # rbx
+    store64(isr_rsp + 32, load64(p + 80));    # rbp
+    store64(isr_rsp + 24, load64(p + 120));   # r12
+    store64(isr_rsp + 16, load64(p + 128));   # r13
+    store64(isr_rsp + 8, load64(p + 136));    # r14
+    store64(isr_rsp, load64(p + 144));        # r15
+    # Hardware frame
+    store64(isr_rsp + 120, load64(p + 24));   # rip
     # CS = 0x08 (kernel code segment)
-    store64(isr_rsp + 80, 0x08);
-    store64(isr_rsp + 88, load64(p + 152)); # rflags
-    store64(isr_rsp + 96, load64(p + 16));  # rsp
+    store64(isr_rsp + 128, 0x08);
+    store64(isr_rsp + 136, load64(p + 152));  # rflags
+    store64(isr_rsp + 144, load64(p + 16));   # rsp
     # SS = 0x10 (kernel data segment)
-    store64(isr_rsp + 104, 0x10);
+    store64(isr_rsp + 152, 0x10);
     return 0;
 }
 

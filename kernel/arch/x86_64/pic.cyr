@@ -45,16 +45,18 @@ fn timer_handler(rsp_after_push) {
 
 fn timer_isr_build() {
     # Build timer ISR in data buffer.
-    # Strategy: push all caller-saved regs, also push rbx/rbp/r12-r15 (callee-saved)
-    # so we have full state. Then call timer_handler(rsp) which may modify
-    # the stack frame for context switching. Then pop everything and iretq.
+    # Strategy: push ALL 15 general-purpose regs (9 caller-saved + 6 callee-saved)
+    # so the full proc state is captured by proc_save_context. Pre-Attempt-15
+    # this ISR only pushed the 9 caller-saved regs despite a stale comment
+    # claiming otherwise; the missing callee-saved push leaked rbx/rbp/r12-r15
+    # between procs, corrupting frame-pointer-relative locals (idle_count etc.)
+    # when the kernel idle proc was finally re-selected. See iron-boot Attempt
+    # 15 § Repair (C) — sub-case 2 territory.
     var p = &timer_isr;
     var handler_addr = &timer_handler;
     var off = 0;
 
-    # Save ALL general-purpose registers (not just caller-saved)
-    # Order: rax rcx rdx rsi rdi r8 r9 r10 r11 (9 regs = caller-saved)
-    # We save these so the ISR stack frame matches what proc_save/restore expect
+    # Caller-saved: rax rcx rdx rsi rdi r8 r9 r10 r11
     store8(p + off, 0x50); off = off + 1;  # push rax
     store8(p + off, 0x51); off = off + 1;  # push rcx
     store8(p + off, 0x52); off = off + 1;  # push rdx
@@ -64,6 +66,18 @@ fn timer_isr_build() {
     store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;  # push r9
     store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;  # push r10
     store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;  # push r11
+
+    # Callee-saved: rbx rbp r12 r13 r14 r15 (Attempt-15 Repair C addition).
+    # After these pushes, [rsp+0..47] = {r15,r14,r13,r12,rbp,rbx} and
+    # [rsp+48..119] = {r11,r10,r9,r8,rdi,rsi,rdx,rcx,rax}; hw frame moves
+    # from [rsp+72..104] to [rsp+120..152]. proc_save/restore_context are
+    # updated to read/write these new offsets.
+    store8(p + off, 0x53); off = off + 1;  # push rbx
+    store8(p + off, 0x55); off = off + 1;  # push rbp
+    store8(p + off, 0x41); store8(p + off + 1, 0x54); off = off + 2;  # push r12
+    store8(p + off, 0x41); store8(p + off + 1, 0x55); off = off + 2;  # push r13
+    store8(p + off, 0x41); store8(p + off + 1, 0x56); off = off + 2;  # push r14
+    store8(p + off, 0x41); store8(p + off + 1, 0x57); off = off + 2;  # push r15
 
     # rdi = rsp (pass stack pointer as first arg to timer_handler)
     # mov rdi, rsp (48 89 E7)
@@ -76,7 +90,15 @@ fn timer_isr_build() {
     # call rax (FF D0)
     store8(p + off, 0xFF); store8(p + off + 1, 0xD0); off = off + 2;
 
-    # Restore r11-r8, rdi, rsi, rdx, rcx, rax (reverse order)
+    # Pop callee-saved first (reverse of push): r15 r14 r13 r12 rbp rbx
+    store8(p + off, 0x41); store8(p + off + 1, 0x5F); off = off + 2;  # pop r15
+    store8(p + off, 0x41); store8(p + off + 1, 0x5E); off = off + 2;  # pop r14
+    store8(p + off, 0x41); store8(p + off + 1, 0x5D); off = off + 2;  # pop r13
+    store8(p + off, 0x41); store8(p + off + 1, 0x5C); off = off + 2;  # pop r12
+    store8(p + off, 0x5D); off = off + 1;  # pop rbp
+    store8(p + off, 0x5B); off = off + 1;  # pop rbx
+
+    # Pop caller-saved: r11 r10 r9 r8 rdi rsi rdx rcx rax (reverse of push)
     store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;  # pop r11
     store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;  # pop r10
     store8(p + off, 0x41); store8(p + off + 1, 0x59); off = off + 2;  # pop r9
