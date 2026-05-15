@@ -637,10 +637,18 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x69; 0xE6; 0x71; }
 # restore survived. Attempt 25 confirmed post-CP-0x19 stall in serial-print /
 # branch logic at lines 640-660 (Repair (M) bisector below narrows the window).
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x19; 0xE6; 0x71; }
+# Repair (N) auxiliary snapshot (Attempt 26+): fb_phys bytes 2+3 → CMOS[0x69]/[0x6A].
+# Captures the FB BAR as the kernel sees it on THIS boot — differs across attempts
+# iff BIOS-save-exit re-enumerates PCIe and the GOP framebuffer landed at a new
+# physical address. Combined with the in-cp_fb bisector (fb.cyr kcp=0xE5..0xEA),
+# pins whether a kcp=0xE8 stall is "FB write to wrong address" (BAR shift) vs
+# "FB write to right address but unsafe cacheability" (MTRR/PAT).
+var _bar_snap = cmos_stamp_fb_phys();
 cp_fb(0x19, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post all 3 CR3 switches + restore
 # Repair (M) bisector stamp 1/4 → kcp=0xE1: cp_fb(0x19) returned without fault.
-# If kcp stays 0x19 across Attempt 26 burns, cp_fb is the killer (TLB / FB MMIO
-# cacheability post-CR3-restore) and Repair (N) drops stamps inside cp_fb itself.
+# Attempt 25 left kcp pegged at 0x19 racily — cp_fb itself didn't return. Repair (N)
+# in-cp_fb bisector (fb.cyr) now lights kcp 0xE5..0xEA inside cp_fb; check those
+# verdicts in read-boot-log BEFORE reading this stamp.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE1; 0xE6; 0x71; }
 
 serial_print("AS1 wrote 0xAAAA, read=", 23);

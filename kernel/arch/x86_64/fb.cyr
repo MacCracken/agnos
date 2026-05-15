@@ -44,10 +44,24 @@
 # Phase 2 (deferred): 8×8 bitmap font + fb_print() mirroring serial_println.
 
 fn cp_fb(idx, color) {
+    # Repair (N) in-cp_fb bisector (Attempt 26+). Six kcp stamps pin which step
+    # inside cp_fb faulted when the Repair (M) outer bisector (kcp 0xE1..0xE4)
+    # left kcp pegged at 0x19 — i.e. cp_fb itself didn't return. Death window
+    # is one function: this one. Stamps use only port I/O (no memory access),
+    # so they fire even if FB MMIO or boot_info access faults.
+    #   kcp=0xE5  function entered (before any load)
+    #   kcp=0xE6  boot_info_ptr loaded, non-zero
+    #   kcp=0xE7  fb_phys loaded, non-zero (bi+0x48 read OK)
+    #   kcp=0xE8  geometry computed, about to do first FB MMIO write
+    #   kcp=0xE9  first store32 to FB MMIO returned (smoking-gun stamp)
+    #   kcp=0xEA  all 16 FB MMIO writes returned (cp_fb about to return)
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE5; 0xE6; 0x71; }
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE6; 0xE6; 0x71; }
     var fb = load64(bi + 0x48);
     if (fb == 0) { return 0; }
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE7; 0xE6; 0x71; }
     var pitch  = load32(bi + 0x50);
     var height = load32(bi + 0x58);
     var col = idx & 0xF;
@@ -55,10 +69,18 @@ fn cp_fb(idx, color) {
     var y = row * 8;
     if (y + 4 > height) { return 0; }
     var x = col * 8;
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE8; 0xE6; 0x71; }
+    # Smoking-gun first FB MMIO write — hoisted out of the loop so the next
+    # stamp distinguishes "first FB write faulted" from "first write OK but
+    # later one faulted". The subsequent loop redundantly overwrites pixel
+    # (0,0); visually harmless, simpler than splitting the loop iteration.
+    store32(fb + y * pitch + x * 4, color);
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE9; 0xE6; 0x71; }
     for (var dy = 0; dy < 4; dy = dy + 1) {
         for (var dx = 0; dx < 4; dx = dx + 1) {
             store32(fb + (y + dy) * pitch + (x + dx) * 4, color);
         }
     }
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xEA; 0xE6; 0x71; }
     return 0;
 }
