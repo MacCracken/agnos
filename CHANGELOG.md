@@ -7,6 +7,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Repair (P) — explicit `FB_CONSOLE_Y0` / `FB_FG` / `FB_BG` re-assign
+  at top of `fb_console_init()`** (`kernel/arch/x86_64/fb_console.cyr`).
+  Attempt 29 burn showed kernel reaching kybernet-launch (CMOS
+  `kcp=0x15` MAGENTA, no fault) but on-screen cp_fb cells at rows 1–2
+  (idx 0x06..0x10, y=8..19) were wiped while row-9 yellows
+  (idx 0x80/0x81/0x82) survived, and no `agnos> ` prompt was visible.
+  Pattern decodes to a single bug at three module-scope coordinates:
+  `var FB_CONSOLE_Y0 = 80;`, `var FB_FG = 0x00FFFFFF;`, and
+  `var FB_BG = 0x00000000;` (at `fb_console.cyr:187-189`) were each
+  reading back as `0` at runtime — `fb_putc` painted text at y=0..55
+  (over the cp_fb cells) in black-on-black (invisible). Zero-init vars
+  in the same file (`fb_cur_x`, `fb_cur_y`, `fb_console_ready`) were
+  unaffected because BSS defaults to zero. Workaround: explicit
+  assignment of all three at the top of `fb_console_init()` body
+  before any other code (3 LOC + 11-line explanatory comment).
+  Surfaced as a cyrius gvar-init bug in
+  `docs/development/issue/2026-05-15-cyrius-nonzero-gvar-init-not-honored.md`;
+  filing into `cyrius/docs/development/issues/` is gated on Attempt 29
+  visual confirmation. Kernel 253,768 → 266,712 B (size delta dominated
+  by DCE/link state, not the 3-line repair).
+
+- **Repair (O) — mem-iso test block deletion** (`kernel/core/main.cyr`).
+  Attempts 17–27 (11 iron burns, repair letters F–N) chased a fault
+  inside a memory-isolation test block that re-reading
+  `agnosticos/docs/development/uefi-boot-prior-art.md` confirmed was
+  post-MVP work breaking pre-MVP boot. Deleted 303 lines (including
+  Repair-M/N bisector stamps + `cmos_stamp_fb_phys()` helper writers).
+  Result on Attempt 28: kernel completed its full init spine end-to-end
+  on archaemenid (GDT/TSS/IDT → APIC/timer → paging → PMM → heap →
+  ACPI/PCI → VFS → initrd → SYSCALL → scheduler arming → idle survival
+  → userland exec → kybernet-launch) — four checkpoints past the
+  closed-beta gate (cp_fb 0x12 / 0x14 / 0x15 all painted MAGENTA, then
+  `arch_halt()` as designed). Kernel 255,048 → 253,496 B (-1,552;
+  comments dominate the line-count, hence smaller-than-line-count
+  binary shrink). One-line follow-up landed same-session:
+  `main.cyr:415` `sh_cmd_bench()` → `kybernet()` (shell dispatch tree
+  now reachable — kernel 253,496 → 253,768 B, +272).
+
 - **Repair (K) — PML4 health stamps for Attempt 24** (`kernel/core/main.cyr`
   mem-iso block). Attempt 23 confirmed the PMM-handed-out-kernel-PT
   hypothesis is wrong (all 12 Repair (J) stamps at CMOS [0x56..0x61]

@@ -5,71 +5,60 @@
 # any subsystem is up.
 fb_console_init();
 
-serial_println("AGNOS kernel v1.30.0", 20);
-serial_println("64-bit long mode", 16);
+kprintln("AGNOS kernel v1.30.0", 20);
+kprintln("64-bit long mode", 16);
 
-# Bisector 0x80: about to call gdt_init. If we see 5 but not 0x80,
-# the fault is in one of the two serial_println calls above.
-asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x80; 0xE6; 0x71; }
-cp_fb(0x80, 0x00FFFF00);  # YELLOW — early arch
+# Per-stage CMOS stamps survive hangs and are decoded by
+# agnosticos/scripts/read-boot-log.sh. Slot map: 0x50 = kernel CP,
+# 0x51 = kernel magic, 0x52/0x53 = gnoboot. cp_fb() visual cells were
+# stripped Attempt-29-post: shell-on-iron made the per-stage colored
+# grid noise — kprint mirrors everything to the fb console already.
+# cp_fb() the function remains in fb.cyr; re-add a call here if a new
+# stage needs visual bisection.
 
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x80; 0xE6; 0x71; }   # CP 0x80: pre-gdt
 gdt_init();
-serial_println("GDT loaded", 10);
+kprintln("GDT loaded", 10);
 
-# Bisector 0x81: gdt_init returned, about to call tss_init.
-asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x81; 0xE6; 0x71; }
-cp_fb(0x81, 0x00FFFF00);  # YELLOW — early arch
-
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x81; 0xE6; 0x71; }   # CP 0x81: pre-tss
 tss_init();
-serial_println("TSS loaded (ring 3 ready)", 25);
+kprintln("TSS loaded (ring 3 ready)", 25);
 
-# Bisector 0x82: tss_init returned, about to call idt_init.
-asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x82; 0xE6; 0x71; }
-cp_fb(0x82, 0x00FFFF00);  # YELLOW — early arch
-
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x82; 0xE6; 0x71; }   # CP 0x82: pre-idt
 idt_init();
-serial_println("IDT loaded", 10);
+kprintln("IDT loaded", 10);
 
 # === CMOS kernel checkpoint 6 (arch interrupts ready: GDT+TSS+IDT) ===
-# Pairs with boot_shim CPs 1-5 (early entry) and gnoboot CPs 1-5 (pre-jmp,
-# CMOS[0x52]/[0x53]). Decoded by agnosticos/scripts/read-boot-log.sh.
-# Slot map: 0x50 = kernel CP, 0x51 = kernel magic, 0x52/0x53 = gnoboot.
-# (Pre-2026-05-14 builds used 0x40-0x43; BIOS on archaemenid was
-# observed writing 0x42/0x43/0x44 every cold boot, so the whole 4-byte
-# scheme shifted +0x10 into the virgin 0x50-0x7F CMOS region.)
-# 8 bytes, clobbers AL only.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x06; 0xE6; 0x71; }
-cp_fb(0x06, 0x00FFFF00);  # YELLOW — GDT+TSS+IDT loaded
 
 pic_init();
-serial_println("PIC remapped", 12);
+kprintln("PIC remapped", 12);
 
 timer_ticks = 0;
 timer_isr_build();
 idt_set_gate(&idt + 32 * 16, &timer_isr, 0x08, 0x8E);
-serial_println("Timer ISR installed", 19);
+kprintln("Timer ISR installed", 19);
 
 # Initialize Local APIC (keeps PIC for keyboard IRQ1)
 apic_init();
 # Start APIC timer on vector 32 (same as PIT), ~100Hz
 # QEMU bus freq varies; 10000000 gives roughly 100Hz
 apic_timer_init(32, 10000000);
-serial_print("APIC: id=", 9);
+kprint("APIC: id=", 9);
 kprint_num(cpu_id);
-serial_println(" timer active", 13);
+kprintln(" timer active", 13);
 
 # === CMOS kernel checkpoint 7 (APIC + timer live) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x07; 0xE6; 0x71; }
-cp_fb(0x07, 0x0000FF00);  # GREEN — APIC + timer live
 
 # Start Application Processors
 cpu_count = 1;
 ap_ready = 0;
 smp_lock = 0;
 smp_start_aps();
-serial_print("SMP: ", 5);
+kprint("SMP: ", 5);
 kprint_num(cpu_count);
-serial_println(" CPUs online", 12);
+kprintln(" CPUs online", 12);
 
 kb_head = 0;
 kb_tail = 0;
@@ -79,148 +68,142 @@ kb_ctrl = 0;
 kb_init_tables();
 kb_isr_build();
 idt_set_gate(&idt + 33 * 16, &kb_isr, 0x08, 0x8E);
-serial_println("Keyboard ISR installed (full US QWERTY)", 39);
+kprintln("Keyboard ISR installed (full US QWERTY)", 39);
 
 pt_init();
-serial_print("Page tables: ", 13);
+kprint("Page tables: ", 13);
 kprint_num(pt_get_mapped_mb());
-serial_println("MB mapped", 9);
+kprintln("MB mapped", 9);
 
 # === CMOS kernel checkpoint 8 (page tables built — historical stall point) ===
 # Pre-RDRAND-fix (cyrius 5.11.x, missing -cpu max in QEMU smoke) this was
 # the visible stall. Iron may surface the same or different geometry —
 # CP 8 == reached, CP 8 not reached == pt_init internals faulted.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x08; 0xE6; 0x71; }
-cp_fb(0x08, 0x0000FF00);  # GREEN — page tables built
 
 pmm_init();
-serial_print("PMM: ", 5);
+kprint("PMM: ", 5);
 kprint_num(pmm_free_count());
-serial_print(" free / ", 8);
+kprint(" free / ", 8);
 kprint_num(pmm_total);
-serial_println(" pages", 6);
+kprintln(" pages", 6);
 
 # === CMOS kernel checkpoint 9 (physical memory manager up) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x09; 0xE6; 0x71; }
-cp_fb(0x09, 0x0000FF00);  # GREEN — PMM up
 
 # KASLR probe — emits the randomized next-free hint so two consecutive
 # boots can be diffed for "did randomization actually fire". Asserted
 # by .github/workflows/ci.yml's boot-test job (two-boot-diff check).
 # v1.28.0.
-serial_print("KASLR: pmm_next_free=", 21);
+kprint("KASLR: pmm_next_free=", 21);
 kprint_num(pmm_next_free);
-serial_println("", 0);
+kprintln("", 0);
 
 var pg1 = pmm_alloc();
 pmm_free(pg1);
-serial_print("PMM test: ", 10);
+kprint("PMM test: ", 10);
 kprint_num(pmm_free_count());
-serial_println(" free", 5);
+kprintln(" free", 5);
 
 vmm_alloc_at(0x1000000);
 store64(0x1000000, 0xDEAD);
-serial_print("VMM: ", 5);
+kprint("VMM: ", 5);
 kprint_num(load64(0x1000000));
-serial_println(" (expect 57005)", 15);
+kprintln(" (expect 57005)", 15);
 
 # Initialize kernel heap
 heap_init();
-serial_println("Heap initialized", 16);
+kprintln("Heap initialized", 16);
 
 # === CMOS kernel checkpoint 10 (heap up — kmalloc usable) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0A; 0xE6; 0x71; }
-cp_fb(0x0A, 0x0000FF00);  # GREEN — heap up
 
 dev_init();
-serial_println("Devices registered", 18);
+kprintln("Devices registered", 18);
 # Parse ACPI tables (RSDP, RSDT, DMAR) for hardware discovery
 acpi_init();
 if (acpi_rsdp_addr != 0) {
-    serial_print("ACPI: RSDP at ", 14);
+    kprint("ACPI: RSDP at ", 14);
     kprint_num(acpi_rsdp_addr);
-    serial_println("", 0);
+    kprintln("", 0);
     if (acpi_dmar_addr != 0) {
-        serial_print("ACPI: DMAR at ", 14);
+        kprint("ACPI: DMAR at ", 14);
         kprint_num(acpi_dmar_addr);
-        serial_print(" IOMMU base=", 12);
+        kprint(" IOMMU base=", 12);
         kprint_num(acpi_iommu_base);
-        serial_println("", 0);
+        kprintln("", 0);
     }
 } else {
-    serial_println("ACPI: no RSDP found", 19);
+    kprintln("ACPI: no RSDP found", 19);
 }
 
 pci_scan();
-serial_print("PCI: ", 5);
+kprint("PCI: ", 5);
 kprint_num(pci_count);
-serial_println(" devices", 8);
+kprintln(" devices", 8);
 
 # === CMOS kernel checkpoint 11 (ACPI + PCI enumerated) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0B; 0xE6; 0x71; }
-cp_fb(0x0B, 0x0000FF00);  # GREEN — ACPI + PCI enumerated
 
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
 if (acpi_iommu_base != 0) {
     if (iommu_init() == 0) {
-        serial_println("IOMMU: VT-d enabled, DMA restricted", 36);
+        kprintln("IOMMU: VT-d enabled, DMA restricted", 36);
     } else {
-        serial_println("IOMMU: init failed", 18);
+        kprintln("IOMMU: init failed", 18);
     }
 }
 
 if (pci_find(0x1AF4, 0x1000) >= 0) {
     if (virtio_net_init() == 0) {
-        serial_print("VirtIO-net: MAC=", 16);
+        kprint("VirtIO-net: MAC=", 16);
         for (var mi = 0; mi < 6; mi = mi + 1) {
             kprint_num(load8(&vnet_mac + mi));
-            if (mi < 5) { serial_print(":", 1); }
+            if (mi < 5) { kprint(":", 1); }
         }
-        serial_println("", 0);
+        kprintln("", 0);
         net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
-        serial_println("Net: 10.0.2.15/24 gw 10.0.2.2", 30);
+        kprintln("Net: 10.0.2.15/24 gw 10.0.2.2", 30);
     }
 }
 if (pci_find(0x1AF4, 0x1001) >= 0) {
     if (virtio_blk_init() == 0) {
-        serial_print("VirtIO-blk: ", 12);
+        kprint("VirtIO-blk: ", 12);
         kprint_num(vblk_capacity);
-        serial_println(" sectors", 8);
+        kprintln(" sectors", 8);
         if (fatfs_init() == 0) {
-            serial_println("FAT16 filesystem mounted", 24);
+            kprintln("FAT16 filesystem mounted", 24);
         }
     }
 }
 vfs_init();
-serial_println("VFS initialized", 15);
+kprintln("VFS initialized", 15);
 
 # === CMOS kernel checkpoint 12 (VFS up) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0C; 0xE6; 0x71; }
-cp_fb(0x0C, 0x0000FF00);  # GREEN — VFS up
 
 var h1 = kmalloc(16);
 var h2 = kmalloc(100);
 var h3 = kmalloc(4096);
-serial_print("Heap: ", 6);
+kprint("Heap: ", 6);
 kprint_num(h1);
-serial_print(" ", 1);
+kprint(" ", 1);
 kprint_num(h2);
-serial_print(" ", 1);
+kprint(" ", 1);
 kprint_num(h3);
-serial_println("", 0);
+kprintln("", 0);
 kfree_sized(h2, 100);
 
 # Initialize SYSCALL/SYSRET
 syscall_init();
-serial_println("SYSCALL/SYSRET initialized", 26);
+kprintln("SYSCALL/SYSRET initialized", 26);
 
 # Initialize stack canary secret (S13)
 stack_canary_init();
-serial_println("Stack canary initialized", 24);
+kprintln("Stack canary initialized", 24);
 
 # === CMOS kernel checkpoint 13 (SYSCALL + stack canary) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0D; 0xE6; 0x71; }
-cp_fb(0x0D, 0x0000FF00);  # GREEN — SYSCALL + stack canary
 
 # Syscall test (direct call — still works)
 kernel_return_rsp = 0;
@@ -231,26 +214,26 @@ var p0 = proc_create(0x100000);
 proc_set_state(0, 2);  # kernel "process" is running
 
 var pid = ksyscall(2, 0, 0, 0);
-serial_print("Syscall getpid=", 15);
+kprint("Syscall getpid=", 15);
 kprint_num(pid);
-serial_println("", 0);
+kprintln("", 0);
 
 ksyscall(1, 0, "Syscall write works!\n", 21);
 
 ksyscall(0, 42, 0, 0);
-serial_print("Exit code: ", 11);
+kprint("Exit code: ", 11);
 kprint_num(sys_exit_code);
-serial_println("", 0);
+kprintln("", 0);
 
 # Hardware SYSCALL test (from kernel mode — same privilege, tests the plumbing)
-serial_print("HW syscall test: ", 17);
+kprint("HW syscall test: ", 17);
 test_hw_syscall();
 
 # === Context Switch Test ===
 # Create two test processes with dedicated stacks.
 # Process stacks at 0x800000 + pid * 0x10000, 64KB apart.
 # Stack grows down, so stack_top is base + size.
-serial_println("Creating test processes...", 25);
+kprintln("Creating test processes...", 25);
 
 proc_count = 0;
 proc_current = 0;
@@ -263,56 +246,52 @@ proc_set_state(0, 2);  # running
 var stack_a = 0x800000 + 1 * 0x10000;
 if (vmm_is_mapped(stack_a) == 0) { vmm_alloc_at(stack_a); }
 var pa = proc_create_full(&test_proc_a, stack_a + 0x4000);
-serial_print("Process A (pid=", 15);
+kprint("Process A (pid=", 15);
 kprint_num(pa);
-serial_println(") created", 9);
+kprintln(") created", 9);
 
 # Process 2: test_proc_b
 var stack_b = 0x800000 + 2 * 0x10000;
 if (vmm_is_mapped(stack_b) == 0) { vmm_alloc_at(stack_b); }
 var pb = proc_create_full(&test_proc_b, stack_b + 0x4000);
-serial_print("Process B (pid=", 15);
+kprint("Process B (pid=", 15);
 kprint_num(pb);
-serial_println(") created", 9);
+kprintln(") created", 9);
 
-serial_print("Processes: ", 11);
+kprint("Processes: ", 11);
 kprint_num(proc_count);
-serial_print(" total, ", 8);
+kprint(" total, ", 8);
 kprint_num(proc_count_by_state(1));
-serial_println(" ready", 6);
+kprintln(" ready", 6);
 
 # === CMOS kernel checkpoint 14 (test procs created) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0E; 0xE6; 0x71; }
-cp_fb(0x0E, 0x0000FFFF);  # CYAN — scheduler arming (test procs created)
 
 # Enable interrupts and activate scheduler
 asm { sti; }
-serial_println("Interrupts enabled", 18);
+kprintln("Interrupts enabled", 18);
 
 # === CMOS kernel checkpoint 15 (interrupts enabled — sti executed) ===
 # CP 15 reached but CP 16 not = scheduler activation faulted, or a flood
 # of interrupts post-sti is preventing forward progress.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0F; 0xE6; 0x71; }
-cp_fb(0x0F, 0x0000FFFF);  # CYAN — sti executed
 
 # Wait a few ticks before activating scheduler
 arch_wait();
 arch_wait();
-serial_print("Timer ticks before sched: ", 26);
+kprint("Timer ticks before sched: ", 26);
 kprint_num(timer_ticks);
-serial_println("", 0);
+kprintln("", 0);
 
-serial_println("Activating scheduler...", 23);
+kprintln("Activating scheduler...", 23);
 sched_active = 1;
 
 # === CMOS kernel checkpoint 16 (scheduler armed) ===
 # This is the AGNOS MVP closed-beta gate: reaching CP 16 means kernel
 # init succeeded end-to-end through scheduler activation. Subsequent
 # stall (no CP 17 ever emitted, no shell prompt) is a scheduler /
-# context-switch issue, not an init issue. See state.md § "Open:
-# timer-driven context switch broken".
+# context-switch issue, not an init issue. Held since Attempt 16.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
-cp_fb(0x10, 0x0000FFFF);  # CYAN — scheduler armed (CLOSED-BETA GATE)
 
 # Kernel idle loop: halts, wakes on timer, scheduler switches to A or B
 # After enough ticks, deactivate and report
@@ -322,17 +301,14 @@ while (idle_count < 50) {
     if (idle_count == 0) {
         # CMOS CP 0x12: first hlt returned — timer ISR + first context-switch round-trip OK
         asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
-        cp_fb(0x12, 0x0000FFFF);  # CYAN — first hlt round-trip
     }
     if (idle_count == 9) {
         # CMOS CP 0x13: 10 hlts done — matches QEMU's known-good count under gnoboot
         asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x13; 0xE6; 0x71; }
-        cp_fb(0x13, 0x0000FFFF);  # CYAN — 10 hlts done
     }
     if (idle_count == 24) {
         # CMOS CP 0x14: 25 hlts done — between QEMU known-good and loop end
         asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
-        cp_fb(0x14, 0x0000FFFF);  # CYAN — 25 hlts done
     }
     idle_count = idle_count + 1;
 }
@@ -341,64 +317,62 @@ while (idle_count < 50) {
 sched_active = 0;
 # CMOS CP 0x11: post-scheduler idle loop completed
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x11; 0xE6; 0x71; }
-cp_fb(0x11, 0x00FF00FF);  # MAGENTA — post-scheduler idle loop completed
-serial_println("", 0);
-serial_print("Scheduler test done. Timer ticks: ", 34);
+kprintln("", 0);
+kprint("Scheduler test done. Timer ticks: ", 34);
 kprint_num(timer_ticks);
-serial_println("", 0);
+kprintln("", 0);
 
 # === Memory Isolation Test ===
 # VFS + initrd test
-serial_print("VFS write: ", 11);
+kprint("VFS write: ", 11);
 vfs_write(0, "OK\n", 3);
 
 # Build and mount test initrd at 0x6000 (free page table area)
 initrd_build_test(0x6000);
 var nfiles = initrd_init(0x6000);
-serial_print("Initrd: ", 8);
+kprint("Initrd: ", 8);
 kprint_num(nfiles);
-serial_println(" files", 6);
+kprintln(" files", 6);
 
 # Open and read hello.txt
 var hfd = initrd_open("hello.txt", 9);
 var hbuf[16];
 var hn = vfs_read(hfd, &hbuf, 14);
-serial_print("initrd hello.txt: ", 18);
-serial_print(&hbuf, hn);
+kprint("initrd hello.txt: ", 18);
+kprint(&hbuf, hn);
 vfs_close(hfd);
 
 # Open and read test
 var tfd = initrd_open("test", 4);
 var tbuf[8];
 var tn = vfs_read(tfd, &tbuf, 5);
-serial_print("initrd test: ", 13);
-serial_print(&tbuf, tn);
+kprint("initrd test: ", 13);
+kprint(&tbuf, tn);
 vfs_close(tfd);
 var mf = vfs_create_memfile("HELLO", 5);
 var rbuf[8];
 var rn = vfs_read(mf, &rbuf, 5);
-serial_print("VFS memfile read: ", 18);
-serial_print(&rbuf, rn);
-serial_println("", 0);
+kprint("VFS memfile read: ", 18);
+kprint(&rbuf, rn);
+kprintln("", 0);
 vfs_close(mf);
 # CMOS CP 0x12: post-VFS / initrd / memfile tests
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
-cp_fb(0x12, 0x00FF00FF);  # MAGENTA — overwrites CYAN; reached post-VFS/initrd/memfile
 
 # Memory-isolation test removed 2026-05-15 (Attempt 27). The AS1/AS2 build + CR3
-# dance was post-MVP verification, not boot infrastructure. cp_fb under restored
-# kernel CR3 pegged kcp at 0x19 for 9 repair letters (F-N); per UEFI handoff
+# dance was post-MVP verification, not boot infrastructure. Under restored kernel
+# CR3 the test pegged kcp at 0x19 for 9 repair letters (F-N); per UEFI handoff
 # contract (docs/development/uefi-boot-prior-art.md §6), early kernels inherit
 # UEFI's identity map — pt_init's 0-4GB mapping doesn't cover the GOP FB BAR
 # the way UEFI's did. Mem-iso correctness is post-closed-beta work.
 
 # === Userland Exec Test ===
 # Spawn user_test_proc as a proper isolated process with its own address space
-serial_println("Userland exec test...", 21);
+kprintln("Userland exec test...", 21);
 var exec_pid = spawn_user_proc(&user_test_proc);
-serial_print("Spawned pid=", 12);
+kprint("Spawned pid=", 12);
 kprint_num(exec_pid);
-serial_println("", 0);
+kprintln("", 0);
 
 if (exec_pid >= 0) {
     var ep = &proc_table + exec_pid * 176;
@@ -406,21 +380,20 @@ if (exec_pid >= 0) {
     var exec_rsp = load64(ep + 16);
     var exec_cr3 = load64(ep + 160);
     # skipped
-    serial_println("Userland exec complete", 22);
+    kprintln("Userland exec complete", 22);
 }
 # CMOS CP 0x14: post-userland-exec test (spawn done, exec_and_wait still bypassed)
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
-cp_fb(0x14, 0x00FF00FF);  # MAGENTA — overwrites CYAN; reached post-userland-exec
 
 # Launch kybernet (PID 1) — enters the shell loop, which reads scancodes
-# from the PS/2 kbd ring and dispatches commands. Until fb glyph rendering
-# lands, shell I/O is serial-only; iron without a serial cable receives
-# keystrokes but paints no visible output. fb console = next slot.
-serial_println("Launching kybernet...", 21);
+# from the kbd ring and dispatches commands. Shell I/O mirrors to fb via
+# kprint (Repair P, Attempt 29) so iron sees both serial and on-screen.
+# Open: USB-keyboard PS/2 emulation under UEFI legacy SMM not confirmed
+# on archaemenid as of Attempt 29 — shell visible, kbd ring empty.
+kprintln("Launching kybernet...", 21);
 # CMOS CP 0x15: reached kybernet-launch site (kybernet() runs the shell loop)
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x15; 0xE6; 0x71; }
-cp_fb(0x15, 0x00FF00FF);  # MAGENTA — kybernet-launch reached
 kybernet(); arch_halt();
 
-serial_println("Halted.", 7);
+kprintln("Halted.", 7);
 arch_halt();

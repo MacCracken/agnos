@@ -62,7 +62,7 @@ fn fb_console_init() {
     # black-on-black (FG=BG=0, invisible). Zero-init vars (fb_cur_x,
     # fb_cur_y, fb_console_ready) were unaffected because BSS defaults
     # to zero — no init code needed. Surface as cyrius issue separately.
-    FB_CONSOLE_Y0 = 80;
+    FB_CONSOLE_Y0 = 8;
     FB_FG = 0x00FFFFFF;
     FB_BG = 0x00000000;
     # Printable ASCII 0x20..0x7E (CGA-style 8x8 bitmaps; DEL=blank).
@@ -192,11 +192,14 @@ fn fb_height() {
     return load32(bi + 0x58);
 }
 
-# Console area lives below the cp_fb marker grid.
-# Row 0 = boot_shim canary; rows 1..9 = cp_fb cells (idx 0x00..0x9F).
-# Idx 0x80..0x82 are used today, idx range 0xA0+ is reserved for future
-# cp_fb growth. Console starts at y=80 = 10 cell-rows down.
-var FB_CONSOLE_Y0 = 80;
+# Console origin. Row 0 (y=0..7) remains reserved for the boot_shim
+# canary stripe — gnoboot-handoff diagnostic kept by design. cp_fb
+# marker grid was stripped Attempt-29-post (the kernel reaches shell
+# on iron reliably now; visual stage cells became noise once kprint
+# text mirroring landed). cp_fb() the function still ships in fb.cyr —
+# re-bumping FB_CONSOLE_Y0 if visual bisection is needed again is a
+# one-line change.
+var FB_CONSOLE_Y0 = 8;
 var FB_FG = 0x00FFFFFF;  # white
 var FB_BG = 0x00000000;  # black
 
