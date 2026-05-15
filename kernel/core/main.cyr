@@ -383,13 +383,22 @@ cp_fb(0x12, 0x00FF00FF);  # MAGENTA — overwrites CYAN; reached post-VFS/initrd
 # Memory-isolation test. v1.25.1 gated this behind MEMORY_ISOLATION_TEST
 # after `store64(0xC00000, ...)` page-faulted post-cr3-switch despite
 # AS1's PD[6] being verified correct. v1.27.1 identified the root cause
-# as SMAP (CR4.SMAP set in the boot shim, line 52 of boot_shim.cyr):
-# proc_map_page writes per-process PD entries with US=1 (0x87, since
-# the page must be user-accessible from CPL=3), and SMAP traps CPL=0
-# access to US=1 pages. The fix is `stac`/`clac` brackets around the
-# test's user-page accesses, the same pattern userland-accessing
+# as SMAP: proc_map_page writes per-process PD entries with US=1 (0x87,
+# since the page must be user-accessible from CPL=3), and SMAP traps
+# CPL=0 access to US=1 pages. The fix is `stac`/`clac` brackets around
+# the test's user-page accesses, the same pattern userland-accessing
 # kernels use everywhere. Pre-switch diagnostic reads worked because
 # they hit kernel's own US=0 page-table pages.
+#
+# **CR4.SMAP enable site (v1.30.1):** under Path A (legacy ELF32 multi-
+# boot1) the boot shim itself enables SMEP/SMAP — see arch/x86_64/
+# boot_shim.cyr lines 70-88 (CPUID-gated). Under Path C (ELF64 + gnoboot
+# sovereign handoff) UEFI hands us CR4 with both bits at 0 and we enable
+# them right after `boot_info_capture_rdi()` at checkpoint 6 — see arch/
+# x86_64/boot_shim.cyr `#ifdef ELF64_KERNEL` block, post-CP-5. Pre-v1.30.1
+# Path C kernels left SMAP=0, which made the `stac` two lines below an
+# illegal-opcode #UD and triple-faulted iron at this site (Attempts 16-18,
+# iron-boot log).
 serial_println("Memory isolation test...", 23);
 
 # CMOS CP 0x1A: cp_fb sanity check entering mem-iso block (Attempt 18). On
@@ -468,6 +477,23 @@ asm {
     0xE6; 0x71;                # out 0x71, al  — write byte 2 of CR4
 }
 cp_fb(0x18, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post first cr3_load(as1)
+
+# Attempt 19: re-dump CR4 byte 2 to CMOS[0x55] right before `stac`.
+# Attempt 18's CMOS[0x54] = 0x00 read proved CR4.SMAP = 0 at CP 0x18,
+# which made `stac` below a #UD → triple-fault. v1.30.1 added SMEP+SMAP
+# enable in boot_shim.cyr (Path C, post-CP-5). This second dump confirms
+# the new CR4 value reached the test site — if CMOS[0x55] = 0x30 (SMEP
+# 0x10 | SMAP 0x20), the enable held all the way here. If 0x00 again,
+# something between boot_shim and this site cleared CR4 (investigate
+# any CR3/CR0/CR4 mutation downstream of boot_shim).
+asm {
+    0xB0; 0x55;                # mov al, 0x55  — select CMOS register 0x55
+    0xE6; 0x70;                # out 0x70, al
+    0x0F; 0x20; 0xE0;          # mov rax, cr4
+    0x48; 0xC1; 0xE8; 0x10;    # shr rax, 16
+    0xE6; 0x71;                # out 0x71, al  — write byte 2 of CR4
+}
+
 asm { 0x0F; 0x01; 0xCB; }   # stac
 # CMOS CP 0x1B: stac executed without faulting under AS1 CR3 (Attempt 18 SMAP bisector).
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x1B; 0xE6; 0x71; }

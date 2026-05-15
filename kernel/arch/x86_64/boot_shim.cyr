@@ -254,11 +254,52 @@ asm {
 # `mov [rax], rdi` writes RDI to boot_info_ptr. See mbi.cyr for the why.
 boot_info_capture_rdi();
 
-# === Checkpoint 5 (boot_info_capture_rdi returned) ===
-# If CMOS[0x50] reads 5 after reset, kernel survived its first call/ret
-# — fault is somewhere later in top-level kernel init (gdt_init,
-# idt_init, paging, scheduler, ...).
+# === CR4: CPUID-gated SMEP (bit 20) + SMAP (bit 21) enable, then CP 5 ===
+#
+# The legacy ELF32 multiboot1 shim (above, lines 70-88) enables these on
+# the way into long mode. The Path C handoff comes from gnoboot with PAE
+# already on and SMEP/SMAP untouched — UEFI leaves both at 0 on
+# archaemenid (Attempt 18 dump CMOS[0x54] = 0x00 confirmed). The comment
+# in core/main.cyr that claimed "CR4.SMAP set in the boot shim" was
+# stale w.r.t. Path C; without SMAP=1 here, the `stac` in the kernel's
+# memory-isolation test (core/main.cyr ~line 471) is #UD → triple-fault
+# → reset. That is the Attempt-16/17/18 stall profile exactly (kcp pins
+# at 0x18, screen ladder dies past 0x12).
+#
+# Read-modify-write CR4 via EBX; CPUID leaf 7 sub-leaf 0 returns feature
+# bits in EBX (SMEP at EBX[7], SMAP at EBX[20]) so we test against the
+# *original* CPUID-EBX (stashed in EAX) before each set. Skips silently
+# on QEMU `qemu64` (lacks both); enables both on Zen (advertises both)
+# and any qemu `-cpu max`. Push/pop in long mode default to 64-bit
+# (`0x53` = `push rbx`, `0x5B` = `pop rbx`) — fine because CR4's upper
+# bits are all zero (no defined CR4 bit above 31 today).
+#
+# We then write CMOS[0x50] = 5 — combined "boot_info_capture_rdi
+# returned AND CR4 SMEP/SMAP enabled". Avoids a CMOS-value collision
+# with main.cyr's `CMOS[0x50] = 0x06` (GDT/TSS/IDT loaded). The cost is
+# coarser bisection: if kcp pins at 4, the fault is in either
+# boot_info_capture_rdi OR the CR4 block. CPUID/`mov cr4` from ring-0
+# are routine, so the merged checkpoint is a reasonable trade.
 asm {
+    0x0F; 0x20; 0xE3;                                      # mov  ebx, cr4
+    0x53;                                                  # push rbx                ; save working CR4
+    0xB8; 0x07; 0x00; 0x00; 0x00;                          # mov  eax, 7
+    0x31; 0xC9;                                            # xor  ecx, ecx
+    0x0F; 0xA2;                                            # cpuid                   ; EBX = feature bits
+    0x89; 0xD8;                                            # mov  eax, ebx           ; stash features in eax
+    0x5B;                                                  # pop  rbx                ; restore working CR4
+    0xA9; 0x80; 0x00; 0x00; 0x00;                          # test eax, 0x80          ; SMEP supported?
+    0x74; 0x06;                                            # jz   +6                 ; skip OR if not
+    0x81; 0xCB; 0x00; 0x00; 0x10; 0x00;                    # or   ebx, 0x100000      ; CR4.SMEP
+    0xA9; 0x00; 0x00; 0x10; 0x00;                          # test eax, 0x100000      ; SMAP supported?
+    0x74; 0x06;                                            # jz   +6                 ; skip OR if not
+    0x81; 0xCB; 0x00; 0x00; 0x20; 0x00;                    # or   ebx, 0x200000      ; CR4.SMAP
+    0x0F; 0x22; 0xE3;                                      # mov  cr4, ebx
+
+    # === Checkpoint 5 (boot_info_capture_rdi returned AND CR4 done) ===
+    # If CMOS[0x50] reads 5 after reset, kernel survived its first
+    # call/ret + CR4 SMEP/SMAP enable — fault is somewhere later in
+    # top-level kernel init (gdt_init, idt_init, paging, scheduler, ...).
     0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x05; 0xE6; 0x71;        # CMOS[0x50] = 5
 }
 #endif
