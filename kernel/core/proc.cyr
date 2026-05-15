@@ -126,6 +126,20 @@ fn proc_get_exit_code(pid) {
 var kpti_kernel_cr3 = 0x1000;  # Default to boot page tables
 var kpti_user_cr3 = 0x1000;
 
+# Repair (J) — Attempt 23: PMM-allocation CMOS-stamp call counter.
+# Distinguishes successive `proc_create_address_space` invocations so each
+# call's 6 pmm_alloc results land in a different CMOS slot range:
+#   call 1 (AS1)  → slots 0x56..0x5B
+#   call 2 (AS2)  → slots 0x5C..0x61
+#   call 3+       → no stamps (out of CMOS scratch budget)
+# Each stamp writes byte 2 of the returned phys addr — `(addr >> 16) & 0xFF`.
+# Reading 0x00 from any stamp = pmm_alloc returned a phys < 0x10000, which is
+# inside the kernel-reserved [0x1000..0x3FFF] PT range. That's the smoking gun
+# for the Attempt-22 kernel-CR3-restore #PF (kcp=0x68): zeroing a "fresh" page
+# that's actually the kernel PML4 corrupts it in place, then `mov cr3, 0x1000`
+# walks zeros and #PFs. See iron-boot-testing-log.md § Attempt 22 audit.
+var proc_pca_call_n = 0;
+
 # Load cr3_val (first param at [rbp-8] per Cyrius calling convention)
 # into RAX, then write to CR3. Replaces the `var x = y; asm { mov cr3,
 # rax; }` pattern — that pattern relied on cc3-era codegen leaving the
@@ -152,12 +166,24 @@ fn cr3_load(cr3_val) {
 # gap: the aarch64 kernel was carrying x86 page-table code in these
 # slots and would have walked wrong memory if any caller had reached it.
 fn proc_create_address_space() {
+    # Repair (J) — Attempt 23: bump the global call counter and compute the
+    # CMOS slot base for this invocation's 6 pmm_alloc stamps. Only the first
+    # two calls (AS1 / AS2 from the mem-iso test in main.cyr) get stamped;
+    # subsequent calls leave `pca_stamp_base = 0` and skip stamping.
+    proc_pca_call_n = proc_pca_call_n + 1;
+    var pca_stamp_base = 0;
+    if (proc_pca_call_n == 1) { pca_stamp_base = 0x56; }
+    if (proc_pca_call_n == 2) { pca_stamp_base = 0x5C; }
+
     # Allocate 3 pages for kernel page tables: PML4, PDPT, PD
     var new_pml4 = pmm_alloc();
+    if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 0); outb(0x71, (new_pml4 >> 16) & 0xFF); }
     if (new_pml4 == 0) { return 0; }
     var new_pdpt = pmm_alloc();
+    if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 1); outb(0x71, (new_pdpt >> 16) & 0xFF); }
     if (new_pdpt == 0) { pmm_free(new_pml4); return 0; }
     var new_pd = pmm_alloc();
+    if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 2); outb(0x71, (new_pd >> 16) & 0xFF); }
     if (new_pd == 0) { pmm_free(new_pml4); pmm_free(new_pdpt); return 0; }
 
     # Zero all three pages
@@ -191,10 +217,13 @@ fn proc_create_address_space() {
 
     # S8 (KPTI): Allocate separate user page tables with minimal kernel mappings
     var u_pml4 = pmm_alloc();
+    if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 3); outb(0x71, (u_pml4 >> 16) & 0xFF); }
     if (u_pml4 == 0) { return new_pml4; }  # Fallback: no KPTI for this process
     var u_pdpt = pmm_alloc();
+    if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 4); outb(0x71, (u_pdpt >> 16) & 0xFF); }
     if (u_pdpt == 0) { pmm_free(u_pml4); return new_pml4; }
     var u_pd = pmm_alloc();
+    if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 5); outb(0x71, (u_pd >> 16) & 0xFF); }
     if (u_pd == 0) { pmm_free(u_pml4); pmm_free(u_pdpt); return new_pml4; }
 
     memset(u_pml4, 0, 4096);
