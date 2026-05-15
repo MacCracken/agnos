@@ -634,12 +634,19 @@ asm {
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x69; 0xE6; 0x71; }
 
 # CMOS CP 0x19: all three CR3 switches + SMAP-bracketed stores/loads + kernel-PT
-# restore survived. Any post-CP-0x19 stall is in the serial-print / branch logic
-# at lines 462-479, not in the page-table machinery.
+# restore survived. Attempt 25 confirmed post-CP-0x19 stall in serial-print /
+# branch logic at lines 640-660 (Repair (M) bisector below narrows the window).
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x19; 0xE6; 0x71; }
 cp_fb(0x19, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post all 3 CR3 switches + restore
+# Repair (M) bisector stamp 1/4 → kcp=0xE1: cp_fb(0x19) returned without fault.
+# If kcp stays 0x19 across Attempt 26 burns, cp_fb is the killer (TLB / FB MMIO
+# cacheability post-CR3-restore) and Repair (N) drops stamps inside cp_fb itself.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE1; 0xE6; 0x71; }
 
 serial_print("AS1 wrote 0xAAAA, read=", 23);
+# Repair (M) bisector stamp 2/4 → kcp=0xE2: first post-mem-iso serial_print
+# returned. Isolates UART-first-touch faults from later print-block faults.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE2; 0xE6; 0x71; }
 kprint_num(val_as1);
 serial_print(" recheck=", 9);
 kprint_num(val_as1_check);
@@ -647,6 +654,10 @@ serial_println("", 0);
 serial_print("AS2 wrote 0xBBBB, read=", 23);
 kprint_num(val_as2);
 serial_println("", 0);
+# Repair (M) bisector stamp 3/4 → kcp=0xE3: full 8-call print block returned.
+# Isolates print-class faults (serial_print / kprint_num) from branch-class
+# faults reading val_as1_check / val_as2 stack spills below.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE3; 0xE6; 0x71; }
 
 if (val_as1_check == 0xAAAA) {
     if (val_as2 == 0xBBBB) {
@@ -657,6 +668,10 @@ if (val_as1_check == 0xAAAA) {
 } else {
     serial_println("Memory isolation: FAIL (AS1 clobbered)", 38);
 }
+# Repair (M) bisector stamp 4/4 → kcp=0xE4: nested if/else branch completed.
+# If kcp=0xE4 but not 0x13, the kcp=0x13 stamp itself faulted (improbable —
+# identical byte pattern to 24 working stamps).
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0xE4; 0xE6; 0x71; }
 # CMOS CP 0x13: post-memory-isolation test
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x13; 0xE6; 0x71; }
 cp_fb(0x13, 0x00FF00FF);  # MAGENTA — overwrites CYAN; reached post-mem-isolation
