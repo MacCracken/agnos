@@ -396,6 +396,10 @@ serial_println("Memory isolation test...", 23);
 var as1 = proc_create_address_space();
 var as2 = proc_create_address_space();
 
+# CMOS CP 0x16: address spaces created OK
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x16; 0xE6; 0x71; }
+cp_fb(0x16, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post create-address-space x2
+
 # Map virtual address 0xC00000 (12MB) in each, to different 2MB physical regions.
 # We need 2MB-aligned physical addresses since we use huge pages.
 #
@@ -420,6 +424,10 @@ if (vmm_is_mapped(phys2) == 0) {
 proc_map_page(as1, 0xC00000, phys1);
 proc_map_page(as2, 0xC00000, phys2);
 
+# CMOS CP 0x17: per-process page mappings installed OK
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x17; 0xE6; 0x71; }
+cp_fb(0x17, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post proc_map_page x2
+
 # Write different values via each address space. cr3_load() is a helper
 # in proc.cyr that loads its parameter into CR3 via [rbp-8] — robust
 # under cc5's regalloc, unlike the pre-v1.26.0 `var x = y; asm { mov
@@ -435,6 +443,10 @@ proc_map_page(as2, 0xC00000, phys2);
 # entry stub re-clears AC implicitly (the interrupt gate clears
 # RFLAGS.AC on entry per Intel SDM Vol 3 §6.12.1.4).
 cr3_load(as1);
+# CMOS CP 0x18: first cr3 switch (AS1) survived — AS1 has kernel-text mapped.
+# Any post-CP-0x18 stall is in the SMAP'd accesses or subsequent CR3 switches.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x18; 0xE6; 0x71; }
+cp_fb(0x18, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post first cr3_load(as1)
 asm { 0x0F; 0x01; 0xCB; }   # stac
 store64(0xC00000, 0xAAAA);
 var val_as1 = load64(0xC00000);
@@ -458,6 +470,12 @@ asm {
     0x48; 0xB8; 0x00; 0x10; 0x00; 0x00; 0x00; 0x00; 0x00; 0x00;   # mov rax, 0x1000
     0x0F; 0x22; 0xD8;                                              # mov cr3, rax
 }
+
+# CMOS CP 0x19: all three CR3 switches + SMAP-bracketed stores/loads + kernel-PT
+# restore survived. Any post-CP-0x19 stall is in the serial-print / branch logic
+# at lines 462-479, not in the page-table machinery.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x19; 0xE6; 0x71; }
+cp_fb(0x19, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post all 3 CR3 switches + restore
 
 serial_print("AS1 wrote 0xAAAA, read=", 23);
 kprint_num(val_as1);
