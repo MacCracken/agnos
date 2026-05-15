@@ -53,6 +53,18 @@ fn fset(ch, val) {
 }
 
 fn fb_console_init() {
+    # Defensive re-assignment of layout/color gvars. The top-level
+    # `var FB_CONSOLE_Y0 = 80;` (and FB_FG / FB_BG) declarations below
+    # should initialize via cyrius v5.7.19 gvar-init phase, but on
+    # iron-attempt-29 (2026-05-15) the non-zero initializers were observed
+    # NOT honored at runtime — values read back as 0, causing fb_putc to
+    # paint text at y=0..55 (wiping cp_fb cells 0x06..0x10) in solid
+    # black-on-black (FG=BG=0, invisible). Zero-init vars (fb_cur_x,
+    # fb_cur_y, fb_console_ready) were unaffected because BSS defaults
+    # to zero — no init code needed. Surface as cyrius issue separately.
+    FB_CONSOLE_Y0 = 80;
+    FB_FG = 0x00FFFFFF;
+    FB_BG = 0x00000000;
     # Printable ASCII 0x20..0x7E (CGA-style 8x8 bitmaps; DEL=blank).
     fset(0x20, 0x0000000000000000);  # space
     fset(0x21, 0x1818181818001800);  # !
