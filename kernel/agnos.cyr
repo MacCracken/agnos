@@ -8,6 +8,7 @@ kernel;
 include "arch/x86_64/boot_data.cyr"
 include "arch/x86_64/mbi.cyr"
 include "arch/x86_64/fb.cyr"
+include "arch/x86_64/fb_console.cyr"
 include "arch/x86_64/serial.cyr"
 include "arch/x86_64/gdt.cyr"
 include "arch/x86_64/idt.cyr"

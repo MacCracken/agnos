@@ -1,1 +1,31 @@
-fn kprint_num(n: i64) { return kfmt_int(n); }
+# Mirror kernel output to both serial (debug) and framebuffer console
+# (iron-visible). serial_* is the historical primary; fb_putc/print/
+# println from fb_console.cyr renders the same bytes to the GOP
+# framebuffer. Either is safe to call before its backend is up:
+# - serial_* no-ops if UART not initialized
+# - fb_putc no-ops if fb_console_ready == 0 or fb_phys == 0
+fn kputc(ch) {
+    serial_putc(ch);
+    fb_putc(ch);
+    return 0;
+}
+
+fn kprint(buf, len) {
+    serial_print(buf, len);
+    fb_print(buf, len);
+    return 0;
+}
+
+fn kprintln(buf, len) {
+    serial_println(buf, len);
+    fb_println(buf, len);
+    return 0;
+}
+
+# Print decimal integer to both serial and fb (was serial-only via kfmt_int).
+fn kprint_num(n: i64) {
+    var buf[24];
+    var len = fmt_int_buf(n, &buf);
+    kprint(&buf, len);
+    return 0;
+}

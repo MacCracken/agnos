@@ -8,68 +8,68 @@ fn sh_streq(a, alen, b, blen) {
 }
 
 fn sh_cmd_help() {
-    serial_println("AGNOS Shell commands:", 21);
-    serial_println("  help    - this message", 24);
-    serial_println("  echo    - print text", 22);
-    serial_println("  ps      - process list", 24);
-    serial_println("  free    - memory info", 23);
-    serial_println("  cat     - read file", 21);
-    serial_println("  uptime  - timer ticks", 23);
-    serial_println("  lspci   - PCI devices", 23);
-    serial_println("  cpus    - CPU count", 21);
-    serial_println("  net     - network info", 24);
-    serial_println("  send    - send UDP msg", 24);
-    serial_println("  recv    - recv UDP pkt", 24);
-    serial_println("  tcp     - TCP connect test", 28);
-    serial_println("  pipe    - test pipe IPC", 25);
-    serial_println("  blkread - read disk sector", 28);
-    serial_println("  ls      - list disk files", 27);
-    serial_println("  disk    - disk info", 21);
-    serial_println("  bench   - run benchmarks", 26);
-    serial_println("  test    - run test suite", 26);
-    serial_println("  halt    - shutdown", 20);
+    kprintln("AGNOS Shell commands:", 21);
+    kprintln("  help    - this message", 24);
+    kprintln("  echo    - print text", 22);
+    kprintln("  ps      - process list", 24);
+    kprintln("  free    - memory info", 23);
+    kprintln("  cat     - read file", 21);
+    kprintln("  uptime  - timer ticks", 23);
+    kprintln("  lspci   - PCI devices", 23);
+    kprintln("  cpus    - CPU count", 21);
+    kprintln("  net     - network info", 24);
+    kprintln("  send    - send UDP msg", 24);
+    kprintln("  recv    - recv UDP pkt", 24);
+    kprintln("  tcp     - TCP connect test", 28);
+    kprintln("  pipe    - test pipe IPC", 25);
+    kprintln("  blkread - read disk sector", 28);
+    kprintln("  ls      - list disk files", 27);
+    kprintln("  disk    - disk info", 21);
+    kprintln("  bench   - run benchmarks", 26);
+    kprintln("  test    - run test suite", 26);
+    kprintln("  halt    - shutdown", 20);
     return 0;
 }
 
 fn sh_cmd_ps() {
-    serial_println("PID  STATE", 10);
+    kprintln("PID  STATE", 10);
     for (var i = 0; i < proc_count; i = i + 1) {
         kprint_num(i);
-        serial_print("    ", 4);
+        kprint("    ", 4);
         var st = proc_get_state(i);
-        if (st == 0) { serial_println("halted", 6); }
-        if (st == 1) { serial_println("ready", 5); }
-        if (st == 2) { serial_println("running", 7); }
+        if (st == 0) { kprintln("halted", 6); }
+        if (st == 1) { kprintln("ready", 5); }
+        if (st == 2) { kprintln("running", 7); }
     }
     return 0;
 }
 
 fn sh_cmd_free() {
-    serial_print("PMM: ", 5);
+    kprint("PMM: ", 5);
     kprint_num(pmm_free_count());
-    serial_print("/", 1);
+    kprint("/", 1);
     kprint_num(pmm_total);
-    serial_println(" pages (4KB each)", 17);
-    serial_print("Heap: ", 6);
+    kprintln(" pages (4KB each)", 17);
+    kprint("Heap: ", 6);
     kprint_num(heap_allocs);
-    serial_print(" allocs, ", 9);
+    kprint(" allocs, ", 9);
     kprint_num(heap_frees);
-    serial_println(" frees", 6);
+    kprintln(" frees", 6);
     return 0;
 }
 
 fn bench_report(name, nlen, cycles, ops) {
-    serial_print(name, nlen);
+    kprint(name, nlen);
     kprint_num(cycles / ops);
-    serial_println(" cycles/op", 10);
+    kprintln(" cycles/op", 10);
     return 0;
 }
 
 fn sh_cmd_bench() {
-    serial_println("=== AGNOS Benchmarks (3-tier) ===", 33);
+    kprintln("=== AGNOS Benchmarks (3-tier) ===", 33);
     var t0 = 0;
     var t1 = 0;
-    serial_println("[tier1] core", 12);
+    kprintln("[tier1] core", 12);
     t0 = rdtsc();
     for (var i = 0; i < 1000; i = i + 1) { var pg = pmm_alloc(); pmm_free(pg); }
     t1 = rdtsc();
@@ -93,10 +93,10 @@ fn sh_cmd_bench() {
     }
     t1 = rdtsc();
     pmm_free(mem_pg);
-    serial_print("  memwrite_1MB: ", 16);
+    kprint("  memwrite_1MB: ", 16);
     kprint_num((t1 - t0) / 1000);
-    serial_println(" Kcycles", 8);
-    serial_println("[tier2] subsystems", 18);
+    kprintln(" Kcycles", 8);
+    kprintln("[tier2] subsystems", 18);
     t0 = rdtsc();
     for (var i = 0; i < 10000; i = i + 1) { ksyscall(2, 0, 0, 0); }
     t1 = rdtsc();
@@ -108,7 +108,7 @@ fn sh_cmd_bench() {
     t0 = rdtsc();
     for (var i = 0; i < 1000; i = i + 1) { ksyscall(1, 0, ".", 1); }
     t1 = rdtsc();
-    serial_println("", 0);
+    kprintln("", 0);
     bench_report("  syscall_write1: ", 18, t1 - t0, 1000);
     t0 = rdtsc();
     for (var i = 0; i < 100; i = i + 1) {
@@ -119,24 +119,24 @@ fn sh_cmd_bench() {
     }
     t1 = rdtsc();
     bench_report("  vfs_open_read_close: ", 23, t1 - t0, 100);
-    serial_println("[tier3] integration", 19);
+    kprintln("[tier3] integration", 19);
     t0 = rdtsc();
-    for (var i = 0; i < 1000; i = i + 1) { serial_putc(46); }
+    for (var i = 0; i < 1000; i = i + 1) { kputc(46); }
     t1 = rdtsc();
-    serial_println("", 0);
+    kprintln("", 0);
     bench_report("  serial_putc: ", 15, t1 - t0, 1000);
-    serial_println("=== done ===", 13);
+    kprintln("=== done ===", 13);
     return 0;
 }
 
 fn sh_cmd_cat(arg, arglen) {
-    if (arglen < 1) { serial_println("usage: cat <file>", 17); return 0; }
+    if (arglen < 1) { kprintln("usage: cat <file>", 17); return 0; }
     var fd = initrd_open(arg, arglen);
-    if (fd < 0) { serial_println("file not found", 14); return 0; }
+    if (fd < 0) { kprintln("file not found", 14); return 0; }
     var cbuf[64];
     var n = vfs_read(fd, &cbuf, 512);
     while (n > 0) {
-        serial_print(&cbuf, n);
+        kprint(&cbuf, n);
         n = vfs_read(fd, &cbuf, 512);
     }
     vfs_close(fd);
@@ -165,164 +165,164 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "free", 4) == 1) { return sh_cmd_free(); }
     if (sh_streq(buf, clen, "uptime", 6) == 1) {
         kprint_num(timer_ticks);
-        serial_println(" ticks", 6);
+        kprintln(" ticks", 6);
         return 0;
     }
     if (sh_streq(buf, clen, "cat", 3) == 1) { return sh_cmd_cat(arg, arglen); }
     if (sh_streq(buf, clen, "echo", 4) == 1) {
-        serial_print(arg, arglen);
-        serial_println("", 0);
+        kprint(arg, arglen);
+        kprintln("", 0);
         return 0;
     }
     if (sh_streq(buf, clen, "lspci", 5) == 1) {
         for (var i = 0; i < pci_count; i = i + 1) {
             var base = &pci_devs + i * 32;
-            serial_print("  slot ", 7);
+            kprint("  slot ", 7);
             kprint_num(load64(base));
-            serial_print(": vendor=", 9);
+            kprint(": vendor=", 9);
             kfmt_hex0x(load64(base + 8));
-            serial_print(" device=", 8);
+            kprint(" device=", 8);
             kfmt_hex0x(load64(base + 16));
-            serial_print(" bar0=", 6);
+            kprint(" bar0=", 6);
             kfmt_hex0x(load64(base + 24));
-            serial_println("", 0);
+            kprintln("", 0);
         }
         return 0;
     }
     if (sh_streq(buf, clen, "cpus", 4) == 1) {
-        serial_print("Online: ", 8);
+        kprint("Online: ", 8);
         kprint_num(cpu_count);
-        serial_println(" CPUs", 5);
+        kprintln(" CPUs", 5);
         return 0;
     }
     if (sh_streq(buf, clen, "net", 3) == 1) {
-        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
-        serial_print("IP: 10.0.2.15  MAC: ", 20);
+        if (vnet_active == 0) { kprintln("no network", 10); return 0; }
+        kprint("IP: 10.0.2.15  MAC: ", 20);
         for (var i = 0; i < 6; i = i + 1) {
             kprint_num(load8(&vnet_mac + i));
-            if (i < 5) { serial_putc(58); }
+            if (i < 5) { kputc(58); }
         }
-        serial_println("", 0);
+        kprintln("", 0);
         return 0;
     }
     if (sh_streq(buf, clen, "send", 4) == 1) {
-        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
-        if (arglen < 1) { serial_println("usage: send <msg>", 17); return 0; }
+        if (vnet_active == 0) { kprintln("no network", 10); return 0; }
+        if (arglen < 1) { kprintln("usage: send <msg>", 17); return 0; }
         net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
         var r = udp_send(ip4(10,0,2,2), 1234, 5555, arg, arglen);
-        serial_print("sent ", 5);
+        kprint("sent ", 5);
         kprint_num(r);
-        serial_println(" bytes", 6);
+        kprintln(" bytes", 6);
         return 0;
     }
     if (sh_streq(buf, clen, "recv", 4) == 1) {
-        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
+        if (vnet_active == 0) { kprintln("no network", 10); return 0; }
         net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
         var rbuf[64];
         var rlen = net_recv_udp(&rbuf, 512);
         if (rlen == 0) {
-            serial_println("no packet received", 18);
+            kprintln("no packet received", 18);
         } else {
-            serial_print("recv UDP (", 10);
+            kprint("recv UDP (", 10);
             kprint_num(rlen);
-            serial_print(" bytes): ", 9);
-            serial_print(&rbuf, rlen);
-            serial_println("", 0);
+            kprint(" bytes): ", 9);
+            kprint(&rbuf, rlen);
+            kprintln("", 0);
         }
         return 0;
     }
     if (sh_streq(buf, clen, "pipe", 4) == 1) {
         var pfds[2];
         var pr = vfs_create_pipe(&pfds);
-        if (pr < 0) { serial_println("pipe: failed", 12); return 0; }
+        if (pr < 0) { kprintln("pipe: failed", 12); return 0; }
         var rfd = load64(&pfds);
         var wfd = load64(&pfds + 8);
-        serial_print("pipe: rfd=", 10);
+        kprint("pipe: rfd=", 10);
         kprint_num(rfd);
-        serial_print(" wfd=", 5);
+        kprint(" wfd=", 5);
         kprint_num(wfd);
-        serial_println("", 0);
+        kprintln("", 0);
         # Write test data
         var tdata = "hello pipe";
         var wn = vfs_write(wfd, tdata, 10);
-        serial_print("wrote ", 6);
+        kprint("wrote ", 6);
         kprint_num(wn);
-        serial_println(" bytes", 6);
+        kprintln(" bytes", 6);
         # Read it back
         var pbuf[16];
         var rn = vfs_read(rfd, &pbuf, 128);
-        serial_print("read ", 5);
+        kprint("read ", 5);
         kprint_num(rn);
-        serial_print(" bytes: ", 8);
-        serial_print(&pbuf, rn);
-        serial_println("", 0);
+        kprint(" bytes: ", 8);
+        kprint(&pbuf, rn);
+        kprintln("", 0);
         vfs_close(rfd);
         vfs_close(wfd);
         return 0;
     }
     if (sh_streq(buf, clen, "tcp", 3) == 1) {
-        if (vnet_active == 0) { serial_println("no network", 10); return 0; }
+        if (vnet_active == 0) { kprintln("no network", 10); return 0; }
         net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
-        serial_println("TCP: connecting to 10.0.2.2:80...", 32);
+        kprintln("TCP: connecting to 10.0.2.2:80...", 32);
         var conn = tcp_connect(ip4(10,0,2,2), 80, 49152);
         if (conn < 0) {
-            serial_println("TCP: connect failed (RST or timeout)", 36);
+            kprintln("TCP: connect failed (RST or timeout)", 36);
         } else {
-            serial_print("TCP: connected, conn_id=", 24);
+            kprint("TCP: connected, conn_id=", 24);
             kprint_num(conn);
-            serial_println("", 0);
+            kprintln("", 0);
             tcp_close(conn);
-            serial_println("TCP: closed", 11);
+            kprintln("TCP: closed", 11);
         }
         return 0;
     }
     if (sh_streq(buf, clen, "blkread", 7) == 1) {
-        if (vblk_active == 0) { serial_println("no block device", 15); return 0; }
+        if (vblk_active == 0) { kprintln("no block device", 15); return 0; }
         # Parse sector number from arg (simple decimal)
         var sector = 0;
         for (var i = 0; i < arglen; i = i + 1) {
             var digit = load8(arg + i) - 48;
             if (digit >= 0) { if (digit <= 9) { sector = sector * 10 + digit; } }
         }
-        serial_print("Reading sector ", 15);
+        kprint("Reading sector ", 15);
         kprint_num(sector);
-        serial_println(":", 1);
+        kprintln(":", 1);
         var rbuf[64];
         var r = blk_read(sector, &rbuf);
-        if (r != 0) { serial_println("read failed", 11); return 0; }
+        if (r != 0) { kprintln("read failed", 11); return 0; }
         # Hexdump first 64 bytes
         for (var i = 0; i < 64; i = i + 1) {
             kfmt_byte(load8(&rbuf + i));
-            serial_putc(32);
-            if ((i & 15) == 15) { serial_println("", 0); }
+            kputc(32);
+            if ((i & 15) == 15) { kprintln("", 0); }
         }
         return 0;
     }
     if (sh_streq(buf, clen, "ls", 2) == 1) {
-        if (fatfs_active == 0) { serial_println("no filesystem", 13); return 0; }
+        if (fatfs_active == 0) { kprintln("no filesystem", 13); return 0; }
         fatfs_ls();
         return 0;
     }
     if (sh_streq(buf, clen, "disk", 4) == 1) {
-        if (vblk_active == 0) { serial_println("no block device", 15); return 0; }
-        serial_print("VirtIO-blk: ", 12);
+        if (vblk_active == 0) { kprintln("no block device", 15); return 0; }
+        kprint("VirtIO-blk: ", 12);
         kprint_num(vblk_capacity);
-        serial_print(" sectors (", 10);
+        kprint(" sectors (", 10);
         kprint_num(vblk_capacity / 2);
-        serial_println(" KB)", 4);
+        kprintln(" KB)", 4);
         if (fatfs_active != 0) {
-            serial_println("Filesystem: FAT16", 17);
-            serial_print("  bytes/sector: ", 16);
+            kprintln("Filesystem: FAT16", 17);
+            kprint("  bytes/sector: ", 16);
             kprint_num(fatfs_bytes_per_sector);
-            serial_println("", 0);
-            serial_print("  sectors/cluster: ", 19);
+            kprintln("", 0);
+            kprint("  sectors/cluster: ", 19);
             kprint_num(fatfs_sectors_per_cluster);
-            serial_println("", 0);
-            serial_print("  root entries: ", 16);
+            kprintln("", 0);
+            kprint("  root entries: ", 16);
             kprint_num(fatfs_root_entry_count);
-            serial_println("", 0);
+            kprintln("", 0);
         } else {
-            serial_println("Filesystem: none", 16);
+            kprintln("Filesystem: none", 16);
         }
         return 0;
     }
@@ -331,17 +331,17 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "test", 4) == 1) { return sh_cmd_test(); }
 #endif
     if (sh_streq(buf, clen, "halt", 4) == 1) { return 0 - 99; }
-    serial_print("unknown: ", 9);
-    serial_print(buf, clen);
-    serial_println("", 0);
+    kprint("unknown: ", 9);
+    kprint(buf, clen);
+    kprintln("", 0);
     return 0;
 }
 
 fn shell() {
-    serial_println("AGNOS shell v1.30.0 (type 'help')", 33);
+    kprintln("AGNOS shell v1.30.0 (type 'help')", 33);
     var sh_running = 1;
     while (sh_running == 1) {
-        serial_print("agnos> ", 7);
+        kprint("agnos> ", 7);
         sh_len = 0;
         # Read line character by character
         var reading = 1;
@@ -351,20 +351,20 @@ fn shell() {
                 var sc = kb_read_scancode();
                 var ch = scancode_to_ascii(sc);
                 if (ch == 10) {
-                    serial_println("", 0);
+                    kprintln("", 0);
                     reading = 0;
                 }
                 if (ch == 8) {
                     if (sh_len > 0) {
                         sh_len = sh_len - 1;
-                        serial_putc(8); serial_putc(32); serial_putc(8);
+                        kputc(8); kputc(32); kputc(8);
                     }
                 }
                 if (ch > 31) {
                     if (sh_len < 126) {
                         store8(&sh_buf + sh_len, ch);
                         sh_len = sh_len + 1;
-                        serial_putc(ch);
+                        kputc(ch);
                     }
                 }
             }
