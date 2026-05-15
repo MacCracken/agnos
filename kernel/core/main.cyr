@@ -392,6 +392,16 @@ cp_fb(0x12, 0x00FF00FF);  # MAGENTA — overwrites CYAN; reached post-VFS/initrd
 # they hit kernel's own US=0 page-table pages.
 serial_println("Memory isolation test...", 23);
 
+# CMOS CP 0x1A: cp_fb sanity check entering mem-iso block (Attempt 18). On
+# kernel CR3, BEFORE any AS-creation work. Attempt 17 left cells 0x16/0x17/0x18
+# unpainted despite CMOS writes landing — the cp_fb-vs-AS1 hypothesis says
+# cp_fb works on kernel CR3 but #PFs after cr3_load(as1) because the
+# framebuffer phys (high UEFI address) isn't in AS1's per-process PT mirror
+# (PD-copy only covers 0-4 GB). If cell 0x1A paints YELLOW, that hypothesis
+# survives. If it doesn't, cp_fb broke somewhere upstream of this point.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x1A; 0xE6; 0x71; }
+cp_fb(0x1A, 0x00FFFF00);  # YELLOW — distinguishes from MAGENTA bisector cells
+
 # Create two address spaces
 var as1 = proc_create_address_space();
 var as2 = proc_create_address_space();
@@ -446,11 +456,32 @@ cr3_load(as1);
 # CMOS CP 0x18: first cr3 switch (AS1) survived — AS1 has kernel-text mapped.
 # Any post-CP-0x18 stall is in the SMAP'd accesses or subsequent CR3 switches.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x18; 0xE6; 0x71; }
+# Attempt 18: CR4 byte 2 (bits 16-23) → CMOS[0x54]. Pins down CR4.SMAP (bit 21
+# = byte 2 bit 5) enforcement state on iron BEFORE the suspected cp_fb-under-
+# AS1 fault. Port I/O only — runs even if AS1's PT mirror is broken. Byte 2
+# bit map (LSB-first within the byte): FSGSBASE/PCIDE/OSXSAVE/-/SMEP/SMAP/PKE/-.
+asm {
+    0xB0; 0x54;                # mov al, 0x54  — select CMOS register 0x54
+    0xE6; 0x70;                # out 0x70, al
+    0x0F; 0x20; 0xE0;          # mov rax, cr4
+    0x48; 0xC1; 0xE8; 0x10;    # shr rax, 16
+    0xE6; 0x71;                # out 0x71, al  — write byte 2 of CR4
+}
 cp_fb(0x18, 0x00FF00FF);  # MAGENTA — mem-iso bisector: post first cr3_load(as1)
 asm { 0x0F; 0x01; 0xCB; }   # stac
+# CMOS CP 0x1B: stac executed without faulting under AS1 CR3 (Attempt 18 SMAP bisector).
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x1B; 0xE6; 0x71; }
+cp_fb(0x1B, 0x00FF00FF);  # MAGENTA — SMAP bisector: post-stac, AS1 CR3
 store64(0xC00000, 0xAAAA);
 var val_as1 = load64(0xC00000);
+# CMOS CP 0x1C: SMAP-bracketed store64+load64 succeeded under AS1 (Attempt 18 SMAP bisector).
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x1C; 0xE6; 0x71; }
+cp_fb(0x1C, 0x00FF00FF);  # MAGENTA — SMAP bisector: post-store/load
 asm { 0x0F; 0x01; 0xCA; }   # clac
+# CMOS CP 0x1D: clac executed; AS1 SMAP-bracketed round-trip complete (Attempt 18 SMAP bisector).
+# Any post-0x1D stall is in cr3_load(as2) at line 456 or beyond.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x1D; 0xE6; 0x71; }
+cp_fb(0x1D, 0x00FF00FF);  # MAGENTA — SMAP bisector: post-clac, AS1 done
 
 # Switch to AS2, write 0xBBBB to same virtual address
 cr3_load(as2);
