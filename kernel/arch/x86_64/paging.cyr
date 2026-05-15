@@ -25,12 +25,19 @@ fn pt_init() {
     store64(0x2000 + 1 * 8, 0x40000000 | 0x83);   # 1 GB @ 0x40000000 | P|RW|PS
     store64(0x2000 + 2 * 8, 0x80000000 | 0x83);   # 1 GB @ 0x80000000 | P|RW|PS
     store64(0x2000 + 3 * 8, 0xC0000000 | 0x83);   # 1 GB @ 0xC0000000 | P|RW|PS
-    # Set U/S bit on PML4[0] and PDPT[0] so user-mode pages work
-    # PML4 at 0x1000, PDPT at 0x2000 — need bit 2 (User) set
-    var pml4e = load64(0x1000);
-    store64(0x1000, pml4e | 0x04);
-    var pdpte = load64(0x2000);
-    store64(0x2000, pdpte | 0x04);
+    # Build PML4[0] and PDPT[0] from scratch with P|RW|US. Path A
+    # (multiboot via boot_shim) pre-seeded PML4[0]=0x2003 / PDPT[0]=0x3003
+    # and pt_init only had to OR-in bit 2 (US) for ring-3 access. Path C
+    # (gnoboot / sovereign UEFI) inherits UEFI's identity map and skips
+    # boot_shim's PT setup entirely — phys 0x1000/0x2000 stay cold (= 0)
+    # at kernel entry. The OR-in pattern then produced PML4[0]=0x04
+    # (P=0, no PDPT address) and faulted on `mov cr3, 0x1000` in the
+    # mem-iso block. Explicit full writes are self-sufficient under both
+    # paths. See iron-boot Attempt 24 / Repair (K) — all 7 PML4 health
+    # stamps read 0x04, ruling out runtime corruption and pinning the bug
+    # to this site.
+    store64(0x1000, 0x2007);   # PML4[0] -> PDPT @ 0x2000 | P|RW|US
+    store64(0x2000, 0x3007);   # PDPT[0] -> PD   @ 0x3000 | P|RW|US
     # Reload CR3 to flush TLB
     asm { mov rax, cr3; }
     asm { mov cr3, rax; }
