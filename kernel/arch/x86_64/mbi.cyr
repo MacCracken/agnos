@@ -45,42 +45,4 @@ fn boot_info_capture_rdi(): i64 {
     }
     return 0;
 }
-
-# Repair (N) auxiliary (Attempt 26+). Snapshot fb_phys bytes 2+3 to
-# CMOS[0x69]/[0x6A] for BAR-shift detection. Distinguishes BIOS-save-exit
-# (cold POST, PCIe re-enum, fresh BAR assignment) from warm reset
-# (BAR retained from prior boot) — one of three working suspects for the
-# Attempt-25 racy CP-0x19 hang. Pairs with the in-cp_fb bisector in fb.cyr:
-# if kcp pegs at 0xE8 (FB write faulted), [0x69]/[0x6A] tell us which BAR
-# the write tried to hit; comparing across attempts isolates BAR drift.
-#
-# Same boot_info_ptr access pattern as boot_info_capture_rdi above —
-# `var p = &boot_info_ptr` emits a single `mov rax, <abs_addr>` and the
-# inline asm walks from there. Two CMOS slots written:
-#   CMOS[0x69] = (fb_phys >> 16) & 0xFF  — byte 2 (64KB-granularity BAR shift)
-#   CMOS[0x6A] = (fb_phys >> 24) & 0xFF  — byte 3 (16MB-granularity BAR shift)
-fn cmos_stamp_fb_phys(): i64 {
-    var p = &boot_info_ptr;          # mov rax, <abs_addr_of_boot_info_ptr>
-    asm {
-        # rax = &boot_info_ptr (Cyrius emit)
-        0x48; 0x8B; 0x00;            # mov rax, [rax]       — rax = boot_info_ptr value (struct addr)
-        0x48; 0x8B; 0x40; 0x48;      # mov rax, [rax+0x48]  — rax = fb_phys
-        0x48; 0xC1; 0xE8; 0x10;      # shr rax, 16          — byte 2 now in al
-        # Stamp byte 2 → CMOS[0x69]. al ops preserve upper bytes of rax,
-        # so the shifted value survives the mov al, 0x69 / mov al, cl dance.
-        0x88; 0xC1;                  # mov cl, al           — preserve byte 2 in cl
-        0xB0; 0x69;                  # mov al, 0x69
-        0xE6; 0x70;                  # out 0x70, al
-        0x88; 0xC8;                  # mov al, cl
-        0xE6; 0x71;                  # out 0x71, al
-        # Continue: rax still holds (fb_phys >> 16). One more shr by 8 → byte 3 in al.
-        0x48; 0xC1; 0xE8; 0x08;      # shr rax, 8           — byte 3 now in al
-        0x88; 0xC1;                  # mov cl, al           — preserve byte 3 in cl
-        0xB0; 0x6A;                  # mov al, 0x6A
-        0xE6; 0x70;                  # out 0x70, al
-        0x88; 0xC8;                  # mov al, cl
-        0xE6; 0x71;                  # out 0x71, al
-    }
-    return 0;
-}
 #endif
