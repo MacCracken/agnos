@@ -7,6 +7,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Repair (K) — PML4 health stamps for Attempt 24** (`kernel/core/main.cyr`
+  mem-iso block). Attempt 23 confirmed the PMM-handed-out-kernel-PT
+  hypothesis is wrong (all 12 Repair (J) stamps at CMOS [0x56..0x61]
+  read 0xaf — pmm_alloc returned safe pages well above the 2 MB
+  watermark). The cr3-restore #PF at `main.cyr:575-577` (`mov rax,
+  0x1000 / mov cr3, rax`) is still the death site, but PMM is ruled
+  out as the source of corruption.
+
+  Repair (K) is a direct probe of phys 0x1000 itself: 7 stamps writing
+  the low byte of `load64(0x1000)` (= PML4[0]'s flag bits, 0x07 when
+  healthy: P|RW|US pointing at kernel PDPT @ 0x2000) to virgin CMOS
+  registers [0x62..0x68] at 7 checkpoints across the mem-iso block.
+  Each stamp is 14 bytes of asm (`mov al, slot` / `out 0x70, al` /
+  `mov rax, [0x1000]` via 64-bit SIB form `48 8B 04 25 disp32` /
+  `out 0x71, al`). Insertion sites:
+    - [0x62] after kcp=0x1A (entering mem-iso, before AS work)
+    - [0x63] after kcp=0x16 (post AS1+AS2 create)
+    - [0x64] after kcp=0x17 (post proc_map_page x2)
+    - [0x65] after kcp=0x18 (post first cr3_load(as1))
+    - [0x66] after kcp=0x1D (post first AS1 SMAP round-trip)
+    - [0x67] after kcp=0x64 (post AS2 SMAP round-trip)
+    - [0x68] after kcp=0x68 (post second AS1 round-trip — last quiet
+      point before the cr3-restore that #PFs)
+
+  Reading [0x62..0x68] post-mortem:
+    - All 0x07 + kcp=0x68 → PML4 healthy throughout. The cr3-restore
+      #PF is NOT direct PML4 corruption; premise inverts and Repair
+      (L) needs a #PF handler that dumps CR2 + error code so we can
+      see the actual fault address/type.
+    - First 0x00 at slot N + kcp=0x68 → corruption window pinned
+      between checkpoints (N-1) and N. Repair (L) adds finer stamps
+      in that span.
+    - Other byte values → entry rewritten (different bug class —
+      torn flags or replaced pointer).
+
+  Pure diagnostic; no behavior change. Each stamp lives in the main
+  body, not the `timer_isr[]` buffer (its 1-byte headroom is
+  unaffected). Companion `agnosticos/scripts/src/read-boot-log.cyr`
+  updated with the [0x62..0x68] interpreter and revised kcp=104
+  verdict pointing at the new stamp ladder. Joins Repairs F+H+I+J
+  in the in-flight `1.30.1` candidate; VERSION stays at 1.30.0 until
+  iron-boot validates the cut.
+
 - **Persistent CMOS boot-log at kernel entry** (Attempt 8 bisection;
   `kernel/arch/x86_64/boot_shim.cyr` ELF64 path). Attempt 7's visual
   canary returned an ambiguous null-result on iron — the no-stripe
