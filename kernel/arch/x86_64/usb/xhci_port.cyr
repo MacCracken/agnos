@@ -33,6 +33,21 @@
 # archaemenid reports 6).
 var xhci_port_proto = 0;   # Pointer into a PMM page allocated at init
 
+# Per-port bitmaps stamped by xhci_enumerate_port and surfaced via CMOS
+# at end-of-enumerate. Bit (port_num - 1) set when condition holds.
+# Read post-mortem via `read-boot-log` slots 0x63 / 0x64.
+var xhci_port_ccs_mask   = 0;   # bit p-1 set if port p reported CCS=1
+var xhci_port_reset_mask = 0;   # bit p-1 set if xhci_port_reset(p) returned 1
+
+# CMOS post-mortem stamp for xhci state. Slot in [0x62..0x6A]; val low
+# byte only. Slots are the Repair-O retired range — `read-boot-log` is
+# the decoder pair.
+fn xhci_cmos_stamp(slot, val) {
+    outb(0x70, slot);
+    outb(0x71, val & 0xFF);
+    return 0;
+}
+
 # Walk the xECP chain and populate xhci_port_proto. Returns 1 on success,
 # 0 if no chain was reachable (xecp == 0, meaning no extended caps —
 # legal per spec; in that case every port stays "unknown" and Phase 3
@@ -48,23 +63,51 @@ fn xhci_xecp_classify_ports() {
         xhci_port_proto = page;
     }
 
-    if (xhci_xecp == 0) { return 1; }   # No extended caps — leave all 0
+    if (xhci_xecp == 0) {
+        # No extended caps — stamp empty inventory and leave all 0.
+        xhci_cmos_stamp(0x68, 0);   # cap_count = 0
+        xhci_cmos_stamp(0x69, 0);   # cap_id_bitmap = 0
+        xhci_cmos_stamp(0x6A, 0);   # first SupProto fingerprint = 0
+        return 1;
+    }
+
+    # Inventory accumulators stamped after the walk.
+    var cap_count       = 0;
+    var cap_id_bitmap   = 0;   # bit 0 = USBLEGSUP, bit 1 = SupportedProtocol
+    var first_supproto  = 0;   # 1 once first SupProto cap seen
+    var first_rev       = 0;
+    var first_pcount    = 0;
 
     var cap_off = xhci_xecp * 4;        # First cap, in bytes from MMIO base
     var safety = 0;
     while (cap_off != 0) {
-        if (safety > 64) { return 1; }   # Cap chain bounded; defensive
+        if (safety > 64) {
+            # Defensive ceiling hit — stamp what we have and bail.
+            xhci_cmos_stamp(0x68, cap_count & 0xFF);
+            xhci_cmos_stamp(0x69, cap_id_bitmap & 0xFF);
+            xhci_cmos_stamp(0x6A, ((first_rev & 0xF) << 4) | (first_pcount & 0xF));
+            return 1;
+        }
         safety = safety + 1;
+        cap_count = cap_count + 1;
 
         var dw0 = load32(xhci_mmio_base + cap_off);
         var cap_id = dw0 & 0xFF;
         var next_off = (dw0 >> 8) & 0xFF;      # in dwords; 0 = end of chain
+
+        if (cap_id == XHCI_XECP_USBLEGSUP)      { cap_id_bitmap = cap_id_bitmap | 0x1; }
+        if (cap_id == XHCI_XECP_SUPPORTED_PROT) { cap_id_bitmap = cap_id_bitmap | 0x2; }
 
         if (cap_id == XHCI_XECP_SUPPORTED_PROT) {
             var rev_major = (dw0 >> 24) & 0xFF;
             var dw2 = load32(xhci_mmio_base + cap_off + 8);
             var port_off   = dw2 & 0xFF;       # 1-based
             var port_count = (dw2 >> 8) & 0xFF;
+            if (first_supproto == 0) {
+                first_supproto = 1;
+                first_rev = rev_major;
+                first_pcount = port_count;
+            }
             var p = port_off;
             while (p < port_off + port_count) {
                 if (p >= 1) {
@@ -79,6 +122,9 @@ fn xhci_xecp_classify_ports() {
         if (next_off == 0) { cap_off = 0; }
         else { cap_off = cap_off + next_off * 4; }
     }
+    xhci_cmos_stamp(0x68, cap_count & 0xFF);
+    xhci_cmos_stamp(0x69, cap_id_bitmap & 0xFF);
+    xhci_cmos_stamp(0x6A, ((first_rev & 0xF) << 4) | (first_pcount & 0xF));
     return 1;
 }
 
@@ -98,13 +144,17 @@ fn xhci_xecp_classify_ports() {
 fn xhci_usblegsup_claim() {
     if (xhci_xecp == 0) {
         kprintln("xhci: USBLEGSUP n/a (no xECP)", 29);
+        xhci_cmos_stamp(0x62, 0);   # outcome enum: 0 = n/a-no-xECP
         return 1;
     }
 
     var cap_off = xhci_xecp * 4;
     var safety = 0;
     while (cap_off != 0) {
-        if (safety > 64) { return 1; }
+        if (safety > 64) {
+            xhci_cmos_stamp(0x62, 4);   # outcome enum: 4 = cap-not-present (safety bound)
+            return 1;
+        }
         safety = safety + 1;
 
         var dw0 = load32(xhci_mmio_base + cap_off);
@@ -117,6 +167,7 @@ fn xhci_usblegsup_claim() {
             store32(xhci_mmio_base + cap_off, legsup | 0x1000000);
             if ((legsup & 0x10000) == 0) {
                 kprintln("xhci: USBLEGSUP already OS-owned", 32);
+                xhci_cmos_stamp(0x62, 1);   # outcome enum: 1 = already-OS-owned
                 return 1;
             }
             # Poll until BIOS-Owned (bit 16) clears. Spec recommends
@@ -127,11 +178,13 @@ fn xhci_usblegsup_claim() {
                 var ls2 = load32(xhci_mmio_base + cap_off);
                 if ((ls2 & 0x10000) == 0) {
                     kprintln("xhci: USBLEGSUP claimed from BIOS", 33);
+                    xhci_cmos_stamp(0x62, 2);   # outcome enum: 2 = claimed-from-BIOS
                     return 1;
                 }
                 wait = wait + 1;
             }
             kprintln("xhci: USBLEGSUP BIOS held (timeout)", 35);
+            xhci_cmos_stamp(0x62, 3);   # outcome enum: 3 = BIOS-held-timeout
             return 0;
         }
 
@@ -140,6 +193,7 @@ fn xhci_usblegsup_claim() {
     }
 
     kprintln("xhci: USBLEGSUP n/a (cap not present)", 37);
+    xhci_cmos_stamp(0x62, 4);   # outcome enum: 4 = cap-not-present
     return 1;
 }
 

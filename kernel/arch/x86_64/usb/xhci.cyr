@@ -581,14 +581,20 @@ fn xhci_get_device_descriptor(slot_id, length) {
 fn xhci_enumerate_port(port_num) {
     var psc = xhci_portsc_read(port_num);
     if ((psc & 0x1) == 0) { return 0; }   # CCS=0 — nothing attached
+    # CCS=1 — record for CMOS post-mortem (slot 0x63).
+    xhci_port_ccs_mask = xhci_port_ccs_mask | (1 << (port_num - 1));
 
     var proto = load8(xhci_port_proto + port_num);   # 2, 3, or 0=unknown
     if (xhci_port_reset(port_num, proto) == 0) {
         kprint("xhci: port ", 11);
         kprint_num(port_num);
-        kprintln(" reset failed", 13);
+        kprint(" reset failed (proto=", 21);
+        kprint_num(proto);
+        kprintln(")", 1);
         return 0;
     }
+    # Reset succeeded — record for CMOS post-mortem (slot 0x64).
+    xhci_port_reset_mask = xhci_port_reset_mask | (1 << (port_num - 1));
 
     var speed = xhci_port_speed(port_num);
     var slot_id = xhci_enable_slot();
@@ -738,6 +744,22 @@ fn xhci_enumerate() {
         }
         p = p + 1;
     }
+
+    # CMOS post-mortem stamps: per-port CCS bitmap, reset-success bitmap,
+    # and packed proto nibbles for ports 1..6. Decoded via `read-boot-log`
+    # slots 0x63 / 0x64 / 0x65 / 0x66 / 0x67. Stamped before the kcp
+    # write so the kcp slot stays last-write-wins-clean for kybernet.
+    xhci_cmos_stamp(0x63, xhci_port_ccs_mask & 0xFF);
+    xhci_cmos_stamp(0x64, xhci_port_reset_mask & 0xFF);
+    var pp1 = load8(xhci_port_proto + 1) & 0xF;
+    var pp2 = load8(xhci_port_proto + 2) & 0xF;
+    var pp3 = load8(xhci_port_proto + 3) & 0xF;
+    var pp4 = load8(xhci_port_proto + 4) & 0xF;
+    var pp5 = load8(xhci_port_proto + 5) & 0xF;
+    var pp6 = load8(xhci_port_proto + 6) & 0xF;
+    xhci_cmos_stamp(0x65, (pp1 << 4) | pp2);
+    xhci_cmos_stamp(0x66, (pp3 << 4) | pp4);
+    xhci_cmos_stamp(0x67, (pp5 << 4) | pp6);
 
     if (any_addressed != 0) {
         # CMOS kernel checkpoint 0x32 (xhci port enumeration complete,
