@@ -5,6 +5,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.30.0] — 2026-05-13 (iron-validated 2026-05-15)
+
+**Kernel ABI break — entry contract switches from multiboot2 to AGNOS
+sovereign boot-info struct (Path C handoff).** Closes the
+Path-A → Path-C transition triggered by GRUB's strict-W^X EFI
+relocator being incompatible with multiboot2 on modern firmware
+(see `agnosticos/docs/development/iron-boot-testing-log.md`
+§ Diagnosis 2 for the forensic trail and
+`agnosticos/docs/development/path-c-sovereign-uefi.md` for the
+new plan). Pairs with **gnoboot v0.2.0** — the AGNOS sovereign
+UEFI bootloader that replaces GRUB on the boot path (gnoboot
+shipped its CMOS-removal + banner-tightening cleanup track at
+0.2.0 same-cycle).
+
+**Iron validation completed 2026-05-15 on archaemenid (NUC AMD).**
+The initial 2026-05-13 cut compiled but had not booted on iron.
+Attempts 4–29 walked the bring-up; **Attempt 28 (2026-05-15)**
+hit the MVP-spine end-to-end (closed-beta CP `0x11` MAGENTA held;
+kernel completed init → idle → userland exec → kybernet → shell);
+**Attempt 29 cleanup-pass burn (~16:45 PDT)** rendered the full
+kernel log on the framebuffer in coherent text and surfaced the
+USB-keyboard blocker (MVP gap #3 — falsified PS/2-SMM-emulation
+hypothesis on this firmware; carried into 1.30.1 as the next
+substantive work). The repairs / cleanup / boot-shim canaries that
+landed across this cycle are folded below into Added / Changed /
+Fixed.
+
+cyrius pin **5.11.43 → 5.11.55** (5.11.43 → 5.11.53 at initial cut;
+.53 → .55 during iron-validation as the cyrius cycle ran ahead);
+`build/agnos` **251056 → 266312 bytes** (+15,256 across the cycle —
+visual canary, CMOS boot-log, Repair P, kprint mirror, cleanup pass,
++ DCE / link state shifts); entry unchanged at `0x1000A8`.
+
 ### Added
 
 - **Repair (P) — explicit `FB_CONSOLE_Y0` / `FB_FG` / `FB_BG` re-assign
@@ -27,6 +60,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   filing into `cyrius/docs/development/issues/` is gated on Attempt 29
   visual confirmation. Kernel 253,768 → 266,712 B (size delta dominated
   by DCE/link state, not the 3-line repair).
+
+- **Post-Attempt-29 cleanup pass** — strip cp_fb call sites; collapse
+  serial_print/serial_println into kprint/kprintln; shrink
+  `FB_CONSOLE_Y0` 80 → 8 (boot_shim canary stripe stays at y=0..7).
+  All 19 `cp_fb(...)` call lines stripped from `main.cyr` (the CMOS
+  port-I/O stamps preserved — still readable post-mortem via
+  `read-boot-log.sh`); 85 `serial_print(`/`serial_println(` calls →
+  `kprint(`/`kprintln(` (mirrors to both serial + framebuffer; fixes
+  the scrambled-digits issue from the Attempt 29 photo where labels
+  weren't mirroring but numbers were). `cp_fb()` fn + color palette
+  preserved in `fb.cyr` — one-line `cp_fb(<idx>, <color>);` re-add
+  is the future-bisection path. `read-boot-log.cyr` (in agnosticos)
+  verdict text refreshed for the post-cleanup kernel. Burn-verified
+  ~16:45 PDT 2026-05-15: full kernel log rendered coherently on
+  framebuffer, shell prompt visible, USB-kbd blocker surfaced (1.30.1
+  scope). Kernel 266,712 → 266,312 B (-400 from cp_fb call removal
+  partially offset by kprint indirection vs direct serial_print).
 
 - **Repair (O) — mem-iso test block deletion** (`kernel/core/main.cyr`).
   Attempts 17–27 (11 iron burns, repair letters F–N) chased a fault
@@ -84,9 +134,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   body, not the `timer_isr[]` buffer (its 1-byte headroom is
   unaffected). Companion `agnosticos/scripts/src/read-boot-log.cyr`
   updated with the [0x62..0x68] interpreter and revised kcp=104
-  verdict pointing at the new stamp ladder. Joins Repairs F+H+I+J
-  in the in-flight `1.30.1` candidate; VERSION stays at 1.30.0 until
-  iron-boot validates the cut.
+  verdict pointing at the new stamp ladder. Joined Repairs F+H+I+J
+  in-flight; the mem-iso block (and its stamps) was subsequently
+  deleted by Repair (O) when post-MVP framing was confirmed.
 
 - **Persistent CMOS boot-log at kernel entry** (Attempt 8 bisection;
   `kernel/arch/x86_64/boot_shim.cyr` ELF64 path). Attempt 7's visual
@@ -161,6 +211,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Boot-info source register: `RBX → RDI`.** The kernel's ELF64
+  entry shim no longer expects `RBX = MBI ptr` from multiboot2
+  § 8.4.3; it now expects `RDI = &agnos_boot_info` from gnoboot's
+  sovereign handoff (struct magic `0x41474E4F = 'AGNO'`; layout
+  spec in agnosticos's path-c plan § Handoff).
+  - `kernel/arch/x86_64/mbi.cyr`: asm byte `0x18 → 0x38`
+    (`mov [rax], rbx` → `mov [rax], rdi`). Function renamed
+    `mbi_capture_rbx` → `boot_info_capture_rdi`. Header comment
+    block fully rewritten for sovereign-struct context.
+  - `kernel/arch/x86_64/boot_data.cyr`: global renamed
+    `mb_info_ptr` → `boot_info_ptr`.
+  - `kernel/arch/x86_64/boot_shim.cyr`: call site updated; ELF64
+    shim header comments rewritten end-to-end (RBX/MB2 → RDI/sov).
+- **cyrius pin**: 5.11.43 → 5.11.53 → **5.11.55**. Initial cut took
+  5.11.43 → 5.11.53 to pick up the post-Path-A fixes (entry-save REX
+  hotfix from 5.11.53; byte-array literal + `fn efi_main` convention
+  from 5.11.51/.52). During iron-validation the cyrius cycle ran
+  ahead to 5.11.55 (the stdlib-annotation-arc + consumer-issue
+  closeout burst landed 55 patches across 2026-05-11/12/13); pin
+  re-synced to 5.11.55 to stay current with the gnoboot 5.11.53 pin
+  and avoid stale stdlib lag.
 - **SMP AP-wakeup IPI block gated for Attempt 10 diagnostic**
   (`kernel/arch/x86_64/smp.cyr:177-189`). Attempt 9 on iron Zen advanced
   past Attempt 8's `tss_init_cpu` slot-trap and now dies between kernel
@@ -184,7 +255,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   0x07 → fault is in trampoline build or stack alloc, instrument finer
   in Attempt 11. See
   `agnosticos/docs/development/iron-boot-testing-log.md` § *Attempt 9*.
-
 - **Boot-info struct version bumped 1 → 2** to consume gnoboot v0.1.0+'s
   inlined framebuffer fields at offsets 0x48-0x5C (`fb_phys`,
   `fb_pitch`, `fb_width`, `fb_height`, `fb_pixel_format`). Kernel
@@ -228,42 +298,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stay in-bounds), but corrupted other kernel state. Resize to
   `var gdt[104]`. Found by code-reading after the `tss_init_cpu` slot
   fix above.
-
-## [1.30.0] — 2026-05-13
-
-**Kernel ABI break — entry contract switches from multiboot2 to AGNOS
-sovereign boot-info struct (Path C handoff).** Closes the
-Path-A → Path-C transition triggered by GRUB's strict-W^X EFI
-relocator being incompatible with multiboot2 on modern firmware
-(see `agnosticos/docs/development/iron-boot-testing-log.md`
-§ Diagnosis 2 for the forensic trail and
-`agnosticos/docs/development/path-c-sovereign-uefi.md` for the
-new plan). Pairs with **gnoboot v0.1.0** — the new AGNOS sovereign
-UEFI bootloader that replaces GRUB on the boot path.
-
-cyrius pin **5.11.43 → 5.11.53**; `build/agnos` **251056 → 251040 bytes**
-(-16 from rename + reachable-fn shift); entry unchanged at `0x1000A8`.
-
-### Changed
-
-- **Boot-info source register: `RBX → RDI`.** The kernel's ELF64
-  entry shim no longer expects `RBX = MBI ptr` from multiboot2
-  § 8.4.3; it now expects `RDI = &agnos_boot_info` from gnoboot's
-  sovereign handoff (struct magic `0x41474E4F = 'AGNO'`; layout
-  spec in agnosticos's path-c plan § Handoff).
-  - `kernel/arch/x86_64/mbi.cyr`: asm byte `0x18 → 0x38`
-    (`mov [rax], rbx` → `mov [rax], rdi`). Function renamed
-    `mbi_capture_rbx` → `boot_info_capture_rdi`. Header comment
-    block fully rewritten for sovereign-struct context.
-  - `kernel/arch/x86_64/boot_data.cyr`: global renamed
-    `mb_info_ptr` → `boot_info_ptr`.
-  - `kernel/arch/x86_64/boot_shim.cyr`: call site updated; ELF64
-    shim header comments rewritten end-to-end (RBX/MB2 → RDI/sov).
-- **cyrius pin**: 5.11.43 → 5.11.53. Picks up the post-Path-A
-  fixes (entry-save REX hotfix from 5.11.53; byte-array literal +
-  `fn efi_main` convention from 5.11.51/.52 — none of which affect
-  the AGNOS kernel itself, but pin synchrony with gnoboot reduces
-  investigation surface when iron-boot debug picks back up).
 
 ### CI restructure
 
@@ -309,21 +343,35 @@ cyrius pin **5.11.43 → 5.11.53**; `build/agnos` **251056 → 251040 bytes**
   `boot_info_ptr` yet — the kernel just stashes the pointer.
   Adding those is part of the 1.30.x scheduler-under-UEFI sub-arc.
 
-### Open (tracked in state.md § Open investigation)
+### Closed during iron validation (2026-05-15)
 
 - **Timer-driven scheduler stops after ~10 context switches** under
-  gnoboot+OVMF. Root cause likely involves `pt_init` writing kernel
-  page tables at fixed physical `0x1000/0x2000/0x3000` (only valid
-  under the multiboot1 boot-shim's seeded tables, not under UEFI),
-  with downstream corruption in `apic_init` (maps `0xFEE00000` via
-  same broken PT) and `proc_create_address_space` (templates the
-  per-process PD off the broken kernel PD). Fix path: stop assuming
-  fixed-physical page-table location — either `pmm_alloc` the kernel
-  PML4/PDPT/PD too, or detect UEFI vs `-kernel` boot and branch.
-- **Iron Attempt 5 on NUC AMD** pending USB re-provision via
-  `agnosticos/scripts/install-usb.sh` + gnoboot v0.1.0 + this kernel.
-  Real iron may behave differently from OVMF; if iron boots through
-  to scheduler, the QEMU-specific bug isn't iron-blocking.
+  gnoboot+OVMF → ✅ resolved. On iron (Attempt 28 onward), the
+  scheduler completes a 50+ tick run cleanly; QEMU+OVMF behavior
+  diverged from iron because of the gnoboot+OVMF inherited-mapping
+  edge case, not a load-bearing kernel bug. Repair (O) deleting the
+  mem-iso test block (post-MVP work breaking pre-MVP boot) was the
+  actual fix; the previously-hypothesized fixed-physical page-table
+  concern turned out to not be the root cause.
+- **Iron Attempt 5 on NUC AMD** → ✅ resolved (and 24 more attempts
+  past it). USB re-provision via `agnosticos/scripts/install-usb.sh`
+  + gnoboot 0.1.0 (then 0.2.0) + repeated kernel rebuilds carried
+  the bring-up through Attempts 4–29. Closed-beta gate (CP `0x11`
+  MAGENTA) held from Attempt 16; full spine on iron at Attempt 28;
+  shell visible on iron at Attempt 29; cleanup-pass burn ~16:45 PDT
+  validated the full text log on framebuffer. The remaining
+  USB-keyboard input blocker (MVP gap #3) is carried into 1.30.1 —
+  not a 1.30.0 regression, a new-driver scope.
+
+### Open (carry-forward to 1.30.1)
+
+- **USB-keyboard scancodes not reaching `kb_buf`** on archaemenid
+  (UEFI legacy SMM PS/2-emulation genuinely off post-EBS;
+  BIOS-knob + every USB-A port confirmed). Real-answer fallback:
+  native XHCI + USB-HID-boot-protocol driver in
+  `kernel/arch/x86_64/usb/` — scoped at
+  `agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`,
+  5 phases, ~1.2–2.1k LOC, kernel-side, in-tree.
 
 ### Out of scope (1.30.0)
 
