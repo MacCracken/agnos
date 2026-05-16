@@ -145,6 +145,15 @@ kprintln(" devices", 8);
 # === CMOS kernel checkpoint 11 (ACPI + PCI enumerated) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0B; 0xE6; 0x71; }
 
+# xHCI Phase 1 — locate the USB 3.x host controller (if present),
+# identity-map already covered by pt_init (0–4 GB), read capability
+# window, cache MaxSlots/MaxIntrs/MaxPorts/CSZ/DBOFF/RTSOFF as module
+# globals for later phases. Probe-only — no controller reset, no DMA,
+# no port enumeration. CMOS checkpoint 0x30 stamps on success. See
+# `agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`
+# § Phase 1.
+xhci_probe();
+
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
 if (acpi_iommu_base != 0) {
     if (iommu_init() == 0) {

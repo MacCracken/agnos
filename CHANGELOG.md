@@ -5,6 +5,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **xHCI Phase 1 — PCIe discovery + capability reads**
+  (`kernel/arch/x86_64/usb/xhci.cyr`, `kernel/arch/x86_64/usb/xhci_regs.cyr`).
+  First phase of the in-tree USB-HID-boot keyboard driver. Locates the
+  USB 3.x host controller via PCI class lookup (class `0x0C`, subclass
+  `0x03`, prog-if `0x30`), reads the capability window from the MMIO
+  BAR, and caches `MaxSlots` / `MaxIntrs` / `MaxPorts` / context-size /
+  `AC64` / `DBOFF` / `RTSOFF` / `xECP` as module globals for later
+  phases. Probe-only — no controller reset, no DMA, no port enumeration
+  (those are Phase 2 onward). Iron-test gate: framebuffer shows
+  `xhci: found at <addr>, ver=1.X0, N slots, M ports` and CMOS reaches
+  `kcp = 0x30`. `build/agnos` 266,312 → 273,816 B (+7,504). Bus master
+  + memory space access enabled on the PCI command register at probe
+  time so Phase 2 can talk to the controller. Scoping +
+  per-phase roadmap:
+  [`agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/usb-hid-keyboard-driver.md).
+
+### Changed
+
+- **`pci.cyr` extended with class-code capture + 64-bit BAR support.**
+  Added side arrays `pci_class[256]` (packed
+  `class<<16 | subclass<<8 | prog_if` per slot) and `pci_bar0_hi[256]`
+  (high 32 bits when BAR0 is a 64-bit memory BAR per PCI 3.0
+  §6.2.5.1 type field). `pci_scan` now populates both arrays
+  alongside the existing `PciDev` struct. Existing consumers
+  (`virtio_net`, `virtio_blk`, `iommu`, `shell.cyr` lspci) stay
+  byte-compatible against `&pci_devs + i * 32` indexing — no struct
+  changes. New helpers `pci_find_by_class(class, subclass, prog_if)`
+  + `pci_bar0_64(idx)` are the access points for the xHCI probe and
+  any future class-driven lookup (NVMe, future Ethernet, etc.).
+
 ## [1.30.0] — 2026-05-13 (iron-validated 2026-05-15)
 
 **Kernel ABI break — entry contract switches from multiboot2 to AGNOS

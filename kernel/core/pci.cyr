@@ -18,6 +18,13 @@ struct PciDev { slot; vendor; device; bar0; }
 var pci_devs[1024];  # 32 entries x 32 bytes (max 32 PCI slots)
 var pci_count = 0;
 
+# Side arrays parallel to pci_devs[i*32]. Kept separate from PciDev so
+# existing consumers (virtio_net, virtio_blk, iommu, shell.cyr lspci)
+# stay byte-compatible against `&pci_devs + i * 32` indexing.
+# v1.30.1: added for xhci_probe (PCI class lookup + 64-bit BAR readback).
+var pci_class[256];     # 32 entries x 8 bytes; packed (class<<16 | subclass<<8 | prog_if)
+var pci_bar0_hi[256];   # 32 entries x 8 bytes; high 32 bits of BAR0 when 64-bit memory BAR
+
 fn pci_addr(bus, slot, func, off) {
     return 0x80000000 | (bus << 16) | (slot << 11) | (func << 8) | (off & 0xFC);
 }
@@ -69,7 +76,33 @@ fn pci_scan() {
                 PciDev_set_slot(base, slot);
                 PciDev_set_vendor(base, vendor & 0xFFFF);
                 PciDev_set_device(base, (vendor >> 16) & 0xFFFF);
-                PciDev_set_bar0(base, pci_read32(0, slot, 0, 0x10));
+                var bar0_lo = pci_read32(0, slot, 0, 0x10);
+                PciDev_set_bar0(base, bar0_lo);
+                # Class code register (PCI config offset 0x08):
+                #   byte 0 = revision, byte 1 = prog-if,
+                #   byte 2 = subclass, byte 3 = class.
+                # Pack as (class<<16 | subclass<<8 | prog_if) — drops
+                # revision, which no consumer needs in v1.30.1.
+                var class_reg = pci_read32(0, slot, 0, 0x08);
+                var packed = (((class_reg >> 24) & 0xFF) << 16)
+                           | (((class_reg >> 16) & 0xFF) << 8)
+                           | ((class_reg >> 8) & 0xFF);
+                store64(&pci_class + pci_count * 8, packed);
+                # 64-bit memory BAR detection (BAR layout per PCI 3.0 §6.2.5.1):
+                #   bit 0 = 0 (memory), bits 2:1 = type (0=32, 2=64).
+                # When BAR0 is a 64-bit memory BAR, BAR1 holds the high
+                # 32 bits of the same logical BAR. Otherwise BAR1 is a
+                # separate BAR (or absent) and bar0_hi stays 0. Existing
+                # 32-bit BAR0 consumers (virtio_net/blk) are unaffected
+                # because PciDev_bar0 still returns the low 32 bits.
+                var bar0_hi = 0;
+                if ((bar0_lo & 0x01) == 0) {
+                    var bar_type = (bar0_lo >> 1) & 0x03;
+                    if (bar_type == 2) {
+                        bar0_hi = pci_read32(0, slot, 0, 0x14);
+                    }
+                }
+                store64(&pci_bar0_hi + pci_count * 8, bar0_hi);
                 pci_count = pci_count + 1;
             }
         }
@@ -87,4 +120,30 @@ fn pci_find(vendor, device) {
         }
     }
     return 0 - 1;
+}
+
+# Locate a PCI device by (class, subclass, prog_if). Returns the
+# pci_devs index, or -1 if not present. Added v1.30.1 for xhci_probe
+# (class 0x0C, subclass 0x03, prog-if 0x30) but generic — any class
+# lookup works.
+fn pci_find_by_class(class_code, subclass, prog_if) {
+    var want = (class_code << 16) | (subclass << 8) | prog_if;
+    for (var i = 0; i < pci_count; i = i + 1) {
+        if (load64(&pci_class + i * 8) == want) {
+            return i;
+        }
+    }
+    return 0 - 1;
+}
+
+# Return the full 64-bit BAR0 phys for the device at pci_devs[idx],
+# with the bottom 4 flag bits masked off (memory base address only,
+# per PCI 3.0 §6.2.5.1). For 32-bit BARs the high half is zero so
+# this is bit-equivalent to the masked low half. Added v1.30.1 for
+# xhci_probe — XHCI BAR0 is always a 64-bit prefetchable memory BAR.
+fn pci_bar0_64(idx) {
+    var base = &pci_devs + idx * 32;
+    var lo = PciDev_bar0(base) & 0xFFFFFFF0;
+    var hi = load64(&pci_bar0_hi + idx * 8) & 0xFFFFFFFF;
+    return lo | (hi << 32);
 }

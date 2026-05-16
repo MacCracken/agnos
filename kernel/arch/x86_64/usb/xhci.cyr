@@ -1,0 +1,170 @@
+# === xHCI controller driver — Phase 1: probe + capability reads ===
+#
+# Locates the xHCI controller via PCI class lookup (class 0x0C, subclass
+# 0x03, prog-if 0x30), reads the capability window from its MMIO BAR,
+# and caches MaxSlots / MaxIntrs / MaxPorts / context-size / DBOFF /
+# RTSOFF as module globals for later phases.
+#
+# This is the bus-side foundation for the AGNOS in-kernel USB-HID-boot
+# keyboard driver — see
+# `agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`
+# § Phase 1 for the per-phase plan, the integration-surface table, and
+# the architectural choices locked at the start of the arc.
+#
+# Phase 1 boundaries:
+#   - WHAT it does    : finds the controller, identity-maps the BAR
+#                       (already covered by kernel `pt_init` to 4 GB),
+#                       reads CAPLENGTH/HCIVERSION/HCSPARAMS1/HCCPARAMS1/
+#                       DBOFF/RTSOFF, prints a one-line summary.
+#   - WHAT it does NOT: halt, reset, allocate DCBAA/cmd ring/event ring,
+#                       start the controller, address devices, or read
+#                       any operational/runtime register. Those are
+#                       Phase 2 onward.
+#
+# Iron-test gate: framebuffer shows
+#   `xhci: found at <addr>, ver=1.X0, N slots, M ports`
+# and CMOS[0x40] reaches kcp = 0x30 (probe completed).
+#
+# Memory-budget note: this module allocates no DMA buffers in Phase 1.
+# Total per-phase memory cost is the cache globals below (~80 bytes).
+
+# --- Cached probe outputs (populated by xhci_probe) -----------------
+
+var xhci_present    = 0;   # 1 if a controller was found, 0 otherwise
+var xhci_pci_idx    = 0;   # pci_devs index of the xHCI device
+var xhci_mmio_base  = 0;   # full 64-bit phys/virt address of MMIO BAR
+var xhci_cap_len    = 0;   # CAPLENGTH (operational reg base offset)
+var xhci_version    = 0;   # HCIVERSION (BCD: 0x0100 / 0x0110 / 0x0120)
+var xhci_max_slots  = 0;   # HCSPARAMS1[7:0]
+var xhci_max_intrs  = 0;   # HCSPARAMS1[18:8]
+var xhci_max_ports  = 0;   # HCSPARAMS1[31:24]
+var xhci_csz        = 0;   # HCCPARAMS1[2] — 0=32B context, 1=64B context
+var xhci_ac64       = 0;   # HCCPARAMS1[0] — 64-bit addressing capable
+var xhci_db_off     = 0;   # DBOFF (doorbell array offset, dword-aligned)
+var xhci_rts_off    = 0;   # RTSOFF (runtime register offset, 32B-aligned)
+var xhci_xecp       = 0;   # HCCPARAMS1[31:16] — extended cap ptr (×4)
+
+# --- Capability register accessors ----------------------------------
+#
+# Capability window is read-only and tiny (≤ 0x20 bytes). The xHCI spec
+# requires natural-alignment loads — CAPLENGTH is u8, HCIVERSION is u16,
+# everything else is u32. We honor the spec strictly here; loose typing
+# (always load32) happens to work on x86 but breaks on some embedded
+# implementations and is bad form even where it works.
+
+fn xhci_cap_read8(off) {
+    return load8(xhci_mmio_base + off);
+}
+
+fn xhci_cap_read16(off) {
+    return load16(xhci_mmio_base + off);
+}
+
+fn xhci_cap_read32(off) {
+    return load32(xhci_mmio_base + off);
+}
+
+# --- Probe ----------------------------------------------------------
+
+fn xhci_probe() {
+    # 1. Locate the controller via PCI class lookup.
+    var idx = pci_find_by_class(XHCI_PCI_CLASS, XHCI_PCI_SUBCLASS, XHCI_PCI_PROGIF);
+    if (idx < 0) {
+        kprintln("xhci: no controller found", 25);
+        return 0;
+    }
+
+    # 2. Compute MMIO base from the 64-bit BAR0. PCI 3.0 §6.2.5.1: the
+    # bottom 4 bits of BAR0 are flag bits (memory/IO, type, prefetch);
+    # `pci_bar0_64` masks them off and combines BAR0/BAR1 high half.
+    # XHCI BAR0 is required to be a 64-bit memory BAR per xHCI 1.2 §5.2.1.
+    var mmio = pci_bar0_64(idx);
+    if (mmio == 0) {
+        kprintln("xhci: BAR0 is zero (firmware did not assign)", 44);
+        return 0;
+    }
+
+    # 3. Enable bus master + memory space access on the device (PCI
+    # command register bits 1 + 2). Firmware usually leaves these set
+    # already, but assert it explicitly — the controller will be
+    # completely silent without bus-master, and we won't notice the
+    # difference until Phase 2 (cmd ring submission).
+    var slot = PciDev_slot(&pci_devs + idx * 32);
+    pci_enable_bus_master(slot);
+
+    # 4. Verify the MMIO region is reachable from kernel CR3. `pt_init`
+    # identity-maps 0–4 GB (PD at 0x3000 covers 0–1 GB at 2 MB pages;
+    # PDPT[1..3] cover 1–4 GB as 1 GB huge pages). On archaemenid the
+    # XHCI BAR should land well within the 4 GB window — anything past
+    # that would need a `vmm_alloc_at(mmio)` extension, deferred until
+    # we see iron evidence of a high BAR.
+    if (mmio >= 0x100000000) {
+        # >= 4 GB — print and bail. Phase 2 follow-up if seen on iron.
+        kprint("xhci: BAR above 4GB (not yet supported) @ ", 42);
+        kprint_num(mmio);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # 5. Cache the probe result and read the capability window.
+    xhci_present   = 1;
+    xhci_pci_idx   = idx;
+    xhci_mmio_base = mmio;
+    xhci_cap_len   = xhci_cap_read8(XHCI_CAP_CAPLENGTH);
+    xhci_version   = xhci_cap_read16(XHCI_CAP_HCIVERSION);
+
+    var hcsp1      = xhci_cap_read32(XHCI_CAP_HCSPARAMS1);
+    xhci_max_slots = hcsp1 & 0xFF;
+    xhci_max_intrs = (hcsp1 >> 8) & 0x7FF;
+    xhci_max_ports = (hcsp1 >> 24) & 0xFF;
+
+    var hccp1      = xhci_cap_read32(XHCI_CAP_HCCPARAMS1);
+    xhci_ac64      = hccp1 & 0x01;
+    xhci_csz       = (hccp1 >> 2) & 0x01;
+    xhci_xecp      = (hccp1 >> 16) & 0xFFFF;
+
+    xhci_db_off    = xhci_cap_read32(XHCI_CAP_DBOFF) & 0xFFFFFFFC;
+    xhci_rts_off   = xhci_cap_read32(XHCI_CAP_RTSOFF) & 0xFFFFFFE0;
+
+    # 6. Report the find. Format aligns with other PCI-class consumers
+    # (virtio_net / virtio_blk) — single kprintln summary plus per-field
+    # follow-ups so iron post-mortems can read each value individually.
+    kprint("xhci: found at ", 15);
+    kprint_num(mmio);
+    kprint(", ver=", 6);
+    # HCIVERSION is BCD: 0x0110 means 1.10. Print as raw hex; readers
+    # of the spec recognize 0x0100 / 0x0110 / 0x0120 / 0x0130 immediately
+    # without needing a decimal-point formatter in the kernel.
+    kprint_num(xhci_version);
+    kprint(", ", 2);
+    kprint_num(xhci_max_slots);
+    kprint(" slots, ", 8);
+    kprint_num(xhci_max_ports);
+    kprintln(" ports", 6);
+
+    kprint("xhci: caplen=", 13);
+    kprint_num(xhci_cap_len);
+    kprint(" csz=", 5);
+    kprint_num(xhci_csz);
+    kprint(" ac64=", 6);
+    kprint_num(xhci_ac64);
+    kprint(" intrs=", 7);
+    kprint_num(xhci_max_intrs);
+    kprintln("", 0);
+
+    kprint("xhci: dboff=", 12);
+    kprint_num(xhci_db_off);
+    kprint(" rtsoff=", 8);
+    kprint_num(xhci_rts_off);
+    kprint(" xecp=", 6);
+    kprint_num(xhci_xecp);
+    kprintln("", 0);
+
+    # 7. CMOS kernel checkpoint 0x30 (xhci probe complete). Readable
+    # post-mortem via `agnosticos/scripts/read-boot-log.sh`. Matches the
+    # CMOS-checkpoint convention from `core/main.cyr` — 8-byte raw asm
+    # block that survives a triple-fault reset.
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x30; 0xE6; 0x71; }
+
+    return 1;
+}

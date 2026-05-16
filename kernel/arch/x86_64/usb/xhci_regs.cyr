@@ -1,0 +1,61 @@
+# === xHCI register offset constants ===
+#
+# Reference: Intel xHCI 1.2 specification, January 2023.
+# https://www.intel.com/content/www/us/en/products/docs/io/universal-serial-bus/extensible-host-controler-interface-usb-xhci.html
+#
+# The xHCI controller exposes four register windows in the MMIO BAR:
+#
+#   MMIO[0 ..  CAPLENGTH)         Capability registers — read-only HW info
+#   MMIO[CAPLENGTH .. +0x400)     Operational registers — runtime control
+#   MMIO[DBOFF .. +N*4)           Doorbell array — one DWORD per slot
+#   MMIO[RTSOFF .. +N*0x20)       Runtime registers — interrupter state
+#
+# CAPLENGTH / DBOFF / RTSOFF are read from the capability window at boot;
+# downstream phases consume them to compute the operational/doorbell/
+# runtime addresses. Phase 1 only reads the capability window — Phase 2
+# (controller init) and later phases use the operational window.
+#
+# All multi-byte reads/writes against MMIO are PCI-coherent on x86_64 —
+# no explicit barriers required (USBLEGSUP handoff is the only edge case
+# where ordering matters, deferred to Phase 2).
+
+# Capability register offsets (relative to MMIO base)
+enum XhciCapReg {
+    XHCI_CAP_CAPLENGTH  = 0x00;     # u8  — operational reg offset
+    XHCI_CAP_HCIVERSION = 0x02;     # u16 — BCD version, e.g. 0x0110 for 1.10
+    XHCI_CAP_HCSPARAMS1 = 0x04;     # u32 — structural params 1
+    XHCI_CAP_HCSPARAMS2 = 0x08;     # u32 — structural params 2
+    XHCI_CAP_HCSPARAMS3 = 0x0C;     # u32 — structural params 3
+    XHCI_CAP_HCCPARAMS1 = 0x10;     # u32 — capability params 1
+    XHCI_CAP_DBOFF      = 0x14;     # u32 — doorbell array offset (4-byte aligned)
+    XHCI_CAP_RTSOFF     = 0x18;     # u32 — runtime register offset (32-byte aligned)
+    XHCI_CAP_HCCPARAMS2 = 0x1C;     # u32 — capability params 2 (xHCI 1.1+)
+}
+
+# HCSPARAMS1 bit fields (Intel xHCI §5.3.3) --------------------------
+#   bits [7:0]   MaxSlots  — max device slots
+#   bits [18:8]  MaxIntrs  — max interrupters
+#   bits [31:24] MaxPorts  — max root hub ports
+
+# HCCPARAMS1 bit fields (Intel xHCI §5.3.6) --------------------------
+#   bit 0        AC64      — 64-bit addressing capability
+#   bit 1        BNC       — bandwidth negotiation
+#   bit 2        CSZ       — context size (0 = 32-byte, 1 = 64-byte)
+#   bit 3        PPC       — port power control
+#   bit 4        PIND      — port indicators
+#   bit 5        LHRC      — light HC reset capability
+#   bit 6        LTC       — latency tolerance messaging
+#   bit 7        NSS       — no secondary SID
+#   bit 8        PAE       — parse all event data
+#   bit 9        SPC       — stopped EDTLA capability (xHCI 1.1+)
+#   bit 10       SEC       — stopped short packet capability
+#   bit 11       CFC       — contiguous frame ID capability
+#   bits [15:12] MaxPSASize  - max primary stream array size
+#   bits [31:16] xECP      — extended capability pointer (offset / 4)
+
+# PCI class triple for xHCI controllers (per PCI-SIG class code list)
+enum XhciPciClass {
+    XHCI_PCI_CLASS    = 0x0C;       # Serial Bus Controller
+    XHCI_PCI_SUBCLASS = 0x03;       # USB Controller
+    XHCI_PCI_PROGIF   = 0x30;       # xHCI (vs 0x00=UHCI, 0x10=OHCI, 0x20=EHCI)
+}
