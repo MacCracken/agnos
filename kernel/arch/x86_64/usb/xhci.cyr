@@ -250,6 +250,13 @@ fn xhci_rt_write64(addr, val) {
 fn xhci_init() {
     if (xhci_present == 0) { return 0; }
 
+    # Phase 2.5 — claim USBLEGSUP from BIOS before any halt / reset /
+    # operational-register writes. Best-effort: failure here does NOT
+    # abort init; the downstream halt-reset-start chain may still work
+    # on platforms whose BIOS doesn't actively interfere, and the iron
+    # log makes the claim outcome explicit either way.
+    xhci_usblegsup_claim();
+
     # 1. Halt: clear R/S bit, wait for HCH.
     var cmd = xhci_op_read32(XHCI_OP_USBCMD);
     if ((cmd & 0x01) != 0) {

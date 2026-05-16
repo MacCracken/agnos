@@ -82,6 +82,67 @@ fn xhci_xecp_classify_ports() {
     return 1;
 }
 
+# Phase 2.5 — claim the controller from BIOS via the USBLEGSUP extended
+# cap. xHCI 1.2 §4.22.1: BIOS owns the controller post-POST until SW
+# writes HC OS Owned (bit 24) and observes HC BIOS Owned (bit 16) clear.
+# While BIOS owns, SMI handlers wired for legacy USB emulation can
+# silently absorb operational-register writes — exactly the symptom on
+# archaemenid Attempt 32 where the USB2 `PR` write produced no PRC.
+#
+# Best-effort: any failure path (no xECP, no USBLEGSUP cap, BIOS won't
+# release) is non-fatal. The downstream port-reset path will still
+# surface its own diagnostic if the original symptom recurs; this fn
+# just adds the missing diagnostic edge — did we attempt the handoff,
+# and did BIOS yield. Returns 1 on success or no-op, 0 only on timeout
+# (BIOS-owned never cleared). xhci_init proceeds either way.
+fn xhci_usblegsup_claim() {
+    if (xhci_xecp == 0) {
+        kprintln("xhci: USBLEGSUP n/a (no xECP)", 29);
+        return 1;
+    }
+
+    var cap_off = xhci_xecp * 4;
+    var safety = 0;
+    while (cap_off != 0) {
+        if (safety > 64) { return 1; }
+        safety = safety + 1;
+
+        var dw0 = load32(xhci_mmio_base + cap_off);
+        var cap_id = dw0 & 0xFF;
+        var next_off = (dw0 >> 8) & 0xFF;
+
+        if (cap_id == XHCI_XECP_USBLEGSUP) {
+            var legsup = load32(xhci_mmio_base + cap_off);
+            # Always set OS-Owned (bit 24); harmless if already set.
+            store32(xhci_mmio_base + cap_off, legsup | 0x1000000);
+            if ((legsup & 0x10000) == 0) {
+                kprintln("xhci: USBLEGSUP already OS-owned", 32);
+                return 1;
+            }
+            # Poll until BIOS-Owned (bit 16) clears. Spec recommends
+            # ~1 s; 10M iters matches the order-of-magnitude budget used
+            # elsewhere in this file (~250 ms per 1M iter on Zen).
+            var wait = 0;
+            while (wait < 10000000) {
+                var ls2 = load32(xhci_mmio_base + cap_off);
+                if ((ls2 & 0x10000) == 0) {
+                    kprintln("xhci: USBLEGSUP claimed from BIOS", 33);
+                    return 1;
+                }
+                wait = wait + 1;
+            }
+            kprintln("xhci: USBLEGSUP BIOS held (timeout)", 35);
+            return 0;
+        }
+
+        if (next_off == 0) { cap_off = 0; }
+        else { cap_off = cap_off + next_off * 4; }
+    }
+
+    kprintln("xhci: USBLEGSUP n/a (cap not present)", 37);
+    return 1;
+}
+
 # Per-port PORTSC accessors. Port numbers are 1-based throughout this
 # file to match xHCI spec wording; the offset math compensates.
 fn xhci_portsc_addr(port_num) {
