@@ -719,6 +719,13 @@ fn xhci_enumerate() {
     if (xhci_slot_tables_init() == 0) { return 0; }
     if (xhci_xecp_classify_ports() == 0) { return 0; }
 
+    # Assert PORTSC.PP=1 across all root-hub ports so CCS / PED / PR
+    # become meaningful. Without this, every PORTSC reads CCS=0 on
+    # controllers with HCCPARAMS1.PPC=1 (AMD FCH default after HCRST).
+    # See xhci_ports_power_on in xhci_port.cyr for the full sequence
+    # and CMOS[0x6B] post-mortem.
+    xhci_ports_power_on();
+
     var any_addressed = 0;
     var p = 1;
     while (p <= xhci_max_ports) {

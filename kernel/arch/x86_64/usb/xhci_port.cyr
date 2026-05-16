@@ -39,13 +39,56 @@ var xhci_port_proto = 0;   # Pointer into a PMM page allocated at init
 var xhci_port_ccs_mask   = 0;   # bit p-1 set if port p reported CCS=1
 var xhci_port_reset_mask = 0;   # bit p-1 set if xhci_port_reset(p) returned 1
 
-# CMOS post-mortem stamp for xhci state. Slot in [0x62..0x6A]; val low
+# CMOS post-mortem stamp for xhci state. Slot in [0x62..0x6B]; val low
 # byte only. Slots are the Repair-O retired range — `read-boot-log` is
 # the decoder pair.
 fn xhci_cmos_stamp(slot, val) {
     outb(0x70, slot);
     outb(0x71, val & 0xFF);
     return 0;
+}
+
+# Phase 3 prep: assert PORTSC.PP=1 on every root-hub port so attached
+# devices can register a connect. xHCI 1.2 §4.19.1.1 + §5.4.8: when
+# HCCPARAMS1.PPC=1, HCRST leaves PP=0 and SW must explicitly set PP=1
+# before CCS / PED / PR transitions are meaningful. When PPC=0 the bit
+# reads as 1 unconditionally and the write is a no-op — safe either way.
+#
+# After PP=1 the USB power-on debounce (~20ms typ per USB 2.0 §11.5.1.5
+# / xHCI 1.2 §4.19.5) must elapse before CCS settles. No wall clock is
+# available pre-PIT; reuse the same coarse poll-count idiom the reset
+# path uses (1M iterations ≈ 100ms scale on Zen-class silicon, well past
+# the 20ms requirement).
+#
+# Stamps CMOS[0x6B] with the bitmap of ports that read PP=1 after the
+# debounce. read-boot-log decodes the slot — empty bitmap = controller
+# refused PP writes (PPC=1 but other bits gate it, or controller-level
+# port disable upstream); full bitmap = PP stuck (or PPC=0, indistinguishable
+# at this layer — diagnostic still useful because partial bitmaps tell us
+# something asymmetric is happening).
+fn xhci_ports_power_on() {
+    var p = 1;
+    while (p <= xhci_max_ports) {
+        var psc = xhci_portsc_read(p);
+        xhci_portsc_write(p, (psc & 0xFF01FFFF) | 0x200, 0);   # PP = bit 9
+        p = p + 1;
+    }
+    # Debounce — single global wait covers all ports since writes above
+    # were back-to-back. Coarse, no clock.
+    var wait = 0;
+    while (wait < 1000000) { wait = wait + 1; }
+    # Confirm PP stuck and stamp the bitmap for post-mortem.
+    var pp_set_mask = 0;
+    var p2 = 1;
+    while (p2 <= xhci_max_ports) {
+        var psc2 = xhci_portsc_read(p2);
+        if ((psc2 & 0x200) != 0) {
+            pp_set_mask = pp_set_mask | (1 << (p2 - 1));
+        }
+        p2 = p2 + 1;
+    }
+    xhci_cmos_stamp(0x6B, pp_set_mask & 0xFF);
+    return 1;
 }
 
 # Walk the xECP chain and populate xhci_port_proto. Returns 1 on success,

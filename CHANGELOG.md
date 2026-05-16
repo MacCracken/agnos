@@ -5,6 +5,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **xHCI Phase 3 — assert PORTSC.PP=1 before port enumeration**
+  (`kernel/arch/x86_64/usb/xhci_port.cyr`,
+  `kernel/arch/x86_64/usb/xhci.cyr`). Root cause of the
+  Attempt-37 iron-boot symptom: every PORTSC slot reported
+  `CCS=0` across all 6 archaemenid ports despite physically
+  attached devices (`read-boot-log` CMOS[0x63] = `0x00`).
+  xHCI 1.2 §4.19.1.1 / §5.4.8: when `HCCPARAMS1.PPC=1`
+  (the AMD FCH default), `HCRST` leaves `PORTSC.PP=0` on
+  every port and the controller gates the receiver until
+  software asserts `PP=1` explicitly. The kernel previously
+  documented the `PP` bit in `xhci_regs.cyr:196` but never
+  wrote it — `xhci_init`'s `HCRST` flipped every port off,
+  and `xhci_enumerate` walked the ports looking at `CCS`
+  while every receiver was still gated. New
+  `xhci_ports_power_on()` walks `1..xhci_max_ports`,
+  RMWs `PORTSC` with `(psc & 0xFF01FFFF) | 0x200`
+  (preserves W1C status-change bits per the existing
+  `xhci_portsc_write` semantics), waits a coarse
+  ~100ms-scale debounce loop for the USB 2.0 §11.5.1.5
+  power-on settle window, then reads PP back per port and
+  stamps the verified bitmap to CMOS[0x6B]. Called from
+  `xhci_enumerate` between `xhci_xecp_classify_ports()`
+  and the per-port enumerate loop. Safe on PPC=0 silicon
+  (PP reads as 1 unconditionally there; the write is a
+  controller-side no-op). Iron-test gate: CMOS[0x6B] full
+  bitmap and at least one CCS bit set when a device is
+  physically attached. `build/agnos` 341,864 → 342,328 B
+  (+464). Diagnostic decoder pair:
+  `agnosticos/scripts/src/read-boot-log.cyr`
+  (CMOS slot range extended `0x62..0x6A` → `0x62..0x6B`).
+
 ### Added
 
 - **xHCI Phase 1 — PCIe discovery + capability reads**
