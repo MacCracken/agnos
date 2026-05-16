@@ -327,9 +327,9 @@ fn sh_exec(buf, len) {
         return 0;
     }
     if (sh_streq(buf, clen, "bench", 5) == 1) { return sh_cmd_bench(); }
-#ifdef TEST
+    #ifdef TEST
     if (sh_streq(buf, clen, "test", 4) == 1) { return sh_cmd_test(); }
-#endif
+    #endif
     if (sh_streq(buf, clen, "halt", 4) == 1) { return 0 - 99; }
     kprint("unknown: ", 9);
     kprint(buf, clen);

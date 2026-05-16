@@ -116,8 +116,8 @@ fn pci_record(bus, slot, func) {
     #   byte 2 = subclass, byte 3 = class.
     var class_reg = pci_read32(bus, slot, func, 0x08);
     var packed = (((class_reg >> 24) & 0xFF) << 16)
-               | (((class_reg >> 16) & 0xFF) << 8)
-               | ((class_reg >> 8) & 0xFF);
+    | (((class_reg >> 16) & 0xFF) << 8)
+    | ((class_reg >> 8) & 0xFF);
     store64(&pci_class + pci_count * 8, packed);
     # 64-bit memory BAR detection (PCI 3.0 §6.2.5.1):
     #   bit 0 = 0 (memory), bits 2:1 = type (0=32, 2=64).
