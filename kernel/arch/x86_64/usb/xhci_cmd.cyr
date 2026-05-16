@@ -1,0 +1,181 @@
+# === xHCI generic command issue + completion poll — Phase 3 ===
+#
+# Submits a single command TRB to the cmd ring at the current enqueue
+# pointer, rings doorbell 0 (Host Controller doorbell, target=0), then
+# polls the event ring for the matching Command Completion Event.
+#
+# Caller passes the four TRB dwords with the cycle bit *omitted* from
+# dword 3 — xhci_cmd_issue OR-s in the current Producer Cycle State so
+# the caller doesn't have to track it. Returns 1 on completion-code =
+# Success, 0 on any failure (timeout, non-success completion, ring not
+# initialized). The slot ID and completion code from the event are
+# exposed via globals so the caller can act on them.
+#
+# Cycle-bit / wrap discipline (xHCI 1.2 §4.9.3):
+#   - Initial PCS = 1 (set in xhci_rings_init).
+#   - Each command written at xhci_cmd_ring_idx with cycle = PCS.
+#   - When idx reaches slot 255 (Link TRB), we update the Link's cycle
+#     bit to current PCS so HW will follow it on the wrap, then flip PCS
+#     and reset idx to 0.
+#
+# Phase 3 in practice issues at most a handful of commands per boot
+# (Enable Slot + Address Device per connected USB device), so the wrap
+# path almost certainly never fires. It's still implemented correctly
+# because skipping it produces a silent-corruption failure mode that's
+# painful to diagnose on iron when port count rises (e.g. hub support).
+#
+# Event-ring drain discipline:
+#   - HW writes events with cycle bit = event ring's HW CCS.
+#   - SW's xhci_evt_ring_cycle tracks the expected cycle for the next
+#     unconsumed event. When the slot under xhci_evt_ring_idx has cycle
+#     == xhci_evt_ring_cycle, it's a new event.
+#   - After consuming, advance idx; on wrap (idx == 256), reset to 0 and
+#     flip xhci_evt_ring_cycle.
+#   - ERDP is written with bit 3 set (EHB — Event Handler Busy, W1C) per
+#     §5.5.2.3.3 to acknowledge interrupt and unblock further events.
+
+# Last-command completion result (read by callers after xhci_cmd_issue
+# returns). Slot ID is meaningful for Enable Slot (returns assigned slot)
+# and as a sanity check for slot-targeted commands (Address Device, etc.).
+var xhci_last_cmd_slot_id = 0;
+var xhci_last_cmd_ccode   = 0;
+
+# Per-command-issue completion timeout. At a few cycles per load+load
+# pair this bounds wall time to roughly a quarter second on Zen — the
+# spec doesn't define a hard ceiling but contemporary controllers
+# complete Enable Slot / Address Device in microseconds.
+var XHCI_CMD_TIMEOUT_SPINS = 10000000;
+
+# Submit one TRB to the cmd ring. cycle bit is OR-d in by this function.
+# Caller-supplied dword 3 must have its bit 0 zero.
+fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
+    if (xhci_rings_ready == 0) { return 0; }
+
+    var slot_off = xhci_cmd_ring_idx * 16;
+    var trb      = xhci_cmd_ring_phys + slot_off;
+
+    store32(trb,      p_lo);
+    store32(trb + 4,  p_hi);
+    store32(trb + 8,  status);
+    store32(trb + 12, ctrl_partial | xhci_cmd_ring_cycle);
+
+    xhci_cmd_ring_idx = xhci_cmd_ring_idx + 1;
+
+    # Wrap handling: when next free slot is 255 (the Link TRB), align the
+    # Link TRB's cycle bit with current PCS so HW follows it, then flip
+    # PCS and reset idx. Slot 255 itself is never used for commands.
+    if (xhci_cmd_ring_idx == 255) {
+        var link = xhci_cmd_ring_phys + 255 * 16;
+        var link_dw3 = load32(link + 12);
+        if (xhci_cmd_ring_cycle == 1) {
+            link_dw3 = link_dw3 | 0x1;
+        } else {
+            link_dw3 = link_dw3 & 0xFFFFFFFE;
+        }
+        store32(link + 12, link_dw3);
+        if (xhci_cmd_ring_cycle == 1) {
+            xhci_cmd_ring_cycle = 0;
+        } else {
+            xhci_cmd_ring_cycle = 1;
+        }
+        xhci_cmd_ring_idx = 0;
+    }
+
+    # Ring HC doorbell (slot 0) with target/stream = 0. xHCI 1.2 §5.6.
+    store32(xhci_mmio_base + xhci_db_off, 0);
+
+    return trb;
+}
+
+# Drain one Command Completion Event from the event ring that matches
+# the submitted cmd TRB phys. Populates xhci_last_cmd_slot_id and
+# xhci_last_cmd_ccode. Returns 1 if the completion code is Success, 0
+# otherwise (caller is responsible for inspecting the ccode global on
+# failure to decide whether to print a per-cause line).
+fn xhci_cmd_wait(cmd_trb_phys) {
+    var wait = 0;
+    while (wait < XHCI_CMD_TIMEOUT_SPINS) {
+        var evt_off = xhci_evt_ring_idx * 16;
+        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt_dw3 = load32(evt + 12);
+        var evt_cycle = evt_dw3 & 0x1;
+
+        # HW writes cycle = HW_PCS on each new event. SW's expected cycle
+        # for this slot equals xhci_evt_ring_cycle. If they differ, no
+        # new event yet — keep spinning.
+        if (evt_cycle == xhci_evt_ring_cycle) {
+            var evt_type = (evt_dw3 >> 10) & 0x3F;
+            if (evt_type == XHCI_TRB_CMD_COMPLETION) {
+                var evt_p_lo = load32(evt);
+                # Match on low 32 bits of cmd TRB phys — sufficient since
+                # cmd ring is page-aligned and < 4 GB on archaemenid.
+                if (evt_p_lo == (cmd_trb_phys & 0xFFFFFFFF)) {
+                    var evt_dw2 = load32(evt + 8);
+                    xhci_last_cmd_ccode   = (evt_dw2 >> 24) & 0xFF;
+                    xhci_last_cmd_slot_id = (evt_dw3 >> 24) & 0xFF;
+
+                    # Advance dequeue index; wrap at segment boundary by
+                    # flipping the expected cycle (HW does the same).
+                    xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+                    if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+                        xhci_evt_ring_idx = 0;
+                        if (xhci_evt_ring_cycle == 1) {
+                            xhci_evt_ring_cycle = 0;
+                        } else {
+                            xhci_evt_ring_cycle = 1;
+                        }
+                    }
+
+                    # Update ERDP with EHB (bit 3) set to clear the
+                    # Event Handler Busy state per §5.5.2.3.3.
+                    var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
+                    var new_erdp = xhci_evt_ring_phys + xhci_evt_ring_idx * 16;
+                    xhci_rt_write64(ir0 + XHCI_IR_ERDP, new_erdp | 0x8);
+
+                    if (xhci_last_cmd_ccode == XHCI_CC_SUCCESS) { return 1; }
+                    return 0;
+                }
+                # Different cmd TRB — not for us. Should not happen in
+                # Phase 3 (we issue one cmd at a time, drain before next),
+                # but defensively: consume the event and keep looking.
+                xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+                if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+                    xhci_evt_ring_idx = 0;
+                    if (xhci_evt_ring_cycle == 1) {
+                        xhci_evt_ring_cycle = 0;
+                    } else {
+                        xhci_evt_ring_cycle = 1;
+                    }
+                }
+            } else {
+                # Non-cmd-completion event (PortStatusChange, etc.).
+                # Phase 3 consumes and discards; later phases will route.
+                xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+                if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+                    xhci_evt_ring_idx = 0;
+                    if (xhci_evt_ring_cycle == 1) {
+                        xhci_evt_ring_cycle = 0;
+                    } else {
+                        xhci_evt_ring_cycle = 1;
+                    }
+                }
+            }
+        }
+        wait = wait + 1;
+    }
+
+    # Timeout — surface and return failure. ccode 0 is "Invalid" per
+    # xHCI 1.2 §6.4.5 so any non-zero check on the global still works.
+    xhci_last_cmd_ccode   = 0;
+    xhci_last_cmd_slot_id = 0;
+    kprintln("xhci: cmd completion timeout", 28);
+    return 0;
+}
+
+# Combined submit + wait — the only entry point Phase 3 callers should
+# use. Returns 1 on Success ccode, 0 on any failure path.
+fn xhci_cmd_issue(p_lo, p_hi, status, ctrl_partial) {
+    var trb_phys = xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial);
+    if (trb_phys == 0) { return 0; }
+    return xhci_cmd_wait(trb_phys);
+}

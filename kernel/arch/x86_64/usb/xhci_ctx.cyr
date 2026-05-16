@@ -1,0 +1,201 @@
+# === xHCI device context allocation + initialization — Phase 3 ===
+#
+# Builds the Input Context + Device Context pair the xHCI controller
+# needs to address a USB device. Per xHCI 1.2 §4.6.5 + §6.2, the
+# sequence is:
+#
+#   1. Allocate an Input Context (used by SW to feed the controller
+#      configuration). Layout depends on HCCPARAMS1.CSZ:
+#        CSZ=0 — 32-byte contexts: Input Control(32) + Slot(32) + EP[0..30](32*31)
+#        CSZ=1 — 64-byte contexts: Input Control(64) + Slot(64) + EP[0..30](64*31)
+#      On archaemenid CSZ=1, so each context is 64 bytes. We only need
+#      Slot + EP0 (first three contexts = 192 bytes), but the Input
+#      Control header sets the Add Context Flags so HW knows which
+#      contexts to consume.
+#
+#   2. Allocate a Device Context — same size + layout as Input, but HW
+#      writes into it (current device state after Address Device, etc.).
+#      Its phys goes into DCBAA[slot_id] so the controller can find it.
+#
+# Both are 4 KB page allocations from the PMM (one page per context is
+# more than the 192 bytes we strictly need, but simpler — and consistent
+# with Phase 2's "one page per DMA structure" pattern that already made
+# bisecting alloc failures trivial on iron).
+#
+# Phase 3 only fills Slot Context + EP0 Context. Phase 4 will add the
+# interrupt-IN endpoint context when Configure Endpoint runs.
+
+# Per-slot device state. Indexed by slot_id (1..MaxSlots; slot 0 is the
+# Scratchpad Buffer Array pointer in DCBAA, not a device). Tracked here
+# so Phase 4 + Phase 5 can find the input ctx / dev ctx / xfer ring per
+# device without re-walking the controller.
+#
+# Sized for MaxSlots=64 (archaemenid). Index 0 left unused — slot IDs
+# returned by Enable Slot are always >= 1 per §4.6.3.
+var XHCI_MAX_SLOTS_GUARD = 64;
+
+# Parallel arrays (Cyrius lacks struct-of-array sugar; one var per field
+# keeps allocation predictable). 65 entries = slots 0..64 with slot 0
+# reserved.
+var xhci_slot_input_ctx     = 0;   # Pointer to a 65-entry table (alloc'd at init)
+var xhci_slot_dev_ctx       = 0;
+var xhci_slot_xfer_ring     = 0;   # EP0 transfer ring page phys
+var xhci_slot_xfer_cycle    = 0;   # EP0 PCS table
+var xhci_slot_xfer_idx      = 0;   # EP0 enqueue index table
+var xhci_slot_port_num      = 0;   # Root hub port (1-based) per slot
+var xhci_slot_speed         = 0;   # PORTSC PortSpeed value per slot
+var xhci_slot_max_packet    = 0;   # EP0 MPS per slot (after descriptor read)
+var xhci_slot_table_ready   = 0;
+
+# Allocate the slot-tracking tables (one page total covers 65 slots * 8
+# bytes/field * 8 fields = 4160 bytes — pad to one page).
+fn xhci_slot_tables_init() {
+    if (xhci_slot_table_ready != 0) { return 1; }
+    var page = pmm_alloc();
+    if (page == 0) { kprintln("xhci: slot table alloc failed", 29); return 0; }
+    if (vmm_is_mapped(page) == 0) { vmm_map(page, page, 0x83); }
+    xhci_zero_page(page);
+
+    # Lay out 8 arrays of 65 u64 entries within the one page (520 bytes
+    # each, 8 * 520 = 4160 bytes, fits in 4 KB with 32 bytes padding).
+    var stride = 520;  # 65 entries * 8 bytes, rounded
+    xhci_slot_input_ctx   = page + 0;
+    xhci_slot_dev_ctx     = page + stride;
+    xhci_slot_xfer_ring   = page + stride * 2;
+    xhci_slot_xfer_cycle  = page + stride * 3;
+    xhci_slot_xfer_idx    = page + stride * 4;
+    xhci_slot_port_num    = page + stride * 5;
+    xhci_slot_speed       = page + stride * 6;
+    xhci_slot_max_packet  = page + stride * 7;
+    xhci_slot_table_ready = 1;
+    return 1;
+}
+
+# Convenience accessors — the table base + (slot_id * 8) layout means
+# every getter/setter is one load64/store64. Bound check defensively;
+# returning 0 on out-of-range matches "no device at this slot".
+fn xhci_slot_get(table, slot_id) {
+    if (slot_id < 1) { return 0; }
+    if (slot_id > XHCI_MAX_SLOTS_GUARD) { return 0; }
+    return load64(table + slot_id * 8);
+}
+
+fn xhci_slot_set(table, slot_id, value) {
+    if (slot_id < 1) { return 0; }
+    if (slot_id > XHCI_MAX_SLOTS_GUARD) { return 0; }
+    store64(table + slot_id * 8, value);
+    return 1;
+}
+
+# EP0 Max Packet Size by port speed (xHCI 1.2 §6.2.3.2, Table 6-9). FS
+# devices can declare 8/16/32/64 in bMaxPacketSize0 — Phase 3 starts at
+# 8 (the safe minimum), fetches the first 8 descriptor bytes to learn
+# the real value, then updates the context via Evaluate Context if it
+# differs. For LS the value is fixed at 8; for HS/SS the controller
+# rejects anything other than 64/512.
+fn xhci_ep0_mps_for_speed(speed) {
+    if (speed == XHCI_SPEED_LOW)        { return 8; }
+    if (speed == XHCI_SPEED_FULL)       { return 8; }
+    if (speed == XHCI_SPEED_HIGH)       { return 64; }
+    if (speed == XHCI_SPEED_SUPER)      { return 512; }
+    if (speed == XHCI_SPEED_SUPER_PLUS) { return 512; }
+    return 8;
+}
+
+# Allocate an Input Context page, fill Input Control + Slot + EP0. CSZ=1
+# layout (64-byte contexts):
+#   [0x000 .. 0x040)  Input Control Context
+#   [0x040 .. 0x080)  Slot Context
+#   [0x080 .. 0x0C0)  Endpoint Context 0 (EP0 bidirectional)
+#
+# Returns the input context phys (also virt) on success, 0 on alloc fail.
+# Also allocates the EP0 transfer ring (one page) and stashes its phys
+# in the Slot table.
+fn xhci_alloc_input_ctx(port_num, speed) {
+    var ictx = pmm_alloc();
+    if (ictx == 0) { kprintln("xhci: input ctx alloc failed", 28); return 0; }
+    if (vmm_is_mapped(ictx) == 0) { vmm_map(ictx, ictx, 0x83); }
+    iommu_register_dma(ictx);
+    xhci_zero_page(ictx);
+
+    # Input Control Context (xHCI 1.2 §6.2.5):
+    #   dword 0 — Drop Context Flags (D0/D1 reserved, D2..D31 = drop EP[2..31])
+    #   dword 1 — Add Context Flags  (A0 = Slot, A1 = EP0, A2..A31 = EP[2..31])
+    # For Address Device we need A0 + A1 set (per §4.6.5).
+    store32(ictx + 0,  0);          # Drop = 0 (nothing to drop yet)
+    store32(ictx + 4,  0x3);        # Add  = A0 | A1 (Slot + EP0)
+    # dwords 2..7 reserved/Configuration Value/Interface Number/Alternate
+    # Setting — all zero for Phase 3.
+
+    # Slot Context at offset 0x40 (xHCI 1.2 §6.2.2):
+    #   dword 0:
+    #     bits [19:0]  Route String          = 0 (direct root hub port)
+    #     bits [23:20] Speed                  = port speed
+    #     bit 25       MTT                    = 0
+    #     bit 26       Hub                    = 0
+    #     bits [31:27] Context Entries        = 1 (Slot + EP0 only)
+    var slot_dw0 = (1 << 27) | ((speed & 0xF) << 20);
+    store32(ictx + 0x40, slot_dw0);
+    # dword 1:
+    #   bits [15:0]  Max Exit Latency       = 0
+    #   bits [23:16] Root Hub Port Number   = port_num (1-based)
+    #   bits [31:24] Number of Ports        = 0 (not a hub)
+    store32(ictx + 0x44, (port_num & 0xFF) << 16);
+    # dword 2: parent hub / TT — zero for a root-hub device.
+    store32(ictx + 0x48, 0);
+    # dword 3: USB Device Address / Slot State — written by HW.
+    store32(ictx + 0x4C, 0);
+
+    # Endpoint 0 Context at offset 0x80 (xHCI 1.2 §6.2.3):
+    # First allocate the EP0 transfer ring (one page, Normal/Setup/Data/
+    # Status TRBs at slot 0 onward).
+    var xfer = pmm_alloc();
+    if (xfer == 0) { kprintln("xhci: ep0 xfer ring alloc failed", 32); return 0; }
+    if (vmm_is_mapped(xfer) == 0) { vmm_map(xfer, xfer, 0x83); }
+    iommu_register_dma(xfer);
+    xhci_zero_page(xfer);
+
+    # EP0 context dword 0:
+    #   bits [2:0]   EP State            = 0 (Disabled — HW will set to Running)
+    #   bits [9:8]   Mult                = 0
+    #   bits [14:10] MaxPStreams         = 0 (no streams for control)
+    #   bit 15       LSA                 = 0
+    #   bits [23:16] Interval            = 0 (control)
+    store32(ictx + 0x80, 0);
+    # dword 1:
+    #   bits [2:1]   CErr                = 3 (max error count)
+    #   bits [5:3]   EP Type             = 4 (Control Endpoint)
+    #   bits [15:8]  Max Burst Size      = 0
+    #   bits [31:16] Max Packet Size     = MPS for speed
+    var mps = xhci_ep0_mps_for_speed(speed);
+    var ep0_dw1 = (3 << 1) | (4 << 3) | ((mps & 0xFFFF) << 16);
+    store32(ictx + 0x84, ep0_dw1);
+    # dwords 2/3: TR Dequeue Pointer (64-bit) with DCS in bit 0. Initial
+    # Dequeue Cycle State = 1 (matches the producer cycle SW will use).
+    store64(ictx + 0x88, xfer | 0x1);
+    # dword 4:
+    #   bits [15:0]  Average TRB Length  = 8 (control transfers — small)
+    store32(ictx + 0x90, 8);
+
+    # Stash the xfer ring + per-slot state. Caller will fill in slot_id
+    # → table once Enable Slot returns.
+    return ictx;
+}
+
+# Allocate the Device Context page. HW writes; SW must not touch.
+# Returns phys (= virt) on success, 0 on alloc fail.
+fn xhci_alloc_device_ctx() {
+    var dctx = pmm_alloc();
+    if (dctx == 0) { kprintln("xhci: dev ctx alloc failed", 26); return 0; }
+    if (vmm_is_mapped(dctx) == 0) { vmm_map(dctx, dctx, 0x83); }
+    iommu_register_dma(dctx);
+    xhci_zero_page(dctx);
+    return dctx;
+}
+
+# Install the Device Context phys at DCBAA[slot_id]. Caller has already
+# confirmed slot_id is valid (1..MaxSlots).
+fn xhci_dcbaa_install(slot_id, dev_ctx_phys) {
+    store64(xhci_dcbaa_phys + slot_id * 8, dev_ctx_phys);
+    return 1;
+}

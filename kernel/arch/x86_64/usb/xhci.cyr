@@ -382,3 +382,363 @@ fn xhci_start() {
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x31; 0xE6; 0x71; }
     return 1;
 }
+
+# --- Phase 3: port enumeration + device addressing -----------------
+#
+# Walks the root hub ports, resets each connected port, issues Enable
+# Slot + Address Device, fetches the device descriptor (8-byte then
+# 18-byte), and classifies HID boot keyboards. One framebuffer line per
+# connected port; CMOS checkpoint 0x32 stamps after the first HID kbd
+# is successfully addressed.
+#
+# Plan reference: planning/usb-hid-keyboard-driver.md § Phase 3.
+
+# Static scratch buffer for descriptor fetches. One page reused across
+# every port enumeration — descriptors are small (Device = 18 bytes,
+# Configuration is up to a few hundred for HID kbd) so one page is more
+# than enough. Allocated lazily on first Phase 3 entry.
+var xhci_desc_buf_phys = 0;
+
+# Phase 3 record of the first detected HID boot keyboard. Phase 4 + 5
+# pick up from here. slot_id = 0 means "none seen yet".
+var xhci_kbd_slot_id = 0;
+
+# Issue Enable Slot command. Returns the assigned slot ID on success, 0
+# on failure. Slot Type = 0 (USB device; xHCI 1.2 §6.4.3.2 lists other
+# types for Stream-protocol and downstream-bus devices that we never
+# use). xhci_last_cmd_slot_id is the authoritative result via the cmd
+# completion event.
+fn xhci_enable_slot() {
+    if (xhci_cmd_issue(0, 0, 0, XHCI_TRB_ENABLE_SLOT << 10) == 0) {
+        kprint("xhci: Enable Slot failed, ccode=", 32);
+        kprint_num(xhci_last_cmd_ccode);
+        kprintln("", 0);
+        return 0;
+    }
+    return xhci_last_cmd_slot_id;
+}
+
+# Issue Address Device command. `bsr`=0 means actually assign device
+# address (the normal case); =1 means block-set-address (sets slot to
+# Addressed state without USB SET_ADDRESS — used for early descriptor
+# fetch on quirky devices, not needed for Phase 3).
+fn xhci_address_device(slot_id, input_ctx_phys, bsr) {
+    var ctrl = (XHCI_TRB_ADDRESS_DEVICE << 10) | ((slot_id & 0xFF) << 24);
+    if (bsr != 0) { ctrl = ctrl | 0x200; }   # BSR bit 9
+    var p_lo = input_ctx_phys & 0xFFFFFFFF;
+    var p_hi = 0;
+    if (xhci_cmd_issue(p_lo, p_hi, 0, ctrl) == 0) {
+        kprint("xhci: Address Device failed, ccode=", 35);
+        kprint_num(xhci_last_cmd_ccode);
+        kprintln("", 0);
+        return 0;
+    }
+    return 1;
+}
+
+# Ring the per-slot doorbell for EP0 (target = 1).
+fn xhci_ring_ep0_doorbell(slot_id) {
+    # Doorbell array at MMIO + DBOFF; one dword per slot.
+    var db_addr = xhci_mmio_base + xhci_db_off + slot_id * 4;
+    store32(db_addr, 1);   # DB Target = 1 (Control EP)
+    return 0;
+}
+
+# Drain one Transfer Event from the event ring matching the given slot
+# ID. Returns 1 on Success ccode, 0 otherwise. Populates
+# xhci_last_cmd_ccode (re-used for any cmd/xfer event surface).
+fn xhci_wait_transfer_event(slot_id) {
+    var wait = 0;
+    while (wait < XHCI_CMD_TIMEOUT_SPINS) {
+        var evt_off = xhci_evt_ring_idx * 16;
+        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt_dw3 = load32(evt + 12);
+        var evt_cycle = evt_dw3 & 0x1;
+        if (evt_cycle == xhci_evt_ring_cycle) {
+            var evt_type = (evt_dw3 >> 10) & 0x3F;
+            if (evt_type == XHCI_TRB_TRANSFER_EVENT) {
+                var evt_slot = (evt_dw3 >> 24) & 0xFF;
+                if (evt_slot == slot_id) {
+                    var evt_dw2 = load32(evt + 8);
+                    xhci_last_cmd_ccode = (evt_dw2 >> 24) & 0xFF;
+                    xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+                    if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+                        xhci_evt_ring_idx = 0;
+                        if (xhci_evt_ring_cycle == 1) {
+                            xhci_evt_ring_cycle = 0;
+                        } else {
+                            xhci_evt_ring_cycle = 1;
+                        }
+                    }
+                    var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
+                    var new_erdp = xhci_evt_ring_phys + xhci_evt_ring_idx * 16;
+                    xhci_rt_write64(ir0 + XHCI_IR_ERDP, new_erdp | 0x8);
+                    if (xhci_last_cmd_ccode == XHCI_CC_SUCCESS) { return 1; }
+                    # SHORT_PACKET is a soft-fail for variable-length
+                    # responses — descriptor read can come back short
+                    # when the device declares fewer bytes than asked.
+                    if (xhci_last_cmd_ccode == XHCI_CC_SHORT_PACKET) { return 1; }
+                    return 0;
+                }
+            }
+            # Non-matching or non-transfer event — consume and continue.
+            xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+            if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+                xhci_evt_ring_idx = 0;
+                if (xhci_evt_ring_cycle == 1) {
+                    xhci_evt_ring_cycle = 0;
+                } else {
+                    xhci_evt_ring_cycle = 1;
+                }
+            }
+        }
+        wait = wait + 1;
+    }
+    xhci_last_cmd_ccode = 0;
+    kprintln("xhci: transfer event timeout", 28);
+    return 0;
+}
+
+# Write one TRB at the given slot's EP0 transfer ring enqueue index,
+# advance the index + cycle (no Link TRB on transfer rings — xfer
+# rings are smaller than one page and won't wrap during Phase 3).
+fn xhci_ep0_enqueue(slot_id, p_lo, p_hi, status, ctrl_partial) {
+    var ring  = xhci_slot_get(xhci_slot_xfer_ring,  slot_id);
+    var cycle = xhci_slot_get(xhci_slot_xfer_cycle, slot_id);
+    var idx   = xhci_slot_get(xhci_slot_xfer_idx,   slot_id);
+    if (ring == 0) { return 0; }
+
+    var trb = ring + idx * 16;
+    store32(trb,      p_lo);
+    store32(trb + 4,  p_hi);
+    store32(trb + 8,  status);
+    store32(trb + 12, ctrl_partial | cycle);
+
+    idx = idx + 1;
+    # 256-slot transfer ring; Phase 3 issues at most 3 TRBs per device
+    # so wrap is moot — just guard.
+    if (idx >= 255) { idx = 0; if (cycle == 1) { cycle = 0; } else { cycle = 1; } }
+    xhci_slot_set(xhci_slot_xfer_idx,   slot_id, idx);
+    xhci_slot_set(xhci_slot_xfer_cycle, slot_id, cycle);
+    return trb;
+}
+
+# Build a 3-TRB control IN transfer: Setup + Data + Status. Per xHCI
+# 1.2 §4.11.2.1 sequence diagram. Returns 1 on Success completion, 0 on
+# any failure.
+fn xhci_control_in(slot_id, bm_req, b_req, w_val, w_idx, w_len, buf_phys) {
+    # Setup Stage TRB (IDT=1 → 8-byte SETUP packed into the TRB itself):
+    #   p_lo  = bmRequestType | (bRequest<<8) | (wValue<<16)
+    #   p_hi  = wIndex | (wLength<<16)
+    #   status = TRB Transfer Length=8 (bits[16:0]) | Interrupter Target=0
+    #   ctrl   = TRT=3(IN Data) [bits 17:16] | IDT=1 (bit 6) |
+    #            type=SETUP_STAGE(2)<<10 | cycle
+    var setup_lo = (bm_req & 0xFF) | ((b_req & 0xFF) << 8) | ((w_val & 0xFFFF) << 16);
+    var setup_hi = (w_idx & 0xFFFF) | ((w_len & 0xFFFF) << 16);
+    var setup_ctrl = (3 << 16) | (1 << 6) | (XHCI_TRB_SETUP_STAGE << 10);
+    if (xhci_ep0_enqueue(slot_id, setup_lo, setup_hi, 8, setup_ctrl) == 0) { return 0; }
+
+    # Data Stage TRB:
+    #   p_lo/p_hi = buf_phys
+    #   status    = w_len in bits[16:0], TD Size=0, Interrupter Target=0
+    #   ctrl      = DIR=1 (IN, bit 16) | type=DATA_STAGE(3)<<10 | cycle
+    var data_ctrl = (1 << 16) | (XHCI_TRB_DATA_STAGE << 10);
+    if (xhci_ep0_enqueue(slot_id, buf_phys & 0xFFFFFFFF, 0, w_len, data_ctrl) == 0) { return 0; }
+
+    # Status Stage TRB:
+    #   p_lo/p_hi = 0
+    #   status    = Interrupter Target=0
+    #   ctrl      = IOC=1 (bit 5) | DIR=0 (OUT — opposite of IN data) |
+    #               type=STATUS_STAGE(4)<<10 | cycle
+    var status_ctrl = (1 << 5) | (XHCI_TRB_STATUS_STAGE << 10);
+    if (xhci_ep0_enqueue(slot_id, 0, 0, 0, status_ctrl) == 0) { return 0; }
+
+    # Ring EP0 doorbell — controller starts processing all three TRBs.
+    xhci_ring_ep0_doorbell(slot_id);
+
+    # Wait for the Status Stage TRB's Transfer Event (it carries IOC=1).
+    return xhci_wait_transfer_event(slot_id);
+}
+
+# Fetch the first 18 bytes of the USB Device Descriptor into the shared
+# scratch buffer. Returns 1 on success. Caller then reads from
+# xhci_desc_buf_phys to parse fields.
+fn xhci_get_device_descriptor(slot_id, length) {
+    # GET_DESCRIPTOR(Device, 0): bmRequestType=0x80 (D-to-H, std, dev),
+    # bRequest=6 (GET_DESCRIPTOR), wValue=(DescriptorType=1 << 8) | 0,
+    # wIndex=0, wLength=length.
+    return xhci_control_in(slot_id, 0x80, 0x06, 0x0100, 0, length, xhci_desc_buf_phys);
+}
+
+# Per-port enumeration: classify + reset + Enable Slot + Address Device
+# + Get Device Descriptor + HID predicate. Emits one summary line.
+# Returns 1 if a HID boot keyboard was found at this port, 0 otherwise.
+fn xhci_enumerate_port(port_num) {
+    var psc = xhci_portsc_read(port_num);
+    if ((psc & 0x1) == 0) { return 0; }   # CCS=0 — nothing attached
+
+    var proto = load8(xhci_port_proto + port_num);   # 2, 3, or 0=unknown
+    if (xhci_port_reset(port_num, proto) == 0) {
+        kprint("xhci: port ", 11);
+        kprint_num(port_num);
+        kprintln(" reset failed", 13);
+        return 0;
+    }
+
+    var speed = xhci_port_speed(port_num);
+    var slot_id = xhci_enable_slot();
+    if (slot_id == 0) { return 0; }
+
+    # Allocate input + device contexts for this slot.
+    var ictx = xhci_alloc_input_ctx(port_num, speed);
+    if (ictx == 0) { return 0; }
+    var dctx = xhci_alloc_device_ctx();
+    if (dctx == 0) { return 0; }
+
+    # Allocate EP0 transfer ring (one page). The MPS-vs-speed default
+    # is filled into the input ctx by xhci_alloc_input_ctx; we set up
+    # the slot tracking arrays now so xhci_ep0_enqueue can find them.
+    var xfer = pmm_alloc();
+    if (xfer == 0) { kprintln("xhci: ep0 xfer alloc failed", 27); return 0; }
+    if (vmm_is_mapped(xfer) == 0) { vmm_map(xfer, xfer, 0x83); }
+    iommu_register_dma(xfer);
+    xhci_zero_page(xfer);
+
+    # Update the EP0 context's TR Dequeue Pointer in the input ctx to
+    # the actual xfer ring address. xhci_alloc_input_ctx stored a stub.
+    store64(ictx + 0x88, xfer | 0x1);
+
+    xhci_slot_set(xhci_slot_input_ctx,    slot_id, ictx);
+    xhci_slot_set(xhci_slot_dev_ctx,      slot_id, dctx);
+    xhci_slot_set(xhci_slot_xfer_ring,    slot_id, xfer);
+    xhci_slot_set(xhci_slot_xfer_cycle,   slot_id, 1);
+    xhci_slot_set(xhci_slot_xfer_idx,     slot_id, 0);
+    xhci_slot_set(xhci_slot_port_num,     slot_id, port_num);
+    xhci_slot_set(xhci_slot_speed,        slot_id, speed);
+    xhci_slot_set(xhci_slot_max_packet,   slot_id, xhci_ep0_mps_for_speed(speed));
+
+    # Install the device context phys at DCBAA[slot_id].
+    xhci_dcbaa_install(slot_id, dctx);
+
+    # Issue Address Device — assigns USB device address, transitions
+    # slot to Addressed state.
+    if (xhci_address_device(slot_id, ictx, 0) == 0) { return 0; }
+
+    # Fetch 8-byte device descriptor first to learn actual EP0 MPS for
+    # FS devices that declare anything other than the default 8.
+    if (xhci_desc_buf_phys == 0) {
+        var buf = pmm_alloc();
+        if (buf == 0) { kprintln("xhci: desc buf alloc failed", 27); return 0; }
+        if (vmm_is_mapped(buf) == 0) { vmm_map(buf, buf, 0x83); }
+        iommu_register_dma(buf);
+        xhci_desc_buf_phys = buf;
+    }
+    xhci_zero_page(xhci_desc_buf_phys);
+    if (xhci_get_device_descriptor(slot_id, 8) == 0) {
+        kprintln("xhci: get descriptor (8) failed", 31);
+        return 0;
+    }
+
+    # Now fetch full 18 bytes.
+    xhci_zero_page(xhci_desc_buf_phys);
+    if (xhci_get_device_descriptor(slot_id, 18) == 0) {
+        kprintln("xhci: get descriptor (18) failed", 32);
+        return 0;
+    }
+
+    # Parse standard fields. Device descriptor layout (USB 2.0 §9.6.1):
+    #   [0]  bLength            (18)
+    #   [1]  bDescriptorType    (1 = DEVICE)
+    #   [2..3]  bcdUSB
+    #   [4]  bDeviceClass
+    #   [5]  bDeviceSubClass
+    #   [6]  bDeviceProtocol
+    #   [7]  bMaxPacketSize0    (8/16/32/64 for FS; 64 for HS; 9 for SS=2^9=512)
+    #   [8..9]   idVendor
+    #   [10..11] idProduct
+    var dev_class = load8(xhci_desc_buf_phys + 4);
+    var vid       = load16(xhci_desc_buf_phys + 8);
+    var pid       = load16(xhci_desc_buf_phys + 10);
+
+    # HID-boot-kbd predicate per usb-hid-keyboard-driver.md: typically
+    # the class triple lives on the Interface Descriptor, not Device.
+    # When bDeviceClass=0 (interface-defined), we'd need to also fetch
+    # the configuration descriptor and walk to the interface. That's
+    # Phase 4 work. For Phase 3 we expose the Device Descriptor class
+    # values and flag HID-at-device-level here; the proper interface-
+    # level predicate fires in Phase 4 once we walk the config.
+    var is_hid = 0;
+    if (dev_class == 0x03) {
+        # Device-class HID — rare but legal (some keyboards do this).
+        var sub_class = load8(xhci_desc_buf_phys + 5);
+        var proto_dev = load8(xhci_desc_buf_phys + 6);
+        if (sub_class == 0x01) {
+            if (proto_dev == 0x01) { is_hid = 1; }
+        }
+    }
+
+    # One-line summary per port.
+    kprint("xhci: port ", 11);
+    kprint_num(port_num);
+    kprint(" connected, ", 12);
+    xhci_print_speed(speed);
+    kprint(", slot=", 7);
+    kprint_num(slot_id);
+    kprint(", VID=", 6);
+    kprint_num(vid);
+    kprint(" PID=", 5);
+    kprint_num(pid);
+    kprint(", class=", 8);
+    kprint_num(dev_class);
+    if (is_hid != 0) {
+        kprintln(" [HID-kbd]", 10);
+        if (xhci_kbd_slot_id == 0) { xhci_kbd_slot_id = slot_id; }
+        return 1;
+    }
+    kprintln("", 0);
+    return 0;
+}
+
+# Top-level Phase 3 driver — called from main after xhci_init succeeds.
+# Walks every root hub port, enumerating any that report CCS=1. Stamps
+# kcp=0x32 once at least one device has been successfully addressed.
+fn xhci_enumerate() {
+    if (xhci_running == 0) { return 0; }
+
+    if (xhci_slot_tables_init() == 0) { return 0; }
+    if (xhci_xecp_classify_ports() == 0) { return 0; }
+
+    var any_addressed = 0;
+    var p = 1;
+    while (p <= xhci_max_ports) {
+        var found_kbd = xhci_enumerate_port(p);
+        if (found_kbd != 0) { any_addressed = 1; }
+        # Even non-HID devices count as "addressed" for the kcp stamp
+        # — Phase 3's gate is "we drove at least one device through
+        # Address Device", not "we found a keyboard specifically".
+        var psc = xhci_portsc_read(p);
+        if ((psc & 0x1) != 0) {
+            # Connected — if enumerate_port didn't return 1 for HID, we
+            # still want to flag general success. Re-check by inspecting
+            # the slot tracking arrays: if any slot has port_num == p,
+            # enumeration succeeded.
+            var s = 1;
+            while (s <= XHCI_MAX_SLOTS_GUARD) {
+                if (xhci_slot_get(xhci_slot_port_num, s) == p) {
+                    any_addressed = 1;
+                    s = XHCI_MAX_SLOTS_GUARD + 1;   # break
+                }
+                s = s + 1;
+            }
+        }
+        p = p + 1;
+    }
+
+    if (any_addressed != 0) {
+        # CMOS kernel checkpoint 0x32 (xhci port enumeration complete,
+        # at least one device addressed). Readable post-mortem via
+        # scripts/build/read-boot-log.
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x32; 0xE6; 0x71; }
+    }
+    return any_addressed;
+}

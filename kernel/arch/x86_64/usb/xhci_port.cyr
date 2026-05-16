@@ -1,0 +1,164 @@
+# === xHCI port enumeration + reset — Phase 3 ===
+#
+# Walks the controller's root hub ports (count = HCSPARAMS1.MaxPorts,
+# cached as xhci_max_ports during probe), classifies each as USB 2.0 or
+# USB 3.x via the xECP Supported Protocol caps, and brings any connected
+# port up to Enabled state.
+#
+# USB3 vs USB2 reset semantics (xHCI 1.2 §4.19):
+#   USB3: on attach the controller auto-resets and transitions the port
+#         to Enabled. SW polls CCS=1 + PED=1; no PR write needed.
+#   USB2: SW must write PORTSC.PR=1 to start reset, then poll for PRC
+#         (Port Reset Change) or PED. PR self-clears when reset finishes.
+#
+# Port classification matters because writing PR=1 to an already-enabled
+# USB3 port is a no-op at best, undefined at worst on some silicon; the
+# reverse (waiting for auto-reset on a USB2 port) hangs forever.
+#
+# xECP Supported Protocol parsing: walk the chain from
+# `mmio + xhci_xecp * 4`, looking for cap ID 2. Each Supported Protocol
+# cap declares a contiguous port range [Compatible Port Offset ..
+# +Compatible Port Count - 1] (port numbers are 1-based per spec). The
+# Revision Major byte distinguishes USB 2.x (0x02) from USB 3.x (0x03).
+#
+# A typical NUC chipset publishes two Supported Protocol caps:
+#   USB 2.0 caps covering ports 1..N
+#   USB 3.x caps covering ports N+1..M
+# But the layout is per-chipset, so we don't assume — we build a port→
+# protocol classification array by walking every Supported Protocol cap.
+
+# Per-port classification: 0 = unknown, 2 = USB 2.x, 3 = USB 3.x.
+# Indexed 1..xhci_max_ports (entry 0 unused to match spec port numbering).
+# Backed by a static 16-byte array (sufficient for MaxPorts ≤ 15; current
+# archaemenid reports 6).
+var xhci_port_proto = 0;   # Pointer into a PMM page allocated at init
+
+# Walk the xECP chain and populate xhci_port_proto. Returns 1 on success,
+# 0 if no chain was reachable (xecp == 0, meaning no extended caps —
+# legal per spec; in that case every port stays "unknown" and Phase 3
+# falls back to "try USB3 first, USB2 on timeout").
+fn xhci_xecp_classify_ports() {
+    # One-page scratch — first 32 bytes is the proto array, rest unused
+    # for now. PMM-alloc once; reused for future port-state needs.
+    if (xhci_port_proto == 0) {
+        var page = pmm_alloc();
+        if (page == 0) { kprintln("xhci: port classify alloc failed", 32); return 0; }
+        if (vmm_is_mapped(page) == 0) { vmm_map(page, page, 0x83); }
+        xhci_zero_page(page);
+        xhci_port_proto = page;
+    }
+
+    if (xhci_xecp == 0) { return 1; }   # No extended caps — leave all 0
+
+    var cap_off = xhci_xecp * 4;        # First cap, in bytes from MMIO base
+    var safety = 0;
+    while (cap_off != 0) {
+        if (safety > 64) { return 1; }   # Cap chain bounded; defensive
+        safety = safety + 1;
+
+        var dw0 = load32(xhci_mmio_base + cap_off);
+        var cap_id = dw0 & 0xFF;
+        var next_off = (dw0 >> 8) & 0xFF;      # in dwords; 0 = end of chain
+
+        if (cap_id == XHCI_XECP_SUPPORTED_PROT) {
+            var rev_major = (dw0 >> 24) & 0xFF;
+            var dw2 = load32(xhci_mmio_base + cap_off + 8);
+            var port_off   = dw2 & 0xFF;       # 1-based
+            var port_count = (dw2 >> 8) & 0xFF;
+            var p = port_off;
+            while (p < port_off + port_count) {
+                if (p >= 1) {
+                    if (p <= xhci_max_ports) {
+                        store8(xhci_port_proto + p, rev_major);
+                    }
+                }
+                p = p + 1;
+            }
+        }
+
+        if (next_off == 0) { cap_off = 0; }
+        else { cap_off = cap_off + next_off * 4; }
+    }
+    return 1;
+}
+
+# Per-port PORTSC accessors. Port numbers are 1-based throughout this
+# file to match xHCI spec wording; the offset math compensates.
+fn xhci_portsc_addr(port_num) {
+    return xhci_op_base + XHCI_PORT_BASE + (port_num - 1) * XHCI_PORT_STRIDE;
+}
+
+fn xhci_portsc_read(port_num) {
+    return load32(xhci_portsc_addr(port_num));
+}
+
+# PORTSC RMW: bits 17:23 = 0x00FE0000 are W1C status-change bits. Writes
+# don't accidentally clear changes the kernel hasn't observed because we
+# only OR in W1C bits the caller explicitly wants to clear (`w1c_clear`)
+# and leave the rest of that field zero.
+fn xhci_portsc_write(port_num, value, w1c_clear) {
+    var addr = xhci_portsc_addr(port_num);
+    # value supplies the non-W1C portion (mask 0xFF01FFFF — everything
+    # except the change bits); w1c_clear supplies exactly the change bits
+    # to clear. Any change bit not in w1c_clear stays as it was (W1C
+    # semantics: writing 0 has no effect).
+    store32(addr, (value & 0xFF01FFFF) | (w1c_clear & 0x00FE0000));
+    return 0;
+}
+
+# Per-port reset sequence — bring port from Connected → Enabled.
+# Returns 1 on PED=1 observed, 0 on timeout.
+fn xhci_port_reset(port_num, proto) {
+    if (proto == 3) {
+        # USB3 — controller auto-resets on attach. Just poll PED.
+        var wait = 0;
+        while (wait < 1000000) {
+            var psc = xhci_portsc_read(port_num);
+            if ((psc & 0x2) != 0) { return 1; }   # PED set
+            wait = wait + 1;
+        }
+        return 0;
+    }
+    # USB2 (or unknown — try USB2 path; safer default for archaemenid
+    # where the USB-attached keyboard is most likely USB2 LS/FS).
+    # Set PR=1 (bit 4). W1C bits in 0x00FE0000 stay preserved.
+    var psc0 = xhci_portsc_read(port_num);
+    xhci_portsc_write(port_num, (psc0 & 0xFF01FFFF) | 0x10, 0);
+    # Poll for PRC (bit 21) — indicates reset done.
+    var wait2 = 0;
+    while (wait2 < 1000000) {
+        var psc = xhci_portsc_read(port_num);
+        if ((psc & 0x200000) != 0) {
+            # Clear PRC by writing 1 back to it, preserving other state.
+            xhci_portsc_write(port_num, psc & 0xFF01FFFF, 0x200000);
+            # Confirm PED set after reset.
+            var psc2 = xhci_portsc_read(port_num);
+            if ((psc2 & 0x2) != 0) { return 1; }
+            return 0;
+        }
+        wait2 = wait2 + 1;
+    }
+    return 0;
+}
+
+# Read the PortSpeed field after a successful reset. Spec guarantees
+# this is valid only when PED=1. Returns the raw 4-bit speed value;
+# caller maps via XhciPortSpeed enum.
+fn xhci_port_speed(port_num) {
+    var psc = xhci_portsc_read(port_num);
+    return (psc >> 10) & 0xF;
+}
+
+# Print a short speed label (LS/FS/HS/SS/SS+) for the per-port summary
+# line. Inlined kprint calls because Cyrius's string-literal handling
+# is per-call-site — `return "LS"` from a helper isn't part of the
+# established kernel pattern.
+fn xhci_print_speed(speed) {
+    if (speed == XHCI_SPEED_LOW)        { kprint("LS",  2); return 0; }
+    if (speed == XHCI_SPEED_FULL)       { kprint("FS",  2); return 0; }
+    if (speed == XHCI_SPEED_HIGH)       { kprint("HS",  2); return 0; }
+    if (speed == XHCI_SPEED_SUPER)      { kprint("SS",  2); return 0; }
+    if (speed == XHCI_SPEED_SUPER_PLUS) { kprint("SS+", 3); return 0; }
+    kprint("??", 2);
+    return 0;
+}

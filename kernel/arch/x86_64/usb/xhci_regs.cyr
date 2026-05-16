@@ -125,12 +125,149 @@ enum XhciIrReg {
     XHCI_IR_ERDP        = 0x18;     # u64 — Event Ring Dequeue Pointer
 }
 
-# TRB types we touch in Phase 2 (xHCI 1.2 §6.4.6 — full table).
+# TRB types we touch in Phase 2 + Phase 3 (xHCI 1.2 §6.4.6 — full table).
 # TRB type lives in bits [15:10] of dword 3 → shift up by 10 when packing.
-# Only Link is needed in Phase 2 (cmd-ring last-slot wrap).
 enum XhciTrbType {
-    XHCI_TRB_LINK       = 6;        # Link TRB — points to next ring segment / wraps
+    # Transfer ring TRBs
+    XHCI_TRB_NORMAL          = 1;   # Normal data TRB (bulk / interrupt / iso)
+    XHCI_TRB_SETUP_STAGE     = 2;   # Setup Stage TRB (control xfer 8-byte SETUP)
+    XHCI_TRB_DATA_STAGE      = 3;   # Data Stage TRB (control xfer data phase)
+    XHCI_TRB_STATUS_STAGE    = 4;   # Status Stage TRB (control xfer ACK phase)
+    XHCI_TRB_LINK            = 6;   # Link TRB — points to next ring segment / wraps
+    # Command ring TRBs
+    XHCI_TRB_ENABLE_SLOT     = 9;   # Enable Slot command (returns slot ID)
+    XHCI_TRB_DISABLE_SLOT    = 10;  # Disable Slot command
+    XHCI_TRB_ADDRESS_DEVICE  = 11;  # Address Device command
+    XHCI_TRB_CONFIGURE_EP    = 12;  # Configure Endpoint command (Phase 4)
+    XHCI_TRB_EVAL_CONTEXT    = 13;  # Evaluate Context command
+    # Event ring TRBs (HW-produced)
+    XHCI_TRB_TRANSFER_EVENT  = 32;  # Transfer Event
+    XHCI_TRB_CMD_COMPLETION  = 33;  # Command Completion Event
+    XHCI_TRB_PORT_STATUS_CHG = 34;  # Port Status Change Event
 }
+
+# TRB Completion Codes (xHCI 1.2 §6.4.5). Returned in event TRB dword 2
+# bits [31:24]. Only Success(1) is a green path — everything else means
+# the command or transfer failed and Phase 3 needs to surface the cause.
+enum XhciCompletionCode {
+    XHCI_CC_SUCCESS              = 1;
+    XHCI_CC_DATA_BUFFER_ERROR    = 2;
+    XHCI_CC_BABBLE_DETECTED      = 3;
+    XHCI_CC_USB_TRANSACTION_ERR  = 4;
+    XHCI_CC_TRB_ERROR            = 5;
+    XHCI_CC_STALL_ERROR          = 6;
+    XHCI_CC_RESOURCE_ERROR       = 7;
+    XHCI_CC_BANDWIDTH_ERROR      = 8;
+    XHCI_CC_NO_SLOTS_AVAILABLE   = 9;
+    XHCI_CC_INVALID_STREAM_TYPE  = 10;
+    XHCI_CC_SLOT_NOT_ENABLED     = 11;
+    XHCI_CC_EP_NOT_ENABLED       = 12;
+    XHCI_CC_SHORT_PACKET         = 13;
+    XHCI_CC_PARAMETER_ERROR      = 17;
+    XHCI_CC_CONTEXT_STATE_ERROR  = 19;
+}
+
+# PORTSC — Port Status and Control Register (xHCI 1.2 §5.4.8).
+#
+# Located at op_base + 0x400 + (port_num * 0x10). Each root hub port has
+# its own 0x10-byte block (PORTSC + PORTPMSC + PORTLI + PORTHLPMC). Phase
+# 3 only touches PORTSC (the first dword).
+#
+# RW1C-style bits (bits 17-23: CSC PEC WRC OCC PRC PLC CEC) are write-1-
+# to-clear — masking them off when doing read-modify-write is mandatory
+# or we'll accidentally clear status change indicators the kernel hasn't
+# observed yet. Mask: 0x00FE0000.
+enum XhciPortReg {
+    XHCI_PORT_BASE      = 0x400;    # First port's PORTSC offset
+    XHCI_PORT_STRIDE    = 0x10;     # Bytes between adjacent ports
+    XHCI_PORTSC         = 0x00;     # u32 — status + control (this dword)
+    XHCI_PORTPMSC       = 0x04;     # u32 — power management (not used Phase 3)
+    XHCI_PORTLI         = 0x08;     # u32 — link info
+    XHCI_PORTHLPMC      = 0x0C;     # u32 — hardware LPM control
+}
+
+# PORTSC bit layout (xHCI 1.2 §5.4.8). Stored as masks; bit-position
+# constants are inlined into shifts at the use site.
+#   bit 0       CCS    — Current Connect Status (RO)
+#   bit 1       PED    — Port Enabled/Disabled (RW1C, but RW only via PR clearing)
+#   bit 3       OCA    — Over-current Active (RO)
+#   bit 4       PR     — Port Reset (RW1S; self-clears)
+#   bits [8:5]  PLS    — Port Link State (4 bits)
+#   bit 9       PP     — Port Power
+#   bits [13:10] PS    — Port Speed (1=FS, 2=LS, 3=HS, 4=SS, 5=SS+)
+#   bits [15:14] PIC   — Port Indicator Control
+#   bit 16      LWS    — Port Link State Write Strobe
+#   bit 17      CSC    — Connect Status Change (RW1C)
+#   bit 18      PEC    — Port Enabled/Disabled Change (RW1C)
+#   bit 19      WRC    — Warm Port Reset Change (RW1C, USB3 only)
+#   bit 20      OCC    — Over-current Change (RW1C)
+#   bit 21      PRC    — Port Reset Change (RW1C)
+#   bit 22      PLC    — Port Link State Change (RW1C)
+#   bit 23      CEC    — Port Config Error Change (RW1C)
+#   bit 24      CAS    — Cold Attach Status (RO)
+#   bit 25-27   WCE/WDE/WOE — Wake on Connect/Disconnect/Overcurrent Enable
+#   bit 30      DR     — Device Removable (RO)
+#   bit 31      WPR    — Warm Port Reset (W1S, USB3 only)
+
+# USB Port Speed encoding (PORTSC bits 13:10 — default values; the xECP
+# Supported Protocol cap can override these via per-protocol PSI tables,
+# but Phase 3 trusts the default mapping for keyboard bring-up).
+enum XhciPortSpeed {
+    XHCI_SPEED_FULL          = 1;   # 12 Mbps  — EP0 MPS default 8 (can be 8/16/32/64)
+    XHCI_SPEED_LOW           = 2;   # 1.5 Mbps — EP0 MPS 8
+    XHCI_SPEED_HIGH          = 3;   # 480 Mbps — EP0 MPS 64
+    XHCI_SPEED_SUPER         = 4;   # 5 Gbps   — EP0 MPS 512
+    XHCI_SPEED_SUPER_PLUS    = 5;   # 10 Gbps  — EP0 MPS 512
+}
+
+# Extended Capability IDs (xHCI 1.2 §7). The chain starts at MMIO +
+# (HCCPARAMS1.xECP * 4); each entry's low byte is CapID, next byte is the
+# pointer to the next cap (also in dwords). Two caps matter for Phase 3:
+#
+#   USBLEGSUP (1) — BIOS/OS ownership semaphore. If BIOS holds the bit
+#     and won't release, port resets are silently absorbed. Phase 3 reads
+#     it; if BIOS-owned and we can't take it, surface a clear failure
+#     line so the iron post-mortem doesn't blame the wrong thing.
+#
+#   SupportedProtocol (2) — declares port ranges as USB Major.Minor. A
+#     typical NUC chipset has two Supported Protocol caps (one for USB
+#     2.0 ports, one for USB 3.x); Phase 3 walks them to classify each
+#     PORTSC's reset semantics.
+enum XhciXecpCap {
+    XHCI_XECP_USBLEGSUP      = 1;
+    XHCI_XECP_SUPPORTED_PROT = 2;
+}
+
+# USBLEGSUP register layout (xHCI 1.2 §7.1):
+#   bit 0     — CapID (= 1, redundant with the next-ptr byte)
+#   bits [15:8] — NextCapPtr (in dwords, 0 = end of chain)
+#   bit 16    — HC BIOS Owned Semaphore
+#   bit 24    — HC OS Owned Semaphore (write 1 to claim, then poll bit 16)
+
+# Supported Protocol cap dword layout (xHCI 1.2 §7.2):
+#   dword 0:
+#     bits [7:0]    CapID (= 2)
+#     bits [15:8]   NextCapPtr
+#     bits [23:16]  Revision Minor (BCD)
+#     bits [31:24]  Revision Major (e.g. 0x02 for USB 2.0, 0x03 for USB 3.x)
+#   dword 1:
+#     "USB " name string (0x20425355 little-endian)
+#   dword 2:
+#     bits [7:0]    Compatible Port Offset (1-based)
+#     bits [15:8]   Compatible Port Count
+#     bits [27:16]  Protocol Defined
+#     bits [31:28]  Protocol Speed ID Count
+#   dword 3:
+#     bits [4:0]    Slot Type
+
+# Per-port doorbell encoding (xHCI 1.2 §5.6). Each doorbell is a single
+# dword at MMIO + DBOFF + (slot_id * 4). Slot 0 is the Host Controller
+# doorbell (used by xhci_cmd_issue); slots 1..MaxSlots target individual
+# devices. DB_Target (bits [7:0]) selects the endpoint:
+#   0 = reserved (host controller doorbell only uses 0)
+#   1 = Control endpoint (EP0) — Phase 3 control transfers ring this
+#   2..31 = paired bulk/interrupt/iso endpoint indices
+# DB_Stream_ID (bits [31:16]) is 0 for control transfers.
 
 # DCBAA / cmd ring / event ring sizing (xHCI 1.2 §6.1, §6.5)
 #   - DCBAA:      8 bytes per slot, MaxSlots+1 entries (slot 0 reserved

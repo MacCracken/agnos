@@ -160,6 +160,14 @@ xhci_probe();
 # success. See planning/usb-hid-keyboard-driver.md § Phase 2.
 xhci_init();
 
+# xHCI Phase 3 — port enumeration. Walks the root hub, resets any
+# connected port, issues Enable Slot + Address Device, fetches the
+# device descriptor, and flags HID boot keyboards. One framebuffer
+# line per connected port; CMOS checkpoint 0x32 stamps when at least
+# one device is addressed. See planning/usb-hid-keyboard-driver.md
+# § Phase 3.
+xhci_enumerate();
+
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
 if (acpi_iommu_base != 0) {
     if (iommu_init() == 0) {
