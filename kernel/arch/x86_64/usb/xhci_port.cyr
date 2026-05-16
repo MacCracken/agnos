@@ -286,23 +286,27 @@ fn xhci_port_reset(port_num, proto) {
     }
     # USB2 (or unknown — try USB2 path; safer default for archaemenid
     # where the USB-attached keyboard is most likely USB2 LS/FS).
-    # Set PR=1 (bit 4). W1C bits in 0x00FE0000 stay preserved.
+    # Repair (R): clear CSC W1C, then assert PR=1 with PP=1 defensively;
+    # capture PSC change-byte to CMOS[0x6C] on any failure path.
     var psc0 = xhci_portsc_read(port_num);
-    xhci_portsc_write(port_num, (psc0 & 0xFF01FFFF) | 0x10, 0);
-    # Poll for PRC (bit 21) — indicates reset done.
+    xhci_portsc_write(port_num, psc0 & 0xFF01FFFF, 0x20000);
+    var psc1 = xhci_portsc_read(port_num);
+    xhci_portsc_write(port_num, (psc1 & 0xFF01FFFF) | 0x10 | 0x200, 0);
     var wait2 = 0;
+    var psc_last = 0;
     while (wait2 < 1000000) {
         var psc = xhci_portsc_read(port_num);
+        psc_last = psc;
         if ((psc & 0x200000) != 0) {
-            # Clear PRC by writing 1 back to it, preserving other state.
             xhci_portsc_write(port_num, psc & 0xFF01FFFF, 0x200000);
-            # Confirm PED set after reset.
             var psc2 = xhci_portsc_read(port_num);
             if ((psc2 & 0x2) != 0) { return 1; }
+            xhci_cmos_stamp(0x6C, (psc2 >> 16) & 0xFF);
             return 0;
         }
         wait2 = wait2 + 1;
     }
+    xhci_cmos_stamp(0x6C, (psc_last >> 16) & 0xFF);
     return 0;
 }
 
