@@ -168,7 +168,17 @@ fn xhci_probe() {
     kprint_num(xhci_xecp);
     kprintln("", 0);
 
-    # 7. CMOS kernel checkpoint 0x30 (xhci probe complete). Readable
+    # 7. Repair (R7): stamp HCCPARAMS1 + HCCPARAMS2 low bytes to CMOS for
+    # the post-mortem channel. Surfaces controller-advertised capabilities
+    # beyond the three we already cache (AC64/CSZ/xECP). HCCPARAMS2 (xHCI
+    # 1.1+) covers U3C/CMC/FSC/CTC/LEC/CIC/ETC/ETC_TSC quirks — any AMD-FCH-
+    # specific bit that gates per-port reset state-machine entry will surface
+    # here. Pure diagnostic; controller behavior unchanged.
+    var hccp2 = xhci_cap_read32(XHCI_CAP_HCCPARAMS2);
+    xhci_cmos_stamp(0x6E, hccp1 & 0xFF);
+    xhci_cmos_stamp(0x6F, hccp2 & 0xFF);
+
+    # 8. CMOS kernel checkpoint 0x30 (xhci probe complete). Readable
     # post-mortem via `agnosticos/scripts/read-boot-log.sh`. Matches the
     # CMOS-checkpoint convention from `core/main.cyr` — 8-byte raw asm
     # block that survives a triple-fault reset.

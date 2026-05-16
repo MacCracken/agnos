@@ -286,11 +286,63 @@ fn xhci_port_reset(port_num, proto) {
     }
     # USB2 (or unknown — try USB2 path; safer default for archaemenid
     # where the USB-attached keyboard is most likely USB2 LS/FS).
-    # Repair (R): clear CSC W1C, then assert PR=1 with PP=1 defensively;
-    # capture PSC change-byte to CMOS[0x6C] on any failure path.
+    #
+    # Repair (R10): SeaBIOS pattern. PR=1 is only honored by the controller
+    # when the port-link state machine is in Polling (PLS=7). Before R10 we
+    # wrote PR=1 unconditionally, against an unknown PLS — Attempt 38 CMOS
+    # dump showed [0x6C]=0x00 (no PSC change bits set at timeout), the
+    # signature of a silently-absorbed PR write. xHCI 1.2 §4.19.1.1 + SeaBIOS
+    # src/hw/usb-xhci.c xhci_hub_reset confirm: USB2 attach sequence is
+    # Disconnected → Powered → Polling → (host PR=1) → Reset → Enabled.
+    # Other PLS values that can be observed at this entry: U0 (0, already
+    # enabled), Disabled (4), RxDetect (5), Inactive (6).
+    #
+    # R10 logic:
+    #   1. Read PLS, stamp to CMOS[0x6D] on the connected port for diag.
+    #   2. If PLS == U0 — port is already past reset, skip and treat as
+    #      success (Enable Slot will catch real failures downstream).
+    #   3. If PLS != Polling — wait ~20ms for device chirp to complete,
+    #      re-poll PLS. Bail if it never settles to Polling (or skip-to-U0).
+    #   4. Only then proceed with R2's CSC pre-clear + R1's PR|PP write +
+    #      R4's PSC change-byte stamp on any failure path.
     var psc0 = xhci_portsc_read(port_num);
+    var pls0 = (psc0 >> 5) & 0xF;
+    # Stamp first PLS only on the connected port — avoids smearing across
+    # all 6 unconnected ports. Top nibble carries provenance for the decoder.
+    if ((psc0 & 0x1) != 0) {
+        xhci_cmos_stamp(0x6D, pls0 & 0xF);
+    }
+    # U0 fast path — already enabled. Treat as success; Enable Slot will
+    # catch real downstream issues with a non-Success completion code.
+    if (pls0 == 0) {
+        return 1;
+    }
+    # Wait for PLS=Polling if we're not already there.
+    if (pls0 != 7) {
+        var settle = 0;
+        while (settle < 200000) {
+            var psc_s = xhci_portsc_read(port_num);
+            var pls_s = (psc_s >> 5) & 0xF;
+            if (pls_s == 7) { break; }
+            if (pls_s == 0) {
+                # Arrived at U0 during the wait — flag and return success.
+                xhci_cmos_stamp(0x6D, 0xF0 | pls_s);
+                return 1;
+            }
+            settle = settle + 1;
+        }
+        # Re-read after the settle for the final-PLS stamp; if still not
+        # Polling, stamp the final state in the top nibble (provenance).
+        var psc_f = xhci_portsc_read(port_num);
+        var pls_f = (psc_f >> 5) & 0xF;
+        if (pls_f != 7) {
+            xhci_cmos_stamp(0x6D, 0xE0 | pls_f);
+        }
+    }
+    # R2 retained: CSC pre-clear, then re-read.
     xhci_portsc_write(port_num, psc0 & 0xFF01FFFF, 0x20000);
     var psc1 = xhci_portsc_read(port_num);
+    # R1 retained: PR=1 + PP=1 defensively.
     xhci_portsc_write(port_num, (psc1 & 0xFF01FFFF) | 0x10 | 0x200, 0);
     var wait2 = 0;
     var psc_last = 0;
@@ -302,11 +354,16 @@ fn xhci_port_reset(port_num, proto) {
             var psc2 = xhci_portsc_read(port_num);
             if ((psc2 & 0x2) != 0) { return 1; }
             xhci_cmos_stamp(0x6C, (psc2 >> 16) & 0xFF);
+            # R8: PORTPMSC of the failing port to CMOS[0x60] (reuses retired
+            # AS2 slot per Repair-O cleanup). USB2 PMSC bits encode L1 status,
+            # remote-wake support, test mode — non-standard quirks land here.
+            xhci_cmos_stamp(0x60, load32(xhci_portsc_addr(port_num) + 0x04) & 0xFF);
             return 0;
         }
         wait2 = wait2 + 1;
     }
     xhci_cmos_stamp(0x6C, (psc_last >> 16) & 0xFF);
+    xhci_cmos_stamp(0x60, load32(xhci_portsc_addr(port_num) + 0x04) & 0xFF);
     return 0;
 }
 
