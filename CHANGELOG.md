@@ -31,10 +31,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `xhci_enumerate` between `xhci_xecp_classify_ports()`
   and the per-port enumerate loop. Safe on PPC=0 silicon
   (PP reads as 1 unconditionally there; the write is a
-  controller-side no-op). Iron-test gate: CMOS[0x6B] full
-  bitmap and at least one CCS bit set when a device is
-  physically attached. `build/agnos` 341,864 → 342,328 B
-  (+464). Diagnostic decoder pair:
+  controller-side no-op). Iron-test gate: framebuffer line
+  `xhci: PP=1 asserted, bitmap=<N>` between
+  `xhci: controller running, HCH=0, ...` and the per-port
+  `xhci: port N reset failed (proto=X)` (or success)
+  lines; CMOS[0x6B] full bitmap survives kcp overwrite for
+  post-mortem; at least one CCS bit set when a device is
+  physically attached. `build/agnos` 341,864 → 342,408 B
+  (+544). Diagnostic decoder pair:
   `agnosticos/scripts/src/read-boot-log.cyr`
   (CMOS slot range extended `0x62..0x6A` → `0x62..0x6B`).
 

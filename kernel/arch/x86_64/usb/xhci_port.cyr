@@ -88,6 +88,13 @@ fn xhci_ports_power_on() {
         p2 = p2 + 1;
     }
     xhci_cmos_stamp(0x6B, pp_set_mask & 0xFF);
+    # Framebuffer line — survives the CMOS-kcp overwrite that kybernet does
+    # downstream, and matches the per-phase line shape used elsewhere
+    # (`xhci: halted, reset clean` etc.). Bitmap is the raw byte; decode by
+    # bit position = port number - 1.
+    kprint("xhci: PP=1 asserted, bitmap=", 28);
+    kprint_num(pp_set_mask);
+    kprintln("", 0);
     return 1;
 }
 
