@@ -250,14 +250,10 @@ fn xhci_rt_write64(addr, val) {
 fn xhci_init() {
     if (xhci_present == 0) { return 0; }
 
-    # Phase 2.5 USBLEGSUP claim — call DISABLED for bisection. Reverts
-    # the kernel to the Phase-3-only state that Attempt 32 burned with
-    # (visually clean, port-reset symptom isolated). If this burn shows
-    # the framebuffer rendering clean again, Phase 2.5 is the regression
-    # source and needs re-examination before re-enabling. fn definition
-    # in xhci_port.cyr is left in place so re-enabling is a one-line
-    # restore.
-    # xhci_usblegsup_claim();
+    # xHCI 1.2 §4.22.1: claim controller from BIOS SMI before any
+    # operational-register writes, else PR writes can be silently absorbed
+    # by legacy USB SMI handlers.
+    xhci_usblegsup_claim();
 
     # 1. Halt: clear R/S bit, wait for HCH.
     var cmd = xhci_op_read32(XHCI_OP_USBCMD);
