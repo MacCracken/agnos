@@ -50,7 +50,7 @@ else
     # EMITELF64_KERNEL: ELF64 header + multiboot2 + EFI64-entry tag.
     # GRUB-EFI hands off in long mode without long-mode-exit, so the
     # kernel must be 64-bit code. Diagnosis + plan in
-    # agnosticos/docs/development/iron-boot-testing-log.md § Diagnosis
+    # agnosticos/docs/development/iron-nuc-zen-log.md § Diagnosis
     # 2026-05-13 and path-a-elf64-multiboot2.md.
     export CYRIUS_ELF64_KERNEL=1
     PREPPED="$ROOT/build/agnos_x86.cyr"

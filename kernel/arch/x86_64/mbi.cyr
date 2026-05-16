@@ -32,7 +32,7 @@
 # History: pre-Path-C builds used `mbi_capture_rbx()` and expected
 # RBX = MBI physical address per multiboot2 § 8.4.3. The Path A
 # multiboot2-via-GRUB experiment died under GRUB's strict-W^X EFI
-# relocator (see agnosticos/docs/development/iron-boot-testing-log.md
+# relocator (see agnosticos/docs/development/iron-nuc-zen-log.md
 # § Diagnosis 2). Path C replaces GRUB with gnoboot entirely and
 # changes the handoff protocol to a sovereign struct addressed
 # through RDI.

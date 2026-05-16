@@ -195,7 +195,7 @@ fn smp_start_aps() {
     # the fault is in trampoline build / stack alloc and Attempt 11 will
     # instrument those.
     #
-    # See: agnosticos/docs/development/iron-boot-testing-log.md § Attempt 9.
+    # See: agnosticos/docs/development/iron-nuc-zen-log.md § Attempt 9.
     # for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_init(ap); }
     # for (var w = 0; w < 2000000; w = w + 1) { }
     # for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_sipi(ap, 0x08); }

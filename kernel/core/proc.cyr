@@ -137,7 +137,7 @@ var kpti_user_cr3 = 0x1000;
 # inside the kernel-reserved [0x1000..0x3FFF] PT range. That's the smoking gun
 # for the Attempt-22 kernel-CR3-restore #PF (kcp=0x68): zeroing a "fresh" page
 # that's actually the kernel PML4 corrupts it in place, then `mov cr3, 0x1000`
-# walks zeros and #PFs. See iron-boot-testing-log.md § Attempt 22 audit.
+# walks zeros and #PFs. See iron-nuc-zen-log.md § Attempt 22 audit.
 var proc_pca_call_n = 0;
 
 # Load cr3_val (first param at [rbp-8] per Cyrius calling convention)

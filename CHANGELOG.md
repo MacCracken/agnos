@@ -43,7 +43,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 sovereign boot-info struct (Path C handoff).** Closes the
 Path-A → Path-C transition triggered by GRUB's strict-W^X EFI
 relocator being incompatible with multiboot2 on modern firmware
-(see `agnosticos/docs/development/iron-boot-testing-log.md`
+(see `agnosticos/docs/development/iron-nuc-zen-log.md`
 § Diagnosis 2 for the forensic trail and
 `agnosticos/docs/development/path-c-sovereign-uefi.md` for the
 new plan). Pairs with **gnoboot v0.2.0** — the AGNOS sovereign
@@ -286,7 +286,7 @@ visual canary, CMOS boot-log, Repair P, kprint mirror, cleanup pass,
   `kernel checkpt` ≥ 0x08 → AP wakeup is the fault, patch follows; still
   0x07 → fault is in trampoline build or stack alloc, instrument finer
   in Attempt 11. See
-  `agnosticos/docs/development/iron-boot-testing-log.md` § *Attempt 9*.
+  `agnosticos/docs/development/iron-nuc-zen-log.md` § *Attempt 9*.
 - **Boot-info struct version bumped 1 → 2** to consume gnoboot v0.1.0+'s
   inlined framebuffer fields at offsets 0x48-0x5C (`fb_phys`,
   `fb_pitch`, `fb_width`, `fb_height`, `fb_pixel_format`). Kernel
@@ -312,7 +312,7 @@ visual canary, CMOS boot-log, Repair P, kprint mirror, cleanup pass,
   `gdt_init` uses for `lgdt [rax]` two functions up). Net change:
   −4 instruction bytes. Credit Attempt-8 CMOS bisector for pinpointing
   the failure to ~3 lines of asm without a serial cable on the iron
-  target. See `agnosticos/docs/development/iron-boot-testing-log.md`
+  target. See `agnosticos/docs/development/iron-nuc-zen-log.md`
   § *Attempt 8*.
 
 - **GDT array undersized — OOB writes stomped `boot_info_ptr`**
@@ -424,7 +424,7 @@ sequence; no new features.
 this patch is *behaviorally identical* to v1.29.0 (both set CR4 bits
 5 + 20 + 21). The patch is therefore **not** a confirmed causal fix
 for Attempt 3's silent reset on the NUC AMD; that diagnosis is still
-open (see `agnosticos/docs/development/iron-boot-testing-log.md`
+open (see `agnosticos/docs/development/iron-nuc-zen-log.md`
 Attempt 4 — serial-cable capture is the recommended next step). The
 patch *does* fix a real portability bug that future Intel hosts
 (queued post-AMD-proof) and older AMD silicon would have hit.
@@ -464,7 +464,7 @@ patch *does* fix a real portability bug that future Intel hosts
 
 - Iron-side Attempt 3 reset on the NUC AMD is **not** explained by
   this patch (Zen advertises both feature bits). Open hypotheses
-  (per the iron-boot-testing-log): low-memory page-table / GDT /
+  (per the iron-nuc-zen-log): low-memory page-table / GDT /
   stack collision with UEFI runtime-reserved regions; multiboot1 +
   UEFI fundamental handoff gap requiring a multiboot2 retrofit; or
   shim-level fault in a different early step. Serial-cable capture

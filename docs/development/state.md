@@ -67,7 +67,7 @@ on hardware blocks only on the scheduler dispatching a runnable user
 task (kybernet PID 1 / agnoshi).
 
 Iron-side bisector + fix plan: see Attempt 12 in
-`agnosticos/docs/development/iron-boot-testing-log.md` (finer CMOS
+`agnosticos/docs/development/iron-nuc-zen-log.md` (finer CMOS
 checkpoints around the post-`sched_active=1` loop + the `if (0 == 1)`
 → `while (1 == 1)` patch on `test_proc_a/b` as the cheapest of the
 three fix paths below).

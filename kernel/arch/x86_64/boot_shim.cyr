@@ -148,7 +148,7 @@ asm {
 #
 # Pre-Path-C builds expected RAX=0x36d76289 + RBX=MBI per multiboot2
 # § 8.4.3. That path is dead — GRUB's strict-W^X EFI relocator broke
-# it irrecoverably (iron-boot log § Diagnosis 2). Path C drops GRUB
+# it irrecoverably (iron-nuc-zen log § Diagnosis 2). Path C drops GRUB
 # entirely; gnoboot is the only thing between UEFI firmware and us.
 #
 # Sequence (minimal — just what's needed before kernel main can run):

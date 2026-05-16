@@ -145,7 +145,7 @@ fn do_context_switch(isr_rsp) {
     # the round-robin oscillating proc_a ↔ proc_b indefinitely with proc 0
     # never re-selected, consistent with proc 0's state somehow being read
     # as non-2 here. Unconditional set removes that variable. See
-    # iron-boot-testing-log § Attempt 14 + state.md sub-case 3b.
+    # iron-nuc-zen-log § Attempt 14 + state.md sub-case 3b.
     proc_save_context(old, isr_rsp);
     proc_set_state(old, 1);  # running → ready (unconditional)
 

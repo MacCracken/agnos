@@ -5,7 +5,7 @@
 # uninitialized stack word and jump to garbage. Iron-boot Attempt 12
 # (2026-05-14) triple-faulted on iter 0 of the scheduler loop with the
 # previous `if (0 == 1) { ... } return 0;` shape. See
-# docs/development/iron-boot-testing-log.md § Attempt 12 for the trace.
+# docs/development/iron-nuc-zen-log.md § Attempt 12 for the trace.
 # Coupled file: scripts/bench.sh inverts `while (1 == 1)` → `if (0 == 1)`
 # for bench builds so the scheduler doesn't keep these alive past
 # arch_halt. bench.sh guards on a match-count of exactly 2 — if you
