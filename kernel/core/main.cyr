@@ -149,10 +149,16 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0B; 0xE6; 0x71; }
 # identity-map already covered by pt_init (0–4 GB), read capability
 # window, cache MaxSlots/MaxIntrs/MaxPorts/CSZ/DBOFF/RTSOFF as module
 # globals for later phases. Probe-only — no controller reset, no DMA,
-# no port enumeration. CMOS checkpoint 0x30 stamps on success. See
-# `agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`
-# § Phase 1.
+# no port enumeration. CMOS checkpoint 0x30 stamps on success.
 xhci_probe();
+
+# xHCI Phase 2 (halt + reset bite) — clear R/S, wait HCH, write HCRST,
+# wait for it to self-clear, then wait for CNR. Leaves the controller
+# in the spec-defined "halted, reset clean" state that DMA-structure
+# programming (DCBAA / cmd ring / event ring) assumes. No-op if the
+# probe didn't find a controller. CMOS checkpoint 0x31 stamps on
+# success. See planning/usb-hid-keyboard-driver.md § Phase 2.
+xhci_init();
 
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
 if (acpi_iommu_base != 0) {

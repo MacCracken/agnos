@@ -1,0 +1,141 @@
+# === xHCI DMA structures — Phase 2 ===
+#
+# Allocates and initializes the four DMA structures the controller needs
+# before USBCMD.R/S can be set:
+#
+#   DCBAA       — Device Context Base Address Array (1 page, 512 entries
+#                 of 8 bytes each, slot-id-indexed). Slot 0 is the
+#                 Scratchpad Buffer Array pointer in xHCI 1.1+; left
+#                 zeroed (HCSPARAMS2.MaxScratchpadBufs is expected to be
+#                 0 on archaemenid; if not, Phase 2 init log will surface
+#                 it and a follow-up scratchpad allocation lands).
+#
+#   Cmd ring    — 256 16-byte TRBs (1 page). Producer ring; software
+#                 writes command TRBs and rings doorbell 0 to hand off.
+#                 Slot 255 holds a Link TRB wrapping back to slot 0 with
+#                 Toggle Cycle = 1 (HW + SW flip Producer Cycle State on
+#                 wrap, per xHCI 1.2 §4.9.3).
+#
+#   Event ring  — 256 16-byte TRBs (1 page). Single segment for
+#                 simplicity. HW writes Transfer / Command Completion /
+#                 Port Status Change events; software polls in Phase 5
+#                 (MSI-X is a follow-up). HW owns the cycle bit.
+#
+#   ERST        — Event Ring Segment Table. One 16-byte entry pointing
+#                 at the event ring segment, on its own 4 KB page (4080
+#                 bytes wasted — easier to bisect on iron than packing
+#                 ERST into the start of the event ring page).
+#
+# All four are PMM-allocated. The kernel identity-maps 0–4 GB via
+# pt_init, and pmm_alloc returns pages within the first 16 MB, so phys
+# == virt and DMA is safe without IOMMU translation. iommu_register_dma
+# is best-effort — it's a no-op when VT-d isn't active.
+
+# --- Module globals (consumed by xhci_init + Phase 3 cmd path) ------
+
+var xhci_dcbaa_phys     = 0;   # DCBAA page phys (= virt; 4 KB aligned)
+var xhci_cmd_ring_phys  = 0;   # Command ring page phys
+var xhci_cmd_ring_cycle = 0;   # Producer Cycle State (PCS) for cmd ring
+var xhci_cmd_ring_idx   = 0;   # Next free TRB slot in cmd ring (0..254)
+var xhci_evt_ring_phys  = 0;   # Event ring page phys
+var xhci_evt_ring_cycle = 0;   # Consumer Cycle State (CCS) for event ring
+var xhci_evt_ring_idx   = 0;   # Next event TRB slot to consume
+var xhci_erst_phys      = 0;   # ERST page phys (entry 0 at offset 0)
+var xhci_rings_ready    = 0;   # 1 once all four allocations succeeded
+
+# Event ring segment size — 256 TRBs × 16 bytes = 4 KB (one page).
+# Bumped only when a Phase-5+ workload actually needs more than 256
+# unconsumed events between polls.
+var XHCI_EVT_RING_SEGMENT_SIZE = 256;
+
+# --- Helpers --------------------------------------------------------
+
+# 4 KB / 8 B per store = 512 store64 calls. Same idiom virtio_blk uses
+# at qbase initialization.
+fn xhci_zero_page(page) {
+    for (var i = 0; i < 512; i = i + 1) {
+        store64(page + i * 8, 0);
+    }
+    return 0;
+}
+
+# Plan open-question #3: verify pmm_alloc-returned pages are actually
+# present in the active page table AND readable. Runs once on the first
+# allocation. If this fails, every later allocation also fails — fail
+# fast with a kprintln so iron post-mortem is unambiguous (vs silent
+# triple-fault when the controller later DMAs into the page).
+fn xhci_dma_check(page) {
+    store64(page, 0x0DEADBEEFCAFE);
+    var v = load64(page);
+    if (v != 0x0DEADBEEFCAFE) { return 0; }
+    store64(page, 0);
+    return 1;
+}
+
+# --- Allocate + initialize all four DMA structures ------------------
+
+fn xhci_rings_init() {
+    if (xhci_rings_ready != 0) { return 1; }
+
+    # 1. DCBAA — 1 page, zeroed. Sanity-check the very first allocation.
+    var dcbaa = pmm_alloc();
+    if (dcbaa == 0) { kprintln("xhci: DCBAA alloc failed", 24); return 0; }
+    if (xhci_dma_check(dcbaa) == 0) {
+        kprintln("xhci: DMA sanity check failed (page unreadable)", 47);
+        return 0;
+    }
+    if (vmm_is_mapped(dcbaa) == 0) { vmm_map(dcbaa, dcbaa, 0x83); }
+    iommu_register_dma(dcbaa);
+    xhci_zero_page(dcbaa);
+    xhci_dcbaa_phys = dcbaa;
+
+    # 2. Command ring — 1 page, zeroed, Link TRB at slot 255 wraps to
+    # slot 0 with Toggle Cycle = 1. Initial Producer Cycle State = 1
+    # (xHCI 1.2 §4.9.3); the Link TRB's cycle bit must match the current
+    # PCS for HW to follow it on the first wrap.
+    var cmd = pmm_alloc();
+    if (cmd == 0) { kprintln("xhci: cmd ring alloc failed", 27); return 0; }
+    if (vmm_is_mapped(cmd) == 0) { vmm_map(cmd, cmd, 0x83); }
+    iommu_register_dma(cmd);
+    xhci_zero_page(cmd);
+
+    # Link TRB at slot 255 (offset 0xFF0):
+    #   dwords 0/1 — ring base addr (64-bit; written as one store64)
+    #   dword 2    — 0 (status fields N/A for Link)
+    #   dword 3    — type=Link(6) << 10 | TC(bit 1) | C(bit 0) = 0x1803
+    var link_off = 255 * 16;
+    store64(cmd + link_off, cmd);
+    store32(cmd + link_off + 8, 0);
+    store32(cmd + link_off + 12, (XHCI_TRB_LINK << 10) | 0x2 | 0x1);
+
+    xhci_cmd_ring_phys  = cmd;
+    xhci_cmd_ring_cycle = 1;
+    xhci_cmd_ring_idx   = 0;
+
+    # 3. Event ring — 1 page, zeroed. HW owns the cycle bit; our CCS
+    # tracking starts at 1 to match HW's first-write cycle.
+    var evt = pmm_alloc();
+    if (evt == 0) { kprintln("xhci: event ring alloc failed", 29); return 0; }
+    if (vmm_is_mapped(evt) == 0) { vmm_map(evt, evt, 0x83); }
+    iommu_register_dma(evt);
+    xhci_zero_page(evt);
+    xhci_evt_ring_phys  = evt;
+    xhci_evt_ring_cycle = 1;
+    xhci_evt_ring_idx   = 0;
+
+    # 4. ERST — one 16-byte entry pointing at the event ring. ERST entry:
+    #   dwords 0/1 — segment base address (64-bit, 64-byte aligned)
+    #   dword 2    — segment size in TRBs (low 16 bits)
+    #   dword 3    — reserved (already zeroed)
+    var erst = pmm_alloc();
+    if (erst == 0) { kprintln("xhci: ERST alloc failed", 23); return 0; }
+    if (vmm_is_mapped(erst) == 0) { vmm_map(erst, erst, 0x83); }
+    iommu_register_dma(erst);
+    xhci_zero_page(erst);
+    store64(erst, evt);
+    store32(erst + 8, XHCI_EVT_RING_SEGMENT_SIZE);
+    xhci_erst_phys = erst;
+
+    xhci_rings_ready = 1;
+    return 1;
+}

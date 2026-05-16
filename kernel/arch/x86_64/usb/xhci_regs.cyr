@@ -59,3 +59,87 @@ enum XhciPciClass {
     XHCI_PCI_SUBCLASS = 0x03;       # USB Controller
     XHCI_PCI_PROGIF   = 0x30;       # xHCI (vs 0x00=UHCI, 0x10=OHCI, 0x20=EHCI)
 }
+
+# Operational register offsets (relative to op_base = MMIO + CAPLENGTH).
+# Phase 2 only reads/writes USBCMD + USBSTS to halt and reset; the full
+# set lands as later phases consume them.
+enum XhciOpReg {
+    XHCI_OP_USBCMD   = 0x00;        # u32 — Run/Stop, HCRST, INTE, ...
+    XHCI_OP_USBSTS   = 0x04;        # u32 — HCH, HSE, EINT, PCD, CNR, ...
+    XHCI_OP_PAGESIZE = 0x08;        # u32 — supported page sizes (bitmask)
+    XHCI_OP_DNCTRL   = 0x14;        # u32 — device notification control
+    XHCI_OP_CRCR     = 0x18;        # u64 — command ring control / pointer
+    XHCI_OP_DCBAAP   = 0x30;        # u64 — device context base addr array ptr
+    XHCI_OP_CONFIG   = 0x38;        # u32 — MaxSlotsEn + U3E + CIE
+}
+
+# USBCMD bit fields (xHCI 1.2 §5.4.1) --------------------------------
+#   bit 0   R/S      — Run/Stop (1 = run)
+#   bit 1   HCRST    — Host Controller Reset
+#   bit 2   INTE     — Interrupter Enable
+#   bit 3   HSEE     — Host System Error Enable
+#   bit 7   LHCRST   — Light HC Reset
+#   bit 8   CSS      — Controller Save State
+#   bit 9   CRS      — Controller Restore State
+#   bit 10  EWE      — Enable Wrap Event
+#   bit 11  EU3S     — Enable U3 MFINDEX Stop
+
+# USBSTS bit fields (xHCI 1.2 §5.4.2) --------------------------------
+#   bit 0   HCH      — HCHalted (1 = halted)
+#   bit 2   HSE      — Host System Error
+#   bit 3   EINT     — Event Interrupt
+#   bit 4   PCD      — Port Change Detect
+#   bit 8   SSS      — Save State Status
+#   bit 9   RSS      — Restore State Status
+#   bit 10  SRE      — Save / Restore Error
+#   bit 11  CNR      — Controller Not Ready (1 = not ready)
+#   bit 12  HCE      — Host Controller Error
+
+# CRCR bit fields (xHCI 1.2 §5.4.5) — Command Ring Control Register --
+#   bit 0   RCS      — Ring Cycle State (initial producer cycle)
+#   bit 1   CS       — Command Stop
+#   bit 2   CA       — Command Abort
+#   bit 3   CRR      — Command Ring Running (RO)
+#   bits [63:6]      — Command Ring Pointer (64-byte aligned)
+
+# CONFIG bit fields (xHCI 1.2 §5.4.7) --------------------------------
+#   bits [7:0]       — MaxSlotsEn  (must equal HCSPARAMS1.MaxSlots for full enum)
+#   bit 8            — U3E          (xHCI 1.1+)
+#   bit 9            — CIE          (xHCI 1.1+ Configuration Information Enable)
+
+# Runtime register offsets (relative to rt_base = MMIO + RTSOFF).
+# Layout: MFINDEX (u32, +0x00), 28-byte reserved padding to +0x20, then
+# 32-byte interrupter array starting at +0x20 with stride 0x20. Phase 2
+# uses interrupter 0 only (poll-mode event ring).
+enum XhciRtReg {
+    XHCI_RT_MFINDEX     = 0x00;     # u32 — microframe index
+    XHCI_RT_IR0_BASE    = 0x20;     # interrupter 0 starts here
+}
+
+# Per-interrupter register offsets (relative to interrupter base):
+enum XhciIrReg {
+    XHCI_IR_IMAN        = 0x00;     # u32 — Interrupter Management (IE, IP)
+    XHCI_IR_IMOD        = 0x04;     # u32 — Interrupter Moderation
+    XHCI_IR_ERSTSZ      = 0x08;     # u32 — Event Ring Segment Table Size
+    XHCI_IR_ERSTBA      = 0x10;     # u64 — Event Ring Segment Table Base
+    XHCI_IR_ERDP        = 0x18;     # u64 — Event Ring Dequeue Pointer
+}
+
+# TRB types we touch in Phase 2 (xHCI 1.2 §6.4.6 — full table).
+# TRB type lives in bits [15:10] of dword 3 → shift up by 10 when packing.
+# Only Link is needed in Phase 2 (cmd-ring last-slot wrap).
+enum XhciTrbType {
+    XHCI_TRB_LINK       = 6;        # Link TRB — points to next ring segment / wraps
+}
+
+# DCBAA / cmd ring / event ring sizing (xHCI 1.2 §6.1, §6.5)
+#   - DCBAA:      8 bytes per slot, MaxSlots+1 entries (slot 0 reserved
+#                 in xHCI 1.0; in 1.1+ it's the Scratchpad Buffer Array
+#                 pointer). 1 page (512 entries) covers MaxSlots ≤ 511.
+#   - Cmd ring:   16-byte TRBs, 256 per page. Last TRB is a Link TRB
+#                 pointing back to slot 0 with TC=1 (toggle cycle).
+#   - Event ring: 16-byte TRBs, 256 per page. NO Link TRB (event ring
+#                 wraps via the dequeue pointer + cycle bit owned by HW).
+#   - ERST:       16 bytes per entry, one entry sufficient for one event
+#                 ring segment. Allocated on its own page (4080 wasted
+#                 bytes; trivial cost, easier to bisect on iron).

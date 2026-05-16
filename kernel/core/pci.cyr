@@ -15,15 +15,25 @@
 #derive(accessors)
 struct PciDev { slot; vendor; device; bar0; }
 
-var pci_devs[1024];  # 32 entries x 32 bytes (max 32 PCI slots)
+# Capacity = 128 entries. Bus-0/func-0-only enumeration filled at most
+# ~10-15 on QEMU and 6 on archaemenid; full bus walk + multifunction
+# expansion on AMD Ryzen platforms can push the count to 40-60. 128
+# entries x 32 bytes = 4 KB; cheap on the heap-mapped BSS.
+var pci_devs[4096];     # 128 entries x 32 bytes
 var pci_count = 0;
 
 # Side arrays parallel to pci_devs[i*32]. Kept separate from PciDev so
 # existing consumers (virtio_net, virtio_blk, iommu, shell.cyr lspci)
 # stay byte-compatible against `&pci_devs + i * 32` indexing.
 # v1.30.1: added for xhci_probe (PCI class lookup + 64-bit BAR readback).
-var pci_class[256];     # 32 entries x 8 bytes; packed (class<<16 | subclass<<8 | prog_if)
-var pci_bar0_hi[256];   # 32 entries x 8 bytes; high 32 bits of BAR0 when 64-bit memory BAR
+var pci_class[1024];    # 128 entries x 8 bytes; packed (class<<16 | subclass<<8 | prog_if)
+var pci_bar0_hi[1024];  # 128 entries x 8 bytes; high 32 bits of BAR0 when 64-bit memory BAR
+# v1.30.1: full PCIe-addressing — packed (bus<<8 | func) per entry.
+# Legacy consumers (virtio_net/blk, iommu, lspci) assume bus=0/func=0
+# and only look at PciDev_slot — they continue to work unchanged because
+# every entry they care about reads back 0x0000 here. xhci_probe is the
+# first consumer that actually decodes this side array.
+var pci_busfunc[1024];  # 128 entries x 8 bytes; (bus<<8 | func)
 
 fn pci_addr(bus, slot, func, off) {
     return 0x80000000 | (bus << 16) | (slot << 11) | (func << 8) | (off & 0xFC);
@@ -59,6 +69,10 @@ fn pci_write32(bus, slot, func, off, val) {
     return 0;
 }
 
+# Legacy bus-0/func-0 bus-master enable. Kept for virtio_net/blk callers
+# whose devices are always at bus 0 / func 0 on the QEMU test surface.
+# New code should prefer `pci_enable_bus_master_idx(idx)` which uses the
+# `pci_busfunc` side array for full PCIe addressing.
 fn pci_enable_bus_master(slot) {
     var cmd = pci_read32(0, slot, 0, 4);
     cmd = cmd | 7;  # Set I/O Space + Memory Space + Bus Master bits
@@ -66,44 +80,92 @@ fn pci_enable_bus_master(slot) {
     return 0;
 }
 
+# Full-addressing bus-master enable. Looks up bus + slot + func from the
+# pci_devs entry at `idx` (slot in PciDev struct, bus/func in pci_busfunc
+# side array), then writes the PCI command register with I/O + memory +
+# bus-master bits set. Added v1.30.1 for xhci on AMD Ryzen platforms where
+# the XHCI controller sits at non-zero bus / non-zero function.
+fn pci_enable_bus_master_idx(idx) {
+    var slot = PciDev_slot(&pci_devs + idx * 32);
+    var bf = load64(&pci_busfunc + idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    var cmd = pci_read32(bus, slot, func, 4);
+    cmd = cmd | 7;
+    pci_write32(bus, slot, func, 4, cmd);
+    return 0;
+}
+
+# Capture one (bus, slot, func) device into pci_devs[pci_count].
+# Returns 1 if a real device was recorded, 0 if absent or table full.
+# Factored out of pci_scan() so the multi-bus / multifunction loop reads
+# linearly: probe → recurse → enumerate.
+fn pci_record(bus, slot, func) {
+    if (pci_count >= 128) { return 0; }
+    var vendor = pci_read32(bus, slot, func, 0);
+    if (vendor == 0xFFFFFFFF) { return 0; }
+    if (vendor == 0) { return 0; }
+    var base = &pci_devs + pci_count * 32;
+    PciDev_set_slot(base, slot);
+    PciDev_set_vendor(base, vendor & 0xFFFF);
+    PciDev_set_device(base, (vendor >> 16) & 0xFFFF);
+    var bar0_lo = pci_read32(bus, slot, func, 0x10);
+    PciDev_set_bar0(base, bar0_lo);
+    # Class code register (PCI config offset 0x08):
+    #   byte 0 = revision, byte 1 = prog-if,
+    #   byte 2 = subclass, byte 3 = class.
+    var class_reg = pci_read32(bus, slot, func, 0x08);
+    var packed = (((class_reg >> 24) & 0xFF) << 16)
+               | (((class_reg >> 16) & 0xFF) << 8)
+               | ((class_reg >> 8) & 0xFF);
+    store64(&pci_class + pci_count * 8, packed);
+    # 64-bit memory BAR detection (PCI 3.0 §6.2.5.1):
+    #   bit 0 = 0 (memory), bits 2:1 = type (0=32, 2=64).
+    var bar0_hi = 0;
+    if ((bar0_lo & 0x01) == 0) {
+        var bar_type = (bar0_lo >> 1) & 0x03;
+        if (bar_type == 2) {
+            bar0_hi = pci_read32(bus, slot, func, 0x14);
+        }
+    }
+    store64(&pci_bar0_hi + pci_count * 8, bar0_hi);
+    store64(&pci_busfunc + pci_count * 8, (bus << 8) | func);
+    pci_count = pci_count + 1;
+    return 1;
+}
+
+# Brute-force enumeration of bus 0..255, slot 0..31, with multifunction
+# header gating (func 0 always; func 1..7 only if the func-0 header type
+# has the multifunction bit). Empty (bus,slot,func) tuples return
+# 0xFFFFFFFF on master-abort almost instantly — total cost on archaemenid
+# is well under 100 ms even with the full 256-bus sweep.
+#
+# Why brute force over bridge-recursion: simpler to implement in inline
+# asm + Cyrius and good enough for the Phase 1 / closed-beta surface.
+# Bridge-recursion is the textbook approach (scan bus 0, on each PCI
+# bridge enqueue its secondary bus, drain queue) and may replace this
+# later — when it does, the only user-visible change is boot time.
 fn pci_scan() {
     pci_count = 0;
-    for (var slot = 0; slot < 32; slot = slot + 1) {
-        var vendor = pci_read32(0, slot, 0, 0);
-        if (vendor != 0xFFFFFFFF) {
-            if (vendor != 0) {
-                var base = &pci_devs + pci_count * 32;
-                PciDev_set_slot(base, slot);
-                PciDev_set_vendor(base, vendor & 0xFFFF);
-                PciDev_set_device(base, (vendor >> 16) & 0xFFFF);
-                var bar0_lo = pci_read32(0, slot, 0, 0x10);
-                PciDev_set_bar0(base, bar0_lo);
-                # Class code register (PCI config offset 0x08):
-                #   byte 0 = revision, byte 1 = prog-if,
-                #   byte 2 = subclass, byte 3 = class.
-                # Pack as (class<<16 | subclass<<8 | prog_if) — drops
-                # revision, which no consumer needs in v1.30.1.
-                var class_reg = pci_read32(0, slot, 0, 0x08);
-                var packed = (((class_reg >> 24) & 0xFF) << 16)
-                           | (((class_reg >> 16) & 0xFF) << 8)
-                           | ((class_reg >> 8) & 0xFF);
-                store64(&pci_class + pci_count * 8, packed);
-                # 64-bit memory BAR detection (BAR layout per PCI 3.0 §6.2.5.1):
-                #   bit 0 = 0 (memory), bits 2:1 = type (0=32, 2=64).
-                # When BAR0 is a 64-bit memory BAR, BAR1 holds the high
-                # 32 bits of the same logical BAR. Otherwise BAR1 is a
-                # separate BAR (or absent) and bar0_hi stays 0. Existing
-                # 32-bit BAR0 consumers (virtio_net/blk) are unaffected
-                # because PciDev_bar0 still returns the low 32 bits.
-                var bar0_hi = 0;
-                if ((bar0_lo & 0x01) == 0) {
-                    var bar_type = (bar0_lo >> 1) & 0x03;
-                    if (bar_type == 2) {
-                        bar0_hi = pci_read32(0, slot, 0, 0x14);
+    for (var bus = 0; bus < 256; bus = bus + 1) {
+        for (var slot = 0; slot < 32; slot = slot + 1) {
+            # Probe function 0 first. If absent, skip the slot entirely.
+            var vendor0 = pci_read32(bus, slot, 0, 0);
+            if (vendor0 != 0xFFFFFFFF) {
+                if (vendor0 != 0) {
+                    pci_record(bus, slot, 0);
+                    # Header type at config offset 0x0E. Bit 7 = device
+                    # implements multiple functions. Only enumerate
+                    # func 1..7 if that bit is set — saves ~55k I/O reads
+                    # on a typical system where most slots are single-func.
+                    var ht_reg = pci_read32(bus, slot, 0, 0x0C);
+                    var header_type = (ht_reg >> 16) & 0xFF;
+                    if ((header_type & 0x80) != 0) {
+                        for (var func = 1; func < 8; func = func + 1) {
+                            pci_record(bus, slot, func);
+                        }
                     }
                 }
-                store64(&pci_bar0_hi + pci_count * 8, bar0_hi);
-                pci_count = pci_count + 1;
             }
         }
     }

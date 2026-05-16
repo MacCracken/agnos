@@ -6,10 +6,15 @@
 # grid. Required for iron-MVP (typeable shell on hardware without a
 # serial cable).
 #
-# Layout (matches fb.cyr docstring):
-#   y =   0..7   boot_shim canary stripe (256 white pixels)
-#   y =   8..79  cp_fb marker-cell grid (rows 1..9, 10 rows of 16 cells)
-#   y =  80..    text console (this module). 8x8 glyphs, software scroll.
+# Layout (v1.30.1: simplified — kernel boots reliably enough that the
+# stage-bisection apparatus came down):
+#   y =   0..    text console (this module). 8x8 glyphs, software scroll.
+#
+# Prior layouts kept rows reserved for a boot_shim canary stripe and the
+# cp_fb marker-cell grid; both are gone. The full-screen clear at the
+# top of `fb_console_init()` also wipes whatever gnoboot painted on its
+# way out (gnoboot's `efi_clear` + handoff banner) so the kernel log is
+# the only thing on the framebuffer once shell comes up.
 #
 # Font: subset of CGA 8x8 covering printable ASCII 0x20..0x7F (96 glyphs,
 # 768 bytes). Each glyph is 8 bytes top-to-bottom; bit 7 = leftmost pixel
@@ -54,17 +59,38 @@ fn fset(ch, val) {
 
 fn fb_console_init() {
     # Defensive re-assignment of layout/color gvars. The top-level
-    # `var FB_CONSOLE_Y0 = 80;` (and FB_FG / FB_BG) declarations below
+    # `var FB_CONSOLE_Y0 = 0;` (and FB_FG / FB_BG) declarations below
     # should initialize via cyrius v5.7.19 gvar-init phase, but on
     # iron-attempt-29 (2026-05-15) the non-zero initializers were observed
     # NOT honored at runtime — values read back as 0, causing fb_putc to
-    # paint text at y=0..55 (wiping cp_fb cells 0x06..0x10) in solid
-    # black-on-black (FG=BG=0, invisible). Zero-init vars (fb_cur_x,
-    # fb_cur_y, fb_console_ready) were unaffected because BSS defaults
-    # to zero — no init code needed. Surface as cyrius issue separately.
-    FB_CONSOLE_Y0 = 8;
+    # paint solid black-on-black (FG=BG=0, invisible). Zero-init vars
+    # (fb_cur_x, fb_cur_y, fb_console_ready) were unaffected because BSS
+    # defaults to zero — no init code needed. Surface as cyrius issue
+    # separately. (FB_CONSOLE_Y0 happens to want 0 now, but assign
+    # explicitly to keep the defensive pattern consistent for the other
+    # two.)
+    FB_CONSOLE_Y0 = 0;
     FB_FG = 0x00FFFFFF;
     FB_BG = 0x00000000;
+    # Full-screen clear before any glyphs render. Gnoboot calls
+    # `efi_clear(st)` pre-banner and then prints its handoff line, so
+    # row 0 of the framebuffer carries firmware-font text on entry; the
+    # kernel's first 8-px-glyph row would otherwise overlay that line.
+    # One linear sweep of the framebuffer (pitch x height u32 stores)
+    # paints over both gnoboot's banner and any residual UEFI logo —
+    # cost is small (~8 MB at 1080p, runs once, ~5 ms on Zen).
+    var fb_clr = fb_fb_phys();
+    if (fb_clr != 0) {
+        var pitch_clr  = fb_pitch();
+        var height_clr = fb_height();
+        var width_clr  = fb_width();
+        for (var py = 0; py < height_clr; py = py + 1) {
+            var scan_clr = fb_clr + py * pitch_clr;
+            for (var px = 0; px < width_clr; px = px + 1) {
+                store32(scan_clr + px * 4, 0x00000000);
+            }
+        }
+    }
     # Printable ASCII 0x20..0x7E (CGA-style 8x8 bitmaps; DEL=blank).
     fset(0x20, 0x0000000000000000);  # space
     fset(0x21, 0x1818181818001800);  # !
@@ -192,14 +218,12 @@ fn fb_height() {
     return load32(bi + 0x58);
 }
 
-# Console origin. Row 0 (y=0..7) remains reserved for the boot_shim
-# canary stripe — gnoboot-handoff diagnostic kept by design. cp_fb
-# marker grid was stripped Attempt-29-post (the kernel reaches shell
-# on iron reliably now; visual stage cells became noise once kprint
-# text mirroring landed). cp_fb() the function still ships in fb.cyr —
-# re-bumping FB_CONSOLE_Y0 if visual bisection is needed again is a
-# one-line change.
-var FB_CONSOLE_Y0 = 8;
+# Console origin. v1.30.1: boot_shim canary stripe at y=0..7 was deleted
+# and the cp_fb marker grid (rows 1..9) was already stripped Attempt-29-
+# post — so the entire screen is text-console territory now. cp_fb() the
+# function still ships in fb.cyr; re-bumping FB_CONSOLE_Y0 if visual
+# bisection is needed again is a one-line change.
+var FB_CONSOLE_Y0 = 0;
 var FB_FG = 0x00FFFFFF;  # white
 var FB_BG = 0x00000000;  # black
 

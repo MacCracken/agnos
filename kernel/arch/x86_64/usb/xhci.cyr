@@ -43,6 +43,10 @@ var xhci_ac64       = 0;   # HCCPARAMS1[0] — 64-bit addressing capable
 var xhci_db_off     = 0;   # DBOFF (doorbell array offset, dword-aligned)
 var xhci_rts_off    = 0;   # RTSOFF (runtime register offset, 32B-aligned)
 var xhci_xecp       = 0;   # HCCPARAMS1[31:16] — extended cap ptr (×4)
+var xhci_op_base    = 0;   # MMIO + CAPLENGTH — operational register window
+var xhci_rt_base    = 0;   # MMIO + RTSOFF   — runtime register window (interrupter array)
+var xhci_halted     = 0;   # 1 after xhci_init() drove the controller into halted+reset state
+var xhci_running    = 0;   # 1 after xhci_start() set R/S=1 and observed HCH=0
 
 # --- Capability register accessors ----------------------------------
 #
@@ -89,8 +93,10 @@ fn xhci_probe() {
     # already, but assert it explicitly — the controller will be
     # completely silent without bus-master, and we won't notice the
     # difference until Phase 2 (cmd ring submission).
-    var slot = PciDev_slot(&pci_devs + idx * 32);
-    pci_enable_bus_master(slot);
+    # `pci_enable_bus_master_idx` (vs the legacy `pci_enable_bus_master`)
+    # decodes bus + func from pci_busfunc — required on AMD Ryzen where
+    # the XHCI controller is multifunction / behind a PCIe root port.
+    pci_enable_bus_master_idx(idx);
 
     # 4. Verify the MMIO region is reachable from kernel CR3. `pt_init`
     # identity-maps 0–4 GB (PD at 0x3000 covers 0–1 GB at 2 MB pages;
@@ -125,6 +131,8 @@ fn xhci_probe() {
 
     xhci_db_off    = xhci_cap_read32(XHCI_CAP_DBOFF) & 0xFFFFFFFC;
     xhci_rts_off   = xhci_cap_read32(XHCI_CAP_RTSOFF) & 0xFFFFFFE0;
+    xhci_op_base   = mmio + xhci_cap_len;
+    xhci_rt_base   = mmio + xhci_rts_off;
 
     # 6. Report the find. Format aligns with other PCI-class consumers
     # (virtio_net / virtio_blk) — single kprintln summary plus per-field
@@ -166,5 +174,211 @@ fn xhci_probe() {
     # block that survives a triple-fault reset.
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x30; 0xE6; 0x71; }
 
+    return 1;
+}
+
+# --- Operational register accessors ---------------------------------
+#
+# Operational registers live at MMIO + CAPLENGTH (cached in xhci_op_base
+# after xhci_probe). All op-regs are 32-bit-aligned; spec mostly uses
+# 32-bit accesses except CRCR / DCBAAP which are 64-bit. Phase 2 only
+# touches USBCMD / USBSTS, both 32-bit.
+
+fn xhci_op_read32(off) {
+    return load32(xhci_op_base + off);
+}
+
+fn xhci_op_write32(off, val) {
+    store32(xhci_op_base + off, val);
+    return 0;
+}
+
+fn xhci_op_write64(off, val) {
+    store64(xhci_op_base + off, val);
+    return 0;
+}
+
+# --- Runtime register accessors -------------------------------------
+#
+# Runtime regs live at MMIO + RTSOFF. Layout: MFINDEX (u32) at +0x00,
+# then the interrupter array at +0x20 with 0x20 stride. Phase 2 uses
+# interrupter 0 only. ERSTBA / ERDP are 64-bit; ERSTSZ / IMAN / IMOD
+# are 32-bit. Callers compute the absolute interrupter address (e.g.
+# `xhci_rt_base + XHCI_RT_IR0_BASE`) and pass field offsets.
+
+fn xhci_rt_read32(addr) {
+    return load32(addr);
+}
+
+fn xhci_rt_write32(addr, val) {
+    store32(addr, val);
+    return 0;
+}
+
+fn xhci_rt_write64(addr, val) {
+    store64(addr, val);
+    return 0;
+}
+
+# --- Phase 2: halt + reset ------------------------------------------
+#
+# Drive the controller into "halted + reset" state — the well-defined
+# starting point for everything Phase 2+ does. Sequence per xHCI 1.2
+# §4.2 (Host Controller Initialization):
+#
+#   1. If R/S is set, clear it. Wait for HCH to set (≤ 16 ms by spec).
+#   2. Write HCRST=1 to USBCMD. The controller clears HCRST when reset
+#      completes (no spec maximum, but real silicon completes in ms).
+#   3. After HCRST clears, wait for CNR (Controller Not Ready) to clear
+#      in USBSTS. Spec allows up to ~10 ms here; some controllers take
+#      longer on cold POST.
+#
+# Timeout strategy: each spin uses a fixed iteration ceiling (1,000,000).
+# At a few cycles per load, that bounds wall time to roughly a quarter
+# second on Zen — generous compared to the spec's 16 ms HCH window but
+# safe even on slow virtual hardware. A real watchdog comes with the
+# jiffies-based scheduler (post-MVP).
+#
+# Returns 1 on success (halted, reset complete, CNR clear) and 0 on any
+# timeout. Caller (main.cyr) is expected to early-return on 0 — without
+# a reset controller, DMA structure programming is undefined behavior.
+#
+# Iron gate: framebuffer shows
+#   `xhci: halted, reset clean`
+# CMOS checkpoint kcp = 0x31 stamped only on success.
+
+fn xhci_init() {
+    if (xhci_present == 0) { return 0; }
+
+    # 1. Halt: clear R/S bit, wait for HCH.
+    var cmd = xhci_op_read32(XHCI_OP_USBCMD);
+    if ((cmd & 0x01) != 0) {
+        xhci_op_write32(XHCI_OP_USBCMD, cmd & 0xFFFFFFFE);
+    }
+    var wait = 0;
+    while (wait < 1000000) {
+        var sts = xhci_op_read32(XHCI_OP_USBSTS);
+        if ((sts & 0x01) != 0) { break; }
+        wait = wait + 1;
+    }
+    if (wait >= 1000000) {
+        kprintln("xhci: halt timeout (HCH never set)", 35);
+        return 0;
+    }
+
+    # 2. Reset: write HCRST=1, wait for it to self-clear.
+    xhci_op_write32(XHCI_OP_USBCMD, 0x02);
+    wait = 0;
+    while (wait < 1000000) {
+        var c2 = xhci_op_read32(XHCI_OP_USBCMD);
+        if ((c2 & 0x02) == 0) { break; }
+        wait = wait + 1;
+    }
+    if (wait >= 1000000) {
+        kprintln("xhci: reset timeout (HCRST never cleared)", 41);
+        return 0;
+    }
+
+    # 3. Wait for CNR clear. Per xHCI 1.2 §5.4.2, software must not
+    # write any operational register other than USBSTS while CNR=1.
+    wait = 0;
+    while (wait < 1000000) {
+        var sts2 = xhci_op_read32(XHCI_OP_USBSTS);
+        if ((sts2 & 0x800) == 0) { break; }
+        wait = wait + 1;
+    }
+    if (wait >= 1000000) {
+        kprintln("xhci: CNR never cleared", 23);
+        return 0;
+    }
+
+    xhci_halted = 1;
+    kprintln("xhci: halted, reset clean", 25);
+
+    # Halt+reset is a transient state; we proceed straight into the
+    # rings-init + controller-start path. CMOS kcp=0x31 stamps only when
+    # the controller actually reaches the running state (HCH=0). If any
+    # step inside xhci_start fails, kcp stays at 0x30 and the per-step
+    # kprintln line in xhci_start identifies the failure point.
+    if (xhci_start() == 0) { return 0; }
+    return 1;
+}
+
+# --- Phase 2: controller start --------------------------------------
+#
+# Allocates DMA structures (DCBAA / cmd ring / event ring / ERST), wires
+# them into the controller's operational + runtime registers, then sets
+# USBCMD.R/S=1 and observes USBSTS.HCH=0. After this, the controller is
+# running and Phase 3 (port enumeration + Enable Slot) can begin.
+#
+# Sequence per xHCI 1.2 §4.2 (Host Controller Initialization), step 4
+# onward (steps 1–3 are halt + reset, handled by xhci_init):
+#
+#   4. Program CONFIG.MaxSlotsEn        (operational, 32-bit)
+#   5. Program DCBAAP                   (operational, 64-bit)
+#   6. Program CRCR with RCS=1          (operational, 64-bit)
+#   7. Program interrupter 0:
+#        ERSTSZ = 1                     (runtime,    32-bit)
+#        ERSTBA = ERST phys             (runtime,    64-bit)
+#        ERDP   = event ring phys       (runtime,    64-bit)
+#   8. USBCMD.R/S = 1, INTE = 1         (operational, 32-bit)
+#   9. Wait USBSTS.HCH = 0
+#
+# INTE=1 is harmless under poll-mode Phase 5: events still queue to the
+# event ring; we just drain them on a timer tick instead of via MSI-X.
+# When MSI-X bring-up lands, the IDT vector + IMAN.IE are added then.
+#
+# Iron-test gate: framebuffer line `xhci: controller running, HCH=0,
+# ERDP=0xXXXXXXXX` and CMOS[0x40] kcp = 0x31.
+
+fn xhci_start() {
+    if (xhci_halted == 0) { return 0; }
+
+    if (xhci_rings_init() == 0) { return 0; }
+
+    # CONFIG.MaxSlotsEn — open all device slots the controller advertises.
+    # Bits [7:0] only; preserve U3E / CIE bits in the upper byte.
+    var cfg = xhci_op_read32(XHCI_OP_CONFIG) & 0xFFFFFF00;
+    xhci_op_write32(XHCI_OP_CONFIG, cfg | (xhci_max_slots & 0xFF));
+
+    # DCBAAP — 64-bit, 64-byte aligned (page-aligned satisfies).
+    xhci_op_write64(XHCI_OP_DCBAAP, xhci_dcbaa_phys);
+
+    # CRCR — 64-bit. Bottom 6 bits encode RCS (bit 0), CS (bit 1, W1S),
+    # CA (bit 2, W1S), CRR (bit 3, RO). Set RCS=1; ring base is
+    # page-aligned so all other bits are clean.
+    xhci_op_write64(XHCI_OP_CRCR, xhci_cmd_ring_phys | 0x1);
+
+    # Interrupter 0 (xHCI 1.2 §5.5.2). ERSTSZ first, then ERSTBA, then
+    # ERDP — order matters: HW reads ERSTBA only when ERSTSZ ≠ 0.
+    var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
+    xhci_rt_write32(ir0 + XHCI_IR_ERSTSZ, 1);
+    xhci_rt_write64(ir0 + XHCI_IR_ERSTBA, xhci_erst_phys);
+    xhci_rt_write64(ir0 + XHCI_IR_ERDP, xhci_evt_ring_phys);
+    # Leave IMAN.IE = 0 (poll mode); IMOD default is fine for keyboard.
+
+    # Run/Stop + interrupter enable. Then wait for HCH=0. Spec gives no
+    # bound but contemporary controllers transition within microseconds.
+    var usbcmd = xhci_op_read32(XHCI_OP_USBCMD);
+    xhci_op_write32(XHCI_OP_USBCMD, usbcmd | 0x05);
+
+    var wait = 0;
+    while (wait < 1000000) {
+        var sts = xhci_op_read32(XHCI_OP_USBSTS);
+        if ((sts & 0x01) == 0) { break; }
+        wait = wait + 1;
+    }
+    if (wait >= 1000000) {
+        kprintln("xhci: start timeout (HCH never cleared)", 39);
+        return 0;
+    }
+
+    xhci_running = 1;
+    kprint("xhci: controller running, HCH=0, ERDP=", 38);
+    kprint_num(xhci_evt_ring_phys);
+    kprintln("", 0);
+
+    # CMOS kernel checkpoint 0x31 (xhci controller running).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x31; 0xE6; 0x71; }
     return 1;
 }
