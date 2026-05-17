@@ -5,10 +5,12 @@
 #
 #   DCBAA       — Device Context Base Address Array (1 page, 512 entries
 #                 of 8 bytes each, slot-id-indexed). Slot 0 is the
-#                 Scratchpad Buffer Array pointer in xHCI 1.1+; left
-#                 zeroed (HCSPARAMS2.MaxScratchpadBufs is expected to be
-#                 0 on archaemenid; if not, Phase 2 init log will surface
-#                 it and a follow-up scratchpad allocation lands).
+#                 Scratchpad Buffer Array pointer in xHCI 1.1+ — populated
+#                 by Repair (AA) when HCSPARAMS2.MaxScratchpadBufs > 0.
+#                 AMD Renoir/Cezanne advertises non-zero scratchpad bufs;
+#                 leaving DCBAA[0] zero caused the Attempts 32-49 silent-
+#                 absorb (port reset state machine needs scratchpad-backed
+#                 context save area per xHCI 1.2 §4.20).
 #
 #   Cmd ring    — 256 16-byte TRBs (1 page). Producer ring; software
 #                 writes command TRBs and rings doorbell 0 to hand off.
@@ -88,6 +90,62 @@ fn xhci_rings_init() {
     iommu_register_dma(dcbaa);
     xhci_zero_page(dcbaa);
     xhci_dcbaa_phys = dcbaa;
+
+    # 1b. Repair (AA) — Scratchpad buffer array → DCBAA[0]. xHCI 1.2 §4.20:
+    # if HCSPARAMS2.MaxScratchpadBufs > 0, the OS MUST allocate that many
+    # page-sized buffers and place their phys addresses in a u64 array,
+    # then write the array's phys into DCBAA[0] before R/S=1. Without this,
+    # the controller has no context-save backing — per-port reset writes
+    # are absorbed silently because the reset state machine relies on
+    # scratchpad-backed save area. Linux xhci_setup_scratchpad_bufs in
+    # xhci-mem.c is the canonical reference. xhci_max_scratchpad is
+    # populated by xhci_probe via HCSPARAMS2 read.
+    if (xhci_max_scratchpad > 0) {
+        # Allocate the pointer array (1 page = 512 u64 entries, plenty
+        # for any realistic MaxScratchpadBufs which tops out at 1023).
+        var sp_array = pmm_alloc();
+        if (sp_array == 0) { kprintln("xhci: scratchpad array alloc failed", 35); return 0; }
+        if (vmm_is_mapped(sp_array) == 0) { vmm_map(sp_array, sp_array, 0x83); }
+        iommu_register_dma(sp_array);
+        xhci_zero_page(sp_array);
+
+        # Allocate N scratchpad buffers, one PAGESIZE each. xHCI op-reg
+        # PAGESIZE (offset 0x08) is a bitmask of supported page sizes;
+        # bit 0 = 4 KB (always set on x86_64). pmm_alloc returns 4 KB
+        # pages, which matches the minimum supported size.
+        var i = 0;
+        while (i < xhci_max_scratchpad) {
+            var buf = pmm_alloc();
+            if (buf == 0) { kprintln("xhci: scratchpad buf alloc failed", 33); return 0; }
+            if (vmm_is_mapped(buf) == 0) { vmm_map(buf, buf, 0x83); }
+            iommu_register_dma(buf);
+            xhci_zero_page(buf);
+            store64(sp_array + i * 8, buf);
+            i = i + 1;
+        }
+
+        # Install scratchpad array phys into DCBAA[0]. This is just a
+        # memory write — the controller reads DCBAA[0] when it needs
+        # scratchpad backing, which is gated by R/S being set. xhci_start
+        # writes DCBAAP after rings_init, then sets R/S, so order is safe.
+        store64(dcbaa, sp_array);
+        xhci_scratchpad_phys = sp_array;
+
+        kprint("xhci: scratchpad ready, array=", 30);
+        kprint_num(sp_array);
+        kprintln("", 0);
+
+        # CMOS[0x83] — scratchpad array phys low byte. Non-zero proves
+        # the install took (alloc succeeded + store64 wrote). Pair with
+        # [0x80] (count > 0) for the unblock-verdict matrix.
+        xhci_cmos_stamp(0x83, sp_array & 0xFF);
+    } else {
+        # MaxScratchpadBufs = 0 — some silicon doesn't need scratchpad.
+        # DCBAA[0] stays zero, which is spec-compliant. Stamp explicit 0
+        # so post-mortem differentiates "no scratchpad needed" from
+        # "stamp site didn't run" (latter shows pre-AA binary on iron).
+        xhci_cmos_stamp(0x83, 0x00);
+    }
 
     # 2. Command ring — 1 page, zeroed, Link TRB at slot 255 wraps to
     # slot 0 with Toggle Cycle = 1. Initial Producer Cycle State = 1

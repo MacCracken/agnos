@@ -47,6 +47,8 @@ var xhci_op_base    = 0;   # MMIO + CAPLENGTH — operational register window
 var xhci_rt_base    = 0;   # MMIO + RTSOFF   — runtime register window (interrupter array)
 var xhci_halted     = 0;   # 1 after xhci_init() drove the controller into halted+reset state
 var xhci_running    = 0;   # 1 after xhci_start() set R/S=1 and observed HCH=0
+var xhci_max_scratchpad  = 0;   # HCSPARAMS2 Max Scratchpad Bufs (Hi<<5|Lo, 10-bit)
+var xhci_scratchpad_phys = 0;   # Scratchpad Buffer Array page phys (DCBAA[0] target)
 
 # --- Capability register accessors ----------------------------------
 #
@@ -110,7 +112,7 @@ fn xhci_probe() {
     var msi_mode = pci_enable_msix_masked(idx);
     if (msi_mode == 1)      { kprintln("xhci: MSI-X enabled (function-mask)", 35); }
     else { if (msi_mode == 2) { kprintln("xhci: MSI enabled", 17); }
-           else                { kprintln("xhci: no MSI/MSI-X cap advertised", 33); } }
+        else                { kprintln("xhci: no MSI/MSI-X cap advertised", 33); } }
 
     # 4. Verify the MMIO region is reachable from kernel CR3. `pt_init`
     # identity-maps 0–4 GB (PD at 0x3000 covers 0–1 GB at 2 MB pages;
@@ -202,6 +204,44 @@ fn xhci_probe() {
     var hccp2 = xhci_cap_read32(XHCI_CAP_HCCPARAMS2);
     xhci_cmos_stamp(0x6E, hccp1 & 0xFF);
     xhci_cmos_stamp(0x6F, hccp2 & 0xFF);
+
+    # Repair (AA) — HCSPARAMS2.MaxScratchpadBufs read + scratchpad count
+    # decode. xHCI 1.2 §4.20 requires the OS to allocate N page-sized
+    # scratchpad buffers when MaxScratchpadBufs > 0 and write their
+    # array's phys into DCBAA[0] BEFORE setting R/S=1. Without it, the
+    # controller has no context-save backing area — the per-port reset
+    # state machine may absorb PR writes silently because the reset path
+    # needs scratchpad-backed save/restore. Attempts 32-49 silent-absorb
+    # arc exhausted F5/X/V'' (cache attribute), b/W (controller-side
+    # spec-visible), b'/c/d/e/Z (multi-SupProto / FCH timing / SMI /
+    # interrupter-readiness) without touching DCBAA[0]. AMD Renoir/
+    # Cezanne (1022:1639) advertises non-zero scratchpad bufs — Linux
+    # xhci_setup_scratchpad_bufs (xhci-mem.c) confirms the spec
+    # requirement. MaxScratchpadBufs layout (xHCI 1.2 §5.3.4):
+    #   bits 31:27 — Lo (5 bits)
+    #   bit  26    — SPR (Scratchpad Restore, ignored here)
+    #   bits 25:21 — Hi (5 bits)
+    # Effective count = (Hi << 5) | Lo, range 0-1023.
+    var hcsp2 = xhci_cap_read32(XHCI_CAP_HCSPARAMS2);
+    var sp_hi = (hcsp2 >> 21) & 0x1F;
+    var sp_lo = (hcsp2 >> 27) & 0x1F;
+    xhci_max_scratchpad = (sp_hi << 5) | sp_lo;
+
+    kprint("xhci: scratchpad bufs=", 22);
+    kprint_num(xhci_max_scratchpad);
+    kprintln("", 0);
+
+    # CMOS stamps 0x80-0x82 — first use of the 0x80+ range. Per
+    # project_archaemenid_cmos_map memory: 0x50-0x7F is virgin scratch
+    # (now exhausted); 0x80+ is untested but BIOS writes 0x42/0x43/0x44
+    # cold-boot side, doesn't appear to touch 0x80+. Sentinel 0xAA at
+    # 0x81 validates the slot range survived BIOS/POST.
+    #   [0x80] = MaxScratchpadBufs (low byte; full value if < 256)
+    #   [0x81] = 0xAA sentinel — proves [0x80] is trustworthy
+    #   [0x82] = HCSPARAMS2 byte 3 (raw bits 31:24) for cross-check
+    xhci_cmos_stamp(0x80, xhci_max_scratchpad & 0xFF);
+    xhci_cmos_stamp(0x81, 0xAA);
+    xhci_cmos_stamp(0x82, (hcsp2 >> 24) & 0xFF);
 
     # 7b. Repair (V) — MTRR/PAT MMIO cache-attribute diagnostic.
     # F5 hypothesis: with PS=1 2MB-page PDEs (flag 0x83 = P|W|PS), the
