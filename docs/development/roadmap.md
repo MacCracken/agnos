@@ -35,18 +35,18 @@ The 1.30.0 kernel ABI break was the gate cut; 1.30.x is the **stabilization arc*
 
 Order within 1.30.x is **iron-first**: Attempt 5 is the cheapest signal (~30 min reboot vs. hours of kernel debugging), and its outcome shapes scheduler-fix priority. If iron passes, scheduler-fix gets normal-priority slot. If iron also stalls, scheduler-fix becomes the iron-unblock.
 
-### xHCI Linux-diff hardening (post-Attempt-52 audit, 2026-05-17)
+### xHCI Linux-diff hardening (closed 2026-05-17, 1.30.4 closeout)
 
-Pre-Attempt-52 connectivity audit across `kernel/arch/x86_64/usb/` surfaced four spec deviations from Linux's `drivers/usb/host/xhci.c` init sequence. **None are plausible silent-absorb gates** (audit-verified; structurally inert under current iron evidence), but each is a real spec gap worth closing before MVP ships. Order them in 1.30.x or push past once the silent-absorb arc resolves.
+Pre-Attempt-52 connectivity audit across `kernel/arch/x86_64/usb/` surfaced four spec deviations from Linux's `drivers/usb/host/xhci.c` init sequence. **None are plausible silent-absorb gates** (audit-verified; structurally inert under current iron evidence) — each is a real spec gap worth closing before public-beta. **All four landed as the 1.30.4 closeout** (~10 LOC total; kernel build 350,008 B → 350,272 B; no iron burn — cyrius-compile gate is the validation surface).
 
-| # | Gap | Spec ref | AGNOS today | Linux | Fix |
-|---|-----|----------|-------------|-------|-----|
-| H1 | `XHCI_OP_PAGESIZE` never validated | xHCI 1.2 §5.4.3 | assumes 4 KB pages for scratchpad alloc | reads bit 0, asserts 4 KB advertised | `xhci_op_read32(XHCI_OP_PAGESIZE)`, bail if bit 0 = 0. ~5 LOC in `xhci_ring.cyr` scratchpad path. |
-| H2 | `XHCI_IR_IMAN.IP` never cleared | xHCI 1.2 §5.5.2.1 | nothing (poll-mode comment) | writes IP=1 (RW1C) on init | `xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x1)` in `xhci_start` after ERDP. ~2 LOC. |
-| H3 | `XHCI_IR_IMOD` left at HW default 0 | xHCI 1.2 §5.5.2.2 | nothing | writes 0x000003E8 (1000 × 250 ns = 250 µs) | `xhci_rt_write32(ir0 + XHCI_IR_IMOD, 0x3E8)` in same block. ~2 LOC. |
-| H4 | `USBCMD.HSEE` (bit 3) never set | xHCI 1.2 §5.4.1.4 | sets only R/S \| INTE (0x05) | sets R/S \| INTE \| HSEE (0x0D) | `xhci_op_write32(XHCI_OP_USBCMD, usbcmd \| 0x0D)` in `xhci_start`. ~1 LOC. |
+| # | Gap | Spec ref | AGNOS today | Status |
+|---|-----|----------|-------------|--------|
+| H1 | `XHCI_OP_PAGESIZE` never validated | xHCI 1.2 §5.4.3 | now reads bit 0, asserts 4 KB advertised, bails with `xhci: PAGESIZE rejects 4KB, bitmap=N` if not | ✅ 1.30.4 (`xhci_ring.cyr` scratchpad path) |
+| H2 | `XHCI_IR_IMAN.IP` never cleared | xHCI 1.2 §5.5.2.1 | now writes IP=1 (RW1C) on init via `xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x1)` after ERDP | ✅ 1.30.4 (`xhci.cyr` `xhci_start`) |
+| H3 | `XHCI_IR_IMOD` left at HW default 0 | xHCI 1.2 §5.5.2.2 | now writes 0x000003E8 (1000 × 250 ns = 250 µs) via `xhci_rt_write32(ir0 + XHCI_IR_IMOD, 0x3E8)` | ✅ 1.30.4 (`xhci.cyr` `xhci_start`) |
+| H4 | `USBCMD.HSEE` (bit 3) never set | xHCI 1.2 §5.4.1.4 | now sets R/S \| INTE \| HSEE (0x0D) instead of 0x05 | ✅ 1.30.4 (`xhci.cyr` `xhci_start`) |
 
-These slot anywhere in 1.30.x after the silent-absorb arc closes; they don't block MVP boot-to-shell but should land before public-beta. Audit trail in [iron-nuc-zen-log § Attempt 52 prep](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
+Closes the public-beta xHCI spec-compliance debt. Audit trail in [iron-nuc-zen-log § Attempt 52 + handoff/AMD-quirk audit](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
 
 ## 1.29.x Arc Plan
 

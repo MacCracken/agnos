@@ -3,7 +3,9 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — 1.30.4 (staging)
+## [Unreleased]
+
+## [1.30.4] — 2026-05-17 (xHCI Linux-diff hardening closeout)
 
 **xHCI Phase 3 silent-absorb arc continues — Repair (BB) Device Notification
 Control + audit-driven follow-ups (stamp redesigns, double xfer-ring leak)
@@ -37,13 +39,20 @@ both attempts. Repairs (CC) + (DD) land in the same staging cycle:
 extended-CMOS routing through 0x72/0x73 for slots ≥ 0x80, and event-ring
 drain + USBSTS.PCD clear before each port-reset PR write (USBSTS PCD=1
 across the silent-absorb arc was a signal AGNOS never acknowledged; the
-twelfth hypothesis). **Decoupling decision holds**: iron-burn cadence
-stays batched; Phase 4 (Configure Endpoint + SET_PROTOCOL=boot) + Phase 5
-(HID translation + `kb_buf` feed) develop in parallel against AGNOS Phase
-1-3 infrastructure regardless of any single repair outcome. 1.30.4 cycle
-is **open-ended** — staging area for BB validation, the CC + DD
-follow-ons, Phase 4/5 code surface, and any further Linux-diff hypotheses
-that surface as the silent-absorb arc continues.
+twelfth hypothesis). **Attempt 52 iron burn (2026-05-17) — Row 2 / DD falsified;
+twelfth hypothesis exhausted.** FB rendered `xhci: drained 1 events` +
+`port 1/3 reset failed` — DD site executed cleanly (1 real firmware-residue
+event consumed) but silent-absorb persists. Post-Attempt-52 handoff /
+AMD-quirk audit (Linux `xhci-pci.c` AMD-Renoir quirk paths +
+`pci-quirks.c` `usb_amd_quirk_pll` chipset detection) confirmed no
+Renoir-specific cold-boot workarounds AGNOS misses. **Decoupling decision
+activates as written**: xHCI silent-absorb arc closes as "non-spec gate,
+parallel-track only"; no Attempt 53 without explicit new-burn
+authorization. 1.30.4 closes with **xHCI Linux-diff hardening (H1-H4)**
+as the spec-discipline closeout contribution (~10 LOC, all audit-verified
+non-silent-absorb gates). Phase 4 (Configure Endpoint + SET_PROTOCOL=boot)
++ Phase 5 (HID translation + `kb_buf` feed) move from "shovel-ready
+plan" to active work in 1.30.5+.
 
 ### Added
 
@@ -102,6 +111,35 @@ that surface as the silent-absorb arc continues.
   arc; first one to act directly on a USBSTS bit AGNOS had been
   observing but never acknowledging.
 
+#### xHCI Linux-diff hardening (H1-H4) — 1.30.4 closeout, 2026-05-17
+
+Four spec deviations from Linux's `drivers/usb/host/xhci.c` init sequence,
+surfaced by the pre-Attempt-52 connectivity audit. **None are silent-absorb
+gates** (audit-verified, structurally inert under current iron evidence);
+each is a real spec gap closed before public-beta. Total ~10 LOC.
+
+- **H1 — `XHCI_OP_PAGESIZE` 4 KB assertion** (`kernel/arch/x86_64/usb/xhci_ring.cyr`).
+  xHCI 1.2 §5.4.3. Scratchpad alloc path now reads PAGESIZE op-reg before
+  `pmm_alloc` and bails with `xhci: PAGESIZE rejects 4KB, bitmap=N` if bit
+  0 is clear. All contemporary x86_64 silicon advertises 4 KB; the
+  assertion guards against silicon that requires larger pages from
+  silently mis-sizing scratchpad buffers.
+- **H2 — `XHCI_IR_IMAN.IP` RW1C clear in `xhci_start`** (`kernel/arch/x86_64/usb/xhci.cyr`).
+  xHCI 1.2 §5.5.2.1. After the ERDP write, `IMAN |= 0x1` clears any
+  Interrupt Pending bit left over from BIOS/firmware that would otherwise
+  inhibit a fresh edge-triggered interrupt assertion when MSI-X lands.
+  IMAN.IE (bit 1) stays 0 — poll mode for MVP.
+- **H3 — `XHCI_IR_IMOD` 250 µs interrupt moderation** (`kernel/arch/x86_64/usb/xhci.cyr`).
+  xHCI 1.2 §5.5.2.2. Same block as H2. Writes `0x000003E8` (1000 × 250 ns
+  = 250 µs moderation). HW default is 0 (no moderation) which under
+  MSI/MSI-X would risk interrupt storms. Safe under poll mode; matches
+  Linux's default.
+- **H4 — `USBCMD.HSEE` bit 3 in start mask** (`kernel/arch/x86_64/usb/xhci.cyr`).
+  xHCI 1.2 §5.4.1.4. Start mask widened from `0x05` (R/S | INTE) to
+  `0x0D` (R/S | INTE | HSEE) so any subsequent Host System Error sets
+  `USBSTS.HSE` *and* asserts the interrupter. Without HSEE an HSE would
+  go unreported — fail-silent regression risk.
+
 ### Changed
 
 - **CMOS [0x83] stamp redesign** (`kernel/arch/x86_64/usb/xhci_ring.cyr`).
@@ -130,21 +168,22 @@ that surface as the silent-absorb arc continues.
   so BB site executed but didn't unblock reset (eleventh hypothesis
   falsified). CMOS readback exposed the slots-≥-0x80 alias bug rolled
   into Repairs (CC) + (DD) above.
-- **Attempt 52 iron burn (planned)** — **LAST authorized just-testing
-  burn** before pivot to Phase 4/5 non-iron work regardless of outcome
-  (per `feedback_iron_burns_block_other_work` — burns hold up unrelated
-  user work on the single dev machine). Flash post-CC+DD staging
-  binary (~350,008 B floor), attach Keychron K2 to port 1 or port 3,
-  boot, photograph FB block between `xhci: USBLEGSUP already
-  OS-owned` and `VFS initialized`, then
-  `sudo ./scripts/read-boot-log.sh`. Truth channels in order:
-  (1) FB primary — does `xhci: drained N events` line surface? does any
-  `xhci: port N connected, …` line surface downstream? (2)
-  `CMOS[0x86]=0xCC` — CC fix landed, slots 0x80+ are real CMOS
-  (retroactively decodes Attempts 50/51 `[0x80]/[0x82]/[0x84]`); (3)
-  `CMOS[0x87]=0xDD` — DD drain site executed; (4) `CMOS[0x64]`
-  reset-OK bitmap — the binary unblock indicator. Outcome matrix in
-  `iron-nuc-zen-log.md` § Attempt 52 prep.
+- **Attempt 52 iron burn (2026-05-17) — Row 2 / DD falsified; CC routing
+  partial; twelfth hypothesis exhausted.** Post-mortem: FB rendered
+  `xhci: drained 1 events` (DD site executed cleanly, 1 real firmware-residue
+  event consumed) + `port 1 reset failed (proto=2)` + `port 3 reset failed
+  (proto=2)`. CMOS `[0x86]=0x5A` / `[0x87]=0xA5` instead of intended
+  `0xCC` / `0xDD` — extended-CMOS bank empirically honors offsets `0..5`
+  cleanly on AMD FCH 1022:1639 but `≥ 6` returns mystery values
+  (`[0x80..0x85]` round-trip correctly: MaxScratchpadBufs=2, sp_array
+  phys byte 2 = 0xF6, BB sentinel = 0xBB). Diagnostic-infrastructure
+  question, not load-bearing: FB lines are the truth channel for site-
+  executed proofs. **Decoupling decision activates as written**: xHCI
+  silent-absorb arc closes as "non-spec gate, parallel-track only." No
+  Attempt 53 without explicit new-burn authorization. Full outcome +
+  post-mortem handoff/AMD-quirk audit in
+  [`agnosticos/docs/development/iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md)
+  § Attempt 52.
 - **Phase 4 code surface (Configure Endpoint + SET_PROTOCOL=boot)** —
   per `agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`
   § Phase 4. Develops against the Phase 1-3 infrastructure regardless
@@ -155,10 +194,13 @@ that surface as the silent-absorb arc continues.
 
 ### Notes
 
-- 1.30.4 is **intentionally open-ended** — the cycle stays in staging
-  and continues to absorb repairs (BB → CC → DD → ...), Phase 4/5 code
-  surface, and any further Linux-diff hypotheses that surface. Tag cut
-  is user-driven; the cycle does not auto-bump on engineering volume.
+- 1.30.4 **closes 2026-05-17 with xHCI Linux-diff hardening (H1-H4)** —
+  staging absorbed BB → CC → DD repairs across 2026-05-17, Attempt 52
+  burn confirmed Row 2 / DD falsified, post-Attempt-52 handoff/AMD-quirk
+  audit confirmed no Renoir-specific cold-boot workarounds AGNOS misses,
+  and the four spec-discipline gaps (H1-H4) landed as the closeout
+  contribution. 1.30.5 staging opens for Phase 4/5 code surface + any
+  follow-on hypotheses.
 - **Audit precedent (AA → BB → CC)**: three consecutive cycles where a
   register/operation/port defined in headers but never invoked
   (correctly) turned out to be a silent gate. AA: DCBAA[0] scratchpad
@@ -170,11 +212,13 @@ that surface as the silent-absorb arc continues.
   AND pressure-test diagnostic readback paths against alternative
   explanations (e.g., "what if this byte is plausible by coincidence
   rather than by my write?") before treating CMOS as ground truth.
-- **Iron burn discipline**: Attempt 52 (the CC+DD burn) is the last
-  authorized just-testing burn before pivot to Phase 4/5 non-iron
-  development. Future instrumentation proposals require a line-by-line
-  audit table before a burn is requested (per
-  `feedback_iron_burns_block_other_work`).
+- **Iron burn discipline**: Attempt 52 (the CC+DD burn, 2026-05-17) WAS
+  the last authorized just-testing burn before pivot to Phase 4/5
+  non-iron development. Pivot in force. H1-H4 hardening landed as
+  build-verified kernel changes (~350,272 B vs 350,008 B pre-edit) with
+  no iron burn — the cyrius-compile gate is the validation surface.
+  Future instrumentation proposals require a line-by-line audit table
+  before a burn is requested (per `feedback_iron_burns_block_other_work`).
 
 ## [1.30.3] — 2026-05-17
 
