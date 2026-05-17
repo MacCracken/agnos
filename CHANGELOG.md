@@ -5,19 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.30.3] — 2026-05-16
+## [1.30.3] — 2026-05-17
 
-**Repair (X') — post-X PDE re-stamp.** Diagnostic-only follow-up to
-Attempt 44 (Repair X), which preserved boot-to-shell but did not
-clear the PORTSC silent-absorb on archaemenid (CMOS `[0x70]=0x03`,
-`[0x6C]=0x00`, `[0x63]=0x04`, `[0x64]=0x00`). Two paths from that
-outcome are indistinguishable from the V/X stamps alone: either
-`vmm_remap_uc_2mb` is a no-op on the BAR's PDE (rewrite never
-landed), or it landed and F5 (cache attribute) is wrong. X' walks
-the page table back to the controlling 2 MB PDE after the remap
-and stamps its low byte to `CMOS[0x73]` — `0x9B`/`0xBB` proves UC
-mapping landed (escalate to Repair V''), `0x83` proves the rewrite
-didn't reach the PDE (debug the helper).
+**xHCI Phase 3 deep-dive — six-attempt silent-absorb investigation arc
+(Attempts 45-50 prep) culminating in Repair (AA) scratchpad allocation
+candidate fix.** After Repair (X) UC remap (1.30.2) preserved boot-to-shell
+but did NOT clear the PORTSC silent-absorb on archaemenid (CMOS `[0x70]=0x03`,
+`[0x6C]=0x00`, `[0x63]=0x04`, `[0x64]=0x00`), this cycle ran a structured
+per-attempt hypothesis ladder: **X'** (PDE re-stamp confirmed UC landed —
+falsified F5), **V''** (four-level walk confirmed no aliasing — falsified
+hypothesis (a)), **W** (USBSTS/USBCMD spec-clean at reset-fail — falsified
+controller-side spec-visible gate (b)), **b'** (per-cap SupProto fingerprint
+confirmed no overlap with failing ports — falsified multi-SupProto routing),
+**Z + USBLEGCTLSTS SMI disable + MSI-X bundle** (Attempt 49 upstream-plumbing
+bundle — Linux/SeaBIOS prior-art derived: AMD-FCH timing + SMI re-arming +
+interrupter-readiness — all three executed but none broke the absorb). With
+all behavioral hypotheses in the trio exhausted, a same-machine Linux diff
+against `drivers/usb/host/xhci-mem.c` `xhci_setup_scratchpad_bufs` surfaced
+the gap that NO prior letter touched: `xhci_ring.cyr` left `DCBAA[0] = 0` on
+a TODO comment assuming `HCSPARAMS2.MaxScratchpadBufs = 0`, but AMD
+Renoir/Cezanne (1022:1639) advertises non-zero per Linux's standard probe path.
+xHCI 1.2 §4.20: controller "may not function correctly" until the OS programs
+the scratchpad buffer array into `DCBAA[0]` before R/S=1; per-port reset state
+machine relies on scratchpad-backed context save area. **Repair (AA)** reads
+HCSPARAMS2, allocates a u64 pointer array + N page-sized scratchpad buffers,
+and writes the array phys into `DCBAA[0]` before R/S=1. Attempt 50 iron burn
+pending validation; if Row 1 hits, Phase 4 (Configure Endpoint + SET_PROTOCOL=
+boot) + Phase 5 (HID translation + `kb_buf` feed) become the typeable-shell
+gate. Full arc in [iron-nuc-zen-log §§ Attempts 45-50](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
 
 ### Added
 
@@ -25,12 +40,98 @@ didn't reach the PDE (debug the helper).
   ~14 LOC + 1 CMOS slot after `vmm_remap_uc_2mb(mmio)` at xhci_probe
   step 5b. Walks `PD@0x3000` for sub-1GB BARs or the post-shatter
   `PDPT[gb_idx]→PD` for ≥1GB BARs (archaemenid's xHCI lands at
-  `0xFC800000`, so the shatter path is the load-bearing one).
+  `0xFC900000`, so the shatter path is the load-bearing one).
   Pure read-only diagnostic; controller behavior unchanged.
-- **`CMOS[0x73]` decoder + cheat-sheet** (`agnosticos/scripts/src/read-boot-log.cyr`).
-  Stamp interpretation: `0x9B`/`0xBB`=UC mapping landed,
-  `0x83`=remap is a no-op, `0x00`=stamp didn't run, other=flag
-  for triage.
+  Attempt 45 confirmed `CMOS[0x73]=0x9B`/`0xBB` = PA3=UC landed →
+  F5 (cache attribute) falsified despite remap success.
+- **Repair (V'') full PML4→PDPT→PD walk** (`kernel/arch/x86_64/usb/xhci.cyr`).
+  ~30 LOC + 3 CMOS slots (`[0x74]`/`[0x75]`/`[0x76]`) walking the BAR's
+  complete translation chain from `PML4@0x1000`. PS-bit detection at
+  PDPTE level writes `0xFF` sentinel to `[0x76]` when a 1 GB huge page
+  covers the BAR (shatter never ran). Divergence between `[0x73]`
+  (X' shortcut) and `[0x76]` (V'' walk) localizes any aliased-mapping
+  hypothesis. Pure read-only diagnostic. Attempt 46 confirmed walk
+  agrees with X' → hypothesis (a) aliased mapping falsified.
+- **Repair (W) USBSTS / USBCMD / unclassified xECP cap stamps**
+  (`kernel/arch/x86_64/usb/xhci_port.cyr` + `xhci.cyr`). Reads
+  USBSTS bytes 0+1 (CNR/HCE/HCH gate detection per xHCI 1.2 §5.4.2)
+  and USBCMD byte 0 (R/S/HCRST/INTE state) at reset-fail time;
+  classifies xECP caps not consumed by the existing USBLEGSUP /
+  SupProto walk. CMOS slots `[0x77]`/`[0x78]`/`[0x79]`/`[0x7A]`.
+  Pure diagnostic — surfaces controller-level gates beyond the
+  per-port state machine. Attempt 47 confirmed controller spec-clean
+  at reset-fail-time → hypothesis (b) controller-side spec-visible
+  gate falsified.
+- **Repair (b') per-cap SupProto fingerprint capture**
+  (`kernel/arch/x86_64/usb/xhci_port.cyr`). Captures `rev_major | port_count`
+  + `port_off` for the 2nd and 3rd SupProto caps (1st stays in
+  `[0x6A]`). CMOS slots `[0x7B]`/`[0x7C]`/`[0x7D]`/`[0x7E]`. Pure
+  read-only diagnostic. Attempt 48 confirmed both extra SupProto
+  caps confine to USB3 ports 5+6 individually (no overlap with
+  failing USB2 ports 1+3) → multi-SupProto routing hypothesis
+  falsified for this hardware.
+- **MSI-X enable with Function Mask** (`kernel/core/pci.cyr` +
+  `kernel/arch/x86_64/usb/xhci.cyr`). New `pci_find_cap` walks the
+  PCI cap list at config-space offset `0x34`; `pci_enable_msix_masked`
+  sets Enable (bit 31) + Function Mask (bit 30) on MSI-X cap `0x11`
+  (falls back to MSI cap `0x05` if MSI-X absent). Per Linux
+  `xhci_setup_msix` prior art — some xHCI silicon gates op-reg
+  state-machine progress on the interrupter being "configured" in
+  PCI config space, independent of whether the OS routes the IRQ.
+  AGNOS polls events on a timer tick instead of via vector; Function
+  Mask suppresses entry delivery so no spurious IDT vectors dispatch.
+  Adds FB line `xhci: MSI-X enabled (function-mask)` /
+  `xhci: MSI enabled` / `xhci: no MSI/MSI-X cap advertised`. Attempt 49
+  confirmed MSI-X path executed but didn't unblock silent-absorb in
+  isolation (part of the upstream plumbing bundle).
+- **Repair (AA) HCSPARAMS2 read + scratchpad buffer install**
+  (`kernel/arch/x86_64/usb/xhci.cyr` + `xhci_ring.cyr`). `xhci_probe`
+  extension reads HCSPARAMS2 at `cap_base+0x08`, decodes
+  `MaxScratchpadBufs = (hi << 5) | lo` per xHCI 1.2 §5.3.4 (bits 25:21
+  hi, 31:27 lo, 10-bit range 0-1023). `xhci_rings_init` step 1b
+  allocates a u64 pointer array (1 page) + N page-sized scratchpad
+  buffers, writes each phys to `sp_array[i]`, writes `sp_array_phys`
+  into `DCBAA[0]` before R/S=1. Per Linux `xhci_setup_scratchpad_bufs`
+  (`drivers/usb/host/xhci-mem.c`) — xHCI 1.2 §4.20 makes this an
+  OS requirement when `MaxScratchpadBufs > 0`. Suspected silent-absorb
+  root cause across Attempts 32-49 (no prior letter touched `DCBAA[0]`).
+  Adds FB lines `xhci: scratchpad bufs=N` + `xhci: scratchpad ready,
+  array=0xPHYS`. CMOS slots `[0x80]`/`[0x81]`/`[0x82]`/`[0x83]` (first
+  use of CMOS 0x80+ range; `[0x81]=0xAA` sentinel validates the slot
+  range survived BIOS/POST). Attempt 50 iron burn pending validation.
+- **CMOS decoder + cheat-sheet extensions** (`agnosticos/scripts/src/read-boot-log.cyr`).
+  Slots `[0x73]` (X'), `[0x74]`/`[0x75]`/`[0x76]` (V''),
+  `[0x77]`/`[0x78]`/`[0x79]`/`[0x7A]` (W),
+  `[0x7B]`/`[0x7C]`/`[0x7D]`/`[0x7E]` (b'), `[0x7F]` (Z),
+  `[0x80]`/`[0x81]`/`[0x82]`/`[0x83]` (AA) all decoded with per-row
+  outcome interpretation matrices. Pre-bound verdicts wire each stamp
+  pattern to a next-action recommendation.
+
+### Changed
+
+- **Repair (Z) AMD-FCH timing delay** (`kernel/arch/x86_64/usb/xhci_port.cyr`).
+  ~10 ms TSC-based spin (~30M cycles) inserted between the CSC W1C
+  clear and the PR write in the per-port USB2 reset path. Mirrors
+  SeaBIOS `xhci_hub_reset` `msleep(10)` pattern observed empirically
+  on AMD silicon. Sentinel `CMOS[0x7F]=0xAA` proves the site executed.
+  Attempt 49 confirmed the site ran but didn't unblock silent-absorb
+  in isolation (part of the upstream plumbing bundle).
+- **USBLEGCTLSTS SMI disable post-USBLEGSUP claim**
+  (`kernel/arch/x86_64/usb/xhci_port.cyr`). New
+  `xhci_usblegctlsts_disable_smi(cap_off)` masks `0xFFFFE01F` + ORs
+  `0x1FFF0000` to clear bits 5-12 SMI enables AND W1C bits 16-28
+  status. Called from all three USBLEGSUP outcome paths (already-OS /
+  claimed-from-BIOS / BIOS-held-timeout). Mirrors Linux
+  `quirk_usb_handoff_xhci` prior art — BIOS-left enables in
+  USBLEGCTLSTS can continue firing SMI on USB activity post-handoff,
+  stealing cycles from PORTSC writes. Attempt 49 confirmed the site
+  ran (rides the existing `xhci: USBLEGSUP already OS-owned` FB line)
+  but didn't unblock silent-absorb in isolation.
+
+### Fixed
+
+- **`xhci.cyr:115` MSI fallback indent** — pre-existing fmt issue from
+  the MSI-X enable work, now `cyrius fmt`-clean. No behavioral change.
 
 ## [1.30.2] — 2026-05-16
 
