@@ -344,34 +344,56 @@ fn xhci_port_reset(port_num, proto) {
     # R2 retained: CSC pre-clear, then re-read. Repair (S): neutralize.
     xhci_portsc_write(port_num, psc0 & XHCI_PORTSC_NEUTRAL, 0x20000);
     var psc1 = xhci_portsc_read(port_num);
-    # Repair (S): Linux-canonical PORTSC write. Neutralize psc1 down
-    # to RO|RWS bits (zeroes LWS, RsvdZ, RW1S, RW1C — the bits AGNOS
-    # previously preserved with 0xFF01FFFF), then OR in PR=1. PP is
-    # preserved through neutralization (bit 9 lives in RWS), so the
-    # defensive `| 0x200` from Repair (R1) is dropped to exactly match
-    # Linux's xhci-hub.c USB_PORT_FEAT_RESET case.
-    xhci_portsc_write(port_num, (psc1 & XHCI_PORTSC_NEUTRAL) | 0x10, 0);
-    var wait2 = 0;
+    # Repair (T) 2026-05-16: Linux-style PR retry. USB-core
+    # `hub.c:hub_port_reset` retries the PR write up to 5× before failing;
+    # xhci-hub.c doesn't but the layer above does. On archaemenid AMD FCH
+    # Attempt 41 (post-S'), Linux-canonical RMW + PP preserved through the
+    # mask restored bitmap=0x3F + CCS=0x04 but the silent-absorb persisted
+    # (PR=0, PRC=0, PED=0 at timeout — controller did not engage). Retry
+    # the PR write up to 3× when the silent-absorb signature is observed.
+    # If any of PR/PRC/PED is set at the timeout boundary, the controller
+    # engaged — break to the failure-stamp path with current diagnostics.
     var psc_last = 0;
-    while (wait2 < 1000000) {
-        var psc = xhci_portsc_read(port_num);
-        psc_last = psc;
-        if ((psc & 0x200000) != 0) {
-            # Repair (S): neutralize value, w1c-clear PRC.
-            xhci_portsc_write(port_num, psc & XHCI_PORTSC_NEUTRAL, 0x200000);
-            var psc2 = xhci_portsc_read(port_num);
-            if ((psc2 & 0x2) != 0) { return 1; }
-            xhci_cmos_stamp(0x6C, (psc2 >> 16) & 0xFF);
-            # R8: PORTPMSC of the failing port to CMOS[0x60] (reuses retired
-            # AS2 slot per Repair-O cleanup). USB2 PMSC bits encode L1 status,
-            # remote-wake support, test mode — non-standard quirks land here.
-            xhci_cmos_stamp(0x60, load32(xhci_portsc_addr(port_num) + 0x04) & 0xFF);
-            return 0;
+    var retry = 0;
+    while (retry < 3) {
+        # Repair (S): Linux-canonical PORTSC write. Neutralize psc1 down
+        # to RO|RWS bits (zeroes LWS, RsvdZ, RW1S, RW1C — the bits AGNOS
+        # previously preserved with 0xFF01FFFF), then OR in PR=1. PP is
+        # preserved through neutralization (bit 9 lives in RWS), so the
+        # defensive `| 0x200` from Repair (R1) is dropped to exactly match
+        # Linux's xhci-hub.c USB_PORT_FEAT_RESET case.
+        xhci_portsc_write(port_num, (psc1 & XHCI_PORTSC_NEUTRAL) | 0x10, 0);
+        var wait2 = 0;
+        while (wait2 < 1000000) {
+            var psc = xhci_portsc_read(port_num);
+            psc_last = psc;
+            if ((psc & 0x200000) != 0) {
+                # Repair (S): neutralize value, w1c-clear PRC.
+                xhci_portsc_write(port_num, psc & XHCI_PORTSC_NEUTRAL, 0x200000);
+                var psc2 = xhci_portsc_read(port_num);
+                if ((psc2 & 0x2) != 0) {
+                    xhci_cmos_stamp(0x70, retry & 0xFF);
+                    return 1;
+                }
+                xhci_cmos_stamp(0x6C, (psc2 >> 16) & 0xFF);
+                # R8: PORTPMSC of the failing port to CMOS[0x60] (reuses retired
+                # AS2 slot per Repair-O cleanup). USB2 PMSC bits encode L1 status,
+                # remote-wake support, test mode — non-standard quirks land here.
+                xhci_cmos_stamp(0x60, load32(xhci_portsc_addr(port_num) + 0x04) & 0xFF);
+                xhci_cmos_stamp(0x70, retry & 0xFF);
+                return 0;
+            }
+            wait2 = wait2 + 1;
         }
-        wait2 = wait2 + 1;
+        # Silent-absorb signature: PR=0 AND PRC=0 AND PED=0 at timeout.
+        # 0x10=PR, 0x200000=PRC, 0x2=PED → mask 0x200012.
+        if ((psc_last & 0x200012) != 0) { break; }
+        psc1 = xhci_portsc_read(port_num);
+        retry = retry + 1;
     }
     xhci_cmos_stamp(0x6C, (psc_last >> 16) & 0xFF);
     xhci_cmos_stamp(0x60, load32(xhci_portsc_addr(port_num) + 0x04) & 0xFF);
+    xhci_cmos_stamp(0x70, retry & 0xFF);
     return 0;
 }
 
