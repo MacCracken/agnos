@@ -128,6 +128,16 @@ fn xhci_xecp_classify_ports() {
     var first_supproto  = 0;   # 1 once first SupProto cap seen
     var first_rev       = 0;
     var first_pcount    = 0;
+    # Repair (W) 2026-05-16 — capture the first two unclassified cap IDs
+    # (anything that isn't USBLEGSUP or the FIRST SupProto). Surfaces the
+    # 3 caps the driver currently silently skips in cap_count=5 walks:
+    # second SupProto (rev=3 USB3 sibling table), Debug Cap (0x0A), xPM
+    # (0x03), vendor caps (0xC0+). Packed nibble-each to CMOS[0x7A]; raw
+    # spec-defined cap IDs are ≤ 0x0A so the nibble fits cleanly. Vendor
+    # caps (>0xF) clip to low nibble — surfaced visibly by cap_count[0x68]
+    # not summing to the known IDs.
+    var first_unclassified  = 0;
+    var second_unclassified = 0;
 
     var cap_off = xhci_xecp * 4;        # First cap, in bytes from MMIO base
     var safety = 0;
@@ -137,6 +147,7 @@ fn xhci_xecp_classify_ports() {
             xhci_cmos_stamp(0x68, cap_count & 0xFF);
             xhci_cmos_stamp(0x69, cap_id_bitmap & 0xFF);
             xhci_cmos_stamp(0x6A, ((first_rev & 0xF) << 4) | (first_pcount & 0xF));
+            xhci_cmos_stamp(0x7A, ((first_unclassified & 0xF) << 4) | (second_unclassified & 0xF));
             return 1;
         }
         safety = safety + 1;
@@ -148,6 +159,13 @@ fn xhci_xecp_classify_ports() {
 
         if (cap_id == XHCI_XECP_USBLEGSUP)      { cap_id_bitmap = cap_id_bitmap | 0x1; }
         if (cap_id == XHCI_XECP_SUPPORTED_PROT) { cap_id_bitmap = cap_id_bitmap | 0x2; }
+
+        # Repair (W): tag whether THIS iteration is the first SupProto.
+        # Computed before the SupProto block flips first_supproto.
+        var was_first_supproto = 0;
+        if (cap_id == XHCI_XECP_SUPPORTED_PROT) {
+            if (first_supproto == 0) { was_first_supproto = 1; }
+        }
 
         if (cap_id == XHCI_XECP_SUPPORTED_PROT) {
             var rev_major = (dw0 >> 24) & 0xFF;
@@ -170,12 +188,29 @@ fn xhci_xecp_classify_ports() {
             }
         }
 
+        # Repair (W): capture caps that aren't USBLEGSUP and aren't the
+        # FIRST SupProto. A second SupProto lands here (driver only honors
+        # the first), as do Debug Cap / vendor-defined caps (driver
+        # doesn't consume them at all).
+        if (cap_id != XHCI_XECP_USBLEGSUP) {
+            if (was_first_supproto == 0) {
+                if (first_unclassified == 0) {
+                    first_unclassified = cap_id;
+                } else {
+                    if (second_unclassified == 0) {
+                        second_unclassified = cap_id;
+                    }
+                }
+            }
+        }
+
         if (next_off == 0) { cap_off = 0; }
         else { cap_off = cap_off + next_off * 4; }
     }
     xhci_cmos_stamp(0x68, cap_count & 0xFF);
     xhci_cmos_stamp(0x69, cap_id_bitmap & 0xFF);
     xhci_cmos_stamp(0x6A, ((first_rev & 0xF) << 4) | (first_pcount & 0xF));
+    xhci_cmos_stamp(0x7A, ((first_unclassified & 0xF) << 4) | (second_unclassified & 0xF));
     return 1;
 }
 
@@ -394,6 +429,25 @@ fn xhci_port_reset(port_num, proto) {
     xhci_cmos_stamp(0x6C, (psc_last >> 16) & 0xFF);
     xhci_cmos_stamp(0x60, load32(xhci_portsc_addr(port_num) + 0x04) & 0xFF);
     xhci_cmos_stamp(0x70, retry & 0xFF);
+    # Repair (W) 2026-05-16 — controller-side gate diagnostic at reset-
+    # fail-time. Captures USBSTS byte 0 + byte 1 + USBCMD byte 0:
+    #   [0x77] USBSTS byte 0 — HCH (bit 0) / HSE (bit 2) / EINT (bit 3) /
+    #                          PCD (bit 4). HCH=1 means controller halted.
+    #   [0x78] USBSTS byte 1 — SSS (bit 0=8) / RSS (bit 1=9) / SRE (bit
+    #                          2=10) / CNR (bit 3=11) / HCE (bit 4=12).
+    #                          CNR=1 is THE silent-absorb smoking gun —
+    #                          spec says no operational-register writes
+    #                          accepted while CNR=1.
+    #   [0x79] USBCMD byte 0 — R/S (bit 0) / HCRST (bit 1) / INTE (bit
+    #                          2) / HSEE (bit 3) / LHCRST (bit 7) etc.
+    # Disambiguates Burn-A row-1 outcome (Attempt 46 V'' walk: UC mapping
+    # landed AND four-level walk agrees AND silent-absorb persists; the
+    # gate is downstream of cache attributes). Last-write-wins across
+    # ports is fine — USBSTS / USBCMD are controller-wide, not per-port.
+    var ws = xhci_op_read32(XHCI_OP_USBSTS);
+    xhci_cmos_stamp(0x77, ws & 0xFF);
+    xhci_cmos_stamp(0x78, (ws >> 8) & 0xFF);
+    xhci_cmos_stamp(0x79, xhci_op_read32(XHCI_OP_USBCMD) & 0xFF);
     return 0;
 }
 
