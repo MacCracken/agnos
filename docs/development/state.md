@@ -16,7 +16,7 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.30.2** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.30.3** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **5.11.53** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-16 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Last assertion tightened** | `KASLR: pmm_next_free=N` varies across two boots | CI `boot-test` job, v1.28.0 (**currently broken — see "Open investigation" below**) |

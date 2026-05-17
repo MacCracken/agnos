@@ -205,6 +205,30 @@ fn xhci_probe() {
     xhci_cmos_stamp(0x71, rdmsr(0x2FF) & 0xFF);
     xhci_cmos_stamp(0x72, rdmsr(0x277) & 0xFF);
 
+    # 7c. Repair (X') — post-X PDE re-stamp. Walk the page table to the
+    # 2 MB PDE that controls the xHCI BAR and stamp its low byte to
+    # CMOS[0x73]. Disambiguates Attempt 44's row-2 outcome (silent-absorb
+    # survived UC remap, kcp=0x15, [0x70]=0x03, [0x6C]=0x00):
+    #   0x9B (or 0xBB if A-bit set by walk) = P|W|PWT|PCD|PS → PA3=UC →
+    #     vmm_remap_uc_2mb DID land in the page table; F5 falsified;
+    #     escalate to V'' (full PML4→PDPT→PD walk for aliasing).
+    #   0x83 = P|W|PS → PA0=WB → vmm_remap_uc_2mb is a no-op on this
+    #     path; the rewrite didn't reach the controlling PDE; debug
+    #     the remap helper itself (TLB / pmm_alloc / PDPT-repoint).
+    # Walks both halves of vmm_remap_uc_2mb's address split:
+    #   mmio <  1 GB → PD@0x3000 (boot-time PD, untouched by shatter)
+    #   mmio >= 1 GB → PDPT[gb_idx] points at the post-shatter PD;
+    #                  mask off the low 12 flag bits to get its base.
+    var pde_addr = 0;
+    if (mmio < 0x40000000) {
+        pde_addr = 0x3000 + ((mmio >> 21) & 0x1FF) * 8;
+    } else {
+        var pdpt_entry = load64(0x2000 + ((mmio >> 30) & 0x1FF) * 8);
+        var new_pd     = pdpt_entry & 0xFFFFFFFFFFFFF000;
+        pde_addr       = new_pd + ((mmio >> 21) & 0x1FF) * 8;
+    }
+    xhci_cmos_stamp(0x73, load64(pde_addr) & 0xFF);
+
     # 8. CMOS kernel checkpoint 0x30 (xhci probe complete). Readable
     # post-mortem via `agnosticos/scripts/read-boot-log.sh`. Matches the
     # CMOS-checkpoint convention from `core/main.cyr` — 8-byte raw asm

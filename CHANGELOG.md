@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.30.3] — 2026-05-16
+
+**Repair (X') — post-X PDE re-stamp.** Diagnostic-only follow-up to
+Attempt 44 (Repair X), which preserved boot-to-shell but did not
+clear the PORTSC silent-absorb on archaemenid (CMOS `[0x70]=0x03`,
+`[0x6C]=0x00`, `[0x63]=0x04`, `[0x64]=0x00`). Two paths from that
+outcome are indistinguishable from the V/X stamps alone: either
+`vmm_remap_uc_2mb` is a no-op on the BAR's PDE (rewrite never
+landed), or it landed and F5 (cache attribute) is wrong. X' walks
+the page table back to the controlling 2 MB PDE after the remap
+and stamps its low byte to `CMOS[0x73]` — `0x9B`/`0xBB` proves UC
+mapping landed (escalate to Repair V''), `0x83` proves the rewrite
+didn't reach the PDE (debug the helper).
+
+### Added
+
+- **Repair (X') PDE re-stamp** (`kernel/arch/x86_64/usb/xhci.cyr`).
+  ~14 LOC + 1 CMOS slot after `vmm_remap_uc_2mb(mmio)` at xhci_probe
+  step 5b. Walks `PD@0x3000` for sub-1GB BARs or the post-shatter
+  `PDPT[gb_idx]→PD` for ≥1GB BARs (archaemenid's xHCI lands at
+  `0xFC800000`, so the shatter path is the load-bearing one).
+  Pure read-only diagnostic; controller behavior unchanged.
+- **`CMOS[0x73]` decoder + cheat-sheet** (`agnosticos/scripts/src/read-boot-log.cyr`).
+  Stamp interpretation: `0x9B`/`0xBB`=UC mapping landed,
+  `0x83`=remap is a no-op, `0x00`=stamp didn't run, other=flag
+  for triage.
+
 ## [1.30.2] — 2026-05-16
 
 **xHCI Phase 3 closeout — `vmm_remap_uc_2mb` lands the xHCI BAR on
