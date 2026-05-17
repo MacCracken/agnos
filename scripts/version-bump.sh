@@ -54,31 +54,50 @@ if [ -f "$ROOT/kernel/agnos.cyr" ]; then
     updated="$updated  kernel/agnos.cyr\n"
 fi
 
-# 4. kernel/core/main.cyr — serial_println with auto-computed length
-#    "AGNOS kernel vX.Y.Z" = 15 + len(version)
-if [ -f "$ROOT/kernel/core/main.cyr" ]; then
+# 4. kernel/version.cyr — AUTO-GENERATED single-source-of-truth for all
+#    runtime banner strings. v1.30.2+: replaces the per-site sed regexes
+#    that previously bumped main.cyr / shell.cyr / aarch64/main.cyr
+#    independently and re-computed each byte length. Mirrors cyrius's
+#    src/version_str.cyr pattern. New banner site → add a paired var
+#    here (and reference it from the consuming .cyr); script needs no
+#    changes for new banners.
+if [ -f "$ROOT/kernel/version.cyr" ] || [ -f "$ROOT/kernel/agnos.cyr" ]; then
     KSTR="AGNOS kernel v$NEW"
     KLEN=${#KSTR}
-    sed -i -E "s|\"AGNOS kernel v[0-9]+\.[0-9]+\.[0-9]+[^\"]*\", [0-9]+\)|\"$KSTR\", $KLEN)|" "$ROOT/kernel/core/main.cyr"
-    updated="$updated  kernel/core/main.cyr ($KSTR, $KLEN)\n"
-fi
-
-# 5. kernel/arch/aarch64/main.cyr — serial_println with auto-computed length
-#    "AGNOS kernel vX.Y.Z [aarch64]" = 26 + len(version)
-if [ -f "$ROOT/kernel/arch/aarch64/main.cyr" ]; then
-    ASTR="AGNOS kernel v$NEW [aarch64]"
-    ALEN=${#ASTR}
-    sed -i -E "s|\"AGNOS kernel v[0-9]+\.[0-9]+\.[0-9]+[^\"]* \[aarch64\]\", [0-9]+\)|\"$ASTR\", $ALEN)|" "$ROOT/kernel/arch/aarch64/main.cyr"
-    updated="$updated  kernel/arch/aarch64/main.cyr ($ASTR, $ALEN)\n"
-fi
-
-# 6. kernel/user/shell.cyr — serial_println with auto-computed length
-#    "AGNOS shell vX.Y.Z (type 'help')" = 27 + len(version)
-if [ -f "$ROOT/kernel/user/shell.cyr" ]; then
     SSTR="AGNOS shell v$NEW (type 'help')"
     SLEN=${#SSTR}
-    sed -i -E "s|\"AGNOS shell v[0-9]+\.[0-9]+\.[0-9]+[^\"]* \(type 'help'\)\", [0-9]+\)|\"$SSTR\", $SLEN)|" "$ROOT/kernel/user/shell.cyr"
-    updated="$updated  kernel/user/shell.cyr ($SSTR, $SLEN)\n"
+    ASTR="AGNOS kernel v$NEW [aarch64]"
+    ALEN=${#ASTR}
+    cat > "$ROOT/kernel/version.cyr" <<EOF
+# kernel/version.cyr — AUTO-GENERATED from \`VERSION\` by
+# \`scripts/version-bump.sh\`. Do NOT edit by hand; the next bump
+# will overwrite. To regenerate without bumping, run:
+#
+#   sh scripts/version-bump.sh "\$(cat VERSION)"
+#
+# Why this file exists: pre-v1.30.2, each boot banner had its own
+# hardcoded \`"AGNOS … vX.Y.Z …"\` literal + a hardcoded byte length
+# in three .cyr files (kernel/core/main.cyr, kernel/user/shell.cyr,
+# kernel/arch/aarch64/main.cyr). \`version-bump.sh\` had a sed regex
+# per site that re-computed the byte length each bump; any new
+# banner would silently miss the bump until CI caught the mismatch.
+# Pattern mirrors cyrius's \`src/version_str.cyr\` — centralising the
+# strings here means version-bump.sh writes ONE file every time and
+# the sources just reference these vars. No regex hunting; no drift;
+# no length-recount; new banners auto-bump by adding to this file.
+
+var _AGNOS_VERSION                   = "$NEW";
+
+var _AGNOS_KERNEL_BANNER             = "$KSTR";
+var _AGNOS_KERNEL_BANNER_LEN         = $KLEN;
+
+var _AGNOS_SHELL_BANNER              = "$SSTR";
+var _AGNOS_SHELL_BANNER_LEN          = $SLEN;
+
+var _AGNOS_KERNEL_AARCH64_BANNER     = "$ASTR";
+var _AGNOS_KERNEL_AARCH64_BANNER_LEN = $ALEN;
+EOF
+    updated="$updated  kernel/version.cyr (regenerated)\n"
 fi
 
 # 7. CHANGELOG.md — add new version section after [Unreleased]
@@ -111,7 +130,7 @@ printf "$updated"
 
 # Verify — check for any remaining OLD version references (excluding CHANGELOG history)
 echo ""
-STALE=$(grep -rn "$OLD" "$ROOT/VERSION" "$ROOT/kernel/agnos.cyr" "$ROOT/kernel/core/main.cyr" "$ROOT/kernel/arch/aarch64/main.cyr" "$ROOT/kernel/user/shell.cyr" 2>/dev/null || true)
+STALE=$(grep -rn "$OLD" "$ROOT/VERSION" "$ROOT/kernel/agnos.cyr" "$ROOT/kernel/version.cyr" 2>/dev/null || true)
 if [ -n "$STALE" ]; then
     echo "WARNING: stale $OLD references found:"
     echo "$STALE"

@@ -1,0 +1,27 @@
+# kernel/version.cyr — AUTO-GENERATED from `VERSION` by
+# `scripts/version-bump.sh`. Do NOT edit by hand; the next bump
+# will overwrite. To regenerate without bumping, run:
+#
+#   sh scripts/version-bump.sh "$(cat VERSION)"
+#
+# Why this file exists: pre-v1.30.2, each boot banner had its own
+# hardcoded `"AGNOS … vX.Y.Z …"` literal + a hardcoded byte length
+# in three .cyr files (kernel/core/main.cyr, kernel/user/shell.cyr,
+# kernel/arch/aarch64/main.cyr). `version-bump.sh` had a sed regex
+# per site that re-computed the byte length each bump; any new
+# banner would silently miss the bump until CI caught the mismatch.
+# Pattern mirrors cyrius's `src/version_str.cyr` — centralising the
+# strings here means version-bump.sh writes ONE file every time and
+# the sources just reference these vars. No regex hunting; no drift;
+# no length-recount; new banners auto-bump by adding to this file.
+
+var _AGNOS_VERSION                   = "1.30.2";
+
+var _AGNOS_KERNEL_BANNER             = "AGNOS kernel v1.30.2";
+var _AGNOS_KERNEL_BANNER_LEN         = 20;
+
+var _AGNOS_SHELL_BANNER              = "AGNOS shell v1.30.2 (type 'help')";
+var _AGNOS_SHELL_BANNER_LEN          = 33;
+
+var _AGNOS_KERNEL_AARCH64_BANNER     = "AGNOS kernel v1.30.2 [aarch64]";
+var _AGNOS_KERNEL_AARCH64_BANNER_LEN = 30;

@@ -1,6 +1,6 @@
 # aarch64 main — boot sequence for QEMU virt
 
-serial_println("AGNOS kernel v1.30.1 [aarch64]", 30);
+serial_println(_AGNOS_KERNEL_AARCH64_BANNER, _AGNOS_KERNEL_AARCH64_BANNER_LEN);
 serial_println("64-bit ARM, PL011 UART", 22);
 
 gic_init();

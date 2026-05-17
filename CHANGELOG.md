@@ -16,6 +16,28 @@ diagnostic, Repair (V) MTRR/PAT cache-attribute diagnostic, and
 Repair (X) the actual unblock. 1.30.1 was a pre-iron-validation tag
 on the S-only stack; 1.30.2 supersedes it directly.
 
+### Changed
+
+- **Centralize runtime version strings in `kernel/version.cyr`**
+  (`kernel/version.cyr`, `kernel/agnos.cyr`, `kernel/core/main.cyr`,
+  `kernel/user/shell.cyr`, `kernel/arch/aarch64/main.cyr`,
+  `scripts/version-bump.sh`). Pre-v1.30.2, three boot banner sites
+  each carried a hardcoded `"AGNOS … vX.Y.Z …"` literal + a
+  hardcoded byte length, and `version-bump.sh` ran a sed regex per
+  site that re-computed each length on every bump. Adding a new
+  banner anywhere meant teaching the script about it; missing that
+  edit got caught by CI's `grep -q "$VERSION" kernel/*.cyr` only
+  after a release was cut. New `kernel/version.cyr` (auto-generated,
+  mirrors cyrius's `src/version_str.cyr` pattern) holds paired
+  `_AGNOS_*_BANNER` + `_AGNOS_*_BANNER_LEN` vars plus a bare
+  `_AGNOS_VERSION` constant; `kernel/agnos.cyr` includes it once at
+  the top so every consumer resolves the same strings. The three
+  banner sites now reference vars instead of literals. New
+  `version-bump.sh` block #4 regenerates `kernel/version.cyr` via a
+  single heredoc — adding a new banner is a one-file edit
+  (`kernel/version.cyr` + the consuming `.cyr`), no script changes
+  required. Build delta: `+256 B` (new var symbols + initializers).
+
 ### Fixed
 
 - **xHCI Phase 3 — remap MMIO BAR as Uncacheable via
