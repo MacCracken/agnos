@@ -104,6 +104,7 @@ fn outl(port, val) { return 0; }
 fn inb(port) { return 0; }
 fn inw(port) { return 0; }
 fn inl(port) { return 0; }
+fn rdmsr(msr) { return 0; }
 
 # Page table helpers
 fn pt_map_2mb(base, idx, addr) { return 0; }

@@ -72,6 +72,22 @@ fn rdtsc() {
     return result;
 }
 
+# Read 64-bit value of an x86 MSR. ecx = msr number; rdmsr returns
+# edx:eax (high32:low32); combine into rax. Used by Repair (V) to
+# stamp MTRR_DEF_TYPE (0x2FF) + PAT (0x277) for the MMIO cache-attribute
+# post-mortem. msr=-0x08, result=-0x10.
+fn rdmsr(msr) {
+    var result = 0;
+    asm {
+        0x48; 0x8B; 0x4D; 0xF8;       # mov  rcx, [rbp-0x08]   ; ecx = msr#
+        0x0F; 0x32;                    # rdmsr                  ; edx:eax = MSR
+        0x48; 0xC1; 0xE2; 0x20;        # shl  rdx, 32
+        0x48; 0x09; 0xD0;              # or   rax, rdx          ; rax = combined u64
+        0x48; 0x89; 0x45; 0xF0;        # mov  [rbp-0x10], rax   ; result = rax
+    }
+    return result;
+}
+
 # Hardware random 64-bit via RDRAND. Returns 0 on failure (Intel SDM
 # specifies destination is zeroed on RDRAND failure); callers should
 # check val==0 and fall back to a mixer. Extracted from the

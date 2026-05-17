@@ -178,6 +178,22 @@ fn xhci_probe() {
     xhci_cmos_stamp(0x6E, hccp1 & 0xFF);
     xhci_cmos_stamp(0x6F, hccp2 & 0xFF);
 
+    # 7b. Repair (V) — MTRR/PAT MMIO cache-attribute diagnostic.
+    # F5 hypothesis: with PS=1 2MB-page PDEs (flag 0x83 = P|W|PS), the
+    # PAT-index bits collapse to PWT=0, PCD=0, PAT(bit 12)=0 → PAT entry 0.
+    # The firmware-default PAT MSR (0x277) has PA0 = WB (0x06), which
+    # would mean the xHCI BAR is silently write-back cached and PORTSC
+    # writes coalesce in L1/L2 — matching Attempt 42's deterministic
+    # silent-absorb across all 3 retries. Diagnostic stamps:
+    #   [0x71] = MTRR_DEF_TYPE (MSR 0x2FF) low byte
+    #             bits 0-7 = default mem-type (0=UC, 1=WC, 4=WT, 5=WP, 6=WB)
+    #             bit 10   = FE (fixed-range MTRR enable)
+    #             bit 11   = E  (MTRR enable global)
+    #   [0x72] = PAT MSR (0x277) byte 0 (PA0 — entry our 2MB PDE selects)
+    # Pure read-only diagnostic; no controller-side risk.
+    xhci_cmos_stamp(0x71, rdmsr(0x2FF) & 0xFF);
+    xhci_cmos_stamp(0x72, rdmsr(0x277) & 0xFF);
+
     # 8. CMOS kernel checkpoint 0x30 (xhci probe complete). Readable
     # post-mortem via `agnosticos/scripts/read-boot-log.sh`. Matches the
     # CMOS-checkpoint convention from `core/main.cyr` — 8-byte raw asm
