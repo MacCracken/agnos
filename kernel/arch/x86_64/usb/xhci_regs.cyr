@@ -233,8 +233,8 @@ enum XhciPortReg {
 # (CMOS[0x6C]=0x00, no PSC change bits set at poll-timeout).
 enum XhciPortscMask {
     XHCI_PORTSC_RO        = 0x40003C09;   # bits {0, 3, 10-13, 30} — CCS|OCA|Speed|DR
-    XHCI_PORTSC_RWS       = 0x0E00C1E0;   # bits {5-9, 14-15, 25-27} — PLS|PP|PIC|WCE/WDE/WOE
-    XHCI_PORTSC_NEUTRAL   = 0x4E00FDE9;   # RO | RWS — preserve mask for any RMW
+    XHCI_PORTSC_RWS       = 0x0E00C3E0;   # bits {5-9, 14-15, 25-27} — PLS|PP|PIC|WCE/WDE/WOE
+    XHCI_PORTSC_NEUTRAL   = 0x4E00FFE9;   # RO | RWS — preserve mask for any RMW
     XHCI_PORTSC_W1C       = 0x00FE0002;   # bits {1, 17-23} — PED + change bits (RW1C-writable)
 }
 
