@@ -461,6 +461,14 @@ fn xhci_init() {
     # site executed even if kybernet later overwrites kcp.
     xhci_op_write32(XHCI_OP_DNCTRL, 0x02);
     xhci_cmos_stamp(0x84, 0xBB);
+    # Repair (CC) 2026-05-17 — Extended-CMOS sentinel. Attempt 51 readback
+    # exposed that slots 0x80+ were aliasing to RTC time-of-day registers
+    # because port 0x70 bit 7 is the NMI mask, not a slot-index bit.
+    # `xhci_cmos_stamp` now routes ≥0x80 through 0x72/0x73 (extended
+    # bank); this sentinel proves the AMD FCH 1022:1639 honors that pair.
+    # Read-back at [0x86]=0xCC → extended CMOS is live; anything else →
+    # fall back to FB-only diagnostics for >0x7F slots.
+    xhci_cmos_stamp(0x86, 0xCC);
     kprintln("xhci: dev_notifications enabled", 31);
 
     xhci_halted = 1;

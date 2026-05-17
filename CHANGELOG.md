@@ -22,12 +22,28 @@ handling being enabled. Audit also found a real but post-Phase-3 memory
 leak (double xfer-ring allocation in `xhci_enumerate_port`) and two CMOS
 stamp design flaws from Attempt 50 (`[0x83]` captures page-aligned phys
 low byte = always 0x00; `[0x80]=53` vs `[0x82]=0` inconsistency from
-unobserved hcsp2 byte 2). **Decoupling decision holds**: iron-burn cadence
+unobserved hcsp2 byte 2). **Attempt 51 burn (2026-05-17) — BB falsified**
+empirically: FB line `xhci: dev_notifications enabled` rendered, `port 1
+reset failed (proto=2)` + `port 3 reset failed (proto=2)` followed.
+Eleventh hypothesis in the arc. Post-mortem readback also exposed a
+foundational **CMOS-alias bug** — slots ≥ 0x80 written via the legacy
+`0x70/0x71` port pair had been silently aliasing to RTC time-of-day
+registers (port 0x70 bit 7 is the NMI mask, not a slot-index bit), so the
+entire AA + BB diagnostic capture at `[0x80]/[0x82]/[0x84]` was returning
+BCD wall-clock seconds/minutes/hours rather than the kernel's intended
+bytes. Slots `[0x81]/[0x83]/[0x85]` aliased to RTC alarm regs (rarely
+touched scratch), preserving kernel writes and masking the bug across
+both attempts. Repairs (CC) + (DD) land in the same staging cycle:
+extended-CMOS routing through 0x72/0x73 for slots ≥ 0x80, and event-ring
+drain + USBSTS.PCD clear before each port-reset PR write (USBSTS PCD=1
+across the silent-absorb arc was a signal AGNOS never acknowledged; the
+twelfth hypothesis). **Decoupling decision holds**: iron-burn cadence
 stays batched; Phase 4 (Configure Endpoint + SET_PROTOCOL=boot) + Phase 5
 (HID translation + `kb_buf` feed) develop in parallel against AGNOS Phase
-1-3 infrastructure regardless of BB iron outcome. 1.30.4 cycle is
-**open-ended** — staging area for BB validation + Phase 4/5 code surface
-+ any follow-up Linux-diff hypotheses if BB falsifies.
+1-3 infrastructure regardless of any single repair outcome. 1.30.4 cycle
+is **open-ended** — staging area for BB validation, the CC + DD
+follow-ons, Phase 4/5 code surface, and any further Linux-diff hypotheses
+that surface as the silent-absorb arc continues.
 
 ### Added
 
@@ -44,9 +60,47 @@ stays batched; Phase 4 (Configure Endpoint + SET_PROTOCOL=boot) + Phase 5
   Captures `(hcsp2 >> 16) & 0xFF` alongside the existing `[0x82]` byte-3
   stamp. Disambiguates Attempt 50's `[0x80]=53` vs `[0x82]=0x00`
   mathematical impossibility (per AGNOS decode `(bits 25:21 << 5) | bits
-  31:27` with `[0x82]=0` constraining count ≤ 7). Either the actual
-  hcsp2 has bits in byte 2 we didn't observe, or there's a Cyrius
-  shift-emit / CMOS-capture divergence worth surfacing.
+  31:27` with `[0x82]=0` constraining count ≤ 7). **Post-Attempt-51
+  finding**: the `[0x80]=53` mystery was the CMOS-alias bug all along —
+  53 was RTC seconds at read time, not MaxScratchpadBufs. The byte-2
+  cross-check survives as defense-in-depth once CC routes the slots
+  correctly.
+- **Repair (CC) extended-CMOS routing for slots ≥ 0x80**
+  (`kernel/arch/x86_64/usb/xhci_port.cyr` `xhci_cmos_stamp`; mirror in
+  `agnosticos/scripts/src/read-boot-log.cyr` `cmos_read`). Splits on
+  slot 0x80: slots < 0x80 keep the legacy 0x70/0x71 path; slots ≥ 0x80
+  route through the extended CMOS bank at 0x72/0x73 (offset = slot −
+  0x80, no NMI-mask bit collision). Root cause for Attempts 50+51
+  capture corruption: `outb(0x70, 0x84)` clears bit 7 = NMI mask and
+  selects slot 0x04 (RTC hours), so the entire `[0x80]/[0x82]/[0x84]`
+  AA + BB diagnostic surface had been reading RTC time-of-day BCD. The
+  RTC alarm registers at indices 0x01/0x03/0x05 are unused scratch on
+  archaemenid's AMD FCH, which preserved the kernel writes at
+  `[0x81]/[0x83]/[0x85]` and masked the bug across both burns. Empirical
+  sentinel `xhci_cmos_stamp(0x86, 0xCC)` in `xhci.cyr` (after the BB
+  stamp) verifies the AMD FCH 1022:1639 honors the 0x72/0x73 port pair;
+  `[0x86]=0xCC` on next iron read → extended CMOS live, anything else
+  → fall back to FB-only diagnostics for the >0x7F range.
+- **Repair (DD) event-ring drain + USBSTS.PCD clear before port reset**
+  (`kernel/arch/x86_64/usb/xhci_port.cyr` new
+  `xhci_drain_port_change_events`, called from `xhci_port_reset` USB2
+  path after Repair (Z) 10 ms timing delay and before the first
+  PORTSC.PR write). Walks event TRBs from `xhci_evt_ring_idx` while the
+  cycle bit matches `xhci_evt_ring_cycle`, advances the dequeue pointer
+  with EHB (bit 3) set on the ERDP write-back, then RW1C-clears
+  USBSTS.PCD via `xhci_op_write32(XHCI_OP_USBSTS, 0x10)`. 64-TRB safety
+  bound prevents runaway on a corrupted cycle bit. Hypothesis under
+  test: AMD FCH 1022:1639 gates further PORTSC writes (silent absorb)
+  until prior Port Status Change events are consumed and PCD is
+  cleared. Attempt 51 [0x77]=0x10 (USBSTS.PCD=1) was direct evidence
+  the controller had a pending change event sitting un-acknowledged
+  across the entire silent-absorb arc; Linux's `xhci-hub.c` drains
+  events between port operations via `xhci_handle_event` from
+  `xhci_hub_status_data`, but AGNOS only drained from EP0 doorbell
+  completions (post-reset, too late). Sentinel `[0x87]=0xDD` + FB line
+  `xhci: drained N events`. Twelfth hypothesis in the silent-absorb
+  arc; first one to act directly on a USBSTS bit AGNOS had been
+  observing but never acknowledging.
 
 ### Changed
 
@@ -70,19 +124,31 @@ stays batched; Phase 4 (Configure Endpoint + SET_PROTOCOL=boot) + Phase 5
 
 ### Pending validation
 
-- **Attempt 51 iron burn** — flash post-BB binary, attach Keychron K2 to
-  port 1 or port 3, boot, photograph FB block between `xhci: USBLEGSUP
-  already OS-owned` and `VFS initialized`, then `sudo
-  ./scripts/read-boot-log.sh`. Truth channels in order: (1) FB
-  primary — does `xhci: port N connected, …` line surface? (2)
-  `CMOS[0x84]=0xBB` confirms BB site executed; (3) `CMOS[0x64]`
-  reset-OK bitmap — the binary unblock indicator; (4) `CMOS[0x85]`
-  HCSPARAMS2 byte 2 + `CMOS[0x83]` redesigned scratchpad phys byte 2.
-  Outcome matrix in `iron-nuc-zen-log.md` § Attempt 51 prep.
+- **Attempt 51 iron burn (2026-05-17) — BB falsified, CMOS-alias bug
+  surfaced.** Post-mortem: FB rendered `xhci: dev_notifications enabled`
+  + `port 1 reset failed (proto=2)` + `port 3 reset failed (proto=2)`,
+  so BB site executed but didn't unblock reset (eleventh hypothesis
+  falsified). CMOS readback exposed the slots-≥-0x80 alias bug rolled
+  into Repairs (CC) + (DD) above.
+- **Attempt 52 iron burn (planned)** — **LAST authorized just-testing
+  burn** before pivot to Phase 4/5 non-iron work regardless of outcome
+  (per `feedback_iron_burns_block_other_work` — burns hold up unrelated
+  user work on the single dev machine). Flash post-CC+DD staging
+  binary (~350,008 B floor), attach Keychron K2 to port 1 or port 3,
+  boot, photograph FB block between `xhci: USBLEGSUP already
+  OS-owned` and `VFS initialized`, then
+  `sudo ./scripts/read-boot-log.sh`. Truth channels in order:
+  (1) FB primary — does `xhci: drained N events` line surface? does any
+  `xhci: port N connected, …` line surface downstream? (2)
+  `CMOS[0x86]=0xCC` — CC fix landed, slots 0x80+ are real CMOS
+  (retroactively decodes Attempts 50/51 `[0x80]/[0x82]/[0x84]`); (3)
+  `CMOS[0x87]=0xDD` — DD drain site executed; (4) `CMOS[0x64]`
+  reset-OK bitmap — the binary unblock indicator. Outcome matrix in
+  `iron-nuc-zen-log.md` § Attempt 52 prep.
 - **Phase 4 code surface (Configure Endpoint + SET_PROTOCOL=boot)** —
   per `agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`
   § Phase 4. Develops against the Phase 1-3 infrastructure regardless
-  of BB outcome.
+  of any single repair outcome.
 - **Phase 5 code surface (HID-boot translation + `kb_buf` feed)** — per
   same planning doc § Phase 5. Closes typeable-shell gate when both
   Phase 4 and the silent-absorb unblock land.
@@ -90,16 +156,25 @@ stays batched; Phase 4 (Configure Endpoint + SET_PROTOCOL=boot) + Phase 5
 ### Notes
 
 - 1.30.4 is **intentionally open-ended** — the cycle stays in staging
-  until either (a) BB unblocks reset + Phase 4/5 ship typeable shell, or
-  (b) BB falsifies and the next Linux-diff hypothesis lands. Phase 4/5
-  code may merge incrementally; tag cuts when the cycle reaches a
-  coherent ship state.
-- **Audit precedent (AA → BB)**: two consecutive cycles where a
-  register/operation defined in headers but never invoked turned out
-  to be the silent-absorb gate. Future Phase 3+ work should grep
-  `xhci_regs.cyr` constants against `xhci_*_write32` / `xhci_op_write*`
-  call sites systematically; the AA + BB findings are likely not the
-  last.
+  and continues to absorb repairs (BB → CC → DD → ...), Phase 4/5 code
+  surface, and any further Linux-diff hypotheses that surface. Tag cut
+  is user-driven; the cycle does not auto-bump on engineering volume.
+- **Audit precedent (AA → BB → CC)**: three consecutive cycles where a
+  register/operation/port defined in headers but never invoked
+  (correctly) turned out to be a silent gate. AA: DCBAA[0] scratchpad
+  install. BB: DNCTRL register. CC: extended-CMOS port pair (the bug
+  was in the *write/read path*, not a missing operation, but the same
+  audit shape — code referenced a CMOS slot that the legacy port pair
+  couldn't address). Future Phase 3+ work should grep `xhci_regs.cyr`
+  constants against `xhci_*_write32` / `xhci_op_write*` call sites
+  AND pressure-test diagnostic readback paths against alternative
+  explanations (e.g., "what if this byte is plausible by coincidence
+  rather than by my write?") before treating CMOS as ground truth.
+- **Iron burn discipline**: Attempt 52 (the CC+DD burn) is the last
+  authorized just-testing burn before pivot to Phase 4/5 non-iron
+  development. Future instrumentation proposals require a line-by-line
+  audit table before a burn is requested (per
+  `feedback_iron_burns_block_other_work`).
 
 ## [1.30.3] — 2026-05-17
 

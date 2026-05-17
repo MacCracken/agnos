@@ -39,13 +39,90 @@ var xhci_port_proto = 0;   # Pointer into a PMM page allocated at init
 var xhci_port_ccs_mask   = 0;   # bit p-1 set if port p reported CCS=1
 var xhci_port_reset_mask = 0;   # bit p-1 set if xhci_port_reset(p) returned 1
 
-# CMOS post-mortem stamp for xhci state. Slot in [0x62..0x6B]; val low
-# byte only. Slots are the Repair-O retired range — `read-boot-log` is
-# the decoder pair.
+# CMOS post-mortem stamp for xhci state.
+#
+# Two-bank port routing (CC fix 2026-05-17). The MC146818 CMOS index
+# register at 0x70 latches a 7-bit address — bit 7 is the NMI mask, not
+# a slot index bit. Writing `outb(0x70, 0x84)` selects slot 0x04 (RTC
+# hours register) AND disables NMI; bits >0x7F never reach the chip.
+# Attempt 51 readback confirmed: [0x80]/[0x82]/[0x84] returned RTC
+# seconds/minutes/hours in BCD (48 / 04 / 19 = 19:04:48 wall clock),
+# never the kernel's intended bytes. Slots 0x81/0x83/0x85 happened to
+# alias to RTC alarm registers (rarely-touched scratch) and preserved
+# kernel writes, which masked the bug across Attempts 50 + 51.
+#
+# Extended CMOS bank (slots 0x80..0xFF) lives on the second port pair
+# 0x72/0x73, with 0x72 taking a 7-bit offset (no NMI bit). On chipsets
+# that support extended CMOS the offset+0x80 selects slot 0x80+offset.
+# AMD FCH 1022:1639 support is empirically gated by sentinel slot 0x86
+# in xhci_init — if read-boot-log reads [0x86]=0xCC after burn,
+# extended CMOS is live; if 0xFF / 0x00 / RTC artifact, fall back to
+# FB-only diagnostics for the >0x7F range.
 fn xhci_cmos_stamp(slot, val) {
-    outb(0x70, slot);
-    outb(0x71, val & 0xFF);
+    if (slot < 0x80) {
+        outb(0x70, slot);
+        outb(0x71, val & 0xFF);
+    } else {
+        outb(0x72, slot - 0x80);
+        outb(0x73, val & 0xFF);
+    }
     return 0;
+}
+
+# Repair (DD) 2026-05-17 — Event-ring drain + USBSTS.PCD clear before
+# port reset. Attempt 51 [0x77]=0x10 = USBSTS.PCD (Port Change Detect,
+# bit 4) was set across the silent-absorb arc, signaling at least one
+# Port Status Change event sitting on the event ring un-acknowledged.
+# Linux's xhci-hub.c drains events between port operations (via
+# xhci_handle_event called from xhci_hub_status_data); AGNOS never has.
+# Hypothesis: AMD FCH 1022:1639 gates further PORTSC writes (silent
+# absorb) until the prior change event is consumed and PCD is cleared.
+#
+# Walks event TRBs from xhci_evt_ring_idx while cycle-bit matches
+# xhci_evt_ring_cycle, advances the dequeue pointer, writes ERDP back
+# with EHB (bit 3) set, then clears USBSTS.PCD via write-1-to-clear.
+# Sentinel [0x87]=0xDD proves the site executed; FB line surfaces the
+# drained count for empirical correlation with the silent-absorb gate.
+#
+# Safety bound of 64 TRBs prevents runaway loop if the event ring
+# state is corrupted (cycle bit always matching). 64 >> any plausible
+# pre-reset queue depth (Linux typically drains ≤2 events between
+# resets; 64 covers cold-boot + multi-port-power-on cascade).
+fn xhci_drain_port_change_events() {
+    if (xhci_evt_ring_phys == 0) { return 0; }
+    var drained = 0;
+    var safety = 0;
+    while (safety < 64) {
+        var evt_off = xhci_evt_ring_idx * 16;
+        var evt = xhci_evt_ring_phys + evt_off;
+        var evt_dw3 = load32(evt + 12);
+        var evt_cycle = evt_dw3 & 0x1;
+        if (evt_cycle != xhci_evt_ring_cycle) { break; }
+        xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+        if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+            xhci_evt_ring_idx = 0;
+            if (xhci_evt_ring_cycle == 1) {
+                xhci_evt_ring_cycle = 0;
+            } else {
+                xhci_evt_ring_cycle = 1;
+            }
+        }
+        drained = drained + 1;
+        safety = safety + 1;
+    }
+    if (drained > 0) {
+        var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
+        var new_erdp = xhci_evt_ring_phys + xhci_evt_ring_idx * 16;
+        xhci_rt_write64(ir0 + XHCI_IR_ERDP, new_erdp | 0x8);
+    }
+    # Clear USBSTS.PCD (bit 4) — RW1C. Other RW1C bits (HSE bit 2,
+    # EINT bit 3) are left alone; we only acknowledge port-change.
+    xhci_op_write32(XHCI_OP_USBSTS, 0x10);
+    xhci_cmos_stamp(0x87, 0xDD);
+    kprint("xhci: drained ", 14);
+    kprint_num(drained);
+    kprintln(" events", 7);
+    return drained;
 }
 
 # Phase 3 prep: assert PORTSC.PP=1 on every root-hub port so attached
@@ -475,6 +552,13 @@ fn xhci_port_reset(port_num, proto) {
     xhci_cmos_stamp(0x7F, 0xAA);
     var z_t0 = rdtsc();
     while ((rdtsc() - z_t0) < 30000000) { }
+    # Repair (DD) — drain pending Port Status Change events + clear
+    # USBSTS.PCD before the PR write. Z timing delay above ensures any
+    # device-chirp-to-Polling transition has emitted its Port Status
+    # Change event by now; draining it acknowledges the event ring +
+    # lets the controller honor subsequent PORTSC writes (hypothesis:
+    # AMD FCH silent-absorb gate is unacknowledged change events).
+    xhci_drain_port_change_events();
     var psc1 = xhci_portsc_read(port_num);
     # Repair (T) 2026-05-16: Linux-style PR retry. USB-core
     # `hub.c:hub_port_reset` retries the PR write up to 5× before failing;
