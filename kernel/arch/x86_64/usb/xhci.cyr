@@ -534,12 +534,24 @@ fn xhci_start() {
     xhci_rt_write32(ir0 + XHCI_IR_ERSTSZ, 1);
     xhci_rt_write64(ir0 + XHCI_IR_ERSTBA, xhci_erst_phys);
     xhci_rt_write64(ir0 + XHCI_IR_ERDP, xhci_evt_ring_phys);
-    # Leave IMAN.IE = 0 (poll mode); IMOD default is fine for keyboard.
+    # H2 (xHCI 1.2 §5.5.2.1): clear IMAN.IP (Interrupt Pending, bit 0,
+    # RW1C) by writing 1. Any pending bit left over from BIOS/firmware
+    # would inhibit a fresh edge-triggered interrupt assertion later.
+    # IMAN.IE (bit 1) stays 0 — poll mode for MVP.
+    xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x1);
+    # H3 (xHCI 1.2 §5.5.2.2): set IMOD to 0x000003E8 (1000 × 250 ns =
+    # 250 µs interrupt moderation). HW default is 0 (no moderation) —
+    # under MSI/MSI-X this would risk interrupt storms once IMAN.IE goes
+    # to 1. Safe under poll mode; matches Linux's default.
+    xhci_rt_write32(ir0 + XHCI_IR_IMOD, 0x3E8);
 
-    # Run/Stop + interrupter enable. Then wait for HCH=0. Spec gives no
-    # bound but contemporary controllers transition within microseconds.
+    # Run/Stop + interrupter enable + HSEE. Then wait for HCH=0. Spec
+    # gives no bound but contemporary controllers transition within µs.
+    # H4 (xHCI 1.2 §5.4.1.4): set USBCMD.HSEE (bit 3) so any Host System
+    # Error sets USBSTS.HSE *and* asserts the interrupter; without HSEE
+    # an HSE goes unreported. Mask becomes R/S | INTE | HSEE = 0x0D.
     var usbcmd = xhci_op_read32(XHCI_OP_USBCMD);
-    xhci_op_write32(XHCI_OP_USBCMD, usbcmd | 0x05);
+    xhci_op_write32(XHCI_OP_USBCMD, usbcmd | 0x0D);
 
     var wait = 0;
     while (wait < 1000000) {

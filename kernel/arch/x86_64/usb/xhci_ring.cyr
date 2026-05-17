@@ -101,6 +101,19 @@ fn xhci_rings_init() {
     # xhci-mem.c is the canonical reference. xhci_max_scratchpad is
     # populated by xhci_probe via HCSPARAMS2 read.
     if (xhci_max_scratchpad > 0) {
+        # H1 (xHCI 1.2 §5.4.3): validate PAGESIZE advertises 4 KB before
+        # allocating page-sized scratchpad buffers. PAGESIZE op-reg is a
+        # bitmask of supported page sizes; bit 0 = 4 KB (PAGESIZE = 1).
+        # All contemporary x86_64 silicon advertises 4 KB; bail if not
+        # rather than silently mis-sizing scratchpad to a controller that
+        # requires larger pages.
+        var pagesize = xhci_op_read32(XHCI_OP_PAGESIZE);
+        if ((pagesize & 0x1) == 0) {
+            kprint("xhci: PAGESIZE rejects 4KB, bitmap=", 35);
+            kprint_num(pagesize);
+            kprintln("", 0);
+            return 0;
+        }
         # Allocate the pointer array (1 page = 512 u64 entries, plenty
         # for any realistic MaxScratchpadBufs which tops out at 1023).
         var sp_array = pmm_alloc();
