@@ -135,10 +135,12 @@ fn xhci_rings_init() {
         kprint_num(sp_array);
         kprintln("", 0);
 
-        # CMOS[0x83] — scratchpad array phys low byte. Non-zero proves
-        # the install took (alloc succeeded + store64 wrote). Pair with
-        # [0x80] (count > 0) for the unblock-verdict matrix.
-        xhci_cmos_stamp(0x83, sp_array & 0xFF);
+        # CMOS[0x83] — scratchpad array phys byte 2 (bits 23:16).
+        # Page-aligned phys is structurally `& 0xFF == 0` (4 KB alignment),
+        # so the original Attempt 50 capture was always 0x00 — Row 1/Row 4
+        # distinction in the prep matrix was broken. Byte 2 is non-zero
+        # for any phys >= 64 KB (always true post-kernel-init on x86_64).
+        xhci_cmos_stamp(0x83, (sp_array >> 16) & 0xFF);
     } else {
         # MaxScratchpadBufs = 0 — some silicon doesn't need scratchpad.
         # DCBAA[0] stays zero, which is spec-compliant. Stamp explicit 0

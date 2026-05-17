@@ -239,9 +239,15 @@ fn xhci_probe() {
     #   [0x80] = MaxScratchpadBufs (low byte; full value if < 256)
     #   [0x81] = 0xAA sentinel — proves [0x80] is trustworthy
     #   [0x82] = HCSPARAMS2 byte 3 (raw bits 31:24) for cross-check
+    #   [0x85] = HCSPARAMS2 byte 2 (raw bits 23:16) — 1.30.4 audit add-on
+    #            to disambiguate the Attempt 50 [0x80]=53 vs [0x82]=0
+    #            inconsistency (math says count <= 7 with [0x82]=0; FB
+    #            rendered count=53; either CMOS-capture / Cyrius-shift
+    #            issue or hcsp2 has bits we didn't observe).
     xhci_cmos_stamp(0x80, xhci_max_scratchpad & 0xFF);
     xhci_cmos_stamp(0x81, 0xAA);
     xhci_cmos_stamp(0x82, (hcsp2 >> 24) & 0xFF);
+    xhci_cmos_stamp(0x85, (hcsp2 >> 16) & 0xFF);
 
     # 7b. Repair (V) — MTRR/PAT MMIO cache-attribute diagnostic.
     # F5 hypothesis: with PS=1 2MB-page PDEs (flag 0x83 = P|W|PS), the
@@ -441,6 +447,21 @@ fn xhci_init() {
         kprintln("xhci: CNR never cleared", 23);
         return 0;
     }
+
+    # Repair (BB) 2026-05-17 — Device Notification Control (xHCI 1.2 §5.4.4).
+    # XHCI_OP_DNCTRL (offset 0x14) is the notification-enable register; bit 1
+    # = N1 (Function Wake). Linux's xhci_set_dev_notifications writes
+    # DEV_NOTE_FWAKE = 0x02 during xhci_init unconditionally — AGNOS defined
+    # the register at xhci_regs.cyr:70 but never wrote it across 50 iron
+    # attempts. Default = 0 disables every notification class. Hypothesis:
+    # some port-link-state transitions on AMD Renoir/Cezanne (1022:1639)
+    # are gated on notification handling being enabled. Same shape as
+    # Repair (AA) — register documented but write step skipped. Stamp
+    # sentinel [0x84]=0xBB at the write site so post-mortem proves the
+    # site executed even if kybernet later overwrites kcp.
+    xhci_op_write32(XHCI_OP_DNCTRL, 0x02);
+    xhci_cmos_stamp(0x84, 0xBB);
+    kprintln("xhci: dev_notifications enabled", 31);
 
     xhci_halted = 1;
     kprintln("xhci: halted, reset clean", 25);
@@ -751,18 +772,12 @@ fn xhci_enumerate_port(port_num) {
     var dctx = xhci_alloc_device_ctx();
     if (dctx == 0) { return 0; }
 
-    # Allocate EP0 transfer ring (one page). The MPS-vs-speed default
-    # is filled into the input ctx by xhci_alloc_input_ctx; we set up
-    # the slot tracking arrays now so xhci_ep0_enqueue can find them.
-    var xfer = pmm_alloc();
-    if (xfer == 0) { kprintln("xhci: ep0 xfer alloc failed", 27); return 0; }
-    if (vmm_is_mapped(xfer) == 0) { vmm_map(xfer, xfer, 0x83); }
-    iommu_register_dma(xfer);
-    xhci_zero_page(xfer);
-
-    # Update the EP0 context's TR Dequeue Pointer in the input ctx to
-    # the actual xfer ring address. xhci_alloc_input_ctx stored a stub.
-    store64(ictx + 0x88, xfer | 0x1);
+    # Extract the EP0 xfer ring phys from the input ctx — xhci_alloc_input_ctx
+    # already allocated it and wrote it into the EP0 context's TR Dequeue
+    # Pointer at offset 0x88 (with DCS=1 in bit 0). The 1.30.4 audit found
+    # we were allocating a second page here and overwriting the alloc'd
+    # one, leaking page A. Mask off bit 0 (DCS) to recover bare phys.
+    var xfer = load64(ictx + 0x88) & 0xFFFFFFFFFFFFFFFE;
 
     xhci_slot_set(xhci_slot_input_ctx,    slot_id, ictx);
     xhci_slot_set(xhci_slot_dev_ctx,      slot_id, dctx);

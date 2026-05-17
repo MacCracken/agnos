@@ -3,7 +3,103 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [Unreleased] — 1.30.4 (staging)
+
+**xHCI Phase 3 silent-absorb arc continues — Repair (BB) Device Notification
+Control + audit-driven follow-ups (stamp redesigns, double xfer-ring leak)
++ Phase 4/5 development lanes opening in parallel.** Attempt 50 burn
+(2026-05-17) confirmed Repair (AA) scratchpad install ran cleanly per FB
+(`scratchpad ready` + `controller running`) but silent-absorb on USB2
+ports 1+3 survived → AA falsified, tenth hypothesis in the arc. Same-session
+audit of `agnos/kernel/arch/x86_64/usb/` (TODO / stub / silent-success
+patterns) surfaced **DNCTRL (op_reg 0x14) defined at `xhci_regs.cyr:70` but
+never written** — exact AA precedent (constant known, write step skipped).
+WebFetch of Linux `drivers/usb/host/xhci.c` confirmed `xhci_set_dev_notifications`
+writes `DEV_NOTE_FWAKE = 0x02` to op_regs+0x14 during `xhci_init()`
+unconditionally before R/S=1. Hypothesis: some USB2 port-link-state
+transitions on AMD Renoir/Cezanne (1022:1639) are gated on notification
+handling being enabled. Audit also found a real but post-Phase-3 memory
+leak (double xfer-ring allocation in `xhci_enumerate_port`) and two CMOS
+stamp design flaws from Attempt 50 (`[0x83]` captures page-aligned phys
+low byte = always 0x00; `[0x80]=53` vs `[0x82]=0` inconsistency from
+unobserved hcsp2 byte 2). **Decoupling decision holds**: iron-burn cadence
+stays batched; Phase 4 (Configure Endpoint + SET_PROTOCOL=boot) + Phase 5
+(HID translation + `kb_buf` feed) develop in parallel against AGNOS Phase
+1-3 infrastructure regardless of BB iron outcome. 1.30.4 cycle is
+**open-ended** — staging area for BB validation + Phase 4/5 code surface
++ any follow-up Linux-diff hypotheses if BB falsifies.
+
+### Added
+
+- **Repair (BB) Device Notification Control write** (`kernel/arch/x86_64/usb/xhci.cyr`).
+  ~3 LOC in `xhci_init()` after the CNR-clear wait, before `xhci_halted`
+  flip: `xhci_op_write32(XHCI_OP_DNCTRL, 0x02)` enables N1 Function Wake
+  notifications per xHCI 1.2 §5.4.4. Stamp sentinel `CMOS[0x84]=0xBB`
+  proves the site executed (survives kybernet kcp overwrite). FB line
+  `xhci: dev_notifications enabled` between `CNR never cleared` guard
+  and `halted, reset clean`. Hypothesis under test: same-shape Linux-diff
+  to AA (register defined, write step missing) — eleventh in the
+  silent-absorb arc.
+- **CMOS [0x85] HCSPARAMS2 byte 2 cross-check stamp** (`kernel/arch/x86_64/usb/xhci.cyr`).
+  Captures `(hcsp2 >> 16) & 0xFF` alongside the existing `[0x82]` byte-3
+  stamp. Disambiguates Attempt 50's `[0x80]=53` vs `[0x82]=0x00`
+  mathematical impossibility (per AGNOS decode `(bits 25:21 << 5) | bits
+  31:27` with `[0x82]=0` constraining count ≤ 7). Either the actual
+  hcsp2 has bits in byte 2 we didn't observe, or there's a Cyrius
+  shift-emit / CMOS-capture divergence worth surfacing.
+
+### Changed
+
+- **CMOS [0x83] stamp redesign** (`kernel/arch/x86_64/usb/xhci_ring.cyr`).
+  Now captures `(sp_array >> 16) & 0xFF` instead of `sp_array & 0xFF`.
+  Page-aligned phys is structurally `& 0xFF == 0` (4 KB alignment),
+  which made the original Attempt 50 outcome matrix's Row 1 vs Row 4
+  distinction broken (`[0x83]==0` was supposed to mean alloc-failed but
+  ran also on success). Byte 2 is non-zero for any phys ≥ 64 KB
+  (universally true post-kernel-init on x86_64). FB still the primary
+  load-bearing channel.
+- **Double xfer-ring allocation in `xhci_enumerate_port` removed**
+  (`kernel/arch/x86_64/usb/xhci.cyr`). `xhci_alloc_input_ctx` at
+  `xhci_ctx.cyr:152` already allocates the EP0 transfer ring page and
+  stores its phys (with DCS bit) at `ictx+0x88`. The prior code at
+  `xhci.cyr:757-765` allocated a *second* page and overwrote the field,
+  leaking page A. Replaced with `load64(ictx + 0x88) & ~1` to extract
+  the existing phys. Stale `"xhci_alloc_input_ctx stored a stub"`
+  comment removed in same change — it was misleading; the field was a
+  real phys, not a stub.
+
+### Pending validation
+
+- **Attempt 51 iron burn** — flash post-BB binary, attach Keychron K2 to
+  port 1 or port 3, boot, photograph FB block between `xhci: USBLEGSUP
+  already OS-owned` and `VFS initialized`, then `sudo
+  ./scripts/read-boot-log.sh`. Truth channels in order: (1) FB
+  primary — does `xhci: port N connected, …` line surface? (2)
+  `CMOS[0x84]=0xBB` confirms BB site executed; (3) `CMOS[0x64]`
+  reset-OK bitmap — the binary unblock indicator; (4) `CMOS[0x85]`
+  HCSPARAMS2 byte 2 + `CMOS[0x83]` redesigned scratchpad phys byte 2.
+  Outcome matrix in `iron-nuc-zen-log.md` § Attempt 51 prep.
+- **Phase 4 code surface (Configure Endpoint + SET_PROTOCOL=boot)** —
+  per `agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`
+  § Phase 4. Develops against the Phase 1-3 infrastructure regardless
+  of BB outcome.
+- **Phase 5 code surface (HID-boot translation + `kb_buf` feed)** — per
+  same planning doc § Phase 5. Closes typeable-shell gate when both
+  Phase 4 and the silent-absorb unblock land.
+
+### Notes
+
+- 1.30.4 is **intentionally open-ended** — the cycle stays in staging
+  until either (a) BB unblocks reset + Phase 4/5 ship typeable shell, or
+  (b) BB falsifies and the next Linux-diff hypothesis lands. Phase 4/5
+  code may merge incrementally; tag cuts when the cycle reaches a
+  coherent ship state.
+- **Audit precedent (AA → BB)**: two consecutive cycles where a
+  register/operation defined in headers but never invoked turned out
+  to be the silent-absorb gate. Future Phase 3+ work should grep
+  `xhci_regs.cyr` constants against `xhci_*_write32` / `xhci_op_write*`
+  call sites systematically; the AA + BB findings are likely not the
+  last.
 
 ## [1.30.3] — 2026-05-17
 
