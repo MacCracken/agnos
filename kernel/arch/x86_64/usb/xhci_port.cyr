@@ -138,6 +138,23 @@ fn xhci_xecp_classify_ports() {
     # not summing to the known IDs.
     var first_unclassified  = 0;
     var second_unclassified = 0;
+    # Repair (b') 2026-05-17 — per-cap fingerprint capture for the 2nd
+    # and 3rd SupProto caps. Attempt 47 ([0x7A]=0x22) surfaced THREE
+    # SupProto caps on this AMD FCH; the existing first_rev/first_pcount
+    # only fingerprints the 1st. The per-port tagging loop already runs
+    # for every SupProto (so xhci_port_proto[] is populated correctly),
+    # but per-cap rev_major / port_off / port_count for the 2nd and 3rd
+    # caps was previously dropped on the floor. Stamps land in virgin
+    # CMOS [0x7B]/[0x7C] (2nd) and [0x7D]/[0x7E] (3rd). port_count packs
+    # into a nibble (≤ 4 in this controller); port_off uses full byte.
+    var second_supproto = 0;
+    var second_rev      = 0;
+    var second_pcount   = 0;
+    var second_poff     = 0;
+    var third_supproto  = 0;
+    var third_rev       = 0;
+    var third_pcount    = 0;
+    var third_poff      = 0;
 
     var cap_off = xhci_xecp * 4;        # First cap, in bytes from MMIO base
     var safety = 0;
@@ -148,6 +165,10 @@ fn xhci_xecp_classify_ports() {
             xhci_cmos_stamp(0x69, cap_id_bitmap & 0xFF);
             xhci_cmos_stamp(0x6A, ((first_rev & 0xF) << 4) | (first_pcount & 0xF));
             xhci_cmos_stamp(0x7A, ((first_unclassified & 0xF) << 4) | (second_unclassified & 0xF));
+            xhci_cmos_stamp(0x7B, ((second_rev & 0xF) << 4) | (second_pcount & 0xF));
+            xhci_cmos_stamp(0x7C, second_poff & 0xFF);
+            xhci_cmos_stamp(0x7D, ((third_rev & 0xF) << 4) | (third_pcount & 0xF));
+            xhci_cmos_stamp(0x7E, third_poff & 0xFF);
             return 1;
         }
         safety = safety + 1;
@@ -176,6 +197,20 @@ fn xhci_xecp_classify_ports() {
                 first_supproto = 1;
                 first_rev = rev_major;
                 first_pcount = port_count;
+            } else {
+                if (second_supproto == 0) {
+                    second_supproto = 1;
+                    second_rev = rev_major;
+                    second_pcount = port_count;
+                    second_poff = port_off;
+                } else {
+                    if (third_supproto == 0) {
+                        third_supproto = 1;
+                        third_rev = rev_major;
+                        third_pcount = port_count;
+                        third_poff = port_off;
+                    }
+                }
             }
             var p = port_off;
             while (p < port_off + port_count) {
@@ -211,6 +246,10 @@ fn xhci_xecp_classify_ports() {
     xhci_cmos_stamp(0x69, cap_id_bitmap & 0xFF);
     xhci_cmos_stamp(0x6A, ((first_rev & 0xF) << 4) | (first_pcount & 0xF));
     xhci_cmos_stamp(0x7A, ((first_unclassified & 0xF) << 4) | (second_unclassified & 0xF));
+    xhci_cmos_stamp(0x7B, ((second_rev & 0xF) << 4) | (second_pcount & 0xF));
+    xhci_cmos_stamp(0x7C, second_poff & 0xFF);
+    xhci_cmos_stamp(0x7D, ((third_rev & 0xF) << 4) | (third_pcount & 0xF));
+    xhci_cmos_stamp(0x7E, third_poff & 0xFF);
     return 1;
 }
 
