@@ -253,6 +253,39 @@ fn xhci_xecp_classify_ports() {
     return 1;
 }
 
+# Zero the USBLEGCTLSTS SMI-source enables and W1C the SMI-status bits
+# at USBLEGSUP cap offset +0x04 (xHCI 1.2 §7.1.2). Without this, BIOS may
+# leave USB-related SMIs armed (SMI on USB IRQ / SMI on HSE / SMI on PCI
+# command / SMI on BAR / SMI on Ownership Change). Each fires SMM, which
+# preempts the CPU into firmware land — operational-register writes to
+# xhci can be paused, mis-ordered, or absorbed depending on what the SMM
+# handler touches. Linux's xhci-pci `quirk_usb_handoff_xhci` does this
+# right after the USBLEGSUP ownership flip; AGNOS Phase 2.5 was missing
+# the step.
+#
+# Layout (xHCI 1.2 Table 7-2):
+#   bits 0-4   reserved
+#   bits 5-12  SMI enables (USB SMI / HSE / PCI cmd / BAR / OS-owner / etc.)
+#   bits 13-15 reserved
+#   bits 16-19 USB SMI status (RW1C)
+#   bits 20-28 SMI status (RW1C — Host System Error / PCI Cmd / BAR / etc.)
+#   bits 29-31 reserved
+# Mask choices match Linux's `XHCI_LEGACY_DISABLE_SMI`: clear enables
+# (bits 5-12) AND clear status (bits 16-19 + 20-28 RW1C). Final write
+# uses w1c semantics — zeroing the enables and writing 1s to status bits
+# clears them in a single write.
+fn xhci_usblegctlsts_disable_smi(cap_off) {
+    var ctlsts_off = cap_off + 4;
+    var ctlsts = load32(xhci_mmio_base + ctlsts_off);
+    # Clear SMI enables (bits 5-12); leave reserved bits as-read; W1C the
+    # SMI status bits (16-28) by writing them back as 1s. Final pattern:
+    #   mask off 0x000001E0 | 0x00001E00 = bits 5-12 enables
+    #   OR  in  0x1FFF0000 to W1C bits 16-28 status
+    var cleared = (ctlsts & 0xFFFFE01F) | 0x1FFF0000;
+    store32(xhci_mmio_base + ctlsts_off, cleared);
+    return 0;
+}
+
 # Phase 2.5 — claim the controller from BIOS via the USBLEGSUP extended
 # cap. xHCI 1.2 §4.22.1: BIOS owns the controller post-POST until SW
 # writes HC OS Owned (bit 24) and observes HC BIOS Owned (bit 16) clear.
@@ -293,6 +326,7 @@ fn xhci_usblegsup_claim() {
             if ((legsup & 0x10000) == 0) {
                 kprintln("xhci: USBLEGSUP already OS-owned", 32);
                 xhci_cmos_stamp(0x62, 1);   # outcome enum: 1 = already-OS-owned
+                xhci_usblegctlsts_disable_smi(cap_off);
                 return 1;
             }
             # Poll until BIOS-Owned (bit 16) clears. Spec recommends
@@ -304,12 +338,17 @@ fn xhci_usblegsup_claim() {
                 if ((ls2 & 0x10000) == 0) {
                     kprintln("xhci: USBLEGSUP claimed from BIOS", 33);
                     xhci_cmos_stamp(0x62, 2);   # outcome enum: 2 = claimed-from-BIOS
+                    xhci_usblegctlsts_disable_smi(cap_off);
                     return 1;
                 }
                 wait = wait + 1;
             }
             kprintln("xhci: USBLEGSUP BIOS held (timeout)", 35);
             xhci_cmos_stamp(0x62, 3);   # outcome enum: 3 = BIOS-held-timeout
+            # Even on BIOS-held timeout, clear SMI enables — the SMI
+            # control register is OS-writable independent of the
+            # ownership semaphore per xHCI 1.2 §7.1.2.
+            xhci_usblegctlsts_disable_smi(cap_off);
             return 0;
         }
 
@@ -417,6 +456,25 @@ fn xhci_port_reset(port_num, proto) {
     }
     # R2 retained: CSC pre-clear, then re-read. Repair (S): neutralize.
     xhci_portsc_write(port_num, psc0 & XHCI_PORTSC_NEUTRAL, 0x20000);
+    # Repair (Z) 2026-05-17 — AMD-FCH PR-write timing delay. SeaBIOS
+    # `xhci_hub_reset` empirically waits ~10 ms between port-state
+    # setup operations on AMD FCH silicon; AGNOS Attempts 32-48 ladder
+    # eliminated cache-attribute (F5/X/V''), aliased mapping (a/V''),
+    # spec-visible controller gate (b/W — USBSTS/USBCMD spec-clean),
+    # and multi-SupProto routing (b'/Attempt 48 — extra SupProto caps
+    # cover USB3 ports 5/6, NOT the failing USB2 ports 1+3). Z is the
+    # last behavioral hypothesis in the silent-absorb trio.
+    #
+    # Sentinel stamp [0x7F]=0xAA proves the site executed (survives
+    # future edits / DCE / build-mismatch). Last-write-wins is fine —
+    # non-zero at [0x7F] = Z ran at least once across all 6 ports.
+    #
+    # Wait ≈ 10 ms via rdtsc spin. 30M cycles = 10 ms at 3 GHz (Zen
+    # TSC baseline); range across 2-4 GHz = 7.5-15 ms, all within
+    # SeaBIOS's target band.
+    xhci_cmos_stamp(0x7F, 0xAA);
+    var z_t0 = rdtsc();
+    while ((rdtsc() - z_t0) < 30000000) { }
     var psc1 = xhci_portsc_read(port_num);
     # Repair (T) 2026-05-16: Linux-style PR retry. USB-core
     # `hub.c:hub_port_reset` retries the PR write up to 5× before failing;

@@ -96,6 +96,98 @@ fn pci_enable_bus_master_idx(idx) {
     return 0;
 }
 
+# Walk the standard PCI capability list for the device at pci_devs[idx]
+# and return the config-space offset of the first capability whose ID
+# matches `cap_id`. Returns 0 if not found. PCI 3.0 §6.7: cap list head
+# is at config offset 0x34 (1 byte), cap chain links via `next` byte at
+# cap+0x01. Loop safety bound is 48 caps (spec max is ~32, plus pad).
+#
+# Differs from the xHCI xECP chain (which lives in MMIO, not config space)
+# — this is the standard PCI cap list for MSI/MSI-X/PM/PCIe/AER etc.
+fn pci_find_cap(idx, cap_id) {
+    var slot = PciDev_slot(&pci_devs + idx * 32);
+    var bf = load64(&pci_busfunc + idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    # Status register (bits 16-31 of config dword 0x04). Bit 4 = Capabilities List.
+    var sts_cmd = pci_read32(bus, slot, func, 4);
+    if (((sts_cmd >> 16) & 0x10) == 0) {
+        return 0;
+    }
+    # Cap pointer at config offset 0x34 (byte). Mask off the bottom 2
+    # bits per spec (caps are dword-aligned).
+    var cap_ptr_dw = pci_read32(bus, slot, func, 0x34);
+    var off = cap_ptr_dw & 0xFC;
+    var safety = 0;
+    while (off != 0) {
+        if (safety > 48) { return 0; }
+        safety = safety + 1;
+        # Capability header dword:
+        #   bits 0-7  = cap ID
+        #   bits 8-15 = next ptr (0 = end)
+        #   bits 16-31 = cap-specific message control / data
+        var hdr = pci_read32(bus, slot, func, off);
+        if ((hdr & 0xFF) == cap_id) {
+            return off;
+        }
+        off = (hdr >> 8) & 0xFC;
+    }
+    return 0;
+}
+
+# Enable MSI-X on the device at pci_devs[idx] with all table entries
+# masked (Function Mask bit). The controller sees "MSI-X configured"
+# in its config space — required by some xHCI silicon (per Linux
+# xhci_setup_msix unconditional probe) to honor operational-register
+# state-machine progress, even when the OS polls instead of routing
+# interrupts. We don't populate the MSI-X table because no IDT vector
+# is wired; Function Mask bit (control reg bit 14) gates all entries.
+#
+# MSI-X cap layout (PCI 3.0 §6.8.2 / PCIe 4.0 §7.7.2):
+#   dword 0: [cap_id:8=0x11][next:8][control:16]
+#     control bit 15 = MSI-X Enable
+#     control bit 14 = Function Mask (mask all entries)
+#     control bits 10:0 = Table Size - 1
+# Within the 32-bit pci_read32/pci_write32 view, bits 16-31 of the dword
+# ARE the control reg — so MSI-X Enable = dword bit 31, Function Mask =
+# dword bit 30.
+#
+# Falls back to MSI cap (0x05) if MSI-X not advertised. MSI control reg
+# is at cap+0x00 bits 16-31 (same dword layout); Enable bit = control
+# reg bit 0 = dword bit 16.
+#
+# Returns 1 if MSI-X enabled, 2 if MSI enabled, 0 if neither advertised.
+fn pci_enable_msix_masked(idx) {
+    var slot = PciDev_slot(&pci_devs + idx * 32);
+    var bf = load64(&pci_busfunc + idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    var msix_off = pci_find_cap(idx, 0x11);
+    if (msix_off != 0) {
+        var hdr = pci_read32(bus, slot, func, msix_off);
+        # Set Enable (bit 31) and Function Mask (bit 30) in the control
+        # reg portion of the dword. Preserve bits 16-29 (table size +
+        # reserved); preserve bits 0-15 (cap_id + next_ptr).
+        var newhdr = hdr | 0xC0000000;
+        pci_write32(bus, slot, func, msix_off, newhdr);
+        return 1;
+    }
+    var msi_off = pci_find_cap(idx, 0x05);
+    if (msi_off != 0) {
+        var hdr = pci_read32(bus, slot, func, msi_off);
+        # MSI Enable = control reg bit 0 = dword bit 16. No function-mask
+        # equivalent for legacy MSI; we leave Multiple Message Enable
+        # at 0 (1 vector) and skip address/data programming since we
+        # don't route the IRQ. Some silicon will assert MSI even
+        # unrouted — INTE in USBCMD is separately gated, so even if a
+        # spurious MSI fires, no IDT vector is dispatched.
+        var newhdr = hdr | 0x00010000;
+        pci_write32(bus, slot, func, msi_off, newhdr);
+        return 2;
+    }
+    return 0;
+}
+
 # Capture one (bus, slot, func) device into pci_devs[pci_count].
 # Returns 1 if a real device was recorded, 0 if absent or table full.
 # Factored out of pci_scan() so the multi-bus / multifunction loop reads
