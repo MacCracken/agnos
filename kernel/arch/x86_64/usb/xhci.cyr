@@ -229,6 +229,36 @@ fn xhci_probe() {
     }
     xhci_cmos_stamp(0x73, load64(pde_addr) & 0xFF);
 
+    # 7d. Repair (V'') — full PML4→PDPT→PD walk for the BAR virtual address.
+    # F5 (BAR cache attribute) was confirmed by Attempt 43 (PA0=WB) and the
+    # UC remap was confirmed landed by Attempt 45 X' (CMOS[0x73]=0x9B = PA3=UC),
+    # yet the silent-absorb survived. Hypothesis (a): some OTHER mapping of
+    # the same physical BAR is still WB through a different page-table path,
+    # and the controller is coherent on physical address. The X' shortcut at
+    # 7c reads the PDE via vmm_remap_uc_2mb's address split (0x3000-based for
+    # mmio<1GB, post-shatter new_pd for mmio>=1GB). The four-level walk here
+    # starts from PML4@0x1000 and follows the actual translation chain — if
+    # PDPTE has the PS bit set, the BAR is mapped by a 1GB huge page and the
+    # shatter never ran (write 0xFF sentinel to [0x76]). Divergence between
+    # [0x73] (X' shortcut) and [0x76] (V'' walk) localizes the aliasing.
+    # Pure read-only diagnostic; controller behavior unchanged.
+    var pml4_addr = 0x1000 + ((mmio >> 39) & 0x1FF) * 8;
+    var pml4e     = load64(pml4_addr);
+    xhci_cmos_stamp(0x74, pml4e & 0xFF);
+
+    var pdpt_base = pml4e & 0xFFFFFFFFFFFFF000;
+    var pdpt_addr = pdpt_base + ((mmio >> 30) & 0x1FF) * 8;
+    var pdpte     = load64(pdpt_addr);
+    xhci_cmos_stamp(0x75, pdpte & 0xFF);
+
+    if ((pdpte & 0x80) != 0) {
+        xhci_cmos_stamp(0x76, 0xFF);
+    } else {
+        var pd_base = pdpte & 0xFFFFFFFFFFFFF000;
+        var pd_addr = pd_base + ((mmio >> 21) & 0x1FF) * 8;
+        xhci_cmos_stamp(0x76, load64(pd_addr) & 0xFF);
+    }
+
     # 8. CMOS kernel checkpoint 0x30 (xhci probe complete). Readable
     # post-mortem via `agnosticos/scripts/read-boot-log.sh`. Matches the
     # CMOS-checkpoint convention from `core/main.cyr` — 8-byte raw asm
