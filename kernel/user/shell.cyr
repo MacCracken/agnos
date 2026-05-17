@@ -338,7 +338,7 @@ fn sh_exec(buf, len) {
 }
 
 fn shell() {
-    kprintln(_AGNOS_SHELL_BANNER, _AGNOS_SHELL_BANNER_LEN);
+    print_agnos_shell_banner();
     var sh_running = 1;
     while (sh_running == 1) {
         kprint("agnos> ", 7);

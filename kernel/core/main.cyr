@@ -5,7 +5,7 @@
 # any subsystem is up.
 fb_console_init();
 
-kprintln(_AGNOS_KERNEL_BANNER, _AGNOS_KERNEL_BANNER_LEN);
+print_agnos_kernel_banner();
 kprintln("64-bit long mode", 16);
 
 # Per-stage CMOS stamps survive hangs and are decoded by

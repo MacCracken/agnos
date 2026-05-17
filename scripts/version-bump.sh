@@ -81,21 +81,39 @@ if [ -f "$ROOT/kernel/version.cyr" ] || [ -f "$ROOT/kernel/agnos.cyr" ]; then
 # kernel/arch/aarch64/main.cyr). \`version-bump.sh\` had a sed regex
 # per site that re-computed the byte length each bump; any new
 # banner would silently miss the bump until CI caught the mismatch.
-# Pattern mirrors cyrius's \`src/version_str.cyr\` — centralising the
-# strings here means version-bump.sh writes ONE file every time and
-# the sources just reference these vars. No regex hunting; no drift;
-# no length-recount; new banners auto-bump by adding to this file.
+#
+# Design note (v1.30.2 second take): banners are wrapped in **functions**,
+# not stored in \`var BANNER = "…"\` globals. Cyrius kmode==1 emit order
+# is PARSE_PROG before EMIT_GVAR_INITS — the kernel program body runs
+# BEFORE gvar initializers in execution order, so a \`kprintln(BANNER,
+# LEN)\` from main.cyr's top-level body would read uninitialized memory
+# (empty banner; CI's \`grep -aq "AGNOS kernel v"\` would fail). Function
+# bodies bake the literal's rodata pointer into the compiled \`mov\`
+# instruction at compile time, so they work regardless of init order.
+# Cyrius's own \`src/version_str.cyr\` uses \`var\` globals successfully
+# because cyrius is a userland program — standard ELF startup runs
+# initializers before main. AGNOS kernel inverts that order.
 
-var _AGNOS_VERSION                   = "$NEW";
+#ifdef ARCH_X86_64
+fn print_agnos_kernel_banner() {
+    kprintln("$KSTR", $KLEN);
+}
+#endif
 
-var _AGNOS_KERNEL_BANNER             = "$KSTR";
-var _AGNOS_KERNEL_BANNER_LEN         = $KLEN;
+#ifdef ARCH_AARCH64
+fn print_agnos_kernel_banner() {
+    serial_println("$ASTR", $ALEN);
+}
+#endif
 
-var _AGNOS_SHELL_BANNER              = "$SSTR";
-var _AGNOS_SHELL_BANNER_LEN          = $SLEN;
+fn print_agnos_shell_banner() {
+    kprintln("$SSTR", $SLEN);
+}
 
-var _AGNOS_KERNEL_AARCH64_BANNER     = "$ASTR";
-var _AGNOS_KERNEL_AARCH64_BANNER_LEN = $ALEN;
+# Bare version string — safe to use from any consumer that runs AFTER
+# gvar init has completed (kybernet, userspace, etc.). NOT safe to use
+# from the kernel program body (same kmode init-order constraint above).
+var _AGNOS_VERSION = "$NEW";
 EOF
     updated="$updated  kernel/version.cyr (regenerated)\n"
 fi

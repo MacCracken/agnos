@@ -26,17 +26,40 @@ on the S-only stack; 1.30.2 supersedes it directly.
   hardcoded byte length, and `version-bump.sh` ran a sed regex per
   site that re-computed each length on every bump. Adding a new
   banner anywhere meant teaching the script about it; missing that
-  edit got caught by CI's `grep -q "$VERSION" kernel/*.cyr` only
-  after a release was cut. New `kernel/version.cyr` (auto-generated,
-  mirrors cyrius's `src/version_str.cyr` pattern) holds paired
-  `_AGNOS_*_BANNER` + `_AGNOS_*_BANNER_LEN` vars plus a bare
-  `_AGNOS_VERSION` constant; `kernel/agnos.cyr` includes it once at
-  the top so every consumer resolves the same strings. The three
-  banner sites now reference vars instead of literals. New
-  `version-bump.sh` block #4 regenerates `kernel/version.cyr` via a
-  single heredoc — adding a new banner is a one-file edit
-  (`kernel/version.cyr` + the consuming `.cyr`), no script changes
-  required. Build delta: `+256 B` (new var symbols + initializers).
+  edit got caught by CI's `grep -aq "AGNOS kernel v"` only after a
+  release was cut. New `kernel/version.cyr` (auto-generated) wraps
+  the three banners in **functions** (`print_agnos_kernel_banner`,
+  `print_agnos_shell_banner` — aarch64 variant of the kernel banner
+  selected via `#ifdef ARCH_AARCH64`) plus a bare `_AGNOS_VERSION`
+  string var for post-init consumers. `kernel/agnos.cyr` includes
+  `version.cyr` after `core/kprint.cyr` and the arch-specific
+  `serial.cyr` files so the function bodies parse cleanly. The three
+  banner call sites now invoke functions instead of inline
+  literal+length pairs. `version-bump.sh` block #4 regenerates
+  `kernel/version.cyr` via a single heredoc; adding a new banner is
+  a one-file edit (`kernel/version.cyr` + the consuming `.cyr`), no
+  script changes required. Build delta: `+160 B` (343,752 →
+  344,520) for the three function wrappers + `_AGNOS_VERSION` slot.
+
+  **Why functions, not vars** (first-take regression caught by
+  CI's boot-banner grep): Cyrius's `src/version_str.cyr` uses `var`
+  globals successfully because cyrius is a userland program —
+  standard ELF startup runs gvar initializers before main. AGNOS
+  kernel inverts that order: `kmode==1` emit (the freestanding
+  multiboot path) is `PARSE_PROG before EMIT_GVAR_INITS`, so
+  initializers run AFTER the kernel program body in execution order.
+  A `kprintln(_AGNOS_KERNEL_BANNER, _AGNOS_KERNEL_BANNER_LEN)` from
+  `main.cyr`'s top-level body therefore read an uninitialized slot
+  and printed 20 zero bytes — invisible on the framebuffer, but
+  fatal to CI's `grep -aq "AGNOS kernel v"` gate. Function bodies
+  bake the literal's rodata address into the compiled `mov`
+  instruction at parse time, so they work regardless of init order
+  and the var-vs-fn distinction is the cleanest way to draw the
+  userland/kernel line for any future shared-pattern consumer.
+  Smoke-test under `qemu-system-x86_64 -machine q35 -cpu max` with
+  gnoboot v0.2.0 + OVMF confirms both banners ("AGNOS kernel v1.30.2"
+  + "AGNOS shell v1.30.2 (type 'help')") render and shell reaches
+  the `agnos>` prompt.
 
 ### Fixed
 
