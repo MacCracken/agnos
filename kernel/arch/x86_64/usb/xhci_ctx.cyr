@@ -245,7 +245,7 @@ fn xhci_interrupt_interval(b_interval, speed) {
 # TRBs filled in by xhci_kbd_arm_xfer_ring). xfer_ring_phys must be
 # 16-byte aligned (page-aligned satisfies); DCS=1 in the bottom bit.
 fn xhci_input_ctx_add_interrupt_in(ictx_phys, ep_addr, mps,
-    b_interval, speed, xfer_ring_phys) {
+b_interval, speed, xfer_ring_phys) {
     var dci = xhci_dci_for_ep(ep_addr);
     if (dci < 2) { return 0; }     # EP0 handled by xhci_alloc_input_ctx
 

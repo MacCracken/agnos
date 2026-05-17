@@ -186,7 +186,7 @@ fn hid_kbd_configure(slot_id) {
     var interval_byte = 0;
     store16(&mps_buf, 0);
     if (xhci_find_hid_boot_kbd_endpoint(total_len,
-        &intf_num, &ep_addr, &mps_buf, &interval_byte) == 0) {
+    &intf_num, &ep_addr, &mps_buf, &interval_byte) == 0) {
         kprintln("hid: no HID-boot-kbd interface in config", 40);
         return 0;
     }
@@ -233,7 +233,7 @@ fn hid_kbd_configure(slot_id) {
     if (ictx == 0) { return 0; }
     var speed = xhci_slot_get(xhci_slot_speed, slot_id);
     var dci = xhci_input_ctx_add_interrupt_in(ictx, ep_addr, mps,
-        interval_byte, speed, xfer_ring);
+    interval_byte, speed, xfer_ring);
     if (dci == 0) { return 0; }
 
     # Step 6: Configure Endpoint command. After this returns success the
