@@ -70,7 +70,8 @@ fn xhci_ports_power_on() {
     var p = 1;
     while (p <= xhci_max_ports) {
         var psc = xhci_portsc_read(p);
-        xhci_portsc_write(p, (psc & 0xFF01FFFF) | 0x200, 0);   # PP = bit 9
+        # Repair (S): neutralize via XHCI_PORTSC_NEUTRAL, then OR in PP.
+        xhci_portsc_write(p, (psc & XHCI_PORTSC_NEUTRAL) | 0x200, 0);
         p = p + 1;
     }
     # Debounce — single global wait covers all ports since writes above
@@ -257,17 +258,18 @@ fn xhci_portsc_read(port_num) {
     return load32(xhci_portsc_addr(port_num));
 }
 
-# PORTSC RMW: bits 17:23 = 0x00FE0000 are W1C status-change bits. Writes
-# don't accidentally clear changes the kernel hasn't observed because we
-# only OR in W1C bits the caller explicitly wants to clear (`w1c_clear`)
-# and leave the rest of that field zero.
+# PORTSC RMW — Linux-canonical neutralization pattern (see Repair (S)
+# notes in xhci_regs.cyr). `value` is masked to XHCI_PORTSC_NEUTRAL
+# (RO + RWS bits only) before the OR-in of any new bits at the call
+# site; `w1c_clear` supplies the W1C bits the caller explicitly wants
+# to clear (writing 1 clears, writing 0 preserves — so any change bit
+# not in w1c_clear stays as it was). Bit 1 (PED) is included in the
+# w1c_clear mask because PED is RW1C per xHCI 1.2 §5.4.8 — Linux's
+# XHCI_PORT_RW1CS = (1<<1) | (0x7f<<17) treats it the same as the
+# 17-23 change bits.
 fn xhci_portsc_write(port_num, value, w1c_clear) {
     var addr = xhci_portsc_addr(port_num);
-    # value supplies the non-W1C portion (mask 0xFF01FFFF — everything
-    # except the change bits); w1c_clear supplies exactly the change bits
-    # to clear. Any change bit not in w1c_clear stays as it was (W1C
-    # semantics: writing 0 has no effect).
-    store32(addr, (value & 0xFF01FFFF) | (w1c_clear & 0x00FE0000));
+    store32(addr, (value & XHCI_PORTSC_NEUTRAL) | (w1c_clear & XHCI_PORTSC_W1C));
     return 0;
 }
 
@@ -339,18 +341,24 @@ fn xhci_port_reset(port_num, proto) {
             xhci_cmos_stamp(0x6D, 0xE0 | pls_f);
         }
     }
-    # R2 retained: CSC pre-clear, then re-read.
-    xhci_portsc_write(port_num, psc0 & 0xFF01FFFF, 0x20000);
+    # R2 retained: CSC pre-clear, then re-read. Repair (S): neutralize.
+    xhci_portsc_write(port_num, psc0 & XHCI_PORTSC_NEUTRAL, 0x20000);
     var psc1 = xhci_portsc_read(port_num);
-    # R1 retained: PR=1 + PP=1 defensively.
-    xhci_portsc_write(port_num, (psc1 & 0xFF01FFFF) | 0x10 | 0x200, 0);
+    # Repair (S): Linux-canonical PORTSC write. Neutralize psc1 down
+    # to RO|RWS bits (zeroes LWS, RsvdZ, RW1S, RW1C — the bits AGNOS
+    # previously preserved with 0xFF01FFFF), then OR in PR=1. PP is
+    # preserved through neutralization (bit 9 lives in RWS), so the
+    # defensive `| 0x200` from Repair (R1) is dropped to exactly match
+    # Linux's xhci-hub.c USB_PORT_FEAT_RESET case.
+    xhci_portsc_write(port_num, (psc1 & XHCI_PORTSC_NEUTRAL) | 0x10, 0);
     var wait2 = 0;
     var psc_last = 0;
     while (wait2 < 1000000) {
         var psc = xhci_portsc_read(port_num);
         psc_last = psc;
         if ((psc & 0x200000) != 0) {
-            xhci_portsc_write(port_num, psc & 0xFF01FFFF, 0x200000);
+            # Repair (S): neutralize value, w1c-clear PRC.
+            xhci_portsc_write(port_num, psc & XHCI_PORTSC_NEUTRAL, 0x200000);
             var psc2 = xhci_portsc_read(port_num);
             if ((psc2 & 0x2) != 0) { return 1; }
             xhci_cmos_stamp(0x6C, (psc2 >> 16) & 0xFF);

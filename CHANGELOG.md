@@ -7,6 +7,65 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **xHCI Phase 3 — normalize PORTSC RMW to Linux's
+  `xhci_port_state_to_neutral` mask** (Repair (S),
+  `kernel/arch/x86_64/usb/xhci_regs.cyr`,
+  `kernel/arch/x86_64/usb/xhci_port.cyr`). Attempt 39
+  CMOS post-mortem confirmed Repair (R10)'s PLS gate ran
+  clean (`CMOS[0x6D]=0x07`, Polling — spec-compliant
+  precondition for USB2 `PR=1`) yet the PR write was
+  still absorbed silently (`CMOS[0x6C]=0x00`, no PSC
+  change bits set). Linux-side audit of
+  `drivers/usb/host/xhci-hub.c` identified the canonical
+  PORTSC read-modify-write pattern:
+  `writel(xhci_port_state_to_neutral(read()) | newbit)`
+  where `xhci_port_state_to_neutral(p) = (p & XHCI_PORT_RO) |
+  (p & XHCI_PORT_RWS)` preserves only the read-only and
+  read-write-sticky bits and zeroes everything else (W1C,
+  W1S, LWS, reserved). AGNOS previously used a single
+  mask `0xFF01FFFF` that preserved nine bits Linux
+  explicitly zeroes — most importantly **bit 16 (LWS,
+  Port Link State Write Strobe)**. xHCI 1.2 §5.4.8.3:
+  when LWS=1, any PORTSC write touching the PLS field
+  (which a value-preserve RMW does implicitly) is
+  treated as a strobed PLS update; combining that with
+  `PR=1` in the same write is undefined behavior and on
+  AMD FCH silicon matches the "PR absorbed silently"
+  symptom (CMOS[0x6E]=0xE5 also confirms `PPC=0` on
+  archaemenid — port power is hardwired-on per port and
+  the Repair (Q) PP-assert is structurally a no-op on
+  this silicon, isolating Repair (S) as the load-bearing
+  change). New `XhciPortscMask` enum holds
+  `XHCI_PORTSC_RO` (`0x40003C09`),
+  `XHCI_PORTSC_RWS` (`0x0E00C1E0`),
+  `XHCI_PORTSC_NEUTRAL` (`0x4E00FDE9` = RO|RWS) and
+  `XHCI_PORTSC_W1C` (`0x00FE0002` = PED + change bits
+  17-23, mirroring Linux's `XHCI_PORT_RW1CS`).
+  `xhci_portsc_write` helper, the PP-assert site in
+  `xhci_ports_power_on`, the CSC pre-clear in
+  `xhci_port_reset`, and the PR write itself all rewritten
+  to neutralize through `XHCI_PORTSC_NEUTRAL`; the
+  defensive `| 0x200` Repair (R1) added to the PR write
+  is dropped because PP is preserved through
+  neutralization (bit 9 lives in RWS) — exact byte-for-byte
+  match with the Linux USB_PORT_FEAT_RESET case handler.
+  Iron-test gate: `xhci: port N connected, …` line
+  surfaces between `xhci: PP=1 asserted, bitmap=63` and
+  `VFS initialized`; CMOS[0x64] reset-OK bitmap shows a
+  non-zero bit for the connected port. `build/agnos`
+  342,408 → 343,384 B (+976; R10 PLS gate +
+  R7/R8 ride-along diagnostics + Repair S
+  cumulative across the Attempt 39+40 sequence; pure
+  Repair (S) delta vs immediate-prior R10 build is +64 B).
+  Diagnostic decoder pair refreshed in
+  `agnosticos/scripts/src/read-boot-log.cyr` (cheat-sheet
+  rows for PSCchg=<none> + PLS=Polling now reference
+  Repair (S); HCCP1 PPC bit decoded directly instead of
+  assumed; LWS-preservation hypothesis documented;
+  kcp=0x15 verdict extended to mention the
+  CMOS[0x62-0x6F + 0x60] xhci post-mortem range and
+  queued Repair (T) / Repair (V) fallbacks).
+
 - **xHCI Phase 3 — assert PORTSC.PP=1 before port enumeration**
   (`kernel/arch/x86_64/usb/xhci_port.cyr`,
   `kernel/arch/x86_64/usb/xhci.cyr`). Root cause of the

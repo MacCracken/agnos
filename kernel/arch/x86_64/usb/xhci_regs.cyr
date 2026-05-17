@@ -173,10 +173,20 @@ enum XhciCompletionCode {
 # its own 0x10-byte block (PORTSC + PORTPMSC + PORTLI + PORTHLPMC). Phase
 # 3 only touches PORTSC (the first dword).
 #
-# RW1C-style bits (bits 17-23: CSC PEC WRC OCC PRC PLC CEC) are write-1-
-# to-clear — masking them off when doing read-modify-write is mandatory
-# or we'll accidentally clear status change indicators the kernel hasn't
-# observed yet. Mask: 0x00FE0000.
+# Read-modify-write semantics on PORTSC are non-trivial because the
+# register packs RO, RW, RWS, RW1C, RW1S, and RsvdZ bits in one dword.
+# AGNOS mirrors Linux's `xhci_port_state_to_neutral` pattern (see
+# `drivers/usb/host/xhci-hub.c`): on any RMW, mask the read value down
+# to the RO + RWS bits only, then OR in whatever new bits the caller
+# wants to set. This zeroes:
+#   - RW1C bits (writing 1 clears, writing 0 preserves; the helper
+#     accepts a separate w1c_clear mask for explicit clears),
+#   - RW1S bits (PR, WPR — only set when the caller explicitly ORs
+#     them in),
+#   - LWS (bit 16, "Port Link State Write Strobe" — only set when
+#     writing a new PLS value via a strobed update),
+#   - Reserved bits 2 / 28 / 29 (RsvdZ — spec says write 0).
+# See `XHCI_PORTSC_NEUTRAL` / `XHCI_PORTSC_W1C` below for the masks.
 enum XhciPortReg {
     XHCI_PORT_BASE      = 0x400;    # First port's PORTSC offset
     XHCI_PORT_STRIDE    = 0x10;     # Bytes between adjacent ports
@@ -208,6 +218,25 @@ enum XhciPortReg {
 #   bit 25-27   WCE/WDE/WOE — Wake on Connect/Disconnect/Overcurrent Enable
 #   bit 30      DR     — Device Removable (RO)
 #   bit 31      WPR    — Warm Port Reset (W1S, USB3 only)
+
+# PORTSC RMW masks — mirror Linux's `xhci_port_state_to_neutral`
+# (`drivers/usb/host/xhci-hub.c`). Repair (S) 2026-05-16: AGNOS
+# previously used a single mask `0xFF01FFFF` that preserved everything
+# except the W1C change bits 17-23. That mask kept LWS (bit 16), RsvdZ
+# (bits 2, 28, 29), PED (bit 1), PR (bit 4), CAS (bit 24), and WPR
+# (bit 31) on every write — Linux explicitly zeroes all of those.
+# Preserving LWS is the load-bearing risk: if the controller exposes
+# LWS=1 at PORTSC read time, ORing in PR=1 over a value with LWS set
+# can be interpreted by silicon as a strobed PLS-write *and* a port
+# reset request simultaneously (xHCI 1.2 §5.4.8.3); on AMD FCH this
+# matches the "PR write absorbed silently" symptom seen in Attempt 38
+# (CMOS[0x6C]=0x00, no PSC change bits set at poll-timeout).
+enum XhciPortscMask {
+    XHCI_PORTSC_RO        = 0x40003C09;   # bits {0, 3, 10-13, 30} — CCS|OCA|Speed|DR
+    XHCI_PORTSC_RWS       = 0x0E00C1E0;   # bits {5-9, 14-15, 25-27} — PLS|PP|PIC|WCE/WDE/WOE
+    XHCI_PORTSC_NEUTRAL   = 0x4E00FDE9;   # RO | RWS — preserve mask for any RMW
+    XHCI_PORTSC_W1C       = 0x00FE0002;   # bits {1, 17-23} — PED + change bits (RW1C-writable)
+}
 
 # USB Port Speed encoding (PORTSC bits 13:10 — default values; the xECP
 # Supported Protocol cap can override these via per-protocol PSI tables,
