@@ -1,0 +1,369 @@
+# === HID-boot keyboard — report differ + kb_buf writer ===
+#
+# Phase 5 plumbing: feeds HID boot-protocol reports into the existing
+# `kb_buf` ring that `arch/x86_64/keyboard.cyr`'s `scancode_to_ascii()`
+# consumes. The translation table lives in hid_translate.cyr; this file
+# owns module state, the report differ, and the kb_buf writer.
+#
+# Module state (set by Phase 4 / hid_kbd_init):
+#   hid_kbd_slot_id     — xHCI slot ID for the keyboard (0 = no keyboard)
+#   hid_kbd_interface   — bInterfaceNumber for the HID-boot interface
+#   hid_kbd_ep_addr     — bEndpointAddress for the interrupt-IN endpoint
+#   hid_kbd_ep_mps      — wMaxPacketSize for that endpoint (always 8 for boot)
+#   hid_kbd_ep_interval — bInterval (frames between polls)
+#   hid_kbd_xfer_ring   — phys of the transfer-ring page (allocated Phase 4)
+#   hid_kbd_report_buf  — phys of the static 8-byte report buffer
+#
+# Single-keyboard scope for MVP per planning doc § "Architectural choices".
+# Second keyboard plugged later is ignored — first-wins.
+
+var hid_kbd_slot_id     = 0;
+var hid_kbd_interface   = 0;
+var hid_kbd_ep_addr     = 0;
+var hid_kbd_ep_mps      = 8;
+var hid_kbd_ep_interval = 0;
+var hid_kbd_xfer_ring   = 0;
+var hid_kbd_report_buf  = 0;
+var hid_kbd_xfer_idx    = 0;   # Next TRB slot on kbd ring (0..255)
+var hid_kbd_xfer_cycle  = 1;   # Producer cycle state for kbd ring
+
+# Two 8-byte buffers: current and previous reports. Allocated statically
+# (BSS) rather than from PMM since the DMA buffer is hid_kbd_report_buf
+# (xHCI controller writes into that phys); these two copies are CPU-side
+# scratch for the differ.
+var hid_curr_report[8];
+var hid_prev_report[8];
+
+# Initialize HID layer. Called from main.cyr after xhci_init. Does NOT
+# require a keyboard to be present — keyboard discovery happens later
+# when port enumeration finds a HID-boot-class device (Phase 4).
+fn hid_kbd_init() {
+    hid_translate_init();
+    for (var i = 0; i < 8; i = i + 1) {
+        store8(&hid_curr_report + i, 0);
+        store8(&hid_prev_report + i, 0);
+    }
+    hid_kbd_slot_id = 0;
+    hid_kbd_report_buf = 0;
+    kprintln("hid: keyboard layer initialized", 31);
+    return 0;
+}
+
+# Push a single PS/2 set-1 scancode byte into kb_buf, advancing kb_head
+# with 8-bit wrap. Mirrors the byte-write contract that kb_isr_build
+# (kernel/arch/x86_64/keyboard.cyr:3) implements for the PS/2 ISR path —
+# producer changes (HID), consumer (scancode_to_ascii) doesn't.
+fn hid_kb_push(scancode) {
+    store8(&kb_buf + kb_head, scancode & 0xFF);
+    kb_head = (kb_head + 1) & 0xFF;
+    return 0;
+}
+
+# Is HID usage code `code` present in the 6-slot keys array of report
+# starting at `report_addr` + offset 2? Returns 1 if yes, 0 if no.
+# 0x00 in a slot means empty; we don't have to handle that as a "present"
+# because hid_usage_to_ps2(0) returns 0 (unmapped) and the differ skips
+# zero translations.
+fn hid_report_contains(report_addr, code) {
+    for (var i = 2; i < 8; i = i + 1) {
+        if (load8(report_addr + i) == code) { return 1; }
+    }
+    return 0;
+}
+
+# Diff the modifier byte (report[0]). For each of the 8 modifier bits:
+#   - bit set in curr, clear in prev → make scancode pushed
+#   - bit clear in curr, set in prev → break scancode pushed (sc | 0x80)
+#   - same in both → no emit
+# Unmapped modifier bits (LGui/RGui in MVP) have scancode 0 — silently
+# dropped because scancode_to_ascii drops 0 anyway.
+fn hid_modifier_diff(curr_mods, prev_mods) {
+    var changed = curr_mods ^ prev_mods;
+    if (changed == 0) { return 0; }
+    for (var bit = 0; bit < 8; bit = bit + 1) {
+        var mask = 1 << bit;
+        if ((changed & mask) != 0) {
+            var sc = hid_modifier_bit_to_ps2(bit);
+            if (sc != 0) {
+                if ((curr_mods & mask) != 0) {
+                    hid_kb_push(sc);        # make
+                } else {
+                    hid_kb_push(sc | 0x80); # break
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# Diff the 6-key slot array (report bytes 2..7) and emit make/break
+# scancodes. Algorithm matches what Linux's hid-input.c does at the
+# logical level:
+#   - For each key in curr that's NOT in prev → make scancode
+#   - For each key in prev that's NOT in curr → break scancode
+#
+# HID-boot reports are unordered (a slot is just "this key is pressed");
+# matching by contains() over both arrays is the canonical translation.
+# Error codes 0x01..0x03 (NKRO rollover / POST fail / undefined) in any
+# slot are silently dropped because hid_usage_to_ps2 returns 0 for those
+# unmapped HID codes.
+fn hid_report_keys_diff(curr_addr, prev_addr) {
+    # Emit makes for keys newly-present in curr
+    for (var i = 2; i < 8; i = i + 1) {
+        var code = load8(curr_addr + i);
+        if (code >= 4) {
+            if (hid_report_contains(prev_addr, code) == 0) {
+                var sc = hid_usage_to_ps2(code);
+                if (sc != 0) { hid_kb_push(sc); }
+            }
+        }
+    }
+    # Emit breaks for keys that were in prev but absent in curr
+    for (var j = 2; j < 8; j = j + 1) {
+        var pcode = load8(prev_addr + j);
+        if (pcode >= 4) {
+            if (hid_report_contains(curr_addr, pcode) == 0) {
+                var psc = hid_usage_to_ps2(pcode);
+                if (psc != 0) { hid_kb_push(psc | 0x80); }
+            }
+        }
+    }
+    return 0;
+}
+
+# Phase 4 — issue SET_PROTOCOL = boot to the keyboard interface.
+# HID 1.11 §7.2.6: bmRequestType=0x21 (H-to-D, Class, recipient=Interface),
+# bRequest=0x0B (SET_PROTOCOL), wValue=0 (boot protocol), wIndex=interface,
+# wLength=0. After this returns success the keyboard delivers fixed
+# 8-byte boot reports regardless of any HID report descriptor it may
+# also expose (which we deliberately don't parse — see planning doc §
+# "Architectural choices" / HID descriptor parsing = skipped).
+fn hid_set_protocol_boot(slot_id, interface) {
+    return xhci_control_no_data(slot_id, 0x21, 0x0B, 0, interface);
+}
+
+# Phase 4 — full keyboard configuration sequence. Called from
+# xhci_enumerate_port after Address Device + Get Device Descriptor have
+# succeeded and the device is suspected to host a HID-boot-keyboard
+# interface (device class is 0 / interface-defined, or device class 0x03).
+# Sequence:
+#   1. Get Configuration Descriptor (9-byte header, then full)
+#   2. Walk for HID-boot-keyboard interface + interrupt-IN endpoint
+#   3. SET_PROTOCOL = boot on the interface
+#   4. Allocate transfer ring for the kbd IN endpoint
+#   5. Update Input Context with the new EP via xhci_input_ctx_add_interrupt_in
+#   6. Configure Endpoint command (TRB type 12)
+#   7. Ring the kbd doorbell to kick the first IN transaction
+# Returns 1 on success (keyboard ready to deliver reports), 0 otherwise.
+fn hid_kbd_configure(slot_id) {
+    # Reuse the shared descriptor scratch buffer xhci_get_device_descriptor
+    # has already provisioned by this point.
+    if (xhci_desc_buf_phys == 0) { return 0; }
+
+    # Step 1a: read 9-byte config descriptor header to learn wTotalLength.
+    xhci_zero_page(xhci_desc_buf_phys);
+    if (xhci_get_config_descriptor(slot_id, 0, 9) == 0) {
+        kprintln("hid: get config descriptor (9) failed", 38);
+        return 0;
+    }
+    var total_len = load16(xhci_desc_buf_phys + 2);
+    if (total_len < 18) { return 0; }   # need at least one intf + ep
+    if (total_len > 4096) { total_len = 4096; } # clamp to scratch page
+
+    # Step 1b: read full config descriptor.
+    xhci_zero_page(xhci_desc_buf_phys);
+    if (xhci_get_config_descriptor(slot_id, 0, total_len) == 0) {
+        kprintln("hid: get config descriptor (full) failed", 40);
+        return 0;
+    }
+
+    # Step 2: walk for HID-boot-keyboard interface + interrupt-IN endpoint.
+    # Out-pointers live in this stack frame; copied to module globals on
+    # success.
+    var intf_num    = 0;
+    var ep_addr     = 0;
+    var mps_buf[2];                 # 16-bit slot
+    var interval_byte = 0;
+    store16(&mps_buf, 0);
+    if (xhci_find_hid_boot_kbd_endpoint(total_len,
+        &intf_num, &ep_addr, &mps_buf, &interval_byte) == 0) {
+        kprintln("hid: no HID-boot-kbd interface in config", 40);
+        return 0;
+    }
+    var mps = load16(&mps_buf);
+    if (mps == 0) { mps = 8; }      # HID-boot reports are always 8 bytes
+
+    # Step 3: SET_PROTOCOL = boot. Force the keyboard onto the predictable
+    # boot-report format.
+    if (hid_set_protocol_boot(slot_id, intf_num) == 0) {
+        kprintln("hid: SET_PROTOCOL=boot failed", 29);
+        return 0;
+    }
+
+    # Step 4: allocate the transfer ring + report buffer pages.
+    var xfer_ring = pmm_alloc();
+    if (xfer_ring == 0) { kprintln("hid: xfer ring alloc failed", 27); return 0; }
+    if (vmm_is_mapped(xfer_ring) == 0) { vmm_map(xfer_ring, xfer_ring, 0x83); }
+    iommu_register_dma(xfer_ring);
+    xhci_zero_page(xfer_ring);
+
+    var report_buf = pmm_alloc();
+    if (report_buf == 0) { kprintln("hid: report buf alloc failed", 28); return 0; }
+    if (vmm_is_mapped(report_buf) == 0) { vmm_map(report_buf, report_buf, 0x83); }
+    iommu_register_dma(report_buf);
+    xhci_zero_page(report_buf);
+
+    # Pre-fill the first Normal TRB on the kbd xfer ring pointing to the
+    # static 8-byte report buffer. IOC=1 so the Transfer Event surfaces
+    # to the event ring once the controller writes the IN data.
+    #   p_lo / p_hi = report_buf phys
+    #   status      = TRB Transfer Length = mps (8) | Interrupter Target=0
+    #   ctrl        = IOC=1 (bit 5) | type=Normal(1)<<10 | cycle=1
+    var trb = xfer_ring;
+    store64(trb + 0, report_buf);
+    store32(trb + 8, mps & 0x1FFFF);
+    var trb_ctrl = (1 << 5) | (XHCI_TRB_NORMAL << 10) | 0x1;
+    store32(trb + 12, trb_ctrl);
+    hid_kbd_xfer_idx   = 1;   # next free TRB slot (we just filled 0)
+    hid_kbd_xfer_cycle = 1;
+
+    # Step 5: extend the input context. xhci_alloc_input_ctx left it
+    # holding Slot + EP0; we add the kbd interrupt-IN EP context.
+    var ictx = xhci_slot_get(xhci_slot_input_ctx, slot_id);
+    if (ictx == 0) { return 0; }
+    var speed = xhci_slot_get(xhci_slot_speed, slot_id);
+    var dci = xhci_input_ctx_add_interrupt_in(ictx, ep_addr, mps,
+        interval_byte, speed, xfer_ring);
+    if (dci == 0) { return 0; }
+
+    # Step 6: Configure Endpoint command. After this returns success the
+    # new EP transitions to Running.
+    if (xhci_configure_endpoint(slot_id, ictx) == 0) { return 0; }
+
+    # Step 7: stash module state + kick first IN by ringing the kbd
+    # doorbell. Doorbell Target = DCI for stream-less endpoints.
+    hid_kbd_slot_id     = slot_id;
+    hid_kbd_interface   = intf_num;
+    hid_kbd_ep_addr     = ep_addr;
+    hid_kbd_ep_mps      = mps;
+    hid_kbd_ep_interval = interval_byte;
+    hid_kbd_xfer_ring   = xfer_ring;
+    hid_kbd_report_buf  = report_buf;
+    var db_addr = xhci_mmio_base + xhci_db_off + slot_id * 4;
+    store32(db_addr, dci & 0xFF);
+
+    kprint("hid: keyboard configured, boot protocol on, EP=", 47);
+    kprint_num(ep_addr);
+    kprintln(", polling 8-byte reports", 24);
+    xhci_cmos_stamp(0x50, 0x33);   # kcp = 0x33 per Phase 4 gate
+    return 1;
+}
+
+# Process a fresh 8-byte HID boot report at phys `report_phys`. Called by
+# hid_poll() (Phase 5 event-ring drain) once a Transfer Event arrives on
+# the kbd endpoint. Reports a copy in/out via hid_curr_report / hid_prev_report
+# so the differ has a stable view independent of further DMA writes.
+fn hid_process_report(report_phys) {
+    if (hid_kbd_slot_id == 0) { return 0; }
+    # Snapshot the freshly-DMAed report into hid_curr_report. We work
+    # off the CPU-side copy from here so the controller is free to start
+    # the next IN transfer on the transfer ring.
+    for (var i = 0; i < 8; i = i + 1) {
+        store8(&hid_curr_report + i, load8(report_phys + i));
+    }
+    var curr_mods = load8(&hid_curr_report + 0);
+    var prev_mods = load8(&hid_prev_report + 0);
+    hid_modifier_diff(curr_mods, prev_mods);
+    hid_report_keys_diff(&hid_curr_report, &hid_prev_report);
+    # Promote curr → prev for the next diff cycle.
+    for (var j = 0; j < 8; j = j + 1) {
+        store8(&hid_prev_report + j, load8(&hid_curr_report + j));
+    }
+    return 0;
+}
+
+# Re-arm the kbd transfer ring with one fresh Normal TRB pointing at the
+# shared report buffer. Called after each Transfer Event has been
+# processed so the controller has another IN slot to fulfil. Ring is one
+# page (256 TRBs at 16 bytes each); we advance enqueue with wrap-and-toggle.
+fn hid_arm_xfer_trb() {
+    if (hid_kbd_xfer_ring == 0) { return 0; }
+    if (hid_kbd_report_buf == 0) { return 0; }
+    var trb = hid_kbd_xfer_ring + hid_kbd_xfer_idx * 16;
+    store64(trb + 0, hid_kbd_report_buf);
+    store32(trb + 8, hid_kbd_ep_mps & 0x1FFFF);
+    var ctrl = (1 << 5) | (XHCI_TRB_NORMAL << 10) | (hid_kbd_xfer_cycle & 0x1);
+    store32(trb + 12, ctrl);
+    hid_kbd_xfer_idx = hid_kbd_xfer_idx + 1;
+    if (hid_kbd_xfer_idx >= 256) {
+        hid_kbd_xfer_idx = 0;
+        if (hid_kbd_xfer_cycle == 1) { hid_kbd_xfer_cycle = 0; }
+        else { hid_kbd_xfer_cycle = 1; }
+    }
+    return 1;
+}
+
+# Phase 5 poll entry — drain the event ring, processing any Transfer
+# Events that belong to the kbd interrupt-IN endpoint. Non-blocking;
+# returns immediately when no matching events are pending. Intended to
+# be called from the timer-ISR / scheduler-tick path (one call site,
+# trivial to wire — planning doc § Phase 5).
+#
+# Per xHCI 1.2 §6.4.2.1, Transfer Event TRB layout:
+#   DW0/1 — pointer to the producer TRB that completed
+#   DW2   — bits 31:24 ccode, bits 23:0 transfer length (mps − residual)
+#   DW3   — bit 0 cycle, bits 15:10 type=32, bits 20:16 EP ID (DCI),
+#           bits 31:24 slot ID
+#
+# Non-kbd events are passed through silently — xhci_wait_transfer_event
+# is the synchronous consumer for EP0 events during Phase 3/4 control
+# transfers, and shouldn't be running concurrently with hid_poll under
+# the current cooperative-poll regime. If that invariant ever changes
+# (interrupt-driven xHCI), this loop needs to become event-type-aware.
+fn hid_poll() {
+    if (hid_kbd_slot_id == 0) { return 0; }
+    var processed = 0;
+    var drained = 0;
+    while (drained < 64) {       # bound — prevents runaway on corrupt cycle
+        var evt_off = xhci_evt_ring_idx * 16;
+        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt_dw3 = load32(evt + 12);
+        var evt_cycle = evt_dw3 & 0x1;
+        if (evt_cycle != xhci_evt_ring_cycle) {
+            # No more events for us this tick — exit.
+            break;
+        }
+        var evt_type = (evt_dw3 >> 10) & 0x3F;
+        var evt_slot = (evt_dw3 >> 24) & 0xFF;
+        var evt_ep   = (evt_dw3 >> 16) & 0x1F;
+        var our_dci  = xhci_dci_for_ep(hid_kbd_ep_addr);
+        if (evt_type == XHCI_TRB_TRANSFER_EVENT) {
+            if (evt_slot == hid_kbd_slot_id) {
+                if (evt_ep == our_dci) {
+                    # Kbd IN report just landed in hid_kbd_report_buf.
+                    hid_process_report(hid_kbd_report_buf);
+                    processed = processed + 1;
+                    hid_arm_xfer_trb();
+                    var db_addr = xhci_mmio_base + xhci_db_off + hid_kbd_slot_id * 4;
+                    store32(db_addr, our_dci & 0xFF);
+                }
+            }
+        }
+        # Consume the event regardless of which path matched — non-kbd
+        # events drop silently here. (If EP0 transfers run concurrently
+        # this would race with xhci_wait_transfer_event; see note above.)
+        xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+        if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+            xhci_evt_ring_idx = 0;
+            if (xhci_evt_ring_cycle == 1) { xhci_evt_ring_cycle = 0; }
+            else { xhci_evt_ring_cycle = 1; }
+        }
+        drained = drained + 1;
+    }
+    if (drained > 0) {
+        var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
+        var new_erdp = xhci_evt_ring_phys + xhci_evt_ring_idx * 16;
+        xhci_rt_write64(ir0 + XHCI_IR_ERDP, new_erdp | 0x8);
+    }
+    return processed;
+}

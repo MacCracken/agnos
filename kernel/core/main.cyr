@@ -168,6 +168,29 @@ xhci_init();
 # § Phase 3.
 xhci_enumerate();
 
+# HID-boot keyboard layer (Phase 4 + Phase 5 per
+# planning/usb-hid-keyboard-driver.md). Phase 4 walks the configuration
+# descriptor on every addressed slot, issues Configure Endpoint +
+# SET_PROTOCOL=boot on the first HID-boot-keyboard interface found, and
+# arms the interrupt-IN transfer ring. Phase 5 is poll-driven from
+# kb_has_key() — the existing scancode_to_ASCII path consumes the
+# resulting PS/2 byte stream unchanged.
+#
+# Iterating slots (rather than only inspecting xhci_kbd_slot_id) catches
+# the common case where bDeviceClass=0 and HID class lives on the
+# interface descriptor — hid_kbd_configure's config-descriptor walk
+# does the actual class triple match. First-success wins; subsequent
+# addressed slots are skipped because hid_kbd_slot_id != 0 short-circuits
+# hid_kbd_configure on entry.
+hid_kbd_init();
+for (var s = 1; s <= 64; s = s + 1) {
+    if (hid_kbd_slot_id != 0) { break; }
+    var sctx = xhci_slot_get(xhci_slot_input_ctx, s);
+    if (sctx != 0) {
+        hid_kbd_configure(s);
+    }
+}
+
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
 if (acpi_iommu_base != 0) {
     if (iommu_init() == 0) {

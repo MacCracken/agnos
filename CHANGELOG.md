@@ -3,7 +3,26 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [Unreleased] — 1.30.5 (staging)
+
+**USB HID keyboard driver — Phase 4 + Phase 5 (parallel-track to xHCI
+silent-absorb arc, per the decoupling decision).** With 1.30.4 closing the
+xHCI Linux-diff hardening backlog (H1-H4) and Attempt 52 settling the
+silent-absorb arc as a parallel-track investigation, 1.30.5 picks up the
+Phase 4/5 code surface that's been shovel-ready in
+[`agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/usb-hid-keyboard-driver.md)
+since 2026-05-15. Phase 4 = Get Configuration Descriptor + Configure
+Endpoint + SET_PROTOCOL=boot + transfer ring for the interrupt-IN
+endpoint. Phase 5 = HID-usage→PS/2 set-1 scancode translation + report
+differ + `kb_buf` writer + poll-mode event-ring drain on the kbd endpoint.
+Develops in parallel against Phase 1-3 infrastructure (which is already
+landed and running on QEMU); validation surface for 1.30.5 is the QEMU
+xhci-pci emulated controller — clean spec-compliant xHCI without AMD-FCH
+quirks, so Phase 3 enumeration completes cleanly and Phase 4/5 can be
+exercised end-to-end. Archaemenid silent-absorb remains the only
+iron-side blocker; when that unblocks (later silicon discovery, different
+hardware target, or unstuck via the parallel-track xHCI hardening
+backlog), Phase 4/5 is already functionally proved.
 
 ## [1.30.4] — 2026-05-17 (xHCI Linux-diff hardening closeout)
 

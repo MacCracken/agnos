@@ -751,6 +751,42 @@ fn xhci_control_in(slot_id, bm_req, b_req, w_val, w_idx, w_len, buf_phys) {
     return xhci_wait_transfer_event(slot_id);
 }
 
+# Generic H-to-D control transfer with no data stage. Used for SET_*
+# class/standard requests (SET_PROTOCOL, SET_IDLE, etc.) where the host
+# sends only a SETUP TRB and the device acks via an IN Status Stage.
+# Two-TRB sequence: SETUP (TRT=0, no-data) + STATUS (DIR=1, IN ack).
+fn xhci_control_no_data(slot_id, bm_req, b_req, w_val, w_idx) {
+    # Setup Stage TRB: TRT=0 (No Data Stage).
+    var setup_lo = (bm_req & 0xFF) | ((b_req & 0xFF) << 8) | ((w_val & 0xFFFF) << 16);
+    var setup_hi = (w_idx & 0xFFFF);
+    var setup_ctrl = (0 << 16) | (1 << 6) | (XHCI_TRB_SETUP_STAGE << 10);
+    if (xhci_ep0_enqueue(slot_id, setup_lo, setup_hi, 8, setup_ctrl) == 0) { return 0; }
+    # Status Stage TRB: DIR=1 (IN ack — opposite of an H-to-D data flow,
+    # but when there's no data, status direction is IN per §4.11.2).
+    var status_ctrl = (1 << 16) | (1 << 5) | (XHCI_TRB_STATUS_STAGE << 10);
+    if (xhci_ep0_enqueue(slot_id, 0, 0, 0, status_ctrl) == 0) { return 0; }
+    xhci_ring_ep0_doorbell(slot_id);
+    return xhci_wait_transfer_event(slot_id);
+}
+
+# Phase 4 — Configure Endpoint command (TRB type 12). Takes a populated
+# Input Context (caller has set Add Flags + EP context for the new EP via
+# xhci_input_ctx_add_interrupt_in) and commands the controller to fold
+# the new endpoint into the device's Device Context. After this returns
+# success the new EP transitions to Running and accepts doorbell rings.
+fn xhci_configure_endpoint(slot_id, input_ctx_phys) {
+    var ctrl = (XHCI_TRB_CONFIGURE_EP << 10) | ((slot_id & 0xFF) << 24);
+    var p_lo = input_ctx_phys & 0xFFFFFFFF;
+    var p_hi = 0;
+    if (xhci_cmd_issue(p_lo, p_hi, 0, ctrl) == 0) {
+        kprint("xhci: Configure Endpoint failed, ccode=", 39);
+        kprint_num(xhci_last_cmd_ccode);
+        kprintln("", 0);
+        return 0;
+    }
+    return 1;
+}
+
 # Fetch the first 18 bytes of the USB Device Descriptor into the shared
 # scratch buffer. Returns 1 on success. Caller then reads from
 # xhci_desc_buf_phys to parse fields.
@@ -759,6 +795,86 @@ fn xhci_get_device_descriptor(slot_id, length) {
     # bRequest=6 (GET_DESCRIPTOR), wValue=(DescriptorType=1 << 8) | 0,
     # wIndex=0, wLength=length.
     return xhci_control_in(slot_id, 0x80, 0x06, 0x0100, 0, length, xhci_desc_buf_phys);
+}
+
+# Fetch a Configuration Descriptor into the shared scratch buffer. Phase 4.
+# Caller typically issues this twice: first with length=9 to read the
+# header (wTotalLength tells the full size), then again with the full
+# length to capture all nested interface + endpoint + HID descriptors.
+# Per USB 2.0 §9.4.3: GET_DESCRIPTOR(Configuration, index):
+#   bmRequestType=0x80, bRequest=6, wValue=(0x02<<8)|index, wIndex=0.
+fn xhci_get_config_descriptor(slot_id, config_idx, length) {
+    return xhci_control_in(slot_id, 0x80,
+        0x06, (0x02 << 8) | (config_idx & 0xFF), 0, length, xhci_desc_buf_phys);
+}
+
+# Walk the Configuration Descriptor in xhci_desc_buf_phys looking for an
+# Interface Descriptor matching HID-boot-keyboard (class=0x03,
+# subclass=0x01, protocol=0x01) followed by an interrupt-IN endpoint
+# descriptor. Writes the interface number, endpoint address, max packet
+# size, and bInterval into the four out-pointer slots and returns 1 on
+# success; returns 0 if no HID-boot-kbd interface is found.
+#
+# Descriptor TLV layout (USB 2.0 §9.5):
+#   [0] bLength (covers this entire descriptor)
+#   [1] bDescriptorType
+# Type values: 2 = CONFIGURATION (9 bytes), 4 = INTERFACE (9 bytes),
+#              5 = ENDPOINT (7 bytes), 0x21 = HID (variable), etc.
+# We scan TLVs sequentially. State machine: track whether we're currently
+# inside a matched HID-boot-keyboard interface; on first endpoint found
+# while in that state, if it's interrupt-IN, capture and return.
+fn xhci_find_hid_boot_kbd_endpoint(total_length,
+    out_intf_addr, out_ep_addr_p, out_mps_p, out_interval_p) {
+    var off = 0;
+    var in_kbd_intf = 0;
+    var cur_intf_num = 0;
+    while (off < total_length) {
+        var b_length = load8(xhci_desc_buf_phys + off);
+        if (b_length == 0) { return 0; }   # malformed — guard against infinite loop
+        var b_type = load8(xhci_desc_buf_phys + off + 1);
+        if (b_type == 4) {
+            # Interface Descriptor (USB 2.0 §9.6.5):
+            #   [2] bInterfaceNumber, [3] bAlternateSetting,
+            #   [4] bNumEndpoints, [5] bInterfaceClass,
+            #   [6] bInterfaceSubClass, [7] bInterfaceProtocol
+            var i_class = load8(xhci_desc_buf_phys + off + 5);
+            var i_sub   = load8(xhci_desc_buf_phys + off + 6);
+            var i_proto = load8(xhci_desc_buf_phys + off + 7);
+            cur_intf_num = load8(xhci_desc_buf_phys + off + 2);
+            if (i_class == 0x03) {
+                if (i_sub == 0x01) {
+                    if (i_proto == 0x01) {
+                        in_kbd_intf = 1;
+                        store8(out_intf_addr, cur_intf_num);
+                    } else { in_kbd_intf = 0; }
+                } else { in_kbd_intf = 0; }
+            } else { in_kbd_intf = 0; }
+        } else {
+            if (b_type == 5) {
+                # Endpoint Descriptor (USB 2.0 §9.6.6):
+                #   [2] bEndpointAddress (bit 7 = direction; 1 = IN)
+                #   [3] bmAttributes (bits 1:0 = transfer type; 3 = interrupt)
+                #   [4..5] wMaxPacketSize
+                #   [6] bInterval
+                if (in_kbd_intf != 0) {
+                    var ep_addr = load8(xhci_desc_buf_phys + off + 2);
+                    var attrs   = load8(xhci_desc_buf_phys + off + 3);
+                    if ((ep_addr & 0x80) != 0) {
+                        if ((attrs & 0x03) == 0x03) {
+                            var mps = load16(xhci_desc_buf_phys + off + 4);
+                            var ivl = load8(xhci_desc_buf_phys + off + 6);
+                            store8(out_ep_addr_p, ep_addr);
+                            store16(out_mps_p, mps);
+                            store8(out_interval_p, ivl);
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+        off = off + b_length;
+    }
+    return 0;
 }
 
 # Per-port enumeration: classify + reset + Enable Slot + Address Device

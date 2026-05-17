@@ -56,6 +56,12 @@ fn kb_isr_build() {
 }
 
 fn kb_has_key() {
+    # Phase 5 cooperative-poll hook: drain any pending USB-HID Transfer
+    # Events into kb_buf via hid_poll() before checking the ring. Single
+    # producer feeding the same consumer-facing contract as the PS/2 ISR
+    # path; no-op when no HID keyboard was discovered during enumeration
+    # (hid_kbd_slot_id == 0 inside hid_poll).
+    hid_poll();
     if (kb_head != kb_tail) { return 1; }
     return 0;
 }

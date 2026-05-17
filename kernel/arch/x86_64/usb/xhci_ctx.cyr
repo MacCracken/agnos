@@ -199,3 +199,91 @@ fn xhci_dcbaa_install(slot_id, dev_ctx_phys) {
     store64(xhci_dcbaa_phys + slot_id * 8, dev_ctx_phys);
     return 1;
 }
+
+# Compute the DCI (Device Context Index) for a USB endpoint address.
+#   DCI = (ep_num * 2) + (in_direction ? 1 : 0)
+# EP0 is always DCI=1 (handled by xhci_alloc_input_ctx). For an
+# interrupt-IN keyboard endpoint at bEndpointAddress=0x81, DCI=3.
+fn xhci_dci_for_ep(ep_addr) {
+    var ep_num = ep_addr & 0x0F;
+    var is_in  = (ep_addr & 0x80) >> 7;
+    return (ep_num * 2) + is_in;
+}
+
+# Compute the xHCI Interval field for an interrupt-IN endpoint, given the
+# bInterval byte from the endpoint descriptor and the port speed. xHCI 1.2
+# §6.2.3.6: Interval encodes 2^Interval microframes between successive
+# transactions.
+#   - HS / SS: bInterval is already a log2-microframes count (1..16); xHCI
+#     Interval = bInterval - 1 (clamped to 0..15).
+#   - FS / LS: bInterval is in frames (1..255); a strict log2(bInterval*8)
+#     gives slow polling (10 ms typical bInterval × 8 microframes = ~7).
+#     For MVP typeable-shell responsiveness we pin FS keyboards to
+#     Interval=3 (= 8 microframes = 1 ms) — over-polling a keyboard is
+#     harmless on a non-power-constrained device.
+fn xhci_interrupt_interval(b_interval, speed) {
+    if (speed == XHCI_SPEED_HIGH) {
+        var hi = b_interval;
+        if (hi == 0) { return 0; }
+        hi = hi - 1;
+        if (hi > 15) { return 15; }
+        return hi;
+    }
+    if (speed == XHCI_SPEED_SUPER)      { return b_interval - 1; }
+    if (speed == XHCI_SPEED_SUPER_PLUS) { return b_interval - 1; }
+    return 3;   # FS / LS default
+}
+
+# Phase 4 — add an Interrupt-IN endpoint to an existing Input Context.
+# Sets the Add Context Flag for the new EP, fills the EP context with
+# type=Interrupt-IN, MaxPacketSize, Interval, transfer ring deq pointer,
+# and bumps Slot Context's "Context Entries" to cover the new DCI. The
+# Input Context is consumed by the subsequent Configure Endpoint command
+# (see xhci.cyr) which transitions the EP into the Running state.
+#
+# Caller has already allocated the transfer ring page (one page; Normal
+# TRBs filled in by xhci_kbd_arm_xfer_ring). xfer_ring_phys must be
+# 16-byte aligned (page-aligned satisfies); DCS=1 in the bottom bit.
+fn xhci_input_ctx_add_interrupt_in(ictx_phys, ep_addr, mps,
+    b_interval, speed, xfer_ring_phys) {
+    var dci = xhci_dci_for_ep(ep_addr);
+    if (dci < 2) { return 0; }     # EP0 handled by xhci_alloc_input_ctx
+
+    # Input Control Context — set Add bit for the new EP (A_dci). Always
+    # reaffirm A0 (Slot) per Linux convention; HW reads the Slot context
+    # alongside the new EP context during Configure Endpoint.
+    var add_flags = load32(ictx_phys + 4);
+    add_flags = add_flags | (1 << dci) | 0x1;
+    store32(ictx_phys + 4, add_flags);
+
+    # Slot Context dword 0: bump Context Entries (bits 31:27) to cover
+    # the new DCI. CE = max(existing, dci). We re-derive from the field
+    # to preserve speed / hub bits / route string.
+    var slot_dw0 = load32(ictx_phys + 0x40);
+    var cur_ce = (slot_dw0 >> 27) & 0x1F;
+    if (dci > cur_ce) {
+        slot_dw0 = (slot_dw0 & 0x07FFFFFF) | ((dci & 0x1F) << 27);
+        store32(ictx_phys + 0x40, slot_dw0);
+    }
+
+    # EP context at offset (dci + 1) * 64 (CSZ=1, 64-byte contexts).
+    #   DCI=2 → 0xC0, DCI=3 → 0x100, DCI=4 → 0x140, ...
+    var ep_ctx = ictx_phys + (dci + 1) * 0x40;
+
+    # dword 0 — Interval at bits 23:16.
+    var interval = xhci_interrupt_interval(b_interval, speed);
+    store32(ep_ctx + 0, (interval & 0xFF) << 16);
+    # dword 1:
+    #   bits [2:1]   CErr            = 3 (max error count)
+    #   bits [5:3]   EP Type         = 7 (Interrupt IN)
+    #   bits [15:8]  Max Burst Size  = 0 (non-SS keyboards)
+    #   bits [31:16] Max Packet Size = mps (8 for HID-boot)
+    var ep_dw1 = (3 << 1) | (7 << 3) | ((mps & 0xFFFF) << 16);
+    store32(ep_ctx + 4, ep_dw1);
+    # dwords 2/3: TR Dequeue Pointer with DCS=1.
+    store64(ep_ctx + 8, xfer_ring_phys | 0x1);
+    # dword 4: Average TRB Length = mps (interrupt transfers ~= mps bytes
+    # per IN); Max ESIT Payload Lo at bits 31:16, zero for keyboards.
+    store32(ep_ctx + 16, mps & 0xFFFF);
+    return dci;
+}

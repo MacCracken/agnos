@@ -1,0 +1,151 @@
+# === HID-boot keyboard → PS/2 set-1 scancode translation ===
+#
+# Phase 5 layer: maps the 8-byte HID boot-protocol report shape onto the
+# existing PS/2 set-1 scancode-stream that `arch/x86_64/keyboard.cyr`'s
+# `scancode_to_ascii()` already understands. Pure-data; no xHCI surface.
+#
+# HID boot report (8 bytes, USB-HID 1.11 §B.1):
+#   byte 0   = modifier bitmap (LCtrl/LShift/LAlt/LGui/RCtrl/RShift/RAlt/RGui)
+#   byte 1   = reserved (0x00)
+#   byte 2-7 = 6 key-slot usage codes; 0x00 = empty slot, 0x01-0x03 = error
+#
+# We translate HID usage codes (USB-HID Usage Tables §10, keyboard page 0x07)
+# to PS/2 set-1 make codes. The diff between current and previous report
+# (see hid.cyr) emits PS/2 makes for newly-pressed keys and PS/2 breaks
+# (scancode | 0x80) for newly-released — same byte-stream shape the
+# existing `kb_buf` consumer expects.
+#
+# Table coverage matches the planning doc § Phase 5 (~150 LOC):
+# - HID 0x04..0x1D (a..z) → PS/2 0x1E/0x30/0x2E/0x20/0x12/...
+# - HID 0x1E..0x27 (1..9, 0) → PS/2 0x02..0x0B
+# - Enter / Esc / Backspace / Tab / Space / common punctuation
+# - F1..F12
+# - HID 0x46..0x52 (PrintScreen / arrows / etc.) and keypad: deferred
+#   (extended 0xE0-prefixed PS/2 set-1; not required for MVP typeable shell).
+
+var hid_to_ps2[256];           # Main HID usage → PS/2 set-1 make code
+var hid_modifier_to_ps2[8];    # Modifier bit 0..7 → PS/2 make code
+
+fn hid_translate_init() {
+    # Zero entire table — unmapped HID codes return 0 (ignored).
+    for (var i = 0; i < 256; i = i + 1) {
+        store8(&hid_to_ps2 + i, 0);
+    }
+    for (var j = 0; j < 8; j = j + 1) {
+        store8(&hid_modifier_to_ps2 + j, 0);
+    }
+
+    # Letters a..z (HID 0x04..0x1D → PS/2 set-1)
+    store8(&hid_to_ps2 + 0x04, 0x1E);  # a
+    store8(&hid_to_ps2 + 0x05, 0x30);  # b
+    store8(&hid_to_ps2 + 0x06, 0x2E);  # c
+    store8(&hid_to_ps2 + 0x07, 0x20);  # d
+    store8(&hid_to_ps2 + 0x08, 0x12);  # e
+    store8(&hid_to_ps2 + 0x09, 0x21);  # f
+    store8(&hid_to_ps2 + 0x0A, 0x22);  # g
+    store8(&hid_to_ps2 + 0x0B, 0x23);  # h
+    store8(&hid_to_ps2 + 0x0C, 0x17);  # i
+    store8(&hid_to_ps2 + 0x0D, 0x24);  # j
+    store8(&hid_to_ps2 + 0x0E, 0x25);  # k
+    store8(&hid_to_ps2 + 0x0F, 0x26);  # l
+    store8(&hid_to_ps2 + 0x10, 0x32);  # m
+    store8(&hid_to_ps2 + 0x11, 0x31);  # n
+    store8(&hid_to_ps2 + 0x12, 0x18);  # o
+    store8(&hid_to_ps2 + 0x13, 0x19);  # p
+    store8(&hid_to_ps2 + 0x14, 0x10);  # q
+    store8(&hid_to_ps2 + 0x15, 0x13);  # r
+    store8(&hid_to_ps2 + 0x16, 0x1F);  # s
+    store8(&hid_to_ps2 + 0x17, 0x14);  # t
+    store8(&hid_to_ps2 + 0x18, 0x16);  # u
+    store8(&hid_to_ps2 + 0x19, 0x2F);  # v
+    store8(&hid_to_ps2 + 0x1A, 0x11);  # w
+    store8(&hid_to_ps2 + 0x1B, 0x2D);  # x
+    store8(&hid_to_ps2 + 0x1C, 0x15);  # y
+    store8(&hid_to_ps2 + 0x1D, 0x2C);  # z
+
+    # Number row 1..9, 0 (HID 0x1E..0x27 → PS/2 0x02..0x0B)
+    store8(&hid_to_ps2 + 0x1E, 0x02);  # 1
+    store8(&hid_to_ps2 + 0x1F, 0x03);  # 2
+    store8(&hid_to_ps2 + 0x20, 0x04);  # 3
+    store8(&hid_to_ps2 + 0x21, 0x05);  # 4
+    store8(&hid_to_ps2 + 0x22, 0x06);  # 5
+    store8(&hid_to_ps2 + 0x23, 0x07);  # 6
+    store8(&hid_to_ps2 + 0x24, 0x08);  # 7
+    store8(&hid_to_ps2 + 0x25, 0x09);  # 8
+    store8(&hid_to_ps2 + 0x26, 0x0A);  # 9
+    store8(&hid_to_ps2 + 0x27, 0x0B);  # 0
+
+    # Control / whitespace
+    store8(&hid_to_ps2 + 0x28, 0x1C);  # Enter
+    store8(&hid_to_ps2 + 0x29, 0x01);  # Esc
+    store8(&hid_to_ps2 + 0x2A, 0x0E);  # Backspace
+    store8(&hid_to_ps2 + 0x2B, 0x0F);  # Tab
+    store8(&hid_to_ps2 + 0x2C, 0x39);  # Space
+
+    # Punctuation row 1
+    store8(&hid_to_ps2 + 0x2D, 0x0C);  # -
+    store8(&hid_to_ps2 + 0x2E, 0x0D);  # =
+    store8(&hid_to_ps2 + 0x2F, 0x1A);  # [
+    store8(&hid_to_ps2 + 0x30, 0x1B);  # ]
+    store8(&hid_to_ps2 + 0x31, 0x2B);  # \
+
+    # Punctuation row 2
+    store8(&hid_to_ps2 + 0x33, 0x27);  # ;
+    store8(&hid_to_ps2 + 0x34, 0x28);  # '
+    store8(&hid_to_ps2 + 0x35, 0x29);  # `
+    store8(&hid_to_ps2 + 0x36, 0x33);  # ,
+    store8(&hid_to_ps2 + 0x37, 0x34);  # .
+    store8(&hid_to_ps2 + 0x38, 0x35);  # /
+
+    # CapsLock — handled by scancode_to_ascii as toggle on PS/2 0x3A
+    store8(&hid_to_ps2 + 0x39, 0x3A);
+
+    # F1..F10 (HID 0x3A..0x43 → PS/2 0x3B..0x44)
+    store8(&hid_to_ps2 + 0x3A, 0x3B);  # F1
+    store8(&hid_to_ps2 + 0x3B, 0x3C);  # F2
+    store8(&hid_to_ps2 + 0x3C, 0x3D);  # F3
+    store8(&hid_to_ps2 + 0x3D, 0x3E);  # F4
+    store8(&hid_to_ps2 + 0x3E, 0x3F);  # F5
+    store8(&hid_to_ps2 + 0x3F, 0x40);  # F6
+    store8(&hid_to_ps2 + 0x40, 0x41);  # F7
+    store8(&hid_to_ps2 + 0x41, 0x42);  # F8
+    store8(&hid_to_ps2 + 0x42, 0x43);  # F9
+    store8(&hid_to_ps2 + 0x43, 0x44);  # F10
+
+    # F11, F12 (HID 0x44..0x45 → PS/2 0x57, 0x58)
+    store8(&hid_to_ps2 + 0x44, 0x57);  # F11
+    store8(&hid_to_ps2 + 0x45, 0x58);  # F12
+
+    # Modifier byte (HID boot report byte 0):
+    #   bit 0 = LCtrl  → PS/2 0x1D
+    #   bit 1 = LShift → PS/2 0x2A
+    #   bit 2 = LAlt   → PS/2 0x38
+    #   bit 3 = LGui   → no basic PS/2 set-1 (extended 0xE0 5B); leave 0 for MVP
+    #   bit 4 = RCtrl  → PS/2 0x1D (scancode_to_ascii treats either as ctrl)
+    #   bit 5 = RShift → PS/2 0x36
+    #   bit 6 = RAlt   → PS/2 0x38 (treated as alt for MVP)
+    #   bit 7 = RGui   → no basic PS/2 set-1; 0 for MVP
+    store8(&hid_modifier_to_ps2 + 0, 0x1D);
+    store8(&hid_modifier_to_ps2 + 1, 0x2A);
+    store8(&hid_modifier_to_ps2 + 2, 0x38);
+    store8(&hid_modifier_to_ps2 + 3, 0);
+    store8(&hid_modifier_to_ps2 + 4, 0x1D);
+    store8(&hid_modifier_to_ps2 + 5, 0x36);
+    store8(&hid_modifier_to_ps2 + 6, 0x38);
+    store8(&hid_modifier_to_ps2 + 7, 0);
+    return 0;
+}
+
+# Translate a single HID usage code to its PS/2 set-1 make scancode.
+# Returns 0 for unmapped codes (silently dropped — Phase 5 extended
+# coverage can add arrows / keypad / media keys later).
+fn hid_usage_to_ps2(hid_code) {
+    if (hid_code >= 256) { return 0; }
+    return load8(&hid_to_ps2 + hid_code);
+}
+
+# Translate a modifier-bit position (0..7) to its PS/2 make scancode.
+fn hid_modifier_bit_to_ps2(bit) {
+    if (bit >= 8) { return 0; }
+    return load8(&hid_modifier_to_ps2 + bit);
+}

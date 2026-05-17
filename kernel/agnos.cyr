@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.30.4
+# agnos.cyr — AGNOS kernel v1.30.5
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
@@ -80,6 +80,8 @@ include "arch/x86_64/usb/xhci_cmd.cyr"
 include "arch/x86_64/usb/xhci_ctx.cyr"
 include "arch/x86_64/usb/xhci_port.cyr"
 include "arch/x86_64/usb/xhci.cyr"
+include "arch/x86_64/usb/hid_translate.cyr"
+include "arch/x86_64/usb/hid.cyr"
 include "arch/x86_64/iommu.cyr"
 include "core/virtio_net.cyr"
 include "core/virtio_blk.cyr"
