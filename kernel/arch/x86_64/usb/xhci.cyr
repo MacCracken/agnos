@@ -116,6 +116,17 @@ fn xhci_probe() {
     xhci_present   = 1;
     xhci_pci_idx   = idx;
     xhci_mmio_base = mmio;
+
+    # 5b. Repair (X) — remap the BAR's 2MB chunk as UC. Attempt 43 CMOS
+    # confirmed F5: [0x71]=0x00 (MTRRs disabled) + [0x72]=0x06 (PA0=WB).
+    # The boot-time identity map (pt_init) covers this BAR via either
+    # PD@0x3000 (BAR<1GB) or PDPT[1..3]'s 1GB huge pages (BAR≥1GB), both
+    # at flag 0x83 → PAT entry 0 = WB. PORTSC writes were coalescing in
+    # L1/L2 (Attempt 42 stamped 3 deterministic silent-absorbs via the
+    # Repair-T retry loop). vmm_remap_uc_2mb selects PA3=UC for this
+    # chunk only, leaving surrounding RAM WB-cached.
+    vmm_remap_uc_2mb(mmio);
+
     xhci_cap_len   = xhci_cap_read8(XHCI_CAP_CAPLENGTH);
     xhci_version   = xhci_cap_read16(XHCI_CAP_HCIVERSION);
 

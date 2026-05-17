@@ -32,6 +32,55 @@ fn vmm_map_user_exec(virt, phys) {
     return vmm_map(virt, phys, 0x87);
 }
 
+# Repair (X) — remap a single 2MB chunk as Uncacheable (UC) by setting
+# PCD=1 | PWT=1 (PAT-bit=0) on the controlling PDE. For 2MB pages the
+# PAT-index bits are {PWT=3, PCD=4, PAT=12}; PWT|PCD|PAT=011 selects PAT
+# entry 3, which under the firmware-default PAT MSR (0x0007040600070406)
+# is UC (0x00). Used for MMIO BARs (xHCI, AHCI, etc.) where coalesced
+# writes in WB-cached mappings reach the controller silently absorbed.
+#
+# F5 was confirmed Attempt 43 on archaemenid: CMOS[0x71]=0x00 (MTRRs
+# globally disabled, PAT alone governs), CMOS[0x72]=0x06 (PA0=WB). The
+# default vmm_map(..., 0x83) on a 2MB PDE selects PAT entry 0 (PCD=PWT=
+# PAT=0) → WB → PORTSC writes coalesce in L1/L2 and never reach the
+# xHCI controller. PA3=UC is the only firmware-default PAT entry that
+# is reachable with PAT-bit=0 (PA1=WC, PA2=UC- need PAT=1).
+#
+# Strategy by physical address:
+#   < 1 GB:   the chunk is mapped via PD@0x3000 (set by pt_init). Rewrite
+#             the controlling PDE in place with flag 0x9B (0x83 | 0x18).
+#   1–4 GB:   pt_init mapped these as 1 GB huge pages in PDPT[1..3].
+#             Shatter the containing 1 GB region: allocate a fresh PD,
+#             fill 512 identity 2MB entries (WB), override the BAR's
+#             chunk to UC, then point PDPT[gb_idx] at the new PD (PS=0).
+#             CR3 reload evicts the 1 GB-page TLB entry.
+#
+# Returns 1 on success, 0 on pmm_alloc failure (shatter case only).
+fn vmm_remap_uc_2mb(phys) {
+    var chunk = phys & 0xFFFFFFFFFFE00000;
+    if (phys < 0x40000000) {
+        var pd_idx = (phys >> 21) & 0x1FF;
+        store64(0x3000 + pd_idx * 8, chunk | 0x9B);
+        var flush = phys;
+        asm { invlpg [rax]; }
+        return 1;
+    }
+    var gb_idx = (phys >> 30) & 0x1FF;
+    var new_pd = pmm_alloc();
+    if (new_pd == 0) { return 0; }
+    var gb_base = gb_idx * 0x40000000;
+    for (var i = 0; i < 512; i = i + 1) {
+        var addr = gb_base + i * 0x200000;
+        var pde  = addr | 0x83;
+        if (addr == chunk) { pde = addr | 0x9B; }
+        store64(new_pd + i * 8, pde);
+    }
+    store64(0x2000 + gb_idx * 8, new_pd | 0x03);
+    asm { mov rax, cr3; }
+    asm { mov cr3, rax; }
+    return 1;
+}
+
 fn vmm_unmap(virt) {
     var pd_idx = (virt >> 21) & 0x1FF;
     store64(0x3000 + pd_idx * 8, 0);

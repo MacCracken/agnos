@@ -5,7 +5,99 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.30.2] — 2026-05-16
+
+**xHCI Phase 3 closeout — `vmm_remap_uc_2mb` lands the xHCI BAR on
+PA3=UC, fixing the PORTSC silent-absorb that survived seven Phase-3
+repairs.** Roll-up of all Unreleased work since 1.30.0 plus the
+F5 (MMIO write-coalescing) investigation arc — Repair (S')
+one-nibble RWS-mask typo fix, Repair (T) Linux-style PR retry
+diagnostic, Repair (V) MTRR/PAT cache-attribute diagnostic, and
+Repair (X) the actual unblock. 1.30.1 was a pre-iron-validation tag
+on the S-only stack; 1.30.2 supersedes it directly.
+
 ### Fixed
+
+- **xHCI Phase 3 — remap MMIO BAR as Uncacheable via
+  `vmm_remap_uc_2mb`** (Repair (X), `kernel/core/vmm.cyr`,
+  `kernel/arch/x86_64/usb/xhci.cyr`). F5 (MMIO write-coalescing in
+  WB-cached BAR mapping) confirmed by Attempt 43's Repair-(V)
+  diagnostic: `CMOS[0x71]=0x00` (MTRRs globally disabled, PAT alone
+  governs) + `CMOS[0x72]=0x06` (PA0=WB). The boot-time identity map
+  set by `pt_init` covers the xHCI BAR via either PD@0x3000 (BAR<1GB,
+  2MB pages) or PDPT[1..3]'s 1GB huge pages (1–4GB) — both at flag
+  `0x83` (P|RW|PS). For 2MB+ pages the PAT-index bits are {PWT=3,
+  PCD=4, PAT=12}; with all three zero the page selects PAT entry 0 =
+  PA0 = WB under firmware-default `0x0007040600070406`. PORTSC writes
+  therefore coalesced in L1/L2 and never reached the xHCI controller
+  on archaemenid's AMD FCH — matching Attempt 42's deterministic
+  3-of-3 silent-absorbs through Repair (T)'s retry loop. New
+  `vmm_remap_uc_2mb(phys)` flips PWT|PCD on the 2MB chunk containing
+  `phys` (PWT|PCD|PAT=011 selects PA3 = UC under firmware default),
+  handling both the in-place PDE rewrite case (phys<1GB, flag
+  `0x9B`) and the 1GB-page shatter case (phys≥1GB: allocate a new PD
+  via `pmm_alloc`, fill 512 identity 2MB entries, override the
+  target chunk to UC, repoint PDPT[gb_idx] at the new PD with PS=0,
+  CR3 reload to evict the 1GB-page TLB entry). `xhci_probe` calls
+  `vmm_remap_uc_2mb(mmio)` immediately after caching `xhci_mmio_base`,
+  ahead of the first CAPLENGTH read. On archaemenid the BAR at
+  `0xFC800000` falls in PDPT[3]'s 1GB huge page (3–4GB) and exercises
+  the shatter path; on QEMU `-cpu max` the BAR lands at `0xFEBF0000`
+  (just under 4GB) and also exercises the shatter path. Only the
+  BAR's single 2MB chunk is UC — surrounding RAM and MMIO stay
+  WB-cached. Iron-test gate: `xhci: port N connected, …` line
+  surfaces between `xhci: PP=1 asserted, bitmap=63` and
+  `VFS initialized`; `CMOS[0x64]` reset-OK bitmap shows a non-zero
+  bit for the connected port; `CMOS[0x6C]` PSC-change byte shows
+  PRC|PED (`0x21`) instead of `0x00`. Floor for revert: pre-X binary
+  (post-V from Attempt 43).
+
+- **xHCI Phase 3 — MTRR/PAT MMIO cache-attribute diagnostic**
+  (Repair (V), `kernel/arch/x86_64/usb/xhci.cyr`,
+  `kernel/arch/x86_64/io.cyr`). Pure read-only diagnostic added to
+  `xhci_probe` to disambiguate F5 (MMIO write-coalescing) from the
+  remaining controller-side hypotheses after Repair (T)'s PR-retry
+  loop hit deterministic 3-of-3 silent-absorbs at Attempt 42. New
+  `rdmsr` helper in `kernel/arch/x86_64/io.cyr` wraps the
+  `rdmsr` instruction (ECX=MSR index, returns EDX:EAX combined as
+  a 64-bit value); `xhci_probe` stamps `MTRR_DEF_TYPE` (MSR `0x2FF`)
+  low byte to `CMOS[0x71]` and `PAT` (MSR `0x277`) byte-0 (PA0) to
+  `CMOS[0x72]`. The decoder cheat-sheet in
+  `agnosticos/scripts/src/read-boot-log.cyr` translates these into
+  the F5-confirmed / F5-weakened / helper-didn't-execute outcomes.
+  Attempt 43 stamped `[0x71]=0x00` (MTRRs globally disabled — bit 11
+  E=0, byte=UC default) and `[0x72]=0x06` (PA0=WB) — F5 confirmed.
+  No controller-side risk; `rdmsr` is a non-faulting privileged read
+  on every x86_64 since the Pentium.
+
+- **xHCI Phase 3 — Linux-style PR retry loop** (Repair (T),
+  `kernel/arch/x86_64/usb/xhci_port.cyr`). USB-core `hub.c`
+  retries `USB_PORT_FEAT_RESET` up to 5× when the controller absorbs
+  the write; AGNOS now wraps the PR write + PRC-poll block in a
+  `retry < 3` loop and stamps the consumed retry count to
+  `CMOS[0x70]`. On archaemenid Attempt 42 the loop ran to exhaustion
+  (`[0x70]=0x03`) with no PRC/PED engagement at any iteration —
+  falsifying F4 (Linux-style retry) and surfacing F5 (MMIO cache)
+  as the surviving hypothesis. T is retained because the diagnostic
+  it produces (`[0x70]` retry count) is permanently useful for
+  detecting non-deterministic silicon and the 10-LOC cost is
+  negligible.
+
+- **xHCI Phase 3 — fix RWS-mask typo from Repair (S)** (Repair (S'),
+  `kernel/arch/x86_64/usb/xhci_regs.cyr`). Repair (S) landed with
+  `XHCI_PORTSC_RWS = 0x0E00C1E0` — dropping bit 9 (PP) vs Linux's
+  `0x0E00C3E0`. The S helper double-masked through the RWS gate,
+  stripping PP=0 on every PORTSC write; on AMD FCH the ports
+  quiesced (PP bitmap `0x3F` → `0x00`, CCS bitmap `0x04` → `0x00`)
+  at Attempt 40 and the entire xhci surface regressed. S' restores
+  `XHCI_PORTSC_RWS = 0x0E00C3E0` and `XHCI_PORTSC_NEUTRAL =
+  0x4E00FFE9` (RO|RWS = `0x40003C09 | 0x0E00C3E0`). One-nibble
+  constant fix; binary-size byte-equivalent (343,384 B both sides).
+  Attempt 41 restored Attempt-39 shape exactly (PP bitmap `0x3F`,
+  CCS `0x04`), confirming the typo was the sole regression vector
+  and that F3 (RW1C/RWS/LWS mask handling) is genuinely insufficient
+  on this silicon — escalating F4 → F5 → Repair (T) → Repair (V) →
+  Repair (X) which lands above.
 
 - **xHCI Phase 3 — normalize PORTSC RMW to Linux's
   `xhci_port_state_to_neutral` mask** (Repair (S),
