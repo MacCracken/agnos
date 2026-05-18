@@ -600,6 +600,11 @@ var xhci_kbd_slot_id = 0;
 # use). xhci_last_cmd_slot_id is the authoritative result via the cmd
 # completion event.
 fn xhci_enable_slot() {
+    kprint("xhci: enable_slot entry idx=", 28);
+    kprint_num(xhci_evt_ring_idx);
+    kprint(" cycle=", 7);
+    kprint_num(xhci_evt_ring_cycle);
+    kprintln("", 0);
     if (xhci_cmd_issue(0, 0, 0, XHCI_TRB_ENABLE_SLOT << 10) == 0) {
         kprint("xhci: Enable Slot failed, ccode=", 32);
         kprint_num(xhci_last_cmd_ccode);

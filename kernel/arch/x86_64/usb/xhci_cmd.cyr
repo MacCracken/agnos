@@ -40,6 +40,11 @@
 var xhci_last_cmd_slot_id = 0;
 var xhci_last_cmd_ccode   = 0;
 
+# Attempt-56 instrumentation — events consumed by the current xhci_cmd_wait
+# call. Reset per-call. Bound printed lines to keep FB output finite.
+var xhci_diag_evt_count = 0;
+var XHCI_DIAG_EVT_MAX   = 12;
+
 # Per-command-issue completion timeout. At a few cycles per load+load
 # pair this bounds wall time to roughly a quarter second on Zen — the
 # spec doesn't define a hard ceiling but contemporary controllers
@@ -93,6 +98,7 @@ fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
 # otherwise (caller is responsible for inspecting the ccode global on
 # failure to decide whether to print a per-cause line).
 fn xhci_cmd_wait(cmd_trb_phys) {
+    xhci_diag_evt_count = 0;
     var wait = 0;
     while (wait < XHCI_CMD_TIMEOUT_SPINS) {
         var evt_off = xhci_evt_ring_idx * 16;
@@ -105,6 +111,16 @@ fn xhci_cmd_wait(cmd_trb_phys) {
         # new event yet — keep spinning.
         if (evt_cycle == xhci_evt_ring_cycle) {
             var evt_type = (evt_dw3 >> 10) & 0x3F;
+            xhci_diag_evt_count = xhci_diag_evt_count + 1;
+            if (xhci_diag_evt_count <= XHCI_DIAG_EVT_MAX) {
+                kprint("xhci: evt#", 10);
+                kprint_num(xhci_diag_evt_count);
+                kprint(" type=", 6);
+                kprint_num(evt_type);
+                kprint(" cycle=", 7);
+                kprint_num(evt_cycle);
+                kprintln("", 0);
+            }
             if (evt_type == XHCI_TRB_CMD_COMPLETION) {
                 var evt_p_lo = load32(evt);
                 # Match on low 32 bits of cmd TRB phys — sufficient since
@@ -168,7 +184,13 @@ fn xhci_cmd_wait(cmd_trb_phys) {
     # xHCI 1.2 §6.4.5 so any non-zero check on the global still works.
     xhci_last_cmd_ccode   = 0;
     xhci_last_cmd_slot_id = 0;
-    kprintln("xhci: cmd completion timeout", 28);
+    kprint("xhci: cmd completion timeout, final_idx=", 40);
+    kprint_num(xhci_evt_ring_idx);
+    kprint(" cycle=", 7);
+    kprint_num(xhci_evt_ring_cycle);
+    kprint(" events_seen=", 13);
+    kprint_num(xhci_diag_evt_count);
+    kprintln("", 0);
     return 0;
 }
 
