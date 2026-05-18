@@ -5,213 +5,69 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-**Bundled atop 1.30.6 banner** — all changes part of the post-FF cmd-path triage cycle. Will roll into the next tagged release once the cmd-ring gate is closed.
+## [1.30.6] — 2026-05-18 (xHCI cmd-path arc — FF through QQ; MSI-X table programming closeout)
 
-### Added
+**Phase 4 Enable Slot `events_seen=0` opened the cmd-path silent-absorb arc; 1.30.6 bundles the full repair surface as code.** 1.30.5 closed the Phase 3 silent-absorb arc with Repair (EE) after 13 falsified hypotheses; 1.30.6 opens the Phase 4 cmd-path arc with Repair (FF) and accumulates ten subsequent behavioral repairs (GG, HH, JJ, KK, LL, MM, NN, OO, QQ + QQ'') as the four-source convergent-prior-art audit (Linux + FreeBSD + Haiku + EDK2 — see [`xhci-prior-art-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/xhci-prior-art-audit.md)) narrows the gate. As of the 1.30.6 cut: FF through OO burned and falsified across Attempts 57-62; QQ + QQ'' (MSI-X Table vector-0 programming) staged-not-yet-burned. Per the iron-bring-up convention, code lands in the release regardless of iron validation; iron resolution moves separately in [`iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md). Bottoming-out path if QQ falsifies: Repair (PP) UC-remap of DMA regions (event ring + cmd ring + DCBAA + scratchpad), pre-staged but not auto-applied; otherwise decouple Phase 4/5 to QEMU code-completion. **The whole arc bundles under one 1.30.6 banner** per the user's 2026-05-18 cycle directive ("I really don't care what fixes it I want it fixed... hardening and cleanup can always be done later") — no per-repair point release.
 
-- **Repair (MM)** — PCI MSI-X Function Mask cleared, leave Enable=1. New
-  `pci_enable_msix_unmasked` at `kernel/core/pci.cyr:191-238`; call-site
-  swap in `xhci.cyr:103-115` (was `pci_enable_msix_masked`). FB literal
-  changed: `xhci: MSI-X enabled (no function-mask)` (was `(function-mask)`).
-  Per-vector mask defaults to 1 (PCI 3.0 §6.8.2.5.3) so spurious MSI-X
-  messages stay suppressed even with Function Mask=0. Hypothesis: AMD FCH
-  1022:1639 interprets Function Mask as a stronger gate than PCI spec
-  implies — suppressing internal interrupter state-machine progress (DMA
-  event posting) on top of message TX suppression. Linux's
-  `pci_alloc_irq_vectors` path always leaves Function Mask=0 post-init.
-  Build size: 367,944 → 368,472 B (+528 B). Staged for Attempt 61 iron
-  burn; outcome pre-bound in
-  [`iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md)
-  § Attempt 61. **Decoupling decision**: if MM falsifies, no `Repair (NN)`
-  letter ladder — escalate as controller-firmware issue or pivot to
-  different bare-metal target; Phase 4/5 (HID configure + kb_buf) continues
-  in parallel.
+### The opening narrative — Repair (FF) and the events_seen=0 discovery
 
-- **Repair (HH)** — Post-doorbell-write `load32` readback flush in
-  `xhci_cmd_submit` (`xhci_cmd.cyr:130-131`). Matches Linux
-  `xhci_ring_cmd_db` (`xhci-ring.c`) — `writel(DB_VALUE_HOST, dba); readl(dba);`
-  AMD FCH 1022:1639 empirically misses doorbells without this readback (the
-  CPU-side store completes but the doorbell write sits in the host bridge's
-  posted-write queue indefinitely; UC mapping prevents CPU coalescing but
-  does not prevent host-bridge deferral). **Attempt 60 outcome**: HH
-  applied, `events_seen=0` persists — doorbell-flush hypothesis closed.
-
-- **Repair (JJ)** — Universal `load32` readback flush on every operational
-  + runtime register write. `xhci_op_write32`, `xhci_op_write64`,
-  `xhci_rt_write32`, `xhci_rt_write64` in `xhci.cyr:354-391` each do
-  `store…; var flush = load32(addr);`. Matches Linux convention (`writel +
-  readl` in `xhci-mem.c` / `xhci.c` — every CRCR / DCBAAP / ERSTBA /
-  ERSTSZ / ERDP / IMAN / USBCMD / CONFIG operational write followed by a
-  readback). **Attempt 60 outcome**: JJ applied universally, `events_seen=0`
-  persists — host-bridge posted-write deferral hypothesis closed across
-  the entire operational + runtime register surface.
-
-- **Repair (KK)** — CNR (Controller Not Ready, USBSTS bit 11) poll before
-  any operational-register writes in `xhci_start`. `xhci.cyr:540-559`.
-  Matches Linux `xhci_init` → `xhci_handshake(STS_CNR, 0, …)`. AMD FCH has
-  a documented post-reset CNR re-assert window where HCRST=0 but CNR=1,
-  and operational writes during that window are silently absorbed by the
-  controller. **Attempt 60 outcome**: KK applied, no `xhci: CNR never
-  cleared` line on FB → CNR was clear at the poll's first iteration; post-
-  reset CNR re-assert hypothesis closed for this silicon.
-
-- **Repair (LL)** — Link TRB initial cycle bit fix in `xhci_rings_init`.
-  `xhci_ring.cyr:179-192` — removed `| 0x1` from initial Link TRB write.
-  Per xHCI 1.2 §4.9.3.1 the Link TRB starts with C bit opposite of PCS=1
-  so HW doesn't follow it before SW fills the ring; SW updates Link TRB.C
-  to current PCS just before wrap (logic at lines 80-95). Matches Linux
-  `xhci_alloc_segment` (zeroes the ring, writes Link TRB type+TC without
-  setting C). First Enable Slot doesn't traverse Link TRB so LL is
-  defensive correctness — but spec-correct and shipped in same burn.
-
-- **Repair (GG)** — AMD-Vi global IOMMU disable for the AMD Renoir 1022:1639
-  platform (archaemenid iron target). `amd_iommu_disable()` at
-  `kernel/arch/x86_64/iommu.cyr:269-317` walks PCI 0:0.2 cap list for ID
-  `0x0F` (Secure Device), confirms cap type bits [18:16] == `0x3` (IOMMU),
-  extracts MMIO base, maps it UC, writes IOMMU Control Register at MMIO+0x18
-  = 0 (passthrough). Called from `kernel/core/main.cyr:155` after `pci_scan()`
-  and before `xhci_probe()`. Intel boxes no-op (no cap `0x0F` at 0:0.2 → early
-  return). Targets the "AMD Renoir firmware-enabled IOMMU silently blocks
-  every device DMA pre-OS-setup" hypothesis bound at the Attempt 57 close.
-  **Iron outcome (Attempt 58)**: FB confirms `amdvi: cap@64 mmio=4247781376
-  en=1` + `amdvi: disabled, ctrl_rb=0` — AMD-Vi *was* firmware-enabled, GG
-  wrote successfully. But `events_seen=0` persists for Enable Slot
-  specifically. **GG is the 15th falsified hypothesis** in the silent-absorb /
-  event-posting arc — the strongest "platform-side DMA gating" candidate is
-  now eliminated. Proper passthrough / DTE setup is v6.x territory.
-
-- **Edit A** — read-only CRCR.CRR / ERSTSZ / IMAN / ERDP readback after
-  `xhci_start` completes the R/S=1 + HCH=0 wait. `xhci.cyr:583-603`. Single
-  FB line: `xhci: CRCR.CRR=<N> ERSTSZ=<N> IMAN=<N> ERDP_lo=<N>`. **Attempt
-  58 outcome**: `CRCR.CRR=0 ERSTSZ=1 IMAN=2 ERDP_lo=5672968`. IMAN=2 (IE=1
-  + IP=W1C-cleared) formally confirms Repair (FF) stuck at the register.
-  ERSTSZ=1 confirms our write reached the controller. ERDP_lo=`0x569008` =
-  page-aligned `0x569000` + EHB bit 3 set by HW — proves HW touched the
-  event handler. CRCR.CRR=0 is spec-ambiguous at this readback position
-  (pre-doorbell); promoted to primary suspect pending post-doorbell
-  disambiguation in Attempt 60+.
-
-- **Edit B** — read-only per-submit TRB phys + dw3 readback in
-  `xhci_cmd_submit`. `xhci_cmd.cyr:53-54, 99-109`. Print bounded to 2
-  submissions via `XHCI_DIAG_SUBMIT_MAX`. FB line: `xhci: cmd_submit#<N>
-  trb_phys=<P> dw3=<D>`. Verifies (a) the TRB landed at the address HW will
-  fetch from (`xhci_cmd_ring_phys + idx*16`) and (b) the cycle bit + TRB
-  type were stored correctly. **Attempt 58 outcome**: print line MISSING from
-  FB. Root cause identified as stale USB build (Edit B in commit `0e3d01a` at
-  20:21; `build/agnos` was timestamped 20:20; USB flashed pre-commit).
-  `build/agnos` rebuilt 20:53 and verified to contain `xhci: cmd_submit#`
-  literal via `strings`. Attempt 59 re-burn pending on fresh USB to capture
-  the readback values.
-
-### Iron status (Attempts 57 + 58)
-
-- **Attempt 57** (2026-05-17, clean FF cut): 14th falsified hypothesis in
-  the silent-absorb arc. `events_seen=0` survived IMAN.IE=1 alone. The
-  search class narrowed from "event posting infrastructure" to "platform-
-  or cmd-ring-side gating."
-- **Attempt 58** (2026-05-17, GG + Edits A+B bundled in `0e3d01a`):
-  **Breakthrough — `xhci: drained 1 events` (was 0 in Attempts 56/57) +
-  EHB=1 in ERDP_lo prove HW *is* posting events to the ring.** Either FF
-  (IMAN.IE=1) or GG (AMD-Vi disable) was the unblock for general event
-  posting; the two were bundled so we can't attribute cleanly without a
-  decoupling burn (deprioritized — diagnostic gain low vs iron-burn cost).
-  The gate is now narrow: Enable Slot specifically produces no
-  CMD_COMPLETION event. Three open sub-classes: (a) CRCR write absorbed →
-  cmd ring base never latched, (b) cmd ring latched but first TRB cycle bit
-  wrong → HW skips, (c) doorbell write absorbed. Attempt 59 closes class
-  (b) via Edit B readback.
-- **Phase 3 reset on port 3**: still UNBLOCKED across Attempts 55-58
-  (Repair EE intact two minors running).
-- **CMOS extended-CMOS-offset-≥6 alias quirk** (`[0x86]=0x5A` /
-  `[0x87]=0xA5`): firmware-managed by AMD FCH 1022:1639, reproducible across
-  builds, not a code regression.
-
-### Process
-
-- **Build freshness ownership clarified mid-Attempt-58**: kernel build
-  freshness during iron-boot bring-up is Claude's responsibility (per
-  `feedback_bootloader_kernel_ownership` and now also
-  `feedback_build_freshness_is_mine`). User owns `install-usb.sh --update`;
-  Claude must rebuild + verify before declaring next-burn-ready. The cost of
-  the un-clarified ownership: one iron burn (Attempt 58) effectively
-  half-instrumented because the USB had a pre-commit build.
-
-## [1.30.6] — 2026-05-17 (Repair FF — IMAN.IE=1; events were never posting on AMD FCH)
-
-**Phase 4 Enable Slot `events_seen=0` root-caused as IMAN.IE=0 silent
-event-posting block.** Attempt 56 burn (2026-05-17, archaemenid AMD
-Renoir 1022:1639) was the read-only event-ring-state instrumentation cut
-queued in the 1.30.5 working tree. FB output:
+Attempt 56 burn (2026-05-17, archaemenid AMD Renoir 1022:1639) was the read-only event-ring-state instrumentation cut queued in the 1.30.5 working tree. FB output:
 
 ```
 xhci: enable_slot entry idx=1 cycle=1
 xhci: cmd completion timeout, final_idx=1 cycle=1 events_seen=0
 ```
 
-`events_seen=0` over the full `XHCI_CMD_TIMEOUT_SPINS` (~250 ms) window
-following the Enable Slot doorbell, combined with `xhci: drained 0
-events` from the pre-PR drain, means the controller never wrote a
-single event to the event ring after R/S=1 — not the expected Command
-Completion Event, not the PSC events from the reset loop (which
-`Reset events bitmap=63` had suggested fired). Triage class 3
-(event-ring polling vs PSC events from PR-engaged reset) is falsified:
-there are no events to poll. The event ring infrastructure itself was
-correctly programmed (ERSTSZ=1, ERSTBA=erst_phys, ERDP=evt_ring_phys,
-CRCR pointer + RCS=1 ordering all clean per audit), but the interrupter
-was disabled.
+`events_seen=0` over the full `XHCI_CMD_TIMEOUT_SPINS` (~250 ms) window following the Enable Slot doorbell, combined with `xhci: drained 0 events` from the pre-PR drain, meant the controller never wrote a single event to the event ring after R/S=1. The event ring infrastructure itself was programmed correctly (ERSTSZ=1, ERSTBA=erst_phys, ERDP=evt_ring_phys, CRCR pointer + RCS=1 ordering all clean per audit), but the interrupter appeared disabled.
 
-Root cause: `xhci_start` wrote `IMAN = 0x1` (IP clear, **IE=0**) with a
-deliberate comment "IMAN.IE (bit 1) stays 0 — poll mode for MVP." xHCI
-1.2 §5.5.2.1 spec text reads as if IE only gates interrupt generation,
-not event posting, but Linux `xhci-mem.c` sets IE=1 unconditionally and
-AMD FCH silicon empirically gates event posting on IE=1 (which §4.17's
-"Software shall set the IE flag to '1' for all Interrupters that it
-intends to use" is the canonical reading of). With IE=0, the controller
-treats the interrupter as disabled and silently drops all events.
-
-**Repair (FF)** — one-line fix at
-`kernel/arch/x86_64/usb/xhci.cyr:541`:
-
-```cyrius
-# Before
-xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x1);
-# After
-xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x3);
-```
-
-Mask is now `IP=W1C clear | IE=set`. Safe under MSI-X function-mask
-(FB confirms `MSI-X enabled (function-mask)`): the controller may
-assert an MSI but the function-mask suppresses delivery, so no unwired
-IDT vector is exposed. When MSI-X bring-up lands in a later phase, an
-ISR + IDT vector pair is added then; IE=1 already in place.
-
-This is structurally the same shape as Repair (EE): a deliberate AGNOS
-deviation from Linux's convention, justified by a spec reading that
-appeared defensible in isolation, falsified empirically by AMD FCH
-silicon. EE was an inner re-mask stripping the PR bit; FF is an "IE=0
-in poll mode" assumption silently disabling event posting. Both
-surfaced via prior-art diff (EDK2 + Linux) rather than per-spec audit.
+Initial hypothesis (Repair FF): `xhci_start` wrote `IMAN = 0x1` (IP clear, **IE=0**) with a deliberate "IMAN.IE stays 0 — poll mode for MVP" comment. xHCI 1.2 §4.17 reads "Software shall set the IE flag to '1' for all Interrupters that it intends to use" — and Linux's `xhci-mem.c` sets IE=1 unconditionally. One-line fix at `kernel/arch/x86_64/usb/xhci.cyr:541`: `IMAN = 0x3` (IP=W1C clear + IE=1). **Attempt 57 falsified this as the unblock for Enable Slot specifically** — Attempt 58 then proved (via the GG+EditA+EditB bundle) that *some* events post (`drained 1 events`), narrowing the gate to "Enable Slot CCE silent-absorb" rather than "entire event ring silent." The arc opened from there. FF stayed in the code (spec-correct, Linux-aligned); subsequent repairs targeted the increasingly narrow cmd-path-specific gate.
 
 ### Added
 
-- **Repair (FF)** — `xhci_start` now writes `IMAN = 0x3` (IP clear +
-  IE set) instead of `IMAN = 0x1`. AMD FCH 1022:1639 requires IE=1 to
-  post events to the event ring; without it the entire interrupter is
-  treated as disabled and all events (CCE, PSC, transfer) are dropped
-  silently. (`kernel/arch/x86_64/usb/xhci.cyr:541`)
+- **Repair (FF)** 2026-05-17 — `xhci_start` writes `IMAN = 0x3` (IP=W1C clear + IE=1) instead of `IMAN = 0x1`. xHCI 1.2 §4.17 + Linux `xhci-mem.c` convention; AMD FCH 1022:1639 silicon-spec alignment. One-line behavioral change at `kernel/arch/x86_64/usb/xhci.cyr:541`. **Attempt 57 outcome**: `events_seen=0` survived — IMAN.IE=1 alone did not unblock Enable Slot CCE posting (though it likely contributed to general event posting per Attempt 58's drained-1 evidence). FF stays in code as spec-correct baseline.
 
-### Iron status
+- **Repair (GG)** 2026-05-17 — AMD-Vi global IOMMU disable for AMD Renoir 1022:1639. `amd_iommu_disable()` at `kernel/arch/x86_64/iommu.cyr:269-317` walks PCI 0:0.2 cap list for ID `0x0F` (Secure Device), confirms cap type bits [18:16]==`0x3` (IOMMU), maps MMIO base UC, writes IOMMU Control Register at MMIO+0x18 = 0 (passthrough). Called from `kernel/core/main.cyr:155` after `pci_scan()` and before `xhci_probe()`. Intel boxes no-op. **Attempt 58 outcome**: FB confirms `amdvi: cap@64 mmio=4247781376 en=1` + `amdvi: disabled, ctrl_rb=0` — AMD-Vi *was* firmware-enabled, GG wrote successfully — but `events_seen=0` persists for Enable Slot. Strongest "platform-side DMA gating" candidate eliminated. Proper passthrough / DTE setup deferred to v6.x.
 
-- **Phase 4 Enable Slot** — Attempt 56 burn confirmed `events_seen=0`
-  as the gate; FF is the proposed unblock. Attempt 57 will be the FF
-  iron test. Phase 4 (`hid_kbd_configure`) and Phase 5 (`hid_poll` +
-  HID→PS/2 + `kb_buf` writer) remain code-surface complete; both stay
-  dormant on iron until Enable Slot returns a valid slot ID + ccode=1.
-- **CMOS post-mortem slots** unchanged from 1.30.5; the FF site is
-  pre-instrumentation (xhci_start, before any per-port stamps), so the
-  iron evidence for FF is the FB lines `enable_slot entry idx=X
-  cycle=Y` + `cmd completion timeout … events_seen=N` from the
-  Attempt 56 instrumentation already in `xhci_cmd_wait`.
+- **Repair (HH)** 2026-05-17 — Post-doorbell-write `load32` readback flush in `xhci_cmd_submit` (`xhci_cmd.cyr:130-131`). Matches Linux `xhci_ring_cmd_db` (`xhci-ring.c`) `writel(DB_VALUE_HOST, dba); readl(dba);` convention against AMD-FCH host-bridge posted-write deferral. **Attempt 60 outcome**: applied as part of HH/JJ/KK/LL stack; `events_seen=0` persists — doorbell-flush hypothesis closed.
+
+- **Repair (JJ)** 2026-05-17 — Universal `load32` readback flush on every operational + runtime register write. `xhci_op_write32`, `xhci_op_write64`, `xhci_rt_write32`, `xhci_rt_write64` in `xhci.cyr:354-391` each do `store…; var flush = load32(addr);`. Matches Linux's `writel + readl` universal convention across CRCR / DCBAAP / ERSTBA / ERSTSZ / ERDP / IMAN / USBCMD / CONFIG. **Attempt 60 outcome**: `events_seen=0` persists — host-bridge posted-write deferral hypothesis closed across the entire operational + runtime register surface.
+
+- **Repair (KK)** 2026-05-17 — CNR (Controller Not Ready, USBSTS bit 11) poll before any operational-register writes in `xhci_start`. `xhci.cyr:540-559`. Matches Linux `xhci_init` → `xhci_handshake(STS_CNR, 0, …)`. **Attempt 60 outcome**: no `xhci: CNR never cleared` line on FB → CNR was clear at the poll's first iteration; post-reset CNR re-assert hypothesis closed for this silicon.
+
+- **Repair (LL)** 2026-05-17 — Link TRB initial cycle bit fix in `xhci_rings_init` (`xhci_ring.cyr:179-192`) — removed `| 0x1` from initial Link TRB write per xHCI 1.2 §4.9.3.1 (C bit starts opposite of PCS=1). Defensive correctness for ring-wrap; first Enable Slot doesn't traverse Link TRB so LL doesn't gate the symptom but stays as spec correctness.
+
+- **Repair (MM)** 2026-05-17 — PCI MSI-X Function Mask cleared, Enable=1. New `pci_enable_msix_unmasked` at `kernel/core/pci.cyr:216-241`; call-site swap in `xhci.cyr` (was `pci_enable_msix_masked`). FB literal: `xhci: MSI-X enabled (no function-mask)`. Matches Linux `pci_alloc_irq_vectors` posture (Function Mask = 0 post-init). Per-vector mask defaults to 1 (PCI 3.0 §6.8.2.5.3) so spurious MSI-X messages stay suppressed. Hypothesis: AMD FCH 1022:1639 interprets Function Mask as a stronger gate than PCI spec implies (suppressing internal interrupter state-machine progress on top of message TX suppression). **Attempt 61 outcome**: `events_seen=0` persists — Function Mask hypothesis closed.
+
+- **Repair (NN)** 2026-05-18 — Two-LOC reorder in `xhci.cyr` per four-source convergent prior-art audit ([`xhci-prior-art-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/xhci-prior-art-audit.md)). (NN.A) `xhci_start` interrupter-setup writes ERDP before ERSTBA per xHCI 1.2 §5.5.2.3.3 + 3-of-4 prior-art convergence (FreeBSD `xhci.c:1505-9`, Haiku `xhci.cpp:1744-9`, EDK2 `XhciSched.c:2651-9`); (NN.B) CRCR moved to after IMOD per 2-of-4 prior-art convergence (FreeBSD `xhci.c:1517-23`, Haiku `xhci.cpp:1756-7`). Zero-risk hygiene; spec-strict. **Attempt 62 outcome (bundled with OO)**: `events_seen=0` persists — both reorderings were zero-risk hygiene that did not address the gate. Stays in code as spec-correct convergent-prior-art alignment.
+
+- **Repair (OO)** 2026-05-18 — Tier 2 convergent-prior-art bundle, four sub-repairs in `xhci.cyr` + `xhci_cmd.cyr`. (OO.A) USBSTS RW1C-clear at `xhci_start` entry (FreeBSD `xhci.c:1463-66` pattern); (OO.B) IMAN.IE write moved to AFTER R/S=1 (Linux `xhci.c:1145-7` convention; reverses Repair FF's pre-R/S placement); (OO.C) explicit `mfence` before doorbell write; (OO.D) cmd-ring TRB readback flush. **Attempt 62 outcome**: bundled with NN, `events_seen=0` persists. None of A/B/C/D unblocked. Stays as Linux-convention-aligned baseline.
+
+- **Repair (QQ + QQ'')** 2026-05-18 — MSI-X Table vector-0 programming + Linux's MaskAll-then-table-then-clear-MaskAll ordering. MSI-X audit ([iron-nuc-zen-log § Attempt 63 prep](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md)) found AGNOS never wrote the MSI-X Table — every vector's Address/Data/Vector Control was at reset (Address=0, Data=0, Vector Control=1 by reset per PCI 3.0 §6.8.2.5.3), while Linux's `msix_capability_init` populates Address/Data for every claimed vector BEFORE clearing FuncMask. Hypothesis: AMD FCH 1022:1639's interrupter state machine gates event posting on a configured (non-zero Address) table. Edits: `kernel/core/pci.cyr` extends `pci_enable_msix_unmasked` with three-phase ordering — **Phase 1**: Enable+FuncMask=1 (MaskAll-during-init window); **Phase 2**: read Table Offset/BIR from cap+0x04, compute `table_phys = BAR(BIR) + offset`, write vector 0's Address Lo = 0xFEE00000 (BSP LAPIC, dest CPU 0, physical mode) + Address Hi = 0 + Data = 0x40 (vector 0x40, Fixed delivery, Edge trigger) + Vector Control = 1 (mask preserved — AGNOS polls, no ISR plumbing required), readback flush; **Phase 3**: clear FuncMask. `kernel/arch/x86_64/usb/xhci.cyr`: MSI-X enable call reordered to AFTER `vmm_remap_uc_2mb` so table writes hit the UC-remapped BAR chunk (mandatory — pre-Repair-X PORTSC silent-absorb-in-WB hazard otherwise). Build: 368,568 → **368,968 B** (+400 B). **First repair in the arc tied to a direct, named, Linux-implicit divergence** (not a spec-path reorder). Confidence: medium-high. Vendor-cap audit confirmed Linux applies no `1022:1639`-gated quirk to the cold-boot Enable Slot path (dry well); BAR memtype audit confirmed AGNOS matches `ioremap_uc()` semantics (PWT=1+PCD=1+PAT=0 → PAT entry 3 = strict UC under firmware PAT MSR `0x0007040600070406`). Staged for Attempt 63 iron burn.
+
+- **Edit A** 2026-05-17 — read-only CRCR.CRR / ERSTSZ / IMAN / ERDP readback after `xhci_start` completes the R/S=1 + HCH=0 wait (`xhci.cyr:583-603`). Single FB line: `xhci: CRCR.CRR=<N> ERSTSZ=<N> IMAN=<N> ERDP_lo=<N>`. **Attempt 58 outcome**: `CRCR.CRR=0 ERSTSZ=1 IMAN=2 ERDP_lo=5672968`. IMAN=2 (IE=1 + IP=W1C-cleared) formally confirms FF stuck. ERSTSZ=1 + ERDP_lo=`0x569008` (page-aligned `0x569000` + EHB bit 3 set by HW) prove ring infrastructure is good and HW touched the event handler. CRCR.CRR=0 is spec-ambiguous pre-doorbell.
+
+- **Edit B** 2026-05-17 — read-only per-submit TRB phys + dw3 readback in `xhci_cmd_submit` (`xhci_cmd.cyr:53-54, 99-109`), bounded to 2 submissions via `XHCI_DIAG_SUBMIT_MAX`. FB line: `xhci: cmd_submit#<N> trb_phys=<P> dw3=<D>`. Verifies (a) TRB landed at the address HW will fetch from and (b) the cycle bit + TRB type were stored correctly. **Attempt 58 outcome**: print line MISSING from FB due to stale USB build (Edit B in commit `0e3d01a` at 20:21; `build/agnos` was timestamped 20:20; USB flashed pre-commit). Root-cause established the `feedback_build_freshness_is_mine` discipline.
+
+### Iron status (Attempts 56 — 62, archaemenid AMD Renoir 1022:1639)
+
+- **Attempt 56** (2026-05-17): event-ring-state instrumentation cut. `events_seen=0` discovered as the cmd-path gate. Triage class 3 (event polling vs PSC posting) falsified — no events on ring at all.
+- **Attempt 57** (2026-05-17, FF): `events_seen=0` survived IMAN.IE=1. Search class narrowed from "event posting infrastructure" to "platform- or cmd-ring-side gating."
+- **Attempt 58** (2026-05-17, GG + Edits A+B): **Breakthrough — `xhci: drained 1 events` (was 0 in 56/57) + EHB=1 in ERDP_lo prove HW *is* posting events to the ring.** Either FF or GG was the unblock for general posting (the two were bundled — decoupling burn deprioritized as low-info vs cost). The gate narrowed to "Enable Slot specifically produces no CMD_COMPLETION event."
+- **Attempts 59-60** (2026-05-17, HH/JJ/KK/LL stack): all four falsified. `events_seen=0` persists.
+- **Attempt 61** (2026-05-18, MM): MSI-X Function Mask clear — falsified.
+- **Attempt 62** (2026-05-18, NN+OO bundled): four-source convergent prior-art reorders (NN.A/B) + Tier 2 bundle (OO.A/B/C/D) — all falsified. 9-letter ladder closed at OO; `feedback_stop_letter_laddering` triggered.
+- **Vendor-cap audit** (2026-05-18, 0 burns): Linux applies exactly one `1022:1639`-gated quirk (`XHCI_BROKEN_D3COLD_S2I`), irrelevant to cold-boot Enable Slot. `drivers/usb/host/xhci-ring.c` `handle_cmd_completion` / `queue_command` / `xhci_ring_cmd_db` contain no AMD-gated branches. FreeBSD `xhci_pci_attach` applies zero AMD errata for `0x1639`. **Dry well — no Repair (QQ) candidate from Linux quirks.**
+- **MSI-X table + BAR memtype audit** (2026-05-18, 0 burns, parallel): MSI-X table never programmed — DIVERGENCE FOUND (Repair QQ candidate). BAR memtype matches `ioremap_uc()` strict UC — CLEAN.
+- **Attempt 63 (QQ + QQ'')** staged 2026-05-18: build verified 368,968 B; pending iron burn.
+- **Phase 3 reset on port 3**: still UNBLOCKED across Attempts 55-62 (Repair EE intact across two minors running).
+- **CMOS slot integrity** (archaemenid CMOS map): `[0x86]=0x5A` / `[0x87]=0xA5` corruption confirms those slots are not in virgin-scratch zone (0x50-0x7F). AA (0x81) / BB (0x84) sentinels intact — 0x80-0x84 band confirmed reliable scratch on AMD FCH 1022:1639.
+
+### Process
+
+- **Build freshness ownership** clarified mid-Attempt-58: kernel build freshness during iron-boot bring-up is Claude's responsibility (`feedback_bootloader_kernel_ownership`, `feedback_build_freshness_is_mine`). User owns `install-usb.sh --update`; Claude rebuilds + verifies before declaring next-burn-ready. Cost of un-clarified ownership: one half-instrumented iron burn (Attempt 58, pre-commit USB).
+- **Letter-laddering escape plan** (`feedback_stop_letter_laddering`): at 9 letters deep (FF→OO) the escape plan crystallized as the load-bearing artifact, not the next letter. Two read-only audits (vendor-cap, MSI-X+BAR memtype) ran in lieu of stacking Repair (PP) on iron. The MSI-X audit surfaced QQ; the BAR memtype audit confirmed AGNOS exceeds Linux semantics. Documented in [iron-nuc-zen-log § Attempt 62 final entry](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
+- **Single-repair-per-burn discipline suspended** for the cmd-path arc (user directive 2026-05-18): "I really don't care what fixes it I want it fixed... hardening and cleanup can always be done later." Multi-repair bundles permitted (NN+OO bundled at Attempt 62; QQ + QQ'' bundled in this cut). Instrumentation discipline (`feedback_no_instrumentation_means_no_instrumentation`) remains in force — no kprintlns added in NN/OO/QQ.
+- **Convergent-prior-art audit** as a pattern (new this cycle): when symptom-dictionary letter-laddering hits 5-6 deep on the same root, write a baseline-diff doc against ≥3 independent reference impls. Was missing through FF/GG/HH/JJ/KK/LL/MM; would have collapsed those into a single bundle. Pattern documented at [`xhci-prior-art-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/xhci-prior-art-audit.md).
 
 ## [1.30.5] — 2026-05-17 (Repair EE — xHCI silent-absorb arc closed; Phase 4 + Phase 5 HID keyboard driver landed)
 
