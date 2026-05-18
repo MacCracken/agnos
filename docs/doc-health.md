@@ -36,7 +36,7 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 | File | Last touched | Status | Notes |
 |---|---|---|---|
-| `README.md` | 2026-05-11 | 🟡 Stale | "Size Comparison" section claims `AGNOS \| ~243 KB`; current binary is **368,968 B (~360 KB)** at v1.30.7. Cyrius pin reference may also drift. Recommended refresh: re-anchor binary-size claims to point at `state.md` (lib-doc precedent), or rewrite to current numbers. Lower priority than agnosticos README per the lib-doc-precedent gap analysis in agnosticos doc-health.md. |
+| `README.md` | 2026-05-18 | ✅ Fresh | **Refreshed 2026-05-18 (Path-A cleanup sweep)**: Quick Start QEMU `-kernel` command replaced with Path-C gnoboot+OVMF flow + `agnosticos/scripts/install-usb.sh` iron flow; Architecture ASCII boot-path rewritten for Path-C (UEFI → gnoboot → boot-info struct → ELF64 + RDI handoff); Project Map `lib/` → `klib/` (3 files), added `version.cyr` (v1.30.2+), added `arch/x86_64/usb/` subdir; Benchmarks section pointed at `gnoboot/tests/ovmf_smoke.sh` (legacy `-kernel` flow retired with multiboot1); Requirements section updated to note OVMF requirement + SMEP+SMAP framing; **Subsystems table extended (35 → 36+)**: Boot row updated to Path-C, Keyboard row notes USB-HID-boot via xHCI, new rows for xHCI Host Controller + USB-HID-boot Keyboard, Page Tables row notes 4 GB ceiling + Repair (X) UC remap. Lib-doc precedent applied to Size Comparison table (dropped size cell, deferred to state.md). Closes the Path-A cosmetic-cleanup follow-up flagged in roadmap.md § Next cycle. |
 | `CHANGELOG.md` | 2026-05-18 | ✅ Fresh | **Just consolidated**: the v1.30.6 entry now bundles the full xHCI cmd-path arc (Repairs FF → QQ across Attempts 56-62) into one comprehensive section; empty `[1.30.7] — 2026-05-18` placeholder added by `scripts/version-bump.sh` to accumulate next-cycle entries. |
 | `CLAUDE.md` | 2026-05-14 | ✅ Fresh | Durable-only structure; volatile state correctly deferred to state.md. No drift in rules across the v1.28.x → v1.30.x arcs. |
 | `BENCHMARKS.md` | (pre-v1.30) | 🟠 Stale | CI-generated artifact, present in tree. Doc-health "Next sweep target #1" from v1.27.1 — verify whether it carries the last-released numbers as a tagged-state reference or is purely CI-output. |
@@ -90,12 +90,10 @@ This is a **ledger**, not a one-time audit. Rewrite-in-place as docs change. Sma
 
 ## Next sweep targets
 
-1. **`development/roadmap.md` 1.30.x cycle-summary insertion** — script bumped the Current line + cyrius pin, but the body's Active table still references v1.27.2-era "1.28.x Arc Plan" and Attempt 5. Insert a `## 1.30.x Arc` section covering: Path-C sovereign-struct ABI (v1.30.0), Phase 4/5 USB-HID (v1.30.5), xHCI cmd-path arc FF→QQ (v1.30.6), and the iron-validation milestone (2026-05-15). **Highest-priority remaining stale doc post-S2/S3 sweep.**
-2. **`README.md` size + cyrius-pin refresh** — lib-doc precedent application (delete embedded "~243 KB" claim, point at state.md for binary size). Mirror the agnosticos lib-doc-precedent sweep that lands in agnosticos doc-staleness audit S4.
-3. **`architecture/overview.md`** — header bump (cyrius 5.10.44 → 5.11.59, v1.27.2 → v1.30.7) + kernel-size pointer. Memory-map + SMAP notes stay.
-4. **`kybernet-bridge.md`** — kybernet pin 1.2.0 → 1.2.1 single-line bump.
-5. **`syscall-additions.md`** — header bump only; surface unchanged across v1.27.x → v1.30.x.
-6. **`BENCHMARKS.md` policy decision** — original v1.27.1 carry-forward target; still pending. Decide if state-reference numbers get checked in or stay CI-only.
+**Sweep status (2026-05-18 doc-staleness audit closeout)**: items 1-5 from the original 2026-05-18 Next-sweep list (roadmap 1.30.x cycle-summary, README lib-doc precedent + Path-A cleanup, architecture/overview.md header + boot-flow rewrite, kybernet-bridge.md pin bump, syscall-additions.md header bump) all landed in the same-day follow-up sweep. Build.sh cosmetic banner also cleaned (Path-A "pending shim rewrite" → Path-C `gnoboot + OVMF / install-usb.sh`). Remaining queue:
+
+1. **`BENCHMARKS.md` policy decision** — original v1.27.1 carry-forward target; still pending. Decide if last-released numbers get checked in as a tagged-state reference or stay CI-only. Low priority but the longest-running carry-forward in this ledger.
+2. **`docs/development/state.md` body — periodic reverification** — after this sweep the body is fresh (Build artifacts table through v1.30.7, ecosystem block updated, Open Investigation section pointing at xHCI cmd-path arc). New convention from this audit: doc-health.md MUST verify state.md body prose against header date at every minor cut, not trust the script's header bump alone.
 
 ---
 
