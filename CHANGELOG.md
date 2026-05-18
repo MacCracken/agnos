@@ -5,6 +5,82 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**Bundled atop 1.30.6 banner in commit `0e3d01a` ("fixing pci for xhci")** — three changes that ship together without a version bump because they're all part of the post-FF cmd-path triage cycle. Will roll into the next tagged release once the cmd-ring gate is closed.
+
+### Added
+
+- **Repair (GG)** — AMD-Vi global IOMMU disable for the AMD Renoir 1022:1639
+  platform (archaemenid iron target). `amd_iommu_disable()` at
+  `kernel/arch/x86_64/iommu.cyr:269-317` walks PCI 0:0.2 cap list for ID
+  `0x0F` (Secure Device), confirms cap type bits [18:16] == `0x3` (IOMMU),
+  extracts MMIO base, maps it UC, writes IOMMU Control Register at MMIO+0x18
+  = 0 (passthrough). Called from `kernel/core/main.cyr:155` after `pci_scan()`
+  and before `xhci_probe()`. Intel boxes no-op (no cap `0x0F` at 0:0.2 → early
+  return). Targets the "AMD Renoir firmware-enabled IOMMU silently blocks
+  every device DMA pre-OS-setup" hypothesis bound at the Attempt 57 close.
+  **Iron outcome (Attempt 58)**: FB confirms `amdvi: cap@64 mmio=4247781376
+  en=1` + `amdvi: disabled, ctrl_rb=0` — AMD-Vi *was* firmware-enabled, GG
+  wrote successfully. But `events_seen=0` persists for Enable Slot
+  specifically. **GG is the 15th falsified hypothesis** in the silent-absorb /
+  event-posting arc — the strongest "platform-side DMA gating" candidate is
+  now eliminated. Proper passthrough / DTE setup is v6.x territory.
+
+- **Edit A** — read-only CRCR.CRR / ERSTSZ / IMAN / ERDP readback after
+  `xhci_start` completes the R/S=1 + HCH=0 wait. `xhci.cyr:583-603`. Single
+  FB line: `xhci: CRCR.CRR=<N> ERSTSZ=<N> IMAN=<N> ERDP_lo=<N>`. **Attempt
+  58 outcome**: `CRCR.CRR=0 ERSTSZ=1 IMAN=2 ERDP_lo=5672968`. IMAN=2 (IE=1
+  + IP=W1C-cleared) formally confirms Repair (FF) stuck at the register.
+  ERSTSZ=1 confirms our write reached the controller. ERDP_lo=`0x569008` =
+  page-aligned `0x569000` + EHB bit 3 set by HW — proves HW touched the
+  event handler. CRCR.CRR=0 is spec-ambiguous at this readback position
+  (pre-doorbell); promoted to primary suspect pending post-doorbell
+  disambiguation in Attempt 60+.
+
+- **Edit B** — read-only per-submit TRB phys + dw3 readback in
+  `xhci_cmd_submit`. `xhci_cmd.cyr:53-54, 99-109`. Print bounded to 2
+  submissions via `XHCI_DIAG_SUBMIT_MAX`. FB line: `xhci: cmd_submit#<N>
+  trb_phys=<P> dw3=<D>`. Verifies (a) the TRB landed at the address HW will
+  fetch from (`xhci_cmd_ring_phys + idx*16`) and (b) the cycle bit + TRB
+  type were stored correctly. **Attempt 58 outcome**: print line MISSING from
+  FB. Root cause identified as stale USB build (Edit B in commit `0e3d01a` at
+  20:21; `build/agnos` was timestamped 20:20; USB flashed pre-commit).
+  `build/agnos` rebuilt 20:53 and verified to contain `xhci: cmd_submit#`
+  literal via `strings`. Attempt 59 re-burn pending on fresh USB to capture
+  the readback values.
+
+### Iron status (Attempts 57 + 58)
+
+- **Attempt 57** (2026-05-17, clean FF cut): 14th falsified hypothesis in
+  the silent-absorb arc. `events_seen=0` survived IMAN.IE=1 alone. The
+  search class narrowed from "event posting infrastructure" to "platform-
+  or cmd-ring-side gating."
+- **Attempt 58** (2026-05-17, GG + Edits A+B bundled in `0e3d01a`):
+  **Breakthrough — `xhci: drained 1 events` (was 0 in Attempts 56/57) +
+  EHB=1 in ERDP_lo prove HW *is* posting events to the ring.** Either FF
+  (IMAN.IE=1) or GG (AMD-Vi disable) was the unblock for general event
+  posting; the two were bundled so we can't attribute cleanly without a
+  decoupling burn (deprioritized — diagnostic gain low vs iron-burn cost).
+  The gate is now narrow: Enable Slot specifically produces no
+  CMD_COMPLETION event. Three open sub-classes: (a) CRCR write absorbed →
+  cmd ring base never latched, (b) cmd ring latched but first TRB cycle bit
+  wrong → HW skips, (c) doorbell write absorbed. Attempt 59 closes class
+  (b) via Edit B readback.
+- **Phase 3 reset on port 3**: still UNBLOCKED across Attempts 55-58
+  (Repair EE intact two minors running).
+- **CMOS extended-CMOS-offset-≥6 alias quirk** (`[0x86]=0x5A` /
+  `[0x87]=0xA5`): firmware-managed by AMD FCH 1022:1639, reproducible across
+  builds, not a code regression.
+
+### Process
+
+- **Build freshness ownership clarified mid-Attempt-58**: kernel build
+  freshness during iron-boot bring-up is Claude's responsibility (per
+  `feedback_bootloader_kernel_ownership` and now also
+  `feedback_build_freshness_is_mine`). User owns `install-usb.sh --update`;
+  Claude must rebuild + verify before declaring next-burn-ready. The cost of
+  the un-clarified ownership: one iron burn (Attempt 58) effectively
+  half-instrumented because the USB had a pre-commit build.
+
 ## [1.30.6] — 2026-05-17 (Repair FF — IMAN.IE=1; events were never posting on AMD FCH)
 
 **Phase 4 Enable Slot `events_seen=0` root-caused as IMAN.IE=0 silent
