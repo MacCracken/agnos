@@ -547,6 +547,17 @@ fn xhci_start() {
 
     if (xhci_rings_init() == 0) { return 0; }
 
+    # Repair (OO.A) 2026-05-18 — RW1C-clear all USBSTS change bits before
+    # configuring the controller. FreeBSD xhci_start_controller pattern
+    # (sys/dev/usb/controller/xhci.c:1463-66): read USBSTS, write same value
+    # back to clear every set RW1C bit. HCRST clears most state but PCD /
+    # EINT can survive across reset on some controllers, and stale change
+    # bits can confuse the interrupter state machine on the first event
+    # post-R/S. Convergent-prior-art Tier 2 bundle entry; covers the gap
+    # where AGNOS previously relied on HCRST to do this implicitly.
+    var sts_pre = xhci_op_read32(XHCI_OP_USBSTS);
+    xhci_op_write32(XHCI_OP_USBSTS, sts_pre);
+
     # Repair (KK) 2026-05-17 — wait for CNR (Controller Not Ready, USBSTS
     # bit 11) to clear before any operational-register writes. Linux's
     # xhci_init does this via xhci_handshake(&xhci->op_regs->status,
@@ -596,12 +607,16 @@ fn xhci_start() {
     # receives HW writes when IE=0 on AMD FCH 1022:1639 — spec §5.5.2.1
     # is read by Linux/xhci-mem.c as "IE=1 required for event posting,"
     # not just for interrupt generation, and the empirical AMD behavior
-    # matches that reading. Mask is now 0x3: IP=W1C clear (bit 0) + IE=set
-    # (bit 1). H2 (IP clear of any BIOS/firmware-residue pending bit)
-    # still applies. Safe under MSI-X function-mask — controller may
-    # assert IRQ but MSI-X cap suppresses delivery; no unwired IDT vector
-    # is exposed.
-    xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x3);
+    # matches that reading. Mask is 0x3: IP=W1C clear (bit 0) + IE=set
+    # (bit 1).
+    #
+    # Repair (OO.B) 2026-05-18 — IMAN.IE write RELOCATED to after R/S=1 +
+    # HCH-clear wait. Linux xhci_run_finished (drivers/usb/host/xhci.c:
+    # 1145-1147) sets CMD_EIE on USBCMD after xhci_start sets R/S=1, and
+    # xhci_enable_interrupter sets IMAN.IE later still. FF's pre-R/S
+    # placement may have been the wrong order: some controllers latch
+    # interrupter IE-config at the R/S transition and ignore pre-R/S IE
+    # writes. The actual write now lives below, after the HCH-clear spin.
     # H3 (xHCI 1.2 §5.5.2.2): set IMOD to 0x000003E8 (1000 × 250 ns =
     # 250 µs interrupt moderation). HW default is 0 (no moderation) —
     # under MSI/MSI-X this would risk interrupt storms once IMAN.IE goes
@@ -635,6 +650,12 @@ fn xhci_start() {
         kprintln("xhci: start timeout (HCH never cleared)", 39);
         return 0;
     }
+
+    # Repair (OO.B) 2026-05-18 — IMAN.IE write LANDS HERE, after R/S=1 +
+    # HCH-clear wait, per Linux xhci_enable_interrupter convention. Bit 0
+    # is RW1C (IP); writing 0x3 clears any pending IP and sets IE=1 in the
+    # same store. See the relocation note above the ERSTBA write.
+    xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x3);
 
     xhci_running = 1;
     kprint("xhci: controller running, HCH=0, ERDP=", 38);
