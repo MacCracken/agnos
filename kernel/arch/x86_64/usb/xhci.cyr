@@ -576,17 +576,19 @@ fn xhci_start() {
     # DCBAAP — 64-bit, 64-byte aligned (page-aligned satisfies).
     xhci_op_write64(XHCI_OP_DCBAAP, xhci_dcbaa_phys);
 
-    # CRCR — 64-bit. Bottom 6 bits encode RCS (bit 0), CS (bit 1, W1S),
-    # CA (bit 2, W1S), CRR (bit 3, RO). Set RCS=1; ring base is
-    # page-aligned so all other bits are clean.
-    xhci_op_write64(XHCI_OP_CRCR, xhci_cmd_ring_phys | 0x1);
-
-    # Interrupter 0 (xHCI 1.2 §5.5.2). ERSTSZ first, then ERSTBA, then
-    # ERDP — order matters: HW reads ERSTBA only when ERSTSZ ≠ 0.
+    # Interrupter 0 (xHCI 1.2 §5.5.2). Repair (NN) 2026-05-18 — order is
+    # ERSTSZ → ERDP → ERSTBA. ERDP must be valid before ERSTBA per
+    # §5.5.2.3.3 (once ERSTBA enables the ring, undefined behavior if
+    # ERDP is outside the ring). Convergent prior art: FreeBSD
+    # xhci_start_controller (sys/dev/usb/controller/xhci.c:1505-9), Haiku
+    # XHCI::Start (xhci.cpp:1744-9), EDK2 CreateEventRing (XhciSched.c:
+    # 2651-9) all program ERDP before ERSTBA. Linux is the outlier;
+    # works on most silicon but AMD FCH 1022:1639 may be strict-spec.
+    # See docs/development/xhci-prior-art-audit.md.
     var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
     xhci_rt_write32(ir0 + XHCI_IR_ERSTSZ, 1);
-    xhci_rt_write64(ir0 + XHCI_IR_ERSTBA, xhci_erst_phys);
     xhci_rt_write64(ir0 + XHCI_IR_ERDP, xhci_evt_ring_phys);
+    xhci_rt_write64(ir0 + XHCI_IR_ERSTBA, xhci_erst_phys);
     # Repair (FF) 2026-05-17 — IMAN.IE (bit 1) MUST be 1, not 0.
     # Attempt 56 instrumentation reported `events_seen=0` over the full
     # XHCI_CMD_TIMEOUT_SPINS window after an Enable Slot doorbell, with
@@ -605,6 +607,15 @@ fn xhci_start() {
     # under MSI/MSI-X this would risk interrupt storms once IMAN.IE goes
     # to 1. Safe under poll mode; matches Linux's default.
     xhci_rt_write32(ir0 + XHCI_IR_IMOD, 0x3E8);
+
+    # CRCR — 64-bit. Bottom 6 bits encode RCS (bit 0), CS (bit 1, W1S),
+    # CA (bit 2, W1S), CRR (bit 3, RO). Set RCS=1; ring base is
+    # page-aligned so all other bits are clean. Repair (NN) 2026-05-18 —
+    # moved here from before ERST setup to match FreeBSD
+    # (xhci.c:1517-23) and Haiku (xhci.cpp:1756-7), which both program
+    # the interrupter first, then CRCR last before R/S=1. AMD FCH may
+    # couple cmd-ring state to event-ring readiness internally.
+    xhci_op_write64(XHCI_OP_CRCR, xhci_cmd_ring_phys | 0x1);
 
     # Run/Stop + interrupter enable + HSEE. Then wait for HCH=0. Spec
     # gives no bound but contemporary controllers transition within µs.
