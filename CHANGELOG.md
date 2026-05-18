@@ -5,6 +5,83 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.30.6] — 2026-05-17 (Repair FF — IMAN.IE=1; events were never posting on AMD FCH)
+
+**Phase 4 Enable Slot `events_seen=0` root-caused as IMAN.IE=0 silent
+event-posting block.** Attempt 56 burn (2026-05-17, archaemenid AMD
+Renoir 1022:1639) was the read-only event-ring-state instrumentation cut
+queued in the 1.30.5 working tree. FB output:
+
+```
+xhci: enable_slot entry idx=1 cycle=1
+xhci: cmd completion timeout, final_idx=1 cycle=1 events_seen=0
+```
+
+`events_seen=0` over the full `XHCI_CMD_TIMEOUT_SPINS` (~250 ms) window
+following the Enable Slot doorbell, combined with `xhci: drained 0
+events` from the pre-PR drain, means the controller never wrote a
+single event to the event ring after R/S=1 — not the expected Command
+Completion Event, not the PSC events from the reset loop (which
+`Reset events bitmap=63` had suggested fired). Triage class 3
+(event-ring polling vs PSC events from PR-engaged reset) is falsified:
+there are no events to poll. The event ring infrastructure itself was
+correctly programmed (ERSTSZ=1, ERSTBA=erst_phys, ERDP=evt_ring_phys,
+CRCR pointer + RCS=1 ordering all clean per audit), but the interrupter
+was disabled.
+
+Root cause: `xhci_start` wrote `IMAN = 0x1` (IP clear, **IE=0**) with a
+deliberate comment "IMAN.IE (bit 1) stays 0 — poll mode for MVP." xHCI
+1.2 §5.5.2.1 spec text reads as if IE only gates interrupt generation,
+not event posting, but Linux `xhci-mem.c` sets IE=1 unconditionally and
+AMD FCH silicon empirically gates event posting on IE=1 (which §4.17's
+"Software shall set the IE flag to '1' for all Interrupters that it
+intends to use" is the canonical reading of). With IE=0, the controller
+treats the interrupter as disabled and silently drops all events.
+
+**Repair (FF)** — one-line fix at
+`kernel/arch/x86_64/usb/xhci.cyr:541`:
+
+```cyrius
+# Before
+xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x1);
+# After
+xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x3);
+```
+
+Mask is now `IP=W1C clear | IE=set`. Safe under MSI-X function-mask
+(FB confirms `MSI-X enabled (function-mask)`): the controller may
+assert an MSI but the function-mask suppresses delivery, so no unwired
+IDT vector is exposed. When MSI-X bring-up lands in a later phase, an
+ISR + IDT vector pair is added then; IE=1 already in place.
+
+This is structurally the same shape as Repair (EE): a deliberate AGNOS
+deviation from Linux's convention, justified by a spec reading that
+appeared defensible in isolation, falsified empirically by AMD FCH
+silicon. EE was an inner re-mask stripping the PR bit; FF is an "IE=0
+in poll mode" assumption silently disabling event posting. Both
+surfaced via prior-art diff (EDK2 + Linux) rather than per-spec audit.
+
+### Added
+
+- **Repair (FF)** — `xhci_start` now writes `IMAN = 0x3` (IP clear +
+  IE set) instead of `IMAN = 0x1`. AMD FCH 1022:1639 requires IE=1 to
+  post events to the event ring; without it the entire interrupter is
+  treated as disabled and all events (CCE, PSC, transfer) are dropped
+  silently. (`kernel/arch/x86_64/usb/xhci.cyr:541`)
+
+### Iron status
+
+- **Phase 4 Enable Slot** — Attempt 56 burn confirmed `events_seen=0`
+  as the gate; FF is the proposed unblock. Attempt 57 will be the FF
+  iron test. Phase 4 (`hid_kbd_configure`) and Phase 5 (`hid_poll` +
+  HID→PS/2 + `kb_buf` writer) remain code-surface complete; both stay
+  dormant on iron until Enable Slot returns a valid slot ID + ccode=1.
+- **CMOS post-mortem slots** unchanged from 1.30.5; the FF site is
+  pre-instrumentation (xhci_start, before any per-port stamps), so the
+  iron evidence for FF is the FB lines `enable_slot entry idx=X
+  cycle=Y` + `cmd completion timeout … events_seen=N` from the
+  Attempt 56 instrumentation already in `xhci_cmd_wait`.
+
 ## [1.30.5] — 2026-05-17 (Repair EE — xHCI silent-absorb arc closed; Phase 4 + Phase 5 HID keyboard driver landed)
 
 **The 13-hypothesis xHCI silent-absorb arc closed as a homegrown bug, not

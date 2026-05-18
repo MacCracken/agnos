@@ -503,9 +503,12 @@ fn xhci_init() {
 #   8. USBCMD.R/S = 1, INTE = 1         (operational, 32-bit)
 #   9. Wait USBSTS.HCH = 0
 #
-# INTE=1 is harmless under poll-mode Phase 5: events still queue to the
-# event ring; we just drain them on a timer tick instead of via MSI-X.
-# When MSI-X bring-up lands, the IDT vector + IMAN.IE are added then.
+# INTE=1 is harmless under poll-mode Phase 5: events queue to the event
+# ring; we drain them on a timer tick instead of via MSI-X. IMAN.IE=1 is
+# *also* required (Repair FF) — Attempt 56 instrumentation proved AMD
+# FCH 1022:1639 will not post events to the ring when IE=0, regardless
+# of poll-vs-MSI mode. MSI-X function-mask suppresses actual IRQ delivery
+# until an ISR + IDT vector are wired in a later phase.
 #
 # Iron-test gate: framebuffer line `xhci: controller running, HCH=0,
 # ERDP=0xXXXXXXXX` and CMOS[0x40] kcp = 0x31.
@@ -534,11 +537,19 @@ fn xhci_start() {
     xhci_rt_write32(ir0 + XHCI_IR_ERSTSZ, 1);
     xhci_rt_write64(ir0 + XHCI_IR_ERSTBA, xhci_erst_phys);
     xhci_rt_write64(ir0 + XHCI_IR_ERDP, xhci_evt_ring_phys);
-    # H2 (xHCI 1.2 §5.5.2.1): clear IMAN.IP (Interrupt Pending, bit 0,
-    # RW1C) by writing 1. Any pending bit left over from BIOS/firmware
-    # would inhibit a fresh edge-triggered interrupt assertion later.
-    # IMAN.IE (bit 1) stays 0 — poll mode for MVP.
-    xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x1);
+    # Repair (FF) 2026-05-17 — IMAN.IE (bit 1) MUST be 1, not 0.
+    # Attempt 56 instrumentation reported `events_seen=0` over the full
+    # XHCI_CMD_TIMEOUT_SPINS window after an Enable Slot doorbell, with
+    # the pre-PR drain also returning 0 events. The event ring never
+    # receives HW writes when IE=0 on AMD FCH 1022:1639 — spec §5.5.2.1
+    # is read by Linux/xhci-mem.c as "IE=1 required for event posting,"
+    # not just for interrupt generation, and the empirical AMD behavior
+    # matches that reading. Mask is now 0x3: IP=W1C clear (bit 0) + IE=set
+    # (bit 1). H2 (IP clear of any BIOS/firmware-residue pending bit)
+    # still applies. Safe under MSI-X function-mask — controller may
+    # assert IRQ but MSI-X cap suppresses delivery; no unwired IDT vector
+    # is exposed.
+    xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x3);
     # H3 (xHCI 1.2 §5.5.2.2): set IMOD to 0x000003E8 (1000 × 250 ns =
     # 250 µs interrupt moderation). HW default is 0 (no moderation) —
     # under MSI/MSI-X this would risk interrupt storms once IMAN.IE goes
