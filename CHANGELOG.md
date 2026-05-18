@@ -5,6 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**xHCI cmd-path arc reframe — `events_seen=0` reproduces on QEMU's qemu-xhci, invalidating the 10-letter silicon-quirk ladder (FF through QQ+QQ2).** Two changes land this cut: a generally-useful PML4[N>0] extension to `vmm_remap_uc_2mb` (needed to map qemu-xhci's 768 GB BAR; future-proofs against any iron firmware that places xhci BAR above 512 GB), and removal of the dead `mmio >= 0x100000000` early-out gate in `xhci_probe`. The QEMU smoke run with the BAR fix in place produced the exact iron Attempt 63 symptom — same `xhci: enable_slot entry idx=0 cycle=1` → `cmd completion timeout … events_seen=0` → `Enable Slot failed, ccode=0` — on a completely different controller (64 slots / 8 ports vs iron's 64/6; scratchpad bufs=0 vs iron's 2; no USBLEGSUP cap; csz=0 vs iron's CSZ=1; BAR at 768 GB vs iron's sub-4GB). The reframe: the cmd-path silent-absorb is **agnos-side code**, not AMD FCH 1022:1639 silicon. QEMU is now the active debug surface for the arc — full kprint observability via serial, no iron burns required. See [`agnosticos/docs/development/iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) § Attempt 64 for the QEMU repro narrative.
+
+### Changed
+
+- `kernel/core/vmm.cyr` — `vmm_remap_uc_2mb` extended to handle `phys ≥ 512 GB` (PML4[N>0]). Allocates a fresh PDPT under the target PML4 entry if absent, then shatters the 1 GB region into 2 MB entries with the target chunk marked UC. Sub-1 GB and 1–512 GB paths unchanged. +280 B kernel size.
+- `kernel/arch/x86_64/usb/xhci.cyr` — removed the `mmio >= 0x100000000` early-out (lines 109–115 pre-edit). `vmm_remap_uc_2mb` now handles the high-BAR case generically; the gate was a "deferred until iron evidence" placeholder per the original comment.
+
+### Notes
+
+- No `VERSION` bump. The cmd-path debug arc continues; version cuts when iron + QEMU both pass.
+- Iron-test gate unchanged: closed-beta MVP still needs typeable keyboard input on archaemenid. The reframe just relocates the bug surface.
+
 ## [1.30.7] — 2026-05-18 (Attempt 63 iron burn — QQ + QQ2 falsified; VISUAL BOOT-TO-SHELL ON IRON ACHIEVED)
 
 **The first iron build to render `agnoshi shell v1.30.7 (type 'help')` on archaemenid's framebuffer.** Same xhci cmd-path code as 1.30.6 (FF→OO behavioral repairs + QQ + QQ2 MSI-X table programming); the version bump marks the burn that proved the kernel no longer fatal-blocks on `events_seen=0` after xhci init failure. Boot proceeds past the xhci gate into scheduler test (timer ticks: 153) → `init: hello AGNOS!` → userland test (HELLO) → userland complete → launching kybernet → kybernet starting init → launching shell → agnoshi prompt visible on screen. The closed-beta MVP's visual half is hit on iron; the remaining gate is functional keyboard input through xhci (still gated on the cmd-path silent-absorb — no Enable Slot CCE → no HID enumeration).
