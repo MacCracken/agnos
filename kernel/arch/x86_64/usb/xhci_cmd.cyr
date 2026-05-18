@@ -117,7 +117,18 @@ fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
     }
 
     # Ring HC doorbell (slot 0) with target/stream = 0. xHCI 1.2 §5.6.
+    # Repair (HH) 2026-05-17 — post-write readback flushes the PCI
+    # posted-write so the controller actually sees the doorbell before
+    # cmd_wait begins spinning. Matches Linux xhci_ring_cmd_db
+    # (xhci-ring.c): writel then readl. AMD FCH 1022:1639 empirically
+    # requires this — without it the cmd ring TRB write + doorbell
+    # store reach the store buffer but the doorbell never crosses the
+    # PCIe write barrier (events_seen=0 signature, Attempts 57-59: reset
+    # succeeded on port 3 but Enable Slot CCE never arrived; Attempt 59
+    # confirmed dw3=0x2401 cycle-bit-clean, so TRB content is healthy
+    # and the gate is on the doorbell→controller path).
     store32(xhci_mmio_base + xhci_db_off, 0);
+    var db_flush = load32(xhci_mmio_base + xhci_db_off);
 
     return trb;
 }
@@ -214,12 +225,40 @@ fn xhci_cmd_wait(cmd_trb_phys) {
     # xHCI 1.2 §6.4.5 so any non-zero check on the global still works.
     xhci_last_cmd_ccode   = 0;
     xhci_last_cmd_slot_id = 0;
+    # Repair (II) 2026-05-17 — triage capture at the timeout moment.
+    # Disambiguates the events_seen=0 outcome between two failure
+    # families, given the readback fix (HH) lands but doesn't unblock:
+    #   CRCR low bit 3 (CRR) = 1 → HW accepted cmd ring + processed
+    #     but didn't post CCE. Hypothesis: event-posting gate beyond
+    #     IMAN.IE (e.g., per-CCE quirk, ERDP latching issue).
+    #   CRCR low bit 3 (CRR) = 0 → HW never accepted cmd ring. Either
+    #     doorbell still didn't cross (HH insufficient) or CRCR write
+    #     was lost / cmd ring base rejected.
+    #   USBSTS byte 0 bit 0 (HCH) = 1 → controller halted itself
+    #     between R/S=1 and timeout. Major regression in xhci_start.
+    #   USBSTS byte 1 bit 3 (CNR) = 1 → controller-not-ready blocked
+    #     subsequent writes (post-init CNR re-assert).
+    #   USBSTS byte 1 bit 4 (HCE) = 1 → controller-fatal error.
+    # CMOS slots 0x88..0x8B via extended-CMOS bank (post-CC). Sentinel
+    # 0x88=0xEE proves the timeout site executed; the three data
+    # slots are interpreted per the matrix above.
+    var crcr_lo = xhci_op_read32(XHCI_OP_CRCR);
+    var usbsts  = xhci_op_read32(XHCI_OP_USBSTS);
+    xhci_cmos_stamp(0x88, 0xEE);
+    xhci_cmos_stamp(0x89, crcr_lo & 0xFF);
+    xhci_cmos_stamp(0x8A, usbsts & 0xFF);
+    xhci_cmos_stamp(0x8B, (usbsts >> 8) & 0xFF);
     kprint("xhci: cmd completion timeout, final_idx=", 40);
     kprint_num(xhci_evt_ring_idx);
     kprint(" cycle=", 7);
     kprint_num(xhci_evt_ring_cycle);
     kprint(" events_seen=", 13);
     kprint_num(xhci_diag_evt_count);
+    kprintln("", 0);
+    kprint("xhci: timeout state CRCR_lo=", 28);
+    kprint_num(crcr_lo & 0xFF);
+    kprint(" USBSTS=", 8);
+    kprint_num(usbsts & 0xFFFF);
     kprintln("", 0);
     return 0;
 }
