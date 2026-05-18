@@ -3,26 +3,92 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — 1.30.5 (staging)
+## [Unreleased]
 
-**USB HID keyboard driver — Phase 4 + Phase 5 (parallel-track to xHCI
-silent-absorb arc, per the decoupling decision).** With 1.30.4 closing the
-xHCI Linux-diff hardening backlog (H1-H4) and Attempt 52 settling the
-silent-absorb arc as a parallel-track investigation, 1.30.5 picks up the
-Phase 4/5 code surface that's been shovel-ready in
-[`agnosticos/docs/development/planning/usb-hid-keyboard-driver.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/usb-hid-keyboard-driver.md)
-since 2026-05-15. Phase 4 = Get Configuration Descriptor + Configure
-Endpoint + SET_PROTOCOL=boot + transfer ring for the interrupt-IN
-endpoint. Phase 5 = HID-usage→PS/2 set-1 scancode translation + report
-differ + `kb_buf` writer + poll-mode event-ring drain on the kbd endpoint.
-Develops in parallel against Phase 1-3 infrastructure (which is already
-landed and running on QEMU); validation surface for 1.30.5 is the QEMU
-xhci-pci emulated controller — clean spec-compliant xHCI without AMD-FCH
-quirks, so Phase 3 enumeration completes cleanly and Phase 4/5 can be
-exercised end-to-end. Archaemenid silent-absorb remains the only
-iron-side blocker; when that unblocks (later silicon discovery, different
-hardware target, or unstuck via the parallel-track xHCI hardening
-backlog), Phase 4/5 is already functionally proved.
+## [1.30.5] — 2026-05-17 (Repair EE — xHCI silent-absorb arc closed; Phase 4 + Phase 5 HID keyboard driver landed)
+
+**The 13-hypothesis xHCI silent-absorb arc closed as a homegrown bug, not
+silicon.** Five days of per-bit spec audit across Attempts 32-54 chased a
+"controller absorbs PORTSC.PR writes" hypothesis through cache attributes,
+PML4 walks, scratchpad install, DNCTRL, event-ring drain, timing delays,
+and per-port SupProto fingerprints. Root cause surfaced via prior-art
+diff against EDK2 `XhciDxe` (`XhciPortReset`) and Linux `xhci-hub.c`
+(`xhci_set_port_reset`): both write `portsc | PR` without re-masking.
+AGNOS's `xhci_portsc_write` (`kernel/arch/x86_64/usb/xhci_port.cyr:464`)
+was applying an inner `& XHCI_PORTSC_NEUTRAL` mask before the OR-in of
+W1C bits — and `PR` (bit 4) is RW1S, *outside* `NEUTRAL` — so every
+port-reset write across the entire arc had its PR bit silently stripped
+before `store32` hit the controller. "Silent-absorb" was real; the
+absorber was AGNOS's own helper, not silicon. One-line fix removed the
+inner re-mask. Cyrius pin bumped 5.11.55 → 5.11.59 in the same commit.
+
+**Iron evidence** (Attempt 55, archaemenid AMD Renoir 1022:1639): for the
+first time across 13 attempts, `CMOS[0x64]` reports a non-zero
+reset-OK bitmap (`0x04` = port 3 reset succeeded; Keychron K2 on port 3
+of the USB2 bank). FB shows no `xhci: port 3 reset failed (proto=2)`
+line — Phase 3 enumeration now reaches the Enable Slot command for the
+first time. Per-attempt + CMOS-table detail in [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 55](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
+
+**Bundled in 1.30.5**: Phase 4 + Phase 5 of the USB HID-boot keyboard
+driver, completing the boot-to-typeable-shell code surface. Phase 4
+(`hid_kbd_configure`): Get Configuration Descriptor + walk for the
+HID-boot-keyboard interface + Configure Endpoint TRB (type 12) +
+`SET_PROTOCOL=boot` + interrupt-IN transfer ring construction. Phase 5
+(`hid_poll` + translation): event-ring drain on the keyboard endpoint +
+HID-usage → PS/2 set-1 scancode translation table + report differ
+(press/release inference between consecutive 8-byte HID reports) +
+`kb_buf` writer routing through the existing `scancode_to_ascii` path so
+the shell sees keys via the same buffer that the legacy PS/2 path used.
+Code surface: 2 new files (`hid_kbd.cyr`, `hid_translate.cyr`) +
+extensions to `xhci.cyr` / `xhci_cmd.cyr` / `kb.cyr` / `main.cyr`;
+~600 LOC. Validation surface is QEMU `xhci-pci` (spec-compliant
+controller); Phase 4/5 stay dormant on iron until the Phase 4 Enable
+Slot ccode=0 gate (Attempt 55's new gate, downstream of the EE
+unblock) clears.
+
+### Added
+
+- **Repair (EE)** — `xhci_portsc_write` no longer applies `& XHCI_PORTSC_NEUTRAL`
+  to `value` inside the helper; caller is responsible for the OR-in mask
+  per EDK2 + Linux convention. (`kernel/arch/x86_64/usb/xhci_port.cyr`)
+- **`hid_kbd.cyr`** — USB HID-boot keyboard driver. `hid_kbd_init`,
+  `hid_kbd_configure` (Get Configuration Descriptor + interface walk +
+  Configure Endpoint TRB + SET_PROTOCOL=boot + transfer ring),
+  `hid_poll` (event-ring drain on kbd EP, report differ, scancode
+  emission).
+- **`hid_translate.cyr`** — HID-usage → PS/2 set-1 translation table.
+  ASCII-printable + arrow + modifier coverage matching the existing
+  `scancode_to_ascii` path; boot-protocol-only (full HID report
+  descriptor parsing deferred).
+- **xHCI cmd-ring extensions** — `xhci_cmd_submit` + `xhci_cmd_wait`
+  generalized to handle Configure Endpoint TRB; `xhci_set_protocol`
+  helper for the USB HID class-specific request.
+- **`kb.cyr` integration** — `kb_has_key()` now also drives `hid_poll()`
+  on every shell-tick; structurally inert when `hid_kbd_slot_id == 0`
+  (no HID keyboard configured), so safe on hardware where Phase 4
+  hasn't run yet.
+
+### Changed
+
+- **`cyrius.cyml`** — toolchain pin bumped 5.11.55 → 5.11.59 alongside
+  the EE one-liner. Matches kriya 0.6.0's parallel-M5 pin bump.
+
+### Iron status
+
+- **Phase 3** (port reset) unblocked on archaemenid USB2 bank port 3.
+  Silent-absorb arc closed at 13 falsified hypotheses + EE-confirmed.
+- **Phase 4** (Enable Slot command-ring round-trip) is the new iron-side
+  gate. FB on Attempt 55 reads `kbd: Enable Slot failed, ccode=0` →
+  `xhci: enumeration timeout` (`ccode=0` is the default of
+  `xhci_last_cmd_ccode`, surfacing when `xhci_cmd_wait` times out
+  without consuming a matching Command Completion Event). Triage
+  classes in [`iron-nuc-zen-log.md` § Attempt 55](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md);
+  Attempt 56 read-only event-ring instrumentation queued in working
+  tree (1.30.6 staging).
+- **Phase 4/5** code surface validated on QEMU `xhci-pci` (spec-compliant
+  controller, Phase 3 completes end-to-end, Phase 4 reaches Configure
+  Endpoint, Phase 5 drains keyboard reports). Dormant on archaemenid
+  until Phase 4 gate clears.
 
 ## [1.30.4] — 2026-05-17 (xHCI Linux-diff hardening closeout)
 
