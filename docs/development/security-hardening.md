@@ -1,14 +1,14 @@
 # Security Hardening Implementation Guide
 
-> **Last Updated**: 2026-05-11 (v1.27.2 closeout — status block added; per-item implementation prose unchanged)
+> **Last Updated**: 2026-05-18 (S7 KASLR shipped at v1.28.0 — status block flipped to 13/13)
 >
 > From the 2026-04-13 audit. See [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md) for findings; [`roadmap.md`](roadmap.md) for the tracking table; [`state.md`](state.md) for live state.
 
 ---
 
-## Status (v1.27.1)
+## Status (v1.28.0+ — fully closed)
 
-12 of 13 items are **Done** as of v1.27.1. Only **S7 (KASLR)** remains open. This guide is the historical implementation reference — what shipped, how, and the dependencies between items. For the current state, see `roadmap.md` § Security Hardening.
+**13 of 13 items are Done** as of v1.28.0. KASLR shipped via the data-only variant (Option B per [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md)); the full PIE-binary variant (Option A) is deferred to cyrius v6.1.x where PIE codegen lands. This guide is the historical implementation reference — what shipped, how, and the dependencies between items. For the current state, see `roadmap.md` § Security Hardening.
 
 | # | Item | Status | Notes |
 |---|------|--------|-------|
@@ -18,7 +18,7 @@
 | S4 | Per-process exit codes | ✅ Done | `proc_exit_code` per slot, returned via `waitpid` |
 | S5 | Per-connection TCP RX buffers | ✅ Done | Bounded per-conn ring buffer |
 | S6 | Stack guard pages | ✅ Done | 4 KB unmapped page below each kernel stack |
-| S7 | **KASLR** | 🟠 **Open** | Last item. Needs boot shim + relocatable binary. Candidate for v1.28.0. |
+| S7 | **KASLR** | ✅ **Done (v1.28.0)** | Data-only variant shipped per proposals/2026-05-11-kaslr-scope.md Option B — RDRAND-seeded `pmm_next_free` randomization, KASLR probe printout, sign-mask hygiene, memory-isolation phys-move. Option A (full PIE binary KASLR) deferred to cyrius v6.1.x. |
 | S8 | KPTI (Kernel Page Table Isolation) | ✅ Done (partial) | PD entry 0 kept in user tables for trampoline/ISR; full isolation needs 4 KB pages |
 | S9 | Spectre v2 mitigations | ✅ Done | IBRS set/clear on SYSCALL entry/exit; retpoline deferred to compiler |
 | S10 | IOMMU (VT-d) | ✅ Done | ACPI RSDP/RSDT/DMAR parsing + VT-d root/context/IO page tables; DMA restricted to first 16 MB |
@@ -26,7 +26,7 @@
 | S12 | TCP sequence/ACK validation | ✅ Done | Window-check on incoming segments |
 | S13 | Stack canaries | ✅ Done | RDRAND-seeded `_canary` secret; manual canary in ksyscall / elf_load / net_handle_tcp |
 
-The v1.27.1 memory-isolation closeout (SMAP root cause + `stac`/`clac` brackets) is downstream of S1+S8 — see [`../../CHANGELOG.md`](../../CHANGELOG.md) for the narrative.
+The v1.27.1 memory-isolation closeout (SMAP root cause + `stac`/`clac` brackets) is downstream of S1+S8 — see [`../../CHANGELOG.md`](../../CHANGELOG.md) for the narrative. The security-track itself is now historical; subsequent kernel work (1.28.x → 1.30.x) is correctness/bring-up, not security-track items.
 
 ---
 
@@ -311,39 +311,27 @@ User process recurses deeply. Triggers page fault on guard page. Verify serial o
 
 ---
 
-## S7: KASLR (Kernel Address Space Layout Randomization)
+## S7: KASLR (Kernel Address Space Layout Randomization) — SHIPPED v1.28.0
 
-**Goal**: Kernel load address is randomized per boot.
+**Status**: ✅ Done (data-only variant, Option B). Per [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md) the full binary-load-address KASLR (Option A) needs Cyrius PIE codegen and is deferred to cyrius v6.1.x; Option B randomizes per-boot data layout (PMM next-free pointer, stack bases, ELF load addresses) using RDRAND-seeded entropy — covers the attack surface that doesn't require PIE.
 
-### Why this is hard
+### What shipped at v1.28.0
 
-Every `&function_name` and `&global_var` in Cyrius produces an absolute address baked into the binary. Without relocation tables or PIC (position-independent code) support in the Cyrius compiler, every address reference would need manual patching at boot.
+1. **Entropy source** — `rdrand_u64` in `kernel/arch/x86_64/io.cyr`; checks CPUID leaf 1 ECX bit 30 before use; falls back to a constant + timer XOR if RDRAND missing (relevant on `qemu64` default — see `state.md` for the `-cpu max` requirement).
 
-### What's needed
+2. **`kaslr_seed`** in `kernel/core/pmm.cyr` — seeds `pmm_next_free` from RDRAND-derived entropy at boot. CI `boot-test` asserts that `KASLR: pmm_next_free=N` varies across two consecutive boots (currently gated; see `state.md` Version table for the assertion-status).
 
-1. **Entropy source** — RDRAND (check CPUID leaf 1, ECX bit 30):
-```cyrius
-fn rdrand64() {
-    var val = 0;
-    asm {
-        0x48; 0x0F; 0xC7; 0xF0;  # rdrand rax
-        0x48; 0x89; 0x45; 0xF8;  # mov [rbp-0x08], rax
-    }
-    return val;
-}
-```
+3. **Sign-mask hygiene** — ensures negative entropy values don't fold into wraparound bugs in the bitmap walker.
 
-2. **Relocatable binary** — requires Cyrius compiler to emit relocation entries or generate PIC. This is a **compiler-level feature request**.
+4. **Memory-isolation phys-move** — kernel data pages relocated to randomized physical addresses at boot to break "predictable physical base" assumptions in userspace probes.
 
-3. **Boot shim changes** — page tables map randomized VA to physical 0x100000. Apply relocations.
+### Deferred to cyrius v6.1.x — Option A (full PIE)
 
-### Recommendation
+Every `&function_name` and `&global_var` in Cyrius produces an absolute address baked into the binary today. Without PIE codegen in the Cyrius compiler, full binary-load-address randomization would need manual relocation patching at boot — out of scope until cyrius emits PIE/relocations natively.
 
-**Defer until Cyrius compiler supports relocations or PIC.** File a feature request in `../cyrius/`. In the meantime, the other mitigations (S1, S2, S8) significantly reduce the attack surface even without KASLR.
+### Why Option B was the right cut
 
-### Interim alternative
-
-Randomize the user-visible portions (stack base, ELF load address) which are already per-process. This gives partial ASLR without compiler changes.
+The data-only variant covers the practical KASLR threat model (defeating fixed-offset ROP/Spectre gadgets that target heap/stack layout) without the compiler dependency. Option A buys binary-load-address randomization on top of that, which is a real but smaller increment of additional protection. Shipping Option B now removed S7 from the security-track gate without blocking on cyrius v6.x.
 
 ---
 
