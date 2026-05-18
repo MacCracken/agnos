@@ -339,13 +339,27 @@ fn xhci_op_read32(off) {
     return load32(xhci_op_base + off);
 }
 
+# Repair (JJ) 2026-05-17 — readback flush after every operational write.
+# Matches Linux convention (writel + readl in xhci-mem.c / xhci.c — every
+# CRCR / DCBAAP / ERSTBA / ERSTSZ / ERDP / IMAN / USBCMD / CONFIG
+# operational write is followed by a readl of the same register). Without
+# this, the AMD FCH (1022:1639) holds the write in its internal posted-
+# write queue indefinitely, and the controller's internal state machine
+# never sees the new value. UC mapping (Repair X) prevents CPU-side
+# coalescing but does NOT prevent host-bridge posted-write deferral —
+# only a readback of the same MMIO region forces the bridge to drain.
+# Symptom this fixes: events_seen=0 after Enable Slot doorbell with CRCR
+# write nominally complete on the CPU side (Attempts 56-59).
+
 fn xhci_op_write32(off, val) {
     store32(xhci_op_base + off, val);
+    var flush = load32(xhci_op_base + off);
     return 0;
 }
 
 fn xhci_op_write64(off, val) {
     store64(xhci_op_base + off, val);
+    var flush = load32(xhci_op_base + off);
     return 0;
 }
 
@@ -361,13 +375,18 @@ fn xhci_rt_read32(addr) {
     return load32(addr);
 }
 
+# Repair (JJ) — same readback flush convention for runtime writes
+# (ERSTSZ / ERSTBA / ERDP / IMAN / IMOD).
+
 fn xhci_rt_write32(addr, val) {
     store32(addr, val);
+    var flush = load32(addr);
     return 0;
 }
 
 fn xhci_rt_write64(addr, val) {
     store64(addr, val);
+    var flush = load32(addr);
     return 0;
 }
 
@@ -517,6 +536,27 @@ fn xhci_start() {
     if (xhci_halted == 0) { return 0; }
 
     if (xhci_rings_init() == 0) { return 0; }
+
+    # Repair (KK) 2026-05-17 — wait for CNR (Controller Not Ready, USBSTS
+    # bit 11) to clear before any operational-register writes. Linux's
+    # xhci_init does this via xhci_handshake(&xhci->op_regs->status,
+    # STS_CNR, 0, ...) before touching CONFIG / DCBAAP / CRCR. AGNOS
+    # previously only waited for HCRST to self-clear; on AMD FCH some
+    # post-reset CNR re-assert windows exist where HCRST=0 but CNR=1,
+    # and ALL operational writes during that window are silently absorbed
+    # by the controller. This is the canonical "post-init CNR re-assert"
+    # symptom from Linux's xhci-hub.c history — writes complete on the
+    # CPU side, never reach the controller's internal state machine.
+    var cnr_wait = 0;
+    while (cnr_wait < 1000000) {
+        var sts = xhci_op_read32(XHCI_OP_USBSTS);
+        if ((sts & 0x800) == 0) { break; }      # bit 11 = CNR
+        cnr_wait = cnr_wait + 1;
+    }
+    if (cnr_wait >= 1000000) {
+        kprintln("xhci: CNR never cleared", 23);
+        return 0;
+    }
 
     # CONFIG.MaxSlotsEn — open all device slots the controller advertises.
     # Bits [7:0] only; preserve U3E / CIE bits in the upper byte.

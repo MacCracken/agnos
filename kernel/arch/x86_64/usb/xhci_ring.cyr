@@ -175,11 +175,21 @@ fn xhci_rings_init() {
     # Link TRB at slot 255 (offset 0xFF0):
     #   dwords 0/1 — ring base addr (64-bit; written as one store64)
     #   dword 2    — 0 (status fields N/A for Link)
-    #   dword 3    — type=Link(6) << 10 | TC(bit 1) | C(bit 0) = 0x1803
+    #   dword 3    — type=Link(6) << 10 | TC(bit 1) | C(bit 0)
+    # Repair (LL) 2026-05-17 — initial Link TRB C bit MUST be 0 (NOT
+    # PCS=1). Per xHCI 1.2 §4.9.3.1: the Link TRB starts with C bit
+    # opposite of PCS so HW doesn't follow it before SW fills the ring.
+    # SW updates Link TRB.C to current PCS just before wrap (see
+    # xhci_cmd_submit lines 80-95). Linux's xhci_alloc_segment zeroes
+    # the ring then writes Link TRB type+TC without setting C — same
+    # initial state we want. Previously set | 0x1 — defensive fix even
+    # though the first Enable Slot doesn't reach wrap; bugs of this
+    # shape are pinpointed in Linux's commit history as the cause of
+    # spurious HW cmd-ring traversal on early controllers.
     var link_off = 255 * 16;
     store64(cmd + link_off, cmd);
     store32(cmd + link_off + 8, 0);
-    store32(cmd + link_off + 12, (XHCI_TRB_LINK << 10) | 0x2 | 0x1);
+    store32(cmd + link_off + 12, (XHCI_TRB_LINK << 10) | 0x2);
 
     xhci_cmd_ring_phys  = cmd;
     xhci_cmd_ring_cycle = 1;
