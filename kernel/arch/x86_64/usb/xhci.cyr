@@ -100,17 +100,27 @@ fn xhci_probe() {
     # the XHCI controller is multifunction / behind a PCIe root port.
     pci_enable_bus_master_idx(idx);
 
-    # 3b. Enable MSI-X (or fall back to MSI) with Function Mask set.
-    # Per Linux xhci_setup_msix prior art: some xHCI silicon gates
-    # operational-register state-machine progress on the interrupter
-    # being "configured" via MSI/MSI-X enable in PCI config space,
-    # independent of whether the OS actually routes the IRQ. AGNOS
-    # polls the event ring on a timer tick instead of via vector, but
-    # the controller needs to see MSI/MSI-X enable asserted in its
-    # config space anyway. Function Mask suppresses entry delivery so
-    # no spurious IDT vector dispatches happen.
-    var msi_mode = pci_enable_msix_masked(idx);
-    if (msi_mode == 1)      { kprintln("xhci: MSI-X enabled (function-mask)", 35); }
+    # 3b. Enable MSI-X (or fall back to MSI). Per Linux xhci_setup_msix
+    # prior art: some xHCI silicon gates operational-register state-
+    # machine progress on the interrupter being "configured" via MSI/
+    # MSI-X enable in PCI config space, independent of whether the OS
+    # actually routes the IRQ. AGNOS polls the event ring on a timer
+    # tick instead of via vector, but the controller needs to see MSI/
+    # MSI-X enable asserted in its config space anyway.
+    #
+    # Repair (MM) 2026-05-17 — drop the PCI Function Mask bit. Attempt
+    # 60 exhausted the prior hypothesis stack (FF/GG/HH/JJ/KK/LL); per
+    # docs/development/state.md the remaining user-validated behavioral
+    # hypothesis is that AMD FCH 1022:1639 interprets PCI MSI-X Function
+    # Mask as a stronger gate than the PCI spec implies — suppressing
+    # internal interrupter state-machine progress (including the DMA
+    # writes that post events to the ring), not just MSI-X message
+    # transmission. Linux's pci_alloc_irq_vectors path always leaves
+    # Function Mask = 0; we now match that posture. Per-vector masks in
+    # the MSI-X table default to 1 (PCI 3.0 §6.8.2.5.3), so no spurious
+    # MSI-X messages will be transmitted even with Function Mask=0.
+    var msi_mode = pci_enable_msix_unmasked(idx);
+    if (msi_mode == 1)      { kprintln("xhci: MSI-X enabled (no function-mask)", 38); }
     else { if (msi_mode == 2) { kprintln("xhci: MSI enabled", 17); }
         else                { kprintln("xhci: no MSI/MSI-X cap advertised", 33); } }
 

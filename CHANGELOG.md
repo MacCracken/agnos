@@ -5,9 +5,64 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-**Bundled atop 1.30.6 banner in commit `0e3d01a` ("fixing pci for xhci")** — three changes that ship together without a version bump because they're all part of the post-FF cmd-path triage cycle. Will roll into the next tagged release once the cmd-ring gate is closed.
+**Bundled atop 1.30.6 banner** — all changes part of the post-FF cmd-path triage cycle. Will roll into the next tagged release once the cmd-ring gate is closed.
 
 ### Added
+
+- **Repair (MM)** — PCI MSI-X Function Mask cleared, leave Enable=1. New
+  `pci_enable_msix_unmasked` at `kernel/core/pci.cyr:191-238`; call-site
+  swap in `xhci.cyr:103-115` (was `pci_enable_msix_masked`). FB literal
+  changed: `xhci: MSI-X enabled (no function-mask)` (was `(function-mask)`).
+  Per-vector mask defaults to 1 (PCI 3.0 §6.8.2.5.3) so spurious MSI-X
+  messages stay suppressed even with Function Mask=0. Hypothesis: AMD FCH
+  1022:1639 interprets Function Mask as a stronger gate than PCI spec
+  implies — suppressing internal interrupter state-machine progress (DMA
+  event posting) on top of message TX suppression. Linux's
+  `pci_alloc_irq_vectors` path always leaves Function Mask=0 post-init.
+  Build size: 367,944 → 368,472 B (+528 B). Staged for Attempt 61 iron
+  burn; outcome pre-bound in
+  [`iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md)
+  § Attempt 61. **Decoupling decision**: if MM falsifies, no `Repair (NN)`
+  letter ladder — escalate as controller-firmware issue or pivot to
+  different bare-metal target; Phase 4/5 (HID configure + kb_buf) continues
+  in parallel.
+
+- **Repair (HH)** — Post-doorbell-write `load32` readback flush in
+  `xhci_cmd_submit` (`xhci_cmd.cyr:130-131`). Matches Linux
+  `xhci_ring_cmd_db` (`xhci-ring.c`) — `writel(DB_VALUE_HOST, dba); readl(dba);`
+  AMD FCH 1022:1639 empirically misses doorbells without this readback (the
+  CPU-side store completes but the doorbell write sits in the host bridge's
+  posted-write queue indefinitely; UC mapping prevents CPU coalescing but
+  does not prevent host-bridge deferral). **Attempt 60 outcome**: HH
+  applied, `events_seen=0` persists — doorbell-flush hypothesis closed.
+
+- **Repair (JJ)** — Universal `load32` readback flush on every operational
+  + runtime register write. `xhci_op_write32`, `xhci_op_write64`,
+  `xhci_rt_write32`, `xhci_rt_write64` in `xhci.cyr:354-391` each do
+  `store…; var flush = load32(addr);`. Matches Linux convention (`writel +
+  readl` in `xhci-mem.c` / `xhci.c` — every CRCR / DCBAAP / ERSTBA /
+  ERSTSZ / ERDP / IMAN / USBCMD / CONFIG operational write followed by a
+  readback). **Attempt 60 outcome**: JJ applied universally, `events_seen=0`
+  persists — host-bridge posted-write deferral hypothesis closed across
+  the entire operational + runtime register surface.
+
+- **Repair (KK)** — CNR (Controller Not Ready, USBSTS bit 11) poll before
+  any operational-register writes in `xhci_start`. `xhci.cyr:540-559`.
+  Matches Linux `xhci_init` → `xhci_handshake(STS_CNR, 0, …)`. AMD FCH has
+  a documented post-reset CNR re-assert window where HCRST=0 but CNR=1,
+  and operational writes during that window are silently absorbed by the
+  controller. **Attempt 60 outcome**: KK applied, no `xhci: CNR never
+  cleared` line on FB → CNR was clear at the poll's first iteration; post-
+  reset CNR re-assert hypothesis closed for this silicon.
+
+- **Repair (LL)** — Link TRB initial cycle bit fix in `xhci_rings_init`.
+  `xhci_ring.cyr:179-192` — removed `| 0x1` from initial Link TRB write.
+  Per xHCI 1.2 §4.9.3.1 the Link TRB starts with C bit opposite of PCS=1
+  so HW doesn't follow it before SW fills the ring; SW updates Link TRB.C
+  to current PCS just before wrap (logic at lines 80-95). Matches Linux
+  `xhci_alloc_segment` (zeroes the ring, writes Link TRB type+TC without
+  setting C). First Enable Slot doesn't traverse Link TRB so LL is
+  defensive correctness — but spec-correct and shipped in same burn.
 
 - **Repair (GG)** — AMD-Vi global IOMMU disable for the AMD Renoir 1022:1639
   platform (archaemenid iron target). `amd_iommu_disable()` at
