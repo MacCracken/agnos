@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-05-17 (v1.29.0 closeout) | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. If a row above goes stale by more than a minor's worth of work, the row is wrong — fix it or move it.
+> **Last refresh**: 2026-05-18 (v1.29.0 closeout) | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. If a row above goes stale by more than a minor's worth of work, the row is wrong — fix it or move it.
 >
 > **Scope**: live snapshot of this repo (`agnos`). Volatile state lives here so [`CLAUDE.md`](../../CLAUDE.md) can stay durable. Historical narrative lives in [`CHANGELOG.md`](../../CHANGELOG.md); the design ledger lives in [`roadmap.md`](roadmap.md).
 
@@ -16,9 +16,9 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.30.6** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.30.7** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **5.11.53** | `cyrius.cyml [package].cyrius` |
-| **Released** | 2026-05-17 | [`CHANGELOG.md`](../../CHANGELOG.md) |
+| **Released** | 2026-05-18 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Last assertion tightened** | `KASLR: pmm_next_free=N` varies across two boots | CI `boot-test` job, v1.28.0 (**currently broken — see "Open investigation" below**) |
 
 ## Open investigation — timer-driven context switch under UEFI+gnoboot (2026-05-13, iron-confirmed 2026-05-14)

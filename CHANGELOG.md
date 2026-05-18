@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.30.7] — 2026-05-18
+
 ## [1.30.6] — 2026-05-18 (xHCI cmd-path arc — FF through QQ; MSI-X table programming closeout)
 
 **Phase 4 Enable Slot `events_seen=0` opened the cmd-path silent-absorb arc; 1.30.6 bundles the full repair surface as code.** 1.30.5 closed the Phase 3 silent-absorb arc with Repair (EE) after 13 falsified hypotheses; 1.30.6 opens the Phase 4 cmd-path arc with Repair (FF) and accumulates ten subsequent behavioral repairs (GG, HH, JJ, KK, LL, MM, NN, OO, QQ + QQ'') as the four-source convergent-prior-art audit (Linux + FreeBSD + Haiku + EDK2 — see [`xhci-prior-art-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/xhci-prior-art-audit.md)) narrows the gate. As of the 1.30.6 cut: FF through OO burned and falsified across Attempts 57-62; QQ + QQ'' (MSI-X Table vector-0 programming) staged-not-yet-burned. Per the iron-bring-up convention, code lands in the release regardless of iron validation; iron resolution moves separately in [`iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md). Bottoming-out path if QQ falsifies: Repair (PP) UC-remap of DMA regions (event ring + cmd ring + DCBAA + scratchpad), pre-staged but not auto-applied; otherwise decouple Phase 4/5 to QEMU code-completion. **The whole arc bundles under one 1.30.6 banner** per the user's 2026-05-18 cycle directive ("I really don't care what fixes it I want it fixed... hardening and cleanup can always be done later") — no per-repair point release.
