@@ -580,6 +580,28 @@ fn xhci_start() {
     kprint_num(xhci_evt_ring_phys);
     kprintln("", 0);
 
+    # Attempt-58 instrumentation (post-FF, events still 0 on iron).
+    # Read-only readback of cmd-ring + interrupter state. CRCR.CRR is
+    # bit 3 of CRCR low 32; xHCI 1.2 §5.4.5 marks the pointer portion
+    # indeterminate-on-read but CRR is RO-readable. Expect:
+    #   CRR=1     — controller accepted the cmd ring + entered Running.
+    #   ERSTSZ=1  — single ERST segment as written.
+    #   IMAN=3    — IP|IE both set (FF repair stuck at the register).
+    #   ERDP_lo   — equals xhci_evt_ring_phys low 32 pre-first-event.
+    var crcr_lo = xhci_op_read32(XHCI_OP_CRCR);
+    var erstsz  = xhci_rt_read32(ir0 + XHCI_IR_ERSTSZ);
+    var iman_rb = xhci_rt_read32(ir0 + XHCI_IR_IMAN);
+    var erdp_lo = xhci_rt_read32(ir0 + XHCI_IR_ERDP);
+    kprint("xhci: CRCR.CRR=", 15);
+    kprint_num((crcr_lo >> 3) & 0x1);
+    kprint(" ERSTSZ=", 8);
+    kprint_num(erstsz);
+    kprint(" IMAN=", 6);
+    kprint_num(iman_rb);
+    kprint(" ERDP_lo=", 9);
+    kprint_num(erdp_lo);
+    kprintln("", 0);
+
     # CMOS kernel checkpoint 0x31 (xhci controller running).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x31; 0xE6; 0x71; }
     return 1;

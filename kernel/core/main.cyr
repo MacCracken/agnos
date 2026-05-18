@@ -145,6 +145,15 @@ kprintln(" devices", 8);
 # === CMOS kernel checkpoint 11 (ACPI + PCI enumerated) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0B; 0xE6; 0x71; }
 
+# Repair (GG) 2026-05-17 — disable AMD-Vi before any device DMA. On
+# AMD Renoir 1022:1639 (archaemenid) firmware enables AMD-Vi by default;
+# without OS-side DTE setup ALL device DMA is silently blocked. AGNOS
+# only ships Intel VT-d below this point. amd_iommu_disable() pokes the
+# IOMMU cap at PCI 0:0.2, finds the MMIO base, and writes the Control
+# Register to 0 — passthrough for everyone. Intel boxes no-op (no cap
+# 0x0F at 0:0.2). See iron-nuc-zen-log.md § Attempt 57 → 58.
+amd_iommu_disable();
+
 # xHCI Phase 1 — locate the USB 3.x host controller (if present),
 # identity-map already covered by pt_init (0–4 GB), read capability
 # window, cache MaxSlots/MaxIntrs/MaxPorts/CSZ/DBOFF/RTSOFF as module

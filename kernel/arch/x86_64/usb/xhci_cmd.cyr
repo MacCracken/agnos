@@ -45,6 +45,14 @@ var xhci_last_cmd_ccode   = 0;
 var xhci_diag_evt_count = 0;
 var XHCI_DIAG_EVT_MAX   = 12;
 
+# Attempt-58 instrumentation — first-N xhci_cmd_submit calls print the
+# computed TRB phys + dword 3 readback so we can confirm (a) the TRB
+# landed at the address HW will fetch from (xhci_cmd_ring_phys + idx*16)
+# and (b) the cycle bit + TRB type were stored correctly. Bounded to 2
+# (Enable Slot + Address Device on a single-keyboard archaemenid boot).
+var xhci_diag_submit_count = 0;
+var XHCI_DIAG_SUBMIT_MAX   = 2;
+
 # Per-command-issue completion timeout. At a few cycles per load+load
 # pair this bounds wall time to roughly a quarter second on Zen — the
 # spec doesn't define a hard ceiling but contemporary controllers
@@ -84,6 +92,20 @@ fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
             xhci_cmd_ring_cycle = 1;
         }
         xhci_cmd_ring_idx = 0;
+    }
+
+    # Attempt-58 instrumentation — first-N submits print TRB addr + dw3
+    # to confirm cmd ring + cycle bit are coherent with HW's view. Bounded
+    # by XHCI_DIAG_SUBMIT_MAX (2) so FB stays one screen.
+    if (xhci_diag_submit_count < XHCI_DIAG_SUBMIT_MAX) {
+        xhci_diag_submit_count = xhci_diag_submit_count + 1;
+        kprint("xhci: cmd_submit#", 17);
+        kprint_num(xhci_diag_submit_count);
+        kprint(" trb_phys=", 10);
+        kprint_num(trb);
+        kprint(" dw3=", 5);
+        kprint_num(load32(trb + 12));
+        kprintln("", 0);
     }
 
     # Ring HC doorbell (slot 0) with target/stream = 0. xHCI 1.2 §5.6.

@@ -221,3 +221,97 @@ fn iommu_register_dma(phys) {
     iommu_allow_dma_2mb(phys);
     return 0;
 }
+
+# === AMD-Vi IOMMU Disable — Repair (GG), 2026-05-17 ===
+#
+# Everything above this line is Intel VT-d. Archaemenid is AMD Renoir
+# 1022:1639 — uses AMD-Vi (a different IOMMU). The VT-d path no-ops on
+# AMD because ACPI DMAR is Intel-specific; AMD publishes IVRS instead.
+# But AMD-Vi is enabled by firmware on consumer Zen platforms; without
+# OS-side DTE setup, every device DMA gets translated against an
+# undefined Device Table Entry and silently blocked.
+#
+# Symptom (Attempts 56+57): `events_seen=0` over the full timeout window
+# regardless of IMAN.IE state. xHCI CPU-side MMIO works (port reset
+# succeeds — PORTSC is CPU→device); xHCI device-side DMA does not
+# (cmd-ring TRB read + event-ring TRB write both blocked).
+#
+# MVP fix: disable AMD-Vi globally. Proper passthrough/DTE setup is
+# v6.x territory. This function:
+#   1. Walks PCI 0:0.2 capability list for cap ID 0x0F (Secure Device).
+#   2. Confirms cap type bits [18:16] == 0x3 (IOMMU).
+#   3. Extracts MMIO base from cap+4 (low) and cap+8 (high), masking off
+#      the Enable bit + reserved bits per AMD I/O Virt §3.1.1.
+#   4. Maps the 2 MB region containing the MMIO as UC.
+#   5. Writes IOMMU Control Register (MMIO+0x18) = 0 to disable
+#      translation, command buffer, event log — effectively passthrough.
+#
+# Call from main.cyr BEFORE xhci_probe.
+
+fn amd_iommu_find_cap(bus, slot, func) {
+    var sts_cmd = pci_read32(bus, slot, func, 4);
+    if (((sts_cmd >> 16) & 0x10) == 0) { return 0; }
+    var cap_ptr_dw = pci_read32(bus, slot, func, 0x34);
+    var off = cap_ptr_dw & 0xFC;
+    var safety = 0;
+    while (off != 0) {
+        if (safety > 48) { return 0; }
+        safety = safety + 1;
+        var hdr = pci_read32(bus, slot, func, off);
+        if ((hdr & 0xFF) == 0x0F) {
+            if (((hdr >> 16) & 0x7) == 0x3) { return off; }
+        }
+        off = (hdr >> 8) & 0xFC;
+    }
+    return 0;
+}
+
+fn amd_iommu_disable() {
+    var bus  = 0;
+    var slot = 0;
+    var func = 2;
+    var cap  = amd_iommu_find_cap(bus, slot, func);
+    if (cap == 0) {
+        kprintln("amdvi: cap 0x0F absent at 0:0.2 (not AMD-Vi)", 44);
+        return 0;
+    }
+    var base_lo = pci_read32(bus, slot, func, cap + 4);
+    var base_hi = pci_read32(bus, slot, func, cap + 8);
+    var enable  = base_lo & 0x1;
+    var mmio_lo = base_lo & 0xFFFFC000;
+    var mmio    = mmio_lo | (base_hi << 32);
+
+    kprint("amdvi: cap@", 11);
+    kprint_num(cap);
+    kprint(" mmio=", 6);
+    kprint_num(mmio);
+    kprint(" en=", 4);
+    kprint_num(enable);
+    kprintln("", 0);
+
+    if (enable == 0) {
+        kprintln("amdvi: already off; DMA not gated by IOMMU", 42);
+        return 0;
+    }
+    if (mmio == 0) {
+        kprintln("amdvi: mmio base zero, cannot disable", 37);
+        return 0;
+    }
+    if (mmio >= 0x100000000) {
+        kprintln("amdvi: mmio above 4 GB (rare), skipping", 39);
+        return 0;
+    }
+
+    if (vmm_is_mapped(mmio) == 0) { vmm_map(mmio, mmio, 0x83); }
+    vmm_remap_uc_2mb(mmio);
+
+    # IOMMU Control Register at MMIO+0x18 (64-bit). Bit 0 = IommuEn;
+    # writing 0 disables translation, cmd buffer, event log, everything.
+    store64(mmio + 0x18, 0);
+    var ctrl_rb = load64(mmio + 0x18);
+    kprint("amdvi: disabled, ctrl_rb=", 25);
+    kprint_num(ctrl_rb);
+    kprintln("", 0);
+
+    return 1;
+}
