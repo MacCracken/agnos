@@ -1,31 +1,34 @@
 # AGNOS Kernel Architecture
 
-> **Last Updated**: 2026-05-11 (v1.27.2 closeout)
+> **Last Updated**: 2026-05-18 (v1.30.7 cycle)
 >
-> Multi-arch (x86_64 + aarch64), 26 syscalls, 35 subsystems. Built with cyrius 5.10.44 (pinned in `cyrius.cyml`). Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+).
+> Multi-arch (x86_64 + aarch64), 26 syscalls, 35+ subsystems. Built with cyrius 5.11.59 (pinned in `cyrius.cyml`). Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+). Iron-validated NUC AMD Zen 2026-05-15 (boot-to-shell MVP cleared kernel-init layer; xHCI Enable Slot CCE cmd-path gate remains open as of v1.30.7 — see [`../development/state.md`](../development/state.md) § Open investigation).
 >
-> For live binary sizes per arch, source line counts, sibling pins, and test surface, see [`../development/state.md`](../development/state.md).
+> For live binary sizes per arch, per-cut size trajectory, source line counts, sibling pins, and test surface, see [`../development/state.md`](../development/state.md).
 
 ## Boot Sequence
 
 ### x86_64
 
 ```
-BIOS/UEFI -> GRUB/QEMU multiboot1 loader
-  -> 32-bit entry (ELF32, base 0x100000)
-    -> Identity page tables (4 levels, 2MB huge pages)
-    -> Enable PAE -> set CR3 -> enable LME in EFER -> enable paging
-    -> Load 64-bit GDT -> far jump to 64-bit code
-      -> Cyrius kernel main() (sh scripts/build.sh — wraps cyrius build with #define ARCH_X86_64)
+UEFI firmware
+  -> gnoboot (sovereign UEFI bootloader, PE32+ EFI Application)
+    -> Path-C sovereign boot-info struct (magic 0x41474E4F, 80 bytes)
+    -> ELF64 multiboot2 kernel mapping + jmp rax handoff
+      -> RDI = &boot_info convention (v1.30.0+ ABI break)
+      -> Cyrius kernel agnos.cyr orchestrator (sh scripts/build.sh)
         -> Serial I/O (COM1), GDT+TSS, IDT, PIC, Local APIC
         -> Page tables, PMM, VMM, kernel heap
         -> Process table, scheduler, SYSCALL/SYSRET
         -> ELF loader, VFS, initrd, device drivers
         -> PCI scan, VirtIO-Net, VirtIO-Blk, IP/UDP/TCP stack
+        -> Native xHCI + USB-HID-boot keyboard (Phase 1-5)
         -> SMP init (APIC, IPI, trampoline, per-CPU stacks)
         -> 26 syscalls (signals, epoll, timerfd, pipes)
         -> kybernet (PID 1) -> interactive shell
 ```
+
+The pre-v1.30.0 multiboot1 + 32→64 shim path (GRUB/`qemu -kernel`) is retired. See [`../development/path-c-sovereign-uefi.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/path-c-sovereign-uefi.md) (in agnosticos) for the boot-info ABI design.
 
 ### aarch64
 
@@ -47,13 +50,13 @@ qemu-system-aarch64 -M virt
 0x001000 - 0x002000  PML4 (boot identity map)
 0x002000 - 0x003000  PDPT (1 GB huge pages for 0-4 GB at PDPT[0..3])
 0x003000 - 0x004000  PD   (2 MB huge pages for 0-1 GB; per-process variants live elsewhere)
-0x100000 - 0x13D000  Kernel code + data (~248 KB x86_64 at v1.27.1)
+0x100000 - 0x1??000  Kernel code + data (live size in ../development/state.md)
 0x200000 - 0x1000000 Available physical memory (2 MB - 16 MB)
 0xFEE00000           Local APIC MMIO
 0xFED90000+          IOMMU (VT-d) register window when ACPI DMAR is present
 ```
 
-Live binary size lives in [`../development/state.md`](../development/state.md) (bumped per release). Identity-map ceiling extended to 4 GB at v1.25.0 so QEMU's ACPI tables resolve; the per-process PD-copy loop at `proc_create_address_space` mirrors that ceiling into every address space (v1.25.1).
+Live binary size + per-cut trajectory lives in [`../development/state.md`](../development/state.md). Identity-map ceiling extended to 4 GB at v1.25.0 so QEMU's ACPI tables resolve; the per-process PD-copy loop at `proc_create_address_space` mirrors that ceiling into every address space (v1.25.1). The XHCI BAR for AMD FCH 1022:1639 sits below 4 GB and is remapped strict-UC (PWT=1+PCD=1+PAT=0) on top of the identity map per Repair (X) at v1.30.x (kernel/core/vmm.cyr `vmm_remap_uc_2mb`).
 
 ## Subsystem Diagram
 
@@ -90,12 +93,12 @@ Live binary size lives in [`../development/state.md`](../development/state.md) (
 │  Signals, Epoll  │  Kernel Stdlib (kstring, kfmt)       │
 ├──────────────────┴──────────────────────────────────────┤
 │  SMP (APIC, IPI, trampoline)  │  Page Tables (per-proc) │
-│  Timer (APIC ~100Hz)          │  Keyboard (PS/2 QWERTY) │
+│  Timer (APIC ~100Hz)          │  Keyboard (PS/2 + USB-HID-boot via xHCI) │
 │  PIC (8259A)  Local APIC      │  IDT (256 vectors)      │
 │  GDT (5 seg + TSS)            │  Serial (COM1 0x3F8)    │
 ├─────────────────────────────────────────────────────────┤
-│                  Boot Shim (32->64)                      │
-│           Multiboot1 (ELF32 — see state.md for size)     │
+│           Path-C sovereign boot-info ABI (v1.30.0+)      │
+│      gnoboot (UEFI) → RDI = &boot_info → ELF64 entry     │
 └─────────────────────────────────────────────────────────┘
 ```
 

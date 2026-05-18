@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.30.7 — x86_64 + aarch64, ~245KB/91KB, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU, **sovereign-struct entry (RDI = &boot_info)** via gnoboot v0.1.0. Built with cyrius 5.11.59.
+> **Current**: v1.30.7 — x86_64 + aarch64, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU, **sovereign-struct entry (RDI = &boot_info)** via gnoboot v0.2.0, native xHCI + USB-HID-boot keyboard driver (Phase 1-5 code-complete), iron-validated NUC AMD Zen 2026-05-15. Built with cyrius 5.11.59. Live binary sizes per arch + per-cut size trajectory: [`state.md`](state.md).
 >
 > Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 
@@ -20,57 +20,42 @@ Per-version detail lives in [`CHANGELOG.md`](../../CHANGELOG.md). This is the at
 | **v1.27.x** | Cyrius pin 5.7.22 → 5.10.44 + ecosystem realignment; latent cross-arch `#ifdef` correctness fix in `proc.cyr` (4 x86-only page-table fns); **memory-isolation deeper-fault closed — root cause was SMAP**, fix is `stac`/`clac` brackets, test un-gated, CI assertion tightened to `Memory isolation: PASS`; CLAUDE.md durable-only reshape per first-party-documentation standards; new `docs/development/state.md` (volatile state) + `docs/doc-health.md` (whole-tree currency ledger); `CODE_OF_CONDUCT.md` added. |
 | **v1.28.x** | **KASLR (data-only)** — Security Hardening **track fully closed (13/13)**: `rdrand_u64` helper, `kaslr_seed`, randomized `pmm_next_free`, two-boot-diff CI assertion. **`serial_putc` methodology**: bench-history provenance schema (qemu_version / cpu_model / host_arch / kvm_enabled / cyrius_version) — matched-conditions re-measure showed the "regression" was QEMU UART-emulation drift, not codegen. **VFS tagged unions** via new `kernel/lib/ktagged.cyr` (inline tagged-union helpers, no heap alloc). **Struct refactor** (partial): `PciDev` `#derive(accessors)` ✅, `vfs_table` counted (ktagged port), `proc_table` blocked on cyrius v5.11.x cap-raise (16-field metadata-table overflow filed upstream, acknowledged + slotted). `sched.cyr` `cr3_load` hygiene fix (replaces v1.27.x-era brittle CR3-load pattern). 1.29.0 is the arc gate. |
 | **v1.29.x** | Cyrius pin **5.10.44 → 5.11.x**; `Process` `#derive(accessors)` port (passive — landed at pin bump); minor follow-ups on the 1.28.x carry-forward. Gate cut at v1.29.1 ahead of the Path A→C transition. |
-| **v1.30.0** | **Kernel ABI break — sovereign-struct entry (Path C handoff).** Replaces multiboot2-via-GRUB (Path A, dead) with the gnoboot sovereign UEFI bootloader. Entry contract switches from `RBX = MBI ptr` (multiboot2 § 8.4.3) to `RDI = &agnos_boot_info` (magic `0x41474E4F = 'AGNO'`, layout in agnosticos's path-c plan). `kernel/arch/x86_64/mbi.cyr` asm byte `0x18 → 0x38`; `mbi_capture_rbx → boot_info_capture_rdi`; `mb_info_ptr → boot_info_ptr`. cyrius pin **5.11.43 → 5.11.53**. **CI restructure**: `qemu -kernel` retired (ELF64 has no PVH note; QEMU rejects); replaced with `gnoboot + OVMF + qemu-system-x86_64 -cpu max` boot-test. Pairs with gnoboot v0.1.0. |
+| **v1.30.0** | **Kernel ABI break — sovereign-struct entry (Path C handoff).** Replaces multiboot2-via-GRUB (Path A, dead) with the gnoboot sovereign UEFI bootloader. Entry contract switches from `RBX = MBI ptr` to `RDI = &agnos_boot_info` (magic `0x41474E4F`). cyrius pin **5.11.43 → 5.11.53**. CI restructure: `qemu -kernel` retired; replaced with `gnoboot + OVMF + qemu-system-x86_64 -cpu max`. Pairs with gnoboot v0.1.0. |
+| **v1.30.1–.4** | **xHCI Linux-diff hardening closeout**: XHCI BAR UC remap (Repair X), PORTSC strict-RW1S model, USB-HID Phase 1-3 (PCIe discovery → controller init → port enumeration), four spec gaps closed (H1: PAGESIZE validation; H2: IMAN.IP RW1C clear; H3: IMOD = 0x3E8; H4: USBCMD.HSEE). |
+| **v1.30.5** | **Phase 4/5 USB-HID boot keyboard driver landed + Phase 3 silent-absorb arc closed.** `hid_kbd_configure` + `hid_poll` + HID→PS/2 mapping + `kb_buf` writer. Repair (EE) one-line fix to `xhci_portsc_write`'s inner re-mask closed the 13-hypothesis Phase 3 silent-absorb arc (Attempts 32-54 chased the wrong cause). |
+| **v1.30.6** | **xHCI cmd-path arc — Repairs FF → QQ bundled (single CHANGELOG entry).** FF (IMAN.IE=1), GG (AMD-Vi disable), HH (doorbell readback), JJ (universal readback), KK (CNR poll), LL (Link TRB cycle), MM (MSI-X FuncMask), NN (ERDP/ERSTBA + CRCR/IMOD reorder per 4-source prior-art convergence), OO (Tier 2 bundle: USBSTS-clear + IMAN.IE-post-R/S + mfence + TRB-readback), QQ (MSI-X Table vector-0 programming — first arc repair tied to a named Linux-implicit divergence). 9-letter ladder closed at OO; QQ staged-not-yet-burned. |
+| **v1.30.7** | Version bump for next-cycle work (no kernel source delta beyond the bump). |
 
-## 1.30.x Arc Plan — scheduler-under-UEFI + iron Attempt 5
+## 1.30.x Arc Recap
 
-The 1.30.0 kernel ABI break was the gate cut; 1.30.x is the **stabilization arc** that follows. Two known open items, both surfaced post-handoff under gnoboot+OVMF.
+The 1.30.x arc is the **kernel-ABI break + hardware-bring-up arc**. It opened with the sovereign-struct entry (v1.30.0, Path-C UEFI handoff via gnoboot), closed Phase 3 USB silent-absorb (v1.30.5, Repair EE), bundled the xHCI cmd-path repairs FF→QQ (v1.30.6), and is iron-validated on NUC AMD Zen 2026-05-15 for boot-to-shell MVP except the xHCI Enable Slot CCE gate. Per-attempt detail in [agnosticos iron-nuc-zen-log](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
 
-| Slot | Item | Source | Notes |
-|------|------|--------|-------|
-| **1.30.0** | **Sovereign-struct entry + CI restructure** | this arc opener | ✅ shipped. RDI handoff; gnoboot+OVMF CI boot-test; CI asserts banner + KASLR two-boot-diff + `Activating scheduler`. |
-| **1.30.x** | **scheduler/page-table breakage under UEFI** | [state.md § Open investigation](state.md#open-timer-driven-context-switch-broken--deeper-than-test_proc-alone) | gnoboot delivers cleanly; kernel reaches `Activating scheduler` then 10 context switches succeed; cycle breaks. Suspected: `pt_init` writes to fixed-physical `0x1000/0x2000/0x3000` (only valid under multiboot1's seeded shim, NOT under UEFI); `apic_init` maps `0xFEE00000` via same broken page tables; per-process PT templates corrupted. Fix path: stop assuming fixed-physical page-table location — `pmm_alloc` the kernel PML4/PDPT/PD too, or detect UEFI vs `-kernel` boot and branch. Once fixed, re-tighten CI back to `Memory isolation: PASS` + `Userland exec complete`. |
-| **1.30.x** | **Iron Attempt 5 on NUC AMD** | [agnosticos iron-nuc-zen log](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) | gnoboot v0.1.0 + agnos v1.30.0 USB re-provision via `agnosticos/scripts/install-usb.sh`. Real iron may behave differently from OVMF (NUC AMD Zen has RDRAND natively; APIC routing differs; different memory layout). If iron boots through to scheduler, the QEMU-OVMF-specific bug may not apply. If iron also stalls, the kernel fix is critical for closed-beta MVP. |
-| **1.30.x** | **Cosmetic cleanup** | follow-up | `scripts/build.sh` still prints `multiboot2 (ELF64): OK` + `Boot: pending shim rewrite — see ... path-a-elf64-multiboot2.md`. Both labels are out of date post-1.30.0; should reference Path C. Trivial. |
+| Item | Status | Notes |
+|------|--------|-------|
+| **Sovereign-struct entry + CI restructure (v1.30.0)** | ✅ shipped | RDI handoff; gnoboot+OVMF CI boot-test. Closed the `qemu -kernel` legacy path. |
+| **scheduler-under-UEFI hypothesis** | ✅ resolved | The "page tables at fixed physical 0x1000/0x2000/0x3000 break under UEFI" investigation was superseded by the **2026-05-15 iron-validation milestone** (archaemenid NUC AMD Zen reached kernel CP 0x10, all 17 init checkpoints pass, `sched_active=1` survives, first hlt + timer-driven context switches succeed on real silicon). The pre-1.30.5 QEMU+OVMF stall was a `test_proc_a/b`-shape symptom resolved by Phase 4/5 progression replacing the test stubs with real boot-path procs. |
+| **xHCI Linux-diff hardening (H1-H4, v1.30.4)** | ✅ shipped | PAGESIZE validation (xHCI 1.2 §5.4.3), IMAN.IP RW1C clear (§5.5.2.1), IMOD = 0x3E8 (§5.5.2.2), USBCMD.HSEE = 1 (§5.4.1.4). Closes public-beta xHCI spec-compliance debt. |
+| **Phase 4/5 USB-HID kbd driver (v1.30.5)** | ✅ shipped | `hid_kbd_configure` + `hid_poll` + HID→PS/2 + `kb_buf` writer. Iron-side: code-complete, dormant on archaemenid until Enable Slot CCE gate clears. QEMU `xhci-pci` is the active validation surface. |
+| **Phase 3 silent-absorb (Repair EE, v1.30.5)** | ✅ closed | 13 falsified hypotheses across Attempts 32-54 chasing "controller absorbs PORTSC.PR writes"; root cause was `xhci_portsc_write` inner re-mask `& XHCI_PORTSC_NEUTRAL` stripping the RW1S PR bit. One-line fix in `agnos@41ee6dc`. |
+| **xHCI cmd-path arc FF→QQ (v1.30.6)** | 🔄 in-flight | Nine spec-path repairs (FF-OO) burned and falsified across Attempts 57-62 on archaemenid (`events_seen=0` after Enable Slot doorbell on AMD FCH 1022:1639). Repair (QQ + QQ'') MSI-X Table vector-0 programming staged at v1.30.7 cut, not yet burned. Bottoming-out: Repair (PP) UC-remap DMA regions OR decouple Phase 4/5 to QEMU code-completion. Per-attempt + 4-source convergent-prior-art audit in [agnosticos iron-nuc-zen-log](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) + [`xhci-prior-art-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/xhci-prior-art-audit.md). |
+| **MSI-X audit + BAR memtype audit (2026-05-18)** | ✅ closed | 0 iron burns. MSI-X table programming divergence FOUND (AGNOS never wrote table → Repair QQ candidate). BAR memtype CLEAN (PWT=1+PCD=1+PAT=0 = strict UC, matches `ioremap_uc()`). Vendor-cap audit dry well: no Linux `1022:1639`-gated quirk affects Enable Slot CCE. |
+| **`scripts/build.sh` cosmetic cleanup** | 🟠 trivial follow-up | Still prints `multiboot2 (ELF64): OK` + `Boot: pending shim rewrite — see ... path-a-elf64-multiboot2.md`. Both labels are out of date post-1.30.0; should reference Path C. |
 
-Order within 1.30.x is **iron-first**: Attempt 5 is the cheapest signal (~30 min reboot vs. hours of kernel debugging), and its outcome shapes scheduler-fix priority. If iron passes, scheduler-fix gets normal-priority slot. If iron also stalls, scheduler-fix becomes the iron-unblock.
+## Next cycle — open items not bound to a minor
 
-### xHCI Linux-diff hardening (closed 2026-05-17, 1.30.4 closeout)
+| # | Item | Status | Notes |
+|---|------|--------|-------|
+| 1 | **xHCI Enable Slot CCE silent-absorb resolution** | open | Iron-side, archaemenid. QQ staged; PP and decouple-to-QEMU are bottoming-out paths. Resolution gates boot-to-shell-on-iron MVP. |
+| 2 | **Bench-history snapshot in repo** | open | Decide: check in last-released `BENCHMARKS.md` + `bench-history.csv` as a tagged-state reference, or leave CI-only. Original v1.27.1 carry-forward, still pending. |
+| 3 | **`mmap` (anonymous-only)** | open | Planned #6 split — anonymous mmap is independent of ext2. Adds VMM surface but no fs work. |
+| 4 | **Hardware-validation infra** | open | RPi4 / NUC harness on self-hosted runner. Unblocks SMP-AP-wakeup-on-real-hardware (Active #1). |
+| 5 | **SMP AP wakeup on real hardware** | open | QEMU-validated only. Gated on #4. |
+| 6 | **`scripts/build.sh` cosmetic banner cleanup** | open | Trivial label refresh for Path-C era. |
 
-Pre-Attempt-52 connectivity audit across `kernel/arch/x86_64/usb/` surfaced four spec deviations from Linux's `drivers/usb/host/xhci.c` init sequence. **None are plausible silent-absorb gates** (audit-verified; structurally inert under current iron evidence) — each is a real spec gap worth closing before public-beta. **All four landed as the 1.30.4 closeout** (~10 LOC total; kernel build 350,008 B → 350,272 B; no iron burn — cyrius-compile gate is the validation surface).
-
-| # | Gap | Spec ref | AGNOS today | Status |
-|---|-----|----------|-------------|--------|
-| H1 | `XHCI_OP_PAGESIZE` never validated | xHCI 1.2 §5.4.3 | now reads bit 0, asserts 4 KB advertised, bails with `xhci: PAGESIZE rejects 4KB, bitmap=N` if not | ✅ 1.30.4 (`xhci_ring.cyr` scratchpad path) |
-| H2 | `XHCI_IR_IMAN.IP` never cleared | xHCI 1.2 §5.5.2.1 | now writes IP=1 (RW1C) on init via `xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x1)` after ERDP | ✅ 1.30.4 (`xhci.cyr` `xhci_start`) |
-| H3 | `XHCI_IR_IMOD` left at HW default 0 | xHCI 1.2 §5.5.2.2 | now writes 0x000003E8 (1000 × 250 ns = 250 µs) via `xhci_rt_write32(ir0 + XHCI_IR_IMOD, 0x3E8)` | ✅ 1.30.4 (`xhci.cyr` `xhci_start`) |
-| H4 | `USBCMD.HSEE` (bit 3) never set | xHCI 1.2 §5.4.1.4 | now sets R/S \| INTE \| HSEE (0x0D) instead of 0x05 | ✅ 1.30.4 (`xhci.cyr` `xhci_start`) |
-
-Closes the public-beta xHCI spec-compliance debt. Audit trail in [iron-nuc-zen-log § Attempt 52 + handoff/AMD-quirk audit](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
-
-## 1.29.x Arc Plan
-
-The 1.28.x arc closed at v1.29.0 (the gate cut — closeout findings from the 4-slot arc captured there). 1.29.x is a **scoped-feature arc**: pick up the cyrius v5.11.x dependency (proc_table derive port lands passively at pin bump) and walk down the longer-horizon "Planned" items in focused patches. **1.30.0 is reserved for full-binary KASLR (Option A)**; the 1.29.x arc explicitly does *not* try to do that — it builds the runway.
-
-| Slot | Item | Source | Notes |
-|------|------|--------|-------|
-| **1.29.0** | **1.28.x closeout gate** | this arc opener | ✅ shipped. Closes the 1.28.x arc cleanly, opens 1.29.x. |
-| **1.29.1** | **`Process` `#derive(accessors)` port** | Active #3 residue | Passive — depends on cyrius v5.11.x cap-raise landing first. Once the cyrius pin bump arrives, re-add `#derive(accessors)` to `struct Process` + port consumers (proc.cyr wrappers, sched.cyr save/restore, main.cyr exec_pid load). Small follow-up. |
-| **1.29.2** | **Bench-history snapshot in repo** | post-1.27.2 carry | Decide: check in last-released `BENCHMARKS.md` + `bench-history.csv` as a tagged-state reference (matches what `release.yml` already attaches as release artifact), or leave the CI artifact as the only source. Small operational item; resolvable in one cut. |
-| **1.29.3+** | **`mmap` (anonymous-only)** | Planned #6 (split) | Anonymous mmap is independent of ext2; can ship without a real filesystem. Adds VMM surface but no fs work — reasonable next bite after the small items. File-backed mmap waits for ext2 (post-1.30). |
-| **1.29.x** | **Hardware-validation infra** | Active #1 unblock | RPi4 / NUC harness on the self-hosted runner. Unblocks SMP-AP-wakeup-on-real-hardware (Active #1). Cross-cuts CI work, not kernel work — slottable any time. |
-
-Order beyond 1.29.1 is loose — the arc shape will firm up as we ship. Notable items that are **explicitly NOT in 1.29.x**:
-
-- **Full-binary KASLR (Option A)** — pushed from 1.30.0 to **1.31.0** (the 1.30.0 slot got repurposed for the Path C sovereign-struct kernel ABI break). Still gated on cyrius v6.1.x PIE support. See [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md) and [cyrius/proposals/2026-05-11-pie-support.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/proposals/2026-05-11-pie-support.md).
-- **ext2 (Planned #5)** — too big for a sub-patch slot; would consume an entire minor. Deferred to its own arc (1.32.x candidate; could move earlier if mmap shows the need urgently).
-- **Preemptive scheduling (Planned #8)** — deep rewrite of scheduler + IRQ handlers. Same reasoning as ext2: own-arc territory. The v1.28.3 `sched.cyr` `cr3_load` hygiene is one prerequisite already in place.
-
-### Carried over (not 1.29.x)
-
-| # | Item | Notes |
-|---|------|-------|
-| 1 | SMP AP wakeup on real hardware | QEMU-validated only. Closes once hardware-validation infra lands (a 1.29.x candidate slot — but the kernel-side AP-wakeup work itself is post-infra). |
+Explicitly **NOT** in the near-term queue:
+- **Full-binary KASLR (Option A)** — slotted for v1.31.0; gated on cyrius v6.1.x PIE support (see below).
+- **ext2 (Planned #5)** — own-arc territory; v1.32.x candidate.
+- **Preemptive scheduling (Planned #8)** — deep rewrite of scheduler + IRQ handlers; own-arc.
 
 ## 1.31.0 — Full-Binary KASLR (Option A)
 

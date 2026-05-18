@@ -143,23 +143,18 @@ for the methodology caveat.
 
 ## Size Comparison
 
-| Kernel | Size | Language | Scope |
-|--------|------|----------|-------|
-| **AGNOS** | **~243 KB** | Cyrius | 35 subsystems, 26 syscalls, TCP/IP, FAT16, VirtIO, SMP, ELF loader, ACPI, IOMMU, shell |
-| xv6 (MIT) | ~100 KB | C | 21 syscalls, no networking, no SMP, no real FS |
-| seL4 (verified) | ~30 KB | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
-| MINIX 3 | ~600 KB | C | Microkernel + basic drivers |
-| Linux (minimal) | ~1.5 MB | C | Barely boots, no drivers |
-| Linux (typical) | 10–30 MB | C | Desktop-ready |
+| Kernel | Language | Scope |
+|--------|----------|-------|
+| **AGNOS** | Cyrius | 35+ subsystems, 26 syscalls, TCP/IP, FAT16, VirtIO, SMP, ELF loader, ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, shell |
+| xv6 (MIT) | C | 21 syscalls, no networking, no SMP, no real FS |
+| seL4 (verified) | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
+| MINIX 3 | C | Microkernel + basic drivers |
+| Linux (minimal) | C | Barely boots, no drivers |
+| Linux (typical) | C | Desktop-ready |
 
-~243 KB for a fully functional kernel with TCP/IP, block I/O, filesystem,
-SMP, signals, epoll, pipes, ACPI/IOMMU, and an interactive shell —
-written entirely in Cyrius. No C, no LLVM, no libc.
+A fully functional kernel with TCP/IP, block I/O, filesystem, SMP, signals, epoll, pipes, ACPI/IOMMU, native xHCI / USB-HID-boot keyboard, and an interactive shell — written entirely in Cyrius. No C, no LLVM, no libc.
 
-For live binary sizes per arch, source line counts, test surface, and
-ecosystem sibling pins, see
-[`docs/development/state.md`](docs/development/state.md) (refreshed every
-release).
+For live binary sizes per arch (x86_64 + aarch64), per-cut size trajectory across v1.27.x → v1.30.x, source line counts, test surface, and ecosystem sibling pins, see [`docs/development/state.md`](docs/development/state.md) (refreshed every release). Versions intentionally elided from this table per the lib-doc precedent — the size cells drift faster than the README can be re-cut.
 
 ## Requirements
 

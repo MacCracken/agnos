@@ -1,10 +1,10 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> **Last Updated**: 2026-05-11 (v1.27.2 closeout — header refresh; surface unchanged since v1.21.0)
+> **Last Updated**: 2026-05-18 (v1.30.7 cycle — header refresh; surface unchanged since v1.21.0)
 >
-> All 26 syscalls implemented as of v1.21.0. kybernet (currently v1.2.0) can run on AGNOS as PID 1.
+> All 26 syscalls implemented as of v1.21.0. kybernet (currently v1.2.1) can run on AGNOS as PID 1.
 >
-> **Status**: This doc is the implementation reference for the v1.21.0 syscall buildout — historical record of how each syscall got wired in `kernel/core/syscall.cyr`. Current syscall surface lives in [`state.md` § Syscall surface](state.md). No new syscalls have shipped since v1.21.0; the v1.27.x arc has been correctness work, not API expansion.
+> **Status**: This doc is the implementation reference for the v1.21.0 syscall buildout — historical record of how each syscall got wired in `kernel/core/syscall.cyr`. Current syscall surface lives in [`state.md` § Syscall surface](state.md). **No new syscalls have shipped since v1.21.0** through the entire v1.27.x → v1.30.x bring-up / hardening / iron-validation arc — the work has been correctness, security hardening (S1-S13 13/13 closed at v1.28.0), the sovereign-struct kernel ABI break (v1.30.0 Path-C), and the native xHCI + USB-HID-boot driver (Phase 1-5 across v1.30.1-v1.30.5). API expansion stays deliberate.
 
 ## Current State
 
