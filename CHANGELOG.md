@@ -5,7 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.30.7] — 2026-05-18
+## [1.30.7] — 2026-05-18 (Attempt 63 iron burn — QQ + QQ2 falsified; VISUAL BOOT-TO-SHELL ON IRON ACHIEVED)
+
+**The first iron build to render `agnoshi shell v1.30.7 (type 'help')` on archaemenid's framebuffer.** Same xhci cmd-path code as 1.30.6 (FF→OO behavioral repairs + QQ + QQ2 MSI-X table programming); the version bump marks the burn that proved the kernel no longer fatal-blocks on `events_seen=0` after xhci init failure. Boot proceeds past the xhci gate into scheduler test (timer ticks: 153) → `init: hello AGNOS!` → userland test (HELLO) → userland complete → launching kybernet → kybernet starting init → launching shell → agnoshi prompt visible on screen. The closed-beta MVP's visual half is hit on iron; the remaining gate is functional keyboard input through xhci (still gated on the cmd-path silent-absorb — no Enable Slot CCE → no HID enumeration).
+
+**xHCI cmd-path status after Attempt 63**: Repairs QQ (MSI-X table vector-0 programming with Message Address Lo=0xFEE00000 / Hi=0 / Data=0x40 / Vector Control=1 + readback flush) and QQ2 (Linux-canonical Enable+MaskAll → table-write → clear-MaskAll ordering) burned bundled and **falsified** — `events_seen=0` survives. The speculative-table-read mechanism hypothesis (controller reads its own MSI-X table to gate event posting) is disproven on AMD FCH 1022:1639. Letter ladder now 10 deep on the same symptom (FF → GG → HH → JJ → KK → LL → MM → NN → OO → QQ+QQ2). USBSTS = 0x00, USBCMD = 0x0d (R/S | INTE | HSEE), CCS bitmap 0x04 on port 2 — controller is healthy and silent on CCEs only.
+
+Iron-side narrative + boot-log read in [`agnosticos/docs/development/iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) § Attempt 63.
+
+### Changed
+
+- `VERSION`: 1.30.6 → 1.30.7
+- `kernel/version.cyr`: kernel banner, shell banner, `_AGNOS_VERSION` bumped to 1.30.7
+- `docs/development/state.md`: kernel row + release date refreshed
+
+### Notes
+
+- No code change from 1.30.6 — same `pci_enable_msix_unmasked` + `xhci_start` surface. Banner-only release for the iron-validation receipt.
+- Next-move options under user review: (PP) UC-remap DMA regions; (QQ3) Linux-style per-vector MSI-X programming across all N vectors; (Phase-4/5-software) xHCI 1.2 §4.6 audit on whether Enable Slot is normatively required for HID enumeration; (decouple) Phase 4/5 to QEMU code-completion.
 
 ## [1.30.6] — 2026-05-18 (xHCI cmd-path arc — FF through QQ; MSI-X table programming closeout)
 

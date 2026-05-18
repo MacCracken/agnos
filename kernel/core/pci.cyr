@@ -27,7 +27,15 @@ var pci_count = 0;
 # stay byte-compatible against `&pci_devs + i * 32` indexing.
 # v1.30.1: added for xhci_probe (PCI class lookup + 64-bit BAR readback).
 var pci_class[1024];    # 128 entries x 8 bytes; packed (class<<16 | subclass<<8 | prog_if)
-var pci_bar0_hi[1024];  # 128 entries x 8 bytes; high 32 bits of BAR0 when 64-bit memory BAR
+# Resolved 64-bit phys for each of the six standard BARs per device.
+# Layout: idx*48 + slot*8 where slot ∈ {0..5}. For a 64-bit memory BAR
+# at slot N, slot N is the full resolved phys (lo & 0xFFFFFFF0 | hi<<32)
+# and slot N+1 is stored as 0 (consumed — N+1 holds the high half of
+# BAR(N), not an independent BAR). 32-bit memory BARs and I/O BARs
+# store their low value masked of the 4 flag bits. Unimplemented BARs
+# store 0. Consumers should call pci_bar_64(idx, bir) which understands
+# this layout; pci_bar0_64(idx) is the legacy shortcut for slot 0.
+var pci_bar_phys[6144]; # 128 entries x 6 BARs x 8 bytes
 # v1.30.1: full PCIe-addressing — packed (bus<<8 | func) per entry.
 # Legacy consumers (virtio_net/blk, iommu, lspci) assume bus=0/func=0
 # and only look at PciDev_slot — they continue to work unchanged because
@@ -188,46 +196,19 @@ fn pci_enable_msix_masked(idx) {
     return 0;
 }
 
-# Repair (MM) 2026-05-17 — MSI-X Enable WITHOUT Function Mask.
-# Repair (QQ + QQ'') 2026-05-18 — also program vector 0 of the MSI-X
-# Table, using Linux's MaskAll-then-table-then-clear-MaskAll ordering.
+# Enable MSI-X with vector 0 programmed against the BSP LAPIC, then
+# clear the device-wide Function Mask. Per-vector mask stays = 1 so
+# no IDT delivery actually fires (AGNOS polls the event ring on timer
+# tick — no ISR registered). The Linux ordering — Enable + MaskAll,
+# write the table, clear MaskAll — is followed because the AMD FCH
+# 1022:1639 interrupter state machine wants to see a configured table
+# before it will post events on this side of the cap header.
 #
-# MM-era (this function pre-QQ) set Enable + clear FuncMask, then
-# stopped. Per PCI 3.0 §6.8.2.5.3, MSI-X Table entries' per-vector
-# Mask bit is initialized to 1 at reset (and re-initialized to 1 each
-# time MSI-X Enable transitions 0→1). With Function Mask cleared but
-# per-vector masks at default = 1, no MSI-X message would transmit —
-# that was the intended polling-friendly posture (AGNOS polls the
-# event ring on timer tick; no ISR registered).
+# MUST run AFTER xhci.cyr's vmm_remap_uc_2mb so table writes land in
+# UC; otherwise they coalesce in WB and the controller never observes
+# the configured table.
 #
-# But: the all-zero table (Address=0, Data=0, VectorControl=1) meant
-# the AMD FCH 1022:1639 interrupter state machine saw an unconfigured
-# table, which (per the MSI-X audit in iron-nuc-zen-log § Attempt 63
-# prep) is the leading hypothesis for why `events_seen=0` survived the
-# nine spec-path repairs FF/GG/HH/JJ/KK/LL/MM/NN/OO. Linux's
-# pci_alloc_irq_vectors → msix_capability_init populates Address/Data
-# for every claimed vector BEFORE clearing FuncMask. AGNOS now matches
-# that init order.
-#
-# QQ.1 — Phase 1: Enable + FuncMask BOTH set. Linux uses
-#   pci_msix_clear_and_set_ctrl(dev, 0, MASKALL | ENABLE) atomically;
-#   we approximate with one config write. The MaskAll-during-init
-#   window ensures no MSI-X message can transmit during table writes.
-# QQ.2 — Phase 2: program vector 0's table entry. Read Table Offset/BIR
-#   from cap+0x04; compute table_phys = BAR(BIR) + offset per PCI 3.0
-#   §6.8.2.4. Write Address Lo = 0xFEE00000 (BSP LAPIC base, dest CPU 0,
-#   physical destination mode), Address Hi = 0 (x86_64 MSI is 32-bit),
-#   Data = 0x40 (vector 0x40, Fixed delivery, Edge trigger), Vector
-#   Control = 1 (mask=1; preserves AGNOS polling posture — no ISR
-#   plumbing required). Readback flush per Repair JJ convention.
-#   MUST run AFTER xhci.cyr's vmm_remap_uc_2mb so the table writes
-#   hit UC (otherwise WB coalescing hazard, same as the pre-Repair-X
-#   PORTSC silent-absorb).
-# QQ.3 — Phase 3: clear FuncMask. Enable stays = 1. End state matches
-#   Linux's post-msix_capability_init posture.
-#
-# Returns 1 if MSI-X enabled (function mask CLEAR, vector 0 programmed,
-# per-vector mask = 1), 2 if MSI fallback, 0 if neither advertised.
+# Returns 1 if MSI-X enabled, 2 if MSI fallback, 0 if neither advertised.
 fn pci_enable_msix_unmasked(idx) {
     var slot = PciDev_slot(&pci_devs + idx * 32);
     var bf = load64(&pci_busfunc + idx * 8);
@@ -237,16 +218,21 @@ fn pci_enable_msix_unmasked(idx) {
     if (msix_off != 0) {
         var hdr = pci_read32(bus, slot, func, msix_off);
 
-        # QQ Phase 1 — Enable + FuncMask BOTH set (MaskAll window).
+        # Phase 1 — Enable + FuncMask BOTH set (MaskAll window per
+        # Linux msix_capability_init).
         var hdr_p1 = (hdr & 0x3FFFFFFF) | 0xC0000000;
         pci_write32(bus, slot, func, msix_off, hdr_p1);
 
-        # QQ Phase 2 — read Table Offset/BIR, compute table_phys, write
-        # vector 0's entry, readback flush.
+        # Phase 2 — read MSI-X Table Offset/BIR, resolve the table's
+        # full 64-bit phys via pci_bar_64 (which handles 64-bit BARs
+        # and consumed slots — the raw `pci_read32(0x10 + bir*4)` we
+        # used before truncated the upper 32 bits and treated BAR slots
+        # as independent, both of which break for the standard xHCI
+        # layout where BAR0 is a 64-bit memory BAR). Program vector 0.
         var tob = pci_read32(bus, slot, func, msix_off + 4);
         var bir = tob & 0x07;
         var tbl_off = tob & 0xFFFFFFF8;
-        var bar = pci_read32(bus, slot, func, 0x10 + bir * 4) & 0xFFFFFFF0;
+        var bar = pci_bar_64(idx, bir);
         var tbl = bar + tbl_off;
         store32(tbl + 0,  0xFEE00000);
         store32(tbl + 4,  0);
@@ -254,7 +240,7 @@ fn pci_enable_msix_unmasked(idx) {
         store32(tbl + 12, 1);
         var flush = load32(tbl + 12);
 
-        # QQ Phase 3 — clear FuncMask. Enable stays = 1.
+        # Phase 3 — clear FuncMask. Enable stays = 1.
         var hdr_p3 = (hdr & 0x3FFFFFFF) | 0x80000000;
         pci_write32(bus, slot, func, msix_off, hdr_p3);
 
@@ -293,16 +279,41 @@ fn pci_record(bus, slot, func) {
     | (((class_reg >> 16) & 0xFF) << 8)
     | ((class_reg >> 8) & 0xFF);
     store64(&pci_class + pci_count * 8, packed);
-    # 64-bit memory BAR detection (PCI 3.0 §6.2.5.1):
-    #   bit 0 = 0 (memory), bits 2:1 = type (0=32, 2=64).
-    var bar0_hi = 0;
-    if ((bar0_lo & 0x01) == 0) {
-        var bar_type = (bar0_lo >> 1) & 0x03;
-        if (bar_type == 2) {
-            bar0_hi = pci_read32(bus, slot, func, 0x14);
+    # BAR walk — all six slots (PCI 3.0 §6.2.5.1):
+    #   bit 0 = 0 (memory) / 1 (I/O); for memory, bits 2:1 = type (0=32, 2=64).
+    # 64-bit memory BARs consume two adjacent slots: slot N holds the
+    # low 32 bits (with flag bits) and slot N+1 holds the high 32 bits.
+    # We resolve each BAR to a full 64-bit phys here so MSI-X / BAR
+    # consumers can index by BIR without re-doing the slot math.
+    var s = 0;
+    while (s < 6) {
+        var lo = pci_read32(bus, slot, func, 0x10 + s * 4);
+        if (lo == 0 || lo == 0xFFFFFFFF) {
+            store64(&pci_bar_phys + pci_count * 48 + s * 8, 0);
+            s = s + 1;
+        } else {
+            if ((lo & 0x01) == 0) {
+                # memory BAR
+                var bar_type = (lo >> 1) & 0x03;
+                var phys = lo & 0xFFFFFFF0;
+                if (bar_type == 2 && s < 5) {
+                    # 64-bit — consume next slot for high half.
+                    var hi = pci_read32(bus, slot, func, 0x10 + (s + 1) * 4);
+                    phys = phys | (hi << 32);
+                    store64(&pci_bar_phys + pci_count * 48 + s * 8, phys);
+                    store64(&pci_bar_phys + pci_count * 48 + (s + 1) * 8, 0);
+                    s = s + 2;
+                } else {
+                    store64(&pci_bar_phys + pci_count * 48 + s * 8, phys);
+                    s = s + 1;
+                }
+            } else {
+                # I/O BAR — bits 1:0 are flag, mask them off.
+                store64(&pci_bar_phys + pci_count * 48 + s * 8, lo & 0xFFFFFFFC);
+                s = s + 1;
+            }
         }
     }
-    store64(&pci_bar0_hi + pci_count * 8, bar0_hi);
     store64(&pci_busfunc + pci_count * 8, (bus << 8) | func);
     pci_count = pci_count + 1;
     return 1;
@@ -372,14 +383,18 @@ fn pci_find_by_class(class_code, subclass, prog_if) {
     return 0 - 1;
 }
 
-# Return the full 64-bit BAR0 phys for the device at pci_devs[idx],
-# with the bottom 4 flag bits masked off (memory base address only,
-# per PCI 3.0 §6.2.5.1). For 32-bit BARs the high half is zero so
-# this is bit-equivalent to the masked low half. Added v1.30.1 for
-# xhci_probe — XHCI BAR0 is always a 64-bit prefetchable memory BAR.
+# Return the full 64-bit phys for BAR(bir) of the device at pci_devs[idx].
+# Flag bits already masked at probe time (pci_record). For 32-bit BARs the
+# high half is zero so the return is bit-equivalent to the masked low half;
+# for slots consumed as the high half of a preceding 64-bit BAR, returns 0
+# (caller error — BIR pointing at a consumed slot is a malformed cap).
+fn pci_bar_64(idx, bir) {
+    if (bir < 0 || bir > 5) { return 0; }
+    return load64(&pci_bar_phys + idx * 48 + bir * 8);
+}
+
+# Legacy shortcut for BAR0. Kept so xhci.cyr's existing pci_bar0_64
+# consumer doesn't need rework.
 fn pci_bar0_64(idx) {
-    var base = &pci_devs + idx * 32;
-    var lo = PciDev_bar0(base) & 0xFFFFFFF0;
-    var hi = load64(&pci_bar0_hi + idx * 8) & 0xFFFFFFFF;
-    return lo | (hi << 32);
+    return load64(&pci_bar_phys + idx * 48);
 }
