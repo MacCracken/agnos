@@ -449,17 +449,21 @@ fn xhci_portsc_read(port_num) {
 }
 
 # PORTSC RMW — Linux-canonical neutralization pattern (see Repair (S)
-# notes in xhci_regs.cyr). `value` is masked to XHCI_PORTSC_NEUTRAL
-# (RO + RWS bits only) before the OR-in of any new bits at the call
-# site; `w1c_clear` supplies the W1C bits the caller explicitly wants
-# to clear (writing 1 clears, writing 0 preserves — so any change bit
-# not in w1c_clear stays as it was). Bit 1 (PED) is included in the
-# w1c_clear mask because PED is RW1C per xHCI 1.2 §5.4.8 — Linux's
-# XHCI_PORT_RW1CS = (1<<1) | (0x7f<<17) treats it the same as the
-# 17-23 change bits.
+# notes in xhci_regs.cyr). `value` is pre-masked at the call site to
+# (XHCI_PORTSC_NEUTRAL | wanted-RW1S-bits); RW1S bits (PR=0x10,
+# WPR=0x80000000) are intentionally outside NEUTRAL so the helper must
+# NOT re-apply that mask. Repair (EE) 2026-05-17: removed the inner
+# `& XHCI_PORTSC_NEUTRAL` re-mask — it silently stripped PR on every
+# port-reset write across Attempts 32-54 (13 falsified hypotheses, 5 days
+# of "AMD silent-absorb" chase). Root-cause surfaced via prior-art diff
+# against EDK2 XhciDxe + Linux xhci-hub.c — neither re-masks; both treat
+# the OR-in of RW1S bits as final. `w1c_clear` is still gated to legal
+# RW1C bits (PED bit 1, change bits 17-23) so callers can't accidentally
+# stomp arbitrary state. See planning/usb-hid-keyboard-driver.md §
+# Silent-Absorb Resolution Plan for the full trace.
 fn xhci_portsc_write(port_num, value, w1c_clear) {
     var addr = xhci_portsc_addr(port_num);
-    store32(addr, (value & XHCI_PORTSC_NEUTRAL) | (w1c_clear & XHCI_PORTSC_W1C));
+    store32(addr, value | (w1c_clear & XHCI_PORTSC_W1C));
     return 0;
 }
 

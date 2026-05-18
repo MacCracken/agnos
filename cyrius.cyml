@@ -5,7 +5,7 @@ description = "Sovereign operating system kernel"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/agnos"
 language = "cyrius"
-cyrius = "5.11.55"
+cyrius = "5.11.59"
 
 [build]
 entry = "kernel/agnos.cyr"
