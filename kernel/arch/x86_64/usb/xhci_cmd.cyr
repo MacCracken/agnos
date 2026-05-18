@@ -94,13 +94,21 @@ fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
         xhci_cmd_ring_idx = 0;
     }
 
-    # Attempt-58 instrumentation — first-N submits print TRB addr + dw3
-    # to confirm cmd ring + cycle bit are coherent with HW's view. Bounded
-    # by XHCI_DIAG_SUBMIT_MAX (2) so FB stays one screen.
-    if (xhci_diag_submit_count < XHCI_DIAG_SUBMIT_MAX) {
-        xhci_diag_submit_count = xhci_diag_submit_count + 1;
+    # Attempt-59 instrumentation — print TRB addr + dw3 on first 2 submits.
+    # Was gated on `xhci_diag_submit_count < XHCI_DIAG_SUBMIT_MAX` in
+    # Attempt 58 but the print never fired on iron despite all four string
+    # literals being present in the binary (`strings /mnt/boot/agnos`
+    # confirms). Suspected gvar-init-order: `XHCI_DIAG_SUBMIT_MAX` reading
+    # 0 at first call → gate `0 < 0` = FALSE. Two-pronged fix: (a) drop the
+    # gvar dep entirely; gate on `xhci_cmd_ring_idx <= 2`, which we KNOW
+    # works at runtime (Phase 3 reset depends on it incrementing); (b) keep
+    # the count globals updated for the existing CHANGELOG narrative + any
+    # future readers who grep for them. idx was incremented at line 75 above,
+    # so first call: idx=1 → print; second call: idx=2 → print; third+: skip.
+    xhci_diag_submit_count = xhci_diag_submit_count + 1;
+    if (xhci_cmd_ring_idx <= 2) {
         kprint("xhci: cmd_submit#", 17);
-        kprint_num(xhci_diag_submit_count);
+        kprint_num(xhci_cmd_ring_idx);
         kprint(" trb_phys=", 10);
         kprint_num(trb);
         kprint(" dw3=", 5);
