@@ -100,30 +100,6 @@ fn xhci_probe() {
     # the XHCI controller is multifunction / behind a PCIe root port.
     pci_enable_bus_master_idx(idx);
 
-    # 3b. Enable MSI-X (or fall back to MSI). Per Linux xhci_setup_msix
-    # prior art: some xHCI silicon gates operational-register state-
-    # machine progress on the interrupter being "configured" via MSI/
-    # MSI-X enable in PCI config space, independent of whether the OS
-    # actually routes the IRQ. AGNOS polls the event ring on a timer
-    # tick instead of via vector, but the controller needs to see MSI/
-    # MSI-X enable asserted in its config space anyway.
-    #
-    # Repair (MM) 2026-05-17 — drop the PCI Function Mask bit. Attempt
-    # 60 exhausted the prior hypothesis stack (FF/GG/HH/JJ/KK/LL); per
-    # docs/development/state.md the remaining user-validated behavioral
-    # hypothesis is that AMD FCH 1022:1639 interprets PCI MSI-X Function
-    # Mask as a stronger gate than the PCI spec implies — suppressing
-    # internal interrupter state-machine progress (including the DMA
-    # writes that post events to the ring), not just MSI-X message
-    # transmission. Linux's pci_alloc_irq_vectors path always leaves
-    # Function Mask = 0; we now match that posture. Per-vector masks in
-    # the MSI-X table default to 1 (PCI 3.0 §6.8.2.5.3), so no spurious
-    # MSI-X messages will be transmitted even with Function Mask=0.
-    var msi_mode = pci_enable_msix_unmasked(idx);
-    if (msi_mode == 1)      { kprintln("xhci: MSI-X enabled (no function-mask)", 38); }
-    else { if (msi_mode == 2) { kprintln("xhci: MSI enabled", 17); }
-        else                { kprintln("xhci: no MSI/MSI-X cap advertised", 33); } }
-
     # 4. Verify the MMIO region is reachable from kernel CR3. `pt_init`
     # identity-maps 0–4 GB (PD at 0x3000 covers 0–1 GB at 2 MB pages;
     # PDPT[1..3] cover 1–4 GB as 1 GB huge pages). On archaemenid the
@@ -152,6 +128,33 @@ fn xhci_probe() {
     # Repair-T retry loop). vmm_remap_uc_2mb selects PA3=UC for this
     # chunk only, leaving surrounding RAM WB-cached.
     vmm_remap_uc_2mb(mmio);
+
+    # 5c. Enable MSI-X (or fall back to MSI). Per Linux xhci_setup_msix
+    # prior art: some xHCI silicon gates operational-register state-
+    # machine progress on the interrupter being "configured" via MSI/
+    # MSI-X enable in PCI config space, independent of whether the OS
+    # actually routes the IRQ. AGNOS polls the event ring on a timer
+    # tick instead of via vector, but the controller needs to see MSI/
+    # MSI-X enable asserted in its config space anyway.
+    #
+    # Repair (MM) 2026-05-17 — drop the PCI Function Mask bit. Matches
+    # Linux's pci_alloc_irq_vectors posture (Function Mask = 0).
+    #
+    # Repair (QQ + QQ'') 2026-05-18 — also program vector 0 of the
+    # MSI-X Table, using Linux's MaskAll-then-table-then-clear-MaskAll
+    # ordering. Attempt 62 (NN+OO bundle) falsified the spec-path repair
+    # set; the MSI-X audit (iron-nuc-zen-log § Attempt 63 prep) found
+    # AGNOS was leaving Message Address/Data/Vector Control at reset
+    # (all zeros / mask=1), while Linux always populates Address/Data
+    # before clearing FuncMask. Hypothesis: AMD FCH 1022:1639 gates
+    # internal event posting on a configured (non-zero Address) table.
+    # See pci.cyr:pci_enable_msix_unmasked for the full table-write
+    # sequence. MUST run after vmm_remap_uc_2mb above so the table
+    # writes hit UC and don't coalesce in L1/L2.
+    var msi_mode = pci_enable_msix_unmasked(idx);
+    if (msi_mode == 1)      { kprintln("xhci: MSI-X enabled (no function-mask)", 38); }
+    else { if (msi_mode == 2) { kprintln("xhci: MSI enabled", 17); }
+        else                { kprintln("xhci: no MSI/MSI-X cap advertised", 33); } }
 
     xhci_cap_len   = xhci_cap_read8(XHCI_CAP_CAPLENGTH);
     xhci_version   = xhci_cap_read16(XHCI_CAP_HCIVERSION);

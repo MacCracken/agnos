@@ -189,30 +189,45 @@ fn pci_enable_msix_masked(idx) {
 }
 
 # Repair (MM) 2026-05-17 — MSI-X Enable WITHOUT Function Mask.
+# Repair (QQ + QQ'') 2026-05-18 — also program vector 0 of the MSI-X
+# Table, using Linux's MaskAll-then-table-then-clear-MaskAll ordering.
 #
-# Per PCI 3.0 §6.8.2.5.3, MSI-X Table entries' per-vector Mask bit is
-# initialized to 1 at reset (and re-initialized to 1 each time MSI-X
-# Enable transitions 0→1). Therefore with per-vector masks at default
-# and Function Mask cleared, NO MSI-X message will be transmitted — the
-# per-vector mask alone suffices to suppress spurious IDT vector
-# dispatches. We don't need the Function Mask to be set to stay safe.
+# MM-era (this function pre-QQ) set Enable + clear FuncMask, then
+# stopped. Per PCI 3.0 §6.8.2.5.3, MSI-X Table entries' per-vector
+# Mask bit is initialized to 1 at reset (and re-initialized to 1 each
+# time MSI-X Enable transitions 0→1). With Function Mask cleared but
+# per-vector masks at default = 1, no MSI-X message would transmit —
+# that was the intended polling-friendly posture (AGNOS polls the
+# event ring on timer tick; no ISR registered).
 #
-# Empirical motivation (archaemenid Attempts 56-60): `events_seen=0`
-# survives IMAN.IE=1 (FF), AMD-Vi disable (GG), doorbell readback flush
-# (HH), universal readback flush (JJ), CNR poll (KK). The remaining
-# user-validated hypothesis (per docs/development/state.md) is that AMD
-# FCH 1022:1639 gates internal event posting on PCI MSI-X Function Mask
-# being CLEAR — i.e., interprets Function Mask as a stronger gate than
-# the PCI spec implies (suppresses internal interrupter state-machine
-# progress, including DMA event posting, not just MSI-X message TX).
+# But: the all-zero table (Address=0, Data=0, VectorControl=1) meant
+# the AMD FCH 1022:1639 interrupter state machine saw an unconfigured
+# table, which (per the MSI-X audit in iron-nuc-zen-log § Attempt 63
+# prep) is the leading hypothesis for why `events_seen=0` survived the
+# nine spec-path repairs FF/GG/HH/JJ/KK/LL/MM/NN/OO. Linux's
+# pci_alloc_irq_vectors → msix_capability_init populates Address/Data
+# for every claimed vector BEFORE clearing FuncMask. AGNOS now matches
+# that init order.
 #
-# Linux's pci_alloc_irq_vectors path always leaves Function Mask = 0
-# after MSI-X setup (it sets Enable, then unmasks per-vector entries as
-# they're claimed by ISR registration). AGNOS doesn't register ISRs but
-# can still match Linux's Function-Mask-clear posture.
+# QQ.1 — Phase 1: Enable + FuncMask BOTH set. Linux uses
+#   pci_msix_clear_and_set_ctrl(dev, 0, MASKALL | ENABLE) atomically;
+#   we approximate with one config write. The MaskAll-during-init
+#   window ensures no MSI-X message can transmit during table writes.
+# QQ.2 — Phase 2: program vector 0's table entry. Read Table Offset/BIR
+#   from cap+0x04; compute table_phys = BAR(BIR) + offset per PCI 3.0
+#   §6.8.2.4. Write Address Lo = 0xFEE00000 (BSP LAPIC base, dest CPU 0,
+#   physical destination mode), Address Hi = 0 (x86_64 MSI is 32-bit),
+#   Data = 0x40 (vector 0x40, Fixed delivery, Edge trigger), Vector
+#   Control = 1 (mask=1; preserves AGNOS polling posture — no ISR
+#   plumbing required). Readback flush per Repair JJ convention.
+#   MUST run AFTER xhci.cyr's vmm_remap_uc_2mb so the table writes
+#   hit UC (otherwise WB coalescing hazard, same as the pre-Repair-X
+#   PORTSC silent-absorb).
+# QQ.3 — Phase 3: clear FuncMask. Enable stays = 1. End state matches
+#   Linux's post-msix_capability_init posture.
 #
-# Returns 1 if MSI-X enabled (function mask CLEAR; per-vector masks at
-# default = 1), 2 if MSI enabled, 0 if neither advertised.
+# Returns 1 if MSI-X enabled (function mask CLEAR, vector 0 programmed,
+# per-vector mask = 1), 2 if MSI fallback, 0 if neither advertised.
 fn pci_enable_msix_unmasked(idx) {
     var slot = PciDev_slot(&pci_devs + idx * 32);
     var bf = load64(&pci_busfunc + idx * 8);
@@ -221,13 +236,28 @@ fn pci_enable_msix_unmasked(idx) {
     var msix_off = pci_find_cap(idx, 0x11);
     if (msix_off != 0) {
         var hdr = pci_read32(bus, slot, func, msix_off);
-        # Set Enable (bit 31) ONLY. Function Mask (bit 30) explicitly
-        # cleared via the mask-then-OR pattern: clear both 30+31 first,
-        # then OR in Enable alone. This handles the case where firmware
-        # left Function Mask set; the bare `hdr | 0x80000000` would have
-        # left it set.
-        var newhdr = (hdr & 0x3FFFFFFF) | 0x80000000;
-        pci_write32(bus, slot, func, msix_off, newhdr);
+
+        # QQ Phase 1 — Enable + FuncMask BOTH set (MaskAll window).
+        var hdr_p1 = (hdr & 0x3FFFFFFF) | 0xC0000000;
+        pci_write32(bus, slot, func, msix_off, hdr_p1);
+
+        # QQ Phase 2 — read Table Offset/BIR, compute table_phys, write
+        # vector 0's entry, readback flush.
+        var tob = pci_read32(bus, slot, func, msix_off + 4);
+        var bir = tob & 0x07;
+        var tbl_off = tob & 0xFFFFFFF8;
+        var bar = pci_read32(bus, slot, func, 0x10 + bir * 4) & 0xFFFFFFF0;
+        var tbl = bar + tbl_off;
+        store32(tbl + 0,  0xFEE00000);
+        store32(tbl + 4,  0);
+        store32(tbl + 8,  0x40);
+        store32(tbl + 12, 1);
+        var flush = load32(tbl + 12);
+
+        # QQ Phase 3 — clear FuncMask. Enable stays = 1.
+        var hdr_p3 = (hdr & 0x3FFFFFFF) | 0x80000000;
+        pci_write32(bus, slot, func, msix_off, hdr_p3);
+
         return 1;
     }
     var msi_off = pci_find_cap(idx, 0x05);
