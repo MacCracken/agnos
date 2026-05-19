@@ -5,7 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-(Reserved for iron-burn-validation deltas. The next cut is **1.30.8** if iron Attempt 65 surfaces archaemenid-specific fixes; otherwise iron-clean validation rolls into a 1.30.7 retrospective note.)
+**Slated for 1.30.8** — final 1.30.x patch closing iron-side carry-forwards:
+- **Framebuffer VGA-vs-HDMI bug** (carry-forward from pre-1.30.7 iron-bring-up): different output-path behavior across display connectors on archaemenid. Repair pending.
+- Any iron Attempt 65 deltas surfaced when validating the typeable-shell chain on archaemenid (none expected — cyrius .64 + CSZ-aware code + Add Flags fix should all apply to iron the same way they apply to QEMU; if there's iron-specific divergence it lands here).
+
+After 1.30.8, moves to **1.31.x** for the next roadmap phase.
 
 ## [1.30.7] — 2026-05-18 (Attempt 63 VISUAL BOOT-TO-SHELL ON IRON → root cause found via QEMU → TYPEABLE SHELL ON QEMU)
 
