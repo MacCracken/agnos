@@ -967,6 +967,26 @@ fn xhci_configure_endpoint(slot_id, input_ctx_phys) {
     return 1;
 }
 
+# Issue Evaluate Context command (TRB type 13). Used to update fields in
+# an existing Slot/EP context without re-running Address Device or
+# Configure Endpoint. Per xHCI 1.2 §4.6.7 the canonical case is EP0 MPS
+# update after the device reports its real bMaxPacketSize0 — Phase 3
+# starts EP0 at the safe minimum (8 for FS) and reconciles here once
+# GDD-8 returns the actual value. Linux reference:
+# xhci_check_maxpacket() in drivers/usb/host/xhci.c.
+fn xhci_evaluate_context(slot_id, input_ctx_phys) {
+    var ctrl = (XHCI_TRB_EVAL_CONTEXT << 10) | ((slot_id & 0xFF) << 24);
+    var p_lo = input_ctx_phys & 0xFFFFFFFF;
+    var p_hi = 0;
+    if (xhci_cmd_issue(p_lo, p_hi, 0, ctrl) == 0) {
+        kprint("xhci: Evaluate Context failed, ccode=", 37);
+        kprint_num(xhci_last_cmd_ccode);
+        kprintln("", 0);
+        return 0;
+    }
+    return 1;
+}
+
 # Fetch the first 18 bytes of the USB Device Descriptor into the shared
 # scratch buffer. Returns 1 on success. Caller then reads from
 # xhci_desc_buf_phys to parse fields.
@@ -1125,6 +1145,34 @@ fn xhci_enumerate_port(port_num) {
     if (xhci_get_device_descriptor(slot_id, 8) == 0) {
         kprintln("xhci: get descriptor (8) failed", 31);
         return 0;
+    }
+
+    # EP0 MPS reconciliation (xHCI 1.2 §4.6.7). The Input Context was
+    # programmed with xhci_ep0_mps_for_speed(speed) — 8 for FS, the safe
+    # minimum. Real bMaxPacketSize0 from GDD-8 can be 8/16/32/64 for FS;
+    # if it differs from what we put in EP0, issue Evaluate Context to
+    # update the EP0 Max Packet Size before any wLength>MPS request.
+    # Without this, GCD-9 (9 bytes) on an FS device that reports MPS=64
+    # times out because xHCI expects multi-packet under the stale MPS=8.
+    # Linux: xhci_check_maxpacket() in drivers/usb/host/xhci.c.
+    var real_mps = load8(xhci_desc_buf_phys + 7);
+    var cur_mps  = xhci_slot_get(xhci_slot_max_packet, slot_id);
+    if (real_mps != cur_mps) {
+        var ictx2 = xhci_slot_get(xhci_slot_input_ctx, slot_id);
+        if (ictx2 != 0) {
+            # Input Control Context: Drop=0, Add=A0|A1 (Slot + EP0 — spec
+            # requires Slot context to be present even if unchanged).
+            store32(ictx2 + 0, 0);
+            store32(ictx2 + 4, 0x3);
+            # Patch EP0 Context dw1 — replace bits [31:16] (Max Packet Size),
+            # preserving CErr / EP Type / Max Burst in bits [15:0].
+            var ep0_ctx = ictx2 + xhci_ep0_ctx_off();
+            var ep0_dw1 = load32(ep0_ctx + 4);
+            ep0_dw1 = (ep0_dw1 & 0xFFFF) | ((real_mps & 0xFFFF) << 16);
+            store32(ep0_ctx + 4, ep0_dw1);
+            if (xhci_evaluate_context(slot_id, ictx2) == 0) { return 0; }
+            xhci_slot_set(xhci_slot_max_packet, slot_id, real_mps);
+        }
     }
 
     # Now fetch full 18 bytes.
