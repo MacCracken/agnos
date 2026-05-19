@@ -94,11 +94,16 @@ fn fb_console_init() {
     if (fb_clr != 0) {
         var pitch_clr  = fb_pitch();
         var height_clr = fb_height();
-        var stride_u32 = pitch_clr / 4;
+        # u64 block-zero: 2 pixels per cycle. Halves loop count vs u32.
+        # pitch is 8-aligned at 1080p (7680 = 8*960); a non-8-aligned
+        # pitch would leave 4-7 bytes per row dirty (right-edge), same
+        # failure mode as a non-4-aligned pitch under the prior u32
+        # loop. WC-mapped FB writes coalesce into 8-byte bursts.
+        var stride_u64 = pitch_clr / 8;
         for (var py = 0; py < height_clr; py = py + 1) {
             var scan_clr = fb_clr + py * pitch_clr;
-            for (var px = 0; px < stride_u32; px = px + 1) {
-                store32(scan_clr + px * 4, 0x00000000);
+            for (var px = 0; px < stride_u64; px = px + 1) {
+                store64(scan_clr + px * 8, 0);
             }
         }
     }
@@ -269,22 +274,29 @@ fn fb_scroll_up() {
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var height = fb_height();
-    var stride_u32 = pitch / 4;
+    # u64 block-copy: 2 pixels per cycle. At 1080p, pitch=7680 -> 960
+    # u64s per row (vs 1920 u32s). Halves both inner-loop count and
+    # WC-write-combiner burst count. Read side still pays WC-mapped
+    # FB read latency — if scroll feel doesn't improve, that's the
+    # real bottleneck and we need a RAM-side shadow buffer.
+    var stride_u64 = pitch / 8;
     var rows_to_copy = height - FB_CONSOLE_Y0 - 8;
     if (rows_to_copy <= 0) { return 0; }
     # Copy line-by-line, top-down (no overlap risk since src is below dst).
     for (var y = 0; y < rows_to_copy; y = y + 1) {
         var src = fb + (FB_CONSOLE_Y0 + 8 + y) * pitch;
         var dst = fb + (FB_CONSOLE_Y0 + y) * pitch;
-        for (var x = 0; x < stride_u32; x = x + 1) {
-            store32(dst + x * 4, load32(src + x * 4));
+        for (var x = 0; x < stride_u64; x = x + 1) {
+            store64(dst + x * 8, load64(src + x * 8));
         }
     }
-    # Clear new bottom 8-px row to FB_BG.
+    # Clear new bottom 8-px row to FB_BG. FB_BG is 0x00000000 today, so
+    # the packed-pair u64 value is also 0 — no shift. If FB_BG ever
+    # becomes non-zero, repack as (FB_BG << 32) | (FB_BG & 0xFFFFFFFF).
     var clear_y = FB_CONSOLE_Y0 + rows_to_copy;
     for (var y = 0; y < 8; y = y + 1) {
-        for (var x = 0; x < stride_u32; x = x + 1) {
-            store32(fb + (clear_y + y) * pitch + x * 4, FB_BG);
+        for (var x = 0; x < stride_u64; x = x + 1) {
+            store64(fb + (clear_y + y) * pitch + x * 8, 0);
         }
     }
     return 0;
