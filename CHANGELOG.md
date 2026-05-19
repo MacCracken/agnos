@@ -5,13 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-**Slated for 1.31.x** — next roadmap phase opens after 1.30.8 closes the iron-side carry-forwards.
+**Slated for 1.31.x** — Phase-5 interrupt-IN keystroke delivery on iron (the open blocker from Attempt 67), plus the pre-1.30.7 framebuffer VGA-vs-HDMI bug. Closed-beta MVP visual + HID-enumeration halves are landed on iron; the typeable-shell-on-iron gate is the remaining 1.31.x scope.
 
-## [1.30.8] — 2026-05-18 (Repair RR — Linux-canonical EP0 control-transfer hardening)
+## [1.30.8] — 2026-05-18 (Iron Attempts 65/66/67 — RR falsified, EP0 MPS reconciliation clears HID enumeration; Phase-5 interrupt-IN open)
 
-**Iron Attempt 65 surfaced an EP0 control-transfer timeout** — Phase-3 silent-absorb (the 10-letter FF→QQ+QQ2 ladder) cleared cleanly on archaemenid with the .64-fixed binary; Address Device + Get Device Descriptor 8 + Get Device Descriptor 18 all succeeded. But the *third* consecutive EP0 control transfer — the first request inside `hid_kbd_configure`, `xhci_get_config_descriptor(slot_id, 0, 9)` — timed out (`xhci: transfer event timeout` + `hid: get config descriptor (9) failed`). Iron-only divergence: QEMU's qemu-xhci runs the same binary end-to-end to typeable shell. Diagnosis: AMD FCH 1022:1639 is stricter than QEMU on EP0 ring conventions.
+**Three same-day iron burns on archaemenid (Beelink SER AMD Renoir 1022:1639) carried the post-cyrius-.64 binary from "Phase-3 cleared" all the way to "HID enumeration cleared, agnoshi rendering on screen, but keystrokes silent."** This is the first 1.30.x cut where every xhci-side command and every EP0 control transfer completes on iron without a falsification.
 
-**Repair (RR) — Linux-canonical EP0 control-transfer hardening**: diffed `xhci_control_in` / `xhci_ep0_enqueue` against Linux `xhci_queue_ctrl_tx` (drivers/usb/host/xhci-ring.c, v6.13) and bundled three convergent-prior-art deltas:
+### Iron Attempts 65 / 66 / 67 — the same-day arc
+
+| # | Time (PDT) | Build under test | Outcome |
+|---|---|---|---|
+| 65 | ~19:07 | 411,280 B (post cyrius-.64 + CSZ helpers + Add-Flags A0\|A_new) | **Phase-3 silent-absorb cleared on iron**; Enable Slot, Address Device, GDD-8, GDD-18 all succeed (iron keyboard `VID=1452 PID=591`); new blocker — first `xhci_get_config_descriptor(slot_id, 0, 9)` inside `hid_kbd_configure` times out. Iron-only divergence vs QEMU's typeable end-to-end. |
+| 66 | ~20:08 | 412,080 B (post Repair RR) | **RR falsified**: GCD-9 still times out. EP0-ring-conventions diagnosis disproven; ISP / deferred-cycle-Setup / `p_hi` are not the gate. |
+| 67 | ~20:58 | **412,832 B** (post EP0 MPS reconciliation) | **HID enumeration clears end-to-end on iron**. `hid: probing iface kbd, slot=1, VID=1452 PID=591, class=0` → `hid: keyboard configured, boot protocol on, EP=129, polling 8-byte reports` → FB renders `agnoshi shell v1.30.8 (type 'help')`. New blocker — keystrokes don't reach the `agnos>` prompt (Phase-5 interrupt-IN silent). |
+
+### Repair (RR) — Linux-canonical EP0 control-transfer hardening (Attempt 66, FALSIFIED)
+
+Diffed `xhci_control_in` / `xhci_ep0_enqueue` against Linux `xhci_queue_ctrl_tx` (drivers/usb/host/xhci-ring.c, v6.13) and bundled three convergent-prior-art deltas:
 
 - **RR.A** — Set `ISP` (Interrupt on Short Packet, bit 2) on the Data Stage TRB. Linux always sets it for IN data. Without ISP, a SHORT_PACKET on Data Stage doesn't emit its own Transfer Event; if Status Stage scheduling is delayed by the controller, the whole transfer goes silent. With ISP, the Data Stage's SHORT_PACKET event provides recovery / faster signaling.
 - **RR.B** — Deferred-cycle Setup TRB write per Linux's `giveback_first_trb` convention. Write Setup with the *inverted* cycle bit (HW skips it), build Data + Status with the normal cycle, then atomically flip Setup's cycle to mark the TD live. Prevents controller DMA prefetch from racing partial TDs. Applied to both `xhci_control_in` (3-TRB Setup/Data/Status) and `xhci_control_no_data` (2-TRB Setup/Status, used by SET_PROTOCOL).
@@ -19,11 +29,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 New helper `xhci_ep0_enqueue_raw(slot_id, p_lo, p_hi, status, ctrl_full)` — variant of `xhci_ep0_enqueue` that takes a fully-formed dw3 (caller controls cycle bit), used for the deferred-cycle Setup write.
 
-**Build**: kernel 411,216 B (1.30.7) → **~412,100 B** (1.30.8 with version-string +20 B). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin 5.11.64.
+**Status post-Attempt-66**: RR ships as defensive hardening — it matches Linux convention and provides better recovery behavior on SHORT_PACKET / cycle-prefetch races. It just isn't the iron-side gate for GCD-9.
 
-**Iron burn pending** (user decision). Pre-bound outcomes: `hid: keyboard configured, boot protocol on, EP=129` ⇒ MVP closeout end-to-end; `hid: get config descriptor (9) failed` survives ⇒ falsifies RR; visible regression ⇒ revert RR.B (cycle deferral) and isolate RR.A alone.
+### EP0 MPS reconciliation — xHCI 1.2 §4.6.7 / Linux `xhci_check_maxpacket` (Attempt 67, CLEARED HID ENUMERATION)
 
-**Open carry-forward into 1.31.x**:
+Diagnosis between Attempts 66 and 67: the Input Context's EP0 Max Packet Size is programmed pre-Address-Device at the speed-safe minimum (`xhci_ep0_mps_for_speed(speed)` — 8 for FS). The real `bMaxPacketSize0` returned from GDD-8 can be 8/16/32/64 for FS. Per xHCI 1.2 §4.6.7, if it differs from the stale Input-Context EP0 MPS, an Evaluate Context (TRB type 13) must update EP0 MPS *before* any wLength > MPS request. GCD-9 with stale MPS=8 multi-packets under the wrong burst size → the controller drops the second packet and the transfer event never posts. Linux reference: `xhci_check_maxpacket()` in `drivers/usb/host/xhci.c`. AMD FCH 1022:1639 enforces this strictly; QEMU's qemu-xhci is permissive on stale MPS — which is why the same binary ran end-to-end on QEMU through Attempt-65-equivalent code paths.
+
+Repair (`+48 LOC` in `kernel/arch/x86_64/usb/xhci.cyr`):
+
+- New `xhci_evaluate_context(slot_id, input_ctx_phys)` — issues TRB type 13 (`XHCI_TRB_EVAL_CONTEXT`), waits for the Command Completion Event, returns 0 on non-success ccode with a diagnostic print.
+- New reconciliation block in `xhci_enumerate_port` after GDD-8: compares `load8(xhci_desc_buf_phys + 7)` (real `bMaxPacketSize0`) vs the slot's tracked `xhci_slot_max_packet`. On mismatch, allocates an Input Context with Drop=0, Add=A0|A1 (Slot + EP0 — spec requires Slot context present even if unchanged), patches EP0 dw1 bits [31:16] with the real MPS while preserving CErr/EPType/MaxBurst in [15:0], fires `xhci_evaluate_context`, updates the tracked slot MPS.
+
+### Result on iron post-Attempt-67
+
+Every xhci-side command now completes on archaemenid:
+
+```
+xhci: cmd_submit#1 trb_phys=... dw3=9217           (Enable Slot ✓)
+xhci: cmd_submit#2 trb_phys=... dw3=16788481       (Address Device ✓)
+hid: probing iface kbd, slot=1, VID=1452 PID=591, class=0
+                                                   (Evaluate Context ✓, Configure Endpoint ✓)
+hid: keyboard configured, boot protocol on, EP=129, polling 8-byte reports
+...
+AGNOS shell v1.30.8 (type 'help')
+agnos>                                              ← no echo on keystroke (Phase-5 open)
+```
+
+USBSTS stays clean across the burn (no HSE / HCE / SRE); USBCMD = R/S | INTE | HSEE; no `xhci: transfer event timeout` printed. The controller isn't reporting an error — it's just not posting Transfer Events for the interrupt-IN ring on keypress.
+
+### Build
+
+Kernel `build/agnos` 411,216 B (1.30.7) → **412,832 B** (1.30.8 final — version-string + RR hardening + Evaluate Context surface + MPS reconciliation block). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin 5.11.64.
+
+### Changed
+
+- `kernel/arch/x86_64/usb/xhci.cyr`: **Repair RR** — `xhci_control_in` and `xhci_control_no_data` rewritten for Linux-canonical ISP + deferred-cycle Setup + full 64-bit `buf_phys` propagation. New helper `xhci_ep0_enqueue_raw`.
+- `kernel/arch/x86_64/usb/xhci.cyr`: **EP0 MPS reconciliation** — new `xhci_evaluate_context(slot_id, input_ctx_phys)` issuing TRB type 13. New post-GDD-8 block in `xhci_enumerate_port` per xHCI 1.2 §4.6.7 / Linux `xhci_check_maxpacket` — compares real `bMaxPacketSize0` vs the speed-safe MPS, builds Input Context with Add=A0|A1, patches EP0 dw1 [31:16] preserving CErr/EPType/MaxBurst, fires Evaluate Context, updates tracked slot MPS.
+
+### Open carry-forward into 1.31.x
+
+- **Phase-5 interrupt-IN keystroke delivery on iron** (the Attempt-67 blocker): keypresses on the iron keyboard produce no characters at the `agnos>` prompt despite HID configured + polling armed. Likely candidates — interrupt-IN Transfer Event not being posted by the controller on keystroke (analogous to but distinct from Phase-3 CCE silent-absorb; different ring, different doorbell), or Transfer Event posts but `xhci_handle_transfer_event` isn't decoding it into HID reports, or HID translation runs but `kb_buf` enqueue isn't reaching agnoshi's `kb_read`. QEMU is symmetric end-to-end with the same binary (sendkey → echoed input) — so iron-specific divergence sits in the interrupt-IN event-posting layer. First diagnostic step (no burn): read-only audit of AGNOS's `xhci_handle_transfer_event` vs Linux `handle_tx_event` (drivers/usb/host/xhci-ring.c) to confirm interrupt-IN Transfer Event decoding parity.
 - **Framebuffer VGA-vs-HDMI bug** (from pre-1.30.7 iron-bring-up): different output-path behavior across display connectors on archaemenid. Repair pending.
 
 ## [1.30.7] — 2026-05-18 (Attempt 63 VISUAL BOOT-TO-SHELL ON IRON → root cause found via QEMU → TYPEABLE SHELL ON QEMU)
