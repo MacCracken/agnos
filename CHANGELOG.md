@@ -5,7 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-**Slated for 1.31.x** — Phase-5 interrupt-IN keystroke delivery on iron (the open blocker from Attempt 67), plus the pre-1.30.7 framebuffer VGA-vs-HDMI bug. Closed-beta MVP visual + HID-enumeration halves are landed on iron; the typeable-shell-on-iron gate is the remaining 1.31.x scope.
+**1.30.x is the closed-beta MVP arc** — kernel + kybernet + agnoshi typeable on iron archaemenid. 1.31.x opens AFTER the MVP gate hits (networking or storage, depending on next direction). Phase-5 interrupt-IN keystroke delivery is the open MVP blocker → lands in **1.30.9** below.
+
+The pre-1.30.7 framebuffer VGA-vs-HDMI bug is NOT MVP-blocking (visual gate hit on at least one display path) — left as carry-forward.
+
+## [1.30.9] — TBD
+
+Closing the iron typeable-shell gate — Phase-5 interrupt-IN keystroke delivery. Fills in when the next movement lands. Strategy notes live in `agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 67 (next-move space).
 
 ## [1.30.8] — 2026-05-18 (Iron Attempts 65/66/67 — RR falsified, EP0 MPS reconciliation clears HID enumeration; Phase-5 interrupt-IN open)
 
