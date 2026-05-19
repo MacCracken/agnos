@@ -5,11 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-**Slated for 1.30.8** — final 1.30.x patch closing iron-side carry-forwards:
-- **Framebuffer VGA-vs-HDMI bug** (carry-forward from pre-1.30.7 iron-bring-up): different output-path behavior across display connectors on archaemenid. Repair pending.
-- Any iron Attempt 65 deltas surfaced when validating the typeable-shell chain on archaemenid (none expected — cyrius .64 + CSZ-aware code + Add Flags fix should all apply to iron the same way they apply to QEMU; if there's iron-specific divergence it lands here).
+**Slated for 1.31.x** — next roadmap phase opens after 1.30.8 closes the iron-side carry-forwards.
 
-After 1.30.8, moves to **1.31.x** for the next roadmap phase.
+## [1.30.8] — 2026-05-18 (Repair RR — Linux-canonical EP0 control-transfer hardening)
+
+**Iron Attempt 65 surfaced an EP0 control-transfer timeout** — Phase-3 silent-absorb (the 10-letter FF→QQ+QQ2 ladder) cleared cleanly on archaemenid with the .64-fixed binary; Address Device + Get Device Descriptor 8 + Get Device Descriptor 18 all succeeded. But the *third* consecutive EP0 control transfer — the first request inside `hid_kbd_configure`, `xhci_get_config_descriptor(slot_id, 0, 9)` — timed out (`xhci: transfer event timeout` + `hid: get config descriptor (9) failed`). Iron-only divergence: QEMU's qemu-xhci runs the same binary end-to-end to typeable shell. Diagnosis: AMD FCH 1022:1639 is stricter than QEMU on EP0 ring conventions.
+
+**Repair (RR) — Linux-canonical EP0 control-transfer hardening**: diffed `xhci_control_in` / `xhci_ep0_enqueue` against Linux `xhci_queue_ctrl_tx` (drivers/usb/host/xhci-ring.c, v6.13) and bundled three convergent-prior-art deltas:
+
+- **RR.A** — Set `ISP` (Interrupt on Short Packet, bit 2) on the Data Stage TRB. Linux always sets it for IN data. Without ISP, a SHORT_PACKET on Data Stage doesn't emit its own Transfer Event; if Status Stage scheduling is delayed by the controller, the whole transfer goes silent. With ISP, the Data Stage's SHORT_PACKET event provides recovery / faster signaling.
+- **RR.B** — Deferred-cycle Setup TRB write per Linux's `giveback_first_trb` convention. Write Setup with the *inverted* cycle bit (HW skips it), build Data + Status with the normal cycle, then atomically flip Setup's cycle to mark the TD live. Prevents controller DMA prefetch from racing partial TDs. Applied to both `xhci_control_in` (3-TRB Setup/Data/Status) and `xhci_control_no_data` (2-TRB Setup/Status, used by SET_PROTOCOL).
+- **RR.C** — Propagate the full 64-bit `buf_phys` via the Data Stage TRB's `p_hi` (was hardcoded 0). No-op on archaemenid (descriptor buffers in low 4 GB), defensive against future high-memory allocations.
+
+New helper `xhci_ep0_enqueue_raw(slot_id, p_lo, p_hi, status, ctrl_full)` — variant of `xhci_ep0_enqueue` that takes a fully-formed dw3 (caller controls cycle bit), used for the deferred-cycle Setup write.
+
+**Build**: kernel 411,216 B (1.30.7) → **~412,100 B** (1.30.8 with version-string +20 B). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin 5.11.64.
+
+**Iron burn pending** (user decision). Pre-bound outcomes: `hid: keyboard configured, boot protocol on, EP=129` ⇒ MVP closeout end-to-end; `hid: get config descriptor (9) failed` survives ⇒ falsifies RR; visible regression ⇒ revert RR.B (cycle deferral) and isolate RR.A alone.
+
+**Open carry-forward into 1.31.x**:
+- **Framebuffer VGA-vs-HDMI bug** (from pre-1.30.7 iron-bring-up): different output-path behavior across display connectors on archaemenid. Repair pending.
 
 ## [1.30.7] — 2026-05-18 (Attempt 63 VISUAL BOOT-TO-SHELL ON IRON → root cause found via QEMU → TYPEABLE SHELL ON QEMU)
 

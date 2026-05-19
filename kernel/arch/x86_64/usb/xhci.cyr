@@ -834,10 +834,47 @@ fn xhci_ep0_enqueue(slot_id, p_lo, p_hi, status, ctrl_partial) {
     return trb;
 }
 
+# Variant of xhci_ep0_enqueue that takes a FULL dw3 (caller controls the
+# cycle bit). Used for the deferred-cycle Setup TRB write per Linux's
+# xhci_queue_ctrl_tx / giveback_first_trb convention — see xhci_control_in.
+fn xhci_ep0_enqueue_raw(slot_id, p_lo, p_hi, status, ctrl_full) {
+    var ring  = xhci_slot_get(xhci_slot_xfer_ring,  slot_id);
+    var cycle = xhci_slot_get(xhci_slot_xfer_cycle, slot_id);
+    var idx   = xhci_slot_get(xhci_slot_xfer_idx,   slot_id);
+    if (ring == 0) { return 0; }
+
+    var trb = ring + idx * 16;
+    store32(trb,      p_lo);
+    store32(trb + 4,  p_hi);
+    store32(trb + 8,  status);
+    store32(trb + 12, ctrl_full);
+
+    idx = idx + 1;
+    if (idx >= 255) { idx = 0; if (cycle == 1) { cycle = 0; } else { cycle = 1; } }
+    xhci_slot_set(xhci_slot_xfer_idx,   slot_id, idx);
+    xhci_slot_set(xhci_slot_xfer_cycle, slot_id, cycle);
+    return trb;
+}
+
 # Build a 3-TRB control IN transfer: Setup + Data + Status. Per xHCI
 # 1.2 §4.11.2.1 sequence diagram. Returns 1 on Success completion, 0 on
 # any failure.
+#
+# Repair (RR) — 2026-05-18 — Linux-canonical convergence per
+# drivers/usb/host/xhci-ring.c xhci_queue_ctrl_tx:
+#   RR.A — set ISP on Data Stage TRB so SHORT_PACKET on IN data emits a
+#          Transfer Event from the Data Stage itself (decouples reporting
+#          from Status Stage scheduling on strict controllers).
+#   RR.B — deferred-cycle Setup write (giveback_first_trb): write Setup
+#          with INVERTED cycle so HW skips it, build the rest of the TD,
+#          then atomically flip Setup's cycle to mark the TD live. Prevents
+#          DMA prefetch from seeing a partial TD.
+#   RR.C — propagate full 64-bit buf_phys via p_hi (was hardcoded 0).
 fn xhci_control_in(slot_id, bm_req, b_req, w_val, w_idx, w_len, buf_phys) {
+    var start_cycle = xhci_slot_get(xhci_slot_xfer_cycle, slot_id);
+    var inverted    = 1;
+    if (start_cycle == 1) { inverted = 0; }
+
     # Setup Stage TRB (IDT=1 → 8-byte SETUP packed into the TRB itself):
     #   p_lo  = bmRequestType | (bRequest<<8) | (wValue<<16)
     #   p_hi  = wIndex | (wLength<<16)
@@ -847,14 +884,17 @@ fn xhci_control_in(slot_id, bm_req, b_req, w_val, w_idx, w_len, buf_phys) {
     var setup_lo = (bm_req & 0xFF) | ((b_req & 0xFF) << 8) | ((w_val & 0xFFFF) << 16);
     var setup_hi = (w_idx & 0xFFFF) | ((w_len & 0xFFFF) << 16);
     var setup_ctrl = (3 << 16) | (1 << 6) | (XHCI_TRB_SETUP_STAGE << 10);
-    if (xhci_ep0_enqueue(slot_id, setup_lo, setup_hi, 8, setup_ctrl) == 0) { return 0; }
+    # RR.B: write Setup with inverted cycle so HW skips until we fix up.
+    var setup_trb = xhci_ep0_enqueue_raw(slot_id, setup_lo, setup_hi, 8, setup_ctrl | inverted);
+    if (setup_trb == 0) { return 0; }
 
     # Data Stage TRB:
-    #   p_lo/p_hi = buf_phys
+    #   p_lo/p_hi = buf_phys (full 64-bit per RR.C)
     #   status    = w_len in bits[16:0], TD Size=0, Interrupter Target=0
-    #   ctrl      = DIR=1 (IN, bit 16) | type=DATA_STAGE(3)<<10 | cycle
-    var data_ctrl = (1 << 16) | (XHCI_TRB_DATA_STAGE << 10);
-    if (xhci_ep0_enqueue(slot_id, buf_phys & 0xFFFFFFFF, 0, w_len, data_ctrl) == 0) { return 0; }
+    #   ctrl      = ISP=1 (bit 2, RR.A) | DIR=1 (IN, bit 16) |
+    #               type=DATA_STAGE(3)<<10 | cycle
+    var data_ctrl = (1 << 16) | (1 << 2) | (XHCI_TRB_DATA_STAGE << 10);
+    if (xhci_ep0_enqueue(slot_id, buf_phys & 0xFFFFFFFF, (buf_phys >> 32) & 0xFFFFFFFF, w_len, data_ctrl) == 0) { return 0; }
 
     # Status Stage TRB:
     #   p_lo/p_hi = 0
@@ -864,10 +904,17 @@ fn xhci_control_in(slot_id, bm_req, b_req, w_val, w_idx, w_len, buf_phys) {
     var status_ctrl = (1 << 5) | (XHCI_TRB_STATUS_STAGE << 10);
     if (xhci_ep0_enqueue(slot_id, 0, 0, 0, status_ctrl) == 0) { return 0; }
 
+    # RR.B fixup — atomically flip Setup TRB cycle to the live value. HW
+    # sees a fully-formed TD on its next prefetch / doorbell-driven walk.
+    store32(setup_trb + 12, setup_ctrl | start_cycle);
+
     # Ring EP0 doorbell — controller starts processing all three TRBs.
     xhci_ring_ep0_doorbell(slot_id);
 
     # Wait for the Status Stage TRB's Transfer Event (it carries IOC=1).
+    # Data Stage may also emit a SHORT_PACKET event first (RR.A); the wait
+    # helper accepts SHORT_PACKET as a soft success and returns on the
+    # first matching event.
     return xhci_wait_transfer_event(slot_id);
 }
 
@@ -875,16 +922,29 @@ fn xhci_control_in(slot_id, bm_req, b_req, w_val, w_idx, w_len, buf_phys) {
 # class/standard requests (SET_PROTOCOL, SET_IDLE, etc.) where the host
 # sends only a SETUP TRB and the device acks via an IN Status Stage.
 # Two-TRB sequence: SETUP (TRT=0, no-data) + STATUS (DIR=1, IN ack).
+#
+# Repair (RR.B applied here too) — deferred-cycle Setup write for parity
+# with xhci_control_in.
 fn xhci_control_no_data(slot_id, bm_req, b_req, w_val, w_idx) {
+    var start_cycle = xhci_slot_get(xhci_slot_xfer_cycle, slot_id);
+    var inverted    = 1;
+    if (start_cycle == 1) { inverted = 0; }
+
     # Setup Stage TRB: TRT=0 (No Data Stage).
     var setup_lo = (bm_req & 0xFF) | ((b_req & 0xFF) << 8) | ((w_val & 0xFFFF) << 16);
     var setup_hi = (w_idx & 0xFFFF);
     var setup_ctrl = (0 << 16) | (1 << 6) | (XHCI_TRB_SETUP_STAGE << 10);
-    if (xhci_ep0_enqueue(slot_id, setup_lo, setup_hi, 8, setup_ctrl) == 0) { return 0; }
+    var setup_trb = xhci_ep0_enqueue_raw(slot_id, setup_lo, setup_hi, 8, setup_ctrl | inverted);
+    if (setup_trb == 0) { return 0; }
+
     # Status Stage TRB: DIR=1 (IN ack — opposite of an H-to-D data flow,
     # but when there's no data, status direction is IN per §4.11.2).
     var status_ctrl = (1 << 16) | (1 << 5) | (XHCI_TRB_STATUS_STAGE << 10);
     if (xhci_ep0_enqueue(slot_id, 0, 0, 0, status_ctrl) == 0) { return 0; }
+
+    # RR.B fixup.
+    store32(setup_trb + 12, setup_ctrl | start_cycle);
+
     xhci_ring_ep0_doorbell(slot_id);
     return xhci_wait_transfer_event(slot_id);
 }
