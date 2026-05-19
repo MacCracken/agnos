@@ -5,46 +5,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.30.10] — 2026-05-19 (Framebuffer refresh — WC mapping + pitch-aware loops; iron Attempt 69 pending)
+## [1.30.10] — 2026-05-19 (Framebuffer refresh — WC + pitch-aware + u64 block-copy; iron Attempts 69→70, CRT-class refresh PASS)
 
-**Post-MVP open.** First cut after the closed-beta MVP gate (1.30.9, Iron Attempt 68). Scoped to framebuffer refresh quality — Attempt 68's bench scroll showed pixel-pattern noise in the lower FB region, traced to the kernel mapping the GOP framebuffer as WB-cached (default `vmm_map(..., 0x83)` selects PAT entry 0 = WB under firmware-default PAT MSR; confirmed Attempt 43). WB on a framebuffer means CPU pixel writes batch through L1/L2 and reach the display controller on cache evictions — visible as the observed artifact.
+**Post-MVP open. Speed closed out.** First cut after the closed-beta MVP gate (1.30.9, Iron Attempt 68). Scoped to framebuffer refresh quality — Attempt 68's bench scroll showed pixel-pattern noise in the lower FB region, traced to the kernel mapping the GOP framebuffer as WB-cached (default `vmm_map(..., 0x83)` selects PAT entry 0 = WB under firmware-default PAT MSR; confirmed Attempt 43). WB on a framebuffer means CPU pixel writes batch through L1/L2 and reach the display controller on cache evictions — visible as the observed artifact. Landed as two iron burns under one version: Attempt 69 (WC + pitch-aware → PARTIAL, cache artifacts gone but scroll still heavy) and Attempt 70 (u64 block-copy → PASS, CRT-class refresh, tearing below typical-user threshold).
 
-### Bundle (three behavioral changes, single working-tree movement)
+### Bundle (four behavioral changes, two iron burns)
 
 Per `feedback_redesign_dont_reinvent` — paths converged on the canonical Linux/EDK2 framebuffer mapping pattern, audited in advance, no letter ladder:
 
-1. **WC framebuffer mapping** — `vmm_remap_wc_2mb(phys)` + `vmm_remap_wc_range(phys, size)` added to `kernel/core/vmm.cyr`; mirrors `vmm_remap_uc_2mb` structurally, flag `0x8B` (PWT=1, PCD=0, PAT=0) selects PAT entry 1 = WC under firmware-default PAT MSR. `kernel/core/main.cyr:8` now calls `vmm_remap_wc_range(fb_fb_phys(), fb_pitch() * fb_height())` immediately before `fb_console_init()`, so the FB is WC-mapped before the first kernel paint. WC coalesces sequential pixel writes into burst transactions to the display controller, eliminating WB-cache eviction timing artifacts. Linux `vesafb` / `efifb` request `ioremap_wc()`; same pattern.
+1. **WC framebuffer mapping** *(Attempt 69)* — `vmm_remap_wc_2mb(phys)` + `vmm_remap_wc_range(phys, size)` added to `kernel/core/vmm.cyr`; mirrors `vmm_remap_uc_2mb` structurally, flag `0x8B` (PWT=1, PCD=0, PAT=0) selects PAT entry 1 = WC under firmware-default PAT MSR. `kernel/core/main.cyr:8` now calls `vmm_remap_wc_range(fb_fb_phys(), fb_pitch() * fb_height())` immediately before `fb_console_init()`, so the FB is WC-mapped before the first kernel paint. WC coalesces sequential pixel writes into burst transactions to the display controller, eliminating WB-cache eviction timing artifacts. Linux `vesafb` / `efifb` request `ioremap_wc()`; same pattern.
 
-2. **Pitch-aware init clear** — `fb_console_init`'s full-screen clear (`kernel/arch/x86_64/fb_console.cyr` ~line 80) now iterates `pitch / 4` u32s per row instead of `width`. When firmware's `PixelsPerScanLine > HorizontalResolution`, the padding u32s between `width*4` and `pitch` previously carried stale UEFI/firmware paint forever. Invisible behind the arcade-cabinet bezel on archaemenid; visible on QEMU and direct-attach displays.
+2. **Pitch-aware init clear** *(Attempt 69)* — `fb_console_init`'s full-screen clear (`kernel/arch/x86_64/fb_console.cyr` ~line 80) now iterates `pitch / 4` u32s per row instead of `width`. When firmware's `PixelsPerScanLine > HorizontalResolution`, the padding u32s between `width*4` and `pitch` previously carried stale UEFI/firmware paint forever. Invisible behind the arcade-cabinet bezel on archaemenid; visible on QEMU and direct-attach displays.
 
-3. **Pitch-aware scroll clear** — `fb_scroll_up` body copy + bottom-row clear (~line 250-275) walk `pitch / 4` u32s per row. Same rationale as #2 but in the scroll path.
+3. **Pitch-aware scroll clear** *(Attempt 69)* — `fb_scroll_up` body copy + bottom-row clear (~line 250-275) walk `pitch / 4` u32s per row. Same rationale as #2 but in the scroll path.
+
+4. **u64 block-copy** *(Attempt 70 follow-on, same 1.30.10)* — three inner loops in `kernel/arch/x86_64/fb_console.cyr` switched from `store32`/`load32` per-u32 to `store64`/`load64` per-u64 (`fb_console_init` full clear, `fb_scroll_up` body copy, `fb_scroll_up` bottom clear). Outer row iteration unchanged. Pre-loop computes `stride_u64 = pitch / 8` instead of `stride_u32 = pitch / 4`. Halves inner-loop transaction count: per-scroll IO drops from ~4.13M u32 pairs to ~2.07M u64 pairs. On WC-mapped FB the write combiner fills 8-byte bursts per cycle instead of 4-byte. Same instruction widths on x86-64 — build size identical (414,544 B) — but iron refresh perceptibly doubled (user-reported "old-school CRT 80's-ish speeds, smoother, not perfect").
 
 ### Verification
 
 - ✅ Cyrius build clean (5.11.64 pin, no errors, 32 unreachable fns)
 - ✅ QEMU Path-C serial smoke — `EXPECT="AGNOS shell"` matched on ConOut
 - ✅ QEMU visual at **1920×1080 (std VGA via `-vga std -global VGA.xres=1920 -global VGA.yres=1080`)** — boots clean, scrolls clean, no regression at iron-class extent
-- ⏸ Iron Attempt 69 — pending. Per-attempt detail in [`agnosticos/docs/development/iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) § Attempt 69 prep, with pre-bound outcome matrix.
+- ✅ **Iron Attempt 69 → PARTIAL** — WB-cache eviction artifacts gone under WC; scroll throughput still showed a visible refresh sweep walking up the screen
+- ✅ **Iron Attempt 70 → PASS** — u64 block-copy halved per-scroll transaction count; refresh sweep now perceptually below threshold for typical use. Maps to Attempt-70 pre-bound matrix row 1 ("visible refresh line gone or perceptually below threshold"). Per-attempt detail in [`agnosticos/docs/development/iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) § Attempts 69, 70.
 
 ### Build
 
-`build/agnos` 413,216 B (1.30.9) → **414,544 B** (1.30.10, +1,328 B). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin **5.11.64**. gnoboot **0.2.0** unchanged (Path-C handoff ABI stable).
+`build/agnos` 413,216 B (1.30.9) → **414,544 B** (1.30.10, +1,328 B; Attempt-70 u64 follow-on did not change size — same MOV instruction widths on x86-64). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin **5.11.64**. gnoboot **0.2.0** unchanged (Path-C handoff ABI stable).
 
 ### Changed
 
 - `VERSION`: 1.30.9 → 1.30.10
 - `kernel/core/vmm.cyr`: added `vmm_remap_wc_2mb(phys)` + `vmm_remap_wc_range(phys, size)` (parallel to existing `vmm_remap_uc_2mb`)
 - `kernel/core/main.cyr`: WC remap call inserted at line 8, immediately before `fb_console_init()`
-- `kernel/arch/x86_64/fb_console.cyr`: `fb_console_init` clear loop + `fb_scroll_up` body/clear loops switched from `width` to `pitch / 4` extent
+- `kernel/arch/x86_64/fb_console.cyr`: `fb_console_init` clear loop + `fb_scroll_up` body/clear loops switched from `width` to `pitch / 4` extent (Attempt 69), then from u32 to u64 granularity with `stride_u64 = pitch / 8` (Attempt 70)
 - `kernel/version.cyr`: kernel banner, shell banner, `_AGNOS_VERSION` bumped to 1.30.10
 
-### Out of scope (deferred to 1.30.11 hardening)
+### Out of scope
 
-- Obsolete gvar-init defensive workaround in `fb_console_init` (dead code post-cyrius 5.11.64 fix; non-blocking cleanup)
-- VGA-vs-HDMI handoff canary (separate concern from cache-mapping; needs A/B under different cable types)
-- Block-copy scroll body (per-pixel store32 is fine under WC; revisit only if scroll perf is still observably slow post-burn)
+Speed is closed for 1.30.10. Still-open framebuffer items stay in the 1.30.x line:
 
-Glyph-to-font extraction is the 1.30.12 scope; 1.31.x opens for networking or storage.
+- **VGA-vs-HDMI handoff canary** → 1.30.11 hardening (separate concern from cache-mapping; needs A/B under different cable types)
+- **Obsolete gvar-init defensive workaround** in `fb_console_init` → 1.30.11 (dead code post-cyrius 5.11.64 fix; non-blocking cleanup)
+- **FB BAR memtype check** → 1.30.11 hardening (verify PAT entry is actually WC at runtime, not just remap-intent)
+- **Glyph-to-font extraction** → 1.30.12 (externalize inline CGA 8x8 table; possibly aligned with BannerManor M2 CYML font format)
+- **RAM-side shadow buffer → single-burst FB push** → 1.31.x triage (the mathematically-certain path to pristine refresh; gated on PMM contiguous-page allocation — Multiboot2 memory-map parse + `pmm_alloc_contig`. "If-and-when-we-want-pristine," not "must-fix")
+- **Multi-device USB / xHCI** (BT mouse + keyboard regression) → triage after 1.30.11 closes; current driver assumes single HID slot context, Linux `drivers/usb/host/xhci-mem.c::xhci_alloc_virt_device` is the reference for multi-slot allocation
 
 ## [1.30.9] — 2026-05-18 (Iron Attempt 68 — SET_CONFIGURATION + canonical FS interval + ISP → **TYPEABLE SHELL ON IRON, MVP GATE HIT**)
 
