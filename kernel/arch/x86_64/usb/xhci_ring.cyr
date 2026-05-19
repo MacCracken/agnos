@@ -48,7 +48,21 @@ var xhci_rings_ready    = 0;   # 1 once all four allocations succeeded
 # Event ring segment size — 256 TRBs × 16 bytes = 4 KB (one page).
 # Bumped only when a Phase-5+ workload actually needs more than 256
 # unconsumed events between polls.
-var XHCI_EVT_RING_SEGMENT_SIZE = 256;
+#
+# 2026-05-18 Attempt 64 (QEMU OBS): converted from `var = 256` to an
+# enum constant. The previous `var` declaration was being read as 0 by
+# xhci_rings_init's `store32(erst + 8, XHCI_EVT_RING_SEGMENT_SIZE);`
+# (line below), planting ERST entry 0 with Ring Segment Size = 0. The
+# xHCI controller, seeing a 0-sized segment, had nowhere to write
+# Command Completion Events — root cause of the 10-letter FF→QQ+QQ2
+# ladder. Empirically verified via QEMU monitor `xp /4wx <erst_phys>`:
+# bytes 8-11 of the ERST entry read 0x00000000 instead of 0x00000100.
+# Same gvar-init-order pattern xhci_cmd.cyr:107-115 names as suspected
+# for XHCI_DIAG_SUBMIT_MAX. Enum constants compile to literals — no
+# init order to get wrong.
+enum XhciEvtRing {
+    XHCI_EVT_RING_SEGMENT_SIZE = 256;
+}
 
 # --- Helpers --------------------------------------------------------
 

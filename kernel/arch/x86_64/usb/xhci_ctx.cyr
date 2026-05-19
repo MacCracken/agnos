@@ -8,10 +8,11 @@
 #      configuration). Layout depends on HCCPARAMS1.CSZ:
 #        CSZ=0 — 32-byte contexts: Input Control(32) + Slot(32) + EP[0..30](32*31)
 #        CSZ=1 — 64-byte contexts: Input Control(64) + Slot(64) + EP[0..30](64*31)
-#      On archaemenid CSZ=1, so each context is 64 bytes. We only need
-#      Slot + EP0 (first three contexts = 192 bytes), but the Input
-#      Control header sets the Add Context Flags so HW knows which
-#      contexts to consume.
+#      Iron (archaemenid AMD FCH 1022:1639) has CSZ=1; QEMU's qemu-xhci
+#      has CSZ=0. Offsets honor xhci_csz at runtime via xhci_ctx_size()
+#      and the slot/ep helpers below. We only need Slot + EP0 (first
+#      three contexts = 96 or 192 bytes), but the Input Control header
+#      sets the Add Context Flags so HW knows which contexts to consume.
 #
 #   2. Allocate a Device Context — same size + layout as Input, but HW
 #      writes into it (current device state after Address Device, etc.).
@@ -24,6 +25,35 @@
 #
 # Phase 3 only fills Slot Context + EP0 Context. Phase 4 will add the
 # interrupt-IN endpoint context when Configure Endpoint runs.
+
+# --- CSZ-aware context offset helpers --------------------------------
+#
+# HCCPARAMS1.CSZ bit selects context block size:
+#   CSZ=0  → 32-byte contexts (iron rarely; QEMU qemu-xhci default)
+#   CSZ=1  → 64-byte contexts (archaemenid AMD FCH, most physical xHCI)
+#
+# Layout of Input Context (and Device Context):
+#   Input Control Context   at offset 0
+#   Slot Context            at offset 1 * ctx_size
+#   EP0 Context             at offset 2 * ctx_size
+#   EP[N] Context           at offset (dci + 1) * ctx_size  where dci ≥ 2
+
+fn xhci_ctx_size() {
+    if (xhci_csz == 0) { return 32; }
+    return 64;
+}
+
+fn xhci_slot_ctx_off() {
+    return xhci_ctx_size();
+}
+
+fn xhci_ep0_ctx_off() {
+    return xhci_ctx_size() * 2;
+}
+
+fn xhci_ep_ctx_off(dci) {
+    return xhci_ctx_size() * (dci + 1);
+}
 
 # Per-slot device state. Indexed by slot_id (1..MaxSlots; slot 0 is the
 # Scratchpad Buffer Array pointer in DCBAA, not a device). Tracked here
@@ -127,26 +157,29 @@ fn xhci_alloc_input_ctx(port_num, speed) {
     # dwords 2..7 reserved/Configuration Value/Interface Number/Alternate
     # Setting — all zero for Phase 3.
 
-    # Slot Context at offset 0x40 (xHCI 1.2 §6.2.2):
+    # Slot Context at offset xhci_slot_ctx_off() (xHCI 1.2 §6.2.2 — 0x20 for
+    # CSZ=0, 0x40 for CSZ=1):
     #   dword 0:
     #     bits [19:0]  Route String          = 0 (direct root hub port)
     #     bits [23:20] Speed                  = port speed
     #     bit 25       MTT                    = 0
     #     bit 26       Hub                    = 0
     #     bits [31:27] Context Entries        = 1 (Slot + EP0 only)
+    var slot = ictx + xhci_slot_ctx_off();
     var slot_dw0 = (1 << 27) | ((speed & 0xF) << 20);
-    store32(ictx + 0x40, slot_dw0);
+    store32(slot + 0, slot_dw0);
     # dword 1:
     #   bits [15:0]  Max Exit Latency       = 0
     #   bits [23:16] Root Hub Port Number   = port_num (1-based)
     #   bits [31:24] Number of Ports        = 0 (not a hub)
-    store32(ictx + 0x44, (port_num & 0xFF) << 16);
+    store32(slot + 4, (port_num & 0xFF) << 16);
     # dword 2: parent hub / TT — zero for a root-hub device.
-    store32(ictx + 0x48, 0);
+    store32(slot + 8, 0);
     # dword 3: USB Device Address / Slot State — written by HW.
-    store32(ictx + 0x4C, 0);
+    store32(slot + 12, 0);
 
-    # Endpoint 0 Context at offset 0x80 (xHCI 1.2 §6.2.3):
+    # Endpoint 0 Context at offset xhci_ep0_ctx_off() (xHCI 1.2 §6.2.3 —
+    # 0x40 for CSZ=0, 0x80 for CSZ=1):
     # First allocate the EP0 transfer ring (one page, Normal/Setup/Data/
     # Status TRBs at slot 0 onward).
     var xfer = pmm_alloc();
@@ -155,13 +188,14 @@ fn xhci_alloc_input_ctx(port_num, speed) {
     iommu_register_dma(xfer);
     xhci_zero_page(xfer);
 
+    var ep0 = ictx + xhci_ep0_ctx_off();
     # EP0 context dword 0:
     #   bits [2:0]   EP State            = 0 (Disabled — HW will set to Running)
     #   bits [9:8]   Mult                = 0
     #   bits [14:10] MaxPStreams         = 0 (no streams for control)
     #   bit 15       LSA                 = 0
     #   bits [23:16] Interval            = 0 (control)
-    store32(ictx + 0x80, 0);
+    store32(ep0 + 0, 0);
     # dword 1:
     #   bits [2:1]   CErr                = 3 (max error count)
     #   bits [5:3]   EP Type             = 4 (Control Endpoint)
@@ -169,13 +203,13 @@ fn xhci_alloc_input_ctx(port_num, speed) {
     #   bits [31:16] Max Packet Size     = MPS for speed
     var mps = xhci_ep0_mps_for_speed(speed);
     var ep0_dw1 = (3 << 1) | (4 << 3) | ((mps & 0xFFFF) << 16);
-    store32(ictx + 0x84, ep0_dw1);
+    store32(ep0 + 4, ep0_dw1);
     # dwords 2/3: TR Dequeue Pointer (64-bit) with DCS in bit 0. Initial
     # Dequeue Cycle State = 1 (matches the producer cycle SW will use).
-    store64(ictx + 0x88, xfer | 0x1);
+    store64(ep0 + 8, xfer | 0x1);
     # dword 4:
     #   bits [15:0]  Average TRB Length  = 8 (control transfers — small)
-    store32(ictx + 0x90, 8);
+    store32(ep0 + 16, 8);
 
     # Stash the xfer ring + per-slot state. Caller will fill in slot_id
     # → table once Enable Slot returns.
@@ -249,26 +283,33 @@ b_interval, speed, xfer_ring_phys) {
     var dci = xhci_dci_for_ep(ep_addr);
     if (dci < 2) { return 0; }     # EP0 handled by xhci_alloc_input_ctx
 
-    # Input Control Context — set Add bit for the new EP (A_dci). Always
-    # reaffirm A0 (Slot) per Linux convention; HW reads the Slot context
-    # alongside the new EP context during Configure Endpoint.
-    var add_flags = load32(ictx_phys + 4);
-    add_flags = add_flags | (1 << dci) | 0x1;
-    store32(ictx_phys + 4, add_flags);
+    # Input Control Context — Add Flags = A0 (Slot) + A_dci (new EP).
+    # Discard any pre-existing flags from xhci_alloc_input_ctx (notably
+    # A1 / EP0) — Configure Endpoint should not re-load EP0 from the
+    # stale Input Context EP0 (HW has been advancing the Device Context
+    # EP0 dequeue pointer during Get Device Descriptor traffic). Matches
+    # Linux xhci_init_input_control_ctx (xhci-mem.c) convention. Drop
+    # Flags (offset 0) untouched — caller may have set them for an EP
+    # removal pass, not our concern here. QEMU surfaced this 2026-05-18
+    # Attempt 64: A1 carried forward caused Configure Endpoint ccode=5
+    # (TRB Error) because Input EP0's TR DQ Ptr was stale.
+    store32(ictx_phys + 4, (1 << dci) | 0x1);
 
     # Slot Context dword 0: bump Context Entries (bits 31:27) to cover
     # the new DCI. CE = max(existing, dci). We re-derive from the field
     # to preserve speed / hub bits / route string.
-    var slot_dw0 = load32(ictx_phys + 0x40);
+    var slot = ictx_phys + xhci_slot_ctx_off();
+    var slot_dw0 = load32(slot);
     var cur_ce = (slot_dw0 >> 27) & 0x1F;
     if (dci > cur_ce) {
         slot_dw0 = (slot_dw0 & 0x07FFFFFF) | ((dci & 0x1F) << 27);
-        store32(ictx_phys + 0x40, slot_dw0);
+        store32(slot, slot_dw0);
     }
 
-    # EP context at offset (dci + 1) * 64 (CSZ=1, 64-byte contexts).
-    #   DCI=2 → 0xC0, DCI=3 → 0x100, DCI=4 → 0x140, ...
-    var ep_ctx = ictx_phys + (dci + 1) * 0x40;
+    # EP context at offset (dci + 1) * ctx_size.
+    #   CSZ=0 (32B): DCI=2 → 0x60,  DCI=3 → 0x80,  DCI=4 → 0xA0
+    #   CSZ=1 (64B): DCI=2 → 0xC0,  DCI=3 → 0x100, DCI=4 → 0x140
+    var ep_ctx = ictx_phys + xhci_ep_ctx_off(dci);
 
     # dword 0 — Interval at bits 23:16.
     var interval = xhci_interrupt_interval(b_interval, speed);

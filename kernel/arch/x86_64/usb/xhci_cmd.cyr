@@ -57,7 +57,17 @@ var XHCI_DIAG_SUBMIT_MAX   = 2;
 # pair this bounds wall time to roughly a quarter second on Zen — the
 # spec doesn't define a hard ceiling but contemporary controllers
 # complete Enable Slot / Address Device in microseconds.
-var XHCI_CMD_TIMEOUT_SPINS = 10000000;
+#
+# 2026-05-18 Attempt 64 (QEMU repro): converted from `var = 10000000` to
+# enum constant. Same gvar-init-order bug class as XHCI_EVT_RING_SEGMENT_SIZE
+# in xhci_ring.cyr — if the top-level `var = N` initializer doesn't run
+# before xhci_cmd_wait's first call, the spin loop `while (wait < X)` reads
+# X=0 and exits immediately without ever inspecting the event ring. Bug
+# class is suspected to be in the Cyrius compiler's module-load ordering;
+# see cyrius/docs/development/issues/2026-05-18-gvar-init-order-zero-reads.md.
+enum XhciCmdSpins {
+    XHCI_CMD_TIMEOUT_SPINS = 10000000;
+}
 
 # Submit one TRB to the cmd ring. cycle bit is OR-d in by this function.
 # Caller-supplied dword 3 must have its bit 0 zero.
