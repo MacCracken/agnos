@@ -250,11 +250,16 @@ fn xhci_dci_for_ep(ep_addr) {
 # transactions.
 #   - HS / SS: bInterval is already a log2-microframes count (1..16); xHCI
 #     Interval = bInterval - 1 (clamped to 0..15).
-#   - FS / LS: bInterval is in frames (1..255); a strict log2(bInterval*8)
-#     gives slow polling (10 ms typical bInterval × 8 microframes = ~7).
-#     For MVP typeable-shell responsiveness we pin FS keyboards to
-#     Interval=3 (= 8 microframes = 1 ms) — over-polling a keyboard is
-#     harmless on a non-power-constrained device.
+#   - FS / LS: bInterval is in frames (1..255); Linux convention is
+#     Interval = fls(8 * bInterval) - 1 — Linux drivers/usb/host/xhci.c
+#     xhci_parse_microframe_interval(). Earlier AGNOS pinned FS to
+#     Interval=3 (1 ms) chasing typing responsiveness, but AMD FCH on
+#     archaemenid validates Interval against the device's declared
+#     bInterval and may treat a faster-than-declared rate as a config
+#     error — Phase-5 audit 2026-05-18 surfaced this as one of three
+#     iron-vs-Linux behavioral diffs. 8 ms (the typical bInterval=10
+#     case) is well below the perceptible-typing-lag threshold; over-
+#     polling for "responsiveness" was unmeasured intent.
 fn xhci_interrupt_interval(b_interval, speed) {
     if (speed == XHCI_SPEED_HIGH) {
         var hi = b_interval;
@@ -265,7 +270,19 @@ fn xhci_interrupt_interval(b_interval, speed) {
     }
     if (speed == XHCI_SPEED_SUPER)      { return b_interval - 1; }
     if (speed == XHCI_SPEED_SUPER_PLUS) { return b_interval - 1; }
-    return 3;   # FS / LS default
+    # FS / LS: fls(8 * bInterval) - 1. Inline fls because the kernel has
+    # no bsr intrinsic yet.
+    var x = b_interval;
+    if (x == 0) { x = 1; }                 # defensive — spec says bInterval >= 1
+    x = x * 8;                             # frames → microframes
+    var bit = 0;
+    while (x > 0) {
+        bit = bit + 1;
+        x = x >> 1;
+    }
+    var interval = bit - 1;
+    if (interval > 15) { interval = 15; }  # xHCI 1.2 max
+    return interval;
 }
 
 # Phase 4 — add an Interrupt-IN endpoint to an existing Input Context.

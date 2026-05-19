@@ -193,6 +193,21 @@ fn hid_kbd_configure(slot_id) {
     var mps = load16(&mps_buf);
     if (mps == 0) { mps = 8; }      # HID-boot reports are always 8 bytes
 
+    # Step 2.5: SET_CONFIGURATION (USB 2.0 §9.4.7). Transitions the device
+    # from Address → Configured state; per §9.1.1.5, endpoints other than
+    # EP0 are NOT operational until the device is Configured. Skipping this
+    # is why iron HID keyboards NAK every interrupt-IN poll forever after
+    # Configure Endpoint succeeds host-side (QEMU's usb-kbd is permissive
+    # and ships reports anyway; real firmware honors the state machine).
+    # bConfigurationValue lives at config descriptor byte 5 — Linux
+    # `usb_choose_configuration()` typically picks the first config, value
+    # = 1 for single-config HID-boot keyboards.
+    var config_value = load8(xhci_desc_buf_phys + 5);
+    if (xhci_control_no_data(slot_id, 0x00, 0x09, config_value, 0) == 0) {
+        kprintln("hid: SET_CONFIGURATION failed", 29);
+        return 0;
+    }
+
     # Step 3: SET_PROTOCOL = boot. Force the keyboard onto the predictable
     # boot-report format.
     if (hid_set_protocol_boot(slot_id, intf_num) == 0) {
@@ -222,7 +237,9 @@ fn hid_kbd_configure(slot_id) {
     var trb = xfer_ring;
     store64(trb + 0, report_buf);
     store32(trb + 8, mps & 0x1FFFF);
-    var trb_ctrl = (1 << 5) | (XHCI_TRB_NORMAL << 10) | 0x1;
+    # IOC=bit 5, ISP=bit 2 (Interrupt on Short Packet — Linux always sets
+    # ISP for IN data; defensive against a HID device returning <mps bytes).
+    var trb_ctrl = (1 << 5) | (1 << 2) | (XHCI_TRB_NORMAL << 10) | 0x1;
     store32(trb + 12, trb_ctrl);
     hid_kbd_xfer_idx   = 1;   # next free TRB slot (we just filled 0)
     hid_kbd_xfer_cycle = 1;
@@ -292,7 +309,8 @@ fn hid_arm_xfer_trb() {
     var trb = hid_kbd_xfer_ring + hid_kbd_xfer_idx * 16;
     store64(trb + 0, hid_kbd_report_buf);
     store32(trb + 8, hid_kbd_ep_mps & 0x1FFFF);
-    var ctrl = (1 << 5) | (XHCI_TRB_NORMAL << 10) | (hid_kbd_xfer_cycle & 0x1);
+    # IOC=bit 5, ISP=bit 2 — see hid_kbd_configure for rationale.
+    var ctrl = (1 << 5) | (1 << 2) | (XHCI_TRB_NORMAL << 10) | (hid_kbd_xfer_cycle & 0x1);
     store32(trb + 12, ctrl);
     hid_kbd_xfer_idx = hid_kbd_xfer_idx + 1;
     if (hid_kbd_xfer_idx >= 256) {
