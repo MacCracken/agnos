@@ -104,6 +104,86 @@ fn vmm_remap_uc_2mb(phys) {
     return 1;
 }
 
+# Remap a 2MB chunk as Write-Combining (WC). Flag bits: PWT=1 (bit 3),
+# PCD=0 (bit 4 clear), PAT-bit=0 (bit 12 clear) on the controlling PDE.
+# Selects PAT entry 1 = WC under the firmware-default PAT MSR
+# (0x0007040600070406, where PA1=WC per Attempt-43 audit).
+#
+# For framebuffers: WC coalesces CPU pixel writes into burst transactions
+# to the display controller, eliminating the WB-cached eviction-timing
+# artifacts that show up as visible refresh noise during scrolls. UC
+# would be correct but slow (per-write MMIO round-trip); WB is correct
+# but visible noise (cache holds in-flight pixels). WC is the canonical
+# framebuffer mapping.
+#
+# Flag construction: 0x83 (Present+Writable+2MB) | 0x08 (PWT=1) = 0x8B.
+# Structure mirrors vmm_remap_uc_2mb exactly; only the flag differs
+# (0x9B = UC vs 0x8B = WC).
+#
+# Returns 1 on success, 0 on pmm_alloc failure.
+fn vmm_remap_wc_2mb(phys) {
+    var chunk = phys & 0xFFFFFFFFFFE00000;
+    if (phys < 0x40000000) {
+        var pd_idx = (phys >> 21) & 0x1FF;
+        store64(0x3000 + pd_idx * 8, chunk | 0x8B);
+        var flush = phys;
+        asm { invlpg [rax]; }
+        return 1;
+    }
+    var pml4_idx = (phys >> 39) & 0x1FF;
+    var pdpt_idx = (phys >> 30) & 0x1FF;
+    var pdpt_base = 0x2000;
+    if (pml4_idx > 0) {
+        var pml4e = load64(0x1000 + pml4_idx * 8);
+        if ((pml4e & 1) == 0) {
+            var new_pdpt = pmm_alloc();
+            if (new_pdpt == 0) { return 0; }
+            for (var i = 0; i < 512; i = i + 1) {
+                store64(new_pdpt + i * 8, 0);
+            }
+            store64(0x1000 + pml4_idx * 8, new_pdpt | 0x03);
+            pdpt_base = new_pdpt;
+        } else {
+            pdpt_base = pml4e & 0xFFFFFFFFFFFFF000;
+        }
+    }
+    var new_pd = pmm_alloc();
+    if (new_pd == 0) { return 0; }
+    var pdpt_va_base = pml4_idx * 0x8000000000 + pdpt_idx * 0x40000000;
+    for (var j = 0; j < 512; j = j + 1) {
+        var addr = pdpt_va_base + j * 0x200000;
+        var pde  = addr | 0x83;
+        if (addr == chunk) { pde = addr | 0x8B; }
+        store64(new_pd + j * 8, pde);
+    }
+    store64(pdpt_base + pdpt_idx * 8, new_pd | 0x03);
+    asm { mov rax, cr3; }
+    asm { mov cr3, rax; }
+    return 1;
+}
+
+# Remap [phys, phys+size) as Write-Combining. Iterates 2MB chunks;
+# rounds the start down + walks until end. Used for the framebuffer
+# (~8 MB at 1920x1080 32bpp; ~2 MB at 800x600).
+#
+# Note: each call to vmm_remap_wc_2mb in the 1-512GB / ≥512GB cases
+# allocates a fresh PD and shatters the containing 1 GB region. For
+# multi-chunk FBs above 1 GB this is suboptimal (re-shatters per
+# chunk, leaks the prior PD). Archaemenid's FB lives in the 32-bit
+# hole so the < 1GB path applies and all chunks share PD@0x3000.
+# Address the suboptimal-high case if a target ever puts the FB
+# above 1 GB.
+fn vmm_remap_wc_range(phys, size) {
+    var start = phys & 0xFFFFFFFFFFE00000;
+    var end = phys + size;
+    var p = start;
+    while (p < end) {
+        if (vmm_remap_wc_2mb(p) == 0) { return 0; }
+        p = p + 0x200000;
+    }
+    return 1;
+}
+
 fn vmm_unmap(virt) {
     var pd_idx = (virt >> 21) & 0x1FF;
     store64(0x3000 + pd_idx * 8, 0);

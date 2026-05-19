@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-05-18 (v1.30.7 cycle open — 1.30.5 Phase 4/5 USB-HID kbd landed, 1.30.6 xHCI cmd-path arc bundled FF→QQ, iron-validated on archaemenid NUC AMD 2026-05-15 for boot-to-shell MVP except Enable Slot CCE gate, 1.30.7 next-cycle bump 2026-05-18) | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. The script only refreshes header date + Version-row + roadmap "Current" line; body prose drifts independently and needs manual sweeps at minor closeouts.
+> **Last refresh**: 2026-05-19 (v1.30.7 cycle open — 1.30.5 Phase 4/5 USB-HID kbd landed, 1.30.6 xHCI cmd-path arc bundled FF→QQ, iron-validated on archaemenid NUC AMD 2026-05-15 for boot-to-shell MVP except Enable Slot CCE gate, 1.30.7 next-cycle bump 2026-05-18) | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. The script only refreshes header date + Version-row + roadmap "Current" line; body prose drifts independently and needs manual sweeps at minor closeouts.
 >
 > **Scope**: live snapshot of this repo (`agnos`). Volatile state lives here so [`CLAUDE.md`](../../CLAUDE.md) can stay durable. Historical narrative lives in [`CHANGELOG.md`](../../CHANGELOG.md); the design ledger lives in [`roadmap.md`](roadmap.md). Iron-bring-up per-attempt detail lives in [agnosticos `iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
 
@@ -16,9 +16,9 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.30.9** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.30.10** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **5.11.59** | `cyrius.cyml [package].cyrius` |
-| **Released** | 2026-05-18 | [`CHANGELOG.md`](../../CHANGELOG.md) |
+| **Released** | 2026-05-19 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-15 (archaemenid NUC AMD — boot-to-shell MVP cleared the kernel-init layer; xHCI Enable Slot CCE remains the cmd-path gate as of 2026-05-18 — see `iron-nuc-zen-log` § Attempts 56-62) | NUC AMD Attempts 11 / 29 / 55 |
 
 ## Open investigation — xHCI Enable Slot CCE silent-absorb (2026-05-18, archaemenid NUC AMD)

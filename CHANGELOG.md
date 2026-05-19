@@ -5,13 +5,91 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-**1.30.x is the closed-beta MVP arc** — kernel + kybernet + agnoshi typeable on iron archaemenid. 1.31.x opens AFTER the MVP gate hits (networking or storage, depending on next direction). Phase-5 interrupt-IN keystroke delivery is the open MVP blocker → lands in **1.30.9** below.
+## [1.30.10] — 2026-05-19 (Framebuffer refresh — WC mapping + pitch-aware loops; iron Attempt 69 pending)
 
-The pre-1.30.7 framebuffer VGA-vs-HDMI bug is NOT MVP-blocking (visual gate hit on at least one display path) — left as carry-forward.
+**Post-MVP open.** First cut after the closed-beta MVP gate (1.30.9, Iron Attempt 68). Scoped to framebuffer refresh quality — Attempt 68's bench scroll showed pixel-pattern noise in the lower FB region, traced to the kernel mapping the GOP framebuffer as WB-cached (default `vmm_map(..., 0x83)` selects PAT entry 0 = WB under firmware-default PAT MSR; confirmed Attempt 43). WB on a framebuffer means CPU pixel writes batch through L1/L2 and reach the display controller on cache evictions — visible as the observed artifact.
 
-## [1.30.9] — TBD
+### Bundle (three behavioral changes, single working-tree movement)
 
-Closing the iron typeable-shell gate — Phase-5 interrupt-IN keystroke delivery. Fills in when the next movement lands. Strategy notes live in `agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 67 (next-move space).
+Per `feedback_redesign_dont_reinvent` — paths converged on the canonical Linux/EDK2 framebuffer mapping pattern, audited in advance, no letter ladder:
+
+1. **WC framebuffer mapping** — `vmm_remap_wc_2mb(phys)` + `vmm_remap_wc_range(phys, size)` added to `kernel/core/vmm.cyr`; mirrors `vmm_remap_uc_2mb` structurally, flag `0x8B` (PWT=1, PCD=0, PAT=0) selects PAT entry 1 = WC under firmware-default PAT MSR. `kernel/core/main.cyr:8` now calls `vmm_remap_wc_range(fb_fb_phys(), fb_pitch() * fb_height())` immediately before `fb_console_init()`, so the FB is WC-mapped before the first kernel paint. WC coalesces sequential pixel writes into burst transactions to the display controller, eliminating WB-cache eviction timing artifacts. Linux `vesafb` / `efifb` request `ioremap_wc()`; same pattern.
+
+2. **Pitch-aware init clear** — `fb_console_init`'s full-screen clear (`kernel/arch/x86_64/fb_console.cyr` ~line 80) now iterates `pitch / 4` u32s per row instead of `width`. When firmware's `PixelsPerScanLine > HorizontalResolution`, the padding u32s between `width*4` and `pitch` previously carried stale UEFI/firmware paint forever. Invisible behind the arcade-cabinet bezel on archaemenid; visible on QEMU and direct-attach displays.
+
+3. **Pitch-aware scroll clear** — `fb_scroll_up` body copy + bottom-row clear (~line 250-275) walk `pitch / 4` u32s per row. Same rationale as #2 but in the scroll path.
+
+### Verification
+
+- ✅ Cyrius build clean (5.11.64 pin, no errors, 32 unreachable fns)
+- ✅ QEMU Path-C serial smoke — `EXPECT="AGNOS shell"` matched on ConOut
+- ✅ QEMU visual at **1920×1080 (std VGA via `-vga std -global VGA.xres=1920 -global VGA.yres=1080`)** — boots clean, scrolls clean, no regression at iron-class extent
+- ⏸ Iron Attempt 69 — pending. Per-attempt detail in [`agnosticos/docs/development/iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) § Attempt 69 prep, with pre-bound outcome matrix.
+
+### Build
+
+`build/agnos` 413,216 B (1.30.9) → **414,544 B** (1.30.10, +1,328 B). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin **5.11.64**. gnoboot **0.2.0** unchanged (Path-C handoff ABI stable).
+
+### Changed
+
+- `VERSION`: 1.30.9 → 1.30.10
+- `kernel/core/vmm.cyr`: added `vmm_remap_wc_2mb(phys)` + `vmm_remap_wc_range(phys, size)` (parallel to existing `vmm_remap_uc_2mb`)
+- `kernel/core/main.cyr`: WC remap call inserted at line 8, immediately before `fb_console_init()`
+- `kernel/arch/x86_64/fb_console.cyr`: `fb_console_init` clear loop + `fb_scroll_up` body/clear loops switched from `width` to `pitch / 4` extent
+- `kernel/version.cyr`: kernel banner, shell banner, `_AGNOS_VERSION` bumped to 1.30.10
+
+### Out of scope (deferred to 1.30.11 hardening)
+
+- Obsolete gvar-init defensive workaround in `fb_console_init` (dead code post-cyrius 5.11.64 fix; non-blocking cleanup)
+- VGA-vs-HDMI handoff canary (separate concern from cache-mapping; needs A/B under different cable types)
+- Block-copy scroll body (per-pixel store32 is fine under WC; revisit only if scroll perf is still observably slow post-burn)
+
+Glyph-to-font extraction is the 1.30.12 scope; 1.31.x opens for networking or storage.
+
+## [1.30.9] — 2026-05-18 (Iron Attempt 68 — SET_CONFIGURATION + canonical FS interval + ISP → **TYPEABLE SHELL ON IRON, MVP GATE HIT**)
+
+**The closed-beta MVP gate hits.** Both halves — visual (since 1.30.7) and functional (typeable keyboard via xhci HID) — clear on archaemenid. `agnos> echo "Assembly Up!"` echoed back from the iron Logitech (VID=1452 PID=591) keyboard.
+
+### The bundle (three behavioral diffs vs Linux/USB 2.0)
+
+Per `feedback_redesign_dont_reinvent` — landed in one burn, no letter ladder, single read-only audit pass surfaced all three:
+
+1. **SET_CONFIGURATION before SET_PROTOCOL** (`hid.cyr` `hid_kbd_configure`) — USB 2.0 §9.4.7. Reads `bConfigurationValue` from config descriptor byte 5, fires `xhci_control_no_data(slot_id, 0x00, 0x09, config_value, 0)`. Without this the device sits in Address state forever — strict USB firmware NAKs every interrupt-IN poll because no configuration is active.
+2. **Linux-canonical FS polling interval** (`xhci_ctx.cyr` `xhci_interrupt_interval`) — FS/LS branch replaced `return 3` (hardcoded 1 ms over-poll) with `fls(8 * bInterval) - 1` clamped to ≤15. Inline `fls` (kernel has no bsr intrinsic).
+3. **ISP on interrupt-IN Normal TRB** (`hid.cyr` line 225 + `hid_arm_xfer_trb` line 295) — Linux convention for IN-data TRBs.
+
+### Result — iron Attempt 68
+
+```
+hid: keyboard layer initialized
+hid: keyboard configured, boot protocol on, EP=129, polling 8-byte reports
+...
+AGNOS shell v1.30.9 (type 'help')
+agnos> echo "Assembly Up!"
+Assembly Up!
+agnos>
+```
+
+Bench (3-tier) runs end-to-end under the typeable shell on iron — fibonacci 133 c/op, syscall_write 31 c/op, open+read+close 256 c/op, serial putc ~11.6 c/op. Photos + per-attempt narrative in [`iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) § Attempt 68.
+
+### Why iron diverged from QEMU
+
+QEMU's `usb-kbd` is permissive — ships interrupt-IN reports as soon as the host arms a TRB and rings the doorbell, ignoring device-side state. Real iron HID firmware honors USB 2.0 §9.1.1's "endpoints not operational until Configured" rule and NAKs every interrupt-IN poll until SET_CONFIGURATION moves the device Address → Configured. Same iron-strict / QEMU-permissive divergence shape as the Attempt 64 root-cause search; same QEMU lane was the audit unlock.
+
+### Build
+
+`build/agnos` 412,832 B (1.30.8) → **413,216 B** (1.30.9, +384 B). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin 5.11.64.
+
+### Changed
+
+- `VERSION`: 1.30.8 → 1.30.9
+- `kernel/version.cyr`: kernel banner, shell banner, `_AGNOS_VERSION` bumped to 1.30.9
+- `kernel/arch/x86_64/usb/hid.cyr`: SET_CONFIGURATION between config-descriptor walk and SET_PROTOCOL in `hid_kbd_configure`; ISP bit added to initial interrupt-IN Normal TRB (line 225) and `hid_arm_xfer_trb` (line 295).
+- `kernel/arch/x86_64/usb/xhci_ctx.cyr`: `xhci_interrupt_interval` FS/LS branch rewritten to Linux-canonical `fls(8 * bInterval) - 1`.
+
+### Open carry-forward into 1.30.10
+
+- **Framebuffer refresh quality + VGA-vs-HDMI handoff audit**. Visible refresh is poor on archaemenid; pixel-pattern noise observed in the lower bench-output region of the FB. GOP framebuffer pitch/stride/format reconciliation pending. Now the active 1.30.x branch.
 
 ## [1.30.8] — 2026-05-18 (Iron Attempts 65/66/67 — RR falsified, EP0 MPS reconciliation clears HID enumeration; Phase-5 interrupt-IN open)
 

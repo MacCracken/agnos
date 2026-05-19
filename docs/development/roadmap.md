@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.30.9 — x86_64 + aarch64, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU, **sovereign-struct entry (RDI = &boot_info)** via gnoboot v0.2.0, native xHCI + USB-HID-boot keyboard driver (Phase 1-5 code-complete), iron-validated NUC AMD Zen 2026-05-15. Built with cyrius 5.11.64. Live binary sizes per arch + per-cut size trajectory: [`state.md`](state.md).
+> **Current**: v1.30.10 — x86_64 + aarch64, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU, **sovereign-struct entry (RDI = &boot_info)** via gnoboot v0.2.0, native xHCI + USB-HID-boot keyboard driver (Phase 1-5 code-complete), iron-validated NUC AMD Zen 2026-05-15. Built with cyrius 5.11.64. Live binary sizes per arch + per-cut size trajectory: [`state.md`](state.md).
 >
 > Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 

@@ -1,8 +1,24 @@
 # === 64-bit Cyrius kernel code ===
 
+# Remap the framebuffer as Write-Combining (WC) BEFORE the first paint.
+# gnoboot's GOP capture leaves fb_phys at the firmware-default mapping
+# (WB-cached PAT entry 0 under the archaemenid PAT MSR). WB on a
+# framebuffer means CPU pixel writes batch through L1/L2 and reach the
+# display controller on eviction — visible as refresh-noise / bench-
+# scroll pixel-pattern artifacts (Attempt 68 photo).
+#
+# WC remap (PAT entry 1) coalesces sequential CPU writes into burst
+# transactions, eliminating the cache-eviction-timing artifacts. Range
+# spans `pitch * height` bytes — the full GOP region.
+#
+# If fb_fb_phys() returns 0 (no GOP / serial-only headless), the range
+# loop sees end == start and exits without remap; downstream paints
+# are no-ops via the same fb_phys==0 guard.
+vmm_remap_wc_range(fb_fb_phys(), fb_pitch() * fb_height());
+
 # Populate the 8x8 font in BSS so fb_putc renders glyphs once shell()
 # starts emitting through kprint. Pure data fill — safe to run before
-# any subsystem is up.
+# any subsystem is up. Now paints into the WC-remapped FB above.
 fb_console_init();
 
 print_agnos_kernel_banner();

@@ -76,17 +76,28 @@ fn fb_console_init() {
     # `efi_clear(st)` pre-banner and then prints its handoff line, so
     # row 0 of the framebuffer carries firmware-font text on entry; the
     # kernel's first 8-px-glyph row would otherwise overlay that line.
-    # One linear sweep of the framebuffer (pitch x height u32 stores)
-    # paints over both gnoboot's banner and any residual UEFI logo —
-    # cost is small (~8 MB at 1080p, runs once, ~5 ms on Zen).
+    # One linear sweep of the framebuffer paints over both gnoboot's
+    # banner and any residual UEFI logo.
+    #
+    # Pitch-aware extent: inner loop walks `pitch / 4` u32s per row, not
+    # `width`. When PixelsPerScanLine > HorizontalResolution (firmware
+    # pads scanlines for alignment), the padding u32s carry stale
+    # firmware paint forever otherwise — invisible behind the arcade
+    # cabinet bezel on archaemenid but real and right-edge-visible on
+    # QEMU / direct-attach displays.
+    #
+    # Cost at 1080p with pitch=7680 bytes: 1920 u32 writes per row × 1080
+    # rows = ~2.07M store32. WC-mapped (per vmm_remap_wc_range called
+    # from core/main.cyr before this init) these burst to the controller
+    # without paying WB cache eviction artifacts.
     var fb_clr = fb_fb_phys();
     if (fb_clr != 0) {
         var pitch_clr  = fb_pitch();
         var height_clr = fb_height();
-        var width_clr  = fb_width();
+        var stride_u32 = pitch_clr / 4;
         for (var py = 0; py < height_clr; py = py + 1) {
             var scan_clr = fb_clr + py * pitch_clr;
-            for (var px = 0; px < width_clr; px = px + 1) {
+            for (var px = 0; px < stride_u32; px = px + 1) {
                 store32(scan_clr + px * 4, 0x00000000);
             }
         }
@@ -247,26 +258,32 @@ fn fb_fill_cell(cell_x, abs_y, color) {
 # Scroll the console area up by one 8-px row. Copy the rectangle from
 # y=FB_CONSOLE_Y0+8..height down to y=FB_CONSOLE_Y0..(height-8), then
 # clear the new bottom row to FB_BG.
+#
+# Pitch-aware: inner loops iterate `pitch / 4` u32s per row, not
+# `width`. Same rationale as fb_console_init's clear — when ppl > hres,
+# the padding columns carry stale firmware paint that the scroll body
+# was previously leaving untouched. Copy is byte-stable either way; the
+# bottom-row clear specifically needs the pitch extent.
 fn fb_scroll_up() {
     var fb = fb_fb_phys();
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
-    var width = fb_width();
     var height = fb_height();
+    var stride_u32 = pitch / 4;
     var rows_to_copy = height - FB_CONSOLE_Y0 - 8;
     if (rows_to_copy <= 0) { return 0; }
     # Copy line-by-line, top-down (no overlap risk since src is below dst).
     for (var y = 0; y < rows_to_copy; y = y + 1) {
         var src = fb + (FB_CONSOLE_Y0 + 8 + y) * pitch;
         var dst = fb + (FB_CONSOLE_Y0 + y) * pitch;
-        for (var x = 0; x < width; x = x + 1) {
+        for (var x = 0; x < stride_u32; x = x + 1) {
             store32(dst + x * 4, load32(src + x * 4));
         }
     }
     # Clear new bottom 8-px row to FB_BG.
     var clear_y = FB_CONSOLE_Y0 + rows_to_copy;
     for (var y = 0; y < 8; y = y + 1) {
-        for (var x = 0; x < width; x = x + 1) {
+        for (var x = 0; x < stride_u32; x = x + 1) {
             store32(fb + (clear_y + y) * pitch + x * 4, FB_BG);
         }
     }
