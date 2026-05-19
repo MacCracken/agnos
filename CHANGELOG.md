@@ -5,6 +5,62 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.30.11] — 2026-05-19 (FB hardening — PixelFormat guard + WC retry-after-pmm + idempotent vmm_remap_wc_2mb; QEMU PASS, iron Attempt 71 pending)
+
+**Post-MVP hardening cycle.** Three 1.30.10 carry-forward items closed (VGA-vs-HDMI handoff guard, obsolete gvar-init workaround cleanup, FB BAR memtype runtime check), plus a pre-existing multi-chunk WC-remap leak in `vmm_remap_wc_2mb` that the new memtype check surfaced and is now fixed in the same cut. The quiet-boot ON/OFF asymmetry on archaemenid (HDMI-spec mode produces garbled glyphs, VGA-spec mode renders clean — original symptom in Attempt 33 photo, 2026-05-16) is hypothesized to be a non-BGRX PixelFormat under quiet-boot ON; the new guard refuses to paint when `pf > 1` so the kernel falls cleanly to serial-only rather than corrupting glyphs. Iron Attempt 71 with quiet-boot ON is what proves the hypothesis.
+
+### Bundle (four behavioral changes, no iron burns yet)
+
+Per `feedback_redesign_dont_reinvent` — audited Linux's `drivers/video/fbdev/efifb.c` PixelFormat handling and `arch/x86/mm/pat.c` PAT-readback patterns before designing the guards. No diagnostic-letter ladder.
+
+1. **PixelFormat-aware FB render + serial diagnostic**. New `fb_pf()` getter reads `boot_info+0x5C` (gnoboot already captured `pf` from GOP — kernel just never read it). `fb_console_init` now logs `fb: phys=0x... pf=N w=W h=H pitch=P` to serial before any paint — ground truth available even when the FB itself goes garbled. Pf-aware branch: `pf == 0` (RGBX) and `pf == 1` (BGRX) both render safely (monochrome white/black is symmetric in those channels); `pf == 2` (PixelBitMask) or `pf == 3` (PixelBltOnly) → log warning, set `fb_console_ready = 0`, fall to serial-only console. Linux ref: `efifb.c` rejects modes outside the two 8-bit-per-channel-with-reserved formats.
+
+2. **Obsolete gvar-init defensive workaround DELETED**. The `fb_console_init` re-assignment of `FB_CONSOLE_Y0 / FB_FG / FB_BG` was a 2026-05-15 workaround for cyrius 5.7.19's gvar-init-order bug (top-level non-zero `var` initializers weren't honored at runtime). Cyrius 5.11.64 fixed the underlying issue at the MVP gate. Dead code removed; top-level initializers now take effect correctly.
+
+3. **FB BAR memtype runtime check** — new `fb_verify_wc()` function reads back the controlling 2MB PDE (or 1GB PDPT entry for unshattered cases) and decodes PWT/PCD/PAT bits against the firmware-default PAT MSR. Called from `kernel/core/main.cyr` AFTER `pmm_init` + a post-pmm WC remap retry, so it sees the final cache state. Emits exactly one line per boot: `fb: WC verified (PAT entry 1)` (green gate) or `fb: WARN expected PAT entry 1 (WC), got entry N PDE=0x...` (silent regression — pixel-pattern noise about to return). New `vmm_get_pde_2mb(phys)` accessor in `kernel/core/vmm.cyr` walks PML4 → PDPT → PD across all coverage paths (< 1 GB inline PD@0x3000, 1 GB–512 GB PML4[0] walk, ≥ 512 GB lazy-PML4 walk). Linux ref: `arch/x86/mm/pat.c`.
+
+4. **`vmm_remap_wc_2mb` idempotency fix** (real pre-existing bug surfaced by item 3). Multi-chunk FBs above 1 GB previously re-shattered the PDPT entry on every chunk in the same 1 GB region, allocating a fresh PD each call and **overwriting earlier chunks' WC bits with WB defaults from the new PD's identity fill**. Net result: only the LAST chunk ended up WC; all earlier chunks reverted to WB. Iron archaemenid was unaffected (FB BAR in 32-bit hole, inline path is naturally idempotent), but any future iron target with a high FB BAR — and QEMU q35, which places its FB BAR at `0x80000000` — silently leaked PDs and ended up partially WB. New idempotency branch: if the PDPT entry is already shattered (Present + not a 1 GB huge page), reuse the existing PD and just edit the target PDE in place. Same shape extended into `vmm_remap_wc_2mb` only; `vmm_remap_uc_2mb` left alone (only called once per UC region in current usage).
+
+### Post-pmm WC retry
+
+`kernel/core/main.cyr` now calls `vmm_remap_wc_range` a second time right after `pmm_init` returns, followed by `fb_verify_wc()`. The line-17 attempt at boot succeeds immediately for FBs in the 32-bit hole (< 1 GB inline-PD-rewrite path, no allocation needed — iron archaemenid case) but silently fails for FBs at phys ≥ 1 GB because `vmm_remap_wc_2mb`'s high-mem path needs `pmm_alloc` for a fresh PD and pmm isn't initialized at line 17. The post-pmm retry is a no-op on iron (PDE already 0x8B from line 17) and the completion gate on QEMU q35 / any high-BAR target. FB briefly paints WB-cached in the high-BAR case until the retry — benign, since the display reads physical memory regardless of cache type.
+
+### Verification
+
+- ✅ Cyrius build clean (5.11.64 pin, no errors, 31 unreachable fns)
+- ✅ Multiboot2 ELF64 entry preserved at `0x1000a8`
+- ✅ QEMU Path-C **headless smoke** via new `agnosticos/scripts/qemu-fb-smoke.sh` — `EXPECT="AGNOS shell"` matched on ConOut at 1920×1080. New harness is the headless companion to `qemu-fb-visual.sh`; reusable across cycles.
+- ✅ Serial diagnostic landed: `fb: phys=0x80000000 pf=1 w=1920 h=1080 pitch=7680`
+- ✅ Post-pmm WC verification landed: `fb: WC verified (PAT entry 1)` — the idempotency fix is what made this go from WARN to verified under q35
+- ✅ Kernel + shell banners bumped to **v1.30.11**
+- ⏸ Iron Attempt 71 — pending. Targets the quiet-boot-ON HDMI-spec mode on archaemenid. Pre-bound outcomes matrix in `agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 71 prep.
+
+### Build
+
+`build/agnos` 414,544 B (1.30.10) → **416,496 B** (1.30.11, +1,952 B). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin **5.11.64**. gnoboot **0.2.0** unchanged (Path-C handoff ABI stable, no boot_info field added — gnoboot already captured `pf` at +0x5C; kernel just started reading it).
+
+### Changed
+
+- `VERSION`: 1.30.10 → 1.30.11
+- `kernel/arch/x86_64/fb_console.cyr`:
+  - new `fb_pf()` getter (reads `boot_info+0x5C`)
+  - new `fb_verify_wc()` function (one-shot PAT readback + decode + serial log)
+  - `fb_console_init` now logs the boot-time geometry diagnostic + guards on `pf > 1` (skip FB, serial-only) + DELETED the obsolete `FB_CONSOLE_Y0/FB_FG/FB_BG` re-assignment block (cyrius 5.11.64 made it dead code)
+- `kernel/core/vmm.cyr`:
+  - new `vmm_get_pde_2mb(phys)` accessor (walks PML4 → PDPT → PD; covers < 1 GB inline, 1–512 GB, ≥ 512 GB lazy-PML4 paths)
+  - `vmm_remap_wc_2mb` now idempotent for already-shattered PDPT entries — fixes the multi-chunk WC-leak
+- `kernel/core/main.cyr`: post-`pmm_init` WC remap retry + `fb_verify_wc()` call
+- `kernel/version.cyr`: kernel banner, shell banner, `_AGNOS_VERSION` bumped to 1.30.11
+- **NEW** `agnosticos/scripts/qemu-fb-smoke.sh`: headless Path-C boot smoke harness with EXPECT-grep + timeout
+
+### Out of scope
+
+- **PixelInformation bitmask decoder** for `pf == 2` cases. gnoboot doesn't capture the 16-byte bitmask (boot_info ABI would have to grow); kernel currently rejects pf==2 outright. Implement on iron evidence — if Attempt 71 reports pf==2 under quiet-boot ON, then 1.30.12 (or later) adds gnoboot capture + kernel decoder.
+- **`vmm_remap_uc_2mb` idempotency** — symmetric to the WC fix, but UC is called once per BAR in current usage. Defensive update queued for next vmm touch.
+- **Shadow buffer + single-burst FB push** → 1.31.x triage as before (pristine refresh; gated on PMM contig allocator).
+- **Multi-device USB / xHCI** → still queued for triage after this cycle.
+- **Glyph-to-font extraction** → 1.30.12 scope.
+
 ## [1.30.10] — 2026-05-19 (Framebuffer refresh — WC + pitch-aware + u64 block-copy; iron Attempts 69→70, CRT-class refresh PASS)
 
 **Post-MVP open. Speed closed out.** First cut after the closed-beta MVP gate (1.30.9, Iron Attempt 68). Scoped to framebuffer refresh quality — Attempt 68's bench scroll showed pixel-pattern noise in the lower FB region, traced to the kernel mapping the GOP framebuffer as WB-cached (default `vmm_map(..., 0x83)` selects PAT entry 0 = WB under firmware-default PAT MSR; confirmed Attempt 43). WB on a framebuffer means CPU pixel writes batch through L1/L2 and reach the display controller on cache evictions — visible as the observed artifact. Landed as two iron burns under one version: Attempt 69 (WC + pitch-aware → PARTIAL, cache artifacts gone but scroll still heavy) and Attempt 70 (u64 block-copy → PASS, CRT-class refresh, tearing below typical-user threshold).

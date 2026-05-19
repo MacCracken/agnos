@@ -58,20 +58,52 @@ fn fset(ch, val) {
 }
 
 fn fb_console_init() {
-    # Defensive re-assignment of layout/color gvars. The top-level
-    # `var FB_CONSOLE_Y0 = 0;` (and FB_FG / FB_BG) declarations below
-    # should initialize via cyrius v5.7.19 gvar-init phase, but on
-    # iron-attempt-29 (2026-05-15) the non-zero initializers were observed
-    # NOT honored at runtime — values read back as 0, causing fb_putc to
-    # paint solid black-on-black (FG=BG=0, invisible). Zero-init vars
-    # (fb_cur_x, fb_cur_y, fb_console_ready) were unaffected because BSS
-    # defaults to zero — no init code needed. Surface as cyrius issue
-    # separately. (FB_CONSOLE_Y0 happens to want 0 now, but assign
-    # explicitly to keep the defensive pattern consistent for the other
-    # two.)
-    FB_CONSOLE_Y0 = 0;
-    FB_FG = 0x00FFFFFF;
-    FB_BG = 0x00000000;
+    # Boot-time diagnostic: log the GOP geometry that gnoboot captured
+    # from firmware. Three purposes:
+    #   1. Ground truth on mode parameters when the FB itself may be
+    #      garbled (post-mortem from serial / read-boot-log captures).
+    #   2. Confirms boot_info pointer is alive and fb_present is set.
+    #   3. First diagnostic for the VGA-vs-HDMI / quiet-boot-ON
+    #      GOP-rendering bug — Attempt 33/34 (2026-05-16) observed
+    #      garbled glyphs under HDMI-spec mode (quiet-boot ON), clean
+    #      glyphs under VGA-spec (quiet-boot OFF). The pf / pitch /
+    #      geometry reported here is what tells us why.
+    var diag_phys  = fb_fb_phys();
+    var diag_pf    = fb_pf();
+    var diag_w     = fb_width();
+    var diag_h     = fb_height();
+    var diag_pitch = fb_pitch();
+    serial_print("fb: phys=", 9);
+    kfmt_hex0x(diag_phys);
+    serial_print(" pf=", 4);
+    kfmt_int(diag_pf);
+    serial_print(" w=", 3);
+    kfmt_int(diag_w);
+    serial_print(" h=", 3);
+    kfmt_int(diag_h);
+    serial_print(" pitch=", 7);
+    kfmt_int(diag_pitch);
+    serial_println("", 0);
+
+    # PixelFormat guard. EFI_GRAPHICS_PIXEL_FORMAT values:
+    #   0 = PixelRedGreenBlueReserved8BitPerColor (RGBX 32bpp)
+    #   1 = PixelBlueGreenRedReserved8BitPerColor (BGRX 32bpp) ← what
+    #       the kernel's monochrome glyph paint implicitly assumes
+    #   2 = PixelBitMask (custom layout via PixelInformation bitmask)
+    #   3 = PixelBltOnly (no direct framebuffer — Blt() service only)
+    # White (0x00FFFFFF) and black (0x00000000) are symmetric in those
+    # channels under both RGBX and BGRX — so pf == 0 is safe for the
+    # current text console too. PixelBitMask / BltOnly are NOT safe:
+    # bit layout is firmware-defined, or direct writes are silently
+    # ignored. Refuse to paint, fall to serial-only console with a
+    # warning. Linux ref: drivers/video/fbdev/efifb.c rejects modes
+    # outside the two 8-bit-per-channel-with-reserved formats.
+    if (diag_pf > 1) {
+        serial_println("fb: WARN unsupported PixelFormat, FB paint disabled, serial-only console", 73);
+        fb_console_ready = 0;
+        return 0;
+    }
+
     # Full-screen clear before any glyphs render. Gnoboot calls
     # `efi_clear(st)` pre-banner and then prints its handoff line, so
     # row 0 of the framebuffer carries firmware-font text on entry; the
@@ -207,6 +239,42 @@ fn fb_console_init() {
     fb_cur_x = 0;
     fb_cur_y = 0;
     fb_console_ready = 1;
+    # PAT-state confirmation is deferred to fb_verify_wc(), called from
+    # kernel/core/main.cyr AFTER pmm_init returns. The early WC remap
+    # at main.cyr line 17 takes effect immediately for FBs in the 32-bit
+    # hole (iron archaemenid <1GB path = inline PDE rewrite at 0x3000)
+    # but needs pmm_alloc for the >=1GB path (QEMU q35 places the FB BAR
+    # at 0x80000000 = 2GB). pmm isn't ready at line 17. Verifying WC
+    # before the post-pmm_init retry would false-WARN on q35 and on any
+    # future iron target with a high FB BAR. Single authoritative line
+    # emitted post-retry.
+    return 0;
+}
+
+# Verify the framebuffer is WC-mapped by reading back the controlling
+# cache-mapping leaf entry (2MB PDE or 1GB PDPT entry, depending on
+# whether vmm_remap_wc_2mb shattered the page) and decoding its PAT
+# bits against the firmware-default PAT MSR. Called from
+# kernel/core/main.cyr after pmm_init + the post-pmm WC remap retry.
+# Logs one line: either `fb: WC verified (PAT entry 1)` (the green
+# gate) or a WARN with the actual PAT entry index and the raw PDE
+# bytes so iron post-mortem can tell silent-WC-drop from accessor-
+# coverage-miss. Linux ref: arch/x86/mm/pat.c.
+fn fb_verify_wc() {
+    var phys = fb_fb_phys();
+    if (phys == 0) { return 0; }
+    var pde = vmm_get_pde_2mb(phys);
+    # PAT-index = PWT(bit3) | PCD(bit4)<<1 | PAT-page(bit12)<<2
+    var pat_idx = ((pde >> 3) & 1) | (((pde >> 4) & 1) << 1) | (((pde >> 12) & 1) << 2);
+    if (pat_idx == 1) {
+        serial_println("fb: WC verified (PAT entry 1)", 29);
+    } else {
+        serial_print("fb: WARN expected PAT entry 1 (WC), got entry ", 47);
+        kfmt_int(pat_idx);
+        serial_print(" PDE=", 5);
+        kfmt_hex0x(pde);
+        serial_println("", 0);
+    }
     return 0;
 }
 
@@ -232,6 +300,17 @@ fn fb_height() {
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
     return load32(bi + 0x58);
+}
+# EFI_GRAPHICS_PIXEL_FORMAT enum value (0=RGBX 1=BGRX 2=BitMask 3=BltOnly).
+# Stored by gnoboot at boot_info + 0x5C; see gnoboot/src/main.cyr step 10c.
+# Returns 0 (PixelRedGreenBlueReserved8BitPerColor — also safe for the
+# monochrome paint) if boot_info is unavailable, so callers reading
+# this without a boot_info pointer don't false-positive into the
+# unsupported branch.
+fn fb_pf() {
+    var bi = load64(&boot_info_ptr);
+    if (bi == 0) { return 0; }
+    return load32(bi + 0x5C);
 }
 
 # Console origin. v1.30.1: boot_shim canary stripe at y=0..7 was deleted

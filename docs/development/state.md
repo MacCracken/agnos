@@ -16,7 +16,7 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.30.10** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.30.11** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **5.11.59** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-19 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-15 (archaemenid NUC AMD — boot-to-shell MVP cleared the kernel-init layer; xHCI Enable Slot CCE remains the cmd-path gate as of 2026-05-18 — see `iron-nuc-zen-log` § Attempts 56-62) | NUC AMD Attempts 11 / 29 / 55 |

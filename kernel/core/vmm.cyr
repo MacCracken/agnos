@@ -147,6 +147,25 @@ fn vmm_remap_wc_2mb(phys) {
             pdpt_base = pml4e & 0xFFFFFFFFFFFFF000;
         }
     }
+    # Idempotency: if the PDPT entry is already shattered (Present + not
+    # a 1GB huge page), reuse the existing PD and just edit the target
+    # PDE. Without this, vmm_remap_wc_range's chunk-by-chunk loop would
+    # re-shatter and overwrite earlier chunks' WC bits every call —
+    # leaking N-1 PDs and leaving only the final chunk actually WC.
+    # Surfaced 2026-05-19 by the 1.30.11 fb_verify_wc readback under
+    # QEMU q35 (FB at 0x80000000, 4×2MB chunks, only the last chunk
+    # ended up WC). The < 1GB path above is naturally idempotent
+    # (rewriting PDE@0x3000 with the same flags), so this branch only
+    # matters for high-BAR FBs.
+    var existing = load64(pdpt_base + pdpt_idx * 8);
+    if ((existing & 1) != 0 && (existing & 0x80) == 0) {
+        var pd_base = existing & 0xFFFFFFFFFFFFF000;
+        var pd_idx2 = (phys >> 21) & 0x1FF;
+        store64(pd_base + pd_idx2 * 8, chunk | 0x8B);
+        var flush_v = phys;
+        asm { invlpg [rax]; }
+        return 1;
+    }
     var new_pd = pmm_alloc();
     if (new_pd == 0) { return 0; }
     var pdpt_va_base = pml4_idx * 0x8000000000 + pdpt_idx * 0x40000000;
@@ -190,6 +209,49 @@ fn vmm_unmap(virt) {
     var flush = virt;
     asm { invlpg [rax]; }
     return 0;
+}
+
+# Read back the controlling cache-mapping PTE for a physical address.
+# Used to verify a prior vmm_remap_wc_2mb / vmm_remap_uc_2mb actually
+# took (PAT-index selection). Returns the leaf entry whose PWT/PCD/PAT
+# bits determine the cache type for the page — that's a 2MB PDE in the
+# common shattered case, or a 1GB PDPT entry if the PDPT slot is still
+# a huge page (boot-shim default for PML4[0] PDPT[0..3] pre-shatter).
+# Bit positions for PWT (bit 3) / PCD (bit 4) / PAT-page (bit 12) are
+# identical for 1GB and 2MB pages, so callers compute pat_idx with the
+# same math regardless of which leaf level we hit.
+#
+# Returns 0 if the page isn't mapped (caller treats as "couldn't read
+# back" — distinguishable from a valid PDE which always has the Present
+# bit set, so the caller can also test bit 0).
+#
+# Coverage:
+#   phys <    1 GB: PD@0x3000 direct (boot-shim's initial PD).
+#   phys 1 GB..512 GB: PML4[0]'s PDPT@0x2000, walk to PD if shattered,
+#                      or return the PDPT entry directly if still a 1GB page.
+#   phys ≥ 512 GB: PML4[N>0] — walk PML4 first, fail if entry absent.
+#                  (Mirrors vmm_remap_wc_2mb's lazy-allocation path.)
+fn vmm_get_pde_2mb(phys) {
+    if (phys < 0x40000000) {
+        var pd_idx_lo = (phys >> 21) & 0x1FF;
+        return load64(0x3000 + pd_idx_lo * 8);
+    }
+    var pml4_idx = (phys >> 39) & 0x1FF;
+    var pdpt_idx = (phys >> 30) & 0x1FF;
+    var pd_idx   = (phys >> 21) & 0x1FF;
+    var pdpt_base = 0x2000;
+    if (pml4_idx > 0) {
+        var pml4e = load64(0x1000 + pml4_idx * 8);
+        if ((pml4e & 1) == 0) { return 0; }
+        pdpt_base = pml4e & 0xFFFFFFFFFFFFF000;
+    }
+    var pdpte = load64(pdpt_base + pdpt_idx * 8);
+    if ((pdpte & 1) == 0) { return 0; }
+    # PS bit (7) set => 1 GB huge page. Its own PWT/PCD/PAT bits govern.
+    if ((pdpte & 0x80) != 0) { return pdpte; }
+    # Otherwise it points to a PD; walk one more level.
+    var pd_base = pdpte & 0xFFFFFFFFFFFFF000;
+    return load64(pd_base + pd_idx * 8);
 }
 
 fn vmm_is_mapped(virt) {

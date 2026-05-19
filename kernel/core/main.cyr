@@ -104,6 +104,20 @@ kprint(" free / ", 8);
 kprint_num(pmm_total);
 kprintln(" pages", 6);
 
+# 1.30.11 hardening: re-attempt WC remap of the FB, then verify WC took.
+# The line-17 vmm_remap_wc_range above succeeds for FBs in the 32-bit
+# hole (< 1 GB — inline PDE rewrite at 0x3000, no allocation needed)
+# but silently fails for FBs at phys >= 1 GB because vmm_remap_wc_2mb's
+# high-mem path needs pmm_alloc for a fresh PD, and pmm wasn't ready
+# that early in boot. Now that pmm_init has returned, retry: no-op on
+# iron archaemenid (FB BAR sits in the 32-bit hole, PDE already 0x8B
+# from the line-17 call), succeeds on QEMU q35 (FB BAR at 0x80000000)
+# and any future target placing the FB BAR above 1 GB. FB briefly
+# paints WB-cached in the high-BAR case until this retry — benign,
+# display reads from physical memory regardless of cache type.
+vmm_remap_wc_range(fb_fb_phys(), fb_pitch() * fb_height());
+fb_verify_wc();
+
 # === CMOS kernel checkpoint 9 (physical memory manager up) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x09; 0xE6; 0x71; }
 
