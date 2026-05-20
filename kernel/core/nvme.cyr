@@ -569,14 +569,15 @@ fn nvme_identify_ns(nsid) {
 var NVME_IO_Q_ENTRIES = 64;        # 64-entry I/O queues (same as admin)
 var NVME_IO_QID       = 1;         # single I/O queue, qid=1
 
-var nvme_iosq_phys    = 0;
-var nvme_iocq_phys    = 0;
-var nvme_read_scratch = 0;         # 4 KB DMA buffer for Phase 3 demo read
-var nvme_iosq_tail    = 0;
-var nvme_iocq_head    = 0;
-var nvme_iocq_phase   = 1;
-var nvme_io_cmd_id    = 0;
-var nvme_io_ready     = 0;
+var nvme_iosq_phys     = 0;
+var nvme_iocq_phys     = 0;
+var nvme_read_scratch  = 0;         # 4 KB DMA buffer for read/write demo (Phase 3+4)
+var nvme_prp_list_phys = 0;         # 4 KB PRP list page (Phase 4 multi-page transfers)
+var nvme_iosq_tail     = 0;
+var nvme_iocq_head     = 0;
+var nvme_iocq_phase    = 1;
+var nvme_io_cmd_id     = 0;
+var nvme_io_ready      = 0;
 
 # I/O qid=1 doorbells: SQ tail at (2*1)*(4<<DSTRD) past 0x1000, CQ
 # head at (2*1 + 1)*(4<<DSTRD) past 0x1000. With DSTRD=0 (4-byte
@@ -587,26 +588,36 @@ fn nvme_db_io_cq() { return nvme_mmio_base + 0x1000 + (3 * (4 << nvme_dstrd)); }
 fn nvme_io_queue_init() {
     if (nvme_admin_ready == 0) { return 0; }
 
-    # 1. Allocate I/O SQ + I/O CQ + read scratch (3 × 4 KB pages).
+    # 1. Allocate I/O SQ + I/O CQ + R/W scratch + PRP list page
+    #    (4 × 4 KB pages). PRP list page sized at one 4 KB page = up to
+    #    512 PRP entries = up to 2 MB transfer with 4 KB host pages,
+    #    which covers MDTS for every reasonable NVMe controller (QEMU
+    #    reports MDTS=7 → 512 KB max).
     var sq = pmm_alloc();
     var cq = pmm_alloc();
     var sc = pmm_alloc();
+    var pl = pmm_alloc();
     if (sq == 0) { kprintln("nvme: IOSQ alloc failed (PMM OOM)", 33); return 0; }
     if (cq == 0) { kprintln("nvme: IOCQ alloc failed (PMM OOM)", 33); return 0; }
     if (sc == 0) { kprintln("nvme: IO scratch alloc failed (PMM OOM)", 39); return 0; }
+    if (pl == 0) { kprintln("nvme: PRP list alloc failed (PMM OOM)", 37); return 0; }
     if (vmm_is_mapped(sq) == 0) { vmm_map(sq, sq, 0x83); }
     if (vmm_is_mapped(cq) == 0) { vmm_map(cq, cq, 0x83); }
     if (vmm_is_mapped(sc) == 0) { vmm_map(sc, sc, 0x83); }
+    if (vmm_is_mapped(pl) == 0) { vmm_map(pl, pl, 0x83); }
     iommu_register_dma(sq);
     iommu_register_dma(cq);
     iommu_register_dma(sc);
+    iommu_register_dma(pl);
     nvme_zero_page(sq);
     nvme_zero_page(cq);
     nvme_zero_page(sc);
+    nvme_zero_page(pl);
 
-    nvme_iosq_phys    = sq;
-    nvme_iocq_phys    = cq;
-    nvme_read_scratch = sc;
+    nvme_iosq_phys     = sq;
+    nvme_iocq_phys     = cq;
+    nvme_read_scratch  = sc;
+    nvme_prp_list_phys = pl;
 
     # 2. Create I/O CQ first (must precede SQ create — see header note).
     #    NVMe 1.4 §5.3:
@@ -713,27 +724,51 @@ fn nvme_io_poll(expected_cid) {
     return 0 - 1;
 }
 
-# Single-LBA blocking read. Reads `lba` (sector index) of namespace 1
-# into `buf` (must be page-aligned + size >= LBA bytes). Caller owns
-# the buffer + IOMMU registration. Returns 1 on success, 0 on failure.
-# Phase 4 will add multi-LBA + PRP-list pathways; this is the simplest
-# possible Read demonstration.
+# Internal R/W dispatch — builds PRP1 / PRP2 / PRP list per NVMe 1.4
+# §4.3 transfer rules, submits the I/O SQE, polls for completion.
+# Used by both nvme_read_lba/nvme_write_lba (single LBA) and the
+# multi-LBA nvme_read_sectors/nvme_write_sectors. Caller guarantees
+# `buf_phys` is host-page-aligned and the surrounding buffer is
+# physically contiguous for `byte_count` bytes.
 #
-# NVMe Read SQE layout (NVMe 1.4 §6.13):
-#   DW0     opcode 0x02 | CID
-#   DW1     NSID
-#   DW6-7   PRP1
-#   DW8-9   PRP2 (0 for single-page reads)
-#   DW10    SLBA [31:0]
-#   DW11    SLBA [63:32]
-#   DW12    NLB [15:0] (zero-based) | DTYPE [7:4] | PRINFO/etc. (0 here)
-fn nvme_read_lba(lba, buf) {
-    if (nvme_io_ready == 0) { return 0; }
+# PRP layout rules (NVMe 1.4 §4.3):
+#   - PRP1 covers the first page (up to 4 KB at offset 0 here)
+#   - 1 page:   PRP1 only, PRP2 = 0
+#   - 2 pages:  PRP1 + PRP2 = second page address
+#   - >2 pages: PRP1 + PRP2 = PRP list page; list entries are page 1,
+#               page 2, ... (page 0 is in PRP1). Each list entry is a
+#               64-bit physical address; the page boundary at 4 KB
+#               gives 512 entries → up to 2 MB total transfer.
+fn nvme_rw_internal(opcode, lba, nlb_zb, buf_phys, byte_count) {
+    var page_size    = 4096;
+    var pages_needed = (byte_count + page_size - 1) / page_size;
+    var prp1 = buf_phys;
+    var prp2 = 0;
+    if (pages_needed == 2) {
+        prp2 = buf_phys + page_size;
+    }
+    if (pages_needed > 2) {
+        # Build the PRP list: list[i] = buf_phys + (i + 1) * page_size
+        # for i in 0..pages_needed-2 (one entry per page beyond PRP1).
+        # Zeroing the rest of the list page is unnecessary — controller
+        # only consumes the count of entries dictated by byte_count.
+        var entries = pages_needed - 1;
+        for (var i = 0; i < entries; i = i + 1) {
+            store64(nvme_prp_list_phys + i * 8, buf_phys + (i + 1) * page_size);
+        }
+        prp2 = nvme_prp_list_phys;
+    }
     var slba_lo = lba & 0xFFFFFFFF;
     var slba_hi = (lba >> 32) & 0xFFFFFFFF;
-    var nlb_zb  = 0;   # 0-based → 1 LBA
-    var cid = nvme_io_submit(0x02, 1, buf, 0, slba_lo, slba_hi, nlb_zb);
-    var st  = nvme_io_poll(cid);
+    var cid = nvme_io_submit(opcode, 1, prp1, prp2, slba_lo, slba_hi, nlb_zb);
+    return nvme_io_poll(cid);
+}
+
+# Single-LBA blocking read. `buf` must be host-page-aligned. Returns
+# 1 on success, 0 on failure (with diagnostic).
+fn nvme_read_lba(lba, buf) {
+    if (nvme_io_ready == 0) { return 0; }
+    var st = nvme_rw_internal(0x02, lba, 0, buf, nvme_ns1_lba_bytes);
     if (st != 0) {
         kprint("nvme: read LBA ", 15);
         kprint_num(lba);
@@ -745,22 +780,144 @@ fn nvme_read_lba(lba, buf) {
     return 1;
 }
 
-# Boot-time validation read — issues `nvme_read_lba(0, scratch)` and
-# prints the first 8 bytes as decimal so any pattern pre-written to
-# the backing file is visible in the serial transcript. Removed in
-# Phase 5 once block_dev dispatch wraps the read path.
-fn nvme_first_read_demo() {
+# Single-LBA blocking write. Mirrors nvme_read_lba; opcode 0x01.
+fn nvme_write_lba(lba, buf) {
     if (nvme_io_ready == 0) { return 0; }
-    if (nvme_read_lba(0, nvme_read_scratch) == 0) { return 0; }
+    var st = nvme_rw_internal(0x01, lba, 0, buf, nvme_ns1_lba_bytes);
+    if (st != 0) {
+        kprint("nvme: write LBA ", 16);
+        kprint_num(lba);
+        kprint(" failed, status=", 16);
+        kprint_num(st);
+        kprintln("", 0);
+        return 0;
+    }
+    return 1;
+}
 
+# Multi-LBA blocking read. `count` LBAs starting at `lba` into a
+# physically-contiguous buffer of size count * LBA_bytes (caller's
+# responsibility). NLB is zero-based per spec (count - 1). Returns 1
+# on success, 0 on failure.
+fn nvme_read_sectors(lba, count, buf) {
+    if (nvme_io_ready == 0) { return 0; }
+    if (count == 0) { return 0; }
+    var bytes = count * nvme_ns1_lba_bytes;
+    var st = nvme_rw_internal(0x02, lba, count - 1, buf, bytes);
+    if (st != 0) {
+        kprint("nvme: read_sectors LBA ", 23);
+        kprint_num(lba);
+        kprint(" count=", 7);
+        kprint_num(count);
+        kprint(" failed, status=", 16);
+        kprint_num(st);
+        kprintln("", 0);
+        return 0;
+    }
+    return 1;
+}
+
+# Multi-LBA blocking write. Mirrors nvme_read_sectors; opcode 0x01.
+fn nvme_write_sectors(lba, count, buf) {
+    if (nvme_io_ready == 0) { return 0; }
+    if (count == 0) { return 0; }
+    var bytes = count * nvme_ns1_lba_bytes;
+    var st = nvme_rw_internal(0x01, lba, count - 1, buf, bytes);
+    if (st != 0) {
+        kprint("nvme: write_sectors LBA ", 24);
+        kprint_num(lba);
+        kprint(" count=", 7);
+        kprint_num(count);
+        kprint(" failed, status=", 16);
+        kprint_num(st);
+        kprintln("", 0);
+        return 0;
+    }
+    return 1;
+}
+
+# Boot-time R/W validation — three round-trips against namespace 1:
+#   1. LBA 0 read (Phase 3 carry-forward): prints first 8 bytes of
+#      whatever the backing file holds.
+#   2. LBA 5 write-then-read: 8-byte pattern "CYRIUS!!" (bytes 67 89
+#      82 73 85 83 33 33). Demonstrates the write path landed and
+#      the data is durable across a separate read.
+#   3. LBA 20-27 multi-LBA write-then-read: 4 KB ramp pattern
+#      (byte[i] = i & 0xFF), 8 LBAs at 512 B/LBA = one page. Exercises
+#      the PRP1-only multi-LBA path with nlb_zb = 7.
+#
+# PRP2 and PRP-list paths are coded but not boot-demo'd — first
+# real exercise lands in Phase 5 when block_dev callers request
+# larger transfers. Removed in Phase 5 once block_dev dispatch wraps
+# the R/W path and these become dead demonstration code.
+fn nvme_rw_demo() {
+    if (nvme_io_ready == 0) { return 0; }
+
+    # --- 1. LBA 0 read (Phase 3 demo carried forward) ---
+    if (nvme_read_lba(0, nvme_read_scratch) == 0) { return 0; }
     kprint("nvme: ns1 LBA0 first 8 bytes:", 29);
     for (var i = 0; i < 8; i = i + 1) {
         kprint(" ", 1);
         kprint_num(load8(nvme_read_scratch + i));
     }
     kprintln("", 0);
-
-    # CMOS kcp = 0x45 (first NVMe read completed).
+    # CMOS kcp = 0x45 (first NVMe read completed — Phase 3 carry-forward)
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x45; 0xE6; 0x71; }
+
+    # --- 2. LBA 5 write-then-read round-trip ---
+    nvme_zero_page(nvme_read_scratch);
+    # Pattern "CYRIUS!!" = bytes 67, 89, 82, 73, 85, 83, 33, 33.
+    store8(nvme_read_scratch + 0, 67);
+    store8(nvme_read_scratch + 1, 89);
+    store8(nvme_read_scratch + 2, 82);
+    store8(nvme_read_scratch + 3, 73);
+    store8(nvme_read_scratch + 4, 85);
+    store8(nvme_read_scratch + 5, 83);
+    store8(nvme_read_scratch + 6, 33);
+    store8(nvme_read_scratch + 7, 33);
+    if (nvme_write_lba(5, nvme_read_scratch) == 0) { return 0; }
+    nvme_zero_page(nvme_read_scratch);
+    if (nvme_read_lba(5, nvme_read_scratch) == 0) { return 0; }
+    var single_ok = 1;
+    if (load8(nvme_read_scratch + 0) != 67) { single_ok = 0; }
+    if (load8(nvme_read_scratch + 1) != 89) { single_ok = 0; }
+    if (load8(nvme_read_scratch + 2) != 82) { single_ok = 0; }
+    if (load8(nvme_read_scratch + 3) != 73) { single_ok = 0; }
+    if (load8(nvme_read_scratch + 4) != 85) { single_ok = 0; }
+    if (load8(nvme_read_scratch + 5) != 83) { single_ok = 0; }
+    if (load8(nvme_read_scratch + 6) != 33) { single_ok = 0; }
+    if (load8(nvme_read_scratch + 7) != 33) { single_ok = 0; }
+    if (single_ok == 1) {
+        kprintln("nvme: LBA5 single-LBA write-then-read PASS", 42);
+        # CMOS kcp = 0x46 (single-LBA write round-trip)
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x46; 0xE6; 0x71; }
+    }
+    if (single_ok == 0) {
+        kprintln("nvme: LBA5 single-LBA write-then-read FAIL", 42);
+    }
+
+    # --- 3. LBA 20-27 multi-LBA (8 LBAs = 4 KB, PRP1-only) ---
+    # Fill the 4 KB scratch with a ramp: byte[i] = i & 0xFF.
+    for (var j = 0; j < 4096; j = j + 1) {
+        store8(nvme_read_scratch + j, j & 0xFF);
+    }
+    if (nvme_write_sectors(20, 8, nvme_read_scratch) == 0) { return 0; }
+    nvme_zero_page(nvme_read_scratch);
+    if (nvme_read_sectors(20, 8, nvme_read_scratch) == 0) { return 0; }
+    var multi_ok = 1;
+    for (var k = 0; k < 4096; k = k + 1) {
+        if (load8(nvme_read_scratch + k) != (k & 0xFF)) {
+            multi_ok = 0;
+        }
+    }
+    if (multi_ok == 1) {
+        kprintln("nvme: LBA20-27 multi-LBA(8) round-trip PASS", 43);
+        # CMOS kcp = 0x47 (multi-LBA round-trip)
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x47; 0xE6; 0x71; }
+    }
+    if (multi_ok == 0) {
+        kprintln("nvme: LBA20-27 multi-LBA(8) round-trip FAIL", 43);
+    }
+
     return 1;
 }

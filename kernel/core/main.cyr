@@ -293,12 +293,19 @@ if (nvme_admin_init() == 1) {
     nvme_identify_ctrl();
     nvme_identify_ns(1);
     # NVMe Phase 3 — Create I/O CQ + Create I/O SQ via admin commands
-    # (qid=1, 64 entries each, polling-only — MSI-X is Phase 5), then
-    # issue a blocking NVMe Read of LBA 0 from namespace 1 as proof
-    # that the I/O path round-trips. CMOS checkpoints 0x44 (I/O queue
-    # ready) and 0x45 (first read complete) stamp on success.
+    # (qid=1, 64 entries each, polling-only — MSI-X is Phase 5). CMOS
+    # checkpoint 0x44 stamps when both creates land.
+    #
+    # NVMe Phase 4 — adds the write path + multi-LBA + PRP2 + PRP list
+    # (coded; PRP2/list not boot-demo'd until block_dev callers in
+    # Phase 5 ask for larger transfers). The R/W demo here exercises
+    # three round-trips: LBA 0 read (Phase 3 carry-forward, kcp 0x45),
+    # LBA 5 single-LBA write-then-read (kcp 0x46), LBA 20-27 multi-LBA
+    # (8 LBAs = one page, PRP1-only path, kcp 0x47). PASS/FAIL prints
+    # to serial; mismatches don't halt — the visual receipt is the
+    # post-mortem signal.
     if (nvme_io_queue_init() == 1) {
-        nvme_first_read_demo();
+        nvme_rw_demo();
     }
 }
 vfs_init();

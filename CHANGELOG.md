@@ -97,6 +97,47 @@ Bytes `65 71 78 79 83 33 10 0` decimal = `A G N O S ! \n \0` ASCII — byte-exac
 
 **Out of scope:** Iron burn — the QEMU receipt is byte-exact, so the polling-only single-LBA path is well-modeled. Iron validation slots in alongside Phase 4 (write path) or Phase 5 (block_dev dispatch + MSI-X) once the write-then-read-back round-trip is in place.
 
+### NVMe Phase 4 (WRITE + multi-LBA + PRP1 / PRP2 / PRP-list transfer dispatch)
+
+Fourth engineering cut. Adds ~200 LOC to `kernel/core/nvme.cyr`. The driver now reads *and* writes — disk persistence is real, and the host can `dd` the backing file post-boot to confirm the kernel's bytes landed where they were sent. NVMe Write (opcode 0x01) is structurally identical to NVMe Read (opcode 0x02) per NVMe 1.4 §6.15, so the bigger work was the transfer-dispatch substrate (PRP1 / PRP2 / PRP list) shared by both paths.
+
+**What it does:**
+- **`nvme_rw_internal(opcode, lba, nlb_zb, buf_phys, byte_count)`** — internal transfer-dispatch helper. Computes pages-needed from byte_count. PRP layout per NVMe 1.4 §4.3:
+    - 1 page: PRP1 only, PRP2 = 0
+    - 2 pages: PRP1 + PRP2 = `buf_phys + 4096`
+    - >2 pages: PRP1 + PRP2 = PRP list page (allocated once at `nvme_io_queue_init`); list entries are `buf_phys + (i+1)*4096` for i in 0..pages-2. One 4 KB list page = 512 entries = up to 2 MB total transfer with 4 KB host pages, comfortably above QEMU's MDTS=7 (512 KB).
+- **`nvme_read_lba(lba, buf)` / `nvme_write_lba(lba, buf)`** — single-LBA, mirror each other; both delegate to `nvme_rw_internal` with `nlb_zb=0` and `byte_count = ns1_lba_bytes`.
+- **`nvme_read_sectors(lba, count, buf)` / `nvme_write_sectors(lba, count, buf)`** — multi-LBA, count expressed in LBAs (1-based; the spec NLB field is zero-based and the wrapper handles the off-by-one).
+- **`nvme_io_queue_init` extended** to allocate a 4th DMA page (PRP list scratch) alongside SQ + CQ + R/W scratch. All four pages registered with `iommu_register_dma` per the S10 contract.
+- **`nvme_rw_demo` replaces `nvme_first_read_demo`** — three round-trips: LBA 0 read (Phase 3 carry-forward), LBA 5 single-LBA write-then-read with pattern `CYRIUS!!`, LBA 20-27 multi-LBA(8) write-then-read with a 4 KB ramp (`byte[i] = i & 0xFF`). PASS / FAIL prints to serial; mismatches don't halt.
+
+**What it does NOT do:** MSI-X IRQ-driven completion, block_dev dispatch abstraction. PRP2 and PRP-list paths are **coded but not boot-demo'd** — the boot demo exercises the PRP1-only path twice (single-LBA + 8-LBA-in-one-page); first real exercise of PRP2 / PRP-list lands in Phase 5 when block_dev callers request larger transfers.
+
+**CMOS checkpoints:** `kcp=0x45` (LBA 0 read, Phase 3 carry), `kcp=0x46` (single-LBA write round-trip), `kcp=0x47` (multi-LBA round-trip).
+
+**QEMU validation:**
+
+```
+nvme: ns1 LBA0 first 8 bytes: 65 71 78 79 83 33 10 0
+nvme: LBA5 single-LBA write-then-read PASS
+nvme: LBA20-27 multi-LBA(8) round-trip PASS
+```
+
+**Host-side disk persistence verification** (the receipt that proves bytes left the kernel, traveled the NVMe path, and landed on the backing file):
+
+```
+$ dd if=nvme0.img bs=512 count=1 skip=5 | xxd -l 8
+00000000: 4359 5249 5553 2121                      CYRIUS!!
+$ dd if=nvme0.img bs=512 count=1 skip=20 | xxd -l 16
+00000000: 0001 0203 0405 0607 0809 0a0b 0c0d 0e0f  ................
+```
+
+LBA 5 holds the `CYRIUS!!` pattern written by `nvme_write_lba`. LBA 20-27 holds 4096 bytes of the ramp pattern written by `nvme_write_sectors(20, 8, scratch)`. NLB=7 was honored across all 8 LBAs. No CID mismatches; no poll timeouts; phase-tag tracking correct on both Read and Write paths through the same I/O CQ.
+
+**Build:** `build/agnos` 434,560 B (Phase 3) → **438,416 B** (+3,856 B for Phase 4). Multiboot2 ELF64 entry `0x1000a8` preserved. Net since 1.31.0 baseline: +16,504 B for the full Phase 1-4 driver (~860 LOC of nvme.cyr).
+
+**Out of scope:** Iron burn — write path is QEMU-validated with disk persistence proof. PRP-list iron exercise comes via Phase 5's block_dev callers. First iron burn opportunity is after Phase 5 lands MSI-X + block_dev so the driver can be plugged into the existing VFS / FAT path that virtio_blk currently fronts.
+
 ## [1.31.0] — 2026-05-20 (Production build goes lean — KTEST + XHCI_VERBOSE compile gates; FB-absent guard; stale Attempt-N prose retired; `docs/development/build.md`)
 
 **1.30.x cycle closed; 1.31.x cycle opens with the production-default flip.** The 1.30.x sweep (1.30.0 → 1.30.12) cleared the FB-hardening + MVP-gate work on both BIOS paths (VGA-spec Attempt 68, Quiet Boot Attempt 76, true-font swap Attempt 77; Attempt 78 falsified the gnoboot SetMode-bounce lever, Attempt 79 Intel cross-check was structurally inconclusive). What landed there made every boot loud — KTEST self-test output + xhci developmental traces were unconditional because we needed them during the silent-absorb diagnostic arc. With the gate green, production boots should not carry diagnostic spam. 1.31.0 introduces source-side compile gates so the test paths and the verbose xhci trace ship out by default; opt back in via `KTEST=1` / `XHCI_VERBOSE=1` to the build script. Bundled: an FB-absent honesty guard the prior cycle's `fb_console_init` rewrite missed, a sweep of decayed Attempt-N references from `fb_console.cyr` comments, and a new `docs/development/build.md` that documents the gate matrix end-to-end. Cycle theme pivots from FB to **storage** — first 1.31.x engineering cuts target the NVMe block layer, not the framebuffer.
