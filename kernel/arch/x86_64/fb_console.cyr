@@ -144,33 +144,14 @@ fn fb_console_init() {
     cmos_ext_write(0x9E, diag_mmax & 0xFF);
     cmos_ext_write(0x9F, 0xFB);
 
-    # === Variable-MTRR WC install for UMA framebuffer ===
-    # On AMD APUs with iGPU + UMA stolen DRAM as framebuffer (archaemenid
-    # Beelink SER), the FB is system main memory the display controller
-    # reads from. CPU writes to that range must reach DRAM, not sit in
-    # WB cache lines the display controller can't snoop. We previously
-    # set PAT entry 1 = WC and remap the FB pages with PAT-WC bits — but
-    # the QEMU OVMF audit on 2026-05-19 confirmed MTRR=UC overrides PAT
-    # entirely (Intel SDM Table 11-7, AMD APM Vol 2 §7.7.5). Iron quiet-
-    # boot path lands the FB BAR under firmware MTRR coverage that flips
-    # the effective type to UC even with PAT-WC requested — visible as
-    # the Attempt-33 garbled-glyph signature (partial cache-evicted lines
-    # reaching DRAM, others stale, display reads inconsistent state).
-    #
-    # Fix: plant a variable MTRR with type=WC covering [fb_phys, fb_phys
-    # + size_pow2). Variable MTRRs win over MTRR_DEF_TYPE for their range
-    # (SDM §11.11.4). Linux equivalent: arch_phys_wc_add() → mtrr_add_page.
-    # No cache-disable dance — fb_console_init runs pre-IDT/pre-SMP, so
-    # the wbinvd bracket suffices for single-CPU coherency.
-    fb_mtrr_install_wc(fb_fb_phys(), fb_size_or_fallback());
-
-    # === MTRR + PCI-BAR audits (CMOS-stamped) ===
-    # Read-only diagnostic confirming the install above landed. Stamps
-    # land in RTC-alias slots on archaemenid (0x80-0x8F bank-2 aliases
-    # RTC time-of-day per read-boot-log.cyr:50-55) — visual outcome on
-    # iron is the authoritative signal, not the CMOS readback.
-    fb_audit_mtrr();
-    fb_audit_pci_bar();
+    # MTRR-WC install + MTRR/PCI audit calls removed 2026-05-20:
+    # Attempt 74 falsified the "MTRR=UC overrides PAT-WC" hypothesis
+    # (no visual change after WC install) and the wrmsr to MTRR
+    # PHYSBASE/PHYSMASK is the leading suspect for the new Quiet Boot
+    # lockup (AMD SYS_CFG_MSR MtrrLock → #GP on writes). True root
+    # cause was font-pixel-density at 2560x1440 — see fb_scale() below
+    # and the iron-nuc-zen-log § Attempt 74 result. Function bodies
+    # remain in this file for now; full cleanup follow-up.
 
     # PixelFormat guard. EFI_GRAPHICS_PIXEL_FORMAT values:
     #   0 = PixelRedGreenBlueReserved8BitPerColor (RGBX 32bpp)
@@ -673,17 +654,39 @@ var FB_CONSOLE_Y0 = 0;
 var FB_FG = 0x00FFFFFF;  # white
 var FB_BG = 0x00000000;  # black
 
-# Paint a solid-color 8x8 cell at (cell_x, abs_y_px). Used by scroll
-# bottom-row clear; not by glyph render (which interleaves FG/BG).
+# Glyph scale factor derived from display height. 8x8 CGA bitmap glyphs
+# are illegibly small on native HDMI modes (at 2560x1440 an 8-px-tall
+# row is 0.5% of screen height — text appears as horizontal stripes,
+# the Attempt-33 signature). Scale each font pixel into an SxS block at
+# render time so character cells are 8*S pixels per side. Picked from
+# height rather than width because text legibility tracks vertical pixel
+# count, not aspect ratio.
+#
+#   h ≤  900  → scale = 1   (8-px text, native CGA size; legacy / VGA)
+#   h ≤ 1200  → scale = 2   (16-px text, ~80 cols at 1920x1080)
+#   h ≤ 1800  → scale = 3   (24-px text, ~106 cols at 2560x1440)
+#   h >  1800 → scale = 4   (32-px text, ~120 cols at 3840x2160)
+fn fb_scale() {
+    var h = fb_height();
+    if (h <= 900)  { return 1; }
+    if (h <= 1200) { return 2; }
+    if (h <= 1800) { return 3; }
+    return 4;
+}
+
+# Paint a solid-color cell (8*scale × 8*scale) at (cell_x, abs_y_px).
+# Used by scroll bottom-row clear and backspace; not by glyph render
+# (which interleaves FG/BG per font bit).
 fn fb_fill_cell(cell_x, abs_y, color) {
     var fb = fb_fb_phys();
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var width = fb_width();
-    var x_px = cell_x * 8;
-    if (x_px + 8 > width) { return 0; }
-    for (var dy = 0; dy < 8; dy = dy + 1) {
-        for (var dx = 0; dx < 8; dx = dx + 1) {
+    var cell_w = 8 * fb_scale();
+    var x_px = cell_x * cell_w;
+    if (x_px + cell_w > width) { return 0; }
+    for (var dy = 0; dy < cell_w; dy = dy + 1) {
+        for (var dx = 0; dx < cell_w; dx = dx + 1) {
             store32(fb + (abs_y + dy) * pitch + (x_px + dx) * 4, color);
         }
     }
@@ -704,27 +707,28 @@ fn fb_scroll_up() {
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var height = fb_height();
+    var cell_w = 8 * fb_scale();
     # u64 block-copy: 2 pixels per cycle. At 1080p, pitch=7680 -> 960
     # u64s per row (vs 1920 u32s). Halves both inner-loop count and
     # WC-write-combiner burst count. Read side still pays WC-mapped
     # FB read latency — if scroll feel doesn't improve, that's the
     # real bottleneck and we need a RAM-side shadow buffer.
     var stride_u64 = pitch / 8;
-    var rows_to_copy = height - FB_CONSOLE_Y0 - 8;
+    var rows_to_copy = height - FB_CONSOLE_Y0 - cell_w;
     if (rows_to_copy <= 0) { return 0; }
     # Copy line-by-line, top-down (no overlap risk since src is below dst).
     for (var y = 0; y < rows_to_copy; y = y + 1) {
-        var src = fb + (FB_CONSOLE_Y0 + 8 + y) * pitch;
+        var src = fb + (FB_CONSOLE_Y0 + cell_w + y) * pitch;
         var dst = fb + (FB_CONSOLE_Y0 + y) * pitch;
         for (var x = 0; x < stride_u64; x = x + 1) {
             store64(dst + x * 8, load64(src + x * 8));
         }
     }
-    # Clear new bottom 8-px row to FB_BG. FB_BG is 0x00000000 today, so
-    # the packed-pair u64 value is also 0 — no shift. If FB_BG ever
+    # Clear new bottom cell_w-px row to FB_BG. FB_BG is 0x00000000 today,
+    # so the packed-pair u64 value is also 0 — no shift. If FB_BG ever
     # becomes non-zero, repack as (FB_BG << 32) | (FB_BG & 0xFFFFFFFF).
     var clear_y = FB_CONSOLE_Y0 + rows_to_copy;
-    for (var y = 0; y < 8; y = y + 1) {
+    for (var y = 0; y < cell_w; y = y + 1) {
         for (var x = 0; x < stride_u64; x = x + 1) {
             store64(fb + (clear_y + y) * pitch + x * 8, 0);
         }
@@ -743,8 +747,10 @@ fn fb_putc(ch) {
     var pitch = fb_pitch();
     var width = fb_width();
     var height = fb_height();
-    var max_cols = width / 8;
-    var max_rows = (height - FB_CONSOLE_Y0) / 8;
+    var s = fb_scale();
+    var cell_w = 8 * s;
+    var max_cols = width / cell_w;
+    var max_rows = (height - FB_CONSOLE_Y0) / cell_w;
 
     # Newline.
     if (ch == 10) {
@@ -765,7 +771,7 @@ fn fb_putc(ch) {
     if (ch == 8) {
         if (fb_cur_x > 0) {
             fb_cur_x = fb_cur_x - 1;
-            fb_fill_cell(fb_cur_x, FB_CONSOLE_Y0 + fb_cur_y * 8, FB_BG);
+            fb_fill_cell(fb_cur_x, FB_CONSOLE_Y0 + fb_cur_y * cell_w, FB_BG);
         }
         return 0;
     }
@@ -783,16 +789,26 @@ fn fb_putc(ch) {
         }
     }
 
+    # Render the 8x8 CGA glyph, scaling each font bit into an SxS block
+    # so the on-screen character cell is cell_w x cell_w. Inner pixel
+    # paint loop runs cell_w*cell_w store32s per glyph (576 at scale=3,
+    # 1024 at scale=4) — same write-combiner-friendly pattern as the
+    # init clear and scroll-bottom-clear.
     var glyph = &fb_font + (ch - 0x20) * 8;
-    var x_px = fb_cur_x * 8;
-    var y_px = FB_CONSOLE_Y0 + fb_cur_y * 8;
+    var x_px = fb_cur_x * cell_w;
+    var y_px = FB_CONSOLE_Y0 + fb_cur_y * cell_w;
     for (var row = 0; row < 8; row = row + 1) {
         var bits = load8(glyph + row);
-        var scan = fb + (y_px + row) * pitch + x_px * 4;
         for (var col = 0; col < 8; col = col + 1) {
             var on = (bits >> (7 - col)) & 1;
-            if (on == 1) { store32(scan + col * 4, FB_FG); }
-            else         { store32(scan + col * 4, FB_BG); }
+            var color = FB_BG;
+            if (on == 1) { color = FB_FG; }
+            for (var dy = 0; dy < s; dy = dy + 1) {
+                var scan = fb + (y_px + row * s + dy) * pitch + (x_px + col * s) * 4;
+                for (var dx = 0; dx < s; dx = dx + 1) {
+                    store32(scan + dx * 4, color);
+                }
+            }
         }
     }
     fb_cur_x = fb_cur_x + 1;
