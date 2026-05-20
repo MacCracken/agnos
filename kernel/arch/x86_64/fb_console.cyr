@@ -91,6 +91,7 @@ fn fb_console_init() {
     var diag_pitch = fb_pitch();
     var diag_mode  = fb_mode_current();
     var diag_mmax  = fb_mode_max();
+    var diag_size  = fb_fb_size();  # Attempt 73: GOP FrameBufferSize
     serial_print("fb: mode=", 9);
     kfmt_int(diag_mode);
     serial_print("/", 1);
@@ -105,6 +106,8 @@ fn fb_console_init() {
     kfmt_int(diag_h);
     serial_print(" pitch=", 7);
     kfmt_int(diag_pitch);
+    serial_print(" size=", 6);
+    kfmt_hex0x(diag_size);
     serial_println("", 0);
 
     # Mirror the geometry to CMOS extended-bank scratch [0x90..0x9F] so
@@ -140,6 +143,18 @@ fn fb_console_init() {
     cmos_ext_write(0x9D, diag_mode & 0xFF);
     cmos_ext_write(0x9E, diag_mmax & 0xFF);
     cmos_ext_write(0x9F, 0xFB);
+
+    # === Attempt 73: MTRR + PCI-BAR audits ===
+    # Pre-paint diagnostic burst targeting the surviving BAR-placement-
+    # divergence candidate from Attempt 72 (geometry was clean, paint
+    # still corrupts under Quiet Boot ON). Each logs one serial line:
+    #   fb_audit: mtrr_eff=N def=M covered=Y/N   — effective MTRR type
+    #   fb_audit: pci=B:D.0 bar=I base=… fb_phys=… delta=…   — BAR match
+    # Both are read-only (rdmsr + PCI config-read); zero behavioral
+    # diff vs current. If either is the divergence root cause, the
+    # serial transcript names it explicitly under each BIOS path.
+    fb_audit_mtrr();
+    fb_audit_pci_bar();
 
     # PixelFormat guard. EFI_GRAPHICS_PIXEL_FORMAT values:
     #   0 = PixelRedGreenBlueReserved8BitPerColor (RGBX 32bpp)
@@ -334,6 +349,168 @@ fn fb_verify_wc() {
     return 0;
 }
 
+# === Attempt 73 Repair #2: MTRR effective-type audit for fb_phys ==========
+#
+# Reads MTRR_DEF_TYPE (MSR 0x2FF), IA32_MTRRCAP (MSR 0xFE), and the
+# variable-range MTRR pairs (MSRs 0x200-0x20F) via existing rdmsr().
+# Computes the effective MTRR type covering fb_phys per Intel SDM Vol 3A
+# §11.5.2.2 / AMD APM Vol 2 §7.7.5: variable MTRR with V=1 whose
+# (base_addr & mask_addr) == (phys & mask_addr) wins; falls through to
+# DEF_TYPE if no MTRR covers the address.
+#
+# Type encoding (matches PAT enum at MSR 0x277):
+#   0 = UC (Uncacheable — overrides PAT to UC unconditionally)
+#   1 = WC (Write-Combining)
+#   4 = WT (Write-Through)
+#   5 = WP (Write-Protect)
+#   6 = WB (Write-Back — allows PAT to override per-page)
+#
+# Logs one line summarizing eff/def/covered. WARNs when eff=UC: PAT-WC
+# cannot take effect, scroll-copy reads will be UC-speed, FB writes go
+# uncached. This is the silent-WC-drop class on AMD Zen platforms where
+# firmware pins certain MMIO ranges to UC via fixed/variable MTRRs.
+# Linux reference: arch/x86/kernel/cpu/mtrr/generic.c::mtrr_type_lookup_variable.
+fn fb_audit_mtrr() {
+    var fb_phys = fb_fb_phys();
+    if (fb_phys == 0) { return 0; }
+
+    var def_type = rdmsr(0x2FF);
+    var def_byte = def_type & 0xFF;
+    var enable   = (def_type >> 11) & 1;
+
+    if (enable == 0) {
+        serial_println("fb_audit: mtrr_disabled — PAT authoritative", 43);
+        return def_byte;
+    }
+
+    var mtrrcap = rdmsr(0xFE);
+    var vcnt    = mtrrcap & 0xFF;
+    if (vcnt > 8) { vcnt = 8; }  # safety cap; modern x86 ships ≤ 8 pairs
+
+    var matched_type = def_byte;
+    var matched      = 0;
+
+    for (var i = 0; i < vcnt; i = i + 1) {
+        var base_msr = rdmsr(0x200 + i * 2);
+        var mask_msr = rdmsr(0x201 + i * 2);
+        var valid    = (mask_msr >> 11) & 1;
+        if (valid != 0) {
+            var base_addr = base_msr & 0xFFFFFFFFFFFFF000;
+            var mask_addr = mask_msr & 0xFFFFFFFFFFFFF000;
+            if ((fb_phys & mask_addr) == (base_addr & mask_addr)) {
+                matched_type = base_msr & 0xFF;
+                matched      = 1;
+            }
+        }
+    }
+
+    serial_print("fb_audit: mtrr_eff=", 19);
+    kfmt_int(matched_type);
+    serial_print(" def=", 5);
+    kfmt_int(def_byte);
+    serial_print(" covered=", 9);
+    kfmt_int(matched);
+    serial_println("", 0);
+
+    if (matched_type == 0) {
+        serial_println("fb_audit: WARN MTRR=UC pins fb_phys to uncached — PAT-WC blocked", 64);
+    }
+
+    return matched_type;
+}
+
+# === Attempt 73 Repair #3: PCI BAR readback for VGA-class device ===========
+#
+# Walks PCI config space via legacy 0xCF8/0xCFC port-I/O (the canonical
+# pre-MMCONFIG accessor — see Linux arch/x86/pci/early.c and OSDev's
+# "PCI" article). Filters by class code at config+0x08:
+#   0x030000 = VGA-compatible controller
+#   0x038000 = Other display controller (catches some integrated GPUs)
+#
+# For each matching device, reads BAR0..BAR5 (offsets 0x10..0x24) and
+# logs the first MMIO BAR whose base + a 256 MB heuristic window
+# contains fb_phys. NO BAR SIZING (write-all-1s read-back trick):
+# the live FB is currently being painted from the BAR we're examining,
+# and unmapping it transiently — even for a single dword-write cycle —
+# risks corrupting paint state. fb_size_or_fallback() already gives us
+# the firmware-authoritative extent from Repair #1.
+#
+# Cap at bus 0..3 to avoid scanning empty buses on archaemenid (a Beelink
+# SER NUC; integrated GPU sits on bus 0). Adjust the upper bound if a
+# future target has its VGA on a higher bus segment.
+#
+# Logs one line per match. If no match (BAR reassignment, discrete GPU
+# on bus >= 4, or class-code that misses our filter), logs that too.
+fn pci_cfg_addr(bus, dev, func, off) {
+    return 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (off & 0xFC);
+}
+fn pci_cfg_read32(bus, dev, func, off) {
+    outl(0xCF8, pci_cfg_addr(bus, dev, func, off));
+    return inl(0xCFC);
+}
+fn fb_audit_pci_bar() {
+    var fb_phys = fb_fb_phys();
+    if (fb_phys == 0) { return 0; }
+
+    var matched = 0;
+
+    for (var bus = 0; bus < 4; bus = bus + 1) {
+        for (var dev = 0; dev < 32; dev = dev + 1) {
+            if (matched == 0) {
+                var vendor = pci_cfg_read32(bus, dev, 0, 0x00) & 0xFFFF;
+                if (vendor != 0xFFFF) {
+                    var class_code = (pci_cfg_read32(bus, dev, 0, 0x08) >> 16) & 0xFFFF;
+                    if (class_code == 0x0300 || class_code == 0x0380) {
+                        for (var b = 0; b < 6; b = b + 1) {
+                            if (matched == 0) {
+                                var bar_off = 0x10 + b * 4;
+                                var bar = pci_cfg_read32(bus, dev, 0, bar_off);
+                                if ((bar & 1) == 0) {  # MMIO (bit[0]=0)
+                                    var type_bits = (bar >> 1) & 3;
+                                    var base = bar & 0xFFFFFFF0;
+                                    if (type_bits == 2) {  # 64-bit BAR
+                                        var bar_hi = pci_cfg_read32(bus, dev, 0, bar_off + 4);
+                                        base = base | (bar_hi << 32);
+                                    }
+                                    if (base != 0 && fb_phys >= base) {
+                                        var delta = fb_phys - base;
+                                        if (delta < 0x10000000) {  # 256 MB heuristic
+                                            serial_print("fb_audit: pci=", 14);
+                                            kfmt_int(bus);
+                                            serial_print(":", 1);
+                                            kfmt_int(dev);
+                                            serial_print(".0 class=", 9);
+                                            kfmt_hex0x(class_code);
+                                            serial_print(" bar=", 5);
+                                            kfmt_int(b);
+                                            serial_print(" base=", 6);
+                                            kfmt_hex0x(base);
+                                            serial_print(" fb_phys=", 9);
+                                            kfmt_hex0x(fb_phys);
+                                            serial_print(" delta=", 7);
+                                            kfmt_hex0x(delta);
+                                            serial_println("", 0);
+                                            matched = 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (matched == 0) {
+        serial_print("fb_audit: pci no VGA BAR matched fb_phys=", 41);
+        kfmt_hex0x(fb_phys);
+        serial_println(" (BAR reassignment, discrete GPU on bus>=4, or class-code miss)", 63);
+    }
+
+    return 0;
+}
+
 # Get framebuffer geometry from boot_info. Returns 0 if unavailable
 # (boot_info_ptr unset, fb_phys=0, or pixel-format incompatible). Callers
 # should early-return on 0.
@@ -386,6 +563,29 @@ fn fb_mode_max() {
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
     return load32(bi + 0x64);
+}
+# GOP Mode->FrameBufferSize (UINTN/u64) — authoritative FB extent per
+# UEFI 2.10 §11.9.1: "amount of memory required to hold the frame
+# buffer". Stored by gnoboot at boot_info + 0x68 (Attempt 73 addition).
+# Returns 0 if (a) boot_info unavailable, (b) gnoboot is pre-Attempt-73
+# and the slot is still the END-tag zero, or (c) GOP couldn't be
+# located (no FB). Callers should pair with fb_size_or_fallback()
+# rather than reading this directly — the fallback to pitch*height
+# keeps the legacy path working under older gnoboots.
+fn fb_fb_size() {
+    var bi = load64(&boot_info_ptr);
+    if (bi == 0) { return 0; }
+    return load64(bi + 0x68);
+}
+# Return the WC-remap extent for the FB BAR. Prefers the firmware-
+# authoritative FrameBufferSize (gnoboot 0.4.0+, Attempt 73+) and
+# falls back to the legacy computed pitch*height when fb_size is
+# zero (older gnoboot, or GOP-absent text-only boot). Single source
+# of truth so the WC remap site and any future verify paths agree.
+fn fb_size_or_fallback() {
+    var sz = fb_fb_size();
+    if (sz != 0) { return sz; }
+    return fb_pitch() * fb_height();
 }
 
 # Console origin. v1.30.1: boot_shim canary stripe at y=0..7 was deleted

@@ -14,7 +14,15 @@
 # If fb_fb_phys() returns 0 (no GOP / serial-only headless), the range
 # loop sees end == start and exits without remap; downstream paints
 # are no-ops via the same fb_phys==0 guard.
-vmm_remap_wc_range(fb_fb_phys(), fb_pitch() * fb_height());
+#
+# Attempt 73: range now sourced from fb_size_or_fallback() — prefers
+# the firmware-authoritative GOP Mode->FrameBufferSize (gnoboot 0.4.0+,
+# UEFI 2.10 §11.9.1) over the computed pitch*height. Closes the case
+# where firmware-reported BAR extent differs from the geometry product
+# (BAR padded for alignment, or BAR sized to the next mode up). Under
+# pre-Attempt-73 gnoboots fb_size_or_fallback() returns the legacy
+# pitch*height value — backward-compatible.
+vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 
 # Populate the 8x8 font in BSS so fb_putc renders glyphs once shell()
 # starts emitting through kprint. Pure data fill — safe to run before
@@ -115,7 +123,12 @@ kprintln(" pages", 6);
 # and any future target placing the FB BAR above 1 GB. FB briefly
 # paints WB-cached in the high-BAR case until this retry — benign,
 # display reads from physical memory regardless of cache type.
-vmm_remap_wc_range(fb_fb_phys(), fb_pitch() * fb_height());
+#
+# Attempt 73: same fb_size_or_fallback() switch as the line-17 call
+# above. Both call sites must agree on the remap extent or the second
+# call would (under a pre-Attempt-73 gnoboot) shrink/grow coverage
+# differently from the first.
+vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 fb_verify_wc();
 
 # === CMOS kernel checkpoint 9 (physical memory manager up) ===
