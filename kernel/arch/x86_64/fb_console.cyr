@@ -22,10 +22,9 @@
 # bit 7 = leftmost pixel of that row. Stored packed as two u64s per glyph
 # via fset16(ch, hi, lo) — hi = rows 0-7, lo = rows 8-15 — so each literal
 # reads top-to-bottom: 0xR0R1R2R3R4R5R6R7 0xR8R9RARBRCRDRERF. Replaced
-# the hand-drawn 8x8 CGA bitmap at 1.30.12 — at 2K+ native HDMI the 8x8
-# source was illegible even at 3x scale (Attempt 76 photo,
-# iron-nuc-zen-photos/attempt-76-quiet-boot-scaled-glyphs-illegible.jpg).
-# Cell dimensions are now non-square: cell_w = 8*scale, cell_h = 16*scale.
+# the hand-drawn 8x8 CGA bitmap because at 2K+ native HDMI the 8x8
+# source was illegible (~0.55% of screen height per row at 1440p). Cell
+# dimensions are now non-square: cell_w = 8*scale, cell_h = 16*scale.
 #
 # Color: white foreground on black background. Both pixels are painted
 # per glyph cell (no transparency) so the console area paints fully even
@@ -94,11 +93,11 @@ fn fb_console_init() {
     #   1. Ground truth on mode parameters when the FB itself may be
     #      garbled (post-mortem from serial / read-boot-log captures).
     #   2. Confirms boot_info pointer is alive and fb_present is set.
-    #   3. First diagnostic for the VGA-vs-HDMI / quiet-boot-ON
-    #      GOP-rendering bug — Attempt 33/34 (2026-05-16) observed
-    #      garbled glyphs under HDMI-spec mode (quiet-boot ON), clean
-    #      glyphs under VGA-spec (quiet-boot OFF). The pf / pitch /
-    #      geometry reported here is what tells us why.
+    #   3. First diagnostic for vendor-specific FB-handoff bugs (e.g.
+    #      the AMD Zen quiet-boot scanout residue per memory pin
+    #      project_amd_zen_scanout_residue): pf / pitch / geometry /
+    #      mode reported here is what differentiates "firmware leaves
+    #      scanout linear" from "firmware leaves scanout tiled/DCC".
     var diag_phys  = fb_fb_phys();
     var diag_pf    = fb_pf();
     var diag_w     = fb_width();
@@ -106,7 +105,7 @@ fn fb_console_init() {
     var diag_pitch = fb_pitch();
     var diag_mode  = fb_mode_current();
     var diag_mmax  = fb_mode_max();
-    var diag_size  = fb_fb_size();  # Attempt 73: GOP FrameBufferSize
+    var diag_size  = fb_fb_size();
     serial_print("fb: mode=", 9);
     kfmt_int(diag_mode);
     serial_print("/", 1);
@@ -159,13 +158,27 @@ fn fb_console_init() {
     cmos_ext_write(0x9E, diag_mmax & 0xFF);
     cmos_ext_write(0x9F, 0xFB);
 
-    # MTRR-WC install + MTRR/PCI audit removed at 1.30.12. Attempt 74
-    # falsified the "MTRR=UC overrides PAT-WC" hypothesis (visual unchanged
-    # after WC install) and the wrmsr to MTRR PHYSBASE/PHYSMASK locked the
-    # box under Quiet Boot (AMD SYS_CFG_MSR MtrrLock → #GP). The 1.30.11
-    # cut removed the call sites; 1.30.12 removed the function bodies as
-    # part of the true-font swap bundle. Real root cause across the 71-74
-    # ladder was font-pixel-density — see fb_scale() and the VGA 8x16 swap.
+    # FB-absent guard. No GOP at handoff (text-only firmware, headless
+    # server, or LocateProtocol failure in gnoboot) leaves fb_phys = 0
+    # and pf = 0 in boot_info — the pf > 1 guard below does NOT catch
+    # that case (0 > 1 is false), and we'd otherwise fall through and
+    # set fb_console_ready = 1, lying to upper-layer routing about an
+    # FB console being live. Downstream paint ops all early-return on
+    # fb_phys == 0 (so no segfault), but the readiness signal needs to
+    # be honest. Set ready=0 and bail.
+    if (diag_phys == 0) {
+        serial_println("fb: no framebuffer present, serial-only console", 47);
+        fb_console_ready = 0;
+        return 0;
+    }
+
+    # No MTRR-WC install here. PAT-based WC mapping (vmm_remap_wc_2mb,
+    # called from kernel/core/main.cyr) is the cache-typing path. A
+    # prior MTRR install attempt on archaemenid Quiet Boot triggered
+    # #GP via AMD SYS_CFG_MSR MtrrLock — wrmsr to MTRR PHYSBASE/PHYSMASK
+    # is unsafe post-firmware-init on locked-down platforms. PAT bits
+    # in the leaf PTE are the modern equivalent and don't require MSR
+    # writes. See fb_verify_wc() for the PAT-state confirmation gate.
 
     # PixelFormat guard. EFI_GRAPHICS_PIXEL_FORMAT values:
     #   0 = PixelRedGreenBlueReserved8BitPerColor (RGBX 32bpp)
@@ -417,33 +430,29 @@ fn fb_mode_max() {
 }
 # GOP Mode->FrameBufferSize (UINTN/u64) — authoritative FB extent per
 # UEFI 2.10 §11.9.1: "amount of memory required to hold the frame
-# buffer". Stored by gnoboot at boot_info + 0x68 (Attempt 73 addition).
-# Returns 0 if (a) boot_info unavailable, (b) gnoboot is pre-Attempt-73
-# and the slot is still the END-tag zero, or (c) GOP couldn't be
-# located (no FB). Callers should pair with fb_size_or_fallback()
-# rather than reading this directly — the fallback to pitch*height
-# keeps the legacy path working under older gnoboots.
+# buffer". Returns 0 if boot_info unavailable, gnoboot didn't populate
+# the slot (END-tag zero), or GOP couldn't be located. Callers should
+# pair with fb_size_or_fallback() rather than reading this directly.
 fn fb_fb_size() {
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
     return load64(bi + 0x68);
 }
 # Return the WC-remap extent for the FB BAR. Prefers the firmware-
-# authoritative FrameBufferSize (gnoboot 0.4.0+, Attempt 73+) and
-# falls back to the legacy computed pitch*height when fb_size is
-# zero (older gnoboot, or GOP-absent text-only boot). Single source
-# of truth so the WC remap site and any future verify paths agree.
+# authoritative FrameBufferSize when populated; falls back to the
+# computed pitch*height otherwise. Single source of truth so the WC
+# remap site and any future verify paths agree.
 fn fb_size_or_fallback() {
     var sz = fb_fb_size();
     if (sz != 0) { return sz; }
     return fb_pitch() * fb_height();
 }
 
-# Console origin. v1.30.1: boot_shim canary stripe at y=0..7 was deleted
-# and the cp_fb marker grid (rows 1..9) was already stripped Attempt-29-
-# post — so the entire screen is text-console territory now. cp_fb() the
-# function still ships in fb.cyr; re-bumping FB_CONSOLE_Y0 if visual
-# bisection is needed again is a one-line change.
+# Console origin. The entire screen is text-console territory; no
+# reserved canary stripe or marker grid above the text. Bump
+# FB_CONSOLE_Y0 if a top-of-screen visual diagnostic ever needs to
+# come back — one-line change, no other call sites depend on a
+# specific value.
 var FB_CONSOLE_Y0 = 0;
 var FB_FG = 0x00FFFFFF;  # white
 var FB_BG = 0x00000000;  # black

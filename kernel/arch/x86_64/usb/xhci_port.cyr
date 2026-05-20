@@ -119,9 +119,11 @@ fn xhci_drain_port_change_events() {
     # EINT bit 3) are left alone; we only acknowledge port-change.
     xhci_op_write32(XHCI_OP_USBSTS, 0x10);
     xhci_cmos_stamp(0x87, 0xDD);
+    #ifdef XHCI_VERBOSE
     kprint("xhci: drained ", 14);
     kprint_num(drained);
     kprintln(" events", 7);
+    #endif
     return drained;
 }
 
@@ -166,13 +168,14 @@ fn xhci_ports_power_on() {
         p2 = p2 + 1;
     }
     xhci_cmos_stamp(0x6B, pp_set_mask & 0xFF);
-    # Framebuffer line — survives the CMOS-kcp overwrite that kybernet does
-    # downstream, and matches the per-phase line shape used elsewhere
-    # (`xhci: halted, reset clean` etc.). Bitmap is the raw byte; decode by
-    # bit position = port number - 1.
+    # Framebuffer line — the bitmap detail is debug; CMOS stamp at 0x6B is
+    # the unconditional record. Gate this so production boots don't carry
+    # the raw bitmap on screen.
+    #ifdef XHCI_VERBOSE
     kprint("xhci: PP=1 asserted, bitmap=", 28);
     kprint_num(pp_set_mask);
     kprintln("", 0);
+    #endif
     return 1;
 }
 

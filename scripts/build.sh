@@ -65,7 +65,25 @@ else
     # path). Both must be set in lockstep. Prepended rather than `-D`'d
     # because `-D` doesn't propagate into included files (cyrius caveat
     # — same reason `ARCH_X86_64` is prepended, not `-D`'d).
-    (echo '#define ARCH_X86_64' && echo '#define ELF64_KERNEL' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
+    #
+    # Optional gates (env-var driven, same prepend mechanism):
+    #   KTEST=1         — boot-time in-kernel self-tests (Syscall, Context
+    #                     Switch, VFS/initrd, Userland Exec) emit their
+    #                     output and CMOS checkpoints. Off by default;
+    #                     production boots skip the test spam.
+    #   XHCI_VERBOSE=1  — xhci developmental debug detail (cmd_submit#,
+    #                     evt# trace, PP=1 bitmap, CRCR.CRR readback,
+    #                     enable_slot entry idx). High-level confirmation
+    #                     lines (halted/reset clean, dev_notifications,
+    #                     controller running, port N connected, error
+    #                     cases) stay unconditional.
+    {
+        echo '#define ARCH_X86_64'
+        echo '#define ELF64_KERNEL'
+        [ -n "$KTEST" ]        && echo '#define KTEST'
+        [ -n "$XHCI_VERBOSE" ] && echo '#define XHCI_VERBOSE'
+        cat "$ROOT/kernel/agnos.cyr"
+    } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")
     rm -f "$PREPPED"
     SZ=$(wc -c < "$ROOT/build/agnos")

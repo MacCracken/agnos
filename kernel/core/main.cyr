@@ -303,6 +303,7 @@ kprintln("Stack canary initialized", 24);
 # === CMOS kernel checkpoint 13 (SYSCALL + stack canary) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0D; 0xE6; 0x71; }
 
+#ifdef KTEST
 # Syscall test (direct call — still works)
 kernel_return_rsp = 0;
 kernel_return_rip = 0;
@@ -323,10 +324,17 @@ kprint("Exit code: ", 11);
 kprint_num(sys_exit_code);
 kprintln("", 0);
 
-# Hardware SYSCALL test (from kernel mode — same privilege, tests the plumbing)
+# Hardware SYSCALL test (from kernel mode — same privilege, tests the plumbing).
+# test_hw_syscall() prints intermediate detail to serial; one bare digit (the
+# getpid result) lands on the kprint channel inside the call, so we close the
+# "HW syscall test: " prefix with an explicit kprintln. Without this the next
+# kprintln collides on the same FB row producing "0Creating test...".
 kprint("HW syscall test: ", 17);
 test_hw_syscall();
+kprintln("", 0);
+#endif
 
+#ifdef KTEST
 # === Context Switch Test ===
 # Create two test processes with dedicated stacks.
 # Process stacks at 0x800000 + pid * 0x10000, 64KB apart.
@@ -364,6 +372,7 @@ kprintln(" ready", 6);
 
 # === CMOS kernel checkpoint 14 (test procs created) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0E; 0xE6; 0x71; }
+#endif
 
 # Enable interrupts and activate scheduler
 asm { sti; }
@@ -391,6 +400,7 @@ sched_active = 1;
 # context-switch issue, not an init issue. Held since Attempt 16.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
 
+#ifdef KTEST
 # Kernel idle loop: halts, wakes on timer, scheduler switches to A or B
 # After enough ticks, deactivate and report
 var idle_count = 0;
@@ -419,7 +429,9 @@ kprintln("", 0);
 kprint("Scheduler test done. Timer ticks: ", 34);
 kprint_num(timer_ticks);
 kprintln("", 0);
+#endif
 
+#ifdef KTEST
 # === Memory Isolation Test ===
 # VFS + initrd test
 kprint("VFS write: ", 11);
@@ -456,6 +468,7 @@ kprintln("", 0);
 vfs_close(mf);
 # CMOS CP 0x12: post-VFS / initrd / memfile tests
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
+#endif
 
 # Memory-isolation test removed 2026-05-15 (Attempt 27). The AS1/AS2 build + CR3
 # dance was post-MVP verification, not boot infrastructure. Under restored kernel
@@ -464,6 +477,7 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
 # UEFI's identity map — pt_init's 0-4GB mapping doesn't cover the GOP FB BAR
 # the way UEFI's did. Mem-iso correctness is post-closed-beta work.
 
+#ifdef KTEST
 # === Userland Exec Test ===
 # Spawn user_test_proc as a proper isolated process with its own address space
 kprintln("Userland exec test...", 21);
@@ -482,6 +496,7 @@ if (exec_pid >= 0) {
 }
 # CMOS CP 0x14: post-userland-exec test (spawn done, exec_and_wait still bypassed)
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
+#endif
 
 # Launch kybernet (PID 1) — enters the shell loop, which reads scancodes
 # from the kbd ring and dispatches commands. Shell I/O mirrors to fb via

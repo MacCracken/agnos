@@ -125,6 +125,7 @@ fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
     # future readers who grep for them. idx was incremented at line 75 above,
     # so first call: idx=1 → print; second call: idx=2 → print; third+: skip.
     xhci_diag_submit_count = xhci_diag_submit_count + 1;
+    #ifdef XHCI_VERBOSE
     if (xhci_cmd_ring_idx <= 2) {
         kprint("xhci: cmd_submit#", 17);
         kprint_num(xhci_cmd_ring_idx);
@@ -134,6 +135,7 @@ fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
         kprint_num(load32(trb + 12));
         kprintln("", 0);
     }
+    #endif
 
     # Ring HC doorbell (slot 0) with target/stream = 0. xHCI 1.2 §5.6.
     # Repair (HH) 2026-05-17 — post-write readback flushes the PCI
@@ -178,6 +180,7 @@ fn xhci_cmd_wait(cmd_trb_phys) {
         if (evt_cycle == xhci_evt_ring_cycle) {
             var evt_type = (evt_dw3 >> 10) & 0x3F;
             xhci_diag_evt_count = xhci_diag_evt_count + 1;
+            #ifdef XHCI_VERBOSE
             if (xhci_diag_evt_count <= XHCI_DIAG_EVT_MAX) {
                 kprint("xhci: evt#", 10);
                 kprint_num(xhci_diag_evt_count);
@@ -187,6 +190,7 @@ fn xhci_cmd_wait(cmd_trb_phys) {
                 kprint_num(evt_cycle);
                 kprintln("", 0);
             }
+            #endif
             if (evt_type == XHCI_TRB_CMD_COMPLETION) {
                 var evt_p_lo = load32(evt);
                 # Match on low 32 bits of cmd TRB phys — sufficient since

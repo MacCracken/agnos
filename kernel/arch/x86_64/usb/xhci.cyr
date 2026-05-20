@@ -662,14 +662,12 @@ fn xhci_start() {
     kprint_num(xhci_evt_ring_phys);
     kprintln("", 0);
 
-    # Attempt-58 instrumentation (post-FF, events still 0 on iron).
-    # Read-only readback of cmd-ring + interrupter state. CRCR.CRR is
-    # bit 3 of CRCR low 32; xHCI 1.2 §5.4.5 marks the pointer portion
-    # indeterminate-on-read but CRR is RO-readable. Expect:
-    #   CRR=1     — controller accepted the cmd ring + entered Running.
-    #   ERSTSZ=1  — single ERST segment as written.
-    #   IMAN=3    — IP|IE both set (FF repair stuck at the register).
-    #   ERDP_lo   — equals xhci_evt_ring_phys low 32 pre-first-event.
+    #ifdef XHCI_VERBOSE
+    # Read-only readback of cmd-ring + interrupter state for diagnostic
+    # purposes. CRCR.CRR is bit 3 of CRCR low 32; xHCI 1.2 §5.4.5 marks
+    # the pointer portion indeterminate-on-read but CRR is RO-readable.
+    # Expect: CRR=1, ERSTSZ=1, IMAN=3 (IP|IE), ERDP_lo = xhci_evt_ring_phys
+    # low 32 pre-first-event.
     var crcr_lo = xhci_op_read32(XHCI_OP_CRCR);
     var erstsz  = xhci_rt_read32(ir0 + XHCI_IR_ERSTSZ);
     var iman_rb = xhci_rt_read32(ir0 + XHCI_IR_IMAN);
@@ -683,6 +681,7 @@ fn xhci_start() {
     kprint(" ERDP_lo=", 9);
     kprint_num(erdp_lo);
     kprintln("", 0);
+    #endif
 
     # CMOS kernel checkpoint 0x31 (xhci controller running).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x31; 0xE6; 0x71; }
@@ -715,11 +714,13 @@ var xhci_kbd_slot_id = 0;
 # use). xhci_last_cmd_slot_id is the authoritative result via the cmd
 # completion event.
 fn xhci_enable_slot() {
+    #ifdef XHCI_VERBOSE
     kprint("xhci: enable_slot entry idx=", 28);
     kprint_num(xhci_evt_ring_idx);
     kprint(" cycle=", 7);
     kprint_num(xhci_evt_ring_cycle);
     kprintln("", 0);
+    #endif
     if (xhci_cmd_issue(0, 0, 0, XHCI_TRB_ENABLE_SLOT << 10) == 0) {
         kprint("xhci: Enable Slot failed, ccode=", 32);
         kprint_num(xhci_last_cmd_ccode);
