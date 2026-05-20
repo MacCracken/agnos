@@ -5,6 +5,89 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### NVMe Phase 1 (probe + capability decode + controller disable)
+
+First engineering cut of the 1.31.x storage arc. New `kernel/core/nvme.cyr` (~230 LOC) modeled on `kernel/arch/x86_64/usb/xhci.cyr` Phase 1 — per `feedback_redesign_dont_reinvent`, Linux's `drivers/nvme/host/pci.c` `nvme_disable_ctrl` + `nvme_wait_ready` path is the reference impl.
+
+**What it does:**
+- `nvme_probe()` — `pci_find_by_class(0x01, 0x08, 0x02)` (NVM Express triple), `pci_bar0_64` → MMIO base, `pci_enable_bus_master_idx`, `vmm_remap_uc_2mb` (BAR needs UC, not WB). Reads `CAP[63:0]` as two 32-bit halves and `VS[31:0]`, decodes MQES / DSTRD / TO / CSS_NVM / MPSMIN / MPSMAX / version triple, prints a two-line summary.
+- `nvme_disable()` — if `CC.EN=1` clear it, write back, poll `CSTS.RDY=0` (1M-iter safety ceiling; QEMU NVMe reaches RDY=0 in tens of iterations).
+- Wired into `main.cyr` after `virtio_blk_init`. Graceful no-op when no NVMe device is present.
+
+**What it does NOT do:** Admin queue (AQA / ASQ / ACQ programming), `CC.EN=1` re-enable, IDENTIFY, I/O queues, read/write, MSI-X. Those are Phase 2 onward.
+
+**CMOS checkpoints:** `kcp=0x40` on probe done, `kcp=0x41` on disable confirmed. Slots 0x40-0x47 reserved for NVMe (parallel to xhci's 0x30-0x37).
+
+**QEMU validation (NVMe 1.4 model):**
+
+```
+gnoboot v0.4.2: handing off to kernel
+nvme: found at 824633737216, version=1.4.0
+nvme: MQES=2047 DSTRD=0 TO=15x500ms CSS_NVM=1 MPSMIN=0 MPSMAX=4
+nvme: controller disabled, RDY=0
+VFS initialized
+AGNOS shell v1.31.0 (type 'help')
+```
+
+Tested with `-drive file=nvme0.img,if=none,format=raw,id=nvme0 -device nvme,drive=nvme0,serial=AGN001` on QEMU q35. BAR0 lands at 0xC0000000000 (768 GB high range, same shatter-path code that handles qemu-xhci on q35). MQES=2047 = 2048-entry queue support (zero-based), DSTRD=0 = standard 4-byte doorbell stride. The baseline no-NVMe smoke continues to PASS — `nvme: no controller found` prints and the kernel proceeds to shell unchanged.
+
+**Build:** `build/agnos` 421,912 B (1.31.0) → **424,656 B** (+2,744 B for the nvme.cyr module). Multiboot2 ELF64 entry `0x1000a8` preserved.
+
+**Out of scope:** Iron burn — Phase 1 is pure read-only enumeration; no behavioral path lands new on iron until at least Phase 3 (first I/O). Will bundle with Phase 2 or Phase 3 once the admin-queue + IDENTIFY path is in place.
+
+## [1.31.0] — 2026-05-20 (Production build goes lean — KTEST + XHCI_VERBOSE compile gates; FB-absent guard; stale Attempt-N prose retired; `docs/development/build.md`)
+
+**1.30.x cycle closed; 1.31.x cycle opens with the production-default flip.** The 1.30.x sweep (1.30.0 → 1.30.12) cleared the FB-hardening + MVP-gate work on both BIOS paths (VGA-spec Attempt 68, Quiet Boot Attempt 76, true-font swap Attempt 77; Attempt 78 falsified the gnoboot SetMode-bounce lever, Attempt 79 Intel cross-check was structurally inconclusive). What landed there made every boot loud — KTEST self-test output + xhci developmental traces were unconditional because we needed them during the silent-absorb diagnostic arc. With the gate green, production boots should not carry diagnostic spam. 1.31.0 introduces source-side compile gates so the test paths and the verbose xhci trace ship out by default; opt back in via `KTEST=1` / `XHCI_VERBOSE=1` to the build script. Bundled: an FB-absent honesty guard the prior cycle's `fb_console_init` rewrite missed, a sweep of decayed Attempt-N references from `fb_console.cyr` comments, and a new `docs/development/build.md` that documents the gate matrix end-to-end. Cycle theme pivots from FB to **storage** — first 1.31.x engineering cuts target the NVMe block layer, not the framebuffer.
+
+### Bundle (three behavioral changes, doc addition)
+
+1. **`KTEST` compile gate.** Boot-time in-kernel self-tests in `kernel/core/main.cyr` (Syscall test, Context Switch test, Scheduler test idle loop, VFS/initrd test, Userland Exec test) are now `#ifdef KTEST` — off by default. Production boots skip ~18 lines of test output and ~6 CMOS checkpoints (CP12, CP14×2, CP18 cluster). The shell-side assertion framework gate `TEST` (separate, gates `include "user/test.cyr"` in `agnos.cyr`; consumed by `scripts/ktest.sh`) is unchanged — different layer, different purpose. Enable via `KTEST=1 ./scripts/build.sh`.
+
+2. **`XHCI_VERBOSE` compile gate.** Developmental xhci output is now `#ifdef XHCI_VERBOSE` across `kernel/arch/x86_64/usb/{xhci,xhci_cmd,xhci_port}.cyr`: `cmd_submit#` TRB-tracking, `evt#` event trace, `drained N events`, `PP=1 asserted bitmap=`, `CRCR.CRR / ERSTSZ / IMAN / ERDP_lo` readback, `enable_slot entry idx=` / `cycle=`. High-level confirmation lines stay unconditional (`xhci: halted, reset clean`, `dev_notifications enabled`, `controller running, HCH=0, ERDP=`, `port N connected`, error cases) — those are operational signal, not diagnostic noise. CMOS checkpoint stamps stay unconditional too; they're the iron post-mortem channel and cost nothing on a working boot. Enable via `XHCI_VERBOSE=1 ./scripts/build.sh`.
+
+3. **FB-absent guard in `fb_console_init`.** New early-return path: if `diag_phys == 0` (no GOP at handoff — text-only firmware, headless server, or LocateProtocol failure in gnoboot), serial-print `"fb: no framebuffer present, serial-only console"`, set `fb_console_ready = 0`, return. The existing `pf > 1` guard does NOT catch this case (`0 > 1` is false), and the prior code would fall through and set `fb_console_ready = 1`, lying to upper-layer routing about an FB console being live. Downstream paint ops all early-return on `fb_phys == 0` so there was no segfault risk, but the readiness signal needed to be honest. Closes a quality residue from the 1.30.11 PixelFormat-guard cut.
+
+4. **`docs/development/build.md` — new.** End-to-end build documentation: how `scripts/build.sh` resolves the cyrius toolchain, the source-side defines (`ARCH_X86_64` / `ELF64_KERNEL`) vs cyrius-backend env vars (`CYRIUS_ELF64_KERNEL=1`) lockstep, the `KTEST` / `XHCI_VERBOSE` opt-in gates, the prepend-instead-of-`-D` rationale (`-D` doesn't propagate into included files — same caveat that drove the `ARCH_X86_64` prepend), output artifacts, smoke-test entry points, and links to the Path-C handoff + iron bring-up references. Distinguishes `KTEST` (boot-time inline tests) from `TEST` (shell-side `test` command, `scripts/ktest.sh`) — two gates, two layers, two purposes; a recurring source of confusion now documented in place.
+
+### Verification
+
+- ✅ Cyrius build clean (5.11.64 pin, no errors, 43 unreachable fns — up from 33 at 1.30.12 because gated test code is unreachable when `KTEST` is undefined)
+- ✅ Multiboot2 ELF64 entry preserved at `0x1000a8`
+- ✅ Default lean build: `build/agnos` 425,840 B (1.30.12) → **421,912 B** (1.31.0, −3,928 B net from gated code compile-out)
+- ✅ Iron Attempt 77 (1.30.12 true-font swap on archaemenid Quiet Boot) — VGA console legible end-to-end, no regressions vs the QEMU receipts. User-confirmed at cycle close 2026-05-20. Boot logging streamlined as designed: production banner cadence visible without the test-spam / verbose-xhci noise.
+- ⏸ Iron burn of 1.31.0 itself — deferred. Per `feedback_iron_burns_block_other_work` no diagnostic-only burns are scheduled; the production-default flip will be exercised on the first 1.31.x storage burn that needs iron validation.
+
+### Build
+
+`build/agnos` **421,912 B** at 1.31.0 (was 425,840 B at 1.30.12, −3,928 B). The reduction is exactly the gated-out code: KTEST inline-test bodies + XHCI_VERBOSE kprint sites compile to nothing when the flag is undefined. With `KTEST=1 XHCI_VERBOSE=1 ./scripts/build.sh`, expect ~425-426 KB matching the 1.30.12 footprint. Multiboot2 ELF64 entry `0x1000a8`. Cyrius pin **5.11.64**. gnoboot **0.4.2** unchanged (kernel-side change only).
+
+### Changed
+
+- `VERSION`: 1.30.12 → 1.31.0
+- `kernel/version.cyr`: kernel banner, shell banner, `_AGNOS_VERSION` bumped to 1.31.0 (auto-regenerated by `scripts/version-bump.sh`)
+- `kernel/agnos.cyr`: header-comment version reference bumped 1.30.12 → 1.31.0 (auto)
+- `kernel/core/main.cyr`: five `#ifdef KTEST` / `#endif` brackets around Syscall test, Context Switch test, Scheduler idle-loop test, VFS/initrd + memfile test, Userland Exec test. One added `kprintln("", 0);` after `test_hw_syscall();` so the FB row doesn't collide with the next kprint when KTEST is enabled (the function prints intermediate detail to serial and one bare digit to the kprint channel; the explicit newline closes the row).
+- `kernel/arch/x86_64/fb_console.cyr`:
+  - Header comment: stripped reference to 1.30.12 Attempt 76 photo; collapsed to "8×8 source was illegible (~0.55% of screen height per row at 1440p)" — display-density framing per `feedback_display_density_before_speculation`
+  - `fb_console_init` diagnostic-rationale block: stripped Attempt 33/34 (VGA-vs-HDMI) historical text; now points at `project_amd_zen_scanout_residue` memory pin for the live FB-handoff bug class
+  - **Added FB-absent guard** (early-return for `diag_phys == 0`)
+  - MTRR comment block collapsed: prior block explained why MTRR-WC was removed (Attempt 74 falsification, AMD SYS_CFG_MSR MtrrLock #GP); replaced with a forward-looking comment about why PAT is the cache-typing path
+  - `fb_fb_size` comment: stripped "Attempt 73 addition" / "gnoboot 0.4.0+, Attempt 73+" archaeology — gnoboot 0.4.x is the only supported floor, no version-conditional caveats needed
+  - `fb_size_or_fallback` comment: same archaeology cleanup
+  - `FB_CONSOLE_Y0` comment: stripped "v1.30.1: boot_shim canary stripe ... Attempt-29-post" historical text; kept the operational note ("bump if a top-of-screen visual diagnostic needs to come back — one-line change")
+- `kernel/arch/x86_64/usb/xhci.cyr`: `#ifdef XHCI_VERBOSE` around CRCR/ERSTSZ/IMAN/ERDP readback block in `xhci_start` and the `enable_slot entry idx=` line in `xhci_enable_slot`
+- `kernel/arch/x86_64/usb/xhci_cmd.cyr`: `#ifdef XHCI_VERBOSE` around `cmd_submit#` print in `xhci_cmd_submit` and `evt#` trace in `xhci_cmd_wait`
+- `kernel/arch/x86_64/usb/xhci_port.cyr`: `#ifdef XHCI_VERBOSE` around `drained N events` print in `xhci_drain_port_change_events` and `PP=1 asserted bitmap=` print in `xhci_ports_power_on` (CMOS stamps at 0x87/0x6B stay unconditional — those are post-mortem signal)
+- `scripts/build.sh`: env-driven `#define KTEST` / `#define XHCI_VERBOSE` prepends, gated on the presence of the matching env var. Same prepend-not-`-D` mechanism as `ARCH_X86_64` / `ELF64_KERNEL`.
+- `docs/development/build.md`: **new** — see Bundle #4
+
+### Out of scope
+
+- **Storage subsystem engineering.** This cut is purely the cycle-open + build-hygiene work. The 1.31.x storage arc starts in the next cut (NVMe block-layer scaffold expected first — direction confirmation pending at the time of the bump).
+- **Quiet Boot legibility residue.** Parked to the next-cycle pin per `project_amd_zen_scanout_residue` — re-attack vectors are HUBP `clear_tiling` port or shadow-buffer architectural eval, not another GOP SetMode lever (both forms falsified at Attempt 78).
+- **Iron burn of 1.31.0.** Pure build-hygiene + comment cleanup — no behavioral change to validate. First 1.31.x iron burn will be the storage-engineering cut that needs it.
+- **Removal of CMOS stamping** from xhci paths. Stamps are unconditional by design — they're the iron post-mortem channel (`feedback_no_serial_on_iron`), cost effectively nothing on a working boot, and are the only iron-readable signal when serial isn't available.
+
 ## [1.30.12] — 2026-05-20 (True-font swap — VGA 8x16 BIOS ROM replaces hand-drawn CGA 8x8; fb_scale 2-tier; MTRR/audit dead code removed; QEMU PASS at 1080p + 1440p, iron Attempt 77 pending)
 
 **The legibility bar.** Attempt 76 (closing 1.30.11) cleared three of four MVP bars on Quiet Boot at native HDMI 2560×1440: no lockup, live keyboard, live refresh. The fourth — *legible* glyphs — was unsolved because the existing 8×8 CGA bitmap was hand-drawn at primitive resolution; scaling each font pixel 3× made each dot bigger, not each letter readable. This cut swaps the source bitmap for the canonical IBM VGA BIOS 8×16 ROM font (public domain since 1981, same byte table Linux's `lib/fonts/font_8x16.c` carries) and revises `fb_scale()` from four tiers to two. The bundled cleanup deletes the MTRR-install + PCI audit dead code whose call sites already came down at 1.30.11 (`fb_mtrr_install_wc`, `fb_audit_mtrr`, `fb_audit_pci_bar`, plus the two `pci_cfg_*` helpers, plus the matching decoder slots in `read-boot-log.cyr`). Pre-bound on iron Attempt 77 by the outcome tree in `agnosticos/docs/development/true-font-swap-plan.md`.

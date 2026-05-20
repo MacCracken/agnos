@@ -1,0 +1,233 @@
+# === NVMe controller driver — Phase 1: probe + capability read + disable ===
+#
+# Locates an NVMe controller via PCI class lookup (class 0x01, subclass
+# 0x08, prog-if 0x02 — NVM Express), maps its MMIO BAR0 as UC, reads
+# the controller-capability and version registers, and drives the
+# controller into the disabled state (CC.EN=0, CSTS.RDY=0). This is the
+# well-defined starting point that admin-queue programming in Phase 2
+# assumes.
+#
+# Phase 1 boundaries:
+#   - WHAT it does    : finds the controller, remaps BAR0 as UC, reads
+#                       CAP[63:0] + VS[31:0], decodes MQES/DSTRD/TO/CSS/
+#                       MPSMIN/MPSMAX, clears CC.EN if set, polls
+#                       CSTS.RDY=0, prints a one-line summary per stage.
+#   - WHAT it does NOT: allocate admin SQ/CQ, program AQA/ASQ/ACQ, set
+#                       CC.EN=1, submit IDENTIFY, create I/O queues, do
+#                       any namespace I/O, register MSI/MSI-X. Those are
+#                       Phase 2 onward.
+#
+# Iron-test gate: framebuffer shows
+#   `nvme: found at <addr>, version=X.Y.Z`
+#   `nvme: MQES=N DSTRD=N TO=N×500ms CSS=NVM MPSMIN=N MPSMAX=N`
+#   `nvme: controller disabled, RDY=0`
+# and CMOS[0x40] reaches kcp = 0x40 (probe done), 0x41 (disabled).
+#
+# Per `feedback_redesign_dont_reinvent` — modeled on Linux's
+# drivers/nvme/host/pci.c `nvme_disable_ctrl` + `nvme_wait_ready` path.
+
+# --- Register offsets (NVMe 1.4 §3.1.4) -----------------------------
+
+var NVME_REG_CAP_LO  = 0x00;  # CAP[31:0]
+var NVME_REG_CAP_HI  = 0x04;  # CAP[63:32]
+var NVME_REG_VS      = 0x08;  # Version (BCD: maj<<16 | min<<8 | tert)
+var NVME_REG_INTMS   = 0x0C;  # Interrupt Mask Set
+var NVME_REG_INTMC   = 0x10;  # Interrupt Mask Clear
+var NVME_REG_CC      = 0x14;  # Controller Configuration
+var NVME_REG_CSTS    = 0x1C;  # Controller Status
+var NVME_REG_AQA     = 0x24;  # Admin Queue Attributes (Phase 2)
+var NVME_REG_ASQ_LO  = 0x28;  # Admin SQ Base[31:0]   (Phase 2)
+var NVME_REG_ASQ_HI  = 0x2C;  # Admin SQ Base[63:32]  (Phase 2)
+var NVME_REG_ACQ_LO  = 0x30;  # Admin CQ Base[31:0]   (Phase 2)
+var NVME_REG_ACQ_HI  = 0x34;  # Admin CQ Base[63:32]  (Phase 2)
+
+# PCI class triple for NVM Express (PCI Code and ID Assignment 1.16)
+var NVME_PCI_CLASS    = 0x01;
+var NVME_PCI_SUBCLASS = 0x08;
+var NVME_PCI_PROGIF   = 0x02;
+
+# --- Cached probe outputs (populated by nvme_probe) -----------------
+
+var nvme_present     = 0;   # 1 if a controller was found, 0 otherwise
+var nvme_pci_idx     = 0;   # pci_devs index of the NVMe device
+var nvme_mmio_base   = 0;   # full 64-bit phys/virt address of MMIO BAR0
+var nvme_cap_lo      = 0;   # CAP[31:0]
+var nvme_cap_hi      = 0;   # CAP[63:32]
+var nvme_vs          = 0;   # VS register (raw)
+var nvme_mqes        = 0;   # CAP[15:0]  Maximum Queue Entries Supported (zero-based)
+var nvme_dstrd       = 0;   # CAP[35:32] Doorbell Stride (stride = 2^(2+dstrd) bytes)
+var nvme_to          = 0;   # CAP[31:24] Worst-case timeout (in 500ms units)
+var nvme_css_nvm     = 0;   # CAP[37]    NVM Command Set supported
+var nvme_mpsmin      = 0;   # CAP[51:48] Min host page size (2^(12+v))
+var nvme_mpsmax      = 0;   # CAP[55:52] Max host page size (2^(12+v))
+var nvme_ver_major   = 0;
+var nvme_ver_minor   = 0;
+var nvme_ver_tert    = 0;
+var nvme_disabled    = 0;   # 1 after nvme_disable() observed CSTS.RDY=0
+
+# --- MMIO accessors -------------------------------------------------
+#
+# Per NVMe 1.4 §3.1: CAP is the only 64-bit register that drivers
+# touch in the controller properties window; the spec explicitly
+# permits reading it as two 32-bit halves. ASQ/ACQ are 64-bit but
+# also legal as two 32-bit writes — same pattern, kept consistent.
+# load32/store32 (always 32-bit aligned) is the canonical kernel
+# MMIO primitive; we never use load64 on MMIO to keep the door
+# closed on subtle silicon bugs (CAP-read-as-load64 misaligns on
+# some PCIe bridges).
+
+fn nvme_mmio_read32(off) {
+    return load32(nvme_mmio_base + off);
+}
+
+fn nvme_mmio_write32(off, val) {
+    store32(nvme_mmio_base + off, val);
+    # Readback flush — same convention as xhci_op_write32 to defeat
+    # write-combining when this code paths through a non-UC mapping
+    # by accident. UC mapping below should make this redundant; cost
+    # is one read per write, kept defensive.
+    var flush = load32(nvme_mmio_base + off);
+    return 0;
+}
+
+# --- Phase 1: probe -------------------------------------------------
+
+fn nvme_probe() {
+    # 1. Locate the controller via PCI class lookup. NVMe vendor IDs
+    # vary (0x8086 Intel, 0x144D Samsung, 0x1B36 QEMU/Red Hat, ...);
+    # class triple is the portable discriminator.
+    var idx = pci_find_by_class(NVME_PCI_CLASS, NVME_PCI_SUBCLASS, NVME_PCI_PROGIF);
+    if (idx < 0) {
+        kprintln("nvme: no controller found", 25);
+        return 0;
+    }
+
+    # 2. Compute MMIO base from BAR0. NVMe 1.4 §2.1.10: NVMe BAR0/BAR1
+    # is a 64-bit memory BAR (the controller properties window is
+    # mandatory at the start of it). pci_bar0_64 masks the flag bits
+    # and combines BAR0/BAR1 high half.
+    var mmio = pci_bar0_64(idx);
+    if (mmio == 0) {
+        kprintln("nvme: BAR0 is zero (firmware did not assign)", 44);
+        return 0;
+    }
+
+    # 3. Enable bus master + memory space access. NVMe controllers are
+    # silent without bus-master; firmware usually leaves it set but
+    # assert explicitly, same as xhci_probe.
+    pci_enable_bus_master_idx(idx);
+
+    # 4. Cache the probe result before any register access.
+    nvme_present   = 1;
+    nvme_pci_idx   = idx;
+    nvme_mmio_base = mmio;
+
+    # 5. Remap the BAR's 2MB chunk as UC. The boot-time identity map
+    # leaves PCI BARs at PAT entry 0 = WB; NVMe MMIO accesses cannot
+    # be cached or combined. Same call xhci_probe uses for its BAR.
+    vmm_remap_uc_2mb(mmio);
+
+    # 6. Read CAP as two 32-bit halves (NVMe 1.4 §3.1.5 permits it,
+    # and avoids load64 against MMIO — see accessor comment above).
+    nvme_cap_lo = nvme_mmio_read32(NVME_REG_CAP_LO);
+    nvme_cap_hi = nvme_mmio_read32(NVME_REG_CAP_HI);
+
+    # CAP field decode (NVMe 1.4 §3.1.5):
+    #   [15:0]   MQES  — max queue entries (0-based; 0xFFFF = 64K)
+    #   [31:24]  TO    — worst-case enable-or-shutdown timeout, in 500ms units
+    #   [35:32]  DSTRD — doorbell stride exponent (bytes = 4 << dstrd)
+    #   [37]     CSS bit 0 — NVM Command Set supported
+    #   [51:48]  MPSMIN — min host page size (2^(12 + MPSMIN))
+    #   [55:52]  MPSMAX — max host page size (2^(12 + MPSMAX))
+    nvme_mqes    = nvme_cap_lo & 0xFFFF;
+    nvme_to      = (nvme_cap_lo >> 24) & 0xFF;
+    nvme_dstrd   = nvme_cap_hi & 0x0F;
+    nvme_css_nvm = (nvme_cap_hi >> 5) & 0x01;   # bit 37 of CAP = bit 5 of CAP_HI
+    nvme_mpsmin  = (nvme_cap_hi >> 16) & 0x0F;  # bits 51:48 of CAP = bits 19:16 of CAP_HI
+    nvme_mpsmax  = (nvme_cap_hi >> 20) & 0x0F;
+
+    # 7. Read VS. Layout (NVMe 1.4 §3.1.6):
+    #   [31:16]  Major
+    #   [15:8]   Minor
+    #   [7:0]    Tertiary
+    nvme_vs        = nvme_mmio_read32(NVME_REG_VS);
+    nvme_ver_major = (nvme_vs >> 16) & 0xFFFF;
+    nvme_ver_minor = (nvme_vs >> 8) & 0xFF;
+    nvme_ver_tert  = nvme_vs & 0xFF;
+
+    # 8. Report. Two lines: device discovery + capability summary.
+    # Format aligns with xhci_probe's reporting style — single banner
+    # + per-field follow-up for iron post-mortem diff'ing.
+    kprint("nvme: found at ", 15);
+    kprint_num(mmio);
+    kprint(", version=", 10);
+    kprint_num(nvme_ver_major);
+    kprint(".", 1);
+    kprint_num(nvme_ver_minor);
+    kprint(".", 1);
+    kprint_num(nvme_ver_tert);
+    kprintln("", 0);
+
+    kprint("nvme: MQES=", 11);
+    kprint_num(nvme_mqes);
+    kprint(" DSTRD=", 7);
+    kprint_num(nvme_dstrd);
+    kprint(" TO=", 4);
+    kprint_num(nvme_to);
+    kprint("x500ms CSS_NVM=", 15);
+    kprint_num(nvme_css_nvm);
+    kprint(" MPSMIN=", 8);
+    kprint_num(nvme_mpsmin);
+    kprint(" MPSMAX=", 8);
+    kprint_num(nvme_mpsmax);
+    kprintln("", 0);
+
+    # CMOS kernel checkpoint 0x40 — NVMe probe completed.
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x40; 0xE6; 0x71; }
+    return 1;
+}
+
+# --- Phase 1: disable -----------------------------------------------
+#
+# Drive the controller into the disabled state. Per NVMe 1.4 §7.6.1:
+#
+#   1. Read CC. If CC.EN=1, clear it.
+#   2. Write CC back.
+#   3. Poll CSTS until CSTS.RDY=0.
+#   4. Spec-bounded timeout: CAP.TO * 500ms (host worst-case wait
+#      for the controller to honor an enable/disable transition).
+#
+# Timeout strategy: fixed iteration ceiling, same primitive as
+# xhci_init's halt/reset spins (~250ms wall on Zen at 1M iters).
+# CAP.TO * 500ms can be many seconds on slow controllers; the 1M
+# ceiling is a safety net, not the spec deadline. QEMU NVMe reaches
+# RDY=0 within a few hundred iterations.
+#
+# Returns 1 on success (RDY observed clear), 0 on any timeout.
+
+fn nvme_disable() {
+    if (nvme_present == 0) { return 0; }
+
+    var cc = nvme_mmio_read32(NVME_REG_CC);
+    if ((cc & 0x01) != 0) {
+        nvme_mmio_write32(NVME_REG_CC, cc & 0xFFFFFFFE);
+    }
+
+    var wait = 0;
+    while (wait < 1000000) {
+        var sts = nvme_mmio_read32(NVME_REG_CSTS);
+        if ((sts & 0x01) == 0) { break; }
+        wait = wait + 1;
+    }
+    if (wait >= 1000000) {
+        kprintln("nvme: disable timeout (RDY never cleared)", 41);
+        return 0;
+    }
+
+    nvme_disabled = 1;
+    kprintln("nvme: controller disabled, RDY=0", 32);
+
+    # CMOS kernel checkpoint 0x41 — NVMe disabled, RDY=0 observed.
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x41; 0xE6; 0x71; }
+    return 1;
+}

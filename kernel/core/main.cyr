@@ -274,6 +274,14 @@ if (pci_find(0x1AF4, 0x1001) >= 0) {
         }
     }
 }
+# NVMe Phase 1 — locate the NVMe controller (if present), remap BAR0
+# as UC, read CAP + VS, decode capability fields, drive the controller
+# into the disabled state (CC.EN=0, CSTS.RDY=0). Probe-only — no admin
+# queue, no DMA, no namespace I/O. CMOS checkpoints 0x40 / 0x41 stamp
+# on success of each stage. No-op if no NVMe device is present.
+# Phase 2+ adds admin queue + IDENTIFY + I/O queue + read/write.
+nvme_probe();
+nvme_disable();
 vfs_init();
 kprintln("VFS initialized", 15);
 
