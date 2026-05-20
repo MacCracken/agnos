@@ -41,6 +41,22 @@ var fb_cur_x = 0;        # cursor column (in 8-px cells from x=0)
 var fb_cur_y = 0;        # cursor row (in 8-px cells from FB_CONSOLE_Y0)
 var fb_console_ready = 0;
 
+# Write one byte to the CMOS extended bank (slots 0x80..0xFF, addressed
+# via port pair 0x72=index / 0x73=data). The hardware index is the
+# logical slot minus 0x80 per the CC fix 2026-05-17 documented in
+# agnosticos/scripts/src/read-boot-log.cyr.
+#
+# Used by fb_console_init to stamp FB geometry to virgin scratch
+# (0x90..0x9F) for post-mortem decode via read-boot-log on iron (no
+# serial). Standard-bank writes use raw asm + 0xE6/0x71 inline (see
+# boot_shim.cyr's checkpoint pattern); extended-bank needs the offset
+# math, so it's worth a helper.
+fn cmos_ext_write(slot, val) {
+    outb(0x72, slot - 0x80);
+    outb(0x73, val);
+    return 0;
+}
+
 # Pack one glyph's 8 row-bytes into fb_font[glyph_index*8 .. +7].
 # Row order: byte 7 (top) = high nibble pair of `val`, byte 0 (bottom) = low.
 # That way the literal reads top-to-bottom: 0xR0R1R2R3R4R5R6R7.
@@ -73,7 +89,13 @@ fn fb_console_init() {
     var diag_w     = fb_width();
     var diag_h     = fb_height();
     var diag_pitch = fb_pitch();
-    serial_print("fb: phys=", 9);
+    var diag_mode  = fb_mode_current();
+    var diag_mmax  = fb_mode_max();
+    serial_print("fb: mode=", 9);
+    kfmt_int(diag_mode);
+    serial_print("/", 1);
+    kfmt_int(diag_mmax);
+    serial_print(" phys=", 6);
     kfmt_hex0x(diag_phys);
     serial_print(" pf=", 4);
     kfmt_int(diag_pf);
@@ -84,6 +106,40 @@ fn fb_console_init() {
     serial_print(" pitch=", 7);
     kfmt_int(diag_pitch);
     serial_println("", 0);
+
+    # Mirror the geometry to CMOS extended-bank scratch [0x90..0x9F] so
+    # post-mortem read-boot-log can recover it on iron (single-machine
+    # archaemenid setup, no serial cable). 16 contiguous bytes, virgin
+    # range (standard bank 0x50-0x7F is full of checkpoints / PMM / xhci
+    # stamps; extended bank 0x80-0xFF only uses 0x86 today). Layout:
+    #   [0x90..0x93] fb_width  (u32 LE)
+    #   [0x94..0x97] fb_height (u32 LE)
+    #   [0x98..0x9B] fb_pitch  (u32 LE)
+    #   [0x9C]       fb_pf     (u8 — pixel format enum)
+    #   [0x9D]       fb_mode_current low byte
+    #   [0x9E]       fb_mode_max     low byte
+    #   [0x9F]       0xFB sentinel (kernel reached fb_console_init)
+    # Extended bank addressed by port pair 0x72 (index) / 0x73 (data);
+    # index is `slot - 0x80`. Width/height/pitch typically fit comfortably
+    # in their low 16 bits (max ~8192 px / ~32 KB) so we don't dedicate
+    # diagnostics for the upper halves — if any read back nonzero, the
+    # detail will show up in serial anyway.
+    cmos_ext_write(0x90, diag_w & 0xFF);
+    cmos_ext_write(0x91, (diag_w >> 8) & 0xFF);
+    cmos_ext_write(0x92, (diag_w >> 16) & 0xFF);
+    cmos_ext_write(0x93, (diag_w >> 24) & 0xFF);
+    cmos_ext_write(0x94, diag_h & 0xFF);
+    cmos_ext_write(0x95, (diag_h >> 8) & 0xFF);
+    cmos_ext_write(0x96, (diag_h >> 16) & 0xFF);
+    cmos_ext_write(0x97, (diag_h >> 24) & 0xFF);
+    cmos_ext_write(0x98, diag_pitch & 0xFF);
+    cmos_ext_write(0x99, (diag_pitch >> 8) & 0xFF);
+    cmos_ext_write(0x9A, (diag_pitch >> 16) & 0xFF);
+    cmos_ext_write(0x9B, (diag_pitch >> 24) & 0xFF);
+    cmos_ext_write(0x9C, diag_pf & 0xFF);
+    cmos_ext_write(0x9D, diag_mode & 0xFF);
+    cmos_ext_write(0x9E, diag_mmax & 0xFF);
+    cmos_ext_write(0x9F, 0xFB);
 
     # PixelFormat guard. EFI_GRAPHICS_PIXEL_FORMAT values:
     #   0 = PixelRedGreenBlueReserved8BitPerColor (RGBX 32bpp)
@@ -311,6 +367,25 @@ fn fb_pf() {
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
     return load32(bi + 0x5C);
+}
+# GOP Mode->Mode (UINT32) — which mode the firmware booted with. Primary
+# signal for the quiet-boot-vs-VGA-spec divergence: if the two paths land
+# on different mode numbers, the firmware exposed different geometry under
+# each setting and downstream FB rendering inherits that difference.
+# Stored by gnoboot at boot_info + 0x60. Reserved-slot overlay (not a v3
+# struct bump) — v2 readers got zeros there, new readers get the mode #.
+fn fb_mode_current() {
+    var bi = load64(&boot_info_ptr);
+    if (bi == 0) { return 0; }
+    return load32(bi + 0x60);
+}
+# GOP Mode->MaxMode (UINT32) — how many modes the firmware enumerates.
+# Helps tell "1 mode only — firmware doesn't expose mode-set" from "N
+# modes — firmware ran QueryMode iteration internally."
+fn fb_mode_max() {
+    var bi = load64(&boot_info_ptr);
+    if (bi == 0) { return 0; }
+    return load32(bi + 0x64);
 }
 
 # Console origin. v1.30.1: boot_shim canary stripe at y=0..7 was deleted
