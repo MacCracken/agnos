@@ -144,18 +144,31 @@ fn fb_console_init() {
     cmos_ext_write(0x9E, diag_mmax & 0xFF);
     cmos_ext_write(0x9F, 0xFB);
 
+    # === Variable-MTRR WC install for UMA framebuffer ===
+    # On AMD APUs with iGPU + UMA stolen DRAM as framebuffer (archaemenid
+    # Beelink SER), the FB is system main memory the display controller
+    # reads from. CPU writes to that range must reach DRAM, not sit in
+    # WB cache lines the display controller can't snoop. We previously
+    # set PAT entry 1 = WC and remap the FB pages with PAT-WC bits — but
+    # the QEMU OVMF audit on 2026-05-19 confirmed MTRR=UC overrides PAT
+    # entirely (Intel SDM Table 11-7, AMD APM Vol 2 §7.7.5). Iron quiet-
+    # boot path lands the FB BAR under firmware MTRR coverage that flips
+    # the effective type to UC even with PAT-WC requested — visible as
+    # the Attempt-33 garbled-glyph signature (partial cache-evicted lines
+    # reaching DRAM, others stale, display reads inconsistent state).
+    #
+    # Fix: plant a variable MTRR with type=WC covering [fb_phys, fb_phys
+    # + size_pow2). Variable MTRRs win over MTRR_DEF_TYPE for their range
+    # (SDM §11.11.4). Linux equivalent: arch_phys_wc_add() → mtrr_add_page.
+    # No cache-disable dance — fb_console_init runs pre-IDT/pre-SMP, so
+    # the wbinvd bracket suffices for single-CPU coherency.
+    fb_mtrr_install_wc(fb_fb_phys(), fb_size_or_fallback());
+
     # === MTRR + PCI-BAR audits (CMOS-stamped) ===
-    # Read-only diagnostic burst targeting the surviving BAR-placement-
-    # divergence candidate from Attempt 72 (geometry was clean, paint
-    # still corrupts under Quiet Boot ON). Both stamp results to the
-    # CMOS extended bank — iron archaemenid has no serial cable, so
-    # CMOS is the only post-mortem channel:
-    #   [0x88] = matched MTRR effective type at fb_phys
-    #   [0x89] = MTRR_DEF_TYPE bits[7:0]
-    #   [0x8A..0x8D] = matched VGA BAR base bits[31:0] LE32
-    #   [0x8E] = (fb_phys - base) low byte
-    #   [0x8F] = PCI match flag (1=matched, 0=no match)
-    # Zero behavioral diff vs current (rdmsr + PCI config-read).
+    # Read-only diagnostic confirming the install above landed. Stamps
+    # land in RTC-alias slots on archaemenid (0x80-0x8F bank-2 aliases
+    # RTC time-of-day per read-boot-log.cyr:50-55) — visual outcome on
+    # iron is the authoritative signal, not the CMOS readback.
     fb_audit_mtrr();
     fb_audit_pci_bar();
 
@@ -408,6 +421,85 @@ fn fb_audit_mtrr() {
     cmos_ext_write(0x88, matched_type & 0xFF);
 
     return matched_type;
+}
+
+# === Variable-MTRR WC install for the framebuffer ==========================
+#
+# Plants a single variable MTRR pair (PHYSBASE_n/PHYSMASK_n) with type=WC
+# covering [base, base + size_pow2) where size_pow2 is the smallest power
+# of two ≥ requested size, and base is size-aligned downward (Intel SDM
+# Vol 3A §11.11.3 — variable MTRR ranges must be naturally aligned).
+#
+# Why this is the load-bearing fix for UMA-iGPU FB rendering on AMD APUs:
+# the FB is system DRAM that the display controller reads. PAT-WC alone
+# on page-table entries is silently overridden when an MTRR variable or
+# default range covers the FB region with type=UC or type=WB-without-WC-
+# combinability. SDM Table 11-7 / AMD APM Vol 2 §7.7.5 spell the
+# resolution: MTRR-WC wins; MTRR-UC always wins (forces UC). Planting an
+# MTRR-WC range for the FB makes PAT-WC actually take effect.
+#
+# Linux equivalent: arch_phys_wc_add() at arch/x86/mm/pat/set_memory.c
+# wrapping mtrr_add_page() at arch/x86/kernel/cpu/mtrr/mtrr.c. We omit
+# the full safe-MTRR-modify sequence (CR0.CD=1, WBINVD, CR4.PGE clear,
+# CR3 reload, MTRR_DEF_TYPE.E=0, write, re-enable, restore) because
+# fb_console_init runs single-CPU pre-IDT pre-interrupts (CP6 hasn't
+# stamped yet) — the wbinvd bracket plus the natural cache shoot-down
+# from PAT/MTRR-aware page walks suffices. SMP-correct rewrite is
+# post-MVP work.
+#
+# Slot selection: scans variable MTRRs (count from IA32_MTRRCAP bits[7:0],
+# capped at 8) for first pair whose mask.V=0. Returns 1 on success, 0 if
+# all slots occupied or MTRRs disabled.
+fn fb_mtrr_install_wc(phys, size) {
+    if (phys == 0) { return 0; }
+    if (size == 0) { return 0; }
+
+    var s = 0x1000;
+    while (s < size) { s = s * 2; }
+
+    var mtrrcap = rdmsr(0xFE);
+    var vcnt = mtrrcap & 0xFF;
+    if (vcnt > 8) { vcnt = 8; }
+    if (vcnt == 0) { return 0; }
+
+    var def_type = rdmsr(0x2FF);
+    if (((def_type >> 11) & 1) == 0) { return 0; }
+
+    var slot = 0xFF;
+    var free_slot = 0xFF;
+    for (var i = 0; i < vcnt; i = i + 1) {
+        if (slot == 0xFF) {
+            var base_i = rdmsr(0x200 + i * 2);
+            var mask_i = rdmsr(0x201 + i * 2);
+            var valid_i = (mask_i >> 11) & 1;
+            if (valid_i == 0) {
+                if (free_slot == 0xFF) { free_slot = i; }
+            }
+            else {
+                var addr_base = base_i & 0xFFFFFFFFFFFFF000;
+                var addr_mask = mask_i & 0xFFFFFFFFFFFFF000;
+                if ((phys & addr_mask) == (addr_base & addr_mask)) {
+                    slot = i;
+                }
+            }
+        }
+    }
+    if (slot == 0xFF) { slot = free_slot; }
+    if (slot == 0xFF) { return 0; }
+
+    var phys_aligned = phys & 0xFFFFFFFFFFFFF000;
+    var size_mask = s - 1;
+    phys_aligned = phys_aligned & ~size_mask;
+
+    var base_val = phys_aligned | 1;
+    var mask_val = ((~size_mask) & 0x0000FFFFFFFFF000) | 0x800;
+
+    wbinvd();
+    wrmsr(0x200 + slot * 2, base_val);
+    wrmsr(0x201 + slot * 2, mask_val);
+    wbinvd();
+
+    return 1;
 }
 
 # === PCI BAR readback for VGA-class device =================================

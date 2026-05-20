@@ -102,5 +102,31 @@ fn rdrand_u64() {
     return result;
 }
 
+# Write 64-bit value to an x86 MSR. ecx=msr, edx:eax=value (high:low).
+# Used by fb_mtrr_install_wc to plant a variable MTRR for the UMA FB region
+# so PAT-WC can take effect on AMD APUs where firmware leaves the FB BAR
+# under default WB (which can flip to UC on quiet-boot paths). msr=-0x08,
+# val=-0x10.
+fn wrmsr(msr, val) {
+    asm {
+        0x48; 0x8B; 0x4D; 0xF8;       # mov rcx, [rbp-0x08]   ; ecx = msr#
+        0x48; 0x8B; 0x45; 0xF0;       # mov rax, [rbp-0x10]   ; rax = val
+        0x48; 0x89; 0xC2;             # mov rdx, rax
+        0x48; 0xC1; 0xEA; 0x20;       # shr rdx, 32           ; edx = high32
+        0x0F; 0x30;                   # wrmsr                 ; MSR[ecx] = edx:eax
+    }
+    return 0;
+}
+
+# Write-back + invalidate all CPU caches. Required around MTRR variable
+# range writes per Intel SDM Vol 3A §11.11.8 to evict stale lines tagged
+# with the old effective cache type.
+fn wbinvd() {
+    asm {
+        0x0F; 0x09;                   # wbinvd
+    }
+    return 0;
+}
+
 fn arch_wait() { asm { hlt; } return 0; }
 fn arch_halt() { asm { cli; hlt; 0xEB; 0xFE; } return 0; }
