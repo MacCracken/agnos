@@ -5,9 +5,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.30.11] — 2026-05-19 (FB hardening — PixelFormat guard + WC retry-after-pmm + idempotent vmm_remap_wc_2mb; QEMU PASS, iron Attempt 71 pending)
+## [1.30.11] — 2026-05-19 → 2026-05-20 (FB hardening — PixelFormat guard + WC retry-after-pmm + idempotent vmm_remap_wc_2mb + font-density scale + MTRR/audit removal; iron Attempts 71→76, Quiet Boot MVP gate at 76)
 
-**Post-MVP hardening cycle.** Three 1.30.10 carry-forward items closed (VGA-vs-HDMI handoff guard, obsolete gvar-init workaround cleanup, FB BAR memtype runtime check), plus a pre-existing multi-chunk WC-remap leak in `vmm_remap_wc_2mb` that the new memtype check surfaced and is now fixed in the same cut. The quiet-boot ON/OFF asymmetry on archaemenid (HDMI-spec mode produces garbled glyphs, VGA-spec mode renders clean — original symptom in Attempt 33 photo, 2026-05-16) is hypothesized to be a non-BGRX PixelFormat under quiet-boot ON; the new guard refuses to paint when `pf > 1` so the kernel falls cleanly to serial-only rather than corrupting glyphs. Iron Attempt 71 with quiet-boot ON is what proves the hypothesis.
+**Post-MVP hardening cycle — Quiet Boot path joins VGA-spec at the MVP gate.** Three 1.30.10 carry-forward items closed (VGA-vs-HDMI handoff guard, obsolete gvar-init workaround cleanup, FB BAR memtype runtime check), plus a pre-existing multi-chunk WC-remap leak in `vmm_remap_wc_2mb` that the new memtype check surfaced and is now fixed in the same cut. The quiet-boot ON/OFF asymmetry on archaemenid (HDMI-spec mode produces garbled glyphs, VGA-spec mode renders clean — original symptom in Attempt 33 photo, 2026-05-16) was originally hypothesized to be a non-BGRX PixelFormat under quiet-boot ON; the PixelFormat guard landed first and then iron evidence falsified the hypothesis (Attempt 71 stamped `pf=1` BGRX same as VGA-spec). The cycle then accreted a font-pixel-density fix and an MTRR/audit removal across Attempts 72→76 before clearing the Quiet Boot MVP gate — typeable shell, live keyboard, live refresh — at Attempt 76 on 2026-05-20. Visual legibility (the remaining bar) is a font-source problem, not a paint/cache problem, and moves to 1.30.12 true-font.
 
 ### Bundle (four behavioral changes, no iron burns yet)
 
@@ -21,6 +21,14 @@ Per `feedback_redesign_dont_reinvent` — audited Linux's `drivers/video/fbdev/e
 
 4. **`vmm_remap_wc_2mb` idempotency fix** (real pre-existing bug surfaced by item 3). Multi-chunk FBs above 1 GB previously re-shattered the PDPT entry on every chunk in the same 1 GB region, allocating a fresh PD each call and **overwriting earlier chunks' WC bits with WB defaults from the new PD's identity fill**. Net result: only the LAST chunk ended up WC; all earlier chunks reverted to WB. Iron archaemenid was unaffected (FB BAR in 32-bit hole, inline path is naturally idempotent), but any future iron target with a high FB BAR — and QEMU q35, which places its FB BAR at `0x80000000` — silently leaked PDs and ended up partially WB. New idempotency branch: if the PDPT entry is already shattered (Present + not a 1 GB huge page), reuse the existing PD and just edit the target PDE in place. Same shape extended into `vmm_remap_wc_2mb` only; `vmm_remap_uc_2mb` left alone (only called once per UC region in current usage).
 
+### Bundle continued (added across Attempts 72→76, 2026-05-20)
+
+5. **CMOS extended-bank FB-geometry stamping**. `fb_console_init` stamps mode/pf/w/h/pitch/mode#/maxmode + sentinel `0xFB` to slots `[0x90..0x9F]` of the CMOS extended bank, in addition to the serial diagnostic. archaemenid has no serial cable (`feedback_no_serial_on_iron`); CMOS extended bank is the only iron-readable post-mortem channel for FB geometry. Decode path in `agnosticos/scripts/src/read-boot-log.cyr`. First use: Attempt 71 stamp confirmed `pf=1` BGRX under Quiet Boot ON — same as VGA-spec — which falsified the PixelFormat-asymmetry hypothesis that drove this cycle's opening cut.
+
+6. **Font-pixel-density scale by display height** *(Attempt 76 functional fix)*. New `fb_scale()` returns 1/2/3/4 from `fb_height()` (≤900 / ≤1200 / ≤1800 / else). `fb_putc`, `fb_fill_cell`, and `fb_scroll_up` render each font bit as an `S×S` pixel block; the on-screen character cell is `8*S × 8*S`. At archaemenid Quiet Boot's 2560×1440 native HDMI mode, scale=3 produces a 24-px cell — readable as text-shaped objects rather than the 8-px stripes the Attempt-33 photo signature was originally misread as structural scanout corruption. The root cause across the Attempts 71-74 ladder was always font-pixel-density at native HDMI resolutions; the MTRR / PixelFormat / scanout speculation was wrong-layer.
+
+7. **MTRR-install + audit calls removed from `fb_console_init`** *(Attempt 76 lockup fix — falsified hypothesis)*. Attempt 74 added `fb_mtrr_install_wc(fb_phys, fb_size)` + `fb_audit_mtrr()` + `fb_audit_pci_bar()` on the hypothesis that MTRR-UC was overriding PAT-WC and causing the visual corruption (Intel SDM Vol 3A §11.5.2.2 / AMD APM Vol 2 §7.7.5 — MTRR-UC always wins). Iron Attempt 74 falsified both halves: visual corruption unchanged after MTRR-WC install (confirming the hypothesis was wrong-layer), and the system **locked up post-`fb_console_init`** (suspected AMD `SYS_CFG_MSR` MtrrLock → `#GP(0)` on `wrmsr` to variable-range MTRR MSRs, per AMD APM Vol 3 §3.3). Attempt 76 removed the call sites; function bodies remain in-file for now as dead code (full cleanup is a follow-up). Removing them recovered Quiet Boot from "garbled visuals AND lockup" (post-74) to "garbled visuals but typeable shell" (76).
+
 ### Post-pmm WC retry
 
 `kernel/core/main.cyr` now calls `vmm_remap_wc_range` a second time right after `pmm_init` returns, followed by `fb_verify_wc()`. The line-17 attempt at boot succeeds immediately for FBs in the 32-bit hole (< 1 GB inline-PD-rewrite path, no allocation needed — iron archaemenid case) but silently fails for FBs at phys ≥ 1 GB because `vmm_remap_wc_2mb`'s high-mem path needs `pmm_alloc` for a fresh PD and pmm isn't initialized at line 17. The post-pmm retry is a no-op on iron (PDE already 0x8B from line 17) and the completion gate on QEMU q35 / any high-BAR target. FB briefly paints WB-cached in the high-BAR case until the retry — benign, since the display reads physical memory regardless of cache type.
@@ -29,37 +37,48 @@ Per `feedback_redesign_dont_reinvent` — audited Linux's `drivers/video/fbdev/e
 
 - ✅ Cyrius build clean (5.11.64 pin, no errors, 31 unreachable fns)
 - ✅ Multiboot2 ELF64 entry preserved at `0x1000a8`
-- ✅ QEMU Path-C **headless smoke** via new `agnosticos/scripts/qemu-fb-smoke.sh` — `EXPECT="AGNOS shell"` matched on ConOut at 1920×1080. New harness is the headless companion to `qemu-fb-visual.sh`; reusable across cycles.
-- ✅ Serial diagnostic landed: `fb: phys=0x80000000 pf=1 w=1920 h=1080 pitch=7680`
+- ✅ QEMU Path-C **headless smoke** via new `agnosticos/scripts/qemu-fb-smoke.sh` — `EXPECT="AGNOS shell"` matched on ConOut at 1920×1080 and at 2560×1440 (post-font-scale). New harness is the headless companion to `qemu-fb-visual.sh`; reusable across cycles.
+- ✅ Serial diagnostic landed: `fb: mode=N/M phys=0x... pf=1 w=2560 h=1440 pitch=10240 size=0x...`
+- ✅ CMOS extended-bank geometry stamps verified via `read-boot-log` on iron (Attempt 71 → `pf=1` BGRX same as VGA-spec, falsifying the PixelFormat-asymmetry opening hypothesis)
 - ✅ Post-pmm WC verification landed: `fb: WC verified (PAT entry 1)` — the idempotency fix is what made this go from WARN to verified under q35
 - ✅ Kernel + shell banners bumped to **v1.30.11**
-- ⏸ Iron Attempt 71 — pending. Targets the quiet-boot-ON HDMI-spec mode on archaemenid. Pre-bound outcomes matrix in `agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 71 prep.
+- ✅ **Iron Attempt 71** (2026-05-20) — Quiet Boot CMOS stamps proved `pf=1` BGRX; opens the font-density branch.
+- ✅ **Iron Attempt 72-73** — Quiet Boot vs VGA-spec geometry capture; mode/size diff captured to CMOS for diffing.
+- ✗ **Iron Attempt 74** — MTRR-install repair FAILED on both halves (visual unchanged → wrong-layer; new system lockup → MtrrLock suspected). Hypothesis retired; call sites removed at Attempt 76.
+- ⊘ **Iron Attempt 75** — BYPASSED. Photo re-interpretation in chat reframed the "horizontal stripes" as 8-px-cell font density rather than structural scanout corruption (`feedback_display_density_before_speculation` — 8/1440 = 0.55%, ~font height not ~scanout artifact).
+- ✅ **Iron Attempt 76** (2026-05-20) — Quiet Boot MVP gate clear: no lockup, keyboard live, refresh live; glyphs scaled to 24-px cell but still illegible as letters (8×8 CGA source bitmap is the bottleneck). 3-of-4 bars cleared in one burn; legibility moves to 1.30.12 true-font. See `agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 76.
 
 ### Build
 
-`build/agnos` 414,544 B (1.30.10) → **416,496 B** (1.30.11, +1,952 B). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin **5.11.64**. gnoboot **0.2.0** unchanged (Path-C handoff ABI stable, no boot_info field added — gnoboot already captured `pf` at +0x5C; kernel just started reading it).
+`build/agnos` 414,544 B (1.30.10) → 416,496 B (1.30.11 initial cut 2026-05-19) → **422,048 B** (1.30.11 final post-Attempt-76, +7,504 B over the cycle). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin **5.11.64**. gnoboot **0.4.1** at 1.30.11 close (was 0.2.0 at cycle open; 0.3.0 added GOP FrameBufferSize capture at boot_info+0x68 for Attempt 73, 0.4.0/.1 followed for the SetMode arc that Attempt 74 falsified — gnoboot ABI grew but the agnos kernel reads remain back-compat). Path-C handoff ABI stable on the kernel side.
 
 ### Changed
 
 - `VERSION`: 1.30.10 → 1.30.11
 - `kernel/arch/x86_64/fb_console.cyr`:
-  - new `fb_pf()` getter (reads `boot_info+0x5C`)
+  - new `fb_pf()` / `fb_mode_current()` / `fb_mode_max()` / `fb_fb_size()` / `fb_size_or_fallback()` getters
   - new `fb_verify_wc()` function (one-shot PAT readback + decode + serial log)
-  - `fb_console_init` now logs the boot-time geometry diagnostic + guards on `pf > 1` (skip FB, serial-only) + DELETED the obsolete `FB_CONSOLE_Y0/FB_FG/FB_BG` re-assignment block (cyrius 5.11.64 made it dead code)
+  - new `cmos_ext_write(slot, val)` helper for extended-bank CMOS stamps
+  - new `fb_audit_mtrr()` + `fb_mtrr_install_wc(phys, size)` + `fb_audit_pci_bar()` (function bodies retained as dead code after Attempt 76 removed the call sites; full removal is a follow-up)
+  - new `fb_scale()` returning 1/2/3/4 by display height
+  - `fb_console_init` now: logs boot-time geometry to serial; stamps geometry to CMOS extended bank `[0x90..0x9F]`; guards on `pf > 1` (skip FB, serial-only); DELETED the obsolete `FB_CONSOLE_Y0/FB_FG/FB_BG` re-assignment block (cyrius 5.11.64 made it dead code); **does NOT** call the MTRR-install / MTRR-audit / PCI-audit helpers (they tripped MtrrLock `#GP` on AMD per Attempt 74)
+  - `fb_putc` / `fb_fill_cell` / `fb_scroll_up` now use `cell_w = 8 * fb_scale()` and render each font bit as an `S×S` block
 - `kernel/core/vmm.cyr`:
   - new `vmm_get_pde_2mb(phys)` accessor (walks PML4 → PDPT → PD; covers < 1 GB inline, 1–512 GB, ≥ 512 GB lazy-PML4 paths)
   - `vmm_remap_wc_2mb` now idempotent for already-shattered PDPT entries — fixes the multi-chunk WC-leak
 - `kernel/core/main.cyr`: post-`pmm_init` WC remap retry + `fb_verify_wc()` call
 - `kernel/version.cyr`: kernel banner, shell banner, `_AGNOS_VERSION` bumped to 1.30.11
 - **NEW** `agnosticos/scripts/qemu-fb-smoke.sh`: headless Path-C boot smoke harness with EXPECT-grep + timeout
+- **NEW** read-boot-log decoder coverage for slots `[0x88..0x9F]` (MTRR-audit + PCI-audit + extended geometry) in `agnosticos/scripts/src/read-boot-log.cyr`
 
 ### Out of scope
 
-- **PixelInformation bitmask decoder** for `pf == 2` cases. gnoboot doesn't capture the 16-byte bitmask (boot_info ABI would have to grow); kernel currently rejects pf==2 outright. Implement on iron evidence — if Attempt 71 reports pf==2 under quiet-boot ON, then 1.30.12 (or later) adds gnoboot capture + kernel decoder.
+- **PixelInformation bitmask decoder** for `pf == 2` cases. gnoboot doesn't capture the 16-byte bitmask (boot_info ABI would have to grow); kernel currently rejects pf==2 outright. CLOSED — Attempt 71 confirmed `pf=1` on archaemenid Quiet Boot, so no consumer drives this in MVP scope. Reopen if a future iron target reports pf==2.
 - **`vmm_remap_uc_2mb` idempotency** — symmetric to the WC fix, but UC is called once per BAR in current usage. Defensive update queued for next vmm touch.
+- **MTRR-install / audit dead-code removal** — Attempt 76 removed the call sites but the three function bodies (`fb_mtrr_install_wc`, `fb_audit_mtrr`, `fb_audit_pci_bar`) remain in `fb_console.cyr`. Full deletion + grep for unused decoder coverage in `read-boot-log` is a 1.30.12 housekeeping item.
 - **Shadow buffer + single-burst FB push** → 1.31.x triage as before (pristine refresh; gated on PMM contig allocator).
 - **Multi-device USB / xHCI** → still queued for triage after this cycle.
-- **Glyph-to-font extraction** → 1.30.12 scope.
+- **True-font swap (real bitmap font replacing hand-drawn 8×8 CGA)** → **1.30.12 scope** (this is the legibility bar remaining after Attempt 76).
 
 ## [1.30.10] — 2026-05-19 (Framebuffer refresh — WC + pitch-aware + u64 block-copy; iron Attempts 69→70, CRT-class refresh PASS)
 
