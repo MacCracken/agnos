@@ -5,6 +5,60 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.30.12] — 2026-05-20 (True-font swap — VGA 8x16 BIOS ROM replaces hand-drawn CGA 8x8; fb_scale 2-tier; MTRR/audit dead code removed; QEMU PASS at 1080p + 1440p, iron Attempt 77 pending)
+
+**The legibility bar.** Attempt 76 (closing 1.30.11) cleared three of four MVP bars on Quiet Boot at native HDMI 2560×1440: no lockup, live keyboard, live refresh. The fourth — *legible* glyphs — was unsolved because the existing 8×8 CGA bitmap was hand-drawn at primitive resolution; scaling each font pixel 3× made each dot bigger, not each letter readable. This cut swaps the source bitmap for the canonical IBM VGA BIOS 8×16 ROM font (public domain since 1981, same byte table Linux's `lib/fonts/font_8x16.c` carries) and revises `fb_scale()` from four tiers to two. The bundled cleanup deletes the MTRR-install + PCI audit dead code whose call sites already came down at 1.30.11 (`fb_mtrr_install_wc`, `fb_audit_mtrr`, `fb_audit_pci_bar`, plus the two `pci_cfg_*` helpers, plus the matching decoder slots in `read-boot-log.cyr`). Pre-bound on iron Attempt 77 by the outcome tree in `agnosticos/docs/development/true-font-swap-plan.md`.
+
+### Bundle (three behavioral changes, single iron burn)
+
+Per `feedback_redesign_dont_reinvent` — VGA 8×16 = canonical reference impl; no first-principles glyph design.
+
+1. **VGA 8×16 font swap.** `fb_font[768]` → `fb_font[1536]` (96 glyphs × 16 bytes vs 96 × 8). New `fset16(ch, hi, lo)` helper packs each glyph as two u64s — `hi` = rows 0-7, `lo` = rows 8-15 — so each init-table line reads top-to-bottom across two literals: `0xR0R1R2R3R4R5R6R7 0xR8R9RARBRCRDRERF`. 96-line init table transcribed byte-exact from the public-domain IBM VGA ROM dump (verified `'A'` row 7 = `0xFE` etc. against multiple reference copies). The render loop in `fb_putc` now iterates 16 rows instead of 8 and scales each font bit into an `S × S` block, so the on-screen character cell is `8*S × 16*S` (non-square). Cell width and height are now distinct: `cell_w = 8 * fb_scale()`, `cell_h = 16 * fb_scale()`. `fb_fill_cell` and `fb_scroll_up` updated to use `cell_h` for all vertical extents (scroll-up distance, bottom-row clear height, max_rows divisor in `fb_putc`).
+
+2. **`fb_scale()` policy collapse to 2-tier.** Pre-1.30.12 used four tiers (1/2/3/4 by ≤900/≤1200/≤1800/else) because the 8×8 source needed 3-4× scaling to be visible at all on high-DPI displays. With a real 8×16 font, scale=1 (`8×16` cell) is already legible at 1080p (16-px-tall glyph = 1.5% of screen height) and scale=2 (`16×32` cell) covers 2K+ comfortably. New policy: `h ≤ 1200 → 1`, else 2. Two render paths instead of four; same code, less complexity.
+
+3. **MTRR-install + audit dead-code removal** *(bundled cleanup)*. The three function bodies left in `fb_console.cyr` at 1.30.11 (`fb_audit_mtrr` ~57 lines, `fb_mtrr_install_wc` ~78 lines, `fb_audit_pci_bar` ~67 lines incl. helpers) are deleted. Matching `read-boot-log.cyr` decoder coverage for CMOS extended-bank slots `[0x88..0x8F]` (focused-summary block + verbose-mode print rows + sweep header) is retired in step. The 1.30.11 cycle's MtrrLock-as-lockup-cause hypothesis (Attempt 74) was already falsified; this is just the second-stage cleanup the 1.30.11 Out-of-scope flagged as a 1.30.12 item.
+
+### Verification
+
+- ✅ Cyrius build clean (5.11.64 pin, no errors, 33 unreachable fns)
+- ✅ Multiboot2 ELF64 entry preserved at `0x1000a8`
+- ✅ QEMU Path-C **headless smoke at 1920×1080** — `EXPECT="AGNOS shell"` matched. Serial transcript: `fb: mode=0/30 phys=0x80000000 pf=1 w=1920 h=1080 pitch=7680 size=...`, `AGNOS kernel v1.30.12`, `fb: WC verified (PAT entry 1)`, `AGNOS shell v1.30.12`. Scale=1 render path exercised end-to-end.
+- ✅ QEMU Path-C **headless smoke at 2560×1440** — `EXPECT="AGNOS shell"` matched. Same render path under scale=2; cell geometry `16×32`. Confirms the 16-row glyph paint loop doesn't crash and `cell_h` substitution is consistent across `fb_putc` / `fb_fill_cell` / `fb_scroll_up`.
+- ✅ Kernel + shell banners bumped to **v1.30.12**
+- ⏸ Iron Attempt 77 — pending. Pre-bound outcomes matrix in `agnosticos/docs/development/true-font-swap-plan.md` § Verification.
+
+**Visual confirmation (QEMU)** — one-shot screendump via QMP at 2560×1440 captured to [`agnosticos/docs/development/iron-nuc-zen-photos/qemu-1.30.12-vga-8x16-shell-2560x1440.png`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-photos/qemu-1.30.12-vga-8x16-shell-2560x1440.png). Crisp VGA console: xhci log, kybernet startup, `AGNOS shell v1.30.12 (type 'help')`, `agnos>` prompt all legible. No striping, no garbling, no transcription typos visible in the font data — letterforms match the canonical IBM VGA ROM exactly. Scale=2 producing `16×32` cells reads as designed. Iron Attempt 77 is now the only remaining gate.
+
+### Build
+
+`build/agnos` 422,048 B (1.30.11 close) → **425,840 B** (1.30.12, +3,792 B net). Breakdown: +font data + fset16 init calls (~9 KB), -MTRR/audit/PCI dead code (~5 KB), -other (negligible). Multiboot2 ELF64 entry preserved at `0x1000a8`. Cyrius pin **5.11.64**. gnoboot **0.4.1** unchanged (no boot_info field added; kernel-side change only).
+
+### Changed
+
+- `VERSION`: 1.30.11 → 1.30.12
+- `kernel/arch/x86_64/fb_console.cyr`:
+  - file-header comment block updated for 8×16 font + non-square cells
+  - `var fb_font[768]` → `var fb_font[1536]`
+  - `fn fset(ch, val)` → `fn fset16(ch, hi, lo)` — packs 16 bytes from two u64s
+  - init table rewritten: 96 lines of `fset16(0xXX, 0x..., 0x...);` carrying the IBM VGA 8×16 ROM font
+  - `fb_scale()` revised to 2-tier (`h ≤ 1200 → 1`, else 2); accompanying comment block rewritten
+  - `fb_fill_cell` and `fb_scroll_up`: separate `cell_w` (8×s) and `cell_h` (16×s) extents
+  - `fb_putc`: render loop iterates 16 rows instead of 8; `max_rows = (height - FB_CONSOLE_Y0) / cell_h`
+  - DELETED `fb_audit_mtrr`, `fb_mtrr_install_wc`, `fb_audit_pci_bar`, `pci_cfg_addr`, `pci_cfg_read32` (call sites already removed at 1.30.11)
+  - in-file MTRR-removal comment in `fb_console_init` updated to reflect full deletion
+- `kernel/version.cyr`: kernel banner, shell banner, `_AGNOS_VERSION` bumped to 1.30.12 (auto-regenerated by `scripts/version-bump.sh`)
+- `agnosticos/scripts/src/read-boot-log.cyr`: removed reads of CMOS slots `[0x88..0x8F]`, removed focused-summary MTRR/PCI prose block, removed verbose-mode `print_cmos_line` rows for those slots, sweep header re-pointed from "Attempt 74 scanout re-arm" to "Attempt 77 true-font swap"
+
+### Out of scope
+
+- **Color attributes / per-character colors.** White-on-black stays.
+- **Unicode beyond ASCII 0x20-0x7F.** CP437 line-drawing chars are post-MVP.
+- **Spleen / Terminus / Cozette quality bump.** VGA 8×16 is MVP-shaped; higher-density bitmap fonts queued for 1.31.x as a quality bump if archaemenid evidence supports it.
+- **Shadow buffer + single-burst FB push.** Still 1.31.x triage (pristine refresh; gated on PMM contig allocator).
+- **Multi-device USB / xHCI.** Still queued for triage after the visual-MVP gate clears.
+- **Font fallback / runtime font selection.** Compiled-in only; no filesystem dependency at boot.
+
 ## [1.30.11] — 2026-05-19 → 2026-05-20 (FB hardening — PixelFormat guard + WC retry-after-pmm + idempotent vmm_remap_wc_2mb + font-density scale + MTRR/audit removal; iron Attempts 71→76, Quiet Boot MVP gate at 76)
 
 **Post-MVP hardening cycle — Quiet Boot path joins VGA-spec at the MVP gate.** Three 1.30.10 carry-forward items closed (VGA-vs-HDMI handoff guard, obsolete gvar-init workaround cleanup, FB BAR memtype runtime check), plus a pre-existing multi-chunk WC-remap leak in `vmm_remap_wc_2mb` that the new memtype check surfaced and is now fixed in the same cut. The quiet-boot ON/OFF asymmetry on archaemenid (HDMI-spec mode produces garbled glyphs, VGA-spec mode renders clean — original symptom in Attempt 33 photo, 2026-05-16) was originally hypothesized to be a non-BGRX PixelFormat under quiet-boot ON; the PixelFormat guard landed first and then iron evidence falsified the hypothesis (Attempt 71 stamped `pf=1` BGRX same as VGA-spec). The cycle then accreted a font-pixel-density fix and an MTRR/audit removal across Attempts 72→76 before clearing the Quiet Boot MVP gate — typeable shell, live keyboard, live refresh — at Attempt 76 on 2026-05-20. Visual legibility (the remaining bar) is a font-source problem, not a paint/cache problem, and moves to 1.30.12 true-font.

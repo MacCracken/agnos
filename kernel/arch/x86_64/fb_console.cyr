@@ -2,13 +2,13 @@
 #
 # Companion to fb.cyr's cp_fb() cell grid. Where cp_fb paints colored
 # marker cells at fixed positions for boot-progress diagnostics, this
-# module renders 8x8 glyph text in a scrolling region below the cell
+# module renders 8x16 glyph text in a scrolling region below the cell
 # grid. Required for iron-MVP (typeable shell on hardware without a
 # serial cable).
 #
 # Layout (v1.30.1: simplified — kernel boots reliably enough that the
 # stage-bisection apparatus came down):
-#   y =   0..    text console (this module). 8x8 glyphs, software scroll.
+#   y =   0..    text console (this module). 8x16 glyphs, software scroll.
 #
 # Prior layouts kept rows reserved for a boot_shim canary stripe and the
 # cp_fb marker-cell grid; both are gone. The full-screen clear at the
@@ -16,10 +16,16 @@
 # way out (gnoboot's `efi_clear` + handoff banner) so the kernel log is
 # the only thing on the framebuffer once shell comes up.
 #
-# Font: subset of CGA 8x8 covering printable ASCII 0x20..0x7F (96 glyphs,
-# 768 bytes). Each glyph is 8 bytes top-to-bottom; bit 7 = leftmost pixel
-# of that row. Stored packed as one u64 per glyph (row 0 = high byte) so
-# the init table is one line per character.
+# Font: IBM VGA BIOS 8x16 ROM font (public domain, IBM 1981; same byte
+# table Linux's lib/fonts/font_8x16.c carries). Covers printable ASCII
+# 0x20..0x7F (96 glyphs, 1536 bytes). Each glyph is 16 bytes top-to-bottom;
+# bit 7 = leftmost pixel of that row. Stored packed as two u64s per glyph
+# via fset16(ch, hi, lo) — hi = rows 0-7, lo = rows 8-15 — so each literal
+# reads top-to-bottom: 0xR0R1R2R3R4R5R6R7 0xR8R9RARBRCRDRERF. Replaced
+# the hand-drawn 8x8 CGA bitmap at 1.30.12 — at 2K+ native HDMI the 8x8
+# source was illegible even at 3x scale (Attempt 76 photo,
+# iron-nuc-zen-photos/attempt-76-quiet-boot-scaled-glyphs-illegible.jpg).
+# Cell dimensions are now non-square: cell_w = 8*scale, cell_h = 16*scale.
 #
 # Color: white foreground on black background. Both pixels are painted
 # per glyph cell (no transparency) so the console area paints fully even
@@ -36,9 +42,9 @@
 # kprint.cyr (which wraps fb_putc into the kernel-wide print API).
 # Ordering enforced by kernel/agnos.cyr include order.
 
-var fb_font[768];        # 96 glyphs (0x20..0x7F) x 8 bytes
-var fb_cur_x = 0;        # cursor column (in 8-px cells from x=0)
-var fb_cur_y = 0;        # cursor row (in 8-px cells from FB_CONSOLE_Y0)
+var fb_font[1536];       # 96 glyphs (0x20..0x7F) x 16 bytes (VGA 8x16)
+var fb_cur_x = 0;        # cursor column (in 8*scale-px cells from x=0)
+var fb_cur_y = 0;        # cursor row (in 16*scale-px cells from FB_CONSOLE_Y0)
 var fb_console_ready = 0;
 
 # Write one byte to the CMOS extended bank (slots 0x80..0xFF, addressed
@@ -57,19 +63,28 @@ fn cmos_ext_write(slot, val) {
     return 0;
 }
 
-# Pack one glyph's 8 row-bytes into fb_font[glyph_index*8 .. +7].
-# Row order: byte 7 (top) = high nibble pair of `val`, byte 0 (bottom) = low.
-# That way the literal reads top-to-bottom: 0xR0R1R2R3R4R5R6R7.
-fn fset(ch, val) {
-    var g = &fb_font + (ch - 0x20) * 8;
-    store8(g + 0, (val >> 56) & 0xFF);
-    store8(g + 1, (val >> 48) & 0xFF);
-    store8(g + 2, (val >> 40) & 0xFF);
-    store8(g + 3, (val >> 32) & 0xFF);
-    store8(g + 4, (val >> 24) & 0xFF);
-    store8(g + 5, (val >> 16) & 0xFF);
-    store8(g + 6, (val >> 8)  & 0xFF);
-    store8(g + 7, val & 0xFF);
+# Pack one glyph's 16 row-bytes into fb_font[glyph_index*16 .. +15].
+# Row order: hi.byte7 (top) = rows 0-7 high-to-low, lo.byte7 = rows 8-15.
+# That way each literal reads top-to-bottom across two u64s as
+# 0xR0R1R2R3R4R5R6R7 0xR8R9RARBRCRDRERF.
+fn fset16(ch, hi, lo) {
+    var g = &fb_font + (ch - 0x20) * 16;
+    store8(g +  0, (hi >> 56) & 0xFF);
+    store8(g +  1, (hi >> 48) & 0xFF);
+    store8(g +  2, (hi >> 40) & 0xFF);
+    store8(g +  3, (hi >> 32) & 0xFF);
+    store8(g +  4, (hi >> 24) & 0xFF);
+    store8(g +  5, (hi >> 16) & 0xFF);
+    store8(g +  6, (hi >>  8) & 0xFF);
+    store8(g +  7, hi & 0xFF);
+    store8(g +  8, (lo >> 56) & 0xFF);
+    store8(g +  9, (lo >> 48) & 0xFF);
+    store8(g + 10, (lo >> 40) & 0xFF);
+    store8(g + 11, (lo >> 32) & 0xFF);
+    store8(g + 12, (lo >> 24) & 0xFF);
+    store8(g + 13, (lo >> 16) & 0xFF);
+    store8(g + 14, (lo >>  8) & 0xFF);
+    store8(g + 15, lo & 0xFF);
     return 0;
 }
 
@@ -144,14 +159,13 @@ fn fb_console_init() {
     cmos_ext_write(0x9E, diag_mmax & 0xFF);
     cmos_ext_write(0x9F, 0xFB);
 
-    # MTRR-WC install + MTRR/PCI audit calls removed 2026-05-20:
-    # Attempt 74 falsified the "MTRR=UC overrides PAT-WC" hypothesis
-    # (no visual change after WC install) and the wrmsr to MTRR
-    # PHYSBASE/PHYSMASK is the leading suspect for the new Quiet Boot
-    # lockup (AMD SYS_CFG_MSR MtrrLock → #GP on writes). True root
-    # cause was font-pixel-density at 2560x1440 — see fb_scale() below
-    # and the iron-nuc-zen-log § Attempt 74 result. Function bodies
-    # remain in this file for now; full cleanup follow-up.
+    # MTRR-WC install + MTRR/PCI audit removed at 1.30.12. Attempt 74
+    # falsified the "MTRR=UC overrides PAT-WC" hypothesis (visual unchanged
+    # after WC install) and the wrmsr to MTRR PHYSBASE/PHYSMASK locked the
+    # box under Quiet Boot (AMD SYS_CFG_MSR MtrrLock → #GP). The 1.30.11
+    # cut removed the call sites; 1.30.12 removed the function bodies as
+    # part of the true-font swap bundle. Real root cause across the 71-74
+    # ladder was font-pixel-density — see fb_scale() and the VGA 8x16 swap.
 
     # PixelFormat guard. EFI_GRAPHICS_PIXEL_FORMAT values:
     #   0 = PixelRedGreenBlueReserved8BitPerColor (RGBX 32bpp)
@@ -207,103 +221,105 @@ fn fb_console_init() {
             }
         }
     }
-    # Printable ASCII 0x20..0x7E (CGA-style 8x8 bitmaps; DEL=blank).
-    fset(0x20, 0x0000000000000000);  # space
-    fset(0x21, 0x1818181818001800);  # !
-    fset(0x22, 0x6C6C000000000000);  # "
-    fset(0x23, 0x6CFE6C6CFE6C0000);  # #
-    fset(0x24, 0x187EC07C06FC1800);  # $
-    fset(0x25, 0xC6CC1830667CC600);  # %
-    fset(0x26, 0x386C3876DCCC7600);  # &
-    fset(0x27, 0x3030600000000000);  # '
-    fset(0x28, 0x0C18303030180C00);  # (
-    fset(0x29, 0x30180C0C0C183000);  # )
-    fset(0x2A, 0x00663CFF3C660000);  # *
-    fset(0x2B, 0x0018187E18180000);  # +
-    fset(0x2C, 0x0000000000181830);  # ,
-    fset(0x2D, 0x000000FE00000000);  # -
-    fset(0x2E, 0x0000000000181800);  # .
-    fset(0x2F, 0x03060C18306080C0);  # /
-    fset(0x30, 0x7CC6CEDEE6E67C00);  # 0
-    fset(0x31, 0x18381818181818FF);  # 1  (long bottom bar)
-    fset(0x32, 0x7CC60E3C70E0FE00);  # 2
-    fset(0x33, 0x7CC6063C06C67C00);  # 3
-    fset(0x34, 0x1C3C6CCCFE0C1E00);  # 4
-    fset(0x35, 0xFEC0FC0606C67C00);  # 5
-    fset(0x36, 0x3860C0FCC6C67C00);  # 6
-    fset(0x37, 0xFEC60C1830303000);  # 7
-    fset(0x38, 0x7CC6C67CC6C67C00);  # 8
-    fset(0x39, 0x7CC6C67E060C7800);  # 9
-    fset(0x3A, 0x0018180000181800);  # :
-    fset(0x3B, 0x0018180000181830);  # ;
-    fset(0x3C, 0x060C18306030180C);  # <
-    fset(0x3D, 0x0000FE0000FE0000);  # =
-    fset(0x3E, 0x6030180C18306000);  # >
-    fset(0x3F, 0x7CC6060C18001800);  # ?
-    fset(0x40, 0x7CC6DEDADE607C00);  # @
-    fset(0x41, 0x386CC6C6FEC6C600);  # A
-    fset(0x42, 0xFC66667C6666FC00);  # B
-    fset(0x43, 0x3C66C0C0C0663C00);  # C
-    fset(0x44, 0xF86C6666666CF800);  # D
-    fset(0x45, 0xFE60687868607E00);  # E
-    fset(0x46, 0xFE60687868606000);  # F
-    fset(0x47, 0x3C66C0C0CE663E00);  # G
-    fset(0x48, 0xC6C6C6FEC6C6C600);  # H
-    fset(0x49, 0x3C18181818183C00);  # I
-    fset(0x4A, 0x0E060606C6C67C00);  # J
-    fset(0x4B, 0xC6CCD8F0D8CCC600);  # K
-    fset(0x4C, 0x6060606060607E00);  # L
-    fset(0x4D, 0xC6EEFEFED6C6C600);  # M
-    fset(0x4E, 0xC6E6F6DECEC6C600);  # N
-    fset(0x4F, 0x7CC6C6C6C6C67C00);  # O
-    fset(0x50, 0xFC66667C60606000);  # P
-    fset(0x51, 0x7CC6C6C6D6CE7B00);  # Q
-    fset(0x52, 0xFC66667C6C66C700);  # R
-    fset(0x53, 0x7CC660380CC67C00);  # S
-    fset(0x54, 0x7E5A181818183C00);  # T
-    fset(0x55, 0xC6C6C6C6C6C67C00);  # U
-    fset(0x56, 0xC6C6C6C6C66C3800);  # V
-    fset(0x57, 0xC6C6C6D6FEEEC600);  # W
-    fset(0x58, 0xC6C66C386CC6C600);  # X
-    fset(0x59, 0x6666663C18183C00);  # Y
-    fset(0x5A, 0xFEC68C183266FE00);  # Z
-    fset(0x5B, 0x3C30303030303C00);  # [
-    fset(0x5C, 0xC06030180C060200);  # backslash
-    fset(0x5D, 0x3C0C0C0C0C0C3C00);  # ]
-    fset(0x5E, 0x10386CC600000000);  # ^
-    fset(0x5F, 0x00000000000000FF);  # _
-    fset(0x60, 0x3018000000000000);  # `
-    fset(0x61, 0x0000780C7CCCCC76);  # a
-    fset(0x62, 0xE0607C6666667C00);  # b
-    fset(0x63, 0x00007CC6C0C67C00);  # c
-    fset(0x64, 0x1C0C7CCCCCCC7600);  # d
-    fset(0x65, 0x00007CC6FEC07C00);  # e
-    fset(0x66, 0x386C60F060607000);  # f
-    fset(0x67, 0x000076CCCC7C0CF8);  # g
-    fset(0x68, 0xE0606C7666666600);  # h
-    fset(0x69, 0x1800381818183C00);  # i
-    fset(0x6A, 0x0600060606666638);  # j
-    fset(0x6B, 0xE0606678786C6600);  # k
-    fset(0x6C, 0x3818181818183C00);  # l
-    fset(0x6D, 0x0000FEDBDBDBDB00);  # m
-    fset(0x6E, 0x0000DC6666666600);  # n
-    fset(0x6F, 0x00007CC6C6C67C00);  # o
-    fset(0x70, 0x0000DC6666667C60);  # p
-    fset(0x71, 0x000076CCCC7C0C1E);  # q
-    fset(0x72, 0x0000DC7666606000);  # r
-    fset(0x73, 0x00007EC07C06FC00);  # s
-    fset(0x74, 0x3030FC3030361C00);  # t
-    fset(0x75, 0x0000CCCCCCCC7600);  # u
-    fset(0x76, 0x0000C6C6C66C3800);  # v
-    fset(0x77, 0x0000C6D6D6FE6C00);  # w
-    fset(0x78, 0x0000C66C386CC600);  # x
-    fset(0x79, 0x0000C6C6C67E067C);  # y
-    fset(0x7A, 0x0000FE8C18327E00);  # z
-    fset(0x7B, 0x0E1818701818FE00);  # {
-    fset(0x7C, 0x1818181818181800);  # |
-    fset(0x7D, 0x70181C0E181870FE);  # }
-    fset(0x7E, 0x76DC000000000000);  # ~
-    fset(0x7F, 0x0000000000000000);  # DEL = blank
+    # Printable ASCII 0x20..0x7F. IBM VGA BIOS 8x16 ROM font (public domain).
+    # Same byte table Linux's lib/fonts/font_8x16.c carries. Each call sets
+    # 16 rows top-to-bottom; hi = rows 0-7, lo = rows 8-15.
+    fset16(0x20, 0x0000000000000000, 0x0000000000000000);  # space
+    fset16(0x21, 0x0000183C3C3C1818, 0x1800181800000000);  # !
+    fset16(0x22, 0x0066666624000000, 0x0000000000000000);  # "
+    fset16(0x23, 0x0000006C6CFE6C6C, 0x6CFE6C6C00000000);  # #
+    fset16(0x24, 0x18187CC6C2C07C06, 0x0686C67C18180000);  # $
+    fset16(0x25, 0x00000000C2C60C18, 0x3060C68600000000);  # %
+    fset16(0x26, 0x0000386C6C3876DC, 0xCCCCCC7600000000);  # &
+    fset16(0x27, 0x0030303060000000, 0x0000000000000000);  # '
+    fset16(0x28, 0x00000C1830303030, 0x3030180C00000000);  # (
+    fset16(0x29, 0x000030180C0C0C0C, 0x0C0C183000000000);  # )
+    fset16(0x2A, 0x0000000000663CFF, 0x3C66000000000000);  # *
+    fset16(0x2B, 0x000000000018187E, 0x1818000000000000);  # +
+    fset16(0x2C, 0x0000000000000000, 0x0018181830000000);  # ,
+    fset16(0x2D, 0x00000000000000FE, 0x0000000000000000);  # -
+    fset16(0x2E, 0x0000000000000000, 0x0000181800000000);  # .
+    fset16(0x2F, 0x0000000002060C18, 0x3060C08000000000);  # /
+    fset16(0x30, 0x0000386CC6C6D6D6, 0xC6C66C3800000000);  # 0
+    fset16(0x31, 0x0000183878181818, 0x1818187E00000000);  # 1
+    fset16(0x32, 0x00007CC6060C1830, 0x60C0C6FE00000000);  # 2
+    fset16(0x33, 0x00007CC606063C06, 0x0606C67C00000000);  # 3
+    fset16(0x34, 0x00000C1C3C6CCCFE, 0x0C0C0C1E00000000);  # 4
+    fset16(0x35, 0x0000FEC0C0C0FC06, 0x0606C67C00000000);  # 5
+    fset16(0x36, 0x00003860C0C0FCC6, 0xC6C6C67C00000000);  # 6
+    fset16(0x37, 0x0000FEC606060C18, 0x3030303000000000);  # 7
+    fset16(0x38, 0x00007CC6C6C67CC6, 0xC6C6C67C00000000);  # 8
+    fset16(0x39, 0x00007CC6C6C67E06, 0x06060C7800000000);  # 9
+    fset16(0x3A, 0x0000000018180000, 0x0018180000000000);  # :
+    fset16(0x3B, 0x0000000018180000, 0x0018183000000000);  # ;
+    fset16(0x3C, 0x000000060C183060, 0x30180C0600000000);  # <
+    fset16(0x3D, 0x00000000007E0000, 0x7E00000000000000);  # =
+    fset16(0x3E, 0x0000006030180C06, 0x0C18306000000000);  # >
+    fset16(0x3F, 0x00007CC6C60C1818, 0x1800181800000000);  # ?
+    fset16(0x40, 0x0000007CC6C6DEDE, 0xDEDCC07C00000000);  # @
+    fset16(0x41, 0x000010386CC6C6FE, 0xC6C6C6C600000000);  # A
+    fset16(0x42, 0x0000FC6666667C66, 0x666666FC00000000);  # B
+    fset16(0x43, 0x00003C66C2C0C0C0, 0xC0C2663C00000000);  # C
+    fset16(0x44, 0x0000F86C66666666, 0x66666CF800000000);  # D
+    fset16(0x45, 0x0000FE6662687868, 0x606266FE00000000);  # E
+    fset16(0x46, 0x0000FE6662687868, 0x606060F000000000);  # F
+    fset16(0x47, 0x00003C66C2C0C0DE, 0xC6C6663A00000000);  # G
+    fset16(0x48, 0x0000C6C6C6C6FEC6, 0xC6C6C6C600000000);  # H
+    fset16(0x49, 0x00003C1818181818, 0x1818183C00000000);  # I
+    fset16(0x4A, 0x00001E0C0C0C0C0C, 0xCCCCCC7800000000);  # J
+    fset16(0x4B, 0x0000E666666C7878, 0x6C6666E600000000);  # K
+    fset16(0x4C, 0x0000F06060606060, 0x606266FE00000000);  # L
+    fset16(0x4D, 0x0000C6EEFEFED6C6, 0xC6C6C6C600000000);  # M
+    fset16(0x4E, 0x0000C6E6F6FEDECE, 0xC6C6C6C600000000);  # N
+    fset16(0x4F, 0x00007CC6C6C6C6C6, 0xC6C6C67C00000000);  # O
+    fset16(0x50, 0x0000FC6666667C60, 0x606060F000000000);  # P
+    fset16(0x51, 0x00007CC6C6C6C6C6, 0xC6D6DE7C0C0E0000);  # Q
+    fset16(0x52, 0x0000FC6666667C6C, 0x666666E600000000);  # R
+    fset16(0x53, 0x00007CC6C660380C, 0x06C6C67C00000000);  # S
+    fset16(0x54, 0x00007E7E5A181818, 0x1818183C00000000);  # T
+    fset16(0x55, 0x0000C6C6C6C6C6C6, 0xC6C6C67C00000000);  # U
+    fset16(0x56, 0x0000C6C6C6C6C6C6, 0xC66C381000000000);  # V
+    fset16(0x57, 0x0000C6C6C6C6D6D6, 0xD6FEEE6C00000000);  # W
+    fset16(0x58, 0x0000C6C66C7C3838, 0x7C6CC6C600000000);  # X
+    fset16(0x59, 0x0000666666663C18, 0x1818183C00000000);  # Y
+    fset16(0x5A, 0x0000FEC6860C1830, 0x60C2C6FE00000000);  # Z
+    fset16(0x5B, 0x00003C3030303030, 0x3030303C00000000);  # [
+    fset16(0x5C, 0x00000080C0E07038, 0x1C0E060200000000);  # backslash
+    fset16(0x5D, 0x00003C0C0C0C0C0C, 0x0C0C0C3C00000000);  # ]
+    fset16(0x5E, 0x10386CC600000000, 0x0000000000000000);  # ^
+    fset16(0x5F, 0x0000000000000000, 0x0000000000FF0000);  # _
+    fset16(0x60, 0x0030180C00000000, 0x0000000000000000);  # `
+    fset16(0x61, 0x0000000000780C7C, 0xCCCCCC7600000000);  # a
+    fset16(0x62, 0x0000E06060786C66, 0x6666667C00000000);  # b
+    fset16(0x63, 0x00000000007CC6C0, 0xC0C0C67C00000000);  # c
+    fset16(0x64, 0x00001C0C0C3C6CCC, 0xCCCCCC7600000000);  # d
+    fset16(0x65, 0x00000000007CC6FE, 0xC0C0C67C00000000);  # e
+    fset16(0x66, 0x00001C3632307830, 0x3030307800000000);  # f
+    fset16(0x67, 0x000000000076CCCC, 0xCCCCCC7C0CCC7800);  # g
+    fset16(0x68, 0x0000E060606C7666, 0x666666E600000000);  # h
+    fset16(0x69, 0x0000181800381818, 0x1818183C00000000);  # i
+    fset16(0x6A, 0x00000606000E0606, 0x0606060666663C00);  # j
+    fset16(0x6B, 0x0000E06060666C78, 0x786C66E600000000);  # k
+    fset16(0x6C, 0x0000381818181818, 0x1818183C00000000);  # l
+    fset16(0x6D, 0x0000000000ECFED6, 0xD6D6D6C600000000);  # m
+    fset16(0x6E, 0x0000000000DC6666, 0x6666666600000000);  # n
+    fset16(0x6F, 0x00000000007CC6C6, 0xC6C6C67C00000000);  # o
+    fset16(0x70, 0x0000000000DC6666, 0x6666667C6060F000);  # p
+    fset16(0x71, 0x000000000076CCCC, 0xCCCCCC7C0C0C1E00);  # q
+    fset16(0x72, 0x0000000000DC7666, 0x606060F000000000);  # r
+    fset16(0x73, 0x00000000007CC660, 0x380CC67C00000000);  # s
+    fset16(0x74, 0x0000103030FC3030, 0x3030361C00000000);  # t
+    fset16(0x75, 0x0000000000CCCCCC, 0xCCCCCC7600000000);  # u
+    fset16(0x76, 0x0000000000C6C6C6, 0xC6C66C3800000000);  # v
+    fset16(0x77, 0x0000000000C6C6D6, 0xD6D6FE6C00000000);  # w
+    fset16(0x78, 0x0000000000C66C38, 0x38386CC600000000);  # x
+    fset16(0x79, 0x0000000000C6C6C6, 0xC6C6C67E060CF800);  # y
+    fset16(0x7A, 0x0000000000FECC18, 0x3060C6FE00000000);  # z
+    fset16(0x7B, 0x00000E1818187018, 0x1818180E00000000);  # {
+    fset16(0x7C, 0x0000181818181818, 0x1818181800000000);  # |
+    fset16(0x7D, 0x0000701818180E18, 0x1818187000000000);  # }
+    fset16(0x7E, 0x0076DC0000000000, 0x0000000000000000);  # ~
+    fset16(0x7F, 0x0000000010386CC6, 0xC6C6FE0000000000);  # DEL=blank
     fb_cur_x = 0;
     fb_cur_y = 0;
     fb_console_ready = 1;
@@ -344,228 +360,6 @@ fn fb_verify_wc() {
         serial_println("", 0);
     }
     return 0;
-}
-
-# === MTRR effective-type audit for fb_phys ================================
-#
-# Reads MTRR_DEF_TYPE (MSR 0x2FF), IA32_MTRRCAP (MSR 0xFE), and the
-# variable-range MTRR pairs (MSRs 0x200-0x20F) via existing rdmsr().
-# Computes the effective MTRR type covering fb_phys per Intel SDM Vol 3A
-# §11.5.2.2 / AMD APM Vol 2 §7.7.5: variable MTRR with V=1 whose
-# (base_addr & mask_addr) == (phys & mask_addr) wins; falls through to
-# DEF_TYPE if no MTRR covers the address.
-#
-# Type encoding (matches PAT enum at MSR 0x277):
-#   0 = UC, 1 = WC, 4 = WT, 5 = WP, 6 = WB.
-#
-# Sinks results to CMOS extended bank — archaemenid has no serial cable,
-# so any audit output via serial_print is invisible on iron. Stamps:
-#   [0x88] = matched MTRR effective type at fb_phys
-#   [0x89] = MTRR_DEF_TYPE bits[7:0]
-# Decoder reads these in read-boot-log.cyr.
-#
-# Linux reference: arch/x86/kernel/cpu/mtrr/generic.c::mtrr_type_lookup_variable.
-fn fb_audit_mtrr() {
-    var fb_phys = fb_fb_phys();
-    if (fb_phys == 0) { return 0; }
-
-    var def_type = rdmsr(0x2FF);
-    var def_byte = def_type & 0xFF;
-    var enable   = (def_type >> 11) & 1;
-
-    cmos_ext_write(0x89, def_byte & 0xFF);
-
-    if (enable == 0) {
-        cmos_ext_write(0x88, def_byte & 0xFF);
-        return def_byte;
-    }
-
-    var mtrrcap = rdmsr(0xFE);
-    var vcnt    = mtrrcap & 0xFF;
-    if (vcnt > 8) { vcnt = 8; }  # safety cap; modern x86 ships ≤ 8 pairs
-
-    var matched_type = def_byte;
-
-    for (var i = 0; i < vcnt; i = i + 1) {
-        var base_msr = rdmsr(0x200 + i * 2);
-        var mask_msr = rdmsr(0x201 + i * 2);
-        var valid    = (mask_msr >> 11) & 1;
-        if (valid != 0) {
-            var base_addr = base_msr & 0xFFFFFFFFFFFFF000;
-            var mask_addr = mask_msr & 0xFFFFFFFFFFFFF000;
-            if ((fb_phys & mask_addr) == (base_addr & mask_addr)) {
-                matched_type = base_msr & 0xFF;
-            }
-        }
-    }
-
-    cmos_ext_write(0x88, matched_type & 0xFF);
-
-    return matched_type;
-}
-
-# === Variable-MTRR WC install for the framebuffer ==========================
-#
-# Plants a single variable MTRR pair (PHYSBASE_n/PHYSMASK_n) with type=WC
-# covering [base, base + size_pow2) where size_pow2 is the smallest power
-# of two ≥ requested size, and base is size-aligned downward (Intel SDM
-# Vol 3A §11.11.3 — variable MTRR ranges must be naturally aligned).
-#
-# Why this is the load-bearing fix for UMA-iGPU FB rendering on AMD APUs:
-# the FB is system DRAM that the display controller reads. PAT-WC alone
-# on page-table entries is silently overridden when an MTRR variable or
-# default range covers the FB region with type=UC or type=WB-without-WC-
-# combinability. SDM Table 11-7 / AMD APM Vol 2 §7.7.5 spell the
-# resolution: MTRR-WC wins; MTRR-UC always wins (forces UC). Planting an
-# MTRR-WC range for the FB makes PAT-WC actually take effect.
-#
-# Linux equivalent: arch_phys_wc_add() at arch/x86/mm/pat/set_memory.c
-# wrapping mtrr_add_page() at arch/x86/kernel/cpu/mtrr/mtrr.c. We omit
-# the full safe-MTRR-modify sequence (CR0.CD=1, WBINVD, CR4.PGE clear,
-# CR3 reload, MTRR_DEF_TYPE.E=0, write, re-enable, restore) because
-# fb_console_init runs single-CPU pre-IDT pre-interrupts (CP6 hasn't
-# stamped yet) — the wbinvd bracket plus the natural cache shoot-down
-# from PAT/MTRR-aware page walks suffices. SMP-correct rewrite is
-# post-MVP work.
-#
-# Slot selection: scans variable MTRRs (count from IA32_MTRRCAP bits[7:0],
-# capped at 8) for first pair whose mask.V=0. Returns 1 on success, 0 if
-# all slots occupied or MTRRs disabled.
-fn fb_mtrr_install_wc(phys, size) {
-    if (phys == 0) { return 0; }
-    if (size == 0) { return 0; }
-
-    var s = 0x1000;
-    while (s < size) { s = s * 2; }
-
-    var mtrrcap = rdmsr(0xFE);
-    var vcnt = mtrrcap & 0xFF;
-    if (vcnt > 8) { vcnt = 8; }
-    if (vcnt == 0) { return 0; }
-
-    var def_type = rdmsr(0x2FF);
-    if (((def_type >> 11) & 1) == 0) { return 0; }
-
-    var slot = 0xFF;
-    var free_slot = 0xFF;
-    for (var i = 0; i < vcnt; i = i + 1) {
-        if (slot == 0xFF) {
-            var base_i = rdmsr(0x200 + i * 2);
-            var mask_i = rdmsr(0x201 + i * 2);
-            var valid_i = (mask_i >> 11) & 1;
-            if (valid_i == 0) {
-                if (free_slot == 0xFF) { free_slot = i; }
-            }
-            else {
-                var addr_base = base_i & 0xFFFFFFFFFFFFF000;
-                var addr_mask = mask_i & 0xFFFFFFFFFFFFF000;
-                if ((phys & addr_mask) == (addr_base & addr_mask)) {
-                    slot = i;
-                }
-            }
-        }
-    }
-    if (slot == 0xFF) { slot = free_slot; }
-    if (slot == 0xFF) { return 0; }
-
-    var phys_aligned = phys & 0xFFFFFFFFFFFFF000;
-    var size_mask = s - 1;
-    phys_aligned = phys_aligned & ~size_mask;
-
-    var base_val = phys_aligned | 1;
-    var mask_val = ((~size_mask) & 0x0000FFFFFFFFF000) | 0x800;
-
-    wbinvd();
-    wrmsr(0x200 + slot * 2, base_val);
-    wrmsr(0x201 + slot * 2, mask_val);
-    wbinvd();
-
-    return 1;
-}
-
-# === PCI BAR readback for VGA-class device =================================
-#
-# Walks PCI config space via legacy 0xCF8/0xCFC port-I/O (the canonical
-# pre-MMCONFIG accessor — Linux arch/x86/pci/early.c, OSDev "PCI"). Filters
-# by class code at config+0x08:
-#   0x030000 = VGA-compatible controller
-#   0x038000 = Other display controller (catches some integrated GPUs)
-#
-# For each matching device, reads BAR0..BAR5 (offsets 0x10..0x24) and
-# captures the first MMIO BAR whose base + a 256 MB heuristic window
-# contains fb_phys. NO BAR SIZING (write-all-1s read-back trick): the
-# live FB is being painted from the BAR we're examining; unmapping it
-# transiently risks corrupting paint state.
-#
-# Cap at bus 0..3 to avoid scanning empty buses on archaemenid (Beelink
-# SER NUC; integrated GPU sits on bus 0).
-#
-# Sinks results to CMOS extended bank — iron has no serial. Stamps:
-#   [0x8A..0x8D] = matched VGA BAR base bits[31:0] (LE32; 0 if no match)
-#   [0x8E]       = (fb_phys - base) & 0xFF — delta low byte (0 if clean,
-#                  non-zero indicates BAR offset divergence)
-#   [0x8F]       = match flag (1 = matched, 0 = no VGA class found / BAR
-#                  reassigned past 256 MB / discrete GPU on bus >= 4)
-fn pci_cfg_addr(bus, dev, func, off) {
-    return 0x80000000 | (bus << 16) | (dev << 11) | (func << 8) | (off & 0xFC);
-}
-fn pci_cfg_read32(bus, dev, func, off) {
-    outl(0xCF8, pci_cfg_addr(bus, dev, func, off));
-    return inl(0xCFC);
-}
-fn fb_audit_pci_bar() {
-    var fb_phys = fb_fb_phys();
-    if (fb_phys == 0) { return 0; }
-
-    cmos_ext_write(0x8A, 0);
-    cmos_ext_write(0x8B, 0);
-    cmos_ext_write(0x8C, 0);
-    cmos_ext_write(0x8D, 0);
-    cmos_ext_write(0x8E, 0);
-    cmos_ext_write(0x8F, 0);
-
-    var matched = 0;
-
-    for (var bus = 0; bus < 4; bus = bus + 1) {
-        for (var dev = 0; dev < 32; dev = dev + 1) {
-            if (matched == 0) {
-                var vendor = pci_cfg_read32(bus, dev, 0, 0x00) & 0xFFFF;
-                if (vendor != 0xFFFF) {
-                    var class_code = (pci_cfg_read32(bus, dev, 0, 0x08) >> 16) & 0xFFFF;
-                    if (class_code == 0x0300 || class_code == 0x0380) {
-                        for (var b = 0; b < 6; b = b + 1) {
-                            if (matched == 0) {
-                                var bar_off = 0x10 + b * 4;
-                                var bar = pci_cfg_read32(bus, dev, 0, bar_off);
-                                if ((bar & 1) == 0) {  # MMIO (bit[0]=0)
-                                    var type_bits = (bar >> 1) & 3;
-                                    var base = bar & 0xFFFFFFF0;
-                                    if (type_bits == 2) {  # 64-bit BAR
-                                        var bar_hi = pci_cfg_read32(bus, dev, 0, bar_off + 4);
-                                        base = base | (bar_hi << 32);
-                                    }
-                                    if (base != 0 && fb_phys >= base) {
-                                        var delta = fb_phys - base;
-                                        if (delta < 0x10000000) {  # 256 MB heuristic
-                                            cmos_ext_write(0x8A, base & 0xFF);
-                                            cmos_ext_write(0x8B, (base >> 8) & 0xFF);
-                                            cmos_ext_write(0x8C, (base >> 16) & 0xFF);
-                                            cmos_ext_write(0x8D, (base >> 24) & 0xFF);
-                                            cmos_ext_write(0x8E, delta & 0xFF);
-                                            cmos_ext_write(0x8F, 1);
-                                            matched = 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    return matched;
 }
 
 # Get framebuffer geometry from boot_info. Returns 0 if unavailable
@@ -654,27 +448,22 @@ var FB_CONSOLE_Y0 = 0;
 var FB_FG = 0x00FFFFFF;  # white
 var FB_BG = 0x00000000;  # black
 
-# Glyph scale factor derived from display height. 8x8 CGA bitmap glyphs
-# are illegibly small on native HDMI modes (at 2560x1440 an 8-px-tall
-# row is 0.5% of screen height — text appears as horizontal stripes,
-# the Attempt-33 signature). Scale each font pixel into an SxS block at
-# render time so character cells are 8*S pixels per side. Picked from
-# height rather than width because text legibility tracks vertical pixel
-# count, not aspect ratio.
+# Glyph scale factor derived from display height. With the 1.30.12 swap
+# to a real 8x16 bitmap font, scale=1 is already legible at 1080p (cell
+# 8x16 = ~1.5% of screen height) and scale=2 covers 2K+. Pre-1.30.12 used
+# four tiers because the 8x8 source needed more scaling to be visible at
+# all; the real font collapsed that to two tiers. Render expands each
+# font bit into an S x S pixel block, so cell_w = 8*S and cell_h = 16*S.
 #
-#   h ≤  900  → scale = 1   (8-px text, native CGA size; legacy / VGA)
-#   h ≤ 1200  → scale = 2   (16-px text, ~80 cols at 1920x1080)
-#   h ≤ 1800  → scale = 3   (24-px text, ~106 cols at 2560x1440)
-#   h >  1800 → scale = 4   (32-px text, ~120 cols at 3840x2160)
+#   h ≤ 1200  → scale = 1   (8x16 text, ~128 cols at 1024x768, ~240 at 1080p)
+#   h >  1200 → scale = 2   (16x32 text, ~160 cols at 2560x1440, ~240 at 4K)
 fn fb_scale() {
     var h = fb_height();
-    if (h <= 900)  { return 1; }
-    if (h <= 1200) { return 2; }
-    if (h <= 1800) { return 3; }
-    return 4;
+    if (h <= 1200) { return 1; }
+    return 2;
 }
 
-# Paint a solid-color cell (8*scale × 8*scale) at (cell_x, abs_y_px).
+# Paint a solid-color cell (8*scale × 16*scale) at (cell_x, abs_y_px).
 # Used by scroll bottom-row clear and backspace; not by glyph render
 # (which interleaves FG/BG per font bit).
 fn fb_fill_cell(cell_x, abs_y, color) {
@@ -682,10 +471,12 @@ fn fb_fill_cell(cell_x, abs_y, color) {
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var width = fb_width();
-    var cell_w = 8 * fb_scale();
+    var s = fb_scale();
+    var cell_w = 8 * s;
+    var cell_h = 16 * s;
     var x_px = cell_x * cell_w;
     if (x_px + cell_w > width) { return 0; }
-    for (var dy = 0; dy < cell_w; dy = dy + 1) {
+    for (var dy = 0; dy < cell_h; dy = dy + 1) {
         for (var dx = 0; dx < cell_w; dx = dx + 1) {
             store32(fb + (abs_y + dy) * pitch + (x_px + dx) * 4, color);
         }
@@ -693,9 +484,9 @@ fn fb_fill_cell(cell_x, abs_y, color) {
     return 0;
 }
 
-# Scroll the console area up by one 8-px row. Copy the rectangle from
-# y=FB_CONSOLE_Y0+8..height down to y=FB_CONSOLE_Y0..(height-8), then
-# clear the new bottom row to FB_BG.
+# Scroll the console area up by one cell row (16*scale pixels). Copy the
+# rectangle from y=FB_CONSOLE_Y0+cell_h..height down to
+# y=FB_CONSOLE_Y0..(height-cell_h), then clear the new bottom row.
 #
 # Pitch-aware: inner loops iterate `pitch / 4` u32s per row, not
 # `width`. Same rationale as fb_console_init's clear — when ppl > hres,
@@ -707,28 +498,28 @@ fn fb_scroll_up() {
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var height = fb_height();
-    var cell_w = 8 * fb_scale();
+    var cell_h = 16 * fb_scale();
     # u64 block-copy: 2 pixels per cycle. At 1080p, pitch=7680 -> 960
     # u64s per row (vs 1920 u32s). Halves both inner-loop count and
     # WC-write-combiner burst count. Read side still pays WC-mapped
     # FB read latency — if scroll feel doesn't improve, that's the
     # real bottleneck and we need a RAM-side shadow buffer.
     var stride_u64 = pitch / 8;
-    var rows_to_copy = height - FB_CONSOLE_Y0 - cell_w;
+    var rows_to_copy = height - FB_CONSOLE_Y0 - cell_h;
     if (rows_to_copy <= 0) { return 0; }
     # Copy line-by-line, top-down (no overlap risk since src is below dst).
     for (var y = 0; y < rows_to_copy; y = y + 1) {
-        var src = fb + (FB_CONSOLE_Y0 + cell_w + y) * pitch;
+        var src = fb + (FB_CONSOLE_Y0 + cell_h + y) * pitch;
         var dst = fb + (FB_CONSOLE_Y0 + y) * pitch;
         for (var x = 0; x < stride_u64; x = x + 1) {
             store64(dst + x * 8, load64(src + x * 8));
         }
     }
-    # Clear new bottom cell_w-px row to FB_BG. FB_BG is 0x00000000 today,
+    # Clear new bottom cell_h-px row to FB_BG. FB_BG is 0x00000000 today,
     # so the packed-pair u64 value is also 0 — no shift. If FB_BG ever
     # becomes non-zero, repack as (FB_BG << 32) | (FB_BG & 0xFFFFFFFF).
     var clear_y = FB_CONSOLE_Y0 + rows_to_copy;
-    for (var y = 0; y < cell_w; y = y + 1) {
+    for (var y = 0; y < cell_h; y = y + 1) {
         for (var x = 0; x < stride_u64; x = x + 1) {
             store64(fb + (clear_y + y) * pitch + x * 8, 0);
         }
@@ -748,9 +539,10 @@ fn fb_putc(ch) {
     var width = fb_width();
     var height = fb_height();
     var s = fb_scale();
-    var cell_w = 8 * s;
+    var cell_w = 8  * s;
+    var cell_h = 16 * s;
     var max_cols = width / cell_w;
-    var max_rows = (height - FB_CONSOLE_Y0) / cell_w;
+    var max_rows = (height - FB_CONSOLE_Y0) / cell_h;
 
     # Newline.
     if (ch == 10) {
@@ -771,7 +563,7 @@ fn fb_putc(ch) {
     if (ch == 8) {
         if (fb_cur_x > 0) {
             fb_cur_x = fb_cur_x - 1;
-            fb_fill_cell(fb_cur_x, FB_CONSOLE_Y0 + fb_cur_y * cell_w, FB_BG);
+            fb_fill_cell(fb_cur_x, FB_CONSOLE_Y0 + fb_cur_y * cell_h, FB_BG);
         }
         return 0;
     }
@@ -789,15 +581,15 @@ fn fb_putc(ch) {
         }
     }
 
-    # Render the 8x8 CGA glyph, scaling each font bit into an SxS block
-    # so the on-screen character cell is cell_w x cell_w. Inner pixel
-    # paint loop runs cell_w*cell_w store32s per glyph (576 at scale=3,
-    # 1024 at scale=4) — same write-combiner-friendly pattern as the
-    # init clear and scroll-bottom-clear.
-    var glyph = &fb_font + (ch - 0x20) * 8;
+    # Render the 8x16 VGA glyph, scaling each font bit into an SxS block
+    # so the on-screen character cell is cell_w x cell_h (= 8*S x 16*S).
+    # Inner pixel paint loop runs cell_w*cell_h store32s per glyph (128
+    # at scale=1, 512 at scale=2) — same write-combiner-friendly pattern
+    # as the init clear and scroll-bottom-clear.
+    var glyph = &fb_font + (ch - 0x20) * 16;
     var x_px = fb_cur_x * cell_w;
-    var y_px = FB_CONSOLE_Y0 + fb_cur_y * cell_w;
-    for (var row = 0; row < 8; row = row + 1) {
+    var y_px = FB_CONSOLE_Y0 + fb_cur_y * cell_h;
+    for (var row = 0; row < 16; row = row + 1) {
         var bits = load8(glyph + row);
         for (var col = 0; col < 8; col = col + 1) {
             var on = (bits >> (7 - col)) & 1;
