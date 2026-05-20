@@ -231,3 +231,314 @@ fn nvme_disable() {
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x41; 0xE6; 0x71; }
     return 1;
 }
+
+# --- Phase 2: admin queue + IDENTIFY ---
+#
+# Allocate Admin SQ + Admin CQ + a 4 KB IDENTIFY scratch buffer, program
+# AQA / ASQ / ACQ, re-enable the controller (CC.EN=1), wait for
+# CSTS.RDY=1, then submit IDENTIFY CONTROLLER (CNS=0x01) and IDENTIFY
+# NAMESPACE for NSID=1 (CNS=0x00). Polling-only completion — MSI-X is
+# Phase 5 work. Layout per NVMe 1.4 §3.1.21 + §4.2 + §4.6 + §5.15.
+#
+# Per `feedback_redesign_dont_reinvent` — Linux's
+# drivers/nvme/host/pci.c `nvme_pci_configure_admin_queue` +
+# `nvme_init_identify` is the structural reference.
+#
+# Iron-test gate (still QEMU-only): framebuffer adds
+#   `nvme: admin queue ready, CC.EN=1 RDY=1`
+#   `nvme: VID=N SSVID=N NN=N MDTS=N`
+#   `nvme: model='<MN>'`  `nvme: serial='<SN>'`  `nvme: firmware='<FR>'`
+#   `nvme: ns1 NSZE=N LBAS=NB size=NMB`
+# CMOS kcp = 0x42 (admin ready), 0x43 (IDENTIFY CTRL + NS1 both done).
+
+var NVME_ADMIN_Q_ENTRIES = 64;   # ASQS = ACQS = 63 (zero-based)
+var NVME_SQE_SIZE        = 64;   # bytes per submission entry (NVMe 1.4)
+var NVME_CQE_SIZE        = 16;   # bytes per completion entry
+
+# Admin queue state (populated by nvme_admin_init)
+var nvme_asq_phys     = 0;   # Admin SQ base (4 KB page, page-aligned)
+var nvme_acq_phys     = 0;   # Admin CQ base (4 KB page, page-aligned)
+var nvme_ident_phys   = 0;   # IDENTIFY data scratch (4 KB page)
+var nvme_asq_tail     = 0;   # next SQ slot to write
+var nvme_acq_head     = 0;   # next CQ slot to consume
+var nvme_acq_phase    = 1;   # expected Phase Tag on next new CQE
+var nvme_cmd_id       = 0;   # auto-incrementing CID
+var nvme_admin_ready  = 0;   # 1 after admin queue init + CC.EN=1 + RDY=1
+
+# IDENTIFY CONTROLLER cached fields (parsed by nvme_identify_ctrl)
+var nvme_ctrl_vid   = 0;
+var nvme_ctrl_nn    = 0;   # Number of namespaces
+var nvme_ctrl_mdts  = 0;   # Max data transfer (raw — bytes = 1 << (MDTS + 12 + MPSMIN))
+
+# IDENTIFY NAMESPACE (NSID=1) cached fields
+var nvme_ns1_nsze     = 0;   # Logical block count
+var nvme_ns1_lba_bytes = 0;  # Bytes per LBA (typically 512 or 4096)
+
+# Admin doorbell addresses. NVMe 1.4 §3.1.31:
+#   SQ y Tail DB at MMIO + 0x1000 + (2*y) * (4 << DSTRD)
+#   CQ y Head DB at MMIO + 0x1000 + (2*y + 1) * (4 << DSTRD)
+# Admin = y=0; CAP.DSTRD lives in nvme_dstrd from Phase 1.
+
+fn nvme_db_admin_sq() { return nvme_mmio_base + 0x1000; }
+fn nvme_db_admin_cq() { return nvme_mmio_base + 0x1000 + (4 << nvme_dstrd); }
+
+# Zero a 4 KB page via 512 × 8-byte stores. Used for ASQ/ACQ initial
+# state and to scrub the IDENTIFY scratch between commands so stale
+# bytes from a prior IDENTIFY can't be misread.
+fn nvme_zero_page(phys) {
+    for (var i = 0; i < 512; i = i + 1) {
+        store64(phys + i * 8, 0);
+    }
+    return 0;
+}
+
+fn nvme_admin_init() {
+    if (nvme_disabled == 0) { return 0; }
+
+    # 1. Refuse host pages > 4 KB. NVMe 1.4 §3.1.21: CC.MPS = log2(host
+    #    page) - 12. MPSMIN=0 means controller supports 4 KB; QEMU and
+    #    real iron both honor this. We don't try larger pages.
+    if (nvme_mpsmin > 0) {
+        kprintln("nvme: controller requires >4KB pages, unsupported", 49);
+        return 0;
+    }
+
+    # 2. Allocate the three pages (ASQ, ACQ, IDENT scratch). PMM hands
+    #    out 4 KB-aligned pages; they're in the kernel-managed low 16 MB
+    #    pool and already covered by the boot identity map (pt_init at
+    #    0–4 GB), but we still gate on vmm_is_mapped to mirror virtio_blk
+    #    defensively.
+    var asq   = pmm_alloc();
+    var acq   = pmm_alloc();
+    var ident = pmm_alloc();
+    if (asq == 0) { kprintln("nvme: ASQ alloc failed (PMM OOM)", 32); return 0; }
+    if (acq == 0) { kprintln("nvme: ACQ alloc failed (PMM OOM)", 32); return 0; }
+    if (ident == 0) { kprintln("nvme: IDENT alloc failed (PMM OOM)", 34); return 0; }
+    if (vmm_is_mapped(asq)   == 0) { vmm_map(asq,   asq,   0x83); }
+    if (vmm_is_mapped(acq)   == 0) { vmm_map(acq,   acq,   0x83); }
+    if (vmm_is_mapped(ident) == 0) { vmm_map(ident, ident, 0x83); }
+
+    # 3. Register pages with IOMMU. S10 contract — every DMA region is
+    #    declared before any device read/write touches it.
+    iommu_register_dma(asq);
+    iommu_register_dma(acq);
+    iommu_register_dma(ident);
+
+    # 4. Zero the queues. CQ requires zero so the Phase Tag of every
+    #    initial slot starts at 0; first controller-written CQE flips
+    #    it to 1, which is our expected phase.
+    nvme_zero_page(asq);
+    nvme_zero_page(acq);
+    nvme_zero_page(ident);
+
+    nvme_asq_phys   = asq;
+    nvme_acq_phys   = acq;
+    nvme_ident_phys = ident;
+
+    # 5. AQA = (ACQS << 16) | ASQS, both zero-based (63 = 64 entries).
+    nvme_mmio_write32(NVME_REG_AQA, (63 << 16) | 63);
+
+    # 6. ASQ / ACQ base addresses (64-bit, written as 32-bit halves to
+    #    stay aligned and avoid load64-on-MMIO — same posture as the
+    #    CAP read path). Bottom 12 bits MBZ; pmm_alloc returns
+    #    page-aligned values so the constraint is honored implicitly.
+    nvme_mmio_write32(NVME_REG_ASQ_LO, asq & 0xFFFFFFFF);
+    nvme_mmio_write32(NVME_REG_ASQ_HI, (asq >> 32) & 0xFFFFFFFF);
+    nvme_mmio_write32(NVME_REG_ACQ_LO, acq & 0xFFFFFFFF);
+    nvme_mmio_write32(NVME_REG_ACQ_HI, (acq >> 32) & 0xFFFFFFFF);
+
+    # 7. CC: IOCQES=4 (2^4 = 16-byte CQE, NVMe 1.4 §4.6 mandates this
+    #    for the NVM command set), IOSQES=6 (2^6 = 64-byte SQE), AMS=0
+    #    (round-robin), SHN=0 (no shutdown), MPS=0 (4 KB host page),
+    #    CSS=0 (NVM command set), EN=1.
+    var cc = (4 << 20) | (6 << 16) | (0 << 11) | (0 << 7) | (0 << 4) | 1;
+    nvme_mmio_write32(NVME_REG_CC, cc);
+
+    # 8. Wait for CSTS.RDY=1. The controller is now armed for admin
+    #    commands; subsequent reg writes to AQA/ASQ/ACQ are illegal per
+    #    spec while EN=1, so this is the point of no return for the
+    #    queue layout chosen above.
+    var wait = 0;
+    while (wait < 1000000) {
+        var sts = nvme_mmio_read32(NVME_REG_CSTS);
+        if ((sts & 0x01) != 0) { break; }
+        wait = wait + 1;
+    }
+    if (wait >= 1000000) {
+        kprintln("nvme: enable timeout (RDY never set)", 36);
+        return 0;
+    }
+
+    nvme_admin_ready = 1;
+    kprintln("nvme: admin queue ready, CC.EN=1 RDY=1", 38);
+
+    # CMOS kcp = 0x42
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x42; 0xE6; 0x71; }
+    return 1;
+}
+
+# Submit one admin SQE. Caller supplies opcode (DW0[7:0]), NSID (DW1),
+# PRP1 (DW6-7, 64-bit), and CDW10 (DW10). All other dwords are zeroed.
+# Returns the CID the entry was tagged with; pair with nvme_admin_poll
+# to wait for the matching completion.
+fn nvme_admin_submit(opcode, nsid, prp1, cdw10) {
+    if (nvme_admin_ready == 0) { return 0 - 1; }
+
+    var slot = nvme_asq_phys + nvme_asq_tail * NVME_SQE_SIZE;
+    # Zero the 64-byte SQE. Required because we ring the tail doorbell
+    # before all fields are explicitly set — any stale bytes from a
+    # prior submission in this slot would be read by the controller as
+    # part of the current command.
+    for (var i = 0; i < 8; i = i + 1) {
+        store64(slot + i * 8, 0);
+    }
+
+    nvme_cmd_id = nvme_cmd_id + 1;
+    var cid = nvme_cmd_id & 0xFFFF;
+    # DW0: opcode at [7:0], FUSE [9:8]=0, PSDT [15:14]=0 (PRPs not SGLs),
+    #      CID at [31:16].
+    store32(slot +  0, opcode | (cid << 16));
+    store32(slot +  4, nsid);
+    # PRP1 at DW6-7 (byte offset 24). 64-bit.
+    store64(slot + 24, prp1);
+    # CDW10 at byte offset 40.
+    store32(slot + 40, cdw10);
+
+    nvme_asq_tail = nvme_asq_tail + 1;
+    if (nvme_asq_tail >= NVME_ADMIN_Q_ENTRIES) { nvme_asq_tail = 0; }
+
+    # Ring SQ tail doorbell.
+    store32(nvme_db_admin_sq(), nvme_asq_tail);
+    return cid;
+}
+
+# Poll the admin CQ for the next completion. Returns the 15-bit status
+# field (0 = success) or -1 on timeout. Phase-tag tracked per spec:
+# zero-initialized CQ memory means controller writes new entry with
+# P=1, then P=0 after wrap, then P=1 again, etc.
+fn nvme_admin_poll(expected_cid) {
+    if (nvme_admin_ready == 0) { return 0 - 1; }
+    var wait = 0;
+    while (wait < 10000000) {
+        var slot = nvme_acq_phys + nvme_acq_head * NVME_CQE_SIZE;
+        var dw3 = load32(slot + 12);
+        var p = (dw3 >> 16) & 0x01;
+        if (p == nvme_acq_phase) {
+            var status  = (dw3 >> 17) & 0x7FFF;
+            var got_cid = dw3 & 0xFFFF;
+            nvme_acq_head = nvme_acq_head + 1;
+            if (nvme_acq_head >= NVME_ADMIN_Q_ENTRIES) {
+                nvme_acq_head = 0;
+                nvme_acq_phase = 1 - nvme_acq_phase;
+            }
+            # Ring CQ head doorbell so the controller can reuse the slot.
+            store32(nvme_db_admin_cq(), nvme_acq_head);
+            if (got_cid != expected_cid) {
+                kprint("nvme: admin CID mismatch expected=", 34);
+                kprint_num(expected_cid);
+                kprint(" got=", 5);
+                kprint_num(got_cid);
+                kprintln("", 0);
+            }
+            return status;
+        }
+        wait = wait + 1;
+    }
+    kprintln("nvme: admin poll timeout", 24);
+    return 0 - 1;
+}
+
+# IDENTIFY CONTROLLER (opcode 0x06, CNS=0x01 in CDW10, NSID=0). 4 KB
+# response in nvme_ident_phys; we parse VID / NN / MDTS / SN / MN / FR.
+# Per NVMe 1.4 §5.15.2 Figure 247 (Identify Controller Data Structure).
+fn nvme_identify_ctrl() {
+    if (nvme_admin_ready == 0) { return 0; }
+    nvme_zero_page(nvme_ident_phys);
+    var cid = nvme_admin_submit(0x06, 0, nvme_ident_phys, 0x01);
+    var st  = nvme_admin_poll(cid);
+    if (st != 0) {
+        kprint("nvme: IDENTIFY CTRL failed, status=", 35);
+        kprint_num(st);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # Field offsets (NVMe 1.4 §5.15.2 Identify Controller):
+    #   0..1   VID
+    #   2..3   SSVID
+    #   4..23  SN  — 20 ASCII bytes, space-padded
+    #   24..63 MN  — 40 ASCII bytes
+    #   64..71 FR  — 8 ASCII bytes
+    #   77     MDTS — log2 of max transfer in CAP.MPSMIN-page units
+    #   516..519 NN — Number of Namespaces (u32)
+    nvme_ctrl_vid  = load16(nvme_ident_phys + 0);
+    nvme_ctrl_mdts = load8 (nvme_ident_phys + 77);
+    nvme_ctrl_nn   = load32(nvme_ident_phys + 516);
+
+    kprint("nvme: VID=", 10);
+    kprint_num(nvme_ctrl_vid);
+    kprint(" SSVID=", 7);
+    kprint_num(load16(nvme_ident_phys + 2));
+    kprint(" NN=", 4);
+    kprint_num(nvme_ctrl_nn);
+    kprint(" MDTS=", 6);
+    kprint_num(nvme_ctrl_mdts);
+    kprintln("", 0);
+
+    # SN/MN/FR are space-padded ASCII; kprint with explicit length emits
+    # them verbatim. Trailing spaces are fine for an iron post-mortem.
+    kprint("nvme: model='", 13);
+    kprint(nvme_ident_phys + 24, 40);
+    kprintln("'", 1);
+    kprint("nvme: serial='", 14);
+    kprint(nvme_ident_phys + 4, 20);
+    kprintln("'", 1);
+    kprint("nvme: firmware='", 16);
+    kprint(nvme_ident_phys + 64, 8);
+    kprintln("'", 1);
+
+    return 1;
+}
+
+# IDENTIFY NAMESPACE for a single NSID (opcode 0x06, CNS=0x00, NSID=N).
+# Parses NSZE + the active LBA Format → bytes per LBA. Per NVMe 1.4
+# §5.15.2 Figure 245 (Identify Namespace Data Structure).
+fn nvme_identify_ns(nsid) {
+    if (nvme_admin_ready == 0) { return 0; }
+    nvme_zero_page(nvme_ident_phys);
+    var cid = nvme_admin_submit(0x06, nsid, nvme_ident_phys, 0x00);
+    var st  = nvme_admin_poll(cid);
+    if (st != 0) {
+        kprint("nvme: IDENTIFY NS failed, status=", 33);
+        kprint_num(st);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # NSZE at offset 0 (u64). FLBAS at offset 26 (u8); bits [3:0] select
+    # which LBAF entry (offset 128 + idx*4) is active. LBADS at bits
+    # [23:16] of the LBAF entry = log2 bytes per LBA (9 → 512B, 12 → 4KB).
+    var nsze       = load64(nvme_ident_phys + 0);
+    var flbas      = load8 (nvme_ident_phys + 26);
+    var lba_idx    = flbas & 0x0F;
+    var lbaf_entry = load32(nvme_ident_phys + 128 + lba_idx * 4);
+    var lbads      = (lbaf_entry >> 16) & 0xFF;
+    var lba_bytes  = 1 << lbads;
+
+    nvme_ns1_nsze      = nsze;
+    nvme_ns1_lba_bytes = lba_bytes;
+
+    kprint("nvme: ns", 8);
+    kprint_num(nsid);
+    kprint(" NSZE=", 6);
+    kprint_num(nsze);
+    kprint(" LBAS=", 6);
+    kprint_num(lba_bytes);
+    kprint("B size=", 7);
+    kprint_num((nsze * lba_bytes) / (1024 * 1024));
+    kprintln("MB", 2);
+
+    # CMOS kcp = 0x43 (admin queue + IDENTIFY CTRL + IDENTIFY NS1 done).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x43; 0xE6; 0x71; }
+    return 1;
+}

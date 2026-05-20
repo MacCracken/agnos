@@ -279,9 +279,20 @@ if (pci_find(0x1AF4, 0x1001) >= 0) {
 # into the disabled state (CC.EN=0, CSTS.RDY=0). Probe-only — no admin
 # queue, no DMA, no namespace I/O. CMOS checkpoints 0x40 / 0x41 stamp
 # on success of each stage. No-op if no NVMe device is present.
-# Phase 2+ adds admin queue + IDENTIFY + I/O queue + read/write.
 nvme_probe();
 nvme_disable();
+# NVMe Phase 2 — allocate Admin SQ + Admin CQ + IDENTIFY scratch,
+# program AQA/ASQ/ACQ, set CC.EN=1, wait CSTS.RDY=1, submit
+# IDENTIFY CONTROLLER (CNS=0x01) + IDENTIFY NAMESPACE NSID=1
+# (CNS=0x00), parse VID / SN / MN / FR / NN / MDTS / NSZE / LBA size.
+# Polling-only (MSI-X is Phase 5). CMOS checkpoints 0x42 (admin
+# ready) and 0x43 (both IDENTIFY commands completed) stamp on
+# success. No-op if Phase 1 didn't find a controller. Phase 3 adds
+# I/O queue creation + blocking read.
+if (nvme_admin_init() == 1) {
+    nvme_identify_ctrl();
+    nvme_identify_ns(1);
+}
 vfs_init();
 kprintln("VFS initialized", 15);
 

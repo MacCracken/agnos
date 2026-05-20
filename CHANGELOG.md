@@ -35,6 +35,38 @@ Tested with `-drive file=nvme0.img,if=none,format=raw,id=nvme0 -device nvme,driv
 
 **Out of scope:** Iron burn — Phase 1 is pure read-only enumeration; no behavioral path lands new on iron until at least Phase 3 (first I/O). Will bundle with Phase 2 or Phase 3 once the admin-queue + IDENTIFY path is in place.
 
+### NVMe Phase 2 (admin queue + IDENTIFY CONTROLLER + IDENTIFY NAMESPACE)
+
+Second engineering cut of the 1.31.x storage arc. Adds ~250 LOC to `kernel/core/nvme.cyr`. Linux's `drivers/nvme/host/pci.c` `nvme_pci_configure_admin_queue` + `nvme_init_identify` is the structural reference per `feedback_redesign_dont_reinvent`.
+
+**What it does:**
+- `nvme_admin_init()` — allocate Admin SQ + Admin CQ + IDENTIFY scratch (3 × 4 KB pages via `pmm_alloc` + `vmm_map` + `iommu_register_dma`), zero them, program AQA (ASQS=ACQS=63 → 64-entry queues), program ASQ/ACQ base addresses (split 32-bit-half writes to avoid `load64`/`store64` on MMIO — same posture as Phase 1's CAP read), program CC (IOCQES=4, IOSQES=6, AMS=0, MPS=0, CSS=0, EN=1), poll `CSTS.RDY=1`. Refuses controllers with `MPSMIN > 0` (would require > 4 KB host pages).
+- `nvme_admin_submit(opcode, nsid, prp1, cdw10)` — build 64-byte SQE in `nvme_asq_phys` at current tail, zero unused dwords, auto-increment CID, advance tail, ring SQ tail doorbell at `MMIO + 0x1000`.
+- `nvme_admin_poll(expected_cid)` — poll CQ slot at current head for `Phase Tag == nvme_acq_phase`, extract 15-bit status field, advance head (flip expected phase on wraparound), ring CQ head doorbell at `MMIO + 0x1000 + (4 << DSTRD)`. Logs CID-mismatch as a soft warning (continues with whatever completion landed).
+- `nvme_identify_ctrl()` — opcode 0x06, NSID=0, CNS=0x01 in CDW10. Parses VID / SSVID / SN (offset 4, 20 ASCII bytes) / MN (offset 24, 40 ASCII) / FR (offset 64, 8 ASCII) / MDTS (offset 77) / NN (offset 516).
+- `nvme_identify_ns(nsid)` — opcode 0x06, target NSID, CNS=0x00. Parses NSZE (offset 0, u64) + FLBAS (offset 26, u8) → indexes into LBAF table at offset 128 → extracts LBADS (bits [23:16]) → computes bytes per LBA.
+
+**What it does NOT do:** I/O queue creation, namespace read/write, MSI-X, multi-namespace enumeration (only NSID=1 is fetched), IDENTIFY Active Namespace List (CNS=0x02), feature management, log pages. Phase 3 onward.
+
+**CMOS checkpoints:** `kcp=0x42` (admin queue ready), `kcp=0x43` (IDENTIFY CTRL + NS1 both completed).
+
+**QEMU validation:**
+
+```
+nvme: admin queue ready, CC.EN=1 RDY=1
+nvme: VID=6966 SSVID=6900 NN=256 MDTS=7
+nvme: model='QEMU NVMe Ctrl                          '
+nvme: serial='AGN001              '
+nvme: firmware='11.0.0  '
+nvme: ns1 NSZE=32768 LBAS=512B size=16MB
+```
+
+VID=6966 = 0x1B36 (Red Hat); SSVID=6900 = 0x1AF4 (VirtIO subsys — QEMU sets this). NN=256, MDTS=7 → 2^(7+12) = 512 KB max single transfer at the 4 KB host-page assumption. Model / Serial / Firmware fields print as their on-controller ASCII forms (space-padded to spec field length). Namespace 1's NSZE × LBA size exactly matches the 16 MB `nvme0.img` backing file. All round-trips (IDENTIFY CTRL + IDENTIFY NS1) complete with status=0 via polling-only path; no CID mismatches; phase-tag tracking correct on a single non-wrapping CQ pass.
+
+**Build:** `build/agnos` 424,656 B (Phase 1) → **430,168 B** (+5,512 B for Phase 2). Multiboot2 ELF64 entry `0x1000a8` preserved.
+
+**Out of scope:** Iron burn — still QEMU-validatable through Phase 3 / 4. First iron-relevant behavioral path is the namespace read in Phase 3.
+
 ## [1.31.0] — 2026-05-20 (Production build goes lean — KTEST + XHCI_VERBOSE compile gates; FB-absent guard; stale Attempt-N prose retired; `docs/development/build.md`)
 
 **1.30.x cycle closed; 1.31.x cycle opens with the production-default flip.** The 1.30.x sweep (1.30.0 → 1.30.12) cleared the FB-hardening + MVP-gate work on both BIOS paths (VGA-spec Attempt 68, Quiet Boot Attempt 76, true-font swap Attempt 77; Attempt 78 falsified the gnoboot SetMode-bounce lever, Attempt 79 Intel cross-check was structurally inconclusive). What landed there made every boot loud — KTEST self-test output + xhci developmental traces were unconditional because we needed them during the silent-absorb diagnostic arc. With the gate green, production boots should not carry diagnostic spam. 1.31.0 introduces source-side compile gates so the test paths and the verbose xhci trace ship out by default; opt back in via `KTEST=1` / `XHCI_VERBOSE=1` to the build script. Bundled: an FB-absent honesty guard the prior cycle's `fb_console_init` rewrite missed, a sweep of decayed Attempt-N references from `fb_console.cyr` comments, and a new `docs/development/build.md` that documents the gate matrix end-to-end. Cycle theme pivots from FB to **storage** — first 1.31.x engineering cuts target the NVMe block layer, not the framebuffer.
