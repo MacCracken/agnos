@@ -378,10 +378,12 @@ fn nvme_admin_init() {
 }
 
 # Submit one admin SQE. Caller supplies opcode (DW0[7:0]), NSID (DW1),
-# PRP1 (DW6-7, 64-bit), and CDW10 (DW10). All other dwords are zeroed.
-# Returns the CID the entry was tagged with; pair with nvme_admin_poll
-# to wait for the matching completion.
-fn nvme_admin_submit(opcode, nsid, prp1, cdw10) {
+# PRP1 (DW6-7, 64-bit), CDW10 (DW10), and CDW11 (DW11). All other
+# dwords are zeroed. Returns the CID the entry was tagged with; pair
+# with nvme_admin_poll to wait for the matching completion. CDW11 was
+# added at Phase 3 for Create I/O CQ / Create I/O SQ which both need
+# the second control dword; IDENTIFY callers pass 0.
+fn nvme_admin_submit(opcode, nsid, prp1, cdw10, cdw11) {
     if (nvme_admin_ready == 0) { return 0 - 1; }
 
     var slot = nvme_asq_phys + nvme_asq_tail * NVME_SQE_SIZE;
@@ -401,8 +403,9 @@ fn nvme_admin_submit(opcode, nsid, prp1, cdw10) {
     store32(slot +  4, nsid);
     # PRP1 at DW6-7 (byte offset 24). 64-bit.
     store64(slot + 24, prp1);
-    # CDW10 at byte offset 40.
+    # CDW10 at byte offset 40, CDW11 at byte offset 44.
     store32(slot + 40, cdw10);
+    store32(slot + 44, cdw11);
 
     nvme_asq_tail = nvme_asq_tail + 1;
     if (nvme_asq_tail >= NVME_ADMIN_Q_ENTRIES) { nvme_asq_tail = 0; }
@@ -454,7 +457,7 @@ fn nvme_admin_poll(expected_cid) {
 fn nvme_identify_ctrl() {
     if (nvme_admin_ready == 0) { return 0; }
     nvme_zero_page(nvme_ident_phys);
-    var cid = nvme_admin_submit(0x06, 0, nvme_ident_phys, 0x01);
+    var cid = nvme_admin_submit(0x06, 0, nvme_ident_phys, 0x01, 0);
     var st  = nvme_admin_poll(cid);
     if (st != 0) {
         kprint("nvme: IDENTIFY CTRL failed, status=", 35);
@@ -506,7 +509,7 @@ fn nvme_identify_ctrl() {
 fn nvme_identify_ns(nsid) {
     if (nvme_admin_ready == 0) { return 0; }
     nvme_zero_page(nvme_ident_phys);
-    var cid = nvme_admin_submit(0x06, nsid, nvme_ident_phys, 0x00);
+    var cid = nvme_admin_submit(0x06, nsid, nvme_ident_phys, 0x00, 0);
     var st  = nvme_admin_poll(cid);
     if (st != 0) {
         kprint("nvme: IDENTIFY NS failed, status=", 33);
@@ -540,5 +543,224 @@ fn nvme_identify_ns(nsid) {
 
     # CMOS kcp = 0x43 (admin queue + IDENTIFY CTRL + IDENTIFY NS1 done).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x43; 0xE6; 0x71; }
+    return 1;
+}
+
+# --- Phase 3: I/O queue creation + blocking READ ---
+#
+# Create one I/O Submission Queue + one I/O Completion Queue (QID=1)
+# via admin commands, then issue a blocking NVMe Read of LBA 0 from
+# namespace 1 as the boot-time proof that the I/O path works.
+#
+# Per NVMe 1.4 §5.3 (Create I/O CQ, opcode 0x05) + §5.4 (Create I/O SQ,
+# opcode 0x01) + §6.13 (NVM Read, opcode 0x02). Linux's
+# drivers/nvme/host/pci.c `nvme_alloc_queue` + `nvme_create_io_queues`
+# is the structural reference.
+#
+# Ordering note: Create I/O CQ MUST precede Create I/O SQ — the SQ
+# create command names the CQ as its target via CDW11.CQID, and the
+# controller rejects the SQ create if the named CQ doesn't exist yet.
+#
+# Iron-test gate (still QEMU-only): framebuffer adds
+#   `nvme: I/O queue 1 ready (64 entries SQ+CQ)`
+#   `nvme: ns1 LBA0 first 8 bytes: <hex dump>`
+# CMOS kcp = 0x44 (I/O queue ready), 0x45 (first read complete).
+
+var NVME_IO_Q_ENTRIES = 64;        # 64-entry I/O queues (same as admin)
+var NVME_IO_QID       = 1;         # single I/O queue, qid=1
+
+var nvme_iosq_phys    = 0;
+var nvme_iocq_phys    = 0;
+var nvme_read_scratch = 0;         # 4 KB DMA buffer for Phase 3 demo read
+var nvme_iosq_tail    = 0;
+var nvme_iocq_head    = 0;
+var nvme_iocq_phase   = 1;
+var nvme_io_cmd_id    = 0;
+var nvme_io_ready     = 0;
+
+# I/O qid=1 doorbells: SQ tail at (2*1)*(4<<DSTRD) past 0x1000, CQ
+# head at (2*1 + 1)*(4<<DSTRD) past 0x1000. With DSTRD=0 (4-byte
+# stride): SQ1 tail at 0x1008, CQ1 head at 0x100C.
+fn nvme_db_io_sq() { return nvme_mmio_base + 0x1000 + (2 * (4 << nvme_dstrd)); }
+fn nvme_db_io_cq() { return nvme_mmio_base + 0x1000 + (3 * (4 << nvme_dstrd)); }
+
+fn nvme_io_queue_init() {
+    if (nvme_admin_ready == 0) { return 0; }
+
+    # 1. Allocate I/O SQ + I/O CQ + read scratch (3 × 4 KB pages).
+    var sq = pmm_alloc();
+    var cq = pmm_alloc();
+    var sc = pmm_alloc();
+    if (sq == 0) { kprintln("nvme: IOSQ alloc failed (PMM OOM)", 33); return 0; }
+    if (cq == 0) { kprintln("nvme: IOCQ alloc failed (PMM OOM)", 33); return 0; }
+    if (sc == 0) { kprintln("nvme: IO scratch alloc failed (PMM OOM)", 39); return 0; }
+    if (vmm_is_mapped(sq) == 0) { vmm_map(sq, sq, 0x83); }
+    if (vmm_is_mapped(cq) == 0) { vmm_map(cq, cq, 0x83); }
+    if (vmm_is_mapped(sc) == 0) { vmm_map(sc, sc, 0x83); }
+    iommu_register_dma(sq);
+    iommu_register_dma(cq);
+    iommu_register_dma(sc);
+    nvme_zero_page(sq);
+    nvme_zero_page(cq);
+    nvme_zero_page(sc);
+
+    nvme_iosq_phys    = sq;
+    nvme_iocq_phys    = cq;
+    nvme_read_scratch = sc;
+
+    # 2. Create I/O CQ first (must precede SQ create — see header note).
+    #    NVMe 1.4 §5.3:
+    #      DW10: QSIZE [31:16] (0-based) | QID [15:0]
+    #      DW11: IV [31:16] | IEN bit 1 | PC bit 0
+    #    Polling-only at Phase 3 → IEN=0; physically contiguous → PC=1.
+    var qsize_0based = NVME_IO_Q_ENTRIES - 1;
+    var cdw10_cq = (qsize_0based << 16) | NVME_IO_QID;
+    var cdw11_cq = 0x01;   # IEN=0, PC=1
+    var cid_cq = nvme_admin_submit(0x05, 0, cq, cdw10_cq, cdw11_cq);
+    var st_cq = nvme_admin_poll(cid_cq);
+    if (st_cq != 0) {
+        kprint("nvme: Create I/O CQ failed, status=", 35);
+        kprint_num(st_cq);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # 3. Create I/O SQ targeting the CQ just made.
+    #    NVMe 1.4 §5.4:
+    #      DW10: QSIZE [31:16] | QID [15:0]
+    #      DW11: CQID [31:16] | QPRIO [2:1] | PC bit 0
+    #    QPRIO=00 (urgent — irrelevant when only one SQ exists, but it's
+    #    the safe default per Linux ref); PC=1.
+    var cdw10_sq = (qsize_0based << 16) | NVME_IO_QID;
+    var cdw11_sq = (NVME_IO_QID << 16) | 0x01;   # CQID=1, QPRIO=00, PC=1
+    var cid_sq = nvme_admin_submit(0x01, 0, sq, cdw10_sq, cdw11_sq);
+    var st_sq = nvme_admin_poll(cid_sq);
+    if (st_sq != 0) {
+        kprint("nvme: Create I/O SQ failed, status=", 35);
+        kprint_num(st_sq);
+        kprintln("", 0);
+        return 0;
+    }
+
+    nvme_io_ready = 1;
+    kprint("nvme: I/O queue ", 16);
+    kprint_num(NVME_IO_QID);
+    kprint(" ready (", 8);
+    kprint_num(NVME_IO_Q_ENTRIES);
+    kprintln(" entries SQ+CQ)", 15);
+
+    # CMOS kcp = 0x44 (I/O queue ready).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x44; 0xE6; 0x71; }
+    return 1;
+}
+
+# Submit one I/O SQE. Distinct from nvme_admin_submit because I/O
+# commands need PRP2 + CDW10/11/12/13 (Read/Write carry the 64-bit
+# SLBA across CDW10+11 and the NLB in CDW12). PRP2 is 0 when the
+# transfer fits inside PRP1's page (offset 0 + ≤4 KB).
+fn nvme_io_submit(opcode, nsid, prp1, prp2, cdw10, cdw11, cdw12) {
+    if (nvme_io_ready == 0) { return 0 - 1; }
+    var slot = nvme_iosq_phys + nvme_iosq_tail * NVME_SQE_SIZE;
+    for (var i = 0; i < 8; i = i + 1) { store64(slot + i * 8, 0); }
+
+    nvme_io_cmd_id = nvme_io_cmd_id + 1;
+    var cid = nvme_io_cmd_id & 0xFFFF;
+    store32(slot +  0, opcode | (cid << 16));
+    store32(slot +  4, nsid);
+    store64(slot + 24, prp1);              # DW6-7
+    store64(slot + 32, prp2);              # DW8-9
+    store32(slot + 40, cdw10);
+    store32(slot + 44, cdw11);
+    store32(slot + 48, cdw12);
+
+    nvme_iosq_tail = nvme_iosq_tail + 1;
+    if (nvme_iosq_tail >= NVME_IO_Q_ENTRIES) { nvme_iosq_tail = 0; }
+    store32(nvme_db_io_sq(), nvme_iosq_tail);
+    return cid;
+}
+
+# Poll the I/O CQ for the next completion. Same phase-tag logic as
+# admin_poll. 10M-iter ceiling — disk transfers can be slower than
+# IDENTIFY metadata reads, especially on real silicon.
+fn nvme_io_poll(expected_cid) {
+    if (nvme_io_ready == 0) { return 0 - 1; }
+    var wait = 0;
+    while (wait < 10000000) {
+        var slot = nvme_iocq_phys + nvme_iocq_head * NVME_CQE_SIZE;
+        var dw3 = load32(slot + 12);
+        var p = (dw3 >> 16) & 0x01;
+        if (p == nvme_iocq_phase) {
+            var status  = (dw3 >> 17) & 0x7FFF;
+            var got_cid = dw3 & 0xFFFF;
+            nvme_iocq_head = nvme_iocq_head + 1;
+            if (nvme_iocq_head >= NVME_IO_Q_ENTRIES) {
+                nvme_iocq_head = 0;
+                nvme_iocq_phase = 1 - nvme_iocq_phase;
+            }
+            store32(nvme_db_io_cq(), nvme_iocq_head);
+            if (got_cid != expected_cid) {
+                kprint("nvme: I/O CID mismatch expected=", 32);
+                kprint_num(expected_cid);
+                kprint(" got=", 5);
+                kprint_num(got_cid);
+                kprintln("", 0);
+            }
+            return status;
+        }
+        wait = wait + 1;
+    }
+    kprintln("nvme: I/O poll timeout", 22);
+    return 0 - 1;
+}
+
+# Single-LBA blocking read. Reads `lba` (sector index) of namespace 1
+# into `buf` (must be page-aligned + size >= LBA bytes). Caller owns
+# the buffer + IOMMU registration. Returns 1 on success, 0 on failure.
+# Phase 4 will add multi-LBA + PRP-list pathways; this is the simplest
+# possible Read demonstration.
+#
+# NVMe Read SQE layout (NVMe 1.4 §6.13):
+#   DW0     opcode 0x02 | CID
+#   DW1     NSID
+#   DW6-7   PRP1
+#   DW8-9   PRP2 (0 for single-page reads)
+#   DW10    SLBA [31:0]
+#   DW11    SLBA [63:32]
+#   DW12    NLB [15:0] (zero-based) | DTYPE [7:4] | PRINFO/etc. (0 here)
+fn nvme_read_lba(lba, buf) {
+    if (nvme_io_ready == 0) { return 0; }
+    var slba_lo = lba & 0xFFFFFFFF;
+    var slba_hi = (lba >> 32) & 0xFFFFFFFF;
+    var nlb_zb  = 0;   # 0-based → 1 LBA
+    var cid = nvme_io_submit(0x02, 1, buf, 0, slba_lo, slba_hi, nlb_zb);
+    var st  = nvme_io_poll(cid);
+    if (st != 0) {
+        kprint("nvme: read LBA ", 15);
+        kprint_num(lba);
+        kprint(" failed, status=", 16);
+        kprint_num(st);
+        kprintln("", 0);
+        return 0;
+    }
+    return 1;
+}
+
+# Boot-time validation read — issues `nvme_read_lba(0, scratch)` and
+# prints the first 8 bytes as decimal so any pattern pre-written to
+# the backing file is visible in the serial transcript. Removed in
+# Phase 5 once block_dev dispatch wraps the read path.
+fn nvme_first_read_demo() {
+    if (nvme_io_ready == 0) { return 0; }
+    if (nvme_read_lba(0, nvme_read_scratch) == 0) { return 0; }
+
+    kprint("nvme: ns1 LBA0 first 8 bytes:", 29);
+    for (var i = 0; i < 8; i = i + 1) {
+        kprint(" ", 1);
+        kprint_num(load8(nvme_read_scratch + i));
+    }
+    kprintln("", 0);
+
+    # CMOS kcp = 0x45 (first NVMe read completed).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x45; 0xE6; 0x71; }
     return 1;
 }

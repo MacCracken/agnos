@@ -67,6 +67,36 @@ VID=6966 = 0x1B36 (Red Hat); SSVID=6900 = 0x1AF4 (VirtIO subsys — QEMU sets th
 
 **Out of scope:** Iron burn — still QEMU-validatable through Phase 3 / 4. First iron-relevant behavioral path is the namespace read in Phase 3.
 
+### NVMe Phase 3 (I/O queue creation + blocking READ — first byte-level round-trip)
+
+Third engineering cut. Adds ~180 LOC to `kernel/core/nvme.cyr`. This is the cut where the driver crosses from "talks to the controller" to "moves disk bytes" — the I/O queues carry actual namespace I/O, and a boot-time demo read of LBA 0 closes the loop end-to-end. Linux's `drivers/nvme/host/pci.c` `nvme_alloc_queue` + `nvme_create_io_queues` + `nvme_setup_rw` is the structural reference.
+
+**What it does:**
+- `nvme_io_queue_init()` — allocates 3 × 4 KB pages (I/O SQ, I/O CQ, read scratch) via `pmm_alloc` + `vmm_map` + `iommu_register_dma`, zeros them, then issues two admin commands in spec-mandated order: **Create I/O CQ (opcode 0x05)** first, then **Create I/O SQ (opcode 0x01)**. The SQ create names the CQ as its target via CDW11.CQID — the controller rejects the SQ create if the CQ doesn't exist yet, hence the ordering. Polling-only (IEN=0 in the CQ create CDW11). QID=1, 64 entries each, physically contiguous (PC=1).
+- `nvme_io_submit(opcode, nsid, prp1, prp2, cdw10, cdw11, cdw12)` — distinct from `nvme_admin_submit` because I/O commands need PRP2 + extra CDWs. For Read/Write, SLBA is split across CDW10 (low 32) + CDW11 (high 32); NLB sits in CDW12 (zero-based). PRP2 = 0 when the transfer fits inside PRP1's single page (true for any 1-LBA read into a page-aligned buffer).
+- `nvme_io_poll(expected_cid)` — same phase-tag tracking as `nvme_admin_poll`; 10M-iter ceiling (more generous than admin's 10M since real disk transfers can take longer than IDENTIFY metadata reads).
+- `nvme_read_lba(lba, buf)` — wraps the SQE construction. Opcode 0x02, NSID=1, PRP1=buf, NLB=0 (= 1 logical block). Returns 1 on success / 0 on failure.
+- `nvme_first_read_demo()` — boot-time validation. Reads LBA 0 into the scratch buffer and prints first 8 bytes as decimal. Removed in Phase 5 once block_dev dispatch wraps the read path; until then, every QEMU smoke that pre-populates `nvme0.img` gets a byte-level receipt in the serial log.
+
+**Doorbell offsets for I/O queue 1 (NVMe 1.4 §3.1.31):** SQ1 tail at `MMIO + 0x1000 + 2*(4<<DSTRD)` (= 0x1008 with DSTRD=0), CQ1 head at `MMIO + 0x1000 + 3*(4<<DSTRD)` (= 0x100C).
+
+**What it does NOT do:** Write path (opcode 0x01), multi-LBA transfers needing PRP2 / PRP list, MSI-X IRQ-driven completion, block_dev dispatch table. Phases 4 and 5.
+
+**CMOS checkpoints:** `kcp=0x44` (I/O queue ready), `kcp=0x45` (first read completed).
+
+**QEMU validation (with `nvme0.img` pre-populated as `printf 'AGNOS!\n\0' | dd of=nvme0.img bs=512 count=1`):**
+
+```
+nvme: I/O queue 1 ready (64 entries SQ+CQ)
+nvme: ns1 LBA0 first 8 bytes: 65 71 78 79 83 33 10 0
+```
+
+Bytes `65 71 78 79 83 33 10 0` decimal = `A G N O S ! \n \0` ASCII — byte-exact match with the pattern written to the backing file. The bytes traveled: host filesystem → QEMU's NVMe-model SQ executor → controller LBA-0 read → DMA into the kernel's IOMMU-registered scratch page → `load8` from the read scratch → serial log. Every Phase-1/2/3 stage round-tripped cleanly with no CID mismatches and no poll timeouts.
+
+**Build:** `build/agnos` 430,168 B (Phase 2) → **434,560 B** (+4,392 B for Phase 3). Multiboot2 ELF64 entry `0x1000a8` preserved. Net since 1.31.0 baseline: +12,648 B for the full Phase 1-3 driver (~660 LOC of nvme.cyr).
+
+**Out of scope:** Iron burn — the QEMU receipt is byte-exact, so the polling-only single-LBA path is well-modeled. Iron validation slots in alongside Phase 4 (write path) or Phase 5 (block_dev dispatch + MSI-X) once the write-then-read-back round-trip is in place.
+
 ## [1.31.0] — 2026-05-20 (Production build goes lean — KTEST + XHCI_VERBOSE compile gates; FB-absent guard; stale Attempt-N prose retired; `docs/development/build.md`)
 
 **1.30.x cycle closed; 1.31.x cycle opens with the production-default flip.** The 1.30.x sweep (1.30.0 → 1.30.12) cleared the FB-hardening + MVP-gate work on both BIOS paths (VGA-spec Attempt 68, Quiet Boot Attempt 76, true-font swap Attempt 77; Attempt 78 falsified the gnoboot SetMode-bounce lever, Attempt 79 Intel cross-check was structurally inconclusive). What landed there made every boot loud — KTEST self-test output + xhci developmental traces were unconditional because we needed them during the silent-absorb diagnostic arc. With the gate green, production boots should not carry diagnostic spam. 1.31.0 introduces source-side compile gates so the test paths and the verbose xhci trace ship out by default; opt back in via `KTEST=1` / `XHCI_VERBOSE=1` to the build script. Bundled: an FB-absent honesty guard the prior cycle's `fb_console_init` rewrite missed, a sweep of decayed Attempt-N references from `fb_console.cyr` comments, and a new `docs/development/build.md` that documents the gate matrix end-to-end. Cycle theme pivots from FB to **storage** — first 1.31.x engineering cuts target the NVMe block layer, not the framebuffer.
