@@ -28,6 +28,7 @@
 var BLK_NONE   = 0;
 var BLK_VIRTIO = 1;
 var BLK_NVME   = 2;
+var BLK_AHCI   = 3;
 
 # Public block-layer state. Consumers read these directly (matching
 # the existing vblk_active / vblk_capacity access pattern).
@@ -60,22 +61,38 @@ fn blk_register_nvme(capacity, lba_bytes) {
     return 0;
 }
 
+# AHCI takes the slot if it's currently empty OR currently BLK_VIRTIO
+# (real iron beats paravirt). Does NOT override NVMe — NVMe is the
+# modern primary on multi-disk iron; AHCI is auxiliary storage in
+# that topology. The override-vs-take policy here is encoded in the
+# caller (ahci_register_block_dev); this function unconditionally
+# assigns once called.
+fn blk_register_ahci(capacity, lba_bytes) {
+    blk_active    = BLK_AHCI;
+    blk_capacity  = capacity;
+    blk_lba_bytes = lba_bytes;
+    return 0;
+}
+
 # Dispatch wrappers ---------------------------------------------------
 
 fn blk_read(sector, buf) {
     if (blk_active == BLK_VIRTIO) { return vblk_blk_read(sector, buf); }
     if (blk_active == BLK_NVME)   { return nvme_blk_read(sector, buf); }
+    if (blk_active == BLK_AHCI)   { return ahci_blk_read(sector, buf); }
     return 0 - 1;
 }
 
 fn blk_write(sector, buf) {
     if (blk_active == BLK_VIRTIO) { return vblk_blk_write(sector, buf); }
     if (blk_active == BLK_NVME)   { return nvme_blk_write(sector, buf); }
+    if (blk_active == BLK_AHCI)   { return ahci_blk_write(sector, buf); }
     return 0 - 1;
 }
 
 fn blk_read_sectors(start, count, buf) {
     if (blk_active == BLK_VIRTIO) { return vblk_blk_read_sectors(start, count, buf); }
     if (blk_active == BLK_NVME)   { return nvme_blk_read_sectors(start, count, buf); }
+    if (blk_active == BLK_AHCI)   { return ahci_blk_read_sectors(start, count, buf); }
     return 0 - 1;
 }

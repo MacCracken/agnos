@@ -141,6 +141,81 @@ ISS=1 (Gen1 1.5 Gbps) is QEMU's emulation floor — real iron will report 3 (Gen
 
 **Out of scope (iron):** AHCI Phase 1 is read-only enumeration; no behavioral path lands new on iron until at least Phase 4 (first DMA-driven LBA read/write). However, an iron burn at any time post-Phase-1 would validate the enumeration on archaemenid's actual SATA SSD — confirms ABAR location, controller version (likely 1.2+), and that `sda` shows up with DET=3 + SIG=SATA + model-and-serial-resolvable-via-IDENTIFY (Phase 3). Per `feedback_iron_burns_block_other_work`, that needs a written audit before scheduling — likely batched with Phase 2-4 once a usable AHCI block backend exists. Phase 2 (HBA reset + per-port command list + FIS receive + port spin-up + start) is the next bite.
 
+### AHCI/SATA Phase 2 (per-port CL+FIS allocation + spin-up + start)
+
+Builds the per-port command-processing infrastructure that Phase 3+ commands ride on. Adds ~250 LOC to `kernel/core/ahci.cyr`: HBA-reset helper (callable but not invoked by default), `ahci_port_init(port)` running the AHCI 1.3.1 §10.1.2 system-software init sequence per port, `ahci_init_all()` driving init across all DET=3 SATA ports.
+
+**What it does:**
+- **`ahci_hba_reset()`** — full HBA reset (GHC.AE=1 → GHC.HR=1 → poll-clear → re-assert AE). 1M-iter timeout ceiling. Stamps CMOS kcp `0x4D` on success. NOT called by default — kept callable for Phase 3+ consumers that need a known-state baseline. Default `ahci_init_all` skips reset because gnoboot+UEFI hands off a working PHY state; a reset forces per-port DET=3 re-handshake for no gain at Phase 2.
+- **`ahci_port_init(port)`** — full per-port bring-up: clear PxCMD.ST → wait CR=0 → clear PxCMD.FRE → wait FR=0 → allocate 4 KB page each for command list (using 1 KB) + FIS receive area (using 256 B) → zero both → write PxCLB/CLBU + PxFB/FBU → clear PxSERR (W1C) → set PxCMD.FRE=1 → wait FR=1 → set PxCMD.SUD=1 (cold spin-up; no-op if CAP.SSS=0) → wait PxTFD.STS.BSY=0 + DRQ=0 (device ready) → set PxCMD.ST=1 → wait CR=1. Stores per-port CL/FIS phys in module-state arrays (`ahci_port_cl_phys[]` / `ahci_port_fis_phys[]` / `ahci_port_inited[]`, 32 ports max).
+- **`ahci_init_all()`** — walks the PI bitmap, calls `ahci_port_init` for every port with DET=3 + SIG=SATA. ATAPI / PM / SEMB ports skipped (different command-set semantics; iron archaemenid has no ATAPI). Defensively re-asserts GHC.AE=1 before the per-port walk. Stamps CMOS kcp `0x4E` after all ports walked. Returns count of successfully initialized ports.
+
+**Build:** 447,568 B → **455,888 B** (+8,320 B for ahci.cyr additions + aarch64 stubs).
+
+**QEMU validation:**
+```
+ahci: port 0 initialized (CL @ 9326592, FIS @ 9330688)
+ahci: port 1 initialized (CL @ 9334784, FIS @ 9338880)
+```
+Both q35 SATA ports allocated distinct 4 KB pages for CL + FIS (each port's CL+FIS pair are 8 KB apart, satisfying the 1 KB / 256 B alignment requirements trivially from pmm_alloc's 4 KB-aligned returns). ATAPI port 2 + empty ports 3-5 correctly skipped.
+
+### AHCI/SATA Phase 3 (IDENTIFY DEVICE — model / serial / firmware / LBA48 capacity)
+
+First command issued through the Phase 2 CL+FIS infrastructure. Adds ~220 LOC: ATA cmd 0xEC (IDENTIFY DEVICE) — the SATA equivalent of NVMe's IDENTIFY CTRL.
+
+**What it does:**
+- **`ahci_identify_device(port)`** — allocates per-port command table (CT, 4 KB page, first 128 B used: 20 B H2D FIS at +0 + 16 B PRDT[0] at +0x80) + 512-byte IDENTIFY data buffer (4 KB page). Builds H2D Register FIS (FIS type 0x27 / C bit / PM port 0 / opcode 0xEC / zero everything else), builds PRDT[0] pointing at the data buffer with DBC=511, builds Command Header in CL slot 0 (CFL=5 H2D-FIS-DWORDs / PRDTL=1 / CTBA=ct_phys / W=0 read). Clears PxIS + PxSERR, writes PxCI bit 0 to issue, polls completion with task-file-ERR escape hatch. Decodes IDENTIFY response: model (offset 54, 40 byte-swapped ASCII), serial (offset 20, 20 byte-swapped ASCII), firmware (offset 46, 8 byte-swapped ASCII), LBA48 sector count (u64 at offset 200). Caches `ahci_id_lba48` / `ahci_id_lba_bytes` (Phase 4 consumes).
+- **`ahci_print_id_string(buf, off, len)`** — byte-swap printer (ATA IDENTIFY returns text in word-byte-reversed order per ATA-8 §7.16.7). Each pair printed as low-byte-first via two `kprint(ptr, 1)` calls.
+- **`ahci_identify_all()`** — calls IDENTIFY on every initialized port. Stamps CMOS kcp `0x4F` on first successful per-port IDENTIFY.
+
+**Build:** 455,888 B → **463,112 B** (+7,224 B).
+
+**QEMU validation:**
+```
+ahci: port 0 model='QEMU HARDDISK                           ' serial='QM00001             ' fw='2.5+    '
+ahci: port 0 LBA48=131072 sectors (64 MiB)
+ahci: port 1 model='QEMU HARDDISK                           ' serial='QM00003             ' fw='2.5+    '
+ahci: port 1 LBA48=65536 sectors (32 MiB)
+```
+Both ports decoded model + serial + firmware as proper ASCII (byte-swap working). LBA48 capacities exactly match the disk.img / sata1.img sizes (64 MB / 32 MB) byte-for-byte.
+
+### AHCI/SATA Phase 4 (READ DMA EXT + WRITE DMA EXT + boot-time RW demo + block-layer registration)
+
+Real disk I/O — closes the AHCI driver as a working block backend. Adds ~370 LOC + extends `kernel/core/block.cyr` with `BLK_AHCI = 3` and `blk_register_ahci()` + AHCI dispatch arms in `blk_read` / `blk_write` / `blk_read_sectors`.
+
+**What it does:**
+- **`ahci_build_rw_fis(ct_phys, opcode, lba, count)`** — builds an H2D Register FIS for READ DMA EXT (0x25) / WRITE DMA EXT (0x35). LBA48 layout: bytes 4-6 hold LBA[23:0], bytes 8-10 hold LBA[47:24], device byte = 0x40 (LBA mode), count in bytes 12-13.
+- **`ahci_issue_rw(port, opcode, lba, count, data_phys, is_write)`** — common single-PRDT cmd-issue path factored out of Phase 3's IDENTIFY function. Caps `count` at 128 sectors (64 KB) per call — single-PRDT can address more but 64 KB matches typical max-page-transfer needs and keeps the path simple. Sets CH.W bit when `is_write == 1`. Same task-file-ERR escape + 1M-iter PxCI poll as Phase 3.
+- **`ahci_read_lba(port, lba, count, buf)` / `ahci_write_lba(port, lba, count, buf)`** — public READ/WRITE primitives over `ahci_issue_rw`.
+- **`ahci_rw_demo()`** — boot-time round-trip validation, mirrors `nvme_rw_demo`: reads LBA 0 (prints first 8 bytes), writes sentinel `"AHCI-OK!"` to LBA 5, reads LBA 5 back into a fresh buffer, verifies byte-by-byte. Single port (lowest-numbered initialized).
+- **`ahci_blk_read(sector, buf)` / `ahci_blk_write(sector, buf)` / `ahci_blk_read_sectors(start, count, buf)`** — single-sector + multi-sector wrappers translating the AHCI 1/0 success convention to the block-layer 0/-1 convention. Multi-sector chunks at 128-LBA boundaries through the single-PRDT cap.
+- **`ahci_register_block_dev()`** — picks the lowest-numbered initialized port, refreshes capacity via IDENTIFY (since Phase 3's globals only carry the last-called port's data), then **applies policy**: if `blk_active == BLK_NVME`, register as **secondary** (print summary, don't override — NVMe stays primary on multi-disk iron); otherwise call `blk_register_ahci(capacity, 512)` to take the slot (beating virtio paravirt). Stamps CMOS kcp `0x50` on either path.
+
+**block.cyr extension:**
+- New `BLK_AHCI = 3` tag.
+- New `blk_register_ahci(capacity, lba_bytes)` (unconditional slot assignment; the caller in `ahci_register_block_dev` encodes the override-vs-take policy).
+- New AHCI dispatch arms in all three wrappers (`blk_read` / `blk_write` / `blk_read_sectors`).
+
+**Build:** 463,112 B → **470,664 B** (+7,552 B).
+
+**QEMU validation:**
+```
+ahci: port 0 LBA0 first 8 bytes: 0 0 0 0 0 0 0 0
+ahci: port 0 LBA5 write-then-read round-trip PASS
+ahci: port 0 model='QEMU HARDDISK                           ' serial='QM00001             ' fw='2.5+    '
+ahci: port 0 LBA48=131072 sectors (64 MiB)
+ahci: registered as secondary block_dev (port 0, 131072 LBAs x 512B; NVMe primary)
+```
+- LBA 0 read: all zeros (matches dd-zeroed disk.img sector 0 — parted didn't write a protective MBR for our partitioning shape; behavior is correct).
+- LBA 5 write-then-read: PASS — sentinel `"AHCI-OK!"` (8 bytes) round-tripped through DMA, byte-exact.
+- Block-layer registration policy: NVMe present → AHCI registers as **secondary** (logged, but `blk_active` stays BLK_NVME). GPT continues to parse the NVMe partition table (`parts=1/128 [0] nvme-data`); AHCI's disk content is reachable via `ahci_blk_read/write` directly. On a no-NVMe system AHCI would take the slot and downstream consumers (GPT, fatfs, future ext2) would see AHCI transparently.
+
+**CMOS storage-arc sequence at 1.31.1 (full)**: NVMe 0x40-0x48 → GPT 0x49-0x4A → AHCI 0x4B (probe) / 0x4C (port enum) / 0x4D (HBA reset — only when explicitly called) / 0x4E (port init done) / 0x4F (IDENTIFY done) / 0x50 (block-layer registration done). All progressive values in CMOS slot 0x50.
+
+**Out of scope (next bites for 1.31.1 close):**
+- **GPT Phase 3** — CRC32 (table-driven 0xEDB88320) header + array validation, backup-header recovery on primary fail, type-GUID classifier ("Linux fs" / "EFI System" / etc.). Correctness hardening; deferrable to a closing 1.31.1 patch.
+- **Iron burn on archaemenid** — the `sda` 1.8 TB SATA SSD's first iron exercise. Per `feedback_iron_burns_block_other_work` needs a written audit before scheduling; bundles all four AHCI phases at once since they're all read-only against the drive's content except the LBA-5 sentinel write (which is to a location no consumer cares about on archaemenid's drives — but a sentinel write to the wrong physical disk is still a write, so the audit must cover this).
+
 ## [1.31.0] — 2026-05-20 (NVMe arc — Phase 1-5 driver + block-layer dispatch + iron debut on Crucial P3 2TB; cycle-open production-lean — KTEST + XHCI_VERBOSE compile gates + FB-absent guard + `docs/development/build.md`)
 
 ### NVMe Phase 1 (probe + capability decode + controller disable)

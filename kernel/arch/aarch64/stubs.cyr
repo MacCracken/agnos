@@ -113,11 +113,28 @@ fn nvme_blk_read(a, b) { return 0 - 1; }
 fn nvme_blk_write(a, b) { return 0 - 1; }
 fn nvme_blk_read_sectors(a, b, c) { return 0 - 1; }
 
-# AHCI/SATA stubs (1.31.1 storage arc — Phase 1)
+# AHCI/SATA stubs (1.31.1 storage arc — Phase 1 + 2 + 3 + 4)
 var ahci_present = 0;
 var ahci_devices_found = 0;
+var ahci_ports_inited_count = 0;
+var ahci_id_lba48 = 0;
+var ahci_id_lba_bytes = 512;
+var ahci_blk_port = 0 - 1;
 fn ahci_probe() { return 0; }
 fn ahci_enum_ports() { return 0; }
+fn ahci_hba_reset() { return 0; }
+fn ahci_port_init(p) { return 0; }
+fn ahci_init_all() { return 0; }
+fn ahci_identify_device(p) { return 0; }
+fn ahci_identify_all() { return 0; }
+fn ahci_read_lba(p, l, c, b) { return 0; }
+fn ahci_write_lba(p, l, c, b) { return 0; }
+fn ahci_rw_demo() { return 0; }
+fn ahci_blk_read(s, b) { return 0 - 1; }
+fn ahci_blk_write(s, b) { return 0 - 1; }
+fn ahci_blk_read_sectors(s, c, b) { return 0 - 1; }
+fn ahci_register_block_dev() { return 0; }
+fn blk_register_ahci(c, l) { return 0; }
 
 # GPT parser stubs (1.31.1 storage arc — Phase 1 + Phase 2)
 var gpt_present = 0;

@@ -300,3 +300,821 @@ fn ahci_enum_ports() {
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4C; 0xE6; 0x71; }
     return count;
 }
+
+# === AHCI Phase 2 — HBA reset + per-port bring-up ====================
+#
+# Per AHCI 1.3.1 §10.1.2 system-software initialization sequence:
+#   1. Indicate AHCI awareness (GHC.AE=1) — usually firmware-set, we
+#      re-assert.
+#   2. Optionally reset the HBA (GHC.HR=1 → poll until cleared by HW).
+#      We perform reset to ensure a known-state baseline regardless of
+#      what gnoboot/UEFI left behind.
+#   3. Re-set GHC.AE=1 (reset clears it).
+#   4. For each implemented + DET=3 SATA port:
+#       a. PxCMD.ST=0 (in case firmware started it; defensive)
+#       b. wait PxCMD.CR=0
+#       c. PxCMD.FRE=0
+#       d. wait PxCMD.FR=0
+#       e. allocate command list (1 KB, 1 KB-aligned) — pmm_alloc gives
+#          a 4 KB-aligned page; 1 KB alignment is satisfied trivially.
+#          Use only the first 1 KB; the remaining 3 KB of the page is
+#          intentional waste in Phase 2 (Phase 4 may pack per-port
+#          PRDT scratch into it; not now).
+#       f. allocate FIS receive area (256 B, 256 B-aligned) — same
+#          allocator, same alignment guarantee.
+#       g. zero both pages.
+#       h. write PxCLB/PxCLBU (CL base 64-bit) and PxFB/PxFBU.
+#       i. clear PxSERR by writing 0xFFFFFFFF (W1C).
+#       j. PxCMD.FRE=1, wait PxCMD.FR=1.
+#       k. PxCMD.SUD=1 if CAP.SSS=1 (cold spin-up). If SSS=0 the bit is
+#          RO=1 (HW always spun up); write is no-op.
+#       l. wait for PxTFD.STS.BSY=0 && DRQ=0 (device ready for commands)
+#       m. PxCMD.ST=1 (begin processing commands).
+#       n. wait PxCMD.CR=1.
+#
+# ATAPI ports (SIG=0xEB140101) are SKIPPED in Phase 2 — same command
+# infrastructure but different command-set semantics; iron archaemenid
+# has no ATAPI, so no functional regression. Phase 5+ (if ever) can
+# wire CD/DVD support.
+#
+# CMOS checkpoints: 0x4D (HBA reset cleared), 0x4E (all SATA ports
+# initialized — every DET=3+SIG=SATA port that survived port-init).
+
+var AHCI_MAX_PORTS    = 32;
+var ahci_port_cl_phys[256];     # 32 ports × 8 bytes per u64
+var ahci_port_fis_phys[256];    # 32 ports × 8 bytes per u64
+var ahci_port_inited[32];       # 32 × u8 flag
+var ahci_ports_inited_count = 0;
+
+# Timeouts — same 1M-iter ceiling NVMe + xhci use. ~250ms wall on Zen.
+var AHCI_TIMEOUT_SPINS = 1000000;
+
+# CAP fields not previously cached — needed in Phase 2 logic.
+fn ahci_cap_sss() { return (ahci_cap >> 27) & 0x01; }
+
+# --- HBA reset --------------------------------------------------------
+
+fn ahci_hba_reset() {
+    if (ahci_present == 0) { return 0; }
+
+    # 1. Ensure GHC.AE=1 BEFORE reset (spec §10.1.2 step 1).
+    var ghc = ahci_mmio_read32(AHCI_REG_GHC);
+    ghc = ghc | 0x80000000;
+    ahci_mmio_write32(AHCI_REG_GHC, ghc);
+
+    # 2. Trigger HBA reset (GHC.HR=1). HW clears the bit when reset
+    #    completes.
+    ghc = ahci_mmio_read32(AHCI_REG_GHC);
+    ghc = ghc | 0x01;
+    ahci_mmio_write32(AHCI_REG_GHC, ghc);
+
+    var spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        var cur = ahci_mmio_read32(AHCI_REG_GHC);
+        if ((cur & 0x01) == 0) {
+            # 3. Re-assert AHCI mode after reset (reset clears AE).
+            cur = cur | 0x80000000;
+            ahci_mmio_write32(AHCI_REG_GHC, cur);
+            ahci_ghc = cur;
+            # CMOS kcp = 0x4D (HBA reset cleared, AE re-asserted).
+            asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4D; 0xE6; 0x71; }
+            kprintln("ahci: HBA reset complete, AE=1", 30);
+            return 1;
+        }
+        spins = spins + 1;
+    }
+
+    kprintln("ahci: HBA reset timeout (GHC.HR stuck)", 38);
+    return 0;
+}
+
+# --- Per-port command-list + FIS init --------------------------------
+
+fn ahci_port_init(port) {
+    if (ahci_present == 0) { return 0; }
+    if (port < 0) { return 0; }
+    if (port >= AHCI_MAX_PORTS) { return 0; }
+
+    var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+
+    # a. PxCMD.ST=0 (defensive; firmware might have started it).
+    var cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    cmd = cmd & 0xFFFFFFFE;     # clear ST (bit 0)
+    ahci_mmio_write32(port_off + AHCI_P_CMD, cmd);
+
+    # b. Wait for PxCMD.CR=0 (command-list running clear).
+    var spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        var c = ahci_mmio_read32(port_off + AHCI_P_CMD);
+        if ((c >> 15 & 0x01) == 0) { spins = AHCI_TIMEOUT_SPINS; }
+        else { spins = spins + 1; }
+    }
+
+    # c. PxCMD.FRE=0.
+    cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    cmd = cmd & 0xFFFFFFEF;     # clear FRE (bit 4)
+    ahci_mmio_write32(port_off + AHCI_P_CMD, cmd);
+
+    # d. Wait for PxCMD.FR=0.
+    spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        var c = ahci_mmio_read32(port_off + AHCI_P_CMD);
+        if ((c >> 14 & 0x01) == 0) { spins = AHCI_TIMEOUT_SPINS; }
+        else { spins = spins + 1; }
+    }
+
+    # e+f. Allocate command list (1 KB used of a 4 KB page) and FIS
+    #      receive (256 B used of a 4 KB page). pmm_alloc returns
+    #      4 KB-aligned phys; 1 KB / 256 B alignment is trivially OK.
+    var cl_phys  = pmm_alloc();
+    var fis_phys = pmm_alloc();
+    if (cl_phys == 0) { return 0; }
+    if (fis_phys == 0) { return 0; }
+
+    # g. Zero both pages. Single-byte stores in a loop — slow but
+    #    used only once per port at init.
+    var i = 0;
+    while (i < 1024) { store8(cl_phys + i, 0); i = i + 1; }
+    i = 0;
+    while (i < 256) { store8(fis_phys + i, 0); i = i + 1; }
+
+    # Cache phys addresses by port index for later phases.
+    store64(&ahci_port_cl_phys + port * 8, cl_phys);
+    store64(&ahci_port_fis_phys + port * 8, fis_phys);
+
+    # h. Program PxCLB / PxCLBU (CL base) and PxFB / PxFBU (FIS base).
+    #    Split 64-bit phys into two 32-bit halves — same posture as
+    #    NVMe's ASQ/ACQ programming. The "& 0xFFFFFFFF" mask is
+    #    redundant but documents intent.
+    ahci_mmio_write32(port_off + AHCI_P_CLB,  cl_phys & 0xFFFFFFFF);
+    ahci_mmio_write32(port_off + AHCI_P_CLBU, (cl_phys >> 32) & 0xFFFFFFFF);
+    ahci_mmio_write32(port_off + AHCI_P_FB,   fis_phys & 0xFFFFFFFF);
+    ahci_mmio_write32(port_off + AHCI_P_FBU,  (fis_phys >> 32) & 0xFFFFFFFF);
+
+    # i. Clear PxSERR (W1C — writing 1 to each bit clears it).
+    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
+
+    # j. PxCMD.FRE=1, wait PxCMD.FR=1.
+    cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    cmd = cmd | 0x10;           # set FRE (bit 4)
+    ahci_mmio_write32(port_off + AHCI_P_CMD, cmd);
+
+    spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        var c = ahci_mmio_read32(port_off + AHCI_P_CMD);
+        if ((c >> 14 & 0x01) == 1) { spins = AHCI_TIMEOUT_SPINS; }
+        else { spins = spins + 1; }
+    }
+
+    # k. PxCMD.SUD=1 if CAP.SSS=1. If SSS=0 the bit is RO; write is
+    #    effectively a no-op so we always issue it (defensive).
+    cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    cmd = cmd | 0x02;           # set SUD (bit 1)
+    ahci_mmio_write32(port_off + AHCI_P_CMD, cmd);
+
+    # l. Wait for PxTFD.STS.BSY=0 (bit 7) && DRQ=0 (bit 3). Device-
+    #    ready gate before issuing commands. Short spin — device is
+    #    usually already idle on a healthy SATA SSD.
+    spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        var tfd = ahci_mmio_read32(port_off + AHCI_P_TFD);
+        var stat = tfd & 0xFF;
+        if ((stat & 0x88) == 0) { spins = AHCI_TIMEOUT_SPINS; }
+        else { spins = spins + 1; }
+    }
+
+    # m. PxCMD.ST=1 — begin processing commands.
+    cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    cmd = cmd | 0x01;           # set ST (bit 0)
+    ahci_mmio_write32(port_off + AHCI_P_CMD, cmd);
+
+    # n. Wait PxCMD.CR=1 (command-list running).
+    spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        var c = ahci_mmio_read32(port_off + AHCI_P_CMD);
+        if ((c >> 15 & 0x01) == 1) { spins = AHCI_TIMEOUT_SPINS; }
+        else { spins = spins + 1; }
+    }
+
+    store8(&ahci_port_inited + port, 1);
+    ahci_ports_inited_count = ahci_ports_inited_count + 1;
+
+    kprint("ahci: port ", 11);
+    kprint_num(port);
+    kprint(" initialized (CL @ ", 19);
+    kprint_num(cl_phys);
+    kprint(", FIS @ ", 8);
+    kprint_num(fis_phys);
+    kprintln(")", 1);
+    return 1;
+}
+
+# --- AHCI Phase 2 main entry -----------------------------------------
+#
+# Drives reset + walks the PI bitmap, calling `ahci_port_init` for
+# every implemented SATA port (DET=3 + SIG=0x00000101). ATAPI / PM /
+# SEMB / no-device ports are skipped. Returns the count of successfully
+# initialized SATA ports.
+
+fn ahci_init_all() {
+    if (ahci_present == 0) { return 0; }
+    # HBA reset is OPTIONAL per AHCI 1.3.1 §10.1.2 — gnoboot/UEFI leaves
+    # the controller in AHCI-mode + AE=1 + ports PHY-handshaked, so we
+    # trust that handoff state and skip the reset (which would invalidate
+    # the PHY links + force per-port DET=3 wait + SIG re-stabilization,
+    # all for no gain at Phase 2). `ahci_hba_reset` stays defined for
+    # Phase 3+ consumers that need a known-state baseline.
+    # Defensive: re-assert GHC.AE=1 in case some firmware path left it
+    # cleared. Cheap, idempotent.
+    var ghc = ahci_mmio_read32(AHCI_REG_GHC);
+    if ((ghc & 0x80000000) == 0) {
+        ghc = ghc | 0x80000000;
+        ahci_mmio_write32(AHCI_REG_GHC, ghc);
+    }
+
+    var inited   = 0;
+    var port     = 0;
+    var max_port = ahci_np + 1;
+    if (max_port > AHCI_MAX_PORTS) { max_port = AHCI_MAX_PORTS; }
+
+    while (port < max_port) {
+        var bit_set = (ahci_pi >> port) & 0x01;
+        if (bit_set == 1) {
+            var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+            var ssts     = ahci_mmio_read32(port_off + AHCI_P_SSTS);
+            var sig      = ahci_mmio_read32(port_off + AHCI_P_SIG);
+            var det      = ssts & 0x0F;
+            # Only initialize SATA HDDs/SSDs in Phase 2 — ATAPI gets
+            # a separate command-set track (Phase 5+ if ever).
+            if (det == 3) {
+                if (sig == AHCI_SIG_ATA) {
+                    if (ahci_port_init(port) == 1) {
+                        inited = inited + 1;
+                    }
+                }
+            }
+        }
+        port = port + 1;
+    }
+
+    # CMOS kcp = 0x4E (per-port init done).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4E; 0xE6; 0x71; }
+    return inited;
+}
+
+# === AHCI Phase 3 — IDENTIFY DEVICE ==================================
+#
+# First command issued through the Phase 2 CL+FIS infrastructure. ATA
+# command 0xEC (IDENTIFY DEVICE) — the SATA equivalent of NVMe's
+# IDENTIFY CTRL — returns a 512-byte data block describing the drive
+# (model / serial / firmware / LBA48 capacity / sector size).
+#
+# Command path (AHCI 1.3.1 §5 + ATA/ATAPI-8 §7.16):
+#   1. Allocate a Command Table (CT) per port — variable size; for
+#      IDENTIFY we need 80 B header + 16 B for one PRDT entry = 96 B.
+#      pmm_alloc returns 4 KB; we use the first 128 B of it. The
+#      remaining 3.875 KB is intentional waste until a multi-PRDT
+#      command (Phase 4 multi-LBA read) consumes it.
+#   2. Allocate a 512-B IDENTIFY data buffer (4 KB page, first 512 B
+#      used).
+#   3. Build an H2D Register FIS (20 B) at CT+0:
+#       byte 0: 0x27 (FIS type = H2D Register)
+#       byte 1: 0x80 (bit 7 = Command, bits 0-3 = PM port = 0)
+#       byte 2: 0xEC (IDENTIFY DEVICE opcode)
+#       bytes 3-15: zeros (no LBA / no count / no features for IDENTIFY)
+#   4. Build PRDT[0] at CT+0x80 (16 B):
+#       bytes 0-3:  DBA  = data_phys low 32
+#       bytes 4-7:  DBAU = data_phys high 32
+#       bytes 8-11: reserved (0)
+#       bytes 12-15: bits 0-21 = DBC = 511 (= byte_count - 1), bit 31 = I (interrupt, 0)
+#   5. Build Command Header (CL slot 0, 32 B):
+#       bytes 0-1:  bits 0-4 = CFL = 5 (H2D FIS is 5 DWORDs), bit 6 = W = 0 (read)
+#       bytes 2-3:  PRDTL = 1 (one PRDT entry)
+#       bytes 4-7:  PRDBC = 0 (HBA fills on completion)
+#       bytes 8-11: CTBA = CT phys low 32
+#       bytes 12-15: CTBAU = CT phys high 32
+#       bytes 16-31: reserved (0)
+#   6. Set PxCI bit 0 (Command Issue slot 0) — kick the command.
+#   7. Poll PxCI bit 0 to clear (command consumed by HBA + completed
+#      by device). Also check PxIS / PxTFD for error state.
+#   8. Decode IDENTIFY data:
+#       words 10-19 (off 20-39): Serial Number (20 ASCII, byte-swapped per word)
+#       words 23-26 (off 46-53): Firmware Revision (8 ASCII, byte-swapped)
+#       words 27-46 (off 54-93): Model Number (40 ASCII, byte-swapped)
+#       words 60-61 (off 120-123): LBA28 sector count (legacy)
+#       words 100-103 (off 200-207): LBA48 sector count (u64)
+#
+# CMOS kcp = 0x4F (IDENTIFY done for at least one port). Issued on the
+# first successful per-port IDENTIFY parse, not on every port.
+
+var ahci_port_ct_phys[256];    # 32 ports × 8 bytes
+var ahci_port_id_phys[256];    # 32 ports × 8 bytes
+
+# Last-IDENTIFY-decoded fields (cached per ahci_identify_device call).
+var ahci_id_lba48      = 0;
+var ahci_id_lba_bytes  = 512;  # default; word 106 may override
+
+# --- Byte-swapped ASCII print (ATA IDENTIFY quirk) -------------------
+#
+# IDENTIFY DEVICE returns text fields with each 16-bit word stored as
+# (high_byte, low_byte) in memory — opposite of the natural ASCII
+# byte order. To print, swap each pair: print byte at offset+1 first,
+# then byte at offset.
+
+fn ahci_print_id_string(id_buf, off, len) {
+    var i = 0;
+    while (i < len) {
+        kprint(id_buf + off + i + 1, 1);
+        kprint(id_buf + off + i, 1);
+        i = i + 2;
+    }
+    return 0;
+}
+
+# --- Issue IDENTIFY DEVICE on one port -------------------------------
+
+fn ahci_identify_device(port) {
+    if (ahci_present == 0) { return 0; }
+    if (port < 0) { return 0; }
+    if (port >= AHCI_MAX_PORTS) { return 0; }
+    if (load8(&ahci_port_inited + port) != 1) { return 0; }
+
+    var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+    var cl_phys  = load64(&ahci_port_cl_phys + port * 8);
+
+    # Allocate Command Table + IDENTIFY data buffer on first use.
+    # Cached for the port's lifetime; subsequent IDENTIFY calls reuse.
+    var ct_phys = load64(&ahci_port_ct_phys + port * 8);
+    if (ct_phys == 0) {
+        ct_phys = pmm_alloc();
+        if (ct_phys == 0) { return 0; }
+        store64(&ahci_port_ct_phys + port * 8, ct_phys);
+    }
+    var id_phys = load64(&ahci_port_id_phys + port * 8);
+    if (id_phys == 0) {
+        id_phys = pmm_alloc();
+        if (id_phys == 0) { return 0; }
+        store64(&ahci_port_id_phys + port * 8, id_phys);
+    }
+
+    # Zero CT + ID buffer.
+    var i = 0;
+    while (i < 128) { store8(ct_phys + i, 0); i = i + 1; }
+    i = 0;
+    while (i < 512) { store8(id_phys + i, 0); i = i + 1; }
+
+    # --- Build H2D Register FIS at CT+0 ---
+    store8(ct_phys + 0,  0x27);     # FIS type = H2D Register
+    store8(ct_phys + 1,  0x80);     # C bit set, PM port 0
+    store8(ct_phys + 2,  0xEC);     # Command = IDENTIFY DEVICE
+    # bytes 3-15 left zero (no features / no LBA / no count / no ICC)
+
+    # --- Build PRDT[0] at CT+0x80 ---
+    store32(ct_phys + 0x80, id_phys & 0xFFFFFFFF);          # DBA
+    store32(ct_phys + 0x84, (id_phys >> 32) & 0xFFFFFFFF);  # DBAU
+    store32(ct_phys + 0x88, 0);                              # Reserved
+    store32(ct_phys + 0x8C, 511);                            # DBC = byte_count - 1 (no I bit)
+
+    # --- Build Command Header in CL slot 0 ---
+    # bytes 0-1: CFL=5 in bits 0-4, W=0 (read)
+    store32(cl_phys + 0,  5);
+    # bytes 2-3: PRDTL=1 (stored at offset 2 as 16-bit, but Cyrius
+    # store32 above wrote bytes 0-3; the PRDTL field needs to be in
+    # bytes 2-3 of the header word. Rebuild with full 32-bit value:
+    #   bits 0-4  = CFL = 5
+    #   bit 6     = W   = 0
+    #   bits 16-31 = PRDTL = 1
+    store32(cl_phys + 0, (1 << 16) | 5);
+    store32(cl_phys + 4, 0);                                 # PRDBC
+    store32(cl_phys + 8, ct_phys & 0xFFFFFFFF);              # CTBA
+    store32(cl_phys + 12, (ct_phys >> 32) & 0xFFFFFFFF);     # CTBAU
+    # bytes 16-31: reserved, leave zero from the zeroing pass.
+    store32(cl_phys + 16, 0);
+    store32(cl_phys + 20, 0);
+    store32(cl_phys + 24, 0);
+    store32(cl_phys + 28, 0);
+
+    # --- Clear PxIS + PxSERR so we can see fresh error state ---
+    ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
+    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
+
+    # --- Issue: PxCI bit 0 = 1 ---
+    ahci_mmio_write32(port_off + AHCI_P_CI, 1);
+
+    # --- Poll PxCI bit 0 to clear (command complete) ---
+    var spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        var ci = ahci_mmio_read32(port_off + AHCI_P_CI);
+        if ((ci & 0x01) == 0) { spins = AHCI_TIMEOUT_SPINS; }
+        else {
+            # Check for task-file error mid-poll — fast failure path
+            # rather than waiting the full 1M iterations on a wedged cmd.
+            var tfd = ahci_mmio_read32(port_off + AHCI_P_TFD);
+            if ((tfd & 0x01) == 1) {           # ERR bit in STS
+                kprint("ahci: port ", 11);
+                kprint_num(port);
+                kprintln(" IDENTIFY: task-file ERR", 24);
+                return 0;
+            }
+            spins = spins + 1;
+        }
+    }
+
+    # --- Sanity gate: PxCI must actually have cleared (no timeout) ---
+    var ci_final = ahci_mmio_read32(port_off + AHCI_P_CI);
+    if ((ci_final & 0x01) == 1) {
+        kprint("ahci: port ", 11);
+        kprint_num(port);
+        kprintln(" IDENTIFY: timeout (PxCI stuck)", 31);
+        return 0;
+    }
+
+    # --- Decode IDENTIFY data ---
+    # LBA48 sector count: u64 at offset 200 (words 100-103). LBA bytes
+    # default 512; word 106 bit 12 = "logical sector longer than 256
+    # words" → check word 117-118 for actual size. Phase 3 simple path
+    # assumes 512 B/LBA (true for >99% of consumer drives).
+    ahci_id_lba48     = load64(id_phys + 200);
+    ahci_id_lba_bytes = 512;
+
+    kprint("ahci: port ", 11);
+    kprint_num(port);
+    kprint(" model='", 8);
+    ahci_print_id_string(id_phys, 54, 40);
+    kprint("' serial='", 10);
+    ahci_print_id_string(id_phys, 20, 20);
+    kprint("' fw='", 6);
+    ahci_print_id_string(id_phys, 46, 8);
+    kprintln("'", 1);
+
+    kprint("ahci: port ", 11);
+    kprint_num(port);
+    kprint(" LBA48=", 7);
+    kprint_num(ahci_id_lba48);
+    kprint(" sectors (", 10);
+    kprint_num((ahci_id_lba48 * ahci_id_lba_bytes) / 1048576);
+    kprintln(" MiB)", 5);
+
+    return 1;
+}
+
+# --- Drive IDENTIFY across every initialized SATA port ---------------
+
+fn ahci_identify_all() {
+    if (ahci_present == 0) { return 0; }
+    var port      = 0;
+    var max_port  = ahci_np + 1;
+    if (max_port > AHCI_MAX_PORTS) { max_port = AHCI_MAX_PORTS; }
+    var any_ok    = 0;
+
+    while (port < max_port) {
+        if (load8(&ahci_port_inited + port) == 1) {
+            if (ahci_identify_device(port) == 1) {
+                any_ok = 1;
+            }
+        }
+        port = port + 1;
+    }
+
+    if (any_ok == 1) {
+        # CMOS kcp = 0x4F (AHCI IDENTIFY done for at least one port).
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4F; 0xE6; 0x71; }
+    }
+    return any_ok;
+}
+
+# === AHCI Phase 4 — READ/WRITE DMA EXT + block-layer registration ====
+#
+# Real disk I/O. Uses the Phase 2 CL+FIS infrastructure and the Phase 3
+# command-issue pattern. ATA commands:
+#   - READ DMA EXT  (0x25): 48-bit LBA, 16-bit sector count, into PRDT buffer
+#   - WRITE DMA EXT (0x35): same shape, write direction (CH.W=1)
+#
+# Single-PRDT path only — covers transfers up to PRDT.DBC max (4 MB
+# per entry). Multi-PRDT (large sequential transfer split across pages)
+# can land in Phase 5 if needed. Most consumer-side reads/writes are
+# single-sector or page-sized → single-PRDT covers them all.
+#
+# Block-layer registration policy:
+#   - BLK_NONE   → AHCI takes the slot (no other backend)
+#   - BLK_VIRTIO → AHCI overrides (real iron beats QEMU paravirt)
+#   - BLK_NVME   → AHCI does NOT override (NVMe is the modern primary;
+#                  AHCI is auxiliary on multi-disk iron)
+# `ahci_blk_port` records which AHCI port is registered. Phase 4
+# defaults to the lowest-numbered initialized SATA port.
+
+var ahci_blk_port = 0 - 1;    # -1 = not registered; set to port idx on register
+
+# --- Build H2D FIS for READ/WRITE DMA EXT ----------------------------
+#
+# 20-byte H2D Register FIS with LBA48 + count layout (ATA/ATAPI-8
+# §7.21 READ DMA EXT, §7.62 WRITE DMA EXT):
+#   byte 0:  0x27 (FIS type)
+#   byte 1:  0x80 (C bit, PM port 0)
+#   byte 2:  opcode (0x25 read / 0x35 write)
+#   byte 3:  features low (0)
+#   bytes 4-6: LBA[23:0]
+#   byte 7:  device = 0x40 (LBA mode bit set; bits 0-3 = LBA[27:24] but
+#                            in LBA48 mode bits 0-3 are unused since
+#                            high bits come from the exp register)
+#   bytes 8-10: LBA[47:24]
+#   byte 11: features high (0)
+#   bytes 12-13: sector count
+#   byte 14: ICC (0)
+#   byte 15: control (0)
+#   bytes 16-19: reserved
+fn ahci_build_rw_fis(ct_phys, opcode, lba, count) {
+    # Clear the FIS region (20 bytes).
+    var i = 0;
+    while (i < 20) { store8(ct_phys + i, 0); i = i + 1; }
+
+    store8(ct_phys + 0,  0x27);
+    store8(ct_phys + 1,  0x80);
+    store8(ct_phys + 2,  opcode);
+
+    # LBA[23:0] → bytes 4, 5, 6
+    store8(ct_phys + 4, lba & 0xFF);
+    store8(ct_phys + 5, (lba >> 8) & 0xFF);
+    store8(ct_phys + 6, (lba >> 16) & 0xFF);
+    # device byte: LBA mode (bit 6 = 1). LBA48 puts high bits in exp,
+    # not in device byte's low nibble.
+    store8(ct_phys + 7, 0x40);
+
+    # LBA[47:24] → bytes 8, 9, 10
+    store8(ct_phys + 8,  (lba >> 24) & 0xFF);
+    store8(ct_phys + 9,  (lba >> 32) & 0xFF);
+    store8(ct_phys + 10, (lba >> 40) & 0xFF);
+
+    # count → bytes 12-13
+    store8(ct_phys + 12, count & 0xFF);
+    store8(ct_phys + 13, (count >> 8) & 0xFF);
+
+    return 0;
+}
+
+# --- Issue a single-PRDT command (read or write) ---------------------
+#
+# Internal common path for READ/WRITE DMA EXT. Returns 1 on success,
+# 0 on any failure (PxCI never set, task-file ERR, timeout).
+
+fn ahci_issue_rw(port, opcode, lba, count, data_phys, is_write) {
+    if (ahci_present == 0) { return 0; }
+    if (port < 0) { return 0; }
+    if (port >= AHCI_MAX_PORTS) { return 0; }
+    if (load8(&ahci_port_inited + port) != 1) { return 0; }
+    if (count <= 0) { return 0; }
+    if (count > 128) { return 0; }      # cap per-cmd at 64 KB (128 sectors)
+
+    var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+    var cl_phys  = load64(&ahci_port_cl_phys + port * 8);
+    var ct_phys  = load64(&ahci_port_ct_phys + port * 8);
+    if (ct_phys == 0) {
+        ct_phys = pmm_alloc();
+        if (ct_phys == 0) { return 0; }
+        store64(&ahci_port_ct_phys + port * 8, ct_phys);
+    }
+
+    # Zero the part of the CT we'll touch (FIS 20 B + PRDT 16 B at 0x80).
+    var i = 0;
+    while (i < 20)  { store8(ct_phys + i, 0); i = i + 1; }
+    i = 0;
+    while (i < 16)  { store8(ct_phys + 0x80 + i, 0); i = i + 1; }
+
+    ahci_build_rw_fis(ct_phys, opcode, lba, count);
+
+    # PRDT[0]: DBA / DBAU / Reserved / DBC.
+    var byte_count = count * 512;
+    store32(ct_phys + 0x80, data_phys & 0xFFFFFFFF);
+    store32(ct_phys + 0x84, (data_phys >> 32) & 0xFFFFFFFF);
+    store32(ct_phys + 0x88, 0);
+    store32(ct_phys + 0x8C, byte_count - 1);  # DBC = byte_count - 1
+
+    # Command Header slot 0: CFL=5 (H2D FIS DWORDs), W bit per direction,
+    # PRDTL=1, CTBA = ct_phys.
+    var ch_word0 = 5;                          # CFL = 5
+    if (is_write == 1) { ch_word0 = ch_word0 | 0x40; }   # W = bit 6
+    ch_word0 = ch_word0 | (1 << 16);            # PRDTL = 1
+    store32(cl_phys + 0,  ch_word0);
+    store32(cl_phys + 4,  0);                   # PRDBC
+    store32(cl_phys + 8,  ct_phys & 0xFFFFFFFF);
+    store32(cl_phys + 12, (ct_phys >> 32) & 0xFFFFFFFF);
+    store32(cl_phys + 16, 0);
+    store32(cl_phys + 20, 0);
+    store32(cl_phys + 24, 0);
+    store32(cl_phys + 28, 0);
+
+    # Clear any pending IS / SERR before issue.
+    ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
+    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
+
+    # Issue.
+    ahci_mmio_write32(port_off + AHCI_P_CI, 1);
+
+    # Poll completion (CI bit 0 → 0) with task-file error escape hatch.
+    var spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        var ci = ahci_mmio_read32(port_off + AHCI_P_CI);
+        if ((ci & 0x01) == 0) { spins = AHCI_TIMEOUT_SPINS; }
+        else {
+            var tfd = ahci_mmio_read32(port_off + AHCI_P_TFD);
+            if ((tfd & 0x01) == 1) { return 0; }
+            spins = spins + 1;
+        }
+    }
+
+    var ci_final = ahci_mmio_read32(port_off + AHCI_P_CI);
+    if ((ci_final & 0x01) == 1) { return 0; }     # stuck
+
+    return 1;
+}
+
+# --- Public READ / WRITE primitives ----------------------------------
+
+fn ahci_read_lba(port, lba, count, buf) {
+    return ahci_issue_rw(port, 0x25, lba, count, buf, 0);
+}
+
+fn ahci_write_lba(port, lba, count, buf) {
+    return ahci_issue_rw(port, 0x35, lba, count, buf, 1);
+}
+
+# --- Boot-time round-trip demo ---------------------------------------
+#
+# Mirrors `nvme_rw_demo`: read LBA 0 (print first 8 bytes), write a
+# sentinel at LBA 5, read it back and verify. Single port only (port
+# 0 if SATA-initialized). No effect on user data when port 0 carries
+# a blank disk.image (the case in our QEMU smoke).
+
+var ahci_demo_buf = 0;
+var ahci_demo_buf2 = 0;
+
+fn ahci_rw_demo() {
+    if (ahci_present == 0) { return 0; }
+    # Pick the lowest-numbered initialized port for the demo.
+    var port = 0;
+    while (port < AHCI_MAX_PORTS) {
+        if (load8(&ahci_port_inited + port) == 1) { port = port; break; }
+        port = port + 1;
+    }
+    if (port >= AHCI_MAX_PORTS) { return 0; }
+    if (load8(&ahci_port_inited + port) != 1) { return 0; }
+
+    if (ahci_demo_buf == 0) {
+        ahci_demo_buf = pmm_alloc();
+        if (ahci_demo_buf == 0) { return 0; }
+    }
+    if (ahci_demo_buf2 == 0) {
+        ahci_demo_buf2 = pmm_alloc();
+        if (ahci_demo_buf2 == 0) { return 0; }
+    }
+
+    # 1. Read LBA 0 — print first 8 bytes (mirrors nvme demo).
+    var i = 0;
+    while (i < 512) { store8(ahci_demo_buf + i, 0); i = i + 1; }
+    if (ahci_read_lba(port, 0, 1, ahci_demo_buf) == 0) {
+        kprint("ahci: port ", 11);
+        kprint_num(port);
+        kprintln(" LBA0 read FAILED", 17);
+        return 0;
+    }
+    kprint("ahci: port ", 11);
+    kprint_num(port);
+    kprint(" LBA0 first 8 bytes:", 20);
+    i = 0;
+    while (i < 8) {
+        kprint(" ", 1);
+        kprint_num(load8(ahci_demo_buf + i));
+        i = i + 1;
+    }
+    kprintln("", 0);
+
+    # 2. Write a sentinel at LBA 5: "AHCI-OK!" (8 bytes), rest zero.
+    i = 0;
+    while (i < 512) { store8(ahci_demo_buf2 + i, 0); i = i + 1; }
+    store8(ahci_demo_buf2 + 0, 65);    # A
+    store8(ahci_demo_buf2 + 1, 72);    # H
+    store8(ahci_demo_buf2 + 2, 67);    # C
+    store8(ahci_demo_buf2 + 3, 73);    # I
+    store8(ahci_demo_buf2 + 4, 45);    # -
+    store8(ahci_demo_buf2 + 5, 79);    # O
+    store8(ahci_demo_buf2 + 6, 75);    # K
+    store8(ahci_demo_buf2 + 7, 33);    # !
+
+    if (ahci_write_lba(port, 5, 1, ahci_demo_buf2) == 0) {
+        kprint("ahci: port ", 11);
+        kprint_num(port);
+        kprintln(" LBA5 write FAILED", 18);
+        return 0;
+    }
+
+    # 3. Read it back into a fresh buffer.
+    i = 0;
+    while (i < 512) { store8(ahci_demo_buf + i, 0); i = i + 1; }
+    if (ahci_read_lba(port, 5, 1, ahci_demo_buf) == 0) {
+        kprint("ahci: port ", 11);
+        kprint_num(port);
+        kprintln(" LBA5 read-back FAILED", 22);
+        return 0;
+    }
+
+    # 4. Verify the first 8 bytes match "AHCI-OK!".
+    var ok = 1;
+    if (load8(ahci_demo_buf + 0) != 65) { ok = 0; }
+    if (load8(ahci_demo_buf + 1) != 72) { ok = 0; }
+    if (load8(ahci_demo_buf + 2) != 67) { ok = 0; }
+    if (load8(ahci_demo_buf + 3) != 73) { ok = 0; }
+    if (load8(ahci_demo_buf + 4) != 45) { ok = 0; }
+    if (load8(ahci_demo_buf + 5) != 79) { ok = 0; }
+    if (load8(ahci_demo_buf + 6) != 75) { ok = 0; }
+    if (load8(ahci_demo_buf + 7) != 33) { ok = 0; }
+
+    kprint("ahci: port ", 11);
+    kprint_num(port);
+    if (ok == 1) {
+        kprintln(" LBA5 write-then-read round-trip PASS", 37);
+    } else {
+        kprintln(" LBA5 write-then-read round-trip FAIL", 37);
+    }
+    return ok;
+}
+
+# --- Block-layer dispatch wrappers (single + multi-sector) -----------
+
+fn ahci_blk_read(sector, buf) {
+    if (ahci_blk_port < 0) { return 0 - 1; }
+    if (ahci_read_lba(ahci_blk_port, sector, 1, buf) == 1) { return 0; }
+    return 0 - 1;
+}
+
+fn ahci_blk_write(sector, buf) {
+    if (ahci_blk_port < 0) { return 0 - 1; }
+    if (ahci_write_lba(ahci_blk_port, sector, 1, buf) == 1) { return 0; }
+    return 0 - 1;
+}
+
+fn ahci_blk_read_sectors(start, count, buf) {
+    if (ahci_blk_port < 0) { return 0 - 1; }
+    if (count <= 0) { return 0 - 1; }
+    # Single-PRDT cap is 128 sectors per call; chunk larger requests.
+    var done = 0;
+    while (done < count) {
+        var chunk = count - done;
+        if (chunk > 128) { chunk = 128; }
+        if (ahci_read_lba(ahci_blk_port, start + done, chunk, buf + done * 512) == 0) {
+            return 0 - 1;
+        }
+        done = done + chunk;
+    }
+    return 0;
+}
+
+# --- Block-layer registration ----------------------------------------
+#
+# Pick the lowest-numbered initialized port (which had a successful
+# IDENTIFY → ahci_id_lba48 is set from that last call). Capacity for
+# the registered backend = that port's LBA48 sector count.
+#
+# Policy: don't override NVMe (modern primary). Do override virtio
+# (paravirt fallback). Take BLK_NONE if no backend has registered.
+
+fn ahci_register_block_dev() {
+    if (ahci_present == 0) { return 0; }
+
+    var port = 0;
+    while (port < AHCI_MAX_PORTS) {
+        if (load8(&ahci_port_inited + port) == 1) {
+            port = port; break;
+        }
+        port = port + 1;
+    }
+    if (port >= AHCI_MAX_PORTS) { return 0; }
+    if (load8(&ahci_port_inited + port) != 1) { return 0; }
+
+    # Refresh capacity from a per-port IDENTIFY (Phase 3 cached only
+    # the last-called port's data; re-run for the registration port).
+    if (ahci_identify_device(port) == 0) { return 0; }
+
+    ahci_blk_port = port;
+
+    # Don't override NVMe — it's the modern primary on multi-disk iron.
+    if (blk_active == BLK_NVME) {
+        kprint("ahci: registered as secondary block_dev (port ", 46);
+        kprint_num(port);
+        kprint(", ", 2);
+        kprint_num(ahci_id_lba48);
+        kprintln(" LBAs x 512B; NVMe primary)", 27);
+        # CMOS kcp = 0x50 (AHCI block-layer registration done, secondary path).
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x50; 0xE6; 0x71; }
+        return 1;
+    }
+
+    blk_register_ahci(ahci_id_lba48, 512);
+    kprint("ahci: registered as block_dev (port ", 36);
+    kprint_num(port);
+    kprint(", ", 2);
+    kprint_num(ahci_id_lba48);
+    kprintln(" LBAs x 512B)", 13);
+    # CMOS kcp = 0x50 (AHCI block-layer registration done, primary path).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x50; 0xE6; 0x71; }
+    return 1;
+}

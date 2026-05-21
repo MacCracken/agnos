@@ -330,6 +330,26 @@ if (nvme_admin_init() == 1) {
 # initial bring-up; will light up when SATA `sda` is on the bus.
 if (ahci_probe() == 1) {
     ahci_enum_ports();
+    # AHCI Phase 2 — per-port CL+FIS allocation + spin-up + start for
+    # each implemented SATA port (DET=3, SIG=SATA). ATAPI/PM/SEMB
+    # ports skipped. HBA reset is OPTIONAL per spec §10.1.2 and skipped
+    # here — UEFI/gnoboot left the controller in a working state and a
+    # reset would force PHY re-handshake for no gain.
+    if (ahci_init_all() > 0) {
+        # AHCI Phase 3 — issue ATA IDENTIFY DEVICE (cmd 0xEC) on each
+        # initialized SATA port, parse model / serial / firmware /
+        # LBA48 capacity. First exercise of the CL+FIS path; CMOS kcp
+        # 0x4F stamps on first successful IDENTIFY.
+        ahci_identify_all();
+        # AHCI Phase 4 — boot-time R/W round-trip demo on the first
+        # initialized port (mirrors nvme_rw_demo). Then register with
+        # the block layer; policy is "don't override NVMe" so on a
+        # box with both, AHCI registers as secondary visibility only
+        # (blk_active stays BLK_NVME). CMOS kcp 0x50 stamps on
+        # registration.
+        ahci_rw_demo();
+        ahci_register_block_dev();
+    }
 }
 if (gpt_init() == 1) {
     # Phase 2 — dump the full partition table at boot so iron + QEMU
