@@ -15,6 +15,22 @@ Cleans up the three follow-up surfaces from the 1.31.1 AHCI iron debut (Attempt 
 
 **Files changed:** `kernel/core/ahci.cyr` (new `ahci_port_wait_idle` helper at the top of the file, wait-idle calls inserted in `ahci_identify_device` + `ahci_issue_rw`, `ahci_print_id_string` rewritten with right-trim, `ahci_rw_demo` split into `ahci_read_demo` + `#ifdef AHCI_RW_DEMO ahci_write_demo`), `kernel/core/main.cyr` (call site updated to `ahci_read_demo()` + `#ifdef AHCI_RW_DEMO ahci_write_demo() #endif`), `kernel/arch/aarch64/stubs.cyr` (matching stub split + new `ahci_port_wait_idle` stub), `scripts/build.sh` (`AHCI_RW_DEMO=1` honored alongside `KTEST` / `XHCI_VERBOSE`), `docs/development/build.md` (new flag row + usage example).
 
+### Cyrius pin graduation 5.11.64 → 6.0.1 (iron-validated at Attempt 82)
+
+Lifts the kernel pin off the v5.11.64 gvar-init-order anchor onto cycc 6.0.1, the first v6.x-class toolchain. v5.11.64 was the patch that closed the gvar-init-order zero-reads root-cause of the FF→QQ+QQ2 silent-absorb arc (Attempts 57-63) and served as the kernel's stable build floor through the 1.30.x FB hardening arc + the 1.31.0 / 1.31.1 storage-arc cuts. v5.11.x closed at 5.11.69 on 2026-05-19; v6.0.0 cycle opened the same day with the `cyrc → cybs` + `cc5 → cycc` binary-name rename ceremony, and the .1 patch closed a same-day UEFI-emit `fncallN` regression. Back-compat symlinks (`cc5 → cycc`, `cyrc → cybs`) shipped in `cyrius/scripts/install.sh` keep v5.11.x-pinned consumers building unchanged through the v6.0.x window — graduation is opt-in per repo on natural-next-touch.
+
+**What lifts:**
+- `cyrius.cyml`: `cyrius = "5.11.64"` → `cyrius = "6.0.1"`. Single-line bump.
+- No kernel-side code changes — the 1.31.0/1.31.1 storage-arc engineering (NVMe Phase 1-5, AHCI/SATA Phase 1-4, GPT Phase 1-3) + the 1.31.2 AHCI carry-forward triplet all compiled clean against cycc 6.0.1 on the first attempt.
+
+**Why graduate mid-cycle rather than at 1.32.0**: closes the toolchain-drift warning state.md fired throughout the 1.31.x session (`cyrius.cyml pins 5.11.64 but cycc is 6.0.1`); aligns agnos with the broader v6.0.x leading-edge cluster forming through 2026-05-20 (mihi 1.0.0, iam 1.0.0, chakshu 0.6.0, bannermanor 1.0.0, darshana 0.3.5, hapi 0.5.0 — agnoshi followed in the same MVP-path pair); cuts the lag-spectrum's 5.11.64 holdout count down to the boot-path bedrock (kybernet + argonaut still at 5.10.44 — these graduate next).
+
+**Iron validation (Attempt 82, 2026-05-20):** First iron burn of agnos compiled by the v6.0.x toolchain. Boot output matches Attempt 80 / 81 baseline shape end-to-end through to `AGNOS shell v1.31.2`; no behavioral regression introduced by the toolchain swap. NVMe (Crucial P3 2 TB) enumerates + registers as primary block_dev + GPT-parses cleanly (`hdr-CRC-OK arr-CRC-OK`); AHCI (WD Blue SA510 2 TB) enumerates + registers as secondary + the post-RW IDENTIFY (which timed out at Attempt 81 on cycc 5.11.64) clears via the carry-forward `ahci_port_wait_idle` gate. The Attempt-82 burn is therefore a joint validation of both the AHCI carry-forward triplet AND the cyrius v6.0.x lift — both clean on first iron try.
+
+Detail in [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 82](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md). State.md pin-lag spectrum updated to record agnos's exit from the 5.11.64 holdout slot.
+
+**Files changed:** `cyrius.cyml` (one line).
+
 ### 1.31.2 remaining scope — opening
 
 Cycle theme stays **storage**. With AHCI carry-forward shipped above, the primary engineering bite opens:
