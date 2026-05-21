@@ -48,10 +48,10 @@ else
     echo "Building AGNOS kernel [x86_64]..."
     # ELF64 multiboot2 emit (cyrius 5.11.43+). Routes through
     # EMITELF64_KERNEL: ELF64 header + multiboot2 + EFI64-entry tag.
-    # Path-C sovereign UEFI handoff: gnoboot (PE32+ UEFI bootloader)
-    # walks the multiboot2 program headers, maps the kernel, then
-    # `jmp rax` with RDI = &boot_info (magic 0x41474E4F). The kernel
-    # captures RDI in kernel/arch/x86_64/mbi.cyr at entry (v1.30.0+).
+    # Sovereign UEFI handoff: gnoboot (PE32+ UEFI bootloader) walks
+    # the multiboot2 program headers, maps the kernel, then `jmp rax`
+    # with RDI = &boot_info (magic 0x41474E4F). The kernel captures
+    # RDI in kernel/arch/x86_64/mbi.cyr at entry (v1.30.0+).
     # Design: agnosticos/docs/development/path-c-sovereign-uefi.md.
     # The Path-A GRUB-MB2-EFI approach was retired 2026-05-13 (strict
     # W^X UEFI faults inside grub_relocator64_efi_boot); see
@@ -125,12 +125,12 @@ print('  ' + label + ': OK')
 print('  entry: 0x{:x}'.format(entry))
 " 2>/dev/null || echo "  (python3 not available, skipping validation)"
 
-    # ELF64 kernel boot — runs via Path-C handoff: gnoboot maps the
-    # kernel, sets RDI=&boot_info, and jmp rax's into the 64-bit entry
-    # (kernel/arch/x86_64/mbi.cyr captures RDI as the first instruction).
-    # Iron-validated on archaemenid NUC AMD Zen 2026-05-15 (boot-to-shell
-    # MVP cleared the kernel-init layer). QEMU: use OVMF + gnoboot
-    # (see gnoboot/tests/ovmf_smoke.sh). Legacy `qemu -kernel` is gone —
+    # ELF64 kernel boot — gnoboot maps the kernel, sets RDI=&boot_info,
+    # and jmp rax's into the 64-bit entry (kernel/arch/x86_64/mbi.cyr
+    # captures RDI as the first instruction). Iron-validated on
+    # archaemenid NUC AMD Zen 2026-05-15 (boot-to-shell MVP cleared the
+    # kernel-init layer). QEMU: use OVMF + gnoboot (see
+    # gnoboot/tests/ovmf_smoke.sh). Legacy `qemu -kernel` is gone —
     # ELF64 has no PVH note; QEMU rejects it on the Linux-protocol path.
-    echo "Boot: gnoboot + OVMF (QEMU) or install-usb.sh (iron) — Path-C"
+    echo "Boot: gnoboot + OVMF (QEMU) or install-usb.sh (iron)"
 fi

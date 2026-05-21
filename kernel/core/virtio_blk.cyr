@@ -257,7 +257,7 @@ fn vblk_negotiate_features() {
 
     # Set FEATURES_OK (ACK | DRIVER | FEATURES_OK = 1 | 2 | 8 = 11)
     store8(vblk_common_cfg + VBLK_DEV_STATUS,
-           VBLK_STATUS_ACK | VBLK_STATUS_DRIVER | VBLK_STATUS_FEATURES_OK);
+    VBLK_STATUS_ACK | VBLK_STATUS_DRIVER | VBLK_STATUS_FEATURES_OK);
 
     # Re-read; if FEATURES_OK cleared, device rejected our subset
     var status = load8(vblk_common_cfg + VBLK_DEV_STATUS);
@@ -374,7 +374,7 @@ fn virtio_blk_init() {
 
     # Step 8: DRIVER_OK — the device is live, may start processing buffers
     store8(vblk_common_cfg + VBLK_DEV_STATUS,
-           VBLK_STATUS_ACK | VBLK_STATUS_DRIVER | VBLK_STATUS_FEATURES_OK | VBLK_STATUS_DRIVER_OK);
+    VBLK_STATUS_ACK | VBLK_STATUS_DRIVER | VBLK_STATUS_FEATURES_OK | VBLK_STATUS_DRIVER_OK);
 
     vblk_active = 1;
 
