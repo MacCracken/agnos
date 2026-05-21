@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.31.1 — x86_64 + aarch64, 26 syscalls, **40+ subsystems**, kernel stdlib + ACPI + IOMMU, **sovereign-struct entry (RDI = &boot_info)** via gnoboot v0.4.2, native xHCI + USB-HID-boot keyboard driver, **storage stack** (NVMe Phase 1-5 + AHCI/SATA Phase 1-4 + 3-backend block-layer dispatch + GPT Phase 1-3 with CRC32 + backup-header recovery + type-GUID classifier). **MVP GATE CLEARED ON IRON** — typeable shell on archaemenid at Attempt 68 (1.30.9); NVMe iron debut on Crucial P3 2 TB clean at Attempt 80 (1.31.0). Built with cyrius 5.11.x bedrock pin (toolchain itself is 6.0.1; kernel pin stays at 5.11.64 with back-compat symlinks). Live binary sizes per arch + per-cut size trajectory: [`state.md`](state.md).
+> **Current**: v1.31.2 — x86_64 + aarch64, 26 syscalls, **40+ subsystems**, kernel stdlib + ACPI + IOMMU, **sovereign-struct entry (RDI = &boot_info)** via gnoboot v0.4.2, native xHCI + USB-HID-boot keyboard driver, **storage stack** (NVMe Phase 1-5 + AHCI/SATA Phase 1-4 + 3-backend block-layer dispatch + GPT Phase 1-3 with CRC32 + backup-header recovery + type-GUID classifier). **MVP GATE CLEARED ON IRON** — typeable shell on archaemenid at Attempt 68 (1.30.9); NVMe iron debut on Crucial P3 2 TB clean at Attempt 80 (1.31.0). Built with cyrius 5.11.x bedrock pin (toolchain itself is 6.0.1; kernel pin stays at 5.11.64 with back-compat symlinks). Live binary sizes per arch + per-cut size trajectory: [`state.md`](state.md).
 >
 > Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 
@@ -29,7 +29,8 @@ Per-version detail lives in [`CHANGELOG.md`](../../CHANGELOG.md). This is the at
 | **v1.30.9** | **MVP GATE HIT** — iron Attempt 68: SET_CONFIGURATION + canonical FS interval + ISP → typeable shell on archaemenid. xHCI cmd-path arc closes via cyrius v5.11.64's gvar-init-order fix (not a kernel-side bug). |
 | **v1.30.10 → .12** | FB hardening sweep — pitch-aware refresh + WC + PixelFormat guard + true-font swap (VGA 8x16 BIOS ROM replaces hand-drawn CGA 8x8). iron Attempts 69-77; VGA-path legible at 1080p + 1440p. Quiet-Boot legibility residue parked as next-cycle pin. |
 | **v1.31.0** | **Storage cycle open + NVMe arc + iron debut.** Production-lean compile gates (`KTEST` / `XHCI_VERBOSE` default off + FB-absent guard + `docs/development/build.md`); NVMe Phase 1-5 (probe + admin queue + I/O queue + R/W + PRP1/2/list dispatch + `block.cyr` 3-backend wrapper); iron debut on Crucial P3 2 TB clean at Attempt 80 (first-try). |
-| **v1.31.1** [Unreleased] | **GPT layer + AHCI/SATA driver.** GPT Phase 1-3 (header + full 16 KB array walk + UTF-16LE names + `parts` shell command + `gpt_partition_info(idx)` helper + table-less CRC32 + backup-header recovery + 7-GUID type classifier); AHCI/SATA Phase 1-4 (HBA probe + per-port CL+FIS bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT + block-layer registration with NVMe-primary policy). Iron-burn audit drafted at [agnosticos `ahci-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ahci-iron-burn-audit.md). |
+| **v1.31.1** | **GPT layer + AHCI/SATA driver + dual iron debut.** GPT Phase 1-3 (header + full 16 KB array walk + UTF-16LE names + `parts` shell command + `gpt_partition_info(idx)` helper + table-less CRC32 + backup-header recovery + 7-GUID type classifier); AHCI/SATA Phase 1-4 (HBA probe + per-port CL+FIS bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT + block-layer registration with NVMe-primary policy); AHCI iron debut on archaemenid + WD Blue SA510 2 TB SATA SSD at Attempt 81 (PASS-WITH-CAVEAT — three carry-forward patches landed in 1.31.2 `[Unreleased]`). |
+| **v1.31.2** [Unreleased] | **AHCI carry-forward + USB Mass Storage + Optical via USB MS.** AHCI carry-forward landed first (`ahci_port_wait_idle` Linux-canonical quiescence gate / ATA-string right-trim per `ata_id_c_string` / `AHCI_RW_DEMO` compile gate split of `ahci_rw_demo`); USB Mass Storage (Bulk-Only Transport + SCSI READ(10)/WRITE(10)) + Optical via USB MS (SCSI MMC profile — first non-512-B-sector device on AGNOS, iron canary on HP external USB Blu-ray with Pitch Black BD-25) queued as primary engineering bite. |
 
 ## 1.30.x Arc Recap
 
@@ -52,15 +53,18 @@ The 1.30.x arc is the **kernel-ABI break + hardware-bring-up arc**. It opened wi
 
 | # | Item | Status | Notes |
 |---|------|--------|-------|
-| 1 | **AHCI iron debut on archaemenid `sda`** | open | Code-complete (v1.31.1 Phase 1-4), QEMU-validated. Awaits §4 `AHCI_RW_DEMO` compile-gate decision per [agnosticos `ahci-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ahci-iron-burn-audit.md). |
+| 1 | **AHCI iron debut on archaemenid** | ✅ closed | Attempt 81 (2026-05-20) — WD Blue SA510 2 TB SATA SSD enumerated end-to-end, LBA-5 round-trip PASSED on real silicon; PASS-WITH-CAVEAT due to post-RW IDENTIFY hang on registration path. **All three carry-forward patches landed in 1.31.2 `[Unreleased]`** (`ahci_port_wait_idle` quiescence gate / ATA-string right-trim / `AHCI_RW_DEMO` compile gate). |
 | 2 | **AMD Zen Quiet-Boot scanout residue** | parked | Next-cycle pin. Resumption options: HUBP `clear_tiling` port OR shadow-buffer FB-console architectural eval. Doesn't block MVP (VGA-path legible). |
-| 3 | **USB Mass Storage (BBB + SCSI)** | planned 1.31.2 | Third iron-validatable block backend; extends xHCI investment. Linux `drivers/usb/storage/usb.c` reference. |
-| 4 | **ext2 read-only** | planned 1.31.3 | Filesystem class, not device class. FAT16 → ext2 unlocks real Linux disks; consumes GPT + block layer. |
-| 5 | **Bench-history snapshot in repo** | open | Decide: check in last-released `BENCHMARKS.md` + `bench-history.csv` as a tagged-state reference, or leave CI-only. Original v1.27.1 carry-forward. |
-| 6 | **`mmap` (anonymous-only)** | open | Planned #6 split — anonymous mmap is independent of ext2. Adds VMM surface but no fs work. |
-| 7 | **Hardware-validation infra** | open | RPi4 / NUC harness on self-hosted runner. Unblocks SMP-AP-wakeup-on-real-hardware. |
-| 8 | **SMP AP wakeup on real hardware** | open | QEMU-validated only. Gated on #7. |
-| 9 | **`scripts/build.sh` cosmetic banner cleanup** | open | Trivial label refresh for Path-C era. |
+| 3 | **USB Mass Storage (BBB + SCSI)** | planned 1.31.2 | Third iron-validatable block backend; extends xHCI investment. Linux `drivers/usb/storage/usb.c` reference. Iron target: any USB flash/HDD on archaemenid. |
+| 4 | **Optical via USB MS (SCSI MMC profile)** | planned 1.31.2 | Promoted from previously-punted "1.32.x+ ATAPI/AHCI" slot. ~200 LOC additional over USB MS — SCSI INQUIRY device-type=0x05 + 2048-B sector handling + a couple MMC opcodes. **First non-512-B-sector block device on AGNOS.** Iron target: HP external USB Blu-ray on archaemenid (Pitch Black BD-25 loaded). |
+| 5 | **RAM-disk backend** | planned 1.31.3 | Pure-RAM `/dev/ram0`-equivalent (~150 LOC over `pmm_alloc` + tag-dispatch). Useful for tests + initrd-style workflows. |
+| 6 | **VirtIO-blk modern (1.x)** | planned 1.31.3 | Upgrade existing transitional 0.9.5 `virtio_blk.cyr` to MMIO + feature negotiation (~600 LOC delta). Keeps QEMU as a first-class dev target on modern machine types. |
+| 7 | **ext2 read-only** | planned 1.31.4 (displaced from 1.31.3) | Filesystem class, not device class. FAT16 → ext2 unlocks real Linux disks; consumes GPT + block layer. |
+| 8 | **Bench-history snapshot in repo** | open | Decide: check in last-released `BENCHMARKS.md` + `bench-history.csv` as a tagged-state reference, or leave CI-only. Original v1.27.1 carry-forward. |
+| 9 | **`mmap` (anonymous-only)** | open | Planned #6 split — anonymous mmap is independent of ext2. Adds VMM surface but no fs work. |
+| 10 | **Hardware-validation infra** | open | RPi4 / NUC harness on self-hosted runner. Unblocks SMP-AP-wakeup-on-real-hardware. |
+| 11 | **SMP AP wakeup on real hardware** | open | QEMU-validated only. Gated on #10. |
+| 12 | **`scripts/build.sh` cosmetic banner cleanup** | open | Trivial label refresh for Path-C era. |
 
 Explicitly **NOT** in the near-term queue:
 - **Full-binary KASLR (Option A)** — slot pushed beyond 1.31.x; gated on cyrius v6.1.x PIE support (see below). The 1.31.0 slot originally reserved for this was repurposed for the storage arc (NVMe Phase 1-5 + iron debut).

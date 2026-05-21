@@ -47,6 +47,7 @@ Three of these (architecture, ELF64) are mandatory and set by the script automat
 | `ELF64_KERNEL` | source-side (prepended) | on (auto, x86_64) | Selects the 64-bit entry shim (Path C handoff via gnoboot). Paired with `CYRIUS_ELF64_KERNEL=1` (backend gate) |
 | **`KTEST`** | source-side (prepended, env-driven) | **off** | Compiles in the boot-time in-kernel self-tests (Syscall test, Context Switch test, Scheduler test idle loop, VFS/initrd test, Userland Exec test). About 18 lines of test output + several CMOS checkpoints (CP14, CP12-twice, CP14-twice). Off in production so iron boots don't carry test spam |
 | **`XHCI_VERBOSE`** | source-side (prepended, env-driven) | **off** | Compiles in xhci developmental debug output: `cmd_submit#` trb-tracking, `evt#` event trace, `drained N events`, `PP=1 asserted bitmap=`, `CRCR.CRR / ERSTSZ / IMAN / ERDP_lo` readback, `enable_slot entry idx=`. High-level confirmation lines (`halted, reset clean`, `dev_notifications enabled`, `controller running, HCH=0, ERDP=`, port-connected, error cases) are unconditional regardless of this flag |
+| **`AHCI_RW_DEMO`** | source-side (prepended, env-driven) | **off** | Compiles in the AHCI boot-time sentinel write + read-back round-trip at LBA 5 of the lowest-numbered initialized SATA port. Default-off because LBA 5 on a GPT-formatted disk sits inside the partition-entry array (entries 12-15 at standard `partition_entries_lba=2` layout); writing a sentinel there corrupts the partition-array CRC (recoverable via `sgdisk --load-backup` from the disk's tail backup, but not the right default posture against drives the user cares about). The always-on `ahci_read_demo` (LBA 0 readback, no writes) provides Phase-4-DMA validation on iron without the write hazard. Enable for QEMU smoke (`AHCI_RW_DEMO=1 ./scripts/build.sh`) or known-scratch drives only |
 
 ### Enabling the gates
 
@@ -56,6 +57,9 @@ KTEST=1 ./scripts/build.sh
 
 # Get the xhci developmental trace
 XHCI_VERBOSE=1 ./scripts/build.sh
+
+# Compile in the AHCI LBA-5 sentinel write demo (QEMU smoke only — see notes)
+AHCI_RW_DEMO=1 ./scripts/build.sh
 
 # Full developmental output
 KTEST=1 XHCI_VERBOSE=1 ./scripts/build.sh

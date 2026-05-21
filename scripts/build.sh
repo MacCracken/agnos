@@ -77,11 +77,21 @@ else
     #                     lines (halted/reset clean, dev_notifications,
     #                     controller running, port N connected, error
     #                     cases) stay unconditional.
+    #   AHCI_RW_DEMO=1  — boot-time LBA-5 sentinel write + read-back on
+    #                     the first initialized SATA port. DEFAULT OFF
+    #                     in production iron builds: LBA 5 of a GPT disk
+    #                     sits inside the partition-entry array, and a
+    #                     write there is recoverable but not the right
+    #                     default posture. Enable for QEMU smoke or
+    #                     known-scratch drives to validate the WRITE
+    #                     DMA EXT path; ahci_read_demo (LBA 0 readback)
+    #                     runs unconditionally either way.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
         [ -n "$KTEST" ]        && echo '#define KTEST'
         [ -n "$XHCI_VERBOSE" ] && echo '#define XHCI_VERBOSE'
+        [ -n "$AHCI_RW_DEMO" ] && echo '#define AHCI_RW_DEMO'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

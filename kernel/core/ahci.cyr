@@ -614,18 +614,73 @@ var ahci_port_id_phys[256];    # 32 ports × 8 bytes
 var ahci_id_lba48      = 0;
 var ahci_id_lba_bytes  = 512;  # default; word 106 may override
 
+# --- Pre-issue quiescence gate ---------------------------------------
+#
+# AHCI 1.3.1 §3.3.14 says PxCI bits should be set only when the slot is
+# at its default (cleared) value AND the port's task file is idle. On
+# real silicon (vs QEMU), controller-internal slot release lags device
+# completion — issuing the next command before that lag clears wedges
+# the new command (PxCI bit 0 stays set, poll exhausts spin budget).
+# Surfaced first iron try on Attempt 81 (WD Blue SA510 SATA Gen3 on
+# AMD FCH AHCI 1.3): IDENTIFY → R/W → R/W → R/W all PASS, follow-up
+# IDENTIFY hangs.
+#
+# Match Linux's ata_qc_issue / ahci_qc_issue pattern: wait for
+# PxTFD.STS.BSY=0 + DRQ=0 (device idle), PxCI=0, PxSACT=0 before
+# issuing the next command. Returns 1 on idle, 0 on timeout.
+
+fn ahci_port_wait_idle(port) {
+    if (port < 0) { return 0; }
+    if (port >= AHCI_MAX_PORTS) { return 0; }
+    var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+    var spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        var tfd  = ahci_mmio_read32(port_off + AHCI_P_TFD);
+        var ci   = ahci_mmio_read32(port_off + AHCI_P_CI);
+        var sact = ahci_mmio_read32(port_off + AHCI_P_SACT);
+        var sts  = tfd & 0xFF;
+        if ((sts & 0x88) == 0) {
+            if (ci == 0) {
+                if (sact == 0) { return 1; }
+            }
+        }
+        spins = spins + 1;
+    }
+    return 0;
+}
+
 # --- Byte-swapped ASCII print (ATA IDENTIFY quirk) -------------------
 #
 # IDENTIFY DEVICE returns text fields with each 16-bit word stored as
 # (high_byte, low_byte) in memory — opposite of the natural ASCII
 # byte order. To print, swap each pair: print byte at offset+1 first,
 # then byte at offset.
+#
+# Right-trim trailing 0x20 padding per ATA8-ACS §7.16.7 (matches Linux's
+# ata_id_c_string in drivers/ata/libata-core.c). Byte-swap means printed-
+# char-index k maps to field-byte (k XOR 1): if k even -> k+1, else k-1.
 
 fn ahci_print_id_string(id_buf, off, len) {
+    var trim = len;
+    while (trim > 0) {
+        var k = trim - 1;
+        var bidx = 0;
+        if ((k & 1) == 0) { bidx = k + 1; }
+        if ((k & 1) == 1) { bidx = k - 1; }
+        if (load8(id_buf + off + bidx) != 0x20) { trim = trim; break; }
+        trim = trim - 1;
+    }
     var i = 0;
+    var printed = 0;
     while (i < len) {
-        kprint(id_buf + off + i + 1, 1);
-        kprint(id_buf + off + i, 1);
+        if (printed < trim) {
+            kprint(id_buf + off + i + 1, 1);
+            printed = printed + 1;
+        }
+        if (printed < trim) {
+            kprint(id_buf + off + i, 1);
+            printed = printed + 1;
+        }
         i = i + 2;
     }
     return 0;
@@ -638,6 +693,13 @@ fn ahci_identify_device(port) {
     if (port < 0) { return 0; }
     if (port >= AHCI_MAX_PORTS) { return 0; }
     if (load8(&ahci_port_inited + port) != 1) { return 0; }
+
+    if (ahci_port_wait_idle(port) == 0) {
+        kprint("ahci: port ", 11);
+        kprint_num(port);
+        kprintln(" not idle pre-IDENTIFY", 22);
+        return 0;
+    }
 
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
     var cl_phys  = load64(&ahci_port_cl_phys + port * 8);
@@ -865,6 +927,10 @@ fn ahci_issue_rw(port, opcode, lba, count, data_phys, is_write) {
     if (count <= 0) { return 0; }
     if (count > 128) { return 0; }      # cap per-cmd at 64 KB (128 sectors)
 
+    if (ahci_port_wait_idle(port) == 0) {
+        return 0;
+    }
+
     var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
     var cl_phys  = load64(&ahci_port_cl_phys + port * 8);
     var ct_phys  = load64(&ahci_port_ct_phys + port * 8);
@@ -938,19 +1004,28 @@ fn ahci_write_lba(port, lba, count, buf) {
     return ahci_issue_rw(port, 0x35, lba, count, buf, 1);
 }
 
-# --- Boot-time round-trip demo ---------------------------------------
+# --- Boot-time demos -------------------------------------------------
 #
-# Mirrors `nvme_rw_demo`: read LBA 0 (print first 8 bytes), write a
-# sentinel at LBA 5, read it back and verify. Single port only (port
-# 0 if SATA-initialized). No effect on user data when port 0 carries
-# a blank disk.image (the case in our QEMU smoke).
+# Two-tier demo split per the 1.31.1 § AHCI iron-burn audit:
+#   - ahci_read_demo()  — always-on; read LBA 0, print first 8 bytes
+#                         (mirrors `nvme_rw_demo`'s read half). Safe on
+#                         any drive: no writes, no side effects.
+#   - ahci_write_demo() — compile-gated behind `AHCI_RW_DEMO`. Sentinel
+#                         write to LBA 5 + read-back verify. DEFAULT OFF
+#                         in production; enable via `AHCI_RW_DEMO=1
+#                         ./scripts/build.sh` for QEMU smoke or scratch
+#                         drives. LBA 5 of a GPT disk sits inside the
+#                         partition-entry array — landing a sentinel
+#                         there is recoverable but not the right default
+#                         posture.
+#
+# Single port only (lowest-numbered initialized).
 
 var ahci_demo_buf = 0;
 var ahci_demo_buf2 = 0;
 
-fn ahci_rw_demo() {
+fn ahci_read_demo() {
     if (ahci_present == 0) { return 0; }
-    # Pick the lowest-numbered initialized port for the demo.
     var port = 0;
     while (port < AHCI_MAX_PORTS) {
         if (load8(&ahci_port_inited + port) == 1) { port = port; break; }
@@ -963,12 +1038,7 @@ fn ahci_rw_demo() {
         ahci_demo_buf = pmm_alloc();
         if (ahci_demo_buf == 0) { return 0; }
     }
-    if (ahci_demo_buf2 == 0) {
-        ahci_demo_buf2 = pmm_alloc();
-        if (ahci_demo_buf2 == 0) { return 0; }
-    }
 
-    # 1. Read LBA 0 — print first 8 bytes (mirrors nvme demo).
     var i = 0;
     while (i < 512) { store8(ahci_demo_buf + i, 0); i = i + 1; }
     if (ahci_read_lba(port, 0, 1, ahci_demo_buf) == 0) {
@@ -987,9 +1057,31 @@ fn ahci_rw_demo() {
         i = i + 1;
     }
     kprintln("", 0);
+    return 1;
+}
 
-    # 2. Write a sentinel at LBA 5: "AHCI-OK!" (8 bytes), rest zero.
-    i = 0;
+#ifdef AHCI_RW_DEMO
+fn ahci_write_demo() {
+    if (ahci_present == 0) { return 0; }
+    var port = 0;
+    while (port < AHCI_MAX_PORTS) {
+        if (load8(&ahci_port_inited + port) == 1) { port = port; break; }
+        port = port + 1;
+    }
+    if (port >= AHCI_MAX_PORTS) { return 0; }
+    if (load8(&ahci_port_inited + port) != 1) { return 0; }
+
+    if (ahci_demo_buf == 0) {
+        ahci_demo_buf = pmm_alloc();
+        if (ahci_demo_buf == 0) { return 0; }
+    }
+    if (ahci_demo_buf2 == 0) {
+        ahci_demo_buf2 = pmm_alloc();
+        if (ahci_demo_buf2 == 0) { return 0; }
+    }
+
+    # 1. Sentinel at LBA 5: "AHCI-OK!" (8 bytes), rest zero.
+    var i = 0;
     while (i < 512) { store8(ahci_demo_buf2 + i, 0); i = i + 1; }
     store8(ahci_demo_buf2 + 0, 65);    # A
     store8(ahci_demo_buf2 + 1, 72);    # H
@@ -1007,7 +1099,7 @@ fn ahci_rw_demo() {
         return 0;
     }
 
-    # 3. Read it back into a fresh buffer.
+    # 2. Read back into a fresh buffer.
     i = 0;
     while (i < 512) { store8(ahci_demo_buf + i, 0); i = i + 1; }
     if (ahci_read_lba(port, 5, 1, ahci_demo_buf) == 0) {
@@ -1017,7 +1109,7 @@ fn ahci_rw_demo() {
         return 0;
     }
 
-    # 4. Verify the first 8 bytes match "AHCI-OK!".
+    # 3. Verify the first 8 bytes match "AHCI-OK!".
     var ok = 1;
     if (load8(ahci_demo_buf + 0) != 65) { ok = 0; }
     if (load8(ahci_demo_buf + 1) != 72) { ok = 0; }
@@ -1037,6 +1129,7 @@ fn ahci_rw_demo() {
     }
     return ok;
 }
+#endif
 
 # --- Block-layer dispatch wrappers (single + multi-sector) -----------
 
