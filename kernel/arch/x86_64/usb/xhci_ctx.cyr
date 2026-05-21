@@ -345,3 +345,71 @@ b_interval, speed, xfer_ring_phys) {
     store32(ep_ctx + 16, mps & 0xFFFF);
     return dci;
 }
+
+# Phase 2 USB MS — add a bulk-IN + bulk-OUT endpoint PAIR to an existing
+# Input Context in one shot. USB Mass Storage Class Bulk-Only Transport
+# (BBB) always has exactly two endpoints in the data interface; landing
+# them in a single Input Control Context update means a single Configure
+# Endpoint command commits both simultaneously.
+#
+# EP Type values (xHCI 1.2 Table 6-9):
+#   2 = Bulk OUT
+#   6 = Bulk IN
+#
+# Returns 1 on success, 0 if either EP's DCI is out of range. Callers
+# can recover the per-direction DCI via xhci_dci_for_ep(ep_addr).
+#
+# Notes for Phase 2 simplifying assumptions:
+#   - Max Burst Size = 0 (single-burst). SS devices may run slower than
+#     peak; refine when bSSCompanion descriptor parsing lands.
+#   - Average TRB Length set to MPS — minimum safe value for bandwidth
+#     estimation. The controller uses it for scheduling decisions; we
+#     don't optimize bulk throughput at Phase 2.
+#   - CErr = 3 (max error retry count) on both directions, same as
+#     control / interrupt-IN convention.
+fn xhci_input_ctx_add_bulk_pair(ictx_phys, in_ep_addr, in_mps,
+out_ep_addr, out_mps, speed, in_ring_phys, out_ring_phys) {
+    var in_dci  = xhci_dci_for_ep(in_ep_addr);
+    var out_dci = xhci_dci_for_ep(out_ep_addr);
+    if (in_dci < 2)  { return 0; }
+    if (out_dci < 2) { return 0; }
+    if (in_dci == out_dci) { return 0; }   # malformed — same EP twice
+
+    # Input Control Context — Add Flags = A0 (Slot) + A_in_dci + A_out_dci.
+    # Same EP0-evict rationale as _add_interrupt_in: drop A1 so Configure
+    # Endpoint won't re-load EP0 from stale Input EP0 context (HW has been
+    # advancing Device EP0 DQ ptr during enumeration). Drop Flags at
+    # offset 0 left untouched.
+    store32(ictx_phys + 4, (1 << in_dci) | (1 << out_dci) | 0x1);
+
+    # Slot Context dword 0: bump Context Entries (bits 31:27) to cover
+    # the highest DCI we're adding.
+    var slot = ictx_phys + xhci_slot_ctx_off();
+    var slot_dw0 = load32(slot);
+    var cur_ce = (slot_dw0 >> 27) & 0x1F;
+    var new_ce = cur_ce;
+    if (in_dci > new_ce)  { new_ce = in_dci; }
+    if (out_dci > new_ce) { new_ce = out_dci; }
+    if (new_ce > cur_ce) {
+        slot_dw0 = (slot_dw0 & 0x07FFFFFF) | ((new_ce & 0x1F) << 27);
+        store32(slot, slot_dw0);
+    }
+
+    # Bulk-IN EP context (EP Type 6).
+    var in_ctx = ictx_phys + xhci_ep_ctx_off(in_dci);
+    store32(in_ctx + 0, 0);                        # no Interval for bulk
+    var in_dw1 = (3 << 1) | (6 << 3) | ((in_mps & 0xFFFF) << 16);
+    store32(in_ctx + 4, in_dw1);
+    store64(in_ctx + 8, in_ring_phys | 0x1);       # TR DQ Ptr + DCS=1
+    store32(in_ctx + 16, in_mps & 0xFFFF);         # Avg TRB Length = mps
+
+    # Bulk-OUT EP context (EP Type 2).
+    var out_ctx = ictx_phys + xhci_ep_ctx_off(out_dci);
+    store32(out_ctx + 0, 0);
+    var out_dw1 = (3 << 1) | (2 << 3) | ((out_mps & 0xFFFF) << 16);
+    store32(out_ctx + 4, out_dw1);
+    store64(out_ctx + 8, out_ring_phys | 0x1);
+    store32(out_ctx + 16, out_mps & 0xFFFF);
+
+    return 1;
+}

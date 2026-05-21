@@ -137,6 +137,38 @@ fn ahci_port_wait_idle(p) { return 1; }
 fn ahci_blk_read(s, b) { return 0 - 1; }
 fn ahci_blk_write(s, b) { return 0 - 1; }
 fn ahci_blk_read_sectors(s, c, b) { return 0 - 1; }
+
+# USB Mass Storage (1.31.2 storage arc — Phase 1 discovery; bulk transport
+# Phase 2+ TBD). aarch64 has no xHCI surface yet — MSC has nothing to
+# enumerate. Stub the entry points so x86-side calls in main.cyr compile.
+var msc_slot_count = 0;
+var msc_first_slot = 0;
+fn msc_enumerate() { return 0; }
+fn msc_probe_slot(s) { return 0; }
+fn msc_configure_endpoints(s) { return 0; }
+fn msc_test_unit_ready(s, l) { return 0; }
+fn msc_bbb_exec(s, l, c, n, d, dl, di) { return 0; }
+fn msc_bulk_enqueue(s, i, p, l) { return 0; }
+fn msc_alloc_bulk_ring() { return 0; }
+fn msc_build_cbw(s, l, c, n, dl, di) { return 0; }
+fn xhci_input_ctx_add_bulk_pair(i, ie, im, oe, om, sp, ir, or) { return 0; }
+fn msc_inquiry(s, l) { return 0; }
+fn msc_read_capacity(s, l) { return 0; }
+fn msc_ensure_data_buf(r) { return 0; }
+fn msc_print_ascii_field(p, n) { return 0; }
+fn msc_print_pdt_label(p) { return 0; }
+fn msc_build_rw10_cdb(c, o, l, n) { return 0; }
+fn msc_read_lba(s, l, lba, n, b) { return 0; }
+fn msc_write_lba(s, l, lba, n, b) { return 0; }
+fn msc_blk_read(s, b) { return 0 - 1; }
+fn msc_blk_write(s, b) { return 0 - 1; }
+fn msc_blk_read_sectors(s, c, b) { return 0 - 1; }
+fn msc_register_block_dev() { return 0; }
+fn blk_register_usb_ms(c, l) { return 0; }
+fn msc_read_demo() { return 0; }
+#ifdef MSC_RW_DEMO
+fn msc_write_demo() { return 0; }
+#endif
 fn ahci_register_block_dev() { return 0; }
 fn blk_register_ahci(c, l) { return 0; }
 

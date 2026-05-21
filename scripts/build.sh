@@ -92,6 +92,7 @@ else
         [ -n "$KTEST" ]        && echo '#define KTEST'
         [ -n "$XHCI_VERBOSE" ] && echo '#define XHCI_VERBOSE'
         [ -n "$AHCI_RW_DEMO" ] && echo '#define AHCI_RW_DEMO'
+        [ -n "$MSC_RW_DEMO" ]  && echo '#define MSC_RW_DEMO'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

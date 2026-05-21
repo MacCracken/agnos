@@ -243,6 +243,15 @@ for (var s = 1; s <= 64; s = s + 1) {
     }
 }
 
+# USB Mass Storage Phase 1 (1.31.2 storage arc — discovery only). Walks
+# every addressed xHCI slot, matches the MSC-BBB class triple
+# (0x08/0x06/0x50) on each interface, captures bulk-IN + bulk-OUT
+# endpoints and MaxLUN. Pure read-only — no bulk transfers, no SCSI yet.
+# Phase 2 (CBW/CSW + bulk Normal TRBs) + Phase 3 (INQUIRY / READ
+# CAPACITY) + Phase 4 (READ(10) / WRITE(10) + block-layer registration)
+# follow under the same 1.31.2 cycle.
+msc_enumerate();
+
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
 if (acpi_iommu_base != 0) {
     if (iommu_init() == 0) {
@@ -354,6 +363,19 @@ if (ahci_probe() == 1) {
         ahci_register_block_dev();
     }
 }
+
+# USB Mass Storage Phase 4 — block-layer registration. Tertiary backend
+# (after NVMe + AHCI); takes the slot only when neither is present, OR
+# when only VIRTIO holds it (real-iron USB beats paravirt). The MSC
+# class driver's Phase 3 (INQUIRY + READ CAPACITY) has already populated
+# the per-slot row's last_lba + lba_bytes by the time control reaches
+# here.
+msc_register_block_dev();
+msc_read_demo();
+#ifdef MSC_RW_DEMO
+msc_write_demo();
+#endif
+
 if (gpt_init() == 1) {
     # Phase 2 — dump the full partition table at boot so iron + QEMU
     # bring-up runs see the same surface as the `parts` shell command

@@ -29,6 +29,7 @@ var BLK_NONE   = 0;
 var BLK_VIRTIO = 1;
 var BLK_NVME   = 2;
 var BLK_AHCI   = 3;
+var BLK_USB_MS = 4;
 
 # Public block-layer state. Consumers read these directly (matching
 # the existing vblk_active / vblk_capacity access pattern).
@@ -74,12 +75,24 @@ fn blk_register_ahci(capacity, lba_bytes) {
     return 0;
 }
 
+# USB Mass Storage — tertiary backend. Takes the slot only when currently
+# NONE or VIRTIO (override-vs-take policy encoded in msc_register_block_dev).
+# Always assigns once called; the caller is responsible for not calling
+# when a higher-priority backend already holds the slot.
+fn blk_register_usb_ms(capacity, lba_bytes) {
+    blk_active    = BLK_USB_MS;
+    blk_capacity  = capacity;
+    blk_lba_bytes = lba_bytes;
+    return 0;
+}
+
 # Dispatch wrappers ---------------------------------------------------
 
 fn blk_read(sector, buf) {
     if (blk_active == BLK_VIRTIO) { return vblk_blk_read(sector, buf); }
     if (blk_active == BLK_NVME)   { return nvme_blk_read(sector, buf); }
     if (blk_active == BLK_AHCI)   { return ahci_blk_read(sector, buf); }
+    if (blk_active == BLK_USB_MS) { return msc_blk_read(sector, buf); }
     return 0 - 1;
 }
 
@@ -87,6 +100,7 @@ fn blk_write(sector, buf) {
     if (blk_active == BLK_VIRTIO) { return vblk_blk_write(sector, buf); }
     if (blk_active == BLK_NVME)   { return nvme_blk_write(sector, buf); }
     if (blk_active == BLK_AHCI)   { return ahci_blk_write(sector, buf); }
+    if (blk_active == BLK_USB_MS) { return msc_blk_write(sector, buf); }
     return 0 - 1;
 }
 
@@ -94,5 +108,6 @@ fn blk_read_sectors(start, count, buf) {
     if (blk_active == BLK_VIRTIO) { return vblk_blk_read_sectors(start, count, buf); }
     if (blk_active == BLK_NVME)   { return nvme_blk_read_sectors(start, count, buf); }
     if (blk_active == BLK_AHCI)   { return ahci_blk_read_sectors(start, count, buf); }
+    if (blk_active == BLK_USB_MS) { return msc_blk_read_sectors(start, count, buf); }
     return 0 - 1;
 }

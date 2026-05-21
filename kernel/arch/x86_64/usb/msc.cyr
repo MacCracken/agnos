@@ -1,0 +1,1169 @@
+# === USB Mass Storage Class — Bulk-Only Transport (BBB) ===
+#
+# Class driver for USB Mass Storage devices using the Bulk-Only Transport
+# protocol (USB MSC BBB rev 1.0 — interface class 0x08, subclass 0x06 = SCSI
+# transparent, protocol 0x50 = BBB). Third iron-validatable block backend
+# after NVMe + AHCI, extending the existing xHCI investment.
+#
+# Per `feedback_redesign_dont_reinvent`: Linux's drivers/usb/storage/usb.c +
+# drivers/usb/storage/transport.c are the structural references. USB MSC
+# rev 1.0 spec (USB-IF, 1999) is the protocol reference. SCSI Primary
+# Commands (SPC-4) + SCSI Block Commands (SBC-3) are the command-set
+# references for Phase 3+.
+#
+# Phase split (mirrors NVMe Phase 1-5 / AHCI Phase 1-4):
+#   Phase 1 (this cut): class-interface discovery + bulk-EP enumeration +
+#                       GET_MAX_LUN class request. Read-only; no I/O.
+#   Phase 2:            bulk transfer primitives (Normal TRBs on bulk EPs,
+#                       transfer-event polling), CBW issue + CSW receipt
+#                       roundtrip skeleton. SCSI command field stays empty.
+#   Phase 3:            SCSI INQUIRY (0x12) + TEST UNIT READY (0x00) +
+#                       READ CAPACITY(10) (0x25). Iron-validatable as
+#                       "drive enumerated end-to-end."
+#   Phase 4:            SCSI READ(10) (0x28) + WRITE(10) (0x2A), block-
+#                       layer registration as BLK_USB_MS=4. AHCI-policy
+#                       precedence (NVMe wins, AHCI takes empty/VIRTIO,
+#                       USB MS takes empty/VIRTIO when no AHCI present).
+#
+# Phase 1 surface:
+#   msc_probe_slot(slot_id) -> 1 on MSC-BBB device found, 0 otherwise
+#   msc_print_summary()     -> "msc: <N> mass-storage devices detected"
+#
+# Module state is per-slot indexed by slot_id (parallels hid_kbd_*).
+# Multi-device support is structural from day one — USB MSC commonly
+# enumerates one stick at a time, but BBB allows multiple LUNs per
+# device and (with hubs) multiple devices per controller.
+
+
+# --- Module state ----------------------------------------------------
+
+# Per-slot MSC tables (slot_id is 1-based, 1..64). Slot 0 = unused.
+var msc_slot_count    = 0;       # number of MSC-BBB devices found
+var msc_first_slot    = 0;       # first slot_id that completed Phase 1
+                                  # (Phase 2+ will operate on this slot;
+                                  #  multi-device support widens later)
+
+# Per-slot fields (one row per slot, 256 bytes per slot = 4 KB page total).
+# Layout per row, byte offsets within `slot_id * MSC_ROW_BYTES`:
+#   +0   u8   present       (1 if Phase 1 succeeded)
+#   +1   u8   interface_num (bInterfaceNumber of the MSC-BBB interface)
+#   +2   u8   ep_in_addr    (bEndpointAddress of bulk-IN, with 0x80 bit)
+#   +3   u8   ep_out_addr   (bEndpointAddress of bulk-OUT, no 0x80 bit)
+#   +4   u16  ep_in_mps     (bulk-IN wMaxPacketSize)
+#   +6   u16  ep_out_mps    (bulk-OUT wMaxPacketSize)
+#   +8   u8   max_lun       (GET_MAX_LUN response; 0 = single-LUN device)
+var MSC_ROW_BYTES = 256;
+var msc_table_phys = 0;          # 4 KB page, lazy-allocated on first hit
+
+# Phase 2 per-slot row extensions (offsets within the 256-byte row):
+#   +16  u64  bulk_in_ring_phys
+#   +24  u64  bulk_out_ring_phys
+#   +32  u8   bulk_in_cycle    (transfer ring producer cycle bit)
+#   +33  u8   bulk_out_cycle
+#   +34  u16  bulk_in_idx      (next free TRB slot on the IN ring)
+#   +36  u16  bulk_out_idx
+#   +40  u8   bulk_in_dci      (Device Context Index of the IN EP)
+#   +41  u8   bulk_out_dci
+#   +48  u64  cbw_phys         (31-byte CBW scratch; allocated as 4 KB)
+#   +56  u64  csw_phys         (13-byte CSW scratch; allocated as 4 KB)
+#   +64  u32  cbw_tag_next     (host CBW tag counter; echoed in CSW)
+#   +68  u8   endpoints_ready  (1 after Configure Endpoint succeeded)
+#   +69  u8   transport_failed (sticky; 1 after a CSW Phase Error / timeout)
+var MSC_TRB_RING_TRBS = 64;      # 16 B per TRB × 64 = 1 KB; one 4 KB page
+                                  # holds it with room for a Link TRB at
+                                  # the end (Phase 2's small transfers
+                                  # won't actually wrap, but the Link
+                                  # makes wrapping a future no-op).
+
+fn msc_row_addr(slot_id) {
+    return msc_table_phys + slot_id * MSC_ROW_BYTES;
+}
+
+fn msc_ensure_table() {
+    if (msc_table_phys != 0) { return 1; }
+    var p = pmm_alloc();
+    if (p == 0) { return 0; }
+    if (vmm_is_mapped(p) == 0) { vmm_map(p, p, 0x83); }
+    xhci_zero_page(p);
+    msc_table_phys = p;
+    return 1;
+}
+
+
+# --- Configuration descriptor walker ---------------------------------
+
+# Walk the Configuration Descriptor in xhci_desc_buf_phys looking for an
+# Interface Descriptor matching MSC-BBB (class=0x08, subclass=0x06 [SCSI
+# transparent], protocol=0x50 [Bulk-Only Transport]) followed by EXACTLY
+# one bulk-IN endpoint + one bulk-OUT endpoint (USB MSC BBB §3.1).
+#
+# Per USB 2.0 §9.5 / §9.6.5 / §9.6.6 — descriptor TLV walk:
+#   [0] bLength    (covers entire descriptor)
+#   [1] bDescriptorType — 4=INTERFACE (9B), 5=ENDPOINT (7B)
+#
+# State machine: walk TLVs sequentially, track whether we are currently
+# inside a matched MSC-BBB interface; on each endpoint descriptor while
+# inside, classify by direction + transfer type. Stop when both bulk-IN
+# and bulk-OUT are captured (typical MSC has exactly these two; some
+# devices also expose an interrupt-IN for CBI protocol — we ignore non-
+# bulk endpoints since BBB only uses bulk).
+#
+# Returns 1 if both bulk endpoints found, 0 otherwise. Stores results
+# in caller-provided out-pointers (interface number + both EP addrs +
+# both MPS values via the same word-pair layout as the HID walker).
+fn xhci_find_msc_bbb_endpoints(total_length,
+out_intf_p, out_in_ep_p, out_out_ep_p, out_in_mps_p, out_out_mps_p) {
+    var off = 0;
+    var in_msc_intf = 0;
+    var found_in    = 0;
+    var found_out   = 0;
+    while (off < total_length) {
+        var b_length = load8(xhci_desc_buf_phys + off);
+        if (b_length == 0) { return 0; }   # malformed — guard infinite loop
+        var b_type = load8(xhci_desc_buf_phys + off + 1);
+        if (b_type == 4) {
+            # Interface Descriptor:
+            #   [2] bInterfaceNumber, [3] bAlternateSetting,
+            #   [4] bNumEndpoints,    [5] bInterfaceClass,
+            #   [6] bInterfaceSubClass, [7] bInterfaceProtocol
+            var i_class = load8(xhci_desc_buf_phys + off + 5);
+            var i_sub   = load8(xhci_desc_buf_phys + off + 6);
+            var i_proto = load8(xhci_desc_buf_phys + off + 7);
+            if (i_class == 0x08) {
+                if (i_sub == 0x06) {
+                    if (i_proto == 0x50) {
+                        in_msc_intf = 1;
+                        store8(out_intf_p, load8(xhci_desc_buf_phys + off + 2));
+                        # Reset endpoint accumulators when entering the
+                        # interface — alternate settings of an earlier MSC
+                        # interface should not poison the bulk-EP capture.
+                        found_in  = 0;
+                        found_out = 0;
+                    } else { in_msc_intf = 0; }
+                } else { in_msc_intf = 0; }
+            } else { in_msc_intf = 0; }
+        } else {
+            if (b_type == 5) {
+                # Endpoint Descriptor:
+                #   [2] bEndpointAddress (bit 7 = direction; 1 = IN)
+                #   [3] bmAttributes (bits 1:0 = transfer type; 2 = bulk)
+                #   [4..5] wMaxPacketSize
+                #   [6] bInterval — meaningless for bulk; ignored
+                if (in_msc_intf != 0) {
+                    var ep_addr = load8(xhci_desc_buf_phys + off + 2);
+                    var attrs   = load8(xhci_desc_buf_phys + off + 3);
+                    var mps     = load16(xhci_desc_buf_phys + off + 4);
+                    if ((attrs & 0x03) == 0x02) {
+                        # Bulk endpoint — classify direction
+                        if ((ep_addr & 0x80) != 0) {
+                            if (found_in == 0) {
+                                store8(out_in_ep_p, ep_addr);
+                                store16(out_in_mps_p, mps);
+                                found_in = 1;
+                            }
+                        } else {
+                            if (found_out == 0) {
+                                store8(out_out_ep_p, ep_addr);
+                                store16(out_out_mps_p, mps);
+                                found_out = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        off = off + b_length;
+    }
+    if (found_in == 0) { return 0; }
+    if (found_out == 0) { return 0; }
+    return 1;
+}
+
+
+# --- GET_MAX_LUN (USB MSC BBB §3.2) ---------------------------------
+
+# Class-specific control request — returns the highest LUN number this
+# device supports (0..15; 0 = single-LUN, which is the overwhelmingly
+# common case for thumb drives + USB HDDs). Response is one byte at
+# offset 0 of xhci_desc_buf_phys.
+#
+#   bmRequestType = 0xA1 (Device-to-Host | Class | Interface)
+#   bRequest      = 0xFE (GET_MAX_LUN)
+#   wValue        = 0
+#   wIndex        = interface number
+#   wLength       = 1
+#
+# Some devices STALL this request rather than return MaxLUN=0; per the
+# spec a STALL means "single-LUN, treat as MaxLUN=0". Phase 1 surfaces
+# the raw response but defaults to 0 on transfer failure.
+fn msc_get_max_lun(slot_id, interface) {
+    xhci_zero_page(xhci_desc_buf_phys);
+    if (xhci_control_in(slot_id, 0xA1, 0xFE, 0, interface, 1,
+    xhci_desc_buf_phys) == 0) {
+        return 0;   # STALL or other failure — single-LUN per spec
+    }
+    return load8(xhci_desc_buf_phys) & 0x0F;
+}
+
+
+# --- Phase 1 entry point --------------------------------------------
+
+# Per-slot Phase 1 driver — called from main.cyr after xhci_enumerate has
+# addressed each slot. Tests whether the slot's device hosts a USB MSC-BBB
+# interface; if so, captures bulk endpoint info + MaxLUN and prints a
+# single-line summary.
+#
+# Returns 1 if Phase 1 succeeded for this slot (MSC-BBB device detected),
+# 0 otherwise. Multiple slots may return 1 on multi-device USB hosts.
+#
+# Behavior under the slot iteration in main.cyr:
+#   - HID-kbd takes its slot first (Phase 4 of xhci runs ahead).
+#   - msc_probe_slot is non-destructive on non-MSC slots — config
+#     descriptor fetch is read-only, GET_MAX_LUN only runs after class
+#     triple matches.
+#   - Slots already claimed by HID-kbd will still be re-probed here;
+#     the class-triple gate weeds them out cheaply.
+fn msc_probe_slot(slot_id) {
+    if (xhci_desc_buf_phys == 0) { return 0; }
+
+    # Step 1: read 9-byte config descriptor header to learn wTotalLength.
+    xhci_zero_page(xhci_desc_buf_phys);
+    if (xhci_get_config_descriptor(slot_id, 0, 9) == 0) { return 0; }
+    var total_len = load16(xhci_desc_buf_phys + 2);
+    if (total_len < 23) { return 0; }   # need at least intf(9) + 2*ep(7)
+    if (total_len > 4096) { total_len = 4096; }  # clamp to scratch page
+
+    # Step 2: read full config descriptor.
+    xhci_zero_page(xhci_desc_buf_phys);
+    if (xhci_get_config_descriptor(slot_id, 0, total_len) == 0) { return 0; }
+
+    # Step 3: walk for MSC-BBB interface + bulk endpoint pair.
+    var intf_num   = 0;
+    var ep_in      = 0;
+    var ep_out     = 0;
+    var ep_in_mps_buf[2];
+    var ep_out_mps_buf[2];
+    store16(&ep_in_mps_buf, 0);
+    store16(&ep_out_mps_buf, 0);
+    if (xhci_find_msc_bbb_endpoints(total_len,
+    &intf_num, &ep_in, &ep_out, &ep_in_mps_buf, &ep_out_mps_buf) == 0) {
+        return 0;
+    }
+    var ep_in_mps  = load16(&ep_in_mps_buf);
+    var ep_out_mps = load16(&ep_out_mps_buf);
+    # Bulk MPS is 8/16/32/64 for FS, 512 for HS, 1024 for SS. A zero MPS
+    # is malformed; reject defensively (Phase 2 bulk transfers would
+    # divide by zero on residue calculations).
+    if (ep_in_mps  == 0) { return 0; }
+    if (ep_out_mps == 0) { return 0; }
+
+    # Step 4: SET_CONFIGURATION (USB 2.0 §9.4.7). Same reason as HID —
+    # bulk endpoints other than EP0 are not operational until the device
+    # is Configured. Single-config MSC devices declare bConfigurationValue
+    # = 1 at config descriptor byte 5. Re-fetching the config (Step 2 zero-
+    # paged the buffer) is wasteful; trust that byte 5 was preserved
+    # across the walker — it walks but never writes the input buffer.
+    var config_value = load8(xhci_desc_buf_phys + 5);
+    if (xhci_control_no_data(slot_id, 0x00, 0x09, config_value, 0) == 0) {
+        return 0;
+    }
+
+    # Step 5: GET_MAX_LUN (class-specific). Many sticks return 0; some
+    # multi-card readers return up to 3. STALL is treated as MaxLUN=0
+    # per spec, captured inside msc_get_max_lun.
+    var max_lun = msc_get_max_lun(slot_id, intf_num);
+
+    # Step 6: stash module state.
+    if (msc_ensure_table() == 0) { return 0; }
+    var row = msc_row_addr(slot_id);
+    store8(row + 0, 1);
+    store8(row + 1, intf_num);
+    store8(row + 2, ep_in);
+    store8(row + 3, ep_out);
+    store16(row + 4, ep_in_mps);
+    store16(row + 6, ep_out_mps);
+    store8(row + 8, max_lun);
+    if (msc_first_slot == 0) { msc_first_slot = slot_id; }
+    msc_slot_count = msc_slot_count + 1;
+
+    # Step 7: one-line per-slot summary.
+    kprint("msc: slot ", 10);
+    kprint_num(slot_id);
+    kprint(" BBB intf=", 10);
+    kprint_num(intf_num);
+    kprint(" bulk-IN=", 9);
+    kprint_num(ep_in);
+    kprint(" bulk-OUT=", 10);
+    kprint_num(ep_out);
+    kprint(" MPS(in/out)=", 13);
+    kprint_num(ep_in_mps);
+    kprint("/", 1);
+    kprint_num(ep_out_mps);
+    kprint(" MaxLUN=", 8);
+    kprint_num(max_lun);
+    kprintln("", 0);
+
+    # CMOS kcp 0x52 — Phase 1 success for at least one MSC slot. Continues
+    # storage-arc sequence: 0x40-0x48 NVMe, 0x49-0x4A GPT P1-2, 0x4B-0x4D
+    # AHCI P1, 0x4E AHCI P2, 0x4F AHCI P3, 0x50 AHCI P4, 0x51 GPT P3,
+    # 0x52 MSC P1, 0x53 MSC P2 (Configure Endpoint succeeded), 0x54 MSC P2
+    # (TEST UNIT READY round-trip OK).
+    xhci_cmos_stamp(0x52, 0x01);
+
+    # Phase 2 follow-through — configure bulk endpoints + TEST UNIT READY.
+    # Failure of either does NOT abort Phase 1's success line; the device
+    # is enumerated, the boot continues, and the failure surfaces as
+    # transport_failed on the row (kprintln'd at the failure site).
+    if (msc_configure_endpoints(slot_id) != 0) {
+        xhci_cmos_stamp(0x53, slot_id & 0xFF);
+        # Issue TEST UNIT READY against LUN 0 (the only LUN when MaxLUN=0).
+        # A failure here is common for fresh removable media (NOT READY) —
+        # not a transport bug. Phase 3 will follow up with REQUEST SENSE.
+        var tur = msc_test_unit_ready(slot_id, 0);
+        if (tur != 0) {
+            xhci_cmos_stamp(0x54, slot_id & 0xFF);
+            kprint("msc: slot ", 10);
+            kprint_num(slot_id);
+            kprintln(" TEST UNIT READY -> ready (Pass)", 32);
+
+            # Phase 3 — INQUIRY + READ CAPACITY(10). Both have IN data
+            # phases; together they identify the device and decode LUN
+            # geometry. Failures are non-fatal (Phase 4 will gate
+            # block-layer registration on capacity_done==1; the rest
+            # of boot proceeds).
+            if (msc_inquiry(slot_id, 0) != 0) {
+                xhci_cmos_stamp(0x55, slot_id & 0xFF);
+                kprint("msc: slot ", 10);
+                kprint_num(slot_id);
+                kprint(" INQUIRY: vendor='", 18);
+                msc_print_ascii_field(msc_row_addr(slot_id) + 96, 8);
+                kprint("' product='", 11);
+                msc_print_ascii_field(msc_row_addr(slot_id) + 104, 16);
+                kprint("' rev='", 7);
+                msc_print_ascii_field(msc_row_addr(slot_id) + 120, 4);
+                kprint("' type=", 7);
+                msc_print_pdt_label(load8(msc_row_addr(slot_id) + 129));
+                kprintln("", 0);
+            } else {
+                kprint("msc: slot ", 10);
+                kprint_num(slot_id);
+                kprintln(" INQUIRY failed", 15);
+            }
+
+            if (msc_read_capacity(slot_id, 0) != 0) {
+                xhci_cmos_stamp(0x56, slot_id & 0xFF);
+                var rrow = msc_row_addr(slot_id);
+                var last_lba = load64(rrow + 72);
+                var blk     = load32(rrow + 80);
+                # Total sectors = last_lba + 1; MiB = sectors * blk / 1048576.
+                # For QEMU's 8 MB stick: last_lba=16383, blk=512 → 8 MiB.
+                var sectors = last_lba + 1;
+                var mib     = (sectors * blk) / 1048576;
+                kprint("msc: slot ", 10);
+                kprint_num(slot_id);
+                kprint(" READ CAPACITY: last_lba=", 25);
+                kprint_num(last_lba);
+                kprint(" blk=", 5);
+                kprint_num(blk);
+                kprint("B -> ", 5);
+                kprint_num(mib);
+                kprintln(" MiB", 4);
+            } else {
+                kprint("msc: slot ", 10);
+                kprint_num(slot_id);
+                kprintln(" READ CAPACITY(10) failed", 25);
+            }
+        } else {
+            kprint("msc: slot ", 10);
+            kprint_num(slot_id);
+            kprintln(" TEST UNIT READY -> not ready / failed (CSW status != 0)", 56);
+        }
+    }
+
+    return 1;
+}
+
+
+# --- Phase 1 top-level driver ----------------------------------------
+
+# Iterate every addressed xHCI slot, probing each for an MSC-BBB
+# interface. Called from main.cyr after the HID-kbd configure loop.
+# Single-pass: HID-kbd already grabbed its slot (if present); MSC
+# probe is a different class-triple match and won't conflict.
+fn msc_enumerate() {
+    if (xhci_running == 0) { return 0; }
+    var s = 1;
+    while (s <= 64) {
+        var sctx = xhci_slot_get(xhci_slot_input_ctx, s);
+        if (sctx != 0) {
+            msc_probe_slot(s);
+        }
+        s = s + 1;
+    }
+    if (msc_slot_count > 0) {
+        kprint("msc: ", 5);
+        kprint_num(msc_slot_count);
+        kprintln(" mass-storage device(s) detected", 32);
+    }
+    return msc_slot_count;
+}
+
+
+# === Phase 2 — Bulk-Only Transport (BBB) + TEST UNIT READY ===========
+#
+# Bulk transport per USB Mass Storage Class — Bulk-Only Transport rev 1.0
+# (USB-IF, 1999). Three-step round-trip:
+#
+#   1. Host issues a Command Block Wrapper (CBW, 31 bytes) on bulk-OUT.
+#   2. If data transfer is present: host issues a single Normal TRB on
+#      the data-direction bulk endpoint pointing at the caller's buffer.
+#   3. Host posts a Normal TRB on bulk-IN to receive the Command Status
+#      Wrapper (CSW, 13 bytes).
+#
+# Each TRB rings the appropriate endpoint's doorbell; transfer events
+# surface on the shared event ring. Phase 2 polls via the existing
+# xhci_wait_transfer_event helper (slot-id-keyed). MSI-X interrupt-
+# driven completion deferred per xhci + nvme + ahci precedent.
+#
+# Phase 2 ships TEST UNIT READY (SCSI 0x00) as the smallest data-phase-
+# free SCSI command — the device replies with a CSW only, no IN data
+# payload. This validates the full bulk round-trip without exercising
+# the data phase. INQUIRY (0x12) + READ CAPACITY(10) (0x25) — both with
+# IN data phases — land in Phase 3.
+
+# --- Bulk transfer ring allocation -----------------------------------
+
+# Allocate a 4 KB transfer-ring page and write a single Link TRB at the
+# last slot pointing back to the page base + cycle toggle. Returns the
+# ring phys, or 0 on alloc failure. Page is zeroed and IOMMU-registered.
+fn msc_alloc_bulk_ring() {
+    var ring = pmm_alloc();
+    if (ring == 0) { return 0; }
+    if (vmm_is_mapped(ring) == 0) { vmm_map(ring, ring, 0x83); }
+    iommu_register_dma(ring);
+    xhci_zero_page(ring);
+    # Last TRB slot is a Link TRB pointing back to the ring base with
+    # Toggle Cycle = 1 (TC bit, dword 3 bit 1). Phase 2's tiny transfers
+    # never wrap to use this, but having it in place future-proofs the
+    # ring.
+    var link = ring + (MSC_TRB_RING_TRBS - 1) * 16;
+    store64(link + 0, ring);
+    store32(link + 8, 0);
+    store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2 | 0x1);  # TC=1, cycle=1
+    return ring;
+}
+
+# Push a single Normal TRB onto a bulk transfer ring and ring the slot/DCI
+# doorbell. Advances the per-direction cycle bit + index in the slot row.
+# IOC=1 (always — Phase 2 polls every TRB), ISP=1 for IN direction
+# (Interrupt on Short Packet, per Linux convention for IN bulk).
+#
+# Layout (xHCI 1.2 §6.4.1.1 Normal TRB):
+#   dword 0-1: Data Buffer Pointer (phys)
+#   dword 2:   bits [16:0]  TRB Transfer Length
+#              bits [21:17] TD Size = 0 (single-TRB TD)
+#              bits [31:22] Interrupter Target = 0
+#   dword 3:   bit  0       Cycle
+#              bit  2       ISP (Interrupt on Short Packet)
+#              bit  4       CH  (Chain Bit) = 0
+#              bit  5       IOC
+#              bits [15:10] TRB Type = Normal (1)
+fn msc_bulk_enqueue(slot_id, is_in, data_phys, length) {
+    var row = msc_row_addr(slot_id);
+    var ring_off = 24;
+    var cycle_off = 33;
+    var idx_off   = 36;
+    var dci_off   = 41;
+    if (is_in != 0) {
+        ring_off  = 16;
+        cycle_off = 32;
+        idx_off   = 34;
+        dci_off   = 40;
+    }
+    var ring  = load64(row + ring_off);
+    var cycle = load8 (row + cycle_off);
+    var idx   = load16(row + idx_off);
+    var dci   = load8 (row + dci_off);
+    if (ring == 0) { return 0; }
+
+    # Skip the Link TRB slot — if we are about to land on the last slot,
+    # advance through the Link.
+    if (idx == MSC_TRB_RING_TRBS - 1) {
+        # Toggle Cycle is set on the Link TRB; producer cycle flips and
+        # idx wraps to 0. (Phase 2 transfers are short enough this never
+        # actually fires in steady state — defensive.)
+        if (cycle == 1) { cycle = 0; } else { cycle = 1; }
+        idx = 0;
+    }
+
+    var trb = ring + idx * 16;
+    store64(trb + 0, data_phys);
+    store32(trb + 8, length & 0x1FFFF);
+    var trb_ctrl = (XHCI_TRB_NORMAL << 10) | (1 << 5) | (cycle & 0x1);
+    if (is_in != 0) { trb_ctrl = trb_ctrl | (1 << 2); }    # ISP for IN
+    store32(trb + 12, trb_ctrl);
+
+    # Advance enqueue.
+    var new_idx = idx + 1;
+    store16(row + idx_off, new_idx);
+
+    # Ring the doorbell for this slot/DCI.
+    var db_addr = xhci_mmio_base + xhci_db_off + slot_id * 4;
+    store32(db_addr, dci & 0xFF);
+    return 1;
+}
+
+
+# --- Endpoint configuration ------------------------------------------
+
+# Configure the device's bulk-IN + bulk-OUT endpoint pair. Called from
+# msc_probe_slot after Phase 1 discovery has populated the row's
+# ep_in_addr / ep_out_addr / MPS fields. Allocates two transfer rings +
+# CBW + CSW scratch buffers, adds both EPs to the Input Context, issues
+# Configure Endpoint, and stashes per-EP DCI + ring state.
+#
+# Returns 1 on success, 0 on any alloc / Configure Endpoint failure.
+fn msc_configure_endpoints(slot_id) {
+    var row = msc_row_addr(slot_id);
+    if (load8(row + 0) == 0) { return 0; }           # Phase 1 not done
+
+    var ictx = xhci_slot_get(xhci_slot_input_ctx, slot_id);
+    if (ictx == 0) { return 0; }
+    var speed = xhci_slot_get(xhci_slot_speed, slot_id);
+    var in_ep_addr  = load8 (row + 2);
+    var out_ep_addr = load8 (row + 3);
+    var in_mps      = load16(row + 4);
+    var out_mps     = load16(row + 6);
+
+    # Allocate four 4 KB pages: bulk-IN ring, bulk-OUT ring, CBW scratch,
+    # CSW scratch. (CBW is 31 B, CSW is 13 B — but pmm_alloc is page
+    # granularity; the unused tail is harmless.)
+    var in_ring  = msc_alloc_bulk_ring();
+    if (in_ring  == 0) { kprintln("msc: bulk-IN ring alloc failed", 30);  return 0; }
+    var out_ring = msc_alloc_bulk_ring();
+    if (out_ring == 0) { kprintln("msc: bulk-OUT ring alloc failed", 31); return 0; }
+    var cbw = pmm_alloc();
+    if (cbw == 0) { kprintln("msc: CBW buf alloc failed", 25); return 0; }
+    if (vmm_is_mapped(cbw) == 0) { vmm_map(cbw, cbw, 0x83); }
+    iommu_register_dma(cbw);
+    xhci_zero_page(cbw);
+    var csw = pmm_alloc();
+    if (csw == 0) { kprintln("msc: CSW buf alloc failed", 25); return 0; }
+    if (vmm_is_mapped(csw) == 0) { vmm_map(csw, csw, 0x83); }
+    iommu_register_dma(csw);
+    xhci_zero_page(csw);
+
+    # Stash ring + CBW/CSW phys + initial cycle/idx in the row.
+    store64(row + 16, in_ring);
+    store64(row + 24, out_ring);
+    store8 (row + 32, 1);    # bulk_in_cycle  (initial producer cycle)
+    store8 (row + 33, 1);    # bulk_out_cycle
+    store16(row + 34, 0);    # bulk_in_idx
+    store16(row + 36, 0);    # bulk_out_idx
+    store8 (row + 40, xhci_dci_for_ep(in_ep_addr));
+    store8 (row + 41, xhci_dci_for_ep(out_ep_addr));
+    store64(row + 48, cbw);
+    store64(row + 56, csw);
+    store32(row + 64, 0x12345678);     # initial CBW tag (arbitrary)
+
+    # Add the bulk pair to the Input Context, then Configure Endpoint.
+    if (xhci_input_ctx_add_bulk_pair(ictx, in_ep_addr, in_mps,
+    out_ep_addr, out_mps, speed, in_ring, out_ring) == 0) {
+        kprintln("msc: input ctx add bulk pair failed", 35);
+        return 0;
+    }
+    if (xhci_configure_endpoint(slot_id, ictx) == 0) {
+        kprintln("msc: Configure Endpoint failed", 30);
+        return 0;
+    }
+    store8(row + 68, 1);    # endpoints_ready
+    return 1;
+}
+
+
+# --- BBB transport ---------------------------------------------------
+
+# Build the 31-byte CBW at the row's CBW scratch buffer. Per USB MSC BBB
+# §5.1. CDB is copied byte-by-byte from cdb_phys (caller-owned); pads
+# with zeros to the fixed 16-byte CBWCB region.
+#
+# Returns the host tag written to dCBWTag (echoed by device in CSW).
+fn msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in) {
+    var row = msc_row_addr(slot_id);
+    var cbw = load64(row + 48);
+    if (cbw == 0) { return 0; }
+    xhci_zero_page(cbw);
+    # dCBWSignature = 0x43425355 ('USBC' LE)
+    store32(cbw + 0, 0x43425355);
+    var tag = load32(row + 64);
+    store32(cbw + 4, tag);
+    store32(row + 64, tag + 1);          # bump for next CBW
+    store32(cbw + 8, data_len);          # dCBWDataTransferLength
+    var flags = 0;
+    if (dir_in != 0) { flags = 0x80; }   # bmCBWFlags bit 7 = Direction (IN)
+    store8 (cbw + 12, flags);
+    store8 (cbw + 13, lun & 0x0F);       # bCBWLUN
+    var cdb_n = cdb_len;
+    if (cdb_n > 16) { cdb_n = 16; }
+    store8 (cbw + 14, cdb_n & 0x1F);     # bCBWCBLength (5-bit field)
+    var i = 0;
+    while (i < cdb_n) {
+        store8(cbw + 15 + i, load8(cdb_phys + i));
+        i = i + 1;
+    }
+    return tag;
+}
+
+# Execute one BBB command end-to-end:
+#   1. Build CBW at row's scratch buffer.
+#   2. Enqueue CBW on bulk-OUT (31 bytes), ring doorbell, wait event.
+#   3. If data_len > 0: enqueue data TRB on the data-direction EP, wait.
+#   4. Enqueue CSW receive on bulk-IN (13 bytes), wait.
+#   5. Validate CSW signature + tag + status. Return 1 on Pass, 0 else.
+#
+# data_phys may be 0 when data_len == 0 (e.g., TEST UNIT READY). Direction
+# of the data phase is given by dir_in (1 = IN, 0 = OUT).
+#
+# Sets row + 69 (transport_failed) = 1 sticky on Phase Error / timeout
+# so future class-driver code can detect a wedged transport.
+fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
+    var row = msc_row_addr(slot_id);
+    if (load8(row + 68) == 0) { return 0; }            # endpoints not ready
+
+    # Step 1+2: build + send CBW on bulk-OUT.
+    var tag = msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in);
+    var cbw = load64(row + 48);
+    if (msc_bulk_enqueue(slot_id, 0, cbw, 31) == 0) { return 0; }
+    if (xhci_wait_transfer_event(slot_id) == 0) {
+        kprintln("msc: CBW transfer timeout", 25);
+        store8(row + 69, 1);
+        return 0;
+    }
+
+    # Step 3: optional data phase.
+    if (data_len > 0) {
+        if (msc_bulk_enqueue(slot_id, dir_in, data_phys, data_len) == 0) {
+            return 0;
+        }
+        if (xhci_wait_transfer_event(slot_id) == 0) {
+            kprintln("msc: data phase timeout", 23);
+            store8(row + 69, 1);
+            return 0;
+        }
+    }
+
+    # Step 4: post CSW receive on bulk-IN.
+    var csw = load64(row + 56);
+    xhci_zero_page(csw);
+    if (msc_bulk_enqueue(slot_id, 1, csw, 13) == 0) { return 0; }
+    if (xhci_wait_transfer_event(slot_id) == 0) {
+        kprintln("msc: CSW transfer timeout", 25);
+        store8(row + 69, 1);
+        return 0;
+    }
+
+    # Step 5: validate CSW.
+    var sig = load32(csw + 0);
+    if (sig != 0x53425355) {              # 'USBS' LE
+        kprintln("msc: CSW signature mismatch", 27);
+        store8(row + 69, 1);
+        return 0;
+    }
+    var csw_tag = load32(csw + 4);
+    if (csw_tag != tag) {
+        kprintln("msc: CSW tag mismatch", 21);
+        store8(row + 69, 1);
+        return 0;
+    }
+    var status = load8(csw + 12);
+    if (status == 0) { return 1; }        # Pass
+    if (status == 1) { return 0; }        # Command Failed (caller may retry)
+    # status == 2 — Phase Error: transport wedged; needs Reset Recovery.
+    kprintln("msc: CSW phase error", 20);
+    store8(row + 69, 1);
+    return 0;
+}
+
+
+# --- Phase 2 SCSI command — TEST UNIT READY (0x00) -------------------
+
+# Issue SCSI TEST UNIT READY (SPC-4 §6.34). 6-byte CDB, no data phase.
+# Returns 1 if the device returned CSW.bCSWStatus = 0 (Pass), 0 otherwise.
+#
+# CDB layout:
+#   [0]  Opcode = 0x00
+#   [1]  Reserved
+#   [2]  Reserved
+#   [3]  Reserved
+#   [4]  Reserved
+#   [5]  Control = 0
+#
+# A common return on freshly-plugged removable media is 0x02 ("Not Ready
+# — Media not present") — that comes back as CSW status 1 (Command
+# Failed) which we report as 0 here; the device is still functioning,
+# the LUN just isn't ready. Phase 3 will issue REQUEST SENSE to decode
+# the actual reason.
+fn msc_test_unit_ready(slot_id, lun) {
+    var row = msc_row_addr(slot_id);
+    if (load8(row + 68) == 0) { return 0; }       # endpoints not ready
+
+    # Build the 6-byte CDB inline in the CBW scratch (we'll overwrite
+    # CBW + CDB in build_cbw immediately — but we need a stable phys
+    # to pass to msc_build_cbw). Use a 16-byte stack buffer for the CDB.
+    var cdb_buf[2];                # 16 bytes
+    var cdb_p = &cdb_buf;
+    var k = 0;
+    while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
+    # All zeros = TEST UNIT READY (opcode 0x00, control 0x00).
+
+    return msc_bbb_exec(slot_id, lun, cdb_p, 6, 0, 0, 0);
+}
+
+
+# === Phase 3 — INQUIRY (0x12) + READ CAPACITY(10) (0x25) =============
+#
+# Two SCSI commands with IN data phases — exercising the previously-
+# unused data-phase arm of msc_bbb_exec. Together they identify the
+# device (vendor/product/revision) and the LUN geometry (last_lba +
+# lba_bytes), which is the minimum information Phase 4 needs to
+# register the device with the block layer.
+#
+# Per SPC-4 §6.6 (INQUIRY) + SBC-3 §5.10 (READ CAPACITY(10)). Both are
+# 6-byte (INQUIRY uses 6-byte CDB despite the 36+ B response; READ
+# CAPACITY(10) actually uses 10-byte CDB despite the 8-byte response).
+
+# Per-slot Phase 3 results in the row (offsets within the 256-byte row):
+#   +72   u64  last_lba_msc    (highest valid LBA per READ CAPACITY(10))
+#   +80   u32  lba_bytes_msc   (block size in bytes — usually 512, 2048
+#                                for optical via SCSI MMC)
+#   +84   u8   inquiry_done    (1 after a successful INQUIRY)
+#   +85   u8   capacity_done   (1 after a successful READ CAPACITY)
+#   +96   8B   vendor          (INQUIRY response bytes 8..15, ASCII)
+#   +104  16B  product         (INQUIRY response bytes 16..31, ASCII)
+#   +120  4B   revision        (INQUIRY response bytes 32..35, ASCII)
+#   +128  u8   peripheral_qual (INQUIRY response byte 0 bits 7:5)
+#   +129  u8   peripheral_type (INQUIRY response byte 0 bits 4:0)
+
+# Allocate a per-row data scratch page on first use. Used for both
+# INQUIRY (36 B) + READ CAPACITY (8 B) IN data phases; one page per
+# row is plenty.
+fn msc_ensure_data_buf(row) {
+    var existing = load64(row + 136);
+    if (existing != 0) { return existing; }
+    var p = pmm_alloc();
+    if (p == 0) { return 0; }
+    if (vmm_is_mapped(p) == 0) { vmm_map(p, p, 0x83); }
+    iommu_register_dma(p);
+    xhci_zero_page(p);
+    store64(row + 136, p);
+    return p;
+}
+
+
+# --- SCSI INQUIRY (0x12) ---------------------------------------------
+
+# Standard INQUIRY — fetches the 36-byte Standard INQUIRY Data response
+# (SPC-4 §6.6.2). CDB:
+#   [0] Opcode = 0x12
+#   [1] EVPD bit (bit 0) = 0  (standard inquiry, not VPD page)
+#   [2] PageCode = 0          (ignored when EVPD=0)
+#   [3..4] AllocationLength (big-endian u16) = 36
+#   [5] Control = 0
+#
+# Decodes:
+#   byte 0 [7:5]   peripheral qualifier (000 = device present)
+#   byte 0 [4:0]   peripheral device type (0x00=block, 0x05=CD/DVD/BD,
+#                                          0x07=optical, 0x0E=RBC)
+#   byte 8..15     T10 Vendor Identification (ASCII, space-padded)
+#   byte 16..31    Product Identification (ASCII, space-padded)
+#   byte 32..35    Product Revision Level (ASCII)
+#
+# Returns 1 on success (response cached in row + 96..123), 0 on failure.
+fn msc_inquiry(slot_id, lun) {
+    var row = msc_row_addr(slot_id);
+    if (load8(row + 68) == 0) { return 0; }
+
+    var data = msc_ensure_data_buf(row);
+    if (data == 0) { return 0; }
+    xhci_zero_page(data);
+
+    var cdb_buf[2];
+    var cdb_p = &cdb_buf;
+    var k = 0;
+    while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
+    store8(cdb_p + 0, 0x12);
+    store8(cdb_p + 3, 0);          # AllocationLength high byte
+    store8(cdb_p + 4, 36);         # AllocationLength low byte
+
+    if (msc_bbb_exec(slot_id, lun, cdb_p, 6, data, 36, 1) == 0) {
+        return 0;
+    }
+
+    # Cache decoded fields in the row. peripheral qual / type at byte 0.
+    var pq_pt = load8(data + 0);
+    store8(row + 128, (pq_pt >> 5) & 0x7);
+    store8(row + 129, pq_pt & 0x1F);
+    # Vendor / Product / Revision — copy raw bytes into row scratch
+    # without ATA-style byte-swap (SCSI INQUIRY strings are plain ASCII).
+    var i = 0;
+    while (i < 8)  { store8(row + 96  + i, load8(data + 8  + i)); i = i + 1; }
+    i = 0;
+    while (i < 16) { store8(row + 104 + i, load8(data + 16 + i)); i = i + 1; }
+    i = 0;
+    while (i < 4)  { store8(row + 120 + i, load8(data + 32 + i)); i = i + 1; }
+    store8(row + 84, 1);            # inquiry_done
+
+    return 1;
+}
+
+
+# --- SCSI READ CAPACITY(10) (0x25) -----------------------------------
+
+# READ CAPACITY(10) — 8-byte IN data response (SBC-3 §5.10.2).
+#   CDB:
+#     [0] Opcode = 0x25
+#     [1] Reserved
+#     [2..5] LBA = 0 (with PMI=0, just return last LBA)
+#     [6] Reserved
+#     [7] Reserved
+#     [8] PMI (bit 0) = 0
+#     [9] Control = 0
+#
+#   Response (8 bytes, big-endian):
+#     [0..3] Returned LBA (u32 — highest valid LBA on the LUN)
+#     [4..7] Block length in bytes (u32 — typically 512 or 2048)
+#
+# Stores last_lba + lba_bytes in row + 72 / +80. Returns 1 on success.
+#
+# NOTE: u32 LBA tops out at 2 TiB (assuming 512-B blocks). Larger drives
+# require READ CAPACITY(16) (SBC-3 §5.11 — 0x9E service action 0x10).
+# We use READ CAPACITY(10) for Phase 3; if the response is 0xFFFFFFFF,
+# the actual capacity is reported via the 16-byte variant — Phase 4
+# adds the 16-byte fallback path.
+fn msc_read_capacity(slot_id, lun) {
+    var row = msc_row_addr(slot_id);
+    if (load8(row + 68) == 0) { return 0; }
+
+    var data = msc_ensure_data_buf(row);
+    if (data == 0) { return 0; }
+    xhci_zero_page(data);
+
+    var cdb_buf[2];
+    var cdb_p = &cdb_buf;
+    var k = 0;
+    while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
+    store8(cdb_p + 0, 0x25);
+
+    if (msc_bbb_exec(slot_id, lun, cdb_p, 10, data, 8, 1) == 0) {
+        return 0;
+    }
+
+    # Decode big-endian u32 last_lba.
+    var last_lba = (load8(data + 0) << 24)
+                 | (load8(data + 1) << 16)
+                 | (load8(data + 2) << 8)
+                 |  load8(data + 3);
+    var blk_size = (load8(data + 4) << 24)
+                 | (load8(data + 5) << 16)
+                 | (load8(data + 6) << 8)
+                 |  load8(data + 7);
+    store64(row + 72, last_lba);
+    store32(row + 80, blk_size);
+    store8 (row + 85, 1);            # capacity_done
+    return 1;
+}
+
+
+# --- Phase 3 print helpers ------------------------------------------
+
+# Print one of the ASCII-padded fields with right-trim of trailing
+# spaces (matches the AHCI ATA-string right-trim convention; SCSI
+# fields are space-padded fixed-width per SPC-4 §6.6.2).
+fn msc_print_ascii_field(p, n) {
+    var last = 0 - 1;
+    var i = 0;
+    while (i < n) {
+        var b = load8(p + i);
+        if (b != 32) { if (b != 0) { last = i; } }
+        i = i + 1;
+    }
+    if (last < 0) { return 0; }
+    i = 0;
+    while (i <= last) {
+        var c = load8(p + i);
+        if (c == 0) { c = 32; }
+        kprint(p + i, 1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Map peripheral device type code to a single-word label. Phase 3 only
+# decodes the common four — Phase 4 widens.
+fn msc_print_pdt_label(pdt) {
+    if (pdt == 0x00) { kprint("block", 5);   return 0; }
+    if (pdt == 0x05) { kprint("optical", 7); return 0; }
+    if (pdt == 0x07) { kprint("optical", 7); return 0; }
+    if (pdt == 0x0E) { kprint("RBC", 3);     return 0; }
+    kprint("class=", 6);
+    kprint_num(pdt);
+    return 0;
+}
+
+
+# === Phase 4 — READ(10) / WRITE(10) + block-layer registration =======
+#
+# SCSI READ(10) (SBC-3 §5.7, opcode 0x28) + WRITE(10) (SBC-3 §5.27,
+# opcode 0x2A). Both use 10-byte CDB with big-endian u32 LBA and big-
+# endian u16 transfer length (in LBAs). Data phase = count * lba_bytes
+# bytes, capped at 64 KB / single Normal TRB at the bulk-transfer
+# layer (17-bit TRB Transfer Length per xHCI 1.2 §6.4.1.1).
+#
+# At 512 B/LBA the single-TRB cap is 128 sectors. msc_blk_read_sectors
+# chunks larger requests; single-sector blk_read / blk_write are well
+# under the cap.
+
+# CDB encoding for READ(10) / WRITE(10):
+#   [0]  Opcode (0x28 or 0x2A)
+#   [1]  Flags (0 — no DPO / FUA / FUA_NV / RDPROTECT for Phase 4)
+#   [2..5] LBA (big-endian u32)
+#   [6]  Group Number (0)
+#   [7..8] Transfer Length (big-endian u16) — number of LBAs to xfer
+#   [9]  Control (0)
+fn msc_build_rw10_cdb(cdb_p, opcode, lba, count) {
+    var k = 0;
+    while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
+    store8(cdb_p + 0, opcode);
+    store8(cdb_p + 2, (lba >> 24) & 0xFF);
+    store8(cdb_p + 3, (lba >> 16) & 0xFF);
+    store8(cdb_p + 4, (lba >> 8)  & 0xFF);
+    store8(cdb_p + 5,  lba        & 0xFF);
+    store8(cdb_p + 7, (count >> 8) & 0xFF);
+    store8(cdb_p + 8,  count       & 0xFF);
+    return 0;
+}
+
+# Issue SCSI READ(10) against (lba, count) into buf_phys. Caller owns
+# buf_phys (must be IOMMU-registered + at least count*lba_bytes large).
+# Returns 1 on success, 0 on transport / CSW failure.
+fn msc_read_lba(slot_id, lun, lba, count, buf_phys) {
+    var row = msc_row_addr(slot_id);
+    if (load8(row + 68) == 0) { return 0; }       # endpoints not ready
+    if (load8(row + 85) == 0) { return 0; }       # capacity not yet known
+    var blk = load32(row + 80);
+    if (blk == 0) { return 0; }
+    var bytes = count * blk;
+    if (bytes > 65535) { return 0; }              # single-TRB cap
+    var cdb_buf[2];
+    var cdb_p = &cdb_buf;
+    msc_build_rw10_cdb(cdb_p, 0x28, lba, count);
+    return msc_bbb_exec(slot_id, lun, cdb_p, 10, buf_phys, bytes, 1);
+}
+
+# Issue SCSI WRITE(10) from buf_phys to (lba, count). Returns 1 / 0.
+fn msc_write_lba(slot_id, lun, lba, count, buf_phys) {
+    var row = msc_row_addr(slot_id);
+    if (load8(row + 68) == 0) { return 0; }
+    if (load8(row + 85) == 0) { return 0; }
+    var blk = load32(row + 80);
+    if (blk == 0) { return 0; }
+    var bytes = count * blk;
+    if (bytes > 65535) { return 0; }
+    var cdb_buf[2];
+    var cdb_p = &cdb_buf;
+    msc_build_rw10_cdb(cdb_p, 0x2A, lba, count);
+    return msc_bbb_exec(slot_id, lun, cdb_p, 10, buf_phys, bytes, 0);
+}
+
+
+# --- Block-layer wrappers -------------------------------------------
+
+# All wrappers operate on msc_first_slot (the first slot that completed
+# Phase 1+2+3). Multi-slot block exposure would need per-slot blk_*
+# registration — out of Phase 4 scope; the typical archaemenid topology
+# is one USB device at a time during bring-up.
+
+fn msc_blk_read(sector, buf) {
+    if (msc_first_slot == 0) { return 0 - 1; }
+    if (msc_read_lba(msc_first_slot, 0, sector, 1, buf) == 0) {
+        return 0 - 1;
+    }
+    return 0;
+}
+
+fn msc_blk_write(sector, buf) {
+    if (msc_first_slot == 0) { return 0 - 1; }
+    if (msc_write_lba(msc_first_slot, 0, sector, 1, buf) == 0) {
+        return 0 - 1;
+    }
+    return 0;
+}
+
+# Multi-sector read. Chunks into 128-sector calls (64 KB at 512 B LBA —
+# the single-Normal-TRB bulk transfer cap). Caller's buffer is contiguous
+# physical (existing virtio/nvme/ahci convention).
+fn msc_blk_read_sectors(start, count, buf) {
+    if (msc_first_slot == 0) { return 0 - 1; }
+    var row = msc_row_addr(msc_first_slot);
+    var blk = load32(row + 80);
+    if (blk == 0) { return 0 - 1; }
+    var max_per_call = 128;
+    if (blk > 0) { max_per_call = 65535 / blk; }
+    var remaining = count;
+    var cur_lba   = start;
+    var cur_buf   = buf;
+    while (remaining > 0) {
+        var n = remaining;
+        if (n > max_per_call) { n = max_per_call; }
+        if (msc_read_lba(msc_first_slot, 0, cur_lba, n, cur_buf) == 0) {
+            return 0 - 1;
+        }
+        remaining = remaining - n;
+        cur_lba   = cur_lba + n;
+        cur_buf   = cur_buf + n * blk;
+    }
+    return 0;
+}
+
+
+# --- Block-layer registration ---------------------------------------
+
+# Register the first MSC slot with the block layer per the tertiary
+# dispatch policy: NVMe primary, AHCI secondary, USB MS tertiary. USB MS
+# only becomes blk_active when no NVMe AND no AHCI are present, OR when
+# the only other backend is VIRTIO (which it overrides — real-iron USB
+# stick beats paravirt).
+#
+# Called from main.cyr after ahci_register_block_dev. Returns 1 if the
+# call resulted in BLK_USB_MS being installed as blk_active (i.e., no
+# NVMe / no AHCI to defer to), 0 if USB MS deferred to a higher-priority
+# backend or no MSC slot exists.
+fn msc_register_block_dev() {
+    if (msc_first_slot == 0) { return 0; }
+    var row = msc_row_addr(msc_first_slot);
+    if (load8(row + 85) == 0) { return 0; }           # capacity not known
+    var blk_bytes = load32(row + 80);
+    if (blk_bytes == 0) { return 0; }
+    var sectors = load64(row + 72) + 1;
+    if (sectors == 0) { return 0; }
+
+    # Tertiary policy: take the slot only if currently NONE or VIRTIO.
+    # Don't override NVMe or AHCI.
+    if (blk_active == BLK_NVME) {
+        kprint("msc: registered as tertiary block_dev (slot ", 44);
+        kprint_num(msc_first_slot);
+        kprint(", ", 2);
+        kprint_num(sectors);
+        kprint(" LBAs x ", 8);
+        kprint_num(blk_bytes);
+        kprintln("B; NVMe primary)", 16);
+        return 0;
+    }
+    if (blk_active == BLK_AHCI) {
+        kprint("msc: registered as tertiary block_dev (slot ", 44);
+        kprint_num(msc_first_slot);
+        kprint(", ", 2);
+        kprint_num(sectors);
+        kprint(" LBAs x ", 8);
+        kprint_num(blk_bytes);
+        kprintln("B; AHCI primary)", 16);
+        return 0;
+    }
+    if (blk_register_usb_ms(sectors, blk_bytes) == 0) {
+        kprint("msc: registered as block_dev (slot ", 35);
+        kprint_num(msc_first_slot);
+        kprint(", ", 2);
+        kprint_num(sectors);
+        kprint(" LBAs x ", 8);
+        kprint_num(blk_bytes);
+        kprintln("B)", 2);
+        xhci_cmos_stamp(0x57, msc_first_slot & 0xFF);
+        return 1;
+    }
+    return 0;
+}
+
+# Read LBA 0 from the first MSC slot and print first 8 bytes — analogous
+# to ahci_read_demo, exercises the READ(10) + bulk-IN data-phase path
+# against the actual device unconditionally. No write side; write demo
+# (LBA-100 sentinel) is gated behind MSC_RW_DEMO compile flag for the
+# same partition-table-safety reason AHCI_RW_DEMO is gated.
+fn msc_read_demo() {
+    if (msc_first_slot == 0) { return 0; }
+    var row = msc_row_addr(msc_first_slot);
+    if (load8(row + 85) == 0) { return 0; }       # capacity not known
+    var blk_bytes = load32(row + 80);
+    if (blk_bytes != 512) {
+        # Non-512-B sector device (e.g., 2048-B optical). Phase 4 demo
+        # assumes 512 for the print line; just skip and let Phase 5+
+        # widen.
+        return 0;
+    }
+    var buf = pmm_alloc();
+    if (buf == 0) { return 0; }
+    if (vmm_is_mapped(buf) == 0) { vmm_map(buf, buf, 0x83); }
+    iommu_register_dma(buf);
+    xhci_zero_page(buf);
+    if (msc_read_lba(msc_first_slot, 0, 0, 1, buf) == 0) {
+        kprintln("msc: READ(10) LBA0 failed", 25);
+        return 0;
+    }
+    kprint("msc: slot ", 10);
+    kprint_num(msc_first_slot);
+    kprint(" LBA0 first 8 bytes:", 20);
+    var i = 0;
+    while (i < 8) {
+        kprint(" ", 1);
+        kprint_num(load8(buf + i));
+        i = i + 1;
+    }
+    kprintln("", 0);
+    return 1;
+}
+
+#ifdef MSC_RW_DEMO
+# WRITE(10) demo — gated, same safety posture as AHCI_RW_DEMO. Writes
+# a "MSC-OK!\0" sentinel to LBA 100, reads it back, byte-compares.
+# Default off in production iron builds: LBA 100 on a USB stick may
+# sit inside a filesystem; sentinel writes there are recoverable but
+# not the right default posture. Enable for QEMU smoke or known-
+# scratch USB devices via `MSC_RW_DEMO=1 ./scripts/build.sh`.
+fn msc_write_demo() {
+    if (msc_first_slot == 0) { return 0; }
+    var row = msc_row_addr(msc_first_slot);
+    if (load8(row + 85) == 0) { return 0; }
+    var blk_bytes = load32(row + 80);
+    if (blk_bytes != 512) { return 0; }
+    var wbuf = pmm_alloc();
+    if (wbuf == 0) { return 0; }
+    if (vmm_is_mapped(wbuf) == 0) { vmm_map(wbuf, wbuf, 0x83); }
+    iommu_register_dma(wbuf);
+    xhci_zero_page(wbuf);
+    var sentinel = "MSC-OK!\0";
+    var j = 0;
+    while (j < 8) { store8(wbuf + j, load8(sentinel + j)); j = j + 1; }
+    if (msc_write_lba(msc_first_slot, 0, 100, 1, wbuf) == 0) {
+        kprintln("msc: WRITE(10) LBA100 failed", 28);
+        return 0;
+    }
+    var rbuf = pmm_alloc();
+    if (rbuf == 0) { return 0; }
+    if (vmm_is_mapped(rbuf) == 0) { vmm_map(rbuf, rbuf, 0x83); }
+    iommu_register_dma(rbuf);
+    xhci_zero_page(rbuf);
+    if (msc_read_lba(msc_first_slot, 0, 100, 1, rbuf) == 0) {
+        kprintln("msc: READ(10) LBA100 readback failed", 36);
+        return 0;
+    }
+    var k = 0;
+    while (k < 8) {
+        if (load8(rbuf + k) != load8(wbuf + k)) {
+            kprintln("msc: LBA100 write-then-read round-trip MISMATCH", 47);
+            return 0;
+        }
+        k = k + 1;
+    }
+    kprintln("msc: LBA100 write-then-read round-trip PASS", 43);
+    return 1;
+}
+#endif

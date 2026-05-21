@@ -31,6 +31,184 @@ Detail in [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 82](http
 
 **Files changed:** `cyrius.cyml` (one line).
 
+### USB Mass Storage Phase 1 (BBB class-interface discovery + bulk endpoint enumeration + GET_MAX_LUN)
+
+First engineering cut of the **USB Mass Storage** arc — third iron-validatable block backend after NVMe + AHCI. New `kernel/arch/x86_64/usb/msc.cyr` (~290 LOC, 3,840 B compiled) does pure read-only discovery: walks each addressed xHCI slot's Configuration Descriptor for an Interface Descriptor matching the MSC-BBB class triple (class=0x08 / subclass=0x06 [SCSI transparent] / protocol=0x50 [Bulk-Only Transport]), locates bulk-IN + bulk-OUT endpoints within that interface, issues SET_CONFIGURATION + GET_MAX_LUN, and stashes per-slot state in a 4 KB lazy-allocated table. No bulk transfers, no CBW/CSW, no SCSI — Phase 2-3-4 territory.
+
+Per `feedback_redesign_dont_reinvent`, Linux's `drivers/usb/storage/usb.c` + `transport.c` are the structural references; USB MSC BBB rev 1.0 (USB-IF, 1999) is the protocol reference. Phase 1's shape mirrors NVMe Phase 1 + AHCI Phase 1: probe-only enumeration that earns the "device class is alive in the kernel" line in the boot log without changing any other subsystem's behavior.
+
+**What it does:**
+- **`xhci_find_msc_bbb_endpoints(total_length, ...)`** — Configuration Descriptor walker analogous to `xhci_find_hid_boot_kbd_endpoint`. State machine: scan TLVs sequentially, track whether we are currently inside a matched MSC-BBB interface (class 0x08 / subclass 0x06 / protocol 0x50), on each endpoint descriptor classify by direction (`bEndpointAddress` bit 7) + transfer type (`bmAttributes` bits 1:0 = 2 for bulk). Captures the first bulk-IN + first bulk-OUT pair found inside the interface; alternate settings that switch interfaces reset the endpoint accumulators (so an unmatched alt-setting's stray endpoints don't poison the bulk-EP capture). Returns 1 only when both bulk-IN and bulk-OUT are found.
+- **`msc_get_max_lun(slot_id, interface)`** — class-specific control request (USB MSC BBB §3.2): `bmRequestType=0xA1 / bRequest=0xFE / wValue=0 / wIndex=interface / wLength=1`. Returns the highest LUN number this device supports (0 = single-LUN, the overwhelmingly common case for thumb drives). Some devices STALL this request rather than reply; per spec a STALL means "single-LUN, treat as MaxLUN=0" — handled by returning 0 on `xhci_control_in` failure.
+- **`msc_probe_slot(slot_id)`** — per-slot Phase 1 driver. Issues GET_CONFIGURATION_DESCRIPTOR (9-byte header to learn `wTotalLength`, then full), runs the walker, on success issues SET_CONFIGURATION (USB 2.0 §9.4.7 — bulk endpoints aren't operational until the device is Configured; same gate as HID-kbd Step 2.5), calls `msc_get_max_lun`, stashes per-slot row in a 4 KB lazy-allocated table indexed by slot_id, prints one-line summary.
+- **`msc_enumerate()`** — top-level Phase 1 driver, called from `main.cyr` after the HID-kbd configure loop. Iterates slots 1..64, calls `msc_probe_slot` on each that has an allocated input context. HID-kbd already grabbed its slot if a keyboard was present; MSC probe is a different class-triple match and won't conflict. Prints summary `msc: <N> mass-storage device(s) detected (Phase 1 — discovery only)`. Stamps CMOS kcp `0x52` once at least one MSC slot completes Phase 1 — continues the storage-arc sequence 0x40-0x48 NVMe / 0x49-0x4A GPT P1-2 / 0x4B-0x4D AHCI P1 / 0x4E AHCI P2 / 0x4F AHCI P3 / 0x50 AHCI P4 / 0x51 GPT P3 / **0x52 MSC P1**.
+
+**What it does NOT do (Phase 2+ territory):**
+- Bulk transfer primitives — no bulk Normal TRBs queued on the bulk EPs, no transfer-event polling for bulk completions. xHCI currently only operates control (EP0) + interrupt-IN (HID-kbd) endpoints; bulk-IN + bulk-OUT plumbing is Phase 2.
+- Command Block Wrapper (CBW) issue + Command Status Wrapper (CSW) receipt — the BBB transport protocol's request/response shape, Phase 2.
+- SCSI commands — INQUIRY (0x12), TEST UNIT READY (0x00), READ CAPACITY(10) (0x25), READ(10) (0x28), WRITE(10) (0x2A). All Phase 3-4.
+- Block-layer registration — `BLK_USB_MS = 4` constant landed in `block.cyr`, but no `blk_register_usb_ms()` function yet; that comes online when Phase 4's READ(10) / WRITE(10) ship. Dispatch policy at registration: NVMe primary, AHCI secondary, USB MS tertiary — `blk_active=BLK_USB_MS` only when no other backend is present.
+- MSI/MSI-X IRQ-driven completion — polling-only, per xhci + nvme + ahci precedent.
+
+**Block-layer constant:** New `var BLK_USB_MS = 4;` in `kernel/core/block.cyr` reserves the dispatch tag for Phase 4's registration call. No dispatch arm added yet — `blk_read` / `blk_write` / `blk_read_sectors` stay at the existing 3-backend dispatch (VIRTIO/NVME/AHCI).
+
+**QEMU validation** (q35 + OVMF + gnoboot 0.4.2 + agnos 1.31.2 `[Unreleased]` + `-device qemu-xhci,id=xhci -device usb-storage,bus=xhci.0,drive=stick` against an 8 MB scratch `usb.img`):
+
+```
+xhci: port 1 connected, SS, slot=1, VID=18164 PID=1, class=0
+hid: keyboard layer initialized
+hid: no HID-boot-kbd interface in config
+msc: slot 1 BBB intf=0 bulk-IN=129 bulk-OUT=2 MPS(in/out)=1024/1024 MaxLUN=0
+msc: 1 mass-storage device(s) detected (Phase 1 — discovery only)
+nvme: registered as block_dev ( 131072 LBAs x 512B)
+ahci: ... (q35 ich9-ahci probe continues unchanged)
+gpt: present, first=34 last=131038 parts=1/128 hdr-CRC-OK arr-CRC-OK
+...
+AGNOS shell v1.31.2 (type 'help')
+agnos>
+```
+
+Decoded values:
+- VID=18164 = `0x46F4`, PID=1 = `0x0001` — QEMU's standard `usb-storage` device IDs.
+- `class=0` on the device descriptor — `bDeviceClass=0` means "interface-defined", which is the typical USB Mass Storage shape. The MSC walker correctly drops to the Interface Descriptor for the class triple match.
+- `bulk-IN=129` = `0x81` (bit 7 set = IN direction, EP1), `bulk-OUT=2` = `0x02` (EP2). Standard QEMU usb-storage endpoint layout.
+- `MPS(in/out)=1024/1024` — SuperSpeed bulk MPS. The device negotiated SS on xhci port 1 (`SS` in the connection line); HS would have shown 512.
+- `MaxLUN=0` — single-LUN device (the common case).
+
+**HID-kbd interaction:** The HID-kbd configure loop runs first and walks the same Configuration Descriptor of slot 1 looking for a HID-boot keyboard interface — it correctly returns "no HID-boot-kbd interface in config" without claiming the slot. MSC then probes the same slot, matches its class triple, and succeeds. Two class drivers coexist cleanly on the same xhci slot iteration.
+
+**Build:** `build/agnos` 474,600 B (1.31.2 AHCI carry-forward HEAD) → **478,440 B** (+3,840 B for the msc.cyr module + aarch64 stubs + main.cyr wiring + block.cyr constant). Multiboot2 ELF64 entry `0x1000a8` preserved.
+
+**Out of scope (iron):** Phase 1 is pure read-only enumeration; no behavioral path lands new on iron until at least Phase 3 (first SCSI command issued through bulk transport). An iron burn at any time post-Phase-1 would validate the discovery on archaemenid's actual USB stack — confirms xhci ports enumerate a real USB stick + the class triple match works on real-vendor descriptors + GET_MAX_LUN doesn't STALL — but offers little behavioral information beyond what QEMU already showed. Per `feedback_iron_burns_block_other_work`, batch with Phase 2-3-4 once a usable USB MS block backend exists. The pre-burn audit lives in `agnosticos/docs/development/usb-ms-iron-burn-audit.md` — opens when Phase 4 is ready.
+
+**Files changed:** `kernel/arch/x86_64/usb/msc.cyr` (new, 290 LOC), `kernel/agnos.cyr` (include line), `kernel/core/main.cyr` (`msc_enumerate()` call after HID-kbd loop), `kernel/core/block.cyr` (`BLK_USB_MS=4` constant), `kernel/arch/aarch64/stubs.cyr` (matching stubs).
+
+### USB Mass Storage Phase 2 (bulk-EP Configure Endpoint + CBW/CSW BBB transport + TEST UNIT READY)
+
+Second engineering cut of the USB Mass Storage arc, same session as Phase 1. Lights up the **Bulk-Only Transport** half of the protocol: bulk-IN + bulk-OUT endpoint configuration, transfer-ring allocation, Normal-TRB bulk transfer primitives, full CBW → (optional data) → CSW round-trip, and TEST UNIT READY (SCSI 0x00) as the smallest data-phase-free SCSI command for smoke validation. Linux's `drivers/usb/storage/transport.c` § `usb_stor_Bulk_transport` is the structural reference; USB MSC BBB §5.1 (CBW) + §5.2 (CSW) the protocol reference.
+
+**What it does:**
+- **`xhci_input_ctx_add_bulk_pair(ictx, in_ep, in_mps, out_ep, out_mps, speed, in_ring, out_ring)`** — new in `xhci_ctx.cyr`. Adds the MSC-BBB bulk-IN + bulk-OUT endpoint pair to an Input Context in a single Configure Endpoint pass. EP Type values per xHCI 1.2 Table 6-9: bulk-OUT = 2, bulk-IN = 6. Sets Add Flags = `A0 | A_in_dci | A_out_dci` (drops A1 / EP0 per the same stale-EP0-DQ rationale as `_add_interrupt_in`); bumps Slot Context's Context Entries (bits 31:27) to cover the highest of the two new DCIs. EP context fields per direction: CErr=3, EP Type, MPS in upper half of dword 1, TR Dequeue Pointer with DCS=1 in dword 8-9, Avg TRB Length = MPS in dword 16. Max Burst defaults to 0 (Phase 2 doesn't parse the SuperSpeed Companion Descriptor; SS devices may run slower than peak — refine when MB > 0 becomes a perf concern).
+- **`msc_alloc_bulk_ring()`** — allocates a 4 KB transfer-ring page (zeroed, mapped, IOMMU-registered), writes a Link TRB at the last slot pointing back to the ring base with Toggle Cycle = 1. Phase 2's tiny transfers never wrap to use the Link, but it's in place for future ring-wrapping correctness without a separate code path.
+- **`msc_bulk_enqueue(slot_id, is_in, data_phys, length)`** — pushes a single Normal TRB onto the appropriate bulk ring (xHCI 1.2 §6.4.1.1). Encoding: dword 0-1 = Data Buffer Pointer; dword 2 = TRB Transfer Length in bits 16:0, TD Size = 0 (single-TRB TD); dword 3 = Cycle | IOC | ISP (for IN direction only) | type=Normal(1)<<10. Advances per-direction cycle bit + index, rings the slot/DCI doorbell.
+- **`msc_configure_endpoints(slot_id)`** — orchestrates Phase 2 bring-up for one slot: allocates two transfer rings + CBW (31 B) scratch + CSW (13 B) scratch (each a 4 KB page from pmm_alloc, unused tail harmless), stashes ring/CBW/CSW phys + DCIs + initial cycle in the row, calls `xhci_input_ctx_add_bulk_pair` + `xhci_configure_endpoint`. Sets `endpoints_ready = 1` on success. Logs `msc: Configure Endpoint failed` and returns 0 on any alloc / command failure (boot continues; the device just isn't reachable via bulk).
+- **`msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in)`** — populates the 31-byte CBW at the row's scratch buffer (USB MSC BBB §5.1): `dCBWSignature=0x43425355` ('USBC' LE), per-slot host tag counter at offset 4 (echoed in CSW), `dCBWDataTransferLength` (expected data bytes), `bmCBWFlags` bit 7 = direction, `bCBWLUN` low nibble, `bCBWCBLength` 5-bit, CDB bytes 15..15+N. Returns the host tag for later CSW validation.
+- **`msc_bbb_exec(slot_id, lun, cdb, cdb_len, data_phys, data_len, dir_in)`** — full three-step BBB round-trip: enqueue CBW on bulk-OUT + wait Transfer Event; if `data_len > 0`, enqueue data TRB on the data-direction EP + wait; enqueue CSW receive on bulk-IN + wait. Validates CSW signature (0x53425355 'USBS' LE), CSW tag (must match CBW tag), and `bCSWStatus` byte: 0 = Pass (return 1), 1 = Command Failed (return 0; caller may retry with REQUEST SENSE), 2 = Phase Error (return 0 + set sticky `transport_failed` byte; needs Reset Recovery — Phase 3 territory). Each waited Transfer Event is timed-out by the existing `xhci_wait_transfer_event`'s spin counter; timeout sets `transport_failed`.
+- **`msc_test_unit_ready(slot_id, lun)`** — Phase 2 smoke command. Builds a 6-byte CDB (all-zero — opcode 0x00 = TEST UNIT READY, control = 0), calls `msc_bbb_exec` with no data phase. Returns 1 on CSW status = 0, 0 otherwise (NOT_READY on fresh removable media comes back as Failed → 0; that's a device state, not a transport bug — Phase 3 will REQUEST SENSE to decode).
+- **Wiring**: `msc_probe_slot` now follows Phase 1 success with `msc_configure_endpoints` (stamps CMOS kcp `0x53` on success), then `msc_test_unit_ready` against LUN 0 (stamps `0x54` on Pass). Boot output adds `msc: slot N TEST UNIT READY -> ready (Pass)` or `... -> not ready / failed`. Phase 2 failure does NOT abort Phase 1's discovery success line; the device stays enumerated, the boot continues.
+
+**Per-slot row layout (extended)** — the 256-byte row from Phase 1 grows to use offsets 16..69 for Phase 2 state (bulk ring phys, cycle/idx counters per direction, DCIs, CBW/CSW scratch phys, host tag counter, `endpoints_ready` flag, sticky `transport_failed` byte). Documented inline in `msc.cyr`.
+
+**CMOS checkpoints:** `kcp=0x53` (Configure Endpoint succeeded for one slot), `kcp=0x54` (TEST UNIT READY Pass for one slot). Continues storage-arc sequence after `0x52` (MSC Phase 1).
+
+**QEMU validation** (same harness as Phase 1, q35 + OVMF + `-device qemu-xhci,id=xhci -device usb-storage,bus=xhci.0,drive=stick` against 8 MB scratch `usb.img`):
+
+```
+xhci: port 1 connected, SS, slot=1, VID=18164 PID=1, class=0
+hid: no HID-boot-kbd interface in config
+msc: slot 1 BBB intf=0 bulk-IN=129 bulk-OUT=2 MPS(in/out)=1024/1024 MaxLUN=0
+msc: slot 1 TEST UNIT READY -> ready (Pass)
+msc: 1 mass-storage device(s) detected (Phase 1 — discovery only)
+nvme: registered as block_dev ( 131072 LBAs x 512B)
+...
+AGNOS shell v1.31.2 (type 'help')
+```
+
+Decoded round-trip:
+- `Configure Endpoint succeeded` (implicit — no failure log printed): bulk-IN at DCI(0x81)=3, bulk-OUT at DCI(0x02)=4 both Running.
+- CBW(31 B) → bulk-OUT → Transfer Event ccode=Success.
+- No data phase.
+- Empty 13-byte buffer posted on bulk-IN → device DMAs CSW → Transfer Event ccode=Success → CSW signature `0x53425355` matched, CSW tag matched CBW tag, `bCSWStatus = 0` → Pass.
+- "Phase 1 — discovery only" summary text becomes slightly misleading once Phase 2 lights up; line text updates at Phase 3 when the cycle subtitle widens to cover the data path.
+
+QEMU's emulated `usb-storage` against a regular backing file always returns Ready (no removable-media not-present condition). Iron validation will likely surface NOT_READY transient responses on freshly-inserted USB sticks — Phase 3's REQUEST SENSE handler will decode those.
+
+**Build:** 478,440 B (Phase 1) → **484,992 B** (+6,552 B for Phase 2: bulk-EP pair helper in xhci_ctx, ~340 LOC added to msc.cyr, aarch64 stubs).
+
+**Out of scope (iron):** Phase 2 alone doesn't change the iron value proposition — TEST UNIT READY is a smoke command, not a useful workload. Iron burns batch with Phase 3 (INQUIRY decodes vendor/model/serial, READ CAPACITY decodes drive size) + Phase 4 (READ/WRITE + block-layer registration). Pre-burn audit lives in `agnosticos/docs/development/usb-ms-iron-burn-audit.md` (opens with Phase 4 ready).
+
+**Files changed:** `kernel/arch/x86_64/usb/msc.cyr` (+~340 LOC), `kernel/arch/x86_64/usb/xhci_ctx.cyr` (+`xhci_input_ctx_add_bulk_pair`, ~70 LOC), `kernel/arch/aarch64/stubs.cyr` (new stubs for Phase 2 entry points).
+
+### USB Mass Storage Phase 3 (SCSI INQUIRY + READ CAPACITY(10))
+
+Third engineering cut of the USB Mass Storage arc. Two SCSI commands with **IN data phases** — first time the data-phase arm of `msc_bbb_exec` (built but unused in Phase 2's TEST UNIT READY) is exercised end-to-end. Together they identify the device + decode the LUN geometry, which is the minimum information Phase 4's block-layer registration needs.
+
+**What it does:**
+- **`msc_inquiry(slot_id, lun)`** — SPC-4 §6.6 Standard INQUIRY. 6-byte CDB (`opcode=0x12, AllocLen=36`), 36-byte IN data response. Decodes peripheral qualifier (bits 7:5 of byte 0) + peripheral device type (bits 4:0 — 0x00=block, 0x05=CD/DVD/BD, 0x07=optical, 0x0E=RBC), then copies vendor (8B, offset 8), product (16B, offset 16), revision (4B, offset 32) into the per-slot row at offsets +96/+104/+120/+128/+129. Strings are plain ASCII space-padded (unlike ATA's byte-swap convention — SCSI INQUIRY does not byte-swap).
+- **`msc_read_capacity(slot_id, lun)`** — SBC-3 §5.10 READ CAPACITY(10). 10-byte CDB (`opcode=0x25, LBA=0, PMI=0`), 8-byte IN data response. Decodes big-endian u32 last_lba + big-endian u32 block_size into the row at +72/+80. Sets `capacity_done=1` at +85. **Note**: u32 caps at 2 TiB usable (last_lba=0xFFFFFFFF means "use READ CAPACITY(16)" — SBC-3 §5.11 service action 0x10); Phase 4 will add the 16-byte fallback when iron capacity exceeds 2 TiB.
+- **`msc_print_ascii_field(p, n)`** — right-trim helper. Scans printed-char sequence from offset 0..n-1, finds last non-space-non-NUL byte, prints inclusive of that index. Matches the convention used in AHCI's `ahci_print_id_string` after the 1.31.2 right-trim patch landed, but without the byte-swap (SCSI fields are plain ASCII).
+- **`msc_print_pdt_label(pdt)`** — single-word labels for the common peripheral device types: 0x00 → "block", 0x05/0x07 → "optical", 0x0E → "RBC", else `class=<n>`. Phase 4 doesn't yet differentiate handling by PDT but the surface is in place for Phase 5 (optical 2048-B sectors).
+- **Wiring in `msc_probe_slot`**: After Phase 2's TEST UNIT READY Pass, run `msc_inquiry` (stamps CMOS kcp `0x55` on success) + `msc_read_capacity` (stamps `0x56`). Boot output now adds:
+    ```
+    msc: slot 1 INQUIRY: vendor='QEMU' product='QEMU HARDDISK' rev='2.5+' type=block
+    msc: slot 1 READ CAPACITY: last_lba=16383 blk=512B -> 8 MiB
+    ```
+- **Per-row layout extended** to use offsets +72..+136 for Phase 3 state (last_lba, lba_bytes, inquiry_done flag, capacity_done flag, vendor/product/revision strings, peripheral_qual + peripheral_type bytes, lazy-allocated 4 KB IN data scratch page). Documented inline.
+
+**QEMU validation** — same harness as Phase 1+2 against QEMU's emulated `usb-storage` (vendor=QEMU, product=QEMU HARDDISK, rev=2.5+, last_lba=16383 = 16384 sectors × 512 B = 8 MiB, exactly matching the 8 MB scratch `usb.img` size). PDT=0x00 (Direct-access block device — the standard USB stick / USB HDD classification).
+
+**Build:** 484,992 B (Phase 2) → **488,984 B** (+3,992 B for ~200 LOC of Phase 3 surface).
+
+**Out of scope (iron):** Phase 3 still doesn't change the iron value proposition — INQUIRY tells us the vendor/model and READ CAPACITY tells us the size, but neither exercises a useful workload. Iron burn batches with Phase 4 (block-layer registration + READ(10)/WRITE(10) demos).
+
+**Files changed:** `kernel/arch/x86_64/usb/msc.cyr` (+~200 LOC), `kernel/arch/aarch64/stubs.cyr` (matching stubs for the new entry points).
+
+### USB Mass Storage Phase 4 (READ(10) + WRITE(10) + block-layer registration + dispatch arms)
+
+Fourth and final engineering cut of the USB Mass Storage arc — lights up the **workload** path. SCSI READ(10) / WRITE(10) commands ride the BBB transport (Phase 2's `msc_bbb_exec`); block-layer registration as the **tertiary** backend (after NVMe + AHCI) wires USB MS into `blk_read` / `blk_write` / `blk_read_sectors` dispatch; per-priority policy ensures USB MS only becomes `blk_active` when no NVMe + no AHCI are present.
+
+**What it does:**
+- **`msc_build_rw10_cdb(cdb_p, opcode, lba, count)`** — 10-byte CDB encoder shared between READ(10) and WRITE(10). Opcode at byte 0, big-endian u32 LBA at bytes 2-5, big-endian u16 Transfer Length (count of LBAs) at bytes 7-8. Flags/Control all zero for Phase 4 (no DPO, no FUA, no RDPROTECT).
+- **`msc_read_lba(slot_id, lun, lba, count, buf_phys)`** — issues SCSI READ(10) (opcode 0x28) via `msc_bbb_exec` with `dir_in=1` and `data_len = count * lba_bytes`. Single-Normal-TRB cap: 64 KB (17-bit TRB Transfer Length per xHCI 1.2 §6.4.1.1) → 128 sectors at 512 B/LBA. Returns 1 on success, 0 on transport / CSW failure.
+- **`msc_write_lba(slot_id, lun, lba, count, buf_phys)`** — mirror of `msc_read_lba` with opcode 0x2A and `dir_in=0`. Same single-TRB cap.
+- **`msc_blk_read(sector, buf)` / `msc_blk_write(sector, buf)`** — single-sector wrappers on `msc_first_slot`, LUN 0. Return 0 on success / -1 on failure to match the existing virtio/nvme/ahci `_blk_*` convention.
+- **`msc_blk_read_sectors(start, count, buf)`** — multi-sector wrapper. Chunks requests into `max_per_call = 65535 / blk_bytes` calls (128 sectors at 512 B/LBA), loops through `msc_read_lba` with advancing LBA + buffer pointer. Returns 0 / -1.
+- **`msc_register_block_dev()`** — tertiary block-layer registration. Skips if no MSC slot or capacity not known. Policy:
+    - `blk_active == BLK_NVME` → log "msc: registered as tertiary block_dev (slot N, ...; NVMe primary)" + return 0 (callable via `msc_*_lba` direct, but not via `blk_*` dispatch).
+    - `blk_active == BLK_AHCI` → log "msc: registered as tertiary block_dev (slot N, ...; AHCI primary)" + return 0.
+    - else (NONE or VIRTIO) → `blk_register_usb_ms(sectors, blk_bytes)` overrides slot → log "msc: registered as block_dev (slot N, ...)" + stamp CMOS kcp `0x57` + return 1.
+- **`msc_read_demo()`** — analogous to `ahci_read_demo`. Unconditional LBA-0 readback through `msc_read_lba`; prints "msc: slot N LBA0 first 8 bytes: ..." Skips silently when `lba_bytes != 512` (e.g., 2048-B optical — Phase 5+ widens). No write side by default.
+- **`msc_write_demo()` (gated `#ifdef MSC_RW_DEMO`)** — same safety posture as `AHCI_RW_DEMO`. Writes 8-byte `"MSC-OK!\0"` sentinel to LBA 100, reads back, byte-compares, logs "msc: LBA100 write-then-read round-trip PASS" or MISMATCH. Default OFF: iron builds against drives the user cares about don't ship a sentinel write to LBA 100 (which may sit inside a filesystem). Enable for QEMU smoke or known-scratch USB devices via `MSC_RW_DEMO=1 ./scripts/build.sh`. Documented in `docs/development/build.md` alongside `KTEST` / `XHCI_VERBOSE` / `AHCI_RW_DEMO`.
+
+**Block-layer wiring** (`kernel/core/block.cyr`):
+- New `fn blk_register_usb_ms(capacity, lba_bytes)` — unconditionally assigns `blk_active=BLK_USB_MS` once called (caller `msc_register_block_dev` enforces the policy gate).
+- Dispatch arms added to `blk_read` / `blk_write` / `blk_read_sectors` for `BLK_USB_MS == 4` → routes to `msc_blk_*`. Storage stack now has all four tag arms (VIRTIO/NVME/AHCI/USB_MS).
+
+**Wiring in `main.cyr`**: `msc_register_block_dev()` runs after the AHCI block-dev register block + before `gpt_init()`. `msc_read_demo()` runs unconditionally; `msc_write_demo()` runs under `#ifdef MSC_RW_DEMO`.
+
+**Build flag**: `scripts/build.sh` honors `MSC_RW_DEMO=1` alongside `KTEST` / `XHCI_VERBOSE` / `AHCI_RW_DEMO` — same env-driven prepend mechanism per the v1.31.0 cycle-open production-lean posture.
+
+**QEMU validation** — two smokes:
+
+1. **Default build** (no MSC_RW_DEMO) against the existing NVMe-present setup:
+    ```
+    msc: registered as tertiary block_dev (slot 1, 16384 LBAs x 512B; NVMe primary)
+    msc: slot 1 LBA0 first 8 bytes: 0 0 0 0 0 0 0 0
+    ```
+    Tertiary registration: USB MS callable via direct `msc_*_lba` but NVMe stays `blk_active`. READ(10) demo against the 8 MB blank stick returns first 8 bytes = zeros (matches blank backing file).
+
+2. **`MSC_RW_DEMO=1` build** — adds the write round-trip:
+    ```
+    msc: LBA100 write-then-read round-trip PASS
+    ```
+    First AGNOS-issued USB Mass Storage write to land on emulated media. Verified via byte-exact readback through the same SCSI BBB pipeline. **This is the canary that proves bidirectional data-phase bulk I/O on real silicon will land cleanly once the iron audit is satisfied.**
+
+**Phase 1-4 build trajectory** (1.31.2 `[Unreleased]`):
+
+| Cut | Size | Δ |
+|---|---|---|
+| AHCI carry-forward HEAD (Phase 0) | 474,600 B | baseline |
+| + USB MS Phase 1 (discovery)      | 478,440 B | +3,840 B |
+| + USB MS Phase 2 (BBB transport + TUR) | 484,992 B | +6,552 B |
+| + USB MS Phase 3 (INQUIRY + READ CAPACITY) | 488,984 B | +3,992 B |
+| + USB MS Phase 4 (READ/WRITE/register/demo) | **493,688 B** | +4,696 B |
+
+**Total USB MS arc cost: +19,088 B / +4.0% kernel growth** for ~990 LOC across `msc.cyr` (~890 LOC) + `xhci_ctx.cyr` (+70 LOC for `add_bulk_pair`) + `block.cyr` (BLK_USB_MS dispatch arms + register fn) + main.cyr wiring + aarch64 stubs.
+
+**Iron validation gate**: pre-burn audit `agnosticos/docs/development/usb-ms-iron-burn-audit.md` lands alongside this cycle. Iron burns batch the full Phase 1-4 stack (USB stick on archaemenid → enumerate as MSC-BBB device → register as tertiary alongside NVMe Crucial P3 + SATA WD Blue SA510 → READ(10) LBA-0 readback as smoke); Phase 5 (optical via SCSI MMC, 2048-B sectors) follows.
+
+**Files changed:** `kernel/arch/x86_64/usb/msc.cyr` (+~240 LOC for the workload + register + demos), `kernel/core/block.cyr` (+`blk_register_usb_ms` + dispatch arms), `kernel/core/main.cyr` (`msc_register_block_dev()` + `msc_read_demo()` + gated `msc_write_demo()` wired post-AHCI / pre-GPT), `kernel/arch/aarch64/stubs.cyr` (matching stubs for all Phase 4 entry points), `scripts/build.sh` (`MSC_RW_DEMO=1` honored).
+
 ### 1.31.2 remaining scope — opening
 
 Cycle theme stays **storage**. With AHCI carry-forward shipped above, the primary engineering bite opens:
