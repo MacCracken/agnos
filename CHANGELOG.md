@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### 1.31.2 cycle scope — opening
+
+Cycle theme stays **storage**. Primary scope: **USB Mass Storage (Bulk-Only Transport + SCSI READ(10)/WRITE(10))** as the third iron-validatable block backend, extending the xHCI investment. Secondary scope: **AHCI iron carry-forward** from Attempt 81 (1.31.1):
+
+- **Post-RW IDENTIFY hang in `ahci_register_block_dev`** — second IDENTIFY after `ahci_rw_demo` times out on real silicon (`PxCI stuck`), AHCI silently unregisters from the block layer. Hypothesis stack ranked by Linux/spec prior-art (no letter ladder per `feedback_redesign_dont_reinvent`): (1) PxIS not W1C-cleared between commands per AHCI 1.3 §5.6.2; (2) PxCI/PxSACT slot-tag quiescence; (3) WD SA510 firmware-specific BSY=0/DRQ=0 re-check post-DMA-write (analogous to `libata-eh` quirk paths); (4) IDENTIFY-buffer DMA-region reuse hazard. Consult Linux `drivers/ata/libahci.c` § `ahci_qc_issue` + `ahci_handle_port_interrupt` then stack all four behavioral diffs into one burn.
+- **ATA-string trailing-space drag** (cosmetic) — IDENTIFY model/serial/fw are space-padded fixed-width per ATA8-ACS § 7.16.7; AGNOS's `ahci_print_id_string` byte-swaps without right-trimming. Linux's `ata_id_c_string` (drivers/ata/libata-core.c) right-trims to the last non-space byte. AGNOS should match.
+- **`AHCI_RW_DEMO` compile gate** — split `ahci_rw_demo` into a read-only base (`ahci_read_demo` — always on) and a write-extension (`ahci_write_demo` — `#ifdef AHCI_RW_DEMO`). Pattern matches `KTEST` / `XHCI_VERBOSE` per the 1.31.0 cycle-open production-lean baseline. Land before the next AHCI iron burn against any drive the user cares about. (1.31.1's burn was acceptable because LBA 5 of the WD Blue is presumed-empty GPT partition-entry region recoverable via `sgdisk --load-backup`, but this is a "got away with it" outcome, not the right default posture.)
+
+Detail in [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 81](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) and [`agnosticos/docs/development/state.md` § AHCI iron carry-forward](https://github.com/MacCracken/agnosticos/blob/main/docs/development/state.md).
+
+**1.31.3** continues to slot **ext2 read-only**.
+
+---
+
+## [1.31.1] — 2026-05-20 (Storage cycle continuation — GPT Phase 1-3 + AHCI/SATA Phase 1-4 driver + iron debut on WD Blue SA510 SATA SSD)
+
 ### GPT Phase 1 (header probe + decode + first-4KB partition array walk)
 
 First engineering cut of the 1.31.1 storage-arc continuation. New `kernel/core/gpt.cyr` (~180 LOC) consumes the existing block-dispatch layer (`blk_read` / `blk_read_sectors`) to parse a GUID Partition Table at LBA 1. Per `feedback_redesign_dont_reinvent`, UEFI § 5.3.2 + Linux's `block/partitions/efi.c` are the structural references — port the shape, redesign to Cyrius conventions.
@@ -254,7 +270,54 @@ Both CRCs validate (`hdr-CRC-OK arr-CRC-OK`) — primary header path, no backup 
 
 **Build:** 470,664 B (AHCI Phase 4) → **475,096 B** (+4,432 B for gpt.cyr CRC + classifier + Phase 3 wiring in `gpt_init`).
 
-**1.31.1 cycle status:** all planned phases landed under `[Unreleased]`. Iron-burn audit drafted at [agnosticos `docs/development/ahci-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ahci-iron-burn-audit.md) — identifies the LBA-5 sentinel write in `ahci_rw_demo` as the only iron-write hazard, proposes an `AHCI_RW_DEMO` compile-gate mitigation matching the existing `KTEST` / `XHCI_VERBOSE` pattern (default off; QEMU smoke retained via `AHCI_RW_DEMO=1 sh scripts/build.sh`). Closing handoff: §4-patch decision + `[Unreleased]` → `[1.31.1] — 2026-05-20` rename + tag at the user's discretion. Then **1.31.2** opens with USB Mass Storage; **1.31.3** with ext2.
+### AHCI/SATA iron debut — Attempt 81 on archaemenid (WD Blue SA510 2.5" 2 TB SATA SSD)
+
+Second iron debut of the 1.31.1 storage arc, same session as the NVMe debut (Attempt 80, recorded under [1.31.0]). Full driver lit up first-iron-try against the real WD Blue SA510 attached to archaemenid's SATA bay — controller bring-up, IDENTIFY decode, AND a real-platter bidirectional DMA round-trip all worked. Partial caveat: a follow-up IDENTIFY in the registration path timed out, and the §4 `AHCI_RW_DEMO` mitigation drafted in the iron-burn audit was deferred for this burn.
+
+**Iron evidence shape (Attempt 81 boot log, abridged):**
+
+```
+ahci: found at 4240441344, version=1.769
+ahci: NP=1 NCS=32 ISS=3 SAM=1 SSS=0 SNCQ=1 S64A=1
+ahci: GHC=2147483648 PI=1
+ahci: port 0 DET=3 SPD=3 SIG=257 (SATA)
+ahci: port 0 initialized (CL @ 5988352, FIS @ 5992448)
+ahci: port 0 model='WD Blue SA510 2.5 2TB                            ' serial='24313QD00663            ' fw='5304 00WD'
+ahci: port 0 LBA48=3907029168 sectors (1907729 MiB)
+ahci: port 0 LBA0 first 8 bytes: 146 20 0 0 0 111 111 116
+ahci: port 0 LBA5 write-then-read round-trip PASS
+ahci: port 0 IDENTIFY: timeout (PxCI stuck)
+gpt: present, first=34 last=3907029134 parts=2/128 hdr-CRC-OK arr-CRC-OK
+...
+AGNOS shell v1.31.1 (type 'help')
+```
+
+**What worked on real silicon:**
+- BAR5 at real-PCIe address `0xFCDA0000` (AMD FCH AHCI placement) — UC remap clean.
+- AHCI 1.3 spec port spin-up sequence (ST=0 → CR=0 → FRE=0 → FR=0 → CLB/FB program → SERR clear → FRE=1 → FR=1 → SUD=1 → BSY=DRQ=0 → ST=1 → CR=1) completed against firmware-handoff state from gnoboot's UEFI exit.
+- ISS=3 (Gen3 6 Gbps) on iron vs ISS=1 (Gen1 1.5 Gbps) in QEMU — first iron-rate validation.
+- First IDENTIFY DEVICE returned full 512-byte metadata: model `WD Blue SA510 2.5 2TB`, serial `24313QD00663`, firmware `5304 00WD`, LBA48=3907029168 sectors (≈ 2 TB). ATA byte-swap working on non-QEMU.
+- READ DMA EXT (0x25) read LBA 0 returning real disk content (`146 20 0 0 0 111 111 116` — `0x92 0x14 …` followed by ASCII `oot`, likely the tail of a previous Linux install's GRUB-stage1 boot sector).
+- **WRITE DMA EXT (0x35) succeeded at LBA 5 with a real DMA payload landing on the platter** — first AGNOS-issued disk write to land on physical silicon. Re-read at LBA 5 byte-identical → bidirectional DMA confirmed.
+
+**What didn't:**
+- Second IDENTIFY in `ahci_register_block_dev` (capacity refresh) hung in the PxCI-completion poll → function returned 0 → AHCI did NOT register as secondary block_dev. Boot continued cleanly because GPT/VFS/shell consumers all use `blk_active=BLK_NVME`.
+
+**§4 mitigation deferred for this burn.** Full `ahci_rw_demo` (including the LBA-5 sentinel write) ran against the WD Blue. Per the audit's §3 analysis, LBA 5 sits inside the GPT partition-entry array at entries 12-15 — the WD's partition count is not enumerated here (GPT ran on NVMe per the dispatch policy), so the sentinel either replaced empty entries with garbage (recoverable via `sgdisk --load-backup` from the disk's tail backup array) or destroyed up to 4 real entries (same recovery path). **Partition DATA (LBA 34+) was not touched.** The `AHCI_RW_DEMO` compile gate moves to 1.31.2 scope.
+
+**ATA-string trailing-space drag** is visible in the log above: model / serial / firmware fields print with trailing whitespace because `ahci_print_id_string` doesn't right-trim. ATA8-ACS § 7.16.7 fixes those fields as space-padded fixed-width; Linux's `ata_id_c_string` (libata-core.c) right-trims. Patch deferred to 1.31.2 scope alongside the IDENTIFY-timeout investigation.
+
+**Status against the iron-burn audit's success rubric (`ahci-iron-burn-audit.md` § 7):** PASS-WITH-CAVEAT — matches the "Partial — vendor-specific quirk" path (AMD FCH AHCI + WD SA510 combination exposed a state-reset gap absent from q35 ich9-ahci); does NOT match the "Failure" path (no hang, no triple-fault, kernel walked to shell). The "Full success" rubric was missed by a single line — the post-write IDENTIFY timeout means "no new diagnostic letters or hypotheses needed" isn't cleared.
+
+**Contrast with the xHCI arc** continues to compound: AHCI ported from Linux's `libahci.c` to Cyrius conventions per `feedback_redesign_dont_reinvent` lit up first-iron-try (modulo the post-RW IDENTIFY hang). xHCI took 5 weeks / 19 iron attempts / 9 letter codes before clearing on the same iron — the consultation-not-first-principles posture remains the operational difference.
+
+Detail in [agnosticos `docs/development/iron-nuc-zen-log.md` § Attempt 81](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md). Photo: [`iron-nuc-zen-photos/attempt-81-ahci-iron-debut-wd-blue-sa510.jpg`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-photos/attempt-81-ahci-iron-debut-wd-blue-sa510.jpg).
+
+### 1.31.1 cycle close
+
+All planned engineering phases (GPT 1-3, AHCI/SATA 1-4) landed + both iron debuts (NVMe under [1.31.0], AHCI under this tag) closed in a single session 2026-05-20. Two follow-up surfaces (`post-RW IDENTIFY hang`, ATA-string right-trim) plus one deferred mitigation (`AHCI_RW_DEMO` compile gate) carry forward into **1.31.2**, which opens with USB Mass Storage as primary scope. **1.31.3** continues to slot ext2 read-only.
+
+**Build trajectory through 1.31.1:** 441,056 B (1.31.0 NVMe Phase 5 baseline) → 441,176 B (GPT P1) → 443,760 B (GPT P2) → 447,568 B (AHCI P1) → 455,888 B (AHCI P2) → 463,112 B (AHCI P3) → 470,664 B (AHCI P4) → **475,096 B** (GPT P3). Total cycle delta **+34,040 B / +7.7%** for two new device-class drivers + complete GPT layer + ~1,700 LOC engineering.
 
 ## [1.31.0] — 2026-05-20 (NVMe arc — Phase 1-5 driver + block-layer dispatch + iron debut on Crucial P3 2TB; cycle-open production-lean — KTEST + XHCI_VERBOSE compile gates + FB-absent guard + `docs/development/build.md`)
 
