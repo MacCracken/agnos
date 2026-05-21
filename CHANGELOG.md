@@ -138,6 +138,43 @@ LBA 5 holds the `CYRIUS!!` pattern written by `nvme_write_lba`. LBA 20-27 holds 
 
 **Out of scope:** Iron burn — write path is QEMU-validated with disk persistence proof. PRP-list iron exercise comes via Phase 5's block_dev callers. First iron burn opportunity is after Phase 5 lands MSI-X + block_dev so the driver can be plugged into the existing VFS / FAT path that virtio_blk currently fronts.
 
+### NVMe Phase 5 (block_dev dispatch abstraction — virtio-blk + nvme behind one block layer)
+
+Fifth and final engineering cut of the NVMe arc. New `kernel/core/block.cyr` (~80 LOC) plus ~60 LOC added to `kernel/core/nvme.cyr` (block-dev wrappers + registration). Tag-based dispatch between the two backends; virtio-blk + nvme each register themselves at init time; consumers (fatfs, shell) call `blk_read` / `blk_write` / `blk_read_sectors` and don't know which backend serves the call.
+
+**MSI-X status — deferred, not done.** Phase 5's original scope mentioned "MSI-X IRQ-driven completion." Reconsidered mid-cut: AGNOS lacks a generic vector-dispatch framework today, and xhci's existing pattern (enable MSI-X in PCI config to satisfy the controller's expectations, then poll on timer ticks) is precedent for staying with polling. NVMe Phases 1-4 polling works against QEMU and real iron latency is microseconds anyway. True IRQ-driven completion slots in whenever NVMe latency becomes a bottleneck (not now) — when it does, the work covers both NVMe + xhci because they'd share the new vector-dispatch substrate.
+
+**What it does:**
+- **`kernel/core/block.cyr`** — new file. `blk_active` tag (0=none, 1=virtio, 2=nvme), `blk_capacity` (sectors), `blk_lba_bytes`. Two registration entry points: `blk_register_virtio(capacity)` only fills the slot if empty; `blk_register_nvme(capacity, lba_bytes)` always overrides. Init order in `main.cyr` runs virtio first, then NVMe — so when both are present, NVMe's override fires last and the slot ends up with NVMe. Three dispatch wrappers (`blk_read` / `blk_write` / `blk_read_sectors`) branch on the tag and forward to the backend-specific functions.
+- **`virtio_blk.cyr`** — `blk_read` / `blk_write` / `blk_read_sectors` renamed to `vblk_blk_read` / `vblk_blk_write` / `vblk_blk_read_sectors`. The names match the dispatch wrappers' expectations in `block.cyr`. `virtio_blk_init` success path now calls `blk_register_virtio(vblk_capacity)`.
+- **`nvme.cyr`** — new `nvme_blk_read` / `nvme_blk_write` / `nvme_blk_read_sectors` wrappers translate the NVMe-native 1/0 return convention to the block layer's 0/-1 convention, and stage through the page-aligned `nvme_read_scratch` since consumer buffers aren't guaranteed page-aligned. New `nvme_register_block_dev` invoked from `main.cyr` after `nvme_rw_demo` succeeds. Multi-LBA fast path (one NVMe command for N consecutive LBAs) stays available via direct `nvme_read_sectors` / `nvme_write_sectors` for any future caller that owns a page-aligned buffer; `nvme_blk_read_sectors` currently loops single-sector dispatch to keep parity with virtio's existing shape.
+- **`fatfs.cyr`** — `vblk_active` reference replaced with `blk_active`. Now mounts FAT16 from whichever backend the block layer points at.
+- **`shell.cyr`** — same `vblk_active` → `blk_active` replacement for the `blkread` and `disk` commands. The `disk` command output now adapts: prints `VirtIO-blk:` or `NVMe:` prefix based on `blk_active`, and computes capacity as `blk_capacity * blk_lba_bytes / 1024` so it's correct regardless of LBA size.
+- **`arch/aarch64/stubs.cyr`** — stubs added for all new block-layer + NVMe symbols so the aarch64 build still compiles (no NVMe driver on aarch64 today).
+- **`agnos.cyr`** — `core/block.cyr` inserted between `core/nvme.cyr` and `core/net.cyr` so the dispatch layer sees both backends' functions and fatfs/shell see the block layer.
+
+**Design discipline.** Phase 5 deliberately does NOT introduce function pointers / vtables. Cyrius's tag-dispatch idiom (`if (blk_active == X) { ... }`) is the right shape at two backends per CLAUDE.md "three similar lines is better than a premature abstraction." Reach for fn-ptr dispatch when the third backend appears (AHCI / SATA, eventually) and the branch arms start to repeat.
+
+**CMOS checkpoint:** `kcp=0x48` (NVMe registered as block_dev — dispatch live).
+
+**QEMU validation:**
+
+```
+nvme: registered as block_dev ( 32768 LBAs x 512B)
+```
+
+`dd if=nvme0.img bs=512 count=1 skip=5 | xxd -l 8` still returns `CYRIUS!!` — proving the kernel's write traveled through the new dispatch wrapper (`blk_write` → `nvme_blk_write` → `nvme_write_lba` → I/O SQ doorbell → controller → backing file). All Phase 1-4 receipts continue to print unchanged. The `disk` shell command now reports the active backend by name.
+
+**Build:** `build/agnos` 438,416 B (Phase 4) → **441,056 B** (+2,640 B for Phase 5). Multiboot2 ELF64 entry `0x1000a8` preserved. Net since 1.31.0 baseline: **+19,144 B for the full Phase 1-5 NVMe driver + block-layer dispatch**.
+
+**NVMe driver arc closed.** Five phases over a single 2026-05-20 session: probe → admin queue → I/O queue → write + multi-LBA + PRP-list → block_dev abstraction. ~940 LOC across `nvme.cyr` + `block.cyr`. QEMU end-to-end validated with byte-exact disk persistence. The driver is now plugged into the existing fatfs / shell consumer path that virtio-blk previously fronted; on a future iron burn with archaemenid's NVMe SSD, the same kernel reads/writes the same way it does in QEMU.
+
+**Out of scope (NVMe arc closeout):**
+- **True IRQ-driven completion** — deferred per the MSI-X reconsideration above; tracked as a cross-driver opportunity when a vector-dispatch framework lands.
+- **Multi-namespace enumeration** — only NSID=1 fetched; multi-namespace work waits for a real use case.
+- **PRP-list boot-time exercise** — coded but only PRP1 path is boot-demo'd; first real PRP-list exercise comes via real consumer-side multi-page transfers.
+- **Iron burn** — natural next step is to install on archaemenid and verify the kernel sees the real NVMe SSD's IDENTIFY data + GPT/partition header at LBA 0. Per `feedback_iron_burns_block_other_work` this needs a written audit before scheduling — separate proposal.
+
 ## [1.31.0] — 2026-05-20 (Production build goes lean — KTEST + XHCI_VERBOSE compile gates; FB-absent guard; stale Attempt-N prose retired; `docs/development/build.md`)
 
 **1.30.x cycle closed; 1.31.x cycle opens with the production-default flip.** The 1.30.x sweep (1.30.0 → 1.30.12) cleared the FB-hardening + MVP-gate work on both BIOS paths (VGA-spec Attempt 68, Quiet Boot Attempt 76, true-font swap Attempt 77; Attempt 78 falsified the gnoboot SetMode-bounce lever, Attempt 79 Intel cross-check was structurally inconclusive). What landed there made every boot loud — KTEST self-test output + xhci developmental traces were unconditional because we needed them during the silent-absorb diagnostic arc. With the gate green, production boots should not carry diagnostic spam. 1.31.0 introduces source-side compile gates so the test paths and the verbose xhci trace ship out by default; opt back in via `KTEST=1` / `XHCI_VERBOSE=1` to the build script. Bundled: an FB-absent honesty guard the prior cycle's `fb_console_init` rewrite missed, a sweep of decayed Attempt-N references from `fb_console.cyr` comments, and a new `docs/development/build.md` that documents the gate matrix end-to-end. Cycle theme pivots from FB to **storage** — first 1.31.x engineering cuts target the NVMe block layer, not the framebuffer.

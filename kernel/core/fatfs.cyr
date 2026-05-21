@@ -17,7 +17,7 @@ var fatfs_fat_buf[64];
 var fatfs_data_buf[64];
 
 fn fatfs_init() {
-    if (vblk_active == 0) { return 0 - 1; }
+    if (blk_active == 0) { return 0 - 1; }
     # Read boot sector (sector 0)
     var r = blk_read(0, &fatfs_boot_buf);
     if (r != 0) { return 0 - 1; }

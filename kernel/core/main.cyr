@@ -306,6 +306,11 @@ if (nvme_admin_init() == 1) {
     # post-mortem signal.
     if (nvme_io_queue_init() == 1) {
         nvme_rw_demo();
+        # NVMe Phase 5 — register NVMe with the block-dispatch layer.
+        # Overrides whatever virtio-blk_init registered earlier so
+        # NVMe is the production-bound block backend; virtio is the
+        # QEMU-only fallback. CMOS kcp 0x48 stamps on success.
+        nvme_register_block_dev();
     }
 }
 vfs_init();

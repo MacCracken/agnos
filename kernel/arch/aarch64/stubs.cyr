@@ -83,9 +83,35 @@ fn tcp_close(a) { return 0 - 1; }
 var vblk_active = 0;
 var vblk_capacity = 0;
 fn virtio_blk_init() { return 0 - 1; }
+fn vblk_blk_read(a, b) { return 0 - 1; }
+fn vblk_blk_write(a, b) { return 0 - 1; }
+fn vblk_blk_read_sectors(a, b, c) { return 0 - 1; }
+
+# Block-dispatch stubs (Phase 5, 1.31.x storage arc)
+var BLK_NONE   = 0;
+var BLK_VIRTIO = 1;
+var BLK_NVME   = 2;
+var blk_active    = 0;
+var blk_capacity  = 0;
+var blk_lba_bytes = 512;
+fn blk_register_virtio(a) { return 0; }
+fn blk_register_nvme(a, b) { return 0; }
 fn blk_read(a, b) { return 0 - 1; }
 fn blk_write(a, b) { return 0 - 1; }
 fn blk_read_sectors(a, b, c) { return 0 - 1; }
+
+# NVMe stubs (no NVMe driver on aarch64 today)
+fn nvme_probe() { return 0; }
+fn nvme_disable() { return 0; }
+fn nvme_admin_init() { return 0; }
+fn nvme_identify_ctrl() { return 0; }
+fn nvme_identify_ns(a) { return 0; }
+fn nvme_io_queue_init() { return 0; }
+fn nvme_rw_demo() { return 0; }
+fn nvme_register_block_dev() { return 0; }
+fn nvme_blk_read(a, b) { return 0 - 1; }
+fn nvme_blk_write(a, b) { return 0 - 1; }
+fn nvme_blk_read_sectors(a, b, c) { return 0 - 1; }
 
 # FAT16 filesystem stubs
 var fatfs_active = 0;

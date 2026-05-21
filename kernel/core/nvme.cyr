@@ -921,3 +921,67 @@ fn nvme_rw_demo() {
 
     return 1;
 }
+
+# --- Phase 5: block_dev dispatch wrappers ---
+#
+# Adapters that bridge the NVMe-native API (which returns 1=success /
+# 0=failure and requires page-aligned buffers) to the block layer's
+# (sector, buf) → 0=success / -1=failure convention. Same pattern as
+# virtio_blk's `vblk_blk_*` adapters in virtio_blk.cyr — the block
+# layer's public API stays unchanged for fatfs / shell consumers.
+#
+# Buffer staging: like virtio_blk, copies through the page-aligned
+# `nvme_read_scratch` because consumer buffers (fatfs_boot_buf,
+# fatfs_dir_buf, ad-hoc shell buffers) aren't guaranteed page-aligned.
+# Loses zero-copy but matches virtio's existing posture; the multi-LBA
+# fast path stays available via direct nvme_read_sectors / nvme_write_
+# sectors for any future caller that does own a page-aligned buffer.
+
+fn nvme_blk_read(sector, buf) {
+    if (nvme_io_ready == 0) { return 0 - 1; }
+    if (nvme_read_lba(sector, nvme_read_scratch) == 0) { return 0 - 1; }
+    # Copy LBA bytes from scratch into caller's buffer. 8-byte stride
+    # mirrors virtio_blk's loop — 512 / 8 = 64 iterations.
+    for (var i = 0; i < 64; i = i + 1) {
+        store64(buf + i * 8, load64(nvme_read_scratch + i * 8));
+    }
+    return 0;
+}
+
+fn nvme_blk_write(sector, buf) {
+    if (nvme_io_ready == 0) { return 0 - 1; }
+    # Copy caller's buffer into page-aligned scratch first.
+    for (var i = 0; i < 64; i = i + 1) {
+        store64(nvme_read_scratch + i * 8, load64(buf + i * 8));
+    }
+    if (nvme_write_lba(sector, nvme_read_scratch) == 0) { return 0 - 1; }
+    return 0;
+}
+
+fn nvme_blk_read_sectors(start, count, buf) {
+    # Loop single-sector dispatch — matches virtio's shape. Multi-LBA
+    # in one NVMe command stays available via direct nvme_read_sectors
+    # for callers that pass page-aligned buffers; the block-layer API
+    # currently can't promise that.
+    for (var i = 0; i < count; i = i + 1) {
+        var r = nvme_blk_read(start + i, buf + i * 512);
+        if (r != 0) { return 0 - 1; }
+    }
+    return 0;
+}
+
+# Register NVMe with the block layer. Always overrides whatever's
+# there — virtio is the fallback for QEMU-only environments; NVMe is
+# the production-bound backend.
+fn nvme_register_block_dev() {
+    if (nvme_io_ready == 0) { return 0; }
+    blk_register_nvme(nvme_ns1_nsze, nvme_ns1_lba_bytes);
+    kprint("nvme: registered as block_dev (", 32);
+    kprint_num(nvme_ns1_nsze);
+    kprint(" LBAs x ", 8);
+    kprint_num(nvme_ns1_lba_bytes);
+    kprintln("B)", 2);
+    # CMOS kcp = 0x48 (NVMe block-dev registration — block dispatch is live).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x48; 0xE6; 0x71; }
+    return 1;
+}

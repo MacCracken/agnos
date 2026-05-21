@@ -1,0 +1,81 @@
+# === Block layer — backend dispatch (virtio-blk vs NVMe) ===
+#
+# Tag-based dispatch between the two block-device backends. Consumers
+# (fatfs, shell, future VFS-block paths) call `blk_read` / `blk_write`
+# / `blk_read_sectors` and don't know which backend serves the call.
+#
+# Selection policy (NVMe-first):
+#   - virtio-blk-init calls `blk_register_virtio(capacity)` on success.
+#     Only registers if `blk_active == 0`. Virtio fills the slot when
+#     it's the only backend present.
+#   - nvme-init calls `blk_register_nvme(capacity, lba_bytes)` after
+#     I/O queues are ready. ALWAYS overrides whatever's in the slot —
+#     NVMe is the production-bound backend; virtio is the QEMU-only
+#     fallback. Init order: NVMe runs *after* virtio in main.cyr, so
+#     when both are present the NVMe override fires last.
+#
+# Single-sector wrappers preserve virtio's existing (sector, buf)
+# signature and 0=success / -1=failure return code. NVMe's native
+# functions return 1/0; the wrapper translates so the public API
+# stays unchanged for existing fatfs/shell callers.
+#
+# Phase 5 deliberately does NOT introduce function pointers / vtables.
+# Cyrius's tag-dispatch idiom (`if (blk_active == X) { ... }`) is the
+# right shape at two backends; reach for fn-ptr dispatch when the
+# third backend appears (AHCI / SATA, eventually) and the branch arms
+# start to repeat.
+
+var BLK_NONE   = 0;
+var BLK_VIRTIO = 1;
+var BLK_NVME   = 2;
+
+# Public block-layer state. Consumers read these directly (matching
+# the existing vblk_active / vblk_capacity access pattern).
+var blk_active    = 0;   # one of BLK_NONE / BLK_VIRTIO / BLK_NVME
+var blk_capacity  = 0;   # active backend's namespace size, in LBAs
+var blk_lba_bytes = 512; # bytes per LBA on the active backend
+
+# Backend registration ------------------------------------------------
+
+# Virtio registers first (init runs before NVMe), and only if the slot
+# is empty. If NVMe later succeeds, it overrides. This conditional
+# keeps virtio as the fallback without it stomping NVMe's override on
+# re-init paths (none currently, but the symmetry is the design).
+fn blk_register_virtio(capacity) {
+    if (blk_active == 0) {
+        blk_active    = BLK_VIRTIO;
+        blk_capacity  = capacity;
+        blk_lba_bytes = 512;
+    }
+    return 0;
+}
+
+# NVMe always wins when present. Init ordering in main.cyr ensures
+# this is the last register call when both backends initialize on
+# the same boot.
+fn blk_register_nvme(capacity, lba_bytes) {
+    blk_active    = BLK_NVME;
+    blk_capacity  = capacity;
+    blk_lba_bytes = lba_bytes;
+    return 0;
+}
+
+# Dispatch wrappers ---------------------------------------------------
+
+fn blk_read(sector, buf) {
+    if (blk_active == BLK_VIRTIO) { return vblk_blk_read(sector, buf); }
+    if (blk_active == BLK_NVME)   { return nvme_blk_read(sector, buf); }
+    return 0 - 1;
+}
+
+fn blk_write(sector, buf) {
+    if (blk_active == BLK_VIRTIO) { return vblk_blk_write(sector, buf); }
+    if (blk_active == BLK_NVME)   { return nvme_blk_write(sector, buf); }
+    return 0 - 1;
+}
+
+fn blk_read_sectors(start, count, buf) {
+    if (blk_active == BLK_VIRTIO) { return vblk_blk_read_sectors(start, count, buf); }
+    if (blk_active == BLK_NVME)   { return nvme_blk_read_sectors(start, count, buf); }
+    return 0 - 1;
+}

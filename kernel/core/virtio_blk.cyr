@@ -75,6 +75,10 @@ fn virtio_blk_init() {
     vblk_capacity = cap_lo | (cap_hi << 32);
 
     vblk_active = 1;
+    # Phase 5 (1.31.x) — register with the block-dispatch layer. Only
+    # takes effect if no backend has claimed the slot yet; NVMe runs
+    # later in main.cyr and will override when both are present.
+    blk_register_virtio(vblk_capacity);
     return 0;
 }
 
@@ -144,7 +148,12 @@ fn vblk_do_request(req_type, sector, buf) {
     return 0 - 1;
 }
 
-fn blk_read(sector, buf) {
+# Phase 5 (1.31.x storage arc) — renamed from `blk_read` / `blk_write` /
+# `blk_read_sectors` so kernel/core/block.cyr can host the public
+# dispatching layer with those names. Backend-specific implementation
+# stays unchanged; only the symbol name moved.
+
+fn vblk_blk_read(sector, buf) {
     # Use DMA-safe static buffer, then copy to caller's buffer
     var r = vblk_do_request(0, sector, &vblk_dma_buf);
     if (r == 0) {
@@ -155,7 +164,7 @@ fn blk_read(sector, buf) {
     return r;
 }
 
-fn blk_write(sector, buf) {
+fn vblk_blk_write(sector, buf) {
     # Copy caller's buffer to DMA-safe static buffer
     for (var i = 0; i < 64; i = i + 1) {
         store64(&vblk_dma_buf + i * 8, load64(buf + i * 8));
@@ -163,9 +172,9 @@ fn blk_write(sector, buf) {
     return vblk_do_request(1, sector, &vblk_dma_buf);
 }
 
-fn blk_read_sectors(start, count, buf) {
+fn vblk_blk_read_sectors(start, count, buf) {
     for (var i = 0; i < count; i = i + 1) {
-        var r = blk_read(start + i, buf + i * 512);
+        var r = vblk_blk_read(start + i, buf + i * 512);
         if (r != 0) { return 0 - 1; }
     }
     return 0;

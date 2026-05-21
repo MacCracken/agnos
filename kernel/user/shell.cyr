@@ -277,7 +277,7 @@ fn sh_exec(buf, len) {
         return 0;
     }
     if (sh_streq(buf, clen, "blkread", 7) == 1) {
-        if (vblk_active == 0) { kprintln("no block device", 15); return 0; }
+        if (blk_active == 0) { kprintln("no block device", 15); return 0; }
         # Parse sector number from arg (simple decimal)
         var sector = 0;
         for (var i = 0; i < arglen; i = i + 1) {
@@ -304,11 +304,12 @@ fn sh_exec(buf, len) {
         return 0;
     }
     if (sh_streq(buf, clen, "disk", 4) == 1) {
-        if (vblk_active == 0) { kprintln("no block device", 15); return 0; }
-        kprint("VirtIO-blk: ", 12);
-        kprint_num(vblk_capacity);
+        if (blk_active == 0) { kprintln("no block device", 15); return 0; }
+        if (blk_active == BLK_VIRTIO) { kprint("VirtIO-blk: ", 12); }
+        if (blk_active == BLK_NVME)   { kprint("NVMe: ", 6); }
+        kprint_num(blk_capacity);
         kprint(" sectors (", 10);
-        kprint_num(vblk_capacity / 2);
+        kprint_num((blk_capacity * blk_lba_bytes) / 1024);
         kprintln(" KB)", 4);
         if (fatfs_active != 0) {
             kprintln("Filesystem: FAT16", 17);
