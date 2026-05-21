@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.31.4] — 2026-05-21
+
 ### RAM-disk backend + VirtIO 1.x modern virtio-blk-pci driver (1.31.4 cycle scope)
 
 Two bites stacked into one cut per the multi-source convergent audit at `agnosticos/docs/development/ramdisk-virtio-modern-prior-art.md`. Both QEMU-validated; neither has iron exposure (RAM-disk is RAM-only; VirtIO doesn't exist on bare metal).
