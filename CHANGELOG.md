@@ -5,6 +5,82 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### RAM-disk backend + VirtIO 1.x modern virtio-blk-pci driver (1.31.4 cycle scope)
+
+Two bites stacked into one cut per the multi-source convergent audit at `agnosticos/docs/development/ramdisk-virtio-modern-prior-art.md`. Both QEMU-validated; neither has iron exposure (RAM-disk is RAM-only; VirtIO doesn't exist on bare metal).
+
+**Per `feedback_redesign_dont_reinvent` — multi-source prior art**: VirtIO 1.x driver ported from OpenBSD `virtio.c` (state-machine shape, polled-only confirmation), FreeBSD `virtio_pci_modern.c` (cap-walk + VQ setup), Linux `virtio_ring.c` (barrier discipline). RAM-disk ported from OpenBSD `rd.c` MINIROOTSIZE + NetBSD `md.c` MD_KMEM_ALLOCATED preallocation pattern. **Per `feedback_iron_burns_block_other_work` + `feedback_stop_letter_laddering`**: full plan audit shipped BEFORE any code in `agnosticos/docs/development/ramdisk-virtio-modern-prior-art.md` (§§ 1-10).
+
+#### VirtIO 1.x modern virtio-blk-pci driver — full rewrite of `kernel/core/virtio_blk.cyr` (~500 LOC, replaces 181-LOC transitional 0.9.5)
+
+Drops the legacy port-I/O interface; ports the modern PCI transport per OASIS VirtIO 1.2 §§ 2.1 / 4.1 / 5.2:
+
+- **PCI capability-list discovery** (`vblk_scan_caps`) — walks vendor capabilities (ID `0x09`), classifies each by `cfg_type` byte at cap+3, locates COMMON_CFG / NOTIFY_CFG / ISR_CFG / DEVICE_CFG bases inside the device's MMIO BARs. Validates `bar < 6` and rejects `offset+length` wrap-around per Linux `virtio_pci_modern_dev.c:57-62` security check. Each BAR is UC-remapped via `vmm_remap_uc_2mb` (matches `nvme.cyr:128` / `ahci.cyr:153` pattern). NOTIFY_CFG's trailing `notify_off_multiplier` (LE32 at cap+16) cached for the doorbell formula.
+- **Device-ID matching** — accepts BOTH `0x1042` (pure modern, `disable-legacy=on`) AND `0x1001` (transitional, default QEMU `-device virtio-blk-pci`). Cap-list presence is the actual gate, not the device ID — § 4.1.4.10 confirms transitional devices expose modern caps alongside the legacy I/O BAR; a true legacy-only device (`disable-modern=true`) has no caps and fails init gracefully per § 4.1.5.1.1.1.
+- **8-step init state machine** (`virtio_blk_init`) per § 3.1.1, including the NEW `FEATURES_OK` readback gate (step 6) — driver MUST set status |= FEATURES_OK, then re-read, then abort with FAILED if the device cleared the bit. NO retry on FEATURES_OK clear (spec § 2.2.2 mandate; easy footgun flagged by all three reference impls).
+- **64-bit feature negotiation** (`vblk_negotiate_features`) — 2-iteration `device_feature_select=0/1` read pattern → 64-bit accepted subset → write back via `driver_feature_select=0/1`. Accepts ONLY `VIRTIO_F_VERSION_1` (bit 32, mandatory per § 6.1) + opportunistic `VIRTIO_BLK_F_RO` (bit 5). All other bits deliberately unack'd: `ACCESS_PLATFORM` (kernel has no IOMMU), `RING_PACKED` (split rings are simpler — falls back automatically), `NOTIFICATION_DATA`, `RING_EVENT_IDX`, `INDIRECT_DESC`, `IN_ORDER`, `ORDER_PLATFORM`, `NOTIF_CONFIG_DATA`, `RING_RESET`, `SR_IOV`, `FLUSH` (§ 5.2.6.2 confirms writethrough-equivalent behavior when FLUSH unack'd), `BLK_SIZE`, `TOPOLOGY`, `MQ`, `DISCARD`, `WRITE_ZEROES`, `SECURE_ERASE`, `LIFETIME`, `GEOMETRY`.
+- **Capacity** read from DEVICE_CFG offset 0 (le64 sectors in 512-B units) after FEATURES_OK per § 5.2.5.1.
+- **Virtqueue 0 setup** (`vblk_setup_queue_0`) — `queue_select=0`, read `queue_size` (QEMU default 256), allocate three independent pmm pages for descriptor / available / used rings (modern split rings have no inter-region padding requirement per § 2.7.2), identity-map each per `nvme.cyr:317-319` pattern, zero, write 64-bit byte-physical addresses to `queue_desc_lo/hi`, `queue_driver_lo/hi`, `queue_device_lo/hi` (no PFN shift — that was 0.9.5), read `queue_notify_off` and cache the per-VQ doorbell address `vblk_q0_notify = notify_base + qno × multiplier`. `queue_enable = 1` MUST be last (§ 4.1.4.3.2).
+- **Polled-only operation** — no MSI-X, no ISR byte read. Watches `used->idx` directly per OpenBSD `virtio_pci_poll_intr`'s explicit polled path (the source confirms polled-only is spec-legal: § 4.1.4.5 only requires ISR reads when an interrupt fires).
+- **Memory-barrier discipline** (`vblk_do_request`) — `mfence` (encoding `0F AE F0`, same opcode used in `xhci_cmd.cyr:172`) inserted (a) between avail-ring slot write and `avail->idx` increment per § 2.7.13.3.1, and (b) between `used->idx` read and used-ring entry read per § 2.7.13.4.1. All three reference impls flag this as THE critical correctness item — without it the device can race-read a stale slot at the new idx, or the host can read a stale entry's id at the new used.idx.
+- **Request framing unchanged from 0.9.5** — same 16-byte header (`le32 type; le32 reserved; le64 sector`) + data + 1-byte status three-descriptor chain. § 2.7.4.2's device-readable-before-device-writable ordering already satisfied. Doorbell: write `le16` queue index (0) to the cached `vblk_q0_notify` address.
+
+Same public surface as 0.9.5 (`vblk_blk_read` / `vblk_blk_write` / `vblk_blk_read_sectors`) so `block.cyr` dispatch and `main.cyr` init order are byte-compatible. Read-only enforcement added: `vblk_blk_write` returns -1 if `VIRTIO_BLK_F_RO` was accepted.
+
+#### RAM-disk block backend — new `kernel/core/ramdisk.cyr` (~140 LOC)
+
+Pure-RAM block device, build-flag gated by new `RAMDISK_ENABLE=1` env var. Convergent port from OpenBSD `rd.c` `MINIROOTSIZE` + NetBSD `md.c` `MD_KMEM_ALLOCATED`:
+
+- Preallocates `RAMDISK_NPAGES_DEFAULT = 64` (256 KB at 8 sectors/page) backing pages from `pmm_alloc` at boot; stores physical addresses in `ramdisk_pages[1024]` (sized for the 128-page max). On any `pmm_alloc` failure mid-init, abandons the partial allocation (matches NVMe/AHCI/xHCI unwind-by-abandon convention; `pmm` has no free path today), leaves `ramdisk_active=0` so `ramdisk_register_block_dev` skips.
+- 512-B sectors, indexed via `sector >> 3` → page; `(sector & 7) * 512` → offset within page. Inner I/O loop is bare 64-word `store64`/`load64` (matches `virtio_blk.cyr:160-162` idiom). No lazy alloc, no sparse map, no caching, no DMA, no coherency flushes — RAM IS the cache.
+- Identity-shape with existing backends — `ramdisk_blk_read/write/read_sectors` signatures match `vblk_blk_*` / `nvme_blk_*` / `ahci_blk_*` / `msc_blk_*` byte-for-byte (0=success, -1=fail). New `BLK_RAMDISK = 5` tag in `block.cyr` with dispatch arms in `blk_read` / `blk_write` / `blk_read_sectors`.
+- `blk_register_ramdisk` (in `block.cyr`) takes the slot only when `blk_active == BLK_NONE` — lowest priority backend. RAM-disk never overrides NVMe / AHCI / USB-MS / VIRTIO. Annotates the log line with which higher-priority backend held the slot (matches `msc_register_block_dev` pattern): `ramdisk: 512 LBAs x 512B (64 pages; virtio primary)` or `(...; active)` when RAM-disk holds the slot.
+- Sizing matches OpenBSD `MINIROOTSIZE` precedent (the only impl in the audit with a default). 256 KB ≈ 18% of archaemenid's post-boot ~354-page pmm budget — fits FAT12 / minixfs bring-up, leaves kernel margin. Audit-capped at 128 pages (512 KB) until pmm budget grows; build-time bound enforced via `RAMDISK_NPAGES_MAX = 128`.
+- CMOS kcp `0x52` stamps on successful registration; extends storage kcp arc `0x40` – `0x51` (NVMe / GPT / AHCI / USB-MS).
+
+Build-flag plumbing in `scripts/build.sh` follows the existing `KTEST` / `XHCI_VERBOSE` / `AHCI_RW_DEMO` / `MSC_RW_DEMO` pattern (env var → prepended `#define`). Production boots default off → zero pmm cost.
+
+#### Init order, `main.cyr`
+
+```
+1. virtio_blk_init        (accepts 0x1042 OR 0x1001; cap-presence gates)
+2. #ifdef RAMDISK_ENABLE  ramdisk_init + ramdisk_register_block_dev  #endif
+3. nvme_*                 (overrides whatever's in the slot if present)
+4. ahci_*                 (secondary if NVMe, otherwise overrides VIRTIO/RAMDISK)
+5. msc_register_block_dev (tertiary; overrides only NONE/VIRTIO/RAMDISK)
+```
+
+Effective priority: NVMe > AHCI > USB-MS > VirtIO > RAMDISK > NONE.
+
+#### `block.cyr` extension
+
+- New `BLK_RAMDISK = 5` tag
+- New `blk_register_ramdisk(capacity, lba_bytes)` — only takes the slot if `blk_active == BLK_NONE`
+- New dispatch arms in `blk_read` / `blk_write` / `blk_read_sectors`
+
+#### QEMU smoke validation — 5/5 GREEN
+
+1. **Baseline** (no virtio device, `RAMDISK_ENABLE=0`) — boots to `AGNOS shell v1.31.3`, no block backend active, no regression.
+2. **RAMDISK alone** (`RAMDISK_ENABLE=1`, no virtio device) — `ramdisk: 512 LBAs x 512B (64 pages; active)`, boot reaches shell.
+3. **Modern virtio-blk-pci** (`-device virtio-blk-pci,drive=blk,disable-legacy=on,disable-modern=off` + 8 MB scratch backing) — `VirtIO-blk: 16384 sectors` (8 MiB / 512 B = 16384 exact), boot reaches shell. Modern-only cap-list path validated end-to-end.
+4. **Transitional virtio-blk-pci** (`-device virtio-blk-pci,drive=blk` — default QEMU, device ID `0x1001` with modern caps present) — `VirtIO-blk: 16384 sectors`, same outcome via cap-list scan, legacy I/O BAR ignored. Modern caps path correctly drives the transitional device.
+5. **Combined** (`RAMDISK_ENABLE=1` + `-device virtio-blk-pci,...`) — `VirtIO-blk: 16384 sectors` followed by `ramdisk: 512 LBAs x 512B (64 pages; virtio primary)`, then `AGNOS shell`. Priority policy works correctly: virtio holds `blk_active`, RAM-disk allocated and known but secondary.
+
+No iron exposure (RAM-only / QEMU-only); the 1.31.x storage arc's iron coverage stays NVMe + SATA + USB-MS as of 1.31.3.
+
+#### Build trajectory
+
+`build/agnos`: **510,536 B → 520,920 B** (default, `RAMDISK_ENABLE=0`, +10,384 B / +2.0% for modern virtio rewrite net of the 181-LOC transitional retirement) → **520,952 B** (`RAMDISK_ENABLE=1`, +32 B over default for the two `main.cyr` call sites; ramdisk.cyr functions compile in both modes — 3 additional dead-code fns when disabled, eliminable via `CYRIUS_DCE=1`).
+
+#### Audit references
+
+- `agnosticos/docs/development/ramdisk-virtio-modern-prior-art.md` — multi-source convergent audit + implementation plan (§§ 1-10)
+- OASIS VirtIO 1.2 spec (csd01, 2022-05-09) — §§ 2.1 / 2.7 / 3.1.1 / 4.1 / 5.2 / 6.1
+- Linux `drivers/virtio/virtio_pci_modern.c` + `virtio_blk.c` + `virtio_ring.c`
+- FreeBSD `sys/dev/virtio/pci/virtio_pci_modern.c` + `sys/dev/virtio/block/virtio_blk.c`
+- OpenBSD `sys/dev/pci/virtio_pci.c` + `sys/dev/pv/vioblk.c` + `sys/dev/pv/virtio.c`
+- RAM-disk: Linux `drivers/block/brd.c`, FreeBSD `sys/dev/md/md.c`, NetBSD `sys/dev/md.c`, OpenBSD `sys/dev/rd.c`, Haiku `ram_disk.cpp`
+
 ## [1.31.3] — 2026-05-21
 
 ### USB Mass Storage Phase 2.8 — eight-bug repair stack (post-Attempt-86 carry-forward)

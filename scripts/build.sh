@@ -89,10 +89,11 @@ else
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
-        [ -n "$KTEST" ]        && echo '#define KTEST'
-        [ -n "$XHCI_VERBOSE" ] && echo '#define XHCI_VERBOSE'
-        [ -n "$AHCI_RW_DEMO" ] && echo '#define AHCI_RW_DEMO'
-        [ -n "$MSC_RW_DEMO" ]  && echo '#define MSC_RW_DEMO'
+        [ -n "$KTEST" ]          && echo '#define KTEST'
+        [ -n "$XHCI_VERBOSE" ]   && echo '#define XHCI_VERBOSE'
+        [ -n "$AHCI_RW_DEMO" ]   && echo '#define AHCI_RW_DEMO'
+        [ -n "$MSC_RW_DEMO" ]    && echo '#define MSC_RW_DEMO'
+        [ -n "$RAMDISK_ENABLE" ] && echo '#define RAMDISK_ENABLE'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

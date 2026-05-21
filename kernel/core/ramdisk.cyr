@@ -1,0 +1,151 @@
+# === RAM-disk Block Backend ===
+#
+# Pure-RAM block device, 512-B sectors, preallocated at init via pmm_alloc.
+# Useful for filesystem development without iron, as a regression substrate
+# for fatfs / GPT / future ext2 work, and as a test target for the block-
+# dispatch layer's policy logic.
+#
+# Build-flag gated (RAMDISK_ENABLE=1 via scripts/build.sh). When disabled,
+# this file's contents compile out via the #ifdef RAMDISK_ENABLE in main.cyr.
+# When enabled, 64 pages (256 KB) are allocated up-front at boot from pmm_alloc.
+#
+# Multi-source convergent design (see agnosticos/docs/development/
+# ramdisk-virtio-modern-prior-art.md § 3): the "preallocated contiguous-ish
+# page-array" pattern matches OpenBSD rd.c MINIROOTSIZE + NetBSD md.c
+# MD_KMEM_ALLOCATED. We deviate from Linux brd.c's xarray + lazy-allocation
+# pattern because (a) we have no radix-tree infrastructure, (b) preallocation
+# removes an entire failure mode from the I/O hot path, (c) on a 354-free-
+# page budget, lazy gains us nothing — sentinel writes touch the same pages
+# anyway.
+#
+# Sizing rationale: 64 pages × 4 KB = 256 KB ≈ 18% of archaemenid's post-boot
+# pmm free-page budget. Large enough for FAT12 / minixfs bring-up; small
+# enough to leave kernel margin. Matches OpenBSD's MINIROOTSIZE precedent.
+# If pmm budget grows (>1024 free pages post-boot), bump RAMDISK_NPAGES_MAX.
+
+# Configuration -------------------------------------------------------
+# Number of 4 KB backing pages = 64 (256 KB at 8 sectors/page = 512 sectors).
+# To tune, edit RAMDISK_NPAGES_DEFAULT below AND ramdisk_pages[] array size
+# (8 bytes per phys-addr entry, must be >= RAMDISK_NPAGES_DEFAULT * 8).
+# Capped at 128 (512 KB) by audit recommendation — see prior-art doc § 3.5.
+
+var RAMDISK_NPAGES_DEFAULT = 64;   # 256 KB default; matches OpenBSD MINIROOTSIZE
+var RAMDISK_NPAGES_MAX     = 128;  # 512 KB ceiling; audit § 3.5
+
+# State ----------------------------------------------------------------
+# Phys addresses of the N backing pages, indexed by `sector >> 3` (8 sectors
+# per 4 KB page). Sized at 128 entries × 8 bytes = 1024 bytes max footprint
+# regardless of runtime N (allows tuning RAMDISK_NPAGES_DEFAULT without
+# changing the array dim, up to the MAX bound).
+var ramdisk_pages[1024];
+
+var ramdisk_active   = 0;   # 1 if init succeeded and pages are allocated
+var ramdisk_npages   = 0;   # actual allocated count; 0 if init bailed
+var ramdisk_capacity = 0;   # in 512-B sectors = ramdisk_npages * 8
+
+# Initialization ------------------------------------------------------
+# Allocates RAMDISK_NPAGES_DEFAULT pages from pmm_alloc, identity-maps each
+# (matches the nvme.cyr DMA-buffer pattern at line 317), records phys in
+# ramdisk_pages[]. On any pmm_alloc failure mid-loop, leaves ramdisk_active=0
+# and ramdisk_npages=0 so the register path skips; allocated pages stay
+# leaked (pmm has no free path today — matches the NVMe / AHCI / xHCI
+# pattern of unwind-by-abandon).
+fn ramdisk_init() {
+    var n = RAMDISK_NPAGES_DEFAULT;
+    if (n > RAMDISK_NPAGES_MAX) { return 0 - 1; }
+
+    for (var i = 0; i < n; i = i + 1) {
+        var p = pmm_alloc();
+        if (p == 0) {
+            # pmm exhausted mid-init; abandon partial allocation, skip register
+            ramdisk_npages = 0;
+            ramdisk_active = 0;
+            kprint("ramdisk: pmm exhausted after ", 32);
+            kprint_num(i);
+            kprintln(" pages — disabled", 17);
+            return 0 - 1;
+        }
+        # Identity-map the page for kernel access (same posture as nvme.cyr's
+        # admin-queue / IDENTIFY-scratch allocations at lines 317-319).
+        if (vmm_is_mapped(p) == 0) { vmm_map(p, p, 0x83); }
+        # Zero the page (64 × 8-byte stores = 512 bytes per iteration; loop
+        # 8 times to cover the full 4 KB page).
+        for (var k = 0; k < 512; k = k + 1) {
+            store64(p + k * 8, 0);
+        }
+        store64(&ramdisk_pages + i * 8, p);
+    }
+
+    ramdisk_npages   = n;
+    ramdisk_capacity = n * 8;       # 8 sectors per 4 KB page
+    ramdisk_active   = 1;
+    return 0;
+}
+
+# Block-layer surface -------------------------------------------------
+# Public API matching the existing backend convention (vblk_blk_* / nvme_blk_*
+# / ahci_blk_* / msc_blk_*): 0 = success, -1 = failure. Bounds-check every
+# entry. Inner loop is bare 64-word memcpy (matches virtio_blk.cyr:160-162).
+
+fn ramdisk_blk_read(sector, buf) {
+    if (ramdisk_active == 0) { return 0 - 1; }
+    if (sector >= ramdisk_capacity) { return 0 - 1; }
+    var page = load64(&ramdisk_pages + (sector >> 3) * 8);
+    var off  = (sector & 7) * 512;
+    for (var i = 0; i < 64; i = i + 1) {
+        store64(buf + i * 8, load64(page + off + i * 8));
+    }
+    return 0;
+}
+
+fn ramdisk_blk_write(sector, buf) {
+    if (ramdisk_active == 0) { return 0 - 1; }
+    if (sector >= ramdisk_capacity) { return 0 - 1; }
+    var page = load64(&ramdisk_pages + (sector >> 3) * 8);
+    var off  = (sector & 7) * 512;
+    for (var i = 0; i < 64; i = i + 1) {
+        store64(page + off + i * 8, load64(buf + i * 8));
+    }
+    return 0;
+}
+
+fn ramdisk_blk_read_sectors(start, count, buf) {
+    if (ramdisk_active == 0) { return 0 - 1; }
+    if (start + count > ramdisk_capacity) { return 0 - 1; }
+    for (var i = 0; i < count; i = i + 1) {
+        var r = ramdisk_blk_read(start + i, buf + i * 512);
+        if (r != 0) { return 0 - 1; }
+    }
+    return 0;
+}
+
+# Block-dispatch registration -----------------------------------------
+# Called from main.cyr after ramdisk_init. Registers RAM-disk as a lowest-
+# priority backend — `blk_register_ramdisk` (in block.cyr) only takes the
+# slot when blk_active == BLK_NONE. If virtio_blk has already registered
+# (it inits before us per main.cyr ordering), the slot stays virtio; if
+# NVMe / AHCI / USB-MS register later, they override per their own policy.
+fn ramdisk_register_block_dev() {
+    if (ramdisk_active == 0) { return 0; }
+    # Snapshot whatever held the slot before our register attempt; matches
+    # msc_register_block_dev's pattern of annotating the log line when a
+    # higher-priority backend already claimed blk_active.
+    var prior = blk_active;
+    blk_register_ramdisk(ramdisk_capacity, 512);
+    kprint("ramdisk: ", 9);
+    kprint_num(ramdisk_capacity);
+    kprint(" LBAs x 512B (", 14);
+    kprint_num(ramdisk_npages);
+    if (prior == BLK_NONE) {
+        kprintln(" pages; active)", 15);
+    } else {
+        if (prior == BLK_VIRTIO) { kprintln(" pages; virtio primary)", 23); }
+        if (prior == BLK_NVME)   { kprintln(" pages; NVMe primary)", 21); }
+        if (prior == BLK_AHCI)   { kprintln(" pages; AHCI primary)", 21); }
+        if (prior == BLK_USB_MS) { kprintln(" pages; USB-MS primary)", 23); }
+    }
+    # CMOS kcp = 0x52 (RAM-disk block-dev registration — extends storage
+    # kcp arc 0x40-0x51 NVMe/GPT/AHCI/USB-MS).
+    asm { 0xB0; 0x52; 0xE6; 0x70; 0xB0; 0x52; 0xE6; 0x71; }
+    return 1;
+}

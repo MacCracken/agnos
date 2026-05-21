@@ -1,144 +1,468 @@
-# === VirtIO Block Device Driver ===
-# Legacy (transitional) virtio PCI interface for block devices
-# Device ID: vendor=0x1AF4, device=0x1001
-var vblk_iobase = 0;
-var vblk_active = 0;
-var vblk_qbase = 0;
-var vblk_qsize = 0;
-var vblk_idx = 0;
-var vblk_used_last = 0;
-var vblk_capacity = 0;
-# Request structures must be in DMA-accessible memory
-# Use static globals in kernel BSS (identity-mapped)
-var vblk_req_hdr[4];
-var vblk_req_status[2];
-var vblk_dma_buf[64];  # 512-byte DMA buffer for sector data
+# === VirtIO 1.x Modern Block Device Driver ===
+#
+# Replaces the v1.30.x-era transitional 0.9.5 driver (port-I/O PCI interface).
+# Implements the OASIS VirtIO 1.2 modern PCI transport per § 4.1 + § 5.2:
+# capability-list discovery, MMIO BARs, 8-step init with FEATURES_OK gate,
+# 64-bit feature negotiation, 64-bit virtqueue addressing, polled used-ring
+# consumption.
+#
+# Multi-source convergent design (audit at agnosticos/docs/development/
+# ramdisk-virtio-modern-prior-art.md § 5-7): port-reference order is OpenBSD
+# `virtio_pci.c` + `virtio.c` for state-machine shape (most compact, explicit
+# polled path), FreeBSD `virtio_pci_modern.c` for cap-walk + VQ setup (cleanest
+# C), Linux `virtio_ring.c` for barrier discipline (most rigorously commented).
+#
+# Accepts device IDs:
+#   0x1042 — pure modern (QEMU `-device virtio-blk-pci,disable-legacy=on`)
+#   0x1001 — transitional (default QEMU `-device virtio-blk-pci`); modern
+#            caps still exposed alongside the legacy I/O BAR per § 4.1.4.10.
+#            Cap-list presence is the gate, not the device ID.
+#
+# Features accepted: VIRTIO_F_VERSION_1 (32) MANDATORY + VIRTIO_BLK_F_RO (5)
+# opportunistic. All others (FLUSH, BLK_SIZE, TOPOLOGY, MQ, DISCARD,
+# WRITE_ZEROES, INDIRECT_DESC, RING_EVENT_IDX, RING_PACKED, ACCESS_PLATFORM,
+# NOTIFICATION_DATA, IN_ORDER, ORDER_PLATFORM, NOTIF_CONFIG_DATA, RING_RESET,
+# SR_IOV) deliberately unack'd — see prior-art doc § 5.4.
+#
+# Polled-only — no MSI-X plumbing. AGNOS has no generic vector-dispatch
+# surface; OpenBSD's `virtio_pci_poll_intr` explicitly confirms polled
+# operation is spec-legal (skip ISR byte read, watch used->idx directly).
 
-fn virtio_blk_init() {
-    var idx = pci_find(0x1AF4, 0x1001);
-    if (idx < 0) { return 0 - 1; }
-    var bar0 = PciDev_bar0(&pci_devs + idx * 32);
-    vblk_iobase = bar0 & 0xFFFC;
-    # Enable PCI bus mastering for DMA
+# COMMON_CFG register offsets (§ 4.1.4.3) -----------------------------
+var VBLK_DEV_FEAT_SEL    = 0x00;  # le32 RW
+var VBLK_DEV_FEAT        = 0x04;  # le32 RO (windowed)
+var VBLK_DRV_FEAT_SEL    = 0x08;  # le32 RW
+var VBLK_DRV_FEAT        = 0x0C;  # le32 RW (windowed)
+var VBLK_CFG_MSIX_VEC    = 0x10;  # le16 RW (leave 0xFFFF — polled)
+var VBLK_NUM_QUEUES      = 0x12;  # le16 RO
+var VBLK_DEV_STATUS      = 0x14;  # u8   RW
+var VBLK_CFG_GEN         = 0x15;  # u8   RO
+var VBLK_QUEUE_SEL       = 0x16;  # le16 RW
+var VBLK_QUEUE_SIZE      = 0x18;  # le16 RW
+var VBLK_QUEUE_MSIX_VEC  = 0x1A;  # le16 RW (leave 0xFFFF)
+var VBLK_QUEUE_ENABLE    = 0x1C;  # le16 RW
+var VBLK_QUEUE_NOTIFY    = 0x1E;  # le16 RO (×multiplier → notify offset)
+var VBLK_QUEUE_DESC_LO   = 0x20;  # le32 RW (low half of 64-bit phys)
+var VBLK_QUEUE_DESC_HI   = 0x24;  # le32 RW (high half)
+var VBLK_QUEUE_DRIVER_LO = 0x28;  # le32 RW (avail ring phys, low)
+var VBLK_QUEUE_DRIVER_HI = 0x2C;  # le32 RW (high)
+var VBLK_QUEUE_DEVICE_LO = 0x30;  # le32 RW (used ring phys, low)
+var VBLK_QUEUE_DEVICE_HI = 0x34;  # le32 RW (high)
+
+# Status bits (§ 2.1) -------------------------------------------------
+var VBLK_STATUS_ACK         = 1;
+var VBLK_STATUS_DRIVER      = 2;
+var VBLK_STATUS_DRIVER_OK   = 4;
+var VBLK_STATUS_FEATURES_OK = 8;
+var VBLK_STATUS_FAILED      = 128;
+
+# Cap cfg_type values (§ 4.1.4) ---------------------------------------
+var VBLK_CAP_COMMON  = 1;
+var VBLK_CAP_NOTIFY  = 2;
+var VBLK_CAP_ISR     = 3;
+var VBLK_CAP_DEVICE  = 4;
+
+# Request types (§ 5.2.6) ---------------------------------------------
+var VBLK_T_IN    = 0;
+var VBLK_T_OUT   = 1;
+var VBLK_T_FLUSH = 4;
+
+# Descriptor flags (§ 2.7.5) ------------------------------------------
+var VBLK_DESC_F_NEXT  = 1;
+var VBLK_DESC_F_WRITE = 2;
+
+# State ----------------------------------------------------------------
+# MMIO bases (resolved from cap-list walk; 0 = not found)
+var vblk_common_cfg  = 0;   # 60-byte register block
+var vblk_notify_base = 0;   # NOTIFY_CFG BAR + offset (the cap's window base)
+var vblk_notify_mul  = 0;   # notify_off_multiplier (LE32 trailing the notify cap)
+var vblk_device_cfg  = 0;   # DEVICE_CFG (virtio_blk_config); 0 if absent
+var vblk_isr_cfg     = 0;   # ISR byte (we don't read it; kept for completeness)
+
+# Per-queue 0 cached notify address (= notify_base + queue_notify_off × multiplier)
+var vblk_q0_notify   = 0;
+
+# Virtqueue 0 (the only one — single requestq)
+var vblk_qsize       = 0;
+var vblk_desc        = 0;   # desc ring phys (pmm page)
+var vblk_avail       = 0;   # avail ring phys (pmm page)
+var vblk_used        = 0;   # used ring phys (pmm page)
+var vblk_idx         = 0;   # next avail ring slot (driver's perspective)
+var vblk_used_last   = 0;   # last consumed used ring slot
+
+# Block-layer-visible capacity (from DEVICE_CFG.capacity field)
+var vblk_capacity    = 0;   # in 512-B sectors
+var vblk_readonly    = 0;   # 1 if VIRTIO_BLK_F_RO accepted
+var vblk_active      = 0;   # 1 after init completes
+
+# Request structures (DMA-accessible, identity-mapped via BSS)
+# Sized with generous slack (32/16 bytes) to absorb any var[N] sizing
+# ambiguity — actual usage is 16 / 1 / 512 bytes.
+var vblk_req_hdr[32];       # virtio_blk_req header (16 bytes used)
+var vblk_req_status[16];    # 1-byte status (rest unused)
+var vblk_dma_buf[512];      # 512-byte sector DMA buffer
+
+# ---------------------------------------------------------------------
+# Cap-list scan
+# ---------------------------------------------------------------------
+# Walks the device's PCI capability list, finds each vendor cap (ID 0x09),
+# classifies by cfg_type byte at cap+3, computes the MMIO base for each
+# required structure type. Returns 0 on success (COMMON + NOTIFY + ISR all
+# found), -1 on missing required cap (a transitional device with
+# `disable-modern=true` would land here — per spec § 4.1.5.1.1.1, driver
+# MUST fail gracefully on a legacy-only device).
+#
+# Each vendor cap is at least 16 bytes:
+#   +0  cap_vndr (0x09)
+#   +1  cap_next
+#   +2  cap_len
+#   +3  cfg_type
+#   +4  bar (0..5)
+#   +5  id (disambiguator — we use the first of each type)
+#   +6  padding[2]
+#   +8  offset (le32, within the BAR)
+#   +12 length (le32)
+# Notify cap is 20 bytes total (extra trailing le32 notify_off_multiplier).
+fn vblk_scan_caps(idx) {
     var slot = PciDev_slot(&pci_devs + idx * 32);
-    pci_enable_bus_master(slot);
+    var bf = load64(&pci_busfunc + idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
 
-    # Reset device
-    outb(vblk_iobase + 18, 0);
-    # Set ACKNOWLEDGE
-    outb(vblk_iobase + 18, 1);
-    # Set DRIVER
-    outb(vblk_iobase + 18, 3);
+    # Verify capabilities-list bit (Status reg bit 4)
+    var sts_cmd = pci_read32(bus, slot, func, 4);
+    if (((sts_cmd >> 16) & 0x10) == 0) { return 0 - 1; }
 
-    # Read and accept features (mask off EVENT_IDX)
-    var features = inl(vblk_iobase);
-    features = features & (0 - 1 - (1 << 29));
-    outl(vblk_iobase + 4, features);
+    # Walk from cap-ptr head
+    var off = pci_read32(bus, slot, func, 0x34) & 0xFC;
+    var safety = 0;
 
-    # Select queue 0
-    outw(vblk_iobase + 14, 0);
-    vblk_qsize = inw(vblk_iobase + 12);
+    while (off != 0) {
+        if (safety > 48) { return 0 - 1; }
+        safety = safety + 1;
+
+        # Cap header dword: [cap_vndr:8][next:8][cap_len:8][cfg_type:8]
+        var hdr = pci_read32(bus, slot, func, off);
+        var cap_vndr = hdr & 0xFF;
+        var cap_next = (hdr >> 8) & 0xFC;
+        var cfg_type = (hdr >> 24) & 0xFF;
+
+        if (cap_vndr == 0x09) {
+            # bar at +4 (byte 0 of the next dword); offset le32 at +8; length le32 at +12
+            var d1 = pci_read32(bus, slot, func, off + 4);
+            var bar = d1 & 0xFF;
+            var cap_offset = pci_read32(bus, slot, func, off + 8);
+            var cap_length = pci_read32(bus, slot, func, off + 12);
+
+            # Validate bar index, reject offset+length wrap-around
+            # (Linux drivers/virtio/virtio_pci_modern_dev.c:57-62 flagged this
+            # as a kernel-level security check — a malicious or buggy device
+            # advertising a wrap-around offset would otherwise crash the kernel).
+            if (bar < 6) {
+                if ((cap_offset + cap_length) >= cap_offset) {
+                    var bar_phys = pci_bar_64(idx, bar);
+                    if (bar_phys != 0) {
+                        # UC-remap the BAR (idempotent — called once per BAR
+                        # would suffice, but vmm_remap_uc_2mb tolerates repeats).
+                        # Matches nvme.cyr:128 / ahci.cyr:153 pattern.
+                        vmm_remap_uc_2mb(bar_phys);
+                        var cap_base = bar_phys + cap_offset;
+
+                        if (cfg_type == VBLK_CAP_COMMON) {
+                            if (vblk_common_cfg == 0) { vblk_common_cfg = cap_base; }
+                        }
+                        if (cfg_type == VBLK_CAP_NOTIFY) {
+                            if (vblk_notify_base == 0) {
+                                vblk_notify_base = cap_base;
+                                # notify_off_multiplier is the trailing le32
+                                # immediately after the 16-byte cap header.
+                                vblk_notify_mul = pci_read32(bus, slot, func, off + 16);
+                            }
+                        }
+                        if (cfg_type == VBLK_CAP_ISR) {
+                            if (vblk_isr_cfg == 0) { vblk_isr_cfg = cap_base; }
+                        }
+                        if (cfg_type == VBLK_CAP_DEVICE) {
+                            if (vblk_device_cfg == 0) { vblk_device_cfg = cap_base; }
+                        }
+                    }
+                }
+            }
+        }
+
+        off = cap_next;
+    }
+
+    # COMMON + NOTIFY + ISR are required; DEVICE is optional (we can probe
+    # capacity via VIRTIO_BLK_F_GEOMETRY-less fallback, but for now require it).
+    if (vblk_common_cfg == 0) { return 0 - 1; }
+    if (vblk_notify_base == 0) { return 0 - 1; }
+    if (vblk_isr_cfg == 0) { return 0 - 1; }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# State-machine reset (step 1 of § 3.1.1)
+# ---------------------------------------------------------------------
+# Write 0 to device_status, then spin until readback returns 0
+# (§ 4.1.4.3.2 mandatory).
+fn vblk_reset() {
+    store8(vblk_common_cfg + VBLK_DEV_STATUS, 0);
+    var spin = 0;
+    while (load8(vblk_common_cfg + VBLK_DEV_STATUS) != 0) {
+        spin = spin + 1;
+        if (spin > 1000000) { return 0 - 1; }
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Feature negotiation (steps 4-6 of § 3.1.1) — the FEATURES_OK gate
+# ---------------------------------------------------------------------
+# Reads 64-bit offered features (two 32-bit windowed reads via
+# device_feature_select=0/1), computes accepted subset, writes back, sets
+# FEATURES_OK, verifies readback. Returns 0 on success, -1 if device cleared
+# FEATURES_OK (spec § 2.2.2 — driver MUST NOT retry; full reset is the only
+# recovery, and the device is unusable for this boot).
+#
+# Accepts:
+#   VIRTIO_F_VERSION_1 (bit 32) — MANDATORY; device MUST offer
+#   VIRTIO_BLK_F_RO    (bit 5)  — opportunistic; if device offers, we ack
+# All other bits rejected (see prior-art doc § 5.4).
+fn vblk_negotiate_features() {
+    # Read device-offered features (low half then high half)
+    store32(vblk_common_cfg + VBLK_DEV_FEAT_SEL, 0);
+    var feat_lo = load32(vblk_common_cfg + VBLK_DEV_FEAT);
+    store32(vblk_common_cfg + VBLK_DEV_FEAT_SEL, 1);
+    var feat_hi = load32(vblk_common_cfg + VBLK_DEV_FEAT);
+
+    # MUST: device must offer VIRTIO_F_VERSION_1 (bit 32 → feat_hi bit 0)
+    if ((feat_hi & 1) == 0) { return 0 - 1; }
+
+    # Compute driver-accepted subset
+    var drv_lo = 0;
+    var drv_hi = 1;  # VIRTIO_F_VERSION_1
+
+    # Opportunistic VIRTIO_BLK_F_RO (bit 5)
+    if ((feat_lo & 0x20) != 0) {
+        drv_lo = drv_lo | 0x20;
+        vblk_readonly = 1;
+    }
+
+    # Write back accepted features (low half then high half)
+    store32(vblk_common_cfg + VBLK_DRV_FEAT_SEL, 0);
+    store32(vblk_common_cfg + VBLK_DRV_FEAT, drv_lo);
+    store32(vblk_common_cfg + VBLK_DRV_FEAT_SEL, 1);
+    store32(vblk_common_cfg + VBLK_DRV_FEAT, drv_hi);
+
+    # Set FEATURES_OK (ACK | DRIVER | FEATURES_OK = 1 | 2 | 8 = 11)
+    store8(vblk_common_cfg + VBLK_DEV_STATUS,
+           VBLK_STATUS_ACK | VBLK_STATUS_DRIVER | VBLK_STATUS_FEATURES_OK);
+
+    # Re-read; if FEATURES_OK cleared, device rejected our subset
+    var status = load8(vblk_common_cfg + VBLK_DEV_STATUS);
+    if ((status & VBLK_STATUS_FEATURES_OK) == 0) {
+        store8(vblk_common_cfg + VBLK_DEV_STATUS, VBLK_STATUS_FAILED);
+        return 0 - 1;
+    }
+    return 0;
+}
+
+# ---------------------------------------------------------------------
+# Virtqueue 0 setup (step 7 of § 3.1.1)
+# ---------------------------------------------------------------------
+# Programs the single requestq: queue_select=0 → read queue_size → allocate
+# 3 contiguous pmm pages (desc / avail / used — each fits in one 4 KB page
+# at queue_size=256: desc=4 KB, avail=518 B, used=2054 B) → write 64-bit
+# byte-physical addresses to queue_desc/driver/device → cache notify address
+# from queue_notify_off × notify_off_multiplier → queue_enable=1.
+#
+# Returns 0 on success, -1 on alloc or queue-size-zero failure.
+fn vblk_setup_queue_0() {
+    store16(vblk_common_cfg + VBLK_QUEUE_SEL, 0);
+    vblk_qsize = load16(vblk_common_cfg + VBLK_QUEUE_SIZE);
     if (vblk_qsize == 0) { return 0 - 1; }
 
-    # Allocate contiguous pages for the virtqueue
-    # For qsz up to 256: need 3 pages (desc+avail + padding + used ring)
-    var page = pmm_alloc();
-    if (page == 0) { return 0 - 1; }
-    # Allocate 2 more consecutive pages (pmm gives sequential pages)
-    pmm_alloc();
-    pmm_alloc();
-    # Ensure all 3 pages are mapped
-    if (vmm_is_mapped(page) == 0) { vmm_map(page, page, 0x83); }
-    if (vmm_is_mapped(page + 0x1000) == 0) { vmm_map(page + 0x1000, page + 0x1000, 0x83); }
-    if (vmm_is_mapped(page + 0x2000) == 0) { vmm_map(page + 0x2000, page + 0x2000, 0x83); }
-    vblk_qbase = page;
-    # S10: Register DMA region with IOMMU
-    iommu_register_dma(page);
+    # Allocate three pages for desc / avail / used. Each is page-aligned
+    # by pmm_alloc and fits in one 4 KB page for queue_size up to 256
+    # (desc = 16 × 256 = 4096 B; avail = 6 + 2 × 256 = 518 B; used = 6 +
+    # 8 × 256 = 2054 B). Modern split rings have no inter-region padding
+    # requirement (§ 2.7.2) — three independent allocations is fine.
+    var p1 = pmm_alloc();
+    var p2 = pmm_alloc();
+    var p3 = pmm_alloc();
+    if (p1 == 0) { return 0 - 1; }
+    if (p2 == 0) { return 0 - 1; }
+    if (p3 == 0) { return 0 - 1; }
 
-    # Zero all 3 pages
-    for (var i = 0; i < 512; i = i + 1) { store64(page + i * 8, 0); }
-    for (var i = 0; i < 512; i = i + 1) { store64(page + 0x1000 + i * 8, 0); }
-    for (var i = 0; i < 512; i = i + 1) { store64(page + 0x2000 + i * 8, 0); }
+    # Identity-map each page (matches nvme.cyr:317-319 pattern)
+    if (vmm_is_mapped(p1) == 0) { vmm_map(p1, p1, 0x83); }
+    if (vmm_is_mapped(p2) == 0) { vmm_map(p2, p2, 0x83); }
+    if (vmm_is_mapped(p3) == 0) { vmm_map(p3, p3, 0x83); }
 
-    # Set queue PFN
-    outl(vblk_iobase + 8, page / 4096);
+    # Zero each page (512 × 8 = 4096 bytes)
+    for (var i = 0; i < 512; i = i + 1) { store64(p1 + i * 8, 0); }
+    for (var i = 0; i < 512; i = i + 1) { store64(p2 + i * 8, 0); }
+    for (var i = 0; i < 512; i = i + 1) { store64(p3 + i * 8, 0); }
+
+    vblk_desc  = p1;
+    vblk_avail = p2;
+    vblk_used  = p3;
+
+    # Write 64-bit phys addresses, low half first, high half second
+    # (§ 4.1.3.2 — empirical convention; some emulators only latch on the
+    # high-half write, so low-first ensures atomicity in the right direction).
+    store32(vblk_common_cfg + VBLK_QUEUE_DESC_LO,   vblk_desc  & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DESC_HI,   (vblk_desc  >> 32) & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DRIVER_LO, vblk_avail & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DRIVER_HI, (vblk_avail >> 32) & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DEVICE_LO, vblk_used  & 0xFFFFFFFF);
+    store32(vblk_common_cfg + VBLK_QUEUE_DEVICE_HI, (vblk_used  >> 32) & 0xFFFFFFFF);
+
+    # Read queue_notify_off, compute the cached doorbell address
+    # (§ 4.1.4.4: notify_addr = notify_base + queue_notify_off × multiplier)
+    var qno = load16(vblk_common_cfg + VBLK_QUEUE_NOTIFY);
+    vblk_q0_notify = vblk_notify_base + qno * vblk_notify_mul;
+
+    # Mark queue live (MUST be last per § 4.1.4.3.2)
+    store16(vblk_common_cfg + VBLK_QUEUE_ENABLE, 1);
 
     vblk_idx = 0;
     vblk_used_last = 0;
+    return 0;
+}
 
-    # Set DRIVER_OK
-    outb(vblk_iobase + 18, 7);
+# ---------------------------------------------------------------------
+# Top-level init (8 steps per § 3.1.1)
+# ---------------------------------------------------------------------
+# Drives the full modern init sequence. Called from main.cyr once per boot
+# if a virtio-blk-pci device is found on the PCI bus.
+fn virtio_blk_init() {
+    # Step 0: PCI probe — accept BOTH modern (0x1042) and transitional (0x1001)
+    # device IDs. The cap-list presence test inside vblk_scan_caps is the
+    # actual gate; a transitional device with disable-modern=true will have
+    # no virtio caps and fail there.
+    var idx = pci_find(0x1AF4, 0x1042);
+    if (idx < 0) { idx = pci_find(0x1AF4, 0x1001); }
+    if (idx < 0) { return 0 - 1; }
 
-    # Read capacity
-    var cap_lo = inl(vblk_iobase + 20);
-    var cap_hi = inl(vblk_iobase + 24);
-    vblk_capacity = cap_lo | (cap_hi << 32);
+    # Enable bus-master for DMA (matches existing nvme/ahci/virtio_net pattern)
+    pci_enable_bus_master(PciDev_slot(&pci_devs + idx * 32));
+
+    # Scan capabilities → set vblk_common_cfg / vblk_notify_base / vblk_notify_mul
+    # / vblk_isr_cfg / vblk_device_cfg.
+    if (vblk_scan_caps(idx) < 0) { return 0 - 1; }
+
+    # Steps 1-3: reset + ACK + DRIVER
+    if (vblk_reset() < 0) { return 0 - 1; }
+    store8(vblk_common_cfg + VBLK_DEV_STATUS, VBLK_STATUS_ACK);
+    store8(vblk_common_cfg + VBLK_DEV_STATUS, VBLK_STATUS_ACK | VBLK_STATUS_DRIVER);
+
+    # Steps 4-6: feature negotiation + FEATURES_OK gate
+    if (vblk_negotiate_features() < 0) { return 0 - 1; }
+
+    # Capacity (DEVICE_CFG offset 0 = le64 capacity in 512-B sectors).
+    # § 5.2.5.1 allows reading device-config fields only after FEATURES_OK.
+    if (vblk_device_cfg != 0) {
+        var cap_lo = load32(vblk_device_cfg + 0);
+        var cap_hi = load32(vblk_device_cfg + 4);
+        vblk_capacity = cap_lo | (cap_hi << 32);
+    }
+
+    # Step 7: per-VQ setup
+    if (vblk_setup_queue_0() < 0) { return 0 - 1; }
+
+    # Step 8: DRIVER_OK — the device is live, may start processing buffers
+    store8(vblk_common_cfg + VBLK_DEV_STATUS,
+           VBLK_STATUS_ACK | VBLK_STATUS_DRIVER | VBLK_STATUS_FEATURES_OK | VBLK_STATUS_DRIVER_OK);
 
     vblk_active = 1;
-    # Phase 5 (1.31.x) — register with the block-dispatch layer. Only
-    # takes effect if no backend has claimed the slot yet; NVMe runs
-    # later in main.cyr and will override when both are present.
+
+    # Register with the block-dispatch layer (only takes the slot if NONE
+    # holds it — NVMe/AHCI/USB-MS override later per their own policy).
     blk_register_virtio(vblk_capacity);
     return 0;
 }
 
+# ---------------------------------------------------------------------
+# Request submission (3-descriptor chain: header / data / status)
+# ---------------------------------------------------------------------
+# Builds an IN-or-OUT request, publishes on the avail ring with the required
+# wmb between slot write and idx increment (§ 2.7.13.3.1 — all three reference
+# impls flag this as THE critical correctness item), rings the doorbell,
+# polls the used ring (rmb before reading entry id per § 2.7.13.4.1), reads
+# the status byte. Returns 0 on success, -1 on timeout or IOERR/UNSUPP.
 fn vblk_do_request(req_type, sector, buf) {
     if (vblk_active == 0) { return 0 - 1; }
 
-    var qb = vblk_qbase;
     var qsz = vblk_qsize;
-    var desc_base = qb;
-    var avail_base = qb + qsz * 16;
-    # used ring at next page boundary after avail
-    var used_base = (avail_base + 4 + qsz * 2 + 4095) & (0 - 4096);
+    var desc_base  = vblk_desc;
+    var avail_base = vblk_avail;
+    var used_base  = vblk_used;
 
-    # Request header: type(4) + reserved(4) + sector(8) = 16 bytes
-    store32(&vblk_req_hdr, req_type);
+    # virtio_blk_req header: le32 type + le32 reserved + le64 sector = 16 bytes
+    store32(&vblk_req_hdr + 0, req_type);
     store32(&vblk_req_hdr + 4, 0);
     store64(&vblk_req_hdr + 8, sector);
 
-    # Status byte: init to 0xFF
+    # Status byte init to 0xFF (device will overwrite with 0=OK / 1=IOERR / 2=UNSUPP)
     store8(&vblk_req_status, 0xFF);
 
-    # Build 3-descriptor chain
-    # Desc 0: header (device-readable)
-    store64(desc_base, &vblk_req_hdr);       # addr
-    store32(desc_base + 8, 16);               # len
-    store16(desc_base + 12, 1);               # flags: NEXT
-    store16(desc_base + 14, 1);               # next
+    # Build 3-descriptor chain at desc[0..2]
+    # Desc 0: header (device-readable, NEXT)
+    store64(desc_base + 0,  &vblk_req_hdr);
+    store32(desc_base + 8,  16);
+    store16(desc_base + 12, VBLK_DESC_F_NEXT);
+    store16(desc_base + 14, 1);
 
-    # Desc 1: data buffer (512 bytes)
-    store64(desc_base + 16, buf);             # addr
-    store32(desc_base + 24, 512);             # len
-    if (req_type == 0) {
-        store16(desc_base + 28, 3);           # flags: WRITE|NEXT (device writes data)
+    # Desc 1: data buffer (512 B, direction-dependent flags)
+    store64(desc_base + 16, buf);
+    store32(desc_base + 24, 512);
+    if (req_type == VBLK_T_IN) {
+        # Device writes guest memory → F_WRITE | F_NEXT
+        store16(desc_base + 28, VBLK_DESC_F_WRITE | VBLK_DESC_F_NEXT);
     } else {
-        store16(desc_base + 28, 1);           # flags: NEXT (device reads data)
+        # Device reads guest memory → F_NEXT only
+        store16(desc_base + 28, VBLK_DESC_F_NEXT);
     }
-    store16(desc_base + 30, 2);               # next
+    store16(desc_base + 30, 2);
 
-    # Desc 2: status (1 byte, device-writable)
-    store64(desc_base + 32, &vblk_req_status); # addr
-    store32(desc_base + 40, 1);               # len
-    store16(desc_base + 44, 2);               # flags: WRITE
-    store16(desc_base + 46, 0);               # next (unused)
+    # Desc 2: status byte (device-writable, terminal — no F_NEXT)
+    store64(desc_base + 32, &vblk_req_status);
+    store32(desc_base + 40, 1);
+    store16(desc_base + 44, VBLK_DESC_F_WRITE);
+    store16(desc_base + 46, 0);
 
-    # Update available ring
-    var ring_slot = vblk_idx % qsz;
-    store16(avail_base + 4 + ring_slot * 2, 0);  # ring[slot] = desc 0
-    # Memory barrier equivalent: ensure writes are visible
-    store16(avail_base + 2, (vblk_idx + 1) & 0xFFFF);  # idx (must be written AFTER ring entry)
+    # Avail ring slot[idx % qsz] = desc head (0)
+    var slot = vblk_idx % qsz;
+    store16(avail_base + 4 + slot * 2, 0);
+
+    # WMB between slot write and avail.idx increment (§ 2.7.13.3.1).
+    # Without this, the device can race-read a stale slot at the new idx.
+    # mfence encoding: 0F AE F0 — same opcode used in xhci_cmd.cyr:172.
+    asm { 0x0F; 0xAE; 0xF0; }
+
+    # Increment avail.idx (le16 at avail_base + 2). After the wmb, the
+    # device will observe the new slot[] entry before the new idx.
+    store16(avail_base + 2, (vblk_idx + 1) & 0xFFFF);
     vblk_idx = vblk_idx + 1;
 
-    # Notify device (queue 0)
-    outw(vblk_iobase + 16, 0);
+    # Ring the doorbell — write 16-bit queue index (0) to the cached notify
+    # address. § 4.1.5.2: without VIRTIO_F_NOTIFICATION_DATA (we don't
+    # negotiate it), the value is the VQ index as le16.
+    store16(vblk_q0_notify, 0);
 
-    # Poll for completion
+    # Poll used ring for completion. § 2.7.13.4.1 requires an rmb between
+    # reading used.idx and reading used.ring[].id; without it, the consumer
+    # can read a stale entry's id at the new idx.
     var timeout = 0;
     while (timeout < 2000000) {
         var used_idx = load16(used_base + 2);
         if (used_idx != (vblk_used_last & 0xFFFF)) {
+            # RMB before reading the used-ring entry
+            asm { 0x0F; 0xAE; 0xF0; }
             vblk_used_last = vblk_used_last + 1;
+            # Check the status byte
             var status = load8(&vblk_req_status);
             if (status == 0) { return 0; }
             return 0 - 1;
@@ -148,14 +472,14 @@ fn vblk_do_request(req_type, sector, buf) {
     return 0 - 1;
 }
 
-# Phase 5 (1.31.x storage arc) — renamed from `blk_read` / `blk_write` /
-# `blk_read_sectors` so kernel/core/block.cyr can host the public
-# dispatching layer with those names. Backend-specific implementation
-# stays unchanged; only the symbol name moved.
+# ---------------------------------------------------------------------
+# Public block-layer surface (unchanged names from 0.9.5)
+# ---------------------------------------------------------------------
+# Same signatures, same semantics, same return codes. block.cyr dispatch
+# layer and main.cyr init order are byte-compatible across the rewrite.
 
 fn vblk_blk_read(sector, buf) {
-    # Use DMA-safe static buffer, then copy to caller's buffer
-    var r = vblk_do_request(0, sector, &vblk_dma_buf);
+    var r = vblk_do_request(VBLK_T_IN, sector, &vblk_dma_buf);
     if (r == 0) {
         for (var i = 0; i < 64; i = i + 1) {
             store64(buf + i * 8, load64(&vblk_dma_buf + i * 8));
@@ -165,11 +489,11 @@ fn vblk_blk_read(sector, buf) {
 }
 
 fn vblk_blk_write(sector, buf) {
-    # Copy caller's buffer to DMA-safe static buffer
+    if (vblk_readonly == 1) { return 0 - 1; }
     for (var i = 0; i < 64; i = i + 1) {
         store64(&vblk_dma_buf + i * 8, load64(buf + i * 8));
     }
-    return vblk_do_request(1, sector, &vblk_dma_buf);
+    return vblk_do_request(VBLK_T_OUT, sector, &vblk_dma_buf);
 }
 
 fn vblk_blk_read_sectors(start, count, buf) {

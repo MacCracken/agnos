@@ -25,11 +25,12 @@
 # third backend appears (AHCI / SATA, eventually) and the branch arms
 # start to repeat.
 
-var BLK_NONE   = 0;
-var BLK_VIRTIO = 1;
-var BLK_NVME   = 2;
-var BLK_AHCI   = 3;
-var BLK_USB_MS = 4;
+var BLK_NONE    = 0;
+var BLK_VIRTIO  = 1;
+var BLK_NVME    = 2;
+var BLK_AHCI    = 3;
+var BLK_USB_MS  = 4;
+var BLK_RAMDISK = 5;
 
 # Public block-layer state. Consumers read these directly (matching
 # the existing vblk_active / vblk_capacity access pattern).
@@ -86,28 +87,47 @@ fn blk_register_usb_ms(capacity, lba_bytes) {
     return 0;
 }
 
+# RAM-disk — lowest-priority backend (development substrate). Takes the slot
+# only when blk_active == BLK_NONE; never overrides any other backend. With
+# RAM-disk + virtio_blk both enabled (smoke-test boot with `-device virtio-blk-
+# pci,...` + `RAMDISK_ENABLE=1`), virtio's content wins and the RAM-disk's
+# allocation is callable via direct ramdisk_blk_* but not via the public
+# blk_* dispatch. On boots with no other backend (e.g., pure-RAM smoke harness),
+# RAM-disk holds the slot.
+fn blk_register_ramdisk(capacity, lba_bytes) {
+    if (blk_active == BLK_NONE) {
+        blk_active    = BLK_RAMDISK;
+        blk_capacity  = capacity;
+        blk_lba_bytes = lba_bytes;
+    }
+    return 0;
+}
+
 # Dispatch wrappers ---------------------------------------------------
 
 fn blk_read(sector, buf) {
-    if (blk_active == BLK_VIRTIO) { return vblk_blk_read(sector, buf); }
-    if (blk_active == BLK_NVME)   { return nvme_blk_read(sector, buf); }
-    if (blk_active == BLK_AHCI)   { return ahci_blk_read(sector, buf); }
-    if (blk_active == BLK_USB_MS) { return msc_blk_read(sector, buf); }
+    if (blk_active == BLK_VIRTIO)  { return vblk_blk_read(sector, buf); }
+    if (blk_active == BLK_NVME)    { return nvme_blk_read(sector, buf); }
+    if (blk_active == BLK_AHCI)    { return ahci_blk_read(sector, buf); }
+    if (blk_active == BLK_USB_MS)  { return msc_blk_read(sector, buf); }
+    if (blk_active == BLK_RAMDISK) { return ramdisk_blk_read(sector, buf); }
     return 0 - 1;
 }
 
 fn blk_write(sector, buf) {
-    if (blk_active == BLK_VIRTIO) { return vblk_blk_write(sector, buf); }
-    if (blk_active == BLK_NVME)   { return nvme_blk_write(sector, buf); }
-    if (blk_active == BLK_AHCI)   { return ahci_blk_write(sector, buf); }
-    if (blk_active == BLK_USB_MS) { return msc_blk_write(sector, buf); }
+    if (blk_active == BLK_VIRTIO)  { return vblk_blk_write(sector, buf); }
+    if (blk_active == BLK_NVME)    { return nvme_blk_write(sector, buf); }
+    if (blk_active == BLK_AHCI)    { return ahci_blk_write(sector, buf); }
+    if (blk_active == BLK_USB_MS)  { return msc_blk_write(sector, buf); }
+    if (blk_active == BLK_RAMDISK) { return ramdisk_blk_write(sector, buf); }
     return 0 - 1;
 }
 
 fn blk_read_sectors(start, count, buf) {
-    if (blk_active == BLK_VIRTIO) { return vblk_blk_read_sectors(start, count, buf); }
-    if (blk_active == BLK_NVME)   { return nvme_blk_read_sectors(start, count, buf); }
-    if (blk_active == BLK_AHCI)   { return ahci_blk_read_sectors(start, count, buf); }
-    if (blk_active == BLK_USB_MS) { return msc_blk_read_sectors(start, count, buf); }
+    if (blk_active == BLK_VIRTIO)  { return vblk_blk_read_sectors(start, count, buf); }
+    if (blk_active == BLK_NVME)    { return nvme_blk_read_sectors(start, count, buf); }
+    if (blk_active == BLK_AHCI)    { return ahci_blk_read_sectors(start, count, buf); }
+    if (blk_active == BLK_USB_MS)  { return msc_blk_read_sectors(start, count, buf); }
+    if (blk_active == BLK_RAMDISK) { return ramdisk_blk_read_sectors(start, count, buf); }
     return 0 - 1;
 }

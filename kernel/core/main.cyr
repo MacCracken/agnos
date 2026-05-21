@@ -273,7 +273,7 @@ if (pci_find(0x1AF4, 0x1000) >= 0) {
         kprintln("Net: 10.0.2.15/24 gw 10.0.2.2", 30);
     }
 }
-if (pci_find(0x1AF4, 0x1001) >= 0) {
+if ((pci_find(0x1AF4, 0x1042) >= 0) | (pci_find(0x1AF4, 0x1001) >= 0)) {
     if (virtio_blk_init() == 0) {
         kprint("VirtIO-blk: ", 12);
         kprint_num(vblk_capacity);
@@ -283,6 +283,16 @@ if (pci_find(0x1AF4, 0x1001) >= 0) {
         }
     }
 }
+# RAM-disk Phase 1 (1.31.4) — pure-RAM block backend, build-flag gated. When
+# RAMDISK_ENABLE=1 is set at compile time (`RAMDISK_ENABLE=1 ./scripts/build.sh`),
+# preallocates 64 pages (256 KB) at boot via pmm_alloc and registers as the
+# lowest-priority block backend. Production boots leave this off — zero pmm
+# cost. See agnosticos/docs/development/ramdisk-virtio-modern-prior-art.md.
+#ifdef RAMDISK_ENABLE
+if (ramdisk_init() == 0) {
+    ramdisk_register_block_dev();
+}
+#endif
 # NVMe Phase 1 — locate the NVMe controller (if present), remap BAR0
 # as UC, read CAP + VS, decode capability fields, drive the controller
 # into the disabled state (CC.EN=0, CSTS.RDY=0). Probe-only — no admin

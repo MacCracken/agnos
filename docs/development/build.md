@@ -49,6 +49,7 @@ Three of these (architecture, ELF64) are mandatory and set by the script automat
 | **`XHCI_VERBOSE`** | source-side (prepended, env-driven) | **off** | Compiles in xhci developmental debug output: `cmd_submit#` trb-tracking, `evt#` event trace, `drained N events`, `PP=1 asserted bitmap=`, `CRCR.CRR / ERSTSZ / IMAN / ERDP_lo` readback, `enable_slot entry idx=`. High-level confirmation lines (`halted, reset clean`, `dev_notifications enabled`, `controller running, HCH=0, ERDP=`, port-connected, error cases) are unconditional regardless of this flag |
 | **`AHCI_RW_DEMO`** | source-side (prepended, env-driven) | **off** | Compiles in the AHCI boot-time sentinel write + read-back round-trip at LBA 5 of the lowest-numbered initialized SATA port. Default-off because LBA 5 on a GPT-formatted disk sits inside the partition-entry array (entries 12-15 at standard `partition_entries_lba=2` layout); writing a sentinel there corrupts the partition-array CRC (recoverable via `sgdisk --load-backup` from the disk's tail backup, but not the right default posture against drives the user cares about). The always-on `ahci_read_demo` (LBA 0 readback, no writes) provides Phase-4-DMA validation on iron without the write hazard. Enable for QEMU smoke (`AHCI_RW_DEMO=1 ./scripts/build.sh`) or known-scratch drives only |
 | **`MSC_RW_DEMO`** | source-side (prepended, env-driven) | **off** | Compiles in the USB Mass Storage boot-time sentinel write + read-back round-trip at LBA 100 of `msc_first_slot` (first MSC-BBB device that completes Phase 1-3). Default-off for the same reason as `AHCI_RW_DEMO` — LBA 100 on a typical USB stick may sit inside a filesystem; sentinel writes there are recoverable (8 bytes overwritten) but not the right default posture against drives the user cares about. The always-on `msc_read_demo` (LBA 0 readback, no writes) provides Phase-4-DMA validation on iron without the write hazard. Enable for QEMU smoke (`MSC_RW_DEMO=1 ./scripts/build.sh`) or known-scratch USB devices only |
+| **`RAMDISK_ENABLE`** | source-side (prepended, env-driven) | **off** | Compiles in the RAM-disk block backend (`kernel/core/ramdisk.cyr`). At boot, preallocates 64 pages (256 KB) from `pmm_alloc` and registers as the lowest-priority block backend — takes the slot only when no other backend (NVMe / AHCI / USB-MS / VirtIO) holds it. Useful as a development substrate for filesystem work without iron and as a regression target for the block-dispatch policy. Default-off because the 256 KB allocation eats ~18% of archaemenid's post-boot pmm budget (~354 free pages); production boots stay lean. To resize, edit `RAMDISK_NPAGES_DEFAULT` in `ramdisk.cyr` (capped at 128 = 512 KB by `RAMDISK_NPAGES_MAX` until the pmm budget audit reports >1024 free pages post-boot). Multi-source convergent design (OpenBSD `rd.c` MINIROOTSIZE pattern + NetBSD `md.c` MD_KMEM_ALLOCATED preallocation) — see `agnosticos/docs/development/ramdisk-virtio-modern-prior-art.md` § 3 |
 
 ### Enabling the gates
 
@@ -64,6 +65,9 @@ AHCI_RW_DEMO=1 ./scripts/build.sh
 
 # Compile in the USB MS LBA-100 sentinel write demo (QEMU smoke or scratch device only)
 MSC_RW_DEMO=1 ./scripts/build.sh
+
+# Compile in the RAM-disk block backend (256 KB preallocated at boot)
+RAMDISK_ENABLE=1 ./scripts/build.sh
 
 # Full developmental output
 KTEST=1 XHCI_VERBOSE=1 ./scripts/build.sh
