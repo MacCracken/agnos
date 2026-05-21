@@ -68,7 +68,7 @@ Effective priority: NVMe > AHCI > USB-MS > VirtIO > RAMDISK > NONE.
 4. **Transitional virtio-blk-pci** (`-device virtio-blk-pci,drive=blk` — default QEMU, device ID `0x1001` with modern caps present) — `VirtIO-blk: 16384 sectors`, same outcome via cap-list scan, legacy I/O BAR ignored. Modern caps path correctly drives the transitional device.
 5. **Combined** (`RAMDISK_ENABLE=1` + `-device virtio-blk-pci,...`) — `VirtIO-blk: 16384 sectors` followed by `ramdisk: 512 LBAs x 512B (64 pages; virtio primary)`, then `AGNOS shell`. Priority policy works correctly: virtio holds `blk_active`, RAM-disk allocated and known but secondary.
 
-No iron exposure (RAM-only / QEMU-only); the 1.31.x storage arc's iron coverage stays NVMe + SATA + USB-MS as of 1.31.3.
+No iron exposure for the new bites themselves (RAM-disk is `pmm_alloc`-backed; VirtIO has no device to enumerate on bare metal); the 1.31.x storage arc's iron coverage stays NVMe + SATA + USB-MS as of 1.31.3. **The 1.31.4 binary IS iron-validated at Attempt 88 on archaemenid as a no-regression burn** — full storage trio re-registered cleanly (NVMe primary / AHCI secondary / USB MS tertiary), GPT parsed, kernel reached scheduler init (`Timer ticks before sched: 6`). Photos at `agnosticos/docs/development/iron-nuc-zen-photos/attempt-88-agnos-1.31.4-iron-debut-pt{1,2}-*.jpg`; entry at `agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 88. RAM-disk-on-iron deferred as a non-pinned follow-up (rebuild with `RAMDISK_ENABLE=1` and re-burn to see the `ramdisk:` print on archaemenid; low information value since RAM-disk is `pmm_alloc`-backed — only worth it for CHANGELOG completeness — tracked in `agnosticos/docs/development/roadmap.md`, scheduled before 1.35.0).
 
 #### Build trajectory
 
