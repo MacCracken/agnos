@@ -300,12 +300,24 @@ fn xhci_cmd_issue(p_lo, p_hi, status, ctrl_partial) {
 # clearing any stuck TR Dequeue Pointer state in the EP context. TSP bit
 # (bit 9) left 0 = full state clear (Linux default for non-stream EPs).
 #
-# Returns 1 on Success, 0 on any other completion code.
+# Tolerates Context State Error (CC=19) per xHCI 1.2 §4.6.8: Reset Endpoint
+# requires the EP to be in Halted state. After Stop Endpoint, the EP is in
+# Stopped — also a valid pre-condition for the subsequent Set TR Dequeue
+# Pointer command (the actual resync). Treating CSE as success here lets
+# recovery proceed for timeout-wedged (non-STALL) endpoints, where the EP
+# transitions Running → Stopped without ever entering Halted. Phase 2.6
+# iron (Attempt 85) confirmed this is the dominant path on real-vendor
+# Silicon Motion SMI sticks — wedge symptom is transfer-event timeout, not
+# device-side STALL.
+#
+# Returns 1 on Success OR Context State Error; 0 on any other failure.
 fn xhci_cmd_reset_endpoint(slot_id, dci) {
     var ctrl = (XHCI_TRB_RESET_ENDPOINT << 10)
     | ((dci     & 0x1F) << 16)
     | ((slot_id & 0xFF) << 24);
-    return xhci_cmd_issue(0, 0, 0, ctrl);
+    if (xhci_cmd_issue(0, 0, 0, ctrl) != 0) { return 1; }
+    if (xhci_last_cmd_ccode == XHCI_CC_CONTEXT_STATE_ERROR) { return 1; }
+    return 0;
 }
 
 # Stop Endpoint — TRB type 15. Forces a Running EP into Stopped state so

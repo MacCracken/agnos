@@ -5,6 +5,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### USB Mass Storage Phase 2.7 — multi-source-converged Reset Recovery hardening (post-Attempt-85 carry-forward, pre-Attempt-86 build)
+
+Closes the four-patch carry-forward from Attempt 85's FALSIFIED outcome (Phase 2.6's `xhci_cmd_reset_endpoint` returned non-Success completion code, aborting recovery before Set TR Dequeue Pointer could fire). Post-burn code-read against xHCI 1.2 §4.6.8 surfaced the root cause: Reset Endpoint is only legal from Halted state, but Attempt 84/85's transport wedge is a transfer-event timeout — the EP never entered Halted; Stop Endpoint left it in Stopped; Reset Endpoint on Stopped returned `Context State Error` (CC=19).
+
+Per [`feedback_redesign_dont_reinvent`](https://github.com/MacCracken/agnosticos/blob/main/.claude/projects/-home-macro-Repos-agnosticos/memory/feedback_redesign_dont_reinvent.md) (refreshed 2026-05-21 with hard "multi-source" rule after user feedback "LINUX ISN'T THE ONLY RESOURCE OF PRIOR ART"): four-source convergent audit (**FreeBSD** `sys/dev/usb/storage/umass.c` + `sys/dev/usb/controller/xhci.c`; **OpenBSD** `sys/dev/usb/umass.c`; **EDK2** `MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassBot.c`; **Linux** `drivers/usb/storage/transport.c` + `drivers/usb/host/xhci.c` — confirmatory only, not load-bearing). Full audit in [`agnosticos/docs/development/msc-reset-recovery-prior-art.md` § 9](https://github.com/MacCracken/agnosticos/blob/main/docs/development/msc-reset-recovery-prior-art.md). Per [`feedback_no_letter_codes_for_repairs`](https://github.com/MacCracken/agnosticos/blob/main/.claude/projects/-home-macro-Repos-agnosticos/memory/feedback_no_letter_codes_for_repairs.md): named for what they do.
+
+- **Reset Endpoint CSE tolerance** (`xhci_cmd.cyr` `xhci_cmd_reset_endpoint`). Defensive backstop — `XHCI_CC_CONTEXT_STATE_ERROR` returned as success the same way `xhci_cmd_stop_endpoint` already does. Per xHCI 1.2 §4.6.8, Reset Endpoint on a non-Halted EP is harmless — Stop Endpoint already put the EP in the destination state Reset Endpoint would produce from Halted; Set TR Dequeue Pointer at the end of recovery does the actual resync. Treating CSE as success lets recovery proceed for timeout-wedged (non-STALL) endpoints, where the EP transitions Running → Stopped without ever entering Halted.
+
+- **EP-state-aware Reset Endpoint dispatch** (`xhci_ctx.cyr` new `xhci_ep_state(slot_id, dci)` + `xhci_regs.cyr` new `XhciEpState` enum + `msc.cyr` step 7). New helper reads Output EP Context dword 0 bits 0-2 per xHCI 1.2 §6.2.3 (`XHCI_EP_STATE_DISABLED=0 / RUNNING=1 / HALTED=2 / STOPPED=3 / ERROR=4`). `msc_reset_recovery` step 7 gates `xhci_cmd_reset_endpoint` on `XHCI_EP_STATE_HALTED`; STOPPED / RUNNING / DISABLED skip the command entirely. Mirrors FreeBSD `xhci_get_endpoint_state` + `xhci_configure_reset_endpoint` switch.
+
+- **100ms post-BOT-Reset device stall** (`msc.cyr` step 2). 50M-iteration busy-wait between Bulk-Only Mass Storage Reset and CLEAR_FEATURE(HALT). Calibrated against existing 5M ≈ 5-10ms loop at `msc.cyr:369`. Matches EDK2's explicit `gBS->Stall(USB_BOT_RESET_DEVICE_STALL)`; FreeBSD's implicit 50ms `.interval` between RESET1 → RESET2; Linux's `msleep(100)` in `usb_stor_Bulk_reset`. Spec rationale per USB MSC BBB §6.7.3: "The device shall NAK the host's request until the reset is complete." **Highest-confidence fix in the Phase 2.7 stack** — Attempt 84's "Reset Recovery OK but transport stays wedged across retries" matches a CLEAR_FEATURE arriving mid-device-reset → silent NAK → recovery completes structurally but transport stays wedged on retry.
+
+- **Reset Recovery step reorder: device-side first** (`msc.cyr` full `msc_reset_recovery` body). New canonical order: (1) Bulk-Only MS Reset → (2) 100ms stall → (3-4) CLEAR_FEATURE(HALT)×2 → (5) drain stale Transfer Events → (6) Stop Endpoint×2 → (7) Reset Endpoint×2 (Halted-gated) → (8) host-side ring rewind → (9) Set TR Dequeue×2 → (10) clear `transport_failed` sticky. Matches convergent reference ordering across all four impls — device sees a clean reset first, then controller state is resynced to match. Previous Phase 2.6 order (controller-side first, then device-side) was AGNOS-specific; no other reference impl does it that way.
+
+**Iron-validation gate at Attempt 86**: install agnos 1.31.2 `[Unreleased]` HEAD on archaemenid, plug the same Silicon Motion stick used at Attempts 84/85 (`VID=0x090C PID=0x1000`). Success rubric per [`msc-reset-recovery-prior-art.md` § 9.4](https://github.com/MacCracken/agnosticos/blob/main/docs/development/msc-reset-recovery-prior-art.md): (a) full — TUR Pass on retry 2/3 + INQUIRY + RC10 + tertiary registration; (b) partial — Reset Recovery completes, sense data printed (SCSI-layer issue, transport fixed); (c) partial — Reset Recovery still wedges (Phase 2.8 territory; re-read prior art for missed step); (d) failure — new error line not seen before (code bug in 2.7).
+
+**MVP gate posture:** unaffected. `msc_probe_slot` already returns 1 even on transport failure (Phase 1-4 design), so MVP boot-to-shell stays green regardless of Attempt 86 outcome. USB MS arc is opportunistic — closed beta MVP depends on kybernet + agnoshi + kernel-on-iron, not on a specific block backend.
+
+**Build:** 499,736 B (Attempt 85 / Phase 2.6) → **499,816 B** (+80 B for the Phase 2.7 stack — comments + 50M-iter delay loop + `xhci_ep_state` helper + EP-state dispatch in `msc_reset_recovery`).
+
+**Files changed:** `kernel/arch/x86_64/usb/xhci_cmd.cyr` (CSE tolerance on `xhci_cmd_reset_endpoint`), `kernel/arch/x86_64/usb/xhci_regs.cyr` (new `XhciEpState` enum: DISABLED/RUNNING/HALTED/STOPPED/ERROR), `kernel/arch/x86_64/usb/xhci_ctx.cyr` (new `xhci_ep_state(slot_id, dci)` reader), `kernel/arch/x86_64/usb/msc.cyr` (`msc_reset_recovery` body rewritten with device-side-first ordering + 100ms stall + EP-state-aware Reset Endpoint dispatch).
+
+Detail in [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempts 85-86](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) + [`msc-reset-recovery-prior-art.md` § 9](https://github.com/MacCracken/agnosticos/blob/main/docs/development/msc-reset-recovery-prior-art.md).
+
+### USB Mass Storage Phase 2.6 — controller-side xHCI command recovery (post-Attempt-84 carry-forward, FALSIFIED at Attempt 85)
+
+Closes the four-patch controller-side carry-forward from Attempt 84's PARTIAL outcome — the burn that proved Phase 2.5 device-side Reset Recovery executed cleanly on iron but device transport stayed wedged across retries. The Phase 2.6 hypothesis: xHC's EP context lags pinned at the wedged TRDP because device-side recovery doesn't touch controller state; xHCI 1.2 §4.10.2.1 specifies Stop Endpoint + Reset Endpoint + Set TR Dequeue Pointer as the controller-side half of Halted Endpoint Recovery. Hypothesis was correct in shape but the Reset Endpoint dispatch was wrong — see Phase 2.7 above for the multi-source-converged repair stack that landed in the same release cycle.
+
+- **Three new xHCI command helpers** (`xhci_cmd.cyr`): `xhci_cmd_reset_endpoint(slot_id, dci)` (TRB type 14), `xhci_cmd_stop_endpoint(slot_id, dci)` (TRB type 15; tolerates `XHCI_CC_CONTEXT_STATE_ERROR`), `xhci_cmd_set_tr_dequeue(slot_id, dci, deq_ptr_phys, dcs)` (TRB type 16). All three thin wrappers around the existing `xhci_cmd_issue` dispatcher. TRB type constants `XHCI_TRB_RESET_ENDPOINT / XHCI_TRB_STOP_ENDPOINT / XHCI_TRB_SET_TR_DEQUEUE` added to `XhciTrbType` enum in `xhci_regs.cyr`.
+- **`xhci_drain_transfer_events(slot_id)`** new helper in `xhci.cyr`. Drains any stale Transfer Events for the given slot from the event ring — addresses the CSW tag mismatch surfaced at Attempt 84 (a late completion for the wedged TRB was being consumed by the next `xhci_wait_transfer_event` as the new transfer's event).
+- **`msc_reset_recovery` extended** (`msc.cyr`) with the controller-side commands wrapping the device-side dance: Stop Endpoint→Reset Endpoint→drain events→[Phase 2.5 device-side]→ring rewind→Set TR Dequeue Pointer. Initial ordering had controller-side first; Phase 2.7 reordered to device-side first per multi-source convergence.
+
+**Iron-validation at Attempt 85 2026-05-21 → FALSIFIED**: `msc: Reset Endpoint(bulk-IN) failed` × 2 abort recovery before Set TR Dequeue Pointer can fire. Root cause: `xhci_cmd_reset_endpoint` did not tolerate CSE, and the EP was in Stopped (not Halted) after Stop Endpoint → Reset Endpoint returned CSE → recovery aborted. Phase 2.7 fixes this with state-aware dispatch.
+
+**Build:** 496,656 B (Phase 2.5) → **499,736 B** (+3,080 B for Phase 2.6 stack: three xHCI command helpers + event-ring drain + `msc_reset_recovery` extension + aarch64 stubs).
+
+**Files changed:** `kernel/arch/x86_64/usb/xhci_cmd.cyr` (+3 command helpers), `kernel/arch/x86_64/usb/xhci_regs.cyr` (+3 TRB type constants), `kernel/arch/x86_64/usb/xhci.cyr` (+`xhci_drain_transfer_events`), `kernel/arch/x86_64/usb/msc.cyr` (`msc_reset_recovery` extended with controller-side commands), `kernel/arch/aarch64/stubs.cyr` (matching stubs).
+
+Detail in [`iron-nuc-zen-log.md` § Attempt 85](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
+
 ### AHCI carry-forward — three named patches (post-Attempt-81)
 
 Cleans up the three follow-up surfaces from the 1.31.1 AHCI iron debut (Attempt 81 on archaemenid + WD Blue SA510). Read-only investigation found that hypothesis #1 from the carry-forward (PxIS not W1C-cleared between commands) is **wrong** — both `ahci_identify_device` and `ahci_issue_rw` already clear PxIS + PxSERR before issuing. The actual gap is narrower: neither function waits for **controller quiescence** before issuing the next command.
@@ -341,18 +381,13 @@ The retry / Reset Recovery / REQUEST SENSE paths are unexercised by QEMU (which 
 
 **Iron-validation gate for Attempt 84**: install on archaemenid, plug the same USB 2.0 stick used at Attempt 83 (or any real-vendor USB stick), observe whether (a) Reset Recovery unwedges the bulk transport (`msc: slot N Reset Recovery OK` followed by a Pass on retry 2 or 3), or (b) the device-only recovery isn't enough (`xhci: transfer event timeout` repeats, REQUEST SENSE also times out) — which would surface Phase 2.6 as the next-touch. Either outcome is iron-actionable. Pre-burn audit refresh queued for `usb-ms-iron-burn-audit.md` § 7+ (Phase 2.5 success rubric).
 
-### 1.31.2 remaining scope — opening
+### 1.31.2 cycle status — Phase 2.7 built, Attempt 86 burn pending
 
-Cycle theme stays **storage**. With AHCI carry-forward shipped above, the primary engineering bite opens:
+Current `[Unreleased]` work since 1.31.1 cut (the AHCI carry-forward + USB MS Phase 1 through Phase 2.7 + cyrius pin graduation) builds clean. **Closing 1.31.2 is gated on Attempt 86 iron evidence** (the Phase 2.7 burn) — only after iron reports does the user decide whether to ship 1.31.2 as-is, fold Attempt 86 result into the close, or extend with another phase.
 
-- **USB Mass Storage (Bulk-Only Transport + SCSI READ(10)/WRITE(10))** — third iron-validatable block backend, extending the xHCI investment. Linux `drivers/usb/storage/usb.c` reference; structurally simpler than xHCI itself (just bulk endpoints + a small command opcode set). Iron validation target: any flash drive or USB HDD on archaemenid.
-- **Optical via USB MS (SCSI MMC profile)** — promoted from the previously-punted "1.32.x+ optical (ATAPI/AHCI)" slot. The legacy "~800 LOC over AHCI ATAPI" estimate is the *AHCI passthrough* path; USB-attached optical drives ride USB Mass Storage at the SCSI layer, so the additional cost over the planned USB MS work is bounded (~200 LOC: SCSI INQUIRY peripheral-device-type=0x05 discrimination + READ CAPACITY(10) returning 2048 B/sector + parameterizing `lba_bytes` through GPT/fatfs consumers + a couple of MMC-specific opcodes — TEST UNIT READY, READ CAPACITY(10)). **Iron validation target: HP external USB Blu-ray drive (Pitch Black BD-25 disc loaded) on archaemenid.** First non-512-B-sector device on AGNOS — `lba_bytes=2048` will be the first time the `blk_register_*(capacity, lba_bytes)` parameter is exercised at a non-default value, which forces GPT/fatfs consumers to honor it instead of hardcoding `* 512`.
+Iron trajectory so far in 1.31.2 `[Unreleased]`: Attempt 82 (AHCI carry-forward + cyrius 6.0.1 debut PASS) → Attempt 83 (USB MS debut PARTIAL — TUR-gate gap) → Attempt 84 (Phase 2.5 PARTIAL — device-side recovery executes clean; controller-side justified) → Attempt 85 (Phase 2.6 FALSIFIED — Reset Endpoint CSE; multi-source audit triggered) → Phase 2.7 lands in source + build. **Attempt 86 not yet burned.**
 
-**1.31.3** opens with **RAM-disk backend** (~150 LOC, pure-RAM `/dev/ram0`-equivalent over `pmm_alloc` + tag-dispatch) + **VirtIO-blk modern (1.x)** (~600 LOC delta upgrading the existing transitional 0.9.5 `virtio_blk.cyr` to MMIO + feature negotiation). Both backends are structurally independent of USB MS / Optical.
-
-**1.31.4** opens with **ext2 read-only** (displaced from previous 1.31.3 slot; ~1000+ LOC). Filesystem class, not device class — FAT16 read-only at v1.11.0 is the floor; ext2 buys real Linux disk semantics (inodes, indirect blocks).
-
-Detail in [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 81](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) and [`agnosticos/docs/development/state.md` § AHCI iron carry-forward](https://github.com/MacCracken/agnosticos/blob/main/docs/development/state.md).
+Detail in [`agnosticos/docs/development/iron-nuc-zen-log.md` §§ Attempts 81-86](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) and [`agnosticos/docs/development/state.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/state.md).
 
 ---
 

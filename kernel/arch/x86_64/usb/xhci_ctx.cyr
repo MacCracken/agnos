@@ -234,6 +234,22 @@ fn xhci_dcbaa_install(slot_id, dev_ctx_phys) {
     return 1;
 }
 
+# Read the current EP State field (xHCI 1.2 §6.2.3) for a given slot/DCI.
+# Returns the 3-bit state value from Output Endpoint Context dword 0 bits
+# 0-2, or 0 (Disabled) if the slot has no installed device context.
+#
+# Used by Phase 2.6 Reset Recovery dispatch — Reset Endpoint is only legal
+# from Halted (2); calling it on Stopped (3) returns Context State Error.
+# Reading EP State after Stop Endpoint lets us distinguish the STALL-recovery
+# case (Halted → Reset Endpoint) from the timeout-wedge case (Stopped → skip
+# Reset Endpoint, go straight to Set TR Dequeue Pointer).
+fn xhci_ep_state(slot_id, dci) {
+    var dev_ctx = xhci_slot_get(xhci_slot_dev_ctx, slot_id);
+    if (dev_ctx == 0) { return XHCI_EP_STATE_DISABLED; }
+    var ep_ctx  = dev_ctx + xhci_ep_ctx_off(dci);
+    return load32(ep_ctx + 0) & 0x7;
+}
+
 # Compute the DCI (Device Context Index) for a USB endpoint address.
 #   DCI = (ep_num * 2) + (in_direction ? 1 : 0)
 # EP0 is always DCI=1 (handled by xhci_alloc_input_ctx). For an

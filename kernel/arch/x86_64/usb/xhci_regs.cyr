@@ -170,6 +170,19 @@ enum XhciCompletionCode {
     XHCI_CC_CONTEXT_STATE_ERROR  = 19;
 }
 
+# Endpoint State values (xHCI 1.2 §6.2.3, Output Endpoint Context dword 0
+# bits 0-2). After a Stop Endpoint command the EP transitions to Stopped;
+# after a device STALL it transitions to Halted. Reset Endpoint is only
+# legal from Halted — issuing it on a Stopped EP returns CSE. Phase 2.6
+# Reset Recovery reads this field to dispatch correctly.
+enum XhciEpState {
+    XHCI_EP_STATE_DISABLED       = 0;
+    XHCI_EP_STATE_RUNNING        = 1;
+    XHCI_EP_STATE_HALTED         = 2;
+    XHCI_EP_STATE_STOPPED        = 3;
+    XHCI_EP_STATE_ERROR          = 4;
+}
+
 # PORTSC — Port Status and Control Register (xHCI 1.2 §5.4.8).
 #
 # Located at op_base + 0x400 + (port_num * 0x10). Each root hub port has

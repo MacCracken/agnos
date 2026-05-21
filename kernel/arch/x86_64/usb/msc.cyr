@@ -735,41 +735,71 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
 # the xHC's bulk EPs Halted with pinned TR Dequeue Pointers — every post-
 # recovery transfer wedges because the controller refuses to fetch.
 #
-# Canonical sequence:
+# Canonical sequence — device-side FIRST (per converged reference impls:
+# FreeBSD umass, OpenBSD umass, EDK2 UsbMassBot all do device-side reset
+# before any host-controller resync). AGNOS-specific defensive event
+# drain sits between device-side and controller-side phases.
 #
-#   --- controller-side (Phase 2.6 — xHCI 1.2 §4.6.8 / §4.6.9 / §4.6.10) ---
-#   1a. Stop Endpoint(bulk-IN)   — Running → Stopped (tolerates Context
-#                                   State Error if already Stopped/Halted)
-#   1b. Stop Endpoint(bulk-OUT)
-#   2a. Reset Endpoint(bulk-IN)  — Halted → Stopped, clears stuck TRDP
-#   2b. Reset Endpoint(bulk-OUT)
-#   3.  Drain stale Transfer Events for this slot from the event ring
-#       (the smoking gun for Attempt 84's CSW tag mismatch — late
-#       completions for the wedged TRBs would otherwise be consumed by
-#       the next xhci_wait_transfer_event as the new transfer's event).
+#   --- device-side (USB MSC BBB §6.7.3) ---
+#   1. Bulk-Only Mass Storage Reset (class control on EP0, 0x21/0xFF/0/intf)
+#   2. 100ms post-reset device stall — required per USB MSC BBB §6.7.3:
+#      "The device shall NAK the host's request until the reset is
+#      complete." EDK2 UsbBotResetDevice stalls explicitly 100ms;
+#      FreeBSD umass_bbb_config encodes implicit 50ms .interval between
+#      RESET1 → RESET2. Without this stall, Attempt 84 iron showed
+#      "Reset Recovery OK" but transport stayed wedged across retries
+#      because subsequent CLEAR_FEATURE arrived mid-reset.
+#   3. CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN  (0x02/0x01/0/ep_in_addr)
+#   4. CLEAR_FEATURE(ENDPOINT_HALT) on bulk-OUT (0x02/0x01/0/ep_out_addr)
 #
-#   --- device-side (Phase 2.5 — USB MSC BBB §6.7.3) ---
-#   4. Bulk-Only Mass Storage Reset (class control on EP0, 0x21/0xFF/0/intf)
-#   5. CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN  (0x02/0x01/0/ep_in_addr)
-#   6. CLEAR_FEATURE(ENDPOINT_HALT) on bulk-OUT (0x02/0x01/0/ep_out_addr)
+#   --- AGNOS-specific defensive safety ---
+#   5. Drain stale Transfer Events for this slot from the event ring
+#      (smoking gun for Attempt 84's CSW tag mismatch — late completions
+#      for wedged TRBs would otherwise be consumed by the next
+#      xhci_wait_transfer_event as the new transfer's event).
 #
-#   --- host-side ring rewind (Phase 2.5) ---
-#   7. Re-zero ring pages, rewrite Link TRBs, reset cycle/idx in row state.
+#   --- controller-side (xHCI 1.2 §4.6.8 / §4.6.9 / §4.6.10) ---
+#   6a. Stop Endpoint(bulk-IN)   — Running → Stopped (tolerates CSE
+#                                   if already Stopped/Halted)
+#   6b. Stop Endpoint(bulk-OUT)
+#   7a. Reset Endpoint(bulk-IN)  — Halted → Stopped, clears stuck TRDP;
+#                                   ONLY issued if EP state == Halted
+#                                   (spec-correct dispatch per FreeBSD
+#                                   xhci_configure_reset_endpoint —
+#                                   Reset Endpoint on Stopped returns
+#                                   CSE which would abort recovery)
+#   7b. Reset Endpoint(bulk-OUT) — same gate
 #
-#   --- controller-side resync (Phase 2.6) ---
-#   8a. Set TR Dequeue Pointer(bulk-IN,  ring_in,  DCS=1)
-#   8b. Set TR Dequeue Pointer(bulk-OUT, ring_out, DCS=1)
-#       DCS=1 because step 7 reset host-side cycle to 1; the next producer
+#   --- host-side ring rewind ---
+#   8. Re-zero ring pages, rewrite Link TRBs, reset cycle/idx in row state.
+#
+#   --- controller-side resync ---
+#   9a. Set TR Dequeue Pointer(bulk-IN,  ring_in,  DCS=1)
+#   9b. Set TR Dequeue Pointer(bulk-OUT, ring_out, DCS=1)
+#       DCS=1 because step 8 reset host-side cycle to 1; the next producer
 #       TRB will be written with cycle=1 and HW must expect the same.
 #
-#   9. Clear transport_failed sticky.
+#   10. Clear transport_failed sticky.
 #
-# Linux references:
-#   drivers/usb/storage/transport.c — usb_stor_Bulk_reset, usb_stor_clear_halt
-#   drivers/usb/host/xhci.c         — xhci_endpoint_reset (HCD callback)
-#   drivers/usb/host/xhci-ring.c    — xhci_queue_reset_ep,
-#                                      xhci_queue_stop_endpoint,
-#                                      xhci_queue_new_dequeue_state
+# Multi-source prior art (consulted 2026-05-21; per
+# feedback_redesign_dont_reinvent — Linux is one source of many, never
+# the singular reference):
+#   FreeBSD sys/dev/usb/storage/umass.c — umass_t_bbb_reset1_callback +
+#                                          umass_bbb_config (.interval=500/50)
+#   FreeBSD sys/dev/usb/controller/xhci.c — xhci_get_endpoint_state +
+#                                            xhci_configure_reset_endpoint
+#                                            (the state-aware dispatch we
+#                                            mirror in step 7)
+#   OpenBSD sys/dev/usb/umass.c — umass_bbb_reset (TSTATE_BBB_RESET1/2/3)
+#   EDK2    MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassBot.c —
+#                                            UsbBotResetDevice (explicit
+#                                            100ms gBS->Stall mirrored
+#                                            in step 2)
+#   Linux   drivers/usb/storage/transport.c — usb_stor_Bulk_reset
+#   Linux   drivers/usb/host/xhci.c         — xhci_endpoint_reset
+#   Linux   drivers/usb/host/xhci-ring.c    — xhci_queue_reset_ep,
+#                                              xhci_queue_stop_endpoint,
+#                                              xhci_queue_new_dequeue_state
 #
 # Prior-art walk: agnosticos/docs/development/msc-reset-recovery-prior-art.md
 #
@@ -782,9 +812,40 @@ fn msc_reset_recovery(slot_id) {
     var dci_in      = load8(row + 40);
     var dci_out     = load8(row + 41);
 
-    # --- Step 1: Stop Endpoint (controller-side; Running → Stopped) ---
+    # --- Step 1: Bulk-Only Mass Storage Reset (device-side, class CTRL) ---
+    if (xhci_control_no_data(slot_id, 0x21, 0xFF, 0, intf) == 0) {
+        kprintln("msc: Bulk-Only MS Reset failed", 30);
+        return 0;
+    }
+
+    # --- Step 2: 100ms post-reset device stall (USB MSC BBB §6.7.3) ---
+    # EDK2 UsbBotResetDevice does this explicitly. Without it, subsequent
+    # CLEAR_FEATURE may race in-progress device reset → silent NAK →
+    # recovery completes "OK" but transport stays wedged on retry (the
+    # exact Attempt 84 symptom). 50M iteration busy-wait calibrated
+    # against msc.cyr:369 (5M ≈ 5-10ms on Zen-class silicon) ≈ 50-100ms
+    # wall, conservatively at the 100ms target.
+    var rs = 0;
+    while (rs < 50000000) { rs = rs + 1; }
+
+    # --- Step 3: CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN ---
+    if (xhci_control_no_data(slot_id, 0x02, 0x01, 0, ep_in_addr) == 0) {
+        kprintln("msc: CLEAR_FEATURE(HALT) bulk-IN failed", 39);
+        return 0;
+    }
+
+    # --- Step 4: CLEAR_FEATURE(ENDPOINT_HALT) on bulk-OUT ---
+    if (xhci_control_no_data(slot_id, 0x02, 0x01, 0, ep_out_addr) == 0) {
+        kprintln("msc: CLEAR_FEATURE(HALT) bulk-OUT failed", 40);
+        return 0;
+    }
+
+    # --- Step 5: drain stale Transfer Events for this slot ---
+    xhci_drain_transfer_events(slot_id);
+
+    # --- Step 6: Stop Endpoint (controller-side; Running → Stopped) ---
     # Tolerates Context State Error (= EP already Stopped/Halted/Disabled)
-    # which is a valid pre-condition for Reset Endpoint.
+    # which is a valid pre-condition for the optional Reset Endpoint.
     if (xhci_cmd_stop_endpoint(slot_id, dci_in) == 0) {
         kprintln("msc: Stop Endpoint(bulk-IN) failed", 34);
         return 0;
@@ -794,38 +855,29 @@ fn msc_reset_recovery(slot_id) {
         return 0;
     }
 
-    # --- Step 2: Reset Endpoint (controller-side; Halted → Stopped) ---
-    if (xhci_cmd_reset_endpoint(slot_id, dci_in) == 0) {
-        kprintln("msc: Reset Endpoint(bulk-IN) failed", 35);
-        return 0;
+    # --- Step 7: Reset Endpoint (controller-side; Halted → Stopped) ---
+    # Spec-correct dispatch per xHCI 1.2 §4.6.8 + FreeBSD
+    # xhci_configure_reset_endpoint: Reset Endpoint is only legal from
+    # Halted state. Reading Output EP Context state and gating Reset
+    # Endpoint on Halted prevents the CSE-abort that bricked Attempt 85.
+    # The xhci_cmd_reset_endpoint helper also tolerates CSE as a
+    # defensive backstop in case the state read races a transition.
+    var ep_in_state  = xhci_ep_state(slot_id, dci_in);
+    var ep_out_state = xhci_ep_state(slot_id, dci_out);
+    if (ep_in_state == XHCI_EP_STATE_HALTED) {
+        if (xhci_cmd_reset_endpoint(slot_id, dci_in) == 0) {
+            kprintln("msc: Reset Endpoint(bulk-IN) failed", 35);
+            return 0;
+        }
     }
-    if (xhci_cmd_reset_endpoint(slot_id, dci_out) == 0) {
-        kprintln("msc: Reset Endpoint(bulk-OUT) failed", 36);
-        return 0;
-    }
-
-    # --- Step 3: drain stale Transfer Events for this slot ---
-    xhci_drain_transfer_events(slot_id);
-
-    # --- Step 4: Bulk-Only Mass Storage Reset (device-side, class CTRL) ---
-    if (xhci_control_no_data(slot_id, 0x21, 0xFF, 0, intf) == 0) {
-        kprintln("msc: Bulk-Only MS Reset failed", 30);
-        return 0;
-    }
-
-    # --- Step 5: CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN ---
-    if (xhci_control_no_data(slot_id, 0x02, 0x01, 0, ep_in_addr) == 0) {
-        kprintln("msc: CLEAR_FEATURE(HALT) bulk-IN failed", 39);
-        return 0;
+    if (ep_out_state == XHCI_EP_STATE_HALTED) {
+        if (xhci_cmd_reset_endpoint(slot_id, dci_out) == 0) {
+            kprintln("msc: Reset Endpoint(bulk-OUT) failed", 36);
+            return 0;
+        }
     }
 
-    # --- Step 6: CLEAR_FEATURE(ENDPOINT_HALT) on bulk-OUT ---
-    if (xhci_control_no_data(slot_id, 0x02, 0x01, 0, ep_out_addr) == 0) {
-        kprintln("msc: CLEAR_FEATURE(HALT) bulk-OUT failed", 40);
-        return 0;
-    }
-
-    # --- Step 7: host-side ring rewind ---
+    # --- Step 8: host-side ring rewind ---
     var ring_in  = load64(row + 16);
     var ring_out = load64(row + 24);
     if (ring_in != 0) {
@@ -847,8 +899,8 @@ fn msc_reset_recovery(slot_id) {
     store16(row + 34, 0);   # bulk_in_idx    -> 0
     store16(row + 36, 0);   # bulk_out_idx   -> 0
 
-    # --- Step 8: Set TR Dequeue Pointer (controller-side resync) ---
-    # DCS=1 because step 7 reset the host-side cycle bit to 1; HW must
+    # --- Step 9: Set TR Dequeue Pointer (controller-side resync) ---
+    # DCS=1 because step 8 reset the host-side cycle bit to 1; HW must
     # expect cycle=1 on the first new TRB at ring base.
     if (ring_in != 0) {
         if (xhci_cmd_set_tr_dequeue(slot_id, dci_in, ring_in, 1) == 0) {
@@ -863,7 +915,7 @@ fn msc_reset_recovery(slot_id) {
         }
     }
 
-    # --- Step 9: clear transport_failed sticky ---
+    # --- Step 10: clear transport_failed sticky ---
     store8(row + 69, 0);
 
     kprint("msc: slot ", 10);
