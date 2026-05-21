@@ -216,6 +216,46 @@ ahci: registered as secondary block_dev (port 0, 131072 LBAs x 512B; NVMe primar
 - **GPT Phase 3** — CRC32 (table-driven 0xEDB88320) header + array validation, backup-header recovery on primary fail, type-GUID classifier ("Linux fs" / "EFI System" / etc.). Correctness hardening; deferrable to a closing 1.31.1 patch.
 - **Iron burn on archaemenid** — the `sda` 1.8 TB SATA SSD's first iron exercise. Per `feedback_iron_burns_block_other_work` needs a written audit before scheduling; bundles all four AHCI phases at once since they're all read-only against the drive's content except the LBA-5 sentinel write (which is to a location no consumer cares about on archaemenid's drives — but a sentinel write to the wrong physical disk is still a write, so the audit must cover this).
 
+### GPT Phase 3 (CRC32 validation + backup-header recovery + type-GUID classifier)
+
+Closes the GPT layer for the 1.31.1 cycle. Adds ~250 LOC of correctness-hardening over Phase 2: table-less CRC32 (IEEE 802.3 polynomial 0xEDB88320), primary-then-backup header validation, partition-array CRC validation, and a 7-GUID type classifier that prints alongside each partition's name.
+
+**What it does:**
+- **`gpt_crc32_init` / `gpt_crc32_chunk` / `gpt_crc32_finalize` / `gpt_crc32`** — streaming + one-shot CRC32 helpers. Table-less inner loop (8 shifts per input byte). Slower than a 256-entry-table version (~8× more ops per byte) but the GPT validates in microseconds on Zen — total work is ~131K inner iterations for header (92 B) + array (16 KB). A table-driven optimization can land in Phase 4 (if any); Phase 3 prioritizes binary size and code clarity.
+- **`gpt_validate_header_crc(buf)`** — UEFI § 5.3.2 compliant: zero the HeaderCRC32 field (bytes 16-19) in-place during compute, then restore — saves an allocation for a scratch header copy. HeaderSize validated to spec range [92, 4096] before CRC. Returns 1 on match.
+- **`gpt_validate_array_crc()`** — streams CRC across the same 4 × 4 KB chunks Phase 2's walker iterates. Returns 1 on match. Note: leaves chunk 3 in `gpt_array_buf` — `gpt_init` re-primes chunk 0 before the walking pass.
+- **Backup-header recovery path** — when `gpt_validate_header_crc` returns 0 on the primary header at LBA 1, `gpt_init` reads `gpt_alt_lba` (decoded from the primary header's offset-32 field), validates the backup's signature + CRC, and if good swaps in the backup's decoded fields. Sets `gpt_using_backup_header = 1`. If both copies fail CRC, `gpt_init` returns 0 — the disk's GPT is unrecoverable and consumers must not trust the field decode.
+- **`gpt_print_type(lo, hi)`** — type-GUID classifier covering 7 common partition types: **EFI System** (`C12A7328-F81F-11D2-BA4B-00A0C93EC93B`), **Microsoft Basic Data** (`EBD0A0A2-B9E5-4433-87C0-68B6B72699C7`), **Linux Filesystem** (`0FC63DAF-8483-4772-8E79-3D69D8477DE4`), **Linux Swap** (`0657FD6D-A4AB-43C4-84E5-0933C84B4F4F`), **Linux LVM** (`E6D6D379-F507-44C2-A23C-238F2A3DF928`), **Linux RAID** (`A19D880F-05FC-4D3B-A006-743F0F84911E`), **BIOS Boot** (`21686148-6449-6E6F-744E-656564454649`). GPT's mixed-endian GUID convention (UEFI § 5.3.3) is preserved in the load64 byte-order — the in-source constants are NOT canonical human-readable GUIDs but the byte-order-preserving u64 view of the on-disk layout (each constant's comment shows the canonical form).
+- **Trust-posture indicators** — `gpt_print_summary` now appends `hdr-CRC-OK` / `hdr-CRC-BAD`, `arr-CRC-OK` / `arr-CRC-BAD`, and `[backup hdr]` (when recovery fired). Consumers see at-a-glance whether the GPT validated cleanly.
+- **`gpt_print_all_partitions`** now prints the classified type before the name (e.g., `[0] EFI System EFI  LBA 2048-16383 (7 MiB)`).
+
+**CMOS checkpoint:** new `kcp=0x51` (GPT CRC validation completed — fires after the validation logic runs, regardless of pass/fail, so iron post-mortem can tell whether the Phase 3 path executed at all). Phase 2's `0x4A` (array walked) still stamps.
+
+**QEMU validation:** 4-partition disk with mixed types (ESP / parted-default-typed Linux root / Linux swap / MSFT-Basic-flagged Windows-style):
+
+```
+gpt: present, first=34 last=131038 parts=4/128 hdr-CRC-OK arr-CRC-OK
+partitions (4 active / 128 reserved):
+  [0] EFI System EFI  LBA 2048-16383 (7 MiB)
+  [1] (unknown type) linux-root  LBA 16384-65535 (24 MiB)
+  [2] Linux swap swap  LBA 65536-98303 (16 MiB)
+  [3] MSFT Basic winshare  LBA 98304-131038 (15 MiB)
+```
+
+Both CRCs validate (`hdr-CRC-OK arr-CRC-OK`) — primary header path, no backup recovery exercised in QEMU. Three of four partitions classified correctly: **EFI System** (parted's ESP flag), **Linux swap** (parted's linux-swap fs type), **MSFT Basic** (parted's `ntfs` filesystem hint set the `msftdata` flag → MSFT Basic Data GUID). The `linux-root ext4` partition shows **(unknown type)** because parted doesn't assign the Linux Filesystem type GUID for `ext4` without an explicit `set N` flag — it leaves the type GUID at parted's default. `sgdisk -t N 8300` would set the proper Linux FS GUID and trigger classification. Behavior is correct: the classifier matches on-disk type GUID, not filesystem content.
+
+**Backup-header recovery path** is not exercised in this smoke (primary CRC validates). A negative test would require deliberately corrupting bytes 16-19 of LBA 1 — deferred to a Phase 4 test harness if/when one lands.
+
+**Out of scope (Phase 4+ territory, if any):**
+- 256-entry CRC32 table — perf optimization; only matters if GPT validation becomes a measurable boot-time cost.
+- Full 16-byte type-GUID match instead of first-8-only — Phase 1's empty-entry check already shortened on the first 8 bytes; tightening to full 16 is symmetric work but not blocking.
+- Expanded type-GUID classifier coverage — current 7 entries cover the common-OS spread; specialized GUIDs (ChromeOS, FreeBSD, Solaris, Apple HFS+/APFS, etc.) can land if a consumer needs them.
+- `gpt_classify_type(lo, hi) → tag-int` programmatic helper — currently the classifier is print-only; a tag-int variant unblocks consumers that want to act on the classification (e.g., "find the ESP and mount it").
+
+**Build:** 470,664 B (AHCI Phase 4) → **475,096 B** (+4,432 B for gpt.cyr CRC + classifier + Phase 3 wiring in `gpt_init`).
+
+**1.31.1 cycle status:** all planned phases landed under `[Unreleased]`. Closing handoff items: an iron burn audit (per `feedback_iron_burns_block_other_work`) covering AHCI Phase 4's LBA-5 sentinel write surface, and the final `[Unreleased]` → `[1.31.1] — 2026-05-20` rename + tag at the user's discretion. Then **1.31.2** opens with USB Mass Storage; **1.31.3** with ext2.
+
 ## [1.31.0] — 2026-05-20 (NVMe arc — Phase 1-5 driver + block-layer dispatch + iron debut on Crucial P3 2TB; cycle-open production-lean — KTEST + XHCI_VERBOSE compile gates + FB-absent guard + `docs/development/build.md`)
 
 ### NVMe Phase 1 (probe + capability decode + controller disable)

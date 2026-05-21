@@ -81,6 +81,9 @@ fn gpt_validate_signature(buf) {
 # --- Header decode ---------------------------------------------------
 
 fn gpt_decode_header(buf) {
+    gpt_header_size           = load32(buf + 12);
+    gpt_header_crc32_stored   = load32(buf + 16);
+    gpt_alt_lba               = load64(buf + 32);
     gpt_first_usable_lba      = load64(buf + 40);
     gpt_last_usable_lba       = load64(buf + 48);
     gpt_disk_guid_lo          = load64(buf + 56);
@@ -88,6 +91,151 @@ fn gpt_decode_header(buf) {
     gpt_partition_entries_lba = load64(buf + 72);
     gpt_num_partition_entries = load32(buf + 80);
     gpt_partition_entry_size  = load32(buf + 84);
+    gpt_partition_array_crc32 = load32(buf + 88);
+    return 0;
+}
+
+# --- Phase 3: CRC32 (IEEE 802.3 polynomial 0xEDB88320) ---------------
+#
+# Table-less implementation — 8-iteration inner loop per input byte.
+# Slower than a 256-entry-table version (~8× more ops per byte) but
+# the entire GPT validates in well under a second on real iron:
+# header is 92 bytes + array is 16 KB = ~131K inner iterations total,
+# microseconds-class on Zen. Table version is a Phase 4 (if any)
+# optimization, not a Phase 3 blocker.
+#
+# Streaming-friendly: the chunk variant updates a caller-held CRC value
+# in/out. Use this for the partition array which we read 4 KB at a time.
+
+fn gpt_crc32_init() {
+    return 0xFFFFFFFF;
+}
+
+fn gpt_crc32_chunk(crc, buf, len) {
+    var i = 0;
+    while (i < len) {
+        crc = crc ^ load8(buf + i);
+        var k = 0;
+        while (k < 8) {
+            if ((crc & 1) == 1) {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc = crc >> 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+fn gpt_crc32_finalize(crc) {
+    return crc ^ 0xFFFFFFFF;
+}
+
+# Convenience: one-shot CRC over a single contiguous buffer.
+fn gpt_crc32(buf, len) {
+    var c = gpt_crc32_init();
+    c = gpt_crc32_chunk(c, buf, len);
+    return gpt_crc32_finalize(c);
+}
+
+# --- Phase 3: header CRC validation ----------------------------------
+#
+# UEFI § 5.3.2: the HeaderCRC32 field (offset 16) is computed over the
+# first HeaderSize bytes of the header WITH the HeaderCRC32 field
+# itself zeroed during the computation. We zero bytes 16-19 in-place,
+# compute, then restore — saves an allocation for the scratch copy.
+#
+# Returns 1 if computed CRC matches stored, 0 otherwise.
+
+fn gpt_validate_header_crc(buf) {
+    if (gpt_header_size < 92)   { return 0; }      # spec minimum
+    if (gpt_header_size > 4096) { return 0; }      # sanity ceiling (LBA size)
+
+    # Save bytes 16-19, zero them, compute, restore.
+    var saved = load32(buf + 16);
+    store32(buf + 16, 0);
+    var computed = gpt_crc32(buf, gpt_header_size);
+    store32(buf + 16, saved);
+
+    if (computed == gpt_header_crc32_stored) { return 1; }
+    return 0;
+}
+
+# --- Phase 3: partition array CRC validation -------------------------
+#
+# Stream the CRC across the 4 × 4 KB chunks we already iterate during
+# the walk. Returns 1 if computed CRC matches the header's
+# partition_array_crc32, 0 otherwise.
+
+fn gpt_validate_array_crc() {
+    if (gpt_array_buf == 0) { return 0; }
+    var entries_per_chunk = 4096 / gpt_partition_entry_size;
+    var chunks            = (gpt_num_partition_entries + entries_per_chunk - 1) / entries_per_chunk;
+    if (chunks > 4) { chunks = 4; }
+    var bytes_remaining   = gpt_num_partition_entries * gpt_partition_entry_size;
+
+    var crc = gpt_crc32_init();
+    var chunk_id = 0;
+    while (chunk_id < chunks) {
+        var chunk_lba = gpt_partition_entries_lba + chunk_id * 8;
+        if (blk_read_sectors(chunk_lba, 8, gpt_array_buf) != 0) { return 0; }
+        var chunk_len = 4096;
+        if (chunk_len > bytes_remaining) { chunk_len = bytes_remaining; }
+        crc = gpt_crc32_chunk(crc, gpt_array_buf, chunk_len);
+        bytes_remaining = bytes_remaining - chunk_len;
+        chunk_id = chunk_id + 1;
+    }
+    var computed = gpt_crc32_finalize(crc);
+    if (computed == gpt_partition_array_crc32) { return 1; }
+    return 0;
+}
+
+# --- Phase 3: partition-type-GUID classifier -------------------------
+#
+# Map a small set of common partition-type GUIDs to human-readable
+# names. GPT stores type GUIDs in a mixed-endian convention (UEFI
+# § 5.3.3): first 3 fields little-endian, last 2 big-endian. When we
+# load the 16 bytes as two u64s via `load64`, both are little-endian
+# views — meaning the comparison constants below are NOT the canonical
+# human-readable form of the GUID, they are the byte-order-preserving
+# u64 of the on-disk layout. The comment to the right of each constant
+# is the canonical UUID for human reference.
+#
+# Coverage is intentional Phase 3: the seven most common GUIDs the user
+# encounters on a real-world Linux+Windows multi-OS disk. Phase 4+
+# could expand; for now, anything unmatched returns "unknown".
+
+var GPT_TYPE_ESP_LO          = 0x11D2F81FC12A7328;   # ESP: C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+var GPT_TYPE_ESP_HI          = 0x3BC93EC9A0004BBA;
+var GPT_TYPE_MSFT_BASIC_LO   = 0x4433B9E5EBD0A0A2;   # Microsoft Basic Data: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+var GPT_TYPE_MSFT_BASIC_HI   = 0xC79926B7B668C087;
+var GPT_TYPE_LINUX_FS_LO     = 0x477284830FC663AF;   # Linux Filesystem: 0FC63DAF-8483-4772-8E79-3D69D8477DE4
+var GPT_TYPE_LINUX_FS_HI     = 0xE47D47D8693D798E;
+var GPT_TYPE_LINUX_SWAP_LO   = 0x43C4A4AB0657FD6D;   # Linux Swap: 0657FD6D-A4AB-43C4-84E5-0933C84B4F4F
+var GPT_TYPE_LINUX_SWAP_HI   = 0x4F4F4BC83309E584;
+var GPT_TYPE_LINUX_LVM_LO    = 0x44C2F507E6D6D379;   # Linux LVM: E6D6D379-F507-44C2-A23C-238F2A3DF928
+var GPT_TYPE_LINUX_LVM_HI    = 0x28F93D2A8F233CA0;
+var GPT_TYPE_LINUX_RAID_LO   = 0x4D3B05FCA19D880F;   # Linux RAID: A19D880F-05FC-4D3B-A006-743F0F84911E
+var GPT_TYPE_LINUX_RAID_HI   = 0x1E91840F3F7406A0;
+var GPT_TYPE_BIOS_BOOT_LO    = 0x6E6F644921686148;   # BIOS Boot: 21686148-6449-6E6F-744E-656564454649
+var GPT_TYPE_BIOS_BOOT_HI    = 0x4946454564656E74;
+
+# Print the partition-type classification (printed inline by
+# `gpt_print_all_partitions`). Inline-print rather than return-string
+# avoids a string-handling helper for now; if more callers need the
+# classification programmatically a `gpt_classify_type(lo, hi)`
+# returning a tag int can land in Phase 4.
+fn gpt_print_type(lo, hi) {
+    if (lo == GPT_TYPE_ESP_LO        && hi == GPT_TYPE_ESP_HI)        { kprint("EFI System ", 11); return 0; }
+    if (lo == GPT_TYPE_MSFT_BASIC_LO && hi == GPT_TYPE_MSFT_BASIC_HI) { kprint("MSFT Basic ", 11); return 0; }
+    if (lo == GPT_TYPE_LINUX_FS_LO   && hi == GPT_TYPE_LINUX_FS_HI)   { kprint("Linux FS ",    9); return 0; }
+    if (lo == GPT_TYPE_LINUX_SWAP_LO && hi == GPT_TYPE_LINUX_SWAP_HI) { kprint("Linux swap ", 11); return 0; }
+    if (lo == GPT_TYPE_LINUX_LVM_LO  && hi == GPT_TYPE_LINUX_LVM_HI)  { kprint("Linux LVM ",  10); return 0; }
+    if (lo == GPT_TYPE_LINUX_RAID_LO && hi == GPT_TYPE_LINUX_RAID_HI) { kprint("Linux RAID ", 11); return 0; }
+    if (lo == GPT_TYPE_BIOS_BOOT_LO  && hi == GPT_TYPE_BIOS_BOOT_HI)  { kprint("BIOS Boot ",  10); return 0; }
+    kprint("(unknown type) ", 15);
     return 0;
 }
 
@@ -177,6 +325,8 @@ fn gpt_print_all_partitions() {
             var off = gpt_array_buf + (i * gpt_partition_entry_size);
             if (load64(off + 0) != 0) {
                 var idx       = chunk_id * entries_per_chunk + i;
+                var type_lo   = load64(off + 0);
+                var type_hi   = load64(off + 8);
                 var first_lba = load64(off + 32);
                 var last_lba  = load64(off + 40);
                 var sectors   = last_lba - first_lba + 1;
@@ -185,6 +335,7 @@ fn gpt_print_all_partitions() {
                 kprint("  [", 3);
                 kprint_num(idx);
                 kprint("] ", 2);
+                gpt_print_type(type_lo, type_hi);
                 gpt_print_name(off + 56);
                 kprint("  LBA ", 6);
                 kprint_num(first_lba);
@@ -216,6 +367,20 @@ var gpt_q_last_lba  = 0;
 var gpt_q_sectors   = 0;
 var gpt_q_type_lo   = 0;     # PartitionTypeGUID first 8 bytes
 var gpt_q_type_hi   = 0;     # PartitionTypeGUID next 8 bytes
+
+# --- Phase 3 state ---------------------------------------------------
+#
+# Set by `gpt_init` post-validation. Consumers should still gate on
+# `gpt_present == 1` first; these refine the trust story for callers
+# that care (a fully-validated GPT is safer to act on than a header-only
+# decode).
+var gpt_header_size           = 0;     # offset 12 u32 — bytes covered by header CRC
+var gpt_header_crc32_stored   = 0;     # offset 16 u32 — what the disk claims
+var gpt_partition_array_crc32 = 0;     # offset 88 u32 — what the disk claims for the entry array
+var gpt_alt_lba               = 0;     # offset 32 u64 — backup header location
+var gpt_header_crc_ok         = 0;     # computed header CRC matches stored
+var gpt_array_crc_ok          = 0;     # computed array CRC matches stored
+var gpt_using_backup_header   = 0;     # 1 if primary failed and we recovered via alt_lba
 
 fn gpt_partition_info(idx) {
     gpt_q_first_lba = 0;
@@ -258,6 +423,13 @@ fn gpt_print_summary() {
     kprint_num(gpt_partition_count);
     kprint("/", 1);
     kprint_num(gpt_num_partition_entries);
+    # Phase 3: trust posture appended to the summary so consumers see
+    # at-a-glance whether CRCs validated.
+    if (gpt_using_backup_header == 1) { kprint(" [backup hdr]", 13); }
+    if (gpt_header_crc_ok == 1)        { kprint(" hdr-CRC-OK", 11); }
+    else                                { kprint(" hdr-CRC-BAD", 12); }
+    if (gpt_array_crc_ok == 1)         { kprint(" arr-CRC-OK", 11); }
+    else                                { kprint(" arr-CRC-BAD", 12); }
     kprintln("", 0);
     return 0;
 }
@@ -287,12 +459,40 @@ fn gpt_init() {
     # CMOS kcp = 0x49 (GPT header signature valid + decoded).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x49; 0xE6; 0x71; }
 
+    # --- Phase 3: validate primary header CRC ---
+    gpt_header_crc_ok = gpt_validate_header_crc(gpt_header_buf);
+    if (gpt_header_crc_ok == 0) {
+        # Try backup header at alt_lba. If alt_lba is bogus (0 or out
+        # of range) or backup also fails CRC, give up — the disk's GPT
+        # is unrecoverable and we shouldn't trust the field decode.
+        kprint("gpt: primary header CRC mismatch, trying backup @ LBA ", 54);
+        kprint_num(gpt_alt_lba);
+        kprintln("", 0);
+        if (gpt_alt_lba == 0) { return 0; }
+        if (blk_read(gpt_alt_lba, gpt_header_buf) != 0) { return 0; }
+        if (gpt_validate_signature(gpt_header_buf) == 0) { return 0; }
+        gpt_decode_header(gpt_header_buf);
+        gpt_header_crc_ok = gpt_validate_header_crc(gpt_header_buf);
+        if (gpt_header_crc_ok == 0) {
+            kprintln("gpt: backup header CRC mismatch — both copies bad", 49);
+            return 0;
+        }
+        gpt_using_backup_header = 1;
+        kprintln("gpt: recovered via backup header", 32);
+    }
+
     gpt_array_buf = pmm_alloc();
     if (gpt_array_buf == 0) { return 0; }
 
-    # Read the first 4 KB of the partition entry array (= 8 sectors at
-    # 512 B). Standard partition_entries_lba = 2, partition_entry_size
-    # = 128 → 32 entries in this window.
+    # --- Phase 3: validate partition array CRC (streams across chunks) ---
+    gpt_array_crc_ok = gpt_validate_array_crc();
+    if (gpt_array_crc_ok == 0) {
+        kprintln("gpt: partition array CRC mismatch — proceeding (trust degraded)", 63);
+    }
+
+    # Re-read first 4 KB of the array (validate_array_crc walked all 4
+    # chunks and left chunk 3 in scratch; re-prime to chunk 0 for the
+    # subsequent walk pass).
     if (blk_read_sectors(gpt_partition_entries_lba, 8, gpt_array_buf) != 0) {
         return 0;
     }
@@ -300,6 +500,11 @@ fn gpt_init() {
     gpt_partition_count = gpt_walk_all_partitions();
     # CMOS kcp = 0x4A (GPT partition array fully walked — Phase 2).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4A; 0xE6; 0x71; }
+
+    # CMOS kcp = 0x51 (GPT CRC validation completed — Phase 3 gate).
+    # Stamps even on degraded-trust paths (array CRC fail / backup-
+    # header recovery) since the validation logic ran.
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x51; 0xE6; 0x71; }
 
     gpt_present = 1;
     gpt_print_summary();
