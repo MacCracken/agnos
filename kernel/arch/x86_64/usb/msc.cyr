@@ -776,7 +776,7 @@ fn msc_scsi_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in, m
             while (sd < 5000000) { sd = sd + 1; }
         }
         var r = msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len,
-                             data_phys, data_len, dir_in);
+        data_phys, data_len, dir_in);
         if (r != 0) { return 1; }
         attempt = attempt + 1;
     }
