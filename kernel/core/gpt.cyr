@@ -1,0 +1,177 @@
+# === GPT partition-table parser ===
+#
+# Consumes the block layer (blk_read / blk_read_sectors) to parse a GUID
+# Partition Table at LBA 1 (header) + LBA 2-N (entry array). UEFI spec
+# § 5.3.2 + Linux's `block/partitions/efi.c` are the structural
+# references; per `feedback_redesign_dont_reinvent`, port the shape and
+# redesign to Cyrius conventions rather than first-principles diagnostics.
+#
+# Phase 1 scope:
+#   - Read LBA 1 via `blk_read`, validate "EFI PART" signature, decode
+#     the GPT header (first/last usable LBA, disk GUID, partition entry
+#     array LBA + count + entry size).
+#   - Read the first 4 KB of the partition entry array via
+#     `blk_read_sectors(arr_lba, 8, buf)` — covers up to 32 entries at
+#     the standard 128 B entry size, the typical-disk floor.
+#   - Walk those entries, count non-empty ones (PartitionTypeGUID first
+#     8 bytes != 0).
+#   - Print one summary line: usable LBA range + non-empty / total
+#     partition count.
+#
+# Phase 1 explicitly out of scope (Phase 2 territory):
+#   - Full 16 KB partition array walk (only first 4 KB read; cap at 32
+#     entries even when more are advertised in num_partition_entries).
+#   - GPT CRC32 validation (header_crc32 / partition_array_crc32 are
+#     decoded into globals but not verified against computed CRC32).
+#   - Backup-header recovery on primary failure (alt_lba field read but
+#     never followed).
+#   - Partition-aware addressing helpers (`gpt_partition_start(idx)` /
+#     `gpt_partition_size(idx)` / `gpt_partition_type(idx)`).
+#   - `parts` shell command.
+#   - Hex-print of disk / type / unique GUIDs (decoded into globals for
+#     later Phase 2 print helpers).
+#
+# CMOS checkpoints (continue NVMe's 0x40-0x48 sequence): 0x49 (header
+# signature valid + decoded), 0x4A (partition array first 4 KB walked).
+# Inline asm form matches the NVMe stamps in kernel/core/nvme.cyr — slot
+# 0x50 = "current kcp", value = subsystem progress marker.
+#
+# No-op if no block backend is registered (blk_active == 0), if LBA 1
+# read fails, or if the signature check fails (unpartitioned disk —
+# typical for archaemenid's NVMe at debut, where LBA 0 = all zeros).
+
+var GPT_SIG_LO         = 0x20494645;   # "EFI " (little-endian u32 view)
+var GPT_SIG_HI         = 0x54524150;   # "PART" (little-endian u32 view)
+var GPT_MAX_ENTRIES_P1 = 32;           # Phase 1 cap — first 4 KB of array
+var GPT_ENTRY_SIZE_STD = 128;          # spec default partition_entry_size
+
+# Public state — consumers read these directly (matching the existing
+# blk_active / vblk_capacity access pattern in the kernel).
+var gpt_present              = 0;
+var gpt_header_buf           = 0;
+var gpt_array_buf            = 0;
+
+# Decoded GPT header fields (offsets per UEFI § 5.3.2 Table 5-6).
+var gpt_first_usable_lba      = 0;   # offset 40 u64
+var gpt_last_usable_lba       = 0;   # offset 48 u64
+var gpt_disk_guid_lo          = 0;   # offset 56 u64 (low half of 16 B)
+var gpt_disk_guid_hi          = 0;   # offset 64 u64 (high half of 16 B)
+var gpt_partition_entries_lba = 0;   # offset 72 u64
+var gpt_num_partition_entries = 0;   # offset 80 u32
+var gpt_partition_entry_size  = 0;   # offset 84 u32
+
+# Walk result — number of non-empty entries observed in the first
+# 4 KB window. Bounded by GPT_MAX_ENTRIES_P1 in Phase 1.
+var gpt_partition_count       = 0;
+
+# --- Header validation -----------------------------------------------
+#
+# UEFI § 5.3.2: signature is the 8-byte ASCII string "EFI PART" at
+# offset 0 of the GPT header. We compare it as two little-endian u32
+# loads to dodge any 8-byte alignment quirks on the scratch buffer —
+# pmm_alloc returns 4 KB-aligned pages so this is paranoid, but the
+# pattern matches nvme.cyr's "avoid load64 on MMIO" reflex applied to
+# the read-scratch surface (cheap, no downside).
+fn gpt_validate_signature(buf) {
+    if (load32(buf + 0) != GPT_SIG_LO) { return 0; }
+    if (load32(buf + 4) != GPT_SIG_HI) { return 0; }
+    return 1;
+}
+
+# --- Header decode ---------------------------------------------------
+
+fn gpt_decode_header(buf) {
+    gpt_first_usable_lba      = load64(buf + 40);
+    gpt_last_usable_lba       = load64(buf + 48);
+    gpt_disk_guid_lo          = load64(buf + 56);
+    gpt_disk_guid_hi          = load64(buf + 64);
+    gpt_partition_entries_lba = load64(buf + 72);
+    gpt_num_partition_entries = load32(buf + 80);
+    gpt_partition_entry_size  = load32(buf + 84);
+    return 0;
+}
+
+# --- Partition array walk (first 4 KB only in Phase 1) ---------------
+#
+# Count non-empty entries by checking the first 8 bytes of each entry's
+# PartitionTypeGUID field (offset 0 within the entry). Empty entries
+# have the all-zero GUID per UEFI § 5.3.3. Checking only the first 8
+# bytes is a Phase 1 shortcut — a maliciously-zeroed-low-half / nonzero-
+# high-half GUID would slip past, but no real GPT writer produces that
+# shape; Phase 2 can tighten to a full 16-byte check.
+fn gpt_walk_first_4kb() {
+    var count   = 0;
+    var per_4k  = 4096 / gpt_partition_entry_size;
+    var entries = per_4k;
+    if (entries > GPT_MAX_ENTRIES_P1) { entries = GPT_MAX_ENTRIES_P1; }
+    if (entries > gpt_num_partition_entries) {
+        entries = gpt_num_partition_entries;
+    }
+    var i = 0;
+    while (i < entries) {
+        var off = gpt_array_buf + (i * gpt_partition_entry_size);
+        if (load64(off + 0) != 0) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+# --- Print summary ---------------------------------------------------
+#
+# Single line, mirrors nvme.cyr's terse "nvme: ..." log shape.
+fn gpt_print_summary() {
+    kprint("gpt: present, first=", 20);
+    kprint_num(gpt_first_usable_lba);
+    kprint(" last=", 6);
+    kprint_num(gpt_last_usable_lba);
+    kprint(" parts=", 7);
+    kprint_num(gpt_partition_count);
+    kprint("/", 1);
+    kprint_num(gpt_num_partition_entries);
+    kprintln("", 0);
+    return 0;
+}
+
+# --- Boot entry ------------------------------------------------------
+#
+# Probe + decode + walk. Called from main.cyr after the block-dispatch
+# layer is initialized (either virtio_blk_init success or
+# nvme_register_block_dev). Returns 1 on full success (gpt_present = 1,
+# summary printed), 0 on any no-op path (no block backend, read fail,
+# bad signature) — those are normal conditions, not errors.
+fn gpt_init() {
+    if (blk_active == 0) { return 0; }
+
+    gpt_header_buf = pmm_alloc();
+    if (gpt_header_buf == 0) { return 0; }
+
+    if (blk_read(1, gpt_header_buf) != 0) {
+        return 0;
+    }
+
+    if (gpt_validate_signature(gpt_header_buf) == 0) {
+        return 0;
+    }
+
+    gpt_decode_header(gpt_header_buf);
+    # CMOS kcp = 0x49 (GPT header signature valid + decoded).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x49; 0xE6; 0x71; }
+
+    gpt_array_buf = pmm_alloc();
+    if (gpt_array_buf == 0) { return 0; }
+
+    # Read the first 4 KB of the partition entry array (= 8 sectors at
+    # 512 B). Standard partition_entries_lba = 2, partition_entry_size
+    # = 128 → 32 entries in this window.
+    if (blk_read_sectors(gpt_partition_entries_lba, 8, gpt_array_buf) != 0) {
+        return 0;
+    }
+
+    gpt_partition_count = gpt_walk_first_4kb();
+    # CMOS kcp = 0x4A (GPT partition array first 4 KB walked).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4A; 0xE6; 0x71; }
+
+    gpt_present = 1;
+    gpt_print_summary();
+    return 1;
+}

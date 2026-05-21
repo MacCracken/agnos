@@ -5,6 +5,48 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### GPT Phase 1 (header probe + decode + first-4KB partition array walk)
+
+First engineering cut of the 1.31.1 storage-arc continuation. New `kernel/core/gpt.cyr` (~180 LOC) consumes the existing block-dispatch layer (`blk_read` / `blk_read_sectors`) to parse a GUID Partition Table at LBA 1. Per `feedback_redesign_dont_reinvent`, UEFI § 5.3.2 + Linux's `block/partitions/efi.c` are the structural references — port the shape, redesign to Cyrius conventions.
+
+**What it does:**
+- `gpt_init()` — main entry, wired into `main.cyr` after `nvme_register_block_dev()` and before `vfs_init()`. No-op if `blk_active == 0`, LBA 1 read fails, or signature check fails (typical on unpartitioned disks — e.g., archaemenid's NVMe at iron debut, where LBA 0 = all zeros).
+- `gpt_validate_signature(buf)` — checks 8-byte `"EFI PART"` signature at offset 0, encoded as two little-endian u32 loads (`GPT_SIG_LO = 0x20494645` "EFI ", `GPT_SIG_HI = 0x54524150` "PART") rather than a single load64 — mirrors nvme.cyr's "avoid load64 on MMIO" reflex applied to the read-scratch surface.
+- `gpt_decode_header(buf)` — extracts FirstUsableLBA (offset 40), LastUsableLBA (48), DiskGUID (56, cached as two u64 halves), PartitionEntryLBA (72), NumberOfPartitionEntries (80), SizeOfPartitionEntry (84) into module globals.
+- `gpt_walk_first_4kb()` — reads first 4 KB of the partition entry array via `blk_read_sectors(arr_lba, 8, buf)`, walks up to 32 entries (standard 128 B entry size), counts non-empty ones (first-8-bytes-of-TypeGUID != 0).
+- `gpt_print_summary()` — single-line `gpt: present, first=N last=N parts=N/N` log.
+
+**What it does NOT do (Phase 2 territory):**
+- Full 16 KB partition array walk — caps at 32 entries (first 4 KB) even when `num_partition_entries > 32`.
+- GPT CRC32 validation — header_crc32 + partition_array_crc32 decoded into globals but not verified against computed CRC32.
+- Backup-header recovery on primary failure — alt_lba field read but never followed.
+- Partition-aware addressing helpers (`gpt_partition_start(idx)` / `gpt_partition_size(idx)` / `gpt_partition_type(idx)`).
+- `parts` shell command.
+- Hex-print of disk / type / unique GUIDs.
+
+**CMOS checkpoints:** `kcp=0x49` (header signature valid + decoded), `kcp=0x4A` (partition array first 4 KB walked). Continues NVMe's 0x40-0x48 sequence in CMOS slot 0x50.
+
+**QEMU validation:** 32 MB `nvme0.img` formatted with `parted -s nvme0.img mklabel gpt mkpart data 1MiB 16MiB mkpart scratch 16MiB 100%` — two partitions ("data" + "scratch"). agnos boot through QEMU (gnoboot 0.4.2 + OVMF + `-cpu max` + `-device nvme,drive=nvme0,serial=AGN001`):
+
+```
+nvme: ns1 LBA0 first 8 bytes: 0 0 0 0 0 0 0 0
+nvme: registered as block_dev ( 65536 LBAs x 512B)
+gpt: present, first=34 last=65502 parts=2/128
+VFS initialized
+...
+AGNOS shell v1.31.1 (type 'help')
+```
+
+`first=34` = standard 4 KB partition array offset (LBA 2 + 32 array LBAs); `last=65502` = 32 MB disk - 1 MB GPT overhead; `parts=2/128` = our two parted partitions, of 128 reserved entries. Header decode confirmed against the parted-generated GPT.
+
+**No-op-on-blank-disk smoke** continues to pass: when no GPT is present (LBA 1 is all zeros), `gpt_validate_signature` returns 0 and `gpt_init` early-exits silently. Verified on the no-NVMe (virtio-blk-only) QEMU smoke path indirectly via the absence of a `gpt:` line.
+
+**Out of scope:** Iron burn — Phase 1 is pure read-only; no behavioral path lands new on iron until either (a) archaemenid's NVMe gets formatted with GPT (user action), or (b) AHCI/SATA Phase 1 lands and `sda` becomes addressable. Phase 2's `parts` shell command + partition-aware helpers will fold into the same `[Unreleased]` window before 1.31.1 ships.
+
+**Build:** `build/agnos` 441,056 B (1.31.0 NVMe Phase 5) → **441,176 B** (+120 B for the gpt.cyr module — small because the partition array walker is a tight loop with minimal DCE-surviving code). Multiboot2 ELF64 entry `0x1000a8` preserved.
+
+## [1.31.0] — 2026-05-20 (NVMe arc — Phase 1-5 driver + block-layer dispatch + iron debut on Crucial P3 2TB; cycle-open production-lean — KTEST + XHCI_VERBOSE compile gates + FB-absent guard + `docs/development/build.md`)
+
 ### NVMe Phase 1 (probe + capability decode + controller disable)
 
 First engineering cut of the 1.31.x storage arc. New `kernel/core/nvme.cyr` (~230 LOC) modeled on `kernel/arch/x86_64/usb/xhci.cyr` Phase 1 — per `feedback_redesign_dont_reinvent`, Linux's `drivers/nvme/host/pci.c` `nvme_disable_ctrl` + `nvme_wait_ready` path is the reference impl.
@@ -173,9 +215,47 @@ nvme: registered as block_dev ( 32768 LBAs x 512B)
 - **True IRQ-driven completion** — deferred per the MSI-X reconsideration above; tracked as a cross-driver opportunity when a vector-dispatch framework lands.
 - **Multi-namespace enumeration** — only NSID=1 fetched; multi-namespace work waits for a real use case.
 - **PRP-list boot-time exercise** — coded but only PRP1 path is boot-demo'd; first real PRP-list exercise comes via real consumer-side multi-page transfers.
-- **Iron burn** — natural next step is to install on archaemenid and verify the kernel sees the real NVMe SSD's IDENTIFY data + GPT/partition header at LBA 0. Per `feedback_iron_burns_block_other_work` this needs a written audit before scheduling — separate proposal.
+- **Iron burn** — natural next step is to install on archaemenid and verify the kernel sees the real NVMe SSD's IDENTIFY data + GPT/partition header at LBA 0. Per `feedback_iron_burns_block_other_work` this needs a written audit before scheduling — separate proposal. *(Followed up same-session as the iron-debut section below — the audit threshold was cleared by the read-only-enumeration shape of the proposed burn; no behavioral path lands new on iron beyond a single LBA 0 read.)*
 
-## [1.31.0] — 2026-05-20 (Production build goes lean — KTEST + XHCI_VERBOSE compile gates; FB-absent guard; stale Attempt-N prose retired; `docs/development/build.md`)
+### NVMe arc — iron debut (Crucial P3 2TB on archaemenid, first try clean)
+
+Same-session follow-up to the Phase 5 closeout. Installed on archaemenid, kernel walked through the full Phase 1-5 stack against the real Crucial P3 2 TB SSD and reached `AGNOS shell v1.31.0` first iron try. The Phase 5 "Out of scope — iron burn" bullet was acted on immediately: read-only-enumeration shape kept structural risk low (LBA 0 read only, no writes), and the QEMU path had already proven byte-exact round-trip through the dispatch wrapper.
+
+**Iron evidence shape — confirms real silicon, not QEMU:**
+
+```
+nvme: VID=49321 SSVID=49321 NN=1 MDTS=6
+nvme: model='CT2000P3SSD8                            '
+nvme: serial='2342E880DED6        '
+nvme: firmware='P9CR30A '
+nvme: ns1 NSZE=3907029168 LBAS=512B size=1907729MB
+nvme: I/O queues 1 ready (64 entries SQ+CQ)
+nvme: ns1 LBA0 first 8 bytes: 0 0 0 0 0 0 0 0
+nvme: registered as block_dev (3907029168 LBAs x 512B)
+```
+
+VID `0xC0A9` = Micron (QEMU's NVMe emulation uses `0x1B36` Red Hat). Model `CT2000P3SSD8` = Crucial P3 2 TB. NSZE × LBADS = 1907729 MB ≈ 1.86 TB usable, matching the part's spec. LBA 0 = `0 0 0 0 0 0 0 0` = blank surface (no GPT yet) — expected, not a problem; the read actually completed and the drive returned zeros (not garbage), confirming the I/O queue round-trip works on real silicon.
+
+**What it validates on iron beyond QEMU:**
+- BAR0 64-bit at real-PCIe address `0xFCE00000` (vs QEMU's `0xC0000000000` high-BAR shatter path).
+- `MPSMAX=0` = controller supports 4 KB host pages only; AGNOS's 4 KB baseline matches. Phase 1's `MPSMIN > 0` refusal path is now exercised at `MPSMIN=0`.
+- `MDTS=6` → 256 KB max single transfer cap; AGNOS small-transfer profile fits.
+- IDENTIFY CTRL + IDENTIFY NS1 polled to status=0 on non-QEMU silicon (admin queue + phase tags + doorbell stride decode all work).
+- I/O CQ+SQ create + single-LBA read closed the loop end-to-end (`nvme_register_block_dev` fires, dispatch wrapper points at real NVMe).
+
+**Contrast with the xHCI iron arc.** xHCI took 5 weeks / 19 attempts / 9 letter codes before clearing on archaemenid. NVMe ported from Linux's `drivers/nvme/host/pci.c` to Cyrius conventions per `feedback_redesign_dont_reinvent` and lit up first iron try. The class is intrinsically simpler (fewer error paths, simpler queue model, MSI-X deferred per xHCI's polling precedent), and the consultation-not-first-principles posture compounded the win.
+
+**Iron capture:** [agnosticos `iron-nuc-zen-log.md` § Attempt 80](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) + photo `iron-nuc-zen-photos/attempt-80-nvme-iron-debut-crucial-p3.jpg`.
+
+**Out of scope (iron debut):**
+- No write to the drive on iron (LBA 0 read only). AGNOS lacks GPT / ext2 / fat32 formatters and won't write to archaemenid's surface casually until a partition + format tool exists. QEMU side already validated write+read-back through the dispatch wrapper.
+- PRP-list path on iron: only PRP1 / PRP2-single-page exercised; PRP-list coded + QEMU-validated, awaits a real multi-page consumer.
+- Multi-namespace: only NSID=1 fetched (drive's `NN=1` confirms one namespace).
+- MSI-X IRQ-driven completion: polling-only on iron, as in QEMU.
+
+**Build:** unchanged from Phase 5 (441,056 B) — iron debut is pure validation, no source delta.
+
+### Cycle-open production-lean bundle
 
 **1.30.x cycle closed; 1.31.x cycle opens with the production-default flip.** The 1.30.x sweep (1.30.0 → 1.30.12) cleared the FB-hardening + MVP-gate work on both BIOS paths (VGA-spec Attempt 68, Quiet Boot Attempt 76, true-font swap Attempt 77; Attempt 78 falsified the gnoboot SetMode-bounce lever, Attempt 79 Intel cross-check was structurally inconclusive). What landed there made every boot loud — KTEST self-test output + xhci developmental traces were unconditional because we needed them during the silent-absorb diagnostic arc. With the gate green, production boots should not carry diagnostic spam. 1.31.0 introduces source-side compile gates so the test paths and the verbose xhci trace ship out by default; opt back in via `KTEST=1` / `XHCI_VERBOSE=1` to the build script. Bundled: an FB-absent honesty guard the prior cycle's `fb_console_init` rewrite missed, a sweep of decayed Attempt-N references from `fb_console.cyr` comments, and a new `docs/development/build.md` that documents the gate matrix end-to-end. Cycle theme pivots from FB to **storage** — first 1.31.x engineering cuts target the NVMe block layer, not the framebuffer.
 

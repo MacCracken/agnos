@@ -313,6 +313,15 @@ if (nvme_admin_init() == 1) {
         nvme_register_block_dev();
     }
 }
+# GPT Phase 1 — probe the active block backend (NVMe-first by override
+# policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
+# decode + walk the first 4 KB of the partition entry array, print a one-
+# line summary. No-op if no block backend is active, LBA 1 read fails,
+# or the signature check fails (typical on unpartitioned disks — e.g.,
+# archaemenid's NVMe at iron debut, where LBA 0 = all zeros). CMOS kcps
+# 0x49 (header valid) / 0x4A (array walked) extend NVMe's 0x40-0x48
+# sequence.
+gpt_init();
 vfs_init();
 kprintln("VFS initialized", 15);
 
