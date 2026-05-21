@@ -45,6 +45,102 @@ AGNOS shell v1.31.1 (type 'help')
 
 **Build:** `build/agnos` 441,056 B (1.31.0 NVMe Phase 5) → **441,176 B** (+120 B for the gpt.cyr module — small because the partition array walker is a tight loop with minimal DCE-surviving code). Multiboot2 ELF64 entry `0x1000a8` preserved.
 
+### GPT Phase 2 (full 16 KB array walk + name extraction + `parts` shell command + partition-aware helpers)
+
+Second engineering cut of GPT — extends `kernel/core/gpt.cyr` with the full 128-entry array walk (was capped at first 4 KB / 32 entries in Phase 1), UTF-16LE partition-name extraction, boot-time partition table dump, the consumer-facing `parts` shell command, and partition-aware helpers for downstream consumers (ext2 / agnos-boot lookup / future formatter tooling).
+
+**What it does:**
+- **`gpt_walk_all_partitions()`** (replaces Phase 1's `gpt_walk_first_4kb`) — loops 4 × 4 KB chunks of the partition entry array via `blk_read_sectors(arr_lba + chunk*8, 8, gpt_array_buf)`, walks each chunk's entries, counts non-empty ones. Standard layout is 128 entries × 128 B = 16 KB; non-standard `partition_entry_size` is honored (entries_per_chunk = 4096 / entry_size). Re-reads per chunk because `pmm_alloc` returns single 4 KB pages — no contiguous-multi-page allocator in the kernel yet, so the natural shape is iterate-and-overwrite.
+- **`gpt_print_name(name_ptr)`** — UTF-16LE name decoder. Names are 72-byte (36-char-max) UTF-16LE strings at offset 56 of each entry. For the typical ASCII-named partition, the low byte of each u16 is the printable char; `kprint(name_ptr + i*2, 1)` writes one byte directly. Non-ASCII chars (high byte ≠ 0) print as their low-byte glyph — garbled but never breaks surrounding output. Stops at the first u16 = 0.
+- **`gpt_print_all_partitions()`** — multi-line table print: header line shows active/reserved counts, one indented line per non-empty entry showing `[idx] <name>  LBA <first>-<last> (<size> MiB)`. Size in MiB derived from `(sectors * blk_lba_bytes) / 1048576`, so a non-512-B-LBA drive (4 K-native NVMe, eventually) reports correctly. Called from main.cyr at boot when `gpt_init() == 1`, and on demand via the `parts` shell command.
+- **`gpt_partition_info(idx)`** — partition-aware helper. Computes which 4 KB chunk contains `idx`, reads it, decodes type GUID (16 B) + first_lba (8) + last_lba (8) into 5 query globals (`gpt_q_type_lo` / `gpt_q_type_hi` / `gpt_q_first_lba` / `gpt_q_last_lba` / `gpt_q_sectors`). Returns 1 on success, 0 if idx out of range / read failure / empty entry. One 4 KB read per call — callers querying multiple fields of the same partition batch through this single function rather than calling separate getters.
+- **`parts` shell command** — new entry in `kernel/user/shell.cyr`'s command dispatch, wired into the help listing. Calls `gpt_print_all_partitions()`. Prints `no GPT` when `gpt_present == 0`. Re-reads the array on each invocation (no caching) — one `parts` = 4 × 4 KB reads, fine for an infrequent command.
+
+**What it does NOT do (Phase 3 territory):**
+- **GPT CRC32 validation** — header_crc32 and partition_array_crc32 fields decoded but not verified against computed CRC32. Phase 3 will add a table-driven CRC32 (256-entry polynomial table, standard 0xEDB88320) and a `gpt_verify_crcs()` gate. Phase 2 currently trusts the disk's GPT regardless of CRC state — fine for the bring-up window, not for trust-grade production.
+- **Backup-header recovery** — alt_lba field decoded but never followed; primary-header-only path. Phase 3 will probe alt_lba on primary-header CRC failure.
+- **Partition-type-GUID classification** — `gpt_q_type_lo` / `gpt_q_type_hi` returned by `gpt_partition_info` but no helper to map common GUIDs to human-readable names ("Linux filesystem" / "EFI System" / etc.). Phase 3 or downstream consumers (ext2-mount, agnos-boot-lookup) will own the type table.
+
+**Boot-time auto-print rationale.** The `parts` command alone would require keyboard injection for QEMU validation — workable but adds harness complexity. Adding a single `gpt_print_all_partitions()` call in `main.cyr` after `gpt_init() == 1` gives the same partition-table-on-iron output on every boot, costs one extra 16 KB of disk reads (microseconds), and matches the existing NVMe pattern (`nvme: ns1 LBA0 first 8 bytes: ...` boot-time receipt). Will gate behind a `STORAGE_VERBOSE` env if it becomes noisy in production; for the bring-up window, keep it visible.
+
+**CMOS checkpoints:** `kcp=0x4A` semantics widened from "first 4 KB walked" (Phase 1) to "full partition array walked" (Phase 2). Same slot, same value — no new kcp needed; Phase 1 + Phase 2 cleared the gate identically.
+
+**QEMU validation:** 64 MB `nvme0.img` formatted with `parted -s nvme0.img mklabel gpt mkpart agnos-boot fat32 1MiB 16MiB mkpart user-data ext4 16MiB 40MiB mkpart scratch linux-swap 40MiB 56MiB mkpart reserved 56MiB 100%` — four parted partitions with varied names + sizes:
+
+```
+nvme: registered as block_dev ( 131072 LBAs x 512B)
+gpt: present, first=34 last=131038 parts=4/128
+partitions (4 active / 128 reserved):
+  [0] agnos-boot  LBA 2048-32767 (15 MiB)
+  [1] user-data  LBA 32768-81919 (24 MiB)
+  [2] scratch  LBA 81920-114687 (16 MiB)
+  [3] reserved  LBA 114688-131038 (7 MiB)
+VFS initialized
+...
+AGNOS shell v1.31.1 (type 'help')
+```
+
+All four partition names decoded cleanly from UTF-16LE; LBA ranges + MiB sizes match `parted -s nvme0.img print` byte-for-byte (15 / 24 / 16 / 7 MiB matches parted's report). The `parts` shell command path compiled-in but not exercised in this smoke (no keyboard injection); will be exercised on first iron burn once archaemenid's NVMe or SATA surface is GPT-formatted.
+
+**Build:** `build/agnos` 441,176 B (Phase 1) → **443,760 B** (+2,584 B for Phase 2: full walker + name printer + `parts` cmd + partition-aware helpers + boot-time auto-print + aarch64 stubs). Multiboot2 ELF64 entry `0x1000a8` preserved.
+
+**Out of scope (iron):** Same as Phase 1 — archaemenid's M.2 NVMe surface is currently blank (no GPT), and the SATA `sda` surface awaits the AHCI driver. First iron exercise of the GPT layer will come either when the user formats the NVMe or when AHCI Phase 1 lands. Phase 3 (CRC32 + backup-header) and AHCI Phase 1 are next bites under this same 1.31.1 cycle.
+
+### AHCI/SATA Phase 1 (HBA probe + CAP/GHC/PI decode + port enumeration)
+
+First engineering cut of the AHCI/SATA driver — opens the second iron-validatable block-device class for the 1.31.1 cycle (archaemenid `sda` 1.8 TB SATA SSD per `project_hardware_catalog`). New `kernel/core/ahci.cyr` (~280 LOC) modeled on NVMe Phase 1's shape; Intel AHCI 1.3.1 spec + Linux's `drivers/ata/libahci.c` `ahci_save_initial_config` is the structural reference per `feedback_redesign_dont_reinvent`.
+
+**What it does:**
+- **`ahci_probe()`** — PCI class probe via `pci_find_by_class(0x01, 0x06, 0x01)` (Mass Storage / Serial ATA / AHCI 1.0 — distinct from NVMe's `0x01/0x08/0x02` and from legacy IDE `0x01/0x01/*`), fetches BAR5 (ABAR = AHCI Base — NOT BAR0 like NVMe; AHCI 1.3.1 §2.1.11 mandates BAR5 for the register interface) via `pci_bar_64(idx, 5)`, asserts bus-master, remaps the 2 MB chunk as UC. Reads CAP (offset 0x00) and decodes seven fields we care about for Phase 1: **NP** (Number of Ports, bits 0-4, zero-based), **NCS** (Number of Command Slots, bits 8-12, zero-based), **ISS** (Interface Speed Support, bits 20-23, 1/2/3 = 1.5/3/6 Gbps), **SAM** (Supports AHCI Mode only, bit 18), **SSS** (Supports Staggered Spin-up, bit 27), **SNCQ** (Supports Native Command Queuing, bit 30), **S64A** (Supports 64-bit Addressing, bit 31). Reads GHC (0x04), PI (0x0C, Ports Implemented bitmap), VS (0x10, version). Prints three lines: discovery + capability summary + GHC/PI summary.
+- **`ahci_enum_ports()`** — walks the PI bitmap, for each implemented port reads **PxSSTS** (port_offset + 0x28) and **PxSIG** (port_offset + 0x24). Classifies device by signature: `0x00000101` = SATA, `0xEB140101` = ATAPI, `0xC33C0101` = SEMB, `0x96690101` = port multiplier. DET (SSTS bits 0-3) = 3 means "device present + PHY comm established"; DET = 0 means no device; DET = 1 means handshake-incomplete. Counts ports with DET=3 into `ahci_devices_found`.
+- **Module state**: `ahci_present`, `ahci_pci_idx`, `ahci_mmio_base`, decoded CAP fields, GHC, PI, VS, `ahci_devices_found`. Public — downstream consumers (Phase 2+ port-init, future formatter tooling) will read these.
+
+**What it does NOT do (Phase 2+ territory):**
+- **HBA reset** (GHC.HR=1, poll-clear). Firmware-left-state is what we observe; Phase 1 trusts the UEFI handoff state. Phase 2 will own the explicit reset.
+- **AHCI-mode set** (GHC.AE=1 write). Read-only observation of GHC.AE in Phase 1; if AE=0 we'd see it but not write. Q35's ich9-ahci ships with AE=1 from firmware; real iron AHCI controllers usually do too.
+- **Per-port command-list + FIS-receive allocation** — Phase 2 will allocate the 32-entry × 32 B command list (1 KB) + 256 B FIS-receive buffer per port, both 1 KB-aligned, set PxCLB/PxCLBU + PxFB/PxFBU.
+- **Port spin-up + start** (PxCMD.SUD=1, PxCMD.ST=1). Phase 2.
+- **IDENTIFY DEVICE** (ATA cmd 0xEC, 512-byte response with model / serial / firmware / LBA48 capacity). Phase 3.
+- **READ DMA EXT / WRITE DMA EXT** (cmds 0x25 / 0x35). Phase 4.
+- **Block-layer registration** (`blk_register_ahci(capacity, lba_bytes)`). Comes online when Phase 4 lands — until then, AHCI is enumerated but not addressable through `blk_read` / `blk_write`. NVMe stays the active dispatch backend on systems with both.
+- **MSI/MSI-X IRQ-driven completion** — polling-only, per xhci + nvme precedent.
+
+**CMOS checkpoints:** `kcp=0x4B` (HBA probe completed — CAP/GHC/VS decoded), `kcp=0x4C` (port enumeration done). Continues the storage-arc sequence 0x40-0x48 (NVMe) / 0x49-0x4A (GPT) / **0x4B-0x4C (AHCI)** in slot 0x50.
+
+**QEMU validation** — q35's built-in ich9-ahci provides 6 SATA ports. Smoke setup: boot disk on default SATA port (`-drive file=disk.img,format=raw`) + second SATA disk (`-drive file=sata1.img,format=raw`) + separate NVMe via `-device nvme,drive=nvme0` (so both block-device classes light up in one run):
+
+```
+nvme: registered as block_dev ( 131072 LBAs x 512B)
+ahci: found at 2164801536, version=1.0
+ahci: NP=6 NCS=32 ISS=1 SAM=1 SSS=0 SNCQ=1 S64A=1
+ahci: GHC=2147483648 PI=63
+ahci: port 0 DET=3 SPD=1 SIG=257 (SATA)
+ahci: port 1 DET=3 SPD=1 SIG=257 (SATA)
+ahci: port 2 DET=3 SPD=1 SIG=3943956737 (ATAPI)
+ahci: port 3 DET=0 SPD=0 SIG=4294902017 (no device)
+ahci: port 4 DET=0 SPD=0 SIG=4294902017 (no device)
+ahci: port 5 DET=0 SPD=0 SIG=4294902017 (no device)
+gpt: present, first=34 last=131038 parts=1/128
+...
+AGNOS shell v1.31.1 (type 'help')
+```
+
+Decoded values:
+- ABAR `0x81080000` = canonical q35 ich9-ahci location.
+- Version 1.0 (q35 ich9-ahci is AHCI 1.0; real silicon is typically 1.2-1.3.1).
+- NP=6 / NCS=32 / GHC.AE=1 (0x80000000) / PI=0x3F (all 6 ports implemented).
+- Port 0 + Port 1 = SATA HDD/SSD (SIG=0x00000101) — both detected with DET=3.
+- Port 2 = ATAPI (SIG=0xEB140101) — q35's default virtual CDROM device.
+- Port 3-5 = no device (SIG=0xFFFF0101, the QEMU idle-bus marker; DET=0).
+
+ISS=1 (Gen1 1.5 Gbps) is QEMU's emulation floor — real iron will report 3 (Gen3 6 Gbps).
+
+**Boot output ordering** — `ahci: found ... ahci: port N ...` lines print between `nvme: registered as block_dev` and `gpt: present` because AHCI Phase 1 runs immediately after NVMe registration in `main.cyr`, before `gpt_init()`. The GPT layer sees `blk_active=BLK_NVME` (NVMe override stayed in place; AHCI doesn't register until Phase 4 lands), so GPT parses the NVMe disk's partition table — not the SATA disks. The SATA disks are enumerated but not yet addressable through `blk_read`.
+
+**Build:** `build/agnos` 443,760 B (GPT Phase 2) → **447,568 B** (+3,808 B for ahci.cyr module + aarch64 stubs + main.cyr wiring). Multiboot2 ELF64 entry `0x1000a8` preserved.
+
+**Out of scope (iron):** AHCI Phase 1 is read-only enumeration; no behavioral path lands new on iron until at least Phase 4 (first DMA-driven LBA read/write). However, an iron burn at any time post-Phase-1 would validate the enumeration on archaemenid's actual SATA SSD — confirms ABAR location, controller version (likely 1.2+), and that `sda` shows up with DET=3 + SIG=SATA + model-and-serial-resolvable-via-IDENTIFY (Phase 3). Per `feedback_iron_burns_block_other_work`, that needs a written audit before scheduling — likely batched with Phase 2-4 once a usable AHCI block backend exists. Phase 2 (HBA reset + per-port command list + FIS receive + port spin-up + start) is the next bite.
+
 ## [1.31.0] — 2026-05-20 (NVMe arc — Phase 1-5 driver + block-layer dispatch + iron debut on Crucial P3 2TB; cycle-open production-lean — KTEST + XHCI_VERBOSE compile gates + FB-absent guard + `docs/development/build.md`)
 
 ### NVMe Phase 1 (probe + capability decode + controller disable)

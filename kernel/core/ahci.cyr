@@ -1,0 +1,302 @@
+# === AHCI/SATA host controller — Phase 1 (read-only enumeration) ===
+#
+# AHCI is the modern SATA host interface — PCI class triple 0x01 / 0x06
+# / 0x01 (Mass Storage / SATA / AHCI 1.0). Distinct from NVMe (0x01 /
+# 0x08 / 0x02), legacy IDE (0x01 / 0x01 / *), and SCSI (0x01 / 0x00).
+# Reference: Intel AHCI 1.3.1 spec + Linux's `drivers/ata/libahci.c`
+# `ahci_save_initial_config` + `ahci_port_intr` paths.
+#
+# Phase 1 is pure read-only enumeration: locate the HBA via PCI class
+# probe, remap BAR5 (AHCI Base = ABAR — NOT BAR0 — distinct from NVMe
+# which uses BAR0), enable bus mastering, read CAP / VS / PI / GHC,
+# decode capability fields, walk the PI bitmap to identify port-status
+# for each implemented port (DET = device detection, SIG = device
+# signature → SATA / ATAPI / port-multiplier / SEMB classification).
+#
+# Phase 1 explicitly out of scope (Phase 2+ territory):
+#   - HBA reset (GHC.HR=1, poll-clear)
+#   - AHCI-mode set if firmware left controller in legacy mode (GHC.AE=1)
+#   - Per-port command-list + FIS-receive allocation (32 entries × 32 B
+#     command-list + 256-B FIS buffer per port, both 1 KB-aligned)
+#   - Per-port spin-up (PxCMD.SUD=1) + start (PxCMD.ST=1)
+#   - IDENTIFY DEVICE (ATA cmd 0xEC) → model / serial / firmware /
+#     LBA48 capacity
+#   - READ DMA EXT (cmd 0x25) / WRITE DMA EXT (cmd 0x35)
+#   - block-layer registration (`blk_register_ahci`) — adds the third
+#     backend to block.cyr's tag-dispatch
+#   - MSI/MSI-X — staying with polling per the xhci + nvme precedent
+#
+# CMOS checkpoints: 0x4B (HBA probe done — CAP/GHC/VS decoded), 0x4C
+# (port enumeration done — every implemented port's SSTS/SIG read).
+# Continues the storage-arc sequence 0x40-0x48 (NVMe) / 0x49-0x4A
+# (GPT) / 0x4B-0x4C (AHCI). Same CMOS slot 0x50, progressive values.
+#
+# No-op if no AHCI controller is present on the PCI bus — typical for
+# pure-NVMe boxes (QEMU NVMe-only smoke) and for `nvme0`-as-only-disk
+# configurations. Iron archaemenid has both: M.2 NVMe (Crucial P3 at
+# `nvme0`, iron-validated Attempt 80) AND a 2.5" SATA SSD 1.8 TB on
+# `sda` — the AHCI surface AGNOS first sees in iron will be this `sda`.
+
+# --- AHCI register offsets (from ABAR base, per AHCI 1.3.1 §3.1) ----
+
+var AHCI_REG_CAP   = 0x00;   # Host Capabilities
+var AHCI_REG_GHC   = 0x04;   # Global Host Control
+var AHCI_REG_IS    = 0x08;   # Interrupt Status (RWC bitmap)
+var AHCI_REG_PI    = 0x0C;   # Ports Implemented (bitmap; bit i = port i present)
+var AHCI_REG_VS    = 0x10;   # AHCI Version
+var AHCI_REG_CAP2  = 0x24;   # Host Capabilities Extended (AHCI 1.2+)
+var AHCI_REG_BOHC  = 0x28;   # BIOS/OS Handoff Control (AHCI 1.2+)
+
+# Per-port register block — base at ABAR + 0x100 + port_id * 0x80
+var AHCI_PORT_BASE   = 0x100;
+var AHCI_PORT_STRIDE = 0x80;
+# Per-port register offsets within each port's 0x80-byte block:
+var AHCI_P_CLB   = 0x00;   # Command List Base (low 32)
+var AHCI_P_CLBU  = 0x04;   # Command List Base (high 32, AHCI S64A only)
+var AHCI_P_FB    = 0x08;   # FIS Base (low 32)
+var AHCI_P_FBU   = 0x0C;   # FIS Base (high 32)
+var AHCI_P_IS    = 0x10;   # Interrupt Status
+var AHCI_P_IE    = 0x14;   # Interrupt Enable
+var AHCI_P_CMD   = 0x18;   # Command and Status
+var AHCI_P_TFD   = 0x20;   # Task File Data
+var AHCI_P_SIG   = 0x24;   # Device Signature
+var AHCI_P_SSTS  = 0x28;   # SATA Status (DET / SPD / IPM)
+var AHCI_P_SCTL  = 0x2C;   # SATA Control
+var AHCI_P_SERR  = 0x30;   # SATA Error
+var AHCI_P_SACT  = 0x34;   # SATA Active
+var AHCI_P_CI    = 0x38;   # Command Issue
+
+# AHCI device-signature constants (PxSIG, AHCI 1.3.1 §3.3.7).
+var AHCI_SIG_ATA   = 0x00000101;   # SATA HDD/SSD (most common)
+var AHCI_SIG_ATAPI = 0xEB140101;   # SATA optical / removable
+var AHCI_SIG_SEMB  = 0xC33C0101;   # SATA enclosure mgmt bridge
+var AHCI_SIG_PM    = 0x96690101;   # SATA port multiplier
+
+# --- Module state ----------------------------------------------------
+
+var ahci_present     = 0;
+var ahci_pci_idx     = 0;
+var ahci_mmio_base   = 0;
+var ahci_cap         = 0;
+var ahci_cap2        = 0;
+var ahci_ghc         = 0;
+var ahci_pi          = 0;
+var ahci_vs          = 0;
+var ahci_ver_major   = 0;
+var ahci_ver_minor   = 0;
+var ahci_np          = 0;     # Number of Ports (zero-based, +1 = actual)
+var ahci_ncs         = 0;     # Number of Command Slots (zero-based, +1)
+var ahci_iss         = 0;     # Interface Speed Support (1/2/3 = 1.5/3/6 Gbps)
+var ahci_s64a        = 0;     # Supports 64-bit addressing
+var ahci_sam         = 0;     # Supports AHCI mode only (no legacy IDE switch)
+var ahci_sss         = 0;     # Supports Staggered Spin-up
+var ahci_sncq        = 0;     # Supports Native Command Queuing
+var ahci_devices_found = 0;   # Count of ports with DET=3 (device present + comm)
+
+# --- MMIO accessors --------------------------------------------------
+#
+# load32 against AHCI ABAR — mirrors nvme.cyr's "never load64 on MMIO"
+# discipline applied to the AHCI register surface. AHCI 1.3.1 §3.1 is
+# explicit that all HBA registers are 32-bit access; doubleword loads
+# only.
+
+fn ahci_mmio_read32(off) {
+    return load32(ahci_mmio_base + off);
+}
+
+fn ahci_mmio_write32(off, val) {
+    store32(ahci_mmio_base + off, val);
+    return 0;
+}
+
+# --- Phase 1: probe --------------------------------------------------
+#
+# Returns 1 if an AHCI controller was located, BAR5 was non-zero, and
+# CAP/GHC/VS/PI were successfully decoded. Returns 0 on:
+#   - no AHCI device on the PCI bus (pci_find_by_class < 0)
+#   - BAR5 == 0 (firmware did not assign — corrupt PCI config)
+# Either is a normal no-op condition, not an error.
+
+fn ahci_probe() {
+    # 1. PCI class probe. AHCI 1.0 is class=0x01, subclass=0x06,
+    #    prog_if=0x01 — see PCI Code & ID Assignment Spec §B.7.
+    #    Distinct from RAID (0x04), legacy IDE (0x01), SCSI (0x00).
+    var idx = pci_find_by_class(0x01, 0x06, 0x01);
+    if (idx < 0) {
+        kprintln("ahci: no controller found", 25);
+        return 0;
+    }
+
+    # 2. Fetch BAR5 (ABAR = AHCI Base) — distinct from NVMe's BAR0.
+    #    AHCI 1.3.1 §2.1.11: BAR5 is the canonical ABAR location, and
+    #    is the only BAR a spec-compliant AHCI controller uses for
+    #    its register interface.
+    var abar = pci_bar_64(idx, 5);
+    if (abar == 0) {
+        kprintln("ahci: BAR5 is zero (firmware did not assign)", 44);
+        return 0;
+    }
+
+    # 3. Enable bus mastering + memory space access. Symmetric to NVMe
+    #    Phase 1's invocation; firmware usually leaves it set but we
+    #    assert it for defensive boot-state hygiene.
+    pci_enable_bus_master_idx(idx);
+
+    # 4. Cache the probe before any register access.
+    ahci_present   = 1;
+    ahci_pci_idx   = idx;
+    ahci_mmio_base = abar;
+
+    # 5. Remap ABAR's 2 MB chunk as UC. Boot identity map leaves BARs
+    #    at PAT entry 0 = WB; AHCI MMIO cannot be cached. Same call
+    #    nvme_probe + xhci_init use.
+    vmm_remap_uc_2mb(abar);
+
+    # 6. Read CAP. Decode the fields we care about for Phase 1:
+    #    NP  (bits  0-4): Number of Ports (zero-based)
+    #    NCS (bits  8-12): Number of Command Slots (zero-based)
+    #    ISS (bits 20-23): Interface Speed Support (1.5/3/6 Gbps)
+    #    SAM (bit 18): Supports AHCI Mode only
+    #    SSS (bit 27): Supports Staggered Spin-up
+    #    SNCQ (bit 30): Supports Native Command Queuing
+    #    S64A (bit 31): Supports 64-bit Addressing
+    ahci_cap   = ahci_mmio_read32(AHCI_REG_CAP);
+    ahci_np    = ahci_cap & 0x1F;
+    ahci_ncs   = (ahci_cap >> 8) & 0x1F;
+    ahci_iss   = (ahci_cap >> 20) & 0x0F;
+    ahci_sam   = (ahci_cap >> 18) & 0x01;
+    ahci_sss   = (ahci_cap >> 27) & 0x01;
+    ahci_sncq  = (ahci_cap >> 30) & 0x01;
+    ahci_s64a  = (ahci_cap >> 31) & 0x01;
+
+    # 7. Read GHC. Bits we observe (none of these are written in Phase 1):
+    #    AE  (bit 31): AHCI Enable
+    #    IE  (bit 1): Interrupt Enable
+    #    HR  (bit 0): HBA Reset (reads 1 while reset in progress)
+    ahci_ghc = ahci_mmio_read32(AHCI_REG_GHC);
+
+    # 8. Read PI (Ports Implemented). Bitmap — bit i = port i is
+    #    implemented in the silicon. Note: implemented ≠ has-device;
+    #    that's PxSSTS.DET, read in ahci_enum_ports.
+    ahci_pi = ahci_mmio_read32(AHCI_REG_PI);
+
+    # 9. Read VS. AHCI 1.3.1 §3.1.5 layout:
+    #    bits 31-16: Major
+    #    bits 15-0:  Minor
+    ahci_vs        = ahci_mmio_read32(AHCI_REG_VS);
+    ahci_ver_major = (ahci_vs >> 16) & 0xFFFF;
+    ahci_ver_minor = ahci_vs & 0xFFFF;
+
+    # 10. Report. Two lines: discovery + capability summary. Same
+    #     shape as nvme_probe's two-line print.
+    kprint("ahci: found at ", 15);
+    kprint_num(abar);
+    kprint(", version=", 10);
+    kprint_num(ahci_ver_major);
+    kprint(".", 1);
+    kprint_num(ahci_ver_minor);
+    kprintln("", 0);
+
+    kprint("ahci: NP=", 9);
+    kprint_num(ahci_np + 1);
+    kprint(" NCS=", 5);
+    kprint_num(ahci_ncs + 1);
+    kprint(" ISS=", 5);
+    kprint_num(ahci_iss);
+    kprint(" SAM=", 5);
+    kprint_num(ahci_sam);
+    kprint(" SSS=", 5);
+    kprint_num(ahci_sss);
+    kprint(" SNCQ=", 6);
+    kprint_num(ahci_sncq);
+    kprint(" S64A=", 6);
+    kprint_num(ahci_s64a);
+    kprintln("", 0);
+
+    kprint("ahci: GHC=", 10);
+    kprint_num(ahci_ghc);
+    kprint(" PI=", 4);
+    kprint_num(ahci_pi);
+    kprintln("", 0);
+
+    # CMOS kcp = 0x4B (AHCI HBA probe completed).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4B; 0xE6; 0x71; }
+    return 1;
+}
+
+# --- Phase 1: port enumeration ---------------------------------------
+#
+# Walk the PI bitmap, read SSTS + SIG for each implemented port,
+# classify device class. Read-only — no PxCMD reset / spin-up / CL+FIS
+# allocation. The PxCMD register IS read for state visibility but never
+# written; Phase 2 owns the bring-up sequence.
+#
+# SSTS.DET decode (AHCI 1.3.1 §3.3.10):
+#   0 = No device, no PHY communication
+#   1 = Device present, no PHY communication (handshake failure)
+#   3 = Device present, PHY communication established (operational)
+#   4 = Offline mode (loopback / BIST in progress)
+#
+# Returns the count of ports with DET=3 (device present + comm).
+
+fn ahci_enum_ports() {
+    if (ahci_present == 0) { return 0; }
+
+    var count = 0;
+    var port  = 0;
+    var max_port = ahci_np + 1;   # NP is zero-based
+    if (max_port > 32) { max_port = 32; }   # PI is a 32-bit bitmap; defensive cap
+
+    while (port < max_port) {
+        var bit_set = (ahci_pi >> port) & 0x01;
+        if (bit_set == 1) {
+            var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+            var ssts     = ahci_mmio_read32(port_off + AHCI_P_SSTS);
+            var sig      = ahci_mmio_read32(port_off + AHCI_P_SIG);
+            var det      = ssts & 0x0F;
+            var spd      = (ssts >> 4) & 0x0F;
+
+            kprint("ahci: port ", 11);
+            kprint_num(port);
+            kprint(" DET=", 5);
+            kprint_num(det);
+            kprint(" SPD=", 5);
+            kprint_num(spd);
+            kprint(" SIG=", 5);
+            kprint_num(sig);
+
+            if (det == 3) {
+                count = count + 1;
+                if (sig == AHCI_SIG_ATA) {
+                    kprintln(" (SATA)", 7);
+                } else {
+                    if (sig == AHCI_SIG_ATAPI) {
+                        kprintln(" (ATAPI)", 8);
+                    } else {
+                        if (sig == AHCI_SIG_SEMB) {
+                            kprintln(" (SEMB)", 7);
+                        } else {
+                            if (sig == AHCI_SIG_PM) {
+                                kprintln(" (port multiplier)", 18);
+                            } else {
+                                kprintln(" (unknown sig)", 14);
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (det == 0) {
+                    kprintln(" (no device)", 12);
+                } else {
+                    kprintln(" (PHY handshake incomplete)", 27);
+                }
+            }
+        }
+        port = port + 1;
+    }
+
+    ahci_devices_found = count;
+    # CMOS kcp = 0x4C (AHCI port enumeration done).
+    asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4C; 0xE6; 0x71; }
+    return count;
+}

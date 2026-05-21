@@ -91,29 +91,159 @@ fn gpt_decode_header(buf) {
     return 0;
 }
 
-# --- Partition array walk (first 4 KB only in Phase 1) ---------------
+# --- Partition array walk (full 16 KB in Phase 2) --------------------
 #
 # Count non-empty entries by checking the first 8 bytes of each entry's
 # PartitionTypeGUID field (offset 0 within the entry). Empty entries
 # have the all-zero GUID per UEFI § 5.3.3. Checking only the first 8
-# bytes is a Phase 1 shortcut — a maliciously-zeroed-low-half / nonzero-
+# bytes is a Phase 2 shortcut — a maliciously-zeroed-low-half / nonzero-
 # high-half GUID would slip past, but no real GPT writer produces that
-# shape; Phase 2 can tighten to a full 16-byte check.
-fn gpt_walk_first_4kb() {
-    var count   = 0;
-    var per_4k  = 4096 / gpt_partition_entry_size;
-    var entries = per_4k;
-    if (entries > GPT_MAX_ENTRIES_P1) { entries = GPT_MAX_ENTRIES_P1; }
-    if (entries > gpt_num_partition_entries) {
-        entries = gpt_num_partition_entries;
-    }
-    var i = 0;
-    while (i < entries) {
-        var off = gpt_array_buf + (i * gpt_partition_entry_size);
-        if (load64(off + 0) != 0) { count = count + 1; }
-        i = i + 1;
+# shape; CRC32-validation in Phase 3 will catch any tampering.
+#
+# Standard layout: 128 entries × 128 B = 16 KB = 32 LBAs = 4 × 4 KB
+# chunks. We loop over chunks because `pmm_alloc` returns single 4 KB
+# pages (no contiguous-multi-page allocator in the kernel yet); each
+# chunk re-reads into the same scratch buffer.
+fn gpt_walk_all_partitions() {
+    var count             = 0;
+    var entries_per_chunk = 4096 / gpt_partition_entry_size;
+    var chunks            = (gpt_num_partition_entries + entries_per_chunk - 1) / entries_per_chunk;
+    if (chunks > 4) { chunks = 4; }     # cap at 16 KB (standard array)
+    var chunk_id = 0;
+    while (chunk_id < chunks) {
+        var chunk_lba = gpt_partition_entries_lba + chunk_id * 8;
+        if (blk_read_sectors(chunk_lba, 8, gpt_array_buf) != 0) {
+            return count;
+        }
+        var i = 0;
+        while (i < entries_per_chunk) {
+            var off = gpt_array_buf + (i * gpt_partition_entry_size);
+            if (load64(off + 0) != 0) { count = count + 1; }
+            i = i + 1;
+        }
+        chunk_id = chunk_id + 1;
     }
     return count;
+}
+
+# --- Partition name printer ------------------------------------------
+#
+# Partition names are 72-byte UTF-16LE strings (36 max chars) at offset
+# 56 within each entry. For ASCII names — the typical case — the low
+# byte of each u16 is the printable character; we dump it directly via
+# `kprint(ptr+2*i, 1)` which writes one byte to the console. Non-ASCII
+# chars (high byte != 0) print as their low byte's glyph (often garbled
+# but never breaks the surrounding output). Stops at the first u16 = 0.
+fn gpt_print_name(name_ptr) {
+    var i = 0;
+    while (i < 36) {
+        var lo = load8(name_ptr + (i * 2));
+        if (lo == 0) { return 0; }
+        kprint(name_ptr + (i * 2), 1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# --- `parts` shell command implementation ----------------------------
+#
+# Iterate all 4 chunks of the partition array, print one line per
+# non-empty entry: `  [idx] <name>  LBA <first>-<last> (<size> MiB)`.
+# Re-reads disk chunks rather than caching — one `parts` invocation =
+# 4 × 4 KB reads, fine for an infrequent command.
+fn gpt_print_all_partitions() {
+    if (gpt_present == 0) {
+        kprintln("no GPT", 6);
+        return 0;
+    }
+    kprint("partitions (", 12);
+    kprint_num(gpt_partition_count);
+    kprint(" active / ", 10);
+    kprint_num(gpt_num_partition_entries);
+    kprintln(" reserved):", 11);
+
+    var entries_per_chunk = 4096 / gpt_partition_entry_size;
+    var chunks            = (gpt_num_partition_entries + entries_per_chunk - 1) / entries_per_chunk;
+    if (chunks > 4) { chunks = 4; }
+    var chunk_id = 0;
+    while (chunk_id < chunks) {
+        var chunk_lba = gpt_partition_entries_lba + chunk_id * 8;
+        if (blk_read_sectors(chunk_lba, 8, gpt_array_buf) != 0) {
+            kprintln("  array read failed", 19);
+            return 0 - 1;
+        }
+        var i = 0;
+        while (i < entries_per_chunk) {
+            var off = gpt_array_buf + (i * gpt_partition_entry_size);
+            if (load64(off + 0) != 0) {
+                var idx       = chunk_id * entries_per_chunk + i;
+                var first_lba = load64(off + 32);
+                var last_lba  = load64(off + 40);
+                var sectors   = last_lba - first_lba + 1;
+                var size_mib  = (sectors * blk_lba_bytes) / 1048576;
+
+                kprint("  [", 3);
+                kprint_num(idx);
+                kprint("] ", 2);
+                gpt_print_name(off + 56);
+                kprint("  LBA ", 6);
+                kprint_num(first_lba);
+                kprint("-", 1);
+                kprint_num(last_lba);
+                kprint(" (", 2);
+                kprint_num(size_mib);
+                kprintln(" MiB)", 5);
+            }
+            i = i + 1;
+        }
+        chunk_id = chunk_id + 1;
+    }
+    return 0;
+}
+
+# --- Partition-aware helpers (single-chunk reads) --------------------
+#
+# Query an entry by index. Returns 0 if idx is out of range or the
+# array read fails or the entry is empty. Callers should also check
+# `gpt_present == 1` before trusting these.
+#
+# Each helper costs one 4 KB read per invocation. If callers query
+# multiple fields of the same partition, batch via `gpt_partition_info`
+# instead (returns first_lba, sectors, type-guid-low in globals).
+
+var gpt_q_first_lba = 0;     # last queried partition's first_lba
+var gpt_q_last_lba  = 0;
+var gpt_q_sectors   = 0;
+var gpt_q_type_lo   = 0;     # PartitionTypeGUID first 8 bytes
+var gpt_q_type_hi   = 0;     # PartitionTypeGUID next 8 bytes
+
+fn gpt_partition_info(idx) {
+    gpt_q_first_lba = 0;
+    gpt_q_last_lba  = 0;
+    gpt_q_sectors   = 0;
+    gpt_q_type_lo   = 0;
+    gpt_q_type_hi   = 0;
+    if (gpt_present == 0) { return 0; }
+    if (idx < 0) { return 0; }
+    if (idx >= gpt_num_partition_entries) { return 0; }
+
+    var entries_per_chunk = 4096 / gpt_partition_entry_size;
+    var chunk_id          = idx / entries_per_chunk;
+    var slot              = idx % entries_per_chunk;
+    if (chunk_id >= 4) { return 0; }
+
+    var chunk_lba = gpt_partition_entries_lba + chunk_id * 8;
+    if (blk_read_sectors(chunk_lba, 8, gpt_array_buf) != 0) { return 0; }
+
+    var off = gpt_array_buf + (slot * gpt_partition_entry_size);
+    if (load64(off + 0) == 0) { return 0; }     # empty entry
+
+    gpt_q_type_lo   = load64(off + 0);
+    gpt_q_type_hi   = load64(off + 8);
+    gpt_q_first_lba = load64(off + 32);
+    gpt_q_last_lba  = load64(off + 40);
+    gpt_q_sectors   = gpt_q_last_lba - gpt_q_first_lba + 1;
+    return 1;
 }
 
 # --- Print summary ---------------------------------------------------
@@ -167,8 +297,8 @@ fn gpt_init() {
         return 0;
     }
 
-    gpt_partition_count = gpt_walk_first_4kb();
-    # CMOS kcp = 0x4A (GPT partition array first 4 KB walked).
+    gpt_partition_count = gpt_walk_all_partitions();
+    # CMOS kcp = 0x4A (GPT partition array fully walked — Phase 2).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x4A; 0xE6; 0x71; }
 
     gpt_present = 1;

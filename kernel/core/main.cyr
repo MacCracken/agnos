@@ -321,7 +321,24 @@ if (nvme_admin_init() == 1) {
 # archaemenid's NVMe at iron debut, where LBA 0 = all zeros). CMOS kcps
 # 0x49 (header valid) / 0x4A (array walked) extend NVMe's 0x40-0x48
 # sequence.
-gpt_init();
+# AHCI Phase 1 — locate the AHCI/SATA controller (if present), remap
+# BAR5 (ABAR) as UC, read CAP/GHC/VS/PI, walk implemented ports for
+# SSTS/SIG. Read-only probe — no HBA reset, no port init, no command
+# list, no IDENTIFY. Mirrors NVMe Phase 1's shape. CMOS kcps 0x4B / 0x4C
+# stamp on each stage. No-op if no AHCI device is present (QEMU
+# NVMe-only smoke) — typical for archaemenid's M.2-NVMe-as-only-disk
+# initial bring-up; will light up when SATA `sda` is on the bus.
+if (ahci_probe() == 1) {
+    ahci_enum_ports();
+}
+if (gpt_init() == 1) {
+    # Phase 2 — dump the full partition table at boot so iron + QEMU
+    # bring-up runs see the same surface as the `parts` shell command
+    # without needing keyboard injection. Costs one extra 16 KB of disk
+    # reads (4 chunks × 4 KB scratch). Negligible vs the value of having
+    # the table visible on every boot during the storage arc.
+    gpt_print_all_partitions();
+}
 vfs_init();
 kprintln("VFS initialized", 15);
 

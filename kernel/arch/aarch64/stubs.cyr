@@ -113,9 +113,22 @@ fn nvme_blk_read(a, b) { return 0 - 1; }
 fn nvme_blk_write(a, b) { return 0 - 1; }
 fn nvme_blk_read_sectors(a, b, c) { return 0 - 1; }
 
-# GPT parser stubs (1.31.1 storage arc — Phase 1)
+# AHCI/SATA stubs (1.31.1 storage arc — Phase 1)
+var ahci_present = 0;
+var ahci_devices_found = 0;
+fn ahci_probe() { return 0; }
+fn ahci_enum_ports() { return 0; }
+
+# GPT parser stubs (1.31.1 storage arc — Phase 1 + Phase 2)
 var gpt_present = 0;
+var gpt_q_first_lba = 0;
+var gpt_q_last_lba  = 0;
+var gpt_q_sectors   = 0;
+var gpt_q_type_lo   = 0;
+var gpt_q_type_hi   = 0;
 fn gpt_init() { return 0; }
+fn gpt_print_all_partitions() { return 0; }
+fn gpt_partition_info(a) { return 0; }
 
 # FAT16 filesystem stubs
 var fatfs_active = 0;

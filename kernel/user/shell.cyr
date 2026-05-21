@@ -23,6 +23,7 @@ fn sh_cmd_help() {
     kprintln("  tcp     - TCP connect test", 28);
     kprintln("  pipe    - test pipe IPC", 25);
     kprintln("  blkread - read disk sector", 28);
+    kprintln("  parts   - list GPT partitions", 31);
     kprintln("  ls      - list disk files", 27);
     kprintln("  disk    - disk info", 21);
     kprintln("  bench   - run benchmarks", 26);
@@ -325,6 +326,10 @@ fn sh_exec(buf, len) {
         } else {
             kprintln("Filesystem: none", 16);
         }
+        return 0;
+    }
+    if (sh_streq(buf, clen, "parts", 5) == 1) {
+        gpt_print_all_partitions();
         return 0;
     }
     if (sh_streq(buf, clen, "bench", 5) == 1) { return sh_cmd_bench(); }
