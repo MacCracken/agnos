@@ -348,9 +348,9 @@ if (ahci_probe() == 1) {
         # (blk_active stays BLK_NVME). CMOS kcp 0x50 stamps on
         # registration.
         ahci_read_demo();
-#ifdef AHCI_RW_DEMO
+        #ifdef AHCI_RW_DEMO
         ahci_write_demo();
-#endif
+        #endif
         ahci_register_block_dev();
     }
 }
