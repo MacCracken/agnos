@@ -69,6 +69,22 @@ enum XhciCmdSpins {
     XHCI_CMD_TIMEOUT_SPINS = 10000000;
 }
 
+# Bulk-transfer timeout — separate ceiling for class-driver bulk-IN/bulk-OUT
+# waits in msc_bbb_exec. Real Silicon Motion / generic-vendor USB sticks
+# routinely NAK bulk-IN for 50–200ms before delivering the first INQUIRY /
+# RC10 / READ(10) response. Cmd-ring timeout (10M ≈ 25-50ms on Zen) was
+# tuned for Enable Slot / Address Device which complete in microseconds —
+# applying it to bulk transfers caused Attempt 86's INQUIRY data-phase to
+# abandon a still-in-flight transfer, leaving a pinned TRB that poisoned
+# every subsequent BBB exec on the same slot.
+#
+# 200M iterations ≈ 800ms-1.2s wall on Zen-class silicon — comfortably
+# above Linux's USB_CTRL_GET_TIMEOUT=5000ms scaled to "first response"
+# expectations, and below the rubric for declaring a true device wedge.
+enum XhciBulkSpins {
+    XHCI_BULK_TIMEOUT_SPINS = 200000000;
+}
+
 # Submit one TRB to the cmd ring. cycle bit is OR-d in by this function.
 # Caller-supplied dword 3 must have its bit 0 zero.
 fn xhci_cmd_submit(p_lo, p_hi, status, ctrl_partial) {
@@ -348,7 +364,9 @@ fn xhci_cmd_stop_endpoint(slot_id, dci) {
 # Returns 1 on Success, 0 on any failure.
 fn xhci_cmd_set_tr_dequeue(slot_id, dci, deq_ptr_phys, dcs) {
     var param_lo = (deq_ptr_phys & 0xFFFFFFF0) | (dcs & 0x1);
-    var param_hi = 0;
+    # Full 64-bit phys — previously hardcoded 0; works on archaemenid where
+    # PMM pages stay <4GB but malformed on any system with high-memory rings.
+    var param_hi = (deq_ptr_phys >> 32) & 0xFFFFFFFF;
     var ctrl = (XHCI_TRB_SET_TR_DEQUEUE << 10)
     | ((dci     & 0x1F) << 16)
     | ((slot_id & 0xFF) << 24);

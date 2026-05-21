@@ -5,6 +5,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.31.3] — 2026-05-21
+
+### USB Mass Storage Phase 2.8 — eight-bug repair stack (post-Attempt-86 carry-forward)
+
+Closes the post-Attempt-86 audit — Phase 2.7's multi-source-converged Reset Recovery LANDED correctly on iron (`Reset Recovery OK` × 3 in the boot transcript, no `Reset Endpoint failed` regression of Attempt 85) but the TUR retries that followed each successful recovery all failed with "CSW signature mismatch". Audit found EIGHT distinct bugs cascading from a single root cause — `XHCI_CMD_TIMEOUT_SPINS=10M` (~25–50ms wall on Zen) was being applied to bulk transfers too, abandoning live INQUIRY data phases as wedged. Real Silicon Motion / generic-vendor USB sticks routinely NAK bulk-IN for 50–200ms before first response; the old timeout was systematically declaring healthy transfers dead.
+
+Per [`feedback_stop_letter_laddering`](https://github.com/MacCracken/agnosticos/blob/main/.claude/projects/-home-macro-Repos-agnosticos/memory/feedback_stop_letter_laddering.md) — escape plan written BEFORE the next iron burn, not after another falsification. Per [`feedback_redesign_dont_reinvent`](https://github.com/MacCracken/agnosticos/blob/main/.claude/projects/-home-macro-Repos-agnosticos/memory/feedback_redesign_dont_reinvent.md) — every patch backed by Linux + FreeBSD + xHCI 1.2 spec prior art. Per [`feedback_iron_burns_block_other_work`](https://github.com/MacCracken/agnosticos/blob/main/.claude/projects/-home-macro-Repos-agnosticos/memory/feedback_iron_burns_block_other_work.md) — full eight-patch stack lands in ONE burn, no incremental laddering.
+
+- **Bulk timeout extension** (`xhci_cmd.cyr` new `XHCI_BULK_TIMEOUT_SPINS = 200_000_000` ≈ 1s wall, separate enum from cmd-ring timeout). The root cause. Cmd-ring 10M tuned for Enable Slot / Address Device (microseconds); applying it to bulk transfers was abandoning the INQUIRY data phase mid-flight. Linux `USB_CTRL_GET_TIMEOUT=5000ms`; FreeBSD comparable.
+
+- **Strict TRB-pointer matching in transfer-event wait** (`xhci.cyr` new `xhci_wait_transfer_for_trb(slot_id, expected_trb_phys, expected_len)` + `xhci_last_xfer_bytes` global). The previous `xhci_wait_transfer_event(slot_id)` matched on slot_id only — stale completion events for prior wedged TRBs got consumed as if they were the new transfer's event (Attempt 86's "CSW tag mismatch" on TUR #0 was a late INQUIRY CSW delivery being attributed to TUR's CSW receive). New helper matches on `(slot_id, TRB pointer)` from event dword 0; skips and consumes mismatched events without returning false success. Mirrors Linux `drivers/usb/host/xhci-ring.c handle_tx_event`.
+
+- **SHORT_PACKET residue check** (`xhci_wait_transfer_for_trb` body). Previous code returned success on `XHCI_CC_SHORT_PACKET` without inspecting `event_dword_2 bits 23:0` (residue = unfulfilled byte count). When residue == expected_length (0 bytes actually transferred — device sent ZLP), we were reading an uninitialized buffer past the partial-DMA-write boundary. **Direct cause of Attempt 86's repeating "CSW signature mismatch"**: device's ZLP-then-real-CSW pattern after Reset Recovery left `csw_phys[0..3] = 0` (page-zero), sig != 0x53425355.
+
+- **`msc_bbb_exec` transport_failed entry guard** (collapsed into `msc_scsi_exec` wrapper). Previous TUR retry loop ran the first attempt against still-wedged EPs (the INQUIRY-data-timeout's pinned bulk-IN TRB poisoned TUR #0 → "CSW tag mismatch"); Reset Recovery only fired AFTER a failed attempt. New wrapper checks `row + 69` at entry and runs `msc_reset_recovery` BEFORE the first attempt if sticky is set. Linux `usb_stor_invoke_transport` pattern.
+
+- **Reposition drain in Reset Recovery** (`msc.cyr msc_reset_recovery` step 7 ← previously step 5). Stop Endpoint × 2 in steps 5a/5b posts Transfer Events for any pinned in-flight TRBs (per xHCI 1.2 §4.6.9.1). Pre-Stop drain (Phase 2.7's old position) drained an empty ring; those events landed AFTER and got consumed by the next BBB exec's wait. Linux drains in `handle_stopped_endpoint`.
+
+- **Unified retry+recover wrapper for all SCSI commands** (`msc.cyr` new `msc_scsi_exec(slot, lun, cdb, cdb_len, data, data_len, dir_in, max_retries)`). Single retry shell wrapping `msc_bbb_exec`; runs Reset Recovery between failed attempts. INQUIRY/TUR/RC10/RS/READ(10)/WRITE(10) all migrated. Subsumes the hand-rolled TUR retry loop in `msc_probe_slot` (now a single `msc_test_unit_ready` call). Linux `usb_stor_invoke_transport`.
+
+- **Stop Endpoint on transfer-event timeout** (collapsed into entry guard). Wedged EPs no longer linger Running with pinned TRBs between operations — `msc_scsi_exec`'s entry guard fires `msc_reset_recovery` (which Stop-Endpoints both directions) before any post-failure retry.
+
+- **`xhci_cmd_set_tr_dequeue` full 64-bit phys** (`xhci_cmd.cyr`). `param_hi` was hardcoded 0; now `(deq_ptr_phys >> 32) & 0xFFFFFFFF`. Worked on archaemenid (PMM stays <4GB) but malformed for any future high-memory ring placement.
+
+**QEMU validation** (q35 + OVMF + gnoboot 0.4.2 + agnos 1.31.3 + `-device qemu-xhci -device usb-storage,bus=xhci.0,drive=stick` against 8 MB scratch `usb.img`):
+
+```
+msc: slot 1 BBB intf=0 bulk-IN=129 bulk-OUT=2 MPS(in/out)=1024/1024 MaxLUN=0
+msc: slot 1 INQUIRY: vendor='QEMU' product='QEMU HARDDISK' rev='2.5+' type=block
+msc: slot 1 TEST UNIT READY -> ready (Pass)
+msc: slot 1 READ CAPACITY: last_lba=16383 blk=512B -> 8 MiB
+msc: 1 mass-storage device(s) detected
+msc: registered as tertiary block_dev (slot 1, 16384 LBAs x 512B; AHCI primary)
+msc: slot 1 LBA0 first 8 bytes: 0 0 0 0 0 0 0 0
+AGNOS shell v1.31.3 (type 'help')
+```
+
+All four QEMU gates green: INQUIRY decoded, RC10 = 8 MiB, TUR ready, boot complete. No regression of the QEMU-side Phase 1-4 baseline.
+
+**Iron Attempt 87 success rubric**: install agnos 1.31.3 on archaemenid; plug the same Silicon Motion stick (`VID=0x090C PID=0x1000`). Expected: (a) full — `xhci: bulk transfer event timeout` does NOT appear; INQUIRY succeeds first try (with possible 1 retry); TUR Pass; RC10 prints last_lba + blk; tertiary registration line; LBA-0 readback. (b) partial — Reset Recovery still fires but at least one round eventually succeeds (TUR Pass or INQUIRY data lands). (c) failure — same "CSW signature mismatch" loop = new bug class beyond the eight-bug audit.
+
+**MVP gate posture:** unaffected. `msc_probe_slot` returns 1 regardless of post-Configure-EP failures; boot-to-shell stays green. USB MS arc remains opportunistic.
+
+**Build:** 475,096 B (1.31.2 baseline) → **502,072 B** (+26,976 B / +5.7% for the eight-patch stack: new `XHCI_BULK_TIMEOUT_SPINS` enum + `xhci_wait_transfer_for_trb` + `xhci_last_xfer_bytes` + `msc_scsi_exec` wrapper + `msc_bbb_exec` rewrite + Reset Recovery reorder + Set TR Dequeue 64-bit fix + comments).
+
+**Files changed:** `kernel/arch/x86_64/usb/xhci_cmd.cyr` (`XHCI_BULK_TIMEOUT_SPINS` enum, `xhci_cmd_set_tr_dequeue` full 64-bit phys), `kernel/arch/x86_64/usb/xhci.cyr` (`xhci_wait_transfer_for_trb` + `xhci_last_xfer_bytes`), `kernel/arch/x86_64/usb/msc.cyr` (`msc_bulk_enqueue` returns TRB phys, `msc_bbb_exec` rewritten with strict TRB matching + residue check, `msc_scsi_exec` new wrapper, INQUIRY/TUR/RC10/RS/READ/WRITE migrated, Reset Recovery drain repositioned, `msc_probe_slot` TUR loop simplified to single call).
+
+Detail in [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 87](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
+
+## [1.31.2] — 2026-05-21
+
 ### USB Mass Storage Phase 2.7 — multi-source-converged Reset Recovery hardening (post-Attempt-85 carry-forward, pre-Attempt-86 build)
 
 Closes the four-patch carry-forward from Attempt 85's FALSIFIED outcome (Phase 2.6's `xhci_cmd_reset_endpoint` returned non-Success completion code, aborting recovery before Set TR Dequeue Pointer could fire). Post-burn code-read against xHCI 1.2 §4.6.8 surfaced the root cause: Reset Endpoint is only legal from Halted state, but Attempt 84/85's transport wedge is a transfer-event timeout — the EP never entered Halted; Stop Endpoint left it in Stopped; Reset Endpoint on Stopped returned `Context State Error` (CC=19).

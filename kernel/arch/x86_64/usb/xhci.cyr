@@ -756,6 +756,108 @@ fn xhci_ring_ep0_doorbell(slot_id) {
     return 0;
 }
 
+# Last-bulk-transfer actual bytes (populated by xhci_wait_transfer_for_trb).
+# expected_len - residue from the Transfer Event's dword 2 bits 23:0. Read
+# by msc_bbb_exec to validate CSW receipt actually delivered ≥13 bytes (a
+# ZLP from the device produces a SHORT_PACKET event with residue=expected,
+# i.e., 0 bytes transferred — the direct cause of Attempt 86's "CSW
+# signature mismatch" cascade).
+var xhci_last_xfer_bytes = 0;
+
+# Strict transfer-event wait — matches on (slot_id, TRB Pointer). Skips
+# stale events for other TRBs on the same slot (late completions for
+# wedged transfers, Stop Endpoint completion events for pinned TRBs).
+# Returns 1 on success with xhci_last_xfer_bytes set to actual bytes
+# transferred; 0 on timeout / failure / zero-byte SHORT_PACKET.
+#
+# Use this for bulk transfers in class drivers where multiple in-flight
+# TRBs may share a slot. Control-transfer callers can keep using the
+# slot-id-only xhci_wait_transfer_event below.
+#
+# Linux reference: drivers/usb/host/xhci-ring.c handle_tx_event —
+# matches event TRB Pointer against per-URB td list.
+fn xhci_wait_transfer_for_trb(slot_id, expected_trb_phys, expected_len) {
+    var wait = 0;
+    xhci_last_xfer_bytes = 0;
+    while (wait < XHCI_BULK_TIMEOUT_SPINS) {
+        var evt_off = xhci_evt_ring_idx * 16;
+        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt_dw3 = load32(evt + 12);
+        var evt_cycle = evt_dw3 & 0x1;
+        if (evt_cycle == xhci_evt_ring_cycle) {
+            var evt_type = (evt_dw3 >> 10) & 0x3F;
+            var matched = 0;
+            if (evt_type == XHCI_TRB_TRANSFER_EVENT) {
+                var evt_slot = (evt_dw3 >> 24) & 0xFF;
+                if (evt_slot == slot_id) {
+                    var evt_trb_lo = load32(evt + 0);
+                    # Match on low 32 bits — sufficient since transfer
+                    # rings are page-aligned and stay <4GB on archaemenid.
+                    if (evt_trb_lo == (expected_trb_phys & 0xFFFFFFFF)) {
+                        matched = 1;
+                    }
+                }
+            }
+            if (matched != 0) {
+                var evt_dw2 = load32(evt + 8);
+                var ccode   = (evt_dw2 >> 24) & 0xFF;
+                var residue = evt_dw2 & 0xFFFFFF;
+                xhci_last_cmd_ccode = ccode;
+                xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+                if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+                    xhci_evt_ring_idx = 0;
+                    if (xhci_evt_ring_cycle == 1) {
+                        xhci_evt_ring_cycle = 0;
+                    } else {
+                        xhci_evt_ring_cycle = 1;
+                    }
+                }
+                var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
+                var new_erdp = xhci_evt_ring_phys + xhci_evt_ring_idx * 16;
+                xhci_rt_write64(ir0 + XHCI_IR_ERDP, new_erdp | 0x8);
+                if (ccode == XHCI_CC_SUCCESS) {
+                    xhci_last_xfer_bytes = expected_len;
+                    return 1;
+                }
+                if (ccode == XHCI_CC_SHORT_PACKET) {
+                    # Residue == expected_len means 0 bytes transferred —
+                    # device sent ZLP or similar. Treat as failure so the
+                    # caller doesn't read a buffer the controller never
+                    # wrote to.
+                    if (residue >= expected_len) {
+                        xhci_last_xfer_bytes = 0;
+                        return 0;
+                    }
+                    xhci_last_xfer_bytes = expected_len - residue;
+                    return 1;
+                }
+                # STALL_ERROR / TRANSACTION_ERROR / BABBLE_DETECTED / etc.
+                xhci_last_xfer_bytes = 0;
+                return 0;
+            }
+            # Non-matching event — consume and continue. Advance ERDP so
+            # the ring doesn't back up on long sequences of stale events.
+            xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+            if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+                xhci_evt_ring_idx = 0;
+                if (xhci_evt_ring_cycle == 1) {
+                    xhci_evt_ring_cycle = 0;
+                } else {
+                    xhci_evt_ring_cycle = 1;
+                }
+            }
+            var ir0_n = xhci_rt_base + XHCI_RT_IR0_BASE;
+            var new_erdp_n = xhci_evt_ring_phys + xhci_evt_ring_idx * 16;
+            xhci_rt_write64(ir0_n + XHCI_IR_ERDP, new_erdp_n | 0x8);
+        }
+        wait = wait + 1;
+    }
+    xhci_last_cmd_ccode = 0;
+    xhci_last_xfer_bytes = 0;
+    kprintln("xhci: bulk transfer event timeout", 33);
+    return 0;
+}
+
 # Drain one Transfer Event from the event ring matching the given slot
 # ID. Returns 1 on Success ccode, 0 otherwise. Populates
 # xhci_last_cmd_ccode (re-used for any cmd/xfer event surface).

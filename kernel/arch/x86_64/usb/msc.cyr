@@ -341,34 +341,11 @@ fn msc_probe_slot(slot_id) {
             kprintln(" INQUIRY failed", 15);
         }
 
-        # TEST UNIT READY — Phase 2.5 retry loop with Reset Recovery
-        # between failed attempts (Linux usb_stor_TUR + sd_spinup_disk
-        # pattern). Real-vendor USB sticks commonly wedge bulk-IN on
-        # first-of-session transfers; Reset Recovery + retry recovers.
-        var tries = 0;
-        var tur = 0;
-        while (tries < 3) {
-            tur = msc_test_unit_ready(slot_id, 0);
-            if (tur != 0) { break; }
-            # Failed. If transport wedged, recover before next attempt.
-            if (load8(msc_row_addr(slot_id) + 69) == 1) {
-                kprint("msc: slot ", 10);
-                kprint_num(slot_id);
-                kprintln(" transport wedged, attempting Reset Recovery", 44);
-                if (msc_reset_recovery(slot_id) == 0) {
-                    kprint("msc: slot ", 10);
-                    kprint_num(slot_id);
-                    kprintln(" Reset Recovery failed", 22);
-                    break;
-                }
-            }
-            # Inter-retry delay: small spin loop (~5–10 ms wall on Zen-
-            # class silicon). "Becoming ready" SCSI cases typically clear
-            # in a few ms. Same magnitude as AHCI's quiescence poll.
-            var sd = 0;
-            while (sd < 5000000) { sd = sd + 1; }
-            tries = tries + 1;
-        }
+        # TEST UNIT READY — Phase 2.8 (agnos 1.31.3): single call now
+        # carries its own 3-retry + Reset Recovery loop via msc_scsi_exec.
+        # The hand-rolled loop here was redundant after the wrapper
+        # subsumed retry semantics.
+        var tur = msc_test_unit_ready(slot_id, 0);
 
         if (tur != 0) {
             xhci_cmos_stamp(0x54, slot_id & 0xFF);
@@ -493,6 +470,12 @@ fn msc_alloc_bulk_ring() {
 # IOC=1 (always — Phase 2 polls every TRB), ISP=1 for IN direction
 # (Interrupt on Short Packet, per Linux convention for IN bulk).
 #
+# Returns the TRB phys address (16-byte-aligned) on success, 0 on failure.
+# Caller uses the TRB phys for strict event matching via
+# xhci_wait_transfer_for_trb — slot-id-only matching consumed stale
+# completion events as if they belonged to the new transfer (Attempt 86's
+# cascade root cause).
+#
 # Layout (xHCI 1.2 §6.4.1.1 Normal TRB):
 #   dword 0-1: Data Buffer Pointer (phys)
 #   dword 2:   bits [16:0]  TRB Transfer Length
@@ -551,7 +534,7 @@ fn msc_bulk_enqueue(slot_id, is_in, data_phys, length) {
     # Ring the doorbell for this slot/DCI.
     var db_addr = xhci_mmio_base + xhci_db_off + slot_id * 4;
     store32(db_addr, dci & 0xFF);
-    return 1;
+    return trb;
 }
 
 
@@ -667,6 +650,23 @@ fn msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in) {
 #
 # Sets row + 69 (transport_failed) = 1 sticky on Phase Error / timeout
 # so future class-driver code can detect a wedged transport.
+#
+# Attempt 86 carry-forward (agnos 1.31.3, multi-source converged repair):
+#   - **Strict TRB-pointer matching**: each wait matches on (slot_id, TRB
+#     phys) via xhci_wait_transfer_for_trb. Stale completion events from
+#     a prior wedged transfer (e.g., a late INQUIRY-data SUCCESS or a
+#     Stop Endpoint pinned-TRB Stopped event) no longer get consumed as
+#     if they were the new transfer's event. Matches Linux's
+#     handle_tx_event (drivers/usb/host/xhci-ring.c) which finds the URB
+#     by TRB Pointer in dword 0-1 of the event.
+#   - **CSW byte-count validation**: SHORT_PACKET with residue==13 means
+#     the device sent a ZLP (0 bytes transferred); we now reject this
+#     before reading uninitialized csw_phys bytes — direct cause of
+#     Attempt 86's "CSW signature mismatch" cascade.
+#   - **Bulk timeout extension**: waits use XHCI_BULK_TIMEOUT_SPINS (~1s
+#     wall) instead of cmd-ring 10M (~25ms). Real Silicon Motion sticks
+#     routinely NAK bulk-IN for 50–200ms before first response; the old
+#     timeout was abandoning live transfers as wedged.
 fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
     var row = msc_row_addr(slot_id);
     if (load8(row + 68) == 0) { return 0; }            # endpoints not ready
@@ -674,8 +674,9 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
     # Step 1+2: build + send CBW on bulk-OUT.
     var tag = msc_build_cbw(slot_id, lun, cdb_phys, cdb_len, data_len, dir_in);
     var cbw = load64(row + 48);
-    if (msc_bulk_enqueue(slot_id, 0, cbw, 31) == 0) { return 0; }
-    if (xhci_wait_transfer_event(slot_id) == 0) {
+    var cbw_trb = msc_bulk_enqueue(slot_id, 0, cbw, 31);
+    if (cbw_trb == 0) { return 0; }
+    if (xhci_wait_transfer_for_trb(slot_id, cbw_trb, 31) == 0) {
         kprintln("msc: CBW transfer timeout", 25);
         store8(row + 69, 1);
         return 0;
@@ -683,10 +684,9 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
 
     # Step 3: optional data phase.
     if (data_len > 0) {
-        if (msc_bulk_enqueue(slot_id, dir_in, data_phys, data_len) == 0) {
-            return 0;
-        }
-        if (xhci_wait_transfer_event(slot_id) == 0) {
+        var data_trb = msc_bulk_enqueue(slot_id, dir_in, data_phys, data_len);
+        if (data_trb == 0) { return 0; }
+        if (xhci_wait_transfer_for_trb(slot_id, data_trb, data_len) == 0) {
             kprintln("msc: data phase timeout", 23);
             store8(row + 69, 1);
             return 0;
@@ -696,9 +696,20 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
     # Step 4: post CSW receive on bulk-IN.
     var csw = load64(row + 56);
     xhci_zero_page(csw);
-    if (msc_bulk_enqueue(slot_id, 1, csw, 13) == 0) { return 0; }
-    if (xhci_wait_transfer_event(slot_id) == 0) {
+    var csw_trb = msc_bulk_enqueue(slot_id, 1, csw, 13);
+    if (csw_trb == 0) { return 0; }
+    if (xhci_wait_transfer_for_trb(slot_id, csw_trb, 13) == 0) {
         kprintln("msc: CSW transfer timeout", 25);
+        store8(row + 69, 1);
+        return 0;
+    }
+    # Reject sub-CSW receives — a SHORT_PACKET event with residue ≥ 13 - 4
+    # would mean we got <4 bytes (not enough for sig validation). Reading
+    # an uninitialized buffer past partial-DMA-write boundary is undefined.
+    if (xhci_last_xfer_bytes < 13) {
+        kprint("msc: CSW short-receive ", 23);
+        kprint_num(xhci_last_xfer_bytes);
+        kprintln(" bytes (expected 13)", 20);
         store8(row + 69, 1);
         return 0;
     }
@@ -722,6 +733,53 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
     # status == 2 — Phase Error: transport wedged; needs Reset Recovery.
     kprintln("msc: CSW phase error", 20);
     store8(row + 69, 1);
+    return 0;
+}
+
+# === Phase 2.8 — SCSI retry+recover wrapper (Bug-stack 4/5/7) =========
+#
+# Wraps msc_bbb_exec with the canonical Linux usb_stor_invoke_transport
+# retry pattern: on any failure, run Reset Recovery (BOT Reset + EP
+# resync) and retry up to `max_retries` times.
+#
+# Entry-guard semantics — if transport_failed sticky is already set at
+# entry (e.g., a prior INQUIRY data-phase timeout poisoned the bulk
+# rings), Reset Recovery runs BEFORE the first attempt. This was Bug 4
+# of the Attempt 86 audit: the previous code attempted the first TUR
+# against still-wedged EPs because the retry-only happened after a
+# failed exec.
+#
+# Used by INQUIRY, TUR, READ CAPACITY(10), REQUEST SENSE, and the
+# Phase 4 READ(10) / WRITE(10) call sites — every SCSI command goes
+# through this single retry shell.
+#
+# Linux reference: drivers/usb/storage/transport.c usb_stor_invoke_transport.
+fn msc_scsi_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in, max_retries) {
+    var row = msc_row_addr(slot_id);
+    var attempt = 0;
+    while (attempt <= max_retries) {
+        # Entry guard: if transport wedged from a prior failure, recover
+        # BEFORE issuing. The wedge may carry an in-flight pinned TRB
+        # that would poison this exec too.
+        if (load8(row + 69) == 1) {
+            kprint("msc: slot ", 10);
+            kprint_num(slot_id);
+            kprintln(" transport wedged, attempting Reset Recovery", 44);
+            if (msc_reset_recovery(slot_id) == 0) {
+                kprint("msc: slot ", 10);
+                kprint_num(slot_id);
+                kprintln(" Reset Recovery failed", 22);
+                return 0;
+            }
+            # Inter-retry settle (~5-10ms on Zen-class silicon).
+            var sd = 0;
+            while (sd < 5000000) { sd = sd + 1; }
+        }
+        var r = msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len,
+                             data_phys, data_len, dir_in);
+        if (r != 0) { return 1; }
+        attempt = attempt + 1;
+    }
     return 0;
 }
 
@@ -752,23 +810,28 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
 #   3. CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN  (0x02/0x01/0/ep_in_addr)
 #   4. CLEAR_FEATURE(ENDPOINT_HALT) on bulk-OUT (0x02/0x01/0/ep_out_addr)
 #
-#   --- AGNOS-specific defensive safety ---
-#   5. Drain stale Transfer Events for this slot from the event ring
-#      (smoking gun for Attempt 84's CSW tag mismatch — late completions
-#      for wedged TRBs would otherwise be consumed by the next
-#      xhci_wait_transfer_event as the new transfer's event).
-#
 #   --- controller-side (xHCI 1.2 §4.6.8 / §4.6.9 / §4.6.10) ---
-#   6a. Stop Endpoint(bulk-IN)   — Running → Stopped (tolerates CSE
+#   5a. Stop Endpoint(bulk-IN)   — Running → Stopped (tolerates CSE
 #                                   if already Stopped/Halted)
-#   6b. Stop Endpoint(bulk-OUT)
-#   7a. Reset Endpoint(bulk-IN)  — Halted → Stopped, clears stuck TRDP;
+#   5b. Stop Endpoint(bulk-OUT)
+#   6a. Reset Endpoint(bulk-IN)  — Halted → Stopped, clears stuck TRDP;
 #                                   ONLY issued if EP state == Halted
 #                                   (spec-correct dispatch per FreeBSD
 #                                   xhci_configure_reset_endpoint —
 #                                   Reset Endpoint on Stopped returns
 #                                   CSE which would abort recovery)
-#   7b. Reset Endpoint(bulk-OUT) — same gate
+#   6b. Reset Endpoint(bulk-OUT) — same gate
+#
+#   --- AGNOS post-Stop event drain (Attempt 86 carry-forward) ---
+#   7. Drain Transfer Events generated by Stop Endpoint × 2. Spec
+#      (xHCI 1.2 §4.6.9.1): Stop on a Running EP with an in-flight TRB
+#      posts a Transfer Event with CC=Stopped (26) for that TRB BEFORE
+#      the Command Completion Event. cmd_wait silently consumes events
+#      it sees while polling for its CCE, but on real silicon the
+#      Transfer Event can land AFTER the CCE has been processed —
+#      leaving stale events that the next msc_bbb_exec's wait would
+#      otherwise consume as the new transfer's completion. Pre-Stop
+#      drain (1.31.2 Phase 2.7) didn't catch these.
 #
 #   --- host-side ring rewind ---
 #   8. Re-zero ring pages, rewrite Link TRBs, reset cycle/idx in row state.
@@ -840,10 +903,7 @@ fn msc_reset_recovery(slot_id) {
         return 0;
     }
 
-    # --- Step 5: drain stale Transfer Events for this slot ---
-    xhci_drain_transfer_events(slot_id);
-
-    # --- Step 6: Stop Endpoint (controller-side; Running → Stopped) ---
+    # --- Step 5: Stop Endpoint (controller-side; Running → Stopped) ---
     # Tolerates Context State Error (= EP already Stopped/Halted/Disabled)
     # which is a valid pre-condition for the optional Reset Endpoint.
     if (xhci_cmd_stop_endpoint(slot_id, dci_in) == 0) {
@@ -855,7 +915,7 @@ fn msc_reset_recovery(slot_id) {
         return 0;
     }
 
-    # --- Step 7: Reset Endpoint (controller-side; Halted → Stopped) ---
+    # --- Step 6: Reset Endpoint (controller-side; Halted → Stopped) ---
     # Spec-correct dispatch per xHCI 1.2 §4.6.8 + FreeBSD
     # xhci_configure_reset_endpoint: Reset Endpoint is only legal from
     # Halted state. Reading Output EP Context state and gating Reset
@@ -876,6 +936,20 @@ fn msc_reset_recovery(slot_id) {
             return 0;
         }
     }
+
+    # --- Step 7: drain stale Transfer Events POST-Stop/Reset ---
+    # Repositioned from pre-Stop (agnos 1.31.2 Phase 2.7) to here for
+    # the 1.31.3 repair. Stop Endpoint × 2 above generates Transfer
+    # Events for any pinned TRBs on the wedged EPs (xHCI 1.2 §4.6.9.1:
+    # "if the endpoint was running, the xHC posts a Transfer Event with
+    # Completion Code = Stopped"). Those events arrived AFTER the old
+    # pre-Stop drain, then got consumed by the next msc_bbb_exec's
+    # CBW wait as if they belonged to the new transfer — Attempt 86's
+    # "CSW signature mismatch" cascade. Linux's Stop Endpoint completion
+    # handler processes Transfer Events in the same handler (xhci-ring.c
+    # handle_stopped_endpoint); we equivalently drain immediately after
+    # the Stop commands return, before the host-side ring rewind.
+    xhci_drain_transfer_events(slot_id);
 
     # --- Step 8: host-side ring rewind ---
     var ring_in  = load64(row + 16);
@@ -957,7 +1031,9 @@ fn msc_test_unit_ready(slot_id, lun) {
     while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
     # All zeros = TEST UNIT READY (opcode 0x00, control 0x00).
 
-    return msc_bbb_exec(slot_id, lun, cdb_p, 6, 0, 0, 0);
+    # Up to 3 retries with Reset Recovery between failed attempts —
+    # canonical SCSI spin-up pattern (Linux sd_spinup_disk + usb_stor_TUR).
+    return msc_scsi_exec(slot_id, lun, cdb_p, 6, 0, 0, 0, 3);
 }
 
 
@@ -1036,7 +1112,11 @@ fn msc_inquiry(slot_id, lun) {
     store8(cdb_p + 3, 0);          # AllocationLength high byte
     store8(cdb_p + 4, 36);         # AllocationLength low byte
 
-    if (msc_bbb_exec(slot_id, lun, cdb_p, 6, data, 36, 1) == 0) {
+    # INQUIRY is the first SCSI command after Configure Endpoint; real-iron
+    # sticks (Silicon Motion / Realtek / etc.) can NAK bulk-IN for 50-200ms
+    # before delivering the first response. Up to 2 retries with Reset
+    # Recovery between attempts handles the cold-start wedge.
+    if (msc_scsi_exec(slot_id, lun, cdb_p, 6, data, 36, 1, 2) == 0) {
         return 0;
     }
 
@@ -1095,7 +1175,7 @@ fn msc_read_capacity(slot_id, lun) {
     while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
     store8(cdb_p + 0, 0x25);
 
-    if (msc_bbb_exec(slot_id, lun, cdb_p, 10, data, 8, 1) == 0) {
+    if (msc_scsi_exec(slot_id, lun, cdb_p, 10, data, 8, 1, 2) == 0) {
         return 0;
     }
 
@@ -1163,7 +1243,10 @@ fn msc_request_sense(slot_id, lun) {
     store8(cdb_p + 0, 0x03);                       # opcode
     store8(cdb_p + 4, 18);                         # allocation length
 
-    if (msc_bbb_exec(slot_id, lun, cdb_p, 6, data, 18, 1) == 0) {
+    # REQUEST SENSE is a diagnostic itself — only one shot. If the
+    # transport is still wedged after the upstream command's recovery
+    # rounds, REQUEST SENSE timing out is informative on its own.
+    if (msc_scsi_exec(slot_id, lun, cdb_p, 6, data, 18, 1, 1) == 0) {
         return 0;
     }
 
@@ -1296,7 +1379,10 @@ fn msc_read_lba(slot_id, lun, lba, count, buf_phys) {
     var cdb_buf[2];
     var cdb_p = &cdb_buf;
     msc_build_rw10_cdb(cdb_p, 0x28, lba, count);
-    return msc_bbb_exec(slot_id, lun, cdb_p, 10, buf_phys, bytes, 1);
+    # 1 retry — block-level I/O failures should surface fast (callers
+    # like fatfs / GPT expect prompt errors), but a single transient
+    # NAK-storm shouldn't lose the request.
+    return msc_scsi_exec(slot_id, lun, cdb_p, 10, buf_phys, bytes, 1, 1);
 }
 
 # Issue SCSI WRITE(10) from buf_phys to (lba, count). Returns 1 / 0.
@@ -1311,7 +1397,7 @@ fn msc_write_lba(slot_id, lun, lba, count, buf_phys) {
     var cdb_buf[2];
     var cdb_p = &cdb_buf;
     msc_build_rw10_cdb(cdb_p, 0x2A, lba, count);
-    return msc_bbb_exec(slot_id, lun, cdb_p, 10, buf_phys, bytes, 0);
+    return msc_scsi_exec(slot_id, lun, cdb_p, 10, buf_phys, bytes, 0, 1);
 }
 
 
