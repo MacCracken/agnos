@@ -836,24 +836,31 @@ fn nvme_write_sectors(lba, count, buf) {
     return 1;
 }
 
-# Boot-time R/W validation — three round-trips against namespace 1:
-#   1. LBA 0 read (Phase 3 carry-forward): prints first 8 bytes of
-#      whatever the backing file holds.
-#   2. LBA 5 write-then-read: 8-byte pattern "CYRIUS!!" (bytes 67 89
-#      82 73 85 83 33 33). Demonstrates the write path landed and
-#      the data is durable across a separate read.
-#   3. LBA 20-27 multi-LBA write-then-read: 4 KB ramp pattern
-#      (byte[i] = i & 0xFF), 8 LBAs at 512 B/LBA = one page. Exercises
-#      the PRP1-only multi-LBA path with nlb_zb = 7.
+# Boot-time R/W validation. Two halves:
+#   - **Unconditional**: LBA 0 read (Phase 3 carry-forward). Prints
+#     first 8 bytes of whatever the namespace holds. Safe on any disk
+#     including real iron's partitioned NVMe SSD — pure read, no LBA
+#     side effect.
+#   - **`#ifdef KTEST`**: LBA 5 single-LBA write-then-read + LBA 20-27
+#     multi-LBA write-then-read. **DESTRUCTIVE** — overwrites those
+#     LBAs with test patterns. Iron archaemenid's NVMe SSD has GPT
+#     metadata in LBAs 1-33 (LBA 1 = primary GPT header, LBAs 2-33 =
+#     partition entries); writing test patterns there would corrupt
+#     the partition table. KTEST-gated so the default iron build is
+#     read-only against the disk; QEMU validation builds with
+#     `KTEST=1` and keeps the write-receipt path live (target there
+#     is a fresh `nvme0.img` where the LBAs hold zeros to start, no
+#     destruction). Same gate idiom as the boot-time self-tests in
+#     `kernel/core/main.cyr` (1.31.0 cycle-open pattern).
 #
-# PRP2 and PRP-list paths are coded but not boot-demo'd — first
-# real exercise lands in Phase 5 when block_dev callers request
-# larger transfers. Removed in Phase 5 once block_dev dispatch wraps
-# the R/W path and these become dead demonstration code.
+# PRP2 and PRP-list paths are coded but not boot-demo'd. Removed in
+# a later cycle once block_dev dispatch wraps the R/W path and these
+# become dead demonstration code; for now they're the only direct
+# Phase 4 receipt.
 fn nvme_rw_demo() {
     if (nvme_io_ready == 0) { return 0; }
 
-    # --- 1. LBA 0 read (Phase 3 demo carried forward) ---
+    # --- 1. LBA 0 read (Phase 3 demo carried forward — IRON-SAFE) ---
     if (nvme_read_lba(0, nvme_read_scratch) == 0) { return 0; }
     kprint("nvme: ns1 LBA0 first 8 bytes:", 29);
     for (var i = 0; i < 8; i = i + 1) {
@@ -864,7 +871,8 @@ fn nvme_rw_demo() {
     # CMOS kcp = 0x45 (first NVMe read completed — Phase 3 carry-forward)
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x45; 0xE6; 0x71; }
 
-    # --- 2. LBA 5 write-then-read round-trip ---
+    #ifdef KTEST
+    # --- 2. LBA 5 write-then-read round-trip (DESTRUCTIVE, gated) ---
     nvme_zero_page(nvme_read_scratch);
     # Pattern "CYRIUS!!" = bytes 67, 89, 82, 73, 85, 83, 33, 33.
     store8(nvme_read_scratch + 0, 67);
@@ -896,7 +904,7 @@ fn nvme_rw_demo() {
         kprintln("nvme: LBA5 single-LBA write-then-read FAIL", 42);
     }
 
-    # --- 3. LBA 20-27 multi-LBA (8 LBAs = 4 KB, PRP1-only) ---
+    # --- 3. LBA 20-27 multi-LBA (DESTRUCTIVE, gated) ---
     # Fill the 4 KB scratch with a ramp: byte[i] = i & 0xFF.
     for (var j = 0; j < 4096; j = j + 1) {
         store8(nvme_read_scratch + j, j & 0xFF);
@@ -918,6 +926,7 @@ fn nvme_rw_demo() {
     if (multi_ok == 0) {
         kprintln("nvme: LBA20-27 multi-LBA(8) round-trip FAIL", 43);
     }
+    #endif
 
     return 1;
 }
