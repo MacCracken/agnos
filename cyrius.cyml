@@ -11,6 +11,7 @@ cyrius = "6.0.1"
 entry = "kernel/agnos.cyr"
 output = "build/agnos"
 
+#
 # AGNOS is a freestanding kernel binary. It vendors a syscall-free kernel
 # stdlib in kernel/klib/ (kstring, kfmt, ktagged) and links nothing from
 # the host Cyrius stdlib. No external Cyrius deps — `cyrius deps` is a
