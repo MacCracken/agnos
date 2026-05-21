@@ -1,6 +1,6 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.31.1 — x86_64 + aarch64, 26 syscalls, 35 subsystems, kernel stdlib + ACPI + IOMMU, **sovereign-struct entry (RDI = &boot_info)** via gnoboot v0.2.0, native xHCI + USB-HID-boot keyboard driver (Phase 1-5 code-complete), iron-validated NUC AMD Zen 2026-05-15. Built with cyrius 5.11.64. Live binary sizes per arch + per-cut size trajectory: [`state.md`](state.md).
+> **Current**: v1.31.1 — x86_64 + aarch64, 26 syscalls, **40+ subsystems**, kernel stdlib + ACPI + IOMMU, **sovereign-struct entry (RDI = &boot_info)** via gnoboot v0.4.2, native xHCI + USB-HID-boot keyboard driver, **storage stack** (NVMe Phase 1-5 + AHCI/SATA Phase 1-4 + 3-backend block-layer dispatch + GPT Phase 1-3 with CRC32 + backup-header recovery + type-GUID classifier). **MVP GATE CLEARED ON IRON** — typeable shell on archaemenid at Attempt 68 (1.30.9); NVMe iron debut on Crucial P3 2 TB clean at Attempt 80 (1.31.0). Built with cyrius 5.11.x bedrock pin (toolchain itself is 6.0.1; kernel pin stays at 5.11.64 with back-compat symlinks). Live binary sizes per arch + per-cut size trajectory: [`state.md`](state.md).
 >
 > Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 
@@ -24,11 +24,16 @@ Per-version detail lives in [`CHANGELOG.md`](../../CHANGELOG.md). This is the at
 | **v1.30.1–.4** | **xHCI Linux-diff hardening closeout**: XHCI BAR UC remap (Repair X), PORTSC strict-RW1S model, USB-HID Phase 1-3 (PCIe discovery → controller init → port enumeration), four spec gaps closed (H1: PAGESIZE validation; H2: IMAN.IP RW1C clear; H3: IMOD = 0x3E8; H4: USBCMD.HSEE). |
 | **v1.30.5** | **Phase 4/5 USB-HID boot keyboard driver landed + Phase 3 silent-absorb arc closed.** `hid_kbd_configure` + `hid_poll` + HID→PS/2 mapping + `kb_buf` writer. Repair (EE) one-line fix to `xhci_portsc_write`'s inner re-mask closed the 13-hypothesis Phase 3 silent-absorb arc (Attempts 32-54 chased the wrong cause). |
 | **v1.30.6** | **xHCI cmd-path arc — Repairs FF → QQ bundled (single CHANGELOG entry).** FF (IMAN.IE=1), GG (AMD-Vi disable), HH (doorbell readback), JJ (universal readback), KK (CNR poll), LL (Link TRB cycle), MM (MSI-X FuncMask), NN (ERDP/ERSTBA + CRCR/IMOD reorder per 4-source prior-art convergence), OO (Tier 2 bundle: USBSTS-clear + IMAN.IE-post-R/S + mfence + TRB-readback), QQ (MSI-X Table vector-0 programming — first arc repair tied to a named Linux-implicit divergence). 9-letter ladder closed at OO; QQ staged-not-yet-burned. |
-| **v1.30.7** | Version bump for next-cycle work (no kernel source delta beyond the bump). |
+| **v1.30.7** | Pre-MVP-gate version bump (no kernel source delta). |
+| **v1.30.8** | iron Attempts 65/66/67: RR falsified, EP0 MPS reconciliation clears HID enumeration. |
+| **v1.30.9** | **MVP GATE HIT** — iron Attempt 68: SET_CONFIGURATION + canonical FS interval + ISP → typeable shell on archaemenid. xHCI cmd-path arc closes via cyrius v5.11.64's gvar-init-order fix (not a kernel-side bug). |
+| **v1.30.10 → .12** | FB hardening sweep — pitch-aware refresh + WC + PixelFormat guard + true-font swap (VGA 8x16 BIOS ROM replaces hand-drawn CGA 8x8). iron Attempts 69-77; VGA-path legible at 1080p + 1440p. Quiet-Boot legibility residue parked as next-cycle pin. |
+| **v1.31.0** | **Storage cycle open + NVMe arc + iron debut.** Production-lean compile gates (`KTEST` / `XHCI_VERBOSE` default off + FB-absent guard + `docs/development/build.md`); NVMe Phase 1-5 (probe + admin queue + I/O queue + R/W + PRP1/2/list dispatch + `block.cyr` 3-backend wrapper); iron debut on Crucial P3 2 TB clean at Attempt 80 (first-try). |
+| **v1.31.1** [Unreleased] | **GPT layer + AHCI/SATA driver.** GPT Phase 1-3 (header + full 16 KB array walk + UTF-16LE names + `parts` shell command + `gpt_partition_info(idx)` helper + table-less CRC32 + backup-header recovery + 7-GUID type classifier); AHCI/SATA Phase 1-4 (HBA probe + per-port CL+FIS bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT + block-layer registration with NVMe-primary policy). Iron-burn audit drafted at [agnosticos `ahci-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ahci-iron-burn-audit.md). |
 
 ## 1.30.x Arc Recap
 
-The 1.30.x arc is the **kernel-ABI break + hardware-bring-up arc**. It opened with the sovereign-struct entry (v1.30.0, Path-C UEFI handoff via gnoboot), closed Phase 3 USB silent-absorb (v1.30.5, Repair EE), bundled the xHCI cmd-path repairs FF→QQ (v1.30.6), and is iron-validated on NUC AMD Zen 2026-05-15 for boot-to-shell MVP except the xHCI Enable Slot CCE gate. Per-attempt detail in [agnosticos iron-nuc-zen-log](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
+The 1.30.x arc is the **kernel-ABI break + hardware-bring-up arc**. It opened with the sovereign-struct entry (v1.30.0, Path-C UEFI handoff via gnoboot), closed Phase 3 USB silent-absorb (v1.30.5, Repair EE), bundled the xHCI cmd-path repairs FF→QQ (v1.30.6), **hit the MVP gate at iron Attempt 68 (v1.30.9)** with the cyrius v5.11.64 gvar-init-order fix that root-caused the silent-absorb across the 9-letter repair ladder, and closed the FB-hardening sweep at v1.30.12 (true-font swap + VGA path legible at 1080p + 1440p; Quiet-Boot residue parked next-cycle). Per-attempt detail in [agnosticos iron-nuc-zen-log](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
 
 | Item | Status | Notes |
 |------|--------|-------|
@@ -37,33 +42,41 @@ The 1.30.x arc is the **kernel-ABI break + hardware-bring-up arc**. It opened wi
 | **xHCI Linux-diff hardening (H1-H4, v1.30.4)** | ✅ shipped | PAGESIZE validation (xHCI 1.2 §5.4.3), IMAN.IP RW1C clear (§5.5.2.1), IMOD = 0x3E8 (§5.5.2.2), USBCMD.HSEE = 1 (§5.4.1.4). Closes public-beta xHCI spec-compliance debt. |
 | **Phase 4/5 USB-HID kbd driver (v1.30.5)** | ✅ shipped | `hid_kbd_configure` + `hid_poll` + HID→PS/2 + `kb_buf` writer. Iron-side: code-complete, dormant on archaemenid until Enable Slot CCE gate clears. QEMU `xhci-pci` is the active validation surface. |
 | **Phase 3 silent-absorb (Repair EE, v1.30.5)** | ✅ closed | 13 falsified hypotheses across Attempts 32-54 chasing "controller absorbs PORTSC.PR writes"; root cause was `xhci_portsc_write` inner re-mask `& XHCI_PORTSC_NEUTRAL` stripping the RW1S PR bit. One-line fix in `agnos@41ee6dc`. |
-| **xHCI cmd-path arc FF→QQ (v1.30.6)** | 🔄 in-flight | Nine spec-path repairs (FF-OO) burned and falsified across Attempts 57-62 on archaemenid (`events_seen=0` after Enable Slot doorbell on AMD FCH 1022:1639). Repair (QQ + QQ'') MSI-X Table vector-0 programming staged at v1.30.7 cut, not yet burned. Bottoming-out: Repair (PP) UC-remap DMA regions OR decouple Phase 4/5 to QEMU code-completion. Per-attempt + 4-source convergent-prior-art audit in [agnosticos iron-nuc-zen-log](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) + [`xhci-prior-art-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/xhci-prior-art-audit.md). |
-| **MSI-X audit + BAR memtype audit (2026-05-18)** | ✅ closed | 0 iron burns. MSI-X table programming divergence FOUND (AGNOS never wrote table → Repair QQ candidate). BAR memtype CLEAN (PWT=1+PCD=1+PAT=0 = strict UC, matches `ioremap_uc()`). Vendor-cap audit dry well: no Linux `1022:1639`-gated quirk affects Enable Slot CCE. |
+| **xHCI cmd-path arc FF→QQ (v1.30.6)** | ✅ closed | Nine spec-path repairs (FF-OO) falsified Attempts 57-62 on archaemenid. Root cause was traced to a **cyrius-side** kmode gvar-init-order bug (fixed in cyrius v5.11.64) — module-top `var X = INT_LITERAL` read as 0 before init block ran. Iron-validated at Attempt 68 (v1.30.9) — typeable shell. See cyrius issue `2026-05-18-gvar-init-order-zero-reads.md`. |
+| **MSI-X audit + BAR memtype audit (2026-05-18)** | ✅ closed | 0 iron burns. MSI-X table programming divergence FOUND (AGNOS never wrote table → Repair QQ candidate). BAR memtype CLEAN. Audit landed before the cyrius root-cause surfaced; superseded as MVP-blocker by Attempt 68. |
+| **MVP boot-to-shell gate (v1.30.9, Attempt 68)** | ✅ achieved | Typeable shell on archaemenid Beelink SER AMD Renoir. Closes the closed-beta MVP gate. |
+| **FB-hardening sweep + true-font swap (v1.30.10 → .12)** | ✅ closed | VGA-path legible at 1080p + 1440p on iron. Quiet-Boot legibility residue parked as next-cycle pin (`project_amd_zen_scanout_residue`). |
 | **`scripts/build.sh` cosmetic cleanup** | 🟠 trivial follow-up | Still prints `multiboot2 (ELF64): OK` + `Boot: pending shim rewrite — see ... path-a-elf64-multiboot2.md`. Both labels are out of date post-1.30.0; should reference Path C. |
 
 ## Next cycle — open items not bound to a minor
 
 | # | Item | Status | Notes |
 |---|------|--------|-------|
-| 1 | **xHCI Enable Slot CCE silent-absorb resolution** | open | Iron-side, archaemenid. QQ staged; PP and decouple-to-QEMU are bottoming-out paths. Resolution gates boot-to-shell-on-iron MVP. |
-| 2 | **Bench-history snapshot in repo** | open | Decide: check in last-released `BENCHMARKS.md` + `bench-history.csv` as a tagged-state reference, or leave CI-only. Original v1.27.1 carry-forward, still pending. |
-| 3 | **`mmap` (anonymous-only)** | open | Planned #6 split — anonymous mmap is independent of ext2. Adds VMM surface but no fs work. |
-| 4 | **Hardware-validation infra** | open | RPi4 / NUC harness on self-hosted runner. Unblocks SMP-AP-wakeup-on-real-hardware (Active #1). |
-| 5 | **SMP AP wakeup on real hardware** | open | QEMU-validated only. Gated on #4. |
-| 6 | **`scripts/build.sh` cosmetic banner cleanup** | open | Trivial label refresh for Path-C era. |
+| 1 | **AHCI iron debut on archaemenid `sda`** | open | Code-complete (v1.31.1 Phase 1-4), QEMU-validated. Awaits §4 `AHCI_RW_DEMO` compile-gate decision per [agnosticos `ahci-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ahci-iron-burn-audit.md). |
+| 2 | **AMD Zen Quiet-Boot scanout residue** | parked | Next-cycle pin. Resumption options: HUBP `clear_tiling` port OR shadow-buffer FB-console architectural eval. Doesn't block MVP (VGA-path legible). |
+| 3 | **USB Mass Storage (BBB + SCSI)** | planned 1.31.2 | Third iron-validatable block backend; extends xHCI investment. Linux `drivers/usb/storage/usb.c` reference. |
+| 4 | **ext2 read-only** | planned 1.31.3 | Filesystem class, not device class. FAT16 → ext2 unlocks real Linux disks; consumes GPT + block layer. |
+| 5 | **Bench-history snapshot in repo** | open | Decide: check in last-released `BENCHMARKS.md` + `bench-history.csv` as a tagged-state reference, or leave CI-only. Original v1.27.1 carry-forward. |
+| 6 | **`mmap` (anonymous-only)** | open | Planned #6 split — anonymous mmap is independent of ext2. Adds VMM surface but no fs work. |
+| 7 | **Hardware-validation infra** | open | RPi4 / NUC harness on self-hosted runner. Unblocks SMP-AP-wakeup-on-real-hardware. |
+| 8 | **SMP AP wakeup on real hardware** | open | QEMU-validated only. Gated on #7. |
+| 9 | **`scripts/build.sh` cosmetic banner cleanup** | open | Trivial label refresh for Path-C era. |
 
 Explicitly **NOT** in the near-term queue:
-- **Full-binary KASLR (Option A)** — slotted for v1.31.0; gated on cyrius v6.1.x PIE support (see below).
-- **ext2 (Planned #5)** — own-arc territory; v1.32.x candidate.
+- **Full-binary KASLR (Option A)** — slot pushed beyond 1.31.x; gated on cyrius v6.1.x PIE support (see below). The 1.31.0 slot originally reserved for this was repurposed for the storage arc (NVMe Phase 1-5 + iron debut).
 - **Preemptive scheduling (Planned #8)** — deep rewrite of scheduler + IRQ handlers; own-arc.
 
-## 1.31.0 — Full-Binary KASLR (Option A)
+## Full-Binary KASLR (Option A) — slot TBD on the cyrius v6.1.x PIE track
 
-Reserved slot for the major-minor headline (pushed back from 1.30.0 — that slot got repurposed for the sovereign-struct kernel ABI break, which is more architecturally important and time-pressured by the iron-boot MVP). Closes the deferred Option A from `proposals/2026-05-11-kaslr-scope.md` — the data-KASLR shipped at 1.28.0 covers ~80% of the security value; Option A closes the last ~20% (gadgets pre-computed against the kernel binary itself, which currently sits at fixed `0x100000`).
+Reserved for whichever minor lands once cyrius PIE codegen ships. **Originally slotted at 1.31.0**, then pushed back through three slot moves:
+1. **1.30.0 → 1.31.0**: 1.30.0 got repurposed for the Path-C sovereign-struct kernel ABI break (architecturally more important + time-pressured by iron-boot MVP).
+2. **1.31.0 → 1.32.x+**: 1.31.0 got repurposed for the storage arc (NVMe Phase 1-5 + iron debut + cycle-open production-lean); 1.31.1 carries GPT + AHCI/SATA. The compounded storage-arc velocity made deferring KASLR-Option-A the right call.
+
+Closes the deferred Option A from `proposals/2026-05-11-kaslr-scope.md` — the data-KASLR shipped at 1.28.0 covers ~80% of the security value; Option A closes the last ~20% (gadgets pre-computed against the kernel binary itself, which currently sits at fixed `0x100000`).
 
 **Hard prerequisite**: cyrius v6.1.x PIE codegen support. Filed at [cyrius/proposals/2026-05-11-pie-support.md](https://github.com/MacCracken/cyrius/blob/main/docs/development/proposals/2026-05-11-pie-support.md); slotted on the cyrius v6.x track after v6.0.0 (rename + cleanup arc).
 
-If cyrius PIE arrives during 1.30.x, 1.31.0 work can begin in parallel with late 1.30.x slots. If cyrius PIE doesn't arrive in time, 1.31.0 holds — agnos doesn't kludge a hand-rolled relocation table (rejected in both proposals for the same reasons). 1.31.0's exact slot depends on cyrius's actual ship cadence, not agnos's.
+When cyrius PIE lands, KASLR-Option-A work can begin in parallel with whatever 1.3x.y cycle is active. agnos doesn't kludge a hand-rolled relocation table (rejected in both proposals for the same reasons). Actual slot depends on cyrius ship cadence, not agnos's.
 
 **Work surface (when cyrius PIE is available):** roughly per the original kaslr-scope proposal § "Option A" — boot shim grows ~2× (relocation walk + slid entry), kernel binary rebuilt with `--pie`, slide-aware crash-dump symbolizer, CI assertion rewrite (current `KASLR: pmm_next_free=N` probe stays; new `KASLR: kernel_slide=0x<hex>` probe lands alongside). Two-boot-diff assertion extended to cover the binary base.
 
@@ -95,7 +108,7 @@ Arch interface — each arch provides:
 
 ## Security Hardening (from 2026-04-13 audit)
 
-All 13 items shipped through v1.28.0 (S7 KASLR data-only landed). Track complete. Full audit at [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md); per-item implementation history at [`security-hardening.md`](security-hardening.md). Full-binary KASLR (Option A) is **slotted for v1.31.0** (pushed from v1.30.0, which got repurposed for the Path C sovereign-struct ABI break) pending cyrius v6.1.x PIE support; see [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md).
+All 13 items shipped through v1.28.0 (S7 KASLR data-only landed). Track complete. Full audit at [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md); per-item implementation history at [`security-hardening.md`](security-hardening.md). Full-binary KASLR (Option A) was originally slotted for v1.31.0 but the slot got repurposed for the storage arc; KASLR-Option-A now sits on the **cyrius v6.1.x PIE track** with slot TBD on agnos's side. See § *Full-Binary KASLR (Option A)* above and [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md).
 
 | # | Item | Status | Severity |
 |---|------|--------|----------|

@@ -254,7 +254,7 @@ Both CRCs validate (`hdr-CRC-OK arr-CRC-OK`) — primary header path, no backup 
 
 **Build:** 470,664 B (AHCI Phase 4) → **475,096 B** (+4,432 B for gpt.cyr CRC + classifier + Phase 3 wiring in `gpt_init`).
 
-**1.31.1 cycle status:** all planned phases landed under `[Unreleased]`. Closing handoff items: an iron burn audit (per `feedback_iron_burns_block_other_work`) covering AHCI Phase 4's LBA-5 sentinel write surface, and the final `[Unreleased]` → `[1.31.1] — 2026-05-20` rename + tag at the user's discretion. Then **1.31.2** opens with USB Mass Storage; **1.31.3** with ext2.
+**1.31.1 cycle status:** all planned phases landed under `[Unreleased]`. Iron-burn audit drafted at [agnosticos `docs/development/ahci-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ahci-iron-burn-audit.md) — identifies the LBA-5 sentinel write in `ahci_rw_demo` as the only iron-write hazard, proposes an `AHCI_RW_DEMO` compile-gate mitigation matching the existing `KTEST` / `XHCI_VERBOSE` pattern (default off; QEMU smoke retained via `AHCI_RW_DEMO=1 sh scripts/build.sh`). Closing handoff: §4-patch decision + `[Unreleased]` → `[1.31.1] — 2026-05-20` rename + tag at the user's discretion. Then **1.31.2** opens with USB Mass Storage; **1.31.3** with ext2.
 
 ## [1.31.0] — 2026-05-20 (NVMe arc — Phase 1-5 driver + block-layer dispatch + iron debut on Crucial P3 2TB; cycle-open production-lean — KTEST + XHCI_VERBOSE compile gates + FB-absent guard + `docs/development/build.md`)
 
