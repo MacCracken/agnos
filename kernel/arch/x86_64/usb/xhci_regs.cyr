@@ -140,6 +140,9 @@ enum XhciTrbType {
     XHCI_TRB_ADDRESS_DEVICE  = 11;  # Address Device command
     XHCI_TRB_CONFIGURE_EP    = 12;  # Configure Endpoint command (Phase 4)
     XHCI_TRB_EVAL_CONTEXT    = 13;  # Evaluate Context command
+    XHCI_TRB_RESET_ENDPOINT  = 14;  # Reset Endpoint command (clears Halted → Stopped)
+    XHCI_TRB_STOP_ENDPOINT   = 15;  # Stop Endpoint command (Running → Stopped)
+    XHCI_TRB_SET_TR_DEQUEUE  = 16;  # Set TR Dequeue Pointer command (post-recovery resync)
     # Event ring TRBs (HW-produced)
     XHCI_TRB_TRANSFER_EVENT  = 32;  # Transfer Event
     XHCI_TRB_CMD_COMPLETION  = 33;  # Command Completion Event

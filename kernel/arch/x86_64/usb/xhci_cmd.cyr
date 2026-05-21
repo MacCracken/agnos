@@ -271,3 +271,74 @@ fn xhci_cmd_issue(p_lo, p_hi, status, ctrl_partial) {
     if (trb_phys == 0) { return 0; }
     return xhci_cmd_wait(trb_phys);
 }
+
+# === Phase 2.6 — EP recovery commands (xHCI 1.2 §4.6.8 / §4.6.9 / §4.6.10) =
+#
+# These three commands form the controller-side half of USB MSC BBB Reset
+# Recovery. The device-side half (Bulk-Only Mass Storage Reset class request
+# + CLEAR_FEATURE(HALT) × 2) lives in msc_reset_recovery. After a bulk
+# endpoint transitions to Halted (typical on a STALL from the device side
+# during a wedged transfer), the xHC's EP state machine pins the TR
+# Dequeue Pointer at the halted TRB and will not advance. Software must:
+#
+#   1. Stop Endpoint  (TRB 15) — if EP is Running but a transfer is stuck;
+#                                 idempotent on already-Stopped/Halted EPs
+#                                 (returns Context State Error which we
+#                                 tolerate).
+#   2. Reset Endpoint (TRB 14) — Halted → Stopped, clears stuck TRDP state.
+#   3. (device-side recovery runs here)
+#   4. (host-side ring rewind runs here)
+#   5. Set TR Dequeue Pointer (TRB 16) — tells xHC where the new ring base
+#                                         is + the Dequeue Cycle State to
+#                                         expect on the first new TRB.
+#
+# Linux reference: drivers/usb/host/xhci-ring.c —
+#   xhci_queue_reset_ep, xhci_queue_stop_endpoint, xhci_queue_new_dequeue_state.
+# Spec reference: xHCI 1.2 §4.10.2.1 (Halted Endpoint Recovery).
+
+# Reset Endpoint — TRB type 14. Transitions an EP from Halted to Stopped,
+# clearing any stuck TR Dequeue Pointer state in the EP context. TSP bit
+# (bit 9) left 0 = full state clear (Linux default for non-stream EPs).
+#
+# Returns 1 on Success, 0 on any other completion code.
+fn xhci_cmd_reset_endpoint(slot_id, dci) {
+    var ctrl = (XHCI_TRB_RESET_ENDPOINT << 10)
+    | ((dci     & 0x1F) << 16)
+    | ((slot_id & 0xFF) << 24);
+    return xhci_cmd_issue(0, 0, 0, ctrl);
+}
+
+# Stop Endpoint — TRB type 15. Forces a Running EP into Stopped state so
+# the recovery sequence can proceed. Tolerates Context State Error (= 19)
+# completion which means the EP was already Stopped/Halted/Disabled — that
+# is also a valid pre-condition for the subsequent Reset Endpoint command.
+#
+# Returns 1 on Success OR Context State Error; 0 on any other failure.
+fn xhci_cmd_stop_endpoint(slot_id, dci) {
+    var ctrl = (XHCI_TRB_STOP_ENDPOINT << 10)
+    | ((dci     & 0x1F) << 16)
+    | ((slot_id & 0xFF) << 24);
+    if (xhci_cmd_issue(0, 0, 0, ctrl) != 0) { return 1; }
+    if (xhci_last_cmd_ccode == XHCI_CC_CONTEXT_STATE_ERROR) { return 1; }
+    return 0;
+}
+
+# Set TR Dequeue Pointer — TRB type 16. Tells the xHC to resume fetching
+# TRBs from `deq_ptr_phys` with Dequeue Cycle State `dcs` (bit 0 of the
+# parameter dword). Must be issued after Reset Endpoint and after the
+# host-side ring rewind so producer + consumer cycle bits agree.
+#
+# `deq_ptr_phys` is the address of the next TRB the xHC should fetch
+# (16-byte aligned; low 4 bits zeroed before OR-ing with DCS).
+# `dcs` is 1 if the next TRB will have its Cycle bit set, 0 otherwise.
+# Stream ID is 0 (non-stream EPs).
+#
+# Returns 1 on Success, 0 on any failure.
+fn xhci_cmd_set_tr_dequeue(slot_id, dci, deq_ptr_phys, dcs) {
+    var param_lo = (deq_ptr_phys & 0xFFFFFFF0) | (dcs & 0x1);
+    var param_hi = 0;
+    var ctrl = (XHCI_TRB_SET_TR_DEQUEUE << 10)
+    | ((dci     & 0x1F) << 16)
+    | ((slot_id & 0xFF) << 24);
+    return xhci_cmd_issue(param_lo, param_hi, 0, ctrl);
+}

@@ -811,6 +811,56 @@ fn xhci_wait_transfer_event(slot_id) {
     return 0;
 }
 
+# Drain every pending Transfer Event from the event ring matching the given
+# slot ID. Called by msc_reset_recovery (Phase 2.6) before re-arming a
+# wedged endpoint — a TRB that timed out from the producer's perspective
+# may still have a completion event posted by HW after the spin-loop exit
+# (e.g. device responded 100 ms late). If we don't drain, the next
+# xhci_wait_transfer_event call returns immediately on the stale event,
+# making the subsequent transfer appear "complete" before the new TRB has
+# even been processed — this is the root cause of the CSW tag mismatch
+# observed on Attempt 84.
+#
+# Iterates the event ring until the slot under xhci_evt_ring_idx has a
+# stale cycle bit (= ring empty from HW's perspective). Consumes every
+# Transfer Event regardless of completion code; passes through other event
+# types (Command Completion, Port Status Change) untouched by re-entering
+# the wait path semantics — actually, since this is drain-only and we know
+# Phase 2.6 is in a quiescent moment (no commands in flight, just stuck
+# transfers), we drop them too. ERDP is advanced once at the end.
+fn xhci_drain_transfer_events(slot_id) {
+    var drained = 0;
+    var safety  = 0;
+    while (safety < XHCI_EVT_RING_SEGMENT_SIZE) {
+        var evt_off = xhci_evt_ring_idx * 16;
+        var evt     = xhci_evt_ring_phys + evt_off;
+        var evt_dw3 = load32(evt + 12);
+        var evt_cycle = evt_dw3 & 0x1;
+        if (evt_cycle != xhci_evt_ring_cycle) { break; }   # ring empty
+        var evt_type = (evt_dw3 >> 10) & 0x3F;
+        if (evt_type == XHCI_TRB_TRANSFER_EVENT) {
+            var evt_slot = (evt_dw3 >> 24) & 0xFF;
+            if (evt_slot == slot_id) { drained = drained + 1; }
+        }
+        xhci_evt_ring_idx = xhci_evt_ring_idx + 1;
+        if (xhci_evt_ring_idx == XHCI_EVT_RING_SEGMENT_SIZE) {
+            xhci_evt_ring_idx = 0;
+            if (xhci_evt_ring_cycle == 1) {
+                xhci_evt_ring_cycle = 0;
+            } else {
+                xhci_evt_ring_cycle = 1;
+            }
+        }
+        safety = safety + 1;
+    }
+    if (drained > 0) {
+        var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
+        var new_erdp = xhci_evt_ring_phys + xhci_evt_ring_idx * 16;
+        xhci_rt_write64(ir0 + XHCI_IR_ERDP, new_erdp | 0x8);
+    }
+    return drained;
+}
+
 # Write one TRB at the given slot's EP0 transfer ring enqueue index,
 # advance the index + cycle (no Link TRB on transfer rings — xfer
 # rings are smaller than one page and won't wrap during Phase 3).
