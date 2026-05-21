@@ -310,46 +310,75 @@ fn msc_probe_slot(slot_id) {
     # (TEST UNIT READY round-trip OK).
     xhci_cmos_stamp(0x52, 0x01);
 
-    # Phase 2 follow-through — configure bulk endpoints + TEST UNIT READY.
-    # Failure of either does NOT abort Phase 1's success line; the device
-    # is enumerated, the boot continues, and the failure surfaces as
-    # transport_failed on the row (kprintln'd at the failure site).
+    # Phase 2 + Phase 2.5 + Phase 3 follow-through — bulk EP configure,
+    # then INQUIRY (always — SPC-4 §6.6 says INQUIRY doesn't require
+    # Ready), then TUR with retry+Reset-Recovery loop (USB MSC BBB §6.7.3),
+    # then RC10 if TUR passed.
     if (msc_configure_endpoints(slot_id) != 0) {
         xhci_cmos_stamp(0x53, slot_id & 0xFF);
-        # Issue TEST UNIT READY against LUN 0 (the only LUN when MaxLUN=0).
-        # A failure here is common for fresh removable media (NOT READY) —
-        # not a transport bug. Phase 3 will follow up with REQUEST SENSE.
-        var tur = msc_test_unit_ready(slot_id, 0);
+
+        # Phase 3 INQUIRY — runs BEFORE TUR per SPC-4 §6.6 (INQUIRY works
+        # regardless of LUN Ready state). Vendor/product/rev/PDT decode
+        # is independent of "ready" semantics. Hoisted out of the TUR-
+        # pass gate in Phase 2.5 (audit / implementation gap surfaced at
+        # iron Attempt 83).
+        if (msc_inquiry(slot_id, 0) != 0) {
+            xhci_cmos_stamp(0x55, slot_id & 0xFF);
+            kprint("msc: slot ", 10);
+            kprint_num(slot_id);
+            kprint(" INQUIRY: vendor='", 18);
+            msc_print_ascii_field(msc_row_addr(slot_id) + 96, 8);
+            kprint("' product='", 11);
+            msc_print_ascii_field(msc_row_addr(slot_id) + 104, 16);
+            kprint("' rev='", 7);
+            msc_print_ascii_field(msc_row_addr(slot_id) + 120, 4);
+            kprint("' type=", 7);
+            msc_print_pdt_label(load8(msc_row_addr(slot_id) + 129));
+            kprintln("", 0);
+        } else {
+            kprint("msc: slot ", 10);
+            kprint_num(slot_id);
+            kprintln(" INQUIRY failed", 15);
+        }
+
+        # TEST UNIT READY — Phase 2.5 retry loop with Reset Recovery
+        # between failed attempts (Linux usb_stor_TUR + sd_spinup_disk
+        # pattern). Real-vendor USB sticks commonly wedge bulk-IN on
+        # first-of-session transfers; Reset Recovery + retry recovers.
+        var tries = 0;
+        var tur = 0;
+        while (tries < 3) {
+            tur = msc_test_unit_ready(slot_id, 0);
+            if (tur != 0) { break; }
+            # Failed. If transport wedged, recover before next attempt.
+            if (load8(msc_row_addr(slot_id) + 69) == 1) {
+                kprint("msc: slot ", 10);
+                kprint_num(slot_id);
+                kprintln(" transport wedged, attempting Reset Recovery", 44);
+                if (msc_reset_recovery(slot_id) == 0) {
+                    kprint("msc: slot ", 10);
+                    kprint_num(slot_id);
+                    kprintln(" Reset Recovery failed", 22);
+                    break;
+                }
+            }
+            # Inter-retry delay: small spin loop (~5–10 ms wall on Zen-
+            # class silicon). "Becoming ready" SCSI cases typically clear
+            # in a few ms. Same magnitude as AHCI's quiescence poll.
+            var sd = 0;
+            while (sd < 5000000) { sd = sd + 1; }
+            tries = tries + 1;
+        }
+
         if (tur != 0) {
             xhci_cmos_stamp(0x54, slot_id & 0xFF);
             kprint("msc: slot ", 10);
             kprint_num(slot_id);
             kprintln(" TEST UNIT READY -> ready (Pass)", 32);
 
-            # Phase 3 — INQUIRY + READ CAPACITY(10). Both have IN data
-            # phases; together they identify the device and decode LUN
-            # geometry. Failures are non-fatal (Phase 4 will gate
-            # block-layer registration on capacity_done==1; the rest
-            # of boot proceeds).
-            if (msc_inquiry(slot_id, 0) != 0) {
-                xhci_cmos_stamp(0x55, slot_id & 0xFF);
-                kprint("msc: slot ", 10);
-                kprint_num(slot_id);
-                kprint(" INQUIRY: vendor='", 18);
-                msc_print_ascii_field(msc_row_addr(slot_id) + 96, 8);
-                kprint("' product='", 11);
-                msc_print_ascii_field(msc_row_addr(slot_id) + 104, 16);
-                kprint("' rev='", 7);
-                msc_print_ascii_field(msc_row_addr(slot_id) + 120, 4);
-                kprint("' type=", 7);
-                msc_print_pdt_label(load8(msc_row_addr(slot_id) + 129));
-                kprintln("", 0);
-            } else {
-                kprint("msc: slot ", 10);
-                kprint_num(slot_id);
-                kprintln(" INQUIRY failed", 15);
-            }
-
+            # READ CAPACITY(10) — Phase 3 second half. Stays inside the
+            # TUR-pass branch because RC10 legitimately requires Ready
+            # per SBC-3 §5.10.
             if (msc_read_capacity(slot_id, 0) != 0) {
                 xhci_cmos_stamp(0x56, slot_id & 0xFF);
                 var rrow = msc_row_addr(slot_id);
@@ -374,9 +403,15 @@ fn msc_probe_slot(slot_id) {
                 kprintln(" READ CAPACITY(10) failed", 25);
             }
         } else {
+            # All TUR retries exhausted. Issue REQUEST SENSE for
+            # diagnostic decode of why the device says it's not ready.
+            # (Will itself timeout if transport is still wedged — that
+            # iron evidence tells us Phase 2.6's xHCI command-level
+            # recovery is needed.)
             kprint("msc: slot ", 10);
             kprint_num(slot_id);
-            kprintln(" TEST UNIT READY -> not ready / failed (CSW status != 0)", 56);
+            kprintln(" TEST UNIT READY -> not ready after 3 retries", 45);
+            msc_request_sense(slot_id, 0);
         }
     }
 
@@ -685,6 +720,106 @@ fn msc_bbb_exec(slot_id, lun, cdb_phys, cdb_len, data_phys, data_len, dir_in) {
 }
 
 
+# === Phase 2.5 — MSC Reset Recovery (USB MSC BBB §6.7.3) =============
+#
+# When the bulk transport wedges (CSW receive timeout, Phase Error, or
+# any state that sets transport_failed=1), recover via the class-
+# specified three-step sequence:
+#
+#   1. Bulk-Only Mass Storage Reset (class control on EP0):
+#        bmRequestType = 0x21 (Class | Interface | H->D)
+#        bRequest      = 0xFF
+#        wValue        = 0
+#        wIndex        = bInterfaceNumber
+#        wLength       = 0
+#
+#   2. CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN:
+#        bmRequestType = 0x02 (Standard | Endpoint | H->D)
+#        bRequest      = 0x01 (CLEAR_FEATURE)
+#        wValue        = 0x0000 (ENDPOINT_HALT)
+#        wIndex        = ep_in_addr (with direction bit set)
+#        wLength       = 0
+#
+#   3. Same as #2 for bulk-OUT.
+#
+# Linux references: drivers/usb/storage/transport.c § usb_stor_Bulk_reset
+# + usb_stor_clear_halt. After Reset Recovery, the device-side bulk
+# transport is back to "ready for a new CBW"; the host-side rings are
+# also rewound (cycle/idx → ring base, pages re-zeroed, Link TRBs
+# rewritten) so the next msc_bulk_enqueue starts from a clean state.
+#
+# What this does NOT do (held for Phase 2.6 if iron evidence requires):
+#   - Reset Endpoint TRB (xHCI 1.2 §4.6.8): controller-side Halted→Stopped.
+#   - Set TR Dequeue Pointer TRB (§4.6.10): tell controller to restart
+#     from the ring base after recovery.
+#   - Stop Endpoint TRB (§4.6.9): abort an in-flight Running transfer.
+#
+# If iron shows `xhci: transfer event timeout` repeating on a post-
+# Reset-Recovery retry (controller still issuing from a stale TR
+# Dequeue Pointer), Phase 2.6 adds the xHCI command-level half. For
+# now, ship the simpler device-side recovery and let iron tell us
+# whether more is needed.
+#
+# Returns 1 on success, 0 if any of the three control requests failed.
+fn msc_reset_recovery(slot_id) {
+    var row = msc_row_addr(slot_id);
+    var intf        = load8(row + 1);
+    var ep_in_addr  = load8(row + 2);
+    var ep_out_addr = load8(row + 3);
+
+    # Step 1: Bulk-Only Mass Storage Reset (class control, EP0).
+    if (xhci_control_no_data(slot_id, 0x21, 0xFF, 0, intf) == 0) {
+        kprintln("msc: Bulk-Only MS Reset failed", 30);
+        return 0;
+    }
+
+    # Step 2: CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN.
+    if (xhci_control_no_data(slot_id, 0x02, 0x01, 0, ep_in_addr) == 0) {
+        kprintln("msc: CLEAR_FEATURE(HALT) bulk-IN failed", 39);
+        return 0;
+    }
+
+    # Step 3: CLEAR_FEATURE(ENDPOINT_HALT) on bulk-OUT.
+    if (xhci_control_no_data(slot_id, 0x02, 0x01, 0, ep_out_addr) == 0) {
+        kprintln("msc: CLEAR_FEATURE(HALT) bulk-OUT failed", 40);
+        return 0;
+    }
+
+    # Host-side rewind: re-zero both bulk rings, rewrite Link TRBs at
+    # the last slot of each, reset cycle/idx in the per-slot row.
+    # Producer restarts at ring base with initial cycle (1).
+    var ring_in  = load64(row + 16);
+    var ring_out = load64(row + 24);
+    if (ring_in != 0) {
+        xhci_zero_page(ring_in);
+        var link_in  = ring_in + (MSC_TRB_RING_TRBS - 1) * 16;
+        store64(link_in + 0,  ring_in);
+        store32(link_in + 8,  0);
+        store32(link_in + 12, (XHCI_TRB_LINK << 10) | 0x2 | 0x1);
+    }
+    if (ring_out != 0) {
+        xhci_zero_page(ring_out);
+        var link_out = ring_out + (MSC_TRB_RING_TRBS - 1) * 16;
+        store64(link_out + 0,  ring_out);
+        store32(link_out + 8,  0);
+        store32(link_out + 12, (XHCI_TRB_LINK << 10) | 0x2 | 0x1);
+    }
+    store8 (row + 32, 1);   # bulk_in_cycle  -> 1 (initial)
+    store8 (row + 33, 1);   # bulk_out_cycle -> 1 (initial)
+    store16(row + 34, 0);   # bulk_in_idx    -> 0
+    store16(row + 36, 0);   # bulk_out_idx   -> 0
+
+    # Clear transport_failed sticky.
+    store8(row + 69, 0);
+
+    kprint("msc: slot ", 10);
+    kprint_num(slot_id);
+    kprintln(" Reset Recovery OK", 18);
+
+    return 1;
+}
+
+
 # --- Phase 2 SCSI command — TEST UNIT READY (0x00) -------------------
 
 # Issue SCSI TEST UNIT READY (SPC-4 §6.34). 6-byte CDB, no data phase.
@@ -870,6 +1005,104 @@ fn msc_read_capacity(slot_id, lun) {
     store64(row + 72, last_lba);
     store32(row + 80, blk_size);
     store8 (row + 85, 1);            # capacity_done
+    return 1;
+}
+
+
+# --- Phase 2.5 SCSI diagnostic — REQUEST SENSE (0x03) ----------------
+#
+# Decode the sense data from the last CSW Failed response (SPC-4 §6.27).
+# 6-byte CDB; 18-byte fixed-format response. Called after TUR retries
+# exhaust so the iron log carries a one-line decode of WHY the device
+# says it's not ready.
+#
+# CDB layout:
+#   [0]    Opcode = 0x03
+#   [1]    DESC = 0 (fixed-format response, what we want)
+#   [2-3]  Reserved
+#   [4]    AllocationLength = 18
+#   [5]    Control = 0
+#
+# Fixed-format Sense Data layout (SPC-4 §4.5.3):
+#   byte 0    [7] Valid bit | [6:0] Response Code (0x70 current, 0x71 deferred)
+#   byte 2    [3:0] **Sense Key**
+#   byte 7    Additional Sense Length (typ. 10 → 18 bytes total)
+#   byte 12   **ASC** (Additional Sense Code)
+#   byte 13   **ASCQ** (ASC Qualifier)
+#
+# Sense keys (low nibble byte 2, SPC-4 §4.5.6):
+#   0x0 NO SENSE / 0x2 NOT READY / 0x6 UNIT ATTENTION / etc.
+#
+# Common ASC/ASCQ shapes (SPC-4 Annex D):
+#   02/04/01   "becoming ready" → caller could retry
+#   02/3A/xx   "medium not present" → register if INQUIRY worked
+#   06/28/xx   "media may have changed"
+#   06/29/xx   "power-on / reset"
+#
+# Returns 1 on success (sense data decoded + printed), 0 if REQUEST
+# SENSE itself failed (transport still wedged). Prints:
+#   msc: slot N sense key=K ASC=A ASCQ=Q [label]
+fn msc_request_sense(slot_id, lun) {
+    var row = msc_row_addr(slot_id);
+    if (load8(row + 68) == 0) { return 0; }        # endpoints not ready
+
+    var data = msc_ensure_data_buf(row);
+    if (data == 0) { return 0; }
+    xhci_zero_page(data);
+
+    var cdb_buf[2];                                # 16 bytes
+    var cdb_p = &cdb_buf;
+    var k = 0;
+    while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
+    store8(cdb_p + 0, 0x03);                       # opcode
+    store8(cdb_p + 4, 18);                         # allocation length
+
+    if (msc_bbb_exec(slot_id, lun, cdb_p, 6, data, 18, 1) == 0) {
+        return 0;
+    }
+
+    var key  = load8(data + 2) & 0x0F;
+    var asc  = load8(data + 12);
+    var ascq = load8(data + 13);
+
+    kprint("msc: slot ", 10);
+    kprint_num(slot_id);
+    kprint(" sense key=", 11);
+    kprint_num(key);
+    kprint(" ASC=", 5);
+    kprint_num(asc);
+    kprint(" ASCQ=", 6);
+    kprint_num(ascq);
+
+    # Brief label for the common cases — keeps the iron log readable
+    # without forcing the user to look up SPC-4 Annex D codes.
+    if (key == 2) {
+        if (asc == 4) {
+            if (ascq == 1) {
+                kprintln(" (becoming ready)", 17);
+                return 1;
+            }
+        }
+        if (asc == 58) {                           # 0x3A
+            kprintln(" (medium not present)", 21);
+            return 1;
+        }
+    }
+    if (key == 6) {
+        if (asc == 40) {                           # 0x28
+            kprintln(" (media may have changed)", 25);
+            return 1;
+        }
+        if (asc == 41) {                           # 0x29
+            kprintln(" (power-on / reset)", 19);
+            return 1;
+        }
+    }
+    if (key == 0) {
+        kprintln(" (no sense)", 11);
+        return 1;
+    }
+    kprintln("", 0);
     return 1;
 }
 

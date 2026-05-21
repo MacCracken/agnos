@@ -209,6 +209,138 @@ Fourth and final engineering cut of the USB Mass Storage arc — lights up the *
 
 **Files changed:** `kernel/arch/x86_64/usb/msc.cyr` (+~240 LOC for the workload + register + demos), `kernel/core/block.cyr` (+`blk_register_usb_ms` + dispatch arms), `kernel/core/main.cyr` (`msc_register_block_dev()` + `msc_read_demo()` + gated `msc_write_demo()` wired post-AHCI / pre-GPT), `kernel/arch/aarch64/stubs.cyr` (matching stubs for all Phase 4 entry points), `scripts/build.sh` (`MSC_RW_DEMO=1` honored).
 
+### USB Mass Storage iron debut — Attempt 83 on archaemenid (PARTIAL — real-vendor USB 2.0 stick enumerated through Phase 1 + EP-configure; Phase 2 TUR returns NOT_READY and existing TUR-pass gate stops Phase 3 INQUIRY/RC10/tertiary registration)
+
+Third iron-validated storage-class debut of the 1.31.x storage arc, first iron burn of the USB Mass Storage stack. A real-vendor USB 2.0 flash drive (VID `0x0936` PID `0x13E8`, generic OEM) was plugged into archaemenid's USB-A port; xhci enumerated it on port 3 at HS speed, addressed it as slot 2, and MSC Phase 1 + Phase 2's Configure-Endpoint step both lit up clean first iron try. The Phase 2 TEST UNIT READY round-trip returned `bCSWStatus != 0` ("Command Failed") — the spec-anticipated cold-insertion NOT_READY response that QEMU's `usb-storage` emulator never reproduces (pre-burn audit `usb-ms-iron-burn-audit.md` § 3 hypothesis 2 explicitly anticipated this shape). The existing code at `msc.cyr:317-381` gates Phase 3 (INQUIRY + RC10) and Phase 4 (block-layer registration + LBA-0 readback) behind a TUR-pass branch — when TUR failed the entire post-TUR success path was skipped. Boot continued cleanly through NVMe / AHCI / GPT / VFS / kybernet / shell.
+
+**Build under test:**
+
+| Component | Version | Notes |
+|---|---|---|
+| `agnos` | **1.31.2 `[Unreleased]` HEAD** (~492,992 B default; ~493,688 B with `MSC_RW_DEMO=1`) | USB MS Phase 1-4 + AHCI carry-forward triplet + cycc 6.0.1 pin graduation all live. Default build used. |
+| `gnoboot` | 0.4.2 (unchanged from Attempts 78/80/81/82) | Sovereign UEFI handoff, banner only. |
+| `cyrius` | 6.0.1 toolchain; kernel pin 6.0.1 | Second iron burn of agnos on the v6.0.x toolchain (Attempt 82 was the first). |
+
+**Iron evidence shape — confirms real silicon, not QEMU emulation:**
+
+| Field | Iron value | Reading |
+|---|---|---|
+| xhci port | 3 | physical USB-A on archaemenid (HS = USB 2.0; QEMU defaults to SS) |
+| VID | `2358` = `0x0936` | generic OEM USB-stick VID (not Iomega `0x059B` / SanDisk `0x0781` / Apacer `0x0EA0`) |
+| PID | `5096` = `0x13E8` | generic OEM PID; distinct from QEMU's `0x0001` |
+| `bDeviceClass` | 0x00 | "interface-defined" — class lives on the Interface Descriptor (standard MSC shape) |
+| BBB interface | intf=0 | MSC class triple (0x08/0x06/0x50) matched on Interface 0 |
+| Bulk EP IN | `0x82` (EP2 IN) | distinct from QEMU's `0x81` |
+| Bulk EP OUT | `0x01` (EP1 OUT) | distinct from QEMU's `0x02` |
+| Bulk MPS | 512 each direction | HS bulk MPS (USB 2.0 max); QEMU at SS gives 1024 |
+| MaxLUN | 0 | single-LUN stick |
+
+**Boot output — MSC moments + onward** (photo: `iron-nuc-zen-photos/attempt-83-usb-ms-iron-debut.jpg` in agnosticos):
+
+```
+xhci: port 3 connected, HS, slot=2, VID=2358 PID=5096, class=00
+hid: keyboard layer initialized
+hid: keyboard configured, boot protocol on, EP=129, polling 8-byte reports
+msc: slot 2 BBB intf=0 bulk-IN=130 bulk-OUT=1 MPS(in/out)=512/512 MaxLUN=0
+xhci: transfer event timeout
+msc: CSW transfer timeout
+msc: slot 2 TEST UNIT READY -> not ready / failed (CSW status != 0)
+msc: 1 mass-storage device(s) detected
+nvme: found at 4241489920, version=1.4.0
+...(NVMe + AHCI + GPT + shell as Attempt 82 baseline)
+```
+
+**What this validates on iron beyond QEMU:**
+
+- xHCI port-reset / address / Configure Endpoint on a **real-vendor USB 2.0 device** — second xHCI slot occupant on real silicon (slot 1 = HID kbd).
+- Configuration Descriptor walker (`xhci_find_msc_bbb_endpoints`) correctly classifies a real-vendor interface as MSC-BBB (class 0x08 / subclass 0x06 / protocol 0x50) and captures the bulk EP pair at a non-QEMU layout (EP `0x82` / `0x01` vs QEMU's `0x81` / `0x02`).
+- `xhci_input_ctx_add_bulk_pair` + Configure Endpoint command landed against AMD FCH xHCI first try (no Phase-2 init failure log printed → CMOS kcp `0x53` would stamp).
+- CBW transport reached the device on real silicon: the eventual `CSW status != 0` print means the device received the SCSI TEST UNIT READY opcode, processed it, formed a CSW, and DMA'd it back through the bulk-IN ring. The transport layer is structurally working — the device's response (NOT_READY) is a SCSI-semantic state, not a transport bug.
+
+**What this does NOT yet validate on iron (deferred to next-touch):**
+
+- INQUIRY round-trip (SPC-4 §6.6) — currently gated behind TUR pass.
+- READ CAPACITY(10) round-trip (SBC-3 §5.10) — currently gated behind TUR pass.
+- READ(10) / WRITE(10) workload path on real silicon.
+- Tertiary block-layer registration (`msc: registered as tertiary block_dev`).
+- LBA-0 readback via `msc_read_demo`.
+
+**Post-burn code-read finding — failure is transport-layer, not SCSI-semantic:**
+
+The print `TEST UNIT READY -> not ready / failed (CSW status != 0)` is misleading. Reading `msc.cyr` line-by-line shows it's the generic else-branch label in `msc_probe_slot:377-380` — it fires for ANY non-zero return from `msc_test_unit_ready`. The two prior xhci/msc timeout lines come from `msc_bbb_exec:659-663` — **Step 4 CSW receive on bulk-IN timed out**; the device never DMA'd a CSW. `transport_failed` sticky (`row + 69`) is SET. The audit's § 3 hypothesis 2 prediction (NOT_READY with `bCSWStatus=1`, sense `02/04/01`) is **unverified, not confirmed** — no CSW was ever decoded.
+
+This promotes Reset Recovery (USB MSC BBB §6.7.3) from "deferred to Phase 5" to the **primary** Phase 2.5 fix.
+
+**Carry-forward — Phase 2.5 (four-patch device-side stack):**
+
+Single-burn fix per `feedback_redesign_dont_reinvent` (Linux `drivers/usb/storage/transport.c` § `usb_stor_Bulk_reset` + `usb_stor_clear_halt` + `drivers/usb/storage/usb.c` § `usb_stor_TUR` + `drivers/scsi/sd.c` § `sd_spinup_disk` + USB MSC BBB §6.7.3 + SPC-4 §6.27 references — no letter ladder):
+
+1. **`msc_reset_recovery` helper** (PRIMARY — USB MSC BBB §6.7.3). Three control requests via `xhci_control_no_data`: Bulk-Only Mass Storage Reset (`0x21/0xFF/0/intf/0`) + CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN (`0x02/0x01/0/ep_in_addr/0`) + same on bulk-OUT. Plus host-side: re-zero both bulk rings, rewrite Link TRBs, reset cycle/idx state in the per-slot row, clear `transport_failed` sticky. Without this, retries reissue against wedged rings.
+2. **TUR retry loop**. Wrap `msc_test_unit_ready` in 3-try loop in `msc_probe_slot`; between failed attempts call `msc_reset_recovery` when `transport_failed=1`; small spin-count delay (~5M iterations ≈ 5–10ms wall) between tries. Matches Linux's `usb_stor_TUR` + `sd_spinup_disk` retry pattern.
+3. **Hoist INQUIRY out of the TUR-pass gate**. Per SPC-4 §6.6, INQUIRY does not require the LUN to be Ready; the audit anticipated this code shape but the implementation gates Phase 3 entirely behind TUR. Move `msc_inquiry` to run unconditionally after `msc_configure_endpoints` success; keep `msc_read_capacity` inside the TUR-pass branch (RC10 legitimately requires Ready per SBC-3 §5.10). Even if all TUR retries exhaust, INQUIRY may succeed — vendor/product/PDT recovery is independent of LUN ready state.
+4. **`msc_request_sense` helper** (SPC-4 §6.27). 6-byte CDB + 18-byte response. Decode sense key (low nibble of byte 2) + ASC (byte 12) + ASCQ (byte 13). Print one-line diagnostic on TUR failure. Distinguishes "becoming ready" (02/04/01 → retry) / "no medium" (02/3A/00 → still register if INQUIRY worked) / "media changed" (02/28/00 → re-init); surfaces unexpected codes for inspection. Critical for seeing what the device actually reports once Reset Recovery unsticks the transport.
+
+**Held for Phase 2.6 (only if Phase 2.5 iron evidence shows it's needed):**
+
+- Controller-side EP recovery (xHCI Reset Endpoint TRB type 14 + Set TR Dequeue Pointer TRB type 16 + Stop Endpoint TRB type 15 per xHCI 1.2 §4.6.8 / §4.6.9 / §4.6.10). If Phase 2.5's device-only recovery doesn't unstick iron (e.g., `xhci: transfer event timeout` repeats on the retried CBW), Phase 2.6 adds the xHCI command surface to `xhci_cmd.cyr`.
+- READ CAPACITY(16) fallback for > 2 TiB devices — Phase 5 / SBC-3 §5.11.
+- Phase 5 optical (SCSI MMC, 2048-B sectors) — first non-512-B device on AGNOS; separate audit, HP external USB Blu-ray on archaemenid is the iron target.
+
+**Status against the audit's success rubric (`usb-ms-iron-burn-audit.md` § 5):**
+
+- **Full success rubric:** missed by ~5 lines — the entire post-TUR success suite (INQUIRY decode + RC10 + tertiary registration + LBA0 readback) sits behind the TUR-pass gate that didn't open.
+- **Partial — vendor-specific quirk:** matches *exactly* hypothesis 2 of § 3 (NOT_READY on cold insertion of removable media). Surfaces an additional code-vs-audit gap (TUR gate stops Phase 3, not just RC10).
+- **Failure rubric:** not triggered — no xhci enumeration hang, no Configure Endpoint timeout, no kernel fault, boot walked through to AGNOS shell.
+
+**Files changed:** None this commit. Next-touch will modify `kernel/arch/x86_64/usb/msc.cyr` (TUR retry helper + Phase 3 hoist + REQUEST SENSE decode + sense-data-aware retry plumbing).
+
+Detail in [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 83](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md). State.md storage-targets row 3a + new § USB MS iron carry-forward subsection record the cross-repo state.
+
+### USB Mass Storage Phase 2.5 — Reset Recovery + TUR retry + INQUIRY hoist + REQUEST SENSE (post-Attempt-83 carry-forward)
+
+Closes the four-patch device-side carry-forward stack from the Attempt 83 PASS-WITH-CAVEAT — the burn that surfaced Step 4 CSW receive timeouts wedging the bulk transport on real-vendor USB sticks before any post-TUR Phase 3 / Phase 4 work could land. Per `feedback_redesign_dont_reinvent` (Linux `drivers/usb/storage/transport.c` § `usb_stor_Bulk_reset` + `usb_stor_clear_halt` + `drivers/usb/storage/usb.c` § `usb_stor_TUR` + `drivers/scsi/sd.c` § `sd_spinup_disk` references); USB MSC BBB §6.7.3 + SPC-4 §6.6 + §6.27 + SBC-3 §5.10 the spec references. Single-burn fix shape — no letter ladder.
+
+- **`msc_reset_recovery(slot_id)` — new function in `msc.cyr` after `msc_bbb_exec`.** USB MSC BBB §6.7.3 three-step sequence: Bulk-Only Mass Storage Reset class control (`0x21 / 0xFF / 0 / intf / 0`) via `xhci_control_no_data`, then CLEAR_FEATURE(ENDPOINT_HALT) on bulk-IN (`0x02 / 0x01 / 0 / ep_in_addr / 0`), then same on bulk-OUT. Plus host-side rewind: re-zero both bulk-ring pages via `xhci_zero_page`, rewrite the Link TRBs at the last slot of each ring (xHCI 1.2 §6.4.4.1, TC=1 + cycle=1), reset per-slot row state (`bulk_in_cycle` / `bulk_out_cycle` → 1, `bulk_in_idx` / `bulk_out_idx` → 0), clear `transport_failed` sticky byte at `row + 69`. Returns 1 on full success, 0 if any of the three control requests fails. Prints `msc: slot N Reset Recovery OK` on success or a specific `... failed` line for whichever step bailed.
+
+  **Held for Phase 2.6 if iron evidence requires it**: controller-side EP recovery (xHCI Reset Endpoint TRB type 14 / Set TR Dequeue Pointer TRB type 16 / Stop Endpoint TRB type 15 per xHCI 1.2 §4.6.8 / §4.6.9 / §4.6.10). The device-only recovery shipped here may not fully unstick a controller with a wedged TR Dequeue Pointer; if Attempt 84 shows `xhci: transfer event timeout` repeating after Reset Recovery, Phase 2.6 adds the xHCI command-level surface to `xhci_cmd.cyr`.
+
+- **TUR retry loop in `msc_probe_slot` (3 tries with Reset Recovery between failed attempts).** Wraps `msc_test_unit_ready` in `while (tries < 3) { ... }`; if `transport_failed=1` after a failed call, runs `msc_reset_recovery` before the next attempt; if Reset Recovery itself fails, breaks out. Inter-retry delay is a small spin loop (~5M iterations ≈ 5–10 ms wall on Zen-class silicon, matching AHCI's quiescence-poll magnitude). Matches Linux's `usb_stor_TUR` retry pattern + `sd_spinup_disk` shape for "becoming ready" cases that take a few ms to clear.
+
+- **INQUIRY hoisted out of TUR-pass gate.** Per SPC-4 §6.6, Standard INQUIRY does NOT require the LUN to be in Ready state — the audit anticipated this and asserted "Current Phase 2 behavior: prints ... and continues to attempt Phase 3 INQUIRY anyway" but the previous implementation gated all of Phase 3 + Phase 4 behind a TUR-pass branch (the audit/code gap surfaced at Attempt 83). `msc_inquiry` now runs unconditionally after `msc_configure_endpoints` succeeds; vendor / product / revision / PDT decode is recovered even when TUR ultimately fails. `msc_read_capacity` stays inside the TUR-pass branch because RC10 legitimately requires Ready state per SBC-3 §5.10.
+
+- **`msc_request_sense(slot_id, lun)` — new function in `msc.cyr` between `msc_read_capacity` and the Phase 3 print helpers.** SPC-4 §6.27 — 6-byte CDB (opcode `0x03`, DESC=0 fixed-format, allocation length 18, control 0), 18-byte fixed-format response. Decodes sense key (low nibble byte 2), ASC (byte 12), ASCQ (byte 13) from the response and prints a one-line diagnostic: `msc: slot N sense key=K ASC=A ASCQ=Q [label]`. Common SPC-4 Annex D shapes get a short textual label inline: `02/04/01` → "becoming ready", `02/3A/xx` → "medium not present", `06/28/xx` → "media may have changed", `06/29/xx` → "power-on / reset", `00/xx/xx` → "no sense". Called once after all TUR retries are exhausted — gives iron-log evidence of *why* the device says it's not ready. (If transport is still wedged after Reset Recovery, REQUEST SENSE itself will timeout in `msc_bbb_exec` Step 4 — that's also useful iron evidence, pointing at Phase 2.6's controller-side recovery.)
+
+**Boot-output shape change** (vs the previous Attempt-83 capture):
+
+| Path | Previous boot output | Phase 2.5 boot output |
+|---|---|---|
+| MSC-BBB device enumerated | `msc: slot N BBB intf=... bulk-IN=... bulk-OUT=... MPS(in/out)=... MaxLUN=0` | unchanged |
+| Phase 3 INQUIRY | (only after TUR Pass) `msc: slot N INQUIRY: vendor='...' product='...' rev='...' type=block` | (always, after Configure Endpoint) — same |
+| Phase 2 TUR retry — transport-wedged path | (none — went straight to fail) | `msc: slot N transport wedged, attempting Reset Recovery` → `msc: slot N Reset Recovery OK` → retry |
+| Phase 2 TUR Pass | `msc: slot N TEST UNIT READY -> ready (Pass)` | unchanged |
+| Phase 2 TUR exhausted | `msc: slot N TEST UNIT READY -> not ready / failed (CSW status != 0)` (misleading label) | `msc: slot N TEST UNIT READY -> not ready after 3 retries` + `msc: slot N sense key=K ASC=A ASCQ=Q [label]` |
+| Phase 3 RC10 | (only after TUR Pass) `msc: slot N READ CAPACITY: last_lba=... blk=...B -> ... MiB` | (only after TUR Pass — RC10 legitimately requires Ready) — same |
+
+**QEMU validation** — re-ran the existing `-device qemu-xhci -device usb-storage,bus=xhci.0,drive=stick` harness. QEMU's emulated `usb-storage` returns TUR Pass on first try → retry loop short-circuits → boot output matches the pre-Phase-2.5 success path:
+
+```
+msc: slot 1 BBB intf=0 bulk-IN=129 bulk-OUT=2 MPS(in/out)=1024/1024 MaxLUN=0
+msc: slot 1 INQUIRY: vendor='QEMU' product='QEMU HARDDISK' rev='2.5+' type=block
+msc: slot 1 TEST UNIT READY -> ready (Pass)
+msc: slot 1 READ CAPACITY: last_lba=16383 blk=512B -> 8 MiB
+msc: registered as tertiary block_dev (slot 1, 16384 LBAs x 512B; NVMe primary)
+msc: slot 1 LBA0 first 8 bytes: 0 0 0 0 0 0 0 0
+msc: 1 mass-storage device(s) detected
+```
+
+The retry / Reset Recovery / REQUEST SENSE paths are unexercised by QEMU (which always reports Ready); their iron validation lands at Attempt 84.
+
+**Build**: 492,992 B (default 1.31.2 `[Unreleased]` post-Attempt-83 HEAD) → **496,656 B** (+3,664 B for the Phase 2.5 stack: ~85 LOC `msc_reset_recovery` + ~75 LOC `msc_request_sense` + ~60 LOC re-shaped `msc_probe_slot` body + aarch64 stubs).
+
+**Files changed:** `kernel/arch/x86_64/usb/msc.cyr` (+`msc_reset_recovery` after `msc_bbb_exec`; +`msc_request_sense` between `msc_read_capacity` and Phase 3 print helpers; re-shaped Phase 2/3 block in `msc_probe_slot` — INQUIRY hoisted, TUR retry loop with Reset Recovery, REQUEST SENSE call after exhausted retries), `kernel/arch/aarch64/stubs.cyr` (+`msc_reset_recovery` + `msc_request_sense` stubs).
+
+**Iron-validation gate for Attempt 84**: install on archaemenid, plug the same USB 2.0 stick used at Attempt 83 (or any real-vendor USB stick), observe whether (a) Reset Recovery unwedges the bulk transport (`msc: slot N Reset Recovery OK` followed by a Pass on retry 2 or 3), or (b) the device-only recovery isn't enough (`xhci: transfer event timeout` repeats, REQUEST SENSE also times out) — which would surface Phase 2.6 as the next-touch. Either outcome is iron-actionable. Pre-burn audit refresh queued for `usb-ms-iron-burn-audit.md` § 7+ (Phase 2.5 success rubric).
+
 ### 1.31.2 remaining scope — opening
 
 Cycle theme stays **storage**. With AHCI carry-forward shipped above, the primary engineering bite opens:

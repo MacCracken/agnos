@@ -154,6 +154,8 @@ fn msc_build_cbw(s, l, c, n, dl, di) { return 0; }
 fn xhci_input_ctx_add_bulk_pair(i, ie, im, oe, om, sp, ir, or) { return 0; }
 fn msc_inquiry(s, l) { return 0; }
 fn msc_read_capacity(s, l) { return 0; }
+fn msc_reset_recovery(s) { return 0; }
+fn msc_request_sense(s, l) { return 0; }
 fn msc_ensure_data_buf(r) { return 0; }
 fn msc_print_ascii_field(p, n) { return 0; }
 fn msc_print_pdt_label(p) { return 0; }
