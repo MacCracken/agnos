@@ -5,11 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
+## [1.32.0] — 2026-05-22 (Networking arc — kernel TCP/UDP server primitives + DHCP client + r8169 driver Phase 1-4 + iron debut on archaemenid)
 
-- **DHCP gate predicate** — `main.cyr:655` was gating `dhcp_init()` on `if (vnet_active != 0)` (virtio-net only). On real iron with r8169, `vnet_active == 0` permanently, so the gate never fired and the four expected `dhcp:` lines never printed even though the r8169 driver completed Phase 1-4 cleanly. Iron Attempt 92 (2026-05-22) was a Partial PASS that surfaced this: all six expected `r8169:` lines printed verbatim (`found at 0xFCF04000`, `MAC=176:65:111:12:228:37`, `chip-rev byte=0x87`, `reset OK; Phase 1 complete`, `RX ring up`, `TX ring up`) + storage trio + GPT + ext4 mount all byte-identical to Attempt 91, but DHCP was silent. Root cause: the gate predicate, NOT a driver-internal bug (H1/H7/H8 audit hypotheses all blocked upstream). Fix: `if (vnet_active != 0 || nic_ready() != 0)` — explicit OR with the generic abstraction on the RHS so future NIC backends (i225-V queued) don't force another gate edit (per [[feedback_prefer_generic_abstraction_at_call_sites]] — captured after this fix took two rounds of user pushback to land in the right shape). Build 600,520 → 601,392 B (+872 B reachability shift); `scripts/test.sh` 4/4 PASS. **Attempt 93 PENDING IRON** for validation; expected delta = four new `dhcp:` lines between `Interrupts enabled` and the TCP_LISTEN_SMOKE block.
+### Cycle-close summary
 
-## [1.32.0] — 2026-05-22
+The 1.32.x networking arc closes **feature-complete at 1.32.0**. Carry-forward + driver-level OFFER-timeout debug move to 1.32.1.
+
+**Landed in-cycle**:
+
+- **bite A** — TCP server primitives (`tcp_listen` / `tcp_bind` / `tcp_accept` + passive-open SYN handler + SYN_RCVD state branch + ARP REQUEST handler). ~188 LOC in `net.cyr` + smoke harness.
+- **bite F** — UDP server primitives (`udp_bind` / `udp_recv_from` / `udp_send_from` + 8-listener table + per-arrival dispatch in `net_handle_udp`). ~95 LOC in `net.cyr`. Foundation for bite G.
+- **bite G** — DHCP client (RFC 2131 DISCOVER → OFFER → REQUEST → ACK; 240-byte BOOTP fixed header + options 53/55/50/54; on ACK sets `net_ip` / `netmask` / `gateway`). ~260 LOC in `net.cyr` + ~5 LOC `main.cyr` boot hook.
+- **bite B** — r8169 driver Phases 1-4: Phase 1 (PCI probe + MAC read + soft reset), Phase 2 (16-entry RX descriptor ring + per-buffer 4 KB pages + `r8169_poll`), Phase 3 (16-entry TX descriptor ring + `r8169_send` + TPPoll NPQ kick), Phase 4 (NIC dispatcher `nic_ready` / `nic_send` / `nic_poll` priority r8169 > virtio_net + net.cyr migration of 14 sites). ~400 LOC across `r8169.cyr` + integration.
+- **bite D** — iron debut Attempt 92 PARTIAL → Attempt 93 PARTIAL (gate-fix VERIFIED on iron). All six `r8169:` lines + storage trio + GPT + ext4 mount byte-clean on archaemenid through both burns.
+- **DHCP gate predicate fix** (`main.cyr:655`) — surfaced by Attempt 92 silence, landed same-day per user direction, validated by Attempt 93. Predicate now `if (vnet_active != 0 || nic_ready() != 0)` — explicit OR with the generic NIC abstraction on the RHS so future backends (i225-V queued, Wi-Fi later) don't force another gate edit. Build 600,520 → 601,392 B; `scripts/test.sh` 4/4 PASS. Iron evidence: Attempt 93 transcript shows `dhcp: DISCOVER` line egressing through the r8169 path for the first time. Per [[feedback_prefer_generic_abstraction_at_call_sites]] — captured because this fix took two rounds of user pushback to land in the right shape.
+- **Pre-burn audit doc** — `agnosticos/docs/development/r8169-iron-burn-audit.md` landed per [[feedback_iron_burns_block_other_work]] (9 sections mirroring prior storage-arc audits; H1-H9 hypothesis ranking; success rubric).
+
+**Carry-forward to 1.32.1**:
+
+- **r8169 OFFER-timeout** — Attempt 93 confirmed DISCOVER egresses on iron through the gate-fix path, but no OFFER comes back within the timeout window. This puts H1 (PHY-not-configured / no link), H7 (TX OWN stuck), and H8 (RX OWN stuck) from the pre-burn audit back on the table as the now-reachable failure surface. Driver-level audit + discriminator instrumentation (CMOS-bank stamps per the no-serial-on-iron constraint) + corrective patches are 1.32.1 cycle scope.
+- **bite C / i225-V driver** — Intel 2.5GbE family port. Pending dedicated Intel-NIC iron (post-archaemenid-migration ideally).
+- **BBS + MUD userland consumer apps** — separate standalone repos (out-of-cycle by design); arrive when wire-end-to-end has DHCP + accept-success on iron.
+
+**Iron evidence at cycle close**: Attempts 92 + 93 byte-clean on r8169 Phase 1-4 + storage trio + ext4 mount + shell launch. MVP gate (kernel + kybernet + agnoshi on iron) green since Attempt 68 / 1.30.9 and **still green at Attempt 93**.
+
+**Build trajectory across cycle**: 578,432 B (1.31.7 close) → 600,432 B (cycle-open + bite A/F/G + bite B Phases 1-4 landed) → 600,520 B (`TCP_LISTEN_SMOKE=1` variant) → **601,392 B (cycle close, post-gate-fix, `TCP_LISTEN_SMOKE=1`)**. cyrius pin stays on 6.0.1. gnoboot stays on 0.4.2.
+
+### Fixed (post-Attempt 92, validated Attempt 93)
+
+- **DHCP gate predicate** — `main.cyr:655` was gating `dhcp_init()` on `if (vnet_active != 0)` (virtio-net only). On real iron with r8169, `vnet_active == 0` permanently, so the gate never fired and the four expected `dhcp:` lines never printed even though the r8169 driver completed Phase 1-4 cleanly. Iron Attempt 92 (2026-05-22) was a Partial PASS that surfaced this: all six expected `r8169:` lines printed verbatim (`found at 0xFCF04000`, `MAC=176:65:111:12:228:37`, `chip-rev byte=0x87`, `reset OK; Phase 1 complete`, `RX ring up`, `TX ring up`) + storage trio + GPT + ext4 mount all byte-identical to Attempt 91, but DHCP was silent. Root cause: the gate predicate, NOT a driver-internal bug (H1/H7/H8 audit hypotheses all blocked upstream). Fix: `if (vnet_active != 0 || nic_ready() != 0)` — explicit OR with the generic abstraction on the RHS so future NIC backends (i225-V queued) don't force another gate edit (per [[feedback_prefer_generic_abstraction_at_call_sites]] — captured after this fix took two rounds of user pushback to land in the right shape). Build 600,520 → 601,392 B (+872 B reachability shift); `scripts/test.sh` 4/4 PASS. **Attempt 93 IRON-VALIDATED 2026-05-22**: `dhcp: DISCOVER` line egresses on iron through the r8169 path; new failure mode is `dhcp: OFFER timeout` (driver-level H1/H7/H8 surface — 1.32.1 cycle scope).
 
 ### Networking arc — bite B Phase 5 (pre-burn audit): `r8169-iron-burn-audit.md` landed
 
