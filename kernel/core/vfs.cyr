@@ -18,13 +18,14 @@
 # #2 closed.
 
 enum VfsType {
-    VFS_FREE     = 0;
-    VFS_DEVICE   = 1;
-    VFS_MEMFILE  = 2;
-    VFS_SIGNALFD = 3;
-    VFS_EPOLL    = 4;
-    VFS_TIMERFD  = 5;
-    VFS_PIPE     = 6;
+    VFS_FREE      = 0;
+    VFS_DEVICE    = 1;
+    VFS_MEMFILE   = 2;
+    VFS_SIGNALFD  = 3;
+    VFS_EPOLL     = 4;
+    VFS_TIMERFD   = 5;
+    VFS_PIPE      = 6;
+    VFS_EXT2_FILE = 7;   # payload[0]=pos, [1]=size, [2]=inode_num
 }
 
 var vfs_table[1024];  # 32 entries x 32 bytes each
@@ -171,6 +172,17 @@ fn vfs_read(fd_idx, buf, count) {
         # Read end has is_write_end=0 (payload[1])
         if (kpayload(base, 1) != 0) { return 0 - 1; }
         return pipe_read(base, buf, count);
+    }
+    if (ftype == VFS_EXT2_FILE) {
+        var pos       = kpayload(base, 0);
+        var fsize     = kpayload(base, 1);
+        var inode_num = kpayload(base, 2);
+        if (pos >= fsize) { return 0; }
+        var avail = fsize - pos;
+        if (count > avail) { count = avail; }
+        var n = ext2_read_at(inode_num, pos, buf, count);
+        if (n > 0) { kpayload_set(base, 0, pos + n); }
+        return n;
     }
     return 0 - 1;
 }

@@ -71,6 +71,36 @@ Identical content confirms `ext2_logical_to_physical` correctly walked `inode.i_
 
 **Build:** `build/agnos` 537,952 B (Phase 1) → **552,736 B** (+14,784 B for Phase 2: ~165 LOC of new code + 12 KB BSS for the three indirect scratch buffers). Multiboot2 ELF64 entry `0x1000a8` preserved.
 
+#### Phase 3 — directory walk + path resolution + `ls`/`cat` shell verbs + VFS integration (~210 LOC across `kernel/core/ext2.cyr` + `kernel/core/vfs.cyr` + `kernel/user/shell.cyr`)
+
+User-facing payoff of the cycle. `agnos> ls /` and `agnos> cat /file` work end-to-end against any mounted ext2 image.
+
+- **`ext2_dirent_valid(off_in_block, rec_len, name_len)`** — per-entry validation predicates per BSD single-pass shape (FreeBSD `ext2_search_dirblock` / OpenBSD `ext2fs_search_dirblock`). Checks `rec_len > 0` (critical anti-infinite-loop), `rec_len >= 12`, 4-byte alignment, `rec_len >= 8 + name_len`, block-boundary fit. Audit § 3.4.
+- **`ext2_print_dir(dir_inode_num)`** — linear dirent scan. Walks the dir inode's data blocks via `ext2_logical_to_physical`, parses dirents inline, prints non-tombstone (`inode != 0`) entries with `/` suffix for `file_type == 2` (EXT2_FT_DIR). Returns entry count.
+- **`ext2_dir_lookup(dir_inode_num, name, name_len)`** — same walk, but matches against a target name; returns the entry's inode number on hit, 0 if not found, -1 on error. Uses `memeq` for the name compare.
+- **`ext2_path_lookup(path, path_len)`** — absolute-path resolver. Starts at root inode 2, walks component-by-component via `ext2_dir_lookup`. Tolerates leading/trailing/consecutive `/`. Refuses relative paths (must start with `/`). No symlink resolution in Phase 3 (fast-symlinks queued); `.` and `..` work transparently because they're real on-disk dirent entries pointing to the right inodes.
+- **`ext2_open(path, path_len)`** — VFS-integrated open. Resolves path → inode, refuses non-regular and ext4-extents inodes (Phase 4 unlock), allocates a `vfs_alloc()` slot, tags it `VFS_EXT2_FILE` with payload `{pos=0, size=file_size, inode_num}`. Returns the FD index; usable with `vfs_read` / `vfs_close` identically to MEMFILE / DEVICE FDs.
+- **`VFS_EXT2_FILE = 7`** — new tag in `kernel/core/vfs.cyr`'s `VfsType` enum. `vfs_read` arm consumes `pos` + `size` + `inode_num` payload, dispatches to `ext2_read_at(inode_num, pos, buf, count)`, advances `pos` by bytes_read. Mirrors `VFS_MEMFILE`'s shape (same `pos`/`size` semantics, just inode-backed instead of memory-backed).
+- **`sh_cmd_ls(arg, arglen)`** — new shell verb. No args = walks root (inode 2); with arg = `ext2_path_lookup(arg)` → walk that inode. Refuses if ext2 not mounted.
+- **`sh_cmd_cat`** — extended: if the path starts with `/` AND ext2 is mounted, try `ext2_open` first; fall back to `initrd_open` on miss or for bare names (preserves existing initrd consumer behavior).
+
+**QEMU validation:** boot log shows all four Phase 3 surfaces working against the 50 KB hello.txt + auto-created lost+found:
+
+```
+ext2: mounted (blocksize=1024, inode_size=256, inodes_per_group=2048)
+ext2 read@0 (32 B): !"#$%&'()*+,-./0123456789:;<=>?@           <- Phase 1 direct (still green)
+ext2 read@16384 (32 B): !"#$%&'()*+,-./0123456789:;<=>?@       <- Phase 2 single-indirect (still green)
+ext2 ls /: ./ ../ lost+found/ hello.txt                          <- Phase 3 dirent walk
+ext2 cat /hello.txt (first 32 B via VFS): !"#$%&'()*+,-./0123456789:;<=>?@   <- Phase 3 path lookup + VFS_EXT2_FILE
+AGNOS shell v1.31.5 (type 'help')
+```
+
+The four entries in `/` decoded byte-exact (`.` + `..` + `lost+found` + `hello.txt`), `/` suffix correctly marks the three dir entries; `cat` resolved `/hello.txt` from root inode 2 through path lookup → got inode 12 → opened as VFS slot → `vfs_read` dispatched to the new VFS_EXT2_FILE arm → returned 32 bytes byte-exact.
+
+**Build:** `build/agnos` 552,736 B (Phase 2) → **562,872 B** (+10,136 B for Phase 3: ~210 LOC across ext2.cyr / vfs.cyr / shell.cyr + 4 KB BSS for `ext2_dir_buf`). Multiboot2 ELF64 entry `0x1000a8` preserved. Total ext2 driver delta from 1.31.4 baseline: **+41,952 B / ~42 KB** for ~660 LOC of filesystem code.
+
+**Out of scope (Phase 4 territory):** ext4 extents header + leaf walker. Phase 3 refuses inodes with `i_flags & EXTENTS_FL` at both `ext2_open` and `ext2_read_at`, so an ext4 mkfs'd image will fail cleanly with the "Phase 4 unlock" log line. Phase 4 (~250 LOC) detects EXTENTS in `s_feature_incompat`, expands the supported-incompat mask to `0x6746`, adds the FreeBSD-shape extent walker, and unlocks `mount /dev/nvme0p2` + `ls /` against real Linux ext4 root partitions on iron.
+
 #### fatfs hardening — GPT-protective-MBR BPB-zero guard
 
 `kernel/core/fatfs.cyr` was silently faulting on GPT-protective-MBR disks: the MBR has `0x55 0xAA` at byte 510-511 (looks like FAT boot signature) but `0x00 0x00` at offset 11-12 (the BPB bytes-per-sector field). `fatfs_init` accepted the false-positive signature, parsed bytes_per_sector = 0, then divided by zero in the root-sector calc — silent #DE halt. This bug only surfaced when QEMU was invoked with a virtio-blk ESP disk (the normal OVMF boot path), masking the 1.31.x storage-arc QEMU smoke tests that all used NVMe-attached ESPs. Two-line defensive guards added: refuse if `fatfs_bytes_per_sector != 512` (valid FAT in practice) and refuse if `fatfs_sectors_per_cluster == 0`. Cleared the boot path for the ext2 Phase 1 smoke; no regression on any real FAT image.

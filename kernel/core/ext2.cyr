@@ -441,3 +441,235 @@ fn ext2_read_at(inode_num, offset, buf, maxlen) {
 fn ext2_read_file(inode_num, buf, maxlen) {
     return ext2_read_at(inode_num, 0, buf, maxlen);
 }
+
+# --- Directory walk (Phase 3) -----------------------------------------
+#
+# Walks the dirents of a directory inode and either prints them (ls
+# shape) or finds a named entry (path-lookup shape).
+#
+# Dirent format (audit § 3.4):
+#   +0  inode  (4)   — 0 = tombstone, skip but advance
+#   +4  rec_len(2)   — total entry length, multiple of 4, min 12
+#   +6  name_len(1)  — actual name length (0-255)
+#   +7  file_type(1) — only valid if EXT2_FEATURE_INCOMPAT_FILETYPE set
+#   +8  name[]       — name_len bytes, not NUL-terminated
+#
+# Validation predicates per BSD per-entry shape (FreeBSD ext2_search_dirblock
+# / OpenBSD ext2fs_search_dirblock): rec_len >= 12, rec_len & 3 == 0,
+# rec_len >= 8 + name_len, rec_len doesn't span block boundary, rec_len > 0
+# (the critical anti-infinite-loop check). Any failure aborts the walk.
+
+# Directory scratch buffer — full blocksize, reused across blocks.
+var ext2_dir_buf[512];   # 4096 bytes
+
+# Validate a single dirent at byte offset `off_in_block`. Returns 1 if
+# the entry is structurally valid (caller may use it), 0 if the walk
+# should abort (corruption detected).
+fn ext2_dirent_valid(off_in_block, rec_len, name_len) {
+    if (rec_len == 0)                              { return 0; }  # critical: anti-infinite-loop
+    if (rec_len < 12)                              { return 0; }
+    if ((rec_len & 3) != 0)                        { return 0; }
+    if (rec_len < 8 + name_len)                    { return 0; }
+    if (off_in_block + rec_len > ext2_blocksize)   { return 0; }
+    return 1;
+}
+
+# Print a single directory's contents (just names; ls-style). Returns the
+# count of non-tombstone entries printed, or -1 on error.
+fn ext2_print_dir(dir_inode_num) {
+    if (ext2_active == 0) { return 0 - 1; }
+    if (ext2_get_inode(dir_inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+
+    # Validate inode is a directory (mode high nibble = 0x4 = S_IFDIR).
+    var mode = ext2_inode_mode(&ext2_inode_buf);
+    if ((mode & 0xF000) != 0x4000) {
+        kprintln("ext2: not a directory", 21);
+        return 0 - 1;
+    }
+
+    # Save the dir inode (we'll need to re-read it after every
+    # ext2_logical_to_physical call, since that walks the inode tree
+    # and uses ext2_inode_buf as scratch... actually it doesn't, it
+    # takes a buf arg. But ext2_get_inode DOES use ext2_inode_buf.
+    # So we re-fetch on each loop iteration if needed.)
+    var dir_size = ext2_inode_filesize(&ext2_inode_buf);
+    if (dir_size == 0) { return 0; }
+
+    var count = 0;
+    var bytes_done = 0;
+    while (bytes_done < dir_size) {
+        # Refresh inode in case any helper clobbered the buffer.
+        if (ext2_get_inode(dir_inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+
+        var logical = bytes_done / ext2_blocksize;
+        var phys = ext2_logical_to_physical(&ext2_inode_buf, logical);
+        if (phys == 0 - 1) { return 0 - 1; }
+        if (phys == 0)     { bytes_done = bytes_done + ext2_blocksize; continue; }
+
+        if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+
+        # Walk dirents within this block.
+        var off = 0;
+        while (off < ext2_blocksize) {
+            var d = &ext2_dir_buf + off;
+            var inode_num = ext2_load32_le(d, 0);
+            var rec_len   = ext2_load16_le(d, 4);
+            var name_len  = load8(d + 6);
+            var ftype     = load8(d + 7);
+
+            if (ext2_dirent_valid(off, rec_len, name_len) == 0) {
+                kprintln("ext2: dirent validation failed; aborting walk", 45);
+                return count;
+            }
+
+            if (inode_num != 0) {
+                # Print name + '/' suffix for dirs (ftype==2 EXT2_FT_DIR).
+                for (var k = 0; k < name_len; k = k + 1) {
+                    kputc(load8(d + 8 + k));
+                }
+                if (ftype == 2) { kputc(47); }   # '/'
+                kputc(32);                       # space separator
+                count = count + 1;
+            }
+
+            off = off + rec_len;
+        }
+
+        bytes_done = bytes_done + ext2_blocksize;
+    }
+
+    if (count > 0) { kprintln("", 0); }
+    return count;
+}
+
+# Find a named entry inside a directory inode. Returns the entry's inode
+# number on hit, 0 if not found, -1 on error.
+fn ext2_dir_lookup(dir_inode_num, name, name_len) {
+    if (ext2_active == 0) { return 0 - 1; }
+    if (ext2_get_inode(dir_inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+
+    var mode = ext2_inode_mode(&ext2_inode_buf);
+    if ((mode & 0xF000) != 0x4000) { return 0 - 1; }
+
+    var dir_size = ext2_inode_filesize(&ext2_inode_buf);
+    if (dir_size == 0) { return 0; }
+
+    var bytes_done = 0;
+    while (bytes_done < dir_size) {
+        if (ext2_get_inode(dir_inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+        var logical = bytes_done / ext2_blocksize;
+        var phys = ext2_logical_to_physical(&ext2_inode_buf, logical);
+        if (phys == 0 - 1) { return 0 - 1; }
+        if (phys == 0)     { bytes_done = bytes_done + ext2_blocksize; continue; }
+
+        if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+
+        var off = 0;
+        while (off < ext2_blocksize) {
+            var d = &ext2_dir_buf + off;
+            var ent_inode = ext2_load32_le(d, 0);
+            var rec_len   = ext2_load16_le(d, 4);
+            var ent_namelen = load8(d + 6);
+
+            if (ext2_dirent_valid(off, rec_len, ent_namelen) == 0) { return 0; }
+
+            if (ent_inode != 0) {
+                if (ent_namelen == name_len) {
+                    if (memeq(d + 8, name, name_len) == 1) {
+                        return ent_inode;
+                    }
+                }
+            }
+            off = off + rec_len;
+        }
+        bytes_done = bytes_done + ext2_blocksize;
+    }
+    return 0;   # not found
+}
+
+# --- Path lookup (Phase 3) --------------------------------------------
+#
+# Resolves an absolute path "/foo/bar/baz" to an inode number, walking
+# component-by-component from the root inode (always 2). Returns the
+# inode number on success, 0 if any component not found, -1 on error.
+#
+# Path semantics:
+#   - "/" alone → root inode 2
+#   - leading "/" required; relative paths return -1
+#   - trailing "/" tolerated (treated as empty trailing component, skipped)
+#   - multiple consecutive "/" tolerated
+#   - no symlink resolution in Phase 3 (fast-symlinks queued)
+#   - no ".."/"." resolution beyond their on-disk dirents (which point
+#     to the right inodes anyway, so walking through them works trivially)
+
+fn ext2_path_lookup(path, path_len) {
+    if (ext2_active == 0)                  { return 0 - 1; }
+    if (path_len < 1)                      { return 0 - 1; }
+    if (load8(path) != 47)                 { return 0 - 1; }  # must start with '/'
+
+    var current_inode = 2;   # root
+    var i = 1;               # skip leading '/'
+
+    while (i < path_len) {
+        # Skip consecutive '/' separators.
+        while (i < path_len) {
+            if (load8(path + i) != 47) { break; }
+            i = i + 1;
+        }
+        if (i >= path_len) { break; }
+
+        # Find end of current component.
+        var comp_start = i;
+        while (i < path_len) {
+            if (load8(path + i) == 47) { break; }
+            i = i + 1;
+        }
+        var comp_len = i - comp_start;
+        if (comp_len < 1)   { continue; }
+        if (comp_len > 255) { return 0 - 1; }   # ext2 max name_len = 255
+
+        # Walk the current dir to find the component.
+        var next_inode = ext2_dir_lookup(current_inode, path + comp_start, comp_len);
+        if (next_inode == 0 - 1) { return 0 - 1; }
+        if (next_inode == 0)     { return 0; }    # not found
+        current_inode = next_inode;
+    }
+
+    return current_inode;
+}
+
+# --- VFS-integrated open (Phase 3) ------------------------------------
+#
+# Opens a file by absolute path, allocates a VFS slot tagged
+# VFS_EXT2_FILE, and returns the FD index for vfs_read / vfs_close.
+# Returns -1 on lookup failure / non-regular / no free FD.
+
+fn ext2_open(path, path_len) {
+    var inode_num = ext2_path_lookup(path, path_len);
+    if (inode_num == 0 - 1) { return 0 - 1; }
+    if (inode_num == 0)     { return 0 - 1; }
+
+    if (ext2_get_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+
+    # Only allow opening regular files via VFS_EXT2_FILE. Dirs need ls
+    # (ext2_print_dir); other types not supported in Phase 3.
+    var mode = ext2_inode_mode(&ext2_inode_buf);
+    if ((mode & 0xF000) != 0x8000) { return 0 - 1; }
+
+    var flags = ext2_inode_flags(&ext2_inode_buf);
+    if ((flags & 0x80000) != 0) {
+        # ext4 extents — Phase 4 unlock. ext2_read_at will refuse too.
+        return 0 - 1;
+    }
+
+    var fsize = ext2_inode_filesize(&ext2_inode_buf);
+
+    var fd = vfs_alloc();
+    if (fd < 0) { return 0 - 1; }
+    var base = &vfs_table + fd * 32;
+    ktag_set(base, VFS_EXT2_FILE);
+    kpayload_set(base, 0, 0);          # pos
+    kpayload_set(base, 1, fsize);      # size
+    kpayload_set(base, 2, inode_num);  # inode_num
+    return fd;
+}
