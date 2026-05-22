@@ -25,6 +25,16 @@ var ext2_first_data_block   = 0;    # 0 for blocksize >= 2048, 1 for blocksize =
 var ext2_partition_first_lba = 0;   # 0 = whole-disk; set by Phase 3+ partition mount
 var ext2_sectors_per_block  = 0;    # cached: blocksize / 512
 
+# Bite (G) — the backend tag this ext2 mount lives on. Set by the
+# multi-backend probe in `ext2_init` to one of BLK_NVME / BLK_AHCI /
+# BLK_USB_MS / BLK_VIRTIO / BLK_RAMDISK. All in-driver block reads go
+# through `ext2_blk_read` which dispatches via `blk_read_on(ext2_backend,
+# ...)` instead of the global `blk_read` (which would route to
+# blk_active). This decouples the ext2 mount from the override-policy
+# winner — needed on archaemenid where NVMe wins `blk_active` but the
+# ext2 partition lives on AHCI/SATA or a different NVMe partition.
+var ext2_backend            = 0;    # BLK_NONE; set during probe
+
 # Buffers — sized for max-blocksize (4096) since blocks bigger than that
 # are out of scope for Phase 1-4. Module-global var X[N] in Cyrius
 # allocates N u64 = 8N bytes (vs function-local var X[N] which is N
@@ -103,40 +113,140 @@ fn ext2_inode_filesize(inode) {
 # EA_INODE | CSUM_SEED | LARGEDIR = 0x6706. Anything else triggers
 # refusal with a clear "unsupported incompat bits" log line.
 
-fn ext2_init() {
-    if (blk_active == 0) {
-        kprintln("ext2: no block backend", 22);
-        return 0 - 1;
-    }
+# Bite (G) helper — internal block read that routes through whichever
+# backend ext2 successfully probed, not the global `blk_active` winner.
+# All ext2 sub-helpers (ext2_read_block, ext2_get_inode, ...) use this.
+fn ext2_blk_read(sector, buf) {
+    return blk_read_on(ext2_backend, sector, buf);
+}
 
-    # Whole-disk mount: superblock at byte 1024 = LBA 2..3 of disk.
-    # When Phase 3+ adds partition support, this becomes
-    # `ext2_partition_first_lba + 2 ..`.
-    ext2_partition_first_lba = 0;
-    var sb_lba_lo = ext2_partition_first_lba + 2;
-    var sb_lba_hi = ext2_partition_first_lba + 3;
+# Bite (G) probe helper — reads candidate backend's LBA 2 + LBA 3 into
+# `ext2_sb_buf`, returns 1 if the bytes look like an ext2 superblock
+# (magic + sanity checks) or 0 on miss / IO error. The sanity gate is
+# stricter than just `magic == 0xEF53` per audit § 3 H5: a 16-bit value
+# can collide by accident in random data, so we also require log_block_size
+# <= 2 and inodes_per_group > 0. Three-check gate is the documented
+# defense against false positives on btrfs / NTFS / random-data sectors.
+fn ext2_probe_backend(tag, partition_lba) {
+    var sb_lba_lo = partition_lba + 2;
+    var sb_lba_hi = partition_lba + 3;
+    if (blk_read_on(tag, sb_lba_lo, &ext2_sb_buf) != 0) { return 0; }
+    if (blk_read_on(tag, sb_lba_hi, &ext2_sb_buf + 512) != 0) { return 0; }
 
-    # Read 1024 bytes (two sectors) into sb_buf.
-    if (blk_read(sb_lba_lo, &ext2_sb_buf) != 0) {
-        kprintln("ext2: superblock read failed (lo)", 33);
-        return 0 - 1;
-    }
-    if (blk_read(sb_lba_hi, &ext2_sb_buf + 512) != 0) {
-        kprintln("ext2: superblock read failed (hi)", 33);
-        return 0 - 1;
-    }
-
-    # Validate magic 0xEF53. First sanity gate; cheapest possible.
     var magic = ext2_sb_magic(&ext2_sb_buf);
-    if (magic != 0xEF53) {
-        # Quiet failure — every block backend boot reads sector 2,
-        # but most won't be ext2. Don't log noise unless something
-        # explicitly asked for ext2 mount.
+    if (magic != 0xEF53) { return 0; }
+    var log_bs = ext2_sb_log_block_size(&ext2_sb_buf);
+    if (log_bs > 2) { return 0; }
+    var ipg = ext2_sb_inodes_per_group(&ext2_sb_buf);
+    if (ipg == 0) { return 0; }
+    if (ipg > 1048576) { return 0; }
+    return 1;
+}
+
+# Bite (H) — partition-aware mount helper. For a given backend `tag`,
+# walks the parsed GPT partition table (gpt.cyr module-state, populated
+# by gpt_init on the active backend at boot) looking for a partition
+# with the Linux-FS type GUID; for each match, probes ext2 at the
+# partition's first LBA + 2 (where the ext2 superblock lives by spec —
+# byte offset 1024 from the partition start). Returns 1 on first match
+# (ext2_backend + ext2_partition_first_lba set), 0 otherwise.
+#
+# Constraint: the GPT module currently parses GPT against `blk_active`,
+# so this partition-aware mount can only see partitions on the backend
+# holding blk_active. For Attempt 90 on archaemenid that's the NVMe
+# (with its 3-partition layout including p3 = `agnos-fs` ext4 carve).
+# Partitions on other backends (the AHCI/SATA `agnos-fs` carve at
+# sda1) are NOT reachable via this path; they'd need either a separate
+# GPT parse-per-backend or a whole-disk mkfs.ext4 on a non-GPT'd
+# backend. The audit doc § 8 H4 documents this constraint.
+fn ext2_try_partition_mount(tag) {
+    if (gpt_present == 0) { return 0; }
+    if (tag != blk_active) { return 0; }   # see comment above
+
+    for (var pi = 0; pi < gpt_partition_count; pi = pi + 1) {
+        if (gpt_partition_info(pi) != 1) { continue; }
+
+        # Bite (H) — gate on Linux-FS type GUID per audit § 3 H1/H4.
+        # Other type GUIDs (ESP, MSFT Basic, btrfs root) won't have ext2
+        # at their first sector; skipping them avoids both wasted probe
+        # IO and accidental false-positive on incidental 0xEF53 patterns
+        # in foreign filesystems.
+        if (gpt_q_type_lo != GPT_TYPE_LINUX_FS_LO) { continue; }
+        if (gpt_q_type_hi != GPT_TYPE_LINUX_FS_HI) { continue; }
+
+        if (ext2_probe_backend(tag, gpt_q_first_lba) == 1) {
+            ext2_backend = tag;
+            ext2_partition_first_lba = gpt_q_first_lba;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+fn ext2_init() {
+    # Bite (G) multi-backend probe. Walk all registered backends in
+    # priority order (NVMe → AHCI → USB-MS → VirtIO → RAMDISK), reading
+    # each one's LBA 2-3 for an ext2 superblock signature. First match
+    # wins; non-matches are silent (every backend probes itself even on
+    # non-ext2 disks, so noise-free is the right shape).
+    #
+    # On archaemenid: NVMe holds blk_active (btrfs root) but the carved
+    # ext4 partition lives on a different backend or different partition
+    # offset — bite (H) covers the partition-offset case via per-backend
+    # GPT consumption.
+    var candidates_n = 5;
+    var candidates[5];
+    store8(&candidates + 0, BLK_NVME);
+    store8(&candidates + 1, BLK_AHCI);
+    store8(&candidates + 2, BLK_USB_MS);
+    store8(&candidates + 3, BLK_VIRTIO);
+    store8(&candidates + 4, BLK_RAMDISK);
+
+    var matched = 0;
+    for (var ci = 0; ci < candidates_n; ci = ci + 1) {
+        var tag = load8(&candidates + ci);
+        if (blk_is_registered(tag) == 0) { continue; }
+
+        # First attempt: whole-disk (partition_lba = 0). Common for
+        # mkfs.ext2-on-raw-image (QEMU smoke test path).
+        if (ext2_probe_backend(tag, 0) == 1) {
+            ext2_backend = tag;
+            ext2_partition_first_lba = 0;
+            matched = 1;
+            break;
+        }
+
+        # Bite (H) — partition-aware mount. If whole-disk missed AND this
+        # backend has a parsed GPT (NVMe + AHCI typical), iterate the
+        # partition table looking for a Linux-FS partition with an ext2
+        # superblock at its offset+LBA-2. Reuses `gpt_partition_info(idx)`
+        # which returns (first_lba, last_lba, type_guid_class) packed.
+        # Bite (H) is gated on the gpt module being initialized (which it
+        # is, called before ext2_init in main.cyr).
+        if (ext2_try_partition_mount(tag) == 1) {
+            matched = 1;
+            break;
+        }
+    }
+
+    if (matched == 0) {
+        # No backend matched. Silent — every boot reads each backend's
+        # sector 2, but most aren't ext2. Don't log noise.
         return 0 - 1;
     }
 
     # Magic matched — from here on, log loudly: ext2 is the FS, and any
     # failure deserves an explanation.
+
+    kprint("ext2: probe matched backend=", 28);
+    kprint_num(ext2_backend);
+    if (ext2_partition_first_lba > 0) {
+        kprint(" partition_lba=", 15);
+        kprint_num(ext2_partition_first_lba);
+    } else {
+        kprint(" whole-disk", 11);
+    }
+    kprintln("", 0);
 
     # Feature gate. Phase 1-3 mask was 0x6706 (FILETYPE | RECOVER | MMP
     # | FLEX_BG | EA_INODE | CSUM_SEED | LARGEDIR). Phase 4 adds EXTENTS
@@ -156,11 +266,54 @@ fn ext2_init() {
 
     # Decode geometry.
     var log_bs               = ext2_sb_log_block_size(&ext2_sb_buf);
+
+    # Bite (A) input validation: log_block_size must be 0/1/2 — anything
+    # else either overflows `1024 << log_bs` (>= 32 would shift past u32)
+    # or yields blocksize 8192+ which we refuse below anyway. Defensive
+    # cap before the shift so we never compute a nonsense blocksize from
+    # a corrupt superblock.
+    if (log_bs > 2) {
+        kprint("ext2: log_block_size out of range: ", 36);
+        kprint_num(log_bs);
+        kprintln("", 0);
+        return 0 - 1;
+    }
+
     ext2_blocksize           = 1024 << log_bs;
     ext2_blocks_per_group    = ext2_sb_blocks_per_group(&ext2_sb_buf);
     ext2_inodes_per_group    = ext2_sb_inodes_per_group(&ext2_sb_buf);
     ext2_first_data_block    = ext2_sb_first_data_block(&ext2_sb_buf);
     ext2_sectors_per_block   = ext2_blocksize / 512;
+
+    # Bite (A) input validation: superblock geometry sanity. Each of these
+    # would either lead to a divide-by-zero (per-group counts) or
+    # absurd-sized scans (inodes_per_group beyond reason). Cap chosen at
+    # 1M inodes/group — Linux's `mke2fs -i` minimum bytes-per-inode = 1024
+    # gives 4M inodes max at 4 KB blocksize × 32K-blocks/group, but we
+    # cap at 1M for defensive sanity (realistic FSes are 8K-32K). Beyond
+    # this, refuse mount rather than walk into corrupt territory.
+    if (ext2_blocks_per_group == 0) {
+        kprintln("ext2: blocks_per_group=0 (corrupt sb)", 37);
+        return 0 - 1;
+    }
+    if (ext2_inodes_per_group == 0) {
+        kprintln("ext2: inodes_per_group=0 (corrupt sb)", 37);
+        return 0 - 1;
+    }
+    if (ext2_inodes_per_group > 1048576) {
+        kprint("ext2: inodes_per_group > 1M absurd: ", 36);
+        kprint_num(ext2_inodes_per_group);
+        kprintln("", 0);
+        return 0 - 1;
+    }
+    # first_data_block is 0 for blocksize >= 2048, 1 for blocksize == 1024.
+    # Anything else means the superblock is lying or the spec was misread.
+    if (ext2_first_data_block > 1) {
+        kprint("ext2: first_data_block invalid: ", 32);
+        kprint_num(ext2_first_data_block);
+        kprintln("", 0);
+        return 0 - 1;
+    }
 
     # Inode size: DYNAMIC_REV (rev_level >= 1) reads from offset 88;
     # GOOD_OLD_REV defaults to 128. Defensive cap at 256 for our buffer.
@@ -216,7 +369,10 @@ fn ext2_block_to_lba(block_num) {
 fn ext2_read_block(block_num, buf) {
     var lba = ext2_block_to_lba(block_num);
     for (var i = 0; i < ext2_sectors_per_block; i = i + 1) {
-        if (blk_read(lba + i, buf + i * 512) != 0) {
+        # Bite (G) — explicit per-backend dispatch via ext2_blk_read
+        # ensures the read lands on the backend that probed positive,
+        # not whatever holds blk_active.
+        if (ext2_blk_read(lba + i, buf + i * 512) != 0) {
             return 0 - 1;
         }
     }
@@ -243,6 +399,19 @@ fn ext2_read_block(block_num, buf) {
 fn ext2_get_inode(inode_num, out_buf) {
     if (ext2_active == 0) { return 0 - 1; }
     if (inode_num == 0)   { return 0 - 1; }
+
+    # Bite (A) input validation: cap inode_num against the maximum
+    # representable in our Phase 1 BGDT chunk. The BGDT block holds up to
+    # (blocksize / 32) groups; each covers inodes_per_group inodes. For a
+    # 4K-block FS that's 128 groups × inodes_per_group. Beyond this,
+    # `ext2_get_inode` would fall through the block_group bounds check
+    # below anyway, but checking up front avoids the BGDT read on
+    # obviously-bogus inode numbers (defense vs malformed dirent
+    # walks, fuzz inputs, etc).
+    var max_inodes_in_chunk = (ext2_blocksize / 32) * ext2_inodes_per_group;
+    if (inode_num > max_inodes_in_chunk) {
+        return 0 - 1;
+    }
 
     var n            = inode_num - 1;
     var block_group  = n / ext2_inodes_per_group;
@@ -748,6 +917,13 @@ fn ext2_path_lookup(path, path_len) {
     if (ext2_active == 0)                  { return 0 - 1; }
     if (path_len < 1)                      { return 0 - 1; }
     if (load8(path) != 47)                 { return 0 - 1; }  # must start with '/'
+
+    # Bite (A) input validation: PATH_MAX cap = 4096 bytes, matching
+    # POSIX `_POSIX_PATH_MAX` and Linux's per-syscall path cap. Anything
+    # longer is either a malicious input or a confused caller; refuse
+    # before doing N dir-lookups. Single 4 KB cap covers all realistic
+    # absolute paths in the AGNOS surface area today.
+    if (path_len > 4096) { return 0 - 1; }
 
     var current_inode = 2;   # root
     var i = 1;               # skip leading '/'

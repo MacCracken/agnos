@@ -16,7 +16,7 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.31.5** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.31.6** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **5.11.59** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-21 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-20 (archaemenid NUC AMD — **typeable-shell MVP gate cleared at Attempt 68 / 1.30.9**; NVMe iron debut clean at Attempt 80 / 1.31.0 — see `iron-nuc-zen-log` § Attempts 68 + 80) | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB hardening) + 80 (NVMe) |

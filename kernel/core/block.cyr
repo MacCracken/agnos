@@ -38,6 +38,14 @@ var blk_active    = 0;   # one of BLK_NONE / BLK_VIRTIO / BLK_NVME
 var blk_capacity  = 0;   # active backend's namespace size, in LBAs
 var blk_lba_bytes = 512; # bytes per LBA on the active backend
 
+# Bite (G) — bitmask of all backends that have successfully registered,
+# regardless of which one currently holds `blk_active`. Set bit BLK_X
+# means backend X is callable via `blk_read_on(BLK_X, sector, buf)`.
+# Used by filesystem-layer probes (ext2 multi-backend mount) that need
+# to walk all registered backends looking for filesystem signatures,
+# not just the override-policy winner held in `blk_active`.
+var blk_registered = 0;
+
 # Backend registration ------------------------------------------------
 
 # Virtio registers first (init runs before NVMe), and only if the slot
@@ -50,6 +58,7 @@ fn blk_register_virtio(capacity) {
         blk_capacity  = capacity;
         blk_lba_bytes = 512;
     }
+    blk_registered = blk_registered | (1 << BLK_VIRTIO);
     return 0;
 }
 
@@ -60,6 +69,7 @@ fn blk_register_nvme(capacity, lba_bytes) {
     blk_active    = BLK_NVME;
     blk_capacity  = capacity;
     blk_lba_bytes = lba_bytes;
+    blk_registered = blk_registered | (1 << BLK_NVME);
     return 0;
 }
 
@@ -73,6 +83,7 @@ fn blk_register_ahci(capacity, lba_bytes) {
     blk_active    = BLK_AHCI;
     blk_capacity  = capacity;
     blk_lba_bytes = lba_bytes;
+    blk_registered = blk_registered | (1 << BLK_AHCI);
     return 0;
 }
 
@@ -84,6 +95,7 @@ fn blk_register_usb_ms(capacity, lba_bytes) {
     blk_active    = BLK_USB_MS;
     blk_capacity  = capacity;
     blk_lba_bytes = lba_bytes;
+    blk_registered = blk_registered | (1 << BLK_USB_MS);
     return 0;
 }
 
@@ -100,6 +112,7 @@ fn blk_register_ramdisk(capacity, lba_bytes) {
         blk_capacity  = capacity;
         blk_lba_bytes = lba_bytes;
     }
+    blk_registered = blk_registered | (1 << BLK_RAMDISK);
     return 0;
 }
 
@@ -112,6 +125,28 @@ fn blk_read(sector, buf) {
     if (blk_active == BLK_USB_MS)  { return msc_blk_read(sector, buf); }
     if (blk_active == BLK_RAMDISK) { return ramdisk_blk_read(sector, buf); }
     return 0 - 1;
+}
+
+# Bite (G) — explicit per-backend dispatch. Lets filesystem-layer probes
+# read from a specific backend regardless of which one holds `blk_active`.
+# Returns -1 if `tag` is not a registered backend (defends consumers
+# against bit-mask vs ID confusion). Use `blk_registered & (1 << tag)`
+# to gate calls upstream when iterating.
+fn blk_read_on(tag, sector, buf) {
+    if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
+    if (tag == BLK_VIRTIO)  { return vblk_blk_read(sector, buf); }
+    if (tag == BLK_NVME)    { return nvme_blk_read(sector, buf); }
+    if (tag == BLK_AHCI)    { return ahci_blk_read(sector, buf); }
+    if (tag == BLK_USB_MS)  { return msc_blk_read(sector, buf); }
+    if (tag == BLK_RAMDISK) { return ramdisk_blk_read(sector, buf); }
+    return 0 - 1;
+}
+
+# Bite (G) helper — bit-test wrapper. Filesystem probes use this to
+# decide whether to call `blk_read_on(tag, ...)` for a given backend.
+fn blk_is_registered(tag) {
+    if ((blk_registered & (1 << tag)) == 0) { return 0; }
+    return 1;
 }
 
 fn blk_write(sector, buf) {

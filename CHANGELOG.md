@@ -5,6 +5,84 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.31.6] — 2026-05-21
+
+### Cleanup / hardening / audit cycle — eight bites landed
+
+Disciplined post-greenfield closeout for the 1.31.x storage + filesystem arc. Eight bites planned per `agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 89 PRE; all eight landed this cut.
+
+#### Bite (A) — ext2 input validation sweep (~70 LOC delta to `kernel/core/ext2.cyr`)
+
+Defense-in-depth against corrupt or malformed superblocks. New validation gates in `ext2_init`:
+
+- `log_block_size > 2` refused — `1024 << log_bs` would overflow u32 for log_bs >= 32 and yields blocksize 8K+ which is out of scope anyway. Cap before the shift.
+- `blocks_per_group == 0` + `inodes_per_group == 0` refused — both would cause divide-by-zero in the BGDT walk. Explicit error message on each.
+- `inodes_per_group > 1048576` refused — realistic FSes are 8K-32K inodes/group; 1M is the absurdity ceiling. Defends against fuzzed/corrupt sb.
+- `first_data_block > 1` refused — spec says 0 for blocksize >= 2048, 1 for blocksize == 1024. Anything else is sb corruption.
+
+Plus inode-num upper-bound check in `ext2_get_inode`: `inode_num > (blocksize / 32) * inodes_per_group` refused early, before BGDT read. Defends against malicious dirent walks / fuzz inputs.
+
+Plus PATH_MAX cap in `ext2_path_lookup`: `path_len > 4096` refused. Matches POSIX `_POSIX_PATH_MAX` and Linux's per-syscall path cap.
+
+#### Bite (B) — fatfs BPB validation sweep (~20 LOC delta to `kernel/core/fatfs.cyr`)
+
+Extends the 1.31.5 GPT-protective-MBR guard (bytes_per_sector + sectors_per_cluster non-zero) with:
+
+- `sectors_per_cluster > 128` refused — FAT spec caps at 128.
+- `sectors_per_cluster` non-power-of-two refused — checked via `spc & (spc - 1) != 0`.
+- `num_fats == 0` refused — would zero the FAT-region offset calc.
+- `num_fats > 2` refused — spec allows but unseen in practice.
+- `root_entry_count > 16384` refused — cap protects root-sector calc; FAT12/16 typically use 512, FAT32 uses 0.
+
+#### Bite (C) — drop ext2 boot-time smoke hook from `main.cyr` (-50 LOC)
+
+Removed the temporary `ext2_read_at(12, 0, ...)` / `ext2_read_at(12, 16384, ...)` / `ext2_print_dir(2)` / `ext2_open("/hello.txt")` smoke block. `ls`/`cat` shell verbs (1.31.5 Phase 3) are the real consumers; the smoke block was a QEMU-only crutch because serial-stdio QEMU runs have no keyboard. Iron burns get the shell verbs directly; QEMU runs lose the inline smoke output but retain coverage via the (manual) `agnos> ls /` + `cat /hello.txt` issued at the shell prompt.
+
+#### Bite (D) — Cyrius `var X[N]` byte-vs-u64 gotcha → feedback memory + CLAUDE.md note
+
+New memory `feedback_cyrius_var_array_u64_units.md`: **module-global `var X[N]` allocates N×u64 (8N bytes); function-local `var X[N]` allocates N bytes.** Surfaced during 1.31.5 ext2 indirect-buffer sizing. CLAUDE.md note added under the Cyrius section pointing to the canonical example in `agnos/kernel/core/ext2.cyr:28-44`.
+
+#### Bite (E) — `ext2-iron-burn-audit.md` pre-burn audit doc
+
+New doc `agnosticos/docs/development/ext2-iron-burn-audit.md` (~200 prose). Modeled on `ahci-iron-burn-audit.md` + `usb-ms-iron-burn-audit.md` (both called their target Attempt's success path correctly). Covers: scope of Attempt 90, what the burn adds to iron coverage, six hypotheses ranked by iron-specific risk, what NOT to do, success rubrics (full PASS + four partial-failure paths + FALSIFIED), mitigations applied, CMOS post-mortem checkpoints reserved (0x56/0x57/0x58 for bite G/H), multi-source prior art table, and audit disposition.
+
+#### Bite (F) — state.md / roadmap / iron-log sweep for 1.31.5 closeout
+
+- `agnosticos/docs/development/state.md`: leading-edge prose rewritten from giant accreted paragraph into terse cycle-by-cycle bullet list; new § *1.31.6 cleanup cycle* with bite punch-list table; storage progression line updated through ext2/4 + cleanup-cycle open; iron-validation-coverage matrix extended through Attempt 90 PENDING; agnos row in new-repos table updated for 1.31.2→1.31.6 trajectory.
+- `agnos/docs/development/roadmap.md`: header updated to v1.31.6 + filesystem stack + active-cycle pointer; row 7 (ext2/4) marked ✅ closed 1.31.5 with Attempt 89 PASS note + Attempt 90 reframe; row 7a (1.31.6 cleanup) marked OPEN with full bite punch list.
+- `agnosticos/docs/development/iron-nuc-zen-log.md`: Attempt 89 rewritten from PENDING to landed interim no-regression burn (full verbatim chain pt1 + pt2, two-photo reference, rubric scoring); new Attempt 90 PENDING entry queued for the post-bite-G/H ext4 victory lap with success/partial/falsified rubrics + carry-forward.
+
+#### Bite (G) — multi-backend ext2 probe + `blk_read_on` helper (~100 LOC across `block.cyr` + `ext2.cyr`)
+
+**GATING work for iron Attempt 90.** Two new module-level additions in `kernel/core/block.cyr`:
+
+- `var blk_registered = 0;` — bitmask of `(1 << BLK_X)` per backend that successfully registered. Set by each `blk_register_*` call.
+- `fn blk_read_on(tag, sector, buf)` — explicit per-backend dispatch. Reads from the named backend regardless of which one holds `blk_active`. Returns -1 if `tag` is not a registered backend.
+- `fn blk_is_registered(tag)` — bit-test wrapper.
+
+In `kernel/core/ext2.cyr`:
+
+- New module global `var ext2_backend = 0;` — the backend tag this ext2 mount lives on (set during probe).
+- New helper `fn ext2_blk_read(sector, buf)` — routes through `blk_read_on(ext2_backend, ...)` so all sub-helpers (`ext2_read_block`, etc.) follow the mounted backend rather than `blk_active`.
+- New helper `fn ext2_probe_backend(tag, partition_lba)` — reads candidate's LBA 2-3, runs the three-check sanity gate (magic `0xEF53` + log_block_size ≤ 2 + inodes_per_group between 1 and 1M). Defense against false positives on btrfs/NTFS/random-data sectors per audit § 3 H5.
+- `ext2_init` rewritten as a multi-backend probe loop: iterates NVMe → AHCI → USB-MS → VirtIO → RAMDISK in priority order, first match wins. Silent on no-match.
+
+#### Bite (H) — partition-aware mount via GPT consumption (~50 LOC delta to `kernel/core/ext2.cyr`)
+
+`fn ext2_try_partition_mount(tag)`: if whole-disk probe missed AND the candidate backend holds `blk_active` (constraint: gpt.cyr currently parses GPT against `blk_active`), iterate the parsed GPT partition table. For each Linux-FS-GUID partition (gate per audit § 3 H1/H4), probe ext2 at the partition's first LBA + 2 (byte offset 1024 from partition start, per ext2 spec). First match wins; sets `ext2_backend` + `ext2_partition_first_lba`.
+
+Wired into `ext2_init`'s per-backend loop: whole-disk first, partition-aware second. Covers the archaemenid Attempt 89 layout (NVMe with 3 partitions including the carved `agnos-fs` p3 at LBA 3898638336) — partition-aware probe will hit p3 since whole-disk LBA 2-3 lands in the GPT/MBR area.
+
+**Known constraint (audit § 8 H4):** partitions on backends other than `blk_active` (e.g., the AHCI/SATA `agnos-fs` carve at sda1) are NOT reachable until per-backend GPT parsing arrives in a future cycle.
+
+**Build:** `build/agnos` 568,960 B (1.31.5) → **571,296 B** (+2,336 B for bites A+B+G+H net of bite C removal — well under the +270-LOC audit estimate; the deltas are mostly comment-heavy validation gates and per-backend tag math, not large new structures).
+
+#### Verification
+
+- `scripts/test.sh` (x86_64): 4/4 PASS — kernel builds, multiboot ELF valid, size sane (571,208 B test build), kernel_hello builds.
+- aarch64: build unchanged (no aarch64-specific changes).
+- Full QEMU + OVMF ext2/ext4 smoke deferred to the pre-Attempt-90 verification step per `ext2-iron-burn-audit.md` § 9 disposition step 7.
+
 ## [1.31.5] — 2026-05-21
 
 ### ext2 / ext4 read-only filesystem driver (1.31.5 cycle scope — Phase 1 landed)
