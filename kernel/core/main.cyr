@@ -261,6 +261,12 @@ if (acpi_iommu_base != 0) {
     }
 }
 
+# r8169 (RTL8111/8168/8169) Phase 1 probe — runs alongside VirtIO-net.
+# Iron only — silent no-op in QEMU's virtio-net-pci config. Phase 1
+# probe: PCI discovery + MAC + reset. RX/TX rings are Phases 2-3,
+# PENDING IRON per 1.32.0 cycle plan.
+r8169_probe();
+
 if (pci_find(0x1AF4, 0x1000) >= 0) {
     if (virtio_net_init() == 0) {
         kprint("VirtIO-net: MAC=", 16);

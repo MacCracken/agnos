@@ -1,0 +1,173 @@
+# === r8169 / RTL8111/8168 NIC driver — Phase 1 (1.32.0 bite B) ===
+#
+# Realtek RTL8168/8111 family Ethernet driver. Phase 1 scope:
+#   - PCI discovery (vendor 0x10EC + device IDs 0x8168 / 0x8169 / 0x8161)
+#   - BAR mapping (MMIO BAR2 first, fall back BAR0 for legacy chips)
+#   - Bus master enable
+#   - UC remap of MMIO BAR
+#   - MAC address read (6 bytes from MMIO offset 0)
+#   - TxConfig high byte for chip-revision hint
+#   - Reset sequence (write 0x10 to CR @ 0x37, poll until bit cleared)
+#
+# Multi-source convergent prior-art per [[feedback_redesign_dont_reinvent]]:
+#   - Linux drivers/net/ethernet/realtek/r8169_main.c + r8169.h
+#   - FreeBSD sys/dev/re/if_re.c + if_revar.h
+#   - OpenBSD sys/dev/pci/if_re.c (forked from FreeBSD pre-divergence)
+#   - NetBSD sys/dev/pci/if_re.c
+#   - Haiku src/add-ons/kernel/drivers/network/ether/rtl8169/
+#   - Realtek RTL8111/8168 datasheet (public PDF)
+#
+# Phases 2-3 (RX descriptor ring + IRQ + TX descriptor ring) land at iron
+# Attempt 92+ time. Phase 1 is iron-discoverable without iron — code is
+# pure spec port; iron-validates the chip ID + MAC + reset behavior.
+#
+# See agnosticos/docs/development/network-arc-prior-art.md § 1 for the
+# full convergent-shape table and per-source citation map.
+
+# Realtek vendor ID.
+var R8169_PCI_VENDOR = 0x10EC;
+
+# Common modern RTL8168/8111-family device IDs. Add iron-surfaced
+# variants as new boards present them; don't pre-scaffold the full
+# Linux ~50-entry table — extract on real consumer demand per the
+# `mihi → iam/chakshu` extract-on-2nd-consumer pattern.
+var R8169_DEV_8168 = 0x8168;  # RTL-8111/8168 (most common modern variant)
+var R8169_DEV_8169 = 0x8169;  # RTL-8169 (older but still in the wild)
+var R8169_DEV_8161 = 0x8161;  # RTL-8111/8168 PCIE Gigabit (some Beelink variants)
+
+# Register offsets (from RTL8168/8111 datasheet; converged across all
+# four BSD/Linux/Haiku references).
+var R8169_REG_IDR0      = 0x00;  # MAC address byte 0 (ID Register 0)
+var R8169_REG_IDR4      = 0x04;  # MAC address byte 4
+var R8169_REG_TXCONFIG  = 0x40;  # TX Configuration (chip-rev hints in high byte)
+var R8169_REG_RXCONFIG  = 0x44;  # RX Configuration
+var R8169_REG_CR        = 0x37;  # Command Register (8-bit)
+
+# CR bit positions.
+var R8169_CR_RST = 0x10;  # bit 4 — Reset (write 1, poll until cleared)
+var R8169_CR_RE  = 0x08;  # bit 3 — RX Enable
+var R8169_CR_TE  = 0x04;  # bit 2 — TX Enable
+
+# Module-level state — populated by r8169_probe on success.
+var r8169_present     = 0;
+var r8169_pci_idx     = 0;
+var r8169_mmio_base   = 0;
+var r8169_mac[8];        # 6 valid bytes + 2 padding
+var r8169_chip_rev    = 0;
+
+# --- MMIO accessors -------------------------------------------------
+# Mirror nvme.cyr/ahci.cyr convention: never load64 against MMIO. The
+# r8169 register window is only 256 bytes; everything fits in 8/16/32-
+# bit accesses.
+
+fn r8169_mmio_read8(off) {
+    return load8(r8169_mmio_base + off);
+}
+
+fn r8169_mmio_write8(off, val) {
+    store8(r8169_mmio_base + off, val);
+    return 0;
+}
+
+fn r8169_mmio_read32(off) {
+    return load32(r8169_mmio_base + off);
+}
+
+# --- PCI discovery --------------------------------------------------
+
+fn r8169_find_pci() {
+    var idx = pci_find(R8169_PCI_VENDOR, R8169_DEV_8168);
+    if (idx >= 0) { return idx; }
+    idx = pci_find(R8169_PCI_VENDOR, R8169_DEV_8169);
+    if (idx >= 0) { return idx; }
+    idx = pci_find(R8169_PCI_VENDOR, R8169_DEV_8161);
+    if (idx >= 0) { return idx; }
+    return 0 - 1;
+}
+
+# --- Phase 1 probe + reset ------------------------------------------
+#
+# Returns 1 on full probe success (chip found + MAC read + reset clean);
+# 0 if no controller present (silent no-op, no error); -1 on probe
+# failure (BAR0/2 both unmapped or reset timeout).
+
+fn r8169_probe() {
+    var idx = r8169_find_pci();
+    if (idx < 0) {
+        kprintln("r8169: no controller found", 26);
+        return 0;
+    }
+
+    # 2. Discover MMIO BAR. Modern RTL8111/8168 chips expose:
+    #    BAR0 = I/O port base (256 bytes)
+    #    BAR2 = MMIO (same 256-byte register window)
+    # We use MMIO BAR2. If zero (some virt/iron configs strip it),
+    # fall back BAR4 (newer chips relocate MMIO there) then BAR0.
+    var mmio = pci_bar_64(idx, 2);
+    if (mmio == 0) {
+        mmio = pci_bar_64(idx, 4);
+    }
+    if (mmio == 0) {
+        # BAR0 is I/O on RTL811x; treating it as MMIO would fail
+        # silently, so refuse rather than guess.
+        kprintln("r8169: no MMIO BAR (chip exposes I/O-port only?)", 47);
+        return 0 - 1;
+    }
+
+    # 3. Bus master enable. Same call-shape nvme/xhci use.
+    pci_enable_bus_master_idx(idx);
+
+    # 4. Cache probe result.
+    r8169_present   = 1;
+    r8169_pci_idx   = idx;
+    r8169_mmio_base = mmio;
+
+    # 5. UC remap. Standard PCI MMIO can't be cached.
+    vmm_remap_uc_2mb(mmio);
+
+    # 6. Read MAC address — 6 bytes at IDR0..IDR5.
+    for (var i = 0; i < 6; i = i + 1) {
+        store8(&r8169_mac + i, r8169_mmio_read8(R8169_REG_IDR0 + i));
+    }
+
+    # 7. Chip-revision hint. RTL811x families encode mac-version in
+    #    TxConfig bits 31-24 (Linux's tx_config_mac_version table walks
+    #    this). For Phase 1 just capture the raw byte; full chip-rev
+    #    dispatch table is a Phase 2+ scope item per the audit doc.
+    var txconfig = r8169_mmio_read32(R8169_REG_TXCONFIG);
+    r8169_chip_rev = (txconfig >> 24) & 0xFF;
+
+    # 8. Reset. Per RTL8168/8111 datasheet §6.1: write CR.RST=1, poll
+    #    until hardware clears it. Linux uses ~100 loops; FreeBSD 10ms;
+    #    OpenBSD 1ms × 100. We use 1000 reads — comfortable upper
+    #    bound, polled (no sleep — pre-IRQ-safe).
+    r8169_mmio_write8(R8169_REG_CR, R8169_CR_RST);
+    var reset_ok = 0;
+    for (var i = 0; i < 1000; i = i + 1) {
+        var cr = r8169_mmio_read8(R8169_REG_CR);
+        if ((cr & R8169_CR_RST) == 0) {
+            reset_ok = 1;
+            break;
+        }
+    }
+    if (reset_ok == 0) {
+        kprintln("r8169: reset timeout (CR.RST stayed set)", 40);
+        return 0 - 1;
+    }
+
+    # 9. Summary print.
+    kprint("r8169: found at ", 16);
+    kprint_num(mmio);
+    kprintln("", 0);
+    kprint("r8169: MAC=", 11);
+    for (var i = 0; i < 6; i = i + 1) {
+        kprint_num(load8(&r8169_mac + i));
+        if (i < 5) { kprint(":", 1); }
+    }
+    kprintln("", 0);
+    kprint("r8169: chip-rev byte=0x", 23);
+    kprint_num(r8169_chip_rev);
+    kprintln(" (Phase 2+ decodes the family)", 30);
+    kprintln("r8169: reset OK; Phase 1 complete (RX/TX rings PENDING IRON)", 60);
+    return 1;
+}

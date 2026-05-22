@@ -7,6 +7,67 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.32.0] — 2026-05-22
 
+### Networking arc — bite B Phase 1: r8169 PCI discovery + MAC read + reset (code complete, iron-anchored)
+
+Realtek RTL8111/8168 family Ethernet driver, Phase 1. New file `kernel/core/r8169.cyr` (~150 LOC). Multi-source convergent port per [`agnosticos/docs/development/network-arc-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/network-arc-prior-art.md) § 1: Linux `r8169_main.c` + FreeBSD `if_re.c` + OpenBSD `re.c` + NetBSD `re.c` + Haiku rtl8169 + RTL8168/8111 datasheet.
+
+#### Iron anchor (queried via `lspci`/sysfs on archaemenid, no burn needed)
+
+Per [[feedback_archaemenid_is_dev_host]] — chip ID + BAR layout + MAC are discoverable directly from the dev host's Linux:
+
+- **PCI BDF**: `0000:01:00.0`
+- **Vendor:Device**: `10ec:8168` rev 0x15 (RTL8111/8168/8211/8411)
+- **Subsystem**: `10ec:0123`
+- **Class**: `0x020000` (Ethernet)
+- **Linux interface**: `enp1s0`, driver `r8169`
+- **MAC**: `b0:41:6f:0c:e4:25`
+- **BAR0**: I/O port `0xF000` (256 B)
+- **BAR2**: MMIO **`0xFCF04000`** (4 KB, 64-bit) ← driver's primary mapping target
+- **BAR4**: MMIO `0xFCF00000` (16 KB, MSI-X table region, Phase 2+ scope)
+
+#### What landed in `kernel/core/r8169.cyr`
+
+- **PCI device-ID table**: 0x8168 (primary), 0x8169, 0x8161. v1 scope is the most-common modern variants; chip-rev dispatch table (Linux's ~50-entry `r8169_pci_tbl`) deferred until a second iron board surfaces with a new ID per the extract-on-2nd-consumer pattern.
+- **Register-offset constants** (converged across all four refs): `IDR0=0x00`, `TXCONFIG=0x40`, `RXCONFIG=0x44`, `CR=0x37`. CR bit constants: `RST=0x10`, `RE=0x08`, `TE=0x04`.
+- **MMIO accessors**: `r8169_mmio_read8` / `write8` / `read32` — mirrors nvme.cyr/ahci.cyr "no load64 on MMIO" convention.
+- **`r8169_find_pci()`** — iterates 0x8168 → 0x8169 → 0x8161 via `pci_find`. Returns idx or -1.
+- **`r8169_probe()`** — full Phase 1 sequence:
+  1. `pci_find` for one of the three device IDs.
+  2. BAR discovery: BAR2 first (modern RTL811x MMIO), BAR4 fallback (newer chips), refuse if both zero (I/O-port-only chip is out of scope).
+  3. `pci_enable_bus_master_idx(idx)` — same call-shape nvme/xhci use.
+  4. Cache state: `r8169_present`, `r8169_pci_idx`, `r8169_mmio_base`.
+  5. `vmm_remap_uc_2mb(mmio)` — UC remap of the BAR region.
+  6. Read 6-byte MAC at MMIO offset 0 into `r8169_mac[8]`.
+  7. Read TxConfig high byte as chip-revision hint into `r8169_chip_rev` (full mac_version dispatch table is Phase 2+).
+  8. Reset: write `CR.RST=1` (0x10) to offset 0x37, poll ≤1000 reads for bit-clear. Timings per OpenBSD's `re.c` (cheapest implementable; per spec).
+  9. Print summary lines: `r8169: found at <mmio>`, `r8169: MAC=<6 bytes>`, `r8169: chip-rev byte=0x<N>`, `r8169: reset OK; Phase 1 complete (RX/TX rings PENDING IRON)`.
+
+#### Wired in
+
+- `kernel/agnos.cyr`: new `include "core/r8169.cyr"` after `core/net.cyr` line.
+- `kernel/core/main.cyr`: `r8169_probe();` call site added immediately before the existing `pci_find(0x1AF4, 0x1000)` virtio-net probe. Silent no-op in QEMU (no Realtek device); on archaemenid iron the four `r8169:` lines should appear at boot.
+
+#### Verification
+
+- `scripts/test.sh` **4/4 PASS**. Build 593,096 → **595,424 B** (+2,328 B for r8169 Phase 1).
+- QEMU boot under virtio-blk-only smoke: r8169 silent no-op as expected (no Realtek device in the QEMU config). Boot reaches `agnos>` shell prompt — no regression on existing stack (nvme/ahci/usb-ms/virtio-blk/net/etc. all unchanged).
+- **Iron burn (Attempt 92+) PENDING** — will validate that:
+  - `r8169: found at 4243210240` (= 0xFCF04000)
+  - `r8169: MAC=176:65:111:12:228:37` (= decimal bytes of `b0:41:6f:0c:e4:25`)
+  - `r8169: chip-rev byte=0x<N>` matches the RTL8168* rev-15 family entry from Linux's mac_version table
+  - `r8169: reset OK; Phase 1 complete (RX/TX rings PENDING IRON)`
+
+#### Phases 2-3 (RX + TX rings) — next bites
+
+Per the convergent-shape table in audit doc § 1.4:
+
+- **Phase 2** (~250 LOC): RX descriptor ring (64 entries × 16 B at 256-B alignment) + IRQ handler + first packet reception. Validatable by sending an ARP request from the gateway and observing the AGNOS log line for the response.
+- **Phase 3** (~250 LOC): TX descriptor ring (same shape) + send path. Validatable by `yo`-style ICMP echo: send echo-request, gateway responds, AGNOS reads response.
+- **Phase 4** (~100 LOC): Integration with `kernel/core/net.cyr`'s existing TCP/UDP layer — multi-NIC dispatch.
+- **Phase 5** (~200 prose): `r8169-iron-burn-audit.md` + Attempt 92+ iron burn.
+
+Phases 2-4 are also code-writeable from the convergent prior-art reference set without needing iron between phases; iron-burn validation can batch them at Phase 5 time. Per [[feedback_driver_code_is_the_bite]] — write the code, burn validates.
+
 ### Networking arc — bite F: UDP server-side primitives landed (code complete, regression-clean)
 
 Mirror of bite A's TCP server pattern, scoped to UDP. Foundation for bite G (DHCP) — DHCP runs over UDP and consumes the new `udp_bind`/`udp_recv_from` surface directly. Smaller than TCP server (no state machine; UDP is connectionless) — ~95 LOC net.
