@@ -17,6 +17,7 @@
 # --- Globals --------------------------------------------------------
 
 var ext2_active             = 0;    # 0 = not mounted; 1 = mounted
+var ext2_desc_size          = 32;   # BGDT entry size: 32 (legacy) or 64 (ext4 64BIT)
 var ext2_blocksize          = 0;    # bytes per FS block (1024/2048/4096)
 var ext2_blocks_per_group   = 0;
 var ext2_inodes_per_group   = 0;
@@ -84,6 +85,7 @@ fn ext2_sb_magic(sb)             { return ext2_load16_le(sb, 56); }
 fn ext2_sb_rev_level(sb)         { return ext2_load32_le(sb, 76); }
 fn ext2_sb_inode_size(sb)        { return ext2_load16_le(sb, 88); }
 fn ext2_sb_feature_incompat(sb)  { return ext2_load32_le(sb, 96); }
+fn ext2_sb_desc_size(sb)         { return ext2_load16_le(sb, 254); }
 
 # --- Inode field accessors ----------------------------------------------
 
@@ -252,9 +254,12 @@ fn ext2_init() {
     # | FLEX_BG | EA_INODE | CSUM_SEED | LARGEDIR). Phase 4 adds EXTENTS
     # (0x0040) → 0x6746 so mkfs.ext4 -O extents mounts succeed; the
     # actual extent-walk dispatch happens per-inode via i_flags &
-    # EXT4_EXTENTS_FL, not at mount time. Inodes that aren't extents-
-    # encoded keep using the indirect-tree walker transparently.
-    var supported_mask = 0x6746;
+    # EXT4_EXTENTS_FL, not at mount time. Phase 5 (1.31.7 bite A) adds
+    # 64BIT (0x0080) → 0x67C6 so modern mkfs.ext4 defaults (which set
+    # 64BIT even on sub-16-TB partitions) mount. The BGDT stride switches
+    # to s_desc_size below; bg_inode_table_hi is guarded in ext2_get_inode.
+    # Full prior-art audit: ext4-64bit-prior-art.md.
+    var supported_mask = 0x67C6;
     var incompat = ext2_sb_feature_incompat(&ext2_sb_buf);
     var unsupported = incompat & (0xFFFFFFFF ^ supported_mask);
     if (unsupported != 0) {
@@ -327,6 +332,25 @@ fn ext2_init() {
         }
     } else {
         ext2_inode_size = 128;
+    }
+
+    # Phase 5 (1.31.7 bite A): BGDT descriptor size. Default 32 (legacy
+    # ext2/ext4); 64BIT-enabled FSes (sb +254) bump to 64. Anything else
+    # is forward-compat we don't yet understand → refuse. Only valid when
+    # rev >= 1 AND 64BIT bit is set in incompat. See ext4-64bit-prior-art.md.
+    ext2_desc_size = 32;
+    if (rev >= 1) {
+        if ((incompat & 0x80) != 0) {
+            var ds = ext2_sb_desc_size(&ext2_sb_buf);
+            if (ds == 0) { ds = 32; }
+            if (ds > 64) {
+                kprint("ext2: s_desc_size > 64 unsupported: ", 36);
+                kprint_num(ds);
+                kprintln("", 0);
+                return 0 - 1;
+            }
+            ext2_desc_size = ds;
+        }
     }
 
     # Blocksize sanity. 1024/2048/4096 are the realistic values; refuse
@@ -428,9 +452,11 @@ fn ext2_get_inode(inode_num, out_buf) {
         return 0 - 1;
     }
 
-    # BGDT entries are 32 bytes (legacy ext2; ext4 64BIT is 64-byte but
-    # 64BIT is refused at mount). bg_inode_table is at byte offset 8.
-    var bgdt_entry_size = 32;
+    # BGDT entries are 32 bytes (legacy ext2) or s_desc_size bytes
+    # (ext4 64BIT — typically 64). bg_inode_table is at byte offset 8
+    # regardless; bg_inode_table_hi at offset 40 only exists when
+    # desc_size==64 and gates the Phase 6 unlock for >16 TB FSes.
+    var bgdt_entry_size = ext2_desc_size;
     var max_groups_in_chunk = ext2_blocksize / bgdt_entry_size;
     if (block_group >= max_groups_in_chunk) {
         kprintln("ext2: block_group beyond first BGDT chunk (Phase 1 limit)", 57);
@@ -438,6 +464,18 @@ fn ext2_get_inode(inode_num, out_buf) {
     }
     var bgdt_off = &ext2_bgdt_buf + block_group * bgdt_entry_size;
     var inode_table_block = ext2_load32_le(bgdt_off, 8);
+
+    # Phase 5 (1.31.7 bite A): 64BIT mode has a bg_inode_table_hi at byte
+    # offset 40 of the BGDT entry. For FSes <= 16 TB it's always zero;
+    # AGNOS test surfaces never exceed this. Guard so a forward-compat
+    # >16 TB FS surfaces a clear refusal instead of silently truncating.
+    if (ext2_desc_size == 64) {
+        var inode_table_hi = ext2_load32_le(bgdt_off, 40);
+        if (inode_table_hi != 0) {
+            kprintln("ext2: bg_inode_table_hi != 0 (Phase 6 unlock)", 45);
+            return 0 - 1;
+        }
+    }
 
     # Compute target block + offset.
     var byte_offset      = idx_in_group * ext2_inode_size;

@@ -2,9 +2,136 @@
 var sh_buf[128];
 var sh_len = 0;
 
+# === CWD state (1.31.7 bite C) ===
+# Absolute path of the current working directory. Default = "/".
+# Cyrius module-global `var X[N]` allocates N×u64, so [64] = 512 bytes —
+# well above the longest realistic CWD path for AGNOS. Capacity capped
+# at 510 in sh_cmd_cd to leave headroom for the trailing separator math.
+var sh_cwd_inode = 2;       # ext2 root inode by default
+var sh_cwd_path[64];        # backing storage; sh_cwd_init writes the leading '/'
+var sh_cwd_len   = 0;       # actual byte length; set to 1 by sh_cwd_init
+
 fn sh_streq(a, alen, b, blen) {
     if (alen != blen) { return 0; }
     return memeq(a, b, alen);
+}
+
+fn sh_cwd_init() {
+    store8(&sh_cwd_path, 47);
+    sh_cwd_len = 1;
+    sh_cwd_inode = 2;
+    return 0;
+}
+
+# Drop the last path component from sh_cwd_path (no-op at root).
+fn sh_cwd_parent() {
+    if (sh_cwd_len <= 1) { return 0; }
+    sh_cwd_len = sh_cwd_len - 1;
+    while (sh_cwd_len > 1) {
+        if (load8(&sh_cwd_path + sh_cwd_len) == 47) { break; }
+        sh_cwd_len = sh_cwd_len - 1;
+    }
+    if (sh_cwd_len == 0) { sh_cwd_len = 1; }
+    return 0;
+}
+
+# Type-check: is inode a directory? (i_mode & 0xF000) == 0x4000.
+fn sh_is_dir(inode_num) {
+    var ibuf[256];
+    if (ext2_get_inode(inode_num, &ibuf) != 0) { return 0; }
+    var i_mode = ext2_load16_le(&ibuf, 0);
+    if ((i_mode & 0xF000) == 0x4000) { return 1; }
+    return 0;
+}
+
+fn sh_cmd_pwd() {
+    kprint(&sh_cwd_path, sh_cwd_len);
+    kprintln("", 0);
+    return 0;
+}
+
+fn sh_cmd_cd(arg, arglen) {
+    if (ext2_active == 0) { kprintln("cd: no ext2 filesystem mounted", 30); return 0; }
+    # Strip leading + trailing whitespace
+    var s = 0;
+    while (s < arglen) {
+        if (load8(arg + s) != 32) { break; }
+        s = s + 1;
+    }
+    arg = arg + s;
+    arglen = arglen - s;
+    while (arglen > 0) {
+        if (load8(arg + arglen - 1) != 32) { break; }
+        arglen = arglen - 1;
+    }
+    # No arg → root
+    if (arglen == 0) { sh_cwd_init(); return 0; }
+    # `cd /` → root
+    if (arglen == 1) {
+        if (load8(arg) == 47) { sh_cwd_init(); return 0; }
+        # `cd .` → no-op
+        if (load8(arg) == 46) { return 0; }
+    }
+    # `cd ..` → parent (relative)
+    if (arglen == 2) {
+        if (load8(arg) == 46) {
+            if (load8(arg + 1) == 46) {
+                var saved_len = sh_cwd_len;
+                var saved_inode = sh_cwd_inode;
+                sh_cwd_parent();
+                var pino = ext2_path_lookup(&sh_cwd_path, sh_cwd_len);
+                if (pino <= 0) {
+                    sh_cwd_len = saved_len;
+                    sh_cwd_inode = saved_inode;
+                    kprintln("cd: parent lookup failed", 24);
+                    return 0;
+                }
+                sh_cwd_inode = pino;
+                return 0;
+            }
+        }
+    }
+    # Build candidate absolute path in pbuf, then resolve.
+    var pbuf[512];
+    var plen = 0;
+    if (load8(arg) == 47) {
+        # Absolute path: copy as-is
+        for (var i = 0; i < arglen; i = i + 1) {
+            if (plen < 510) {
+                store8(&pbuf + plen, load8(arg + i));
+                plen = plen + 1;
+            }
+        }
+    } else {
+        # Relative: prefix CWD + optional separator + arg
+        for (var i = 0; i < sh_cwd_len; i = i + 1) {
+            store8(&pbuf + plen, load8(&sh_cwd_path + i));
+            plen = plen + 1;
+        }
+        if (sh_cwd_len > 1) {
+            if (plen < 510) {
+                store8(&pbuf + plen, 47);
+                plen = plen + 1;
+            }
+        }
+        for (var i = 0; i < arglen; i = i + 1) {
+            if (plen < 510) {
+                store8(&pbuf + plen, load8(arg + i));
+                plen = plen + 1;
+            }
+        }
+    }
+    if (plen >= 510) { kprintln("cd: path too long", 17); return 0; }
+    var ino = ext2_path_lookup(&pbuf, plen);
+    if (ino <= 0) { kprintln("cd: not found", 13); return 0; }
+    if (sh_is_dir(ino) == 0) { kprintln("cd: not a directory", 19); return 0; }
+    # Commit: copy pbuf to sh_cwd_path
+    for (var i = 0; i < plen; i = i + 1) {
+        store8(&sh_cwd_path + i, load8(&pbuf + i));
+    }
+    sh_cwd_len = plen;
+    sh_cwd_inode = ino;
+    return 0;
 }
 
 fn sh_cmd_help() {
@@ -25,6 +152,8 @@ fn sh_cmd_help() {
     kprintln("  blkread - read disk sector", 28);
     kprintln("  parts   - list GPT partitions", 31);
     kprintln("  ls      - list disk files", 27);
+    kprintln("  cd      - change directory", 28);
+    kprintln("  pwd     - print working dir", 29);
     kprintln("  disk    - disk info", 21);
     kprintln("  bench   - run benchmarks", 26);
     kprintln("  test    - run test suite", 26);
@@ -133,11 +262,37 @@ fn sh_cmd_bench() {
 fn sh_cmd_cat(arg, arglen) {
     if (arglen < 1) { kprintln("usage: cat <file>", 17); return 0; }
     var fd = 0 - 1;
-    # Absolute paths ("/foo/bar") consult ext2 first; bare names fall
-    # back to initrd. ext2 returns -1 cleanly on any failure (not
-    # mounted, path not found, non-regular, ext4-extents inode).
-    if (load8(arg) == 47) {
-        if (ext2_active == 1) { fd = ext2_open(arg, arglen); }
+    # ext2 path-handling:
+    #  - absolute path (starts with `/`) → hand directly to ext2_open
+    #  - bare name → prefix with `/` (root scoping) and try ext2
+    #    (1.31.7 bite C will reroute this against sh_cwd_inode)
+    # On any ext2 miss, fall back to initrd_open with the ORIGINAL arg
+    # (initrd uses bare names, not paths).
+    if (ext2_active == 1) {
+        if (load8(arg) == 47) {
+            fd = ext2_open(arg, arglen);
+        } else {
+            # Bare name: prefix with sh_cwd_path (CWD scoping per 1.31.7 bite C)
+            # then try ext2. Worst-case length = sh_cwd_len + 1 (separator) + arglen,
+            # bounded by pbuf[256].
+            if (sh_cwd_len + arglen + 1 < 256) {
+                var pbuf[256];
+                var plen = 0;
+                for (var i = 0; i < sh_cwd_len; i = i + 1) {
+                    store8(&pbuf + plen, load8(&sh_cwd_path + i));
+                    plen = plen + 1;
+                }
+                if (sh_cwd_len > 1) {
+                    store8(&pbuf + plen, 47);
+                    plen = plen + 1;
+                }
+                for (var i = 0; i < arglen; i = i + 1) {
+                    store8(&pbuf + plen, load8(arg + i));
+                    plen = plen + 1;
+                }
+                fd = ext2_open(&pbuf, plen);
+            }
+        }
     }
     if (fd < 0) { fd = initrd_open(arg, arglen); }
     if (fd < 0) { kprintln("file not found", 14); return 0; }
@@ -153,18 +308,60 @@ fn sh_cmd_cat(arg, arglen) {
 
 fn sh_cmd_ls(arg, arglen) {
     if (ext2_active == 0) { kprintln("ls: no ext2 filesystem mounted", 30); return 0; }
-    var target_inode = 2;   # root
-    if (arglen > 0) {
-        # Strip any trailing whitespace the line parser left in.
-        var pl = arglen;
-        while (pl > 0) {
-            if (load8(arg + pl - 1) != 32) { break; }
-            pl = pl - 1;
+    # Parse args: skip leading whitespace, then any flag tokens
+    # (start with `-`). Flags are accepted syntactically but produce
+    # no behavioral change yet — Phase-3 listing format is fixed.
+    # Whatever remains after the flag tokens is treated as a path.
+    var i = 0;
+    while (i < arglen) {
+        if (load8(arg + i) != 32) { break; }
+        i = i + 1;
+    }
+    while (i < arglen) {
+        if (load8(arg + i) != 45) { break; }
+        while (i < arglen) {
+            if (load8(arg + i) == 32) { break; }
+            i = i + 1;
         }
-        if (pl > 0) {
-            target_inode = ext2_path_lookup(arg, pl);
-            if (target_inode <= 0) { kprintln("ls: not found", 13); return 0; }
+        while (i < arglen) {
+            if (load8(arg + i) != 32) { break; }
+            i = i + 1;
         }
+    }
+    var path = arg + i;
+    var path_len = arglen - i;
+    while (path_len > 0) {
+        if (load8(path + path_len - 1) != 32) { break; }
+        path_len = path_len - 1;
+    }
+    var target_inode = sh_cwd_inode;   # CWD default (1.31.7 bite C)
+    if (path_len > 0) {
+        if (load8(path) == 47) {
+            # Absolute path
+            target_inode = ext2_path_lookup(path, path_len);
+        } else {
+            # Bare name: prefix with sh_cwd_path
+            if (sh_cwd_len + path_len + 1 < 256) {
+                var pbuf[256];
+                var plen = 0;
+                for (var j = 0; j < sh_cwd_len; j = j + 1) {
+                    store8(&pbuf + plen, load8(&sh_cwd_path + j));
+                    plen = plen + 1;
+                }
+                if (sh_cwd_len > 1) {
+                    store8(&pbuf + plen, 47);
+                    plen = plen + 1;
+                }
+                for (var j = 0; j < path_len; j = j + 1) {
+                    store8(&pbuf + plen, load8(path + j));
+                    plen = plen + 1;
+                }
+                target_inode = ext2_path_lookup(&pbuf, plen);
+            } else {
+                target_inode = 0 - 1;
+            }
+        }
+        if (target_inode <= 0) { kprintln("ls: not found", 13); return 0; }
     }
     ext2_print_dir(target_inode);
     return 0;
@@ -197,6 +394,8 @@ fn sh_exec(buf, len) {
     }
     if (sh_streq(buf, clen, "cat", 3) == 1) { return sh_cmd_cat(arg, arglen); }
     if (sh_streq(buf, clen, "ls", 2) == 1) { return sh_cmd_ls(arg, arglen); }
+    if (sh_streq(buf, clen, "cd", 2) == 1) { return sh_cmd_cd(arg, arglen); }
+    if (sh_streq(buf, clen, "pwd", 3) == 1) { return sh_cmd_pwd(); }
     if (sh_streq(buf, clen, "echo", 4) == 1) {
         kprint(arg, arglen);
         kprintln("", 0);
@@ -326,11 +525,6 @@ fn sh_exec(buf, len) {
         }
         return 0;
     }
-    if (sh_streq(buf, clen, "ls", 2) == 1) {
-        if (fatfs_active == 0) { kprintln("no filesystem", 13); return 0; }
-        fatfs_ls();
-        return 0;
-    }
     if (sh_streq(buf, clen, "disk", 4) == 1) {
         if (blk_active == 0) { kprintln("no block device", 15); return 0; }
         if (blk_active == BLK_VIRTIO) { kprint("VirtIO-blk: ", 12); }
@@ -371,6 +565,7 @@ fn sh_exec(buf, len) {
 }
 
 fn shell() {
+    sh_cwd_init();
     print_agnos_shell_banner();
     var sh_running = 1;
     while (sh_running == 1) {

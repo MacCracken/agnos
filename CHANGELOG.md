@@ -5,6 +5,109 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.31.7] — 2026-05-22
+
+### Filesystem follow-ups + shell UX cycle — bites landing as work proceeds
+
+Cycle theme: close the ext4 64BIT pin from agnos roadmap row 7b + tighten the Phase-3 shell-UX papercuts surfaced in Attempt 90's transcript (bare-name `cat hello.txt` falling to initrd; `ls -la` failing with `ls: not found`). Smallest-first bite ordering. One cycle-close iron burn (Attempt 91) for no-regression validation; no new iron-validation surface vs 1.31.6.
+
+#### Bite (D) — `ls -la` long-form dispatch (~25 LOC net to `kernel/user/shell.cyr`)
+
+`sh_cmd_ls` now parses leading whitespace + any flag tokens (start with `-`) before treating the remainder as a path argument. Phase-3 listing format is unchanged — flags are accepted syntactically but produce no behavioral change yet; long-form output is a future-cycle scope item if a real consumer surfaces. Closes the Attempt 90 transcript's `ls -la → ls: not found` papercut without expanding scope.
+
+Before: `ls -la` → `arg = "-la"` → `ext2_path_lookup("-la", 3)` refuses (no leading `/`) → returns -1 → "ls: not found".
+
+After: `ls -la` → flag-token loop skips `-la` → path remainder empty → uses root inode 2 → identical output to bare `ls`. Same shape for `ls -l -a /foo` (skip two flag tokens, lookup `/foo`).
+
+Same-touch cleanup: removed the dead duplicate `ls` handler at the old `sh_exec` dispatch site (FAT16-era fall-through, ~5 LOC) that the line-199 ext2-aware dispatch arm had been shadowing since 1.31.5 Phase 3 landed. Net delta: shell.cyr +25 LOC; `build/agnos` 571,296 B (1.31.6 close) → **571,728 B** (+432 B). `scripts/test.sh` 4/4 PASS.
+
+#### Bite (B) — bare-name `cat` ext2 fall-through (~20 LOC net to `kernel/user/shell.cyr`)
+
+`sh_cmd_cat` now tries ext2 for bare names too, not just absolute paths. Bare-name path: prefix with `/` in a 128-byte stack buffer, then call `ext2_open` against root. Absolute paths (starting with `/`) continue to hand directly to `ext2_open` as before. On any ext2 miss, the function still falls back to `initrd_open` with the ORIGINAL bare-name arg (initrd consumes bare names, not paths).
+
+Closes the Attempt 90 transcript's `cat hello.txt → file not found` papercut. Before: bare names skipped ext2 entirely, hit initrd, missed (initrd had no `hello.txt`), printed "file not found." After: bare names look up against ext2 root first, then fall back to initrd if missed.
+
+Forward-compat note: bite C will swap the hardcoded `/` root prefix for `sh_cwd_path`, giving bare names CWD-relative semantics. Bite B is the structural-prereq for that — the bare-name branch in `sh_cmd_cat` is now in place; bite C rewires its prefix source.
+
+Net delta: shell.cyr +20 LOC; `build/agnos` 571,728 B (post-D) → **572,080 B** (+352 B).
+
+#### Bite (C) — `cd` + `pwd` + CWD scoping (~190 LOC net to `kernel/user/shell.cyr`)
+
+User-facing payoff: `agnos> cd /lost+found && cd .. && pwd` walks a directory tree against a real ext4 mount. Phase-3 path semantics (absolute paths via `ext2_path_lookup`) are extended with CWD-relative resolution, transparent `.`/`..`/multi-component relative paths (free from the existing path-walker), and an explicit `cd: not a directory` type-check that consults `i_mode`.
+
+**New module globals:**
+
+- `sh_cwd_inode` — current directory inode (default = 2 = ext2 root).
+- `sh_cwd_path[64]` — backing storage for the absolute CWD path. Cyrius module-global `var X[N]` = N×u64 = 512 bytes; cap actively enforced at 510 in `sh_cmd_cd` to leave separator-math headroom.
+- `sh_cwd_len` — actual byte length; `sh_cwd_init()` writes the leading `/` and sets it to 1.
+
+**New helpers (~50 LOC):**
+
+- `sh_cwd_init()` — resets state to `/` + inode 2; called from `shell()` entry.
+- `sh_cwd_parent()` — drops the last path component from `sh_cwd_path` (no-op at root); used by `cd ..`.
+- `sh_is_dir(inode_num)` — reads the raw inode (256-byte function-local buffer covers both legacy 128-byte and modern ext4 256-byte inodes), checks `(i_mode & 0xF000) == 0x4000`.
+
+**New verbs (~95 LOC):**
+
+- `sh_cmd_cd(arg, arglen)` — handles `cd` (root), `cd /` (root), `cd .` (no-op), `cd ..` (parent via `sh_cwd_parent`, then re-resolve inode via `ext2_path_lookup`), `cd /abs/path` (absolute), `cd subdir` (relative; prefixes `sh_cwd_path` + `/` separator). Saves+restores state on `cd ..` lookup failure so a malformed FS can't strand the user. 512-byte candidate buffer; refuses paths ≥ 510 with `cd: path too long`. Type-checks the target via `sh_is_dir` before committing; refuses with `cd: not a directory`. Multi-component relative paths (`cd a/b/c`) work transparently — they hand off to the existing `ext2_path_lookup` walker.
+- `sh_cmd_pwd()` — prints `sh_cwd_path`.
+
+**Wired into existing verbs:**
+
+- `sh_cmd_cat` — bare-name branch (introduced bite B) now prefixes `sh_cwd_path` + optional `/` separator + arg, instead of the hardcoded `/`. Worst-case path length (sh_cwd_len + 1 + arglen) bounded against the 256-byte `pbuf`.
+- `sh_cmd_ls` — default `target_inode` flipped from hardcoded 2 to `sh_cwd_inode`. Path arg handling now branches: absolute → existing `ext2_path_lookup`; bare name → CWD-prefix + lookup. Same 256-byte budget as `cat`.
+
+**Wired into dispatch + help:**
+
+- `sh_exec` gains `cd` + `pwd` arms next to existing `cat`/`ls`.
+- `sh_cmd_help` lists `cd - change directory` + `pwd - print working dir`.
+- `shell()` calls `sh_cwd_init()` before the banner so `sh_cwd_path` is well-formed even before any user input.
+
+**Composition with bite B**: bite B installed the bare-name branch in `sh_cmd_cat`; bite C swaps that branch's hardcoded `/` prefix for `sh_cwd_path`. After C, bare-name `cat hello.txt` looks up `<CWD>/hello.txt` first, falls back to initrd on miss.
+
+Net delta: shell.cyr +190 LOC; `build/agnos` 572,080 B (post-B) → **577,776 B** (+5,696 B). `scripts/test.sh` 4/4 PASS; `scripts/ext2-smoke.sh` 4/4 PASS + 4/4 regression cross-check PASS.
+
+#### Bite (A) — ext4 64BIT support (Phase 5, ~25 LOC to `kernel/core/ext2.cyr` + new prior-art doc + ext2-smoke 5th scenario)
+
+**Closes row 7b of `agnos/docs/development/roadmap.md`.** Modern `mkfs.ext4` defaults set `EXT4_FEATURE_INCOMPAT_64BIT` (bit `0x0080`) even on partitions well under the 16 TB threshold where the feature is actually needed. Phase 5 unlocks mounting of these filesystems by reading the on-disk BGDT entry size from `s_desc_size` instead of hardcoding 32.
+
+**Multi-source convergent prior-art audit (audit-first per `feedback_redesign_dont_reinvent`):** New doc `agnosticos/docs/development/ext4-64bit-prior-art.md` (~140 lines) — focused companion to the existing `ext2-ext4-extents-prior-art.md`, citing Linux `fs/ext4/super.c` (`EXT4_DESC_SIZE` macro), FreeBSD `sys/fs/ext2fs/ext2_subr.c` (`e2fs_desc_size`), OpenBSD (RO ext2 only — no 64BIT, hardcoded 32), Haiku `Superblock` accessors, and ext4 kernel.org wiki. Convergent shape: every reference reads `s_desc_size` only when 64BIT is set in `s_feature_incompat`; defaults to 32 otherwise.
+
+**Implementation (`kernel/core/ext2.cyr`):**
+
+- New module global `var ext2_desc_size = 32;` — BGDT entry size after mount.
+- New superblock accessor `fn ext2_sb_desc_size(sb) { return ext2_load16_le(sb, 254); }`.
+- Supported-incompat mask `0x6746` → `0x67C6` (adds `0x80` = 64BIT).
+- New parse block in `ext2_init` (after rev/inode_size decode): if rev ≥ 1 AND 64BIT bit set, read `s_desc_size`; cap at 64; refuse with clear `ext2: s_desc_size > 64 unsupported: <N>` if larger; default 32 otherwise.
+- `ext2_get_inode` BGDT stride switches from hardcoded `32` to `ext2_desc_size`. After loading `inode_table_block` via `ext2_load32_le(bgdt_off, 8)`, a new guard reads `bg_inode_table_hi` at offset 40 when `ext2_desc_size == 64`; refuses with `ext2: bg_inode_table_hi != 0 (Phase 6 unlock)` if non-zero (the actual 64-bit block# math is deferred until a real iron consumer surfaces a >16 TB FS, per audit § 6).
+
+**Out of Phase 5 scope (per audit § 6):** real 64-bit block# math throughout, HUGE_FILE feature, META_BG.
+
+**Test surface (`scripts/ext2-smoke.sh` extended 4/4 → 5/5):** new `build_esp_plus_ext4_64bit_partition` + smoke 5 `5-64bit-partition`. Same layout as smoke 3 but `mkfs.ext4` DROPS `^64bit` from the `-O` list, so the partition has the 64BIT incompat bit set. Boot log:
+
+```
+ext2: probe matched backend=2 partition_lba=67584
+ext2: mounted (blocksize=4096, inode_size=256, inodes_per_group=17152)
+AGNOS shell v1.31.7 (type 'help')
+```
+
+`inodes_per_group=17152` (vs 8192 for the legacy smoke 3 image) reflects mke2fs's larger default for 64BIT images — the geometry parsed correctly through the new desc_size=64 BGDT-stride code path. The implicit validation: if the stride were wrong, BGDT entries would have aliased and the inode lookup would have either failed silently or printed garbage geometry. The 5/5 PASS confirms the stride is right.
+
+Net delta: ext2.cyr +25 LOC; ext2-smoke.sh +30 LOC (new builder + smoke); new prior-art doc +140 lines. `build/agnos` 577,776 B (post-C) → **578,432 B** (+656 B). `scripts/test.sh` 4/4 PASS; `scripts/ext2-smoke.sh` 5/5 PASS + 5/5 regression cross-check PASS.
+
+#### Bite (E, part 1 of 2) — cycle-close sweep landed; Attempt 91 iron burn pending
+
+Per [`feedback_changelog_captures_movement`](file:///home/macro/.claude/projects/-home-macro-Repos-agnosticos/memory/feedback_changelog_captures_movement.md) this entry captures what's landed in the host-side sweep. The iron-burn half of bite E (Attempt 91) is the user-driven cycle close and will add its own receipt section when the burn lands.
+
+- `scripts/ext2-smoke.sh` file-header comment refreshed from "Four scenarios" to "Five scenarios" with smoke-5 line item ("64BIT partition — same shape as smoke 3 but mkfs.ext4 -O 64bit").
+- `agnosticos/docs/development/state.md`: § *1.31.7 cycle* bites table flipped to ✅ landed for D / B / C / A + sweep-landed / iron-pending status for E; recent-history bullet updated; full build trajectory captured (571,296 → 578,432 B = +7,136 B / ~260 LOC net across the four code bites).
+- `agnos/docs/development/roadmap.md` row 7c refreshed with same per-bite ✅ status + build trajectory; row 7b's "ACTIVE in 1.31.7" carries forward unchanged.
+- `agnosticos/docs/development/iron-nuc-zen-log.md`: Attempt 91 PENDING entry written with five-rubric scoring (full PASS / 64BIT miss / shell-verb regression / storage-trio regression / FALSIFIED) + reuse note for `ext2-iron-burn-audit.md` (no new iron-validation surface vs 1.31.6, no new audit doc needed).
+
+**QEMU pre-burn state (host-side):** `scripts/test.sh` 4/4 PASS; `scripts/ext2-smoke.sh` 5/5 PASS + 5/5 regression cross-check. All five smokes reach `AGNOS shell v1.31.7`. The 5th smoke (64BIT-flagged ext4 partition) successfully mounts with `ext2: probe matched backend=2 partition_lba=67584` + `ext2: mounted (blocksize=4096, inode_size=256, inodes_per_group=17152)`, confirming the bite-A desc_size=64 BGDT-stride path works against a real `mkfs.ext4 -O 64bit` image.
+
+**Cycle close pending:** user runs Attempt 91 against fresh 64BIT-flagged NVMe `agnos-fs` p3 on archaemenid. On PASS, bite E part 2 ships (iron transcript + photos + cycle-close framing) and `[1.31.7]` finalizes.
+
 ## [1.31.6] — 2026-05-22
 
 ### Cleanup / hardening / audit cycle — eight bites landed + Iron Attempt 90 ext4 victory lap PASS

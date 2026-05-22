@@ -1,23 +1,26 @@
 #!/bin/bash
 # Multi-backend ext2/ext4 filesystem smoke test for the AGNOS kernel.
-# Validates bites G (multi-backend probe + blk_read_on dispatch) and
-# H (partition-aware mount via GPT consumption) from the 1.31.6 cycle.
-# Four scenarios, each booted under qemu-system-x86_64 + OVMF + gnoboot:
+# Validates bites G (multi-backend probe + blk_read_on dispatch) + H
+# (partition-aware mount via GPT consumption) from the 1.31.6 cycle and
+# bite A (ext4 64BIT support / Phase 5) from the 1.31.7 cycle.
+# Five scenarios, each booted under qemu-system-x86_64 + OVMF + gnoboot:
 #
-#   1. Baseline       — ESP-only on virtio-blk; no ext2 anywhere.
-#                       Confirms silent miss + no regression on storage trio.
+#   1. Baseline        — ESP-only on virtio-blk; no ext2 anywhere.
+#                        Confirms silent miss + no regression on storage trio.
 #   2. AHCI whole-disk — ESP-on-NVMe + raw mkfs.ext4 image on AHCI.
-#                       Exercises bite G non-blk_active probe path.
+#                        Exercises bite G non-blk_active probe path.
 #   3. NVMe partition  — single disk with GPT [ESP, Linux-FS] both on NVMe.
-#                       Exercises bite H partition-aware mount.
+#                        Exercises bite H partition-aware mount (legacy 32 B BGDT).
 #   4. Combined        — NVMe-with-partition + AHCI-whole-disk together.
-#                       Validates probe ordering (NVMe-wins).
+#                        Validates probe ordering (NVMe wins).
+#   5. 64BIT partition — same shape as smoke 3 but mkfs.ext4 -O 64bit.
+#                        Exercises 1.31.7 bite A Phase 5 desc_size=64 stride.
 #
 # Tested under: qemu 9+, edk2 OVMF (2024+), mkfs.ext4 from e2fsprogs 1.47+.
 # Requires: qemu-system-x86_64, OVMF firmware, parted, mtools (mformat
 # / mmd / mcopy), sgdisk, mkfs.ext4, gnoboot built at ../gnoboot/build/.
 #
-# Exit 0 if all four scenarios pass; 1 if any fail. Logs preserved under
+# Exit 0 if all five scenarios pass; 1 if any fail. Logs preserved under
 # build/ext2-smoke-logs/ for post-mortem.
 
 set -u
@@ -148,6 +151,33 @@ build_esp_plus_ext4_partition() {
         "$out" $p2_blocks 2>&1 | tail -2
 }
 
+# 1.31.7 bite A: 64BIT-flagged variant of the partition image. Same
+# layout as build_esp_plus_ext4_partition but DROPS `^64bit` from the
+# -O list, so mkfs.ext4 emits a 64BIT-enabled superblock (s_desc_size=64,
+# BGDT entries 64 B, INCOMPAT bit 0x80). Exercises the Phase 5 mount path.
+build_esp_plus_ext4_64bit_partition() {
+    local out=$1
+    dd if=/dev/zero of="$out" bs=1M count=128 status=none
+    parted -s "$out" mklabel gpt \
+        mkpart ESP fat32 1MiB 33MiB set 1 esp on \
+        mkpart agnos-fs ext4 33MiB 100MiB
+    sgdisk -t 2:8300 "$out" >/dev/null
+    mformat -i "$out"@@1048576 -F
+    mmd -i "$out"@@1048576 ::EFI
+    mmd -i "$out"@@1048576 ::EFI/BOOT
+    mcopy -i "$out"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
+    mmd -i "$out"@@1048576 ::boot
+    mcopy -i "$out"@@1048576 "$AGNOS" ::boot/agnos
+    local p2_offset=34603008
+    local p2_blocks=$(( (67 * 1048576) / 4096 ))
+    /usr/sbin/mkfs.ext4 -F -L AGNOS-64BIT \
+        -O 64bit,extents,^huge_file,^metadata_csum,^has_journal,^orphan_file,^resize_inode \
+        -b 4096 \
+        -d "$SEED_DIR" \
+        -E offset=$p2_offset \
+        "$out" $p2_blocks 2>&1 | tail -2
+}
+
 # --- Smoke runner ----------------------------------------------------
 
 QEMU_TIMEOUT="${QEMU_TIMEOUT:-30}"
@@ -189,12 +219,13 @@ echo "Building images..."
 build_esp_only "$WORK/esp-only.img"
 build_wholedisk_ext4 "$WORK/ext4-wholedisk.img"
 build_esp_plus_ext4_partition "$WORK/esp-plus-ext4.img"
+build_esp_plus_ext4_64bit_partition "$WORK/esp-plus-ext4-64bit.img"
 echo ""
 echo "Image sizes:"
-ls -la "$WORK"/esp-only.img "$WORK"/ext4-wholedisk.img "$WORK"/esp-plus-ext4.img | sed 's/^/  /'
+ls -la "$WORK"/esp-only.img "$WORK"/ext4-wholedisk.img "$WORK"/esp-plus-ext4.img "$WORK"/esp-plus-ext4-64bit.img | sed 's/^/  /'
 echo ""
 
-# --- Four scenarios ---------------------------------------------------
+# --- Five scenarios ---------------------------------------------------
 
 echo "Running smokes..."
 
@@ -229,6 +260,15 @@ run_smoke "4-combined-order" \
     -drive "file=$WORK/ext4-wholedisk.img,format=raw,if=none,id=ext4d" \
     -device "ich9-ahci,id=ahci0" \
     -device "ide-hd,drive=ext4d,bus=ahci0.0"
+
+# Smoke 5: 64BIT-flagged ext4 partition (1.31.7 bite A). Same shape as
+# smoke 3 but the ext4 image has INCOMPAT_64BIT set; mount must succeed
+# with the Phase 5 desc_size=64 BGDT-stride code path. Validates the
+# bg_inode_table_hi guard implicitly (hi field is zero on this test image).
+run_smoke "5-64bit-partition" \
+    "ext2: probe matched backend=2 partition_lba=" \
+    -drive "file=$WORK/esp-plus-ext4-64bit.img,format=raw,if=none,id=combo0" \
+    -device "nvme,drive=combo0,serial=COMBO64-NVME"
 
 # --- Regression cross-check: storage-trio + shell reached ALL smokes --
 echo ""
