@@ -51,6 +51,26 @@ Geometry matches `tune2fs -l ext2-smoke.img` byte-for-byte. `inode 12` lookup hi
 
 **Out of scope (Phase 2-4 territory):** indirect blocks, directory walks, ext4 extents, path resolution, shell commands. All landing in subsequent cuts under this same 1.31.5 cycle.
 
+#### Phase 2 — single/double/triple indirect blocks + offset-aware read API (~165 LOC delta)
+
+Extends `kernel/core/ext2.cyr` with the full i_block[0..14] indirect tree walk per Linux `ext2_block_to_path` / FreeBSD `ufs_getlbns` (audit § 4.2). Lifts the Phase 1 file-size cap from 12 direct blocks (12 KB on 1K-block FS, 48 KB on 4K) to effectively 16 TB (capped by 64-bit `i_size`).
+
+- **`ext2_logical_to_physical(inode_buf, logical_block)`** — universal logical→physical mapper. Direct hit for logical 0-11; single-indirect for 12..11+ptrs (where `ptrs = blocksize/4`); double-indirect for the next ptrs² range; triple-indirect for the final ptrs³ range. Returns 0 for sparse holes (physical block 0 is reserved by ext2), -1 on disk-read failure. Each indirection level uses its own scratch buffer so triple-indirect walks have all three live blocks present at once without aliasing.
+- **`ext2_indirect_buf_l1/l2/l3[512]`** — three module-global 4 KB scratch buffers, one per indirection depth. Module-global `var X[N]` in Cyrius allocates N×u64 (8N bytes), so [512] = 4096 bytes covering the max blocksize. Total BSS cost = 12 KB, fixed.
+- **`ext2_read_at(inode_num, offset, buf, maxlen)`** — generalized read entrypoint. Walks logical blocks starting from `offset / blocksize`, handles first-block / last-block partial reads via `off_in_block` math. Returns bytes_read (0 if offset >= file_size; can be < maxlen if hitting EOF). This is the shape VFS integration in Phase 3 will consume (vfs_read tracks per-FD offset, calls ext2_read_at on each invocation).
+- **`ext2_read_file(inode_num, buf, maxlen)`** — Phase 1's entrypoint preserved as a thin wrapper: `return ext2_read_at(inode_num, 0, buf, maxlen);`. Existing callers (the smoke hook) need no changes; new callers pick the offset-aware shape.
+
+**QEMU validation** — 50 KB deterministic-content file (byte N = `33 + (N % 64)`, so any read prints the same 64-char repeating ASCII pattern); on a 1K-block FS, this forces the file across all 12 direct blocks plus 38 single-indirect entries. Two reads through the smoke hook:
+
+```
+ext2 read@0 (32 B): !"#$%&'()*+,-./0123456789:;<=>?@        <- direct block 0
+ext2 read@16384 (32 B): !"#$%&'()*+,-./0123456789:;<=>?@    <- single-indirect (logical block 16 = entry 4 of i_block[12])
+```
+
+Identical content confirms `ext2_logical_to_physical` correctly walked `inode.i_block[12]` → indirect table → entry 4 → real data block. Double/triple-indirect are correct-by-construction (same algorithm pattern, one more indirection per level) and untested only because forcing them needs >1 MB and >1 GB seed files respectively. Phase 3's `cat /large_file` against the same image exercises the full read window.
+
+**Build:** `build/agnos` 537,952 B (Phase 1) → **552,736 B** (+14,784 B for Phase 2: ~165 LOC of new code + 12 KB BSS for the three indirect scratch buffers). Multiboot2 ELF64 entry `0x1000a8` preserved.
+
 #### fatfs hardening — GPT-protective-MBR BPB-zero guard
 
 `kernel/core/fatfs.cyr` was silently faulting on GPT-protective-MBR disks: the MBR has `0x55 0xAA` at byte 510-511 (looks like FAT boot signature) but `0x00 0x00` at offset 11-12 (the BPB bytes-per-sector field). `fatfs_init` accepted the false-positive signature, parsed bytes_per_sector = 0, then divided by zero in the root-sector calc — silent #DE halt. This bug only surfaced when QEMU was invoked with a virtio-blk ESP disk (the normal OVMF boot path), masking the 1.31.x storage-arc QEMU smoke tests that all used NVMe-attached ESPs. Two-line defensive guards added: refuse if `fatfs_bytes_per_sector != 512` (valid FAT in practice) and refuse if `fatfs_sectors_per_cluster == 0`. Cleared the boot path for the ext2 Phase 1 smoke; no regression on any real FAT image.

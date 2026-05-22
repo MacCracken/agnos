@@ -406,20 +406,36 @@ kprintln("VFS initialized", 15);
 # ext2-ext4-extents-prior-art.md.
 ext2_init();
 
-# === ext2 Phase 1 read smoke (temporary, drop when Phase 3 wires `cat`) ===
-# Reads inode 12 (hello.txt typical on mkfs.ext2 -d /seed) and prints first
-# 80 bytes as ASCII. Silent if ext2 not mounted or inode 12 isn't a regular
-# file (common on disks without our seed file).
+# === ext2 Phase 1+2 read smoke (temporary, drop when Phase 3 wires `cat`) ===
+# Reads inode 12 (first regular file slot; mkfs.ext2 -d /seed places hello.txt
+# there) at two offsets: byte 0 (direct-block path) and byte 16384 (single-
+# indirect path on a 1K-block FS, since 16K > 12 direct blocks × 1K). Each
+# read prints up to 32 ASCII bytes. Silent if ext2 not mounted or inode 12
+# absent. The byte at offset N in the seed file is `33 + (N % 64)` so any
+# read offset prints a deterministic ASCII string we can eyeball-validate.
 if (ext2_active == 1) {
     var ext2_smoke_buf[128];
-    var n_read = ext2_read_file(12, &ext2_smoke_buf, 80);
-    if (n_read > 0) {
-        kprint("ext2 smoke (inode 12, ", 22);
-        kprint_num(n_read);
-        kprint(" bytes): ", 9);
-        for (var i = 0; i < n_read; i = i + 1) {
+
+    var n0 = ext2_read_at(12, 0, &ext2_smoke_buf, 32);
+    if (n0 > 0) {
+        kprint("ext2 read@0 (", 13);
+        kprint_num(n0);
+        kprint(" B): ", 5);
+        for (var i = 0; i < n0; i = i + 1) {
             serial_putc(load8(&ext2_smoke_buf + i));
         }
+        kprintln("", 0);
+    }
+
+    var n1 = ext2_read_at(12, 16384, &ext2_smoke_buf, 32);
+    if (n1 > 0) {
+        kprint("ext2 read@16384 (", 17);
+        kprint_num(n1);
+        kprint(" B): ", 5);
+        for (var i = 0; i < n1; i = i + 1) {
+            serial_putc(load8(&ext2_smoke_buf + i));
+        }
+        kprintln("", 0);
     }
 }
 
