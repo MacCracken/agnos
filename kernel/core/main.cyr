@@ -652,7 +652,7 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
 # it in QEMU and real LANs serve it on iron. On failure, net_init's
 # pre-set fallback (10.0.2.15 / 10.0.2.2 / 255.255.255.0) stays in
 # place, so the kernel still has a workable address.
-if (vnet_active != 0) {
+if (vnet_active != 0 || nic_ready() != 0) {
     dhcp_init();
 }
 

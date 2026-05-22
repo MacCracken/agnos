@@ -7,6 +7,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.32.0] — 2026-05-22
 
+### Networking arc — bite B Phase 5 (pre-burn audit): `r8169-iron-burn-audit.md` landed
+
+Per [[feedback_iron_burns_block_other_work]] — every iron-burn proposal carries a written line-by-line audit FIRST. The audit for Attempt 92+ landed at [`agnosticos/docs/development/r8169-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/r8169-iron-burn-audit.md). 9 sections mirroring the prior storage-arc audits (`ahci-iron-burn-audit.md` / `usb-ms-iron-burn-audit.md` / `ext2-iron-burn-audit.md`):
+
+1. Scope — Phases 1-4 in one burn + retroactive validation of bites A/F/G via real-iron (SLIRP out of the loop).
+2. Coverage matrix — what each Phase delivers.
+3. Hypothesis ranking — 9 hypotheses (H1-H9) ranked by iron-specific risk; HIGH = H1 (PHY not configured → link absent → RX/TX silent but Phase 1-3 probe lines correct); MEDIUM = H2 (chip-revision reset quirk) / H7-H8 (TX or RX OWN never clears); LOW = H3-H6 / H9. Each hypothesis carries a triage column.
+4. What NOT to do — no MSI / chip-rev dispatch / ASPM / jumbo / RX-csum-offload / VLAN / IRQ-driven / i225-V bundling / extra instrumentation / PHY init.
+5. Success rubric — Full PASS (6 r8169 lines + DHCP ACK if cabled + bite-A accept-success), Partial (H1/H3/H7/H8 outcomes), Falsified (boot doesn't reach shell — H2/H6/H9).
+6. Mitigations in code (recap).
+7. No CMOS stamps reserved for this burn (boot log is FB-visible; no hang risk in current code; budget reserved for harder-to-diagnose Phase 6+ work).
+8. Multi-source prior art table — primary ref + cross-validation refs per primitive.
+9. Audit disposition — ready to burn; iron-burn checklist for user; pass/partial/falsified next-document handoff.
+
+**Iron-burn checklist (for the user at burn time)**:
+
+1. Confirm `agnos/build/agnos` is current (600,432 B production / 600,520 B with TCP_LISTEN_SMOKE).
+2. `sh scripts/install-usb.sh --update` from agnosticos repo root.
+3. (Optional) Connect Ethernet cable to archaemenid's onboard NIC for full validation.
+4. Boot archaemenid from USB.
+5. Capture boot-log photo.
+6. Classify per § 5 rubric.
+
+This audit completes bite B's code authoring side. Attempt 92+ iron burn is the final cycle item; on PASS it closes bite B + retroactively closes the bite A scenario-1 + bite G OFFER timeout deferrals.
+
 ### Networking arc — bite B Phases 2 + 3 + 4: r8169 RX/TX rings + NIC dispatcher (code complete)
 
 Phase 2 (RX descriptor ring + per-buffer pages + poll), Phase 3 (TX descriptor ring + send), Phase 4 (NIC dispatcher in r8169.cyr + net.cyr migration). All three landed in the same cut — none individually need iron between them; Phase 5 iron-burn validates the bundle. Multi-source convergent per `agnosticos/docs/development/network-arc-prior-art.md` § 1.4.
