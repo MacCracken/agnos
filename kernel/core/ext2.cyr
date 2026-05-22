@@ -43,6 +43,13 @@ var ext2_indirect_buf_l1[512];  # single-indirect level (i_block[12] → here)
 var ext2_indirect_buf_l2[512];  # double-indirect level 2 (i_block[13] → l1 → here)
 var ext2_indirect_buf_l3[512];  # triple-indirect level 3 (i_block[14] → l1 → l2 → here)
 
+# Phase 4 extent-walk scratch buffer — single buffer reused per descent
+# level. Safe because the extent walk is "pick from current level, read
+# next-level block, repeat": once we've picked from a level, we never
+# need its data again. Cap MAX_EXTENT_DEPTH at 5 per Linux convention
+# (audit § 5.3). 4 KB BSS.
+var ext2_extent_buf[512];
+
 # --- Endian-aware byte helpers (ext2/ext4 is little-endian on disk) -
 
 fn ext2_load16_le(ptr, off) {
@@ -131,11 +138,13 @@ fn ext2_init() {
     # Magic matched — from here on, log loudly: ext2 is the FS, and any
     # failure deserves an explanation.
 
-    # Feature gate. Phase 1-3 supports only: FILETYPE (0x2) + RECOVER
-    # (0x4) + MMP (0x100) + FLEX_BG (0x200) + EA_INODE (0x400) +
-    # CSUM_SEED (0x2000) + LARGEDIR (0x4000) = 0x6706. Anything else
-    # in the incompat field aborts mount.
-    var supported_mask = 0x6706;
+    # Feature gate. Phase 1-3 mask was 0x6706 (FILETYPE | RECOVER | MMP
+    # | FLEX_BG | EA_INODE | CSUM_SEED | LARGEDIR). Phase 4 adds EXTENTS
+    # (0x0040) → 0x6746 so mkfs.ext4 -O extents mounts succeed; the
+    # actual extent-walk dispatch happens per-inode via i_flags &
+    # EXT4_EXTENTS_FL, not at mount time. Inodes that aren't extents-
+    # encoded keep using the indirect-tree walker transparently.
+    var supported_mask = 0x6746;
     var incompat = ext2_sb_feature_incompat(&ext2_sb_buf);
     var unsupported = incompat & (0xFFFFFFFF ^ supported_mask);
     if (unsupported != 0) {
@@ -280,13 +289,144 @@ fn ext2_get_inode(inode_num, out_buf) {
     return 0;
 }
 
-# --- Logical → physical block mapping (Phase 2 — indirect tree walk) --
+# --- ext4 extent walker (Phase 4) -------------------------------------
 #
-# Maps a logical block# within a file (0 = first 4 KB chunk, 1 = second,
-# ...) to the physical FS block# that holds it. Walks the i_block[0..14]
-# tree per Linux ext2_block_to_path / FreeBSD ufs_getlbns shape (audit
-# § 4.2):
+# Resolves a logical block# via the ext4 extent tree (used when an inode
+# has i_flags & EXT4_EXTENTS_FL = 0x80000). Algorithm shape per FreeBSD
+# `ext4_ext_find_extent` (audit § 5.3) — cleanest standalone RO reference;
+# Linux's `extents.c` is tangled with delayed-allocation write paths.
 #
+# Tree shape (all structures 12 bytes, packed, little-endian):
+#   ext4_extent_header:  eh_magic(2)=0xF30A | eh_entries(2) | eh_max(2)
+#                        | eh_depth(2) | eh_generation(4)
+#   ext4_extent       :  ee_block(4) | ee_len(2) | ee_start_hi(2) | ee_start_lo(4)
+#   ext4_extent_idx   :  ei_block(4) | ei_leaf_lo(4) | ei_leaf_hi(2) | ei_unused(2)
+#
+# Root (when EXTENTS_FL set): bytes 0..11 of inode.i_block[] are the
+# header; bytes 12..59 hold 4 × 12-byte entries (leaf entries if
+# depth==0, index entries if depth>0).
+#
+# Returns physical block#, 0 for sparse hole / unwritten extent (caller
+# zero-fills), -1 on error.
+
+fn ext2_extent_header_validate(hdr) {
+    var magic = ext2_load16_le(hdr, 0);
+    if (magic != 0xF30A) { return 0; }
+    var entries = ext2_load16_le(hdr, 2);
+    var max     = ext2_load16_le(hdr, 4);
+    if (entries > max) { return 0; }
+    return 1;
+}
+
+fn ext2_extent_logical_to_physical(inode_buf, logical_block) {
+    # The root header lives embedded in i_block[0..11] (inode_buf + 40).
+    var hdr = inode_buf + 40;
+    if (ext2_extent_header_validate(hdr) == 0) {
+        kprintln("ext2: extent root: bad magic / entries", 38);
+        return 0 - 1;
+    }
+
+    var depth = ext2_load16_le(hdr, 6);
+    if (depth > 5) {
+        kprintln("ext2: extent depth > 5 unsupported", 34);
+        return 0 - 1;
+    }
+
+    # Walk index nodes from root depth down to leaf (depth==0).
+    # At each level, find the LARGEST ei_block <= logical_block, follow
+    # ei_leaf_hi:lo to the next-level block, read it into scratch.
+    # The root walks against i_block[]; subsequent levels walk against
+    # ext2_extent_buf.
+    var current_hdr = hdr;
+    var entries_off = 12;   # entries start after the 12-byte header
+
+    while (depth > 0) {
+        var entries = ext2_load16_le(current_hdr, 2);
+        if (entries == 0) { return 0; }   # empty tree — sparse
+
+        # Linear scan: at the root, max is 4 (60 - 12 = 48 / 12 = 4);
+        # at deeper blocks, max is (blocksize - 12) / 12, fine to scan
+        # linearly given small N per level. Find the LARGEST ei_block <=
+        # target; that's the entry whose subtree covers logical_block.
+        var pick_idx  = 0 - 1;
+        var prev_block = 0;
+        for (var i = 0; i < entries; i = i + 1) {
+            var entry = current_hdr + entries_off + i * 12;
+            var ei_block = ext2_load32_le(entry, 0);
+            if (ei_block <= logical_block) {
+                pick_idx   = i;
+                prev_block = ei_block;
+            } else {
+                break;   # entries are sorted ascending by ei_block
+            }
+        }
+        if (pick_idx < 0) { return 0; }   # logical_block before first entry — sparse
+
+        var pick = current_hdr + entries_off + pick_idx * 12;
+        var leaf_lo = ext2_load32_le(pick, 4);
+        var leaf_hi = ext2_load16_le(pick, 8);
+        # Note (audit § 5.4): Linux uses `<< 31 << 1` to defend against
+        # u32 ext4_fsblk_t builds where `<< 32` is UB. Cyrius u64 is
+        # unambiguous so `<< 32` is fine here.
+        var next_phys = leaf_lo | (leaf_hi << 32);
+        if (next_phys == 0) { return 0; }   # sparse hole
+
+        if (ext2_read_block(next_phys, &ext2_extent_buf) != 0) { return 0 - 1; }
+
+        # Re-validate the new level's header.
+        if (ext2_extent_header_validate(&ext2_extent_buf) == 0) {
+            kprintln("ext2: extent internal: bad magic", 32);
+            return 0 - 1;
+        }
+        var new_depth = ext2_load16_le(&ext2_extent_buf, 6);
+        if (new_depth != depth - 1) {
+            kprintln("ext2: extent depth mismatch", 27);
+            return 0 - 1;
+        }
+        current_hdr = &ext2_extent_buf;
+        depth = new_depth;
+    }
+
+    # Leaf: find ext4_extent where ee_block <= logical_block <
+    # ee_block + actual_len.
+    var leaf_entries = ext2_load16_le(current_hdr, 2);
+    if (leaf_entries == 0) { return 0; }
+
+    for (var i = 0; i < leaf_entries; i = i + 1) {
+        var entry = current_hdr + entries_off + i * 12;
+        var ee_block    = ext2_load32_le(entry, 0);
+        var ee_len_raw  = ext2_load16_le(entry, 4);
+        var ee_start_hi = ext2_load16_le(entry, 6);
+        var ee_start_lo = ext2_load32_le(entry, 8);
+
+        # ee_len > 32768 means unwritten extent (audit § 5.5). actual_len
+        # = ee_len - 32768; physical blocks ARE allocated but content
+        # undefined → zero-fill at caller (we return 0 to signal sparse).
+        var unwritten = 0;
+        var actual_len = ee_len_raw;
+        if (ee_len_raw > 0x8000) {
+            unwritten  = 1;
+            actual_len = ee_len_raw - 0x8000;
+        }
+
+        if (logical_block < ee_block) { return 0; }   # before first → sparse
+        if (logical_block >= ee_block + actual_len) { continue; }   # past this extent
+
+        if (unwritten == 1) { return 0; }   # zero-fill at caller
+
+        var phys_start = ee_start_lo | (ee_start_hi << 32);
+        return phys_start + (logical_block - ee_block);
+    }
+    return 0;   # past all leaf entries → sparse / EOF
+}
+
+# --- Logical → physical block mapping (Phase 2 indirect + Phase 4 extents) --
+#
+# Maps a logical block# within a file to the physical FS block#. Dispatch:
+#   - if inode.i_flags & EXT4_EXTENTS_FL (0x80000) → ext4 extent walker
+#   - else → ext2 indirect-tree walker (i_block[0..14])
+#
+# The ext2 indirect tree (audit § 4.2):
 #   i_block[0..11]   12 direct block pointers       (logical 0..11)
 #   i_block[12]      single-indirect → ptrs entries (logical 12..11+ptrs)
 #   i_block[13]      double-indirect (two levels)
@@ -298,6 +438,13 @@ fn ext2_get_inode(inode_num, out_buf) {
 # allocated extent; -1 on disk-read failure.
 
 fn ext2_logical_to_physical(inode_buf, logical_block) {
+    # Phase 4 dispatch: ext4 extents inodes take a different code path
+    # (Linux switched ext4 to extents as the default in 2008).
+    var flags = ext2_inode_flags(inode_buf);
+    if ((flags & 0x80000) != 0) {
+        return ext2_extent_logical_to_physical(inode_buf, logical_block);
+    }
+
     var ptrs = ext2_blocksize / 4;   # entries per indirect block
 
     # --- Direct (logical 0..11) ---
@@ -376,21 +523,16 @@ fn ext2_read_at(inode_num, offset, buf, maxlen) {
         return 0 - 1;
     }
 
-    # Refuse non-regular files (Phase 1-2 scope is regular file content
-    # reads; dirs / symlinks / specials handled by later phases).
+    # Refuse non-regular files (read paths handle regular file content
+    # only; dirs use ext2_print_dir / ext2_dir_lookup; symlinks deferred).
     var mode = ext2_inode_mode(&ext2_inode_buf);
     var ftype = mode & 0xF000;
     if (ftype != 0x8000) {
         kprintln("ext2: ext2_read_at on non-regular inode", 39);
         return 0 - 1;
     }
-
-    # Refuse ext4 extents in Phase 1-2 (Phase 4 unlock).
-    var flags = ext2_inode_flags(&ext2_inode_buf);
-    if ((flags & 0x80000) != 0) {
-        kprintln("ext2: ext4 EXTENTS_FL inode (Phase 4 unlock)", 44);
-        return 0 - 1;
-    }
+    # Phase 4: ext4 EXTENTS_FL inodes ARE supported (dispatch in
+    # ext2_logical_to_physical). No refusal here.
 
     # Effective read window = min(file_size - offset, maxlen).
     var file_size = ext2_inode_filesize(&ext2_inode_buf);
@@ -651,16 +793,13 @@ fn ext2_open(path, path_len) {
 
     if (ext2_get_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
 
-    # Only allow opening regular files via VFS_EXT2_FILE. Dirs need ls
-    # (ext2_print_dir); other types not supported in Phase 3.
+    # Only allow opening regular files via VFS_EXT2_FILE. Dirs use the
+    # ext2_print_dir path (no VFS fd needed for ls); other types deferred.
+    # Phase 4: ext4 EXTENTS_FL inodes are fine here — ext2_read_at via
+    # the VFS dispatch arm uses ext2_logical_to_physical, which routes
+    # extents inodes through the extent walker transparently.
     var mode = ext2_inode_mode(&ext2_inode_buf);
     if ((mode & 0xF000) != 0x8000) { return 0 - 1; }
-
-    var flags = ext2_inode_flags(&ext2_inode_buf);
-    if ((flags & 0x80000) != 0) {
-        # ext4 extents — Phase 4 unlock. ext2_read_at will refuse too.
-        return 0 - 1;
-    }
 
     var fsize = ext2_inode_filesize(&ext2_inode_buf);
 

@@ -101,6 +101,42 @@ The four entries in `/` decoded byte-exact (`.` + `..` + `lost+found` + `hello.t
 
 **Out of scope (Phase 4 territory):** ext4 extents header + leaf walker. Phase 3 refuses inodes with `i_flags & EXTENTS_FL` at both `ext2_open` and `ext2_read_at`, so an ext4 mkfs'd image will fail cleanly with the "Phase 4 unlock" log line. Phase 4 (~250 LOC) detects EXTENTS in `s_feature_incompat`, expands the supported-incompat mask to `0x6746`, adds the FreeBSD-shape extent walker, and unlocks `mount /dev/nvme0p2` + `ls /` against real Linux ext4 root partitions on iron.
 
+#### Phase 4 — ext4 extents header + leaf walker (~210 LOC delta to `kernel/core/ext2.cyr`)
+
+The cycle's payoff phase for iron: ext4 (Linux's default since ~2008) stores file layouts as extent trees instead of the ext2 indirect tree. Phase 4 detects and walks them transparently behind the existing `ext2_logical_to_physical` dispatch point — every Phase 1-3 consumer (ext2_read_at / vfs_read / ext2_open / ext2_print_dir / ext2_path_lookup) inherits ext4 support with zero call-site changes.
+
+- **Supported-incompat mask `0x6706 → 0x6746`** — adds `EXTENTS` bit `0x0040`. mkfs.ext4 -O extents images now mount; non-extents-encoded inodes within them keep using the indirect walker transparently.
+- **`ext2_extent_header_validate(hdr)`** — checks `eh_magic == 0xF30A` and `eh_entries <= eh_max`. Runs at the root header (embedded in `inode.i_block[0..11]`) and at every internal-node block before trusting the entry array.
+- **`ext2_extent_logical_to_physical(inode_buf, logical_block)`** — FreeBSD `ext4_ext_find_extent` shape per audit § 5.3 (Linux's `extents.c` is tangled with delayed-allocation write paths; the BSD impl is the cleanest standalone RO reference). Walks index nodes top-down: at each level, linear-scan the entries (max 4 at root, `(blocksize-12)/12` at deeper levels) to find the largest `ei_block <= logical_block`, then follow `(ei_leaf_hi << 32) | ei_leaf_lo` to the next-level block. Re-validates the header at each level and asserts `eh_depth` decreases monotonically. At the leaf, locates the `ext4_extent` covering `logical_block` and returns `(ee_start_hi << 32) | ee_start_lo + (logical_block - ee_block)`.
+- **`ext2_extent_buf[512]`** — single 4 KB module-global scratch buffer reused per descent level. Safe because the walk is "pick from current level, read next-level block, repeat" — once we've picked the next-level pointer from the current header, we never need that level's data again. 4 KB BSS.
+- **Unwritten-extent handling (audit § 5.5)** — `ee_len > 0x8000` flags an "unwritten" extent: physical blocks allocated, content undefined. Correct semantics is zero-fill at the caller, NEVER `blk_read` (would return disk garbage). The walker returns 0 (sparse signal) for unwritten extents; `ext2_read_at`'s existing sparse-hole code path zero-fills the buffer.
+- **48-bit shift trap (audit § 5.4)** — Linux uses `<< 31 << 1` rather than `<< 32` in its accessor because `ext4_fsblk_t` is conditionally `u32`/`u64`. Cyrius `u64` is unambiguous so `<< 32` is safe here. Comment in the walker notes this for future 32-bit Cyrius backend ports (RISC-V rv32, etc.).
+- **EXTENTS_FL refusals lifted** — `ext2_read_at` and `ext2_open` no longer refuse `i_flags & 0x80000`. Dispatch happens inside `ext2_logical_to_physical`, so consumers don't need to know which encoding they're traversing.
+- **MAX_EXTENT_DEPTH = 5** per Linux convention. Trees deeper than 5 abort with a log line (realistic ext4 trees are depth 0-2 even for huge files; depth 5 covers files into the PB range).
+
+**QEMU validation — both ext2 and ext4 images work simultaneously through the same code path:**
+
+```sh
+# ext4 image with extents enabled, kept within our supported-mask
+mkfs.ext4 -F -O extents,^huge_file,^64bit,^metadata_csum -d /tmp/ext2-seed /tmp/ext4-smoke.img
+```
+
+ext4 image boot log shows all the same Phase 1-3 surfaces working — through the extent walker on `hello.txt` (which has `i_flags=0x80000`):
+
+```
+ext2: mounted (blocksize=1024, inode_size=256, inodes_per_group=2048)
+ext2 ls /: ./ ../ lost+found/ hello.txt
+ext2 cat /hello.txt (first 32 B via VFS): !"#$%&'()*+,-./0123456789:;<=>?@
+```
+
+Original ext2 image (no extents, indirect tree) continues byte-exact in the same run — no regression. The dispatch correctly routes indirect-encoded inodes through `ext2_indirect_buf_l1/l2/l3` and extents-encoded inodes through `ext2_extent_buf`, with no cross-walker state contamination.
+
+**Build:** `build/agnos` 562,872 B (Phase 3) → **568,960 B** (+6,088 B for Phase 4: ~210 LOC + 4 KB BSS for `ext2_extent_buf`). Multiboot2 ELF64 entry `0x1000a8` preserved. Total ext2/ext4 driver from 1.31.4 baseline: **+48,040 B / ~47 KB** for ~870 LOC of filesystem code across 4 phases.
+
+**Iron path forward:** archaemenid's NVMe Linux-FS partition (LBA 2099200-3907026943, ~1.86 TB, currently logged as "(unknown type)" by GPT Phase 3) is now mountable IF the host filesystem doesn't set incompat bits outside our `0x6746` mask. The audit § 6 + § 8 risk: modern `mkfs.ext4` defaults often include `EXT4_FEATURE_INCOMPAT_64BIT` (0x80) and `EXT4_FEATURE_RO_COMPAT_HUGE_FILE` (HUGE_FILE alone is fine; 64BIT alters BGDT entry size 32 → 64 + block# width 32 → 64 — significant rework). Pre-iron-burn derisk: `sudo tune2fs -l /dev/nvme0n1p2 | grep 'Filesystem features'` on the Linux side. If `64bit` is in the list, a Phase 5 cycle (~200 LOC for 64BIT BGDT + block# widening) is needed before iron `ls /` works against the real root partition. If not, Phase 4 closes the iron `ls` story cleanly.
+
+**Out of scope (deferred):** 64BIT support, META_BG (alternative BGDT placement), INLINE_DATA (file contents inline in i_block/xattrs), HTREE indexed directories (linear scan suffices for read), fast/slow symlinks, write paths. Audit § 1 + § 6 documents the full triage for each.
+
 #### fatfs hardening — GPT-protective-MBR BPB-zero guard
 
 `kernel/core/fatfs.cyr` was silently faulting on GPT-protective-MBR disks: the MBR has `0x55 0xAA` at byte 510-511 (looks like FAT boot signature) but `0x00 0x00` at offset 11-12 (the BPB bytes-per-sector field). `fatfs_init` accepted the false-positive signature, parsed bytes_per_sector = 0, then divided by zero in the root-sector calc — silent #DE halt. This bug only surfaced when QEMU was invoked with a virtio-blk ESP disk (the normal OVMF boot path), masking the 1.31.x storage-arc QEMU smoke tests that all used NVMe-attached ESPs. Two-line defensive guards added: refuse if `fatfs_bytes_per_sector != 512` (valid FAT in practice) and refuse if `fatfs_sectors_per_cluster == 0`. Cleared the boot path for the ext2 Phase 1 smoke; no regression on any real FAT image.
