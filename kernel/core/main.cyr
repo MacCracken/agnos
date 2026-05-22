@@ -271,6 +271,9 @@ if (pci_find(0x1AF4, 0x1000) >= 0) {
         kprintln("", 0);
         net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
         kprintln("Net: 10.0.2.15/24 gw 10.0.2.2", 30);
+        # TCP_LISTEN_SMOKE hook runs LATER (post-interrupt-enable, just
+        # before kybernet launch) so arch_wait() actually waits instead
+        # of HLT-hanging on no-IRQ. See the gated block ~line 660.
     }
 }
 if ((pci_find(0x1AF4, 0x1042) >= 0) | (pci_find(0x1AF4, 0x1001) >= 0)) {
@@ -623,6 +626,64 @@ if (exec_pid >= 0) {
 }
 # CMOS CP 0x14: post-userland-exec test (spawn done, exec_and_wait still bypassed)
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
+#endif
+
+# TCP listen-accept smoke (1.32.0 bite A). Build-flag-gated so production
+# boots don't bind a port. With TCP_LISTEN_SMOKE=1: listen on 8080, poll
+# briefly for one incoming connection, on accept send a banner + close.
+# Pairs with scripts/tcp-listen-smoke.sh's host-side TCP probe.
+# Placed post-interrupt-enable so arch_wait() (= HLT) actually waits for
+# a timer tick rather than hanging on no-IRQ. Pre-kybernet so the test
+# completes before the shell loop swallows the boot serial.
+#ifdef TCP_LISTEN_SMOKE
+# TCP server-side smoke (1.32.0 bite A). Validates that:
+#   - tcp_listen(port) allocates a LISTEN slot
+#   - the listener doesn't spuriously accept on quiet wire
+#   - if SLIRP delivers a SYN, the passive-open path + SYN_RCVD branch
+#     transition the conn to ESTABLISHED and tcp_accept() returns it
+#
+# Note (1.32.0 cycle-open): the "accept-success" scenario in
+# scripts/tcp-listen-smoke.sh currently fails because QEMU SLIRP isn't
+# delivering inbound TCP to the guest NIC under this kernel's hostfwd
+# config. Listener-functional + no-spurious-accept (scenario 2) DOES
+# pass, validating the kernel-side LISTEN/tcp_listen/timeout path.
+# The accept-success surface is deferred to either (a) a deeper SLIRP
+# debug session OR (b) iron testing once a real-NIC driver lands in a
+# later bite. Either path validates the same code; this smoke is the
+# kernel-side regression net, not the load-bearing test.
+{
+    kprintln("tcp_listen smoke: start", 23);
+    # Gratuitous ARP so SLIRP learns our MAC (needed for inbound hostfwd
+    # delivery; doesn't fully fix SLIRP forwarding but doesn't hurt).
+    arp_request(net_ip);
+    var lid = tcp_listen(8080);
+    kprint("tcp_listen(8080) lid=", 21);
+    kprint_num(lid);
+    kprintln("", 0);
+    if (lid >= 0) {
+        var got = 0;
+        # ~8s wait window. Timer-tick anchored for portability.
+        var start_tick = timer_ticks;
+        while ((timer_ticks - start_tick) < 800) {
+            net_poll();
+            var c = tcp_accept(lid);
+            if (c >= 0) {
+                kprint("tcp_accept: conn_id=", 20);
+                kprint_num(c);
+                kprintln("", 0);
+                tcp_send(c, "AGNOS 1.32.0 tcp_listen smoke\n", 30);
+                tcp_close(c);
+                got = 1;
+                break;
+            }
+            arch_wait();
+        }
+        if (got == 0) {
+            kprintln("tcp_listen smoke: no connection within timeout", 46);
+        }
+    }
+    kprintln("tcp_listen smoke: done", 22);
+}
 #endif
 
 # Launch kybernet (PID 1) — enters the shell loop, which reads scancodes

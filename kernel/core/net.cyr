@@ -126,7 +126,7 @@ fn net_copy_buf(dst, src, len) {
 
 fn net_handle_arp(pkt, len) {
     # ARP: eth header (14) + ARP payload
-    # Check operation: offset 14+6 = reply (2)
+    # Check operation: offset 14+6
     if (len < 42) { return 0; }
     var oper = load8(pkt + 20) * 256 + load8(pkt + 21);
     if (oper == 2) {
@@ -138,6 +138,36 @@ fn net_handle_arp(pkt, len) {
         arp_cache_ip = sender_ip;
         net_copy_buf(&arp_cache_mac, pkt + 22, 6);
         arp_pending_ip = 0;  # Request fulfilled
+    }
+    if (oper == 1) {
+        # ARP request — reply if it's asking for our IP. Without this,
+        # SLIRP (or any peer) can't deliver inbound TCP because they
+        # don't know our MAC. (1.32.0 bite A — needed for tcp_listen.)
+        # target IP at pkt+38 (eth14 + arp24)
+        var target_ip = (load8(pkt + 38) << 24) | (load8(pkt + 39) << 16) | (load8(pkt + 40) << 8) | load8(pkt + 41);
+        if (target_ip != net_ip) { return 0; }
+        # Build reply: swap sender/target, oper=2, our MAC as sender HW.
+        if (vnet_active == 0) { return 0; }
+        var requester_mac[8];
+        var requester_ip = (load8(pkt + 28) << 24) | (load8(pkt + 29) << 16) | (load8(pkt + 30) << 8) | load8(pkt + 31);
+        net_copy_buf(&requester_mac, pkt + 22, 6);
+        var p = &net_pkt;
+        var off = eth_build(p, &requester_mac, &vnet_mac, 0x0806);
+        store16(p + off, 0x0001);                # htype=eth
+        store16(p + off + 2, 0x0800);            # ptype=ipv4
+        store8(p + off + 4, 6); store8(p + off + 5, 4);
+        store16(p + off + 6, 0x0002);            # oper=reply
+        memcpy(p + off + 8, &vnet_mac, 6);       # sender HW = us
+        store8(p + off + 14, (net_ip >> 24) & 0xFF);
+        store8(p + off + 15, (net_ip >> 16) & 0xFF);
+        store8(p + off + 16, (net_ip >> 8) & 0xFF);
+        store8(p + off + 17, net_ip & 0xFF);
+        memcpy(p + off + 18, &requester_mac, 6); # target HW = requester
+        store8(p + off + 24, (requester_ip >> 24) & 0xFF);
+        store8(p + off + 25, (requester_ip >> 16) & 0xFF);
+        store8(p + off + 26, (requester_ip >> 8) & 0xFF);
+        store8(p + off + 27, requester_ip & 0xFF);
+        virtio_net_send(p, off + 28);
     }
     return 0;
 }
@@ -202,18 +232,41 @@ fn net_recv_udp(buf, maxlen) {
 }
 
 # === TCP Stack ===
-# States: 0=CLOSED, 1=SYN_SENT, 2=ESTABLISHED, 3=FIN_WAIT, 4=CLOSE_WAIT
+# States: 0=CLOSED, 1=SYN_SENT, 2=ESTABLISHED, 3=FIN_WAIT, 4=CLOSE_WAIT,
+#         5=LISTEN, 6=SYN_RCVD  (added 1.32.0 bite A — server-side TCP)
 # Connection table: 8 entries, each 80 bytes:
 #   offset 0:  state (8 bytes)
-#   offset 8:  src_port (8 bytes)
-#   offset 16: dst_port (8 bytes)
-#   offset 24: dst_ip (8 bytes)
+#   offset 8:  src_port (8 bytes)    - on LISTEN: the listening port
+#   offset 16: dst_port (8 bytes)    - on LISTEN: 0 (wildcard)
+#   offset 24: dst_ip (8 bytes)      - on LISTEN: 0 (wildcard)
 #   offset 32: seq_num (8 bytes)
 #   offset 40: ack_num (8 bytes)
 #   offset 48: rx_buf pointer (8 bytes)
 #   offset 56: rx_buf_len (8 bytes)
 #   offset 64: rx_buf_head (8 bytes)  - write position
-#   offset 72: flags (8 bytes) - last received flags
+#   offset 72: flags (8 bytes) - meta packed in upper bits:
+#     bits 0-7:   last received TCP flags byte (existing use)
+#     bit 8:      is_listening (set on LISTEN entries)
+#     bit 9:      passive_open (set on conns spawned from a LISTEN)
+#     bit 10:     accepted (set when tcp_accept returned this conn to caller)
+#     bits 16-23: parent_listen_id (only meaningful when bit 9 is set)
+
+# State constants (kept in this file as `var` globals; the existing state
+# branches use bare integer literals for historical reasons. New code paths
+# should reference these names.)
+var TCP_STATE_CLOSED = 0;
+var TCP_STATE_SYN_SENT = 1;
+var TCP_STATE_ESTAB = 2;
+var TCP_STATE_FIN_WAIT = 3;
+var TCP_STATE_CLOSE_WAIT = 4;
+var TCP_STATE_LISTEN = 5;
+var TCP_STATE_SYN_RCVD = 6;
+
+# Flag-field metadata bit positions (in the offset-72 u64 field)
+var TCP_FLAG_IS_LISTENING = 0x100;   # bit 8
+var TCP_FLAG_PASSIVE_OPEN = 0x200;   # bit 9
+var TCP_FLAG_ACCEPTED     = 0x400;   # bit 10
+# parent_listen_id occupies bits 16-23 — see tcp_meta_set_parent / tcp_meta_get_parent
 
 var tcp_conns[640];  # 8 connections x 80 bytes each
 var tcp_conn_count = 0;
@@ -407,6 +460,73 @@ fn tcp_close(conn_id) {
     return 0;
 }
 
+# === Server-side TCP (1.32.0 bite A) ===
+
+fn tcp_find_listen(listen_port) {
+    # Scan conn table for state == LISTEN entries with src_port matching the
+    # given local-listening-port. Returns conn_id or -1.
+    for (var i = 0; i < tcp_conn_count; i = i + 1) {
+        var cb = tcp_conn_base(i);
+        if (load64(cb) == 5) {
+            if (load64(cb + 8) == listen_port) {
+                return i;
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+fn tcp_listen(port) {
+    # Refuse duplicate-bind: already-listening on this port → return -1.
+    if (tcp_find_listen(port) >= 0) { return 0 - 1; }
+    if (tcp_conn_count >= 8) { return 0 - 1; }
+    var conn_id = tcp_conn_count;
+    tcp_conn_count = tcp_conn_count + 1;
+    var cb = tcp_conn_base(conn_id);
+    store64(cb, 5);             # state = LISTEN
+    store64(cb + 8, port);      # src_port = listening port
+    store64(cb + 16, 0);        # dst_port = wildcard
+    store64(cb + 24, 0);        # dst_ip = wildcard
+    store64(cb + 32, 0);        # seq_num unused on LISTEN
+    store64(cb + 40, 0);        # ack_num unused on LISTEN
+    store64(cb + 48, 0);        # rx_buf unused on LISTEN
+    store64(cb + 56, 0);        # rx_buf_len unused
+    store64(cb + 64, 0);        # rx_buf_head unused
+    store64(cb + 72, 0x100);    # flags = TCP_FLAG_IS_LISTENING
+    return conn_id;
+}
+
+fn tcp_bind(port, ip) {
+    # v1: bind+listen merged. ip arg unused (we listen on net_ip always).
+    # When a separate bind-without-listen consumer surfaces, split this.
+    return tcp_listen(port);
+}
+
+fn tcp_accept(listen_id) {
+    # Non-blocking accept: scan for ESTABLISHED conns whose parent_listen_id
+    # matches and which haven't been accepted yet. Returns conn_id or -1.
+    if (listen_id < 0) { return 0 - 1; }
+    if (listen_id >= tcp_conn_count) { return 0 - 1; }
+    var lcb = tcp_conn_base(listen_id);
+    if (load64(lcb) != 5) { return 0 - 1; }  # not a LISTEN
+    for (var i = 0; i < tcp_conn_count; i = i + 1) {
+        if (i == listen_id) { continue; }
+        var cb = tcp_conn_base(i);
+        if (load64(cb) != 2) { continue; }   # not ESTABLISHED
+        var meta = load64(cb + 72);
+        # passive_open (bit 9) set AND not yet accepted (bit 10 clear)?
+        if ((meta & 0x200) == 0) { continue; }
+        if ((meta & 0x400) != 0) { continue; }
+        # parent_listen_id (bits 16-23) match?
+        var parent = (meta >> 16) & 0xFF;
+        if (parent != listen_id) { continue; }
+        # Mark accepted and return.
+        store64(cb + 72, meta | 0x400);
+        return i;
+    }
+    return 0 - 1;
+}
+
 fn tcp_find_conn(src_port, dst_port, src_ip) {
     for (var i = 0; i < tcp_conn_count; i = i + 1) {
         var cb = tcp_conn_base(i);
@@ -439,7 +559,43 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
     if (tcp_hdr_len > ip_payload_len) { return 0; }
     var flags = load8(tcp + 13);
     var conn_id = tcp_find_conn(src_port, dst_port, src_ip);
-    if (conn_id < 0) { return 0; }
+    if (conn_id < 0) {
+        # No active conn. Try the passive-open path: incoming SYN to a
+        # LISTEN entry spawns a new SYN_RCVD conn. (1.32.0 bite A.)
+        # Only a pure SYN qualifies — SYN+ACK on an unknown 4-tuple is
+        # spurious; same for plain data/ACK/FIN.
+        if ((flags & 0x02) == 0) { return 0; }
+        if ((flags & 0x10) != 0) { return 0; }
+        var listen_id = tcp_find_listen(dst_port);
+        if (listen_id < 0) { return 0; }
+        # Allocate a new conn slot for the incoming peer.
+        if (tcp_conn_count >= 8) { return 0; }
+        var new_id = tcp_conn_count;
+        tcp_conn_count = tcp_conn_count + 1;
+        var ncb = tcp_conn_base(new_id);
+        # Per-connection RX buffer (matches active tcp_connect path).
+        var rx_buf = kmalloc(256);
+        if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0; }
+        store64(ncb, 6);                       # state = SYN_RCVD
+        store64(ncb + 8, dst_port);            # our src_port = listener's port
+        store64(ncb + 16, src_port);           # peer's port
+        store64(ncb + 24, src_ip);             # peer's IP
+        # ISN — same timer-driven random as tcp_connect.
+        var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
+        store64(ncb + 32, isn);                # our initial seq
+        store64(ncb + 40, (seq + 1) & 0xFFFFFFFF);  # ack their SYN+1
+        store64(ncb + 48, rx_buf);
+        store64(ncb + 56, 0);
+        store64(ncb + 64, 0);
+        # meta: passive_open + parent_listen_id<<16
+        var meta = 0x200 | ((listen_id & 0xFF) << 16);
+        store64(ncb + 72, meta);
+        # Send SYN+ACK (0x12).
+        tcp_send_pkt(new_id, 0x12, 0, 0);
+        # Advance seq by 1 (SYN consumes one sequence number).
+        store64(ncb + 32, (isn + 1) & 0xFFFFFFFF);
+        return 1;
+    }
     var cb = tcp_conn_base(conn_id);
     var state = load64(cb);
     var data_len = ip_payload_len - tcp_hdr_len;
@@ -461,6 +617,28 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
             # RST received
             store64(cb, 0);  # CLOSED
             return 1;
+        }
+    }
+    # SYN_RCVD: expect ACK that matches our SYN+ACK's seq+1.
+    # On match → ESTABLISHED; userland calls tcp_accept() to claim the conn.
+    # (1.32.0 bite A — passive-open handshake completion.)
+    if (state == 6) {
+        if ((flags & 0x04) != 0) {
+            store64(cb, 0);  # RST -> CLOSED
+            return 1;
+        }
+        if ((flags & 0x10) != 0) {
+            var our_seq = load64(cb + 32);
+            if (((ack - our_seq) & 0xFFFFFFFF) != 0) {
+                return 0;  # Bad ACK, drop
+            }
+            store64(cb, 2);  # ESTABLISHED — accept queue ready to drain
+            # If the peer included data in this ACK, fall through into the
+            # ESTABLISHED branch below by re-loading state.
+            state = 2;
+            # Fallthrough.
+        } else {
+            return 1;  # No ACK bit set; keep waiting.
         }
     }
     # ESTABLISHED: handle data, ACK, FIN, RST
@@ -497,7 +675,11 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
             tcp_send_pkt(conn_id, 0x10, 0, 0);
             store64(cb, 4);  # CLOSE_WAIT
         }
-        store64(cb + 72, flags);
+        # Preserve upper-bit metadata (is_listening/passive_open/accepted/
+        # parent_listen_id at bits 8-23); only the low byte tracks received
+        # TCP flags. (1.32.0 bite A — was a flat store before LISTEN landed.)
+        var old_meta = load64(cb + 72) & 0xFFFFFFFFFFFFFF00;
+        store64(cb + 72, old_meta | (flags & 0xFF));
         return 1;
     }
     # FIN_WAIT: expect ACK or FIN-ACK
@@ -527,6 +709,8 @@ fn tcp_state_name(state, buf) {
     if (state == 2) { net_copy_buf(buf, "ESTAB", 5); return 5; }
     if (state == 3) { net_copy_buf(buf, "FIN_WAIT", 8); return 8; }
     if (state == 4) { net_copy_buf(buf, "CLOSE_W", 7); return 7; }
+    if (state == 5) { net_copy_buf(buf, "LISTEN", 6); return 6; }
+    if (state == 6) { net_copy_buf(buf, "SYN_RCVD", 8); return 8; }
     net_copy_buf(buf, "?", 1);
     return 1;
 }
