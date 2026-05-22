@@ -149,6 +149,18 @@ fn blk_is_registered(tag) {
     return 1;
 }
 
+# Bite (G) helper — mark a backend as registered without claiming
+# blk_active. Required for the secondary/tertiary backend paths (AHCI
+# when NVMe is primary, USB MS when NVMe+AHCI hold primary/secondary):
+# those paths intentionally bypass blk_register_* to avoid clobbering
+# the slot, but the filesystem-layer probe still needs to know they're
+# callable via blk_read_on. Call this from the secondary/tertiary code
+# path right after printing the "registered as secondary" log line.
+fn blk_mark_registered(tag) {
+    blk_registered = blk_registered | (1 << tag);
+    return 0;
+}
+
 fn blk_write(sector, buf) {
     if (blk_active == BLK_VIRTIO)  { return vblk_blk_write(sector, buf); }
     if (blk_active == BLK_NVME)    { return nvme_blk_write(sector, buf); }

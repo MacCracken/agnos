@@ -1196,6 +1196,11 @@ fn ahci_register_block_dev() {
         kprint(", ", 2);
         kprint_num(ahci_id_lba48);
         kprintln(" LBAs x 512B; NVMe primary)", 27);
+        # Bite (G) — mark AHCI as callable via blk_read_on(BLK_AHCI, ...)
+        # even though it's not blk_active. Filesystem-layer probes
+        # (ext2 multi-backend mount) iterate on blk_registered, not
+        # blk_active.
+        blk_mark_registered(BLK_AHCI);
         # CMOS kcp = 0x50 (AHCI block-layer registration done, secondary path).
         asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x50; 0xE6; 0x71; }
         return 1;

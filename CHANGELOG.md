@@ -77,11 +77,27 @@ Wired into `ext2_init`'s per-backend loop: whole-disk first, partition-aware sec
 
 **Build:** `build/agnos` 568,960 B (1.31.5) → **571,296 B** (+2,336 B for bites A+B+G+H net of bite C removal — well under the +270-LOC audit estimate; the deltas are mostly comment-heavy validation gates and per-backend tag math, not large new structures).
 
+#### Smoke-surfaced fixes (not originally in the bite plan)
+
+QEMU + OVMF dual-ext4 validation surfaced two pre-existing latent bugs in adjacent code that bite G/H exercises. Both fixed in this cut:
+
+- **`blk_mark_registered(tag)` helper** — `blk_register_ahci`/`blk_register_usb_ms` were skipped on their secondary/tertiary code paths (when NVMe / NVMe+AHCI held `blk_active`) to avoid clobbering the slot. That bypass also skipped the new `blk_registered |= (1 << tag)` bit-set from bite G, leaving AHCI and USB-MS invisible to the multi-backend probe in NVMe-primary topologies (exactly the archaemenid layout). New `blk_mark_registered(tag)` in `block.cyr`; called from `ahci.cyr` secondary path and `msc.cyr` both tertiary paths. Sets the bit without claiming the slot.
+- **`GPT_TYPE_LINUX_FS_LO` byte typo** — pre-existing constant `0x477284830FC663AF` had `0x63` where it should have been `0x3D` (one byte typo). Caused Linux-FS partitions to print as `(unknown type)` in the GPT enumeration (cosmetic) AND blocked bite H's GUID gate from recognizing them (functional). Fix: `0x477284830FC663AF` → `0x477284830FC63DAF` in `gpt.cyr:214`. Now correctly classifies Linux-FS partitions as `Linux FS <name>`. Likely pre-dated 1.31.x — no consumer existed before bite H.
+
 #### Verification
 
-- `scripts/test.sh` (x86_64): 4/4 PASS — kernel builds, multiboot ELF valid, size sane (571,208 B test build), kernel_hello builds.
+- `scripts/test.sh` (x86_64): 4/4 PASS — kernel builds, multiboot ELF valid, size sane (~571 KB test build), kernel_hello builds.
 - aarch64: build unchanged (no aarch64-specific changes).
-- Full QEMU + OVMF ext2/ext4 smoke deferred to the pre-Attempt-90 verification step per `ext2-iron-burn-audit.md` § 9 disposition step 7.
+- **`scripts/ext2-smoke.sh` (new permanent test): 4/4 PASS + 4/4 regression cross-check PASS**.
+  - Smoke 1 (baseline, virtio-blk ESP only, no ext2): silent miss as expected; shell reached.
+  - Smoke 2 (ESP-on-NVMe + whole-disk ext4 on AHCI): `ext2: probe matched backend=3 whole-disk` + `ext2: mounted (blocksize=4096, inode_size=256, inodes_per_group=4096)`. **Bite G validated.**
+  - Smoke 3 (ESP + Linux-FS partition both on NVMe): `ext2: probe matched backend=2 partition_lba=67584` + `ext2: mounted (blocksize=4096, inode_size=256, inodes_per_group=17152)`. **Bite H validated.**
+  - Smoke 4 (combined: NVMe-with-partition + AHCI-whole-disk): NVMe partition-aware wins probe order (backend=2 partition_lba=67584); AHCI not consumed. **Probe ordering validated.**
+  - All four smokes also reach `AGNOS shell v1.31.6` — no regression on storage trio (NVMe + AHCI + USB-MS) enumeration / GPT Phase 3 parsing / VFS init / scheduler activation.
+
+#### `scripts/ext2-smoke.sh` — new permanent test
+
+Promoted from ad-hoc `/tmp` harness to a tracked script alongside `scripts/test.sh`. Auto-discovers OVMF location (Arch + Debian/Ubuntu paths), uses repo-relative paths via the standard `ROOT="$(cd "$(dirname "$0")/.." && pwd)"` pattern, writes intermediates to `build/ext2-smoke/` and logs to `build/ext2-smoke-logs/` (both covered by the existing `build/.gitignore`). Builds three disk images (ESP-only, whole-disk ext4, partitioned ESP+ext4), runs four QEMU+OVMF+gnoboot scenarios, asserts both the bite-specific probe-match line AND the shell-reached regression cross-check. Exits 0 on all-pass, 1 on any fail. Re-runnable for every future kernel touch in the filesystem layer. Requires: `qemu-system-x86_64`, `parted`, `mtools`, `sgdisk`, `mkfs.ext4`, OVMF firmware.
 
 ## [1.31.5] — 2026-05-21
 

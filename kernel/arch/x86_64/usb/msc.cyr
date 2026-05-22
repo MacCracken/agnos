@@ -1482,6 +1482,8 @@ fn msc_register_block_dev() {
         kprint(" LBAs x ", 8);
         kprint_num(blk_bytes);
         kprintln("B; NVMe primary)", 16);
+        # Bite (G) — see block.cyr blk_mark_registered comment.
+        blk_mark_registered(BLK_USB_MS);
         return 0;
     }
     if (blk_active == BLK_AHCI) {
@@ -1492,6 +1494,8 @@ fn msc_register_block_dev() {
         kprint(" LBAs x ", 8);
         kprint_num(blk_bytes);
         kprintln("B; AHCI primary)", 16);
+        # Bite (G) — see block.cyr blk_mark_registered comment.
+        blk_mark_registered(BLK_USB_MS);
         return 0;
     }
     if (blk_register_usb_ms(sectors, blk_bytes) == 0) {
