@@ -58,9 +58,9 @@ fn ext2_load16_le(ptr, off) {
 
 fn ext2_load32_le(ptr, off) {
     return load8(ptr + off)
-         | (load8(ptr + off + 1) << 8)
-         | (load8(ptr + off + 2) << 16)
-         | (load8(ptr + off + 3) << 24);
+    | (load8(ptr + off + 1) << 8)
+    | (load8(ptr + off + 2) << 16)
+    | (load8(ptr + off + 3) << 24);
 }
 
 # --- Superblock field accessors (Haiku-style — endian-handled at boundary) -
@@ -179,8 +179,8 @@ fn ext2_init() {
     # Blocksize sanity. 1024/2048/4096 are the realistic values; refuse
     # anything else (Phase 1 buffer is 4096).
     if ((ext2_blocksize != 1024)
-      & (ext2_blocksize != 2048)
-      & (ext2_blocksize != 4096)) {
+    & (ext2_blocksize != 2048)
+    & (ext2_blocksize != 4096)) {
         kprint("ext2: unsupported blocksize ", 28);
         kprint_num(ext2_blocksize);
         kprintln("", 0);
