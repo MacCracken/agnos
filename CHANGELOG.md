@@ -7,6 +7,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.31.5] — 2026-05-21
 
+### ext2 / ext4 read-only filesystem driver (1.31.5 cycle scope — Phase 1 landed)
+
+Cycle theme is filesystem-class enablement on top of the 1.31.x storage device arc: new `kernel/core/ext2.cyr`, four-phase port plan, multi-source convergent audit at `agnosticos/docs/development/ext2-ext4-extents-prior-art.md` (Linux v6.6 + FreeBSD `main` + OpenBSD `master` + Haiku `master` + ext4 wiki + nongnu ext2 spec). End-state at cycle close: `ls /` and `cat /path` against a real Linux ext4 root partition on iron (Phase 4 unlocks ext4 extents — the dominant ext4 on-disk format since ~2008).
+
+#### Phase 1 — superblock + BGDT + inode-by-number + direct-block file read (~285 LOC)
+
+New `kernel/core/ext2.cyr` (included from `agnos.cyr` between `fatfs.cyr` and `syscall.cyr`) + `ext2_init()` call wired into `main.cyr` immediately after `vfs_init()`. Mount path is whole-disk (LBA 2-3 of the active block backend); partition-aware mount via GPT consumption lands in Phase 3.
+
+- **Superblock parse** — reads 1024 bytes from byte offset 1024 of the active block backend (two `blk_read` sector calls), validates magic `0xEF53`, decodes blocksize via `1024 << s_log_block_size` (1024 / 2048 / 4096 supported), inode_size (DYNAMIC_REV gate at `s_rev_level >= 1`; defaults to 128 for GOOD_OLD_REV), `s_inodes_per_group`, `s_first_data_block`. Endian-aware field accessors (`ext2_load16_le`, `ext2_load32_le`) handle the little-endian on-disk format — Haiku accessor-method style per audit § 3 (one boundary, no `__le32` typedef noise in the rest of the code).
+- **Feature-flag gate** — supported `s_feature_incompat` mask for Phase 1-3 is `0x6706` (FILETYPE | RECOVER | MMP | FLEX_BG | EA_INODE | CSUM_SEED | LARGEDIR). Any bit outside this mask aborts mount with `ext2: unsupported incompat bits: <decimal>`. EXTENTS bit `0x0040` is REFUSED at Phase 1; Phase 4 unlocks. 64BIT / INLINE_DATA / ENCRYPT / DIRDATA / COMPRESSION / JOURNAL_DEV / META_BG all REFUSED (audit § 6.1).
+- **BGDT walk + inode lookup** — universally convergent algorithm across Linux/FreeBSD/OpenBSD/Haiku per audit § 3.3: `block_group = (inode_num - 1) / inodes_per_group`, `byte_offset = (inode_num - 1) % inodes_per_group * inode_size`, target block computed from `bg_inode_table` + `byte_offset / blocksize`. Single-chunk BGDT (covers first ~128 groups on 4K-block FS = up to 16 GB); larger FSes need META_BG or multi-chunk walk, queued for a later phase.
+- **Direct-block file read** — Phase 1 walks `i_block[0..11]` only. Caps at 12 × blocksize per file (48 KB on 4K blocks; 12 KB on 1K blocks). Sparse holes (`i_block[i] == 0`) zero-filled per Linux semantics. Refuses non-regular inodes (`(i_mode & 0xF000) != 0x8000`) and ext4 extents inodes (`i_flags & 0x80000` → "Phase 4 unlock" message). Reads BEYOND the 12-direct cap log "(Phase 2 unlock)" so users know what's coming.
+
+**QEMU validation:**
+
+```sh
+dd if=/dev/zero of=ext2-smoke.img bs=1M count=64
+mkfs.ext2 -F -L AGNOS-SMOKE -d /tmp/ext2-seed ext2-smoke.img    # /tmp/ext2-seed/hello.txt = 64-byte ASCII
+
+# ESP on virtio-blk (boot device), ext2-smoke on NVMe (active block backend due to NVMe override policy)
+qemu-system-x86_64 -m 512M -cpu max -machine q35 \
+    -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE \
+    -drive if=pflash,format=raw,file=$OVMF_VARS \
+    -drive file=esp.img,format=raw,if=none,id=esp0 -device virtio-blk-pci,drive=esp0 \
+    -drive file=ext2-smoke.img,format=raw,if=none,id=ext2d -device nvme,drive=ext2d,serial=ext2smoke \
+    -serial stdio -display none -no-reboot
+```
+
+Boot log shows full ext2 stack working end-to-end:
+
+```
+nvme: registered as block_dev (131072 LBAs x 512B)
+VFS initialized
+ext2: mounted (blocksize=1024, inode_size=256, inodes_per_group=2048)
+ext2 smoke (inode 12, 64 bytes): AAAAAAAABBBBBBBBCCCCCCCC... (byte-exact, full 64 bytes)
+AGNOS shell v1.31.5 (type 'help')
+```
+
+Geometry matches `tune2fs -l ext2-smoke.img` byte-for-byte. `inode 12` lookup hits hello.txt (mkfs.ext2 -d places seed files at the first regular-inode slot after reserved 1-11). Direct-block read returns the 64-byte seed file's content byte-exact through the smoke hook.
+
+**Build:** `build/agnos` 520,920 B (1.31.4) → **537,952 B** (+17,032 B for Phase 1: ~285 LOC ext2.cyr + main.cyr boot wiring + temporary read-smoke hook). Hook will drop when Phase 3 lands `ls`/`cat` shell commands (the proper consumer). Multiboot2 ELF64 entry `0x1000a8` preserved.
+
+**Out of scope (Phase 2-4 territory):** indirect blocks, directory walks, ext4 extents, path resolution, shell commands. All landing in subsequent cuts under this same 1.31.5 cycle.
+
+#### fatfs hardening — GPT-protective-MBR BPB-zero guard
+
+`kernel/core/fatfs.cyr` was silently faulting on GPT-protective-MBR disks: the MBR has `0x55 0xAA` at byte 510-511 (looks like FAT boot signature) but `0x00 0x00` at offset 11-12 (the BPB bytes-per-sector field). `fatfs_init` accepted the false-positive signature, parsed bytes_per_sector = 0, then divided by zero in the root-sector calc — silent #DE halt. This bug only surfaced when QEMU was invoked with a virtio-blk ESP disk (the normal OVMF boot path), masking the 1.31.x storage-arc QEMU smoke tests that all used NVMe-attached ESPs. Two-line defensive guards added: refuse if `fatfs_bytes_per_sector != 512` (valid FAT in practice) and refuse if `fatfs_sectors_per_cluster == 0`. Cleared the boot path for the ext2 Phase 1 smoke; no regression on any real FAT image.
+
 ## [1.31.4] — 2026-05-21
 
 ### RAM-disk backend + VirtIO 1.x modern virtio-blk-pci driver (1.31.4 cycle scope)

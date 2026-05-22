@@ -30,7 +30,14 @@ fn fatfs_init() {
 
     # Parse BPB (BIOS Parameter Block)
     fatfs_bytes_per_sector = load8(&fatfs_boot_buf + 11) | (load8(&fatfs_boot_buf + 12) << 8);
+    # Defensive: GPT-protective MBR also has 0x55/0xAA at byte 510-511 but
+    # zero bytes at offsets 11-12 (no BPB). Without this guard, the root-
+    # sector calc divides by fatfs_bytes_per_sector and traps #DE silently.
+    # Valid FAT sectors are 512/1024/2048/4096; only 512 is common in
+    # practice and is what every test image uses.
+    if (fatfs_bytes_per_sector != 512) { return 0 - 1; }
     fatfs_sectors_per_cluster = load8(&fatfs_boot_buf + 13);
+    if (fatfs_sectors_per_cluster == 0) { return 0 - 1; }
     fatfs_reserved_sectors = load8(&fatfs_boot_buf + 14) | (load8(&fatfs_boot_buf + 15) << 8);
     fatfs_num_fats = load8(&fatfs_boot_buf + 16);
     fatfs_root_entry_count = load8(&fatfs_boot_buf + 17) | (load8(&fatfs_boot_buf + 18) << 8);
