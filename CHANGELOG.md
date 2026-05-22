@@ -7,6 +7,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.32.0] — 2026-05-22
 
+### Networking arc — bite F: UDP server-side primitives landed (code complete, regression-clean)
+
+Mirror of bite A's TCP server pattern, scoped to UDP. Foundation for bite G (DHCP) — DHCP runs over UDP and consumes the new `udp_bind`/`udp_recv_from` surface directly. Smaller than TCP server (no state machine; UDP is connectionless) — ~95 LOC net.
+
+#### What landed in `kernel/core/net.cyr`
+
+- **UDP listener table** — `var udp_listeners[48]` (= 384 bytes = 8 listeners × 48 bytes each, per [[feedback_cyrius_var_array_u64_units]]). Per-entry layout: state, local_port, buf_ptr (kmalloc'd 256 B), buf_len, peer_ip, peer_port.
+- **`udp_find_listener(port) → conn_id`** — scan table for state==bound + matching local_port.
+- **`udp_bind(port) → listener_id`** — refuse duplicate-bind; cap at 8 listeners; kmalloc the per-listener RX buffer.
+- **`udp_recv_from(listener_id, buf, maxlen, src_ip_out, src_port_out) → bytes`** — non-blocking drain. Both out-params may be 0 to skip writing them.
+- **`udp_send_from(src_ip, dst_ip, src_port, dst_port, data, len)`** — egress variant with explicit src_ip override (DHCP needs src_ip=0.0.0.0 since the kernel doesn't have an IP yet).
+- **`net_handle_udp` extended** — now accepts `src_ip` arg, parses src_port + dst_port from the UDP header, looks up listener by dst_port, deposits data + peer metadata into the listener's buffer. Legacy `net_udp_buf` global path preserved (single-consumer fallback). Call site in `net_poll` updated.
+
+#### Verification
+
+- `scripts/test.sh` 4/4 PASS. Build 582,632 → **585,336 B** (+2,704 B).
+- No smoke harness yet — bite G (DHCP) consumes this surface as its first real consumer; their joint smoke is what validates F end-to-end.
+
+### Networking arc — bite G: DHCP client landed (code complete, smoke caveat per bite A)
+
+Kernel-side DHCP client (RFC 2131 DISCOVER → OFFER → REQUEST → ACK) in `kernel/core/net.cyr`. Removes the hardcoded `net_init(ip4(10,0,2,15), …)` as the load-bearing IP source; instead the kernel asks the DHCP server (SLIRP in QEMU; iron gateway later) for an address at boot. On DHCP failure (timeout / NAK), `net_init`'s pre-set fallback stays in place — the kernel always has a workable address.
+
+Originally hypothesized to also fix bite A's scenario-1 SLIRP smoke gap as a side effect. **That hypothesis was falsified at smoke time** (see § Verification below). DHCP DISCOVER egress works; SLIRP doesn't deliver the OFFER back — same QEMU/virtio-net inbound-RX gap that bite A surfaced. Real-iron NICs (bite B/C) take SLIRP out of the loop entirely; both bite A's accept-success and bite G's full DHCP cycle iron-validate together once a real-NIC driver lands.
+
+#### What landed (~260 LOC in `kernel/core/net.cyr`)
+
+- **`dhcp_xid`** — transaction ID, timer-driven random (`(timer_ticks * 64017 + 31337) & 0xFFFFFFFF`).
+- **`dhcp_pkt_buf[300]`** — module-global TX packet scratch (DHCP packets are 240 B fixed BOOTP header + options).
+- **`dhcp_build_packet(buf, xid, opts, opts_len)`** — fills the 240-byte BOOTP header: op=BOOTREQUEST, htype=ETH, hlen=6, xid, flags=broadcast (0x8000), chaddr=`vnet_mac`, magic cookie at offset 236, options at offset 240. Returns 240 + opts_len.
+- **`dhcp_find_option(opts, opts_len, tag) → data_offset`** — RFC 2132 option walker; returns -1 on not-found or malformed. Handles pad (0), end (255), and per-option `tag/len/data` records.
+- **`dhcp_load_u32_be` / `dhcp_store_u32_be`** — big-endian u32 helpers.
+- **`dhcp_print_ip(ip)`** — dotted-quad pretty-print for boot log.
+- **`dhcp_init()`** — full state machine: udp_bind(68) → DISCOVER (53=1, 55=[1,3,6]) → wait OFFER (200 ticks × ~10ms) → parse offered_ip + server_id → REQUEST (53=3, 50=offered_ip, 54=server_id) → wait ACK → parse netmask (1) + gateway (3) → set `net_ip`/`net_netmask`/`net_gateway`.
+
+#### Wired into `kernel/core/main.cyr`
+
+`dhcp_init()` runs unconditionally (no build flag) after scheduler activation + interrupt enable, just before the `TCP_LISTEN_SMOKE`-gated bite-A smoke hook. On DHCP success, `net_ip` reflects the SLIRP/LAN-assigned address. On failure, `net_init`'s fallback (10.0.2.15 / 10.0.2.2 / 255.255.255.0) stays.
+
+#### Verification
+
+- `scripts/test.sh` 4/4 PASS. Build 585,336 → **593,096 B** (+7,760 B for DHCP).
+- Smoke (`TCP_LISTEN_SMOKE=1 sh scripts/build.sh + sh scripts/tcp-listen-smoke.sh`): kernel logs `dhcp: DISCOVER` then `dhcp: OFFER timeout` (no SLIRP reply). Instrumented `net_handle_udp` with a per-arrival `udp_rx: src_port=... dst_port=... len=...` print to confirm whether SLIRP sent anything inbound — **zero udp_rx lines** in the boot log over the full 200-tick wait window. **No inbound UDP at all from SLIRP**, same root-cause as the bite A scenario-1 hostfwd-inbound gap. Diagnostic since removed (per the no-instrumentation discipline).
+- Bite A's smoke result unchanged: scenario 2 (listen-no-connect) still PASS; scenario 1 (accept-one) still FAIL on the same SLIRP-inbound floor.
+
+#### Tracking — what's open at the SLIRP layer
+
+`feedback_iron_burns_block_other_work` says no further QEMU instrumentation without a written line-by-line audit FIRST. The bite-A/F/G code is structurally complete; the deferred validation surface waits for either (a) a focused SLIRP/virtio-net RX investigation (audit-doc-first) OR (b) bite B/C iron-NIC drivers that route around SLIRP entirely. Cycle plan: keep moving on real cycle work; revisit if/when SLIRP debug becomes the bottleneck.
+
 ### Networking arc — bite A: TCP server-side primitives landed (kernel code complete, regression-clean)
 
 Per the user's "lets keep it moving" direction after the lean cycle-open, smallest-first kernel bite A landed. The four sub-bites that compose bite A (state constants + tcp_listen/tcp_bind/tcp_accept allocation + tcp_find_listen scan + passive-open SYN handler with SYN_RCVD→ESTABLISHED transition + flags-field metadata bit packing) all integrate cleanly into the existing `kernel/core/net.cyr` (532 → ~720 LOC, +188 LOC net). Plus a smoke-hook in `kernel/core/main.cyr` (TCP_LISTEN_SMOKE-gated, ~40 LOC) + new test harness `scripts/tcp-listen-smoke.sh` (~180 LOC bash). All smaller than the audit's 300-500 LOC estimate per [`agnosticos/docs/development/network-arc-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/network-arc-prior-art.md) § 3.3.

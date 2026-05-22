@@ -119,6 +119,275 @@ fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
     return virtio_net_send(p, off + 20 + udp_len);
 }
 
+# Send a UDP datagram with an explicit src_ip override (for DHCP, where
+# the kernel doesn't have an assigned IP yet — src_ip=0.0.0.0). Bypasses
+# net_ip. Identical to udp_send otherwise. (1.32.0 bite G — DHCP needs this.)
+fn udp_send_from(src_ip, dst_ip, src_port, dst_port, data, data_len) {
+    if (vnet_active == 0) { return 0 - 1; }
+    var dst_mac[8];
+    memset(&dst_mac, 0xFF, 6);
+    var p = &net_pkt;
+    var off = eth_build(p, &dst_mac, &vnet_mac, 0x0800);
+    var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
+    ip_build(p + off, src_ip, dst_ip, 17, udp_len);
+    return virtio_net_send(p, off + 20 + udp_len);
+}
+
+# === UDP listener table (1.32.0 bite F — server-side UDP) ===
+# 8 listeners × 48 bytes per entry. Layout per entry:
+#   offset 0:  state (0=free, 1=bound)
+#   offset 8:  local_port (u16 effective; stored as u64)
+#   offset 16: buf_ptr (heap-allocated 256-byte recv buffer)
+#   offset 24: buf_len (0 if no datagram pending; else bytes received)
+#   offset 32: peer_ip (src ip of most-recent received datagram)
+#   offset 40: peer_port (src port of most-recent received datagram)
+# Module-global `var X[N]` = N×u64 = 8N bytes per [[feedback_cyrius_var_array_u64_units]]
+# → var udp_listeners[48] = 48*8 = 384 bytes = 8 × 48 byte entries. ✓
+var udp_listeners[48];
+var udp_listener_count = 0;
+
+fn udp_listener_base(listener_id) {
+    return &udp_listeners + listener_id * 48;
+}
+
+fn udp_find_listener(port) {
+    for (var i = 0; i < udp_listener_count; i = i + 1) {
+        var lb = udp_listener_base(i);
+        if (load64(lb) == 1) {
+            if (load64(lb + 8) == port) { return i; }
+        }
+    }
+    return 0 - 1;
+}
+
+fn udp_bind(port) {
+    if (udp_find_listener(port) >= 0) { return 0 - 1; }  # already bound
+    if (udp_listener_count >= 8) { return 0 - 1; }
+    var listener_id = udp_listener_count;
+    udp_listener_count = udp_listener_count + 1;
+    var lb = udp_listener_base(listener_id);
+    var buf = kmalloc(256);
+    if (buf == 0) {
+        udp_listener_count = udp_listener_count - 1;
+        return 0 - 1;
+    }
+    store64(lb, 1);            # bound
+    store64(lb + 8, port);
+    store64(lb + 16, buf);
+    store64(lb + 24, 0);       # no pending datagram
+    store64(lb + 32, 0);
+    store64(lb + 40, 0);
+    return listener_id;
+}
+
+# Drain the most-recent datagram from the listener's buffer. Returns
+# bytes_read (0 if no datagram pending). On success, src_ip_out + src_port_out
+# get the peer's addressing. Both out-params may be 0 to skip writing.
+fn udp_recv_from(listener_id, buf, maxlen, src_ip_out, src_port_out) {
+    if (listener_id < 0) { return 0; }
+    if (listener_id >= udp_listener_count) { return 0; }
+    net_poll();   # absorb any pending packets first
+    var lb = udp_listener_base(listener_id);
+    if (load64(lb) != 1) { return 0; }
+    var rx_len = load64(lb + 24);
+    if (rx_len == 0) { return 0; }
+    var rx_buf = load64(lb + 16);
+    var copy_len = rx_len;
+    if (copy_len > maxlen) { copy_len = maxlen; }
+    net_copy_buf(buf, rx_buf, copy_len);
+    if (src_ip_out != 0) { store64(src_ip_out, load64(lb + 32)); }
+    if (src_port_out != 0) { store64(src_port_out, load64(lb + 40)); }
+    store64(lb + 24, 0);  # consumed
+    return copy_len;
+}
+
+# === DHCP client (1.32.0 bite G) ===
+# Minimal RFC 2131 client: DISCOVER → OFFER → REQUEST → ACK. Removes the
+# hardcoded net_ip=10.0.2.15 in main.cyr's net_init call; instead the
+# kernel asks the DHCP server (SLIRP in QEMU; iron's gateway later) for
+# an IP at boot. Likely fixes the bite-A scenario-1 SLIRP-inbound gap
+# as a side effect — SLIRP only properly registers a guest after seeing
+# a DHCP exchange.
+
+var DHCP_MAGIC_0 = 0x63;
+var DHCP_MAGIC_1 = 0x82;
+var DHCP_MAGIC_2 = 0x53;
+var DHCP_MAGIC_3 = 0x63;
+
+var dhcp_xid = 0;
+var dhcp_pkt_buf[300];
+
+# Find the data offset of a DHCP option by tag within an options blob.
+# Returns -1 if not found or malformed. Returned offset points at the
+# option DATA byte (post-tag, post-len).
+fn dhcp_find_option(opts, opts_len, tag) {
+    var i = 0;
+    while (i < opts_len) {
+        var t = load8(opts + i);
+        if (t == 0) { i = i + 1; continue; }       # pad
+        if (t == 255) { return 0 - 1; }            # end
+        if (i + 1 >= opts_len) { return 0 - 1; }
+        var olen = load8(opts + i + 1);
+        if (i + 2 + olen > opts_len) { return 0 - 1; }
+        if (t == tag) { return i + 2; }
+        i = i + 2 + olen;
+    }
+    return 0 - 1;
+}
+
+fn dhcp_load_u32_be(p) {
+    return (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+}
+
+fn dhcp_store_u32_be(p, v) {
+    store8(p, (v >> 24) & 0xFF);
+    store8(p + 1, (v >> 16) & 0xFF);
+    store8(p + 2, (v >> 8) & 0xFF);
+    store8(p + 3, v & 0xFF);
+    return 0;
+}
+
+# Build the fixed 240-byte BOOTP/DHCP header into `buf` (followed by
+# `opts_len` bytes of options at offset 240). Returns total packet
+# length (240 + opts_len).
+fn dhcp_build_packet(buf, xid, opts, opts_len) {
+    memset(buf, 0, 240);
+    store8(buf, 1);          # op = BOOTREQUEST
+    store8(buf + 1, 1);      # htype = ethernet
+    store8(buf + 2, 6);      # hlen
+    # hops = 0
+    dhcp_store_u32_be(buf + 4, xid);
+    # secs (2) + flags (2): set broadcast flag 0x8000
+    store8(buf + 10, 0x80);
+    # ciaddr/yiaddr/siaddr/giaddr (16 bytes) = 0
+    # chaddr (16 bytes, MAC at first 6)
+    memcpy(buf + 28, &vnet_mac, 6);
+    # sname (64) + file (128) = 0
+    # magic cookie at offset 236
+    store8(buf + 236, DHCP_MAGIC_0);
+    store8(buf + 237, DHCP_MAGIC_1);
+    store8(buf + 238, DHCP_MAGIC_2);
+    store8(buf + 239, DHCP_MAGIC_3);
+    memcpy(buf + 240, opts, opts_len);
+    return 240 + opts_len;
+}
+
+fn dhcp_print_ip(ip) {
+    kprint_num((ip >> 24) & 0xFF); kprint(".", 1);
+    kprint_num((ip >> 16) & 0xFF); kprint(".", 1);
+    kprint_num((ip >> 8) & 0xFF); kprint(".", 1);
+    kprint_num(ip & 0xFF);
+    return 0;
+}
+
+# Run a full DHCP exchange. On success, updates net_ip/net_gateway/
+# net_netmask in place; returns 0. On failure: returns -1, leaves
+# net_init's pre-set values untouched.
+fn dhcp_init() {
+    if (vnet_active == 0) { return 0 - 1; }
+    dhcp_xid = (timer_ticks * 64017 + 31337) & 0xFFFFFFFF;
+    var lid = udp_bind(68);
+    if (lid < 0) {
+        kprintln("dhcp: udp_bind(68) failed", 25);
+        return 0 - 1;
+    }
+
+    # ---- DISCOVER ----
+    var opts[16];
+    store8(&opts, 53); store8(&opts + 1, 1); store8(&opts + 2, 1);  # msg=DISCOVER
+    store8(&opts + 3, 55); store8(&opts + 4, 3);                    # param-list
+    store8(&opts + 5, 1); store8(&opts + 6, 3); store8(&opts + 7, 6);
+    store8(&opts + 8, 255);                                          # end
+    var plen = dhcp_build_packet(&dhcp_pkt_buf, dhcp_xid, &opts, 9);
+    udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, plen);
+    kprintln("dhcp: DISCOVER", 14);
+
+    # ---- wait OFFER ----
+    var rx[320];
+    var src_ip = 0;
+    var src_port = 0;
+    var offered_ip = 0;
+    var server_id = 0;
+    var got = 0;
+    for (var ti = 0; ti < 200; ti = ti + 1) {
+        net_poll();
+        var n = udp_recv_from(lid, &rx, 320, &src_ip, &src_port);
+        if (n >= 240) {
+            if (dhcp_load_u32_be(&rx + 4) == dhcp_xid) {
+                var oo = 240;
+                var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
+                if (mt_off >= 0 && load8(&rx + oo + mt_off) == 2) {
+                    offered_ip = dhcp_load_u32_be(&rx + 16);
+                    var sid_off = dhcp_find_option(&rx + oo, n - oo, 54);
+                    if (sid_off >= 0) { server_id = dhcp_load_u32_be(&rx + oo + sid_off); }
+                    got = 1;
+                    break;
+                }
+            }
+        }
+        arch_wait();
+    }
+    if (got == 0) {
+        kprintln("dhcp: OFFER timeout", 19);
+        return 0 - 1;
+    }
+    kprint("dhcp: OFFER ip=", 15); dhcp_print_ip(offered_ip); kprintln("", 0);
+
+    # ---- REQUEST ----
+    store8(&opts, 53); store8(&opts + 1, 1); store8(&opts + 2, 3);  # msg=REQUEST
+    store8(&opts + 3, 50); store8(&opts + 4, 4);                    # requested IP
+    dhcp_store_u32_be(&opts + 5, offered_ip);
+    store8(&opts + 9, 54); store8(&opts + 10, 4);                   # server id
+    dhcp_store_u32_be(&opts + 11, server_id);
+    store8(&opts + 15, 255);
+    plen = dhcp_build_packet(&dhcp_pkt_buf, dhcp_xid, &opts, 16);
+    udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, plen);
+    kprintln("dhcp: REQUEST", 13);
+
+    # ---- wait ACK ----
+    var assigned_mask = 0;
+    var assigned_gw = 0;
+    got = 0;
+    for (var ti = 0; ti < 200; ti = ti + 1) {
+        net_poll();
+        var n = udp_recv_from(lid, &rx, 320, &src_ip, &src_port);
+        if (n >= 240) {
+            if (dhcp_load_u32_be(&rx + 4) == dhcp_xid) {
+                var oo = 240;
+                var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
+                if (mt_off >= 0) {
+                    var mt = load8(&rx + oo + mt_off);
+                    if (mt == 5) {
+                        var nm_off = dhcp_find_option(&rx + oo, n - oo, 1);
+                        if (nm_off >= 0) { assigned_mask = dhcp_load_u32_be(&rx + oo + nm_off); }
+                        var gw_off = dhcp_find_option(&rx + oo, n - oo, 3);
+                        if (gw_off >= 0) { assigned_gw = dhcp_load_u32_be(&rx + oo + gw_off); }
+                        got = 1;
+                        break;
+                    }
+                    if (mt == 6) {
+                        kprintln("dhcp: NAK", 9);
+                        return 0 - 1;
+                    }
+                }
+            }
+        }
+        arch_wait();
+    }
+    if (got == 0) {
+        kprintln("dhcp: ACK timeout", 17);
+        return 0 - 1;
+    }
+    net_ip = offered_ip;
+    net_netmask = assigned_mask;
+    net_gateway = assigned_gw;
+    kprint("dhcp: ACK ip=", 13); dhcp_print_ip(offered_ip);
+    kprint(" gw=", 4); dhcp_print_ip(assigned_gw);
+    kprint(" mask=", 6); dhcp_print_ip(assigned_mask);
+    kprintln("", 0);
+    return 0;
+}
+
 fn net_copy_buf(dst, src, len) {
     memcpy(dst, src, len);
     return 0;
@@ -172,14 +441,29 @@ fn net_handle_arp(pkt, len) {
     return 0;
 }
 
-fn net_handle_udp(pkt, ip_off, ip_payload_len) {
+fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
     # UDP header at ip_off: src_port(2) dst_port(2) length(2) checksum(2) data...
     if (ip_payload_len < 8) { return 0; }
+    var src_port = (load8(pkt + ip_off) << 8) | load8(pkt + ip_off + 1);
+    var dst_port = (load8(pkt + ip_off + 2) << 8) | load8(pkt + ip_off + 3);
     var udp_data_len = ip_payload_len - 8;
     # Security: cap at buffer size (256 bytes) to prevent overflow
     if (udp_data_len > 248) { udp_data_len = 248; }
+    # Legacy global-buffer path — used by net_recv_udp (single-consumer).
     net_copy_buf(&net_udp_buf, pkt + ip_off + 8, udp_data_len);
     net_udp_buf_len = udp_data_len;
+    # 1.32.0 bite F — also dispatch to any matching bound listener.
+    var lid = udp_find_listener(dst_port);
+    if (lid >= 0) {
+        var lb = udp_listener_base(lid);
+        var lbuf = load64(lb + 16);
+        if (lbuf != 0) {
+            net_copy_buf(lbuf, pkt + ip_off + 8, udp_data_len);
+            store64(lb + 24, udp_data_len);
+            store64(lb + 32, src_ip);
+            store64(lb + 40, src_port);
+        }
+    }
     return udp_data_len;
 }
 
@@ -207,7 +491,7 @@ fn net_poll() {
         var ip_payload_len = ip_total - ip_ihl;
         if (ip_proto == 17) {
             # UDP
-            net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len);
+            net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
             return 2;
         }
         if (ip_proto == 6) {
