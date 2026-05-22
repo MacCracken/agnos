@@ -5,9 +5,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.31.6] — 2026-05-21
+## [1.31.6] — 2026-05-22
 
-### Cleanup / hardening / audit cycle — eight bites landed
+### Cleanup / hardening / audit cycle — eight bites landed + Iron Attempt 90 ext4 victory lap PASS
 
 Disciplined post-greenfield closeout for the 1.31.x storage + filesystem arc. Eight bites planned per `agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 89 PRE; all eight landed this cut.
 
@@ -48,9 +48,9 @@ New doc `agnosticos/docs/development/ext2-iron-burn-audit.md` (~200 prose). Mode
 
 #### Bite (F) — state.md / roadmap / iron-log sweep for 1.31.5 closeout
 
-- `agnosticos/docs/development/state.md`: leading-edge prose rewritten from giant accreted paragraph into terse cycle-by-cycle bullet list; new § *1.31.6 cleanup cycle* with bite punch-list table; storage progression line updated through ext2/4 + cleanup-cycle open; iron-validation-coverage matrix extended through Attempt 90 PENDING; agnos row in new-repos table updated for 1.31.2→1.31.6 trajectory.
-- `agnos/docs/development/roadmap.md`: header updated to v1.31.6 + filesystem stack + active-cycle pointer; row 7 (ext2/4) marked ✅ closed 1.31.5 with Attempt 89 PASS note + Attempt 90 reframe; row 7a (1.31.6 cleanup) marked OPEN with full bite punch list.
-- `agnosticos/docs/development/iron-nuc-zen-log.md`: Attempt 89 rewritten from PENDING to landed interim no-regression burn (full verbatim chain pt1 + pt2, two-photo reference, rubric scoring); new Attempt 90 PENDING entry queued for the post-bite-G/H ext4 victory lap with success/partial/falsified rubrics + carry-forward.
+- `agnosticos/docs/development/state.md`: leading-edge prose rewritten from giant accreted paragraph into terse cycle-by-cycle bullet list; new § *1.31.6 cleanup cycle* with full bite punch-list table; storage progression line + iron-validation-coverage matrix + agnos row in new-repos table all extended through 1.31.6 close + Attempt 90 PASS.
+- `agnos/docs/development/roadmap.md`: header updated to v1.31.6 + filesystem stack + 1.31.x storage arc CLOSED note; row 7 (ext2/4) marked ✅ closed 1.31.5 + Attempt 90 PASS receipt; row 7a (1.31.6 cleanup) marked ✅ CLOSED with full bite punch list + smoke-surfaced fixes + Attempt 90 PASS receipt; row 7b (ext4 64BIT) re-pinned for next storage-cycle reopening.
+- `agnosticos/docs/development/iron-nuc-zen-log.md`: Attempt 89 rewritten from PENDING to landed interim no-regression burn (full verbatim chain pt1 + pt2, two-photo reference, rubric scoring); Attempt 90 written initially as PENDING for the post-bite-G/H ext4 victory lap with success/partial/falsified rubrics, then rewritten at cycle close to PASS with full pt1 + pt2 + pt3 verbatim chains + three-photo reference (see § Iron Attempt 90 below for the cycle-close receipt).
 
 #### Bite (G) — multi-backend ext2 probe + `blk_read_on` helper (~100 LOC across `block.cyr` + `ext2.cyr`)
 
@@ -98,6 +98,34 @@ QEMU + OVMF dual-ext4 validation surfaced two pre-existing latent bugs in adjace
 #### `scripts/ext2-smoke.sh` — new permanent test
 
 Promoted from ad-hoc `/tmp` harness to a tracked script alongside `scripts/test.sh`. Auto-discovers OVMF location (Arch + Debian/Ubuntu paths), uses repo-relative paths via the standard `ROOT="$(cd "$(dirname "$0")/.." && pwd)"` pattern, writes intermediates to `build/ext2-smoke/` and logs to `build/ext2-smoke-logs/` (both covered by the existing `build/.gitignore`). Builds three disk images (ESP-only, whole-disk ext4, partitioned ESP+ext4), runs four QEMU+OVMF+gnoboot scenarios, asserts both the bite-specific probe-match line AND the shell-reached regression cross-check. Exits 0 on all-pass, 1 on any fail. Re-runnable for every future kernel touch in the filesystem layer. Requires: `qemu-system-x86_64`, `parted`, `mtools`, `sgdisk`, `mkfs.ext4`, OVMF firmware.
+
+#### Iron Attempt 90 — ext4 victory lap on NVMe `agnos-fs` partition 2026-05-22 → PASS
+
+Phase 4 payoff burn for the 1.31.x storage arc. ext4 mounted from a real Linux-FS partition on iron NAND, walked through the extent leaf walker, surfaced through `agnos> ls /` against the same NVMe surface that's been carrying the kernel since Attempt 80. **All four 1.31.6 mechanism bites (G multi-backend probe + H partition-aware mount + smoke-surfaced `blk_mark_registered` + `GPT_TYPE_LINUX_FS_LO` byte-typo fix) iron-validated in a single burn.**
+
+The two load-bearing log lines:
+
+```
+ext2: probe matched backend=2 partition_lba=3898638336
+ext2: mounted (blocksize=4096, inode_size=256, inodes_per_group=8192)
+```
+
+`backend=2` = NVMe (priority-order win over AHCI as designed). `partition_lba=3898638336` = NVMe p3 LBA (partition-aware mount fired; whole-disk LBA-2 probe correctly missed since that area is GPT/MBR). Geometry matches the mke2fs default for a 4 GiB partition. Storage trio (NVMe / AHCI / USB MS) byte-matched Attempt 89 — +2.3 KB cleanup delta regressed nothing.
+
+`agnos> ls /` returned `./ ../ lost+found/ hello.txt` byte-exact from the on-disk dirent walk (where `lost+found` is mke2fs's auto-created reserved dir and `hello.txt` is the ASCII seed) — first iron-validated walk of a real Linux ext4 dirent table through the FreeBSD-shape extent walker.
+
+Full attempt receipt + verbatim chains + three iron photos: `agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 90.
+
+**MVP gate**: unaffected — kernel reached `agnos>` shell, `help` enumerated 18 verbs.
+
+#### Known carry-forward to a later cycle (NOT 1.31.x)
+
+- **Bare-name `cat hello.txt` falls through to initrd lookup, returns "file not found"** — ext2 fast-path in `sh_cmd_cat` requires a leading `/` per Phase 3 design (consume `/abs/path`; fall back to `initrd_open` on bare names or on ext2 miss). `cat /hello.txt` would have hit the ext2 path. Documented Phase-3 behavior, not a regression; this is a small UX papercut to address in a later cycle alongside `cd` / CWD scoping for the shell.
+- **Per-backend GPT parsing** — `gpt.cyr` parses GPT against `blk_active` only. The AHCI/SATA `agnos-fs` partition prepared as Attempt 90 surface A is unreachable until per-backend GPT enumeration lands (audit § 8 H4). Out of scope for this cycle; defer to next storage-cycle reopening or to a real consumer.
+
+### Closing the 1.31.x storage arc
+
+1.31.6 closes the storage cycle that opened at 1.31.0. **Five iron debuts** (NVMe @ Attempt 80 / SATA @ 81 / USB MS @ 87 / RAM-disk+VirtIO @ 88 [QEMU primary + iron no-regression] / ext4 @ 90 partition-aware on NVMe NAND) plus **four no-regression burns** (82 / 88 / 89 / 90's storage-trio check). Build trajectory across the cycle: `421,912 B` (1.31.0 cycle-open lean) → `571,296 B` (1.31.6 close) = +149 KB / ~6,500 LOC for NVMe + AHCI + GPT + USB MS + RAM-disk + VirtIO modern + ext2/4 + cleanup hardening. cyrius pin graduated mid-cycle (1.31.1 → 1.31.2 = 5.11.64 → 6.0.1) and stayed stable through cycle close. MVP gate stayed green throughout.
 
 ## [1.31.5] — 2026-05-21
 
