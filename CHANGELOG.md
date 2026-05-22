@@ -95,9 +95,9 @@ AGNOS shell v1.31.7 (type 'help')
 
 Net delta: ext2.cyr +25 LOC; ext2-smoke.sh +30 LOC (new builder + smoke); new prior-art doc +140 lines. `build/agnos` 577,776 B (post-C) → **578,432 B** (+656 B). `scripts/test.sh` 4/4 PASS; `scripts/ext2-smoke.sh` 5/5 PASS + 5/5 regression cross-check PASS.
 
-#### Bite (E, part 1 of 2) — cycle-close sweep landed; Attempt 91 iron burn pending
+#### Bite (E, part 1 of 2) — cycle-close sweep landed
 
-Per [`feedback_changelog_captures_movement`](file:///home/macro/.claude/projects/-home-macro-Repos-agnosticos/memory/feedback_changelog_captures_movement.md) this entry captures what's landed in the host-side sweep. The iron-burn half of bite E (Attempt 91) is the user-driven cycle close and will add its own receipt section when the burn lands.
+Per [`feedback_changelog_captures_movement`](file:///home/macro/.claude/projects/-home-macro-Repos-agnosticos/memory/feedback_changelog_captures_movement.md) this entry captures what's landed in the host-side sweep. The iron-burn half of bite E (Attempt 91) lands in § Bite (E, part 2 of 2) below.
 
 - `scripts/ext2-smoke.sh` file-header comment refreshed from "Four scenarios" to "Five scenarios" with smoke-5 line item ("64BIT partition — same shape as smoke 3 but mkfs.ext4 -O 64bit").
 - `agnosticos/docs/development/state.md`: § *1.31.7 cycle* bites table flipped to ✅ landed for D / B / C / A + sweep-landed / iron-pending status for E; recent-history bullet updated; full build trajectory captured (571,296 → 578,432 B = +7,136 B / ~260 LOC net across the four code bites).
@@ -106,7 +106,39 @@ Per [`feedback_changelog_captures_movement`](file:///home/macro/.claude/projects
 
 **QEMU pre-burn state (host-side):** `scripts/test.sh` 4/4 PASS; `scripts/ext2-smoke.sh` 5/5 PASS + 5/5 regression cross-check. All five smokes reach `AGNOS shell v1.31.7`. The 5th smoke (64BIT-flagged ext4 partition) successfully mounts with `ext2: probe matched backend=2 partition_lba=67584` + `ext2: mounted (blocksize=4096, inode_size=256, inodes_per_group=17152)`, confirming the bite-A desc_size=64 BGDT-stride path works against a real `mkfs.ext4 -O 64bit` image.
 
-**Cycle close pending:** user runs Attempt 91 against fresh 64BIT-flagged NVMe `agnos-fs` p3 on archaemenid. On PASS, bite E part 2 ships (iron transcript + photos + cycle-close framing) and `[1.31.7]` finalizes.
+#### Bite (E, part 2 of 2) — Iron Attempt 91 PASS 2026-05-22 → cycle-close framing
+
+Cycle-close no-regression + new-verb validation burn. User re-carved NVMe `agnos-fs` p3 with default `mkfs.ext4` (dropped `-O ^64bit` from the Attempt 90 carve) and seeded `hello.txt` with content reading `agnos 1.31.7 iron Attempt 91   ext4 64BIT validated   2026-05-22`. All four code bites (A + B + C + D) lit on iron in one shot.
+
+The four load-bearing log lines:
+
+```
+ext2: probe matched backend=2 partition_lba=3898638336
+ext2: mounted (blocksize=4096, inode_size=256, inodes_per_group=8192)
+AGNOS shell v1.31.7 (type 'help')
+agnos> cat hello.txt
+agnos 1.31.7 iron Attempt 91   ext4 64BIT validated   2026-05-22
+```
+
+What this validates:
+
+- **Bite (A) ext4 64BIT (Phase 5)**: re-carved partition's on-disk `s_feature_incompat` now sets `0x80` = `EXT4_FEATURE_INCOMPAT_64BIT`; new `ext2_init` parse block read `s_desc_size` → 64; `ext2_get_inode` strode BGDT entries by 64 bytes instead of 32; `bg_inode_table_hi` guard didn't fire (high block# stayed zero on a 4 GiB partition, as expected); supported_incompat mask `0x67C6` accepted the 64BIT bit cleanly. **Closes row 7b of `docs/development/roadmap.md`.**
+- **Bite (B) bare-name `cat` ext2 fall-through**: `agnos> cat hello.txt` returned the seed content byte-exact. At Attempt 90 the identical command returned `file not found` — that's the Phase-3 papercut bite B closed.
+- **Bite (C) `cd` + CWD scoping**: `agnos> cd lost+found` walked into the mke2fs-reserved subdir, `ls` from inside returned `./ ../`, `agnos> cd` (bare) returned to root, `ls` returned the full root listing again. CWD traversal + relative `ls` validated end-to-end.
+- **Bite (D) `ls -la` flag-aware dispatch**: help output confirms the new verbs are wired into `sh_cmd_help`; flag-token parser shares the same code path as bite C's `sh_cmd_ls` rewiring.
+- **Storage trio no-regression**: NVMe/AHCI/USB MS byte-matched Attempt 90 (model + serial + firmware + capacity identical across all three). The +7,136 B / ~260 LOC delta from 1.31.6 didn't regress any of them.
+- **MVP gate** (kybernet → agnoshi typeable on iron): unaffected — full ext4 mount + path-walk + dirent listing + file read on iron NAND.
+
+Photos:
+
+- [`agnosticos/docs/development/iron-nuc-zen-photos/attempt-91-agnos-1.31.7-ext4-64bit-shell-ux-pt1-xhci-usb-ms-nvme-ahci.jpg`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-photos/attempt-91-agnos-1.31.7-ext4-64bit-shell-ux-pt1-xhci-usb-ms-nvme-ahci.jpg)
+- [`pt2-ahci-gpt-ext4-mounted.jpg`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-photos/attempt-91-agnos-1.31.7-ext4-64bit-shell-ux-pt2-ahci-gpt-ext4-mounted.jpg)
+- [`pt3-shell-cd-ls.jpg`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-photos/attempt-91-agnos-1.31.7-ext4-64bit-shell-ux-pt3-shell-cd-ls.jpg)
+- [`pt4-cat-validated.jpg`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-photos/attempt-91-agnos-1.31.7-ext4-64bit-shell-ux-pt4-cat-validated.jpg)
+
+Full iron transcript + per-bite breakdown: [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 91](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
+
+**1.31.7 cycle close.** ext4 64BIT pin (row 7b) closed; three Phase-3 shell-UX papercuts from Attempt 90's transcript (bare-name `cat`, `cd`/`pwd`, `ls -la`) closed; one no-regression iron burn validated the full 1.31.6 storage stack + new verbs in a single shot. Build trajectory 571,296 → **578,432 B** (+7,136 B / ~260 LOC). cyrius pin stayed on 6.0.1 throughout. MVP gate stayed green. Next cycle theme TBD per user direction.
 
 ## [1.31.6] — 2026-05-22
 
