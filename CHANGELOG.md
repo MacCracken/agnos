@@ -5,6 +5,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.32.1] — 2026-05-22 (Networking arc continued — r8169 driver-level OFFER-timeout debug; bites A+B+C landed, Attempt 94 PENDING IRON)
+
+### Added — r8169 PHY init + diagnostic instrumentation (bites B+C, 1.32.1)
+
+The 1.32.1 cycle opens with the planned audit-first sequence per [[feedback_iron_burns_block_other_work]] + [[feedback_redesign_dont_reinvent]]. Bites A (audit doc extension) + B (CMOS instrumentation) + C (PHY init) all land same-day; Attempt 94 iron burn pending user direction.
+
+**bite A — OFFER-timeout audit extension** (`agnosticos/docs/development/r8169-iron-burn-audit.md` § 10.1-10.8): 261 lines of new audit prose. Re-ranked the 9 pre-burn hypotheses against Attempt 92+93 iron evidence — 6 falsified (H2 reset quirk, H3 MAC garbage, H4 BAR mapping, H6 cache attribute, H9 cross-driver), H5 re-elevated as secondary, **H1 (PHY not configured) ranks top** with H7+H8 as downstream variants of an H1 failure. Line-by-line examination of current `r8169.cyr` against multi-source prior art (Linux `r8169_main.c` + FreeBSD `if_re.c` + OpenBSD `re.c` + NetBSD `re.c` + Haiku + RealTek RTL8168 datasheet §11+§13) confirms: zero PHY-side register writes in current code; OpenBSD's `re_phy_init` is the simplest converged minimum-viable shape. CMOS slot range planning: avoided collision with xhci (0x60-0x6F + 0x70-0x87) and AS1 (0x56-0x57); selected **virgin gap 0x58-0x5F** for r8169 discriminators.
+
+**bite B — CMOS-bank discriminator instrumentation** (~50 LOC in `kernel/core/r8169.cyr` + ~30 LOC in `agnosticos/scripts/src/read-boot-log.cyr`). Seven CMOS slots stamped:
+
+| Slot | Meaning |
+|------|---------|
+| 0x58 | r8169_probe completion sentinel (1 = ran to completion) |
+| 0x59 | phy_init outcome enum: 0=not attempted, 1=link up, 2=autoneg timeout, 3=BMCR-write timeout, 4=BMSR-read timeout |
+| 0x5A | TX send count (saturating byte, 0xFF = ≥255 calls) |
+| 0x5B | TX desc 0 high byte (post-mortem; 0x80 = OWN stuck → H7 fires) |
+| 0x5C | RX poll count (saturating byte) |
+| 0x5D | RX desc 0 high byte (post-mortem; 0x80 = OWN stuck → H8 fires) |
+| 0x5E | RX desc 0 buffer first byte (non-zero = DMA visible — disambiguates H8) |
+| 0x5F | reserved for future r8169 stamps |
+
+Stamps refresh on every `r8169_poll` invocation (scheduler-idle hot path = constantly fresh). Re-uses existing `xhci_cmos_stamp(slot, val)` primitive at `kernel/arch/x86_64/usb/xhci_port.cyr:61-70` — generic two-byte CMOS write handling both standard (0x70/0x71) and extended (0x72/0x73) channels; xhci-prefixed name retained to avoid cross-cutting rename. Kernel-side saturating counters `r8169_tx_send_count` + `r8169_rx_poll_count` avoid the read-modify-write CMOS round-trip on every send/poll. `agnosticos/scripts/src/read-boot-log.cyr` updated with full slot decode + human-readable outcome interpretation; obsolete AS1 #3-#6 + AS2 #1-#6 labels retired in the process (those PMM-diagnostic slots stopped being written by the kernel years ago).
+
+**bite C — PHY init** (~85 LOC in `kernel/core/r8169.cyr`). Three new functions:
+
+- **`r8169_phy_write(reg, val)`** — MDIO write via PHYAR register at MMIO 0x60. Sets flag bit + reg-addr (bits 16:20) + data (bits 0:15); polls for flag-clear completion. 1000-iteration timeout per existing `r8169_probe` reset poll convention.
+- **`r8169_phy_read(reg)`** — MDIO read. Clears flag bit + sets reg-addr; polls for flag-set completion; returns data field. 0xFFFF sentinel on timeout.
+- **`r8169_phy_init()`** — Reads BMCR, sets autoneg-enable (bit 12) + restart-autoneg (bit 9), clears power-down (bit 11), writes back. Polls BMSR.LinkStatus (bit 2) for up to 300 iterations × ~10ms = ~3s — the OpenBSD/NetBSD-converged autoneg timeout. Stamps CMOS slot 0x59 with per-outcome enum.
+
+Hooked into `r8169_probe()` after the existing CR.RST=1 soft reset, before the new "Phase 1 complete" line. Boot log gains one new line: `r8169: link up` on success or `r8169: no link (autoneg timeout)` on failure. Total r8169 boot block grows from 6 lines to 7.
+
+**Multi-source convergent posture** per [[feedback_redesign_dont_reinvent]]: every primitive cited 4-5 of (Linux / FreeBSD / OpenBSD / NetBSD / Haiku / RTL8168 datasheet). OpenBSD's `re_phy_init` is the primary reference (simplest cross-validated form across all five sources); Linux is one source of many, not the singular reference. Per-chip-rev dispatch table is deliberately deferred (audit § 4 — "NO chip-revision dispatch table" at v1).
+
+**Build delta**: 601,392 B (1.32.0 close, `TCP_LISTEN_SMOKE=1`) → **603,784 B (1.32.1 in-flight, post-B+C)**; +2,392 B / ~80 LOC effective in `r8169.cyr` + ~30 LOC in `scripts/src/read-boot-log.cyr`. Production build (no `TCP_LISTEN_SMOKE`): 602,976 B. `scripts/test.sh` 4/4 PASS. QEMU `tcp-listen-smoke` scenario 1 fails as expected (pre-existing SLIRP-RX gap; iron is the validation surface).
+
+**Carry-forward — Attempt 94 iron burn pending**:
+
+- Pre-burn ready: `agnos/build/agnos` is 603,784 B with `TCP_LISTEN_SMOKE=1` (or 602,976 B production). Iron-burn checklist mirrors Attempt 93's; addition is post-burn `sudo ./scripts/read-boot-log.sh` for CMOS 0x58-0x5F decode.
+- Expected outcome on H1 success: 7-line r8169 boot block ending in `r8169: link up`; full DHCP cycle (`DISCOVER` → `OFFER ip=<lan-IP>` → `REQUEST` → `ACK ip=<lan-IP>`); CMOS 0x59 = 1 + 0x5B = 0x00 + 0x5D varies (re-armed pattern).
+- Expected outcome on H1 failure: `r8169: no link (autoneg timeout)` + DHCP OFFER timeout persists; CMOS 0x59 = 2/3/4 disambiguates root cause; 0x5B + 0x5D readouts narrow to H7/H8 vs deeper datasheet.
+
+### Out of cycle (deferred carry-forward from 1.32.0)
+
+- **i225-V driver port** — pending dedicated Intel-NIC iron (post-archaemenid-migration).
+- **BBS + MUD userland consumer apps** — separate standalone repos, out-of-cycle.
+
 ## [1.32.0] — 2026-05-22 (Networking arc — kernel TCP/UDP server primitives + DHCP client + r8169 driver Phase 1-4 + iron debut on archaemenid)
 
 ### Cycle-close summary

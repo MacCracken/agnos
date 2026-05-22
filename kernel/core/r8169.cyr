@@ -97,6 +97,36 @@ var R8169_TXCFG_DEFAULTS = 0x03000700;
 # TPPoll bit 6 = NPQ (Normal Priority Queue kick).
 var R8169_TPPOLL_NPQ = 0x40;
 
+# PHY access — MDIO via PHYAR register at MMIO offset 0x60 (RTL8168/8111
+# datasheet §11). 32-bit layout:
+#   bit 31     = Flag (write: 1 = trigger write; chip clears on done.
+#                      read: 0 = trigger read; chip sets on done.)
+#   bits 30:21 = reserved (write as 0)
+#   bits 20:16 = PHY register address (5 bits, 0..31)
+#   bits 15:0  = data (write = src data; read = received data once flag set)
+var R8169_REG_PHYAR     = 0x60;
+var R8169_PHYAR_FLAG    = 0x80000000;
+var R8169_PHYAR_REG_SHIFT = 16;
+
+# PHY register map (IEEE 802.3 + datasheet §13):
+var R8169_PHY_BMCR      = 0x00;       # Basic Mode Control
+var R8169_PHY_BMSR      = 0x01;       # Basic Mode Status
+var R8169_BMCR_ANENABLE = 0x1000;     # bit 12 — Autonegotiation Enable
+var R8169_BMCR_ANRESTART= 0x0200;     # bit  9 — Restart Autonegotiation
+var R8169_BMCR_PDOWN    = 0x0800;     # bit 11 — Power Down (mask off to ensure live)
+var R8169_BMSR_LINKUP   = 0x0004;     # bit  2 — Link Status (1 = up)
+
+# CMOS post-mortem slot reservations for r8169 (per
+# r8169-iron-burn-audit.md § 10.5; virgin scratch 0x58-0x5F):
+var R8169_KCP_PROBE_DONE     = 0x58;  # 1 = r8169_probe ran to completion
+var R8169_KCP_PHY_OUTCOME    = 0x59;  # 0=not attempted, 1=link up, 2=autoneg timeout,
+                                       # 3=BMCR-write timeout, 4=BMSR-read timeout
+var R8169_KCP_TX_SEND_COUNT  = 0x5A;  # saturating byte counter (0xFF = ≥255)
+var R8169_KCP_TX_DESC0_OWN   = 0x5B;  # TX desc 0 high byte; post-mortem 0x80 = OWN stuck
+var R8169_KCP_RX_POLL_COUNT  = 0x5C;  # saturating byte counter (0xFF = ≥255)
+var R8169_KCP_RX_DESC0_OWN   = 0x5D;  # RX desc 0 high byte; post-mortem 0x80 = OWN stuck
+var R8169_KCP_RX_DESC0_BYTE0 = 0x5E;  # RX desc 0 buf first byte (non-zero = DMA visible)
+
 # Module-level state — populated by r8169_probe on success.
 var r8169_present     = 0;
 var r8169_pci_idx     = 0;
@@ -115,6 +145,13 @@ var r8169_rx_bufs[16];   # phys addrs of 16 RX packet buffers (module-global u64
 var r8169_tx_bufs[16];   # phys addrs of 16 TX packet buffers
 var r8169_rx_idx = 0;    # next RX descriptor to inspect
 var r8169_tx_idx = 0;    # next TX descriptor to fill
+
+# Diagnostic counters for 1.32.1 bite B (per r8169-iron-burn-audit.md
+# § 10.5). Saturating byte counters — kernel-side state avoids the
+# read-modify-write CMOS round-trip on every send/poll. Stamped to
+# CMOS slots 0x5A / 0x5C from the respective hot path.
+var r8169_tx_send_count = 0;
+var r8169_rx_poll_count = 0;
 
 # --- MMIO accessors -------------------------------------------------
 # Mirror nvme.cyr/ahci.cyr convention: never load64 against MMIO. The
@@ -146,6 +183,86 @@ fn r8169_find_pci() {
     return 0 - 1;
 }
 
+# --- PHY access (1.32.1 bite C — H1 fix, multi-source convergent) ---
+#
+# Multi-source agreement (r8169-iron-burn-audit.md § 10.2):
+#   Linux drivers/net/ethernet/realtek/r8169_main.c — full per-mac_version
+#     dispatch via rtl_phy_write_paged_safe; we don't need the full
+#     dispatch for a minimum-viable autoneg restart.
+#   OpenBSD sys/dev/ic/re.c re_phy_init — simplest converged form:
+#     BMCR.autoneg-enable + restart-autoneg, then poll BMSR for link.
+#   FreeBSD if_re.c + NetBSD re.c + Haiku — all mirror OpenBSD's shape.
+#   RealTek RTL8168 datasheet §11/§13 — PHYAR protocol + reg map.
+# AGNOS lands the OpenBSD-converged shape (smallest cross-validated
+# implementation that brings up the PHY enough for DHCP to work).
+
+fn r8169_phy_write(reg, val) {
+    # Build PHYAR write word: flag=1 | reg in bits 20:16 | data in bits 15:0.
+    var par = R8169_PHYAR_FLAG | ((reg & 0x1F) << R8169_PHYAR_REG_SHIFT) | (val & 0xFFFF);
+    store32(r8169_mmio_base + R8169_REG_PHYAR, par);
+    # Poll for completion — chip clears flag bit when write is done.
+    # Datasheet specifies typical 1-10us; we use 1000 iterations of busy
+    # MMIO reads as the timeout bound (matches reset poll convention).
+    for (var i = 0; i < 1000; i = i + 1) {
+        var r = load32(r8169_mmio_base + R8169_REG_PHYAR);
+        if ((r & R8169_PHYAR_FLAG) == 0) { return 1; }
+    }
+    return 0;
+}
+
+fn r8169_phy_read(reg) {
+    # Build PHYAR read word: flag=0 | reg in bits 20:16 | data=0.
+    var par = (reg & 0x1F) << R8169_PHYAR_REG_SHIFT;
+    store32(r8169_mmio_base + R8169_REG_PHYAR, par);
+    # Poll for completion — chip sets flag bit when read data is ready.
+    for (var i = 0; i < 1000; i = i + 1) {
+        var r = load32(r8169_mmio_base + R8169_REG_PHYAR);
+        if ((r & R8169_PHYAR_FLAG) != 0) { return r & 0xFFFF; }
+    }
+    return 0xFFFF;
+}
+
+# Bring the internal PHY up to a link-active state. Minimum-viable form:
+# read current BMCR, set autoneg-enable + restart-autoneg, clear power-
+# down, write back; poll BMSR LinkStatus bit for autoneg completion +
+# link establishment. Returns 1 on link-up, 0 on autoneg timeout, with
+# stamp 0x59 recording fine-grained outcome (see audit doc § 10.5).
+fn r8169_phy_init() {
+    # Read BMCR. 0xFFFF return = MDIO-read timeout (PHY not responding
+    # to MDIO at all — distinct failure mode from autoneg timeout).
+    var bmcr = r8169_phy_read(R8169_PHY_BMCR);
+    if (bmcr == 0xFFFF) {
+        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 4);   # 4 = BMCR-read timeout
+        return 0;
+    }
+    # Set autoneg-enable + restart-autoneg; clear power-down just in case.
+    var new_bmcr = (bmcr | R8169_BMCR_ANENABLE | R8169_BMCR_ANRESTART) & 0xF7FF;
+    if (r8169_phy_write(R8169_PHY_BMCR, new_bmcr) == 0) {
+        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 3);   # 3 = BMCR-write timeout
+        return 0;
+    }
+    # Poll BMSR LinkStatus (bit 2). 300 iterations × ~10ms busy delay ≈ 3s,
+    # the OpenBSD/NetBSD-converged autoneg timeout. archaemenid's wired
+    # NIC + a connected switch typically links in well under 1s.
+    for (var i = 0; i < 300; i = i + 1) {
+        var bmsr = r8169_phy_read(R8169_PHY_BMSR);
+        if (bmsr == 0xFFFF) {
+            xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 4);   # 4 = BMSR-read timeout
+            return 0;
+        }
+        if ((bmsr & R8169_BMSR_LINKUP) != 0) {
+            xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 1);   # 1 = link up
+            return 1;
+        }
+        # ~10ms busy delay via tight inner loop. Approximate — actual
+        # cycle count depends on CPU clock; the 300-iteration outer
+        # budget compensates by being generous.
+        for (var j = 0; j < 100000; j = j + 1) { }
+    }
+    xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 2);           # 2 = autoneg timeout
+    return 0;
+}
+
 # --- Phase 1 probe + reset ------------------------------------------
 #
 # Returns 1 on full probe success (chip found + MAC read + reset clean);
@@ -153,6 +270,18 @@ fn r8169_find_pci() {
 # failure (BAR0/2 both unmapped or reset timeout).
 
 fn r8169_probe() {
+    # 1.32.1 bite B — zero the diagnostic slots up-front so post-mortem
+    # reads can distinguish "probe never ran" (slot 0x58 = boot-default,
+    # often 0xFF or 0x00 depending on cold/warm reset) from "probe ran
+    # but bailed out early" (slot 0x58 = 0, no progression to phy_init).
+    xhci_cmos_stamp(R8169_KCP_PROBE_DONE, 0);
+    xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 0);
+    xhci_cmos_stamp(R8169_KCP_TX_SEND_COUNT, 0);
+    xhci_cmos_stamp(R8169_KCP_TX_DESC0_OWN, 0);
+    xhci_cmos_stamp(R8169_KCP_RX_POLL_COUNT, 0);
+    xhci_cmos_stamp(R8169_KCP_RX_DESC0_OWN, 0);
+    xhci_cmos_stamp(R8169_KCP_RX_DESC0_BYTE0, 0);
+
     var idx = r8169_find_pci();
     if (idx < 0) {
         kprintln("r8169: no controller found", 26);
@@ -229,7 +358,20 @@ fn r8169_probe() {
     kprint("r8169: chip-rev byte=0x", 23);
     kprint_num(r8169_chip_rev);
     kprintln(" (Phase 2+ decodes the family)", 30);
-    kprintln("r8169: reset OK; Phase 1 complete", 33);
+    kprintln("r8169: reset OK", 15);
+
+    # 1.32.1 bite C — bring the internal PHY up. r8169_phy_init stamps
+    # slot 0x59 with the per-outcome enum (1=link up, 2-4=failure modes).
+    # Print result inline so the boot-log shows the proximate link state
+    # without requiring a CMOS read.
+    if (r8169_phy_init() != 0) {
+        kprintln("r8169: link up", 14);
+    } else {
+        kprintln("r8169: no link (autoneg timeout)", 32);
+    }
+
+    kprintln("r8169: Phase 1 complete", 23);
+    xhci_cmos_stamp(R8169_KCP_PROBE_DONE, 1);
     return 1;
 }
 
@@ -306,6 +448,25 @@ fn r8169_init_rx() {
 fn r8169_poll(buf, maxlen) {
     if (r8169_present == 0) { return 0; }
     if (r8169_rx_ring_phys == 0) { return 0; }
+
+    # 1.32.1 bite B — refresh diagnostic snapshots on every poll. Poll
+    # runs continuously in scheduler idle, so the post-mortem reflects
+    # the most-recent observable state across both TX and RX descriptor
+    # 0 (the descriptors DISCOVER and OFFER would have used first).
+    if (r8169_rx_poll_count < 0xFF) {
+        r8169_rx_poll_count = r8169_rx_poll_count + 1;
+    }
+    xhci_cmos_stamp(R8169_KCP_RX_POLL_COUNT, r8169_rx_poll_count);
+    var rx0_status = load32(r8169_rx_ring_phys);
+    xhci_cmos_stamp(R8169_KCP_RX_DESC0_OWN, (rx0_status >> 24) & 0xFF);
+    var rx0_buf = load64(&r8169_rx_bufs);
+    if (rx0_buf != 0) {
+        xhci_cmos_stamp(R8169_KCP_RX_DESC0_BYTE0, load8(rx0_buf) & 0xFF);
+    }
+    if (r8169_tx_ring_phys != 0) {
+        var tx0_status = load32(r8169_tx_ring_phys);
+        xhci_cmos_stamp(R8169_KCP_TX_DESC0_OWN, (tx0_status >> 24) & 0xFF);
+    }
 
     var desc = r8169_rx_ring_phys + r8169_rx_idx * 16;
     var status = load32(desc);
@@ -391,6 +552,13 @@ fn r8169_send(buf, len) {
     if (r8169_present == 0) { return 0 - 1; }
     if (r8169_tx_ring_phys == 0) { return 0 - 1; }
     if (len > 2048) { len = 2048; }
+
+    # 1.32.1 bite B — TX-side activity counter. Kernel-side variable
+    # avoids the read-modify-write CMOS round-trip on every send.
+    if (r8169_tx_send_count < 0xFF) {
+        r8169_tx_send_count = r8169_tx_send_count + 1;
+    }
+    xhci_cmos_stamp(R8169_KCP_TX_SEND_COUNT, r8169_tx_send_count);
 
     var desc = r8169_tx_ring_phys + r8169_tx_idx * 16;
     var status = load32(desc);

@@ -692,7 +692,7 @@ if (vnet_active != 0 || nic_ready() != 0) {
                 kprint("tcp_accept: conn_id=", 20);
                 kprint_num(c);
                 kprintln("", 0);
-                tcp_send(c, "AGNOS 1.32.0 tcp_listen smoke\n", 30);
+                tcp_send(c, "AGNOS 1.32.1 tcp_listen smoke\n", 30);
                 tcp_close(c);
                 got = 1;
                 break;
