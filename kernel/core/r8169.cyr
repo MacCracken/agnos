@@ -48,12 +48,73 @@ var R8169_CR_RST = 0x10;  # bit 4 — Reset (write 1, poll until cleared)
 var R8169_CR_RE  = 0x08;  # bit 3 — RX Enable
 var R8169_CR_TE  = 0x04;  # bit 2 — TX Enable
 
+# === Phase 2-3 (1.32.0 bite B Phases 2+3) — RX + TX ring constants ===
+
+# Descriptor layout (16 bytes each, same for RX + TX per RTL8168 datasheet
+# §6.7; converged across Linux/FreeBSD/OpenBSD/NetBSD/Haiku refs):
+#   offset 0:  status (u32) — OWN[31] | EOR[30] | FS[29] | LS[28] | length[13:0]
+#   offset 4:  vlan (u32) — VLAN tag or 0
+#   offset 8:  buf_addr_lo (u32)
+#   offset 12: buf_addr_hi (u32)
+var R8169_DESC_OWN      = 0x80000000;  # NIC owns when set; driver owns when clear
+var R8169_DESC_EOR      = 0x40000000;  # End Of Ring (last descriptor wraps)
+var R8169_DESC_FS       = 0x20000000;  # First Segment (single-segment frame: FS+LS set)
+var R8169_DESC_LS       = 0x10000000;  # Last Segment
+var R8169_DESC_LEN_MASK = 0x00003FFF;  # length field is 14 bits
+
+# Ring sizes — 16 descriptors per direction. Linux defaults 256 for
+# perf; BBS/MUD-class workloads fit easily in 16. Power-of-two so the
+# (idx + 1) & mask wrap is one AND.
+var R8169_RX_RING_SIZE = 16;
+var R8169_TX_RING_SIZE = 16;
+var R8169_RING_MASK    = 0x0F;        # 16 - 1
+var R8169_BUF_SIZE     = 2048;        # max packet — covers 1500 MTU + Eth + VLAN + slack
+
+# Additional register offsets (Phase 1 only used CR/IDR/TxConfig).
+var R8169_REG_TNPDS_LO     = 0x20;  # Tx Normal Priority Descriptor Start (low)
+var R8169_REG_TNPDS_HI     = 0x24;
+var R8169_REG_RDSAR_LO     = 0xE4;  # RX Descriptor Start Address Register (low)
+var R8169_REG_RDSAR_HI     = 0xE8;
+var R8169_REG_TPPOLL       = 0x38;  # Transmit Priority Poll — bit 6 (0x40) = NPQ kick
+var R8169_REG_IMR          = 0x3C;  # Interrupt Mask
+var R8169_REG_ISR          = 0x3E;  # Interrupt Status (W1C)
+var R8169_REG_RMS          = 0xDA;  # Rx Max packet Size (16-bit)
+var R8169_REG_MTPS         = 0xEC;  # Max Tx Packet Size (8-bit, in 128-byte units)
+
+# RxConfig bits (offset 0x44):
+var R8169_RXCFG_AAP = 0x01;  # accept all phys (promisc — off in v1)
+var R8169_RXCFG_APM = 0x02;  # accept physical match (unicast to our MAC)
+var R8169_RXCFG_AM  = 0x04;  # accept multicast
+var R8169_RXCFG_AB  = 0x08;  # accept broadcast (needed for ARP + DHCP)
+# RX FIFO threshold + DMA burst lifted from Linux defaults:
+#   bits [10:8]  RX DMA burst — 7 = unlimited
+#   bits [15:13] RX FIFO thresh — 7 = unlimited
+var R8169_RXCFG_DEFAULTS = 0xE700;
+
+# TxConfig (offset 0x40) — IFG=3 (standard), DMA burst=7 (unlimited).
+var R8169_TXCFG_DEFAULTS = 0x03000700;
+
+# TPPoll bit 6 = NPQ (Normal Priority Queue kick).
+var R8169_TPPOLL_NPQ = 0x40;
+
 # Module-level state — populated by r8169_probe on success.
 var r8169_present     = 0;
 var r8169_pci_idx     = 0;
 var r8169_mmio_base   = 0;
 var r8169_mac[8];        # 6 valid bytes + 2 padding
 var r8169_chip_rev    = 0;
+
+# RX + TX ring state (Phase 2-3). Ring base addresses come from
+# pmm_alloc (page-aligned = 4096-aligned = 256-aligned, satisfying
+# the spec's descriptor-ring alignment constraint). One pmm_alloc'd
+# page per descriptor buffer (2KB used of 4KB page; ~50% waste, but
+# the simplification is worth it at v1).
+var r8169_rx_ring_phys = 0;
+var r8169_tx_ring_phys = 0;
+var r8169_rx_bufs[16];   # phys addrs of 16 RX packet buffers (module-global u64[]; 16*8 = 128 bytes)
+var r8169_tx_bufs[16];   # phys addrs of 16 TX packet buffers
+var r8169_rx_idx = 0;    # next RX descriptor to inspect
+var r8169_tx_idx = 0;    # next TX descriptor to fill
 
 # --- MMIO accessors -------------------------------------------------
 # Mirror nvme.cyr/ahci.cyr convention: never load64 against MMIO. The
@@ -168,6 +229,228 @@ fn r8169_probe() {
     kprint("r8169: chip-rev byte=0x", 23);
     kprint_num(r8169_chip_rev);
     kprintln(" (Phase 2+ decodes the family)", 30);
-    kprintln("r8169: reset OK; Phase 1 complete (RX/TX rings PENDING IRON)", 60);
+    kprintln("r8169: reset OK; Phase 1 complete", 33);
     return 1;
+}
+
+# === Phase 2 — RX descriptor ring + per-buf pages + poll ============
+#
+# Layout (16 descriptors × 16 bytes = 256 bytes, occupying the first
+# 256 bytes of a pmm_alloc'd 4 KB page; rest of the page is wasted but
+# the page allocator returns page-granularity anyway). Each descriptor's
+# buf_addr_lo/hi points at a separate pmm_alloc'd 4 KB page used as
+# the packet buffer (only first 2 KB consumed).
+#
+# Multi-source convergent shape (audit § 1.2):
+#   - All four BSD/Linux/Haiku refs agree on the 16-byte descriptor with
+#     status[31]=OWN, [30]=EOR, [29]=FS, [28]=LS, [13:0]=length.
+#   - OpenBSD's `re.c` is the simplest reference for the init sequence.
+
+fn r8169_init_rx() {
+    if (r8169_present == 0) { return 0 - 1; }
+
+    # 1. Allocate descriptor ring (page-aligned = 256-aligned by spec).
+    r8169_rx_ring_phys = pmm_alloc();
+    if (r8169_rx_ring_phys == 0) {
+        kprintln("r8169: rx ring pmm_alloc failed", 31);
+        return 0 - 1;
+    }
+    # Zero the descriptor ring (only first 256 B used; zero the page).
+    for (var i = 0; i < 4096; i = i + 1) {
+        store8(r8169_rx_ring_phys + i, 0);
+    }
+
+    # 2. Allocate per-descriptor buffers + initialize descriptors.
+    for (var i = 0; i < 16; i = i + 1) {
+        var buf = pmm_alloc();
+        if (buf == 0) {
+            kprintln("r8169: rx buf pmm_alloc failed", 30);
+            return 0 - 1;
+        }
+        store64(&r8169_rx_bufs + i * 8, buf);
+
+        var desc = r8169_rx_ring_phys + i * 16;
+        var status = 0x80000000 | 2048;   # OWN | BUF_SIZE
+        if (i == 15) { status = status | 0x40000000; }   # EOR on last
+        store32(desc + 0,  status);
+        store32(desc + 4,  0);                            # vlan
+        store32(desc + 8,  buf & 0xFFFFFFFF);
+        store32(desc + 12, (buf >> 32) & 0xFFFFFFFF);
+    }
+
+    # 3. Program RDSAR — NIC reads descriptor ring base from here.
+    store32(r8169_mmio_base + 0xE4, r8169_rx_ring_phys & 0xFFFFFFFF);
+    store32(r8169_mmio_base + 0xE8, (r8169_rx_ring_phys >> 32) & 0xFFFFFFFF);
+
+    # 4. Set RxConfig. Accept broadcast (for ARP) + multicast +
+    #    unicast-to-our-MAC. FIFO/DMA thresholds at unlimited.
+    var rxcfg = 0xE700 | 0x08 | 0x04 | 0x02;
+    store32(r8169_mmio_base + 0x44, rxcfg);
+
+    # 5. Max RX packet size (16-bit register at 0xDA): MTU 1500 + Eth
+    #    (14) + VLAN (4) + CRC (4) headroom = ~1522. Round to 0x05F3.
+    store8(r8169_mmio_base + 0xDA, 0xF3);
+    store8(r8169_mmio_base + 0xDB, 0x05);
+
+    # 6. Enable RX in CR (set RE bit; preserve other bits).
+    var cr = load8(r8169_mmio_base + 0x37);
+    store8(r8169_mmio_base + 0x37, cr | 0x08);
+
+    r8169_rx_idx = 0;
+    kprintln("r8169: RX ring up (16 desc × 2KB buf)", 36);
+    return 0;
+}
+
+# Drain one packet from the RX ring if available. Returns bytes copied
+# into `buf` (0 if no packet pending, or descriptor still NIC-owned).
+fn r8169_poll(buf, maxlen) {
+    if (r8169_present == 0) { return 0; }
+    if (r8169_rx_ring_phys == 0) { return 0; }
+
+    var desc = r8169_rx_ring_phys + r8169_rx_idx * 16;
+    var status = load32(desc);
+    if ((status & 0x80000000) != 0) { return 0; }   # NIC still owns
+
+    var pkt_len = status & 0x3FFF;
+    # Strip CRC: RTL8168 includes 4-byte FCS in the reported length per
+    # datasheet §6.7 (all four BSD/Linux refs do the same subtraction).
+    if (pkt_len >= 4) { pkt_len = pkt_len - 4; }
+    if (pkt_len > maxlen) { pkt_len = maxlen; }
+
+    var bufaddr = load64(&r8169_rx_bufs + r8169_rx_idx * 8);
+    for (var i = 0; i < pkt_len; i = i + 1) {
+        store8(buf + i, load8(bufaddr + i));
+    }
+
+    # Re-arm descriptor for next packet (OWN=1, preserve EOR on last).
+    var new_status = 0x80000000 | 2048;
+    if (r8169_rx_idx == 15) { new_status = new_status | 0x40000000; }
+    store32(desc, new_status);
+
+    r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
+    return pkt_len;
+}
+
+# === Phase 3 — TX descriptor ring + per-buf pages + send ============
+
+fn r8169_init_tx() {
+    if (r8169_present == 0) { return 0 - 1; }
+
+    # 1. Descriptor ring page.
+    r8169_tx_ring_phys = pmm_alloc();
+    if (r8169_tx_ring_phys == 0) {
+        kprintln("r8169: tx ring pmm_alloc failed", 31);
+        return 0 - 1;
+    }
+    for (var i = 0; i < 4096; i = i + 1) {
+        store8(r8169_tx_ring_phys + i, 0);
+    }
+
+    # 2. Per-descriptor buffers. Start with OWN=0 (driver-owned, empty).
+    for (var i = 0; i < 16; i = i + 1) {
+        var buf = pmm_alloc();
+        if (buf == 0) {
+            kprintln("r8169: tx buf pmm_alloc failed", 30);
+            return 0 - 1;
+        }
+        store64(&r8169_tx_bufs + i * 8, buf);
+
+        var desc = r8169_tx_ring_phys + i * 16;
+        var status = 0;
+        if (i == 15) { status = 0x40000000; }    # EOR on last
+        store32(desc + 0,  status);
+        store32(desc + 4,  0);                    # vlan
+        store32(desc + 8,  buf & 0xFFFFFFFF);
+        store32(desc + 12, (buf >> 32) & 0xFFFFFFFF);
+    }
+
+    # 3. Program TNPDS — TX descriptor ring base.
+    store32(r8169_mmio_base + 0x20, r8169_tx_ring_phys & 0xFFFFFFFF);
+    store32(r8169_mmio_base + 0x24, (r8169_tx_ring_phys >> 32) & 0xFFFFFFFF);
+
+    # 4. TxConfig: IFG=3 (standard 96-bit), DMA burst=7 (unlimited).
+    store32(r8169_mmio_base + 0x40, 0x03000700);
+
+    # 5. Max TX packet size (MTPS register, 8-bit, units of 128 bytes).
+    #    0x3B = 59 → 59 × 128 = 7552 bytes; ample for 1500-MTU frames.
+    store8(r8169_mmio_base + 0xEC, 0x3B);
+
+    # 6. Enable TX in CR (set TE bit; preserve other bits).
+    var cr = load8(r8169_mmio_base + 0x37);
+    store8(r8169_mmio_base + 0x37, cr | 0x04);
+
+    r8169_tx_idx = 0;
+    kprintln("r8169: TX ring up (16 desc × 2KB buf)", 36);
+    return 0;
+}
+
+# Send one packet via the TX ring. Returns bytes sent (= len) on success,
+# -1 if the next TX slot is still NIC-owned (queue full — caller can retry
+# after net_poll has progressed). Length capped at R8169_BUF_SIZE (2048).
+fn r8169_send(buf, len) {
+    if (r8169_present == 0) { return 0 - 1; }
+    if (r8169_tx_ring_phys == 0) { return 0 - 1; }
+    if (len > 2048) { len = 2048; }
+
+    var desc = r8169_tx_ring_phys + r8169_tx_idx * 16;
+    var status = load32(desc);
+    if ((status & 0x80000000) != 0) { return 0 - 1; }   # ring full
+
+    var bufaddr = load64(&r8169_tx_bufs + r8169_tx_idx * 8);
+    for (var i = 0; i < len; i = i + 1) {
+        store8(bufaddr + i, load8(buf + i));
+    }
+
+    # Set OWN | FS | LS | length; preserve EOR on last descriptor.
+    var new_status = 0x80000000 | 0x20000000 | 0x10000000 | len;
+    if (r8169_tx_idx == 15) { new_status = new_status | 0x40000000; }
+    store32(desc, new_status);
+
+    # Kick TX engine: write NPQ bit (0x40) to TPPoll. This is W1C-style —
+    # writing the bit asks the NIC to walk the queue once.
+    store8(r8169_mmio_base + 0x38, 0x40);
+
+    r8169_tx_idx = (r8169_tx_idx + 1) & 0x0F;
+    return len;
+}
+
+# === Phase 4 — NIC dispatcher (multi-backend send/poll) =============
+#
+# Replaces net.cyr's hardcoded virtio_net_send / virtio_net_poll calls.
+# Priority: r8169 (real iron, gigabit) > virtio_net (QEMU paravirt). On
+# iron, virtio_net is absent (vnet_active == 0) so r8169 wins; in QEMU,
+# r8169 is absent (r8169_present == 0) so virtio_net wins. No-NIC case
+# returns sane defaults.
+
+fn nic_ready() {
+    if (r8169_present != 0) {
+        if (r8169_tx_ring_phys != 0) { return 1; }
+    }
+    if (vnet_active != 0) { return 1; }
+    return 0;
+}
+
+fn nic_send(buf, len) {
+    if (r8169_present != 0) {
+        if (r8169_tx_ring_phys != 0) {
+            return r8169_send(buf, len);
+        }
+    }
+    if (vnet_active != 0) {
+        return virtio_net_send(buf, len);
+    }
+    return 0 - 1;
+}
+
+fn nic_poll(buf, maxlen) {
+    if (r8169_present != 0) {
+        if (r8169_rx_ring_phys != 0) {
+            var n = r8169_poll(buf, maxlen);
+            if (n > 0) { return n; }
+        }
+    }
+    if (vnet_active != 0) {
+        return virtio_net_poll(buf, maxlen);
+    }
+    return 0;
 }

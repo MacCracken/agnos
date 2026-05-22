@@ -7,6 +7,90 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.32.0] — 2026-05-22
 
+### Networking arc — bite B Phases 2 + 3 + 4: r8169 RX/TX rings + NIC dispatcher (code complete)
+
+Phase 2 (RX descriptor ring + per-buffer pages + poll), Phase 3 (TX descriptor ring + send), Phase 4 (NIC dispatcher in r8169.cyr + net.cyr migration). All three landed in the same cut — none individually need iron between them; Phase 5 iron-burn validates the bundle. Multi-source convergent per `agnosticos/docs/development/network-arc-prior-art.md` § 1.4.
+
+#### Phase 2 — RX ring + buffers + poll (~110 LOC in `kernel/core/r8169.cyr`)
+
+**Descriptor layout** (converged across all five refs — Linux/FreeBSD/OpenBSD/NetBSD/Haiku — and the RTL8168 datasheet §6.7):
+
+```
+offset 0:  status (u32) — OWN[31] | EOR[30] | FS[29] | LS[28] | length[13:0]
+offset 4:  vlan (u32)
+offset 8:  buf_addr_lo (u32)
+offset 12: buf_addr_hi (u32)
+```
+
+OWN=1 → NIC owns (RX: empty waiting-to-fill; TX: ready-to-send). OWN=0 → driver owns. EOR set on last descriptor (NIC wraps to descriptor 0).
+
+**Memory layout**:
+
+- Descriptor ring: `pmm_alloc()` returns a 4 KB page (page-aligned = 4096-aligned = 256-aligned, satisfying the spec's descriptor-ring alignment constraint). 16 descriptors × 16 B = 256 B used, rest of page wasted.
+- Per-descriptor buffer: separate `pmm_alloc()` page per descriptor. 4 KB page, 2 KB used (covers 1500 MTU + Eth + VLAN + slack). 16 RX buffers + 16 TX = 32 pages = 128 KB of buffer memory.
+- Ring size: 16 entries (Linux defaults 256 for perf; BBS/MUD-class workloads fit easily in 16). Power-of-two so `(idx + 1) & 0x0F` wrap is one AND op.
+
+**Init sequence** (`r8169_init_rx`):
+
+1. `pmm_alloc` ring page; zero it.
+2. For each of 16 descriptors: `pmm_alloc` 4 KB buffer page, store its phys in `r8169_rx_bufs[i]`, set descriptor status = OWN | BUF_SIZE (= 2048), set buf_addr_lo/hi from buffer phys. EOR bit set on i==15.
+3. Program RDSAR_LO/HI (offsets 0xE4/0xE8) with ring phys base.
+4. Set RxConfig (offset 0x44) = `0xE700 | AB | AM | APM` (FIFO/DMA thresh unlimited + accept broadcast/multicast/our-phys; no promisc).
+5. Set RMS (Rx Max packet Size, 16-bit at 0xDA) = `0x05F3` (1523 — 1500 MTU + headroom).
+6. Set CR.RE (bit 3 at 0x37); preserve other CR bits.
+
+**`r8169_poll(buf, maxlen)`**: scan `r8169_rx_ring[r8169_rx_idx]`; if OWN=1 return 0 (still NIC-owned); else read length (status & 0x3FFF), strip 4-byte FCS (RTL8168 reports FCS as part of length per datasheet §6.7), copy from buffer to caller's `buf`, re-arm descriptor (OWN=1 + preserve EOR on i==15), advance `r8169_rx_idx`.
+
+#### Phase 3 — TX ring + send (~85 LOC)
+
+Symmetric to Phase 2:
+
+- `r8169_init_tx`: ring page + 16 buffer pages; descriptors start OWN=0 (driver-owned, empty). Program TNPDS_LO/HI (offsets 0x20/0x24). Set TxConfig (offset 0x40) = `0x03000700` (IFG=3 standard, DMA burst=7 unlimited). Set MTPS (Max Tx Packet Size, 8-bit at 0xEC) = `0x3B` (59 × 128 = 7552 bytes, ample for 1500 MTU). Set CR.TE (bit 2 at 0x37).
+- `r8169_send(buf, len)`: cap len at 2048; check next TX descriptor — if OWN=1 return -1 (ring full); else copy `buf[0..len]` to `r8169_tx_bufs[r8169_tx_idx]`; set descriptor status = OWN | FS | LS | length (single-segment frame); preserve EOR on i==15; write TPPoll (offset 0x38) bit 6 (NPQ kick = `0x40`); advance `r8169_tx_idx`.
+
+#### Phase 4 — NIC dispatcher + net.cyr migration (~40 LOC in r8169.cyr + ~15 sites in net.cyr)
+
+Three new wrapper functions in `kernel/core/r8169.cyr` route net.cyr's egress/ingress through whichever NIC is up:
+
+- **`nic_ready() → 0/1`** — replaces `vnet_active` gate. Returns 1 if r8169 is initialized OR virtio_net is active; 0 if neither.
+- **`nic_send(buf, len)`** — priority: r8169 (real iron) > virtio_net (QEMU paravirt). On iron, virtio_net is absent so r8169 wins; in QEMU, r8169 is absent so virtio_net wins. No-NIC returns -1.
+- **`nic_poll(buf, maxlen)`** — same priority. r8169 tried first; if 0 bytes (no packet pending), fall through to virtio_net.
+
+**net.cyr migration**:
+
+- `agnos.cyr` include reorder: `core/r8169.cyr` now precedes `core/net.cyr` so net.cyr can reference `nic_send`/`nic_poll`/`nic_ready`.
+- 6 sites changed: `virtio_net_send(...)` → `nic_send(...)` in `arp_request` (line 107), `udp_send` (119), `udp_send_from` (133), `net_handle_arp` ARP-reply (439), `tcp_send_pkt` (648).
+- 1 site changed: `virtio_net_poll(...)` → `nic_poll(...)` in `net_poll` (472).
+- 7 sites changed: `if (vnet_active == 0) { ... }` → `if (nic_ready() == 0) { ... }` across `arp_request`, `udp_send`, `udp_send_from`, `tcp_send_pkt`, `net_handle_arp`, `net_poll`, and the `dhcp_init` egress gate.
+
+#### Wiring in `kernel/core/main.cyr`
+
+`r8169_probe()` was a bare call after the boot path landed Phase 1. Now wrapped:
+
+```cyrius
+if (r8169_probe() == 1) {
+    r8169_init_rx();
+    r8169_init_tx();
+}
+```
+
+Silent no-op in QEMU (probe returns 0 → no Realtek device). On archaemenid iron: probe returns 1 → ring init runs → driver fully up before the existing `pci_find(0x1AF4, 0x1000)` virtio-net probe runs (which will return -1 on iron since no virtio device, leaving r8169 as sole NIC backend).
+
+#### Verification
+
+- `scripts/test.sh` **4/4 PASS**. Build 595,424 → **600,432 B** (+5,008 B for Phases 2-4 combined). Crosses 600 KB.
+- QEMU boot smoke (with TCP_LISTEN_SMOKE=1): `VirtIO-net: MAC=...` → `Net: 10.0.2.15/24 gw 10.0.2.2` → `dhcp: DISCOVER` → `dhcp: OFFER timeout` (same SLIRP-RX gap as before). `r8169:` lines absent as expected. **The DISCOVER print confirms `nic_send` correctly dispatched through `virtio_net_send` on the no-r8169 QEMU path.** No regression on existing kernel paths.
+- **Iron burn (Attempt 92+) PENDING** — will validate the full chain on archaemenid:
+  - Phase 1 four lines (chip ID + MAC + reset OK)
+  - Phase 2 line: `r8169: RX ring up (16 desc × 2KB buf)`
+  - Phase 3 line: `r8169: TX ring up (16 desc × 2KB buf)`
+  - Then bite-A scenario-1 accept-success path validates end-to-end (host TCP probe → r8169 RX → kernel passive-open SYN handler → SYN+ACK back via r8169 TX → established conn → banner sent → close). DHCP exchange validates UDP both ways via r8169.
+
+#### What's still PENDING IRON for bite B
+
+- **Phase 5**: `r8169-iron-burn-audit.md` (pre-burn audit doc per `feedback_iron_burns_block_other_work`) + Attempt 92+ iron burn + photo capture + transcript landing.
+- Multi-queue support, MSI-X interrupt routing, ASPM workarounds, full chip-revision dispatch table — all DEFERRED until a real consumer (perf workload, second-board iron) surfaces demand. v1 stays single-queue / polling / no-ASPM / single-revision per the audit doc § 1.3 "AGNOS at v1" notes.
+
 ### Networking arc — bite B Phase 1: r8169 PCI discovery + MAC read + reset (code complete, iron-anchored)
 
 Realtek RTL8111/8168 family Ethernet driver, Phase 1. New file `kernel/core/r8169.cyr` (~150 LOC). Multi-source convergent port per [`agnosticos/docs/development/network-arc-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/network-arc-prior-art.md) § 1: Linux `r8169_main.c` + FreeBSD `if_re.c` + OpenBSD `re.c` + NetBSD `re.c` + Haiku rtl8169 + RTL8168/8111 datasheet.

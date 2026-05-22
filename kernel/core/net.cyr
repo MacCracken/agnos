@@ -83,7 +83,7 @@ fn udp_build(pkt, src_port, dst_port, data, data_len) {
 }
 
 fn arp_request(target_ip) {
-    if (vnet_active == 0) { return 0 - 1; }
+    if (nic_ready() == 0) { return 0 - 1; }
     # Security: record pending request BEFORE sending (avoid race with fast reply)
     arp_pending_ip = target_ip;
     var p = &net_pkt;
@@ -104,11 +104,11 @@ fn arp_request(target_ip) {
     store8(p + off + 25, (target_ip >> 16) & 0xFF);
     store8(p + off + 26, (target_ip >> 8) & 0xFF);
     store8(p + off + 27, target_ip & 0xFF);
-    return virtio_net_send(p, off + 28);
+    return nic_send(p, off + 28);
 }
 
 fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
-    if (vnet_active == 0) { return 0 - 1; }
+    if (nic_ready() == 0) { return 0 - 1; }
     # For now, use broadcast MAC (QEMU user-mode handles it)
     var dst_mac[8];
     memset(&dst_mac, 0xFF, 6);
@@ -116,21 +116,21 @@ fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
     var off = eth_build(p, &dst_mac, &vnet_mac, 0x0800);
     var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
     ip_build(p + off, net_ip, dst_ip, 17, udp_len);
-    return virtio_net_send(p, off + 20 + udp_len);
+    return nic_send(p, off + 20 + udp_len);
 }
 
 # Send a UDP datagram with an explicit src_ip override (for DHCP, where
 # the kernel doesn't have an assigned IP yet — src_ip=0.0.0.0). Bypasses
 # net_ip. Identical to udp_send otherwise. (1.32.0 bite G — DHCP needs this.)
 fn udp_send_from(src_ip, dst_ip, src_port, dst_port, data, data_len) {
-    if (vnet_active == 0) { return 0 - 1; }
+    if (nic_ready() == 0) { return 0 - 1; }
     var dst_mac[8];
     memset(&dst_mac, 0xFF, 6);
     var p = &net_pkt;
     var off = eth_build(p, &dst_mac, &vnet_mac, 0x0800);
     var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
     ip_build(p + off, src_ip, dst_ip, 17, udp_len);
-    return virtio_net_send(p, off + 20 + udp_len);
+    return nic_send(p, off + 20 + udp_len);
 }
 
 # === UDP listener table (1.32.0 bite F — server-side UDP) ===
@@ -284,7 +284,7 @@ fn dhcp_print_ip(ip) {
 # net_netmask in place; returns 0. On failure: returns -1, leaves
 # net_init's pre-set values untouched.
 fn dhcp_init() {
-    if (vnet_active == 0) { return 0 - 1; }
+    if (nic_ready() == 0) { return 0 - 1; }
     dhcp_xid = (timer_ticks * 64017 + 31337) & 0xFFFFFFFF;
     var lid = udp_bind(68);
     if (lid < 0) {
@@ -416,7 +416,7 @@ fn net_handle_arp(pkt, len) {
         var target_ip = (load8(pkt + 38) << 24) | (load8(pkt + 39) << 16) | (load8(pkt + 40) << 8) | load8(pkt + 41);
         if (target_ip != net_ip) { return 0; }
         # Build reply: swap sender/target, oper=2, our MAC as sender HW.
-        if (vnet_active == 0) { return 0; }
+        if (nic_ready() == 0) { return 0; }
         var requester_mac[8];
         var requester_ip = (load8(pkt + 28) << 24) | (load8(pkt + 29) << 16) | (load8(pkt + 30) << 8) | load8(pkt + 31);
         net_copy_buf(&requester_mac, pkt + 22, 6);
@@ -436,7 +436,7 @@ fn net_handle_arp(pkt, len) {
         store8(p + off + 25, (requester_ip >> 16) & 0xFF);
         store8(p + off + 26, (requester_ip >> 8) & 0xFF);
         store8(p + off + 27, requester_ip & 0xFF);
-        virtio_net_send(p, off + 28);
+        nic_send(p, off + 28);
     }
     return 0;
 }
@@ -468,8 +468,8 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
 }
 
 fn net_poll() {
-    if (vnet_active == 0) { return 0; }
-    var pkt_len = virtio_net_poll(&net_rx_pkt, 2048);
+    if (nic_ready() == 0) { return 0; }
+    var pkt_len = nic_poll(&net_rx_pkt, 2048);
     if (pkt_len < 14) { return 0; }
     # Parse Ethernet header: dst(6) src(6) ethertype(2)
     var ethertype = (load8(&net_rx_pkt + 12) << 8) | load8(&net_rx_pkt + 13);
@@ -622,7 +622,7 @@ fn tcp_build_header(pkt, src_port, dst_port, seq, ack, flags, window) {
 }
 
 fn tcp_send_pkt(conn_id, flags, data, data_len) {
-    if (vnet_active == 0) { return 0 - 1; }
+    if (nic_ready() == 0) { return 0 - 1; }
     var cb = tcp_conn_base(conn_id);
     var src_port = load64(cb + 8);
     var dst_port = load64(cb + 16);
@@ -645,7 +645,7 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     store8(p + tcp_off + 17, cksum & 0xFF);
     # Build IP header (proto=6 for TCP)
     ip_build(p + off, net_ip, dst_ip, 6, tcp_total);
-    return virtio_net_send(p, off + 20 + tcp_total);
+    return nic_send(p, off + 20 + tcp_total);
 }
 
 fn tcp_connect(dst_ip, dst_port, src_port) {
