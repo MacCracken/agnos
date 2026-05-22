@@ -397,6 +397,15 @@ if (gpt_init() == 1) {
 vfs_init();
 kprintln("VFS initialized", 15);
 
+# ext2 / ext4 Phase 1 (1.31.5) — whole-disk mount attempt against the
+# active block backend. Quiet on non-ext2 disks (most boots); logs
+# geometry on success. Phase 1 reads superblock + BGDT + caches inode
+# geometry; file reads available via ext2_read_file(inode_num, buf,
+# maxlen) — direct blocks only (Phase 2 adds indirects, Phase 3 adds
+# `ls`/`cat`, Phase 4 adds ext4 extents). See agnosticos/docs/development/
+# ext2-ext4-extents-prior-art.md.
+ext2_init();
+
 # === CMOS kernel checkpoint 12 (VFS up) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0C; 0xE6; 0x71; }
 

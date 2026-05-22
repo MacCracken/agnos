@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.31.4
+# agnos.cyr — AGNOS kernel v1.31.5
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
@@ -93,6 +93,7 @@ include "core/block.cyr"
 include "core/gpt.cyr"
 include "core/net.cyr"
 include "core/fatfs.cyr"
+include "core/ext2.cyr"
 include "core/syscall.cyr"
 include "user/test_procs.cyr"
 # Boot shim must be the first top-level statement emitted: it transitions

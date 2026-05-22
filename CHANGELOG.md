@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.31.5] — 2026-05-21
+
 ## [1.31.4] — 2026-05-21
 
 ### RAM-disk backend + VirtIO 1.x modern virtio-blk-pci driver (1.31.4 cycle scope)

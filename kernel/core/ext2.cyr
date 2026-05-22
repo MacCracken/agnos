@@ -1,0 +1,354 @@
+# === ext2 / ext4 Read-Only Filesystem (1.31.5 Phase 1) ===
+#
+# Minimal ext2-format reader over the block dispatch layer (blk_read).
+# Phase 1 scope: superblock + BGDT + inode-by-number + direct-block file
+# read (i_block[0..11]). Caps file reads at 48 KB on 4K-block filesystems
+# (12 direct blocks). Phase 2 adds indirect blocks; Phase 3 adds dirent
+# walk + `ls` / `cat`; Phase 4 adds ext4 extents.
+#
+# Mounting modes:
+#   - whole-disk: ext2_init() reads superblock from LBA 2/3 (byte 1024).
+#     Matches the fatfs precedent (test images are whole-disk formatted).
+#   - partition: Phase 3/4 will add ext2_init_partition(first_lba) which
+#     resolves a GPT partition's first_lba and offsets all reads.
+#
+# Per agnosticos/docs/development/ext2-ext4-extents-prior-art.md §§ 3, 7.
+
+# --- Globals --------------------------------------------------------
+
+var ext2_active             = 0;    # 0 = not mounted; 1 = mounted
+var ext2_blocksize          = 0;    # bytes per FS block (1024/2048/4096)
+var ext2_blocks_per_group   = 0;
+var ext2_inodes_per_group   = 0;
+var ext2_inode_size         = 0;    # 128 (legacy) or 256 (modern ext4)
+var ext2_first_data_block   = 0;    # 0 for blocksize >= 2048, 1 for blocksize == 1024
+var ext2_partition_first_lba = 0;   # 0 = whole-disk; set by Phase 3+ partition mount
+var ext2_sectors_per_block  = 0;    # cached: blocksize / 512
+
+# Buffers — sized for max-blocksize (4096) since blocks bigger than that
+# are out of scope for Phase 1-4.
+var ext2_sb_buf[128];      # 1024 bytes — superblock at byte 1024 of FS
+var ext2_bgdt_buf[512];    # 4096 bytes — one BGDT block (32 BGDT entries × 32 bytes legacy fits in 1 KB; up to 128 entries fit in 4 KB)
+var ext2_inode_buf[32];    # 256 bytes — one inode (covers both 128-legacy + 256-modern)
+var ext2_block_buf[512];   # 4096 bytes — scratch for one data block
+
+# --- Endian-aware byte helpers (ext2/ext4 is little-endian on disk) -
+
+fn ext2_load16_le(ptr, off) {
+    return load8(ptr + off) | (load8(ptr + off + 1) << 8);
+}
+
+fn ext2_load32_le(ptr, off) {
+    return load8(ptr + off)
+         | (load8(ptr + off + 1) << 8)
+         | (load8(ptr + off + 2) << 16)
+         | (load8(ptr + off + 3) << 24);
+}
+
+# --- Superblock field accessors (Haiku-style — endian-handled at boundary) -
+
+fn ext2_sb_blocks_count(sb)      { return ext2_load32_le(sb, 4); }
+fn ext2_sb_first_data_block(sb)  { return ext2_load32_le(sb, 20); }
+fn ext2_sb_log_block_size(sb)    { return ext2_load32_le(sb, 24); }
+fn ext2_sb_blocks_per_group(sb)  { return ext2_load32_le(sb, 32); }
+fn ext2_sb_inodes_per_group(sb)  { return ext2_load32_le(sb, 40); }
+fn ext2_sb_magic(sb)             { return ext2_load16_le(sb, 56); }
+fn ext2_sb_rev_level(sb)         { return ext2_load32_le(sb, 76); }
+fn ext2_sb_inode_size(sb)        { return ext2_load16_le(sb, 88); }
+fn ext2_sb_feature_incompat(sb)  { return ext2_load32_le(sb, 96); }
+
+# --- Inode field accessors ----------------------------------------------
+
+fn ext2_inode_mode(inode)        { return ext2_load16_le(inode, 0); }
+fn ext2_inode_size_lo(inode)     { return ext2_load32_le(inode, 4); }
+fn ext2_inode_size_hi(inode)     { return ext2_load32_le(inode, 108); }
+fn ext2_inode_flags(inode)       { return ext2_load32_le(inode, 32); }
+
+# i_block[i] is a 32-bit LE block pointer at byte offset 40 + i*4
+fn ext2_inode_block_ptr(inode, i) { return ext2_load32_le(inode, 40 + i * 4); }
+
+# Composite file size: low 32 + high 32 (LARGE_FILE feature) for regular files.
+# For Phase 1 we cap at 2 GB regardless (i_size_hi == 0 always on small test images).
+fn ext2_inode_filesize(inode) {
+    var lo = ext2_inode_size_lo(inode);
+    var hi = ext2_inode_size_hi(inode);
+    return lo | (hi << 32);
+}
+
+# --- Mount -------------------------------------------------------------
+#
+# Reads superblock @ byte 1024 of partition (= LBA 2-3 of partition's
+# first_lba). Validates magic 0xEF53, checks feature flags, caches
+# blocksize and inode geometry. Returns 0 on success, -1 on any failure.
+#
+# Phase 1-3 supported-incompat mask: FILETYPE | RECOVER | MMP | FLEX_BG |
+# EA_INODE | CSUM_SEED | LARGEDIR = 0x6706. Anything else triggers
+# refusal with a clear "unsupported incompat bits" log line.
+
+fn ext2_init() {
+    if (blk_active == 0) {
+        kprintln("ext2: no block backend", 22);
+        return 0 - 1;
+    }
+
+    # Whole-disk mount: superblock at byte 1024 = LBA 2..3 of disk.
+    # When Phase 3+ adds partition support, this becomes
+    # `ext2_partition_first_lba + 2 ..`.
+    ext2_partition_first_lba = 0;
+    var sb_lba_lo = ext2_partition_first_lba + 2;
+    var sb_lba_hi = ext2_partition_first_lba + 3;
+
+    # Read 1024 bytes (two sectors) into sb_buf.
+    if (blk_read(sb_lba_lo, &ext2_sb_buf) != 0) {
+        kprintln("ext2: superblock read failed (lo)", 33);
+        return 0 - 1;
+    }
+    if (blk_read(sb_lba_hi, &ext2_sb_buf + 512) != 0) {
+        kprintln("ext2: superblock read failed (hi)", 33);
+        return 0 - 1;
+    }
+
+    # Validate magic 0xEF53. First sanity gate; cheapest possible.
+    var magic = ext2_sb_magic(&ext2_sb_buf);
+    if (magic != 0xEF53) {
+        # Quiet failure — every block backend boot reads sector 2,
+        # but most won't be ext2. Don't log noise unless something
+        # explicitly asked for ext2 mount.
+        return 0 - 1;
+    }
+
+    # Magic matched — from here on, log loudly: ext2 is the FS, and any
+    # failure deserves an explanation.
+
+    # Feature gate. Phase 1-3 supports only: FILETYPE (0x2) + RECOVER
+    # (0x4) + MMP (0x100) + FLEX_BG (0x200) + EA_INODE (0x400) +
+    # CSUM_SEED (0x2000) + LARGEDIR (0x4000) = 0x6706. Anything else
+    # in the incompat field aborts mount.
+    var supported_mask = 0x6706;
+    var incompat = ext2_sb_feature_incompat(&ext2_sb_buf);
+    var unsupported = incompat & (0xFFFFFFFF ^ supported_mask);
+    if (unsupported != 0) {
+        kprint("ext2: unsupported incompat bits: ", 33);
+        kprint_num(unsupported);
+        kprintln("", 0);
+        return 0 - 1;
+    }
+
+    # Decode geometry.
+    var log_bs               = ext2_sb_log_block_size(&ext2_sb_buf);
+    ext2_blocksize           = 1024 << log_bs;
+    ext2_blocks_per_group    = ext2_sb_blocks_per_group(&ext2_sb_buf);
+    ext2_inodes_per_group    = ext2_sb_inodes_per_group(&ext2_sb_buf);
+    ext2_first_data_block    = ext2_sb_first_data_block(&ext2_sb_buf);
+    ext2_sectors_per_block   = ext2_blocksize / 512;
+
+    # Inode size: DYNAMIC_REV (rev_level >= 1) reads from offset 88;
+    # GOOD_OLD_REV defaults to 128. Defensive cap at 256 for our buffer.
+    var rev = ext2_sb_rev_level(&ext2_sb_buf);
+    if (rev >= 1) {
+        ext2_inode_size = ext2_sb_inode_size(&ext2_sb_buf);
+        if (ext2_inode_size == 0) { ext2_inode_size = 128; }
+        if (ext2_inode_size > 256) {
+            kprintln("ext2: inode_size > 256 unsupported", 34);
+            return 0 - 1;
+        }
+    } else {
+        ext2_inode_size = 128;
+    }
+
+    # Blocksize sanity. 1024/2048/4096 are the realistic values; refuse
+    # anything else (Phase 1 buffer is 4096).
+    if ((ext2_blocksize != 1024)
+      & (ext2_blocksize != 2048)
+      & (ext2_blocksize != 4096)) {
+        kprint("ext2: unsupported blocksize ", 28);
+        kprint_num(ext2_blocksize);
+        kprintln("", 0);
+        return 0 - 1;
+    }
+
+    # Mount complete. Log geometry for diagnostic continuity.
+    kprint("ext2: mounted (blocksize=", 25);
+    kprint_num(ext2_blocksize);
+    kprint(", inode_size=", 13);
+    kprint_num(ext2_inode_size);
+    kprint(", inodes_per_group=", 19);
+    kprint_num(ext2_inodes_per_group);
+    kprintln(")", 1);
+
+    ext2_active = 1;
+    return 0;
+}
+
+# --- Block# → LBA conversion ------------------------------------------
+#
+# FS block N starts at byte offset N * blocksize from the START of the
+# partition (or disk in whole-disk mode). Convert to LBA via:
+#   LBA = partition_first_lba + N * sectors_per_block
+
+fn ext2_block_to_lba(block_num) {
+    return ext2_partition_first_lba + block_num * ext2_sectors_per_block;
+}
+
+# Read one FS block into the caller's buffer (buf must be sized >=
+# ext2_blocksize). Returns 0 on success, -1 on read error.
+
+fn ext2_read_block(block_num, buf) {
+    var lba = ext2_block_to_lba(block_num);
+    for (var i = 0; i < ext2_sectors_per_block; i = i + 1) {
+        if (blk_read(lba + i, buf + i * 512) != 0) {
+            return 0 - 1;
+        }
+    }
+    return 0;
+}
+
+# --- Inode lookup -----------------------------------------------------
+#
+# Inode-num → inode struct, copying ext2_inode_size bytes into out_buf.
+# Algorithm is universally convergent (Linux/FreeBSD/OpenBSD/Haiku all
+# identical):
+#
+#   inode_num -= 1                            # 1-indexed!
+#   block_group       = inode_num / inodes_per_group
+#   index_in_group    = inode_num % inodes_per_group
+#   inode_table_block = bgdt[block_group].bg_inode_table
+#   byte_offset       = index_in_group * inode_size
+#   target_block      = inode_table_block + byte_offset / blocksize
+#   offset_in_block   = byte_offset % blocksize
+#
+# Reserved inode numbers: 1 = bad blocks, 2 = root dir (every path
+# lookup starts here), 11 = lost+found typical. Inode 0 is invalid.
+
+fn ext2_get_inode(inode_num, out_buf) {
+    if (ext2_active == 0) { return 0 - 1; }
+    if (inode_num == 0)   { return 0 - 1; }
+
+    var n            = inode_num - 1;
+    var block_group  = n / ext2_inodes_per_group;
+    var idx_in_group = n - block_group * ext2_inodes_per_group;  # n % per_group
+
+    # Read BGDT block. Lives at FS block (first_data_block + 1).
+    # Phase 1 reads exactly one BGDT block; that holds the first
+    # (blocksize / 32) groups. For a 4K-block FS that's 128 groups,
+    # which covers FSes up to 128 * blocks_per_group * 4 KB = 128 *
+    # 32768 * 4 KB = 16 GB. Larger FSes need Phase 4+ work (META_BG
+    # or multi-chunk BGDT walk).
+    var bgdt_block = ext2_first_data_block + 1;
+    if (ext2_read_block(bgdt_block, &ext2_bgdt_buf) != 0) {
+        return 0 - 1;
+    }
+
+    # BGDT entries are 32 bytes (legacy ext2; ext4 64BIT is 64-byte but
+    # 64BIT is refused at mount). bg_inode_table is at byte offset 8.
+    var bgdt_entry_size = 32;
+    var max_groups_in_chunk = ext2_blocksize / bgdt_entry_size;
+    if (block_group >= max_groups_in_chunk) {
+        kprintln("ext2: block_group beyond first BGDT chunk (Phase 1 limit)", 57);
+        return 0 - 1;
+    }
+    var bgdt_off = &ext2_bgdt_buf + block_group * bgdt_entry_size;
+    var inode_table_block = ext2_load32_le(bgdt_off, 8);
+
+    # Compute target block + offset.
+    var byte_offset      = idx_in_group * ext2_inode_size;
+    var blocks_into_table = byte_offset / ext2_blocksize;
+    var off_in_block     = byte_offset - blocks_into_table * ext2_blocksize;
+    var target_block     = inode_table_block + blocks_into_table;
+
+    # Read the inode-table block containing our inode.
+    if (ext2_read_block(target_block, &ext2_block_buf) != 0) {
+        return 0 - 1;
+    }
+
+    # Copy inode_size bytes out.
+    var src = &ext2_block_buf + off_in_block;
+    for (var i = 0; i < ext2_inode_size; i = i + 1) {
+        store8(out_buf + i, load8(src + i));
+    }
+    return 0;
+}
+
+# --- File read (direct blocks only — Phase 1) -------------------------
+#
+# Reads up to maxlen bytes from a regular file's data, starting at
+# offset 0. Walks i_block[0..11] direct pointers; aborts when:
+#   (a) i_block[i] == 0 (sparse hole) → returns zeros for that block
+#   (b) i_block[i+1..] are out of range (file < 12 direct blocks)
+#   (c) we hit i_block[12] (file too big for direct blocks alone — Phase 2)
+#   (d) maxlen reached
+#
+# Returns bytes_read on success (>= 0), -1 on error.
+#
+# IMPORTANT: this is Phase 1 — files > 12 direct blocks (48 KB on 4K)
+# are truncated at the direct-block cap with no warning. Phase 2 lifts
+# this; Phase 4 handles extents (ext4 default since ~2008).
+
+fn ext2_read_file(inode_num, buf, maxlen) {
+    if (ext2_active == 0) { return 0 - 1; }
+    if (buf == 0)         { return 0 - 1; }
+
+    # Load inode.
+    if (ext2_get_inode(inode_num, &ext2_inode_buf) != 0) {
+        return 0 - 1;
+    }
+
+    # Refuse non-regular files (Phase 1 scope is regular file content
+    # reads; dirs / symlinks / specials handled by later phases).
+    var mode = ext2_inode_mode(&ext2_inode_buf);
+    var ftype = mode & 0xF000;
+    if (ftype != 0x8000) {
+        kprintln("ext2: ext2_read_file on non-regular inode", 41);
+        return 0 - 1;
+    }
+
+    # Refuse ext4 extents in Phase 1 (Phase 4 unlock).
+    var flags = ext2_inode_flags(&ext2_inode_buf);
+    if ((flags & 0x80000) != 0) {
+        kprintln("ext2: ext4 EXTENTS_FL inode (Phase 4 unlock)", 44);
+        return 0 - 1;
+    }
+
+    # Effective read size = min(file_size, maxlen).
+    var file_size = ext2_inode_filesize(&ext2_inode_buf);
+    var to_read = file_size;
+    if (to_read > maxlen) { to_read = maxlen; }
+    if (to_read == 0) { return 0; }
+
+    # Walk direct blocks 0..11.
+    var bytes_done = 0;
+    for (var i = 0; i < 12; i = i + 1) {
+        if (bytes_done >= to_read) { break; }
+        var blk = ext2_inode_block_ptr(&ext2_inode_buf, i);
+        if (blk == 0) {
+            # Sparse hole: zero-fill this block's worth of buf.
+            var remaining = to_read - bytes_done;
+            var chunk = ext2_blocksize;
+            if (chunk > remaining) { chunk = remaining; }
+            for (var k = 0; k < chunk; k = k + 1) {
+                store8(buf + bytes_done + k, 0);
+            }
+            bytes_done = bytes_done + chunk;
+        } else {
+            # Real block — read into scratch, then memcpy out.
+            if (ext2_read_block(blk, &ext2_block_buf) != 0) {
+                return 0 - 1;
+            }
+            var remaining = to_read - bytes_done;
+            var chunk = ext2_blocksize;
+            if (chunk > remaining) { chunk = remaining; }
+            for (var k = 0; k < chunk; k = k + 1) {
+                store8(buf + bytes_done + k, load8(&ext2_block_buf + k));
+            }
+            bytes_done = bytes_done + chunk;
+        }
+    }
+
+    # If the file is longer than direct blocks but we hit our cap, log
+    # ONCE per call so the user knows Phase 2 would help.
+    if ((bytes_done < to_read) & (bytes_done >= 12 * ext2_blocksize)) {
+        kprintln("ext2: file exceeds 12 direct blocks (Phase 2 unlock)", 52);
+    }
+
+    return bytes_done;
+}
