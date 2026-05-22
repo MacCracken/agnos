@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **DHCP gate predicate** — `main.cyr:655` was gating `dhcp_init()` on `if (vnet_active != 0)` (virtio-net only). On real iron with r8169, `vnet_active == 0` permanently, so the gate never fired and the four expected `dhcp:` lines never printed even though the r8169 driver completed Phase 1-4 cleanly. Iron Attempt 92 (2026-05-22) was a Partial PASS that surfaced this: all six expected `r8169:` lines printed verbatim (`found at 0xFCF04000`, `MAC=176:65:111:12:228:37`, `chip-rev byte=0x87`, `reset OK; Phase 1 complete`, `RX ring up`, `TX ring up`) + storage trio + GPT + ext4 mount all byte-identical to Attempt 91, but DHCP was silent. Root cause: the gate predicate, NOT a driver-internal bug (H1/H7/H8 audit hypotheses all blocked upstream). Fix: `if (vnet_active != 0 || nic_ready() != 0)` — explicit OR with the generic abstraction on the RHS so future NIC backends (i225-V queued) don't force another gate edit (per [[feedback_prefer_generic_abstraction_at_call_sites]] — captured after this fix took two rounds of user pushback to land in the right shape). Build 600,520 → 601,392 B (+872 B reachability shift); `scripts/test.sh` 4/4 PASS. **Attempt 93 PENDING IRON** for validation; expected delta = four new `dhcp:` lines between `Interrupts enabled` and the TCP_LISTEN_SMOKE block.
+
 ## [1.32.0] — 2026-05-22
 
 ### Networking arc — bite B Phase 5 (pre-burn audit): `r8169-iron-burn-audit.md` landed
