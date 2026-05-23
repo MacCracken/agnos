@@ -213,7 +213,7 @@ fn vnet_negotiate_features() {
     store32(vnet_common_cfg + VNET_DRV_FEAT, drv_hi);
 
     store8(vnet_common_cfg + VNET_DEV_STATUS,
-        VNET_STATUS_ACK | VNET_STATUS_DRIVER | VNET_STATUS_FEATURES_OK);
+    VNET_STATUS_ACK | VNET_STATUS_DRIVER | VNET_STATUS_FEATURES_OK);
 
     var status = load8(vnet_common_cfg + VNET_DEV_STATUS);
     if ((status & VNET_STATUS_FEATURES_OK) == 0) {
@@ -324,16 +324,16 @@ fn virtio_net_init() {
 
     # Queue 0 = RX, queue 1 = TX per § 5.1.2.
     if (vnet_setup_queue(0,
-            &vnet_rx_qsize, &vnet_rx_desc, &vnet_rx_avail, &vnet_rx_used,
-            &vnet_rxq_notify) < 0) { return 0 - 1; }
+    &vnet_rx_qsize, &vnet_rx_desc, &vnet_rx_avail, &vnet_rx_used,
+    &vnet_rxq_notify) < 0) { return 0 - 1; }
     if (vnet_setup_queue(1,
-            &vnet_tx_qsize, &vnet_tx_desc, &vnet_tx_avail, &vnet_tx_used,
-            &vnet_txq_notify) < 0) { return 0 - 1; }
+    &vnet_tx_qsize, &vnet_tx_desc, &vnet_tx_avail, &vnet_tx_used,
+    &vnet_txq_notify) < 0) { return 0 - 1; }
 
     vnet_rx_prime();
 
     store8(vnet_common_cfg + VNET_DEV_STATUS,
-        VNET_STATUS_ACK | VNET_STATUS_DRIVER | VNET_STATUS_FEATURES_OK | VNET_STATUS_DRIVER_OK);
+    VNET_STATUS_ACK | VNET_STATUS_DRIVER | VNET_STATUS_FEATURES_OK | VNET_STATUS_DRIVER_OK);
 
     vnet_active = 1;
     return 0;

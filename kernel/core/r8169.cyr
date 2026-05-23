@@ -488,7 +488,7 @@ fn r8169_probe() {
     # destined to b0:41:6f:0c:e4:25 before the ring is touched.
     r8169_mmio_write8(R8169_REG_CFG9346, R8169_CFG9346_UNLOCK);
     var mac_lo = load8(&r8169_mac) | (load8(&r8169_mac + 1) << 8)
-               | (load8(&r8169_mac + 2) << 16) | (load8(&r8169_mac + 3) << 24);
+    | (load8(&r8169_mac + 2) << 16) | (load8(&r8169_mac + 3) << 24);
     var mac_hi = load8(&r8169_mac + 4) | (load8(&r8169_mac + 5) << 8);
     store32(r8169_mmio_base + R8169_REG_MAC4, mac_hi);
     r8169_mmio_read8(R8169_REG_CR);          # PCI commit (flush posted write)
