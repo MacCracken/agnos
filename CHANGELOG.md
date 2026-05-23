@@ -121,12 +121,16 @@ Used inside Part A's body before length extraction. Pre-fix, an RES frame's repo
 
 **Part C — `r8169_rx_rearm(desc)` helper with EOR read-preserve** (COSMETIC, but cheap). Mirrors Linux `rtl8169_mark_to_asic` lines 3799-3807. Reads back the current EOR bit from `opts1` instead of hard-coding "EOR on idx==15." Pre-fix and post-fix agree today (16-slot ring with EOR at the last slot), but a future ring-resize would silently lose EOR. Replaces the inline 4-line rearm in two sites (success path + skip path).
 
+**Part D — CMOS-stamp hot-path elimination** (audit S-1). Pre-fix `r8169_poll` performed 4 CMOS stamps on every call (RX_POLL_COUNT + RX_DESC0_OWN + RX_DESC0_BYTE0 + TX_DESC0_OWN) at ~2 µs each via 0x70/0x71 port-IO = ~8 µs hot-path tax. With Part A's multi-frame loop running up to 16 times per poll entry, the per-poll cost could easily compete with frame arrival rate on a live LAN — exactly the kind of throughput cliff that lets a single OFFER frame slip through the cracks while we burn CPU stamping CMOS. Stamps now fire only on state transitions: RX_POLL_COUNT + RX_DESC0_OWN + RX_DESC0_BYTE0 stamp only inside the successful-frame-consume branch (so they refresh whenever we actually deliver a frame upstream); TX_DESC0_OWN moved into `r8169_send` and fires when `tx_idx == 1` (the natural "first send completed, next slot active" transition). Post-burn CMOS readback for `read-boot-log.sh --verbose` reflects the same diagnostic story but the hot-path tax is gone.
+
+**Part E — `RxMaxSize` aligned with Linux convergent** (audit S-2). `r8169_init_rx` step 5 now writes `0x4000` (16384) instead of `0x05F3` (1523), matching the Linux v6.6 `rtl_init_one` "effective-disable" pattern. Pre-fix value excluded any VLAN-tagged frame >1518 — not a factor for DHCP-on-untagged-LAN but a convergence gap the audit flagged. Two-byte register write change, no behavior delta expected on the iron test surface.
+
 ### Validated — no regression on storage + networking
 
 - `scripts/test.sh` — 4/4 PASS
 - `scripts/ext2-smoke.sh` — 5/5 PASS + 5/5 regression
 - `scripts/tcp-listen-smoke.sh` — QEMU modern virtio_net DHCP cycle (DISCOVER → OFFER 10.0.2.15 → REQUEST → ACK → tcp_accept conn_id=1) confirmed still working post-r8169-fix
-- Build: 616,744 B (1.32.3 baseline, pre-r8169-fix) → **617,128 B (1.32.3, post-r8169-fix)**. Net +384 B for the 3-part RX-path fix. cyrius 6.0.1 + gnoboot 0.4.2 unchanged.
+- Build: 616,744 B (1.32.3 baseline, pre-r8169-fix) → 617,128 B (Parts A+B+C only) → **617,000 B (Parts A+B+C+D+E, current)**. Net **+256 B** for the full 5-part RX-path bundle (Part D's hot-path-stamp removal actually shrinks the binary by 128 B relative to A+B+C). cyrius 6.0.1 + gnoboot 0.4.2 unchanged.
 
 **Iron-burn validation pending user direction** per [[feedback_iron_burns_block_other_work]]. Expected outcome on archaemenid (assuming the audit's load-bearing diagnosis holds): full DHCP cycle `dhcp: DISCOVER → OFFER ip=192.168.1.X → REQUEST → ACK gw=192.168.1.1 mask=255.255.255.0`, leasing from the same `192.168.1.1` gateway that Linux uses on the same wire.
 
@@ -144,7 +148,7 @@ That's the r8169 chip — same MAC AGNOS sees, same port, same cable — activel
 
 - **i225-V driver** — Intel 2.5GbE driver, pending Intel-NIC iron (post-archaemenid-migration). ~700-1100 LOC. Mirrors r8169 Phase 1-4 shape.
 - **BBS + MUD userland** — separate standalone repos. Arrive when wire-end-to-end TCP accept-success works on iron. Move in parallel.
-- **Iron Attempt 97 — validates 1.32.3 r8169 RX-path fix** (Parts A+B+C) on archaemenid. Target outcome: `dhcp: OFFER ip=192.168.1.X / REQUEST / ACK gw=192.168.1.1` lines on the boot console. If still `OFFER timeout`: re-run audit against the next divergence rank (CMOS-stamp performance tax + RxMaxSize disable per audit S-1 / S-2). Pending user-authorized iron burn per [[feedback_iron_burns_block_other_work]].
+- **Iron Attempt 97 — validates 1.32.3 r8169 RX-path 5-part bundle** (Parts A+B+C+D+E) on archaemenid. Target outcome: `dhcp: OFFER ip=192.168.1.X / REQUEST / ACK gw=192.168.1.1 mask=255.255.255.0` lines on the boot console. If still `OFFER timeout` after the full bundle: re-audit at a finer grain (single-source Linux-only vs the prior multi-source convergent shape may have missed a chip-rev-specific quirk, e.g. CPlusCmd register at MMIO 0xE0 which AGNOS doesn't touch). Pending user-authorized iron burn per [[feedback_iron_burns_block_other_work]].
 - **Legacy virtio-net interface** — full 1.34.x bite per "Deferred" section above.
 
 ### Build trajectory across 1.32.x
@@ -154,7 +158,7 @@ That's the r8169 chip — same MAC AGNOS sees, same port, same cable — activel
 | 1.32.0 close | 601,392 B | — | Networking arc feature-complete (TCP server + UDP server + DHCP client + r8169 Phases 1-4) |
 | 1.32.1 close | 604,096 B | +2,704 B | 6-FIX bundle (nic_mac + net_init iron path + non-blocking PHY + chaddr + 800-iter timeout + RxConfig constants) |
 | 1.32.2 close | 605,056 B | +960 B | 4-FIX bundle (IDR write-back + UDP buf 1024 + DHCP retransmit + PHY-restart-only-if-down) |
-| **1.32.3 close** | **617,128 B** | **+12,072 B** | **virtio-net legacy → modern rewrite + r8169 RX-path fix (multi-frame loop + RES/FS|LS gating + rx_rearm helper); QEMU DHCP works end-to-end; iron Attempt 97 pending** |
+| **1.32.3 close** | **617,000 B** | **+11,944 B** | **virtio-net legacy → modern rewrite + r8169 RX-path 5-part bundle (multi-frame loop + RES/FS\|LS gating + rx_rearm helper + CMOS-stamp hot-path elimination + RxMaxSize Linux-converge); QEMU DHCP works end-to-end; iron Attempt 97 pending** |
 
 cyrius pin stays on 6.0.1. gnoboot stays on 0.4.2. MVP gate (boot-to-shell with typeable keyboard on iron) green since Attempt 68 / 1.30.9 and confirmed still green at Attempt 96.
 

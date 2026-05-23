@@ -490,10 +490,15 @@ fn r8169_init_rx() {
     var rxcfg = R8169_RXCFG_DEFAULTS | R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
     store32(r8169_mmio_base + R8169_REG_RXCONFIG, rxcfg);
 
-    # 5. Max RX packet size (16-bit register at 0xDA): MTU 1500 + Eth
-    #    (14) + VLAN (4) + CRC (4) headroom = ~1522. Round to 0x05F3.
-    store8(r8169_mmio_base + 0xDA, 0xF3);
-    store8(r8169_mmio_base + 0xDB, 0x05);
+    # 5. Max RX packet size (16-bit register at 0xDA). Linux v6.6
+    #    rtl_init_one writes 0x3FFF on most 8168 variants — effectively
+    #    "no max." OpenBSD/FreeBSD use the same disable-pattern. The
+    #    pre-1.32.3 value of 0x05F3 (1523) was tight enough to drop any
+    #    VLAN-tagged frame >1518; not load-bearing for DHCP-on-untagged-LAN
+    #    but the 1.32.3 audit S-2 finding flagged the convergence gap.
+    #    Audit: docs/development/r8169-rx-path-audit.md § S-2.
+    store8(r8169_mmio_base + 0xDA, 0x00);
+    store8(r8169_mmio_base + 0xDB, 0x40);
 
     # 6. Enable RX in CR (set RE bit; preserve other bits).
     var cr = load8(r8169_mmio_base + 0x37);
@@ -537,23 +542,14 @@ fn r8169_poll(buf, maxlen) {
     if (r8169_present == 0) { return 0; }
     if (r8169_rx_ring_phys == 0) { return 0; }
 
-    # 1.32.1 bite B — diagnostic CMOS stamps for the original FIX-#7 arc.
-    # Kept post-1.32.3 audit since they don't break anything and a future
-    # iron burn might want them; the audit's S-1 finding flagged the ~8µs
-    # tax per poll but it isn't load-bearing once the multi-frame loop is in.
+    # 1.32.3 audit S-1: bump in-memory poll counter but skip the per-poll
+    # CMOS stamps. The 4 stamps that fired here (RX_POLL_COUNT + RX_DESC0_OWN
+    # + RX_DESC0_BYTE0 + TX_DESC0_OWN) at ~2 µs each = ~8 µs hot-path tax
+    # competing with frame-arrival rate on a busy LAN. Stamps now fire only
+    # on state transitions (each successful frame consume below; TX stamp
+    # moved to r8169_send).
     if (r8169_rx_poll_count < 0xFF) {
         r8169_rx_poll_count = r8169_rx_poll_count + 1;
-    }
-    xhci_cmos_stamp(R8169_KCP_RX_POLL_COUNT, r8169_rx_poll_count);
-    var rx0_status = load32(r8169_rx_ring_phys);
-    xhci_cmos_stamp(R8169_KCP_RX_DESC0_OWN, (rx0_status >> 24) & 0xFF);
-    var rx0_buf = load64(&r8169_rx_bufs);
-    if (rx0_buf != 0) {
-        xhci_cmos_stamp(R8169_KCP_RX_DESC0_BYTE0, load8(rx0_buf) & 0xFF);
-    }
-    if (r8169_tx_ring_phys != 0) {
-        var tx0_status = load32(r8169_tx_ring_phys);
-        xhci_cmos_stamp(R8169_KCP_TX_DESC0_OWN, (tx0_status >> 24) & 0xFF);
     }
 
     # Multi-frame budget loop (16 = one full ring walk worst case).
@@ -590,6 +586,14 @@ fn r8169_poll(buf, maxlen) {
         for (var i = 0; i < pkt_len; i = i + 1) {
             store8(buf + i, load8(bufaddr + i));
         }
+
+        # 1.32.3 audit S-1: state-transition CMOS stamps — fire only on a
+        # successful frame consume, not every poll-entry. Preserves the
+        # diagnostic story (post-burn read still shows poll-count + RX desc
+        # state + first-byte) without the hot-path tax.
+        xhci_cmos_stamp(R8169_KCP_RX_POLL_COUNT, r8169_rx_poll_count);
+        xhci_cmos_stamp(R8169_KCP_RX_DESC0_OWN, (status >> 24) & 0xFF);
+        xhci_cmos_stamp(R8169_KCP_RX_DESC0_BYTE0, load8(bufaddr) & 0xFF);
 
         r8169_rx_rearm(desc);
         r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
@@ -682,6 +686,14 @@ fn r8169_send(buf, len) {
     var new_status = 0x80000000 | 0x20000000 | 0x10000000 | len;
     if (r8169_tx_idx == 15) { new_status = new_status | 0x40000000; }
     store32(desc, new_status);
+
+    # 1.32.3 audit S-1: TX desc 0 OWN stamp moved from r8169_poll's hot
+    # path into here — fires only when state actually transitions. Post-burn
+    # CMOS read for 0x5B reflects the latest TX descriptor we wrote.
+    if (r8169_tx_idx == 1) {
+        var tx0_status = load32(r8169_tx_ring_phys);
+        xhci_cmos_stamp(R8169_KCP_TX_DESC0_OWN, (tx0_status >> 24) & 0xFF);
+    }
 
     # Kick TX engine: write NPQ bit (0x40) to TPPoll. This is W1C-style —
     # writing the bit asks the NIC to walk the queue once.
