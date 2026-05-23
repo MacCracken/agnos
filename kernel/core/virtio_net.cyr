@@ -1,19 +1,42 @@
 # === VirtIO-Net Driver ===
-# Legacy (transitional) virtio PCI interface
-# BAR0 = I/O base. Registers at offsets from BAR0.
+# Legacy (transitional) virtio PCI interface — vendor 0x1AF4, device 0x1000.
+#
+# Per virtio 1.0 §2.4.2 ("A Note on Virtqueue Layout"), each virtqueue is one
+# physically-contiguous block laid out as desc | avail | pad-to-page | used.
+# The driver hands the device only `desc_base >> 12` via QUEUE_PFN (BAR0+8);
+# the device reconstructs avail_base = desc_base + 16*qsz and
+# used_base = ALIGN(avail_base + 6 + 2*qsz, 4096).
+#
+# Multi-source convergent per docs/development/virtio-net-legacy-layout-audit.md
+# (Linux drivers/virtio/virtio_pci_legacy.c + virtio_ring.h, OpenBSD
+# sys/dev/pv/virtio.c, FreeBSD sys/dev/virtio/virtqueue.c).
+#
+# Memory: each queue gets one 16384 B (var [2048] = 2048×u64 at module scope)
+# reserve, sized for qsz=256 with 4 KB of page-alignment slack (Approach A
+# from the audit — over-allocate + offset, no kernel page-allocator dep).
 var vnet_iobase = 0;
 var vnet_mac[8];
-var vnet_tx_desc[64];
-var vnet_tx_avail[8];
-var vnet_tx_used[8];
-var vnet_rx_desc[64];
-var vnet_rx_avail[8];
-var vnet_rx_used[8];
-var vnet_tx_buf[256];
-var vnet_rx_buf[2048];
-var vnet_tx_idx = 0;
-var vnet_rx_idx = 0;
+var vnet_tx_ring[2048];      # 16384 B reserve (TX desc + avail + pad + used)
+var vnet_rx_ring[2048];      # 16384 B reserve (RX, same shape)
+var vnet_tx_base = 0;        # page-aligned base inside vnet_tx_ring
+var vnet_rx_base = 0;
+var vnet_tx_qsz = 0;         # device-reported queue size (power of 2)
+var vnet_rx_qsz = 0;
+var vnet_tx_avail_off = 0;   # offsets within the per-queue base
+var vnet_tx_used_off = 0;
+var vnet_rx_avail_off = 0;
+var vnet_rx_used_off = 0;
+var vnet_tx_buf[256];        # 2048 B TX scratch (10 hdr + 1500 MTU + slack)
+var vnet_rx_buf[2048];       # 16384 B RX scratch
+var vnet_tx_idx = 0;         # avail.idx mirror (16-bit free-running, wraps via store16)
+var vnet_rx_last_idx = 0;
 var vnet_active = 0;
+
+# Round x up to the next 4096-byte boundary (avoiding `~` bitwise-not, which
+# isn't established in this codebase — divide/multiply form is equivalent).
+fn vnet_page_align(x) {
+    return ((x + 4095) / 4096) * 4096;
+}
 
 fn virtio_net_init() {
     var idx = pci_find(0x1AF4, 0x1000);
@@ -21,56 +44,69 @@ fn virtio_net_init() {
     var bar0 = PciDev_bar0(&pci_devs + idx * 32);
     vnet_iobase = bar0 & 0xFFFC;
 
-    # Reset device
+    # Enable PCI bus-master so the device can DMA from descriptor pages.
+    # Matches the nvme/ahci/virtio_blk pattern. Without this the doorbell
+    # fires but the device can't read driver memory; descriptors are invisible.
+    pci_enable_bus_master(PciDev_slot(&pci_devs + idx * 32));
+
+    # Reset device, then ACKNOWLEDGE (1) | DRIVER (2).
     outb(vnet_iobase + 18, 0);
-    # Set ACKNOWLEDGE (1)
-    outb(vnet_iobase + 18, 1);
-    # Set DRIVER (2)
     outb(vnet_iobase + 18, 3);
 
-    # Read device features, accept MAC feature (bit 5) + any others
+    # Feature negotiation: ACK only VIRTIO_NET_F_MAC (bit 5). Per audit
+    # secondary finding #2, leaving VIRTIO_NET_F_MRG_RXBUF (bit 15) on
+    # would grow the virtio-net header from 10 to 12 bytes and break the
+    # hardcoded hdr_len in send/poll. Drop all other features for MVP.
     var features = inl(vnet_iobase);
-    outl(vnet_iobase + 4, features);
+    var accepted = features & 0x20;
+    outl(vnet_iobase + 4, accepted);
 
-    # Set up TX queue (queue 0)
+    # Page-align both ring bases inside their over-allocated reserves.
+    vnet_tx_base = vnet_page_align(&vnet_tx_ring);
+    vnet_rx_base = vnet_page_align(&vnet_rx_ring);
+
+    # --- TX queue (index 0) ---
     outw(vnet_iobase + 14, 0);
-    var tx_qsz = inw(vnet_iobase + 12);
-    # Queue address = physical page number of descriptor table
-    # We use vnet_tx_desc as the queue memory (already in identity-mapped space)
-    var tx_addr = &vnet_tx_desc;
-    outl(vnet_iobase + 8, tx_addr / 4096);
+    vnet_tx_qsz = inw(vnet_iobase + 12);
+    vnet_tx_avail_off = 16 * vnet_tx_qsz;
+    vnet_tx_used_off  = vnet_page_align(vnet_tx_avail_off + 6 + 2 * vnet_tx_qsz);
+    # Zero the queue region (desc + avail + used + a guard page worth).
+    memset(vnet_tx_base, 0, vnet_tx_used_off + 4096);
+    outl(vnet_iobase + 8, vnet_tx_base / 4096);
 
-    # Set up RX queue (queue 1)
+    # --- RX queue (index 1) ---
     outw(vnet_iobase + 14, 1);
-    var rx_qsz = inw(vnet_iobase + 12);
-    var rx_addr = &vnet_rx_desc;
-    outl(vnet_iobase + 8, rx_addr / 4096);
+    vnet_rx_qsz = inw(vnet_iobase + 12);
+    vnet_rx_avail_off = 16 * vnet_rx_qsz;
+    vnet_rx_used_off  = vnet_page_align(vnet_rx_avail_off + 6 + 2 * vnet_rx_qsz);
+    memset(vnet_rx_base, 0, vnet_rx_used_off + 4096);
+    outl(vnet_iobase + 8, vnet_rx_base / 4096);
 
-    # Populate RX descriptors (1 descriptor pointing to rx_buf)
-    store64(&vnet_rx_desc, &vnet_rx_buf);
-    store32(&vnet_rx_desc + 8, 2048);
-    store16(&vnet_rx_desc + 12, 2);
-    store16(&vnet_rx_desc + 14, 0);
-    # RX avail ring: flags=0, idx=1, ring[0]=0
-    store16(&vnet_rx_avail, 0);
-    store16(&vnet_rx_avail + 2, 1);
-    store16(&vnet_rx_avail + 4, 0);
+    # Populate RX descriptor 0 pointing at vnet_rx_buf with VIRTQ_DESC_F_WRITE.
+    # Single-buffer semantics: only desc 0 is ever used (matches pre-fix shape).
+    store64(vnet_rx_base + 0,  &vnet_rx_buf);
+    store32(vnet_rx_base + 8,  16384);
+    store16(vnet_rx_base + 12, 2);
+    store16(vnet_rx_base + 14, 0);
+    # avail: flags=0, idx=1, ring[0]=desc 0
+    store16(vnet_rx_base + vnet_rx_avail_off,     0);
+    store16(vnet_rx_base + vnet_rx_avail_off + 2, 1);
+    store16(vnet_rx_base + vnet_rx_avail_off + 4, 0);
 
     vnet_tx_idx = 0;
-    vnet_rx_idx = 0;
+    vnet_rx_last_idx = 0;
 
-    # Set DRIVER_OK — legacy: status = ACKNOWLEDGE | DRIVER | DRIVER_OK = 7
+    # DRIVER_OK = ACKNOWLEDGE | DRIVER | DRIVER_OK = 7
     outb(vnet_iobase + 18, 7);
 
-    # Read MAC address (device-specific config at offset 20 in legacy mode)
-    # Only valid if VIRTIO_NET_F_MAC (bit 5) is in features
-    if ((features & 0x20) != 0) {
+    # Read MAC from legacy device-specific config (BAR0 + 20) if F_MAC live.
+    if ((accepted & 0x20) != 0) {
         for (var i = 0; i < 6; i = i + 1) {
             store8(&vnet_mac + i, inb(vnet_iobase + 20 + i));
         }
     }
 
-    # Notify RX queue to start receiving
+    # Notify RX queue to start receiving.
     outw(vnet_iobase + 16, 1);
 
     vnet_active = 1;
@@ -80,62 +116,57 @@ fn virtio_net_init() {
 fn virtio_net_send(buf, len) {
     if (vnet_active == 0) { return 0 - 1; }
     if (len > 1500) { return 0 - 1; }
-    # Virtio net header (10 bytes for legacy): all zeros
+    # 10-byte legacy virtio-net header (all zeros — no checksum offload, no GSO).
     var hdr_len = 10;
     for (var i = 0; i < hdr_len; i = i + 1) {
         store8(&vnet_tx_buf + i, 0);
     }
-    # Copy packet data after header
     for (var i = 0; i < len; i = i + 1) {
         store8(&vnet_tx_buf + hdr_len + i, load8(buf + i));
     }
-    # Set up TX descriptor
-    store64(&vnet_tx_desc, &vnet_tx_buf);
-    store32(&vnet_tx_desc + 8, hdr_len + len);
-    store16(&vnet_tx_desc + 12, 0);
-    store16(&vnet_tx_desc + 14, 0);
-    # TX avail ring
-    store16(&vnet_tx_avail, 0);
-    store16(&vnet_tx_avail + 2, vnet_tx_idx + 1);
-    store16(&vnet_tx_avail + 4, 0);
+    # Single-buffer semantics: always reuse descriptor 0.
+    store64(vnet_tx_base + 0,  &vnet_tx_buf);
+    store32(vnet_tx_base + 8,  hdr_len + len);
+    store16(vnet_tx_base + 12, 0);
+    store16(vnet_tx_base + 14, 0);
+    # avail.ring[idx & (qsz-1)] = 0, then bump avail.idx.
+    var slot = vnet_tx_idx & (vnet_tx_qsz - 1);
+    store16(vnet_tx_base + vnet_tx_avail_off + 4 + slot * 2, 0);
     vnet_tx_idx = vnet_tx_idx + 1;
-    # Notify TX queue
+    store16(vnet_tx_base + vnet_tx_avail_off + 2, vnet_tx_idx);
+    # Doorbell: notify queue 0.
     outw(vnet_iobase + 16, 0);
     return len;
 }
 
-var vnet_rx_last_idx = 0;
-
 fn virtio_net_poll(buf, maxlen) {
     if (vnet_active == 0) { return 0; }
-    # Check RX used ring for received packets
-    # Used ring layout: flags(2) idx(2) ring entries(id(4)+len(4) each)
-    var used_idx = load16(&vnet_rx_used + 2);
+    var used_idx = load16(vnet_rx_base + vnet_rx_used_off + 2);
     if (used_idx == vnet_rx_last_idx) { return 0; }
-    # A packet was received - read used ring entry
-    var entry_off = 4 + (vnet_rx_last_idx & 0xFF) * 8;
-    var desc_id = load32(&vnet_rx_used + entry_off);
-    var pkt_len = load32(&vnet_rx_used + entry_off + 4);
+    # Used-ring entry at slot (last_idx & (qsz-1)): id(u32) + len(u32) = 8 bytes.
+    var slot = vnet_rx_last_idx & (vnet_rx_qsz - 1);
+    var entry_off = vnet_rx_used_off + 4 + slot * 8;
+    var pkt_len = load32(vnet_rx_base + entry_off + 4);
     vnet_rx_last_idx = vnet_rx_last_idx + 1;
-    # Skip the 10-byte virtio-net header
+    # Strip 10-byte virtio-net header.
     var hdr_len = 10;
     var data_len = pkt_len - hdr_len;
     if (data_len < 0) { data_len = 0; }
     if (data_len > maxlen) { data_len = maxlen; }
-    # Copy packet data (skip virtio header)
     for (var i = 0; i < data_len; i = i + 1) {
         store8(buf + i, load8(&vnet_rx_buf + hdr_len + i));
     }
-    # Re-post the RX descriptor for the next packet
-    store64(&vnet_rx_desc, &vnet_rx_buf);
-    store32(&vnet_rx_desc + 8, 2048);
-    store16(&vnet_rx_desc + 12, 2);
-    store16(&vnet_rx_desc + 14, 0);
-    # Update avail ring
-    var avail_idx = load16(&vnet_rx_avail + 2);
-    store16(&vnet_rx_avail + 4 + (avail_idx & 0xFF) * 2, 0);
-    store16(&vnet_rx_avail + 2, avail_idx + 1);
-    # Notify RX queue (queue 1)
+    # Re-post descriptor 0 for the next packet (single-buffer semantics).
+    store64(vnet_rx_base + 0,  &vnet_rx_buf);
+    store32(vnet_rx_base + 8,  16384);
+    store16(vnet_rx_base + 12, 2);
+    store16(vnet_rx_base + 14, 0);
+    # avail.ring[avail.idx & (qsz-1)] = 0, then bump avail.idx.
+    var avail_idx = load16(vnet_rx_base + vnet_rx_avail_off + 2);
+    var av_slot = avail_idx & (vnet_rx_qsz - 1);
+    store16(vnet_rx_base + vnet_rx_avail_off + 4 + av_slot * 2, 0);
+    store16(vnet_rx_base + vnet_rx_avail_off + 2, avail_idx + 1);
+    # Doorbell: notify queue 1.
     outw(vnet_iobase + 16, 1);
     return data_len;
 }
