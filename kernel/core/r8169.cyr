@@ -60,7 +60,9 @@ var R8169_DESC_OWN      = 0x80000000;  # NIC owns when set; driver owns when cle
 var R8169_DESC_EOR      = 0x40000000;  # End Of Ring (last descriptor wraps)
 var R8169_DESC_FS       = 0x20000000;  # First Segment (single-segment frame: FS+LS set)
 var R8169_DESC_LS       = 0x10000000;  # Last Segment
+var R8169_DESC_RES      = 0x00200000;  # Receive Error Summary (1.32.3 audit FINDING #2)
 var R8169_DESC_LEN_MASK = 0x00003FFF;  # length field is 14 bits
+var R8169_FRAG_MASK     = 0x30000000;  # FS | LS — frame complete when both set
 
 # Ring sizes — 16 descriptors per direction. Linux defaults 256 for
 # perf; BBS/MUD-class workloads fit easily in 16. Power-of-two so the
@@ -502,16 +504,43 @@ fn r8169_init_rx() {
     return 0;
 }
 
-# Drain one packet from the RX ring if available. Returns bytes copied
-# into `buf` (0 if no packet pending, or descriptor still NIC-owned).
+# Re-arm an RX descriptor with OWN=1, preserving the EOR bit by reading
+# it back from the descriptor's current opts1. Mirrors Linux's
+# `rtl8169_mark_to_asic` (r8169_main.c:3799-3807) — a future ring-resize
+# bug can't silently lose EOR because we never hard-code which slot has it.
+fn r8169_rx_rearm(desc) {
+    var prev = load32(desc);
+    var eor  = prev & 0x40000000;
+    store32(desc, 0x80000000 | eor | 2048);
+    return 0;
+}
+
+# Drain one valid packet from the RX ring, skipping errored / fragmented /
+# stale slots within a budget. Returns bytes copied into `buf`, or 0 if no
+# good frame found before budget exhaustion or until the next NIC-owned slot.
+#
+# 1.32.3 audit fix (docs/development/r8169-rx-path-audit.md):
+#   - Part A: multi-frame budget loop, mirroring Linux `rtl_rx` (line 4417)
+#     + OpenBSD `re_rxeof` (line 1576) + FreeBSD `re_rxeof` (line 3451).
+#     Pre-fix, this function returned after a single descriptor check, so a
+#     live LAN's IPv6 / IPv4 multicast traffic kept `dhcp_init`'s OFFER loop
+#     burning iterations on background frames while the OFFER sat in a later
+#     slot. CMOS 0x5E=0x01 at Attempt 96 was an IPv4 multicast first byte
+#     (`01:00:5e:...`), not the OFFER's `0xb0:41:...` unicast or `0xff:...`
+#     broadcast — proof the chip received traffic but never the OFFER frame
+#     into the slot we were inspecting.
+#   - Part B: RES (0x00200000) + FS|LS (0x30000000) gating. Pre-fix, an
+#     errored or fragmented frame would have its garbage length passed up to
+#     ethernet_recv which would parse a junk ethertype and silently drop.
+#     The slot still consumed an iteration. Now: skip + re-arm + advance.
 fn r8169_poll(buf, maxlen) {
     if (r8169_present == 0) { return 0; }
     if (r8169_rx_ring_phys == 0) { return 0; }
 
-    # 1.32.1 bite B — refresh diagnostic snapshots on every poll. Poll
-    # runs continuously in scheduler idle, so the post-mortem reflects
-    # the most-recent observable state across both TX and RX descriptor
-    # 0 (the descriptors DISCOVER and OFFER would have used first).
+    # 1.32.1 bite B — diagnostic CMOS stamps for the original FIX-#7 arc.
+    # Kept post-1.32.3 audit since they don't break anything and a future
+    # iron burn might want them; the audit's S-1 finding flagged the ~8µs
+    # tax per poll but it isn't load-bearing once the multi-frame loop is in.
     if (r8169_rx_poll_count < 0xFF) {
         r8169_rx_poll_count = r8169_rx_poll_count + 1;
     }
@@ -527,28 +556,49 @@ fn r8169_poll(buf, maxlen) {
         xhci_cmos_stamp(R8169_KCP_TX_DESC0_OWN, (tx0_status >> 24) & 0xFF);
     }
 
-    var desc = r8169_rx_ring_phys + r8169_rx_idx * 16;
-    var status = load32(desc);
-    if ((status & 0x80000000) != 0) { return 0; }   # NIC still owns
+    # Multi-frame budget loop (16 = one full ring walk worst case).
+    var budget = 16;
+    while (budget > 0) {
+        budget = budget - 1;
 
-    var pkt_len = status & 0x3FFF;
-    # Strip CRC: RTL8168 includes 4-byte FCS in the reported length per
-    # datasheet §6.7 (all four BSD/Linux refs do the same subtraction).
-    if (pkt_len >= 4) { pkt_len = pkt_len - 4; }
-    if (pkt_len > maxlen) { pkt_len = maxlen; }
+        var desc = r8169_rx_ring_phys + r8169_rx_idx * 16;
+        var status = load32(desc);
+        if ((status & R8169_DESC_OWN) != 0) { return 0; }   # NIC still owns this slot; nothing more for now
 
-    var bufaddr = load64(&r8169_rx_bufs + r8169_rx_idx * 8);
-    for (var i = 0; i < pkt_len; i = i + 1) {
-        store8(buf + i, load8(bufaddr + i));
+        # RES — Receive Error Summary. Frame has CRC / runt / link errors;
+        # length field is unreliable. Re-arm and advance.
+        if ((status & R8169_DESC_RES) != 0) {
+            r8169_rx_rearm(desc);
+            r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
+            continue;
+        }
+
+        # FS|LS — both bits MUST be set for a single-segment frame. Pre-1.32.3
+        # we silently delivered fragments as full frames. Now: re-arm + skip.
+        if ((status & R8169_FRAG_MASK) != R8169_FRAG_MASK) {
+            r8169_rx_rearm(desc);
+            r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
+            continue;
+        }
+
+        # Good frame — extract length (strip CRC per RTL § 6.7) + copy.
+        var pkt_len = status & R8169_DESC_LEN_MASK;
+        if (pkt_len >= 4) { pkt_len = pkt_len - 4; }
+        if (pkt_len > maxlen) { pkt_len = maxlen; }
+
+        var bufaddr = load64(&r8169_rx_bufs + r8169_rx_idx * 8);
+        for (var i = 0; i < pkt_len; i = i + 1) {
+            store8(buf + i, load8(bufaddr + i));
+        }
+
+        r8169_rx_rearm(desc);
+        r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
+        return pkt_len;
     }
 
-    # Re-arm descriptor for next packet (OWN=1, preserve EOR on last).
-    var new_status = 0x80000000 | 2048;
-    if (r8169_rx_idx == 15) { new_status = new_status | 0x40000000; }
-    store32(desc, new_status);
-
-    r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
-    return pkt_len;
+    # Budget exhausted with no good frame — give caller a chance to do other work
+    # before we try again. Next poll picks up where this left off via r8169_rx_idx.
+    return 0;
 }
 
 # === Phase 3 — TX descriptor ring + per-buf pages + send ============

@@ -5,6 +5,159 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.32.3] — 2026-05-23 (virtio-net modern rewrite — QEMU DHCP full cycle works; r8169 RX-path audit landed + 3-part fix for iron-side OFFER-timeout; Iron Attempt 96 falsified the 1.32.2 4-FIX bundle, CMOS evidence proves r8169 chip engines healthy)
+
+### Context — two independent bugs, same shell symptom
+
+Iron Attempt 96 (2026-05-23, photos `iron-nuc-zen-photos/attempt-96-agnos-1.32.2-r8169-link-up-rx-tx-rings-up.jpg` + `attempt-96-agnos-1.32.2-fix-7-8-9-10-offer-timeout-persists.jpg`) was burned with the full 1.32.2 4-FIX bundle (#7 IDR write-back + #8 UDP buffer 1024B + #9 DISCOVER/REQUEST midpoint retransmit + #10 PHY-restart-only-if-down). Result: `dhcp: DISCOVER → dhcp: OFFER timeout` — same symptom as Attempts 93/94/95. The r8169 boot block printed BOTH `PHY autoneg kicked (link async)` AND `link up` BEFORE RX/TX init ran, so FIX #10's safe-path branch fired and the engine-wedge mechanism the bundle was designed to prevent did not apply.
+
+Same-session CMOS verbose readback (`sudo ./scripts/read-boot-log.sh --verbose`) decoded the post-mortem unambiguously: 0x58=0x01 (probe done), 0x59=0x01 (PHY LINK UP — autoneg completed), 0x5A=0x02 (TX sends fired twice — DISCOVER + FIX #9 retransmit), **0x5B=0x30 (TX OWN cleared — NIC processed the descriptor and egressed the frame)**, 0x5C=0xFF (RX poll saturated), 0x5D=0x80 (RX desc re-armed), **0x5E=0x01 (RX DMA visible — NIC captured a multicast frame)**. Byte-identical to Attempt 94's healthy baseline. **The r8169 NIC engines are not the bottleneck.** Attempt 94's original framing ("OFFER-timeout root cause moves UPSTREAM of NIC") was correct all along; the 1.32.1 + 1.32.2 audits chased the FIX #3 engine-wedge regression and missed that fixing it (correctly) just restored the original Attempt-94 evidence baseline.
+
+Per user direction "exhaust the QEMU route before more burns and we can do the CMOS items then", the next investigation moved to QEMU + virtio-net + SLIRP + `-object filter-dump` pcap. **The 1.32.0 cycle's "SLIRP-RX gap" framing was wrong** — pcap captures the wire directly and showed AGNOS-egress frames were missing entirely (only OVMF's IPv6 NS DAD probe in 126-byte pcap). SLIRP RX is fine; the AGNOS legacy virtio_net driver was the broken component, not SLIRP. Iron and QEMU were two independent bugs with the same shell-level symptom.
+
+### Added — `agnosticos/docs/development/virtio-net-legacy-layout-audit.md` (multi-source convergent)
+
+Audit doc (~315 lines) landed in agnosticos. Per [[feedback_redesign_dont_reinvent]]: triangulates OASIS virtio 1.0 / 1.1 spec § 2.4.2 + Linux `include/uapi/linux/virtio_ring.h` (`vring_init`, `vring_size`) + Linux `drivers/virtio/virtio_pci_legacy.c` + OpenBSD `sys/dev/pv/virtio.c` (`virtio_alloc_vq`) + FreeBSD `sys/dev/virtio/virtqueue.c` + FreeBSD `sys/dev/virtio/pci/virtio_pci_legacy.c`. Three independent prior-art sources converge on the same formula: each virtqueue is **one physically-contiguous block** laid out as `desc | avail | pad-to-Queue-Align(4096) | used`, with the device computing `avail_base = desc_base + 16*qsz` and `used_base = ALIGN_UP(avail_base + 6 + 2*qsz, 4096)`. Only the desc-base PFN crosses the doorbell — there is no transport-side mechanism to communicate three independent base addresses, so a split-array layout is structurally undetectable to the device. Audit captures verdict (CONFIRMED), spec quotation, Linux/BSD code citations with line numbers, AGNOS divergence walk through `virtio_net.cyr:6-13` + `:39-47` + `:80-105`, minimum-viable fix shape (Approach A: over-allocate + offset), LOC estimate, secondary findings (RX descriptor-slot-rotation, MRG_RXBUF feature-mask trap), risk + cross-references. Post-implementation update appended after the legacy rewrite hit a third bug.
+
+### Added — `kernel/core/virtio_net.cyr` modern rewrite (148 LOC legacy → 366 LOC modern; replaces the v1.30.x-era 0.9.5 driver)
+
+Full rewrite to OASIS VirtIO 1.2 modern PCI transport per § 4.1 + § 5.1, mirroring `virtio_blk.cyr`'s proven shape. Accepts both pure-modern (device ID `0x1041`) and transitional (`0x1000`) — cap-list presence is the gate, not the device ID. Multi-source convergent per `virtio-net-legacy-layout-audit.md` § "Post-implementation update": OpenBSD `vio.c` for net-specific queue ordering (queue 0 = RX, queue 1 = TX per § 5.1.2), Linux `drivers/net/virtio_net.c` for header handling, FreeBSD `if_vtnet.c` for cap-walk classification.
+
+Shape highlights:
+- **PCI capability-list walk** (`vnet_scan_caps`) finds COMMON_CFG / NOTIFY_BASE / ISR_CFG / DEVICE_CFG MMIO bases. Validates BAR index < 6 + offset+length wrap-around (per Linux's `virtio_pci_modern_dev.c:57-62` security check), UC-remaps each BAR via `vmm_remap_uc_2mb`. Identical structure to `vblk_scan_caps`.
+- **8-step init** (`virtio_net_init`): reset → ACK → DRIVER → feature negotiation with FEATURES_OK gate → per-queue setup → DRIVER_OK. Features accepted: `VIRTIO_F_VERSION_1` (mandatory) + `VIRTIO_NET_F_MAC` (opportunistic). All others (MRG_RXBUF, CTRL_VQ, CSUM, GSO, MQ, ANY_LAYOUT, EVENT_IDX, INDIRECT_DESC, …) deliberately unack'd — keeps the 12-byte modern header valid per § 5.1.6.1 and avoids extra queues that would need separate plumbing.
+- **Per-queue setup helper** (`vnet_setup_queue`) — three `pmm_alloc` calls per queue (desc + avail + used), `vmm_map` identity-maps each, zero-fills, writes 64-bit phys to QUEUE_DESC_LO/HI / QUEUE_DRIVER_LO/HI / QUEUE_DEVICE_LO/HI, computes notify address from `QUEUE_NOTIFY × notify_off_multiplier`, sets QUEUE_ENABLE=1. Called twice — queue 0 (RX) and queue 1 (TX).
+- **RX bootstrap** (`vnet_rx_prime`) — pre-arms all 16 RX descriptors with 1536-byte slots from `vnet_rx_buf` (24 KB total = 16 × 1536). Publishes all 16 to the avail ring, sets avail.idx=16, doorbells RX queue. Each subsequent `virtio_net_poll` rotates one slot back into the ring after consumption.
+- **TX path** (`virtio_net_send`) — single 12-byte modern virtio-net header zero-filled + num_buffers field = 1, frame copied into `vnet_tx_buf` (1536 B), one descriptor published at slot `tx_idx % qsize`, wmb (mfence `0F AE F0`) between slot write and avail.idx increment per § 2.7.13.3.1, doorbell at TX queue.
+- **RX path** (`virtio_net_poll`) — reads used.idx, rmb (mfence) per § 2.7.13.4.1, decodes used-ring entry (desc_id + pkt_len), copies frame past 12-byte hdr into caller buffer, re-arms descriptor, republishes on avail ring with wmb, doorbells RX queue. Returns data_len or 0 if no frame ready.
+- **MAC accessor** (`virtio_net_mac`) — reads from `vnet_device_cfg + 0..5` (DEVICE_CFG offset 0 = 6-byte MAC, valid post-FEATURES_OK).
+
+Polled-only — no MSI-X plumbing. Same posture as virtio_blk: no ISR byte read, watch used.idx directly via net_poll callers. MSI-X vector registers (`VNET_CFG_MSIX_VEC`, `VNET_QUEUE_MSIX_VEC`) left at default 0xFFFF (NO_VECTOR).
+
+### Fixed — PCI bus-master enable (audit miss, surfaced during implementation)
+
+The original legacy driver was missing `pci_enable_bus_master(PciDev_slot(...))` — a one-line call that's present in nvme/ahci/virtio_blk paths but absent here. Without bus-master enabled in the PCI command register, the device cannot DMA from descriptor pages: writes to BAR0 I/O ports work (so MAC reads + status writes succeeded), but descriptor reads from system RAM silently failed. The audit caught the layout violation but not this. Modern rewrite includes the bus-master enable as step 1 of `virtio_net_init`, matching the existing virtio_blk pattern.
+
+### Fixed — Feature negotiation discipline
+
+Pre-rewrite, the driver wrote back ALL device-offered features unfiltered. If QEMU advertised `VIRTIO_NET_F_MRG_RXBUF` (bit 15, default-on for virtio-net legacy), the virtio-net header would silently expand from 10 to 12 bytes — but the legacy driver's hardcoded `hdr_len=10` in send/poll would have been off-by-2, corrupting every frame. Modern rewrite accepts only `VIRTIO_F_VERSION_1` + `VIRTIO_NET_F_MAC` and explicitly drops everything else; FEATURES_OK readback verifies the device accepted the subset (per § 2.2.2 — driver MUST NOT retry on rejection, full reset is the only recovery).
+
+### Validated — QEMU full DHCP cycle
+
+QEMU smoke (`scripts/tcp-listen-smoke.sh` with virtio-net-pci + SLIRP):
+
+```
+Activating scheduler...
+dhcp: DISCOVER
+dhcp: OFFER ip=10.0.2.15
+dhcp: REQUEST
+dhcp: ACK ip=10.0.2.15 gw=10.0.2.2 mask=255.255.255.0
+tcp_listen smoke: start
+tcp_listen(8080) lid=0
+tcp_accept: conn_id=1
+tcp_listen smoke: done
+```
+
+Pcap evidence (`-object filter-dump,id=f0,netdev=u1,file=/tmp/agnos-dhcp.pcap` — 1915 B, 5 frames):
+
+1. AGNOS → broadcast, UDP dst=67 (DHCP DISCOVER, 291 B)
+2. SLIRP `10.0.2.2` → broadcast, UDP dst=68 (DHCP OFFER, 590 B)
+3. AGNOS → broadcast, UDP dst=67 (DHCP REQUEST, 298 B)
+4. SLIRP `10.0.2.2` → broadcast, UDP dst=68 (DHCP ACK, 590 B)
+5. AGNOS ARP (42 B, gratuitous post-lease)
+
+Compare to 1.32.2 pcap: 126 B total, only OVMF's IPv6 NS — zero AGNOS frames. The modern rewrite is the first time AGNOS networking actually works end-to-end in QEMU.
+
+### Validated — no regression in storage subsystems
+
+- `scripts/test.sh` — 4/4 PASS
+- `scripts/ext2-smoke.sh` — 5/5 PASS (1-baseline, 2-ahci-wholedisk, 3-nvme-partition, 4-combined-order, 5-64bit-partition) + 5/5 regression cross-check (every smoke reaches `AGNOS shell v`)
+- Build trajectory: 604,096 B (1.32.1 close) → 605,056 B (1.32.2 4-FIX) → **616,744 B (1.32.3 production, post-modern-rewrite)**. Net +11,688 B vs 1.32.2 / +12,648 B vs 1.32.1.
+
+### Deferred — legacy virtio-net interface (1.34.x cleanup)
+
+The legacy 0.9.5 interface still exists in the transitional virtio-net-pci device (BAR0 I/O ports, contiguous in-page queue layout, `QUEUE_PFN` register). Per user direction 2026-05-23: switch to modern now, revisit legacy in 1.34.x. Modern works on every QEMU virtio-net-pci variant (default transitional + non-transitional) and is the path forward; the legacy code path is removed from `virtio_net.cyr` but the audit doc preserves the broken-layout analysis for future reference. If a true legacy-only device (no modern caps in the cap list) appears in some target hardware, `vnet_scan_caps` returns -1 and `virtio_net_init` fails gracefully — `nic_ready()` will report no NIC and the kernel boots to shell without networking, identical to the no-NIC iron path. Carry-forward into 1.34.x: stand up a separate legacy-mode init path that consumes the BAR0 I/O ports + `QUEUE_PFN` interface, gated behind a runtime-detect (cap-list absent → fall back to legacy). The legacy investigation surfaced a third bug beyond the layout violation — doorbell reaches the device + status=DRIVER_OK + spec-correct contiguous layout + bus-master on, but `virtio_net_handle_tx` never fires in QEMU's trace. Three candidate diagnoses recorded in `virtio-net-legacy-layout-audit.md` § "Post-implementation update": memory-ordering between `store16` and `outw`, I/O port sequence diff vs working virtio_blk, or QEMU-side handling of OVMF-prior-init transitional state. Park until 1.34.x.
+
+### Added — agnosticos planning + doc work this cycle
+
+- **`docs/development/planning/usb-hardening.md`** — beta-phase USB defensive stack (~200 lines). Threat model (BadUSB / Stuxnet / Cottonmouth / Thunderclap / syzkaller-Linux-USB-RCE), five defensive stages (pre-descriptor validation → class-policy → in-kernel per-device auth via aegis → behavioral sandboxing via kavach/phylax → IOMMU DMA isolation via AMD-Vi/Intel VT-d). Repo touch-points table, phased ordering (1 + 5 first, then 2 → 3 → 4), libro audit-chain integration mandatory. Public-beta scope, NOT MVP.
+- **`docs/development/first-party/`** — new subdirectory split out of `docs/development/planning/`. Moved `first-party-standards.md`, `first-party-documentation.md`, `example_claude.md`. Updated 11 live-doc cross-references across 10 files; archive + CHANGELOG historical entries intentionally preserved at the old path. Planning README index pointer added. New folder is the canonical home for future standards / template docs (e.g., `doc-health.example.md`).
+- **`docs/development/iron-nuc-zen-log.md` § Attempt 96** — full receipt with transcribed boot output (r8169 init block + post-scheduler block), CMOS readback decode (0x58-0x5F), branch (a) confirmation, three-way next-move framing (a1 external DHCP validation / a2-code-audit RX-path stack walk / a2-stamp one-CMOS-stamp burn). User picked (a1) external — pending. QEMU pivot folded into Attempt 96 narrative same-day.
+- **`docs/development/iron-nuc-zen-log.md` tracker for 1.32.2** — updated from "OPEN — sweep hardening" → "Attempt 96 FALSIFIED 4-FIX bundle; CMOS readback completed → Branch (a) confirmed: NIC engines healthy, root cause upstream/downstream of NIC".
+- **`scripts/src/read-boot-log.cyr`** — argparse `else` clause added so typo'd args (`--versbose`) error out instead of silently falling through to the default focused-summary; preamble refreshed from stale "Attempt 77 prep — agnos 1.30.12 — VGA font swap" to current "agnos 1.32.2 — FIX #7+#8+#9+#10 + Attempt 96 result". Per [[feedback_script_preambles_are_forward_looking]] — this had drifted across the 1.30.12 → 1.32.x arc.
+- **Photos catalogued** — both Attempt 96 photos moved from agnosticos top-level into `docs/development/iron-nuc-zen-photos/` with the existing `attempt-N-agnos-X.Y.Z-<symptom>.jpg` naming convention.
+- **New memory** — `feedback_top_level_photos_are_fresh_iron.md` — if the user drops `1322_*.jpg` at the agnosticos top level, those are FRESH iron-burn evidence (Attempt N+1, look up max from iron-nuc-zen-log and increment), not historical context. Cross-references `feedback_read_state_at_session_start`.
+
+### Added — `agnosticos/docs/development/r8169-rx-path-audit.md` (multi-source convergent, 524 lines)
+
+Per-line audit of `r8169_init_rx` + `r8169_poll` against Linux `r8169_main.c` v6.6 (`rtl_rx` lines 4417-4501, `rtl8169_mark_to_asic` lines 3799-3807), OpenBSD `re_rxeof` (`sys/dev/ic/re.c` lines 1576-1710), FreeBSD `re_rxeof` (`sys/dev/re/if_re.c` lines 3451-3651), plus RTL8168 datasheet § 6.7 + § 13.2. Triangulated divergence catalogue with severity ranks (LOAD-BEARING / LIKELY CONTRIBUTORS / COSMETIC), per-divergence quote pointing at the AGNOS line + each reference's line. Verdict: **LOAD-BEARING bug is `r8169_poll` returning after a single descriptor** (lines 530-532 + 550-551). On a live LAN, IPv4 multicast (`01:00:5e:...`) re-fills descriptor 0 between every poll call; the OFFER landing at a later slot is never inspected because the function returns before walking past the multicast slot. CMOS slot 0x5E=0x01 at Attempt 96 was the multicast first byte, NOT the OFFER's `0xb0` unicast or `0xff` broadcast — the dispositive evidence that the chip is healthy and frames DO land in the ring; we just never look at the right slot.
+
+LIKELY CONTRIBUTORS surfaced: missing `RES` (Receive Error Summary, bit 21) check + missing `FS|LS` complete-frame gate. Pre-fix, errored / fragmented frames had garbage `pkt_len` passed up to `ethernet_recv` which parsed junk ethertypes and silently dropped them — burning iterations of `dhcp_init`'s 800-iter OFFER-wait loop on background bad frames. Secondary findings: CMOS-stamp performance tax (~8 µs per poll, three stamps × ~2 µs each via 0x70/0x71 port-IO) competes with frame arrival rate; RxMaxSize over-tight at 1523 vs Linux's effective-disable at 16384; RxConfig high bits cosmetic divergence (0xE700 vs Linux modern 0xCF00).
+
+### Added — `kernel/core/r8169.cyr` RX-path fix (3 parts, ~40 LOC net)
+
+**Part A — multi-frame budget loop in `r8169_poll`** (LOAD-BEARING). Mirrors Linux `rtl_rx` line 4417 / OpenBSD line 1576 / FreeBSD line 3451 — all three walk the ring via budget-driven loops, skip bad slots, return on first good frame. New shape:
+
+```
+while (budget-- > 0) {
+    load opts1; if (OWN) return 0;            # NIC still owns from here on — stop
+    if (RES) { rearm; advance; continue; }    # error: skip
+    if ((opts1 & FRAG_MASK) != FRAG_MASK)     # fragmented: skip
+        { rearm; advance; continue; }
+    extract len, copy frame, rearm, advance, return len;
+}
+```
+
+Budget = 16 (one full ring walk). The OFFER gets delivered on the first poll cycle that overlaps with its arrival — not "after `dhcp_init` exhausts 800 iterations chewing through multicast one-frame-per-call."
+
+**Part B — `RES` + `FS|LS` gating constants** (LIKELY CONTRIBUTORS). New module-level constants:
+
+```
+var R8169_DESC_RES   = 0x00200000;  # Receive Error Summary (RxRES — Linux line 361)
+var R8169_FRAG_MASK  = 0x30000000;  # FS | LS — frame complete when both set
+```
+
+Used inside Part A's body before length extraction. Pre-fix, an RES frame's reported length could be 0 / 2048 / garbage; `ethernet_recv` would parse a garbage ethertype and drop silently — the slot still consumed a poll iteration.
+
+**Part C — `r8169_rx_rearm(desc)` helper with EOR read-preserve** (COSMETIC, but cheap). Mirrors Linux `rtl8169_mark_to_asic` lines 3799-3807. Reads back the current EOR bit from `opts1` instead of hard-coding "EOR on idx==15." Pre-fix and post-fix agree today (16-slot ring with EOR at the last slot), but a future ring-resize would silently lose EOR. Replaces the inline 4-line rearm in two sites (success path + skip path).
+
+### Validated — no regression on storage + networking
+
+- `scripts/test.sh` — 4/4 PASS
+- `scripts/ext2-smoke.sh` — 5/5 PASS + 5/5 regression
+- `scripts/tcp-listen-smoke.sh` — QEMU modern virtio_net DHCP cycle (DISCOVER → OFFER 10.0.2.15 → REQUEST → ACK → tcp_accept conn_id=1) confirmed still working post-r8169-fix
+- Build: 616,744 B (1.32.3 baseline, pre-r8169-fix) → **617,128 B (1.32.3, post-r8169-fix)**. Net +384 B for the 3-part RX-path fix. cyrius 6.0.1 + gnoboot 0.4.2 unchanged.
+
+**Iron-burn validation pending user direction** per [[feedback_iron_burns_block_other_work]]. Expected outcome on archaemenid (assuming the audit's load-bearing diagnosis holds): full DHCP cycle `dhcp: DISCOVER → OFFER ip=192.168.1.X → REQUEST → ACK gw=192.168.1.1 mask=255.255.255.0`, leasing from the same `192.168.1.1` gateway that Linux uses on the same wire.
+
+### Added — agnosticos network ground-truth check 2026-05-23 (decisive evidence for r8169 RX-path framing)
+
+Pulled `ip -br link` + `ip -br addr` + `ip route` on archaemenid's current Linux session (same machine that runs AGNOS via USB stick). Result:
+
+```
+enp1s0   UP   b0:41:6f:0c:e4:25   192.168.1.124/24   default via 192.168.1.1 proto dhcp
+```
+
+That's the r8169 chip — same MAC AGNOS sees, same port, same cable — actively leased by Linux dhclient from 192.168.1.1 under the running OS. **Branch (a1) wire/server hypothesis FALSIFIED.** The DHCP server is reachable, responsive, and willing to serve this NIC's MAC. The iron OFFER timeout MUST be a code bug in AGNOS's RX path — branch (a2-r8169-RX). This evidence drove the audit + fix above; pre-evidence I had been speculating about external validation paths that didn't apply on a single-machine dev setup (the agnosticos `feedback_top_level_photos_are_fresh_iron` + `project_hardware_catalog` memories both updated with the "no Linux laptop" correction).
+
+### Out-of-cycle carry-forward (continues)
+
+- **i225-V driver** — Intel 2.5GbE driver, pending Intel-NIC iron (post-archaemenid-migration). ~700-1100 LOC. Mirrors r8169 Phase 1-4 shape.
+- **BBS + MUD userland** — separate standalone repos. Arrive when wire-end-to-end TCP accept-success works on iron. Move in parallel.
+- **Iron Attempt 97 — validates 1.32.3 r8169 RX-path fix** (Parts A+B+C) on archaemenid. Target outcome: `dhcp: OFFER ip=192.168.1.X / REQUEST / ACK gw=192.168.1.1` lines on the boot console. If still `OFFER timeout`: re-run audit against the next divergence rank (CMOS-stamp performance tax + RxMaxSize disable per audit S-1 / S-2). Pending user-authorized iron burn per [[feedback_iron_burns_block_other_work]].
+- **Legacy virtio-net interface** — full 1.34.x bite per "Deferred" section above.
+
+### Build trajectory across 1.32.x
+
+| Cycle | Build size (production) | Net delta | Notes |
+|---|---|---|---|
+| 1.32.0 close | 601,392 B | — | Networking arc feature-complete (TCP server + UDP server + DHCP client + r8169 Phases 1-4) |
+| 1.32.1 close | 604,096 B | +2,704 B | 6-FIX bundle (nic_mac + net_init iron path + non-blocking PHY + chaddr + 800-iter timeout + RxConfig constants) |
+| 1.32.2 close | 605,056 B | +960 B | 4-FIX bundle (IDR write-back + UDP buf 1024 + DHCP retransmit + PHY-restart-only-if-down) |
+| **1.32.3 close** | **617,128 B** | **+12,072 B** | **virtio-net legacy → modern rewrite + r8169 RX-path fix (multi-frame loop + RES/FS|LS gating + rx_rearm helper); QEMU DHCP works end-to-end; iron Attempt 97 pending** |
+
+cyrius pin stays on 6.0.1. gnoboot stays on 0.4.2. MVP gate (boot-to-shell with typeable keyboard on iron) green since Attempt 68 / 1.30.9 and confirmed still green at Attempt 96.
+
 ## [1.32.2] — 2026-05-23 (Networking arc continued — Attempt 95 falsified 1.32.1 fix-set on iron; full sweep-hardening cycle, FOUR more bugs found incl. FIX #3 regression cause)
 
 ### Context — what Attempt 95 actually showed
