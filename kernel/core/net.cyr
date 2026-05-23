@@ -89,12 +89,14 @@ fn arp_request(target_ip) {
     var p = &net_pkt;
     var bcast[8];
     memset(&bcast, 0xFF, 6);
-    var off = eth_build(p, &bcast, &vnet_mac, 0x0806);
+    var kmac[8];
+    nic_mac(&kmac);   # FIX #1: backend-agnostic kernel MAC, not vnet_mac
+    var off = eth_build(p, &bcast, &kmac, 0x0806);
     # ARP: htype=1(eth) ptype=0x0800(ipv4) hlen=6 plen=4 oper=1(request)
     store16(p + off, 0x0001); store16(p + off + 2, 0x0800);
     store8(p + off + 4, 6); store8(p + off + 5, 4);
     store16(p + off + 6, 0x0001);
-    memcpy(p + off + 8, &vnet_mac, 6);
+    memcpy(p + off + 8, &kmac, 6);
     store8(p + off + 14, (net_ip >> 24) & 0xFF);
     store8(p + off + 15, (net_ip >> 16) & 0xFF);
     store8(p + off + 16, (net_ip >> 8) & 0xFF);
@@ -112,8 +114,10 @@ fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
     # For now, use broadcast MAC (QEMU user-mode handles it)
     var dst_mac[8];
     memset(&dst_mac, 0xFF, 6);
+    var kmac[8];
+    nic_mac(&kmac);   # FIX #1
     var p = &net_pkt;
-    var off = eth_build(p, &dst_mac, &vnet_mac, 0x0800);
+    var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
     ip_build(p + off, net_ip, dst_ip, 17, udp_len);
     return nic_send(p, off + 20 + udp_len);
@@ -126,8 +130,10 @@ fn udp_send_from(src_ip, dst_ip, src_port, dst_port, data, data_len) {
     if (nic_ready() == 0) { return 0 - 1; }
     var dst_mac[8];
     memset(&dst_mac, 0xFF, 6);
+    var kmac[8];
+    nic_mac(&kmac);   # FIX #1
     var p = &net_pkt;
-    var off = eth_build(p, &dst_mac, &vnet_mac, 0x0800);
+    var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
     ip_build(p + off, src_ip, dst_ip, 17, udp_len);
     return nic_send(p, off + 20 + udp_len);
@@ -260,8 +266,12 @@ fn dhcp_build_packet(buf, xid, opts, opts_len) {
     # secs (2) + flags (2): set broadcast flag 0x8000
     store8(buf + 10, 0x80);
     # ciaddr/yiaddr/siaddr/giaddr (16 bytes) = 0
-    # chaddr (16 bytes, MAC at first 6)
-    memcpy(buf + 28, &vnet_mac, 6);
+    # chaddr (16 bytes, MAC at first 6). FIX #1: use the active NIC's MAC,
+    # not vnet_mac (which is zero on iron without virtio — DHCP servers
+    # drop zero-chaddr requests per RFC 2131 §4.1).
+    var kmac[8];
+    nic_mac(&kmac);
+    memcpy(buf + 28, &kmac, 6);
     # sname (64) + file (128) = 0
     # magic cookie at offset 236
     store8(buf + 236, DHCP_MAGIC_0);
@@ -302,6 +312,11 @@ fn dhcp_init() {
     udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, plen);
     kprintln("dhcp: DISCOVER", 14);
 
+    # FIX #1 prep — capture our own MAC once so OFFER/ACK chaddr-match (FIX #4)
+    # doesn't redo nic_mac() inside the per-iter loop.
+    var our_mac[8];
+    nic_mac(&our_mac);
+
     # ---- wait OFFER ----
     var rx[320];
     var src_ip = 0;
@@ -309,19 +324,33 @@ fn dhcp_init() {
     var offered_ip = 0;
     var server_id = 0;
     var got = 0;
-    for (var ti = 0; ti < 200; ti = ti + 1) {
+    # FIX #5: budget bumped 200 → 800 iter (~2s → ~8s) — RFC 2131 §4.4.1
+    # specifies 4s minimum × retries. Full exponential backoff deferred
+    # to a later cycle; this is the minimum-viable extension.
+    for (var ti = 0; ti < 800; ti = ti + 1) {
         net_poll();
         var n = udp_recv_from(lid, &rx, 320, &src_ip, &src_port);
         if (n >= 240) {
             if (dhcp_load_u32_be(&rx + 4) == dhcp_xid) {
-                var oo = 240;
-                var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
-                if (mt_off >= 0 && load8(&rx + oo + mt_off) == 2) {
-                    offered_ip = dhcp_load_u32_be(&rx + 16);
-                    var sid_off = dhcp_find_option(&rx + oo, n - oo, 54);
-                    if (sid_off >= 0) { server_id = dhcp_load_u32_be(&rx + oo + sid_off); }
-                    got = 1;
-                    break;
+                # FIX #4: verify chaddr matches our hardware address
+                # (RFC 2131 §4.1.1 — MUST). Without this, a colliding xid
+                # from another client on the LAN could be accepted as ours.
+                var chaddr_match = 1;
+                for (var ci = 0; ci < 6; ci = ci + 1) {
+                    if (load8(&rx + 28 + ci) != load8(&our_mac + ci)) {
+                        chaddr_match = 0;
+                    }
+                }
+                if (chaddr_match == 1) {
+                    var oo = 240;
+                    var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
+                    if (mt_off >= 0 && load8(&rx + oo + mt_off) == 2) {
+                        offered_ip = dhcp_load_u32_be(&rx + 16);
+                        var sid_off = dhcp_find_option(&rx + oo, n - oo, 54);
+                        if (sid_off >= 0) { server_id = dhcp_load_u32_be(&rx + oo + sid_off); }
+                        got = 1;
+                        break;
+                    }
                 }
             }
         }
@@ -348,26 +377,35 @@ fn dhcp_init() {
     var assigned_mask = 0;
     var assigned_gw = 0;
     got = 0;
-    for (var ti = 0; ti < 200; ti = ti + 1) {
+    # FIX #5: same 800-iter budget for ACK; FIX #4: same chaddr match.
+    for (var ti = 0; ti < 800; ti = ti + 1) {
         net_poll();
         var n = udp_recv_from(lid, &rx, 320, &src_ip, &src_port);
         if (n >= 240) {
             if (dhcp_load_u32_be(&rx + 4) == dhcp_xid) {
-                var oo = 240;
-                var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
-                if (mt_off >= 0) {
-                    var mt = load8(&rx + oo + mt_off);
-                    if (mt == 5) {
-                        var nm_off = dhcp_find_option(&rx + oo, n - oo, 1);
-                        if (nm_off >= 0) { assigned_mask = dhcp_load_u32_be(&rx + oo + nm_off); }
-                        var gw_off = dhcp_find_option(&rx + oo, n - oo, 3);
-                        if (gw_off >= 0) { assigned_gw = dhcp_load_u32_be(&rx + oo + gw_off); }
-                        got = 1;
-                        break;
+                var chaddr_match = 1;
+                for (var ci = 0; ci < 6; ci = ci + 1) {
+                    if (load8(&rx + 28 + ci) != load8(&our_mac + ci)) {
+                        chaddr_match = 0;
                     }
-                    if (mt == 6) {
-                        kprintln("dhcp: NAK", 9);
-                        return 0 - 1;
+                }
+                if (chaddr_match == 1) {
+                    var oo = 240;
+                    var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
+                    if (mt_off >= 0) {
+                        var mt = load8(&rx + oo + mt_off);
+                        if (mt == 5) {
+                            var nm_off = dhcp_find_option(&rx + oo, n - oo, 1);
+                            if (nm_off >= 0) { assigned_mask = dhcp_load_u32_be(&rx + oo + nm_off); }
+                            var gw_off = dhcp_find_option(&rx + oo, n - oo, 3);
+                            if (gw_off >= 0) { assigned_gw = dhcp_load_u32_be(&rx + oo + gw_off); }
+                            got = 1;
+                            break;
+                        }
+                        if (mt == 6) {
+                            kprintln("dhcp: NAK", 9);
+                            return 0 - 1;
+                        }
                     }
                 }
             }
@@ -420,13 +458,15 @@ fn net_handle_arp(pkt, len) {
         var requester_mac[8];
         var requester_ip = (load8(pkt + 28) << 24) | (load8(pkt + 29) << 16) | (load8(pkt + 30) << 8) | load8(pkt + 31);
         net_copy_buf(&requester_mac, pkt + 22, 6);
+        var kmac[8];
+        nic_mac(&kmac);   # FIX #1
         var p = &net_pkt;
-        var off = eth_build(p, &requester_mac, &vnet_mac, 0x0806);
+        var off = eth_build(p, &requester_mac, &kmac, 0x0806);
         store16(p + off, 0x0001);                # htype=eth
         store16(p + off + 2, 0x0800);            # ptype=ipv4
         store8(p + off + 4, 6); store8(p + off + 5, 4);
         store16(p + off + 6, 0x0002);            # oper=reply
-        memcpy(p + off + 8, &vnet_mac, 6);       # sender HW = us
+        memcpy(p + off + 8, &kmac, 6);           # sender HW = us
         store8(p + off + 14, (net_ip >> 24) & 0xFF);
         store8(p + off + 15, (net_ip >> 16) & 0xFF);
         store8(p + off + 16, (net_ip >> 8) & 0xFF);
@@ -631,8 +671,10 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     var ack = load64(cb + 40);
     var dst_mac[8];
     memset(&dst_mac, 0xFF, 6);
+    var kmac[8];
+    nic_mac(&kmac);   # FIX #1
     var p = &net_pkt;
-    var off = eth_build(p, &dst_mac, &vnet_mac, 0x0800);
+    var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     # Build TCP header after IP header space (20 bytes)
     var tcp_off = off + 20;
     var tcp_hdr_len = tcp_build_header(p + tcp_off, src_port, dst_port, seq, ack, flags, 8192);

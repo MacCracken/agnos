@@ -222,45 +222,56 @@ fn r8169_phy_read(reg) {
     return 0xFFFF;
 }
 
-# Bring the internal PHY up to a link-active state. Minimum-viable form:
-# read current BMCR, set autoneg-enable + restart-autoneg, clear power-
-# down, write back; poll BMSR LinkStatus bit for autoneg completion +
-# link establishment. Returns 1 on link-up, 0 on autoneg timeout, with
-# stamp 0x59 recording fine-grained outcome (see audit doc § 10.5).
+# Bring the internal PHY up by kicking autoneg. NON-BLOCKING SHAPE
+# (1.32.1 FIX #3 per dhcp-end-to-end-audit.md). Earlier (commit b12e25a)
+# version block-polled BMSR.LinkStatus for "300 iterations × ~10ms" but
+# the busy-wait was ~100× too short on AMD Zen at 3.5 GHz (each
+# 100,000-iter empty loop runs in ~28µs, not 10ms), so the 3s budget
+# collapsed to ~8ms while real Ethernet autoneg on copper takes 1.5-3s.
+# Result: false-negative "autoneg timeout" prints with link actually up.
+#
+# Linux moved away from blocking-on-link 20+ years ago (PHYLIB async
+# notifier shape). Our TX/RX rings handle link-not-yet-up gracefully —
+# descriptors sit in the TX ring until the NIC clocks them out post
+# autoneg-complete. So: kick BMCR.ANRESTART, optionally read BMSR once
+# for an opportunistic snapshot, return success unconditionally.
+#
+# CMOS 0x59 outcome enum simplified:
+#   0 = not attempted (probe never reached phy_init)
+#   1 = kicked successfully (BMCR write OK; autoneg running async)
+#   3 = BMCR write timed out (MDIO interface broken — real driver bug)
+#   4 = BMCR/BMSR read timed out (MDIO interface broken — real driver bug)
+# (the 2 = "autoneg timeout" enum is retired — no longer polled).
 fn r8169_phy_init() {
-    # Read BMCR. 0xFFFF return = MDIO-read timeout (PHY not responding
-    # to MDIO at all — distinct failure mode from autoneg timeout).
     var bmcr = r8169_phy_read(R8169_PHY_BMCR);
     if (bmcr == 0xFFFF) {
-        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 4);   # 4 = BMCR-read timeout
+        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 4);   # 4 = MDIO read broken
+        kprintln("r8169: PHY MDIO read failed", 26);
         return 0;
     }
     # Set autoneg-enable + restart-autoneg; clear power-down just in case.
     var new_bmcr = (bmcr | R8169_BMCR_ANENABLE | R8169_BMCR_ANRESTART) & 0xF7FF;
     if (r8169_phy_write(R8169_PHY_BMCR, new_bmcr) == 0) {
-        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 3);   # 3 = BMCR-write timeout
+        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 3);   # 3 = MDIO write broken
+        kprintln("r8169: PHY MDIO write failed", 27);
         return 0;
     }
-    # Poll BMSR LinkStatus (bit 2). 300 iterations × ~10ms busy delay ≈ 3s,
-    # the OpenBSD/NetBSD-converged autoneg timeout. archaemenid's wired
-    # NIC + a connected switch typically links in well under 1s.
-    for (var i = 0; i < 300; i = i + 1) {
-        var bmsr = r8169_phy_read(R8169_PHY_BMSR);
-        if (bmsr == 0xFFFF) {
-            xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 4);   # 4 = BMSR-read timeout
-            return 0;
-        }
-        if ((bmsr & R8169_BMSR_LINKUP) != 0) {
-            xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 1);   # 1 = link up
-            return 1;
-        }
-        # ~10ms busy delay via tight inner loop. Approximate — actual
-        # cycle count depends on CPU clock; the 300-iteration outer
-        # budget compensates by being generous.
-        for (var j = 0; j < 100000; j = j + 1) { }
+    # Opportunistic snapshot — IEEE 802.3 §22.2.4.2 BMSR.LinkStatus is
+    # latching-low, so the first post-restart read clears the latch and
+    # returns the pre-restart latched state (usually 0). Discard it; the
+    # second read returns live state at this moment (~few µs later — link
+    # is unlikely to be up yet, but the read primes future asynchronous
+    # link-state observability via TX OWN clears + RX DMA bytes).
+    var bmsr_first = r8169_phy_read(R8169_PHY_BMSR);   # clear latch
+    var bmsr_now = r8169_phy_read(R8169_PHY_BMSR);     # live snapshot
+    if ((bmsr_now & R8169_BMSR_LINKUP) != 0) {
+        kprintln("r8169: PHY autoneg kicked; link up", 34);
     }
-    xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 2);           # 2 = autoneg timeout
-    return 0;
+    if ((bmsr_now & R8169_BMSR_LINKUP) == 0) {
+        kprintln("r8169: PHY autoneg kicked (link async)", 38);
+    }
+    xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 1);   # 1 = kicked successfully
+    return 1;
 }
 
 # --- Phase 1 probe + reset ------------------------------------------
@@ -424,10 +435,32 @@ fn r8169_init_rx() {
     store32(r8169_mmio_base + 0xE4, r8169_rx_ring_phys & 0xFFFFFFFF);
     store32(r8169_mmio_base + 0xE8, (r8169_rx_ring_phys >> 32) & 0xFFFFFFFF);
 
-    # 4. Set RxConfig. Accept broadcast (for ARP) + multicast +
-    #    unicast-to-our-MAC. FIFO/DMA thresholds at unlimited.
-    var rxcfg = 0xE700 | 0x08 | 0x04 | 0x02;
-    store32(r8169_mmio_base + 0x44, rxcfg);
+    # 4. Set RxConfig (RTL8168 datasheet §13.2; offset 0x44, R/W). FIX #6
+    #    (1.32.1) audit pass — use named constants instead of bare hex,
+    #    document each bit so future audits don't have to recompute.
+    #    Accept bits (low byte):
+    #      AB  (0x08) — accept broadcast. Needed for ARP requests we don't
+    #                    initiate (peer-to-us ARP query) + broadcast DHCP
+    #                    OFFER replies (RFC 2131 §4.1, BOOTP broadcast flag
+    #                    in our DISCOVER asks server to reply broadcast).
+    #      AM  (0x04) — accept multicast. Needed for IPv6 ND / IGMP / LLDP
+    #                    background traffic on a live LAN segment.
+    #      APM (0x02) — accept physical match (unicast to MAC programmed
+    #                    in IDR0..IDR5 — preserved as BIOS left it; on
+    #                    archaemenid that's b0:41:6f:0c:e4:25, verified by
+    #                    r8169_probe at line 320 reading IDR0..IDR5 back
+    #                    into r8169_mac, byte-matched against lspci).
+    #      AAP (0x01) — DELIBERATELY OFF (would enable promisc mode; we
+    #                    don't want every frame on the wire, just ours).
+    #    High bits (R8169_RXCFG_DEFAULTS = 0xE700):
+    #      bits 8-9   = XF (FIFO threshold, 7 = no threshold / unlimited)
+    #      bits 10-13 = MXDMA (max DMA burst, 7 = unlimited)
+    #      bits 14-15 = RX FIFO max DMA burst override
+    #    Matches Linux drivers/net/ethernet/realtek/r8169_main.c::rtl_set_rx_mode
+    #    minus the AcceptAllPhys (promisc) bit which Linux only sets in
+    #    IFF_PROMISC mode.
+    var rxcfg = R8169_RXCFG_DEFAULTS | R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
+    store32(r8169_mmio_base + R8169_REG_RXCONFIG, rxcfg);
 
     # 5. Max RX packet size (16-bit register at 0xDA): MTU 1500 + Eth
     #    (14) + VLAN (4) + CRC (4) headroom = ~1522. Round to 0x05F3.
@@ -620,5 +653,27 @@ fn nic_poll(buf, maxlen) {
     if (vnet_active != 0) {
         return virtio_net_poll(buf, maxlen);
     }
+    return 0;
+}
+
+# Backend-agnostic MAC accessor (1.32.1 FIX #1 per dhcp-end-to-end-audit.md).
+# Net stack consumers (eth_build src field, BOOTP chaddr, ARP sender HW) must
+# use the MAC of whichever NIC is actually wired up. Pre-fix, every net.cyr
+# site reached for &vnet_mac directly — which is only populated by
+# virtio_net_init. On iron with r8169 active and virtio absent, vnet_mac was
+# all-zeros and DHCP servers dropped our zero-chaddr DISCOVER frames.
+#
+# Copies 6 bytes of MAC into the caller's buffer. Returns 1 on success,
+# 0 if no NIC backend is up (out_buf gets zeroed for safety).
+fn nic_mac(out_buf) {
+    if (r8169_present != 0) {
+        memcpy(out_buf, &r8169_mac, 6);
+        return 1;
+    }
+    if (vnet_active != 0) {
+        memcpy(out_buf, &vnet_mac, 6);
+        return 1;
+    }
+    memset(out_buf, 0, 6);
     return 0;
 }

@@ -287,6 +287,22 @@ if (pci_find(0x1AF4, 0x1000) >= 0) {
         # of HLT-hanging on no-IRQ. See the gated block ~line 660.
     }
 }
+
+# FIX #2 (1.32.1 per dhcp-end-to-end-audit.md): on the iron path (r8169 active,
+# virtio absent) the virtio branch above never runs, so net_init() was never
+# called and net_ip / net_gateway / net_netmask stayed at module-default zero.
+# Net_ip=0 is correct for DHCP DISCOVER (RFC 2131 §4.4.1 — client has no lease)
+# but leaving the stack in a never-initialized state means latent breakage for
+# any post-DHCP ARP / route decision. Idempotent — last write wins; if the
+# virtio branch ran above this overwrites with zeros, which is fine pre-DHCP
+# (dhcp_init() will fill the real values on success).
+if (nic_ready() == 1) {
+    if (vnet_active == 0) {
+        # Real-iron path — net_init wasn't called by virtio. Initialize the
+        # net stack with zeros so dhcp_init can fill in the real lease.
+        net_init(0, 0, 0);
+    }
+}
 if ((pci_find(0x1AF4, 0x1042) >= 0) | (pci_find(0x1AF4, 0x1001) >= 0)) {
     if (virtio_blk_init() == 0) {
         kprint("VirtIO-blk: ", 12);
