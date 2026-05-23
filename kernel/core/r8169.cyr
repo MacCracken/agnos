@@ -88,10 +88,25 @@ var R8169_RXCFG_AAP = 0x01;  # accept all phys (promisc — off in v1)
 var R8169_RXCFG_APM = 0x02;  # accept physical match (unicast to our MAC)
 var R8169_RXCFG_AM  = 0x04;  # accept multicast
 var R8169_RXCFG_AB  = 0x08;  # accept broadcast (needed for ARP + DHCP)
-# RX FIFO threshold + DMA burst lifted from Linux defaults:
-#   bits [10:8]  RX DMA burst — 7 = unlimited
-#   bits [15:13] RX FIFO thresh — 7 = unlimited
-var R8169_RXCFG_DEFAULTS = 0xE700;
+# RxConfig high-byte profile. Per Linux v7.0 r8169_main.c::rtl_init_rxcfg
+# (lines 2589-2614), the correct value is chip-mac_version-specific:
+#   VER_02..06 + VER_10..17 (legacy 8168A/B):  RX_FIFO_THRESH|RX_DMA_BURST = 0xE700
+#   VER_18..24 + VER_34..36 + VER_38:          RX128_INT_EN|RX_MULTI_EN|RX_DMA_BURST = 0xC700
+#   VER_40..52 (RTL8168G/H/M — INCLUDING archaemenid's RTL8168h XID 541
+#               mac_version 46):                = 0xCF00 (modern + RX_EARLY_OFF)
+#   default:                                    0x8700 (RX128_INT_EN|RX_DMA_BURST)
+# Bit map of 0xCF00:
+#   bit 15 (0x8000) RX128_INT_EN  — interrupt every 128 packets
+#   bit 14 (0x4000) RX_MULTI_EN   — multi-packet RX DMA
+#   bits 10:8 (0x0700) RX_DMA_BURST = 7 (unlimited)
+#   bit 11 (0x0800) RX_EARLY_OFF  — disable early-RX (mandatory on G/H silicon;
+#                                    Early-RX-ON drops broadcast frames mid-DMA,
+#                                    which is exactly why DHCP OFFER never landed
+#                                    in the ring on Attempts 93-97 even though
+#                                    multicast frames passed cleanly).
+# Single per-chip dispatch is a future refinement; 0xCF00 covers archaemenid +
+# the broader G/H/M cohort (modern Beelink/i9-class Realtek silicon).
+var R8169_RXCFG_DEFAULTS = 0xCF00;
 
 # TxConfig (offset 0x40) — IFG=3 (standard), DMA burst=7 (unlimited).
 var R8169_TXCFG_DEFAULTS = 0x03000700;
@@ -480,13 +495,15 @@ fn r8169_init_rx() {
     #                    into r8169_mac, byte-matched against lspci).
     #      AAP (0x01) — DELIBERATELY OFF (would enable promisc mode; we
     #                    don't want every frame on the wire, just ours).
-    #    High bits (R8169_RXCFG_DEFAULTS = 0xE700):
-    #      bits 8-9   = XF (FIFO threshold, 7 = no threshold / unlimited)
-    #      bits 10-13 = MXDMA (max DMA burst, 7 = unlimited)
-    #      bits 14-15 = RX FIFO max DMA burst override
-    #    Matches Linux drivers/net/ethernet/realtek/r8169_main.c::rtl_set_rx_mode
-    #    minus the AcceptAllPhys (promisc) bit which Linux only sets in
-    #    IFF_PROMISC mode.
+    #    High bits (R8169_RXCFG_DEFAULTS = 0xCF00, post-Attempt-97 fix per
+    #    Linux v7.0 r8169_main.c:2601-2602, RTL_GIGA_MAC_VER_40..52 branch —
+    #    archaemenid's RTL8168h XID 541 = VER_46):
+    #      bit 15 RX128_INT_EN, bit 14 RX_MULTI_EN, bit 11 RX_EARLY_OFF,
+    #      bits 10:8 RX_DMA_BURST=7. See R8169_RXCFG_DEFAULTS site for full
+    #      multi-source convergent receipt + symptom-mapping. Pre-fix value
+    #      0xE700 was the LEGACY 8168A/B profile (Linux VER_07..17) and left
+    #      RX_EARLY_OFF clear on G/H/M silicon — broadcast OFFER frames
+    #      dropped mid-DMA (Attempts 93-97 OFFER timeout).
     var rxcfg = R8169_RXCFG_DEFAULTS | R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
     store32(r8169_mmio_base + R8169_REG_RXCONFIG, rxcfg);
 
