@@ -73,15 +73,39 @@ var R8169_RING_MASK    = 0x0F;        # 16 - 1
 var R8169_BUF_SIZE     = 2048;        # max packet — covers 1500 MTU + Eth + VLAN + slack
 
 # Additional register offsets (Phase 1 only used CR/IDR/TxConfig).
+var R8169_REG_MAC0         = 0x00;  # MAC address lower 4 bytes (32-bit write required on H+)
+var R8169_REG_MAC4         = 0x04;  # MAC address upper 2 bytes (32-bit write, top 2 ignored)
+var R8169_REG_MAR0         = 0x08;  # Multicast hash filter (8 bytes; MAR0+0 + MAR0+4)
 var R8169_REG_TNPDS_LO     = 0x20;  # Tx Normal Priority Descriptor Start (low)
 var R8169_REG_TNPDS_HI     = 0x24;
-var R8169_REG_RDSAR_LO     = 0xE4;  # RX Descriptor Start Address Register (low)
-var R8169_REG_RDSAR_HI     = 0xE8;
 var R8169_REG_TPPOLL       = 0x38;  # Transmit Priority Poll — bit 6 (0x40) = NPQ kick
 var R8169_REG_IMR          = 0x3C;  # Interrupt Mask
 var R8169_REG_ISR          = 0x3E;  # Interrupt Status (W1C)
+var R8169_REG_CFG9346      = 0x50;  # Config register lock/unlock gate (write 0xC0 to unlock, 0x00 to lock)
+var R8169_REG_ERIDR        = 0x70;  # ERI (Extended Register Interface) Data
+var R8169_REG_ERIAR        = 0x74;  # ERI Address / Command
 var R8169_REG_RMS          = 0xDA;  # Rx Max packet Size (16-bit)
 var R8169_REG_MTPS         = 0xEC;  # Max Tx Packet Size (8-bit, in 128-byte units)
+var R8169_REG_RDSAR_LO     = 0xE4;  # RX Descriptor Start Address Register (low)
+var R8169_REG_RDSAR_HI     = 0xE8;
+var R8169_REG_MISC         = 0xF0;  # MISC register — bit 19 RXDV_GATED_EN (G/H+ chips)
+
+# Cfg9346 (config-reg lock gate) — Linux v7.0 r8169_main.c:486-487.
+var R8169_CFG9346_LOCK     = 0x00;
+var R8169_CFG9346_UNLOCK   = 0xC0;
+
+# MISC register bits. Linux r8169_main.c:421.
+var R8169_MISC_RXDV_GATED_EN = 0x00080000;  # bit 19 — when set, RX data-valid signal is gated (frames dropped at validator)
+
+# ERI command word layout — Linux r8169_main.c:389-403.
+#   bit 31     = FLAG (write: chip clears on done; read: chip sets on done)
+#   bits 19:16 = TYPE (0 = EXGMAC, the per-byte-enable EX-GMAC bus)
+#   bits 15:12 = MASK (per-byte write-enable; 0xF000 = all 4 bytes)
+#   bits 11:0  = address
+var R8169_ERIAR_FLAG       = 0x80000000;
+var R8169_ERIAR_WRITE_CMD  = 0x80000000;
+var R8169_ERIAR_MASK_1111  = 0x0000F000;
+var R8169_ERIAR_TYPE_EXGMAC = 0x00000000;
 
 # RxConfig bits (offset 0x44):
 var R8169_RXCFG_AAP = 0x01;  # accept all phys (promisc — off in v1)
@@ -186,6 +210,59 @@ fn r8169_mmio_write8(off, val) {
 
 fn r8169_mmio_read32(off) {
     return load32(r8169_mmio_base + off);
+}
+
+# --- ERI (Extended Register Interface) helpers ----------------------
+#
+# ERI is Realtek's per-byte-enabled config bus, used to reach MAC-internal
+# registers not directly mapped into MMIO (packet filter, AspM thresholds,
+# pause thresholds, FIFO sizing). Linux v7.0 r8169_main.c:1047-1096 is the
+# reference. AGNOS only needs WRITE + READ + the "reset packet filter"
+# bit-toggle for VER_46 init; full RMW helpers (rtl_w0w1_eri) are folded
+# into the call sites.
+#
+# Protocol per Linux:
+#   write: store32(ERIDR, val); store32(ERIAR, WRITE_CMD | type | mask | addr);
+#          poll ERIAR FLAG until cleared.
+#   read:  store32(ERIAR, READ_CMD | type | MASK_1111 | addr);
+#          poll ERIAR FLAG until SET; load32(ERIDR).
+# Linux uses 100us × 100 retries; AGNOS uses 1000 busy-poll iterations to
+# match the PHYAR helper convention above.
+
+fn r8169_eri_write(addr, mask, val) {
+    store32(r8169_mmio_base + R8169_REG_ERIDR, val);
+    var cmd = R8169_ERIAR_WRITE_CMD | R8169_ERIAR_TYPE_EXGMAC | mask | (addr & 0xFFF);
+    store32(r8169_mmio_base + R8169_REG_ERIAR, cmd);
+    for (var i = 0; i < 1000; i = i + 1) {
+        var r = load32(r8169_mmio_base + R8169_REG_ERIAR);
+        if ((r & R8169_ERIAR_FLAG) == 0) { return 1; }
+    }
+    return 0;
+}
+
+fn r8169_eri_read(addr) {
+    var cmd = R8169_ERIAR_TYPE_EXGMAC | R8169_ERIAR_MASK_1111 | (addr & 0xFFF);
+    store32(r8169_mmio_base + R8169_REG_ERIAR, cmd);
+    for (var i = 0; i < 1000; i = i + 1) {
+        var r = load32(r8169_mmio_base + R8169_REG_ERIAR);
+        if ((r & R8169_ERIAR_FLAG) != 0) {
+            return load32(r8169_mmio_base + R8169_REG_ERIDR);
+        }
+    }
+    return 0xFFFFFFFF;
+}
+
+# Reset the chip's internal packet filter state machine — toggle ERI 0xDC
+# bit 0 OFF then ON. Linux v7.0 rtl_reset_packet_filter (line 1613) is the
+# reference; called unconditionally from rtl_hw_start_8168h_1 (line 3569)
+# for VER_46 silicon. Without this, post-CR.RST filter state is undefined
+# per chip-rev and may selectively reject broadcast/unicast frames.
+fn r8169_reset_packet_filter() {
+    var val = r8169_eri_read(0xDC);
+    r8169_eri_write(0xDC, R8169_ERIAR_MASK_1111, val & 0xFFFFFFFE);
+    val = r8169_eri_read(0xDC);
+    r8169_eri_write(0xDC, R8169_ERIAR_MASK_1111, val | 0x00000001);
+    return 0;
 }
 
 # --- PCI discovery --------------------------------------------------
@@ -384,20 +461,67 @@ fn r8169_probe() {
         return 0 - 1;
     }
 
-    # 8b. (1.32.2 FIX #7 per dhcp-end-to-end-audit.md FINDING #7) Reprogram
-    # IDR0..IDR5 with the MAC we read at step 6. Reset (step 8) clears the
-    # NIC's hardware unicast MAC filter to zeros. `RxConfig.APM = 1` set
-    # later in r8169_init_rx tells the NIC to accept unicast frames ONLY
-    # when the dst MAC matches IDR0..IDR5 — so without this write-back,
-    # the filter is zero and any unicast DHCP OFFER (servers that ignore
-    # the BOOTP broadcast flag — Cisco WLCs, Mikrotik, some embedded
-    # servers) is rejected at the hardware filter before reaching the RX
-    # ring. Linux `rtl_rar_set` (MAC0 0x00 + MAC4 0x04) + OpenBSD
-    # `re_setaddr` + FreeBSD/NetBSD `re_set_addr` all do this after every
-    # reset. We didn't — Attempt 95 OFFER timeout consistent with this.
-    for (var i = 0; i < 6; i = i + 1) {
-        r8169_mmio_write8(R8169_REG_IDR0 + i, load8(&r8169_mac + i));
-    }
+    # 8b. Reprogram the hardware unicast MAC filter via Cfg9346-wrapped
+    # 32-bit MAC0/MAC4 writes. Per r8169-chip-init-audit.md item 2/3 +
+    # Linux v7.0 r8169_main.c rtl_rar_set (line 2557):
+    #
+    #   rtl_unlock_config_regs(tp);            // Cfg9346 = 0xC0
+    #   RTL_W32(tp, MAC4, get_unaligned_le16(addr + 4));
+    #   rtl_pci_commit(tp);                    // dummy read of ChipCmd
+    #   RTL_W32(tp, MAC0, get_unaligned_le32(addr));
+    #   rtl_pci_commit(tp);
+    #   rtl_lock_config_regs(tp);              // Cfg9346 = 0x00
+    #
+    # Two convergent issues fixed at once:
+    #   - Cfg9346 lock state: on RTL8168 H+ silicon (archaemenid is
+    #     VER_46 = RTL8168h XID 541), the config register lock gates
+    #     MAC writes. AGNOS's pre-fix 8-bit IDR write loop ran with
+    #     the lock state at its post-CR.RST default (locked) → writes
+    #     silently absorbed → hardware unicast filter stayed at zero.
+    #   - Write width: Linux uses 32-bit MAC0/MAC4 writes; some H+
+    #     silicon honors only 32-bit width here, byte writes ignored.
+    #
+    # Attempts 97/98 evidence: 16 frames consumed, all multicast
+    # (CMOS 0x5E=0x01 = first byte of 01:00:5e:... IPv4 multicast).
+    # APM=1 in RxConfig should accept unicast OFFERs matching MAC0/4,
+    # but with the filter at zero the chip rejects every unicast frame
+    # destined to b0:41:6f:0c:e4:25 before the ring is touched.
+    r8169_mmio_write8(R8169_REG_CFG9346, R8169_CFG9346_UNLOCK);
+    var mac_lo = load8(&r8169_mac) | (load8(&r8169_mac + 1) << 8)
+               | (load8(&r8169_mac + 2) << 16) | (load8(&r8169_mac + 3) << 24);
+    var mac_hi = load8(&r8169_mac + 4) | (load8(&r8169_mac + 5) << 8);
+    store32(r8169_mmio_base + R8169_REG_MAC4, mac_hi);
+    r8169_mmio_read8(R8169_REG_CR);          # PCI commit (flush posted write)
+    store32(r8169_mmio_base + R8169_REG_MAC0, mac_lo);
+    r8169_mmio_read8(R8169_REG_CR);          # PCI commit
+    r8169_mmio_write8(R8169_REG_CFG9346, R8169_CFG9346_LOCK);
+
+    # 8c. Disable RXDV gate. Per r8169-chip-init-audit.md item 1 + Linux
+    # v7.0 r8169_main.c rtl_disable_rxdvgate (line 2749) called from
+    # rtl_hw_start_8168h_1 (line 3575) for VER_46. MISC[19] = RXDV_GATED_EN;
+    # when set, the chip gates the RX data-valid signal at the validator.
+    # Default after CR.RST on G/H+ silicon is silicon-undocumented but
+    # Linux defensively clears it on every chip-up; multicast may slip
+    # through silicon carve-outs (matches Attempts 97/98 evidence) while
+    # broadcast + unicast are dropped.
+    var misc = load32(r8169_mmio_base + R8169_REG_MISC);
+    store32(r8169_mmio_base + R8169_REG_MISC, misc & 0xFFF7FFFF);
+
+    # 8d. Reset internal packet-filter state machine. Per r8169-chip-init-
+    # audit.md item 4 + Linux rtl_reset_packet_filter (line 1613) called
+    # from rtl_hw_start_8168h_1 (line 3569). Toggles ERI 0xDC bit 0 OFF
+    # then ON; without it, post-CR.RST filter state is undefined per
+    # chip-rev. Helper port lives at the top of this file.
+    r8169_reset_packet_filter();
+
+    # 8e. Program the multicast hash filter to accept all multicast. Per
+    # r8169-chip-init-audit.md item 5 + Linux rtl_set_rx_mode (lines
+    # 2863-2864). Without this, RxConfig.AM gates multicast against an
+    # undefined-post-CR.RST 64-bit hash filter; Attempts 97/98 received
+    # multicast only by BIOS-residue, which is fragile and silicon-
+    # dependent.
+    store32(r8169_mmio_base + R8169_REG_MAR0,     0xFFFFFFFF);
+    store32(r8169_mmio_base + R8169_REG_MAR0 + 4, 0xFFFFFFFF);
 
     # 9. Summary print.
     kprint("r8169: found at ", 16);
@@ -495,17 +619,22 @@ fn r8169_init_rx() {
     #                    into r8169_mac, byte-matched against lspci).
     #      AAP (0x01) — DELIBERATELY OFF (would enable promisc mode; we
     #                    don't want every frame on the wire, just ours).
-    #    High bits (R8169_RXCFG_DEFAULTS = 0xCF00, post-Attempt-97 fix per
-    #    Linux v7.0 r8169_main.c:2601-2602, RTL_GIGA_MAC_VER_40..52 branch —
-    #    archaemenid's RTL8168h XID 541 = VER_46):
-    #      bit 15 RX128_INT_EN, bit 14 RX_MULTI_EN, bit 11 RX_EARLY_OFF,
-    #      bits 10:8 RX_DMA_BURST=7. See R8169_RXCFG_DEFAULTS site for full
-    #      multi-source convergent receipt + symptom-mapping. Pre-fix value
-    #      0xE700 was the LEGACY 8168A/B profile (Linux VER_07..17) and left
-    #      RX_EARLY_OFF clear on G/H/M silicon — broadcast OFFER frames
-    #      dropped mid-DMA (Attempts 93-97 OFFER timeout).
-    var rxcfg = R8169_RXCFG_DEFAULTS | R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
-    store32(r8169_mmio_base + R8169_REG_RXCONFIG, rxcfg);
+    #    High bits (R8169_RXCFG_DEFAULTS = 0xCF00, per Linux v7.0
+    #    r8169_main.c:2601-2602, RTL_GIGA_MAC_VER_40..52 branch — VER_46
+    #    is archaemenid's chip).
+    #
+    # PROFILE-ONLY write per r8169-chip-init-audit.md item 8 (init reorder).
+    # Linux v7.0 r8169_main.c:4099-4128 sequences:
+    #   ChipCmd = CmdTxEnb | CmdRxEnb   ← chip enabled FIRST
+    #   rtl_init_rxcfg(tp)               ← RxConfig PROFILE only
+    #   rtl_set_tx_config_registers(tp)  ← TxConfig
+    #   rtl_set_rx_mode(tp->dev)         ← RxConfig RMW with AB|AM|APM
+    # AGNOS pre-fix wrote `profile | accept_bits` in a single pre-CR.RE
+    # store. Some Realtek silicon latches RxConfig at the CR.RE rising
+    # edge; pre-enable writes may be ignored. We now write the profile
+    # here and OR the accept bits in at the end of r8169_init_tx, after
+    # CR.RE | CR.TE are both set.
+    store32(r8169_mmio_base + R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS);
 
     # 5. Max RX packet size (16-bit register at 0xDA). Linux v6.6
     #    rtl_init_one writes 0x3FFF on most 8168 variants — effectively
@@ -669,6 +798,21 @@ fn r8169_init_tx() {
     # 6. Enable TX in CR (set TE bit; preserve other bits).
     var cr = load8(r8169_mmio_base + 0x37);
     store8(r8169_mmio_base + 0x37, cr | 0x04);
+
+    # 7. Finalize RxConfig accept bits. Per r8169-chip-init-audit.md item
+    # 8 + Linux rtl_set_rx_mode (line 2867):
+    #   RTL_W32(tp, RxConfig, (tmp & ~RX_CONFIG_ACCEPT_OK_MASK) | rx_mode);
+    # The chip-profile high bits were written in r8169_init_rx before
+    # CR.RE went high. With both CR.RE + CR.TE now asserted, we RMW the
+    # low nibble (RX_CONFIG_ACCEPT_OK_MASK = 0x0F) to install
+    # AB | AM | APM. AB (broadcast) is the load-bearing bit for DHCP
+    # OFFER reception (RFC 2131 §4.1, BOOTP bcast flag in our DISCOVER
+    # asks the server to reply broadcast); APM gates unicast OFFER from
+    # servers that ignore the bcast flag; AM honors the multicast hash
+    # filter programmed in r8169_probe step 8e.
+    var rxcfg = load32(r8169_mmio_base + R8169_REG_RXCONFIG);
+    var accept = R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
+    store32(r8169_mmio_base + R8169_REG_RXCONFIG, (rxcfg & 0xFFFFFFF0) | accept);
 
     r8169_tx_idx = 0;
     kprintln("r8169: TX ring up (16 desc × 2KB buf)", 36);
