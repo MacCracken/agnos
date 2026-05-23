@@ -120,7 +120,7 @@ var R8169_BMSR_LINKUP   = 0x0004;     # bit  2 — Link Status (1 = up)
 # r8169-iron-burn-audit.md § 10.5; virgin scratch 0x58-0x5F):
 var R8169_KCP_PROBE_DONE     = 0x58;  # 1 = r8169_probe ran to completion
 var R8169_KCP_PHY_OUTCOME    = 0x59;  # 0=not attempted, 1=link up, 2=autoneg timeout,
-                                       # 3=BMCR-write timeout, 4=BMSR-read timeout
+# 3=BMCR-write timeout, 4=BMSR-read timeout
 var R8169_KCP_TX_SEND_COUNT  = 0x5A;  # saturating byte counter (0xFF = ≥255)
 var R8169_KCP_TX_DESC0_OWN   = 0x5B;  # TX desc 0 high byte; post-mortem 0x80 = OWN stuck
 var R8169_KCP_RX_POLL_COUNT  = 0x5C;  # saturating byte counter (0xFF = ≥255)
