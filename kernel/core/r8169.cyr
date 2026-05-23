@@ -249,27 +249,38 @@ fn r8169_phy_init() {
         kprintln("r8169: PHY MDIO read failed", 26);
         return 0;
     }
-    # Set autoneg-enable + restart-autoneg; clear power-down just in case.
+    # (1.32.2 FIX #10 per dhcp-end-to-end-audit.md FINDING #10) Check
+    # link state FIRST, before deciding whether to restart autoneg.
+    # Attempt 94 evidence (TX OWN cleared = 0x30, RX multicast captured =
+    # 0x5E=0x01) showed the BIOS-pre-configured autoneg was already up.
+    # Attempt 95 evidence (TX OWN stuck = 0xb0, RX zero DMA = 0x5E=0x00)
+    # showed the NIC wedged AFTER 1.32.1 FIX #3 unconditionally kicked
+    # BMCR.ANRESTART — autoneg restart takes the link DOWN for 1-3s
+    # while the PHY renegotiates. If init_rx + init_tx + scheduler ran
+    # during that window (~100ms post-probe), the NIC's TX/RX engines
+    # initialized while link was down — some RTL8168 variants wedge in
+    # this state and don't recover. Per IEEE 802.3 §22.2.4.2 BMSR
+    # LinkStatus (bit 2) is latching-low — must read twice for live
+    # state.
+    var bmsr_latch = r8169_phy_read(R8169_PHY_BMSR);   # clear latch
+    var bmsr_live = r8169_phy_read(R8169_PHY_BMSR);    # live snapshot
+    if ((bmsr_live & R8169_BMSR_LINKUP) != 0) {
+        # Link already up (BIOS left autoneg complete from prior PXE /
+        # cold-boot probe). Don't restart — preserves the established
+        # link state through init_rx/init_tx.
+        kprintln("r8169: PHY link up (preserved from BIOS)", 40);
+        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 1);   # 1 = link up
+        return 1;
+    }
+    # Link down — only now kick autoneg restart. Clear PDOWN in case
+    # BIOS left the PHY in power-down state.
     var new_bmcr = (bmcr | R8169_BMCR_ANENABLE | R8169_BMCR_ANRESTART) & 0xF7FF;
     if (r8169_phy_write(R8169_PHY_BMCR, new_bmcr) == 0) {
         xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 3);   # 3 = MDIO write broken
         kprintln("r8169: PHY MDIO write failed", 27);
         return 0;
     }
-    # Opportunistic snapshot — IEEE 802.3 §22.2.4.2 BMSR.LinkStatus is
-    # latching-low, so the first post-restart read clears the latch and
-    # returns the pre-restart latched state (usually 0). Discard it; the
-    # second read returns live state at this moment (~few µs later — link
-    # is unlikely to be up yet, but the read primes future asynchronous
-    # link-state observability via TX OWN clears + RX DMA bytes).
-    var bmsr_first = r8169_phy_read(R8169_PHY_BMSR);   # clear latch
-    var bmsr_now = r8169_phy_read(R8169_PHY_BMSR);     # live snapshot
-    if ((bmsr_now & R8169_BMSR_LINKUP) != 0) {
-        kprintln("r8169: PHY autoneg kicked; link up", 34);
-    }
-    if ((bmsr_now & R8169_BMSR_LINKUP) == 0) {
-        kprintln("r8169: PHY autoneg kicked (link async)", 38);
-    }
+    kprintln("r8169: PHY autoneg kicked (link async)", 38);
     xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 1);   # 1 = kicked successfully
     return 1;
 }
@@ -354,6 +365,21 @@ fn r8169_probe() {
     if (reset_ok == 0) {
         kprintln("r8169: reset timeout (CR.RST stayed set)", 40);
         return 0 - 1;
+    }
+
+    # 8b. (1.32.2 FIX #7 per dhcp-end-to-end-audit.md FINDING #7) Reprogram
+    # IDR0..IDR5 with the MAC we read at step 6. Reset (step 8) clears the
+    # NIC's hardware unicast MAC filter to zeros. `RxConfig.APM = 1` set
+    # later in r8169_init_rx tells the NIC to accept unicast frames ONLY
+    # when the dst MAC matches IDR0..IDR5 — so without this write-back,
+    # the filter is zero and any unicast DHCP OFFER (servers that ignore
+    # the BOOTP broadcast flag — Cisco WLCs, Mikrotik, some embedded
+    # servers) is rejected at the hardware filter before reaching the RX
+    # ring. Linux `rtl_rar_set` (MAC0 0x00 + MAC4 0x04) + OpenBSD
+    # `re_setaddr` + FreeBSD/NetBSD `re_set_addr` all do this after every
+    # reset. We didn't — Attempt 95 OFFER timeout consistent with this.
+    for (var i = 0; i < 6; i = i + 1) {
+        r8169_mmio_write8(R8169_REG_IDR0 + i, load8(&r8169_mac + i));
     }
 
     # 9. Summary print.

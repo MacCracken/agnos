@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-05-22 (**1.31.1 cycle open, code-complete**). The 1.30.x arc closed with the **MVP gate cleared on iron** (typeable shell on archaemenid at Attempt 68, agnos 1.30.9). The 1.30.x FB-hardening sweep closed at 1.30.12 (Quiet-Boot legibility residue parked as next-cycle pin per `project_amd_zen_scanout_residue`). 1.31.0 opened with production-lean compile gates (`KTEST` / `XHCI_VERBOSE`) + storage-arc pivot. The 1.31.0 release shipped the full NVMe driver (Phase 1-5: probe → admin queue → I/O queue → R/W + PRP-list → `block.cyr` dispatch wrapper) + iron debut on archaemenid's Crucial P3 2 TB at Attempt 80 (first-try clean). The 1.31.1 cycle (open at this commit) has landed GPT layer (Phase 1-3: header probe + full 16 KB array walk + `parts` shell command + partition-aware helpers + CRC32 validation + backup-header recovery + type-GUID classifier) and the full AHCI/SATA driver (Phase 1-4: HBA probe → per-port CL+FIS bring-up → IDENTIFY DEVICE → READ/WRITE DMA EXT + block-layer registration with NVMe-primary policy). Iron-burn audit drafted at [agnosticos `ahci-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ahci-iron-burn-audit.md). | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. The script only refreshes header date + Version-row + roadmap "Current" line; body prose drifts independently and needs manual sweeps at minor closeouts.
+> **Last refresh**: 2026-05-23 (**1.31.1 cycle open, code-complete**). The 1.30.x arc closed with the **MVP gate cleared on iron** (typeable shell on archaemenid at Attempt 68, agnos 1.30.9). The 1.30.x FB-hardening sweep closed at 1.30.12 (Quiet-Boot legibility residue parked as next-cycle pin per `project_amd_zen_scanout_residue`). 1.31.0 opened with production-lean compile gates (`KTEST` / `XHCI_VERBOSE`) + storage-arc pivot. The 1.31.0 release shipped the full NVMe driver (Phase 1-5: probe → admin queue → I/O queue → R/W + PRP-list → `block.cyr` dispatch wrapper) + iron debut on archaemenid's Crucial P3 2 TB at Attempt 80 (first-try clean). The 1.31.1 cycle (open at this commit) has landed GPT layer (Phase 1-3: header probe + full 16 KB array walk + `parts` shell command + partition-aware helpers + CRC32 validation + backup-header recovery + type-GUID classifier) and the full AHCI/SATA driver (Phase 1-4: HBA probe → per-port CL+FIS bring-up → IDENTIFY DEVICE → READ/WRITE DMA EXT + block-layer registration with NVMe-primary policy). Iron-burn audit drafted at [agnosticos `ahci-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ahci-iron-burn-audit.md). | **Refresh cadence**: every release, ideally by `scripts/version-bump.sh`. The script only refreshes header date + Version-row + roadmap "Current" line; body prose drifts independently and needs manual sweeps at minor closeouts.
 >
 > **Scope**: live snapshot of this repo (`agnos`). Volatile state lives here so [`CLAUDE.md`](../../CLAUDE.md) can stay durable. Historical narrative lives in [`CHANGELOG.md`](../../CHANGELOG.md); the design ledger lives in [`roadmap.md`](roadmap.md). Iron-bring-up per-attempt detail lives in [agnosticos `iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
 
@@ -16,9 +16,9 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.32.1** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.32.2** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **5.11.59** | `cyrius.cyml [package].cyrius` |
-| **Released** | 2026-05-22 | [`CHANGELOG.md`](../../CHANGELOG.md) |
+| **Released** | 2026-05-23 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-20 (archaemenid NUC AMD — **typeable-shell MVP gate cleared at Attempt 68 / 1.30.9**; NVMe iron debut clean at Attempt 80 / 1.31.0 — see `iron-nuc-zen-log` § Attempts 68 + 80) | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB hardening) + 80 (NVMe) |
 
 ## Open investigations — none blocking MVP (2026-05-20)

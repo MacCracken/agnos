@@ -172,7 +172,16 @@ fn udp_bind(port) {
     var listener_id = udp_listener_count;
     udp_listener_count = udp_listener_count + 1;
     var lb = udp_listener_base(listener_id);
-    var buf = kmalloc(256);
+    # (1.32.2 FIX #8 per dhcp-end-to-end-audit.md FINDING #8) 1024-byte
+    # per-listener recv buffer. Pre-fix kmalloc(256) was too small for
+    # full DHCP OFFER/ACK (240 BOOTP header + ~30-60 bytes of options =
+    # ~270-300 bytes UDP payload). At 256-byte buf + the prior 248-byte
+    # cap in net_handle_udp, server-id (opt 54) + subnet (opt 1) +
+    # gateway (opt 3) were getting truncated past byte 248 — REQUEST
+    # would carry zero `server_id` → server NAK or ignore → ACK timeout
+    # downstream. 1024 bytes carries any realistic DHCP message + most
+    # other UDP traffic this kernel needs.
+    var buf = kmalloc(1024);
     if (buf == 0) {
         udp_listener_count = udp_listener_count - 1;
         return 0 - 1;
@@ -318,7 +327,10 @@ fn dhcp_init() {
     nic_mac(&our_mac);
 
     # ---- wait OFFER ----
-    var rx[320];
+    # (1.32.2 FIX #8) rx[1024] — function-local var X[N] is N bytes per
+    # [[feedback_cyrius_var_array_u64_units]]. Matches udp_bind's
+    # kmalloc(1024) and net_handle_udp's new 1016-byte cap.
+    var rx[1024];
     var src_ip = 0;
     var src_port = 0;
     var offered_ip = 0;
@@ -327,9 +339,18 @@ fn dhcp_init() {
     # FIX #5: budget bumped 200 → 800 iter (~2s → ~8s) — RFC 2131 §4.4.1
     # specifies 4s minimum × retries. Full exponential backoff deferred
     # to a later cycle; this is the minimum-viable extension.
+    # (1.32.2 FIX #9) Retransmit DISCOVER at the midpoint of the wait
+    # window. Same xid means the server treats both as the same DHCP
+    # session and replies once; we just get a second window to catch the
+    # reply if the first frame dropped (link not yet up post-autoneg)
+    # or the first OFFER was lost in transit.
+    var discover_plen = plen;
     for (var ti = 0; ti < 800; ti = ti + 1) {
+        if (ti == 400) {
+            udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, discover_plen);
+        }
         net_poll();
-        var n = udp_recv_from(lid, &rx, 320, &src_ip, &src_port);
+        var n = udp_recv_from(lid, &rx, 1024, &src_ip, &src_port);
         if (n >= 240) {
             if (dhcp_load_u32_be(&rx + 4) == dhcp_xid) {
                 # FIX #4: verify chaddr matches our hardware address
@@ -378,9 +399,14 @@ fn dhcp_init() {
     var assigned_gw = 0;
     got = 0;
     # FIX #5: same 800-iter budget for ACK; FIX #4: same chaddr match.
+    # (1.32.2 FIX #9) Same midpoint REQUEST retransmit as DISCOVER.
+    var request_plen = plen;
     for (var ti = 0; ti < 800; ti = ti + 1) {
+        if (ti == 400) {
+            udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, request_plen);
+        }
         net_poll();
-        var n = udp_recv_from(lid, &rx, 320, &src_ip, &src_port);
+        var n = udp_recv_from(lid, &rx, 1024, &src_ip, &src_port);
         if (n >= 240) {
             if (dhcp_load_u32_be(&rx + 4) == dhcp_xid) {
                 var chaddr_match = 1;
@@ -487,8 +513,12 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
     var src_port = (load8(pkt + ip_off) << 8) | load8(pkt + ip_off + 1);
     var dst_port = (load8(pkt + ip_off + 2) << 8) | load8(pkt + ip_off + 3);
     var udp_data_len = ip_payload_len - 8;
-    # Security: cap at buffer size (256 bytes) to prevent overflow
-    if (udp_data_len > 248) { udp_data_len = 248; }
+    # (1.32.2 FIX #8 per dhcp-end-to-end-audit.md FINDING #8) Cap at 1016
+    # bytes (1024-byte listener buf + 8 bytes UDP header headroom). Pre-fix
+    # cap at 248 truncated DHCP OFFER/ACK option blobs past server-id +
+    # subnet + gateway. Listener buf in udp_bind is kmalloc(1024) to match.
+    # Legacy net_udp_buf (module-global var[256] = 2048 bytes) easily fits.
+    if (udp_data_len > 1016) { udp_data_len = 1016; }
     # Legacy global-buffer path — used by net_recv_udp (single-consumer).
     net_copy_buf(&net_udp_buf, pkt + ip_off + 8, udp_data_len);
     net_udp_buf_len = udp_data_len;
