@@ -1,213 +1,200 @@
-# === r8169 / RTL8111/8168 NIC driver — Phase 1 (1.32.0 bite B) ===
+# === r8169 / RTL8111/8168 NIC driver — full rewrite ===
 #
-# Realtek RTL8168/8111 family Ethernet driver. Phase 1 scope:
-#   - PCI discovery (vendor 0x10EC + device IDs 0x8168 / 0x8169 / 0x8161)
-#   - BAR mapping (MMIO BAR2 first, fall back BAR0 for legacy chips)
-#   - Bus master enable
-#   - UC remap of MMIO BAR
-#   - MAC address read (6 bytes from MMIO offset 0)
-#   - TxConfig high byte for chip-revision hint
-#   - Reset sequence (write 0x10 to CR @ 0x37, poll until bit cleared)
+# Cover-to-cover port from iPXE src/drivers/net/realtek.c + FreeBSD
+# sys/dev/re/if_re.c + sys/dev/rl/if_rlreg.h. Linear read, no grep-jumping,
+# no preserved comments from the prior AGNOS driver (which had accreted
+# nine iron-burn worth of symptom-driven scar tissue and a confidently-wrong
+# "we don't use C+ mode" claim that hid a missing CPRX|CPTX in CPlusCmd —
+# the 16-byte descriptor ring AGNOS uses IS the C+ ring).
 #
-# Multi-source convergent prior-art per [[feedback_redesign_dont_reinvent]]:
-#   - Linux drivers/net/ethernet/realtek/r8169_main.c + r8169.h
-#   - FreeBSD sys/dev/re/if_re.c + if_revar.h
-#   - OpenBSD sys/dev/pci/if_re.c (forked from FreeBSD pre-divergence)
-#   - NetBSD sys/dev/pci/if_re.c
-#   - Haiku src/add-ons/kernel/drivers/network/ether/rtl8169/
-#   - Realtek RTL8111/8168 datasheet (public PDF)
+# Target chip: RTL8168H/8111H (mac_version 46, XID 541) on archaemenid.
+# Source priority: iPXE (closest behavioural analog — pure-poll, no IRQs),
+# FreeBSD (canonical for the 32-bit cmdstat descriptor layout we use, and
+# for the 8168G_PLUS init-order carve-out), Linux only as convergence check.
 #
-# Phases 2-3 (RX descriptor ring + IRQ + TX descriptor ring) land at iron
-# Attempt 92+ time. Phase 1 is iron-discoverable without iron — code is
-# pure spec port; iron-validates the chip ID + MAC + reset behavior.
+# The 8168G/H/+ silicon takes the **late CR.TE|RE enable** path: ring set
+# up, TxConfig + RxConfig fully programmed, THEN CR.TE|RE in one write.
+# Older 8168 variants take the early-enable path. FreeBSD re_init_locked
+# branches on RL_FLAG_8168G_PLUS for this; we don't carry per-variant
+# branches because archaemenid is the only validated target (extract on
+# second consumer per AGNOS convention).
+
+# === Register offsets (RTL8168/8111 datasheet + FreeBSD if_rlreg.h) ===
+
+var R8169_REG_IDR0          = 0x00;     # MAC address byte 0 (dword)
+var R8169_REG_IDR4          = 0x04;     # MAC address byte 4 (dword, top 2 bytes ignored)
+var R8169_REG_MAR0          = 0x08;     # Multicast hash 0..3 (dword)
+var R8169_REG_MAR4          = 0x0C;     # Multicast hash 4..7 (dword)
+var R8169_REG_DUMPSTATS_LO  = 0x10;     # tally counter dump (low + trigger bit)
+var R8169_REG_DUMPSTATS_HI  = 0x14;     # tally counter dump (high)
+var R8169_REG_TNPDS_LO      = 0x20;     # TX descriptor ring base (low)
+var R8169_REG_TNPDS_HI      = 0x24;
+var R8169_REG_CR            = 0x37;     # Command Register (byte)
+var R8169_REG_TPPOLL        = 0x38;     # TX priority poll (8169 variant)
+var R8169_REG_IMR           = 0x3C;     # Interrupt Mask (word) — we leave it 0
+var R8169_REG_ISR           = 0x3E;     # Interrupt Status (word, W1C)
+var R8169_REG_TXCONFIG      = 0x40;     # TX configuration (dword)
+var R8169_REG_RXCONFIG      = 0x44;     # RX configuration (dword)
+var R8169_REG_MISSEDPKT     = 0x4C;     # missed packet counter (cleared on init)
+var R8169_REG_9346CR        = 0x50;     # EEPROM command (gates CONFIG0..5 writes)
+var R8169_REG_CONFIG1       = 0x52;     # CONFIG1
+var R8169_REG_CONFIG3       = 0x54;     # CONFIG3
+var R8169_REG_CONFIG5       = 0x56;     # CONFIG5 (ASPM bits live here)
+var R8169_REG_PHYAR         = 0x60;     # MDIO PHY access (dword)
+var R8169_REG_PHYSTATUS     = 0x6C;     # PHY status (byte)
+var R8169_REG_RMS           = 0xDA;     # RX max packet size (word)
+var R8169_REG_CPLUSCMD      = 0xE0;     # C+ command (word) — MUST be set first
+var R8169_REG_RDSAR_LO      = 0xE4;     # RX descriptor ring base (low)
+var R8169_REG_RDSAR_HI      = 0xE8;
+var R8169_REG_MTPS          = 0xEC;     # Max TX packet size (byte, 128-byte units)
+var R8169_REG_MISC          = 0xF0;     # MISC register (bit 19 RXDV_GATED_EN)
+
+# === Bit definitions ===
+
+# CR (command register, byte at 0x37)
+var R8169_CR_RST            = 0x10;     # Reset
+var R8169_CR_RE             = 0x08;     # Receiver enable
+var R8169_CR_TE             = 0x04;     # Transmit enable
+
+# CPlusCmd (word at 0xE0) — per FreeBSD if_rlreg.h:500-514 and
+# iPXE realtek.c:1076. We set MULRW | RXENB | TXENB. The 32-bit cmdstat
+# descriptor ring IS the C+ ring; RXENB|TXENB are LOAD-BEARING.
+var R8169_CPLUS_TXENB       = 0x0001;
+var R8169_CPLUS_RXENB       = 0x0002;
+var R8169_CPLUS_MULRW       = 0x0008;
+
+# 9346CR (EEPROM command, byte at 0x50) — mode field is bits 7:6.
+var R8169_9346CR_UNLOCK     = 0xC0;     # EEM=11 — config registers writable
+var R8169_9346CR_LOCK       = 0x00;     # EEM=00 — config registers read-only
+
+# CONFIG5 (byte at 0x56) — bit 1 is ASPM-related on 8168G/H.
+var R8169_CONFIG5_ASPM      = 0x02;
+
+# TxConfig (dword at 0x40) — IFG=3 (standard 96-bit) | MAXDMA=7 (unlimited).
+var R8169_TXCFG_DEFAULTS    = 0x03000700;
+
+# RxConfig (dword at 0x44) — per FreeBSD re_set_rxmode + if_rlreg.h.
+#   FIFOTHRESH=7 (no threshold, 0xE000)
+# | MAXDMA=7 (unlimited, 0x0700)
+# | EARLYOFFV2 (8168G_PLUS, 0x0800)
+# = 0xEF00
+var R8169_RXCFG_DEFAULTS    = 0x0000EF00;
+var R8169_RXCFG_AAP         = 0x01;     # accept all phys (promisc, off)
+var R8169_RXCFG_APM         = 0x02;     # accept physical match (unicast to us)
+var R8169_RXCFG_AM          = 0x04;     # accept multicast
+var R8169_RXCFG_AB          = 0x08;     # accept broadcast (DHCP, ARP)
+
+# MISC (dword at 0xF0) — bit 19 = RXDV_GATED_EN.
+var R8169_MISC_RXDV_GATED   = 0x00080000;
+
+# TPPoll (byte at 0x38) — NPQ = normal-priority-queue kick.
+var R8169_TPPOLL_NPQ        = 0x40;
+
+# PHY access (PHYAR dword at 0x60).
+var R8169_PHYAR_FLAG        = 0x80000000;
+var R8169_PHYAR_REG_SHIFT   = 16;
+
+# IEEE 802.3 PHY registers (datasheet §11/§13).
+var R8169_PHY_BMCR          = 0x00;
+var R8169_PHY_BMSR          = 0x01;
+var R8169_BMCR_ANENABLE     = 0x1000;
+var R8169_BMCR_ANRESTART    = 0x0200;
+var R8169_BMCR_PDOWN        = 0x0800;
+var R8169_BMSR_LINKUP       = 0x0004;
+
+# PHYSTATUS (byte at 0x6C) — chip-side link summary, used in addition to BMSR.
+var R8169_PHYSTATUS_LINKSTS = 0x02;
+
+# Tally counter (RL_DUMPSTATS): bit 3 of register 0x10 is start/in-flight.
+var R8169_DUMPSTATS_START   = 0x00000008;
+
+# === Descriptor layout (FreeBSD struct rl_desc — if_rlreg.h:646-651) ===
 #
-# See agnosticos/docs/development/network-arc-prior-art.md § 1 for the
-# full convergent-shape table and per-source citation map.
-
-# Realtek vendor ID.
-var R8169_PCI_VENDOR = 0x10EC;
-
-# Common modern RTL8168/8111-family device IDs. Add iron-surfaced
-# variants as new boards present them; don't pre-scaffold the full
-# Linux ~50-entry table — extract on real consumer demand per the
-# `mihi → iam/chakshu` extract-on-2nd-consumer pattern.
-var R8169_DEV_8168 = 0x8168;  # RTL-8111/8168 (most common modern variant)
-var R8169_DEV_8169 = 0x8169;  # RTL-8169 (older but still in the wild)
-var R8169_DEV_8161 = 0x8161;  # RTL-8111/8168 PCIE Gigabit (some Beelink variants)
-
-# Register offsets (from RTL8168/8111 datasheet; converged across all
-# four BSD/Linux/Haiku references).
-var R8169_REG_IDR0      = 0x00;  # MAC address byte 0 (ID Register 0)
-var R8169_REG_IDR4      = 0x04;  # MAC address byte 4
-var R8169_REG_TXCONFIG  = 0x40;  # TX Configuration (chip-rev hints in high byte)
-var R8169_REG_RXCONFIG  = 0x44;  # RX Configuration
-var R8169_REG_CR        = 0x37;  # Command Register (8-bit)
-
-# CR bit positions.
-var R8169_CR_RST = 0x10;  # bit 4 — Reset (write 1, poll until cleared)
-var R8169_CR_RE  = 0x08;  # bit 3 — RX Enable
-var R8169_CR_TE  = 0x04;  # bit 2 — TX Enable
-
-# === Phase 2-3 (1.32.0 bite B Phases 2+3) — RX + TX ring constants ===
-
-# Descriptor layout (16 bytes each, same for RX + TX per RTL8168 datasheet
-# §6.7; converged across Linux/FreeBSD/OpenBSD/NetBSD/Haiku refs):
-#   offset 0:  status (u32) — OWN[31] | EOR[30] | FS[29] | LS[28] | length[13:0]
-#   offset 4:  vlan (u32) — VLAN tag or 0
-#   offset 8:  buf_addr_lo (u32)
-#   offset 12: buf_addr_hi (u32)
-var R8169_DESC_OWN      = 0x80000000;  # NIC owns when set; driver owns when clear
-var R8169_DESC_EOR      = 0x40000000;  # End Of Ring (last descriptor wraps)
-var R8169_DESC_FS       = 0x20000000;  # First Segment (single-segment frame: FS+LS set)
-var R8169_DESC_LS       = 0x10000000;  # Last Segment
-var R8169_DESC_RES      = 0x00200000;  # Receive Error Summary (1.32.3 audit FINDING #2)
-var R8169_DESC_LEN_MASK = 0x00003FFF;  # length field is 14 bits
-var R8169_FRAG_MASK     = 0x30000000;  # FS | LS — frame complete when both set
-
-# Ring sizes — 16 descriptors per direction. Linux defaults 256 for
-# perf; BBS/MUD-class workloads fit easily in 16. Power-of-two so the
-# (idx + 1) & mask wrap is one AND.
-var R8169_RX_RING_SIZE = 16;
-var R8169_TX_RING_SIZE = 16;
-var R8169_RING_MASK    = 0x0F;        # 16 - 1
-var R8169_BUF_SIZE     = 2048;        # max packet — covers 1500 MTU + Eth + VLAN + slack
-
-# Additional register offsets (Phase 1 only used CR/IDR/TxConfig).
-var R8169_REG_MAC0         = 0x00;  # MAC address lower 4 bytes (32-bit write required on H+)
-var R8169_REG_MAC4         = 0x04;  # MAC address upper 2 bytes (32-bit write, top 2 ignored)
-var R8169_REG_MAR0         = 0x08;  # Multicast hash filter (8 bytes; MAR0+0 + MAR0+4)
-var R8169_REG_TNPDS_LO     = 0x20;  # Tx Normal Priority Descriptor Start (low)
-var R8169_REG_TNPDS_HI     = 0x24;
-var R8169_REG_TPPOLL       = 0x38;  # Transmit Priority Poll — bit 6 (0x40) = NPQ kick
-var R8169_REG_IMR          = 0x3C;  # Interrupt Mask
-var R8169_REG_ISR          = 0x3E;  # Interrupt Status (W1C)
-var R8169_REG_RMS          = 0xDA;  # Rx Max packet Size (16-bit)
-var R8169_REG_MTPS         = 0xEC;  # Max Tx Packet Size (8-bit, in 128-byte units)
-var R8169_REG_RDSAR_LO     = 0xE4;  # RX Descriptor Start Address Register (low)
-var R8169_REG_RDSAR_HI     = 0xE8;
-var R8169_REG_MISC         = 0xF0;  # MISC register — bit 19 RXDV_GATED_EN (G/H+ chips)
-
-# Additional register windows for 8168G_PLUS chip family init. The
-# OCPDR / EPHYAR / DLLPR / MISC_1 / CONFIG3 / ERIAR constants and
-# their helpers were deleted post-Attempt-99 — iPXE + FreeBSD + the
-# Realtek datasheet all show the chip-MCU body they enable is not
-# load-bearing for BCAST/UCAST RX on this chip family.
-var R8169_REG_CPLUSCMD     = 0xE0;  # CPlusCmd (16-bit) — bit 3 PCIMulRW
-
-# CPlusCmd bits.
-var R8169_CPLUSCMD_PCIMULRW = 0x08;  # bit 3 — PCI multiple read/write enable
-
-# MISC register bits.
-var R8169_MISC_RXDV_GATED_EN = 0x00080000;  # bit 19 — when set, RX data-valid signal is gated (frames dropped at validator)
-
-# RxConfig bits (offset 0x44):
-var R8169_RXCFG_AAP = 0x01;  # accept all phys (promisc — off in v1)
-var R8169_RXCFG_APM = 0x02;  # accept physical match (unicast to our MAC)
-var R8169_RXCFG_AM  = 0x04;  # accept multicast
-var R8169_RXCFG_AB  = 0x08;  # accept broadcast (needed for ARP + DHCP)
-# RxConfig high-byte profile — BSD 8168G_PLUS family value.
+# 16 bytes per descriptor, identical for RX and TX:
+#   offset 0  (u32) cmdstat — OWN[31] EOR[30] FS[29] LS[28] ... LEN[13:0]
+#   offset 4  (u32) vlanctl — VLAN tag + (for RX) protocol-ID bits
+#   offset 8  (u32) bufaddr_lo
+#   offset 12 (u32) bufaddr_hi
 #
-# Three-source convergence (FreeBSD sys/dev/re/if_re.c RL_FLAG_8168G_PLUS
-# branch + OpenBSD sys/dev/ic/re.c + NetBSD sys/dev/ic/rtl8169.c):
-#   base = RL_RX_FIFOTHRESH(7) | RL_RX_MAXDMA(7) | RL_RX_BUF_SZ ≈ 0xE700
-#   OR EARLYOFFV2 (0x0800) for 8168H/G silicon → 0xEF00
+# Ring alignment: 256 bytes (datasheet, FreeBSD RL_RING_ALIGN). pmm_alloc
+# returns 4 KB-aligned pages, which trivially satisfies this.
+
+var R8169_DESC_OWN          = 0x80000000;
+var R8169_DESC_EOR          = 0x40000000;
+var R8169_DESC_FS           = 0x20000000;
+var R8169_DESC_LS           = 0x10000000;
+# RX status bits (FreeBSD RL_RDESC_STAT_*)
+var R8169_RDESC_RXERRSUM    = 0x00100000;   # any RX error
+var R8169_RDESC_LEN_MASK    = 0x00003FFF;   # length is 14 bits on 8168G+
+var R8169_FRAG_MASK         = 0x30000000;   # FS|LS — frame complete when both set
+
+# === Ring sizing ===
 #
-# Bit map of 0xEF00:
-#   bits 15:13 (0xE000) RXFTH = 7 — FIFO threshold "no limit" (BSD shape).
-#   bit 11     (0x0800) RX_EARLY_OFF / EARLYOFFV2 — disable early-RX.
-#   bits 10:8  (0x0700) RX_DMA_BURST = 7 (unlimited).
-#
-# Linux's 0xCF00 (FIFOTHRESH=0 + RX128_INT_EN + RX_MULTI_EN + RX_EARLY_OFF)
-# was burned at Attempts 97-99 and failed identically across all three —
-# four-source multi-driver convergence (incl. iPXE which uses 0xE78F at
-# src/drivers/net/realtek.c:1298-1304) supports the BSD shape over Linux
-# for this silicon's broadcast/unicast acceptance behavior.
-var R8169_RXCFG_DEFAULTS = 0xEF00;
+# 16 descriptors per direction is comfortable for the AGNOS workload
+# (DHCP, ARP, TCP smoke, low-pps probes). Power-of-two so (idx + 1) & mask
+# wraps in one AND.
+var R8169_RX_RING_SIZE      = 16;
+var R8169_TX_RING_SIZE      = 16;
+var R8169_RING_MASK         = 0x0F;
+var R8169_BUF_SIZE          = 2048;     # covers 1500 MTU + Eth + VLAN + slack
 
-# TxConfig (offset 0x40) — IFG=3 (standard), DMA burst=7 (unlimited).
-var R8169_TXCFG_DEFAULTS = 0x03000700;
+# === PCI vendor/device IDs ===
+var R8169_PCI_VENDOR        = 0x10EC;
+var R8169_DEV_8168          = 0x8168;
+var R8169_DEV_8169          = 0x8169;
+var R8169_DEV_8161          = 0x8161;
 
-# TPPoll bit 6 = NPQ (Normal Priority Queue kick).
-var R8169_TPPOLL_NPQ = 0x40;
+# === Module-level state ===
 
-# PHY access — MDIO via PHYAR register at MMIO offset 0x60 (RTL8168/8111
-# datasheet §11). 32-bit layout:
-#   bit 31     = Flag (write: 1 = trigger write; chip clears on done.
-#                      read: 0 = trigger read; chip sets on done.)
-#   bits 30:21 = reserved (write as 0)
-#   bits 20:16 = PHY register address (5 bits, 0..31)
-#   bits 15:0  = data (write = src data; read = received data once flag set)
-var R8169_REG_PHYAR     = 0x60;
-var R8169_PHYAR_FLAG    = 0x80000000;
-var R8169_PHYAR_REG_SHIFT = 16;
+var r8169_present           = 0;
+var r8169_pci_idx           = 0;
+var r8169_mmio_base         = 0;
+var r8169_mac[8];                       # 6 valid bytes + 2 padding (module-global, 8*8 = 64 B)
+var r8169_chip_rev          = 0;
+var r8169_rx_ring_phys      = 0;
+var r8169_tx_ring_phys      = 0;
+var r8169_rx_bufs[16];                  # 16 phys addrs (u64 each at module scope)
+var r8169_tx_bufs[16];
+var r8169_rx_idx            = 0;
+var r8169_tx_idx            = 0;
 
-# PHY register map (IEEE 802.3 + datasheet §13):
-var R8169_PHY_BMCR      = 0x00;       # Basic Mode Control
-var R8169_PHY_BMSR      = 0x01;       # Basic Mode Status
-var R8169_BMCR_ANENABLE = 0x1000;     # bit 12 — Autonegotiation Enable
-var R8169_BMCR_ANRESTART= 0x0200;     # bit  9 — Restart Autonegotiation
-var R8169_BMCR_PDOWN    = 0x0800;     # bit 11 — Power Down (mask off to ensure live)
-var R8169_BMSR_LINKUP   = 0x0004;     # bit  2 — Link Status (1 = up)
+# Tally counter dump buffer — 64-byte aligned (RL_DUMP_ALIGN). Module-
+# global var X[N] is N×u64 = 8N bytes, so var stats_buf[16] = 128 B. We
+# need ≥64 B for the rl_stats struct; the page-aligned pmm_alloc'd page
+# we use at runtime gives us alignment ≥4 KB which is overkill but fine.
+var r8169_stats_phys        = 0;
+var r8169_stats_initialized = 0;
 
-# Module-level state — populated by r8169_probe on success.
-var r8169_present     = 0;
-var r8169_pci_idx     = 0;
-var r8169_mmio_base   = 0;
-var r8169_mac[8];        # 6 valid bytes + 2 padding
-var r8169_chip_rev    = 0;
+# === MMIO accessors ============================================================
 
-# RX + TX ring state (Phase 2-3). Ring base addresses come from
-# pmm_alloc (page-aligned = 4096-aligned = 256-aligned, satisfying
-# the spec's descriptor-ring alignment constraint). One pmm_alloc'd
-# page per descriptor buffer (2KB used of 4KB page; ~50% waste, but
-# the simplification is worth it at v1).
-var r8169_rx_ring_phys = 0;
-var r8169_tx_ring_phys = 0;
-var r8169_rx_bufs[16];   # phys addrs of 16 RX packet buffers (module-global u64[]; 16*8 = 128 bytes)
-var r8169_tx_bufs[16];   # phys addrs of 16 TX packet buffers
-var r8169_rx_idx = 0;    # next RX descriptor to inspect
-var r8169_tx_idx = 0;    # next TX descriptor to fill
-
-# Diagnostic counters for 1.32.1 bite B (per r8169-iron-burn-audit.md
-# § 10.5). Saturating byte counters — kernel-side state avoids the
-# read-modify-write CMOS round-trip on every send/poll. Stamped to
-# CMOS slots 0x5A / 0x5C from the respective hot path.
-var r8169_tx_send_count = 0;
-var r8169_rx_poll_count = 0;
-
-# --- MMIO accessors -------------------------------------------------
-# Mirror nvme.cyr/ahci.cyr convention: never load64 against MMIO. The
-# r8169 register window is only 256 bytes; everything fits in 8/16/32-
-# bit accesses.
-
-fn r8169_mmio_read8(off) {
+fn r8169_read8(off) {
     return load8(r8169_mmio_base + off);
 }
 
-fn r8169_mmio_write8(off, val) {
+fn r8169_write8(off, val) {
     store8(r8169_mmio_base + off, val);
     return 0;
 }
 
-fn r8169_mmio_read32(off) {
+fn r8169_read16(off) {
+    return load16(r8169_mmio_base + off);
+}
+
+fn r8169_write16(off, val) {
+    store16(r8169_mmio_base + off, val);
+    return 0;
+}
+
+fn r8169_read32(off) {
     return load32(r8169_mmio_base + off);
 }
 
-# --- chip-MCU helpers DELETED (1.32.3 post-Attempt-99 multi-source pivot) ---
-#
-# The ERI / MAC-OCP / EPHY / ASPM-CLKREQ / PCIe-L2L3 helpers and the
-# rtl_hw_start_8168h_1 body (~280 LOC) were ported from Linux v7.0
-# r8169_main.c during the Attempt 97-99 escalation. Multi-source research
-# falsified the load-bearing assumption: iPXE src/drivers/net/realtek.c +
-# FreeBSD sys/dev/re/if_re.c + OpenBSD/NetBSD/Haiku all receive broadcast
-# on this chip family WITHOUT any chip-MCU body writes. The Realtek
-# RTL8111B/8168B datasheet (§2.1/§2.3/§2.9) confirms IDR/MAR/RCR don't
-# need Cfg9346 unlock and reset preserves IDR. The actual load-bearing
-# misses are in init ORDER + RxConfig PROFILE — addressed inline in
-# r8169_probe and r8169_init_tx below. See agnosticos/docs/development/
-# r8169-chip-init-audit.md § "BSD + iPXE convergence" for the receipt.
+fn r8169_write32(off, val) {
+    store32(r8169_mmio_base + off, val);
+    return 0;
+}
 
-# --- PCI discovery --------------------------------------------------
+# === PCI discovery =============================================================
 
 fn r8169_find_pci() {
     var idx = pci_find(R8169_PCI_VENDOR, R8169_DEV_8168);
@@ -219,90 +206,60 @@ fn r8169_find_pci() {
     return 0 - 1;
 }
 
-# --- PHY access (1.32.1 bite C — H1 fix, multi-source convergent) ---
+# === PHY MDIO access ===========================================================
 #
-# Multi-source agreement (r8169-iron-burn-audit.md § 10.2):
-#   Linux drivers/net/ethernet/realtek/r8169_main.c — full per-mac_version
-#     dispatch via rtl_phy_write_paged_safe; we don't need the full
-#     dispatch for a minimum-viable autoneg restart.
-#   OpenBSD sys/dev/ic/re.c re_phy_init — simplest converged form:
-#     BMCR.autoneg-enable + restart-autoneg, then poll BMSR for link.
-#   FreeBSD if_re.c + NetBSD re.c + Haiku — all mirror OpenBSD's shape.
-#   RealTek RTL8168 datasheet §11/§13 — PHYAR protocol + reg map.
-# AGNOS lands the OpenBSD-converged shape (smallest cross-validated
-# implementation that brings up the PHY enough for DHCP to work).
+# PHYAR at 0x60. Write protocol:
+#   bit 31 = flag (write: 1 to trigger; chip clears on done.
+#                  read: 0 to trigger; chip sets when data ready)
+#   bits 20:16 = PHY register addr (5 bits)
+#   bits 15:0  = data
+#
+# iPXE realtek.c:264-322 polls up to RTL_MII_MAX_WAIT_US (500) at 1us each;
+# we use 1000 spin iterations as an upper bound matching the reset poll.
 
 fn r8169_phy_write(reg, val) {
-    # Build PHYAR write word: flag=1 | reg in bits 20:16 | data in bits 15:0.
     var par = R8169_PHYAR_FLAG | ((reg & 0x1F) << R8169_PHYAR_REG_SHIFT) | (val & 0xFFFF);
-    store32(r8169_mmio_base + R8169_REG_PHYAR, par);
-    # Poll for completion — chip clears flag bit when write is done.
-    # Datasheet specifies typical 1-10us; we use 1000 iterations of busy
-    # MMIO reads as the timeout bound (matches reset poll convention).
+    r8169_write32(R8169_REG_PHYAR, par);
     for (var i = 0; i < 1000; i = i + 1) {
-        var r = load32(r8169_mmio_base + R8169_REG_PHYAR);
+        var r = r8169_read32(R8169_REG_PHYAR);
         if ((r & R8169_PHYAR_FLAG) == 0) { return 1; }
     }
     return 0;
 }
 
 fn r8169_phy_read(reg) {
-    # Build PHYAR read word: flag=0 | reg in bits 20:16 | data=0.
     var par = (reg & 0x1F) << R8169_PHYAR_REG_SHIFT;
-    store32(r8169_mmio_base + R8169_REG_PHYAR, par);
-    # Poll for completion — chip sets flag bit when read data is ready.
+    r8169_write32(R8169_REG_PHYAR, par);
     for (var i = 0; i < 1000; i = i + 1) {
-        var r = load32(r8169_mmio_base + R8169_REG_PHYAR);
+        var r = r8169_read32(R8169_REG_PHYAR);
         if ((r & R8169_PHYAR_FLAG) != 0) { return r & 0xFFFF; }
     }
     return 0xFFFF;
 }
 
-# Bring the internal PHY up by kicking autoneg. NON-BLOCKING SHAPE
-# (1.32.1 FIX #3 per dhcp-end-to-end-audit.md). Earlier (commit b12e25a)
-# version block-polled BMSR.LinkStatus for "300 iterations × ~10ms" but
-# the busy-wait was ~100× too short on AMD Zen at 3.5 GHz (each
-# 100,000-iter empty loop runs in ~28µs, not 10ms), so the 3s budget
-# collapsed to ~8ms while real Ethernet autoneg on copper takes 1.5-3s.
-# Result: false-negative "autoneg timeout" prints with link actually up.
+# Bring the PHY up. Non-blocking shape — autoneg takes 1-3s on copper and
+# our timing budget can't wait. We kick autoneg and return; rings handle
+# link-not-yet-up gracefully (TX descriptors sit until line clocks them).
 #
-# Linux moved away from blocking-on-link 20+ years ago (PHYLIB async
-# notifier shape). Our TX/RX rings handle link-not-yet-up gracefully —
-# descriptors sit in the TX ring until the NIC clocks them out post
-# autoneg-complete. So: kick BMCR.ANRESTART, optionally read BMSR once
-# for an opportunistic snapshot, return success unconditionally.
-#
-# CMOS 0x59 outcome enum simplified:
-#   0 = not attempted (probe never reached phy_init)
-#   1 = kicked successfully (BMCR write OK; autoneg running async)
-#   3 = BMCR write timed out (MDIO interface broken — real driver bug)
-#   4 = BMCR/BMSR read timed out (MDIO interface broken — real driver bug)
-# (the 2 = "autoneg timeout" enum is retired — no longer polled).
+# IEEE 802.3 §22.2.4.2: BMSR.LinkStatus latches low; must read twice.
 fn r8169_phy_init() {
     var bmcr = r8169_phy_read(R8169_PHY_BMCR);
     if (bmcr == 0xFFFF) {
         kprintln("r8169: PHY MDIO read failed", 26);
         return 0;
     }
-    # (1.32.2 FIX #10 per dhcp-end-to-end-audit.md FINDING #10) Check
-    # link state FIRST, before deciding whether to restart autoneg.
-    # Attempt 94 evidence (TX OWN cleared = 0x30, RX multicast captured =
-    # 0x5E=0x01) showed the BIOS-pre-configured autoneg was already up.
-    # Attempt 95 evidence (TX OWN stuck = 0xb0, RX zero DMA = 0x5E=0x00)
-    # showed the NIC wedged AFTER 1.32.1 FIX #3 unconditionally kicked
-    # BMCR.ANRESTART — autoneg restart takes the link DOWN for 1-3s
-    # while the PHY renegotiates. If init_rx + init_tx + scheduler ran
-    # during that window (~100ms post-probe), the NIC's TX/RX engines
-    # initialized while link was down — some RTL8168 variants wedge in
-    # this state and don't recover. Per IEEE 802.3 §22.2.4.2 BMSR
-    # LinkStatus (bit 2) is latching-low — must read twice for live
-    # state.
+
+    # If BIOS already brought autoneg up, preserve it — restarting takes
+    # link DOWN for 1-3s, during which init_rx/init_tx run and may wedge
+    # the RX/TX engines on some 8168 variants.
     var bmsr_latch = r8169_phy_read(R8169_PHY_BMSR);   # clear latch
-    var bmsr_live = r8169_phy_read(R8169_PHY_BMSR);    # live snapshot
+    var bmsr_live  = r8169_phy_read(R8169_PHY_BMSR);   # live snapshot
     if ((bmsr_live & R8169_BMSR_LINKUP) != 0) {
         kprintln("r8169: PHY link up (preserved from BIOS)", 40);
         return 1;
     }
+
+    # PDOWN bit cleared, ANENABLE + ANRESTART set.
     var new_bmcr = (bmcr | R8169_BMCR_ANENABLE | R8169_BMCR_ANRESTART) & 0xF7FF;
     if (r8169_phy_write(R8169_PHY_BMCR, new_bmcr) == 0) {
         kprintln("r8169: PHY MDIO write failed", 27);
@@ -312,11 +269,58 @@ fn r8169_phy_init() {
     return 1;
 }
 
-# --- Phase 1 probe + reset ------------------------------------------
+# === Cfg9346 envelope ==========================================================
 #
-# Returns 1 on full probe success (chip found + MAC read + reset clean);
-# 0 if no controller present (silent no-op, no error); -1 on probe
-# failure (BAR0/2 both unmapped or reset timeout).
+# Per FreeBSD re_init_locked:3197-3200 and the datasheet §2.9: CONFIG0..5
+# registers + IDR0/IDR4 writeback require Cfg9346 EEM=11 (unlock). DO NOT
+# extend this envelope to TxConfig/RxConfig/MAR — datasheet limits the
+# gate to CONFIG-block + IDR.
+
+fn r8169_cfg_unlock() {
+    r8169_write8(R8169_REG_9346CR, R8169_9346CR_UNLOCK);
+    return 0;
+}
+
+fn r8169_cfg_lock() {
+    r8169_write8(R8169_REG_9346CR, R8169_9346CR_LOCK);
+    return 0;
+}
+
+# === Chip reset ================================================================
+#
+# iPXE realtek.c:343-363 and FreeBSD re_reset:732-753 converge: write
+# CR.RST = 0x10, poll until clear. FreeBSD also writes 0x82=1 if MACRESET
+# flag (8168E_VL and later); we skip that branch — the bigger init story
+# (CPlusCmd + ring + RxConfig late-enable) is the load-bearing path.
+
+fn r8169_reset() {
+    r8169_write8(R8169_REG_CR, R8169_CR_RST);
+    for (var i = 0; i < 1000; i = i + 1) {
+        var cr = r8169_read8(R8169_REG_CR);
+        if ((cr & R8169_CR_RST) == 0) { return 0; }
+    }
+    return 0 - 1;
+}
+
+# === ASPM disable ==============================================================
+#
+# CONFIG5 (byte at 0x56) bit 1 controls ASPM-related behaviour on 8168G/H.
+# Linux r8169 disables it for these revisions (rtl_hw_aspm_clkreq_enable).
+# FreeBSD goes through PCIe config-space capability list instead; both
+# approaches converge on "ASPM off" before bringing the chip up.
+# Wrapped in Cfg9346 unlock — datasheet §2.9 requires it for CONFIG block.
+
+fn r8169_aspm_disable() {
+    r8169_cfg_unlock();
+    var c5 = r8169_read8(R8169_REG_CONFIG5);
+    r8169_write8(R8169_REG_CONFIG5, c5 & (0xFF - R8169_CONFIG5_ASPM));
+    r8169_cfg_lock();
+    return 0;
+}
+
+# === Probe =====================================================================
+#
+# Returns 1 on full probe success, 0 if no controller, -1 on init failure.
 
 fn r8169_probe() {
     var idx = r8169_find_pci();
@@ -325,104 +329,50 @@ fn r8169_probe() {
         return 0;
     }
 
-    # 2. Discover MMIO BAR. Modern RTL8111/8168 chips expose:
-    #    BAR0 = I/O port base (256 bytes)
-    #    BAR2 = MMIO (same 256-byte register window)
-    # We use MMIO BAR2. If zero (some virt/iron configs strip it),
-    # fall back BAR4 (newer chips relocate MMIO there) then BAR0.
+    # Modern RTL8111/8168 chips expose:
+    #   BAR0 = I/O port base (256 bytes)
+    #   BAR2 = MMIO (same 256-byte register window)
+    # Some boards relocate MMIO to BAR4.
     var mmio = pci_bar_64(idx, 2);
+    if (mmio == 0) { mmio = pci_bar_64(idx, 4); }
     if (mmio == 0) {
-        mmio = pci_bar_64(idx, 4);
-    }
-    if (mmio == 0) {
-        # BAR0 is I/O on RTL811x; treating it as MMIO would fail
-        # silently, so refuse rather than guess.
         kprintln("r8169: no MMIO BAR (chip exposes I/O-port only?)", 47);
         return 0 - 1;
     }
 
-    # 3. Bus master enable. Same call-shape nvme/xhci use.
     pci_enable_bus_master_idx(idx);
 
-    # 4. Cache probe result.
     r8169_present   = 1;
     r8169_pci_idx   = idx;
     r8169_mmio_base = mmio;
 
-    # 5. UC remap. Standard PCI MMIO can't be cached.
+    # MMIO is uncacheable — make it UC in the page table.
     vmm_remap_uc_2mb(mmio);
 
-    # 6. Read MAC address — 6 bytes at IDR0..IDR5.
+    # Read MAC from IDR0..IDR5. EEPROM autoload at chip-reset populates
+    # these (datasheet §2.3) so the BIOS-handoff MAC is available before
+    # any reset.
     for (var i = 0; i < 6; i = i + 1) {
-        store8(&r8169_mac + i, r8169_mmio_read8(R8169_REG_IDR0 + i));
+        store8(&r8169_mac + i, r8169_read8(R8169_REG_IDR0 + i));
     }
 
-    # 7. Chip-revision hint. RTL811x families encode mac-version in
-    #    TxConfig bits 31-24 (Linux's tx_config_mac_version table walks
-    #    this). For Phase 1 just capture the raw byte; full chip-rev
-    #    dispatch table is a Phase 2+ scope item per the audit doc.
-    var txconfig = r8169_mmio_read32(R8169_REG_TXCONFIG);
+    # Chip-revision hint — bits 31:24 of TxConfig. We capture for the
+    # boot-log print; we don't dispatch per-variant init bodies (one
+    # validated target: 8168H/mac_version 46 on archaemenid).
+    var txconfig = r8169_read32(R8169_REG_TXCONFIG);
     r8169_chip_rev = (txconfig >> 24) & 0xFF;
 
-    # 8. Reset. Per RTL8168/8111 datasheet §6.1: write CR.RST=1, poll
-    #    until hardware clears it. Linux uses ~100 loops; FreeBSD 10ms;
-    #    OpenBSD 1ms × 100. We use 1000 reads — comfortable upper
-    #    bound, polled (no sleep — pre-IRQ-safe).
-    r8169_mmio_write8(R8169_REG_CR, R8169_CR_RST);
-    var reset_ok = 0;
-    for (var i = 0; i < 1000; i = i + 1) {
-        var cr = r8169_mmio_read8(R8169_REG_CR);
-        if ((cr & R8169_CR_RST) == 0) {
-            reset_ok = 1;
-            break;
-        }
-    }
-    if (reset_ok == 0) {
+    # Reset.
+    if (r8169_reset() != 0) {
         kprintln("r8169: reset timeout (CR.RST stayed set)", 40);
         return 0 - 1;
     }
 
-    # 8b. Post-reset init — minimal iPXE-shape, BSD-converged for 8168G_PLUS.
-    #
-    # Multi-source authority (NOT Linux-derived):
-    #   - iPXE src/drivers/net/realtek.c (~1000 LOC PXE/DHCP driver; works
-    #     on this chip family. Init: reset → IDR read → CPlusCmd PCIMulRW
-    #     → MAR all-1s → CR=TE|RE → TCR → RCR. ZERO MAC-OCP/EPHY/ERI/Cfg9346.)
-    #   - FreeBSD sys/dev/re/if_re.c RL_FLAG_8168G_PLUS branch (only chip-
-    #     MCU touches are RXDV gate clear + RxConfig EARLYOFFV2 + deferred
-    #     CR=TE|RE — no MAC-OCP/EPHY body).
-    #   - RTL8111B/8168B datasheet §2.3: CR_RST preserves IDR0-5; EEPROM
-    #     autoload populated them. No writeback needed. §2.9: Cfg9346
-    #     EEM=11 is for CONFIG0-5 only — NOT required for MAR/RCR/IDR.
-    #
-    # Attempts 97-99 (Linux per-chip-rev clone path) all FALSIFIED with
-    # byte-identical CMOS — chip admits multicast, drops broadcast +
-    # unicast. The load-bearing miss is the BSD/iPXE order + RxConfig
-    # profile, NOT the Linux MCU body. See r8169-chip-init-audit.md
-    # § "BSD + iPXE convergence" for the four-source receipt.
+    # Disable ASPM before bringing the link up. CONFIG5 ASPM bit toggled
+    # inside a Cfg9346 unlock envelope per datasheet §2.9.
+    r8169_aspm_disable();
 
-    # 1. CPlusCmd |= PCIMulRW — iPXE realtek.c:1420-1424 writes
-    #    MULRW|CPRX|CPTX. PCIMulRW is the only bit needed for RX to
-    #    function on G/H+ silicon (CPRX|CPTX are the C+ mode bits, which
-    #    we don't use; AGNOS uses the classic descriptor ring).
-    var cpc = load16(r8169_mmio_base + R8169_REG_CPLUSCMD);
-    store16(r8169_mmio_base + R8169_REG_CPLUSCMD, cpc | R8169_CPLUSCMD_PCIMULRW);
-
-    # 2. RXDV gate clear — MISC[bit 19] OFF. BSDs do this unconditionally
-    #    for 8168G_PLUS. Without it, chip's RX validator selectively gates
-    #    incoming frames (post-reset default may be 1 on this stepping).
-    var misc = load32(r8169_mmio_base + 0xF0);
-    store32(r8169_mmio_base + 0xF0, misc & (0xFFFFFFFF - R8169_MISC_RXDV_GATED_EN));
-
-    # 3. MAR0/MAR4 = all-1s — iPXE realtek.c:1283-1284 writes 0xFFFFFFFF
-    #    unconditionally. Per Linux 6.6.2 erratum patch (Patrick Thompson),
-    #    RTL8168H "erroneously filter unicast eapol packets unless allmulti
-    #    is enabled" — mechanism likely extends to broadcast on this stepping.
-    #    Datasheet §2.1: MAR is 4-byte-access only; post-reset value undefined.
-    store32(r8169_mmio_base + 0x08, 0xFFFFFFFF);
-    store32(r8169_mmio_base + 0x0C, 0xFFFFFFFF);
-
-    # 9. Summary print.
+    # Boot-log summary.
     kprint("r8169: found at ", 16);
     kprint_num(mmio);
     kprintln("", 0);
@@ -434,51 +384,37 @@ fn r8169_probe() {
     kprintln("", 0);
     kprint("r8169: chip-rev byte=0x", 23);
     kprint_num(r8169_chip_rev);
-    kprintln(" (Phase 2+ decodes the family)", 30);
+    kprintln("", 0);
     kprintln("r8169: reset OK", 15);
 
-    # 1.32.1 bite C — bring the internal PHY up. r8169_phy_init stamps
-    # slot 0x59 with the per-outcome enum (1=link up, 2-4=failure modes).
-    # Print result inline so the boot-log shows the proximate link state
-    # without requiring a CMOS read.
+    # Kick PHY autoneg async — chip rings will sit until link clocks them.
     if (r8169_phy_init() != 0) {
-        kprintln("r8169: link up", 14);
+        kprintln("r8169: link up or async", 23);
     } else {
-        kprintln("r8169: no link (autoneg timeout)", 32);
+        kprintln("r8169: PHY init failed", 22);
     }
 
-    kprintln("r8169: Phase 1 complete", 23);
     return 1;
 }
 
-# === Phase 2 — RX descriptor ring + per-buf pages + poll ============
+# === RX ring init ==============================================================
 #
-# Layout (16 descriptors × 16 bytes = 256 bytes, occupying the first
-# 256 bytes of a pmm_alloc'd 4 KB page; rest of the page is wasted but
-# the page allocator returns page-granularity anyway). Each descriptor's
-# buf_addr_lo/hi points at a separate pmm_alloc'd 4 KB page used as
-# the packet buffer (only first 2 KB consumed).
-#
-# Multi-source convergent shape (audit § 1.2):
-#   - All four BSD/Linux/Haiku refs agree on the 16-byte descriptor with
-#     status[31]=OWN, [30]=EOR, [29]=FS, [28]=LS, [13:0]=length.
-#   - OpenBSD's `re.c` is the simplest reference for the init sequence.
+# iPXE realtek_refill_rx:632-672 and FreeBSD re_rx_list_init:2106 converge
+# on the OWN-bit / EOR-on-last / per-descriptor buffer pattern. Layout
+# matches the 32-bit cmdstat descriptor — same as FreeBSD struct rl_desc.
 
 fn r8169_init_rx() {
     if (r8169_present == 0) { return 0 - 1; }
 
-    # 1. Allocate descriptor ring (page-aligned = 256-aligned by spec).
     r8169_rx_ring_phys = pmm_alloc();
     if (r8169_rx_ring_phys == 0) {
         kprintln("r8169: rx ring pmm_alloc failed", 31);
         return 0 - 1;
     }
-    # Zero the descriptor ring (only first 256 B used; zero the page).
     for (var i = 0; i < 4096; i = i + 1) {
         store8(r8169_rx_ring_phys + i, 0);
     }
 
-    # 2. Allocate per-descriptor buffers + initialize descriptors.
     for (var i = 0; i < 16; i = i + 1) {
         var buf = pmm_alloc();
         if (buf == 0) {
@@ -488,135 +424,45 @@ fn r8169_init_rx() {
         store64(&r8169_rx_bufs + i * 8, buf);
 
         var desc = r8169_rx_ring_phys + i * 16;
-        var status = 0x80000000 | 2048;   # OWN | BUF_SIZE
-        if (i == 15) { status = status | 0x40000000; }   # EOR on last
+        # cmdstat = OWN | BUF_SIZE (length field = how much room is here).
+        # EOR set on the last slot so the NIC wraps to slot 0.
+        var status = R8169_DESC_OWN | 2048;
+        if (i == 15) { status = status | R8169_DESC_EOR; }
         store32(desc + 0,  status);
-        store32(desc + 4,  0);                            # vlan
-        store32(desc + 8,  buf & 0xFFFFFFFF);
-        store32(desc + 12, (buf >> 32) & 0xFFFFFFFF);
+        store32(desc + 4,  0);                              # vlanctl
+        store32(desc + 8,  buf & 0xFFFFFFFF);               # bufaddr_lo
+        store32(desc + 12, (buf >> 32) & 0xFFFFFFFF);       # bufaddr_hi
     }
-
-    # 3. Program RDSAR — NIC reads descriptor ring base from here. Per
-    # r8169-chip-init-audit.md item 9 + Linux comment at line 2805-2808
-    # ("some iop3xx ARM board needs the TxDescAddrHigh register to be
-    # written before TxDescAddrLow"): write HIGH before LOW. Cheap to
-    # mirror; chip-rev quirk on x86 is undocumented but defensive.
-    store32(r8169_mmio_base + 0xE8, (r8169_rx_ring_phys >> 32) & 0xFFFFFFFF);
-    store32(r8169_mmio_base + 0xE4, r8169_rx_ring_phys & 0xFFFFFFFF);
-
-    # 4. Max RX packet size (16-bit register at 0xDA). Linux v6.6
-    # rtl_init_one writes 0x3FFF on most 8168 variants — effectively
-    # "no max." Audit: docs/development/r8169-rx-path-audit.md § S-2.
-    store8(r8169_mmio_base + 0xDA, 0x00);
-    store8(r8169_mmio_base + 0xDB, 0x40);
-
-    # NOTE: RxConfig write + CR.RE assertion moved to r8169_init_tx tail.
-    # 1.32.3 post-Attempt-99 pivot away from Linux-clone init: iPXE +
-    # FreeBSD + NetBSD `RTKQ_TXRXEN_LATER` 8168H carve-out all write the
-    # FINAL RxConfig (profile + accept bits in ONE write) BEFORE bringing
-    # CR.RE up. Driver-state init_rx/init_tx ordering is unchanged; only
-    # the chip-side enable order moved. See r8169_init_tx tail for the
-    # multi-source citation.
 
     r8169_rx_idx = 0;
     kprintln("r8169: RX ring up (16 desc × 2KB buf)", 36);
     return 0;
 }
 
-# Re-arm an RX descriptor with OWN=1, preserving the EOR bit by reading
-# it back from the descriptor's current opts1. Mirrors Linux's
-# `rtl8169_mark_to_asic` (r8169_main.c:3799-3807) — a future ring-resize
-# bug can't silently lose EOR because we never hard-code which slot has it.
-fn r8169_rx_rearm(desc) {
-    var prev = load32(desc);
-    var eor  = prev & 0x40000000;
-    store32(desc, 0x80000000 | eor | 2048);
-    return 0;
-}
-
-# Drain one valid packet from the RX ring, skipping errored / fragmented /
-# stale slots within a budget. Returns bytes copied into `buf`, or 0 if no
-# good frame found before budget exhaustion or until the next NIC-owned slot.
+# === TX ring init + chip bring-up (8168G_PLUS late-enable path) ===============
 #
-# 1.32.3 audit fix (docs/development/r8169-rx-path-audit.md):
-#   - Part A: multi-frame budget loop, mirroring Linux `rtl_rx` (line 4417)
-#     + OpenBSD `re_rxeof` (line 1576) + FreeBSD `re_rxeof` (line 3451).
-#     Pre-fix, this function returned after a single descriptor check, so a
-#     live LAN's IPv6 / IPv4 multicast traffic kept `dhcp_init`'s OFFER loop
-#     burning iterations on background frames while the OFFER sat in a later
-#     slot. CMOS 0x5E=0x01 at Attempt 96 was an IPv4 multicast first byte
-#     (`01:00:5e:...`), not the OFFER's `0xb0:41:...` unicast or `0xff:...`
-#     broadcast — proof the chip received traffic but never the OFFER frame
-#     into the slot we were inspecting.
-#   - Part B: RES (0x00200000) + FS|LS (0x30000000) gating. Pre-fix, an
-#     errored or fragmented frame would have its garbage length passed up to
-#     ethernet_recv which would parse a junk ethertype and silently drop.
-#     The slot still consumed an iteration. Now: skip + re-arm + advance.
-fn r8169_poll(buf, maxlen) {
-    if (r8169_present == 0) { return 0; }
-    if (r8169_rx_ring_phys == 0) { return 0; }
-
-    # 1.32.3 audit S-1: bump in-memory poll counter but skip the per-poll
-    # CMOS stamps. The 4 stamps that fired here (RX_POLL_COUNT + RX_DESC0_OWN
-    # + RX_DESC0_BYTE0 + TX_DESC0_OWN) at ~2 µs each = ~8 µs hot-path tax
-    # competing with frame-arrival rate on a busy LAN. Stamps now fire only
-    # on state transitions (each successful frame consume below; TX stamp
-    # moved to r8169_send).
-    if (r8169_rx_poll_count < 0xFF) {
-        r8169_rx_poll_count = r8169_rx_poll_count + 1;
-    }
-
-    # Multi-frame budget loop (16 = one full ring walk worst case).
-    var budget = 16;
-    while (budget > 0) {
-        budget = budget - 1;
-
-        var desc = r8169_rx_ring_phys + r8169_rx_idx * 16;
-        var status = load32(desc);
-        if ((status & R8169_DESC_OWN) != 0) { return 0; }   # NIC still owns this slot; nothing more for now
-
-        # RES — Receive Error Summary. Frame has CRC / runt / link errors;
-        # length field is unreliable. Re-arm and advance.
-        if ((status & R8169_DESC_RES) != 0) {
-            r8169_rx_rearm(desc);
-            r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
-            continue;
-        }
-
-        # FS|LS — both bits MUST be set for a single-segment frame. Pre-1.32.3
-        # we silently delivered fragments as full frames. Now: re-arm + skip.
-        if ((status & R8169_FRAG_MASK) != R8169_FRAG_MASK) {
-            r8169_rx_rearm(desc);
-            r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
-            continue;
-        }
-
-        # Good frame — extract length (strip CRC per RTL § 6.7) + copy.
-        var pkt_len = status & R8169_DESC_LEN_MASK;
-        if (pkt_len >= 4) { pkt_len = pkt_len - 4; }
-        if (pkt_len > maxlen) { pkt_len = maxlen; }
-
-        var bufaddr = load64(&r8169_rx_bufs + r8169_rx_idx * 8);
-        for (var i = 0; i < pkt_len; i = i + 1) {
-            store8(buf + i, load8(bufaddr + i));
-        }
-
-        r8169_rx_rearm(desc);
-        r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
-        return pkt_len;
-    }
-
-    # Budget exhausted with no good frame — give caller a chance to do other work
-    # before we try again. Next poll picks up where this left off via r8169_rx_idx.
-    return 0;
-}
-
-# === Phase 3 — TX descriptor ring + per-buf pages + send ============
+# This is where the load-bearing init order lives. Per FreeBSD
+# re_init_locked:3090-3260 for RL_FLAG_8168G_PLUS:
+#
+#   1. C+ command BEFORE all others   (line 3155-3168)
+#   2. IDR0/IDR4 writeback wrapped in Cfg9346 (line 3197-3200)
+#   3. RX list addr (HI then LO)      (line 3206-3209)
+#   4. TX list addr (HI then LO)      (line 3211-3214)
+#   5. MISC RXDV_GATED clear          (line 3216-3220) — 8168G_PLUS only
+#   6. TxConfig                       (line 3240)
+#   7. Early TX threshold = 16        (line 3242)
+#   8. RxConfig + MAR via re_set_rxmode (line 3247)
+#   9. CR.TE|RE LATE                  (line 3259-3260) — 8168G_PLUS only
+#
+# iPXE realtek.c:680-737 (realtek_open) collapses some of these for the
+# older 8169 path (CR enable early at line 705); we follow the FreeBSD
+# late-enable order because that's the 8168G_PLUS-specific branch and
+# archaemenid is 8168H (mac_version 46).
 
 fn r8169_init_tx() {
     if (r8169_present == 0) { return 0 - 1; }
 
-    # 1. Descriptor ring page.
+    # --- 0. TX descriptor ring allocation ----------------------------
     r8169_tx_ring_phys = pmm_alloc();
     if (r8169_tx_ring_phys == 0) {
         kprintln("r8169: tx ring pmm_alloc failed", 31);
@@ -626,7 +472,6 @@ fn r8169_init_tx() {
         store8(r8169_tx_ring_phys + i, 0);
     }
 
-    # 2. Per-descriptor buffers. Start with OWN=0 (driver-owned, empty).
     for (var i = 0; i < 16; i = i + 1) {
         var buf = pmm_alloc();
         if (buf == 0) {
@@ -637,100 +482,293 @@ fn r8169_init_tx() {
 
         var desc = r8169_tx_ring_phys + i * 16;
         var status = 0;
-        if (i == 15) { status = 0x40000000; }    # EOR on last
+        if (i == 15) { status = R8169_DESC_EOR; }
         store32(desc + 0,  status);
-        store32(desc + 4,  0);                    # vlan
+        store32(desc + 4,  0);                              # vlanctl
         store32(desc + 8,  buf & 0xFFFFFFFF);
         store32(desc + 12, (buf >> 32) & 0xFFFFFFFF);
     }
 
-    # 3. Program TNPDS — TX descriptor ring base. Per r8169-chip-init-
-    # audit.md item 9: write HIGH before LOW (same chip-rev quirk as RDSAR).
-    store32(r8169_mmio_base + 0x24, (r8169_tx_ring_phys >> 32) & 0xFFFFFFFF);
-    store32(r8169_mmio_base + 0x20, r8169_tx_ring_phys & 0xFFFFFFFF);
-
-    # 4. Max TX packet size (MTPS register, 8-bit, units of 128 bytes).
-    # 0x3B = 59 → 59 × 128 = 7552 bytes; ample for 1500-MTU frames.
-    store8(r8169_mmio_base + 0xEC, 0x3B);
-
-    # 5. TxConfig — iPXE src/drivers/net/realtek.c:1292-1295. IFG=3
-    #    (standard 96-bit), DMA burst=7 (unlimited). Programmed BEFORE
-    #    CR.TE per the datasheet §2.7 note: "TCR can only be changed
-    #    AFTER setting CR.TE" — wait, iPXE's order writes TCR BEFORE
-    #    CR.TE which contradicts the note; iPXE's order works in practice
-    #    on this chip family per its PXE workload. Cross-check with the
-    #    BSD ordering: FreeBSD re_init_locked() writes TCR via
-    #    re_set_tx_config_registers() before re_set_rxmode() + CR enable.
-    #    We follow the BSD/iPXE convergent order.
-    store32(r8169_mmio_base + 0x40, 0x03000700);
-
-    # 6. RxConfig + accept bits in ONE write — iPXE realtek.c:1298-1304
-    #    shape: profile (0xEF00 = RXFTH=7 | EARLYOFFV2 | MXDMA=7) OR
-    #    accept (AB|AM|APM). Single write, no profile-then-RMW.
+    # --- 1. CPlusCmd FIRST ------------------------------------------
     #
-    #    Critical: write the FINAL RxConfig BEFORE bringing CR.RE up.
-    #    Three Attempts (97/98/99) failed with byte-identical CMOS where
-    #    AGNOS wrote CR.RE first then RMW'd accept bits in — multi-source
-    #    convergence (iPXE + FreeBSD + NetBSD `RTKQ_TXRXEN_LATER` 8168H
-    #    carve-out at rtl8169.c:916) says the chip latches RxConfig at
-    #    CR.RE rising edge on this silicon. AB = load-bearing for DHCP
-    #    OFFER reception (RFC 2131 §4.1 BOOTP broadcast flag).
-    var accept = R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
-    store32(r8169_mmio_base + R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS | accept);
+    # FreeBSD re_init_locked:3155 — "We must configure the C+ register
+    # before all others." Bits: MULRW (PCI multi-read/write) +
+    # RXENB (C+ receive enable) + TXENB (C+ transmit enable). These
+    # last two are LOAD-BEARING — the 32-bit cmdstat ring is the C+ ring;
+    # without CPRX|CPTX the chip processes descriptors in legacy mode
+    # and the RX path stays silent.
+    var cpc = R8169_CPLUS_MULRW | R8169_CPLUS_RXENB | R8169_CPLUS_TXENB;
+    r8169_write16(R8169_REG_CPLUSCMD, cpc);
 
-    # 7. Enable TX + RX in ONE write, AFTER RxConfig is fully programmed.
-    #    iPXE realtek.c:1289 + NetBSD RTKQ_TXRXEN_LATER for RTK_HWREV_8168H
-    #    at rtl8169.c:916. NetBSD specifically carves this out for THIS
-    #    chip rev — silicon-observed deferral, not a hygiene convention.
-    var cr = load8(r8169_mmio_base + 0x37);
-    store8(r8169_mmio_base + 0x37, cr | R8169_CR_TE | R8169_CR_RE);
+    # --- 2. IDR writeback (Cfg9346-wrapped) -------------------------
+    #
+    # The reset preserves IDR via EEPROM autoload, but FreeBSD re-writes
+    # them on every init (line 3197-3200) — defensive against firmware
+    # tools that clear the chip MAC between probe and bringup.
+    var mac_lo = load8(&r8169_mac + 0)
+               | (load8(&r8169_mac + 1) << 8)
+               | (load8(&r8169_mac + 2) << 16)
+               | (load8(&r8169_mac + 3) << 24);
+    var mac_hi = load8(&r8169_mac + 4)
+               | (load8(&r8169_mac + 5) << 8);
+    r8169_cfg_unlock();
+    r8169_write32(R8169_REG_IDR0, mac_lo);
+    r8169_write32(R8169_REG_IDR4, mac_hi);
+    r8169_cfg_lock();
+
+    # --- 3. RX ring base (HI then LO) -------------------------------
+    #
+    # FreeBSD writes HI before LO (line 3206-3209). Linux comment in
+    # rtl_set_rx_tx_desc_registers notes "some iop3xx ARM board needs
+    # TxDescAddrHigh before TxDescAddrLow" — cheap to mirror on x86.
+    r8169_write32(R8169_REG_RDSAR_HI, (r8169_rx_ring_phys >> 32) & 0xFFFFFFFF);
+    r8169_write32(R8169_REG_RDSAR_LO, r8169_rx_ring_phys & 0xFFFFFFFF);
+
+    # --- 4. TX ring base (HI then LO) -------------------------------
+    r8169_write32(R8169_REG_TNPDS_HI, (r8169_tx_ring_phys >> 32) & 0xFFFFFFFF);
+    r8169_write32(R8169_REG_TNPDS_LO, r8169_tx_ring_phys & 0xFFFFFFFF);
+
+    # --- 5. MISC RXDV_GATED clear (8168G_PLUS) ----------------------
+    #
+    # FreeBSD re_init_locked:3216-3220 — without this, the chip's RX
+    # validator gates incoming frames on G+ silicon.
+    var misc = r8169_read32(R8169_REG_MISC);
+    r8169_write32(R8169_REG_MISC, misc & (0xFFFFFFFF - R8169_MISC_RXDV_GATED));
+
+    # --- 6. TxConfig ------------------------------------------------
+    r8169_write32(R8169_REG_TXCONFIG, R8169_TXCFG_DEFAULTS);
+
+    # --- 7. Max RX size (word at 0xDA) ------------------------------
+    #
+    # 0x4000 = 16384, effectively "no max" — covers jumbo frames if the
+    # caller ever asks for them; the per-descriptor BUF_SIZE (2048) is
+    # the real cap.
+    r8169_write16(R8169_REG_RMS, 0x4000);
+
+    # --- 8. Max TX size (byte at 0xEC, in 128-byte units) -----------
+    #
+    # 0x3B = 59 → 59 × 128 = 7552 B, ample for 1500-MTU frames.
+    r8169_write8(R8169_REG_MTPS, 0x3B);
+
+    # --- 9. RxConfig + MAR (matches re_set_rxmode shape) ------------
+    #
+    # MAR0/MAR4 = all-1s — iPXE realtek_open:699-700 unconditionally
+    # writes 0xFFFFFFFF. Linux v6.6 patch (Patrick Thompson) for 8168H
+    # erratum: "erroneously filter unicast eapol packets unless allmulti
+    # is enabled" — accept-all hashes also workaround broadcast filter
+    # quirks on this stepping.
+    r8169_write32(R8169_REG_MAR0, 0xFFFFFFFF);
+    r8169_write32(R8169_REG_MAR4, 0xFFFFFFFF);
+
+    # RxConfig final write — profile (FIFOTHRESH=7 | MAXDMA=7 | EARLYOFFV2)
+    # OR accept bits (AB | AM | APM). Single write, BEFORE CR.RE rises.
+    var accept = R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
+    r8169_write32(R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS | accept);
+
+    # --- 10. Clear missed-packet counter ---------------------------
+    r8169_write32(R8169_REG_MISSEDPKT, 0);
+
+    # --- 11. CR.TE|RE LATE ----------------------------------------
+    #
+    # FreeBSD re_init_locked:3259-3260 — only the 8168G_PLUS path
+    # writes CR with TE|RE AFTER RxConfig + ring setup. The chip
+    # latches RxConfig (specifically the accept mask) at the CR.RE
+    # rising edge on this silicon.
+    var cr = r8169_read8(R8169_REG_CR);
+    r8169_write8(R8169_REG_CR, cr | R8169_CR_TE | R8169_CR_RE);
+
+    # --- 12. Mask all interrupts (pure-poll mode) -----------------
+    #
+    # We don't service IRQs from this driver. iPXE leaves IMR=0 in
+    # its PXE/poll environment; we do the same on archaemenid.
+    r8169_write16(R8169_REG_IMR, 0);
+    r8169_write16(R8169_REG_ISR, 0xFFFF);                  # W1C — drain stale bits
 
     r8169_tx_idx = 0;
     kprintln("r8169: TX ring up (16 desc × 2KB buf)", 36);
     return 0;
 }
 
-# Send one packet via the TX ring. Returns bytes sent (= len) on success,
-# -1 if the next TX slot is still NIC-owned (queue full — caller can retry
-# after net_poll has progressed). Length capped at R8169_BUF_SIZE (2048).
+# === RX poll ===================================================================
+#
+# FreeBSD re_rxeof / iPXE realtek_poll_rx converge: walk slots until the
+# next NIC-owned descriptor, skip errored / fragmented slots, copy good
+# frames out and re-arm OWN. Budget = one full ring walk (16) so a
+# pathological all-error ring doesn't loop forever.
+
+fn r8169_rx_rearm(desc) {
+    var prev = load32(desc);
+    var eor  = prev & R8169_DESC_EOR;
+    store32(desc, R8169_DESC_OWN | eor | 2048);
+    return 0;
+}
+
+fn r8169_poll(buf, maxlen) {
+    if (r8169_present == 0) { return 0; }
+    if (r8169_rx_ring_phys == 0) { return 0; }
+
+    var budget = 16;
+    while (budget > 0) {
+        budget = budget - 1;
+
+        var desc = r8169_rx_ring_phys + r8169_rx_idx * 16;
+        var status = load32(desc);
+        if ((status & R8169_DESC_OWN) != 0) { return 0; }
+
+        # RES (RXERRSUM) = CRC / runt / FIFO / align error; length unreliable.
+        if ((status & R8169_RDESC_RXERRSUM) != 0) {
+            r8169_rx_rearm(desc);
+            r8169_rx_idx = (r8169_rx_idx + 1) & R8169_RING_MASK;
+            continue;
+        }
+
+        # Single-segment frame must have both FS and LS set.
+        if ((status & R8169_FRAG_MASK) != R8169_FRAG_MASK) {
+            r8169_rx_rearm(desc);
+            r8169_rx_idx = (r8169_rx_idx + 1) & R8169_RING_MASK;
+            continue;
+        }
+
+        # Good frame — extract length, strip 4-byte CRC (datasheet §6.7).
+        var pkt_len = status & R8169_RDESC_LEN_MASK;
+        if (pkt_len >= 4) { pkt_len = pkt_len - 4; }
+        if (pkt_len > maxlen) { pkt_len = maxlen; }
+
+        var bufaddr = load64(&r8169_rx_bufs + r8169_rx_idx * 8);
+        for (var i = 0; i < pkt_len; i = i + 1) {
+            store8(buf + i, load8(bufaddr + i));
+        }
+
+        r8169_rx_rearm(desc);
+        r8169_rx_idx = (r8169_rx_idx + 1) & R8169_RING_MASK;
+        return pkt_len;
+    }
+
+    return 0;
+}
+
+# === TX send ===================================================================
+#
+# iPXE realtek_transmit:779-835 (non-legacy branch) + FreeBSD re_encap.
+# Single-segment frames only — Cyrius doesn't have scatter-gather mbufs
+# and the call interface gives us one contiguous buf+len. Write OWN |
+# FS | LS | length into cmdstat, preserve EOR on slot 15, kick TPPoll
+# with NPQ.
+
 fn r8169_send(buf, len) {
     if (r8169_present == 0) { return 0 - 1; }
     if (r8169_tx_ring_phys == 0) { return 0 - 1; }
     if (len > 2048) { len = 2048; }
 
-    if (r8169_tx_send_count < 0xFF) {
-        r8169_tx_send_count = r8169_tx_send_count + 1;
-    }
-
     var desc = r8169_tx_ring_phys + r8169_tx_idx * 16;
     var status = load32(desc);
-    if ((status & 0x80000000) != 0) { return 0 - 1; }   # ring full
+    if ((status & R8169_DESC_OWN) != 0) { return 0 - 1; }   # ring full
 
     var bufaddr = load64(&r8169_tx_bufs + r8169_tx_idx * 8);
     for (var i = 0; i < len; i = i + 1) {
         store8(bufaddr + i, load8(buf + i));
     }
 
-    # Set OWN | FS | LS | length; preserve EOR on last descriptor.
-    var new_status = 0x80000000 | 0x20000000 | 0x10000000 | len;
-    if (r8169_tx_idx == 15) { new_status = new_status | 0x40000000; }
+    var new_status = R8169_DESC_OWN | R8169_DESC_FS | R8169_DESC_LS | len;
+    if (r8169_tx_idx == 15) { new_status = new_status | R8169_DESC_EOR; }
     store32(desc, new_status);
 
-    # Kick TX engine: write NPQ bit (0x40) to TPPoll. This is W1C-style —
-    # writing the bit asks the NIC to walk the queue once.
-    store8(r8169_mmio_base + 0x38, 0x40);
+    # Kick the TX engine. iPXE realtek.c:827: writeb(RTL_TPPOLL_NPQ, ...).
+    r8169_write8(R8169_REG_TPPOLL, R8169_TPPOLL_NPQ);
 
-    r8169_tx_idx = (r8169_tx_idx + 1) & 0x0F;
+    r8169_tx_idx = (r8169_tx_idx + 1) & R8169_RING_MASK;
     return len;
 }
 
-# === Phase 4 — NIC dispatcher (multi-backend send/poll) =============
+# === Tally counter dump ========================================================
 #
-# Replaces net.cyr's hardcoded virtio_net_send / virtio_net_poll calls.
-# Priority: r8169 (real iron, gigabit) > virtio_net (QEMU paravirt). On
-# iron, virtio_net is absent (vnet_active == 0) so r8169 wins; in QEMU,
-# r8169 is absent (r8169_present == 0) so virtio_net wins. No-NIC case
-# returns sane defaults.
+# Datasheet RTL8168 §6.8.4 / FreeBSD re_sysctl_stats:4002-4060.
+#
+# The chip DMAs its hardware tally counters into a host-resident
+# 64-byte-aligned buffer when we write the dump command. Protocol:
+#   1. write physaddr-high to RL_DUMPSTATS_HI (0x14)
+#   2. write physaddr-low  to RL_DUMPSTATS_LO (0x10)  — staging
+#   3. write physaddr-low | RL_DUMPSTATS_START (0x08) to 0x10 — trigger
+#   4. poll bit 3 of 0x10 until cleared (chip clears when done)
+#
+# Buffer layout (FreeBSD struct rl_stats — if_rlreg.h:737-751):
+#   offset 0x00 u64 tx_pkts
+#   offset 0x08 u64 rx_pkts
+#   offset 0x10 u64 tx_errs
+#   offset 0x18 u32 rx_errs
+#   offset 0x1C u16 missed_pkts
+#   offset 0x1E u16 rx_framealign_errs
+#   offset 0x20 u32 tx_onecoll
+#   offset 0x24 u32 tx_multicolls
+#   offset 0x28 u64 rx_ucasts
+#   offset 0x30 u64 rx_bcasts
+#   offset 0x38 u32 rx_mcasts
+#   offset 0x3C u16 tx_aborts
+#   offset 0x3E u16 rx_underruns
+
+fn r8169_dump_stats() {
+    if (r8169_present == 0) { return 0 - 1; }
+
+    if (r8169_stats_initialized == 0) {
+        r8169_stats_phys = pmm_alloc();
+        if (r8169_stats_phys == 0) { return 0 - 1; }
+        r8169_stats_initialized = 1;
+    }
+
+    # Zero the dump buffer so a chip stall leaves us with zeros not stale data.
+    for (var i = 0; i < 64; i = i + 1) {
+        store8(r8169_stats_phys + i, 0);
+    }
+
+    var addr_lo = r8169_stats_phys & 0xFFFFFFFF;
+    var addr_hi = (r8169_stats_phys >> 32) & 0xFFFFFFFF;
+
+    r8169_write32(R8169_REG_DUMPSTATS_HI, addr_hi);
+    r8169_write32(R8169_REG_DUMPSTATS_LO, addr_lo);
+    r8169_write32(R8169_REG_DUMPSTATS_LO, addr_lo | R8169_DUMPSTATS_START);
+
+    # Spin up to ~10 ms equivalent — chip typically completes in <100 us.
+    for (var i = 0; i < 10000; i = i + 1) {
+        var v = r8169_read32(R8169_REG_DUMPSTATS_LO);
+        if ((v & R8169_DUMPSTATS_START) == 0) { return 0; }
+    }
+    return 0 - 1;
+}
+
+fn r8169_print_stats() {
+    if (r8169_dump_stats() != 0) {
+        kprintln("r8169: stats dump timeout", 25);
+        return 0 - 1;
+    }
+    var sb = r8169_stats_phys;
+    kprint("r8169: tx_ok=", 13);
+    kprint_num(load64(sb + 0x00));
+    kprint(" rx_ok=", 7);
+    kprint_num(load64(sb + 0x08));
+    kprint(" tx_err=", 8);
+    kprint_num(load64(sb + 0x10));
+    kprint(" rx_err=", 8);
+    kprint_num(load32(sb + 0x18));
+    kprint(" missed=", 8);
+    kprint_num(load16(sb + 0x1C));
+    kprint(" align=", 7);
+    kprint_num(load16(sb + 0x1E));
+    kprint(" rx_uc=", 7);
+    kprint_num(load64(sb + 0x28));
+    kprint(" rx_bc=", 7);
+    kprint_num(load64(sb + 0x30));
+    kprint(" rx_mc=", 7);
+    kprint_num(load32(sb + 0x38));
+    kprintln("", 0);
+    return 0;
+}
+
+# === NIC backend dispatcher ====================================================
+#
+# net.cyr / dhcp / arp call through these. Priority: real-iron r8169 over
+# QEMU virtio-net. On archaemenid r8169 wins because virtio is absent;
+# in QEMU virtio wins because r8169 is absent. No-NIC case returns sane
+# defaults (caller bails on -1 / 0).
 
 fn nic_ready() {
     if (r8169_present != 0) {
@@ -765,15 +803,7 @@ fn nic_poll(buf, maxlen) {
     return 0;
 }
 
-# Backend-agnostic MAC accessor (1.32.1 FIX #1 per dhcp-end-to-end-audit.md).
-# Net stack consumers (eth_build src field, BOOTP chaddr, ARP sender HW) must
-# use the MAC of whichever NIC is actually wired up. Pre-fix, every net.cyr
-# site reached for &vnet_mac directly — which is only populated by
-# virtio_net_init. On iron with r8169 active and virtio absent, vnet_mac was
-# all-zeros and DHCP servers dropped our zero-chaddr DISCOVER frames.
-#
-# Copies 6 bytes of MAC into the caller's buffer. Returns 1 on success,
-# 0 if no NIC backend is up (out_buf gets zeroed for safety).
+# Copy 6 bytes of MAC into out_buf. Returns 1 on success, 0 if no NIC.
 fn nic_mac(out_buf) {
     if (r8169_present != 0) {
         memcpy(out_buf, &r8169_mac, 6);
