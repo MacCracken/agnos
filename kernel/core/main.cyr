@@ -672,10 +672,10 @@ if (vnet_active != 0 || nic_ready() != 0) {
     # STATIC-IP + ARP-probe test (DHCP bypass) — prove L1/L2/L3 work
     # before re-attempting DHCP. If gateway ARP replies, the wire is
     # sound and DHCP is the only broken layer.
-    # AGNOS announces a locally-administered MAC (set in r8169_probe)
-    # so the gateway's DHCP-snooping binding from Linux dhclient on the
-    # manufactured MAC doesn't conflate AGNOS with Linux. .222 is a
-    # fresh IP the gateway has no prior IP-source-guard binding for.
+    # AGNOS uses the EEPROM hardware MAC (the LAA override was removed —
+    # arp-probe-raw proved the gateway replies to the real MAC claiming
+    # .222 even with Linux's lease active, so there is no source-guard
+    # concern). .222 is a fresh static IP distinct from Linux's lease.
     net_init(ip4(192,168,1,222), ip4(192,168,1,1), ip4(255,255,255,0));
     kprint("net: STATIC ip=192.168.1.222 gw=192.168.1.1", 43);
     kprintln("", 0);
