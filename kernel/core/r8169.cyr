@@ -354,8 +354,8 @@ fn r8169_mac_ocp_modify(reg, mask, set) {
 
 fn r8169_ephy_write(reg, val) {
     var cmd = R8169_EPHYAR_FLAG
-            | ((reg & R8169_EPHYAR_REG_MASK) << R8169_EPHYAR_REG_SHIFT)
-            | (val & R8169_EPHYAR_DATA_MASK);
+    | ((reg & R8169_EPHYAR_REG_MASK) << R8169_EPHYAR_REG_SHIFT)
+    | (val & R8169_EPHYAR_DATA_MASK);
     store32(r8169_mmio_base + R8169_REG_EPHYAR, cmd);
     # Poll for completion: chip clears FLAG when write commits.
     # Linux uses 10 retries × 100us = 1ms; we use 1000 busy-loop iters
@@ -369,7 +369,7 @@ fn r8169_ephy_write(reg, val) {
 
 fn r8169_ephy_read(reg) {
     store32(r8169_mmio_base + R8169_REG_EPHYAR,
-            (reg & R8169_EPHYAR_REG_MASK) << R8169_EPHYAR_REG_SHIFT);
+    (reg & R8169_EPHYAR_REG_MASK) << R8169_EPHYAR_REG_SHIFT);
     for (var i = 0; i < 1000; i = i + 1) {
         var r = load32(r8169_mmio_base + R8169_REG_EPHYAR);
         if ((r & R8169_EPHYAR_FLAG) != 0) {
@@ -430,7 +430,7 @@ fn r8169_aspm_clkreq_disable() {
 fn r8169_pcie_state_l2l3_disable() {
     var v = load8(r8169_mmio_base + R8169_REG_CONFIG3);
     store8(r8169_mmio_base + R8169_REG_CONFIG3,
-           v & (0xFF - R8169_CONFIG3_RDY_TO_L23));
+    v & (0xFF - R8169_CONFIG3_RDY_TO_L23));
     return 0;
 }
 
@@ -499,7 +499,7 @@ fn r8169_hw_start_8168h_1() {
     # 8. RXDV gate disable — Linux line 3575. Already implemented inline.
     var misc = load32(r8169_mmio_base + R8169_REG_MISC);
     store32(r8169_mmio_base + R8169_REG_MISC,
-            misc & (0xFFFFFFFF - R8169_MISC_RXDV_GATED_EN));
+    misc & (0xFFFFFFFF - R8169_MISC_RXDV_GATED_EN));
 
     # 9. ERI 0xC0 = 0 + 0xB8 = 0 — Linux lines 3577-3578.
     r8169_eri_write(0xC0, R8169_ERIAR_MASK_0011, 0x0000);
@@ -508,18 +508,18 @@ fn r8169_hw_start_8168h_1() {
     # 10. DLLPR &= ~PFM_EN — Linux line 3580.
     var dllpr = load8(r8169_mmio_base + R8169_REG_DLLPR);
     store8(r8169_mmio_base + R8169_REG_DLLPR,
-           dllpr & (0xFF - R8169_DLLPR_PFM_EN));
+    dllpr & (0xFF - R8169_DLLPR_PFM_EN));
 
     # 11. MISC_1 &= ~PFM_D3COLD_EN — Linux line 3581.
     var misc1 = load8(r8169_mmio_base + R8169_REG_MISC_1);
     store8(r8169_mmio_base + R8169_REG_MISC_1,
-           misc1 & (0xFF - R8169_MISC_1_PFM_D3COLD));
+    misc1 & (0xFF - R8169_MISC_1_PFM_D3COLD));
 
     # 12. DLLPR &= ~TX_10M_PS_EN — Linux line 3583. Re-read DLLPR (the
     # write in step 10 may have side-effects on adjacent bits).
     dllpr = load8(r8169_mmio_base + R8169_REG_DLLPR);
     store8(r8169_mmio_base + R8169_REG_DLLPR,
-           dllpr & (0xFF - R8169_DLLPR_TX_10M_PS));
+    dllpr & (0xFF - R8169_DLLPR_TX_10M_PS));
 
     # 13. ERI 0x1B0 clear bit 12 — Linux line 3585 rtl_eri_clear_bits(0x1b0, BIT(12)).
     r8169_eri_clear_bits(0x1B0, 0x00001000);
@@ -772,7 +772,7 @@ fn r8169_probe() {
     # already set. Audit item 6.
     var cpc = load16(r8169_mmio_base + R8169_REG_CPLUSCMD);
     store16(r8169_mmio_base + R8169_REG_CPLUSCMD,
-            cpc | R8169_CPLUSCMD_PCIMULRW);
+    cpc | R8169_CPLUSCMD_PCIMULRW);
 
     # Full rtl_hw_start_8168h_1 body — EPHY init + FIFO + pause + ASPM
     # latency + packet filter reset + ERI tunings + RXDV disable + DLLPR
