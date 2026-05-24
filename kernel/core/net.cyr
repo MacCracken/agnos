@@ -98,10 +98,15 @@ fn arp_request(target_ip) {
     var kmac[8];
     nic_mac(&kmac);   # FIX #1: backend-agnostic kernel MAC, not vnet_mac
     var off = eth_build(p, &bcast, &kmac, 0x0806);
-    # ARP: htype=1(eth) ptype=0x0800(ipv4) hlen=6 plen=4 oper=1(request)
-    store16(p + off, 0x0001); store16(p + off + 2, 0x0800);
-    store8(p + off + 4, 6); store8(p + off + 5, 4);
-    store16(p + off + 6, 0x0001);
+    # ARP: htype=1(eth) ptype=0x0800(ipv4) hlen=6 plen=4 oper=1(request).
+    # Fields are network-byte-order (big-endian); store16 is host-order
+    # (little-endian on x86), so write byte pairs explicitly. Attempt 102
+    # pcap showed a single AGNOS-MAC ARP egressed but with htype=0x0100 /
+    # ptype=0x0008 / oper=0x0100 — switch dropped it as malformed.
+    store8(p + off,     0x00); store8(p + off + 1, 0x01);   # htype = ethernet
+    store8(p + off + 2, 0x08); store8(p + off + 3, 0x00);   # ptype = IPv4
+    store8(p + off + 4, 6);    store8(p + off + 5, 4);
+    store8(p + off + 6, 0x00); store8(p + off + 7, 0x01);   # oper  = request
     memcpy(p + off + 8, &kmac, 6);
     store8(p + off + 14, (net_ip >> 24) & 0xFF);
     store8(p + off + 15, (net_ip >> 16) & 0xFF);
@@ -568,10 +573,12 @@ fn net_handle_arp(pkt, len) {
         nic_mac(&kmac);   # FIX #1
         var p = &net_pkt;
         var off = eth_build(p, &requester_mac, &kmac, 0x0806);
-        store16(p + off, 0x0001);                # htype=eth
-        store16(p + off + 2, 0x0800);            # ptype=ipv4
-        store8(p + off + 4, 6); store8(p + off + 5, 4);
-        store16(p + off + 6, 0x0002);            # oper=reply
+        # ARP fields are network-byte-order; store16 is host-order on x86,
+        # so write byte pairs explicitly. Mirror of arp_request fix.
+        store8(p + off,     0x00); store8(p + off + 1, 0x01);   # htype = ethernet
+        store8(p + off + 2, 0x08); store8(p + off + 3, 0x00);   # ptype = IPv4
+        store8(p + off + 4, 6);    store8(p + off + 5, 4);
+        store8(p + off + 6, 0x00); store8(p + off + 7, 0x02);   # oper  = reply
         memcpy(p + off + 8, &kmac, 6);           # sender HW = us
         store8(p + off + 14, (net_ip >> 24) & 0xFF);
         store8(p + off + 15, (net_ip >> 16) & 0xFF);
