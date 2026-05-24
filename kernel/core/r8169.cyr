@@ -516,11 +516,11 @@ fn r8169_init_tx() {
     # them on every init (line 3197-3200) — defensive against firmware
     # tools that clear the chip MAC between probe and bringup.
     var mac_lo = load8(&r8169_mac + 0)
-               | (load8(&r8169_mac + 1) << 8)
-               | (load8(&r8169_mac + 2) << 16)
-               | (load8(&r8169_mac + 3) << 24);
+    | (load8(&r8169_mac + 1) << 8)
+    | (load8(&r8169_mac + 2) << 16)
+    | (load8(&r8169_mac + 3) << 24);
     var mac_hi = load8(&r8169_mac + 4)
-               | (load8(&r8169_mac + 5) << 8);
+    | (load8(&r8169_mac + 5) << 8);
     r8169_cfg_unlock();
     r8169_write32(R8169_REG_IDR0, mac_lo);
     r8169_write32(R8169_REG_IDR4, mac_hi);
