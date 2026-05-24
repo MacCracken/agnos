@@ -90,6 +90,46 @@ var R8169_REG_RDSAR_LO     = 0xE4;  # RX Descriptor Start Address Register (low)
 var R8169_REG_RDSAR_HI     = 0xE8;
 var R8169_REG_MISC         = 0xF0;  # MISC register — bit 19 RXDV_GATED_EN (G/H+ chips)
 
+# rtl_hw_start_8168h_1 port — additional register windows. Offsets converged
+# against Linux v7.0 r8169_main.c enum rtl_registers + rtl8168_8101_registers.
+var R8169_REG_CONFIG3      = 0x54;  # Config 3 — bit 1 Rdy_to_L23 (clear to disable L2/L3)
+var R8169_REG_OCPDR        = 0xB0;  # MAC-OCP data + addr (32-bit write does both)
+var R8169_REG_EPHYAR       = 0x80;  # EPHY (Ethernet PHY internal) Address/data
+var R8169_REG_DLLPR        = 0xD0;  # DLLPR — bit 6 PFM_EN, bit 7 TX_10M_PS_EN
+var R8169_REG_MISC_1       = 0xF2;  # MISC_1 — bit 6 PFM_D3COLD_EN
+var R8169_REG_CPLUSCMD     = 0xE0;  # CPlusCmd (16-bit) — bit 3 PCIMulRW (multiple-read/write enable)
+
+# MAC-OCP: single 32-bit register at 0xB0 with self-encoding addr+data.
+#   write: store32(OCPDR, FLAG | (reg << 15) | data)
+#   read : store32(OCPDR, reg << 15); load32(OCPDR)
+# Linux r8169_main.c:1136-1185. No polling required (unlike GPHY_OCP @0xB8).
+var R8169_OCPAR_FLAG       = 0x80000000;
+
+# EPHY (Ethernet PHY): 32-bit cmd register with polling flag at bit 31.
+#   layout: FLAG | (reg & 0x1F) << 16 | data
+# Linux r8169_main.c:352-356 + 1398-1414.
+var R8169_EPHYAR_FLAG      = 0x80000000;
+var R8169_EPHYAR_REG_SHIFT = 16;
+var R8169_EPHYAR_REG_MASK  = 0x1F;
+var R8169_EPHYAR_DATA_MASK = 0xFFFF;
+
+# ERIAR mask fields (4-bit per-byte write-enable). Linux r8169_main.c:399-403.
+# Already defined: R8169_ERIAR_MASK_1111 = 0x0000F000 (line 107).
+# Add narrower masks for the rtl_hw_start_8168h_1 port.
+var R8169_ERIAR_MASK_0001  = 0x00001000;  # only byte 0 (used by pause thresholds)
+var R8169_ERIAR_MASK_0011  = 0x00003000;  # bytes 0+1 (used by 0x5f0 / 0xc0 / 0xb8 writes)
+
+# DLLPR + MISC_1 bits — Linux r8169_main.c:358-359 + 380.
+var R8169_DLLPR_PFM_EN     = 0x40;   # bit 6 — Pause Frame Mode enable
+var R8169_DLLPR_TX_10M_PS  = 0x80;   # bit 7 — 10M-link TX power-save
+var R8169_MISC_1_PFM_D3COLD = 0x40;  # bit 6 — Pause-frame in D3cold
+
+# Config3.Rdy_to_L23 — Linux r8169_main.c:523. Clearing disables L2/L3 state.
+var R8169_CONFIG3_RDY_TO_L23 = 0x02;
+
+# CPlusCmd bits — Linux r8169_main.c:553.
+var R8169_CPLUSCMD_PCIMULRW = 0x08;  # bit 3 — PCI multiple read/write enable
+
 # Cfg9346 (config-reg lock gate) — Linux v7.0 r8169_main.c:486-487.
 var R8169_CFG9346_LOCK     = 0x00;
 var R8169_CFG9346_UNLOCK   = 0xC0;
@@ -263,6 +303,250 @@ fn r8169_reset_packet_filter() {
     val = r8169_eri_read(0xDC);
     r8169_eri_write(0xDC, R8169_ERIAR_MASK_1111, val | 0x00000001);
     return 0;
+}
+
+# --- ERI set/clear-bits helpers (rtl_hw_start_8168h_1 port) ---------
+#
+# Linux r8169_main.c:1086-1098 — read 32-bit, mask, write back via full
+# byte-enable mask. Used by rtl_hw_start_8168h_1 at lines 3571 / 3585.
+fn r8169_eri_set_bits(addr, bits) {
+    var v = r8169_eri_read(addr);
+    return r8169_eri_write(addr, R8169_ERIAR_MASK_1111, v | bits);
+}
+
+fn r8169_eri_clear_bits(addr, bits) {
+    var v = r8169_eri_read(addr);
+    return r8169_eri_write(addr, R8169_ERIAR_MASK_1111, v & (0xFFFFFFFF - bits));
+}
+
+# --- MAC-OCP helpers (rtl_hw_start_8168h_1 port) --------------------
+#
+# Linux v7.0 r8169_main.c:1136-1185. OCP (On-Chip Programmable) is the
+# chip-MCU control bus reachable via the OCPDR register (offset 0xB0).
+# Encoding: write = FLAG | (reg << 15) | data; read = (reg << 15) → read
+# back. No polling required (unlike GPHY_OCP @0xB8 which gates on a
+# completion flag). VER_46 init writes 4 mac_ocp_modify + 4 mac_ocp_write
+# entries at 0xE056..0xE63E and 0xC094/0xC09E.
+
+fn r8169_mac_ocp_write(reg, data) {
+    var cmd = R8169_OCPAR_FLAG | ((reg & 0xFFFF) << 15) | (data & 0xFFFF);
+    store32(r8169_mmio_base + R8169_REG_OCPDR, cmd);
+    return 0;
+}
+
+fn r8169_mac_ocp_read(reg) {
+    store32(r8169_mmio_base + R8169_REG_OCPDR, (reg & 0xFFFF) << 15);
+    return load32(r8169_mmio_base + R8169_REG_OCPDR) & 0xFFFF;
+}
+
+fn r8169_mac_ocp_modify(reg, mask, set) {
+    var data = r8169_mac_ocp_read(reg);
+    return r8169_mac_ocp_write(reg, (data & (0xFFFF - mask)) | set);
+}
+
+# --- EPHY helpers (rtl_hw_start_8168h_1 port) -----------------------
+#
+# Linux v7.0 r8169_main.c:1398-1414. EPHY is the Ethernet PHY internal
+# register window, separate from MDIO (PHYAR @0x60). Register address
+# is 5-bit (0..0x1F); 16-bit data. Completion-flag polling on bit 31.
+# VER_46 init walks a 6-entry {offset, mask, bits} table writing each
+# EPHY register via __rtl_ephy_init (line 2962).
+
+fn r8169_ephy_write(reg, val) {
+    var cmd = R8169_EPHYAR_FLAG
+            | ((reg & R8169_EPHYAR_REG_MASK) << R8169_EPHYAR_REG_SHIFT)
+            | (val & R8169_EPHYAR_DATA_MASK);
+    store32(r8169_mmio_base + R8169_REG_EPHYAR, cmd);
+    # Poll for completion: chip clears FLAG when write commits.
+    # Linux uses 10 retries × 100us = 1ms; we use 1000 busy-loop iters
+    # matching the PHYAR/ERI helper convention.
+    for (var i = 0; i < 1000; i = i + 1) {
+        var r = load32(r8169_mmio_base + R8169_REG_EPHYAR);
+        if ((r & R8169_EPHYAR_FLAG) == 0) { return 1; }
+    }
+    return 0;
+}
+
+fn r8169_ephy_read(reg) {
+    store32(r8169_mmio_base + R8169_REG_EPHYAR,
+            (reg & R8169_EPHYAR_REG_MASK) << R8169_EPHYAR_REG_SHIFT);
+    for (var i = 0; i < 1000; i = i + 1) {
+        var r = load32(r8169_mmio_base + R8169_REG_EPHYAR);
+        if ((r & R8169_EPHYAR_FLAG) != 0) {
+            return r & R8169_EPHYAR_DATA_MASK;
+        }
+    }
+    return 0xFFFF;
+}
+
+# RMW the EPHY register at `reg`: read, mask off bits in `mask`, OR in
+# `bits`. Matches Linux __rtl_ephy_init's per-entry write shape.
+fn r8169_ephy_modify(reg, mask, bits) {
+    var w = r8169_ephy_read(reg);
+    w = (w & (0xFFFF - mask)) | bits;
+    return r8169_ephy_write(reg, w);
+}
+
+# --- ASPM / CLKREQ disable (rtl_hw_start envelope wrap) -------------
+#
+# Linux v7.0 r8169_main.c:2976-2986 + 4101. PCIe LNKCTL register (cap
+# offset 0x10) holds ASPM control (bits 0-1) and CLKREQ_EN (bit 8).
+# Linux defensively disables CLKREQ before EPHY writes — without this,
+# EPHY register access may be aborted mid-transaction by chip-internal
+# power management. Mirror the disable; re-enable optional (we don't
+# manage ASPM, so leaving CLKREQ disabled post-init is safe for AGNOS).
+#
+# PCIe Express capability ID = 0x10 per PCIe 3.0 §7.8.
+
+fn r8169_aspm_clkreq_disable() {
+    var cap = pci_find_cap(r8169_pci_idx, 0x10);
+    if (cap == 0) { return 0; }   # no PCIe cap — nothing to do
+    var slot = PciDev_slot(&pci_devs + r8169_pci_idx * 32);
+    var bf = load64(&pci_busfunc + r8169_pci_idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    # LNKCTL is at cap+0x10. PCIe LNKCTL bits: 0-1 = ASPM, 8 = CLKREQ_EN.
+    var lnkctl_off = cap + 0x10;
+    # LNKCTL is 16-bit at offset 0x10 within the cap; the dword at
+    # (cap & ~3) + (0x10 & ~3) contains it. Since cap is dword-aligned
+    # per spec, lnkctl_off is dword-aligned + 0 (LNKCTL is in the LOW
+    # 16 bits of that dword).
+    var dw = pci_read32(bus, slot, func, lnkctl_off);
+    # Clear CLKREQ_EN (bit 8 of LNKCTL = bit 8 of low half of dword).
+    dw = dw & 0xFFFFFEFF;
+    # Also clear ASPM L0s/L1 (bits 0-1) — Linux's rtl_mod_config5 chain
+    # disables ASPM_en when called with rtl_hw_aspm_clkreq_enable(tp,false).
+    dw = dw & 0xFFFFFFFC;
+    pci_write32(bus, slot, func, lnkctl_off, dw);
+    return 1;
+}
+
+# --- PCIe L2/L3 disable (rtl_pcie_state_l2l3_disable port) ----------
+#
+# Linux r8169_main.c:2988-2992. Clears Config3.Rdy_to_L23 (bit 1). Work-
+# around for PCI reset during L2/L3 state — without it, chip may not
+# come back cleanly from deep power states. Called from
+# rtl_hw_start_8168h_1 (line 3587).
+fn r8169_pcie_state_l2l3_disable() {
+    var v = load8(r8169_mmio_base + R8169_REG_CONFIG3);
+    store8(r8169_mmio_base + R8169_REG_CONFIG3,
+           v & (0xFF - R8169_CONFIG3_RDY_TO_L23));
+    return 0;
+}
+
+# --- rtl_hw_start_8168h_1 — full chip-MCU init for VER_46 -----------
+#
+# Linux v7.0 r8169_main.c:3550-3607 — the per-chip-rev init body that
+# runs after rtl_disable_rxdvgate + rtl_reset_packet_filter (which AGNOS
+# already calls in r8169_probe). Captures EPHY tuning, FIFO sizing,
+# pause thresholds, ASPM entry latency, additional ERI writes, DLLPR
+# power-save disable, PCIe L2/L3 disable, and MAC-OCP table writes.
+#
+# Order matches Linux verbatim. Each operation cross-cited to its line
+# number in the Linux source for future audit traceability.
+fn r8169_hw_start_8168h_1() {
+    if (r8169_mmio_base == 0) { return 0; }
+
+    # 1. EPHY init — 6-entry table per Linux line 3552-3558. EPHYs are
+    # chip-internal PHY-side tuning registers; without these the chip's
+    # analog front-end is in default state which on H+ silicon can drop
+    # frames at the MAC validator.
+    #   {0x1e, 0x0800, 0x0001}: bit 11 OFF, bit 0 ON
+    #   {0x1d, 0x0000, 0x0800}: bit 11 ON
+    #   {0x05, 0xffff, 0x2089}: full overwrite
+    #   {0x06, 0xffff, 0x5881}: full overwrite
+    #   {0x04, 0xffff, 0x854a}: full overwrite
+    #   {0x01, 0xffff, 0x068b}: full overwrite
+    r8169_ephy_modify(0x1E, 0x0800, 0x0001);
+    r8169_ephy_modify(0x1D, 0x0000, 0x0800);
+    r8169_ephy_modify(0x05, 0xFFFF, 0x2089);
+    r8169_ephy_modify(0x06, 0xFFFF, 0x5881);
+    r8169_ephy_modify(0x04, 0xFFFF, 0x854A);
+    r8169_ephy_modify(0x01, 0xFFFF, 0x068B);
+
+    # 2. FIFO size — Linux line 3564 rtl_set_fifo_size(0x08, 0x10, 0x02, 0x06).
+    # Two ERI writes at 0xC8 (RX) + 0xE8 (TX), packing (stat<<16)|dyn.
+    # Per Linux line 3183-3190.
+    r8169_eri_write(0xC8, R8169_ERIAR_MASK_1111, (0x08 << 16) | 0x02);
+    r8169_eri_write(0xE8, R8169_ERIAR_MASK_1111, (0x10 << 16) | 0x06);
+
+    # 3. Pause thresholds — Linux line 3565 rtl8168g_set_pause_thresholds(0x38, 0x48).
+    # Two ERI byte-writes at 0xCC (low) + 0xD0 (high). Per Linux line 3193-3199.
+    r8169_eri_write(0xCC, R8169_ERIAR_MASK_0001, 0x38);
+    r8169_eri_write(0xD0, R8169_ERIAR_MASK_0001, 0x48);
+
+    # 4. ASPM entry latency — Linux line 3567 rtl_set_def_aspm_entry_latency.
+    # Calls rtl_set_aspm_entry_latency(tp, 0x27) → PCIe config write at
+    # offset 0x070F = 0x27 (L0=7us, L1=16us). Linux line 2943-2947.
+    var slot = PciDev_slot(&pci_devs + r8169_pci_idx * 32);
+    var bf = load64(&pci_busfunc + r8169_pci_idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    # 0x70F is a single byte; read the containing dword, mask byte 3, write back.
+    var dw70c = pci_read32(bus, slot, func, 0x70C);
+    dw70c = (dw70c & 0x00FFFFFF) | (0x27 << 24);
+    pci_write32(bus, slot, func, 0x70C, dw70c);
+
+    # 5. Packet filter reset — Linux line 3569. Already implemented; call.
+    r8169_reset_packet_filter();
+
+    # 6. ERI 0xDC |= 0x001C — Linux line 3571 rtl_eri_set_bits(0xdc, 0x001c).
+    r8169_eri_set_bits(0xDC, 0x001C);
+
+    # 7. ERI 0x5F0 = 0x4F87 — Linux line 3573. Two-byte ERI write.
+    r8169_eri_write(0x5F0, R8169_ERIAR_MASK_0011, 0x4F87);
+
+    # 8. RXDV gate disable — Linux line 3575. Already implemented inline.
+    var misc = load32(r8169_mmio_base + R8169_REG_MISC);
+    store32(r8169_mmio_base + R8169_REG_MISC,
+            misc & (0xFFFFFFFF - R8169_MISC_RXDV_GATED_EN));
+
+    # 9. ERI 0xC0 = 0 + 0xB8 = 0 — Linux lines 3577-3578.
+    r8169_eri_write(0xC0, R8169_ERIAR_MASK_0011, 0x0000);
+    r8169_eri_write(0xB8, R8169_ERIAR_MASK_0011, 0x0000);
+
+    # 10. DLLPR &= ~PFM_EN — Linux line 3580.
+    var dllpr = load8(r8169_mmio_base + R8169_REG_DLLPR);
+    store8(r8169_mmio_base + R8169_REG_DLLPR,
+           dllpr & (0xFF - R8169_DLLPR_PFM_EN));
+
+    # 11. MISC_1 &= ~PFM_D3COLD_EN — Linux line 3581.
+    var misc1 = load8(r8169_mmio_base + R8169_REG_MISC_1);
+    store8(r8169_mmio_base + R8169_REG_MISC_1,
+           misc1 & (0xFF - R8169_MISC_1_PFM_D3COLD));
+
+    # 12. DLLPR &= ~TX_10M_PS_EN — Linux line 3583. Re-read DLLPR (the
+    # write in step 10 may have side-effects on adjacent bits).
+    dllpr = load8(r8169_mmio_base + R8169_REG_DLLPR);
+    store8(r8169_mmio_base + R8169_REG_DLLPR,
+           dllpr & (0xFF - R8169_DLLPR_TX_10M_PS));
+
+    # 13. ERI 0x1B0 clear bit 12 — Linux line 3585 rtl_eri_clear_bits(0x1b0, BIT(12)).
+    r8169_eri_clear_bits(0x1B0, 0x00001000);
+
+    # 14. PCIe L2/L3 disable — Linux line 3587.
+    r8169_pcie_state_l2l3_disable();
+
+    # 15. SKIP rg_saw_cnt PHY-paged read + mac_ocp_modify(0xd412) — Linux
+    # lines 3589-3596. The rg_saw_cnt read requires phy_read_paged(0x0c42,
+    # 0x13) which is a PHY operation through MMD-extended addressing
+    # (paged register access via BMCR magic). Skip for v1; mac_ocp_modify
+    # 0xD412 with sw_cnt_1ms_ini only matters for fine-grain timer
+    # calibration, not load-bearing for OFFER reception.
+
+    # 16. MAC-OCP modifies — Linux lines 3598-3601.
+    r8169_mac_ocp_modify(0xE056, 0x00F0, 0x0000);
+    r8169_mac_ocp_modify(0xE052, 0x6000, 0x8008);
+    r8169_mac_ocp_modify(0xE0D6, 0x01FF, 0x017F);
+    r8169_mac_ocp_modify(0xD420, 0x0FFF, 0x047F);
+
+    # 17. MAC-OCP writes — Linux lines 3603-3606.
+    r8169_mac_ocp_write(0xE63E, 0x0001);
+    r8169_mac_ocp_write(0xE63E, 0x0000);
+    r8169_mac_ocp_write(0xC094, 0x0000);
+    r8169_mac_ocp_write(0xC09E, 0x0000);
+
+    return 1;
 }
 
 # --- PCI discovery --------------------------------------------------
@@ -461,32 +745,44 @@ fn r8169_probe() {
         return 0 - 1;
     }
 
-    # 8b. Reprogram the hardware unicast MAC filter via Cfg9346-wrapped
-    # 32-bit MAC0/MAC4 writes. Per r8169-chip-init-audit.md item 2/3 +
-    # Linux v7.0 r8169_main.c rtl_rar_set (line 2557):
+    # 8b. Full chip-MCU init under a Cfg9346-unlocked window. Mirrors
+    # Linux v7.0 r8169_main.c rtl_hw_start (line 4097-4117) envelope.
+    # Post-Attempt-99 (CMOS readback identical to 97/98: 16 multicast
+    # frames consumed, no broadcast OFFER) we expanded scope from the
+    # 5-item minimum-viable bundle to the full rtl_hw_start_8168h_1 body
+    # (audit items 6+7+9+10+11) on the hypothesis that Linux's per-VER_46
+    # chip-MCU writes are load-bearing for broadcast acceptance.
     #
-    #   rtl_unlock_config_regs(tp);            // Cfg9346 = 0xC0
-    #   RTL_W32(tp, MAC4, get_unaligned_le16(addr + 4));
-    #   rtl_pci_commit(tp);                    // dummy read of ChipCmd
-    #   RTL_W32(tp, MAC0, get_unaligned_le32(addr));
-    #   rtl_pci_commit(tp);
-    #   rtl_lock_config_regs(tp);              // Cfg9346 = 0x00
-    #
-    # Two convergent issues fixed at once:
-    #   - Cfg9346 lock state: on RTL8168 H+ silicon (archaemenid is
-    #     VER_46 = RTL8168h XID 541), the config register lock gates
-    #     MAC writes. AGNOS's pre-fix 8-bit IDR write loop ran with
-    #     the lock state at its post-CR.RST default (locked) → writes
-    #     silently absorbed → hardware unicast filter stayed at zero.
-    #   - Write width: Linux uses 32-bit MAC0/MAC4 writes; some H+
-    #     silicon honors only 32-bit width here, byte writes ignored.
-    #
-    # Attempts 97/98 evidence: 16 frames consumed, all multicast
-    # (CMOS 0x5E=0x01 = first byte of 01:00:5e:... IPv4 multicast).
-    # APM=1 in RxConfig should accept unicast OFFERs matching MAC0/4,
-    # but with the filter at zero the chip rejects every unicast frame
-    # destined to b0:41:6f:0c:e4:25 before the ring is touched.
+    # Linux envelope order, mirrored here:
+    #   rtl_unlock_config_regs(tp)            // Cfg9346 = UNLOCK
+    #   rtl_hw_aspm_clkreq_enable(tp, false)  // PCIe LNKCTL CLKREQ_EN clear
+    #   RTL_W16(tp, CPlusCmd, tp->cp_cmd)     // PCIMulRW set
+    #   rtl_hw_start_8168h_1(tp)              // ~17 chip-MCU writes
+    #   rtl_set_rx_mode … (multicast hash + MAC0/MAC4 here)
+    #   rtl_lock_config_regs(tp)              // Cfg9346 = LOCK
     r8169_mmio_write8(R8169_REG_CFG9346, R8169_CFG9346_UNLOCK);
+
+    # Disable ASPM/CLKREQ before EPHY access (Linux line 4101). Without
+    # this, EPHY register writes may be aborted mid-transaction by chip-
+    # internal power management on H+ silicon — audit item 11.
+    r8169_aspm_clkreq_disable();
+
+    # CPlusCmd — at minimum PCIMulRW. Linux line 4102 writes tp->cp_cmd
+    # which is initialized in rtl_jumbo_max_set (line 4083) with PCIMulRW
+    # already set. Audit item 6.
+    var cpc = load16(r8169_mmio_base + R8169_REG_CPLUSCMD);
+    store16(r8169_mmio_base + R8169_REG_CPLUSCMD,
+            cpc | R8169_CPLUSCMD_PCIMULRW);
+
+    # Full rtl_hw_start_8168h_1 body — EPHY init + FIFO + pause + ASPM
+    # latency + packet filter reset + ERI tunings + RXDV disable + DLLPR
+    # power-save clears + PCIe L2/L3 disable + MAC-OCP table. Audit items
+    # 1+4 (RXDV + packet filter) are now inside this function — removed
+    # from inline here to avoid double-write.
+    r8169_hw_start_8168h_1();
+
+    # 32-bit MAC0/MAC4 write-back (item 2/3 — Cfg9346 already unlocked
+    # above per the envelope). Linux rtl_rar_set line 2557.
     var mac_lo = load8(&r8169_mac) | (load8(&r8169_mac + 1) << 8)
     | (load8(&r8169_mac + 2) << 16) | (load8(&r8169_mac + 3) << 24);
     var mac_hi = load8(&r8169_mac + 4) | (load8(&r8169_mac + 5) << 8);
@@ -494,34 +790,13 @@ fn r8169_probe() {
     r8169_mmio_read8(R8169_REG_CR);          # PCI commit (flush posted write)
     store32(r8169_mmio_base + R8169_REG_MAC0, mac_lo);
     r8169_mmio_read8(R8169_REG_CR);          # PCI commit
-    r8169_mmio_write8(R8169_REG_CFG9346, R8169_CFG9346_LOCK);
 
-    # 8c. Disable RXDV gate. Per r8169-chip-init-audit.md item 1 + Linux
-    # v7.0 r8169_main.c rtl_disable_rxdvgate (line 2749) called from
-    # rtl_hw_start_8168h_1 (line 3575) for VER_46. MISC[19] = RXDV_GATED_EN;
-    # when set, the chip gates the RX data-valid signal at the validator.
-    # Default after CR.RST on G/H+ silicon is silicon-undocumented but
-    # Linux defensively clears it on every chip-up; multicast may slip
-    # through silicon carve-outs (matches Attempts 97/98 evidence) while
-    # broadcast + unicast are dropped.
-    var misc = load32(r8169_mmio_base + R8169_REG_MISC);
-    store32(r8169_mmio_base + R8169_REG_MISC, misc & 0xFFF7FFFF);
-
-    # 8d. Reset internal packet-filter state machine. Per r8169-chip-init-
-    # audit.md item 4 + Linux rtl_reset_packet_filter (line 1613) called
-    # from rtl_hw_start_8168h_1 (line 3569). Toggles ERI 0xDC bit 0 OFF
-    # then ON; without it, post-CR.RST filter state is undefined per
-    # chip-rev. Helper port lives at the top of this file.
-    r8169_reset_packet_filter();
-
-    # 8e. Program the multicast hash filter to accept all multicast. Per
-    # r8169-chip-init-audit.md item 5 + Linux rtl_set_rx_mode (lines
-    # 2863-2864). Without this, RxConfig.AM gates multicast against an
-    # undefined-post-CR.RST 64-bit hash filter; Attempts 97/98 received
-    # multicast only by BIOS-residue, which is fragile and silicon-
-    # dependent.
+    # Multicast hash filter all-1s (item 5). Linux rtl_set_rx_mode 2863-2864.
     store32(r8169_mmio_base + R8169_REG_MAR0,     0xFFFFFFFF);
     store32(r8169_mmio_base + R8169_REG_MAR0 + 4, 0xFFFFFFFF);
+
+    # Close Cfg9346 window (Linux line 4117 rtl_lock_config_regs).
+    r8169_mmio_write8(R8169_REG_CFG9346, R8169_CFG9346_LOCK);
 
     # 9. Summary print.
     kprint("r8169: found at ", 16);
@@ -598,57 +873,25 @@ fn r8169_init_rx() {
         store32(desc + 12, (buf >> 32) & 0xFFFFFFFF);
     }
 
-    # 3. Program RDSAR — NIC reads descriptor ring base from here.
-    store32(r8169_mmio_base + 0xE4, r8169_rx_ring_phys & 0xFFFFFFFF);
+    # 3. Program RDSAR — NIC reads descriptor ring base from here. Per
+    # r8169-chip-init-audit.md item 9 + Linux comment at line 2805-2808
+    # ("some iop3xx ARM board needs the TxDescAddrHigh register to be
+    # written before TxDescAddrLow"): write HIGH before LOW. Cheap to
+    # mirror; chip-rev quirk on x86 is undocumented but defensive.
     store32(r8169_mmio_base + 0xE8, (r8169_rx_ring_phys >> 32) & 0xFFFFFFFF);
+    store32(r8169_mmio_base + 0xE4, r8169_rx_ring_phys & 0xFFFFFFFF);
 
-    # 4. Set RxConfig (RTL8168 datasheet §13.2; offset 0x44, R/W). FIX #6
-    #    (1.32.1) audit pass — use named constants instead of bare hex,
-    #    document each bit so future audits don't have to recompute.
-    #    Accept bits (low byte):
-    #      AB  (0x08) — accept broadcast. Needed for ARP requests we don't
-    #                    initiate (peer-to-us ARP query) + broadcast DHCP
-    #                    OFFER replies (RFC 2131 §4.1, BOOTP broadcast flag
-    #                    in our DISCOVER asks server to reply broadcast).
-    #      AM  (0x04) — accept multicast. Needed for IPv6 ND / IGMP / LLDP
-    #                    background traffic on a live LAN segment.
-    #      APM (0x02) — accept physical match (unicast to MAC programmed
-    #                    in IDR0..IDR5 — preserved as BIOS left it; on
-    #                    archaemenid that's b0:41:6f:0c:e4:25, verified by
-    #                    r8169_probe at line 320 reading IDR0..IDR5 back
-    #                    into r8169_mac, byte-matched against lspci).
-    #      AAP (0x01) — DELIBERATELY OFF (would enable promisc mode; we
-    #                    don't want every frame on the wire, just ours).
-    #    High bits (R8169_RXCFG_DEFAULTS = 0xCF00, per Linux v7.0
-    #    r8169_main.c:2601-2602, RTL_GIGA_MAC_VER_40..52 branch — VER_46
-    #    is archaemenid's chip).
-    #
-    # PROFILE-ONLY write per r8169-chip-init-audit.md item 8 (init reorder).
-    # Linux v7.0 r8169_main.c:4099-4128 sequences:
-    #   ChipCmd = CmdTxEnb | CmdRxEnb   ← chip enabled FIRST
-    #   rtl_init_rxcfg(tp)               ← RxConfig PROFILE only
-    #   rtl_set_tx_config_registers(tp)  ← TxConfig
-    #   rtl_set_rx_mode(tp->dev)         ← RxConfig RMW with AB|AM|APM
-    # AGNOS pre-fix wrote `profile | accept_bits` in a single pre-CR.RE
-    # store. Some Realtek silicon latches RxConfig at the CR.RE rising
-    # edge; pre-enable writes may be ignored. We now write the profile
-    # here and OR the accept bits in at the end of r8169_init_tx, after
-    # CR.RE | CR.TE are both set.
-    store32(r8169_mmio_base + R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS);
-
-    # 5. Max RX packet size (16-bit register at 0xDA). Linux v6.6
-    #    rtl_init_one writes 0x3FFF on most 8168 variants — effectively
-    #    "no max." OpenBSD/FreeBSD use the same disable-pattern. The
-    #    pre-1.32.3 value of 0x05F3 (1523) was tight enough to drop any
-    #    VLAN-tagged frame >1518; not load-bearing for DHCP-on-untagged-LAN
-    #    but the 1.32.3 audit S-2 finding flagged the convergence gap.
-    #    Audit: docs/development/r8169-rx-path-audit.md § S-2.
+    # 4. Max RX packet size (16-bit register at 0xDA). Linux v6.6
+    # rtl_init_one writes 0x3FFF on most 8168 variants — effectively
+    # "no max." Audit: docs/development/r8169-rx-path-audit.md § S-2.
     store8(r8169_mmio_base + 0xDA, 0x00);
     store8(r8169_mmio_base + 0xDB, 0x40);
 
-    # 6. Enable RX in CR (set RE bit; preserve other bits).
-    var cr = load8(r8169_mmio_base + 0x37);
-    store8(r8169_mmio_base + 0x37, cr | 0x08);
+    # NOTE: RxConfig write + CR.RE assertion moved to r8169_init_tx tail
+    # per post-Attempt-99 audit (full rtl_hw_start envelope mirror). Linux
+    # sequences CR=TE|RE in ONE write (line 4124) THEN RxConfig profile
+    # (line 4125). AGNOS now matches that shape — RxConfig writes happen
+    # AFTER both engines come up simultaneously.
 
     r8169_rx_idx = 0;
     kprintln("r8169: RX ring up (16 desc × 2KB buf)", 36);
@@ -784,32 +1027,44 @@ fn r8169_init_tx() {
         store32(desc + 12, (buf >> 32) & 0xFFFFFFFF);
     }
 
-    # 3. Program TNPDS — TX descriptor ring base.
-    store32(r8169_mmio_base + 0x20, r8169_tx_ring_phys & 0xFFFFFFFF);
+    # 3. Program TNPDS — TX descriptor ring base. Per r8169-chip-init-
+    # audit.md item 9: write HIGH before LOW (same chip-rev quirk as RDSAR).
     store32(r8169_mmio_base + 0x24, (r8169_tx_ring_phys >> 32) & 0xFFFFFFFF);
+    store32(r8169_mmio_base + 0x20, r8169_tx_ring_phys & 0xFFFFFFFF);
 
-    # 4. TxConfig: IFG=3 (standard 96-bit), DMA burst=7 (unlimited).
-    store32(r8169_mmio_base + 0x40, 0x03000700);
-
-    # 5. Max TX packet size (MTPS register, 8-bit, units of 128 bytes).
-    #    0x3B = 59 → 59 × 128 = 7552 bytes; ample for 1500-MTU frames.
+    # 4. Max TX packet size (MTPS register, 8-bit, units of 128 bytes).
+    # 0x3B = 59 → 59 × 128 = 7552 bytes; ample for 1500-MTU frames.
     store8(r8169_mmio_base + 0xEC, 0x3B);
 
-    # 6. Enable TX in CR (set TE bit; preserve other bits).
+    # 5. Enable TX + RX in ONE write — `CR = TE | RE` simultaneously, per
+    # Linux v7.0 rtl_hw_start line 4124: `RTL_W8(tp, ChipCmd, CmdTxEnb |
+    # CmdRxEnb)`. r8169-chip-init-audit.md item 8 + the post-Attempt-99
+    # init-order theory: some Realtek silicon (RTL8168h XID 541 / VER_46
+    # is suspected) latches RxConfig + downstream gates at the rising edge
+    # of CR.RE; bringing RE up alone (as the pre-fix split-CR-write did)
+    # may leave the chip in a half-initialized RX state where multicast
+    # slips through silicon defaults but broadcast / unicast filters
+    # remain ungated. Single-write CR=TE|RE matches Linux's known-working
+    # shape on this chip family.
     var cr = load8(r8169_mmio_base + 0x37);
-    store8(r8169_mmio_base + 0x37, cr | 0x04);
+    store8(r8169_mmio_base + 0x37, cr | R8169_CR_TE | R8169_CR_RE);
 
-    # 7. Finalize RxConfig accept bits. Per r8169-chip-init-audit.md item
-    # 8 + Linux rtl_set_rx_mode (line 2867):
-    #   RTL_W32(tp, RxConfig, (tmp & ~RX_CONFIG_ACCEPT_OK_MASK) | rx_mode);
-    # The chip-profile high bits were written in r8169_init_rx before
-    # CR.RE went high. With both CR.RE + CR.TE now asserted, we RMW the
-    # low nibble (RX_CONFIG_ACCEPT_OK_MASK = 0x0F) to install
-    # AB | AM | APM. AB (broadcast) is the load-bearing bit for DHCP
-    # OFFER reception (RFC 2131 §4.1, BOOTP bcast flag in our DISCOVER
-    # asks the server to reply broadcast); APM gates unicast OFFER from
-    # servers that ignore the bcast flag; AM honors the multicast hash
-    # filter programmed in r8169_probe step 8e.
+    # 6. RxConfig profile — POST-enable per Linux line 4125 rtl_init_rxcfg.
+    # 0xCF00 = RX128_INT_EN | RX_MULTI_EN | RX_DMA_BURST(7) | RX_EARLY_OFF
+    # — VER_46-correct profile (legacy 0xE700 left RX_EARLY_OFF clear which
+    # earlier theory suspected dropped broadcast mid-DMA; falsified at
+    # Attempt 98 / 99). Writing AFTER CR.RE rising edge.
+    store32(r8169_mmio_base + R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS);
+
+    # 7. TxConfig — POST-enable per Linux line 4126 rtl_set_tx_config_registers.
+    # IFG=3 (standard 96-bit), DMA burst=7 (unlimited).
+    store32(r8169_mmio_base + 0x40, 0x03000700);
+
+    # 8. RxConfig RMW with accept bits — POST-enable per Linux line 4128
+    # rtl_set_rx_mode. Without this RMW the profile from step 6 has the
+    # accept low nibble at zero (no broadcast, no multicast, no unicast
+    # match). AB = load-bearing for DHCP OFFER reception (RFC 2131 §4.1
+    # BOOTP broadcast flag in our DISCOVER asks server to reply broadcast).
     var rxcfg = load32(r8169_mmio_base + R8169_REG_RXCONFIG);
     var accept = R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
     store32(r8169_mmio_base + R8169_REG_RXCONFIG, (rxcfg & 0xFFFFFFF0) | accept);
