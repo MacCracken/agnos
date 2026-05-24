@@ -5,6 +5,83 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.32.4] — 2026-05-23 (DHCP OFFER-downstream-of-r8169_poll cycle — close out the 1.32.3 carry-forward residual; 10-bundle from `agnosticos/docs/development/dhcp-offer-downstream-audit.md`)
+
+### Context
+
+Attempt 100 (1.32.3 close) unblocked the chip-level RX filter — first iron evidence across the 1.32.x arc that a broadcast frame can be admitted by the chip (CMOS `[0x5E]=0xff`, `[0x5D]=0x72` BAR bit). But `dhcp: OFFER timeout` still in FB → gate moves DOWNSTREAM of `r8169_poll`. Two macro candidates: (c1) admitted broadcast was NOT the DHCP OFFER (ARP / NetBIOS / mDNS / SSDP / Linux dhclient broadcast on same MAC), OR (c2) OFFER admitted but lost in AGNOS UDP/IP/DHCP receive path. Multi-source convergent audit (RFC 2131/2132/768 + Linux `ic_bootp_recv` + OpenBSD `dhcpleased` + FreeBSD/ISC `dhclient` + iPXE `dhcp_deliver` + Plan 9 `dhcpclient`) at [`agnosticos/docs/development/dhcp-offer-downstream-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/dhcp-offer-downstream-audit.md) identified 2 LOAD-BEARING absent validations in AGNOS `dhcp_init` OFFER matcher (BOOTP `op==2`, magic-cookie validation), 2 MEDIUM verifications (xid byte-order, options-walker invariants — **both audited OK this cycle, no code change**), and a (c1)/(c2) disambiguation path via finer-grained CMOS instrumentation + Linux-side `tcpdump`.
+
+### 10-item bundle (per the audit's § 5-6 plan)
+
+This cycle lands the bundle; the next iron burn validates against the rubric in audit § 6 + escape plan in § 7. NO new iron burn auto-proposed per [[feedback_iron_burns_block_other_work]] — user authorizes when ready.
+
+#### Added — `kernel/core/net.cyr` `dhcp_init` OFFER matcher hardening (Items 3 + 4 = Fixes A + B)
+
+- **Fix A — BOOTP `op == 2` (BOOTREPLY) gate** at the head of the OFFER match loop. RFC 2131 §4.1 mandatory; 5-of-5 reference sources enforce. One line: `if (load8(&rx + 0) != 2) { continue; }`. Without this, a looped-back DISCOVER (op=1) with the right xid would pass the matcher despite being structurally wrong.
+- **Fix B — Magic cookie validation** at offset +236 in the OFFER match loop. 4 lines, byte-by-byte against `{0x63, 0x82, 0x53, 0x63}` (NEVER a `u32` literal compare — endianness trap per multi-source spec § 7). 4-of-5 reference sources validate (Linux / OpenBSD / FreeBSD / Plan 9; iPXE relies on TX-symmetry only).
+
+#### Added — `kernel/core/net.cyr` `dhcp_init` ACK matcher mirror (Item 10)
+
+Same two checks (BOOTP `op==2` + magic cookie) mirrored into the ACK match loop. Without these, post-REQUEST silent-drop has the same shape as the OFFER silent-drop the cycle's audit framed.
+
+#### Added — CMOS instrumentation slots `[0x88..0x8C]` (Items 2 + 7) for the next iron burn's disambiguation
+
+- `[0x88]` = last admitted-frame ethertype hi byte (offset +12). `0x08` = IPv4 or ARP plausible; `0xDD` IPv6; other = uncommon.
+- `[0x89]` = last admitted-frame ethertype lo byte (offset +13). `0x00` = IPv4 → DHCP-plausible; `0x06` = ARP → (c1); `0xDD` = IPv6 → (c1).
+- `[0x8A]` = if IPv4, IP proto (offset +14 + IHL bytes). `0x11` = UDP=17 → DHCP-plausible; `0x01` = ICMP; `0x06` = TCP; `0x02` = IGMP.
+- `[0x8B]` = if UDP, UDP dst port low byte (offset +14 + IHL + 3). `0x44` = port 68 = DHCP-bound; `0x89` = 137 NetBIOS; `0xE9` = 5353 mDNS; `0x6C` = 1900 SSDP.
+- `[0x8C]` = listener.state at the moment first UDP/68 frame is delivered to `net_handle_udp`. Confirms listener was bound BEFORE the OFFER frame arrived (escape plan step 2 instrumentation).
+
+Stamps fire on every frame consumed (state-transition only, single store per slot per frame — no hot-path tax per [[feedback_redesign_dont_reinvent]] cycle's r8169 Part D shape from 1.32.3).
+
+#### Added — `scripts/src/read-boot-log.cyr` reader rows for slots `[0x88..0x8C]`
+
+Verbose `--verbose` mode prints decoded values + cheat-sheet inline. Same shape as the existing r8169 / xhci slot rows; pattern-match for one-glance correlation with FB-side `dhcp: OFFER timeout`.
+
+#### Added — `DHCP_FRAME_DUMP` compile-gated full-frame dump to extended CMOS bank `[0x90..0xCF]` (Item 8)
+
+When `cyrius build` invoked with `DHCP_FRAME_DUMP=1`, the first 64 bytes of the FIRST UDP/68 frame consumed post-DISCOVER are mirrored into CMOS slots `[0x90..0xCF]`. Off by default; engaged only if the next burn's `[0x88..0x8B]` shows `08, 00, 11, 44` (admitted frame IS UDP to port 68) AND `dhcp: OFFER timeout` still in FB — at which point we dump the actual frame bytes to confirm vs `tcpdump` capture.
+
+#### Added — `DHCP_STATIC_IP` compile-gated static-IP fallback (Item 9)
+
+When `cyrius build` invoked with `DHCP_STATIC_IP=1`, `dhcp_init` skips the full DHCP cycle and assigns `net_ip` / `net_gateway` / `net_netmask` from build-time constants. Unblocks downstream networking validation (TCP server reachability, REST endpoint testing) without depending on DHCP — escape-plan step 6 from the audit. Default constants suitable for archaemenid's LAN (192.168.1.X subnet); user can edit one constant block to retarget.
+
+#### Audited — Items 5 (xid byte-order) + 6 (options walker) — NO CODE CHANGE NEEDED
+
+- **Item 5 (Fix C — xid byte-order)**: `dhcp_init`'s TX builds xid via `dhcp_store_u32_be(buf+4, xid)` (BE bytes on wire), RX compares via `dhcp_load_u32_be(&rx+4) == dhcp_xid` (BE-load to host-order int → matches host-order local). Symmetric. **No discipline mismatch**; no fix required.
+- **Item 6 (Fix D — options walker)**: `dhcp_find_option` (net.cyr:238-251) correctly handles tag 0 (Pad → skip 1 byte no length), tag 255 (End → return -1), bounds-checks `i + 1 >= opts_len` before length read AND `i + 2 + olen > opts_len` before advance. Walker invariants intact. **No fix required.**
+
+Both confirmed via single-pass code read; documented in audit doc § 10 for future audit traceability.
+
+#### Item 1 — `tcpdump` wire capture (user-side, zero AGNOS code)
+
+Documented in [agnosticos `iron-nuc-zen-log.md` § 1.32.4 next-burn prep](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md). User invocation from Linux side during next AGNOS burn:
+
+```sh
+sudo tcpdump -i enp1s0 -nn -X -s 0 'port 67 or port 68' -w /tmp/dhcp-capture.pcap
+# Reboot to AGNOS USB; let DHCP DISCOVER + OFFER-wait window run
+# Power-cycle to Linux; ctrl-C tcpdump; replay with -r flag
+```
+
+Outcome decoding: OFFER on wire + AGNOS still times out = (c2) confirmed (downstream-of-r8169_poll bug); only DISCOVER + no OFFER = (c1) confirmed (server didn't reply, or replied unicast to different MAC) — different fix path.
+
+### Build trajectory
+
+| Cut | x86_64 (production) | x86_64 (TCP_LISTEN_SMOKE=1) | Delta | Notes |
+|---|---|---|---|---|
+| 1.32.3 close | 617,000 B | 617,984 B | — | BSD/iPXE r8169 rewrite + Attempt 100 PARTIAL baseline |
+| **1.32.4 close** | **TBD** | **TBD** | **~+150-300 B** | OFFER+ACK matcher hardening (2 lines op + 4 lines cookie × 2 matchers = 12 LOC) + 5 CMOS stamp sites in net_poll/net_handle_udp + 5 reader rows in read-boot-log + 1 compile-gated 64-byte dump block + 1 compile-gated static-IP fallback block |
+
+cyrius pin stays on 6.0.1. gnoboot stays on 0.4.2. **MVP gate (boot-to-shell with typeable keyboard on iron) green** since Attempt 68 / 1.30.9 — every 1.32.x burn has reached `AGNOS shell vX.Y.Z` byte-clean; no regression expected from this cycle since changes are scoped to `dhcp_init` validation + diagnostics-only stamps.
+
+### Cross-references
+
+- [`agnosticos/docs/development/dhcp-offer-downstream-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/dhcp-offer-downstream-audit.md) — the audit that drove this bundle (16-row gate table, 8 ranked silent-drop modes, multi-source convergent spec, escape plan).
+- [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 100](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) — the iron evidence base.
+- [`iron-nuc-zen-photos/attempt-100-cmos-readback.txt`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-photos/attempt-100-cmos-readback.txt) — full CMOS slot dump from Attempt 100.
+
+---
+
 ## [1.32.3] — 2026-05-23 (virtio-net modern rewrite — QEMU DHCP full cycle works; r8169 RX-path audit landed + 3-part fix for iron-side OFFER-timeout; Iron Attempt 96 falsified the 1.32.2 4-FIX bundle, CMOS evidence proves r8169 chip engines healthy)
 
 ### Context — two independent bugs, same shell symptom
