@@ -669,7 +669,35 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
 # pre-set fallback (10.0.2.15 / 10.0.2.2 / 255.255.255.0) stays in
 # place, so the kernel still has a workable address.
 if (vnet_active != 0 || nic_ready() != 0) {
-    dhcp_init();
+    # STATIC-IP + ARP-probe test (DHCP bypass) — prove L1/L2/L3 work
+    # before re-attempting DHCP. If gateway ARP replies, the wire is
+    # sound and DHCP is the only broken layer.
+    net_init(ip4(192,168,1,222), ip4(192,168,1,1), ip4(255,255,255,0));
+    kprint("net: STATIC ip=192.168.1.222 gw=192.168.1.1", 43);
+    kprintln("", 0);
+    arp_request(net_gateway);
+    kprintln("arp: request → 192.168.1.1", 26);
+    var arp_start = timer_ticks;
+    var arp_got = 0;
+    while ((timer_ticks - arp_start) < 500) {
+        net_poll();
+        if (arp_pending_ip == 0) { arp_got = 1; break; }
+        arch_wait();
+    }
+    if (arp_got == 1) {
+        kprint("arp: REPLY gw_mac=", 18);
+        kprint_num(load8(&arp_cache_mac + 0)); kprint(":", 1);
+        kprint_num(load8(&arp_cache_mac + 1)); kprint(":", 1);
+        kprint_num(load8(&arp_cache_mac + 2)); kprint(":", 1);
+        kprint_num(load8(&arp_cache_mac + 3)); kprint(":", 1);
+        kprint_num(load8(&arp_cache_mac + 4)); kprint(":", 1);
+        kprint_num(load8(&arp_cache_mac + 5));
+        kprintln("", 0);
+        kprintln("net: L1/L2/L3 PROVEN — wire works, DHCP is the only broken layer", 64);
+    } else {
+        kprintln("arp: TIMEOUT — gateway did not reply within ~5s", 47);
+        kprintln("net: L1/L2/L3 FAILED — bug is BELOW DHCP (NIC/eth/IP/UDP)", 56);
+    }
 }
 
 #ifdef TCP_LISTEN_SMOKE

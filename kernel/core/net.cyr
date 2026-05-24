@@ -229,37 +229,6 @@ var DHCP_MAGIC_1 = 0x82;
 var DHCP_MAGIC_2 = 0x53;
 var DHCP_MAGIC_3 = 0x63;
 
-# 1.32.4 DHCP-OFFER-downstream-of-r8169_poll observability bundle (slots
-# [0x88..0x8C]) per agnosticos/docs/development/dhcp-offer-downstream-audit.md.
-# Stamps fire on every consumed frame at net_poll and on every UDP/68
-# delivery at net_handle_udp (single store per slot per frame, no hot-path
-# tax — same shape as 1.32.3's r8169 Part D state-transition stamps).
-# Decodes for `[0x88..0x8B]` (Attempt 100 → 101 disambiguation):
-#   [0x88] = ethertype hi (offset +12): 0x08 = IPv4 or ARP; 0xDD = IPv6
-#   [0x89] = ethertype lo (offset +13): 0x00 = IPv4; 0x06 = ARP; 0xDD IPv6
-#   [0x8A] = IP proto (offset +14 + IHL): 0x11 = UDP; 0x01 ICMP; 0x06 TCP; 0x02 IGMP
-#   [0x8B] = UDP dst port lo (offset +14 + IHL + 3): 0x44 = 68 (DHCP-bound);
-#            0x89 NetBIOS; 0xE9 mDNS; 0x6C SSDP
-#   [0x8C] = listener.state at first /68 frame: 0x01 bound, 0x00 race
-var DHCP_KCP_ETHERTYPE_HI = 0x88;
-var DHCP_KCP_ETHERTYPE_LO = 0x89;
-var DHCP_KCP_IP_PROTO     = 0x8A;
-var DHCP_KCP_UDP_DPORT_LO = 0x8B;
-var DHCP_KCP_LISTENER_ST  = 0x8C;
-
-# 1.32.4 DHCP_FRAME_DUMP (Item 8) — when build defines DHCP_FRAME_DUMP=1,
-# the first 64 bytes of the FIRST UDP/68 frame consumed post-DISCOVER
-# are mirrored into CMOS slots [0x90..0xCF]. Default off; engage only
-# if [0x88..0x8B] shows DHCP fingerprint AND OFFER still times out.
-# State: 0 = pre-DISCOVER, 1 = post-DISCOVER waiting for first /68 frame,
-#        2 = already dumped (state-transition gate, one dump per boot).
-var dhcp_dump_state = 0;
-
-# 1.32.4 DHCP_STATIC_IP (Item 9) — when build defines DHCP_STATIC_IP=1,
-# dhcp_init skips the wire-DHCP cycle and assigns net_ip / net_gateway /
-# net_netmask from constants below. Unblocks downstream networking
-# validation (TCP server reachability) without depending on DHCP server
-# behavior. Defaults targeted at archaemenid's LAN; edit to retarget.
 var DHCP_STATIC_IP_VAL = 0xC0A8012A;   # 192.168.1.42
 var DHCP_STATIC_GW_VAL = 0xC0A80101;   # 192.168.1.1
 var DHCP_STATIC_NM_VAL = 0xFFFFFF00;   # 255.255.255.0
@@ -370,9 +339,6 @@ fn dhcp_init() {
     var plen = dhcp_build_packet(&dhcp_pkt_buf, dhcp_xid, &opts, 9);
     udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, plen);
     kprintln("dhcp: DISCOVER", 14);
-    # 1.32.4 Item 8 — arm DHCP_FRAME_DUMP for the FIRST UDP/68 frame
-    # consumed after this point (state 0 → 1; net_handle_udp does 1 → 2).
-    dhcp_dump_state = 1;
 
     # FIX #1 prep — capture our own MAC once so OFFER/ACK chaddr-match (FIX #4)
     # doesn't redo nic_mac() inside the per-iter loop.
@@ -608,33 +574,7 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
             store64(lb + 32, src_ip);
             store64(lb + 40, src_port);
         }
-        # 1.32.4 Item 7 — stamp listener.state at delivery time for
-        # DHCP/68 frames. Escape-plan step 2 instrumentation: confirms
-        # the DHCP listener was bound BEFORE OFFER arrived (rules out
-        # listener-binding race as silent-drop site).
-        if (dst_port == 68) {
-            xhci_cmos_stamp(DHCP_KCP_LISTENER_ST, load64(lb) & 0xFF);
-        }
-    } else {
-        # No listener bound — stamp 0 so [0x8C] reflects truth for /68
-        if (dst_port == 68) {
-            xhci_cmos_stamp(DHCP_KCP_LISTENER_ST, 0);
-        }
     }
-    # 1.32.4 Item 8 — DHCP_FRAME_DUMP: when build-flag set, mirror first
-    # 64 bytes of FIRST UDP/68 frame post-DISCOVER into extended-CMOS
-    # slots [0x90..0xCF]. State-transition gate (dhcp_dump_state = 1 →
-    # 2) ensures one dump per boot; default off via #ifdef.
-    #ifdef DHCP_FRAME_DUMP
-    if (dst_port == 68 && dhcp_dump_state == 1) {
-        var dump_max = udp_data_len;
-        if (dump_max > 64) { dump_max = 64; }
-        for (var di = 0; di < dump_max; di = di + 1) {
-            xhci_cmos_stamp(0x90 + di, load8(pkt + ip_off + 8 + di));
-        }
-        dhcp_dump_state = 2;
-    }
-    #endif
     return udp_data_len;
 }
 
@@ -642,60 +582,31 @@ fn net_poll() {
     if (nic_ready() == 0) { return 0; }
     var pkt_len = nic_poll(&net_rx_pkt, 2048);
     if (pkt_len < 14) { return 0; }
-    # Parse Ethernet header: dst(6) src(6) ethertype(2)
     var et_hi = load8(&net_rx_pkt + 12);
     var et_lo = load8(&net_rx_pkt + 13);
     var ethertype = (et_hi << 8) | et_lo;
-    # 1.32.4 Items 2 + 7 — stamp last-consumed frame's identifying bytes
-    # into CMOS slots [0x88..0x8B] so next-burn readback can disambiguate
-    # (c1) "admitted broadcast was NOT DHCP" vs (c2) "admitted broadcast
-    # WAS DHCP but lost downstream." Single state-transition stamp per
-    # frame — same pattern as 1.32.3 r8169 Part D. Defaults to 0 for
-    # the IP-proto + UDP-dport slots if frame isn't IPv4 / isn't UDP.
-    xhci_cmos_stamp(DHCP_KCP_ETHERTYPE_HI, et_hi);
-    xhci_cmos_stamp(DHCP_KCP_ETHERTYPE_LO, et_lo);
     if (ethertype == 0x0806) {
-        # ARP — non-IP, clear proto + port stamps so the slot reflects
-        # the most recently consumed frame's actual fingerprint.
-        xhci_cmos_stamp(DHCP_KCP_IP_PROTO, 0);
-        xhci_cmos_stamp(DHCP_KCP_UDP_DPORT_LO, 0);
         net_handle_arp(&net_rx_pkt, pkt_len);
         return 1;
     }
     if (ethertype == 0x0800) {
-        # IPv4: header at offset 14
-        if (pkt_len < 34) {
-            xhci_cmos_stamp(DHCP_KCP_IP_PROTO, 0);
-            xhci_cmos_stamp(DHCP_KCP_UDP_DPORT_LO, 0);
-            return 0;
-        }
+        if (pkt_len < 34) { return 0; }
         var ip_hdr = &net_rx_pkt + 14;
         var ip_ihl = (load8(ip_hdr) & 0x0F) * 4;
         var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
         var ip_proto = load8(ip_hdr + 9);
         var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
-        xhci_cmos_stamp(DHCP_KCP_IP_PROTO, ip_proto);
-        # Security: validate IP total length >= header length to prevent underflow
-        if (ip_total < ip_ihl) {
-            xhci_cmos_stamp(DHCP_KCP_UDP_DPORT_LO, 0);
-            return 0;
-        }
+        if (ip_total < ip_ihl) { return 0; }
         var ip_payload_len = ip_total - ip_ihl;
         if (ip_proto == 17) {
-            # UDP — stamp dst port low byte ([0x44]=68 means DHCP-bound)
-            xhci_cmos_stamp(DHCP_KCP_UDP_DPORT_LO, load8(&net_rx_pkt + 14 + ip_ihl + 3));
             net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
             return 2;
         }
-        # Non-UDP IPv4 — clear dport slot so it reflects last UDP frame only
-        xhci_cmos_stamp(DHCP_KCP_UDP_DPORT_LO, 0);
         if (ip_proto == 6) {
-            # TCP
             net_handle_tcp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
             return 3;
         }
     }
-    # Non-IPv4/non-ARP frame — proto + dport already cleared above
     return 0;
 }
 

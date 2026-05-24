@@ -149,17 +149,6 @@ var R8169_BMCR_ANRESTART= 0x0200;     # bit  9 — Restart Autonegotiation
 var R8169_BMCR_PDOWN    = 0x0800;     # bit 11 — Power Down (mask off to ensure live)
 var R8169_BMSR_LINKUP   = 0x0004;     # bit  2 — Link Status (1 = up)
 
-# CMOS post-mortem slot reservations for r8169 (per
-# r8169-iron-burn-audit.md § 10.5; virgin scratch 0x58-0x5F):
-var R8169_KCP_PROBE_DONE     = 0x58;  # 1 = r8169_probe ran to completion
-var R8169_KCP_PHY_OUTCOME    = 0x59;  # 0=not attempted, 1=link up, 2=autoneg timeout,
-# 3=BMCR-write timeout, 4=BMSR-read timeout
-var R8169_KCP_TX_SEND_COUNT  = 0x5A;  # saturating byte counter (0xFF = ≥255)
-var R8169_KCP_TX_DESC0_OWN   = 0x5B;  # TX desc 0 high byte; post-mortem 0x80 = OWN stuck
-var R8169_KCP_RX_POLL_COUNT  = 0x5C;  # saturating byte counter (0xFF = ≥255)
-var R8169_KCP_RX_DESC0_OWN   = 0x5D;  # RX desc 0 high byte; post-mortem 0x80 = OWN stuck
-var R8169_KCP_RX_DESC0_BYTE0 = 0x5E;  # RX desc 0 buf first byte (non-zero = DMA visible)
-
 # Module-level state — populated by r8169_probe on success.
 var r8169_present     = 0;
 var r8169_pci_idx     = 0;
@@ -292,7 +281,6 @@ fn r8169_phy_read(reg) {
 fn r8169_phy_init() {
     var bmcr = r8169_phy_read(R8169_PHY_BMCR);
     if (bmcr == 0xFFFF) {
-        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 4);   # 4 = MDIO read broken
         kprintln("r8169: PHY MDIO read failed", 26);
         return 0;
     }
@@ -312,23 +300,15 @@ fn r8169_phy_init() {
     var bmsr_latch = r8169_phy_read(R8169_PHY_BMSR);   # clear latch
     var bmsr_live = r8169_phy_read(R8169_PHY_BMSR);    # live snapshot
     if ((bmsr_live & R8169_BMSR_LINKUP) != 0) {
-        # Link already up (BIOS left autoneg complete from prior PXE /
-        # cold-boot probe). Don't restart — preserves the established
-        # link state through init_rx/init_tx.
         kprintln("r8169: PHY link up (preserved from BIOS)", 40);
-        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 1);   # 1 = link up
         return 1;
     }
-    # Link down — only now kick autoneg restart. Clear PDOWN in case
-    # BIOS left the PHY in power-down state.
     var new_bmcr = (bmcr | R8169_BMCR_ANENABLE | R8169_BMCR_ANRESTART) & 0xF7FF;
     if (r8169_phy_write(R8169_PHY_BMCR, new_bmcr) == 0) {
-        xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 3);   # 3 = MDIO write broken
         kprintln("r8169: PHY MDIO write failed", 27);
         return 0;
     }
     kprintln("r8169: PHY autoneg kicked (link async)", 38);
-    xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 1);   # 1 = kicked successfully
     return 1;
 }
 
@@ -339,18 +319,6 @@ fn r8169_phy_init() {
 # failure (BAR0/2 both unmapped or reset timeout).
 
 fn r8169_probe() {
-    # 1.32.1 bite B — zero the diagnostic slots up-front so post-mortem
-    # reads can distinguish "probe never ran" (slot 0x58 = boot-default,
-    # often 0xFF or 0x00 depending on cold/warm reset) from "probe ran
-    # but bailed out early" (slot 0x58 = 0, no progression to phy_init).
-    xhci_cmos_stamp(R8169_KCP_PROBE_DONE, 0);
-    xhci_cmos_stamp(R8169_KCP_PHY_OUTCOME, 0);
-    xhci_cmos_stamp(R8169_KCP_TX_SEND_COUNT, 0);
-    xhci_cmos_stamp(R8169_KCP_TX_DESC0_OWN, 0);
-    xhci_cmos_stamp(R8169_KCP_RX_POLL_COUNT, 0);
-    xhci_cmos_stamp(R8169_KCP_RX_DESC0_OWN, 0);
-    xhci_cmos_stamp(R8169_KCP_RX_DESC0_BYTE0, 0);
-
     var idx = r8169_find_pci();
     if (idx < 0) {
         kprintln("r8169: no controller found", 26);
@@ -480,7 +448,6 @@ fn r8169_probe() {
     }
 
     kprintln("r8169: Phase 1 complete", 23);
-    xhci_cmos_stamp(R8169_KCP_PROBE_DONE, 1);
     return 1;
 }
 
@@ -634,14 +601,6 @@ fn r8169_poll(buf, maxlen) {
             store8(buf + i, load8(bufaddr + i));
         }
 
-        # 1.32.3 audit S-1: state-transition CMOS stamps — fire only on a
-        # successful frame consume, not every poll-entry. Preserves the
-        # diagnostic story (post-burn read still shows poll-count + RX desc
-        # state + first-byte) without the hot-path tax.
-        xhci_cmos_stamp(R8169_KCP_RX_POLL_COUNT, r8169_rx_poll_count);
-        xhci_cmos_stamp(R8169_KCP_RX_DESC0_OWN, (status >> 24) & 0xFF);
-        xhci_cmos_stamp(R8169_KCP_RX_DESC0_BYTE0, load8(bufaddr) & 0xFF);
-
         r8169_rx_rearm(desc);
         r8169_rx_idx = (r8169_rx_idx + 1) & 0x0F;
         return pkt_len;
@@ -739,12 +698,9 @@ fn r8169_send(buf, len) {
     if (r8169_tx_ring_phys == 0) { return 0 - 1; }
     if (len > 2048) { len = 2048; }
 
-    # 1.32.1 bite B — TX-side activity counter. Kernel-side variable
-    # avoids the read-modify-write CMOS round-trip on every send.
     if (r8169_tx_send_count < 0xFF) {
         r8169_tx_send_count = r8169_tx_send_count + 1;
     }
-    xhci_cmos_stamp(R8169_KCP_TX_SEND_COUNT, r8169_tx_send_count);
 
     var desc = r8169_tx_ring_phys + r8169_tx_idx * 16;
     var status = load32(desc);
@@ -759,14 +715,6 @@ fn r8169_send(buf, len) {
     var new_status = 0x80000000 | 0x20000000 | 0x10000000 | len;
     if (r8169_tx_idx == 15) { new_status = new_status | 0x40000000; }
     store32(desc, new_status);
-
-    # 1.32.3 audit S-1: TX desc 0 OWN stamp moved from r8169_poll's hot
-    # path into here — fires only when state actually transitions. Post-burn
-    # CMOS read for 0x5B reflects the latest TX descriptor we wrote.
-    if (r8169_tx_idx == 1) {
-        var tx0_status = load32(r8169_tx_ring_phys);
-        xhci_cmos_stamp(R8169_KCP_TX_DESC0_OWN, (tx0_status >> 24) & 0xFF);
-    }
 
     # Kick TX engine: write NPQ bit (0x40) to TPPoll. This is W1C-style —
     # writing the bit asks the NIC to walk the queue once.
