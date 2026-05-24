@@ -356,6 +356,16 @@ fn r8169_probe() {
         store8(&r8169_mac + i, r8169_read8(R8169_REG_IDR0 + i));
     }
 
+    # AGNOS sovereign MAC override — flip the U/L bit on byte 0 so the
+    # gateway sees AGNOS as a distinct device from the Linux dhclient
+    # session that holds the manufactured MAC's DHCP lease. Without
+    # this, the router's IP-source-guard / DAI table binds the chip MAC
+    # to Linux's leased IP and silently drops any ARP from AGNOS
+    # claiming a different IP (Attempt 101 root cause). The writeback
+    # to IDR0/IDR4 at r8169_init_rx programs the chip's hardware
+    # unicast filter to accept frames addressed to this override.
+    store8(&r8169_mac + 0, load8(&r8169_mac + 0) | 0x02);
+
     # Chip-revision hint — bits 31:24 of TxConfig. We capture for the
     # boot-log print; we don't dispatch per-variant init bodies (one
     # validated target: 8168H/mac_version 46 on archaemenid).
