@@ -676,7 +676,7 @@ if (vnet_active != 0 || nic_ready() != 0) {
     kprint("net: STATIC ip=192.168.1.222 gw=192.168.1.1", 43);
     kprintln("", 0);
     arp_request(net_gateway);
-    kprintln("arp: request → 192.168.1.1", 26);
+    kprintln("arp: request -> 192.168.1.1", 27);
     var arp_start = timer_ticks;
     var arp_got = 0;
     while ((timer_ticks - arp_start) < 500) {
@@ -685,6 +685,10 @@ if (vnet_active != 0 || nic_ready() != 0) {
         arch_wait();
     }
     if (arp_got == 1) {
+        # Persist the gateway MAC into the route helper's slot — every
+        # off-LAN packet (1.1.1.1, etc.) now resolves through this.
+        memcpy(&net_gateway_mac, &arp_cache_mac, 6);
+        net_gateway_mac_valid = 1;
         kprint("arp: REPLY gw_mac=", 18);
         kprint_num(load8(&arp_cache_mac + 0)); kprint(":", 1);
         kprint_num(load8(&arp_cache_mac + 1)); kprint(":", 1);
@@ -693,10 +697,23 @@ if (vnet_active != 0 || nic_ready() != 0) {
         kprint_num(load8(&arp_cache_mac + 4)); kprint(":", 1);
         kprint_num(load8(&arp_cache_mac + 5));
         kprintln("", 0);
-        kprintln("net: L1/L2/L3 PROVEN — wire works, DHCP is the only broken layer", 64);
+        kprintln("net: L2 OK -- gateway MAC cached", 32);
+
+        # Outbound TCP test: 1.1.1.1:80. SYN+ACK proves r8169 TX unicast
+        # to gateway-MAC, off-LAN routing, r8169 RX of unicast reply, and
+        # the TCP three-way handshake all at once. The "proof that the
+        # router connected" per user direction 2026-05-24.
+        kprintln("tcp: connect 1.1.1.1:80", 23);
+        var conn = tcp_connect(ip4(1,1,1,1), 80, 49152);
+        if (conn >= 0) {
+            kprintln("net: L3+TCP OK -- outbound TCP handshake established", 52);
+            tcp_close(conn);
+        } else {
+            kprintln("net: L3+TCP FAIL -- SYN sent but no SYN+ACK", 43);
+        }
     } else {
-        kprintln("arp: TIMEOUT — gateway did not reply within ~5s", 47);
-        kprintln("net: L1/L2/L3 FAILED — bug is BELOW DHCP (NIC/eth/IP/UDP)", 56);
+        kprintln("arp: TIMEOUT -- gateway did not reply within ~5s", 48);
+        kprintln("net: L1/L2 FAILED -- cannot reach gateway, skipping L3 test", 59);
     }
 }
 

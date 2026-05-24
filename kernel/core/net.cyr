@@ -9,6 +9,12 @@ var arp_pending_ip = 0;  # Security: track which IP we sent an ARP request for
 var net_rx_pkt[256];
 var net_udp_buf[256];
 var net_udp_buf_len = 0;
+# Persistent gateway-MAC slot — populated by main.cyr after the boot-time
+# ARP-to-gateway probe succeeds. route_next_hop_mac consults this for off-LAN
+# destinations. Independent of arp_cache_* so later ARP traffic doesn't
+# clobber it. (dhcp-and-outbound-l3-audit-2026-05-24 § 7.1)
+var net_gateway_mac[8];
+var net_gateway_mac_valid = 0;
 
 fn net_init(ip, gw, mask) {
     net_ip = ip;
@@ -109,11 +115,44 @@ fn arp_request(target_ip) {
     return nic_send(p, off + 28);
 }
 
+# Minimal route lookup. Returns 0 on success (out_mac filled with the L2
+# next-hop MAC for dst_ip), -1 if no MAC is available. On-LAN destinations
+# match (dst_ip & netmask) == (net_ip & netmask); off-LAN destinations use
+# the cached gateway MAC. Convergent shape across Linux / lwIP / iPXE /
+# *BSD / U-Boot / Plan 9 per dhcp-and-outbound-l3-audit-2026-05-24 § 3.
+fn route_next_hop_mac(dst_ip, out_mac) {
+    if (net_netmask != 0) {
+        if ((dst_ip & net_netmask) == (net_ip & net_netmask)) {
+            # On-LAN. For MVP the only on-LAN dst we send to (outside the
+            # broadcast DHCP path which calls udp_send_from with dst=0xFFFFFFFF)
+            # is the gateway itself, which we have cached.
+            if (net_gateway_mac_valid == 1) {
+                if (dst_ip == net_gateway) {
+                    memcpy(out_mac, &net_gateway_mac, 6);
+                    return 0;
+                }
+            }
+            return 0 - 1;
+        }
+    }
+    # Off-LAN — route via the default gateway.
+    if (net_gateway_mac_valid == 1) {
+        memcpy(out_mac, &net_gateway_mac, 6);
+        return 0;
+    }
+    return 0 - 1;
+}
+
 fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
     if (nic_ready() == 0) { return 0 - 1; }
-    # For now, use broadcast MAC (QEMU user-mode handles it)
+    # Default to broadcast MAC — correct for QEMU SLIRP and any actual
+    # broadcast destination. For non-broadcast dst_ip, consult the route
+    # helper; if resolved, use the next-hop MAC instead.
     var dst_mac[8];
     memset(&dst_mac, 0xFF, 6);
+    if (dst_ip != 0xFFFFFFFF) {
+        route_next_hop_mac(dst_ip, &dst_mac);
+    }
     var kmac[8];
     nic_mac(&kmac);   # FIX #1
     var p = &net_pkt;
@@ -736,8 +775,12 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     var dst_ip = load64(cb + 24);
     var seq = load64(cb + 32);
     var ack = load64(cb + 40);
+    # Default broadcast; if the route helper resolves a next-hop MAC for
+    # dst_ip, use it instead. Off-LAN destinations (e.g., 1.1.1.1) need the
+    # gateway MAC at L2; same shape as udp_send above.
     var dst_mac[8];
     memset(&dst_mac, 0xFF, 6);
+    route_next_hop_mac(dst_ip, &dst_mac);
     var kmac[8];
     nic_mac(&kmac);   # FIX #1
     var p = &net_pkt;
