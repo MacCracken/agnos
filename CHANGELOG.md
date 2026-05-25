@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.32.7] — 2026-05-25 (r8169 RX — bite-1/2 BURNED→FALSIFIED for the filter; **bite-3 silicon accept-counter readback RESOLVES the filter-vs-delivery split: `rx_uc>0` proves the MAC ACCEPTS unicast → the entire L2 accept/filter arc is CLOSED; the blocker is RX ring/poll DELIVERY**; bite-4 whole-ring drain BURNED→FALSIFIED (`missed` 158→176 UP — a 64-frame drain can't exceed the 16 descriptors that exist); **bite-5 deepen RX ring 16→64 LANDED + burn-ready**)
+## [1.32.7] — 2026-05-25 (r8169 RX — bite-1/2 BURNED→FALSIFIED for the filter; **bite-3 silicon accept-counter readback RESOLVES the filter-vs-delivery split: `rx_uc>0` proves the MAC ACCEPTS unicast → the entire L2 accept/filter arc is CLOSED; the blocker is RX ring/poll DELIVERY**; bite-4 whole-ring drain BURNED→FALSIFIED (`missed` 158→176 UP — a 64-frame drain can't exceed the 16 descriptors that exist); 🎯 **bite-5 deepen RX ring 16→64 BURNED → CONNECTED: `missed` collapsed 176→0, both `net: LAN-TCP OK` (on-LAN) and `net: L3+TCP OK` (off-LAN via gateway) on iron — the 1.32.x r8169 unicast-RX arc is CLOSED, MVP on-iron networking blocker cleared**)
 
 ### Context
 
@@ -66,6 +66,16 @@ The bite-4-rubric pre-committed lever. bite-4 proved the bottleneck is **ring ca
 - **TX untouched** (tx_err=0, never overflowed) — stays 16. No filter/driver-config change, RX buffering depth only — keeps the deepen-ring result unconfounded against the (now-landed) drain loop.
 
 Build 624,056 → **624,488 B** (+432 B). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (all 5 backends reach shell — zero regression; r8169 path is iron-only, QEMU uses virtio_net). multiboot2 ELF64 OK. `build/agnos` reflects HEAD. VERSION untouched (1.32.7 open). NOT auto-proposed per [[feedback_iron_burns_block_other_work]]. **Rubric**: trailing `r8169: … missed=N …` — `missed` collapses toward 0 ⇒ the deeper ring absorbed the burst (+ `net: LAN-TCP OK` if the MBP peer is up = the win). If `missed` stays high at depth 64 ⇒ the drop is NOT a connect-window overflow → re-baseline to chip-side delivery (below the ring) or `tcp_connect` poll-cadence (tighten the post-SYN loop, drop the `arch_wait` gap).
+
+### Burned (bite-5) — 2026-05-25 → 🎯 CONNECTED. THE 1.32.x r8169 UNICAST-RX ARC IS CLOSED.
+
+🔥 `1327_CONNECTED.jpg`. **The rubric's win branch fired — `missed` collapsed 176 → 0.** FB: `net: STATIC ip=192.168.1.222 gw=192.168.1.1` → `arp: REPLY gw_mac=212:106:145:206:112:96` → `net: L2 OK -- gateway MAC cached` → `tcp: connect on-LAN 192.168.1.121:80` → **`net: LAN-TCP OK -- on-LAN unicast handshake established`** → `tcp: connect 1.1.1.1:80` → **`net: L3+TCP OK -- outbound TCP handshake established`** → trailing `r8169: tx_ok=21 rx_ok=103 tx_err=0 rx_err=0 missed=0 align=0 rx_uc=10 rx_bc=47 rx_mc=46` → `AGNOS shell v1.32.7`.
+
+**Both** the on-LAN MBP-peer SYN+ACK (the first unicast frame from an endpoint we own + log, same L2 segment, no gateway/NAT) **and** the off-LAN 1.1.1.1 handshake through the gateway read cleanly — `missed=0` proves the 64-deep ring absorbed the LAN-chatter burst that overran the 16-deep ring at bite-4 (`missed=176`). The unicast-RX defect was **RX ring DELIVERY CAPACITY all along**: bite-3 exonerated the filter (silicon `rx_uc`>0), bite-4 isolated the constraint to capacity (a drain budget can't exceed the 16 descriptors that physically exist), bite-5 fixed it. 16 was the outlier vs all prior art (Linux/FreeBSD/OpenBSD 256).
+
+The 1.32.x r8169 unicast-RX arc (1.32.0 → 1.32.7, opened 2026-05-22) is **CLOSED** — TX, broadcast/multicast RX, L2 gateway reachability, and now unicast RX (on-LAN *and* off-LAN) are all proven on archaemenid. **The MVP on-iron networking blocker is cleared.** Photo catalogued at `agnosticos/docs/development/iron-nuc-zen-photos/1327-agnos-1.32.7-bite5-rx-ring-16-to-64-connected-…jpg`; full arc narrative in `agnosticos/docs/development/iron-nuc-zen-log.md#tracker-1327-cycle`.
+
+**1.32.8 (next, cleanup)**: gate the `1.1.1.1:80` probe behind a verbose flag and remove the `.121` on-LAN-peer discriminator scaffolding (`net_peer_*` slots, the `main.cyr` peer-wait + on-LAN `tcp_connect`, the MBP harness) — both were diagnostic instruments for this arc, now spent.
 
 ## [1.32.6] — 2026-05-25 (r8169 RX — **gateway L2 reachability PROVEN on iron** via RFC-826 ARP sender-snoop; CPlusCmd `Normal_mode` restored; unicast-class TCP RX carries to 1.32.7)
 
