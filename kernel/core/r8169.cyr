@@ -629,12 +629,39 @@ fn r8169_init_tx() {
 
     # --- 11. CR.TE|RE LATE ----------------------------------------
     #
-    # FreeBSD re_init_locked:3259-3260 — only the 8168G_PLUS path
-    # writes CR with TE|RE AFTER RxConfig + ring setup. The chip
-    # latches RxConfig (specifically the accept mask) at the CR.RE
-    # rising edge on this silicon.
+    # FreeBSD re_init_locked:3259-3260 — the 8168G_PLUS path writes CR
+    # with TE|RE AFTER RxConfig + ring setup. We keep the pre-enable
+    # RxConfig write above (the FreeBSD shape) AND re-assert the accept
+    # filter post-enable below (the OpenBSD/Linux/iPXE shape) — see 11b.
     var cr = r8169_read8(R8169_REG_CR);
     r8169_write8(R8169_REG_CR, cr | R8169_CR_TE | R8169_CR_RE);
+
+    # --- 11b. Re-assert accept filter AFTER CR.RE -----------------
+    #
+    # Multi-source re-derive 2026-05-25: every reference EXCEPT the one
+    # FreeBSD branch AGNOS copied programs the RX accept filter AT or
+    # AFTER RX-enable, never only before it:
+    #   - OpenBSD re.c re_iff()    — RMW of the RxConfig accept bits
+    #                                AFTER re_init's CR.RE is already up.
+    #   - Linux rtl_set_rx_mode()  — called from rtl_open AFTER rtl_hw_start.
+    #   - Linux stable patch "set [Tx/Rx]Config after TX/RX is enabled" —
+    #     on some steppings the accept-bit write is IGNORED if issued
+    #     before TX/RX enable.
+    #   - iPXE realtek_open()      — writes RCR (accept nibble) AFTER CR.RE|TE.
+    # The iron signature is exactly what an ignored-before-enable accept
+    # write produces: MULTICAST (programmed via the SEPARATE MAR register,
+    # written above) passes, while BROADCAST + UNICAST (gated by the
+    # RxConfig accept nibble) drop — even with AAP set, because AAP lives
+    # in that same ignored nibble. CPlusCmd CPRX|CPTX (both 0x000B and
+    # 0x0008) and the RxConfig PROFILE word (both 0xCF00 and 0xEF00) were
+    # each burned both ways and falsified; the pre-vs-post-enable timing of
+    # the accept-nibble write is the one untried, four-source-convergent
+    # lever. RMW (not a blind re-store) so any profile bits the chip
+    # latched at the RE edge survive and we only re-assert acceptance.
+    var rx_re = r8169_read32(R8169_REG_RXCONFIG);
+    rx_re = rx_re & (0xFFFFFFFF - 0x3F);        # clear accept byte (AAP..AcceptErr)
+    rx_re = rx_re | accept;                      # re-assert AAP|AB|AM|APM
+    r8169_write32(R8169_REG_RXCONFIG, rx_re);
 
     # --- 12. Mask all interrupts (pure-poll mode) -----------------
     #
