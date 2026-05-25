@@ -56,15 +56,24 @@ var R8169_CR_RST            = 0x10;     # Reset
 var R8169_CR_RE             = 0x08;     # Receiver enable
 var R8169_CR_TE             = 0x04;     # Transmit enable
 
-# CPlusCmd (word at 0xE0) — per FreeBSD if_rlreg.h + Linux r8169_main.c.
-# On the 8168H (mac_version 46) we write ONLY MULRW (bit 3) — see the
-# bite-6 CPlusCmd correction in r8169_init_tx step 1. Bits [1:0] are the
-# INTT interrupt-moderation field on the gigabit 8168, NOT a datapath
-# enable; RX/TX are gated solely by CR.RE|CR.TE. The TXENB/RXENB names
-# below are the LEGACY 8139C+ register map, kept for reference only.
+# CPlusCmd (word at 0xE0) — value matched to the LIVE WORKING `ethtool -d`
+# dump of Linux's r8169 on THIS exact chip (RTL8168h/VER_46): CPlusCmd reads
+# 0x2061 = Normal_mode(0x2000) | RxVlan(0x40) | RxChkSum(0x20) | INTT[0](0x01).
+# Linux obtains it by PRESERVING the chip's power-on default (tp->cp_cmd =
+# RTL_R16(CPlusCmd), r8169_main.c) then adding offloads — it NEVER zeroes
+# Normal_mode. AGNOS previously wrote a BARE 0x0008 (MULRW only), clobbering
+# the chip-set Normal_mode bit — the one source-confirmed, never-burned
+# divergence left after the L2 accept filter was exonerated. The working dump
+# does NOT set MULRW (bit 3). Re-derived 2026-05-25 (live dump + Linux
+# r8169_main.c CPCMD_MASK + FreeBSD if_rlreg.h + RTL8168 datasheet) per
+# [[feedback_audit_re_derive_dont_validate_comments]]. TXENB/RXENB are the
+# LEGACY 8139C+ register map, kept for reference only.
 var R8169_CPLUS_TXENB       = 0x0001;   # legacy 8139C+ only — NOT used on 8168H
 var R8169_CPLUS_RXENB       = 0x0002;   # legacy 8139C+ only — NOT used on 8168H
-var R8169_CPLUS_MULRW       = 0x0008;
+var R8169_CPLUS_MULRW       = 0x0008;   # PCI multi-RW — FreeBSD sets it; working Linux dump does NOT
+var R8169_CPLUS_RXCHKSUM    = 0x0020;   # RX checksum offload (status only; AGNOS ignores result)
+var R8169_CPLUS_RXVLAN      = 0x0040;   # RX VLAN strip (no-op on untagged LAN)
+var R8169_CPLUS_NORMAL      = 0x2000;   # Normal_mode — chip-set power-on bit; bare writes were zeroing it
 
 # 9346CR (EEPROM command, byte at 0x50) — mode field is bits 7:6.
 var R8169_9346CR_UNLOCK     = 0xC0;     # EEM=11 — config registers writable
@@ -76,13 +85,18 @@ var R8169_CONFIG5_ASPM      = 0x02;
 # TxConfig (dword at 0x40) — IFG=3 (standard 96-bit) | MAXDMA=7 (unlimited).
 var R8169_TXCFG_DEFAULTS    = 0x03000700;
 
-# RxConfig (dword at 0x44) — per FreeBSD re_set_rxmode + if_rlreg.h.
-#   FIFOTHRESH=7 (no threshold, 0xE000)
-# | MAXDMA=7 (unlimited, 0x0700)
-# | EARLYOFFV2 (8168G_PLUS, 0x0800)
-# = 0xEF00
-var R8169_RXCFG_DEFAULTS    = 0x0000EF00;
-var R8169_RXCFG_AAP         = 0x01;     # accept all phys (promisc, off)
+# RxConfig (dword at 0x44) — profile byte matched to the LIVE WORKING Linux
+# dump on this chip (RxConfig = 0x0002CF0E) and to Linux rtl_init_rxcfg's
+# VER_40..53 value:
+#   RX128_INT_EN (0x8000) | RX_MULTI_EN (0x4000)
+# | MAXDMA=7 (unlimited, 0x0700) | RX_EARLY_OFF (0x0800)
+# = 0xCF00
+# (Was 0xEF00 — that set RXFTH bit 13/0x2000, which the working config does
+# NOT; corrected 2026-05-25 from the ethtool -d ground truth. Bit 17/0x20000
+# in the dump is a chip-set status bit Linux never authors — FreeBSD blind-
+# writes without it and RXes unicast fine — so we do NOT write it either.)
+var R8169_RXCFG_DEFAULTS    = 0x0000CF00;
+var R8169_RXCFG_AAP         = 0x01;     # accept all phys (promisc) — dropped; working Linux config never sets it
 var R8169_RXCFG_APM         = 0x02;     # accept physical match (unicast to us)
 var R8169_RXCFG_AM          = 0x04;     # accept multicast
 var R8169_RXCFG_AB          = 0x08;     # accept broadcast (DHCP, ARP)
@@ -506,18 +520,22 @@ fn r8169_init_tx() {
     # --- 1. CPlusCmd FIRST ------------------------------------------
     #
     # FreeBSD re_init_locked:3155 — "We must configure the C+ register
-    # before all others." On the 8168H (mac_version 46) write ONLY
-    # PCIMulRW (bit 3). The prior code OR'd in 0x0001|0x0002 believing
-    # them to be "C+ RX/TX enable" — that is the LEGACY 8139C+ register
-    # map. On the gigabit 8168 family bits [1:0] are the INTT interrupt-
-    # moderation timer select (Linux CPCMD_MASK/INTT_MASK = GENMASK(1,0),
-    # r8169_main.c), NOT a datapath enable. RX/TX are gated solely by
-    # CR.RE|CR.TE (step 11). FreeBSD only sets RXENB|TXENB on the !MACSTAT
-    # (8139C+) branch; the 8168H has MACSTAT, so it does NOT set them.
-    # Re-derived multi-source (FreeBSD if_re.c / Linux r8169_main.c) per
-    # [[feedback_audit_re_derive_dont_validate_comments]] — the old
-    # "CPRX|CPTX load-bearing" comment was the nine-burn CPlusCmd trap.
-    var cpc = R8169_CPLUS_MULRW;
+    # before all others." Value matched VERBATIM to the live working
+    # `ethtool -d enp1s0` dump of Linux's r8169 on THIS chip: CPlusCmd =
+    # 0x2061 = Normal_mode(0x2000) | RxVlan(0x40) | RxChkSum(0x20) | INTT[0](0x01).
+    # The prior code wrote a BARE 0x0008 (MULRW only), which ZEROED the chip's
+    # power-on Normal_mode bit — AGNOS was the ONLY driver clobbering it
+    # (Linux preserves it via tp->cp_cmd = RTL_R16(CPlusCmd); FreeBSD never
+    # clears it). After the L2 accept filter was exonerated on iron (broadcast
+    # + multicast pass via the MAR hash, unicast/APM dead even with AAP set),
+    # Normal_mode is the lone source-confirmed, never-burned divergence from
+    # the proven-working config. RxChkSum/RxVlan are offload-only (harmless:
+    # AGNOS ignores csum status, the LAN is untagged); INTT is inert under
+    # IMR=0; MULRW (bit 3) is intentionally DROPPED (the working dump omits it).
+    # Re-derived 2026-05-25 multi-source (live dump + Linux r8169_main.c
+    # CPCMD_MASK + FreeBSD if_rlreg.h + RTL8168 datasheet) per
+    # [[feedback_audit_re_derive_dont_validate_comments]].
+    var cpc = R8169_CPLUS_NORMAL | R8169_CPLUS_RXVLAN | R8169_CPLUS_RXCHKSUM | 0x0001;
     r8169_write16(R8169_REG_CPLUSCMD, cpc);
 
     # --- 2. IDR writeback (Cfg9346-wrapped, Linux rtl_rar_set protocol) ---
@@ -623,27 +641,18 @@ fn r8169_init_tx() {
     r8169_write32(R8169_REG_MAR0, 0xFFFFFFFF);
     r8169_write32(R8169_REG_MAR4, 0xFFFFFFFF);
 
-    # RxConfig final write — profile (FIFOTHRESH=7 | MAXDMA=7 | EARLYOFFV2)
-    # OR accept bits. Single write, BEFORE CR.RE rises.
+    # RxConfig final write — profile (0xCF00) OR accept bits. Single write,
+    # BEFORE CR.RE rises (re-asserted post-enable in step 11b).
     #
-    # 1.32.5 — add AAP (accept-all-physical / promiscuous, bit 0). Matches
-    # iPXE realtek_open's UNCONDITIONAL RCR low-nibble 0x0F (AAP|APM|AM|AB);
-    # iPXE is the pure-poll from-scratch DMA-ring analog and runs this chip
-    # family promiscuous-by-default for PXE/DHCP — the same workload class as
-    # our bring-up. On the RTL8168H stepping (mac_version 46) the per-address
-    # + broadcast accept path drops BROADCAST (DHCP OFFER) + UNICAST (gateway
-    # ARP reply) while MULTICAST passes — the signature proven across iron
-    # Attempts 97-103 (RX ring delivered 01:00:5e multicast only). TX is
-    # proven on the wire (1324_tcp_capture.pcapng). AAP bypasses the chip's
-    # L2 accept filter entirely, so the gateway's unicast ARP reply + the
-    # broadcast OFFER reach the ring regardless of the H-stepping filter
-    # quirk (cf. Linux VER_46 erratum "filters unicast eapol unless allmulti
-    # enabled"). Also a BISECTOR: if RX still drops with AAP set, the fault
-    # is DOWNSTREAM of the filter (descriptor OWN handoff / DMA / ring), not
-    # the accept mask. The BSDs gate ALLPHYS behind IFF_PROMISC; AAP-by-
-    # default is the iPXE bring-up convention, not a Linux/BSD production
-    # default — acceptable for single-NIC bring-up, revisit at hardening.
-    var accept = R8169_RXCFG_AAP | R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
+    # accept = APM|AM|AB = 0x0E, matching the live working Linux dump's accept
+    # nibble verbatim (RxConfig = 0x0002CF0E). AAP (accept-all-physical /
+    # promiscuous, bit 0) is DROPPED: it was added at 1.32.5 as a bisector and
+    # FALSIFIED on iron (promiscuous set, yet ZERO unicast delivered — if AAP
+    # engaged AGNOS would see the whole LAN's unicast chatter), and the proven-
+    # working Linux config never sets it. Linux receives unicast via plain
+    # physical-match (APM, bit 1) — exactly what we now mirror, paired with the
+    # CPlusCmd Normal_mode fix above that was the actual gate.
+    var accept = R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;   # 0x0E
     r8169_write32(R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS | accept);
 
     # --- 10. Clear missed-packet counter ---------------------------
@@ -670,28 +679,24 @@ fn r8169_init_tx() {
     #     on some steppings the accept-bit write is IGNORED if issued
     #     before TX/RX enable.
     #   - iPXE realtek_open()      — writes RCR (accept nibble) AFTER CR.RE|TE.
-    # The iron signature is exactly what an ignored-before-enable accept
-    # write produces: MULTICAST (programmed via the SEPARATE MAR register,
-    # written above) passes, while BROADCAST + UNICAST (gated by the
-    # RxConfig accept nibble) drop — even with AAP set, because AAP lives
-    # in that same ignored nibble. CPlusCmd CPRX|CPTX (both 0x000B and
-    # 0x0008) and the RxConfig PROFILE word (both 0xCF00 and 0xEF00) were
-    # each burned both ways and falsified; the pre-vs-post-enable timing of
-    # the accept-nibble write is the one untried, four-source-convergent
-    # lever. RMW (not a blind re-store) so any profile bits the chip
-    # latched at the RE edge survive. 1.32.6 APM re-derive: write the FULL
-    # RxConfig word (profile + accept) post-enable as ONE clean write, NOT a
-    # readback-RMW. Per Linux commit 05212ba8132b ("set RxConfig after tx/rx
-    # is enabled"), RxConfig writes issued while RX is DISABLED are silently
-    # dropped by the chip — so the pre-CR.RE write above is a no-op, and the
-    # profile bits (FIFOTHRESH | MAXDMA | EARLYOFFV2) only take if (re)written
-    # here, post-enable. The old RMW preserved whatever reset-value high bits
-    # the readback returned, so on a stepping that ignored the pre-enable
-    # write the PROFILE word may never have landed at all — leaving the RX
-    # FIFO/DMA on reset defaults. Linux writes the profile (rtl_init_rxcfg)
-    # AND the accept bits (rtl_set_rx_mode) both AFTER ChipCmd enable
-    # (rtl_hw_start:4124-4128); mirror that with one clean full write, then a
-    # readback commit to flush the posted write before we leave bring-up.
+    # The post-enable re-assert was the bite-7 broadcast+multicast
+    # breakthrough and is RETAINED: RxConfig writes issued while RX is
+    # DISABLED are silently dropped on this stepping (Linux commit
+    # 05212ba8132b, "set RxConfig after tx/rx is enabled"), so the pre-CR.RE
+    # write above only takes effect when re-written here. Linux likewise
+    # writes both the profile (rtl_init_rxcfg) and the accept bits
+    # (rtl_set_rx_mode) AFTER ChipCmd enable (rtl_hw_start:4124-4128).
+    #
+    # The earlier framing — that the accept-nibble TIMING was the UNICAST
+    # lever — is SUPERSEDED. The 2026-05-25 `ethtool -d` dump of the working
+    # Linux r8169 on this exact chip showed the real unicast gate was CPlusCmd
+    # Normal_mode (zeroed by AGNOS's old bare 0x0008), now fixed in step 1.
+    # The historical CPlusCmd (0x000B / 0x0008) and RxConfig-profile (0xCF00 /
+    # 0xEF00) A/B burns were CONFOUNDED — every one ran with Normal_mode
+    # cleared, so no profile/accept word could deliver unicast regardless.
+    # We write the FULL RxConfig word (profile 0xCF00 + accept 0x0E) here as
+    # ONE clean write matching the working dump, then a readback commit to
+    # flush the posted write before leaving bring-up.
     r8169_write32(R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS | accept);
     r8169_read32(R8169_REG_RXCONFIG);            # rtl_pci_commit — flush posted write
 
