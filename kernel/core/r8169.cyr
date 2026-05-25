@@ -700,6 +700,38 @@ fn r8169_init_tx() {
     r8169_write32(R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS | accept);
     r8169_read32(R8169_REG_RXCONFIG);            # rtl_pci_commit — flush posted write
 
+    # --- 11c. Re-assert IDR physical-match filter AFTER CR.RE ------
+    #
+    # The unicast (APM) accept path compares each inbound frame's dst MAC
+    # against IDR0-5. Step 2 programmed IDR pre-CR.RE in rtl_rar_set order
+    # — but bite-7 (1.32.5) proved THIS stepping SILENTLY DROPS filter-
+    # config writes issued while RX is disabled (Linux 05212ba8132b, for
+    # RxConfig): the accept nibble only engaged once re-asserted post-
+    # CR.RE (step 11b above, the broadcast+multicast breakthrough). The
+    # IDR is the LONE remaining filter register still written ONLY pre-
+    # enable. bite-2 (1.32.6) reordered that pre-enable write to rtl_rar_set
+    # shape and burned FALSIFIED, then declared the IDR filter "exonerated"
+    # — but it never moved the write past CR.RE, so that verdict is
+    # CONFOUNDED exactly like the pre-enable AAP (Attempt 104) and CPlusCmd
+    # (1.32.6 bite-6) burns were: every IDR write tested so far ran while
+    # RX was disabled. Broadcast + multicast deliver via the MAR hash (a
+    # SEPARATE register, latched pre-enable) so they prove NOTHING about the
+    # physical-match path — which has never delivered a single frame on iron
+    # across the whole arc. Re-assert IDR0/IDR4 here, post-enable, mirroring
+    # the proven step-11b shape: Cfg9346 unlock (datasheet §2.9 gates IDR
+    # writes), HIGH half + commit, LOW half (latches the 6-byte filter) +
+    # commit, lock. If the gateway's unicast ARP reply / SYN+ACK now lands,
+    # the pre-enable IDR write was the dropped lever; if it still drops, the
+    # accept+filter layer is GENUINELY exonerated (not confounded) and the
+    # bug is below it — at which point the rx_ucasts tally (reg 0x28) is the
+    # next, instrumentation-class, escape.
+    r8169_cfg_unlock();
+    r8169_write32(R8169_REG_IDR4, mac_hi);          # HIGH half first (rtl_rar_set order)
+    r8169_read32(R8169_REG_IDR4);                    # rtl_pci_commit — flush posted write
+    r8169_write32(R8169_REG_IDR0, mac_lo);          # LOW half latches the 6-byte filter
+    r8169_read32(R8169_REG_IDR0);                    # rtl_pci_commit — flush posted write
+    r8169_cfg_lock();
+
     # --- 12. Mask all interrupts (pure-poll mode) -----------------
     #
     # We don't service IRQs from this driver. iPXE leaves IMR=0 in

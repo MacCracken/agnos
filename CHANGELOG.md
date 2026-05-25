@@ -5,7 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.32.6] — 2026-05-25 (r8169 RX unicast delivery — ARP retransmit; APM re-derive lands the `rtl_rar_set` order + posted-write-flush fix)
+## [1.32.7] — 2026-05-25 (r8169 RX — IDR physical-match filter re-asserted post-`CR.RE`; the unicast-RX lever bite-2's confounded "exoneration" never tested)
+
+### Context
+
+1.32.6 proved **gateway L2 reachability** on iron (RFC-826 ARP sender-snoop), but the gateway's unicast ARP reply and the TCP SYN+ACK — both unicast frames to AGNOS's MAC — still never arrive (`net: L3+TCP FAIL -- SYN sent but no SYN+ACK`). Arc-wide signature: broadcast + multicast deliver; unicast (physical-match) never has.
+
+Decisive reframe: broadcast + multicast both ride the **MAR multicast-hash register** (`MAR=all-1s`; `ff:ff:ff:ff:ff:ff` falls in the all-1s hash bucket) — a register that latches fine pre-enable. So every "RX works" result has only ever exercised the MAR-hash path; the **IDR physical-match path has never delivered a single frame on iron**, and unicast-to-our-MAC is the only class that must transit it.
+
+bite-7 (1.32.5) proved this stepping **silently drops filter-config writes issued while RX is disabled** (Linux commit `05212ba8132b`, for RxConfig) — the accept nibble only engaged once re-asserted *after* `CR.RE`. The IDR (the physical-match filter source) is the **lone remaining filter register still written ONLY pre-`CR.RE`**. 1.32.6 bite-2 reordered that pre-enable IDR write to `rtl_rar_set` shape, burned FALSIFIED, and declared the IDR filter "exonerated" — but it never moved the write past `CR.RE`, so that verdict is **CONFOUNDED exactly like the pre-enable AAP (Attempt 104) and CPlusCmd (1.32.6 bite-6) burns were**: every IDR write tested to date ran while RX was disabled.
+
+### Fixed — `kernel/core/r8169.cyr` IDR physical-match filter re-asserted post-`CR.RE` (step 11c)
+
+- After `CR.TE|RE` rises and the accept nibble is re-asserted (step 11b), **re-write IDR0/IDR4** — Cfg9346-unlock (datasheet §2.9 gates IDR writes), high half + readback commit, low half + readback commit, lock — mirroring the proven step-11b post-enable shape. The low-word write latches the 6-byte physical-match filter against AGNOS's MAC; if pre-enable IDR writes are dropped on this stepping (as RxConfig writes provably are), this is the write that finally lands the unicast filter. Reuses the `mac_lo`/`mac_hi` assembled in step 2.
+- **Bisector role**: if the gateway's unicast ARP reply / SYN+ACK now lands → the pre-enable IDR write was the dropped lever. If unicast STILL drops → the accept+filter layer is genuinely exonerated (not confounded this time), the bug is below it, and the next escape is the hardware `rx_ucasts` tally counter (reg `0x28`) — instrumentation, deferred per [[feedback_no_instrumentation_means_no_instrumentation]] until this last behavioral lever is spent.
+
+Build 622,560 B (1.32.6) → **622,656 B** (+96 B, post-enable IDR re-assert). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (all backends reach shell — no boot regression; r8169 path is iron-only, QEMU uses virtio_net). multiboot2 ELF64 OK. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. `build/agnos` reflects HEAD. NOT auto-proposed per [[feedback_iron_burns_block_other_work]] — the next burn tests it. Rubric: FB reads `net: L3+TCP OK -- outbound TCP handshake established`, or at minimum the gateway's unicast ARP reply clears `arp_pending` via the *unicast* path (not the broadcast snoop).
+
+## [1.32.6] — 2026-05-25 (r8169 RX — **gateway L2 reachability PROVEN on iron** via RFC-826 ARP sender-snoop; CPlusCmd `Normal_mode` restored; unicast-class TCP RX carries to 1.32.7)
 
 ### Context
 
@@ -36,6 +53,26 @@ Three parallel from-scratch re-derives (BSD triangle `if_re.c`/`re.c`/`rtl8169.c
 - **Comment hygiene** — corrected the stale CPlusCmd block (`r8169.cyr:59-64`) that claimed `RXENB|TXENB` are "LOAD-BEARING"; the code (correctly, per the bite-6 correction) writes only `MULRW`. Per [[feedback_audit_re_derive_dont_validate_comments]].
 
 Build 622,560 B (bite 1) → **622,544 B** (−16 B; RMW arithmetic removed, readback flushes + reorder added). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (all backends reach shell — no boot regression; r8169 path is iron-only, QEMU uses virtio_net). multiboot2 ELF64 OK. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. `build/agnos` reflects working tree. NOT auto-proposed per [[feedback_iron_burns_block_other_work]] — the next burn tests it. Discriminator for the next burn: FB shows `arp: REPLY gw_mac=…` + `net: L2 OK` → the rar_set order/flush was load-bearing; still `reply pending` → unicast drop is below the accept+filter layer (next escape: the hardware tally-counter `rx_ucasts` readback at `0x28` to localize definitively, but that is instrumentation and stays deferred per [[feedback_no_instrumentation_means_no_instrumentation]] until the convergent behavioral levers are exhausted).
+
+### bite 4 — REFRAME: gateway-MAC learning is an ARP-layer problem (RFC 826 sender-snoop) — **the cycle's shipped win**
+
+Per user direction (*"the driver works — it's ARP and DHCP"*), chasing "r8169 unicast-class RX delivery" was the wrong layer for *reachability*. `net_handle_arp` (`net.cyr:551`) learned the gateway MAC ONLY from a solicited unicast reply (`oper==2` matching the pending request) — violating RFC 826, which snoops sender IP→MAC from EVERY ARP frame. **Fix**: snoop the sender from any ARP frame (request OR reply), gated on `arp_pending_ip` (security posture unchanged). The Araknis gateway broadcasts its own `who-has` (sender=`.1`, mac=`d4:6a:91:ce:70:60`), which AGNOS already receives as BROADCAST → the gateway MAC is now learnable with **zero unicast RX**. Zero-burn validated on Linux (`scripts/dhcp-probe/src/arp_snoop_check.cyr`, AF_PACKET, NIC stays bound): a 15 s capture saw the gateway as ARP sender 10× broadcast + 5× unicast; the new snoop clears `arp_pending` from the broadcast frames the old reply-only code discarded.
+
+**🎯 BURNED 2026-05-25 → gateway reachability PROVEN on iron — first time in the whole 1.32.x arc.** FB read `arp: REPLY gw_mac=212:106:145:206:112:96` (= `d4:6a:91:ce:70:60`) → `net: L2 OK -- gateway MAC cached`, with zero unicast RX (snooped from the gateway's own broadcast). RFC-826 sender-snoop now proven on iron, not just Linux. Boot then walked into L3: `tcp: connect 1.1.1.1:80` → `net: L3+TCP FAIL -- SYN sent but no SYN+ACK` (the SYN+ACK is a unicast frame to AGNOS's MAC — the parked unicast-RX gap, now isolated as the sole live blocker). Photo: `iron-nuc-zen-photos/1326-agnos-1.32.6-arp-snoop-l2-ok-gateway-cached-tcp-syn-no-synack.jpg`.
+
+### bite 5 — `agnos> test` output re-routed to the framebuffer
+
+`sh_cmd_test` (`kernel/user/test.cyr`) ran the kernel suite (pmm/heap/vfs/proc/syscall/kstdlib/initrd) but emitted only via `serial_print`/`serial_println` → invisible on archaemenid (no serial cable, per [[feedback_no_serial_on_iron]]). Re-routed to `kprintln` so `agnos> test` produces visible PASS/FAIL on iron, converting the in-shell suite into a reusable iron testing surface (later extendable with net/ARP checks for interactive reachability re-runs).
+
+### bite 6 — CPlusCmd `Normal_mode` (0x2000) restored — `0x0008` → `0x2061`; RxConfig accept `0x0F` → `0x0E`
+
+An `ethtool -d enp1s0` dump of the LIVE WORKING Linux r8169 on this exact chip (VER_46) gave the proven config CPlusCmd=`0x2061`, RxConfig=`0x0002CF0E`. A 3-source agent audit (Linux `r8169_main.c` + FreeBSD `if_rlreg.h` + RTL8168 datasheet) killed the bit-17/RMW lead (Linux never authors it; FreeBSD blind-writes without it + RXes unicast) and pinned the lone source-confirmed, never-burned divergence to **CPlusCmd `Normal_mode` — AGNOS's bare `0x0008` (MULRW only) write had ZEROED the chip's power-on Normal_mode bit.** The prior CPlusCmd/profile A/B burns were CONFOUNDED — every one ran with Normal_mode cleared. Also dropped AAP from the accept nibble (`0x0F` → `0x0E` = AB|AM|APM) to match the working dump, which never sets promiscuous.
+
+**🔥 BURNED 2026-05-25 (`1326_still_ack_issue.jpg`) → FALSIFIED for unicast.** FB byte-identical to the bite-4 burn: `arp: REPLY gw_mac=212:106:145:206:112:96` → `net: L2 OK` → `tcp: connect 1.1.1.1:80` → `net: L3+TCP FAIL -- SYN sent but no SYN+ACK`. Normal_mode is now correct **and stays** (it's the proven-Linux value), but it was NOT the unicast gate. **Branch retired**: with Normal_mode restored and the accept nibble matching the working dump, the surviving unicast-RX gap isolates to the one filter register never moved past `CR.RE` — the IDR physical-match write (→ 1.32.7).
+
+### Cycle close
+
+1.32.6 ships **gateway L2 reachability on iron** — the RFC-826 sender-snoop (bite 4) learns the gateway MAC from broadcast with zero unicast RX, the first gateway reachability across the entire 1.32.x networking arc. CPlusCmd `Normal_mode` (bite 6) is restored to the proven-Linux value. The **unicast-class RX residual** (gateway unicast ARP reply / TCP SYN+ACK still undelivered) carries to **1.32.7**, where the IDR physical-match filter is re-asserted post-`CR.RE` — the lever bite-2's confounded "exoneration" never tested. Burned bite-6 build 622,560 B. MVP gate stayed green on iron (boot-to-shell byte-clean). cyrius 6.0.1 + gnoboot 0.4.2 unchanged.
 
 ## [1.32.5] — 2026-05-25 (r8169 RX — broadcast + multicast delivery PROVEN on iron; honest L2 RX self-test; unicast carries to next cycle)
 
