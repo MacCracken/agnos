@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.32.7] — 2026-05-25 (r8169 RX — bite-1 IDR post-`CR.RE` re-assert BURNED→FALSIFIED → L2 accept/filter layer genuinely exonerated; bite-2 on-LAN unicast-TCP discriminator splits raw unicast RX from gateway/off-LAN routing)
+## [1.32.7] — 2026-05-25 (r8169 RX — bite-1/2 BURNED→FALSIFIED for the filter; **bite-3 silicon accept-counter readback RESOLVES the filter-vs-delivery split: `rx_uc=2` proves the MAC ACCEPTS unicast → the entire L2 accept/filter arc is CLOSED; the blocker is RX ring/poll DELIVERY**)
 
 ### Context
 
@@ -35,6 +35,18 @@ Rather than jump straight to the `rx_ucasts` tally instrumentation, run a **beha
 - Harness: `agnosticos/scripts/wire-probe/mbp-arp-rx-probe.sh` rewritten from the ARP-injection probe into a logging on-LAN TCP webservice — a `:80` listener (so the MBP kernel auto-SYN+ACKs and a completed handshake is logged), pcap capture, an ARP stimulus that doubles as AGNOS's peer-discovery signal, and a pcap+log verdict. Run on the `.121` MBP during the burn.
 
 Build 622,656 → **623,928 B** (+1,272 B). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (zero regression). multiboot2 ELF64 OK. `build/agnos` reflects HEAD. VERSION untouched (1.32.7 open). NOT auto-proposed per [[feedback_iron_burns_block_other_work]]. **Discriminator rubric**: `net: LAN-TCP OK` (+ MBP `ACCEPTED` log) → raw unicast RX **works** and the 1.1.1.1 failure is **gateway/off-LAN-specific** (major re-scope); `net: LAN-TCP FAIL` (MBP pcap shows SYN-in + SYN+ACK-out, no AGNOS ACK) → unicast-RX drop **confirmed at an owned, logged endpoint** with no gateway/NAT/Cloudflare in the path → the `rx_ucasts` hardware tally (reg `0x28`) instrumentation is then justified.
+
+### Burned (bite-2) — 2026-05-25 → unicast-RX drop CONFIRMED at an owned, logged endpoint
+
+🔥 `1327_dual_tcp_tests_failing.jpg` + MBP `tcpdump`. FB: `tcp: connect on-LAN 192.168.1.121:80` → `net: LAN-TCP FAIL`, then `1.1.1.1` → `net: L3+TCP FAIL`. The MBP capture proves the chain on the same L2 segment: AGNOS auto-discovered `.121` from its broadcast who-has, TX'd the on-LAN SYN, the MBP kernel SYN+ACK'd it **and retransmitted** — AGNOS never ACK'd. On-LAN and off-LAN unicast SYN+ACK drop identically ⇒ the drop is **general**, not gateway/off-LAN-specific; the re-scope-to-routing branch is ruled out. The `rx_ucasts` hardware tally is now justified → bite-3.
+
+### Fixed — bite-3: r8169 silicon accept-counter readback (`main.cyr` boot net-probe)
+
+Wire in the already-written, never-called `r8169_print_stats` / `r8169_dump_stats` (`r8169.cyr`, FreeBSD `re_sysctl_stats` / RTL8168 §6.8.4 tally-counter DMA), guarded `if (r8169_present == 1)` after both handshakes. Reads the chip's OWN silicon counters split by frame class — `rx_uc` (unicast accepted via physical-match), `rx_bc`, `rx_mc`. No new instrumentation authored; settles the filter-vs-delivery question the inference-only burns could not. Build 623,928 → **623,976 B** (+48 B). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (iron-only; QEMU output byte-identical to bite-2). multiboot2 ELF64 OK.
+
+### Burned (bite-3) — 2026-05-25 → `rx_uc=2`: FILTER ACCEPTS UNICAST, THE RING DROPS IT
+
+🔥 `1327_r8169_line.jpg`. FB trailing line: `r8169: tx_ok=5 rx_ok=140 tx_err=0 rx_err=0 missed=158 align=0 rx_uc=2 rx_bc=82 rx_mc=64`. **`rx_uc=2` > 0 → the chip's own silicon counted unicast frames ACCEPTED by the physical-match filter** — the entire L2 accept/filter arc (accept nibble + AAP + CPlusCmd `Normal_mode` + IDR physical-match) is closed by hardware, not inference. The blocker is **RX ring/poll delivery**: `missed=158` (RxMissed = RX-FIFO overflow, no host descriptor free) with `rx_err=0 align=0` (clean frames) means the ring drops more than half of received traffic for lack of a free descriptor — the unicast SYN+ACK dies there. `r8169_poll` returns after one good frame per call (`r8169.cyr:804`); the convergent next bite is to **drain the whole RX ring per poll call** (FreeBSD `re_rxeof` / iPXE `realtek_poll`).
 
 ## [1.32.6] — 2026-05-25 (r8169 RX — **gateway L2 reachability PROVEN on iron** via RFC-826 ARP sender-snoop; CPlusCmd `Normal_mode` restored; unicast-class TCP RX carries to 1.32.7)
 

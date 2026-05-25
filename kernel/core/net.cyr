@@ -674,34 +674,48 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
 
 fn net_poll() {
     if (nic_ready() == 0) { return 0; }
-    var pkt_len = nic_poll(&net_rx_pkt, 2048);
-    if (pkt_len < 14) { return 0; }
-    var et_hi = load8(&net_rx_pkt + 12);
-    var et_lo = load8(&net_rx_pkt + 13);
-    var ethertype = (et_hi << 8) | et_lo;
-    if (ethertype == 0x0806) {
-        net_handle_arp(&net_rx_pkt, pkt_len);
-        return 1;
-    }
-    if (ethertype == 0x0800) {
-        if (pkt_len < 34) { return 0; }
-        var ip_hdr = &net_rx_pkt + 14;
-        var ip_ihl = (load8(ip_hdr) & 0x0F) * 4;
-        var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
-        var ip_proto = load8(ip_hdr + 9);
-        var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
-        if (ip_total < ip_ihl) { return 0; }
-        var ip_payload_len = ip_total - ip_ihl;
-        if (ip_proto == 17) {
-            net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
-            return 2;
+    # Drain the WHOLE RX ring per call, not one frame. FreeBSD re_rxeof and
+    # iPXE realtek_poll both loop until the next NIC-owned descriptor; AGNOS
+    # returned after the first good frame, so under LAN chatter the 16-deep
+    # ring overran between hlt-spaced polls (tcp_connect: net_poll(); arch_wait()
+    # ×200). The 1.32.7 bite-3 burn read the chip's tally: missed=158 (RxMissed
+    # FIFO-overflow) with rx_err=0/align=0 — clean frames dropped for no free
+    # descriptor; the unicast SYN+ACK died there, not at the filter (rx_uc=2).
+    # A malformed frame skips dispatch but keeps draining (the next frame may be
+    # the SYN+ACK). budget bounds a pathological always-ready ring.
+    var drained = 0;
+    var budget = 64;
+    while (budget > 0) {
+        budget = budget - 1;
+        var pkt_len = nic_poll(&net_rx_pkt, 2048);
+        if (pkt_len < 14) { return drained; }   # ring empty (or runt) — done
+        var et_hi = load8(&net_rx_pkt + 12);
+        var et_lo = load8(&net_rx_pkt + 13);
+        var ethertype = (et_hi << 8) | et_lo;
+        if (ethertype == 0x0806) {
+            net_handle_arp(&net_rx_pkt, pkt_len);
         }
-        if (ip_proto == 6) {
-            net_handle_tcp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
-            return 3;
+        if (ethertype == 0x0800) {
+            if (pkt_len >= 34) {
+                var ip_hdr = &net_rx_pkt + 14;
+                var ip_ihl = (load8(ip_hdr) & 0x0F) * 4;
+                var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
+                var ip_proto = load8(ip_hdr + 9);
+                var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
+                if (ip_total >= ip_ihl) {
+                    var ip_payload_len = ip_total - ip_ihl;
+                    if (ip_proto == 17) {
+                        net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
+                    }
+                    if (ip_proto == 6) {
+                        net_handle_tcp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
+                    }
+                }
+            }
         }
+        drained = drained + 1;
     }
-    return 0;
+    return drained;
 }
 
 fn net_recv_udp(buf, maxlen) {
