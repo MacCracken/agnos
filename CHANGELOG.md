@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.32.4] — 2026-05-23 (DHCP OFFER-downstream-of-r8169_poll cycle — close out the 1.32.3 carry-forward residual; 10-bundle from `agnosticos/docs/development/dhcp-offer-downstream-audit.md`)
+## [1.32.4] — 2026-05-24 (networking iron-isolation cycle — opened on the DHCP-OFFER-downstream 10-bundle, pivoted to a STATIC-IP + ARP probe, CLOSED having PROVEN AGNOS frame construction wire-correct on Linux and ISOLATED the iron failure to r8169 RX delivery. The bug survives; the cycle's gain is the isolation + audit closure, not a green burn.)
 
 ### Context
 
@@ -70,7 +70,7 @@ Outcome decoding: OFFER on wire + AGNOS still times out = (c2) confirmed (downst
 | Cut | x86_64 (production) | x86_64 (TCP_LISTEN_SMOKE=1) | Delta | Notes |
 |---|---|---|---|---|
 | 1.32.3 close | 617,000 B | 617,984 B | — | BSD/iPXE r8169 rewrite + Attempt 100 PARTIAL baseline |
-| **1.32.4 close** | **TBD** | **TBD** | **~+150-300 B** | OFFER+ACK matcher hardening (2 lines op + 4 lines cookie × 2 matchers = 12 LOC) + 5 CMOS stamp sites in net_poll/net_handle_udp + 5 reader rows in read-boot-log + 1 compile-gated 64-byte dump block + 1 compile-gated static-IP fallback block |
+| **1.32.4 close** | **621,816 B** | — (production ships) | **+4,816 B vs 1.32.3** | 10-bundle matcher hardening + outbound L3 routing (`route_next_hop_mac` + persistent gateway-MAC slot) + ARP byte-order fix + boot-time STATIC-IP/ARP/TCP test. LAA override added then removed same-cycle (net-zero on the MAC). AF_PACKET probe harness lives in agnosticos (not counted here). |
 
 cyrius pin stays on 6.0.1. gnoboot stays on 0.4.2. **MVP gate (boot-to-shell with typeable keyboard on iron) green** since Attempt 68 / 1.30.9 — every 1.32.x burn has reached `AGNOS shell vX.Y.Z` byte-clean; no regression expected from this cycle since changes are scoped to `dhcp_init` validation + diagnostics-only stamps.
 
@@ -79,6 +79,45 @@ cyrius pin stays on 6.0.1. gnoboot stays on 0.4.2. **MVP gate (boot-to-shell wit
 - [`agnosticos/docs/development/dhcp-offer-downstream-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/dhcp-offer-downstream-audit.md) — the audit that drove this bundle (16-row gate table, 8 ranked silent-drop modes, multi-source convergent spec, escape plan).
 - [`agnosticos/docs/development/iron-nuc-zen-log.md` § Attempt 100](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md) — the iron evidence base.
 - [`iron-nuc-zen-photos/attempt-100-cmos-readback.txt`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-photos/attempt-100-cmos-readback.txt) — full CMOS slot dump from Attempt 100.
+
+### Cycle arc — pivot to ARP probe, then zero-burn isolation (Attempts 101–102, 2026-05-24)
+
+The 10-bundle above (cycle-open) hardened the DHCP OFFER/ACK matcher, but the cycle never reached the DHCP path on iron — a more fundamental L2 gate surfaced first, and the cycle pivoted to chase it.
+
+#### Added — outbound L3 routing helper (`kernel/core/net.cyr`)
+
+- `route_next_hop_mac(dst_ip, out_mac)` — on-LAN destinations resolve directly; off-LAN destinations resolve via the cached gateway MAC. Replaces a hardcoded broadcast MAC in `udp_send` + `tcp_send_pkt` that prevented off-LAN unicast (e.g., 1.1.1.1) from routing through the gateway. Convergent shape across Linux / lwIP / iPXE / *BSD / U-Boot / Plan 9 per [`agnosticos/.../dhcp-and-outbound-l3-audit-2026-05-24.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/dhcp-and-outbound-l3-audit-2026-05-24.md).
+- `net_gateway_mac[8]` persistent slot + `net_gateway_mac_valid` — populated by the boot-time ARP-to-gateway probe, independent of `arp_cache_*` so later ARP traffic doesn't clobber it.
+
+#### Added — boot-time STATIC-IP + ARP-probe + outbound-TCP test (`kernel/core/main.cyr`)
+
+DHCP-bypass diagnostic: install static `192.168.1.222` → ARP the gateway → on reply, cache the gateway MAC and `tcp_connect(1.1.1.1, 80)` to exercise L3 + off-LAN routing + RX-of-unicast-reply + the TCP three-way handshake in one shot.
+
+#### Fixed — ARP request field byte-order (`kernel/core/net.cyr` `arp_request`)
+
+htype / ptype / oper written as explicit big-endian byte pairs instead of `store16` (host-order on x86). Attempt 101's egress carried byte-swapped `htype=0x0100 / ptype=0x0008 / oper=0x0100` and the switch dropped it as malformed. Mirror of the same fix already present in `net_handle_arp`.
+
+#### Added then Removed — sovereign-MAC (LAA) override (`kernel/core/r8169.cyr`)
+
+A U/L-bit flip (`b0→b2`) was added to dodge a hypothesized router IP-source-guard/DAI drop, then **removed the same cycle** when `arp-probe-raw` falsified the theory (the gateway replied to the real `b0` MAC claiming `.222` while Linux held a live `b0` lease). Net MAC behavior is unchanged from 1.32.3 (EEPROM-autoloaded `b0`); the override only added unicast-filter risk.
+
+#### Added — Cyrius AF_PACKET probe harness (`agnosticos/scripts/dhcp-probe/`)
+
+`arp-probe-raw` (NEW) + `dhcp-probe-raw` build AGNOS's frames **verbatim** (construction functions copied from `net.cyr`) and send them on the real wire via AF_PACKET. Zero-burn isolation tool: `dhcp-probe-raw` leased `.129`; `arp-probe-raw` drew `gateway 192.168.1.1 is at d4:6a:91:ce:70:60`. **Proves AGNOS's eth/IP/UDP/DHCP/ARP construction is wire-correct and the gateway replies to us.**
+
+#### Falsified (branches retired)
+
+- **IP-source-guard / DAI theory** — the LAA override's motivation; falsified by `arp-probe-raw` (b0/.222 drew a reply with Linux's b0 lease active).
+- **Frame-construction + chip-init audit lineage** — every thread in [`r8169-chip-init-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/r8169-chip-init-audit.md) (RXDV-gate, Cfg9346/32-bit-MAC, MAR, RxConfig-profile, MCU-body) is closed by the Linux proof. A fresh datasheet-level re-derivation of the RX filter / ring / poll found no structural fault.
+
+### Iron evidence
+
+- **Attempt 101** (2026-05-23) PARTIAL FALSIFIED — STATIC-IP + ARP probe; ARP-to-gateway timed out → bug is below DHCP (L1/L2/L3).
+- **Attempt 102** (2026-05-24) FALSIFIED — LAA build + ARP byte-order fix + outbound routing; ARP still timed out. Boot-to-shell byte-clean; **drive-swap topology-independence validated** (AGNOS boot drive → internal NVMe slot, Linux → SATA WD Blue) with zero hardcoded-drive assumptions.
+
+### Outcome
+
+Bug survives, but the cycle's gain is structural: the iron failure is now **isolated to r8169 RX delivery** (the reply reaches the PHY but not `r8169_poll`), with construction + TX + gateway-replies-to-us all proven on Linux and the entire chip-init audit surface closed. **Next** (Attempt 103, EEPROM `b0`, 621,816 B, PENDING USER BURN): if ARP still times out, the filter MAC is exonerated and the next move is MMIO / descriptor-DMA observability on the RX ring — not another construction/chip-init audit.
 
 ---
 
