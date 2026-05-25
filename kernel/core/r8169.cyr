@@ -147,12 +147,21 @@ var R8169_FRAG_MASK         = 0x30000000;   # FS|LS — frame complete when both
 
 # === Ring sizing ===
 #
-# 16 descriptors per direction is comfortable for the AGNOS workload
-# (DHCP, ARP, TCP smoke, low-pps probes). Power-of-two so (idx + 1) & mask
-# wraps in one AND.
-var R8169_RX_RING_SIZE      = 16;
+# RX 64 / TX 16. RX deepened 16 -> 64 (1.32.7 bite-5): a 16-deep ring overran
+# between hlt-spaced polls under LAN broadcast/multicast chatter — iron showed
+# missed=176 (RxMissed FIFO-overflow) with rx_err=0/align=0 (clean frames
+# dropped for no free descriptor); the unicast SYN+ACK died there, NOT at the
+# filter (silicon rx_uc>0 proved accept). The bite-4 whole-ring drain alone
+# could not fix it — a 64-frame drain budget can only pull the 16 descriptors
+# that physically exist, so a burst still overflows. 16 was an outlier vs all
+# prior art (Linux NUM_RX_DESC=256, FreeBSD/OpenBSD 256); 64 buys 4x burst
+# headroom and still fits one 4 KB ring page (64*16 = 1024 B). TX never
+# overflowed (tx_err=0) and stays 16. RX/TX masks split because the rings now
+# differ in depth. Power-of-two so (idx + 1) & mask wraps in one AND.
+var R8169_RX_RING_SIZE      = 64;
 var R8169_TX_RING_SIZE      = 16;
-var R8169_RING_MASK         = 0x0F;
+var R8169_RX_RING_MASK      = 0x3F;
+var R8169_TX_RING_MASK      = 0x0F;
 var R8169_BUF_SIZE          = 2048;     # covers 1500 MTU + Eth + VLAN + slack
 
 # === PCI vendor/device IDs ===
@@ -170,7 +179,7 @@ var r8169_mac[8];                       # 6 valid bytes + 2 padding (module-glob
 var r8169_chip_rev          = 0;
 var r8169_rx_ring_phys      = 0;
 var r8169_tx_ring_phys      = 0;
-var r8169_rx_bufs[16];                  # 16 phys addrs (u64 each at module scope)
+var r8169_rx_bufs[64];                  # 64 phys addrs (u64 each at module scope)
 var r8169_tx_bufs[16];
 var r8169_rx_idx            = 0;
 var r8169_tx_idx            = 0;
@@ -443,7 +452,7 @@ fn r8169_init_rx() {
         store8(r8169_rx_ring_phys + i, 0);
     }
 
-    for (var i = 0; i < 16; i = i + 1) {
+    for (var i = 0; i < R8169_RX_RING_SIZE; i = i + 1) {
         var buf = pmm_alloc();
         if (buf == 0) {
             kprintln("r8169: rx buf pmm_alloc failed", 30);
@@ -455,7 +464,7 @@ fn r8169_init_rx() {
         # cmdstat = OWN | BUF_SIZE (length field = how much room is here).
         # EOR set on the last slot so the NIC wraps to slot 0.
         var status = R8169_DESC_OWN | 2048;
-        if (i == 15) { status = status | R8169_DESC_EOR; }
+        if (i == R8169_RX_RING_SIZE - 1) { status = status | R8169_DESC_EOR; }
         store32(desc + 0,  status);
         store32(desc + 4,  0);                              # vlanctl
         store32(desc + 8,  buf & 0xFFFFFFFF);               # bufaddr_lo
@@ -463,7 +472,7 @@ fn r8169_init_rx() {
     }
 
     r8169_rx_idx = 0;
-    kprintln("r8169: RX ring up (16 desc × 2KB buf)", 36);
+    kprintln("r8169: RX ring up (64 desc × 2KB buf)", 36);
     return 0;
 }
 
@@ -762,7 +771,10 @@ fn r8169_poll(buf, maxlen) {
     if (r8169_present == 0) { return 0; }
     if (r8169_rx_ring_phys == 0) { return 0; }
 
-    var budget = 16;
+    # Error-skip walk bounded by ring depth: a pathological all-error ring
+    # can't loop forever, but a legit run of errored slots before a good frame
+    # is fully traversable now that the ring is 64 deep.
+    var budget = R8169_RX_RING_SIZE;
     while (budget > 0) {
         budget = budget - 1;
 
@@ -773,7 +785,7 @@ fn r8169_poll(buf, maxlen) {
         # RES (RXERRSUM) = CRC / runt / FIFO / align error; length unreliable.
         if ((status & R8169_RDESC_RXERRSUM) != 0) {
             r8169_rx_rearm(desc);
-            r8169_rx_idx = (r8169_rx_idx + 1) & R8169_RING_MASK;
+            r8169_rx_idx = (r8169_rx_idx + 1) & R8169_RX_RING_MASK;
             continue;
         }
 
@@ -800,7 +812,7 @@ fn r8169_poll(buf, maxlen) {
         }
 
         r8169_rx_rearm(desc);
-        r8169_rx_idx = (r8169_rx_idx + 1) & R8169_RING_MASK;
+        r8169_rx_idx = (r8169_rx_idx + 1) & R8169_RX_RING_MASK;
         return pkt_len;
     }
 
@@ -836,7 +848,7 @@ fn r8169_send(buf, len) {
     # Kick the TX engine. iPXE realtek.c:827: writeb(RTL_TPPOLL_NPQ, ...).
     r8169_write8(R8169_REG_TPPOLL, R8169_TPPOLL_NPQ);
 
-    r8169_tx_idx = (r8169_tx_idx + 1) & R8169_RING_MASK;
+    r8169_tx_idx = (r8169_tx_idx + 1) & R8169_TX_RING_MASK;
     return len;
 }
 

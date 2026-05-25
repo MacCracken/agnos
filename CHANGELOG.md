@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.32.7] — 2026-05-25 (r8169 RX — bite-1/2 BURNED→FALSIFIED for the filter; **bite-3 silicon accept-counter readback RESOLVES the filter-vs-delivery split: `rx_uc=2` proves the MAC ACCEPTS unicast → the entire L2 accept/filter arc is CLOSED; the blocker is RX ring/poll DELIVERY**)
+## [1.32.7] — 2026-05-25 (r8169 RX — bite-1/2 BURNED→FALSIFIED for the filter; **bite-3 silicon accept-counter readback RESOLVES the filter-vs-delivery split: `rx_uc>0` proves the MAC ACCEPTS unicast → the entire L2 accept/filter arc is CLOSED; the blocker is RX ring/poll DELIVERY**; bite-4 whole-ring drain BURNED→FALSIFIED (`missed` 158→176 UP — a 64-frame drain can't exceed the 16 descriptors that exist); **bite-5 deepen RX ring 16→64 LANDED + burn-ready**)
 
 ### Context
 
@@ -47,6 +47,25 @@ Wire in the already-written, never-called `r8169_print_stats` / `r8169_dump_stat
 ### Burned (bite-3) — 2026-05-25 → `rx_uc=2`: FILTER ACCEPTS UNICAST, THE RING DROPS IT
 
 🔥 `1327_r8169_line.jpg`. FB trailing line: `r8169: tx_ok=5 rx_ok=140 tx_err=0 rx_err=0 missed=158 align=0 rx_uc=2 rx_bc=82 rx_mc=64`. **`rx_uc=2` > 0 → the chip's own silicon counted unicast frames ACCEPTED by the physical-match filter** — the entire L2 accept/filter arc (accept nibble + AAP + CPlusCmd `Normal_mode` + IDR physical-match) is closed by hardware, not inference. The blocker is **RX ring/poll delivery**: `missed=158` (RxMissed = RX-FIFO overflow, no host descriptor free) with `rx_err=0 align=0` (clean frames) means the ring drops more than half of received traffic for lack of a free descriptor — the unicast SYN+ACK dies there. `r8169_poll` returns after one good frame per call (`r8169.cyr:804`); the convergent next bite is to **drain the whole RX ring per poll call** (FreeBSD `re_rxeof` / iPXE `realtek_poll`).
+
+### Fixed — bite-4: whole-ring drain per `net_poll` call (`net.cyr`)
+
+`net_poll` pulled ONE frame per call and `tcp_connect` polls `net_poll(); arch_wait();` ×200 (one frame drained per `hlt` tick), so a LAN-chatter burst overran the 16-deep ring between ticks → FIFO overflow → the unicast SYN+ACK dropped before it was read. Rewrote `net_poll` into a bounded drain loop (`budget=64`): pull→dispatch each frame, malformed frames skip dispatch but keep draining, stop when the ring is empty. **Read path verified sound first** (`tcp_find_conn` 4-tuple match + `net_handle_tcp` SYN+ACK ack-validation correct) — purely a delivery fix. No filter/ring-size change. Build 623,976 → **624,056 B** (+80 B). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5. multiboot2 ELF64 OK. (commit `4c8e972`)
+
+### Burned (bite-4) — 2026-05-25 → FALSIFIED (`missed` rose 158 → 176)
+
+🔥 `1327_TCP_FAIL_Again.jpg`, this time with the on-LAN MBP peer up + the user's controlled pcap/server-log verdict (`agnos-lan-probe-20260525-155754`). FB: `arp: REPLY gw_mac=212:106:145:206:112:96` → `net: L2 OK` → `tcp: connect on-LAN 192.168.1.121:80` → `net: LAN-TCP FAIL` → `tcp: connect 1.1.1.1:80` → `net: L3+TCP FAIL`; trailing `r8169: tx_ok=9 rx_ok=144 tx_err=0 rx_err=0 missed=176 align=0 rx_uc=5 rx_bc=74 rx_mc=65`. **The rubric's "`missed` stays high" branch fired — it went 158 → 176 (UP).** The drain loop alone can't relieve starvation: a 64-frame drain budget can only pull the **16 descriptors that physically exist**, so a burst between `hlt`-spaced polls still overflows. The user's probe is dispositive — at an endpoint we own and log, no gateway/NAT/Cloudflare: AGNOS sent the SYN, our kernel sent SYN+ACK to AGNOS's MAC, AGNOS never ACK'd (`UNICAST RX of SYN+ACK : 0`). ⇒ the pre-committed deepen-the-ring lever is the fix.
+
+### Fixed — bite-5: deepen the RX ring 16 → 64 (`kernel/core/r8169.cyr`)
+
+The bite-4-rubric pre-committed lever. bite-4 proved the bottleneck is **ring capacity, not servicing logic** — and 16 descriptors was an outlier vs all prior art (Linux `NUM_RX_DESC=256`, FreeBSD/OpenBSD 256). A LAN-chatter burst (74 bcast + 65 mcast in the probe window) overruns a 16-deep ring within one `hlt`-spaced poll gap, dropping the clean unicast SYN+ACK for lack of a free descriptor (`missed=176`, `rx_err=0 align=0`; silicon `rx_uc=5` already proved the filter accepts it).
+
+- `R8169_RX_RING_SIZE` 16 → **64** — 4× burst headroom; 64×16 = 1024 B still fits one 4 KB ring page.
+- Shared `R8169_RING_MASK` (0x0F) split into `R8169_RX_RING_MASK` (0x3F) + `R8169_TX_RING_MASK` (0x0F) — the rings now differ in depth.
+- `r8169_rx_bufs[16]` → `[64]`; `r8169_init_rx` loop bound + EOR-slot keyed to `R8169_RX_RING_SIZE`; `r8169_poll` error-skip walk budget 16 → `R8169_RX_RING_SIZE`.
+- **TX untouched** (tx_err=0, never overflowed) — stays 16. No filter/driver-config change, RX buffering depth only — keeps the deepen-ring result unconfounded against the (now-landed) drain loop.
+
+Build 624,056 → **624,488 B** (+432 B). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (all 5 backends reach shell — zero regression; r8169 path is iron-only, QEMU uses virtio_net). multiboot2 ELF64 OK. `build/agnos` reflects HEAD. VERSION untouched (1.32.7 open). NOT auto-proposed per [[feedback_iron_burns_block_other_work]]. **Rubric**: trailing `r8169: … missed=N …` — `missed` collapses toward 0 ⇒ the deeper ring absorbed the burst (+ `net: LAN-TCP OK` if the MBP peer is up = the win). If `missed` stays high at depth 64 ⇒ the drop is NOT a connect-window overflow → re-baseline to chip-side delivery (below the ring) or `tcp_connect` poll-cadence (tighten the post-SYN loop, drop the `arch_wait` gap).
 
 ## [1.32.6] — 2026-05-25 (r8169 RX — **gateway L2 reachability PROVEN on iron** via RFC-826 ARP sender-snoop; CPlusCmd `Normal_mode` restored; unicast-class TCP RX carries to 1.32.7)
 
