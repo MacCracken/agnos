@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.32.5] — 2026-05-24 (r8169 RX broadcast+unicast delivery cycle — TX proven on iron, RX accept-filter re-derived multi-source)
+
+### Context
+
+The `1324_tcp_capture.pcapng` burn (2026-05-24 ~18:55 PDT) closed the 1.32.4 TX-vs-RX disambiguator: AGNOS's broadcast ARP request egressed the wire byte-correct (`b0:41:6f:0c:e4:25 > ff:ff:ff:ff:ff:ff who-has 192.168.1.1 tell 192.168.1.222`), proving r8169 **TX works on iron**. The gateway's unicast reply was invisible from the capture vantage (a regular LAN host, not a SPAN/mirror port), so combined with Attempt 102's Linux proof (gateway unicast-replies to this exact frame, Linux RX delivers it) + the cross-era multicast-only RX signature (Attempts 97–103 delivered `01:00:5e` multicast only), the bug isolates to **r8169 RX dropping broadcast + unicast classes; multicast passes.** Since 2 KB RX buffers exceed the 1500 MTU, every accepted frame is single-descriptor — so the class-selective drop is at the chip's **L2 accept filter**, before the ring. Multi-source re-derivation (FreeBSD/OpenBSD/NetBSD `re_rxeof`/`re_set_rxmode`, iPXE `realtek.c`, Linux VER_46 erratum) at [`agnosticos/docs/development/r8169-rx-path-audit.md` § 1.32.5 addendum](https://github.com/MacCracken/agnosticos/blob/main/docs/development/r8169-rx-path-audit.md).
+
+### Changed — `kernel/core/r8169.cyr` RX accept filter
+
+- **Added AAP (accept-all-physical / promiscuous) to the RxConfig accept mask** — `accept = AAP | AB | AM | APM` (RxConfig `0xEF00 | 0x0F = 0xEF0F`, was `0xEF0E`). Matches iPXE `realtek_open`'s **unconditional** RCR low-nibble `0x0F`; iPXE is the pure-poll from-scratch DMA-ring analog that runs this chip family promiscuous-by-default for PXE/DHCP. On the RTL8168H stepping (mac_version 46) the per-address + broadcast accept path is known-quirky (Linux VER_46 erratum: "filters unicast eapol unless allmulti enabled"); AAP bypasses the L2 accept filter entirely so the broadcast OFFER + unicast ARP reply reach the ring. Also serves as a **bisector** — if RX still drops with AAP set, the fault is downstream of the filter. The BSDs gate ALLPHYS behind `IFF_PROMISC`; AAP-by-default is the iPXE bring-up convention, revisit at hardening.
+
+### Fixed — `kernel/core/r8169.cyr` `r8169_poll`
+
+- **Removed the unconditional FS|LS discard gate.** FreeBSD `re_rxeof` + OpenBSD `re_rxeof` gate the SOF|EOF requirement behind `RL_FLAG_JUMBOV2` only; iPXE `realtek_poll` checks OWN + RES only. For non-jumbo single-descriptor frames (our case — 2 KB buffers > MTU) every accepted frame has FS&LS both set, so the gate never fired for legit traffic but over-gated relative to all non-Linux prior art. OWN-bit handoff already guarantees frame completion when the chip clears OWN.
+
+Build 621,816 B (1.32.4 Attempt 103) → **621,704 B** (−112 B). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 + `scripts/tcp-listen-smoke.sh` 1/2 (baseline match; scenario-1 SLIRP-RX gap iron-only). multiboot2 ELF64 OK. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. **Iron Attempt 104 PENDING USER BURN** — not auto-proposed per [[feedback_iron_burns_block_other_work]]; falsification rubric at [`iron-nuc-zen-log.md#tracker-1325-cycle`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
+
 ## [1.32.4] — 2026-05-24 (networking iron-isolation cycle — opened on the DHCP-OFFER-downstream 10-bundle, pivoted to a STATIC-IP + ARP probe, CLOSED having PROVEN AGNOS frame construction wire-correct on Linux and ISOLATED the iron failure to r8169 RX delivery. The bug survives; the cycle's gain is the isolation + audit closure, not a green burn.)
 
 ### Context
@@ -114,10 +130,11 @@ A U/L-bit flip (`b0→b2`) was added to dodge a hypothesized router IP-source-gu
 
 - **Attempt 101** (2026-05-23) PARTIAL FALSIFIED — STATIC-IP + ARP probe; ARP-to-gateway timed out → bug is below DHCP (L1/L2/L3).
 - **Attempt 102** (2026-05-24) FALSIFIED — LAA build + ARP byte-order fix + outbound routing; ARP still timed out. Boot-to-shell byte-clean; **drive-swap topology-independence validated** (AGNOS boot drive → internal NVMe slot, Linux → SATA WD Blue) with zero hardcoded-drive assumptions.
+- **Attempt 103** (2026-05-24 ~17:24 PDT) FALSIFIED — EEPROM `b0` MAC build (LAA removed, 621,816 B, HEAD `18a6fc4`); ARP STILL timed out (`net: STATIC .222` → `arp: TIMEOUT` → `net: L1/L2 FAILED`, shell v1.32.4 reached byte-clean). Exactly the pre-burn rubric's falsification branch: with `b0` matching the `arp-probe-raw` the gateway answered on Linux, the **filter MAC is EXONERATED** → bug is purely r8169 RX delivery on iron. Photo `attempt-103-agnos-1.32.4-eeprom-b0-mac-arp-timeout-rx-isolated.jpg`.
 
 ### Outcome
 
-Bug survives, but the cycle's gain is structural: the iron failure is now **isolated to r8169 RX delivery** (the reply reaches the PHY but not `r8169_poll`), with construction + TX + gateway-replies-to-us all proven on Linux and the entire chip-init audit surface closed. **Next** (Attempt 103, EEPROM `b0`, 621,816 B, PENDING USER BURN): if ARP still times out, the filter MAC is exonerated and the next move is MMIO / descriptor-DMA observability on the RX ring — not another construction/chip-init audit.
+Bug survives, but the cycle's gain is structural: the iron failure is now **isolated to r8169 RX delivery** (the reply reaches the PHY but not `r8169_poll`), with construction + TX + gateway-replies-to-us all proven on Linux and the entire chip-init audit surface closed. **Attempt 103 (EEPROM `b0`, 621,816 B) confirmed the falsification branch on iron**: ARP still timed out with the EEPROM MAC, so the filter MAC is exonerated and the next move is MMIO / descriptor-DMA observability on the RX ring — not another construction/chip-init audit. The clean TX-vs-RX disambiguator is a second-machine `tcpdump -nn -e arp` on a mirrored switch port during a burn (archaemenid can't sniff its own boot).
 
 ---
 

@@ -572,8 +572,26 @@ fn r8169_init_tx() {
     r8169_write32(R8169_REG_MAR4, 0xFFFFFFFF);
 
     # RxConfig final write — profile (FIFOTHRESH=7 | MAXDMA=7 | EARLYOFFV2)
-    # OR accept bits (AB | AM | APM). Single write, BEFORE CR.RE rises.
-    var accept = R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
+    # OR accept bits. Single write, BEFORE CR.RE rises.
+    #
+    # 1.32.5 — add AAP (accept-all-physical / promiscuous, bit 0). Matches
+    # iPXE realtek_open's UNCONDITIONAL RCR low-nibble 0x0F (AAP|APM|AM|AB);
+    # iPXE is the pure-poll from-scratch DMA-ring analog and runs this chip
+    # family promiscuous-by-default for PXE/DHCP — the same workload class as
+    # our bring-up. On the RTL8168H stepping (mac_version 46) the per-address
+    # + broadcast accept path drops BROADCAST (DHCP OFFER) + UNICAST (gateway
+    # ARP reply) while MULTICAST passes — the signature proven across iron
+    # Attempts 97-103 (RX ring delivered 01:00:5e multicast only). TX is
+    # proven on the wire (1324_tcp_capture.pcapng). AAP bypasses the chip's
+    # L2 accept filter entirely, so the gateway's unicast ARP reply + the
+    # broadcast OFFER reach the ring regardless of the H-stepping filter
+    # quirk (cf. Linux VER_46 erratum "filters unicast eapol unless allmulti
+    # enabled"). Also a BISECTOR: if RX still drops with AAP set, the fault
+    # is DOWNSTREAM of the filter (descriptor OWN handoff / DMA / ring), not
+    # the accept mask. The BSDs gate ALLPHYS behind IFF_PROMISC; AAP-by-
+    # default is the iPXE bring-up convention, not a Linux/BSD production
+    # default — acceptable for single-NIC bring-up, revisit at hardening.
+    var accept = R8169_RXCFG_AAP | R8169_RXCFG_AB | R8169_RXCFG_AM | R8169_RXCFG_APM;
     r8169_write32(R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS | accept);
 
     # --- 10. Clear missed-packet counter ---------------------------
@@ -633,12 +651,17 @@ fn r8169_poll(buf, maxlen) {
             continue;
         }
 
-        # Single-segment frame must have both FS and LS set.
-        if ((status & R8169_FRAG_MASK) != R8169_FRAG_MASK) {
-            r8169_rx_rearm(desc);
-            r8169_rx_idx = (r8169_rx_idx + 1) & R8169_RING_MASK;
-            continue;
-        }
+        # FS|LS gate REMOVED 1.32.5. FreeBSD re_rxeof + OpenBSD re_rxeof gate
+        # the SOF|EOF (FS|LS) requirement behind RL_FLAG_JUMBOV2 ONLY; for
+        # non-jumbo operation neither BSD checks it, and iPXE realtek_poll
+        # checks OWN + RES only. Our 2KB buffers exceed the 1500 MTU, so every
+        # accepted frame is single-descriptor with FS&LS both set — the gate
+        # never fires for legit traffic, and discarding non-FS|LS descriptors
+        # unconditionally over-gates relative to all non-Linux prior art.
+        # OWN-bit handoff already guarantees the frame is complete when the
+        # chip clears OWN, so the length field below is trustworthy. (Paired
+        # with the AAP promiscuous change above: if AAP delivers a frame the
+        # old gate would have rejected, this lets it through.)
 
         # Good frame — extract length, strip 4-byte CRC (datasheet §6.7).
         var pkt_len = status & R8169_RDESC_LEN_MASK;
