@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.32.6] — 2026-05-25 (r8169 RX unicast delivery — ARP retransmit; APM accept-path re-derive confirms convergence)
+## [1.32.6] — 2026-05-25 (r8169 RX unicast delivery — ARP retransmit; APM re-derive lands the `rtl_rar_set` order + posted-write-flush fix)
 
 ### Context
 
@@ -23,6 +23,19 @@ The accept path is fully convergent and the software path is clean. The one real
 - **Discriminator role**: next burn sees `arp: REPLY` → the failure was a transient/elicitation miss; still times out → the unicast drop is systematic, and the deep driver APM re-derive (multi-source) is queued as 1.32.6 bite 2.
 
 Build 622,408 B (1.32.5) → **622,560 B** (+152 B, retransmit loop). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5. multiboot2 ELF64 OK. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. `build/agnos` reflects HEAD. NOT auto-proposed per [[feedback_iron_burns_block_other_work]] — the next burn tests it.
+
+### bite 2 — deep driver APM re-derive: `rtl_rar_set` order + posted-write flush
+
+The LX2 burn (`1326_LX2_Still_No_Gate.jpg`) fired the discriminator's **systematic** branch: FB read `net: L2 RX ALIVE rx=15 arp_in=11 arp_ans=2 -- gateway unicast reply pending`. `arp_ans=2` proves the retransmit loop egressed (AGNOS answered 2 inbound who-has-`.222` queries), `arp_in=11` proves the RX ring delivered 11 broadcast ARP frames — yet the gateway's *unicast* reply never cleared `arp_pending_ip`. **The unicast drop is systematic, not a transient elicitation miss.**
+
+Three parallel from-scratch re-derives (BSD triangle `if_re.c`/`re.c`/`rtl8169.c`; iPXE+Haiku+U-Boot; Linux `r8169_main.c` VER_46 + datasheet + erratum git-history) converged. Reconciled against AGNOS's actual code, the load-bearing reframe and the two divergences:
+
+- **Reframe — broadcast/multicast delivery does NOT prove the accept nibble engages.** `MAR=all-1s` (allmulti) makes BROADCAST pass via the multicast hash (`ff:ff:ff:ff:ff:ff` is the all-1s hash bucket), independent of the RxConfig accept bits. So "broadcast + multicast in" is consistent with the *entire accept nibble being inert* — and UNICAST (I/G bit clear) is the only class that must transit the physical-match (APM/AAP) path. Decisive corroboration: Linux commit `efa5f1311c49` (force-allmulti for VER_46 unicast) was **reverted** (`6a26310273c3`) after the maintainer replayed the exact unicast frame to the exact MAC on the exact chip and it was received — so a *correctly-initialized* VER_46 receives unicast without allmulti. The symptom is an init-protocol bug, not a missing workaround.
+- **Fix 1 — IDR write-back order + flush (`r8169.cyr:520-540`).** The write-back was present and at the right location, but the *protocol* diverged from Linux `rtl_rar_set` (`r8169_main.c:2559-2573`): AGNOS wrote IDR0 (low half) first, IDR4 (high half) second, with no readback between. Linux writes **MAC4 (high) first, `rtl_pci_commit` readback, then MAC0 (low), readback** — the low-word write latches the 6-byte physical-match filter, so the high two bytes must already be resident, and the readback prevents posted-write reordering on fast PCIe from latching a torn address. A torn unicast filter drops the gateway's unicast reply while broadcast (no IDR consult) + multicast (MAR hash) still pass — the exact iron signature. Reordered to high-first with a flush after each write.
+- **Fix 2 — post-enable RxConfig clean full write (`r8169.cyr:660-668`).** Per Linux commit `05212ba8132b`, RxConfig writes issued while RX is *disabled* are silently dropped — so AGNOS's pre-`CR.RE` write was a no-op, and the post-`CR.RE` **read-modify-write** preserved whatever reset-value profile bits the readback returned, meaning the profile word (FIFOTHRESH | MAXDMA | EARLYOFFV2) may never have landed. Replaced the RMW with one clean full write of `RXCFG_DEFAULTS | accept` post-enable (mirroring Linux `rtl_init_rxcfg` + `rtl_set_rx_mode`, both called after `ChipCmd` enable in `rtl_hw_start:4124-4128`), followed by a readback commit.
+- **Comment hygiene** — corrected the stale CPlusCmd block (`r8169.cyr:59-64`) that claimed `RXENB|TXENB` are "LOAD-BEARING"; the code (correctly, per the bite-6 correction) writes only `MULRW`. Per [[feedback_audit_re_derive_dont_validate_comments]].
+
+Build 622,560 B (bite 1) → **622,544 B** (−16 B; RMW arithmetic removed, readback flushes + reorder added). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (all backends reach shell — no boot regression; r8169 path is iron-only, QEMU uses virtio_net). multiboot2 ELF64 OK. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. `build/agnos` reflects working tree. NOT auto-proposed per [[feedback_iron_burns_block_other_work]] — the next burn tests it. Discriminator for the next burn: FB shows `arp: REPLY gw_mac=…` + `net: L2 OK` → the rar_set order/flush was load-bearing; still `reply pending` → unicast drop is below the accept+filter layer (next escape: the hardware tally-counter `rx_ucasts` readback at `0x28` to localize definitively, but that is instrumentation and stays deferred per [[feedback_no_instrumentation_means_no_instrumentation]] until the convergent behavioral levers are exhausted).
 
 ## [1.32.5] — 2026-05-25 (r8169 RX — broadcast + multicast delivery PROVEN on iron; honest L2 RX self-test; unicast carries to next cycle)
 

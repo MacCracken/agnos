@@ -56,11 +56,14 @@ var R8169_CR_RST            = 0x10;     # Reset
 var R8169_CR_RE             = 0x08;     # Receiver enable
 var R8169_CR_TE             = 0x04;     # Transmit enable
 
-# CPlusCmd (word at 0xE0) — per FreeBSD if_rlreg.h:500-514 and
-# iPXE realtek.c:1076. We set MULRW | RXENB | TXENB. The 32-bit cmdstat
-# descriptor ring IS the C+ ring; RXENB|TXENB are LOAD-BEARING.
-var R8169_CPLUS_TXENB       = 0x0001;
-var R8169_CPLUS_RXENB       = 0x0002;
+# CPlusCmd (word at 0xE0) — per FreeBSD if_rlreg.h + Linux r8169_main.c.
+# On the 8168H (mac_version 46) we write ONLY MULRW (bit 3) — see the
+# bite-6 CPlusCmd correction in r8169_init_tx step 1. Bits [1:0] are the
+# INTT interrupt-moderation field on the gigabit 8168, NOT a datapath
+# enable; RX/TX are gated solely by CR.RE|CR.TE. The TXENB/RXENB names
+# below are the LEGACY 8139C+ register map, kept for reference only.
+var R8169_CPLUS_TXENB       = 0x0001;   # legacy 8139C+ only — NOT used on 8168H
+var R8169_CPLUS_RXENB       = 0x0002;   # legacy 8139C+ only — NOT used on 8168H
 var R8169_CPLUS_MULRW       = 0x0008;
 
 # 9346CR (EEPROM command, byte at 0x50) — mode field is bits 7:6.
@@ -517,11 +520,28 @@ fn r8169_init_tx() {
     var cpc = R8169_CPLUS_MULRW;
     r8169_write16(R8169_REG_CPLUSCMD, cpc);
 
-    # --- 2. IDR writeback (Cfg9346-wrapped) -------------------------
+    # --- 2. IDR writeback (Cfg9346-wrapped, Linux rtl_rar_set protocol) ---
     #
-    # The reset preserves IDR via EEPROM autoload, but FreeBSD re-writes
-    # them on every init (line 3197-3200) — defensive against firmware
-    # tools that clear the chip MAC between probe and bringup.
+    # The reset preserves IDR via EEPROM autoload, but FreeBSD + Linux
+    # re-write them on every init (FreeBSD re_init_locked:3197-3200;
+    # Linux rtl_rar_set r8169_main.c:2559-2573) — defensive against
+    # firmware tools that clear the chip MAC between probe and bringup.
+    #
+    # 1.32.6 APM re-derive (3-source convergence, BSD/iPXE/Linux): the
+    # ORDER + the posted-write FLUSH are load-bearing for the unicast
+    # (AcceptMyPhys) filter. Linux rtl_rar_set writes MAC4 (the high half,
+    # bytes 4-5) FIRST, issues an rtl_pci_commit (a readback that flushes
+    # the posted MMIO write), THEN writes MAC0 (the low half, bytes 0-3)
+    # and commits again. The LOW-word (IDR0) write is what latches the
+    # 6-byte physical-match filter, so the high two bytes MUST already be
+    # resident in IDR4 at that instant — writing IDR0 first (the prior
+    # AGNOS order) can latch the filter against a half-updated address.
+    # Without a readback between the two writes, posted-write reordering on
+    # fast PCIe can produce the same torn latch. A torn unicast filter
+    # drops the gateway's UNICAST ARP reply (dst = our MAC) while BROADCAST
+    # (never consults IDR) + MULTICAST (rides the MAR hash) still pass —
+    # the exact iron signature seen since the RxMaxSize fix let frames flow.
+    # Match Linux byte-for-byte: high half + commit, low half + commit.
     var mac_lo = load8(&r8169_mac + 0)
     | (load8(&r8169_mac + 1) << 8)
     | (load8(&r8169_mac + 2) << 16)
@@ -529,8 +549,10 @@ fn r8169_init_tx() {
     var mac_hi = load8(&r8169_mac + 4)
     | (load8(&r8169_mac + 5) << 8);
     r8169_cfg_unlock();
-    r8169_write32(R8169_REG_IDR0, mac_lo);
-    r8169_write32(R8169_REG_IDR4, mac_hi);
+    r8169_write32(R8169_REG_IDR4, mac_hi);          # HIGH half first (rtl_rar_set order)
+    r8169_read32(R8169_REG_IDR4);                    # rtl_pci_commit — flush posted write
+    r8169_write32(R8169_REG_IDR0, mac_lo);          # LOW half latches the 6-byte filter
+    r8169_read32(R8169_REG_IDR0);                    # rtl_pci_commit — flush posted write
     r8169_cfg_lock();
 
     # --- 3. RX ring base (HI then LO) -------------------------------
@@ -657,11 +679,21 @@ fn r8169_init_tx() {
     # each burned both ways and falsified; the pre-vs-post-enable timing of
     # the accept-nibble write is the one untried, four-source-convergent
     # lever. RMW (not a blind re-store) so any profile bits the chip
-    # latched at the RE edge survive and we only re-assert acceptance.
-    var rx_re = r8169_read32(R8169_REG_RXCONFIG);
-    rx_re = rx_re & (0xFFFFFFFF - 0x3F);        # clear accept byte (AAP..AcceptErr)
-    rx_re = rx_re | accept;                      # re-assert AAP|AB|AM|APM
-    r8169_write32(R8169_REG_RXCONFIG, rx_re);
+    # latched at the RE edge survive. 1.32.6 APM re-derive: write the FULL
+    # RxConfig word (profile + accept) post-enable as ONE clean write, NOT a
+    # readback-RMW. Per Linux commit 05212ba8132b ("set RxConfig after tx/rx
+    # is enabled"), RxConfig writes issued while RX is DISABLED are silently
+    # dropped by the chip — so the pre-CR.RE write above is a no-op, and the
+    # profile bits (FIFOTHRESH | MAXDMA | EARLYOFFV2) only take if (re)written
+    # here, post-enable. The old RMW preserved whatever reset-value high bits
+    # the readback returned, so on a stepping that ignored the pre-enable
+    # write the PROFILE word may never have landed at all — leaving the RX
+    # FIFO/DMA on reset defaults. Linux writes the profile (rtl_init_rxcfg)
+    # AND the accept bits (rtl_set_rx_mode) both AFTER ChipCmd enable
+    # (rtl_hw_start:4124-4128); mirror that with one clean full write, then a
+    # readback commit to flush the posted write before we leave bring-up.
+    r8169_write32(R8169_REG_RXCONFIG, R8169_RXCFG_DEFAULTS | accept);
+    r8169_read32(R8169_REG_RXCONFIG);            # rtl_pci_commit — flush posted write
 
     # --- 12. Mask all interrupts (pure-poll mode) -----------------
     #
