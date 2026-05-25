@@ -6,6 +6,12 @@ var net_pkt[256];
 var arp_cache_ip = 0;
 var arp_cache_mac[8];
 var arp_pending_ip = 0;  # Security: track which IP we sent an ARP request for
+# Count of ARP replies the responder has TX'd. A live signal for the boot
+# self-test: a non-zero value is proof the full inbound path fired (RX
+# delivered a request -> net_handle_arp matched our IP -> we sent a reply).
+# 1325 attempt_4 pcap: this round-trip happens on iron while the
+# gateway-unicast-reply gate times out, so the FB must report it.
+var net_arp_replies_sent = 0;
 var net_rx_pkt[256];
 var net_udp_buf[256];
 var net_udp_buf_len = 0;
@@ -590,6 +596,7 @@ fn net_handle_arp(pkt, len) {
         store8(p + off + 26, (requester_ip >> 8) & 0xFF);
         store8(p + off + 27, requester_ip & 0xFF);
         nic_send(p, off + 28);
+        net_arp_replies_sent = net_arp_replies_sent + 1;
     }
     return 0;
 }

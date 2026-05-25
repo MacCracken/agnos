@@ -683,8 +683,19 @@ if (vnet_active != 0 || nic_ready() != 0) {
     kprintln("arp: request -> 192.168.1.1", 27);
     var arp_start = timer_ticks;
     var arp_got = 0;
+    # Honest-self-test counters (1325): record what RX actually delivered
+    # during the gateway-probe wait, not just whether the gateway replied.
+    # attempt_4 pcap proved broadcast RX + the ARP responder fire on iron
+    # while THIS very gate times out -- the old flat "L1/L2 FAILED" verdict
+    # hid a live NIC for the whole arc. rx_frames = any frame net_poll
+    # handled; arp_seen = inbound ARP frames; net_arp_replies_sent (net.cyr)
+    # = replies we TX'd in response.
+    var rx_frames = 0;
+    var arp_seen = 0;
     while ((timer_ticks - arp_start) < 500) {
-        net_poll();
+        var pr = net_poll();
+        if (pr > 0) { rx_frames = rx_frames + 1; }
+        if (pr == 1) { arp_seen = arp_seen + 1; }
         if (arp_pending_ip == 0) { arp_got = 1; break; }
         arch_wait();
     }
@@ -716,8 +727,21 @@ if (vnet_active != 0 || nic_ready() != 0) {
             kprintln("net: L3+TCP FAIL -- SYN sent but no SYN+ACK", 43);
         }
     } else {
-        kprintln("arp: TIMEOUT -- gateway did not reply within ~5s", 48);
-        kprintln("net: L1/L2 FAILED -- cannot reach gateway, skipping L3 test", 59);
+        # Gateway unicast reply never arrived -- but that is NOT "RX dead".
+        # Report what RX did so the FB distinguishes a silent NIC from a
+        # live one still waiting on one unicast round-trip.
+        kprintln("arp: gateway reply not seen within ~5s", 38);
+        if (rx_frames > 0) {
+            kprint("net: L2 RX ALIVE rx=", 20);
+            kprint_num(rx_frames);
+            kprint(" arp_in=", 8);
+            kprint_num(arp_seen);
+            kprint(" arp_ans=", 9);
+            kprint_num(net_arp_replies_sent);
+            kprintln(" -- gateway unicast reply pending", 33);
+        } else {
+            kprintln("net: L2 RX SILENT -- 0 frames in ~5s", 36);
+        }
     }
 }
 
