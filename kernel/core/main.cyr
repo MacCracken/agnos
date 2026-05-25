@@ -773,6 +773,23 @@ if (vnet_active != 0 || nic_ready() != 0) {
         } else {
             kprintln("net: L3+TCP FAIL -- SYN sent but no SYN+ACK", 43);
         }
+
+        # --- r8169 hardware accept-counter readback (1.32.7 bite-3) ----
+        # Both unicast handshakes above have now run (on-LAN peer + 1.1.1.1).
+        # Read the chip's OWN silicon tally counters (FreeBSD re_sysctl_stats /
+        # RTL8168 datasheet 6.8.4) to settle the filter-vs-delivery question the
+        # inference-only burns could not: rx_uc = unicast frames the MAC accepted
+        # via physical-match, rx_bc/rx_mc = broadcast/multicast accepted.
+        #   rx_uc=0 with rx_bc/rx_mc>0 -> the physical-match filter rejects every
+        #     unicast frame (IDR/APM not engaging on this VER_46 despite the
+        #     post-CR.RE re-assert) -- NOT the ring.
+        #   rx_uc>0 -> the MAC accepts unicast; the drop is in our ring/poll
+        #     delivery (broadcast survives the same ring -- investigate why).
+        # Ground truth from silicon, not inference. r8169-only (guarded; QEMU
+        # uses virtio_net and has no RTL8168 to count).
+        if (r8169_present == 1) {
+            r8169_print_stats();
+        }
     } else {
         # Gateway unicast reply never arrived -- but that is NOT "RX dead".
         # Report what RX did so the FB distinguishes a silent NIC from a
