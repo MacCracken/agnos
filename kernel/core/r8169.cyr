@@ -503,12 +503,18 @@ fn r8169_init_tx() {
     # --- 1. CPlusCmd FIRST ------------------------------------------
     #
     # FreeBSD re_init_locked:3155 — "We must configure the C+ register
-    # before all others." Bits: MULRW (PCI multi-read/write) +
-    # RXENB (C+ receive enable) + TXENB (C+ transmit enable). These
-    # last two are LOAD-BEARING — the 32-bit cmdstat ring is the C+ ring;
-    # without CPRX|CPTX the chip processes descriptors in legacy mode
-    # and the RX path stays silent.
-    var cpc = R8169_CPLUS_MULRW | R8169_CPLUS_RXENB | R8169_CPLUS_TXENB;
+    # before all others." On the 8168H (mac_version 46) write ONLY
+    # PCIMulRW (bit 3). The prior code OR'd in 0x0001|0x0002 believing
+    # them to be "C+ RX/TX enable" — that is the LEGACY 8139C+ register
+    # map. On the gigabit 8168 family bits [1:0] are the INTT interrupt-
+    # moderation timer select (Linux CPCMD_MASK/INTT_MASK = GENMASK(1,0),
+    # r8169_main.c), NOT a datapath enable. RX/TX are gated solely by
+    # CR.RE|CR.TE (step 11). FreeBSD only sets RXENB|TXENB on the !MACSTAT
+    # (8139C+) branch; the 8168H has MACSTAT, so it does NOT set them.
+    # Re-derived multi-source (FreeBSD if_re.c / Linux r8169_main.c) per
+    # [[feedback_audit_re_derive_dont_validate_comments]] — the old
+    # "CPRX|CPTX load-bearing" comment was the nine-burn CPlusCmd trap.
+    var cpc = R8169_CPLUS_MULRW;
     r8169_write16(R8169_REG_CPLUSCMD, cpc);
 
     # --- 2. IDR writeback (Cfg9346-wrapped) -------------------------
@@ -539,12 +545,27 @@ fn r8169_init_tx() {
     r8169_write32(R8169_REG_TNPDS_HI, (r8169_tx_ring_phys >> 32) & 0xFFFFFFFF);
     r8169_write32(R8169_REG_TNPDS_LO, r8169_tx_ring_phys & 0xFFFFFFFF);
 
-    # --- 5. MISC RXDV_GATED clear (8168G_PLUS) ----------------------
+    # --- 5. MISC RXDV_GATED clear (8168G_PLUS) + mandatory settle ---
     #
     # FreeBSD re_init_locked:3216-3220 — without this, the chip's RX
-    # validator gates incoming frames on G+ silicon.
+    # validator gates incoming frames on G+ silicon. This is THE one
+    # RX-datapath-load-bearing step on the 8168H (multi-source: Linux
+    # rtl_disable_rxdvgate, OpenBSD RL_FLAG_RXDV_GATED, U-Boot clears it
+    # explicitly for "DHCP failures after kernel reboots" — exactly the
+    # archaemenid warm-boot-from-Linux signature).
     var misc = r8169_read32(R8169_REG_MISC);
     r8169_write32(R8169_REG_MISC, misc & (0xFFFFFFFF - R8169_MISC_RXDV_GATED));
+    # Linux pairs the clear with fsleep(2000) = ~2 ms — the RX validator
+    # needs time to fully open the gate BEFORE CR.RE rises (step 11), or
+    # RX comes up with the gate still half-closed and delivers nothing
+    # while TX (which never consults the gate) egresses fine. We have no
+    # ms-granularity sleep (timer is 100 Hz / 10 ms/tick), so spin on a
+    # non-posted MMIO read like r8169_reset does. Each read round-trips
+    # the PCIe link (~0.5-1 µs, CPU-speed-independent); 8000 reads ≈ 4-8
+    # ms, comfortably past Linux's 2 ms even on fast Zen silicon.
+    for (var s = 0; s < 8000; s = s + 1) {
+        r8169_read32(R8169_REG_MISC);
+    }
 
     # --- 6. TxConfig ------------------------------------------------
     r8169_write32(R8169_REG_TXCONFIG, R8169_TXCFG_DEFAULTS);
