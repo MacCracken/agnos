@@ -551,10 +551,19 @@ fn r8169_init_tx() {
 
     # --- 7. Max RX size (word at 0xDA) ------------------------------
     #
-    # 0x4000 = 16384, effectively "no max" — covers jumbo frames if the
-    # caller ever asks for them; the per-descriptor BUF_SIZE (2048) is
-    # the real cap.
-    r8169_write16(R8169_REG_RMS, 0x4000);
+    # RxMaxSize is a 13-14 bit field on the 8168 (bits [13:0]). The prior
+    # 0x4000 set bit 14 — OUTSIDE the field — so the chip reads RMS = 0,
+    # i.e. "max RX packet size 0" → every inbound frame exceeds the limit
+    # and is rejected at the RX engine. TX never consults RMS, which is
+    # exactly the iron signature: TX egresses (1324/1325 pcaps) while RX
+    # is silent. NO prior-art driver writes 0x4000 here: Linux writes
+    # RX_BUF_SIZE = 0x05F3 (1523), FreeBSD writes the descriptor buffer
+    # length. 0x05F3 covers a full 1518-byte Ethernet frame (1500 MTU +
+    # 14 hdr + 4 CRC) and fits the field. The malformed 0x4000 was
+    # introduced at iron Attempt 97 ("effective-disable") while the FS|LS
+    # gate + wrong RxConfig profile were still masking it; those are now
+    # fixed, so this surfaces as a live RX-silent candidate.
+    r8169_write16(R8169_REG_RMS, 0x05F3);
 
     # --- 8. Max TX size (byte at 0xEC, in 128-byte units) -----------
     #
