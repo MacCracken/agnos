@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.32.7] — 2026-05-25 (r8169 RX — IDR physical-match filter re-asserted post-`CR.RE`; the unicast-RX lever bite-2's confounded "exoneration" never tested)
+## [1.32.7] — 2026-05-25 (r8169 RX — bite-1 IDR post-`CR.RE` re-assert BURNED→FALSIFIED → L2 accept/filter layer genuinely exonerated; bite-2 on-LAN unicast-TCP discriminator splits raw unicast RX from gateway/off-LAN routing)
 
 ### Context
 
@@ -21,6 +21,20 @@ bite-7 (1.32.5) proved this stepping **silently drops filter-config writes issue
 - **Bisector role**: if the gateway's unicast ARP reply / SYN+ACK now lands → the pre-enable IDR write was the dropped lever. If unicast STILL drops → the accept+filter layer is genuinely exonerated (not confounded this time), the bug is below it, and the next escape is the hardware `rx_ucasts` tally counter (reg `0x28`) — instrumentation, deferred per [[feedback_no_instrumentation_means_no_instrumentation]] until this last behavioral lever is spent.
 
 Build 622,560 B (1.32.6) → **622,656 B** (+96 B, post-enable IDR re-assert). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (all backends reach shell — no boot regression; r8169 path is iron-only, QEMU uses virtio_net). multiboot2 ELF64 OK. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. `build/agnos` reflects HEAD. NOT auto-proposed per [[feedback_iron_burns_block_other_work]] — the next burn tests it. Rubric: FB reads `net: L3+TCP OK -- outbound TCP handshake established`, or at minimum the gateway's unicast ARP reply clears `arp_pending` via the *unicast* path (not the broadcast snoop).
+
+### Burned (bite-1) — 2026-05-25 → FALSIFIED
+
+🔥 `1327_TCP_Failure.jpg`. FB byte-identical to the bite-4/6 burns: `arp: REPLY gw_mac=212:106:145:206:112:96` → `net: L2 OK -- gateway MAC cached` → `tcp: connect 1.1.1.1:80` → `net: L3+TCP FAIL -- SYN sent but no SYN+ACK`. The bisector's falsification branch fired: the post-enable IDR write is **not** the lever. **The entire L2 accept/filter layer is now genuinely exonerated** — accept nibble, AAP, CPlusCmd `Normal_mode`, and the IDR physical-match write have all been re-asserted post-`CR.RE` and unicast still drops. The defect is **below** the accept/filter layer.
+
+### Fixed — bite-2: on-LAN unicast-TCP discriminator (`net.cyr` + `main.cyr`)
+
+Rather than jump straight to the `rx_ucasts` tally instrumentation, run a **behavioral** discriminator first (user direction 2026-05-25) that splits **raw unicast RX** from **gateway/off-LAN routing** — the one thing every 1.1.1.1 burn has conflated.
+
+- `net.cyr`: new `net_peer_ip` / `net_peer_mac` / `net_peer_mac_valid` slots. `net_handle_arp` captures a **non-gateway** host that ARP-probes us (`who-has net_ip`) into them — from the host's **broadcast** who-has sender fields (RFC 826), so the peer is learned with **zero unicast RX**, exactly like the gateway. `route_next_hop_mac` resolves on-LAN traffic to the peer (previously only the gateway was resolvable on-LAN).
+- `main.cyr`: after `net: L2 OK`, a ~2 s peer-wait, then `tcp: connect on-LAN <peer>:80` → `net: LAN-TCP OK` / `net: LAN-TCP FAIL`, printed **before** the existing 1.1.1.1 test. The peer's SYN+ACK is the first unicast frame AGNOS must RX, on the same L2 segment (no gateway, no NAT), from an endpoint we own and log.
+- Harness: `agnosticos/scripts/wire-probe/mbp-arp-rx-probe.sh` rewritten from the ARP-injection probe into a logging on-LAN TCP webservice — a `:80` listener (so the MBP kernel auto-SYN+ACKs and a completed handshake is logged), pcap capture, an ARP stimulus that doubles as AGNOS's peer-discovery signal, and a pcap+log verdict. Run on the `.121` MBP during the burn.
+
+Build 622,656 → **623,928 B** (+1,272 B). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (zero regression). multiboot2 ELF64 OK. `build/agnos` reflects HEAD. VERSION untouched (1.32.7 open). NOT auto-proposed per [[feedback_iron_burns_block_other_work]]. **Discriminator rubric**: `net: LAN-TCP OK` (+ MBP `ACCEPTED` log) → raw unicast RX **works** and the 1.1.1.1 failure is **gateway/off-LAN-specific** (major re-scope); `net: LAN-TCP FAIL` (MBP pcap shows SYN-in + SYN+ACK-out, no AGNOS ACK) → unicast-RX drop **confirmed at an owned, logged endpoint** with no gateway/NAT/Cloudflare in the path → the `rx_ucasts` hardware tally (reg `0x28`) instrumentation is then justified.
 
 ## [1.32.6] — 2026-05-25 (r8169 RX — **gateway L2 reachability PROVEN on iron** via RFC-826 ARP sender-snoop; CPlusCmd `Normal_mode` restored; unicast-class TCP RX carries to 1.32.7)
 

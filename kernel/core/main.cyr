@@ -726,6 +726,41 @@ if (vnet_active != 0 || nic_ready() != 0) {
         kprintln("", 0);
         kprintln("net: L2 OK -- gateway MAC cached", 32);
 
+        # --- Internal (on-LAN) unicast TCP test FIRST (1.32.7 bite-2) ---
+        # The mbp-lan-probe harness broadcasts who-has 192.168.1.222 (us);
+        # net_handle_arp captured its IP+MAC into net_peer_* with ZERO unicast
+        # RX (broadcast sender-snoop). Connect to peer:80 over the SAME L2
+        # segment -- no gateway, no NAT. Its SYN+ACK is the FIRST unicast frame
+        # we must RX. If THIS completes, raw unicast RX works and the 1.1.1.1
+        # failure is gateway/off-LAN specific; if it ALSO fails, unicast-RX drop
+        # is confirmed at an endpoint we own and log. Give the peer ~2s to ARP
+        # us if its who-has didn't arrive during the gateway-probe window above.
+        if (net_peer_mac_valid == 0) {
+            var peer_wait = timer_ticks;
+            while ((timer_ticks - peer_wait) < 200) {
+                net_poll();
+                if (net_peer_mac_valid == 1) { break; }
+                arch_wait();
+            }
+        }
+        if (net_peer_mac_valid == 1) {
+            kprint("tcp: connect on-LAN ", 20);
+            kprint_num((net_peer_ip >> 24) & 0xFF); kprint(".", 1);
+            kprint_num((net_peer_ip >> 16) & 0xFF); kprint(".", 1);
+            kprint_num((net_peer_ip >> 8) & 0xFF); kprint(".", 1);
+            kprint_num(net_peer_ip & 0xFF); kprint(":80", 3);
+            kprintln("", 0);
+            var lconn = tcp_connect(net_peer_ip, 80, 49153);
+            if (lconn >= 0) {
+                kprintln("net: LAN-TCP OK -- on-LAN unicast handshake established", 55);
+                tcp_close(lconn);
+            } else {
+                kprintln("net: LAN-TCP FAIL -- on-LAN SYN sent but no SYN+ACK", 51);
+            }
+        } else {
+            kprintln("net: no on-LAN peer (run mbp-lan-probe during boot)", 51);
+        }
+
         # Outbound TCP test: 1.1.1.1:80. SYN+ACK proves r8169 TX unicast
         # to gateway-MAC, off-LAN routing, r8169 RX of unicast reply, and
         # the TCP three-way handshake all at once. The "proof that the
