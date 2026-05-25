@@ -5,7 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.32.5] — 2026-05-24 (r8169 RX broadcast+unicast delivery cycle — TX proven on iron, RX accept-filter re-derived multi-source)
+## [1.32.5] — 2026-05-25 (r8169 RX — broadcast + multicast delivery PROVEN on iron; honest L2 RX self-test; unicast carries to next cycle)
+
+### Cycle close
+
+**The defining win: first inbound frame acted upon on iron in the entire 1.32.x networking arc.** After 7 falsified burns chasing "RX silent," the **post-RX-enable accept-filter re-assert (bite-7)** broke through — AGNOS received a broadcast ARP and egressed a correct unicast reply on the wire (`1325_pcap_attempt_4`), proving the full RX → `r8169_poll` → `net_poll` → `net_handle_arp` → reply-TX chain is healthy. The **honest L2 RX self-test** then surfaced that breakthrough on the framebuffer itself (`net: L2 RX ALIVE rx=10 arp_in=7 arp_ans=1`), retiring the "FB lied for 4 days" diagnostic defect. Broadcast + multicast RX are PROVEN; the cycle's stretch goal — **unicast (APM-class) RX delivery** — carries forward to the next cycle (leading bite: restore the post-reset IDR0-5 write-back that bite H removed, untried in combination with the now-working accept re-assert). Build **622,408 B**, cyrius 6.0.1 + gnoboot 0.4.2 unchanged, `test.sh` 4/4 + `ext2-smoke.sh` 5/5, multiboot2 OK, MVP gate green on iron.
 
 ### Context
 
@@ -43,6 +47,8 @@ Build 621,704 B (Attempt 104) → **621,768 B** (+64 B, settle spin). `scripts/t
 ### Changed — `kernel/core/main.cyr` + `kernel/core/net.cyr` honest L2 RX self-test
 
 - **The boot net self-test now reports what RX actually delivered instead of a flat pass/fail.** During the 5 s gateway-ARP-probe wait (`main.cyr:684-721`) it counts frames `net_poll()` handled (via its existing return code — no driver changes) and ARP replies the responder TX'd (`net_arp_replies_sent`, new counter at `net.cyr:592`). On a gateway-reply timeout it now prints `net: L2 RX ALIVE rx=N arp_in=M arp_ans=K -- gateway unicast reply pending` (RX is alive, only the gateway unicast round-trip is incomplete) or `net: L2 RX SILENT -- 0 frames in ~5s` (truly dead) — replacing the misleading flat `net: L1/L2 FAILED -- cannot reach gateway`. Motivated directly by `1325_pcap_attempt_4`: during the exact window the old verdict reported total L1/L2 failure, the same poll loop was receiving broadcast and answering ARP on the wire. The next burn will surface the breakthrough on the framebuffer without needing a pcap.
+
+**Iron burn `1325-agnos-1.32.5-honest-l2-rx-selftest-rx-alive-on-fb.jpg` 2026-05-25 ~02:00 PDT → RX ALIVE confirmed on the framebuffer** (build 622,408 B, HEAD `52a66f8`). The FB read `net: L2 RX ALIVE rx=10 arp_in=7 arp_ans=1 -- gateway unicast reply pending` — 10 frames delivered, 7 inbound ARP, 1 reply TX'd by AGNOS — surfacing the bite-7 broadcast-RX breakthrough without a pcap and retiring the 4-day "FB lied" defect (a partial-RX NIC no longer reads identically to a dead one). `rx=10 > arp_in=7` means 3 non-ARP frames also delivered (other ethertypes), so broadcast **and** multicast classes pass; the lone remaining gap is the gateway's *unicast* (APM-class) reply, still pending. Leading next bite: restore the post-reset IDR0-5 write-back that bite H removed — broadcast (AB, IDR-independent) delivers while unicast (APM, IDR-dependent) does not, exactly the split a zeroed-IDR unicast filter predicts (the gateway is proven to unicast-reply to this exact MAC+IP frame on Linux, so gateway-silence is ruled out).
 
 Build **622,408 B** (+512 B vs bite-7). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5 (all 5 backends reached shell — the new boot-block prints compile and don't fault). multiboot2 ELF64 OK. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. NOT auto-proposed per [[feedback_iron_burns_block_other_work]].
 
