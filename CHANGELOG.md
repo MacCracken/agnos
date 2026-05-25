@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.32.6] — 2026-05-25 (r8169 RX unicast delivery — ARP retransmit; APM accept-path re-derive confirms convergence)
+
+### Context
+
+1.32.5 proved broadcast + multicast RX on iron (bite-7 + the FB self-test); the gateway's *unicast* ARP reply stayed unseen. A from-scratch re-derive of the unicast accept path **falsified its leading hypothesis** — that bite H (1.32.3) had removed the post-reset IDR0-5 write-back. Reading the code (not the narrative, per [[feedback_audit_re_derive_dont_validate_comments]]): the write-back is **present and correct**, Cfg9346-wrapped at `r8169.cyr:520-534`, matching Linux `rtl_rar_set` — it was already in the burned 1.32.5 build. Full zero-burn audit:
+
+- **IDR0-5 write-back** (the APM unicast-filter source) — present, correct, Cfg9346-wrapped.
+- **Accept nibble `AAP|AB|AM|APM` (`0x0F`)** — written pre-`CR.RE` AND re-asserted post-`CR.RE` (bite-7). Both unicast (APM, bit 1) and promiscuous (AAP, bit 0) are set, so a unicast frame to our MAC must pass the chip's L2 filter.
+- **`net_handle_arp` reply path** (`net.cyr:556-564`) — opcode read big-endian; `sender_ip` and `arp_pending_ip` are both host-ints assembled from the same byte order, so a matching reply WOULD clear the pending request. No software bug.
+
+The accept path is fully convergent and the software path is clean. The one real divergence from all prior-art (Linux `neigh`, iPXE, lwIP `etharp`, *BSD): **AGNOS sent exactly one ARP request and never retransmitted.**
+
+### Added — `kernel/core/main.cyr` ARP request retransmit (RFC 1122 §2.3.2.1)
+
+- **Re-send the gateway ARP request ~1×/sec across the 5 s probe window** while `arp_pending_ip` stays set (`main.cyr:684-713` region). A single request that is missed or not yet elicited otherwise times out the whole window with no retry — and ARP replies are only sent in response to a request, so a missed first reply is never re-offered. 4 retransmits across the window (initial + @100/200/300/400 ticks on the 100 Hz timer). No per-retransmit FB print (functional fix, not instrumentation).
+- **Discriminator role**: next burn sees `arp: REPLY` → the failure was a transient/elicitation miss; still times out → the unicast drop is systematic, and the deep driver APM re-derive (multi-source) is queued as 1.32.6 bite 2.
+
+Build 622,408 B (1.32.5) → **622,560 B** (+152 B, retransmit loop). `scripts/test.sh` 4/4 + `scripts/ext2-smoke.sh` 5/5. multiboot2 ELF64 OK. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. `build/agnos` reflects HEAD. NOT auto-proposed per [[feedback_iron_burns_block_other_work]] — the next burn tests it.
+
 ## [1.32.5] — 2026-05-25 (r8169 RX — broadcast + multicast delivery PROVEN on iron; honest L2 RX self-test; unicast carries to next cycle)
 
 ### Cycle close

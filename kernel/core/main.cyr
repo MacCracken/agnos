@@ -692,11 +692,23 @@ if (vnet_active != 0 || nic_ready() != 0) {
     # = replies we TX'd in response.
     var rx_frames = 0;
     var arp_seen = 0;
+    # ARP request retransmit schedule (RFC 1122 §2.3.2.1). A single request
+    # that is missed or not yet elicited would otherwise time out the whole
+    # 5 s window with no retry — and ARP replies are only sent in response to
+    # a request, so a missed first reply is never re-offered. Every prior-art
+    # stack (Linux neigh, iPXE, lwIP etharp, *BSD) re-sends ~1/sec until
+    # reply/timeout. next_retx = the next tick (100 Hz timer → 100 ticks = 1 s)
+    # to re-send; 4 retransmits across the window (initial + @100/200/300/400).
+    var next_retx = 100;
     while ((timer_ticks - arp_start) < 500) {
         var pr = net_poll();
         if (pr > 0) { rx_frames = rx_frames + 1; }
         if (pr == 1) { arp_seen = arp_seen + 1; }
         if (arp_pending_ip == 0) { arp_got = 1; break; }
+        if ((timer_ticks - arp_start) >= next_retx) {
+            arp_request(net_gateway);
+            next_retx = next_retx + 100;
+        }
         arch_wait();
     }
     if (arp_got == 1) {
