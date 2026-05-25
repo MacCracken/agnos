@@ -553,15 +553,25 @@ fn net_handle_arp(pkt, len) {
     # Check operation: offset 14+6
     if (len < 42) { return 0; }
     var oper = load8(pkt + 20) * 256 + load8(pkt + 21);
-    if (oper == 2) {
-        # ARP reply: sender MAC at pkt+22, sender IP at pkt+28
+    # RFC 826: EVERY ARP packet -- request OR reply -- carries the sender's
+    # IP->MAC mapping (sender HW at +22, sender IP at +28). Learn it from all
+    # of them, not just a solicited unicast reply. The gateway broadcasts its
+    # own "who-has" queries (sender_ip = gateway, sender_mac = gateway) which
+    # we already receive as BROADCAST -- that resolves a pending gateway ARP
+    # WITHOUT the gateway's unicast reply to our request ever being delivered.
+    # Pre-fix this only cached from oper==2, so a path that delivers broadcast
+    # but not the solicited unicast reply could never learn the gateway MAC
+    # even though .1's mapping flew past us in broadcast ARP repeatedly (the
+    # iron arp_in=N count). Security posture UNCHANGED from the reply-only
+    # path: we still only accept a mapping for the exact IP we have an
+    # outstanding request for (arp_pending_ip).
+    if (arp_pending_ip != 0) {
         var sender_ip = (load8(pkt + 28) << 24) | (load8(pkt + 29) << 16) | (load8(pkt + 30) << 8) | load8(pkt + 31);
-        # Security: only accept replies matching our pending ARP request
-        if (arp_pending_ip == 0) { return 0; }
-        if (sender_ip != arp_pending_ip) { return 0; }
-        arp_cache_ip = sender_ip;
-        net_copy_buf(&arp_cache_mac, pkt + 22, 6);
-        arp_pending_ip = 0;  # Request fulfilled
+        if (sender_ip == arp_pending_ip) {
+            arp_cache_ip = sender_ip;
+            net_copy_buf(&arp_cache_mac, pkt + 22, 6);
+            arp_pending_ip = 0;  # Request fulfilled (RFC 826 sender snoop)
+        }
     }
     if (oper == 1) {
         # ARP request — reply if it's asking for our IP. Without this,
