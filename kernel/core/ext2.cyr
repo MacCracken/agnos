@@ -676,7 +676,7 @@ fn ext2_get_inode(inode_num, out_buf) {
 
 fn ext2_put_inode(inode_num, in_buf) {
     if (ext2_active == 0)   { return 0 - 1; }
-    if (ext2_write_ok == 0) { return 0 - 1; }   # WRITE arc § 10 — refuse on csum/64bit FS
+    if (ext2_write_ok == 0) { return 0 - 1; }   # refuse while write is gated (metadata_csum until bite 7; §§ 10, 14)
     if (inode_num == 0)     { return 0 - 1; }
 
     var max_inodes_in_chunk = (ext2_blocksize / 32) * ext2_inodes_per_group;
@@ -702,6 +702,10 @@ fn ext2_put_inode(inode_num, in_buf) {
     var blocks_into_table = byte_offset / ext2_blocksize;
     var off_in_block      = byte_offset - blocks_into_table * ext2_blocksize;
     var target_block      = inode_table_block + blocks_into_table;
+
+    # metadata_csum (bite 5): stamp i_checksum into in_buf before the splice
+    # so the inode lands on disk with a valid CRC32c. No-op on a non-csum FS.
+    if (ext2_csum_on != 0) { ext2_inode_csum_stamp(inode_num, in_buf); }
 
     # RMW: read the table block, splice our inode, write it back.
     if (ext2_read_block(target_block, &ext2_block_buf) != 0) { return 0 - 1; }
@@ -804,6 +808,40 @@ fn ext2_set_inode_bitmap_csum(group, bmbuf) {
     var crc = ext2_crc32c(ext2_csum_seed, bmbuf, (ext2_inodes_per_group + 7) / 8);
     ext2_store16_le(ext2_grp_off(group), 0x1A, crc & 0xFFFF);
     if (ext2_desc_size > 32) { ext2_store16_le(ext2_grp_off(group), 0x3A, (crc >> 16) & 0xFFFF); }
+    return 0;
+}
+
+# Inode checksum (1.33.1 bite 5, audit § 14.3). e2fsprogs ext2fs_inode_csum:
+# crc32c(seed, ino#_le32) → +i_generation_le32 (@100) → +the WHOLE inode
+# (inode_size bytes) with i_checksum_lo (@0x7C) and i_checksum_hi (@0x82)
+# zeroed during the crc. lo16 → 0x7C; hi16 → 0x82, but only when the inode
+# carries the extra region (inode_size > 128 AND i_extra_isize @128 >= 4 —
+# the EXT4_FITS_IN_INODE gate). _calc is non-destructive (save/zero/crc/
+# restore) for compute-and-compare; _stamp writes the result in place.
+fn ext2_inode_has_hi(inode_buf) {
+    if (ext2_inode_size <= 128) { return 0; }
+    if (ext2_load16_le(inode_buf, 128) >= 4) { return 1; }
+    return 0;
+}
+fn ext2_inode_csum_calc(inode_num, inode_buf) {
+    var has_hi = ext2_inode_has_hi(inode_buf);
+    var old_lo = ext2_load16_le(inode_buf, 0x7C);
+    var old_hi = 0;
+    ext2_store16_le(inode_buf, 0x7C, 0);
+    if (has_hi == 1) { old_hi = ext2_load16_le(inode_buf, 0x82); ext2_store16_le(inode_buf, 0x82, 0); }
+    var ile[4]; ext2_store32_le(&ile, 0, inode_num);
+    var crc = ext2_crc32c(ext2_csum_seed, &ile, 4);
+    var gle[4]; ext2_store32_le(&gle, 0, ext2_load32_le(inode_buf, 100));   # i_generation
+    crc = ext2_crc32c(crc, &gle, 4);
+    crc = ext2_crc32c(crc, inode_buf, ext2_inode_size);
+    ext2_store16_le(inode_buf, 0x7C, old_lo);                              # restore
+    if (has_hi == 1) { ext2_store16_le(inode_buf, 0x82, old_hi); }
+    return crc;
+}
+fn ext2_inode_csum_stamp(inode_num, inode_buf) {
+    var crc = ext2_inode_csum_calc(inode_num, inode_buf);
+    ext2_store16_le(inode_buf, 0x7C, crc & 0xFFFF);
+    if (ext2_inode_has_hi(inode_buf) == 1) { ext2_store16_le(inode_buf, 0x82, (crc >> 16) & 0xFFFF); }
     return 0;
 }
 
@@ -2087,6 +2125,19 @@ fn ext2_write_selftest() {
             }
             if (iok == 1) { kprintln("ext2w: ino-bitmap csum match", 28); }
             else          { kprintln("ext2w: ino-bitmap csum MISMATCH", 31); }
+        }
+
+        # bite 5: inode csum compute-and-compare on the root inode (2). calc
+        # is non-destructive, so the stored fields survive for the compare.
+        if (ext2_get_inode(2, &ext2_inode_buf) == 0) {
+            var icc = ext2_inode_csum_calc(2, &ext2_inode_buf);
+            var nok = 1;
+            if ((icc & 0xFFFF) != ext2_load16_le(&ext2_inode_buf, 0x7C)) { nok = 0; }
+            if (ext2_inode_has_hi(&ext2_inode_buf) == 1) {
+                if (((icc >> 16) & 0xFFFF) != ext2_load16_le(&ext2_inode_buf, 0x82)) { nok = 0; }
+            }
+            if (nok == 1) { kprintln("ext2w: inode2 csum match", 24); }
+            else          { kprintln("ext2w: inode2 csum MISMATCH", 27); }
         }
     }
 

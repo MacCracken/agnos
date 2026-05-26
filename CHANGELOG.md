@@ -49,6 +49,14 @@ The bitmap checksum fields live in the group descriptor and must be set whenever
 
 **Verification**: production build **671,552 B**. **`metadata_csum,64bit` image**: `blk-bitmap csum match` + `ino-bitmap csum match` — both reproduce e2fsprogs's stored bitmap checksums (the inode-bitmap span correct at `ipg/8`). **No regression**: 64bit image full W1-W5 + `e2fsck -fn` clean. **Next: bite 5** (inode `i_checksum_lo`/`i_checksum_hi` in `ext2_put_inode`).
 
+### Added — bite 5: inode checksums (`ext2.cyr`)
+
+- **`ext2_inode_csum_calc`** (non-destructive: save/zero/crc/restore) + **`ext2_inode_csum_stamp`** (writes in place) — `crc32c(seed, ino#_le32)` → `+i_generation` (@100) → `+the whole inode` (`inode_size` bytes) with `i_checksum_lo` (@0x7C) and `i_checksum_hi` (@0x82) **zeroed during the crc** per e2fsprogs `ext2fs_inode_csum`. `lo16` → 0x7C; `hi16` → 0x82, gated on **`ext2_inode_has_hi`** (`inode_size > 128 && i_extra_isize @128 >= 4` — the `EXT4_FITS_IN_INODE` rule).
+- **Hook**: `ext2_put_inode` stamps `in_buf` before the RMW splice, `csum_on`-guarded — so every inode written (`create`/`write_at`/`truncate`/`mkdir`/`unlink` link-count bumps) lands with a valid CRC32c.
+- **Self-test**: compute-and-compare on the root inode (2).
+
+**Verification**: production build **672,992 B**. **`metadata_csum,64bit` image**: `inode2 csum match` — `ext2_inode_csum_calc` reproduces e2fsprogs's inode checksum exactly. All five checksum classes now compute-and-compare clean (SB / group-desc / block-bitmap / inode-bitmap / inode). **No regression**: 64bit image full W1-W5 + `e2fsck -fn` clean. **Next: bite 6** (directory-leaf `det_checksum` + the 12-byte tail handling — the trickiest, since the rec_len walker must never reuse the tail).
+
 ## [1.33.0] — 2026-05-25 (ext2/ext4 WRITE arc OPEN — the demo→base maturity exit: filesystem mutation so state persists across reboots, not just *shown*. Audit-first per the multi-source convergent prior-art doc (agnosticos `docs/development/ext2-ext4-write-prior-art.md` — FreeBSD ext2fs primary, Linux ext2, OpenBSD, ext4 spec, e2fsprogs). Phased W1-W5: W1-W4 are QEMU `e2fsck -fn`-clean smoke gates, W5 is the iron burn (create file → power-cycle → persists). **The block-device write primitives already exist + are iron-validated** (`blk_write` → `nvme_blk_write`/`ahci_blk_write`, proven at USB-MS Attempt 87), so this arc is purely the ext2 metadata-mutation layer — zero driver work. Crash-consistency without a journal comes from ordered writes (audit § 3). Sections below land as W-phases complete.)
 
 ### Added — W1 write primitives + metadata write-back (`block.cyr`, `ext2.cyr`)

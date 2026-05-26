@@ -167,6 +167,13 @@ PY
     else
         echo "  FAIL: inode-bitmap csum mismatch"; rc=1
     fi
+
+    # Bite 5: inode checksum reproduces the on-disk value (root inode 2).
+    if strings "$LOG" | grep -q "ext2w: inode2 csum match"; then
+        echo "  PASS: inode csum matches disk (ext2_inode_csum_calc, root inode)"
+    else
+        echo "  FAIL: inode csum mismatch"; strings "$LOG" | grep "inode2 csum" | sed 's/^/        /'; rc=1
+    fi
 fi
 
 # Gate 1: identity write-back checks passed.
