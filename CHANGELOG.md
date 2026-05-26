@@ -38,6 +38,17 @@ The first two checksum classes. Validated by **compute-and-compare against the o
 
 **Verification**: production build **669,072 B**. **`metadata_csum,64bit` image**: `SB csum match` + `grp0 csum match` — `ext2_sb_csum_compute` and `ext2_grp_csum_compute` reproduce e2fsprogs's `s_checksum` and `bg_checksum` exactly (seed `0x5ccda95c`, also host-matched). Write still gated (W3-W5 skip by design). **No regression**: 64bit image (`csum_on=0`) full W1-W5 mutation set still green + `e2fsck -fn` clean — the hooks are dormant. **Next: bite 4** (block + inode bitmap checksums in the BGDT, hooked into the four allocator paths).
 
+### Added — bite 4: block + inode bitmap checksums (`ext2.cyr`)
+
+The bitmap checksum fields live in the group descriptor and must be set whenever a bitmap is rewritten (then `bg_checksum` from bite 3 covers them — which is why these two bites pair).
+
+- **`ext2_set_block_bitmap_csum`** — `crc32c(seed, bitmap, (blocks_per_group+7)/8)` → `bg_block_bitmap_csum_lo` @ 0x18 + `_hi` @ 0x38 (64bit).
+- **`ext2_set_inode_bitmap_csum`** — `crc32c(seed, bitmap, (inodes_per_group+7)/8)` → `bg_inode_bitmap_csum_lo` @ 0x1A + `_hi` @ 0x3A. **The span is `inodes_per_group/8` (1024 B here), NOT the full block** — the #1 silent e2fsck trap (audit § 14.7); the block-bitmap span happens to equal the full 4096-B block only because `blocks_per_group/8 = 4096`.
+- **Hooks**: all four allocator paths (`ext2_alloc_block`/`ext2_free_block`/`ext2_alloc_inode`/`ext2_free_inode`) set the bitmap csum right after writing the bitmap and before `ext2_write_bgdt` (so the same `write_bgdt` recomputes `bg_checksum` over the updated field), `csum_on`-guarded.
+- **Self-test**: reads group-0's block + inode bitmaps, computes both csums, compares to the on-disk descriptor values.
+
+**Verification**: production build **671,552 B**. **`metadata_csum,64bit` image**: `blk-bitmap csum match` + `ino-bitmap csum match` — both reproduce e2fsprogs's stored bitmap checksums (the inode-bitmap span correct at `ipg/8`). **No regression**: 64bit image full W1-W5 + `e2fsck -fn` clean. **Next: bite 5** (inode `i_checksum_lo`/`i_checksum_hi` in `ext2_put_inode`).
+
 ## [1.33.0] — 2026-05-25 (ext2/ext4 WRITE arc OPEN — the demo→base maturity exit: filesystem mutation so state persists across reboots, not just *shown*. Audit-first per the multi-source convergent prior-art doc (agnosticos `docs/development/ext2-ext4-write-prior-art.md` — FreeBSD ext2fs primary, Linux ext2, OpenBSD, ext4 spec, e2fsprogs). Phased W1-W5: W1-W4 are QEMU `e2fsck -fn`-clean smoke gates, W5 is the iron burn (create file → power-cycle → persists). **The block-device write primitives already exist + are iron-validated** (`blk_write` → `nvme_blk_write`/`ahci_blk_write`, proven at USB-MS Attempt 87), so this arc is purely the ext2 metadata-mutation layer — zero driver work. Crash-consistency without a journal comes from ordered writes (audit § 3). Sections below land as W-phases complete.)
 
 ### Added — W1 write primitives + metadata write-back (`block.cyr`, `ext2.cyr`)

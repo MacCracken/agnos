@@ -786,6 +786,27 @@ fn ext2_bgdt_recsum() {
     return 0;
 }
 
+# Bitmap checksums (1.33.1 bite 4, audit § 14.3). The block/inode bitmap
+# CRC32c lives in the group descriptor; set it when the bitmap is written
+# (then bg_checksum, recomputed in ext2_write_bgdt, covers it). `bmbuf`
+# holds the just-written bitmap block. Stored lo16 + (64bit) hi16.
+#   block bitmap: span = (blocks_per_group+7)/8  → lo @ 0x18, hi @ 0x38
+#   inode bitmap: span = (inodes_per_group+7)/8  → lo @ 0x1A, hi @ 0x3A
+# ⚠ the inode-bitmap span is inodes_per_group/8 (e.g. 1024 B), NOT the full
+# block — the #1 silent e2fsck trap (§ 14.7).
+fn ext2_set_block_bitmap_csum(group, bmbuf) {
+    var crc = ext2_crc32c(ext2_csum_seed, bmbuf, (ext2_blocks_per_group + 7) / 8);
+    ext2_store16_le(ext2_grp_off(group), 0x18, crc & 0xFFFF);
+    if (ext2_desc_size > 32) { ext2_store16_le(ext2_grp_off(group), 0x38, (crc >> 16) & 0xFFFF); }
+    return 0;
+}
+fn ext2_set_inode_bitmap_csum(group, bmbuf) {
+    var crc = ext2_crc32c(ext2_csum_seed, bmbuf, (ext2_inodes_per_group + 7) / 8);
+    ext2_store16_le(ext2_grp_off(group), 0x1A, crc & 0xFFFF);
+    if (ext2_desc_size > 32) { ext2_store16_le(ext2_grp_off(group), 0x3A, (crc >> 16) & 0xFFFF); }
+    return 0;
+}
+
 # Number of block groups = ceil((blocks_count - first_data_block) / bpg).
 fn ext2_ngroups() {
     var total = ext2_sb_blocks_count(&ext2_sb_buf) - ext2_first_data_block;
@@ -837,6 +858,7 @@ fn ext2_alloc_block(goal) {
                 if (ext2_write_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
                 # accounting last: BGDT then SB (ext2_bgdt_buf still holds
                 # the descriptor table — bitmap read went to a separate buf)
+                if (ext2_csum_on != 0) { ext2_set_block_bitmap_csum(group, &ext2_bitmap_buf); }
                 ext2_grp_set_free_blocks(group, ext2_grp_free_blocks(group) - 1);
                 if (ext2_write_bgdt() != 0) { return 0 - 1; }
                 ext2_sb_set_free_blocks_count(&ext2_sb_buf, ext2_sb_free_blocks_count(&ext2_sb_buf) - 1);
@@ -866,6 +888,7 @@ fn ext2_free_block(block_num) {
     if (ext2_bitmap_get(&ext2_bitmap_buf, b) == 0) { return 0 - 1; }   # double-free guard
     ext2_bitmap_clear(&ext2_bitmap_buf, b);
     if (ext2_write_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+    if (ext2_csum_on != 0) { ext2_set_block_bitmap_csum(group, &ext2_bitmap_buf); }
     ext2_grp_set_free_blocks(group, ext2_grp_free_blocks(group) + 1);
     if (ext2_write_bgdt() != 0) { return 0 - 1; }
     ext2_sb_set_free_blocks_count(&ext2_sb_buf, ext2_sb_free_blocks_count(&ext2_sb_buf) + 1);
@@ -894,6 +917,7 @@ fn ext2_alloc_inode(is_dir) {
             if (b >= 0) {
                 ext2_bitmap_set(&ext2_bitmap_buf, b);
                 if (ext2_write_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+                if (ext2_csum_on != 0) { ext2_set_inode_bitmap_csum(group, &ext2_bitmap_buf); }
                 ext2_grp_set_free_inodes(group, ext2_grp_free_inodes(group) - 1);
                 if (is_dir != 0) {
                     ext2_grp_set_used_dirs(group, ext2_grp_used_dirs(group) + 1);
@@ -926,6 +950,7 @@ fn ext2_free_inode(inode_num, is_dir) {
     if (ext2_bitmap_get(&ext2_bitmap_buf, b) == 0) { return 0 - 1; }   # double-free guard
     ext2_bitmap_clear(&ext2_bitmap_buf, b);
     if (ext2_write_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+    if (ext2_csum_on != 0) { ext2_set_inode_bitmap_csum(group, &ext2_bitmap_buf); }
     ext2_grp_set_free_inodes(group, ext2_grp_free_inodes(group) + 1);
     if (is_dir != 0) {
         ext2_grp_set_used_dirs(group, ext2_grp_used_dirs(group) - 1);
@@ -2037,6 +2062,32 @@ fn ext2_write_selftest() {
         var gs = ext2_load16_le(ext2_grp_off(0), 0x1E);
         if (gc == gs) { kprintln("ext2w: grp0 csum match", 22); }
         else { kprint("ext2w: grp0 csum MISMATCH calc=", 31); kprint_hex(gc); kprint(" disk=", 6); kprint_hex(gs); kprintln("", 0); }
+
+        # bite 4: block + inode bitmap csum compute-and-compare for group 0.
+        # Reads each bitmap into ext2_bitmap_buf (safe — write is gated on a
+        # csum FS, so the W2 allocator that also uses this buffer won't run).
+        var bbk = ext2_grp_block_bitmap(0);
+        if (ext2_read_block(bbk, &ext2_bitmap_buf) == 0) {
+            var bcrc = ext2_crc32c(ext2_csum_seed, &ext2_bitmap_buf, (ext2_blocks_per_group + 7) / 8);
+            var bok = 1;
+            if ((bcrc & 0xFFFF) != ext2_load16_le(ext2_grp_off(0), 0x18)) { bok = 0; }
+            if (ext2_desc_size > 32) {
+                if (((bcrc >> 16) & 0xFFFF) != ext2_load16_le(ext2_grp_off(0), 0x38)) { bok = 0; }
+            }
+            if (bok == 1) { kprintln("ext2w: blk-bitmap csum match", 28); }
+            else          { kprintln("ext2w: blk-bitmap csum MISMATCH", 31); }
+        }
+        var ibk = ext2_grp_inode_bitmap(0);
+        if (ext2_read_block(ibk, &ext2_bitmap_buf) == 0) {
+            var icrc = ext2_crc32c(ext2_csum_seed, &ext2_bitmap_buf, (ext2_inodes_per_group + 7) / 8);
+            var iok = 1;
+            if ((icrc & 0xFFFF) != ext2_load16_le(ext2_grp_off(0), 0x1A)) { iok = 0; }
+            if (ext2_desc_size > 32) {
+                if (((icrc >> 16) & 0xFFFF) != ext2_load16_le(ext2_grp_off(0), 0x3A)) { iok = 0; }
+            }
+            if (iok == 1) { kprintln("ext2w: ino-bitmap csum match", 28); }
+            else          { kprintln("ext2w: ino-bitmap csum MISMATCH", 31); }
+        }
     }
 
     # 2. block-bitmap free-bit count over the group's blocks_per_group bits.

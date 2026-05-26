@@ -155,6 +155,18 @@ PY
     else
         echo "  FAIL: group-0 bg_checksum mismatch"; strings "$LOG" | grep "grp0 csum" | sed 's/^/        /'; rc=1
     fi
+
+    # Bite 4: block + inode bitmap checksums reproduce on-disk values.
+    if strings "$LOG" | grep -q "ext2w: blk-bitmap csum match"; then
+        echo "  PASS: block-bitmap csum matches disk (ext2_set_block_bitmap_csum)"
+    else
+        echo "  FAIL: block-bitmap csum mismatch"; rc=1
+    fi
+    if strings "$LOG" | grep -q "ext2w: ino-bitmap csum match"; then
+        echo "  PASS: inode-bitmap csum matches disk (span=inodes_per_group/8)"
+    else
+        echo "  FAIL: inode-bitmap csum mismatch"; rc=1
+    fi
 fi
 
 # Gate 1: identity write-back checks passed.
