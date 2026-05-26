@@ -17,7 +17,9 @@
 # --- Globals --------------------------------------------------------
 
 var ext2_active             = 0;    # 0 = not mounted; 1 = mounted
-var ext2_write_ok           = 0;    # WRITE arc: 1 = FS is write-safe (no metadata_csum / 64bit / uninit_bg); set at mount per doc § 10
+var ext2_write_ok           = 0;    # WRITE arc: 1 = FS is write-safe; set at mount (refuses metadata_csum / uninit_bg / bigalloc until the csum bites land — 64bit supported since 1.33.1 bite 1). Doc §§ 10, 14
+var ext2_csum_on            = 0;    # 1 = metadata_csum FS (ro_compat 0x400); set at mount — every metadata block carries a CRC32c (1.33.1 bites 2+)
+var ext2_csum_seed          = 0;    # crc32c seed for per-metadata checksums: UUID-derived, or s_checksum_seed if the CSUM_SEED feature is set; computed at mount
 var ext2_desc_size          = 32;   # BGDT entry size: 32 (legacy) or 64 (ext4 64BIT)
 var ext2_blocksize          = 0;    # bytes per FS block (1024/2048/4096)
 var ext2_blocks_per_group   = 0;
@@ -112,6 +114,51 @@ fn ext2_sb_inode_size(sb)        { return ext2_load16_le(sb, 88); }
 fn ext2_sb_feature_incompat(sb)  { return ext2_load32_le(sb, 96); }
 fn ext2_sb_feature_ro_compat(sb) { return ext2_load32_le(sb, 100); }
 fn ext2_sb_desc_size(sb)         { return ext2_load16_le(sb, 254); }
+fn ext2_sb_checksum_seed(sb)     { return ext2_load32_le(sb, 0x270); }
+
+# --- CRC32c (Castagnoli) for ext4 metadata_csum (1.33.1 bites 2+) ------
+#
+# DISTINCT from gpt.cyr's IEEE-802.3 CRC32 (poly 0xEDB88320): ext4 uses the
+# CASTAGNOLI polynomial, bit-reflected 0x82F63B78. Two CRITICAL departures
+# from gpt_crc32 (audit § 14.1, derived from e2fsprogs lib/ext2fs/csum.c):
+#   - NO implicit init, NO final XOR. The CALLER supplies the running `crc`
+#     (a seed, or 0xFFFFFFFF for a fresh start) and uses the result AS-IS.
+#     (gpt folds init=~0 + final ^~0 into wrappers; ext4 folds them into how
+#      seeds are passed, so the raw running value is what gets stored.)
+# Same reflected shift-right structure as gpt_crc32_chunk; only the poly +
+# the no-finalize contract differ. Self-test (bite 2): ext2_crc32c(
+# 0xFFFFFFFF, "123456789", 9) == 0x1CF96D7C  (^0xFFFFFFFF == 0xE3069283,
+# the canonical iSCSI CRC32C check value — proves the algorithm is real).
+fn ext2_crc32c(crc, buf, len) {
+    var i = 0;
+    while (i < len) {
+        crc = crc ^ load8(buf + i);
+        var k = 0;
+        while (k < 8) {
+            if ((crc & 1) == 1) {
+                crc = (crc >> 1) ^ 0x82F63B78;
+            } else {
+                crc = crc >> 1;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return crc & 0xFFFFFFFF;
+}
+
+# Compute the per-metadata checksum seed at mount (audit § 14.2). With the
+# CSUM_SEED incompat feature (0x2000) the seed is the stored s_checksum_seed
+# (+0x270); otherwise it's crc32c(~0, s_uuid[16] @ +0x68). Default mkfs.ext4
+# does NOT set CSUM_SEED, so the UUID path is the common one. NOTE: the
+# superblock's OWN checksum is seeded with ~0, not this value (§ 14.3) —
+# that is handled at ext2_write_superblock, not here.
+fn ext2_compute_csum_seed() {
+    if ((ext2_sb_feature_incompat(&ext2_sb_buf) & 0x2000) != 0) {
+        return ext2_sb_checksum_seed(&ext2_sb_buf);
+    }
+    return ext2_crc32c(0xFFFFFFFF, &ext2_sb_buf + 0x68, 16);
+}
 
 # Free-space accounting (WRITE arc) — s_free_blocks_count @ +12,
 # s_free_inodes_count @ +16 (both u32). The read path never needed these
@@ -333,6 +380,16 @@ fn ext2_init() {
     var ro_danger = 0x0010 | 0x0200 | 0x0400;
     ext2_write_ok = 1;
     if ((ro_compat & ro_danger) != 0) { ext2_write_ok = 0; }
+
+    # metadata_csum (1.33.1 bite 2): detect + compute the csum seed NOW, so
+    # the write-back primitives can recompute checksums once the later bites
+    # hook them. Detection + seed only — write stays gated on ro_danger
+    # (metadata_csum is in it) until the final csum bite flips it.
+    ext2_csum_on = 0;
+    if ((ro_compat & 0x400) != 0) {
+        ext2_csum_on = 1;
+        ext2_csum_seed = ext2_compute_csum_seed();
+    }
 
     # Decode geometry.
     var log_bs               = ext2_sb_log_block_size(&ext2_sb_buf);
@@ -1883,7 +1940,19 @@ fn ext2_truncate_zero(inode_num) {
 # Driven from main.cyr right after ext2_init() under the #ifdef.
 
 fn ext2_write_selftest() {
+    # crc32c primitive self-test (1.33.1 bite 2) — mount-independent, so it
+    # runs first. Canonical iSCSI vector: crc32c(~0,"123456789",9)=0x1CF96D7C.
+    var cc = ext2_crc32c(0xFFFFFFFF, "123456789", 9);
+    if (cc == 0x1CF96D7C) { kprintln("ext2w: crc32c selftest OK", 25); }
+    else                  { kprintln("ext2w: crc32c selftest MISMATCH", 31); }
+
     if (ext2_active == 0) { kprintln("ext2w: not mounted -- skip", 26); return 0; }
+
+    # metadata_csum state computed at mount (bite 2). seed is consumed by the
+    # checksum recompute hooks in the later bites; printed here for the smoke
+    # to cross-check against the host UUID-derived seed.
+    kprint("ext2w: csum on=", 15); kprint_num(ext2_csum_on);
+    kprint(" seed=", 6); kprint_hex(ext2_csum_seed); kprintln("", 0);
 
     # 1. group-0 BGDT accounting (group 0 entry is first in the block).
     var bgdt_block = ext2_first_data_block + 1;

@@ -112,6 +112,38 @@ echo ""
 
 rc=0
 
+# Bite 2 (1.33.1): crc32c Castagnoli primitive — known iSCSI vector.
+if strings "$LOG" | grep -q "ext2w: crc32c selftest OK"; then
+    echo "  PASS: crc32c primitive (Castagnoli iSCSI vector 0x1CF96D7C)"
+else
+    echo "  FAIL: crc32c primitive self-test"; rc=1
+fi
+
+# Bite 2: when metadata_csum is on, cross-check the kernel's UUID-derived
+# csum seed against the host (crc32c(~0, uuid[16], 16)). On non-csum images
+# this is skipped (csum on=0). kprint_hex emits lowercase, no 0x, no pad.
+if strings "$LOG" | grep -q "ext2w: csum on=1"; then
+    K_SEED=$(strings "$LOG" | sed -nE 's/.*csum on=1 seed=([0-9a-f]+).*/\1/p' | head -1)
+    UUID=$(dumpe2fs -h "$WORK/part-pre.img" 2>/dev/null | sed -nE 's/.*Filesystem UUID:[[:space:]]+([0-9a-f-]+).*/\1/p')
+    H_SEED=$(python3 - "$UUID" <<'PY'
+import sys
+u = bytes.fromhex(sys.argv[1].replace('-', ''))
+c = 0xffffffff
+for x in u:
+    c ^= x
+    for _ in range(8):
+        c = ((c >> 1) ^ 0x82f63b78) if (c & 1) else (c >> 1)
+        c &= 0xffffffff
+print('%x' % c)
+PY
+)
+    if [ -n "$K_SEED" ] && [ "$K_SEED" = "$H_SEED" ]; then
+        echo "  PASS: csum seed matches host UUID-derived (0x$K_SEED)"
+    else
+        echo "  FAIL: csum seed kernel=0x$K_SEED host=0x$H_SEED"; rc=1
+    fi
+fi
+
 # Gate 1: identity write-back checks passed.
 if strings "$LOG" | grep -q "ext2w: block id write-back OK"; then
     echo "  PASS: block identity write-back (ext2_write_block)"
