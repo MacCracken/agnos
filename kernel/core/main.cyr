@@ -553,6 +553,14 @@ if (fatfs_active == 1) {
     kprint(" trc=", 5);
     kprint_num(t2_rc);
     kprintln("", 0);
+    # 1.34.3 bite 1 — LFN-with-content: a long-named file carrying 3000 B
+    # (fatfs_file_buf still holds the i&0xFF pattern). fat-write-smoke.sh
+    # mtype-reads it back by its long name + fsck.fat -n clean.
+    var lc_name = "LongContent12345.bin";
+    var lc_rc = fatfs_write_file_lfn(lc_name, 20, &fatfs_file_buf, 3000);
+    kprint("fatw: lfn-content rc=", 21);
+    kprint_num(lc_rc);
+    kprintln("", 0);
 }
 #endif
 

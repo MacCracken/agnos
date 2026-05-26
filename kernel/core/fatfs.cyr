@@ -1098,3 +1098,84 @@ fn fatfs_create_lfn(name, namelen) {
     if (fat_blk_write(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
     return 0;
 }
+
+# === LFN write WITH content (1.34.3 bite 1) ===
+# Create a long-named file carrying `len` bytes from `src`. 8.3-fitting
+# names fall through to fatfs_write_file (which already does 8.3 + content +
+# overwrite). Otherwise: allocate + write the cluster chain FIRST (data
+# before the dirent, same crash-safe ordering as fatfs_write_file — a crash
+# leaves leaked clusters, never a live dirent → free chain), then write the
+# LFN set (K reverse-ordered 0x0F entries + the 8.3-alias entry, the alias
+# now pointing at the first cluster + carrying FileSize). FAT16/32 only.
+# (LFN-name overwrite-match + grow-truncate are the other 1.34.3 items;
+# this one always creates.) Returns 0/-1.
+fn fatfs_write_file_lfn(name, namelen, src, len) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    if (fatfs_type == 12) { return 0 - 1; }
+    if (fatfs_name_fits_83(name, namelen) == 1) { return fatfs_write_file(name, namelen, src, len); }
+    var alias[16];
+    if (fatfs_gen_alias(name, namelen, &alias) != 0) { return 0 - 1; }
+    var csum = fat_lfn_checksum(&alias);
+    var K = namelen / 13;
+    if (namelen % 13 != 0) { K = K + 1; }
+    var need = K + 1;
+    if (need > 16) { return 0 - 1; }
+
+    # 1. allocate + write the cluster chain (data before the dirent set).
+    var first = 0;
+    var prev = 0;
+    var pos = 0;
+    while (pos < len) {
+        var c = fat_alloc_cluster();
+        if (c == 0) { if (first >= 2) { fat_free_chain(first); } return 0 - 1; }   # ENOSPC rollback
+        if (first == 0) { first = c; }
+        else { if (fat_set_entry(prev, c) != 0) { return 0 - 1; } }
+        prev = c;
+        var base = fatfs_first_sector_of_cluster(c);
+        var s = 0;
+        while (s < fatfs_sectors_per_cluster) {
+            if (pos >= len) { s = fatfs_sectors_per_cluster; }
+            else {
+                var k = 0;
+                while (k < 512) {
+                    if (pos + k < len) { store8(&fatfs_data_buf + k, load8(src + pos + k)); }
+                    else { store8(&fatfs_data_buf + k, 0); }
+                    k = k + 1;
+                }
+                if (fat_blk_write(base + s, &fatfs_data_buf) != 0) { return 0 - 1; }
+                pos = pos + 512;
+                s = s + 1;
+            }
+        }
+    }
+
+    # 2. write the LFN set + the 8.3-alias entry (first cluster + size).
+    if (fatfs_find_free_run(need) != 0) { if (first >= 2) { fat_free_chain(first); } return 0 - 1; }
+    if (fat_blk_read(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    var slot = fatfs_slot_idx;
+    var s2 = 0;
+    while (s2 < K) {
+        var seq = K - s2;
+        var is_last = 0;
+        if (s2 == 0) { is_last = 1; }
+        fatfs_emit_lfn(&fatfs_dir_buf + (slot + s2) * 32, seq, is_last, csum, name, namelen, seq - 1);
+        s2 = s2 + 1;
+    }
+    var ep83 = &fatfs_dir_buf + (slot + K) * 32;
+    var z = 0;
+    while (z < 32) { store8(ep83 + z, 0); z = z + 1; }
+    var j = 0;
+    while (j < 11) { store8(ep83 + j, load8(&alias + j)); j = j + 1; }
+    store8(ep83 + 11, 0x20);                            # attr = ARCHIVE
+    store8(ep83 + 20, (first >> 16) & 0xFF);            # FstClusHI
+    store8(ep83 + 21, (first >> 24) & 0xFF);
+    store8(ep83 + 26, first & 0xFF);                    # FstClusLO
+    store8(ep83 + 27, (first >> 8) & 0xFF);
+    store8(ep83 + 28, len & 0xFF);                      # FileSize
+    store8(ep83 + 29, (len >> 8) & 0xFF);
+    store8(ep83 + 30, (len >> 16) & 0xFF);
+    store8(ep83 + 31, (len >> 24) & 0xFF);
+    if (fat_blk_write(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    fat_fsinfo_mark_unknown();
+    return 0;
+}

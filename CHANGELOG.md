@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — FAT LFN write completeness, bite 1: LFN-with-content (the 1.34.3 cut, in progress) (`core/fatfs.cyr`, `core/main.cyr`, `scripts/fat-write-smoke.sh`)
+
+Second cut of the 1.34.x write-completeness continuation. New **`fatfs_write_file_lfn`** creates a long-named file carrying content: 8.3-fitting names fall through to `fatfs_write_file`; otherwise it allocates + writes the cluster chain first (data-before-dirent crash ordering), then writes the LFN set with the **8.3-alias entry pointing at the first cluster + carrying FileSize** (the released `fatfs_create_lfn` left the alias at cluster 0 / size 0). QEMU-validated via `fat-write-smoke.sh`: `LongContent12345.bin` (3000 B) reads back byte-exact **through its long name** (mtools reconstructs name + content), `fsck.fat -n` clean, all prior FAT write gates green. Remaining 1.34.3 items: LFN-name overwrite-match (`fatfs_find_root` is 8.3-only) + grow-truncate.
+
 ## [1.34.2] — 2026-05-26 (**exFAT write parity** — first cut of the 1.34.x write-completeness continuation (agnos roadmap row 21), bringing exFAT up to FAT's bite-3e level: overwrite-existing, arbitrary-length truncate, PercentInUse maintenance, ENOSPC rollback. The non-verb carry-forwards from the 1.34.0 (FAT) + 1.34.1 (exFAT) minor are landing as 4 themed in-arc cuts (1.34.2–1.34.5); shell verbs stay deferred to the 1.39.x VFS generic-write lift. QEMU/`fsck.exfat`-validated; no iron burn (final-bite only).)
 
 ### Added — exFAT write parity (`core/exfat.cyr`, `core/main.cyr`, `scripts/exfat-write-smoke.sh`)

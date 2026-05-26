@@ -195,9 +195,29 @@ else
     echo "  FAIL: TRUNC2.BIN mismatch ($(wc -c < "$WORK/trunc2.bin" 2>/dev/null) B; want 1000)"; rc=1
 fi
 
+# 11. LFN-with-content (1.34.3 bite 1): LongContent12345.bin written 3000 B
+#     via the long name; mtools reconstructs the long name AND the content
+#     byte-exact (the 8.3-alias entry points at the cluster chain).
+if strings "$LOG" | grep -q "fatw: lfn-content rc=0"; then
+    echo "  PASS: fatfs_write_file_lfn rc=0 (LFN + content)"
+else
+    echo "  FAIL: lfn-content (no 'fatw: lfn-content rc=0' in log)"; rc=1
+fi
+if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "LongContent12345.bin"; then
+    echo "  PASS: long name 'LongContent12345.bin' reconstructed by mtools"
+else
+    echo "  FAIL: LFN-content long name not reconstructed"; rc=1
+fi
+mtype -i "$WORK/esp.img" ::LongContent12345.bin > "$WORK/lfnc.bin" 2>/dev/null
+if cmp -s "$WORK/lfnc.bin" "$WORK/pattern.bin"; then
+    echo "  PASS: LongContent12345.bin content byte-exact (3000 B multi-cluster LFN write)"
+else
+    echo "  FAIL: LFN-content mismatch ($(wc -c < "$WORK/lfnc.bin" 2>/dev/null) B; want 3000)"; rc=1
+fi
+
 echo ""
 echo "=========================================="
-if [ "$rc" = "0" ]; then echo "FAT write smoke (3a-3e: create/content/del/trunc/LFN/overwrite/arb-trunc): PASS"; else echo "FAT write smoke (3a-3e): FAIL"; fi
+if [ "$rc" = "0" ]; then echo "FAT write smoke (3a-3e + 1.34.3 LFN-content): PASS"; else echo "FAT write smoke: FAIL"; fi
 echo "Logs: $LOG"
 echo "=========================================="
 exit $rc
