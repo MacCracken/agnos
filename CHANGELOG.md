@@ -27,6 +27,17 @@ The metadata_csum substrate — no behavior change yet (write stays gated), just
 
 **Verification**: production build **667,440 B**. **64bit image**: crc32c vector PASS + full W1-W5 mutation set still green + `e2fsck -fn` clean (no regression). **`metadata_csum,64bit` image**: `crc32c selftest OK`, `csum on=1 seed=e25418d4`, and **`PASS: csum seed matches host UUID-derived (0xe25418d4)`** — `ext2_crc32c` + `ext2_compute_csum_seed` validated end-to-end against `e2fsck`'s reference. Write correctly still gated (`read-only FS -- write checks skipped`) — the metadata_csum refusal flips in the final bite. **Next: bite 3** (superblock `s_checksum` + per-group `bg_checksum` hooks).
 
+### Added — bite 3: superblock + group-descriptor checksums (`ext2.cyr`)
+
+The first two checksum classes. Validated by **compute-and-compare against the on-disk values e2fsprogs already wrote** (the `e2fsck` reference) — write stays gated, so no risk, but the routines are proven exact before they're ever relied on.
+
+- **`ext2_sb_csum_compute`** — `crc32c(~0, sb, 0x3FC)` over the first 1020 bytes (everything before `s_checksum` @ 0x3FC). Seeded with `~0`, **not** `ext2_csum_seed` — the superblock is the one structure seeded with all-ones (audit § 14.3). The compute ends at 0x3FC, so it naturally excludes the stored field (no zeroing dance). Full 32-bit.
+- **`ext2_grp_csum_compute`** — e2fsprogs `ext2fs_group_desc_csum` for metadata_csum: `crc32c(seed, group#_le32)` → descriptor `[0, 0x1E)` → 2 zero bytes standing in for the `bg_checksum` field → (64bit only) `[0x20, desc_size)`; low 16 bits, stored at 0x1E. **`ext2_bgdt_recsum`** recomputes every valid group in the loaded BGDT block.
+- **Hooks**: `ext2_write_superblock` rewrites `s_checksum` and `ext2_write_bgdt` calls `ext2_bgdt_recsum`, both before the write, both guarded by `ext2_csum_on` (no-ops on a non-csum FS).
+- **Self-test**: on a metadata_csum FS, computes the SB + group-0 checksums and compares to the on-disk values; smoke gates on `SB csum match` + `grp0 csum match`.
+
+**Verification**: production build **669,072 B**. **`metadata_csum,64bit` image**: `SB csum match` + `grp0 csum match` — `ext2_sb_csum_compute` and `ext2_grp_csum_compute` reproduce e2fsprogs's `s_checksum` and `bg_checksum` exactly (seed `0x5ccda95c`, also host-matched). Write still gated (W3-W5 skip by design). **No regression**: 64bit image (`csum_on=0`) full W1-W5 mutation set still green + `e2fsck -fn` clean — the hooks are dormant. **Next: bite 4** (block + inode bitmap checksums in the BGDT, hooked into the four allocator paths).
+
 ## [1.33.0] — 2026-05-25 (ext2/ext4 WRITE arc OPEN — the demo→base maturity exit: filesystem mutation so state persists across reboots, not just *shown*. Audit-first per the multi-source convergent prior-art doc (agnosticos `docs/development/ext2-ext4-write-prior-art.md` — FreeBSD ext2fs primary, Linux ext2, OpenBSD, ext4 spec, e2fsprogs). Phased W1-W5: W1-W4 are QEMU `e2fsck -fn`-clean smoke gates, W5 is the iron burn (create file → power-cycle → persists). **The block-device write primitives already exist + are iron-validated** (`blk_write` → `nvme_blk_write`/`ahci_blk_write`, proven at USB-MS Attempt 87), so this arc is purely the ext2 metadata-mutation layer — zero driver work. Crash-consistency without a journal comes from ordered writes (audit § 3). Sections below land as W-phases complete.)
 
 ### Added — W1 write primitives + metadata write-back (`block.cyr`, `ext2.cyr`)

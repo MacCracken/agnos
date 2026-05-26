@@ -160,6 +160,15 @@ fn ext2_compute_csum_seed() {
     return ext2_crc32c(0xFFFFFFFF, &ext2_sb_buf + 0x68, 16);
 }
 
+# Superblock checksum (1.33.1 bite 3, audit § 14.3): crc32c over the first
+# 1020 bytes of the SB (everything before s_checksum @ 0x3FC), seeded with
+# ~0 — NOT ext2_csum_seed (the SB is the one structure seeded with ~0).
+# Full 32-bit, stored at 0x3FC. The compute naturally excludes the stored
+# field (it ends at 0x3FC), so no zeroing dance is needed.
+fn ext2_sb_csum_compute() {
+    return ext2_crc32c(0xFFFFFFFF, &ext2_sb_buf, 0x3FC);
+}
+
 # Free-space accounting (WRITE arc) — s_free_blocks_count @ +12,
 # s_free_inodes_count @ +16 (both u32). The read path never needed these
 # (reading existing files doesn't consume space); the allocator does.
@@ -551,6 +560,11 @@ fn ext2_write_block(block_num, buf) {
 # write the 1024 bytes directly rather than block-RMW. Caller mutates
 # ext2_sb_buf via the set_* accessors first. Returns 0 / -1.
 fn ext2_write_superblock() {
+    # metadata_csum (bite 3): recompute s_checksum over [0,0x3FC) before the
+    # write, so the on-disk SB stays e2fsck-clean. No-op on a non-csum FS.
+    if (ext2_csum_on != 0) {
+        ext2_store32_le(&ext2_sb_buf, 0x3FC, ext2_sb_csum_compute());
+    }
     var base = ext2_partition_first_lba + 2;
     if (ext2_blk_write(base,     &ext2_sb_buf)       != 0) { return 0 - 1; }
     if (ext2_blk_write(base + 1, &ext2_sb_buf + 512) != 0) { return 0 - 1; }
@@ -713,7 +727,12 @@ fn ext2_put_inode(inode_num, in_buf) {
 
 # --- BGDT block read / write (descriptor table at first_data_block+1) ---
 fn ext2_read_bgdt()  { return ext2_read_block(ext2_first_data_block + 1, &ext2_bgdt_buf); }
-fn ext2_write_bgdt() { return ext2_write_block(ext2_first_data_block + 1, &ext2_bgdt_buf); }
+fn ext2_write_bgdt() {
+    # metadata_csum (bite 3): recompute each group's bg_checksum before the
+    # write. No-op on a non-csum FS.
+    if (ext2_csum_on != 0) { ext2_bgdt_recsum(); }
+    return ext2_write_block(ext2_first_data_block + 1, &ext2_bgdt_buf);
+}
 
 # Group-descriptor field access within the loaded ext2_bgdt_buf. Counts
 # are the u16 lo halves; on 64BIT FSes (desc_size==64) the _hi halves sit
@@ -729,6 +748,43 @@ fn ext2_grp_used_dirs(group)        { return ext2_load16_le(ext2_grp_off(group),
 fn ext2_grp_set_free_blocks(group, v) { return ext2_store16_le(ext2_grp_off(group), 12, v); }
 fn ext2_grp_set_free_inodes(group, v) { return ext2_store16_le(ext2_grp_off(group), 14, v); }
 fn ext2_grp_set_used_dirs(group, v)   { return ext2_store16_le(ext2_grp_off(group), 16, v); }
+
+# Group-descriptor checksum (1.33.1 bite 3, audit § 14.3). e2fsprogs
+# ext2fs_group_desc_csum for metadata_csum: crc32c over the group number
+# (LE32), then the descriptor [0, 0x1E), then 2 zero bytes standing in for
+# the bg_checksum field, then (64bit only) [0x20, desc_size). Truncated to
+# the low 16 bits, stored at 0x1E. Seeded with ext2_csum_seed.
+fn ext2_grp_csum_compute(group) {
+    var off = ext2_grp_off(group);
+    var gle[4];                            # group number, little-endian
+    ext2_store32_le(&gle, 0, group);
+    var crc = ext2_crc32c(ext2_csum_seed, &gle, 4);
+    crc = ext2_crc32c(crc, off, 0x1E);     # [0, bg_checksum)
+    var z2[2];                             # the 2-byte bg_checksum field as 0
+    store8(&z2, 0); store8(&z2 + 1, 0);
+    crc = ext2_crc32c(crc, &z2, 2);
+    if (ext2_desc_size > 0x20) {           # 64bit: the upper half of the desc
+        crc = ext2_crc32c(crc, off + 0x20, ext2_desc_size - 0x20);
+    }
+    return crc & 0xFFFF;
+}
+
+# Recompute bg_checksum for every valid group present in the loaded BGDT
+# block — called from ext2_write_bgdt before the write when csum is on. The
+# loaded block is the first BGDT block (groups 0 .. blocksize/desc_size-1);
+# only [0, ngroups) are real. Cheap (≤64 descriptors) and safe — untouched
+# descriptors recompute to their existing value.
+fn ext2_bgdt_recsum() {
+    var per_block = ext2_blocksize / ext2_desc_size;
+    var ng = ext2_ngroups();
+    if (ng > per_block) { ng = per_block; }
+    var g = 0;
+    while (g < ng) {
+        ext2_store16_le(ext2_grp_off(g), 0x1E, ext2_grp_csum_compute(g));
+        g = g + 1;
+    }
+    return 0;
+}
 
 # Number of block groups = ceil((blocks_count - first_data_block) / bpg).
 fn ext2_ngroups() {
@@ -1968,6 +2024,20 @@ fn ext2_write_selftest() {
     kprint("ext2w: sb free_blk=", 19); kprint_num(ext2_sb_free_blocks_count(&ext2_sb_buf));
     kprint(" free_ino=", 10); kprint_num(ext2_sb_free_inodes_count(&ext2_sb_buf));
     kprintln("", 0);
+
+    # bite 3 compute-and-compare: our SB + group-desc checksum routines must
+    # reproduce the values e2fsprogs already wrote (the e2fsck reference).
+    # ext2_bgdt_buf holds group 0's descriptor from the read just above.
+    if (ext2_csum_on != 0) {
+        var sbc = ext2_sb_csum_compute();
+        var sbs = ext2_load32_le(&ext2_sb_buf, 0x3FC);
+        if (sbc == sbs) { kprintln("ext2w: SB csum match", 20); }
+        else { kprint("ext2w: SB csum MISMATCH calc=", 29); kprint_hex(sbc); kprint(" disk=", 6); kprint_hex(sbs); kprintln("", 0); }
+        var gc = ext2_grp_csum_compute(0);
+        var gs = ext2_load16_le(ext2_grp_off(0), 0x1E);
+        if (gc == gs) { kprintln("ext2w: grp0 csum match", 22); }
+        else { kprint("ext2w: grp0 csum MISMATCH calc=", 31); kprint_hex(gc); kprint(" disk=", 6); kprint_hex(gs); kprintln("", 0); }
+    }
 
     # 2. block-bitmap free-bit count over the group's blocks_per_group bits.
     if (ext2_read_block(bbmp, &ext2_block_buf) != 0) {

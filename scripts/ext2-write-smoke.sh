@@ -142,6 +142,19 @@ PY
     else
         echo "  FAIL: csum seed kernel=0x$K_SEED host=0x$H_SEED"; rc=1
     fi
+
+    # Bite 3: SB + group-desc checksum routines reproduce the on-disk
+    # (e2fsprogs-written) values — compute-and-compare, no write needed.
+    if strings "$LOG" | grep -q "ext2w: SB csum match"; then
+        echo "  PASS: superblock s_checksum matches disk (ext2_sb_csum_compute)"
+    else
+        echo "  FAIL: superblock s_checksum mismatch"; strings "$LOG" | grep "SB csum" | sed 's/^/        /'; rc=1
+    fi
+    if strings "$LOG" | grep -q "ext2w: grp0 csum match"; then
+        echo "  PASS: group-0 bg_checksum matches disk (ext2_grp_csum_compute)"
+    else
+        echo "  FAIL: group-0 bg_checksum mismatch"; strings "$LOG" | grep "grp0 csum" | sed 's/^/        /'; rc=1
+    fi
 fi
 
 # Gate 1: identity write-back checks passed.
