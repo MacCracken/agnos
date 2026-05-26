@@ -1,9 +1,16 @@
 # === Serial I/O ===
 
 fn serial_putc(c) {
-    var ch = c;
-    asm { 0xBA; 0xFD; 0x03; 0x00; 0x00; 0xEC; 0xA8; 0x20; 0x74; 0xFB; }
-    asm { 0x8A; 0x45; 0xF0; 0xBA; 0xF8; 0x03; 0x00; 0x00; 0xEE; }
+    # THR-empty poll, BOUNDED. The old inline-asm `jz` spin (mov edx,0x3FD;
+    # in al,dx; test al,0x20; jz back) had NO iteration cap — a 16550 whose
+    # LSR THR-empty bit (0x20) never sets would spin the CPU forever. On
+    # archaemenid there is no serial cable, so serial output must never be
+    # able to wedge the box (every other AGNOS hardware poll is bounded). If
+    # the transmitter doesn't drain within the cap, drop the char and move on.
+    for (var i = 0; i < 100000; i = i + 1) {
+        if ((inb(0x3FD) & 0x20) != 0) { break; }   # 0x3FD = COM1 LSR
+    }
+    outb(0x3F8, c);   # 0x3F8 = COM1 THR
     return 0;
 }
 

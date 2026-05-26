@@ -226,15 +226,23 @@ fn sh_cmd_bench() {
     t1 = rdtsc();
     bench_report("  heap_4096B: ", 14, t1 - t0, 1000);
     var mem_pg = pmm_alloc();
-    t0 = rdtsc();
-    for (var i = 0; i < 256; i = i + 1) {
-        for (var j = 0; j < 4096; j = j + 8) { store64(mem_pg + j, 0xDEADBEEF); }
+    # Guard: pmm_alloc() returns 0 on exhaustion (pmm.cyr). Dereferencing a 0
+    # base would store 0xDEADBEEF across physical 0..4095 — clobbering the
+    # IVT/low page tables/structures and faulting LATER (e.g. on the next timer
+    # context-switch), a classic delayed-idle lockup. Skip the bench instead.
+    if (mem_pg == 0) {
+        kprintln("  memwrite_1MB: skipped (no page)", 33);
+    } else {
+        t0 = rdtsc();
+        for (var i = 0; i < 256; i = i + 1) {
+            for (var j = 0; j < 4096; j = j + 8) { store64(mem_pg + j, 0xDEADBEEF); }
+        }
+        t1 = rdtsc();
+        pmm_free(mem_pg);
+        kprint("  memwrite_1MB: ", 16);
+        kprint_num((t1 - t0) / 1000);
+        kprintln(" Kcycles", 8);
     }
-    t1 = rdtsc();
-    pmm_free(mem_pg);
-    kprint("  memwrite_1MB: ", 16);
-    kprint_num((t1 - t0) / 1000);
-    kprintln(" Kcycles", 8);
     kprintln("[tier2] subsystems", 18);
     t0 = rdtsc();
     for (var i = 0; i < 10000; i = i + 1) { ksyscall(2, 0, 0, 0); }
@@ -252,9 +260,14 @@ fn sh_cmd_bench() {
     t0 = rdtsc();
     for (var i = 0; i < 100; i = i + 1) {
         var fd = vfs_create_memfile("test", 4);
-        var rb[8];
-        vfs_read(fd, &rb, 4);
-        vfs_close(fd);
+        # Guard: vfs_create_memfile returns -1 if the 32-slot vfs_table is full.
+        # vfs_read(-1, ...) would index &vfs_table + (-1)*32 = 32 bytes BEFORE
+        # the table (OOB read of a bogus tag/payload pointer) — don't.
+        if (fd >= 0) {
+            var rb[8];
+            vfs_read(fd, &rb, 4);
+            vfs_close(fd);
+        }
     }
     t1 = rdtsc();
     bench_report("  vfs_open_read_close: ", 23, t1 - t0, 100);
