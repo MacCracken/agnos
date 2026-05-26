@@ -153,6 +153,14 @@ for w5 in "W5 mkdir" "W5 rmdir round-trip"; do
     fi
 done
 
+# W4b: shell write verbs driven headlessly via sh_exec. The proof is the
+# `cat` of the echo-redirected file printing "SHELL-WROTE-IT" back.
+if strings "$LOG" | grep -q "SHELL-WROTE-IT"; then
+    echo "  PASS: W4b shell echo-redirect + cat (vfs_write arm + mkdir/touch/rm)"
+else
+    echo "  FAIL: W4b shell write verbs (no SHELL-WROTE-IT in cat output)"; rc=1
+fi
+
 # Bonus: free-block count cross-check (self-test sb total vs host debugfs).
 ST_FREE=$(strings "$LOG" | sed -nE 's/.*sb free_blk=([0-9]+).*/\1/p' | head -1)
 if [ -n "$ST_FREE" ] && [ -n "${BASE_FREE:-}" ] && [ "$ST_FREE" = "$BASE_FREE" ]; then
@@ -198,6 +206,16 @@ if debugfs -R "stat /w5tmp" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
     echo "  FAIL: /w5tmp still present on disk (rmdir didn't persist)"; rc=1
 else
     echo "  PASS: /w5tmp absent on disk (rmdir persisted)"
+fi
+
+# W4b host verification: the shell-created dir + echo-redirected file
+# persisted with the right content; the shell touch+rm tmp file is gone.
+shcontent=$(debugfs -R "cat /shdir/keep.txt" "$WORK/part-post.img" 2>/dev/null)
+[ "$shcontent" = "SHELL-WROTE-IT" ] && echo "  PASS: /shdir/keep.txt = shell-written content on disk" || { echo "  FAIL: /shdir/keep.txt='$shcontent' (want SHELL-WROTE-IT)"; rc=1; }
+if debugfs -R "stat /shtmp" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
+    echo "  FAIL: /shtmp still present (shell rm didn't persist)"; rc=1
+else
+    echo "  PASS: /shtmp absent on disk (shell rm persisted)"
 fi
 
 echo ""

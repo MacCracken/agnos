@@ -11,6 +11,15 @@ var sh_cwd_inode = 2;       # ext2 root inode by default
 var sh_cwd_path[64];        # backing storage; sh_cwd_init writes the leading '/'
 var sh_cwd_len   = 0;       # actual byte length; set to 1 by sh_cwd_init
 
+# === Write-verb path scratch (WRITE arc 1.33.x — W4b) ===
+# sh_abspath builds an absolute path here from a possibly-CWD-relative
+# arg; sh_split_parent then splits it into (parent dir inode, basename).
+# 512 bytes (= [64] u64), same cap as sh_cwd_path.
+var sh_path_buf[64];
+var sh_path_len  = 0;
+var sh_base_off  = 0;       # basename offset within sh_path_buf
+var sh_base_len  = 0;       # basename length
+
 fn sh_streq(a, alen, b, blen) {
     if (alen != blen) { return 0; }
     return memeq(a, b, alen);
@@ -367,6 +376,134 @@ fn sh_cmd_ls(arg, arglen) {
     return 0;
 }
 
+# === Write-verb helpers (WRITE arc 1.33.x — W4b) ======================
+
+# Trim leading + trailing spaces; returns the trimmed length, advancing
+# *via the globals* is awkward in Cyrius, so callers pass a ptr and use
+# the returned (ptr,len) pair through sh_trim_off / sh_trim_len.
+var sh_trim_off = 0;
+var sh_trim_len = 0;
+fn sh_trim(p, l) {
+    var o = 0;
+    while (o < l) { if (load8(p + o) != 32) { break; } o = o + 1; }
+    var e = l;
+    while (e > o) { if (load8(p + e - 1) != 32) { break; } e = e - 1; }
+    sh_trim_off = o;
+    sh_trim_len = e - o;
+    return 0;
+}
+
+# Build an absolute path from `arg` into sh_path_buf (absolute → copy;
+# bare → sh_cwd_path + "/" + arg). Returns plen (>0) or -1.
+fn sh_abspath(arg, arglen) {
+    if (arglen < 1) { return 0 - 1; }
+    var plen = 0;
+    if (load8(arg) == 47) {
+        if (arglen > 512) { return 0 - 1; }
+        var i = 0;
+        while (i < arglen) { store8(&sh_path_buf + i, load8(arg + i)); i = i + 1; }
+        plen = arglen;
+    } else {
+        if (sh_cwd_len + arglen + 1 >= 512) { return 0 - 1; }
+        var i = 0;
+        while (i < sh_cwd_len) { store8(&sh_path_buf + plen, load8(&sh_cwd_path + i)); plen = plen + 1; i = i + 1; }
+        if (sh_cwd_len > 1) { store8(&sh_path_buf + plen, 47); plen = plen + 1; }
+        i = 0;
+        while (i < arglen) { store8(&sh_path_buf + plen, load8(arg + i)); plen = plen + 1; i = i + 1; }
+    }
+    sh_path_len = plen;
+    return plen;
+}
+
+# Split sh_path_buf[0..plen) into (parent dir inode, basename). Sets
+# sh_base_off / sh_base_len. Returns the parent inode (>0) or -1.
+fn sh_split_parent(plen) {
+    while (plen > 1) { if (load8(&sh_path_buf + plen - 1) != 47) { break; } plen = plen - 1; }
+    var last = 0 - 1;
+    var i = 0;
+    while (i < plen) { if (load8(&sh_path_buf + i) == 47) { last = i; } i = i + 1; }
+    if (last == 0 - 1) { return 0 - 1; }
+    sh_base_off = last + 1;
+    sh_base_len = plen - (last + 1);
+    if (sh_base_len < 1) { return 0 - 1; }
+    if (last == 0) { return 2; }                       # parent is root "/"
+    return ext2_path_lookup(&sh_path_buf, last);       # dirname → inode
+}
+
+fn sh_cmd_touch(arg, arglen) {
+    if (ext2_active == 0) { kprintln("touch: no fs", 12); return 0; }
+    sh_trim(arg, arglen);
+    if (sh_trim_len < 1) { kprintln("usage: touch <file>", 19); return 0; }
+    if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("touch: bad path", 15); return 0; }
+    var parent = sh_split_parent(sh_path_len);
+    if (parent <= 0) { kprintln("touch: no such directory", 24); return 0; }
+    if (ext2_dir_lookup(parent, &sh_path_buf + sh_base_off, sh_base_len) > 0) { return 0; }  # exists → no-op
+    if (ext2_create(parent, &sh_path_buf + sh_base_off, sh_base_len) <= 0) { kprintln("touch: failed", 13); }
+    return 0;
+}
+
+fn sh_cmd_rm(arg, arglen) {
+    if (ext2_active == 0) { kprintln("rm: no fs", 9); return 0; }
+    sh_trim(arg, arglen);
+    if (sh_trim_len < 1) { kprintln("usage: rm <file>", 16); return 0; }
+    if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("rm: bad path", 12); return 0; }
+    var parent = sh_split_parent(sh_path_len);
+    if (parent <= 0) { kprintln("rm: no such path", 16); return 0; }
+    if (ext2_unlink(parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) { kprintln("rm: failed", 10); }
+    return 0;
+}
+
+fn sh_cmd_mkdir(arg, arglen) {
+    if (ext2_active == 0) { kprintln("mkdir: no fs", 12); return 0; }
+    sh_trim(arg, arglen);
+    if (sh_trim_len < 1) { kprintln("usage: mkdir <dir>", 18); return 0; }
+    if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("mkdir: bad path", 15); return 0; }
+    var parent = sh_split_parent(sh_path_len);
+    if (parent <= 0) { kprintln("mkdir: no such parent", 21); return 0; }
+    if (ext2_mkdir(parent, &sh_path_buf + sh_base_off, sh_base_len) <= 0) { kprintln("mkdir: failed", 13); }
+    return 0;
+}
+
+fn sh_cmd_rmdir(arg, arglen) {
+    if (ext2_active == 0) { kprintln("rmdir: no fs", 12); return 0; }
+    sh_trim(arg, arglen);
+    if (sh_trim_len < 1) { kprintln("usage: rmdir <dir>", 18); return 0; }
+    if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("rmdir: bad path", 15); return 0; }
+    var parent = sh_split_parent(sh_path_len);
+    if (parent <= 0) { kprintln("rmdir: no such path", 19); return 0; }
+    if (ext2_rmdir(parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) { kprintln("rmdir: failed (not empty?)", 26); }
+    return 0;
+}
+
+# `echo TEXT > FILE` — write TEXT + newline to FILE (create or truncate).
+# `text`/`textlen` = the bytes before '>'; `fname`/`fnamelen` = after.
+fn sh_echo_redirect(text, textlen, fname, fnamelen) {
+    if (ext2_active == 0) { kprintln("echo: no fs for redirect", 24); return 0; }
+    sh_trim(text, textlen);
+    var t_off = sh_trim_off; var t_len = sh_trim_len;
+    sh_trim(fname, fnamelen);
+    if (sh_trim_len < 1) { kprintln("echo: no redirect target", 24); return 0; }
+    if (sh_abspath(fname + sh_trim_off, sh_trim_len) < 0) { kprintln("echo: bad path", 14); return 0; }
+    var parent = sh_split_parent(sh_path_len);
+    if (parent <= 0) { kprintln("echo: no such directory", 23); return 0; }
+
+    # create if absent, else truncate (overwrite semantics)
+    var ino = ext2_dir_lookup(parent, &sh_path_buf + sh_base_off, sh_base_len);
+    if (ino <= 0) {
+        if (ext2_create(parent, &sh_path_buf + sh_base_off, sh_base_len) <= 0) { kprintln("echo: create failed", 19); return 0; }
+    } else {
+        ext2_truncate_zero(ino);
+    }
+
+    # open via VFS and write through the vfs_write EXT2 arm, then "\n"
+    var fd = ext2_open(&sh_path_buf, sh_path_len);
+    if (fd < 0) { kprintln("echo: open failed", 17); return 0; }
+    if (t_len > 0) { vfs_write(fd, text + t_off, t_len); }
+    vfs_write(fd, "\n", 1);
+    vfs_close(fd);
+    return 0;
+}
+
 fn sh_exec(buf, len) {
     if (len < 1) { return 0; }
     # Find command end (first space or end)
@@ -397,10 +534,19 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "cd", 2) == 1) { return sh_cmd_cd(arg, arglen); }
     if (sh_streq(buf, clen, "pwd", 3) == 1) { return sh_cmd_pwd(); }
     if (sh_streq(buf, clen, "echo", 4) == 1) {
+        # `echo TEXT > FILE` redirect (WRITE arc): split on the first '>'.
+        var g = 0 - 1;
+        var gi = 0;
+        while (gi < arglen) { if (load8(arg + gi) == 62) { g = gi; break; } gi = gi + 1; }
+        if (g >= 0) { return sh_echo_redirect(arg, g, arg + g + 1, arglen - g - 1); }
         kprint(arg, arglen);
         kprintln("", 0);
         return 0;
     }
+    if (sh_streq(buf, clen, "touch", 5) == 1) { return sh_cmd_touch(arg, arglen); }
+    if (sh_streq(buf, clen, "rm", 2) == 1)    { return sh_cmd_rm(arg, arglen); }
+    if (sh_streq(buf, clen, "mkdir", 5) == 1) { return sh_cmd_mkdir(arg, arglen); }
+    if (sh_streq(buf, clen, "rmdir", 5) == 1) { return sh_cmd_rmdir(arg, arglen); }
     if (sh_streq(buf, clen, "lspci", 5) == 1) {
         for (var i = 0; i < pci_count; i = i + 1) {
             var base = &pci_devs + i * 32;
@@ -615,5 +761,24 @@ fn shell() {
         var result = sh_exec(&sh_buf, sh_len);
         if (result == 0 - 99) { sh_running = 0; }
     }
+    return 0;
+}
+
+# === Shell write-verb self-test (compile-gated EXT2_WRITE_SELFTEST) =====
+# Drives the real verb path via sh_exec with canned commands — exercises
+# echo-redirect (create + vfs_write), cat (read-back), mkdir, touch, rm
+# headlessly (the interactive input loop reads HID, not driveable in a
+# headless QEMU). The `cat` output ("SHELL-WROTE-IT") is the verification
+# the smoke greps; /shdir/keep.txt is left for host debugfs to confirm.
+fn sh_write_selftest() {
+    kprintln("shtest: begin", 13);
+    sh_cwd_init();
+    sh_exec("mkdir /shdir", 12);
+    sh_exec("echo SHELL-WROTE-IT > /shdir/keep.txt", 37);
+    kprint("shtest cat: ", 12);
+    sh_exec("cat /shdir/keep.txt", 19);
+    sh_exec("touch /shtmp", 12);
+    sh_exec("rm /shtmp", 9);
+    kprintln("shtest: end", 11);
     return 0;
 }

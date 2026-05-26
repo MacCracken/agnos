@@ -60,6 +60,16 @@ The demo→base milestone at the FS layer: files can be created, written, **pers
 
 **Verification**: production **659,408 B** (+5,024). No regression (`ext2-smoke.sh` 5/5). **W5 smoke PASS**: `mkdir /w5keep` → in-AGNOS lookup finds it, it's a directory, root `links_count` +1; rmdir round-trip (`mkdir /w5tmp` → `create` a file in it → `rmdir` **refused** non-empty → `unlink` the file → `rmdir` succeeds) → free-counts + parent link + lookup all return to baseline. **`e2fsck -fn` clean** — Pass 4 validates the mkdir/rmdir link accounting; host `debugfs` confirms `/w5keep` is a `directory` on disk (mkdir persisted) and `/w5tmp` **absent** (rmdir persisted). QEMU gate (no iron). **Next: the user-facing glue** — VFS write arm (`vfs_write` for `VFS_EXT2_FILE` + `vfs_create`) + shell `touch`/`echo>`/`rm`/`mkdir`/`rmdir` (interactive/iron-validated, not headless-smokeable) + `s_state` dirty/clean + the W5 iron burn.
 
+### Added — W4b VFS write arm + shell write verbs (`vfs.cyr`, `shell.cyr`, `main.cyr`)
+
+The user-facing surface — `echo hello > /f` works end-to-end.
+
+- **`vfs_write` EXT2 arm** (`vfs.cyr`) — writes at the slot's position via `ext2_write_at`, advances pos, grows the cached size. Mirror of the existing `VFS_EXT2_FILE` read arm.
+- **Shell verbs** (`shell.cyr`) — `touch`, `rm`, `mkdir`, `rmdir`, and `echo TEXT > FILE` redirect (create-or-truncate then write via the VFS arm). Path helpers `sh_abspath` (absolute or CWD-relative → `sh_path_buf`) + `sh_split_parent` (→ parent dir inode + basename, the shape `ext2_create`/`unlink`/`mkdir`/`rmdir` consume) + `sh_trim`.
+- **Headless validation via `sh_exec`** — the interactive line reader is HID-driven (not driveable in a headless QEMU), so a compile-gated `sh_write_selftest` (`main.cyr`, after `ext2_write_selftest`) drives the *real* verb path with canned commands: `mkdir /shdir` → `echo SHELL-WROTE-IT > /shdir/keep.txt` → `cat /shdir/keep.txt` → `touch /shtmp` → `rm /shtmp`.
+
+**Verification**: production **666,840 B** (+7,432). No regression (`ext2-smoke.sh` 5/5 — all backends still reach the shell). **W4b smoke PASS**: the canned `cat` prints **"SHELL-WROTE-IT"** back (echo-redirect created the file + wrote it through the VFS arm, cat read it); **`e2fsck -fn` clean**; host `debugfs` reads `/shdir/keep.txt` = "SHELL-WROTE-IT" off the disk image and confirms `/shtmp` **absent**. **`echo > /f` → reboot → `cat /f` now works at the QEMU level** — the demo→base experience. **Next: the W5 iron burn** (the agnos-fs partition must be re-carved write-friendly first — `mkfs` with `^metadata_csum,^64bit`, since the current `mkfs.ext4`-default partition refuses write by design via the W2 write-safety gate).
+
 ### Fixed — `ext2_init` log_block_size error message length (`ext2.cyr`)
 
 `kprintln("ext2: log_block_size out of range: ", 36)` declared length 36 for a 35-byte string — a 1-byte over-read printing one stray byte on that (rarely-hit) error path. Corrected to 35.

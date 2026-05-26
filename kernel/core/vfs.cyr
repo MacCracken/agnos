@@ -202,6 +202,20 @@ fn vfs_write(fd_idx, buf, count) {
         if (kpayload(base, 1) != 1) { return 0 - 1; }
         return pipe_write(base, buf, count);
     }
+    if (ftype == VFS_EXT2_FILE) {
+        # WRITE arc (1.33.x): write `count` bytes at the current position
+        # via ext2_write_at, advance pos, grow the cached size. Mirror of
+        # the VFS_EXT2_FILE read arm. (On a write-unsafe mount ext2_write_at
+        # returns -1, propagated here.)
+        var pos       = kpayload(base, 0);
+        var inode_num = kpayload(base, 2);
+        var n = ext2_write_at(inode_num, pos, buf, count);
+        if (n > 0) {
+            kpayload_set(base, 0, pos + n);
+            if (pos + n > kpayload(base, 1)) { kpayload_set(base, 1, pos + n); }
+        }
+        return n;
+    }
     return 0 - 1;
 }
 

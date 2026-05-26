@@ -441,6 +441,7 @@ ext2_init();
 # production builds — same gate discipline as AHCI_RW_DEMO / MSC_RW_DEMO.
 #ifdef EXT2_WRITE_SELFTEST
 ext2_write_selftest();
+sh_write_selftest();
 #endif
 
 # === CMOS kernel checkpoint 12 (VFS up) ===
