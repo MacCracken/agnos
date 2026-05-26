@@ -1,5 +1,5 @@
 #!/bin/bash
-# ext2 WRITE-path smoke (1.33.x WRITE arc — W1 primitives .. W4 create/unlink).
+# ext2 WRITE-path smoke (1.33.x WRITE arc — W1 primitives .. W5 mkdir/rmdir).
 #
 # Boots the EXT2_WRITE_SELFTEST kernel against a deliberately write-
 # friendly ext2 partition (no metadata_csum / 64bit / dir_index — the
@@ -144,6 +144,15 @@ for w4 in "W4 create+write" "W4 unlink round-trip"; do
     fi
 done
 
+# W5: mkdir + rmdir (FS layer).
+for w5 in "W5 mkdir" "W5 rmdir round-trip"; do
+    if strings "$LOG" | grep -q "ext2w: $w5 OK"; then
+        echo "  PASS: $w5"
+    else
+        echo "  FAIL: $w5"; rc=1
+    fi
+done
+
 # Bonus: free-block count cross-check (self-test sb total vs host debugfs).
 ST_FREE=$(strings "$LOG" | sed -nE 's/.*sb free_blk=([0-9]+).*/\1/p' | head -1)
 if [ -n "$ST_FREE" ] && [ -n "${BASE_FREE:-}" ] && [ "$ST_FREE" = "$BASE_FREE" ]; then
@@ -182,9 +191,18 @@ else
     echo "  PASS: /w4tmp.txt absent on disk (unlink persisted)"
 fi
 
+# W5 host verification: /w5keep is a directory on disk; /w5tmp gone.
+w5type=$(debugfs -R "stat /w5keep" "$WORK/part-post.img" 2>/dev/null | grep -oE "Type: [a-z]+" | head -1 | awk '{print $2}')
+[ "$w5type" = "directory" ] && echo "  PASS: /w5keep is a directory on disk (mkdir persisted)" || { echo "  FAIL: /w5keep type='$w5type' (want directory)"; rc=1; }
+if debugfs -R "stat /w5tmp" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
+    echo "  FAIL: /w5tmp still present on disk (rmdir didn't persist)"; rc=1
+else
+    echo "  PASS: /w5tmp absent on disk (rmdir persisted)"
+fi
+
 echo ""
 echo "=========================================="
-[ $rc -eq 0 ] && echo "ext2 WRITE smoke (W1-W4): PASS" || echo "ext2 WRITE smoke (W1-W4): FAIL"
+[ $rc -eq 0 ] && echo "ext2 WRITE smoke (W1-W5): PASS" || echo "ext2 WRITE smoke (W1-W5): FAIL"
 echo "Logs: $LOGS"
 echo "=========================================="
 exit $rc
