@@ -482,10 +482,22 @@ if (fatfs_active == 1) {
 # then gates on fsck.fat -n clean + mdir showing NEWFILE.TXT.
 #ifdef FATFS_WRITE_SELFTEST
 if (fatfs_active == 1) {
+    # 3a — empty-file create (dirent only)
     var fw_name = "NEWFILE.TXT";
     var fw_rc = fatfs_create(fw_name, 11);
     kprint("fatw: create NEWFILE.TXT rc=", 28);
     kprint_num(fw_rc);
+    kprintln("", 0);
+    # 3b — multi-cluster content write (3000 B, byte[i] = i & 0xFF). The
+    # byte-exact readback check is the harness's job (fat-write-smoke.sh
+    # fsck.fat's the FS + mtype-diffs WTEST.BIN against the host pattern);
+    # here we just drive the write + report rc.
+    var wi = 0;
+    while (wi < 3000) { store8(&fatfs_file_buf + wi, wi & 0xFF); wi = wi + 1; }
+    var fw2_name = "WTEST.BIN";
+    var fw2_rc = fatfs_write_file(fw2_name, 9, &fatfs_file_buf, 3000);
+    kprint("fatw: write WTEST.BIN rc=", 25);
+    kprint_num(fw2_rc);
     kprintln("", 0);
 }
 #endif

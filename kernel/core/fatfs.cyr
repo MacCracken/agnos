@@ -27,6 +27,9 @@ var fatfs_fat_buf[64];               # holds the FAT sector being consulted for 
 var fatfs_fat_buf_sector = 0 - 1;    # which partition-relative LBA fatfs_fat_buf currently caches
 var fatfs_data_buf[64];
 var fatfs_file_buf[512];             # memfile content scratch (4 KB; multi-cluster cat up to one page)
+var fatfs_fsinfo_sector = 0;         # FAT32 FSInfo sector (partition-relative); 0 = none
+var fatfs_slot_sec = 0;              # write: dir sector of the free slot found by fatfs_find_free_root_slot
+var fatfs_slot_idx = 0;              # write: entry index within that sector
 
 # Partition-relative block read — every fatfs read goes through this, so
 # the FS works on whichever backend/partition the probe matched (NVMe /
@@ -101,12 +104,15 @@ fn fatfs_parse_bpb() {
         else { fatfs_type = 32; }
     }
 
-    # FAT32: root is a cluster chain at RootClus @44. FAT12/16: fixed region.
+    # FAT32: root is a cluster chain at RootClus @44, + FSInfo sector @48
+    # (partition-relative; write maintains its free-count). FAT12/16: fixed region.
     if (fatfs_type == 32) {
         fatfs_root_cluster = load8(&fatfs_boot_buf + 44) | (load8(&fatfs_boot_buf + 45) << 8) | (load8(&fatfs_boot_buf + 46) << 16) | (load8(&fatfs_boot_buf + 47) << 24);
         if (fatfs_root_cluster < 2) { return 0 - 1; }
+        fatfs_fsinfo_sector = load8(&fatfs_boot_buf + 48) | (load8(&fatfs_boot_buf + 49) << 8);
     } else {
         fatfs_root_cluster = 0;
+        fatfs_fsinfo_sector = 0;
         if (fatfs_root_entry_count == 0) { return 0 - 1; }   # FAT12/16 need a fixed root
     }
     return 0;
@@ -472,37 +478,120 @@ fn fatfs_read(cluster, buf, maxlen) {
 
 # === Write path (1.34.x bite 3) ===
 
-# Write a fresh 8.3 directory entry into `slot` of the dir sector currently
-# held in fatfs_dir_buf (the caller's scan left it there), then flush the
-# sector. attr = archive, cluster = 0, size = 0 (empty file). Returns 0/-1.
-fn fatfs_emit_dirent(sec, slot, name11_ptr) {
-    var ep = &fatfs_dir_buf + slot * 32;
-    var i = 0;
-    while (i < 32) { store8(ep + i, 0); i = i + 1; }   # zero the 32-byte entry
-    var j = 0;
-    while (j < 11) { store8(ep + j, load8(name11_ptr + j)); j = j + 1; }
-    store8(ep + 11, 0x20);                              # attr = ARCHIVE
-    # FstClusHI@20, FstClusLO@26, FileSize@28 all stay 0 (empty file).
-    if (fat_blk_write(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+# --- FAT-entry I/O (audit § 2.3 / § 3) -------------------------------
+# Raw FAT entry value at `cluster` (0=free, EOC/bad, or next-cluster).
+# Distinct from fat_next_cluster (which maps EOC/bad → 0); the allocator
+# needs the raw value to spot a free (==0) entry. -1 on IO error.
+fn fat_get_entry(cluster) {
+    var fat_offset = 0;
+    if (fatfs_type == 16) { fat_offset = cluster * 2; }
+    if (fatfs_type == 32) { fat_offset = cluster * 4; }
+    if (fatfs_type == 12) { fat_offset = cluster + (cluster / 2); }
+    var sec = fatfs_fat_start + (fat_offset / 512);
+    var off = fat_offset % 512;
+    if (fatfs_fat_buf_sector != sec) {
+        if (fat_blk_read(sec, &fatfs_fat_buf) != 0) { return 0 - 1; }
+        fatfs_fat_buf_sector = sec;
+    }
+    if (fatfs_type == 16) {
+        return load8(&fatfs_fat_buf + off) | (load8(&fatfs_fat_buf + off + 1) << 8);
+    }
+    if (fatfs_type == 32) {
+        var v = load8(&fatfs_fat_buf + off) | (load8(&fatfs_fat_buf + off + 1) << 8) | (load8(&fatfs_fat_buf + off + 2) << 16) | (load8(&fatfs_fat_buf + off + 3) << 24);
+        return v & 0x0FFFFFFF;
+    }
+    var b0 = load8(&fatfs_fat_buf + off);
+    var b1 = 0;
+    if (off == 511) {
+        if (fat_blk_read(sec + 1, &fatfs_fat_buf) != 0) { return 0 - 1; }
+        fatfs_fat_buf_sector = sec + 1;
+        b1 = load8(&fatfs_fat_buf + 0);
+    } else {
+        b1 = load8(&fatfs_fat_buf + off + 1);
+    }
+    var v12 = b0 | (b1 << 8);
+    if ((cluster & 1) == 1) { return v12 >> 4; }
+    return v12 & 0x0FFF;
+}
+
+# End-of-chain marker for the active FAT type (write is FAT16/32 only).
+fn fat_eoc() {
+    if (fatfs_type == 16) { return 0xFFFF; }
+    return 0x0FFFFFFF;
+}
+
+# Write a FAT entry to ALL `fatfs_num_fats` copies (audit § 2.3: a write
+# must keep every FAT in sync). FAT16/32 only — FAT12's nibble-packed
+# RMW is refused (no realistic AGNOS target is FAT12; reads still work).
+# Read-modify-writes each FAT copy's sector. Returns 0/-1.
+fn fat_set_entry(cluster, value) {
+    if (fatfs_type == 12) { return 0 - 1; }
+    var unit = 2;
+    if (fatfs_type == 32) { unit = 4; }
+    var fat_offset = cluster * unit;
+    var fi = 0;
+    while (fi < fatfs_num_fats) {
+        var base = fatfs_fat_start + fi * fatfs_sectors_per_fat;
+        var sec = base + (fat_offset / 512);
+        var off = fat_offset % 512;
+        if (fat_blk_read(sec, &fatfs_fat_buf) != 0) { return 0 - 1; }
+        fatfs_fat_buf_sector = 0 - 1;                  # cache now dirty/ambiguous
+        if (fatfs_type == 16) {
+            store8(&fatfs_fat_buf + off, value & 0xFF);
+            store8(&fatfs_fat_buf + off + 1, (value >> 8) & 0xFF);
+        } else {
+            # FAT32: preserve the top 4 reserved bits of the existing entry.
+            var cur = load8(&fatfs_fat_buf + off) | (load8(&fatfs_fat_buf + off + 1) << 8) | (load8(&fatfs_fat_buf + off + 2) << 16) | (load8(&fatfs_fat_buf + off + 3) << 24);
+            var nv = (cur & 0xF0000000) | (value & 0x0FFFFFFF);
+            store8(&fatfs_fat_buf + off, nv & 0xFF);
+            store8(&fatfs_fat_buf + off + 1, (nv >> 8) & 0xFF);
+            store8(&fatfs_fat_buf + off + 2, (nv >> 16) & 0xFF);
+            store8(&fatfs_fat_buf + off + 3, (nv >> 24) & 0xFF);
+        }
+        if (fat_blk_write(sec, &fatfs_fat_buf) != 0) { return 0 - 1; }
+        fi = fi + 1;
+    }
+    fatfs_fat_buf_sector = 0 - 1;
     return 0;
 }
 
-# Create an empty 8.3 file in the root directory. First write primitive
-# (audit § 3): no cluster allocation yet — a zero-length file has no
-# clusters, so this is fsck.fat-clean on its own. Refuses an existing
-# name. Finds the first free slot (0x00 end-of-dir or 0xE5 deleted) in
-# the root (FAT32 cluster chain or FAT12/16 fixed region) and writes the
-# dirent there. Root-full (needs a new dir cluster) is a follow-on.
-# Returns 0 on success, -1 on error / exists / no free slot.
-fn fatfs_create(name, namelen) {
-    if (fatfs_active == 0) { return 0 - 1; }
-    var exist[16];
-    if (fatfs_find_root(name, namelen, &exist) == 1) { return 0 - 1; }   # already exists
+# Allocate one free cluster: scan for a 0 entry, mark it EOC (all copies),
+# return the cluster number, or 0 on ENOSPC / error. Linear scan from
+# cluster 2 (the FSInfo next-free hint is an optimization, not used yet).
+fn fat_alloc_cluster() {
+    var max_c = fatfs_count_of_clusters + 2;
+    var c = 2;
+    while (c < max_c) {
+        if (fat_get_entry(c) == 0) {
+            if (fat_set_entry(c, fat_eoc()) != 0) { return 0; }
+            return c;
+        }
+        c = c + 1;
+    }
+    return 0;
+}
 
-    var name11[16];
-    fatfs_build_83(name, namelen, &name11);
+# Mark the FAT32 FSInfo free-count + next-free as UNKNOWN (0xFFFFFFFF).
+# Cheaper + safer than recomputing on every write: 0xFFFFFFFF is spec-
+# valid ("not known") and fsck.fat skips the free-count comparison, so a
+# write never leaves a stale-count mismatch. No-op on FAT12/16. Returns 0/-1.
+fn fat_fsinfo_mark_unknown() {
+    if (fatfs_type != 32) { return 0; }
+    if (fatfs_fsinfo_sector == 0) { return 0; }
+    if (fat_blk_read(fatfs_fsinfo_sector, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    var k = 0;
+    while (k < 8) { store8(&fatfs_dir_buf + 488 + k, 0xFF); k = k + 1; }   # Free_Count@488 + Nxt_Free@492
+    if (fat_blk_write(fatfs_fsinfo_sector, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# --- Directory-entry write -------------------------------------------
+# Find the first free root-dir slot (0x00 end-of-dir / 0xE5 deleted) and
+# record it in fatfs_slot_sec / fatfs_slot_idx. Handles FAT32 root chain
+# + FAT12/16 fixed region. Returns 0 on found, -1 if the root is full
+# (root-extend is a follow-on). Shared by create + write_file.
+fn fatfs_find_free_root_slot() {
     var eps = 512 / 32;
-
     if (fatfs_type == 32) {
         var clus = fatfs_root_cluster;
         while (clus >= 2) {
@@ -512,24 +601,109 @@ fn fatfs_create(name, namelen) {
                 if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
                 for (var e = 0; e < eps; e = e + 1) {
                     var fb = load8(&fatfs_dir_buf + e * 32);
-                    if (fb == 0x00) { return fatfs_emit_dirent(sec, e, &name11); }
-                    if (fb == 0xE5) { return fatfs_emit_dirent(sec, e, &name11); }
+                    if (fb == 0x00) { fatfs_slot_sec = sec; fatfs_slot_idx = e; return 0; }
+                    if (fb == 0xE5) { fatfs_slot_sec = sec; fatfs_slot_idx = e; return 0; }
                 }
             }
             clus = fat_next_cluster(clus);
         }
-        return 0 - 1;                                   # root full (extend = follow-on)
+        return 0 - 1;
     }
-
     var root_sectors = (fatfs_root_entry_count * 32 + 511) / 512;
     for (var s2 = 0; s2 < root_sectors; s2 = s2 + 1) {
         var sec2 = fatfs_root_start + s2;
         if (fat_blk_read(sec2, &fatfs_dir_buf) != 0) { return 0 - 1; }
         for (var e2 = 0; e2 < eps; e2 = e2 + 1) {
             var fb2 = load8(&fatfs_dir_buf + e2 * 32);
-            if (fb2 == 0x00) { return fatfs_emit_dirent(sec2, e2, &name11); }
-            if (fb2 == 0xE5) { return fatfs_emit_dirent(sec2, e2, &name11); }
+            if (fb2 == 0x00) { fatfs_slot_sec = sec2; fatfs_slot_idx = e2; return 0; }
+            if (fb2 == 0xE5) { fatfs_slot_sec = sec2; fatfs_slot_idx = e2; return 0; }
         }
     }
     return 0 - 1;
+}
+
+# Write an 8.3 dirent into (sec, slot): re-reads the sector, fills the
+# 32-byte entry (name, attr=ARCHIVE, FstClusHI/LO, FileSize), writes back.
+# Self-contained (re-reads), so it's safe after intervening FAT/data IO.
+fn fatfs_emit_dirent(sec, slot, name11_ptr, cluster, size) {
+    if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    var ep = &fatfs_dir_buf + slot * 32;
+    var i = 0;
+    while (i < 32) { store8(ep + i, 0); i = i + 1; }
+    var j = 0;
+    while (j < 11) { store8(ep + j, load8(name11_ptr + j)); j = j + 1; }
+    store8(ep + 11, 0x20);                              # attr = ARCHIVE
+    store8(ep + 20, (cluster >> 16) & 0xFF);            # FstClusHI
+    store8(ep + 21, (cluster >> 24) & 0xFF);
+    store8(ep + 26, cluster & 0xFF);                    # FstClusLO
+    store8(ep + 27, (cluster >> 8) & 0xFF);
+    store8(ep + 28, size & 0xFF);                       # FileSize
+    store8(ep + 29, (size >> 8) & 0xFF);
+    store8(ep + 30, (size >> 16) & 0xFF);
+    store8(ep + 31, (size >> 24) & 0xFF);
+    if (fat_blk_write(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Create an empty 8.3 file (cluster 0, size 0) in the root. fsck.fat-clean
+# on its own (an empty file owns no clusters). Refuses an existing name.
+fn fatfs_create(name, namelen) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    var exist[16];
+    if (fatfs_find_root(name, namelen, &exist) == 1) { return 0 - 1; }
+    var name11[16];
+    fatfs_build_83(name, namelen, &name11);
+    if (fatfs_find_free_root_slot() != 0) { return 0 - 1; }
+    return fatfs_emit_dirent(fatfs_slot_sec, fatfs_slot_idx, &name11, 0, 0);
+}
+
+# Create an 8.3 file with `len` bytes of content from `src` (audit § 3
+# step 1-4). Allocates a cluster chain (alloc → link prev→cur → EOC on
+# the last), writes the data (zero-padding the final sector's slack),
+# writes the dirent (first cluster + size), then marks FSInfo unknown.
+# Refuses an existing name + FAT12. Ordering: data clusters are allocated
+# + linked + written BEFORE the dirent is published, so a crash leaves at
+# worst leaked clusters (fsck-reclaimable), never a live dirent → free
+# chain. ENOSPC rollback is a follow-on (won't trigger in the smoke).
+fn fatfs_write_file(name, namelen, src, len) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    if (fatfs_type == 12) { return 0 - 1; }
+    var exist[16];
+    if (fatfs_find_root(name, namelen, &exist) == 1) { return 0 - 1; }
+    var name11[16];
+    fatfs_build_83(name, namelen, &name11);
+    if (fatfs_find_free_root_slot() != 0) { return 0 - 1; }
+
+    var first = 0;
+    var prev = 0;
+    var pos = 0;
+    while (pos < len) {
+        var c = fat_alloc_cluster();
+        if (c == 0) { return 0 - 1; }                  # ENOSPC (rollback = follow-on)
+        if (first == 0) { first = c; }
+        else { if (fat_set_entry(prev, c) != 0) { return 0 - 1; } }   # link prev → c
+        prev = c;
+        var base = fatfs_first_sector_of_cluster(c);
+        var s = 0;
+        while (s < fatfs_sectors_per_cluster) {
+            if (pos >= len) { s = fatfs_sectors_per_cluster; }   # file ended mid-cluster
+            else {
+                var k = 0;
+                while (k < 512) {
+                    if (pos + k < len) { store8(&fatfs_data_buf + k, load8(src + pos + k)); }
+                    else { store8(&fatfs_data_buf + k, 0); }   # zero-pad slack
+                    k = k + 1;
+                }
+                if (fat_blk_write(base + s, &fatfs_data_buf) != 0) { return 0 - 1; }
+                pos = pos + 512;
+                s = s + 1;
+            }
+        }
+    }
+    # Last allocated cluster is already EOC (fat_alloc set it; we only
+    # overwrote PRIOR clusters' EOC when linking the next). Publish the
+    # dirent (first cluster + true size), then FSInfo.
+    if (fatfs_emit_dirent(fatfs_slot_sec, fatfs_slot_idx, &name11, first, len) != 0) { return 0 - 1; }
+    fat_fsinfo_mark_unknown();
+    return 0;
 }

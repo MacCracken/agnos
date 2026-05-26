@@ -55,6 +55,10 @@ rm -rf "$WORK" "$LOGS"; mkdir -p "$WORK" "$LOGS"
 
 IMG="$WORK/agnos-fatw.img"
 
+# Reference pattern for WTEST.BIN (3000 B, byte[i] = i & 0xFF) — the
+# kernel writes the same; we mtype the result back and cmp byte-exact.
+{ for i in $(seq 0 2999); do printf "\\$(printf '%03o' $((i % 256)))"; done; } > "$WORK/pattern.bin"
+
 echo "Building GPT disk (FAT32 ESP + boot files)..."
 dd if=/dev/zero of="$IMG" bs=1M count=128 status=none
 parted -s "$IMG" mklabel gpt \
@@ -83,35 +87,48 @@ echo ""
 
 rc=0
 
-# 1. self-test reported a clean create
+# 1. self-test reported clean create (3a) + write (3b)
 if strings "$LOG" | grep -q "fatw: create NEWFILE.TXT rc=0"; then
-    echo "  PASS: fatfs_create reported rc=0"
+    echo "  PASS: fatfs_create (empty file) rc=0"
 else
     echo "  FAIL: create (no 'fatw: create NEWFILE.TXT rc=0' in log)"; rc=1
+fi
+if strings "$LOG" | grep -q "fatw: write WTEST.BIN rc=0"; then
+    echo "  PASS: fatfs_write_file (multi-cluster content) rc=0"
+else
+    echo "  FAIL: write (no 'fatw: write WTEST.BIN rc=0' in log)"; rc=1
 fi
 
 # 2. post-boot ESP is fsck.fat-clean. NB: `mformat -i img@@1MiB -F` (no
 #    size) formats the FAT32 to the END of the 128 MiB image (~127 MiB,
 #    not the 32 MiB GPT partition), so extract from 1 MiB to end-of-image
-#    or fsck reads past a truncated slice. The dirent we wrote sits in the
-#    first MiB; fsck validates the whole 127 MiB FS.
+#    or fsck reads past a truncated slice. The writes sit in the first
+#    MiB; fsck validates the whole 127 MiB FS (FAT chains + dirents).
 dd if="$IMG" bs=1M skip=1 of="$WORK/esp.img" status=none
 if fsck.fat -n "$WORK/esp.img" >"$LOGS/fsck.log" 2>&1; then
-    echo "  PASS: fsck.fat -n clean (create didn't corrupt FAT / boot files)"
+    echo "  PASS: fsck.fat -n clean (writes didn't corrupt FAT / boot files)"
 else
     echo "  FAIL: fsck.fat -n flagged the post-boot ESP (see $LOGS/fsck.log)"; rc=1
 fi
 
-# 3. NEWFILE.TXT is present on disk
+# 3. NEWFILE.TXT present (empty-file create persisted)
 if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "NEWFILE"; then
     echo "  PASS: NEWFILE.TXT present on disk (create persisted)"
 else
     echo "  FAIL: NEWFILE.TXT absent (mdir)"; rc=1
 fi
 
+# 4. WTEST.BIN content byte-exact (the multi-cluster write actually landed)
+mtype -i "$WORK/esp.img" ::WTEST.BIN > "$WORK/got.bin" 2>/dev/null
+if cmp -s "$WORK/got.bin" "$WORK/pattern.bin"; then
+    echo "  PASS: WTEST.BIN content byte-exact (3000 B multi-cluster write)"
+else
+    echo "  FAIL: WTEST.BIN content mismatch ($(wc -c < "$WORK/got.bin" 2>/dev/null) B vs 3000)"; rc=1
+fi
+
 echo ""
 echo "=========================================="
-if [ "$rc" = "0" ]; then echo "FAT write smoke (3a create): PASS"; else echo "FAT write smoke (3a create): FAIL"; fi
+if [ "$rc" = "0" ]; then echo "FAT write smoke (3a create + 3b content): PASS"; else echo "FAT write smoke (3a create + 3b content): FAIL"; fi
 echo "Logs: $LOG"
 echo "=========================================="
 exit $rc
