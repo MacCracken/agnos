@@ -174,6 +174,13 @@ PY
     else
         echo "  FAIL: inode csum mismatch"; strings "$LOG" | grep "inode2 csum" | sed 's/^/        /'; rc=1
     fi
+
+    # Bite 6: directory-leaf checksum reproduces the on-disk det_checksum.
+    if strings "$LOG" | grep -q "ext2w: rootdir csum match"; then
+        echo "  PASS: dir-leaf csum matches disk (ext2_dir_leaf_csum, root block)"
+    else
+        echo "  FAIL: dir-leaf csum mismatch"; strings "$LOG" | grep "rootdir csum" | sed 's/^/        /'; rc=1
+    fi
 fi
 
 # Gate 1: identity write-back checks passed.

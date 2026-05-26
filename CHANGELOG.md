@@ -57,6 +57,17 @@ The bitmap checksum fields live in the group descriptor and must be set whenever
 
 **Verification**: production build **672,992 B**. **`metadata_csum,64bit` image**: `inode2 csum match` — `ext2_inode_csum_calc` reproduces e2fsprogs's inode checksum exactly. All five checksum classes now compute-and-compare clean (SB / group-desc / block-bitmap / inode-bitmap / inode). **No regression**: 64bit image full W1-W5 + `e2fsck -fn` clean. **Next: bite 6** (directory-leaf `det_checksum` + the 12-byte tail handling — the trickiest, since the rec_len walker must never reuse the tail).
 
+### Added — bite 6: directory-leaf checksums + tail handling (`ext2.cyr`)
+
+The trickiest checksum class — a metadata_csum leaf dir block reserves its last 12 bytes for an `ext4_dir_entry_tail` (fake `inode=0, rec_len=12, name_len=0, file_type=0xDE` whose final 4 bytes hold `det_checksum`).
+
+- **`ext2_dir_limit`** — usable dirent region is `[0, blocksize-12)` on a csum FS (`blocksize` otherwise). **`ext2_dir_leaf_csum`** — `crc32c(seed, dir_ino#) → +dir i_generation → +dirents [0, blocksize-12)` (the tail is *not* covered). **`ext2_dir_tail_stamp`** — writes the tail header + `det_checksum`.
+- **Walkers respect the tail**: `ext2_dir_try_insert` and `ext2_dir_remove` now iterate to `ext2_dir_limit()`, so the `0xDE` tail is never visited as a reusable tombstone (audit § 14.7).
+- **Tail recomputed on every dir-block write**: `ext2_dir_insert` (both the slack-split and the fresh-block-append paths, the latter giving its first dirent `rec_len = ext2_dir_limit()`), `ext2_dir_remove` (after coalesce/tombstone), and `ext2_mkdir`'s seed block (`..` rec_len = `ext2_dir_limit()-12`; new dir's `i_generation` is 0). All `csum_on`-guarded; the dir inode's generation is read from the loaded inode buffer.
+- **Self-test**: computes root's dir-block leaf csum and compares to the on-disk `det_checksum`.
+
+**Verification**: production build **674,640 B**. **`metadata_csum,64bit` image**: `rootdir csum match` — `ext2_dir_leaf_csum` (with the dir-generation seeding) reproduces e2fsprogs's `det_checksum` exactly. **All six checksum classes now compute-and-compare clean.** **No regression** (the dir paths changed, so this matters): 64bit image full create/unlink/mkdir/rmdir/shell-verb set + `e2fsck -fn` clean, and the stripped image too — `ext2_dir_limit()` returns `blocksize` and the tail stamps are guarded off. **Next: bite 7** — flip `ext2_write_ok=1` on a metadata_csum FS and run the FULL write smoke (`e2fsck -fn` clean on the checksummed image), then the W5 iron burn.
+
 ## [1.33.0] — 2026-05-25 (ext2/ext4 WRITE arc OPEN — the demo→base maturity exit: filesystem mutation so state persists across reboots, not just *shown*. Audit-first per the multi-source convergent prior-art doc (agnosticos `docs/development/ext2-ext4-write-prior-art.md` — FreeBSD ext2fs primary, Linux ext2, OpenBSD, ext4 spec, e2fsprogs). Phased W1-W5: W1-W4 are QEMU `e2fsck -fn`-clean smoke gates, W5 is the iron burn (create file → power-cycle → persists). **The block-device write primitives already exist + are iron-validated** (`blk_write` → `nvme_blk_write`/`ahci_blk_write`, proven at USB-MS Attempt 87), so this arc is purely the ext2 metadata-mutation layer — zero driver work. Crash-consistency without a journal comes from ordered writes (audit § 3). Sections below land as W-phases complete.)
 
 ### Added — W1 write primitives + metadata write-back (`block.cyr`, `ext2.cyr`)

@@ -1451,6 +1451,38 @@ fn ext2_dir_lookup(dir_inode_num, name, name_len) {
 
 fn ext2_round4(n) { var m = n + 3; return m - (m & 3); }
 
+# Directory-leaf checksum + tail (1.33.1 bite 6, audit § 14.3). On a
+# metadata_csum FS the last 12 bytes of every leaf dir block are an
+# ext4_dir_entry_tail — a fake dirent (inode=0, rec_len=12, name_len=0,
+# file_type=0xDE) whose final 4 bytes hold det_checksum. So usable dirent
+# space is [0, blocksize-12); the rec_len walkers must stop there and never
+# treat the tail as a reusable tombstone (§ 14.7).
+fn ext2_dir_limit() {
+    if (ext2_csum_on != 0) { return ext2_blocksize - 12; }
+    return ext2_blocksize;
+}
+# Leaf csum: crc32c(seed, dir_ino#) → +dir i_generation → +dirents
+# [0, blocksize-12). The tail itself is NOT covered. Returns the 32-bit crc.
+fn ext2_dir_leaf_csum(dirbuf, dir_ino, dir_gen) {
+    var ile[4]; ext2_store32_le(&ile, 0, dir_ino);
+    var crc = ext2_crc32c(ext2_csum_seed, &ile, 4);
+    var gle[4]; ext2_store32_le(&gle, 0, dir_gen);
+    crc = ext2_crc32c(crc, &gle, 4);
+    return ext2_crc32c(crc, dirbuf, ext2_blocksize - 12);
+}
+# Write the tail header + det_checksum into a dir block before it's flushed.
+# Idempotent on an existing block (the header bytes already match). Caller
+# guards on ext2_csum_on.
+fn ext2_dir_tail_stamp(dirbuf, dir_ino, dir_gen) {
+    var t = ext2_blocksize - 12;
+    ext2_store32_le(dirbuf, t, 0);          # fake inode 0
+    ext2_store16_le(dirbuf, t + 4, 12);     # rec_len = 12 (the tail)
+    store8(dirbuf + t + 6, 0);              # name_len 0
+    store8(dirbuf + t + 7, 0xDE);           # EXT4_FT_DIR_CSUM marker
+    ext2_store32_le(dirbuf, ext2_blocksize - 4, ext2_dir_leaf_csum(dirbuf, dir_ino, dir_gen));
+    return 0;
+}
+
 # Write a dirent record { inode, rec_len, name_len, file_type, name } into
 # buf at byte offset `o`. ftype: 1=regular, 2=dir.
 fn ext2_dirent_write(buf, o, inode, rec_len, name, name_len, ftype) {
@@ -1470,7 +1502,8 @@ fn ext2_dirent_write(buf, o, inode, rec_len, name, name_len, ftype) {
 # live entry's slack (rec_len beyond its real 8+name_len size).
 fn ext2_dir_try_insert(child_ino, name, name_len, ftype, needed) {
     var off = 0;
-    while (off < ext2_blocksize) {
+    var lim = ext2_dir_limit();             # stop before the csum tail (§ 14.7)
+    while (off < lim) {
         var d = &ext2_dir_buf + off;
         var e_ino = ext2_load32_le(d, 0);
         var e_rl  = ext2_load16_le(d, 4);
@@ -1503,6 +1536,7 @@ fn ext2_dir_insert(dir_ino, name, name_len, child_ino, ftype) {
     var needed = ext2_round4(8 + name_len);
     var dir_size = ext2_inode_size_lo(&ext2_inode_buf);
     var nblocks = dir_size / ext2_blocksize;
+    var dir_gen = ext2_load32_le(&ext2_inode_buf, 100);   # for the leaf csum
 
     # 1. try the existing dir blocks
     var lb = 0;
@@ -1512,6 +1546,7 @@ fn ext2_dir_insert(dir_ino, name, name_len, child_ino, ftype) {
         if (phys != 0) {
             if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
             if (ext2_dir_try_insert(child_ino, name, name_len, ftype, needed) == 1) {
+                if (ext2_csum_on != 0) { ext2_dir_tail_stamp(&ext2_dir_buf, dir_ino, dir_gen); }
                 if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
                 return 0;
             }
@@ -1527,7 +1562,10 @@ fn ext2_dir_insert(dir_ino, name, name_len, child_ino, ftype) {
     if (nb <= 0) { return 0 - 1; }
     var z = 0;
     while (z < ext2_blocksize) { store8(&ext2_dir_buf + z, 0); z = z + 1; }
-    ext2_dirent_write(&ext2_dir_buf, 0, child_ino, ext2_blocksize, name, name_len, ftype);
+    # first dirent's rec_len spans the usable region (up to the tail on a
+    # csum FS), then stamp the tail.
+    ext2_dirent_write(&ext2_dir_buf, 0, child_ino, ext2_dir_limit(), name, name_len, ftype);
+    if (ext2_csum_on != 0) { ext2_dir_tail_stamp(&ext2_dir_buf, dir_ino, dir_gen); }
     if (ext2_write_block(nb, &ext2_dir_buf) != 0) { return 0 - 1; }
     ext2_inode_set_size_lo(&ext2_inode_buf, dir_size + ext2_blocksize);
     ext2_inode_set_blocks_lo(&ext2_inode_buf,
@@ -1546,6 +1584,7 @@ fn ext2_dir_remove(dir_ino, name, name_len) {
 
     var dir_size = ext2_inode_size_lo(&ext2_inode_buf);
     var nblocks = dir_size / ext2_blocksize;
+    var dir_gen = ext2_load32_le(&ext2_inode_buf, 100);   # for the leaf csum
     var lb = 0;
     while (lb < nblocks) {
         var phys = ext2_logical_to_physical(&ext2_inode_buf, lb);
@@ -1554,7 +1593,8 @@ fn ext2_dir_remove(dir_ino, name, name_len) {
             if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
             var off = 0;
             var prev = 0 - 1;               # byte offset of previous entry; -1 = block head
-            while (off < ext2_blocksize) {
+            var lim = ext2_dir_limit();     # stop before the csum tail
+            while (off < lim) {
                 var d = &ext2_dir_buf + off;
                 var e_ino = ext2_load32_le(d, 0);
                 var e_rl  = ext2_load16_le(d, 4);
@@ -1569,6 +1609,7 @@ fn ext2_dir_remove(dir_ino, name, name_len) {
                                 ext2_store16_le(&ext2_dir_buf, prev + 4,
                                 ext2_load16_le(&ext2_dir_buf, prev + 4) + e_rl);  # coalesce
                             }
+                            if (ext2_csum_on != 0) { ext2_dir_tail_stamp(&ext2_dir_buf, dir_ino, dir_gen); }
                             if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
                             return 0;
                         }
@@ -1692,11 +1733,14 @@ fn ext2_mkdir(parent_ino, name, name_len) {
     var db = ext2_alloc_block(0);
     if (db <= 0) { ext2_free_inode(ino, 1); return 0 - 1; }
 
-    # seed the dir block: "." (self) then ".." (parent, rec_len to block end)
+    # seed the dir block: "." (self) then ".." (parent, rec_len spanning the
+    # usable region up to the csum tail). The new dir inode is created with
+    # i_generation = 0 (zeroed below), so the leaf csum uses gen 0.
     var z = 0;
     while (z < ext2_blocksize) { store8(&ext2_dir_buf + z, 0); z = z + 1; }
     ext2_dirent_write(&ext2_dir_buf, 0, ino, 12, ".", 1, 2);
-    ext2_dirent_write(&ext2_dir_buf, 12, parent_ino, ext2_blocksize - 12, "..", 2, 2);
+    ext2_dirent_write(&ext2_dir_buf, 12, parent_ino, ext2_dir_limit() - 12, "..", 2, 2);
+    if (ext2_csum_on != 0) { ext2_dir_tail_stamp(&ext2_dir_buf, ino, 0); }
     if (ext2_write_block(db, &ext2_dir_buf) != 0) { ext2_free_block(db); ext2_free_inode(ino, 1); return 0 - 1; }
 
     # init the dir inode: S_IFDIR|0755, links 2 ("." + parent's entry),
@@ -2138,6 +2182,20 @@ fn ext2_write_selftest() {
             }
             if (nok == 1) { kprintln("ext2w: inode2 csum match", 24); }
             else          { kprintln("ext2w: inode2 csum MISMATCH", 27); }
+        }
+
+        # bite 6: directory-leaf csum compute-and-compare on root's block 0.
+        if (ext2_get_inode(2, &ext2_inode_buf) == 0) {
+            var rgen = ext2_load32_le(&ext2_inode_buf, 100);
+            var rphys = ext2_logical_to_physical(&ext2_inode_buf, 0);
+            if (rphys > 0) {
+                if (ext2_read_block(rphys, &ext2_dir_buf) == 0) {
+                    var dcc = ext2_dir_leaf_csum(&ext2_dir_buf, 2, rgen);
+                    var dstor = ext2_load32_le(&ext2_dir_buf, ext2_blocksize - 4);
+                    if (dcc == dstor) { kprintln("ext2w: rootdir csum match", 25); }
+                    else { kprint("ext2w: rootdir csum MISMATCH calc=", 34); kprint_hex(dcc); kprint(" disk=", 6); kprint_hex(dstor); kprintln("", 0); }
+                }
+            }
         }
     }
 
