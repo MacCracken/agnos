@@ -101,6 +101,10 @@ else
     #                     the upcase table back over its FAT chain to
     #                     reproduce its TableChecksum (independent oracle,
     #                     no file seeding). Gated by scripts/exfat-smoke.sh.
+    #   EXFAT_WRITE_SELFTEST=1 — boot-time exFAT write self-test (1.34.1
+    #                     bite 3): create a file by writing its dir-set
+    #                     (0x85/0xC0/0xC1 + SetChecksum + NameHash). Gated
+    #                     by scripts/exfat-write-smoke.sh (fsck.exfat -n).
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -115,6 +119,7 @@ else
         [ -n "$FATFS_SELFTEST" ] && echo '#define FATFS_SELFTEST'
         [ -n "$FATFS_WRITE_SELFTEST" ] && echo '#define FATFS_WRITE_SELFTEST'
         [ -n "$EXFAT_SELFTEST" ] && echo '#define EXFAT_SELFTEST'
+        [ -n "$EXFAT_WRITE_SELFTEST" ] && echo '#define EXFAT_WRITE_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

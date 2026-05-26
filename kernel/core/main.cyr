@@ -614,6 +614,82 @@ if (exfat_active == 1) {
 }
 #endif
 
+# exFAT write self-test (1.34.1 bite 3, compile-gated via EXFAT_WRITE_SELFTEST).
+# 3a — empty-file create (the dir-set write primitive: 0x85+0xC0+0xC1 with
+# SetChecksum + NameHash). exfat-write-smoke.sh extracts the partition after
+# boot and gates on fsck.exfat -n clean (structure + checksum oracle).
+#ifdef EXFAT_WRITE_SELFTEST
+if (exfat_active == 1) {
+    # 3a — empty-file create.
+    var exw_name = "EXWRITE.BIN";
+    var exw_rc = exfat_create(exw_name, 11);
+    kprint("exfatw: create EXWRITE.BIN rc=", 30);
+    kprint_num(exw_rc);
+    kprintln("", 0);
+    var exw_res[24];
+    if (exfat_find(exw_name, 11, &exw_res) == 1) { kprintln("exfatw: create find-back OK", 27); }
+    else { kprintln("exfatw: create find-back FAIL", 29); }
+    # 3b — multi-cluster content write (3000 B, byte[i] = i & 0xFF), then
+    # AGNOS reads it back byte-exact (round-trip); fsck.exfat -n confirms
+    # the bitmap allocation + dir-set on the host (exfat-write-smoke.sh).
+    var wi = 0;
+    while (wi < 3000) { store8(&exfat_file_buf + wi, wi & 0xFF); wi = wi + 1; }
+    var exwc_name = "EXDATA.BIN";
+    var exwc_rc = exfat_write_file(exwc_name, 10, &exfat_file_buf, 3000);
+    kprint("exfatw: write EXDATA.BIN rc=", 28);
+    kprint_num(exwc_rc);
+    kprintln("", 0);
+    var exwc_res[24];
+    if (exfat_find(exwc_name, 10, &exwc_res) == 1) {
+        var exwc_first = load64(&exwc_res);
+        var exwc_len = load64(&exwc_res + 8);
+        var exwc_nfc = load64(&exwc_res + 16);
+        # Read the file back into exfat_file_buf (exfat_read uses exfat_data_buf
+        # as its sector scratch, so this is safe) and verify against the
+        # deterministic pattern byte[i] = i & 0xFF — no need to keep the
+        # source. Offsets past 512 prove the multi-cluster contiguous read.
+        var got = exfat_read(exwc_first, exwc_nfc, &exfat_file_buf, 3000);
+        var exwc_ok = 1;
+        if (exwc_len != 3000) { exwc_ok = 0; }
+        if (got != 3000) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 0) != 0) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 255) != 255) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 256) != 0) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 1000) != (1000 & 0xFF)) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 2999) != (2999 & 0xFF)) { exwc_ok = 0; }
+        kprint("exfatw: EXDATA.BIN len=", 23);
+        kprint_num(exwc_len);
+        kprint(" got=", 5);
+        kprint_num(got);
+        kprint(" nfc=", 5);
+        kprint_num(exwc_nfc);
+        kprintln("", 0);
+        if (exwc_ok == 1) { kprintln("exfatw: write round-trip OK", 27); }
+        else { kprintln("exfatw: write round-trip FAIL", 29); }
+    } else { kprintln("exfatw: write find-back FAIL", 28); }
+    # 3c — delete + truncate-to-zero. Separate files (EXDELME / EXTRUNC) so
+    # the 3b EXDATA.BIN check stays valid; exfat_file_buf still holds the
+    # i&0xFF pattern. fsck.exfat -n must stay clean after freeing the
+    # clusters (no leaked / cross-linked cluster, no orphaned dir-set).
+    var exd_name = "EXDELME.BIN";
+    var exd_wrc = exfat_write_file(exd_name, 11, &exfat_file_buf, 2000);
+    var exd_drc = exfat_delete(exd_name, 11);
+    kprint("exfatw: delete EXDELME.BIN wrc=", 31);
+    kprint_num(exd_wrc);
+    kprint(" drc=", 5);
+    kprint_num(exd_drc);
+    kprintln("", 0);
+    var ext_name = "EXTRUNC.BIN";
+    var ext_wrc = exfat_write_file(ext_name, 11, &exfat_file_buf, 2000);
+    var ext_trc = exfat_truncate_zero(ext_name, 11);
+    kprint("exfatw: trunc EXTRUNC.BIN wrc=", 30);
+    kprint_num(ext_wrc);
+    kprint(" trc=", 5);
+    kprint_num(ext_trc);
+    kprintln("", 0);
+}
+#endif
+
 # WRITE arc 1.33.x — W1 write-path self-test (compile-gated, opt-in via
 # EXT2_WRITE_SELFTEST=1 ./scripts/build.sh). Non-destructive: proves the
 # write primitives + inode RMW + bitmap/free-count reads against a live

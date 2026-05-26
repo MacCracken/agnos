@@ -362,6 +362,9 @@ fn exfat_find(name, namelen, result_ptr) {
     var set_first = 0;
     var set_len = 0;
     var set_nfc = 0;
+    var set_sec_l = 0;           # sector + slot + count of the 0x85 (for delete/truncate)
+    var set_slot_l = 0;
+    var set_cnt_l = 0;
 
     while (clus >= 2) {
         if (clus >= max_c) { return 0 - 1; }
@@ -375,6 +378,9 @@ fn exfat_find(name, namelen, result_ptr) {
                     if (t == 0x00) { return 0; }                 # end of directory
                     if (t == 0x85) {                             # File (set primary)
                         remaining = load8(ep + 1);               # SecondaryCount
+                        set_cnt_l = 1 + remaining;               # total entries in the set
+                        set_sec_l = base + s;                    # where the 0x85 lives
+                        set_slot_l = e;
                         collecting = 1;
                         name_chars = 0;
                         name_got = 0;
@@ -411,6 +417,9 @@ fn exfat_find(name, namelen, result_ptr) {
                             store64(result_ptr, set_first);
                             store64(result_ptr + 8, set_len);
                             store64(result_ptr + 16, set_nfc);
+                            exfat_set_sec = set_sec_l;
+                            exfat_set_slot = set_slot_l;
+                            exfat_set_count = set_cnt_l;
                             return 1;
                         }
                     }
@@ -468,4 +477,402 @@ fn exfat_ls() {
         if (guard > max_c) { return count; }
     }
     return count;
+}
+
+# === Write path (1.34.1 bite 3) ===
+
+# Partition-relative block write — mirror of exfat_blk_read.
+fn exfat_blk_write(sector, buf) {
+    return blk_write_on(exfat_backend, exfat_partition_first_lba + sector, buf);
+}
+
+# Allocation-bitmap sector cache (distinct from the FAT / dir / data
+# scratch so a write sequence — alloc (bitmap) then data — doesn't alias).
+var exfat_bmp_buf[64];
+var exfat_bmp_buf_sec = 0 - 1;
+
+# 16-bit rotate-right-and-add — the shared core of the exFAT SetChecksum
+# (over a dir-set) and NameHash (over the up-cased UTF-16 name). § 3.
+# (NB the prior-art doc's pseudocode is precedence-ambiguous: the mask
+# applies to the rotate, the add comes after — `((rot)&0xFFFF + b)` would
+# be wrong. Verified clean by `fsck.exfat` on a Python-injected dir-set.)
+fn exfat_csum16(chk, b) {
+    var rot = ((chk << 15) | (chk >> 1)) & 0xFFFF;
+    return (rot + b) & 0xFFFF;
+}
+
+# NameHash (16-bit) over the up-cased UTF-16 name, low byte then high byte
+# of each unit. ASCII upcase (matches the read-side assumption; non-ASCII
+# needs the real up-case table — a follow-on). § 3.
+fn exfat_name_hash(name, namelen) {
+    var h = 0;
+    var i = 0;
+    while (i < namelen) {
+        var u = exfat_ascii_up(load8(name + i));
+        h = exfat_csum16(h, u & 0xFF);
+        h = exfat_csum16(h, (u >> 8) & 0xFF);
+        i = i + 1;
+    }
+    return h;
+}
+
+# Write target slot found by exfat_find_free_dir_run.
+var exfat_w_sec = 0;
+var exfat_w_slot = 0;
+
+# Located dir-set of the last exfat_find match (for delete / truncate):
+# sector + slot of the 0x85 primary + the set's total entry count.
+var exfat_set_sec = 0;
+var exfat_set_slot = 0;
+var exfat_set_count = 0;
+
+# Find `need` consecutive free dir-entry slots for a file set, recording
+# the start in exfat_w_sec / exfat_w_slot. exFAT marks end-of-directory
+# with a 0x00 entry (everything after it is free), so the run starts at the
+# first 0x00 that leaves `need` slots before the sector ends. A run that
+# would cross a sector/cluster boundary (or a full root needing extension)
+# is a follow-on → -1. need ≤ 16. Returns 0/-1.
+fn exfat_find_free_dir_run(need) {
+    var eps = 512 / 32;
+    var clus = exfat_root_cluster;
+    var max_c = exfat_cluster_count + 2;
+    var guard = 0;
+    while (clus >= 2) {
+        if (clus >= max_c) { return 0 - 1; }
+        var base = exfat_cluster_sector(clus);
+        for (var s = 0; s < exfat_sectors_per_cluster; s = s + 1) {
+            var sec = base + s;
+            if (exfat_blk_read(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+            for (var e = 0; e < eps; e = e + 1) {
+                var t = load8(&exfat_dir_buf + e * 32);
+                if (t == 0x00) {
+                    if (e + need <= eps) {
+                        exfat_w_sec = sec;
+                        exfat_w_slot = e;
+                        return 0;
+                    }
+                    e = eps;            # run would cross the boundary — next sector
+                }
+            }
+        }
+        clus = exfat_next_cluster(clus);
+        guard = guard + 1;
+        if (guard > max_c) { return 0 - 1; }
+    }
+    return 0 - 1;
+}
+
+# Build + write a file's dir-set into a free root run: one 0x85 File
+# (SecondaryCount + SetChecksum + ARCHIVE attr) + one 0xC0 Stream-Extension
+# (flags + NameLength + NameHash + ValidDataLength/FirstCluster/DataLength)
+# + ⌈namelen/15⌉ 0xC1 File-Name (UTF-16). § 3. `first`/`len`/`flags` = 0/0/0
+# for an empty file; for a file with content `flags` carries AllocationPossible
+# (bit0) | NoFatChain (bit1) and first/len the contiguous run + size. The slot
+# after the set stays 0x00 (it already was), preserving the end-of-directory
+# marker. ASCII names; set must fit one sector (follow-on otherwise). The
+# caller has already refused an existing name + allocated/written any data.
+# Returns 0/-1.
+fn exfat_emit_set(name, namelen, first, len, flags) {
+    var ncname = namelen / 15;
+    if (namelen % 15 != 0) { ncname = ncname + 1; }
+    if (ncname == 0) { ncname = 1; }
+    var sec_count = 1 + ncname;
+    var total = 1 + sec_count;
+    if (total > 16) { return 0 - 1; }                # one-sector run only
+    if (exfat_find_free_dir_run(total) != 0) { return 0 - 1; }
+    if (exfat_blk_read(exfat_w_sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+    var setbase = &exfat_dir_buf + exfat_w_slot * 32;
+
+    var z = 0;
+    while (z < total * 32) { store8(setbase + z, 0); z = z + 1; }
+
+    # 0x85 File (set primary)
+    store8(setbase + 0, 0x85);
+    store8(setbase + 1, sec_count);                  # SecondaryCount
+    store8(setbase + 4, 0x20);                       # FileAttributes = ARCHIVE
+    # 0xC0 Stream Extension
+    var so = 32;
+    store8(setbase + so + 0, 0xC0);
+    store8(setbase + so + 1, flags);                 # GeneralSecondaryFlags
+    store8(setbase + so + 3, namelen);               # NameLength
+    var nh = exfat_name_hash(name, namelen);
+    store8(setbase + so + 4, nh & 0xFF);             # NameHash
+    store8(setbase + so + 5, (nh >> 8) & 0xFF);
+    # ValidDataLength @8 (8 bytes) + DataLength @24 (8 bytes) = len (low 32).
+    store8(setbase + so + 8, len & 0xFF);
+    store8(setbase + so + 9, (len >> 8) & 0xFF);
+    store8(setbase + so + 10, (len >> 16) & 0xFF);
+    store8(setbase + so + 11, (len >> 24) & 0xFF);
+    store8(setbase + so + 20, first & 0xFF);         # FirstCluster
+    store8(setbase + so + 21, (first >> 8) & 0xFF);
+    store8(setbase + so + 22, (first >> 16) & 0xFF);
+    store8(setbase + so + 23, (first >> 24) & 0xFF);
+    store8(setbase + so + 24, len & 0xFF);           # DataLength
+    store8(setbase + so + 25, (len >> 8) & 0xFF);
+    store8(setbase + so + 26, (len >> 16) & 0xFF);
+    store8(setbase + so + 27, (len >> 24) & 0xFF);
+    # 0xC1 File-Name entries
+    var k = 0;
+    while (k < ncname) {
+        var eo = (2 + k) * 32;
+        store8(setbase + eo + 0, 0xC1);
+        store8(setbase + eo + 1, 0x00);
+        var j = 0;
+        while (j < 15) {
+            var ci = k * 15 + j;
+            if (ci < namelen) {
+                store8(setbase + eo + 2 + j * 2, load8(name + ci));
+                store8(setbase + eo + 2 + j * 2 + 1, 0);
+            }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    # SetChecksum over the whole set, skipping the 0x85's own bytes 2,3
+    # (still zero here, so excluding them is exactly the spec rule).
+    var chk = 0;
+    var i = 0;
+    while (i < total * 32) {
+        if (i != 2) { if (i != 3) { chk = exfat_csum16(chk, load8(setbase + i)); } }
+        i = i + 1;
+    }
+    store8(setbase + 2, chk & 0xFF);
+    store8(setbase + 3, (chk >> 8) & 0xFF);
+
+    if (exfat_blk_write(exfat_w_sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Create an empty file (DataLength 0, no clusters → no bitmap touch).
+# fsck.exfat-clean on its own. Refuses an existing name. Returns 0/-1.
+fn exfat_create(name, namelen) {
+    if (exfat_active == 0) { return 0 - 1; }
+    var tmp[24];
+    if (exfat_find(name, namelen, &tmp) == 1) { return 0 - 1; }   # exists
+    return exfat_emit_set(name, namelen, 0, 0, 0x00);
+}
+
+# --- Allocation bitmap (§ 2) -----------------------------------------
+# Load the bitmap byte at logical offset `byte_off` into exfat_bmp_buf,
+# walking the bitmap file's cluster chain. Returns the in-sector byte
+# offset (0..511), or -1 on error.
+fn exfat_bitmap_load_byte(byte_off) {
+    var bpc = exfat_bytes_per_cluster;
+    var cidx = byte_off / bpc;
+    var clus = exfat_bitmap_cluster;
+    var i = 0;
+    while (i < cidx) {
+        clus = exfat_next_cluster(clus);
+        if (clus < 2) { return 0 - 1; }
+        i = i + 1;
+    }
+    var within = byte_off % bpc;
+    var sec = exfat_cluster_sector(clus) + (within / 512);
+    if (exfat_bmp_buf_sec != sec) {
+        if (exfat_blk_read(sec, &exfat_bmp_buf) != 0) { return 0 - 1; }
+        exfat_bmp_buf_sec = sec;
+    }
+    return within % 512;
+}
+
+# Bit for `cluster` in the allocation bitmap: cluster c → bit (c-2),
+# byte (c-2)/8, bit (c-2)%8, LSB-first. Returns 0 (free) / 1 (allocated).
+# On IO error returns 1 (never hand out a cluster we couldn't verify free).
+fn exfat_bitmap_get(cluster) {
+    var idx = cluster - 2;
+    var o = exfat_bitmap_load_byte(idx / 8);
+    if (o < 0) { return 1; }
+    return (load8(&exfat_bmp_buf + o) >> (idx % 8)) & 1;
+}
+
+# Set/clear the bitmap bit for `cluster` (val 1=alloc, 0=free); RMW the
+# byte's sector. Returns 0/-1.
+fn exfat_bitmap_set(cluster, val) {
+    var idx = cluster - 2;
+    var bit = idx % 8;
+    var o = exfat_bitmap_load_byte(idx / 8);
+    if (o < 0) { return 0 - 1; }
+    var b = load8(&exfat_bmp_buf + o);
+    if (val == 1) { b = b | (1 << bit); }
+    else { b = b & (255 - (1 << bit)); }             # clear bit (no ~ operator)
+    store8(&exfat_bmp_buf + o, b);
+    if (exfat_blk_write(exfat_bmp_buf_sec, &exfat_bmp_buf) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Allocate `n` CONTIGUOUS free clusters (so the file can set NoFatChain and
+# skip the FAT — the mkfs.exfat common case + the simplest writer). Linear
+# free-run scan over the bitmap; marks the run allocated; returns the first
+# cluster, or 0 on ENOSPC / error. § 4.
+fn exfat_alloc_contiguous(n) {
+    if (n <= 0) { return 0; }
+    var max_c = exfat_cluster_count + 2;
+    var run = 0;
+    var start = 0;
+    var c = 2;
+    while (c < max_c) {
+        if (exfat_bitmap_get(c) == 0) {
+            if (run == 0) { start = c; }
+            run = run + 1;
+            if (run >= n) {
+                var k = 0;
+                while (k < n) {
+                    if (exfat_bitmap_set(start + k, 1) != 0) { return 0; }
+                    k = k + 1;
+                }
+                return start;
+            }
+        } else {
+            run = 0;
+        }
+        c = c + 1;
+    }
+    return 0;                                         # ENOSPC
+}
+
+# Write a file with `len` bytes from `src` (§ 4): allocate a contiguous
+# cluster run from the bitmap, write the data (zero-padding the final
+# cluster's slack), THEN publish the dir-set (FirstCluster + DataLength +
+# AllocationPossible|NoFatChain). Ordering — data before the dirent — means
+# a crash leaves at worst bitmap-allocated-but-unreferenced clusters (an
+# fsck-fixable leak), never a live dirent → free/cross-linked cluster.
+# Refuses an existing name (overwrite = follow-on) + ENOSPC. Returns 0/-1.
+fn exfat_write_file(name, namelen, src, len) {
+    if (exfat_active == 0) { return 0 - 1; }
+    if (exfat_bitmap_cluster < 2) { return 0 - 1; }
+    var tmp[24];
+    if (exfat_find(name, namelen, &tmp) == 1) { return 0 - 1; }   # exists
+
+    if (len == 0) { return exfat_emit_set(name, namelen, 0, 0, 0x00); }
+
+    var bpc = exfat_bytes_per_cluster;
+    var nclus = (len + bpc - 1) / bpc;
+    var first = exfat_alloc_contiguous(nclus);
+    if (first == 0) { return 0 - 1; }                # ENOSPC
+
+    var pos = 0;
+    var ci = 0;
+    while (ci < nclus) {
+        var base = exfat_cluster_sector(first + ci);
+        var s = 0;
+        while (s < exfat_sectors_per_cluster) {
+            var k = 0;
+            while (k < 512) {
+                if (pos + k < len) { store8(&exfat_data_buf + k, load8(src + pos + k)); }
+                else { store8(&exfat_data_buf + k, 0); }     # zero-pad slack
+                k = k + 1;
+            }
+            if (exfat_blk_write(base + s, &exfat_data_buf) != 0) { return 0 - 1; }
+            pos = pos + 512;
+            s = s + 1;
+        }
+        ci = ci + 1;
+    }
+    # flags: AllocationPossible (bit0) | NoFatChain (bit1) = 0x03.
+    return exfat_emit_set(name, namelen, first, len, 0x03);
+}
+
+# Free a file's clusters in the allocation bitmap. `nfc`=1 → contiguous run
+# of ⌈len/clusterbytes⌉ from `first`; else follow the FAT chain. (Writers
+# here always allocate contiguous → nfc=1; the chain path is for files
+# mkfs/another OS fragmented.) Returns 0/-1.
+fn exfat_free_clusters(first, len, nfc) {
+    if (first < 2) { return 0; }
+    var bpc = exfat_bytes_per_cluster;
+    var nclus = (len + bpc - 1) / bpc;
+    if (nclus == 0) { return 0; }
+    if (nfc == 1) {
+        var k = 0;
+        while (k < nclus) {
+            if (exfat_bitmap_set(first + k, 0) != 0) { return 0 - 1; }
+            k = k + 1;
+        }
+        return 0;
+    }
+    var c = first;
+    var max_c = exfat_cluster_count + 2;
+    var guard = 0;
+    while (c >= 2) {
+        if (c >= max_c) { return 0 - 1; }
+        var nxt = exfat_next_cluster(c);             # read next BEFORE freeing
+        if (exfat_bitmap_set(c, 0) != 0) { return 0 - 1; }
+        c = nxt;
+        guard = guard + 1;
+        if (guard > max_c) { return 0 - 1; }
+    }
+    return 0;
+}
+
+# Delete a file: clear the InUse bit (0x80) on every entry of its dir-set
+# (0x85→0x05, 0xC0→0x40, 0xC1→0x41) FIRST (file no longer referenced), THEN
+# free its clusters — so a crash leaves at worst a bitmap leak (fsck-
+# fixable), never a live dirent → freed/cross-linked cluster. Requires the
+# set to fit one sector (the writer only makes such sets; a spanning set is
+# a follow-on). Returns 0/-1.
+fn exfat_delete(name, namelen) {
+    if (exfat_active == 0) { return 0 - 1; }
+    var res[24];
+    if (exfat_find(name, namelen, &res) != 1) { return 0 - 1; }   # not found
+    var first = load64(&res);
+    var len = load64(&res + 8);
+    var nfc = load64(&res + 16);
+    var sec = exfat_set_sec;
+    var slot = exfat_set_slot;
+    var count = exfat_set_count;
+    if (slot + count > 16) { return 0 - 1; }         # set spans a sector (follow-on)
+    # 1. clear InUse on every entry of the set.
+    if (exfat_blk_read(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+    var e = 0;
+    while (e < count) {
+        var ep = &exfat_dir_buf + (slot + e) * 32;
+        store8(ep, load8(ep) & 0x7F);
+        e = e + 1;
+    }
+    if (exfat_blk_write(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+    # 2. free the clusters.
+    if (exfat_free_clusters(first, len, nfc) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Truncate a file to zero: zero the 0xC0 Stream-Extension's allocation
+# (GeneralSecondaryFlags AllocationPossible bit, ValidDataLength,
+# FirstCluster, DataLength) + recompute the SetChecksum, write the dir-set
+# back FIRST (file now empty, no longer references the chain), THEN free the
+# old clusters. Same crash-safe ordering as delete. One-sector set only.
+# Returns 0/-1.
+fn exfat_truncate_zero(name, namelen) {
+    if (exfat_active == 0) { return 0 - 1; }
+    var res[24];
+    if (exfat_find(name, namelen, &res) != 1) { return 0 - 1; }
+    var first = load64(&res);
+    var len = load64(&res + 8);
+    var nfc = load64(&res + 16);
+    var sec = exfat_set_sec;
+    var slot = exfat_set_slot;
+    var count = exfat_set_count;
+    if (slot + count > 16) { return 0 - 1; }
+    if (exfat_blk_read(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+    var setbase = &exfat_dir_buf + slot * 32;
+    var so = 32;                                     # the 0xC0 is entry 1 of the set
+    store8(setbase + so + 1, 0x00);                  # flags: AllocationPossible = 0
+    var z = 0;
+    while (z < 8) { store8(setbase + so + 8 + z, 0); z = z + 1; }   # ValidDataLength = 0
+    store8(setbase + so + 20, 0); store8(setbase + so + 21, 0);     # FirstCluster = 0
+    store8(setbase + so + 22, 0); store8(setbase + so + 23, 0);
+    var z2 = 0;
+    while (z2 < 8) { store8(setbase + so + 24 + z2, 0); z2 = z2 + 1; }   # DataLength = 0
+    # recompute SetChecksum over the set, skipping the 0x85's bytes 2,3.
+    store8(setbase + 2, 0); store8(setbase + 3, 0);
+    var chk = 0;
+    var i = 0;
+    while (i < count * 32) {
+        if (i != 2) { if (i != 3) { chk = exfat_csum16(chk, load8(setbase + i)); } }
+        i = i + 1;
+    }
+    store8(setbase + 2, chk & 0xFF);
+    store8(setbase + 3, (chk >> 8) & 0xFF);
+    if (exfat_blk_write(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+    # free the old clusters.
+    if (exfat_free_clusters(first, len, nfc) != 0) { return 0 - 1; }
+    return 0;
 }
