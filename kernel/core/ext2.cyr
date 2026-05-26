@@ -780,6 +780,12 @@ fn ext2_write_bgdt() {
 fn ext2_grp_off(group)              { return &ext2_bgdt_buf + group * ext2_desc_size; }
 fn ext2_grp_block_bitmap(group)     { return ext2_load32_le(ext2_grp_off(group), 0); }
 fn ext2_grp_inode_bitmap(group)     { return ext2_load32_le(ext2_grp_off(group), 4); }
+fn ext2_grp_inode_table(group)      { return ext2_load32_le(ext2_grp_off(group), 8); }
+# bg_flags (@0x12, u16): bit 0 INODE_UNINIT, bit 1 BLOCK_UNINIT, bit 2
+# INODE_ZEROED. Set on a default `mkfs.ext4` (metadata_csum) for groups whose
+# bitmaps mkfs left un-materialized — see ext2_materialize_* (1.33.4 bite 3).
+fn ext2_grp_bg_flags(group)         { return ext2_load16_le(ext2_grp_off(group), 0x12); }
+fn ext2_grp_set_bg_flags(group, v)  { return ext2_store16_le(ext2_grp_off(group), 0x12, v); }
 fn ext2_grp_free_blocks(group)      { return ext2_load16_le(ext2_grp_off(group), 12); }
 fn ext2_grp_free_inodes(group)      { return ext2_load16_le(ext2_grp_off(group), 14); }
 fn ext2_grp_used_dirs(group)        { return ext2_load16_le(ext2_grp_off(group), 16); }
@@ -917,6 +923,109 @@ fn ext2_bitmap_first_free(buf, limit) {
     return 0 - 1;
 }
 
+# === uninit block-group materialization (WRITE arc 1.33.4 bite 3) ======
+#
+# A default `mkfs.ext4` (metadata_csum) flags metadata-free groups
+# INODE_UNINIT / BLOCK_UNINIT and does NOT write their bitmaps — the on-disk
+# bitmap block is stale/garbage, "calculable from the group descriptor"
+# (ext4 disk layout § bg_flags). The allocators trust the on-disk bitmap, so
+# allocating into an uninit group would scan garbage AND leave the UNINIT
+# flag set → an e2fsck inconsistency on the real partition (the ^uninit_bg
+# 67 MiB smoke is a single group 0 — always initialized — so it never caught
+# this). Materialize = write the correct bitmap + clear the flag, on first
+# allocation into the group.
+#
+# Empirically (dumpe2fs on a default mkfs.ext4): an UNINIT group reports its
+# WHOLE range free — flex_bg relocates every group's bitmaps + inode table
+# into the flex leader, and uninit groups are never sparse_super backups. So
+# the materialized bitmap is "all free" + the standard trailing/padding bits.
+# The guards below REFUSE (→ allocator skips the group) on any group that
+# would carry metadata, so a wrong bitmap is never produced even on an FS
+# that violates that invariant. Reference: Linux ext4_init_block_bitmap /
+# ext4_mark_bitmap_end; e2fsprogs ext2fs_block_bitmap.
+
+# 1 if g holds a superblock + GDT backup (sparse_super: group 0 + powers of
+# 3/5/7; every group when sparse_super is off). Power-of-base via repeated
+# multiply (group counts are tiny — ≤ a few thousand on base-stage FSes).
+fn ext2_is_power_of(n, base) {
+    var v = 1;
+    while (v < n) { v = v * base; }
+    if (v == n) { return 1; }
+    return 0;
+}
+fn ext2_group_has_super(g) {
+    if ((ext2_sb_feature_ro_compat(&ext2_sb_buf) & 0x1) == 0) { return 1; }  # not sparse_super
+    if (g == 0) { return 1; }
+    if (ext2_is_power_of(g, 3) == 1) { return 1; }   # also catches g==1 (3^0)
+    if (ext2_is_power_of(g, 5) == 1) { return 1; }
+    if (ext2_is_power_of(g, 7) == 1) { return 1; }
+    return 0;
+}
+fn ext2_blk_in_group(blk, g_start, g_end) {
+    if (blk < g_start) { return 0; }
+    if (blk >= g_end)  { return 0; }
+    return 1;
+}
+
+# Inode-table blocks per group = ceil(inodes_per_group * inode_size / bs).
+fn ext2_itable_blocks() {
+    return (ext2_inodes_per_group * ext2_inode_size + ext2_blocksize - 1) / ext2_blocksize;
+}
+
+# Materialize an INODE_UNINIT group's inode bitmap: all inodes free (the
+# group has none in use — group 0, which holds reserved inodes, is never
+# uninit), with bits beyond inodes_per_group padded to 1 (ext4_mark_bitmap_end).
+# Writes the bitmap, sets its csum, clears INODE_UNINIT. Returns 0 / -1.
+fn ext2_materialize_inode_bitmap(g) {
+    var nbits = ext2_blocksize * 8;
+    var z = 0;
+    while (z < ext2_blocksize) { store8(&ext2_bitmap_buf + z, 0); z = z + 1; }
+    var pad = ext2_inodes_per_group;
+    while (pad < nbits) { ext2_bitmap_set(&ext2_bitmap_buf, pad); pad = pad + 1; }
+    var ibmp = ext2_grp_inode_bitmap(g);
+    if (ext2_write_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+    if (ext2_csum_on != 0) { ext2_set_inode_bitmap_csum(g, &ext2_bitmap_buf); }
+    ext2_grp_set_bg_flags(g, ext2_grp_bg_flags(g) & (0xFFFF ^ 0x1));   # clear INODE_UNINIT
+    return 0;
+}
+
+# Materialize a BLOCK_UNINIT group's block bitmap: all blocks free, with
+# trailing blocks past s_blocks_count (final partial group) + bitmap-block
+# padding beyond blocks_per_group marked used. REFUSES (-1 → allocator skips
+# the group) if the group could carry metadata — a super backup, or its own
+# bitmaps/inode-table landing in-group — so "all free" is never wrong.
+fn ext2_materialize_block_bitmap(g) {
+    if (ext2_group_has_super(g) != 0) { return 0 - 1; }    # backup group → has meta
+    var bpg     = ext2_blocks_per_group;
+    var g_start = ext2_first_data_block + g * bpg;
+    var g_end   = g_start + bpg;
+    if (ext2_blk_in_group(ext2_grp_block_bitmap(g), g_start, g_end) == 1) { return 0 - 1; }
+    if (ext2_blk_in_group(ext2_grp_inode_bitmap(g), g_start, g_end) == 1) { return 0 - 1; }
+    var itab = ext2_grp_inode_table(g);
+    var itn  = ext2_itable_blocks();
+    if (ext2_blk_in_group(itab, g_start, g_end) == 1) { return 0 - 1; }
+    if (ext2_blk_in_group(itab + itn - 1, g_start, g_end) == 1) { return 0 - 1; }
+
+    var nbits = ext2_blocksize * 8;
+    var z = 0;
+    while (z < ext2_blocksize) { store8(&ext2_bitmap_buf + z, 0); z = z + 1; }
+    # padding beyond blocks_per_group within the bitmap block
+    var pad = bpg;
+    while (pad < nbits) { ext2_bitmap_set(&ext2_bitmap_buf, pad); pad = pad + 1; }
+    # trailing blocks past the FS end (final partial group)
+    var total = ext2_sb_blocks_count(&ext2_sb_buf);
+    if (g_end > total) {
+        var b = total - g_start;
+        if (b < 0) { b = 0; }
+        while (b < bpg) { ext2_bitmap_set(&ext2_bitmap_buf, b); b = b + 1; }
+    }
+    var bbmp = ext2_grp_block_bitmap(g);
+    if (ext2_write_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+    if (ext2_csum_on != 0) { ext2_set_block_bitmap_csum(g, &ext2_bitmap_buf); }
+    ext2_grp_set_bg_flags(g, ext2_grp_bg_flags(g) & (0xFFFF ^ 0x2));   # clear BLOCK_UNINIT
+    return 0;
+}
+
 # --- block allocator --------------------------------------------------
 # goal = a block to allocate near (its group is tried first); 0 = no hint.
 # Returns the allocated block#, 0 on ENOSPC, -1 on IO/guard error.
@@ -938,21 +1047,30 @@ fn ext2_alloc_block(goal) {
 
         if (ext2_read_bgdt() != 0) { return 0 - 1; }
         if (ext2_grp_free_blocks(group) > 0) {
-            var bbmp = ext2_grp_block_bitmap(group);
-            if (ext2_read_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
-            var b = ext2_bitmap_first_free(&ext2_bitmap_buf, ext2_blocks_per_group);
-            if (b >= 0) {
-                # set bit + write bitmap (step 1) — reserve before use
-                ext2_bitmap_set(&ext2_bitmap_buf, b);
-                if (ext2_write_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
-                # accounting last: BGDT then SB (ext2_bgdt_buf still holds
-                # the descriptor table — bitmap read went to a separate buf)
-                if (ext2_csum_on != 0) { ext2_set_block_bitmap_csum(group, &ext2_bitmap_buf); }
-                ext2_grp_set_free_blocks(group, ext2_grp_free_blocks(group) - 1);
-                if (ext2_write_bgdt() != 0) { return 0 - 1; }
-                ext2_sb_set_free_blocks_count(&ext2_sb_buf, ext2_sb_free_blocks_count(&ext2_sb_buf) - 1);
-                if (ext2_write_superblock() != 0) { return 0 - 1; }
-                return ext2_first_data_block + group * ext2_blocks_per_group + b;
+            # Materialize an uninit block group before trusting its on-disk
+            # bitmap; skip it (try the next group) if it can't be safely
+            # materialized (would carry metadata). 1.33.4 bite 3.
+            var bg_ok = 1;
+            if ((ext2_grp_bg_flags(group) & 0x2) != 0) {
+                if (ext2_materialize_block_bitmap(group) != 0) { bg_ok = 0; }
+            }
+            if (bg_ok == 1) {
+                var bbmp = ext2_grp_block_bitmap(group);
+                if (ext2_read_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+                var b = ext2_bitmap_first_free(&ext2_bitmap_buf, ext2_blocks_per_group);
+                if (b >= 0) {
+                    # set bit + write bitmap (step 1) — reserve before use
+                    ext2_bitmap_set(&ext2_bitmap_buf, b);
+                    if (ext2_write_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+                    # accounting last: BGDT then SB (ext2_bgdt_buf still holds
+                    # the descriptor table — bitmap read went to a separate buf)
+                    if (ext2_csum_on != 0) { ext2_set_block_bitmap_csum(group, &ext2_bitmap_buf); }
+                    ext2_grp_set_free_blocks(group, ext2_grp_free_blocks(group) - 1);
+                    if (ext2_write_bgdt() != 0) { return 0 - 1; }
+                    ext2_sb_set_free_blocks_count(&ext2_sb_buf, ext2_sb_free_blocks_count(&ext2_sb_buf) - 1);
+                    if (ext2_write_superblock() != 0) { return 0 - 1; }
+                    return ext2_first_data_block + group * ext2_blocks_per_group + b;
+                }
             }
         }
         gi = gi + 1;
@@ -1000,6 +1118,11 @@ fn ext2_alloc_inode(is_dir) {
     while (group < ng) {
         if (ext2_read_bgdt() != 0) { return 0 - 1; }
         if (ext2_grp_free_inodes(group) > 0) {
+            # Materialize an INODE_UNINIT group's bitmap (all-free) + clear the
+            # flag before trusting the on-disk bitmap. 1.33.4 bite 3.
+            if ((ext2_grp_bg_flags(group) & 0x1) != 0) {
+                if (ext2_materialize_inode_bitmap(group) != 0) { return 0 - 1; }
+            }
             var ibmp = ext2_grp_inode_bitmap(group);
             if (ext2_read_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
             var b = ext2_bitmap_first_free(&ext2_bitmap_buf, ext2_inodes_per_group);
@@ -2098,6 +2221,42 @@ fn ext2_symlink(parent_ino, name, name_len, target, target_len) {
     return ino;
 }
 
+# === Symlink resolution (WRITE arc 1.33.4) ============================
+# Scratch for ext2_path_lookup's symlink following. Module-global `var
+# X[N]` = N×u64 bytes ([[cyrius-var-array-u64-units]]): [512] = 4096 B =
+# PATH_MAX; [64] = 512 B ≥ inode_size (256). Single-threaded kernel (shell
+# context) → safe to share; ext2_path_lookup is not re-entrant.
+var ext2_symres_work[512];    # rewritable path being resolved
+var ext2_symres_tmp[512];     # scratch to assemble <target> + <remainder>
+var ext2_symres_inode[64];    # symlink inode scratch (kept off ext2_inode_buf)
+
+# Read a symlink target into `out` (cap bytes); returns length or -1.
+# Fast symlinks (i_blocks == 0) inline the target in the i_block area at
+# inode offset 40; slow symlinks store it in the first data block, mapped
+# extent/indirect-aware via ext2_logical_to_physical (Linux ext4 slow
+# symlinks on an extent FS are extent-mapped — reading i_block[0] as a raw
+# pointer would corrupt). Mirrors ext2_symlink's create-side format split.
+fn ext2_readlink(inode_num, out, cap) {
+    if (ext2_get_inode(inode_num, &ext2_symres_inode) != 0) { return 0 - 1; }
+    if ((ext2_inode_mode(&ext2_symres_inode) & 0xF000) != 0xA000) { return 0 - 1; }
+    var tlen = ext2_inode_filesize(&ext2_symres_inode);
+    if (tlen < 1)   { return 0 - 1; }
+    if (tlen > cap) { return 0 - 1; }
+    if (ext2_inode_blocks_lo(&ext2_symres_inode) == 0) {
+        # FAST: target inline at inode offset 40
+        var k = 0;
+        while (k < tlen) { store8(out + k, load8(&ext2_symres_inode + 40 + k)); k = k + 1; }
+        return tlen;
+    }
+    # SLOW: target in the first data block (direct or extent-mapped)
+    var phys = ext2_logical_to_physical(&ext2_symres_inode, 0);
+    if (phys <= 0) { return 0 - 1; }
+    if (ext2_read_block(phys, &ext2_block_buf) != 0) { return 0 - 1; }
+    var j = 0;
+    while (j < tlen) { store8(out + j, load8(&ext2_block_buf + j)); j = j + 1; }
+    return tlen;
+}
+
 # --- Path lookup (Phase 3) --------------------------------------------
 #
 # Resolves an absolute path "/foo/bar/baz" to an inode number, walking
@@ -2109,7 +2268,13 @@ fn ext2_symlink(parent_ino, name, name_len, target, target_len) {
 #   - leading "/" required; relative paths return -1
 #   - trailing "/" tolerated (treated as empty trailing component, skipped)
 #   - multiple consecutive "/" tolerated
-#   - no symlink resolution in Phase 3 (fast-symlinks queued)
+#   - symlinks ARE resolved (1.33.4): a component that resolves to a
+#     symlink inode is followed — its target (read via ext2_readlink:
+#     fast inline or slow data-block) replaces the symlink + is spliced
+#     ahead of the unparsed remainder. Absolute targets restart at root;
+#     relative targets continue from the directory containing the link.
+#     ELOOP-capped at 8 follows (Linux MAXSYMLINKS=40; 8 is ample for
+#     base-stage and bounds the shared-scratch reuse).
 #   - no ".."/"." resolution beyond their on-disk dirents (which point
 #     to the right inodes anyway, so walking through them works trivially)
 
@@ -2125,21 +2290,29 @@ fn ext2_path_lookup(path, path_len) {
     # absolute paths in the AGNOS surface area today.
     if (path_len > 4096) { return 0 - 1; }
 
+    # Copy the input into the rewritable work buffer. On hitting a symlink
+    # we rewrite work = <target> + <unparsed remainder> and re-parse, so the
+    # buffer (not the caller's `path`) is what the loop walks.
+    var wl = path_len;
+    var cp = 0;
+    while (cp < wl) { store8(&ext2_symres_work + cp, load8(path + cp)); cp = cp + 1; }
+
+    var nfollow = 0;
     var current_inode = 2;   # root
     var i = 1;               # skip leading '/'
 
-    while (i < path_len) {
+    while (i < wl) {
         # Skip consecutive '/' separators.
-        while (i < path_len) {
-            if (load8(path + i) != 47) { break; }
+        while (i < wl) {
+            if (load8(&ext2_symres_work + i) != 47) { break; }
             i = i + 1;
         }
-        if (i >= path_len) { break; }
+        if (i >= wl) { break; }
 
         # Find end of current component.
         var comp_start = i;
-        while (i < path_len) {
-            if (load8(path + i) == 47) { break; }
+        while (i < wl) {
+            if (load8(&ext2_symres_work + i) == 47) { break; }
             i = i + 1;
         }
         var comp_len = i - comp_start;
@@ -2147,9 +2320,41 @@ fn ext2_path_lookup(path, path_len) {
         if (comp_len > 255) { return 0 - 1; }   # ext2 max name_len = 255
 
         # Walk the current dir to find the component.
-        var next_inode = ext2_dir_lookup(current_inode, path + comp_start, comp_len);
+        var next_inode = ext2_dir_lookup(current_inode, &ext2_symres_work + comp_start, comp_len);
         if (next_inode == 0 - 1) { return 0 - 1; }
         if (next_inode == 0)     { return 0; }    # not found
+
+        # Symlink? Follow it. (i now points just past the component — at the
+        # '/' before the remainder, or at wl if this was the last component.)
+        if (ext2_get_inode(next_inode, &ext2_symres_inode) != 0) { return 0 - 1; }
+        if ((ext2_inode_mode(&ext2_symres_inode) & 0xF000) == 0xA000) {
+            nfollow = nfollow + 1;
+            if (nfollow > 8) { return 0 - 1; }   # ELOOP
+
+            var tlen = ext2_readlink(next_inode, &ext2_symres_tmp, 4096);
+            if (tlen < 1) { return 0 - 1; }
+
+            # Append the unparsed remainder (work[i..wl), includes its leading
+            # '/') to the target in tmp, then copy tmp back over work. Reading
+            # the remainder out of work BEFORE writing work keeps it intact.
+            var rem_len = wl - i;
+            if (tlen + rem_len > 4096) { return 0 - 1; }
+            var r = 0;
+            while (r < rem_len) {
+                store8(&ext2_symres_tmp + tlen + r, load8(&ext2_symres_work + i + r));
+                r = r + 1;
+            }
+            wl = tlen + rem_len;
+            var c = 0;
+            while (c < wl) { store8(&ext2_symres_work + c, load8(&ext2_symres_tmp + c)); c = c + 1; }
+
+            # Absolute target restarts at root; relative continues from the
+            # directory that contained the link (current_inode, unchanged).
+            if (wl > 0) { if (load8(&ext2_symres_work) == 47) { current_inode = 2; } }
+            i = 0;
+            continue;
+        }
+
         current_inode = next_inode;
     }
 
@@ -2848,6 +3053,83 @@ fn ext2_write_selftest() {
     }
     if (wss == 1) { kprintln("ext2w: Wsym slow OK", 19); }
     else          { kprintln("ext2w: Wsym slow MISMATCH", 25); }
+
+    # === Wsymres: symlink RESOLUTION (1.33.4 bite 2) ===
+    # ext2_path_lookup now FOLLOWS symlinks. /sl_f → "/hl_b.txt" (created in
+    # Whard above, content "HL"); resolving /sl_f must yield hl_b.txt's inode
+    # — pre-1.33.4 it returned the symlink's own inode. A relative link and a
+    # self-referential ELOOP cycle exercise the relative + cap paths.
+    var wsr = 1;
+    var tgt_ino = ext2_path_lookup("/hl_b.txt", 9);
+    if (tgt_ino <= 0) { wsr = 0; }
+    if (ext2_path_lookup("/sl_f", 5) != tgt_ino) { wsr = 0; }   # absolute target → same inode
+
+    # relative symlink /rl → "hl_b.txt" (no leading '/'); resolves in root.
+    var rl = ext2_symlink(2, "rl", 2, "hl_b.txt", 8);
+    if (rl <= 0) { wsr = 0; }
+    if (rl > 0) {
+        if (ext2_path_lookup("/rl", 3) != tgt_ino) { wsr = 0; }   # relative target → same inode
+    }
+
+    # ELOOP: /lp → "lp" (points at itself); lookup must bail (-1), not hang.
+    var lp = ext2_symlink(2, "lp", 2, "lp", 2);
+    if (lp <= 0) { wsr = 0; }
+    if (lp > 0) {
+        if (ext2_path_lookup("/lp", 3) != 0 - 1) { wsr = 0; }     # ELOOP → -1
+    }
+    if (wsr == 1) { kprintln("ext2w: Wsymres resolve OK", 25); }
+    else          { kprintln("ext2w: Wsymres resolve MISMATCH", 31); }
+
+    # === Wuninit: uninit-group materialization (1.33.4 bite 3) ===
+    # Only meaningful on a multi-group flex_bg image (the 67 MiB write-smoke
+    # is a single group 0 → SKIP). Scan for the first INODE_UNINIT + first
+    # BLOCK_UNINIT group; exercise materialization on each. BLOCK side goes
+    # through the real allocator (goal-directed) to prove the integrated
+    # path; INODE side materializes directly (alloc is first-fit, so it can't
+    # be steered to a high group — the block path proves the integration).
+    var wun = 1;
+    var did_uninit = 0;
+    if (ext2_read_bgdt() == 0) {
+        var ung = ext2_ngroups();
+        var gi = 0 - 1;
+        var gb = 0 - 1;
+        var ug = 0;
+        while (ug < ung) {
+            var fl = ext2_grp_bg_flags(ug);
+            if (gi < 0) { if ((fl & 0x1) != 0) { gi = ug; } }
+            if (gb < 0) { if ((fl & 0x2) != 0) { gb = ug; } }
+            ug = ug + 1;
+        }
+        # BLOCK_UNINIT: force an allocation into gb (goal) → materialize+alloc.
+        if (gb > 0) {
+            did_uninit = 1;
+            var goal = ext2_first_data_block + gb * ext2_blocks_per_group;
+            var blk = ext2_alloc_block(goal);
+            if (blk <= 0) { wun = 0; }
+            else {
+                var bgrp = (blk - ext2_first_data_block) / ext2_blocks_per_group;
+                if (bgrp != gb) { wun = 0; }                 # alloc must land in gb
+                if (ext2_read_bgdt() != 0) { wun = 0; }
+                else { if ((ext2_grp_bg_flags(gb) & 0x2) != 0) { wun = 0; } }  # flag cleared
+                ext2_free_block(blk);                        # restore free count
+            }
+        }
+        # INODE_UNINIT: materialize directly + persist via ext2_write_bgdt.
+        if (gi > 0) {
+            did_uninit = 1;
+            if (ext2_read_bgdt() != 0) { wun = 0; }
+            else {
+                if (ext2_materialize_inode_bitmap(gi) != 0) { wun = 0; }
+                if (ext2_write_bgdt() != 0) { wun = 0; }
+                if ((ext2_grp_bg_flags(gi) & 0x1) != 0) { wun = 0; }  # flag cleared
+            }
+        }
+    }
+    if (did_uninit == 0) { kprintln("ext2w: Wuninit SKIP (single-group image)", 40); }
+    else {
+        if (wun == 1) { kprintln("ext2w: Wuninit materialize OK", 29); }
+        else          { kprintln("ext2w: Wuninit materialize MISMATCH", 35); }
+    }
 
     # === Wsync: s_state dirty/clean + sync (1.33.3 bite 4 — cycle close) ===
     # All the bites above mutated, so the first write already cleared

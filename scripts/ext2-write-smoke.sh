@@ -265,6 +265,14 @@ for ws in "Wsym fast" "Wsym slow"; do
     fi
 done
 
+# Wsymres: symlink RESOLUTION (1.33.4 bite 2) — ext2_path_lookup follows a
+# fast symlink to its target inode, a relative symlink, and bails on ELOOP.
+if strings "$LOG" | grep -q "ext2w: Wsymres resolve OK"; then
+    echo "  PASS: Wsymres (resolve fast/relative symlink + ELOOP cap)"
+else
+    echo "  FAIL: Wsymres symlink resolution"; rc=1
+fi
+
 # Wsync: s_state dirty/clean + sync (1.33.3 bite 4) — first write cleared
 # EXT2_VALID_FS (dirty), sync set it back (clean).
 if strings "$LOG" | grep -q "ext2w: Wsync state OK"; then

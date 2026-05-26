@@ -59,11 +59,11 @@ exit(0 if ok else 1)
 " 2>/dev/null
     check "x86 valid multiboot ELF" "0" "$?"
 
-    # Size check — ceiling bumped to 700KB at 1.31.3 to leave room for the
-    # rest of the storage cycle (RAM-disk + VirtIO-blk modern + ext2 still
-    # to land). 1.31.3 USB MS Phase 2.8 alone took the binary 475→502 KB.
+    # Size check — ceiling bumped to 700KB at 1.31.3, then 800KB at 1.33.4
+    # (the WRITE arc + symlink resolution + uninit materialization carried the
+    # binary 675→708 KB; it crossed 700KB with bites 2/3 of 1.33.4).
     SZ=$(wc -c < $ROOT/build/agnos_test 2>/dev/null || echo 0)
-    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 700000 ]; then
+    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 800000 ]; then
         check "x86 size reasonable (${SZ}B)" "0" "0"
     else
         check "x86 size reasonable (${SZ}B)" "0" "1"
