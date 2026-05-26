@@ -5,9 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — exFAT write parity (the 1.34.2 cut — code-complete, awaiting cycle-open VERSION bump + tag) (`core/exfat.cyr`, `core/main.cyr`, `scripts/exfat-write-smoke.sh`)
+## [1.34.2] — 2026-05-26 (**exFAT write parity** — first cut of the 1.34.x write-completeness continuation (agnos roadmap row 21), bringing exFAT up to FAT's bite-3e level: overwrite-existing, arbitrary-length truncate, PercentInUse maintenance, ENOSPC rollback. The non-verb carry-forwards from the 1.34.0 (FAT) + 1.34.1 (exFAT) minor are landing as 4 themed in-arc cuts (1.34.2–1.34.5); shell verbs stay deferred to the 1.39.x VFS generic-write lift. QEMU/`fsck.exfat`-validated; no iron burn (final-bite only).)
 
-First cut of the **1.34.x write-completeness continuation** (agnos roadmap row 21): brings exFAT up to FAT's bite-3e level. QEMU/`fsck.exfat`-validated; no VERSION bump yet.
+### Added — exFAT write parity (`core/exfat.cyr`, `core/main.cyr`, `scripts/exfat-write-smoke.sh`)
+
+Brings exFAT up to FAT's bite-3e level. QEMU/`fsck.exfat`-validated.
 
 - **overwrite-existing** — `exfat_write_file` no longer refuses an existing name: it allocates + writes the new data, then repoints the existing dir-set in place (`exfat_set_update_alloc` rewrites the `0xC0` Stream-Extension's flags/`ValidDataLength`/`FirstCluster`/`DataLength` + recomputes the SetChecksum) and frees the old clusters **after** repointing — so a crash before the repoint leaves the old file intact + leaked new clusters, never a dangling pointer.
 - **arbitrary-length truncate** — new `exfat_truncate(name, newlen)` (shrink only; grow refused): shrinks `DataLength`/`ValidDataLength` + recomputes the SetChecksum first, then frees the orphaned tail clusters (contiguous `NoFatChain`; chained-file tail-free is a follow-on). `exfat_truncate_zero` remains for the newlen==0 case.
