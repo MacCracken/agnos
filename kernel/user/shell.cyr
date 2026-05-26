@@ -589,6 +589,16 @@ fn sh_cmd_ln(arg, arglen) {
     return 0;
 }
 
+# `sync` — mark the FS cleanly-unmounted (s_state VALID_FS) + flush the
+# superblock (1.33.3 bite 4). Run it before pulling power so e2fsck sees
+# a clean FS; skip it and a yanked burn shows "not cleanly unmounted".
+fn sh_cmd_sync() {
+    if (ext2_active == 0) { kprintln("sync: no fs", 11); return 0; }
+    if (ext2_sync() != 0) { kprintln("sync: failed (ro fs?)", 21); return 0; }
+    kprintln("sync: clean", 11);
+    return 0;
+}
+
 # `echo TEXT > FILE` — write TEXT + newline to FILE (create or truncate).
 # `text`/`textlen` = the bytes before '>'; `fname`/`fnamelen` = after.
 fn sh_echo_redirect(text, textlen, fname, fnamelen) {
@@ -663,6 +673,7 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "rmdir", 5) == 1) { return sh_cmd_rmdir(arg, arglen); }
     if (sh_streq(buf, clen, "mv", 2) == 1)    { return sh_cmd_mv(arg, arglen); }
     if (sh_streq(buf, clen, "ln", 2) == 1)    { return sh_cmd_ln(arg, arglen); }
+    if (sh_streq(buf, clen, "sync", 4) == 1)  { return sh_cmd_sync(); }
     if (sh_streq(buf, clen, "lspci", 5) == 1) {
         for (var i = 0; i < pci_count; i = i + 1) {
             var base = &pci_devs + i * 32;

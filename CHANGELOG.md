@@ -27,6 +27,14 @@ First WRITE follow-on. **`ext2_rename(src_parent, src_name, dst_parent, dst_name
 
 **Verified** — `ext2-write-smoke.sh` on `metadata_csum,64bit,extent`: `Wsym fast` (inline target, `i_blocks=0`) + `Wsym slow` (data-block target) OK; **`e2fsck -fn` clean** (validates both fast/slow symlink formats); host `debugfs` confirms `/sl_f` is a symlink with fast-link target `/hl_b.txt`, and `/sl_s` is a slow symlink. No regression. Build 686,576 → **690,816 B**.
 
+### Added — bite 4: `s_state` dirty/clean + `sync` verb (`ext2.cyr`, `shell.cyr`) — closes 1.33.3
+
+The honest no-journal story (prior-art § 10 item 4). **`ext2_mark_dirty()`** clears `EXT2_VALID_FS` in the superblock `s_state` (offset 0x3A) on the FIRST write of a mount and flushes the SB, latched by an in-memory `ext2_fs_dirty` flag (so the dirty SB is written once); hooked into `ext2_write_block` — safe because `ext2_write_superblock` writes via `blk_write` directly, not through `write_block`, so no recursion. **`ext2_sync()`** sets `EXT2_VALID_FS` back + flushes. So a power-cycle *after* `sync` leaves an e2fsck-"clean" FS, while a yanked burn *without* `sync` leaves it "not cleanly unmounted" → the user knows to check. AGNOS writes synchronously through `blk_write` (no writeback cache, § 2.3), so there's no cached data to flush here — only the state bit; a real drive FLUSH-CACHE barrier is the separate 1.33.5 item. Plus the **`sync` shell verb**.
+
+**Verified** — `ext2-write-smoke.sh` on `metadata_csum,64bit,extent`: `Wsync state` confirms `s_state` reads DIRTY after the earlier bites' writes and CLEAN after `sync`; host `debugfs show_super_stats` confirms on-disk **Filesystem state: clean**; **`e2fsck -fn` clean**. No regression. Build 690,816 → **692,112 B**.
+
+**1.33.3 CYCLE CLOSED (QEMU-complete)** — the four dirent-mutation follow-ons (rename/`mv`, hardlink/`ln`, symlink-create/`ln -s`, `s_state`/`sync`) all land `e2fsck -fn`-clean on the real default-`mkfs.ext4` profile. An iron burn (`mv`/`ln`/`ln -s` on the real partition → power-cycle → persists) is available but user-driven, not auto-proposed.
+
 ## [1.33.2] — 2026-05-25 (lockup-hardening — bench + serial stability. A reported lockup at the **idle shell, a few seconds–to–a-minute *after* `bench` completes** (not during) prompted fixes for the three small unbounded/unguarded spots in the bench + serial path — concrete defects that could leave corrupted state for the per-tick scheduler to trip later. Cut and released on its own as the stability fix. The ext2/ext4 WRITE follow-ons (rename / hardlink / symlink-create + `s_state`/`sync`) originally scoped under this number **moved to 1.33.3** — see that entry and [`iron-nuc-zen-log.md#tracker-1333-cycle`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md#tracker-1333-cycle).)
 
 ### Fixed — lockup-hardening: bounded serial poll + bench memory guards

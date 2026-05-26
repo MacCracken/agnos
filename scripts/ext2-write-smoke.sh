@@ -265,6 +265,14 @@ for ws in "Wsym fast" "Wsym slow"; do
     fi
 done
 
+# Wsync: s_state dirty/clean + sync (1.33.3 bite 4) — first write cleared
+# EXT2_VALID_FS (dirty), sync set it back (clean).
+if strings "$LOG" | grep -q "ext2w: Wsync state OK"; then
+    echo "  PASS: Wsync state (dirty-on-write → clean-on-sync)"
+else
+    echo "  FAIL: Wsync state"; rc=1
+fi
+
 # W4b: shell write verbs driven headlessly via sh_exec. The proof is the
 # `cat` of the echo-redirected file printing "SHELL-WROTE-IT" back.
 if strings "$LOG" | grep -q "SHELL-WROTE-IT"; then
@@ -371,6 +379,14 @@ else
 fi
 slstype=$(debugfs -R "stat /sl_s" "$WORK/part-post.img" 2>/dev/null | grep -oE "Type: [a-z]+" | head -1 | awk '{print $2}')
 [ "$slstype" = "symlink" ] && echo "  PASS: /sl_s is a symlink on disk (slow)" || { echo "  FAIL: /sl_s type='$slstype' (want symlink)"; rc=1; }
+
+# Wsync host verification: `sync` left the on-disk superblock marked clean.
+fsstate=$(debugfs -R "show_super_stats -h" "$WORK/part-post.img" 2>/dev/null | grep -i "Filesystem state:" | head -1)
+if echo "$fsstate" | grep -q "clean"; then
+    echo "  PASS: on-disk superblock state = clean (sync set EXT2_VALID_FS)"
+else
+    echo "  FAIL: superblock state not clean after sync ('$fsstate')"; rc=1
+fi
 if debugfs -R "stat /shtmp" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
     echo "  FAIL: /shtmp still present (shell rm didn't persist)"; rc=1
 else

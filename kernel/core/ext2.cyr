@@ -19,6 +19,7 @@
 var ext2_active             = 0;    # 0 = not mounted; 1 = mounted
 var ext2_write_ok           = 0;    # WRITE arc: 1 = FS is write-safe; set at mount (refuses metadata_csum / uninit_bg / bigalloc until the csum bites land — 64bit supported since 1.33.1 bite 1). Doc §§ 10, 14
 var ext2_csum_on            = 0;    # 1 = metadata_csum FS (ro_compat 0x400); set at mount — every metadata block carries a CRC32c (1.33.1 bites 2+)
+var ext2_fs_dirty           = 0;    # WRITE arc 1.33.3 bite 4: 1 once we've cleared s_state EXT2_VALID_FS on the first write this mount; `sync` sets it back. In-memory latch so we flush the dirty SB only once. Doc § 10 item 4
 var ext2_csum_seed          = 0;    # crc32c seed for per-metadata checksums: UUID-derived, or s_checksum_seed if the CSUM_SEED feature is set; computed at mount
 var ext2_desc_size          = 32;   # BGDT entry size: 32 (legacy) or 64 (ext4 64BIT)
 var ext2_blocksize          = 0;    # bytes per FS block (1024/2048/4096)
@@ -543,6 +544,7 @@ fn ext2_blk_write(sector, buf) {
 }
 
 fn ext2_write_block(block_num, buf) {
+    ext2_mark_dirty();          # 1.33.3 bite 4: first write of the mount clears s_state VALID_FS
     var lba = ext2_block_to_lba(block_num);
     for (var i = 0; i < ext2_sectors_per_block; i = i + 1) {
         if (ext2_blk_write(lba + i, buf + i * 512) != 0) {
@@ -566,6 +568,40 @@ fn ext2_write_superblock() {
     var base = ext2_partition_first_lba + 2;
     if (ext2_blk_write(base,     &ext2_sb_buf)       != 0) { return 0 - 1; }
     if (ext2_blk_write(base + 1, &ext2_sb_buf + 512) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# === s_state dirty/clean + sync (WRITE arc 1.33.3 — bite 4, cycle close)
+#
+# The honest no-journal story (doc § 10 item 4). s_state lives at SB offset
+# 0x3A (u16); bit 0 = EXT2_VALID_FS ("cleanly unmounted"). On the FIRST write
+# of a mount we clear it (mark dirty) and flush the SB; `sync` sets it back.
+# So a power-cycle AFTER `sync` leaves an e2fsck-"clean" FS, while a yanked
+# burn WITHOUT `sync` leaves VALID_FS clear → e2fsck reports "not cleanly
+# unmounted" and the user knows to run a check. AGNOS writes synchronously
+# through blk_write (no writeback cache, prior-art § 2.3), so there is no
+# cached data to flush here — only the state bit. A real drive FLUSH-CACHE
+# barrier is the separate 1.33.5 bite. NOTE write_superblock writes via
+# blk_write directly (not ext2_write_block), so calling it from the
+# write_block hook does not recurse.
+fn ext2_mark_dirty() {
+    if (ext2_write_ok == 0) { return 0; }
+    if (ext2_fs_dirty != 0) { return 0; }                  # already dirty — no-op
+    ext2_fs_dirty = 1;
+    var st = ext2_load16_le(&ext2_sb_buf, 0x3A);
+    ext2_store16_le(&ext2_sb_buf, 0x3A, st & 0xFFFE);      # clear EXT2_VALID_FS
+    ext2_write_superblock();                               # flush (recomputes SB csum)
+    return 0;
+}
+
+# Mark the FS clean (set EXT2_VALID_FS) + flush the superblock. Returns 0/-1.
+fn ext2_sync() {
+    if (ext2_active == 0) { return 0 - 1; }
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    var st = ext2_load16_le(&ext2_sb_buf, 0x3A);
+    ext2_store16_le(&ext2_sb_buf, 0x3A, st | 0x0001);      # set EXT2_VALID_FS
+    ext2_fs_dirty = 0;
+    if (ext2_write_superblock() != 0) { return 0 - 1; }
     return 0;
 }
 
@@ -2812,6 +2848,19 @@ fn ext2_write_selftest() {
     }
     if (wss == 1) { kprintln("ext2w: Wsym slow OK", 19); }
     else          { kprintln("ext2w: Wsym slow MISMATCH", 25); }
+
+    # === Wsync: s_state dirty/clean + sync (1.33.3 bite 4 — cycle close) ===
+    # All the bites above mutated, so the first write already cleared
+    # EXT2_VALID_FS → s_state must read DIRTY now. sync sets it back → CLEAN,
+    # and leaves the post-boot image e2fsck-"cleanly unmounted".
+    var wsy = 1;
+    var st_dirty = ext2_load16_le(&ext2_sb_buf, 0x3A);
+    if ((st_dirty & 0x0001) != 0) { wsy = 0; }              # expect VALID_FS CLEAR (dirty)
+    if (ext2_sync() != 0) { wsy = 0; }
+    var st_clean = ext2_load16_le(&ext2_sb_buf, 0x3A);
+    if ((st_clean & 0x0001) == 0) { wsy = 0; }              # expect VALID_FS SET (clean)
+    if (wsy == 1) { kprintln("ext2w: Wsync state OK", 21); }
+    else          { kprintln("ext2w: Wsync state MISMATCH", 27); }
 
     return 0;
 }
