@@ -215,6 +215,28 @@ else
     echo "  FAIL: LFN-content mismatch ($(wc -c < "$WORK/lfnc.bin" 2>/dev/null) B; want 3000)"; rc=1
 fi
 
+# 12. LFN-name overwrite-match (1.34.3 bite 2): LfnOver12345.bin written
+#     3000 B then overwritten 2000 B BY ITS LONG NAME. If overwrite-match
+#     worked → ONE entry, 2000 B. If find missed the long name → a duplicate
+#     under a fresh ~N alias (count 2) and mtype returns the stale 3000 B.
+if strings "$LOG" | grep -q "fatw: lfn-overwrite rc1=0 rc2=0"; then
+    echo "  PASS: fatfs_write_file_lfn overwrite rc1=0 rc2=0"
+else
+    echo "  FAIL: lfn-overwrite (no 'fatw: lfn-overwrite rc1=0 rc2=0' in log)"; rc=1
+fi
+LO_COUNT=$(mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -c "LfnOver12345.bin")
+if [ "$LO_COUNT" = "1" ]; then
+    echo "  PASS: LfnOver12345.bin is a SINGLE dir entry (overwrite-match, no duplicate)"
+else
+    echo "  FAIL: LfnOver12345.bin appears $LO_COUNT times (overwrite-match missed → duplicate long name)"; rc=1
+fi
+mtype -i "$WORK/esp.img" ::LfnOver12345.bin > "$WORK/lfno.bin" 2>/dev/null
+if head -c 2000 "$WORK/pattern.bin" | cmp -s - "$WORK/lfno.bin"; then
+    echo "  PASS: LfnOver12345.bin = 2000 B second write byte-exact (overwrote in place)"
+else
+    echo "  FAIL: LfnOver12345.bin mismatch ($(wc -c < "$WORK/lfno.bin" 2>/dev/null) B; want 2000)"; rc=1
+fi
+
 echo ""
 echo "=========================================="
 if [ "$rc" = "0" ]; then echo "FAT write smoke (3a-3e + 1.34.3 LFN-content): PASS"; else echo "FAT write smoke: FAIL"; fi

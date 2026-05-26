@@ -1113,6 +1113,62 @@ fn fatfs_write_file_lfn(name, namelen, src, len) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (fatfs_type == 12) { return 0 - 1; }
     if (fatfs_name_fits_83(name, namelen) == 1) { return fatfs_write_file(name, namelen, src, len); }
+
+    # Overwrite-match (1.34.3 bite 2): if a file with this LONG name already
+    # exists, replace its content IN PLACE — preserve the 8.3 alias + the LFN
+    # entries (the name is unchanged, so the LFN checksum stays valid); only
+    # the cluster pointer + size change. Without this, a second write would
+    # create a duplicate long name under a fresh ~N alias. Crash-safe order:
+    # clear the dirent's cluster+size + free the old chain BEFORE writing new
+    # data, then repoint — a crash leaves leaked clusters, never a dangling ptr.
+    var ow[16];
+    if (fatfs_find_lfn(name, namelen, &ow) == 1) {
+        var ot_sec = fatfs_slot_sec;
+        var ot_slot = fatfs_slot_idx;
+        var ow_first = load64(&ow);
+        if (fat_blk_read(ot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        var oep = &fatfs_dir_buf + ot_slot * 32;
+        store8(oep + 20, 0); store8(oep + 21, 0); store8(oep + 26, 0); store8(oep + 27, 0);
+        store8(oep + 28, 0); store8(oep + 29, 0); store8(oep + 30, 0); store8(oep + 31, 0);
+        if (fat_blk_write(ot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        if (ow_first >= 2) { if (fat_free_chain(ow_first) != 0) { return 0 - 1; } }
+        var of = 0;
+        var op = 0;
+        var opos = 0;
+        while (opos < len) {
+            var oc = fat_alloc_cluster();
+            if (oc == 0) { if (of >= 2) { fat_free_chain(of); } return 0 - 1; }
+            if (of == 0) { of = oc; } else { if (fat_set_entry(op, oc) != 0) { return 0 - 1; } }
+            op = oc;
+            var ob = fatfs_first_sector_of_cluster(oc);
+            var os = 0;
+            while (os < fatfs_sectors_per_cluster) {
+                if (opos >= len) { os = fatfs_sectors_per_cluster; }
+                else {
+                    var ok = 0;
+                    while (ok < 512) {
+                        if (opos + ok < len) { store8(&fatfs_data_buf + ok, load8(src + opos + ok)); }
+                        else { store8(&fatfs_data_buf + ok, 0); }
+                        ok = ok + 1;
+                    }
+                    if (fat_blk_write(ob + os, &fatfs_data_buf) != 0) { return 0 - 1; }
+                    opos = opos + 512;
+                    os = os + 1;
+                }
+            }
+        }
+        # repoint the existing 8.3-alias entry (cluster + size; name untouched).
+        if (fat_blk_read(ot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        var rep = &fatfs_dir_buf + ot_slot * 32;
+        store8(rep + 20, (of >> 16) & 0xFF); store8(rep + 21, (of >> 24) & 0xFF);
+        store8(rep + 26, of & 0xFF); store8(rep + 27, (of >> 8) & 0xFF);
+        store8(rep + 28, len & 0xFF); store8(rep + 29, (len >> 8) & 0xFF);
+        store8(rep + 30, (len >> 16) & 0xFF); store8(rep + 31, (len >> 24) & 0xFF);
+        if (fat_blk_write(ot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        fat_fsinfo_mark_unknown();
+        return 0;
+    }
+
     var alias[16];
     if (fatfs_gen_alias(name, namelen, &alias) != 0) { return 0 - 1; }
     var csum = fat_lfn_checksum(&alias);
@@ -1177,5 +1233,120 @@ fn fatfs_write_file_lfn(name, namelen, src, len) {
     store8(ep83 + 31, (len >> 24) & 0xFF);
     if (fat_blk_write(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
     fat_fsinfo_mark_unknown();
+    return 0;
+}
+
+# === LFN-aware find (1.34.3 bite 2) ===
+# The reassembled long name (ASCII low-bytes), up to 255 chars.
+var fatfs_lfn_buf[32];
+
+# Compare the reassembled name (fatfs_lfn_buf[0..nm_len)) to the query,
+# ASCII case-insensitive. Returns 1/0.
+fn fatfs_lfn_eq(name, namelen, nm_len) {
+    if (nm_len != namelen) { return 0; }
+    var i = 0;
+    while (i < namelen) {
+        var a = load8(&fatfs_lfn_buf + i);
+        var b = load8(name + i);
+        if (a >= 97) { if (a <= 122) { a = a - 32; } }
+        if (b >= 97) { if (b <= 122) { b = b - 32; } }
+        if (a != b) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Match one sector's entries with persistent LFN state held in the caller's
+# *_ptr scratch. State layout at `st` (4 x i64): [0]=lfn_max (highest seq =
+# K, 0=no pending run), [1]=lfn_term (terminator char pos, -1=none). Returns
+# 1 (match — result_ptr = [cluster,size], fatfs_slot_sec/idx = the 8.3
+# entry), -1 (0x00 end-of-dir), 0 (continue). Reassembles long names from
+# their reverse-ordered 0x0F runs and matches the LONG name OR the 8.3 name.
+fn fatfs_lfn_scan_sector(sector, name, namelen, result_ptr, st) {
+    var eps = 512 / 32;
+    # the 13 UTF-16 char offsets inside a 0x0F LFN entry.
+    var offs[16];
+    store8(&offs + 0, 1);  store8(&offs + 1, 3);  store8(&offs + 2, 5);
+    store8(&offs + 3, 7);  store8(&offs + 4, 9);  store8(&offs + 5, 14);
+    store8(&offs + 6, 16); store8(&offs + 7, 18); store8(&offs + 8, 20);
+    store8(&offs + 9, 22); store8(&offs + 10, 24); store8(&offs + 11, 28);
+    store8(&offs + 12, 30);
+    if (fat_blk_read(sector, &fatfs_dir_buf) != 0) { return 0; }
+    for (var e = 0; e < eps; e = e + 1) {
+        var ep = &fatfs_dir_buf + e * 32;
+        var fb = load8(ep);
+        if (fb == 0) { return 0 - 1; }                  # end of directory
+        if (fb == 0xE5) { store64(st, 0); store64(st + 8, 0 - 1); }   # deleted → reset run
+        else {
+            var attr = load8(ep + 11);
+            if (attr == 0x0F) {                         # LFN entry — accumulate
+                var seq = fb & 0x1F;
+                if (seq >= 1) {
+                    if (seq > load64(st)) { store64(st, seq); }
+                    var base = (seq - 1) * 13;
+                    var j = 0;
+                    while (j < 13) {
+                        var o = load8(&offs + j);
+                        var lo = load8(ep + o);
+                        var hi = load8(ep + o + 1);
+                        var abs = base + j;
+                        if (lo == 0) { if (hi == 0) { if (load64(st + 8) < 0) { store64(st + 8, abs); } } }
+                        if (lo != 0xFF) { if (abs < 255) { store8(&fatfs_lfn_buf + abs, lo); } }
+                        else { if (hi != 0xFF) { if (abs < 255) { store8(&fatfs_lfn_buf + abs, lo); } } }
+                        j = j + 1;
+                    }
+                }
+            } else {
+                if ((attr & 0x08) != 0) { store64(st, 0); store64(st + 8, 0 - 1); }   # volume label → reset
+                else {
+                    var matched = 0;
+                    var lfn_max = load64(st);
+                    if (lfn_max > 0) {
+                        var nm_len = lfn_max * 13;
+                        if (load64(st + 8) >= 0) { nm_len = load64(st + 8); }
+                        if (fatfs_lfn_eq(name, namelen, nm_len) == 1) { matched = 1; }
+                    }
+                    if (matched == 0) { if (fatfs_match_name(ep, name, namelen) == 1) { matched = 1; } }
+                    if (matched == 1) {
+                        store64(result_ptr, fatfs_entry_cluster(ep));
+                        store64(result_ptr + 8, fatfs_entry_size(ep));
+                        fatfs_slot_sec = sector;
+                        fatfs_slot_idx = e;
+                        return 1;
+                    }
+                    store64(st, 0); store64(st + 8, 0 - 1);   # reset run after each 8.3 entry
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+# LFN-aware root find: like fatfs_find_root but matches the LONG name (via
+# reassembly) OR the 8.3 short name. Returns 1 (result_ptr = [cluster,size],
+# fatfs_slot_sec/idx = 8.3 entry) / 0. FAT32 root chain + FAT12/16 region.
+fn fatfs_find_lfn(name, namelen, result_ptr) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    var st[16];                                   # 2 x i64 state: [0]=lfn_max, [8]=lfn_term
+    store64(&st, 0); store64(&st + 8, 0 - 1);
+    if (fatfs_type == 32) {
+        var clus = fatfs_root_cluster;
+        while (clus >= 2) {
+            var base = fatfs_first_sector_of_cluster(clus);
+            for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
+                var r = fatfs_lfn_scan_sector(base + s, name, namelen, result_ptr, &st);
+                if (r == 1) { return 1; }
+                if (r < 0) { return 0; }
+            }
+            clus = fat_next_cluster(clus);
+        }
+        return 0;
+    }
+    var root_sectors = (fatfs_root_entry_count * 32 + 511) / 512;
+    for (var s2 = 0; s2 < root_sectors; s2 = s2 + 1) {
+        var r2 = fatfs_lfn_scan_sector(fatfs_root_start + s2, name, namelen, result_ptr, &st);
+        if (r2 == 1) { return 1; }
+        if (r2 < 0) { return 0; }
+    }
     return 0;
 }

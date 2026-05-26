@@ -561,6 +561,18 @@ if (fatfs_active == 1) {
     kprint("fatw: lfn-content rc=", 21);
     kprint_num(lc_rc);
     kprintln("", 0);
+    # 1.34.3 bite 2 — LFN-name overwrite-match: write a long-named file, then
+    # overwrite it BY ITS LONG NAME (find must reassemble the long name, not
+    # 8.3-mangle the query). 3000 B → 2000 B; the smoke verifies the result is
+    # the 2000-B content + a SINGLE dir entry (no duplicate long name).
+    var lo_name = "LfnOver12345.bin";
+    var lo_r1 = fatfs_write_file_lfn(lo_name, 16, &fatfs_file_buf, 3000);
+    var lo_r2 = fatfs_write_file_lfn(lo_name, 16, &fatfs_file_buf, 2000);
+    kprint("fatw: lfn-overwrite rc1=", 24);
+    kprint_num(lo_r1);
+    kprint(" rc2=", 5);
+    kprint_num(lo_r2);
+    kprintln("", 0);
 }
 #endif
 
