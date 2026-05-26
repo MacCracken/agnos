@@ -89,6 +89,37 @@ dd if=/dev/zero of="$EXPART" bs=512 count="$P2_SECTORS" status=none
 # then spans ~12 clusters, so reading it back exercises the multi-cluster
 # FAT-chain read path the gate validates.
 mkfs.exfat -c 512 "$EXPART" >/dev/null 2>&1 || { echo "ERROR: mkfs.exfat failed"; exit 1; }
+
+# Optional file seed (EXFAT_SEED=1) — exFAT has no userspace file-injector
+# (no mtools-equivalent), so seeding a file needs the in-kernel exfat driver
+# + a privileged loop mount. This will prompt for your sudo password. When
+# seeded, the smoke also gates on `exfatr: file-read OK` (the 0x85/0xC0/0xC1
+# file-set read path). Without it the smoke validates mount + the upcase
+# chain-read oracle only. The seed runs on the standalone exfat.part BEFORE
+# it's dd'd into the image, so it survives.
+SEEDED=0
+if [ -n "${EXFAT_SEED:-}" ]; then
+    echo "Seeding EXFTEST.BIN (3000 B, byte[i]=i%256) via in-kernel exfat mount (sudo)..."
+    python3 - "$WORK/EXFTEST.BIN" <<'PY'
+import sys
+open(sys.argv[1], 'wb').write(bytes(i % 256 for i in range(3000)))
+PY
+    sudo modprobe exfat 2>/dev/null || true
+    MNT="$WORK/mnt"; mkdir -p "$MNT"
+    if sudo mount -t exfat -o loop "$EXPART" "$MNT"; then
+        sudo cp "$WORK/EXFTEST.BIN" "$MNT"/EXFTEST.BIN && sync
+        if sudo umount "$MNT"; then
+            SEEDED=1
+            echo "  seeded."
+        else
+            echo "ERROR: seed umount failed — $MNT still mounted (would leak a loop device). Aborting."
+            exit 1
+        fi
+    else
+        echo "  WARNING: seed mount failed — continuing without a seeded file."
+    fi
+fi
+
 dd if="$EXPART" of="$IMG" bs=512 seek="$P2_FIRST" conv=notrunc status=none
 
 echo "Booting EXFAT_SELFTEST kernel (NVMe + GPT, exFAT MSFT-Basic p2)..."
@@ -101,6 +132,17 @@ timeout "${QEMU_TIMEOUT:-30}" qemu-system-x86_64 \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-EXFATTEST" \
     -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
+
+# A 0-byte log = QEMU never produced serial output (launch failure / host
+# hiccup), NOT an exfat result. Report that honestly instead of emitting
+# misleading per-gate FAILs. Common cause: a stale exfat loop-mount holding
+# a loop device — check `losetup -a` / `mount | grep exfat`.
+if [ ! -s "$LOG" ]; then
+    echo "  ERROR: QEMU produced NO boot output (0-byte log) — launch failure, not an exFAT result."
+    echo "         Check for stale loop mounts:  losetup -a ; mount | grep exfat"
+    echo "         then re-run. Log: $LOG"
+    exit 2
+fi
 
 echo ""
 echo "  --- exfat lines from boot log ---"
@@ -118,11 +160,17 @@ if strings "$LOG" | grep -q "^exfatu: upcase-checksum OK"; then
 else
     echo "  FAIL: upcase-checksum (chain read) — see log"; rc=1
 fi
-# Informational: file readback only if a file was seeded.
-if strings "$LOG" | grep -q "^exfatr: file-read OK"; then
+# File readback: a hard gate when we seeded a file, informational otherwise.
+if [ "$SEEDED" = "1" ]; then
+    if strings "$LOG" | grep -q "^exfatr: file-read OK"; then
+        echo "  PASS: seeded EXFTEST.BIN readback byte-exact (0x85/0xC0/0xC1 file-set read)"
+    else
+        echo "  FAIL: seeded file readback (no 'exfatr: file-read OK' in log)"; rc=1
+    fi
+elif strings "$LOG" | grep -q "^exfatr: file-read OK"; then
     echo "  PASS (bonus): seeded file readback byte-exact"
 elif strings "$LOG" | grep -q "^exfatr: no seeded file"; then
-    echo "  (info) no seeded file — file-set read path compiled, seed EXFTEST.BIN to exercise it"
+    echo "  (info) no seeded file — file-set read path compiled, run EXFAT_SEED=1 to exercise it"
 fi
 
 echo ""
