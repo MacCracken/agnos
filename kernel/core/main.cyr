@@ -276,7 +276,7 @@ if (pci_find(0x1AF4, 0x1000) >= 0) {
     if (virtio_net_init() == 0) {
         kprint("VirtIO-net: MAC=", 16);
         for (var mi = 0; mi < 6; mi = mi + 1) {
-            kprint_num(load8(&vnet_mac + mi));
+            kprint_byte(load8(&vnet_mac + mi));
             if (mi < 5) { kprint(":", 1); }
         }
         kprintln("", 0);
@@ -662,25 +662,35 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
 # Placed post-interrupt-enable so arch_wait() (= HLT) actually waits for
 # a timer tick rather than hanging on no-IRQ. Pre-kybernet so the test
 # completes before the shell loop swallows the boot serial.
-# DHCP client (1.32.0 bite G) — replace the hardcoded 10.0.2.15 in
-# net_init with a real DHCP exchange. Runs unconditionally (no build
-# flag) because DHCP is the standard way to get an IP; SLIRP serves
-# it in QEMU and real LANs serve it on iron. On failure, net_init's
-# pre-set fallback (10.0.2.15 / 10.0.2.2 / 255.255.255.0) stays in
-# place, so the kernel still has a workable address.
+# DHCP client (1.32.0 bite G, re-enabled 1.32.9) — the standard way to
+# get an IP: SLIRP serves it in QEMU, real LANs serve it on iron. The
+# 1.32.3 STATIC bypass that sat here is removed: its OFFER timeout was
+# the r8169 unicast-RX drop fixed at 1.32.7 (RX ring 16->64; both on-LAN
+# and off-LAN TCP handshakes complete on iron), not a DHCP-layer bug.
+# See the 1.32.7 CHANGELOG entry + r8169-iron-burn-audit.md.
 if (vnet_active != 0 || nic_ready() != 0) {
-    # STATIC-IP + ARP-probe test (DHCP bypass) — prove L1/L2/L3 work
-    # before re-attempting DHCP. If gateway ARP replies, the wire is
-    # sound and DHCP is the only broken layer.
-    # AGNOS uses the EEPROM hardware MAC (the LAA override was removed —
-    # arp-probe-raw proved the gateway replies to the real MAC claiming
-    # .222 even with Linux's lease active, so there is no source-guard
-    # concern). .222 is a fresh static IP distinct from Linux's lease.
-    net_init(ip4(192,168,1,222), ip4(192,168,1,1), ip4(255,255,255,0));
-    kprint("net: STATIC ip=192.168.1.222 gw=192.168.1.1", 43);
-    kprintln("", 0);
+    # Iron fallback: seed a workable STATIC address before the DHCP
+    # exchange (192.168.1.222 — the 1.32.3 bypass IP, distinct from
+    # Linux's lease; the EEPROM hardware MAC claiming it draws gateway
+    # ARP replies even with Linux's lease active). On the iron path the
+    # pre-DHCP net_init was net_init(0,0,0), which is not a workable
+    # fallback if DHCP misses. QEMU keeps its 10.0.2.15 SLIRP fallback
+    # from the virtio branch above.
+    if (vnet_active == 0) {
+        net_init(ip4(192,168,1,222), ip4(192,168,1,1), ip4(255,255,255,0));
+    }
+    # dhcp_init() sends DISCOVER from 0.0.0.0 and, on ACK, overwrites
+    # net_ip/net_gateway/net_netmask with the real lease (returns 0,
+    # printing "dhcp: ACK ip=..."). On timeout/NAK it returns nonzero
+    # and the fallback above stays in place.
+    if (dhcp_init() != 0) {
+        kprintln("net: DHCP failed -- using static fallback", 41);
+    }
+    # Resolve the gateway MAC for off-LAN routing. net_gateway now holds
+    # the DHCP-leased gateway (or the static fallback) — the ARP probe
+    # targets whichever we ended with.
     arp_request(net_gateway);
-    kprintln("arp: request -> 192.168.1.1", 27);
+    kprintln("arp: request -> gateway", 23);
     var arp_start = timer_ticks;
     var arp_got = 0;
     # Honest-self-test counters (1325): record what RX actually delivered
@@ -717,12 +727,12 @@ if (vnet_active != 0 || nic_ready() != 0) {
         memcpy(&net_gateway_mac, &arp_cache_mac, 6);
         net_gateway_mac_valid = 1;
         kprint("arp: REPLY gw_mac=", 18);
-        kprint_num(load8(&arp_cache_mac + 0)); kprint(":", 1);
-        kprint_num(load8(&arp_cache_mac + 1)); kprint(":", 1);
-        kprint_num(load8(&arp_cache_mac + 2)); kprint(":", 1);
-        kprint_num(load8(&arp_cache_mac + 3)); kprint(":", 1);
-        kprint_num(load8(&arp_cache_mac + 4)); kprint(":", 1);
-        kprint_num(load8(&arp_cache_mac + 5));
+        kprint_byte(load8(&arp_cache_mac + 0)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 1)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 2)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 3)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 4)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 5));
         kprintln("", 0);
         kprintln("net: L2 OK -- gateway MAC cached", 32);
 

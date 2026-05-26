@@ -5,6 +5,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.32.9] — 2026-05-25 (DHCP re-enablement — the 1.32.3 STATIC bypass is removed and a real DHCP exchange runs again on boot. The OFFER timeout that drove the bypass across the 1.32.x arc was the r8169 unicast-RX drop **fixed at 1.32.7** (RX ring 16→64), not a DHCP-layer bug; with unicast RX delivering on iron, `dhcp_init()` can complete DISCOVER → OFFER → REQUEST → ACK. STATIC (192.168.1.222) stays as the iron fallback so a DHCP miss still leaves a usable address. QEMU/SLIRP DHCP exercised; iron verification is the next burn, user-driven.)
+
+### Changed — boot net-probe re-attempts DHCP (`main.cyr`)
+
+The 1.32.3 STATIC-IP bypass at the boot net-probe (`if (vnet_active != 0 || nic_ready() != 0)`) is removed. It existed only because DHCP's `OFFER timeout` looked like a DHCP bug — the 1.32.x arc proved it was the r8169 **unicast-RX delivery** drop (clean frames dropped for no free descriptor in a 16-deep ring), closed at 1.32.7 by deepening the RX ring 16→64. Both on-LAN and off-LAN unicast handshakes complete on iron at 1.32.7, so the unicast OFFER/ACK that DHCP needs now arrive. The probe now:
+
+- **Seeds a STATIC iron fallback first** — `net_init(192.168.1.222 / 192.168.1.1 / 255.255.255.0)` on the iron path (`vnet_active == 0`) before the exchange, so a DHCP miss leaves a workable address (.222 is distinct from Linux's lease; the EEPROM hardware MAC claiming it draws gateway ARP replies even with Linux's lease active). QEMU keeps its `10.0.2.15` SLIRP fallback from the virtio branch.
+- **Re-attempts `dhcp_init()`** — sends DISCOVER from `0.0.0.0`; on ACK it overwrites `net_ip`/`net_gateway`/`net_netmask` with the real lease (returns 0, printing `dhcp: ACK ip=…`); on timeout/NAK it returns nonzero, prints `net: DHCP failed -- using static fallback`, and the fallback stays in place.
+- **Keeps the gateway ARP probe + L2-OK verdict** unchanged — it now targets whichever gateway we ended with (DHCP-leased or static fallback), caching the gateway MAC for off-LAN routing. The `NET_VERBOSE` `1.1.1.1:80` smoke + r8169 silicon tally readback (1.32.8) remain gated out of production.
+
+No change to the r8169/eth/IP/UDP/DHCP-state-machine code — `dhcp_init()` (`net.cyr`) is unchanged from the 1.32.0 RFC 2131 implementation (BOOTREPLY op-gate, magic-cookie check, xid + chaddr match, 800-iter/~8 s OFFER+ACK windows with midpoint retransmit). This cut is purely the call-site re-enablement.
+
+### Fixed — network-path logging printed base-16 values in decimal
+
+Several net-path log lines used `kprint_num` (decimal) where the value is conventionally hex, so a gateway MAC rendered as `arp: REPLY gw_mac=212:106:145:206:112:96` instead of `d4:6a:91:ce:70:60`, and a line literally labelled `byte=0x` printed a decimal number after the `0x`. Decimal `kprint_num` was simply the wrong formatter for those quantities. Added two framebuffer-visible hex printers in `kprint.cyr` — `kprint_byte(b)` (2-digit zero-padded, fb twin of the serial-only `kfmt_byte`) and `kprint_hex(n)` (variable-width, fb twin of `kfmt_hex`) — and routed every offending net-path site through them:
+
+- **MAC octets → `kprint_byte`** at all four print sites: `main.cyr` `arp: REPLY gw_mac=…` (gateway MAC cached after the ARP probe) + `VirtIO-net: MAC=…` (QEMU enumerate), `r8169.cyr` `r8169: MAC=…` (iron NIC enumerate), and the `shell.cyr` `net` command's `MAC:` line.
+- **r8169 MMIO/BAR base address → `kprint_hex`** — `r8169: found at <decimal>` now prints `r8169: found at 0x<hex>`.
+- **r8169 chip-rev byte → `kprint_byte`** — `r8169: chip-rev byte=0x<decimal>` (the `0x` label contradicting a decimal value) now prints the actual hex byte.
+
+IP addresses (the `net`/`tcp` dotted-quads, `dhcp_print_ip`) and the counter tallies (`r8169_print_stats`' `tx_ok`/`rx_ok`/`missed`/`rx_uc`/…) stay decimal — those are the correct base for each.
+
+### Build
+
+Production **623,816 B** (+552 B vs 1.32.8's 623,264 B — the DHCP call-site re-enable is ~+40 B; the rest is the two new `kprint_byte`/`kprint_hex` helpers + the six net-path logging-site swaps). `scripts/test.sh` **4/4** + `scripts/ext2-smoke.sh` **5/5** (all backends reach `AGNOS shell v` — no boot regression). multiboot2 ELF64 OK, entry `0x1000a8`. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. `build/agnos` reflects HEAD (production, no `NET_VERBOSE`). QEMU smoke harnesses carry no NIC, so they skip the net-probe block; **iron DHCP verification is the next burn (user-driven)** — expect `dhcp: DISCOVER` → `dhcp: OFFER ip=…` → `dhcp: REQUEST` → `dhcp: ACK ip=…` followed by `net: L2 OK -- gateway MAC cached`.
+
 ## [1.32.8] — 2026-05-25 (networking closeout cleanup — the 1.32.x r8169 unicast-RX arc is CONNECTED, so the per-burn diagnostics it accreted come out of the production boot: 1.1.1.1 outbound-TCP smoke + r8169 silicon tally readback gated behind `NET_VERBOSE`; the `.121` on-LAN-peer discriminator removed entirely; shell net commands `net`/`send`/`recv`/`tcp` de-hardcoded off QEMU SLIRP onto `nic_ready()` + the boot-configured gateway so they work on iron. DHCP re-enablement deferred to its own cycle **1.32.9**.)
 
 ### Changed — boot net diagnostics gated behind `NET_VERBOSE`

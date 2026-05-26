@@ -29,3 +29,29 @@ fn kprint_num(n: i64) {
     kprint(&buf, len);
     return 0;
 }
+
+# Print a byte as 2-digit lowercase hex to both serial and fb. MAC octets,
+# register bytes, and other base-16 values want this; kprint_num (decimal)
+# renders them wrong (e.g. a gateway MAC byte 0xD4 as "212"). fb-visible
+# twin of kfmt_byte (which is serial-only). Always 2 digits, zero-padded.
+fn kprint_byte(b) {
+    var hi = (b >> 4) & 0xF;
+    var lo = b & 0xF;
+    var buf[2];
+    if (hi < 10) { store8(&buf, 48 + hi); } else { store8(&buf, 87 + hi); }
+    if (lo < 10) { store8(&buf + 1, 48 + lo); } else { store8(&buf + 1, 87 + lo); }
+    kprint(&buf, 2);
+    return 0;
+}
+
+# Print a value as variable-width lowercase hex (no 0x prefix) to both
+# serial and fb. For MMIO/BAR addresses, register values, and other
+# base-16 quantities where kprint_num (decimal) is the wrong formatter.
+# fb-visible twin of kfmt_hex (serial-only); callers supply their own
+# "0x" literal in the preceding kprint() label.
+fn kprint_hex(n) {
+    var buf[16];
+    var len = fmt_hex_buf(n, &buf);
+    kprint(&buf, len);
+    return 0;
+}

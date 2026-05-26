@@ -435,7 +435,7 @@ fn sh_exec(buf, len) {
         var nmac[8];
         nic_mac(&nmac);
         for (var i = 0; i < 6; i = i + 1) {
-            kprint_num(load8(&nmac + i));
+            kprint_byte(load8(&nmac + i));
             if (i < 5) { kputc(58); }
         }
         kprintln("", 0);

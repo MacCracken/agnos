@@ -410,17 +410,17 @@ fn r8169_probe() {
     r8169_aspm_disable();
 
     # Boot-log summary.
-    kprint("r8169: found at ", 16);
-    kprint_num(mmio);
+    kprint("r8169: found at 0x", 18);
+    kprint_hex(mmio);
     kprintln("", 0);
     kprint("r8169: MAC=", 11);
     for (var i = 0; i < 6; i = i + 1) {
-        kprint_num(load8(&r8169_mac + i));
+        kprint_byte(load8(&r8169_mac + i));
         if (i < 5) { kprint(":", 1); }
     }
     kprintln("", 0);
     kprint("r8169: chip-rev byte=0x", 23);
-    kprint_num(r8169_chip_rev);
+    kprint_byte(r8169_chip_rev);
     kprintln("", 0);
     kprintln("r8169: reset OK", 15);
 
