@@ -308,9 +308,6 @@ if ((pci_find(0x1AF4, 0x1042) >= 0) | (pci_find(0x1AF4, 0x1001) >= 0)) {
         kprint("VirtIO-blk: ", 12);
         kprint_num(vblk_capacity);
         kprintln(" sectors", 8);
-        if (fatfs_init() == 0) {
-            kprintln("FAT16 filesystem mounted", 24);
-        }
     }
 }
 # RAM-disk Phase 1 (1.31.4) — pure-RAM block backend, build-flag gated. When
@@ -433,6 +430,52 @@ kprintln("VFS initialized", 15);
 # verbs that consume ext2_open + vfs_read. See agnosticos/docs/development/
 # ext2-ext4-extents-prior-art.md for the multi-source convergent port.
 ext2_init();
+
+# FAT-family mount (1.34.x) — backend-agnostic, partition-aware probe
+# (lifted out of the old virtio-only branch). Runs after the block
+# backends register + GPT parse so it can find a FAT on any backend or
+# in the ESP / MSFT-Basic partition. Silent on no-FAT (prints its own
+# "fat: mounted FAT.." line on success). Independent of the ext2 mount.
+fatfs_init();
+
+# FAT read self-test (1.34.x bite 2, compile-gated via FATFS_SELFTEST).
+# Gates the FAT32 + chain-traversal read path: list the root, find the
+# seeded multi-cluster FATTEST.BIN (3000 B, byte[i] = i & 0xFF), read it
+# back via the cluster chain, byte-verify at offsets that prove we read
+# PAST the first 512-byte cluster (the old reader's cap). fat-smoke.sh.
+#ifdef FATFS_SELFTEST
+if (fatfs_active == 1) {
+    var fst_lc = fatfs_ls();
+    kprint("fatr: mounted type=", 19);
+    kprint_num(fatfs_type);
+    kprint(" lscount=", 9);
+    kprint_num(fst_lc);
+    kprintln("", 0);
+    var fst_name = "FATTEST.BIN";
+    var fst_res[16];
+    if (fatfs_find_root(fst_name, 11, &fst_res) == 1) {
+        var fst_cl = load64(&fst_res);
+        var fst_sz = load64(&fst_res + 8);
+        var fst_got = fatfs_read(fst_cl, &fatfs_file_buf, 3000);
+        kprint("fatr: FATTEST.BIN size=", 23);
+        kprint_num(fst_sz);
+        kprint(" got=", 5);
+        kprint_num(fst_got);
+        kprintln("", 0);
+        var fst_ok = 1;
+        if (fst_got != 3000) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 0) != 0) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 255) != 255) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 256) != 0) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 1000) != (1000 & 0xFF)) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 2999) != (2999 & 0xFF)) { fst_ok = 0; }
+        if (fst_ok == 1) { kprintln("fatr: chain-read OK", 19); }
+        else { kprintln("fatr: chain-read FAIL", 21); }
+    } else {
+        kprintln("fatr: FATTEST.BIN not found", 27);
+    }
+}
+#endif
 
 # WRITE arc 1.33.x — W1 write-path self-test (compile-gated, opt-in via
 # EXT2_WRITE_SELFTEST=1 ./scripts/build.sh). Non-destructive: proves the

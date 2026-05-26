@@ -1,80 +1,238 @@
-# === FAT16 Filesystem (Read-Only) ===
-# Minimal FAT16 reader for virtio block device
+# === FAT-family Filesystem (FAT12/16/32, Read) ===
+# 1.34.x FAT-family arc. Partition-aware, multi-backend (routes through
+# blk_read_on(fat_backend, fat_partition_first_lba + sector) — mirrors
+# ext2's mount), FAT12/16/32 with cluster-chain traversal. See
+# agnosticos/docs/development/fat-family-prior-art.md. (Was a minimal
+# whole-disk FAT16-RO virtio-only reader before bite 2.)
 var fatfs_active = 0;
 var fatfs_bytes_per_sector = 0;
 var fatfs_sectors_per_cluster = 0;
 var fatfs_reserved_sectors = 0;
 var fatfs_num_fats = 0;
 var fatfs_root_entry_count = 0;
-var fatfs_fat_start = 0;
-var fatfs_root_start = 0;
-var fatfs_data_start = 0;
+var fatfs_fat_start = 0;             # partition-relative LBA of FAT #0
+var fatfs_root_start = 0;            # FAT12/16: partition-relative LBA of fixed root region
+var fatfs_data_start = 0;            # partition-relative LBA of cluster 2
 var fatfs_total_sectors = 0;
-var fatfs_sectors_per_fat = 0;
+var fatfs_sectors_per_fat = 0;       # resolved (FATSz16 or FATSz32)
+var fatfs_type = 0;                  # 12 / 16 / 32 (by CountOfClus, the only correct test)
+var fatfs_root_cluster = 0;          # FAT32: first cluster of the root dir chain
+var fatfs_count_of_clusters = 0;     # data-region cluster count (drives the type test)
+# Mount target — which backend + partition the FS lives on (ext2 pattern).
+var fat_backend = 0;                 # BLK_NONE; set during probe
+var fat_partition_first_lba = 0;     # 0 = whole-disk; partition base LBA otherwise
 var fatfs_boot_buf[64];
 var fatfs_dir_buf[64];
-var fatfs_fat_buf[64];
+var fatfs_fat_buf[64];               # holds the FAT sector being consulted for chain-follow
+var fatfs_fat_buf_sector = 0 - 1;    # which partition-relative LBA fatfs_fat_buf currently caches
 var fatfs_data_buf[64];
+var fatfs_file_buf[512];             # memfile content scratch (4 KB; multi-cluster cat up to one page)
 
-fn fatfs_init() {
-    if (blk_active == 0) { return 0 - 1; }
-    # Read boot sector (sector 0)
-    var r = blk_read(0, &fatfs_boot_buf);
-    if (r != 0) { return 0 - 1; }
+# Partition-relative block read — every fatfs read goes through this, so
+# the FS works on whichever backend/partition the probe matched (NVMe /
+# AHCI / USB-MS / VirtIO), exactly like ext2_blk_read.
+fn fat_blk_read(sector, buf) {
+    return blk_read_on(fat_backend, fat_partition_first_lba + sector, buf);
+}
 
-    # Validate signature at offset 510-511: 0x55, 0xAA
-    var sig_lo = load8(&fatfs_boot_buf + 510);
-    var sig_hi = load8(&fatfs_boot_buf + 511);
-    if (sig_lo != 0x55) { return 0 - 1; }
-    if (sig_hi != 0xAA) { return 0 - 1; }
+# Parse the BPB/EBPB already loaded in fatfs_boot_buf into the region
+# globals + FAT type. FAT12/16/32 per audit § 2.1-2.2. Returns 0 on a
+# valid FAT, -1 otherwise. Does NOT touch fat_backend/partition (the
+# caller set those before reading the boot sector).
+fn fatfs_parse_bpb() {
+    if (load8(&fatfs_boot_buf + 510) != 0x55) { return 0 - 1; }
+    if (load8(&fatfs_boot_buf + 511) != 0xAA) { return 0 - 1; }
 
-    # Parse BPB (BIOS Parameter Block)
     fatfs_bytes_per_sector = load8(&fatfs_boot_buf + 11) | (load8(&fatfs_boot_buf + 12) << 8);
-    # Defensive: GPT-protective MBR also has 0x55/0xAA at byte 510-511 but
-    # zero bytes at offsets 11-12 (no BPB). Without this guard, the root-
-    # sector calc divides by fatfs_bytes_per_sector and traps #DE silently.
-    # Valid FAT sectors are 512/1024/2048/4096; only 512 is common in
-    # practice and is what every test image uses.
+    # 512-only guard also rejects the GPT protective MBR (0x55AA but
+    # zero BPB), which would #DE the geometry divides.
     if (fatfs_bytes_per_sector != 512) { return 0 - 1; }
+
     fatfs_sectors_per_cluster = load8(&fatfs_boot_buf + 13);
-    # Bite (B) BPB validation: sectors_per_cluster must be a power of two
-    # between 1 and 128 per FAT spec. 0 was already refused; this catches
-    # 3/5/7/... and >= 256 which would imply a malformed BPB.
     if (fatfs_sectors_per_cluster == 0) { return 0 - 1; }
     if (fatfs_sectors_per_cluster > 128) { return 0 - 1; }
     var spc_pow2 = fatfs_sectors_per_cluster & (fatfs_sectors_per_cluster - 1);
-    if (spc_pow2 != 0) { return 0 - 1; }   # not power-of-two
+    if (spc_pow2 != 0) { return 0 - 1; }
 
     fatfs_reserved_sectors = load8(&fatfs_boot_buf + 14) | (load8(&fatfs_boot_buf + 15) << 8);
+    if (fatfs_reserved_sectors == 0) { return 0 - 1; }   # >=1 always (FAT32 ~32)
     fatfs_num_fats = load8(&fatfs_boot_buf + 16);
-    # Bite (B) BPB validation: num_fats is 1 or 2 in every realistic FAT
-    # image (spec says "usually 2"). 0 = divide-by-zero-equivalent in the
-    # `fat_start + num_fats * sectors_per_fat` calc below. >2 is technically
-    # legal but never appears in the wild and would imply a malformed BPB.
     if (fatfs_num_fats == 0) { return 0 - 1; }
     if (fatfs_num_fats > 2)  { return 0 - 1; }
 
     fatfs_root_entry_count = load8(&fatfs_boot_buf + 17) | (load8(&fatfs_boot_buf + 18) << 8);
-    # Bite (B) BPB validation: root_entry_count cap. FAT12/16 typically use
-    # 512; FAT32 sets this to 0 (root lives in clusters). The largest legitimate
-    # value capped at 16K entries protects the root-sector calc against
-    # absurd sizes (16K * 32 = 512 KB scan).
     if (fatfs_root_entry_count > 16384) { return 0 - 1; }
 
+    # Total sectors: 16-bit @19, else 32-bit @32.
     fatfs_total_sectors = load8(&fatfs_boot_buf + 19) | (load8(&fatfs_boot_buf + 20) << 8);
     if (fatfs_total_sectors == 0) {
         fatfs_total_sectors = load8(&fatfs_boot_buf + 32) | (load8(&fatfs_boot_buf + 33) << 8) | (load8(&fatfs_boot_buf + 34) << 16) | (load8(&fatfs_boot_buf + 35) << 24);
     }
-    fatfs_sectors_per_fat = load8(&fatfs_boot_buf + 22) | (load8(&fatfs_boot_buf + 23) << 8);
+    if (fatfs_total_sectors == 0) { return 0 - 1; }
 
-    # Compute region offsets
-    fatfs_fat_start = fatfs_reserved_sectors;
+    # FAT size: FATSz16 @22, else FATSz32 @36 (FAT32). The old reader read
+    # only @22 → 0 on FAT32 → broken geometry (audit gap 4).
+    fatfs_sectors_per_fat = load8(&fatfs_boot_buf + 22) | (load8(&fatfs_boot_buf + 23) << 8);
+    if (fatfs_sectors_per_fat == 0) {
+        fatfs_sectors_per_fat = load8(&fatfs_boot_buf + 36) | (load8(&fatfs_boot_buf + 37) << 8) | (load8(&fatfs_boot_buf + 38) << 16) | (load8(&fatfs_boot_buf + 39) << 24);
+    }
+    if (fatfs_sectors_per_fat == 0) { return 0 - 1; }
+
+    # Region geometry (partition-relative sectors).
+    fatfs_fat_start  = fatfs_reserved_sectors;
     fatfs_root_start = fatfs_fat_start + fatfs_num_fats * fatfs_sectors_per_fat;
     var root_sectors = (fatfs_root_entry_count * 32 + fatfs_bytes_per_sector - 1) / fatfs_bytes_per_sector;
     fatfs_data_start = fatfs_root_start + root_sectors;
 
-    fatfs_active = 1;
+    # CountOfClus — the ONLY correct FAT-type test (MS spec, audit § 2.2).
+    var data_sectors = fatfs_total_sectors - fatfs_data_start;
+    fatfs_count_of_clusters = data_sectors / fatfs_sectors_per_cluster;
+    if (fatfs_count_of_clusters < 4085) {
+        fatfs_type = 12;
+    } else {
+        if (fatfs_count_of_clusters < 65525) { fatfs_type = 16; }
+        else { fatfs_type = 32; }
+    }
+
+    # FAT32: root is a cluster chain at RootClus @44. FAT12/16: fixed region.
+    if (fatfs_type == 32) {
+        fatfs_root_cluster = load8(&fatfs_boot_buf + 44) | (load8(&fatfs_boot_buf + 45) << 8) | (load8(&fatfs_boot_buf + 46) << 16) | (load8(&fatfs_boot_buf + 47) << 24);
+        if (fatfs_root_cluster < 2) { return 0 - 1; }
+    } else {
+        fatfs_root_cluster = 0;
+        if (fatfs_root_entry_count == 0) { return 0 - 1; }   # FAT12/16 need a fixed root
+    }
     return 0;
+}
+
+# Try to mount a FAT on (backend, partition base LBA). Sets the mount
+# target, reads + parses the boot sector via the partition-relative path.
+# Returns 1 on a valid FAT mount candidate, 0 otherwise.
+fn fatfs_probe_backend(tag, part_lba) {
+    if (blk_is_registered(tag) == 0) { return 0; }
+    fat_backend = tag;
+    fat_partition_first_lba = part_lba;
+    fatfs_fat_buf_sector = 0 - 1;                    # invalidate FAT-sector cache
+    if (fat_blk_read(0, &fatfs_boot_buf) != 0) { return 0; }
+    if (fatfs_parse_bpb() != 0) { return 0; }
+    return 1;
+}
+
+# Multi-backend, partition-aware mount — mirrors ext2_init. Walk every
+# registered backend; try whole-disk FAT first (mkfs.vfat on a raw
+# image), then, on the blk_active backend with a parsed GPT, the ESP /
+# Microsoft-Basic-Data partitions (where FAT lives). First match wins.
+fn fatfs_init() {
+    var candidates_n = 5;
+    var candidates[5];
+    store8(&candidates + 0, BLK_NVME);
+    store8(&candidates + 1, BLK_AHCI);
+    store8(&candidates + 2, BLK_USB_MS);
+    store8(&candidates + 3, BLK_VIRTIO);
+    store8(&candidates + 4, BLK_RAMDISK);
+
+    var matched = 0;
+    for (var ci = 0; ci < candidates_n; ci = ci + 1) {
+        var tag = load8(&candidates + ci);
+        if (blk_is_registered(tag) == 0) { continue; }
+
+        # Whole-disk FAT (no partition table).
+        if (fatfs_probe_backend(tag, 0) == 1) { matched = 1; break; }
+
+        # Partition-aware: GPT is parsed only against blk_active (ext2's
+        # same constraint). Gate on ESP / MSFT-Basic type GUIDs — FAT
+        # doesn't live in a Linux-FS partition.
+        if (gpt_present == 1) {
+            if (tag == blk_active) {
+                for (var pi = 0; pi < gpt_partition_count; pi = pi + 1) {
+                    if (gpt_partition_info(pi) != 1) { continue; }
+                    var is_fat = 0;
+                    if (gpt_q_type_lo == GPT_TYPE_ESP_LO) {
+                        if (gpt_q_type_hi == GPT_TYPE_ESP_HI) { is_fat = 1; }
+                    }
+                    if (gpt_q_type_lo == GPT_TYPE_MSFT_BASIC_LO) {
+                        if (gpt_q_type_hi == GPT_TYPE_MSFT_BASIC_HI) { is_fat = 1; }
+                    }
+                    if (is_fat == 0) { continue; }
+                    if (fatfs_probe_backend(tag, gpt_q_first_lba) == 1) { matched = 1; break; }
+                }
+            }
+        }
+        if (matched == 1) { break; }
+    }
+
+    if (matched == 0) {
+        fat_backend = 0;
+        fat_partition_first_lba = 0;
+        return 0 - 1;
+    }
+
+    fatfs_active = 1;
+    kprint("fat: mounted FAT", 16);
+    kprint_num(fatfs_type);
+    kprint(" backend=", 9);
+    kprint_num(fat_backend);
+    if (fat_partition_first_lba > 0) {
+        kprint(" partition_lba=", 15);
+        kprint_num(fat_partition_first_lba);
+    } else {
+        kprint(" whole-disk", 11);
+    }
+    kprintln("", 0);
+    return 0;
+}
+
+# Follow the FAT chain: next cluster after `cluster`, or 0 on EOC / bad /
+# error (caller treats 0 as end-of-chain). Caches the consulted FAT
+# sector in fatfs_fat_buf. FAT12 packs 1.5 bytes/entry and can straddle a
+# sector boundary. Audit § 2.3.
+fn fat_next_cluster(cluster) {
+    if (cluster < 2) { return 0; }
+    var fat_offset = 0;
+    if (fatfs_type == 16) { fat_offset = cluster * 2; }
+    if (fatfs_type == 32) { fat_offset = cluster * 4; }
+    if (fatfs_type == 12) { fat_offset = cluster + (cluster / 2); }
+
+    var sec = fatfs_fat_start + (fat_offset / 512);
+    var off = fat_offset % 512;
+    if (fatfs_fat_buf_sector != sec) {
+        if (fat_blk_read(sec, &fatfs_fat_buf) != 0) { return 0; }
+        fatfs_fat_buf_sector = sec;
+    }
+
+    if (fatfs_type == 16) {
+        var v16 = load8(&fatfs_fat_buf + off) | (load8(&fatfs_fat_buf + off + 1) << 8);
+        if (v16 >= 0xFFF8) { return 0; }
+        if (v16 == 0xFFF7) { return 0; }
+        return v16;
+    }
+    if (fatfs_type == 32) {
+        var v32 = load8(&fatfs_fat_buf + off) | (load8(&fatfs_fat_buf + off + 1) << 8) | (load8(&fatfs_fat_buf + off + 2) << 16) | (load8(&fatfs_fat_buf + off + 3) << 24);
+        v32 = v32 & 0x0FFFFFFF;
+        if (v32 >= 0x0FFFFFF8) { return 0; }
+        if (v32 == 0x0FFFFFF7) { return 0; }
+        return v32;
+    }
+    # FAT12: two bytes, high byte may be in the next FAT sector.
+    var b0 = load8(&fatfs_fat_buf + off);
+    var b1 = 0;
+    if (off == 511) {
+        if (fat_blk_read(sec + 1, &fatfs_fat_buf) != 0) { return 0; }
+        fatfs_fat_buf_sector = sec + 1;
+        b1 = load8(&fatfs_fat_buf + 0);
+    } else {
+        b1 = load8(&fatfs_fat_buf + off + 1);
+    }
+    var v12 = b0 | (b1 << 8);
+    if ((cluster & 1) == 1) { v12 = v12 >> 4; } else { v12 = v12 & 0x0FFF; }
+    if (v12 >= 0xFF8) { return 0; }
+    if (v12 == 0xFF7) { return 0; }
+    return v12;
+}
+
+# Partition-relative LBA of a cluster's first sector.
+fn fatfs_first_sector_of_cluster(cluster) {
+    return fatfs_data_start + (cluster - 2) * fatfs_sectors_per_cluster;
 }
 
 fn fatfs_print_name(entry_ptr) {
@@ -108,7 +266,10 @@ fn fatfs_entry_size(entry_ptr) {
 }
 
 fn fatfs_entry_cluster(entry_ptr) {
-    return load8(entry_ptr + 26) | (load8(entry_ptr + 27) << 8);
+    # FstClusLO @26 + FstClusHI @20 (FAT32; zero on FAT12/16).
+    var lo = load8(entry_ptr + 26) | (load8(entry_ptr + 27) << 8);
+    var hi = load8(entry_ptr + 20) | (load8(entry_ptr + 21) << 8);
+    return lo | (hi << 16);
 }
 
 fn fatfs_ls_sector(entries_per_sector, count_ptr) {
@@ -136,11 +297,27 @@ fn fatfs_ls_sector(entries_per_sector, count_ptr) {
 fn fatfs_ls() {
     if (fatfs_active == 0) { serial_println("no filesystem", 13); return 0; }
     var entries_per_sector = 512 / 32;
-    var root_sectors = (fatfs_root_entry_count * 32 + 511) / 512;
     var count = 0;
+
+    if (fatfs_type == 32) {
+        # FAT32 root is a cluster chain at fatfs_root_cluster.
+        var clus = fatfs_root_cluster;
+        while (clus >= 2) {
+            var base = fatfs_first_sector_of_cluster(clus);
+            for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
+                if (fat_blk_read(base + s, &fatfs_dir_buf) != 0) { return count; }
+                var done = fatfs_ls_sector(entries_per_sector, &count);
+                if (done < 0) { return count; }
+            }
+            clus = fat_next_cluster(clus);
+        }
+        return count;
+    }
+
+    # FAT12/16 fixed root region.
+    var root_sectors = (fatfs_root_entry_count * 32 + 511) / 512;
     for (var s = 0; s < root_sectors; s = s + 1) {
-        var r = blk_read(fatfs_root_start + s, &fatfs_dir_buf);
-        if (r != 0) { break; }
+        if (fat_blk_read(fatfs_root_start + s, &fatfs_dir_buf) != 0) { return count; }
         var done = fatfs_ls_sector(entries_per_sector, &count);
         if (done < 0) { return count; }
     }
@@ -184,7 +361,7 @@ fn fatfs_match_name(entry_ptr, name, namelen) {
 }
 
 fn fatfs_find_inner(sector, entries_per_sector, name, namelen, result_ptr) {
-    var r = blk_read(sector, &fatfs_dir_buf);
+    var r = fat_blk_read(sector, &fatfs_dir_buf);
     if (r != 0) { return 0; }
     for (var e = 0; e < entries_per_sector; e = e + 1) {
         var ep = &fatfs_dir_buf + e * 32;
@@ -204,46 +381,79 @@ fn fatfs_find_inner(sector, entries_per_sector, name, namelen, result_ptr) {
     return 0;
 }
 
-fn fatfs_open(name, namelen) {
-    if (fatfs_active == 0) { return 0 - 1; }
+# Search the root directory for an 8.3 name. Handles both the FAT12/16
+# fixed root region and the FAT32 root cluster chain. Returns 1 (result_ptr
+# = [cluster, size]), 0 (not found), via fatfs_find_inner per sector.
+fn fatfs_find_root(name, namelen, result_ptr) {
     var entries_per_sector = 512 / 32;
-    var root_sectors = (fatfs_root_entry_count * 32 + 511) / 512;
-    var result[16];
-    for (var s = 0; s < root_sectors; s = s + 1) {
-        var found = fatfs_find_inner(fatfs_root_start + s, entries_per_sector, name, namelen, &result);
-        if (found == 1) {
-            var cluster = load64(&result);
-            var fsize = load64(&result + 8);
-            if (cluster < 2) { return 0 - 1; }
-            # Security: validate cluster number is within filesystem bounds
-            var max_cluster = (fatfs_total_sectors - fatfs_data_start) / fatfs_sectors_per_cluster + 2;
-            if (cluster >= max_cluster) { return 0 - 1; }
-            # Security: validate file size is reasonable
-            if (fsize > fatfs_total_sectors * 512) { return 0 - 1; }
-            # Read first cluster into data_buf
-            var data_sector = fatfs_data_start + (cluster - 2) * fatfs_sectors_per_cluster;
-            blk_read(data_sector, &fatfs_data_buf);
-            # Create a memfile VFS entry
-            var read_len = fsize;
-            if (read_len > 512) { read_len = 512; }
-            return vfs_create_memfile(&fatfs_data_buf, read_len);
+    if (fatfs_type == 32) {
+        var clus = fatfs_root_cluster;
+        while (clus >= 2) {
+            var base = fatfs_first_sector_of_cluster(clus);
+            for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
+                var f = fatfs_find_inner(base + s, entries_per_sector, name, namelen, result_ptr);
+                if (f == 1) { return 1; }
+                if (f < 0) { return 0; }     # end-of-dir marker
+            }
+            clus = fat_next_cluster(clus);
         }
-        if (found < 0) { break; }
+        return 0;
     }
-    return 0 - 1;
+    var root_sectors = (fatfs_root_entry_count * 32 + 511) / 512;
+    for (var s = 0; s < root_sectors; s = s + 1) {
+        var f2 = fatfs_find_inner(fatfs_root_start + s, entries_per_sector, name, namelen, result_ptr);
+        if (f2 == 1) { return 1; }
+        if (f2 < 0) { return 0; }
+    }
+    return 0;
 }
 
+fn fatfs_open(name, namelen) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    var result[16];
+    if (fatfs_find_root(name, namelen, &result) != 1) { return 0 - 1; }
+    var cluster = load64(&result);
+    var fsize = load64(&result + 8);
+    if (cluster < 2) { return 0 - 1; }
+    var max_cluster = fatfs_count_of_clusters + 2;
+    if (cluster >= max_cluster) { return 0 - 1; }
+    if (fsize > fatfs_total_sectors * 512) { return 0 - 1; }
+    # Read the file (multi-cluster, via the chain) into the memfile buffer,
+    # capped at one page. Files > 4 KB truncate at the cap — a streaming /
+    # bigger memfile is a follow-on bite.
+    var cap = fsize;
+    if (cap > 4096) { cap = 4096; }
+    var got = fatfs_read(cluster, &fatfs_file_buf, cap);
+    if (got < 0) { return 0 - 1; }
+    return vfs_create_memfile(&fatfs_file_buf, got);
+}
+
+# Read a file's data by following its cluster chain into `buf`, up to
+# `maxlen` bytes. Returns bytes read (≤ maxlen), or -1 on bad args.
+# `buf` must be at least maxlen bytes (caller-owned, distinct from the
+# fatfs_data_buf sector scratch used here).
 fn fatfs_read(cluster, buf, maxlen) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (cluster < 2) { return 0 - 1; }
     if (buf == 0) { return 0 - 1; }
-    # Security: validate cluster bounds
-    var max_cluster = (fatfs_total_sectors - fatfs_data_start) / fatfs_sectors_per_cluster + 2;
-    if (cluster >= max_cluster) { return 0 - 1; }
-    var data_sector = fatfs_data_start + (cluster - 2) * fatfs_sectors_per_cluster;
-    var r = blk_read(data_sector, buf);
-    if (r != 0) { return 0 - 1; }
-    var read_len = 512;
-    if (read_len > maxlen) { read_len = maxlen; }
-    return read_len;
+    var max_cluster = fatfs_count_of_clusters + 2;
+    var total = 0;
+    var clus = cluster;
+    while (clus >= 2) {
+        if (clus >= max_cluster) { return total; }    # corrupt-chain guard
+        if (total >= maxlen) { return total; }
+        var base = fatfs_first_sector_of_cluster(clus);
+        for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
+            if (total >= maxlen) { return total; }
+            if (fat_blk_read(base + s, &fatfs_data_buf) != 0) { return total; }
+            var chunk = 512;
+            if (maxlen - total < chunk) { chunk = maxlen - total; }
+            for (var i = 0; i < chunk; i = i + 1) {
+                store8(buf + total + i, load8(&fatfs_data_buf + i));
+            }
+            total = total + chunk;
+        }
+        clus = fat_next_cluster(clus);
+    }
+    return total;
 }

@@ -92,6 +92,10 @@ else
     #                     1.32.x unicast-RX arc is closed, so production
     #                     boots end cleanly at "net: L2 OK". Enable to
     #                     re-confirm end-to-end connectivity on iron.
+    #   FATFS_SELFTEST=1 — boot-time FAT read self-test (1.34.x): mount the
+    #                     FAT, list root, read the seeded multi-cluster
+    #                     FATTEST.BIN back via the cluster chain + byte-
+    #                     verify. Gated by scripts/fat-smoke.sh.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -103,6 +107,7 @@ else
         [ -n "$TCP_LISTEN_SMOKE" ] && echo '#define TCP_LISTEN_SMOKE'
         [ -n "$NET_VERBOSE" ]    && echo '#define NET_VERBOSE'
         [ -n "$EXT2_WRITE_SELFTEST" ] && echo '#define EXT2_WRITE_SELFTEST'
+        [ -n "$FATFS_SELFTEST" ] && echo '#define FATFS_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")
