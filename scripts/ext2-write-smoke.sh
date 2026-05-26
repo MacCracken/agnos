@@ -232,6 +232,16 @@ for w5 in "W5 mkdir" "W5 rmdir round-trip"; do
     fi
 done
 
+# Wrename: rename / mv (1.33.3 bite 1) — file rename, cross-parent dir
+# move (".." repoint + parent link-count shift), and dst-exists refusal.
+for wr in "Wren file" "Wren xdir" "Wren refuse"; do
+    if strings "$LOG" | grep -q "ext2w: $wr OK"; then
+        echo "  PASS: $wr"
+    else
+        echo "  FAIL: $wr"; rc=1
+    fi
+done
+
 # W4b: shell write verbs driven headlessly via sh_exec. The proof is the
 # `cat` of the echo-redirected file printing "SHELL-WROTE-IT" back.
 if strings "$LOG" | grep -q "SHELL-WROTE-IT"; then
@@ -291,6 +301,26 @@ fi
 # persisted with the right content; the shell touch+rm tmp file is gone.
 shcontent=$(debugfs -R "cat /shdir/keep.txt" "$WORK/part-post.img" 2>/dev/null)
 [ "$shcontent" = "SHELL-WROTE-IT" ] && echo "  PASS: /shdir/keep.txt = shell-written content on disk" || { echo "  FAIL: /shdir/keep.txt='$shcontent' (want SHELL-WROTE-IT)"; rc=1; }
+
+# Wrename host verification: file rename + cross-parent dir move reached
+# the platter (link counts already validated by e2fsck -fn above).
+if debugfs -R "stat /rndst.txt" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
+    echo "  PASS: /rndst.txt present on disk (file rename persisted)"
+else
+    echo "  FAIL: /rndst.txt absent (file rename didn't persist)"; rc=1
+fi
+if debugfs -R "stat /rnsrc.txt" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
+    echo "  FAIL: /rnsrc.txt still present (old name not removed)"; rc=1
+else
+    echo "  PASS: /rnsrc.txt absent on disk (old name removed)"
+fi
+rnptype=$(debugfs -R "stat /rnp/rnd" "$WORK/part-post.img" 2>/dev/null | grep -oE "Type: [a-z]+" | head -1 | awk '{print $2}')
+[ "$rnptype" = "directory" ] && echo "  PASS: /rnp/rnd is a directory on disk (cross-parent dir move persisted)" || { echo "  FAIL: /rnp/rnd type='$rnptype' (want directory)"; rc=1; }
+if debugfs -R "stat /rnd" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
+    echo "  FAIL: /rnd still present in root (dir move didn't remove old entry)"; rc=1
+else
+    echo "  PASS: /rnd absent from root (dir move removed old entry)"
+fi
 if debugfs -R "stat /shtmp" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
     echo "  FAIL: /shtmp still present (shell rm didn't persist)"; rc=1
 else

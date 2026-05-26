@@ -488,6 +488,44 @@ fn sh_cmd_rmdir(arg, arglen) {
     return 0;
 }
 
+# `mv SRC DST` — rename/move (1.33.3 bite 1). Two path args split on the
+# first space. SRC's basename is copied to a local before DST is resolved,
+# because sh_abspath/sh_split_parent reuse the shared sh_path_buf.
+fn sh_cmd_mv(arg, arglen) {
+    if (ext2_active == 0) { kprintln("mv: no fs", 9); return 0; }
+    sh_trim(arg, arglen);
+    if (sh_trim_len < 1) { kprintln("usage: mv <src> <dst>", 21); return 0; }
+    var ts = arg + sh_trim_off;
+    var tl = sh_trim_len;
+    var sp = 0 - 1;
+    var i = 0;
+    while (i < tl) { if (load8(ts + i) == 32) { sp = i; break; } i = i + 1; }
+    if (sp < 0) { kprintln("usage: mv <src> <dst>", 21); return 0; }
+    var doff = sp + 1;
+    while (doff < tl) { if (load8(ts + doff) != 32) { break; } doff = doff + 1; }
+    if (doff >= tl) { kprintln("usage: mv <src> <dst>", 21); return 0; }
+
+    # resolve SRC → parent + copy basename to a local
+    if (sh_abspath(ts, sp) < 0) { kprintln("mv: bad src path", 16); return 0; }
+    var src_parent = sh_split_parent(sh_path_len);
+    if (src_parent <= 0) { kprintln("mv: no such src directory", 25); return 0; }
+    var src_nl = sh_base_len;
+    if (src_nl > 255) { kprintln("mv: src name too long", 21); return 0; }
+    var srcname[256];
+    var k = 0;
+    while (k < src_nl) { store8(&srcname + k, load8(&sh_path_buf + sh_base_off + k)); k = k + 1; }
+
+    # resolve DST → parent + basename (left in sh_path_buf)
+    if (sh_abspath(ts + doff, tl - doff) < 0) { kprintln("mv: bad dst path", 16); return 0; }
+    var dst_parent = sh_split_parent(sh_path_len);
+    if (dst_parent <= 0) { kprintln("mv: no such dst directory", 25); return 0; }
+
+    if (ext2_rename(src_parent, &srcname, src_nl, dst_parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) {
+        kprintln("mv: failed (no such src / dst exists / dir loop?)", 49);
+    }
+    return 0;
+}
+
 # `echo TEXT > FILE` — write TEXT + newline to FILE (create or truncate).
 # `text`/`textlen` = the bytes before '>'; `fname`/`fnamelen` = after.
 fn sh_echo_redirect(text, textlen, fname, fnamelen) {
@@ -560,6 +598,7 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "rm", 2) == 1)    { return sh_cmd_rm(arg, arglen); }
     if (sh_streq(buf, clen, "mkdir", 5) == 1) { return sh_cmd_mkdir(arg, arglen); }
     if (sh_streq(buf, clen, "rmdir", 5) == 1) { return sh_cmd_rmdir(arg, arglen); }
+    if (sh_streq(buf, clen, "mv", 2) == 1)    { return sh_cmd_mv(arg, arglen); }
     if (sh_streq(buf, clen, "lspci", 5) == 1) {
         for (var i = 0; i < pci_count; i = i + 1) {
             var base = &pci_devs + i * 32;

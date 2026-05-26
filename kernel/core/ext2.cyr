@@ -1815,6 +1815,149 @@ fn ext2_rmdir(parent_ino, name, name_len) {
     return 0;
 }
 
+# === rename / mv (WRITE arc 1.33.3 — bite 1) =========================
+#
+# Move/rename `src_name` in `src_parent` to `dst_name` in `dst_parent`.
+# Pure recomposition of the W4 dirent insert/remove + inode link
+# primitives — no new on-disk format. Ordered writes per doc § 3: add the
+# NEW dirent first (the inode is reachable by both names through the
+# window, never unreferenced), then fix the moved dir's ".." + parent link
+# counts on a cross-parent move, then remove the OLD dirent last. e2fsck
+# Pass-3 (directory connectivity) + Pass-4 (link counts) are the oracle.
+#
+# Base-stage scope (documented limits, each e2fsck-safe):
+#   - refuses if `dst_name` already exists (rename-replace is a follow-on)
+#   - refuses moving a directory into itself or one of its descendants
+#     (would orphan the subtree / create a `..` cycle e2fsck must cut)
+#   - linear dirs only (we never create htree-indexed dirs)
+# Returns 0 on success, -1 on error/refusal.
+
+# file_type byte from inode mode (the `filetype` feature is set on every
+# default mkfs.ext4 FS, so the dirent must carry the right type).
+fn ext2_ftype_from_mode(mode) {
+    var t = mode & 0xF000;
+    if (t == 0x8000) { return 1; }   # regular
+    if (t == 0x4000) { return 2; }   # directory
+    if (t == 0xA000) { return 7; }   # symlink
+    if (t == 0x2000) { return 3; }   # char device
+    if (t == 0x6000) { return 4; }   # block device
+    if (t == 0x1000) { return 5; }   # fifo
+    if (t == 0xC000) { return 6; }   # socket
+    return 1;
+}
+
+# Rewrite the ".." entry of `dir_ino` to point at `new_parent`; re-stamp
+# the leaf csum tail. Mirrors the ext2_dir_remove block walk. Returns 0/-1.
+fn ext2_dir_set_dotdot(dir_ino, new_parent) {
+    if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    var dir_size = ext2_inode_size_lo(&ext2_inode_buf);
+    var nblocks = dir_size / ext2_blocksize;
+    var dir_gen = ext2_load32_le(&ext2_inode_buf, 100);
+    var lb = 0;
+    while (lb < nblocks) {
+        var phys = ext2_logical_to_physical(&ext2_inode_buf, lb);
+        if (phys == 0 - 1) { return 0 - 1; }
+        if (phys != 0) {
+            if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+            var off = 0;
+            while (off < ext2_blocksize) {
+                var d = &ext2_dir_buf + off;
+                var e_ino = ext2_load32_le(d, 0);
+                var e_rl  = ext2_load16_le(d, 4);
+                var e_nl  = load8(d + 6);
+                if (e_rl == 0) { return 0 - 1; }
+                if (e_ino != 0) {
+                    if (e_nl == 2) {
+                        if (load8(d + 8) == 46) { if (load8(d + 9) == 46) {
+                            ext2_store32_le(&ext2_dir_buf, off, new_parent);
+                            if (ext2_csum_on != 0) { ext2_dir_tail_stamp(&ext2_dir_buf, dir_ino, dir_gen); }
+                            if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+                            return 0;
+                        } }
+                    }
+                }
+                off = off + e_rl;
+            }
+        }
+        lb = lb + 1;
+    }
+    return 0 - 1;   # no ".." found
+}
+
+# Is `maybe_ancestor` equal to, or an ancestor of, `start_dir`? Walks ".."
+# upward from start_dir toward root (inode 2), bounded at 64 levels.
+# Returns 1 yes, 0 no, -1 error. Blocks moving a dir into its own subtree.
+fn ext2_is_ancestor(maybe_ancestor, start_dir) {
+    var cur = start_dir;
+    var depth = 0;
+    while (depth < 64) {
+        if (cur == maybe_ancestor) { return 1; }
+        if (cur == 2) { return 0; }                  # reached root, not found
+        var up = ext2_dir_lookup(cur, "..", 2);
+        if (up <= 0) { return 0 - 1; }
+        if (up == cur) { return 0; }                 # ".." self-ref → stop
+        cur = up;
+        depth = depth + 1;
+    }
+    return 0 - 1;   # too deep — refuse rather than risk an undetected loop
+}
+
+fn ext2_rename(src_parent, src_name, src_nl, dst_parent, dst_name, dst_nl) {
+    if (ext2_write_ok == 0) { return 0 - 1; }
+
+    var src_ino = ext2_dir_lookup(src_parent, src_name, src_nl);
+    if (src_ino <= 0) { return 0 - 1; }              # src must exist
+
+    if (ext2_get_inode(src_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    var src_mode = ext2_inode_mode(&ext2_inode_buf);
+    var src_is_dir = 0;
+    if ((src_mode & 0xF000) == 0x4000) { src_is_dir = 1; }
+    var ftype = ext2_ftype_from_mode(src_mode);
+
+    # no-op: same parent + same name
+    if (src_parent == dst_parent) {
+        if (src_nl == dst_nl) {
+            if (memeq(src_name, dst_name, src_nl) == 1) { return 0; }
+        }
+    }
+
+    # refuse if the destination name already exists — rename-replace is a
+    # follow-on bite; this keeps bite 1 e2fsck-trivially-clean.
+    var dst_existing = ext2_dir_lookup(dst_parent, dst_name, dst_nl);
+    if (dst_existing != 0) { return 0 - 1; }         # >0 exists, <0 error
+
+    var cross = 0;
+    if (src_parent != dst_parent) { cross = 1; }
+
+    # directory-move safety: never into itself or a descendant
+    if (src_is_dir == 1) {
+        if (src_ino == dst_parent) { return 0 - 1; }
+        if (cross == 1) {
+            if (ext2_is_ancestor(src_ino, dst_parent) != 0) { return 0 - 1; }
+        }
+    }
+
+    # 1. add the new dirent FIRST (inode reachable by both names)
+    if (ext2_dir_insert(dst_parent, dst_name, dst_nl, src_ino, ftype) != 0) { return 0 - 1; }
+
+    # 2. cross-parent directory move: repoint ".." + shift parent link counts
+    if (src_is_dir == 1) {
+        if (cross == 1) {
+            if (ext2_dir_set_dotdot(src_ino, dst_parent) != 0) { return 0 - 1; }
+            if (ext2_get_inode(dst_parent, &ext2_inode_buf) != 0) { return 0 - 1; }
+            ext2_inode_set_links_count(&ext2_inode_buf, ext2_inode_links_count(&ext2_inode_buf) + 1);
+            if (ext2_put_inode(dst_parent, &ext2_inode_buf) != 0) { return 0 - 1; }
+            if (ext2_get_inode(src_parent, &ext2_inode_buf) != 0) { return 0 - 1; }
+            ext2_inode_set_links_count(&ext2_inode_buf, ext2_inode_links_count(&ext2_inode_buf) - 1);
+            if (ext2_put_inode(src_parent, &ext2_inode_buf) != 0) { return 0 - 1; }
+        }
+    }
+
+    # 3. remove the OLD dirent last
+    if (ext2_dir_remove(src_parent, src_name, src_nl) != 0) { return 0 - 1; }
+    return 0;
+}
+
 # --- Path lookup (Phase 3) --------------------------------------------
 #
 # Resolves an absolute path "/foo/bar/baz" to an inode number, walking
@@ -2449,6 +2592,52 @@ fn ext2_write_selftest() {
     if (rl5b != rl5) { w5r = 0; }
     if (w5r == 1) { kprintln("ext2w: W5 rmdir round-trip OK", 29); }
     else          { kprintln("ext2w: W5 rmdir round-trip MISMATCH", 35); }
+
+    # === Wrename: rename / mv (1.33.3 bite 1) ===
+    # (a) same-dir file rename: create /rnsrc.txt → rename to /rndst.txt
+    #     (kept for host verify). Old name gone, new present.
+    var wrf = 1;
+    if (ext2_create(2, "rnsrc.txt", 9) <= 0) { wrf = 0; }
+    if (ext2_rename(2, "rnsrc.txt", 9, 2, "rndst.txt", 9) != 0) { wrf = 0; }
+    if (ext2_path_lookup("/rnsrc.txt", 10) != 0) { wrf = 0; }   # old gone
+    if (ext2_path_lookup("/rndst.txt", 10) <= 0) { wrf = 0; }   # new present
+    if (wrf == 1) { kprintln("ext2w: Wren file OK", 19); }
+    else          { kprintln("ext2w: Wren file MISMATCH", 25); }
+
+    # (b) cross-parent directory move: mkdir /rnp + /rnd, move /rnd into
+    #     /rnp. Checks the ".." repoint + parent link-count shift (root
+    #     loses a link, /rnp gains one). /rnp/rnd kept for host e2fsck Pass-3/4.
+    var wrx = 1;
+    var pino = ext2_mkdir(2, "rnp", 3);
+    var dino = ext2_mkdir(2, "rnd", 3);
+    if (pino <= 0) { wrx = 0; }
+    if (dino <= 0) { wrx = 0; }
+    var rootl_a = 0;
+    if (ext2_get_inode(2, &ext2_inode_buf) == 0) { rootl_a = ext2_inode_links_count(&ext2_inode_buf); }
+    var pl_a = 0;
+    if (pino > 0) { if (ext2_get_inode(pino, &ext2_inode_buf) == 0) { pl_a = ext2_inode_links_count(&ext2_inode_buf); } }
+    if (ext2_rename(2, "rnd", 3, pino, "rnd", 3) != 0) { wrx = 0; }
+    if (ext2_path_lookup("/rnd", 4) != 0) { wrx = 0; }              # gone from root
+    if (ext2_dir_lookup(pino, "rnd", 3) <= 0) { wrx = 0; }          # present in /rnp
+    if (dino > 0) { if (ext2_dir_lookup(dino, "..", 2) != pino) { wrx = 0; } }   # ".." repointed
+    var rootl_b = 0;
+    if (ext2_get_inode(2, &ext2_inode_buf) == 0) { rootl_b = ext2_inode_links_count(&ext2_inode_buf); }
+    var pl_b = 0;
+    if (pino > 0) { if (ext2_get_inode(pino, &ext2_inode_buf) == 0) { pl_b = ext2_inode_links_count(&ext2_inode_buf); } }
+    if (rootl_b != rootl_a - 1) { wrx = 0; }                       # root lost the ".." link
+    if (pl_b != pl_a + 1) { wrx = 0; }                             # /rnp gained it
+    if (wrx == 1) { kprintln("ext2w: Wren xdir OK", 19); }
+    else          { kprintln("ext2w: Wren xdir MISMATCH", 25); }
+
+    # (c) refuse rename onto an existing name (rename-replace is a follow-on).
+    var wre = 1;
+    if (ext2_create(2, "rnx.txt", 7) <= 0) { wre = 0; }
+    if (ext2_create(2, "rny.txt", 7) <= 0) { wre = 0; }
+    if (ext2_rename(2, "rnx.txt", 7, 2, "rny.txt", 7) == 0) { wre = 0; }   # must REFUSE
+    if (ext2_path_lookup("/rnx.txt", 8) <= 0) { wre = 0; }         # src untouched
+    if (ext2_path_lookup("/rny.txt", 8) <= 0) { wre = 0; }         # dst untouched
+    if (wre == 1) { kprintln("ext2w: Wren refuse OK", 21); }
+    else          { kprintln("ext2w: Wren refuse MISMATCH", 27); }
 
     return 0;
 }
