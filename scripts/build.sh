@@ -108,6 +108,7 @@ else
         [ -n "$NET_VERBOSE" ]    && echo '#define NET_VERBOSE'
         [ -n "$EXT2_WRITE_SELFTEST" ] && echo '#define EXT2_WRITE_SELFTEST'
         [ -n "$FATFS_SELFTEST" ] && echo '#define FATFS_SELFTEST'
+        [ -n "$FATFS_WRITE_SELFTEST" ] && echo '#define FATFS_WRITE_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

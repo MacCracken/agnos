@@ -35,6 +35,13 @@ fn fat_blk_read(sector, buf) {
     return blk_read_on(fat_backend, fat_partition_first_lba + sector, buf);
 }
 
+# Partition-relative block write — the mirror of fat_blk_read for the
+# 1.34.x FAT write path. Routes through blk_write_on (+ the 1.33.5
+# blk_flush durability barrier is available via blk_flush_on(fat_backend)).
+fn fat_blk_write(sector, buf) {
+    return blk_write_on(fat_backend, fat_partition_first_lba + sector, buf);
+}
+
 # Parse the BPB/EBPB already loaded in fatfs_boot_buf into the region
 # globals + FAT type. FAT12/16/32 per audit § 2.1-2.2. Returns 0 on a
 # valid FAT, -1 otherwise. Does NOT touch fat_backend/partition (the
@@ -324,11 +331,11 @@ fn fatfs_ls() {
     return count;
 }
 
-fn fatfs_match_name(entry_ptr, name, namelen) {
-    # Compare 8.3 name against a simple filename
-    # Build 8.3 padded name from input
-    var fat_name[16];
-    memset(&fat_name, 0x20, 11);
+# Build the 11-byte space-padded, upper-cased 8.3 form of `name` into
+# `out` (11 bytes). Shared by match (read) + create (write). 8.3 only —
+# LFN generation is a follow-on (audit gap 5).
+fn fatfs_build_83(name, namelen, out) {
+    memset(out, 0x20, 11);
     var dot_pos = 0 - 1;
     for (var i = 0; i < namelen; i = i + 1) {
         if (load8(name + i) == 46) { dot_pos = i; }
@@ -339,24 +346,29 @@ fn fatfs_match_name(entry_ptr, name, namelen) {
             if (i >= 8) { break; }
             var ch = load8(name + i);
             if (ch >= 97) { if (ch <= 122) { ch = ch - 32; } }
-            store8(&fat_name + i, ch);
+            store8(out + i, ch);
         }
     } else {
         for (var i = 0; i < dot_pos; i = i + 1) {
             if (i >= 8) { break; }
             var ch = load8(name + i);
             if (ch >= 97) { if (ch <= 122) { ch = ch - 32; } }
-            store8(&fat_name + i, ch);
+            store8(out + i, ch);
         }
         var ext_start = dot_pos + 1;
         for (var i = 0; i < namelen - ext_start; i = i + 1) {
             if (i >= 3) { break; }
             var ch = load8(name + ext_start + i);
             if (ch >= 97) { if (ch <= 122) { ch = ch - 32; } }
-            store8(&fat_name + 8 + i, ch);
+            store8(out + 8 + i, ch);
         }
     }
-    # Compare
+    return 0;
+}
+
+fn fatfs_match_name(entry_ptr, name, namelen) {
+    var fat_name[16];
+    fatfs_build_83(name, namelen, &fat_name);
     return memeq(entry_ptr, &fat_name, 11);
 }
 
@@ -456,4 +468,68 @@ fn fatfs_read(cluster, buf, maxlen) {
         clus = fat_next_cluster(clus);
     }
     return total;
+}
+
+# === Write path (1.34.x bite 3) ===
+
+# Write a fresh 8.3 directory entry into `slot` of the dir sector currently
+# held in fatfs_dir_buf (the caller's scan left it there), then flush the
+# sector. attr = archive, cluster = 0, size = 0 (empty file). Returns 0/-1.
+fn fatfs_emit_dirent(sec, slot, name11_ptr) {
+    var ep = &fatfs_dir_buf + slot * 32;
+    var i = 0;
+    while (i < 32) { store8(ep + i, 0); i = i + 1; }   # zero the 32-byte entry
+    var j = 0;
+    while (j < 11) { store8(ep + j, load8(name11_ptr + j)); j = j + 1; }
+    store8(ep + 11, 0x20);                              # attr = ARCHIVE
+    # FstClusHI@20, FstClusLO@26, FileSize@28 all stay 0 (empty file).
+    if (fat_blk_write(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Create an empty 8.3 file in the root directory. First write primitive
+# (audit § 3): no cluster allocation yet — a zero-length file has no
+# clusters, so this is fsck.fat-clean on its own. Refuses an existing
+# name. Finds the first free slot (0x00 end-of-dir or 0xE5 deleted) in
+# the root (FAT32 cluster chain or FAT12/16 fixed region) and writes the
+# dirent there. Root-full (needs a new dir cluster) is a follow-on.
+# Returns 0 on success, -1 on error / exists / no free slot.
+fn fatfs_create(name, namelen) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    var exist[16];
+    if (fatfs_find_root(name, namelen, &exist) == 1) { return 0 - 1; }   # already exists
+
+    var name11[16];
+    fatfs_build_83(name, namelen, &name11);
+    var eps = 512 / 32;
+
+    if (fatfs_type == 32) {
+        var clus = fatfs_root_cluster;
+        while (clus >= 2) {
+            var base = fatfs_first_sector_of_cluster(clus);
+            for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
+                var sec = base + s;
+                if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+                for (var e = 0; e < eps; e = e + 1) {
+                    var fb = load8(&fatfs_dir_buf + e * 32);
+                    if (fb == 0x00) { return fatfs_emit_dirent(sec, e, &name11); }
+                    if (fb == 0xE5) { return fatfs_emit_dirent(sec, e, &name11); }
+                }
+            }
+            clus = fat_next_cluster(clus);
+        }
+        return 0 - 1;                                   # root full (extend = follow-on)
+    }
+
+    var root_sectors = (fatfs_root_entry_count * 32 + 511) / 512;
+    for (var s2 = 0; s2 < root_sectors; s2 = s2 + 1) {
+        var sec2 = fatfs_root_start + s2;
+        if (fat_blk_read(sec2, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        for (var e2 = 0; e2 < eps; e2 = e2 + 1) {
+            var fb2 = load8(&fatfs_dir_buf + e2 * 32);
+            if (fb2 == 0x00) { return fatfs_emit_dirent(sec2, e2, &name11); }
+            if (fb2 == 0xE5) { return fatfs_emit_dirent(sec2, e2, &name11); }
+        }
+    }
+    return 0 - 1;
 }

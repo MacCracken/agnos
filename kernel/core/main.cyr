@@ -477,6 +477,19 @@ if (fatfs_active == 1) {
 }
 #endif
 
+# FAT write self-test (1.34.x bite 3, compile-gated via FATFS_WRITE_SELFTEST).
+# Creates an empty 8.3 file in the mounted FAT root; fat-write-smoke.sh
+# then gates on fsck.fat -n clean + mdir showing NEWFILE.TXT.
+#ifdef FATFS_WRITE_SELFTEST
+if (fatfs_active == 1) {
+    var fw_name = "NEWFILE.TXT";
+    var fw_rc = fatfs_create(fw_name, 11);
+    kprint("fatw: create NEWFILE.TXT rc=", 28);
+    kprint_num(fw_rc);
+    kprintln("", 0);
+}
+#endif
+
 # WRITE arc 1.33.x — W1 write-path self-test (compile-gated, opt-in via
 # EXT2_WRITE_SELFTEST=1 ./scripts/build.sh). Non-destructive: proves the
 # write primitives + inode RMW + bitmap/free-count reads against a live
