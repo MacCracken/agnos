@@ -438,6 +438,14 @@ ext2_init();
 # "fat: mounted FAT.." line on success). Independent of the ext2 mount.
 fatfs_init();
 
+# exFAT mount (1.34.1) — a FAT-family SIBLING module, near-zero shared
+# code with fatfs (allocation bitmap, typed dir-entry sets, no BPB). Runs
+# after fatfs_init: fatfs self-excludes exFAT (BytsPerSec@11 == 0), so the
+# two coexist on one disk (FAT32 ESP + exFAT MSFT-Basic partition). Silent
+# on no-exFAT; prints its own "exfat: mounted .." on success. Read only in
+# this bite. See agnosticos/docs/development/exfat-prior-art.md.
+exfat_init();
+
 # FAT read self-test (1.34.x bite 2, compile-gated via FATFS_SELFTEST).
 # Gates the FAT32 + chain-traversal read path: list the root, find the
 # seeded multi-cluster FATTEST.BIN (3000 B, byte[i] = i & 0xFF), read it
@@ -545,6 +553,64 @@ if (fatfs_active == 1) {
     kprint(" trc=", 5);
     kprint_num(t2_rc);
     kprintln("", 0);
+}
+#endif
+
+# exFAT read self-test (1.34.1 bite 2, compile-gated via EXFAT_SELFTEST).
+# Gates the read substrate against an EMPTY mkfs.exfat volume — no file
+# seeding, no root needed (exfat has no mtools-equivalent): (1) mount +
+# locate the 0x81 bitmap / 0x82 upcase system files, (2) read the up-case
+# table back over its FAT chain and reproduce the TableChecksum baked in
+# by mkfs.exfat — an independent oracle for the multi-cluster chain-read
+# path. If a file WAS seeded (EXFAT_SEED_FILE on the image), also read it
+# back. exfat-smoke.sh.
+#ifdef EXFAT_SELFTEST
+if (exfat_active == 1) {
+    var ex_lc = exfat_ls();
+    kprint("exfatr: lscount=", 16);
+    kprint_num(ex_lc);
+    kprint(" bitmap_clus=", 13);
+    kprint_num(exfat_bitmap_cluster);
+    kprint(" upcase_clus=", 13);
+    kprint_num(exfat_upcase_cluster);
+    kprint(" upcase_len=", 12);
+    kprint_num(exfat_upcase_length);
+    kprintln("", 0);
+    # Multi-cluster FAT-chain read validated against the upcase TableChecksum.
+    var ex_uc = exfat_verify_upcase();
+    if (ex_uc == 1) { kprintln("exfatu: upcase-checksum OK", 26); }
+    else {
+        if (ex_uc == 0) { kprintln("exfatu: upcase-checksum MISMATCH", 32); }
+        else { kprintln("exfatu: upcase-checksum ERROR", 29); }
+    }
+    # Opportunistic file readback (only if EXFTEST.BIN was seeded into the
+    # volume; an empty mkfs.exfat image has no file sets → "not found").
+    var ex_fn = "EXFTEST.BIN";
+    var ex_res[24];
+    if (exfat_find(ex_fn, 11, &ex_res) == 1) {
+        var ex_first = load64(&ex_res);
+        var ex_sz = load64(&ex_res + 8);
+        var ex_nfc = load64(&ex_res + 16);
+        var ex_got = exfat_read(ex_first, ex_nfc, &exfat_file_buf, 3000);
+        kprint("exfatr: EXFTEST.BIN size=", 25);
+        kprint_num(ex_sz);
+        kprint(" got=", 5);
+        kprint_num(ex_got);
+        kprint(" nfc=", 5);
+        kprint_num(ex_nfc);
+        kprintln("", 0);
+        var ex_ok = 1;
+        if (ex_got != 3000) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 0) != 0) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 255) != 255) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 256) != 0) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 1000) != (1000 & 0xFF)) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 2999) != (2999 & 0xFF)) { ex_ok = 0; }
+        if (ex_ok == 1) { kprintln("exfatr: file-read OK", 20); }
+        else { kprintln("exfatr: file-read FAIL", 22); }
+    } else {
+        kprintln("exfatr: no seeded file (mount + upcase gates only)", 49);
+    }
 }
 #endif
 

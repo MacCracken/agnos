@@ -96,6 +96,11 @@ else
     #                     FAT, list root, read the seeded multi-cluster
     #                     FATTEST.BIN back via the cluster chain + byte-
     #                     verify. Gated by scripts/fat-smoke.sh.
+    #   EXFAT_SELFTEST=1 — boot-time exFAT read self-test (1.34.1): mount,
+    #                     locate the bitmap/upcase system files, and read
+    #                     the upcase table back over its FAT chain to
+    #                     reproduce its TableChecksum (independent oracle,
+    #                     no file seeding). Gated by scripts/exfat-smoke.sh.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -109,6 +114,7 @@ else
         [ -n "$EXT2_WRITE_SELFTEST" ] && echo '#define EXT2_WRITE_SELFTEST'
         [ -n "$FATFS_SELFTEST" ] && echo '#define FATFS_SELFTEST'
         [ -n "$FATFS_WRITE_SELFTEST" ] && echo '#define FATFS_WRITE_SELFTEST'
+        [ -n "$EXFAT_SELFTEST" ] && echo '#define EXFAT_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.34.0
+# agnos.cyr — AGNOS kernel v1.34.1
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
@@ -94,6 +94,7 @@ include "core/gpt.cyr"
 include "core/r8169.cyr"
 include "core/net.cyr"
 include "core/fatfs.cyr"
+include "core/exfat.cyr"
 include "core/ext2.cyr"
 include "core/syscall.cyr"
 include "user/test_procs.cyr"

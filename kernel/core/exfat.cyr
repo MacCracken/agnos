@@ -1,0 +1,471 @@
+# === exFAT filesystem (read) — agnos 1.34.1, bite 2 ===
+# A FAT-family SIBLING, not a fatfs mode: exFAT shares almost no on-disk
+# structure with FAT12/16/32 — no BPB-shaped geometry, an allocation
+# bitmap instead of a FAT free-scan, and a TYPED 32-byte directory-entry
+# SET per file instead of one record. So it lands as its own module per
+# the 2026-05-26 FS-scope split. Partition-aware + multi-backend (routes
+# through blk_read_on(exfat_backend, exfat_partition_first_lba + sector),
+# mirroring fatfs/ext2). Read only in this bite; write is bite 3.
+# See agnosticos/docs/development/exfat-prior-art.md.
+#
+# fatfs's own probe self-excludes exFAT (it reads BytsPerSec@11, which
+# exFAT zeroes → != 512 → reject), so the two coexist on one disk.
+
+var exfat_active = 0;
+var exfat_backend = 0;                 # BLK_NONE; set during probe
+var exfat_partition_first_lba = 0;     # 0 = whole-disk; partition base LBA otherwise
+
+# Geometry (boot region § 1). All sector offsets are volume-relative.
+var exfat_bytes_per_sector = 0;
+var exfat_sectors_per_cluster = 0;
+var exfat_bytes_per_cluster = 0;
+var exfat_fat_offset = 0;              # sector offset of FAT #0
+var exfat_fat_length = 0;              # sectors per FAT
+var exfat_cluster_heap_offset = 0;     # sector offset of cluster 2
+var exfat_cluster_count = 0;
+var exfat_root_cluster = 0;
+var exfat_num_fats = 0;
+var exfat_volume_length = 0;
+
+# System-file locations, recorded by the root dir-set walk at mount.
+var exfat_bitmap_cluster = 0;
+var exfat_bitmap_length = 0;           # bytes
+var exfat_upcase_cluster = 0;
+var exfat_upcase_length = 0;           # bytes
+var exfat_upcase_checksum = 0;         # TableChecksum from the 0x82 entry
+
+# Scratch buffers. Single-threaded kernel (per project_multithreading_
+# future_arc) → module-global shared scratch is safe. NB module-global
+# `var X[N]` allocates N*8 bytes (feedback_cyrius_var_array_u64_units),
+# so [64] = 512 B = one sector; [512] = 4 KB.
+var exfat_boot_buf[64];                # sector 0
+var exfat_dir_buf[64];                 # directory sector cache
+var exfat_fat_buf[64];                 # FAT sector cache
+var exfat_fat_buf_sec = 0 - 1;         # which volume-relative LBA exfat_fat_buf holds
+var exfat_data_buf[64];                # data sector scratch
+var exfat_file_buf[512];               # memfile content scratch (4 KB)
+var exfat_name_buf[32];                # reconstructed file name (ASCII), up to 255 chars
+
+# Partition-relative block read — every exfat read goes through this so
+# the FS works on whichever backend/partition the probe matched.
+fn exfat_blk_read(sector, buf) {
+    return blk_read_on(exfat_backend, exfat_partition_first_lba + sector, buf);
+}
+
+# Little-endian 32-bit field read from a buffer.
+fn exfat_rd32(p, off) {
+    return load8(p + off) | (load8(p + off + 1) << 8) | (load8(p + off + 2) << 16) | (load8(p + off + 3) << 24);
+}
+
+# Parse the boot region already loaded in exfat_boot_buf (§ 1). Returns 0
+# on a valid exFAT volume, -1 otherwise. Does NOT set exfat_backend /
+# partition (the caller did that before reading sector 0).
+fn exfat_parse_boot() {
+    # FileSystemName @3 = "EXFAT   " (5 letters + 3 spaces) — the signature.
+    if (load8(&exfat_boot_buf + 3) != 0x45) { return 0 - 1; }   # 'E'
+    if (load8(&exfat_boot_buf + 4) != 0x58) { return 0 - 1; }   # 'X'
+    if (load8(&exfat_boot_buf + 5) != 0x46) { return 0 - 1; }   # 'F'
+    if (load8(&exfat_boot_buf + 6) != 0x41) { return 0 - 1; }   # 'A'
+    if (load8(&exfat_boot_buf + 7) != 0x54) { return 0 - 1; }   # 'T'
+    if (load8(&exfat_boot_buf + 8) != 0x20) { return 0 - 1; }   # ' '
+    # BootSignature @510 = 0xAA55.
+    if (load8(&exfat_boot_buf + 510) != 0x55) { return 0 - 1; }
+    if (load8(&exfat_boot_buf + 511) != 0xAA) { return 0 - 1; }
+
+    # BytesPerSectorShift @108. Only 512-byte logical sectors are handled
+    # (matches the 512-byte block layer 1:1; >512 is a follow-on).
+    var bps_shift = load8(&exfat_boot_buf + 108);
+    if (bps_shift != 9) { return 0 - 1; }
+    exfat_bytes_per_sector = 1 << bps_shift;
+
+    # SectorsPerClusterShift @109.
+    var spc_shift = load8(&exfat_boot_buf + 109);
+    if (spc_shift > 25) { return 0 - 1; }
+    exfat_sectors_per_cluster = 1 << spc_shift;
+    exfat_bytes_per_cluster = exfat_bytes_per_sector * exfat_sectors_per_cluster;
+
+    exfat_fat_offset          = exfat_rd32(&exfat_boot_buf, 80);
+    exfat_fat_length          = exfat_rd32(&exfat_boot_buf, 84);
+    exfat_cluster_heap_offset = exfat_rd32(&exfat_boot_buf, 88);
+    exfat_cluster_count       = exfat_rd32(&exfat_boot_buf, 92);
+    exfat_root_cluster        = exfat_rd32(&exfat_boot_buf, 96);
+    exfat_num_fats            = load8(&exfat_boot_buf + 110);
+    exfat_volume_length       = exfat_rd32(&exfat_boot_buf, 72);
+
+    if (exfat_fat_offset == 0) { return 0 - 1; }
+    if (exfat_cluster_heap_offset == 0) { return 0 - 1; }
+    if (exfat_cluster_count == 0) { return 0 - 1; }
+    if (exfat_root_cluster < 2) { return 0 - 1; }
+    if (exfat_sectors_per_cluster == 0) { return 0 - 1; }
+    if (exfat_num_fats == 0) { return 0 - 1; }
+    return 0;
+}
+
+# Volume-relative LBA of a cluster's first sector. Clusters number from 2.
+fn exfat_cluster_sector(c) {
+    return exfat_cluster_heap_offset + (c - 2) * exfat_sectors_per_cluster;
+}
+
+# Follow the FAT chain: next cluster after `c`, or 0 on EOC / bad / error.
+# exFAT FAT is 32-bit; EOC = 0xFFFFFFFF, bad = 0xFFFFFFF7. Caches the
+# consulted FAT sector. § 2.
+fn exfat_next_cluster(c) {
+    if (c < 2) { return 0; }
+    var off = c * 4;
+    var sec = exfat_fat_offset + (off / 512);
+    var o = off % 512;
+    if (exfat_fat_buf_sec != sec) {
+        if (exfat_blk_read(sec, &exfat_fat_buf) != 0) { return 0; }
+        exfat_fat_buf_sec = sec;
+    }
+    var v = exfat_rd32(&exfat_fat_buf, o);
+    if (v >= 0xFFFFFFF7) { return 0; }     # 0xFFFFFFF7 bad + 0xFFFFFFF8.. EOC/reserved
+    return v;
+}
+
+# Try to mount an exFAT volume on (backend, partition base LBA). Sets the
+# mount target, reads + parses the boot region. Returns 1 on a valid
+# candidate, 0 otherwise.
+fn exfat_probe_backend(tag, part_lba) {
+    if (blk_is_registered(tag) == 0) { return 0; }
+    exfat_backend = tag;
+    exfat_partition_first_lba = part_lba;
+    exfat_fat_buf_sec = 0 - 1;                       # invalidate FAT cache
+    if (exfat_blk_read(0, &exfat_boot_buf) != 0) { return 0; }
+    if (exfat_parse_boot() != 0) { return 0; }
+    return 1;
+}
+
+# Walk the root directory (following its FAT chain) recording the system
+# files: 0x81 Allocation Bitmap (FirstCluster + DataLength) and 0x82
+# Up-case Table (FirstCluster + DataLength + TableChecksum). § 3. Stops at
+# the 0x00 end-of-directory marker. Returns 0/-1. (Bite 3 write needs the
+# bitmap; read needs neither, but the upcase TableChecksum is the read
+# path's self-test oracle — see exfat_verify_upcase.)
+fn exfat_locate_system_files() {
+    var eps = 512 / 32;                              # 16 entries per sector
+    var clus = exfat_root_cluster;
+    var max_c = exfat_cluster_count + 2;
+    var guard = 0;
+    while (clus >= 2) {
+        if (clus >= max_c) { return 0 - 1; }
+        var base = exfat_cluster_sector(clus);
+        for (var s = 0; s < exfat_sectors_per_cluster; s = s + 1) {
+            if (exfat_blk_read(base + s, &exfat_dir_buf) != 0) { return 0 - 1; }
+            for (var e = 0; e < eps; e = e + 1) {
+                var ep = &exfat_dir_buf + e * 32;
+                var t = load8(ep);
+                if (t == 0x00) { return 0; }         # end of directory
+                if (t == 0x81) {
+                    exfat_bitmap_cluster = exfat_rd32(ep, 20);
+                    exfat_bitmap_length  = exfat_rd32(ep, 24);
+                }
+                if (t == 0x82) {
+                    exfat_upcase_checksum = exfat_rd32(ep, 4);
+                    exfat_upcase_cluster  = exfat_rd32(ep, 20);
+                    exfat_upcase_length   = exfat_rd32(ep, 24);
+                }
+            }
+        }
+        clus = exfat_next_cluster(clus);
+        guard = guard + 1;
+        if (guard > max_c) { return 0 - 1; }         # loop guard
+    }
+    return 0;
+}
+
+# Multi-backend, partition-aware mount — mirrors fatfs_init / ext2_init.
+# Walk every registered backend; try whole-disk exFAT first, then (on the
+# blk_active backend with a parsed GPT) the ESP / Microsoft-Basic-Data
+# partitions. First match wins. Silent on no-exFAT (logs on success).
+fn exfat_init() {
+    var candidates_n = 5;
+    var candidates[5];
+    store8(&candidates + 0, BLK_NVME);
+    store8(&candidates + 1, BLK_AHCI);
+    store8(&candidates + 2, BLK_USB_MS);
+    store8(&candidates + 3, BLK_VIRTIO);
+    store8(&candidates + 4, BLK_RAMDISK);
+
+    var matched = 0;
+    for (var ci = 0; ci < candidates_n; ci = ci + 1) {
+        var tag = load8(&candidates + ci);
+        if (blk_is_registered(tag) == 0) { continue; }
+
+        # Whole-disk exFAT (no partition table).
+        if (exfat_probe_backend(tag, 0) == 1) { matched = 1; break; }
+
+        # Partition-aware: GPT is parsed only against blk_active. exFAT
+        # lives in ESP or Microsoft-Basic-Data partitions.
+        if (gpt_present == 1) {
+            if (tag == blk_active) {
+                for (var pi = 0; pi < gpt_partition_count; pi = pi + 1) {
+                    if (gpt_partition_info(pi) != 1) { continue; }
+                    var is_cand = 0;
+                    if (gpt_q_type_lo == GPT_TYPE_ESP_LO) {
+                        if (gpt_q_type_hi == GPT_TYPE_ESP_HI) { is_cand = 1; }
+                    }
+                    if (gpt_q_type_lo == GPT_TYPE_MSFT_BASIC_LO) {
+                        if (gpt_q_type_hi == GPT_TYPE_MSFT_BASIC_HI) { is_cand = 1; }
+                    }
+                    if (is_cand == 0) { continue; }
+                    if (exfat_probe_backend(tag, gpt_q_first_lba) == 1) { matched = 1; break; }
+                }
+            }
+        }
+        if (matched == 1) { break; }
+    }
+
+    if (matched == 0) {
+        exfat_backend = 0;
+        exfat_partition_first_lba = 0;
+        return 0 - 1;
+    }
+
+    exfat_active = 1;
+    exfat_locate_system_files();
+    kprint("exfat: mounted backend=", 23);
+    kprint_num(exfat_backend);
+    if (exfat_partition_first_lba > 0) {
+        kprint(" partition_lba=", 15);
+        kprint_num(exfat_partition_first_lba);
+    } else {
+        kprint(" whole-disk", 11);
+    }
+    kprint(" spc=", 5);
+    kprint_num(exfat_sectors_per_cluster);
+    kprint(" root_clus=", 11);
+    kprint_num(exfat_root_cluster);
+    kprintln("", 0);
+    return 0;
+}
+
+# Read `maxlen` bytes of a file's data starting at `first_cluster` into
+# `buf`. `no_fat_chain` = 1 → clusters are CONTIGUOUS (step c+1, FAT not
+# consulted, the mkfs.exfat common case + what AGNOS write will produce);
+# 0 → follow the FAT chain. Returns bytes read (<= maxlen), or -1 on bad
+# args. § 4. (System files — bitmap, upcase — carry no NoFatChain flag,
+# so they read via the chain; see exfat_verify_upcase.)
+fn exfat_read(first_cluster, no_fat_chain, buf, maxlen) {
+    if (exfat_active == 0) { return 0 - 1; }
+    if (first_cluster < 2) { return 0 - 1; }
+    if (buf == 0) { return 0 - 1; }
+    var max_c = exfat_cluster_count + 2;
+    var total = 0;
+    var clus = first_cluster;
+    var guard = 0;
+    while (clus >= 2) {
+        if (clus >= max_c) { return total; }         # corrupt-chain guard
+        if (total >= maxlen) { return total; }
+        var base = exfat_cluster_sector(clus);
+        for (var s = 0; s < exfat_sectors_per_cluster; s = s + 1) {
+            if (total >= maxlen) { return total; }
+            if (exfat_blk_read(base + s, &exfat_data_buf) != 0) { return total; }
+            var chunk = 512;
+            if (maxlen - total < chunk) { chunk = maxlen - total; }
+            for (var i = 0; i < chunk; i = i + 1) {
+                store8(buf + total + i, load8(&exfat_data_buf + i));
+            }
+            total = total + chunk;
+        }
+        if (no_fat_chain == 1) { clus = clus + 1; }   # contiguous run
+        else { clus = exfat_next_cluster(clus); }
+        guard = guard + 1;
+        if (guard > max_c) { return total; }          # loop guard
+    }
+    return total;
+}
+
+# Stream the up-case table through its TableChecksum (32-bit rotate-right-
+# and-add over ALL DataLength bytes), following the FAT chain, and compare
+# to the checksum stored in the 0x82 dir entry. An INDEPENDENT read-path
+# oracle: mkfs.exfat bakes the checksum in, so a byte-exact multi-cluster
+# chain read reproduces it. Returns 1 = match, 0 = mismatch, -1 = error.
+# § 2 (algorithm) / § 3 (entry).
+fn exfat_verify_upcase() {
+    if (exfat_active == 0) { return 0 - 1; }
+    if (exfat_upcase_cluster < 2) { return 0 - 1; }
+    var remaining = exfat_upcase_length;
+    var clus = exfat_upcase_cluster;
+    var max_c = exfat_cluster_count + 2;
+    var cks = 0;
+    var guard = 0;
+    while (remaining > 0) {
+        if (clus < 2) { return 0 - 1; }              # chain ended before length
+        if (clus >= max_c) { return 0 - 1; }
+        var base = exfat_cluster_sector(clus);
+        var s = 0;
+        while (s < exfat_sectors_per_cluster) {
+            if (remaining == 0) { s = exfat_sectors_per_cluster; }
+            else {
+                if (exfat_blk_read(base + s, &exfat_data_buf) != 0) { return 0 - 1; }
+                var chunk = 512;
+                if (remaining < chunk) { chunk = remaining; }
+                var i = 0;
+                while (i < chunk) {
+                    var rot = ((cks & 1) << 31) | ((cks >> 1) & 0x7FFFFFFF);
+                    cks = (rot + load8(&exfat_data_buf + i)) & 0xFFFFFFFF;
+                    i = i + 1;
+                }
+                remaining = remaining - chunk;
+                s = s + 1;
+            }
+        }
+        clus = exfat_next_cluster(clus);
+        guard = guard + 1;
+        if (guard > max_c) { return 0 - 1; }
+    }
+    if (cks == exfat_upcase_checksum) { return 1; }
+    return 0;
+}
+
+# ASCII upper-case (case-insensitive compare for ASCII names; the real
+# up-case table is needed only for non-ASCII, a follow-on per § 2).
+fn exfat_ascii_up(c) {
+    if (c >= 97) { if (c <= 122) { return c - 32; } }
+    return c;
+}
+
+# Compare the reconstructed name in exfat_name_buf (length got_chars) to
+# the target (name, namelen), ASCII case-insensitive. Returns 1/0.
+fn exfat_name_eq(name, namelen, got_chars) {
+    if (got_chars != namelen) { return 0; }
+    var i = 0;
+    while (i < namelen) {
+        var a = exfat_ascii_up(load8(&exfat_name_buf + i));
+        var b = exfat_ascii_up(load8(name + i));
+        if (a != b) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# Find a file by name in the root directory via the typed dir-set walk
+# (§ 3): each file = a 0x85 primary (SecondaryCount) + a 0xC0 Stream
+# Extension (NameLength, FirstCluster, DataLength, NoFatChain flag) + N
+# 0xC1 File Name entries (15 UTF-16 chars each). A set may straddle a
+# sector/cluster boundary, so this consumes entries as one ordered stream
+# across the whole root, holding a small set-collection state. On a match
+# stores [first_cluster, data_length, no_fat_chain] at result_ptr (24 B)
+# and returns 1; 0 = not found, -1 = error. ASCII names (low UTF-16 byte).
+fn exfat_find(name, namelen, result_ptr) {
+    if (exfat_active == 0) { return 0 - 1; }
+    var eps = 512 / 32;
+    var clus = exfat_root_cluster;
+    var max_c = exfat_cluster_count + 2;
+    var guard = 0;
+
+    var collecting = 0;          # 1 while inside a 0x85 set
+    var remaining = 0;           # secondary entries still to consume
+    var name_chars = 0;          # NameLength from the 0xC0 entry
+    var name_got = 0;            # chars accumulated into exfat_name_buf
+    var set_first = 0;
+    var set_len = 0;
+    var set_nfc = 0;
+
+    while (clus >= 2) {
+        if (clus >= max_c) { return 0 - 1; }
+        var base = exfat_cluster_sector(clus);
+        for (var s = 0; s < exfat_sectors_per_cluster; s = s + 1) {
+            if (exfat_blk_read(base + s, &exfat_dir_buf) != 0) { return 0 - 1; }
+            for (var e = 0; e < eps; e = e + 1) {
+                var ep = &exfat_dir_buf + e * 32;
+                var t = load8(ep);
+                if (collecting == 0) {
+                    if (t == 0x00) { return 0; }                 # end of directory
+                    if (t == 0x85) {                             # File (set primary)
+                        remaining = load8(ep + 1);               # SecondaryCount
+                        collecting = 1;
+                        name_chars = 0;
+                        name_got = 0;
+                        set_first = 0;
+                        set_len = 0;
+                        set_nfc = 0;
+                    }
+                    # 0x81/0x82/0x83 + not-in-use entries: skip (single).
+                } else {
+                    if (t == 0xC0) {                             # Stream Extension
+                        var flags = load8(ep + 1);
+                        set_nfc = (flags >> 1) & 1;              # GeneralSecondaryFlags bit1
+                        name_chars = load8(ep + 3);              # NameLength (chars)
+                        set_first = exfat_rd32(ep, 20);          # FirstCluster
+                        set_len = exfat_rd32(ep, 24);            # DataLength (low 32 bits)
+                    } else {
+                        if (t == 0xC1) {                         # File Name (15 UTF-16 chars)
+                            var j = 0;
+                            while (j < 15) {
+                                if (name_got < name_chars) {
+                                    if (name_got < 255) {
+                                        store8(&exfat_name_buf + name_got, load8(ep + 2 + j * 2));
+                                    }
+                                    name_got = name_got + 1;
+                                }
+                                j = j + 1;
+                            }
+                        }
+                    }
+                    remaining = remaining - 1;
+                    if (remaining == 0) {                        # set complete
+                        collecting = 0;
+                        if (exfat_name_eq(name, namelen, name_chars) == 1) {
+                            store64(result_ptr, set_first);
+                            store64(result_ptr + 8, set_len);
+                            store64(result_ptr + 16, set_nfc);
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+        clus = exfat_next_cluster(clus);
+        guard = guard + 1;
+        if (guard > max_c) { return 0 - 1; }
+    }
+    return 0;
+}
+
+# Open a file by name into a VFS memfile (mirrors fatfs_open). Caps the
+# read at one page (4 KB) like fatfs; a streaming / bigger memfile is a
+# follow-on. Returns the fd, or -1. Shell `cat` wiring is deferred to the
+# 1.39.x VFS lift (same as fatfs).
+fn exfat_open(name, namelen) {
+    if (exfat_active == 0) { return 0 - 1; }
+    var res[24];
+    if (exfat_find(name, namelen, &res) != 1) { return 0 - 1; }
+    var first = load64(&res);
+    var len = load64(&res + 8);
+    var nfc = load64(&res + 16);
+    if (first < 2) { return 0 - 1; }
+    var cap = len;
+    if (cap > 4096) { cap = 4096; }
+    var got = exfat_read(first, nfc, &exfat_file_buf, cap);
+    if (got < 0) { return 0 - 1; }
+    return vfs_create_memfile(&exfat_file_buf, got);
+}
+
+# Count the in-use File entries (0x85) in the root — a lightweight `ls`
+# (no name reconstruction). Stops at the 0x00 end-of-directory marker.
+fn exfat_ls() {
+    if (exfat_active == 0) { return 0; }
+    var eps = 512 / 32;
+    var clus = exfat_root_cluster;
+    var max_c = exfat_cluster_count + 2;
+    var guard = 0;
+    var count = 0;
+    while (clus >= 2) {
+        if (clus >= max_c) { return count; }
+        var base = exfat_cluster_sector(clus);
+        for (var s = 0; s < exfat_sectors_per_cluster; s = s + 1) {
+            if (exfat_blk_read(base + s, &exfat_dir_buf) != 0) { return count; }
+            for (var e = 0; e < eps; e = e + 1) {
+                var t = load8(&exfat_dir_buf + e * 32);
+                if (t == 0x00) { return count; }
+                if (t == 0x85) { count = count + 1; }
+            }
+        }
+        clus = exfat_next_cluster(clus);
+        guard = guard + 1;
+        if (guard > max_c) { return count; }
+    }
+    return count;
+}
