@@ -1350,7 +1350,7 @@ fn ext2_dir_insert(dir_ino, name, name_len, child_ino, ftype) {
     if (ext2_write_block(nb, &ext2_dir_buf) != 0) { return 0 - 1; }
     ext2_inode_set_size_lo(&ext2_inode_buf, dir_size + ext2_blocksize);
     ext2_inode_set_blocks_lo(&ext2_inode_buf,
-        ext2_inode_blocks_lo(&ext2_inode_buf) + ext2_bmap_alloc_count * (ext2_blocksize / 512));
+    ext2_inode_blocks_lo(&ext2_inode_buf) + ext2_bmap_alloc_count * (ext2_blocksize / 512));
     if (ext2_put_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
     return 0;
 }
@@ -1386,7 +1386,7 @@ fn ext2_dir_remove(dir_ino, name, name_len) {
                                 ext2_store32_le(&ext2_dir_buf, off, 0);          # tombstone head
                             } else {
                                 ext2_store16_le(&ext2_dir_buf, prev + 4,
-                                    ext2_load16_le(&ext2_dir_buf, prev + 4) + e_rl);  # coalesce
+                                ext2_load16_le(&ext2_dir_buf, prev + 4) + e_rl);  # coalesce
                             }
                             if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
                             return 0;
