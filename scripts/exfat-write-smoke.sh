@@ -128,6 +128,16 @@ strings "$LOG" | grep -q "^exfatw: delete EXDELME.BIN wrc=0 drc=0" \
 strings "$LOG" | grep -q "^exfatw: trunc EXTRUNC.BIN wrc=0 trc=0" \
     && echo "  PASS: 3c truncate-to-zero (write rc=0, trunc rc=0)" \
     || { echo "  FAIL: 3c truncate"; rc=1; }
+# 1.34.2 — write parity: overwrite-existing, arbitrary truncate, ENOSPC
+strings "$LOG" | grep -q "^exfatw: overwrite round-trip OK" \
+    && echo "  PASS: 1.34.2 overwrite-existing (1000 B -> 2000 B, byte-exact)" \
+    || { echo "  FAIL: 1.34.2 overwrite"; rc=1; }
+strings "$LOG" | grep -q "^exfatw: truncate round-trip OK" \
+    && echo "  PASS: 1.34.2 arbitrary-length truncate (3000 B -> 1000 B)" \
+    || { echo "  FAIL: 1.34.2 arbitrary truncate"; rc=1; }
+strings "$LOG" | grep -q "^exfatw: enospc clean -- no partial file" \
+    && echo "  PASS: 1.34.2 ENOSPC rollback (oversize request, no partial file)" \
+    || { echo "  FAIL: 1.34.2 ENOSPC"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

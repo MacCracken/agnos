@@ -687,6 +687,59 @@ if (exfat_active == 1) {
     kprint(" trc=", 5);
     kprint_num(ext_trc);
     kprintln("", 0);
+    # 1.34.2 — overwrite-existing (in place, no new dir slot): EXDATA.BIN
+    # 3000 B -> 2000 B (the 3b round-trip already validated its content).
+    # Overwrite/truncate operate on an EXISTING file by design, so reusing
+    # EXDATA avoids exhausting the single-cluster root (root-extension is a
+    # 1.34.4 item). exfat_file_buf still holds the i&0xFF pattern.
+    var exov_r = exfat_write_file(exwc_name, 10, &exfat_file_buf, 2000);
+    var exov_res[24];
+    var exov_ok = 0;
+    if (exfat_find(exwc_name, 10, &exov_res) == 1) {
+        var exov_first = load64(&exov_res);
+        var exov_len = load64(&exov_res + 8);
+        var exov_nfc = load64(&exov_res + 16);
+        var ng = exfat_read(exov_first, exov_nfc, &exfat_file_buf, exov_len);
+        exov_ok = 1;
+        if (exov_len != 2000) { exov_ok = 0; }
+        if (ng != 2000) { exov_ok = 0; }
+        if (load8(&exfat_file_buf + 0) != 0) { exov_ok = 0; }
+        if (load8(&exfat_file_buf + 1999) != (1999 & 0xFF)) { exov_ok = 0; }
+    }
+    kprint("exfatw: overwrite EXDATA.BIN rc=", 32);
+    kprint_num(exov_r);
+    kprintln("", 0);
+    if (exov_ok == 1) { kprintln("exfatw: overwrite round-trip OK", 31); }
+    else { kprintln("exfatw: overwrite round-trip FAIL", 33); }
+    # 1.34.2 — arbitrary-length truncate (in place): EXDATA.BIN 2000 -> 1000.
+    var extr_t = exfat_truncate(exwc_name, 10, 1000);
+    var extr_res[24];
+    var extr_ok = 0;
+    if (exfat_find(exwc_name, 10, &extr_res) == 1) {
+        var extr_first = load64(&extr_res);
+        var extr_len = load64(&extr_res + 8);
+        var extr_nfc = load64(&extr_res + 16);
+        var tg = exfat_read(extr_first, extr_nfc, &exfat_file_buf, extr_len);
+        extr_ok = 1;
+        if (extr_len != 1000) { extr_ok = 0; }
+        if (tg != 1000) { extr_ok = 0; }
+        if (load8(&exfat_file_buf + 999) != (999 & 0xFF)) { extr_ok = 0; }
+    }
+    kprint("exfatw: trunc EXDATA.BIN t=", 27);
+    kprint_num(extr_t);
+    kprintln("", 0);
+    if (extr_ok == 1) { kprintln("exfatw: truncate round-trip OK", 30); }
+    else { kprintln("exfatw: truncate round-trip FAIL", 32); }
+    # 1.34.2 — ENOSPC rollback: request a file larger than the volume; alloc
+    # must fail BEFORE publishing anything (no partial file, fsck stays clean).
+    var exns_name = "EXNOSPC.BIN";
+    var exns_rc = exfat_write_file(exns_name, 11, &exfat_file_buf, 100000000);
+    kprint("exfatw: enospc EXNOSPC.BIN rc=", 30);
+    kprint_num(exns_rc);
+    kprintln("", 0);
+    var exns_res[24];
+    if (exfat_find(exns_name, 11, &exns_res) == 1) { kprintln("exfatw: enospc file present FAIL", 32); }
+    else { kprintln("exfatw: enospc clean -- no partial file", 39); }
 }
 #endif
 
