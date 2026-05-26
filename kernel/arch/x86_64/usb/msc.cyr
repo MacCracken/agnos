@@ -1424,6 +1424,28 @@ fn msc_blk_write(sector, buf) {
     return 0;
 }
 
+# SCSI SYNCHRONIZE CACHE(10) (SBC-3 §5.20, opcode 0x35) — commit the
+# device's volatile write cache. No data phase (dCBWDataTransferLength=0);
+# all-zero operands (LBA 0, blocks 0) = flush the whole device, IMMED=0 so
+# the good CSW means the flush is done. A cacheless stick may answer CHECK
+# CONDITION / INVALID OPCODE — msc_scsi_exec surfaces that as failure (-1),
+# benign (nothing to flush). 1.33.5 fsync barrier (flush-cache-prior-art.md
+# § 2.3). cdb_buf[2] matches msc_read_lba's proven 10-byte-CDB allocation.
+fn msc_blk_flush() {
+    if (msc_first_slot == 0) { return 0 - 1; }
+    var row = msc_row_addr(msc_first_slot);
+    if (load8(row + 68) == 0) { return 0 - 1; }        # endpoints not ready
+    var cdb_buf[2];
+    var cdb_p = &cdb_buf;
+    var k = 0;
+    while (k < 16) { store8(cdb_p + k, 0); k = k + 1; }
+    store8(cdb_p + 0, 0x35);                            # SYNCHRONIZE CACHE(10)
+    if (msc_scsi_exec(msc_first_slot, 0, cdb_p, 10, 0, 0, 0, 1) == 0) {
+        return 0 - 1;
+    }
+    return 0;
+}
+
 # Multi-sector read. Chunks into 128-sector calls (64 KB at 512 B LBA —
 # the single-Normal-TRB bulk transfer cap). Caller's buffer is contiguous
 # physical (existing virtio/nvme/ahci convention).

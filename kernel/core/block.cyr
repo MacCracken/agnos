@@ -193,16 +193,12 @@ fn blk_write_on(tag, sector, buf) {
 # dispatchers. Returns 0 on success, -1 on failure.
 fn blk_flush_on(tag) {
     if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
+    if (tag == BLK_VIRTIO)  { return vblk_blk_flush(); }
     if (tag == BLK_NVME)    { return nvme_blk_flush(); }
     if (tag == BLK_AHCI)    { return ahci_blk_flush(); }
-    # VirtIO / USB-MS / RAM-disk flush land in 1.33.5 bite 3. Until then
-    # they are honest no-ops: RAM-disk is volatile by definition; VirtIO
-    # without VIRTIO_BLK_F_FLUSH and a cacheless USB stick are write-
-    # through, so there is nothing to commit. Bite 3 promotes VirtIO +
-    # USB-MS to real cache-flush commands (feature-gated / SYNCHRONIZE
-    # CACHE). The FS backend on iron + the write-smoke is NVMe, so this
-    # default is unreached by the bite-2 durability gate.
-    return 0;
+    if (tag == BLK_USB_MS)  { return msc_blk_flush(); }
+    if (tag == BLK_RAMDISK) { return ramdisk_blk_flush(); }
+    return 0 - 1;
 }
 
 fn blk_flush() {

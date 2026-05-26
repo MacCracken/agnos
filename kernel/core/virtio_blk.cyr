@@ -93,6 +93,7 @@ var vblk_used_last   = 0;   # last consumed used ring slot
 # Block-layer-visible capacity (from DEVICE_CFG.capacity field)
 var vblk_capacity    = 0;   # in 512-B sectors
 var vblk_readonly    = 0;   # 1 if VIRTIO_BLK_F_RO accepted
+var vblk_flush_supported = 0;   # 1 if VIRTIO_BLK_F_FLUSH accepted (1.33.5)
 var vblk_active      = 0;   # 1 after init completes
 
 # Request structures (DMA-accessible, identity-mapped via BSS)
@@ -247,6 +248,15 @@ fn vblk_negotiate_features() {
     if ((feat_lo & 0x20) != 0) {
         drv_lo = drv_lo | 0x20;
         vblk_readonly = 1;
+    }
+
+    # Opportunistic VIRTIO_BLK_F_FLUSH (bit 9) — if the device has a
+    # writeback cache it offers this; ack it so vblk_blk_flush can issue
+    # a real FLUSH. If not offered, the device is write-through and flush
+    # is a no-op by definition (§ 5.2, flush-cache-prior-art.md § 2.4).
+    if ((feat_lo & 0x200) != 0) {
+        drv_lo = drv_lo | 0x200;
+        vblk_flush_supported = 1;
     }
 
     # Write back accepted features (low half then high half)
@@ -472,6 +482,65 @@ fn vblk_do_request(req_type, sector, buf) {
     return 0 - 1;
 }
 
+# FLUSH request (VIRTIO_BLK_T_FLUSH = 4) — commit the device's writeback
+# cache to stable storage. No data buffer, so this is a 2-descriptor
+# chain (header + status), unlike the 3-descriptor read/write chain; the
+# sector field is reserved (0) for flush. Same avail-ring / wmb / doorbell
+# / used-poll machinery as vblk_do_request. Callers gate on
+# vblk_flush_supported. 1.33.5 fsync barrier (flush-cache-prior-art.md § 2.4).
+fn vblk_do_flush() {
+    if (vblk_active == 0) { return 0 - 1; }
+
+    var qsz = vblk_qsize;
+    var desc_base  = vblk_desc;
+    var avail_base = vblk_avail;
+    var used_base  = vblk_used;
+
+    # Header: type=FLUSH, reserved=0, sector=0 (reserved for flush)
+    store32(&vblk_req_hdr + 0, VBLK_T_FLUSH);
+    store32(&vblk_req_hdr + 4, 0);
+    store64(&vblk_req_hdr + 8, 0);
+
+    store8(&vblk_req_status, 0xFF);
+
+    # Desc 0: header (device-readable, NEXT → 1)
+    store64(desc_base + 0,  &vblk_req_hdr);
+    store32(desc_base + 8,  16);
+    store16(desc_base + 12, VBLK_DESC_F_NEXT);
+    store16(desc_base + 14, 1);
+
+    # Desc 1: status byte (device-writable, terminal — no F_NEXT)
+    store64(desc_base + 16, &vblk_req_status);
+    store32(desc_base + 24, 1);
+    store16(desc_base + 28, VBLK_DESC_F_WRITE);
+    store16(desc_base + 30, 0);
+
+    # Avail ring slot[idx % qsz] = desc head (0)
+    var slot = vblk_idx % qsz;
+    store16(avail_base + 4 + slot * 2, 0);
+
+    # WMB before publishing the new idx (§ 2.7.13.3.1).
+    asm { 0x0F; 0xAE; 0xF0; }
+    store16(avail_base + 2, (vblk_idx + 1) & 0xFFFF);
+    vblk_idx = vblk_idx + 1;
+
+    store16(vblk_q0_notify, 0);
+
+    var timeout = 0;
+    while (timeout < 2000000) {
+        var used_idx = load16(used_base + 2);
+        if (used_idx != (vblk_used_last & 0xFFFF)) {
+            asm { 0x0F; 0xAE; 0xF0; }
+            vblk_used_last = vblk_used_last + 1;
+            var status = load8(&vblk_req_status);
+            if (status == 0) { return 0; }
+            return 0 - 1;
+        }
+        timeout = timeout + 1;
+    }
+    return 0 - 1;
+}
+
 # ---------------------------------------------------------------------
 # Public block-layer surface (unchanged names from 0.9.5)
 # ---------------------------------------------------------------------
@@ -494,6 +563,14 @@ fn vblk_blk_write(sector, buf) {
         store64(&vblk_dma_buf + i * 8, load64(buf + i * 8));
     }
     return vblk_do_request(VBLK_T_OUT, sector, &vblk_dma_buf);
+}
+
+# VirtIO FLUSH. No-op success when VIRTIO_BLK_F_FLUSH wasn't negotiated
+# (write-through device — nothing to commit). 1.33.5 fsync barrier.
+fn vblk_blk_flush() {
+    if (vblk_active == 0) { return 0 - 1; }
+    if (vblk_flush_supported == 0) { return 0; }
+    return vblk_do_flush();
 }
 
 fn vblk_blk_read_sectors(start, count, buf) {

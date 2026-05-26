@@ -109,6 +109,14 @@ fn ramdisk_blk_write(sector, buf) {
     return 0;
 }
 
+# RAM-disk is volatile (pmm_alloc-backed) — there is no non-volatile
+# medium and no cache layer, so "commit to stable storage" is vacuous.
+# Honest success. 1.33.5 fsync barrier (flush-cache-prior-art.md § 2.5).
+fn ramdisk_blk_flush() {
+    if (ramdisk_active == 0) { return 0 - 1; }
+    return 0;
+}
+
 fn ramdisk_blk_read_sectors(start, count, buf) {
     if (ramdisk_active == 0) { return 0 - 1; }
     if (start + count > ramdisk_capacity) { return 0 - 1; }
