@@ -20,6 +20,22 @@ The foundation layer: the symmetric write siblings of the read path, plus a non-
 
 **Verification**: production build **629,568 B** (+5,752 vs 1.32.9 — the write primitives, dead-code-eliminable until W2+ calls them). No regression: `scripts/test.sh` **4/4** + `scripts/ext2-smoke.sh` **5/5** (all backends reach `AGNOS shell v`, legacy + 64BIT BGDT). **W1 smoke PASS**: `grp0 free_blk` / `sb free_blk` / `bitmap free-bits` all = **16068**, byte-identical to host `debugfs -R stats` → free-count accessors + bitmap-read math validated; `ext2_write_block` + `ext2_put_inode` identity round-trips byte-clean; `e2fsck -fn` on the post-boot image **clean (exit 0)**. The block-device write primitives are themselves iron-validated (USB-MS Attempt 87). W1 is a QEMU gate — no iron burn (the W5 burn is the first WRITE iron exposure).
 
+### Added — W2 block + inode allocators + write-safety gate (`ext2.cyr`)
+
+Bitmap-walk allocators per the prior-art doc §§ 4-5 (FreeBSD `ext2_alloc` primary). The "find a block" read walkers now have "create a block" siblings.
+
+- **`ext2_alloc_block(goal)` / `ext2_free_block(b)`** — block-bitmap walk with a goal-group hint + group wrap; full accounting (per-group `bg_free_blocks_count` + superblock `s_free_blocks_count`). We trust the bitmap — reserved regions are pre-set by mkfs, so a first-0-bit scan skips them. Double-free guard on the free path.
+- **`ext2_alloc_inode(is_dir)` / `ext2_free_inode(i, is_dir)`** — inode-bitmap mirror; `is_dir` bumps/drops `bg_used_dirs_count`. First-fit group placement (Orlov deliberately not ported — placement is an optimization, not correctness, per doc § 5).
+- **Commit ordering** (doc § 3): set the alloc bit + write the bitmap *before* the resource is used; bump free-counts (BGDT then superblock) *last* — a crash leaks (fsck-reclaimable) but never dangles.
+- Supporting: `ext2_read_bgdt`/`ext2_write_bgdt`, group-descriptor field accessors+stores (`ext2_grp_*`), `ext2_ngroups`, bitmap bit helpers (`ext2_bitmap_get`/`set`/`clear`/`first_free`), `ext2_bitmap_buf` scratch (kept distinct from the BGDT/data buffers so an allocator can hold all three live).
+- **Write-safety gate** (`ext2_write_ok`, set at mount per doc § 10): WRITE must honor `ro_compat` (a read-only mount ignores it). The FS still **reads** fully, but mutation is refused on `metadata_csum` (0x400) / `uninit_bg` (0x10) / `bigalloc` (0x200) / `64bit` (incompat 0x80) — the bits a naive writer would corrupt. `mkfs.ext4` defaults set `metadata_csum`+`64bit`, so the real agnos-fs partition refuses write until those deferred sub-cycles; the write smoke targets a `-O ^metadata_csum,^64bit,^uninit_bg` image. `ext2_put_inode` + all allocators check the flag.
+
+**Verification**: production **640,848 B** (+11,280; allocators dead-code-eliminable until W3+). No regression (`ext2-smoke.sh` 5/5). **W2 smoke PASS** (`scripts/ext2-write-smoke.sh`): alloc 3 blocks + 1 inode (`blk 1084 1085 1086 ino 15`) → free all → free-counts return **exactly** to baseline (`16068 → 16068`, `17138 → 17138`); `e2fsck -fn` on the post-boot image **clean** — bitmap set/clear + BGDT/SB accounting symmetry proven. QEMU gate (no iron). **Next: W3** (`ext2_write_at` + truncate).
+
+### Fixed — `ext2_init` log_block_size error message length (`ext2.cyr`)
+
+`kprintln("ext2: log_block_size out of range: ", 36)` declared length 36 for a 35-byte string — a 1-byte over-read printing one stray byte on that (rarely-hit) error path. Corrected to 35.
+
 ## [1.32.9] — 2026-05-25 (DHCP re-enablement — the 1.32.3 STATIC bypass is removed and a real DHCP exchange runs again on boot. The OFFER timeout that drove the bypass across the 1.32.x arc was the r8169 unicast-RX drop **fixed at 1.32.7** (RX ring 16→64), not a DHCP-layer bug; with unicast RX delivering on iron, `dhcp_init()` can complete DISCOVER → OFFER → REQUEST → ACK. STATIC (192.168.1.222) stays as the iron fallback so a DHCP miss still leaves a usable address. QEMU/SLIRP DHCP exercised; iron verification is the next burn, user-driven.)
 
 ### Changed — boot net-probe re-attempts DHCP (`main.cyr`)

@@ -1,5 +1,5 @@
 #!/bin/bash
-# ext2 WRITE-path W1 smoke (1.33.x WRITE arc).
+# ext2 WRITE-path smoke (1.33.x WRITE arc — W1 primitives + W2 allocators).
 #
 # Boots the EXT2_WRITE_SELFTEST kernel against a deliberately write-
 # friendly ext2 partition (no metadata_csum / 64bit / dir_index — the
@@ -116,6 +116,16 @@ else
     echo "  FAIL: inode identity put"; rc=1
 fi
 
+# W2: block + inode allocator round-trip (alloc 3 blocks + 1 inode, free
+# them, free-counts must return to baseline). Absent on a read-only FS.
+if strings "$LOG" | grep -q "ext2w: W2 alloc/free round-trip OK"; then
+    echo "  PASS: W2 allocator round-trip (alloc/free block+inode)"
+elif strings "$LOG" | grep -q "ext2w: read-only FS"; then
+    echo "  SKIP: W2 allocator round-trip (FS mounted read-only for write)"
+else
+    echo "  FAIL: W2 allocator round-trip"; rc=1
+fi
+
 # Bonus: free-block count cross-check (self-test sb total vs host debugfs).
 ST_FREE=$(strings "$LOG" | sed -nE 's/.*sb free_blk=([0-9]+).*/\1/p' | head -1)
 if [ -n "$ST_FREE" ] && [ -n "${BASE_FREE:-}" ] && [ "$ST_FREE" = "$BASE_FREE" ]; then
@@ -136,7 +146,7 @@ fi
 
 echo ""
 echo "=========================================="
-[ $rc -eq 0 ] && echo "ext2 WRITE W1 smoke: PASS" || echo "ext2 WRITE W1 smoke: FAIL"
+[ $rc -eq 0 ] && echo "ext2 WRITE smoke (W1+W2): PASS" || echo "ext2 WRITE smoke (W1+W2): FAIL"
 echo "Logs: $LOGS"
 echo "=========================================="
 exit $rc

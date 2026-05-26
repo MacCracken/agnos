@@ -17,6 +17,7 @@
 # --- Globals --------------------------------------------------------
 
 var ext2_active             = 0;    # 0 = not mounted; 1 = mounted
+var ext2_write_ok           = 0;    # WRITE arc: 1 = FS is write-safe (no metadata_csum / 64bit / uninit_bg); set at mount per doc § 10
 var ext2_desc_size          = 32;   # BGDT entry size: 32 (legacy) or 64 (ext4 64BIT)
 var ext2_blocksize          = 0;    # bytes per FS block (1024/2048/4096)
 var ext2_blocks_per_group   = 0;
@@ -61,6 +62,12 @@ var ext2_indirect_buf_l3[512];  # triple-indirect level 3 (i_block[14] → l1 �
 # (audit § 5.3). 4 KB BSS.
 var ext2_extent_buf[512];
 
+# WRITE arc (1.33.x) bitmap scratch — one block holds a full group's
+# block- or inode-bitmap (4096 B = 32768 bits >= blocks_per_group). Kept
+# distinct from ext2_block_buf / ext2_bgdt_buf so an allocator can hold
+# the BGDT block, the bitmap block, and a data block live at once.
+var ext2_bitmap_buf[512];
+
 # --- Endian-aware byte helpers (ext2/ext4 is little-endian on disk) -
 
 fn ext2_load16_le(ptr, off) {
@@ -103,6 +110,7 @@ fn ext2_sb_magic(sb)             { return ext2_load16_le(sb, 56); }
 fn ext2_sb_rev_level(sb)         { return ext2_load32_le(sb, 76); }
 fn ext2_sb_inode_size(sb)        { return ext2_load16_le(sb, 88); }
 fn ext2_sb_feature_incompat(sb)  { return ext2_load32_le(sb, 96); }
+fn ext2_sb_feature_ro_compat(sb) { return ext2_load32_le(sb, 100); }
 fn ext2_sb_desc_size(sb)         { return ext2_load16_le(sb, 254); }
 
 # Free-space accounting (WRITE arc) — s_free_blocks_count @ +12,
@@ -295,6 +303,23 @@ fn ext2_init() {
         return 0 - 1;
     }
 
+    # WRITE arc (1.33.x) — write-safety gate (prior-art doc § 10). Reads
+    # tolerate ro_compat freely (an RO mount ignores it); WRITE must HONOR
+    # it or refuse. We refuse write (mount stays fully readable, just
+    # immutable) on the bits that genuinely break a naive writer:
+    #   ro_compat GDT_CSUM/uninit_bg (0x10), BIGALLOC (0x200),
+    #             METADATA_CSUM (0x400 — every metadata block carries a
+    #             CRC32c; writing without updating it = e2fsck rejects)
+    #   incompat  64BIT (0x80 — BGDT count _hi halves; deferred sub-cycle)
+    # `mkfs.ext4` defaults set metadata_csum + 64bit, so the real agnos-fs
+    # partition refuses write until those sub-cycles land; the write smoke
+    # targets a `-O ^metadata_csum,^64bit,^uninit_bg` image (write_ok=1).
+    var ro_compat = ext2_sb_feature_ro_compat(&ext2_sb_buf);
+    var ro_danger = 0x0010 | 0x0200 | 0x0400;
+    ext2_write_ok = 1;
+    if ((ro_compat & ro_danger) != 0) { ext2_write_ok = 0; }
+    if ((incompat & 0x80) != 0)       { ext2_write_ok = 0; }
+
     # Decode geometry.
     var log_bs               = ext2_sb_log_block_size(&ext2_sb_buf);
 
@@ -304,7 +329,7 @@ fn ext2_init() {
     # cap before the shift so we never compute a nonsense blocksize from
     # a corrupt superblock.
     if (log_bs > 2) {
-        kprint("ext2: log_block_size out of range: ", 36);
+        kprint("ext2: log_block_size out of range: ", 35);
         kprint_num(log_bs);
         kprintln("", 0);
         return 0 - 1;
@@ -565,8 +590,9 @@ fn ext2_get_inode(inode_num, out_buf) {
 # Returns 0 / -1.
 
 fn ext2_put_inode(inode_num, in_buf) {
-    if (ext2_active == 0) { return 0 - 1; }
-    if (inode_num == 0)   { return 0 - 1; }
+    if (ext2_active == 0)   { return 0 - 1; }
+    if (ext2_write_ok == 0) { return 0 - 1; }   # WRITE arc § 10 — refuse on csum/64bit FS
+    if (inode_num == 0)     { return 0 - 1; }
 
     var max_inodes_in_chunk = (ext2_blocksize / 32) * ext2_inodes_per_group;
     if (inode_num > max_inodes_in_chunk) { return 0 - 1; }
@@ -599,6 +625,185 @@ fn ext2_put_inode(inode_num, in_buf) {
         store8(dst + i, load8(in_buf + i));
     }
     if (ext2_write_block(target_block, &ext2_block_buf) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# === Block / inode allocators (WRITE arc 1.33.x — W2) =================
+#
+# Bitmap-walk allocators per the prior-art doc §§ 4-5 (FreeBSD ext2_alloc
+# primary). A block/inode bitmap is one bit per block/inode in a group,
+# packed LSB-first into <= one FS block. We TRUST the bitmap: reserved
+# regions (SB / BGDT / bitmaps / inode-table / sparse-super backups) are
+# pre-set by mkfs, so a first-0-bit scan skips them without us computing
+# the layout. Commit order (doc § 3): set the alloc bit + write the bitmap
+# BEFORE the caller uses the resource; bump free-counts (BGDT then SB)
+# LAST — so a crash leaks (fsck-reclaimable) but never dangles. Free
+# reverses. All gated on ext2_write_ok.
+
+# --- BGDT block read / write (descriptor table at first_data_block+1) ---
+fn ext2_read_bgdt()  { return ext2_read_block(ext2_first_data_block + 1, &ext2_bgdt_buf); }
+fn ext2_write_bgdt() { return ext2_write_block(ext2_first_data_block + 1, &ext2_bgdt_buf); }
+
+# Group-descriptor field access within the loaded ext2_bgdt_buf. Counts
+# are the u16 lo halves (the _hi halves only exist on 64BIT FSes, which
+# ext2_write_ok refuses, so lo is the whole value here).
+fn ext2_grp_off(group)              { return &ext2_bgdt_buf + group * ext2_desc_size; }
+fn ext2_grp_block_bitmap(group)     { return ext2_load32_le(ext2_grp_off(group), 0); }
+fn ext2_grp_inode_bitmap(group)     { return ext2_load32_le(ext2_grp_off(group), 4); }
+fn ext2_grp_free_blocks(group)      { return ext2_load16_le(ext2_grp_off(group), 12); }
+fn ext2_grp_free_inodes(group)      { return ext2_load16_le(ext2_grp_off(group), 14); }
+fn ext2_grp_used_dirs(group)        { return ext2_load16_le(ext2_grp_off(group), 16); }
+fn ext2_grp_set_free_blocks(group, v) { return ext2_store16_le(ext2_grp_off(group), 12, v); }
+fn ext2_grp_set_free_inodes(group, v) { return ext2_store16_le(ext2_grp_off(group), 14, v); }
+fn ext2_grp_set_used_dirs(group, v)   { return ext2_store16_le(ext2_grp_off(group), 16, v); }
+
+# Number of block groups = ceil((blocks_count - first_data_block) / bpg).
+fn ext2_ngroups() {
+    var total = ext2_sb_blocks_count(&ext2_sb_buf) - ext2_first_data_block;
+    return (total + ext2_blocks_per_group - 1) / ext2_blocks_per_group;
+}
+
+# --- bitmap bit helpers (LSB-first within each byte) ---
+fn ext2_bitmap_get(buf, bit)   { return (load8(buf + bit / 8) >> (bit & 7)) & 1; }
+fn ext2_bitmap_set(buf, bit)   { var p = buf + bit / 8; store8(p, load8(p) | (1 << (bit & 7))); return 0; }
+fn ext2_bitmap_clear(buf, bit) { var p = buf + bit / 8; store8(p, load8(p) & (0xFF ^ (1 << (bit & 7)))); return 0; }
+
+# First 0-bit in [0, limit) of buf, or -1 if none.
+fn ext2_bitmap_first_free(buf, limit) {
+    var b = 0;
+    while (b < limit) {
+        if (ext2_bitmap_get(buf, b) == 0) { return b; }
+        b = b + 1;
+    }
+    return 0 - 1;
+}
+
+# --- block allocator --------------------------------------------------
+# goal = a block to allocate near (its group is tried first); 0 = no hint.
+# Returns the allocated block#, 0 on ENOSPC, -1 on IO/guard error.
+fn ext2_alloc_block(goal) {
+    if (ext2_active == 0)   { return 0 - 1; }
+    if (ext2_write_ok == 0) { return 0 - 1; }
+
+    var ng = ext2_ngroups();
+    var start = 0;
+    if (goal > ext2_first_data_block) {
+        start = (goal - ext2_first_data_block) / ext2_blocks_per_group;
+    }
+    if (start >= ng) { start = 0; }
+
+    var gi = 0;
+    while (gi < ng) {
+        var group = start + gi;
+        if (group >= ng) { group = group - ng; }      # wrap
+
+        if (ext2_read_bgdt() != 0) { return 0 - 1; }
+        if (ext2_grp_free_blocks(group) > 0) {
+            var bbmp = ext2_grp_block_bitmap(group);
+            if (ext2_read_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+            var b = ext2_bitmap_first_free(&ext2_bitmap_buf, ext2_blocks_per_group);
+            if (b >= 0) {
+                # set bit + write bitmap (step 1) — reserve before use
+                ext2_bitmap_set(&ext2_bitmap_buf, b);
+                if (ext2_write_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+                # accounting last: BGDT then SB (ext2_bgdt_buf still holds
+                # the descriptor table — bitmap read went to a separate buf)
+                ext2_grp_set_free_blocks(group, ext2_grp_free_blocks(group) - 1);
+                if (ext2_write_bgdt() != 0) { return 0 - 1; }
+                ext2_sb_set_free_blocks_count(&ext2_sb_buf, ext2_sb_free_blocks_count(&ext2_sb_buf) - 1);
+                if (ext2_write_superblock() != 0) { return 0 - 1; }
+                return ext2_first_data_block + group * ext2_blocks_per_group + b;
+            }
+        }
+        gi = gi + 1;
+    }
+    return 0;   # ENOSPC
+}
+
+# Free a data block. Caller must have cleared the pointer to it first
+# (doc § 3 — free the pointer before the bit). Returns 0 / -1.
+fn ext2_free_block(block_num) {
+    if (ext2_active == 0)   { return 0 - 1; }
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    if (block_num < ext2_first_data_block) { return 0 - 1; }
+
+    var rel   = block_num - ext2_first_data_block;
+    var group = rel / ext2_blocks_per_group;
+    var b     = rel - group * ext2_blocks_per_group;
+
+    if (ext2_read_bgdt() != 0) { return 0 - 1; }
+    var bbmp = ext2_grp_block_bitmap(group);
+    if (ext2_read_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+    if (ext2_bitmap_get(&ext2_bitmap_buf, b) == 0) { return 0 - 1; }   # double-free guard
+    ext2_bitmap_clear(&ext2_bitmap_buf, b);
+    if (ext2_write_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+    ext2_grp_set_free_blocks(group, ext2_grp_free_blocks(group) + 1);
+    if (ext2_write_bgdt() != 0) { return 0 - 1; }
+    ext2_sb_set_free_blocks_count(&ext2_sb_buf, ext2_sb_free_blocks_count(&ext2_sb_buf) + 1);
+    if (ext2_write_superblock() != 0) { return 0 - 1; }
+    return 0;
+}
+
+# --- inode allocator --------------------------------------------------
+# is_dir != 0 bumps bg_used_dirs_count. Returns the (1-based) inode#, 0 if
+# no free inode, -1 on IO/guard error. Reserved inodes (< s_first_ino) are
+# pre-set in the bitmap by mkfs, so first-0-bit scan skips them. Group
+# placement is first-fit (doc § 5 — Orlov / most-free deliberately not
+# ported; placement is an optimization, not a correctness requirement).
+fn ext2_alloc_inode(is_dir) {
+    if (ext2_active == 0)   { return 0 - 1; }
+    if (ext2_write_ok == 0) { return 0 - 1; }
+
+    var ng = ext2_ngroups();
+    var group = 0;
+    while (group < ng) {
+        if (ext2_read_bgdt() != 0) { return 0 - 1; }
+        if (ext2_grp_free_inodes(group) > 0) {
+            var ibmp = ext2_grp_inode_bitmap(group);
+            if (ext2_read_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+            var b = ext2_bitmap_first_free(&ext2_bitmap_buf, ext2_inodes_per_group);
+            if (b >= 0) {
+                ext2_bitmap_set(&ext2_bitmap_buf, b);
+                if (ext2_write_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+                ext2_grp_set_free_inodes(group, ext2_grp_free_inodes(group) - 1);
+                if (is_dir != 0) {
+                    ext2_grp_set_used_dirs(group, ext2_grp_used_dirs(group) + 1);
+                }
+                if (ext2_write_bgdt() != 0) { return 0 - 1; }
+                ext2_sb_set_free_inodes_count(&ext2_sb_buf, ext2_sb_free_inodes_count(&ext2_sb_buf) - 1);
+                if (ext2_write_superblock() != 0) { return 0 - 1; }
+                return group * ext2_inodes_per_group + b + 1;
+            }
+        }
+        group = group + 1;
+    }
+    return 0;   # no free inode
+}
+
+# Free an inode. is_dir != 0 decrements bg_used_dirs_count. Caller must
+# have removed the dirent + freed the inode's data blocks first. 0 / -1.
+fn ext2_free_inode(inode_num, is_dir) {
+    if (ext2_active == 0)   { return 0 - 1; }
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    if (inode_num == 0)     { return 0 - 1; }
+
+    var n     = inode_num - 1;
+    var group = n / ext2_inodes_per_group;
+    var b     = n - group * ext2_inodes_per_group;
+
+    if (ext2_read_bgdt() != 0) { return 0 - 1; }
+    var ibmp = ext2_grp_inode_bitmap(group);
+    if (ext2_read_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+    if (ext2_bitmap_get(&ext2_bitmap_buf, b) == 0) { return 0 - 1; }   # double-free guard
+    ext2_bitmap_clear(&ext2_bitmap_buf, b);
+    if (ext2_write_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
+    ext2_grp_set_free_inodes(group, ext2_grp_free_inodes(group) + 1);
+    if (is_dir != 0) {
+        ext2_grp_set_used_dirs(group, ext2_grp_used_dirs(group) - 1);
+    }
+    if (ext2_write_bgdt() != 0) { return 0 - 1; }
+    ext2_sb_set_free_inodes_count(&ext2_sb_buf, ext2_sb_free_inodes_count(&ext2_sb_buf) + 1);
+    if (ext2_write_superblock() != 0) { return 0 - 1; }
     return 0;
 }
 
@@ -1178,6 +1383,13 @@ fn ext2_write_selftest() {
     kprint("ext2w: bitmap free-bits=", 24); kprint_num(free_bits);
     kprintln("", 0);
 
+    # Write checks below mutate the FS — gate on the write-safety flag so
+    # a csum/64bit FS reports cleanly instead of failing put_inode.
+    if (ext2_write_ok == 0) {
+        kprintln("ext2w: read-only FS -- write checks skipped", 43);
+        return 0;
+    }
+
     # 3a. identity write-back of the block-bitmap block (still in
     #     ext2_block_buf): write unchanged, re-read into l1 scratch, diff.
     if (ext2_write_block(bbmp, &ext2_block_buf) != 0) {
@@ -1218,6 +1430,37 @@ fn ext2_write_selftest() {
     }
     if (iok == 1) { kprintln("ext2w: inode id put OK", 22); }
     else          { kprintln("ext2w: inode id put MISMATCH", 28); }
+
+    # === W2: allocator round-trip — alloc 3 blocks + 1 inode, free them,
+    #     assert free-counts return to baseline (proves bitmap set/clear +
+    #     BGDT/SB accounting symmetry). Net FS change = zero → e2fsck clean.
+    var fb0 = ext2_sb_free_blocks_count(&ext2_sb_buf);
+    var fi0 = ext2_sb_free_inodes_count(&ext2_sb_buf);
+    var a1 = ext2_alloc_block(0);
+    var a2 = ext2_alloc_block(a1);
+    var a3 = ext2_alloc_block(a2);
+    var ain = ext2_alloc_inode(0);
+    kprint("ext2w: alloc blk ", 17); kprint_num(a1);
+    kprint(" ", 1); kprint_num(a2);
+    kprint(" ", 1); kprint_num(a3);
+    kprint(" ino ", 5); kprint_num(ain);
+    kprintln("", 0);
+    ext2_free_block(a3);
+    ext2_free_block(a2);
+    ext2_free_block(a1);
+    ext2_free_inode(ain, 0);
+    var fb1 = ext2_sb_free_blocks_count(&ext2_sb_buf);
+    var fi1 = ext2_sb_free_inodes_count(&ext2_sb_buf);
+    kprint("ext2w: free_blk ", 16); kprint_num(fb0);
+    kprint(" -> ", 4); kprint_num(fb1);
+    kprint(" free_ino ", 10); kprint_num(fi0);
+    kprint(" -> ", 4); kprint_num(fi1);
+    kprintln("", 0);
+    if ((fb0 == fb1) & (fi0 == fi1) & (a1 > 0) & (ain > 0)) {
+        kprintln("ext2w: W2 alloc/free round-trip OK", 34);
+    } else {
+        kprintln("ext2w: W2 alloc/free round-trip MISMATCH", 40);
+    }
 
     return 0;
 }
