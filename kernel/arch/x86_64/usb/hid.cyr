@@ -244,6 +244,23 @@ fn hid_kbd_configure(slot_id) {
     hid_kbd_xfer_idx   = 1;   # next free TRB slot (we just filled 0)
     hid_kbd_xfer_cycle = 1;
 
+    # Link TRB at slot 255 wraps the transfer ring back to slot 0 (xHCI 1.2
+    # §4.9.2.2). WITHOUT it the controller runs off the end of the 256-TRB
+    # page after ~255 reports — the 1.33.4 interactive-lockup root cause: the
+    # kbd interrupt-IN EP is polled continuously, so a few seconds of typing
+    # exhausts the ring, the EP stalls, and keyboard input wedges (the CPU
+    # stays alive on the timer, so from the user's seat it looks like a hard
+    # freeze; query-status shows the vCPU still running). Mirrors the command
+    # ring's Link TRB (xhci_ring.cyr:203-206) + wrap (xhci_cmd.cyr:112-130).
+    # Initial C=0 (opposite of PCS=1) so HW won't follow it until
+    # hid_arm_xfer_trb aligns its cycle on the first wrap; TC (bit 1) set so
+    # HW flips its Consumer Cycle State when it does. Slot 255 is reserved —
+    # never armed with a Normal TRB.
+    var link = xfer_ring + 255 * 16;
+    store64(link, xfer_ring);
+    store32(link + 8, 0);
+    store32(link + 12, (XHCI_TRB_LINK << 10) | 0x2);
+
     # Step 5: extend the input context. xhci_alloc_input_ctx left it
     # holding Slot + EP0; we add the kbd interrupt-IN EP context.
     var ictx = xhci_slot_get(xhci_slot_input_ctx, slot_id);
@@ -313,10 +330,20 @@ fn hid_arm_xfer_trb() {
     var ctrl = (1 << 5) | (1 << 2) | (XHCI_TRB_NORMAL << 10) | (hid_kbd_xfer_cycle & 0x1);
     store32(trb + 12, ctrl);
     hid_kbd_xfer_idx = hid_kbd_xfer_idx + 1;
-    if (hid_kbd_xfer_idx >= 256) {
-        hid_kbd_xfer_idx = 0;
+    # Reached the Link TRB slot (255, set up in hid_kbd_configure): align its
+    # cycle bit with the current producer cycle so HW follows it, flip our
+    # cycle, wrap to slot 0. Mirrors xhci_cmd_submit's wrap (xhci_cmd.cyr:115).
+    # Pre-1.33.4 this wrapped at `>= 256` with no Link TRB — the controller
+    # had no way to return to slot 0 and fell off the page end.
+    if (hid_kbd_xfer_idx == 255) {
+        var link = hid_kbd_xfer_ring + 255 * 16;
+        var link_dw3 = load32(link + 12);
+        if (hid_kbd_xfer_cycle == 1) { link_dw3 = link_dw3 | 0x1; }
+        else { link_dw3 = link_dw3 & 0xFFFFFFFE; }
+        store32(link + 12, link_dw3);
         if (hid_kbd_xfer_cycle == 1) { hid_kbd_xfer_cycle = 0; }
         else { hid_kbd_xfer_cycle = 1; }
+        hid_kbd_xfer_idx = 0;
     }
     return 1;
 }
