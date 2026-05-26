@@ -102,6 +102,7 @@ else
         [ -n "$RAMDISK_ENABLE" ] && echo '#define RAMDISK_ENABLE'
         [ -n "$TCP_LISTEN_SMOKE" ] && echo '#define TCP_LISTEN_SMOKE'
         [ -n "$NET_VERBOSE" ]    && echo '#define NET_VERBOSE'
+        [ -n "$EXT2_WRITE_SELFTEST" ] && echo '#define EXT2_WRITE_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

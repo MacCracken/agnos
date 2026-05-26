@@ -74,6 +74,24 @@ fn ext2_load32_le(ptr, off) {
     | (load8(ptr + off + 3) << 24);
 }
 
+# --- Endian-aware byte STORES (WRITE arc 1.33.x — mirror of the loaders) -
+# Splice a 16/32-bit value little-endian into a buffer. Used by the
+# metadata write-back path (superblock/BGDT/inode field mutation).
+
+fn ext2_store16_le(ptr, off, val) {
+    store8(ptr + off,     val & 0xFF);
+    store8(ptr + off + 1, (val >> 8) & 0xFF);
+    return 0;
+}
+
+fn ext2_store32_le(ptr, off, val) {
+    store8(ptr + off,     val & 0xFF);
+    store8(ptr + off + 1, (val >> 8) & 0xFF);
+    store8(ptr + off + 2, (val >> 16) & 0xFF);
+    store8(ptr + off + 3, (val >> 24) & 0xFF);
+    return 0;
+}
+
 # --- Superblock field accessors (Haiku-style — endian-handled at boundary) -
 
 fn ext2_sb_blocks_count(sb)      { return ext2_load32_le(sb, 4); }
@@ -86,6 +104,14 @@ fn ext2_sb_rev_level(sb)         { return ext2_load32_le(sb, 76); }
 fn ext2_sb_inode_size(sb)        { return ext2_load16_le(sb, 88); }
 fn ext2_sb_feature_incompat(sb)  { return ext2_load32_le(sb, 96); }
 fn ext2_sb_desc_size(sb)         { return ext2_load16_le(sb, 254); }
+
+# Free-space accounting (WRITE arc) — s_free_blocks_count @ +12,
+# s_free_inodes_count @ +16 (both u32). The read path never needed these
+# (reading existing files doesn't consume space); the allocator does.
+fn ext2_sb_free_blocks_count(sb)        { return ext2_load32_le(sb, 12); }
+fn ext2_sb_free_inodes_count(sb)        { return ext2_load32_le(sb, 16); }
+fn ext2_sb_set_free_blocks_count(sb, v) { return ext2_store32_le(sb, 12, v); }
+fn ext2_sb_set_free_inodes_count(sb, v) { return ext2_store32_le(sb, 16, v); }
 
 # --- Inode field accessors ----------------------------------------------
 
@@ -403,6 +429,38 @@ fn ext2_read_block(block_num, buf) {
     return 0;
 }
 
+# --- Block write (WRITE arc 1.33.x — mirror of ext2_read_block) -------
+# Per-backend dispatch via blk_write_on(ext2_backend, ...) so mutations
+# land on the FS's actual backend, not the blk_active winner (same
+# decoupling as the read side on archaemenid). The block-device write
+# primitives are already iron-validated (USB-MS Attempt 87, AHCI demos).
+
+fn ext2_blk_write(sector, buf) {
+    return blk_write_on(ext2_backend, sector, buf);
+}
+
+fn ext2_write_block(block_num, buf) {
+    var lba = ext2_block_to_lba(block_num);
+    for (var i = 0; i < ext2_sectors_per_block; i = i + 1) {
+        if (ext2_blk_write(lba + i, buf + i * 512) != 0) {
+            return 0 - 1;
+        }
+    }
+    return 0;
+}
+
+# Write the in-memory superblock (ext2_sb_buf, 1024 bytes) back to disk.
+# The superblock lives at byte offset 1024 of the partition = LBA
+# first_lba+2..+3 (two 512-B sectors) regardless of FS blocksize, so we
+# write the 1024 bytes directly rather than block-RMW. Caller mutates
+# ext2_sb_buf via the set_* accessors first. Returns 0 / -1.
+fn ext2_write_superblock() {
+    var base = ext2_partition_first_lba + 2;
+    if (ext2_blk_write(base,     &ext2_sb_buf)       != 0) { return 0 - 1; }
+    if (ext2_blk_write(base + 1, &ext2_sb_buf + 512) != 0) { return 0 - 1; }
+    return 0;
+}
+
 # --- Inode lookup -----------------------------------------------------
 #
 # Inode-num → inode struct, copying ext2_inode_size bytes into out_buf.
@@ -493,6 +551,54 @@ fn ext2_get_inode(inode_num, out_buf) {
     for (var i = 0; i < ext2_inode_size; i = i + 1) {
         store8(out_buf + i, load8(src + i));
     }
+    return 0;
+}
+
+# --- Inode write-back (WRITE arc 1.33.x) ------------------------------
+#
+# Inverse of ext2_get_inode. Read-modify-WRITE at BLOCK granularity: an
+# inode is inode_size bytes but the inode table is block-packed, so we
+# read the table block, splice inode_size bytes from in_buf at the
+# inode's offset, and write the whole block back. A bare inode_size-byte
+# write would clobber the adjacent inodes sharing the block. Location
+# math mirrors ext2_get_inode exactly. `in_buf` holds inode_size bytes.
+# Returns 0 / -1.
+
+fn ext2_put_inode(inode_num, in_buf) {
+    if (ext2_active == 0) { return 0 - 1; }
+    if (inode_num == 0)   { return 0 - 1; }
+
+    var max_inodes_in_chunk = (ext2_blocksize / 32) * ext2_inodes_per_group;
+    if (inode_num > max_inodes_in_chunk) { return 0 - 1; }
+
+    var n            = inode_num - 1;
+    var block_group  = n / ext2_inodes_per_group;
+    var idx_in_group = n - block_group * ext2_inodes_per_group;
+
+    var bgdt_block = ext2_first_data_block + 1;
+    if (ext2_read_block(bgdt_block, &ext2_bgdt_buf) != 0) { return 0 - 1; }
+
+    var bgdt_entry_size = ext2_desc_size;
+    var max_groups_in_chunk = ext2_blocksize / bgdt_entry_size;
+    if (block_group >= max_groups_in_chunk) { return 0 - 1; }
+    var bgdt_off = &ext2_bgdt_buf + block_group * bgdt_entry_size;
+    var inode_table_block = ext2_load32_le(bgdt_off, 8);
+    if (ext2_desc_size == 64) {
+        if (ext2_load32_le(bgdt_off, 40) != 0) { return 0 - 1; }
+    }
+
+    var byte_offset       = idx_in_group * ext2_inode_size;
+    var blocks_into_table = byte_offset / ext2_blocksize;
+    var off_in_block      = byte_offset - blocks_into_table * ext2_blocksize;
+    var target_block      = inode_table_block + blocks_into_table;
+
+    # RMW: read the table block, splice our inode, write it back.
+    if (ext2_read_block(target_block, &ext2_block_buf) != 0) { return 0 - 1; }
+    var dst = &ext2_block_buf + off_in_block;
+    for (var i = 0; i < ext2_inode_size; i = i + 1) {
+        store8(dst + i, load8(in_buf + i));
+    }
+    if (ext2_write_block(target_block, &ext2_block_buf) != 0) { return 0 - 1; }
     return 0;
 }
 
@@ -1025,4 +1131,93 @@ fn ext2_open(path, path_len) {
     kpayload_set(base, 1, fsize);      # size
     kpayload_set(base, 2, inode_num);  # inode_num
     return fd;
+}
+
+# === W1 write-path self-test (compile-gated EXT2_WRITE_SELFTEST) =======
+#
+# NON-DESTRUCTIVE proof of the WRITE primitives without changing FS
+# content (so host `e2fsck -fn` stays clean). Three checks:
+#   1. grp-0 BGDT accounting + superblock free totals — compare to host
+#      `debugfs -R stats <img>`.
+#   2. block-bitmap free-bit count — should track grp-0 bg_free_blocks.
+#   3. identity write-back: read a metadata block + inode 2, write each
+#      back UNCHANGED, re-read, assert byte-identical — exercises
+#      ext2_write_block + ext2_put_inode end-to-end with zero net change.
+# Driven from main.cyr right after ext2_init() under the #ifdef.
+
+fn ext2_write_selftest() {
+    if (ext2_active == 0) { kprintln("ext2w: not mounted -- skip", 26); return 0; }
+
+    # 1. group-0 BGDT accounting (group 0 entry is first in the block).
+    var bgdt_block = ext2_first_data_block + 1;
+    if (ext2_read_block(bgdt_block, &ext2_bgdt_buf) != 0) {
+        kprintln("ext2w: BGDT read FAIL", 21); return 0 - 1;
+    }
+    var g0 = &ext2_bgdt_buf;
+    var bbmp = ext2_load32_le(g0, 0);
+    kprint("ext2w: grp0 free_blk=", 21); kprint_num(ext2_load16_le(g0, 12));
+    kprint(" free_ino=", 10); kprint_num(ext2_load16_le(g0, 14));
+    kprint(" dirs=", 6); kprint_num(ext2_load16_le(g0, 16));
+    kprintln("", 0);
+    kprint("ext2w: sb free_blk=", 19); kprint_num(ext2_sb_free_blocks_count(&ext2_sb_buf));
+    kprint(" free_ino=", 10); kprint_num(ext2_sb_free_inodes_count(&ext2_sb_buf));
+    kprintln("", 0);
+
+    # 2. block-bitmap free-bit count over the group's blocks_per_group bits.
+    if (ext2_read_block(bbmp, &ext2_block_buf) != 0) {
+        kprintln("ext2w: bbmp read FAIL", 21); return 0 - 1;
+    }
+    var free_bits = 0;
+    var bit = 0;
+    while (bit < ext2_blocks_per_group) {
+        if ((load8(&ext2_block_buf + bit / 8) & (1 << (bit & 7))) == 0) {
+            free_bits = free_bits + 1;
+        }
+        bit = bit + 1;
+    }
+    kprint("ext2w: bitmap free-bits=", 24); kprint_num(free_bits);
+    kprintln("", 0);
+
+    # 3a. identity write-back of the block-bitmap block (still in
+    #     ext2_block_buf): write unchanged, re-read into l1 scratch, diff.
+    if (ext2_write_block(bbmp, &ext2_block_buf) != 0) {
+        kprintln("ext2w: block id-write FAIL", 26); return 0 - 1;
+    }
+    if (ext2_read_block(bbmp, &ext2_indirect_buf_l1) != 0) {
+        kprintln("ext2w: block reread FAIL", 24); return 0 - 1;
+    }
+    var ok = 1;
+    var j = 0;
+    while (j < ext2_blocksize) {
+        if (load8(&ext2_block_buf + j) != load8(&ext2_indirect_buf_l1 + j)) {
+            ok = 0; break;
+        }
+        j = j + 1;
+    }
+    if (ok == 1) { kprintln("ext2w: block id write-back OK", 29); }
+    else         { kprintln("ext2w: block id write-back MISMATCH", 35); }
+
+    # 3b. identity put_inode of root (inode 2): get -> put unchanged ->
+    #     get into a distinct scratch (ext2_extent_buf) -> diff.
+    if (ext2_get_inode(2, &ext2_inode_buf) != 0) {
+        kprintln("ext2w: root get FAIL", 20); return 0 - 1;
+    }
+    if (ext2_put_inode(2, &ext2_inode_buf) != 0) {
+        kprintln("ext2w: root put FAIL", 20); return 0 - 1;
+    }
+    if (ext2_get_inode(2, &ext2_extent_buf) != 0) {
+        kprintln("ext2w: root reget FAIL", 22); return 0 - 1;
+    }
+    var iok = 1;
+    var k = 0;
+    while (k < ext2_inode_size) {
+        if (load8(&ext2_inode_buf + k) != load8(&ext2_extent_buf + k)) {
+            iok = 0; break;
+        }
+        k = k + 1;
+    }
+    if (iok == 1) { kprintln("ext2w: inode id put OK", 22); }
+    else          { kprintln("ext2w: inode id put MISMATCH", 28); }
+
+    return 0;
 }

@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.33.0] — 2026-05-25 (ext2/ext4 WRITE arc OPEN — the demo→base maturity exit: filesystem mutation so state persists across reboots, not just *shown*. Audit-first per the multi-source convergent prior-art doc (agnosticos `docs/development/ext2-ext4-write-prior-art.md` — FreeBSD ext2fs primary, Linux ext2, OpenBSD, ext4 spec, e2fsprogs). Phased W1-W5: W1-W4 are QEMU `e2fsck -fn`-clean smoke gates, W5 is the iron burn (create file → power-cycle → persists). **The block-device write primitives already exist + are iron-validated** (`blk_write` → `nvme_blk_write`/`ahci_blk_write`, proven at USB-MS Attempt 87), so this arc is purely the ext2 metadata-mutation layer — zero driver work. Crash-consistency without a journal comes from ordered writes (audit § 3). Sections below land as W-phases complete.)
+
+### Added — W1 write primitives + metadata write-back (`block.cyr`, `ext2.cyr`)
+
+The foundation layer: the symmetric write siblings of the read path, plus a non-destructive self-test that proves them against a live mount.
+
+- **`blk_write_on(tag, sector, buf)`** (`block.cyr`) — per-backend write dispatch mirroring `blk_read_on`. The ext2 write path routes mutations through this (via `ext2_backend`) so they land on the FS's actual backend, not the `blk_active` winner — the same decoupling the read path needs on archaemenid (agnos-fs may not be the override-policy winner).
+- **`ext2_blk_write` / `ext2_write_block(block_num, buf)`** — block-granular write, the mirror of `ext2_read_block` (LBA via `ext2_block_to_lba`, sector loop via `blk_write_on`).
+- **`ext2_write_superblock()`** — writes the in-memory superblock (`ext2_sb_buf`, 1024 B) back to LBA `first_lba+2..+3` directly (the SB lives at byte 1024 regardless of blocksize).
+- **`ext2_put_inode(inode_num, in_buf)`** — inode write-back as **read-modify-write at block granularity** (an inode is `inode_size` B but the table is block-packed, so a bare-slice write would clobber neighbours). Location math mirrors `ext2_get_inode` exactly.
+- **`ext2_store16_le` / `ext2_store32_le`** — endian byte stores (loaders' siblings); **`ext2_sb_free_blocks_count` / `_free_inodes_count`** read+store accessors (offsets +12/+16 — the read path never needed the free counts).
+- **`ext2_write_selftest()`** (compile-gated `EXT2_WRITE_SELFTEST`, driven from `main.cyr` after `ext2_init()`) — NON-DESTRUCTIVE: reads grp-0 BGDT accounting + superblock free totals + the block-bitmap free-bit count, then identity-writes a metadata block and inode 2 (read → write unchanged → re-read → byte-compare). New `scripts/ext2-write-smoke.sh` boots it against a write-friendly ext2 image (`-O ^metadata_csum,^64bit,^dir_index,^uninit_bg`) and gates on the identity checks + `e2fsck -fn` clean.
+
+**Verification**: production build **629,568 B** (+5,752 vs 1.32.9 — the write primitives, dead-code-eliminable until W2+ calls them). No regression: `scripts/test.sh` **4/4** + `scripts/ext2-smoke.sh` **5/5** (all backends reach `AGNOS shell v`, legacy + 64BIT BGDT). **W1 smoke PASS**: `grp0 free_blk` / `sb free_blk` / `bitmap free-bits` all = **16068**, byte-identical to host `debugfs -R stats` → free-count accessors + bitmap-read math validated; `ext2_write_block` + `ext2_put_inode` identity round-trips byte-clean; `e2fsck -fn` on the post-boot image **clean (exit 0)**. The block-device write primitives are themselves iron-validated (USB-MS Attempt 87). W1 is a QEMU gate — no iron burn (the W5 burn is the first WRITE iron exposure).
+
 ## [1.32.9] — 2026-05-25 (DHCP re-enablement — the 1.32.3 STATIC bypass is removed and a real DHCP exchange runs again on boot. The OFFER timeout that drove the bypass across the 1.32.x arc was the r8169 unicast-RX drop **fixed at 1.32.7** (RX ring 16→64), not a DHCP-layer bug; with unicast RX delivering on iron, `dhcp_init()` can complete DISCOVER → OFFER → REQUEST → ACK. STATIC (192.168.1.222) stays as the iron fallback so a DHCP miss still leaves a usable address. QEMU/SLIRP DHCP exercised; iron verification is the next burn, user-driven.)
 
 ### Changed — boot net-probe re-attempts DHCP (`main.cyr`)

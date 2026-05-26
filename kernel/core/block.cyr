@@ -170,6 +170,21 @@ fn blk_write(sector, buf) {
     return 0 - 1;
 }
 
+# Write mirror of blk_read_on — dispatch a single-sector write to a
+# specific backend (not blk_active). The ext2 WRITE arc (1.33.x) uses
+# this so mutations land on whichever backend the FS probed positive
+# (ext2_backend), exactly like reads route through blk_read_on. Same
+# registered-bit gate as the read side.
+fn blk_write_on(tag, sector, buf) {
+    if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
+    if (tag == BLK_VIRTIO)  { return vblk_blk_write(sector, buf); }
+    if (tag == BLK_NVME)    { return nvme_blk_write(sector, buf); }
+    if (tag == BLK_AHCI)    { return ahci_blk_write(sector, buf); }
+    if (tag == BLK_USB_MS)  { return msc_blk_write(sector, buf); }
+    if (tag == BLK_RAMDISK) { return ramdisk_blk_write(sector, buf); }
+    return 0 - 1;
+}
+
 fn blk_read_sectors(start, count, buf) {
     if (blk_active == BLK_VIRTIO)  { return vblk_blk_read_sectors(start, count, buf); }
     if (blk_active == BLK_NVME)    { return nvme_blk_read_sectors(start, count, buf); }

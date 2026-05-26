@@ -434,6 +434,15 @@ kprintln("VFS initialized", 15);
 # ext2-ext4-extents-prior-art.md for the multi-source convergent port.
 ext2_init();
 
+# WRITE arc 1.33.x — W1 write-path self-test (compile-gated, opt-in via
+# EXT2_WRITE_SELFTEST=1 ./scripts/build.sh). Non-destructive: proves the
+# write primitives + inode RMW + bitmap/free-count reads against a live
+# ext2 mount without changing FS content (e2fsck stays clean). Off in
+# production builds — same gate discipline as AHCI_RW_DEMO / MSC_RW_DEMO.
+#ifdef EXT2_WRITE_SELFTEST
+ext2_write_selftest();
+#endif
+
 # === CMOS kernel checkpoint 12 (VFS up) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0C; 0xE6; 0x71; }
 
