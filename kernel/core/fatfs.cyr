@@ -672,18 +672,43 @@ fn fatfs_create(name, namelen) {
 fn fatfs_write_file(name, namelen, src, len) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (fatfs_type == 12) { return 0 - 1; }
-    var exist[16];
-    if (fatfs_find_root(name, namelen, &exist) == 1) { return 0 - 1; }
     var name11[16];
     fatfs_build_83(name, namelen, &name11);
-    if (fatfs_find_free_root_slot() != 0) { return 0 - 1; }
+
+    # Target dirent slot: reuse the existing entry (overwrite) or a free
+    # one (create). 8.3-name match only — overwriting an LFN file by its
+    # long name is a follow-on (find_root is 8.3-only).
+    var res[16];
+    var target_sec = 0;
+    var target_slot = 0;
+    if (fatfs_find_root(name, namelen, &res) == 1) {
+        target_sec = fatfs_slot_sec;
+        target_slot = fatfs_slot_idx;
+        var old_first = load64(&res);
+        # Clear the dirent's cluster+size FIRST (stop referencing the old
+        # chain), THEN free it — crash leaves leaked clusters, never a live
+        # dirent → freed chain. New content is written below.
+        if (fat_blk_read(target_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        var oep = &fatfs_dir_buf + target_slot * 32;
+        store8(oep + 20, 0); store8(oep + 21, 0); store8(oep + 26, 0); store8(oep + 27, 0);
+        store8(oep + 28, 0); store8(oep + 29, 0); store8(oep + 30, 0); store8(oep + 31, 0);
+        if (fat_blk_write(target_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        if (old_first >= 2) { if (fat_free_chain(old_first) != 0) { return 0 - 1; } }
+    } else {
+        if (fatfs_find_free_root_slot() != 0) { return 0 - 1; }
+        target_sec = fatfs_slot_sec;
+        target_slot = fatfs_slot_idx;
+    }
 
     var first = 0;
     var prev = 0;
     var pos = 0;
     while (pos < len) {
         var c = fat_alloc_cluster();
-        if (c == 0) { return 0 - 1; }                  # ENOSPC (rollback = follow-on)
+        if (c == 0) {                                  # ENOSPC: roll back the partial chain
+            if (first >= 2) { fat_free_chain(first); }
+            return 0 - 1;
+        }
         if (first == 0) { first = c; }
         else { if (fat_set_entry(prev, c) != 0) { return 0 - 1; } }   # link prev → c
         prev = c;
@@ -707,7 +732,7 @@ fn fatfs_write_file(name, namelen, src, len) {
     # Last allocated cluster is already EOC (fat_alloc set it; we only
     # overwrote PRIOR clusters' EOC when linking the next). Publish the
     # dirent (first cluster + true size), then FSInfo.
-    if (fatfs_emit_dirent(fatfs_slot_sec, fatfs_slot_idx, &name11, first, len) != 0) { return 0 - 1; }
+    if (fatfs_emit_dirent(target_sec, target_slot, &name11, first, len) != 0) { return 0 - 1; }
     fat_fsinfo_mark_unknown();
     return 0;
 }
@@ -780,6 +805,55 @@ fn fatfs_truncate_zero(name, namelen) {
     if (first >= 2) {
         if (fat_free_chain(first) != 0) { return 0 - 1; }
     }
+    fat_fsinfo_mark_unknown();
+    return 0;
+}
+
+# Truncate an 8.3 file to `newlen` bytes (shrink only; newlen > size is
+# refused — grow-truncate is a follow-on). Keeps the first ceil(newlen/
+# cluster) clusters, caps that cluster EOC, frees the tail. Ordered: write
+# the smaller size + cap the new last cluster EOC, THEN free the tail — the
+# freed tail is unreferenced by the truncated chain, so a crash leaks it
+# (fsck-reclaimable), never a live dirent → free chain. FAT16/32 only.
+fn fatfs_truncate(name, namelen, newlen) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    if (fatfs_type == 12) { return 0 - 1; }
+    var res[16];
+    if (fatfs_find_root(name, namelen, &res) != 1) { return 0 - 1; }
+    var first = load64(&res);
+    var oldsize = load64(&res + 8);
+    var sec = fatfs_slot_sec;
+    var slot = fatfs_slot_idx;
+    if (newlen > oldsize) { return 0 - 1; }            # grow not supported (follow-on)
+    if (newlen == oldsize) { return 0; }               # no-op
+
+    if (newlen == 0) { return fatfs_truncate_zero(name, namelen); }
+
+    var bpc = fatfs_sectors_per_cluster * 512;
+    var keep = newlen / bpc;
+    if (newlen % bpc != 0) { keep = keep + 1; }        # clusters to keep (ceil)
+
+    # Walk to the keep-th cluster (the new last); capture the tail first.
+    var c = first;
+    var idx = 1;
+    while (idx < keep) {
+        var nxt = fat_next_cluster(c);
+        if (nxt == 0) { return 0 - 1; }                # chain shorter than size says — corrupt
+        c = nxt;
+        idx = idx + 1;
+    }
+    var tail = fat_next_cluster(c);
+
+    # 1. write the new (smaller) size into the dirent.
+    if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    var ep = &fatfs_dir_buf + slot * 32;
+    store8(ep + 28, newlen & 0xFF); store8(ep + 29, (newlen >> 8) & 0xFF);
+    store8(ep + 30, (newlen >> 16) & 0xFF); store8(ep + 31, (newlen >> 24) & 0xFF);
+    if (fat_blk_write(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    # 2. cap the new last cluster EOC.
+    if (fat_set_entry(c, fat_eoc()) != 0) { return 0 - 1; }
+    # 3. free the now-orphaned tail.
+    if (tail >= 2) { if (fat_free_chain(tail) != 0) { return 0 - 1; } }
     fat_fsinfo_mark_unknown();
     return 0;
 }

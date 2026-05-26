@@ -525,6 +525,26 @@ if (fatfs_active == 1) {
     kprint("fatw: lfn create rc=", 20);
     kprint_num(lf_rc);
     kprintln("", 0);
+    # 3e — overwrite-existing + arbitrary-length truncate. fatfs_file_buf
+    # still holds the i&0xFF pattern. WOVER: write 1000 B then overwrite
+    # with 2000 B (must free the old chain + replace). TRUNC2: write 3000 B
+    # then truncate to 1000 B (must free the tail clusters).
+    var ov_name = "WOVER.BIN";
+    var ov_rc1 = fatfs_write_file(ov_name, 9, &fatfs_file_buf, 1000);
+    var ov_rc2 = fatfs_write_file(ov_name, 9, &fatfs_file_buf, 2000);
+    kprint("fatw: overwrite WOVER.BIN rc1=", 30);
+    kprint_num(ov_rc1);
+    kprint(" rc2=", 5);
+    kprint_num(ov_rc2);
+    kprintln("", 0);
+    var t2_name = "TRUNC2.BIN";
+    var t2_wrc = fatfs_write_file(t2_name, 10, &fatfs_file_buf, 3000);
+    var t2_rc = fatfs_truncate(t2_name, 10, 1000);
+    kprint("fatw: trunc2 TRUNC2.BIN wrc=", 28);
+    kprint_num(t2_wrc);
+    kprint(" trc=", 5);
+    kprint_num(t2_rc);
+    kprintln("", 0);
 }
 #endif
 

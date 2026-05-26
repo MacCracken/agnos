@@ -168,9 +168,36 @@ else
     echo "  FAIL: long name not reconstructed (LFN chain/checksum wrong)"; rc=1
 fi
 
+# 9. overwrite-existing (3e): rc + WOVER.BIN is the 2000 B second write
+#    (not the 1000 B first, not 3000 B appended) — old chain freed/replaced
+if strings "$LOG" | grep -q "fatw: overwrite WOVER.BIN rc1=0 rc2=0"; then
+    echo "  PASS: overwrite rc1=0 rc2=0"
+else
+    echo "  FAIL: overwrite (no 'fatw: overwrite WOVER.BIN rc1=0 rc2=0' in log)"; rc=1
+fi
+mtype -i "$WORK/esp.img" ::WOVER.BIN > "$WORK/wover.bin" 2>/dev/null
+if head -c 2000 "$WORK/pattern.bin" | cmp -s - "$WORK/wover.bin"; then
+    echo "  PASS: WOVER.BIN = 2000 B second write byte-exact (overwrite replaced content)"
+else
+    echo "  FAIL: WOVER.BIN mismatch ($(wc -c < "$WORK/wover.bin" 2>/dev/null) B; want 2000)"; rc=1
+fi
+
+# 10. arbitrary truncate (3e): TRUNC2.BIN written 3000 B, truncated to 1000 B
+if strings "$LOG" | grep -q "fatw: trunc2 TRUNC2.BIN wrc=0 trc=0"; then
+    echo "  PASS: arbitrary truncate wrc=0 trc=0"
+else
+    echo "  FAIL: truncate (no 'fatw: trunc2 TRUNC2.BIN wrc=0 trc=0' in log)"; rc=1
+fi
+mtype -i "$WORK/esp.img" ::TRUNC2.BIN > "$WORK/trunc2.bin" 2>/dev/null
+if head -c 1000 "$WORK/pattern.bin" | cmp -s - "$WORK/trunc2.bin"; then
+    echo "  PASS: TRUNC2.BIN = first 1000 B byte-exact (tail freed, size updated)"
+else
+    echo "  FAIL: TRUNC2.BIN mismatch ($(wc -c < "$WORK/trunc2.bin" 2>/dev/null) B; want 1000)"; rc=1
+fi
+
 echo ""
 echo "=========================================="
-if [ "$rc" = "0" ]; then echo "FAT write smoke (3a create + 3b content + 3c del/trunc + 3d LFN): PASS"; else echo "FAT write smoke (3a create + 3b content + 3c del/trunc + 3d LFN): FAIL"; fi
+if [ "$rc" = "0" ]; then echo "FAT write smoke (3a-3e: create/content/del/trunc/LFN/overwrite/arb-trunc): PASS"; else echo "FAT write smoke (3a-3e): FAIL"; fi
 echo "Logs: $LOG"
 echo "=========================================="
 exit $rc
