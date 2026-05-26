@@ -5,6 +5,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.32.8] — 2026-05-25 (networking closeout cleanup — the 1.32.x r8169 unicast-RX arc is CONNECTED, so the per-burn diagnostics it accreted come out of the production boot: 1.1.1.1 outbound-TCP smoke + r8169 silicon tally readback gated behind `NET_VERBOSE`; the `.121` on-LAN-peer discriminator removed entirely; shell net commands `net`/`send`/`recv`/`tcp` de-hardcoded off QEMU SLIRP onto `nic_ready()` + the boot-configured gateway so they work on iron. DHCP re-enablement deferred to its own cycle **1.32.9**.)
+
+### Changed — boot net diagnostics gated behind `NET_VERBOSE`
+
+The 1.32.x unicast-RX arc closed at 1.32.7 (ring 16→64; both on-LAN and off-LAN TCP handshakes complete on iron). Its two instruments stay available for future debugging but are compiled out of the production boot, so the framebuffer now ends cleanly at `net: L2 OK -- gateway MAC cached`:
+
+- **`1.1.1.1:80` outbound-TCP smoke** (`main.cyr` boot net-probe) — proves r8169 TX-to-gateway-MAC + off-LAN routing + unicast RX of the reply + the 3-way handshake. Now under `#ifdef NET_VERBOSE`.
+- **r8169 silicon accept-counter readback** (`r8169_print_stats`, the `r8169: tx_ok=… rx_uc=… missed=…` line) — FreeBSD `re_sysctl_stats` / RTL8168 §6.8.4 tally DMA. Now under the same `#ifdef NET_VERBOSE`.
+
+New `scripts/build.sh` gate `NET_VERBOSE=1` (same env-var prepend mechanism as `XHCI_VERBOSE` / `TCP_LISTEN_SMOKE`), off by default. Rebuild with `NET_VERBOSE=1 sh scripts/build.sh` to re-confirm end-to-end connectivity on iron.
+
+### Changed — shell net commands (`net`/`send`/`recv`/`tcp`) de-hardcoded for iron
+
+These four commands gated on `vnet_active` (the virtio-only flag) and hardcoded QEMU SLIRP addresses (`10.0.2.15` / `10.0.2.2`), so on iron they printed `no network` despite the r8169 being up + connected, and re-`net_init`'d the working stack to bogus SLIRP values. Same wrong-flag class as the 1.32.0 DHCP gate fix (`main.cyr:671`). Now:
+
+- **Gate** — all four use `if (vnet_active == 0 && nic_ready() == 0)` (the `nic_ready()` abstraction; works for virtio *and* r8169), matching the boot net-probe gate.
+- **`net`** — prints the live configured `net_ip` (dotted quad) + the active NIC's MAC via `nic_mac()` instead of the hardcoded `IP: 10.0.2.15` / `vnet_mac`.
+- **`send` / `recv`** — dropped the SLIRP `net_init` clobber (the boot net-probe already configured the stack); `send` targets `net_gateway`.
+- **`tcp`** — dropped the SLIRP `net_init`; connects to the configured `net_gateway:80` and prints the resolved gateway address.
+
+No `net_init` re-init in any of them — the boot net-probe owns the stack config. Iron behavior to be verified on the next burn (user-driven).
+
+### Removed — `.121` on-LAN-peer discriminator scaffolding (1.32.7 bite-2)
+
+The on-LAN unicast-TCP discriminator was the one-off instrument that proved the unicast-RX drop was general (not gateway-specific) at an owned, logged endpoint. It required the `mbp-lan-probe` harness broadcasting during boot and is not reproducible without it, so it is removed entirely rather than gated:
+
+- `net.cyr`: `net_peer_ip` / `net_peer_mac` / `net_peer_mac_valid` slots, the `route_next_hop_mac` on-LAN-peer branch, and the `net_handle_arp` broadcast-snoop capture block (the `requester_ip` computation stays — it builds the ARP reply target fields).
+- `main.cyr`: the ~2 s peer-wait, the `tcp: connect on-LAN …` / `net: LAN-TCP OK|FAIL` block, and the `net: no on-LAN peer` fallback line.
+
+### Build
+
+Production **623,264 B** (−1,224 B vs 1.32.7's 624,488 B — net of removed `.121` scaffolding + gated-out boot diagnostics, partly offset by the de-hardcoded shell `net`/`tcp` address-formatting). `NET_VERBOSE=1` build **623,648 B** (+384 B, the gated boot-probe path compiles). `scripts/test.sh` **4/4** + `scripts/ext2-smoke.sh` **5/5** (all backends reach shell — no boot regression). multiboot2 ELF64 OK, entry `0x1000a8`. cyrius 6.0.1 + gnoboot 0.4.2 unchanged. `build/agnos` reflects HEAD (production, no `NET_VERBOSE`). The **boot-to-shell path is behaviorally unchanged** vs the iron-validated 1.32.7 (only diagnostics removed/gated — no change to the NIC/RX/TX/filter path), so no boot-regression risk. The **shell `net`/`send`/`recv`/`tcp` command changes are interactive-only** (not on the boot path) and are to be verified on the next iron burn (user-driven).
+
 ## [1.32.7] — 2026-05-25 (r8169 RX — bite-1/2 BURNED→FALSIFIED for the filter; **bite-3 silicon accept-counter readback RESOLVES the filter-vs-delivery split: `rx_uc>0` proves the MAC ACCEPTS unicast → the entire L2 accept/filter arc is CLOSED; the blocker is RX ring/poll DELIVERY**; bite-4 whole-ring drain BURNED→FALSIFIED (`missed` 158→176 UP — a 64-frame drain can't exceed the 16 descriptors that exist); 🎯 **bite-5 deepen RX ring 16→64 BURNED → CONNECTED: `missed` collapsed 176→0, both `net: LAN-TCP OK` (on-LAN) and `net: L3+TCP OK` (off-LAN via gateway) on iron — the 1.32.x r8169 unicast-RX arc is CLOSED, MVP on-iron networking blocker cleared**)
 
 ### Context

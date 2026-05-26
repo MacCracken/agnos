@@ -86,6 +86,12 @@ else
     #                     known-scratch drives to validate the WRITE
     #                     DMA EXT path; ahci_read_demo (LBA 0 readback)
     #                     runs unconditionally either way.
+    #   NET_VERBOSE=1   — boot net diagnostics: the 1.1.1.1:80 outbound-TCP
+    #                     smoke + the r8169 silicon tally readback
+    #                     (rx_uc/rx_bc/rx_mc/missed). Off by default — the
+    #                     1.32.x unicast-RX arc is closed, so production
+    #                     boots end cleanly at "net: L2 OK". Enable to
+    #                     re-confirm end-to-end connectivity on iron.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -95,6 +101,7 @@ else
         [ -n "$MSC_RW_DEMO" ]    && echo '#define MSC_RW_DEMO'
         [ -n "$RAMDISK_ENABLE" ] && echo '#define RAMDISK_ENABLE'
         [ -n "$TCP_LISTEN_SMOKE" ] && echo '#define TCP_LISTEN_SMOKE'
+        [ -n "$NET_VERBOSE" ]    && echo '#define NET_VERBOSE'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

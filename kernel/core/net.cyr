@@ -22,18 +22,6 @@ var net_udp_buf_len = 0;
 var net_gateway_mac[8];
 var net_gateway_mac_valid = 0;
 
-# On-LAN diagnostic peer slot (1.32.7 bite-2). Populated by net_handle_arp
-# when a non-gateway host ARP-probes US (who-has net_ip) -- captured from the
-# BROADCAST who-has's sender fields (RFC 826), so learned with ZERO unicast RX,
-# exactly like the gateway. The boot probe runs an on-LAN unicast TCP test
-# against this peer (the mbp-lan-probe harness on .121) BEFORE the off-LAN
-# 1.1.1.1 test: the peer's SYN+ACK is the first unicast frame we must RX, on
-# the SAME L2 segment (no gateway, no NAT), so it splits raw unicast-RX from
-# gateway/off-LAN routing. Independent of arp_cache_* / net_gateway_mac.
-var net_peer_ip = 0;
-var net_peer_mac[8];
-var net_peer_mac_valid = 0;
-
 fn net_init(ip, gw, mask) {
     net_ip = ip;
     net_gateway = gw;
@@ -152,14 +140,6 @@ fn route_next_hop_mac(dst_ip, out_mac) {
             if (net_gateway_mac_valid == 1) {
                 if (dst_ip == net_gateway) {
                     memcpy(out_mac, &net_gateway_mac, 6);
-                    return 0;
-                }
-            }
-            # On-LAN diagnostic peer (1.32.7 bite-2): the mbp-lan-probe host,
-            # learned via broadcast snoop in net_handle_arp.
-            if (net_peer_mac_valid == 1) {
-                if (dst_ip == net_peer_ip) {
-                    memcpy(out_mac, &net_peer_mac, 6);
                     return 0;
                 }
             }
@@ -605,17 +585,6 @@ fn net_handle_arp(pkt, len) {
         var requester_mac[8];
         var requester_ip = (load8(pkt + 28) << 24) | (load8(pkt + 29) << 16) | (load8(pkt + 30) << 8) | load8(pkt + 31);
         net_copy_buf(&requester_mac, pkt + 22, 6);
-        # On-LAN diagnostic peer capture (1.32.7 bite-2): a host actively
-        # ARPing for US is a reachable on-LAN endpoint. Record it (skip the
-        # gateway) so the boot probe can run an on-LAN unicast TCP test whose
-        # SYN+ACK isolates raw unicast RX from gateway/off-LAN routing. This
-        # who-has arrived as BROADCAST, so the peer is learned with ZERO
-        # unicast RX -- the same RFC-826 sender-snoop that learns the gateway.
-        if (requester_ip != net_gateway) {
-            net_peer_ip = requester_ip;
-            net_copy_buf(&net_peer_mac, pkt + 22, 6);
-            net_peer_mac_valid = 1;
-        }
         var kmac[8];
         nic_mac(&kmac);   # FIX #1
         var p = &net_pkt;

@@ -423,28 +423,38 @@ fn sh_exec(buf, len) {
         return 0;
     }
     if (sh_streq(buf, clen, "net", 3) == 1) {
-        if (vnet_active == 0) { kprintln("no network", 10); return 0; }
-        kprint("IP: 10.0.2.15  MAC: ", 20);
+        if (vnet_active == 0 && nic_ready() == 0) { kprintln("no network", 10); return 0; }
+        # Report the live configured address + the active NIC's MAC (virtio
+        # OR r8169) instead of the old hardcoded SLIRP 10.0.2.15 / vnet_mac.
+        kprint("IP: ", 4);
+        kprint_num((net_ip >> 24) & 0xFF); kprint(".", 1);
+        kprint_num((net_ip >> 16) & 0xFF); kprint(".", 1);
+        kprint_num((net_ip >> 8) & 0xFF); kprint(".", 1);
+        kprint_num(net_ip & 0xFF);
+        kprint("  MAC: ", 7);
+        var nmac[8];
+        nic_mac(&nmac);
         for (var i = 0; i < 6; i = i + 1) {
-            kprint_num(load8(&vnet_mac + i));
+            kprint_num(load8(&nmac + i));
             if (i < 5) { kputc(58); }
         }
         kprintln("", 0);
         return 0;
     }
     if (sh_streq(buf, clen, "send", 4) == 1) {
-        if (vnet_active == 0) { kprintln("no network", 10); return 0; }
+        if (vnet_active == 0 && nic_ready() == 0) { kprintln("no network", 10); return 0; }
         if (arglen < 1) { kprintln("usage: send <msg>", 17); return 0; }
-        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
-        var r = udp_send(ip4(10,0,2,2), 1234, 5555, arg, arglen);
+        # Use the boot-configured stack (net_init ran in the boot net-probe);
+        # send to the configured gateway, not the old SLIRP 10.0.2.2.
+        var r = udp_send(net_gateway, 1234, 5555, arg, arglen);
         kprint("sent ", 5);
         kprint_num(r);
         kprintln(" bytes", 6);
         return 0;
     }
     if (sh_streq(buf, clen, "recv", 4) == 1) {
-        if (vnet_active == 0) { kprintln("no network", 10); return 0; }
-        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
+        if (vnet_active == 0 && nic_ready() == 0) { kprintln("no network", 10); return 0; }
+        # Boot net-probe already configured the stack; no SLIRP re-init.
         var rbuf[64];
         var rlen = net_recv_udp(&rbuf, 512);
         if (rlen == 0) {
@@ -488,10 +498,15 @@ fn sh_exec(buf, len) {
         return 0;
     }
     if (sh_streq(buf, clen, "tcp", 3) == 1) {
-        if (vnet_active == 0) { kprintln("no network", 10); return 0; }
-        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
-        kprintln("TCP: connecting to 10.0.2.2:80...", 32);
-        var conn = tcp_connect(ip4(10,0,2,2), 80, 49152);
+        if (vnet_active == 0 && nic_ready() == 0) { kprintln("no network", 10); return 0; }
+        # Connect to the configured gateway:80 (boot probe set net_gateway);
+        # no SLIRP re-init. Routers typically serve :80.
+        kprint("TCP: connecting to ", 19);
+        kprint_num((net_gateway >> 24) & 0xFF); kprint(".", 1);
+        kprint_num((net_gateway >> 16) & 0xFF); kprint(".", 1);
+        kprint_num((net_gateway >> 8) & 0xFF); kprint(".", 1);
+        kprint_num(net_gateway & 0xFF); kprintln(":80...", 6);
+        var conn = tcp_connect(net_gateway, 80, 49152);
         if (conn < 0) {
             kprintln("TCP: connect failed (RST or timeout)", 36);
         } else {

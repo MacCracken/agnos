@@ -726,45 +726,21 @@ if (vnet_active != 0 || nic_ready() != 0) {
         kprintln("", 0);
         kprintln("net: L2 OK -- gateway MAC cached", 32);
 
-        # --- Internal (on-LAN) unicast TCP test FIRST (1.32.7 bite-2) ---
-        # The mbp-lan-probe harness broadcasts who-has 192.168.1.222 (us);
-        # net_handle_arp captured its IP+MAC into net_peer_* with ZERO unicast
-        # RX (broadcast sender-snoop). Connect to peer:80 over the SAME L2
-        # segment -- no gateway, no NAT. Its SYN+ACK is the FIRST unicast frame
-        # we must RX. If THIS completes, raw unicast RX works and the 1.1.1.1
-        # failure is gateway/off-LAN specific; if it ALSO fails, unicast-RX drop
-        # is confirmed at an endpoint we own and log. Give the peer ~2s to ARP
-        # us if its who-has didn't arrive during the gateway-probe window above.
-        if (net_peer_mac_valid == 0) {
-            var peer_wait = timer_ticks;
-            while ((timer_ticks - peer_wait) < 200) {
-                net_poll();
-                if (net_peer_mac_valid == 1) { break; }
-                arch_wait();
-            }
-        }
-        if (net_peer_mac_valid == 1) {
-            kprint("tcp: connect on-LAN ", 20);
-            kprint_num((net_peer_ip >> 24) & 0xFF); kprint(".", 1);
-            kprint_num((net_peer_ip >> 16) & 0xFF); kprint(".", 1);
-            kprint_num((net_peer_ip >> 8) & 0xFF); kprint(".", 1);
-            kprint_num(net_peer_ip & 0xFF); kprint(":80", 3);
-            kprintln("", 0);
-            var lconn = tcp_connect(net_peer_ip, 80, 49153);
-            if (lconn >= 0) {
-                kprintln("net: LAN-TCP OK -- on-LAN unicast handshake established", 55);
-                tcp_close(lconn);
-            } else {
-                kprintln("net: LAN-TCP FAIL -- on-LAN SYN sent but no SYN+ACK", 51);
-            }
-        } else {
-            kprintln("net: no on-LAN peer (run mbp-lan-probe during boot)", 51);
-        }
-
+        # --- Net diagnostics behind NET_VERBOSE (1.32.8 cleanup) ----------
+        # The 1.32.x r8169 unicast-RX arc is CLOSED (1.32.7: ring 16->64, both
+        # on-LAN and off-LAN handshakes complete on iron). Its two diagnostic
+        # instruments stay available for future debugging but are compiled out
+        # of the production boot so the FB ends cleanly at "net: L2 OK":
+        #   - the 1.1.1.1:80 outbound-TCP smoke (proves TX-to-gateway-MAC +
+        #     off-LAN routing + unicast RX of the reply + the 3-way handshake)
+        #   - the r8169 silicon tally readback (rx_uc/rx_bc/rx_mc + missed)
+        # The .121 on-LAN-peer discriminator (1.32.7 bite-2) was removed
+        # entirely with this cleanup -- it required the mbp-lan-probe harness
+        # running during boot and is not reproducible without it.
+        #ifdef NET_VERBOSE
         # Outbound TCP test: 1.1.1.1:80. SYN+ACK proves r8169 TX unicast
-        # to gateway-MAC, off-LAN routing, r8169 RX of unicast reply, and
-        # the TCP three-way handshake all at once. The "proof that the
-        # router connected" per user direction 2026-05-24.
+        # to gateway-MAC, off-LAN routing, r8169 RX of the unicast reply, and
+        # the TCP three-way handshake all at once.
         kprintln("tcp: connect 1.1.1.1:80", 23);
         var conn = tcp_connect(ip4(1,1,1,1), 80, 49152);
         if (conn >= 0) {
@@ -774,22 +750,14 @@ if (vnet_active != 0 || nic_ready() != 0) {
             kprintln("net: L3+TCP FAIL -- SYN sent but no SYN+ACK", 43);
         }
 
-        # --- r8169 hardware accept-counter readback (1.32.7 bite-3) ----
-        # Both unicast handshakes above have now run (on-LAN peer + 1.1.1.1).
-        # Read the chip's OWN silicon tally counters (FreeBSD re_sysctl_stats /
-        # RTL8168 datasheet 6.8.4) to settle the filter-vs-delivery question the
-        # inference-only burns could not: rx_uc = unicast frames the MAC accepted
-        # via physical-match, rx_bc/rx_mc = broadcast/multicast accepted.
-        #   rx_uc=0 with rx_bc/rx_mc>0 -> the physical-match filter rejects every
-        #     unicast frame (IDR/APM not engaging on this VER_46 despite the
-        #     post-CR.RE re-assert) -- NOT the ring.
-        #   rx_uc>0 -> the MAC accepts unicast; the drop is in our ring/poll
-        #     delivery (broadcast survives the same ring -- investigate why).
-        # Ground truth from silicon, not inference. r8169-only (guarded; QEMU
-        # uses virtio_net and has no RTL8168 to count).
+        # r8169 silicon accept-counter readback (FreeBSD re_sysctl_stats /
+        # RTL8168 datasheet 6.8.4): rx_uc/rx_bc/rx_mc split by frame class +
+        # missed (RxMissed FIFO overflow). r8169-only (QEMU uses virtio_net
+        # and has no RTL8168 to count).
         if (r8169_present == 1) {
             r8169_print_stats();
         }
+        #endif
     } else {
         # Gateway unicast reply never arrived -- but that is NOT "RX dead".
         # Report what RX did so the FB distinguishes a silent NIC from a

@@ -16,7 +16,7 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.32.7** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.32.8** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **6.0.1** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-25 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-23 (archaemenid NUC AMD — **MVP gate still green at Attempt 100 / 1.32.3**; storage trio + GPT + ext4 + shell byte-clean across all 1.32.3 burns; **DHCP feature gate carries forward** — chip-level RX filter unblocked at Attempt 100 [BSD/iPXE rewrite; `[0x5E]=0xff` broadcast admitted for first time across 1.32.x arc], OFFER-timeout downstream of `r8169_poll` is the next-cycle work) | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB hardening) + 80 (NVMe) + 81-91 (storage arc) + 92-100 (1.32.x networking arc) |
