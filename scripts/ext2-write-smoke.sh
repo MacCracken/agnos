@@ -62,7 +62,15 @@ PART_OFFSET=$(( 33 * 1048576 ))            # 33 MiB — ESP occupies 1..33 MiB
 PART_BYTES=$(( 67 * 1048576 ))             # 67 MiB ext2 partition
 PART_BLOCKS=$(( PART_BYTES / 4096 ))
 
-echo "Building write-friendly ext2 image (no metadata_csum/64bit/dir_index)..."
+# Feature profile is parameterized (1.33.1 metadata_csum + 64bit arc, audit
+# § 14.6): the default is the 1.33.0 write-friendly stripped set; override
+# EXT2_SMOKE_FEATURES to gate a bite against a checksummed/64bit image, e.g.
+#   bite 1: EXT2_SMOKE_FEATURES="^resize_inode,^dir_index,^metadata_csum,64bit,^uninit_bg"
+#   bite 7: EXT2_SMOKE_FEATURES="^resize_inode,^dir_index,metadata_csum,64bit,^uninit_bg"
+# The self-test-line + e2fsck gates below are feature-agnostic, so the same
+# script proves every bite — only the image profile changes.
+EXT2_SMOKE_FEATURES="${EXT2_SMOKE_FEATURES:-^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg}"
+echo "Building ext2 image (mkfs -O $EXT2_SMOKE_FEATURES)..."
 SEED="$WORK/seed"; mkdir -p "$SEED"
 echo "agnos write arc W1 seed" > "$SEED/hello.txt"
 mkdir -p "$SEED/etc"; echo "archaemenid" > "$SEED/etc/hostname"
@@ -77,7 +85,7 @@ mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 mkfs.ext2 -F -q -L AGNOS-WTEST -b 4096 -m 0 \
-    -O ^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg \
+    -O "$EXT2_SMOKE_FEATURES" \
     -d "$SEED" -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
 
 # --- pristine baseline (debugfs stats on the partition slice) ---
@@ -184,10 +192,10 @@ fi
 # 100 @ 8192); /hello.txt truncated to 0.
 echo ""
 echo "  --- host debugfs W3 verification ---"
-ehsize=$(debugfs -R "stat /etc/hostname" "$WORK/part-post.img" 2>/dev/null | grep -oE "Size: [0-9]+" | head -1 | grep -oE "[0-9]+")
-[ "$ehsize" = "8292" ] && echo "  PASS: /etc/hostname size=8292 on disk (write_at + sparse alloc)" || { echo "  FAIL: /etc/hostname size=${ehsize:-?} (want 8292)"; rc=1; }
-hhsize=$(debugfs -R "stat /hello.txt" "$WORK/part-post.img" 2>/dev/null | grep -oE "Size: [0-9]+" | head -1 | grep -oE "[0-9]+")
-[ "$hhsize" = "0" ] && echo "  PASS: /hello.txt size=0 on disk (truncate)" || { echo "  FAIL: /hello.txt size=${hhsize:-?} (want 0)"; rc=1; }
+ehsize=$(debugfs -R "stat /w3b.txt" "$WORK/part-post.img" 2>/dev/null | grep -oE "Size: [0-9]+" | head -1 | grep -oE "[0-9]+")
+[ "$ehsize" = "8292" ] && echo "  PASS: /w3b.txt size=8292 on disk (write_at + sparse alloc)" || { echo "  FAIL: /w3b.txt size=${ehsize:-?} (want 8292)"; rc=1; }
+hhsize=$(debugfs -R "stat /w3a.txt" "$WORK/part-post.img" 2>/dev/null | grep -oE "Size: [0-9]+" | head -1 | grep -oE "[0-9]+")
+[ "$hhsize" = "0" ] && echo "  PASS: /w3a.txt size=0 on disk (truncate)" || { echo "  FAIL: /w3a.txt size=${hhsize:-?} (want 0)"; rc=1; }
 
 # W4 host verification: /w4keep.txt persisted with content (create+write+
 # dirent-insert reached disk); /w4tmp.txt absent (unlink reached disk).

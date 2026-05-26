@@ -314,22 +314,25 @@ fn ext2_init() {
         return 0 - 1;
     }
 
-    # WRITE arc (1.33.x) — write-safety gate (prior-art doc § 10). Reads
+    # WRITE arc — write-safety gate (prior-art doc §§ 10, 14). Reads
     # tolerate ro_compat freely (an RO mount ignores it); WRITE must HONOR
     # it or refuse. We refuse write (mount stays fully readable, just
-    # immutable) on the bits that genuinely break a naive writer:
+    # immutable) only on the bits we don't yet maintain:
     #   ro_compat GDT_CSUM/uninit_bg (0x10), BIGALLOC (0x200),
     #             METADATA_CSUM (0x400 — every metadata block carries a
-    #             CRC32c; writing without updating it = e2fsck rejects)
-    #   incompat  64BIT (0x80 — BGDT count _hi halves; deferred sub-cycle)
-    # `mkfs.ext4` defaults set metadata_csum + 64bit, so the real agnos-fs
-    # partition refuses write until those sub-cycles land; the write smoke
-    # targets a `-O ^metadata_csum,^64bit,^uninit_bg` image (write_ok=1).
+    #             CRC32c; writing without updating it = e2fsck rejects).
+    #             metadata_csum support lands bite-by-bite (§ 14.6); until
+    #             that arc's final bite flips it, a checksummed FS is RO.
+    # 64BIT (incompat 0x80) is NO LONGER a write blocker (1.33.1 bite 1,
+    # § 14.4): on a <16 TB FS every bg_*_hi half is 0, and the existing
+    # lo-field stores preserve them via the whole-block RMW; ext2_desc_size
+    # already gives the 64-byte BGDT stride. The only 64bit-coupled write
+    # cost is bg_checksum, which is a metadata_csum concern (above), not a
+    # 64bit one — so a `64bit,^metadata_csum` FS is fully writable here.
     var ro_compat = ext2_sb_feature_ro_compat(&ext2_sb_buf);
     var ro_danger = 0x0010 | 0x0200 | 0x0400;
     ext2_write_ok = 1;
     if ((ro_compat & ro_danger) != 0) { ext2_write_ok = 0; }
-    if ((incompat & 0x80) != 0)       { ext2_write_ok = 0; }
 
     # Decode geometry.
     var log_bs               = ext2_sb_log_block_size(&ext2_sb_buf);
@@ -656,8 +659,10 @@ fn ext2_read_bgdt()  { return ext2_read_block(ext2_first_data_block + 1, &ext2_b
 fn ext2_write_bgdt() { return ext2_write_block(ext2_first_data_block + 1, &ext2_bgdt_buf); }
 
 # Group-descriptor field access within the loaded ext2_bgdt_buf. Counts
-# are the u16 lo halves (the _hi halves only exist on 64BIT FSes, which
-# ext2_write_ok refuses, so lo is the whole value here).
+# are the u16 lo halves; on 64BIT FSes (desc_size==64) the _hi halves sit
+# at 0x2C/0x2E/0x30 and are 0 on any <16 TB FS — the lo store touches only
+# 2 bytes, so the whole-block RMW preserves the zeroed _hi, leaving lo the
+# whole value (1.33.1 bite 1, audit § 14.4).
 fn ext2_grp_off(group)              { return &ext2_bgdt_buf + group * ext2_desc_size; }
 fn ext2_grp_block_bitmap(group)     { return ext2_load32_le(ext2_grp_off(group), 0); }
 fn ext2_grp_inode_bitmap(group)     { return ext2_load32_le(ext2_grp_off(group), 4); }
@@ -1683,6 +1688,16 @@ var ext2_bmap_was_new     = 0;
 fn ext2_bmap_alloc(inode_buf, lblk) {
     ext2_bmap_was_new = 0;
     if (ext2_write_ok == 0) { return 0; }
+    # Extent-mapped inodes (i_flags & EXTENTS_FL 0x80000): i_block[] holds
+    # an ext4 extent header, NOT direct/indirect pointers — walking it as
+    # pointers corrupts the tree. Extent *allocation* is a deferred cycle
+    # (audit § 11); refuse here so the writer never authors into an extent
+    # inode. New AGNOS files are always indirect (ext2_create zeroes
+    # i_flags), so this only fires on Linux-created (mkfs/cp) extent files
+    # + dirs — for which inserting into an EXISTING block still works (that
+    # path reads via the extent walker + writes the block back directly;
+    # only block *append* lands here). 1.33.1 bite 1.
+    if ((ext2_inode_flags(inode_buf) & 0x80000) != 0) { return 0; }
     var ptrs = ext2_blocksize / 4;
 
     # --- direct (0..11) ---
@@ -1738,6 +1753,10 @@ fn ext2_write_at(inode_num, offset, src, len) {
     if (len == 0)           { return 0; }
     if (ext2_get_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
     if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x8000) { return 0 - 1; }
+    if ((ext2_inode_flags(&ext2_inode_buf) & 0x80000) != 0) {
+        kprintln("ext2: write to extent inode unsupported (deferred)", 50);
+        return 0 - 1;
+    }
 
     ext2_bmap_alloc_count = 0;
     var written = 0;
@@ -1805,6 +1824,10 @@ fn ext2_truncate_zero(inode_num) {
     if (ext2_active == 0)   { return 0 - 1; }
     if (ext2_write_ok == 0) { return 0 - 1; }
     if (ext2_get_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+    if ((ext2_inode_flags(&ext2_inode_buf) & 0x80000) != 0) {
+        kprintln("ext2: truncate of extent inode unsupported (deferred)", 53);
+        return 0 - 1;
+    }
 
     var ptrs = ext2_blocksize / 4;
     var freed = 0;
@@ -1972,9 +1995,15 @@ fn ext2_write_selftest() {
     }
 
     # === W3: file-data write (ext2_write_at) + sparse alloc + truncate ===
-    # W3a: overwrite /hello.txt @0 with a 200-byte pattern; read back, compare.
-    var hino = ext2_path_lookup("/hello.txt", 10);
-    if (hino <= 0) { kprintln("ext2w: /hello.txt lookup FAIL", 29); return 0; }
+    # W3 targets files the self-test CREATES (always indirect-mapped — see
+    # ext2_create, which zeroes i_flags), NOT the mkfs `-d` seeds: on a
+    # 64bit/ext4 image the seeds are extent-mapped (i_flags 0x80000) and
+    # writing them is correctly refused (1.33.1 bite-1 guard, audit § 11).
+    # Self-created files exercise the real write+alloc path on EVERY image
+    # profile (stripped / 64bit / metadata_csum).
+    var hino = ext2_create(2, "w3a.txt", 7);
+    if (hino <= 0) { kprintln("ext2w: /w3a.txt create FAIL", 27); return 0; }
+    # W3a: write a 200-byte pattern @0; read back, compare.
     var pi = 0;
     while (pi < 256) { store8(&ext2_extent_buf + pi, (pi * 7 + 3) & 0xFF); pi = pi + 1; }
     var wa = ext2_write_at(hino, 0, &ext2_extent_buf, 200);
@@ -1990,17 +2019,18 @@ fn ext2_write_selftest() {
     if (w3a == 1) { kprintln("ext2w: W3 write/read 200 OK", 27); }
     else          { kprintln("ext2w: W3 write/read 200 MISMATCH", 33); }
 
-    # W3b: sparse write — 100 bytes at offset 8192 of /etc/hostname forces a
-    # new direct block (block 1 stays a hole); assert i_blocks grew by 8.
-    var eino = ext2_path_lookup("/etc/hostname", 13);
-    if (eino <= 0) { kprintln("ext2w: /etc/hostname lookup FAIL", 32); return 0; }
+    # W3b: sparse write — 100 bytes at offset 8192 of a fresh /w3b.txt forces
+    # a new block at logical 2 (blocks 0,1 stay holes); assert i_blocks grew
+    # by 8 (one 4 KB block = 8 × 512-B sectors).
+    var eino = ext2_create(2, "w3b.txt", 7);
+    if (eino <= 0) { kprintln("ext2w: /w3b.txt create FAIL", 27); return 0; }
     var qi = 0;
     while (qi < 100) { store8(&ext2_extent_buf + qi, (qi + 65) & 0xFF); qi = qi + 1; }
-    if (ext2_get_inode(eino, &ext2_inode_buf) != 0) { kprintln("ext2w: hostname get FAIL", 24); return 0; }
+    if (ext2_get_inode(eino, &ext2_inode_buf) != 0) { kprintln("ext2w: w3b get FAIL", 19); return 0; }
     var ib0 = ext2_inode_blocks_lo(&ext2_inode_buf);
     var wb = ext2_write_at(eino, 8192, &ext2_extent_buf, 100);
     var rb = ext2_read_at(eino, 8192, &ext2_indirect_buf_l2, 100);
-    if (ext2_get_inode(eino, &ext2_inode_buf) != 0) { kprintln("ext2w: hostname reget FAIL", 26); return 0; }
+    if (ext2_get_inode(eino, &ext2_inode_buf) != 0) { kprintln("ext2w: w3b reget FAIL", 21); return 0; }
     var ib1 = ext2_inode_blocks_lo(&ext2_inode_buf);
     var w3b = 1;
     if (wb != 100) { w3b = 0; }
@@ -2014,7 +2044,7 @@ fn ext2_write_selftest() {
     if (w3b == 1) { kprintln("ext2w: W3 sparse-alloc write OK", 31); }
     else          { kprintln("ext2w: W3 sparse-alloc write MISMATCH", 37); }
 
-    # W3c: truncate /hello.txt to 0 — frees its block, i_size=0, read => 0.
+    # W3c: truncate /w3a.txt to 0 — frees its block, i_size=0, read => 0.
     var tfb0 = ext2_sb_free_blocks_count(&ext2_sb_buf);
     var trc = ext2_truncate_zero(hino);
     var tfb1 = ext2_sb_free_blocks_count(&ext2_sb_buf);
