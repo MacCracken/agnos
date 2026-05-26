@@ -1998,6 +1998,70 @@ fn ext2_link(target_ino, dst_parent, dst_name, dst_nl) {
     return 0;
 }
 
+# === symlink-create / ln -s (WRITE arc 1.33.3 — bite 3) ==============
+#
+# Create symlink `name` in `parent_ino` pointing at `target`. FAST symlink
+# (target < 60 B) stores the target inline in the 60-byte i_block array
+# (i_blocks=0, no data block); SLOW symlink (>= 60 B) puts it in one data
+# block (i_block[0], indirect-mapped — no EXTENTS_FL, like every file this
+# arc creates). dirent file_type = 7 (S_IFLNK). This bite only CREATES
+# symlinks e2fsck-clean; *resolving* them on traversal is the 1.33.4 item.
+# Order (doc § 3): alloc inode (+ slow: data block) → init → insert dirent;
+# rolls back on failure. NOTE the rollback must NOT call ext2_truncate_zero
+# on a fast symlink — its i_block holds target TEXT, not block pointers.
+# Returns the new inode (>0) or -1.
+fn ext2_symlink(parent_ino, name, name_len, target, target_len) {
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    if (target_len < 1) { return 0 - 1; }
+    if (target_len > ext2_blocksize) { return 0 - 1; }       # one block max (base-stage)
+    if (ext2_dir_lookup(parent_ino, name, name_len) != 0) { return 0 - 1; }   # refuse exists/err
+
+    var ino = ext2_alloc_inode(0);                           # not a dir
+    if (ino <= 0) { return 0 - 1; }
+
+    # slow symlink needs a data block — alloc before init so a failure unwinds
+    var db = 0;
+    if (target_len >= 60) {
+        db = ext2_alloc_block(0);
+        if (db <= 0) { ext2_free_inode(ino, 0); return 0 - 1; }
+        var z = 0;
+        while (z < ext2_blocksize) { store8(&ext2_block_buf + z, 0); z = z + 1; }
+        var t = 0;
+        while (t < target_len) { store8(&ext2_block_buf + t, load8(target + t)); t = t + 1; }
+        if (ext2_write_block(db, &ext2_block_buf) != 0) { ext2_free_block(db); ext2_free_inode(ino, 0); return 0 - 1; }
+    }
+
+    # init the symlink inode (zeroed → i_flags 0, no EXTENTS_FL)
+    var z2 = 0;
+    while (z2 < ext2_inode_size) { store8(&ext2_inode_buf + z2, 0); z2 = z2 + 1; }
+    ext2_inode_set_mode(&ext2_inode_buf, 0xA1FF);            # S_IFLNK | 0777
+    ext2_inode_set_links_count(&ext2_inode_buf, 1);
+    ext2_inode_set_size_lo(&ext2_inode_buf, target_len);
+    if (target_len < 60) {
+        # FAST: target inline in the i_block area (inode offset 40), 0 blocks
+        var f = 0;
+        while (f < target_len) { store8(&ext2_inode_buf + 40 + f, load8(target + f)); f = f + 1; }
+        ext2_inode_set_blocks_lo(&ext2_inode_buf, 0);
+    } else {
+        # SLOW: one data block holds the target
+        ext2_inode_set_block_ptr(&ext2_inode_buf, 0, db);
+        ext2_inode_set_blocks_lo(&ext2_inode_buf, ext2_blocksize / 512);
+    }
+    if (ext2_put_inode(ino, &ext2_inode_buf) != 0) {
+        if (db > 0) { ext2_free_block(db); }
+        ext2_free_inode(ino, 0);
+        return 0 - 1;
+    }
+
+    # link into the parent (ftype 7 = symlink)
+    if (ext2_dir_insert(parent_ino, name, name_len, ino, 7) != 0) {
+        if (db > 0) { ext2_free_block(db); }     # NOT truncate_zero (fast i_block = text)
+        ext2_free_inode(ino, 0);
+        return 0 - 1;
+    }
+    return ino;
+}
+
 # --- Path lookup (Phase 3) --------------------------------------------
 #
 # Resolves an absolute path "/foo/bar/baz" to an inode number, walking
@@ -2710,6 +2774,44 @@ fn ext2_write_selftest() {
     if (ext2_path_lookup("/hl_d2", 6) != 0) { whd = 0; }            # no entry made
     if (whd == 1) { kprintln("ext2w: Whard refuse-dir OK", 26); }
     else          { kprintln("ext2w: Whard refuse-dir MISMATCH", 32); }
+
+    # === Wsymlink: ln -s (1.33.3 bite 3) ===
+    # FAST symlink /sl_f → "/hl_b.txt" (9 B inline, i_blocks 0); SLOW symlink
+    # /sl_s → 70-B target in a data block. Both kept for host e2fsck (which
+    # validates the fast/slow format + i_size + target).
+    var wsf = 1;
+    var slf = ext2_symlink(2, "sl_f", 4, "/hl_b.txt", 9);
+    if (slf <= 0) { wsf = 0; }
+    if (slf > 0) {
+        if (ext2_get_inode(slf, &ext2_inode_buf) != 0) { wsf = 0; }
+        else {
+            if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0xA000) { wsf = 0; }   # S_IFLNK
+            if (ext2_inode_size_lo(&ext2_inode_buf) != 9) { wsf = 0; }
+            if (ext2_inode_blocks_lo(&ext2_inode_buf) != 0) { wsf = 0; }              # fast → 0 blocks
+            if (load8(&ext2_inode_buf + 40) != 47) { wsf = 0; }                       # inline starts '/'
+        }
+    }
+    if (wsf == 1) { kprintln("ext2w: Wsym fast OK", 19); }
+    else          { kprintln("ext2w: Wsym fast MISMATCH", 25); }
+
+    # slow symlink: 70-byte target ("/" + 69 'a')
+    var stbuf[80];
+    store8(&stbuf, 47);
+    var sbi = 1;
+    while (sbi < 70) { store8(&stbuf + sbi, 97); sbi = sbi + 1; }
+    var wss = 1;
+    var sls = ext2_symlink(2, "sl_s", 4, &stbuf, 70);
+    if (sls <= 0) { wss = 0; }
+    if (sls > 0) {
+        if (ext2_get_inode(sls, &ext2_inode_buf) != 0) { wss = 0; }
+        else {
+            if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0xA000) { wss = 0; }
+            if (ext2_inode_size_lo(&ext2_inode_buf) != 70) { wss = 0; }
+            if (ext2_inode_blocks_lo(&ext2_inode_buf) == 0) { wss = 0; }              # slow → has a block
+        }
+    }
+    if (wss == 1) { kprintln("ext2w: Wsym slow OK", 19); }
+    else          { kprintln("ext2w: Wsym slow MISMATCH", 25); }
 
     return 0;
 }

@@ -21,6 +21,12 @@ First WRITE follow-on. **`ext2_rename(src_parent, src_name, dst_parent, dst_name
 
 **Verified** — `ext2-write-smoke.sh` on `metadata_csum,64bit,extent`: `Whard link` (hardlink → unlink one name → the other survives, nlink 2→1) + `Whard refuse-dir` (dir hardlink refused) OK; **`e2fsck -fn` clean incl. Pass-4 link accounting**; host `debugfs` confirms `/hl_b.txt`="HL" survives the unlink of `/hl_a.txt`, and `/hl_d2` is absent (dir hardlink refused). No regression. Build 682,952 → **686,576 B**.
 
+### Added — bite 3: symlink-create / `ln -s` (`ext2.cyr`, `shell.cyr`)
+
+**`ext2_symlink(parent, name, target)`** — allocates an `S_IFLNK` inode (mode 0xA1FF). **Fast symlink** (target < 60 B) stores the target inline in the 60-byte `i_block` array (`i_blocks=0`, no data block); **slow symlink** (≥ 60 B) writes it to one indirect-mapped data block. dirent `file_type` 7; refuses dst-exists. The rollback path deliberately never calls `ext2_truncate_zero` on a fast symlink — its `i_block` holds target *text*, not block pointers, so interpreting it as block numbers would free random blocks. Plus **`ln -s TARGET LINK`** flag-parsing folded into the shared `ln` verb (TARGET stored verbatim, not path-resolved). This bite only *creates* symlinks e2fsck-clean — *resolving* them on traversal is the 1.33.4 item.
+
+**Verified** — `ext2-write-smoke.sh` on `metadata_csum,64bit,extent`: `Wsym fast` (inline target, `i_blocks=0`) + `Wsym slow` (data-block target) OK; **`e2fsck -fn` clean** (validates both fast/slow symlink formats); host `debugfs` confirms `/sl_f` is a symlink with fast-link target `/hl_b.txt`, and `/sl_s` is a slow symlink. No regression. Build 686,576 → **690,816 B**.
+
 ## [1.33.2] — 2026-05-25 (lockup-hardening — bench + serial stability. A reported lockup at the **idle shell, a few seconds–to–a-minute *after* `bench` completes** (not during) prompted fixes for the three small unbounded/unguarded spots in the bench + serial path — concrete defects that could leave corrupted state for the per-tick scheduler to trip later. Cut and released on its own as the stability fix. The ext2/ext4 WRITE follow-ons (rename / hardlink / symlink-create + `s_state`/`sync`) originally scoped under this number **moved to 1.33.3** — see that entry and [`iron-nuc-zen-log.md#tracker-1333-cycle`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md#tracker-1333-cycle).)
 
 ### Fixed — lockup-hardening: bounded serial poll + bench memory guards

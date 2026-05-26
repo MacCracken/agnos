@@ -255,6 +255,16 @@ for wh in "Whard link" "Whard refuse-dir"; do
     fi
 done
 
+# Wsymlink: ln -s (1.33.3 bite 3) — fast (inline target, 0 blocks) + slow
+# (target in a data block) symlink creation.
+for ws in "Wsym fast" "Wsym slow"; do
+    if strings "$LOG" | grep -q "ext2w: $ws OK"; then
+        echo "  PASS: $ws"
+    else
+        echo "  FAIL: $ws"; rc=1
+    fi
+done
+
 # W4b: shell write verbs driven headlessly via sh_exec. The proof is the
 # `cat` of the echo-redirected file printing "SHELL-WROTE-IT" back.
 if strings "$LOG" | grep -q "SHELL-WROTE-IT"; then
@@ -349,6 +359,18 @@ if debugfs -R "stat /hl_d2" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
 else
     echo "  PASS: /hl_d2 absent on disk (dir hardlink refused)"
 fi
+
+# Wsymlink host verification: /sl_f + /sl_s are symlinks; the fast one's
+# inline target is /hl_b.txt (debugfs prints "Fast link dest").
+slftype=$(debugfs -R "stat /sl_f" "$WORK/part-post.img" 2>/dev/null | grep -oE "Type: [a-z]+" | head -1 | awk '{print $2}')
+[ "$slftype" = "symlink" ] && echo "  PASS: /sl_f is a symlink on disk (fast)" || { echo "  FAIL: /sl_f type='$slftype' (want symlink)"; rc=1; }
+if debugfs -R "stat /sl_f" "$WORK/part-post.img" 2>/dev/null | grep -q "/hl_b.txt"; then
+    echo "  PASS: /sl_f fast-link target = /hl_b.txt"
+else
+    echo "  FAIL: /sl_f fast-link target not /hl_b.txt"; rc=1
+fi
+slstype=$(debugfs -R "stat /sl_s" "$WORK/part-post.img" 2>/dev/null | grep -oE "Type: [a-z]+" | head -1 | awk '{print $2}')
+[ "$slstype" = "symlink" ] && echo "  PASS: /sl_s is a symlink on disk (slow)" || { echo "  FAIL: /sl_s type='$slstype' (want symlink)"; rc=1; }
 if debugfs -R "stat /shtmp" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
     echo "  FAIL: /shtmp still present (shell rm didn't persist)"; rc=1
 else

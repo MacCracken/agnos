@@ -531,27 +531,58 @@ fn sh_cmd_mv(arg, arglen) {
 fn sh_cmd_ln(arg, arglen) {
     if (ext2_active == 0) { kprintln("ln: no fs", 9); return 0; }
     sh_trim(arg, arglen);
-    if (sh_trim_len < 1) { kprintln("usage: ln <src> <newname>", 25); return 0; }
+    if (sh_trim_len < 1) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
     var ts = arg + sh_trim_off;
     var tl = sh_trim_len;
+
+    # detect a leading "-s " → symlink mode; advance past it
+    var symmode = 0;
+    if (tl >= 2) {
+        if (load8(ts) == 45) { if (load8(ts + 1) == 115) {           # "-s"
+            if (tl == 2) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
+            if (load8(ts + 2) != 32) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
+            symmode = 1;
+            var adv = 3;
+            while (adv < tl) { if (load8(ts + adv) != 32) { break; } adv = adv + 1; }
+            ts = ts + adv;
+            tl = tl - adv;
+        } }
+    }
+
+    # split the remaining text into two tokens on the first space
     var sp = 0 - 1;
     var i = 0;
     while (i < tl) { if (load8(ts + i) == 32) { sp = i; break; } i = i + 1; }
-    if (sp < 0) { kprintln("usage: ln <src> <newname>", 25); return 0; }
+    if (sp < 0) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
     var doff = sp + 1;
     while (doff < tl) { if (load8(ts + doff) != 32) { break; } doff = doff + 1; }
-    if (doff >= tl) { kprintln("usage: ln <src> <newname>", 25); return 0; }
+    if (doff >= tl) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
 
-    # resolve SRC → existing inode (scalar, survives the next sh_abspath)
+    if (symmode == 1) {
+        # SYMLINK: token A = target string (stored verbatim, NOT resolved);
+        # token B = link path. Copy the target to a local before sh_abspath(B)
+        # reuses sh_path_buf.
+        var tgt_len = sp;
+        if (tgt_len > 255) { kprintln("ln: target too long", 19); return 0; }
+        var tgtbuf[256];
+        var c = 0;
+        while (c < tgt_len) { store8(&tgtbuf + c, load8(ts + c)); c = c + 1; }
+        if (sh_abspath(ts + doff, tl - doff) < 0) { kprintln("ln: bad link path", 17); return 0; }
+        var lparent = sh_split_parent(sh_path_len);
+        if (lparent <= 0) { kprintln("ln: no such link directory", 26); return 0; }
+        if (ext2_symlink(lparent, &sh_path_buf + sh_base_off, sh_base_len, &tgtbuf, tgt_len) <= 0) {
+            kprintln("ln: symlink failed (exists?)", 28);
+        }
+        return 0;
+    }
+
+    # HARDLINK: SRC must exist; resolve to an inode before reusing sh_path_buf
     if (sh_abspath(ts, sp) < 0) { kprintln("ln: bad src path", 16); return 0; }
     var src_ino = ext2_path_lookup(&sh_path_buf, sh_path_len);
     if (src_ino <= 0) { kprintln("ln: no such src", 15); return 0; }
-
-    # resolve NEWNAME → parent + basename (left in sh_path_buf)
     if (sh_abspath(ts + doff, tl - doff) < 0) { kprintln("ln: bad dst path", 16); return 0; }
     var dst_parent = sh_split_parent(sh_path_len);
     if (dst_parent <= 0) { kprintln("ln: no such dst directory", 25); return 0; }
-
     if (ext2_link(src_ino, dst_parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) {
         kprintln("ln: failed (dir / dst exists?)", 30);
     }
