@@ -42,6 +42,16 @@ The bite where the allocators start doing real file work — the mutating siblin
 
 **Verification**: production **648,016 B** (+7,168). No regression (`ext2-smoke.sh` 5/5). **W3 smoke PASS**: overwrite /hello.txt @0 with 200 bytes → in-AGNOS readback byte-identical; sparse-write 100 bytes @8192 of /etc/hostname → new direct block allocated, block 1 a hole, readback identical, `i_blocks` +8; truncate /hello.txt → block freed, reads 0. **`e2fsck -fn` clean**; host `debugfs` confirms on disk: /etc/hostname `Size: 8292` (write+sparse landed), /hello.txt `Size: 0` (truncate landed). QEMU gate (no iron). **Next: W4** (dirent insert/remove + `create`/`unlink` + VFS arms).
 
+### Added — W4a directory mutation + create/unlink (`ext2.cyr`)
+
+The demo→base milestone at the FS layer: files can be created, written, **persisted**, and deleted. Dirent ops per the prior-art doc § 7 (FreeBSD `ext2_direnter`/`ext2_dirremove`).
+
+- **`ext2_dir_insert`** — places a dirent by reusing a tombstone (inode 0) whose `rec_len` fits, or splitting a live entry's slack (`rec_len` beyond its real `round4(8+name_len)` size); appends a fresh direct dir block when no block has room. **`ext2_dir_remove`** — coalesces the victim's `rec_len` into the previous entry, or tombstones the block head. Helpers `ext2_round4`, `ext2_dirent_write`, `ext2_dir_try_insert`. Linear directories only (we never create htree-indexed dirs; smoke image is `-O ^dir_index`).
+- **`ext2_create(dir, name)`** — alloc inode → init (S_IFREG | 0644, links 1, zeroed) → insert dirent; rolls back the inode if the dirent insert fails. **`ext2_unlink(dir, name)`** — remove dirent → dec links → at 0, set `i_dtime` + truncate + free inode. Refuses directories (rmdir is W5).
+- **The `e2fsck` gate caught two real unlink bugs** (the point of the gate, per doc § 3): (1) a freed inode with `i_dtime == 0` trips *"Deleted inode N has zero dtime"* — so unlink now stamps `i_dtime` at links→0; (2) a *small* `i_dtime` (e.g. 1) is misread as an orphan-list next-inode pointer (the orphan chain is threaded through `i_dtime`) → *"corrupted orphan linked list"* — so the stamp is a timestamp-shaped value (`1748000000`, > any inode number), which can't be a next-pointer. No RTC, so it's a fixed sentinel; e2fsck checks `dtime != 0` + plausibility, not the value.
+
+**Verification**: production **654,384 B** (+6,368). No regression (`ext2-smoke.sh` 5/5). **W4a smoke PASS**: `create("/w4keep.txt")` + write "AGNOS-W4-WROTE" → in-AGNOS lookup+readback match; `create("/w4tmp.txt")` + write + `unlink` → lookup gone, free-counts return to baseline. **`e2fsck -fn` clean**; host `debugfs` reads `/w4keep.txt` = "AGNOS-W4-WROTE" off the disk image (create+write+dirent **persisted**) and confirms `/w4tmp.txt` **absent** (unlink persisted). QEMU gate (no iron). **Next: W4b** (VFS write arm `vfs_write` for `VFS_EXT2_FILE` + `vfs_create` + shell `touch`/`echo>`/`rm` — the user-facing `echo hello > /f` glue; interactive/iron-validated, not headless-smokeable), then **W5** (mkdir/rmdir + commit-order + iron burn).
+
 ### Fixed — `ext2_init` log_block_size error message length (`ext2.cyr`)
 
 `kprintln("ext2: log_block_size out of range: ", 36)` declared length 36 for a 35-byte string — a 1-byte over-read printing one stray byte on that (rarely-hit) error path. Corrected to 35.

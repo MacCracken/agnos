@@ -1258,6 +1258,207 @@ fn ext2_dir_lookup(dir_inode_num, name, name_len) {
     return 0;   # not found
 }
 
+# === Directory mutation + create / unlink (WRITE arc 1.33.x — W4a) =====
+#
+# Dirent insert (rec_len split) + remove (coalesce into prev / tombstone
+# the block head) per the prior-art doc § 7 (FreeBSD ext2_direnter /
+# ext2_dirremove). create = alloc inode + init + insert dirent; unlink =
+# remove dirent + dec links + (at 0) free blocks + inode. Linear dirs only
+# (we never create htree-indexed dirs; the smoke image is `-O ^dir_index`).
+# Uses ext2_dir_buf for the dir block. All gated on ext2_write_ok. Commit
+# order per doc § 3.
+
+fn ext2_round4(n) { var m = n + 3; return m - (m & 3); }
+
+# Write a dirent record { inode, rec_len, name_len, file_type, name } into
+# buf at byte offset `o`. ftype: 1=regular, 2=dir.
+fn ext2_dirent_write(buf, o, inode, rec_len, name, name_len, ftype) {
+    ext2_store32_le(buf, o, inode);
+    ext2_store16_le(buf, o + 4, rec_len);
+    store8(buf + o + 6, name_len);
+    store8(buf + o + 7, ftype);
+    var i = 0;
+    while (i < name_len) { store8(buf + o + 8 + i, load8(name + i)); i = i + 1; }
+    return 0;
+}
+
+# Try to place (child_ino, name, ftype) into the dir block already loaded
+# in ext2_dir_buf. `needed` = round4(8 + name_len). Returns 1 if placed
+# (buf modified — caller writes it back), 0 if the block has no room.
+# Case A reuses a tombstone (inode 0) whose rec_len fits; case B splits a
+# live entry's slack (rec_len beyond its real 8+name_len size).
+fn ext2_dir_try_insert(child_ino, name, name_len, ftype, needed) {
+    var off = 0;
+    while (off < ext2_blocksize) {
+        var d = &ext2_dir_buf + off;
+        var e_ino = ext2_load32_le(d, 0);
+        var e_rl  = ext2_load16_le(d, 4);
+        var e_nl  = load8(d + 6);
+        if (e_rl == 0) { return 0; }                  # corrupt — abandon block
+        if (e_ino == 0) {
+            if (e_rl >= needed) {
+                ext2_dirent_write(&ext2_dir_buf, off, child_ino, e_rl, name, name_len, ftype);
+                return 1;
+            }
+        } else {
+            var e_real = ext2_round4(8 + e_nl);
+            if (e_rl - e_real >= needed) {
+                ext2_store16_le(&ext2_dir_buf, off + 4, e_real);   # shrink live entry
+                ext2_dirent_write(&ext2_dir_buf, off + e_real, child_ino, e_rl - e_real, name, name_len, ftype);
+                return 1;
+            }
+        }
+        off = off + e_rl;
+    }
+    return 0;
+}
+
+# Insert a dirent into a directory. Returns 0 / -1.
+fn ext2_dir_insert(dir_ino, name, name_len, child_ino, ftype) {
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x4000) { return 0 - 1; }
+
+    var needed = ext2_round4(8 + name_len);
+    var dir_size = ext2_inode_size_lo(&ext2_inode_buf);
+    var nblocks = dir_size / ext2_blocksize;
+
+    # 1. try the existing dir blocks
+    var lb = 0;
+    while (lb < nblocks) {
+        var phys = ext2_logical_to_physical(&ext2_inode_buf, lb);
+        if (phys == 0 - 1) { return 0 - 1; }
+        if (phys != 0) {
+            if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+            if (ext2_dir_try_insert(child_ino, name, name_len, ftype, needed) == 1) {
+                if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+                return 0;
+            }
+        }
+        lb = lb + 1;
+    }
+
+    # 2. no slack anywhere — append a fresh dir block (direct only; an
+    #    indirect-block dir append is deferred — base-stage dirs are tiny)
+    if (nblocks >= 12) { return 0 - 1; }
+    ext2_bmap_alloc_count = 0;
+    var nb = ext2_bmap_alloc(&ext2_inode_buf, nblocks);
+    if (nb <= 0) { return 0 - 1; }
+    var z = 0;
+    while (z < ext2_blocksize) { store8(&ext2_dir_buf + z, 0); z = z + 1; }
+    ext2_dirent_write(&ext2_dir_buf, 0, child_ino, ext2_blocksize, name, name_len, ftype);
+    if (ext2_write_block(nb, &ext2_dir_buf) != 0) { return 0 - 1; }
+    ext2_inode_set_size_lo(&ext2_inode_buf, dir_size + ext2_blocksize);
+    ext2_inode_set_blocks_lo(&ext2_inode_buf,
+        ext2_inode_blocks_lo(&ext2_inode_buf) + ext2_bmap_alloc_count * (ext2_blocksize / 512));
+    if (ext2_put_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    return 0;
+}
+
+# Remove the named entry from a directory. Coalesces its rec_len into the
+# previous entry, or tombstones it if it's the block head. Returns 0 if
+# removed, -1 on error / not found.
+fn ext2_dir_remove(dir_ino, name, name_len) {
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x4000) { return 0 - 1; }
+
+    var dir_size = ext2_inode_size_lo(&ext2_inode_buf);
+    var nblocks = dir_size / ext2_blocksize;
+    var lb = 0;
+    while (lb < nblocks) {
+        var phys = ext2_logical_to_physical(&ext2_inode_buf, lb);
+        if (phys == 0 - 1) { return 0 - 1; }
+        if (phys != 0) {
+            if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+            var off = 0;
+            var prev = 0 - 1;               # byte offset of previous entry; -1 = block head
+            while (off < ext2_blocksize) {
+                var d = &ext2_dir_buf + off;
+                var e_ino = ext2_load32_le(d, 0);
+                var e_rl  = ext2_load16_le(d, 4);
+                var e_nl  = load8(d + 6);
+                if (e_rl == 0) { return 0 - 1; }
+                if (e_ino != 0) {
+                    if (e_nl == name_len) {
+                        if (memeq(d + 8, name, name_len) == 1) {
+                            if (prev == 0 - 1) {
+                                ext2_store32_le(&ext2_dir_buf, off, 0);          # tombstone head
+                            } else {
+                                ext2_store16_le(&ext2_dir_buf, prev + 4,
+                                    ext2_load16_le(&ext2_dir_buf, prev + 4) + e_rl);  # coalesce
+                            }
+                            if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+                            return 0;
+                        }
+                    }
+                }
+                prev = off;
+                off = off + e_rl;
+            }
+        }
+        lb = lb + 1;
+    }
+    return 0 - 1;   # not found
+}
+
+# Create a regular file `name` (0644) in directory `dir_ino`. Returns the
+# new inode number (>0) or -1. Order (doc § 3): alloc inode (bitmap+count)
+# → init inode → insert dirent; rolls back the inode if the dirent fails.
+fn ext2_create(dir_ino, name, name_len) {
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    var ino = ext2_alloc_inode(0);
+    if (ino <= 0) { return 0 - 1; }
+
+    var z = 0;
+    while (z < ext2_inode_size) { store8(&ext2_inode_buf + z, 0); z = z + 1; }
+    ext2_inode_set_mode(&ext2_inode_buf, 0x81A4);          # S_IFREG | 0644
+    ext2_inode_set_links_count(&ext2_inode_buf, 1);
+    if (ext2_put_inode(ino, &ext2_inode_buf) != 0) { ext2_free_inode(ino, 0); return 0 - 1; }
+
+    if (ext2_dir_insert(dir_ino, name, name_len, ino, 1) != 0) {
+        ext2_free_inode(ino, 0);
+        return 0 - 1;
+    }
+    return ino;
+}
+
+# Unlink a regular file `name` from `dir_ino`: remove dirent, dec links,
+# and (at 0) free the file's blocks + inode. Refuses directories (rmdir is
+# W5). Returns 0 / -1. Order (doc § 3): dirent-remove → links-- → free.
+fn ext2_unlink(dir_ino, name, name_len) {
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    var ino = ext2_dir_lookup(dir_ino, name, name_len);
+    if (ino <= 0) { return 0 - 1; }
+    if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0x4000) { return 0 - 1; }   # dir → rmdir
+
+    if (ext2_dir_remove(dir_ino, name, name_len) != 0) { return 0 - 1; }
+
+    if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    var links = ext2_inode_links_count(&ext2_inode_buf) - 1;
+    ext2_inode_set_links_count(&ext2_inode_buf, links);
+    if (links == 0) {
+        # Mark the inode deleted: i_dtime (offset 20) must be non-zero AND
+        # look like a TIMESTAMP, not a small integer. The orphan inode list
+        # is threaded through i_dtime (each orphan's dtime = next orphan#),
+        # so a small dtime (e.g. 1) makes e2fsck read the freed inode as an
+        # orphan-chain link to inode 1 → "corrupted orphan linked list". A
+        # value above any inode number can't be a next-pointer, so it's
+        # treated as a deletion time. We have no RTC → fixed epoch sentinel
+        # (2025-ish); e2fsck checks dtime!=0 + plausibility, not the value.
+        # (truncate_zero below re-reads/re-writes the inode but leaves
+        # i_dtime untouched, so it survives.)
+        ext2_store32_le(&ext2_inode_buf, 20, 1748000000);
+    }
+    if (ext2_put_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    if (links == 0) {
+        ext2_truncate_zero(ino);
+        ext2_free_inode(ino, 0);
+    }
+    return 0;
+}
+
 # --- Path lookup (Phase 3) --------------------------------------------
 #
 # Resolves an absolute path "/foo/bar/baz" to an inode number, walking
@@ -1715,6 +1916,35 @@ fn ext2_write_selftest() {
     if (rc3 != 0)      { w3c = 0; }
     if (w3c == 1) { kprintln("ext2w: W3 truncate-to-zero OK", 29); }
     else          { kprintln("ext2w: W3 truncate-to-zero MISMATCH", 35); }
+
+    # === W4a: create + write + read (kept for host verify), then a
+    #     create→unlink round-trip (free-counts must return).
+    var nino = ext2_create(2, "w4keep.txt", 10);
+    var w4c = 1;
+    if (nino <= 0) { w4c = 0; }
+    if (nino > 0) {
+        if (ext2_write_at(nino, 0, "AGNOS-W4-WROTE", 14) != 14) { w4c = 0; }
+        if (ext2_path_lookup("/w4keep.txt", 11) != nino) { w4c = 0; }
+        if (ext2_read_at(nino, 0, &ext2_indirect_buf_l2, 14) != 14) { w4c = 0; }
+        if (memeq(&ext2_indirect_buf_l2, "AGNOS-W4-WROTE", 14) != 1) { w4c = 0; }
+    }
+    if (w4c == 1) { kprintln("ext2w: W4 create+write OK", 25); }
+    else          { kprintln("ext2w: W4 create+write MISMATCH", 31); }
+
+    var fb4 = ext2_sb_free_blocks_count(&ext2_sb_buf);
+    var fi4 = ext2_sb_free_inodes_count(&ext2_sb_buf);
+    var tino = ext2_create(2, "w4tmp.txt", 9);
+    var w4u = 1;
+    if (tino <= 0) { w4u = 0; }
+    if (tino > 0) {
+        ext2_write_at(tino, 0, "tmp", 3);
+        if (ext2_unlink(2, "w4tmp.txt", 9) != 0) { w4u = 0; }
+        if (ext2_path_lookup("/w4tmp.txt", 10) != 0) { w4u = 0; }
+    }
+    if (ext2_sb_free_blocks_count(&ext2_sb_buf) != fb4) { w4u = 0; }
+    if (ext2_sb_free_inodes_count(&ext2_sb_buf) != fi4) { w4u = 0; }
+    if (w4u == 1) { kprintln("ext2w: W4 unlink round-trip OK", 30); }
+    else          { kprintln("ext2w: W4 unlink round-trip MISMATCH", 36); }
 
     return 0;
 }
