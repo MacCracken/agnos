@@ -126,9 +126,37 @@ else
     echo "  FAIL: WTEST.BIN content mismatch ($(wc -c < "$WORK/got.bin" 2>/dev/null) B vs 3000)"; rc=1
 fi
 
+# 5. delete + truncate reported clean (3c)
+if strings "$LOG" | grep -q "fatw: delete DELME.BIN wrc=0 drc=0"; then
+    echo "  PASS: fatfs_delete rc=0 (write + unlink)"
+else
+    echo "  FAIL: delete (no 'fatw: delete DELME.BIN wrc=0 drc=0' in log)"; rc=1
+fi
+if strings "$LOG" | grep -q "fatw: trunc TRUNC.BIN wrc=0 trc=0"; then
+    echo "  PASS: fatfs_truncate_zero rc=0 (write + truncate)"
+else
+    echo "  FAIL: truncate (no 'fatw: trunc TRUNC.BIN wrc=0 trc=0' in log)"; rc=1
+fi
+
+# 6. DELME.BIN gone from disk (delete removed the dirent; fsck check #2
+#    above also proves its chain was freed with no leaked clusters)
+if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "DELME"; then
+    echo "  FAIL: DELME.BIN still present (delete didn't remove dirent)"; rc=1
+else
+    echo "  PASS: DELME.BIN absent (delete persisted, chain freed per fsck)"
+fi
+
+# 7. TRUNC.BIN is now zero-length (truncate freed the chain + zeroed size)
+mtype -i "$WORK/esp.img" ::TRUNC.BIN > "$WORK/trunc.bin" 2>/dev/null
+if [ -s "$WORK/trunc.bin" ]; then
+    echo "  FAIL: TRUNC.BIN not empty ($(wc -c < "$WORK/trunc.bin") B)"; rc=1
+else
+    echo "  PASS: TRUNC.BIN truncated to 0 bytes"
+fi
+
 echo ""
 echo "=========================================="
-if [ "$rc" = "0" ]; then echo "FAT write smoke (3a create + 3b content): PASS"; else echo "FAT write smoke (3a create + 3b content): FAIL"; fi
+if [ "$rc" = "0" ]; then echo "FAT write smoke (3a create + 3b content + 3c del/trunc): PASS"; else echo "FAT write smoke (3a create + 3b content + 3c del/trunc): FAIL"; fi
 echo "Logs: $LOG"
 echo "=========================================="
 exit $rc

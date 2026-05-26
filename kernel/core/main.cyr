@@ -499,6 +499,25 @@ if (fatfs_active == 1) {
     kprint("fatw: write WTEST.BIN rc=", 25);
     kprint_num(fw2_rc);
     kprintln("", 0);
+    # 3c — delete + truncate. Separate files (DELME / TRUNC) so the 3b
+    # WTEST.BIN content check stays valid. fatfs_file_buf still holds the
+    # pattern (write_file doesn't mutate src), so reuse its first 2000 B.
+    var dl_name = "DELME.BIN";
+    var dl_wrc = fatfs_write_file(dl_name, 9, &fatfs_file_buf, 2000);
+    var dl_drc = fatfs_delete(dl_name, 9);
+    kprint("fatw: delete DELME.BIN wrc=", 27);
+    kprint_num(dl_wrc);
+    kprint(" drc=", 5);
+    kprint_num(dl_drc);
+    kprintln("", 0);
+    var tr_name = "TRUNC.BIN";
+    var tr_wrc = fatfs_write_file(tr_name, 9, &fatfs_file_buf, 2000);
+    var tr_rc = fatfs_truncate_zero(tr_name, 9);
+    kprint("fatw: trunc TRUNC.BIN wrc=", 26);
+    kprint_num(tr_wrc);
+    kprint(" trc=", 5);
+    kprint_num(tr_rc);
+    kprintln("", 0);
 }
 #endif
 

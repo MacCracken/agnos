@@ -390,9 +390,13 @@ fn fatfs_find_inner(sector, entries_per_sector, name, namelen, result_ptr) {
         if (attr == 0x0F) { continue; }
         if ((attr & 0x08) != 0) { continue; }
         if (fatfs_match_name(ep, name, namelen) == 1) {
-            # Found it: store cluster and size in result_ptr
+            # Found it: store cluster + size in result_ptr, and record the
+            # dirent's location (sector + slot) so delete/truncate can
+            # modify it in place.
             store64(result_ptr, fatfs_entry_cluster(ep));
             store64(result_ptr + 8, fatfs_entry_size(ep));
+            fatfs_slot_sec = sector;
+            fatfs_slot_idx = e;
             return 1;
         }
     }
@@ -704,6 +708,78 @@ fn fatfs_write_file(name, namelen, src, len) {
     # overwrote PRIOR clusters' EOC when linking the next). Publish the
     # dirent (first cluster + true size), then FSInfo.
     if (fatfs_emit_dirent(fatfs_slot_sec, fatfs_slot_idx, &name11, first, len) != 0) { return 0 - 1; }
+    fat_fsinfo_mark_unknown();
+    return 0;
+}
+
+# Free a cluster chain starting at `first` — set every FAT entry in the
+# chain to 0 (free), in all FAT copies. Reads each cluster's next-pointer
+# BEFORE freeing it. Loop-guarded against a self-referential chain.
+# FAT16/32 only (fat_set_entry refuses FAT12). Returns 0/-1.
+fn fat_free_chain(first) {
+    if (fatfs_type == 12) { return 0 - 1; }
+    var max_c = fatfs_count_of_clusters + 2;
+    var c = first;
+    var guard = 0;
+    while (c >= 2) {
+        if (c >= max_c) { return 0 - 1; }            # corrupt chain (out of range)
+        var nxt = fat_next_cluster(c);               # read next BEFORE freeing c
+        if (fat_set_entry(c, 0) != 0) { return 0 - 1; }
+        c = nxt;
+        guard = guard + 1;
+        if (guard > max_c) { return 0 - 1; }         # loop guard
+    }
+    return 0;
+}
+
+# Delete (unlink) an 8.3 file from the root. Ordered per audit § 3
+# inverse: mark the dirent 0xE5 FIRST (file no longer referenced), THEN
+# free the cluster chain — so a crash between leaves leaked clusters
+# (fsck-reclaimable), never a live dirent → free chain (cross-link risk).
+# FAT16/32 only. Returns 0/-1.
+fn fatfs_delete(name, namelen) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    if (fatfs_type == 12) { return 0 - 1; }
+    var res[16];
+    if (fatfs_find_root(name, namelen, &res) != 1) { return 0 - 1; }   # not found
+    var first = load64(&res);
+    var sec = fatfs_slot_sec;
+    var slot = fatfs_slot_idx;
+    # 1. mark the dirent deleted.
+    if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    store8(&fatfs_dir_buf + slot * 32, 0xE5);
+    if (fat_blk_write(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    # 2. free the chain.
+    if (first >= 2) {
+        if (fat_free_chain(first) != 0) { return 0 - 1; }
+    }
+    fat_fsinfo_mark_unknown();
+    return 0;
+}
+
+# Truncate an 8.3 file to zero length: clear the dirent's cluster pointer
+# + size FIRST (file now empty, no longer references the chain), THEN free
+# the old chain. Same crash-safe ordering as delete. FAT16/32 only.
+# (Arbitrary-length truncate is a follow-on.) Returns 0/-1.
+fn fatfs_truncate_zero(name, namelen) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    if (fatfs_type == 12) { return 0 - 1; }
+    var res[16];
+    if (fatfs_find_root(name, namelen, &res) != 1) { return 0 - 1; }
+    var first = load64(&res);
+    var sec = fatfs_slot_sec;
+    var slot = fatfs_slot_idx;
+    # 1. clear cluster pointer + size in the dirent.
+    if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    var ep = &fatfs_dir_buf + slot * 32;
+    store8(ep + 20, 0); store8(ep + 21, 0);          # FstClusHI = 0
+    store8(ep + 26, 0); store8(ep + 27, 0);          # FstClusLO = 0
+    store8(ep + 28, 0); store8(ep + 29, 0); store8(ep + 30, 0); store8(ep + 31, 0);   # size = 0
+    if (fat_blk_write(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    # 2. free the old chain.
+    if (first >= 2) {
+        if (fat_free_chain(first) != 0) { return 0 - 1; }
+    }
     fat_fsinfo_mark_unknown();
     return 0;
 }
