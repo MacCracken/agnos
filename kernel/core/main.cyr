@@ -518,6 +518,13 @@ if (fatfs_active == 1) {
     kprint(" trc=", 5);
     kprint_num(tr_rc);
     kprintln("", 0);
+    # 3d — LFN create (long name needing 2 LFN entries; mtools/fsck
+    # reconstruct + checksum-validate the name on the host).
+    var lf_name = "LongFileName12345.txt";
+    var lf_rc = fatfs_create_lfn(lf_name, 21);
+    kprint("fatw: lfn create rc=", 20);
+    kprint_num(lf_rc);
+    kprintln("", 0);
 }
 #endif
 

@@ -154,9 +154,23 @@ else
     echo "  PASS: TRUNC.BIN truncated to 0 bytes"
 fi
 
+# 8. LFN create (3d): self-test rc + mtools reconstructs the long name.
+#    mdir showing the exact long name means the LFN entry chain + the 8.3
+#    alias checksum are correct (mtools/fsck validate the checksum link).
+if strings "$LOG" | grep -q "fatw: lfn create rc=0"; then
+    echo "  PASS: fatfs_create_lfn rc=0"
+else
+    echo "  FAIL: lfn create (no 'fatw: lfn create rc=0' in log)"; rc=1
+fi
+if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "LongFileName12345.txt"; then
+    echo "  PASS: long name 'LongFileName12345.txt' reconstructed by mtools (LFN chain + checksum OK)"
+else
+    echo "  FAIL: long name not reconstructed (LFN chain/checksum wrong)"; rc=1
+fi
+
 echo ""
 echo "=========================================="
-if [ "$rc" = "0" ]; then echo "FAT write smoke (3a create + 3b content + 3c del/trunc): PASS"; else echo "FAT write smoke (3a create + 3b content + 3c del/trunc): FAIL"; fi
+if [ "$rc" = "0" ]; then echo "FAT write smoke (3a create + 3b content + 3c del/trunc + 3d LFN): PASS"; else echo "FAT write smoke (3a create + 3b content + 3c del/trunc + 3d LFN): FAIL"; fi
 echo "Logs: $LOG"
 echo "=========================================="
 exit $rc
