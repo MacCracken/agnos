@@ -373,20 +373,18 @@ fn ext2_init() {
     # WRITE arc — write-safety gate (prior-art doc §§ 10, 14). Reads
     # tolerate ro_compat freely (an RO mount ignores it); WRITE must HONOR
     # it or refuse. We refuse write (mount stays fully readable, just
-    # immutable) only on the bits we don't yet maintain:
-    #   ro_compat GDT_CSUM/uninit_bg (0x10), BIGALLOC (0x200),
-    #             METADATA_CSUM (0x400 — every metadata block carries a
-    #             CRC32c; writing without updating it = e2fsck rejects).
-    #             metadata_csum support lands bite-by-bite (§ 14.6); until
-    #             that arc's final bite flips it, a checksummed FS is RO.
-    # 64BIT (incompat 0x80) is NO LONGER a write blocker (1.33.1 bite 1,
-    # § 14.4): on a <16 TB FS every bg_*_hi half is 0, and the existing
-    # lo-field stores preserve them via the whole-block RMW; ext2_desc_size
-    # already gives the 64-byte BGDT stride. The only 64bit-coupled write
-    # cost is bg_checksum, which is a metadata_csum concern (above), not a
-    # 64bit one — so a `64bit,^metadata_csum` FS is fully writable here.
+    # immutable) only on the ro_compat bits we do NOT maintain:
+    #   GDT_CSUM/uninit_bg (0x10) — lazy-bg-init + the legacy crc16 group-
+    #                               desc checksum; a separate deferred feature
+    #   BIGALLOC (0x200)          — cluster allocation; not ported
+    # METADATA_CSUM (0x400) is NO LONGER refused (1.33.1 bites 2-7): the
+    # write path now maintains CRC32c across the superblock, group
+    # descriptors, block+inode bitmaps, inodes, and directory leaves
+    # (§ 14). 64BIT (incompat 0x80) was lifted at bite 1 (§ 14.4). So a
+    # default-`mkfs.ext4` FS (metadata_csum + 64bit, no uninit_bg) — i.e.
+    # the real agnos-fs partition — is now fully writable.
     var ro_compat = ext2_sb_feature_ro_compat(&ext2_sb_buf);
-    var ro_danger = 0x0010 | 0x0200 | 0x0400;
+    var ro_danger = 0x0010 | 0x0200;
     ext2_write_ok = 1;
     if ((ro_compat & ro_danger) != 0) { ext2_write_ok = 0; }
 
@@ -753,6 +751,23 @@ fn ext2_grp_set_free_blocks(group, v) { return ext2_store16_le(ext2_grp_off(grou
 fn ext2_grp_set_free_inodes(group, v) { return ext2_store16_le(ext2_grp_off(group), 14, v); }
 fn ext2_grp_set_used_dirs(group, v)   { return ext2_store16_le(ext2_grp_off(group), 16, v); }
 
+# bg_itable_unused (@0x1C lo, @0x32 hi for 64bit) — the count of inodes at
+# the TAIL of the group's inode table that have NEVER been used. Live when
+# group-desc checksums are on (gdt_csum or metadata_csum): e2fsck uses it as
+# a high-water mark to skip scanning/csum-checking guaranteed-unused inodes.
+# Allocating an inode in that tail region MUST shrink it, or e2fsck flags the
+# inode as "in the unused inodes area" (1.33.1 bite 7 accounting fix).
+fn ext2_grp_itable_unused(group) {
+    var lo = ext2_load16_le(ext2_grp_off(group), 0x1C);
+    if (ext2_desc_size > 32) { return lo | (ext2_load16_le(ext2_grp_off(group), 0x32) << 16); }
+    return lo;
+}
+fn ext2_grp_set_itable_unused(group, v) {
+    ext2_store16_le(ext2_grp_off(group), 0x1C, v & 0xFFFF);
+    if (ext2_desc_size > 32) { ext2_store16_le(ext2_grp_off(group), 0x32, (v >> 16) & 0xFFFF); }
+    return 0;
+}
+
 # Group-descriptor checksum (1.33.1 bite 3, audit § 14.3). e2fsprogs
 # ext2fs_group_desc_csum for metadata_csum: crc32c over the group number
 # (LE32), then the descriptor [0, 0x1E), then 2 zero bytes standing in for
@@ -955,7 +970,14 @@ fn ext2_alloc_inode(is_dir) {
             if (b >= 0) {
                 ext2_bitmap_set(&ext2_bitmap_buf, b);
                 if (ext2_write_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
-                if (ext2_csum_on != 0) { ext2_set_inode_bitmap_csum(group, &ext2_bitmap_buf); }
+                if (ext2_csum_on != 0) {
+                    ext2_set_inode_bitmap_csum(group, &ext2_bitmap_buf);
+                    # shrink the never-used inode tail so e2fsck doesn't see
+                    # this inode "in the unused inodes area". Only grows the
+                    # used watermark downward; freeing never raises it back.
+                    var wm = ext2_inodes_per_group - (b + 1);
+                    if (ext2_grp_itable_unused(group) > wm) { ext2_grp_set_itable_unused(group, wm); }
+                }
                 ext2_grp_set_free_inodes(group, ext2_grp_free_inodes(group) - 1);
                 if (is_dir != 0) {
                     ext2_grp_set_used_dirs(group, ext2_grp_used_dirs(group) + 1);
