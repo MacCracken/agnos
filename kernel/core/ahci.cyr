@@ -348,6 +348,10 @@ var ahci_ports_inited_count = 0;
 
 # Timeouts — same 1M-iter ceiling NVMe + xhci use. ~250ms wall on Zen.
 var AHCI_TIMEOUT_SPINS = 1000000;
+# Flush uses a far larger ceiling than a single-PRDT transfer: FLUSH
+# CACHE EXT can take seconds while the drive commits its write cache
+# (ATA8-ACS budgets ~30s). ~30x the transfer ceiling. 1.33.5 fsync barrier.
+var AHCI_FLUSH_TIMEOUT_SPINS = 30000000;
 
 # CAP fields not previously cached — needed in Phase 2 logic.
 fn ahci_cap_sss() { return (ahci_cap >> 27) & 0x01; }
@@ -1004,6 +1008,77 @@ fn ahci_write_lba(port, lba, count, buf) {
     return ahci_issue_rw(port, 0x35, lba, count, buf, 1);
 }
 
+# --- Issue a non-data ATA command (no PRDT) --------------------------
+#
+# Sibling of ahci_issue_rw for commands with no data phase — FLUSH
+# CACHE EXT (0xEA). Same present/inited/wait-idle guards, same H2D FIS
+# scaffolding (ahci_build_rw_fis with lba=0/count=0 — FLUSH CACHE EXT
+# ignores both), but the command header sets PRDTL=0 (no PRDT) and W=0,
+# and the completion poll uses the generous flush ceiling. Returns 1 on
+# success, 0 on PxTFD.ERR / stuck CI / timeout. 1.33.5 fsync barrier
+# (per flush-cache-prior-art.md § 2.2).
+fn ahci_issue_nodata(port, opcode) {
+    if (ahci_present == 0) { return 0; }
+    if (port < 0) { return 0; }
+    if (port >= AHCI_MAX_PORTS) { return 0; }
+    if (load8(&ahci_port_inited + port) != 1) { return 0; }
+
+    if (ahci_port_wait_idle(port) == 0) {
+        return 0;
+    }
+
+    var port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+    var cl_phys  = load64(&ahci_port_cl_phys + port * 8);
+    var ct_phys  = load64(&ahci_port_ct_phys + port * 8);
+    if (ct_phys == 0) {
+        ct_phys = pmm_alloc();
+        if (ct_phys == 0) { return 0; }
+        store64(&ahci_port_ct_phys + port * 8, ct_phys);
+    }
+
+    # Zero the FIS region (20 B). No PRDT for a non-data command.
+    var i = 0;
+    while (i < 20) { store8(ct_phys + i, 0); i = i + 1; }
+
+    # FLUSH CACHE EXT ignores LBA/count; reuse the rw FIS builder with
+    # lba=0 count=0 (byte2=opcode, byte7=0x40 LBA-mode, rest zero).
+    ahci_build_rw_fis(ct_phys, opcode, 0, 0);
+
+    # Command Header slot 0: CFL=5 (H2D FIS DWORDs), W=0 (non-data),
+    # PRDTL=0 (no PRDT), CTBA = ct_phys.
+    store32(cl_phys + 0,  5);                   # CFL=5, PRDTL=0, W=0
+    store32(cl_phys + 4,  0);                   # PRDBC
+    store32(cl_phys + 8,  ct_phys & 0xFFFFFFFF);
+    store32(cl_phys + 12, (ct_phys >> 32) & 0xFFFFFFFF);
+    store32(cl_phys + 16, 0);
+    store32(cl_phys + 20, 0);
+    store32(cl_phys + 24, 0);
+    store32(cl_phys + 28, 0);
+
+    # Clear any pending IS / SERR before issue.
+    ahci_mmio_write32(port_off + AHCI_P_IS,   0xFFFFFFFF);
+    ahci_mmio_write32(port_off + AHCI_P_SERR, 0xFFFFFFFF);
+
+    # Issue.
+    ahci_mmio_write32(port_off + AHCI_P_CI, 1);
+
+    # Poll completion (CI bit 0 → 0) with task-file error escape hatch.
+    var spins = 0;
+    while (spins < AHCI_FLUSH_TIMEOUT_SPINS) {
+        var ci = ahci_mmio_read32(port_off + AHCI_P_CI);
+        if ((ci & 0x01) == 0) { spins = AHCI_FLUSH_TIMEOUT_SPINS; }
+        else {
+            var tfd = ahci_mmio_read32(port_off + AHCI_P_TFD);
+            if ((tfd & 0x01) == 1) { return 0; }
+            spins = spins + 1;
+        }
+    }
+
+    var ci_final = ahci_mmio_read32(port_off + AHCI_P_CI);
+    if ((ci_final & 0x01) == 1) { return 0; }     # stuck
+    return 1;
+}
+
 # --- Boot-time demos -------------------------------------------------
 #
 # Two-tier demo split per the 1.31.1 § AHCI iron-burn audit:
@@ -1142,6 +1217,13 @@ fn ahci_blk_read(sector, buf) {
 fn ahci_blk_write(sector, buf) {
     if (ahci_blk_port < 0) { return 0 - 1; }
     if (ahci_write_lba(ahci_blk_port, sector, 1, buf) == 1) { return 0; }
+    return 0 - 1;
+}
+
+# FLUSH CACHE EXT (0xEA) on the registered port. 1.33.5 fsync barrier.
+fn ahci_blk_flush() {
+    if (ahci_blk_port < 0) { return 0 - 1; }
+    if (ahci_issue_nodata(ahci_blk_port, 0xEA) == 1) { return 0; }
     return 0 - 1;
 }
 

@@ -602,6 +602,13 @@ fn ext2_sync() {
     ext2_store16_le(&ext2_sb_buf, 0x3A, st | 0x0001);      # set EXT2_VALID_FS
     ext2_fs_dirty = 0;
     if (ext2_write_superblock() != 0) { return 0 - 1; }
+    # 1.33.5 fsync barrier: force the drive to commit its volatile write
+    # cache. Goes LAST — every preceding blk_write_on (incl. the clean-
+    # state SB just written) has already completed at the controller;
+    # the flush pushes that controller-acked data through the drive's
+    # own cache to non-volatile media. Without it `sync` is honest only
+    # at the FS level. flush-cache-prior-art.md § 3.
+    blk_flush_on(ext2_backend);
     return 0;
 }
 

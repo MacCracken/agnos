@@ -185,6 +185,30 @@ fn blk_write_on(tag, sector, buf) {
     return 0 - 1;
 }
 
+# Flush mirror of blk_write_on — issue a device cache-flush (durability
+# barrier) to a specific backend. ext2_sync() calls blk_flush_on(
+# ext2_backend) so the `sync` verb commits the drive's volatile write
+# cache, not just the FS s_state bit. 1.33.5 fsync barrier
+# (flush-cache-prior-art.md § 3). Same registered-bit gate as the R/W
+# dispatchers. Returns 0 on success, -1 on failure.
+fn blk_flush_on(tag) {
+    if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
+    if (tag == BLK_NVME)    { return nvme_blk_flush(); }
+    if (tag == BLK_AHCI)    { return ahci_blk_flush(); }
+    # VirtIO / USB-MS / RAM-disk flush land in 1.33.5 bite 3. Until then
+    # they are honest no-ops: RAM-disk is volatile by definition; VirtIO
+    # without VIRTIO_BLK_F_FLUSH and a cacheless USB stick are write-
+    # through, so there is nothing to commit. Bite 3 promotes VirtIO +
+    # USB-MS to real cache-flush commands (feature-gated / SYNCHRONIZE
+    # CACHE). The FS backend on iron + the write-smoke is NVMe, so this
+    # default is unreached by the bite-2 durability gate.
+    return 0;
+}
+
+fn blk_flush() {
+    return blk_flush_on(blk_active);
+}
+
 fn blk_read_sectors(start, count, buf) {
     if (blk_active == BLK_VIRTIO)  { return vblk_blk_read_sectors(start, count, buf); }
     if (blk_active == BLK_NVME)    { return nvme_blk_read_sectors(start, count, buf); }
