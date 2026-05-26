@@ -131,6 +131,17 @@ fn ext2_inode_flags(inode)       { return ext2_load32_le(inode, 32); }
 # i_block[i] is a 32-bit LE block pointer at byte offset 40 + i*4
 fn ext2_inode_block_ptr(inode, i) { return ext2_load32_le(inode, 40 + i * 4); }
 
+# Inode field STORES (WRITE arc). i_size_lo @ +4, i_links_count @ +26
+# (u16), i_blocks_lo @ +28 (in 512-B sectors — the classic ext2 trap: a
+# 4 KB block adds 8, not 1), i_block[i] @ +40+4i. i_mode @ +0.
+fn ext2_inode_set_mode(inode, v)         { return ext2_store16_le(inode, 0, v); }
+fn ext2_inode_set_size_lo(inode, v)      { return ext2_store32_le(inode, 4, v); }
+fn ext2_inode_links_count(inode)         { return ext2_load16_le(inode, 26); }
+fn ext2_inode_set_links_count(inode, v)  { return ext2_store16_le(inode, 26, v); }
+fn ext2_inode_blocks_lo(inode)           { return ext2_load32_le(inode, 28); }
+fn ext2_inode_set_blocks_lo(inode, v)    { return ext2_store32_le(inode, 28, v); }
+fn ext2_inode_set_block_ptr(inode, i, v) { return ext2_store32_le(inode, 40 + i * 4, v); }
+
 # Composite file size: low 32 + high 32 (LARGE_FILE feature) for regular files.
 # For Phase 1 we cap at 2 GB regardless (i_size_hi == 0 always on small test images).
 fn ext2_inode_filesize(inode) {
@@ -1338,6 +1349,194 @@ fn ext2_open(path, path_len) {
     return fd;
 }
 
+# === File-data write + truncate (WRITE arc 1.33.x — W3) ===============
+#
+# ext2_write_at is the mutating sibling of ext2_read_at; ext2_bmap_alloc
+# the allocating sibling of ext2_logical_to_physical. Scope: direct +
+# single-indirect block allocation (covers files up to 12*bs + (bs/4)*bs
+# = ~4 MB on 4K blocks — every base-stage file). Double/triple-indirect
+# allocation is deferred (the read path supports reading all levels; we
+# just don't write files that large at base stage). All gated on
+# ext2_write_ok. Commit order per doc § 3.
+
+# Per-op allocation accounting (for i_blocks) + "data block was freshly
+# allocated" flag (for zero-vs-RMW on a partial write).
+var ext2_bmap_alloc_count = 0;
+var ext2_bmap_was_new     = 0;
+
+# Map logical block -> physical, ALLOCATING the data block (and the
+# single-indirect block, if needed) when absent. Mutates inode_buf in
+# place (i_block[] for direct; i_block[12] when the indirect block is
+# born). Bumps ext2_bmap_alloc_count per block allocated (data + indirect)
+# and sets ext2_bmap_was_new=1 iff the returned DATA block is new. Returns
+# phys block# (>0), or 0 on ENOSPC / unsupported depth.
+fn ext2_bmap_alloc(inode_buf, lblk) {
+    ext2_bmap_was_new = 0;
+    if (ext2_write_ok == 0) { return 0; }
+    var ptrs = ext2_blocksize / 4;
+
+    # --- direct (0..11) ---
+    if (lblk < 12) {
+        var p = ext2_inode_block_ptr(inode_buf, lblk);
+        if (p != 0) { return p; }
+        var nb = ext2_alloc_block(0);
+        if (nb <= 0) { return 0; }
+        ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+        ext2_bmap_was_new = 1;
+        ext2_inode_set_block_ptr(inode_buf, lblk, nb);
+        return nb;
+    }
+
+    # --- single-indirect (12 .. 12+ptrs-1) ---
+    if (lblk < 12 + ptrs) {
+        var idx = lblk - 12;
+        var ind = ext2_inode_block_ptr(inode_buf, 12);
+        if (ind == 0) {
+            # birth the indirect block: alloc + zero + write, then link it.
+            ind = ext2_alloc_block(0);
+            if (ind <= 0) { return 0; }
+            ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+            var z = 0;
+            while (z < ext2_blocksize) { store8(&ext2_indirect_buf_l1 + z, 0); z = z + 1; }
+            if (ext2_write_block(ind, &ext2_indirect_buf_l1) != 0) { return 0; }
+            ext2_inode_set_block_ptr(inode_buf, 12, ind);
+        }
+        if (ext2_read_block(ind, &ext2_indirect_buf_l1) != 0) { return 0; }
+        var dp = ext2_load32_le(&ext2_indirect_buf_l1, idx * 4);
+        if (dp != 0) { return dp; }
+        var db = ext2_alloc_block(ind);             # goal: near the indirect block
+        if (db <= 0) { return 0; }
+        ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+        ext2_bmap_was_new = 1;
+        ext2_store32_le(&ext2_indirect_buf_l1, idx * 4, db);
+        if (ext2_write_block(ind, &ext2_indirect_buf_l1) != 0) { return 0; }
+        return db;
+    }
+
+    return 0;   # double/triple-indirect allocation deferred (base-stage cap)
+}
+
+# Write `len` bytes from `src` at byte `offset` into a regular file.
+# Allocates blocks on demand (sparse holes between old EOF and offset stay
+# holes — their pointers remain 0, read-zero-filled). Grows i_size; bumps
+# i_blocks by (blocks allocated)*sectors_per_block. Returns bytes written
+# (>=0, may be < len on ENOSPC) or -1 on error. Per doc § 3 the data lands
+# before the inode pointer/size is persisted (put_inode is last).
+fn ext2_write_at(inode_num, offset, src, len) {
+    if (ext2_active == 0)   { return 0 - 1; }
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    if (len == 0)           { return 0; }
+    if (ext2_get_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+    if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x8000) { return 0 - 1; }
+
+    ext2_bmap_alloc_count = 0;
+    var written = 0;
+    var cur = offset;
+    var rem = len;
+    while (rem > 0) {
+        var lblk = cur / ext2_blocksize;
+        var boff = cur - lblk * ext2_blocksize;
+        var chunk = ext2_blocksize - boff;
+        if (chunk > rem) { chunk = rem; }
+
+        var phys = ext2_bmap_alloc(&ext2_inode_buf, lblk);
+        if (phys <= 0) { break; }                    # ENOSPC / depth cap — return partial
+        var was_new = ext2_bmap_was_new;
+
+        if (chunk == ext2_blocksize) {
+            # full-block overwrite — no need to preserve anything
+            var c = 0;
+            while (c < ext2_blocksize) {
+                store8(&ext2_block_buf + c, load8(src + written + c));
+                c = c + 1;
+            }
+        } else {
+            # partial block: zero a freshly-born block, else RMW the old one
+            if (was_new == 1) {
+                var zz = 0;
+                while (zz < ext2_blocksize) { store8(&ext2_block_buf + zz, 0); zz = zz + 1; }
+            } else {
+                if (ext2_read_block(phys, &ext2_block_buf) != 0) { break; }
+            }
+            var c2 = 0;
+            while (c2 < chunk) {
+                store8(&ext2_block_buf + boff + c2, load8(src + written + c2));
+                c2 = c2 + 1;
+            }
+        }
+        if (ext2_write_block(phys, &ext2_block_buf) != 0) { break; }
+
+        written = written + chunk;
+        cur = cur + chunk;
+        rem = rem - chunk;
+    }
+
+    # grow i_size (base stage = lo half only); add allocated blocks to i_blocks
+    var end_off = offset + written;
+    if (end_off > ext2_inode_size_lo(&ext2_inode_buf)) {
+        ext2_inode_set_size_lo(&ext2_inode_buf, end_off);
+    }
+    if (ext2_bmap_alloc_count > 0) {
+        var add = ext2_bmap_alloc_count * (ext2_blocksize / 512);
+        ext2_inode_set_blocks_lo(&ext2_inode_buf, ext2_inode_blocks_lo(&ext2_inode_buf) + add);
+    }
+    if (ext2_put_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+    return written;
+}
+
+# Truncate a regular file to zero length: free all data blocks (direct +
+# single-indirect) and the indirect block, then i_size = i_blocks = 0.
+# Refuses (returns -1) if the file reaches double/triple-indirect — those
+# this driver never creates, and freeing them is a deferred sub-cycle.
+# Returns the count of blocks freed (>=0) or -1. Caller persists nothing
+# else (put_inode is done here). Frees per doc § 3 (pointer cleared, then
+# block freed).
+fn ext2_truncate_zero(inode_num) {
+    if (ext2_active == 0)   { return 0 - 1; }
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    if (ext2_get_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+
+    var ptrs = ext2_blocksize / 4;
+    var freed = 0;
+
+    # double/triple-indirect present → refuse (we never create them)
+    if (ext2_inode_block_ptr(&ext2_inode_buf, 13) != 0) { return 0 - 1; }
+    if (ext2_inode_block_ptr(&ext2_inode_buf, 14) != 0) { return 0 - 1; }
+
+    # direct blocks
+    var i = 0;
+    while (i < 12) {
+        var p = ext2_inode_block_ptr(&ext2_inode_buf, i);
+        if (p != 0) {
+            ext2_inode_set_block_ptr(&ext2_inode_buf, i, 0);   # clear ptr first
+            ext2_free_block(p);
+            freed = freed + 1;
+        }
+        i = i + 1;
+    }
+
+    # single-indirect: free each data block, then the indirect block itself
+    var ind = ext2_inode_block_ptr(&ext2_inode_buf, 12);
+    if (ind != 0) {
+        if (ext2_read_block(ind, &ext2_indirect_buf_l1) != 0) { return 0 - 1; }
+        var k = 0;
+        while (k < ptrs) {
+            var dp = ext2_load32_le(&ext2_indirect_buf_l1, k * 4);
+            if (dp != 0) { ext2_free_block(dp); freed = freed + 1; }
+            k = k + 1;
+        }
+        ext2_inode_set_block_ptr(&ext2_inode_buf, 12, 0);
+        ext2_free_block(ind);
+        freed = freed + 1;
+    }
+
+    ext2_inode_set_size_lo(&ext2_inode_buf, 0);
+    ext2_store32_le(&ext2_inode_buf, 108, 0);     # i_size_high = 0
+    ext2_inode_set_blocks_lo(&ext2_inode_buf, 0);
+    if (ext2_put_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+    return freed;
+}
+
 # === W1 write-path self-test (compile-gated EXT2_WRITE_SELFTEST) =======
 #
 # NON-DESTRUCTIVE proof of the WRITE primitives without changing FS
@@ -1461,6 +1660,61 @@ fn ext2_write_selftest() {
     } else {
         kprintln("ext2w: W2 alloc/free round-trip MISMATCH", 40);
     }
+
+    # === W3: file-data write (ext2_write_at) + sparse alloc + truncate ===
+    # W3a: overwrite /hello.txt @0 with a 200-byte pattern; read back, compare.
+    var hino = ext2_path_lookup("/hello.txt", 10);
+    if (hino <= 0) { kprintln("ext2w: /hello.txt lookup FAIL", 29); return 0; }
+    var pi = 0;
+    while (pi < 256) { store8(&ext2_extent_buf + pi, (pi * 7 + 3) & 0xFF); pi = pi + 1; }
+    var wa = ext2_write_at(hino, 0, &ext2_extent_buf, 200);
+    var ra = ext2_read_at(hino, 0, &ext2_indirect_buf_l2, 200);
+    var w3a = 1;
+    if (wa != 200) { w3a = 0; }
+    if (ra != 200) { w3a = 0; }
+    var ax = 0;
+    while (ax < 200) {
+        if (load8(&ext2_extent_buf + ax) != load8(&ext2_indirect_buf_l2 + ax)) { w3a = 0; break; }
+        ax = ax + 1;
+    }
+    if (w3a == 1) { kprintln("ext2w: W3 write/read 200 OK", 27); }
+    else          { kprintln("ext2w: W3 write/read 200 MISMATCH", 33); }
+
+    # W3b: sparse write — 100 bytes at offset 8192 of /etc/hostname forces a
+    # new direct block (block 1 stays a hole); assert i_blocks grew by 8.
+    var eino = ext2_path_lookup("/etc/hostname", 13);
+    if (eino <= 0) { kprintln("ext2w: /etc/hostname lookup FAIL", 32); return 0; }
+    var qi = 0;
+    while (qi < 100) { store8(&ext2_extent_buf + qi, (qi + 65) & 0xFF); qi = qi + 1; }
+    if (ext2_get_inode(eino, &ext2_inode_buf) != 0) { kprintln("ext2w: hostname get FAIL", 24); return 0; }
+    var ib0 = ext2_inode_blocks_lo(&ext2_inode_buf);
+    var wb = ext2_write_at(eino, 8192, &ext2_extent_buf, 100);
+    var rb = ext2_read_at(eino, 8192, &ext2_indirect_buf_l2, 100);
+    if (ext2_get_inode(eino, &ext2_inode_buf) != 0) { kprintln("ext2w: hostname reget FAIL", 26); return 0; }
+    var ib1 = ext2_inode_blocks_lo(&ext2_inode_buf);
+    var w3b = 1;
+    if (wb != 100) { w3b = 0; }
+    if (rb != 100) { w3b = 0; }
+    var bx = 0;
+    while (bx < 100) {
+        if (load8(&ext2_extent_buf + bx) != load8(&ext2_indirect_buf_l2 + bx)) { w3b = 0; break; }
+        bx = bx + 1;
+    }
+    if (ib1 != ib0 + 8) { w3b = 0; }
+    if (w3b == 1) { kprintln("ext2w: W3 sparse-alloc write OK", 31); }
+    else          { kprintln("ext2w: W3 sparse-alloc write MISMATCH", 37); }
+
+    # W3c: truncate /hello.txt to 0 — frees its block, i_size=0, read => 0.
+    var tfb0 = ext2_sb_free_blocks_count(&ext2_sb_buf);
+    var trc = ext2_truncate_zero(hino);
+    var tfb1 = ext2_sb_free_blocks_count(&ext2_sb_buf);
+    var rc3 = ext2_read_at(hino, 0, &ext2_indirect_buf_l2, 200);
+    var w3c = 1;
+    if (trc < 1)       { w3c = 0; }
+    if (tfb1 <= tfb0)  { w3c = 0; }
+    if (rc3 != 0)      { w3c = 0; }
+    if (w3c == 1) { kprintln("ext2w: W3 truncate-to-zero OK", 29); }
+    else          { kprintln("ext2w: W3 truncate-to-zero MISMATCH", 35); }
 
     return 0;
 }

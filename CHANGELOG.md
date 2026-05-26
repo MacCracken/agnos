@@ -32,6 +32,16 @@ Bitmap-walk allocators per the prior-art doc §§ 4-5 (FreeBSD `ext2_alloc` prim
 
 **Verification**: production **640,848 B** (+11,280; allocators dead-code-eliminable until W3+). No regression (`ext2-smoke.sh` 5/5). **W2 smoke PASS** (`scripts/ext2-write-smoke.sh`): alloc 3 blocks + 1 inode (`blk 1084 1085 1086 ino 15`) → free all → free-counts return **exactly** to baseline (`16068 → 16068`, `17138 → 17138`); `e2fsck -fn` on the post-boot image **clean** — bitmap set/clear + BGDT/SB accounting symmetry proven. QEMU gate (no iron). **Next: W3** (`ext2_write_at` + truncate).
 
+### Added — W3 file-data write + sparse allocation + truncate (`ext2.cyr`)
+
+The bite where the allocators start doing real file work — the mutating siblings of `ext2_read_at` / `ext2_logical_to_physical`.
+
+- **`ext2_bmap_alloc(inode_buf, lblk)`** — logical→physical with **allocation**: returns the data block, allocating it (and the single-indirect block, born + zeroed + linked, when needed) if absent. Covers **direct + single-indirect** (files to ~4 MB on 4K blocks — every base-stage file); double/triple-indirect allocation deferred (read path still reads all levels). Tracks blocks-allocated (for i_blocks) + a was-new flag (zero-vs-RMW on partial writes).
+- **`ext2_write_at(inode_num, offset, src, len)`** — writes bytes at any offset, allocating blocks on demand; sparse holes between old EOF and offset stay holes (pointer 0, read-zero-filled). Full-block overwrite skips the read; partial write to a new block zero-fills first, to an existing block read-modify-writes. Grows `i_size`; bumps `i_blocks` by allocated-blocks × sectors-per-block (the 512-B-sector accounting). `put_inode` persists last (doc § 3 ordering — data before pointer/size).
+- **`ext2_truncate_zero(inode_num)`** — frees all data blocks (direct + single-indirect) + the indirect block, clears the pointers, zeroes `i_size`/`i_blocks`. Refuses on double/triple-indirect files (never created by this driver).
+
+**Verification**: production **648,016 B** (+7,168). No regression (`ext2-smoke.sh` 5/5). **W3 smoke PASS**: overwrite /hello.txt @0 with 200 bytes → in-AGNOS readback byte-identical; sparse-write 100 bytes @8192 of /etc/hostname → new direct block allocated, block 1 a hole, readback identical, `i_blocks` +8; truncate /hello.txt → block freed, reads 0. **`e2fsck -fn` clean**; host `debugfs` confirms on disk: /etc/hostname `Size: 8292` (write+sparse landed), /hello.txt `Size: 0` (truncate landed). QEMU gate (no iron). **Next: W4** (dirent insert/remove + `create`/`unlink` + VFS arms).
+
 ### Fixed — `ext2_init` log_block_size error message length (`ext2.cyr`)
 
 `kprintln("ext2: log_block_size out of range: ", 36)` declared length 36 for a 35-byte string — a 1-byte over-read printing one stray byte on that (rarely-hit) error path. Corrected to 35.

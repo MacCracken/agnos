@@ -1,5 +1,5 @@
 #!/bin/bash
-# ext2 WRITE-path smoke (1.33.x WRITE arc — W1 primitives + W2 allocators).
+# ext2 WRITE-path smoke (1.33.x WRITE arc — W1 primitives + W2 allocators + W3 file-write).
 #
 # Boots the EXT2_WRITE_SELFTEST kernel against a deliberately write-
 # friendly ext2 partition (no metadata_csum / 64bit / dir_index — the
@@ -126,6 +126,15 @@ else
     echo "  FAIL: W2 allocator round-trip"; rc=1
 fi
 
+# W3: file-data write (ext2_write_at) + sparse-block alloc + truncate.
+for w3 in "W3 write/read 200" "W3 sparse-alloc write" "W3 truncate-to-zero"; do
+    if strings "$LOG" | grep -q "ext2w: $w3 OK"; then
+        echo "  PASS: $w3"
+    else
+        echo "  FAIL: $w3"; rc=1
+    fi
+done
+
 # Bonus: free-block count cross-check (self-test sb total vs host debugfs).
 ST_FREE=$(strings "$LOG" | sed -nE 's/.*sb free_blk=([0-9]+).*/\1/p' | head -1)
 if [ -n "$ST_FREE" ] && [ -n "${BASE_FREE:-}" ] && [ "$ST_FREE" = "$BASE_FREE" ]; then
@@ -144,9 +153,19 @@ else
     echo "  FAIL: e2fsck -fn reported problems:"; sed 's/^/        /' "$LOGS/e2fsck.log"; rc=1
 fi
 
+# W3 host verification — the writes/truncate reached the platter (debugfs
+# reads files without mounting). /etc/hostname grew to 8292 (12 + hole +
+# 100 @ 8192); /hello.txt truncated to 0.
+echo ""
+echo "  --- host debugfs W3 verification ---"
+ehsize=$(debugfs -R "stat /etc/hostname" "$WORK/part-post.img" 2>/dev/null | grep -oE "Size: [0-9]+" | head -1 | grep -oE "[0-9]+")
+[ "$ehsize" = "8292" ] && echo "  PASS: /etc/hostname size=8292 on disk (write_at + sparse alloc)" || { echo "  FAIL: /etc/hostname size=${ehsize:-?} (want 8292)"; rc=1; }
+hhsize=$(debugfs -R "stat /hello.txt" "$WORK/part-post.img" 2>/dev/null | grep -oE "Size: [0-9]+" | head -1 | grep -oE "[0-9]+")
+[ "$hhsize" = "0" ] && echo "  PASS: /hello.txt size=0 on disk (truncate)" || { echo "  FAIL: /hello.txt size=${hhsize:-?} (want 0)"; rc=1; }
+
 echo ""
 echo "=========================================="
-[ $rc -eq 0 ] && echo "ext2 WRITE smoke (W1+W2): PASS" || echo "ext2 WRITE smoke (W1+W2): FAIL"
+[ $rc -eq 0 ] && echo "ext2 WRITE smoke (W1+W2+W3): PASS" || echo "ext2 WRITE smoke (W1+W2+W3): FAIL"
 echo "Logs: $LOGS"
 echo "=========================================="
 exit $rc
