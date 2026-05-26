@@ -255,7 +255,7 @@ msc_enumerate();
 # Initialize IOMMU if DMAR table found (S10: restrict DMA)
 if (acpi_iommu_base != 0) {
     if (iommu_init() == 0) {
-        kprintln("IOMMU: VT-d enabled, DMA restricted", 36);
+        kprintln("IOMMU: VT-d enabled, DMA restricted", 35);
     } else {
         kprintln("IOMMU: init failed", 18);
     }
@@ -281,7 +281,7 @@ if (pci_find(0x1AF4, 0x1000) >= 0) {
         }
         kprintln("", 0);
         net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
-        kprintln("Net: 10.0.2.15/24 gw 10.0.2.2", 30);
+        kprintln("Net: 10.0.2.15/24 gw 10.0.2.2", 29);
         # TCP_LISTEN_SMOKE hook runs LATER (post-interrupt-enable, just
         # before kybernet launch) so arch_wait() actually waits instead
         # of HLT-hanging on no-IRQ. See the gated block ~line 660.
@@ -506,7 +506,7 @@ kprintln("", 0);
 # Create two test processes with dedicated stacks.
 # Process stacks at 0x800000 + pid * 0x10000, 64KB apart.
 # Stack grows down, so stack_top is base + size.
-kprintln("Creating test processes...", 25);
+kprintln("Creating test processes...", 26);
 
 proc_count = 0;
 proc_current = 0;

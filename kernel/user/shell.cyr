@@ -264,7 +264,7 @@ fn sh_cmd_bench() {
     t1 = rdtsc();
     kprintln("", 0);
     bench_report("  serial_putc: ", 15, t1 - t0, 1000);
-    kprintln("=== done ===", 13);
+    kprintln("=== done ===", 12);
     return 0;
 }
 

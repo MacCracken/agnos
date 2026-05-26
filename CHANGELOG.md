@@ -70,9 +70,13 @@ The user-facing surface — `echo hello > /f` works end-to-end.
 
 **Verification**: production **666,840 B** (+7,432). No regression (`ext2-smoke.sh` 5/5 — all backends still reach the shell). **W4b smoke PASS**: the canned `cat` prints **"SHELL-WROTE-IT"** back (echo-redirect created the file + wrote it through the VFS arm, cat read it); **`e2fsck -fn` clean**; host `debugfs` reads `/shdir/keep.txt` = "SHELL-WROTE-IT" off the disk image and confirms `/shtmp` **absent**. **`echo > /f` → reboot → `cat /f` now works at the QEMU level** — the demo→base experience. **Next: the W5 iron burn** (the agnos-fs partition must be re-carved write-friendly first — `mkfs` with `^metadata_csum,^64bit`, since the current `mkfs.ext4`-default partition refuses write by design via the W2 write-safety gate).
 
-### Fixed — `ext2_init` log_block_size error message length (`ext2.cyr`)
+### Fixed — `kprint` byte-length corrections (release cleanup, 5 sites)
 
-`kprintln("ext2: log_block_size out of range: ", 36)` declared length 36 for a 35-byte string — a 1-byte over-read printing one stray byte on that (rarely-hit) error path. Corrected to 35.
+`kprint`/`kprintln` take an explicit byte length; five literals had the wrong count (surfaced by a length-vs-literal audit during the cut). Four over-read by one (printing a stray trailing byte), one under-read (dropping a char):
+- `ext2.cyr` `"ext2: log_block_size out of range: "` 36 → 35 (over-read; rare error path)
+- `main.cyr` `"IOMMU: VT-d enabled, DMA restricted"` 36 → 35; `"Net: 10.0.2.15/24 gw 10.0.2.2"` 30 → 29 (over-read)
+- `main.cyr` `"Creating test processes..."` 25 → 26 (under-read — was printing `…processes..`, dropping the third dot)
+- `shell.cyr` `"=== done ==="` 13 → 12 (over-read, `bench` output)
 
 ## [1.32.9] — 2026-05-25 (DHCP re-enablement — the 1.32.3 STATIC bypass is removed and a real DHCP exchange runs again on boot. The OFFER timeout that drove the bypass across the 1.32.x arc was the r8169 unicast-RX drop **fixed at 1.32.7** (RX ring 16→64), not a DHCP-layer bug; with unicast RX delivering on iron, `dhcp_init()` can complete DISCOVER → OFFER → REQUEST → ACK. STATIC (192.168.1.222) stays as the iron fallback so a DHCP miss still leaves a usable address. QEMU/SLIRP DHCP exercised; iron verification is the next burn, user-driven.)
 
