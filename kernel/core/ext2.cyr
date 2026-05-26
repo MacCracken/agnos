@@ -1869,11 +1869,11 @@ fn ext2_dir_set_dotdot(dir_ino, new_parent) {
                 if (e_ino != 0) {
                     if (e_nl == 2) {
                         if (load8(d + 8) == 46) { if (load8(d + 9) == 46) {
-                            ext2_store32_le(&ext2_dir_buf, off, new_parent);
-                            if (ext2_csum_on != 0) { ext2_dir_tail_stamp(&ext2_dir_buf, dir_ino, dir_gen); }
-                            if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
-                            return 0;
-                        } }
+                                ext2_store32_le(&ext2_dir_buf, off, new_parent);
+                                if (ext2_csum_on != 0) { ext2_dir_tail_stamp(&ext2_dir_buf, dir_ino, dir_gen); }
+                                if (ext2_write_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+                                return 0;
+                            } }
                     }
                 }
                 off = off + e_rl;

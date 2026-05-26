@@ -65,8 +65,11 @@ PART_BLOCKS=$(( PART_BYTES / 4096 ))
 # Feature profile is parameterized (1.33.1 metadata_csum + 64bit arc, audit
 # § 14.6): the default is the 1.33.0 write-friendly stripped set; override
 # EXT2_SMOKE_FEATURES to gate a bite against a checksummed/64bit image, e.g.
-#   bite 1: EXT2_SMOKE_FEATURES="^resize_inode,^dir_index,^metadata_csum,64bit,^uninit_bg"
-#   bite 7: EXT2_SMOKE_FEATURES="^resize_inode,^dir_index,metadata_csum,64bit,^uninit_bg"
+#   64bit-only:   EXT2_SMOKE_FEATURES="^resize_inode,^dir_index,^metadata_csum,64bit,extent,^uninit_bg"
+#   csum+64bit:   EXT2_SMOKE_FEATURES="^resize_inode,^dir_index,metadata_csum,64bit,extent,^uninit_bg"
+# NOTE: `64bit` REQUIRES `extent` — mkfs errors out ("Extents MUST be enabled
+# for a 64-bit filesystem") if you enable 64bit without it. The real-partition
+# profile is `metadata_csum,64bit,extent` (matches default `mkfs.ext4`).
 # The self-test-line + e2fsck gates below are feature-agnostic, so the same
 # script proves every bite — only the image profile changes.
 EXT2_SMOKE_FEATURES="${EXT2_SMOKE_FEATURES:-^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg}"
