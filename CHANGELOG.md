@@ -15,6 +15,12 @@ First WRITE follow-on. **`ext2_rename(src_parent, src_name, dst_parent, dst_name
 
 **Fixed** — `ext2-write-smoke.sh` profile-comment corrected: the checksummed example was missing `extent`, and `mkfs` rejects `64bit` without it ("Extents MUST be enabled for a 64-bit filesystem"). The real-partition profile is `metadata_csum,64bit,extent`.
 
+### Added — bite 2: hardlink / `ln` (`ext2.cyr`, `shell.cyr`)
+
+**`ext2_link(target_ino, dst_parent, dst_name)`** — a second dirent for an existing inode + `i_links_count++`. The count is bumped FIRST, then the dirent added (rolled back on insert failure), per § 3: a crash then leaves a too-HIGH count (a harmless leak e2fsck reclaims) rather than a too-LOW count that a later unlink could drive to 0 and free a still-referenced inode. Refuses directory hardlinks (would break the tree) + dst-exists. `ext2_unlink` already decrements-and-conditionally-frees, so a multi-link file unwinds correctly when one name is removed. Plus the **`ln SRC NEWNAME` shell verb** (SRC resolved to an inode before the dst path reuses `sh_path_buf`).
+
+**Verified** — `ext2-write-smoke.sh` on `metadata_csum,64bit,extent`: `Whard link` (hardlink → unlink one name → the other survives, nlink 2→1) + `Whard refuse-dir` (dir hardlink refused) OK; **`e2fsck -fn` clean incl. Pass-4 link accounting**; host `debugfs` confirms `/hl_b.txt`="HL" survives the unlink of `/hl_a.txt`, and `/hl_d2` is absent (dir hardlink refused). No regression. Build 682,952 → **686,576 B**.
+
 ## [1.33.2] — 2026-05-25 (lockup-hardening — bench + serial stability. A reported lockup at the **idle shell, a few seconds–to–a-minute *after* `bench` completes** (not during) prompted fixes for the three small unbounded/unguarded spots in the bench + serial path — concrete defects that could leave corrupted state for the per-tick scheduler to trip later. Cut and released on its own as the stability fix. The ext2/ext4 WRITE follow-ons (rename / hardlink / symlink-create + `s_state`/`sync`) originally scoped under this number **moved to 1.33.3** — see that entry and [`iron-nuc-zen-log.md#tracker-1333-cycle`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md#tracker-1333-cycle).)
 
 ### Fixed — lockup-hardening: bounded serial poll + bench memory guards

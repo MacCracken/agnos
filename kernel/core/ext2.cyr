@@ -1958,6 +1958,46 @@ fn ext2_rename(src_parent, src_name, src_nl, dst_parent, dst_name, dst_nl) {
     return 0;
 }
 
+# === hardlink / ln (WRITE arc 1.33.3 — bite 2) =======================
+#
+# Hard-link `dst_name` in `dst_parent` to the existing inode `target_ino`:
+# a second dirent for one inode + i_links_count++. Refuses directories
+# (dir hardlinks break the tree — e2fsck cuts them) and an already-existing
+# dst name. Order (doc § 3): bump the link count FIRST, then add the dirent,
+# so a crash leaves a too-HIGH count (a harmless leak e2fsck reclaims) rather
+# than a too-LOW count that a later unlink could drive to 0 and free a still-
+# referenced inode (a dangling-pointer corruption). ext2_unlink already
+# decrements-and-conditionally-frees, so it unwinds a multi-link file cleanly.
+# Returns 0 / -1.
+fn ext2_link(target_ino, dst_parent, dst_name, dst_nl) {
+    if (ext2_write_ok == 0) { return 0 - 1; }
+    if (target_ino <= 0) { return 0 - 1; }
+    if (ext2_get_inode(target_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    var tmode = ext2_inode_mode(&ext2_inode_buf);
+    if ((tmode & 0xF000) == 0x4000) { return 0 - 1; }    # refuse dir hardlink
+    var ftype = ext2_ftype_from_mode(tmode);
+
+    # refuse if the destination name already exists
+    var ex = ext2_dir_lookup(dst_parent, dst_name, dst_nl);
+    if (ex != 0) { return 0 - 1; }                       # >0 exists, <0 error
+
+    # bump link count first (re-fetch — dir_lookup clobbered the buffer)
+    if (ext2_get_inode(target_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    var nl = ext2_inode_links_count(&ext2_inode_buf) + 1;
+    ext2_inode_set_links_count(&ext2_inode_buf, nl);
+    if (ext2_put_inode(target_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+
+    # add the dirent; on failure roll the link count back
+    if (ext2_dir_insert(dst_parent, dst_name, dst_nl, target_ino, ftype) != 0) {
+        if (ext2_get_inode(target_ino, &ext2_inode_buf) == 0) {
+            ext2_inode_set_links_count(&ext2_inode_buf, nl - 1);
+            ext2_put_inode(target_ino, &ext2_inode_buf);
+        }
+        return 0 - 1;
+    }
+    return 0;
+}
+
 # --- Path lookup (Phase 3) --------------------------------------------
 #
 # Resolves an absolute path "/foo/bar/baz" to an inode number, walking
@@ -2638,6 +2678,38 @@ fn ext2_write_selftest() {
     if (ext2_path_lookup("/rny.txt", 8) <= 0) { wre = 0; }         # dst untouched
     if (wre == 1) { kprintln("ext2w: Wren refuse OK", 21); }
     else          { kprintln("ext2w: Wren refuse MISMATCH", 27); }
+
+    # === Whardlink: ln (1.33.3 bite 2) ===
+    # create /hl_a.txt (marker "HL"), hardlink to /hl_b.txt → same inode +
+    # nlink 2; unlink /hl_a.txt → nlink 1, /hl_b.txt survives (kept for host).
+    var whl = 1;
+    var hla = ext2_create(2, "hl_a.txt", 8);
+    if (hla <= 0) { whl = 0; }
+    if (hla > 0) { ext2_write_at(hla, 0, "HL", 2); }
+    if (ext2_link(hla, 2, "hl_b.txt", 8) != 0) { whl = 0; }
+    if (ext2_path_lookup("/hl_b.txt", 9) != hla) { whl = 0; }       # same inode
+    if (hla > 0) {
+        if (ext2_get_inode(hla, &ext2_inode_buf) != 0) { whl = 0; }
+        else { if (ext2_inode_links_count(&ext2_inode_buf) != 2) { whl = 0; } }
+    }
+    if (ext2_unlink(2, "hl_a.txt", 8) != 0) { whl = 0; }            # drop one link
+    if (ext2_path_lookup("/hl_a.txt", 9) != 0) { whl = 0; }         # old name gone
+    if (ext2_path_lookup("/hl_b.txt", 9) != hla) { whl = 0; }       # other survives
+    if (hla > 0) {
+        if (ext2_get_inode(hla, &ext2_inode_buf) != 0) { whl = 0; }
+        else { if (ext2_inode_links_count(&ext2_inode_buf) != 1) { whl = 0; } }
+    }
+    if (whl == 1) { kprintln("ext2w: Whard link OK", 20); }
+    else          { kprintln("ext2w: Whard link MISMATCH", 26); }
+
+    # refuse a directory hardlink (would create a `..`-less second parent ref)
+    var whd = 1;
+    var hld = ext2_mkdir(2, "hl_d", 4);
+    if (hld <= 0) { whd = 0; }
+    if (ext2_link(hld, 2, "hl_d2", 5) == 0) { whd = 0; }            # must REFUSE
+    if (ext2_path_lookup("/hl_d2", 6) != 0) { whd = 0; }            # no entry made
+    if (whd == 1) { kprintln("ext2w: Whard refuse-dir OK", 26); }
+    else          { kprintln("ext2w: Whard refuse-dir MISMATCH", 32); }
 
     return 0;
 }

@@ -526,6 +526,38 @@ fn sh_cmd_mv(arg, arglen) {
     return 0;
 }
 
+# `ln SRC NEWNAME` — hard-link (1.33.3 bite 2). SRC must exist; resolve it
+# to an inode BEFORE the second sh_abspath reuses sh_path_buf for NEWNAME.
+fn sh_cmd_ln(arg, arglen) {
+    if (ext2_active == 0) { kprintln("ln: no fs", 9); return 0; }
+    sh_trim(arg, arglen);
+    if (sh_trim_len < 1) { kprintln("usage: ln <src> <newname>", 25); return 0; }
+    var ts = arg + sh_trim_off;
+    var tl = sh_trim_len;
+    var sp = 0 - 1;
+    var i = 0;
+    while (i < tl) { if (load8(ts + i) == 32) { sp = i; break; } i = i + 1; }
+    if (sp < 0) { kprintln("usage: ln <src> <newname>", 25); return 0; }
+    var doff = sp + 1;
+    while (doff < tl) { if (load8(ts + doff) != 32) { break; } doff = doff + 1; }
+    if (doff >= tl) { kprintln("usage: ln <src> <newname>", 25); return 0; }
+
+    # resolve SRC → existing inode (scalar, survives the next sh_abspath)
+    if (sh_abspath(ts, sp) < 0) { kprintln("ln: bad src path", 16); return 0; }
+    var src_ino = ext2_path_lookup(&sh_path_buf, sh_path_len);
+    if (src_ino <= 0) { kprintln("ln: no such src", 15); return 0; }
+
+    # resolve NEWNAME → parent + basename (left in sh_path_buf)
+    if (sh_abspath(ts + doff, tl - doff) < 0) { kprintln("ln: bad dst path", 16); return 0; }
+    var dst_parent = sh_split_parent(sh_path_len);
+    if (dst_parent <= 0) { kprintln("ln: no such dst directory", 25); return 0; }
+
+    if (ext2_link(src_ino, dst_parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) {
+        kprintln("ln: failed (dir / dst exists?)", 30);
+    }
+    return 0;
+}
+
 # `echo TEXT > FILE` — write TEXT + newline to FILE (create or truncate).
 # `text`/`textlen` = the bytes before '>'; `fname`/`fnamelen` = after.
 fn sh_echo_redirect(text, textlen, fname, fnamelen) {
@@ -599,6 +631,7 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "mkdir", 5) == 1) { return sh_cmd_mkdir(arg, arglen); }
     if (sh_streq(buf, clen, "rmdir", 5) == 1) { return sh_cmd_rmdir(arg, arglen); }
     if (sh_streq(buf, clen, "mv", 2) == 1)    { return sh_cmd_mv(arg, arglen); }
+    if (sh_streq(buf, clen, "ln", 2) == 1)    { return sh_cmd_ln(arg, arglen); }
     if (sh_streq(buf, clen, "lspci", 5) == 1) {
         for (var i = 0; i < pci_count; i = i + 1) {
             var base = &pci_devs + i * 32;

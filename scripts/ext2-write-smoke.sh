@@ -245,6 +245,16 @@ for wr in "Wren file" "Wren xdir" "Wren refuse"; do
     fi
 done
 
+# Whardlink: ln (1.33.3 bite 2) — second dirent + i_links_count++; unlink
+# one link leaves the other; dir-hardlink refused.
+for wh in "Whard link" "Whard refuse-dir"; do
+    if strings "$LOG" | grep -q "ext2w: $wh OK"; then
+        echo "  PASS: $wh"
+    else
+        echo "  FAIL: $wh"; rc=1
+    fi
+done
+
 # W4b: shell write verbs driven headlessly via sh_exec. The proof is the
 # `cat` of the echo-redirected file printing "SHELL-WROTE-IT" back.
 if strings "$LOG" | grep -q "SHELL-WROTE-IT"; then
@@ -323,6 +333,21 @@ if debugfs -R "stat /rnd" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
     echo "  FAIL: /rnd still present in root (dir move didn't remove old entry)"; rc=1
 else
     echo "  PASS: /rnd absent from root (dir move removed old entry)"
+fi
+
+# Whardlink host verification: /hl_b.txt survives the unlink of /hl_a.txt
+# with content intact (link count handled); /hl_a.txt gone; no /hl_d2.
+hlb=$(debugfs -R "cat /hl_b.txt" "$WORK/part-post.img" 2>/dev/null)
+[ "$hlb" = "HL" ] && echo "  PASS: /hl_b.txt = \"HL\" on disk (hardlink survived unlink of other name)" || { echo "  FAIL: /hl_b.txt='$hlb' (want HL)"; rc=1; }
+if debugfs -R "stat /hl_a.txt" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
+    echo "  FAIL: /hl_a.txt still present (unlinked hardlink name persisted)"; rc=1
+else
+    echo "  PASS: /hl_a.txt absent on disk (unlinked hardlink name removed)"
+fi
+if debugfs -R "stat /hl_d2" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
+    echo "  FAIL: /hl_d2 present (dir hardlink was not refused)"; rc=1
+else
+    echo "  PASS: /hl_d2 absent on disk (dir hardlink refused)"
 fi
 if debugfs -R "stat /shtmp" "$WORK/part-post.img" 2>&1 | grep -q "Inode:"; then
     echo "  FAIL: /shtmp still present (shell rm didn't persist)"; rc=1
