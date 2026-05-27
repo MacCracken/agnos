@@ -127,6 +127,14 @@ else
     fail=$((fail + 1))
 fi
 
+if grep -q "tcp: wnd PASS" "$LOG"; then
+    echo "PASS: B4 peer-window send-chunk sizing (cap + zero-window persist)"
+    pass=$((pass + 1))
+else
+    echo "FAIL: 'tcp: wnd PASS' not found — window-honoring regression"
+    fail=$((fail + 1))
+fi
+
 echo ""
 echo "=== tcp-smoke: $pass passed, $fail failed ==="
 [ "$fail" -eq 0 ] && exit 0

@@ -1125,6 +1125,18 @@ fn tcp_eff_mss(peer_mss) {
     return m;
 }
 
+# Next send-chunk size (B3 + B4): bounded by remaining bytes, the effective MSS,
+# and the peer's usable window `wnd`. A zero window returns 1 — the single-byte
+# persist probe (RFC 9293 §3.8.6.1). (One in flight, so the usable window is
+# the peer's advertised window with no in-flight subtraction.)
+fn tcp_send_chunk(remaining, mss, wnd) {
+    var c = remaining;
+    if (c > mss) { c = mss; }
+    if (wnd == 0) { return 1; }
+    if (c > wnd) { c = wnd; }
+    return c;
+}
+
 fn tcp_checksum_compute(src_ip, dst_ip, tcp_buf, tcp_len) {
     # Pseudo-header: src_ip(4) + dst_ip(4) + zero(1) + proto(1) + tcp_len(2)
     var sum = 0;
@@ -1360,8 +1372,8 @@ fn tcp_send(conn_id, data, len) {
     if (mss < 1) { mss = TCP_MSS_DEFAULT; }
     var sent = 0;
     while (sent < len) {
-        var chunk = len - sent;
-        if (chunk > mss) { chunk = mss; }
+        # B3 MSS + B4 peer-window cap (zero window → 1-byte persist probe).
+        var chunk = tcp_send_chunk(len - sent, mss, load64(cb + 88));
         var seq = load64(cb + 32);
         tcp_send_pkt(conn_id, 0x18, data + sent, chunk);   # PSH+ACK
         store64(cb + 32, (seq + chunk) & 0xFFFFFFFF);
@@ -1602,6 +1614,10 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
     var cb = tcp_conn_base(conn_id);
     var state = load64(cb);
     var data_len = ip_payload_len - tcp_hdr_len;
+    # B4: capture the peer's advertised window from every inbound segment (the
+    # window field is always valid — incl. the SYN-ACK, so it's set before our
+    # first send). tcp_send honors this as the usable send window.
+    store64(cb + 88, (load8(tcp + 14) << 8) | load8(tcp + 15));
     # B2: an inbound ACK that covers our held (oldest unACKed) segment advances
     # SND.UNA and disarms the retransmit. seqlen counts the SYN/FIN phantom byte.
     # The `< 0x40000000` guard rejects wrapped dup-acks (ack <= retx_seq).
@@ -1675,8 +1691,7 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         # only a segment starting exactly there is accepted (no out-of-order
         # reassembly queue in v1 — see tcp-hardening-prior-art.md § 4).
         var expected = load64(cb + 40);
-        # Track the peer's advertised window (reserved for B4 send-side flow ctl).
-        store64(cb + 88, (load8(tcp + 14) << 8) | load8(tcp + 15));
+        # (peer window already captured at the top of this handler — B4)
         if (data_len > 0) {
             if (seq == expected) {
                 # Append into the ring (flow-control-clamped + wrapped), advance
