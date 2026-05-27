@@ -191,7 +191,7 @@ ok_host=0
 if strings "$LOG_1" | grep -qE "tcp_accept: conn_id="; then
     ok_kernel=1
 fi
-if [ -f "$NC_OUT_1" ] && grep -q "AGNOS 1.32.0 tcp_listen smoke" "$NC_OUT_1"; then
+if [ -f "$NC_OUT_1" ] && grep -q "tcp_listen smoke" "$NC_OUT_1"; then
     ok_host=1
 fi
 if [ "$ok_kernel" = "1" ] && [ "$ok_host" = "1" ]; then

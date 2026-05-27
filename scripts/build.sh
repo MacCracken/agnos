@@ -120,6 +120,9 @@ else
     #                     checksum self-verify (a valid ICMP message sums to
     #                     0) + a best-effort gateway ping. Gated by
     #                     scripts/icmp-smoke.sh.
+    #   TCP_SELFTEST=1   — boot-time TCP receive-ring self-test (1.35.1 B1):
+    #                     hermetic FIFO-order + buffer-wrap reassembly check on
+    #                     the in-order ring. Gated by scripts/tcp-smoke.sh.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -138,6 +141,7 @@ else
         [ -n "$FAT_ALLOW_ESP_WRITE" ] && echo '#define FAT_ALLOW_ESP_WRITE'
         [ -n "$DNS_SELFTEST" ]   && echo '#define DNS_SELFTEST'
         [ -n "$ICMP_SELFTEST" ]  && echo '#define ICMP_SELFTEST'
+        [ -n "$TCP_SELFTEST" ]   && echo '#define TCP_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

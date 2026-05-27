@@ -975,22 +975,33 @@ fn net_recv_udp(buf, maxlen) {
 # === TCP Stack ===
 # States: 0=CLOSED, 1=SYN_SENT, 2=ESTABLISHED, 3=FIN_WAIT, 4=CLOSE_WAIT,
 #         5=LISTEN, 6=SYN_RCVD  (added 1.32.0 bite A — server-side TCP)
-# Connection table: 8 entries, each 80 bytes:
-#   offset 0:  state (8 bytes)
-#   offset 8:  src_port (8 bytes)    - on LISTEN: the listening port
-#   offset 16: dst_port (8 bytes)    - on LISTEN: 0 (wildcard)
-#   offset 24: dst_ip (8 bytes)      - on LISTEN: 0 (wildcard)
-#   offset 32: seq_num (8 bytes)
-#   offset 40: ack_num (8 bytes)
-#   offset 48: rx_buf pointer (8 bytes)
-#   offset 56: rx_buf_len (8 bytes)
-#   offset 64: rx_buf_head (8 bytes)  - write position
-#   offset 72: flags (8 bytes) - meta packed in upper bits:
+# Connection table: 8 entries, each 128 bytes (grown 80 → 128 at 1.35.1 B0
+# for TCP hardening — the original 10 slots were full). Offsets 0-72 keep
+# their 1.32.0 meaning; 56 was the vestigial single-segment `rx_buf_len`
+# (the 1.35.1 B1 in-order ring replaced it) and is repurposed for SND.UNA.
+#   offset 0:   state (8 bytes)
+#   offset 8:   src_port (8 bytes)    - on LISTEN: the listening port
+#   offset 16:  dst_port (8 bytes)    - on LISTEN: 0 (wildcard)
+#   offset 24:  dst_ip (8 bytes)      - on LISTEN: 0 (wildcard)
+#   offset 32:  seq_num / SND.NXT (8 bytes)  - next seq to send
+#   offset 40:  ack_num / RCV.NXT (8 bytes)  - next seq expected (in-order)
+#   offset 48:  rx_buf — receive RING base ptr (TCP_RX_RING bytes, kmalloc'd)
+#   offset 56:  SND.UNA (8 bytes) — oldest unACKed seq (reserved; B2 retransmit)
+#   offset 64:  rx_write (8 bytes) — cumulative bytes written into the ring
+#   offset 72:  flags (8 bytes) - meta packed in upper bits:
 #     bits 0-7:   last received TCP flags byte (existing use)
 #     bit 8:      is_listening (set on LISTEN entries)
 #     bit 9:      passive_open (set on conns spawned from a LISTEN)
 #     bit 10:     accepted (set when tcp_accept returned this conn to caller)
 #     bits 16-23: parent_listen_id (only meaningful when bit 9 is set)
+#   offset 80:  rx_read (8 bytes) — cumulative bytes drained by tcp_recv
+#   offset 88:  SND.WND (8 bytes) — peer's last-advertised window (reserved; B4)
+#   offset 96:  retx_seq (8 bytes) — reserved (B2 retransmit)
+#   offset 104: retx_len (8 bytes) — reserved (B2)
+#   offset 112: retx_tick (8 bytes) — reserved (B2)
+#   offset 120: retx_count (8 bytes) — reserved (B2)
+# Ring occupancy = rx_write - rx_read; free = TCP_RX_RING - occupancy; the
+# advertised window is that free count (B1 — no longer the hardcoded 8192).
 
 # State constants (kept in this file as `var` globals; the existing state
 # branches use bare integer literals for historical reasons. New code paths
@@ -1009,12 +1020,48 @@ var TCP_FLAG_PASSIVE_OPEN = 0x200;   # bit 9
 var TCP_FLAG_ACCEPTED     = 0x400;   # bit 10
 # parent_listen_id occupies bits 16-23 — see tcp_meta_set_parent / tcp_meta_get_parent
 
-var tcp_conns[640];  # 8 connections x 80 bytes each
+var tcp_conns[640];  # ≥ 8 connections x 128 bytes (module-global var[N] = N×8 B = 5120 B)
 var tcp_conn_count = 0;
 var tcp_rx_tmpbuf[256];
+# Per-connection receive ring size (B1). 2048 fits the 16-bit window field
+# and the heap's 2048-byte slab class; 8× this is the worst-case TCP rx heap.
+var TCP_RX_RING = 2048;
 
 fn tcp_conn_base(conn_id) {
-    return &tcp_conns + conn_id * 80;
+    return &tcp_conns + conn_id * 128;
+}
+
+# Receive-ring free space (B1) — TCP_RX_RING minus current occupancy. This is
+# the value advertised as the TCP window, so the peer never sends more than we
+# can hold (replaces the 1.32.0 hardcoded 8192-with-a-248-byte-buffer lie).
+fn tcp_rx_free(cb) {
+    var occ = load64(cb + 64) - load64(cb + 80);   # rx_write - rx_read
+    var free = TCP_RX_RING - occ;
+    if (free < 0) { free = 0; }
+    return free;
+}
+
+# Append up to `len` bytes from `src` into the conn's receive ring, clamped to
+# free space (flow control) and wrapped at the ring boundary. Advances
+# rx_write; returns bytes actually taken. TCP_RX_RING is a power of two, so the
+# position is a mask, not a modulo.
+fn tcp_rx_append(cb, src, len) {
+    var rx_buf = load64(cb + 48);
+    if (rx_buf == 0) { return 0; }
+    var take = len;
+    var free = tcp_rx_free(cb);
+    if (take > free) { take = free; }
+    if (take <= 0) { return 0; }
+    var rxw = load64(cb + 64);
+    var wpos = rxw & (TCP_RX_RING - 1);
+    var first = TCP_RX_RING - wpos;        # contiguous room to end of ring
+    if (first > take) { first = take; }
+    net_copy_buf(rx_buf + wpos, src, first);
+    if (take > first) {
+        net_copy_buf(rx_buf, src + first, take - first);
+    }
+    store64(cb + 64, rxw + take);          # advance rx_write
+    return take;
 }
 
 fn tcp_checksum_compute(src_ip, dst_ip, tcp_buf, tcp_len) {
@@ -1096,9 +1143,12 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     nic_mac(&kmac);   # FIX #1
     var p = &net_pkt;
     var off = eth_build(p, &dst_mac, &kmac, 0x0800);
-    # Build TCP header after IP header space (20 bytes)
+    # Build TCP header after IP header space (20 bytes). Advertise the real
+    # receive-ring free space (B1) — not the old hardcoded 8192.
     var tcp_off = off + 20;
-    var tcp_hdr_len = tcp_build_header(p + tcp_off, src_port, dst_port, seq, ack, flags, 8192);
+    var win = tcp_rx_free(cb);
+    if (win > 65535) { win = 65535; }
+    var tcp_hdr_len = tcp_build_header(p + tcp_off, src_port, dst_port, seq, ack, flags, win);
     # Copy data after TCP header
     memcpy(p + tcp_off + tcp_hdr_len, data, data_len);
     var tcp_total = tcp_hdr_len + data_len;
@@ -1116,24 +1166,31 @@ fn tcp_connect(dst_ip, dst_port, src_port) {
     var conn_id = tcp_conn_count;
     tcp_conn_count = tcp_conn_count + 1;
     var cb = tcp_conn_base(conn_id);
-    # Allocate per-connection RX buffer (S5: prevent shared-buffer corruption)
-    var rx_buf = kmalloc(256);
+    # Allocate per-connection receive RING (S5: prevent shared-buffer corruption)
+    var rx_buf = kmalloc(TCP_RX_RING);
     if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0 - 1; }
+    # Use timer_ticks for initial seq randomization (reduces spoofing risk)
+    var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
     store64(cb, 1);             # state = SYN_SENT
     store64(cb + 8, src_port);
     store64(cb + 16, dst_port);
     store64(cb + 24, dst_ip);
-    # Use timer_ticks for initial seq randomization (reduces spoofing risk)
-    store64(cb + 32, (timer_ticks * 64017 + 1) & 0xFFFFFFFF);  # initial seq
-    store64(cb + 40, 0);        # ack_num
-    store64(cb + 48, rx_buf);   # per-connection rx_buf
-    store64(cb + 56, 0);        # rx_buf_len
-    store64(cb + 64, 0);        # rx_buf_head
+    store64(cb + 32, isn);      # SND.NXT (initial seq)
+    store64(cb + 40, 0);        # RCV.NXT (set when SYN-ACK arrives)
+    store64(cb + 48, rx_buf);   # receive ring base
+    store64(cb + 56, isn);      # SND.UNA = isn
+    store64(cb + 64, 0);        # rx_write
     store64(cb + 72, 0);        # flags
+    store64(cb + 80, 0);        # rx_read
+    store64(cb + 88, 0);        # SND.WND (peer window; learned on SYN-ACK)
+    store64(cb + 96, 0);        # retx_seq   (B2)
+    store64(cb + 104, 0);       # retx_len   (B2)
+    store64(cb + 112, 0);       # retx_tick  (B2)
+    store64(cb + 120, 0);       # retx_count (B2)
     # Send SYN (flags = 0x02)
     tcp_send_pkt(conn_id, 0x02, 0, 0);
-    # Advance seq by 1 (SYN consumes a sequence number)
-    var isn = load64(cb + 32);
+    # Advance SND.NXT by 1 (SYN consumes a sequence number); SND.UNA stays at
+    # isn until the SYN is ACKed.
     store64(cb + 32, (isn + 1) & 0xFFFFFFFF);
     # Wait for SYN-ACK (poll a few times)
     for (var i = 0; i < 200; i = i + 1) {
@@ -1168,16 +1225,27 @@ fn tcp_recv(conn_id, buf, maxlen) {
     # Poll for packets
     net_poll();
     var cb = tcp_conn_base(conn_id);
-    var rx_len = load64(cb + 56);
-    if (rx_len == 0) { return 0; }
     var rx_buf = load64(cb + 48);
     if (rx_buf == 0) { return 0; }
-    var copy_len = rx_len;
-    if (copy_len > maxlen) { copy_len = maxlen; }
-    net_copy_buf(buf, rx_buf, copy_len);
-    store64(cb + 56, 0);
-    store64(cb + 64, 0);
-    return copy_len;
+    # B1 ring drain (FIFO): available = rx_write - rx_read.
+    var rxw = load64(cb + 64);
+    var rxr = load64(cb + 80);
+    var avail = rxw - rxr;
+    if (avail <= 0) { return 0; }
+    var take = avail;
+    if (take > maxlen) { take = maxlen; }
+    var rpos = rxr & (TCP_RX_RING - 1);
+    var first = TCP_RX_RING - rpos;        # contiguous bytes to end of ring
+    if (first > take) { first = take; }
+    net_copy_buf(buf, rx_buf + rpos, first);
+    if (take > first) {
+        net_copy_buf(buf + first, rx_buf, take - first);
+    }
+    store64(cb + 80, rxr + take);          # advance rx_read
+    # Draining freed ring space → send a window-update ACK so a peer that
+    # stalled on a small/zero window resumes (keeps large streams flowing).
+    if (load64(cb) == 2) { tcp_send_pkt(conn_id, 0x10, 0, 0); }
+    return take;
 }
 
 fn tcp_close(conn_id) {
@@ -1198,10 +1266,10 @@ fn tcp_close(conn_id) {
         tcp_send_pkt(conn_id, 0x11, 0, 0);
         store64(cb, 0);  # CLOSED
     }
-    # Free per-connection RX buffer
+    # Free per-connection receive ring
     var rx_buf = load64(cb + 48);
     if (rx_buf != 0) {
-        kfree_sized(rx_buf, 256);
+        kfree_sized(rx_buf, TCP_RX_RING);
         store64(cb + 48, 0);
     }
     return 0;
@@ -1237,9 +1305,15 @@ fn tcp_listen(port) {
     store64(cb + 32, 0);        # seq_num unused on LISTEN
     store64(cb + 40, 0);        # ack_num unused on LISTEN
     store64(cb + 48, 0);        # rx_buf unused on LISTEN
-    store64(cb + 56, 0);        # rx_buf_len unused
-    store64(cb + 64, 0);        # rx_buf_head unused
+    store64(cb + 56, 0);        # SND.UNA unused
+    store64(cb + 64, 0);        # rx_write unused
     store64(cb + 72, 0x100);    # flags = TCP_FLAG_IS_LISTENING
+    store64(cb + 80, 0);        # rx_read unused
+    store64(cb + 88, 0);        # SND.WND unused
+    store64(cb + 96, 0);        # retx_seq unused
+    store64(cb + 104, 0);       # retx_len unused
+    store64(cb + 112, 0);       # retx_tick unused
+    store64(cb + 120, 0);       # retx_count unused
     return conn_id;
 }
 
@@ -1320,23 +1394,29 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         var new_id = tcp_conn_count;
         tcp_conn_count = tcp_conn_count + 1;
         var ncb = tcp_conn_base(new_id);
-        # Per-connection RX buffer (matches active tcp_connect path).
-        var rx_buf = kmalloc(256);
+        # Per-connection receive ring (matches active tcp_connect path).
+        var rx_buf = kmalloc(TCP_RX_RING);
         if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0; }
+        # ISN — same timer-driven random as tcp_connect.
+        var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
         store64(ncb, 6);                       # state = SYN_RCVD
         store64(ncb + 8, dst_port);            # our src_port = listener's port
         store64(ncb + 16, src_port);           # peer's port
         store64(ncb + 24, src_ip);             # peer's IP
-        # ISN — same timer-driven random as tcp_connect.
-        var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
-        store64(ncb + 32, isn);                # our initial seq
-        store64(ncb + 40, (seq + 1) & 0xFFFFFFFF);  # ack their SYN+1
-        store64(ncb + 48, rx_buf);
-        store64(ncb + 56, 0);
-        store64(ncb + 64, 0);
+        store64(ncb + 32, isn);                # SND.NXT (our initial seq)
+        store64(ncb + 40, (seq + 1) & 0xFFFFFFFF);  # RCV.NXT = their SYN+1
+        store64(ncb + 48, rx_buf);             # receive ring base
+        store64(ncb + 56, isn);                # SND.UNA = isn
+        store64(ncb + 64, 0);                  # rx_write
         # meta: passive_open + parent_listen_id<<16
         var meta = 0x200 | ((listen_id & 0xFF) << 16);
         store64(ncb + 72, meta);
+        store64(ncb + 80, 0);                  # rx_read
+        store64(ncb + 88, 0);                  # SND.WND (learned on the ACK)
+        store64(ncb + 96, 0);                  # retx_seq   (B2)
+        store64(ncb + 104, 0);                 # retx_len   (B2)
+        store64(ncb + 112, 0);                 # retx_tick  (B2)
+        store64(ncb + 120, 0);                 # retx_count (B2)
         # Send SYN+ACK (0x12).
         tcp_send_pkt(new_id, 0x12, 0, 0);
         # Advance seq by 1 (SYN consumes one sequence number).
@@ -1394,33 +1474,33 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
             store64(cb, 0);  # RST -> CLOSED
             return 1;
         }
-        # Security: validate sequence number is within receive window
-        var expected_seq = load64(cb + 40);
-        var seq_diff = (seq - expected_seq) & 0xFFFFFFFF;
-        if (seq_diff >= 8192) {
-            # Outside receive window — drop packet (unless pure ACK with no data)
-            if (data_len > 0) { return 0; }
-            if ((flags & 0x01) != 0) { return 0; }  # FIN outside window
-        }
+        # B1 in-order receive ring. RCV.NXT (cb+40) is the next byte we expect;
+        # only a segment starting exactly there is accepted (no out-of-order
+        # reassembly queue in v1 — see tcp-hardening-prior-art.md § 4).
+        var expected = load64(cb + 40);
+        # Track the peer's advertised window (reserved for B4 send-side flow ctl).
+        store64(cb + 88, (load8(tcp + 14) << 8) | load8(tcp + 15));
         if (data_len > 0) {
-            # Security: cap at per-connection buffer size (256 bytes)
-            if (data_len > 248) { data_len = 248; }
-            # Store data in per-connection rx buffer
-            var rx_buf = load64(cb + 48);
-            if (rx_buf != 0) {
-                net_copy_buf(rx_buf, tcp + tcp_hdr_len, data_len);
+            if (seq == expected) {
+                # Append into the ring (flow-control-clamped + wrapped), advance
+                # RCV.NXT by the bytes actually accepted.
+                var took = tcp_rx_append(cb, tcp + tcp_hdr_len, data_len);
+                store64(cb + 40, (expected + took) & 0xFFFFFFFF);
             }
-            store64(cb + 56, data_len);
-            # Update ack
-            store64(cb + 40, seq + data_len);
-            # Send ACK
+            # ACK either way: in-order advances RCV.NXT; out-of-order / a
+            # retransmit of already-acked bytes re-sends the cumulative ACK so
+            # the peer retransmits the gap. The ACK carries our live window.
             tcp_send_pkt(conn_id, 0x10, 0, 0);
         }
         if ((flags & 0x01) != 0) {
-            # FIN received
-            store64(cb + 40, seq + 1);
-            tcp_send_pkt(conn_id, 0x10, 0, 0);
-            store64(cb, 4);  # CLOSE_WAIT
+            # FIN — honor only when it is the next in-order byte (seq+data_len
+            # == RCV.NXT); otherwise it sits beyond a gap and the peer resends.
+            var rcv = load64(cb + 40);
+            if (((seq + data_len) & 0xFFFFFFFF) == rcv) {
+                store64(cb + 40, (rcv + 1) & 0xFFFFFFFF);
+                tcp_send_pkt(conn_id, 0x10, 0, 0);
+                store64(cb, 4);  # CLOSE_WAIT
+            }
         }
         # Preserve upper-bit metadata (is_listening/passive_open/accepted/
         # parent_listen_id at bits 8-23); only the low byte tracks received

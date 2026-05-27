@@ -1325,6 +1325,63 @@ if (vnet_active != 0 || nic_ready() != 0) {
 }
 #endif
 
+#ifdef TCP_SELFTEST
+# TCP receive-ring self-test (1.35.1 B1). Hermetic: builds a fake ESTABLISHED
+# conn and exercises tcp_rx_append + tcp_recv for (a) FIFO byte order and
+# (b) a buffer wrap, asserting byte-exact delivery. Proves the in-order ring
+# that replaced the 1.32.0 overwrite-latest path (which silently truncated
+# any multi-segment stream). Zero network dependency.
+{
+    var cid = tcp_conn_count;
+    var cb = tcp_conn_base(cid);
+    var ring = kmalloc(TCP_RX_RING);
+    if (ring == 0) {
+        kprintln("tcp: ring FAIL", 14);
+    } else {
+        tcp_conn_count = tcp_conn_count + 1;
+        store64(cb, 2);                 # ESTABLISHED
+        store64(cb + 8, 0xEEEE); store64(cb + 16, 0xEEEE); store64(cb + 24, 0);
+        store64(cb + 32, 0); store64(cb + 40, 0); store64(cb + 48, ring);
+        store64(cb + 56, 0); store64(cb + 64, 0); store64(cb + 72, 0);
+        store64(cb + 80, 0); store64(cb + 88, 0); store64(cb + 96, 0);
+        store64(cb + 104, 0); store64(cb + 112, 0); store64(cb + 120, 0);
+
+        var src[64];
+        var dbuf[64];
+        var ok = 1;
+
+        # Phase 1 — FIFO order, no wrap: append 20 'A' then 20 'B', drain 40.
+        memset(&src, 0x41, 20);
+        if (tcp_rx_append(cb, &src, 20) != 20) { ok = 0; }
+        memset(&src, 0x42, 20);
+        if (tcp_rx_append(cb, &src, 20) != 20) { ok = 0; }
+        if (tcp_recv(cid, &dbuf, 40) != 40) { ok = 0; }
+        if (load8(&dbuf + 0) != 0x41) { ok = 0; }
+        if (load8(&dbuf + 19) != 0x41) { ok = 0; }
+        if (load8(&dbuf + 20) != 0x42) { ok = 0; }
+        if (load8(&dbuf + 39) != 0x42) { ok = 0; }
+
+        # Phase 2 — wrap: reposition the cursors 8 bytes shy of the ring end,
+        # append 32 'C' (8 land at the tail, 24 wrap to the head), drain 32.
+        store64(cb + 64, 2040); store64(cb + 80, 2040);
+        memset(&src, 0x43, 32);
+        if (tcp_rx_append(cb, &src, 32) != 32) { ok = 0; }
+        if (tcp_recv(cid, &dbuf, 32) != 32) { ok = 0; }
+        if (load8(&dbuf + 0) != 0x43) { ok = 0; }
+        if (load8(&dbuf + 7) != 0x43) { ok = 0; }    # last byte before wrap
+        if (load8(&dbuf + 8) != 0x43) { ok = 0; }    # first byte after wrap
+        if (load8(&dbuf + 31) != 0x43) { ok = 0; }
+
+        if (ok == 1) { kprintln("tcp: ring PASS", 14); }
+        if (ok == 0) { kprintln("tcp: ring FAIL", 14); }
+
+        kfree_sized(ring, TCP_RX_RING);
+        store64(cb + 48, 0); store64(cb, 0);
+        tcp_conn_count = tcp_conn_count - 1;
+    }
+}
+#endif
+
 #ifdef TCP_LISTEN_SMOKE
 # TCP server-side smoke (1.32.0 bite A). Validates that:
 #   - tcp_listen(port) allocates a LISTEN slot
