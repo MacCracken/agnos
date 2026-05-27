@@ -126,6 +126,9 @@ else
     #   NTP_SELFTEST=1   — boot-time SNTP parse self-test (1.35.x): hermetic
     #                     transmit-timestamp → Unix epoch conversion + UTC
     #                     breakdown. Gated by scripts/ntp-smoke.sh.
+    #   MMAP_SELFTEST=1  — boot-time anonymous-mmap allocator self-test
+    #                     (1.35.3): hermetic 2 MB-contiguous alloc/free/count +
+    #                     mmap length-rounding. Gated by scripts/mmap-smoke.sh.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -146,6 +149,7 @@ else
         [ -n "$ICMP_SELFTEST" ]  && echo '#define ICMP_SELFTEST'
         [ -n "$TCP_SELFTEST" ]   && echo '#define TCP_SELFTEST'
         [ -n "$NTP_SELFTEST" ]   && echo '#define NTP_SELFTEST'
+        [ -n "$MMAP_SELFTEST" ]  && echo '#define MMAP_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

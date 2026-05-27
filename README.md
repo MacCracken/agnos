@@ -62,7 +62,7 @@ Common:
   -> filesystems: ext2/ext4 (read + write) and FAT12/16/32 + exFAT (read + write)
   -> Native xHCI + USB-HID-boot keyboard driver (Phase 1-5)
   -> SMP infrastructure (APIC, IPI, trampoline, per-CPU stacks)
-  -> 26 syscalls (signals, epoll, timerfd, pipes)
+  -> 27 syscalls (signals, epoll, timerfd, pipes, anonymous mmap)
   -> kybernet (PID 1) -> interactive shell
 ```
 
@@ -174,7 +174,7 @@ for the methodology caveat (closed at v1.28.1 — kept as audit trail).
 
 | Kernel | Language | Scope |
 |--------|----------|-------|
-| **AGNOS** | Cyrius | 40+ subsystems, 26 syscalls, TCP/IP + DHCP, real-iron NIC (r8169), full storage stack (NVMe / AHCI / USB-MS / VirtIO-blk + 5-backend block layer + GPT), read+write filesystems (ext2/ext4, FAT12/16/32, exFAT), SMP, ELF loader, ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, shell |
+| **AGNOS** | Cyrius | 40+ subsystems, 27 syscalls, TCP/IP + DHCP, real-iron NIC (r8169), full storage stack (NVMe / AHCI / USB-MS / VirtIO-blk + 5-backend block layer + GPT), read+write filesystems (ext2/ext4, FAT12/16/32, exFAT), SMP, ELF loader, ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, shell |
 | xv6 (MIT) | C | 21 syscalls, no networking, no SMP, no real FS |
 | seL4 (verified) | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
 | MINIX 3 | C | Microkernel + basic drivers |

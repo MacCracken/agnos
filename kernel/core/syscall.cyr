@@ -33,6 +33,10 @@ fn stack_canary_check(canary) {
 # 26=write_boot_checkpoint(byte) — diagnostic-only, writes CMOS[0x50]=arg1.
 #    Added for iron-boot bring-up so userspace (kybernet) can mark progress
 #    in the same CMOS slot the kernel uses. Will likely stay through MVP.
+# 27=mmap(length) — anonymous, zero-filled, 2 MB-granular (1.35.3). The first
+#    new functional syscall since v1.21.0; the CVE-2026-31431 immunity is
+#    anchored on the absence of the AF_ALG/socket/splice surface, which mmap
+#    (a pure memory syscall) does not add.
 
 var sys_exit_code = 0;
 
@@ -307,6 +311,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         outb(0x71, arg1 & 0xFF);
         stack_canary_check(canary);
         return 0;
+    }
+    if (num == 27) {
+        # mmap(length=arg1) — anonymous, zero-filled, 2 MB-granular (1.35.3).
+        # addr/prot/flags/fd/offset ignored (always anonymous R/W/U). Returns
+        # the base vaddr or 0 (MAP_FAILED). See proc.cyr sys_mmap.
+        stack_canary_check(canary);
+        return sys_mmap(arg1);
     }
     stack_canary_check(canary);
     return 0 - 1;

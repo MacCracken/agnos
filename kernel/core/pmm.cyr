@@ -144,6 +144,70 @@ fn pmm_free(addr) {
     return 0;
 }
 
+# 2 MB-contiguous physical allocation (1.35.3, for anonymous mmap). The user
+# VMM is 2 MB huge pages only; a huge page must be backed by a fully-reserved
+# 2 MB region or it aliases (the ELF/stack idiom reserves only 1 of the 512
+# pages — a latent hazard mmap must not inherit). Scans the eight 2 MB-aligned
+# regions (512 pages each; region 0 is the kernel) for one that is entirely
+# free, marks all 512, returns the 2 MB-aligned base — or 0 if none is free
+# (the 16 MB pool fragments under single-page allocs, so this can fail; mmap
+# treats 0 as MAP_FAILED).
+fn pmm_alloc_2mb() {
+    pmm_spin_lock();
+    for (var r = 1; r < 8; r = r + 1) {
+        var base = r * 512;
+        var free = 1;
+        for (var i = 0; i < 512; i = i + 1) {
+            if (pmm_test(base + i) != 0) { free = 0; i = 512; }
+        }
+        if (free == 1) {
+            for (var j = 0; j < 512; j = j + 1) { pmm_set(base + j); }
+            pmm_used = pmm_used + 512;
+            pmm_spin_unlock();
+            return base * 0x1000;
+        }
+    }
+    pmm_spin_unlock();
+    return 0;
+}
+
+# Count currently-free 2 MB regions (lets sys_mmap pre-check a multi-region
+# request so its map loop can't fail part-way — single-threaded, so the count
+# stays valid through the subsequent allocs).
+fn pmm_count_2mb_free() {
+    pmm_spin_lock();
+    var count = 0;
+    for (var r = 1; r < 8; r = r + 1) {
+        var base = r * 512;
+        var free = 1;
+        for (var i = 0; i < 512; i = i + 1) {
+            if (pmm_test(base + i) != 0) { free = 0; i = 512; }
+        }
+        if (free == 1) { count = count + 1; }
+    }
+    pmm_spin_unlock();
+    return count;
+}
+
+# Free a 2 MB region allocated by pmm_alloc_2mb. addr must be 2 MB-aligned and
+# outside the kernel region.
+fn pmm_free_2mb(addr) {
+    var base = addr / 0x1000;
+    if (base % 512 != 0) { return 0 - 1; }   # not 2 MB-aligned
+    if (base < 512) { return 0 - 1; }         # region 0 is the kernel
+    if (base >= 4096) { return 0 - 1; }
+    pmm_spin_lock();
+    for (var i = 0; i < 512; i = i + 1) {
+        if (pmm_test(base + i) == 1) {
+            pmm_clear(base + i);
+            pmm_used = pmm_used - 1;
+        }
+    }
+    if (base < pmm_next_free) { pmm_next_free = base; }
+    pmm_spin_unlock();
+    return 0;
+}
+
 fn pmm_free_count() {
     return pmm_total - pmm_used;
 }

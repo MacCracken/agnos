@@ -5,6 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.35.3] — 2026-05-27 (**anonymous `mmap`** — the first new *functional* syscall since v1.21.0. A process can now request a fresh, zero-filled region of its own address space, the substrate a heap-grower / arena allocator needs. Independent of the FS arcs; the comms arc (1.35.0–1.35.2) is closed. Audit-doc-first: agnosticos [`mmap-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/mmap-prior-art.md).)
+
+### Added — anonymous `mmap` (syscall 27), 2 MB-granular
+
+The kernel had no way to hand a running process more address space — code, stack, and ELF segments were all mapped at spawn and never grew. `mmap(length)` (anonymous, zero-filled) closes that. It is the first new *functional* syscall since the v1.21.0 buildout; it adds a pure memory facility, not socket/crypto surface, so the attack-surface story stays anchored on the **absence** of AF_ALG / socket / `splice` rather than a fixed table size.
+
+- **`pmm.cyr`** — new `pmm_alloc_2mb` / `pmm_free_2mb` / `pmm_count_2mb_free`. The user VMM is **2 MB huge pages only**, and the existing ELF/stack idiom maps a full huge page while reserving only 1 of its 512 underlying 4 KB pages — a latent aliasing hazard a repeatedly-called `mmap` must **not** inherit. So `mmap` gets a real 2 MB-contiguous allocator: scan the 4 KB bitmap's eight 2 MB-aligned regions (region 0 is the kernel) for one entirely free, mark all 512, return the 2 MB-aligned base (0 = none free; the 16 MB pool fragments under single-page allocs).
+- **`proc.cyr`** — `sys_mmap(length)`: round `length` up to 2 MB, pre-check `pmm_count_2mb_free()` so the map loop can't fail part-way, then per 2 MB chunk `pmm_alloc_2mb` → identity-map for kernel access (`vmm_map(phys,phys,0x83)` if not already) → zero-fill → `proc_map_page(proc_get_cr3(proc_current), vaddr, phys)` (US=1) into the caller's address space. A global bump cursor `mmap_next_vaddr` runs 256 MB → 1 GB (clear of code and per-pid stacks; each address space is its own CR3, so a monotonic global cursor never collides). Returns the base vaddr or 0 (MAP_FAILED). `addr`/`prot`/`flags`/`fd`/`offset` accepted-and-ignored (always anonymous, R/W/U).
+- **`syscall.cyr`** — dispatch entry 27 = `sys_mmap(arg1)`. Slot 26 was already `write_boot_checkpoint` (an iron-boot diagnostic), so `mmap` takes 27; dispatch table is now 28 entries (0–27). aarch64 gets a `sys_mmap` stub (x86-only for now).
+- **Validation** — new `scripts/mmap-smoke.sh` (`MMAP_SELFTEST=1`): hermetic `mmap: pmm2mb PASS` — `pmm_alloc_2mb` returns distinct, non-overlapping, 2 MB-aligned regions; the free-count drops by the alloc count and is restored on `pmm_free_2mb`; the length-rounding is exact (4 KB→2 MB, 2 MB→2 MB, 2 MB+1→4 MB). The full map-into-process path rides the iron-proven `proc_map_page` huge-page idiom (no live user-proc at boot to drive it). `test.sh` 4/4, `check.sh` 11/11. Production build 819,888 → **821,856 B**.
+- **Deferred** (audit § 6): `munmap` (the natural pair, syscall 28 — v1 maps without reclaim, freed at process teardown); 4 KB-granular `mmap` (needs a 4 KB user-paging level — a large VMM arc); file-backed `mmap` (needs the VFS page cache); `MAP_FIXED` / placement hints / `mremap`.
+
 ## [1.35.2] — 2026-05-27 (**NTP/SNTP client** — the kernel's first wall clock, set from a one-shot SNTP query. The last AGNOS-side networking-comms item after DNS / ICMP / TCP-hardening; the substrate TLS/HTTP need — reliable TCP + name resolution + a wall clock — is now complete. The 1.35.x line: 1.35.0 catchup (docs + DNS + ICMP) → 1.35.1 TCP hardening (B0–B4) → 1.35.2 NTP.)
 
 ### Added — NTP/SNTP client + the kernel's first wall clock (1.35.x comms)

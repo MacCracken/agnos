@@ -322,4 +322,36 @@ fn proc_unmap_page(cr3, virt) {
     }
     return 0;
 }
+
+# === Anonymous mmap (1.35.3) ===
+# Global vaddr arena cursor: 256 MB base (clear of code ~2-34 MB and per-pid
+# stacks at 0x800000 + pid*0x400000), ceiling 1 GB (the per-process PD covers
+# 0-1 GB). Each address space is independent (own CR3), so a global monotonic
+# cursor never collides across processes. 2 MB-granular (the VMM is huge-pages
+# only) and bump-only (no reclaim on the v1 no-munmap path). See
+# agnosticos/docs/development/mmap-prior-art.md.
+var mmap_next_vaddr = 0x10000000;
+
+# sys_mmap(length): map `length` (rounded up to 2 MB) of zero-filled, user-
+# accessible memory into the calling process's address space; return the base
+# vaddr or 0 (MAP_FAILED). Anonymous only — addr/prot/flags/fd/offset ignored.
+fn sys_mmap(length) {
+    var len = (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;   # round up to 2 MB
+    if (len < 0x200000) { len = 0x200000; }
+    var npages = len / 0x200000;
+    var cr3 = proc_get_cr3(proc_current);
+    if (cr3 == 0) { return 0; }
+    if ((mmap_next_vaddr + len) > 0x40000000) { return 0; }    # arena exhausted (>1 GB)
+    if (pmm_count_2mb_free() < npages) { return 0; }            # not enough physical
+    var base_vaddr = mmap_next_vaddr;
+    for (var i = 0; i < npages; i = i + 1) {
+        var phys = pmm_alloc_2mb();
+        if (phys == 0) { return 0; }            # pre-counted, but guard anyway
+        if (vmm_is_mapped(phys) == 0) { vmm_map(phys, phys, 0x83); }
+        memset(phys, 0, 0x200000);              # zero-fill (anonymous contract)
+        proc_map_page(cr3, mmap_next_vaddr, phys);
+        mmap_next_vaddr = mmap_next_vaddr + 0x200000;
+    }
+    return base_vaddr;
+}
 #endif

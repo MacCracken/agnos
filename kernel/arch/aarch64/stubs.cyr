@@ -208,6 +208,7 @@ fn rdmsr(msr) { return 0; }
 fn pt_map_2mb(base, idx, addr) { return 0; }
 fn proc_create_address_space() { return 0; }
 fn proc_map_page(cr3, virt, phys) { return 0; }
+fn sys_mmap(length) { return 0; }   # anonymous mmap is x86-only (1.35.3)
 
 # x86 test procs (not applicable)
 fn test_proc_a() { return 0; }

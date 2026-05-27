@@ -2,7 +2,7 @@
 
 > **Last Updated**: 2026-05-26 (v1.35.0 cycle)
 >
-> Multi-arch (x86_64 + aarch64), 26 syscalls, 40+ subsystems. Built with cyrius 6.0.1 (pinned in `cyrius.cyml`). Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+). **Iron-validated on archaemenid (NUC AMD Zen)**: boot-to-shell MVP cleared at Attempt 68 (1.30.9) with a typeable USB-HID keyboard; the storage stack (NVMe/AHCI/USB-MS), the r8169 NIC + DHCP networking stack, and ext2/4 write all iron-validated since. See [`../development/state.md`](../development/state.md) for the live subsystem rollup + open items.
+> Multi-arch (x86_64 + aarch64), 27 syscalls, 40+ subsystems. Built with cyrius 6.0.1 (pinned in `cyrius.cyml`). Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+). **Iron-validated on archaemenid (NUC AMD Zen)**: boot-to-shell MVP cleared at Attempt 68 (1.30.9) with a typeable USB-HID keyboard; the storage stack (NVMe/AHCI/USB-MS), the r8169 NIC + DHCP networking stack, and ext2/4 write all iron-validated since. See [`../development/state.md`](../development/state.md) for the live subsystem rollup + open items.
 >
 > For live binary sizes per arch, per-cut size trajectory, source line counts, sibling pins, and test surface, see [`../development/state.md`](../development/state.md).
 
@@ -26,7 +26,7 @@ UEFI firmware
         -> filesystems read+write (ext2/ext4, FAT12/16/32, exFAT)
         -> Native xHCI + USB-HID-boot keyboard (Phase 1-5)
         -> SMP init (APIC, IPI, trampoline, per-CPU stacks)
-        -> 26 syscalls (signals, epoll, timerfd, pipes)
+        -> 27 syscalls (signals, epoll, timerfd, pipes, anonymous mmap)
         -> kybernet (PID 1) -> interactive shell
 ```
 
@@ -71,14 +71,15 @@ Live binary size + per-cut trajectory lives in [`../development/state.md`](../de
 ├─────────────────────────────────────────────────────────┤
 │              kybernet (PID 1 Init)                       │
 ├─────────────────────────────────────────────────────────┤
-│              Syscall Interface (26 syscalls)              │
+│              Syscall Interface (27 syscalls)              │
 │  exit(0) write(1) getpid(2) spawn(3) waitpid(4)        │
 │  read(5) close(6) open(7) dup(8) mkdir(9) rmdir(10)    │
 │  mount(11) sync(12) reboot(13) pause(14) getuid(15)    │
 │  kill(16) sigprocmask(17) signalfd(18)                  │
 │  epoll_create(19) epoll_ctl(20) epoll_wait(21)          │
 │  timerfd_create(22) timerfd_settime(23) umount(24)      │
-│  pipe(25)                                               │
+│  pipe(25) mmap(27)                                      │
+│  [26 write_boot_checkpoint = diagnostic]                │
 ├──────────────────┬──────────────────────────────────────┤
 │  ELF Loader      │  VFS (device/memfile/signalfd/epoll/  │
 │  static ELF64    │       timerfd/pipe)                  │

@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-05-27. **1.35.2 RELEASED — NTP/SNTP** (the kernel's first wall clock from a one-shot SNTP query; `ntp` + `date` verbs). **1.35.1 RELEASED — TCP hardening** B0–B4 (in-order receive ring + retransmit/RTO + MSS/segmentation + peer-window; the minimal SYN/ACK/FIN machine is now a reliable, flow-controlled stream). **1.35.0 RELEASED** — the catchup-tidbits cut: a full docs sweep + **DNS stub resolver** (`dns` verb; `dns-smoke.sh` green, live `example.com` via SLIRP; audit agnosticos [`dns-stub-resolver-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/dns-stub-resolver-prior-art.md)) + **ICMP echo / ping** (`ping` verb, pingable + `icmp_ping`; `icmp-smoke.sh` green — hermetic checksum + live gateway round-trip). The planned AGNOS-side comms order (DNS → ICMP → TCP-hardening → NTP) is **COMPLETE**; TLS + PIE are the cyrius-side next destinations (days-to-weeks). Legacy virtio-net back-burnered (known TX gap); plug-and-play / hot-add still a candidate. **Last release: agnos 1.35.2.** The **1.34.x FAT-family arc** ([`roadmap.md`](roadmap.md) row 21) shipped FAT12/16/32 + exFAT read+write across **1.34.0–1.34.6** (FAT read+write → exFAT read+write → write parity → LFN/truncate → directory growth → exFAT Unicode names → ESP-write guard) — all RELEASED + `fsck`-clean in QEMU. **Only the user-driven FAT/exFAT iron burn remains** (the arc's first iron touch — the guard makes it brick-safe; plan in agnosticos `#tracker-1341-cycle`). Production build **819,888 B** (~820 KB; the 1.35.x comms arc added DNS + ICMP + TCP-hardening + NTP since the ~799 KB 1.34.6 cut); `test.sh` 4/4 + `check.sh` 11/11 (binary-size sanity ceilings at 1.2 M), ext2 + FAT + exFAT + dns + icmp + tcp + ntp smokes green. **MVP gate (boot-to-shell with typeable keyboard) green on archaemenid since Attempt 68 / 1.30.9.** **Closed arcs (history → [`CHANGELOG.md`](../../CHANGELOG.md) + the iron-log, not here):** storage backends + GPT + ext2/4 read (1.31.x), networking incl. r8169 unicast-RX + DHCP iron-verified (1.32.x), ext2/4 WRITE incl. the W5 demo→base iron burn + fsync barrier (1.33.x). **Forward plan beyond 1.34.x** — big-write own-cycles (1.37 extent / 1.38 jbd2 / 1.39 VFS) → kernel-slimming (1.40 font→`kashi` / 1.41 shell→agnoshi) → 1.42 perf → 1.43–1.45 agnos-2.0 runway, + platform decades (1.5x Intel / 1.6x Pi / 1.7x radios / 1.8x RISC-V) — lives in [`roadmap.md`](roadmap.md). 1.30.x AMD Zen scanout residue stays parked per `project_amd_zen_scanout_residue`. | **Refresh cadence**: every release, ideally via `scripts/version-bump.sh` (it refreshes the header date + Version row + roadmap "Current" line; body prose needs a manual sweep at minor closeouts — like this one).
+> **Last refresh**: 2026-05-27. **1.35.3 RELEASED — anonymous `mmap`** (syscall 27, 2 MB-granular zero-filled memory into the caller's address space; new `pmm_alloc_2mb` contiguous allocator; `mmap-smoke.sh` green; audit agnosticos [`mmap-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/mmap-prior-art.md)). The first new *functional* syscall since v1.21.0 — a pure memory facility, no socket/crypto surface. **1.35.2 RELEASED — NTP/SNTP** (the kernel's first wall clock from a one-shot SNTP query; `ntp` + `date` verbs). **1.35.1 RELEASED — TCP hardening** B0–B4 (in-order receive ring + retransmit/RTO + MSS/segmentation + peer-window; the minimal SYN/ACK/FIN machine is now a reliable, flow-controlled stream). **1.35.0 RELEASED** — the catchup-tidbits cut: a full docs sweep + **DNS stub resolver** (`dns` verb; `dns-smoke.sh` green, live `example.com` via SLIRP; audit agnosticos [`dns-stub-resolver-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/dns-stub-resolver-prior-art.md)) + **ICMP echo / ping** (`ping` verb, pingable + `icmp_ping`; `icmp-smoke.sh` green — hermetic checksum + live gateway round-trip). The planned AGNOS-side comms order (DNS → ICMP → TCP-hardening → NTP) is **COMPLETE**; TLS + PIE are the cyrius-side next destinations (days-to-weeks). Legacy virtio-net back-burnered (known TX gap); plug-and-play / hot-add still a candidate. **Last release: agnos 1.35.3.** The **1.34.x FAT-family arc** ([`roadmap.md`](roadmap.md) row 21) shipped FAT12/16/32 + exFAT read+write across **1.34.0–1.34.6** (FAT read+write → exFAT read+write → write parity → LFN/truncate → directory growth → exFAT Unicode names → ESP-write guard) — all RELEASED + `fsck`-clean in QEMU. **Only the user-driven FAT/exFAT iron burn remains** (the arc's first iron touch — the guard makes it brick-safe; plan in agnosticos `#tracker-1341-cycle`). Production build **821,856 B** (~822 KB; the 1.35.x arc added DNS + ICMP + TCP-hardening + NTP + mmap since the ~799 KB 1.34.6 cut); `test.sh` 4/4 + `check.sh` 11/11 (binary-size sanity ceilings at 1.2 M), ext2 + FAT + exFAT + dns + icmp + tcp + ntp + mmap smokes green. **MVP gate (boot-to-shell with typeable keyboard) green on archaemenid since Attempt 68 / 1.30.9.** **Closed arcs (history → [`CHANGELOG.md`](../../CHANGELOG.md) + the iron-log, not here):** storage backends + GPT + ext2/4 read (1.31.x), networking incl. r8169 unicast-RX + DHCP iron-verified (1.32.x), ext2/4 WRITE incl. the W5 demo→base iron burn + fsync barrier (1.33.x). **Forward plan beyond 1.34.x** — big-write own-cycles (1.37 extent / 1.38 jbd2 / 1.39 VFS) → kernel-slimming (1.40 font→`kashi` / 1.41 shell→agnoshi) → 1.42 perf → 1.43–1.45 agnos-2.0 runway, + platform decades (1.5x Intel / 1.6x Pi / 1.7x radios / 1.8x RISC-V) — lives in [`roadmap.md`](roadmap.md). 1.30.x AMD Zen scanout residue stays parked per `project_amd_zen_scanout_residue`. | **Refresh cadence**: every release, ideally via `scripts/version-bump.sh` (it refreshes the header date + Version row + roadmap "Current" line; body prose needs a manual sweep at minor closeouts — like this one).
 >
 > **Scope**: live snapshot of this repo (`agnos`). Volatile state lives here so [`CLAUDE.md`](../../CLAUDE.md) can stay durable. Historical narrative lives in [`CHANGELOG.md`](../../CHANGELOG.md); the design ledger lives in [`roadmap.md`](roadmap.md). Iron-bring-up per-attempt detail lives in [agnosticos `iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
 
@@ -16,7 +16,7 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.35.2** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.35.3** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **6.0.1** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-27 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-25 (archaemenid NUC AMD — **MVP gate green since Attempt 68 / 1.30.9**; **1.32.x networking arc iron-COMPLETE**: r8169 unicast-RX solved at 1.32.7 + DHCP real lease `.142` iron-verified at 1.32.9; storage trio + GPT + ext4 + shell byte-clean). The 1.33.x ext2/4-WRITE + 1.34.x FAT-family arcs are QEMU/`fsck`-validated; their final-bite iron burns stay user-driven (pending). | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB) + 80-91 (storage arc) + 92+ (networking arc — DHCP iron-verified 1.32.9) |
@@ -46,10 +46,10 @@ Sizes from `wc -c` on `build/agnos*` after `scripts/build.sh`, cyrius 6.0.1, def
 
 | Arch | Binary | Size | Notes |
 |---|---|---|---|
-| x86_64 | `build/agnos` | **798,936 B** (~780 KB, at 1.34.6) | ELF64 multiboot2 (Path C — sovereign UEFI boot-info ABI via gnoboot v0.4.2; RDI = `&boot_info`, magic `0x41474E4F`), entry `0x1000a8`. Boots under `qemu-system-x86_64 -cpu max` + OVMF + gnoboot. Iron-validated on archaemenid: MVP gate Attempt 68 (1.30.9), storage trio Attempts 80/81/87, ext4 victory lap 90/91, networking arc through Attempt ~100 (DHCP iron-verified 1.32.9). |
+| x86_64 | `build/agnos` | **821,856 B** (~802 KB, at 1.35.3) | ELF64 multiboot2 (Path C — sovereign UEFI boot-info ABI via gnoboot v0.4.2; RDI = `&boot_info`, magic `0x41474E4F`), entry `0x1000a8`. Boots under `qemu-system-x86_64 -cpu max` + OVMF + gnoboot. Iron-validated on archaemenid: MVP gate Attempt 68 (1.30.9), storage trio Attempts 80/81/87, ext4 victory lap 90/91, networking arc through Attempt ~100 (DHCP iron-verified 1.32.9). |
 | aarch64 | `build/agnos-aarch64` | compile-tested (~94 KB last measured, 1.31.x) | DTB + EL2→EL1 + PL011 UART + GIC. Compile-only — boot harness not yet wired; the x86-only storage/net/FS growth lands as zero-LOC stubs on the aarch64 side. |
 
-Per-cut size trajectory + deltas live in [`CHANGELOG.md`](../../CHANGELOG.md) (the at-a-glance ledger — this is current truth, not a log). Bookmarks: ~249 KB (1.28.x) → **~395 KB v1.30.9 MVP gate** → 1.31.x storage arc → 1.32.x networking → 1.33.x ext2/4 write → 1.34.x FAT-family → **798,936 B (1.34.6)**.
+Per-cut size trajectory + deltas live in [`CHANGELOG.md`](../../CHANGELOG.md) (the at-a-glance ledger — this is current truth, not a log). Bookmarks: ~249 KB (1.28.x) → **~395 KB v1.30.9 MVP gate** → 1.31.x storage arc → 1.32.x networking → 1.33.x ext2/4 write → 1.34.x FAT-family → 798,936 B (1.34.6) → 1.35.x comms (DNS/ICMP/TCP/NTP) + mmap → **821,856 B (1.35.3)**.
 
 ---
 
@@ -128,14 +128,22 @@ All subsystems are **code-complete** through 1.34.6 (1.35.0 cycle just opened). 
 | Signals | per-process `proc_signals` / `proc_sigmask`, `kill`, `sigprocmask`, `signalfd` |
 | Epoll + Timerfd | `epoll_{create,ctl,wait}`, `timerfd_{create,settime}` |
 
-### Syscall surface (26)
+### Syscall surface (27 functional + 1 diagnostic = 28 dispatch entries)
 
 `exit`(0), `write`(1), `getpid`(2), `spawn`(3), `waitpid`(4), `read`(5),
 `close`(6), `open`(7), `dup`(8), `mkdir`(9), `rmdir`(10), `mount`(11),
 `sync`(12), `reboot`(13), `pause`(14), `getuid`(15), `kill`(16),
 `sigprocmask`(17), `signalfd`(18), `epoll_create`(19), `epoll_ctl`(20),
 `epoll_wait`(21), `timerfd_create`(22), `timerfd_settime`(23),
-`umount`(24), `pipe`(25).
+`umount`(24), `pipe`(25), **`mmap`(27)**.
+
+Slot **26** is `write_boot_checkpoint(byte)` — a CMOS-write diagnostic from
+iron-boot bring-up, not part of the functional set. The 26-call kybernet
+surface (0–25) was complete at v1.21.0; `mmap` (27, **1.35.3** — anonymous,
+2 MB-granular, zero-filled) is the first new *functional* syscall since. It
+adds a pure memory facility, not socket/crypto surface — the attack-surface
+story stays anchored on the **absence** of AF_ALG / socket / `splice`, not on
+a fixed table size.
 
 ---
 
@@ -185,7 +193,9 @@ Source: [`docs/development/roadmap.md`](roadmap.md) `## Active` section.
 | 4 | `struct Process` `#derive(accessors)` port | Was blocked on a cyrius cap-raise (16-field metadata-table overflow); revisit against the current cyrius 6.0.1 pin — picks up passively when the field-table cap is confirmed lifted. |
 
 Recently closed — arc bookmarks only; per-cut detail in [`CHANGELOG.md`](../../CHANGELOG.md):
-- **1.34.x — FAT-family arc** (latest): FAT12/16/32 + exFAT read **and write** (LFN, cluster allocator, root extension, spanning-append, overwrite/truncate/delete) + ESP-write safety guard (1.34.6). `fsck.fat` / `fsck.exfat` / `mtools` validated.
+- **1.35.3 — anonymous `mmap`** (latest): syscall 27 + `pmm_alloc_2mb` 2 MB-contiguous allocator; 2 MB-granular zero-filled memory into the caller's address space. First new functional syscall since v1.21.0. `mmap-smoke.sh` green. (Was the roadmap `mmap (anonymous-only)` open item.)
+- **1.35.0–1.35.2 — networking-comms arc**: DNS stub resolver + ICMP/ping + TCP hardening (B0–B4) + NTP/SNTP. The reliable-stream + name-resolution + wall-clock substrate for TLS. All RELEASED + smokes green.
+- **1.34.x — FAT-family arc**: FAT12/16/32 + exFAT read **and write** (LFN, cluster allocator, root extension, spanning-append, overwrite/truncate/delete) + ESP-write safety guard (1.34.6). `fsck.fat` / `fsck.exfat` / `mtools` validated.
 - **1.33.x — ext2/4 WRITE arc**: file create/write/truncate on ext2/ext4; persist-across-reboot iron-validated (Attempts 90/91).
 - **1.32.x — networking arc**: TCP/UDP server primitives + DHCP client + r8169 NIC; iron-COMPLETE (DHCP lease verified 1.32.9; r8169 RX fix 1.32.7).
 - **1.31.x — storage arc**: NVMe (iron Attempt 80) + GPT + AHCI/SATA (iron Attempt 87) + USB-MS + RAM-disk + 5-backend block layer + ext2/ext4 read.

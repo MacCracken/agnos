@@ -1473,6 +1473,37 @@ if (vnet_active != 0 || nic_ready() != 0) {
 }
 #endif
 
+#ifdef MMAP_SELFTEST
+# Anonymous-mmap allocator self-test (1.35.3). Hermetic: exercises the new
+# 2 MB-contiguous allocator (pmm_alloc_2mb / _free_2mb / _count) + the mmap
+# length-rounding. The full sys_mmap map-into-process path reuses the iron-
+# proven proc_map_page idiom (no live user proc at boot to drive it directly).
+{
+    var ok = 1;
+    var before = pmm_count_2mb_free();
+    var a = pmm_alloc_2mb();
+    if (a == 0) { ok = 0; }
+    if ((a & 0x1FFFFF) != 0) { ok = 0; }           # 2 MB-aligned
+    var b = pmm_alloc_2mb();
+    if (b == 0) { ok = 0; }
+    if ((b & 0x1FFFFF) != 0) { ok = 0; }
+    if (a == b) { ok = 0; }                          # distinct regions
+    var d = a - b;
+    if (d < 0) { d = 0 - d; }
+    if (d < 0x200000) { ok = 0; }                    # non-overlapping (>= 2 MB apart)
+    if (pmm_count_2mb_free() != before - 2) { ok = 0; }
+    pmm_free_2mb(a);
+    pmm_free_2mb(b);
+    if (pmm_count_2mb_free() != before) { ok = 0; }  # frees restore the count
+    # mmap length-rounding (the sys_mmap formula): 4 KB→2 MB, 2 MB→2 MB, +1→4 MB.
+    if (((4096 + 0x1FFFFF) & 0xFFFFFFFFFFE00000) != 0x200000) { ok = 0; }
+    if (((0x200000 + 0x1FFFFF) & 0xFFFFFFFFFFE00000) != 0x200000) { ok = 0; }
+    if (((0x200001 + 0x1FFFFF) & 0xFFFFFFFFFFE00000) != 0x400000) { ok = 0; }
+    if (ok == 1) { kprintln("mmap: pmm2mb PASS", 17); }
+    if (ok == 0) { kprintln("mmap: pmm2mb FAIL", 17); }
+}
+#endif
+
 #ifdef TCP_LISTEN_SMOKE
 # TCP server-side smoke (1.32.0 bite A). Validates that:
 #   - tcp_listen(port) allocates a LISTEN slot
