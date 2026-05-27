@@ -138,6 +138,13 @@ strings "$LOG" | grep -q "^exfatw: truncate round-trip OK" \
 strings "$LOG" | grep -q "^exfatw: enospc clean -- no partial file" \
     && echo "  PASS: 1.34.2 ENOSPC rollback (oversize request, no partial file)" \
     || { echo "  FAIL: 1.34.2 ENOSPC"; rc=1; }
+# 1.34.4 bite 1 — root-directory extension: 10 new files past the 16-entry root
+strings "$LOG" | grep -q "^exfatw: rootext 10 new files nfail=0" \
+    && echo "  PASS: 1.34.4 root extension (10 new files created past single-cluster root)" \
+    || { echo "  FAIL: 1.34.4 root extension (some creates failed)"; rc=1; }
+strings "$LOG" | grep -q "^exfatw: rootext readback OK" \
+    && echo "  PASS: 1.34.4 extended-root file readback byte-exact" \
+    || { echo "  FAIL: 1.34.4 rootext readback"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

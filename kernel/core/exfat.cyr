@@ -526,62 +526,146 @@ var exfat_set_sec = 0;
 var exfat_set_slot = 0;
 var exfat_set_count = 0;
 
-# Find `need` consecutive free dir-entry slots for a file set, recording
-# the start in exfat_w_sec / exfat_w_slot. exFAT marks end-of-directory
-# with a 0x00 entry (everything after it is free), so the run starts at the
-# first 0x00 that leaves `need` slots before the sector ends. A run that
-# would cross a sector/cluster boundary (or a full root needing extension)
-# is a follow-on → -1. need ≤ 16. Returns 0/-1.
-fn exfat_find_free_dir_run(need) {
+# Write a 32-bit exFAT FAT entry (1.34.4 — the root directory is FAT-chained,
+# unlike NoFatChain data files, so extending it needs FAT writes). Invalidates
+# the FAT read cache. Returns 0/-1.
+fn exfat_fat_set(cluster, value) {
+    var off = cluster * 4;
+    var sec = exfat_fat_offset + (off / 512);
+    var o = off % 512;
+    if (exfat_blk_read(sec, &exfat_fat_buf) != 0) { return 0 - 1; }
+    exfat_fat_buf_sec = 0 - 1;                          # cache now dirty
+    store8(&exfat_fat_buf + o, value & 0xFF);
+    store8(&exfat_fat_buf + o + 1, (value >> 8) & 0xFF);
+    store8(&exfat_fat_buf + o + 2, (value >> 16) & 0xFF);
+    store8(&exfat_fat_buf + o + 3, (value >> 24) & 0xFF);
+    if (exfat_blk_write(sec, &exfat_fat_buf) != 0) { return 0 - 1; }
+    exfat_fat_buf_sec = 0 - 1;
+    return 0;
+}
+
+# Entries per cluster (32-byte dir entries).
+fn exfat_dir_entries_per_cluster() {
+    return (512 / 32) * exfat_sectors_per_cluster;
+}
+
+# Map root-dir linear entry index `lin` → the cluster holding it, EXTENDING
+# the FAT-chained root by fresh zeroed clusters as needed (1.34.4). exFAT
+# directories are byte streams terminated by a 0x00 end-of-dir entry, so a
+# fresh cluster (all 0x00) cleanly extends the end-of-dir. Both the bitmap
+# (alloc) and the FAT (link prev → new → EOC) are updated. Returns the
+# cluster number, or 0 on ENOSPC / error.
+fn exfat_root_cluster_for_index(lin) {
+    var epc = exfat_dir_entries_per_cluster();
+    var cidx = lin / epc;
+    var clus = exfat_root_cluster;
+    var i = 0;
+    var guard = 0;
+    var max_c = exfat_cluster_count + 2;
+    while (i < cidx) {
+        var nxt = exfat_next_cluster(clus);
+        if (nxt < 2) {                                  # chain end → extend
+            var c = exfat_alloc_contiguous(1);
+            if (c == 0) { return 0; }                   # ENOSPC
+            if (exfat_fat_set(clus, c) != 0) { return 0; }
+            if (exfat_fat_set(c, 0xFFFFFFFF) != 0) { return 0; }   # EOC
+            var base = exfat_cluster_sector(c);
+            var s = 0;
+            while (s < exfat_sectors_per_cluster) {
+                var z = 0;
+                while (z < 512) { store8(&exfat_data_buf + z, 0); z = z + 1; }
+                if (exfat_blk_write(base + s, &exfat_data_buf) != 0) { return 0; }
+                s = s + 1;
+            }
+            nxt = c;
+        }
+        clus = nxt;
+        i = i + 1;
+        guard = guard + 1;
+        if (guard > max_c) { return 0; }
+    }
+    return clus;
+}
+
+# Linear entry index of the root's first end-of-directory (0x00) entry —
+# the append point. Walks the FAT chain; if the chain ends without a 0x00,
+# returns the total entry count (append at the chain end → extend).
+fn exfat_dir_end_index() {
     var eps = 512 / 32;
     var clus = exfat_root_cluster;
     var max_c = exfat_cluster_count + 2;
+    var lin = 0;
     var guard = 0;
     while (clus >= 2) {
-        if (clus >= max_c) { return 0 - 1; }
+        if (clus >= max_c) { return lin; }
         var base = exfat_cluster_sector(clus);
         for (var s = 0; s < exfat_sectors_per_cluster; s = s + 1) {
-            var sec = base + s;
-            if (exfat_blk_read(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+            if (exfat_blk_read(base + s, &exfat_dir_buf) != 0) { return lin; }
             for (var e = 0; e < eps; e = e + 1) {
-                var t = load8(&exfat_dir_buf + e * 32);
-                if (t == 0x00) {
-                    if (e + need <= eps) {
-                        exfat_w_sec = sec;
-                        exfat_w_slot = e;
-                        return 0;
-                    }
-                    e = eps;            # run would cross the boundary — next sector
-                }
+                if (load8(&exfat_dir_buf + e * 32) == 0x00) { return lin; }
+                lin = lin + 1;
             }
         }
         clus = exfat_next_cluster(clus);
         guard = guard + 1;
-        if (guard > max_c) { return 0 - 1; }
+        if (guard > max_c) { return lin; }
     }
-    return 0 - 1;
+    return lin;
 }
 
-# Build + write a file's dir-set into a free root run: one 0x85 File
-# (SecondaryCount + SetChecksum + ARCHIVE attr) + one 0xC0 Stream-Extension
-# (flags + NameLength + NameHash + ValidDataLength/FirstCluster/DataLength)
-# + ⌈namelen/15⌉ 0xC1 File-Name (UTF-16). § 3. `first`/`len`/`flags` = 0/0/0
-# for an empty file; for a file with content `flags` carries AllocationPossible
-# (bit0) | NoFatChain (bit1) and first/len the contiguous run + size. The slot
-# after the set stays 0x00 (it already was), preserving the end-of-directory
-# marker. ASCII names; set must fit one sector (follow-on otherwise). The
-# caller has already refused an existing name + allocated/written any data.
-# Returns 0/-1.
+# Append a fully-built dir-set (`total` 32-byte entries in `setbase`) at the
+# root's end-of-directory, flowing CONTIGUOUSLY across sector/cluster
+# boundaries (1.34.4 — the correct exFAT append: a set must start at the
+# first 0x00 and stream from there; the previous one-sector-fit placement
+# could strand a 0x00 before live entries → fsck "0x85 follows unused
+# entry"). Extends the root as the run + the trailing 0x00 require. Per-entry
+# RMW so a set straddling a cluster boundary lands correctly. Returns 0/-1.
+fn exfat_dir_append_set(setbase, total) {
+    var eps = 512 / 32;
+    var epc = exfat_dir_entries_per_cluster();
+    var lin = exfat_dir_end_index();
+    var j = 0;
+    while (j < total) {
+        var li = lin + j;
+        var clus = exfat_root_cluster_for_index(li);
+        if (clus == 0) { return 0 - 1; }                # ENOSPC
+        var within = li % epc;
+        var sec = exfat_cluster_sector(clus) + (within / eps);
+        var slot = within % eps;
+        if (exfat_blk_read(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+        var ep = &exfat_dir_buf + slot * 32;
+        var b = 0;
+        while (b < 32) { store8(ep + b, load8(setbase + j * 32 + b)); b = b + 1; }
+        if (exfat_blk_write(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+        j = j + 1;
+    }
+    # ensure the entry after the set exists + is 0x00 (end-of-dir); a freshly
+    # extended cluster is already zeroed, so this only extends if needed.
+    if (exfat_root_cluster_for_index(lin + total) == 0) { return 0 - 1; }
+    return 0;
+}
+
+# Set-build scratch — up to 19 x 32-B entries (a 255-char name): [80] = 640 B.
+var exfat_set_buf[80];
+
+# Build a file's dir-set into exfat_set_buf and APPEND it at the root's
+# end-of-directory: one 0x85 File (SecondaryCount + SetChecksum + ARCHIVE
+# attr) + one 0xC0 Stream-Extension (flags + NameLength + NameHash +
+# ValidDataLength/FirstCluster/DataLength) + ⌈namelen/15⌉ 0xC1 File-Name
+# (UTF-16). § 3. `first`/`len`/`flags` = 0/0/0 for an empty file; for a file
+# with content `flags` carries AllocationPossible (bit0) | NoFatChain (bit1).
+# The set is built whole (so the SetChecksum covers it), then streamed at the
+# append point — spanning sector/cluster boundaries + extending the root as
+# needed (exfat_dir_append_set). ASCII names. Caller already refused an
+# existing name + wrote any data. Returns 0/-1.
 fn exfat_emit_set(name, namelen, first, len, flags) {
     var ncname = namelen / 15;
     if (namelen % 15 != 0) { ncname = ncname + 1; }
     if (ncname == 0) { ncname = 1; }
     var sec_count = 1 + ncname;
     var total = 1 + sec_count;
-    if (total > 16) { return 0 - 1; }                # one-sector run only
-    if (exfat_find_free_dir_run(total) != 0) { return 0 - 1; }
-    if (exfat_blk_read(exfat_w_sec, &exfat_dir_buf) != 0) { return 0 - 1; }
-    var setbase = &exfat_dir_buf + exfat_w_slot * 32;
+    if (total > 19) { return 0 - 1; }                # max set (255-char name)
+    var setbase = &exfat_set_buf;
 
     var z = 0;
     while (z < total * 32) { store8(setbase + z, 0); z = z + 1; }
@@ -639,8 +723,7 @@ fn exfat_emit_set(name, namelen, first, len, flags) {
     store8(setbase + 2, chk & 0xFF);
     store8(setbase + 3, (chk >> 8) & 0xFF);
 
-    if (exfat_blk_write(exfat_w_sec, &exfat_dir_buf) != 0) { return 0 - 1; }
-    return 0;
+    return exfat_dir_append_set(setbase, total);
 }
 
 # Create an empty file (DataLength 0, no clusters → no bitmap touch).
