@@ -889,6 +889,13 @@ ext2_write_selftest();
 sh_write_selftest();
 #endif
 
+# 1.37.0 — ext4 extent-ALLOCATION self-test (compile-gated). Appends past EOF
+# of a seed EXTENTS_FL file to exercise ext2_extent_append_block. Gated by
+# scripts/ext-extent-smoke.sh (host e2fsck -fn clean + grow/byte verify).
+#ifdef EXT2_EXTENT_WRITE_SELFTEST
+ext2_extent_write_selftest();
+#endif
+
 # === CMOS kernel checkpoint 12 (VFS up) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0C; 0xE6; 0x71; }
 

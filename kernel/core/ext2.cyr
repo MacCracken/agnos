@@ -1318,6 +1318,102 @@ fn ext2_extent_logical_to_physical(inode_buf, logical_block) {
     return 0;   # past all leaf entries → sparse / EOF
 }
 
+# --- ext4 extent ALLOCATION (write — 1.37.0) --------------------------
+#
+# Depth-0 append: allocate a physical block for logical block `lblk` and map
+# it by either extending the last leaf extent (when this is its next logical
+# block AND the new physical block is contiguous) or inserting a new leaf
+# extent into the inline root (i_block[], <= 4 entries). The root lives in the
+# inode (inode_buf + 40), so the caller's ext2_put_inode persists it — no
+# separate tree-node write at depth 0. Returns the physical block#, or 0 for
+# ENOSPC / depth>0 / root-full / out-of-order (all deferred to 1.37.1+).
+# Multi-source: Linux ext4_ext_insert_extent, FreeBSD ext4_ext_*, e2fsprogs
+# ext2fs_extent_insert. See agnosticos/docs/development/ext4-extent-alloc-prior-art.md.
+fn ext2_extent_append_block(inode_buf, lblk) {
+    var hdr = inode_buf + 40;
+    if (ext2_extent_header_validate(hdr) == 0) { return 0; }
+    if (ext2_load16_le(hdr, 6) != 0) {                 # eh_depth
+        kprintln("ext2: extent depth>0 append deferred (1.37.1)", 45);
+        return 0;
+    }
+    var entries = ext2_load16_le(hdr, 2);
+    var max     = ext2_load16_le(hdr, 4);
+
+    # Empty tree → allocate + write the first extent.
+    if (entries == 0) {
+        var nb0 = ext2_alloc_block(0);
+        if (nb0 <= 0) { return 0; }
+        var e0 = hdr + 12;
+        ext2_store32_le(e0, 0, lblk);                  # ee_block
+        ext2_store16_le(e0, 4, 1);                     # ee_len = 1 (initialized)
+        ext2_store16_le(e0, 6, (nb0 >> 32) & 0xFFFF);  # ee_start_hi
+        ext2_store32_le(e0, 8, nb0 & 0xFFFFFFFF);      # ee_start_lo
+        ext2_store16_le(hdr, 2, 1);                    # eh_entries = 1
+        ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+        ext2_bmap_was_new = 1;
+        return nb0;
+    }
+
+    var last = hdr + 12 + (entries - 1) * 12;
+    var last_block = ext2_load32_le(last, 0);
+    var last_len   = ext2_load16_le(last, 4);
+    var last_phys  = ext2_load32_le(last, 8) | (ext2_load16_le(last, 6) << 32);
+
+    # Depth-0 append-at-end only: a logical block before the last extent's end
+    # would need an in-sort-order insert (hole fill) — deferred.
+    if (lblk < last_block + last_len) { return 0; }
+
+    # Allocate, preferring the block right after the last extent (contiguity).
+    var goal = last_phys + last_len;
+    var nb = ext2_alloc_block(goal);
+    if (nb <= 0) { return 0; }
+
+    # Fast path: extend the last extent if this is its next logical block, the
+    # new physical block is contiguous, and it stays initialized (< 32768).
+    if (lblk == last_block + last_len) {
+        if (nb == last_phys + last_len) {
+            if (last_len < 0x8000) {
+                ext2_store16_le(last, 4, last_len + 1);
+                ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+                ext2_bmap_was_new = 1;
+                return nb;
+            }
+        }
+    }
+
+    # Else insert a new leaf extent if the inline root has room.
+    if (entries < max) {
+        var e = hdr + 12 + entries * 12;
+        ext2_store32_le(e, 0, lblk);
+        ext2_store16_le(e, 4, 1);
+        ext2_store16_le(e, 6, (nb >> 32) & 0xFFFF);
+        ext2_store32_le(e, 8, nb & 0xFFFFFFFF);
+        ext2_store16_le(hdr, 2, entries + 1);
+        ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+        ext2_bmap_was_new = 1;
+        return nb;
+    }
+
+    # Inline root full → split deferred (1.37.1). Return the block so the
+    # partial-write return doesn't leak it.
+    ext2_free_block(nb);
+    kprintln("ext2: extent root full -- split deferred (1.37.1)", 49);
+    return 0;
+}
+
+# Resolve-or-append for an EXTENTS_FL inode: return the existing physical
+# block for `lblk` (overwrite in place — works at any depth via the reader)
+# or append a new one (depth-0). Mirrors ext2_bmap_alloc's was_new contract
+# so ext2_write_at's i_blocks accounting is correct.
+fn ext2_extent_bmap_alloc(inode_buf, lblk) {
+    ext2_bmap_was_new = 0;
+    if (ext2_write_ok == 0) { return 0; }
+    var existing = ext2_extent_logical_to_physical(inode_buf, lblk);
+    if (existing > 0) { return existing; }     # already mapped → overwrite in place
+    if (existing < 0) { return 0; }            # tree error
+    return ext2_extent_append_block(inode_buf, lblk);   # sparse/EOF → append
+}
+
 # --- Logical → physical block mapping (Phase 2 indirect + Phase 4 extents) --
 #
 # Maps a logical block# within a file to the physical FS block#. Dispatch:
@@ -2490,10 +2586,14 @@ fn ext2_write_at(inode_num, offset, src, len) {
     if (len == 0)           { return 0; }
     if (ext2_get_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
     if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x8000) { return 0 - 1; }
-    if ((ext2_inode_flags(&ext2_inode_buf) & 0x80000) != 0) {
-        kprintln("ext2: write to extent inode unsupported (deferred)", 50);
-        return 0 - 1;
-    }
+    # EXTENTS_FL inodes route block-mapping through the extent path (1.37.0):
+    # overwrite-in-place works at any depth (resolve via the reader); block
+    # *append* is depth-0 only for now (extent-append returns 0 → partial
+    # write past the inline-root / depth>0 cap). Indirect inodes keep the
+    # ext2_bmap_alloc path. The shared tail (i_size / i_blocks / put_inode)
+    # persists the extent root since it lives in the inode.
+    var is_extent = 0;
+    if ((ext2_inode_flags(&ext2_inode_buf) & 0x80000) != 0) { is_extent = 1; }
 
     ext2_bmap_alloc_count = 0;
     var written = 0;
@@ -2505,7 +2605,9 @@ fn ext2_write_at(inode_num, offset, src, len) {
         var chunk = ext2_blocksize - boff;
         if (chunk > rem) { chunk = rem; }
 
-        var phys = ext2_bmap_alloc(&ext2_inode_buf, lblk);
+        var phys = 0;
+        if (is_extent == 1) { phys = ext2_extent_bmap_alloc(&ext2_inode_buf, lblk); }
+        else                { phys = ext2_bmap_alloc(&ext2_inode_buf, lblk); }
         if (phys <= 0) { break; }                    # ENOSPC / depth cap — return partial
         var was_new = ext2_bmap_was_new;
 
@@ -3151,5 +3253,38 @@ fn ext2_write_selftest() {
     if (wsy == 1) { kprintln("ext2w: Wsync state OK", 21); }
     else          { kprintln("ext2w: Wsync state MISMATCH", 27); }
 
+    return 0;
+}
+
+# === ext4 extent-ALLOCATION self-test (compile-gated EXT2_EXTENT_WRITE_SELFTEST, 1.37.0) ===
+# Appends a known pattern past EOF of a SEED extent-mapped file (`/extseed.dat`,
+# created by `mkfs.ext4 -d` so it carries EXTENTS_FL with a depth-0 inline root),
+# exercising ext2_extent_append_block via ext2_write_at. The smoke
+# (scripts/ext-extent-smoke.sh) then host-verifies: e2fsck -fn clean + the file
+# grew + the appended bytes are 0xAB. Gate string: "ext-ext: append PASS".
+fn ext2_extent_write_selftest() {
+    if (ext2_active == 0)   { kprintln("ext-ext: not mounted -- skip", 28); return 0; }
+    if (ext2_write_ok == 0) { kprintln("ext-ext: read-only -- skip", 26); return 0; }
+    var ino = ext2_path_lookup("/extseed.dat", 12);
+    if (ino <= 0) { kprintln("ext-ext: /extseed.dat not found FAIL", 36); return 0 - 1; }
+    if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { kprintln("ext-ext: get_inode FAIL", 23); return 0 - 1; }
+    if ((ext2_inode_flags(&ext2_inode_buf) & 0x80000) == 0) {
+        kprintln("ext-ext: seed not extent-mapped FAIL", 36); return 0 - 1;
+    }
+    kprint("ext-ext: ino=", 13); kprint_num(ino);
+    kprint(" extent size0=", 14); kprint_num(ext2_inode_size_lo(&ext2_inode_buf)); kprintln("", 0);
+
+    # Append 64 bytes of 0xAB at logical block 1 (offset = blocksize) — past the
+    # seed's block 0, so this forces a new-block alloc through the extent path.
+    var pat[64];                                   # function-local var[N] = N bytes
+    var i = 0;
+    while (i < 64) { store8(&pat + i, 0xAB); i = i + 1; }
+    var w = ext2_write_at(ino, ext2_blocksize, &pat, 64);
+    if (w != 64) {
+        kprint("ext-ext: write_at returned ", 27); kprint_num(w); kprintln(" (want 64) FAIL", 15);
+        return 0 - 1;
+    }
+    if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    kprint("ext-ext: append PASS new size=", 30); kprint_num(ext2_inode_size_lo(&ext2_inode_buf)); kprintln("", 0);
     return 0;
 }
