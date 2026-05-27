@@ -5,9 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — FAT LFN/truncate completeness (the 1.34.3 cut — code-complete, awaiting cycle-open VERSION bump + tag) (`core/fatfs.cyr`, `core/main.cyr`, `scripts/fat-write-smoke.sh`)
+## [1.34.3] — 2026-05-26 (**FAT LFN/truncate completeness** — second cut of the 1.34.x write-completeness continuation (roadmap row 21): LFN-with-content, LFN-name overwrite-match (the first LFN *read* in the driver), and grow-truncate. FAT-only — exFAT is UTF-16-native, no LFN. QEMU/`fsck.fat`-validated; no iron burn (final-bite only).)
 
-Second cut of the 1.34.x write-completeness continuation. All three items QEMU-validated via `fat-write-smoke.sh` (`fsck.fat -n` clean throughout, no regression to the existing FAT write gates); build 772,568 → **783,240 B**.
+### Added — FAT LFN/truncate completeness (`core/fatfs.cyr`, `core/main.cyr`, `scripts/fat-write-smoke.sh`)
+
+All three items QEMU-validated via `fat-write-smoke.sh` (`fsck.fat -n` clean throughout, no regression to the existing FAT write gates); build 772,568 → **783,240 B**.
 
 - **bite 1 — LFN-with-content**: new **`fatfs_write_file_lfn`** creates a long-named file carrying content — 8.3-fitting names fall through to `fatfs_write_file`; otherwise it allocates + writes the cluster chain first (data-before-dirent crash ordering), then writes the LFN set with the **8.3-alias entry pointing at the first cluster + carrying FileSize** (the released `fatfs_create_lfn` left the alias at cluster 0 / size 0). `LongContent12345.bin` (3000 B) reads back byte-exact through its long name.
 - **bite 2 — LFN-name overwrite-match**: new **`fatfs_find_lfn`** does the first LFN *read* — it reassembles long names from their reverse-ordered `0x0F` entry runs (13 UTF-16 chars each, terminator-aware) and matches the query against the LONG name OR the 8.3 short name, recording the 8.3 entry's location. `fatfs_write_file_lfn` now uses it to **overwrite an existing long-named file in place** (repoint cluster + size, free the old chain; the 8.3 alias + LFN entries are preserved so the LFN checksum stays valid) instead of creating a duplicate under a fresh `~N` alias. `LfnOver12345.bin` written 3000 B then overwritten 2000 B by its long name → a *single* dir entry, content byte-exact.
