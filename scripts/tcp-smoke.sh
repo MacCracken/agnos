@@ -100,14 +100,26 @@ echo "--- serial log (TCP lines) ---"
 grep -E "tcp:" "$LOG" || echo "(no tcp lines captured)"
 echo "------------------------------"
 
+pass=0
+fail=0
+
 if grep -q "tcp: ring PASS" "$LOG"; then
-    echo "PASS: in-order receive ring (FIFO order + buffer wrap, byte-exact)"
-    echo ""
-    echo "=== tcp-smoke: 1 passed, 0 failed ==="
-    exit 0
+    echo "PASS: B1 in-order receive ring (FIFO order + buffer wrap, byte-exact)"
+    pass=$((pass + 1))
+else
+    echo "FAIL: 'tcp: ring PASS' not found — ring reassembly regression"
+    fail=$((fail + 1))
 fi
 
-echo "FAIL: 'tcp: ring PASS' not found — ring reassembly regression"
+if grep -q "tcp: retx PASS" "$LOG"; then
+    echo "PASS: B2 retransmit logic (RTO backoff + arm/disarm + resend + give-up)"
+    pass=$((pass + 1))
+else
+    echo "FAIL: 'tcp: retx PASS' not found — retransmit logic regression"
+    fail=$((fail + 1))
+fi
+
 echo ""
-echo "=== tcp-smoke: 0 passed, 1 failed ==="
+echo "=== tcp-smoke: $pass passed, $fail failed ==="
+[ "$fail" -eq 0 ] && exit 0
 exit 1

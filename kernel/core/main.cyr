@@ -1335,8 +1335,12 @@ if (vnet_active != 0 || nic_ready() != 0) {
     var cid = tcp_conn_count;
     var cb = tcp_conn_base(cid);
     var ring = kmalloc(TCP_RX_RING);
-    if (ring == 0) {
+    var rtx = kmalloc(TCP_RETX_BUF);
+    if (ring == 0 || rtx == 0) {
+        if (ring != 0) { kfree_sized(ring, TCP_RX_RING); }
+        if (rtx != 0) { kfree_sized(rtx, TCP_RETX_BUF); }
         kprintln("tcp: ring FAIL", 14);
+        kprintln("tcp: retx FAIL", 14);
     } else {
         tcp_conn_count = tcp_conn_count + 1;
         store64(cb, 2);                 # ESTABLISHED
@@ -1345,6 +1349,7 @@ if (vnet_active != 0 || nic_ready() != 0) {
         store64(cb + 56, 0); store64(cb + 64, 0); store64(cb + 72, 0);
         store64(cb + 80, 0); store64(cb + 88, 0); store64(cb + 96, 0);
         store64(cb + 104, 0); store64(cb + 112, 0); store64(cb + 120, 0);
+        store64(cb + 128, 0); store64(cb + 136, rtx);
 
         var src[64];
         var dbuf[64];
@@ -1375,8 +1380,36 @@ if (vnet_active != 0 || nic_ready() != 0) {
         if (ok == 1) { kprintln("tcp: ring PASS", 14); }
         if (ok == 0) { kprintln("tcp: ring FAIL", 14); }
 
+        # --- B2 retransmit logic (hermetic) ---
+        var ok2 = 1;
+        # RTO backoff (fixed base, ×2, capped at ×16).
+        if (tcp_retx_rto(0) != 100) { ok2 = 0; }
+        if (tcp_retx_rto(1) != 200) { ok2 = 0; }
+        if (tcp_retx_rto(4) != 1600) { ok2 = 0; }
+        if (tcp_retx_rto(5) != 1600) { ok2 = 0; }
+        # Arm sets the held-segment fields + pins SND.UNA.
+        tcp_arm_retx(cb, 12345, 0x18, &src, 10);
+        if (load64(cb + 96) != 12345) { ok2 = 0; }    # retx_seq
+        if (load64(cb + 104) != 10) { ok2 = 0; }       # retx_len
+        if (load64(cb + 128) != 0x18) { ok2 = 0; }     # retx_flags armed
+        if (load64(cb + 56) != 12345) { ok2 = 0; }     # SND.UNA pinned
+        # Force the segment "due" (now - (now-2000) = 2000 ≥ RTO via modular
+        # subtraction) and confirm a resend bumps the retry count.
+        store64(cb + 112, timer_ticks - 2000);
+        tcp_retx_tick();
+        if (load64(cb + 120) != 1) { ok2 = 0; }        # one resend
+        # At the retry cap, the next due tick declares the conn dead + disarms.
+        store64(cb + 120, TCP_RTO_RETRIES);
+        store64(cb + 112, timer_ticks - 2000);
+        tcp_retx_tick();
+        if (load64(cb) != 0) { ok2 = 0; }              # CLOSED
+        if (load64(cb + 128) != 0) { ok2 = 0; }        # disarmed
+        if (ok2 == 1) { kprintln("tcp: retx PASS", 14); }
+        if (ok2 == 0) { kprintln("tcp: retx FAIL", 14); }
+
         kfree_sized(ring, TCP_RX_RING);
-        store64(cb + 48, 0); store64(cb, 0);
+        kfree_sized(rtx, TCP_RETX_BUF);
+        store64(cb + 48, 0); store64(cb + 136, 0); store64(cb, 0);
         tcp_conn_count = tcp_conn_count - 1;
     }
 }

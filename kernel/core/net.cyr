@@ -913,6 +913,9 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
 
 fn net_poll() {
     if (nic_ready() == 0) { return 0; }
+    # B2: drive TCP retransmits before draining RX (cheap ≤8-conn scan; only
+    # acts when a held segment's RTO has elapsed).
+    tcp_retx_tick();
     # Drain the WHOLE RX ring per call, not one frame. FreeBSD re_rxeof and
     # iPXE realtek_poll both loop until the next NIC-owned descriptor; AGNOS
     # returned after the first good frame, so under LAN chatter the 16-deep
@@ -996,12 +999,17 @@ fn net_recv_udp(buf, maxlen) {
 #     bits 16-23: parent_listen_id (only meaningful when bit 9 is set)
 #   offset 80:  rx_read (8 bytes) — cumulative bytes drained by tcp_recv
 #   offset 88:  SND.WND (8 bytes) — peer's last-advertised window (reserved; B4)
-#   offset 96:  retx_seq (8 bytes) — reserved (B2 retransmit)
-#   offset 104: retx_len (8 bytes) — reserved (B2)
-#   offset 112: retx_tick (8 bytes) — reserved (B2)
-#   offset 120: retx_count (8 bytes) — reserved (B2)
+#   offset 96:  retx_seq (8 bytes) — seq of the held unACKed segment (B2)
+#   offset 104: retx_len (8 bytes) — payload bytes held (0 for pure SYN/FIN) (B2)
+#   offset 112: retx_tick (8 bytes) — timer_ticks when last (re)sent (B2)
+#   offset 120: retx_count (8 bytes) — retransmit attempts so far (B2)
+#   offset 128: retx_flags (8 bytes) — TCP flags to resend; 0 = disarmed (B2)
+#   offset 136: retx_buf (8 bytes) — held payload ptr (kmalloc TCP_RETX_BUF) (B2)
 # Ring occupancy = rx_write - rx_read; free = TCP_RX_RING - occupancy; the
 # advertised window is that free count (B1 — no longer the hardcoded 8192).
+# One-in-flight retransmit (B2): a single unACKed segment is held in retx_buf
+# and resent on RTO expiry until ACKed or the retry cap; SND.UNA (56) tracks
+# the oldest unACKed seq.
 
 # State constants (kept in this file as `var` globals; the existing state
 # branches use bare integer literals for historical reasons. New code paths
@@ -1020,15 +1028,20 @@ var TCP_FLAG_PASSIVE_OPEN = 0x200;   # bit 9
 var TCP_FLAG_ACCEPTED     = 0x400;   # bit 10
 # parent_listen_id occupies bits 16-23 — see tcp_meta_set_parent / tcp_meta_get_parent
 
-var tcp_conns[640];  # ≥ 8 connections x 128 bytes (module-global var[N] = N×8 B = 5120 B)
+var tcp_conns[640];  # ≥ 8 connections x 144 bytes (module-global var[N] = N×8 B = 5120 B)
 var tcp_conn_count = 0;
 var tcp_rx_tmpbuf[256];
 # Per-connection receive ring size (B1). 2048 fits the 16-bit window field
 # and the heap's 2048-byte slab class; 8× this is the worst-case TCP rx heap.
 var TCP_RX_RING = 2048;
+# Retransmit (B2): held-segment buffer size (one Ethernet MSS payload), fixed
+# initial RTO in 100 Hz timer ticks (1 s), and the retry cap before giving up.
+var TCP_RETX_BUF = 1460;
+var TCP_RTO_BASE = 100;        # ticks (1 s at the 100 Hz timer)
+var TCP_RTO_RETRIES = 5;       # resends before declaring the conn dead
 
 fn tcp_conn_base(conn_id) {
-    return &tcp_conns + conn_id * 128;
+    return &tcp_conns + conn_id * 144;
 }
 
 # Receive-ring free space (B1) — TCP_RX_RING minus current occupancy. This is
@@ -1161,6 +1174,70 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     return nic_send(p, off + 20 + tcp_total);
 }
 
+# === TCP retransmit (B2) — one in-flight segment, fixed RTO + ×2 backoff ===
+# Per tcp-hardening-prior-art.md § 4: stop-and-wait-scale retransmit (iPXE
+# model). A single unACKed segment is held; resent on RTO expiry until the
+# peer ACKs past it or the retry cap declares the conn dead.
+
+# Arm (or re-arm) the held segment. `seq` = its starting seq; `flags` = the
+# TCP flags to resend with (0x02 SYN / 0x12 SYN-ACK / 0x18 data / 0x11 FIN-ACK);
+# `data`/`data_len` its payload (data_len 0 for flag-only segments). SND.UNA is
+# pinned to `seq` while armed (the oldest unACKed byte).
+fn tcp_arm_retx(cb, seq, flags, data, data_len) {
+    var n = data_len;
+    if (n > TCP_RETX_BUF) { n = TCP_RETX_BUF; }
+    if (n > 0) {
+        var rb = load64(cb + 136);
+        if (rb != 0) { net_copy_buf(rb, data, n); }
+    }
+    store64(cb + 56, seq);          # SND.UNA
+    store64(cb + 96, seq);          # retx_seq
+    store64(cb + 104, n);           # retx_len
+    store64(cb + 112, timer_ticks); # retx_tick (last sent)
+    store64(cb + 120, 0);           # retx_count (fresh)
+    store64(cb + 128, flags);       # retx_flags (non-zero = armed)
+    return 0;
+}
+
+fn tcp_disarm_retx(cb) {
+    store64(cb + 128, 0);           # retx_flags = 0 (nothing in flight)
+    return 0;
+}
+
+# RTO for a retry count: TCP_RTO_BASE doubled per retry, capped at ×16 (RFC
+# 6298 backoff; fixed base, RTT estimation deferred — audit § 4).
+fn tcp_retx_rto(count) {
+    var shift = count;
+    if (shift > 4) { shift = 4; }
+    return TCP_RTO_BASE << shift;
+}
+
+# Per-poll retransmit driver (called from net_poll). Resends each armed conn's
+# held segment when its RTO has elapsed, doubling the RTO; after TCP_RTO_RETRIES
+# resends with no ACK, the conn is declared dead (→ CLOSED).
+fn tcp_retx_tick() {
+    for (var i = 0; i < tcp_conn_count; i = i + 1) {
+        var cb = tcp_conn_base(i);
+        var rflags = load64(cb + 128);
+        if (rflags == 0) { continue; }                       # not armed
+        var count = load64(cb + 120);
+        if ((timer_ticks - load64(cb + 112)) < tcp_retx_rto(count)) { continue; }
+        if (count >= TCP_RTO_RETRIES) {
+            store64(cb, 0);          # exhausted → CLOSED
+            tcp_disarm_retx(cb);
+            continue;
+        }
+        # Resend from retx_seq (temporarily restore it as SND.NXT for the build).
+        var saved_nxt = load64(cb + 32);
+        store64(cb + 32, load64(cb + 96));
+        tcp_send_pkt(i, rflags, load64(cb + 136), load64(cb + 104));
+        store64(cb + 32, saved_nxt);
+        store64(cb + 112, timer_ticks);
+        store64(cb + 120, count + 1);
+    }
+    return 0;
+}
+
 fn tcp_connect(dst_ip, dst_port, src_port) {
     if (tcp_conn_count >= 8) { return 0 - 1; }
     var conn_id = tcp_conn_count;
@@ -1169,6 +1246,9 @@ fn tcp_connect(dst_ip, dst_port, src_port) {
     # Allocate per-connection receive RING (S5: prevent shared-buffer corruption)
     var rx_buf = kmalloc(TCP_RX_RING);
     if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0 - 1; }
+    # Retransmit hold buffer (B2).
+    var retx_buf = kmalloc(TCP_RETX_BUF);
+    if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); tcp_conn_count = tcp_conn_count - 1; return 0 - 1; }
     # Use timer_ticks for initial seq randomization (reduces spoofing risk)
     var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
     store64(cb, 1);             # state = SYN_SENT
@@ -1183,17 +1263,22 @@ fn tcp_connect(dst_ip, dst_port, src_port) {
     store64(cb + 72, 0);        # flags
     store64(cb + 80, 0);        # rx_read
     store64(cb + 88, 0);        # SND.WND (peer window; learned on SYN-ACK)
-    store64(cb + 96, 0);        # retx_seq   (B2)
-    store64(cb + 104, 0);       # retx_len   (B2)
-    store64(cb + 112, 0);       # retx_tick  (B2)
-    store64(cb + 120, 0);       # retx_count (B2)
-    # Send SYN (flags = 0x02)
+    store64(cb + 96, 0);        # retx_seq
+    store64(cb + 104, 0);       # retx_len
+    store64(cb + 112, 0);       # retx_tick
+    store64(cb + 120, 0);       # retx_count
+    store64(cb + 128, 0);       # retx_flags (disarmed)
+    store64(cb + 136, retx_buf);
+    # Send SYN (flags = 0x02) and arm its retransmit.
     tcp_send_pkt(conn_id, 0x02, 0, 0);
+    tcp_arm_retx(cb, isn, 0x02, 0, 0);
     # Advance SND.NXT by 1 (SYN consumes a sequence number); SND.UNA stays at
     # isn until the SYN is ACKed.
     store64(cb + 32, (isn + 1) & 0xFFFFFFFF);
-    # Wait for SYN-ACK (poll a few times)
-    for (var i = 0; i < 200; i = i + 1) {
+    # Wait for SYN-ACK. Poll on a timer deadline (not a fixed iteration count)
+    # so the B2 retransmits (1 s, 2 s, …) have time to recover a lost SYN.
+    var deadline = timer_ticks + 800;   # ~8 s
+    while (timer_ticks < deadline) {
         net_poll();
         var state = load64(cb);
         if (state == 2) { return conn_id; }
@@ -1211,11 +1296,12 @@ fn tcp_send(conn_id, data, len) {
     var cb = tcp_conn_base(conn_id);
     var state = load64(cb);
     if (state != 2) { return 0 - 1; }
-    # Send PSH+ACK (flags = 0x18)
-    var r = tcp_send_pkt(conn_id, 0x18, data, len);
-    # Advance seq
+    # Send PSH+ACK (flags = 0x18), advance SND.NXT, and arm the retransmit
+    # (B2 — one in flight; a fetch client sends a request then waits).
     var seq = load64(cb + 32);
-    store64(cb + 32, seq + len);
+    var r = tcp_send_pkt(conn_id, 0x18, data, len);
+    store64(cb + 32, (seq + len) & 0xFFFFFFFF);
+    tcp_arm_retx(cb, seq, 0x18, data, len);
     return r;
 }
 
@@ -1254,23 +1340,30 @@ fn tcp_close(conn_id) {
     var cb = tcp_conn_base(conn_id);
     var state = load64(cb);
     if (state == 2) {
-        # Send FIN+ACK (flags = 0x11)
+        # Send FIN+ACK (flags = 0x11), advance SND.NXT, arm the FIN retransmit
+        # (flag-only — retx_len 0, so it never dereferences the held buffer).
+        var seq = load64(cb + 32);
         tcp_send_pkt(conn_id, 0x11, 0, 0);
         store64(cb, 3);  # FIN_WAIT
-        # Advance seq by 1 (FIN consumes a sequence number)
-        var seq = load64(cb + 32);
-        store64(cb + 32, seq + 1);
+        store64(cb + 32, (seq + 1) & 0xFFFFFFFF);
+        tcp_arm_retx(cb, seq, 0x11, 0, 0);
     }
     if (state == 4) {
         # CLOSE_WAIT: send FIN+ACK
         tcp_send_pkt(conn_id, 0x11, 0, 0);
         store64(cb, 0);  # CLOSED
     }
-    # Free per-connection receive ring
+    # Free per-connection buffers (receive ring + retransmit hold). The FIN
+    # retransmit above is flag-only, so freeing the hold buffer here is safe.
     var rx_buf = load64(cb + 48);
     if (rx_buf != 0) {
         kfree_sized(rx_buf, TCP_RX_RING);
         store64(cb + 48, 0);
+    }
+    var retx_buf = load64(cb + 136);
+    if (retx_buf != 0) {
+        kfree_sized(retx_buf, TCP_RETX_BUF);
+        store64(cb + 136, 0);
     }
     return 0;
 }
@@ -1314,6 +1407,8 @@ fn tcp_listen(port) {
     store64(cb + 104, 0);       # retx_len unused
     store64(cb + 112, 0);       # retx_tick unused
     store64(cb + 120, 0);       # retx_count unused
+    store64(cb + 128, 0);       # retx_flags unused (LISTEN never retransmits)
+    store64(cb + 136, 0);       # retx_buf unused
     return conn_id;
 }
 
@@ -1394,9 +1489,11 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         var new_id = tcp_conn_count;
         tcp_conn_count = tcp_conn_count + 1;
         var ncb = tcp_conn_base(new_id);
-        # Per-connection receive ring (matches active tcp_connect path).
+        # Per-connection receive ring + retransmit hold (matches tcp_connect).
         var rx_buf = kmalloc(TCP_RX_RING);
         if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0; }
+        var retx_buf = kmalloc(TCP_RETX_BUF);
+        if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); tcp_conn_count = tcp_conn_count - 1; return 0; }
         # ISN — same timer-driven random as tcp_connect.
         var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
         store64(ncb, 6);                       # state = SYN_RCVD
@@ -1413,19 +1510,40 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         store64(ncb + 72, meta);
         store64(ncb + 80, 0);                  # rx_read
         store64(ncb + 88, 0);                  # SND.WND (learned on the ACK)
-        store64(ncb + 96, 0);                  # retx_seq   (B2)
-        store64(ncb + 104, 0);                 # retx_len   (B2)
-        store64(ncb + 112, 0);                 # retx_tick  (B2)
-        store64(ncb + 120, 0);                 # retx_count (B2)
-        # Send SYN+ACK (0x12).
+        store64(ncb + 96, 0);                  # retx_seq
+        store64(ncb + 104, 0);                 # retx_len
+        store64(ncb + 112, 0);                 # retx_tick
+        store64(ncb + 120, 0);                 # retx_count
+        store64(ncb + 128, 0);                 # retx_flags (disarmed)
+        store64(ncb + 136, retx_buf);
+        # Send SYN+ACK (0x12), advance SND.NXT, arm its retransmit.
         tcp_send_pkt(new_id, 0x12, 0, 0);
-        # Advance seq by 1 (SYN consumes one sequence number).
+        tcp_arm_retx(ncb, isn, 0x12, 0, 0);
         store64(ncb + 32, (isn + 1) & 0xFFFFFFFF);
         return 1;
     }
     var cb = tcp_conn_base(conn_id);
     var state = load64(cb);
     var data_len = ip_payload_len - tcp_hdr_len;
+    # B2: an inbound ACK that covers our held (oldest unACKed) segment advances
+    # SND.UNA and disarms the retransmit. seqlen counts the SYN/FIN phantom byte.
+    # The `< 0x40000000` guard rejects wrapped dup-acks (ack <= retx_seq).
+    if ((flags & 0x10) != 0) {
+        var rflags = load64(cb + 128);
+        if (rflags != 0) {
+            var rseq = load64(cb + 96);
+            var seqlen = load64(cb + 104);
+            if ((rflags & 0x02) != 0) { seqlen = seqlen + 1; }
+            if ((rflags & 0x01) != 0) { seqlen = seqlen + 1; }
+            var diff = (ack - rseq) & 0xFFFFFFFF;
+            if (diff >= seqlen) {
+                if (diff < 0x40000000) {
+                    store64(cb + 56, ack);   # SND.UNA = ack
+                    tcp_disarm_retx(cb);
+                }
+            }
+        }
+    }
     # SYN_SENT: expect SYN-ACK (flags & 0x12 == 0x12)
     if (state == 1) {
         if ((flags & 0x12) == 0x12) {
