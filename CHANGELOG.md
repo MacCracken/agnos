@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.34.6] — 2026-05-26 (**ESP-write safety guard** — the 1.34.x arc cap (code half). FAT/exFAT refuse writes to an ESP-type GPT partition so the boot ESP can't be clobbered, before the FAT-family arc's first iron burn. QEMU-validated (fires / override / no-false-block); the user-driven iron burn is the only remaining 1.34.x item.)
+
+### Added — ESP-write safety guard (1.34.x arc cap) (`core/fatfs.cyr`, `core/exfat.cyr`, `scripts/build.sh`, `scripts/fat-write-smoke.sh`)
+
+Before the FAT-family arc's first iron burn: AGNOS now refuses FAT/exFAT **writes** to an ESP-type GPT partition — the boot ESP (gnoboot's `BOOTX64.EFI` + the kernel) is firmware/boot territory; data writes belong on a Microsoft-Basic-Data partition or a removable USB stick. `fatfs`/`exfat` record `fat_on_esp`/`exfat_on_esp` at mount (the matched partition's type GUID is ESP vs MSFT-Basic; whole-disk = writable), and the single write chokepoint `fat_blk_write`/`exfat_blk_write` refuses when on the ESP, so a write self-test or a write bug can't touch the boot files. `FAT_ALLOW_ESP_WRITE` (build flag) overrides it for the QEMU `fat-write-smoke`, whose ESP is a throwaway test image. (`boot_info` carries no boot-device field, so the guard keys off the ESP partition-type GUID, not "the partition we booted from.")
+
+QEMU-validated 3 ways: **(A) fires** — write self-test with no override on the ESP → `create rc=-1`, `BOOTX64.EFI` intact, no test file written, `fsck.fat` clean; **(B) override** — `FAT_ALLOW_ESP_WRITE` → ESP writes work; **(C) no false-block** — exFAT on a MSFT-Basic partition (no override) → writes work, `fsck.exfat` clean. Completes the 1.34.x write-completeness continuation's arc cap; the user-driven FAT/exFAT iron burn (plan in `iron-nuc-zen-log.md` `#tracker-1341-cycle`) is the only remaining 1.34.x item.
+
 ## [1.34.5] — 2026-05-26 (**exFAT Unicode names** — the final cut of the 1.34.x write-completeness continuation (roadmap row 21): the volume's **up-case table** now drives the NameHash + case-fold compare, so non-ASCII names round-trip correctly instead of ASCII-upcase. QEMU/`fsck.exfat`-validated; no iron burn (the arc-cap FAT/exFAT iron burn is the only remaining 1.34.x item, user-driven).)
 
 ### Added — exFAT Unicode names: real up-case table for NameHash + case-fold (`core/exfat.cyr`, `core/main.cyr`, `scripts/exfat-write-smoke.sh`)

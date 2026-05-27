@@ -105,6 +105,12 @@ else
     #                     bite 3): create a file by writing its dir-set
     #                     (0x85/0xC0/0xC1 + SetChecksum + NameHash). Gated
     #                     by scripts/exfat-write-smoke.sh (fsck.exfat -n).
+    #   FAT_ALLOW_ESP_WRITE=1 — override the ESP-write safety guard (1.34.x):
+    #                     FAT/exFAT writes are refused on an ESP-type GPT
+    #                     partition by default (the boot ESP is read-only).
+    #                     Set this ONLY for the QEMU fat-write-smoke, whose
+    #                     ESP image is a throwaway test volume. NEVER on an
+    #                     iron build — the burn targets a data volume.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -120,6 +126,7 @@ else
         [ -n "$FATFS_WRITE_SELFTEST" ] && echo '#define FATFS_WRITE_SELFTEST'
         [ -n "$EXFAT_SELFTEST" ] && echo '#define EXFAT_SELFTEST'
         [ -n "$EXFAT_WRITE_SELFTEST" ] && echo '#define EXFAT_WRITE_SELFTEST'
+        [ -n "$FAT_ALLOW_ESP_WRITE" ] && echo '#define FAT_ALLOW_ESP_WRITE'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

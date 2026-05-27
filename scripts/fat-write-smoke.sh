@@ -14,7 +14,9 @@
 # length file is fsck.fat-clean on its own. Content write (cluster
 # allocator + chain) is bite 3b.
 #
-# Build first:  FATFS_WRITE_SELFTEST=1 ./scripts/build.sh
+# Build first:  FATFS_WRITE_SELFTEST=1 FAT_ALLOW_ESP_WRITE=1 ./scripts/build.sh
+#               (this smoke writes the ESP test image, so it overrides the
+#                ESP-write safety guard — that override is for test images ONLY)
 # Requires: qemu-system-x86_64, OVMF, parted, mtools, sgdisk, fsck.fat
 #           (dosfstools), dd, strings. gnoboot at ../gnoboot/build/.
 # Exit 0 if create + fsck-clean + mdir all pass; 1 otherwise.
@@ -47,7 +49,7 @@ done
 GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 1; }
-[ -f "$AGNOS" ]   || { echo "ERROR: agnos not built — run FATFS_WRITE_SELFTEST=1 ./scripts/build.sh"; exit 1; }
+[ -f "$AGNOS" ]   || { echo "ERROR: agnos not built — run FATFS_WRITE_SELFTEST=1 FAT_ALLOW_ESP_WRITE=1 ./scripts/build.sh"; exit 1; }
 
 WORK="$ROOT/build/fat-write-smoke"
 LOGS="$ROOT/build/fat-write-smoke-logs"

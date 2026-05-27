@@ -25,21 +25,21 @@
 
 #ifdef ARCH_X86_64
 fn print_agnos_kernel_banner() {
-    kprintln("AGNOS kernel v1.34.5", 20);
+    kprintln("AGNOS kernel v1.34.6", 20);
 }
 #endif
 
 #ifdef ARCH_AARCH64
 fn print_agnos_kernel_banner() {
-    serial_println("AGNOS kernel v1.34.5 [aarch64]", 30);
+    serial_println("AGNOS kernel v1.34.6 [aarch64]", 30);
 }
 #endif
 
 fn print_agnos_shell_banner() {
-    kprintln("AGNOS shell v1.34.5 (type 'help')", 33);
+    kprintln("AGNOS shell v1.34.6 (type 'help')", 33);
 }
 
 # Bare version string — safe to use from any consumer that runs AFTER
 # gvar init has completed (kybernet, userspace, etc.). NOT safe to use
 # from the kernel program body (same kmode init-order constraint above).
-var _AGNOS_VERSION = "1.34.5";
+var _AGNOS_VERSION = "1.34.6";

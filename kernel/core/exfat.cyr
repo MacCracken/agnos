@@ -33,6 +33,7 @@ var exfat_bitmap_length = 0;           # bytes
 var exfat_upcase_cluster = 0;
 var exfat_upcase_length = 0;           # bytes
 var exfat_upcase_checksum = 0;         # TableChecksum from the 0x82 entry
+var exfat_on_esp = 0;                  # 1 if mounted on an ESP-type GPT partition — writes refused by default (1.34.x ESP-write safety guard)
 
 # Scratch buffers. Single-threaded kernel (per project_multithreading_
 # future_arc) → module-global shared scratch is safe. NB module-global
@@ -193,23 +194,25 @@ fn exfat_init() {
         if (blk_is_registered(tag) == 0) { continue; }
 
         # Whole-disk exFAT (no partition table).
-        if (exfat_probe_backend(tag, 0) == 1) { matched = 1; break; }
+        if (exfat_probe_backend(tag, 0) == 1) { exfat_on_esp = 0; matched = 1; break; }
 
         # Partition-aware: GPT is parsed only against blk_active. exFAT
-        # lives in ESP or Microsoft-Basic-Data partitions.
+        # lives in ESP or Microsoft-Basic-Data partitions. Record whether the
+        # matched partition is the ESP (→ write-protected by the guard).
         if (gpt_present == 1) {
             if (tag == blk_active) {
                 for (var pi = 0; pi < gpt_partition_count; pi = pi + 1) {
                     if (gpt_partition_info(pi) != 1) { continue; }
                     var is_cand = 0;
+                    var is_esp = 0;
                     if (gpt_q_type_lo == GPT_TYPE_ESP_LO) {
-                        if (gpt_q_type_hi == GPT_TYPE_ESP_HI) { is_cand = 1; }
+                        if (gpt_q_type_hi == GPT_TYPE_ESP_HI) { is_cand = 1; is_esp = 1; }
                     }
                     if (gpt_q_type_lo == GPT_TYPE_MSFT_BASIC_LO) {
                         if (gpt_q_type_hi == GPT_TYPE_MSFT_BASIC_HI) { is_cand = 1; }
                     }
                     if (is_cand == 0) { continue; }
-                    if (exfat_probe_backend(tag, gpt_q_first_lba) == 1) { matched = 1; break; }
+                    if (exfat_probe_backend(tag, gpt_q_first_lba) == 1) { exfat_on_esp = is_esp; matched = 1; break; }
                 }
             }
         }
@@ -564,8 +567,16 @@ fn exfat_ls() {
 
 # === Write path (1.34.1 bite 3) ===
 
-# Partition-relative block write — mirror of exfat_blk_read.
+# Partition-relative block write — mirror of exfat_blk_read. ESP-write safety
+# guard (1.34.x arc cap): refuse all writes when mounted on an ESP-type GPT
+# partition (the boot ESP); data writes belong on a Microsoft-Basic-Data
+# partition or a removable USB stick. Single write chokepoint, so refusing
+# here blocks every mutation before any disk touch. `FAT_ALLOW_ESP_WRITE`
+# overrides it (shared with fatfs) for controlled QEMU test images.
 fn exfat_blk_write(sector, buf) {
+    #ifndef FAT_ALLOW_ESP_WRITE
+    if (exfat_on_esp == 1) { return 0 - 1; }
+    #endif
     return blk_write_on(exfat_backend, exfat_partition_first_lba + sector, buf);
 }
 
