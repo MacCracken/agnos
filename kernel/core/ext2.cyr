@@ -1404,9 +1404,9 @@ fn ext2_extent_leaf_place(leafblk, lblk, nb, inode_num, inode_buf) {
         var ll = ext2_load16_le(lst, 4);
         var lp = ext2_load32_le(lst, 8) | (ext2_load16_le(lst, 6) << 32);
         if (lblk == lb + ll) { if (nb == lp + ll) { if (ll < 0x8000) {
-            ext2_store16_le(lst, 4, ll + 1);
-            placed = 1;
-        }}}
+                    ext2_store16_le(lst, 4, ll + 1);
+                    placed = 1;
+                }}}
         if (placed == 0) {
             if (lblk < lb + ll) { return 0; }                # out-of-order — deferred
             if (le >= lm) { return 0; }                       # leaf full → 1.37.2
@@ -1481,11 +1481,11 @@ fn ext2_extent_append_block(inode_buf, lblk, inode_num) {
 
     # Extend the last extent (no new entry — works even at entries==max).
     if (lblk == last_block + last_len) { if (nb == last_phys + last_len) { if (last_len < 0x8000) {
-        ext2_store16_le(last, 4, last_len + 1);
-        ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
-        ext2_bmap_was_new = 1;
-        return nb;
-    }}}
+                ext2_store16_le(last, 4, last_len + 1);
+                ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+                ext2_bmap_was_new = 1;
+                return nb;
+            }}}
 
     # New entry needed: insert into the inline root if it has room.
     if (entries < max) {
