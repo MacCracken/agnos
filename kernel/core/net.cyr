@@ -818,6 +818,74 @@ fn dns_resolve(host, host_len, out_ip) {
     return result;
 }
 
+# === NTP / SNTP client (1.35.x) ===
+# RFC 4330 simple unicast client — sets the kernel's first wall clock from one
+# UDP/123 query. No offset calc, no drift discipline (audit § 7). Multi-source
+# convergent per docs/development/ntp-sntp-prior-art.md.
+var NTP_UNIX_DELTA = 2208988800;   # seconds between the 1900 and 1970 epochs
+var NTP_CLIENT_PORT = 0xC7B0;      # fixed ephemeral source port for the stub
+var ntp_listener = 0;
+var ntp_listener_bound = 0;
+var net_unix_time = 0;             # synced base — Unix seconds at the sync moment
+var net_ntp_synctick = 0;          # timer_ticks captured at sync
+var net_ntp_synced = 0;            # 1 once a sync has landed
+
+# Transmit Timestamp (offset 40, 32-bit seconds, big-endian) → Unix seconds.
+fn ntp_parse_unix(resp) {
+    var ntp_secs = dhcp_load_u32_be(resp + 40);
+    if (ntp_secs == 0) { return 0; }
+    return ntp_secs - NTP_UNIX_DELTA;
+}
+
+# Query server_ip:123 for the time; on success set net_unix_time + the sync
+# tick. Returns 0 on success, 0-1 on failure (no NIC / no server / timeout).
+fn ntp_sync(server_ip) {
+    if (nic_ready() == 0) { return 0 - 1; }
+    if (server_ip == 0) { return 0 - 1; }
+    if (ntp_listener_bound == 0) {
+        var bound = udp_bind(NTP_CLIENT_PORT);
+        if (bound < 0) { return 0 - 1; }
+        ntp_listener = bound;
+        ntp_listener_bound = 1;
+    }
+    var req[48];
+    var i = 0;
+    while (i < 48) { store8(&req + i, 0); i = i + 1; }
+    store8(&req, 0x1B);            # LI=0 VN=3 Mode=3 (client)
+
+    var rbuf[64];
+    udp_recv_from(ntp_listener, &rbuf, 64, 0, 0);   # drain any stale datagram
+    udp_send_from(net_ip, server_ip, NTP_CLIENT_PORT, 123, &req, 48);
+
+    var result = 0 - 1;
+    for (var t = 0; t < 800; t = t + 1) {
+        if (t == 400) { udp_send_from(net_ip, server_ip, NTP_CLIENT_PORT, 123, &req, 48); }
+        net_poll();
+        var n = udp_recv_from(ntp_listener, &rbuf, 64, 0, 0);
+        if (n >= 48) {
+            if ((load8(&rbuf) & 0x07) == 4) {        # mode = 4 (server)
+                var u = ntp_parse_unix(&rbuf);
+                if (u != 0) {
+                    net_unix_time = u;
+                    net_ntp_synctick = timer_ticks;
+                    net_ntp_synced = 1;
+                    result = 0;
+                    t = 800;                          # break
+                }
+            }
+        }
+        arch_wait();
+    }
+    return result;
+}
+
+# Current wall-clock Unix seconds — the synced base plus elapsed ticks (free-
+# running, disciplined only at sync; 100 Hz timer). 0 if never synced.
+fn ntp_now() {
+    if (net_ntp_synced == 0) { return 0; }
+    return net_unix_time + (timer_ticks - net_ntp_synctick) / 100;
+}
+
 fn net_handle_arp(pkt, len) {
     # ARP: eth header (14) + ARP payload
     # Check operation: offset 14+6

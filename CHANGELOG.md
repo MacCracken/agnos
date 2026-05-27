@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — NTP/SNTP client + the kernel's first wall clock (1.35.x comms)
+
+The kernel had **no time-of-day** — only `timer_ticks` (a 100 Hz counter); the RTC was never read. A unicast SNTP client (RFC 4330 simple mode) now sets a wall clock from one UDP/123 query. This is the third networking-comms item (after DNS + ICMP + TCP hardening) and the last AGNOS-side prerequisite before TLS (cert-validity checks need a real clock). Audit-doc-first: agnosticos [`ntp-sntp-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ntp-sntp-prior-art.md) (RFC 4330/5905 + musl/OpenBSD/chrony-simple + lwIP sntp).
+
+- **`net.cyr`** — `ntp_sync(server_ip)` builds the 48-byte SNTP request (byte 0 = `0x1B`, rest zero), sends to `:123` from a fixed ephemeral port (DNS-style lazy bind), polls for the response, validates mode 4, and reads the **Transmit Timestamp** (offset 40). `ntp_parse_unix` converts NTP→Unix (subtract the `2208988800` 1900↔1970 delta). `net_unix_time` + `net_ntp_synctick` hold the synced base; `ntp_now()` returns a free-running wall clock = base + elapsed-ticks/100. Reuses the existing UDP transport + (for hostnames) `dns_resolve`. Simple mode only — no offset/delay calc, no clock discipline, no 2036-era handling (audit § 7).
+- **`shell.cyr`** — `ntp <server>` (dotted-quad or DNS-resolved, like `ping`) syncs + prints the Unix time; `date` prints `ntp_now()` as Unix seconds + a UTC `HH:MM:SS` breakdown (or "not synced").
+- **Validation** — new `scripts/ntp-smoke.sh` (`NTP_SELFTEST=1`): hermetic `ntp: parse PASS` — a synthetic response's transmit timestamp (NTP `3913056000`) converts to Unix `1704067200` (2024-01-01 00:00:00 UTC) and a +3661 s value breaks down to `01:01:01`. Live SNTP sync is the manual `ntp <server>` verb (SLIRP has no NTP server). `test.sh` 4/4, `check.sh` 11/11. Production build 816,544 → **819,888 B**.
+
 ## [1.35.1] — 2026-05-27 (**cycle-open** — **TCP hardening**, the reliable-fetch enabler. The minimal SYN/ACK/FIN state machine (1.32.0) connects/sends/recvs but has no retransmit, no RX window, no MSS negotiation — fine for DHCP/DNS/ICMP request-reply, not for a sustained `ark`/`nous` fetch. This cycle hardens it. The 1.35.0 catchup cut — full docs sweep + DNS stub + ICMP/ping — is closed; legacy virtio-net stays back-burnered; NTP/SNTP queues after TCP; TLS stays with the cyrius agent. **Lean cycle-open**: VERSION 1.35.0 → 1.35.1, this header; multi-source audit-doc-first per [[feedback_redesign_dont_reinvent]], then bites.)
 
 ### Changed — TCP hardening B0 + B1: in-order receive ring (the keystone)

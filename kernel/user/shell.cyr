@@ -189,6 +189,8 @@ fn sh_cmd_help() {
     kprintln("  tcp     - TCP connect test", 28);
     kprintln("  dns     - resolve hostname", 28);
     kprintln("  ping    - ICMP echo a host", 28);
+    kprintln("  ntp     - SNTP time sync", 25);
+    kprintln("  date    - show synced UTC time", 32);
     kprintln("  pipe    - test pipe IPC", 25);
     kprintln("  blkread - read disk sector", 28);
     kprintln("  parts   - list GPT partitions", 31);
@@ -867,6 +869,39 @@ fn sh_exec(buf, len) {
         } else {
             kprint("ping: reply in ", 15); kprint_num(rtt); kprintln(" ticks", 6);
         }
+        return 0;
+    }
+    if (sh_streq(buf, clen, "ntp", 3) == 1) {
+        if (vnet_active == 0 && nic_ready() == 0) { kprintln("no network", 10); return 0; }
+        var s = 0;
+        while (s < arglen) { if (load8(arg + s) != 32) { break; } s = s + 1; }
+        var h = arg + s;
+        var hlen = arglen - s;
+        while (hlen > 0) { if (load8(h + hlen - 1) != 32) { break; } hlen = hlen - 1; }
+        if (hlen < 1) { kprintln("usage: ntp <server>", 19); return 0; }
+        var srv = sh_parse_ipv4(h, hlen);
+        if (srv == 0) {
+            if (dns_resolve(h, hlen, &srv) != 0) { kprintln("ntp: cannot resolve", 19); return 0; }
+        }
+        if (ntp_sync(srv) != 0) { kprintln("ntp: no response", 16); return 0; }
+        kprint("ntp: synced unix=", 17); kprint_num(ntp_now()); kprintln("", 0);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "date", 4) == 1) {
+        var now = ntp_now();
+        if (now == 0) { kprintln("date: not synced -- run ntp <srv>", 33); return 0; }
+        kprint("unix=", 5); kprint_num(now);
+        var tod = now % 86400;     # seconds into the UTC day
+        var hh = tod / 3600;
+        var mm = (tod % 3600) / 60;
+        var ss = tod % 60;
+        kprint(" UTC ", 5);
+        if (hh < 10) { kprint("0", 1); }
+        kprint_num(hh); kprint(":", 1);
+        if (mm < 10) { kprint("0", 1); }
+        kprint_num(mm); kprint(":", 1);
+        if (ss < 10) { kprint("0", 1); }
+        kprint_num(ss); kprintln("", 0);
         return 0;
     }
     if (sh_streq(buf, clen, "blkread", 7) == 1) {

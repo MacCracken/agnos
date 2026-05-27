@@ -1447,6 +1447,32 @@ if (vnet_active != 0 || nic_ready() != 0) {
 }
 #endif
 
+#ifdef NTP_SELFTEST
+# NTP parse self-test (1.35.x). Hermetic: a synthetic SNTP response whose
+# Transmit Timestamp (offset 40) = NTP 3913056000 must parse to Unix
+# 1704067200 (2024-01-01 00:00:00 UTC, via the 1900→1970 epoch delta), and a
+# +3661 s value must break down to 01:01:01 UTC. Zero network dependency.
+{
+    var resp[48];
+    var i = 0;
+    while (i < 48) { store8(&resp + i, 0); i = i + 1; }
+    store8(&resp, 0x1C);   # LI=0 VN=3 Mode=4 (server) — realistic, not checked here
+    store8(&resp + 40, (3913056000 >> 24) & 0xFF);
+    store8(&resp + 41, (3913056000 >> 16) & 0xFF);
+    store8(&resp + 42, (3913056000 >> 8) & 0xFF);
+    store8(&resp + 43, 3913056000 & 0xFF);
+    var ok = 1;
+    if (ntp_parse_unix(&resp) != 1704067200) { ok = 0; }
+    var t = 1704070861;            # 1704067200 + 3661 s
+    var tod = t % 86400;
+    if (tod / 3600 != 1) { ok = 0; }
+    if ((tod % 3600) / 60 != 1) { ok = 0; }
+    if (tod % 60 != 1) { ok = 0; }
+    if (ok == 1) { kprintln("ntp: parse PASS", 15); }
+    if (ok == 0) { kprintln("ntp: parse FAIL", 15); }
+}
+#endif
+
 #ifdef TCP_LISTEN_SMOKE
 # TCP server-side smoke (1.32.0 bite A). Validates that:
 #   - tcp_listen(port) allocates a LISTEN slot
