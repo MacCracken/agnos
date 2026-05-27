@@ -25,6 +25,36 @@ fn sh_streq(a, alen, b, blen) {
     return memeq(a, b, alen);
 }
 
+# Parse a dotted-quad "a.b.c.d" into a big-endian u32 (via ip4). Returns 0
+# if the string isn't a well-formed IPv4 literal — the caller then treats it
+# as a hostname and resolves it via DNS.
+fn sh_parse_ipv4(str, len) {
+    var o0 = 0; var o1 = 0; var o2 = 0; var o3 = 0;
+    var oi = 0; var cur = 0; var digits = 0;
+    for (var i = 0; i < len; i = i + 1) {
+        var c = load8(str + i);
+        if (c == 46) {                 # '.'
+            if (digits == 0) { return 0; }
+            if (oi == 0) { o0 = cur; }
+            if (oi == 1) { o1 = cur; }
+            if (oi == 2) { o2 = cur; }
+            if (oi >= 3) { return 0; }
+            oi = oi + 1; cur = 0; digits = 0;
+        } else {
+            var d = c - 48;
+            if (d < 0) { return 0; }
+            if (d > 9) { return 0; }
+            cur = cur * 10 + d;
+            if (cur > 255) { return 0; }
+            digits = digits + 1;
+        }
+    }
+    if (digits == 0) { return 0; }
+    if (oi != 3) { return 0; }          # need exactly 4 octets
+    o3 = cur;
+    return ip4(o0, o1, o2, o3);
+}
+
 fn sh_cwd_init() {
     store8(&sh_cwd_path, 47);
     sh_cwd_len = 1;
@@ -158,6 +188,7 @@ fn sh_cmd_help() {
     kprintln("  recv    - recv UDP pkt", 24);
     kprintln("  tcp     - TCP connect test", 28);
     kprintln("  dns     - resolve hostname", 28);
+    kprintln("  ping    - ICMP echo a host", 28);
     kprintln("  pipe    - test pipe IPC", 25);
     kprintln("  blkread - read disk sector", 28);
     kprintln("  parts   - list GPT partitions", 31);
@@ -810,6 +841,32 @@ fn sh_exec(buf, len) {
         kprint_num((resolved >> 16) & 0xFF); kprint(".", 1);
         kprint_num((resolved >> 8) & 0xFF); kprint(".", 1);
         kprint_num(resolved & 0xFF); kprintln("", 0);
+        return 0;
+    }
+    if (sh_streq(buf, clen, "ping", 4) == 1) {
+        if (vnet_active == 0 && nic_ready() == 0) { kprintln("no network", 10); return 0; }
+        var s = 0;
+        while (s < arglen) { if (load8(arg + s) != 32) { break; } s = s + 1; }
+        var h = arg + s;
+        var hlen = arglen - s;
+        while (hlen > 0) { if (load8(h + hlen - 1) != 32) { break; } hlen = hlen - 1; }
+        if (hlen < 1) { kprintln("usage: ping <host>", 18); return 0; }
+        # Dotted-quad if it parses; otherwise resolve the name via DNS.
+        var target = sh_parse_ipv4(h, hlen);
+        if (target == 0) {
+            if (dns_resolve(h, hlen, &target) != 0) { kprintln("ping: cannot resolve", 20); return 0; }
+        }
+        kprint("PING ", 5);
+        kprint_num((target >> 24) & 0xFF); kprint(".", 1);
+        kprint_num((target >> 16) & 0xFF); kprint(".", 1);
+        kprint_num((target >> 8) & 0xFF); kprint(".", 1);
+        kprint_num(target & 0xFF); kprintln("", 0);
+        var rtt = icmp_ping(target);
+        if (rtt < 0) {
+            kprintln("ping: no reply (timeout)", 24);
+        } else {
+            kprint("ping: reply in ", 15); kprint_num(rtt); kprintln(" ticks", 6);
+        }
         return 0;
     }
     if (sh_streq(buf, clen, "blkread", 7) == 1) {

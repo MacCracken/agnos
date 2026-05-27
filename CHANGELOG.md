@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — ICMP echo / ping (1.35.x catchup, second code bite)
+
+ICMP (RFC 792) — the kernel had no ICMP at all (proto 1 was unhandled in the IP demux). Adds echo in both directions plus basic error awareness, and a `ping` shell verb (the diagnostic pair with the DNS bite's `dns`). ICMP echo is identical across every stack, so the prior art is cited inline (RFC 792) rather than in a standalone doc.
+
+- **`net.cyr`** — `net_handle_icmp` wired into `net_poll`'s IP demux at `ip_proto == 1`: type 8 (echo request) → `icmp_send_echo_reply` (AGNOS is now **pingable**, id/seq/payload echoed verbatim); type 0 (echo reply) → matched against the outstanding `icmp_id`; types 3/11 (dest-unreachable / time-exceeded) logged. `icmp_ping(dst_ip)` builds an echo request (8-byte header + 32-byte payload), sends it, and waits (bounded ~3 s) for the matching reply, returning elapsed `timer_ticks`. The ICMP checksum reuses `ip_checksum` directly (no pseudo-header).
+- **`shell.cyr`** — `ping <host>` verb: parses a dotted-quad via the new `sh_parse_ipv4` helper, else falls back to `dns_resolve` (so `ping example.com` works off the DNS bite). Prints the target + reply/timeout.
+- **Validation** — new `scripts/icmp-smoke.sh` (`ICMP_SELFTEST=1` + QEMU/SLIRP). Hermetic gate passes: a built echo request re-checksums to 0 (`icmp: build PASS`). The live path also worked — gateway echo round-tripped through SLIRP (`icmp: gw reply ticks=0`). No iron burn required (rides the iron-COMPLETE 1.32.9 path).
+- **Build** — production 805,680 → **810,560 B**. `test.sh` 4/4, `check.sh` 11/11.
+
 ### Added — DNS stub resolver (1.35.x catchup, first code bite)
 
 A minimal RFC 1035 stub resolver — turn a hostname into an IPv4 by asking the configured recursive resolver over UDP/53. The precondition for name-based networking (`ark`/`nous` fetch, `hoosh` gateway hostnames) and the substrate for the `dig` userland tool. Audit-doc-first per [[feedback_redesign_dont_reinvent]]: [`dns-stub-resolver-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/dns-stub-resolver-prior-art.md) (RFC 1035/3596 + musl `res_*` + lwIP/iPXE `dns.c` + Plan 9 `ndb/dns`). Built on the existing UDP transport (the 1.32.x DHCP work already shipped `udp_bind`/`udp_recv_from` + the ingress demux) — no new transport code.

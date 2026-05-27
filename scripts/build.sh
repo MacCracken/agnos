@@ -116,6 +116,10 @@ else
     #                     RFC 1035 parse test (compression-pointer answer ->
     #                     93.184.216.34), and attempts a live lookup. Gated
     #                     by scripts/dns-smoke.sh.
+    #   ICMP_SELFTEST=1  — boot-time ICMP echo self-test (1.35.x): hermetic
+    #                     checksum self-verify (a valid ICMP message sums to
+    #                     0) + a best-effort gateway ping. Gated by
+    #                     scripts/icmp-smoke.sh.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -133,6 +137,7 @@ else
         [ -n "$EXFAT_WRITE_SELFTEST" ] && echo '#define EXFAT_WRITE_SELFTEST'
         [ -n "$FAT_ALLOW_ESP_WRITE" ] && echo '#define FAT_ALLOW_ESP_WRITE'
         [ -n "$DNS_SELFTEST" ]   && echo '#define DNS_SELFTEST'
+        [ -n "$ICMP_SELFTEST" ]  && echo '#define ICMP_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

@@ -1294,6 +1294,37 @@ if (vnet_active != 0 || nic_ready() != 0) {
 }
 #endif
 
+#ifdef ICMP_SELFTEST
+# ICMP echo self-test (1.35.x, compile-gated via ICMP_SELFTEST).
+#   (1) HERMETIC: build an echo request, store its checksum, then re-checksum
+#       the whole message — a correct ICMP checksum makes the message sum to
+#       0 (one's-complement property). Zero network dependency. Load-bearing.
+#   (2) Best-effort live ping of the gateway (SLIRP = 10.0.2.2; informational,
+#       depends on host ICMP permissions).
+{
+    var em[16];
+    store8(&em + 0, 8); store8(&em + 1, 0);          # type 8 echo request
+    store8(&em + 2, 0); store8(&em + 3, 0);          # checksum placeholder
+    store8(&em + 4, 0x41); store8(&em + 5, 0x47);    # id
+    store8(&em + 6, 0x00); store8(&em + 7, 0x01);    # seq
+    store8(&em + 8, 0x68); store8(&em + 9, 0x69);    # "hi" payload
+    store8(&em + 10, 0x00); store8(&em + 11, 0x00);
+    var ck = ip_checksum(&em, 12);
+    store8(&em + 2, (ck >> 8) & 0xFF); store8(&em + 3, ck & 0xFF);
+    if (ip_checksum(&em, 12) == 0) {
+        kprintln("icmp: build PASS", 16);
+    } else {
+        kprintln("icmp: build FAIL", 16);
+    }
+    var grtt = icmp_ping(net_gateway);
+    if (grtt < 0) {
+        kprintln("icmp: gw no reply", 17);
+    } else {
+        kprint("icmp: gw reply ticks=", 21); kprint_num(grtt); kprintln("", 0);
+    }
+}
+#endif
+
 #ifdef TCP_LISTEN_SMOKE
 # TCP server-side smoke (1.32.0 bite A). Validates that:
 #   - tcp_listen(port) allocates a LISTEN slot
