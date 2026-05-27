@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.36.1
+# agnos.cyr — AGNOS kernel v1.36.2
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
@@ -112,7 +112,9 @@ include "user/test_procs.cyr"
 # regression locked in by cyrius check.sh gate 4ab. See
 # docs/development/proposals/2026-04-27-cc5-kernel-boot-shim-regression.md.
 include "arch/x86_64/boot_shim.cyr"
-include "core/main.cyr"
+include "core/main.cyr"          # boot-init sequence
+include "core/selftests.cyr"     # compile-gated boot self-tests (1.36.2 split) — after init, before launch
+include "core/boot_finish.cyr"   # kybernet launch — must stay last
 #endif
 
 #ifdef ARCH_AARCH64

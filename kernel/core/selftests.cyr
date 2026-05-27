@@ -1,0 +1,410 @@
+# === Boot self-tests (split from main.cyr at the 1.36.2 refactor) ===
+# Compile-gated (#ifdef *_SELFTEST / *_SMOKE) hermetic + live checks that run
+# after main.cyr boot init and BEFORE core/boot_finish.cyr launches kybernet.
+# Production builds set no flags -> these compile to nothing. Included in order
+# (main -> selftests -> boot_finish) so the production binary is byte-identical.
+
+#ifdef DNS_SELFTEST
+# DNS stub-resolver self-test (1.35.x bite 2, compile-gated via DNS_SELFTEST).
+#   (1) Print the DHCP-captured resolver (bite 1 / option 6) — under QEMU
+#       SLIRP this is 10.0.2.3, hermetic (no internet needed).
+#   (2) HERMETIC parse test: feed dns_parse_answer a hand-built RFC 1035
+#       response for example.com -> 93.184.216.34 whose answer NAME is a
+#       0xC0 compression pointer back to the question. Asserts the extracted
+#       A record — exercises dns_skip_name's pointer case + the answer walk
+#       with zero network dependency. This is the load-bearing smoke gate.
+#   (3) Best-effort live lookup (informational; needs SLIRP->host DNS).
+{
+    kprint("dns: resolver=", 14); dhcp_print_ip(net_dns_server); kprintln("", 0);
+
+    var resp[64];
+    # Header: id=0xABCD flags=0x8180 (QR|RD|RA) qd=1 an=1 ns=0 ar=0
+    store8(&resp + 0, 0xAB); store8(&resp + 1, 0xCD);
+    store8(&resp + 2, 0x81); store8(&resp + 3, 0x80);
+    store8(&resp + 4, 0x00); store8(&resp + 5, 0x01);
+    store8(&resp + 6, 0x00); store8(&resp + 7, 0x01);
+    store8(&resp + 8, 0x00); store8(&resp + 9, 0x00);
+    store8(&resp + 10, 0x00); store8(&resp + 11, 0x00);
+    # Question: 07 "example" 03 "com" 00, QTYPE=A, QCLASS=IN
+    store8(&resp + 12, 7);
+    store8(&resp + 13, 101); store8(&resp + 14, 120); store8(&resp + 15, 97);
+    store8(&resp + 16, 109); store8(&resp + 17, 112); store8(&resp + 18, 108);
+    store8(&resp + 19, 101);
+    store8(&resp + 20, 3);
+    store8(&resp + 21, 99); store8(&resp + 22, 111); store8(&resp + 23, 109);
+    store8(&resp + 24, 0);
+    store8(&resp + 25, 0x00); store8(&resp + 26, 0x01);
+    store8(&resp + 27, 0x00); store8(&resp + 28, 0x01);
+    # Answer: NAME = 0xC0 0x0C (pointer to offset 12), A, IN, ttl=256, rdlen=4,
+    # RDATA = 93.184.216.34
+    store8(&resp + 29, 0xC0); store8(&resp + 30, 0x0C);
+    store8(&resp + 31, 0x00); store8(&resp + 32, 0x01);
+    store8(&resp + 33, 0x00); store8(&resp + 34, 0x01);
+    store8(&resp + 35, 0x00); store8(&resp + 36, 0x00);
+    store8(&resp + 37, 0x01); store8(&resp + 38, 0x00);
+    store8(&resp + 39, 0x00); store8(&resp + 40, 0x04);
+    store8(&resp + 41, 93); store8(&resp + 42, 184);
+    store8(&resp + 43, 216); store8(&resp + 44, 34);
+
+    var parsed = 0;
+    if (dns_parse_answer(&resp, 45, 0xABCD, &parsed) == 0) {
+        if (parsed == ip4(93, 184, 216, 34)) {
+            kprintln("dns: parse PASS", 15);
+        } else {
+            kprintln("dns: parse FAIL", 15);
+        }
+    } else {
+        kprintln("dns: parse FAIL", 15);
+    }
+
+    # Cache + TTL self-test (1.35.6). dns_parse_answer above set dns_last_ttl
+    # from the hand-built answer (ttl=256). Then exercise the positive cache:
+    # put→find hit, un-cached miss, and the not-expired gate. Runs BEFORE the
+    # live lookup so it doesn't observe example.com's insertion.
+    var cok = 1;
+    if (dns_last_ttl != 256) { cok = 0; }                       # TTL extraction
+    dns_cache_put("cachetst", 8, ip4(5, 6, 7, 8), 100);
+    var cf = dns_cache_find("cachetst", 8);
+    if (cf < 0) { cok = 0; }
+    else { if (load64(&dns_cache_ip + cf * 8) != ip4(5, 6, 7, 8)) { cok = 0; } }
+    if (dns_cache_find("notcached", 9) >= 0) { cok = 0; }       # miss: never inserted
+    store64(&dns_cache_ip + 7 * 8, ip4(9, 9, 9, 9));            # hand-place an expired entry
+    store64(&dns_cache_exp + 7 * 8, 0);                         # exp in the past
+    store64(&dns_cache_len + 7 * 8, 3);
+    store8(&dns_cache_names + 7 * 64 + 0, 101);                 # "exp"
+    store8(&dns_cache_names + 7 * 64 + 1, 120);
+    store8(&dns_cache_names + 7 * 64 + 2, 112);
+    if (dns_cache_find("exp", 3) >= 0) { cok = 0; }             # miss: expired
+    if (cok == 1) { kprintln("dns: cache PASS", 15); }
+    if (cok == 0) { kprintln("dns: cache FAIL", 15); }
+
+    var live = 0;
+    if (dns_resolve("example.com", 11, &live) == 0) {
+        kprint("dns: live=", 10); dhcp_print_ip(live); kprintln("", 0);
+    } else {
+        kprintln("dns: live skip", 14);
+    }
+}
+#endif
+
+#ifdef ICMP_SELFTEST
+# ICMP echo self-test (1.35.x, compile-gated via ICMP_SELFTEST).
+#   (1) HERMETIC: build an echo request, store its checksum, then re-checksum
+#       the whole message — a correct ICMP checksum makes the message sum to
+#       0 (one's-complement property). Zero network dependency. Load-bearing.
+#   (2) Best-effort live ping of the gateway (SLIRP = 10.0.2.2; informational,
+#       depends on host ICMP permissions).
+{
+    var em[16];
+    store8(&em + 0, 8); store8(&em + 1, 0);          # type 8 echo request
+    store8(&em + 2, 0); store8(&em + 3, 0);          # checksum placeholder
+    store8(&em + 4, 0x41); store8(&em + 5, 0x47);    # id
+    store8(&em + 6, 0x00); store8(&em + 7, 0x01);    # seq
+    store8(&em + 8, 0x68); store8(&em + 9, 0x69);    # "hi" payload
+    store8(&em + 10, 0x00); store8(&em + 11, 0x00);
+    var ck = ip_checksum(&em, 12);
+    store8(&em + 2, (ck >> 8) & 0xFF); store8(&em + 3, ck & 0xFF);
+    if (ip_checksum(&em, 12) == 0) {
+        kprintln("icmp: build PASS", 16);
+    } else {
+        kprintln("icmp: build FAIL", 16);
+    }
+    var grtt = icmp_ping(net_gateway);
+    if (grtt < 0) {
+        kprintln("icmp: gw no reply", 17);
+    } else {
+        kprint("icmp: gw reply ticks=", 21); kprint_num(grtt); kprintln("", 0);
+    }
+}
+#endif
+
+#ifdef TCP_SELFTEST
+# TCP receive-ring self-test (1.35.1 B1). Hermetic: builds a fake ESTABLISHED
+# conn and exercises tcp_rx_append + tcp_recv for (a) FIFO byte order and
+# (b) a buffer wrap, asserting byte-exact delivery. Proves the in-order ring
+# that replaced the 1.32.0 overwrite-latest path (which silently truncated
+# any multi-segment stream). Zero network dependency.
+{
+    var cid = tcp_conn_count;
+    var cb = tcp_conn_base(cid);
+    var ring = kmalloc(TCP_RX_RING);
+    var rtx = kmalloc(TCP_RETX_BUF);
+    if (ring == 0 || rtx == 0) {
+        if (ring != 0) { kfree_sized(ring, TCP_RX_RING); }
+        if (rtx != 0) { kfree_sized(rtx, TCP_RETX_BUF); }
+        kprintln("tcp: ring FAIL", 14);
+        kprintln("tcp: retx FAIL", 14);
+    } else {
+        tcp_conn_count = tcp_conn_count + 1;
+        store64(cb, 2);                 # ESTABLISHED
+        store64(cb + 8, 0xEEEE); store64(cb + 16, 0xEEEE); store64(cb + 24, 0);
+        store64(cb + 32, 0); store64(cb + 40, 0); store64(cb + 48, ring);
+        store64(cb + 56, 0); store64(cb + 64, 0); store64(cb + 72, 0);
+        store64(cb + 80, 0); store64(cb + 88, 0); store64(cb + 96, 0);
+        store64(cb + 104, 0); store64(cb + 112, 0); store64(cb + 120, 0);
+        store64(cb + 128, 0); store64(cb + 136, rtx);
+
+        var src[64];
+        var dbuf[64];
+        var ok = 1;
+
+        # Phase 1 — FIFO order, no wrap: append 20 'A' then 20 'B', drain 40.
+        memset(&src, 0x41, 20);
+        if (tcp_rx_append(cb, &src, 20) != 20) { ok = 0; }
+        memset(&src, 0x42, 20);
+        if (tcp_rx_append(cb, &src, 20) != 20) { ok = 0; }
+        if (tcp_recv(cid, &dbuf, 40) != 40) { ok = 0; }
+        if (load8(&dbuf + 0) != 0x41) { ok = 0; }
+        if (load8(&dbuf + 19) != 0x41) { ok = 0; }
+        if (load8(&dbuf + 20) != 0x42) { ok = 0; }
+        if (load8(&dbuf + 39) != 0x42) { ok = 0; }
+
+        # Phase 2 — wrap: reposition the cursors 8 bytes shy of the ring end,
+        # append 32 'C' (8 land at the tail, 24 wrap to the head), drain 32.
+        store64(cb + 64, 2040); store64(cb + 80, 2040);
+        memset(&src, 0x43, 32);
+        if (tcp_rx_append(cb, &src, 32) != 32) { ok = 0; }
+        if (tcp_recv(cid, &dbuf, 32) != 32) { ok = 0; }
+        if (load8(&dbuf + 0) != 0x43) { ok = 0; }
+        if (load8(&dbuf + 7) != 0x43) { ok = 0; }    # last byte before wrap
+        if (load8(&dbuf + 8) != 0x43) { ok = 0; }    # first byte after wrap
+        if (load8(&dbuf + 31) != 0x43) { ok = 0; }
+
+        if (ok == 1) { kprintln("tcp: ring PASS", 14); }
+        if (ok == 0) { kprintln("tcp: ring FAIL", 14); }
+
+        # --- B2 retransmit logic (hermetic) ---
+        var ok2 = 1;
+        # RTO backoff (fixed base, ×2, capped at ×16).
+        if (tcp_retx_rto(0) != 100) { ok2 = 0; }
+        if (tcp_retx_rto(1) != 200) { ok2 = 0; }
+        if (tcp_retx_rto(4) != 1600) { ok2 = 0; }
+        if (tcp_retx_rto(5) != 1600) { ok2 = 0; }
+        # Arm sets the held-segment fields + pins SND.UNA.
+        tcp_arm_retx(cb, 12345, 0x18, &src, 10);
+        if (load64(cb + 96) != 12345) { ok2 = 0; }    # retx_seq
+        if (load64(cb + 104) != 10) { ok2 = 0; }       # retx_len
+        if (load64(cb + 128) != 0x18) { ok2 = 0; }     # retx_flags armed
+        if (load64(cb + 56) != 12345) { ok2 = 0; }     # SND.UNA pinned
+        # Force the segment "due" (now - (now-2000) = 2000 ≥ RTO via modular
+        # subtraction) and confirm a resend bumps the retry count.
+        store64(cb + 112, timer_ticks - 2000);
+        tcp_retx_tick();
+        if (load64(cb + 120) != 1) { ok2 = 0; }        # one resend
+        # At the retry cap, the next due tick declares the conn dead + disarms.
+        store64(cb + 120, TCP_RTO_RETRIES);
+        store64(cb + 112, timer_ticks - 2000);
+        tcp_retx_tick();
+        if (load64(cb) != 0) { ok2 = 0; }              # CLOSED
+        if (load64(cb + 128) != 0) { ok2 = 0; }        # disarmed
+        if (ok2 == 1) { kprintln("tcp: retx PASS", 14); }
+        if (ok2 == 0) { kprintln("tcp: retx FAIL", 14); }
+
+        # --- B3 MSS option emit + parse + effective-MSS (hermetic) ---
+        var ok3 = 1;
+        # Emit: write the option into src[0..3] and verify the bytes (1460 = 0x05B4).
+        if (tcp_write_mss_opt(&src) != 4) { ok3 = 0; }
+        if (load8(&src + 0) != 2) { ok3 = 0; }
+        if (load8(&src + 1) != 4) { ok3 = 0; }
+        if (load8(&src + 2) != 0x05) { ok3 = 0; }
+        if (load8(&src + 3) != 0xB4) { ok3 = 0; }
+        # Parse: a 24-byte header (20 zero + the MSS option) → 1460; a bare
+        # 20-byte header (no options) → 0 (absent).
+        memset(&dbuf, 0, 24);
+        store8(&dbuf + 20, 2); store8(&dbuf + 21, 4);
+        store8(&dbuf + 22, 0x05); store8(&dbuf + 23, 0xB4);
+        if (tcp_parse_mss(&dbuf, 24) != 1460) { ok3 = 0; }
+        if (tcp_parse_mss(&dbuf, 20) != 0) { ok3 = 0; }
+        # Effective MSS: clamp to ours, default when absent, honor a smaller peer.
+        if (tcp_eff_mss(1460) != 1460) { ok3 = 0; }
+        if (tcp_eff_mss(0) != 536) { ok3 = 0; }
+        if (tcp_eff_mss(1000) != 1000) { ok3 = 0; }
+        if (tcp_eff_mss(9000) != 1460) { ok3 = 0; }
+        if (ok3 == 1) { kprintln("tcp: mss PASS", 13); }
+        if (ok3 == 0) { kprintln("tcp: mss FAIL", 13); }
+
+        # --- B4 peer-window send-chunk sizing (hermetic) ---
+        var ok4 = 1;
+        if (tcp_send_chunk(100, 1460, 65535) != 100) { ok4 = 0; }    # remaining-bound
+        if (tcp_send_chunk(5000, 1460, 65535) != 1460) { ok4 = 0; }  # MSS-bound
+        if (tcp_send_chunk(100, 1460, 30) != 30) { ok4 = 0; }        # window-bound
+        if (tcp_send_chunk(100, 1460, 0) != 1) { ok4 = 0; }          # zero-window persist
+        if (ok4 == 1) { kprintln("tcp: wnd PASS", 13); }
+        if (ok4 == 0) { kprintln("tcp: wnd FAIL", 13); }
+
+        kfree_sized(ring, TCP_RX_RING);
+        kfree_sized(rtx, TCP_RETX_BUF);
+        store64(cb + 48, 0); store64(cb + 136, 0); store64(cb, 0);
+        tcp_conn_count = tcp_conn_count - 1;
+    }
+}
+#endif
+
+#ifdef NTP_SELFTEST
+# NTP parse self-test (1.35.x). Hermetic: a synthetic SNTP response whose
+# Transmit Timestamp (offset 40) = NTP 3913056000 must parse to Unix
+# 1704067200 (2024-01-01 00:00:00 UTC, via the 1900→1970 epoch delta), and a
+# +3661 s value must break down to 01:01:01 UTC. Zero network dependency.
+{
+    var resp[48];
+    var i = 0;
+    while (i < 48) { store8(&resp + i, 0); i = i + 1; }
+    store8(&resp, 0x1C);   # LI=0 VN=3 Mode=4 (server) — realistic, not checked here
+    store8(&resp + 40, (3913056000 >> 24) & 0xFF);
+    store8(&resp + 41, (3913056000 >> 16) & 0xFF);
+    store8(&resp + 42, (3913056000 >> 8) & 0xFF);
+    store8(&resp + 43, 3913056000 & 0xFF);
+    var ok = 1;
+    if (ntp_parse_unix(&resp) != 1704067200) { ok = 0; }
+    var t = 1704070861;            # 1704067200 + 3661 s
+    var tod = t % 86400;
+    if (tod / 3600 != 1) { ok = 0; }
+    if ((tod % 3600) / 60 != 1) { ok = 0; }
+    if (tod % 60 != 1) { ok = 0; }
+    if (ok == 1) { kprintln("ntp: parse PASS", 15); }
+    if (ok == 0) { kprintln("ntp: parse FAIL", 15); }
+}
+#endif
+
+#ifdef MMAP_SELFTEST
+# Anonymous-mmap allocator self-test (1.35.3). Hermetic: exercises the new
+# 2 MB-contiguous allocator (pmm_alloc_2mb / _free_2mb / _count) + the mmap
+# length-rounding. The full sys_mmap map-into-process path reuses the iron-
+# proven proc_map_page idiom (no live user proc at boot to drive it directly).
+{
+    var ok = 1;
+    var before = pmm_count_2mb_free();
+    var a = pmm_alloc_2mb();
+    if (a == 0) { ok = 0; }
+    if ((a & 0x1FFFFF) != 0) { ok = 0; }           # 2 MB-aligned
+    var b = pmm_alloc_2mb();
+    if (b == 0) { ok = 0; }
+    if ((b & 0x1FFFFF) != 0) { ok = 0; }
+    if (a == b) { ok = 0; }                          # distinct regions
+    var d = a - b;
+    if (d < 0) { d = 0 - d; }
+    if (d < 0x200000) { ok = 0; }                    # non-overlapping (>= 2 MB apart)
+    if (pmm_count_2mb_free() != before - 2) { ok = 0; }
+    pmm_free_2mb(a);
+    pmm_free_2mb(b);
+    if (pmm_count_2mb_free() != before) { ok = 0; }  # frees restore the count
+    # mmap length-rounding (the sys_mmap formula): 4 KB→2 MB, 2 MB→2 MB, +1→4 MB.
+    if (((4096 + 0x1FFFFF) & 0xFFFFFFFFFFE00000) != 0x200000) { ok = 0; }
+    if (((0x200000 + 0x1FFFFF) & 0xFFFFFFFFFFE00000) != 0x200000) { ok = 0; }
+    if (((0x200001 + 0x1FFFFF) & 0xFFFFFFFFFFE00000) != 0x400000) { ok = 0; }
+    if (ok == 1) { kprintln("mmap: pmm2mb PASS", 17); }
+    if (ok == 0) { kprintln("mmap: pmm2mb FAIL", 17); }
+}
+# munmap self-test (1.35.4). Hermetic: the pmm_free_2mb guards sys_munmap leans
+# on (reject misaligned / kernel-region / out-of-range) + an alloc→free→alloc
+# reuse round-trip (freed physical must be allocatable again — the core munmap
+# value). The full sys_munmap PD-walk + proc_unmap_page + invlpg path rides
+# those proven primitives (no live user proc at boot to drive a real unmap).
+{
+    var m = 1;
+    if (pmm_free_2mb(0x201000) == 0) { m = 0; }      # page 513 — not 2 MB-aligned → reject
+    if (pmm_free_2mb(0x0) == 0) { m = 0; }            # kernel region (base 0 < 512) → reject
+    if (pmm_free_2mb(0x1000000) == 0) { m = 0; }      # 16 MB, base 4096 ≥ pool → reject
+    var c0 = pmm_count_2mb_free();
+    var x = pmm_alloc_2mb();
+    if (x == 0) { m = 0; }
+    pmm_free_2mb(x);
+    if (pmm_count_2mb_free() != c0) { m = 0; }         # free restored the count
+    var y = pmm_alloc_2mb();
+    if (y == 0) { m = 0; }                             # reusable after free
+    pmm_free_2mb(y);
+    if (pmm_count_2mb_free() != c0) { m = 0; }
+    if (m == 1) { kprintln("munmap: pmm-reuse PASS", 22); }
+    if (m == 0) { kprintln("munmap: pmm-reuse FAIL", 22); }
+}
+#endif
+
+#ifdef RTC_SELFTEST
+# RTC boot-clock self-test (1.35.5). Hermetic civil_to_unix anchors (shared with
+# the NTP test) + BCD decode, plus a live-bounded rtc_read_unix() sanity check
+# (QEMU's emulated CMOS returns the host time, so assert a plausible epoch only).
+{
+    var ok = 1;
+    if (civil_to_unix(1970, 1, 1, 0, 0, 0) != 0)          { ok = 0; }   # epoch
+    if (civil_to_unix(2024, 1, 1, 0, 0, 0) != 1704067200) { ok = 0; }   # 2024-01-01 00:00:00
+    if (civil_to_unix(2024, 1, 1, 1, 1, 1) != 1704070861) { ok = 0; }   # +3661 s
+    if (civil_to_unix(2024, 3, 1, 0, 0, 0) != 1709251200) { ok = 0; }   # leap-year boundary
+    if (rtc_bcd(0x59) != 59) { ok = 0; }
+    if (rtc_bcd(0x00) != 0)  { ok = 0; }
+    if (rtc_bcd(0x99) != 99) { ok = 0; }
+    var live = rtc_read_unix();
+    if (live < 1577836800) { ok = 0; }                     # > 2020-01-01: read path works
+    if (ok == 1) { kprintln("rtc: clock PASS", 15); }
+    if (ok == 0) { kprintln("rtc: clock FAIL", 15); }
+}
+#endif
+
+#ifdef HARDENING_SELFTEST
+# Arc-close hardening self-test (1.35.7 pass 1). Hermetic table over
+# ip_safe_payload_len — the ingress clamp that stops a forged IPv4 total-length
+# from over-reading net_rx_pkt across the ICMP/UDP/TCP handlers.
+{
+    var ok = 1;
+    if (ip_safe_payload_len(84, 20, 84) != 64)         { ok = 0; }  # valid: total=84 ihl=20 -> 64
+    if (ip_safe_payload_len(40, 20, 40) != 20)         { ok = 0; }  # exact-fit boundary
+    if (ip_safe_payload_len(28, 20, 60) != 8)          { ok = 0; }  # padded frame (total < avail) untouched
+    if (ip_safe_payload_len(65535, 20, 60) != 40)      { ok = 0; }  # forged total > avail -> clamp to 60 -> 40
+    if (ip_safe_payload_len(84, 16, 84) != (0 - 1))    { ok = 0; }  # ihl < 20 -> reject
+    if (ip_safe_payload_len(84, 0, 84) != (0 - 1))     { ok = 0; }  # ihl 0 -> reject
+    if (ip_safe_payload_len(10, 20, 84) != (0 - 1))    { ok = 0; }  # total < ihl -> reject
+    if (ip_safe_payload_len(1000, 60, 40) != (0 - 1))  { ok = 0; }  # truncated: ihl 60 claimed, 40 received
+    if (ok == 1) { kprintln("hardening: ip-clamp PASS", 24); }
+    if (ok == 0) { kprintln("hardening: ip-clamp FAIL", 24); }
+}
+#endif
+
+#ifdef TCP_LISTEN_SMOKE
+# TCP server-side smoke (1.32.0 bite A). Validates that:
+#   - tcp_listen(port) allocates a LISTEN slot
+#   - the listener doesn't spuriously accept on quiet wire
+#   - if SLIRP delivers a SYN, the passive-open path + SYN_RCVD branch
+#     transition the conn to ESTABLISHED and tcp_accept() returns it
+#
+# Note (1.32.0 cycle-open): the "accept-success" scenario in
+# scripts/tcp-listen-smoke.sh currently fails because QEMU SLIRP isn't
+# delivering inbound TCP to the guest NIC under this kernel's hostfwd
+# config. Listener-functional + no-spurious-accept (scenario 2) DOES
+# pass, validating the kernel-side LISTEN/tcp_listen/timeout path.
+# The accept-success surface is deferred to either (a) a deeper SLIRP
+# debug session OR (b) iron testing once a real-NIC driver lands in a
+# later bite. Either path validates the same code; this smoke is the
+# kernel-side regression net, not the load-bearing test.
+{
+    kprintln("tcp_listen smoke: start", 23);
+    # Gratuitous ARP so SLIRP learns our MAC (needed for inbound hostfwd
+    # delivery; doesn't fully fix SLIRP forwarding but doesn't hurt).
+    arp_request(net_ip);
+    var lid = tcp_listen(8080);
+    kprint("tcp_listen(8080) lid=", 21);
+    kprint_num(lid);
+    kprintln("", 0);
+    if (lid >= 0) {
+        var got = 0;
+        # ~8s wait window. Timer-tick anchored for portability.
+        var start_tick = timer_ticks;
+        while ((timer_ticks - start_tick) < 800) {
+            net_poll();
+            var c = tcp_accept(lid);
+            if (c >= 0) {
+                kprint("tcp_accept: conn_id=", 20);
+                kprint_num(c);
+                kprintln("", 0);
+                tcp_send(c, "AGNOS 1.32.1 tcp_listen smoke\n", 30);
+                tcp_close(c);
+                got = 1;
+                break;
+            }
+            arch_wait();
+        }
+        if (got == 0) {
+            kprintln("tcp_listen smoke: no connection within timeout", 46);
+        }
+    }
+    kprintln("tcp_listen smoke: done", 22);
+}
+#endif

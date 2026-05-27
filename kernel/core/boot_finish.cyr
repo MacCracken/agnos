@@ -1,0 +1,16 @@
+# === Boot finalization (split from main.cyr at the 1.36.2 refactor) ===
+# The final boot act: launch kybernet (PID 1, runs the shell loop). Must be
+# included AFTER core/selftests.cyr so test builds run their checks first.
+
+# Launch kybernet (PID 1) — enters the shell loop, which reads scancodes
+# from the kbd ring and dispatches commands. Shell I/O mirrors to fb via
+# kprint (Repair P, Attempt 29) so iron sees both serial and on-screen.
+# Open: USB-keyboard PS/2 emulation under UEFI legacy SMM not confirmed
+# on archaemenid as of Attempt 29 — shell visible, kbd ring empty.
+kprintln("Launching kybernet...", 21);
+# CMOS CP 0x15: reached kybernet-launch site (kybernet() runs the shell loop)
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x15; 0xE6; 0x71; }
+kybernet(); arch_halt();
+
+kprintln("Halted.", 7);
+arch_halt();

@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.36.2] — 2026-05-27 (**Refactor — `main.cyr` selftest extraction.** Declutter the boot orchestrator: the trailing block of compile-gated boot self-tests + the kybernet launch move out of `main.cyr`, leaving it the boot-init sequence. Pure source reorganization — **production build byte-for-byte identical** (same sha256), behavior provably unchanged.)
+
+### Changed — split the boot self-tests + launch out of `main.cyr`
+
+`main.cyr` had grown to 1661 LOC: boot init, then ~400 LOC of compile-gated `#ifdef *_SELFTEST` / `*_SMOKE` hermetic+live checks, then the `kybernet()` launch. The trailing selftest block and the launch moved into siblings, leaving `main.cyr` as the **1244-LOC boot-init sequence**:
+
+- `core/selftests.cyr` — the compile-gated boot self-tests (DNS / ICMP / TCP / NTP / MMAP / RTC / HARDENING / TCP_LISTEN). Production sets no flags → these compile to nothing.
+- `core/boot_finish.cyr` — the boot's final act: `kybernet()` (PID 1, the shell loop) + the `Halted.` fallback. Included **after** `selftests.cyr` so test builds run their checks first, then launch — preserving execution order.
+- `agnos.cyr` include order: `… boot_shim → main → selftests → boot_finish`.
+
+The FS (FATFS/EXFAT/EXT2) + KTEST selftests stay inline in `main.cyr` — they're interspersed mid-boot-sequence (tied to where the state they test is set up), not a cleanly-extractable trailing block.
+
+- **Validation** — **production byte-identical** (`18e23876…`, 828,528 B; selftests are `#ifdef`'d out of production, so the binary is unchanged). Test-build ordering confirmed — the moved block still runs after init + before launch: `dns-smoke` 3/3, `hardening-smoke` 1/1, `tcp-listen-smoke` 2/2 (the last explicitly runs just before the kybernet launch). `test.sh` 4/4, `check.sh` 11/11.
+- **Refactor cycle** — with the `net.cyr` split (1.36.0/1.36.1), the 1.36.x refactor cycle's planned targets are done. `ext2.cyr`→1.39.x, `shell.cyr`→1.41.x remain deferred until those subsystems are next touched.
+
 ## [1.36.1] — 2026-05-27 (**`net.cyr` split, part 2: app-protocols + ingress — net.cyr refactor COMPLETE.** Finishes the split started at 1.36.0: the per-protocol layer and the ingress/demux path move out, leaving `net.cyr` as the L2/L3 core. Pure source reorganization — **build byte-for-byte identical** (same sha256), behavior provably unchanged.)
 
 ### Changed — split the app-protocol + ingress layers out of `net.cyr`
