@@ -1,0 +1,95 @@
+# === ICMP — echo/ping + error awareness (split from net.cyr — 1.36.1 refactor, net.cyr split part 2) ===
+# Pure source reorg; included in original order in agnos.cyr so the compiled unit
+# (and binary) is byte-identical to the pre-split net.cyr. Depends on the net.cyr core.
+
+# === ICMP (RFC 792) — echo / ping + basic error awareness (1.35.x) ===
+# Type 8 = echo request, 0 = echo reply, 3 = dest unreachable, 11 = time
+# exceeded. The 8-byte header is type/code/checksum + (for echo) id/seq; the
+# checksum is a one's-complement sum over the whole ICMP message (no pseudo-
+# header — unlike UDP/TCP), so ip_checksum() applies directly. Convergent
+# across every stack (Linux / *BSD / lwIP / iPXE); no wire subtleties, so no
+# standalone audit doc (cf. the DNS bite's compression/resolver nuances).
+var icmp_id = 0x4147;        # "AG" — our echo identifier
+var icmp_seq = 0;            # incrementing echo sequence
+var icmp_reply_seen = 0;     # set when an echo reply matching icmp_id arrives
+var icmp_reply_from = 0;     # src ip of that reply
+
+# Reflect an inbound echo request (type 8) as an echo reply (type 0) — makes
+# AGNOS pingable. id/seq/payload are echoed verbatim (RFC 792 §Echo).
+fn icmp_send_echo_reply(src_ip, icmp_msg, icmp_len) {
+    if (icmp_len > 1024) { return 0 - 1; }
+    var dst_mac[8];
+    memset(&dst_mac, 0xFF, 6);
+    if (src_ip != 0xFFFFFFFF) { route_next_hop_mac(src_ip, &dst_mac); }
+    var kmac[8];
+    nic_mac(&kmac);
+    var p = &net_pkt;
+    var off = eth_build(p, &dst_mac, &kmac, 0x0800);
+    memcpy(p + off + 20, icmp_msg, icmp_len);
+    store8(p + off + 20, 0);            # type = echo reply
+    store8(p + off + 20 + 2, 0);        # zero checksum before recompute
+    store8(p + off + 20 + 3, 0);
+    var ck = ip_checksum(p + off + 20, icmp_len);
+    store8(p + off + 20 + 2, (ck >> 8) & 0xFF);
+    store8(p + off + 20 + 3, ck & 0xFF);
+    ip_build(p + off, net_ip, src_ip, 1, icmp_len);
+    return nic_send(p, off + 20 + icmp_len);
+}
+
+# IP demux hook for proto 1. icmp_off = offset of the ICMP message in pkt.
+fn net_handle_icmp(pkt, icmp_off, icmp_len, src_ip) {
+    if (icmp_len < 8) { return 0; }
+    var t = load8(pkt + icmp_off);
+    if (t == 8) {
+        icmp_send_echo_reply(src_ip, pkt + icmp_off, icmp_len);
+        return 0;
+    }
+    if (t == 0) {
+        var id = (load8(pkt + icmp_off + 4) << 8) | load8(pkt + icmp_off + 5);
+        if (id == icmp_id) {
+            icmp_reply_seen = 1;
+            icmp_reply_from = src_ip;
+        }
+        return 0;
+    }
+    # Basic error awareness — no socket-delivery path yet, so just surface it.
+    if (t == 3) { kprintln("icmp: dest unreachable", 22); }
+    if (t == 11) { kprintln("icmp: time exceeded", 19); }
+    return 0;
+}
+
+# Send one echo request to dst_ip and wait (bounded ~3s) for the matching
+# reply. Returns elapsed timer_ticks (>= 0) on success, 0-1 on timeout/no-NIC.
+fn icmp_ping(dst_ip) {
+    if (nic_ready() == 0) { return 0 - 1; }
+    icmp_seq = (icmp_seq + 1) & 0xFFFF;
+
+    var dst_mac[8];
+    memset(&dst_mac, 0xFF, 6);
+    if (dst_ip != 0xFFFFFFFF) { route_next_hop_mac(dst_ip, &dst_mac); }
+    var kmac[8];
+    nic_mac(&kmac);
+    var p = &net_pkt;
+    var off = eth_build(p, &dst_mac, &kmac, 0x0800);
+    var m = p + off + 20;               # ICMP message start
+    var icmp_len = 40;                  # 8-byte header + 32-byte payload
+    store8(m + 0, 8); store8(m + 1, 0);                       # type 8, code 0
+    store8(m + 2, 0); store8(m + 3, 0);                       # checksum (zeroed)
+    store8(m + 4, (icmp_id >> 8) & 0xFF); store8(m + 5, icmp_id & 0xFF);
+    store8(m + 6, (icmp_seq >> 8) & 0xFF); store8(m + 7, icmp_seq & 0xFF);
+    for (var i = 0; i < 32; i = i + 1) { store8(m + 8 + i, 0x41 + (i & 0x0F)); }
+    var ck = ip_checksum(m, icmp_len);
+    store8(m + 2, (ck >> 8) & 0xFF); store8(m + 3, ck & 0xFF);
+    ip_build(p + off, net_ip, dst_ip, 1, icmp_len);
+
+    icmp_reply_seen = 0;
+    var start = timer_ticks;
+    if (nic_send(p, off + 20 + icmp_len) < 0) { return 0 - 1; }
+    while ((timer_ticks - start) < 300) {     # ~3s at the 100 Hz timer
+        net_poll();
+        if (icmp_reply_seen == 1) { return timer_ticks - start; }
+        arch_wait();
+    }
+    return 0 - 1;
+}
+

@@ -1,0 +1,297 @@
+# === DHCP client (split from net.cyr — 1.36.1 refactor, net.cyr split part 2) ===
+# Pure source reorg; included in original order in agnos.cyr so the compiled unit
+# (and binary) is byte-identical to the pre-split net.cyr. Depends on the net.cyr core.
+
+# === DHCP client (1.32.0 bite G) ===
+# Minimal RFC 2131 client: DISCOVER → OFFER → REQUEST → ACK. Removes the
+# hardcoded net_ip=10.0.2.15 in main.cyr's net_init call; instead the
+# kernel asks the DHCP server (SLIRP in QEMU; iron's gateway later) for
+# an IP at boot. Likely fixes the bite-A scenario-1 SLIRP-inbound gap
+# as a side effect — SLIRP only properly registers a guest after seeing
+# a DHCP exchange.
+
+var DHCP_MAGIC_0 = 0x63;
+var DHCP_MAGIC_1 = 0x82;
+var DHCP_MAGIC_2 = 0x53;
+var DHCP_MAGIC_3 = 0x63;
+
+var DHCP_STATIC_IP_VAL = 0xC0A8012A;   # 192.168.1.42
+var DHCP_STATIC_GW_VAL = 0xC0A80101;   # 192.168.1.1
+var DHCP_STATIC_NM_VAL = 0xFFFFFF00;   # 255.255.255.0
+
+var dhcp_xid = 0;
+var dhcp_pkt_buf[300];
+
+# Find the data offset of a DHCP option by tag within an options blob.
+# Returns -1 if not found or malformed. Returned offset points at the
+# option DATA byte (post-tag, post-len).
+fn dhcp_find_option(opts, opts_len, tag) {
+    var i = 0;
+    while (i < opts_len) {
+        var t = load8(opts + i);
+        if (t == 0) { i = i + 1; continue; }       # pad
+        if (t == 255) { return 0 - 1; }            # end
+        if (i + 1 >= opts_len) { return 0 - 1; }
+        var olen = load8(opts + i + 1);
+        if (i + 2 + olen > opts_len) { return 0 - 1; }
+        if (t == tag) { return i + 2; }
+        i = i + 2 + olen;
+    }
+    return 0 - 1;
+}
+
+fn dhcp_load_u32_be(p) {
+    return (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+}
+
+fn dhcp_store_u32_be(p, v) {
+    store8(p, (v >> 24) & 0xFF);
+    store8(p + 1, (v >> 16) & 0xFF);
+    store8(p + 2, (v >> 8) & 0xFF);
+    store8(p + 3, v & 0xFF);
+    return 0;
+}
+
+# Build the fixed 240-byte BOOTP/DHCP header into `buf` (followed by
+# `opts_len` bytes of options at offset 240). Returns total packet
+# length (240 + opts_len).
+fn dhcp_build_packet(buf, xid, opts, opts_len) {
+    memset(buf, 0, 240);
+    store8(buf, 1);          # op = BOOTREQUEST
+    store8(buf + 1, 1);      # htype = ethernet
+    store8(buf + 2, 6);      # hlen
+    # hops = 0
+    dhcp_store_u32_be(buf + 4, xid);
+    # secs (2) + flags (2): set broadcast flag 0x8000
+    store8(buf + 10, 0x80);
+    # ciaddr/yiaddr/siaddr/giaddr (16 bytes) = 0
+    # chaddr (16 bytes, MAC at first 6). FIX #1: use the active NIC's MAC,
+    # not vnet_mac (which is zero on iron without virtio — DHCP servers
+    # drop zero-chaddr requests per RFC 2131 §4.1).
+    var kmac[8];
+    nic_mac(&kmac);
+    memcpy(buf + 28, &kmac, 6);
+    # sname (64) + file (128) = 0
+    # magic cookie at offset 236
+    store8(buf + 236, DHCP_MAGIC_0);
+    store8(buf + 237, DHCP_MAGIC_1);
+    store8(buf + 238, DHCP_MAGIC_2);
+    store8(buf + 239, DHCP_MAGIC_3);
+    memcpy(buf + 240, opts, opts_len);
+    return 240 + opts_len;
+}
+
+fn dhcp_print_ip(ip) {
+    kprint_num((ip >> 24) & 0xFF); kprint(".", 1);
+    kprint_num((ip >> 16) & 0xFF); kprint(".", 1);
+    kprint_num((ip >> 8) & 0xFF); kprint(".", 1);
+    kprint_num(ip & 0xFF);
+    return 0;
+}
+
+# Run a full DHCP exchange. On success, updates net_ip/net_gateway/
+# net_netmask in place; returns 0. On failure: returns -1, leaves
+# net_init's pre-set values untouched.
+fn dhcp_init() {
+    if (nic_ready() == 0) { return 0 - 1; }
+    # 1.32.4 Item 9 — DHCP_STATIC_IP fallback. When build defines
+    # DHCP_STATIC_IP=1, skip the wire-DHCP cycle and assign network
+    # config from constants above. Escape-plan step 6: unblocks
+    # downstream networking validation (TCP server reachability,
+    # REST endpoint testing) without depending on DHCP server reply.
+    #ifdef DHCP_STATIC_IP
+    net_ip = DHCP_STATIC_IP_VAL;
+    net_gateway = DHCP_STATIC_GW_VAL;
+    net_netmask = DHCP_STATIC_NM_VAL;
+    kprint("dhcp: STATIC ip=", 16); dhcp_print_ip(net_ip);
+    kprint(" gw=", 4); dhcp_print_ip(net_gateway);
+    kprint(" mask=", 6); dhcp_print_ip(net_netmask);
+    kprintln("", 0);
+    return 0;
+    #endif
+    dhcp_xid = (timer_ticks * 64017 + 31337) & 0xFFFFFFFF;
+    var lid = udp_bind(68);
+    if (lid < 0) {
+        kprintln("dhcp: udp_bind(68) failed", 25);
+        return 0 - 1;
+    }
+
+    # ---- DISCOVER ----
+    var opts[16];
+    store8(&opts, 53); store8(&opts + 1, 1); store8(&opts + 2, 1);  # msg=DISCOVER
+    store8(&opts + 3, 55); store8(&opts + 4, 3);                    # param-list
+    store8(&opts + 5, 1); store8(&opts + 6, 3); store8(&opts + 7, 6);
+    store8(&opts + 8, 255);                                          # end
+    var plen = dhcp_build_packet(&dhcp_pkt_buf, dhcp_xid, &opts, 9);
+    udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, plen);
+    kprintln("dhcp: DISCOVER", 14);
+
+    # FIX #1 prep — capture our own MAC once so OFFER/ACK chaddr-match (FIX #4)
+    # doesn't redo nic_mac() inside the per-iter loop.
+    var our_mac[8];
+    nic_mac(&our_mac);
+
+    # ---- wait OFFER ----
+    # (1.32.2 FIX #8) rx[1024] — function-local var X[N] is N bytes per
+    # [[feedback_cyrius_var_array_u64_units]]. Matches udp_bind's
+    # kmalloc(1024) and net_handle_udp's new 1016-byte cap.
+    var rx[1024];
+    var src_ip = 0;
+    var src_port = 0;
+    var offered_ip = 0;
+    var server_id = 0;
+    var got = 0;
+    # FIX #5: budget bumped 200 → 800 iter (~2s → ~8s) — RFC 2131 §4.4.1
+    # specifies 4s minimum × retries. Full exponential backoff deferred
+    # to a later cycle; this is the minimum-viable extension.
+    # (1.32.2 FIX #9) Retransmit DISCOVER at the midpoint of the wait
+    # window. Same xid means the server treats both as the same DHCP
+    # session and replies once; we just get a second window to catch the
+    # reply if the first frame dropped (link not yet up post-autoneg)
+    # or the first OFFER was lost in transit.
+    var discover_plen = plen;
+    for (var ti = 0; ti < 800; ti = ti + 1) {
+        if (ti == 400) {
+            udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, discover_plen);
+        }
+        net_poll();
+        var n = udp_recv_from(lid, &rx, 1024, &src_ip, &src_port);
+        if (n >= 240) {
+            # 1.32.4 Fix A (Item 3) — BOOTP op MUST be 2 (BOOTREPLY) per
+            # RFC 2131 §4.1; 5-of-5 reference sources enforce. Without
+            # this gate, a looped-back DISCOVER (op=1) with the right xid
+            # would pass the matcher despite being structurally wrong.
+            if (load8(&rx + 0) != 2) { arch_wait(); continue; }
+            # 1.32.4 Fix B (Item 4) — Magic cookie {0x63,0x82,0x53,0x63}
+            # MUST appear at offset +236 per RFC 2131 §3. Byte-by-byte
+            # compare (NEVER a u32 literal — endianness trap per
+            # dhcp-offer-downstream-audit.md § 7 silent-drop #5).
+            # 4-of-5 reference sources validate (Linux/OpenBSD/FreeBSD/Plan 9).
+            if (load8(&rx + 236) != DHCP_MAGIC_0) { arch_wait(); continue; }
+            if (load8(&rx + 237) != DHCP_MAGIC_1) { arch_wait(); continue; }
+            if (load8(&rx + 238) != DHCP_MAGIC_2) { arch_wait(); continue; }
+            if (load8(&rx + 239) != DHCP_MAGIC_3) { arch_wait(); continue; }
+            if (dhcp_load_u32_be(&rx + 4) == dhcp_xid) {
+                # FIX #4: verify chaddr matches our hardware address
+                # (RFC 2131 §4.1.1 — MUST). Without this, a colliding xid
+                # from another client on the LAN could be accepted as ours.
+                var chaddr_match = 1;
+                for (var ci = 0; ci < 6; ci = ci + 1) {
+                    if (load8(&rx + 28 + ci) != load8(&our_mac + ci)) {
+                        chaddr_match = 0;
+                    }
+                }
+                if (chaddr_match == 1) {
+                    var oo = 240;
+                    var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
+                    if (mt_off >= 0 && load8(&rx + oo + mt_off) == 2) {
+                        offered_ip = dhcp_load_u32_be(&rx + 16);
+                        var sid_off = dhcp_find_option(&rx + oo, n - oo, 54);
+                        if (sid_off >= 0) { server_id = dhcp_load_u32_be(&rx + oo + sid_off); }
+                        got = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        arch_wait();
+    }
+    if (got == 0) {
+        kprintln("dhcp: OFFER timeout", 19);
+        return 0 - 1;
+    }
+    kprint("dhcp: OFFER ip=", 15); dhcp_print_ip(offered_ip); kprintln("", 0);
+
+    # ---- REQUEST ----
+    store8(&opts, 53); store8(&opts + 1, 1); store8(&opts + 2, 3);  # msg=REQUEST
+    store8(&opts + 3, 50); store8(&opts + 4, 4);                    # requested IP
+    dhcp_store_u32_be(&opts + 5, offered_ip);
+    store8(&opts + 9, 54); store8(&opts + 10, 4);                   # server id
+    dhcp_store_u32_be(&opts + 11, server_id);
+    store8(&opts + 15, 255);
+    plen = dhcp_build_packet(&dhcp_pkt_buf, dhcp_xid, &opts, 16);
+    udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, plen);
+    kprintln("dhcp: REQUEST", 13);
+
+    # ---- wait ACK ----
+    var assigned_mask = 0;
+    var assigned_gw = 0;
+    var assigned_dns = 0;
+    got = 0;
+    # FIX #5: same 800-iter budget for ACK; FIX #4: same chaddr match.
+    # (1.32.2 FIX #9) Same midpoint REQUEST retransmit as DISCOVER.
+    var request_plen = plen;
+    for (var ti = 0; ti < 800; ti = ti + 1) {
+        if (ti == 400) {
+            udp_send_from(0, 0xFFFFFFFF, 68, 67, &dhcp_pkt_buf, request_plen);
+        }
+        net_poll();
+        var n = udp_recv_from(lid, &rx, 1024, &src_ip, &src_port);
+        if (n >= 240) {
+            # 1.32.4 Item 10 — mirror Fix A + Fix B into ACK matcher.
+            # Without these, post-REQUEST silent-drop has the same
+            # shape as the OFFER silent-drop the cycle's audit framed.
+            if (load8(&rx + 0) != 2) { arch_wait(); continue; }
+            if (load8(&rx + 236) != DHCP_MAGIC_0) { arch_wait(); continue; }
+            if (load8(&rx + 237) != DHCP_MAGIC_1) { arch_wait(); continue; }
+            if (load8(&rx + 238) != DHCP_MAGIC_2) { arch_wait(); continue; }
+            if (load8(&rx + 239) != DHCP_MAGIC_3) { arch_wait(); continue; }
+            if (dhcp_load_u32_be(&rx + 4) == dhcp_xid) {
+                var chaddr_match = 1;
+                for (var ci = 0; ci < 6; ci = ci + 1) {
+                    if (load8(&rx + 28 + ci) != load8(&our_mac + ci)) {
+                        chaddr_match = 0;
+                    }
+                }
+                if (chaddr_match == 1) {
+                    var oo = 240;
+                    var mt_off = dhcp_find_option(&rx + oo, n - oo, 53);
+                    if (mt_off >= 0) {
+                        var mt = load8(&rx + oo + mt_off);
+                        if (mt == 5) {
+                            var nm_off = dhcp_find_option(&rx + oo, n - oo, 1);
+                            if (nm_off >= 0) { assigned_mask = dhcp_load_u32_be(&rx + oo + nm_off); }
+                            var gw_off = dhcp_find_option(&rx + oo, n - oo, 3);
+                            if (gw_off >= 0) { assigned_gw = dhcp_load_u32_be(&rx + oo + gw_off); }
+                            # Option 6 (RFC 2132 §3.8) — DNS server list; take the
+                            # first 4-byte address. Requested in the DISCOVER
+                            # param-list; captured here for the 1.35.x DNS stub.
+                            var dns_off = dhcp_find_option(&rx + oo, n - oo, 6);
+                            if (dns_off >= 0) { assigned_dns = dhcp_load_u32_be(&rx + oo + dns_off); }
+                            got = 1;
+                            break;
+                        }
+                        if (mt == 6) {
+                            kprintln("dhcp: NAK", 9);
+                            return 0 - 1;
+                        }
+                    }
+                }
+            }
+        }
+        arch_wait();
+    }
+    if (got == 0) {
+        kprintln("dhcp: ACK timeout", 17);
+        return 0 - 1;
+    }
+    net_ip = offered_ip;
+    net_netmask = assigned_mask;
+    net_gateway = assigned_gw;
+    # DNS resolver: prefer the lease's option 6; fall back to the gateway
+    # (a LAN router almost always proxies DNS) when the lease omits it.
+    if (assigned_dns != 0) { net_dns_server = assigned_dns; }
+    if (assigned_dns == 0) { net_dns_server = assigned_gw; }
+    kprint("dhcp: ACK ip=", 13); dhcp_print_ip(offered_ip);
+    kprint(" gw=", 4); dhcp_print_ip(assigned_gw);
+    kprint(" mask=", 6); dhcp_print_ip(assigned_mask);
+    kprint(" dns=", 5); dhcp_print_ip(net_dns_server);
+    kprintln("", 0);
+    return 0;
+}
+
+fn net_copy_buf(dst, src, len) {
+    memcpy(dst, src, len);
+    return 0;
+}
+

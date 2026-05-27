@@ -1,0 +1,179 @@
+# === Packet ingress + demux — ARP/UDP handlers, ip_safe_payload_len, net_poll, net_recv_udp (split from net.cyr — 1.36.1 refactor, net.cyr split part 2) ===
+# Pure source reorg; included in original order in agnos.cyr so the compiled unit
+# (and binary) is byte-identical to the pre-split net.cyr. Depends on the net.cyr core.
+
+fn net_handle_arp(pkt, len) {
+    # ARP: eth header (14) + ARP payload
+    # Check operation: offset 14+6
+    if (len < 42) { return 0; }
+    var oper = load8(pkt + 20) * 256 + load8(pkt + 21);
+    # RFC 826: EVERY ARP packet -- request OR reply -- carries the sender's
+    # IP->MAC mapping (sender HW at +22, sender IP at +28). Learn it from all
+    # of them, not just a solicited unicast reply. The gateway broadcasts its
+    # own "who-has" queries (sender_ip = gateway, sender_mac = gateway) which
+    # we already receive as BROADCAST -- that resolves a pending gateway ARP
+    # WITHOUT the gateway's unicast reply to our request ever being delivered.
+    # Pre-fix this only cached from oper==2, so a path that delivers broadcast
+    # but not the solicited unicast reply could never learn the gateway MAC
+    # even though .1's mapping flew past us in broadcast ARP repeatedly (the
+    # iron arp_in=N count). Security posture UNCHANGED from the reply-only
+    # path: we still only accept a mapping for the exact IP we have an
+    # outstanding request for (arp_pending_ip).
+    if (arp_pending_ip != 0) {
+        var sender_ip = (load8(pkt + 28) << 24) | (load8(pkt + 29) << 16) | (load8(pkt + 30) << 8) | load8(pkt + 31);
+        if (sender_ip == arp_pending_ip) {
+            arp_cache_ip = sender_ip;
+            net_copy_buf(&arp_cache_mac, pkt + 22, 6);
+            arp_pending_ip = 0;  # Request fulfilled (RFC 826 sender snoop)
+        }
+    }
+    if (oper == 1) {
+        # ARP request — reply if it's asking for our IP. Without this,
+        # SLIRP (or any peer) can't deliver inbound TCP because they
+        # don't know our MAC. (1.32.0 bite A — needed for tcp_listen.)
+        # target IP at pkt+38 (eth14 + arp24)
+        var target_ip = (load8(pkt + 38) << 24) | (load8(pkt + 39) << 16) | (load8(pkt + 40) << 8) | load8(pkt + 41);
+        if (target_ip != net_ip) { return 0; }
+        # Build reply: swap sender/target, oper=2, our MAC as sender HW.
+        if (nic_ready() == 0) { return 0; }
+        var requester_mac[8];
+        var requester_ip = (load8(pkt + 28) << 24) | (load8(pkt + 29) << 16) | (load8(pkt + 30) << 8) | load8(pkt + 31);
+        net_copy_buf(&requester_mac, pkt + 22, 6);
+        var kmac[8];
+        nic_mac(&kmac);   # FIX #1
+        var p = &net_pkt;
+        var off = eth_build(p, &requester_mac, &kmac, 0x0806);
+        # ARP fields are network-byte-order; store16 is host-order on x86,
+        # so write byte pairs explicitly. Mirror of arp_request fix.
+        store8(p + off,     0x00); store8(p + off + 1, 0x01);   # htype = ethernet
+        store8(p + off + 2, 0x08); store8(p + off + 3, 0x00);   # ptype = IPv4
+        store8(p + off + 4, 6);    store8(p + off + 5, 4);
+        store8(p + off + 6, 0x00); store8(p + off + 7, 0x02);   # oper  = reply
+        memcpy(p + off + 8, &kmac, 6);           # sender HW = us
+        store8(p + off + 14, (net_ip >> 24) & 0xFF);
+        store8(p + off + 15, (net_ip >> 16) & 0xFF);
+        store8(p + off + 16, (net_ip >> 8) & 0xFF);
+        store8(p + off + 17, net_ip & 0xFF);
+        memcpy(p + off + 18, &requester_mac, 6); # target HW = requester
+        store8(p + off + 24, (requester_ip >> 24) & 0xFF);
+        store8(p + off + 25, (requester_ip >> 16) & 0xFF);
+        store8(p + off + 26, (requester_ip >> 8) & 0xFF);
+        store8(p + off + 27, requester_ip & 0xFF);
+        nic_send(p, off + 28);
+        net_arp_replies_sent = net_arp_replies_sent + 1;
+    }
+    return 0;
+}
+
+fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
+    # UDP header at ip_off: src_port(2) dst_port(2) length(2) checksum(2) data...
+    if (ip_payload_len < 8) { return 0; }
+    var src_port = (load8(pkt + ip_off) << 8) | load8(pkt + ip_off + 1);
+    var dst_port = (load8(pkt + ip_off + 2) << 8) | load8(pkt + ip_off + 3);
+    var udp_data_len = ip_payload_len - 8;
+    # (1.32.2 FIX #8 per dhcp-end-to-end-audit.md FINDING #8) Cap at 1016
+    # bytes (1024-byte listener buf + 8 bytes UDP header headroom). Pre-fix
+    # cap at 248 truncated DHCP OFFER/ACK option blobs past server-id +
+    # subnet + gateway. Listener buf in udp_bind is kmalloc(1024) to match.
+    # Legacy net_udp_buf (module-global var[256] = 2048 bytes) easily fits.
+    if (udp_data_len > 1016) { udp_data_len = 1016; }
+    # Legacy global-buffer path — used by net_recv_udp (single-consumer).
+    net_copy_buf(&net_udp_buf, pkt + ip_off + 8, udp_data_len);
+    net_udp_buf_len = udp_data_len;
+    # 1.32.0 bite F — also dispatch to any matching bound listener.
+    var lid = udp_find_listener(dst_port);
+    if (lid >= 0) {
+        var lb = udp_listener_base(lid);
+        var lbuf = load64(lb + 16);
+        if (lbuf != 0) {
+            net_copy_buf(lbuf, pkt + ip_off + 8, udp_data_len);
+            store64(lb + 24, udp_data_len);
+            store64(lb + 32, src_ip);
+            store64(lb + 40, src_port);
+        }
+    }
+    return udp_data_len;
+}
+
+# Hardening (1.35.7, arc-close pass 1): an IPv4 header's total-length field is
+# attacker-controlled; never let a handler read past the bytes actually received.
+# Given the claimed total length, the header length, and bytes available
+# (frame_len - 14), return the safe payload length, or 0-1 if the header is
+# malformed or the claimed length doesn't fit the received frame. Convergent with
+# Linux ip_rcv / lwIP ip4_input / *BSD ip_input. See
+# agnosticos/docs/development/arc-close-hardening-1-35.md.
+fn ip_safe_payload_len(ip_total, ip_ihl, avail) {
+    if (ip_ihl < 20) { return 0 - 1; }            # IPv4 header is >= 20 bytes
+    if (ip_total < ip_ihl) { return 0 - 1; }      # total can't be < its own header
+    var total = ip_total;
+    if (total > avail) { total = avail; }          # clamp to actually-received bytes
+    if (total < ip_ihl) { return 0 - 1; }          # truncated frame — header doesn't fit
+    return total - ip_ihl;
+}
+
+fn net_poll() {
+    if (nic_ready() == 0) { return 0; }
+    # B2: drive TCP retransmits before draining RX (cheap ≤8-conn scan; only
+    # acts when a held segment's RTO has elapsed).
+    tcp_retx_tick();
+    # Drain the WHOLE RX ring per call, not one frame. FreeBSD re_rxeof and
+    # iPXE realtek_poll both loop until the next NIC-owned descriptor; AGNOS
+    # returned after the first good frame, so under LAN chatter the 16-deep
+    # ring overran between hlt-spaced polls (tcp_connect: net_poll(); arch_wait()
+    # ×200). The 1.32.7 bite-3 burn read the chip's tally: missed=158 (RxMissed
+    # FIFO-overflow) with rx_err=0/align=0 — clean frames dropped for no free
+    # descriptor; the unicast SYN+ACK died there, not at the filter (rx_uc=2).
+    # A malformed frame skips dispatch but keeps draining (the next frame may be
+    # the SYN+ACK). budget bounds a pathological always-ready ring.
+    var drained = 0;
+    var budget = 64;
+    while (budget > 0) {
+        budget = budget - 1;
+        var pkt_len = nic_poll(&net_rx_pkt, 2048);
+        if (pkt_len < 14) { return drained; }   # ring empty (or runt) — done
+        var et_hi = load8(&net_rx_pkt + 12);
+        var et_lo = load8(&net_rx_pkt + 13);
+        var ethertype = (et_hi << 8) | et_lo;
+        if (ethertype == 0x0806) {
+            net_handle_arp(&net_rx_pkt, pkt_len);
+        }
+        if (ethertype == 0x0800) {
+            if (pkt_len >= 34) {
+                var ip_hdr = &net_rx_pkt + 14;
+                var ip_ihl = (load8(ip_hdr) & 0x0F) * 4;
+                var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
+                var ip_proto = load8(ip_hdr + 9);
+                var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
+                # Clamp/validate the claimed IP length against what we actually
+                # received before any handler trusts it (1.35.7 hardening).
+                var ip_payload_len = ip_safe_payload_len(ip_total, ip_ihl, pkt_len - 14);
+                if (ip_payload_len >= 0) {
+                    if (ip_proto == 1) {
+                        net_handle_icmp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
+                    }
+                    if (ip_proto == 17) {
+                        net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
+                    }
+                    if (ip_proto == 6) {
+                        net_handle_tcp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
+                    }
+                }
+            }
+        }
+        drained = drained + 1;
+    }
+    return drained;
+}
+
+fn net_recv_udp(buf, maxlen) {
+    # Poll once for new packets
+    net_poll();
+    if (net_udp_buf_len == 0) { return 0; }
+    var copy_len = net_udp_buf_len;
+    if (copy_len > maxlen) { copy_len = maxlen; }
+    net_copy_buf(buf, &net_udp_buf, copy_len);
+    var result = net_udp_buf_len;
+    net_udp_buf_len = 0;
+    return result;
+}
+

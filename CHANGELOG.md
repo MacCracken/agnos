@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.36.1] — 2026-05-27 (**`net.cyr` split, part 2: app-protocols + ingress — net.cyr refactor COMPLETE.** Finishes the split started at 1.36.0: the per-protocol layer and the ingress/demux path move out, leaving `net.cyr` as the L2/L3 core. Pure source reorganization — **build byte-for-byte identical** (same sha256), behavior provably unchanged.)
+
+### Changed — split the app-protocol + ingress layers out of `net.cyr`
+
+`net.cyr` went from a 2019-LOC catch-all to a focused **272-LOC L2/L3 core** (Ethernet / ARP-build / IPv4 / UDP transport + the UDP listener table). The rest moved verbatim into siblings, included in their original order so the concatenated compilation unit is unchanged:
+
+- `net_dhcp.cyr` — DHCP client (RFC 2131)
+- `net_icmp.cyr` — ICMP echo/ping + error awareness
+- `net_dns.cyr` — DNS stub resolver + TTL cache
+- `net_ntp.cyr` — NTP/SNTP client
+- `net_rtc.cyr` — RTC boot clock + `civil_to_unix`
+- `net_ingress.cyr` — the receive/dispatch path: `net_handle_arp`/`net_handle_udp`, `ip_safe_payload_len`, `net_poll`, `net_recv_udp` (this was physically at the *bottom* of `net.cyr`, after the protocols, so it becomes its own trailing module to keep the include order — hence the binary — identical)
+
+Combined with `net_tcp.cyr` (1.36.0), the network stack is now 8 focused files (core + ingress + 5 protocols + TCP), mirroring how mature stacks organize `net/`. No logic touched; the demux's cross-file handler references resolve in the same compilation unit.
+
+- **Validation** — **byte-identical build** (`512734b3…`, 828,528 B) before vs after the split (the strongest behavior-preservation proof); plus the full net smoke suite green across the moved files: `dns-smoke` 3/3, `icmp-smoke` 1/1, `ntp-smoke` 1/1, `rtc-smoke` 1/1, `tcp-smoke` 4/4, `tcp-listen-smoke` 2/2; `test.sh` 4/4, `check.sh` 11/11.
+- **Refactor cycle status** — the `net.cyr` split (the 1.36.x headline) is **complete**. `ext2.cyr` split stays deferred to the 1.39.x VFS arc; `shell.cyr` to 1.41.x.
+
 ## [1.36.0] — 2026-05-27 (**Refactor cycle open — `net.cyr` split, part 1: TCP extraction.** The 1.35.x arc grew `net.cyr` into a 2019-LOC catch-all across 10 protocol sections. This cycle splits it along those boundaries, starting with the largest. Pure source reorganization — **the compiled `build/agnos` is byte-for-byte identical** (same sha256) before and after, so behavior is provably unchanged.)
 
 ### Changed — extract the TCP stack into `kernel/core/net_tcp.cyr`

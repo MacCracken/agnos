@@ -1,0 +1,234 @@
+# === DNS stub resolver + TTL cache (split from net.cyr — 1.36.1 refactor, net.cyr split part 2) ===
+# Pure source reorg; included in original order in agnos.cyr so the compiled unit
+# (and binary) is byte-identical to the pre-split net.cyr. Depends on the net.cyr core.
+
+# === DNS stub resolver (1.35.x) ===
+# RFC 1035 over UDP/53. Stub only: one blocking A-query at a time, no cache,
+# no TCP fallback, no EDNS0. Resolver address from DHCP option 6
+# (net_dns_server), falling back to the gateway then 1.1.1.1. Multi-source
+# convergent per docs/development/dns-stub-resolver-prior-art.md
+# (RFC 1035/3596 + musl res_* + lwIP/iPXE dns.c + Plan 9 ndb/dns).
+var DNS_CLIENT_PORT = 0xC353;   # 50003 — fixed ephemeral source port for the stub
+var dns_listener = 0;           # listener id once bound (lazy)
+var dns_listener_bound = 0;     # 0 until the first udp_bind(DNS_CLIENT_PORT)
+var dns_query_id = 0x1535;      # incrementing transaction id
+var dns_last_ttl = 0;           # TTL (seconds) of the A record from the last parse
+
+# DNS positive cache (1.35.6) — 8 slots, TTL-respecting, evict-soonest. lwIP
+# dns.c-style small fixed table. Parallel module-global arrays (each var X[N] at
+# module scope = N u64s). dns_cache_ip slot 0-value = empty. Names <= 63 bytes
+# cached (slot i name at byte offset i*64 in the 512-byte name region).
+var dns_cache_ip[8];            # A-record IP (network-order int); 0 = empty slot
+var dns_cache_exp[8];           # expiry in timer_ticks (100 Hz)
+var dns_cache_len[8];           # cached name length
+var dns_cache_names[64];        # 8 slots * 64 bytes = 512 bytes of name storage
+
+# Read a big-endian u16 at ptr.
+fn dns_u16(ptr) {
+    return (load8(ptr) << 8) | load8(ptr + 1);
+}
+
+# Encode a dotted hostname into RFC 1035 length-prefixed labels at `out`,
+# terminated by a zero byte. Returns bytes written (incl. terminator), or
+# 0-1 on a malformed name. "www.example.com" -> 03 www 07 example 03 com 00
+fn dns_qname_encode(out, host, host_len) {
+    var w = 0;
+    var seg_start = 0;
+    var i = 0;
+    while (i <= host_len) {
+        var at_end = 0;
+        if (i == host_len) { at_end = 1; }
+        var is_dot = 0;
+        if (at_end == 0) { if (load8(host + i) == 46) { is_dot = 1; } }   # '.'
+        if (at_end == 1 || is_dot == 1) {
+            var seg_len = i - seg_start;
+            if (seg_len < 1) { return 0 - 1; }    # empty label (".." or leading '.')
+            if (seg_len > 63) { return 0 - 1; }   # label too long
+            store8(out + w, seg_len);
+            w = w + 1;
+            for (var j = 0; j < seg_len; j = j + 1) {
+                store8(out + w, load8(host + seg_start + j));
+                w = w + 1;
+            }
+            seg_start = i + 1;
+        }
+        i = i + 1;
+    }
+    store8(out + w, 0);   # root terminator
+    w = w + 1;
+    return w;
+}
+
+# Build an A-record query into `out`. Returns total length or 0-1.
+fn dns_build_query(out, id, host, host_len) {
+    store8(out + 0, (id >> 8) & 0xFF); store8(out + 1, id & 0xFF);   # ID
+    store8(out + 2, 0x01); store8(out + 3, 0x00);   # flags: RD=1, rest 0
+    store8(out + 4, 0x00); store8(out + 5, 0x01);   # QDCOUNT=1
+    store8(out + 6, 0x00); store8(out + 7, 0x00);   # ANCOUNT=0
+    store8(out + 8, 0x00); store8(out + 9, 0x00);   # NSCOUNT=0
+    store8(out + 10, 0x00); store8(out + 11, 0x00); # ARCOUNT=0
+    var qn = dns_qname_encode(out + 12, host, host_len);
+    if (qn < 0) { return 0 - 1; }
+    var p = 12 + qn;
+    store8(out + p, 0x00); store8(out + p + 1, 0x01);     # QTYPE  = A (1)
+    store8(out + p + 2, 0x00); store8(out + p + 3, 0x01); # QCLASS = IN (1)
+    return p + 4;
+}
+
+# Skip a name at offset p in msg[0..len]. Handles label runs + 0xC0
+# compression pointers (the stub only needs to step past names, never
+# decompress them). Returns the offset just past the name, or 0-1.
+fn dns_skip_name(msg, p, len) {
+    var safety = 0;
+    while (safety <= 128) {
+        safety = safety + 1;
+        if (p >= len) { return 0 - 1; }
+        var b = load8(msg + p);
+        if ((b & 0xC0) == 0xC0) { return p + 2; }   # pointer: name ends here
+        if (b == 0) { return p + 1; }               # root: name ends here
+        p = p + 1 + b;                              # ordinary label, keep going
+    }
+    return 0 - 1;
+}
+
+# Parse a response in msg[0..len]. Validates id + QR + RCODE, walks the
+# answer section, copies the first A record (4-byte IPv4, big-endian) to
+# out_ip. Returns 0 on success, 0-1 otherwise.
+fn dns_parse_answer(msg, len, want_id, out_ip) {
+    if (len < 12) { return 0 - 1; }
+    if (dns_u16(msg + 0) != want_id) { return 0 - 1; }
+    var flags = dns_u16(msg + 2);
+    if ((flags & 0x8000) == 0) { return 0 - 1; }   # QR must be 1 (a response)
+    if ((flags & 0x000F) != 0) { return 0 - 1; }   # RCODE != NOERROR (3 = NXDOMAIN)
+    var qd = dns_u16(msg + 4);
+    var an = dns_u16(msg + 6);
+    if (an < 1) { return 0 - 1; }
+
+    var p = 12;
+    for (var q = 0; q < qd; q = q + 1) {            # skip the question section
+        p = dns_skip_name(msg, p, len);
+        if (p < 0) { return 0 - 1; }
+        p = p + 4;                                  # QTYPE + QCLASS
+    }
+    for (var a = 0; a < an; a = a + 1) {            # walk answers
+        p = dns_skip_name(msg, p, len);
+        if (p < 0) { return 0 - 1; }
+        if (p + 10 > len) { return 0 - 1; }
+        var rtype = dns_u16(msg + p);
+        var rclass = dns_u16(msg + p + 2);
+        var rdlen = dns_u16(msg + p + 8);
+        p = p + 10;
+        if (p + rdlen > len) { return 0 - 1; }
+        if (rtype == 1) { if (rclass == 1) { if (rdlen == 4) {
+                    store64(out_ip, dhcp_load_u32_be(msg + p));   # first A record wins
+                    dns_last_ttl = dhcp_load_u32_be(msg + p - 6); # TTL sits TYPE+CLASS+TTL before RDATA
+                    return 0;
+                }}}
+        p = p + rdlen;                              # skip CNAME / AAAA / etc.
+    }
+    return 0 - 1;
+}
+
+# Cache lookup: return the slot index of a live (unexpired) exact-name match,
+# or 0-1 on miss. Names > 63 bytes are never cached.
+fn dns_cache_find(host, host_len) {
+    if (host_len > 63) { return 0 - 1; }
+    for (var i = 0; i < 8; i = i + 1) {
+        if (load64(&dns_cache_ip + i * 8) != 0) {              # occupied
+            if (load64(&dns_cache_exp + i * 8) > timer_ticks) { # not expired
+                if (load64(&dns_cache_len + i * 8) == host_len) {
+                    var eq = 1;
+                    for (var j = 0; j < host_len; j = j + 1) {
+                        if (load8(&dns_cache_names + i * 64 + j) != load8(host + j)) { eq = 0; j = host_len; }
+                    }
+                    if (eq == 1) { return i; }
+                }
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+# Cache insert: clamp TTL to [10 s, 3600 s], use an empty/expired slot or evict
+# the soonest-to-expire. No-op for ip 0 or names > 63 bytes.
+fn dns_cache_put(host, host_len, ip, ttl_secs) {
+    if (ip == 0) { return 0; }
+    if (host_len > 63) { return 0; }
+    var ttl = ttl_secs;
+    if (ttl < 10) { ttl = 10; }
+    if (ttl > 3600) { ttl = 3600; }
+    var slot = 0 - 1;
+    for (var i = 0; i < 8; i = i + 1) {
+        if (load64(&dns_cache_ip + i * 8) == 0) { slot = i; i = 8; }              # empty
+        else { if (load64(&dns_cache_exp + i * 8) <= timer_ticks) { slot = i; i = 8; } }  # expired
+    }
+    if (slot < 0) {                                          # full — evict soonest-to-expire
+        slot = 0;
+        var best = load64(&dns_cache_exp);
+        for (var i = 1; i < 8; i = i + 1) {
+            var e = load64(&dns_cache_exp + i * 8);
+            if (e < best) { best = e; slot = i; }
+        }
+    }
+    store64(&dns_cache_ip + slot * 8, ip);
+    store64(&dns_cache_exp + slot * 8, timer_ticks + ttl * 100);
+    store64(&dns_cache_len + slot * 8, host_len);
+    for (var j = 0; j < host_len; j = j + 1) { store8(&dns_cache_names + slot * 64 + j, load8(host + j)); }
+    return 0;
+}
+
+# Resolve a hostname (host/host_len) to an IPv4, stored big-endian at out_ip.
+# Returns 0 on success, 0-1 on failure (no NIC / no resolver / timeout / NXDOMAIN).
+fn dns_resolve(host, host_len, out_ip) {
+    # Cache first — a hit needs no NIC and returns instantly.
+    var ci = dns_cache_find(host, host_len);
+    if (ci >= 0) {
+        store64(out_ip, load64(&dns_cache_ip + ci * 8));
+        return 0;
+    }
+    if (nic_ready() == 0) { return 0 - 1; }
+
+    var server = net_dns_server;
+    if (server == 0) { server = net_gateway; }
+    if (server == 0) { server = ip4(1, 1, 1, 1); }   # 1.1.1.1 last resort
+    if (server == 0) { return 0 - 1; }
+
+    if (dns_listener_bound == 0) {
+        var bound = udp_bind(DNS_CLIENT_PORT);
+        if (bound < 0) { return 0 - 1; }
+        dns_listener = bound;
+        dns_listener_bound = 1;
+    }
+
+    dns_query_id = (dns_query_id + 1) & 0xFFFF;
+    var id = dns_query_id;
+
+    var qbuf[320];
+    var qlen = dns_build_query(&qbuf, id, host, host_len);
+    if (qlen < 0) { return 0 - 1; }
+
+    var rbuf[512];
+    # Drain any stale datagram in the single-slot listener buffer first.
+    udp_recv_from(dns_listener, &rbuf, 512, 0, 0);
+
+    udp_send_from(net_ip, server, DNS_CLIENT_PORT, 53, &qbuf, qlen);
+
+    var result = 0 - 1;
+    for (var ti = 0; ti < 800; ti = ti + 1) {
+        if (ti == 400) {   # one midpoint retransmit (musl/lwIP retry discipline)
+            udp_send_from(net_ip, server, DNS_CLIENT_PORT, 53, &qbuf, qlen);
+        }
+        net_poll();
+        var n = udp_recv_from(dns_listener, &rbuf, 512, 0, 0);
+        if (n > 0) {
+            if (dns_parse_answer(&rbuf, n, id, out_ip) == 0) {
+                dns_cache_put(host, host_len, load64(out_ip), dns_last_ttl);  # cache the answer (TTL-clamped)
+                result = 0;
+                ti = 800;   # break
+            }
+        }
+        arch_wait();
+    }
+    return result;
+}
+
