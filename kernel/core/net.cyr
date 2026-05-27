@@ -1046,6 +1046,7 @@ fn rtc_read_unix() {
     var year = 2000 + yr;
     if (cent >= 19) { if (cent <= 21) { year = cent * 100 + yr; } }
     if (year < 1970) { return 0; }                   # implausible — let NTP handle it
+    if (year > 2200) { return 0; }                   # garbage century/year reg — NTP handles it (arc-close hardening pass 2)
     return civil_to_unix(year, mon, day, hour, mins, sec);
 }
 
@@ -1908,7 +1909,7 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
             if (((ack - our_seq) & 0xFFFFFFFF) != 0) {
                 return 0;  # Bad ACK, drop
             }
-            store64(cb + 40, seq + 1);
+            store64(cb + 40, (seq + 1) & 0xFFFFFFFF);   # mask: TCP seq wraps at 2^32 (arc-close hardening pass 2)
             store64(cb, 2);  # ESTABLISHED
             # B3: learn the peer's MSS from the SYN-ACK option (clamp to ours).
             store64(cb + 144, tcp_eff_mss(tcp_parse_mss(tcp, tcp_hdr_len)));
@@ -1991,7 +1992,7 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
             return 1;
         }
         if ((flags & 0x01) != 0) {
-            store64(cb + 40, seq + 1);
+            store64(cb + 40, (seq + 1) & 0xFFFFFFFF);   # mask: TCP seq wraps at 2^32 (arc-close hardening pass 2)
             tcp_send_pkt(conn_id, 0x10, 0, 0);
             store64(cb, 0);  # CLOSED
         }

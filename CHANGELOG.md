@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**Arc-close hardening, pass 2** (staged on top of 1.35.7 — version TBD by user). Wrap/range edges in the new arithmetic. Two genuine gaps fixed (TCP seq-wrap, RTC year bound); the rest of the pass-1 candidate list reviewed clean. Non-structural (refactor → 1.36.x). Audit: agnosticos [`arc-close-hardening-1-35.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/arc-close-hardening-1-35.md) § Pass 2.
+
+### Fixed — TCP sequence-number wrap (RCV.NXT)
+
+A sweep of every SND.NXT/RCV.NXT update found that **all mask `& 0xFFFFFFFF` except two** `store64(cb + 40, seq + 1)` sites in `net_handle_tcp` (SYN_SENT→ESTABLISHED and FIN_WAIT). The SYN_SENT one is a real (rare) bug: a peer whose ISN is near 2³² (`0xFFFFFFFF`) sets RCV.NXT to `0x100000000` instead of `0`, so the peer's first data segment carries the wrapped seq `0`, never equals `expected`, and the in-order accept (`seq == expected`) silently rejects everything → the connection stalls (~1-in-2³² per connection). Both sites now mask, matching the other six seq-update sites (incl. the passive-open path that already did). One-character guard; no new behavior on the common path.
+
+### Fixed — RTC implausible-year upper bound
+
+`rtc_read_unix` rejected `year < 1970` but not absurdly-high years; a corrupt CMOS century/year register could seed a far-future wall clock (bounded, NTP-corrected, but asserted as real until then). Now also rejects `year > 2200` → returns 0 (clock unset, `date` says so) so NTP sets it instead.
+
+### Reviewed clean (no change)
+`tcp_rx_append` (flow-clamped + power-of-two ring mask), mmap arena exhaustion (`sys_mmap` pre-counts free regions; mid-loop alloc failure is unreachable in the single-core model — flagged for the future SMP arc, not pre-emptively rolled back), `munmap` partial range (idempotent per-region), DNS cache eviction (bounded scans, no loop; name-region indexing safe), UDP length (IP-payload-derived, pass-1-clamped). Details in the audit doc § Pass 2.
+
+- **Validation** — the fixes are inline wrap/range guards with no new valid-path behavior, so validated by **no-regression**: `tcp-smoke` 4/4, `tcp-listen-smoke` 2/2 (handshake/data/FIN/passive-open unaffected), `rtc-smoke` 1/1 (live ~2026 CMOS read still seeds), `test.sh` 4/4, `check.sh` 11/11. The wrap fix's correctness rests on the now-uniform masking across all 8 seq-update sites. Production build 828,464 → **828,528 B**.
+
 ## [1.35.7] — 2026-05-27 (**1.35.x arc-close hardening, pass 1** — the 1.35.x line added a lot of untrusted-input surface (DNS/ICMP/NTP/TCP parsers). This pass hardens it *without restructuring* (refactor ops are reserved for the separate 1.36.x cycle). Pass 1 closes a forged-IP-length over-read at the ingress demux. Audit: agnosticos [`arc-close-hardening-1-35.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/arc-close-hardening-1-35.md).)
 
 ### Security — clamp the IPv4 total-length at the ingress demux
