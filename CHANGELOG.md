@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.37.3] — 2026-05-27
+
 ## [1.37.2] — OPEN (not yet tagged) (**ext4 extent allocation — multi-leaf (depth-1 sibling split).** When the depth-1 leaf fills, a SIBLING leaf is now allocated and a 2nd (3rd, 4th) index entry is added to the inline root — so a fragmented file can span up to 4 leaves (≈ 4 × eh_max extents) without needing depth 2. Continues 1.37.1's depth-0→1 grow. Audit § 5 / agnosticos [`ext4-extent-alloc-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ext4-extent-alloc-prior-art.md).)
 
 ### Added — sibling-leaf split (depth-1, up to 4 leaves)
