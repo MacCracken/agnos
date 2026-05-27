@@ -5,9 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — exFAT Unicode names: real up-case table for NameHash + case-fold (the 1.34.5 cut, the last 1.34.x item — code-complete, awaiting cycle-open VERSION bump + tag) (`core/exfat.cyr`, `core/main.cyr`, `scripts/exfat-write-smoke.sh`)
+## [1.34.5] — 2026-05-26 (**exFAT Unicode names** — the final cut of the 1.34.x write-completeness continuation (roadmap row 21): the volume's **up-case table** now drives the NameHash + case-fold compare, so non-ASCII names round-trip correctly instead of ASCII-upcase. QEMU/`fsck.exfat`-validated; no iron burn (the arc-cap FAT/exFAT iron burn is the only remaining 1.34.x item, user-driven).)
 
-Final cut of the 1.34.x write-completeness continuation. exFAT name handling used ASCII upcase, so a non-ASCII name got the wrong NameHash (fsck-flagged) and case-folded wrong. Now the volume's **up-case table** drives both:
+### Added — exFAT Unicode names: real up-case table for NameHash + case-fold (`core/exfat.cyr`, `core/main.cyr`, `scripts/exfat-write-smoke.sh`)
+
+exFAT name handling used ASCII upcase, so a non-ASCII name got the wrong NameHash (fsck-flagged) and case-folded wrong. Now the volume's **up-case table** drives both:
 
 - **`exfat_load_upcase`** loads the `0x82` system file (already located at mount) into an 8 KB buffer via its FAT chain (the standard mkfs table is 5836 B; a larger table falls back to ASCII upcase).
 - **`exfat_upcase`** maps a UTF-16 code unit through the RLE-compressed table (a `0xFFFF` marker + count means an identity run; any other entry is the explicit mapping). Verified against a real `mkfs.exfat` table (`a→A`, `é→É` U+00E9→U+00C9, `ÿ→Ÿ` U+00FF→U+0178 — the up-cased unit can exceed one byte, which is why the NameHash hashes both halves). Loaded at mount after the system-file locate.
