@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.37.0] — OPEN (not yet tagged) (**ext4 extent ALLOCATION arc — opened.** First of the heavy big-write cycles. The 1.33.x WRITE arc reached file-write via *indirect-mapped* inodes (no `EXTENTS_FL`), so it can't grow an inode that already uses extents (anything `mkfs.ext4`/Linux created). This arc adds the extent write path: allocate a block, then extend/insert an extent + `eh_entries`/`ee_len`/`ee_start_hi` accounting, with tree-splits for full nodes. Audit-doc-first: agnosticos [`ext4-extent-alloc-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ext4-extent-alloc-prior-art.md) (Linux `extents.c` + FreeBSD `ext4_ext_*` + e2fsprogs `ext2fs_extent_insert`). **1.37.0 scope (in progress)**: depth-0 append — extend-last-extent (contiguous) + insert into the inline root (≤ 4 extents), goal-hinted block alloc, route `ext2_write_at` by `EXTENTS_FL`. 1.37.1 = leaf-overflow split (depth 1); 1.37.2 = multi-leaf/deeper splits + iron burn.)
+
 ## [1.36.2] — 2026-05-27 (**Refactor — `main.cyr` selftest extraction.** Declutter the boot orchestrator: the trailing block of compile-gated boot self-tests + the kybernet launch move out of `main.cyr`, leaving it the boot-init sequence. Pure source reorganization — **production build byte-for-byte identical** (same sha256), behavior provably unchanged.)
 
 ### Changed — split the boot self-tests + launch out of `main.cyr`
