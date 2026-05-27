@@ -1423,30 +1423,77 @@ fn ext2_extent_leaf_place(leafblk, lblk, nb, inode_num, inode_buf) {
     return 1;
 }
 
+# Add a NEW sibling leaf to a depth-1 tree: build a leaf block holding the one
+# extent {lblk, nbd}, then append an index entry to the inline root pointing at
+# it (1.37.2 — when the rightmost leaf is full). Returns the leaf block# (>0) or
+# 0 if the root index is also full (→ depth-2 grow, deferred to 1.37.3) / error.
+# The new data block `nbd` is the caller's (counted there); this counts the leaf.
+fn ext2_extent_add_sibling_leaf(inode_buf, lblk, nbd, inode_num) {
+    var hdr = inode_buf + 40;
+    var nent = ext2_load16_le(hdr, 2);
+    if (nent >= 4) {                                          # inline root index full
+        kprintln("ext2: extent root index full -- depth-2 deferred (1.37.3)", 56);
+        return 0;
+    }
+    var newleaf = ext2_alloc_block(nbd);                      # goal: near the data block
+    if (newleaf <= 0) { return 0; }
+    var lmax = (ext2_blocksize - 12) / 12;
+    var z = 0;
+    while (z < ext2_blocksize) { store8(&ext2_extent_buf + z, 0); z = z + 1; }
+    ext2_store16_le(&ext2_extent_buf, 0, 0xF30A);             # eh_magic
+    ext2_store16_le(&ext2_extent_buf, 2, 1);                 # eh_entries = 1
+    ext2_store16_le(&ext2_extent_buf, 4, lmax);              # eh_max
+    ext2_store16_le(&ext2_extent_buf, 6, 0);                 # eh_depth = 0 (leaf)
+    var e0 = &ext2_extent_buf + 12;
+    ext2_store32_le(e0, 0, lblk); ext2_store16_le(e0, 4, 1);
+    ext2_store16_le(e0, 6, (nbd >> 32) & 0xFFFF); ext2_store32_le(e0, 8, nbd & 0xFFFFFFFF);
+    ext2_extent_node_csum_stamp(&ext2_extent_buf, inode_num, inode_buf);
+    if (ext2_write_block(newleaf, &ext2_extent_buf) != 0) { ext2_free_block(newleaf); return 0; }
+    var ix = hdr + 12 + nent * 12;                            # next free root index slot
+    ext2_store32_le(ix, 0, lblk);                            # ei_block = first logical in this leaf
+    ext2_store32_le(ix, 4, newleaf & 0xFFFFFFFF);            # ei_leaf_lo
+    ext2_store16_le(ix, 8, (newleaf >> 32) & 0xFFFF);        # ei_leaf_hi
+    ext2_store16_le(ix, 10, 0);                              # ei_unused
+    ext2_store16_le(hdr, 2, nent + 1);                       # eh_entries++
+    ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;       # leaf tree block counts toward i_blocks
+    return newleaf;
+}
+
 fn ext2_extent_append_block(inode_buf, lblk, inode_num) {
     var hdr = inode_buf + 40;
     if (ext2_extent_header_validate(hdr) == 0) { return 0; }
     var depth = ext2_load16_le(hdr, 6);
-    if (depth > 1) { kprintln("ext2: extent depth>1 append deferred (1.37.2)", 45); return 0; }
+    if (depth > 1) { kprintln("ext2: extent depth>1 append deferred (1.37.3)", 45); return 0; }
 
-    # --- depth 1: descend to the (rightmost) leaf, allocate, place ---
+    # --- depth 1: descend to the rightmost leaf; extend / insert / split ---
     if (depth == 1) {
         var nent = ext2_load16_le(hdr, 2);
         if (nent == 0) { return 0; }
         var ix = hdr + 12 + (nent - 1) * 12;                  # rightmost index entry
         var leafblk = ext2_load32_le(ix, 4) | (ext2_load16_le(ix, 8) << 32);
         if (leafblk == 0) { return 0; }
-        if (ext2_read_block(leafblk, &ext2_extent_buf) != 0) { return 0; }   # peek for goal
-        var goal = 0;
+        if (ext2_read_block(leafblk, &ext2_extent_buf) != 0) { return 0; }   # peek leaf
         var le = ext2_load16_le(&ext2_extent_buf, 2);
+        var lm = ext2_load16_le(&ext2_extent_buf, 4);
+        var lb = 0; var ll = 0; var lp = 0; var goal = 0;
         if (le > 0) {
             var lst = &ext2_extent_buf + 12 + (le - 1) * 12;
-            goal = (ext2_load32_le(lst, 8) | (ext2_load16_le(lst, 6) << 32)) + ext2_load16_le(lst, 4);
+            lb = ext2_load32_le(lst, 0); ll = ext2_load16_le(lst, 4);
+            lp = ext2_load32_le(lst, 8) | (ext2_load16_le(lst, 6) << 32);
+            goal = lp + ll;
         }
         var nbd = ext2_alloc_block(goal);
         if (nbd <= 0) { return 0; }
-        if (ext2_extent_leaf_place(leafblk, lblk, nbd, inode_num, inode_buf) == 0) {
-            ext2_free_block(nbd); return 0;
+        if (le > 0) { if (lblk < lb + ll) { ext2_free_block(nbd); return 0; } }  # out-of-order — deferred
+        var is_extend = 0;
+        if (le > 0) { if (lblk == lb + ll) { if (nbd == lp + ll) { if (ll < 0x8000) { is_extend = 1; } } } }
+        var use_place = 0;
+        if (is_extend == 1) { use_place = 1; }
+        if (le < lm) { use_place = 1; }
+        if (use_place == 1) {                                 # extend last, or insert into a non-full leaf
+            if (ext2_extent_leaf_place(leafblk, lblk, nbd, inode_num, inode_buf) == 0) { ext2_free_block(nbd); return 0; }
+        } else {                                              # leaf full + new entry → sibling leaf
+            if (ext2_extent_add_sibling_leaf(inode_buf, lblk, nbd, inode_num) == 0) { ext2_free_block(nbd); return 0; }
         }
         ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
         ext2_bmap_was_new = 1;
@@ -3389,21 +3436,31 @@ fn ext2_extent_write_selftest() {
     var pat[64];
     var i = 0;
     while (i < 64) { store8(&pat + i, 0xAB); i = i + 1; }
-    var lb = 2;
-    while (lb <= 10) {
-        var w = ext2_write_at(ino, lb * ext2_blocksize, &pat, 64);
+    # Sparse writes at logical 2,4,6,… — each gap forces a new extent. The inline
+    # root fills (depth-0→1 grow, 1.37.1), then the leaf fills (eh_max), then a
+    # SIBLING leaf is added (1.37.2) → root eh_entries == 2 at depth 1. Loop until
+    # that 2nd leaf appears, capped at lblk 800 (covers a 4096-block 340-extent
+    # leaf). Adaptive so it works at any block size.
+    var lblk = 2;
+    var got_sibling = 0;
+    while (lblk <= 800) {
+        var w = ext2_write_at(ino, lblk * ext2_blocksize, &pat, 64);
         if (w != 64) {
-            kprint("ext-ext: write_at lblk=", 23); kprint_num(lb);
+            kprint("ext-ext: write_at lblk=", 23); kprint_num(lblk);
             kprint(" returned ", 10); kprint_num(w); kprintln(" FAIL", 5);
             return 0 - 1;
         }
-        lb = lb + 2;
+        if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+        if (ext2_load16_le(&ext2_inode_buf + 40, 6) == 1) {
+            if (ext2_load16_le(&ext2_inode_buf + 40, 2) >= 2) { got_sibling = 1; lblk = 802; }
+        }
+        lblk = lblk + 2;
     }
     if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
-    var depth = ext2_load16_le(&ext2_inode_buf + 40, 6);
-    kprint("ext-ext: final depth=", 21); kprint_num(depth);
+    kprint("ext-ext: final depth=", 21); kprint_num(ext2_load16_le(&ext2_inode_buf + 40, 6));
+    kprint(" root_entries=", 14); kprint_num(ext2_load16_le(&ext2_inode_buf + 40, 2));
     kprint(" size=", 6); kprint_num(ext2_inode_size_lo(&ext2_inode_buf)); kprintln("", 0);
-    if (depth != 1) { kprintln("ext-ext: expected depth 1 after grow FAIL", 41); return 0 - 1; }
+    if (got_sibling == 0) { kprintln("ext-ext: no 2nd leaf formed FAIL", 32); return 0 - 1; }
     kprintln("ext-ext: append PASS", 20);
     return 0;
 }

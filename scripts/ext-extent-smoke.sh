@@ -4,14 +4,15 @@
 # Builds a default-profile ext4 image (metadata_csum,64bit,extent) with a seed
 # file `/extseed.dat` — which `mkfs.ext4 -d` lays down EXTENTS_FL (depth-0
 # inline root). Boots agnos with EXT2_EXTENT_WRITE_SELFTEST=1, which appends 64
-# bytes of 0xAB at SPARSE logical blocks 2,4,6,8,10 — each gap forces a new
-# extent, so the 4-entry inline root fills and the tree GROWS to depth 1
-# (ext2_extent_grow_indepth + a checksummed leaf block; 1.37.1). Then
+# bytes of 0xAB at SPARSE logical blocks 2,4,6,… — each gap forces a new extent.
+# The 4-entry inline root fills (depth-0→1 grow, 1.37.1), the leaf fills (eh_max),
+# then a SIBLING leaf is added → depth-1 tree with 2 root index entries (1.37.2).
+# The selftest loops until that 2nd leaf appears (adaptive, capped). Then
 # HOST-verifies the mutated partition:
-#   1. serial gate: "ext-ext: append PASS" (selftest also asserts final depth==1)
-#   2. `e2fsck -fn` clean (the load-bearing gate — proves the depth-0→1 grow, the
-#      leaf-node checksum, and the inode-checksum recompute are all correct)
-#   3. /extseed.dat grew to 41024 B and bytes at offset 8192 (block 2) are 0xAB
+#   1. serial gate: "ext-ext: append PASS" (selftest asserts depth==1 + 2 leaves)
+#   2. `e2fsck -fn` clean (the load-bearing gate — proves the grow, the sibling
+#      split, BOTH leaf-node checksums, the root index, and the inode checksum)
+#   3. /extseed.dat is large+sparse and bytes at offset 8192 (block 2) are 0xAB
 #
 # Requires: qemu-system-x86_64, OVMF, parted, sgdisk, mtools, mkfs.ext4,
 #           e2fsck, debugfs, dd, strings, xxd. gnoboot at ../gnoboot/build/.
@@ -67,7 +68,7 @@ mkfs.ext4 -F -q -L AGNOS-EXT -b 4096 -m 0 -d "$SEED" -E offset=$PART_OFFSET "$IM
 echo "Booting EXT2_EXTENT_WRITE_SELFTEST kernel (NVMe + GPT)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/ext-extent.log"
-timeout "${QEMU_TIMEOUT:-30}" qemu-system-x86_64 \
+timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
@@ -95,25 +96,26 @@ else
     echo "  FAIL: e2fsck -fn reported errors (see $LOGS/e2fsck.log):"; sed 's/^/    /' "$LOGS/e2fsck.log"; rc=1
 fi
 
-# sparse writes at logical blocks 2,4,6,8,10 (offsets 8192..40960, 64 B each) →
-# final size = 10*4096 + 64 = 41024; logical block 2 (offset 8192) holds 0xAB.
+# Sparse writes (logical 2,4,6,…) fill the inline root → grow to depth 1 → fill
+# the leaf → add a SIBLING leaf (1.37.2). Size is adaptive (loop stops at the
+# 2nd leaf); logical block 2 (offset 8192) always holds 0xAB.
 debugfs -R "dump /extseed.dat $WORK/extseed-post.dat" "$WORK/part-post.img" >/dev/null 2>&1
 if [ -f "$WORK/extseed-post.dat" ]; then
     SZ=$(stat -c %s "$WORK/extseed-post.dat")
-    if [ "$SZ" -eq 41024 ]; then echo "  PASS: /extseed.dat grew to 41024 B (sparse, last write at block 10)"
-    else echo "  FAIL: /extseed.dat size $SZ (expected 41024)"; rc=1; fi
+    if [ "$SZ" -gt 200000 ]; then echo "  PASS: /extseed.dat grew large+sparse ($SZ B — many extents across 2 leaves)"
+    else echo "  FAIL: /extseed.dat size $SZ too small (expected a multi-leaf file > 200 KB)"; rc=1; fi
     BYTES=$(xxd -s 8192 -l 4 -p "$WORK/extseed-post.dat")
     if [ "$BYTES" = "abababab" ]; then echo "  PASS: appended bytes at offset 8192 (logical block 2) = 0xAB"
     else echo "  FAIL: bytes at 8192 = 0x$BYTES (expected abababab)"; rc=1; fi
 else
     echo "  FAIL: could not dump /extseed.dat from the image"; rc=1
 fi
-# Confirm the tree grew to depth 1 (debugfs prints the extent tree for the inode).
-if debugfs -R "stat /extseed.dat" "$WORK/part-post.img" 2>/dev/null | grep -qiE 'depth|interior'; then
-    echo "  PASS: extent tree shows interior/depth node (grew to depth 1)"
+# The selftest's serial line reports the final tree shape — confirm depth 1 with
+# >= 2 root index entries (a sibling leaf was added).
+if strings "$LOG" | grep -qE 'ext-ext: final depth=1 root_entries=[2-9]'; then
+    echo "  PASS: depth-1 tree with >= 2 leaves (sibling-leaf split exercised)"
 else
-    echo "  INFO: debugfs stat didn't surface a depth marker (selftest asserted depth==1)"
-fi
+    echo "  FAIL: did not reach a 2-leaf depth-1 tree"; rc=1; fi
 
 echo ""
 [ "$rc" -eq 0 ] && echo "=== ext-extent-smoke: PASS ===" || echo "=== ext-extent-smoke: FAIL ==="

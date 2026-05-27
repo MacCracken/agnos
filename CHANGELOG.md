@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.37.2] — OPEN (not yet tagged) (**ext4 extent allocation — multi-leaf (depth-1 sibling split).** When the depth-1 leaf fills, a SIBLING leaf is now allocated and a 2nd (3rd, 4th) index entry is added to the inline root — so a fragmented file can span up to 4 leaves (≈ 4 × eh_max extents) without needing depth 2. Continues 1.37.1's depth-0→1 grow. Audit § 5 / agnosticos [`ext4-extent-alloc-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ext4-extent-alloc-prior-art.md).)
+
+### Added — sibling-leaf split (depth-1, up to 4 leaves)
+
+- **`ext2.cyr`** — `ext2_extent_add_sibling_leaf`: builds a new leaf block holding the one new extent (with its metadata_csum node checksum) and appends an index entry to the inline root (`ei_block`/`ei_leaf_hi:lo`, `eh_entries++`). `ext2_extent_append_block`'s depth-1 path now decides per-append: **extend** the rightmost leaf's last extent, **insert** into it if it has room, else (leaf full + new entry needed) **add a sibling leaf** — unless the inline root's 4 index slots are also full, which returns 0 (depth-2 grow deferred to 1.37.3). Out-of-order/hole-fill still deferred. The new leaf + data block both count toward `i_blocks`.
+- **Validation** — `ext-extent-smoke.sh` now drives the leaf to overflow: sparse writes (logical 2,4,6,…) fill the inline root → grow to depth 1 → fill the leaf (eh_max) → **add a sibling leaf** (selftest loops until `eh_depth==1` with `eh_entries==2`, then asserts; reached a ~2.7 MB sparse file across 2 leaves). **`e2fsck -fn` clean** on the default `mkfs.ext4` (metadata_csum) image — proves the grow, the sibling split, BOTH leaf-node checksums, the root index, and the inode checksum are all correct. **No regression**: `ext2-write-smoke` (indirect) PASS, `test.sh` 4/4, `check.sh` 11/11. Production build 836,032 → **838,048 B**.
+- **Next (1.37.3)**: depth-2 grow (root index full → spill the 4 index entries into an index block, root becomes depth 2) + the arc's iron burn (user-driven — extent allocation's first real-hardware touch).
+
 ## [1.37.1] — OPEN (not yet tagged) (**ext4 extent allocation — depth 0→1 tree growth.** When the inline extent root (4 entries) fills, the tree now grows to depth 1 — the root's extents spill into a leaf BLOCK and the root becomes a single index entry — and further appends land in that leaf. Continues the 1.37.0 depth-0 append. Audit § 5 / agnosticos [`ext4-extent-alloc-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ext4-extent-alloc-prior-art.md).)
 
 ### Added — depth-1 extent tree (leaf-overflow grow + leaf-node checksum)
