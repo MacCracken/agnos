@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.35.7
+# agnos.cyr — AGNOS kernel v1.36.0
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
@@ -93,6 +93,7 @@ include "core/block.cyr"
 include "core/gpt.cyr"
 include "core/r8169.cyr"
 include "core/net.cyr"
+include "core/net_tcp.cyr"   # TCP stack — split out of net.cyr at 1.36.0; must follow net.cyr
 include "core/fatfs.cyr"
 include "core/exfat.cyr"
 include "core/ext2.cyr"

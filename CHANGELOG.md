@@ -5,7 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-**Arc-close hardening, pass 2** (staged on top of 1.35.7 — version TBD by user). Wrap/range edges in the new arithmetic. Two genuine gaps fixed (TCP seq-wrap, RTC year bound); the rest of the pass-1 candidate list reviewed clean. Non-structural (refactor → 1.36.x). Audit: agnosticos [`arc-close-hardening-1-35.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/arc-close-hardening-1-35.md) § Pass 2.
+## [1.36.0] — 2026-05-27 (**Refactor cycle open — `net.cyr` split, part 1: TCP extraction.** The 1.35.x arc grew `net.cyr` into a 2019-LOC catch-all across 10 protocol sections. This cycle splits it along those boundaries, starting with the largest. Pure source reorganization — **the compiled `build/agnos` is byte-for-byte identical** (same sha256) before and after, so behavior is provably unchanged.)
+
+### Changed — extract the TCP stack into `kernel/core/net_tcp.cyr`
+
+The TCP region (state machine + conn table, retransmit/B2, server-side listen/accept — ~780 LOC, lines 1242–EOF) moved verbatim out of `net.cyr` into a new `net_tcp.cyr`, included immediately after `net.cyr` in `agnos.cyr`. `net.cyr` (now ~1240 LOC) keeps the L2/L3 core: Ethernet/ARP/IPv4/UDP transport, the UDP listener table, DHCP, ICMP, DNS, NTP, RTC, and the shared `net_poll` demux (which forward-references `net_handle_tcp` / `tcp_retx_tick` in `net_tcp.cyr`, resolved in the same compilation unit). No logic touched.
+
+- **Validation** — **byte-identical build** (`637340…`, 828,528 B) before vs after the split, the strongest proof of behavior preservation; plus `tcp-smoke` 4/4 + `tcp-listen-smoke` 2/2 (the TCP selftest builds, which differ from production, confirm `net_tcp.cyr` compiles cleanly in those configs), `test.sh` 4/4, `check.sh` 11/11.
+- **Next (1.36.x)** — part 2 extracts the app-protocol layer (DHCP / DNS / NTP / ICMP / RTC) into per-protocol files; `net.cyr` ends as the L2/L3 core. `ext2.cyr` (FS) deferred to the 1.39.x VFS arc; `shell.cyr` to the 1.41.x agnoshi split.
+
+## [1.35.7] — 2026-05-27 (**1.35.x arc-close hardening (passes 1 + 2)** — the 1.35.x line added untrusted-input parsers (DNS/ICMP/NTP/TCP) + new arithmetic; this arc-close hardening tightens it *without restructuring* (refactor ops reserved for the 1.36.x cycle). **Pass 1**: forged-IP-length over-read clamp at the ingress demux. **Pass 2**: wrap/range edges (TCP seq-wrap, RTC year bound). Audit: agnosticos [`arc-close-hardening-1-35.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/arc-close-hardening-1-35.md).)
+
+**Pass 2 — wrap/range edges:**
 
 ### Fixed — TCP sequence-number wrap (RCV.NXT)
 
@@ -20,7 +31,7 @@ A sweep of every SND.NXT/RCV.NXT update found that **all mask `& 0xFFFFFFFF` exc
 
 - **Validation** — the fixes are inline wrap/range guards with no new valid-path behavior, so validated by **no-regression**: `tcp-smoke` 4/4, `tcp-listen-smoke` 2/2 (handshake/data/FIN/passive-open unaffected), `rtc-smoke` 1/1 (live ~2026 CMOS read still seeds), `test.sh` 4/4, `check.sh` 11/11. The wrap fix's correctness rests on the now-uniform masking across all 8 seq-update sites. Production build 828,464 → **828,528 B**.
 
-## [1.35.7] — 2026-05-27 (**1.35.x arc-close hardening, pass 1** — the 1.35.x line added a lot of untrusted-input surface (DNS/ICMP/NTP/TCP parsers). This pass hardens it *without restructuring* (refactor ops are reserved for the separate 1.36.x cycle). Pass 1 closes a forged-IP-length over-read at the ingress demux. Audit: agnosticos [`arc-close-hardening-1-35.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/arc-close-hardening-1-35.md).)
+**Pass 1 — ingress over-read:**
 
 ### Security — clamp the IPv4 total-length at the ingress demux
 

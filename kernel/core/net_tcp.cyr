@@ -1,0 +1,785 @@
+# === TCP Stack (split out of net.cyr at the 1.36.0 refactor) ===
+# Pure source reorganization — NO logic change. Included immediately after
+# core/net.cyr in agnos.cyr, so the concatenated compilation unit (and thus
+# the compiled binary) is byte-identical to the pre-split net.cyr. Holds the
+# TCP state machine + conn table, retransmit (B2), and server-side TCP
+# (listen/accept). Depends on net.cyr core (IP/UDP/eth/nic_send/net_poll).
+
+# === TCP Stack ===
+# States: 0=CLOSED, 1=SYN_SENT, 2=ESTABLISHED, 3=FIN_WAIT, 4=CLOSE_WAIT,
+#         5=LISTEN, 6=SYN_RCVD  (added 1.32.0 bite A — server-side TCP)
+# Connection table: 8 entries, each 128 bytes (grown 80 → 128 at 1.35.1 B0
+# for TCP hardening — the original 10 slots were full). Offsets 0-72 keep
+# their 1.32.0 meaning; 56 was the vestigial single-segment `rx_buf_len`
+# (the 1.35.1 B1 in-order ring replaced it) and is repurposed for SND.UNA.
+#   offset 0:   state (8 bytes)
+#   offset 8:   src_port (8 bytes)    - on LISTEN: the listening port
+#   offset 16:  dst_port (8 bytes)    - on LISTEN: 0 (wildcard)
+#   offset 24:  dst_ip (8 bytes)      - on LISTEN: 0 (wildcard)
+#   offset 32:  seq_num / SND.NXT (8 bytes)  - next seq to send
+#   offset 40:  ack_num / RCV.NXT (8 bytes)  - next seq expected (in-order)
+#   offset 48:  rx_buf — receive RING base ptr (TCP_RX_RING bytes, kmalloc'd)
+#   offset 56:  SND.UNA (8 bytes) — oldest unACKed seq (reserved; B2 retransmit)
+#   offset 64:  rx_write (8 bytes) — cumulative bytes written into the ring
+#   offset 72:  flags (8 bytes) - meta packed in upper bits:
+#     bits 0-7:   last received TCP flags byte (existing use)
+#     bit 8:      is_listening (set on LISTEN entries)
+#     bit 9:      passive_open (set on conns spawned from a LISTEN)
+#     bit 10:     accepted (set when tcp_accept returned this conn to caller)
+#     bits 16-23: parent_listen_id (only meaningful when bit 9 is set)
+#   offset 80:  rx_read (8 bytes) — cumulative bytes drained by tcp_recv
+#   offset 88:  SND.WND (8 bytes) — peer's last-advertised window (reserved; B4)
+#   offset 96:  retx_seq (8 bytes) — seq of the held unACKed segment (B2)
+#   offset 104: retx_len (8 bytes) — payload bytes held (0 for pure SYN/FIN) (B2)
+#   offset 112: retx_tick (8 bytes) — timer_ticks when last (re)sent (B2)
+#   offset 120: retx_count (8 bytes) — retransmit attempts so far (B2)
+#   offset 128: retx_flags (8 bytes) — TCP flags to resend; 0 = disarmed (B2)
+#   offset 136: retx_buf (8 bytes) — held payload ptr (kmalloc TCP_RETX_BUF) (B2)
+#   offset 144: eff_mss (8 bytes) — effective send MSS = min(ours, peer's) (B3)
+# Ring occupancy = rx_write - rx_read; free = TCP_RX_RING - occupancy; the
+# advertised window is that free count (B1 — no longer the hardcoded 8192).
+# One-in-flight retransmit (B2): a single unACKed segment is held in retx_buf
+# and resent on RTO expiry until ACKed or the retry cap; SND.UNA (56) tracks
+# the oldest unACKed seq.
+
+# State constants (kept in this file as `var` globals; the existing state
+# branches use bare integer literals for historical reasons. New code paths
+# should reference these names.)
+var TCP_STATE_CLOSED = 0;
+var TCP_STATE_SYN_SENT = 1;
+var TCP_STATE_ESTAB = 2;
+var TCP_STATE_FIN_WAIT = 3;
+var TCP_STATE_CLOSE_WAIT = 4;
+var TCP_STATE_LISTEN = 5;
+var TCP_STATE_SYN_RCVD = 6;
+
+# Flag-field metadata bit positions (in the offset-72 u64 field)
+var TCP_FLAG_IS_LISTENING = 0x100;   # bit 8
+var TCP_FLAG_PASSIVE_OPEN = 0x200;   # bit 9
+var TCP_FLAG_ACCEPTED     = 0x400;   # bit 10
+# parent_listen_id occupies bits 16-23 — see tcp_meta_set_parent / tcp_meta_get_parent
+
+var tcp_conns[640];  # ≥ 8 connections x 144 bytes (module-global var[N] = N×8 B = 5120 B)
+var tcp_conn_count = 0;
+var tcp_rx_tmpbuf[256];
+# Per-connection receive ring size (B1). 2048 fits the 16-bit window field
+# and the heap's 2048-byte slab class; 8× this is the worst-case TCP rx heap.
+var TCP_RX_RING = 2048;
+# Retransmit (B2): held-segment buffer size (one Ethernet MSS payload), fixed
+# initial RTO in 100 Hz timer ticks (1 s), and the retry cap before giving up.
+var TCP_RETX_BUF = 1460;
+var TCP_RTO_BASE = 100;        # ticks (1 s at the 100 Hz timer)
+var TCP_RTO_RETRIES = 5;       # resends before declaring the conn dead
+# MSS (B3): the value we advertise on our SYN/SYN-ACK (Ethernet MTU 1500 − IP
+# 20 − TCP 20). TCP_MSS_DEFAULT is the RFC 9293 fallback when a peer's SYN
+# omits the MSS option.
+var TCP_OUR_MSS = 1460;
+var TCP_MSS_DEFAULT = 536;
+
+fn tcp_conn_base(conn_id) {
+    return &tcp_conns + conn_id * 152;
+}
+
+# Receive-ring free space (B1) — TCP_RX_RING minus current occupancy. This is
+# the value advertised as the TCP window, so the peer never sends more than we
+# can hold (replaces the 1.32.0 hardcoded 8192-with-a-248-byte-buffer lie).
+fn tcp_rx_free(cb) {
+    var occ = load64(cb + 64) - load64(cb + 80);   # rx_write - rx_read
+    var free = TCP_RX_RING - occ;
+    if (free < 0) { free = 0; }
+    return free;
+}
+
+# Append up to `len` bytes from `src` into the conn's receive ring, clamped to
+# free space (flow control) and wrapped at the ring boundary. Advances
+# rx_write; returns bytes actually taken. TCP_RX_RING is a power of two, so the
+# position is a mask, not a modulo.
+fn tcp_rx_append(cb, src, len) {
+    var rx_buf = load64(cb + 48);
+    if (rx_buf == 0) { return 0; }
+    var take = len;
+    var free = tcp_rx_free(cb);
+    if (take > free) { take = free; }
+    if (take <= 0) { return 0; }
+    var rxw = load64(cb + 64);
+    var wpos = rxw & (TCP_RX_RING - 1);
+    var first = TCP_RX_RING - wpos;        # contiguous room to end of ring
+    if (first > take) { first = take; }
+    net_copy_buf(rx_buf + wpos, src, first);
+    if (take > first) {
+        net_copy_buf(rx_buf, src + first, take - first);
+    }
+    store64(cb + 64, rxw + take);          # advance rx_write
+    return take;
+}
+
+# MSS option (B3, RFC 9293 §3.2 — kind 2, len 4, 16-bit value). Written after
+# the 20-byte fixed header on a SYN/SYN-ACK; returns its length (4).
+fn tcp_write_mss_opt(p) {
+    store8(p + 0, 2);                       # kind = MSS
+    store8(p + 1, 4);                       # length
+    store8(p + 2, (TCP_OUR_MSS >> 8) & 0xFF);
+    store8(p + 3, TCP_OUR_MSS & 0xFF);
+    return 4;
+}
+
+# Walk a received segment's options (between the 20-byte header and hdr_len)
+# for the MSS option. Returns the peer's MSS, or 0 if absent/malformed.
+fn tcp_parse_mss(tcp, hdr_len) {
+    var p = 20;
+    while (p + 1 < hdr_len) {
+        var kind = load8(tcp + p);
+        if (kind == 0) { return 0; }             # End Of Options
+        if (kind == 1) { p = p + 1; continue; }  # NOP
+        var olen = load8(tcp + p + 1);
+        if (olen < 2) { return 0; }              # malformed — stop
+        if (kind == 2) {
+            if (olen == 4) {
+                if (p + 4 <= hdr_len) {
+                    return (load8(tcp + p + 2) << 8) | load8(tcp + p + 3);
+                }
+            }
+        }
+        p = p + olen;
+    }
+    return 0;
+}
+
+# Effective send MSS for a peer MSS value (0 = peer omitted the option): clamp
+# to ours, fall back to the RFC 9293 default when absent.
+fn tcp_eff_mss(peer_mss) {
+    var m = peer_mss;
+    if (m == 0) { m = TCP_MSS_DEFAULT; }
+    if (m > TCP_OUR_MSS) { m = TCP_OUR_MSS; }
+    if (m < 1) { m = TCP_MSS_DEFAULT; }
+    return m;
+}
+
+# Next send-chunk size (B3 + B4): bounded by remaining bytes, the effective MSS,
+# and the peer's usable window `wnd`. A zero window returns 1 — the single-byte
+# persist probe (RFC 9293 §3.8.6.1). (One in flight, so the usable window is
+# the peer's advertised window with no in-flight subtraction.)
+fn tcp_send_chunk(remaining, mss, wnd) {
+    var c = remaining;
+    if (c > mss) { c = mss; }
+    if (wnd == 0) { return 1; }
+    if (c > wnd) { c = wnd; }
+    return c;
+}
+
+fn tcp_checksum_compute(src_ip, dst_ip, tcp_buf, tcp_len) {
+    # Pseudo-header: src_ip(4) + dst_ip(4) + zero(1) + proto(1) + tcp_len(2)
+    var sum = 0;
+    # src_ip
+    sum = sum + ((src_ip >> 16) & 0xFFFF);
+    sum = sum + (src_ip & 0xFFFF);
+    # dst_ip
+    sum = sum + ((dst_ip >> 16) & 0xFFFF);
+    sum = sum + (dst_ip & 0xFFFF);
+    # zero + proto=6
+    sum = sum + 6;
+    # tcp_len
+    sum = sum + tcp_len;
+    # TCP header + data
+    var i = 0;
+    while (i < tcp_len) {
+        var hi = load8(tcp_buf + i) << 8;
+        var lo = 0;
+        if (i + 1 < tcp_len) { lo = load8(tcp_buf + i + 1); }
+        sum = sum + hi + lo;
+        i = i + 2;
+    }
+    while (sum > 0xFFFF) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (0 - 1 - sum) & 0xFFFF;
+}
+
+fn tcp_build_header(pkt, src_port, dst_port, seq, ack, flags, window) {
+    # src_port (2)
+    store8(pkt, (src_port >> 8) & 0xFF);
+    store8(pkt + 1, src_port & 0xFF);
+    # dst_port (2)
+    store8(pkt + 2, (dst_port >> 8) & 0xFF);
+    store8(pkt + 3, dst_port & 0xFF);
+    # seq (4)
+    store8(pkt + 4, (seq >> 24) & 0xFF);
+    store8(pkt + 5, (seq >> 16) & 0xFF);
+    store8(pkt + 6, (seq >> 8) & 0xFF);
+    store8(pkt + 7, seq & 0xFF);
+    # ack (4)
+    store8(pkt + 8, (ack >> 24) & 0xFF);
+    store8(pkt + 9, (ack >> 16) & 0xFF);
+    store8(pkt + 10, (ack >> 8) & 0xFF);
+    store8(pkt + 11, ack & 0xFF);
+    # data offset (5 = 20 bytes, shift left 4) + reserved + flags
+    # data_offset_and_flags: high byte = (5 << 4) = 0x50, low byte = flags
+    store8(pkt + 12, 0x50);
+    store8(pkt + 13, flags & 0xFF);
+    # window (2)
+    store8(pkt + 14, (window >> 8) & 0xFF);
+    store8(pkt + 15, window & 0xFF);
+    # checksum (2) - filled later
+    store8(pkt + 16, 0);
+    store8(pkt + 17, 0);
+    # urgent pointer (2)
+    store8(pkt + 18, 0);
+    store8(pkt + 19, 0);
+    return 20;
+}
+
+fn tcp_send_pkt(conn_id, flags, data, data_len) {
+    if (nic_ready() == 0) { return 0 - 1; }
+    var cb = tcp_conn_base(conn_id);
+    var src_port = load64(cb + 8);
+    var dst_port = load64(cb + 16);
+    var dst_ip = load64(cb + 24);
+    var seq = load64(cb + 32);
+    var ack = load64(cb + 40);
+    # Default broadcast; if the route helper resolves a next-hop MAC for
+    # dst_ip, use it instead. Off-LAN destinations (e.g., 1.1.1.1) need the
+    # gateway MAC at L2; same shape as udp_send above.
+    var dst_mac[8];
+    memset(&dst_mac, 0xFF, 6);
+    route_next_hop_mac(dst_ip, &dst_mac);
+    var kmac[8];
+    nic_mac(&kmac);   # FIX #1
+    var p = &net_pkt;
+    var off = eth_build(p, &dst_mac, &kmac, 0x0800);
+    # Build TCP header after IP header space (20 bytes). Advertise the real
+    # receive-ring free space (B1) — not the old hardcoded 8192.
+    var tcp_off = off + 20;
+    var win = tcp_rx_free(cb);
+    if (win > 65535) { win = 65535; }
+    var tcp_hdr_len = tcp_build_header(p + tcp_off, src_port, dst_port, seq, ack, flags, win);
+    # SYN / SYN-ACK carry the MSS option (B3): bump the data offset to 6 words
+    # (24 bytes) and append the 4-byte option. SYNs never carry data, so the
+    # data copy below lands correctly past the option.
+    var opt_len = 0;
+    if ((flags & 0x02) != 0) {
+        store8(p + tcp_off + 12, 0x60);     # data offset = 6 × 4 = 24 bytes
+        tcp_write_mss_opt(p + tcp_off + tcp_hdr_len);
+        opt_len = 4;
+    }
+    # Copy data after the header (+ options)
+    memcpy(p + tcp_off + tcp_hdr_len + opt_len, data, data_len);
+    var tcp_total = tcp_hdr_len + opt_len + data_len;
+    # Compute TCP checksum
+    var cksum = tcp_checksum_compute(net_ip, dst_ip, p + tcp_off, tcp_total);
+    store8(p + tcp_off + 16, (cksum >> 8) & 0xFF);
+    store8(p + tcp_off + 17, cksum & 0xFF);
+    # Build IP header (proto=6 for TCP)
+    ip_build(p + off, net_ip, dst_ip, 6, tcp_total);
+    return nic_send(p, off + 20 + tcp_total);
+}
+
+# === TCP retransmit (B2) — one in-flight segment, fixed RTO + ×2 backoff ===
+# Per tcp-hardening-prior-art.md § 4: stop-and-wait-scale retransmit (iPXE
+# model). A single unACKed segment is held; resent on RTO expiry until the
+# peer ACKs past it or the retry cap declares the conn dead.
+
+# Arm (or re-arm) the held segment. `seq` = its starting seq; `flags` = the
+# TCP flags to resend with (0x02 SYN / 0x12 SYN-ACK / 0x18 data / 0x11 FIN-ACK);
+# `data`/`data_len` its payload (data_len 0 for flag-only segments). SND.UNA is
+# pinned to `seq` while armed (the oldest unACKed byte).
+fn tcp_arm_retx(cb, seq, flags, data, data_len) {
+    var n = data_len;
+    if (n > TCP_RETX_BUF) { n = TCP_RETX_BUF; }
+    if (n > 0) {
+        var rb = load64(cb + 136);
+        if (rb != 0) { net_copy_buf(rb, data, n); }
+    }
+    store64(cb + 56, seq);          # SND.UNA
+    store64(cb + 96, seq);          # retx_seq
+    store64(cb + 104, n);           # retx_len
+    store64(cb + 112, timer_ticks); # retx_tick (last sent)
+    store64(cb + 120, 0);           # retx_count (fresh)
+    store64(cb + 128, flags);       # retx_flags (non-zero = armed)
+    return 0;
+}
+
+fn tcp_disarm_retx(cb) {
+    store64(cb + 128, 0);           # retx_flags = 0 (nothing in flight)
+    return 0;
+}
+
+# RTO for a retry count: TCP_RTO_BASE doubled per retry, capped at ×16 (RFC
+# 6298 backoff; fixed base, RTT estimation deferred — audit § 4).
+fn tcp_retx_rto(count) {
+    var shift = count;
+    if (shift > 4) { shift = 4; }
+    return TCP_RTO_BASE << shift;
+}
+
+# Per-poll retransmit driver (called from net_poll). Resends each armed conn's
+# held segment when its RTO has elapsed, doubling the RTO; after TCP_RTO_RETRIES
+# resends with no ACK, the conn is declared dead (→ CLOSED).
+fn tcp_retx_tick() {
+    for (var i = 0; i < tcp_conn_count; i = i + 1) {
+        var cb = tcp_conn_base(i);
+        var rflags = load64(cb + 128);
+        if (rflags == 0) { continue; }                       # not armed
+        var count = load64(cb + 120);
+        if ((timer_ticks - load64(cb + 112)) < tcp_retx_rto(count)) { continue; }
+        if (count >= TCP_RTO_RETRIES) {
+            store64(cb, 0);          # exhausted → CLOSED
+            tcp_disarm_retx(cb);
+            continue;
+        }
+        # Resend from retx_seq (temporarily restore it as SND.NXT for the build).
+        var saved_nxt = load64(cb + 32);
+        store64(cb + 32, load64(cb + 96));
+        tcp_send_pkt(i, rflags, load64(cb + 136), load64(cb + 104));
+        store64(cb + 32, saved_nxt);
+        store64(cb + 112, timer_ticks);
+        store64(cb + 120, count + 1);
+    }
+    return 0;
+}
+
+fn tcp_connect(dst_ip, dst_port, src_port) {
+    if (tcp_conn_count >= 8) { return 0 - 1; }
+    var conn_id = tcp_conn_count;
+    tcp_conn_count = tcp_conn_count + 1;
+    var cb = tcp_conn_base(conn_id);
+    # Allocate per-connection receive RING (S5: prevent shared-buffer corruption)
+    var rx_buf = kmalloc(TCP_RX_RING);
+    if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0 - 1; }
+    # Retransmit hold buffer (B2).
+    var retx_buf = kmalloc(TCP_RETX_BUF);
+    if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); tcp_conn_count = tcp_conn_count - 1; return 0 - 1; }
+    # Use timer_ticks for initial seq randomization (reduces spoofing risk)
+    var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
+    store64(cb, 1);             # state = SYN_SENT
+    store64(cb + 8, src_port);
+    store64(cb + 16, dst_port);
+    store64(cb + 24, dst_ip);
+    store64(cb + 32, isn);      # SND.NXT (initial seq)
+    store64(cb + 40, 0);        # RCV.NXT (set when SYN-ACK arrives)
+    store64(cb + 48, rx_buf);   # receive ring base
+    store64(cb + 56, isn);      # SND.UNA = isn
+    store64(cb + 64, 0);        # rx_write
+    store64(cb + 72, 0);        # flags
+    store64(cb + 80, 0);        # rx_read
+    store64(cb + 88, 0);        # SND.WND (peer window; learned on SYN-ACK)
+    store64(cb + 96, 0);        # retx_seq
+    store64(cb + 104, 0);       # retx_len
+    store64(cb + 112, 0);       # retx_tick
+    store64(cb + 120, 0);       # retx_count
+    store64(cb + 128, 0);       # retx_flags (disarmed)
+    store64(cb + 136, retx_buf);
+    store64(cb + 144, TCP_MSS_DEFAULT);   # eff_mss (refined when SYN-ACK's MSS arrives)
+    # Send SYN (flags = 0x02) and arm its retransmit.
+    tcp_send_pkt(conn_id, 0x02, 0, 0);
+    tcp_arm_retx(cb, isn, 0x02, 0, 0);
+    # Advance SND.NXT by 1 (SYN consumes a sequence number); SND.UNA stays at
+    # isn until the SYN is ACKed.
+    store64(cb + 32, (isn + 1) & 0xFFFFFFFF);
+    # Wait for SYN-ACK. Poll on a timer deadline (not a fixed iteration count)
+    # so the B2 retransmits (1 s, 2 s, …) have time to recover a lost SYN.
+    var deadline = timer_ticks + 800;   # ~8 s
+    while (timer_ticks < deadline) {
+        net_poll();
+        var state = load64(cb);
+        if (state == 2) { return conn_id; }
+        if (state == 0) { return 0 - 1; }
+        arch_wait();
+    }
+    # Timeout
+    store64(cb, 0);
+    return 0 - 1;
+}
+
+fn tcp_send(conn_id, data, len) {
+    if (conn_id < 0) { return 0 - 1; }
+    if (conn_id >= tcp_conn_count) { return 0 - 1; }
+    var cb = tcp_conn_base(conn_id);
+    if (load64(cb) != 2) { return 0 - 1; }
+    # B3: segment into ≤ effective-MSS chunks. One in flight (B2): send a chunk,
+    # arm its retransmit, then wait (bounded) for its ACK before the next — so
+    # exactly one segment is held, and a loss is recovered by the B2 timer.
+    var mss = load64(cb + 144);
+    if (mss < 1) { mss = TCP_MSS_DEFAULT; }
+    var sent = 0;
+    while (sent < len) {
+        # B3 MSS + B4 peer-window cap (zero window → 1-byte persist probe).
+        var chunk = tcp_send_chunk(len - sent, mss, load64(cb + 88));
+        var seq = load64(cb + 32);
+        tcp_send_pkt(conn_id, 0x18, data + sent, chunk);   # PSH+ACK
+        store64(cb + 32, (seq + chunk) & 0xFFFFFFFF);
+        tcp_arm_retx(cb, seq, 0x18, data + sent, chunk);
+        sent = sent + chunk;
+        var deadline = timer_ticks + 800;       # ~8 s ceiling per chunk
+        while (timer_ticks < deadline) {
+            net_poll();
+            if (load64(cb + 128) == 0) { break; }   # retx disarmed = ACKed
+            if (load64(cb) != 2) { break; }         # conn left ESTABLISHED
+            arch_wait();
+        }
+        if (load64(cb) != 2) { return sent; }       # closed/reset mid-send
+    }
+    return sent;
+}
+
+fn tcp_recv(conn_id, buf, maxlen) {
+    if (conn_id < 0) { return 0; }
+    if (conn_id >= tcp_conn_count) { return 0; }
+    # Poll for packets
+    net_poll();
+    var cb = tcp_conn_base(conn_id);
+    var rx_buf = load64(cb + 48);
+    if (rx_buf == 0) { return 0; }
+    # B1 ring drain (FIFO): available = rx_write - rx_read.
+    var rxw = load64(cb + 64);
+    var rxr = load64(cb + 80);
+    var avail = rxw - rxr;
+    if (avail <= 0) { return 0; }
+    var take = avail;
+    if (take > maxlen) { take = maxlen; }
+    var rpos = rxr & (TCP_RX_RING - 1);
+    var first = TCP_RX_RING - rpos;        # contiguous bytes to end of ring
+    if (first > take) { first = take; }
+    net_copy_buf(buf, rx_buf + rpos, first);
+    if (take > first) {
+        net_copy_buf(buf + first, rx_buf, take - first);
+    }
+    store64(cb + 80, rxr + take);          # advance rx_read
+    # Draining freed ring space → send a window-update ACK so a peer that
+    # stalled on a small/zero window resumes (keeps large streams flowing).
+    if (load64(cb) == 2) { tcp_send_pkt(conn_id, 0x10, 0, 0); }
+    return take;
+}
+
+fn tcp_close(conn_id) {
+    if (conn_id < 0) { return 0 - 1; }
+    if (conn_id >= tcp_conn_count) { return 0 - 1; }
+    var cb = tcp_conn_base(conn_id);
+    var state = load64(cb);
+    if (state == 2) {
+        # Send FIN+ACK (flags = 0x11), advance SND.NXT, arm the FIN retransmit
+        # (flag-only — retx_len 0, so it never dereferences the held buffer).
+        var seq = load64(cb + 32);
+        tcp_send_pkt(conn_id, 0x11, 0, 0);
+        store64(cb, 3);  # FIN_WAIT
+        store64(cb + 32, (seq + 1) & 0xFFFFFFFF);
+        tcp_arm_retx(cb, seq, 0x11, 0, 0);
+    }
+    if (state == 4) {
+        # CLOSE_WAIT: send FIN+ACK
+        tcp_send_pkt(conn_id, 0x11, 0, 0);
+        store64(cb, 0);  # CLOSED
+    }
+    # Free per-connection buffers (receive ring + retransmit hold). The FIN
+    # retransmit above is flag-only, so freeing the hold buffer here is safe.
+    var rx_buf = load64(cb + 48);
+    if (rx_buf != 0) {
+        kfree_sized(rx_buf, TCP_RX_RING);
+        store64(cb + 48, 0);
+    }
+    var retx_buf = load64(cb + 136);
+    if (retx_buf != 0) {
+        kfree_sized(retx_buf, TCP_RETX_BUF);
+        store64(cb + 136, 0);
+    }
+    return 0;
+}
+
+# === Server-side TCP (1.32.0 bite A) ===
+
+fn tcp_find_listen(listen_port) {
+    # Scan conn table for state == LISTEN entries with src_port matching the
+    # given local-listening-port. Returns conn_id or -1.
+    for (var i = 0; i < tcp_conn_count; i = i + 1) {
+        var cb = tcp_conn_base(i);
+        if (load64(cb) == 5) {
+            if (load64(cb + 8) == listen_port) {
+                return i;
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+fn tcp_listen(port) {
+    # Refuse duplicate-bind: already-listening on this port → return -1.
+    if (tcp_find_listen(port) >= 0) { return 0 - 1; }
+    if (tcp_conn_count >= 8) { return 0 - 1; }
+    var conn_id = tcp_conn_count;
+    tcp_conn_count = tcp_conn_count + 1;
+    var cb = tcp_conn_base(conn_id);
+    store64(cb, 5);             # state = LISTEN
+    store64(cb + 8, port);      # src_port = listening port
+    store64(cb + 16, 0);        # dst_port = wildcard
+    store64(cb + 24, 0);        # dst_ip = wildcard
+    store64(cb + 32, 0);        # seq_num unused on LISTEN
+    store64(cb + 40, 0);        # ack_num unused on LISTEN
+    store64(cb + 48, 0);        # rx_buf unused on LISTEN
+    store64(cb + 56, 0);        # SND.UNA unused
+    store64(cb + 64, 0);        # rx_write unused
+    store64(cb + 72, 0x100);    # flags = TCP_FLAG_IS_LISTENING
+    store64(cb + 80, 0);        # rx_read unused
+    store64(cb + 88, 0);        # SND.WND unused
+    store64(cb + 96, 0);        # retx_seq unused
+    store64(cb + 104, 0);       # retx_len unused
+    store64(cb + 112, 0);       # retx_tick unused
+    store64(cb + 120, 0);       # retx_count unused
+    store64(cb + 128, 0);       # retx_flags unused (LISTEN never retransmits)
+    store64(cb + 136, 0);       # retx_buf unused
+    store64(cb + 144, 0);       # eff_mss unused (set per-conn on passive open)
+    return conn_id;
+}
+
+fn tcp_bind(port, ip) {
+    # v1: bind+listen merged. ip arg unused (we listen on net_ip always).
+    # When a separate bind-without-listen consumer surfaces, split this.
+    return tcp_listen(port);
+}
+
+fn tcp_accept(listen_id) {
+    # Non-blocking accept: scan for ESTABLISHED conns whose parent_listen_id
+    # matches and which haven't been accepted yet. Returns conn_id or -1.
+    if (listen_id < 0) { return 0 - 1; }
+    if (listen_id >= tcp_conn_count) { return 0 - 1; }
+    var lcb = tcp_conn_base(listen_id);
+    if (load64(lcb) != 5) { return 0 - 1; }  # not a LISTEN
+    for (var i = 0; i < tcp_conn_count; i = i + 1) {
+        if (i == listen_id) { continue; }
+        var cb = tcp_conn_base(i);
+        if (load64(cb) != 2) { continue; }   # not ESTABLISHED
+        var meta = load64(cb + 72);
+        # passive_open (bit 9) set AND not yet accepted (bit 10 clear)?
+        if ((meta & 0x200) == 0) { continue; }
+        if ((meta & 0x400) != 0) { continue; }
+        # parent_listen_id (bits 16-23) match?
+        var parent = (meta >> 16) & 0xFF;
+        if (parent != listen_id) { continue; }
+        # Mark accepted and return.
+        store64(cb + 72, meta | 0x400);
+        return i;
+    }
+    return 0 - 1;
+}
+
+fn tcp_find_conn(src_port, dst_port, src_ip) {
+    for (var i = 0; i < tcp_conn_count; i = i + 1) {
+        var cb = tcp_conn_base(i);
+        var state = load64(cb);
+        if (state != 0) {
+            if (load64(cb + 8) == dst_port) {
+                if (load64(cb + 16) == src_port) {
+                    if (load64(cb + 24) == src_ip) {
+                        return i;
+                    }
+                }
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
+    var canary = stack_canary_secret;
+    if (ip_payload_len < 20) { return 0; }
+    var tcp = pkt + ip_off;
+    var src_port = (load8(tcp) << 8) | load8(tcp + 1);
+    var dst_port = (load8(tcp + 2) << 8) | load8(tcp + 3);
+    var seq = (load8(tcp + 4) << 24) | (load8(tcp + 5) << 16) | (load8(tcp + 6) << 8) | load8(tcp + 7);
+    var ack = (load8(tcp + 8) << 24) | (load8(tcp + 9) << 16) | (load8(tcp + 10) << 8) | load8(tcp + 11);
+    var data_off_byte = load8(tcp + 12);
+    var tcp_hdr_len = ((data_off_byte >> 4) & 0x0F) * 4;
+    # Security: validate TCP header length
+    if (tcp_hdr_len < 20) { return 0; }
+    if (tcp_hdr_len > ip_payload_len) { return 0; }
+    var flags = load8(tcp + 13);
+    var conn_id = tcp_find_conn(src_port, dst_port, src_ip);
+    if (conn_id < 0) {
+        # No active conn. Try the passive-open path: incoming SYN to a
+        # LISTEN entry spawns a new SYN_RCVD conn. (1.32.0 bite A.)
+        # Only a pure SYN qualifies — SYN+ACK on an unknown 4-tuple is
+        # spurious; same for plain data/ACK/FIN.
+        if ((flags & 0x02) == 0) { return 0; }
+        if ((flags & 0x10) != 0) { return 0; }
+        var listen_id = tcp_find_listen(dst_port);
+        if (listen_id < 0) { return 0; }
+        # Allocate a new conn slot for the incoming peer.
+        if (tcp_conn_count >= 8) { return 0; }
+        var new_id = tcp_conn_count;
+        tcp_conn_count = tcp_conn_count + 1;
+        var ncb = tcp_conn_base(new_id);
+        # Per-connection receive ring + retransmit hold (matches tcp_connect).
+        var rx_buf = kmalloc(TCP_RX_RING);
+        if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0; }
+        var retx_buf = kmalloc(TCP_RETX_BUF);
+        if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); tcp_conn_count = tcp_conn_count - 1; return 0; }
+        # ISN — same timer-driven random as tcp_connect.
+        var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
+        store64(ncb, 6);                       # state = SYN_RCVD
+        store64(ncb + 8, dst_port);            # our src_port = listener's port
+        store64(ncb + 16, src_port);           # peer's port
+        store64(ncb + 24, src_ip);             # peer's IP
+        store64(ncb + 32, isn);                # SND.NXT (our initial seq)
+        store64(ncb + 40, (seq + 1) & 0xFFFFFFFF);  # RCV.NXT = their SYN+1
+        store64(ncb + 48, rx_buf);             # receive ring base
+        store64(ncb + 56, isn);                # SND.UNA = isn
+        store64(ncb + 64, 0);                  # rx_write
+        # meta: passive_open + parent_listen_id<<16
+        var meta = 0x200 | ((listen_id & 0xFF) << 16);
+        store64(ncb + 72, meta);
+        store64(ncb + 80, 0);                  # rx_read
+        store64(ncb + 88, 0);                  # SND.WND (learned on the ACK)
+        store64(ncb + 96, 0);                  # retx_seq
+        store64(ncb + 104, 0);                 # retx_len
+        store64(ncb + 112, 0);                 # retx_tick
+        store64(ncb + 120, 0);                 # retx_count
+        store64(ncb + 128, 0);                 # retx_flags (disarmed)
+        store64(ncb + 136, retx_buf);
+        # B3: effective send MSS from the peer's SYN MSS option (clamped to ours).
+        store64(ncb + 144, tcp_eff_mss(tcp_parse_mss(tcp, tcp_hdr_len)));
+        # Send SYN+ACK (0x12), advance SND.NXT, arm its retransmit.
+        tcp_send_pkt(new_id, 0x12, 0, 0);
+        tcp_arm_retx(ncb, isn, 0x12, 0, 0);
+        store64(ncb + 32, (isn + 1) & 0xFFFFFFFF);
+        return 1;
+    }
+    var cb = tcp_conn_base(conn_id);
+    var state = load64(cb);
+    var data_len = ip_payload_len - tcp_hdr_len;
+    # B4: capture the peer's advertised window from every inbound segment (the
+    # window field is always valid — incl. the SYN-ACK, so it's set before our
+    # first send). tcp_send honors this as the usable send window.
+    store64(cb + 88, (load8(tcp + 14) << 8) | load8(tcp + 15));
+    # B2: an inbound ACK that covers our held (oldest unACKed) segment advances
+    # SND.UNA and disarms the retransmit. seqlen counts the SYN/FIN phantom byte.
+    # The `< 0x40000000` guard rejects wrapped dup-acks (ack <= retx_seq).
+    if ((flags & 0x10) != 0) {
+        var rflags = load64(cb + 128);
+        if (rflags != 0) {
+            var rseq = load64(cb + 96);
+            var seqlen = load64(cb + 104);
+            if ((rflags & 0x02) != 0) { seqlen = seqlen + 1; }
+            if ((rflags & 0x01) != 0) { seqlen = seqlen + 1; }
+            var diff = (ack - rseq) & 0xFFFFFFFF;
+            if (diff >= seqlen) {
+                if (diff < 0x40000000) {
+                    store64(cb + 56, ack);   # SND.UNA = ack
+                    tcp_disarm_retx(cb);
+                }
+            }
+        }
+    }
+    # SYN_SENT: expect SYN-ACK (flags & 0x12 == 0x12)
+    if (state == 1) {
+        if ((flags & 0x12) == 0x12) {
+            # Security: validate ACK matches our SYN seq + 1
+            var our_seq = load64(cb + 32);
+            if (((ack - our_seq) & 0xFFFFFFFF) != 0) {
+                return 0;  # Bad ACK, drop
+            }
+            store64(cb + 40, (seq + 1) & 0xFFFFFFFF);   # mask: TCP seq wraps at 2^32 (arc-close hardening pass 2)
+            store64(cb, 2);  # ESTABLISHED
+            # B3: learn the peer's MSS from the SYN-ACK option (clamp to ours).
+            store64(cb + 144, tcp_eff_mss(tcp_parse_mss(tcp, tcp_hdr_len)));
+            # Send ACK (flags = 0x10)
+            tcp_send_pkt(conn_id, 0x10, 0, 0);
+            return 1;
+        }
+        if ((flags & 0x04) != 0) {
+            # RST received
+            store64(cb, 0);  # CLOSED
+            return 1;
+        }
+    }
+    # SYN_RCVD: expect ACK that matches our SYN+ACK's seq+1.
+    # On match → ESTABLISHED; userland calls tcp_accept() to claim the conn.
+    # (1.32.0 bite A — passive-open handshake completion.)
+    if (state == 6) {
+        if ((flags & 0x04) != 0) {
+            store64(cb, 0);  # RST -> CLOSED
+            return 1;
+        }
+        if ((flags & 0x10) != 0) {
+            var our_seq = load64(cb + 32);
+            if (((ack - our_seq) & 0xFFFFFFFF) != 0) {
+                return 0;  # Bad ACK, drop
+            }
+            store64(cb, 2);  # ESTABLISHED — accept queue ready to drain
+            # If the peer included data in this ACK, fall through into the
+            # ESTABLISHED branch below by re-loading state.
+            state = 2;
+            # Fallthrough.
+        } else {
+            return 1;  # No ACK bit set; keep waiting.
+        }
+    }
+    # ESTABLISHED: handle data, ACK, FIN, RST
+    if (state == 2) {
+        if ((flags & 0x04) != 0) {
+            store64(cb, 0);  # RST -> CLOSED
+            return 1;
+        }
+        # B1 in-order receive ring. RCV.NXT (cb+40) is the next byte we expect;
+        # only a segment starting exactly there is accepted (no out-of-order
+        # reassembly queue in v1 — see tcp-hardening-prior-art.md § 4).
+        var expected = load64(cb + 40);
+        # (peer window already captured at the top of this handler — B4)
+        if (data_len > 0) {
+            if (seq == expected) {
+                # Append into the ring (flow-control-clamped + wrapped), advance
+                # RCV.NXT by the bytes actually accepted.
+                var took = tcp_rx_append(cb, tcp + tcp_hdr_len, data_len);
+                store64(cb + 40, (expected + took) & 0xFFFFFFFF);
+            }
+            # ACK either way: in-order advances RCV.NXT; out-of-order / a
+            # retransmit of already-acked bytes re-sends the cumulative ACK so
+            # the peer retransmits the gap. The ACK carries our live window.
+            tcp_send_pkt(conn_id, 0x10, 0, 0);
+        }
+        if ((flags & 0x01) != 0) {
+            # FIN — honor only when it is the next in-order byte (seq+data_len
+            # == RCV.NXT); otherwise it sits beyond a gap and the peer resends.
+            var rcv = load64(cb + 40);
+            if (((seq + data_len) & 0xFFFFFFFF) == rcv) {
+                store64(cb + 40, (rcv + 1) & 0xFFFFFFFF);
+                tcp_send_pkt(conn_id, 0x10, 0, 0);
+                store64(cb, 4);  # CLOSE_WAIT
+            }
+        }
+        # Preserve upper-bit metadata (is_listening/passive_open/accepted/
+        # parent_listen_id at bits 8-23); only the low byte tracks received
+        # TCP flags. (1.32.0 bite A — was a flat store before LISTEN landed.)
+        var old_meta = load64(cb + 72) & 0xFFFFFFFFFFFFFF00;
+        store64(cb + 72, old_meta | (flags & 0xFF));
+        return 1;
+    }
+    # FIN_WAIT: expect ACK or FIN-ACK
+    if (state == 3) {
+        if ((flags & 0x04) != 0) {
+            store64(cb, 0);  # RST -> CLOSED
+            return 1;
+        }
+        if ((flags & 0x01) != 0) {
+            store64(cb + 40, (seq + 1) & 0xFFFFFFFF);   # mask: TCP seq wraps at 2^32 (arc-close hardening pass 2)
+            tcp_send_pkt(conn_id, 0x10, 0, 0);
+            store64(cb, 0);  # CLOSED
+        }
+        if ((flags & 0x10) != 0) {
+            store64(cb, 0);  # ACK of FIN -> CLOSED
+        }
+        stack_canary_check(canary);
+        return 1;
+    }
+    stack_canary_check(canary);
+    return 0;
+}
+
+fn tcp_state_name(state, buf) {
+    if (state == 0) { net_copy_buf(buf, "CLOSED", 6); return 6; }
+    if (state == 1) { net_copy_buf(buf, "SYN_SENT", 8); return 8; }
+    if (state == 2) { net_copy_buf(buf, "ESTAB", 5); return 5; }
+    if (state == 3) { net_copy_buf(buf, "FIN_WAIT", 8); return 8; }
+    if (state == 4) { net_copy_buf(buf, "CLOSE_W", 7); return 7; }
+    if (state == 5) { net_copy_buf(buf, "LISTEN", 6); return 6; }
+    if (state == 6) { net_copy_buf(buf, "SYN_RCVD", 8); return 8; }
+    net_copy_buf(buf, "?", 1);
+    return 1;
+}
