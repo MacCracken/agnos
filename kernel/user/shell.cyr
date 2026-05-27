@@ -157,6 +157,7 @@ fn sh_cmd_help() {
     kprintln("  send    - send UDP msg", 24);
     kprintln("  recv    - recv UDP pkt", 24);
     kprintln("  tcp     - TCP connect test", 28);
+    kprintln("  dns     - resolve hostname", 28);
     kprintln("  pipe    - test pipe IPC", 25);
     kprintln("  blkread - read disk sector", 28);
     kprintln("  parts   - list GPT partitions", 31);
@@ -789,6 +790,26 @@ fn sh_exec(buf, len) {
             tcp_close(conn);
             kprintln("TCP: closed", 11);
         }
+        return 0;
+    }
+    if (sh_streq(buf, clen, "dns", 3) == 1) {
+        if (vnet_active == 0 && nic_ready() == 0) { kprintln("no network", 10); return 0; }
+        # Trim leading + trailing spaces off the hostname token.
+        var s = 0;
+        while (s < arglen) { if (load8(arg + s) != 32) { break; } s = s + 1; }
+        var h = arg + s;
+        var hlen = arglen - s;
+        while (hlen > 0) { if (load8(h + hlen - 1) != 32) { break; } hlen = hlen - 1; }
+        if (hlen < 1) { kprintln("usage: dns <hostname>", 21); return 0; }
+        var resolved = 0;
+        if (dns_resolve(h, hlen, &resolved) != 0) { kprintln("dns: lookup failed", 18); return 0; }
+        kprint("dns: ", 5);
+        for (var i = 0; i < hlen; i = i + 1) { kputc(load8(h + i)); }
+        kprint(" -> ", 4);
+        kprint_num((resolved >> 24) & 0xFF); kprint(".", 1);
+        kprint_num((resolved >> 16) & 0xFF); kprint(".", 1);
+        kprint_num((resolved >> 8) & 0xFF); kprint(".", 1);
+        kprint_num(resolved & 0xFF); kprintln("", 0);
         return 0;
     }
     if (sh_streq(buf, clen, "blkread", 7) == 1) {

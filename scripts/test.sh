@@ -61,9 +61,12 @@ exit(0 if ok else 1)
 
     # Size check — ceiling bumped to 700KB at 1.31.3, then 800KB at 1.33.4
     # (the WRITE arc + symlink resolution + uninit materialization carried the
-    # binary 675→708 KB; it crossed 700KB with bites 2/3 of 1.33.4).
+    # binary 675→708 KB; it crossed 700KB with bites 2/3 of 1.33.4). The
+    # 1.34.x FAT-family arc reached ~799 KB; 1.35.x DNS crossed 800 KB, so the
+    # sanity ceiling moved 800K → 1.2M — generous headroom for the rest of the
+    # 1.x line while still catching a runaway-bloat regression.
     SZ=$(wc -c < $ROOT/build/agnos_test 2>/dev/null || echo 0)
-    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 800000 ]; then
+    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 1200000 ]; then
         check "x86 size reasonable (${SZ}B)" "0" "0"
     else
         check "x86 size reasonable (${SZ}B)" "0" "1"

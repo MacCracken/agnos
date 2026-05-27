@@ -1232,6 +1232,68 @@ if (vnet_active != 0 || nic_ready() != 0) {
     }
 }
 
+#ifdef DNS_SELFTEST
+# DNS stub-resolver self-test (1.35.x bite 2, compile-gated via DNS_SELFTEST).
+#   (1) Print the DHCP-captured resolver (bite 1 / option 6) — under QEMU
+#       SLIRP this is 10.0.2.3, hermetic (no internet needed).
+#   (2) HERMETIC parse test: feed dns_parse_answer a hand-built RFC 1035
+#       response for example.com -> 93.184.216.34 whose answer NAME is a
+#       0xC0 compression pointer back to the question. Asserts the extracted
+#       A record — exercises dns_skip_name's pointer case + the answer walk
+#       with zero network dependency. This is the load-bearing smoke gate.
+#   (3) Best-effort live lookup (informational; needs SLIRP->host DNS).
+{
+    kprint("dns: resolver=", 14); dhcp_print_ip(net_dns_server); kprintln("", 0);
+
+    var resp[64];
+    # Header: id=0xABCD flags=0x8180 (QR|RD|RA) qd=1 an=1 ns=0 ar=0
+    store8(&resp + 0, 0xAB); store8(&resp + 1, 0xCD);
+    store8(&resp + 2, 0x81); store8(&resp + 3, 0x80);
+    store8(&resp + 4, 0x00); store8(&resp + 5, 0x01);
+    store8(&resp + 6, 0x00); store8(&resp + 7, 0x01);
+    store8(&resp + 8, 0x00); store8(&resp + 9, 0x00);
+    store8(&resp + 10, 0x00); store8(&resp + 11, 0x00);
+    # Question: 07 "example" 03 "com" 00, QTYPE=A, QCLASS=IN
+    store8(&resp + 12, 7);
+    store8(&resp + 13, 101); store8(&resp + 14, 120); store8(&resp + 15, 97);
+    store8(&resp + 16, 109); store8(&resp + 17, 112); store8(&resp + 18, 108);
+    store8(&resp + 19, 101);
+    store8(&resp + 20, 3);
+    store8(&resp + 21, 99); store8(&resp + 22, 111); store8(&resp + 23, 109);
+    store8(&resp + 24, 0);
+    store8(&resp + 25, 0x00); store8(&resp + 26, 0x01);
+    store8(&resp + 27, 0x00); store8(&resp + 28, 0x01);
+    # Answer: NAME = 0xC0 0x0C (pointer to offset 12), A, IN, ttl=256, rdlen=4,
+    # RDATA = 93.184.216.34
+    store8(&resp + 29, 0xC0); store8(&resp + 30, 0x0C);
+    store8(&resp + 31, 0x00); store8(&resp + 32, 0x01);
+    store8(&resp + 33, 0x00); store8(&resp + 34, 0x01);
+    store8(&resp + 35, 0x00); store8(&resp + 36, 0x00);
+    store8(&resp + 37, 0x01); store8(&resp + 38, 0x00);
+    store8(&resp + 39, 0x00); store8(&resp + 40, 0x04);
+    store8(&resp + 41, 93); store8(&resp + 42, 184);
+    store8(&resp + 43, 216); store8(&resp + 44, 34);
+
+    var parsed = 0;
+    if (dns_parse_answer(&resp, 45, 0xABCD, &parsed) == 0) {
+        if (parsed == ip4(93, 184, 216, 34)) {
+            kprintln("dns: parse PASS", 15);
+        } else {
+            kprintln("dns: parse FAIL", 15);
+        }
+    } else {
+        kprintln("dns: parse FAIL", 15);
+    }
+
+    var live = 0;
+    if (dns_resolve("example.com", 11, &live) == 0) {
+        kprint("dns: live=", 10); dhcp_print_ip(live); kprintln("", 0);
+    } else {
+        kprintln("dns: live skip", 14);
+    }
+}
+#endif
+
 #ifdef TCP_LISTEN_SMOKE
 # TCP server-side smoke (1.32.0 bite A). Validates that:
 #   - tcp_listen(port) allocates a LISTEN slot

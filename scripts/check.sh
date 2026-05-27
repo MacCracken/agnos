@@ -48,13 +48,15 @@ check "version in kernel" $?
 grep -q "$VERSION" "$ROOT/CHANGELOG.md" 2>/dev/null
 check "version in changelog" $?
 
-# Binary size sanity. cc5 (cyrius 5.x) emits more code than cc3 did
-# under the previous toolchain (~250KB vs ~110KB at v1.22.0); upper
-# bound widened to 350KB to leave headroom without becoming a no-op.
+# Binary size sanity. The 350KB bound dated to the v1.22.0 / ~250KB era and
+# went stale across the storage (1.31.x), networking (1.32.x), ext2/4-write
+# (1.33.x), FAT-family (1.34.x), and DNS (1.35.x) arcs — the kernel is ~806KB.
+# Ceiling moved to 1.2M: generous headroom for the rest of the 1.x line while
+# still catching a runaway-bloat regression. Matches scripts/test.sh.
 echo ""
 echo "--- Binary ---"
 SZ=$(wc -c < "$ROOT/build/agnos")
-test "$SZ" -gt 50000 && test "$SZ" -lt 350000
+test "$SZ" -gt 50000 && test "$SZ" -lt 1200000
 check "binary size ($SZ bytes)" $?
 
 echo ""

@@ -111,6 +111,11 @@ else
     #                     Set this ONLY for the QEMU fat-write-smoke, whose
     #                     ESP image is a throwaway test volume. NEVER on an
     #                     iron build — the burn targets a data volume.
+    #   DNS_SELFTEST=1   — boot-time DNS stub self-test (1.35.x): prints the
+    #                     DHCP-captured resolver (option 6), runs a hermetic
+    #                     RFC 1035 parse test (compression-pointer answer ->
+    #                     93.184.216.34), and attempts a live lookup. Gated
+    #                     by scripts/dns-smoke.sh.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -127,6 +132,7 @@ else
         [ -n "$EXFAT_SELFTEST" ] && echo '#define EXFAT_SELFTEST'
         [ -n "$EXFAT_WRITE_SELFTEST" ] && echo '#define EXFAT_WRITE_SELFTEST'
         [ -n "$FAT_ALLOW_ESP_WRITE" ] && echo '#define FAT_ALLOW_ESP_WRITE'
+        [ -n "$DNS_SELFTEST" ]   && echo '#define DNS_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")
