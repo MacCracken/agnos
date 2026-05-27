@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.35.2] — 2026-05-27 (**NTP/SNTP client** — the kernel's first wall clock, set from a one-shot SNTP query. The last AGNOS-side networking-comms item after DNS / ICMP / TCP-hardening; the substrate TLS/HTTP need — reliable TCP + name resolution + a wall clock — is now complete. The 1.35.x line: 1.35.0 catchup (docs + DNS + ICMP) → 1.35.1 TCP hardening (B0–B4) → 1.35.2 NTP.)
+
 ### Added — NTP/SNTP client + the kernel's first wall clock (1.35.x comms)
 
 The kernel had **no time-of-day** — only `timer_ticks` (a 100 Hz counter); the RTC was never read. A unicast SNTP client (RFC 4330 simple mode) now sets a wall clock from one UDP/123 query. This is the third networking-comms item (after DNS + ICMP + TCP hardening) and the last AGNOS-side prerequisite before TLS (cert-validity checks need a real clock). Audit-doc-first: agnosticos [`ntp-sntp-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ntp-sntp-prior-art.md) (RFC 4330/5905 + musl/OpenBSD/chrony-simple + lwIP sntp).

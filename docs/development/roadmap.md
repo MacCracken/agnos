@@ -1,10 +1,10 @@
 # AGNOS Kernel Roadmap
 
-> **Current**: v1.35.1. Shipped and (mostly) iron-validated on archaemenid: MVP boot-to-shell (Attempt 68 / 1.30.9), the **storage stack** (NVMe / AHCI/SATA / USB-MS / RAM-disk / VirtIO 1.x + 5-backend block-layer dispatch + GPT), the **networking stack** (r8169 GbE NIC + ARP/IPv4/UDP + TCP incl. server primitives + DHCP — iron-COMPLETE at 1.32.9), and **read+write filesystems** (ext2/ext4 via the 1.33.x WRITE arc; FAT12/16/32 + exFAT via the 1.34.x FAT-family arc — `fsck`/`mtools`-validated, first FAT/exFAT iron burn user-driven/pending). Done-state detail lives in [`state.md`](state.md) + [`CHANGELOG.md`](../../CHANGELOG.md).
+> **Current**: v1.35.2. Shipped and (mostly) iron-validated on archaemenid: MVP boot-to-shell (Attempt 68 / 1.30.9), the **storage stack** (NVMe / AHCI/SATA / USB-MS / RAM-disk / VirtIO 1.x + 5-backend block-layer dispatch + GPT), the **networking stack** (r8169 GbE NIC + ARP/IPv4/UDP + TCP incl. server primitives + DHCP — iron-COMPLETE at 1.32.9), and **read+write filesystems** (ext2/ext4 via the 1.33.x WRITE arc; FAT12/16/32 + exFAT via the 1.34.x FAT-family arc — `fsck`/`mtools`-validated, first FAT/exFAT iron burn user-driven/pending). Done-state detail lives in [`state.md`](state.md) + [`CHANGELOG.md`](../../CHANGELOG.md).
 >
 > **This file is forward-facing only** — completed arcs are not re-listed here; their history is the CHANGELOG's job.
 >
-> **1.35.0 RELEASED** — the catchup-tidbits cut: full docs sweep + **DNS stub resolver** + **ICMP echo / ping** (both QEMU-validated). **1.35.1 OPEN — TCP hardening** (retransmit + RX window + MSS on the minimal SYN/ACK/FIN machine; the reliable-`ark`/`nous`-fetch enabler). Then **NTP/SNTP**; TLS stays with the cyrius agent. Legacy virtio-net back-burnered (known TX gap); plug-and-play / hot-add still a candidate.
+> **1.35.x networking-comms arc — COMPLETE** (all RELEASED): **1.35.0** docs sweep + DNS + ICMP · **1.35.1** TCP hardening (B0–B4: in-order ring + retransmit/RTO + MSS/segmentation + peer-window) · **1.35.2** NTP/SNTP (the kernel's first wall clock). The reliable-stream + name-resolution + wall-clock substrate is now in place. The next destinations — **TLS** (→ HTTP / `ark`-fetch) and **PIE** (→ full-binary KASLR) — are **cyrius-side** (PIE codegen + stdlib TLS, days-to-weeks; the user drives them with the cyrius agent). Legacy virtio-net back-burnered (known TX gap); plug-and-play / hot-add still a candidate.
 >
 > Live state: [`state.md`](state.md). Per-version history: [`../../CHANGELOG.md`](../../CHANGELOG.md). Language roadmap: `../cyrius/docs/development/roadmap.md`.
 
@@ -14,7 +14,7 @@ The 1.35.x cycle theme plus open items not yet bound to a specific minor.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| **1.35.1 — TCP hardening** | active | Retransmit + RX window + MSS on the minimal SYN/ACK/FIN machine — the reliable-`ark`/`nous`-fetch enabler. Audit-doc-first, then bites. (1.35.0 shipped the docs sweep + DNS stub + ICMP/ping; NTP queues after; legacy virtio-net back-burnered; plug-and-play still a candidate.) |
+| **1.35.x networking-comms arc** | ✅ COMPLETE (1.35.0–1.35.2) | DNS + ICMP + TCP-hardening (B0–B4) + NTP all RELEASED — the AGNOS-side comms runway is done. The next big destinations, **TLS** (→ HTTP / `ark`-fetch) and **full-binary KASLR**, are **cyrius-gated** (stdlib TLS / PIE codegen, days-to-weeks); until they land, near-term agnos work is the open items below. |
 | **AMD Zen Quiet-Boot scanout residue** | parked | Doesn't block MVP (VGA-path legible at 1080p + 1440p). Resumption options: HUBP `clear_tiling` port (Linux `drivers/gpu/drm/amd/display/` analog) OR a shadow-buffer FB-console architectural eval (simpledrm-style). Pin: `project_amd_zen_scanout_residue`. |
 | **Optical via USB-MS (SCSI MMC profile) / ATAPI** | folds into 1.35.x plug-and-play | HP external USB Blu-ray derps archaemenid at cold boot if plugged pre-power-on (USB hand-off / firmware quirk); hot-add support fixes the cold-plug quirk as a side effect. Alternative iron path: AllInOne internal CD/DVD (likely SATA ATAPI — would revive previously-punted ATAPI/AHCI passthrough). |
 | **`mmap` (anonymous-only)** | open | Adds VMM surface but no filesystem work; independent of the FS arcs and could ship in a near-term cycle. |
