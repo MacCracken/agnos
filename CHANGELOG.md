@@ -5,7 +5,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — directory growth: root extension + cross-boundary dir-set append, exFAT + FAT (the 1.34.4 cut — code-complete, awaiting cycle-open VERSION bump + tag) (`core/exfat.cyr`, `core/fatfs.cyr`, `core/main.cyr`, `scripts/{exfat,fat}-write-smoke.sh`)
+## [1.34.4] — 2026-05-26 (**directory growth — root extension + cross-boundary dir-set append (exFAT + FAT)** — third cut of the 1.34.x write-completeness continuation (roadmap row 21). Both filesystems gain a **spanning append**: a dir-set starts at the first `0x00` and streams across sector/cluster boundaries, extending the FAT-chained root by fresh zeroed clusters — clearing the single-cluster-root ceiling that blocked multi-file creates. QEMU/`fsck`-validated; no iron burn (final-bite only).)
+
+### Added — directory growth: root extension + cross-boundary dir-set append, exFAT + FAT (`core/exfat.cyr`, `core/fatfs.cyr`, `core/main.cyr`, `scripts/{exfat,fat}-write-smoke.sh`)
 
 Third cut of the 1.34.x write-completeness continuation. Both filesystems previously placed each dir-set within a single sector and refused once the root filled (the ceiling that forced 1.34.2's overwrite/truncate tests to run in place). Same fix on both: a **spanning append** — a set starts at the first `0x00` (end-of-directory) and streams contiguously across sector/cluster boundaries, extending the (FAT-chained) root by fresh zeroed clusters as needed. The previous one-sector-fit placement could strand a `0x00` before live entries → fsck "0x85/entry follows unused entry" (the exFAT smoke caught this). Build 783,240 → **788,696 B**.
 
