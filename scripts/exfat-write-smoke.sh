@@ -145,6 +145,15 @@ strings "$LOG" | grep -q "^exfatw: rootext 10 new files nfail=0" \
 strings "$LOG" | grep -q "^exfatw: rootext readback OK" \
     && echo "  PASS: 1.34.4 extended-root file readback byte-exact" \
     || { echo "  FAIL: 1.34.4 rootext readback"; rc=1; }
+# 1.34.5 — Unicode name: Café.txt (0xE9 'é'). fsck.exfat recomputes the
+# NameHash via the volume up-case table (é→É); ASCII-upcase → mismatch.
+# The fsck-clean gate above is the discriminator; these confirm create+find.
+strings "$LOG" | grep -q "^exfatw: unicode Cafe-acute rc=0" \
+    && echo "  PASS: 1.34.5 non-ASCII name create (real up-case NameHash)" \
+    || { echo "  FAIL: 1.34.5 non-ASCII create"; rc=1; }
+strings "$LOG" | grep -q "^exfatw: unicode find+read OK" \
+    && echo "  PASS: 1.34.5 non-ASCII name find + content readback" \
+    || { echo "  FAIL: 1.34.5 non-ASCII find/read"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

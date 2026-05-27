@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — exFAT Unicode names: real up-case table for NameHash + case-fold (the 1.34.5 cut, the last 1.34.x item — code-complete, awaiting cycle-open VERSION bump + tag) (`core/exfat.cyr`, `core/main.cyr`, `scripts/exfat-write-smoke.sh`)
+
+Final cut of the 1.34.x write-completeness continuation. exFAT name handling used ASCII upcase, so a non-ASCII name got the wrong NameHash (fsck-flagged) and case-folded wrong. Now the volume's **up-case table** drives both:
+
+- **`exfat_load_upcase`** loads the `0x82` system file (already located at mount) into an 8 KB buffer via its FAT chain (the standard mkfs table is 5836 B; a larger table falls back to ASCII upcase).
+- **`exfat_upcase`** maps a UTF-16 code unit through the RLE-compressed table (a `0xFFFF` marker + count means an identity run; any other entry is the explicit mapping). Verified against a real `mkfs.exfat` table (`a→A`, `é→É` U+00E9→U+00C9, `ÿ→Ÿ` U+00FF→U+0178 — the up-cased unit can exceed one byte, which is why the NameHash hashes both halves). Loaded at mount after the system-file locate.
+- `exfat_name_hash` (write) + `exfat_name_eq` (read/match) now use `exfat_upcase` instead of ASCII upcase.
+
+**Verification** — build 788,696 → **798,648 B**; `exfat-write-smoke.sh` creates `Café.txt` (byte `0xE9`) → `fsck.exfat -n` **clean** (fsck recomputes the NameHash with the volume up-case table and it matches — the discriminating oracle; ASCII upcase would leave `0xE9` → "name hash mismatch"/corrupted), plus find-by-non-ASCII-name + content readback. All prior exFAT/FAT/ext2 gates green, `test.sh` 4/4. The 1.34.x write-completeness continuation (1.34.2–1.34.5) is **feature-complete**; only the arc cap remains (ESP-write safety guard + the user-driven FAT/exFAT iron burn).
+
 ## [1.34.4] — 2026-05-26 (**directory growth — root extension + cross-boundary dir-set append (exFAT + FAT)** — third cut of the 1.34.x write-completeness continuation (roadmap row 21). Both filesystems gain a **spanning append**: a dir-set starts at the first `0x00` and streams across sector/cluster boundaries, extending the FAT-chained root by fresh zeroed clusters — clearing the single-cluster-root ceiling that blocked multi-file creates. QEMU/`fsck`-validated; no iron burn (final-bite only).)
 
 ### Added — directory growth: root extension + cross-boundary dir-set append, exFAT + FAT (`core/exfat.cyr`, `core/fatfs.cyr`, `core/main.cyr`, `scripts/{exfat,fat}-write-smoke.sh`)

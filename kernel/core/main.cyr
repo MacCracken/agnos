@@ -839,6 +839,33 @@ if (exfat_active == 1) {
     }
     if (rx_ok == 1) { kprintln("exfatw: rootext readback OK", 27); }
     else { kprintln("exfatw: rootext readback FAIL", 29); }
+    # 1.34.5 — Unicode (non-ASCII) name: "Caf<U+00E9>.txt" (byte 0xE9 = 'é').
+    # The NameHash must use the volume's up-case table (é→É U+00C9); ASCII
+    # upcase would leave 0xE9 → wrong hash → fsck.exfat "name hash mismatch".
+    # fsck-clean on this file is the discriminating oracle.
+    var unb[16];
+    store8(&unb + 0, 67); store8(&unb + 1, 97); store8(&unb + 2, 102);  # "Caf"
+    store8(&unb + 3, 233);                              # 0xE9 = 'é' (Latin-1)
+    store8(&unb + 4, 46); store8(&unb + 5, 116); store8(&unb + 6, 120); store8(&unb + 7, 116);  # ".txt"
+    var u_rc = exfat_write_file(&unb, 8, &exfat_file_buf, 200);
+    kprint("exfatw: unicode Cafe-acute rc=", 30);
+    kprint_num(u_rc);
+    kprintln("", 0);
+    var u_res[24];
+    var u_ok = 0;
+    if (exfat_find(&unb, 8, &u_res) == 1) {             # find by the non-ASCII name
+        var u_first = load64(&u_res);
+        var u_len = load64(&u_res + 8);
+        var u_nfc = load64(&u_res + 16);
+        var u_got = exfat_read(u_first, u_nfc, &exfat_file_buf, u_len);
+        u_ok = 1;
+        if (u_len != 200) { u_ok = 0; }
+        if (u_got != 200) { u_ok = 0; }
+        if (load8(&exfat_file_buf + 0) != 0) { u_ok = 0; }
+        if (load8(&exfat_file_buf + 199) != (199 & 0xFF)) { u_ok = 0; }
+    }
+    if (u_ok == 1) { kprintln("exfatw: unicode find+read OK", 28); }
+    else { kprintln("exfatw: unicode find+read FAIL", 30); }
 }
 #endif
 

@@ -224,6 +224,7 @@ fn exfat_init() {
 
     exfat_active = 1;
     exfat_locate_system_files();
+    exfat_load_upcase();                                 # 1.34.5 — for non-ASCII NameHash/compare
     kprint("exfat: mounted backend=", 23);
     kprint_num(exfat_backend);
     if (exfat_partition_first_lba > 0) {
@@ -319,21 +320,103 @@ fn exfat_verify_upcase() {
     return 0;
 }
 
-# ASCII upper-case (case-insensitive compare for ASCII names; the real
-# up-case table is needed only for non-ASCII, a follow-on per § 2).
+# ASCII upper-case — the fallback when the real up-case table isn't loaded
+# (or is larger than the buffer). Correct for ASCII; for non-ASCII units
+# exfat_upcase consults the volume's table.
 fn exfat_ascii_up(c) {
     if (c >= 97) { if (c <= 122) { return c - 32; } }
     return c;
 }
 
-# Compare the reconstructed name in exfat_name_buf (length got_chars) to
-# the target (name, namelen), ASCII case-insensitive. Returns 1/0.
+# === Up-case table (1.34.5 — Unicode names) ===
+# The volume's up-case table (the 0x82 system file), loaded at mount. exFAT
+# stores it RLE-compressed: a sequence of 16-bit entries where entry 0xFFFF
+# is a marker whose following 16-bit value N means "the next N code units map
+# to themselves (identity)"; any other entry E at code-unit index i means
+# upcase(i) = E. Capped at 8 KB (the standard mkfs table is 5836 B); a larger
+# table falls back to ASCII upcase. § 2.
+var exfat_upcase_buf[1024];                            # 8 KB
+var exfat_upcase_loaded = 0;
+
+# Load the up-case table into exfat_upcase_buf via its FAT chain. Called at
+# mount after exfat_locate_system_files. Best-effort: on any miss, leaves
+# exfat_upcase_loaded = 0 (→ ASCII fallback). Returns 0.
+fn exfat_load_upcase() {
+    exfat_upcase_loaded = 0;
+    if (exfat_upcase_cluster < 2) { return 0; }
+    if (exfat_upcase_length == 0) { return 0; }
+    if (exfat_upcase_length > 8192) { return 0; }      # too big → ASCII fallback
+    var remaining = exfat_upcase_length;
+    var clus = exfat_upcase_cluster;
+    var max_c = exfat_cluster_count + 2;
+    var off = 0;
+    var guard = 0;
+    while (remaining > 0) {
+        if (clus < 2) { return 0; }
+        if (clus >= max_c) { return 0; }
+        var base = exfat_cluster_sector(clus);
+        var s = 0;
+        while (s < exfat_sectors_per_cluster) {
+            if (remaining == 0) { s = exfat_sectors_per_cluster; }
+            else {
+                if (exfat_blk_read(base + s, &exfat_data_buf) != 0) { return 0; }
+                var chunk = 512;
+                if (remaining < chunk) { chunk = remaining; }
+                var i = 0;
+                while (i < chunk) { store8(&exfat_upcase_buf + off + i, load8(&exfat_data_buf + i)); i = i + 1; }
+                off = off + chunk;
+                remaining = remaining - chunk;
+                s = s + 1;
+            }
+        }
+        clus = exfat_next_cluster(clus);
+        guard = guard + 1;
+        if (guard > max_c) { return 0; }
+    }
+    exfat_upcase_loaded = 1;
+    return 0;
+}
+
+# Upper-case a UTF-16 code unit `v` via the loaded table (RLE walk), or ASCII
+# upcase if the table isn't loaded. Verified against a real mkfs.exfat table
+# (a→A, é→É U+00E9→U+00C9, ÿ→Ÿ U+00FF→U+0178). O(entries up to v) — fine for
+# the short names we hash/compare.
+fn exfat_upcase(v) {
+    if (exfat_upcase_loaded == 0) {
+        if (v >= 97) { if (v <= 122) { return v - 32; } }   # ASCII fallback
+        return v;
+    }
+    var i = 0;                                          # current code-unit index
+    var p = 0;                                          # byte offset into the table
+    var len = exfat_upcase_length;
+    while (p + 1 < len) {
+        var e = load8(&exfat_upcase_buf + p) | (load8(&exfat_upcase_buf + p + 1) << 8);
+        p = p + 2;
+        if (e == 0xFFFF) {
+            if (p + 1 >= len) { return v; }
+            var n = load8(&exfat_upcase_buf + p) | (load8(&exfat_upcase_buf + p + 1) << 8);
+            p = p + 2;
+            if (v >= i) { if (v < i + n) { return v; } }   # identity run covers v
+            i = i + n;
+        } else {
+            if (i == v) { return e; }
+            i = i + 1;
+        }
+        if (i > v) { return v; }                        # passed v with no explicit map
+    }
+    return v;
+}
+
+# Compare the reconstructed name in exfat_name_buf (length got_chars) to the
+# target (name, namelen), case-insensitive via the volume's up-case table
+# (1.34.5 — correct for non-ASCII; ASCII fallback if the table isn't loaded).
+# Names are Latin-1 byte arrays → UTF-16 unit = byte value. Returns 1/0.
 fn exfat_name_eq(name, namelen, got_chars) {
     if (got_chars != namelen) { return 0; }
     var i = 0;
     while (i < namelen) {
-        var a = exfat_ascii_up(load8(&exfat_name_buf + i));
-        var b = exfat_ascii_up(load8(name + i));
+        var a = exfat_upcase(load8(&exfat_name_buf + i));
+        var b = exfat_upcase(load8(name + i));
         if (a != b) { return 0; }
         i = i + 1;
     }
@@ -501,14 +584,16 @@ fn exfat_csum16(chk, b) {
     return (rot + b) & 0xFFFF;
 }
 
-# NameHash (16-bit) over the up-cased UTF-16 name, low byte then high byte
-# of each unit. ASCII upcase (matches the read-side assumption; non-ASCII
-# needs the real up-case table — a follow-on). § 3.
+# NameHash (16-bit) over the up-cased UTF-16 name, low byte then high byte of
+# each unit, via the volume's up-case table (1.34.5 — correct for non-ASCII;
+# ASCII fallback if the table isn't loaded). Names are Latin-1 byte arrays →
+# UTF-16 unit = byte value; the up-cased unit may exceed one byte (e.g. ÿ →
+# Ÿ U+0178), which is why both halves are hashed. § 3.
 fn exfat_name_hash(name, namelen) {
     var h = 0;
     var i = 0;
     while (i < namelen) {
-        var u = exfat_ascii_up(load8(name + i));
+        var u = exfat_upcase(load8(name + i));
         h = exfat_csum16(h, u & 0xFF);
         h = exfat_csum16(h, (u >> 8) & 0xFF);
         i = i + 1;
