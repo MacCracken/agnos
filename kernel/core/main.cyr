@@ -303,6 +303,16 @@ if (nic_ready() == 1) {
         net_init(0, 0, 0);
     }
 }
+# RTC boot clock (1.35.5) — seed the wall clock locally from the CMOS RTC so the
+# kernel knows the time with no network. Independent of the NIC; the timer has
+# been live since checkpoint 7. A later `ntp <server>` refines/overrides it.
+# See agnosticos/docs/development/rtc-boot-clock-prior-art.md.
+var rtc_t = net_clock_seed_rtc();
+if (rtc_t != 0) {
+    kprint("Wall clock: RTC seed Unix ", 26);
+    kprint_num(rtc_t);
+    kprintln("", 0);
+}
 if ((pci_find(0x1AF4, 0x1042) >= 0) | (pci_find(0x1AF4, 0x1001) >= 0)) {
     if (virtio_blk_init() == 0) {
         kprint("VirtIO-blk: ", 12);
@@ -1523,6 +1533,26 @@ if (vnet_active != 0 || nic_ready() != 0) {
     if (pmm_count_2mb_free() != c0) { m = 0; }
     if (m == 1) { kprintln("munmap: pmm-reuse PASS", 22); }
     if (m == 0) { kprintln("munmap: pmm-reuse FAIL", 22); }
+}
+#endif
+
+#ifdef RTC_SELFTEST
+# RTC boot-clock self-test (1.35.5). Hermetic civil_to_unix anchors (shared with
+# the NTP test) + BCD decode, plus a live-bounded rtc_read_unix() sanity check
+# (QEMU's emulated CMOS returns the host time, so assert a plausible epoch only).
+{
+    var ok = 1;
+    if (civil_to_unix(1970, 1, 1, 0, 0, 0) != 0)          { ok = 0; }   # epoch
+    if (civil_to_unix(2024, 1, 1, 0, 0, 0) != 1704067200) { ok = 0; }   # 2024-01-01 00:00:00
+    if (civil_to_unix(2024, 1, 1, 1, 1, 1) != 1704070861) { ok = 0; }   # +3661 s
+    if (civil_to_unix(2024, 3, 1, 0, 0, 0) != 1709251200) { ok = 0; }   # leap-year boundary
+    if (rtc_bcd(0x59) != 59) { ok = 0; }
+    if (rtc_bcd(0x00) != 0)  { ok = 0; }
+    if (rtc_bcd(0x99) != 99) { ok = 0; }
+    var live = rtc_read_unix();
+    if (live < 1577836800) { ok = 0; }                     # > 2020-01-01: read path works
+    if (ok == 1) { kprintln("rtc: clock PASS", 15); }
+    if (ok == 0) { kprintln("rtc: clock FAIL", 15); }
 }
 #endif
 

@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.35.5] — 2026-05-27 (**RTC boot clock** — the local companion to 1.35.2's NTP. The kernel now reads the CMOS RTC at boot and seeds a wall clock *without a network*, so `ntp_now()`/`date` work from the first second of uptime; NTP refines/overrides it when a server is reachable. Opened with a cyrius toolchain-pin move (6.0.1 → 6.0.3). Audit: agnosticos [`rtc-boot-clock-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/rtc-boot-clock-prior-art.md).)
+
+### Added — RTC boot clock (CMOS read + `civil_to_unix`)
+
+1.35.2 gave the kernel a wall clock, but only after a successful SNTP round-trip — with no network (or no reachable time server) `date` said "not synced." Every PC has a battery-backed RTC that already knows the date; reading it at boot is the obvious local fallback, and it gives the eventual TLS-cert-validity path a plausible clock before any network is up. The NTP audit had explicitly flagged *"the RTC was never read."*
+
+- **`net.cyr`** — `rtc_read_unix()` reads the MC146818 CMOS RTC (ports 0x70/0x71): bounded UIP-clear wait + read-twice-until-stable (OSDev/Linux/SeaBIOS convergent idiom), BCD + 12h-mode normalization per Status Register B, century register (when it decodes plausibly) else `2000 + yy`, sanity-reject `< 1970`. `civil_to_unix(y,mo,d,h,mi,s)` (Howard Hinnant's branch-free days-from-civil) converts to Unix seconds — the exact inverse of the `date` breakdown, and a reusable primitive for a future `time()` syscall / RTC-write path. `net_clock_seed_rtc()` sets the existing `net_unix_time`/`net_ntp_synctick` base (so `ntp_now()` is unchanged) and a new `net_clock_source` (1=RTC); `ntp_sync` sets source=2 (NTP overrides). x86-only — `net.cyr` is compiled inside `#ifdef ARCH_X86_64`, so no aarch64 stub.
+- **`main.cyr`** — seeds the wall clock from the RTC in the x86 boot sequence (after the timer is live), printing `Wall clock: RTC seed Unix <t>`.
+- **`shell.cyr`** — `date` now prints the source tag (`[RTC]` / `[NTP]`); the "not synced" message becomes "clock unset" (the RTC usually seeds it at boot).
+- **Validation** — new `scripts/rtc-smoke.sh` (`RTC_SELFTEST=1`): `rtc: clock PASS` — hermetic `civil_to_unix` anchors (2024-01-01 = 1704067200, +3661 s, 2024-03-01 leap boundary = 1709251200, epoch = 0) + BCD decode, plus a live-bounded `rtc_read_unix()` against QEMU's emulated CMOS (asserts a post-2020 epoch — the read decoded the host's ~May-2026 date correctly). `test.sh` 4/4, `check.sh` 11/11. Production build 822,864 → **825,632 B**.
+- **Deferred** (audit § 8): RTC *write* (`systohc`), IRQ8 periodic/alarm, and a userland `time()`/`gettimeofday` syscall (would build on `civil_to_unix`).
+
+### Changed — cyrius toolchain pin 6.0.1 → 6.0.3
+
+The kernel `cyrius.cyml` pin moved from 6.0.1 to 6.0.3 after a byte-for-byte A/B: the same `kernel/agnos.cyr` source compiled with each toolchain produced an **identical** `build/agnos` (same sha256, 822,864 B) — so 6.0.3 "creates the same work" literally, and "performs the same" by construction. CI had been green on the pinned 6.0.1; since the binary is identical, CI on 6.0.3 produces the exact artifact it was already validating. Confirmed via `CYRIUS_HOME=~/.cyrius/versions/<ver>` direct-wrapper builds (the `cyrius build` default uses the `current` toolchain and only *warns* on pin drift unless `CYRIUS_STRICT_PIN=1`). This also silences the editor/LSP drift warning the right way — by validating + adopting, not suppressing. (Note: the agnosticos `scripts/` boot-pipeline project stays on its own 5.11.59 pin — separate Cyrius project, out of scope.)
+
 ## [1.35.4] — 2026-05-27 (**`munmap`** — the natural pair to 1.35.3's `mmap`. Releases an anonymous region and returns its physical 2 MB pages to the PMM, so a process that churns mappings no longer leaks the arena until teardown. Closes the mmap/munmap pair. Audit: agnosticos [`mmap-prior-art.md` § 7](https://github.com/MacCracken/agnosticos/blob/main/docs/development/mmap-prior-art.md).)
 
 ### Added — `munmap` (syscall 28)

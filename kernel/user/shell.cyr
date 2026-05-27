@@ -889,7 +889,7 @@ fn sh_exec(buf, len) {
     }
     if (sh_streq(buf, clen, "date", 4) == 1) {
         var now = ntp_now();
-        if (now == 0) { kprintln("date: not synced -- run ntp <srv>", 33); return 0; }
+        if (now == 0) { kprintln("date: clock unset -- run ntp <srv>", 34); return 0; }
         kprint("unix=", 5); kprint_num(now);
         var tod = now % 86400;     # seconds into the UTC day
         var hh = tod / 3600;
@@ -901,7 +901,9 @@ fn sh_exec(buf, len) {
         if (mm < 10) { kprint("0", 1); }
         kprint_num(mm); kprint(":", 1);
         if (ss < 10) { kprint("0", 1); }
-        kprint_num(ss); kprintln("", 0);
+        kprint_num(ss);
+        if (net_clock_source == 1) { kprintln(" [RTC]", 6); }
+        else { if (net_clock_source == 2) { kprintln(" [NTP]", 6); } else { kprintln("", 0); } }
         return 0;
     }
     if (sh_streq(buf, clen, "blkread", 7) == 1) {

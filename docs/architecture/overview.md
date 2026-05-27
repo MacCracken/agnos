@@ -2,7 +2,7 @@
 
 > **Last Updated**: 2026-05-26 (v1.35.0 cycle)
 >
-> Multi-arch (x86_64 + aarch64), 28 syscalls, 40+ subsystems. Built with cyrius 6.0.1 (pinned in `cyrius.cyml`). Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+). **Iron-validated on archaemenid (NUC AMD Zen)**: boot-to-shell MVP cleared at Attempt 68 (1.30.9) with a typeable USB-HID keyboard; the storage stack (NVMe/AHCI/USB-MS), the r8169 NIC + DHCP networking stack, and ext2/4 write all iron-validated since. See [`../development/state.md`](../development/state.md) for the live subsystem rollup + open items.
+> Multi-arch (x86_64 + aarch64), 28 syscalls, 40+ subsystems. Built with cyrius 6.0.3 (pinned in `cyrius.cyml`). Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+). **Iron-validated on archaemenid (NUC AMD Zen)**: boot-to-shell MVP cleared at Attempt 68 (1.30.9) with a typeable USB-HID keyboard; the storage stack (NVMe/AHCI/USB-MS), the r8169 NIC + DHCP networking stack, and ext2/4 write all iron-validated since. See [`../development/state.md`](../development/state.md) for the live subsystem rollup + open items.
 >
 > For live binary sizes per arch, per-cut size trajectory, source line counts, sibling pins, and test surface, see [`../development/state.md`](../development/state.md).
 

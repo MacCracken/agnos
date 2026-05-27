@@ -129,6 +129,9 @@ else
     #   MMAP_SELFTEST=1  — boot-time anonymous-mmap allocator self-test
     #                     (1.35.3): hermetic 2 MB-contiguous alloc/free/count +
     #                     mmap length-rounding. Gated by scripts/mmap-smoke.sh.
+    #   RTC_SELFTEST=1   — boot-time RTC boot-clock self-test (1.35.5): hermetic
+    #                     civil_to_unix anchors + BCD decode + a live-bounded
+    #                     CMOS read sanity. Gated by scripts/rtc-smoke.sh.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -150,6 +153,7 @@ else
         [ -n "$TCP_SELFTEST" ]   && echo '#define TCP_SELFTEST'
         [ -n "$NTP_SELFTEST" ]   && echo '#define NTP_SELFTEST'
         [ -n "$MMAP_SELFTEST" ]  && echo '#define MMAP_SELFTEST'
+        [ -n "$RTC_SELFTEST" ]   && echo '#define RTC_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")
