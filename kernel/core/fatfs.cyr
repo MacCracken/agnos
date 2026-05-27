@@ -809,12 +809,11 @@ fn fatfs_truncate_zero(name, namelen) {
     return 0;
 }
 
-# Truncate an 8.3 file to `newlen` bytes (shrink only; newlen > size is
-# refused — grow-truncate is a follow-on). Keeps the first ceil(newlen/
-# cluster) clusters, caps that cluster EOC, frees the tail. Ordered: write
-# the smaller size + cap the new last cluster EOC, THEN free the tail — the
-# freed tail is unreferenced by the truncated chain, so a crash leaks it
-# (fsck-reclaimable), never a live dirent → free chain. FAT16/32 only.
+# Resize an 8.3 file to `newlen` bytes. SHRINK keeps the first ceil(newlen/
+# cluster) clusters, caps that cluster EOC, frees the tail (size + EOC first,
+# THEN free — a crash leaks the tail, never a live dirent → free chain).
+# GROW (1.34.3) extends with zero-filled clusters (see the grow block below).
+# FAT16/32 only.
 fn fatfs_truncate(name, namelen, newlen) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (fatfs_type == 12) { return 0 - 1; }
@@ -824,8 +823,79 @@ fn fatfs_truncate(name, namelen, newlen) {
     var oldsize = load64(&res + 8);
     var sec = fatfs_slot_sec;
     var slot = fatfs_slot_idx;
-    if (newlen > oldsize) { return 0 - 1; }            # grow not supported (follow-on)
     if (newlen == oldsize) { return 0; }               # no-op
+
+    # GROW (1.34.3 bite 3): extend to newlen, the grown region reading as
+    # zeros. Zero the old last cluster's slack beyond oldsize, allocate +
+    # zero-fill the new clusters, link them, then publish the new size last
+    # (a crash leaves a chain longer than the dirent size — fsck-fixable —
+    # never a live dirent → unwritten/garbage cluster). ENOSPC rolls back.
+    if (newlen > oldsize) {
+        var bpc0 = fatfs_sectors_per_cluster * 512;
+        var cur_clus = (oldsize + bpc0 - 1) / bpc0;    # 0 if empty
+        var new_clus = (newlen + bpc0 - 1) / bpc0;
+        var last = 0;
+        if (first >= 2) {
+            last = first;
+            var gi = 1;
+            while (gi < cur_clus) {
+                var gn = fat_next_cluster(last);
+                if (gn == 0) { return 0 - 1; }          # chain shorter than size — corrupt
+                last = gn;
+                gi = gi + 1;
+            }
+            var off_in = oldsize % bpc0;                # bytes used in the last cluster (0 = full)
+            if (off_in != 0) {
+                var gbase = fatfs_first_sector_of_cluster(last);
+                var gs = off_in / 512;
+                var gsoff = off_in % 512;
+                while (gs < fatfs_sectors_per_cluster) {
+                    if (fat_blk_read(gbase + gs, &fatfs_data_buf) != 0) { return 0 - 1; }
+                    var gk = gsoff;
+                    while (gk < 512) { store8(&fatfs_data_buf + gk, 0); gk = gk + 1; }
+                    if (fat_blk_write(gbase + gs, &fatfs_data_buf) != 0) { return 0 - 1; }
+                    gsoff = 0;
+                    gs = gs + 1;
+                }
+            }
+        }
+        var need_new = new_clus - cur_clus;
+        var prev = last;
+        var newfirst = 0;
+        var gj = 0;
+        while (gj < need_new) {
+            var gc = fat_alloc_cluster();
+            if (gc == 0) {                              # ENOSPC: roll back the partial growth
+                if (newfirst >= 2) { fat_free_chain(newfirst); }
+                if (last >= 2) { fat_set_entry(last, fat_eoc()); }
+                return 0 - 1;
+            }
+            if (newfirst == 0) { newfirst = gc; }
+            if (prev >= 2) { if (fat_set_entry(prev, gc) != 0) { return 0 - 1; } }   # link prev → gc
+            prev = gc;
+            var nbase = fatfs_first_sector_of_cluster(gc);
+            var ns = 0;
+            while (ns < fatfs_sectors_per_cluster) {
+                var nz = 0;
+                while (nz < 512) { store8(&fatfs_data_buf + nz, 0); nz = nz + 1; }
+                if (fat_blk_write(nbase + ns, &fatfs_data_buf) != 0) { return 0 - 1; }
+                ns = ns + 1;
+            }
+            gj = gj + 1;
+        }
+        # publish: size = newlen (+ first cluster if the file was empty).
+        if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        var gep = &fatfs_dir_buf + slot * 32;
+        if (first < 2) {
+            store8(gep + 20, (newfirst >> 16) & 0xFF); store8(gep + 21, (newfirst >> 24) & 0xFF);
+            store8(gep + 26, newfirst & 0xFF); store8(gep + 27, (newfirst >> 8) & 0xFF);
+        }
+        store8(gep + 28, newlen & 0xFF); store8(gep + 29, (newlen >> 8) & 0xFF);
+        store8(gep + 30, (newlen >> 16) & 0xFF); store8(gep + 31, (newlen >> 24) & 0xFF);
+        if (fat_blk_write(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        fat_fsinfo_mark_unknown();
+        return 0;
+    }
 
     if (newlen == 0) { return fatfs_truncate_zero(name, namelen); }
 

@@ -5,14 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — FAT LFN write completeness, bites 1-2 (the 1.34.3 cut, in progress) (`core/fatfs.cyr`, `core/main.cyr`, `scripts/fat-write-smoke.sh`)
+### Added — FAT LFN/truncate completeness (the 1.34.3 cut — code-complete, awaiting cycle-open VERSION bump + tag) (`core/fatfs.cyr`, `core/main.cyr`, `scripts/fat-write-smoke.sh`)
 
-Second cut of the 1.34.x write-completeness continuation. QEMU-validated via `fat-write-smoke.sh` (`fsck.fat -n` clean throughout, no regression to the existing FAT write gates).
+Second cut of the 1.34.x write-completeness continuation. All three items QEMU-validated via `fat-write-smoke.sh` (`fsck.fat -n` clean throughout, no regression to the existing FAT write gates); build 772,568 → **783,240 B**.
 
 - **bite 1 — LFN-with-content**: new **`fatfs_write_file_lfn`** creates a long-named file carrying content — 8.3-fitting names fall through to `fatfs_write_file`; otherwise it allocates + writes the cluster chain first (data-before-dirent crash ordering), then writes the LFN set with the **8.3-alias entry pointing at the first cluster + carrying FileSize** (the released `fatfs_create_lfn` left the alias at cluster 0 / size 0). `LongContent12345.bin` (3000 B) reads back byte-exact through its long name.
 - **bite 2 — LFN-name overwrite-match**: new **`fatfs_find_lfn`** does the first LFN *read* — it reassembles long names from their reverse-ordered `0x0F` entry runs (13 UTF-16 chars each, terminator-aware) and matches the query against the LONG name OR the 8.3 short name, recording the 8.3 entry's location. `fatfs_write_file_lfn` now uses it to **overwrite an existing long-named file in place** (repoint cluster + size, free the old chain; the 8.3 alias + LFN entries are preserved so the LFN checksum stays valid) instead of creating a duplicate under a fresh `~N` alias. `LfnOver12345.bin` written 3000 B then overwritten 2000 B by its long name → a *single* dir entry, content byte-exact.
+- **bite 3 — grow-truncate**: `fatfs_truncate` was shrink-only; it now also **grows** a file to `newlen` with the grown region reading as zeros — it zero-fills the old last cluster's slack, allocates + zero-fills the new clusters, links them onto the chain, then publishes the new size last (a crash leaves a chain longer than the dirent size, fsck-fixable, never a live dirent → garbage cluster; ENOSPC rolls back). Handles growth from empty (sets the first cluster) + growth within the existing last cluster. `GROW.BIN` written 1000 B then grown to 3000 B → `[0,1000)` data + `[1000,3000)` zeros.
 
-Remaining 1.34.3 item: grow-truncate (FAT `fatfs_truncate` is shrink-only).
+**The 1.34.3 cut is feature-complete** — delete-by-long-name (clear the LFN run; `fatfs_find_lfn` already locates the set) is a noted follow-on.
 
 ## [1.34.2] — 2026-05-26 (**exFAT write parity** — first cut of the 1.34.x write-completeness continuation (agnos roadmap row 21), bringing exFAT up to FAT's bite-3e level: overwrite-existing, arbitrary-length truncate, PercentInUse maintenance, ENOSPC rollback. The non-verb carry-forwards from the 1.34.0 (FAT) + 1.34.1 (exFAT) minor are landing as 4 themed in-arc cuts (1.34.2–1.34.5); shell verbs stay deferred to the 1.39.x VFS generic-write lift. QEMU/`fsck.exfat`-validated; no iron burn (final-bite only).)
 

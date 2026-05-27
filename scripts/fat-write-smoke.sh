@@ -237,6 +237,22 @@ else
     echo "  FAIL: LfnOver12345.bin mismatch ($(wc -c < "$WORK/lfno.bin" 2>/dev/null) B; want 2000)"; rc=1
 fi
 
+# 13. grow-truncate (1.34.3 bite 3): GROW.BIN written 1000 B then grown to
+#     3000 B — the grown region [1000,3000) must read as zeros (data + hole).
+if strings "$LOG" | grep -q "fatw: grow GROW.BIN w=0 t=0"; then
+    echo "  PASS: fatfs_truncate grow w=0 t=0"
+else
+    echo "  FAIL: grow (no 'fatw: grow GROW.BIN w=0 t=0' in log)"; rc=1
+fi
+head -c 1000 "$WORK/pattern.bin" > "$WORK/grow_exp.bin"
+dd if=/dev/zero bs=1 count=2000 status=none >> "$WORK/grow_exp.bin"
+mtype -i "$WORK/esp.img" ::GROW.BIN > "$WORK/grow.bin" 2>/dev/null
+if cmp -s "$WORK/grow.bin" "$WORK/grow_exp.bin"; then
+    echo "  PASS: GROW.BIN = 3000 B, [0,1000)=data + [1000,3000)=zeros (grow zero-filled)"
+else
+    echo "  FAIL: GROW.BIN grow mismatch ($(wc -c < "$WORK/grow.bin" 2>/dev/null) B; want 3000 w/ zero tail)"; rc=1
+fi
+
 echo ""
 echo "=========================================="
 if [ "$rc" = "0" ]; then echo "FAT write smoke (3a-3e + 1.34.3 LFN-content): PASS"; else echo "FAT write smoke: FAIL"; fi

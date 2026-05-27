@@ -573,6 +573,16 @@ if (fatfs_active == 1) {
     kprint(" rc2=", 5);
     kprint_num(lo_r2);
     kprintln("", 0);
+    # 1.34.3 bite 3 — grow-truncate: write 1000 B, grow to 3000 B. The grown
+    # region [1000,3000) must read as zeros; fat-write-smoke.sh verifies.
+    var gr_name = "GROW.BIN";
+    var gr_w = fatfs_write_file(gr_name, 8, &fatfs_file_buf, 1000);
+    var gr_t = fatfs_truncate(gr_name, 8, 3000);
+    kprint("fatw: grow GROW.BIN w=", 22);
+    kprint_num(gr_w);
+    kprint(" t=", 3);
+    kprint_num(gr_t);
+    kprintln("", 0);
 }
 #endif
 
