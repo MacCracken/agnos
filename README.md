@@ -2,6 +2,8 @@
 
 > Sovereign operating system kernel. Written in Cyrius. Assembly up. Zero C, zero Rust, zero LLVM.
 
+**Status**: boots to a typeable interactive shell on real AMD hardware (the MVP gate, since v1.30.9). Storage (NVMe / SATA / USB-MS), networking (TCP/IP + DHCP over a real-iron NIC), and read+write filesystems (ext2/ext4, FAT12/16/32, exFAT) are all landed — the storage trio, networking, and ext4 are iron-validated; the FAT-family is QEMU/`fsck`-validated. Current version in [`VERSION`](VERSION); live capability snapshot in [`docs/development/state.md`](docs/development/state.md).
+
 ## Quick Start
 
 ```sh
@@ -28,7 +30,7 @@ sh scripts/test.sh --all
 
 ## Architecture
 
-Multi-arch kernel: `kernel/klib/` (3 files — `kstring`, `kfmt`, `ktagged`; freestanding syscall-free stdlib), `kernel/arch/x86_64/` (17 files + `usb/` subdir with 8 xHCI/HID files), `kernel/arch/aarch64/` (9 files), `kernel/core/` (18 files), `kernel/user/` (4 files), plus `kernel/agnos.cyr` orchestrator, `kernel/version.cyr` auto-generated banner module (v1.30.2+), and `kernel/kernel_hello.cyr` smoke test.
+Multi-arch kernel: `kernel/klib/` (3 files — `kstring`, `kfmt`, `ktagged`; freestanding syscall-free stdlib), `kernel/arch/x86_64/` (17 files + `usb/` subdir with 9 xHCI/HID files), `kernel/arch/aarch64/` (9 files), `kernel/core/` (26 files — the storage, networking, and filesystem stacks live here), `kernel/user/` (4 files), plus `kernel/agnos.cyr` orchestrator, `kernel/version.cyr` auto-generated banner module (v1.30.2+), and `kernel/kernel_hello.cyr` smoke test.
 
 The build script wraps `cyrius build` with a `#define ARCH_X86_64` /
 `#define ARCH_AARCH64` prepend, since `cyrius build -D NAME` doesn't
@@ -54,14 +56,17 @@ Common:
   -> PMM (bitmap), VMM, kernel heap (slab)
   -> process table, context switch, scheduler, SYSCALL/SYSRET
   -> ELF loader, VFS, initrd, device drivers
-  -> PCI bus, VirtIO-Net, IP/UDP stack
+  -> PCI bus; networking: VirtIO-Net + r8169 NIC, IP / ARP / UDP / TCP, DHCP client
+  -> storage: NVMe, AHCI/SATA, USB Mass Storage, RAM-disk, VirtIO-blk —
+       5-backend block layer (multi-backend probe) + GPT partition parse
+  -> filesystems: ext2/ext4 (read + write) and FAT12/16/32 + exFAT (read + write)
   -> Native xHCI + USB-HID-boot keyboard driver (Phase 1-5)
   -> SMP infrastructure (APIC, IPI, trampoline, per-CPU stacks)
   -> 26 syscalls (signals, epoll, timerfd, pipes)
   -> kybernet (PID 1) -> interactive shell
 ```
 
-## Subsystems (36+)
+## Subsystems (40+)
 
 | Subsystem | Description |
 |-----------|-------------|
@@ -75,7 +80,7 @@ Common:
 | GIC | ARM GICv2 interrupt controller (aarch64) |
 | Timer | APIC periodic ~100Hz (x86_64), ARM generic timer (aarch64) |
 | Keyboard | PS/2 full US QWERTY + USB-HID-boot via xHCI (x86_64); UART RX (aarch64) |
-| xHCI Host Controller | Native USB 3.x host controller driver: PCIe discovery, BAR UC remap, controller init (HCRST + R/S + scratchpad + DCBAA + event ring + cmd ring), port enumeration with PORTSC strict-RW1S, Enable Slot + Address Device cmd path, MSI-X table programming (v1.30.0+ — Phase 1-5 code-complete; iron-side resolution in flight for AMD FCH 1022:1639 Enable Slot CCE gate) |
+| xHCI Host Controller | Native USB 3.x host controller driver: PCIe discovery, BAR UC remap, controller init (HCRST + R/S + scratchpad + DCBAA + event ring + cmd ring), port enumeration with PORTSC strict-RW1S, Enable Slot + Address Device cmd path, MSI-X table programming. Iron-validated on archaemenid (AMD FCH 1022:1639) — the typeable-shell MVP gate at Attempt 68 / v1.30.9. |
 | USB-HID-boot Keyboard | hid_kbd_configure + hid_poll + HID→PS/2 usage translation + kb_buf writer (v1.30.5; lives in kernel/arch/x86_64/usb/) |
 | Page Tables | 2MB huge pages, 4GB identity map ceiling, per-process; XHCI BAR strict-UC remap (Repair X) |
 | PMM | Bitmap allocator, 4096 pages, next-free hint |
@@ -89,18 +94,27 @@ Common:
 | Device Drivers | Serial char device |
 | Initrd | Flat format, name lookup |
 | PCI Bus | Config space scan, device discovery |
-| VirtIO-Net | Legacy PCI, virtqueues, Ethernet frames |
-| IP/UDP Stack | ARP, IPv4, UDP send/recv |
-| TCP Stack | Connect, send, recv, close, SYN/ACK/FIN state machine |
-| VirtIO-Blk | Legacy PCI, sector read/write, DMA buffers |
-| FAT16 | Read-only, root directory listing, file open/read |
+| NIC drivers | **r8169** (RTL8168/8125, real-iron — PCI probe + RX/TX rings; iron-CONNECTED on archaemenid at 1.32.7) + **VirtIO-Net** (legacy PCI, QEMU) |
+| IP / ARP / UDP | IPv4, ARP request/reply, UDP send/recv + 8-listener bind table |
+| TCP | Client (connect/send/recv/close) + server primitives (listen/bind/accept); SYN/ACK/FIN state machine |
+| DHCP client | RFC 2131 DISCOVER → OFFER → REQUEST → ACK; real lease iron-verified on archaemenid (1.32.9) |
+| Block layer | 5-backend tag dispatch (NVMe / AHCI / USB-MS / VirtIO-blk / RAM-disk) + multi-backend probe + per-backend FLUSH durability barrier |
+| NVMe | Phase 1-5: admin + I/O queues, READ/WRITE, PRP1/PRP2/PRP-list; iron debut Crucial P3 2 TB |
+| AHCI / SATA | HBA + per-port bring-up, IDENTIFY, READ/WRITE DMA EXT; iron debut WD Blue SA510 2 TB |
+| USB Mass Storage | BBB transport + SCSI (INQUIRY / TUR / READ CAPACITY / READ / WRITE) over xHCI bulk; iron debut Silicon Motion stick |
+| RAM-disk / VirtIO-blk | `pmm_alloc`-backed RAM-disk + VirtIO 1.x modern virtio-blk (QEMU) |
+| GPT | Header + 16 KB array walk, table-less CRC32, backup-header recovery, type-GUID classifier, `parts` shell cmd |
+| ext2 / ext4 | **Read + write**: superblock / BGDT / inode, indirect tree + ext4 extents, 64BIT, dir walk + path resolution; create / write / unlink / mkdir / rmdir / rename / ln / symlink / truncate, metadata_csum, `e2fsck -fn`-clean. Iron-validated on real NVMe NAND (persist-across-reboot). |
+| FAT12/16/32 | **Read + write**: partition-aware multi-backend mount, FAT-chain traversal, create / content / delete / truncate, LFN; `fsck.fat -n`-clean |
+| exFAT | **Read + write**: allocation bitmap + typed dir-set (SetChecksum / NameHash) + up-case table (Unicode names) + directory growth; `fsck.exfat -n`-clean |
+| FS write safety | ESP-write guard — FAT/exFAT writes refused on the boot ESP partition (firmware territory); data writes go to MSFT-Basic partitions / USB sticks |
 | Pipes | Circular buffer IPC, read/write ends |
 | SMP Infrastructure | APIC, IPI, trampoline, per-CPU stacks |
 | Signals | per-process signals/sigmask, kill, sigprocmask, signalfd |
 | Epoll | epoll_create, epoll_ctl, epoll_wait |
 | Timerfd | timerfd_create, timerfd_settime |
 | Scheduler | Round-robin |
-| Shell | 19 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench test halt |
+| Shell | 28 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench test halt + `cd` `pwd` `parts` (storage/FS nav) + `mkdir` `rm` `rmdir` `touch` `ln` `sync` (ext2/ext4 mutation verbs) |
 | kybernet Init | PID 1, 26 kernel syscalls ready |
 
 ## Syscalls (26)
@@ -160,16 +174,16 @@ for the methodology caveat (closed at v1.28.1 — kept as audit trail).
 
 | Kernel | Language | Scope |
 |--------|----------|-------|
-| **AGNOS** | Cyrius | 35+ subsystems, 26 syscalls, TCP/IP, FAT16, VirtIO, SMP, ELF loader, ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, shell |
+| **AGNOS** | Cyrius | 40+ subsystems, 26 syscalls, TCP/IP + DHCP, real-iron NIC (r8169), full storage stack (NVMe / AHCI / USB-MS / VirtIO-blk + 5-backend block layer + GPT), read+write filesystems (ext2/ext4, FAT12/16/32, exFAT), SMP, ELF loader, ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, shell |
 | xv6 (MIT) | C | 21 syscalls, no networking, no SMP, no real FS |
 | seL4 (verified) | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
 | MINIX 3 | C | Microkernel + basic drivers |
 | Linux (minimal) | C | Barely boots, no drivers |
 | Linux (typical) | C | Desktop-ready |
 
-A fully functional kernel with TCP/IP, block I/O, filesystem, SMP, signals, epoll, pipes, ACPI/IOMMU, native xHCI / USB-HID-boot keyboard, and an interactive shell — written entirely in Cyrius. No C, no LLVM, no libc.
+A fully functional kernel with TCP/IP + DHCP, a real-iron NIC, a 5-backend block layer (NVMe / AHCI / USB-MS / VirtIO-blk / RAM-disk) + GPT, **read+write** filesystems (ext2/ext4, FAT12/16/32, exFAT), SMP, signals, epoll, pipes, ACPI/IOMMU, native xHCI / USB-HID-boot keyboard, and an interactive shell — written entirely in Cyrius. No C, no LLVM, no libc. The storage trio (NVMe / SATA / USB-MS) and the networking + ext4 stacks are iron-validated on real AMD hardware (archaemenid).
 
-For live binary sizes per arch (x86_64 + aarch64), per-cut size trajectory across v1.27.x → v1.30.x, source line counts, test surface, and ecosystem sibling pins, see [`docs/development/state.md`](docs/development/state.md) (refreshed every release). Versions intentionally elided from this table per the lib-doc precedent — the size cells drift faster than the README can be re-cut.
+For live binary sizes per arch (x86_64 + aarch64), per-cut size trajectory, source line counts, test surface, and ecosystem sibling pins, see [`docs/development/state.md`](docs/development/state.md) (refreshed every release). Versions intentionally elided from this table per the lib-doc precedent — the size cells drift faster than the README can be re-cut.
 
 ## Requirements
 
@@ -193,10 +207,11 @@ agnos/
 │   ├── arch/x86_64/
 │   │   ├── *.cyr            # boot_shim, mbi (Path-C handoff), gdt, idt, pic, apic, smp,
 │   │   │                    # paging, ring3, fb / fb_console, iommu, syscall_hw, …
-│   │   └── usb/             # xhci{,_cmd,_ctx,_port,_regs,_ring}, hid, hid_translate
+│   │   └── usb/             # xhci{,_cmd,_ctx,_port,_regs,_ring}, hid, hid_translate, msc (USB Mass Storage)
 │   ├── arch/aarch64/        # boot_data, gic, timer, exceptions, paging, main, stubs, …
-│   ├── core/                # pmm, vmm, heap, proc, sched, vfs, net, virtio_{net,blk},
-│   │                        # fatfs, pci, acpi, elf, syscall, devs, initrd, kprint, main
+│   ├── core/                # pmm, vmm, heap, proc, sched, vfs, syscall, elf, devs, initrd, kprint, main,
+│   │                        # net, virtio_net, r8169 (networking); block, nvme, ahci, virtio_blk,
+│   │                        # ramdisk, gpt (storage); ext2, fatfs, exfat (filesystems); pci, acpi
 │   └── user/                # shell, init, test, test_procs
 ├── scripts/
 │   ├── build.sh             # Multi-arch wrapper around `cyrius build` (emits ELF64 multiboot2)
@@ -208,7 +223,7 @@ agnos/
 │   ├── architecture/        # System overview + non-obvious invariants
 │   ├── audit/               # Security audit reports (YYYY-MM-DD-*)
 │   ├── development/
-│   │   ├── roadmap.md       # Shipped arcs + open items + 1.31.0 KASLR slot
+│   │   ├── roadmap.md       # Shipped arcs (the at-a-glance ledger) + open items + future slots
 │   │   ├── state.md         # Live state snapshot, bumped every release
 │   │   ├── issue/           # Open bug investigations (archive/ for resolved)
 │   │   └── proposals/       # Pre-decision design drafts

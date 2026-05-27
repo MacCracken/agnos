@@ -1,8 +1,8 @@
 # AGNOS Kernel Architecture
 
-> **Last Updated**: 2026-05-18 (v1.30.7 cycle)
+> **Last Updated**: 2026-05-26 (v1.35.0 cycle)
 >
-> Multi-arch (x86_64 + aarch64), 26 syscalls, 35+ subsystems. Built with cyrius 5.11.59 (pinned in `cyrius.cyml`). Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+). Iron-validated NUC AMD Zen 2026-05-15 (boot-to-shell MVP cleared kernel-init layer; xHCI Enable Slot CCE cmd-path gate remains open as of v1.30.7 — see [`../development/state.md`](../development/state.md) § Open investigation).
+> Multi-arch (x86_64 + aarch64), 26 syscalls, 40+ subsystems. Built with cyrius 6.0.1 (pinned in `cyrius.cyml`). Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+). **Iron-validated on archaemenid (NUC AMD Zen)**: boot-to-shell MVP cleared at Attempt 68 (1.30.9) with a typeable USB-HID keyboard; the storage stack (NVMe/AHCI/USB-MS), the r8169 NIC + DHCP networking stack, and ext2/4 write all iron-validated since. See [`../development/state.md`](../development/state.md) for the live subsystem rollup + open items.
 >
 > For live binary sizes per arch, per-cut size trajectory, source line counts, sibling pins, and test surface, see [`../development/state.md`](../development/state.md).
 
@@ -21,7 +21,9 @@ UEFI firmware
         -> Page tables, PMM, VMM, kernel heap
         -> Process table, scheduler, SYSCALL/SYSRET
         -> ELF loader, VFS, initrd, device drivers
-        -> PCI scan, VirtIO-Net, VirtIO-Blk, IP/UDP/TCP stack
+        -> PCI scan; storage (NVMe / AHCI / USB-MS / VirtIO-Blk / RAM-disk + 5-backend block layer + GPT)
+        -> networking (VirtIO-Net / r8169 GbE + ARP/IPv4/UDP/TCP + DHCP)
+        -> filesystems read+write (ext2/ext4, FAT12/16/32, exFAT)
         -> Native xHCI + USB-HID-boot keyboard (Phase 1-5)
         -> SMP init (APIC, IPI, trampoline, per-CPU stacks)
         -> 26 syscalls (signals, epoll, timerfd, pipes)
@@ -62,9 +64,10 @@ Live binary size + per-cut trajectory lives in [`../development/state.md`](../de
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                   Interactive Shell (19 commands)        │
+│                   Interactive Shell (28 commands)        │
 │  help echo ps free cat uptime lspci cpus net send recv  │
-│  tcp pipe blkread ls disk bench test halt               │
+│  tcp pipe blkread ls cd pwd disk parts mount bench test  │
+│  + ext2/FAT mount/ls/cat/write/rm/mkdir verbs   halt    │
 ├─────────────────────────────────────────────────────────┤
 │              kybernet (PID 1 Init)                       │
 ├─────────────────────────────────────────────────────────┤
@@ -82,10 +85,12 @@ Live binary size + per-cut trajectory lives in [`../development/state.md`](../de
 │  per-process AS  │  Initrd, Device drivers (serial)     │
 ├──────────────────┼──────────────────────────────────────┤
 │  Scheduler       │  PCI Bus (config scan)               │
-│  round-robin     │  VirtIO-Net (virtqueues, Ethernet)   │
-│  Context Switch  │  VirtIO-Blk (sector R/W, DMA)        │
-│                  │  IP/UDP/TCP Stack (ARP, IPv4)         │
-│                  │  FAT16 (read-only filesystem)         │
+│  round-robin     │  Net: VirtIO-Net + r8169 GbE         │
+│  Context Switch  │  IP/UDP/TCP + ARP + DHCP client      │
+│                  │  Block layer (5 backends): NVMe /    │
+│                  │   AHCI / USB-MS / VirtIO-Blk / RAM   │
+│                  │  GPT partitions                      │
+│                  │  FS read+write: ext2/4, FAT, exFAT   │
 ├──────────────────┼──────────────────────────────────────┤
 │  Process Table   │  VMM (2MB pages, user-accessible)    │
 │  16 slots, 168B  │  Kernel Heap (slab, 8 classes)       │
@@ -120,8 +125,8 @@ Per-process address spaces are created by `proc_create_address_space` (`kernel/c
 
 ## Networking
 
-PCI bus enumeration discovers VirtIO-Net device. Legacy PCI transport with virtqueues for packet send/receive. Ethernet frames with ARP for address resolution, IPv4 for routing, UDP and TCP for transport. TCP supports connect, send, recv, close with SYN/ACK/FIN state machine.
+PCI bus enumeration discovers the NIC: **VirtIO-Net** (QEMU, legacy PCI + virtqueues) or the **r8169** Realtek RTL8111/8168/8169 GbE driver (real iron, RX/TX descriptor rings, iron-validated on archaemenid). On top: Ethernet frames with ARP for address resolution, IPv4 for routing, UDP and TCP for transport. TCP supports connect, send, recv, close with a SYN/ACK/FIN state machine plus listen/accept server primitives. A **DHCP client** acquires a lease (DISCOVER → OFFER → REQUEST → ACK), iron-verified at 1.32.9.
 
-## Block I/O
+## Block I/O & filesystems
 
-VirtIO-Blk driver for sector-level read/write with DMA-safe buffers. FAT16 filesystem reader mounted on boot (read-only, root directory listing, file open/read).
+A tag-based **block layer** (`kernel/core/block.cyr`) dispatches to five backends — `BLK_NVME`, `BLK_AHCI` (SATA), `BLK_USB` (USB Mass Storage, BBB+SCSI), `BLK_VIRTIO`, `BLK_RAM` — with NVMe taking primary when present. **GPT** parses the partition table (CRC32 validation + backup-header recovery + type-GUID classification). Filesystems are mounted partition-aware and support **read and write**: ext2/ext4 (1.33.x WRITE arc — create/write/truncate, persist-across-reboot), FAT12/16/32 and exFAT (1.34.x FAT-family arc — LFN, cluster allocator, directory growth, overwrite/truncate/delete). An ESP-write safety guard refuses FAT/exFAT mutation on an ESP-type partition so the boot ESP can't be clobbered.

@@ -1,10 +1,10 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> **Last Updated**: 2026-05-18 (v1.30.7 cycle — header refresh; surface unchanged since v1.21.0)
+> **Last Updated**: 2026-05-26 (v1.35.0 docs sweep — surface confirmed unchanged since v1.21.0)
 >
 > All 26 syscalls implemented as of v1.21.0. kybernet (currently v1.2.1) can run on AGNOS as PID 1.
 >
-> **Status**: This doc is the implementation reference for the v1.21.0 syscall buildout — historical record of how each syscall got wired in `kernel/core/syscall.cyr`. Current syscall surface lives in [`state.md` § Syscall surface](state.md). **No new syscalls have shipped since v1.21.0** through the entire v1.27.x → v1.30.x bring-up / hardening / iron-validation arc — the work has been correctness, security hardening (S1-S13 13/13 closed at v1.28.0), the sovereign-struct kernel ABI break (v1.30.0 Path-C), and the native xHCI + USB-HID-boot driver (Phase 1-5 across v1.30.1-v1.30.5). API expansion stays deliberate.
+> **Status**: This doc is the implementation reference for the v1.21.0 syscall buildout — historical record of how each syscall got wired in `kernel/core/syscall.cyr`. Current syscall surface lives in [`state.md` § Syscall surface](state.md). **No new syscalls have shipped since v1.21.0** through the entire v1.27.x → v1.34.x arc — security hardening (S1-S13 13/13 at v1.28.0), the Path-C sovereign-struct kernel ABI break (v1.30.0), native xHCI + USB-HID-boot (v1.30.x), the storage stack (v1.31.x), networking (v1.32.x), and the ext2/4 + FAT-family **write** arcs (v1.33.x / v1.34.x) all reuse the existing 26-call surface (FS mutation rides `open`/`write`/`mkdir`/`mount`/`sync`). API expansion stays deliberate.
 
 ## Current State
 

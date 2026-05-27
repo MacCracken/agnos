@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.35.0] — 2026-05-26 (**cycle-open** — the catchup-tidbits cycle (roadmap §1.35.x: DNS stub resolver, legacy virtio-net interface, plug-and-play / hot-add), opened with a **full agnos documentation sweep** after the 1.34.x FAT-family arc closed. **Lean cycle-open**: VERSION 1.34.6 → 1.35.0, this header; no code bites yet.)
+
+### Changed — full documentation sweep (`README.md`, `docs/development/state.md`, `docs/development/roadmap.md`, `docs/architecture/overview.md`, `docs/development/build.md`, `docs/development/syscall-additions.md`, `docs/development/kybernet-bridge.md`, `docs/doc-health.md`)
+
+The README + per-tree docs had drifted to the v1.30.x / 1.31.1 MVP-gate-and-storage era (pre the 1.32.x networking, 1.33.x ext2/4-write, and 1.34.x FAT-family arcs). Swept to current 1.35.0 state:
+
+- **`README.md`** — capability picture (storage stack, networking, the ext2/4 + full FAT-family filesystem stack), subsystem table (40+) with corrected xHCI/FAT rows, shell-command count, file counts, size comparison.
+- **`state.md`** — body brought forward from its frozen 1.31.1 shape: Build artifacts (475 KB → 798,936 B; cyrius 5.11.59 → 6.0.1), source rollup (66 → 71 files, core 22 → 26, usb 8 → 9), subsystem table (added r8169 / DHCP / USB-MS / RAM-disk / ext2-4 / FAT-family / exFAT / FS-write guard rows; per-cut size-trajectory log trimmed to a CHANGELOG pointer), In-flight + Recently-closed sections.
+- **`roadmap.md`** — **restructured to be forward-facing**: the completed "Shipped" arc ledger, the 1.30.x recap, all ✅-closed rows, and the completed Security-Hardening / Multi-Architecture / Planned tables were removed (their history lives in this CHANGELOG); only active / slotted-future / deferred items + the platform decade map + the cyrius-PIE-gated KASLR track remain.
+- **`architecture/overview.md`** — 35+ → 40+ subsystems, cyrius pin, boot sequence + subsystem diagram + Block-I/O / Networking prose updated for the storage / networking / read+write-FS stacks; "FAT16 read-only" retired.
+- **`build.md`** — compile-gate flag table completed: was current through the storage arc (`AHCI_RW_DEMO` / `MSC_RW_DEMO` / `RAMDISK_ENABLE`), added the 7 networking/FS gates accreted since (`NET_VERBOSE`, `EXT2_WRITE_SELFTEST`, `FATFS_SELFTEST`, `FATFS_WRITE_SELFTEST`, `EXFAT_SELFTEST`, `EXFAT_WRITE_SELFTEST`, `FAT_ALLOW_ESP_WRITE`) + enabling examples. All 13 `scripts/build.sh` gates now documented.
+- **`syscall-additions.md` / `kybernet-bridge.md`** — header refresh; surface/design confirmed unchanged since v1.21.0 (26-call surface; the write arcs reuse `open`/`write`/`mkdir`/`mount`/`sync`).
+- **`doc-health.md`** — currency ledger refreshed for the 1.35.0 sweep.
+
 ## [1.34.6] — 2026-05-26 (**ESP-write safety guard** — the 1.34.x arc cap (code half). FAT/exFAT refuse writes to an ESP-type GPT partition so the boot ESP can't be clobbered, before the FAT-family arc's first iron burn. QEMU-validated (fires / override / no-false-block); the user-driven iron burn is the only remaining 1.34.x item.)
 
 ### Added — ESP-write safety guard (1.34.x arc cap) (`core/fatfs.cyr`, `core/exfat.cyr`, `scripts/build.sh`, `scripts/fat-write-smoke.sh`)

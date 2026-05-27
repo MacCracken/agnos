@@ -1,6 +1,6 @@
 # Kybernet Bridge Plan
 
-> **Last Updated**: 2026-05-18 (v1.30.7 cycle — kybernet pin refreshed to 1.2.1; design unchanged since v1.21.0)
+> **Last Updated**: 2026-05-26 (v1.35.0 docs sweep — design unchanged since v1.21.0; kybernet pin 1.2.1)
 >
 > Make kybernet run on both Linux and AGNOS via a switchable syscall backend.
 >

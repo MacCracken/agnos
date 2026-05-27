@@ -38,7 +38,7 @@ Both source-side defines and backend env vars must be in lockstep — they gate 
 
 ## Build flags
 
-Three of these (architecture, ELF64) are mandatory and set by the script automatically. Two are opt-in development gates set via env var.
+The architecture + ELF64 flags are mandatory and set by the script automatically. The rest are opt-in development gates set via env var (all default-off; production boots stay lean).
 
 | Flag | Defined where | Default | Effect |
 |---|---|---|---|
@@ -50,6 +50,13 @@ Three of these (architecture, ELF64) are mandatory and set by the script automat
 | **`AHCI_RW_DEMO`** | source-side (prepended, env-driven) | **off** | Compiles in the AHCI boot-time sentinel write + read-back round-trip at LBA 5 of the lowest-numbered initialized SATA port. Default-off because LBA 5 on a GPT-formatted disk sits inside the partition-entry array (entries 12-15 at standard `partition_entries_lba=2` layout); writing a sentinel there corrupts the partition-array CRC (recoverable via `sgdisk --load-backup` from the disk's tail backup, but not the right default posture against drives the user cares about). The always-on `ahci_read_demo` (LBA 0 readback, no writes) provides Phase-4-DMA validation on iron without the write hazard. Enable for QEMU smoke (`AHCI_RW_DEMO=1 ./scripts/build.sh`) or known-scratch drives only |
 | **`MSC_RW_DEMO`** | source-side (prepended, env-driven) | **off** | Compiles in the USB Mass Storage boot-time sentinel write + read-back round-trip at LBA 100 of `msc_first_slot` (first MSC-BBB device that completes Phase 1-3). Default-off for the same reason as `AHCI_RW_DEMO` — LBA 100 on a typical USB stick may sit inside a filesystem; sentinel writes there are recoverable (8 bytes overwritten) but not the right default posture against drives the user cares about. The always-on `msc_read_demo` (LBA 0 readback, no writes) provides Phase-4-DMA validation on iron without the write hazard. Enable for QEMU smoke (`MSC_RW_DEMO=1 ./scripts/build.sh`) or known-scratch USB devices only |
 | **`RAMDISK_ENABLE`** | source-side (prepended, env-driven) | **off** | Compiles in the RAM-disk block backend (`kernel/core/ramdisk.cyr`). At boot, preallocates 64 pages (256 KB) from `pmm_alloc` and registers as the lowest-priority block backend — takes the slot only when no other backend (NVMe / AHCI / USB-MS / VirtIO) holds it. Useful as a development substrate for filesystem work without iron and as a regression target for the block-dispatch policy. Default-off because the 256 KB allocation eats ~18% of archaemenid's post-boot pmm budget (~354 free pages); production boots stay lean. To resize, edit `RAMDISK_NPAGES_DEFAULT` in `ramdisk.cyr` (capped at 128 = 512 KB by `RAMDISK_NPAGES_MAX` until the pmm budget audit reports >1024 free pages post-boot). Multi-source convergent design (OpenBSD `rd.c` MINIROOTSIZE pattern + NetBSD `md.c` MD_KMEM_ALLOCATED preallocation) — see `agnosticos/docs/development/ramdisk-virtio-modern-prior-art.md` § 3 |
+| **`NET_VERBOSE`** | source-side (prepended, env-driven) | **off** | Compiles in boot net diagnostics: the 1.1.1.1:80 outbound-TCP smoke + the r8169 silicon tally readback. Gated out of production at 1.32.8 once the r8169 unicast-RX arc reached CONNECTED — the per-burn diagnostics it accreted are developmental noise, not validation signal |
+| **`EXT2_WRITE_SELFTEST`** | source-side (prepended, env-driven) | **off** | Boot-time ext2/ext4 **write** self-test (1.33.x WRITE arc): create / write / truncate / unlink against the mounted ext2/4 FS, with `e2fsck -fn` as the host-side oracle on the resulting image |
+| **`FATFS_SELFTEST`** | source-side (prepended, env-driven) | **off** | Boot-time FAT **read** self-test (1.34.x): mount the FAT12/16/32 volume + cluster-chain read + directory listing |
+| **`FATFS_WRITE_SELFTEST`** | source-side (prepended, env-driven) | **off** | Boot-time FAT **write** self-test (1.34.x): create / multi-cluster write / overwrite / truncate / delete / LFN; `fsck.fat -n` + `mtools` as the host-side oracle |
+| **`EXFAT_SELFTEST`** | source-side (prepended, env-driven) | **off** | Boot-time exFAT **read** self-test (1.34.1): mount + typed dir-set read + multi-cluster chain read |
+| **`EXFAT_WRITE_SELFTEST`** | source-side (prepended, env-driven) | **off** | Boot-time exFAT **write** self-test (1.34.1+): dir-set create (SetChecksum + NameHash) / bitmap-allocator content write / overwrite / truncate / delete / root extension / Unicode names; `fsck.exfat -n` as the host-side oracle |
+| **`FAT_ALLOW_ESP_WRITE`** | source-side (prepended, env-driven) | **off** | Overrides the ESP-write safety guard (1.34.6). By default FAT/exFAT refuse writes to a partition whose GPT type-GUID is the EFI System Partition, so the boot ESP can't be clobbered. This flag lifts that refusal for QEMU FAT/exFAT **test images** whose backing partition happens to carry an ESP-type GUID. **Never** set this on real boot media |
 
 ### Enabling the gates
 
@@ -68,6 +75,10 @@ MSC_RW_DEMO=1 ./scripts/build.sh
 
 # Compile in the RAM-disk block backend (256 KB preallocated at boot)
 RAMDISK_ENABLE=1 ./scripts/build.sh
+
+# Boot-time filesystem write self-tests (paired with the QEMU smoke harnesses)
+FATFS_WRITE_SELFTEST=1 ./scripts/build.sh        # scripts/fat-write-smoke.sh
+EXFAT_WRITE_SELFTEST=1 FAT_ALLOW_ESP_WRITE=1 ./scripts/build.sh   # scripts/exfat-write-smoke.sh on an ESP-typed test image
 
 # Full developmental output
 KTEST=1 XHCI_VERBOSE=1 ./scripts/build.sh

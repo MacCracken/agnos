@@ -6,7 +6,7 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-05-26. **Current: agnos 1.34.6 RELEASED** (ESP-write safety guard — the 1.34.x arc-cap code). Active arc = the **1.34.x FAT-family write-completeness continuation** ([`roadmap.md`](roadmap.md) row 21): **1.34.0** FAT read+write, **1.34.1** exFAT read+write, **1.34.2** exFAT write parity, **1.34.3** FAT LFN/truncate completeness, **1.34.4** directory growth, **1.34.5** exFAT Unicode names, **1.34.6** ESP-write safety guard — all RELEASED + `fsck`-clean in QEMU. **The 1.34.x write-completeness continuation is COMPLETE; the ESP-write guard (the arc-cap code) is RELEASED.** **Only the user-driven FAT/exFAT iron burn remains** (the FAT-family arc's first iron touch — the guard makes it brick-safe; plan in agnosticos `#tracker-1341-cycle`). Production build **798,648 B**; `test.sh` 4/4, ext2 + FAT + exFAT smokes green. **MVP gate (boot-to-shell with typeable keyboard) green on archaemenid since Attempt 68 / 1.30.9.** **Closed arcs (history → [`CHANGELOG.md`](../../CHANGELOG.md) + the iron-log, not here):** storage backends + GPT + ext2/4 read (1.31.x), networking incl. r8169 unicast-RX + DHCP iron-verified (1.32.x), ext2/4 WRITE incl. the W5 demo→base iron burn + fsync barrier (1.33.x). **Forward plan beyond 1.34.x** — big-write own-cycles (1.37 extent / 1.38 jbd2 / 1.39 VFS) → kernel-slimming (1.40 font→`kashi` / 1.41 shell→agnoshi) → 1.42 perf → 1.43–1.45 agnos-2.0 runway, + platform decades (1.5x Intel / 1.6x Pi / 1.7x radios / 1.8x RISC-V) — lives in [`roadmap.md`](roadmap.md). 1.30.x AMD Zen scanout residue stays parked per `project_amd_zen_scanout_residue`. | **Refresh cadence**: every release, ideally via `scripts/version-bump.sh` (it refreshes the header date + Version row + roadmap "Current" line; body prose needs a manual sweep at minor closeouts — like this one).
+> **Last refresh**: 2026-05-26. **1.35.0 cycle OPEN — the catchup-tidbits cycle** (theme: DNS stub resolver + legacy virtio-net interface + plug-and-play / hot-add; opened with a lean version bump + full docs sweep — README + roadmap + this file brought forward from their frozen 1.31.1 shape). **Last release: agnos 1.34.6** (ESP-write safety guard — the 1.34.x FAT-family arc-cap code). The **1.34.x FAT-family arc** ([`roadmap.md`](roadmap.md) row 21) shipped FAT12/16/32 + exFAT read+write across **1.34.0–1.34.6** (FAT read+write → exFAT read+write → write parity → LFN/truncate → directory growth → exFAT Unicode names → ESP-write guard) — all RELEASED + `fsck`-clean in QEMU. **Only the user-driven FAT/exFAT iron burn remains** (the arc's first iron touch — the guard makes it brick-safe; plan in agnosticos `#tracker-1341-cycle`). Production build **798,936 B** (~799 KB); `test.sh` 4/4, ext2 + FAT + exFAT smokes green. **MVP gate (boot-to-shell with typeable keyboard) green on archaemenid since Attempt 68 / 1.30.9.** **Closed arcs (history → [`CHANGELOG.md`](../../CHANGELOG.md) + the iron-log, not here):** storage backends + GPT + ext2/4 read (1.31.x), networking incl. r8169 unicast-RX + DHCP iron-verified (1.32.x), ext2/4 WRITE incl. the W5 demo→base iron burn + fsync barrier (1.33.x). **Forward plan beyond 1.34.x** — big-write own-cycles (1.37 extent / 1.38 jbd2 / 1.39 VFS) → kernel-slimming (1.40 font→`kashi` / 1.41 shell→agnoshi) → 1.42 perf → 1.43–1.45 agnos-2.0 runway, + platform decades (1.5x Intel / 1.6x Pi / 1.7x radios / 1.8x RISC-V) — lives in [`roadmap.md`](roadmap.md). 1.30.x AMD Zen scanout residue stays parked per `project_amd_zen_scanout_residue`. | **Refresh cadence**: every release, ideally via `scripts/version-bump.sh` (it refreshes the header date + Version row + roadmap "Current" line; body prose needs a manual sweep at minor closeouts — like this one).
 >
 > **Scope**: live snapshot of this repo (`agnos`). Volatile state lives here so [`CLAUDE.md`](../../CLAUDE.md) can stay durable. Historical narrative lives in [`CHANGELOG.md`](../../CHANGELOG.md); the design ledger lives in [`roadmap.md`](roadmap.md). Iron-bring-up per-attempt detail lives in [agnosticos `iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md).
 
@@ -16,7 +16,7 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.34.6** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.35.0** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **6.0.1** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-05-26 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-25 (archaemenid NUC AMD — **MVP gate green since Attempt 68 / 1.30.9**; **1.32.x networking arc iron-COMPLETE**: r8169 unicast-RX solved at 1.32.7 + DHCP real lease `.142` iron-verified at 1.32.9; storage trio + GPT + ext4 + shell byte-clean). The 1.33.x ext2/4-WRITE + 1.34.x FAT-family arcs are QEMU/`fsck`-validated; their final-bite iron burns stay user-driven (pending). | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB) + 80-91 (storage arc) + 92+ (networking arc — DHCP iron-verified 1.32.9) |
@@ -42,31 +42,14 @@ The full history of these investigations lives in [`CHANGELOG.md`](../../CHANGEL
 
 ## Build artifacts
 
-Measured under cyrius 5.11.59, `CYRIUS_NO_WARN_SHADOW_LIB=1`, default
-DCE behavior. All sizes are from `wc -c` on `build/agnos*` after
-`scripts/build.sh` / `scripts/build.sh --aarch64`.
+Sizes from `wc -c` on `build/agnos*` after `scripts/build.sh`, cyrius 6.0.1, default DCE.
 
 | Arch | Binary | Size | Notes |
 |---|---|---|---|
-| x86_64 | `build/agnos` | **475,096 B** (~464 KB) | ELF64 multiboot2 (Path C — sovereign UEFI boot-info ABI via gnoboot v0.4.2; RDI = `&boot_info`, magic `0x41474E4F`), entry `0x1000a8`. Boots under `qemu-system-x86_64 -cpu max` + OVMF + gnoboot. Iron-validated archaemenid: MVP gate at Attempt 68 (1.30.9); NVMe debut clean at Attempt 80 (1.31.0). |
-| aarch64 | `build/agnos-aarch64` | **93,640 B** (~91 KB) | Cross-compiled. DTB + EL2→EL1 + PL011 UART + GIC. Compile-tested only — boot harness not yet wired. The +9 KB delta between x86_64 lines added since 1.30.7 (66 → 475 KB) is x86-only: USB-HID + xHCI cmd-path + FB hardening + NVMe + AHCI + GPT. aarch64 stubs absorb the new symbols with zero LOC delta. |
+| x86_64 | `build/agnos` | **798,936 B** (~780 KB, at 1.34.6) | ELF64 multiboot2 (Path C — sovereign UEFI boot-info ABI via gnoboot v0.4.2; RDI = `&boot_info`, magic `0x41474E4F`), entry `0x1000a8`. Boots under `qemu-system-x86_64 -cpu max` + OVMF + gnoboot. Iron-validated on archaemenid: MVP gate Attempt 68 (1.30.9), storage trio Attempts 80/81/87, ext4 victory lap 90/91, networking arc through Attempt ~100 (DHCP iron-verified 1.32.9). |
+| aarch64 | `build/agnos-aarch64` | compile-tested (~94 KB last measured, 1.31.x) | DTB + EL2→EL1 + PL011 UART + GIC. Compile-only — boot harness not yet wired; the x86-only storage/net/FS growth lands as zero-LOC stubs on the aarch64 side. |
 
-Size trajectory through 1.31.1 — bookmark cuts only; per-patch detail in CHANGELOG:
-
-| Cut | x86_64 | Delta source |
-|---|---|---|
-| v1.27.2 (1.28.x arc start) | 248,896 B | — |
-| v1.28.0 | 249,152 B (+256) | KASLR (S7) — Security Hardening track closed 13/13 |
-| v1.29.1 | 251,312 B (+2,160 over arc) | 1.28.x VFS-tagged-unions + PciDev derive + bench-history schema |
-| v1.30.0 | ~266,312 B (+15,000) | **Path-C sovereign UEFI boot-info ABI** — ELF64 + multiboot2 + RDI handoff |
-| v1.30.4 | 295,496 B (+29,184) | xHCI Linux-diff hardening — BAR UC remap, PORTSC RW1S, USB-HID Phase 1-3 |
-| v1.30.5 | ~360,000 B (+64,504) | Phase 4/5 USB-HID kbd driver + Repair (EE) Phase 3 silent-absorb closeout |
-| v1.30.6 | 368,568 B (+8,568) | xHCI cmd-path arc Repairs FF → OO bundle |
-| v1.30.7 | 368,968 B (+400) | Repair (QQ + QQ'') MSI-X Table programming (staged) — pre-MVP-gate cut |
-| **v1.30.9** | ~395,000 B (+~26,000) | **MVP GATE HIT** — Attempt 68 typeable shell on iron (SET_CONFIGURATION + canonical FS interval + ISP via cyrius v5.11.64 gvar-init-order fix) |
-| v1.30.10 → .12 | ~411,000 → 425,840 B (+30,840 over .9) | FB hardening sweep — pitch-aware refresh, WC + PixelFormat guard, true-font swap (VGA 8x16 BIOS ROM replaces hand-drawn CGA 8x8); 1.30.12 closes 1.30.x at `75914e9` |
-| **v1.31.0** | **421,912 B** (−3,928 from .12) | **Cycle open** — production-lean: `KTEST` + `XHCI_VERBOSE` compile gates strip diagnostic spam from default builds. Then NVMe Phase 1-5 (probe → admin queue → I/O queue → R/W + PRP-list → `block.cyr` dispatch) lands [Unreleased] same-session + iron debut Attempt 80 (Crucial P3 2 TB) clean. Cycle theme pivots from FB to storage. |
-| **v1.31.1** [Unreleased] | **475,096 B** (+34,040 from 1.31.0 storage-arc baseline of 441,056 B with NVMe applied) | **Storage cycle continues** — GPT Phase 1-3 (header probe + full 16 KB array walk + UTF-16LE name extraction + `parts` shell command + `gpt_partition_info(idx)` helper + CRC32 header/array validation + backup-header recovery + 7-GUID type classifier) + AHCI/SATA Phase 1-4 (HBA probe + BAR5 UC remap + CAP/GHC/PI decode + per-port CL+FIS bring-up + ATA IDENTIFY DEVICE + READ/WRITE DMA EXT + block-layer registration with NVMe-primary policy). Code-complete; iron burn awaits §4 patch decision on the audit. |
+Per-cut size trajectory + deltas live in [`CHANGELOG.md`](../../CHANGELOG.md) (the at-a-glance ledger — this is current truth, not a log). Bookmarks: ~249 KB (1.28.x) → **~395 KB v1.30.9 MVP gate** → 1.31.x storage arc → 1.32.x networking → 1.33.x ext2/4 write → 1.34.x FAT-family → **798,936 B (1.34.6)**.
 
 ---
 
@@ -74,14 +57,14 @@ Size trajectory through 1.31.1 — bookmark cuts only; per-patch detail in CHANG
 
 | Tree | Files | Notes |
 |---|---|---|
-| `kernel/` (total) | **66** `.cyr` | 15,048 lines across all kernel sources (was 6,306 at v1.30.7 — +8,742 lines for xHCI subsystem + storage stack) |
+| `kernel/` (total) | **71** `.cyr` | ~26,922 lines across all kernel sources (the 1.31.x storage, 1.32.x networking, 1.33.x ext2/4-write, and 1.34.x FAT-family arcs since the v1.30.x MVP-gate era) |
 | `kernel/agnos.cyr` | 1 | Main orchestrator — only `#ifdef` + `include` |
 | `kernel/kernel_hello.cyr` | 1 | Minimal smoke test |
 | `kernel/klib/` | 3 | `kstring.cyr`, `kfmt.cyr`, `ktagged.cyr` — vendored kernel-safe stdlib |
 | `kernel/arch/x86_64/` | 17 | boot_shim, boot_data, fb, fb_console, mbi, serial, gdt, idt, pic, apic, smp, keyboard, paging, io, syscall_hw, ring3, iommu |
-| `kernel/arch/x86_64/usb/` | 8 | xhci, xhci_regs, xhci_ring, xhci_cmd, xhci_ctx, xhci_port, hid, hid_translate |
+| `kernel/arch/x86_64/usb/` | 9 | xhci, xhci_regs, xhci_ring, xhci_cmd, xhci_ctx, xhci_port, hid, hid_translate, msc (USB Mass Storage) |
 | `kernel/arch/aarch64/` | 9 | boot_data, serial, gic, timer, exceptions, keyboard, paging, stubs, main |
-| `kernel/core/` | **22** | pmm, vmm, heap, proc, sched, syscall, vfs, devs, initrd, kprint, main, net, virtio_net, virtio_blk, fatfs, pci, acpi, elf, **nvme, block, gpt, ahci** (last four landed in the 1.31.x storage arc) |
+| `kernel/core/` | **26** | pmm, vmm, heap, proc, sched, syscall, vfs, devs, initrd, kprint, main, pci, acpi, elf; **net, virtio_net, r8169** (networking); **block, nvme, ahci, virtio_blk, ramdisk, gpt** (storage); **ext2, fatfs, exfat** (filesystems) |
 | `kernel/user/` | 4 | shell, init, test, test_procs |
 | `kernel/version.cyr` | 1 | Auto-generated banner strings — `scripts/version-bump.sh` regenerates |
 
@@ -89,11 +72,11 @@ Size trajectory through 1.31.1 — bookmark cuts only; per-patch detail in CHANG
 
 ## Subsystem status (40+)
 
-All subsystems are **code-complete** through v1.31.1. **MVP gate is cleared on iron** — typeable shell at Attempt 68 (1.30.9). The 1.31.x storage arc has shipped a full NVMe driver (iron-validated at Attempt 80), GPT layer (QEMU-validated), and AHCI/SATA driver (QEMU-validated, iron-burn audit drafted). The roadmap's "Active" table is the source of truth for in-flight work; this is the shipped surface.
+All subsystems are **code-complete** through 1.34.6 (1.35.0 cycle just opened). **MVP gate cleared on iron** — typeable shell at Attempt 68 (1.30.9). Since then: the **1.31.x storage arc** (NVMe / AHCI / USB-MS / RAM-disk / VirtIO-blk + 5-backend block layer + GPT + ext2/ext4 read) closed with iron debuts at Attempts 80/81/87/90/91; the **1.32.x networking arc** (TCP/UDP server primitives + DHCP + r8169 NIC) is iron-COMPLETE (DHCP lease verified 1.32.9); the **1.33.x ext2/4 WRITE arc** is iron-validated (persist-across-reboot); the **1.34.x FAT-family arc** (FAT12/16/32 + exFAT read+write + ESP-write guard) is QEMU/`fsck`-validated. The README § Subsystems is the full enumeration; the roadmap's arc ledger is the at-a-glance index; this table is the shipped-surface detail.
 
 | Subsystem | Notes |
 |---|---|
-| Boot (multiboot1, 32→64 shim) | 32-bit ELF entry, long mode transition (x86_64) |
+| Boot (multiboot2, 32→64 shim) | 32-bit ELF entry, long mode transition (x86_64) |
 | Boot (aarch64) | DTB, EL2→EL1, PL011 UART, GIC, ARM timer |
 | Boot (Path-C sovereign UEFI) | gnoboot v0.4.2 hands off via `RDI = &boot_info` (magic `0x41474E4F`); replaces multiboot2-via-GRUB |
 | Framebuffer console | GOP handoff capture, WC remap, pitch-aware u64 block-copy paint, 8x16 VGA BIOS-ROM glyph set (true-font swap at 1.30.12) |
@@ -122,18 +105,25 @@ All subsystems are **code-complete** through v1.31.1. **MVP gate is cleared on i
 | PCI Bus | Config space scan, device discovery, 64-bit BAR support |
 | ACPI | RSDP scan, DMAR parsing (VT-d), basic table layout |
 | IOMMU (VT-d) | Root/context/IO page tables, DTE registration for device DMA |
-| VirtIO-Net | Legacy PCI, virtqueues, Ethernet frames |
+| VirtIO-Net | Legacy PCI, virtqueues, Ethernet frames (QEMU NIC) |
+| **r8169 NIC** | Realtek RTL8111/8168/8169 GbE driver — RX/TX descriptor rings (64/RX, TX-split mask), unicast filter, iron-validated on archaemenid (RX isolated-construction fix 1.32.7) |
 | IP/UDP Stack | ARP, IPv4, UDP send/recv |
-| TCP Stack | Connect, send, recv, close, SYN/ACK/FIN state machine |
+| TCP Stack | Connect, send, recv, close, SYN/ACK/FIN state machine + **server primitives** (listen/accept) |
+| **DHCP client** | DISCOVER → OFFER → REQUEST → ACK lease acquisition; iron-verified lease on archaemenid (1.32.9) |
 | VirtIO-Blk | Legacy PCI, sector read/write, DMA buffers |
 | **NVMe** | Full Phase 1-5 driver — probe + admin queue + I/O queue + R/W DMA + PRP1/PRP2/PRP-list dispatch. Iron-debut clean on Crucial P3 2 TB at Attempt 80 (1.31.0) |
-| **AHCI/SATA** | Full Phase 1-4 driver — HBA probe + per-port CL+FIS bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. QEMU-validated on q35 ich9-ahci; iron-burn audit drafted (1.31.1 [Unreleased]) |
-| **Block-layer dispatch** | `kernel/core/block.cyr` — tag-based 3-backend dispatch (`BLK_VIRTIO` / `BLK_NVME` / `BLK_AHCI`); NVMe overrides virtio; AHCI registers as secondary when NVMe present (1.31.x) |
+| **AHCI/SATA** | Full Phase 1-4 driver — HBA probe + per-port CL+FIS bring-up + IDENTIFY DEVICE + READ/WRITE DMA EXT. QEMU-validated on q35 ich9-ahci; iron-validated on archaemenid (Attempt 87) |
+| **Block-layer dispatch** | `kernel/core/block.cyr` — tag-based 5-backend dispatch (`BLK_VIRTIO` / `BLK_NVME` / `BLK_AHCI` / `BLK_USB` / `BLK_RAM`); NVMe overrides virtio; AHCI/USB register as secondary when NVMe present (1.31.x) |
 | **GPT partition parser** | Full Phase 1-3 — header probe + signature decode + full 16 KB array walk + UTF-16LE name extraction + `parts` shell command + `gpt_partition_info(idx)` helper + table-less CRC32 (0xEDB88320) validation + backup-header recovery + 7-GUID type classifier (ESP / MSFT Basic / Linux FS / Linux Swap / Linux LVM / Linux RAID / BIOS Boot) (1.31.1) |
-| FAT16 | Read-only, root directory listing, file open/read |
+| **USB Mass Storage** | `usb/msc.cyr` — Bulk-Only Transport, SCSI READ/WRITE(10), block-layer backend (`BLK_USB`) |
+| **RAM-disk** | `core/ramdisk.cyr` — in-memory block backend (`BLK_RAM`) for test/seed images |
+| **ext2 / ext4** | Read **and write** — inode/block-group walk, directory ops, file create/write/truncate; persist-across-reboot iron-validated (1.33.x WRITE arc, Attempts 90/91) |
+| **FAT12 / FAT16 / FAT32** | Read **and write** — cluster-chain walk, LFN (read + spanning-append write), file create/overwrite/truncate/delete, cluster allocator; `fsck.fat` + `mtools` validated (1.34.x) |
+| **exFAT** | Read **and write** — 32-bit FAT, allocation bitmap, up-case table (RLE), typed dir-sets (File / Stream-Ext / File-Name), SetChecksum/NameHash; root extension + spanning-append; `fsck.exfat` validated (1.34.x) |
+| **FS-write safety guard** | Refuses FAT/exFAT writes on ESP-type GPT partitions (boot ESP protection); `FAT_ALLOW_ESP_WRITE` compile-override for QEMU test images (1.34.6) |
 | Pipes | Circular buffer IPC, read/write ends, VFS type 6 |
 | SMP Infrastructure | APIC, IPI, trampoline, per-CPU stacks |
-| Shell | 20 commands (added `parts` for GPT in 1.31.1) |
+| Shell | 28 commands (storage/FS/net arcs added `parts`, mount/ls/cat/write/rm/mkdir over the FS backends, net diagnostics) |
 | kybernet Init | PID 1 |
 | Signals | per-process `proc_signals` / `proc_sigmask`, `kill`, `sigprocmask`, `signalfd` |
 | Epoll + Timerfd | `epoll_{create,ctl,wait}`, `timerfd_{create,settime}` |
@@ -164,7 +154,7 @@ kybernet (PID 1)
 └── daimon       — agent orchestrator
 ```
 
-**Single-pin convention retired**: the previous "all on cyrius 5.10.44" stack-pin convention dissolved during the v5.11.x burst (2026-05-11/12/13). agnos itself moved to cyrius 5.11.59 during the Path-A → Path-C ELF64/UEFI-emit transition (forced by Cyrius .29/.30/.31 ELF section-header fix arc). Most other userland repos are at cyrius 5.10.44 bedrock; a 5.11.x leading-edge cluster is forming (sigil, sankoch, agnosys, et al at 5.11.4-5.11.8). Per-repo pin-lag spectrum is tracked in [agnosticos `state.md` § Pin-lag spectrum](https://github.com/MacCracken/agnosticos/blob/main/docs/development/state.md) — the genesis-repo is authoritative for cross-repo state. **Versions intentionally elided here** to avoid double-bookkeeping; agnosticos's state.md refreshes per repo touch.
+**Single-pin convention retired**: the old "all on one cyrius pin" stack convention dissolved during the v5.11.x burst (2026-05-11/12/13); each repo now pins independently. **agnos is on cyrius 6.0.1** (graduated from 5.11.64 mid-1.31.x). The per-repo pin-lag spectrum is tracked in [agnosticos `state.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/state.md) — the genesis repo is authoritative for cross-repo state. **Sibling versions intentionally elided here** to avoid double-bookkeeping.
 
 ---
 
@@ -175,7 +165,7 @@ kybernet (PID 1)
 | `scripts/check.sh` | **11/11** PASS | build, test, doc-exists ×6, version-in-kernel, version-in-changelog, binary-size |
 | `scripts/test.sh --all` | **7/7** PASS | x86 builds, multiboot ELF, size, kernel_hello builds; aarch64 compiles, size, valid ELF |
 | CI `boot-test` (QEMU) | banner + `KASLR: pmm_next_free=N` varies across 2 boots + `Memory isolation: PASS` + `Userland exec complete` | `.github/workflows/ci.yml` `boot-test` job |
-| CI `Format check` | 47/47 fmt-clean (1 skip: `kernel/user/shell.cyr` per `#ifdef`-in-fn-body carve-out) | `ci.yml` `check` job |
+| CI `Format check` | all kernel sources fmt-clean (1 skip: `kernel/user/shell.cyr` per `#ifdef`-in-fn-body carve-out) | `ci.yml` `check` job |
 
 CI runs on a self-hosted runner labeled `[self-hosted, linux, x64]` for
 `boot-test` and `benchmarks` (need QEMU + KVM-class CPU); `build`, `check`,
@@ -189,27 +179,18 @@ Source: [`docs/development/roadmap.md`](roadmap.md) `## Active` section.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | AHCI iron debut on archaemenid `sda` | Code-complete (1.31.1 Phase 1-4); QEMU-validated. Awaits §4 `AHCI_RW_DEMO` compile-gate decision per [`ahci-iron-burn-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/ahci-iron-burn-audit.md). |
+| 1 | 1.35.x catchup-tidbits cycle | Active theme: DNS stub resolver (A-record over existing UDP egress) + legacy virtio-net interface (transitional 0.9.5) + plug-and-play / hot-add (also clears the archaemenid USB-optical cold-boot quirk + unlocks optical). Lean cycle-open done (bump + docs sweep); no code bites yet. |
 | 2 | AMD Zen Quiet-Boot scanout residue | Parked next-cycle pin (`project_amd_zen_scanout_residue`). MVP unblocked via VGA-spec path; resumption options are HUBP `clear_tiling` port or shadow-buffer FB-console architectural eval. |
 | 3 | SMP AP wakeup on real hardware | QEMU-validated only; needs hardware-in-the-loop infra. Stays open across multiple arcs. |
-| 4 | `struct Process` `#derive(accessors)` port | Blocked on cyrius v5.11.x cap-raise — upstream acknowledged the 16-field metadata-table overflow + slotted for repair. Picks up passively at the next cyrius pin bump. |
+| 4 | `struct Process` `#derive(accessors)` port | Was blocked on a cyrius cap-raise (16-field metadata-table overflow); revisit against the current cyrius 6.0.1 pin — picks up passively when the field-table cap is confirmed lifted. |
 
-Recently closed (see [`CHANGELOG.md`](../../CHANGELOG.md)):
-- **v1.31.1** [Unreleased] — **Storage cycle continues**: GPT Phase 1-3 + AHCI/SATA Phase 1-4. ~1,440 LOC of new engineering (gpt.cyr + ahci.cyr + block.cyr extension + main.cyr wiring + aarch64 stubs). Iron-burn audit drafted. Awaits §4 patch + tag.
-- **v1.31.0** — **Cycle open + NVMe arc + iron debut**: production-lean (`KTEST` + `XHCI_VERBOSE` compile gates default off + FB-absent guard + new `docs/development/build.md`) + NVMe Phase 1-5 (probe + admin queue + I/O queue + R/W + PRP-list + `block.cyr` dispatch) + iron debut on Crucial P3 2 TB at Attempt 80 (first-try clean).
-- **v1.30.12** — True-font swap: VGA 8x16 BIOS ROM replaces hand-drawn CGA 8x8; closes 1.30.x FB-hardening sweep at QEMU+iron 1080p / 1440p PASS. iron Attempts 71-77.
-- **v1.30.11** — FB hardening: PixelFormat guard + WC retry-after-pmm + idempotent `vmm_remap_wc_2mb` + font-density scale + MTRR/audit removal. Quiet-Boot MVP gate at Attempt 76.
-- **v1.30.10** — Framebuffer refresh: WC + pitch-aware + u64 block-copy. iron Attempts 69-70.
-- **v1.30.9** — **MVP GATE HIT** at iron Attempt 68: SET_CONFIGURATION + canonical FS interval + ISP → typeable shell on archaemenid. Closeout of the xHCI cmd-path arc via cyrius v5.11.64's gvar-init-order fix.
-- **v1.30.8** — Iron Attempts 65/66/67: RR falsified, EP0 MPS reconciliation clears HID enumeration.
-- **v1.30.7** — pre-MVP-gate version bump (no kernel source delta).
-- **v1.30.6** — xHCI cmd-path arc bundle: Repairs FF → QQ + MSI-X table programming closeout.
-- **v1.30.5** — Phase 4/5 USB-HID boot keyboard driver + Repair (EE) Phase 3 silent-absorb one-line closeout.
-- **v1.30.4** — xHCI Linux-diff hardening closeout (BAR UC remap, PORTSC strict-RW1S, USB-HID Phase 1-3).
-- **v1.30.0** — Sovereign-struct kernel ABI: ELF64 multiboot2, RDI = `&boot_info` Path-C handoff via gnoboot v0.2.0.
-- **v1.29.x arc** — Closeout for 1.28.x.
-- **v1.28.x arc** — KASLR data-only (S7 closed; Security Hardening track 13/13).
-- **v1.27.x arc and earlier** — see archived entries in `CHANGELOG.md`.
+Recently closed — arc bookmarks only; per-cut detail in [`CHANGELOG.md`](../../CHANGELOG.md):
+- **1.34.x — FAT-family arc** (latest): FAT12/16/32 + exFAT read **and write** (LFN, cluster allocator, root extension, spanning-append, overwrite/truncate/delete) + ESP-write safety guard (1.34.6). `fsck.fat` / `fsck.exfat` / `mtools` validated.
+- **1.33.x — ext2/4 WRITE arc**: file create/write/truncate on ext2/ext4; persist-across-reboot iron-validated (Attempts 90/91).
+- **1.32.x — networking arc**: TCP/UDP server primitives + DHCP client + r8169 NIC; iron-COMPLETE (DHCP lease verified 1.32.9; r8169 RX fix 1.32.7).
+- **1.31.x — storage arc**: NVMe (iron Attempt 80) + GPT + AHCI/SATA (iron Attempt 87) + USB-MS + RAM-disk + 5-backend block layer + ext2/ext4 read.
+- **1.30.x — MVP gate**: typeable shell on archaemenid at Attempt 68 (1.30.9) + FB-hardening sweep (true-font swap 1.30.12).
+- **1.27.x – 1.29.x and earlier**: Path-C sovereign UEFI ABI (1.30.0), KASLR / Security Hardening 13/13 (1.28.x), VFS tagged-unions (1.29.x) — see archived `CHANGELOG.md` entries.
 
 ---
 
@@ -224,14 +205,8 @@ Recently closed (see [`CHANGELOG.md`](../../CHANGELOG.md)):
 
 ---
 
-## What changed at v1.31.0 / v1.31.1
+## Refresh discipline
 
-[`CHANGELOG.md`](../../CHANGELOG.md) carries the full narrative. The headline moves of the past week:
+[`CHANGELOG.md`](../../CHANGELOG.md) carries the full per-cut narrative; this file is current-truth + pointers, **not a log**. Arc-level summary lives in the "Recently closed" block above.
 
-- **MVP gate hit** at iron Attempt 68 (1.30.9) — typeable shell on archaemenid. Root-cause of the 9-letter xHCI cmd-path repair ladder was traced to a cyrius kmode gvar-init-order bug (fixed in cyrius v5.11.64); see cyrius issue `2026-05-18-gvar-init-order-zero-reads.md`.
-- **1.30.x FB-hardening sweep** (1.30.10 → 1.30.12) closed at the true-font swap; VGA path legible at 1080p + 1440p. Quiet-Boot legibility residue parked as next-cycle pin.
-- **1.31.x cycle theme pivots from FB to storage**. Production-lean compile gates (`KTEST` / `XHCI_VERBOSE`) ship out diagnostic spam by default.
-- **NVMe arc** (Phase 1-5) lands [1.31.0] same-session as the cycle open + iron debut on Crucial P3 2 TB first-try clean (Attempt 80). Build 421,912 → 441,056 B.
-- **GPT layer + AHCI/SATA driver** land [1.31.1] same-session. Total 1.31.1 delta: +34,040 B / ~1,440 LOC. Code-complete; iron burn awaits the §4 `AHCI_RW_DEMO` compile-gate decision in the audit.
-
-The systemic refresh discipline: `scripts/version-bump.sh` keeps the header date + Version-table row + `roadmap.md "Current"` line fresh atomically with the bump; body prose (Open Investigation, Build artifacts table extension, Subsystem status, Source rollup, Recently closed bullet list, ecosystem block, In-flight table) needs manual sweep at each minor closeout. This pattern was clarified during the 2026-05-18 doc-staleness audit when the script-fresh header was discovered next to v1.29.0-era body prose; the current sweep (2026-05-20) extends it to the 1.31.x storage-arc shape.
+`scripts/version-bump.sh` keeps the header date + Version-table row + `roadmap.md "Current"` line fresh atomically with the bump. Body prose (Build artifacts sizes, Source rollup counts, Subsystem status table, In-flight table, Recently-closed bookmarks) needs a **manual sweep at each minor closeout** — the script touches the header, not the body. This pattern was established during the 2026-05-18 doc-staleness audit (script-fresh header found next to v1.29.0-era body prose); the 1.35.0 cycle-open sweep (2026-05-26) brought the body forward from its frozen 1.31.1 shape through the 1.32.x networking / 1.33.x ext2-4-write / 1.34.x FAT-family arcs.
