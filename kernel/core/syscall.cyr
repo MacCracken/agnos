@@ -37,6 +37,8 @@ fn stack_canary_check(canary) {
 #    new functional syscall since v1.21.0; the CVE-2026-31431 immunity is
 #    anchored on the absence of the AF_ALG/socket/splice surface, which mmap
 #    (a pure memory syscall) does not add.
+# 28=munmap(addr, length) — release an mmap region + free its physical 2 MB
+#    pages (1.35.4). The natural pair to 27; same pure-memory posture.
 
 var sys_exit_code = 0;
 
@@ -318,6 +320,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # the base vaddr or 0 (MAP_FAILED). See proc.cyr sys_mmap.
         stack_canary_check(canary);
         return sys_mmap(arg1);
+    }
+    if (num == 28) {
+        # munmap(addr=arg1, length=arg2) — release an mmap region + free its
+        # physical 2 MB pages (1.35.4). Returns 0 / -1. See proc.cyr sys_munmap.
+        stack_canary_check(canary);
+        return sys_munmap(arg1, arg2);
     }
     stack_canary_check(canary);
     return 0 - 1;

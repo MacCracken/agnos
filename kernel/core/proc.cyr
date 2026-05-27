@@ -354,4 +354,44 @@ fn sys_mmap(length) {
     }
     return base_vaddr;
 }
+
+# sys_munmap(addr, length): release a region previously returned by sys_mmap
+# and return its physical 2 MB pages to the PMM. addr must be 2 MB-aligned and
+# inside the mmap arena [0x10000000, 0x40000000); length rounds up to 2 MB like
+# mmap. Conservative (no VMA tracking): frees each currently-mapped 2 MB region
+# in the range, skips already-unmapped ones (idempotent), never touches non-
+# arena memory. vaddr space is reclaimed only when the range sits exactly at the
+# top of the bump arena (LIFO); otherwise physical is freed but the cursor holds.
+# Returns 0 on success, -1 on a bad request. See mmap-prior-art.md § 7.
+fn sys_munmap(addr, length) {
+    if ((addr & 0x1FFFFF) != 0) { return 0 - 1; }            # not 2 MB-aligned
+    if (addr < 0x10000000) { return 0 - 1; }                  # below the arena
+    var len = (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;       # round up to 2 MB
+    if (len < 0x200000) { len = 0x200000; }
+    if ((addr + len) > 0x40000000) { return 0 - 1; }          # past the ceiling
+    var cr3 = proc_get_cr3(proc_current);
+    if (cr3 == 0) { return 0 - 1; }
+    # Walk PML4 -> PDPT -> PD once; the whole arena shares one PD (covers 0-1 GB).
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var npages = len / 0x200000;
+    var flush = 0;
+    for (var i = 0; i < npages; i = i + 1) {
+        var vaddr = addr + i * 0x200000;
+        var pd_idx = (vaddr >> 21) & 0x1FF;
+        var entry = load64(pd_addr + pd_idx * 8);
+        if ((entry & 1) != 0) {                               # present -> unmap + free
+            var phys = entry & 0xFFFFFFFFFFE00000;
+            proc_unmap_page(cr3, vaddr);                      # clears kernel + KPTI user PD
+            flush = vaddr;
+            asm { invlpg [rax]; }                             # drop the stale huge-page TLB entry
+            pmm_free_2mb(phys);
+        }
+    }
+    # LIFO vaddr reclaim: rewind the bump cursor if this was the most-recent map.
+    if ((addr + len) == mmap_next_vaddr) { mmap_next_vaddr = addr; }
+    return 0;
+}
 #endif

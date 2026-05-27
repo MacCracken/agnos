@@ -5,6 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.35.4] — 2026-05-27 (**`munmap`** — the natural pair to 1.35.3's `mmap`. Releases an anonymous region and returns its physical 2 MB pages to the PMM, so a process that churns mappings no longer leaks the arena until teardown. Closes the mmap/munmap pair. Audit: agnosticos [`mmap-prior-art.md` § 7](https://github.com/MacCracken/agnosticos/blob/main/docs/development/mmap-prior-art.md).)
+
+### Added — `munmap` (syscall 28)
+
+`mmap` (1.35.3) could hand out memory but never take it back — the global bump arena (256 MB→1 GB) and the 16 MB physical pool only recovered at process teardown, a leak for any consumer that grows *and shrinks* (arena allocators, a resizable heap). `munmap(addr, length)` closes the pair.
+
+- **`proc.cyr`** — `sys_munmap(addr, length)`: validate `addr` is 2 MB-aligned and inside the arena `[0x10000000, 0x40000000)`, round `length` up to 2 MB, walk to the PD once, then per 2 MB region recover the phys from the (present) PD entry, `proc_unmap_page` (clears both the kernel and KPTI user PD), `invlpg` the vaddr (drop the stale huge-page TLB entry — the live process must not keep a window into now-freed physical), and `pmm_free_2mb(phys)`. Already-unmapped regions are skipped (idempotent, no double-free); non-arena addresses are rejected (never touches code / stacks / kernel). A LIFO reclaim rewinds the bump cursor when the freed range sits exactly at the arena top, so alloc-then-free round-trips don't bleed vaddr space. Deliberately **not** Linux's VMA-tree model (no `vm_area_struct` splitting/merging) — AGNOS has no VMA layer, so `munmap` is the literal inverse of the bump `mmap`, not a general range op (audit § 7).
+- **`syscall.cyr`** — dispatch entry 28 = `sys_munmap(arg1, arg2)`. Dispatch table now 29 entries (0–28); aarch64 gets a `sys_munmap` stub.
+- **Validation** — `MMAP_SELFTEST` / `mmap-smoke.sh` extended (the mmap/munmap pair shares one test surface): new `munmap: pmm-reuse PASS` — `pmm_free_2mb` rejects misaligned / kernel-region / out-of-range addresses (the guards `sys_munmap` leans on), and an alloc→free→alloc round-trip proves freed physical is genuinely reusable with the free-count restored each cycle. The full `sys_munmap` PD-walk + `proc_unmap_page` + `invlpg` path rides those proven primitives (no live user-proc at boot). `mmap-smoke.sh` 2/2, `test.sh` 4/4, `check.sh` 11/11. Production build 821,856 → **822,864 B**.
+- **Housekeeping** — dropped the stale `scripts/build.sh` "banner cleanup" roadmap row: the banner already validates `multiboot2 (ELF64): OK` (a real ELF-class/magic/entry check) and prints the Path-C `Boot: gnoboot + OVMF … / install-usb.sh` line; the "pending shim rewrite" label it referenced was removed cycles ago.
+- **Deferred** (audit § 6/7): `munmap` of partial / 4 KB-granular regions (needs the 4 KB user-paging level); a vaddr free-list to reclaim non-top arena holes (only if a consumer shows real fragmentation).
+
 ## [1.35.3] — 2026-05-27 (**anonymous `mmap`** — the first new *functional* syscall since v1.21.0. A process can now request a fresh, zero-filled region of its own address space, the substrate a heap-grower / arena allocator needs. Independent of the FS arcs; the comms arc (1.35.0–1.35.2) is closed. Audit-doc-first: agnosticos [`mmap-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/mmap-prior-art.md).)
 
 ### Added — anonymous `mmap` (syscall 27), 2 MB-granular

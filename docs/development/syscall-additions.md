@@ -1,14 +1,14 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> **Last Updated**: 2026-05-27 (v1.35.3 — `mmap` added at slot 27)
+> **Last Updated**: 2026-05-27 (v1.35.4 — `munmap` added at slot 28)
 >
-> The 26-call kybernet surface (0–25) was complete at v1.21.0; kybernet (currently v1.2.1) runs on AGNOS as PID 1. Two dispatch entries have been added **since** v1.21.0, both outside that kybernet set: slot **26** `write_boot_checkpoint(byte)` (a CMOS-write diagnostic added during iron-boot bring-up) and slot **27** `mmap(length)` (anonymous, 2 MB-granular memory; v1.35.3). The dispatch table is now **28 entries (0–27)**.
+> The 26-call kybernet surface (0–25) was complete at v1.21.0; kybernet (currently v1.2.1) runs on AGNOS as PID 1. Three dispatch entries have been added **since** v1.21.0, all outside that kybernet set: slot **26** `write_boot_checkpoint(byte)` (a CMOS-write diagnostic added during iron-boot bring-up), slot **27** `mmap(length)` (anonymous, 2 MB-granular memory; v1.35.3), and slot **28** `munmap(addr, length)` (its pair; v1.35.4). The dispatch table is now **29 entries (0–28)**.
 >
-> **Status**: This doc is the implementation reference for the v1.21.0 syscall buildout — historical record of how each syscall got wired in `kernel/core/syscall.cyr`. Current syscall surface lives in [`state.md` § Syscall surface](state.md). The 26-call kybernet set was untouched through the entire v1.27.x → v1.34.x arc — security hardening (S1-S13 13/13 at v1.28.0), the Path-C sovereign-struct kernel ABI break (v1.30.0), native xHCI + USB-HID-boot (v1.30.x), the storage stack (v1.31.x), networking (v1.32.x), and the ext2/4 + FAT-family **write** arcs (v1.33.x / v1.34.x) all reuse it (FS mutation rides `open`/`write`/`mkdir`/`mount`/`sync`). The first *new functional* syscall since v1.21.0 is `mmap` (27, v1.35.3) — it adds a pure memory facility, not socket/crypto surface. API expansion stays deliberate.
+> **Status**: This doc is the implementation reference for the v1.21.0 syscall buildout — historical record of how each syscall got wired in `kernel/core/syscall.cyr`. Current syscall surface lives in [`state.md` § Syscall surface](state.md). The 26-call kybernet set was untouched through the entire v1.27.x → v1.34.x arc — security hardening (S1-S13 13/13 at v1.28.0), the Path-C sovereign-struct kernel ABI break (v1.30.0), native xHCI + USB-HID-boot (v1.30.x), the storage stack (v1.31.x), networking (v1.32.x), and the ext2/4 + FAT-family **write** arcs (v1.33.x / v1.34.x) all reuse it (FS mutation rides `open`/`write`/`mkdir`/`mount`/`sync`). The first *new functional* syscalls since v1.21.0 are `mmap` (27, v1.35.3) + `munmap` (28, v1.35.4) — a pure memory facility, not socket/crypto surface. API expansion stays deliberate.
 
 ## Current State
 
-**AGNOS kernel** (`kernel/core/syscall.cyr`) implements the 26-call kybernet surface below (slots 0–25, all tiers complete), plus two later additions: `write_boot_checkpoint` (26, diagnostic) and `mmap` (27, v1.35.3) — see the header note.
+**AGNOS kernel** (`kernel/core/syscall.cyr`) implements the 26-call kybernet surface below (slots 0–25, all tiers complete), plus three later additions: `write_boot_checkpoint` (26, diagnostic), `mmap` (27, v1.35.3), and `munmap` (28, v1.35.4) — see the header note.
 
 ### Original 8 (v1.0.0):
 
@@ -285,7 +285,7 @@ if (num == 23) {
 
 ## Summary
 
-All tiers implemented. 26-call kybernet surface (8 original + 18 new). (Slots 26 `write_boot_checkpoint` and 27 `mmap` were added later — outside the kybernet set; see the header note.)
+All tiers implemented. 26-call kybernet surface (8 original + 18 new). (Slots 26 `write_boot_checkpoint`, 27 `mmap`, and 28 `munmap` were added later — outside the kybernet set; see the header note.)
 
 | Tier | Syscalls | Status |
 |------|----------|--------|
