@@ -1005,6 +1005,7 @@ fn net_recv_udp(buf, maxlen) {
 #   offset 120: retx_count (8 bytes) — retransmit attempts so far (B2)
 #   offset 128: retx_flags (8 bytes) — TCP flags to resend; 0 = disarmed (B2)
 #   offset 136: retx_buf (8 bytes) — held payload ptr (kmalloc TCP_RETX_BUF) (B2)
+#   offset 144: eff_mss (8 bytes) — effective send MSS = min(ours, peer's) (B3)
 # Ring occupancy = rx_write - rx_read; free = TCP_RX_RING - occupancy; the
 # advertised window is that free count (B1 — no longer the hardcoded 8192).
 # One-in-flight retransmit (B2): a single unACKed segment is held in retx_buf
@@ -1039,9 +1040,14 @@ var TCP_RX_RING = 2048;
 var TCP_RETX_BUF = 1460;
 var TCP_RTO_BASE = 100;        # ticks (1 s at the 100 Hz timer)
 var TCP_RTO_RETRIES = 5;       # resends before declaring the conn dead
+# MSS (B3): the value we advertise on our SYN/SYN-ACK (Ethernet MTU 1500 − IP
+# 20 − TCP 20). TCP_MSS_DEFAULT is the RFC 9293 fallback when a peer's SYN
+# omits the MSS option.
+var TCP_OUR_MSS = 1460;
+var TCP_MSS_DEFAULT = 536;
 
 fn tcp_conn_base(conn_id) {
-    return &tcp_conns + conn_id * 144;
+    return &tcp_conns + conn_id * 152;
 }
 
 # Receive-ring free space (B1) — TCP_RX_RING minus current occupancy. This is
@@ -1075,6 +1081,48 @@ fn tcp_rx_append(cb, src, len) {
     }
     store64(cb + 64, rxw + take);          # advance rx_write
     return take;
+}
+
+# MSS option (B3, RFC 9293 §3.2 — kind 2, len 4, 16-bit value). Written after
+# the 20-byte fixed header on a SYN/SYN-ACK; returns its length (4).
+fn tcp_write_mss_opt(p) {
+    store8(p + 0, 2);                       # kind = MSS
+    store8(p + 1, 4);                       # length
+    store8(p + 2, (TCP_OUR_MSS >> 8) & 0xFF);
+    store8(p + 3, TCP_OUR_MSS & 0xFF);
+    return 4;
+}
+
+# Walk a received segment's options (between the 20-byte header and hdr_len)
+# for the MSS option. Returns the peer's MSS, or 0 if absent/malformed.
+fn tcp_parse_mss(tcp, hdr_len) {
+    var p = 20;
+    while (p + 1 < hdr_len) {
+        var kind = load8(tcp + p);
+        if (kind == 0) { return 0; }             # End Of Options
+        if (kind == 1) { p = p + 1; continue; }  # NOP
+        var olen = load8(tcp + p + 1);
+        if (olen < 2) { return 0; }              # malformed — stop
+        if (kind == 2) {
+            if (olen == 4) {
+                if (p + 4 <= hdr_len) {
+                    return (load8(tcp + p + 2) << 8) | load8(tcp + p + 3);
+                }
+            }
+        }
+        p = p + olen;
+    }
+    return 0;
+}
+
+# Effective send MSS for a peer MSS value (0 = peer omitted the option): clamp
+# to ours, fall back to the RFC 9293 default when absent.
+fn tcp_eff_mss(peer_mss) {
+    var m = peer_mss;
+    if (m == 0) { m = TCP_MSS_DEFAULT; }
+    if (m > TCP_OUR_MSS) { m = TCP_OUR_MSS; }
+    if (m < 1) { m = TCP_MSS_DEFAULT; }
+    return m;
 }
 
 fn tcp_checksum_compute(src_ip, dst_ip, tcp_buf, tcp_len) {
@@ -1162,9 +1210,18 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     var win = tcp_rx_free(cb);
     if (win > 65535) { win = 65535; }
     var tcp_hdr_len = tcp_build_header(p + tcp_off, src_port, dst_port, seq, ack, flags, win);
-    # Copy data after TCP header
-    memcpy(p + tcp_off + tcp_hdr_len, data, data_len);
-    var tcp_total = tcp_hdr_len + data_len;
+    # SYN / SYN-ACK carry the MSS option (B3): bump the data offset to 6 words
+    # (24 bytes) and append the 4-byte option. SYNs never carry data, so the
+    # data copy below lands correctly past the option.
+    var opt_len = 0;
+    if ((flags & 0x02) != 0) {
+        store8(p + tcp_off + 12, 0x60);     # data offset = 6 × 4 = 24 bytes
+        tcp_write_mss_opt(p + tcp_off + tcp_hdr_len);
+        opt_len = 4;
+    }
+    # Copy data after the header (+ options)
+    memcpy(p + tcp_off + tcp_hdr_len + opt_len, data, data_len);
+    var tcp_total = tcp_hdr_len + opt_len + data_len;
     # Compute TCP checksum
     var cksum = tcp_checksum_compute(net_ip, dst_ip, p + tcp_off, tcp_total);
     store8(p + tcp_off + 16, (cksum >> 8) & 0xFF);
@@ -1269,6 +1326,7 @@ fn tcp_connect(dst_ip, dst_port, src_port) {
     store64(cb + 120, 0);       # retx_count
     store64(cb + 128, 0);       # retx_flags (disarmed)
     store64(cb + 136, retx_buf);
+    store64(cb + 144, TCP_MSS_DEFAULT);   # eff_mss (refined when SYN-ACK's MSS arrives)
     # Send SYN (flags = 0x02) and arm its retransmit.
     tcp_send_pkt(conn_id, 0x02, 0, 0);
     tcp_arm_retx(cb, isn, 0x02, 0, 0);
@@ -1294,15 +1352,31 @@ fn tcp_send(conn_id, data, len) {
     if (conn_id < 0) { return 0 - 1; }
     if (conn_id >= tcp_conn_count) { return 0 - 1; }
     var cb = tcp_conn_base(conn_id);
-    var state = load64(cb);
-    if (state != 2) { return 0 - 1; }
-    # Send PSH+ACK (flags = 0x18), advance SND.NXT, and arm the retransmit
-    # (B2 — one in flight; a fetch client sends a request then waits).
-    var seq = load64(cb + 32);
-    var r = tcp_send_pkt(conn_id, 0x18, data, len);
-    store64(cb + 32, (seq + len) & 0xFFFFFFFF);
-    tcp_arm_retx(cb, seq, 0x18, data, len);
-    return r;
+    if (load64(cb) != 2) { return 0 - 1; }
+    # B3: segment into ≤ effective-MSS chunks. One in flight (B2): send a chunk,
+    # arm its retransmit, then wait (bounded) for its ACK before the next — so
+    # exactly one segment is held, and a loss is recovered by the B2 timer.
+    var mss = load64(cb + 144);
+    if (mss < 1) { mss = TCP_MSS_DEFAULT; }
+    var sent = 0;
+    while (sent < len) {
+        var chunk = len - sent;
+        if (chunk > mss) { chunk = mss; }
+        var seq = load64(cb + 32);
+        tcp_send_pkt(conn_id, 0x18, data + sent, chunk);   # PSH+ACK
+        store64(cb + 32, (seq + chunk) & 0xFFFFFFFF);
+        tcp_arm_retx(cb, seq, 0x18, data + sent, chunk);
+        sent = sent + chunk;
+        var deadline = timer_ticks + 800;       # ~8 s ceiling per chunk
+        while (timer_ticks < deadline) {
+            net_poll();
+            if (load64(cb + 128) == 0) { break; }   # retx disarmed = ACKed
+            if (load64(cb) != 2) { break; }         # conn left ESTABLISHED
+            arch_wait();
+        }
+        if (load64(cb) != 2) { return sent; }       # closed/reset mid-send
+    }
+    return sent;
 }
 
 fn tcp_recv(conn_id, buf, maxlen) {
@@ -1409,6 +1483,7 @@ fn tcp_listen(port) {
     store64(cb + 120, 0);       # retx_count unused
     store64(cb + 128, 0);       # retx_flags unused (LISTEN never retransmits)
     store64(cb + 136, 0);       # retx_buf unused
+    store64(cb + 144, 0);       # eff_mss unused (set per-conn on passive open)
     return conn_id;
 }
 
@@ -1516,6 +1591,8 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         store64(ncb + 120, 0);                 # retx_count
         store64(ncb + 128, 0);                 # retx_flags (disarmed)
         store64(ncb + 136, retx_buf);
+        # B3: effective send MSS from the peer's SYN MSS option (clamped to ours).
+        store64(ncb + 144, tcp_eff_mss(tcp_parse_mss(tcp, tcp_hdr_len)));
         # Send SYN+ACK (0x12), advance SND.NXT, arm its retransmit.
         tcp_send_pkt(new_id, 0x12, 0, 0);
         tcp_arm_retx(ncb, isn, 0x12, 0, 0);
@@ -1554,6 +1631,8 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
             }
             store64(cb + 40, seq + 1);
             store64(cb, 2);  # ESTABLISHED
+            # B3: learn the peer's MSS from the SYN-ACK option (clamp to ours).
+            store64(cb + 144, tcp_eff_mss(tcp_parse_mss(tcp, tcp_hdr_len)));
             # Send ACK (flags = 0x10)
             tcp_send_pkt(conn_id, 0x10, 0, 0);
             return 1;

@@ -119,6 +119,14 @@ else
     fail=$((fail + 1))
 fi
 
+if grep -q "tcp: mss PASS" "$LOG"; then
+    echo "PASS: B3 MSS option (emit + parse + effective-MSS clamp/default)"
+    pass=$((pass + 1))
+else
+    echo "FAIL: 'tcp: mss PASS' not found — MSS option regression"
+    fail=$((fail + 1))
+fi
+
 echo ""
 echo "=== tcp-smoke: $pass passed, $fail failed ==="
 [ "$fail" -eq 0 ] && exit 0

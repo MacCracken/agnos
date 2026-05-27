@@ -1407,6 +1407,29 @@ if (vnet_active != 0 || nic_ready() != 0) {
         if (ok2 == 1) { kprintln("tcp: retx PASS", 14); }
         if (ok2 == 0) { kprintln("tcp: retx FAIL", 14); }
 
+        # --- B3 MSS option emit + parse + effective-MSS (hermetic) ---
+        var ok3 = 1;
+        # Emit: write the option into src[0..3] and verify the bytes (1460 = 0x05B4).
+        if (tcp_write_mss_opt(&src) != 4) { ok3 = 0; }
+        if (load8(&src + 0) != 2) { ok3 = 0; }
+        if (load8(&src + 1) != 4) { ok3 = 0; }
+        if (load8(&src + 2) != 0x05) { ok3 = 0; }
+        if (load8(&src + 3) != 0xB4) { ok3 = 0; }
+        # Parse: a 24-byte header (20 zero + the MSS option) → 1460; a bare
+        # 20-byte header (no options) → 0 (absent).
+        memset(&dbuf, 0, 24);
+        store8(&dbuf + 20, 2); store8(&dbuf + 21, 4);
+        store8(&dbuf + 22, 0x05); store8(&dbuf + 23, 0xB4);
+        if (tcp_parse_mss(&dbuf, 24) != 1460) { ok3 = 0; }
+        if (tcp_parse_mss(&dbuf, 20) != 0) { ok3 = 0; }
+        # Effective MSS: clamp to ours, default when absent, honor a smaller peer.
+        if (tcp_eff_mss(1460) != 1460) { ok3 = 0; }
+        if (tcp_eff_mss(0) != 536) { ok3 = 0; }
+        if (tcp_eff_mss(1000) != 1000) { ok3 = 0; }
+        if (tcp_eff_mss(9000) != 1460) { ok3 = 0; }
+        if (ok3 == 1) { kprintln("tcp: mss PASS", 13); }
+        if (ok3 == 0) { kprintln("tcp: mss FAIL", 13); }
+
         kfree_sized(ring, TCP_RX_RING);
         kfree_sized(rtx, TCP_RETX_BUF);
         store64(cb + 48, 0); store64(cb + 136, 0); store64(cb, 0);

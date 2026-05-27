@@ -22,7 +22,15 @@ One-in-flight retransmit (iPXE-scale, audit § 4) — the reliability half of th
 
 - **`net.cyr`** — `tcp_arm_retx` captures the held segment (seq + flags + payload, pinning SND.UNA); `tcp_retx_rto(count)` = 1 s base, ×2 per retry, capped ×16 (RFC 6298 backoff, fixed base — RTT estimation deferred); `tcp_retx_tick` (driven from `net_poll`) resends due segments and closes the conn after `TCP_RTO_RETRIES` (5) unACKed resends. Arm points: SYN (`tcp_connect`), SYN-ACK (passive open), data (`tcp_send`), FIN (`tcp_close`). An inbound ACK covering the held segment advances SND.UNA + disarms (with a wrapped-dup-ACK guard). `tcp_connect` now polls on an ~8 s timer deadline (was a fixed 200-iteration count) so SYN retransmits have time to recover.
 - **Validation** — `tcp-smoke.sh` extended (`tcp: retx PASS`): hermetic checks of the RTO-backoff math, arm/disarm field plumbing, a force-due resend bumping the retry count, and the give-up → CLOSED path. `tcp-listen-smoke.sh` 2/2 (the passive-open handshake exercises arm-on-SYN-ACK + ACK-disarm — no regression). `test.sh` 4/4, `check.sh` 11/11. Production build 812,096 → **814,576 B**.
-- **Remaining**: B3 MSS + send segmentation, B4 honor peer SND.WND.
+- **Remaining**: B4 honor peer SND.WND.
+
+### Added — TCP hardening B3: MSS option + send segmentation
+
+The SYN carried no MSS option (peers assumed the 536 default) and `tcp_send` emitted the caller's whole `len` as a single segment — a >MSS send produced an oversized, IP-fragmenting-or-dropped segment. B3 fixes both (audit § 4).
+
+- **`net.cyr`** — SYN / SYN-ACK now carry the MSS option (RFC 9293 §3.2: kind 2, len 4, value `TCP_OUR_MSS` = 1460; data offset bumped to 6 words). `tcp_parse_mss` walks a received segment's options (NOP/EOL-aware) for the peer's MSS; `tcp_eff_mss` clamps it to ours and falls back to 536 when absent. The effective MSS is learned on the SYN-ACK (active open) and the incoming SYN (passive open), stored per-conn. `tcp_send` now **segments into ≤ effective-MSS chunks**, sending one at a time and waiting (bounded ~8 s) for each chunk's ACK before the next — keeping the B2 one-in-flight invariant so every segment is retransmit-protected. Struct grew 144 → 152 B for `eff_mss`.
+- **Validation** — `tcp-smoke.sh` extended (`tcp: mss PASS`): hermetic option emit (byte-exact `02 04 05 B4`), parse (24-byte header → 1460; bare 20-byte header → absent), and the effective-MSS clamp/default/honor-smaller math. `tcp-listen-smoke.sh` 2/2 — the handshake now exchanges MSS options and the banner ships via the new segmenting blocking `tcp_send`, no regression. `test.sh` 4/4, `check.sh` 11/11. Production build 814,576 → **816,320 B**.
+- **Remaining**: B4 honor peer SND.WND (closes the cycle).
 
 ## [1.35.0] — 2026-05-27 (the **catchup-tidbits cycle** — a full agnos documentation sweep (after the 1.34.x FAT-family arc) plus the cycle's first two networking-comms bites: **DNS stub resolver** + **ICMP echo / ping**. Opened lean 2026-05-26 (VERSION 1.34.6 → 1.35.0); bites landed 2026-05-26→27. Legacy virtio-net was back-burnered (known TX-handler gap, covered by the modern driver). The networking-comms continuation — TCP hardening, then NTP — moves to 1.35.1+; TLS stays with the cyrius agent.)
 
