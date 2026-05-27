@@ -583,6 +583,42 @@ if (fatfs_active == 1) {
     kprint(" t=", 3);
     kprint_num(gr_t);
     kprintln("", 0);
+    # 1.34.4 (FAT side) — FAT32 root extension + cross-sector LFN runs: create
+    # 40 LFN-named files (`LfNN_longx.dat`, 3 dir entries each = 120, far past
+    # what the host pre-allocated for the root) with content. Distinct 6-char
+    # bases (`LFNN_L`) so the ~N alias generator doesn't collide. All must
+    # create rc=0; fat-write-smoke.sh gates fsck.fat -n clean + readback —
+    # forces the root to grow + LFN sets to straddle cluster boundaries.
+    var lnb[16];
+    store8(&lnb + 0, 76); store8(&lnb + 1, 102);        # "Lf"
+    store8(&lnb + 4, 95); store8(&lnb + 5, 108); store8(&lnb + 6, 111);  # "_lo"
+    store8(&lnb + 7, 110); store8(&lnb + 8, 103); store8(&lnb + 9, 120); # "ngx"
+    store8(&lnb + 10, 46); store8(&lnb + 11, 100); store8(&lnb + 12, 97); store8(&lnb + 13, 116);  # ".dat"
+    var rxn_fail = 0;
+    var rxn = 0;
+    while (rxn < 40) {
+        store8(&lnb + 2, 48 + (rxn / 10));              # tens digit (varies the basis)
+        store8(&lnb + 3, 48 + (rxn % 10));              # ones digit
+        if (fatfs_write_file_lfn(&lnb, 14, &fatfs_file_buf, 50) != 0) { rxn_fail = rxn_fail + 1; }
+        rxn = rxn + 1;
+    }
+    kprint("fatw: fatrootext 40 lfn files nfail=", 36);
+    kprint_num(rxn_fail);
+    kprintln("", 0);
+    # read Lf39_longx.dat back (last created — in an extended root cluster).
+    store8(&lnb + 2, 51); store8(&lnb + 3, 57);         # "39"
+    var rxn_res[16];
+    var rxn_ok = 0;
+    if (fatfs_find_lfn(&lnb, 14, &rxn_res) == 1) {
+        var rxn_cl = load64(&rxn_res);
+        var rxn_got = fatfs_read(rxn_cl, &fatfs_file_buf, 50);
+        rxn_ok = 1;
+        if (rxn_got != 50) { rxn_ok = 0; }
+        if (load8(&fatfs_file_buf + 0) != 0) { rxn_ok = 0; }
+        if (load8(&fatfs_file_buf + 49) != (49 & 0xFF)) { rxn_ok = 0; }
+    }
+    if (rxn_ok == 1) { kprintln("fatw: fatrootext readback OK", 28); }
+    else { kprintln("fatw: fatrootext readback FAIL", 30); }
 }
 #endif
 

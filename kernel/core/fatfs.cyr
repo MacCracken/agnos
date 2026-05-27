@@ -598,7 +598,9 @@ fn fatfs_find_free_root_slot() {
     var eps = 512 / 32;
     if (fatfs_type == 32) {
         var clus = fatfs_root_cluster;
+        var last_clus = clus;
         while (clus >= 2) {
+            last_clus = clus;
             var base = fatfs_first_sector_of_cluster(clus);
             for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
                 var sec = base + s;
@@ -611,7 +613,15 @@ fn fatfs_find_free_root_slot() {
             }
             clus = fat_next_cluster(clus);
         }
-        return 0 - 1;
+        # root chain is 100% full (no 0x00/0xE5) → extend by a fresh cluster
+        # (1.34.4). Safe for a single slot: only reached when no free slot
+        # exists anywhere, so the fresh cluster's slot 0 immediately follows
+        # the packed chain (no stranded 0x00).
+        var nc = fat_root_extend(last_clus);
+        if (nc == 0) { return 0 - 1; }
+        fatfs_slot_sec = fatfs_first_sector_of_cluster(nc);
+        fatfs_slot_idx = 0;
+        return 0;
     }
     var root_sectors = (fatfs_root_entry_count * 32 + 511) / 512;
     for (var s2 = 0; s2 < root_sectors; s2 = s2 + 1) {
@@ -1131,11 +1141,162 @@ fn fatfs_emit_lfn(ep, seq, is_last, checksum, name, namelen, chunk_index) {
     return 0;
 }
 
-# Create an empty file with a long name: 8.3-fitting names fall through
-# to fatfs_create; otherwise generate a unique alias + write the LFN set
-# (K reverse-ordered LFN entries + the 8.3 alias) into one contiguous
-# run. K = ceil(namelen/13). FAT16/32 only. Returns 0/-1. (LFN + content
-# and LFN refuse-exists are follow-ons; this lands LFN create.)
+# === FAT32 root extension + cross-boundary dir-set append (1.34.4) ===
+# Mirrors the exFAT spanning append. The FAT12/16 root is a fixed region
+# (can't grow); only the FAT32 root is a cluster chain that extends.
+
+# Extend the FAT32 root by one cluster: alloc (fat_alloc_cluster marks it
+# EOC), link `last_clus` → c, zero it. Returns the new cluster, or 0.
+fn fat_root_extend(last_clus) {
+    var c = fat_alloc_cluster();                        # allocates + sets EOC
+    if (c == 0) { return 0; }
+    if (fat_set_entry(last_clus, c) != 0) { return 0; }  # link last → c
+    var base = fatfs_first_sector_of_cluster(c);
+    var s = 0;
+    while (s < fatfs_sectors_per_cluster) {
+        var z = 0;
+        while (z < 512) { store8(&fatfs_data_buf + z, 0); z = z + 1; }
+        if (fat_blk_write(base + s, &fatfs_data_buf) != 0) { return 0; }
+        s = s + 1;
+    }
+    fat_fsinfo_mark_unknown();
+    return c;
+}
+
+# Map a FAT32 root-dir linear entry index → its cluster, extending the chain
+# as needed. Returns the cluster, or 0 on ENOSPC/error. FAT32 only.
+fn fat_root_cluster_for_index(lin) {
+    var epc = (512 / 32) * fatfs_sectors_per_cluster;
+    var cidx = lin / epc;
+    var clus = fatfs_root_cluster;
+    var i = 0;
+    var guard = 0;
+    var max_c = fatfs_count_of_clusters + 2;
+    while (i < cidx) {
+        var nxt = fat_next_cluster(clus);
+        if (nxt < 2) {
+            nxt = fat_root_extend(clus);
+            if (nxt == 0) { return 0; }
+        }
+        clus = nxt;
+        i = i + 1;
+        guard = guard + 1;
+        if (guard > max_c) { return 0; }
+    }
+    return clus;
+}
+
+# Linear entry index of the root's first end-of-directory (0x00) entry — the
+# append point. FAT32 chain or FAT12/16 fixed region.
+fn fat_dir_end_index() {
+    var eps = 512 / 32;
+    var lin = 0;
+    if (fatfs_type == 32) {
+        var clus = fatfs_root_cluster;
+        var max_c = fatfs_count_of_clusters + 2;
+        var guard = 0;
+        while (clus >= 2) {
+            if (clus >= max_c) { return lin; }
+            var base = fatfs_first_sector_of_cluster(clus);
+            for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
+                if (fat_blk_read(base + s, &fatfs_dir_buf) != 0) { return lin; }
+                for (var e = 0; e < eps; e = e + 1) {
+                    if (load8(&fatfs_dir_buf + e * 32) == 0x00) { return lin; }
+                    lin = lin + 1;
+                }
+            }
+            clus = fat_next_cluster(clus);
+            guard = guard + 1;
+            if (guard > max_c) { return lin; }
+        }
+        return lin;
+    }
+    var root_sectors = (fatfs_root_entry_count * 32 + 511) / 512;
+    for (var s2 = 0; s2 < root_sectors; s2 = s2 + 1) {
+        if (fat_blk_read(fatfs_root_start + s2, &fatfs_dir_buf) != 0) { return lin; }
+        for (var e2 = 0; e2 < eps; e2 = e2 + 1) {
+            if (load8(&fatfs_dir_buf + e2 * 32) == 0x00) { return lin; }
+            lin = lin + 1;
+        }
+    }
+    return lin;
+}
+
+# Append a built dir-set (`total` 32-byte entries in `setbuf`) at the root's
+# end-of-directory, streaming entries CONTIGUOUSLY across sector/cluster
+# boundaries (per-entry RMW) — the correct placement for an LFN set that
+# straddles a boundary, and it extends the FAT32 root as the run requires.
+# FAT12/16 fixed root is bounded by RootEntryCount → -1 if it would overflow.
+# Returns 0/-1.
+fn fat_dir_append_set(setbuf, total) {
+    var eps = 512 / 32;
+    var lin = fat_dir_end_index();
+    if (fatfs_type != 32) {
+        if (lin + total > fatfs_root_entry_count) { return 0 - 1; }   # fixed root full
+    }
+    var j = 0;
+    while (j < total) {
+        var li = lin + j;
+        var sec = 0;
+        var slot = 0;
+        if (fatfs_type == 32) {
+            var clus = fat_root_cluster_for_index(li);
+            if (clus == 0) { return 0 - 1; }
+            var epc = eps * fatfs_sectors_per_cluster;
+            var within = li % epc;
+            sec = fatfs_first_sector_of_cluster(clus) + (within / eps);
+            slot = within % eps;
+        } else {
+            sec = fatfs_root_start + (li / eps);
+            slot = li % eps;
+        }
+        if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        var ep = &fatfs_dir_buf + slot * 32;
+        var b = 0;
+        while (b < 32) { store8(ep + b, load8(setbuf + j * 32 + b)); b = b + 1; }
+        if (fat_blk_write(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+        j = j + 1;
+    }
+    # ensure a 0x00 end-of-dir entry exists after the set (FAT32 extends if
+    # needed; FAT12/16 is within the fixed region per the check above).
+    if (fatfs_type == 32) {
+        if (fat_root_cluster_for_index(lin + total) == 0) { return 0 - 1; }
+    }
+    return 0;
+}
+
+# Build an LFN set into `setbuf` (K reverse-ordered 0x0F entries + the 8.3
+# alias entry with FstClus/FileSize = first/len). Returns total entries (K+1).
+# Shared by create + write-with-content.
+var fatfs_lfn_set_buf[88];                              # up to 21 x 32-B = 672 B
+
+fn fatfs_build_lfn_set(setbuf, name, namelen, alias, csum, K, first, len) {
+    var s = 0;
+    while (s < K) {
+        var seq = K - s;
+        var is_last = 0;
+        if (s == 0) { is_last = 1; }
+        fatfs_emit_lfn(setbuf + s * 32, seq, is_last, csum, name, namelen, seq - 1);
+        s = s + 1;
+    }
+    var ep83 = setbuf + K * 32;
+    var z = 0;
+    while (z < 32) { store8(ep83 + z, 0); z = z + 1; }
+    var j = 0;
+    while (j < 11) { store8(ep83 + j, load8(alias + j)); j = j + 1; }
+    store8(ep83 + 11, 0x20);                             # attr = ARCHIVE
+    store8(ep83 + 20, (first >> 16) & 0xFF); store8(ep83 + 21, (first >> 24) & 0xFF);
+    store8(ep83 + 26, first & 0xFF); store8(ep83 + 27, (first >> 8) & 0xFF);
+    store8(ep83 + 28, len & 0xFF); store8(ep83 + 29, (len >> 8) & 0xFF);
+    store8(ep83 + 30, (len >> 16) & 0xFF); store8(ep83 + 31, (len >> 24) & 0xFF);
+    return 0;
+}
+
+# Create an empty file with a long name: 8.3-fitting names fall through to
+# fatfs_create; otherwise generate a unique alias + append the LFN set
+# (K reverse-ordered LFN entries + the 8.3 alias) at the end-of-directory,
+# spanning + extending the root as needed (1.34.4). K = ceil(namelen/13).
+# FAT16/32 only. Returns 0/-1.
 fn fatfs_create_lfn(name, namelen) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (fatfs_name_fits_83(name, namelen) == 1) { return fatfs_create(name, namelen); }
@@ -1146,27 +1307,9 @@ fn fatfs_create_lfn(name, namelen) {
     var K = namelen / 13;
     if (namelen % 13 != 0) { K = K + 1; }
     var need = K + 1;
-    if (need > 16) { return 0 - 1; }
-    if (fatfs_find_free_run(need) != 0) { return 0 - 1; }
-    if (fat_blk_read(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
-    var slot = fatfs_slot_idx;
-    # K LFN entries, highest seq first (reverse order), then the 8.3 entry.
-    var s = 0;
-    while (s < K) {
-        var seq = K - s;
-        var is_last = 0;
-        if (s == 0) { is_last = 1; }
-        fatfs_emit_lfn(&fatfs_dir_buf + (slot + s) * 32, seq, is_last, csum, name, namelen, seq - 1);
-        s = s + 1;
-    }
-    var ep83 = &fatfs_dir_buf + (slot + K) * 32;
-    var z = 0;
-    while (z < 32) { store8(ep83 + z, 0); z = z + 1; }
-    var j = 0;
-    while (j < 11) { store8(ep83 + j, load8(&alias + j)); j = j + 1; }
-    store8(ep83 + 11, 0x20);               # attr = ARCHIVE (cluster 0, size 0)
-    if (fat_blk_write(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
-    return 0;
+    if (need > 21) { return 0 - 1; }                    # max set (255-char name)
+    fatfs_build_lfn_set(&fatfs_lfn_set_buf, name, namelen, &alias, csum, K, 0, 0);
+    return fat_dir_append_set(&fatfs_lfn_set_buf, need);
 }
 
 # === LFN write WITH content (1.34.3 bite 1) ===
@@ -1245,7 +1388,7 @@ fn fatfs_write_file_lfn(name, namelen, src, len) {
     var K = namelen / 13;
     if (namelen % 13 != 0) { K = K + 1; }
     var need = K + 1;
-    if (need > 16) { return 0 - 1; }
+    if (need > 21) { return 0 - 1; }                    # max set (255-char name)
 
     # 1. allocate + write the cluster chain (data before the dirent set).
     var first = 0;
@@ -1275,33 +1418,13 @@ fn fatfs_write_file_lfn(name, namelen, src, len) {
         }
     }
 
-    # 2. write the LFN set + the 8.3-alias entry (first cluster + size).
-    if (fatfs_find_free_run(need) != 0) { if (first >= 2) { fat_free_chain(first); } return 0 - 1; }
-    if (fat_blk_read(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
-    var slot = fatfs_slot_idx;
-    var s2 = 0;
-    while (s2 < K) {
-        var seq = K - s2;
-        var is_last = 0;
-        if (s2 == 0) { is_last = 1; }
-        fatfs_emit_lfn(&fatfs_dir_buf + (slot + s2) * 32, seq, is_last, csum, name, namelen, seq - 1);
-        s2 = s2 + 1;
+    # 2. build the LFN set (alias → first cluster + size) + append it at the
+    # end-of-directory, spanning + extending the root (1.34.4).
+    fatfs_build_lfn_set(&fatfs_lfn_set_buf, name, namelen, &alias, csum, K, first, len);
+    if (fat_dir_append_set(&fatfs_lfn_set_buf, need) != 0) {
+        if (first >= 2) { fat_free_chain(first); }
+        return 0 - 1;
     }
-    var ep83 = &fatfs_dir_buf + (slot + K) * 32;
-    var z = 0;
-    while (z < 32) { store8(ep83 + z, 0); z = z + 1; }
-    var j = 0;
-    while (j < 11) { store8(ep83 + j, load8(&alias + j)); j = j + 1; }
-    store8(ep83 + 11, 0x20);                            # attr = ARCHIVE
-    store8(ep83 + 20, (first >> 16) & 0xFF);            # FstClusHI
-    store8(ep83 + 21, (first >> 24) & 0xFF);
-    store8(ep83 + 26, first & 0xFF);                    # FstClusLO
-    store8(ep83 + 27, (first >> 8) & 0xFF);
-    store8(ep83 + 28, len & 0xFF);                      # FileSize
-    store8(ep83 + 29, (len >> 8) & 0xFF);
-    store8(ep83 + 30, (len >> 16) & 0xFF);
-    store8(ep83 + 31, (len >> 24) & 0xFF);
-    if (fat_blk_write(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
     fat_fsinfo_mark_unknown();
     return 0;
 }

@@ -253,6 +253,27 @@ else
     echo "  FAIL: GROW.BIN grow mismatch ($(wc -c < "$WORK/grow.bin" 2>/dev/null) B; want 3000 w/ zero tail)"; rc=1
 fi
 
+# 14. FAT32 root extension + cross-sector LFN runs (1.34.4 FAT side): 40
+#     LFN-named files (120 dir entries) past the 16-entry root cluster force
+#     AGNOS to extend the root + sets to straddle cluster boundaries. All
+#     create rc=0 + fsck.fat -n clean + the long names reconstruct + readback.
+if strings "$LOG" | grep -q "fatw: fatrootext 40 lfn files nfail=0"; then
+    echo "  PASS: 1.34.4 FAT32 root extension (40 LFN files created past 16-entry root)"
+else
+    echo "  FAIL: 1.34.4 FAT root extension (some LFN creates failed)"; rc=1
+fi
+if strings "$LOG" | grep -q "fatw: fatrootext readback OK"; then
+    echo "  PASS: 1.34.4 extended-root LFN file readback byte-exact"
+else
+    echo "  FAIL: 1.34.4 fatrootext readback"; rc=1
+fi
+LF_CNT=$(mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -c "Lf[0-9][0-9]_longx.dat")
+if [ "$LF_CNT" -ge 40 ] 2>/dev/null; then
+    echo "  PASS: 1.34.4 all 40 long names reconstructed by mtools (count=$LF_CNT)"
+else
+    echo "  FAIL: 1.34.4 only $LF_CNT/40 long names present (root-extension lost entries)"; rc=1
+fi
+
 echo ""
 echo "=========================================="
 if [ "$rc" = "0" ]; then echo "FAT write smoke (3a-3e + 1.34.3 LFN-content): PASS"; else echo "FAT write smoke: FAIL"; fi

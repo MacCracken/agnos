@@ -5,15 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — exFAT directory growth: root extension + cross-boundary dir-set append (the 1.34.4 cut, in progress) (`core/exfat.cyr`, `core/main.cyr`, `scripts/exfat-write-smoke.sh`)
+### Added — directory growth: root extension + cross-boundary dir-set append, exFAT + FAT (the 1.34.4 cut — code-complete, awaiting cycle-open VERSION bump + tag) (`core/exfat.cyr`, `core/fatfs.cyr`, `core/main.cyr`, `scripts/{exfat,fat}-write-smoke.sh`)
 
-Third cut of the 1.34.x write-completeness continuation. The exFAT writer previously placed each dir-set within a single sector and refused once the single-cluster root filled (the ceiling that forced 1.34.2's overwrite/truncate tests to run in place). This bite makes directory growth correct:
+Third cut of the 1.34.x write-completeness continuation. Both filesystems previously placed each dir-set within a single sector and refused once the root filled (the ceiling that forced 1.34.2's overwrite/truncate tests to run in place). Same fix on both: a **spanning append** — a set starts at the first `0x00` (end-of-directory) and streams contiguously across sector/cluster boundaries, extending the (FAT-chained) root by fresh zeroed clusters as needed. The previous one-sector-fit placement could strand a `0x00` before live entries → fsck "0x85/entry follows unused entry" (the exFAT smoke caught this). Build 783,240 → **788,696 B**.
+
+**exFAT** (`core/exfat.cyr`):
 
 - **`exfat_fat_set`** — write a 32-bit exFAT FAT entry (the root directory is FAT-chained, unlike NoFatChain data files).
 - **`exfat_root_cluster_for_index`** — map a linear root-dir entry index to its cluster, **extending** the root by fresh zeroed clusters (alloc from the bitmap + link prev→new→EOC in the FAT) as the index requires.
 - **`exfat_dir_append_set`** — append a fully-built set at the root's first `0x00` (end-of-directory), streaming the entries **contiguously across sector/cluster boundaries** (per-entry RMW) and extending the root as the run + trailing `0x00` need. This replaces the one-sector-fit placement, which could strand a `0x00` before live entries → `fsck.exfat` "0x85 follows unused entry" (caught by the smoke). `exfat_emit_set` now builds the set into a 640-B scratch (so the SetChecksum covers the whole set) then appends it.
 
-This unifies 1.34.4's two exFAT items — **root extension** and **cross-sector dir-set** — into one mechanism, and re-enables the deferred multi-new-file create path. **Verification** — build 783,240 → **785,736 B**; `exfat-write-smoke.sh` creates 10 new files (`EXN0.BIN`..`EXN9.BIN`, 30 dir entries) past the 16-entry root → `fsck.exfat -n` **clean, files 13** + extended-root file reads back byte-exact; all prior exFAT/FAT/ext2 gates green, `test.sh` 4/4. Remaining 1.34.4: FAT cross-sector LFN runs + FAT32 root extension (`fatfs_find_free_run`/`fatfs_find_free_root_slot` are one-sector, no-extend).
+This unifies exFAT's two 1.34.4 items — **root extension** and **cross-sector dir-set** — into one mechanism, and re-enables the deferred multi-new-file create path. Validated: `exfat-write-smoke.sh` creates 10 new files (`EXN0.BIN`..`EXN9.BIN`, 30 dir entries) past the 16-entry root → `fsck.exfat -n` **clean, files 13** + extended-root file reads back byte-exact.
+
+**FAT** (`core/fatfs.cyr`): the same mechanism — **`fat_root_extend`** (FAT32 only: alloc + link + zero a cluster), **`fat_root_cluster_for_index`** (extend the FAT32 root chain to a linear index), **`fat_dir_end_index`**, and **`fat_dir_append_set`** (append a built set at the first `0x00`, spanning sector/cluster boundaries + extending the FAT32 root; the FAT12/16 fixed root stays bounded by RootEntryCount). `fatfs_create_lfn` + `fatfs_write_file_lfn` now build the LFN set into a shared scratch (`fatfs_build_lfn_set`) then append it — so an LFN set straddling a sector lands correctly and the root grows past its pre-allocated clusters. `fatfs_find_free_root_slot` (8.3) extends the FAT32 root when 100%-full. Validated: `fat-write-smoke.sh` creates 40 LFN-named files (`LfNN_longx.dat`, 120 dir entries, distinct `~N` alias bases) past the 16-entry FAT32 root cluster → `fsck.fat -n` clean, all 40 long names reconstruct (count=40), extended-root readback byte-exact.
+
+**Verification** — build 783,240 → **788,696 B**; `test.sh` 4/4; both write smokes + ext2 green. The 1.34.4 cut is **feature-complete**. Deleted-slot reuse is deferred (directories grow append-only; deleted entries stay as fsck-valid holes).
 
 ## [1.34.3] — 2026-05-26 (**FAT LFN/truncate completeness** — second cut of the 1.34.x write-completeness continuation (roadmap row 21): LFN-with-content, LFN-name overwrite-match (the first LFN *read* in the driver), and grow-truncate. FAT-only — exFAT is UTF-16-native, no LFN. QEMU/`fsck.fat`-validated; no iron burn (final-bite only).)
 
