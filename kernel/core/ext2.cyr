@@ -1318,37 +1318,152 @@ fn ext2_extent_logical_to_physical(inode_buf, logical_block) {
     return 0;   # past all leaf entries → sparse / EOF
 }
 
-# --- ext4 extent ALLOCATION (write — 1.37.0) --------------------------
+# --- ext4 extent ALLOCATION (write — 1.37.0 depth-0, 1.37.1 depth-1) ---
 #
-# Depth-0 append: allocate a physical block for logical block `lblk` and map
-# it by either extending the last leaf extent (when this is its next logical
-# block AND the new physical block is contiguous) or inserting a new leaf
-# extent into the inline root (i_block[], <= 4 entries). The root lives in the
-# inode (inode_buf + 40), so the caller's ext2_put_inode persists it — no
-# separate tree-node write at depth 0. Returns the physical block#, or 0 for
-# ENOSPC / depth>0 / root-full / out-of-order (all deferred to 1.37.1+).
-# Multi-source: Linux ext4_ext_insert_extent, FreeBSD ext4_ext_*, e2fsprogs
+# Grows an EXTENTS_FL inode by allocating a block and mapping it via the extent
+# tree. Depth 0 = inline root (≤ 4 extents, in the inode); depth 1 = one inline
+# index entry → a single leaf BLOCK (≤ eh_max extents). When the inline root
+# fills, the tree grows depth 0→1 (ext2_extent_grow_indepth). Multi-leaf /
+# depth>1 splits are deferred (1.37.2). Multi-source: Linux
+# ext4_ext_insert_extent + ext4_ext_grow_indepth, FreeBSD ext4_ext_*, e2fsprogs
 # ext2fs_extent_insert. See agnosticos/docs/development/ext4-extent-alloc-prior-art.md.
-fn ext2_extent_append_block(inode_buf, lblk) {
+
+# Extent tree-block (leaf/index) checksum tail (metadata_csum only). Same seed
+# as the inode csum: crc32c(crc32c(crc32c(seed, ino), i_generation), node[0..tail))
+# stored at EXT4_EXTENT_TAIL_OFFSET = 12 + eh_max*12. The INLINE ROOT carries no
+# tail (the inode checksum covers it); only on-disk tree blocks need this.
+fn ext2_extent_node_csum_stamp(node_buf, inode_num, inode_buf) {
+    if (ext2_csum_on == 0) { return 0; }
+    var tail = 12 + ext2_load16_le(node_buf, 4) * 12;          # after eh_max entries
+    var ile[4]; ext2_store32_le(&ile, 0, inode_num);
+    var crc = ext2_crc32c(ext2_csum_seed, &ile, 4);
+    var gle[4]; ext2_store32_le(&gle, 0, ext2_load32_le(inode_buf, 100));   # i_generation
+    crc = ext2_crc32c(crc, &gle, 4);
+    crc = ext2_crc32c(crc, node_buf, tail);
+    ext2_store32_le(node_buf, tail, crc);
+    return 0;
+}
+
+# Grow depth 0 → 1: spill the inline root's extents into a freshly-allocated
+# leaf block, then rewrite the root as a single index entry pointing at it.
+# Returns the leaf block# (>0) or 0 on failure. Uses ext2_extent_buf as the
+# node scratch. Counts the leaf toward i_blocks (a tree block).
+fn ext2_extent_grow_indepth(inode_buf, inode_num) {
+    var hdr = inode_buf + 40;
+    var entries = ext2_load16_le(hdr, 2);
+    var last = hdr + 12 + (entries - 1) * 12;
+    var last_phys = ext2_load32_le(last, 8) | (ext2_load16_le(last, 6) << 32);
+    var leafblk = ext2_alloc_block(last_phys + 1);
+    if (leafblk <= 0) { return 0; }
+    var lmax = (ext2_blocksize - 12) / 12;
+    var z = 0;
+    while (z < ext2_blocksize) { store8(&ext2_extent_buf + z, 0); z = z + 1; }
+    ext2_store16_le(&ext2_extent_buf, 0, 0xF30A);              # eh_magic
+    ext2_store16_le(&ext2_extent_buf, 2, entries);            # eh_entries (spilled)
+    ext2_store16_le(&ext2_extent_buf, 4, lmax);               # eh_max
+    ext2_store16_le(&ext2_extent_buf, 6, 0);                  # eh_depth = 0 (leaf)
+    var c = 0;
+    while (c < entries * 12) { store8(&ext2_extent_buf + 12 + c, load8(hdr + 12 + c)); c = c + 1; }
+    ext2_extent_node_csum_stamp(&ext2_extent_buf, inode_num, inode_buf);
+    if (ext2_write_block(leafblk, &ext2_extent_buf) != 0) { ext2_free_block(leafblk); return 0; }
+    # Rewrite the inline root as depth 1 with one index entry → leafblk.
+    var first_block = ext2_load32_le(hdr + 12, 0);            # lowest logical
+    var k = 12;
+    while (k < 60) { store8(hdr + k, 0); k = k + 1; }
+    ext2_store16_le(hdr, 2, 1);                               # eh_entries = 1
+    ext2_store16_le(hdr, 4, 4);                               # eh_max (inline root)
+    ext2_store16_le(hdr, 6, 1);                               # eh_depth = 1
+    var ix = hdr + 12;
+    ext2_store32_le(ix, 0, first_block);                      # ei_block
+    ext2_store32_le(ix, 4, leafblk & 0xFFFFFFFF);             # ei_leaf_lo
+    ext2_store16_le(ix, 8, (leafblk >> 32) & 0xFFFF);         # ei_leaf_hi
+    ext2_store16_le(ix, 10, 0);                               # ei_unused
+    ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;        # leaf block counts toward i_blocks
+    return leafblk;
+}
+
+# Place an already-allocated block `nb` for logical `lblk` into a leaf BLOCK:
+# extend the last extent (contiguous) or insert a new one (if room). Restamps
+# the node csum + writes the leaf. Returns 1 on success, 0 if the leaf is full
+# (→ 1.37.2) / out-of-order / IO error (caller frees nb). Uses ext2_extent_buf.
+fn ext2_extent_leaf_place(leafblk, lblk, nb, inode_num, inode_buf) {
+    if (ext2_read_block(leafblk, &ext2_extent_buf) != 0) { return 0; }
+    if (ext2_extent_header_validate(&ext2_extent_buf) == 0) { return 0; }
+    var le = ext2_load16_le(&ext2_extent_buf, 2);
+    var lm = ext2_load16_le(&ext2_extent_buf, 4);
+    var placed = 0;
+    if (le == 0) {
+        var e0 = &ext2_extent_buf + 12;
+        ext2_store32_le(e0, 0, lblk); ext2_store16_le(e0, 4, 1);
+        ext2_store16_le(e0, 6, (nb >> 32) & 0xFFFF); ext2_store32_le(e0, 8, nb & 0xFFFFFFFF);
+        ext2_store16_le(&ext2_extent_buf, 2, 1);
+        placed = 1;
+    } else {
+        var lst = &ext2_extent_buf + 12 + (le - 1) * 12;
+        var lb = ext2_load32_le(lst, 0);
+        var ll = ext2_load16_le(lst, 4);
+        var lp = ext2_load32_le(lst, 8) | (ext2_load16_le(lst, 6) << 32);
+        if (lblk == lb + ll) { if (nb == lp + ll) { if (ll < 0x8000) {
+            ext2_store16_le(lst, 4, ll + 1);
+            placed = 1;
+        }}}
+        if (placed == 0) {
+            if (lblk < lb + ll) { return 0; }                # out-of-order — deferred
+            if (le >= lm) { return 0; }                       # leaf full → 1.37.2
+            var e = &ext2_extent_buf + 12 + le * 12;
+            ext2_store32_le(e, 0, lblk); ext2_store16_le(e, 4, 1);
+            ext2_store16_le(e, 6, (nb >> 32) & 0xFFFF); ext2_store32_le(e, 8, nb & 0xFFFFFFFF);
+            ext2_store16_le(&ext2_extent_buf, 2, le + 1);
+            placed = 1;
+        }
+    }
+    if (placed == 0) { return 0; }
+    ext2_extent_node_csum_stamp(&ext2_extent_buf, inode_num, inode_buf);
+    if (ext2_write_block(leafblk, &ext2_extent_buf) != 0) { return 0; }
+    return 1;
+}
+
+fn ext2_extent_append_block(inode_buf, lblk, inode_num) {
     var hdr = inode_buf + 40;
     if (ext2_extent_header_validate(hdr) == 0) { return 0; }
-    if (ext2_load16_le(hdr, 6) != 0) {                 # eh_depth
-        kprintln("ext2: extent depth>0 append deferred (1.37.1)", 45);
-        return 0;
+    var depth = ext2_load16_le(hdr, 6);
+    if (depth > 1) { kprintln("ext2: extent depth>1 append deferred (1.37.2)", 45); return 0; }
+
+    # --- depth 1: descend to the (rightmost) leaf, allocate, place ---
+    if (depth == 1) {
+        var nent = ext2_load16_le(hdr, 2);
+        if (nent == 0) { return 0; }
+        var ix = hdr + 12 + (nent - 1) * 12;                  # rightmost index entry
+        var leafblk = ext2_load32_le(ix, 4) | (ext2_load16_le(ix, 8) << 32);
+        if (leafblk == 0) { return 0; }
+        if (ext2_read_block(leafblk, &ext2_extent_buf) != 0) { return 0; }   # peek for goal
+        var goal = 0;
+        var le = ext2_load16_le(&ext2_extent_buf, 2);
+        if (le > 0) {
+            var lst = &ext2_extent_buf + 12 + (le - 1) * 12;
+            goal = (ext2_load32_le(lst, 8) | (ext2_load16_le(lst, 6) << 32)) + ext2_load16_le(lst, 4);
+        }
+        var nbd = ext2_alloc_block(goal);
+        if (nbd <= 0) { return 0; }
+        if (ext2_extent_leaf_place(leafblk, lblk, nbd, inode_num, inode_buf) == 0) {
+            ext2_free_block(nbd); return 0;
+        }
+        ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+        ext2_bmap_was_new = 1;
+        return nbd;
     }
+
+    # --- depth 0: inline root ---
     var entries = ext2_load16_le(hdr, 2);
     var max     = ext2_load16_le(hdr, 4);
 
-    # Empty tree → allocate + write the first extent.
-    if (entries == 0) {
+    if (entries == 0) {                                       # empty tree → first extent
         var nb0 = ext2_alloc_block(0);
         if (nb0 <= 0) { return 0; }
         var e0 = hdr + 12;
-        ext2_store32_le(e0, 0, lblk);                  # ee_block
-        ext2_store16_le(e0, 4, 1);                     # ee_len = 1 (initialized)
-        ext2_store16_le(e0, 6, (nb0 >> 32) & 0xFFFF);  # ee_start_hi
-        ext2_store32_le(e0, 8, nb0 & 0xFFFFFFFF);      # ee_start_lo
-        ext2_store16_le(hdr, 2, 1);                    # eh_entries = 1
+        ext2_store32_le(e0, 0, lblk); ext2_store16_le(e0, 4, 1);
+        ext2_store16_le(e0, 6, (nb0 >> 32) & 0xFFFF); ext2_store32_le(e0, 8, nb0 & 0xFFFFFFFF);
+        ext2_store16_le(hdr, 2, 1);
         ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
         ext2_bmap_was_new = 1;
         return nb0;
@@ -1358,60 +1473,52 @@ fn ext2_extent_append_block(inode_buf, lblk) {
     var last_block = ext2_load32_le(last, 0);
     var last_len   = ext2_load16_le(last, 4);
     var last_phys  = ext2_load32_le(last, 8) | (ext2_load16_le(last, 6) << 32);
+    if (lblk < last_block + last_len) { return 0; }           # out-of-order hole fill — deferred
 
-    # Depth-0 append-at-end only: a logical block before the last extent's end
-    # would need an in-sort-order insert (hole fill) — deferred.
-    if (lblk < last_block + last_len) { return 0; }
-
-    # Allocate, preferring the block right after the last extent (contiguity).
     var goal = last_phys + last_len;
     var nb = ext2_alloc_block(goal);
     if (nb <= 0) { return 0; }
 
-    # Fast path: extend the last extent if this is its next logical block, the
-    # new physical block is contiguous, and it stays initialized (< 32768).
-    if (lblk == last_block + last_len) {
-        if (nb == last_phys + last_len) {
-            if (last_len < 0x8000) {
-                ext2_store16_le(last, 4, last_len + 1);
-                ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
-                ext2_bmap_was_new = 1;
-                return nb;
-            }
-        }
-    }
+    # Extend the last extent (no new entry — works even at entries==max).
+    if (lblk == last_block + last_len) { if (nb == last_phys + last_len) { if (last_len < 0x8000) {
+        ext2_store16_le(last, 4, last_len + 1);
+        ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+        ext2_bmap_was_new = 1;
+        return nb;
+    }}}
 
-    # Else insert a new leaf extent if the inline root has room.
+    # New entry needed: insert into the inline root if it has room.
     if (entries < max) {
         var e = hdr + 12 + entries * 12;
-        ext2_store32_le(e, 0, lblk);
-        ext2_store16_le(e, 4, 1);
-        ext2_store16_le(e, 6, (nb >> 32) & 0xFFFF);
-        ext2_store32_le(e, 8, nb & 0xFFFFFFFF);
+        ext2_store32_le(e, 0, lblk); ext2_store16_le(e, 4, 1);
+        ext2_store16_le(e, 6, (nb >> 32) & 0xFFFF); ext2_store32_le(e, 8, nb & 0xFFFFFFFF);
         ext2_store16_le(hdr, 2, entries + 1);
         ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
         ext2_bmap_was_new = 1;
         return nb;
     }
 
-    # Inline root full → split deferred (1.37.1). Return the block so the
-    # partial-write return doesn't leak it.
-    ext2_free_block(nb);
-    kprintln("ext2: extent root full -- split deferred (1.37.1)", 49);
-    return 0;
+    # Inline root full → grow to depth 1, then place nb into the new leaf (1.37.1).
+    var leafblk = ext2_extent_grow_indepth(inode_buf, inode_num);
+    if (leafblk <= 0) { ext2_free_block(nb); return 0; }
+    if (ext2_extent_leaf_place(leafblk, lblk, nb, inode_num, inode_buf) == 0) {
+        ext2_free_block(nb); return 0;
+    }
+    ext2_bmap_alloc_count = ext2_bmap_alloc_count + 1;
+    ext2_bmap_was_new = 1;
+    return nb;
 }
 
-# Resolve-or-append for an EXTENTS_FL inode: return the existing physical
-# block for `lblk` (overwrite in place — works at any depth via the reader)
-# or append a new one (depth-0). Mirrors ext2_bmap_alloc's was_new contract
-# so ext2_write_at's i_blocks accounting is correct.
-fn ext2_extent_bmap_alloc(inode_buf, lblk) {
+# Resolve-or-append for an EXTENTS_FL inode: return the existing physical block
+# for `lblk` (overwrite in place — works at any depth via the reader) or append
+# a new one (depth 0/1). Mirrors ext2_bmap_alloc's was_new contract.
+fn ext2_extent_bmap_alloc(inode_buf, lblk, inode_num) {
     ext2_bmap_was_new = 0;
     if (ext2_write_ok == 0) { return 0; }
     var existing = ext2_extent_logical_to_physical(inode_buf, lblk);
     if (existing > 0) { return existing; }     # already mapped → overwrite in place
     if (existing < 0) { return 0; }            # tree error
-    return ext2_extent_append_block(inode_buf, lblk);   # sparse/EOF → append
+    return ext2_extent_append_block(inode_buf, lblk, inode_num);   # sparse/EOF → append
 }
 
 # --- Logical → physical block mapping (Phase 2 indirect + Phase 4 extents) --
@@ -2606,7 +2713,7 @@ fn ext2_write_at(inode_num, offset, src, len) {
         if (chunk > rem) { chunk = rem; }
 
         var phys = 0;
-        if (is_extent == 1) { phys = ext2_extent_bmap_alloc(&ext2_inode_buf, lblk); }
+        if (is_extent == 1) { phys = ext2_extent_bmap_alloc(&ext2_inode_buf, lblk, inode_num); }
         else                { phys = ext2_bmap_alloc(&ext2_inode_buf, lblk); }
         if (phys <= 0) { break; }                    # ENOSPC / depth cap — return partial
         var was_new = ext2_bmap_was_new;
@@ -3274,17 +3381,29 @@ fn ext2_extent_write_selftest() {
     kprint("ext-ext: ino=", 13); kprint_num(ino);
     kprint(" extent size0=", 14); kprint_num(ext2_inode_size_lo(&ext2_inode_buf)); kprintln("", 0);
 
-    # Append 64 bytes of 0xAB at logical block 1 (offset = blocksize) — past the
-    # seed's block 0, so this forces a new-block alloc through the extent path.
-    var pat[64];                                   # function-local var[N] = N bytes
+    # Append 64 bytes of 0xAB at SPARSE logical blocks 2,4,6,8,10. Each logical
+    # gap forces a NEW extent (no contiguous-extend), so the 4-entry inline root
+    # fills at block 6, and block 8 triggers ext2_extent_grow_indepth → depth 1
+    # (1.37.1); the rest land in the new leaf. Exercises depth-0 insert, the
+    # grow, and depth-1 leaf insert (+ the metadata_csum leaf-node checksum).
+    var pat[64];
     var i = 0;
     while (i < 64) { store8(&pat + i, 0xAB); i = i + 1; }
-    var w = ext2_write_at(ino, ext2_blocksize, &pat, 64);
-    if (w != 64) {
-        kprint("ext-ext: write_at returned ", 27); kprint_num(w); kprintln(" (want 64) FAIL", 15);
-        return 0 - 1;
+    var lb = 2;
+    while (lb <= 10) {
+        var w = ext2_write_at(ino, lb * ext2_blocksize, &pat, 64);
+        if (w != 64) {
+            kprint("ext-ext: write_at lblk=", 23); kprint_num(lb);
+            kprint(" returned ", 10); kprint_num(w); kprintln(" FAIL", 5);
+            return 0 - 1;
+        }
+        lb = lb + 2;
     }
     if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
-    kprint("ext-ext: append PASS new size=", 30); kprint_num(ext2_inode_size_lo(&ext2_inode_buf)); kprintln("", 0);
+    var depth = ext2_load16_le(&ext2_inode_buf + 40, 6);
+    kprint("ext-ext: final depth=", 21); kprint_num(depth);
+    kprint(" size=", 6); kprint_num(ext2_inode_size_lo(&ext2_inode_buf)); kprintln("", 0);
+    if (depth != 1) { kprintln("ext-ext: expected depth 1 after grow FAIL", 41); return 0 - 1; }
+    kprintln("ext-ext: append PASS", 20);
     return 0;
 }

@@ -4,12 +4,14 @@
 # Builds a default-profile ext4 image (metadata_csum,64bit,extent) with a seed
 # file `/extseed.dat` — which `mkfs.ext4 -d` lays down EXTENTS_FL (depth-0
 # inline root). Boots agnos with EXT2_EXTENT_WRITE_SELFTEST=1, which appends 64
-# bytes of 0xAB past EOF (logical block 1) via ext2_write_at → the new
-# ext2_extent_append_block path. Then HOST-verifies the mutated partition:
-#   1. serial gate: "ext-ext: append PASS"
-#   2. `e2fsck -fn` clean on the partition slice (the load-bearing gate — proves
-#      the extent-root edit + inode-checksum recompute are correct)
-#   3. /extseed.dat grew to (4096 + 64) and bytes at offset 4096 are 0xAB
+# bytes of 0xAB at SPARSE logical blocks 2,4,6,8,10 — each gap forces a new
+# extent, so the 4-entry inline root fills and the tree GROWS to depth 1
+# (ext2_extent_grow_indepth + a checksummed leaf block; 1.37.1). Then
+# HOST-verifies the mutated partition:
+#   1. serial gate: "ext-ext: append PASS" (selftest also asserts final depth==1)
+#   2. `e2fsck -fn` clean (the load-bearing gate — proves the depth-0→1 grow, the
+#      leaf-node checksum, and the inode-checksum recompute are all correct)
+#   3. /extseed.dat grew to 41024 B and bytes at offset 8192 (block 2) are 0xAB
 #
 # Requires: qemu-system-x86_64, OVMF, parted, sgdisk, mtools, mkfs.ext4,
 #           e2fsck, debugfs, dd, strings, xxd. gnoboot at ../gnoboot/build/.
@@ -93,16 +95,24 @@ else
     echo "  FAIL: e2fsck -fn reported errors (see $LOGS/e2fsck.log):"; sed 's/^/    /' "$LOGS/e2fsck.log"; rc=1
 fi
 
+# sparse writes at logical blocks 2,4,6,8,10 (offsets 8192..40960, 64 B each) →
+# final size = 10*4096 + 64 = 41024; logical block 2 (offset 8192) holds 0xAB.
 debugfs -R "dump /extseed.dat $WORK/extseed-post.dat" "$WORK/part-post.img" >/dev/null 2>&1
 if [ -f "$WORK/extseed-post.dat" ]; then
     SZ=$(stat -c %s "$WORK/extseed-post.dat")
-    if [ "$SZ" -eq 4160 ]; then echo "  PASS: /extseed.dat grew to 4160 B (4096 + 64)"
-    else echo "  FAIL: /extseed.dat size $SZ (expected 4160)"; rc=1; fi
-    BYTES=$(xxd -s 4096 -l 4 -p "$WORK/extseed-post.dat")
-    if [ "$BYTES" = "abababab" ]; then echo "  PASS: appended bytes at offset 4096 = 0xAB"
-    else echo "  FAIL: bytes at 4096 = 0x$BYTES (expected abababab)"; rc=1; fi
+    if [ "$SZ" -eq 41024 ]; then echo "  PASS: /extseed.dat grew to 41024 B (sparse, last write at block 10)"
+    else echo "  FAIL: /extseed.dat size $SZ (expected 41024)"; rc=1; fi
+    BYTES=$(xxd -s 8192 -l 4 -p "$WORK/extseed-post.dat")
+    if [ "$BYTES" = "abababab" ]; then echo "  PASS: appended bytes at offset 8192 (logical block 2) = 0xAB"
+    else echo "  FAIL: bytes at 8192 = 0x$BYTES (expected abababab)"; rc=1; fi
 else
     echo "  FAIL: could not dump /extseed.dat from the image"; rc=1
+fi
+# Confirm the tree grew to depth 1 (debugfs prints the extent tree for the inode).
+if debugfs -R "stat /extseed.dat" "$WORK/part-post.img" 2>/dev/null | grep -qiE 'depth|interior'; then
+    echo "  PASS: extent tree shows interior/depth node (grew to depth 1)"
+else
+    echo "  INFO: debugfs stat didn't surface a depth marker (selftest asserted depth==1)"
 fi
 
 echo ""
