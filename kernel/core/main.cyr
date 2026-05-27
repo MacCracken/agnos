@@ -1295,6 +1295,27 @@ if (vnet_active != 0 || nic_ready() != 0) {
         kprintln("dns: parse FAIL", 15);
     }
 
+    # Cache + TTL self-test (1.35.6). dns_parse_answer above set dns_last_ttl
+    # from the hand-built answer (ttl=256). Then exercise the positive cache:
+    # put→find hit, un-cached miss, and the not-expired gate. Runs BEFORE the
+    # live lookup so it doesn't observe example.com's insertion.
+    var cok = 1;
+    if (dns_last_ttl != 256) { cok = 0; }                       # TTL extraction
+    dns_cache_put("cachetst", 8, ip4(5, 6, 7, 8), 100);
+    var cf = dns_cache_find("cachetst", 8);
+    if (cf < 0) { cok = 0; }
+    else { if (load64(&dns_cache_ip + cf * 8) != ip4(5, 6, 7, 8)) { cok = 0; } }
+    if (dns_cache_find("notcached", 9) >= 0) { cok = 0; }       # miss: never inserted
+    store64(&dns_cache_ip + 7 * 8, ip4(9, 9, 9, 9));            # hand-place an expired entry
+    store64(&dns_cache_exp + 7 * 8, 0);                         # exp in the past
+    store64(&dns_cache_len + 7 * 8, 3);
+    store8(&dns_cache_names + 7 * 64 + 0, 101);                 # "exp"
+    store8(&dns_cache_names + 7 * 64 + 1, 120);
+    store8(&dns_cache_names + 7 * 64 + 2, 112);
+    if (dns_cache_find("exp", 3) >= 0) { cok = 0; }             # miss: expired
+    if (cok == 1) { kprintln("dns: cache PASS", 15); }
+    if (cok == 0) { kprintln("dns: cache FAIL", 15); }
+
     var live = 0;
     if (dns_resolve("example.com", 11, &live) == 0) {
         kprint("dns: live=", 10); dhcp_print_ip(live); kprintln("", 0);

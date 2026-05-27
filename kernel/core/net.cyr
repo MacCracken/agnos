@@ -664,6 +664,16 @@ var DNS_CLIENT_PORT = 0xC353;   # 50003 — fixed ephemeral source port for the 
 var dns_listener = 0;           # listener id once bound (lazy)
 var dns_listener_bound = 0;     # 0 until the first udp_bind(DNS_CLIENT_PORT)
 var dns_query_id = 0x1535;      # incrementing transaction id
+var dns_last_ttl = 0;           # TTL (seconds) of the A record from the last parse
+
+# DNS positive cache (1.35.6) — 8 slots, TTL-respecting, evict-soonest. lwIP
+# dns.c-style small fixed table. Parallel module-global arrays (each var X[N] at
+# module scope = N u64s). dns_cache_ip slot 0-value = empty. Names <= 63 bytes
+# cached (slot i name at byte offset i*64 in the 512-byte name region).
+var dns_cache_ip[8];            # A-record IP (network-order int); 0 = empty slot
+var dns_cache_exp[8];           # expiry in timer_ticks (100 Hz)
+var dns_cache_len[8];           # cached name length
+var dns_cache_names[64];        # 8 slots * 64 bytes = 512 bytes of name storage
 
 # Read a big-endian u16 at ptr.
 fn dns_u16(ptr) {
@@ -763,6 +773,7 @@ fn dns_parse_answer(msg, len, want_id, out_ip) {
         if (p + rdlen > len) { return 0 - 1; }
         if (rtype == 1) { if (rclass == 1) { if (rdlen == 4) {
                     store64(out_ip, dhcp_load_u32_be(msg + p));   # first A record wins
+                    dns_last_ttl = dhcp_load_u32_be(msg + p - 6); # TTL sits TYPE+CLASS+TTL before RDATA
                     return 0;
                 }}}
         p = p + rdlen;                              # skip CNAME / AAAA / etc.
@@ -770,9 +781,63 @@ fn dns_parse_answer(msg, len, want_id, out_ip) {
     return 0 - 1;
 }
 
+# Cache lookup: return the slot index of a live (unexpired) exact-name match,
+# or 0-1 on miss. Names > 63 bytes are never cached.
+fn dns_cache_find(host, host_len) {
+    if (host_len > 63) { return 0 - 1; }
+    for (var i = 0; i < 8; i = i + 1) {
+        if (load64(&dns_cache_ip + i * 8) != 0) {              # occupied
+            if (load64(&dns_cache_exp + i * 8) > timer_ticks) { # not expired
+                if (load64(&dns_cache_len + i * 8) == host_len) {
+                    var eq = 1;
+                    for (var j = 0; j < host_len; j = j + 1) {
+                        if (load8(&dns_cache_names + i * 64 + j) != load8(host + j)) { eq = 0; j = host_len; }
+                    }
+                    if (eq == 1) { return i; }
+                }
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+# Cache insert: clamp TTL to [10 s, 3600 s], use an empty/expired slot or evict
+# the soonest-to-expire. No-op for ip 0 or names > 63 bytes.
+fn dns_cache_put(host, host_len, ip, ttl_secs) {
+    if (ip == 0) { return 0; }
+    if (host_len > 63) { return 0; }
+    var ttl = ttl_secs;
+    if (ttl < 10) { ttl = 10; }
+    if (ttl > 3600) { ttl = 3600; }
+    var slot = 0 - 1;
+    for (var i = 0; i < 8; i = i + 1) {
+        if (load64(&dns_cache_ip + i * 8) == 0) { slot = i; i = 8; }              # empty
+        else { if (load64(&dns_cache_exp + i * 8) <= timer_ticks) { slot = i; i = 8; } }  # expired
+    }
+    if (slot < 0) {                                          # full — evict soonest-to-expire
+        slot = 0;
+        var best = load64(&dns_cache_exp);
+        for (var i = 1; i < 8; i = i + 1) {
+            var e = load64(&dns_cache_exp + i * 8);
+            if (e < best) { best = e; slot = i; }
+        }
+    }
+    store64(&dns_cache_ip + slot * 8, ip);
+    store64(&dns_cache_exp + slot * 8, timer_ticks + ttl * 100);
+    store64(&dns_cache_len + slot * 8, host_len);
+    for (var j = 0; j < host_len; j = j + 1) { store8(&dns_cache_names + slot * 64 + j, load8(host + j)); }
+    return 0;
+}
+
 # Resolve a hostname (host/host_len) to an IPv4, stored big-endian at out_ip.
 # Returns 0 on success, 0-1 on failure (no NIC / no resolver / timeout / NXDOMAIN).
 fn dns_resolve(host, host_len, out_ip) {
+    # Cache first — a hit needs no NIC and returns instantly.
+    var ci = dns_cache_find(host, host_len);
+    if (ci >= 0) {
+        store64(out_ip, load64(&dns_cache_ip + ci * 8));
+        return 0;
+    }
     if (nic_ready() == 0) { return 0 - 1; }
 
     var server = net_dns_server;
@@ -809,6 +874,7 @@ fn dns_resolve(host, host_len, out_ip) {
         var n = udp_recv_from(dns_listener, &rbuf, 512, 0, 0);
         if (n > 0) {
             if (dns_parse_answer(&rbuf, n, id, out_ip) == 0) {
+                dns_cache_put(host, host_len, load64(out_ip), dns_last_ttl);  # cache the answer (TTL-clamped)
                 result = 0;
                 ti = 800;   # break
             }

@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.35.6] — 2026-05-27 (**DNS cache** — the resolver's robustness item: an 8-entry, TTL-respecting positive cache so repeated lookups (`ping`/`ntp`/the eventual `ark`-fetch to one host) don't re-query. Closes the last of the 1.35.x catchup tidbits. Audit: agnosticos [`dns-stub-resolver-prior-art.md` § 9](https://github.com/MacCracken/agnosticos/blob/main/docs/development/dns-stub-resolver-prior-art.md).)
+
+### Added — DNS positive cache (TTL-aware)
+
+The 1.35.0 stub re-queried the nameserver on every `dns`/`ping`/`ntp <host>` — functionally fine but wasteful over a link we'd rather not hammer, and a drag on the eventual `ark` fetch (many requests to one host). A small lwIP `dns.c`-style cache fixes it. (The other two items often lumped under "DNS robustness" were already shipped at 1.35.0: `dns_parse_answer` already walks all answer RRs and skips CNAME/AAAA to take the first valid A — multi-A / CNAME-chain — and `dns_resolve` already does one midpoint retransmit. So this cut is the cache + the TTL the parser had been discarding.)
+
+- **`net.cyr`** — `dns_cache_find` / `dns_cache_put`: 8 slots (parallel module-global arrays + a 512-byte name region), linear scan, exact-name match, not-expired gate, evict-soonest-to-expire on a full insert. `dns_parse_answer` now records the matched A record's TTL into `dns_last_ttl` (it sits `TYPE+CLASS+TTL` = 6 bytes before the RDATA, which the answer walk had been stepping over). `dns_resolve` checks the cache first (instant return, no NIC needed) and inserts on a successful live lookup. TTL is **clamped to [10 s, 3600 s]** — the floor defends against 0-TTL thrash, the ceiling means even a misbehaving authoritative TTL self-heals within an hour (the kernel has no cache-flush verb yet). Positive-only (no NXDOMAIN pinning); names > 63 bytes resolve but aren't cached. No locking — relies on the same single-core invariant as the rest of the net stack (the future SMP arc unwinds it).
+- **Validation** — `dns-smoke.sh` extended to 3 hermetic gates: the existing `dns: parse PASS`, plus new `dns: cache PASS` — TTL extraction (the hand-built answer carries `ttl=256`), a put→find hit returning the right IP, an un-cached miss, and the expired-entry gate (a hand-placed past-expiry slot must miss). Live `example.com` lookup also succeeded under SLIRP. `test.sh` 4/4, `check.sh` 11/11. Production build 825,632 → **828,112 B**.
+- **Still deferred** (audit § 9): negative caching, multi-nameserver fallback (DHCP opt 6 can list several; only the first is captured), and a cache-flush / `dig`-style surface — when a consumer asks.
+
 ## [1.35.5] — 2026-05-27 (**RTC boot clock** — the local companion to 1.35.2's NTP. The kernel now reads the CMOS RTC at boot and seeds a wall clock *without a network*, so `ntp_now()`/`date` work from the first second of uptime; NTP refines/overrides it when a server is reachable. Opened with a cyrius toolchain-pin move (6.0.1 → 6.0.3). Audit: agnosticos [`rtc-boot-clock-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/rtc-boot-clock-prior-art.md).)
 
 ### Added — RTC boot clock (CMOS read + `civil_to_unix`)

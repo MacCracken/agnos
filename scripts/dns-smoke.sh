@@ -6,12 +6,15 @@
 # the serial log. SLIRP supplies a hermetic environment: DHCP hands out
 # resolver 10.0.2.3 (DHCP option 6) and forwards DNS to the host resolver.
 #
-# Gates (both hermetic — no internet required):
+# Gates (all hermetic — no internet required):
 #   1. "dns: parse PASS"      — the hand-built RFC 1035 response (answer NAME
 #                               is a 0xC0 compression pointer) parsed back to
 #                               93.184.216.34. Proves dns_skip_name + the
 #                               answer walk. LOAD-BEARING.
-#   2. "dns: resolver=10.0.2.3" — DHCP option 6 captured (bite 1). Proves the
+#   2. "dns: cache PASS"      — TTL extraction (answer ttl=256) + the positive
+#                               cache (put/find hit, un-cached miss, expiry
+#                               gate). LOAD-BEARING (1.35.6).
+#   3. "dns: resolver=10.0.2.3" — DHCP option 6 captured (bite 1). Proves the
 #                               opt-6 capture end-to-end through QEMU SLIRP.
 #
 # Informational (internet-dependent, NOT required to pass):
@@ -124,6 +127,14 @@ if grep -q "dns: parse PASS" "$LOG"; then
     pass=$((pass + 1))
 else
     echo "FAIL: 'dns: parse PASS' not found — parse/skip-name regression"
+    fail=$((fail + 1))
+fi
+
+if grep -q "dns: cache PASS" "$LOG"; then
+    echo "PASS: TTL extraction + positive cache (put/find hit, miss, expiry gate)"
+    pass=$((pass + 1))
+else
+    echo "FAIL: 'dns: cache PASS' not found — TTL/cache regression (1.35.6)"
     fail=$((fail + 1))
 fi
 
