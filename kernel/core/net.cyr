@@ -1156,6 +1156,22 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
     return udp_data_len;
 }
 
+# Hardening (1.35.7, arc-close pass 1): an IPv4 header's total-length field is
+# attacker-controlled; never let a handler read past the bytes actually received.
+# Given the claimed total length, the header length, and bytes available
+# (frame_len - 14), return the safe payload length, or 0-1 if the header is
+# malformed or the claimed length doesn't fit the received frame. Convergent with
+# Linux ip_rcv / lwIP ip4_input / *BSD ip_input. See
+# agnosticos/docs/development/arc-close-hardening-1-35.md.
+fn ip_safe_payload_len(ip_total, ip_ihl, avail) {
+    if (ip_ihl < 20) { return 0 - 1; }            # IPv4 header is >= 20 bytes
+    if (ip_total < ip_ihl) { return 0 - 1; }      # total can't be < its own header
+    var total = ip_total;
+    if (total > avail) { total = avail; }          # clamp to actually-received bytes
+    if (total < ip_ihl) { return 0 - 1; }          # truncated frame — header doesn't fit
+    return total - ip_ihl;
+}
+
 fn net_poll() {
     if (nic_ready() == 0) { return 0; }
     # B2: drive TCP retransmits before draining RX (cheap ≤8-conn scan; only
@@ -1189,8 +1205,10 @@ fn net_poll() {
                 var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
                 var ip_proto = load8(ip_hdr + 9);
                 var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
-                if (ip_total >= ip_ihl) {
-                    var ip_payload_len = ip_total - ip_ihl;
+                # Clamp/validate the claimed IP length against what we actually
+                # received before any handler trusts it (1.35.7 hardening).
+                var ip_payload_len = ip_safe_payload_len(ip_total, ip_ihl, pkt_len - 14);
+                if (ip_payload_len >= 0) {
                     if (ip_proto == 1) {
                         net_handle_icmp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
                     }

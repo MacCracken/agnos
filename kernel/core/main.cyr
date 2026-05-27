@@ -1577,6 +1577,25 @@ if (vnet_active != 0 || nic_ready() != 0) {
 }
 #endif
 
+#ifdef HARDENING_SELFTEST
+# Arc-close hardening self-test (1.35.7 pass 1). Hermetic table over
+# ip_safe_payload_len — the ingress clamp that stops a forged IPv4 total-length
+# from over-reading net_rx_pkt across the ICMP/UDP/TCP handlers.
+{
+    var ok = 1;
+    if (ip_safe_payload_len(84, 20, 84) != 64)         { ok = 0; }  # valid: total=84 ihl=20 -> 64
+    if (ip_safe_payload_len(40, 20, 40) != 20)         { ok = 0; }  # exact-fit boundary
+    if (ip_safe_payload_len(28, 20, 60) != 8)          { ok = 0; }  # padded frame (total < avail) untouched
+    if (ip_safe_payload_len(65535, 20, 60) != 40)      { ok = 0; }  # forged total > avail -> clamp to 60 -> 40
+    if (ip_safe_payload_len(84, 16, 84) != (0 - 1))    { ok = 0; }  # ihl < 20 -> reject
+    if (ip_safe_payload_len(84, 0, 84) != (0 - 1))     { ok = 0; }  # ihl 0 -> reject
+    if (ip_safe_payload_len(10, 20, 84) != (0 - 1))    { ok = 0; }  # total < ihl -> reject
+    if (ip_safe_payload_len(1000, 60, 40) != (0 - 1))  { ok = 0; }  # truncated: ihl 60 claimed, 40 received
+    if (ok == 1) { kprintln("hardening: ip-clamp PASS", 24); }
+    if (ok == 0) { kprintln("hardening: ip-clamp FAIL", 24); }
+}
+#endif
+
 #ifdef TCP_LISTEN_SMOKE
 # TCP server-side smoke (1.32.0 bite A). Validates that:
 #   - tcp_listen(port) allocates a LISTEN slot

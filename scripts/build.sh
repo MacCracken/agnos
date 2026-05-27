@@ -132,6 +132,9 @@ else
     #   RTC_SELFTEST=1   — boot-time RTC boot-clock self-test (1.35.5): hermetic
     #                     civil_to_unix anchors + BCD decode + a live-bounded
     #                     CMOS read sanity. Gated by scripts/rtc-smoke.sh.
+    #   HARDENING_SELFTEST=1 — arc-close hardening self-test (1.35.7): hermetic
+    #                     ip_safe_payload_len ingress-clamp table. Gated by
+    #                     scripts/hardening-smoke.sh.
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
@@ -154,6 +157,7 @@ else
         [ -n "$NTP_SELFTEST" ]   && echo '#define NTP_SELFTEST'
         [ -n "$MMAP_SELFTEST" ]  && echo '#define MMAP_SELFTEST'
         [ -n "$RTC_SELFTEST" ]   && echo '#define RTC_SELFTEST'
+        [ -n "$HARDENING_SELFTEST" ] && echo '#define HARDENING_SELFTEST'
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")
