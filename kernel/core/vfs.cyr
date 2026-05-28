@@ -56,6 +56,23 @@ fn vfs_create_memfile(data, size) {
     return idx;
 }
 
+# === Generic read-dispatch (1.39.1 — VFS generic-write lift, bite 1) ===
+# ext2 is opened path-aware by the caller (the shell owns CWD scoping); this
+# dispatches the remaining read backends by bare name in priority order —
+# FAT -> exFAT -> initrd — so the shell read verbs reach FAT/exFAT volumes
+# for the first time (previously ext2-or-initrd only). Each backend
+# self-guards on its own mount flag (returns -1 if not mounted) and yields a
+# ready VFS fd (FAT/exFAT via vfs_create_memfile; initrd via its own
+# memfile) or -1 on miss. First hit wins. This is the read seam the write
+# bites (1.39.4+) extend; the dispatch lives here, not scattered in shell.
+fn vfs_open_secondary(name, namelen) {
+    var fd = fatfs_open(name, namelen);
+    if (fd >= 0) { return fd; }
+    fd = exfat_open(name, namelen);
+    if (fd >= 0) { return fd; }
+    return initrd_open(name, namelen);
+}
+
 fn vfs_read_signalfd(base, buf) {
     var sigmask = load64(base + 24);
     var pending = load64(&proc_signals + proc_current * 8);

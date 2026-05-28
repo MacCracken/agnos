@@ -351,7 +351,11 @@ fn sh_cmd_cat(arg, arglen) {
             }
         }
     }
-    if (fd < 0) { fd = initrd_open(arg, arglen); }
+    # ext2 missed (or not mounted): fall through to the generic secondary
+    # read-dispatch — FAT -> exFAT -> initrd (1.39.1 VFS lift bite 1). This
+    # is what lets `cat` reach a FAT/exFAT volume's root files for the first
+    # time; previously only ext2 + initrd were reachable.
+    if (fd < 0) { fd = vfs_open_secondary(arg, arglen); }
     if (fd < 0) { kprintln("file not found", 14); return 0; }
     var cbuf[64];
     var n = vfs_read(fd, &cbuf, 512);

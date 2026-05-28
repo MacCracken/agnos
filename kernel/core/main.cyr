@@ -492,6 +492,13 @@ if (fatfs_active == 1) {
     } else {
         kprintln("fatr: FATTEST.BIN not found", 27);
     }
+    # 1.39.1 VFS-lift bite 1: drive the real shell `cat` verb against a FAT
+    # file. ext2 is unmounted on this volume, so sh_cmd_cat skips its ext2
+    # arm and falls through to vfs_open_secondary -> fatfs_open. The file's
+    # content ("VFS-CAT-FAT-OK") printing below proves the shell read path
+    # now reaches FAT (previously ext2-or-initrd only). fat-smoke.sh gates it.
+    kprintln("vfscat: shell cat over FAT ->", 29);
+    sh_exec("cat CATTEST.TXT", 15);
 }
 #endif
 

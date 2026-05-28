@@ -71,6 +71,11 @@ mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 mcopy -i "$IMG"@@1048576 "$WORK/FATTEST.BIN" ::FATTEST.BIN
+# 1.39.1 VFS-lift bite 1: a small text file the FATFS_SELFTEST drives the
+# shell `cat` verb against (via sh_exec → sh_cmd_cat → vfs_open_secondary →
+# fatfs_open). Proves the shell read verb reaches a FAT volume end-to-end.
+printf 'VFS-CAT-FAT-OK\n' > "$WORK/CATTEST.TXT"
+mcopy -i "$IMG"@@1048576 "$WORK/CATTEST.TXT" ::CATTEST.TXT
 
 echo "Booting FATFS_SELFTEST kernel (NVMe + GPT, FAT32 ESP)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
@@ -98,6 +103,14 @@ if strings "$LOG" | grep -q "fatr: chain-read OK"; then
     echo "  PASS: multi-cluster chain read byte-exact (read past first cluster)"
 else
     echo "  FAIL: chain read (no 'fatr: chain-read OK' in log)"; rc=1
+fi
+# 1.39.1 VFS-lift bite 1: the shell `cat` verb reaches FAT (sh_cmd_cat →
+# vfs_open_secondary → fatfs_open). The kernel ran `cat CATTEST.TXT`; its
+# content must appear in the log.
+if strings "$LOG" | grep -q "VFS-CAT-FAT-OK"; then
+    echo "  PASS: shell 'cat' reaches FAT volume (vfs_open_secondary dispatch)"
+else
+    echo "  FAIL: shell cat over FAT (no 'VFS-CAT-FAT-OK' in log)"; rc=1
 fi
 
 echo ""

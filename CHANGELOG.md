@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.39.1] — 2026-05-28 (**VFS generic-write lift — bite 1: `cat` reaches FAT/exFAT.** The 1.39.x arc's first engineering rung. Until now every shell read/write verb was hardwired to ext2 — `cat` tried ext2 then initrd and **never** touched the FAT/exFAT volumes, even though their read/write code (1.34.x) is `fsck`-clean. This cut adds the generic read-dispatch seam: `cat` now falls through to FAT, then exFAT, then initrd. Read-side first by design — additive, zero-risk to the iron-validated ext2 write/journal path. Arc plan: agnosticos [`vfs-generic-write-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/vfs-generic-write-prior-art.md).)
+
+### Added
+
+- **`vfs_open_secondary(name, namelen)`** (`kernel/core/vfs.cyr`) — generic read-dispatch over the non-ext2 backends: tries `fatfs_open` → `exfat_open` → `initrd_open` in priority order, each self-guarding on its own mount flag, returning a ready VFS fd (FAT/exFAT via `vfs_create_memfile`) or -1. First hit wins. This is the dispatch seam the write bites (1.39.4+) extend; the dispatch lives in the VFS layer, not scattered across shell verbs.
+
+### Changed
+
+- **`sh_cmd_cat`** (`kernel/user/shell.cyr`) — the ext2-miss fallback now routes through `vfs_open_secondary` instead of `initrd_open` directly. `cat` reaches a FAT/exFAT volume's root files for the first time; ext2 (path/CWD-aware) is still tried first, initrd remains the final fallback. No change to the ext2 read path.
+
+### Validation
+
+- New `fat-smoke.sh` gate: the FATFS selftest stages a `CATTEST.TXT` text file and drives the **real shell verb** `cat CATTEST.TXT` via `sh_exec` → `sh_cmd_cat` → `vfs_open_secondary` → `fatfs_open`; its content `VFS-CAT-FAT-OK` in the boot log proves end-to-end reach. **PASS** (alongside FAT32 mount + multi-cluster chain-read, no regression).
+- **No ext2 regression**: `ext2-write-smoke.sh` W4b (`shell echo-redirect + cat`) still **PASS** — the ext2 `cat` arm is unchanged.
+- `check.sh` 11/11, `test.sh` 4/4. Production build **993,088 B** (+256 B vs 1.39.0 for the dispatch helper), multiboot2 OK.
+
+### Not yet (next bites)
+
+- `ls` over FAT/exFAT (1.39.2) — needs a generic readdir: `fatfs_ls` currently emits via `serial_print` (invisible on iron per the no-serial-on-iron constraint) and `exfat_ls` only *counts* entries (no name reconstruction). That's its own bite.
+- Generic create/write (`touch`/`echo >`), unlink/mkdir/rmdir, rename — bites 1.39.4–1.39.6.
+
 ## [1.39.0] — 2026-05-28 (**Cyrius toolchain re-pin `6.0.3` → `6.0.14` — language bump.** A standalone language-version cut: the deferred re-pin to current Cyrius plus the VERSION roll that opens the 1.39.x line. No kernel engineering in this tag — the 1.39.x **VFS generic-write lift** arc (shared write path for the FAT/exFAT shell verbs + the two now-crash-safe writable filesystems) lands in subsequent 1.39.x cuts, with specific roadmap tags assigned then.)
 
 ### Changed
