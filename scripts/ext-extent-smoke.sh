@@ -1,10 +1,12 @@
 #!/bin/bash
 # ext4 extent-ALLOCATION smoke for the AGNOS kernel (1.37.0–1.37.3, depth 0→2).
 #
-# Builds a default-profile ext4 image (metadata_csum,64bit,extent) with a seed
-# file `/extseed.dat` — which `mkfs.ext4 -d` lays down EXTENTS_FL (depth-0
-# inline root). Boots agnos with EXT2_EXTENT_WRITE_SELFTEST=1, which appends 64
-# bytes of 0xAB at SPARSE logical blocks 2,4,6,… — each gap forces a new extent.
+# Builds a default-profile ext4 image (metadata_csum,64bit,extent) with NO seed
+# file — the kernel SELF-SEEDS `/extseed.dat` as an empty EXTENTS_FL inode
+# (`ext2_extent_seed_create`), so this smoke exercises the EXACT iron-burn path
+# (flash-and-test, no host-side mount/seed). Boots agnos with
+# EXT2_EXTENT_WRITE_SELFTEST=1, which appends 64 bytes of 0xAB at SPARSE logical
+# blocks 2,4,6,… — each gap forces a new extent.
 # The tree climbs the full ladder: inline root fills → depth-0→1 grow (1.37.1);
 # the leaf fills (eh_max) → SIBLING leaf (1.37.2); all 4 inline-root index slots
 # fill (4 full leaves ≈ 1360 extents at 4 KB) → depth-1→2 grow into an INDEX
@@ -50,10 +52,9 @@ PART_OFFSET=$(( 33 * 1048576 ))
 PART_BYTES=$(( 67 * 1048576 ))
 PART_BLOCKS=$(( PART_BYTES / 4096 ))
 
-SEED="$WORK/seed"; mkdir -p "$SEED"
-echo "agnos 1.37.0 extent-alloc seed file" > "$SEED/extseed.dat"   # small → depth-0 inline-root extent
-
-echo "=== AGNOS ext4 extent-allocation smoke (1.37.0) ==="
+# NO host-side seed: the kernel self-creates /extseed.dat as an empty extent
+# file (ext2_extent_seed_create) — the exact iron-burn path.
+echo "=== AGNOS ext4 extent-allocation smoke (1.37.0-1.37.3, self-seed) ==="
 dd if=/dev/zero of="$IMG" bs=1M count=128 status=none
 parted -s "$IMG" mklabel gpt \
     mkpart ESP fat32 1MiB 33MiB set 1 esp on \
@@ -63,8 +64,9 @@ mformat -i "$IMG"@@1048576 -F
 mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
-# default mkfs.ext4 profile → seed files are extent-mapped (EXTENTS_FL)
-mkfs.ext4 -F -q -L AGNOS-EXT -b 4096 -m 0 -d "$SEED" -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
+# default mkfs.ext4 profile (metadata_csum,64bit,extent); no -d seed — the kernel
+# self-creates the extent file, so this validates the iron-burn self-seed path.
+mkfs.ext4 -F -q -L AGNOS-EXT -b 4096 -m 0 -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
 
 echo "Booting EXT2_EXTENT_WRITE_SELFTEST kernel (NVMe + GPT)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"

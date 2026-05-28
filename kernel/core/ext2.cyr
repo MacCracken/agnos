@@ -3551,11 +3551,43 @@ fn ext2_write_selftest() {
 # exercising ext2_extent_append_block via ext2_write_at. The smoke
 # (scripts/ext-extent-smoke.sh) then host-verifies: e2fsck -fn clean + the file
 # grew + the appended bytes are 0xAB. Gate string: "ext-ext: append PASS".
+# Self-seed: create /extseed.dat as an EMPTY depth-0 extent file under root (ino
+# 2) when it's absent — so the iron burn is flash-and-test (no host-side mount /
+# `mkfs.ext4 -d` seed needed). A freshly-allocated inode is zeroed (no stale
+# indirect pointers), so setting EXTENTS_FL + an empty inline extent root
+# (eh_entries=0) is sound; the subsequent sparse writes exercise the allocator
+# from depth 0. Mirrors the ext2_symlink inode-init pattern. Returns the new
+# inode (>0) or -1. (Compile-gated with the selftest — never called in production.)
+fn ext2_extent_seed_create() {
+    var ino = ext2_alloc_inode(0);                           # regular file (not dir)
+    if (ino <= 0) { return 0 - 1; }
+    var z = 0;
+    while (z < ext2_inode_size) { store8(&ext2_inode_buf + z, 0); z = z + 1; }
+    ext2_inode_set_mode(&ext2_inode_buf, 0x81FF);            # S_IFREG | 0777
+    ext2_inode_set_links_count(&ext2_inode_buf, 1);
+    ext2_inode_set_size_lo(&ext2_inode_buf, 0);
+    ext2_inode_set_blocks_lo(&ext2_inode_buf, 0);
+    ext2_store32_le(&ext2_inode_buf, 32, 0x80000);           # i_flags = EXT4_EXTENTS_FL
+    var hdr = &ext2_inode_buf + 40;                          # empty depth-0 extent inline root
+    ext2_store16_le(hdr, 0, 0xF30A);                         # eh_magic
+    ext2_store16_le(hdr, 2, 0);                              # eh_entries
+    ext2_store16_le(hdr, 4, 4);                              # eh_max (inline root)
+    ext2_store16_le(hdr, 6, 0);                              # eh_depth
+    ext2_store16_le(hdr, 8, 0);                              # eh_generation
+    if (ext2_put_inode(ino, &ext2_inode_buf) != 0) { ext2_free_inode(ino, 0); return 0 - 1; }
+    if (ext2_dir_insert(2, "extseed.dat", 11, ino, 1) != 0) { ext2_free_inode(ino, 0); return 0 - 1; }
+    return ino;
+}
+
 fn ext2_extent_write_selftest() {
     if (ext2_active == 0)   { kprintln("ext-ext: not mounted -- skip", 28); return 0; }
     if (ext2_write_ok == 0) { kprintln("ext-ext: read-only -- skip", 26); return 0; }
     var ino = ext2_path_lookup("/extseed.dat", 12);
-    if (ino <= 0) { kprintln("ext-ext: /extseed.dat not found FAIL", 36); return 0 - 1; }
+    if (ino <= 0) {                                          # absent → self-seed (flash-and-test)
+        ino = ext2_extent_seed_create();
+        if (ino <= 0) { kprintln("ext-ext: seed create FAIL", 25); return 0 - 1; }
+        kprintln("ext-ext: seeded /extseed.dat (empty extent file)", 48);
+    }
     if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { kprintln("ext-ext: get_inode FAIL", 23); return 0 - 1; }
     if ((ext2_inode_flags(&ext2_inode_buf) & 0x80000) == 0) {
         kprintln("ext-ext: seed not extent-mapped FAIL", 36); return 0 - 1;
