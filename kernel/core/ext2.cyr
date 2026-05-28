@@ -793,7 +793,8 @@ fn ext2_put_inode(inode_num, in_buf) {
 # the journal log AND to the target block during checkpoint). If no tx is
 # active, fall back to a direct ext2_write_block. Used at metadata-write
 # sites (inode table blocks today; bitmap / group desc / extent-tree nodes
-# to follow in 1.38.7+ once iron data justifies widening the scope).
+# to follow in the 1.39.x VFS generic-write lift, once that arc widens the
+# set of journaled metadata beyond what the 1.38.x put_inode path covers).
 fn ext2_metadata_write_or_log(blocknr, buf) {
     if (ext2_jbd2_tx_active != 0) {
         return ext2_jbd2_log_metadata(blocknr, buf);
@@ -4482,9 +4483,12 @@ fn ext2_jbd2_commit_tx() {
 }
 
 # Optional abort: drop the in-progress tx without committing. Useful when
-# a higher-layer write fails mid-collection. No on-disk effect at 1.38.4
-# (we hadn't written anything anyway); 1.38.5+ will need to NOT issue the
-# descriptor write either.
+# a higher-layer write fails mid-collection. On-disk-safe even when called
+# from commit_tx's mid-write failure paths (a stray descriptor/data block
+# may already sit in the log area): the journal SB is left clean (s_start=0)
+# and its sequence is NOT advanced, so the next mount's replay never reads
+# the orphaned log blocks. Only a committed tx (commit block written + SB
+# advanced) is ever replayed.
 fn ext2_jbd2_abort_tx() {
     if (ext2_jbd2_tx_active == 0) { return 0; }
     kprint("jbd2: abort_tx: dropping ", 25);

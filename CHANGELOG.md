@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.11] — 2026-05-28 (**1.38.x jbd2 journaling arc CLOSE — crash-safe journaling iron-validated on archaemenid.** The 1.38.10 CSUM_V2/V3 write+replay code, QEMU-green and Linux-`e2fsck`-oracle-validated, was confirmed on real NAND by the `13810_*` re-burn: the write side commits to the unmodified CSUM_V3 agnos-fs journal, a 100-tx stress loop runs clean, and a mid-cycle power cut recovers to a clean journal with host `e2fsck -fn` clean. This is the cycle-close housekeeping cut — the engineering landed at 1.38.10; 1.38.11 records the iron receipt, tidies stale in-code arc markers, and re-verifies the whole gate suite stays green. No behavioral change — production build byte-identical to 1.38.10 at **992,832 B**.)
+
+### Iron validation — the `13810_*` re-burn (archaemenid, 2026-05-28)
+
+- **Write side PROVEN on real NAND.** The integration path's `commit_tx` — which the 1389 burn showed refusing every commit under the pre-1.38.10 CSUM_V3 guard — now reads `jbd2-int: commit_tx: COMMITTED seq=4 n_blocks=1 -- checkpoint applied + journal clean` → `integration selftest PASS` against the *unmodified* archaemenid agnos-fs journal (CSUM_V3 + 64BIT, `incompat=0x12`).
+- **Stress + crash recovery PROVEN.** The 100-commit stress loop closed on `jbd2-crash: 100/100 done` → `stress loop PASS (clean shutdown)`; a deliberate **mid-cycle power cut** was recovered on the next boot to `jbd2: clean journal ino=8 size=32760 seq=142`. The journal advanced seq 4 → 142 across commit + stress + crash + recovery, with host `e2fsck -fn` clean and the on-disk journal SB `CLEAN` at every checkpoint.
+- Iron evidence (photos + per-boot validate verdicts) catalogued in the **agnosticos** repo: `iron-nuc-zen-log.md#tracker-138-cycle` + `iron-nuc-zen-photos/` (`13810-agnos-1.38.10-boot{1,2,3,5}-*.jpg`). This closes the only open carry-forward item the 1.38.10 entry left ("re-burn pending").
+
+### Changed — stale in-code arc markers (`ext2.cyr`, comments only — codegen unaffected)
+
+- `ext2_metadata_write_or_log` routing-scope note: the "bitmap / group desc / extent-tree nodes to follow in **1.38.7+**" marker (a past version) re-pointed to the **1.39.x VFS generic-write lift**, where the journaled-metadata set actually widens.
+- `ext2_jbd2_abort_tx` header comment: replaced the stale "no on-disk effect at 1.38.4 … 1.38.5+ will need to …" future-tense note with the current on-disk-safety invariant (a stray descriptor/data block from a mid-write abort is never replayed because the journal SB is left clean and its sequence un-advanced — only a fully-committed tx is ever replayed).
+
+### Validation
+
+- Production build byte-identical to 1.38.10 (**992,832 B**) — the version bump + comment tidies introduce zero codegen change. multiboot2 (ELF64) OK.
+- `check.sh` **11/11**, `test.sh` **4/4**.
+- All five jbd2 smokes **PASS** on a CSUM_V3 journal (each built with its selftest gate): `tx`, `writepath` (`COMMITTED` + SB `s_sequence` 1→2 clean), `integration` (same), `crash` (4/4 e2fsck-clean across staggered kill points), `replay` (V3 tag parse + tail/commit/data csum gates).
+
 ## [1.38.10] — 2026-05-28 (**JBD2 CSUM_V2/V3 write + replay support — the 2026-05-28 iron-burn unlock.** The first real-NAND JBD2 burn falsified the audit's premise: archaemenid's agnos-fs journal is **CSUM_V3 + 64BIT** (`incompat=0x12`, `csum_type=4`/CRC32C) — the Linux kernel stamps CSUM_V3 onto a `metadata_csum` FS's journal on first RW mount, which `mke2fs` does *not* do, so the QEMU smokes (mkfs-default journals) never exercised it and the 1.38.7 narrow-scope refusal aborted every `commit_tx` on iron. This cut implements the CSUM_V2/V3 tag/descriptor/commit checksums on both the write and replay sides so AGNOS can journal to the real iron filesystem. On-disk formats re-derived verbatim from `include/linux/jbd2.h` + `fs/jbd2/commit.c` and **validated against the Linux `e2fsck` oracle** — e2fsck replays an AGNOS-format CSUM_V3 journal clean, and a deliberately-corrupted commit csum is rejected with "transaction was corrupt".)
 
 ### Added — CSUM_V2/V3 journal checksums (`ext2.cyr`)
