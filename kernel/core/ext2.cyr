@@ -4506,6 +4506,72 @@ fn ext2_jbd2_integration_selftest() {
     return 0;
 }
 
+# === 1.38.7 crash-stress selftest (JBD2_CRASH_SELFTEST=1) ===
+# Runs a loop of `commit_count` real commits of the root inode, with a
+# busy-wait between each so the total stress window stretches to ~3 s.
+# The companion smoke (scripts/jbd2-crash-smoke.sh) SIGKILLs QEMU at
+# varied points within that window and then re-boots — AGNOS's replay
+# on the second boot is the test: regardless of where the kill landed
+# (pre-descriptor, mid-descriptor, between-data, pre-commit, post-commit
+# pre-checkpoint, mid-checkpoint, post-checkpoint pre-SB-clean), host
+# `e2fsck -fn` on the partition must be clean. The stress window
+# maximises probability of catching the dangerous mid-commit + mid-
+# checkpoint states; even crashes outside the window (clean shutdown,
+# nothing-written) must produce a clean FS on re-boot.
+#
+# Loop count + per-iter delay tuned so the total loop takes ~3 s on
+# QEMU q35 + NVMe. Adjust LOOP_N / DELAY_CYCLES below if iron is slower.
+fn ext2_jbd2_crash_selftest() {
+    if (ext2_active == 0)       { kprintln("jbd2-crash: skip (no fs)", 24); return 0; }
+    if (ext2_jbd2_present == 0) { kprintln("jbd2-crash: skip (no journal)", 29); return 0; }
+    if (ext2_jbd2_clean == 0)   { kprintln("jbd2-crash: skip (journal dirty)", 32); return 0; }
+    if (ext2_write_ok == 0)     { kprintln("jbd2-crash: skip (FS RO)", 24); return 0; }
+
+    kprintln("jbd2-crash: stress loop begin (100 commits, ~3s window)", 55);
+
+    var loop_n = 100;
+    # rdtsc-based busy wait: ~3 GHz × ~30 ms per iter = 100M cycles.
+    # Loop total: ~3 s (the SIGKILL target window).
+    var delay_cycles = 100000000;
+
+    var i = 0;
+    while (i < loop_n) {
+        if (ext2_get_inode(2, &ext2_inode_buf) != 0) {
+            kprintln("jbd2-crash: get_inode FAIL", 26);
+            return 0 - 1;
+        }
+        if (ext2_jbd2_begin_tx() != 0) {
+            kprintln("jbd2-crash: begin_tx FAIL", 25);
+            return 0 - 1;
+        }
+        if (ext2_put_inode(2, &ext2_inode_buf) != 0) {
+            kprintln("jbd2-crash: put_inode FAIL", 26);
+            ext2_jbd2_abort_tx();
+            return 0 - 1;
+        }
+        if (ext2_jbd2_commit_tx() != 0) {
+            kprintln("jbd2-crash: commit_tx FAIL", 26);
+            return 0 - 1;
+        }
+
+        # Print progress every 25 iters so smoke can grep for "still running".
+        if ((i + 1) == 25)  { kprintln("jbd2-crash: 25/100 done", 23); }
+        if ((i + 1) == 50)  { kprintln("jbd2-crash: 50/100 done", 23); }
+        if ((i + 1) == 75)  { kprintln("jbd2-crash: 75/100 done", 23); }
+        if ((i + 1) == 100) { kprintln("jbd2-crash: 100/100 done", 24); }
+
+        # Busy wait so kill timing has a wide target.
+        var t0 = rdtsc();
+        while ((rdtsc() - t0) < delay_cycles) { }
+
+        i = i + 1;
+    }
+
+    ext2_sync();
+    kprintln("jbd2-crash: stress loop PASS (clean shutdown)", 45);
+    return 0;
+}
+
 fn ext2_jbd2_replay_one_tx(start_blk) {
     var bs = ext2_blocksize;
 

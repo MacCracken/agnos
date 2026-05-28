@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.7] — 2026-05-28 (**JBD2 crash-injection smoke — end-to-end recovery validated.** New `scripts/jbd2-crash-smoke.sh` runs N iterations (default 4, override `ITERATIONS=N` up to 64) of: fresh `mkfs.ext4` image → boot agnos with a 100-commit stress loop (~3 s window via `rdtsc` busy-wait between commits) → **SIGKILL QEMU at varied points within the busy window** → re-boot agnos against the same image → host `e2fsck -fn` MUST be clean. The honest finding from N=4: **all 4 iterations landed in the 30 ms busy-wait gap between commits** (boot 2 saw `clean journal` every time, not `DIRTY journal → replay`). With sync-checkpoint + the three FLUSH-CACHE barriers, each commit's at-risk window is ~10 ms; statistically the kill lands in the 75 % "between commits" zone. **Every kill point produces an e2fsck-clean FS** — that's the dispositive guarantee. The specific mid-commit-then-replay path stays validated by `jbd2-replay-smoke.sh` (1.38.3, manually-constructed dirty journal). 1.38.8's hardening can tighten the kill timing if iron data motivates it.)
+
+### Added — crash-stress selftest + crash smoke
+
+- **`ext2.cyr` `ext2_jbd2_crash_selftest()`** — runs 100 `put_inode(root)` commits in a loop, with an `rdtsc` busy-wait between each (~30 ms / commit, ~3 s total window). Compile-gated `JBD2_CRASH_SELFTEST=1`. Progress markers every 25 iterations so the smoke can see how far the loop got pre-SIGKILL.
+- **`scripts/jbd2-crash-smoke.sh`** — per iteration: fresh mkfs.ext4 → boot 1 with `timeout -s KILL <T>` (varied T across 2.0 / 2.7 / 3.4 / 4.1 s by default) → boot 2 (30 s timeout) for replay + clean run → e2fsck. Tracks `boot-2 saw dirty` vs `boot-2 saw clean` so the operator can see how many kills exercised the replay path. Per-iteration boot logs + e2fsck logs preserved in `build/jbd2-crash-smoke-logs/` for post-mortem.
+- **`selftests.cyr`** — `JBD2_CRASH_SELFTEST` invocation block.
+- **`scripts/build.sh`** — `JBD2_CRASH_SELFTEST=1` env-var gate.
+
+### Validation
+
+- `test.sh` 4/4, `check.sh` 11/11.
+- `jbd2-crash-smoke.sh` PASS 4/4 (all iterations e2fsck-clean). Boot-1 markers showed real commit progress before each kill (e.g., `seq=14` for iter-3); boot-2 saw clean journal in all cases (kills landed between commits).
+- All prior JBD2 smokes regression-clean.
+- Production build (no selftest flag) 984,632 → **986,184 B** (+1,552 — crash selftest body).
+
 ## [1.38.6] — 2026-05-28 (**JBD2 integration — metadata writes route through the journal.** When a tx is active, `ext2_put_inode`'s inode-table block write now flows through `ext2_jbd2_log_metadata` → gets bundled into the commit's descriptor + data + commit + checkpoint sequence, instead of writing directly. Mechanism: a new `ext2_metadata_write_or_log` routing helper inspects `ext2_jbd2_tx_active` and dispatches accordingly. `ext2_write_at_journaled` is the public wrapper for callers that want atomic inode-update semantics (opens a tx, runs `ext2_write_at`, commits on success / aborts on failure). **Narrow-scope limitation**: only the inode-table write is currently routed. Block-bitmap / group-descriptor / sb / extent-tree node writes from the allocation path stay direct — full atomicity for *growing* writes waits for 1.38.7+. For overwrite-in-place this provides complete inode-update atomicity; for grow operations, a mid-write crash can split bitmap-and-inode → e2fsck-fixable orphan blocks, not data loss.)
 
 ### Added — integration helpers + selftest

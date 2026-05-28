@@ -369,6 +369,15 @@ ext2_jbd2_writepath_selftest();
 ext2_jbd2_integration_selftest();
 #endif
 
+#ifdef JBD2_CRASH_SELFTEST
+# 1.38.7 crash-stress selftest. Runs 100 real put_inode commits over a
+# ~3-second window (rdtsc busy-wait between iterations) so the companion
+# jbd2-crash-smoke.sh can SIGKILL QEMU at varied points within the window
+# and validate that AGNOS's replay on next boot leaves the FS host-e2fsck
+# clean regardless of where the kill landed.
+ext2_jbd2_crash_selftest();
+#endif
+
 #ifdef HARDENING_SELFTEST
 # Arc-close hardening self-test (1.35.7 pass 1). Hermetic table over
 # ip_safe_payload_len — the ingress clamp that stops a forged IPv4 total-length
