@@ -3742,6 +3742,10 @@ fn ext2_jbd2_probe() {
     ext2_jbd2_size              = ext2_jsb_maxlen(jsb);
     ext2_jbd2_sequence          = ext2_jsb_seq_expected(jsb);
     ext2_jbd2_start             = ext2_jsb_start(jsb);
+    # 1.38.4 lifecycle: seed the tx-sequence allocator from the journal's
+    # next-expected sequence. Replay advances ext2_jbd2_sequence; new tx's
+    # opened via ext2_jbd2_begin_tx() will pick up from there.
+    ext2_jbd2_tx_seq_next       = ext2_jbd2_sequence;
     ext2_jbd2_first             = ext2_jsb_first(jsb);
     ext2_jbd2_feature_compat    = ext2_jsb_feature_compat(jsb);
     ext2_jbd2_feature_incompat  = ext2_jsb_feature_incompat(jsb);
@@ -3986,6 +3990,155 @@ fn kprintln_num_only(n) {
 # JBD2_REPLAY_TAG_MAX = 256 (inlined — `const` is not a Cyrius keyword; the
 # array-size in `var ext2_jbd2_tag_buf[256]` above must stay an integer literal).
 
+# === JBD2 transaction lifecycle (1.38.4 — in-memory scaffold) ===
+#
+# The write-side API the integration at 1.38.6 will plug into:
+#
+#   ext2_jbd2_begin_tx()                  — start collecting metadata blocks
+#   ext2_jbd2_log_metadata(blocknr, buf)  — queue a metadata block for the tx
+#   ext2_jbd2_commit_tx()                 — serialize; at 1.38.4 emits a trace
+#                                           only; 1.38.5 will hook in descriptor
+#                                           + data + commit + FLUSH-CACHE writes
+#
+# Caller holds the buffers alive between log_metadata and commit_tx (no copy
+# is made here — the integration uses long-lived kernel buffers like
+# ext2_inode_buf / ext2_dir_buf / ext2_extent_buf that outlive the tx).
+#
+# Cap at 256 logged blocks per tx — covers any realistic ext4 metadata
+# update (an extent-tree split + inode + bitmap + group desc is ~5 blocks).
+# Storage: ext2_jbd2_tx_blocks[256] (target FS blocks) + ext2_jbd2_tx_bufs[256]
+# (source buffer pointers). 256 × 8 × 2 = 4 KiB BSS.
+var ext2_jbd2_tx_active   = 0;    # 0 = no tx in progress, 1 = collecting
+var ext2_jbd2_tx_seq      = 0;    # sequence allocated at begin_tx (≥ 1)
+var ext2_jbd2_tx_count    = 0;    # entries in current tx
+var ext2_jbd2_tx_seq_next = 1;    # next-sequence allocator (advanced on commit)
+var ext2_jbd2_tx_blocks[256];     # target FS block per entry
+var ext2_jbd2_tx_bufs[256];       # source buffer pointer per entry
+
+fn ext2_jbd2_begin_tx() {
+    if (ext2_jbd2_tx_active != 0) {
+        kprintln("jbd2: begin_tx: nested begin -- ERROR", 37);
+        return 0 - 1;
+    }
+    ext2_jbd2_tx_active = 1;
+    ext2_jbd2_tx_count  = 0;
+    # Allocate a sequence. Post-replay tx_seq_next was lifted to the
+    # replayed-from value; pre-replay (or no journal) it stays 1.
+    ext2_jbd2_tx_seq    = ext2_jbd2_tx_seq_next;
+    return 0;
+}
+
+fn ext2_jbd2_log_metadata(blocknr, buf) {
+    if (ext2_jbd2_tx_active == 0) {
+        kprintln("jbd2: log_metadata: no active tx -- ERROR", 41);
+        return 0 - 1;
+    }
+    if (ext2_jbd2_tx_count >= 256) {
+        kprintln("jbd2: log_metadata: tx full (256 entries) -- ERROR", 50);
+        return 0 - 1;
+    }
+    store64(&ext2_jbd2_tx_blocks + ext2_jbd2_tx_count * 8, blocknr);
+    store64(&ext2_jbd2_tx_bufs   + ext2_jbd2_tx_count * 8, buf);
+    ext2_jbd2_tx_count = ext2_jbd2_tx_count + 1;
+    return 0;
+}
+
+# 1.38.4 commit: trace-only. 1.38.5 replaces this body with the actual
+# descriptor → data → commit + FLUSH-CACHE sequence; the API contract
+# (called by callers under ext2_jbd2_begin_tx/log_metadata) stays.
+fn ext2_jbd2_commit_tx() {
+    if (ext2_jbd2_tx_active == 0) {
+        kprintln("jbd2: commit_tx: no active tx -- ERROR", 38);
+        return 0 - 1;
+    }
+
+    kprint("jbd2: commit_tx (trace-only at 1.38.4): seq=", 44);
+    kprint_num(ext2_jbd2_tx_seq);
+    kprint(" n_blocks=", 10);
+    kprintln_num_only(ext2_jbd2_tx_count);
+    var i = 0;
+    while (i < ext2_jbd2_tx_count) {
+        kprint("  log: target_blk=", 18);
+        kprint_num(load64(&ext2_jbd2_tx_blocks + i * 8));
+        kprintln("", 0);
+        i = i + 1;
+    }
+
+    ext2_jbd2_tx_active   = 0;
+    ext2_jbd2_tx_count    = 0;
+    ext2_jbd2_tx_seq_next = ext2_jbd2_tx_seq_next + 1;
+    return 0;
+}
+
+# Optional abort: drop the in-progress tx without committing. Useful when
+# a higher-layer write fails mid-collection. No on-disk effect at 1.38.4
+# (we hadn't written anything anyway); 1.38.5+ will need to NOT issue the
+# descriptor write either.
+fn ext2_jbd2_abort_tx() {
+    if (ext2_jbd2_tx_active == 0) { return 0; }
+    kprint("jbd2: abort_tx: dropping ", 25);
+    kprint_num(ext2_jbd2_tx_count);
+    kprintln(" pending entries", 16);
+    ext2_jbd2_tx_active = 0;
+    ext2_jbd2_tx_count  = 0;
+    return 0;
+}
+
+# === Compile-gated boot self-test (JBD2_TX_SELFTEST=1) ===
+# Exercises the lifecycle API once at boot to prove it sequences correctly
+# without an actual disk surface. Smoke gates the trace lines.
+fn ext2_jbd2_tx_selftest() {
+    if (ext2_active == 0) {
+        kprintln("jbd2-tx: skip (no fs)", 21);
+        return 0;
+    }
+    if (ext2_jbd2_present == 0) {
+        kprintln("jbd2-tx: skip (no journal)", 26);
+        return 0;
+    }
+
+    kprintln("jbd2-tx: selftest begin", 23);
+
+    # Negative: log_metadata before begin → error
+    if (ext2_jbd2_log_metadata(99, 0) == 0) {
+        kprintln("jbd2-tx: log_metadata-without-begin SHOULD have errored", 55);
+        return 0 - 1;
+    }
+
+    if (ext2_jbd2_begin_tx() != 0) {
+        kprintln("jbd2-tx: begin_tx FAILED", 24);
+        return 0 - 1;
+    }
+
+    # Negative: nested begin → error
+    if (ext2_jbd2_begin_tx() == 0) {
+        kprintln("jbd2-tx: nested begin SHOULD have errored", 41);
+        return 0 - 1;
+    }
+
+    # Log three dummy entries. Use ext2_jbd2_data_buf as a known live
+    # buffer (any pointer that survives the call sequence works — we
+    # don't dereference it at 1.38.4).
+    var dummy = &ext2_jbd2_data_buf;
+    if (ext2_jbd2_log_metadata(100, dummy) != 0) { return 0 - 1; }
+    if (ext2_jbd2_log_metadata(101, dummy) != 0) { return 0 - 1; }
+    if (ext2_jbd2_log_metadata(102, dummy) != 0) { return 0 - 1; }
+
+    if (ext2_jbd2_commit_tx() != 0) {
+        kprintln("jbd2-tx: commit_tx FAILED", 25);
+        return 0 - 1;
+    }
+
+    # Negative: commit-without-begin → error
+    if (ext2_jbd2_commit_tx() == 0) {
+        kprintln("jbd2-tx: commit-without-begin SHOULD have errored", 49);
+        return 0 - 1;
+    }
+
+    kprintln("jbd2-tx: selftest PASS", 22);
+    return 0;
+}
+
 fn ext2_jbd2_replay_one_tx(start_blk) {
     var bs = ext2_blocksize;
 
@@ -4210,6 +4363,7 @@ fn ext2_jbd2_replay() {
     ext2_jbd2_clean       = 1;
     ext2_jbd2_start       = 0;
     ext2_jbd2_sequence    = seq;
+    ext2_jbd2_tx_seq_next = seq;       # 1.38.4: seed lifecycle's next-tx seq from replay
     ext2_jbd2_replay_done = 1;
     ext2_write_ok         = saved_write_ok;
     if (ext2_write_ok == 0) { ext2_write_ok = 1; }                 # lift the refusal

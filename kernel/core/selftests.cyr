@@ -339,6 +339,14 @@
 }
 #endif
 
+#ifdef JBD2_TX_SELFTEST
+# 1.38.4 in-memory transaction lifecycle self-test. Exercises
+# begin_tx / log_metadata / commit_tx + the negative paths (nested begin,
+# log-without-begin, commit-without-begin). No on-disk effect — 1.38.4
+# is trace-only; 1.38.5 will hook the real journal writes into commit_tx.
+ext2_jbd2_tx_selftest();
+#endif
+
 #ifdef HARDENING_SELFTEST
 # Arc-close hardening self-test (1.35.7 pass 1). Hermetic table over
 # ip_safe_payload_len — the ingress clamp that stops a forged IPv4 total-length

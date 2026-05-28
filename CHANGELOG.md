@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.4] — 2026-05-28 (**JBD2 transaction lifecycle — in-memory scaffold.** The write-side API the integration at 1.38.6 will plug into: `ext2_jbd2_begin_tx` → `ext2_jbd2_log_metadata(blocknr, buf)` → `ext2_jbd2_commit_tx`. Plus `ext2_jbd2_abort_tx` for mid-collection failures. Pure in-memory at 1.38.4 — `commit_tx` emits a trace listing the queued target FS blocks; **no on-disk journal writes happen yet** (1.38.5 will hook the descriptor + data + commit + FLUSH-CACHE sequence in, leaving the same call-site API contract). This cut also wires the sequence allocator (`ext2_jbd2_tx_seq_next`) into the probe + replay paths so commit sequences follow on from a replayed journal seamlessly. The buffer-ownership model is "borrowed": the caller's source buffer must stay live across `log_metadata` → `commit_tx` — fine in practice, because callers will use long-lived kernel buffers (`ext2_inode_buf`, `ext2_dir_buf`, `ext2_extent_buf`) that outlive the tx.)
+
+### Added — lifecycle API + compile-gated boot self-test
+
+- **`ext2.cyr`** — new `ext2_jbd2_begin_tx()` / `ext2_jbd2_log_metadata(blocknr, buf)` / `ext2_jbd2_commit_tx()` / `ext2_jbd2_abort_tx()`. State: `ext2_jbd2_tx_active`, `ext2_jbd2_tx_seq`, `ext2_jbd2_tx_count`, `ext2_jbd2_tx_seq_next`, plus the per-entry arrays `ext2_jbd2_tx_blocks[256]` (target FS blocks, u64 each) and `ext2_jbd2_tx_bufs[256]` (source buffer pointers). Cap at 256 entries per tx — far above any realistic ext4 single-tx metadata footprint (~5-20 blocks). 4 KiB BSS total.
+- **`ext2.cyr` `ext2_jbd2_probe`** — seeds `ext2_jbd2_tx_seq_next` from `s_sequence` at mount, so commits picked up post-mount continue from the journal's next-expected sequence (preserves the journal's monotonic seq invariant).
+- **`ext2.cyr` `ext2_jbd2_replay`** — sets `ext2_jbd2_tx_seq_next = seq` after replay completes, so writes initiated post-replay don't reuse a sequence that was just applied.
+- **`ext2.cyr`** — new `ext2_jbd2_tx_selftest()`: compile-gated boot self-test (`JBD2_TX_SELFTEST=1`). Exercises the three positive paths + three negative-path error responses (log-without-begin, nested begin, commit-without-begin). Each negative-test return value is gated so a missing error response fails the test.
+- **`scripts/build.sh`** — env-var gates for `JBD2_TX_SELFTEST=1` and `JBD2_NO_REPLAY=1` (the regression-escape from 1.38.3 was already used implicitly; now formally available).
+- **`scripts/jbd2-tx-smoke.sh`** — boots agnos with `JBD2_TX_SELFTEST=1`, gates 7 trace lines: `selftest begin` + commit-trace header (seq=1, n_blocks=3) + 3 `log: target_blk=N` entries + `selftest PASS` + shell prompt.
+
+### Validation
+
+- `test.sh` 4/4, `check.sh` 11/11.
+- `jbd2-tx-smoke.sh` PASS (kernel-side trace exactly as expected):
+  ```
+  jbd2-tx: selftest begin
+  jbd2: log_metadata: no active tx -- ERROR        (negative #1 -- caught)
+  jbd2: begin_tx: nested begin -- ERROR             (negative #2 -- caught)
+  jbd2: commit_tx (trace-only at 1.38.4): seq=1 n_blocks=3
+    log: target_blk=100 / 101 / 102
+  jbd2: commit_tx: no active tx -- ERROR            (negative #3 -- caught)
+  jbd2-tx: selftest PASS
+  AGNOS shell v1.38.4 (type 'help')
+  ```
+- `jbd2-replay-smoke.sh` regression-clean, `jbd2-logdump-smoke.sh` regression-clean.
+- Production build (no selftest flag) 970,920 → **977,792 B** (+6,872 — lifecycle API bodies + 4 KiB BSS for tx buffers + selftest fn always-compiled).
+
 ## [1.38.3] — 2026-05-28 (**JBD2 replay-on-mount — the unlock.** The dirty-journal mount path now APPLIES the parsed transactions: data blocks are copied from journal log positions → their target FS positions, the journal superblock is rewritten as clean (`s_start = 0`, `s_sequence` advanced, CRC32C recomputed if `CSUM_V2/V3` is set), a FLUSH-CACHE barrier flushes the controller's write cache, and finally `ext2_sync` re-asserts `EXT2_VALID_FS` so `e2fsck -fn` sees a cleanly-unmounted FS. **`ext2_write_ok` lifts from 0 → 1 on success — the dirty-mount refusal becomes a successful RW mount.** Promotes 1.38.0's stop-gap into a fully-recovering JBD2 reader. Replay is **validate-first, apply-second**: the descriptor's tags are parsed into memory, the commit block is read + sequence-matched, and ONLY THEN do the data writes start — guaranteeing a torn transaction (no commit block) is discarded, never half-applied. Compile gate `JBD2_NO_REPLAY=1` skips replay entirely so the 1.38.0 refusal-only path remains exercisable in regression.)
 
 ### Added — replay engine
