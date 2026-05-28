@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.39.0] — 2026-05-28 (**Cyrius toolchain re-pin `6.0.3` → `6.0.14` — language bump.** A standalone language-version cut: the deferred re-pin to current Cyrius plus the VERSION roll that opens the 1.39.x line. No kernel engineering in this tag — the 1.39.x **VFS generic-write lift** arc (shared write path for the FAT/exFAT shell verbs + the two now-crash-safe writable filesystems) lands in subsequent 1.39.x cuts, with specific roadmap tags assigned then.)
+
+### Changed
+
+- **Cyrius toolchain pin `6.0.3` → `6.0.14`** (`cyrius.cyml`). The pin had been held conservatively on 6.0.3 since the 1.35.5 cycle-open and through the 1.37/1.38 big-write arcs; this cut re-pins to current. **Validated byte-identical**: the production kernel is unchanged at **992,832 B** (multiboot2 ELF64 OK) on 6.0.14, `check.sh` 11/11, `test.sh` 4/4, and the jbd2 integration write-path smoke PASSes on the new toolchain — 6.0.14 has zero codegen impact on agnos. The "pin drift" build warning is now cleared.
+- VERSION `1.38.11` → `1.39.0`.
+
 ## [1.38.11] — 2026-05-28 (**1.38.x jbd2 journaling arc CLOSE — crash-safe journaling iron-validated on archaemenid.** The 1.38.10 CSUM_V2/V3 write+replay code, QEMU-green and Linux-`e2fsck`-oracle-validated, was confirmed on real NAND by the `13810_*` re-burn: the write side commits to the unmodified CSUM_V3 agnos-fs journal, a 100-tx stress loop runs clean, and a mid-cycle power cut recovers to a clean journal with host `e2fsck -fn` clean. This is the cycle-close housekeeping cut — the engineering landed at 1.38.10; 1.38.11 records the iron receipt, tidies stale in-code arc markers, and re-verifies the whole gate suite stays green. No behavioral change — production build byte-identical to 1.38.10 at **992,832 B**.)
 
 ### Iron validation — the `13810_*` re-burn (archaemenid, 2026-05-28)
