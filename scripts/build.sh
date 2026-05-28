@@ -11,6 +11,24 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CYRIUS_HOME="${CYRIUS_HOME:-$HOME/.cyrius}"
 CYRB="$CYRIUS_HOME/bin/cyrius"
+
+# kashi freestanding font-data core (1.37.5 fold-in). Located via env var
+# with a sibling-checkout default — works on a local devbox where both
+# repos live under ~/Repos/ AND in CI where actions/checkout only fetches
+# this repo. When the sibling is absent we clone main (or KASHI_REF if
+# set). Once kashi 0.6.0 is tagged on GitHub, bump the default to that
+# tag.
+KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
+KASHI_REF="${KASHI_REF:-main}"
+if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
+    echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for build..." >&2
+    rm -rf "$KASHI_DIR"
+    git clone --quiet --depth 1 --branch "$KASHI_REF" \
+        https://github.com/MacCracken/kashi.git "$KASHI_DIR" >&2 || {
+        echo "ERROR: kashi clone failed (ref=$KASHI_REF)" >&2
+        exit 1
+    }
+fi
 CC_ARM="$CYRIUS_HOME/bin/cc5_aarch64"
 echo "  toolchain: $CYRB" >&2
 ARCH="x86_64"
@@ -164,7 +182,8 @@ else
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include
         # resolution. The [deps.kashi] block in cyrius.cyml documents the
         # contract; this cat is the mechanism. Zero-stdlib by construction.
-        cat "$ROOT/../kashi/src/font_data.cyr"
+        # KASHI_DIR resolved above (sibling checkout locally, auto-clone in CI).
+        cat "$KASHI_DIR/src/font_data.cyr"
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

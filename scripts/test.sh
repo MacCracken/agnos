@@ -4,6 +4,20 @@
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CYRIUS_HOME="${CYRIUS_HOME:-$HOME/.cyrius}"
 CYRB="$CYRIUS_HOME/bin/cyrius"
+
+# kashi sibling/fetch handling — same contract as scripts/build.sh (see comment
+# there). KASHI_REF defaults to main until kashi 0.6.0 is tagged on GitHub.
+KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
+KASHI_REF="${KASHI_REF:-main}"
+if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
+    echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for test..." >&2
+    rm -rf "$KASHI_DIR"
+    git clone --quiet --depth 1 --branch "$KASHI_REF" \
+        https://github.com/MacCracken/kashi.git "$KASHI_DIR" >&2 || {
+        echo "ERROR: kashi clone failed (ref=$KASHI_REF)" >&2
+        exit 1
+    }
+fi
 # cc5_aarch64 existence is the gate for aarch64 cross-compile; cyrius
 # wrapper invokes it internally — we never call cc5/cc5_aarch64 directly.
 CC_ARM="$CYRIUS_HOME/bin/cc5_aarch64"
@@ -33,7 +47,7 @@ test_x86() {
     rm -f $ROOT/build/agnos_test
     if [ -x "$CYRB" ]; then
         PREPPED="$ROOT/build/agnos_prepped.cyr"
-        (echo '#define ARCH_X86_64' && cat "$ROOT/../kashi/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
+        (echo '#define ARCH_X86_64' && cat "$KASHI_DIR/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
         (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" $ROOT/build/agnos_test) 2>&1
         rm -f "$PREPPED"
     else
@@ -93,7 +107,7 @@ test_aarch64() {
     # kernel/ so relative `include "arch/..."` paths resolve.
     mkdir -p $ROOT/build
     PREPPED_ARM="$ROOT/build/agnos_arm_prepped.cyr"
-    (echo '#define ARCH_AARCH64' && cat "$ROOT/../kashi/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
+    (echo '#define ARCH_AARCH64' && cat "$KASHI_DIR/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
     (cd "$ROOT/kernel" && "$CYRB" build --aarch64 --no-deps "$PREPPED_ARM" /tmp/agnos_arm_test >/dev/null 2>&1)
     rc=$?
     rm -f "$PREPPED_ARM"
