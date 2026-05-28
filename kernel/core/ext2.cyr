@@ -3607,6 +3607,46 @@ fn ext2_write_selftest() {
 # JBD2 on-disk fields are BIG-endian (Tweedie ext3 inheritance, in contrast
 # to ext2/ext4's LE everywhere else) — see ext2_load32_be below.
 
+# JBD2 CMOS stamp slot map (1.38.9 iron-burn automation — Layer 3).
+# Stamped from the JBD2 paths so the agnosticos `read-boot-log` script can
+# report iron-burn outcomes without a serial cable (per [[feedback_no_serial_on_iron]]
+# — archaemenid has no serial; FB + CMOS extended bank are the only kernel-
+# readable channels). Slots 0xA0-0xA4 are virgin scratch (existing CMOS map per
+# [[project_archaemenid_cmos_map]] uses through 0x8C for boot/r8169/xhci/net;
+# 0x90-0x9F is fb_console.cyr's FB-geometry post-mortem; 0xA0+ is fresh). Per slot:
+#   0xA0 PROBE_OUTCOME   = 0:no-journal / 1:clean / 2:dirty / 0xFF:malformed
+#   0xA1 REPLAY_ATTEMPT  = 0:not-attempted / 1:replay-path-ran
+#   0xA2 REPLAY_OUTCOME  = 0:n/a / 1:success / 0xFF:failure
+#   0xA3 REPLAY_TX_COUNT = saturating count of replayed transactions
+#   0xA4 COMMIT_TX_COUNT = saturating count of in-boot commit_tx successes
+enum Jbd2CmosSlot {
+    JBD2_CMOS_PROBE_OUTCOME   = 0xA0;
+    JBD2_CMOS_REPLAY_ATTEMPT  = 0xA1;
+    JBD2_CMOS_REPLAY_OUTCOME  = 0xA2;
+    JBD2_CMOS_REPLAY_TX_COUNT = 0xA3;
+    JBD2_CMOS_COMMIT_TX_COUNT = 0xA4;
+}
+
+# Extended-bank CMOS write (port 0x72 = index, 0x73 = data; offset = slot - 0x80
+# per boot_shim.cyr's CC fix). Slots 0x80-0xFF.
+fn jbd2_cmos_write(slot, val) {
+    outb(0x72, slot - 0x80);
+    outb(0x73, val & 0xFF);
+    return 0;
+}
+
+# Saturating-increment helper. Reads current value, increments by 1 unless
+# already 0xFF (so post-mortem can tell "happened ≥ N" without overflow wrap).
+fn jbd2_cmos_inc(slot) {
+    outb(0x72, slot - 0x80);
+    var cur = inb(0x73);
+    if (cur < 0xFF) {
+        outb(0x72, slot - 0x80);
+        outb(0x73, cur + 1);
+    }
+    return 0;
+}
+
 # Journal-superblock magic + blocktype tags + feature flags (jbd2).
 enum Jbd2Blocktype {
     JBD2_MAGIC                          = 0xC03B3998;
@@ -3709,14 +3749,27 @@ fn ext2_jbd2_probe() {
     ext2_jbd2_present = 0;
     ext2_jbd2_clean = 0;
 
+    # 1.38.9 iron-burn automation: preset all JBD2 CMOS slots at the top of
+    # probe. Presets are the "nothing-good-happened-here" sentinels so any
+    # malformed-return below just leaves them in place. Success paths
+    # overwrite the relevant slot before their return. Counters start at 0
+    # (saturating-increment helpers will bump as work happens).
+    jbd2_cmos_write(JBD2_CMOS_PROBE_OUTCOME,   0xFF);    # malformed until probe succeeds
+    jbd2_cmos_write(JBD2_CMOS_REPLAY_ATTEMPT,  0);
+    jbd2_cmos_write(JBD2_CMOS_REPLAY_OUTCOME,  0);
+    jbd2_cmos_write(JBD2_CMOS_REPLAY_TX_COUNT, 0);
+    jbd2_cmos_write(JBD2_CMOS_COMMIT_TX_COUNT, 0);
+
     var compat = ext2_sb_feature_compat(&ext2_sb_buf);
     if ((compat & EXT2_FEATURE_COMPAT_HAS_JOURNAL) == 0) {
-        return 0;                              # no journal — done
+        jbd2_cmos_write(JBD2_CMOS_PROBE_OUTCOME, 0);     # 0 = no-journal
+        return 0;                                         # no journal — done
     }
 
     ext2_jbd2_inum = ext2_sb_journal_inum(&ext2_sb_buf);
     if (ext2_jbd2_inum == 0) {
         kprintln("jbd2: has_journal set but s_journal_inum=0 -- malformed", 56);
+        # PROBE_OUTCOME stays 0xFF (preset above)
         return 0 - 2;
     }
 
@@ -3811,6 +3864,7 @@ fn ext2_jbd2_probe() {
         kprint(" seq=", 5);
         kprint_num(ext2_jbd2_sequence);
         kprintln("", 0);
+        jbd2_cmos_write(JBD2_CMOS_PROBE_OUTCOME, 1);     # 1 = clean
         return 0;
     }
 
@@ -3824,6 +3878,7 @@ fn ext2_jbd2_probe() {
     kprint(" seq=", 5);
     kprint_num(ext2_jbd2_sequence);
     kprintln(" -- refusing RW mount (replay lands at 1.38.2)", 46);
+    jbd2_cmos_write(JBD2_CMOS_PROBE_OUTCOME, 2);         # 2 = dirty
     return 0 - 1;
 }
 
@@ -4290,6 +4345,11 @@ fn ext2_jbd2_commit_tx() {
     ext2_jbd2_tx_active = 0;
     ext2_jbd2_tx_count  = 0;
     ext2_jbd2_log_head  = 1;
+
+    # 1.38.9 iron-burn automation: saturating-increment the commit count
+    # so a post-burn `read-boot-log` can confirm AGNOS produced N journaled
+    # writes this boot (proves the 1.38.6 integration path actually fired).
+    jbd2_cmos_inc(JBD2_CMOS_COMMIT_TX_COUNT);
 
     kprint("jbd2: commit_tx: COMMITTED seq=", 31);
     kprint_num(ext2_jbd2_tx_seq);
@@ -4810,6 +4870,10 @@ fn ext2_jbd2_replay() {
     var saved_write_ok = ext2_write_ok;
     ext2_write_ok = 1;
 
+    # 1.38.9 iron-burn automation: stamp REPLAY_ATTEMPT = 1 the moment we
+    # enter the apply loop. Subsequent stamps update OUTCOME + TX_COUNT.
+    jbd2_cmos_write(JBD2_CMOS_REPLAY_ATTEMPT, 1);
+
     var blk = ext2_jbd2_start;
     var seq = ext2_jbd2_sequence;
     var safety_cap = 64;
@@ -4820,6 +4884,7 @@ fn ext2_jbd2_replay() {
         if (consumed < 0) {
             kprintln("jbd2: replay: ABORTED -- FS may be in mixed state", 49);
             ext2_write_ok = 0;                                      # safety: refuse RW
+            jbd2_cmos_write(JBD2_CMOS_REPLAY_OUTCOME, 0xFF);        # failure
             return 0 - 1;
         }
         if (consumed == 0) { break; }                              # end of log
@@ -4830,6 +4895,7 @@ fn ext2_jbd2_replay() {
     # Replay walked clean. Rewrite the journal SB.
     if (ext2_jbd2_rewrite_sb_clean(seq) != 0) {
         ext2_write_ok = 0;
+        jbd2_cmos_write(JBD2_CMOS_REPLAY_OUTCOME, 0xFF);            # failure (SB-clean rewrite)
         return 0 - 1;
     }
 
@@ -4847,6 +4913,13 @@ fn ext2_jbd2_replay() {
     # `e2fsck -fn` see "cleanly unmounted" rather than warning about
     # the dirty bit ext2_mark_dirty cleared during replay's writes.
     ext2_sync();
+
+    # 1.38.9 iron-burn automation: replay succeeded — stamp OUTCOME=1 + the
+    # replayed-tx count (saturating byte; covers tx counts ≤ 255 directly).
+    jbd2_cmos_write(JBD2_CMOS_REPLAY_OUTCOME, 1);
+    var replayed = ext2_jbd2_replay_count;
+    if (replayed > 0xFF) { replayed = 0xFF; }
+    jbd2_cmos_write(JBD2_CMOS_REPLAY_TX_COUNT, replayed);
 
     kprint("jbd2: replay: APPLIED ", 22);
     kprint_num(ext2_jbd2_replay_count);

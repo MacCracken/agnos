@@ -5,6 +5,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.9] — 2026-05-28 (**Iron-burn automation — CMOS-stamped JBD2 telemetry + host wrappers.** Three layers of automation that drop iron-burn-cycle friction without needing a serial cable (archaemenid has none per [[feedback_no_serial_on_iron]]). Layer 3 stamps the JBD2 paths into CMOS slots 0xA0-0xA4 so a post-burn `read-boot-log` can confirm probe-outcome / replay-fired+outcome / replayed-tx-count / commit-tx-count — survives reboot, no FB-camera needed. Layer 1 wraps the build+flash and the post-burn validate into single commands. Layer 2 bundles multiple tests per boot. The combination drops the burn cadence from the audit doc's 4-5 flashes-per-rubric down to 3.)
+
+### Added — Layer 3: CMOS-stamped JBD2 telemetry (kernel)
+
+- **`ext2.cyr`** — new `Jbd2CmosSlot` enum + `jbd2_cmos_write(slot, val)` + `jbd2_cmos_inc(slot)` (saturating-byte increment). Slot map at 0xA0-0xA4 — virgin scratch range; existing CMOS map uses through 0x8C (boot/r8169/xhci/net) + 0x90-0x9F (`fb_console.cyr` FB-geometry post-mortem); 0xA0+ is fresh.
+- **`ext2.cyr` `ext2_jbd2_probe`** — presets all 5 slots at function top (PROBE_OUTCOME=0xFF malformed-default; replay/commit counters=0). Success paths overwrite PROBE_OUTCOME (0=no-journal / 1=clean / 2=dirty); malformed-return paths leave 0xFF in place. Clean preset clears counters from any prior boot's stamps.
+- **`ext2.cyr` `ext2_jbd2_replay`** — stamps REPLAY_ATTEMPT=1 at the apply-loop entry; REPLAY_OUTCOME=1 + REPLAY_TX_COUNT (saturating) on success; REPLAY_OUTCOME=0xFF on torn-malformed or SB-rewrite failure.
+- **`ext2.cyr` `ext2_jbd2_commit_tx`** — `jbd2_cmos_inc(COMMIT_TX_COUNT)` at the end of every successful commit (post-checkpoint, post-SB-clean). Proves the 1.38.6 integration path actually fired during a boot.
+- **`agnosticos/scripts/src/read-boot-log.cyr`** — extended to read slots 0xA0-0xA4 + emit a `--- JBD2 iron-burn telemetry (1.38.9+) ---` section with verdict lines (`PROBE: CLEAN/DIRTY/MALFORMED/no-journal`; `REPLAY: SUCCESS, applied N tx, SB now clean` / `REPLAY: FAILED`; `COMMIT: AGNOS produced N journaled commits this boot`; plus warn lines for inconsistent states like `probe=DIRTY but replay=not-attempted`).
+
+### Added — Layer 1: host-side wrappers (single-command prep + validate)
+
+- **`agnosticos/scripts/iron-jbd2-prep.sh`** — `sh iron-jbd2-prep.sh {production|no-replay|replay|integration|crash} [partition_offset]`. Builds agnos with the right env-var gate for the variant; for `replay`, pre-stages the dirty journal via `mk-dirty-journal-img.py`; runs `install-usb.sh --update` (ESP-only flash so agnos-fs persists). One command per variant; replaces the manual "remember-which-env-var-this-variant-needs + build + maybe-dirty-prep + flash" sequence.
+- **`agnosticos/scripts/iron-jbd2-validate.sh`** — `sudo sh iron-jbd2-validate.sh`. Reads CMOS JBD2 telemetry via `read-boot-log`; runs `e2fsck -fn /dev/nvme0n1p2`; parses on-disk journal SB (Python — magic / s_start / s_sequence / verdict). All read-only; safe to run after any burn.
+
+### Added — Layer 2: bundled multi-test boots
+
+Documentation update — the audit doc's `§ 7 Burn-day flow` now has two flows: a manual flow (1.38.8-era, 4-5 burns) and an automated flow (1.38.9+, 3 burns) using Layer 1 + 2 + 3 together. Recommended cadence laid out as a per-variant table in `agnosticos/docs/development/ext4-jbd2-iron-burn-audit.md`.
+
+### Validation
+
+- `test.sh` 4/4, `check.sh` 11/11.
+- `jbd2-replay-smoke.sh` regression-clean (CMOS stamps don't break the existing path; e2fsck `AGNOS-EXT: 12/17152 files (8.3% non-contiguous), 2146/17152 blocks`).
+- Production build 986,656 → **987,544 B** (+888 — CMOS helpers + stamp call sites).
+
 ## [1.38.8] — 2026-05-28 (**JBD2 arc-close hardening — replay-side ingress validation + iron-burn pre-audit doc.** Parallels the 1.35.7 arc-close hardening pass (ingress IP-length clamp). Adds defensive bounds checks to the JBD2 replay path — the only untrusted-input surface of the JBD2 stack (the journal content is whatever was on disk when AGNOS booted; the write side trusts its own callers). NO new functional surface — the existing replay-then-e2fsck-clean behavior is unchanged; the hardening only adds REFUSALS for malformed inputs that would otherwise off-end or stomp foundational FS metadata. Plus the **iron-burn pre-audit doc** in agnosticos, the line-by-line rubric the user-driven burn will follow.)
 
 ### Added — replay-path bounds checks
