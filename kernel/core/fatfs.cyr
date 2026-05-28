@@ -272,7 +272,7 @@ fn fatfs_print_name(entry_ptr) {
         namelen = namelen - 1;
     }
     for (var i = 0; i < namelen; i = i + 1) {
-        serial_putc(load8(entry_ptr + i));
+        kputc(load8(entry_ptr + i));   # FB-visible (1.39.2): was serial_putc
     }
     # Print extension (3 chars, skip trailing spaces)
     var extlen = 3;
@@ -281,9 +281,9 @@ fn fatfs_print_name(entry_ptr) {
         extlen = extlen - 1;
     }
     if (extlen > 0) {
-        serial_putc(46);  # '.'
+        kputc(46);  # '.'
         for (var i = 0; i < extlen; i = i + 1) {
-            serial_putc(load8(entry_ptr + 8 + i));
+            kputc(load8(entry_ptr + 8 + i));
         }
     }
     return 0;
@@ -310,12 +310,12 @@ fn fatfs_ls_sector(entries_per_sector, count_ptr) {
         var attr = load8(ep + 11);
         if (attr == 0x0F) { continue; }
         if ((attr & 0x08) != 0) { continue; }
-        serial_print("  ", 2);
+        kprint("  ", 2);
         fatfs_print_name(ep);
         var fsize = fatfs_entry_size(ep);
-        serial_print("  ", 2);
+        kprint("  ", 2);
         kprint_num(fsize);
-        serial_println(" bytes", 6);
+        kprintln(" bytes", 6);
         var cnt = load64(count_ptr);
         store64(count_ptr, cnt + 1);
     }
@@ -323,7 +323,7 @@ fn fatfs_ls_sector(entries_per_sector, count_ptr) {
 }
 
 fn fatfs_ls() {
-    if (fatfs_active == 0) { serial_println("no filesystem", 13); return 0; }
+    if (fatfs_active == 0) { kprintln("no filesystem", 13); return 0; }
     var entries_per_sector = 512 / 32;
     var count = 0;
 

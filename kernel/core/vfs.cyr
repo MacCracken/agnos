@@ -73,6 +73,18 @@ fn vfs_open_secondary(name, namelen) {
     return initrd_open(name, namelen);
 }
 
+# Generic directory-listing dispatch for the non-ext2 primary case (1.39.2 —
+# VFS generic-write lift, bite 2). ext2 is listed by the caller (path/CWD-
+# aware, via ext2_print_dir on a resolved inode); this lists the FAT or
+# exFAT *root* when one of them is the mounted primary (single-primary-FS
+# model — ext2 wins when present). Returns the entry count, or -1 when no
+# secondary FS is mounted. Root-only; FAT/exFAT subdir paths deferred.
+fn vfs_print_dir_secondary() {
+    if (fatfs_active != 0) { return fatfs_ls(); }
+    if (exfat_active != 0) { return exfat_print_dir(); }
+    return 0 - 1;
+}
+
 fn vfs_read_signalfd(base, buf) {
     var sigmask = load64(base + 24);
     var pending = load64(&proc_signals + proc_current * 8);

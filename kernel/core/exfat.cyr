@@ -565,6 +565,82 @@ fn exfat_ls() {
     return count;
 }
 
+# FB-visible root directory listing (1.39.2 VFS lift bite 2). Mirrors
+# exfat_find's typed dir-set walk (0x85 File -> 0xC0 Stream Extension
+# (NameLength, DataLength) -> N x 0xC1 File Name, 15 UTF-16 chars each), but
+# on each completed set reconstructs the ASCII name into exfat_name_buf and
+# prints "  <name>  <size> bytes" via kprint (iron-visible, unlike exfat_ls
+# which only COUNTS). This is what the shell `ls` verb dispatches to for an
+# exFAT primary FS. Returns the entry count. Root-only (subdir walk deferred).
+fn exfat_print_dir() {
+    if (exfat_active == 0) { kprintln("no filesystem", 13); return 0; }
+    var eps = 512 / 32;
+    var clus = exfat_root_cluster;
+    var max_c = exfat_cluster_count + 2;
+    var guard = 0;
+    var count = 0;
+    var collecting = 0;          # 1 while inside a 0x85 set
+    var remaining = 0;           # secondary entries still to consume
+    var name_chars = 0;          # NameLength from the 0xC0 entry
+    var name_got = 0;            # chars accumulated into exfat_name_buf
+    var set_len = 0;             # DataLength from the 0xC0 entry
+    while (clus >= 2) {
+        if (clus >= max_c) { return count; }
+        var base = exfat_cluster_sector(clus);
+        for (var s = 0; s < exfat_sectors_per_cluster; s = s + 1) {
+            if (exfat_blk_read(base + s, &exfat_dir_buf) != 0) { return count; }
+            for (var e = 0; e < eps; e = e + 1) {
+                var ep = &exfat_dir_buf + e * 32;
+                var t = load8(ep);
+                if (collecting == 0) {
+                    if (t == 0x00) { return count; }             # end of directory
+                    if (t == 0x85) {                             # File (set primary)
+                        remaining = load8(ep + 1);               # SecondaryCount
+                        collecting = 1;
+                        name_chars = 0;
+                        name_got = 0;
+                        set_len = 0;
+                    }
+                } else {
+                    if (t == 0xC0) {                             # Stream Extension
+                        name_chars = load8(ep + 3);              # NameLength (chars)
+                        set_len = exfat_rd32(ep, 24);            # DataLength (low 32 bits)
+                    } else {
+                        if (t == 0xC1) {                         # File Name (15 UTF-16)
+                            var j = 0;
+                            while (j < 15) {
+                                if (name_got < name_chars) {
+                                    if (name_got < 255) {
+                                        store8(&exfat_name_buf + name_got, load8(ep + 2 + j * 2));
+                                    }
+                                    name_got = name_got + 1;
+                                }
+                                j = j + 1;
+                            }
+                        }
+                    }
+                    remaining = remaining - 1;
+                    if (remaining == 0) {                        # set complete -> print
+                        collecting = 0;
+                        var pc = name_chars;
+                        if (pc > 255) { pc = 255; }
+                        kprint("  ", 2);
+                        kprint(&exfat_name_buf, pc);
+                        kprint("  ", 2);
+                        kprint_num(set_len);
+                        kprintln(" bytes", 6);
+                        count = count + 1;
+                    }
+                }
+            }
+        }
+        clus = exfat_next_cluster(clus);
+        guard = guard + 1;
+        if (guard > max_c) { return count; }
+    }
+    return count;
+}
+
 # === Write path (1.34.1 bite 3) ===
 
 # Partition-relative block write — mirror of exfat_blk_read. ESP-write safety

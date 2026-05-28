@@ -112,6 +112,14 @@ if strings "$LOG" | grep -q "VFS-CAT-FAT-OK"; then
 else
     echo "  FAIL: shell cat over FAT (no 'VFS-CAT-FAT-OK' in log)"; rc=1
 fi
+# 1.39.2 VFS-lift bite 2: the shell `ls` verb lists a FAT root via
+# vfs_print_dir_secondary → fatfs_ls (now FB-visible). The kernel ran `ls`;
+# the staged file's 8.3 name must appear in the log.
+if strings "$LOG" | grep -q "CATTEST.TXT"; then
+    echo "  PASS: shell 'ls' lists FAT root (FB-visible names via fatfs_ls)"
+else
+    echo "  FAIL: shell ls over FAT (no 'CATTEST.TXT' name in log)"; rc=1
+fi
 
 echo ""
 echo "=========================================="

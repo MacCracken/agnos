@@ -5,6 +5,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.39.2] — 2026-05-28 (**VFS generic-write lift — bite 2: `ls` lists FAT/exFAT.** Read-side, second rung. `sh_cmd_ls` was ext2-only (`ls: no ext2 filesystem mounted`); the FAT lister emitted via `serial_print` (invisible on iron per the no-serial constraint) and the exFAT lister only *counted* entries. This cut makes `ls` list a FAT/exFAT primary's root with FB-visible names + sizes, via a generic directory-dispatch seam. Single-primary-FS: ext2 still wins when mounted; FAT/exFAT root lists when it's the primary. Additive, zero-risk to the ext2 path.)
+
+### Added
+
+- **`vfs_print_dir_secondary()`** (`kernel/core/vfs.cyr`) — generic directory-listing dispatch for the non-ext2 primary: `fatfs_ls` (FAT) or `exfat_print_dir` (exFAT), returning the entry count or -1 when no secondary FS is mounted. The `ls` analog of bite 1's `vfs_open_secondary`.
+- **`exfat_print_dir()`** (`kernel/core/exfat.cyr`) — FB-visible exFAT root lister with **name reconstruction**: mirrors the validated `exfat_find` typed dir-set walk (`0x85` File → `0xC0` Stream Extension → N × `0xC1` File Name, 15 UTF-16 chars each), printing `  <name>  <size> bytes` per completed set. Previously `exfat_ls` only counted entries.
+
+### Changed
+
+- **`fatfs_print_name` / `fatfs_ls_sector` / `fatfs_ls`** (`kernel/core/fatfs.cyr`) — output converted from `serial_*` (iron-invisible) to FB (`kputc`/`kprint`/`kprintln`). The count return is unchanged, so the FATFS selftest's `lscount` contract is preserved; names are now visible on real hardware.
+- **`sh_cmd_ls`** (`kernel/user/shell.cyr`) — the ext2-absent branch now falls through to `vfs_print_dir_secondary` instead of erroring. `ls` lists a FAT/exFAT root for the first time. The ext2-active path is untouched (change isolated to the `ext2_active == 0` branch).
+
+### Validation
+
+- `fat-smoke.sh`: drives `ls` via `sh_exec`; the staged `CATTEST.TXT` 8.3 name appears in the boot log → **PASS** (`shell 'ls' lists FAT root`). FAT mount + chain-read + bite-1 `cat` gates still green.
+- `exfat-smoke.sh`: `ls` dispatch runs clean (marker printed + boot reaches the shell, so `exfat_print_dir` returned) → **PASS**. exFAT name reconstruction is logic-mirrored from the e2e-validated `exfat_find` and gets a full name assertion under `EXFAT_SEED=1` (the seeded-file path; default volume is empty as exFAT has no userspace injector).
+- `check.sh` 11/11, `test.sh` 4/4. Production build **994,824 B** (+1,736 vs 1.39.1 for the exFAT lister + dispatch), multiboot2 OK.
+
+### Not yet (next bites)
+
+- Generic create/write (`touch`/`echo >`) — bite 3 (1.39.3).
+- unlink/mkdir/rmdir (1.39.4), rename + `sync` (1.39.5), mount-registry consolidation + arc-close hardening + iron burn (1.39.6).
+- FAT/exFAT *subdirectory* paths in `cat`/`ls` (currently root-only) — folds into the write bites or a later refinement.
+
 ## [1.39.1] — 2026-05-28 (**VFS generic-write lift — bite 1: `cat` reaches FAT/exFAT.** The 1.39.x arc's first engineering rung. Until now every shell read/write verb was hardwired to ext2 — `cat` tried ext2 then initrd and **never** touched the FAT/exFAT volumes, even though their read/write code (1.34.x) is `fsck`-clean. This cut adds the generic read-dispatch seam: `cat` now falls through to FAT, then exFAT, then initrd. Read-side first by design — additive, zero-risk to the iron-validated ext2 write/journal path. Arc plan: agnosticos [`vfs-generic-write-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/vfs-generic-write-prior-art.md).)
 
 ### Added

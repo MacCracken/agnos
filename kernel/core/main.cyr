@@ -499,6 +499,12 @@ if (fatfs_active == 1) {
     # now reaches FAT (previously ext2-or-initrd only). fat-smoke.sh gates it.
     kprintln("vfscat: shell cat over FAT ->", 29);
     sh_exec("cat CATTEST.TXT", 15);
+    # 1.39.2 VFS-lift bite 2: drive the real shell `ls` verb. ext2 is
+    # unmounted, so sh_cmd_ls falls through to vfs_print_dir_secondary ->
+    # fatfs_ls (now FB-visible). The 8.3 names (CATTEST.TXT, FATTEST.BIN)
+    # printing below prove `ls` lists a FAT root. fat-smoke.sh gates it.
+    kprintln("vfsls: shell ls over FAT ->", 27);
+    sh_exec("ls", 2);
 }
 #endif
 
@@ -694,6 +700,13 @@ if (exfat_active == 1) {
     } else {
         kprintln("exfatr: no seeded file (mount + upcase gates only)", 49);
     }
+    # 1.39.2 VFS-lift bite 2: drive the real shell `ls` over exFAT. ext2 is
+    # unmounted -> sh_cmd_ls falls through to vfs_print_dir_secondary ->
+    # exfat_print_dir (name reconstruction, a mirror of the validated
+    # exfat_find set-walk). On an unseeded volume it prints no file names but
+    # proves the dispatch runs clean; under EXFAT_SEED=1 the seeded name lists.
+    kprintln("vfsls: shell ls over exFAT ->", 29);
+    sh_exec("ls", 2);
 }
 #endif
 

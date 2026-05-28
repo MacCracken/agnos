@@ -172,6 +172,22 @@ elif strings "$LOG" | grep -q "^exfatr: file-read OK"; then
 elif strings "$LOG" | grep -q "^exfatr: no seeded file"; then
     echo "  (info) no seeded file — file-set read path compiled, run EXFAT_SEED=1 to exercise it"
 fi
+# 1.39.2 VFS-lift bite 2: the shell `ls` verb reaches exFAT via
+# vfs_print_dir_secondary → exfat_print_dir. Dispatch must run clean (marker
+# printed AND boot reaches the shell after, so exfat_print_dir returned);
+# when seeded, the reconstructed name must list.
+if strings "$LOG" | grep -q "vfsls: shell ls over exFAT" && strings "$LOG" | grep -q "AGNOS shell"; then
+    echo "  PASS: shell 'ls' dispatches to exFAT (exfat_print_dir ran clean, boot completed)"
+else
+    echo "  FAIL: shell ls over exFAT (no 'vfsls' marker or boot didn't complete)"; rc=1
+fi
+if [ "$SEEDED" = "1" ]; then
+    if strings "$LOG" | grep -q "EXFTEST.BIN"; then
+        echo "  PASS: shell 'ls' lists exFAT name (exfat_print_dir reconstruction)"
+    else
+        echo "  FAIL: exFAT ls name (no 'EXFTEST.BIN' in log)"; rc=1
+    fi
+fi
 
 echo ""
 echo "=========================================="

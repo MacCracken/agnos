@@ -368,7 +368,13 @@ fn sh_cmd_cat(arg, arglen) {
 }
 
 fn sh_cmd_ls(arg, arglen) {
-    if (ext2_active == 0) { kprintln("ls: no ext2 filesystem mounted", 30); return 0; }
+    if (ext2_active == 0) {
+        # Single-primary fallthrough (1.39.2 VFS lift bite 2): no ext2 ->
+        # list a FAT/exFAT primary's root instead (FB-visible names + sizes).
+        # Subdir paths on FAT/exFAT are deferred; root listing is the win.
+        if (vfs_print_dir_secondary() >= 0) { return 0; }
+        kprintln("ls: no filesystem mounted", 25); return 0;
+    }
     # Parse args: skip leading whitespace, then any flag tokens
     # (start with `-`). Flags are accepted syntactically but produce
     # no behavioral change yet — Phase-3 listing format is fixed.
