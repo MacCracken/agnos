@@ -159,6 +159,12 @@ else
         [ -n "$MMAP_SELFTEST" ]  && echo '#define MMAP_SELFTEST'
         [ -n "$RTC_SELFTEST" ]   && echo '#define RTC_SELFTEST'
         [ -n "$HARDENING_SELFTEST" ] && echo '#define HARDENING_SELFTEST'
+        # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
+        # rather than via cyrius dep resolution because `cyrius build` looks
+        # for cyrius.cyml at cwd and we cd into kernel/ for relative include
+        # resolution. The [deps.kashi] block in cyrius.cyml documents the
+        # contract; this cat is the mechanism. Zero-stdlib by construction.
+        cat "$ROOT/../kashi/src/font_data.cyr"
         cat "$ROOT/kernel/agnos.cyr"
     } > "$PREPPED"
     (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" "$ROOT/build/agnos")

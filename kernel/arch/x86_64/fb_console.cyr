@@ -19,12 +19,17 @@
 # Font: IBM VGA BIOS 8x16 ROM font (public domain, IBM 1981; same byte
 # table Linux's lib/fonts/font_8x16.c carries). Covers printable ASCII
 # 0x20..0x7F (96 glyphs, 1536 bytes). Each glyph is 16 bytes top-to-bottom;
-# bit 7 = leftmost pixel of that row. Stored packed as two u64s per glyph
-# via fset16(ch, hi, lo) — hi = rows 0-7, lo = rows 8-15 — so each literal
-# reads top-to-bottom: 0xR0R1R2R3R4R5R6R7 0xR8R9RARBRCRDRERF. Replaced
-# the hand-drawn 8x8 CGA bitmap because at 2K+ native HDMI the 8x8
-# source was illegible (~0.55% of screen height per row at 1440p). Cell
-# dimensions are now non-square: cell_w = 8*scale, cell_h = 16*scale.
+# bit 7 = leftmost pixel of that row. As of agnos 1.37.5 the glyph data
+# + accessors live in the **kashi** freestanding font-data core
+# (`../kashi/src/font_data.cyr`, pulled via `[deps.kashi]` in cyrius.cyml);
+# this module only renders. `kashi_font_init()` populates kashi's BSS once
+# from packed u64 literals, then per-glyph render queries `kashi_glyph_ptr`/
+# `kashi_glyph_row` against `KASHI_FONT_VGA_8X16`. Cell dimensions stay
+# non-square: cell_w = 8*scale, cell_h = 16*scale. The 8x16 source replaced
+# the hand-drawn 8x8 CGA bitmap because at 2K+ native HDMI the 8x8 source
+# was illegible (~0.55% of screen height per row at 1440p); the 8x8 table
+# is retained in kashi (`KASHI_FONT_CGA_8X8`) for future low-res / dense-grid
+# uses but agnos's kernel console doesn't render it.
 #
 # Color: white foreground on black background. Both pixels are painted
 # per glyph cell (no transparency) so the console area paints fully even
@@ -41,7 +46,9 @@
 # kprint.cyr (which wraps fb_putc into the kernel-wide print API).
 # Ordering enforced by kernel/agnos.cyr include order.
 
-var fb_font[1536];       # 96 glyphs (0x20..0x7F) x 16 bytes (VGA 8x16)
+# Glyph BSS + per-glyph init lives in kashi (1.37.5 fold-in). Accessors used:
+#   kashi_font_init()                          # called once below
+#   kashi_glyph_ptr(KASHI_FONT_VGA_8X16, ch)   # base of 16 row bytes for `ch`
 var fb_cur_x = 0;        # cursor column (in 8*scale-px cells from x=0)
 var fb_cur_y = 0;        # cursor row (in 16*scale-px cells from FB_CONSOLE_Y0)
 var fb_console_ready = 0;
@@ -59,31 +66,6 @@ var fb_console_ready = 0;
 fn cmos_ext_write(slot, val) {
     outb(0x72, slot - 0x80);
     outb(0x73, val);
-    return 0;
-}
-
-# Pack one glyph's 16 row-bytes into fb_font[glyph_index*16 .. +15].
-# Row order: hi.byte7 (top) = rows 0-7 high-to-low, lo.byte7 = rows 8-15.
-# That way each literal reads top-to-bottom across two u64s as
-# 0xR0R1R2R3R4R5R6R7 0xR8R9RARBRCRDRERF.
-fn fset16(ch, hi, lo) {
-    var g = &fb_font + (ch - 0x20) * 16;
-    store8(g +  0, (hi >> 56) & 0xFF);
-    store8(g +  1, (hi >> 48) & 0xFF);
-    store8(g +  2, (hi >> 40) & 0xFF);
-    store8(g +  3, (hi >> 32) & 0xFF);
-    store8(g +  4, (hi >> 24) & 0xFF);
-    store8(g +  5, (hi >> 16) & 0xFF);
-    store8(g +  6, (hi >>  8) & 0xFF);
-    store8(g +  7, hi & 0xFF);
-    store8(g +  8, (lo >> 56) & 0xFF);
-    store8(g +  9, (lo >> 48) & 0xFF);
-    store8(g + 10, (lo >> 40) & 0xFF);
-    store8(g + 11, (lo >> 32) & 0xFF);
-    store8(g + 12, (lo >> 24) & 0xFF);
-    store8(g + 13, (lo >> 16) & 0xFF);
-    store8(g + 14, (lo >>  8) & 0xFF);
-    store8(g + 15, lo & 0xFF);
     return 0;
 }
 
@@ -234,105 +216,10 @@ fn fb_console_init() {
             }
         }
     }
-    # Printable ASCII 0x20..0x7F. IBM VGA BIOS 8x16 ROM font (public domain).
-    # Same byte table Linux's lib/fonts/font_8x16.c carries. Each call sets
-    # 16 rows top-to-bottom; hi = rows 0-7, lo = rows 8-15.
-    fset16(0x20, 0x0000000000000000, 0x0000000000000000);  # space
-    fset16(0x21, 0x0000183C3C3C1818, 0x1800181800000000);  # !
-    fset16(0x22, 0x0066666624000000, 0x0000000000000000);  # "
-    fset16(0x23, 0x0000006C6CFE6C6C, 0x6CFE6C6C00000000);  # #
-    fset16(0x24, 0x18187CC6C2C07C06, 0x0686C67C18180000);  # $
-    fset16(0x25, 0x00000000C2C60C18, 0x3060C68600000000);  # %
-    fset16(0x26, 0x0000386C6C3876DC, 0xCCCCCC7600000000);  # &
-    fset16(0x27, 0x0030303060000000, 0x0000000000000000);  # '
-    fset16(0x28, 0x00000C1830303030, 0x3030180C00000000);  # (
-    fset16(0x29, 0x000030180C0C0C0C, 0x0C0C183000000000);  # )
-    fset16(0x2A, 0x0000000000663CFF, 0x3C66000000000000);  # *
-    fset16(0x2B, 0x000000000018187E, 0x1818000000000000);  # +
-    fset16(0x2C, 0x0000000000000000, 0x0018181830000000);  # ,
-    fset16(0x2D, 0x00000000000000FE, 0x0000000000000000);  # -
-    fset16(0x2E, 0x0000000000000000, 0x0000181800000000);  # .
-    fset16(0x2F, 0x0000000002060C18, 0x3060C08000000000);  # /
-    fset16(0x30, 0x0000386CC6C6D6D6, 0xC6C66C3800000000);  # 0
-    fset16(0x31, 0x0000183878181818, 0x1818187E00000000);  # 1
-    fset16(0x32, 0x00007CC6060C1830, 0x60C0C6FE00000000);  # 2
-    fset16(0x33, 0x00007CC606063C06, 0x0606C67C00000000);  # 3
-    fset16(0x34, 0x00000C1C3C6CCCFE, 0x0C0C0C1E00000000);  # 4
-    fset16(0x35, 0x0000FEC0C0C0FC06, 0x0606C67C00000000);  # 5
-    fset16(0x36, 0x00003860C0C0FCC6, 0xC6C6C67C00000000);  # 6
-    fset16(0x37, 0x0000FEC606060C18, 0x3030303000000000);  # 7
-    fset16(0x38, 0x00007CC6C6C67CC6, 0xC6C6C67C00000000);  # 8
-    fset16(0x39, 0x00007CC6C6C67E06, 0x06060C7800000000);  # 9
-    fset16(0x3A, 0x0000000018180000, 0x0018180000000000);  # :
-    fset16(0x3B, 0x0000000018180000, 0x0018183000000000);  # ;
-    fset16(0x3C, 0x000000060C183060, 0x30180C0600000000);  # <
-    fset16(0x3D, 0x00000000007E0000, 0x7E00000000000000);  # =
-    fset16(0x3E, 0x0000006030180C06, 0x0C18306000000000);  # >
-    fset16(0x3F, 0x00007CC6C60C1818, 0x1800181800000000);  # ?
-    fset16(0x40, 0x0000007CC6C6DEDE, 0xDEDCC07C00000000);  # @
-    fset16(0x41, 0x000010386CC6C6FE, 0xC6C6C6C600000000);  # A
-    fset16(0x42, 0x0000FC6666667C66, 0x666666FC00000000);  # B
-    fset16(0x43, 0x00003C66C2C0C0C0, 0xC0C2663C00000000);  # C
-    fset16(0x44, 0x0000F86C66666666, 0x66666CF800000000);  # D
-    fset16(0x45, 0x0000FE6662687868, 0x606266FE00000000);  # E
-    fset16(0x46, 0x0000FE6662687868, 0x606060F000000000);  # F
-    fset16(0x47, 0x00003C66C2C0C0DE, 0xC6C6663A00000000);  # G
-    fset16(0x48, 0x0000C6C6C6C6FEC6, 0xC6C6C6C600000000);  # H
-    fset16(0x49, 0x00003C1818181818, 0x1818183C00000000);  # I
-    fset16(0x4A, 0x00001E0C0C0C0C0C, 0xCCCCCC7800000000);  # J
-    fset16(0x4B, 0x0000E666666C7878, 0x6C6666E600000000);  # K
-    fset16(0x4C, 0x0000F06060606060, 0x606266FE00000000);  # L
-    fset16(0x4D, 0x0000C6EEFEFED6C6, 0xC6C6C6C600000000);  # M
-    fset16(0x4E, 0x0000C6E6F6FEDECE, 0xC6C6C6C600000000);  # N
-    fset16(0x4F, 0x00007CC6C6C6C6C6, 0xC6C6C67C00000000);  # O
-    fset16(0x50, 0x0000FC6666667C60, 0x606060F000000000);  # P
-    fset16(0x51, 0x00007CC6C6C6C6C6, 0xC6D6DE7C0C0E0000);  # Q
-    fset16(0x52, 0x0000FC6666667C6C, 0x666666E600000000);  # R
-    fset16(0x53, 0x00007CC6C660380C, 0x06C6C67C00000000);  # S
-    fset16(0x54, 0x00007E7E5A181818, 0x1818183C00000000);  # T
-    fset16(0x55, 0x0000C6C6C6C6C6C6, 0xC6C6C67C00000000);  # U
-    fset16(0x56, 0x0000C6C6C6C6C6C6, 0xC66C381000000000);  # V
-    fset16(0x57, 0x0000C6C6C6C6D6D6, 0xD6FEEE6C00000000);  # W
-    fset16(0x58, 0x0000C6C66C7C3838, 0x7C6CC6C600000000);  # X
-    fset16(0x59, 0x0000666666663C18, 0x1818183C00000000);  # Y
-    fset16(0x5A, 0x0000FEC6860C1830, 0x60C2C6FE00000000);  # Z
-    fset16(0x5B, 0x00003C3030303030, 0x3030303C00000000);  # [
-    fset16(0x5C, 0x00000080C0E07038, 0x1C0E060200000000);  # backslash
-    fset16(0x5D, 0x00003C0C0C0C0C0C, 0x0C0C0C3C00000000);  # ]
-    fset16(0x5E, 0x10386CC600000000, 0x0000000000000000);  # ^
-    fset16(0x5F, 0x0000000000000000, 0x0000000000FF0000);  # _
-    fset16(0x60, 0x0030180C00000000, 0x0000000000000000);  # `
-    fset16(0x61, 0x0000000000780C7C, 0xCCCCCC7600000000);  # a
-    fset16(0x62, 0x0000E06060786C66, 0x6666667C00000000);  # b
-    fset16(0x63, 0x00000000007CC6C0, 0xC0C0C67C00000000);  # c
-    fset16(0x64, 0x00001C0C0C3C6CCC, 0xCCCCCC7600000000);  # d
-    fset16(0x65, 0x00000000007CC6FE, 0xC0C0C67C00000000);  # e
-    fset16(0x66, 0x00001C3632307830, 0x3030307800000000);  # f
-    fset16(0x67, 0x000000000076CCCC, 0xCCCCCC7C0CCC7800);  # g
-    fset16(0x68, 0x0000E060606C7666, 0x666666E600000000);  # h
-    fset16(0x69, 0x0000181800381818, 0x1818183C00000000);  # i
-    fset16(0x6A, 0x00000606000E0606, 0x0606060666663C00);  # j
-    fset16(0x6B, 0x0000E06060666C78, 0x786C66E600000000);  # k
-    fset16(0x6C, 0x0000381818181818, 0x1818183C00000000);  # l
-    fset16(0x6D, 0x0000000000ECFED6, 0xD6D6D6C600000000);  # m
-    fset16(0x6E, 0x0000000000DC6666, 0x6666666600000000);  # n
-    fset16(0x6F, 0x00000000007CC6C6, 0xC6C6C67C00000000);  # o
-    fset16(0x70, 0x0000000000DC6666, 0x6666667C6060F000);  # p
-    fset16(0x71, 0x000000000076CCCC, 0xCCCCCC7C0C0C1E00);  # q
-    fset16(0x72, 0x0000000000DC7666, 0x606060F000000000);  # r
-    fset16(0x73, 0x00000000007CC660, 0x380CC67C00000000);  # s
-    fset16(0x74, 0x0000103030FC3030, 0x3030361C00000000);  # t
-    fset16(0x75, 0x0000000000CCCCCC, 0xCCCCCC7600000000);  # u
-    fset16(0x76, 0x0000000000C6C6C6, 0xC6C66C3800000000);  # v
-    fset16(0x77, 0x0000000000C6C6D6, 0xD6D6FE6C00000000);  # w
-    fset16(0x78, 0x0000000000C66C38, 0x38386CC600000000);  # x
-    fset16(0x79, 0x0000000000C6C6C6, 0xC6C6C67E060CF800);  # y
-    fset16(0x7A, 0x0000000000FECC18, 0x3060C6FE00000000);  # z
-    fset16(0x7B, 0x00000E1818187018, 0x1818180E00000000);  # {
-    fset16(0x7C, 0x0000181818181818, 0x1818181800000000);  # |
-    fset16(0x7D, 0x0000701818180E18, 0x1818187000000000);  # }
-    fset16(0x7E, 0x0076DC0000000000, 0x0000000000000000);  # ~
-    fset16(0x7F, 0x0000000010386CC6, 0xC6C6FE0000000000);  # DEL=blank
+    # Glyph data lives in kashi (1.37.5 fold-in). One init populates kashi's
+    # BSS for both VGA 8x16 and CGA 8x8 from the packed u64 literals; agnos
+    # only renders the 8x16 face via kashi_glyph_ptr below.
+    kashi_font_init();
     fb_cur_x = 0;
     fb_cur_y = 0;
     fb_console_ready = 1;
@@ -595,7 +482,8 @@ fn fb_putc(ch) {
     # Inner pixel paint loop runs cell_w*cell_h store32s per glyph (128
     # at scale=1, 512 at scale=2) — same write-combiner-friendly pattern
     # as the init clear and scroll-bottom-clear.
-    var glyph = &fb_font + (ch - 0x20) * 16;
+    var glyph = kashi_glyph_ptr(KASHI_FONT_VGA_8X16, ch);
+    if (glyph == 0) { return 0; }       # ch outside kashi's encoded range: drop
     var x_px = fb_cur_x * cell_w;
     var y_px = FB_CONSOLE_Y0 + fb_cur_y * cell_h;
     for (var row = 0; row < 16; row = row + 1) {

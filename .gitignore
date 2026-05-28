@@ -6,6 +6,12 @@
 # freestanding stdlib lives at kernel/klib/, not kernel/lib/.)
 /lib/
 
+# cyrius dep-resolver lock file. The kernel build uses `cyrius build --no-deps`
+# and prepends `../kashi/src/font_data.cyr` directly in scripts/build.sh, so
+# the lock never participates in the build. Ignore so an accidental
+# `cyrius build` (without --no-deps) doesn't leave a tracked stray.
+/cyrius.lock
+
 # IDE
 .idea/
 .vscode/

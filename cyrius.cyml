@@ -20,3 +20,16 @@ output = "build/agnos"
 # the shadow warning and any stomp risk from a future `cyrius deps` run.)
 [deps]
 stdlib = []
+
+# Console-font subsystem — kashi's FREESTANDING glyph core (src/font_data.cyr)
+# is zero-stdlib (uses only store8/load8 + arithmetic), so a freestanding kernel
+# can include it directly. Pulled in at 1.37.5 (arc-close hand-off, 2026-05-28)
+# to retire the inline VGA 8x16 / CGA 8x8 glyph tables that previously lived in
+# kernel/arch/x86_64/fb_console.cyr. kashi 0.1.0's font_data.cyr was extracted
+# byte-for-byte from agnos's tables, so glyph rendering is byte-identical to
+# 1.37.4 by construction. The stdlib-using library face (PSF import etc.) lives
+# in kashi/src/lib.cyr and never reaches the kernel; the parallel agent develops
+# it independently per project_kashi_parallel_split memory.
+[deps.kashi]
+path    = "../kashi"
+modules = ["src/font_data.cyr"]

@@ -33,7 +33,7 @@ test_x86() {
     rm -f $ROOT/build/agnos_test
     if [ -x "$CYRB" ]; then
         PREPPED="$ROOT/build/agnos_prepped.cyr"
-        (echo '#define ARCH_X86_64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
+        (echo '#define ARCH_X86_64' && cat "$ROOT/../kashi/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED"
         (cd "$ROOT/kernel" && "$CYRB" build --no-deps "$PREPPED" $ROOT/build/agnos_test) 2>&1
         rm -f "$PREPPED"
     else
@@ -93,7 +93,7 @@ test_aarch64() {
     # kernel/ so relative `include "arch/..."` paths resolve.
     mkdir -p $ROOT/build
     PREPPED_ARM="$ROOT/build/agnos_arm_prepped.cyr"
-    (echo '#define ARCH_AARCH64' && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
+    (echo '#define ARCH_AARCH64' && cat "$ROOT/../kashi/src/font_data.cyr" && cat "$ROOT/kernel/agnos.cyr") > "$PREPPED_ARM"
     (cd "$ROOT/kernel" && "$CYRB" build --aarch64 --no-deps "$PREPPED_ARM" /tmp/agnos_arm_test >/dev/null 2>&1)
     rc=$?
     rm -f "$PREPPED_ARM"
