@@ -504,6 +504,21 @@ fn ext2_init() {
     kprintln(")", 1);
 
     ext2_active = 1;
+
+    # JBD2 journal probe (1.38.0 audit-doc-first stop-gap). If the FS has
+    # the has_journal compat feature, peek at the journal superblock; on
+    # a dirty journal (s_start != 0) downgrade write_ok so AGNOS can't
+    # stomp Linux's committed-but-not-checkpointed log entries (replay
+    # lands at 1.38.2). On a malformed journal, refuse mount entirely.
+    var jp = ext2_jbd2_probe();
+    if (jp == 0 - 1) {
+        ext2_write_ok = 0;                     # dirty: RO stays, RW refused
+    }
+    if (jp == 0 - 2) {                         # malformed: refuse mount
+        ext2_active = 0;
+        return 0 - 1;
+    }
+
     return 0;
 }
 
@@ -3543,6 +3558,157 @@ fn ext2_write_selftest() {
     else          { kprintln("ext2w: Wsync state MISMATCH", 27); }
 
     return 0;
+}
+
+# === JBD2 journaling — 1.38.0 audit-doc-first opening: probe + dirty-refusal ===
+#
+# A default `mkfs.ext4` filesystem ships with `has_journal` (compat bit
+# 0x0004) and a journal inode (s_journal_inum, typically 8). AGNOS today
+# writes directly without going through the journal — fine on clean
+# shutdown, but a yanked power mid-update can tear, AND a journal Linux
+# left committed-but-not-checkpointed gets silently ignored. 1.38.0 closes
+# the second hole as a stop-gap: probe the journal superblock at mount;
+# if dirty (s_start != 0), refuse RW mount with a clear diagnostic so
+# AGNOS can't stomp Linux's pending log entries. Future bites: log reader
+# (.1) → replay (.2, lifts the refusal) → in-memory lifecycle (.3) → log
+# write path (.4) → integration (.5) → crash smoke (.6) → hardening (.8).
+# Iron burn user-driven after .8.
+#
+# Audit + design: agnosticos/docs/development/ext4-jbd2-prior-art.md
+#
+# JBD2 on-disk fields are BIG-endian (Tweedie ext3 inheritance, in contrast
+# to ext2/ext4's LE everywhere else) — see ext2_load32_be below.
+
+# Journal-superblock magic + blocktype tags (jbd2 journal_header_s).
+enum Jbd2Blocktype {
+    JBD2_MAGIC                       = 0xC03B3998;
+    JBD2_BLOCKTYPE_DESCRIPTOR        = 1;
+    JBD2_BLOCKTYPE_COMMIT            = 2;
+    JBD2_BLOCKTYPE_SUPERBLOCK_V1     = 3;
+    JBD2_BLOCKTYPE_SUPERBLOCK_V2     = 4;
+    JBD2_BLOCKTYPE_REVOKE            = 5;
+    EXT2_FEATURE_COMPAT_HAS_JOURNAL  = 0x0004;
+}
+
+# Big-endian u32 loader (journal headers are BE throughout — Tweedie 1998).
+fn ext2_load32_be(ptr, off) {
+    return (load8(ptr + off) << 24)
+    | (load8(ptr + off + 1) << 16)
+    | (load8(ptr + off + 2) << 8)
+    | load8(ptr + off + 3);
+}
+
+# Superblock accessors the probe needs (not used elsewhere yet).
+fn ext2_sb_feature_compat(sb) { return ext2_load32_le(sb, 92); }
+fn ext2_sb_journal_inum(sb)   { return ext2_load32_le(sb, 224); }
+
+# Journal-superblock accessors (jbd2 journal_superblock_s, all BE).
+fn ext2_jsb_magic(jsb)        { return ext2_load32_be(jsb, 0); }
+fn ext2_jsb_blocktype(jsb)    { return ext2_load32_be(jsb, 4); }
+fn ext2_jsb_blocksize(jsb)    { return ext2_load32_be(jsb, 12); }
+fn ext2_jsb_maxlen(jsb)       { return ext2_load32_be(jsb, 16); }
+fn ext2_jsb_first(jsb)        { return ext2_load32_be(jsb, 20); }
+fn ext2_jsb_seq_expected(jsb) { return ext2_load32_be(jsb, 24); }
+fn ext2_jsb_start(jsb)        { return ext2_load32_be(jsb, 28); }
+
+# Module-scope probe state populated by ext2_jbd2_probe at mount time.
+var ext2_jbd2_present   = 0;       # 1 if has_journal compat bit set + probe OK
+var ext2_jbd2_clean     = 0;       # 1 if s_start == 0 (clean / cleanly unmounted)
+var ext2_jbd2_inum      = 0;       # journal inode number (from FS superblock)
+var ext2_jbd2_size      = 0;       # journal length in blocks (from journal SB)
+var ext2_jbd2_sequence  = 0;       # next-expected commit sequence (from journal SB)
+var ext2_jbd2_start     = 0;       # first log block of current state (0 = clean)
+
+# 4 KiB scratch for the journal-superblock block read. Module-scope
+# `var X[N]` = N×u64 = 8N bytes, so 512 × 8 = 4096 bytes (one max FS block).
+# Per `feedback_cyrius_var_array_u64_units`.
+var ext2_jbd2_sb_buf[512];
+
+# Probe the journal at mount. Returns:
+#   0   — no journal feature bit OR clean journal (RW mount stays allowed)
+#  -1  — dirty journal (caller downgrades ext2_write_ok; RO mount stays)
+#  -2  — malformed journal (caller refuses mount entirely)
+# Called from ext2_mount AFTER ext2_active=1 so the read API works.
+fn ext2_jbd2_probe() {
+    ext2_jbd2_present = 0;
+    ext2_jbd2_clean = 0;
+
+    var compat = ext2_sb_feature_compat(&ext2_sb_buf);
+    if ((compat & EXT2_FEATURE_COMPAT_HAS_JOURNAL) == 0) {
+        return 0;                              # no journal — done
+    }
+
+    ext2_jbd2_inum = ext2_sb_journal_inum(&ext2_sb_buf);
+    if (ext2_jbd2_inum == 0) {
+        kprintln("jbd2: has_journal set but s_journal_inum=0 -- malformed", 56);
+        return 0 - 2;
+    }
+
+    var n = ext2_read_at(ext2_jbd2_inum, 0, &ext2_jbd2_sb_buf, 4096);
+    if (n < 4096) {
+        kprint("jbd2: journal SB read short (ino=", 33);
+        kprint_num(ext2_jbd2_inum);
+        kprint(", n=", 4);
+        kprint_num(n);
+        kprintln(")", 1);
+        return 0 - 2;
+    }
+
+    var jsb = &ext2_jbd2_sb_buf;
+    if (ext2_jsb_magic(jsb) != JBD2_MAGIC) {
+        kprintln("jbd2: bad magic on journal SB -- malformed", 42);
+        return 0 - 2;
+    }
+
+    var bt = ext2_jsb_blocktype(jsb);
+    var bt_ok = 0;
+    if (bt == JBD2_BLOCKTYPE_SUPERBLOCK_V1) { bt_ok = 1; }
+    if (bt == JBD2_BLOCKTYPE_SUPERBLOCK_V2) { bt_ok = 1; }
+    if (bt_ok == 0) {
+        kprint("jbd2: unknown journal SB blocktype=", 35);
+        kprint_num(bt);
+        kprintln("", 0);
+        return 0 - 2;
+    }
+
+    var jbs = ext2_jsb_blocksize(jsb);
+    if (jbs != ext2_blocksize) {
+        kprint("jbd2: journal blocksize=", 24);
+        kprint_num(jbs);
+        kprint(" != FS blocksize=", 17);
+        kprint_num(ext2_blocksize);
+        kprintln(" -- malformed", 13);
+        return 0 - 2;
+    }
+
+    ext2_jbd2_size     = ext2_jsb_maxlen(jsb);
+    ext2_jbd2_sequence = ext2_jsb_seq_expected(jsb);
+    ext2_jbd2_start    = ext2_jsb_start(jsb);
+    ext2_jbd2_present  = 1;
+
+    if (ext2_jbd2_start == 0) {
+        ext2_jbd2_clean = 1;
+        kprint("jbd2: clean journal ino=", 24);
+        kprint_num(ext2_jbd2_inum);
+        kprint(" size=", 6);
+        kprint_num(ext2_jbd2_size);
+        kprint(" seq=", 5);
+        kprint_num(ext2_jbd2_sequence);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # Dirty: committed-but-not-checkpointed transactions present. AGNOS
+    # cannot replay them yet (lands at 1.38.2), so refuse RW to prevent
+    # silent stomp on Linux's pending log entries.
+    kprint("jbd2: DIRTY journal ino=", 24);
+    kprint_num(ext2_jbd2_inum);
+    kprint(" start=", 7);
+    kprint_num(ext2_jbd2_start);
+    kprint(" seq=", 5);
+    kprint_num(ext2_jbd2_sequence);
+    kprintln(" -- refusing RW mount (replay lands at 1.38.2)", 46);
+    return 0 - 1;
 }
 
 # === ext4 extent-ALLOCATION self-test (compile-gated EXT2_EXTENT_WRITE_SELFTEST, 1.37.0) ===
