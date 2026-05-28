@@ -31,7 +31,7 @@ def crc32c(data, seed=0xFFFFFFFF):
     return crc & 0xFFFFFFFF
 
 
-def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq, data_source="block"):
+def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq, data_source="block", csum_seed=None):
     """Synthesize a one-transaction journal at log blocks [1, 2, 3].
 
     Layout:
@@ -40,9 +40,24 @@ def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq
               target_blk's current FS content so replay is a no-op write;
               "fill" uses 0xCC pattern — replay corrupts target_blk, useful
               for negative tests)
-      jfp+3 = commit block (no payload csum, h_chksum_type=0)
+      jfp+3 = commit block
+
+    When csum_seed is not None the journal is CSUM_V3: the descriptor uses the
+    16-byte journal_block_tag3_t layout (t_flags be32@+4, t_blocknr_high@+8,
+    t_checksum@+12), carries a 4-byte tail csum at bs-4, and the commit block
+    carries h_chksum[0]. All per fs/jbd2/commit.c — see ext4-jbd2-prior-art.md §8.
     """
     uuid = b"\x00" * 16
+    is_v3 = csum_seed is not None
+
+    # Read the data first (the tag data csum covers it).
+    if data_source == "block":
+        f.seek(part_off + target_blk * bs)
+        data = f.read(bs)
+        if len(data) < bs:
+            data = data + b"\x00" * (bs - len(data))
+    else:
+        data = b"\xCC" * bs
 
     # === Descriptor at jfp+1 ===
     desc = bytearray(bs)
@@ -50,32 +65,30 @@ def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq
     struct.pack_into(">I", desc, 4, 1)            # blocktype = DESCRIPTOR
     struct.pack_into(">I", desc, 8, seq)          # transaction sequence
     tag_off = 12
-    struct.pack_into(">I", desc, tag_off,       target_blk & 0xFFFFFFFF)
-    struct.pack_into(">H", desc, tag_off + 4,   0x08)   # flags = LAST_TAG
-    struct.pack_into(">H", desc, tag_off + 6,   0)      # t_checksum (no CSUM_V3)
-    pos = tag_off + 8
-    if has_64bit:
-        struct.pack_into(">I", desc, pos, (target_blk >> 32) & 0xFFFFFFFF)
-        pos += 4
-    desc[pos : pos + 16] = uuid                       # first-tag UUID
+    if is_v3:
+        data_csum = crc32c(data, crc32c(struct.pack(">I", seq), csum_seed))
+        struct.pack_into(">I", desc, tag_off,      target_blk & 0xFFFFFFFF)
+        struct.pack_into(">I", desc, tag_off + 4,  0x08)                       # t_flags LAST_TAG (be32)
+        struct.pack_into(">I", desc, tag_off + 8,  (target_blk >> 32) & 0xFFFFFFFF)  # t_blocknr_high
+        struct.pack_into(">I", desc, tag_off + 12, data_csum)                  # t_checksum (full 32-bit)
+        desc[tag_off + 16 : tag_off + 32] = uuid                              # first-tag UUID
+        # descriptor tail csum at bs-4
+        struct.pack_into(">I", desc, bs - 4, 0)
+        struct.pack_into(">I", desc, bs - 4, crc32c(bytes(desc), csum_seed))
+    else:
+        struct.pack_into(">I", desc, tag_off,       target_blk & 0xFFFFFFFF)
+        struct.pack_into(">H", desc, tag_off + 4,   0)      # t_checksum (legacy @ +4)
+        struct.pack_into(">H", desc, tag_off + 6,   0x08)   # t_flags = LAST_TAG (legacy @ +6)
+        pos = tag_off + 8
+        if has_64bit:
+            struct.pack_into(">I", desc, pos, (target_blk >> 32) & 0xFFFFFFFF)
+            pos += 4
+        desc[pos : pos + 16] = uuid                       # first-tag UUID
     f.seek(part_off + (jfp + 1) * bs); f.write(desc)
 
-    # === Data at jfp+2 ===
-    if data_source == "block":
-        # Read target_blk's current FS content so replay is a no-op write
-        # → e2fsck stays clean after replay (the FS sees the same bytes
-        # it would have anyway). The "ESCAPE" subtlety: if the block's
-        # first 4 bytes happen to be the JBD2 magic, we'd need to zero
-        # them + set t_flags |= ESCAPE. For a fresh mkfs.ext4 with a
-        # high target_blk (data/empty region), this is overwhelmingly
-        # unlikely; we don't probe-for-or-set ESCAPE here (test fixture,
-        # not Linux fidelity).
-        f.seek(part_off + target_blk * bs)
-        data = f.read(bs)
-        if len(data) < bs:
-            data = data + b"\x00" * (bs - len(data))
-    else:
-        data = b"\xCC" * bs
+    # === Data at jfp+2 === (already read above; "block" mode = no-op replay,
+    # so e2fsck stays clean. ESCAPE — first 4 bytes == JBD2 magic — is not
+    # handled here; a high target_blk in a fresh mkfs.ext4 never collides.)
     f.seek(part_off + (jfp + 2) * bs); f.write(data)
 
     # === Commit at jfp+3 ===
@@ -83,7 +96,13 @@ def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq
     struct.pack_into(">I", commit, 0, 0xC03B3998)
     struct.pack_into(">I", commit, 4, 2)          # blocktype = COMMIT
     struct.pack_into(">I", commit, 8, seq)
-    # h_chksum_type at +12 stays 0 (no V1 csum); h_commit_sec / nsec stay 0
+    if is_v3:
+        # CSUM_V2/V3 commit csum: type/size = 0, h_chksum[0] @ +0x10 = crc32c
+        # over the whole block with that field zeroed (jbd2_commit_block_csum_set).
+        commit[12] = 0; commit[13] = 0
+        struct.pack_into(">I", commit, 16, 0)
+        struct.pack_into(">I", commit, 16, crc32c(bytes(commit), csum_seed))
+    # else h_chksum_type at +12 stays 0 (no V1 csum); h_commit_sec / nsec stay 0
     f.seek(part_off + (jfp + 3) * bs); f.write(commit)
 
     return target_blk
@@ -91,7 +110,7 @@ def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq
 
 def main():
     if len(sys.argv) < 3:
-        print("usage: mk-dirty-journal-img.py <image> <partition_offset> [s_start | --synth-tx [target_blk]]", file=sys.stderr)
+        print("usage: mk-dirty-journal-img.py <image> <partition_offset> [s_start | --synth-tx [target_blk]] [--csum-v3]", file=sys.stderr)
         sys.exit(1)
 
     img = sys.argv[1]
@@ -99,13 +118,21 @@ def main():
     synth_tx = False
     target_blk = 100
     new_start = 1
-    if len(sys.argv) > 3:
-        if sys.argv[3] == "--synth-tx":
+    # --csum-v3: upgrade the journal to JBD2 CSUM_V3 + 64BIT (incompat 0x12,
+    # csum_type=4) — mirrors what the Linux kernel stamps on the first RW mount
+    # of a metadata_csum FS. Lets the smokes match the archaemenid iron journal.
+    # Standalone (clean upgrade) or combined with --synth-tx (dirty V3 tx).
+    upgrade_v3 = "--csum-v3" in sys.argv
+    rest = [a for a in sys.argv[3:] if a != "--csum-v3"]
+    if rest:
+        if rest[0] == "--synth-tx":
             synth_tx = True
-            if len(sys.argv) > 4:
-                target_blk = int(sys.argv[4])
+            if len(rest) > 1:
+                target_blk = int(rest[1])
         else:
-            new_start = int(sys.argv[3])
+            new_start = int(rest[0])
+    elif not upgrade_v3:
+        new_start = 1   # legacy default when no flags at all
 
     with open(img, "r+b") as f:
         # === 1. FS superblock at partition_offset + 1024 ===
@@ -173,16 +200,31 @@ def main():
             print(f"journal SB bad magic 0x{jmagic:08x}", file=sys.stderr)
             sys.exit(2)
         j_incompat = struct.unpack_from(">I", jsb, 40)[0]
+
+        # === Optional CSUM_V3 + 64BIT upgrade (mirrors Linux first-RW-mount) ===
+        if upgrade_v3:
+            j_incompat |= 0x12                       # 64BIT (0x02) | CSUM_V3 (0x10)
+            struct.pack_into(">I", jsb, 40, j_incompat)
+            jsb[80] = 4                              # s_checksum_type = CRC32C
         has_64bit = bool(j_incompat & 0x02)
+        is_v3 = bool(j_incompat & 0x10)
+        # j_csum_seed = crc32c(~0, journal s_uuid[16] @ +0x30) — only meaningful
+        # when csum_v2/v3 is set; passed to synth so its tags/commit are valid.
+        csum_seed = crc32c(bytes(jsb[0x30:0x40])) if (j_incompat & 0x18) else None
+
+        # Whether to advance s_start. A pure --csum-v3 clean upgrade leaves the
+        # journal clean (s_start untouched); dirty/synth modes set it.
+        write_start = synth_tx or bool(rest and rest[0] != "--synth-tx")
 
         # === 4a. (Optional) synthesize a one-transaction journal ===
         if synth_tx:
             seq = struct.unpack_from(">I", jsb, 24)[0] or 1   # next-expected seq
-            write_synthetic_transaction(f, part_off, first_phys, bs, has_64bit, target_blk, seq)
+            write_synthetic_transaction(f, part_off, first_phys, bs, has_64bit, target_blk, seq, csum_seed=csum_seed)
             new_start = 1   # journal head now points at the descriptor we just wrote
 
-        # === 4. Set s_start = new_start (offset 28, BE u32) ===
-        struct.pack_into(">I", jsb, 28, new_start)
+        # === 4. Set s_start = new_start (offset 28, BE u32) when in a dirty mode ===
+        if write_start:
+            struct.pack_into(">I", jsb, 28, new_start)
 
         # === 5. Recompute SB CSUM if CSUM_V2 (0x8) or CSUM_V3 (0x10) is set ===
         CSUM_V2_V3 = 0x18
@@ -202,9 +244,15 @@ def main():
 
     print(f"journal inode: {j_inum}")
     print(f"journal first block: {first_phys}  (byte offset 0x{first_phys * bs:x} within partition)")
+    if upgrade_v3:
+        print(f"upgraded journal to CSUM_V3 + 64BIT (incompat=0x{j_incompat:08x}, csum_type=4, seed=0x{csum_seed:08x})")
     if synth_tx:
-        print(f"synthesized 1-tx journal: target FS block {target_blk}, data = 0xCC × {bs}")
-    print(f"s_start written: {new_start} at image byte 0x{jsb_byte_off + 28:x}{csum_note}")
+        kind = "V3" if is_v3 else "legacy"
+        print(f"synthesized 1-tx {kind} journal: target FS block {target_blk}")
+    if write_start:
+        print(f"s_start written: {new_start} at image byte 0x{jsb_byte_off + 28:x}{csum_note}")
+    else:
+        print(f"journal left clean (s_start unchanged){csum_note}")
 
 
 if __name__ == "__main__":

@@ -3720,6 +3720,7 @@ var ext2_jbd2_feature_incompat  = 0;   # journal-level incompat (incl. CSUM_V2/V
 var ext2_jbd2_feature_ro_compat = 0;   # journal-level ro_compat
 var ext2_jbd2_nr_users          = 0;   # number of FSes sharing this journal (usually 1)
 var ext2_jbd2_csum_type         = 0;   # 1=CRC32, 4=CRC32C, 0=none
+var ext2_jbd2_csum_seed         = 0;   # crc32c(~0, journal s_uuid[16] @ +0x30) — jbd2 j_csum_seed; computed at probe for CSUM_V2/V3 tag/desc/commit csums (1.38.10)
 
 # 4 KiB scratch for the journal-superblock block read. Module-scope
 # `var X[N]` = N×u64 = 8N bytes, so 512 × 8 = 4096 bytes (one max FS block).
@@ -3737,6 +3738,11 @@ var ext2_jbd2_sb_buf[512];
 # tags per descriptor at 4 KiB blocks).
 var ext2_jbd2_data_buf[512];
 var ext2_jbd2_tag_buf[256];
+# Parallel to tag_buf: the expected per-tag data csum from a CSUM_V2/V3
+# descriptor (t_checksum). Validated against the logged data block at apply
+# time so replay rejects a torn data block (the commit + descriptor-tail csums
+# cover only those two blocks, not the data). 0 sentinel = no csum to check.
+var ext2_jbd2_tag_csum_buf[256];
 var ext2_jbd2_replay_done    = 0;  # 1 after a successful replay this mount
 var ext2_jbd2_replay_count   = 0;  # transactions applied by the last replay
 
@@ -3823,6 +3829,11 @@ fn ext2_jbd2_probe() {
     ext2_jbd2_feature_ro_compat = ext2_jsb_feature_ro_compat(jsb);
     ext2_jbd2_nr_users          = ext2_jsb_nr_users(jsb);
     ext2_jbd2_csum_type         = ext2_jsb_checksum_type(jsb);
+    # jbd2 j_csum_seed = crc32c(~0, journal s_uuid[16] @ +0x30) — the seed for
+    # per-tag data csums, descriptor-tail csums, and commit-block csums on a
+    # CSUM_V2/V3 journal (1.38.10). Linux: journal.c j->j_csum_seed. Computed
+    # unconditionally (cheap); only consulted on the csum_v2/v3 write/replay paths.
+    ext2_jbd2_csum_seed         = ext2_crc32c(0xFFFFFFFF, jsb + 0x30, 16);
 
     # JBD2 SB-csum validation (1.38.1 — conditional on CSUM_V2/V3 incompat
     # feature). Linux jbd2_superblock_csum():
@@ -3909,6 +3920,8 @@ fn ext2_jbd2_log_walk_and_trace() {
 
     var has_64bit = 0;
     if ((ext2_jbd2_feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0) { has_64bit = 1; }
+    var has_csum3 = 0;
+    if ((ext2_jbd2_feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0) { has_csum3 = 1; }
 
     var blk = ext2_jbd2_start;
     var txn_count = 0;
@@ -3952,18 +3965,25 @@ fn ext2_jbd2_log_walk_and_trace() {
             kprint_num(blk);
             kprintln("", 0);
 
-            # Parse tags. Layout depends on flags:
-            #   t_blocknr_lo (4 BE) + t_flags (2 BE) + t_checksum (2 BE) = 8 B
-            #   + t_blocknr_hi (4 BE) if JBD2_FEATURE_INCOMPAT_64BIT
+            # Parse tags. Layout depends on csum feature (re-derived 2026-05-28):
+            #   CSUM_V3 → 16 B: t_blocknr@0 t_flags@4(be32) t_blocknr_high@8 t_checksum@12
+            #   legacy  → t_blocknr@0 t_checksum@4(be16) t_flags@6(be16) (+hi@8 if 64bit)
             #   + 16 B UUID if first tag OR !SAME_UUID flag
             var tag_off = 12;
             var data_blks = 0;
             var done = 0;
             while ((tag_off < ext2_blocksize - 16) & (done == 0)) {
                 var t_blk_lo = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off);
-                var t_flags  = ext2_load16_be(&ext2_jbd2_sb_buf, tag_off + 4);
-                var tag_size = 8;
-                if (has_64bit == 1) { tag_size = 12; }
+                var t_flags  = 0;
+                var tag_size = 0;
+                if (has_csum3 == 1) {
+                    t_flags  = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off + 4);
+                    tag_size = 16;
+                } else {
+                    t_flags  = ext2_load16_be(&ext2_jbd2_sb_buf, tag_off + 6);   # flags @ +6 (was swapped)
+                    tag_size = 8;
+                    if (has_64bit == 1) { tag_size = 12; }
+                }
                 # UUID present if this is the first tag OR SAME_UUID not set.
                 var uuid_present = 0;
                 if (data_blks == 0)                       { uuid_present = 1; }
@@ -4128,13 +4148,81 @@ fn ext2_jbd2_write_log_block(log_blk, buf) {
     return ext2_write_block(phys, buf);
 }
 
+# --- CSUM_V2/V3 journal checksums (1.38.10) ---
+# All consume ext2_jbd2_csum_seed (crc32c of the journal s_uuid, set at probe)
+# and AGNOS's non-finalized ext2_crc32c, mirroring jbd2_chksum(). Derived from
+# fs/jbd2/commit.c {jbd2_block_tag_csum_set, jbd2_descriptor_block_csum_set,
+# jbd2_commit_block_csum_set}; layout cross-checked against include/linux/jbd2.h.
+# See agnosticos ext4-jbd2-prior-art.md §8.1.
+
+# Per-tag data csum: crc32c(crc32c(seed, be32(seq)), data_block[0..blocksize)).
+# Full 32-bit; caller stores it whole for CSUM_V3 or truncates to 16 for V2.
+fn ext2_jbd2_tag_data_csum(seq, data_buf) {
+    var seqbuf[4];                          # function-local var X[N] = N bytes
+    ext2_store32_be(&seqbuf, 0, seq);
+    var c = ext2_crc32c(ext2_jbd2_csum_seed, &seqbuf, 4);
+    return ext2_crc32c(c, data_buf, ext2_blocksize);
+}
+
+# Descriptor-block tail csum. jbd2_journal_block_tail = { be32 t_checksum } in
+# the LAST 4 bytes of the block: zero it, crc32c the whole block, store BE back.
+# Tags must not overrun blocksize-4 (our small txns never approach it).
+fn ext2_jbd2_desc_tail_csum_set(desc_buf) {
+    var tail_off = ext2_blocksize - 4;
+    ext2_store32_be(desc_buf, tail_off, 0);
+    var c = ext2_crc32c(ext2_jbd2_csum_seed, desc_buf, ext2_blocksize);
+    ext2_store32_be(desc_buf, tail_off, c);
+    return 0;
+}
+
+# Commit-block csum (CSUM_V2/V3 path, jbd2_commit_block_csum_set): h_chksum_type
+# and h_chksum_size are zeroed, h_chksum[0] @ +0x10 holds crc32c(seed, whole
+# block) computed with that field pre-zeroed. (The type=4/size=4 payload form is
+# the older V1 ASYNC_COMMIT convention — not used when CSUM_V2/V3 is set.)
+fn ext2_jbd2_commit_csum_set(commit_buf) {
+    store8(commit_buf + 12, 0);             # h_chksum_type = 0
+    store8(commit_buf + 13, 0);             # h_chksum_size = 0
+    ext2_store32_be(commit_buf, 16, 0);     # h_chksum[0] zeroed before compute
+    var c = ext2_crc32c(ext2_jbd2_csum_seed, commit_buf, ext2_blocksize);
+    ext2_store32_be(commit_buf, 16, c);
+    return 0;
+}
+
+# Replay-side validators (mirror the set helpers above; non-mutating — they
+# save/restore the stored csum field so the buffer is unchanged after the call).
+fn ext2_jbd2_desc_tail_csum_valid(desc_buf) {
+    var tail_off = ext2_blocksize - 4;
+    var stored = ext2_load32_be(desc_buf, tail_off);
+    ext2_store32_be(desc_buf, tail_off, 0);
+    var c = ext2_crc32c(ext2_jbd2_csum_seed, desc_buf, ext2_blocksize);
+    ext2_store32_be(desc_buf, tail_off, stored);
+    if (c == stored) { return 1; }
+    return 0;
+}
+fn ext2_jbd2_commit_csum_valid(commit_buf) {
+    var stored = ext2_load32_be(commit_buf, 16);
+    ext2_store32_be(commit_buf, 16, 0);
+    var c = ext2_crc32c(ext2_jbd2_csum_seed, commit_buf, ext2_blocksize);
+    ext2_store32_be(commit_buf, 16, stored);
+    if (c == stored) { return 1; }
+    return 0;
+}
+
 # Build the descriptor block in ext2_jbd2_sb_buf (re-purposed as scratch
 # during commit) and write it to journal log block `log_blk`.
 # Tags emitted: legacy 8-byte layout (t_blocknr_lo + t_flags + t_checksum)
 # + optional t_blocknr_hi (4 B) if 64BIT, + UUID (16 B) on the FIRST tag
-# only (subsequent tags carry SAME_UUID flag). 1.38.5 narrow scope: refuses
-# CSUM_V2/V3 journals (no per-tag t_checksum, no commit-block payload csum
-# — implemented in 1.38.7 hardening if iron data justifies).
+# only (subsequent tags carry SAME_UUID flag).
+#
+# 1.38.10: two tag layouts (re-derived from include/linux/jbd2.h 2026-05-28):
+#   - CSUM_V3  → journal_block_tag3_t (16 B): t_blocknr@0 t_flags@4(be32)
+#     t_blocknr_high@8 t_checksum@12(be32, full data csum)
+#   - legacy   → journal_block_tag_t : t_blocknr@0 t_checksum@4(be16)
+#     t_flags@6(be16) t_blocknr_high@8(64bit). [Was SWAPPED pre-1.38.10 —
+#     flags/checksum offsets crossed; self-consistent in QEMU but not
+#     Linux-replayable. Fixed here.]
+# When CSUM_V2/V3 is set the per-tag data csum is populated and a 4-byte
+# jbd2_journal_block_tail csum is written at blocksize-4.
 fn ext2_jbd2_build_and_write_descriptor(log_blk, n_tags) {
     var jsb = &ext2_jbd2_sb_buf;
     # Zero the buffer first (the journal tracks ess. log-block size).
@@ -4148,6 +4236,10 @@ fn ext2_jbd2_build_and_write_descriptor(log_blk, n_tags) {
 
     var has_64bit = 0;
     if ((ext2_jbd2_feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0) { has_64bit = 1; }
+    var has_csum3 = 0;
+    if ((ext2_jbd2_feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0) { has_csum3 = 1; }
+    var has_csum  = 0;
+    if ((ext2_jbd2_feature_incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)) != 0) { has_csum = 1; }
 
     var tag_off = 12;
     var i = 0;
@@ -4156,22 +4248,42 @@ fn ext2_jbd2_build_and_write_descriptor(log_blk, n_tags) {
         var blk_lo  = target & 0xFFFFFFFF;
         var blk_hi  = (target >> 32) & 0xFFFFFFFF;
 
-        ext2_store32_be(jsb, tag_off,     blk_lo);
         var flags = 0;
         if (i == n_tags - 1) { flags = flags | JBD2_FLAG_LAST_TAG; }
         if (i > 0)           { flags = flags | JBD2_FLAG_SAME_UUID; }
-        ext2_store16_be(jsb, tag_off + 4, flags);
-        ext2_store16_be(jsb, tag_off + 6, 0);                          # t_checksum (no CSUM_V3)
-        tag_off = tag_off + 8;
-        if (has_64bit == 1) {
-            ext2_store32_be(jsb, tag_off, blk_hi);
-            tag_off = tag_off + 4;
+
+        # Per-tag data csum (CSUM_V2/V3): crc32c over be32(seq) + data block.
+        # Data lives in tx_bufs[i] — written verbatim to the log (no escaping;
+        # metadata blocks never start with the 0xC03B3998 journal magic, so the
+        # JBD2_FLAG_ESCAPE case is out of scope, matching the pre-csum path).
+        var data_csum = 0;
+        if (has_csum == 1) {
+            var dbuf = load64(&ext2_jbd2_tx_bufs + i * 8);
+            data_csum = ext2_jbd2_tag_data_csum(ext2_jbd2_tx_seq, dbuf);
         }
+
+        ext2_store32_be(jsb, tag_off, blk_lo);
+        if (has_csum3 == 1) {
+            ext2_store32_be(jsb, tag_off + 4,  flags);                 # t_flags (be32)
+            ext2_store32_be(jsb, tag_off + 8,  blk_hi);                # t_blocknr_high (always present in tag3)
+            ext2_store32_be(jsb, tag_off + 12, data_csum);             # t_checksum (full 32-bit)
+            tag_off = tag_off + 16;
+        } else {
+            var tcsum16 = 0;
+            if (has_csum == 1) { tcsum16 = data_csum & 0xFFFF; }       # CSUM_V2 truncated csum
+            ext2_store16_be(jsb, tag_off + 4, tcsum16);                # t_checksum @ +4 (was swapped)
+            ext2_store16_be(jsb, tag_off + 6, flags);                  # t_flags    @ +6 (was swapped)
+            tag_off = tag_off + 8;
+            if (has_64bit == 1) {
+                ext2_store32_be(jsb, tag_off, blk_hi);
+                tag_off = tag_off + 4;
+            }
+        }
+
         if (i == 0) {
-            # First-tag UUID = 16 zero bytes (matches what the Python helper
-            # generates — keeps things simple; Linux jbd2 cares only that
-            # the UUID matches what the journal SB carries OR that SAME_UUID
-            # was set on subsequent tags, both of which we satisfy here).
+            # First-tag UUID = 16 zero bytes. Linux recovery only SKIPs the
+            # tag UUID (recovery.c do_one_pass), never validates it; the csum
+            # seed comes from the journal-SB UUID, not this field.
             var u = 0;
             while (u < 16) { store8(jsb + tag_off + u, 0); u = u + 1; }
             tag_off = tag_off + 16;
@@ -4179,12 +4291,18 @@ fn ext2_jbd2_build_and_write_descriptor(log_blk, n_tags) {
         i = i + 1;
     }
 
+    # CSUM_V2/V3: 4-byte descriptor-block tail csum at blocksize-4 over the
+    # whole (now tag-filled) block. Must come after all tags are laid down.
+    if (has_csum == 1) {
+        ext2_jbd2_desc_tail_csum_set(jsb);
+    }
+
     return ext2_jbd2_write_log_block(log_blk, jsb);
 }
 
-# Build the commit block + write it. `h_chksum_type = 0` (no payload csum)
-# is fine when the journal doesn't have CSUM_V2/V3 enabled (we refuse those
-# at the commit-tx entry below).
+# Build the commit block + write it. For a CSUM_V2/V3 journal the commit block
+# carries h_chksum[0] = crc32c(seed, whole block); for a no-csum journal the
+# h_chksum_type/size/[0] fields stay 0 (the zeroed buffer already satisfies this).
 fn ext2_jbd2_build_and_write_commit(log_blk) {
     var jsb = &ext2_jbd2_sb_buf;
     var z = 0;
@@ -4192,7 +4310,9 @@ fn ext2_jbd2_build_and_write_commit(log_blk) {
     ext2_store32_be(jsb, 0, JBD2_MAGIC);
     ext2_store32_be(jsb, 4, JBD2_BLOCKTYPE_COMMIT);
     ext2_store32_be(jsb, 8, ext2_jbd2_tx_seq);
-    # h_chksum_type at +12 stays 0 (no CSUM)
+    if ((ext2_jbd2_feature_incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)) != 0) {
+        ext2_jbd2_commit_csum_set(jsb);
+    }
     return ext2_jbd2_write_log_block(log_blk, jsb);
 }
 
@@ -4240,12 +4360,14 @@ fn ext2_jbd2_commit_tx() {
         return 0 - 1;
     }
 
-    # Narrow-scope refusal: CSUM_V2/V3 journals carry per-tag + per-commit
-    # csums we don't yet compute (1.38.7 hardening). Refuse cleanly rather
-    # than produce a journal that replay (ours or Linux's) would reject.
-    var csum_mask = JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3;
-    if ((ext2_jbd2_feature_incompat & csum_mask) != 0) {
-        kprintln("jbd2: commit_tx: CSUM_V2/V3 journal not yet supported (1.38.7) -- aborting", 73);
+    # Feature gate (1.38.10): we now compute CSUM_V2/V3 tag + descriptor + commit
+    # checksums, so those are supported. REVOKE/64BIT don't affect our write path
+    # (we never emit revokes; 64BIT is handled in the tag layout). Refuse only
+    # genuinely-unhandled incompat features (ASYNC_COMMIT, FAST_COMMIT, future
+    # bits) — writing a tx for those would produce a journal replay rejects.
+    var supported = JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_64BIT | JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3;
+    if ((ext2_jbd2_feature_incompat & supported) != ext2_jbd2_feature_incompat) {
+        kprintln("jbd2: commit_tx: unsupported journal incompat features -- aborting", 65);
         ext2_jbd2_abort_tx();
         return 0 - 1;
     }
@@ -4657,20 +4779,47 @@ fn ext2_jbd2_replay_one_tx(start_blk) {
     }
     var tx_seq = ext2_load32_be(&ext2_jbd2_sb_buf, 8);
 
-    # === Parse tags ===
+    # === Feature flags + CSUM_V2/V3 descriptor-tail validation ===
     var has_64bit = 0;
     if ((ext2_jbd2_feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0) { has_64bit = 1; }
+    var has_csum3 = 0;
+    if ((ext2_jbd2_feature_incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0) { has_csum3 = 1; }
+    var has_csum  = 0;
+    if ((ext2_jbd2_feature_incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)) != 0) { has_csum = 1; }
+    # The descriptor's tail csum covers the whole descriptor block; a mismatch
+    # means the descriptor is torn/corrupt — refuse before trusting its tags.
+    if (has_csum == 1) {
+        if (ext2_jbd2_desc_tail_csum_valid(&ext2_jbd2_sb_buf) == 0) {
+            kprintln("jbd2: replay: descriptor tail csum mismatch -- torn", 51);
+            return 0 - 1;
+        }
+    }
+
+    # === Parse tags ===
+    #   CSUM_V3 → 16 B tag3 (t_blocknr@0 t_flags@4be32 t_blocknr_high@8 t_checksum@12)
+    #   legacy  → t_blocknr@0 t_checksum@4be16 t_flags@6be16 (+t_blocknr_high@8 if 64bit)
     var tag_off = 12;
     var n_tags = 0;
     var done = 0;
     while ((tag_off < bs - 16) & (done == 0) & (n_tags < 256)) {
         var t_blk_lo = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off);
-        var t_flags  = ext2_load16_be(&ext2_jbd2_sb_buf, tag_off + 4);
-        var tag_size = 8;
+        var t_flags  = 0;
         var t_blk_hi = 0;
-        if (has_64bit == 1) {
-            t_blk_hi = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off + 8);
-            tag_size = 12;
+        var t_csum   = 0;
+        var tag_size = 0;
+        if (has_csum3 == 1) {
+            t_flags  = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off + 4);
+            t_blk_hi = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off + 8);   # always present in tag3
+            t_csum   = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off + 12);  # full 32-bit data csum
+            tag_size = 16;
+        } else {
+            t_csum   = ext2_load16_be(&ext2_jbd2_sb_buf, tag_off + 4);   # csum @ +4 (was swapped)
+            t_flags  = ext2_load16_be(&ext2_jbd2_sb_buf, tag_off + 6);   # flags @ +6 (was swapped)
+            tag_size = 8;
+            if (has_64bit == 1) {
+                t_blk_hi = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off + 8);
+                tag_size = 12;
+            }
         }
         var uuid_present = 0;
         if (n_tags == 0)                          { uuid_present = 1; }
@@ -4683,6 +4832,7 @@ fn ext2_jbd2_replay_one_tx(start_blk) {
         var target = (t_blk_hi << 32) | t_blk_lo;
         var packed = (t_flags << 56) | (target & 0xFFFFFFFFFFFFFF);
         store64(&ext2_jbd2_tag_buf + n_tags * 8, packed);
+        store64(&ext2_jbd2_tag_csum_buf + n_tags * 8, t_csum);          # expected data csum (CSUM_V2/V3)
 
         n_tags = n_tags + 1;
         if ((t_flags & JBD2_FLAG_LAST_TAG) != 0) { done = 1; }
@@ -4724,6 +4874,14 @@ fn ext2_jbd2_replay_one_tx(start_blk) {
     if (ext2_load32_be(&ext2_jbd2_sb_buf, 8) != tx_seq) {
         kprintln("jbd2: replay: sequence mismatch desc vs commit", 46);
         return 0 - 1;
+    }
+    # CSUM_V2/V3 atomicity gate: the commit block's h_chksum[0] covers the whole
+    # block. A mismatch means the commit didn't land intact → torn tx → halt.
+    if (has_csum == 1) {
+        if (ext2_jbd2_commit_csum_valid(&ext2_jbd2_sb_buf) == 0) {
+            kprintln("jbd2: replay: commit csum mismatch -- torn", 42);
+            return 0 - 1;
+        }
     }
 
     # === Apply data blocks (now that commit validated) ===
@@ -4769,6 +4927,22 @@ fn ext2_jbd2_replay_one_tx(start_blk) {
             kprint("jbd2: replay: short read on data blk=", 37);
             kprintln_num_only(data_blk);
             return 0 - 1;
+        }
+
+        # CSUM_V2/V3 per-tag data csum: crc32c(crc32c(seed, be32(seq)), data)
+        # over the log-stored (pre-unescape) block. Covers the logged data the
+        # commit/descriptor csums don't — a mismatch is a torn data block. V2
+        # stores only the low 16 bits, so compare masked when not csum3.
+        if (has_csum == 1) {
+            var want = load64(&ext2_jbd2_tag_csum_buf + i * 8);
+            var got  = ext2_jbd2_tag_data_csum(tx_seq, &ext2_jbd2_data_buf);
+            if (has_csum3 == 0) { got = got & 0xFFFF; }
+            if (got != want) {
+                kprint("jbd2: replay: data csum mismatch tag=", 37);
+                kprint_num(i);
+                kprintln(" -- torn", 8);
+                return 0 - 1;
+            }
         }
 
         # ESCAPE handling: tag bit 0 means the data's first 4 bytes were

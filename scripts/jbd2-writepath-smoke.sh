@@ -60,8 +60,10 @@ mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 mkfs.ext4 -F -q -L AGNOS-EXT -b 4096 -m 0 -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
+# Match iron: stamp the journal CSUM_V3 + 64BIT (what Linux does on first RW mount).
+python3 "$ROOT/scripts/mk-dirty-journal-img.py" "$IMG" "$PART_OFFSET" --csum-v3
 
-echo "Booting agnos (JBD2_WP_SELFTEST kernel, clean journal at boot)..."
+echo "Booting agnos (JBD2_WP_SELFTEST kernel, CSUM_V3 journal at boot)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/jbd2-writepath.log"
 timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \

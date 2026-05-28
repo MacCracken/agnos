@@ -55,8 +55,10 @@ mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 mkfs.ext4 -F -q -L AGNOS-EXT -b 4096 -m 0 -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
+# Match iron: stamp the journal CSUM_V3 + 64BIT (what Linux does on first RW mount).
+python3 "$ROOT/scripts/mk-dirty-journal-img.py" "$IMG" "$PART_OFFSET" --csum-v3
 
-echo "Booting agnos (JBD2_TX_SELFTEST kernel, clean journal)..."
+echo "Booting agnos (JBD2_TX_SELFTEST kernel, CSUM_V3 journal)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/jbd2-tx.log"
 timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \
@@ -81,10 +83,10 @@ check_line() {
     fi
 }
 check_line "selftest begin"                          "jbd2-tx: selftest begin"
-check_line "commit trace (seq=1 n_blocks=3)"         "jbd2: commit_tx (trace-only at 1.38.4): seq=1 n_blocks=3"
-check_line "log entry blk=100"                       "log: target_blk=100"
-check_line "log entry blk=101"                       "log: target_blk=101"
-check_line "log entry blk=102"                       "log: target_blk=102"
+# 1.38.5+ made commit_tx a REAL on-disk commit (the 1.38.4 "trace-only" +
+# per-entry "log: target_blk=N" lines were retired then). The lifecycle test
+# now drives a real 3-block commit; the COMMITTED line is the gate.
+check_line "real commit (seq=1 n_blocks=3)"          "jbd2: commit_tx: COMMITTED seq=1 n_blocks=3"
 check_line "selftest PASS"                           "jbd2-tx: selftest PASS"
 if strings "$LOG" | grep -q "^AGNOS shell"; then
     echo "  PASS: shell came up after selftest"

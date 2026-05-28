@@ -70,8 +70,10 @@ if ! e2fsck -fn "$WORK/part-pre.img" >"$LOGS/e2fsck-pre.log" 2>&1; then
     sed 's/^/    /' "$LOGS/e2fsck-pre.log"
 fi
 
-echo "Synthesizing one-tx journal targeting FS block $TARGET_BLK (read-source mode)..."
-python3 "$ROOT/scripts/mk-dirty-journal-img.py" "$IMG" "$PART_OFFSET" --synth-tx "$TARGET_BLK" | sed 's/^/  /'
+echo "Synthesizing one-tx CSUM_V3 journal targeting FS block $TARGET_BLK (read-source mode)..."
+# --csum-v3 makes the synth tx use the 16-byte tag3 layout + tail/commit csums,
+# matching the archaemenid iron journal AGNOS's replay must handle.
+python3 "$ROOT/scripts/mk-dirty-journal-img.py" "$IMG" "$PART_OFFSET" --synth-tx "$TARGET_BLK" --csum-v3 | sed 's/^/  /'
 
 echo "Booting agnos (replay will fire at mount)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"

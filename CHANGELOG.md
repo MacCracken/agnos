@@ -5,6 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.10] — 2026-05-28 (**JBD2 CSUM_V2/V3 write + replay support — the 2026-05-28 iron-burn unlock.** The first real-NAND JBD2 burn falsified the audit's premise: archaemenid's agnos-fs journal is **CSUM_V3 + 64BIT** (`incompat=0x12`, `csum_type=4`/CRC32C) — the Linux kernel stamps CSUM_V3 onto a `metadata_csum` FS's journal on first RW mount, which `mke2fs` does *not* do, so the QEMU smokes (mkfs-default journals) never exercised it and the 1.38.7 narrow-scope refusal aborted every `commit_tx` on iron. This cut implements the CSUM_V2/V3 tag/descriptor/commit checksums on both the write and replay sides so AGNOS can journal to the real iron filesystem. On-disk formats re-derived verbatim from `include/linux/jbd2.h` + `fs/jbd2/commit.c` and **validated against the Linux `e2fsck` oracle** — e2fsck replays an AGNOS-format CSUM_V3 journal clean, and a deliberately-corrupted commit csum is rejected with "transaction was corrupt".)
+
+### Added — CSUM_V2/V3 journal checksums (`ext2.cyr`)
+
+- **`ext2_jbd2_csum_seed`** — `j_csum_seed = crc32c(~0, journal s_uuid[16] @ +0x30)`, computed at probe (mirrors Linux `journal.c`). Reuses the existing non-finalized `ext2_crc32c` (= `jbd2_chksum`).
+- **`ext2_jbd2_tag_data_csum` / `ext2_jbd2_desc_tail_csum_set` / `ext2_jbd2_commit_csum_set`** + replay-side `_valid` validators. Per-tag data csum = `crc32c(crc32c(seed, be32(seq)), data)`; descriptor tail (`jbd2_journal_block_tail` @ blocksize-4) + commit (`h_chksum[0]` @ +0x10, type/size=0) = `crc32c(seed, whole_block)`.
+- **`ext2_jbd2_build_and_write_descriptor`** — emits the 16-byte `journal_block_tag3_t` (t_flags be32@+4, t_blocknr_high@+8, t_checksum@+12) + tail csum on a CSUM_V3 journal; populates the legacy 16-bit `t_checksum` on CSUM_V2.
+- **`ext2_jbd2_build_and_write_commit`** — writes the commit-block csum on a CSUM_V2/V3 journal.
+- **Replay** (`ext2_jbd2_replay_one_tx` + the diagnostic log-walk) — parses the V3 16-byte tag layout and validates the descriptor-tail csum, the commit-block csum (atomicity gate), and **per-tag data-block csums** (the only check covering the logged data blocks — a torn data block is now rejected as `data csum mismatch -- torn`).
+
+### Changed
+
+- **`ext2_jbd2_commit_tx`** — the blanket 1.38.7 CSUM_V2/V3 refusal is replaced by a precise feature gate: REVOKE / 64BIT / CSUM_V2 / CSUM_V3 are supported; only genuinely-unhandled incompat features (ASYNC_COMMIT, FAST_COMMIT, future bits) still abort.
+
+### Fixed
+
+- **Legacy `journal_block_tag_t` field swap** — pre-1.38.10 read+write placed `t_flags`@+4 and `t_checksum`@+6, but the real struct is `t_checksum`@+4 (be16), `t_flags`@+6 (be16). Self-consistent in QEMU (AGNOS-reads-AGNOS, csum=0) but made AGNOS-written journals **not Linux-replayable** (Linux read flags from the wrong offset → never saw LAST_TAG). Corrected on both sides.
+
+### Added — test infrastructure
+
+- **`scripts/mk-dirty-journal-img.py`** — `--csum-v3` upgrades a journal to CSUM_V3 + 64BIT (incompat=0x12, csum_type=4, SB-csum recomputed) — what Linux stamps on first RW mount; `--synth-tx --csum-v3` emits a 16-byte-tag dirty tx with valid tail/commit/data csums.
+- **jbd2 smokes** (tx / writepath / integration / crash / replay) now stamp CSUM_V3 onto the journal post-`mkfs` so they exercise the real-iron path, not the unrepresentative mkfs-default no-csum journal. Stale 1.38.4-era trace assertions in `jbd2-tx-smoke.sh` updated to the real `COMMITTED` line (commit went trace-only → real at 1.38.5).
+
+### Validation
+
+- `test.sh` 4/4, `check.sh` 11/11. All five jbd2 write/replay smokes **PASS on a CSUM_V3 journal**: integration (`commit_tx: COMMITTED` where iron showed the refusal), writepath, tx, replay (V3 tag parse + all three csum gates), crash 4/4 (e2fsck-clean across staggered kill points).
+- **Linux-oracle cross-check**: `e2fsck -fy` replays an AGNOS-format CSUM_V3 journal with no "Journal checksum error"; corrupting the commit csum → "Journal transaction 1 was corrupt, replay was aborted" (proves e2fsck actually validates what AGNOS writes).
+- Production build 990,232 → **992,832 B**.
+
 ## [1.38.9] — 2026-05-28 (**Iron-burn automation — CMOS-stamped JBD2 telemetry + host wrappers.** Three layers of automation that drop iron-burn-cycle friction without needing a serial cable (archaemenid has none per [[feedback_no_serial_on_iron]]). Layer 3 stamps the JBD2 paths into CMOS slots 0xA0-0xA4 so a post-burn `read-boot-log` can confirm probe-outcome / replay-fired+outcome / replayed-tx-count / commit-tx-count — survives reboot, no FB-camera needed. Layer 1 wraps the build+flash and the post-burn validate into single commands. Layer 2 bundles multiple tests per boot. The combination drops the burn cadence from the audit doc's 4-5 flashes-per-rubric down to 3.)
 
 ### Added — Layer 3: CMOS-stamped JBD2 telemetry (kernel)

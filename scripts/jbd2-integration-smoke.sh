@@ -60,8 +60,13 @@ mmd -i "$IMG"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG"@@1048576 "$AGNOS" ::boot/agnos
 mkfs.ext4 -F -q -L AGNOS-EXT -b 4096 -m 0 -E offset=$PART_OFFSET "$IMG" $PART_BLOCKS
+# Upgrade the journal to CSUM_V3 + 64BIT — what the Linux kernel stamps on the
+# first RW mount of a metadata_csum FS, and what archaemenid's iron journal
+# carries (incompat=0x12). mke2fs leaves the journal csum-less, so without this
+# the smoke would exercise the no-csum write path, not the real-iron CSUM_V3 one.
+python3 "$ROOT/scripts/mk-dirty-journal-img.py" "$IMG" "$PART_OFFSET" --csum-v3
 
-echo "Booting agnos (JBD2_INT_SELFTEST kernel)..."
+echo "Booting agnos (JBD2_INT_SELFTEST kernel, CSUM_V3 journal)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/jbd2-integration.log"
 timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \

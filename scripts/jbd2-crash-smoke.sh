@@ -63,6 +63,8 @@ mmd -i "$IMG_TEMPLATE"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$IMG_TEMPLATE"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$IMG_TEMPLATE"@@1048576 "$AGNOS" ::boot/agnos
 mkfs.ext4 -F -q -L AGNOS-EXT -b 4096 -m 0 -E offset=$PART_OFFSET "$IMG_TEMPLATE" $PART_BLOCKS
+# Match iron: stamp the journal CSUM_V3 + 64BIT (what Linux does on first RW mount).
+python3 "$ROOT/scripts/mk-dirty-journal-img.py" "$IMG_TEMPLATE" "$PART_OFFSET" --csum-v3
 
 # Kill timing strategy: spread across the ~3 s stress window (kernel boots
 # in ~1.5 s, then selftest runs ~3 s, then shell). Cover early/mid/late
