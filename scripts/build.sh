@@ -179,6 +179,7 @@ else
         [ -n "$HARDENING_SELFTEST" ] && echo '#define HARDENING_SELFTEST'
         [ -n "$JBD2_LOGDUMP" ]       && echo '#define JBD2_LOGDUMP'
         [ -n "$JBD2_TX_SELFTEST" ]   && echo '#define JBD2_TX_SELFTEST'
+        [ -n "$JBD2_WP_SELFTEST" ]   && echo '#define JBD2_WP_SELFTEST'
         [ -n "$JBD2_NO_REPLAY" ]     && echo '#define JBD2_NO_REPLAY'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks

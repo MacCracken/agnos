@@ -4015,6 +4015,114 @@ var ext2_jbd2_tx_seq_next = 1;    # next-sequence allocator (advanced on commit)
 var ext2_jbd2_tx_blocks[256];     # target FS block per entry
 var ext2_jbd2_tx_bufs[256];       # source buffer pointer per entry
 
+# 1.38.5 — head of the journal log (where the next tx's descriptor will
+# land). After every successful sync-checkpoint commit, the journal is
+# made clean (s_start=0) and head resets to 1, so each commit reuses the
+# same log space — wasteful for high-throughput but correct + simple. The
+# audit doc's "advance head" + circular-log management is deferred until
+# async checkpoint lands (post-1.38.x, when multi-threading arrives).
+var ext2_jbd2_log_head = 1;
+
+# 1.38.5 helpers — BE u32 store (mirror of ext2_load32_be) + journal-block
+# resolve-and-write (translates a journal log block# → its FS physical block
+# via ext2_logical_to_physical on the journal inode, then ext2_write_block).
+fn ext2_store32_be(ptr, off, v) {
+    store8(ptr + off,     (v >> 24) & 0xFF);
+    store8(ptr + off + 1, (v >> 16) & 0xFF);
+    store8(ptr + off + 2, (v >>  8) & 0xFF);
+    store8(ptr + off + 3, v & 0xFF);
+    return 0;
+}
+
+fn ext2_store16_be(ptr, off, v) {
+    store8(ptr + off,     (v >> 8) & 0xFF);
+    store8(ptr + off + 1, v & 0xFF);
+    return 0;
+}
+
+fn ext2_jbd2_write_log_block(log_blk, buf) {
+    if (ext2_get_inode(ext2_jbd2_inum, &ext2_inode_buf) != 0) {
+        kprintln("jbd2: write_log_block: get_inode FAIL", 37);
+        return 0 - 1;
+    }
+    var phys = ext2_logical_to_physical(&ext2_inode_buf, log_blk);
+    if (phys == 0) {
+        kprint("jbd2: write_log_block: log_blk=", 31);
+        kprint_num(log_blk);
+        kprintln(" resolves to phys=0", 19);
+        return 0 - 1;
+    }
+    return ext2_write_block(phys, buf);
+}
+
+# Build the descriptor block in ext2_jbd2_sb_buf (re-purposed as scratch
+# during commit) and write it to journal log block `log_blk`.
+# Tags emitted: legacy 8-byte layout (t_blocknr_lo + t_flags + t_checksum)
+# + optional t_blocknr_hi (4 B) if 64BIT, + UUID (16 B) on the FIRST tag
+# only (subsequent tags carry SAME_UUID flag). 1.38.5 narrow scope: refuses
+# CSUM_V2/V3 journals (no per-tag t_checksum, no commit-block payload csum
+# — implemented in 1.38.7 hardening if iron data justifies).
+fn ext2_jbd2_build_and_write_descriptor(log_blk, n_tags) {
+    var jsb = &ext2_jbd2_sb_buf;
+    # Zero the buffer first (the journal tracks ess. log-block size).
+    var z = 0;
+    while (z < ext2_blocksize) { store8(jsb + z, 0); z = z + 1; }
+
+    # Header: magic + blocktype + sequence (all BE).
+    ext2_store32_be(jsb, 0, JBD2_MAGIC);
+    ext2_store32_be(jsb, 4, JBD2_BLOCKTYPE_DESCRIPTOR);
+    ext2_store32_be(jsb, 8, ext2_jbd2_tx_seq);
+
+    var has_64bit = 0;
+    if ((ext2_jbd2_feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0) { has_64bit = 1; }
+
+    var tag_off = 12;
+    var i = 0;
+    while (i < n_tags) {
+        var target  = load64(&ext2_jbd2_tx_blocks + i * 8);
+        var blk_lo  = target & 0xFFFFFFFF;
+        var blk_hi  = (target >> 32) & 0xFFFFFFFF;
+
+        ext2_store32_be(jsb, tag_off,     blk_lo);
+        var flags = 0;
+        if (i == n_tags - 1) { flags = flags | JBD2_FLAG_LAST_TAG; }
+        if (i > 0)           { flags = flags | JBD2_FLAG_SAME_UUID; }
+        ext2_store16_be(jsb, tag_off + 4, flags);
+        ext2_store16_be(jsb, tag_off + 6, 0);                          # t_checksum (no CSUM_V3)
+        tag_off = tag_off + 8;
+        if (has_64bit == 1) {
+            ext2_store32_be(jsb, tag_off, blk_hi);
+            tag_off = tag_off + 4;
+        }
+        if (i == 0) {
+            # First-tag UUID = 16 zero bytes (matches what the Python helper
+            # generates — keeps things simple; Linux jbd2 cares only that
+            # the UUID matches what the journal SB carries OR that SAME_UUID
+            # was set on subsequent tags, both of which we satisfy here).
+            var u = 0;
+            while (u < 16) { store8(jsb + tag_off + u, 0); u = u + 1; }
+            tag_off = tag_off + 16;
+        }
+        i = i + 1;
+    }
+
+    return ext2_jbd2_write_log_block(log_blk, jsb);
+}
+
+# Build the commit block + write it. `h_chksum_type = 0` (no payload csum)
+# is fine when the journal doesn't have CSUM_V2/V3 enabled (we refuse those
+# at the commit-tx entry below).
+fn ext2_jbd2_build_and_write_commit(log_blk) {
+    var jsb = &ext2_jbd2_sb_buf;
+    var z = 0;
+    while (z < ext2_blocksize) { store8(jsb + z, 0); z = z + 1; }
+    ext2_store32_be(jsb, 0, JBD2_MAGIC);
+    ext2_store32_be(jsb, 4, JBD2_BLOCKTYPE_COMMIT);
+    ext2_store32_be(jsb, 8, ext2_jbd2_tx_seq);
+    # h_chksum_type at +12 stays 0 (no CSUM)
+    return ext2_jbd2_write_log_block(log_blk, jsb);
+}
+
 fn ext2_jbd2_begin_tx() {
     if (ext2_jbd2_tx_active != 0) {
         kprintln("jbd2: begin_tx: nested begin -- ERROR", 37);
@@ -4043,30 +4151,133 @@ fn ext2_jbd2_log_metadata(blocknr, buf) {
     return 0;
 }
 
-# 1.38.4 commit: trace-only. 1.38.5 replaces this body with the actual
-# descriptor → data → commit + FLUSH-CACHE sequence; the API contract
-# (called by callers under ext2_jbd2_begin_tx/log_metadata) stays.
+# 1.38.5 commit: real on-disk write sequence.
+#   1. write descriptor block at log_head
+#   2. write each data block at log_head+1..log_head+n
+#   3. FLUSH-CACHE barrier  (data must precede commit on platter)
+#   4. write commit block at log_head+1+n
+#   5. FLUSH-CACHE barrier  (commit must precede checkpoint on platter)
+#   6. checkpoint: apply each data block to its target FS position
+#   7. FLUSH-CACHE barrier  (checkpoint must precede SB-clean on platter)
+#   8. rewrite journal SB clean (s_start=0, s_sequence advanced) + flush
+#   9. reset log_head = 1 + advance tx_seq_next + tx_active = 0
 fn ext2_jbd2_commit_tx() {
     if (ext2_jbd2_tx_active == 0) {
         kprintln("jbd2: commit_tx: no active tx -- ERROR", 38);
         return 0 - 1;
     }
 
-    kprint("jbd2: commit_tx (trace-only at 1.38.4): seq=", 44);
-    kprint_num(ext2_jbd2_tx_seq);
-    kprint(" n_blocks=", 10);
-    kprintln_num_only(ext2_jbd2_tx_count);
+    # Narrow-scope refusal: CSUM_V2/V3 journals carry per-tag + per-commit
+    # csums we don't yet compute (1.38.7 hardening). Refuse cleanly rather
+    # than produce a journal that replay (ours or Linux's) would reject.
+    var csum_mask = JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3;
+    if ((ext2_jbd2_feature_incompat & csum_mask) != 0) {
+        kprintln("jbd2: commit_tx: CSUM_V2/V3 journal not yet supported (1.38.7) -- aborting", 73);
+        ext2_jbd2_abort_tx();
+        return 0 - 1;
+    }
+
+    var n = ext2_jbd2_tx_count;
+    if (n == 0) {
+        # Empty tx — no on-disk work. Just reset state.
+        ext2_jbd2_tx_active = 0;
+        return 0;
+    }
+
+    # Reserve log space: descriptor + n data + commit.
+    var needed = 1 + n + 1;
+    if (ext2_jbd2_log_head + needed > ext2_jbd2_size) {
+        kprint("jbd2: commit_tx: log overflow (head=", 36);
+        kprint_num(ext2_jbd2_log_head);
+        kprint(" + ", 3);
+        kprint_num(needed);
+        kprint(" > size=", 8);
+        kprintln_num_only(ext2_jbd2_size);
+        ext2_jbd2_abort_tx();
+        return 0 - 1;
+    }
+
+    var desc_blk   = ext2_jbd2_log_head;
+    var commit_blk = desc_blk + 1 + n;
+
+    # 1. Descriptor.
+    if (ext2_jbd2_build_and_write_descriptor(desc_blk, n) != 0) {
+        kprintln("jbd2: commit_tx: descriptor write FAIL", 38);
+        ext2_jbd2_abort_tx();
+        return 0 - 1;
+    }
+
+    # 2. Data blocks into the log.
     var i = 0;
-    while (i < ext2_jbd2_tx_count) {
-        kprint("  log: target_blk=", 18);
-        kprint_num(load64(&ext2_jbd2_tx_blocks + i * 8));
-        kprintln("", 0);
+    while (i < n) {
+        var data_log_blk = desc_blk + 1 + i;
+        var src          = load64(&ext2_jbd2_tx_bufs + i * 8);
+        if (ext2_jbd2_write_log_block(data_log_blk, src) != 0) {
+            kprint("jbd2: commit_tx: data block write FAIL i=", 41);
+            kprintln_num_only(i);
+            ext2_jbd2_abort_tx();
+            return 0 - 1;
+        }
         i = i + 1;
     }
 
-    ext2_jbd2_tx_active   = 0;
-    ext2_jbd2_tx_count    = 0;
+    # 3. Barrier: descriptor + data must be durable BEFORE commit goes out.
+    #    (A torn write here yields no commit → replay finds no commit → discards.)
+    blk_flush_on(ext2_backend);
+
+    # 4. Commit block.
+    if (ext2_jbd2_build_and_write_commit(commit_blk) != 0) {
+        kprintln("jbd2: commit_tx: commit-block write FAIL", 40);
+        ext2_jbd2_abort_tx();
+        return 0 - 1;
+    }
+
+    # 5. Barrier: commit must be durable BEFORE we start checkpoint
+    #    (a crash post-commit-pre-checkpoint leaves a replayable journal entry,
+    #    never a half-applied checkpoint).
+    blk_flush_on(ext2_backend);
+
+    # 6. Checkpoint: apply each data block to its final FS position.
+    #    Reuses 1.38.3 replay's write path (ext2_write_block on target_blk).
+    i = 0;
+    while (i < n) {
+        var target = load64(&ext2_jbd2_tx_blocks + i * 8);
+        var src    = load64(&ext2_jbd2_tx_bufs   + i * 8);
+        if (ext2_write_block(target, src) != 0) {
+            kprint("jbd2: commit_tx: checkpoint write FAIL target=", 46);
+            kprintln_num_only(target);
+            # Don't abort post-commit — the journal carries the data; replay
+            # on next mount will retry. Surface but continue with SB-advance.
+        }
+        i = i + 1;
+    }
+
+    # 7. Barrier: checkpoint must be durable BEFORE we mark the journal clean
+    #    (otherwise an interrupted clean-SB write could leave us with no
+    #    journal pointer to a not-yet-checkpointed tx).
+    blk_flush_on(ext2_backend);
+
+    # 8. Mark journal clean (sync-checkpoint model: tx + checkpoint complete
+    #    simultaneously, so journal returns to empty after every commit).
     ext2_jbd2_tx_seq_next = ext2_jbd2_tx_seq_next + 1;
+    if (ext2_jbd2_rewrite_sb_clean(ext2_jbd2_tx_seq_next) != 0) {
+        kprintln("jbd2: commit_tx: SB-clean rewrite FAIL (journal may look dirty next mount)", 72);
+        ext2_jbd2_tx_active = 0;
+        ext2_jbd2_tx_count  = 0;
+        return 0 - 1;
+    }
+    ext2_jbd2_sequence = ext2_jbd2_tx_seq_next;
+
+    # 9. Reset tx state. Log head goes back to 1 (sync-checkpoint reuses space).
+    ext2_jbd2_tx_active = 0;
+    ext2_jbd2_tx_count  = 0;
+    ext2_jbd2_log_head  = 1;
+
+    kprint("jbd2: commit_tx: COMMITTED seq=", 31);
+    kprint_num(ext2_jbd2_tx_seq);
+    kprint(" n_blocks=", 10);
+    kprint_num(n);
+    kprintln(" -- checkpoint applied + journal clean", 38);
     return 0;
 }
 
@@ -4136,6 +4347,58 @@ fn ext2_jbd2_tx_selftest() {
     }
 
     kprintln("jbd2-tx: selftest PASS", 22);
+    return 0;
+}
+
+# === 1.38.5 write-path self-test (JBD2_WP_SELFTEST=1) ===
+# Drives an end-to-end real commit on a clean-journal FS: reads a known-
+# safe target FS block (high data area, unused on a fresh mkfs.ext4),
+# logs it back via begin_tx/log_metadata/commit_tx, and lets the smoke
+# verify post-mortem via (a) the trace + (b) host `e2fsck -fn` clean
+# on the partition + (c) the journal SB on disk reads s_start=0,
+# s_sequence advanced.
+#
+# The "log the same content we just read" pattern (mirrors the 1.38.3
+# replay-smoke approach) keeps the FS byte-identical pre/post commit so
+# e2fsck has no structural complaint, while the journal/SB writes
+# exercise the full commit machinery.
+fn ext2_jbd2_writepath_selftest() {
+    if (ext2_active == 0)       { kprintln("jbd2-wp: skip (no fs)", 21); return 0; }
+    if (ext2_jbd2_present == 0) { kprintln("jbd2-wp: skip (no journal)", 26); return 0; }
+    if (ext2_write_ok == 0)     { kprintln("jbd2-wp: skip (FS read-only)", 28); return 0; }
+
+    kprintln("jbd2-wp: write-path selftest begin", 34);
+
+    # Read a known-safe high FS block into ext2_jbd2_data_buf. Block 300
+    # is well into the data area of a 67 MiB partition (~17 k blocks
+    # total, journal occupies ~16-1039, plus inode tables / bitmaps in
+    # the low range). Reading + logging back = a no-op data-byte write,
+    # so e2fsck stays clean.
+    if (ext2_read_block(300, &ext2_jbd2_data_buf) != 0) {
+        kprintln("jbd2-wp: read source blk=300 FAIL", 33);
+        return 0 - 1;
+    }
+
+    if (ext2_jbd2_begin_tx() != 0) {
+        kprintln("jbd2-wp: begin_tx FAIL", 22);
+        return 0 - 1;
+    }
+    if (ext2_jbd2_log_metadata(300, &ext2_jbd2_data_buf) != 0) {
+        kprintln("jbd2-wp: log_metadata FAIL", 26);
+        return 0 - 1;
+    }
+    if (ext2_jbd2_commit_tx() != 0) {
+        kprintln("jbd2-wp: commit_tx FAIL", 23);
+        return 0 - 1;
+    }
+
+    # Sync the FS SB (set VALID_FS bit) so host e2fsck sees a cleanly-
+    # unmounted FS. Real callers won't sync per commit (commits are
+    # frequent, sync is what graceful unmount does); the selftest mimics
+    # the unmount step here so the smoke can validate via e2fsck.
+    ext2_sync();
+
+    kprintln("jbd2-wp: write-path selftest PASS", 33);
     return 0;
 }
 

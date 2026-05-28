@@ -5,6 +5,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.5] — 2026-05-28 (**JBD2 journal write path — AGNOS PRODUCES journals.** `commit_tx` swaps from trace-only (1.38.4) to the real on-disk sequence: **descriptor → data blocks → barrier → commit → barrier → checkpoint → barrier → SB-clean → barrier**. Three load-bearing FLUSH-CACHE barriers (1.33.5 primitive) gate against any SSD write-reordering catastrophe — a torn pre-commit yields no commit (replay discards), a torn post-commit pre-checkpoint yields a replayable journal entry (replay re-applies), a torn post-checkpoint pre-SB-clean yields a still-dirty journal pointing at the just-applied tx (replay idempotent re-applies). Sync-checkpoint model: every commit immediately checkpoints + cleans the journal (`s_start = 0`), so the same log space is reused. Wasteful for high-throughput but correct, simple, and matches AGNOS's single-threaded cooperative model (async checkpoint waits for the multi-threading arc per [[project_multithreading_future_arc]]). API-contract unchanged from 1.38.4 — 1.38.6's integration plugs into the same `begin_tx`/`log_metadata`/`commit_tx` surface without callsite changes.)
+
+### Added — real on-disk commit machinery
+
+- **`ext2.cyr`** — `ext2_store32_be` / `ext2_store16_be` (big-endian stores, mirrors of `_be` loaders); `ext2_jbd2_write_log_block(log_blk, buf)` (resolves a journal-log block# → its FS physical block via `ext2_logical_to_physical` on the journal inode, then `ext2_write_block`).
+- **`ext2.cyr` `ext2_jbd2_build_and_write_descriptor(log_blk, n_tags)`** — assembles the descriptor in `ext2_jbd2_sb_buf` (re-purposed as scratch during commit): magic + blocktype=1 + sequence (all BE) + variable-length tag stream (`t_blocknr_lo` + `t_flags` + `t_checksum` legacy 8-B layout, optional `t_blocknr_hi` under `JBD2_FEATURE_INCOMPAT_64BIT`, UUID on first tag with `SAME_UUID` set on subsequent tags, `LAST_TAG` on the final tag).
+- **`ext2.cyr` `ext2_jbd2_build_and_write_commit(log_blk)`** — assembles the commit block: magic + blocktype=2 + sequence + `h_chksum_type=0` (no payload csum; matches journals without CSUM_V2/V3).
+- **`ext2.cyr` `ext2_jbd2_commit_tx`** — replaced the trace body with the 9-step sequence: (1) descriptor write, (2) per-tag data-block writes, (3) FLUSH-CACHE barrier, (4) commit-block write, (5) FLUSH-CACHE barrier, (6) checkpoint (each data block → its target FS position via `ext2_write_block`), (7) FLUSH-CACHE barrier, (8) journal-SB clean via `ext2_jbd2_rewrite_sb_clean(seq+1)`, (9) state reset + log_head back to 1. Narrow-scope refusal: CSUM_V2/V3 journals abort cleanly (per-tag + per-commit csums deferred to 1.38.7 hardening). Log-overflow detection: refuses + aborts if `log_head + 1 + n + 1 > size`.
+- **`ext2.cyr` `ext2_jbd2_writepath_selftest`** — end-to-end self-test (compile-gated `JBD2_WP_SELFTEST=1`): reads FS block 300 → logs it back via begin/log/commit → calls `ext2_sync` at end (mimics graceful unmount so the host-side `e2fsck` sees `VALID_FS` set). The "log the same content we just read" pattern (mirrors 1.38.3 replay-smoke) keeps the FS byte-identical pre/post commit so e2fsck has no structural complaint while the full commit machinery is exercised.
+- **`selftests.cyr`** — wired `JBD2_WP_SELFTEST` invocation. Documented the (now-active) reality that `JBD2_TX_SELFTEST=1` also exercises a real commit at 1.38.5+ (log-then-commit pointer to `ext2_jbd2_data_buf` against dummy high-FS targets).
+- **`scripts/build.sh`** — added `JBD2_WP_SELFTEST=1` env-var gate.
+
+### Added — write-path smoke
+
+- **`scripts/jbd2-writepath-smoke.sh`** — seven-gate validation: (1) selftest reached the API, (2) `commit_tx: COMMITTED seq=1 n_blocks=1` line emitted, (3) `checkpoint applied + journal clean` line, (4) selftest PASS, (5) shell at v1.38.5, (6) **host `e2fsck -fn` clean on the partition** (dispositive: proves the descriptor + data + commit + checkpoint sequence preserved FS structural validity), (7) **journal SB on disk shows `s_start = 0` + `s_sequence ≥ 2`** (proves the sync-checkpoint cleaned the journal correctly; the SB is parsed host-side in Python by walking FS-SB → journal inode → extent → log block 0).
+
+### Validation
+
+- `test.sh` 4/4, `check.sh` 11/11.
+- `jbd2-writepath-smoke.sh` PASS (all 7 gates).
+- All prior JBD2 smokes (`refusal`, `logdump`, `replay`, `tx`) regression-clean.
+- Production build 977,792 → **982,576 B** (+4,784 — descriptor/commit builders + write helper + new selftest fn; selftests are always compiled, only the call site is gated).
+
 ## [1.38.4] — 2026-05-28 (**JBD2 transaction lifecycle — in-memory scaffold.** The write-side API the integration at 1.38.6 will plug into: `ext2_jbd2_begin_tx` → `ext2_jbd2_log_metadata(blocknr, buf)` → `ext2_jbd2_commit_tx`. Plus `ext2_jbd2_abort_tx` for mid-collection failures. Pure in-memory at 1.38.4 — `commit_tx` emits a trace listing the queued target FS blocks; **no on-disk journal writes happen yet** (1.38.5 will hook the descriptor + data + commit + FLUSH-CACHE sequence in, leaving the same call-site API contract). This cut also wires the sequence allocator (`ext2_jbd2_tx_seq_next`) into the probe + replay paths so commit sequences follow on from a replayed journal seamlessly. The buffer-ownership model is "borrowed": the caller's source buffer must stay live across `log_metadata` → `commit_tx` — fine in practice, because callers will use long-lived kernel buffers (`ext2_inode_buf`, `ext2_dir_buf`, `ext2_extent_buf`) that outlive the tx.)
 
 ### Added — lifecycle API + compile-gated boot self-test

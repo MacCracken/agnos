@@ -342,9 +342,21 @@
 #ifdef JBD2_TX_SELFTEST
 # 1.38.4 in-memory transaction lifecycle self-test. Exercises
 # begin_tx / log_metadata / commit_tx + the negative paths (nested begin,
-# log-without-begin, commit-without-begin). No on-disk effect — 1.38.4
-# is trace-only; 1.38.5 will hook the real journal writes into commit_tx.
+# log-without-begin, commit-without-begin). NOTE: with 1.38.5's real write
+# path in commit_tx, this selftest now also exercises a real commit —
+# logging a pointer to ext2_jbd2_data_buf to dummy target blocks 100/101/102
+# (high free blocks on a fresh mkfs.ext4 67 MiB partition). For an isolated
+# end-to-end write check on real source data, use JBD2_WP_SELFTEST=1 below.
 ext2_jbd2_tx_selftest();
+#endif
+
+#ifdef JBD2_WP_SELFTEST
+# 1.38.5 write-path end-to-end selftest. Reads a known-safe high FS
+# block (300), logs it back via begin/log/commit (no-op data write), and
+# calls ext2_sync at end so the smoke's host-side e2fsck sees a cleanly-
+# unmounted FS. Validates the descriptor + data + commit + barrier +
+# checkpoint + SB-clean sequence end-to-end.
+ext2_jbd2_writepath_selftest();
 #endif
 
 #ifdef HARDENING_SELFTEST
