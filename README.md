@@ -2,7 +2,7 @@
 
 > Sovereign operating system kernel. Written in Cyrius. Assembly up. Zero C, zero Rust, zero LLVM.
 
-**Status**: boots to a typeable interactive shell on real AMD hardware (the MVP gate, since v1.30.9). Storage (NVMe / SATA / USB-MS), networking (TCP/IP + DHCP over a real-iron NIC), and read+write filesystems (ext2/ext4, FAT12/16/32, exFAT) are all landed — the storage trio, networking, and ext4 are iron-validated; the FAT-family is QEMU/`fsck`-validated. Current version in [`VERSION`](VERSION); live capability snapshot in [`docs/development/state.md`](docs/development/state.md).
+**Status**: boots to a typeable interactive shell on real AMD hardware (the MVP gate, since v1.30.9). Storage (NVMe / SATA / USB-MS), networking (TCP/IP + DHCP + DNS + NTP + ICMP over a real-iron NIC), and read+write filesystems (ext2/ext4 incl. **ext4 extent allocation** + **JBD2 journaling — crash-safe metadata writes**, FAT12/16/32, exFAT) are all landed — the storage trio, networking, ext4 read+write+extent-alloc are iron-validated; the FAT-family + JBD2 stacks are QEMU/`fsck`-validated. The console-font subsystem is **vendored from [kashi](https://github.com/MacCracken/kashi) 1.0.0** (freestanding glyph core consumed via `[deps.kashi]`). Current version in [`VERSION`](VERSION); live capability snapshot in [`docs/development/state.md`](docs/development/state.md).
 
 ## Quick Start
 
@@ -30,7 +30,7 @@ sh scripts/test.sh --all
 
 ## Architecture
 
-Multi-arch kernel: `kernel/klib/` (3 files — `kstring`, `kfmt`, `ktagged`; freestanding syscall-free stdlib), `kernel/arch/x86_64/` (17 files + `usb/` subdir with 9 xHCI/HID files), `kernel/arch/aarch64/` (9 files), `kernel/core/` (26 files — the storage, networking, and filesystem stacks live here), `kernel/user/` (4 files), plus `kernel/agnos.cyr` orchestrator, `kernel/version.cyr` auto-generated banner module (v1.30.2+), and `kernel/kernel_hello.cyr` smoke test.
+Multi-arch kernel: `kernel/klib/` (3 files — `kstring`, `kfmt`, `ktagged`; freestanding syscall-free stdlib), `kernel/arch/x86_64/` (17 files + `usb/` subdir with 9 xHCI/HID files), `kernel/arch/aarch64/` (9 files), `kernel/core/` (35 files — storage, networking-split-into-8-protocol-files at 1.36.0/.1, filesystem stacks, selftests-split-out at 1.36.2), `kernel/user/` (4 files), plus `kernel/agnos.cyr` orchestrator, `kernel/version.cyr` auto-generated banner module (v1.30.2+), and `kernel/kernel_hello.cyr` smoke test. **External dep**: kashi 1.0.0 freestanding font-data core (`[deps.kashi]` in `cyrius.cyml`; 1.37.5 fold-in).
 
 The build script wraps `cyrius build` with a `#define ARCH_X86_64` /
 `#define ARCH_AARCH64` prepend, since `cyrius build -D NAME` doesn't
@@ -59,7 +59,9 @@ Common:
   -> PCI bus; networking: VirtIO-Net + r8169 NIC, IP / ARP / UDP / TCP, DHCP client
   -> storage: NVMe, AHCI/SATA, USB Mass Storage, RAM-disk, VirtIO-blk —
        5-backend block layer (multi-backend probe) + GPT partition parse
-  -> filesystems: ext2/ext4 (read + write) and FAT12/16/32 + exFAT (read + write)
+  -> filesystems: ext2/ext4 (read + write + extent allocation + JBD2 journaling)
+       and FAT12/16/32 + exFAT (read + write)
+  -> console-font: kashi 1.0.0 freestanding glyph core (vendored via [deps.kashi])
   -> Native xHCI + USB-HID-boot keyboard driver (Phase 1-5)
   -> SMP infrastructure (APIC, IPI, trampoline, per-CPU stacks)
   -> 28 syscalls (signals, epoll, timerfd, pipes, anonymous mmap/munmap)
@@ -104,17 +106,19 @@ Common:
 | USB Mass Storage | BBB transport + SCSI (INQUIRY / TUR / READ CAPACITY / READ / WRITE) over xHCI bulk; iron debut Silicon Motion stick |
 | RAM-disk / VirtIO-blk | `pmm_alloc`-backed RAM-disk + VirtIO 1.x modern virtio-blk (QEMU) |
 | GPT | Header + 16 KB array walk, table-less CRC32, backup-header recovery, type-GUID classifier, `parts` shell cmd |
-| ext2 / ext4 | **Read + write**: superblock / BGDT / inode, indirect tree + ext4 extents, 64BIT, dir walk + path resolution; create / write / unlink / mkdir / rmdir / rename / ln / symlink / truncate, metadata_csum, `e2fsck -fn`-clean. Iron-validated on real NVMe NAND (persist-across-reboot). |
+| ext2 / ext4 | **Read + write + extent allocation + JBD2 journaling**. Read: superblock / BGDT / inode, indirect tree + ext4 extents, 64BIT, dir walk + path resolution. Write: create / write / unlink / mkdir / rmdir / rename / ln / symlink / truncate, metadata_csum, `e2fsck -fn`-clean. Extent alloc (1.37.x): depth-0 → depth-1 grow → multi-leaf → depth-2 grow (the full on-demand grow ladder). JBD2 (1.38.x): journal-SB probe, log reader, replay-on-mount, in-memory transaction lifecycle, write path (3-barrier sync-checkpoint), `put_inode` integration. Iron-validated through 1.37.3 on real NVMe NAND (persist + extent-grow across reboot). |
+| JBD2 journaling | New at 1.38.x: when a tx is active, metadata writes route through `ext2_jbd2_log_metadata` → descriptor + data + commit block in the journal log → FLUSH-CACHE barriers between each stage → checkpoint to the FS → SB-clean. Dirty journal at mount triggers replay. Sync-checkpoint model: every commit immediately checkpoints + cleans (no log fill). `jbd2-crash-smoke.sh` validates SIGKILL-at-varied-points → e2fsck-clean on next boot. |
 | FAT12/16/32 | **Read + write**: partition-aware multi-backend mount, FAT-chain traversal, create / content / delete / truncate, LFN; `fsck.fat -n`-clean |
 | exFAT | **Read + write**: allocation bitmap + typed dir-set (SetChecksum / NameHash) + up-case table (Unicode names) + directory growth; `fsck.exfat -n`-clean |
 | FS write safety | ESP-write guard — FAT/exFAT writes refused on the boot ESP partition (firmware territory); data writes go to MSFT-Basic partitions / USB sticks |
+| Console font | **kashi 1.0.0** (vendored at 1.37.5): freestanding VGA 8x16 + CGA 8x8 glyph cores; `fb_console.cyr` consumes via `kashi_glyph_ptr`. The stdlib-using kashi library face (PSF1/PSF2 import, runtime registry) lives in `kashi/src/lib.cyr` and never reaches the kernel. |
 | Pipes | Circular buffer IPC, read/write ends |
 | SMP Infrastructure | APIC, IPI, trampoline, per-CPU stacks |
 | Signals | per-process signals/sigmask, kill, sigprocmask, signalfd |
 | Epoll | epoll_create, epoll_ctl, epoll_wait |
 | Timerfd | timerfd_create, timerfd_settime |
 | Scheduler | Round-robin |
-| Shell | 28 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench test halt + `cd` `pwd` `parts` (storage/FS nav) + `mkdir` `rm` `rmdir` `touch` `ln` `sync` (ext2/ext4 mutation verbs) |
+| Shell | 34 commands: help echo ps free cat uptime lspci cpus net send recv tcp pipe blkread ls disk bench test halt + `cd` `pwd` `parts` (storage/FS nav) + `mkdir` `rm` `rmdir` `touch` `ln` `sync` (ext2/ext4 mutation verbs) + `dns` `ping` `ntp` `date` (1.35.x networking-comms) + `jbd2` (1.38.1 journal-state diagnostic) |
 | kybernet Init | PID 1, 26 kernel syscalls ready |
 
 ## Syscalls (26)
@@ -174,14 +178,14 @@ for the methodology caveat (closed at v1.28.1 — kept as audit trail).
 
 | Kernel | Language | Scope |
 |--------|----------|-------|
-| **AGNOS** | Cyrius | 40+ subsystems, 28 syscalls, TCP/IP + DHCP, real-iron NIC (r8169), full storage stack (NVMe / AHCI / USB-MS / VirtIO-blk + 5-backend block layer + GPT), read+write filesystems (ext2/ext4, FAT12/16/32, exFAT), SMP, ELF loader, ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, shell |
+| **AGNOS** | Cyrius | 40+ subsystems, 28 syscalls, TCP/IP + DHCP + DNS + NTP + ICMP, real-iron NIC (r8169), full storage stack (NVMe / AHCI / USB-MS / VirtIO-blk + 5-backend block layer + GPT), read+write filesystems (ext2/ext4 incl. extent allocation + **JBD2 crash-safe journaling**, FAT12/16/32, exFAT), SMP, ELF loader, ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, vendored kashi 1.0.0 console-font core, shell |
 | xv6 (MIT) | C | 21 syscalls, no networking, no SMP, no real FS |
 | seL4 (verified) | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
 | MINIX 3 | C | Microkernel + basic drivers |
 | Linux (minimal) | C | Barely boots, no drivers |
 | Linux (typical) | C | Desktop-ready |
 
-A fully functional kernel with TCP/IP + DHCP, a real-iron NIC, a 5-backend block layer (NVMe / AHCI / USB-MS / VirtIO-blk / RAM-disk) + GPT, **read+write** filesystems (ext2/ext4, FAT12/16/32, exFAT), SMP, signals, epoll, pipes, ACPI/IOMMU, native xHCI / USB-HID-boot keyboard, and an interactive shell — written entirely in Cyrius. No C, no LLVM, no libc. The storage trio (NVMe / SATA / USB-MS) and the networking + ext4 stacks are iron-validated on real AMD hardware (archaemenid).
+A fully functional kernel with TCP/IP + DHCP + DNS + NTP, a real-iron NIC, a 5-backend block layer (NVMe / AHCI / USB-MS / VirtIO-blk / RAM-disk) + GPT, **read+write+journaled** filesystems (ext2/ext4 incl. ext4 extent allocation + JBD2 crash-safe journaling, FAT12/16/32, exFAT), SMP, signals, epoll, pipes, ACPI/IOMMU, native xHCI / USB-HID-boot keyboard, vendored kashi 1.0.0 console-font core, and an interactive shell — written entirely in Cyrius. No C, no LLVM, no libc. The storage trio (NVMe / SATA / USB-MS), networking, and ext4 read+write+extent-alloc stacks are iron-validated on real AMD hardware (archaemenid); the JBD2 journaling and FAT-family stacks are QEMU/`fsck`-validated with the iron burn user-driven post-1.38.8.
 
 For live binary sizes per arch (x86_64 + aarch64), per-cut size trajectory, source line counts, test surface, and ecosystem sibling pins, see [`docs/development/state.md`](docs/development/state.md) (refreshed every release). Versions intentionally elided from this table per the lib-doc precedent — the size cells drift faster than the README can be re-cut.
 
@@ -210,8 +214,10 @@ agnos/
 │   │   └── usb/             # xhci{,_cmd,_ctx,_port,_regs,_ring}, hid, hid_translate, msc (USB Mass Storage)
 │   ├── arch/aarch64/        # boot_data, gic, timer, exceptions, paging, main, stubs, …
 │   ├── core/                # pmm, vmm, heap, proc, sched, vfs, syscall, elf, devs, initrd, kprint, main,
-│   │                        # net, virtio_net, r8169 (networking); block, nvme, ahci, virtio_blk,
-│   │                        # ramdisk, gpt (storage); ext2, fatfs, exfat (filesystems); pci, acpi
+│   │                        # boot_finish, selftests (1.36.2 declutter); pci, acpi;
+│   │                        # net + net_tcp/dhcp/icmp/dns/ntp/rtc/ingress (8 net files post-1.36.0/.1 split);
+│   │                        # r8169 (NIC driver); block, nvme, ahci, virtio_blk, ramdisk, gpt (storage);
+│   │                        # ext2 (read+write+extent-alloc+JBD2 — 1.31.x → 1.38.x arcs), fatfs, exfat
 │   └── user/                # shell, init, test, test_procs
 ├── scripts/
 │   ├── build.sh             # Multi-arch wrapper around `cyrius build` (emits ELF64 multiboot2)

@@ -15,11 +15,11 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # kashi freestanding font-data core (1.37.5 fold-in). Located via env var
 # with a sibling-checkout default — works on a local devbox where both
 # repos live under ~/Repos/ AND in CI where actions/checkout only fetches
-# this repo. When the sibling is absent we clone main (or KASHI_REF if
-# set). Once kashi 0.6.0 is tagged on GitHub, bump the default to that
-# tag.
+# this repo. When the sibling is absent we clone the pinned tag (override
+# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.0 — kashi's v1 API freeze;
+# bump as kashi cuts new 1.x releases.
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-main}"
+KASHI_REF="${KASHI_REF:-1.0.0}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for build..." >&2
     rm -rf "$KASHI_DIR"

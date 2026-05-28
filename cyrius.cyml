@@ -27,8 +27,10 @@ stdlib = []
 # to retire the inline VGA 8x16 / CGA 8x8 glyph tables that previously lived in
 # kernel/arch/x86_64/fb_console.cyr. kashi 0.1.0's font_data.cyr was extracted
 # byte-for-byte from agnos's tables, so glyph rendering is byte-identical to
-# 1.37.4 by construction. The stdlib-using library face (PSF import etc.) lives
-# in kashi/src/lib.cyr and never reaches the kernel; the parallel agent develops
+# 1.37.4 by construction. kashi reached **v1.0.0** (API freeze) on 2026-05-28;
+# scripts/build.sh + test.sh default KASHI_REF=1.0.0 for CI/clean-checkout
+# resolution. The stdlib-using library face (PSF import etc.) lives in
+# kashi/src/lib.cyr and never reaches the kernel; the parallel agent develops
 # it independently per project_kashi_parallel_split memory.
 [deps.kashi]
 path    = "../kashi"
