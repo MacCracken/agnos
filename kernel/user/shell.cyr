@@ -636,6 +636,11 @@ fn sh_cmd_jbd2() {
     kprint("jbd2: state=", 12);
     if (ext2_jbd2_clean == 1) { kprintln("clean", 5); }
     else                      { kprintln("DIRTY (needs replay -- not yet implemented)", 43); }
+    # 1.38.2: when dirty, dump the parsed log (descriptor / commit / revoke
+    # walker; non-mutating). Replay still pending (1.38.3).
+    if (ext2_jbd2_clean == 0) {
+        ext2_jbd2_log_walk_and_trace();
+    }
     kprint("jbd2: start=", 12); kprint_num(ext2_jbd2_start);
     kprint(" first=", 7); kprint_num(ext2_jbd2_first);
     kprint(" seq=", 5); kprint_num(ext2_jbd2_sequence); kprintln("", 0);

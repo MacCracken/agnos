@@ -513,6 +513,9 @@ fn ext2_init() {
     var jp = ext2_jbd2_probe();
     if (jp == 0 - 1) {
         ext2_write_ok = 0;                     # dirty: RO stays, RW refused
+        #ifdef JBD2_LOGDUMP
+        ext2_jbd2_log_walk_and_trace();        # 1.38.2: trace the dirty log at mount
+        #endif
     }
     if (jp == 0 - 2) {                         # malformed: refuse mount
         ext2_active = 0;
@@ -3597,12 +3600,24 @@ enum Jbd2Blocktype {
     JBD2_FEATURE_INCOMPAT_FAST_COMMIT   = 0x00000020;
 }
 
-# Big-endian u32 loader (journal headers are BE throughout — Tweedie 1998).
+# Big-endian loaders (journal headers are BE throughout — Tweedie 1998).
 fn ext2_load32_be(ptr, off) {
     return (load8(ptr + off) << 24)
     | (load8(ptr + off + 1) << 16)
     | (load8(ptr + off + 2) << 8)
     | load8(ptr + off + 3);
+}
+
+fn ext2_load16_be(ptr, off) {
+    return (load8(ptr + off) << 8) | load8(ptr + off + 1);
+}
+
+# JBD2 descriptor-tag flag bits (jbd2.h JBD2_FLAG_*).
+enum Jbd2TagFlag {
+    JBD2_FLAG_ESCAPE    = 0x01;
+    JBD2_FLAG_SAME_UUID = 0x02;
+    JBD2_FLAG_DELETED   = 0x04;
+    JBD2_FLAG_LAST_TAG  = 0x08;
 }
 
 # Superblock accessors the probe needs (not used elsewhere yet).
@@ -3767,6 +3782,154 @@ fn ext2_jbd2_probe() {
     kprint_num(ext2_jbd2_sequence);
     kprintln(" -- refusing RW mount (replay lands at 1.38.2)", 46);
     return 0 - 1;
+}
+
+# === JBD2 log-format reader — 1.38.2 ===
+#
+# Walks the journal log from `s_start` parsing descriptor → data → commit
+# block sequences (with optional revoke blocks). Emits a `debugfs logdump`-
+# style trace to the FB console. **Non-mutating.** Halts on the first
+# malformed block (bad magic, unknown blocktype, short read) — that's the
+# torn-transaction boundary, exactly where 1.38.3's replay will stop
+# applying.
+#
+# Buffer reuse: `ext2_jbd2_sb_buf` is reusable post-probe (the SB content
+# was extracted into module state at mount), so we read journal blocks
+# into it without a second BSS allocation.
+#
+# Returns: number of complete (descriptor + commit) transactions seen, or
+# 0 on a clean journal, or -1 on read failure / malformed block.
+fn ext2_jbd2_log_walk_and_trace() {
+    if (ext2_jbd2_present == 0) {
+        kprintln("jbd2: log: no journal", 21);
+        return 0 - 1;
+    }
+    if (ext2_jbd2_start == 0) {
+        kprintln("jbd2: log: clean (s_start=0, nothing to walk)", 45);
+        return 0;
+    }
+
+    var has_64bit = 0;
+    if ((ext2_jbd2_feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0) { has_64bit = 1; }
+
+    var blk = ext2_jbd2_start;
+    var txn_count = 0;
+    var safety_cap = 64;                       # bound the walk; smoke uses 1 tx
+    var loops = 0;
+
+    kprint("jbd2: log: walk start=", 22);
+    kprint_num(blk);
+    kprint(" seq_expected=", 14);
+    kprint_num(ext2_jbd2_sequence);
+    kprintln("", 0);
+
+    while ((blk < ext2_jbd2_size) & (loops < safety_cap)) {
+        loops = loops + 1;
+        var byte_off = blk * ext2_blocksize;
+        var n = ext2_read_at(ext2_jbd2_inum, byte_off, &ext2_jbd2_sb_buf, ext2_blocksize);
+        if (n < ext2_blocksize) {
+            kprint("jbd2: log: short read at blk=", 29);
+            kprint_num(blk);
+            kprintln("", 0);
+            return 0 - 1;
+        }
+
+        var magic = ext2_load32_be(&ext2_jbd2_sb_buf, 0);
+        if (magic != JBD2_MAGIC) {
+            kprint("jbd2: log: end at blk=", 22);
+            kprint_num(blk);
+            kprint(" (no magic; ", 12);
+            kprint_num(txn_count);
+            kprintln(" complete tx)", 13);
+            return txn_count;
+        }
+
+        var bt      = ext2_load32_be(&ext2_jbd2_sb_buf, 4);
+        var blk_seq = ext2_load32_be(&ext2_jbd2_sb_buf, 8);
+
+        if (bt == JBD2_BLOCKTYPE_DESCRIPTOR) {
+            kprint("jbd2: log: DESCRIPTOR seq=", 26);
+            kprint_num(blk_seq);
+            kprint(" at blk=", 8);
+            kprint_num(blk);
+            kprintln("", 0);
+
+            # Parse tags. Layout depends on flags:
+            #   t_blocknr_lo (4 BE) + t_flags (2 BE) + t_checksum (2 BE) = 8 B
+            #   + t_blocknr_hi (4 BE) if JBD2_FEATURE_INCOMPAT_64BIT
+            #   + 16 B UUID if first tag OR !SAME_UUID flag
+            var tag_off = 12;
+            var data_blks = 0;
+            var done = 0;
+            while ((tag_off < ext2_blocksize - 16) & (done == 0)) {
+                var t_blk_lo = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off);
+                var t_flags  = ext2_load16_be(&ext2_jbd2_sb_buf, tag_off + 4);
+                var tag_size = 8;
+                if (has_64bit == 1) { tag_size = 12; }
+                # UUID present if this is the first tag OR SAME_UUID not set.
+                var uuid_present = 0;
+                if (data_blks == 0)                       { uuid_present = 1; }
+                if ((t_flags & JBD2_FLAG_SAME_UUID) == 0) { uuid_present = 1; }
+                if (uuid_present == 1) { tag_size = tag_size + 16; }
+
+                kprint("  tag: dest_blk=", 16);
+                kprint_num(t_blk_lo);
+                kprint(" flags=0x", 9);
+                kprint_num(t_flags);
+                kprintln("", 0);
+
+                data_blks = data_blks + 1;
+                if ((t_flags & JBD2_FLAG_LAST_TAG) != 0) { done = 1; }
+                tag_off = tag_off + tag_size;
+            }
+
+            # Advance past descriptor + its data blocks.
+            blk = blk + 1 + data_blks;
+        }
+
+        if (bt == JBD2_BLOCKTYPE_COMMIT) {
+            kprint("jbd2: log: COMMIT seq=", 22);
+            kprint_num(blk_seq);
+            kprint(" at blk=", 8);
+            kprintln_num_only(blk);
+            txn_count = txn_count + 1;
+            blk = blk + 1;
+        }
+
+        if (bt == JBD2_BLOCKTYPE_REVOKE) {
+            var r_count = ext2_load32_be(&ext2_jbd2_sb_buf, 12);
+            kprint("jbd2: log: REVOKE seq=", 22);
+            kprint_num(blk_seq);
+            kprint(" count=", 7);
+            kprint_num(r_count);
+            kprint(" at blk=", 8);
+            kprintln_num_only(blk);
+            blk = blk + 1;
+        }
+
+        if ((bt != JBD2_BLOCKTYPE_DESCRIPTOR) & (bt != JBD2_BLOCKTYPE_COMMIT) & (bt != JBD2_BLOCKTYPE_REVOKE)) {
+            kprint("jbd2: log: unknown blocktype=", 29);
+            kprint_num(bt);
+            kprint(" at blk=", 8);
+            kprintln_num_only(blk);
+            return 0 - 1;
+        }
+    }
+
+    if (loops >= safety_cap) {
+        kprint("jbd2: log: safety cap hit at ", 29);
+        kprint_num(safety_cap);
+        kprintln(" iterations", 11);
+    }
+    return txn_count;
+}
+
+# Helper: print a number followed by newline. (kprintln_num would conflict
+# with existing kprint_num; spell it out for clarity.)
+fn kprintln_num_only(n) {
+    kprint_num(n);
+    kprintln("", 0);
+    return 0;
 }
 
 # === ext4 extent-ALLOCATION self-test (compile-gated EXT2_EXTENT_WRITE_SELFTEST, 1.37.0) ===

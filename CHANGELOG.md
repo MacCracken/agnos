@@ -5,6 +5,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.2] — 2026-05-28 (**JBD2 log-format reader — descriptor / commit / revoke walker.** The journal-aware mount path now PARSES the log when a dirty journal is detected — descriptor → data → commit block sequences are walked from `s_start`, tags within each descriptor are decoded (variable-length: `t_blocknr_lo`+`t_flags`+`t_checksum`, optionally `t_blocknr_hi` under 64BIT, optionally UUID for first-tag-or-non-SAME_UUID), and a `debugfs logdump`-style trace is emitted to the FB. Non-mutating — replay (apply data blocks to FS positions + clean the SB) lands at 1.38.3. The walker halts on the first malformed block (bad magic / unknown blocktype / short read), exactly where replay will stop applying. Available two ways: compile-gated automatic invocation at mount (`JBD2_LOGDUMP=1 sh scripts/build.sh`) or on-demand via the `jbd2` shell verb when a dirty journal is present.)
+
+### Added — journal log walker + diagnostic emission
+
+- **`ext2.cyr`** — new `ext2_jbd2_log_walk_and_trace()`: from `s_start`, walks journal blocks parsing descriptor / commit / revoke headers (`magic 0xC03B3998`, blocktype 1/2/5, BE sequence). For descriptors: decodes the variable-length tag stream until `JBD2_FLAG_LAST_TAG` (`0x08`) or block-end, emitting one `tag: dest_blk=N flags=0xF` line per tag; tag size is `8` (legacy) or `12` (`JBD2_FEATURE_INCOMPAT_64BIT`) plus `16` UUID bytes on the first tag (or any tag without `SAME_UUID`). For commits: prints `jbd2: log: COMMIT seq=N at blk=B` and increments the transaction count. For revokes: prints `jbd2: log: REVOKE seq=N count=C`. Halts + diagnoses on no-magic / unknown-blocktype / short-read. Returns the complete-transaction count or `-1` on error. Buffer reuse: `ext2_jbd2_sb_buf[512]` (the SB read scratch from 1.38.0) is reused for block reads since SB content was extracted into module state at mount.
+- **`ext2.cyr`** — supporting infra: `ext2_load16_be` (big-endian u16 loader), `Jbd2TagFlag` enum (`ESCAPE`/`SAME_UUID`/`DELETED`/`LAST_TAG`), and a `kprintln_num_only` helper for the trailing-number print pattern.
+- **`ext2.cyr` `ext2_mount`** — added `#ifdef JBD2_LOGDUMP` block that invokes `ext2_jbd2_log_walk_and_trace()` immediately after the dirty-journal refusal diagnostic, so the same boot that printed `DIRTY journal` now prints the parsed log trace right after.
+- **`shell.cyr` `sh_cmd_jbd2`** — extended: when `ext2_jbd2_clean == 0`, also runs the walker after the SB state dump. On-demand path for production builds (no compile gate needed).
+- **`scripts/build.sh`** — added `JBD2_LOGDUMP=1` env-var gate to the prepend block (mirrors `EXT2_EXTENT_WRITE_SELFTEST` / `DNS_SELFTEST` / etc.).
+
+### Added — synthetic-transaction journal generator + logdump smoke
+
+- **`scripts/mk-dirty-journal-img.py`** — new `--synth-tx [target_fs_block]` mode synthesizes a complete one-transaction journal at log blocks `[1, 2, 3]`: descriptor (magic + blocktype=1 + seq + one LAST_TAG tag pointing at `target_fs_block` with zero UUID), data (4 KiB of `0xCC`), commit (magic + blocktype=2 + seq, `h_chksum_type=0` — matches journals without `CSUM_V2/V3`). Auto-detects `JBD2_FEATURE_INCOMPAT_64BIT` (`0x02`) and widens the tag accordingly. Sets `s_start=1` so the walker walks the synthetic tx. Replay-by-Linux works ⇒ AGNOS's walker should parse it byte-identically.
+- **`scripts/jbd2-logdump-smoke.sh`** — builds the kernel via `JBD2_LOGDUMP=1` (gates with `strings | grep "jbd2: log: walk start="`), generates the synth-tx image, boots, validates the trace via 5 line-match checks plus the shell-prompt gate.
+
+### Validation
+
+- `test.sh` 4/4, `check.sh` 11/11.
+- `jbd2-logdump-smoke.sh` PASS (trace matches the synthesized tx exactly).
+- `jbd2-refusal-smoke.sh` regression-clean (the s_start != 0 trip + RO mount path is unchanged).
+- `ext-extent-smoke.sh` regression-clean (the clean-journal probe line still emits; the walker isn't called on clean journals so no logdump on the normal default path).
+- Production build (logdump off) 956,168 → **959,272 B** (+3,104 — walker fn body + tag enum + two helpers; the function is always compiled, only the auto-mount call is gated).
+
 ## [1.38.1] — 2026-05-28 (**JBD2 probe deepens — full SB read surface + V2 csum + `jbd2` diagnostic verb + dirty-image test infrastructure.** 1.38.0 landed the basic probe + dirty-refusal but left the refusal path untested (no dirty-journal image existed). This cut completes the journal-SB read surface (s_first / s_feature_compat,incompat,ro_compat / s_nr_users / s_checksum_type / s_checksum), adds conditional CRC32C-V2/V3 validation of the journal SB (the malformed-detection path), and bundles a `jbd2` shell verb for diagnostic continuity. Host-side: `scripts/mk-dirty-journal-img.py` mutates an ext4 image's journal to `s_start != 0` (recomputing the SB csum when CSUM_V2/V3 is set) so the refusal path becomes testable; `scripts/jbd2-refusal-smoke.sh` boots agnos against that image and gates the three signals (DIRTY diagnostic + refusal reason + shell-still-comes-up RO). The smoke is also the foundation 1.38.2's log-format reader + 1.38.3's replay will reuse.)
 
 ### Added — journal-superblock probe completion + validation + diagnostic verb

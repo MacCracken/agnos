@@ -177,6 +177,7 @@ else
         [ -n "$MMAP_SELFTEST" ]  && echo '#define MMAP_SELFTEST'
         [ -n "$RTC_SELFTEST" ]   && echo '#define RTC_SELFTEST'
         [ -n "$HARDENING_SELFTEST" ] && echo '#define HARDENING_SELFTEST'
+        [ -n "$JBD2_LOGDUMP" ]       && echo '#define JBD2_LOGDUMP'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include

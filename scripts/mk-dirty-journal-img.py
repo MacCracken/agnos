@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # mk-dirty-journal-img.py — set s_start != 0 in an ext4 image's journal,
 # recomputing the journal-SB CRC32C if FEATURE_INCOMPAT_CSUM_V2/V3 is set.
+# Optional --synth-tx mode synthesizes a one-transaction journal at log
+# blocks [1, 2, 3] (descriptor + data + commit) so 1.38.2's log walker
+# has real content to parse + 1.38.3's replay has a real tx to apply.
 #
-# Used by scripts/jbd2-refusal-smoke.sh to validate AGNOS's 1.38.0 dirty-
-# journal mount refusal (and, later, 1.38.3's replay path). Produces an
-# image that on-disk looks "as if a transaction committed but a crash hit
-# before checkpoint completed" — replay-able by Linux's jbd2.
+# Used by scripts/jbd2-refusal-smoke.sh (parse mode, just s_start != 0)
+# and scripts/jbd2-logdump-smoke.sh (--synth-tx, a fully-formed dirty
+# journal). Produces an image that on-disk looks "as if a transaction
+# committed but a crash hit before checkpoint completed" — replay-able
+# by Linux's jbd2.
 #
 # Usage:
-#   mk-dirty-journal-img.py <image.img> <partition_offset_bytes> [new_s_start]
+#   mk-dirty-journal-img.py <image> <partition_offset> [s_start]
+#   mk-dirty-journal-img.py <image> <partition_offset> --synth-tx [target_fs_block]
 #
 # Exits 0 on success, nonzero on parse failure.
 
@@ -26,14 +31,63 @@ def crc32c(data, seed=0xFFFFFFFF):
     return crc & 0xFFFFFFFF
 
 
+def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq):
+    """Synthesize a one-transaction journal at log blocks [1, 2, 3].
+
+    Layout:
+      jfp+1 = descriptor block (one LAST_TAG tag for target_blk, UUID = zero)
+      jfp+2 = data block (4 KB of 0xCC — what would be written to target_blk on replay)
+      jfp+3 = commit block (no payload csum, h_chksum_type=0)
+    """
+    uuid = b"\x00" * 16
+
+    # === Descriptor at jfp+1 ===
+    desc = bytearray(bs)
+    struct.pack_into(">I", desc, 0, 0xC03B3998)   # magic
+    struct.pack_into(">I", desc, 4, 1)            # blocktype = DESCRIPTOR
+    struct.pack_into(">I", desc, 8, seq)          # transaction sequence
+    tag_off = 12
+    struct.pack_into(">I", desc, tag_off,       target_blk & 0xFFFFFFFF)
+    struct.pack_into(">H", desc, tag_off + 4,   0x08)   # flags = LAST_TAG
+    struct.pack_into(">H", desc, tag_off + 6,   0)      # t_checksum (no CSUM_V3)
+    pos = tag_off + 8
+    if has_64bit:
+        struct.pack_into(">I", desc, pos, (target_blk >> 32) & 0xFFFFFFFF)
+        pos += 4
+    desc[pos : pos + 16] = uuid                       # first-tag UUID
+    f.seek(part_off + (jfp + 1) * bs); f.write(desc)
+
+    # === Data at jfp+2 (placeholder content; replay will copy this to target_blk) ===
+    f.seek(part_off + (jfp + 2) * bs); f.write(b"\xCC" * bs)
+
+    # === Commit at jfp+3 ===
+    commit = bytearray(bs)
+    struct.pack_into(">I", commit, 0, 0xC03B3998)
+    struct.pack_into(">I", commit, 4, 2)          # blocktype = COMMIT
+    struct.pack_into(">I", commit, 8, seq)
+    # h_chksum_type at +12 stays 0 (no V1 csum); h_commit_sec / nsec stay 0
+    f.seek(part_off + (jfp + 3) * bs); f.write(commit)
+
+    return target_blk
+
+
 def main():
     if len(sys.argv) < 3:
-        print("usage: mk-dirty-journal-img.py <image> <partition_offset> [s_start=1]", file=sys.stderr)
+        print("usage: mk-dirty-journal-img.py <image> <partition_offset> [s_start | --synth-tx [target_blk]]", file=sys.stderr)
         sys.exit(1)
 
     img = sys.argv[1]
     part_off = int(sys.argv[2])
-    new_start = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    synth_tx = False
+    target_blk = 100
+    new_start = 1
+    if len(sys.argv) > 3:
+        if sys.argv[3] == "--synth-tx":
+            synth_tx = True
+            if len(sys.argv) > 4:
+                target_blk = int(sys.argv[4])
+        else:
+            new_start = int(sys.argv[3])
 
     with open(img, "r+b") as f:
         # === 1. FS superblock at partition_offset + 1024 ===
@@ -101,6 +155,13 @@ def main():
             print(f"journal SB bad magic 0x{jmagic:08x}", file=sys.stderr)
             sys.exit(2)
         j_incompat = struct.unpack_from(">I", jsb, 40)[0]
+        has_64bit = bool(j_incompat & 0x02)
+
+        # === 4a. (Optional) synthesize a one-transaction journal ===
+        if synth_tx:
+            seq = struct.unpack_from(">I", jsb, 24)[0] or 1   # next-expected seq
+            write_synthetic_transaction(f, part_off, first_phys, bs, has_64bit, target_blk, seq)
+            new_start = 1   # journal head now points at the descriptor we just wrote
 
         # === 4. Set s_start = new_start (offset 28, BE u32) ===
         struct.pack_into(">I", jsb, 28, new_start)
@@ -123,6 +184,8 @@ def main():
 
     print(f"journal inode: {j_inum}")
     print(f"journal first block: {first_phys}  (byte offset 0x{first_phys * bs:x} within partition)")
+    if synth_tx:
+        print(f"synthesized 1-tx journal: target FS block {target_blk}, data = 0xCC × {bs}")
     print(f"s_start written: {new_start} at image byte 0x{jsb_byte_off + 28:x}{csum_note}")
 
 
