@@ -512,9 +512,16 @@ fn ext2_init() {
     # lands at 1.38.2). On a malformed journal, refuse mount entirely.
     var jp = ext2_jbd2_probe();
     if (jp == 0 - 1) {
-        ext2_write_ok = 0;                     # dirty: RO stays, RW refused
+        ext2_write_ok = 0;                     # dirty: refuse RW until replay decides
         #ifdef JBD2_LOGDUMP
         ext2_jbd2_log_walk_and_trace();        # 1.38.2: trace the dirty log at mount
+        #endif
+        # 1.38.3: attempt replay. Success lifts write_ok back to 1; failure
+        # keeps it at 0 (RO mount). The replay function decides — we don't
+        # speculate here. (Compile gate `JBD2_NO_REPLAY=1` skips replay so
+        # the 1.38.0 refusal-only path can still be exercised in regression.)
+        #ifndef JBD2_NO_REPLAY
+        ext2_jbd2_replay();
         #endif
     }
     if (jp == 0 - 2) {                         # malformed: refuse mount
@@ -3661,6 +3668,20 @@ var ext2_jbd2_csum_type         = 0;   # 1=CRC32, 4=CRC32C, 0=none
 # Per `feedback_cyrius_var_array_u64_units`.
 var ext2_jbd2_sb_buf[512];
 
+# 1.38.3 replay state — buffers + per-tx tag table.
+# `ext2_jbd2_data_buf[512]` (4 KiB) holds the data block being copied from
+# journal → FS during replay (separate from sb_buf so descriptor parsing
+# and data writes don't fight over the same buffer).
+# `ext2_jbd2_tag_buf[256]` holds up to 256 tags per transaction, each packed
+# as `(flags << 56) | target_blk_56bit` — flags in the high byte, target FS
+# block in the low 56 bits. 256 × 8 = 2 KiB. 256 tags is far more than any
+# realistic ext4 single-tx (mkfs.ext4's default journal can only hold ~340
+# tags per descriptor at 4 KiB blocks).
+var ext2_jbd2_data_buf[512];
+var ext2_jbd2_tag_buf[256];
+var ext2_jbd2_replay_done    = 0;  # 1 after a successful replay this mount
+var ext2_jbd2_replay_count   = 0;  # transactions applied by the last replay
+
 # Probe the journal at mount. Returns:
 #   0   — no journal feature bit OR clean journal (RW mount stays allowed)
 #  -1  — dirty journal (caller downgrades ext2_write_ok; RO mount stays)
@@ -3929,6 +3950,282 @@ fn ext2_jbd2_log_walk_and_trace() {
 fn kprintln_num_only(n) {
     kprint_num(n);
     kprintln("", 0);
+    return 0;
+}
+
+# === JBD2 replay-on-mount — 1.38.3 ===
+#
+# Walks the dirty journal and APPLIES each committed transaction's data
+# blocks to their final FS positions, then rewrites the journal SB as
+# clean (s_start=0, s_sequence advanced) and issues a FLUSH-CACHE barrier.
+# Promotes 1.38.0's mount refusal into a successful RW mount on recoverable
+# journals. Per e2fsprogs `journal_recover()` + Tweedie 1998 § 3.4.
+#
+# Algorithm (per-tx, validate-first then apply):
+#   1. Read descriptor block from journal at `blk`. Validate magic + bt=1.
+#   2. Parse tags into ext2_jbd2_tag_buf[] (packed (flags<<56)|target_blk).
+#      Variable-length per tag: 8 base + 4 if 64BIT + 16 UUID on first-or-
+#      non-SAME_UUID. Halt on LAST_TAG (0x08).
+#   3. Commit block is at `blk + 1 + N_tags`. Read it; validate magic +
+#      bt=2 + sequence-matches-descriptor.
+#   4. ONLY AFTER COMMIT VALIDATES: copy each data block (blk+1, blk+2, …,
+#      blk+N_tags) → its target FS block via ext2_write_block. Handle the
+#      JBD2_FLAG_ESCAPE case (data block's first 4 bytes were zeroed to
+#      avoid the FS mistaking it for a journal block; restore the magic
+#      0xC03B3998 BE before writing).
+#   5. Halt on any malformed block (no magic / bt mismatch / sequence
+#      mismatch / read failure) — that's the torn boundary.
+#   6. Halt on REVOKE block (1.38.3 doesn't handle revoke semantics yet —
+#      better to refuse than silently apply over a revoked block; full
+#      revoke support deferred to 1.38.7 hardening).
+#
+# Returns: 0 on success, -1 on torn / malformed / revoke encountered.
+# Caller (ext2_mount) lifts ext2_write_ok = 1 only on 0 return + after the
+# SB-clean rewrite completes.
+
+# JBD2_REPLAY_TAG_MAX = 256 (inlined — `const` is not a Cyrius keyword; the
+# array-size in `var ext2_jbd2_tag_buf[256]` above must stay an integer literal).
+
+fn ext2_jbd2_replay_one_tx(start_blk) {
+    var bs = ext2_blocksize;
+
+    # === Read + validate descriptor ===
+    if (ext2_read_at(ext2_jbd2_inum, start_blk * bs, &ext2_jbd2_sb_buf, bs) < bs) {
+        kprintln("jbd2: replay: short read on descriptor", 38);
+        return 0 - 1;
+    }
+    if (ext2_load32_be(&ext2_jbd2_sb_buf, 0) != JBD2_MAGIC) {
+        return 0;                                                  # end of log
+    }
+    var bt = ext2_load32_be(&ext2_jbd2_sb_buf, 4);
+    if (bt == JBD2_BLOCKTYPE_REVOKE) {
+        kprintln("jbd2: replay: REVOKE encountered -- not yet supported (1.38.7)", 62);
+        return 0 - 1;
+    }
+    if (bt != JBD2_BLOCKTYPE_DESCRIPTOR) {
+        kprint("jbd2: replay: unexpected blocktype=", 35);
+        kprint_num(bt);
+        kprint(" at blk=", 8);
+        kprintln_num_only(start_blk);
+        return 0 - 1;
+    }
+    var tx_seq = ext2_load32_be(&ext2_jbd2_sb_buf, 8);
+
+    # === Parse tags ===
+    var has_64bit = 0;
+    if ((ext2_jbd2_feature_incompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0) { has_64bit = 1; }
+    var tag_off = 12;
+    var n_tags = 0;
+    var done = 0;
+    while ((tag_off < bs - 16) & (done == 0) & (n_tags < 256)) {
+        var t_blk_lo = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off);
+        var t_flags  = ext2_load16_be(&ext2_jbd2_sb_buf, tag_off + 4);
+        var tag_size = 8;
+        var t_blk_hi = 0;
+        if (has_64bit == 1) {
+            t_blk_hi = ext2_load32_be(&ext2_jbd2_sb_buf, tag_off + 8);
+            tag_size = 12;
+        }
+        var uuid_present = 0;
+        if (n_tags == 0)                          { uuid_present = 1; }
+        if ((t_flags & JBD2_FLAG_SAME_UUID) == 0) { uuid_present = 1; }
+        if (uuid_present == 1) { tag_size = tag_size + 16; }
+
+        # Pack into tag_buf: (flags << 56) | target_blk_56bit.
+        # We don't carry the full 64-bit target since the FS we journal
+        # against is < 2^56 blocks (16 EB at 4 KiB). Sufficient.
+        var target = (t_blk_hi << 32) | t_blk_lo;
+        var packed = (t_flags << 56) | (target & 0xFFFFFFFFFFFFFF);
+        store64(&ext2_jbd2_tag_buf + n_tags * 8, packed);
+
+        n_tags = n_tags + 1;
+        if ((t_flags & JBD2_FLAG_LAST_TAG) != 0) { done = 1; }
+        tag_off = tag_off + tag_size;
+    }
+    if (n_tags == 256) {
+        kprintln("jbd2: replay: tag table overflow -- refusing", 44);
+        return 0 - 1;
+    }
+    if (done == 0) {
+        kprintln("jbd2: replay: no LAST_TAG seen in descriptor", 44);
+        return 0 - 1;
+    }
+
+    # === Read + validate commit block (validate-first, apply-second) ===
+    var commit_blk = start_blk + 1 + n_tags;
+    if (ext2_read_at(ext2_jbd2_inum, commit_blk * bs, &ext2_jbd2_sb_buf, bs) < bs) {
+        kprintln("jbd2: replay: short read on commit", 34);
+        return 0 - 1;
+    }
+    if (ext2_load32_be(&ext2_jbd2_sb_buf, 0) != JBD2_MAGIC) {
+        kprintln("jbd2: replay: torn (no commit magic)", 36);
+        return 0 - 1;
+    }
+    if (ext2_load32_be(&ext2_jbd2_sb_buf, 4) != JBD2_BLOCKTYPE_COMMIT) {
+        kprintln("jbd2: replay: expected COMMIT, got different blocktype", 54);
+        return 0 - 1;
+    }
+    if (ext2_load32_be(&ext2_jbd2_sb_buf, 8) != tx_seq) {
+        kprintln("jbd2: replay: sequence mismatch desc vs commit", 46);
+        return 0 - 1;
+    }
+
+    # === Apply data blocks (now that commit validated) ===
+    var i = 0;
+    while (i < n_tags) {
+        var packed = load64(&ext2_jbd2_tag_buf + i * 8);
+        var tflags = (packed >> 56) & 0xFF;
+        var target = packed & 0xFFFFFFFFFFFFFF;
+
+        # Read journal data block.
+        var data_blk = start_blk + 1 + i;
+        if (ext2_read_at(ext2_jbd2_inum, data_blk * bs, &ext2_jbd2_data_buf, bs) < bs) {
+            kprint("jbd2: replay: short read on data blk=", 37);
+            kprintln_num_only(data_blk);
+            return 0 - 1;
+        }
+
+        # ESCAPE handling: tag bit 0 means the data's first 4 bytes were
+        # zeroed (the source block coincidentally started with the JBD2
+        # magic). Restore the magic before writing to the FS.
+        if ((tflags & JBD2_FLAG_ESCAPE) != 0) {
+            store8(&ext2_jbd2_data_buf + 0, 0xC0);
+            store8(&ext2_jbd2_data_buf + 1, 0x3B);
+            store8(&ext2_jbd2_data_buf + 2, 0x39);
+            store8(&ext2_jbd2_data_buf + 3, 0x98);
+        }
+
+        # Write to the FS target block. Caller (the replay top-level) lifts
+        # write_ok briefly so ext2_write_block accepts. This ext2_mark_dirty
+        # side effect is fine — replay IS mutating the FS.
+        if (ext2_write_block(target, &ext2_jbd2_data_buf) != 0) {
+            kprint("jbd2: replay: write failed target_blk=", 38);
+            kprintln_num_only(target);
+            return 0 - 1;
+        }
+
+        i = i + 1;
+    }
+
+    # Update tracking + return number of journal blocks consumed.
+    ext2_jbd2_replay_count = ext2_jbd2_replay_count + 1;
+    return 2 + n_tags;                                              # descriptor + N data + commit
+}
+
+# Rewrite the journal SB on disk as "clean": s_start=0, s_sequence advanced
+# to next-expected. Recomputes SB CSUM_V2/V3 if the feature is set. Issues
+# a FLUSH-CACHE barrier after. Returns 0/-1.
+fn ext2_jbd2_rewrite_sb_clean(new_seq) {
+    # Re-read the journal SB block 0 (we clobbered ext2_jbd2_sb_buf during
+    # the walk; need fresh canonical content + uuid/feature fields).
+    if (ext2_read_at(ext2_jbd2_inum, 0, &ext2_jbd2_sb_buf, ext2_blocksize) < ext2_blocksize) {
+        kprintln("jbd2: replay: SB re-read failed", 31);
+        return 0 - 1;
+    }
+    var jsb = &ext2_jbd2_sb_buf;
+
+    # s_start = 0 (BE u32 at offset 28); s_sequence = new_seq (BE u32 at 24).
+    store8(jsb + 28, 0); store8(jsb + 29, 0); store8(jsb + 30, 0); store8(jsb + 31, 0);
+    store8(jsb + 24, (new_seq >> 24) & 0xFF);
+    store8(jsb + 25, (new_seq >> 16) & 0xFF);
+    store8(jsb + 26, (new_seq >>  8) & 0xFF);
+    store8(jsb + 27, new_seq & 0xFF);
+
+    # If CSUM_V2/V3 is set, recompute the SB checksum.
+    var csum_mask = JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3;
+    if ((ext2_jbd2_feature_incompat & csum_mask) != 0) {
+        store8(jsb + 252, 0); store8(jsb + 253, 0);
+        store8(jsb + 254, 0); store8(jsb + 255, 0);
+        var c = ext2_crc32c(0xFFFFFFFF, jsb, 1024);
+        store8(jsb + 252, (c >> 24) & 0xFF);
+        store8(jsb + 253, (c >> 16) & 0xFF);
+        store8(jsb + 254, (c >>  8) & 0xFF);
+        store8(jsb + 255, c & 0xFF);
+    }
+
+    # Resolve the journal's first physical block and write directly via the
+    # block layer (bypass ext2_write_at's file-abstraction overhead — no
+    # extent / indirect changes happen here, just an in-place block rewrite).
+    if (ext2_get_inode(ext2_jbd2_inum, &ext2_inode_buf) != 0) {
+        kprintln("jbd2: replay: journal get_inode failed", 38);
+        return 0 - 1;
+    }
+    var phys = ext2_logical_to_physical(&ext2_inode_buf, 0);
+    if (phys == 0) {
+        kprintln("jbd2: replay: journal log-block 0 resolves to phys=0", 52);
+        return 0 - 1;
+    }
+    if (ext2_write_block(phys, jsb) != 0) {
+        kprintln("jbd2: replay: SB clean-write failed", 35);
+        return 0 - 1;
+    }
+
+    # FLUSH-CACHE barrier: the clean SB must reach non-volatile media before
+    # we declare success. Reuses 1.33.5's `blk_flush_on(ext2_backend)`.
+    blk_flush_on(ext2_backend);
+
+    return 0;
+}
+
+# Top-level replay driver. Returns 0 on success (write_ok lifted), -1 on
+# torn/malformed. ext2_jbd2_clean is updated to 1 on success.
+fn ext2_jbd2_replay() {
+    if (ext2_jbd2_present == 0) { return 0; }
+    if (ext2_jbd2_clean == 1)   { return 0; }
+    ext2_jbd2_replay_count = 0;
+
+    kprint("jbd2: replay: walk start=", 25);
+    kprint_num(ext2_jbd2_start);
+    kprint(" seq=", 5);
+    kprintln_num_only(ext2_jbd2_sequence);
+
+    # Temporarily lift write_ok so ext2_write_block accepts. We re-gate
+    # afterward based on replay result.
+    var saved_write_ok = ext2_write_ok;
+    ext2_write_ok = 1;
+
+    var blk = ext2_jbd2_start;
+    var seq = ext2_jbd2_sequence;
+    var safety_cap = 64;
+    var loops = 0;
+    while ((blk < ext2_jbd2_size) & (loops < safety_cap)) {
+        loops = loops + 1;
+        var consumed = ext2_jbd2_replay_one_tx(blk);
+        if (consumed < 0) {
+            kprintln("jbd2: replay: ABORTED -- FS may be in mixed state", 49);
+            ext2_write_ok = 0;                                      # safety: refuse RW
+            return 0 - 1;
+        }
+        if (consumed == 0) { break; }                              # end of log
+        blk = blk + consumed;
+        seq = seq + 1;
+    }
+
+    # Replay walked clean. Rewrite the journal SB.
+    if (ext2_jbd2_rewrite_sb_clean(seq) != 0) {
+        ext2_write_ok = 0;
+        return 0 - 1;
+    }
+
+    ext2_jbd2_clean       = 1;
+    ext2_jbd2_start       = 0;
+    ext2_jbd2_sequence    = seq;
+    ext2_jbd2_replay_done = 1;
+    ext2_write_ok         = saved_write_ok;
+    if (ext2_write_ok == 0) { ext2_write_ok = 1; }                 # lift the refusal
+
+    # Mark the FS cleanly-unmounted on disk. Replay was a coherent
+    # mutation (one or more committed-tx applied + journal SB cleaned);
+    # the FS is now consistent. Re-setting EXT2_VALID_FS lets a host
+    # `e2fsck -fn` see "cleanly unmounted" rather than warning about
+    # the dirty bit ext2_mark_dirty cleared during replay's writes.
+    ext2_sync();
+
+    kprint("jbd2: replay: APPLIED ", 22);
+    kprint_num(ext2_jbd2_replay_count);
+    kprint(" tx; SB now clean (next seq=", 28);
+    kprint_num(seq);
+    kprintln(") -- RW mount LIFTED", 20);
     return 0;
 }
 

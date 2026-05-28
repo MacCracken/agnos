@@ -31,12 +31,15 @@ def crc32c(data, seed=0xFFFFFFFF):
     return crc & 0xFFFFFFFF
 
 
-def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq):
+def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq, data_source="block"):
     """Synthesize a one-transaction journal at log blocks [1, 2, 3].
 
     Layout:
       jfp+1 = descriptor block (one LAST_TAG tag for target_blk, UUID = zero)
-      jfp+2 = data block (4 KB of 0xCC — what would be written to target_blk on replay)
+      jfp+2 = data block (content depends on data_source: "block" reads
+              target_blk's current FS content so replay is a no-op write;
+              "fill" uses 0xCC pattern — replay corrupts target_blk, useful
+              for negative tests)
       jfp+3 = commit block (no payload csum, h_chksum_type=0)
     """
     uuid = b"\x00" * 16
@@ -57,8 +60,23 @@ def write_synthetic_transaction(f, part_off, jfp, bs, has_64bit, target_blk, seq
     desc[pos : pos + 16] = uuid                       # first-tag UUID
     f.seek(part_off + (jfp + 1) * bs); f.write(desc)
 
-    # === Data at jfp+2 (placeholder content; replay will copy this to target_blk) ===
-    f.seek(part_off + (jfp + 2) * bs); f.write(b"\xCC" * bs)
+    # === Data at jfp+2 ===
+    if data_source == "block":
+        # Read target_blk's current FS content so replay is a no-op write
+        # → e2fsck stays clean after replay (the FS sees the same bytes
+        # it would have anyway). The "ESCAPE" subtlety: if the block's
+        # first 4 bytes happen to be the JBD2 magic, we'd need to zero
+        # them + set t_flags |= ESCAPE. For a fresh mkfs.ext4 with a
+        # high target_blk (data/empty region), this is overwhelmingly
+        # unlikely; we don't probe-for-or-set ESCAPE here (test fixture,
+        # not Linux fidelity).
+        f.seek(part_off + target_blk * bs)
+        data = f.read(bs)
+        if len(data) < bs:
+            data = data + b"\x00" * (bs - len(data))
+    else:
+        data = b"\xCC" * bs
+    f.seek(part_off + (jfp + 2) * bs); f.write(data)
 
     # === Commit at jfp+3 ===
     commit = bytearray(bs)

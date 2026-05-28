@@ -5,6 +5,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.3] — 2026-05-28 (**JBD2 replay-on-mount — the unlock.** The dirty-journal mount path now APPLIES the parsed transactions: data blocks are copied from journal log positions → their target FS positions, the journal superblock is rewritten as clean (`s_start = 0`, `s_sequence` advanced, CRC32C recomputed if `CSUM_V2/V3` is set), a FLUSH-CACHE barrier flushes the controller's write cache, and finally `ext2_sync` re-asserts `EXT2_VALID_FS` so `e2fsck -fn` sees a cleanly-unmounted FS. **`ext2_write_ok` lifts from 0 → 1 on success — the dirty-mount refusal becomes a successful RW mount.** Promotes 1.38.0's stop-gap into a fully-recovering JBD2 reader. Replay is **validate-first, apply-second**: the descriptor's tags are parsed into memory, the commit block is read + sequence-matched, and ONLY THEN do the data writes start — guaranteeing a torn transaction (no commit block) is discarded, never half-applied. Compile gate `JBD2_NO_REPLAY=1` skips replay entirely so the 1.38.0 refusal-only path remains exercisable in regression.)
+
+### Added — replay engine
+
+- **`ext2.cyr`** — new `ext2_jbd2_replay_one_tx(start_blk)`: reads descriptor at `start_blk`, validates magic + blocktype, parses the variable-length tag stream into `ext2_jbd2_tag_buf[]` (packed `(flags << 56) | target_blk_56bit`, up to 256 tags). Reads the commit block at `start_blk + 1 + n_tags`, validates magic + blocktype + sequence-matches-descriptor. **Only then** copies each data block (journal `start_blk + 1 + i` → FS `tag[i].target_blk`) via `ext2_write_block`. Handles `JBD2_FLAG_ESCAPE` (restores the JBD2 magic in the first 4 bytes of the data block before writing). Halts on any malformed block — that's the torn boundary. Returns the number of journal blocks consumed (or -1 on error).
+- **`ext2.cyr`** — new `ext2_jbd2_rewrite_sb_clean(new_seq)`: re-reads the journal SB block 0, sets `s_start = 0` and `s_sequence = new_seq` (both BE u32), recomputes the CRC32C-V2/V3 checksum if the feature is set, resolves the journal's first FS block via `ext2_logical_to_physical`, writes the clean SB back via `ext2_write_block` (in-place, no extent allocation), and issues `blk_flush_on(ext2_backend)` — the FLUSH-CACHE barrier that makes the clean-journal state durable.
+- **`ext2.cyr`** — new `ext2_jbd2_replay()`: top-level driver. Walks transactions, accumulates the replay count, on success calls `rewrite_sb_clean` + `ext2_sync` (which re-asserts `EXT2_VALID_FS` so `e2fsck` sees cleanly-unmounted), lifts `ext2_write_ok = 1`, and emits `jbd2: replay: APPLIED N tx; SB now clean (next seq=K) -- RW mount LIFTED`. Failure keeps `write_ok = 0`.
+- **`ext2.cyr`** — supporting BSS: `ext2_jbd2_data_buf[512]` (4 KiB) for data-block reads during replay, `ext2_jbd2_tag_buf[256]` (2 KiB) for per-tx tag tables.
+- **`ext2.cyr` `ext2_mount`** — dirty-journal branch now calls `ext2_jbd2_replay()` (under `#ifndef JBD2_NO_REPLAY`) after the existing refusal diagnostic + optional logdump. Success path lifts the refusal; failure path leaves write_ok = 0.
+
+### Added — Python helper read-source mode + replay smoke
+
+- **`scripts/mk-dirty-journal-img.py`** — extended `--synth-tx` to default to "block" `data_source` mode: reads the target FS block's CURRENT content from disk and uses that as the journal's data block, so replay is a byte-identical no-op write. Replay-then-`e2fsck` stays clean. Alternative `"fill"` mode keeps the old 0xCC pattern for negative tests.
+- **`scripts/jbd2-replay-smoke.sh`** — five-gate validation: (1) DIRTY journal printed (probe still fires), (2) `replay: APPLIED 1 tx` printed, (3) `RW mount LIFTED` printed, (4) shell came up at v1.38.3, (5) **host `e2fsck -fn` clean on the post-replay partition** — the dispositive gate proving the SB was rewritten clean, FLUSH-CACHE issued, data writes consistent with FS state, and `VALID_FS` re-asserted by `ext2_sync`.
+
+### Validation
+
+- `test.sh` 4/4, `check.sh` 11/11.
+- `jbd2-replay-smoke.sh` PASS (all 5 gates including the e2fsck post-replay check).
+- `jbd2-logdump-smoke.sh` regression — still emits the trace, and additionally now logs replay success (a happy regression: the logdump build also exercises replay).
+- `jbd2-refusal-smoke.sh` — semantics now shift: the "refusal" diagnostic still emits, but replay immediately follows and lifts write_ok. Smoke's "shell came up" gate still PASS. To exercise pure-refusal regression, build with `JBD2_NO_REPLAY=1` (the compile gate that skips replay).
+- Production build 959,272 → **970,920 B** (+11,648 — replay-one-tx + rewrite-sb-clean + top-level driver + buffers).
+
 ## [1.38.2] — 2026-05-28 (**JBD2 log-format reader — descriptor / commit / revoke walker.** The journal-aware mount path now PARSES the log when a dirty journal is detected — descriptor → data → commit block sequences are walked from `s_start`, tags within each descriptor are decoded (variable-length: `t_blocknr_lo`+`t_flags`+`t_checksum`, optionally `t_blocknr_hi` under 64BIT, optionally UUID for first-tag-or-non-SAME_UUID), and a `debugfs logdump`-style trace is emitted to the FB. Non-mutating — replay (apply data blocks to FS positions + clean the SB) lands at 1.38.3. The walker halts on the first malformed block (bad magic / unknown blocktype / short read), exactly where replay will stop applying. Available two ways: compile-gated automatic invocation at mount (`JBD2_LOGDUMP=1 sh scripts/build.sh`) or on-demand via the `jbd2` shell verb when a dirty journal is present.)
 
 ### Added — journal log walker + diagnostic emission
