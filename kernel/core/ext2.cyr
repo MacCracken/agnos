@@ -4639,6 +4639,16 @@ fn ext2_jbd2_replay_one_tx(start_blk) {
 
     # === Read + validate commit block (validate-first, apply-second) ===
     var commit_blk = start_blk + 1 + n_tags;
+    # 1.38.8 hardening: bound commit_blk against journal size. A malformed
+    # descriptor claiming a wildly large tag count would push commit_blk past
+    # the journal — refuse before the read so we don't off-end the inode.
+    if (commit_blk >= ext2_jbd2_size) {
+        kprint("jbd2: replay: tx commit_blk=", 28);
+        kprint_num(commit_blk);
+        kprint(" >= journal_size=", 17);
+        kprintln_num_only(ext2_jbd2_size);
+        return 0 - 1;
+    }
     if (ext2_read_at(ext2_jbd2_inum, commit_blk * bs, &ext2_jbd2_sb_buf, bs) < bs) {
         kprintln("jbd2: replay: short read on commit", 34);
         return 0 - 1;
@@ -4657,11 +4667,41 @@ fn ext2_jbd2_replay_one_tx(start_blk) {
     }
 
     # === Apply data blocks (now that commit validated) ===
+    # 1.38.8 hardening: cache the FS-block ceiling for tag bounds checks.
+    # `ext2_sb_blocks_count` is the lo half (u32, sufficient for FSes ≤ 16 TB
+    # at 4 KiB blocks — far above any realistic AGNOS target). 64BIT
+    # `s_blocks_count_hi` at sb+0x150 widening is deferred to >2^32-block FSes.
+    var fs_total_blocks = ext2_sb_blocks_count(&ext2_sb_buf);
+
     var i = 0;
     while (i < n_tags) {
         var packed = load64(&ext2_jbd2_tag_buf + i * 8);
         var tflags = (packed >> 56) & 0xFF;
         var target = packed & 0xFFFFFFFFFFFFFF;
+
+        # 1.38.8 hardening: target FS-block must be in-range before write.
+        # A malformed journal could carry a wildly-OOB target; without this
+        # check we'd hand a garbage LBA to the backend.
+        if (target >= fs_total_blocks) {
+            kprint("jbd2: replay: tag target_blk=", 29);
+            kprint_num(target);
+            kprint(" >= fs_total_blocks=", 20);
+            kprintln_num_only(fs_total_blocks);
+            return 0 - 1;
+        }
+        # 1.38.8 hardening: refuse writes to the first 4 blocks (SB + early
+        # GDT region). Replaying a tx that claims to write to the FS SB or
+        # its first BGDT block is almost certainly a malformed-journal attack
+        # (the journal shouldn't be authoring its own filesystem's foundational
+        # metadata via replay) — and a bug in our own write path could only
+        # ever land here legitimately if we journaled an SB rewrite, which we
+        # don't do. Defensive refusal.
+        if (target < 4) {
+            kprint("jbd2: replay: tag target_blk=", 29);
+            kprint_num(target);
+            kprintln(" too low (SB/early-GDT range) -- refusing", 41);
+            return 0 - 1;
+        }
 
         # Read journal data block.
         var data_blk = start_blk + 1 + i;

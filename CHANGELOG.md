@@ -5,6 +5,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.8] — 2026-05-28 (**JBD2 arc-close hardening — replay-side ingress validation + iron-burn pre-audit doc.** Parallels the 1.35.7 arc-close hardening pass (ingress IP-length clamp). Adds defensive bounds checks to the JBD2 replay path — the only untrusted-input surface of the JBD2 stack (the journal content is whatever was on disk when AGNOS booted; the write side trusts its own callers). NO new functional surface — the existing replay-then-e2fsck-clean behavior is unchanged; the hardening only adds REFUSALS for malformed inputs that would otherwise off-end or stomp foundational FS metadata. Plus the **iron-burn pre-audit doc** in agnosticos, the line-by-line rubric the user-driven burn will follow.)
+
+### Added — replay-path bounds checks
+
+- **`ext2.cyr` `ext2_jbd2_replay_one_tx`** — three new guard refusals before any data write:
+  1. `commit_blk < ext2_jbd2_size` — a descriptor claiming a wildly large `n_tags` would push the commit-block offset past the end of the journal; refuse before the off-end read, with a clear `commit_blk=N >= journal_size=M` diagnostic.
+  2. `target < fs_total_blocks` (`ext2_sb_blocks_count`) — a malformed tag could carry an OOB FS-block target; refuse before handing a garbage LBA to the backend.
+  3. `target >= 4` — refuse writes to the first 4 FS blocks (FS-SB at byte 1024 + early BGDT region). A journal authoring its own filesystem's foundational metadata via replay is almost certainly malformed; legitimate JBD2 use never targets this range.
+
+### Added — iron-burn pre-audit
+
+- **`agnosticos/docs/development/ext4-jbd2-iron-burn-audit.md`** — pre-burn audit per [[feedback_iron_burns_block_other_work]]. Seven sections: (1) what the burn proves, mapping every 1.38.x bite to the QEMU validation that lands here on iron; (2) hypothesis; (3) pre-burn state (production build = no env-var flags); (4) six test-item rubric with PASS / falsifies per item; (5) diff against QEMU — where iron could expose what QEMU's idealized NVMe model couldn't (DMA reordering, FLUSH-CACHE latency, real power-loss durability); (6) out of scope; (7) burn-day flow. The user calls the burn — this doc is the audit-before-burn discipline.
+
+### Validation
+
+- `test.sh` 4/4, `check.sh` 11/11.
+- `jbd2-replay-smoke.sh` regression-clean — bounds-check additions don't break the happy path; e2fsck `AGNOS-EXT: 12/17152 files (8.3% non-contiguous), 2146/17152 blocks`.
+- Production build 986,184 → **986,656 B** (+472 — three bounds checks + diagnostics).
+- All prior JBD2 smokes (refusal / logdump / replay / tx / writepath / integration / crash) regression-clean (sampled replay and tested production); the new bounds only trigger on malformed inputs the existing smokes never produce.
+
+### JBD2 arc-close summary
+
+The 1.38.x arc shipped in eight bites:
+- **1.38.0** journal-SB probe + dirty-mount refusal stop-gap
+- **1.38.1** probe deepens (full SB read surface, CRC32C-V2 validation, `jbd2` shell verb, dirty-image generator)
+- **1.38.2** log-format reader (descriptor / commit / revoke walker + logdump trace)
+- **1.38.3** replay-on-mount (the unlock; lifts dirty-refusal to RW after replay)
+- **1.38.4** transaction lifecycle (in-memory begin / log / commit / abort)
+- **1.38.5** journal write path (AGNOS PRODUCES journals; 3-barrier sync-checkpoint)
+- **1.38.6** integration (`put_inode` routes through journal under active tx)
+- **1.38.7** crash-injection smoke (4/4 e2fsck-clean across varied SIGKILL points)
+- **1.38.8** arc-close hardening + iron-burn audit doc (this cut)
+
+**Iron burn**: user-driven, post-1.38.8 per the audit doc's rubric. Not auto-proposed.
+
 ## [1.38.7] — 2026-05-28 (**JBD2 crash-injection smoke — end-to-end recovery validated.** New `scripts/jbd2-crash-smoke.sh` runs N iterations (default 4, override `ITERATIONS=N` up to 64) of: fresh `mkfs.ext4` image → boot agnos with a 100-commit stress loop (~3 s window via `rdtsc` busy-wait between commits) → **SIGKILL QEMU at varied points within the busy window** → re-boot agnos against the same image → host `e2fsck -fn` MUST be clean. The honest finding from N=4: **all 4 iterations landed in the 30 ms busy-wait gap between commits** (boot 2 saw `clean journal` every time, not `DIRTY journal → replay`). With sync-checkpoint + the three FLUSH-CACHE barriers, each commit's at-risk window is ~10 ms; statistically the kill lands in the 75 % "between commits" zone. **Every kill point produces an e2fsck-clean FS** — that's the dispositive guarantee. The specific mid-commit-then-replay path stays validated by `jbd2-replay-smoke.sh` (1.38.3, manually-constructed dirty journal). 1.38.8's hardening can tighten the kill timing if iron data motivates it.)
 
 ### Added — crash-stress selftest + crash smoke
