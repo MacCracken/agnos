@@ -779,8 +779,26 @@ fn ext2_put_inode(inode_num, in_buf) {
     for (var i = 0; i < ext2_inode_size; i = i + 1) {
         store8(dst + i, load8(in_buf + i));
     }
-    if (ext2_write_block(target_block, &ext2_block_buf) != 0) { return 0 - 1; }
+    # 1.38.6 integration: if a journal tx is active, route the inode-table
+    # block write through the journal instead of writing in place. The
+    # caller (e.g. ext2_write_at_journaled) is responsible for opening +
+    # committing the tx; the routing here is automatic. Default behavior
+    # (no tx active) is unchanged — direct write.
+    if (ext2_metadata_write_or_log(target_block, &ext2_block_buf) != 0) { return 0 - 1; }
     return 0;
+}
+
+# 1.38.6: thin routing helper. If a journal tx is active, queue the metadata
+# block write via ext2_jbd2_log_metadata (the commit will write it both to
+# the journal log AND to the target block during checkpoint). If no tx is
+# active, fall back to a direct ext2_write_block. Used at metadata-write
+# sites (inode table blocks today; bitmap / group desc / extent-tree nodes
+# to follow in 1.38.7+ once iron data justifies widening the scope).
+fn ext2_metadata_write_or_log(blocknr, buf) {
+    if (ext2_jbd2_tx_active != 0) {
+        return ext2_jbd2_log_metadata(blocknr, buf);
+    }
+    return ext2_write_block(blocknr, buf);
 }
 
 # === Block / inode allocators (WRITE arc 1.33.x — W2) =================
@@ -4399,6 +4417,92 @@ fn ext2_jbd2_writepath_selftest() {
     ext2_sync();
 
     kprintln("jbd2-wp: write-path selftest PASS", 33);
+    return 0;
+}
+
+# === 1.38.6 integration — journaled wrappers + selftest ===
+#
+# `ext2_write_at_journaled` is the public entry point for callers that want
+# the journal-protected file-write contract (atomic update of the inode
+# metadata on commit). Opens a tx, runs the existing `ext2_write_at`, and
+# commits on success / aborts on failure. The metadata writes inside the
+# call (currently: inode-table block via `ext2_put_inode` →
+# `ext2_metadata_write_or_log`) flow through the journal because the tx is
+# active. Data writes inside `ext2_write_at`'s loop stay direct (narrow =
+# metadata-only journaling).
+#
+# Narrow-scope limitation: block-bitmap / group-descriptor / sb / extent-tree
+# node writes during block allocation are NOT yet routed (1.38.7+). For
+# overwrite-in-place writes (no allocation), this provides full inode-update
+# atomicity. For growing writes, the bitmap / inode pair can split under a
+# mid-write crash → e2fsck-fixable orphan blocks, not data loss.
+fn ext2_write_at_journaled(inode_num, offset, src, len) {
+    if (ext2_jbd2_present == 0) {                              # no journal: just write
+        return ext2_write_at(inode_num, offset, src, len);
+    }
+    if (ext2_jbd2_clean == 0) {                                # dirty journal: replay first (caller's responsibility)
+        return ext2_write_at(inode_num, offset, src, len);
+    }
+    if (ext2_jbd2_begin_tx() != 0) {                           # tx already active or other failure
+        return ext2_write_at(inode_num, offset, src, len);     # fall back to direct
+    }
+    var rv = ext2_write_at(inode_num, offset, src, len);
+    if (rv > 0) {
+        if (ext2_jbd2_commit_tx() != 0) { return 0 - 1; }      # commit failure is a real error
+    } else {
+        ext2_jbd2_abort_tx();
+    }
+    return rv;
+}
+
+# === Integration selftest (JBD2_INT_SELFTEST=1) ===
+# Proves the routing works: opens a tx → reads root inode (2) → calls
+# put_inode (which routes through journal via the metadata helper) →
+# verifies tx_count incremented → commits → verifies COMMITTED trace.
+fn ext2_jbd2_integration_selftest() {
+    if (ext2_active == 0)       { kprintln("jbd2-int: skip (no fs)", 22); return 0; }
+    if (ext2_jbd2_present == 0) { kprintln("jbd2-int: skip (no journal)", 27); return 0; }
+    if (ext2_jbd2_clean == 0)   { kprintln("jbd2-int: skip (journal dirty)", 30); return 0; }
+    if (ext2_write_ok == 0)     { kprintln("jbd2-int: skip (FS RO)", 22); return 0; }
+
+    kprintln("jbd2-int: integration selftest begin", 36);
+
+    # Read root inode (2) — guaranteed to exist on any ext2/4 FS.
+    if (ext2_get_inode(2, &ext2_inode_buf) != 0) {
+        kprintln("jbd2-int: get_inode(2) FAIL", 27);
+        return 0 - 1;
+    }
+
+    # Open a tx + call put_inode. With the 1.38.6 routing in place, the
+    # inode-table write inside put_inode goes via ext2_jbd2_log_metadata.
+    if (ext2_jbd2_begin_tx() != 0) {
+        kprintln("jbd2-int: begin_tx FAIL", 23);
+        return 0 - 1;
+    }
+    if (ext2_put_inode(2, &ext2_inode_buf) != 0) {
+        kprintln("jbd2-int: put_inode FAIL", 24);
+        ext2_jbd2_abort_tx();
+        return 0 - 1;
+    }
+
+    # Integration check: tx_count > 0 iff put_inode routed through journal.
+    if (ext2_jbd2_tx_count == 0) {
+        kprintln("jbd2-int: put_inode did NOT route through journal (integration broken)", 71);
+        ext2_jbd2_abort_tx();
+        return 0 - 1;
+    }
+    kprint("jbd2-int: put_inode routed through journal (logged ", 51);
+    kprint_num(ext2_jbd2_tx_count);
+    kprintln(" metadata blocks)", 17);
+
+    # Commit + sync for e2fsck-clean post-mortem.
+    if (ext2_jbd2_commit_tx() != 0) {
+        kprintln("jbd2-int: commit_tx FAIL", 24);
+        return 0 - 1;
+    }
+    ext2_sync();
+
+    kprintln("jbd2-int: integration selftest PASS", 35);
     return 0;
 }
 

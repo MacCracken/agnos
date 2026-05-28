@@ -359,6 +359,16 @@ ext2_jbd2_tx_selftest();
 ext2_jbd2_writepath_selftest();
 #endif
 
+#ifdef JBD2_INT_SELFTEST
+# 1.38.6 integration selftest. Proves the metadata-write routing works:
+# opens a tx → reads root inode (2) → calls put_inode (which routes its
+# inode-table write through ext2_jbd2_log_metadata because the tx is
+# active) → verifies tx_count incremented → commits + syncs. The smoke
+# gates the "put_inode routed through journal" line — its presence proves
+# the integration intercepted what would otherwise have been a direct write.
+ext2_jbd2_integration_selftest();
+#endif
+
 #ifdef HARDENING_SELFTEST
 # Arc-close hardening self-test (1.35.7 pass 1). Hermetic table over
 # ip_safe_payload_len — the ingress clamp that stops a forged IPv4 total-length

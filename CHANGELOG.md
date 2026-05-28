@@ -5,6 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.38.6] — 2026-05-28 (**JBD2 integration — metadata writes route through the journal.** When a tx is active, `ext2_put_inode`'s inode-table block write now flows through `ext2_jbd2_log_metadata` → gets bundled into the commit's descriptor + data + commit + checkpoint sequence, instead of writing directly. Mechanism: a new `ext2_metadata_write_or_log` routing helper inspects `ext2_jbd2_tx_active` and dispatches accordingly. `ext2_write_at_journaled` is the public wrapper for callers that want atomic inode-update semantics (opens a tx, runs `ext2_write_at`, commits on success / aborts on failure). **Narrow-scope limitation**: only the inode-table write is currently routed. Block-bitmap / group-descriptor / sb / extent-tree node writes from the allocation path stay direct — full atomicity for *growing* writes waits for 1.38.7+. For overwrite-in-place this provides complete inode-update atomicity; for grow operations, a mid-write crash can split bitmap-and-inode → e2fsck-fixable orphan blocks, not data loss.)
+
+### Added — integration helpers + selftest
+
+- **`ext2.cyr`** — new `ext2_metadata_write_or_log(blocknr, buf)`: thin router — if `ext2_jbd2_tx_active != 0`, queues via `ext2_jbd2_log_metadata`; else direct `ext2_write_block`. Used at the inode-table write site in `ext2_put_inode` (replaces the prior unconditional `ext2_write_block`). Default (no tx active) behavior unchanged — direct write, matching all pre-1.38.6 call sites.
+- **`ext2.cyr` `ext2_put_inode`** — final block write now goes through the routing helper. Single-line behavior change at the persist step.
+- **`ext2.cyr`** — new `ext2_write_at_journaled(inode, off, src, len)`: the public journal-protected write entry. Opens tx → runs existing `ext2_write_at` (whose internal `ext2_put_inode` call now routes via journal) → commits on success / aborts on failure. Falls back to direct `ext2_write_at` when no journal is present, journal is dirty, or `begin_tx` fails (so it's safe to swap in at call sites without breaking on RO/no-journal scenarios).
+- **`ext2.cyr`** — new `ext2_jbd2_integration_selftest()`: opens a tx → reads root inode (2) → calls `ext2_put_inode(2, &ext2_inode_buf)` → **verifies `ext2_jbd2_tx_count > 0`** (the dispositive routing check — non-zero proves the helper intercepted what would otherwise be a direct write) → commits + syncs. Emits `jbd2-int: put_inode routed through journal (logged N metadata blocks)` on the positive path.
+- **`selftests.cyr`** — wired `JBD2_INT_SELFTEST` invocation block (alongside the existing JBD2_TX/WP gates).
+- **`scripts/build.sh`** — added `JBD2_INT_SELFTEST=1` env-var gate.
+
+### Added — integration smoke
+
+- **`scripts/jbd2-integration-smoke.sh`** — seven-gate validation: (1) selftest reached the API, (2) **put_inode routed through journal** (dispositive), (3) `commit_tx: COMMITTED seq=1 n_blocks=1`, (4) integration selftest PASS, (5) shell at v1.38.6, (6) host `e2fsck -fn` clean post-commit, (7) journal SB on disk shows `s_start = 0` + `s_sequence >= 2`.
+
+### Validation
+
+- `test.sh` 4/4, `check.sh` 11/11.
+- `jbd2-integration-smoke.sh` PASS — all 7 gates green; trace from QEMU:
+  ```
+  jbd2-int: integration selftest begin
+  jbd2-int: put_inode routed through journal (logged 1 metadata blocks)
+  jbd2: commit_tx: COMMITTED seq=1 n_blocks=1 -- checkpoint applied + journal clean
+  jbd2-int: integration selftest PASS
+  AGNOS shell v1.38.6 (type 'help')
+  ```
+- All prior JBD2 smokes (refusal / logdump / replay / tx / writepath) regression-clean.
+- Production build (no selftest flag) 982,576 → **984,632 B** (+2,056 — routing helper + integration wrapper + selftest body).
+
 ## [1.38.5] — 2026-05-28 (**JBD2 journal write path — AGNOS PRODUCES journals.** `commit_tx` swaps from trace-only (1.38.4) to the real on-disk sequence: **descriptor → data blocks → barrier → commit → barrier → checkpoint → barrier → SB-clean → barrier**. Three load-bearing FLUSH-CACHE barriers (1.33.5 primitive) gate against any SSD write-reordering catastrophe — a torn pre-commit yields no commit (replay discards), a torn post-commit pre-checkpoint yields a replayable journal entry (replay re-applies), a torn post-checkpoint pre-SB-clean yields a still-dirty journal pointing at the just-applied tx (replay idempotent re-applies). Sync-checkpoint model: every commit immediately checkpoints + cleans the journal (`s_start = 0`), so the same log space is reused. Wasteful for high-throughput but correct, simple, and matches AGNOS's single-threaded cooperative model (async checkpoint waits for the multi-threading arc per [[project_multithreading_future_arc]]). API-contract unchanged from 1.38.4 — 1.38.6's integration plugs into the same `begin_tx`/`log_metadata`/`commit_tx` surface without callsite changes.)
 
 ### Added — real on-disk commit machinery
