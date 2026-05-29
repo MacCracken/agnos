@@ -5,6 +5,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.39.9] — 2026-05-28 (**VFS generic-write lift — bite 9: FAT/exFAT subdirectory paths.** Removes the last FAT/exFAT-vs-ext2 asymmetry — ext2 verbs were already path/CWD-aware; FAT/exFAT were root-only. Pure backend work: the shell already passed full slashed paths to the secondary dispatch, the backends just ignored the slashes. A path-walk resolves all-but-last component to a directory cluster; the directory finders are generalized to take a start cluster. **`cat`/`touch`/`echo >`/`rm`/`mkdir`/`rmdir`/`mv` now operate inside subdirectories on both filesystems.** This completes the functional verb surface for the VFS lift; the arc closes pending the user-driven iron burn.)
+
+### Added — FAT subdir paths (`fatfs.cyr`)
+
+- **`fatfs_resolve_parent(path, pathlen)`** — walks a path's leading components, returning the parent directory's cluster (`0` = root) and setting `fatfs_leaf_off`/`len` for the final component. Rejects a missing/non-directory intermediate component or a trailing slash.
+- **`fatfs_find_in_dir(dir_clus, …)`** / **`fatfs_find_free_slot_in_dir(dir_clus)`** — generalize the root finders to any directory. Sentinel **`dir_clus == 0` delegates to the existing `fatfs_find_root`/`fatfs_find_free_root_slot`**, so a bare name (no `/`) is byte-identical to pre-bite-9. A subdir chain is walked (and extended via the chain-generic `fat_root_extend`).
+- Wired open/create/write/delete/mkdir/rmdir/rename to resolve the parent then operate on `(dir_clus, leaf)`. `mkdir`'s `..` entry now points at the real parent cluster (`0` = root, per spec).
+
+### Added — exFAT subdir paths (`exfat.cyr`)
+
+- **`exfat_resolve_parent`** (mirror of the FAT walk) + **`_in(start_clus, …)`** variants of `exfat_find` / `exfat_dir_end_index` / `exfat_dir_cluster_for_index` / `exfat_dir_append_set` / `exfat_emit_set`. The root-named functions are kept as thin wrappers delegating to `_in(0, …)`, so every existing root caller is unchanged.
+- Wired open/create/write/delete/mkdir/rmdir/rename to resolve + emit into the target directory.
+
+### Changed
+
+- **`mv` (rename)** on both backends is bounded to **same-parent** rename — src and dst must share a parent directory. Cross-directory move is a documented follow-on (FAT does an in-place dirent rewrite; exFAT re-emits the set into the parent + soft-deletes the old). Differing parents are rejected.
+
+### Validation
+
+- Subdir scenarios added to both write selftests + smokes (create/write/`cat`/`rm`/`mkdir`/`mv` against slashed paths inside a subdirectory): `fat-write-smoke` +4 gates (incl. content readback + same-parent dir rename), `exfat-write-smoke` +4 gates (in-kernel `exfat_find_in_dir` find-back inside the subdir's cluster + `cat` output). Both **PASS**, host `fsck.fat`/`fsck.exfat` clean.
+- No regression: FAT/exFAT read smokes green; **ext2-write regression bar** (W1–W5) PASS — the iron-validated ext2/jbd2 path is untouched. `check.sh` 11/11, `test.sh` 4/4.
+- Production build **1,007,696 B → 1,014,528 B** (+6,832 B: subdir resolvers + per-directory finder generalization across both backends), multiboot2 OK.
+
+### Not yet (follow-ons)
+
+- **Cross-directory `mv`** (different parent dirs) — same-parent only for now.
+- **`ls <subdir>`** listing — `ls` lists the primary FS root; a path arg for the secondary listing is a small follow-on (the file/dir verbs all take subdir paths).
+- **User-driven iron burn** per the `#tracker-139-cycle` rubric — closes the VFS-lift arc on real hardware.
+
+
 ## [1.39.8] — 2026-05-28 (**VFS generic-write lift — bite 8 (arc close): mount-registry consolidation + ingress hardening.** The functional verb surface completed at 1.39.7; this cut consolidates the dispatch and hardens its ingress seam. The seven `vfs_*_secondary` verbs each carried a copy of the same four-line non-ESP-preference chain — the single-primary-FS *policy* scattered across seven sites; it now lives once in `vfs_secondary_select()`. A bounds/ingress review of both writable backends added one guard at the generic seam. **No behavior change for any valid name.** FAT/exFAT *subdirectory* paths split out to bite 9 / 1.39.9 — Large effort, ~14 functions across both backends.)
 
 ### Changed — mount-registry consolidation (`vfs.cyr`)
