@@ -170,6 +170,16 @@ strings "$LOG" | grep -q "^exfatw: shell echo round-trip OK" \
 strings "$LOG" | grep -q "^exfatw: shell rm gone OK" \
     && echo "  PASS: 1.39.4 shell 'rm' removed file on exFAT (vfs_delete_secondary)" \
     || { echo "  FAIL: 1.39.4 shell rm over exFAT (target still present)"; rc=1; }
+# 1.39.6 VFS-lift bite 6: shell mkdir/rmdir over exFAT (vfs_mkdir_secondary/
+# vfs_rmdir_secondary -> exfat_mkdir/exfat_rmdir). In-kernel find confirms
+# the created dir-set + that the removed one is gone; fsck.exfat -n (below)
+# confirms the Directory dir-set + cluster are structurally sound.
+strings "$LOG" | grep -q "^exfatw: shell mkdir find-back OK" \
+    && echo "  PASS: 1.39.6 shell 'mkdir' created dir on exFAT (exfat_mkdir)" \
+    || { echo "  FAIL: 1.39.6 shell mkdir over exFAT"; rc=1; }
+strings "$LOG" | grep -q "^exfatw: shell rmdir gone OK" \
+    && echo "  PASS: 1.39.6 shell 'rmdir' removed dir on exFAT (exfat_rmdir)" \
+    || { echo "  FAIL: 1.39.6 shell rmdir over exFAT (dir still present)"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

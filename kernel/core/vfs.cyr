@@ -128,18 +128,20 @@ fn vfs_delete_secondary(name, namelen) {
     return 0 - 1;
 }
 
-# Generic directory create/remove dispatch (1.39.5 — VFS lift bite 5,
-# mkdir/rmdir). FAT only this cut — exFAT directory-create lands at 1.39.6
-# (it needs a different dir-set + cluster shape), so an exFAT primary returns
-# -1 here (the verb reports failure) until then. Same non-ESP preference.
+# Generic directory create/remove dispatch (1.39.5 FAT + 1.39.6 exFAT — VFS
+# lift bites 5/6, mkdir/rmdir). Same non-ESP preference as create/write.
 fn vfs_mkdir_secondary(name, namelen) {
-    if (fatfs_active != 0 && fat_on_esp == 0) { return fatfs_mkdir(name, namelen); }
+    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_mkdir(name, namelen); }
+    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_mkdir(name, namelen); }
     if (fatfs_active != 0) { return fatfs_mkdir(name, namelen); }
+    if (exfat_active != 0) { return exfat_mkdir(name, namelen); }
     return 0 - 1;
 }
 fn vfs_rmdir_secondary(name, namelen) {
-    if (fatfs_active != 0 && fat_on_esp == 0) { return fatfs_rmdir(name, namelen); }
+    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_rmdir(name, namelen); }
+    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_rmdir(name, namelen); }
     if (fatfs_active != 0) { return fatfs_rmdir(name, namelen); }
+    if (exfat_active != 0) { return exfat_rmdir(name, namelen); }
     return 0 - 1;
 }
 

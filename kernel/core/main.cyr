@@ -957,6 +957,19 @@ if (exfat_active == 1) {
     var shrm_res[24];
     if (exfat_find("SHRMTGT.TXT", 11, &shrm_res) == 1) { kprintln("exfatw: shell rm still-present FAIL", 35); }
     else { kprintln("exfatw: shell rm gone OK", 24); }
+    # 1.39.6 VFS-lift bite 6: shell mkdir/rmdir over exFAT (sh_cmd_mkdir/rmdir
+    # -> vfs_mkdir_secondary/vfs_rmdir_secondary -> exfat_mkdir/exfat_rmdir).
+    # SHEXDIR kept (find-back confirms the dir-set); SHEXRMD created then
+    # removed (find-miss confirms). exfat-write-smoke.sh also fsck-checks.
+    sh_exec("mkdir SHEXDIR", 13);
+    var shmd_res[24];
+    if (exfat_find("SHEXDIR", 7, &shmd_res) == 1) { kprintln("exfatw: shell mkdir find-back OK", 32); }
+    else { kprintln("exfatw: shell mkdir find-back FAIL", 34); }
+    sh_exec("mkdir SHEXRMD", 13);
+    sh_exec("rmdir SHEXRMD", 13);
+    var shrd_res[24];
+    if (exfat_find("SHEXRMD", 7, &shrd_res) == 1) { kprintln("exfatw: shell rmdir still-present FAIL", 38); }
+    else { kprintln("exfatw: shell rmdir gone OK", 27); }
 }
 #endif
 
