@@ -669,6 +669,20 @@ if (fatfs_active == 1) {
     sh_exec("touch SHMVA", 11);
     sh_exec("mv SHMVA SHMVB", 14);
     sh_exec("sync", 4);
+    # 1.39.9 VFS-lift bite 9: subdirectory paths. Create a dir, then drive the
+    # shell verbs against slashed paths inside it — exercises
+    # fatfs_resolve_parent + the *_in_dir finders end-to-end (create/write/cat/
+    # mkdir/rmdir/mv/rm in a subdir). fat-write-smoke.sh fsck's clean +
+    # mtype-checks SHSUB/SUBKEEP.TXT content, confirms SHSUB/SUBRM.TXT gone +
+    # SHSUB/SUBD2 (renamed dir) present, and greps the `cat` output.
+    sh_exec("mkdir SHSUB", 11);
+    sh_exec("echo SUBDIR-FAT-OK > SHSUB/SUBKEEP.TXT", 38);
+    sh_exec("touch SHSUB/SUBRM.TXT", 21);
+    sh_exec("rm SHSUB/SUBRM.TXT", 18);
+    sh_exec("mkdir SHSUB/SUBD1", 17);
+    sh_exec("mv SHSUB/SUBD1 SHSUB/SUBD2", 26);
+    kprintln("vfsw: subdir paths over FAT done", 32);
+    sh_exec("cat SHSUB/SUBKEEP.TXT", 21);
 }
 #endif
 
@@ -989,6 +1003,30 @@ if (exfat_active == 1) {
         else { kprintln("exfatw: shell mv OK", 19); }
     } else { kprintln("exfatw: shell mv dst-missing FAIL", 33); }
     sh_exec("sync", 4);
+    # 1.39.9 VFS-lift bite 9: subdirectory paths. SHEXDIR was created above.
+    # Drive shell verbs against slashed paths inside it — exercises
+    # exfat_resolve_parent + the *_in_dir finders + emit_set_in. Validated
+    # in-kernel (find-back inside SHEXDIR's cluster) + via the `cat` output
+    # ("SUBDIR-EXFAT-OK") in the boot log; exfat-write-smoke.sh fsck-checks.
+    sh_exec("echo SUBDIR-EXFAT-OK > SHEXDIR/SUBKEEP.TXT", 42);
+    sh_exec("touch SHEXDIR/SUBRM.TXT", 23);
+    sh_exec("rm SHEXDIR/SUBRM.TXT", 20);
+    sh_exec("mkdir SHEXDIR/SUBD1", 19);
+    sh_exec("mv SHEXDIR/SUBD1 SHEXDIR/SUBD2", 30);
+    var shx_dir[24];
+    if (exfat_find("SHEXDIR", 7, &shx_dir) == 1) {
+        var shx_clus = load64(&shx_dir);
+        var shx_kept[24];
+        if (exfat_find_in_dir(shx_clus, "SUBKEEP.TXT", 11, &shx_kept) == 1) { kprintln("exfatw: subdir find-back OK", 27); }
+        else { kprintln("exfatw: subdir find-back FAIL", 29); }
+        var shx_rm[24];
+        if (exfat_find_in_dir(shx_clus, "SUBRM.TXT", 9, &shx_rm) == 1) { kprintln("exfatw: subdir rm-remains FAIL", 30); }
+        else { kprintln("exfatw: subdir rm gone OK", 25); }
+        var shx_d2[24];
+        if (exfat_find_in_dir(shx_clus, "SUBD2", 5, &shx_d2) == 1) { kprintln("exfatw: subdir renamed-dir OK", 29); }
+        else { kprintln("exfatw: subdir renamed-dir FAIL", 31); }
+    } else { kprintln("exfatw: subdir parent-missing FAIL", 34); }
+    sh_exec("cat SHEXDIR/SUBKEEP.TXT", 23);
 }
 #endif
 

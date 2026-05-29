@@ -321,10 +321,36 @@ if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "SHMVB" && ! mdir -i "$WORK/
 else
     echo "  FAIL: shell mv over FAT (SHMVB absent or SHMVA still present)"; rc=1
 fi
+# 1.39.9 VFS-lift bite 9: subdirectory paths. SHSUB/SUBKEEP.TXT was written
+# via a slashed path (echo > SHSUB/SUBKEEP.TXT), SHSUB/SUBRM.TXT created then
+# removed, SHSUB/SUBD1 renamed to SHSUB/SUBD2 — all inside a subdirectory.
+# Proves fatfs_resolve_parent + the *_in_dir finders end-to-end. fsck-clean
+# above proves the subdir chains + dirents (incl. ./..) are valid.
+mtype -i "$WORK/esp.img" ::SHSUB/SUBKEEP.TXT > "$WORK/subkeep.txt" 2>/dev/null
+if grep -q "SUBDIR-FAT-OK" "$WORK/subkeep.txt" 2>/dev/null; then
+    echo "  PASS: subdir write — SHSUB/SUBKEEP.TXT content via slashed path (fatfs_resolve_parent)"
+else
+    echo "  FAIL: subdir write (SHSUB/SUBKEEP.TXT missing 'SUBDIR-FAT-OK')"; rc=1
+fi
+if mdir -i "$WORK/esp.img" ::SHSUB 2>/dev/null | grep -q "SUBRM"; then
+    echo "  FAIL: subdir rm (SHSUB/SUBRM.TXT still present)"; rc=1
+else
+    echo "  PASS: subdir 'rm' removed SHSUB/SUBRM.TXT (vfs_delete_secondary in subdir)"
+fi
+if mdir -i "$WORK/esp.img" ::SHSUB 2>/dev/null | grep -q "SUBD2" && ! mdir -i "$WORK/esp.img" ::SHSUB 2>/dev/null | grep -q "SUBD1"; then
+    echo "  PASS: subdir 'mkdir'+'mv' — SHSUB/SUBD2 present, SUBD1 gone (same-parent dir rename)"
+else
+    echo "  FAIL: subdir mkdir/mv (SHSUB/SUBD2 absent or SUBD1 still present)"; rc=1
+fi
+if grep -q "SUBDIR-FAT-OK" "$LOG" 2>/dev/null; then
+    echo "  PASS: subdir 'cat' SHSUB/SUBKEEP.TXT read back via slashed path"
+else
+    echo "  FAIL: subdir cat (no 'SUBDIR-FAT-OK' in boot log from cat)"; rc=1
+fi
 
 echo ""
 echo "=========================================="
-if [ "$rc" = "0" ]; then echo "FAT write smoke (3a-3e + 1.34.3 LFN-content): PASS"; else echo "FAT write smoke: FAIL"; fi
+if [ "$rc" = "0" ]; then echo "FAT write smoke (3a-3e + 1.34.3 LFN-content + 1.39.9 subdir): PASS"; else echo "FAT write smoke: FAIL"; fi
 echo "Logs: $LOG"
 echo "=========================================="
 exit $rc

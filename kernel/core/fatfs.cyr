@@ -445,10 +445,111 @@ fn fatfs_find_root(name, namelen, result_ptr) {
     return 0;
 }
 
+# === Subdir path resolution (1.39.9 — VFS lift bite 9) ===
+# The FAT dir ops above were root-only: each searched `fatfs_root_cluster`
+# (or the FAT12/16 fixed root area) directly. These three helpers generalize
+# the directory to an arbitrary cluster so slashed paths (`a/b/file.txt`)
+# reach subdirectories — removing the last FAT-vs-ext2 asymmetry (ext2 verbs
+# were already path/CWD-aware). The shell already passes the full path; the
+# backend simply ignored the slashes until now.
+#
+# Convention: `dir_clus == 0` means "the FS root" and delegates to the
+# existing root finders, so a bare name (no '/') is byte-identical to the
+# pre-bite-9 behavior. `dir_clus >= 2` means a subdirectory cluster chain
+# (works for every FAT type — only the *root* differs by type, and find_root
+# owns that). fatfs_resolve_parent sets fatfs_leaf_off/len for the final
+# component.
+
+# Search one directory (root or subdir chain) for an 8.3 name.
+fn fatfs_find_in_dir(dir_clus, name, namelen, result_ptr) {
+    if (dir_clus < 2) { return fatfs_find_root(name, namelen, result_ptr); }
+    var eps = 512 / 32;
+    var clus = dir_clus;
+    while (clus >= 2) {
+        var base = fatfs_first_sector_of_cluster(clus);
+        for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
+            var f = fatfs_find_inner(base + s, eps, name, namelen, result_ptr);
+            if (f == 1) { return 1; }
+            if (f < 0) { return 0; }         # end-of-dir marker
+        }
+        clus = fat_next_cluster(clus);
+    }
+    return 0;
+}
+
+# Find (or grow) a free dirent slot in one directory. Root delegates to the
+# existing finder; a subdir chain is walked, then extended (fat_root_extend
+# is chain-generic despite the name — alloc + link last->new + zero).
+fn fatfs_find_free_slot_in_dir(dir_clus) {
+    if (dir_clus < 2) { return fatfs_find_free_root_slot(); }
+    var eps = 512 / 32;
+    var clus = dir_clus;
+    var last_clus = clus;
+    while (clus >= 2) {
+        last_clus = clus;
+        var base = fatfs_first_sector_of_cluster(clus);
+        for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
+            var sec = base + s;
+            if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+            for (var e = 0; e < eps; e = e + 1) {
+                var fb = load8(&fatfs_dir_buf + e * 32);
+                if (fb == 0x00) { fatfs_slot_sec = sec; fatfs_slot_idx = e; return 0; }
+                if (fb == 0xE5) { fatfs_slot_sec = sec; fatfs_slot_idx = e; return 0; }
+            }
+        }
+        clus = fat_next_cluster(clus);
+    }
+    var nc = fat_root_extend(last_clus);
+    if (nc == 0) { return 0 - 1; }
+    fatfs_slot_sec = fatfs_first_sector_of_cluster(nc);
+    fatfs_slot_idx = 0;
+    return 0;
+}
+
+# Walk a path's leading components, returning the parent directory's cluster
+# (0 = root) and setting fatfs_leaf_off/len for the final component. Returns
+# -1 if any intermediate component is missing or is not a directory, or the
+# path has a trailing slash (no leaf). A path with no '/' → (root, whole name).
+var fatfs_leaf_off = 0;
+var fatfs_leaf_len = 0;
+fn fatfs_resolve_parent(path, pathlen) {
+    var last_slash = 0 - 1;
+    var i = 0;
+    while (i < pathlen) { if (load8(path + i) == 47) { last_slash = i; } i = i + 1; }
+    if (last_slash < 0) {
+        fatfs_leaf_off = 0;
+        fatfs_leaf_len = pathlen;
+        return 0;
+    }
+    fatfs_leaf_off = last_slash + 1;
+    fatfs_leaf_len = pathlen - last_slash - 1;
+    if (fatfs_leaf_len < 1) { return 0 - 1; }        # trailing slash
+    var dir_clus = 0;
+    var cs = 0;
+    var p = 0;
+    while (p <= last_slash) {
+        if (p == last_slash || load8(path + p) == 47) {
+            var cl = p - cs;
+            if (cl > 0) {
+                var rr[16];
+                if (fatfs_find_in_dir(dir_clus, path + cs, cl, &rr) != 1) { return 0 - 1; }
+                if (fat_blk_read(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+                if ((load8(&fatfs_dir_buf + fatfs_slot_idx * 32 + 11) & 0x10) == 0) { return 0 - 1; }
+                dir_clus = load64(&rr);
+            }
+            cs = p + 1;
+        }
+        p = p + 1;
+    }
+    return dir_clus;
+}
+
 fn fatfs_open(name, namelen) {
     if (fatfs_active == 0) { return 0 - 1; }
     var result[16];
-    if (fatfs_find_root(name, namelen, &result) != 1) { return 0 - 1; }
+    var dir_clus = fatfs_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
+    if (fatfs_find_in_dir(dir_clus, name + fatfs_leaf_off, fatfs_leaf_len, &result) != 1) { return 0 - 1; }
     var cluster = load64(&result);
     var fsize = load64(&result + 8);
     if (cluster < 2) { return 0 - 1; }
@@ -678,11 +779,15 @@ fn fatfs_emit_dirent(sec, slot, name11_ptr, cluster, size) {
 # on its own (an empty file owns no clusters). Refuses an existing name.
 fn fatfs_create(name, namelen) {
     if (fatfs_active == 0) { return 0 - 1; }
+    var dir_clus = fatfs_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
+    var lo = name + fatfs_leaf_off;
+    var ll = fatfs_leaf_len;
     var exist[16];
-    if (fatfs_find_root(name, namelen, &exist) == 1) { return 0 - 1; }
+    if (fatfs_find_in_dir(dir_clus, lo, ll, &exist) == 1) { return 0 - 1; }
     var name11[16];
-    fatfs_build_83(name, namelen, &name11);
-    if (fatfs_find_free_root_slot() != 0) { return 0 - 1; }
+    fatfs_build_83(lo, ll, &name11);
+    if (fatfs_find_free_slot_in_dir(dir_clus) != 0) { return 0 - 1; }
     return fatfs_emit_dirent(fatfs_slot_sec, fatfs_slot_idx, &name11, 0, 0);
 }
 
@@ -697,16 +802,20 @@ fn fatfs_create(name, namelen) {
 fn fatfs_write_file(name, namelen, src, len) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (fatfs_type == 12) { return 0 - 1; }
+    var dir_clus = fatfs_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
+    var lo = name + fatfs_leaf_off;
+    var ll = fatfs_leaf_len;
     var name11[16];
-    fatfs_build_83(name, namelen, &name11);
+    fatfs_build_83(lo, ll, &name11);
 
     # Target dirent slot: reuse the existing entry (overwrite) or a free
     # one (create). 8.3-name match only — overwriting an LFN file by its
-    # long name is a follow-on (find_root is 8.3-only).
+    # long name is a follow-on (find_in_dir is 8.3-only).
     var res[16];
     var target_sec = 0;
     var target_slot = 0;
-    if (fatfs_find_root(name, namelen, &res) == 1) {
+    if (fatfs_find_in_dir(dir_clus, lo, ll, &res) == 1) {
         target_sec = fatfs_slot_sec;
         target_slot = fatfs_slot_idx;
         var old_first = load64(&res);
@@ -720,7 +829,7 @@ fn fatfs_write_file(name, namelen, src, len) {
         if (fat_blk_write(target_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
         if (old_first >= 2) { if (fat_free_chain(old_first) != 0) { return 0 - 1; } }
     } else {
-        if (fatfs_find_free_root_slot() != 0) { return 0 - 1; }
+        if (fatfs_find_free_slot_in_dir(dir_clus) != 0) { return 0 - 1; }
         target_sec = fatfs_slot_sec;
         target_slot = fatfs_slot_idx;
     }
@@ -790,8 +899,10 @@ fn fat_free_chain(first) {
 fn fatfs_delete(name, namelen) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (fatfs_type == 12) { return 0 - 1; }
+    var dir_clus = fatfs_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
     var res[16];
-    if (fatfs_find_root(name, namelen, &res) != 1) { return 0 - 1; }   # not found
+    if (fatfs_find_in_dir(dir_clus, name + fatfs_leaf_off, fatfs_leaf_len, &res) != 1) { return 0 - 1; }   # not found
     var first = load64(&res);
     var sec = fatfs_slot_sec;
     var slot = fatfs_slot_idx;
@@ -846,10 +957,14 @@ fn fatfs_dir_is_empty(first_cluster) {
 fn fatfs_mkdir(name, namelen) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (fatfs_type == 12) { return 0 - 1; }
+    var dir_clus = fatfs_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
+    var lo = name + fatfs_leaf_off;
+    var ll = fatfs_leaf_len;
     var exist[16];
-    if (fatfs_find_root(name, namelen, &exist) == 1) { return 0 - 1; }   # exists
+    if (fatfs_find_in_dir(dir_clus, lo, ll, &exist) == 1) { return 0 - 1; }   # exists
     var name11[16];
-    fatfs_build_83(name, namelen, &name11);
+    fatfs_build_83(lo, ll, &name11);
     var dc = fat_alloc_cluster();                        # marked EOC by alloc
     if (dc == 0) { return 0 - 1; }                       # ENOSPC
     # First sector: "." (→ dc) at slot 0, ".." (→ 0 = root parent) at slot 1.
@@ -867,7 +982,12 @@ fn fatfs_mkdir(name, namelen) {
     store8(&fatfs_dir_buf + 33, 0x2E);
     var p2 = 2;
     while (p2 < 11) { store8(&fatfs_dir_buf + 32 + p2, 0x20); p2 = p2 + 1; }
-    store8(&fatfs_dir_buf + 32 + 11, 0x10);              # ATTR_DIRECTORY (parent = root, cluster 0)
+    store8(&fatfs_dir_buf + 32 + 11, 0x10);              # ATTR_DIRECTORY
+    # ".." points at the parent dir's first cluster (0 = root, per FAT spec).
+    store8(&fatfs_dir_buf + 32 + 20, (dir_clus >> 16) & 0xFF);
+    store8(&fatfs_dir_buf + 32 + 21, (dir_clus >> 24) & 0xFF);
+    store8(&fatfs_dir_buf + 32 + 26, dir_clus & 0xFF);
+    store8(&fatfs_dir_buf + 32 + 27, (dir_clus >> 8) & 0xFF);
     var base = fatfs_first_sector_of_cluster(dc);
     if (fat_blk_write(base, &fatfs_dir_buf) != 0) { return 0 - 1; }
     # Zero the remaining sectors of the cluster.
@@ -878,8 +998,8 @@ fn fatfs_mkdir(name, namelen) {
         if (fat_blk_write(base + s, &fatfs_dir_buf) != 0) { return 0 - 1; }
         s = s + 1;
     }
-    # Publish the DIRECTORY dirent in the root (attr 0x10, cluster dc, size 0).
-    if (fatfs_find_free_root_slot() != 0) { return 0 - 1; }
+    # Publish the DIRECTORY dirent in the parent dir (attr 0x10, cluster dc, size 0).
+    if (fatfs_find_free_slot_in_dir(dir_clus) != 0) { return 0 - 1; }
     if (fat_blk_read(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
     var ep = &fatfs_dir_buf + fatfs_slot_idx * 32;
     var q = 0;
@@ -905,14 +1025,27 @@ fn fatfs_mkdir(name, namelen) {
 fn fatfs_rename(oldname, oldlen, newname, newlen) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (fatfs_type == 12) { return 0 - 1; }
+    # Resolve both paths. FAT rename here is an in-place dirent name rewrite,
+    # so src and dst must share a parent directory — cross-directory move
+    # (different parents) is a follow-on. Capture each leaf before the next
+    # resolve clobbers the shared fatfs_leaf_off/len globals.
+    var new_dir = fatfs_resolve_parent(newname, newlen);
+    if (new_dir < 0) { return 0 - 1; }
+    var new_off = fatfs_leaf_off;
+    var new_len = fatfs_leaf_len;
+    var old_dir = fatfs_resolve_parent(oldname, oldlen);
+    if (old_dir < 0) { return 0 - 1; }
+    var old_off = fatfs_leaf_off;
+    var old_len = fatfs_leaf_len;
+    if (new_dir != old_dir) { return 0 - 1; }            # cross-dir move: follow-on
     var nexist[16];
-    if (fatfs_find_root(newname, newlen, &nexist) == 1) { return 0 - 1; }  # dst exists
+    if (fatfs_find_in_dir(new_dir, newname + new_off, new_len, &nexist) == 1) { return 0 - 1; }  # dst exists
     var res[16];
-    if (fatfs_find_root(oldname, oldlen, &res) != 1) { return 0 - 1; }     # src missing
+    if (fatfs_find_in_dir(old_dir, oldname + old_off, old_len, &res) != 1) { return 0 - 1; }     # src missing
     var sec = fatfs_slot_sec;
     var slot = fatfs_slot_idx;
     var newname11[16];
-    fatfs_build_83(newname, newlen, &newname11);
+    fatfs_build_83(newname + new_off, new_len, &newname11);
     if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
     var ep = &fatfs_dir_buf + slot * 32;
     var j = 0;
@@ -928,8 +1061,10 @@ fn fatfs_rename(oldname, oldlen, newname, newlen) {
 fn fatfs_rmdir(name, namelen) {
     if (fatfs_active == 0) { return 0 - 1; }
     if (fatfs_type == 12) { return 0 - 1; }
+    var dir_clus = fatfs_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
     var res[16];
-    if (fatfs_find_root(name, namelen, &res) != 1) { return 0 - 1; }     # not found
+    if (fatfs_find_in_dir(dir_clus, name + fatfs_leaf_off, fatfs_leaf_len, &res) != 1) { return 0 - 1; }     # not found
     var first = load64(&res);
     # Confirm it's a directory via the parent dirent attr.
     if (fat_blk_read(fatfs_slot_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }

@@ -186,6 +186,23 @@ strings "$LOG" | grep -q "^exfatw: shell rmdir gone OK" \
 strings "$LOG" | grep -q "^exfatw: shell mv OK" \
     && echo "  PASS: 1.39.7 shell 'mv' renamed file on exFAT (exfat_rename)" \
     || { echo "  FAIL: 1.39.7 shell mv over exFAT"; rc=1; }
+# 1.39.9 VFS-lift bite 9: subdirectory paths. Slashed paths inside SHEXDIR —
+# create/write/rm/mkdir/mv — exercise exfat_resolve_parent + the *_in_dir
+# finders + emit_set_in. In-kernel find-back inside SHEXDIR's cluster + the
+# `cat` output ("SUBDIR-EXFAT-OK") in the log; fsck.exfat (below) confirms the
+# subdir dir-sets + chains are clean.
+strings "$LOG" | grep -q "^exfatw: subdir find-back OK" \
+    && echo "  PASS: 1.39.9 subdir write+find inside SHEXDIR (exfat_resolve_parent)" \
+    || { echo "  FAIL: 1.39.9 subdir write/find over exFAT"; rc=1; }
+strings "$LOG" | grep -q "^exfatw: subdir rm gone OK" \
+    && echo "  PASS: 1.39.9 subdir 'rm' removed SHEXDIR/SUBRM.TXT" \
+    || { echo "  FAIL: 1.39.9 subdir rm over exFAT (target still present)"; rc=1; }
+strings "$LOG" | grep -q "^exfatw: subdir renamed-dir OK" \
+    && echo "  PASS: 1.39.9 subdir 'mkdir'+'mv' dir rename inside SHEXDIR" \
+    || { echo "  FAIL: 1.39.9 subdir mkdir/mv over exFAT"; rc=1; }
+strings "$LOG" | grep -q "SUBDIR-EXFAT-OK" \
+    && echo "  PASS: 1.39.9 subdir 'cat' SHEXDIR/SUBKEEP.TXT read back via slashed path" \
+    || { echo "  FAIL: 1.39.9 subdir cat over exFAT (no 'SUBDIR-EXFAT-OK' in log)"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

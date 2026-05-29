@@ -434,10 +434,23 @@ fn exfat_name_eq(name, namelen, got_chars) {
 # across the whole root, holding a small set-collection state. On a match
 # stores [first_cluster, data_length, no_fat_chain] at result_ptr (24 B)
 # and returns 1; 0 = not found, -1 = error. ASCII names (low UTF-16 byte).
+# === Subdir path resolution (1.39.9 — VFS lift bite 9) ===
+# Mirror of the FAT side (fatfs_resolve_parent + *_in_dir). exFAT dir ops were
+# root-only: each searched `exfat_root_cluster` directly. The directory is now
+# a parameter so slashed paths reach subdirectories. Convention: `start_clus`
+# / `dir_clus` < 2 means "the FS root" (delegates to root behavior, so a bare
+# name is byte-identical to pre-bite-9). The root-named wrappers keep every
+# existing caller unchanged.
 fn exfat_find(name, namelen, result_ptr) {
+    return exfat_find_in_dir(0, name, namelen, result_ptr);
+}
+
+# Search one directory (root or subdir cluster chain) for a name.
+fn exfat_find_in_dir(start_clus, name, namelen, result_ptr) {
     if (exfat_active == 0) { return 0 - 1; }
     var eps = 512 / 32;
-    var clus = exfat_root_cluster;
+    var clus = start_clus;
+    if (clus < 2) { clus = exfat_root_cluster; }
     var max_c = exfat_cluster_count + 2;
     var guard = 0;
 
@@ -523,10 +536,51 @@ fn exfat_find(name, namelen, result_ptr) {
 # read at one page (4 KB) like fatfs; a streaming / bigger memfile is a
 # follow-on. Returns the fd, or -1. Shell `cat` wiring is deferred to the
 # 1.39.x VFS lift (same as fatfs).
+# Walk a path's leading components, returning the parent directory's cluster
+# (0 = root) and setting exfat_leaf_off/len for the final component. Returns
+# -1 if any intermediate component is missing or is not a directory, or the
+# path has a trailing slash. A path with no '/' → (root, whole name).
+var exfat_leaf_off = 0;
+var exfat_leaf_len = 0;
+fn exfat_resolve_parent(path, pathlen) {
+    var last_slash = 0 - 1;
+    var i = 0;
+    while (i < pathlen) { if (load8(path + i) == 47) { last_slash = i; } i = i + 1; }
+    if (last_slash < 0) {
+        exfat_leaf_off = 0;
+        exfat_leaf_len = pathlen;
+        return 0;
+    }
+    exfat_leaf_off = last_slash + 1;
+    exfat_leaf_len = pathlen - last_slash - 1;
+    if (exfat_leaf_len < 1) { return 0 - 1; }        # trailing slash
+    var dir_clus = 0;
+    var cs = 0;
+    var p = 0;
+    while (p <= last_slash) {
+        if (p == last_slash || load8(path + p) == 47) {
+            var cl = p - cs;
+            if (cl > 0) {
+                var rr[24];
+                if (exfat_find_in_dir(dir_clus, path + cs, cl, &rr) != 1) { return 0 - 1; }
+                # confirm directory via the 0x85 FileAttributes (offset +4, bit 0x10)
+                if (exfat_blk_read(exfat_set_sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+                if ((load8(&exfat_dir_buf + exfat_set_slot * 32 + 4) & 0x10) == 0) { return 0 - 1; }
+                dir_clus = load64(&rr);
+            }
+            cs = p + 1;
+        }
+        p = p + 1;
+    }
+    return dir_clus;
+}
+
 fn exfat_open(name, namelen) {
     if (exfat_active == 0) { return 0 - 1; }
     var res[24];
-    if (exfat_find(name, namelen, &res) != 1) { return 0 - 1; }
+    var dir_clus = exfat_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
+    if (exfat_find_in_dir(dir_clus, name + exfat_leaf_off, exfat_leaf_len, &res) != 1) { return 0 - 1; }
     var first = load64(&res);
     var len = load64(&res + 8);
     var nfc = load64(&res + 16);
@@ -728,9 +782,13 @@ fn exfat_dir_entries_per_cluster() {
 # (alloc) and the FAT (link prev → new → EOC) are updated. Returns the
 # cluster number, or 0 on ENOSPC / error.
 fn exfat_root_cluster_for_index(lin) {
+    return exfat_dir_cluster_for_index_in(0, lin);
+}
+fn exfat_dir_cluster_for_index_in(start_clus, lin) {
     var epc = exfat_dir_entries_per_cluster();
     var cidx = lin / epc;
-    var clus = exfat_root_cluster;
+    var clus = start_clus;
+    if (clus < 2) { clus = exfat_root_cluster; }
     var i = 0;
     var guard = 0;
     var max_c = exfat_cluster_count + 2;
@@ -763,8 +821,12 @@ fn exfat_root_cluster_for_index(lin) {
 # the append point. Walks the FAT chain; if the chain ends without a 0x00,
 # returns the total entry count (append at the chain end → extend).
 fn exfat_dir_end_index() {
+    return exfat_dir_end_index_in(0);
+}
+fn exfat_dir_end_index_in(start_clus) {
     var eps = 512 / 32;
-    var clus = exfat_root_cluster;
+    var clus = start_clus;
+    if (clus < 2) { clus = exfat_root_cluster; }
     var max_c = exfat_cluster_count + 2;
     var lin = 0;
     var guard = 0;
@@ -793,13 +855,16 @@ fn exfat_dir_end_index() {
 # entry"). Extends the root as the run + the trailing 0x00 require. Per-entry
 # RMW so a set straddling a cluster boundary lands correctly. Returns 0/-1.
 fn exfat_dir_append_set(setbase, total) {
+    return exfat_dir_append_set_in(0, setbase, total);
+}
+fn exfat_dir_append_set_in(dir_clus, setbase, total) {
     var eps = 512 / 32;
     var epc = exfat_dir_entries_per_cluster();
-    var lin = exfat_dir_end_index();
+    var lin = exfat_dir_end_index_in(dir_clus);
     var j = 0;
     while (j < total) {
         var li = lin + j;
-        var clus = exfat_root_cluster_for_index(li);
+        var clus = exfat_dir_cluster_for_index_in(dir_clus, li);
         if (clus == 0) { return 0 - 1; }                # ENOSPC
         var within = li % epc;
         var sec = exfat_cluster_sector(clus) + (within / eps);
@@ -813,7 +878,7 @@ fn exfat_dir_append_set(setbase, total) {
     }
     # ensure the entry after the set exists + is 0x00 (end-of-dir); a freshly
     # extended cluster is already zeroed, so this only extends if needed.
-    if (exfat_root_cluster_for_index(lin + total) == 0) { return 0 - 1; }
+    if (exfat_dir_cluster_for_index_in(dir_clus, lin + total) == 0) { return 0 - 1; }
     return 0;
 }
 
@@ -831,6 +896,9 @@ var exfat_set_buf[80];
 # needed (exfat_dir_append_set). ASCII names. Caller already refused an
 # existing name + wrote any data. Returns 0/-1.
 fn exfat_emit_set(name, namelen, first, len, flags, fattr) {
+    return exfat_emit_set_in(0, name, namelen, first, len, flags, fattr);
+}
+fn exfat_emit_set_in(dir_clus, name, namelen, first, len, flags, fattr) {
     var ncname = namelen / 15;
     if (namelen % 15 != 0) { ncname = ncname + 1; }
     if (ncname == 0) { ncname = 1; }
@@ -895,16 +963,20 @@ fn exfat_emit_set(name, namelen, first, len, flags, fattr) {
     store8(setbase + 2, chk & 0xFF);
     store8(setbase + 3, (chk >> 8) & 0xFF);
 
-    return exfat_dir_append_set(setbase, total);
+    return exfat_dir_append_set_in(dir_clus, setbase, total);
 }
 
 # Create an empty file (DataLength 0, no clusters → no bitmap touch).
 # fsck.exfat-clean on its own. Refuses an existing name. Returns 0/-1.
 fn exfat_create(name, namelen) {
     if (exfat_active == 0) { return 0 - 1; }
+    var dir_clus = exfat_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
+    var lo = name + exfat_leaf_off;
+    var ll = exfat_leaf_len;
     var tmp[24];
-    if (exfat_find(name, namelen, &tmp) == 1) { return 0 - 1; }   # exists
-    return exfat_emit_set(name, namelen, 0, 0, 0x00, 0x20);
+    if (exfat_find_in_dir(dir_clus, lo, ll, &tmp) == 1) { return 0 - 1; }   # exists
+    return exfat_emit_set_in(dir_clus, lo, ll, 0, 0, 0x00, 0x20);
 }
 
 # --- Allocation bitmap (§ 2) -----------------------------------------
@@ -995,6 +1067,10 @@ fn exfat_alloc_contiguous(n) {
 fn exfat_write_file(name, namelen, src, len) {
     if (exfat_active == 0) { return 0 - 1; }
     if (exfat_bitmap_cluster < 2) { return 0 - 1; }
+    var dir_clus = exfat_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
+    var lo = name + exfat_leaf_off;
+    var ll = exfat_leaf_len;
 
     # An existing name → OVERWRITE: keep its dir-set, repoint it at the new
     # data, free the old clusters AFTER repointing (new data is allocated +
@@ -1010,7 +1086,7 @@ fn exfat_write_file(name, namelen, src, len) {
     var ov_slot = 0;
     var ov_count = 0;
     var tmp[24];
-    if (exfat_find(name, namelen, &tmp) == 1) {
+    if (exfat_find_in_dir(dir_clus, lo, ll, &tmp) == 1) {
         existed = 1;
         old_first = load64(&tmp);
         old_len = load64(&tmp + 8);
@@ -1056,7 +1132,7 @@ fn exfat_write_file(name, namelen, src, len) {
         exfat_update_percent_in_use();
         return 0;
     }
-    var rc = exfat_emit_set(name, namelen, first, len, flags, 0x20);
+    var rc = exfat_emit_set_in(dir_clus, lo, ll, first, len, flags, 0x20);
     if (rc == 0) { exfat_update_percent_in_use(); }
     return rc;
 }
@@ -1100,8 +1176,10 @@ fn exfat_free_clusters(first, len, nfc) {
 # a follow-on). Returns 0/-1.
 fn exfat_delete(name, namelen) {
     if (exfat_active == 0) { return 0 - 1; }
+    var dir_clus = exfat_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
     var res[24];
-    if (exfat_find(name, namelen, &res) != 1) { return 0 - 1; }   # not found
+    if (exfat_find_in_dir(dir_clus, name + exfat_leaf_off, exfat_leaf_len, &res) != 1) { return 0 - 1; }   # not found
     var first = load64(&res);
     var len = load64(&res + 8);
     var nfc = load64(&res + 16);
@@ -1166,15 +1244,19 @@ fn exfat_dir_is_empty(first) {
 # leaks at worst a bitmap cluster (fsck-fixable). Refuses an existing name.
 fn exfat_mkdir(name, namelen) {
     if (exfat_active == 0) { return 0 - 1; }
+    var dir_clus = exfat_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
+    var lo = name + exfat_leaf_off;
+    var ll = exfat_leaf_len;
     var tmp[24];
-    if (exfat_find(name, namelen, &tmp) == 1) { return 0 - 1; }   # exists
+    if (exfat_find_in_dir(dir_clus, lo, ll, &tmp) == 1) { return 0 - 1; }   # exists
     var dc = exfat_alloc_contiguous(1);
     if (dc < 2) { return 0 - 1; }                                 # ENOSPC
     if (exfat_zero_cluster(dc) != 0) {
         exfat_free_clusters(dc, exfat_bytes_per_cluster, 1);
         return 0 - 1;
     }
-    if (exfat_emit_set(name, namelen, dc, exfat_bytes_per_cluster, 0x03, 0x10) != 0) {
+    if (exfat_emit_set_in(dir_clus, lo, ll, dc, exfat_bytes_per_cluster, 0x03, 0x10) != 0) {
         exfat_free_clusters(dc, exfat_bytes_per_cluster, 1);
         return 0 - 1;
     }
@@ -1187,8 +1269,10 @@ fn exfat_mkdir(name, namelen) {
 # teardown (clear InUse bits + free the cluster). Returns 0/-1.
 fn exfat_rmdir(name, namelen) {
     if (exfat_active == 0) { return 0 - 1; }
+    var dir_clus = exfat_resolve_parent(name, namelen);
+    if (dir_clus < 0) { return 0 - 1; }
     var res[24];
-    if (exfat_find(name, namelen, &res) != 1) { return 0 - 1; }   # not found
+    if (exfat_find_in_dir(dir_clus, name + exfat_leaf_off, exfat_leaf_len, &res) != 1) { return 0 - 1; }   # not found
     var first = load64(&res);
     # Confirm directory via the 0x85 FileAttributes (set primary @ set_sec/slot).
     if (exfat_blk_read(exfat_set_sec, &exfat_dir_buf) != 0) { return 0 - 1; }
@@ -1208,10 +1292,23 @@ fn exfat_rmdir(name, namelen) {
 # cluster-set (fsck-fixable cross-link) only if interrupted mid-rename.
 fn exfat_rename(oldname, oldlen, newname, newlen) {
     if (exfat_active == 0) { return 0 - 1; }
+    # Resolve both paths; src and dst must share a parent directory (the
+    # re-emit appends into the dst's parent + soft-deletes the src set in the
+    # same dir). Cross-directory move is a follow-on. Capture each leaf before
+    # the next resolve clobbers the shared exfat_leaf_off/len globals.
+    var new_dir = exfat_resolve_parent(newname, newlen);
+    if (new_dir < 0) { return 0 - 1; }
+    var new_off = exfat_leaf_off;
+    var new_len = exfat_leaf_len;
+    var old_dir = exfat_resolve_parent(oldname, oldlen);
+    if (old_dir < 0) { return 0 - 1; }
+    var old_off = exfat_leaf_off;
+    var old_len = exfat_leaf_len;
+    if (new_dir != old_dir) { return 0 - 1; }                         # cross-dir move: follow-on
     var nexist[24];
-    if (exfat_find(newname, newlen, &nexist) == 1) { return 0 - 1; }  # dst exists
+    if (exfat_find_in_dir(new_dir, newname + new_off, new_len, &nexist) == 1) { return 0 - 1; }  # dst exists
     var res[24];
-    if (exfat_find(oldname, oldlen, &res) != 1) { return 0 - 1; }     # src missing
+    if (exfat_find_in_dir(old_dir, oldname + old_off, old_len, &res) != 1) { return 0 - 1; }     # src missing
     var first = load64(&res);
     var len = load64(&res + 8);
     var sec = exfat_set_sec;
@@ -1222,8 +1319,8 @@ fn exfat_rename(oldname, oldlen, newname, newlen) {
     if (exfat_blk_read(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
     var fattr = load8(&exfat_dir_buf + slot * 32 + 4);
     var flags = load8(&exfat_dir_buf + (slot + 1) * 32 + 1);
-    # Publish the new name over the same clusters.
-    if (exfat_emit_set(newname, newlen, first, len, flags, fattr) != 0) { return 0 - 1; }
+    # Publish the new name over the same clusters (in the shared parent dir).
+    if (exfat_emit_set_in(new_dir, newname + new_off, new_len, first, len, flags, fattr) != 0) { return 0 - 1; }
     # Soft-delete the old set: clear InUse on each entry (NO cluster free —
     # the new set owns them now). Re-read since emit may have touched the buf.
     if (exfat_blk_read(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
