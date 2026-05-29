@@ -5,6 +5,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.39.3] — 2026-05-28 (**VFS generic-write lift — bite 3: `touch` + `echo >` write to FAT/exFAT.** The write side. The shell's create/write verbs were ext2-only; they now create + write files on a FAT/exFAT primary, completing read+write reach for the secondary filesystems. The FAT/exFAT write code (1.34.x) was `fsck`-clean but unreachable from the shell until now. Single-primary-FS, root-level; the dispatch prefers the non-ESP (real data) FS when multiple mount.)
+
+### Added
+
+- **`vfs_create_secondary` / `vfs_write_secondary`** (`kernel/core/vfs.cyr`) — generic create/write dispatch over the non-ext2 backends (`fatfs_create`/`exfat_create`, `fatfs_write_file`/`exfat_write_file`). The write analog of bite 1/2's read/list dispatch.
+- **Non-ESP-preferring secondary selection.** When a boot FAT **ESP** *and* a FAT/exFAT **data** partition both mount, the write + list helpers (`vfs_create_secondary`/`vfs_write_secondary`/`vfs_print_dir_secondary`) now target the **non-ESP** FS first (the ESP is boot-only and write-guarded), falling back to an ESP FS only as the sole mount. The single-primary-FS heuristic until the 1.39.6 mount-registry bite. (Surfaced by the exfat-write-smoke, which mounts both.)
+
+### Changed
+
+- **`sh_cmd_touch`** — ext2-absent branch creates a bare-named file in the FAT/exFAT root via `vfs_create_secondary` (was `touch: no fs`).
+- **`sh_echo_redirect`** — ext2-absent branch assembles `text + "\n"` into one buffer and writes it via `vfs_write_secondary` (FAT/exFAT writes are whole-file/overwrite). Was `echo: no fs for redirect`.
+- Both changes are isolated to the `ext2_active == 0` branch — the ext2 write path is untouched.
+
+### Validation
+
+- `fat-write-smoke.sh` (`FAT_ALLOW_ESP_WRITE=1`): drives `touch SHTOUCH.TXT` + `echo SHELL-FAT-WROTE > SHECHO.TXT` via `sh_exec`; both land on disk (`mdir`/`mtype`) and **`fsck.fat -n` clean** → **PASS**.
+- `exfat-write-smoke.sh`: same verbs over exFAT; in-kernel find-back + content round-trip (`SHELL-EXFAT-WR`, len=15) + **`fsck.exfat -n` clean** → **PASS**.
+- No regression: `fat-smoke`/`exfat-smoke` (bite 1/2 `cat`+`ls`) still green; ext2 path untouched. `check.sh` 11/11, `test.sh` 4/4. Production build **997,560 B**, multiboot2 OK.
+
+### Not yet (next bites)
+
+- `rm` / `mkdir` / `rmdir` across FAT/exFAT — bite 4 (1.39.4; confirm FAT/exFAT dir-create surface first).
+- `mv` (rename) + `sync` dispatch — bite 5.
+- Mount-registry consolidation (replacing the non-ESP heuristic with a real primary/mount-point model) + arc-close hardening + iron burn — bite 6.
+
 ## [1.39.2] — 2026-05-28 (**VFS generic-write lift — bite 2: `ls` lists FAT/exFAT.** Read-side, second rung. `sh_cmd_ls` was ext2-only (`ls: no ext2 filesystem mounted`); the FAT lister emitted via `serial_print` (invisible on iron per the no-serial constraint) and the exFAT lister only *counted* entries. This cut makes `ls` list a FAT/exFAT primary's root with FB-visible names + sizes, via a generic directory-dispatch seam. Single-primary-FS: ext2 still wins when mounted; FAT/exFAT root lists when it's the primary. Additive, zero-risk to the ext2 path.)
 
 ### Added

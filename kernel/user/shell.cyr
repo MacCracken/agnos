@@ -489,7 +489,14 @@ fn sh_split_parent(plen) {
 }
 
 fn sh_cmd_touch(arg, arglen) {
-    if (ext2_active == 0) { kprintln("touch: no fs", 12); return 0; }
+    if (ext2_active == 0) {
+        # Single-primary fallthrough (1.39.3): no ext2 -> create a bare-named
+        # file in the FAT/exFAT root via vfs_create_secondary. Root-only.
+        sh_trim(arg, arglen);
+        if (sh_trim_len < 1) { kprintln("usage: touch <file>", 19); return 0; }
+        if (vfs_create_secondary(arg + sh_trim_off, sh_trim_len) == 0) { return 0; }
+        kprintln("touch: no fs", 12); return 0;
+    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: touch <file>", 19); return 0; }
     if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("touch: bad path", 15); return 0; }
@@ -678,7 +685,27 @@ fn sh_cmd_sync() {
 # `echo TEXT > FILE` — write TEXT + newline to FILE (create or truncate).
 # `text`/`textlen` = the bytes before '>'; `fname`/`fnamelen` = after.
 fn sh_echo_redirect(text, textlen, fname, fnamelen) {
-    if (ext2_active == 0) { kprintln("echo: no fs for redirect", 24); return 0; }
+    if (ext2_active == 0) {
+        # Single-primary fallthrough (1.39.3): no ext2 -> create+write a
+        # bare-named file in the FAT/exFAT root. FAT/exFAT writes are
+        # whole-file (overwrite), so assemble text + "\n" into one buffer and
+        # hand it to vfs_write_secondary in a single call. Root-only.
+        sh_trim(text, textlen);
+        var et_off = sh_trim_off; var et_len = sh_trim_len;
+        sh_trim(fname, fnamelen);
+        if (sh_trim_len < 1) { kprintln("echo: no redirect target", 24); return 0; }
+        var ebuf[512];                       # function-local: 512 bytes
+        var ew = 0;
+        var ek = 0;
+        while (ek < et_len) {
+            if (ew >= 511) { break; }
+            store8(&ebuf + ew, load8(text + et_off + ek));
+            ew = ew + 1; ek = ek + 1;
+        }
+        if (ew < 511) { store8(&ebuf + ew, 10); ew = ew + 1; }   # trailing '\n'
+        if (vfs_write_secondary(fname + sh_trim_off, sh_trim_len, &ebuf, ew) >= 0) { return 0; }
+        kprintln("echo: no fs for redirect", 24); return 0;
+    }
     sh_trim(text, textlen);
     var t_off = sh_trim_off; var t_len = sh_trim_len;
     sh_trim(fname, fnamelen);

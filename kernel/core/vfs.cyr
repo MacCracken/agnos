@@ -79,9 +79,39 @@ fn vfs_open_secondary(name, namelen) {
 # exFAT *root* when one of them is the mounted primary (single-primary-FS
 # model — ext2 wins when present). Returns the entry count, or -1 when no
 # secondary FS is mounted. Root-only; FAT/exFAT subdir paths deferred.
+#   When more than one secondary FS is mounted (e.g. a boot FAT ESP + an
+#   exFAT data partition), the *list*/*write* helpers prefer the non-ESP
+#   (real data) FS — the ESP is boot-only and write-guarded — falling back to
+#   an ESP FS only if it's the sole mount. (Read/`cat` uses miss-fallthrough,
+#   so it doesn't need this.) A real mount-point namespace is the 1.39.6 bite;
+#   this is the single-primary-FS heuristic until then.
 fn vfs_print_dir_secondary() {
+    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_ls(); }
+    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_print_dir(); }
     if (fatfs_active != 0) { return fatfs_ls(); }
     if (exfat_active != 0) { return exfat_print_dir(); }
+    return 0 - 1;
+}
+
+# Generic create/write dispatch for the non-ext2 primary (1.39.3 — VFS
+# generic-write lift, bite 3). The write analog of bite 1/2's read/list
+# dispatch. ext2 is handled path-aware by the caller; these create/write a
+# bare-named file in the FAT/exFAT *root* (single-primary-FS, root-only —
+# subdir paths deferred). FAT/exFAT writes self-gate on the ESP-write guard
+# (refused on a boot ESP unless FAT_ALLOW_ESP_WRITE). Returns 0 / bytes on
+# success, -1 on miss-or-failure.
+fn vfs_create_secondary(name, namelen) {
+    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_create(name, namelen); }
+    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_create(name, namelen); }
+    if (fatfs_active != 0) { return fatfs_create(name, namelen); }
+    if (exfat_active != 0) { return exfat_create(name, namelen); }
+    return 0 - 1;
+}
+fn vfs_write_secondary(name, namelen, src, len) {
+    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_write_file(name, namelen, src, len); }
+    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_write_file(name, namelen, src, len); }
+    if (fatfs_active != 0) { return fatfs_write_file(name, namelen, src, len); }
+    if (exfat_active != 0) { return exfat_write_file(name, namelen, src, len); }
     return 0 - 1;
 }
 

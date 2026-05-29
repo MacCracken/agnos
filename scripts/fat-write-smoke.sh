@@ -276,6 +276,22 @@ else
     echo "  FAIL: 1.34.4 only $LF_CNT/40 long names present (root-extension lost entries)"; rc=1
 fi
 
+# 1.39.3 VFS-lift bite 3: the shell write verbs reach FAT. The kernel ran
+# `touch SHTOUCH.TXT` + `echo SHELL-FAT-WROTE > SHECHO.TXT` via sh_exec ->
+# sh_cmd_touch / sh_echo_redirect -> vfs_create_secondary / vfs_write_secondary
+# -> fatfs_create / fatfs_write_file. Verify both landed on disk + content.
+if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "SHTOUCH"; then
+    echo "  PASS: shell 'touch' created SHTOUCH.TXT on FAT (vfs_create_secondary)"
+else
+    echo "  FAIL: shell touch over FAT (SHTOUCH.TXT absent on disk)"; rc=1
+fi
+mtype -i "$WORK/esp.img" ::SHECHO.TXT > "$WORK/shecho.txt" 2>/dev/null
+if grep -q "SHELL-FAT-WROTE" "$WORK/shecho.txt" 2>/dev/null; then
+    echo "  PASS: shell 'echo >' wrote SHECHO.TXT content on FAT (vfs_write_secondary)"
+else
+    echo "  FAIL: shell echo> over FAT (SHECHO.TXT content missing 'SHELL-FAT-WROTE')"; rc=1
+fi
+
 echo ""
 echo "=========================================="
 if [ "$rc" = "0" ]; then echo "FAT write smoke (3a-3e + 1.34.3 LFN-content): PASS"; else echo "FAT write smoke: FAIL"; fi

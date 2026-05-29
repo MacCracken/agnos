@@ -154,6 +154,16 @@ strings "$LOG" | grep -q "^exfatw: unicode Cafe-acute rc=0" \
 strings "$LOG" | grep -q "^exfatw: unicode find+read OK" \
     && echo "  PASS: 1.34.5 non-ASCII name find + content readback" \
     || { echo "  FAIL: 1.34.5 non-ASCII find/read"; rc=1; }
+# 1.39.3 VFS-lift bite 3: the shell write verbs reach exFAT (sh_cmd_touch /
+# sh_echo_redirect -> vfs_create_secondary / vfs_write_secondary ->
+# exfat_create / exfat_write_file). In-kernel find-back + content round-trip;
+# fsck.exfat -n (below) confirms the structure stayed clean after the writes.
+strings "$LOG" | grep -q "^exfatw: shell touch find-back OK" \
+    && echo "  PASS: 1.39.3 shell 'touch' created file on exFAT (vfs_create_secondary)" \
+    || { echo "  FAIL: 1.39.3 shell touch over exFAT"; rc=1; }
+strings "$LOG" | grep -q "^exfatw: shell echo round-trip OK" \
+    && echo "  PASS: 1.39.3 shell 'echo >' wrote content on exFAT (vfs_write_secondary)" \
+    || { echo "  FAIL: 1.39.3 shell echo> over exFAT"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

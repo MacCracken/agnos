@@ -642,6 +642,14 @@ if (fatfs_active == 1) {
     }
     if (rxn_ok == 1) { kprintln("fatw: fatrootext readback OK", 28); }
     else { kprintln("fatw: fatrootext readback FAIL", 30); }
+    # 1.39.3 VFS-lift bite 3: drive the real shell write verbs. ext2 is
+    # unmounted, so sh_cmd_touch / sh_echo_redirect fall through to
+    # vfs_create_secondary / vfs_write_secondary -> fatfs_create /
+    # fatfs_write_file. fat-write-smoke.sh fsck's + mtype-checks the results
+    # (SHTOUCH.TXT empty-create, SHECHO.TXT content "SHELL-FAT-WROTE").
+    kprintln("vfsw: shell touch+echo over FAT ->", 34);
+    sh_exec("touch SHTOUCH.TXT", 17);
+    sh_exec("echo SHELL-FAT-WROTE > SHECHO.TXT", 33);
 }
 #endif
 
@@ -896,6 +904,39 @@ if (exfat_active == 1) {
     }
     if (u_ok == 1) { kprintln("exfatw: unicode find+read OK", 28); }
     else { kprintln("exfatw: unicode find+read FAIL", 30); }
+    # 1.39.3 VFS-lift bite 3: drive the real shell write verbs over exFAT.
+    # ext2 unmounted -> sh_cmd_touch / sh_echo_redirect fall through to
+    # vfs_create_secondary / vfs_write_secondary -> exfat_create /
+    # exfat_write_file. Verify in-kernel (find-back + content read-back);
+    # exfat-write-smoke.sh also fsck.exfat -n's the result.
+    kprintln("vfsw: shell touch+echo over exFAT ->", 36);
+    sh_exec("touch SHTOUCH.TXT", 17);
+    sh_exec("echo SHELL-EXFAT-WR > SHECHO.TXT", 32);
+    var sht_res[24];
+    if (exfat_find("SHTOUCH.TXT", 11, &sht_res) == 1) { kprintln("exfatw: shell touch find-back OK", 32); }
+    else { kprintln("exfatw: shell touch find-back FAIL", 34); }
+    var she_res[24];
+    if (exfat_find("SHECHO.TXT", 10, &she_res) == 1) {
+        var she_first = load64(&she_res);
+        var she_len = load64(&she_res + 8);
+        var she_nfc = load64(&she_res + 16);
+        var she_got = exfat_read(she_first, she_nfc, &exfat_file_buf, 64);
+        var she_ok = 1;
+        if (she_got < 14) { she_ok = 0; }
+        # Content-match the 14 chars of "SHELL-EXFAT-WR" (robust to the
+        # trailing-newline length detail). echo writes text + '\n'.
+        var she_ref = "SHELL-EXFAT-WR";
+        var she_ci = 0;
+        while (she_ci < 14) {
+            if (load8(&exfat_file_buf + she_ci) != load8(she_ref + she_ci)) { she_ok = 0; }
+            she_ci = she_ci + 1;
+        }
+        kprint("exfatw: shell echo len=", 23);
+        kprint_num(she_len);
+        kprintln("", 0);
+        if (she_ok == 1) { kprintln("exfatw: shell echo round-trip OK", 32); }
+        else { kprintln("exfatw: shell echo round-trip FAIL", 34); }
+    } else { kprintln("exfatw: shell echo find-back FAIL", 33); }
 }
 #endif
 
