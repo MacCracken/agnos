@@ -203,6 +203,11 @@ strings "$LOG" | grep -q "^exfatw: subdir renamed-dir OK" \
 strings "$LOG" | grep -q "SUBDIR-EXFAT-OK" \
     && echo "  PASS: 1.39.9 subdir 'cat' SHEXDIR/SUBKEEP.TXT read back via slashed path" \
     || { echo "  FAIL: 1.39.9 subdir cat over exFAT (no 'SUBDIR-EXFAT-OK' in log)"; rc=1; }
+# 1.40.1 exec-from-disk bite 1: vfs_read_file reads a 6000-byte file fully
+# (past the 4 KB memfile cap) — the read primitive the exec load path needs.
+strings "$LOG" | grep -q "^vfsrf: exFAT whole-file read past 4KB OK" \
+    && echo "  PASS: 1.40.1 vfs_read_file whole-file read past 4 KB cap (exFAT)" \
+    || { echo "  FAIL: 1.40.1 vfs_read_file over exFAT (no 'whole-file read past 4KB OK')"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

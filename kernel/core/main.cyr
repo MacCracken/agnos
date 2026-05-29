@@ -683,6 +683,22 @@ if (fatfs_active == 1) {
     sh_exec("mv SHSUB/SUBD1 SHSUB/SUBD2", 26);
     kprintln("vfsw: subdir paths over FAT done", 32);
     sh_exec("cat SHSUB/SUBKEEP.TXT", 21);
+    # 1.40.1 exec-from-disk bite 1: whole-file read past the 4 KB memfile cap
+    # (vfs_read_file). Write a 6000-byte pattern file, read it back fully into
+    # an 8 KB buffer, verify length + bytes past offset 4096 (the old cap).
+    var rfi = 0;
+    while (rfi < 6000) { store8(&vfs_scratch_buf + rfi, rfi & 0xFF); rfi = rfi + 1; }
+    fatfs_write_file("BIGRF.BIN", 9, &vfs_scratch_buf, 6000);
+    var rfz = 0;
+    while (rfz < 8192) { store8(&vfs_scratch_buf + rfz, 0); rfz = rfz + 1; }   # clear so a short read can't pass on stale bytes
+    var rfn = vfs_read_file("BIGRF.BIN", 9, &vfs_scratch_buf, 8192);
+    var rfok = 1;
+    if (rfn != 6000) { rfok = 0; }
+    if (load8(&vfs_scratch_buf + 0) != 0) { rfok = 0; }
+    if (load8(&vfs_scratch_buf + 5000) != (5000 & 0xFF)) { rfok = 0; }   # past the 4 KB cap
+    if (load8(&vfs_scratch_buf + 5999) != (5999 & 0xFF)) { rfok = 0; }
+    if (rfok == 1) { kprintln("vfsrf: FAT whole-file read past 4KB OK", 38); }
+    else { kprintln("vfsrf: FAT whole-file read FAIL", 31); }
 }
 #endif
 
@@ -1027,6 +1043,21 @@ if (exfat_active == 1) {
         else { kprintln("exfatw: subdir renamed-dir FAIL", 31); }
     } else { kprintln("exfatw: subdir parent-missing FAIL", 34); }
     sh_exec("cat SHEXDIR/SUBKEEP.TXT", 23);
+    # 1.40.1 exec-from-disk bite 1: whole-file read past the 4 KB memfile cap
+    # (vfs_read_file) over exFAT.
+    var xrfi = 0;
+    while (xrfi < 6000) { store8(&vfs_scratch_buf + xrfi, xrfi & 0xFF); xrfi = xrfi + 1; }
+    exfat_write_file("BIGRF.BIN", 9, &vfs_scratch_buf, 6000);
+    var xrfz = 0;
+    while (xrfz < 8192) { store8(&vfs_scratch_buf + xrfz, 0); xrfz = xrfz + 1; }
+    var xrfn = vfs_read_file("BIGRF.BIN", 9, &vfs_scratch_buf, 8192);
+    var xrfok = 1;
+    if (xrfn != 6000) { xrfok = 0; }
+    if (load8(&vfs_scratch_buf + 0) != 0) { xrfok = 0; }
+    if (load8(&vfs_scratch_buf + 5000) != (5000 & 0xFF)) { xrfok = 0; }   # past the 4 KB cap
+    if (load8(&vfs_scratch_buf + 5999) != (5999 & 0xFF)) { xrfok = 0; }
+    if (xrfok == 1) { kprintln("vfsrf: exFAT whole-file read past 4KB OK", 40); }
+    else { kprintln("vfsrf: exFAT whole-file read FAIL", 33); }
 }
 #endif
 

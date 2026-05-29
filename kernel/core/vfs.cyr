@@ -30,6 +30,13 @@ enum VfsType {
 
 var vfs_table[1024];  # 32 entries x 32 bytes each
 
+# Whole-file staging buffer (1.40.1 exec-from-disk). Module-global so it is
+# N×u64 = 8192 bytes — kmalloc/pmm_alloc both cap at one 4 KB page, so a
+# staging area larger than that must be a reserved region, not an allocator
+# call. Used by the selftests to exercise vfs_read_file past the 4 KB cap;
+# the real exec load buffer (1.40.2) will be sized for a binary.
+var vfs_scratch_buf[1024];
+
 fn vfs_init() {
     memset(&vfs_table, 0, 1024);  # 32 entries x 32 bytes
     # FD 0 = serial device (data=device index 0)
@@ -102,6 +109,70 @@ fn vfs_secondary_select() {
     if (fatfs_active != 0)  { return SEC_FAT; }
     if (exfat_active != 0)  { return SEC_EXFAT; }
     return SEC_NONE;
+}
+
+# === Whole-file read (1.40.1 — exec-from-disk, bite 1) ===
+# Read an ENTIRE file from a VFS path into `dst` (up to `cap` bytes),
+# resolving whichever filesystem backs the path. Returns bytes read, or -1
+# on miss/error. This is the read primitive the exec-from-disk load path
+# (1.40.2) sits on: `cat`/`vfs_open_secondary` wrap a file as a ≤ 4 KB
+# VFS_MEMFILE, but an ELF is far larger — exec needs the whole image in one
+# contiguous buffer. ext2 is path/inode-based (regular files only); FAT/exFAT
+# go through the 1.39.x resolver + a full cluster-chain read (the readers
+# themselves were never 4 KB-capped — only the *_open memfile wrappers were).
+# Precedence mirrors `cat`: ext2 first when mounted, else the selected
+# secondary FS. initrd is intentionally NOT covered here (its programs already
+# exec from memory via the boot path).
+fn vfs_read_file(path, namelen, dst, cap) {
+    if (dst == 0)   { return 0 - 1; }
+    if (cap <= 0)   { return 0 - 1; }
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    # ext2 (primary FS): resolve path -> inode, regular-file only, read fully.
+    if (ext2_active != 0) {
+        var ino = ext2_path_lookup(path, namelen);
+        if (ino > 0) {
+            if (ext2_get_inode(ino, &ext2_inode_buf) == 0) {
+                if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0x8000) {
+                    var fsz = ext2_inode_filesize(&ext2_inode_buf);
+                    var want = fsz;
+                    if (want > cap) { want = cap; }
+                    return ext2_read_at(ino, 0, dst, want);
+                }
+            }
+        }
+    }
+    # FAT / exFAT secondary, via the 1.39.x resolver + full chain read.
+    var fs = vfs_secondary_select();
+    if (fs == SEC_FAT) {
+        var fdir = fatfs_resolve_parent(path, namelen);
+        if (fdir >= 0) {
+            var fr[16];
+            if (fatfs_find_in_dir(fdir, path + fatfs_leaf_off, fatfs_leaf_len, &fr) == 1) {
+                var fclus = load64(&fr);
+                var ffsz = load64(&fr + 8);
+                var fwant = ffsz;
+                if (fwant > cap) { fwant = cap; }
+                if (fclus >= 2) { return fatfs_read(fclus, dst, fwant); }
+            }
+        }
+        return 0 - 1;
+    }
+    if (fs == SEC_EXFAT) {
+        var xdir = exfat_resolve_parent(path, namelen);
+        if (xdir >= 0) {
+            var xr[24];
+            if (exfat_find_in_dir(xdir, path + exfat_leaf_off, exfat_leaf_len, &xr) == 1) {
+                var xclus = load64(&xr);
+                var xfsz = load64(&xr + 8);
+                var xnfc = load64(&xr + 16);
+                var xwant = xfsz;
+                if (xwant > cap) { xwant = cap; }
+                if (xclus >= 2) { return exfat_read(xclus, xnfc, dst, xwant); }
+            }
+        }
+        return 0 - 1;
+    }
+    return 0 - 1;
 }
 
 # Ingress bound for the name arg of every secondary write/dir verb (bite 8

@@ -347,6 +347,13 @@ if grep -q "SUBDIR-FAT-OK" "$LOG" 2>/dev/null; then
 else
     echo "  FAIL: subdir cat (no 'SUBDIR-FAT-OK' in boot log from cat)"; rc=1
 fi
+# 1.40.1 exec-from-disk bite 1: vfs_read_file reads a 6000-byte file fully
+# (past the 4 KB memfile cap) — the read primitive the exec load path needs.
+if grep -q "^vfsrf: FAT whole-file read past 4KB OK" "$LOG" 2>/dev/null; then
+    echo "  PASS: 1.40.1 vfs_read_file whole-file read past 4 KB cap (FAT)"
+else
+    echo "  FAIL: 1.40.1 vfs_read_file over FAT (no 'whole-file read past 4KB OK')"; rc=1
+fi
 
 echo ""
 echo "=========================================="
