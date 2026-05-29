@@ -5,6 +5,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.39.7] — 2026-05-28 (**VFS generic-write lift — bite 7: `mv` (rename) + `sync` on FAT/exFAT.** The last functional verb. `mv` renames within a FAT/exFAT root; `sync` flushes the backend. With this, the full shell verb set — `cat`/`ls`/`touch`/`echo >`/`rm`/`mkdir`/`rmdir`/`mv`/`sync` — works on both secondary filesystems. Neither FS has POSIX-atomic rename, so each uses its own content-preserving approach (no copy).)
+
+### Added — FAT/exFAT rename + sync (`fatfs.cyr`, `exfat.cyr`, `vfs.cyr`)
+
+- **`fatfs_rename`** (FAT32) — in-place dirent **name rewrite** (keeps cluster chain + size + attr → size-independent, works for files *and* directories). Refuses if the destination exists or source is missing. 8.3 names.
+- **`exfat_rename`** — re-emits a new dir-set carrying the new name but pointing at the **same clusters** (no content copy / realloc), then soft-deletes the old set (clears InUse, does **not** free clusters). exFAT has no in-place rename (name drives the File-Name entries + NameHash + SetChecksum).
+- **`vfs_rename_secondary` / `vfs_sync_secondary`** — dispatch (non-ESP-preferring). `sync` is a `blk_flush_on` durability barrier (FAT/exFAT writes already go straight to the block layer).
+
+### Changed
+
+- **`sh_cmd_mv` / `sh_cmd_sync`** — ext2-absent branches wired to the dispatch (was `mv: no fs` / `sync: no fs`). Isolated to the `ext2_active == 0` branch; ext2 path untouched.
+
+### Validation
+
+- `fat-write-smoke.sh`: `touch SHMVA` → `mv SHMVA SHMVB` → SHMVB present, SHMVA gone, **`fsck.fat -n` clean**; `sync` runs clean → **PASS**.
+- `exfat-write-smoke.sh`: same; in-kernel `exfat_find` confirms dst present + src gone, **`fsck.exfat -n` clean** (the re-emit left no cross-link / orphan) → **PASS**.
+- No regression: FAT 31+/exFAT full smoke green; bites 1–6 green; ext2 untouched. `check.sh` 11/11, `test.sh` 4/4. Production build **1,008,816 B**, multiboot2 OK.
+
+### Not yet (next — arc close)
+
+- **1.39.8 — arc-close**: mount-registry consolidation (replace the non-ESP heuristic with a real primary/mount-point model), FAT/exFAT *subdirectory* paths in the verbs (currently root-only), hardening, + the user-driven iron burn. The functional verb surface is complete; 1.39.8 is consolidation + iron.
+
+
 ## [1.39.6] — 2026-05-28 (**VFS generic-write lift — bite 6: `mkdir`/`rmdir` on exFAT.** Completes directory create/remove across both secondary filesystems (FAT landed at 1.39.5). exFAT directories have a different shape than FAT — **no `.`/`..` entries**, a dir-set with the Directory `FileAttributes`, and a NoFatChain single cluster — so this is its own bite.)
 
 ### Added — exFAT directory create/remove (`kernel/core/exfat.cyr`)

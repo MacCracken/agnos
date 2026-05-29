@@ -314,6 +314,13 @@ if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "SHRMD"; then
 else
     echo "  PASS: shell 'rmdir' removed SHRMD dir on FAT (vfs_rmdir_secondary)"
 fi
+# 1.39.7 VFS-lift bite 7: shell mv (rename) over FAT. SHMVA was renamed to
+# SHMVB (in-place dirent rewrite) — SHMVB present, SHMVA gone, fsck clean.
+if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "SHMVB" && ! mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "SHMVA"; then
+    echo "  PASS: shell 'mv' renamed SHMVA→SHMVB on FAT (vfs_rename_secondary)"
+else
+    echo "  FAIL: shell mv over FAT (SHMVB absent or SHMVA still present)"; rc=1
+fi
 
 echo ""
 echo "=========================================="

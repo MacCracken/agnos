@@ -896,6 +896,31 @@ fn fatfs_mkdir(name, namelen) {
     return 0;
 }
 
+# Rename a file or directory within the root (FAT32) — in-place dirent name
+# rewrite (keeps the cluster chain + size + attr, so it's size-independent
+# and works for files AND directories; a renamed dir's "."/".." are
+# unaffected since the parent is unchanged). Refuses if the destination
+# exists or the source is missing. 8.3 names only (LFN rename is a follow-on).
+# Returns 0/-1.
+fn fatfs_rename(oldname, oldlen, newname, newlen) {
+    if (fatfs_active == 0) { return 0 - 1; }
+    if (fatfs_type == 12) { return 0 - 1; }
+    var nexist[16];
+    if (fatfs_find_root(newname, newlen, &nexist) == 1) { return 0 - 1; }  # dst exists
+    var res[16];
+    if (fatfs_find_root(oldname, oldlen, &res) != 1) { return 0 - 1; }     # src missing
+    var sec = fatfs_slot_sec;
+    var slot = fatfs_slot_idx;
+    var newname11[16];
+    fatfs_build_83(newname, newlen, &newname11);
+    if (fat_blk_read(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    var ep = &fatfs_dir_buf + slot * 32;
+    var j = 0;
+    while (j < 11) { store8(ep + j, load8(&newname11 + j)); j = j + 1; }    # name field only
+    if (fat_blk_write(sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
+    return 0;
+}
+
 # Remove an empty subdirectory from the root (FAT32). Verifies the target is
 # a directory (parent dirent attr 0x10) AND empty, then reuses fatfs_delete's
 # teardown (mark dirent 0xE5 + free the cluster chain). Refuses a non-dir, a

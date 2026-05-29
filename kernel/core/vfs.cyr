@@ -145,6 +145,24 @@ fn vfs_rmdir_secondary(name, namelen) {
     return 0 - 1;
 }
 
+# Generic rename + sync dispatch for the non-ext2 primary (1.39.7 — VFS lift
+# bite 7). Rename: FAT does an in-place dirent rewrite, exFAT re-emits the
+# dir-set over the same clusters (neither has POSIX-atomic rename). Sync:
+# FAT/exFAT writes go straight to the block layer, so sync is a durability
+# barrier (blk flush) on the active backend. Same non-ESP preference.
+fn vfs_rename_secondary(oldname, oldlen, newname, newlen) {
+    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_rename(oldname, oldlen, newname, newlen); }
+    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_rename(oldname, oldlen, newname, newlen); }
+    if (fatfs_active != 0) { return fatfs_rename(oldname, oldlen, newname, newlen); }
+    if (exfat_active != 0) { return exfat_rename(oldname, oldlen, newname, newlen); }
+    return 0 - 1;
+}
+fn vfs_sync_secondary() {
+    if (fatfs_active != 0) { blk_flush_on(fat_backend); return 0; }
+    if (exfat_active != 0) { blk_flush_on(exfat_backend); return 0; }
+    return 0 - 1;
+}
+
 fn vfs_read_signalfd(base, buf) {
     var sigmask = load64(base + 24);
     var pending = load64(&proc_signals + proc_current * 8);

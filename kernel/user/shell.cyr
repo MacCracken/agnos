@@ -566,7 +566,25 @@ fn sh_cmd_rmdir(arg, arglen) {
 # first space. SRC's basename is copied to a local before DST is resolved,
 # because sh_abspath/sh_split_parent reuse the shared sh_path_buf.
 fn sh_cmd_mv(arg, arglen) {
-    if (ext2_active == 0) { kprintln("mv: no fs", 9); return 0; }
+    if (ext2_active == 0) {
+        # Single-primary fallthrough (1.39.7): no ext2 -> rename within the
+        # FAT/exFAT root via vfs_rename_secondary. Bare src/dst names, root-only.
+        sh_trim(arg, arglen);
+        if (sh_trim_len < 1) { kprintln("usage: mv <src> <dst>", 21); return 0; }
+        var mts = arg + sh_trim_off;
+        var mtl = sh_trim_len;
+        var msp = 0 - 1;
+        var mi = 0;
+        while (mi < mtl) { if (load8(mts + mi) == 32) { msp = mi; break; } mi = mi + 1; }
+        if (msp < 0) { kprintln("usage: mv <src> <dst>", 21); return 0; }
+        var mdoff = msp + 1;
+        while (mdoff < mtl) { if (load8(mts + mdoff) != 32) { break; } mdoff = mdoff + 1; }
+        if (mdoff >= mtl) { kprintln("usage: mv <src> <dst>", 21); return 0; }
+        var mdl = mtl - mdoff;
+        while (mdl > 0) { if (load8(mts + mdoff + mdl - 1) != 32) { break; } mdl = mdl - 1; }
+        if (vfs_rename_secondary(mts, msp, mts + mdoff, mdl) == 0) { return 0; }
+        kprintln("mv: failed", 10); return 0;
+    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: mv <src> <dst>", 21); return 0; }
     var ts = arg + sh_trim_off;
@@ -698,7 +716,13 @@ fn sh_cmd_jbd2() {
 # superblock (1.33.3 bite 4). Run it before pulling power so e2fsck sees
 # a clean FS; skip it and a yanked burn shows "not cleanly unmounted".
 fn sh_cmd_sync() {
-    if (ext2_active == 0) { kprintln("sync: no fs", 11); return 0; }
+    if (ext2_active == 0) {
+        # Single-primary fallthrough (1.39.7): no ext2 -> flush the FAT/exFAT
+        # backend (writes are already through the block layer; this is the
+        # durability barrier).
+        if (vfs_sync_secondary() == 0) { kprintln("sync: clean", 11); return 0; }
+        kprintln("sync: no fs", 11); return 0;
+    }
     if (ext2_sync() != 0) { kprintln("sync: failed (ro fs?)", 21); return 0; }
     kprintln("sync: clean", 11);
     return 0;

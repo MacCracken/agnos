@@ -1198,6 +1198,45 @@ fn exfat_rmdir(name, namelen) {
     return exfat_delete(name, namelen);                           # clear InUse + free
 }
 
+# Rename a file or directory within the root. exFAT has no in-place rename
+# (the File-Name entries + NameHash + SetChecksum all depend on the name, and
+# a length change resizes the set), so this re-emits a NEW dir-set carrying
+# the new name but pointing at the SAME clusters (no content copy / realloc),
+# then soft-deletes the OLD set (clears InUse, does NOT free the clusters).
+# Refuses if the destination exists or the source is missing. One-sector set.
+# Crash window: emit-new-then-clear-old leaves a transient two-names → one
+# cluster-set (fsck-fixable cross-link) only if interrupted mid-rename.
+fn exfat_rename(oldname, oldlen, newname, newlen) {
+    if (exfat_active == 0) { return 0 - 1; }
+    var nexist[24];
+    if (exfat_find(newname, newlen, &nexist) == 1) { return 0 - 1; }  # dst exists
+    var res[24];
+    if (exfat_find(oldname, oldlen, &res) != 1) { return 0 - 1; }     # src missing
+    var first = load64(&res);
+    var len = load64(&res + 8);
+    var sec = exfat_set_sec;
+    var slot = exfat_set_slot;
+    var count = exfat_set_count;
+    if (slot + count > 16) { return 0 - 1; }                          # spanning set (follow-on)
+    # Capture flags (0xC0 GeneralSecondaryFlags) + attr (0x85 FileAttributes).
+    if (exfat_blk_read(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+    var fattr = load8(&exfat_dir_buf + slot * 32 + 4);
+    var flags = load8(&exfat_dir_buf + (slot + 1) * 32 + 1);
+    # Publish the new name over the same clusters.
+    if (exfat_emit_set(newname, newlen, first, len, flags, fattr) != 0) { return 0 - 1; }
+    # Soft-delete the old set: clear InUse on each entry (NO cluster free —
+    # the new set owns them now). Re-read since emit may have touched the buf.
+    if (exfat_blk_read(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+    var e = 0;
+    while (e < count) {
+        var ep = &exfat_dir_buf + (slot + e) * 32;
+        store8(ep, load8(ep) & 0x7F);
+        e = e + 1;
+    }
+    if (exfat_blk_write(sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+    return 0;
+}
+
 # Truncate a file to zero: zero the 0xC0 Stream-Extension's allocation
 # (GeneralSecondaryFlags AllocationPossible bit, ValidDataLength,
 # FirstCluster, DataLength) + recompute the SetChecksum, write the dir-set

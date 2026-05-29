@@ -662,6 +662,13 @@ if (fatfs_active == 1) {
     sh_exec("mkdir SHKEEP", 12);
     sh_exec("mkdir SHRMD", 11);
     sh_exec("rmdir SHRMD", 11);
+    # 1.39.7 VFS-lift bite 7: shell mv (rename) + sync over FAT (sh_cmd_mv ->
+    # vfs_rename_secondary -> fatfs_rename in-place dirent rewrite; sh_cmd_sync
+    # -> vfs_sync_secondary -> blk flush). SHMVA→SHMVB; smoke checks B present,
+    # A gone, fsck clean.
+    sh_exec("touch SHMVA", 11);
+    sh_exec("mv SHMVA SHMVB", 14);
+    sh_exec("sync", 4);
 }
 #endif
 
@@ -970,6 +977,18 @@ if (exfat_active == 1) {
     var shrd_res[24];
     if (exfat_find("SHEXRMD", 7, &shrd_res) == 1) { kprintln("exfatw: shell rmdir still-present FAIL", 38); }
     else { kprintln("exfatw: shell rmdir gone OK", 27); }
+    # 1.39.7 VFS-lift bite 7: shell mv (rename) + sync over exFAT (sh_cmd_mv ->
+    # vfs_rename_secondary -> exfat_rename re-emit-at-same-clusters). SHMVA→SHMVB;
+    # in-kernel: dst present + src gone. exfat-write-smoke.sh also fsck-checks.
+    sh_exec("touch SHMVA", 11);
+    sh_exec("mv SHMVA SHMVB", 14);
+    var shmv_b[24];
+    var shmv_a[24];
+    if (exfat_find("SHMVB", 5, &shmv_b) == 1) {
+        if (exfat_find("SHMVA", 5, &shmv_a) == 1) { kprintln("exfatw: shell mv src-remains FAIL", 33); }
+        else { kprintln("exfatw: shell mv OK", 19); }
+    } else { kprintln("exfatw: shell mv dst-missing FAIL", 33); }
+    sh_exec("sync", 4);
 }
 #endif
 

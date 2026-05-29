@@ -180,6 +180,12 @@ strings "$LOG" | grep -q "^exfatw: shell mkdir find-back OK" \
 strings "$LOG" | grep -q "^exfatw: shell rmdir gone OK" \
     && echo "  PASS: 1.39.6 shell 'rmdir' removed dir on exFAT (exfat_rmdir)" \
     || { echo "  FAIL: 1.39.6 shell rmdir over exFAT (dir still present)"; rc=1; }
+# 1.39.7 VFS-lift bite 7: shell mv (rename) over exFAT (vfs_rename_secondary
+# -> exfat_rename re-emit-at-same-clusters). In-kernel: dst found + src gone;
+# fsck.exfat -n (below) confirms no cross-link / orphan after the re-emit.
+strings "$LOG" | grep -q "^exfatw: shell mv OK" \
+    && echo "  PASS: 1.39.7 shell 'mv' renamed file on exFAT (exfat_rename)" \
+    || { echo "  FAIL: 1.39.7 shell mv over exFAT"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then
