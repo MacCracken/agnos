@@ -2,6 +2,13 @@
 # Load a static ELF64 binary from memory address into a new process.
 # Returns pid or -1 on error.
 
+# ELF header + program-header staging buffer (1.40.2 exec-from-disk). Module-
+# global → 512 u64 = 4096 bytes; holds the header + phdr table (read once) so
+# parsing survives the segment loop, which reuses vfs_scratch_buf for the data
+# chunks. A static binary's phdr table is tiny (phoff≈64 + phnum×56), so 4 KB
+# is ample; loads whose phdr table exceeds the first 4 KB are refused.
+var elf_hdr_buf[512];
+
 fn elf_load(elf_addr, elf_size) {
     var canary = stack_canary_secret;
     # Verify minimum ELF header size (64 bytes for ELF64)
@@ -112,6 +119,117 @@ fn elf_load(elf_addr, elf_size) {
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);
     }
+    stack_canary_check(canary);
+    return new_pid;
+}
+
+# Streaming ELF64 loader from a filesystem path (1.40.2 — exec-from-disk).
+# Same validation + page mapping as elf_load, but the image is NOT in memory:
+# the header+phdrs are read into elf_hdr_buf, and each PT_LOAD segment is
+# streamed from its file offset. Block I/O stays OFF the process address space
+# — each chunk is read under the KERNEL page tables into vfs_scratch_buf, then
+# memcpy'd into the mapped process pages under the process CR3 (chunked at the
+# 8 KB scratch size, so no large contiguous buffer is needed). ext2 only
+# (vfs_read_file_at is ext2-only; FAT/exFAT exec is a follow-on). Returns pid
+# or -1. CR3-switch idiom mirrors elf_load: assign the target to a var (lands
+# in rax) immediately before `asm { mov cr3, rax; }`.
+fn elf_load_from_file(path, namelen) {
+    var canary = stack_canary_secret;
+    var fsize = vfs_file_size(path, namelen);
+    if (fsize < 64) { return 0 - 1; }                 # too small for an ELF64 header
+    var hdr = &elf_hdr_buf;
+    var hcap = 4096;
+    if (fsize < hcap) { hcap = fsize; }
+    var hgot = vfs_read_file_at(path, namelen, 0, hdr, hcap);
+    if (hgot < 64) { return 0 - 1; }
+    # ELF magic + 64-bit class
+    if (load8(hdr) != 0x7F) { return 0 - 1; }
+    if (load8(hdr + 1) != 0x45) { return 0 - 1; }
+    if (load8(hdr + 2) != 0x4C) { return 0 - 1; }
+    if (load8(hdr + 3) != 0x46) { return 0 - 1; }
+    if (load8(hdr + 4) != 2) { return 0 - 1; }
+    var entry = load64(hdr + 24);
+    if (entry < 0x200000) { return 0 - 1; }
+    var phoff = load64(hdr + 32);
+    var phentsize = load16(hdr + 54);
+    var phnum = load16(hdr + 56);
+    if (phentsize < 56) { return 0 - 1; }
+    if (phnum > 64) { return 0 - 1; }
+    # The phdr table must lie within the bytes we staged into the 4 KB buffer.
+    if (phoff >= hgot) { return 0 - 1; }
+    if (phoff + phnum * phentsize > hgot) { return 0 - 1; }
+
+    var new_cr3 = proc_create_address_space();
+    if (new_cr3 == 0) { return 0 - 1; }
+
+    for (var phi = 0; phi < phnum; phi = phi + 1) {
+        var ph = hdr + phoff + phi * phentsize;
+        var p_type = load32(ph);
+        if (p_type == 1) {
+            var p_offset = load64(ph + 8);
+            var p_vaddr  = load64(ph + 16);
+            var p_filesz = load64(ph + 32);
+            var p_memsz  = load64(ph + 40);
+            # Same security bounds as elf_load, validated against the file size.
+            if (p_offset >= fsize) { return 0 - 1; }
+            if (p_filesz > fsize) { return 0 - 1; }
+            if (p_offset + p_filesz > fsize) { return 0 - 1; }
+            if (p_memsz < p_filesz) { return 0 - 1; }
+            if (p_vaddr + p_memsz < p_vaddr) { return 0 - 1; }
+            if (p_vaddr < 0x200000) { return 0 - 1; }
+            if (p_memsz > 0x2000000) { return 0 - 1; }
+
+            # Map + populate 2 MB pages WITHOUT a CR3 switch. Each page is
+            # pmm_alloc'd and identity-mapped in the kernel (vmm_map phys→phys),
+            # so we write the segment data straight into the physical page via
+            # its kernel address, then proc_map_page it into the process. The
+            # process later sees it at p_vaddr. This avoids switching CR3 into a
+            # half-built address space (the fragile part); file bytes are read
+            # directly into the physical page (no scratch, no copy step).
+            var page_start = p_vaddr & 0xFFFFFFFFFFE00000;
+            var page_end = (p_vaddr + p_memsz + 0x1FFFFF) & 0xFFFFFFFFFFE00000;
+            var seg_v1 = p_vaddr + p_filesz;          # end of file-backed data (vaddr)
+            var pg = page_start;
+            while (pg < page_end) {
+                var phys = pmm_alloc();
+                if (phys == 0) { return 0 - 1; }
+                if (vmm_is_mapped(phys) == 0) { vmm_map(phys, phys, 0x83); }
+                proc_map_page(new_cr3, pg, phys);
+                # Zero the whole page first (covers BSS + any slack), then copy
+                # the slice of file-backed data that lands in [pg, pg+2MB).
+                memset(phys, 0, 0x200000);
+                var lo = p_vaddr;  if (pg > lo) { lo = pg; }
+                var hi = seg_v1;   if (pg + 0x200000 < hi) { hi = pg + 0x200000; }
+                if (hi > lo) {
+                    var copy_len = hi - lo;
+                    var file_off = p_offset + (lo - p_vaddr);
+                    var phys_off = lo - pg;
+                    var done = 0;
+                    while (done < copy_len) {
+                        var chunk = copy_len - done;
+                        if (chunk > 65536) { chunk = 65536; }
+                        var rn = vfs_read_file_at(path, namelen, file_off + done, phys + phys_off + done, chunk);
+                        if (rn != chunk) { return 0 - 1; }
+                        done = done + chunk;
+                    }
+                }
+                pg = pg + 0x200000;
+            }
+        }
+    }
+
+    # User stack (identical to elf_load).
+    var pid = proc_count;
+    var stack_base = 0x800000 + pid * 0x400000;
+    var stack_phys = pmm_alloc();
+    if (stack_phys == 0) { return 0 - 1; }
+    if (vmm_is_mapped(stack_phys) == 0) { vmm_map(stack_phys, stack_phys, 0x83); }
+    proc_map_page(new_cr3, stack_base, stack_phys);
+    proc_unmap_page(new_cr3, stack_base - 0x200000);
+    var stack_top = stack_base + 0x4000;
+
+    var new_pid = proc_create_full(entry, stack_top);
+    if (new_pid >= 0) { proc_set_cr3(new_pid, new_cr3); }
     stack_canary_check(canary);
     return new_pid;
 }

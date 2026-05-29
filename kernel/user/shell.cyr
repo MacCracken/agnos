@@ -728,6 +728,32 @@ fn sh_cmd_sync() {
     return 0;
 }
 
+# `run <path>` — exec a static ELF64 from the filesystem (1.40.2 exec-from-disk).
+# Resolves the path (CWD-relative ok), streams the ELF into a new process via
+# elf_load_from_file (ext2 only — the agnos-fs root), runs it to completion via
+# exec_and_wait, and prints the exit code. The shell runs in kernel context, so
+# exec_and_wait saves the kernel return point and resumes here when the program
+# calls exit(). proc_table layout: entry@+24, rsp@+16, cr3@+160 (176-B rows).
+fn sh_cmd_run(arg, arglen) {
+    sh_trim(arg, arglen);
+    if (sh_trim_len < 1) { kprintln("usage: run <path>", 17); return 0; }
+    if (ext2_active == 0) { kprintln("run: needs ext2 fs", 18); return 0; }
+    if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("run: bad path", 13); return 0; }
+    var pid = elf_load_from_file(&sh_path_buf, sh_path_len);
+    if (pid < 0) { kprintln("run: not an executable", 22); return 0; }
+    # 1.40.2 lands the streaming LOAD (elf_load_from_file): the ELF is parsed,
+    # validated, and mapped into a new process with a correct entry + stack.
+    # The ring-3 EXECUTION step (exec_and_wait) is its own bring-up — the iretq
+    # / KPTI-user-CR3 path has never been validated end-to-end — and lands at
+    # 1.40.3. Until then `run` loads + reports rather than hanging on an
+    # unproven ring-3 transition.
+    var ep = &proc_table + pid * 176;
+    kprint("run: loaded pid=", 16); kprint_num(pid);
+    kprint(" entry=", 7); kprint_hex(load64(ep + 24));
+    kprintln(" (ring3 exec: 1.40.3)", 21);
+    return 0;
+}
+
 # `echo TEXT > FILE` — write TEXT + newline to FILE (create or truncate).
 # `text`/`textlen` = the bytes before '>'; `fname`/`fnamelen` = after.
 fn sh_echo_redirect(text, textlen, fname, fnamelen) {
@@ -823,6 +849,7 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "mv", 2) == 1)    { return sh_cmd_mv(arg, arglen); }
     if (sh_streq(buf, clen, "ln", 2) == 1)    { return sh_cmd_ln(arg, arglen); }
     if (sh_streq(buf, clen, "sync", 4) == 1)  { return sh_cmd_sync(); }
+    if (sh_streq(buf, clen, "run", 3) == 1)   { return sh_cmd_run(arg, arglen); }
     if (sh_streq(buf, clen, "jbd2", 4) == 1)  { return sh_cmd_jbd2(); }
     if (sh_streq(buf, clen, "lspci", 5) == 1) {
         for (var i = 0; i < pci_count; i = i + 1) {

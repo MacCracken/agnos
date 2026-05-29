@@ -175,6 +175,45 @@ fn vfs_read_file(path, namelen, dst, cap) {
     return 0 - 1;
 }
 
+# === Offset read + size (1.40.2 — exec-from-disk streaming load) ===
+# The streaming ELF loader reads the header into a scratch, then each PT_LOAD
+# segment from its file offset directly. That needs an *offset* read, which
+# only ext2 supports (ext2_read_at takes an offset); FAT/exFAT read from the
+# chain start only, so exec-from-FAT/exFAT is a follow-on (the agnos-fs root
+# is ext2, so this covers the real case). Both return -1 outside ext2.
+fn vfs_read_file_at(path, namelen, offset, dst, len) {
+    if (dst == 0)    { return 0 - 1; }
+    if (len <= 0)    { return 0 - 1; }
+    if (offset < 0)  { return 0 - 1; }
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (ext2_active != 0) {
+        var ino = ext2_path_lookup(path, namelen);
+        if (ino > 0) {
+            if (ext2_get_inode(ino, &ext2_inode_buf) == 0) {
+                if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0x8000) {
+                    return ext2_read_at(ino, offset, dst, len);
+                }
+            }
+        }
+    }
+    return 0 - 1;
+}
+
+fn vfs_file_size(path, namelen) {
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (ext2_active != 0) {
+        var ino = ext2_path_lookup(path, namelen);
+        if (ino > 0) {
+            if (ext2_get_inode(ino, &ext2_inode_buf) == 0) {
+                if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0x8000) {
+                    return ext2_inode_filesize(&ext2_inode_buf);
+                }
+            }
+        }
+    }
+    return 0 - 1;
+}
+
 # Ingress bound for the name arg of every secondary write/dir verb (bite 8
 # hardening). The dispatch is the generic seam these verbs funnel through, so
 # the name length is sanity-checked here rather than trusting each caller: a

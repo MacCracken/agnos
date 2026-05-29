@@ -165,6 +165,7 @@ else
         [ -n "$NET_VERBOSE" ]    && echo '#define NET_VERBOSE'
         [ -n "$EXT2_WRITE_SELFTEST" ] && echo '#define EXT2_WRITE_SELFTEST'
         [ -n "$EXT2_EXTENT_WRITE_SELFTEST" ] && echo '#define EXT2_EXTENT_WRITE_SELFTEST'
+        [ -n "$EXEC_SELFTEST" ]      && echo '#define EXEC_SELFTEST'
         [ -n "$FATFS_SELFTEST" ] && echo '#define FATFS_SELFTEST'
         [ -n "$FATFS_WRITE_SELFTEST" ] && echo '#define FATFS_WRITE_SELFTEST'
         [ -n "$EXFAT_SELFTEST" ] && echo '#define EXFAT_SELFTEST'

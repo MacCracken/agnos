@@ -1071,6 +1071,63 @@ ext2_write_selftest();
 sh_write_selftest();
 #endif
 
+# 1.40.2 — exec-from-disk self-test (compile-gated, EXEC_SELFTEST=1). Builds a
+# minimal static ELF64 (write(1,"EXEC-DISK-OK\n",13) then exit(42)) into the
+# scratch buffer, writes it to ext2 as /prog, then `run /prog` — exercising
+# elf_load_from_file (streaming load) + exec_and_wait end-to-end. Gated by
+# exec-smoke.sh on the "EXEC-DISK-OK" marker + "run: exit 42".
+#ifdef EXEC_SELFTEST
+if (ext2_active == 1) {
+    var eb = &vfs_scratch_buf;
+    var ez = 0;
+    while (ez < 256) { store8(eb + ez, 0); ez = ez + 1; }
+    # ELF64 header
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);      # class=64, LE, version
+    store8(eb + 16, 2);                                            # e_type = ET_EXEC
+    store8(eb + 18, 0x3E);                                         # e_machine = x86-64
+    store8(eb + 20, 1);                                            # e_version
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64);                                           # e_phoff = 64
+    store8(eb + 52, 64);                                           # e_ehsize
+    store8(eb + 54, 56);                                           # e_phentsize
+    store8(eb + 56, 1);                                            # e_phnum = 1
+    # Program header @64 (PT_LOAD, whole file at 0x400000)
+    store8(eb + 64, 1);                                            # p_type = PT_LOAD
+    store8(eb + 68, 5);                                            # p_flags = R+X
+    store8(eb + 82, 0x40);                                         # p_vaddr  = 0x400000
+    store8(eb + 90, 0x40);                                         # p_paddr  = 0x400000
+    store8(eb + 96, 182);                                          # p_filesz = 182
+    store8(eb + 104, 182);                                         # p_memsz  = 182
+    store8(eb + 113, 0x10);                                        # p_align  = 0x1000
+    # Code @120 (zeros between the 4 stored opcode bytes complete each imm32)
+    var c = 120;
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC0); store8(eb + c + 3, 0x01); c = c + 7;  # mov rax,1 (write)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC7); store8(eb + c + 3, 0x01); c = c + 7;  # mov rdi,1 (fd)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xBE); store8(eb + c + 2, 0xA9); store8(eb + c + 4, 0x40); c = c + 10; # movabs rsi,0x4000A9 (msg)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC2); store8(eb + c + 3, 0x0D); c = c + 7;  # mov rdx,13 (len)
+    store8(eb + c, 0x0F); store8(eb + c + 1, 0x05); c = c + 2;                                                     # syscall
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC0); store8(eb + c + 3, 0x00); c = c + 7;  # mov rax,0 (exit)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC7); store8(eb + c + 3, 0x2A); c = c + 7;  # mov rdi,42 (code)
+    store8(eb + c, 0x0F); store8(eb + c + 1, 0x05);                                                                # syscall
+    # Message @169: "EXEC-DISK-OK\n"
+    store8(eb + 169, 69); store8(eb + 170, 88); store8(eb + 171, 69); store8(eb + 172, 67);   # EXEC
+    store8(eb + 173, 45);                                                                      # -
+    store8(eb + 174, 68); store8(eb + 175, 73); store8(eb + 176, 83); store8(eb + 177, 75);   # DISK
+    store8(eb + 178, 45);                                                                      # -
+    store8(eb + 179, 79); store8(eb + 180, 75); store8(eb + 181, 10);                          # OK\n
+    var pino = ext2_create(2, "prog", 4);
+    if (pino > 0) {
+        ext2_write_at(pino, 0, eb, 182);
+        ext2_sync();
+        kprintln("exec: running /prog", 19);
+        sh_exec("run /prog", 9);
+    } else {
+        kprintln("exec: create /prog FAIL", 23);
+    }
+}
+#endif
+
 # 1.37.0 — ext4 extent-ALLOCATION self-test (compile-gated). Appends past EOF
 # of a seed EXTENTS_FL file to exercise ext2_extent_append_block. Gated by
 # scripts/ext-extent-smoke.sh (host e2fsck -fn clean + grow/byte verify).
