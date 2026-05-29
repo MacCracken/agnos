@@ -55,24 +55,36 @@ fn is_user_range(ptr, len) {
     return 1;
 }
 
-# Resume kernel execution after a user process exits.
-# Restores saved kernel RSP and jumps to saved RIP.
+# Resume kernel execution after a user process exits, by performing
+# exec_and_wait's epilogue: ret_rsp is exec_and_wait's OWN rbp, so
+# `mov rsp, ret_rsp; pop rbp; ret` restores the caller's rbp and returns into
+# the caller (sh_cmd_run) exactly as if exec_and_wait had returned normally —
+# letting the kernel/shell continue (run more programs) instead of halting on a
+# garbage rbp. (1.40.4 — the old version jmp'd without restoring rbp.)
 fn kernel_resume() {
-    var ret_rsp = kernel_return_rsp;   # [rbp - 0x08]
-    var ret_rip = kernel_return_rip;   # [rbp - 0x10]
     kernel_return_rsp = 0;
     kernel_return_rip = 0;
-    # Switch back to kernel segments (CS=0x08, SS=0x10)
-    # and restore kernel stack, then jump to return point
+    # Switch back to kernel data segments (SS/DS/ES = 0x10).
     asm {
         0x48; 0xC7; 0xC0; 0x10; 0x00; 0x00; 0x00;  # mov rax, 0x10
         0x8E; 0xD8;  # mov ds, ax
         0x8E; 0xC0;  # mov es, ax
-        0x8E; 0xD0;  # mov ss, ax (not needed since we're already ring 0 from syscall entry)
+        0x8E; 0xD0;  # mov ss, ax
     }
+    # Restore the full resume context exec_and_wait saved (callee-saved regs +
+    # caller rbp + return rsp/rip), then jmp — exec_and_wait "returns" exactly
+    # as a normal call. `var c = &exec_ctx` lands the address in rax; rdx scratch.
+    var c = &exec_ctx;
     asm {
-        0x48; 0x8B; 0x65; 0xF8;  # mov rsp, [rbp-0x08] (ret_rsp)
-        0xFF; 0x65; 0xF0;         # jmp [rbp-0x10] (ret_rip)
+        0x48; 0x8B; 0x18;        # mov rbx, [rax]
+        0x4C; 0x8B; 0x60; 0x08;  # mov r12, [rax+8]
+        0x4C; 0x8B; 0x68; 0x10;  # mov r13, [rax+16]
+        0x4C; 0x8B; 0x70; 0x18;  # mov r14, [rax+24]
+        0x4C; 0x8B; 0x78; 0x20;  # mov r15, [rax+32]
+        0x48; 0x8B; 0x68; 0x28;  # mov rbp, [rax+40]   (caller rbp)
+        0x48; 0x8B; 0x50; 0x38;  # mov rdx, [rax+56]   (return rip)
+        0x48; 0x8B; 0x60; 0x30;  # mov rsp, [rax+48]   (caller post-call rsp)
+        0xFF; 0xE2;              # jmp rdx
     }
     return 0;
 }

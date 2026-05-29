@@ -94,21 +94,35 @@ echo ""
 # executed in ring 3 and its write(1,…) reached the console; "run: exit 42"
 # proves exec_and_wait resumed the kernel with the program's exit code.
 rc=0
-if strings "$LOG" | grep -q "^EXEC-DISK-OK"; then
-    echo "  PASS: /prog ran in ring 3 from disk — write(1) reached the console"
+# 1.40.4: ENOEXEC — the non-ELF /notelf is refused cleanly (no crash; the boot
+# proceeds to the subdir run after it).
+if strings "$LOG" | grep -q "^run: not an executable"; then
+    echo "  PASS: ENOEXEC — non-ELF /notelf refused cleanly"
 else
-    echo "  FAIL: no 'EXEC-DISK-OK' (program did not run in ring 3)"; rc=1
+    echo "  FAIL: no 'run: not an executable' for /notelf (ENOEXEC path)"; rc=1
+fi
+# Subdir program path — /bin/prog2 is loaded from a subdirectory (proves
+# sh_abspath + ext2_path_lookup), run in ring 3 (EXEC-DISK-OK), and exits 42.
+if strings "$LOG" | grep -q "^exec: running /bin/prog2"; then
+    echo "  PASS: subdir program /bin/prog2 dispatched (path resolution)"
+else
+    echo "  FAIL: /bin/prog2 not attempted"; rc=1
+fi
+if strings "$LOG" | grep -q "^EXEC-DISK-OK"; then
+    echo "  PASS: /bin/prog2 ran in ring 3 from a subdir — write(1) reached the console"
+else
+    echo "  FAIL: no 'EXEC-DISK-OK' (subdir program did not run in ring 3)"; rc=1
 fi
 if strings "$LOG" | grep -q "^run: exit 42"; then
-    echo "  PASS: exec_and_wait resumed kernel + captured exit code 42"
+    echo "  PASS: exec_and_wait captured exit code 42 (subdir program)"
 else
     echo "  FAIL: no 'run: exit 42' (ring-3 exit / exit-code path)"; rc=1
 fi
 
-# Post-boot fsck: the /prog write must leave the FS clean.
+# Post-boot fsck: the writes (/bin/prog2 + /notelf) must leave the FS clean.
 dd if="$IMG" bs=1M skip=33 count=67 of="$WORK/part-post.img" status=none
 if e2fsck -fn "$WORK/part-post.img" > "$LOGS/fsck.log" 2>&1; then
-    echo "  PASS: e2fsck -fn clean after /prog write"
+    echo "  PASS: e2fsck -fn clean after the writes"
 else
     echo "  FAIL: e2fsck flagged the post-boot image (see $LOGS/fsck.log)"; rc=1
 fi

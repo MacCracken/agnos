@@ -5,35 +5,44 @@ var exec_entry_g = 0;
 var exec_rsp_g = 0;
 var exec_cr3_g = 0;
 
+# 1.40.4: full kernel resume context (setjmp/longjmp). Saved by exec_and_wait
+# before entering ring 3; restored by kernel_resume when the program exits, so
+# exec_and_wait "returns" exactly as a normal call — including the callee-saved
+# registers (rbx/r12-r15) the ring-3 program clobbers. Layout (u64):
+#   [0]=rbx [1]=r12 [2]=r13 [3]=r14 [4]=r15 [5]=caller rbp [6]=return rsp [7]=return rip
+var exec_ctx[8];
+
 # Execute a user process and wait for it to exit.
 # Saves kernel return context so exit syscall returns here.
 fn exec_and_wait(entry, rsp, cr3) {
-    # Save params to globals (avoid param clobber in asm)
+    # 1.40.4: FIRST thing — snapshot the full kernel resume context into exec_ctx
+    # (callee-saved regs still hold the CALLER's values here; the body below may
+    # clobber them). kernel_resume restores these on the program's exit() so the
+    # caller (sh_cmd_run / the shell) continues cleanly and can run more programs.
+    # `var ctxp = &exec_ctx` lands the array address in rax (the proven idiom);
+    # rdx is a scratch temp. [rbp]=caller rbp, [rbp+8]=return addr, [rbp+16]=
+    # caller's post-call rsp.
+    var ctxp = &exec_ctx;
+    asm {
+        0x48; 0x89; 0x18;             # mov [rax], rbx
+        0x4C; 0x89; 0x60; 0x08;       # mov [rax+8], r12
+        0x4C; 0x89; 0x68; 0x10;       # mov [rax+16], r13
+        0x4C; 0x89; 0x70; 0x18;       # mov [rax+24], r14
+        0x4C; 0x89; 0x78; 0x20;       # mov [rax+32], r15
+        0x48; 0x8B; 0x55; 0x00;       # mov rdx, [rbp]      (caller rbp)
+        0x48; 0x89; 0x50; 0x28;       # mov [rax+40], rdx
+        0x48; 0x8D; 0x55; 0x10;       # lea rdx, [rbp+16]   (caller post-call rsp)
+        0x48; 0x89; 0x50; 0x30;       # mov [rax+48], rdx
+        0x48; 0x8B; 0x55; 0x08;       # mov rdx, [rbp+8]    (return addr)
+        0x48; 0x89; 0x50; 0x38;       # mov [rax+56], rdx
+    }
+    kernel_return_rsp = 1;   # nonzero = "a kernel resume context is armed" (ksyscall exit checks this)
+    kernel_return_rip = 0;
+
+    # Pass params to enter_ring3 via globals (avoid param clobber in asm).
     exec_entry_g = entry;
     exec_rsp_g = rsp;
     exec_cr3_g = cr3;
-
-    # Save return context: kernel_resume will restore rbp and jump to return addr
-    # We read [rbp+8] = return address and save rbp as the stack to restore.
-    # But we can't use asm [rbp+N] safely with params. Instead, use a nested
-    # function with no params to capture the frame.
-    # Actually — we just need kernel_return_rsp and kernel_return_rip set.
-    # kernel_resume does: mov rsp, [rbp-0x08]; jmp [rbp-0x10]
-    # So it restores a saved rbp as rsp and jumps to a saved rip.
-    # We want it to "return" from exec_and_wait normally.
-    # The trick: save the CALLER's rbp and return address.
-    # In exec_and_wait(entry, rsp, cr3): params at rbp-0x08, -0x10, -0x18
-    # Then new locals start at rbp-0x20.
-    var save_rbp = 0;     # [rbp-0x20]
-    var save_retaddr = 0; # [rbp-0x28]
-    asm {
-        0x48; 0x8B; 0x45; 0x00;   # mov rax, [rbp] (saved caller rbp)
-        0x48; 0x89; 0x45; 0xE0;   # mov [rbp-0x20], rax
-        0x48; 0x8B; 0x45; 0x08;   # mov rax, [rbp+0x08] (return address)
-        0x48; 0x89; 0x45; 0xD8;   # mov [rbp-0x28], rax
-    }
-    kernel_return_rsp = save_rbp;
-    kernel_return_rip = save_retaddr;
 
     # 1.40.3: re-run syscall_init right before ring 3. Ring 3 had never executed,
     # so the SYSCALL MSRs (STAR / LSTAR / SFMASK / EFER.SCE) set at boot were

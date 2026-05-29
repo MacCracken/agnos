@@ -137,6 +137,7 @@ fn elf_load_from_file(path, namelen) {
     var canary = stack_canary_secret;
     var fsize = vfs_file_size(path, namelen);
     if (fsize < 64) { return 0 - 1; }                 # too small for an ELF64 header
+    if (fsize > 0x1000000) { return 0 - 1; }          # E2BIG — cap binaries at 16 MB (1.40.4)
     var hdr = &elf_hdr_buf;
     var hcap = 4096;
     if (fsize < hcap) { hcap = fsize; }

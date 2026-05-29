@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.4] — 2026-05-29 (**Exec-from-disk — bite 4: subdir/CWD program paths + ENOEXEC/E2BIG bounds.** `run` resolves a program by a subdirectory or CWD-relative path and refuses non-ELF / oversized files cleanly. The exec-smoke now loads + runs a program from `/bin/prog2` (a subdirectory) and refuses a non-ELF `/notelf`.)
+
+### Added / Changed
+
+- **Subdir + CWD program paths** — `sh_cmd_run` already routes through `sh_abspath` (CWD-relative → absolute) + `ext2_path_lookup` (multi-component), so a program in a subdirectory (`run /bin/prog2`, or relative from the CWD) resolves and runs. Validated end-to-end (load + ring-3 run + exit code) from `/bin/prog2`.
+- **E2BIG** — `elf_load_from_file` rejects files larger than 16 MB (`fsize > 0x1000000`) in addition to the existing `< 64`-byte floor; oversized images return -1 (`run: not an executable`).
+- **ENOEXEC** — a non-ELF file (no `0x7F 'E' 'L' 'F'` magic / 64-bit class) is already rejected by `elf_load_from_file`; verified `/notelf` is refused cleanly with no crash.
+
+### Validation
+
+- `exec-smoke.sh` restructured + PASS: ENOEXEC (`/notelf` refused) → subdir program `/bin/prog2` loaded from a subdirectory, run in ring 3 (`EXEC-DISK-OK`), exit 42 captured; `e2fsck -fn` clean. `check.sh` 11/11, `test.sh` 4/4; ext2-write regression green. Production build **1,033,304 B → 1,033,448 B**.
+
+### Known follow-ons
+
+- **Multi-run continuation**: `exec_and_wait` returns into the kernel *main-body inline* frame imperfectly, so the boot selftest runs the real exec last (a second sequential exec from the inline body won't continue). The real shell loop is a normal frame; a clean multi-run/shell-loop validation + the **~17 % intermittent exec flake** (host-load / `pmm_alloc_2mb` timing) are hardening items for a later bite.
+- Deferred (unchanged): argv/env, preemptive ring 3 (interrupt-path KPTI), Meltdown-grade KPTI, FAT/exFAT exec.
+
+
 ## [1.40.3] — 2026-05-29 (**Exec-from-disk — bite 3: ring-3 execution (the RUN half) — WORKING.** `run /prog` now loads a static ELF64 off ext2, executes it in ring 3, and returns its exit code: the exec-smoke's hand-built program prints `EXEC-DISK-OK` (its `write(1,…)` reaches the console) and the shell reports `run: exit 42`. This brought up the entire ring-3 + SYSCALL path, which had never executed (the KTEST always bypassed it) — ten distinct first-run bugs, below. Run-to-completion / single-threaded model: the program runs with interrupts masked (preemptive ring 3 is a later arc).)
 
 ### Fixed — ring-3 + SYSCALL bring-up (`ring3.cyr`, `syscall_hw.cyr`, `proc.cyr`, `elf.cyr`, `vfs.cyr`)

@@ -1123,15 +1123,32 @@ if (ext2_active == 1) {
     store8(eb + 174, 68); store8(eb + 175, 73); store8(eb + 176, 83); store8(eb + 177, 75);   # DISK
     store8(eb + 178, 45);                                                                      # -
     store8(eb + 179, 79); store8(eb + 180, 75); store8(eb + 181, 10);                          # OK\n
-    var pino = ext2_create(2, "prog", 4);
-    if (pino > 0) {
-        ext2_write_at(pino, 0, eb, 182);
-        ext2_sync();
-        kprintln("exec: running /prog", 19);
-        sh_exec("run /prog", 9);
-    } else {
-        kprintln("exec: create /prog FAIL", 23);
-    }
+    # 1.40.4: write the ELF to a SUBDIRECTORY (/bin/prog2) + a non-ELF (/notelf).
+    # The selftest runs the non-exec'ing case (ENOEXEC) FIRST, then the real
+    # ring-3 exec LAST — exec_and_wait does not cleanly return into the kernel
+    # *main-body* inline frame, so a second real exec after it won't run here
+    # (multi-run / shell-loop continuation is a follow-on; the real shell loop is
+    # a proper frame). Ordering this way validates ENOEXEC + subdir + exec all in
+    # one boot.
+    ext2_mkdir(2, "bin", 3);
+    var bino = ext2_path_lookup("/bin", 4);
+    var p2 = 0;
+    if (bino > 0) { p2 = ext2_create(bino, "prog2", 5); }
+    if (p2 > 0) { ext2_write_at(p2, 0, eb, 182); }
+    # non-ELF: 100 bytes from eb+100 (inside the ELF/zero region; byte0 != 0x7F).
+    var nino = ext2_create(2, "notelf", 6);
+    if (nino > 0) { ext2_write_at(nino, 0, eb + 100, 100); }
+    ext2_sync();
+
+    # ENOEXEC first — elf_load_from_file rejects the non-ELF, sh_cmd_run prints
+    # "run: not an executable" and returns normally (no exec_and_wait).
+    kprintln("exec: running /notelf", 21);
+    sh_exec("run /notelf", 11);
+
+    # Subdir exec LAST — proves sh_abspath + ext2_path_lookup resolve a program
+    # in a subdirectory, loaded + run in ring 3 → EXEC-DISK-OK + run: exit 42.
+    kprintln("exec: running /bin/prog2", 24);
+    sh_exec("run /bin/prog2", 14);
 }
 #endif
 
