@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.1] — 2026-05-29 (**Exec-from-disk — bite 1: `vfs_read_file` (whole-file read past the 4 KB cap).** The one genuinely new primitive the exec load path needs: read an *entire* file from a VFS path into a caller buffer, resolving whichever filesystem backs it. `cat`/`vfs_open_secondary` wrap a file as a ≤ 4 KB `VFS_MEMFILE`, but an ELF is far larger — the readers themselves (`fatfs_read`/`exfat_read`/`ext2_read_at`) were never 4 KB-capped, only the `*_open` memfile wrappers were. No code change to the load/run path yet — that's 1.40.2.)
+
+### Added — `vfs_read_file` (`vfs.cyr`)
+
+- **`vfs_read_file(path, namelen, dst, cap)`** — reads a whole file into `dst` (up to `cap`), returning bytes read or -1. ext2 is path→inode (regular-file only, via `ext2_path_lookup` + `ext2_read_at`); FAT/exFAT go through the 1.39.x resolver (`fatfs_resolve_parent`/`exfat_resolve_parent` + the `*_in_dir` finders) + a full cluster-chain read. Precedence mirrors `cat`: ext2 first when mounted, else the selected secondary FS. Reuses the `vfs_sec_name_ok` (1..255) ingress bound. initrd intentionally not covered (its programs already exec from memory).
+- **`vfs_scratch_buf`** (`vfs.cyr`, module-global, 8 KB) — a staging buffer larger than one page. `kmalloc` and `pmm_alloc` both cap at a single 4 KB page, so a >4 KB staging area must be a reserved region, not an allocator call (see below).
+
+### Findings (shape 1.40.2)
+
+- **No large-contiguous allocator.** `kmalloc`/`pmm_alloc` both top out at one 4 KB page — so the exec load buffer cannot be `kmalloc`'d (the prior-art doc's original plan). The 1.40.2 load path will instead stream segments from disk and/or use a reserved window; design decision re-opened in [`exec-from-disk-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/exec-from-disk-prior-art.md) §3.
+- **`var X[N]` in the kernel main body is function-local-sized** (N bytes; the main body runs as a PARSE_PROG function context), not the `N×8` module-global form — a true module-global (top-level in an included file, like `vfs_table`) is required for a large fixed buffer. Memory: [[cyrius-var-array-u64-units]].
+
+### Validation
+
+- New whole-file-read selftest in both write selftests: write a 6000-byte pattern file, clear the staging buffer, `vfs_read_file` it back, verify length + bytes at offset 5000/5999 (**past the old 4 KB cap**). `fat-write-smoke` + `exfat-write-smoke` each +1 gate, both **PASS**.
+- No regression: `check.sh` 11/11, `test.sh` 4/4, FAT/exFAT read smokes + ext2-write regression all green. Production build **1,014,528 B → 1,024,256 B** (+9,728 B: `vfs_read_file` + the 8 KB `vfs_scratch_buf`).
+
+
 ## [1.40.0] — 2026-05-28 (**Exec-from-disk arc — cycle open.** The second base-maturity exit leg: base = FS-crash-safe (done, 1.37–1.39) **+ exec-from-disk** (this arc). Today programs come only from the in-memory initrd; 1.40.x makes the kernel **read an ELF from a VFS path, load it, run it, and collect its exit code** — using the writable + path-addressable filesystem the 1.39.x VFS lift earned. `elf_load` (a hardened static ELF64 *buffer* loader) + the process/scheduler plumbing (`proc`/`sched`/`spawn`/`waitpid`) already exist; the single gap is **disk → contiguous buffer** (the 4 KB memfile cap blocks real binaries) + a shell `run` verb. Lean cycle-open: version + arc plan, no kernel code yet. **1.41.x remains shell→agnoshi** (kernel-slimming); the combined VFS+exec iron burn lands at the end of 1.40.x.)
 
 ### Added
