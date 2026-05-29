@@ -164,6 +164,12 @@ strings "$LOG" | grep -q "^exfatw: shell touch find-back OK" \
 strings "$LOG" | grep -q "^exfatw: shell echo round-trip OK" \
     && echo "  PASS: 1.39.3 shell 'echo >' wrote content on exFAT (vfs_write_secondary)" \
     || { echo "  FAIL: 1.39.3 shell echo> over exFAT"; rc=1; }
+# 1.39.4 VFS-lift bite 4: shell `rm` over exFAT (vfs_delete_secondary ->
+# exfat_delete). In-kernel find after rm must miss; fsck.exfat -n (below)
+# confirms the dir-set + clusters were freed cleanly.
+strings "$LOG" | grep -q "^exfatw: shell rm gone OK" \
+    && echo "  PASS: 1.39.4 shell 'rm' removed file on exFAT (vfs_delete_secondary)" \
+    || { echo "  FAIL: 1.39.4 shell rm over exFAT (target still present)"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

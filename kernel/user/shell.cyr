@@ -508,7 +508,14 @@ fn sh_cmd_touch(arg, arglen) {
 }
 
 fn sh_cmd_rm(arg, arglen) {
-    if (ext2_active == 0) { kprintln("rm: no fs", 9); return 0; }
+    if (ext2_active == 0) {
+        # Single-primary fallthrough (1.39.4): no ext2 -> delete a bare-named
+        # file in the FAT/exFAT root via vfs_delete_secondary. Root-only.
+        sh_trim(arg, arglen);
+        if (sh_trim_len < 1) { kprintln("usage: rm <file>", 16); return 0; }
+        if (vfs_delete_secondary(arg + sh_trim_off, sh_trim_len) == 0) { return 0; }
+        kprintln("rm: no fs", 9); return 0;
+    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: rm <file>", 16); return 0; }
     if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("rm: bad path", 12); return 0; }

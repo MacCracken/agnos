@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.39.4] — 2026-05-28 (**VFS generic-write lift — bite 4: `rm` removes FAT/exFAT files.** The shell `rm` verb now deletes files on a FAT/exFAT primary via generic dispatch. Scope note: FAT/exFAT have `delete` but **no directory-create** (`mkdir`/`rmdir` don't exist in either backend), so this bite ships `rm` only; `mkdir`/`rmdir` over FAT/exFAT need a new dir-create implementation and are split into a follow-on bite. Single-primary-FS, root-level, non-ESP-preferring.)
+
+### Added
+
+- **`vfs_delete_secondary(name, namelen)`** (`kernel/core/vfs.cyr`) — generic delete dispatch over `fatfs_delete` / `exfat_delete`, same non-ESP-preferring selection as create/write. Returns 0 on success, -1 on miss-or-failure.
+
+### Changed
+
+- **`sh_cmd_rm`** — ext2-absent branch deletes a bare-named file in the FAT/exFAT root via `vfs_delete_secondary` (was `rm: no fs`). Isolated to the `ext2_active == 0` branch; ext2 path untouched.
+
+### Validation
+
+- `fat-write-smoke.sh`: kernel runs `touch SHRMTGT.TXT` then `rm SHRMTGT.TXT`; the target is **absent on disk** (`mdir`) and **`fsck.fat -n` clean** (chain/dirent freed, no leak) → **PASS**.
+- `exfat-write-smoke.sh`: same; in-kernel `exfat_find` misses after `rm` (`exfatw: shell rm gone OK`) + **`fsck.exfat -n` clean** → **PASS**.
+- No regression: bite 1–3 gates (`cat`/`ls`/`touch`/`echo >`) still green; ext2 path untouched. `check.sh` 11/11, `test.sh` 4/4. Production build **998,312 B**, multiboot2 OK.
+
+### Not yet (next bites)
+
+- **`mkdir`/`rmdir` over FAT/exFAT** (1.39.5) — requires implementing directory-create in both backends (allocate a dir cluster, init `.`/`..`, add the parent dirent / dir-set with the directory flag). The verbs stay ext2-only until then.
+- `mv` (rename) + `sync` dispatch (1.39.6); mount-registry consolidation + arc-close hardening + iron burn (1.39.7).
+
 ## [1.39.3] — 2026-05-28 (**VFS generic-write lift — bite 3: `touch` + `echo >` write to FAT/exFAT.** The write side. The shell's create/write verbs were ext2-only; they now create + write files on a FAT/exFAT primary, completing read+write reach for the secondary filesystems. The FAT/exFAT write code (1.34.x) was `fsck`-clean but unreachable from the shell until now. Single-primary-FS, root-level; the dispatch prefers the non-ESP (real data) FS when multiple mount.)
 
 ### Added

@@ -115,6 +115,19 @@ fn vfs_write_secondary(name, namelen, src, len) {
     return 0 - 1;
 }
 
+# Generic delete dispatch for the non-ext2 primary (1.39.4 — VFS lift bite 4,
+# `rm`). Same non-ESP-preferring selection as create/write. Returns 0 on
+# success, -1 on miss-or-failure. (FAT/exFAT directory create/remove —
+# mkdir/rmdir — are not yet implemented in either backend, so those verbs
+# stay ext2-only until a dir-create bite adds them.)
+fn vfs_delete_secondary(name, namelen) {
+    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_delete(name, namelen); }
+    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_delete(name, namelen); }
+    if (fatfs_active != 0) { return fatfs_delete(name, namelen); }
+    if (exfat_active != 0) { return exfat_delete(name, namelen); }
+    return 0 - 1;
+}
+
 fn vfs_read_signalfd(base, buf) {
     var sigmask = load64(base + 24);
     var pending = load64(&proc_signals + proc_current * 8);

@@ -650,6 +650,11 @@ if (fatfs_active == 1) {
     kprintln("vfsw: shell touch+echo over FAT ->", 34);
     sh_exec("touch SHTOUCH.TXT", 17);
     sh_exec("echo SHELL-FAT-WROTE > SHECHO.TXT", 33);
+    # 1.39.4 VFS-lift bite 4: shell `rm` over FAT (sh_cmd_rm ->
+    # vfs_delete_secondary -> fatfs_delete). Dedicated target so the bite-3
+    # SHTOUCH/SHECHO gates stay valid; fat-write-smoke.sh checks it's gone.
+    sh_exec("touch SHRMTGT.TXT", 17);
+    sh_exec("rm SHRMTGT.TXT", 14);
 }
 #endif
 
@@ -937,6 +942,14 @@ if (exfat_active == 1) {
         if (she_ok == 1) { kprintln("exfatw: shell echo round-trip OK", 32); }
         else { kprintln("exfatw: shell echo round-trip FAIL", 34); }
     } else { kprintln("exfatw: shell echo find-back FAIL", 33); }
+    # 1.39.4 VFS-lift bite 4: shell `rm` over exFAT (sh_cmd_rm ->
+    # vfs_delete_secondary -> exfat_delete). Create a dedicated target, rm it,
+    # confirm in-kernel it's gone; exfat-write-smoke.sh also fsck-checks.
+    sh_exec("touch SHRMTGT.TXT", 17);
+    sh_exec("rm SHRMTGT.TXT", 14);
+    var shrm_res[24];
+    if (exfat_find("SHRMTGT.TXT", 11, &shrm_res) == 1) { kprintln("exfatw: shell rm still-present FAIL", 35); }
+    else { kprintln("exfatw: shell rm gone OK", 24); }
 }
 #endif
 

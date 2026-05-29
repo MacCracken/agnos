@@ -291,6 +291,15 @@ if grep -q "SHELL-FAT-WROTE" "$WORK/shecho.txt" 2>/dev/null; then
 else
     echo "  FAIL: shell echo> over FAT (SHECHO.TXT content missing 'SHELL-FAT-WROTE')"; rc=1
 fi
+# 1.39.4 VFS-lift bite 4: shell `rm` over FAT. The kernel ran
+# `touch SHRMTGT.TXT` then `rm SHRMTGT.TXT` (vfs_delete_secondary ->
+# fatfs_delete). The target must be ABSENT on disk (+ fsck-clean above
+# proves the chain/dirent were freed with no leak).
+if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "SHRMTGT"; then
+    echo "  FAIL: shell rm over FAT (SHRMTGT.TXT still present)"; rc=1
+else
+    echo "  PASS: shell 'rm' removed SHRMTGT.TXT on FAT (vfs_delete_secondary)"
+fi
 
 echo ""
 echo "=========================================="
