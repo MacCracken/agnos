@@ -20,18 +20,24 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3) {
     return result;
 }
 
-fn syscall_init() {
-    # 1.40.3: allocate the SYSCALL kernel stack once (a fresh 2 MB region; RSP
-    # set near its top, grows down). Replaces the hardcoded 0x1F0000 that now
-    # overlaps the kernel image. Mapped identity (within 0-1 GB the per-process
-    # CR3 mirrors), writable.
-    if (syscall_kstack_top == 0) {
-        var ks = pmm_alloc_2mb();
-        if (ks != 0) {
-            if (vmm_is_mapped(ks) == 0) { vmm_map(ks, ks, 0x83); }
-            syscall_kstack_top = ks + 0x1F0000;   # near the top of the 2 MB region
-        }
+# 1.40.5: reserve the SYSCALL kernel stack (a fresh 2 MB region; RSP set near
+# its top, grows down). Call EARLY in boot (right after heap_init) so the first
+# pmm_alloc_2mb pins it to phys 0x200000 → identity VA 0x3F0000, BELOW the user
+# code/stack VAs (0x400000+); a late alloc could land at 0x400000 and collide
+# with the user-code page (the ~17% exec flake). Mapped identity (within the
+# 0-1 GB the per-process CR3 mirrors), writable. Idempotent.
+fn syscall_kstack_reserve() {
+    if (syscall_kstack_top != 0) { return 0; }
+    var ks = pmm_alloc_2mb();
+    if (ks != 0) {
+        if (vmm_is_mapped(ks) == 0) { vmm_map(ks, ks, 0x83); }
+        syscall_kstack_top = ks + 0x1F0000;   # near the top of the 2 MB region
     }
+    return 0;
+}
+
+fn syscall_init() {
+    syscall_kstack_reserve();   # no-op if already reserved early in boot
 
     # Program the MSRs for SYSCALL/SYSRET.
     # MSR 0xC0000081 (STAR): segment selectors

@@ -158,6 +158,14 @@ kprintln(" (expect 57005)", 15);
 heap_init();
 kprintln("Heap initialized", 16);
 
+# 1.40.5: reserve the SYSCALL kernel stack NOW — the first pmm_alloc_2mb, before
+# the heap grows (net/fs init) and fragments the low region. This pins it to
+# phys 0x200000 → identity VA 0x3F0000, safely BELOW the user code/stack VAs
+# (0x400000+). Allocating it late sometimes landed it at 0x400000, whose VA
+# overlaps the user-code page → the ~17% exec flake. syscall_init() later sees
+# syscall_kstack_top != 0 and keeps it.
+syscall_kstack_reserve();
+
 # === CMOS kernel checkpoint 10 (heap up — kmalloc usable) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0A; 0xE6; 0x71; }
 
@@ -1077,13 +1085,12 @@ sh_write_selftest();
 # elf_load_from_file (streaming load) + exec_and_wait end-to-end. Gated by
 # exec-smoke.sh on the "EXEC-DISK-OK" marker + "run: exit 42".
 #ifdef EXEC_SELFTEST
-if (ext2_active == 1) {
-    # 1.40.3: initialize SYSCALL/SYSRET + allocate the syscall kernel stack NOW,
-    # before the user process exists. pmm_alloc_2mb then returns a low region
-    # (~0x200000, below the user code/stack VAs 0x400000/0x800000), so the kernel
-    # stack's identity VA can't collide with a user mapping. (Boot's syscall_init
-    # at ~line 1154 runs after this selftest, so without this the stack would be
-    # allocated late, inside the user VA window.)
+# 1.40.5: the exec selftest is a real FUNCTION (not inline main-body code), so
+# exec_and_wait returns into a normal stack frame and multiple sequential runs
+# work — the same shape as the real shell loop. (Inline main-body return was the
+# 1.40.4 multi-run limitation.)
+fn exec_disk_selftest() {
+    if (ext2_active == 0) { return 0; }
     syscall_init();
     var eb = &vfs_scratch_buf;
     var ez = 0;
@@ -1123,13 +1130,7 @@ if (ext2_active == 1) {
     store8(eb + 174, 68); store8(eb + 175, 73); store8(eb + 176, 83); store8(eb + 177, 75);   # DISK
     store8(eb + 178, 45);                                                                      # -
     store8(eb + 179, 79); store8(eb + 180, 75); store8(eb + 181, 10);                          # OK\n
-    # 1.40.4: write the ELF to a SUBDIRECTORY (/bin/prog2) + a non-ELF (/notelf).
-    # The selftest runs the non-exec'ing case (ENOEXEC) FIRST, then the real
-    # ring-3 exec LAST — exec_and_wait does not cleanly return into the kernel
-    # *main-body* inline frame, so a second real exec after it won't run here
-    # (multi-run / shell-loop continuation is a follow-on; the real shell loop is
-    # a proper frame). Ordering this way validates ENOEXEC + subdir + exec all in
-    # one boot.
+    # Write the ELF to a SUBDIRECTORY (/bin/prog2) + a non-ELF (/notelf).
     ext2_mkdir(2, "bin", 3);
     var bino = ext2_path_lookup("/bin", 4);
     var p2 = 0;
@@ -1140,16 +1141,22 @@ if (ext2_active == 1) {
     if (nino > 0) { ext2_write_at(nino, 0, eb + 100, 100); }
     ext2_sync();
 
-    # ENOEXEC first — elf_load_from_file rejects the non-ELF, sh_cmd_run prints
+    # ENOEXEC — elf_load_from_file rejects the non-ELF; sh_cmd_run prints
     # "run: not an executable" and returns normally (no exec_and_wait).
     kprintln("exec: running /notelf", 21);
     sh_exec("run /notelf", 11);
 
-    # Subdir exec LAST — proves sh_abspath + ext2_path_lookup resolve a program
-    # in a subdirectory, loaded + run in ring 3 → EXEC-DISK-OK + run: exit 42.
+    # Subdir exec — load + run /bin/prog2 from a subdirectory in ring 3
+    # (EXEC-DISK-OK + run: exit 42). The "selftest done" line AFTER it proves
+    # exec_and_wait returned cleanly into this function frame (return-and-
+    # continue — the 1.40.5 multi-run fix). A *second* sequential real exec has
+    # a remaining per-process (pid reuse) issue → follow-on.
     kprintln("exec: running /bin/prog2", 24);
     sh_exec("run /bin/prog2", 14);
+    kprintln("exec: selftest done", 19);
+    return 0;
 }
+exec_disk_selftest();
 #endif
 
 # 1.37.0 — ext4 extent-ALLOCATION self-test (compile-gated). Appends past EOF

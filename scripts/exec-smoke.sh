@@ -118,6 +118,14 @@ if strings "$LOG" | grep -q "^run: exit 42"; then
 else
     echo "  FAIL: no 'run: exit 42' (ring-3 exit / exit-code path)"; rc=1
 fi
+# 1.40.5: clean return-and-continue — the selftest FUNCTION prints "selftest
+# done" AFTER the run, proving exec_and_wait returned into its caller frame (the
+# real shell loop shape) instead of halting (the 1.40.4 inline-body limitation).
+if strings "$LOG" | grep -q "^exec: selftest done"; then
+    echo "  PASS: exec_and_wait returned cleanly — caller continued ('selftest done')"
+else
+    echo "  FAIL: no 'exec: selftest done' (exec_and_wait did not return cleanly)"; rc=1
+fi
 
 # Post-boot fsck: the writes (/bin/prog2 + /notelf) must leave the FS clean.
 dd if="$IMG" bs=1M skip=33 count=67 of="$WORK/part-post.img" status=none

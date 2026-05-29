@@ -5,6 +5,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.5] — 2026-05-29 (**Exec-from-disk — bite 5 (arc close): hardening + clean multi-run + automated arc sweep + manual iron plan.** Fixes the two 1.40.4 follow-ons (clean exec_and_wait return; the kstack-collision flake), adds a one-command sweep of the last two arcs, and writes the on-iron manual checklist. The 1.40.x exec arc + the 1.39.x VFS arc are now ready for the combined iron burn.)
+
+### Fixed
+
+- **Clean return-and-continue from `exec_and_wait`** — replaced the partial frame-restore with a full setjmp/longjmp: `exec_and_wait` snapshots callee-saved regs (rbx/r12-r15) + the caller's rbp + return rsp/rip into `exec_ctx`; `kernel_resume` restores them all on the program's `exit()`. The ring-3 program clobbers callee-saved regs, so the old path resumed the kernel with garbage and halted after one run. Now the caller continues (a program runs, control returns to the shell-loop frame) — proven: the exec selftest is a real function that runs `/bin/prog2` then prints `exec: selftest done`.
+- **Exec flake (kstack VA collision)** — the SYSCALL kernel stack was `pmm_alloc_2mb`'d late, so the heap (net/fs boot growth) had fragmented the low region and the stack sometimes landed at phys `0x400000`, whose identity VA overlaps the user-code page → ~17 % intermittent triple-fault. Now **reserved right after `heap_init`** (`syscall_kstack_reserve`, the first `pmm_alloc_2mb`) → pinned to phys `0x200000` / VA `0x3F0000`, safely below user VAs. Smoke now ~consistently green (residual rare host-load QEMU timing only; not on iron).
+
+### Added
+
+- **`scripts/sweep.sh`** — rebuilds + runs every QEMU self-test smoke for the two latest arcs in one command: baseline `check.sh` (build/test/version/size), 1.39.x FAT/exFAT read+write+subdir, ext2-write regression bar, 1.40.x exec-from-disk; restores the plain build; tallies PASS/FAIL (**7/7 PASS**).
+- **agnosticos `exec-iron-manual-tests.md`** — the on-archaemenid manual checklist for both arcs (exec-from-disk A1–A6: ENOEXEC → ring-3 run `EXEC-DISK-OK` + `run: exit 42` + clean return + post-burn `e2fsck`; FAT/exFAT verbs B1–B4) with the dispositive bars. Linked from `iron-nuc-zen-log.md#tracker-139-cycle` (the two burns are now one hardware session).
+
+### Validation
+
+- `scripts/sweep.sh` **7/7 PASS**. `check.sh` 11/11, `test.sh` 4/4. exec-smoke green incl. the new `exec: selftest done` (clean-return) gate. Production build **1,033,448 B → 1,033,512 B**.
+
+### Known follow-ons (post-arc)
+
+- **Multi-`run` in one boot**: a *second* sequential real exec has a per-process (pid-reuse) teardown issue → its own bite. The single-exec-then-return path (the common shell case) is fixed.
+- Deferred (unchanged): argv/env, preemptive ring 3 (interrupt-path KPTI), Meltdown-grade KPTI, FAT/exFAT exec, the combined VFS+exec **iron burn** (user-driven, per `exec-iron-manual-tests.md`).
+
+
 ## [1.40.4] — 2026-05-29 (**Exec-from-disk — bite 4: subdir/CWD program paths + ENOEXEC/E2BIG bounds.** `run` resolves a program by a subdirectory or CWD-relative path and refuses non-ELF / oversized files cleanly. The exec-smoke now loads + runs a program from `/bin/prog2` (a subdirectory) and refuses a non-ELF `/notelf`.)
 
 ### Added / Changed
