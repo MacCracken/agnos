@@ -191,7 +191,14 @@ fn elf_load_from_file(path, namelen) {
             var seg_v1 = p_vaddr + p_filesz;          # end of file-backed data (vaddr)
             var pg = page_start;
             while (pg < page_end) {
-                var phys = pmm_alloc();
+                # pmm_alloc_2mb (NOT pmm_alloc): proc_map_page installs a 2 MB
+                # huge page masked to 2 MB alignment, so the backing phys MUST be
+                # a fully-reserved 2 MB-aligned region — otherwise the mapping
+                # points at floor_2MB(phys) and the bytes we write to a 4 KB
+                # pmm_alloc page land elsewhere (the latent ELF/stack aliasing
+                # hazard pmm.cyr documents). This is what made the loaded code
+                # read as #UD in ring 3 at 1.40.3.
+                var phys = pmm_alloc_2mb();
                 if (phys == 0) { return 0 - 1; }
                 if (vmm_is_mapped(phys) == 0) { vmm_map(phys, phys, 0x83); }
                 proc_map_page(new_cr3, pg, phys);
@@ -218,10 +225,10 @@ fn elf_load_from_file(path, namelen) {
         }
     }
 
-    # User stack (identical to elf_load).
+    # User stack — 2 MB-aligned region (same huge-page aliasing rule as above).
     var pid = proc_count;
     var stack_base = 0x800000 + pid * 0x400000;
-    var stack_phys = pmm_alloc();
+    var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }
     if (vmm_is_mapped(stack_phys) == 0) { vmm_map(stack_phys, stack_phys, 0x83); }
     proc_map_page(new_cr3, stack_base, stack_phys);

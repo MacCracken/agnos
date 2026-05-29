@@ -39,7 +39,27 @@ fn exec_and_wait(entry, rsp, cr3) {
     kpti_kernel_cr3 = exec_cr3_g;
     kpti_user_cr3 = proc_get_user_cr3(exec_cr3_g);
 
-    # Switch CR3 and enter ring 3 (use user CR3 for KPTI)
+    # 1.40.3: re-assert IA32_EFER.SCE (SYSCALL enable, bit 0) right before ring 3.
+    # syscall_init sets it at boot, but ring 3 had never run, so the SYSCALL path
+    # was never exercised — at the first real ring-3 SYSCALL, EFER read back 0xd00
+    # (NXE set, SCE clear) → #UD. Re-asserting here guarantees SYSCALL works for
+    # the program we're about to enter. (rdmsr/or-eax-1/wrmsr on MSR 0xC0000080.)
+    asm {
+        0xB9; 0x80; 0x00; 0x00; 0xC0;   # mov ecx, 0xC0000080 (IA32_EFER)
+        0x0F; 0x32;                       # rdmsr
+        0x0D; 0x01; 0x00; 0x00; 0x00;     # or eax, 1 (SCE)
+        0x0F; 0x30;                       # wrmsr
+    }
+
+    # 1.40.3: do all kernel-data work BEFORE switching to the minimal user CR3.
+    # tss_set_rsp0 reads the Local APIC (0xFEE00020) for the CPU id, which the
+    # user CR3 does not map — reading it AFTER the switch faulted (→ #PF → #DF →
+    # triple fault, the ring-3 bring-up blocker). Done here under the kernel CR3.
+    tss_set_rsp0(tss_kernel_stack);
+
+    # Switch CR3 and enter ring 3 (use user CR3 for KPTI). After the switch
+    # enter_ring3 only writes the iretq frame at 0x7000 (in the 0-2 MB
+    # trampoline the user CR3 maps) + iretqs — no kernel-data access remains.
     var cr3_load = kpti_user_cr3;
     asm { mov cr3, rax; }
     enter_ring3(exec_entry_g, exec_rsp_g);
@@ -47,14 +67,23 @@ fn exec_and_wait(entry, rsp, cr3) {
 }
 
 fn enter_ring3(entry, user_rsp) {
-    # Set TSS RSP0 so interrupts/syscalls come back to kernel stack
-    tss_set_rsp0(tss_kernel_stack);
+    # (TSS RSP0 is set by exec_and_wait BEFORE the CR3 switch — see note there.
+    # It must NOT be touched here: under the user CR3 the APIC read would fault.)
 
     # Write the iretq frame directly at 0x7000 using the function params.
     # Layout: [0]=RIP [8]=CS [16]=RFLAGS [24]=RSP [32]=SS
     store64(0x7000, entry);
     store64(0x7008, 0x23);
-    store64(0x7010, 0x202);
+    # RFLAGS = 0x002 (reserved bit only — IF CLEARED). exec_and_wait is a
+    # synchronous run-to-completion model (the shell blocks until the program's
+    # exit() resumes the kernel), and AGNOS is single-threaded (preemption is a
+    # future arc), so the program is not meant to be preempted. Masking
+    # interrupts in ring 3 avoids a timer ISR running under the minimal user
+    # CR3 — which lacks the Local APIC and triple-faulted on EOI (1.40.3).
+    # SYSCALL is unaffected by IF, so write()/exit() still work. Preemptive
+    # ring 3 (needs the interrupt entry path to swap to the kernel CR3) lands
+    # with the multithreading arc.
+    store64(0x7010, 0x002);
     store64(0x7018, user_rsp);
     store64(0x7020, 0x1B);
 

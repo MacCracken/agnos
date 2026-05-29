@@ -741,16 +741,17 @@ fn sh_cmd_run(arg, arglen) {
     if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("run: bad path", 13); return 0; }
     var pid = elf_load_from_file(&sh_path_buf, sh_path_len);
     if (pid < 0) { kprintln("run: not an executable", 22); return 0; }
-    # 1.40.2 lands the streaming LOAD (elf_load_from_file): the ELF is parsed,
-    # validated, and mapped into a new process with a correct entry + stack.
-    # The ring-3 EXECUTION step (exec_and_wait) is its own bring-up — the iretq
-    # / KPTI-user-CR3 path has never been validated end-to-end — and lands at
-    # 1.40.3. Until then `run` loads + reports rather than hanging on an
-    # unproven ring-3 transition.
+    # 1.40.3 — wire ring-3 execution: enter the loaded program in ring 3 via
+    # exec_and_wait (saves the kernel return point; the program's exit() syscall
+    # resumes here), then report the exit code.
     var ep = &proc_table + pid * 176;
-    kprint("run: loaded pid=", 16); kprint_num(pid);
-    kprint(" entry=", 7); kprint_hex(load64(ep + 24));
-    kprintln(" (ring3 exec: 1.40.3)", 21);
+    var e = load64(ep + 24);
+    var r = load64(ep + 16);
+    var c = load64(ep + 160);
+    exec_and_wait(e, r, c);
+    kprint("run: exit ", 10);
+    kprint_num(proc_get_exit_code(pid));
+    kprintln("", 0);
     return 0;
 }
 
