@@ -66,6 +66,7 @@ fn vfs_create_memfile(data, size) {
 # memfile) or -1 on miss. First hit wins. This is the read seam the write
 # bites (1.39.4+) extend; the dispatch lives here, not scattered in shell.
 fn vfs_open_secondary(name, namelen) {
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
     var fd = fatfs_open(name, namelen);
     if (fd >= 0) { return fd; }
     fd = exfat_open(name, namelen);
@@ -73,88 +74,124 @@ fn vfs_open_secondary(name, namelen) {
     return initrd_open(name, namelen);
 }
 
+# === Secondary mount registry (1.39.8 — VFS lift bite 8, consolidation) ===
+# Bites 2-7 each repeated the same four-line non-ESP-preference if-chain
+# (FAT-non-ESP -> exFAT-non-ESP -> FAT-any -> exFAT-any). That chain *is*
+# the single-primary-FS mount policy, and copy-pasting it across seven verbs
+# meant the policy lived in seven places — a registry by smell, scattered.
+# It now lives once, here: `vfs_secondary_select()` returns the chosen
+# secondary FS id and every `vfs_*_secondary` verb is a thin two-line switch
+# over that id. Behavior is byte-identical to the unrolled chains (same
+# precedence, same ESP-fallback-only-if-sole-mount rule); the win is one
+# place to evolve when the real mount-point namespace lands (non-goal §5,
+# deferred past this arc). Read/`cat` (bite 1) stays on miss-fallthrough and
+# does not consult the selector — it tries every backend, so it needs no
+# policy.
+enum SecFs {
+    SEC_NONE  = 0;
+    SEC_FAT   = 1;
+    SEC_EXFAT = 2;
+}
+
+fn vfs_secondary_select() {
+    # Prefer a real (non-ESP) data partition; fall back to an ESP-resident
+    # FS only when it is the sole mount. ext2 is never a "secondary" — the
+    # shell routes ext2 path-aware before reaching any of these helpers.
+    if (fatfs_active != 0  && fat_on_esp == 0)   { return SEC_FAT; }
+    if (exfat_active != 0  && exfat_on_esp == 0)  { return SEC_EXFAT; }
+    if (fatfs_active != 0)  { return SEC_FAT; }
+    if (exfat_active != 0)  { return SEC_EXFAT; }
+    return SEC_NONE;
+}
+
+# Ingress bound for the name arg of every secondary write/dir verb (bite 8
+# hardening). The dispatch is the generic seam these verbs funnel through, so
+# the name length is sanity-checked here rather than trusting each caller: a
+# name is rejected if empty (< 1) or longer than 255 — longer than any FAT
+# (8.3 / LFN) or exFAT name can be. This bounds the one *unbounded* read on
+# the path (fatfs_build_83's dot-scan loops the full namelen) and backstops
+# the exFAT create/mkdir entry points, which carry no namelen guard of their
+# own. The shell verbs already guard sh_trim_len < 1; this is defense-in-depth
+# at the seam so a future non-shell caller can't drive a runaway out-of-bounds
+# read. Behavior is unchanged for every valid name (all real names are 1..255).
+fn vfs_sec_name_ok(namelen) {
+    if (namelen < 1)   { return 0; }
+    if (namelen > 255) { return 0; }
+    return 1;
+}
+
 # Generic directory-listing dispatch for the non-ext2 primary case (1.39.2 —
-# VFS generic-write lift, bite 2). ext2 is listed by the caller (path/CWD-
+# bite 2; consolidated at bite 8). ext2 is listed by the caller (path/CWD-
 # aware, via ext2_print_dir on a resolved inode); this lists the FAT or
-# exFAT *root* when one of them is the mounted primary (single-primary-FS
-# model — ext2 wins when present). Returns the entry count, or -1 when no
-# secondary FS is mounted. Root-only; FAT/exFAT subdir paths deferred.
-#   When more than one secondary FS is mounted (e.g. a boot FAT ESP + an
-#   exFAT data partition), the *list*/*write* helpers prefer the non-ESP
-#   (real data) FS — the ESP is boot-only and write-guarded — falling back to
-#   an ESP FS only if it's the sole mount. (Read/`cat` uses miss-fallthrough,
-#   so it doesn't need this.) A real mount-point namespace is the 1.39.6 bite;
-#   this is the single-primary-FS heuristic until then.
+# exFAT *root* when one of them is the selected secondary primary. Returns
+# the entry count, or -1 when no secondary FS is mounted.
 fn vfs_print_dir_secondary() {
-    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_ls(); }
-    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_print_dir(); }
-    if (fatfs_active != 0) { return fatfs_ls(); }
-    if (exfat_active != 0) { return exfat_print_dir(); }
+    var fs = vfs_secondary_select();
+    if (fs == SEC_FAT)   { return fatfs_ls(); }
+    if (fs == SEC_EXFAT) { return exfat_print_dir(); }
     return 0 - 1;
 }
 
-# Generic create/write dispatch for the non-ext2 primary (1.39.3 — VFS
-# generic-write lift, bite 3). The write analog of bite 1/2's read/list
-# dispatch. ext2 is handled path-aware by the caller; these create/write a
-# bare-named file in the FAT/exFAT *root* (single-primary-FS, root-only —
-# subdir paths deferred). FAT/exFAT writes self-gate on the ESP-write guard
+# Generic create/write dispatch for the non-ext2 primary (1.39.3 — bite 3;
+# consolidated at bite 8). Creates/writes a bare-named file in the selected
+# FAT/exFAT *root*. FAT/exFAT writes self-gate on the ESP-write guard
 # (refused on a boot ESP unless FAT_ALLOW_ESP_WRITE). Returns 0 / bytes on
 # success, -1 on miss-or-failure.
 fn vfs_create_secondary(name, namelen) {
-    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_create(name, namelen); }
-    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_create(name, namelen); }
-    if (fatfs_active != 0) { return fatfs_create(name, namelen); }
-    if (exfat_active != 0) { return exfat_create(name, namelen); }
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    var fs = vfs_secondary_select();
+    if (fs == SEC_FAT)   { return fatfs_create(name, namelen); }
+    if (fs == SEC_EXFAT) { return exfat_create(name, namelen); }
     return 0 - 1;
 }
 fn vfs_write_secondary(name, namelen, src, len) {
-    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_write_file(name, namelen, src, len); }
-    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_write_file(name, namelen, src, len); }
-    if (fatfs_active != 0) { return fatfs_write_file(name, namelen, src, len); }
-    if (exfat_active != 0) { return exfat_write_file(name, namelen, src, len); }
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    var fs = vfs_secondary_select();
+    if (fs == SEC_FAT)   { return fatfs_write_file(name, namelen, src, len); }
+    if (fs == SEC_EXFAT) { return exfat_write_file(name, namelen, src, len); }
     return 0 - 1;
 }
 
-# Generic delete dispatch for the non-ext2 primary (1.39.4 — VFS lift bite 4,
-# `rm`). Same non-ESP-preferring selection as create/write. Returns 0 on
-# success, -1 on miss-or-failure. (FAT/exFAT directory create/remove —
-# mkdir/rmdir — are not yet implemented in either backend, so those verbs
-# stay ext2-only until a dir-create bite adds them.)
+# Generic delete dispatch for the non-ext2 primary (1.39.4 — bite 4, `rm`;
+# consolidated at bite 8). Returns 0 on success, -1 on miss-or-failure.
 fn vfs_delete_secondary(name, namelen) {
-    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_delete(name, namelen); }
-    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_delete(name, namelen); }
-    if (fatfs_active != 0) { return fatfs_delete(name, namelen); }
-    if (exfat_active != 0) { return exfat_delete(name, namelen); }
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    var fs = vfs_secondary_select();
+    if (fs == SEC_FAT)   { return fatfs_delete(name, namelen); }
+    if (fs == SEC_EXFAT) { return exfat_delete(name, namelen); }
     return 0 - 1;
 }
 
-# Generic directory create/remove dispatch (1.39.5 FAT + 1.39.6 exFAT — VFS
-# lift bites 5/6, mkdir/rmdir). Same non-ESP preference as create/write.
+# Generic directory create/remove dispatch (1.39.5 FAT + 1.39.6 exFAT —
+# bites 5/6, mkdir/rmdir; consolidated at bite 8).
 fn vfs_mkdir_secondary(name, namelen) {
-    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_mkdir(name, namelen); }
-    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_mkdir(name, namelen); }
-    if (fatfs_active != 0) { return fatfs_mkdir(name, namelen); }
-    if (exfat_active != 0) { return exfat_mkdir(name, namelen); }
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    var fs = vfs_secondary_select();
+    if (fs == SEC_FAT)   { return fatfs_mkdir(name, namelen); }
+    if (fs == SEC_EXFAT) { return exfat_mkdir(name, namelen); }
     return 0 - 1;
 }
 fn vfs_rmdir_secondary(name, namelen) {
-    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_rmdir(name, namelen); }
-    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_rmdir(name, namelen); }
-    if (fatfs_active != 0) { return fatfs_rmdir(name, namelen); }
-    if (exfat_active != 0) { return exfat_rmdir(name, namelen); }
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    var fs = vfs_secondary_select();
+    if (fs == SEC_FAT)   { return fatfs_rmdir(name, namelen); }
+    if (fs == SEC_EXFAT) { return exfat_rmdir(name, namelen); }
     return 0 - 1;
 }
 
-# Generic rename + sync dispatch for the non-ext2 primary (1.39.7 — VFS lift
-# bite 7). Rename: FAT does an in-place dirent rewrite, exFAT re-emits the
-# dir-set over the same clusters (neither has POSIX-atomic rename). Sync:
-# FAT/exFAT writes go straight to the block layer, so sync is a durability
-# barrier (blk flush) on the active backend. Same non-ESP preference.
+# Generic rename + sync dispatch for the non-ext2 primary (1.39.7 — bite 7;
+# rename consolidated at bite 8). Rename: FAT does an in-place dirent
+# rewrite, exFAT re-emits the dir-set over the same clusters (neither has
+# POSIX-atomic rename). Sync: FAT/exFAT writes go straight to the block
+# layer, so sync is a durability barrier (blk flush). Sync flushes whichever
+# backend is active *regardless of ESP* (a durability barrier must reach the
+# boot ESP too), so it does NOT route through the non-ESP selector.
 fn vfs_rename_secondary(oldname, oldlen, newname, newlen) {
-    if (fatfs_active != 0 && fat_on_esp == 0)  { return fatfs_rename(oldname, oldlen, newname, newlen); }
-    if (exfat_active != 0 && exfat_on_esp == 0) { return exfat_rename(oldname, oldlen, newname, newlen); }
-    if (fatfs_active != 0) { return fatfs_rename(oldname, oldlen, newname, newlen); }
-    if (exfat_active != 0) { return exfat_rename(oldname, oldlen, newname, newlen); }
+    if (vfs_sec_name_ok(oldlen) == 0) { return 0 - 1; }
+    if (vfs_sec_name_ok(newlen) == 0) { return 0 - 1; }
+    var fs = vfs_secondary_select();
+    if (fs == SEC_FAT)   { return fatfs_rename(oldname, oldlen, newname, newlen); }
+    if (fs == SEC_EXFAT) { return exfat_rename(oldname, oldlen, newname, newlen); }
     return 0 - 1;
 }
 fn vfs_sync_secondary() {

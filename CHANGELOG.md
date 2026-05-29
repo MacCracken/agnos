@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.39.8] — 2026-05-28 (**VFS generic-write lift — bite 8 (arc close): mount-registry consolidation + ingress hardening.** The functional verb surface completed at 1.39.7; this cut consolidates the dispatch and hardens its ingress seam. The seven `vfs_*_secondary` verbs each carried a copy of the same four-line non-ESP-preference chain — the single-primary-FS *policy* scattered across seven sites; it now lives once in `vfs_secondary_select()`. A bounds/ingress review of both writable backends added one guard at the generic seam. **No behavior change for any valid name.** FAT/exFAT *subdirectory* paths split out to bite 9 / 1.39.9 — Large effort, ~14 functions across both backends.)
+
+### Changed — mount-registry consolidation (`vfs.cyr`)
+
+- **`vfs_secondary_select()`** — new single source of the single-primary-FS selection policy (prefer a non-ESP data partition; fall back to an ESP-resident FS only when it's the sole mount). The seven `vfs_*_secondary` verbs (`print_dir`/`create`/`write`/`delete`/`mkdir`/`rmdir`/`rename`) are now thin switches over its `SecFs` result instead of each re-stating the four-line `fatfs_active`/`fat_on_esp`/`exfat_active`/`exfat_on_esp` chain. **Byte-identical behavior** — same precedence, same ESP-fallback-only-if-sole-mount rule. `vfs_sync_secondary` keeps flushing whichever backend is active *regardless of ESP* (a durability barrier must reach the boot ESP too), so it intentionally does not route through the non-ESP selector.
+
+### Added — ingress hardening (`vfs.cyr`)
+
+- **`vfs_sec_name_ok(namelen)`** — bounds the name length (1..255) at the generic dispatch seam, the layer every secondary write/dir verb funnels through. Bounds the one *unbounded* read on the path (`fatfs_build_83`'s dot-scan loops the full `namelen`) and backstops `exfat_create`/`exfat_mkdir`, which carried no namelen guard of their own. 255 is longer than any FAT (8.3 / LFN) or exFAT name. Defense-in-depth: the shell verbs already guard `sh_trim_len < 1`; this protects against a future non-shell caller. Behavior is unchanged for every valid name.
+
+### Hardening review (no fix needed)
+
+- Re-derived (not comment-trusted, per the audit discipline) every backend buffer against its worst case: `exfat_set_buf[80]`=640 B ≥ the 608 B max 19-entry dir-set (the `total > 19` cap in `exfat_emit_set` is what protects it); `fatfs_dir_buf`/`exfat_dir_buf`/`exfat_bmp_buf`=512 B = one sector; `exfat_name_buf` 256 B with `< 255` write guards on every reconstruction loop. All sound; the only gap was the unbounded `namelen` read, fixed above.
+
+### Validation
+
+- `check.sh` **11/11**, `test.sh` **4/4**. All four FAT/exFAT smokes green through the consolidated selector — `fat-smoke` / `fat-write-smoke` / `exfat-smoke` / `exfat-write-smoke` PASS, host `fsck.fat` / `fsck.exfat` clean. **ext2-write regression bar** (`ext2-write-smoke` W1–W5) PASS — the iron-validated ext2/jbd2 path is untouched.
+- Production build **1,008,816 B → 1,007,696 B** (−1,120 B net: −1,760 B from folding the duplicated chains, +640 B for the guard fn + six call sites), multiboot2 OK.
+
+### Iron pre-audit
+
+- **1.39.x VFS-lift iron-burn rubric written** → `agnosticos/docs/development/iron-nuc-zen-log.md#tracker-139-cycle` (8-row falsification table; root-only verbs). Folds in the long-pending 1.34.x FAT/exFAT iron burn. Mechanism: the shell verbs only fire when `ext2_active == 0`, so the burn uses a `FATFS_WRITE_SELFTEST` / `EXFAT_WRITE_SELFTEST` self-driver (FB-readable). Test-surface fork (brick-safe USB FAT32/exFAT data stick vs. boot-ESP write) is the user's call. User-driven; no auto-run.
+
+### Not yet (next)
+
+- **1.39.9 — bite 9**: FAT/exFAT *subdirectory* paths in the verbs (currently root-only). Every FAT/exFAT op hardcodes `var clus = fatfs_root_cluster` as the start directory; subdir support threads a start-directory cluster through ~14 functions in both backends (generic path-walk resolving all-but-last component) plus shell path-splitting. ext2 verbs are already path/CWD-aware — this removes the last FAT/exFAT asymmetry.
+
+
 ## [1.39.7] — 2026-05-28 (**VFS generic-write lift — bite 7: `mv` (rename) + `sync` on FAT/exFAT.** The last functional verb. `mv` renames within a FAT/exFAT root; `sync` flushes the backend. With this, the full shell verb set — `cat`/`ls`/`touch`/`echo >`/`rm`/`mkdir`/`rmdir`/`mv`/`sync` — works on both secondary filesystems. Neither FS has POSIX-atomic rename, so each uses its own content-preserving approach (no copy).)
 
 ### Added — FAT/exFAT rename + sync (`fatfs.cyr`, `exfat.cyr`, `vfs.cyr`)
