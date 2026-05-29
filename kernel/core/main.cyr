@@ -655,6 +655,13 @@ if (fatfs_active == 1) {
     # SHTOUCH/SHECHO gates stay valid; fat-write-smoke.sh checks it's gone.
     sh_exec("touch SHRMTGT.TXT", 17);
     sh_exec("rm SHRMTGT.TXT", 14);
+    # 1.39.5 VFS-lift bite 5: shell mkdir/rmdir over FAT (sh_cmd_mkdir/rmdir
+    # -> vfs_mkdir_secondary/vfs_rmdir_secondary -> fatfs_mkdir/fatfs_rmdir).
+    # SHKEEP is kept (smoke confirms it's a navigable dir); SHRMD is created
+    # then removed (smoke confirms it's gone). fsck.fat validates ./.. + chains.
+    sh_exec("mkdir SHKEEP", 12);
+    sh_exec("mkdir SHRMD", 11);
+    sh_exec("rmdir SHRMD", 11);
 }
 #endif
 

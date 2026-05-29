@@ -526,7 +526,15 @@ fn sh_cmd_rm(arg, arglen) {
 }
 
 fn sh_cmd_mkdir(arg, arglen) {
-    if (ext2_active == 0) { kprintln("mkdir: no fs", 12); return 0; }
+    if (ext2_active == 0) {
+        # Single-primary fallthrough (1.39.5): no ext2 -> create a bare-named
+        # directory in the FAT root via vfs_mkdir_secondary. Root-only;
+        # exFAT mkdir lands at 1.39.6 (returns failure until then).
+        sh_trim(arg, arglen);
+        if (sh_trim_len < 1) { kprintln("usage: mkdir <dir>", 18); return 0; }
+        if (vfs_mkdir_secondary(arg + sh_trim_off, sh_trim_len) == 0) { return 0; }
+        kprintln("mkdir: failed", 13); return 0;
+    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: mkdir <dir>", 18); return 0; }
     if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("mkdir: bad path", 15); return 0; }
@@ -537,7 +545,14 @@ fn sh_cmd_mkdir(arg, arglen) {
 }
 
 fn sh_cmd_rmdir(arg, arglen) {
-    if (ext2_active == 0) { kprintln("rmdir: no fs", 12); return 0; }
+    if (ext2_active == 0) {
+        # Single-primary fallthrough (1.39.5): no ext2 -> remove an empty
+        # bare-named directory in the FAT root via vfs_rmdir_secondary.
+        sh_trim(arg, arglen);
+        if (sh_trim_len < 1) { kprintln("usage: rmdir <dir>", 18); return 0; }
+        if (vfs_rmdir_secondary(arg + sh_trim_off, sh_trim_len) == 0) { return 0; }
+        kprintln("rmdir: failed (not empty?)", 26); return 0;
+    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: rmdir <dir>", 18); return 0; }
     if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("rmdir: bad path", 15); return 0; }

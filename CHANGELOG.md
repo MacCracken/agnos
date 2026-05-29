@@ -5,6 +5,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.39.5] — 2026-05-28 (**VFS generic-write lift — bite 5: `mkdir`/`rmdir` on FAT (new backend capability).** The first bite that *adds* a filesystem capability rather than dispatching existing code — FAT directory create/remove didn't exist before. `mkdir`/`rmdir` now work on a FAT primary. exFAT directory-create has a different shape (no `.`/`..`, dir-set with the Directory attr) and lands at 1.39.6.)
+
+### Added — FAT directory create/remove (`kernel/core/fatfs.cyr`)
+
+- **`fatfs_mkdir`** (FAT32) — allocates one cluster, initialises it with `.` (→ self) + `..` (→ parent; cluster 0 for root) then zeros, and publishes a DIRECTORY-attr (`0x10`) dirent in the root. Crash-safe ordering: cluster allocated + written *before* the parent dirent is published (a crash leaks at worst a cluster, never a live dirent → free chain).
+- **`fatfs_rmdir`** (FAT32) — verifies the target is a directory (parent dirent `attr & 0x10`) **and** empty, then reuses `fatfs_delete`'s teardown (mark dirent `0xE5` + free the cluster chain).
+- **`fatfs_dir_is_empty`** — walks a directory's cluster chain; any live entry (not `0x00`/`0xE5`/LFN/volume/the `.`/`..` dots) means non-empty.
+- **`vfs_mkdir_secondary` / `vfs_rmdir_secondary`** (`vfs.cyr`) — dispatch (FAT only this cut; exFAT returns -1 until 1.39.6). Non-ESP-preferring.
+
+### Changed
+
+- **`sh_cmd_mkdir` / `sh_cmd_rmdir`** — ext2-absent branches route through the dispatch (was `mkdir: no fs` / `rmdir: no fs`). Isolated to the `ext2_active == 0` branch; ext2 path untouched.
+
+### Validation
+
+- `fat-write-smoke.sh`: kernel runs `mkdir SHKEEP`, `mkdir SHRMD`, `rmdir SHRMD`. **`mdir` can descend into `SHKEEP`** (valid `.`/`..` + cluster), `SHRMD` is **gone**, and **`fsck.fat -n` clean** (directory structure + chains sound) → **PASS** (31/31 smoke gates green).
+- No regression: bites 1–4 (`cat`/`ls`/`touch`/`echo >`/`rm`) still green; `exfat-write-smoke` PASS; ext2 path untouched. `check.sh` 11/11, `test.sh` 4/4. Production build **1,002,800 B** (crossed 1 MB; ceiling 1.2 MB), multiboot2 OK.
+
+### Not yet (next bites)
+
+- **exFAT `mkdir`/`rmdir`** (1.39.6) — needs the exFAT directory dir-set (Directory `FileAttributes`, a cluster of zeroed entries, no `.`/`..`).
+- `mv` (rename) + `sync` dispatch (1.39.7); mount-registry consolidation + arc-close hardening + iron burn (1.39.8).
+
+
 ## [1.39.4] — 2026-05-28 (**VFS generic-write lift — bite 4: `rm` removes FAT/exFAT files.** The shell `rm` verb now deletes files on a FAT/exFAT primary via generic dispatch. Scope note: FAT/exFAT have `delete` but **no directory-create** (`mkdir`/`rmdir` don't exist in either backend), so this bite ships `rm` only; `mkdir`/`rmdir` over FAT/exFAT need a new dir-create implementation and are split into a follow-on bite. Single-primary-FS, root-level, non-ESP-preferring.)
 
 ### Added

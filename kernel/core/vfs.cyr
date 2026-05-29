@@ -128,6 +128,21 @@ fn vfs_delete_secondary(name, namelen) {
     return 0 - 1;
 }
 
+# Generic directory create/remove dispatch (1.39.5 — VFS lift bite 5,
+# mkdir/rmdir). FAT only this cut — exFAT directory-create lands at 1.39.6
+# (it needs a different dir-set + cluster shape), so an exFAT primary returns
+# -1 here (the verb reports failure) until then. Same non-ESP preference.
+fn vfs_mkdir_secondary(name, namelen) {
+    if (fatfs_active != 0 && fat_on_esp == 0) { return fatfs_mkdir(name, namelen); }
+    if (fatfs_active != 0) { return fatfs_mkdir(name, namelen); }
+    return 0 - 1;
+}
+fn vfs_rmdir_secondary(name, namelen) {
+    if (fatfs_active != 0 && fat_on_esp == 0) { return fatfs_rmdir(name, namelen); }
+    if (fatfs_active != 0) { return fatfs_rmdir(name, namelen); }
+    return 0 - 1;
+}
+
 fn vfs_read_signalfd(base, buf) {
     var sigmask = load64(base + 24);
     var pending = load64(&proc_signals + proc_current * 8);

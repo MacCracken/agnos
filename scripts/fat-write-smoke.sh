@@ -300,6 +300,20 @@ if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "SHRMTGT"; then
 else
     echo "  PASS: shell 'rm' removed SHRMTGT.TXT on FAT (vfs_delete_secondary)"
 fi
+# 1.39.5 VFS-lift bite 5: shell mkdir/rmdir over FAT. SHKEEP must be a
+# navigable directory (mdir can descend into it → it has valid ./.. +
+# cluster); SHRMD (mkdir then rmdir) must be gone. fsck-clean above proves
+# the dir cluster + chains are structurally sound.
+if mdir -i "$WORK/esp.img" ::SHKEEP >/dev/null 2>&1; then
+    echo "  PASS: shell 'mkdir' created navigable SHKEEP dir on FAT (vfs_mkdir_secondary)"
+else
+    echo "  FAIL: shell mkdir over FAT (SHKEEP not a navigable directory)"; rc=1
+fi
+if mdir -i "$WORK/esp.img" :: 2>/dev/null | grep -q "SHRMD"; then
+    echo "  FAIL: shell rmdir over FAT (SHRMD still present)"; rc=1
+else
+    echo "  PASS: shell 'rmdir' removed SHRMD dir on FAT (vfs_rmdir_secondary)"
+fi
 
 echo ""
 echo "=========================================="
