@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.0] — 2026-05-28 (**Exec-from-disk arc — cycle open.** The second base-maturity exit leg: base = FS-crash-safe (done, 1.37–1.39) **+ exec-from-disk** (this arc). Today programs come only from the in-memory initrd; 1.40.x makes the kernel **read an ELF from a VFS path, load it, run it, and collect its exit code** — using the writable + path-addressable filesystem the 1.39.x VFS lift earned. `elf_load` (a hardened static ELF64 *buffer* loader) + the process/scheduler plumbing (`proc`/`sched`/`spawn`/`waitpid`) already exist; the single gap is **disk → contiguous buffer** (the 4 KB memfile cap blocks real binaries) + a shell `run` verb. Lean cycle-open: version + arc plan, no kernel code yet. **1.41.x remains shell→agnoshi** (kernel-slimming); the combined VFS+exec iron burn lands at the end of 1.40.x.)
+
+### Added
+
+- **Arc plan** — agnosticos [`exec-from-disk-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/exec-from-disk-prior-art.md): multi-source survey (xv6 `exec.c`, Linux `load_elf_binary`, FreeBSD `imgact_elf`, Plan 9), AGNOS current-state gap analysis, design decisions (slurp-then-load reusing `elf_load` unchanged; bounded `kmalloc` load buffer; `vfs_read_file` whole-file primitive; `run <path>` verb; static-only, argv deferred), and the bite ladder.
+
+### Cycle plan (no code this cut)
+
+- **1.40.1** — `vfs_read_file`: arbitrary-size whole-file read into a bounded buffer (past the 4 KB memfile cap), FS-resolved across ext2/FAT/exFAT.
+- **1.40.2** — `run <path>`: `vfs_read_file` → `elf_load` → `waitpid` → exit code; selftest seeds + runs a tiny static ELF off the FS.
+- **1.40.3** — CWD-relative + subdir program paths (rides the 1.39.9 resolver) + ENOEXEC/E2BIG bounds; per-FS coverage.
+- **1.40.4+** — arc-close hardening; **combined VFS (1.39.x) + exec (1.40.x) iron burn** (extends `#tracker-139-cycle`).
+
+
 ## [1.39.9] — 2026-05-28 (**VFS generic-write lift — bite 9: FAT/exFAT subdirectory paths.** Removes the last FAT/exFAT-vs-ext2 asymmetry — ext2 verbs were already path/CWD-aware; FAT/exFAT were root-only. Pure backend work: the shell already passed full slashed paths to the secondary dispatch, the backends just ignored the slashes. A path-walk resolves all-but-last component to a directory cluster; the directory finders are generalized to take a start cluster. **`cat`/`touch`/`echo >`/`rm`/`mkdir`/`rmdir`/`mv` now operate inside subdirectories on both filesystems.** This completes the functional verb surface for the VFS lift; the arc closes pending the user-driven iron burn.)
 
 ### Added — FAT subdir paths (`fatfs.cyr`)
