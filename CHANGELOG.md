@@ -5,6 +5,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.2] — 2026-05-29 (**Exec-from-disk — bite 2: streaming ELF loader (the load half).** `run <path>` reads a real static ELF64 off ext2, validates it, and maps it into a new process — proven end-to-end. The ring-3 *execution* step (`exec_and_wait`) is unproven pre-existing infra (the KTEST always bypassed it) and is its own bring-up at 1.40.3, so `run` currently loads + reports rather than hanging on an unvalidated ring-3 transition.)
+
+### Added
+
+- **`elf_load_from_file(path, namelen)`** (`elf.cyr`) — streaming ELF64 loader from a filesystem path. Same hardened validation as `elf_load` (magic/class/entry/phdr/segment bounds), but the image is never held in one buffer: the header+phdrs are read into `elf_hdr_buf` (4 KB module-global), then **each `PT_LOAD` segment's file bytes are read directly into its physical pages via the kernel identity mapping** — `pmm_alloc` a page, `vmm_map(phys,phys)`, `proc_map_page` it into the process, then `vfs_read_file_at(... phys+off ...)`. ext2 only (offset reads); FAT/exFAT exec is a follow-on.
+- **`vfs_read_file_at(path, namelen, offset, dst, len)` + `vfs_file_size(path, namelen)`** (`vfs.cyr`) — ext2 offset-read + size (the streaming primitives). FAT/exFAT return -1 (read-from-start only).
+- **`run <path>` shell verb** (`shell.cyr`) — resolves the path (CWD-relative), `elf_load_from_file`, reports `run: loaded pid=N entry=… (ring3 exec: 1.40.3)`. The `exec_and_wait` call is deferred to 1.40.3.
+- **`EXEC_SELFTEST` build flag** + **`exec-smoke.sh`** — the kernel hand-builds a minimal static ELF64 (`write(1,"EXEC-DISK-OK\n"); exit(42)`), writes it to ext2 as `/prog`, then `run`s it; the smoke gates on the load (`run: loaded pid=`, `entry=0x400078`) + `e2fsck -fn` clean.
+
+### Changed
+
+- **No CR3 switch during load.** The first cut switched CR3 into the half-built process address space to `memcpy` segments (the idiom `elf_load` uses) — it **hung** (KPTI + the fragile `var→rax` CR3-load idiom). Rewritten to populate physical pages via their kernel identity address with no CR3 switch — simpler and robust.
+
+### Validation
+
+- `exec-smoke` PASS: `/prog` written to ext2, stream-loaded, header parsed from disk (`entry=0x400078`), mapped into pid 0; `e2fsck -fn` clean. `check.sh` 11/11, `test.sh` 4/4; FAT-write (incl. 1.40.1 `vfsrf`) + ext2-write regression green. Production build **1,024,256 B → 1,033,296 B**.
+
+### Not yet (next)
+
+- **1.40.3 — ring-3 execution bring-up**: make `exec_and_wait` actually run the loaded program in ring 3 and return its exit code (debug the iretq + KPTI user-CR3 mapping of the user pages — never validated end-to-end). Then the test ELF prints `EXEC-DISK-OK` + `run: exit 42`.
+- **1.40.4** — CWD/subdir program paths + ENOEXEC/E2BIG bounds. **1.40.5+** — hardening + the combined VFS+exec iron burn.
+
+
 ## [1.40.1] — 2026-05-29 (**Exec-from-disk — bite 1: `vfs_read_file` (whole-file read past the 4 KB cap).** The one genuinely new primitive the exec load path needs: read an *entire* file from a VFS path into a caller buffer, resolving whichever filesystem backs it. `cat`/`vfs_open_secondary` wrap a file as a ≤ 4 KB `VFS_MEMFILE`, but an ELF is far larger — the readers themselves (`fatfs_read`/`exfat_read`/`ext2_read_at`) were never 4 KB-capped, only the `*_open` memfile wrappers were. No code change to the load/run path yet — that's 1.40.2.)
 
 ### Added — `vfs_read_file` (`vfs.cyr`)
