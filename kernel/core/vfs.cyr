@@ -39,9 +39,17 @@ var vfs_scratch_buf[1024];
 
 fn vfs_init() {
     memset(&vfs_table, 0, 1024);  # 32 entries x 32 bytes
-    # FD 0 = serial device (data=device index 0)
+    # FD 0 = stdin, FD 1 = stdout, FD 2 = stderr — all the serial/console device
+    # (device index 0). Pre-1.40.3 only fd 0 was set, so a user program's
+    # write(1, …) (stdout) went nowhere; wiring fd 1/2 here makes ring-3 stdout
+    # reach the console (exec-from-disk). vfs_alloc starts at fd 3, leaving these
+    # three reserved.
     ktag_set(&vfs_table, VFS_DEVICE);
     kpayload_set(&vfs_table, 2, 0);
+    ktag_set(&vfs_table + 32, VFS_DEVICE);
+    kpayload_set(&vfs_table + 32, 2, 0);
+    ktag_set(&vfs_table + 64, VFS_DEVICE);
+    kpayload_set(&vfs_table + 64, 2, 0);
     return 0;
 }
 

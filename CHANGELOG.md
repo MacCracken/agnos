@@ -5,6 +5,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.3] — 2026-05-29 (**Exec-from-disk — bite 3: ring-3 execution (the RUN half) — WORKING.** `run /prog` now loads a static ELF64 off ext2, executes it in ring 3, and returns its exit code: the exec-smoke's hand-built program prints `EXEC-DISK-OK` (its `write(1,…)` reaches the console) and the shell reports `run: exit 42`. This brought up the entire ring-3 + SYSCALL path, which had never executed (the KTEST always bypassed it) — ten distinct first-run bugs, below. Run-to-completion / single-threaded model: the program runs with interrupts masked (preemptive ring 3 is a later arc).)
+
+### Fixed — ring-3 + SYSCALL bring-up (`ring3.cyr`, `syscall_hw.cyr`, `proc.cyr`, `elf.cyr`, `vfs.cyr`)
+
+- **`mov cr3, r10` mis-encoded** in the SYSCALL entry stub as `44 0F 22 DA` (REX.R → selects nonexistent cr11 → `#UD`); corrected to `41 0F 22 DA` (REX.B → r10). Both the entry and exit CR3 switches. *This was the core blocker.*
+- **LSTAR programmed via NX-stack bytecode**: `syscall_init` built the `wrmsr` in a local buffer and ran it via `call rax` — with `EFER.NXE` set the stack is no-execute, so LSTAR was never written and `SYSCALL` vectored into data. Replaced with a direct `wrmsr` (`var→rax` + `rdx:eax` split). **Not a Cyrius bug — executing NX stack data.**
+- **`EFER.SCE` not in effect** at the first ring-3 `SYSCALL` (`#UD`) — re-asserted before entering ring 3.
+- **KPTI dual-CR3 mismatch**: ring 3 ran under one CR3 while the stub switched to a different `exec_cr3_g` that didn't map the stub. Collapsed the split for now — ring 3 + the stub run under the one full per-process CR3 (kernel pages supervisor, user U/S; protection holds, only Meltdown-defense deferred). `proc_create_address_space` stashes the kernel-side CR3 as the "user" CR3.
+- **SYSCALL kernel stack** was a hardcoded `0x1F0000` (now overlapping the >1.9 MB kernel image) — replaced with a `pmm_alloc_2mb` region, allocated **before** the user process so its identity VA can't collide with the user stack VA window.
+- **SMAP** (CR4.SMAP, set on Zen / `-cpu max`) blocked the kernel reading the user buffer for `write()` — added `STAC`/`CLAC` around the handler call (Linux user-copy model; SMAP stays enabled).
+- **`tss_set_rsp0` read the Local APIC after the CR3 switch** (user CR3 lacks the APIC) → moved before the switch.
+- **Timer interrupt in ring 3** ran an ISR under the minimal CR3 → masked `IF` in the ring-3 RFLAGS (fits the synchronous run-to-completion model; `SYSCALL` is unaffected by IF).
+- **2 MB-page vs 4 KB `pmm_alloc`** in `elf_load_from_file` left loaded code at the wrong physical address (`#UD` in ring 3) → `pmm_alloc_2mb`.
+- **fd 1/2 not wired to the console** → ring-3 `write(1,…)` went nowhere; `vfs_init` now maps stdin/stdout/stderr to the serial device.
+
+### Validation
+
+- **`exec-smoke.sh` PASS (6/6)**: `/prog` written to ext2 → stream-loaded → ring 3 → `EXEC-DISK-OK` + `run: exit 42`; `e2fsck -fn` clean. `check.sh` 11/11, `test.sh` 4/4; FAT/exFAT/ext2 write smokes all green (no regression). Production build **1,033,296 B → 1,033,304 B**.
+
+### Not yet (next)
+
+- **1.40.4** — CWD-relative + subdir program paths (rides the 1.39.9 resolver) + ENOEXEC/E2BIG bounds. **1.40.5+** — hardening + the combined VFS+exec iron burn. Deferred: argv/env, preemptive ring 3 (interrupt-path KPTI), Meltdown-grade KPTI, FAT/exFAT exec.
+
+
 ## [1.40.2] — 2026-05-29 (**Exec-from-disk — bite 2: streaming ELF loader (the load half).** `run <path>` reads a real static ELF64 off ext2, validates it, and maps it into a new process — proven end-to-end. The ring-3 *execution* step (`exec_and_wait`) is unproven pre-existing infra (the KTEST always bypassed it) and is its own bring-up at 1.40.3, so `run` currently loads + reports rather than hanging on an unvalidated ring-3 transition.)
 
 ### Added

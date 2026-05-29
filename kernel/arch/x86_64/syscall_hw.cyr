@@ -3,6 +3,11 @@
 
 var syscall_entry_buf[256];  # Enlarged for IBRS instructions
 var kernel_rsp_save = 0;
+# 1.40.3: dedicated kernel stack TOP for the SYSCALL entry path. The stub used
+# to switch RSP to a hardcoded 0x1F0000, which now overlaps the >1.9 MB kernel
+# image (corruption / read-only push fault). Allocated once in syscall_init from
+# a fresh 2 MB region; the stub switches RSP here on entry from ring 3.
+var syscall_kstack_top = 0;
 # Saved kernel context for returning from user mode on exit
 var kernel_return_rsp = 0;
 var kernel_return_rip = 0;
@@ -16,6 +21,18 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3) {
 }
 
 fn syscall_init() {
+    # 1.40.3: allocate the SYSCALL kernel stack once (a fresh 2 MB region; RSP
+    # set near its top, grows down). Replaces the hardcoded 0x1F0000 that now
+    # overlaps the kernel image. Mapped identity (within 0-1 GB the per-process
+    # CR3 mirrors), writable.
+    if (syscall_kstack_top == 0) {
+        var ks = pmm_alloc_2mb();
+        if (ks != 0) {
+            if (vmm_is_mapped(ks) == 0) { vmm_map(ks, ks, 0x83); }
+            syscall_kstack_top = ks + 0x1F0000;   # near the top of the 2 MB region
+        }
+    }
+
     # Program the MSRs for SYSCALL/SYSRET.
     # MSR 0xC0000081 (STAR): segment selectors
     #   Bits 47:32 = kernel CS selector (0x08) — for SYSCALL entry
@@ -37,35 +54,23 @@ fn syscall_init() {
         0x0F; 0x30;
     }
 
-    # Write LSTAR (MSR 0xC0000082) — handler address
-    # Need to split lstar_val into low32 and high32
-    var lstar_lo = lstar_val & 0xFFFFFFFF;
-    var lstar_hi = (lstar_val >> 32) & 0xFFFFFFFF;
-
-    # mov ecx, 0xC0000082
-    # mov eax, lstar_lo
-    # mov edx, lstar_hi
-    # wrmsr
-    # We build this as bytecode since we need runtime values
-    var msrbuf[32];
-    var mp = &msrbuf;
-    var mo = 0;
-    # mov ecx, 0xC0000082
-    store8(mp + mo, 0xB9); mo = mo + 1;
-    store32(mp + mo, 0xC0000082); mo = mo + 4;
-    # mov eax, imm32 (lstar_lo)
-    store8(mp + mo, 0xB8); mo = mo + 1;
-    store32(mp + mo, lstar_lo); mo = mo + 4;
-    # mov edx, imm32 (lstar_hi)
-    store8(mp + mo, 0xBA); mo = mo + 1;
-    store32(mp + mo, lstar_hi); mo = mo + 4;
-    # wrmsr
-    store8(mp + mo, 0x0F); store8(mp + mo + 1, 0x30); mo = mo + 2;
-    # ret
-    store8(mp + mo, 0xC3); mo = mo + 1;
-    # Execute the bytecode buffer (call rax = FF D0)
-    var mfn = &msrbuf;
-    asm { 0xFF; 0xD0; }
+    # Write LSTAR (MSR 0xC0000082) = &syscall_entry_buf (the SYSCALL entry RIP).
+    # 1.40.3: the old path built the wrmsr as bytecode in a LOCAL (stack) buffer
+    # and executed it via `var mfn = &msrbuf; asm { call rax }`. With EFER.NXE
+    # set (EFER=0xd00), the stack is no-execute, so that call faulted and LSTAR
+    # was never written — the first real SYSCALL then vectored to a stale/garbage
+    # LSTAR (into data ~0x113 B before the stub) and triple-faulted. NOT a Cyrius
+    # bug: the `var v = VALUE; asm {…rax…}` idiom itself is sound (the CR3
+    # switches rely on it and reach ring 3); the bug was *executing NX stack
+    # data*. Fixed with a direct wrmsr — `var lstar_v = lstar_val` lands the
+    # address in rax, then split to edx:eax and wrmsr. No bytecode, no stack exec.
+    var lstar_v = lstar_val;
+    asm {
+        0x48; 0x89; 0xC2;              # mov rdx, rax   (rax = lstar_val)
+        0x48; 0xC1; 0xEA; 0x20;        # shr rdx, 32    (edx = high32)
+        0xB9; 0x82; 0x00; 0x00; 0xC0;  # mov ecx, 0xC0000082 (LSTAR)
+        0x0F; 0x30;                     # wrmsr (edx:eax -> LSTAR; eax = rax low32)
+    }
 
     # Write SFMASK (MSR 0xC0000084) = 0x200 (clear IF)
     asm {
@@ -131,7 +136,7 @@ fn syscall_init() {
     # mov r10, [r10] — 4D 8B 12
     store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x12); eoff = eoff + 3;
     # mov cr3, r10 — 44 0F 22 DA
-    store8(ep + eoff, 0x44); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;  # mov cr3, r10 — 41 (REX.B for r10) 0F 22 DA; was 0x44 (REX.R → cr11 → #UD)
 
     # Save user RSP into kernel_rsp_save
     # mov r10, imm64(kernel_rsp_save addr)  — 49 BA imm64
@@ -140,10 +145,11 @@ fn syscall_init() {
     # mov [r10], rsp — 49 89 22
     store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x22); eoff = eoff + 3;
 
-    # Switch to kernel stack (use 0x1F0000 as dedicated syscall kernel stack)
-    # mov rsp, 0x1F0000  — 48 BC imm64
+    # Switch to the dedicated SYSCALL kernel stack (allocated above; not the old
+    # hardcoded 0x1F0000 that overlapped the kernel image).
+    # mov rsp, syscall_kstack_top  — 48 BC imm64
     store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0xBC); eoff = eoff + 2;
-    store64(ep + eoff, 0x1F0000); eoff = eoff + 8;
+    store64(ep + eoff, syscall_kstack_top); eoff = eoff + 8;
 
     # S9: Set IBRS (Spectre v2 mitigation) if supported
     # Now on kernel stack so we can use push/pop to preserve regs.
@@ -196,10 +202,17 @@ fn syscall_init() {
     # mov rdi, [r10] — 49 8B 3A  (user_rsp from kernel_rsp_save → rdi)
     store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x3A); eoff = eoff + 3;
 
+    # 1.40.3: STAC before the handler — SMAP (CR4.SMAP, set on Zen/-cpu max)
+    # blocks supervisor access to user (U/S=1) pages, so write()/read() copying
+    # the user buffer faulted (e=0001 on the user msg VA). STAC sets EFLAGS.AC,
+    # permitting the handler's user-memory access; CLAC clears it after. (Linux's
+    # user-copy model.) STAC/CLAC = 0F 01 CB / 0F 01 CA.
+    store8(ep + eoff, 0x0F); store8(ep + eoff + 1, 0x01); store8(ep + eoff + 2, 0xCB); eoff = eoff + 3;  # stac
     # call syscall_handler  — mov rax, imm64; call rax
     store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0xB8); eoff = eoff + 2;
     store64(ep + eoff, handler); eoff = eoff + 8;
     store8(ep + eoff, 0xFF); store8(ep + eoff + 1, 0xD0); eoff = eoff + 2;
+    store8(ep + eoff, 0x0F); store8(ep + eoff + 1, 0x01); store8(ep + eoff + 2, 0xCA); eoff = eoff + 3;  # clac
 
     # rax now has return value
 
@@ -224,7 +237,7 @@ fn syscall_init() {
     # mov r10, [r10]
     store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x12); eoff = eoff + 3;
     # mov cr3, r10
-    store8(ep + eoff, 0x44); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;  # mov cr3, r10 — 41 (REX.B for r10) 0F 22 DA; was 0x44 (REX.R → cr11 → #UD)
 
     # S9: Clear IBRS before returning to user mode (avoid user-mode perf hit)
     if (ibrs_supported == 1) {

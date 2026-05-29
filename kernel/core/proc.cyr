@@ -236,9 +236,16 @@ fn proc_create_address_space() {
     # User PD: only entry 0 (0-2MB) for SYSCALL/ISR trampoline — supervisor-only
     store64(u_pd, load64(0x3000) & (0 - 1 - 0x04));  # Copy entry 0, clear U/S bit
 
-    # Store user CR3 in the kernel PD at a known offset (entry 511, unused)
-    # so proc_get_user_cr3 can find it from the kernel CR3
-    store64(new_pd + 511 * 8, u_pml4);
+    # 1.40.3: collapse the KPTI split for ring-3 bring-up. The minimal user CR3
+    # (u_pml4, only 0-2MB supervisor) never mapped the user code/stack a running
+    # ring-3 process needs, and the SYSCALL/interrupt CR3-swap paths are unproven
+    # hand-asm that triple-faulted. Stash the FULL per-process CR3 (new_pml4) as
+    # the "user" CR3: it maps kernel pages supervisor (U/S=0 → ring 3 still can't
+    # touch them, so protection holds), user pages U/S=1 (ring 3 runs), the
+    # SYSCALL stub (0-2MB), the user stack, and the Local APIC (PDPT[3]). The
+    # stub's CR3 switches become safe no-ops. Only the Meltdown side-channel
+    # defense is deferred — KPTI-proper is its own arc.
+    store64(new_pd + 511 * 8, new_pml4);
 
     return new_pml4;
 }

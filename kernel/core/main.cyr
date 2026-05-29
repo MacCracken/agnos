@@ -1078,6 +1078,13 @@ sh_write_selftest();
 # exec-smoke.sh on the "EXEC-DISK-OK" marker + "run: exit 42".
 #ifdef EXEC_SELFTEST
 if (ext2_active == 1) {
+    # 1.40.3: initialize SYSCALL/SYSRET + allocate the syscall kernel stack NOW,
+    # before the user process exists. pmm_alloc_2mb then returns a low region
+    # (~0x200000, below the user code/stack VAs 0x400000/0x800000), so the kernel
+    # stack's identity VA can't collide with a user mapping. (Boot's syscall_init
+    # at ~line 1154 runs after this selftest, so without this the stack would be
+    # allocated late, inside the user VA window.)
+    syscall_init();
     var eb = &vfs_scratch_buf;
     var ez = 0;
     while (ez < 256) { store8(eb + ez, 0); ez = ez + 1; }

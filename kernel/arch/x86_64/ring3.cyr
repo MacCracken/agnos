@@ -43,9 +43,14 @@ fn exec_and_wait(entry, rsp, cr3) {
     # the frame-save asm above (which already stashed the return point).
     syscall_init();
 
-    # S8 (KPTI): set global CR3 pair for SYSCALL stub before entering ring 3
+    # 1.40.3: run ring 3 AND the SYSCALL stub under the SAME full per-process
+    # CR3 (exec_cr3_g, which maps kernel supervisor + user U/S + the stub 0-2MB +
+    # APIC). The old code ran the program under proc_get_user_cr3(exec_cr3_g) (a
+    # DIFFERENT, minimal CR3) while the stub switched to exec_cr3_g — so the
+    # stub's `mov cr3` landed in a CR3 that didn't map the stub → fault. Making
+    # both the same makes that switch a safe no-op. (KPTI-proper is a later arc.)
     kpti_kernel_cr3 = exec_cr3_g;
-    kpti_user_cr3 = proc_get_user_cr3(exec_cr3_g);
+    kpti_user_cr3 = exec_cr3_g;
 
     # 1.40.3: re-assert IA32_EFER.SCE (SYSCALL enable, bit 0) right before ring 3.
     # syscall_init sets it at boot, but ring 3 had never run, so the SYSCALL path

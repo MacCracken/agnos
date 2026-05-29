@@ -88,21 +88,21 @@ echo "  --- exec lines from boot log ---"
 strings "$LOG" | grep -E "^exec:|^run:" | sed 's/^/  /'
 echo ""
 
-# 1.40.2 validates the LOAD half: /prog is written to ext2, then the streaming
-# loader (elf_load_from_file) reads it back, parses the header, and maps it
-# into a new process. A correct entry (0x400078, from the hand-built ELF
-# header) proves the header was read from disk + parsed. Ring-3 EXECUTION
-# (exec_and_wait → "EXEC-DISK-OK" + exit 42) is bite 1.40.3.
+# 1.40.3 validates exec-from-disk END TO END: /prog (a hand-built static ELF64)
+# is written to ext2, stream-loaded (elf_load_from_file), run in ring 3 via
+# exec_and_wait, and its exit code captured. "EXEC-DISK-OK" proves the program
+# executed in ring 3 and its write(1,…) reached the console; "run: exit 42"
+# proves exec_and_wait resumed the kernel with the program's exit code.
 rc=0
-if strings "$LOG" | grep -q "^run: loaded pid="; then
-    echo "  PASS: elf_load_from_file loaded /prog from ext2 into a process (streaming load)"
+if strings "$LOG" | grep -q "^EXEC-DISK-OK"; then
+    echo "  PASS: /prog ran in ring 3 from disk — write(1) reached the console"
 else
-    echo "  FAIL: no 'run: loaded pid=' (streaming load did not complete)"; rc=1
+    echo "  FAIL: no 'EXEC-DISK-OK' (program did not run in ring 3)"; rc=1
 fi
-if strings "$LOG" | grep -q "entry=400078"; then
-    echo "  PASS: ELF header read from disk + parsed (entry=0x400078)"
+if strings "$LOG" | grep -q "^run: exit 42"; then
+    echo "  PASS: exec_and_wait resumed kernel + captured exit code 42"
 else
-    echo "  FAIL: wrong/absent entry point (header parse over disk)"; rc=1
+    echo "  FAIL: no 'run: exit 42' (ring-3 exit / exit-code path)"; rc=1
 fi
 
 # Post-boot fsck: the /prog write must leave the FS clean.
