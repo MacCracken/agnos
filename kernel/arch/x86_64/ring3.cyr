@@ -35,6 +35,14 @@ fn exec_and_wait(entry, rsp, cr3) {
     kernel_return_rsp = save_rbp;
     kernel_return_rip = save_retaddr;
 
+    # 1.40.3: re-run syscall_init right before ring 3. Ring 3 had never executed,
+    # so the SYSCALL MSRs (STAR / LSTAR / SFMASK / EFER.SCE) set at boot were
+    # never exercised — at the first real SYSCALL, SCE read clear (#UD) and RIP
+    # landed at 0x1000 (a bad LSTAR). Re-asserting them here (idempotent; also
+    # rebuilds the entry stub) guarantees SYSCALL vectors to our stub. Safe after
+    # the frame-save asm above (which already stashed the return point).
+    syscall_init();
+
     # S8 (KPTI): set global CR3 pair for SYSCALL stub before entering ring 3
     kpti_kernel_cr3 = exec_cr3_g;
     kpti_user_cr3 = proc_get_user_cr3(exec_cr3_g);
