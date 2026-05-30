@@ -1153,6 +1153,8 @@ fn exec_disk_selftest() {
     # a remaining per-process (pid reuse) issue → follow-on.
     kprintln("exec: running /bin/prog2", 24);
     sh_exec("run /bin/prog2", 14);
+    kprintln("exec: running /bin/prog2 #2", 27);
+    sh_exec("run /bin/prog2", 14);
     kprintln("exec: selftest done", 19);
     return 0;
 }

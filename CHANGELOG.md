@@ -5,6 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.6] — 2026-05-29 (**Exec-from-disk — bite 6 (post-arc follow-on): multi-`run` in one boot.** The shell can now run several programs sequentially — each loads from disk, runs in ring 3, and returns its own exit code. Two fixes resolved the second-exec fault.)
+
+### Fixed
+
+- **CR3 not restored on program exit** — the SYSCALL stub left CR3 = the per-process CR3 (mirrors 0-1 GB + PDPT[1..3] only, NOT the device MMIO). After the first program exited, the kernel kept running on that CR3, so the *next* `run`'s ext2 read faulted on the **NVMe BAR** (`CR2≈0xC0000010xx`). `kernel_resume` now restores the boot kernel CR3 (`0x1000`, maps everything incl. MMIO) before returning.
+- **Exit code mis-attributed across runs** — `proc_current` was never updated when a program ran, so a second `run`'s `exit(n)` recorded on the prior pid and came back 0. `sh_cmd_run` now sets `proc_current = pid` before `exec_and_wait` → each run reports its true exit code.
+
+### Changed
+
+- **`scripts/sweep.sh`** — each smoke now runs **once** per attempt (was running twice — pass-check + display) with a single retry, so a transient host-load/QEMU-timing flake doesn't fail the whole sweep (a real failure still fails both attempts).
+
+### Validation
+
+- exec-smoke extended to run `/bin/prog2` **twice** in one boot: ENOEXEC (`/notelf`) → run #1 `EXEC-DISK-OK` + `run: exit 42` → run #2 `EXEC-DISK-OK` + `run: exit 42` → `exec: selftest done`; `e2fsck` clean. exec-smoke 8/8 standalone. `scripts/sweep.sh` **7/7 PASS**, `check.sh` 11/11, `test.sh` 4/4. Production build **1,033,512 B → 1,033,528 B**.
+
+### Still follow-on
+
+- **1.40.7** — argv/env passing to programs. Then **1.40.8** — final hardening + burn prep (updated scripts). Deferred: preemptive ring 3 (interrupt-path KPTI), Meltdown-grade KPTI, FAT/exFAT exec, the user-driven combined VFS+exec iron burn.
+
+
 ## [1.40.5] — 2026-05-29 (**Exec-from-disk — bite 5 (arc close): hardening + clean multi-run + automated arc sweep + manual iron plan.** Fixes the two 1.40.4 follow-ons (clean exec_and_wait return; the kstack-collision flake), adds a one-command sweep of the last two arcs, and writes the on-iron manual checklist. The 1.40.x exec arc + the 1.39.x VFS arc are now ready for the combined iron burn.)
 
 ### Fixed
