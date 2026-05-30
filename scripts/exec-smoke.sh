@@ -118,13 +118,17 @@ if strings "$LOG" | grep -q "^run: exit 42"; then
 else
     echo "  FAIL: no 'run: exit 42' (ring-3 exit / exit-code path)"; rc=1
 fi
-# 1.40.7: argv — `run /bin/argc one two` → the program exit()s with argc (3),
-# proving argc/argv reach ring 3 on the SysV init stack. This is also the 2nd
-# sequential run of a DIFFERENT program (multi-run + per-run exit code).
-if strings "$LOG" | grep -q "^run: exit 3"; then
-    echo "  PASS: argv reached ring 3 — /bin/argc one two exited with argc=3"
+# 1.40.8: argv DEREF — `run /bin/argv Z` exits with argv[1][0] = 'Z' = 0x5A = 90.
+# This is exec #2 (after /bin/prog2) — within the proven 2-exec-per-boot envelope
+# (a 3rd real exec currently exhausts the 2 MB-page pool; teardown is a follow-on).
+# exit 90 is a STRONGER argv test than the 1.40.7 argc-count run it replaces: it
+# requires argc>=2 AND argv[1] to point at the real "Z" string in the user stack
+# (the 1.40.7 wrong-buffer bug — strings in a kernel scratch page — would make
+# argv[1] dereference garbage; argc-count alone could not catch it).
+if strings "$LOG" | grep -q "^run: exit 90"; then
+    echo "  PASS: argv[1] dereferenced — /bin/argv Z exited with argv[1][0]=90"
 else
-    echo "  FAIL: no 'run: exit 3' (argc/argv not delivered to the program)"; rc=1
+    echo "  FAIL: no 'run: exit 90' (argv[i] pointers don't resolve to arg strings)"; rc=1
 fi
 # Clean return after BOTH runs — "selftest done" proves exec_and_wait returned
 # into its caller frame each time (multi-run + shell-loop shape).

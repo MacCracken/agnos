@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.8] — 2026-05-29 (**Exec-from-disk — bite 8 (arc harden + burn prep).** Fixes a real argv bug the 1.40.7 smoke could not catch, adds an argv-dereference gate, and ships a one-command iron burn-prep script. The 1.39.x VFS + 1.40.x exec arcs are now iron-ready.)
+
+### Fixed
+- **argv strings landed in the wrong buffer (1.40.7 regression).** `elf_load_from_file` wrote each argv string into `elf_file_stack` — a *kernel* scratch buffer — while `argv[i]` pointed at `user_base + wp` in the *user* stack. `argc` (`[rsp]`) was correct, but any program that dereferenced `argv[i]` read uninitialised user memory. Strings are now written to `stack_phys + wp` (the phys alias of the user stack the process sees at `user_base + wp`). The dead `elf_file_stack[512]` buffer is removed.
+- **argv string-area overflow bound.** A token is emitted only when `str_o + tl + 1 < 0x4000` — a long command line can no longer write past the reserved top `0x1000` of the stack region (this is on top of the existing `argc <= 8` cap).
+
+### Added
+- **argv-dereference smoke gate (replaces the 1.40.7 argc-count run).** The exec selftest's exec #2 now builds `/bin/argv` (`exit(argv[1][0])`) and runs `run /bin/argv Z` → **exit 90** (0x5A), dereferencing `argv[1]` end-to-end. This is strictly stronger than the argc-count run it replaces: exit 90 requires `argc >= 2` AND `argv[1]` to point at the real `"Z"` string in the user stack — exactly the wrong-buffer bug above, which argc-count alone could not catch. `exec-smoke.sh` is 7 gates (ENOEXEC, subdir dispatch, EXEC-DISK-OK, exit 42, exit 90, clean return, e2fsck).
+- **`scripts/burn-prep.sh`** — one command to get iron-ready: runs the full arc sweep (aborts on red), builds the EXEC selftest kernel as `build/agnos`, reports freshness, and prints the exact flash + FB-watch steps (track A exec + track B FAT/exFAT) pointing at `exec-iron-manual-tests.md`.
+
+### Found (diagnosed, not yet fixed)
+- **Third sequential `run` in one boot fails at load** (`run: not an executable`). `elf_load_from_file` → `pmm_alloc_2mb()` returns 0: each exec allocates 2 MB pages for its segments + user stack and **never frees them on program exit** (no process teardown), so the 2 MB-page pool exhausts on the 3rd exec. Multi-run (1.40.6) was only ever validated at 2 execs. The selftest stays within that proven 2-exec envelope; **process teardown / page reclaim on exit** is now the top exec follow-on (it gates real interactive multi-program use).
+
+### Validation
+- `scripts/exec-smoke.sh` **7/7** (ENOEXEC, subdir dispatch, EXEC-DISK-OK, `run: exit 42`, `run: exit 90` argv deref, clean return, e2fsck), `check.sh` 11/11. `scripts/sweep.sh` **6/6** (ARC SWEEP: PASS — its exec gate now ends on `exit 90`). Production build **1,034,704 B → 1,034,768 B**.
+
+### Still follow-on
+- **Process teardown** (free 2 MB pages on exit — lifts the 2-exec-per-boot ceiling; see Found above) — top priority.
+- The user-driven combined VFS + exec **iron burn** (per `exec-iron-manual-tests.md`) — run `scripts/burn-prep.sh`, flash, watch the FB.
+- Deferred: argv envp/auxv *contents*, preemptive ring 3 (interrupt-path KPTI), Meltdown-grade KPTI, FAT/exFAT exec, `$PATH` search, `#!` scripts.
+
 ## [1.40.7] — 2026-05-29
 
 ## [1.40.6] — 2026-05-29 (**Exec-from-disk — bite 6 (post-arc follow-on): multi-`run` in one boot.** The shell can now run several programs sequentially — each loads from disk, runs in ring 3, and returns its own exit code. Two fixes resolved the second-exec fault.)

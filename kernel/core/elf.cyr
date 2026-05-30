@@ -253,6 +253,9 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
         var ts = ai;
         while (ai < argv_len) { if (load8(argv_src + ai) == 32) { break; } ai = ai + 1; }    # to next space
         var tl = ai - ts;
+        # 1.40.8: keep the arg strings within the reserved stack top (0x3100..
+        # 0x4000) — a long command line can't write past the stack region.
+        if (str_o + tl + 1 >= 0x4000) { break; }
         var k = 0;
         while (k < tl) { store8(stack_phys + str_o + k, load8(argv_src + ts + k)); k = k + 1; }
         store8(stack_phys + str_o + tl, 0);                                                   # NUL

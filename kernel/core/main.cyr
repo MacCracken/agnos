@@ -1151,11 +1151,11 @@ fn exec_disk_selftest() {
     kprintln("exec: running /bin/prog2", 24);
     sh_exec("run /bin/prog2", 14);
 
-    # 1.40.7: argv — build /bin/argc (a tiny ELF that exit()s with argc), then
-    # `run /bin/argc one two` → argc=3 → exit 3. Second sequential run (different
-    # program) also re-proves multi-run + per-run exit code. Reuses eb.
-    var ci = 0;
-    while (ci < 200) { store8(eb + ci, 0); ci = ci + 1; }
+    # 1.40.8: argv DEREF — build /bin/av (exit argv[1][0]) and `run /bin/av Z`
+    # → exit 0x5A (90). Proves argv[i] POINTERS resolve to the actual arg STRING
+    # bytes in the user stack; argc alone could not catch a wrong-buffer write.
+    var di = 0;
+    while (di < 200) { store8(eb + di, 0); di = di + 1; }
     store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
     store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
     store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
@@ -1163,17 +1163,18 @@ fn exec_disk_selftest() {
     store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
     store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
     store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
-    store8(eb + 96, 133); store8(eb + 104, 133);                  # p_filesz/memsz = 133
+    store8(eb + 96, 138); store8(eb + 104, 138);                  # p_filesz/memsz = 138
     store8(eb + 113, 0x10);                                       # p_align
-    # code @120: mov rdi,[rsp] (argc) ; mov rax,0 (exit) ; syscall
-    store8(eb + 120, 0x48); store8(eb + 121, 0x8B); store8(eb + 122, 0x3C); store8(eb + 123, 0x24);
-    store8(eb + 124, 0x48); store8(eb + 125, 0xC7); store8(eb + 126, 0xC0);
-    store8(eb + 131, 0x0F); store8(eb + 132, 0x05);
-    var aino = 0;
-    if (bino > 0) { aino = ext2_create(bino, "argc", 4); }
-    if (aino > 0) { ext2_write_at(aino, 0, eb, 133); ext2_sync(); }
-    kprintln("exec: running /bin/argc one two", 31);
-    sh_exec("run /bin/argc one two", 21);
+    # code @120: mov rsi,[rsp+0x10] (argv[1]) ; movzx rdi,byte[rsi] ; mov rax,0 ; syscall
+    store8(eb + 120, 0x48); store8(eb + 121, 0x8B); store8(eb + 122, 0x74); store8(eb + 123, 0x24); store8(eb + 124, 0x10);
+    store8(eb + 125, 0x48); store8(eb + 126, 0x0F); store8(eb + 127, 0xB6); store8(eb + 128, 0x3E);
+    store8(eb + 129, 0x48); store8(eb + 130, 0xC7); store8(eb + 131, 0xC0);
+    store8(eb + 136, 0x0F); store8(eb + 137, 0x05);
+    var vino = 0;
+    if (bino > 0) { vino = ext2_create(bino, "argv", 4); }
+    if (vino > 0) { ext2_write_at(vino, 0, eb, 138); ext2_sync(); }
+    kprintln("exec: running /bin/argv Z", 25);
+    sh_exec("run /bin/argv Z", 15);
 
     kprintln("exec: selftest done", 19);
     return 0;
