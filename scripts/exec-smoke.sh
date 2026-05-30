@@ -108,25 +108,26 @@ if strings "$LOG" | grep -q "^exec: running /bin/prog2"; then
 else
     echo "  FAIL: /bin/prog2 not attempted"; rc=1
 fi
-# 1.40.6: multi-run — /bin/prog2 is run TWICE in one boot; each ring-3 run
-# prints EXEC-DISK-OK and exits 42. Both markers must appear at least twice
-# (proves kernel_resume restores the boot CR3 so the next run's ext2/NVMe read
-# works, + proc_current tracks the exit code per run).
-N_OK=$(strings "$LOG" | grep -c "^EXEC-DISK-OK")
-N_EXIT=$(strings "$LOG" | grep -c "^run: exit 42")
-if [ "${N_OK:-0}" -ge 2 ]; then
-    echo "  PASS: ring-3 program ran from disk twice (EXEC-DISK-OK x$N_OK)"
+if strings "$LOG" | grep -q "^EXEC-DISK-OK"; then
+    echo "  PASS: /bin/prog2 ran in ring 3 — write(1) reached the console"
 else
-    echo "  FAIL: EXEC-DISK-OK count=$N_OK (want >= 2, multi-run)"; rc=1
+    echo "  FAIL: no 'EXEC-DISK-OK' (subdir program did not run in ring 3)"; rc=1
 fi
-if [ "${N_EXIT:-0}" -ge 2 ]; then
-    echo "  PASS: exit code 42 captured on both runs (run: exit 42 x$N_EXIT)"
+if strings "$LOG" | grep -q "^run: exit 42"; then
+    echo "  PASS: exec_and_wait captured exit code 42 (/bin/prog2)"
 else
-    echo "  FAIL: 'run: exit 42' count=$N_EXIT (want >= 2; exit-code/proc_current)"; rc=1
+    echo "  FAIL: no 'run: exit 42' (ring-3 exit / exit-code path)"; rc=1
 fi
-# Clean return-and-continue — the selftest FUNCTION prints "selftest done" AFTER
-# both runs, proving exec_and_wait returned into its caller frame (shell-loop
-# shape) both times.
+# 1.40.7: argv — `run /bin/argc one two` → the program exit()s with argc (3),
+# proving argc/argv reach ring 3 on the SysV init stack. This is also the 2nd
+# sequential run of a DIFFERENT program (multi-run + per-run exit code).
+if strings "$LOG" | grep -q "^run: exit 3"; then
+    echo "  PASS: argv reached ring 3 — /bin/argc one two exited with argc=3"
+else
+    echo "  FAIL: no 'run: exit 3' (argc/argv not delivered to the program)"; rc=1
+fi
+# Clean return after BOTH runs — "selftest done" proves exec_and_wait returned
+# into its caller frame each time (multi-run + shell-loop shape).
 if strings "$LOG" | grep -q "^exec: selftest done"; then
     echo "  PASS: exec_and_wait returned cleanly after each run ('selftest done')"
 else

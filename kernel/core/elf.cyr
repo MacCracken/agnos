@@ -133,7 +133,7 @@ fn elf_load(elf_addr, elf_size) {
 # (vfs_read_file_at is ext2-only; FAT/exFAT exec is a follow-on). Returns pid
 # or -1. CR3-switch idiom mirrors elf_load: assign the target to a var (lands
 # in rax) immediately before `asm { mov cr3, rax; }`.
-fn elf_load_from_file(path, namelen) {
+fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     var canary = stack_canary_secret;
     var fsize = vfs_file_size(path, namelen);
     if (fsize < 64) { return 0 - 1; }                 # too small for an ELF64 header
@@ -234,7 +234,38 @@ fn elf_load_from_file(path, namelen) {
     if (vmm_is_mapped(stack_phys) == 0) { vmm_map(stack_phys, stack_phys, 0x83); }
     proc_map_page(new_cr3, stack_base, stack_phys);
     proc_unmap_page(new_cr3, stack_base - 0x200000);
-    var stack_top = stack_base + 0x4000;
+
+    # 1.40.7: build the SysV process init stack so the program gets argc/argv.
+    # The stack page maps stack_base -> stack_phys 1:1 (both 2 MB-aligned), so we
+    # write the layout via stack_phys (identity) and the program reads it at
+    # stack_base+off. Layout at entry: rsp -> [argc][argv0]..[argvN-1][NULL]
+    # [envp NULL][auxv AT_NULL(0,0)] ; the argv strings live higher up the page.
+    # Control block at stack offset 0x3000 (16-aligned → rsp 16-aligned, ~12 KB
+    # of stack below it for the program); strings from 0x3100. argv_src is the
+    # raw command tail ("/bin/argc a b"); argv[0] is its first token. argc ≤ 8.
+    var argc = 0;
+    var str_o = 0x3100;
+    var ai = 0;
+    while (ai < argv_len) {
+        while (ai < argv_len) { if (load8(argv_src + ai) != 32) { break; } ai = ai + 1; }   # skip spaces
+        if (ai >= argv_len) { break; }
+        if (argc >= 8) { break; }
+        var ts = ai;
+        while (ai < argv_len) { if (load8(argv_src + ai) == 32) { break; } ai = ai + 1; }    # to next space
+        var tl = ai - ts;
+        var k = 0;
+        while (k < tl) { store8(stack_phys + str_o + k, load8(argv_src + ts + k)); k = k + 1; }
+        store8(stack_phys + str_o + tl, 0);                                                   # NUL
+        store64(stack_phys + 0x3008 + argc * 8, stack_base + str_o);                          # argv[argc] -> string VA
+        str_o = str_o + tl + 1;
+        argc = argc + 1;
+    }
+    store64(stack_phys + 0x3000, argc);                          # argc
+    store64(stack_phys + 0x3008 + argc * 8, 0);                  # argv NULL
+    store64(stack_phys + 0x3008 + (argc + 1) * 8, 0);            # envp NULL
+    store64(stack_phys + 0x3008 + (argc + 2) * 8, 0);            # auxv AT_NULL type
+    store64(stack_phys + 0x3008 + (argc + 3) * 8, 0);            # auxv AT_NULL val
+    var stack_top = stack_base + 0x3000;                         # rsp -> argc
 
     var new_pid = proc_create_full(entry, stack_top);
     if (new_pid >= 0) { proc_set_cr3(new_pid, new_cr3); }

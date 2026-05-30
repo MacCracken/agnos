@@ -736,10 +736,17 @@ fn sh_cmd_sync() {
 # calls exit(). proc_table layout: entry@+24, rsp@+16, cr3@+160 (176-B rows).
 fn sh_cmd_run(arg, arglen) {
     sh_trim(arg, arglen);
-    if (sh_trim_len < 1) { kprintln("usage: run <path>", 17); return 0; }
+    if (sh_trim_len < 1) { kprintln("usage: run <path> [args]", 24); return 0; }
     if (ext2_active == 0) { kprintln("run: needs ext2 fs", 18); return 0; }
-    if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("run: bad path", 13); return 0; }
-    var pid = elf_load_from_file(&sh_path_buf, sh_path_len);
+    # 1.40.7: split the PATH token (up to the first space) from the args. Resolve
+    # only the path token to absolute (sh_abspath); pass the WHOLE trimmed tail
+    # as argv_src so the program gets argc/argv (argv[0] = the path as typed).
+    var av = arg + sh_trim_off;
+    var avlen = sh_trim_len;
+    var plen = 0;
+    while (plen < avlen) { if (load8(av + plen) == 32) { break; } plen = plen + 1; }
+    if (sh_abspath(av, plen) < 0) { kprintln("run: bad path", 13); return 0; }
+    var pid = elf_load_from_file(&sh_path_buf, sh_path_len, av, avlen);
     if (pid < 0) { kprintln("run: not an executable", 22); return 0; }
     # 1.40.3 — wire ring-3 execution: enter the loaded program in ring 3 via
     # exec_and_wait (saves the kernel return point; the program's exit() syscall

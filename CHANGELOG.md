@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.7] — 2026-05-29
+
 ## [1.40.6] — 2026-05-29 (**Exec-from-disk — bite 6 (post-arc follow-on): multi-`run` in one boot.** The shell can now run several programs sequentially — each loads from disk, runs in ring 3, and returns its own exit code. Two fixes resolved the second-exec fault.)
 
 ### Fixed
