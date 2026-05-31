@@ -138,7 +138,33 @@ fn exc_handlers_init() {
             store8(stub + 53, 0xE6); store8(stub + 54, 0x70);
             store8(stub + 55, 0x48); store8(stub + 56, 0x8B); store8(stub + 57, 0x04); store8(stub + 58, 0x24);  # mov rax,[rsp]
             store8(stub + 59, 0xE6); store8(stub + 60, 0x71);
-            tail = 61;
+            # 1.40.9 follow-on #2: the low-24 CR2 (0x5C-0x5E) is ambiguous — a
+            # ≥4 GB faulting address reads back identical to a low one once the
+            # top bytes are dropped, and the static audit proved low 0x6190 IS
+            # mapped (so the real address must be ≥4 GB). Stamp CR2 bits 24-47
+            # too → the full 48-bit canonical #PF address. (#PF faulting
+            # addresses are always canonical, so bits 48-63 are sign-extension
+            # of bit 47 — no need to stamp them.) Slots 0x60-0x62 = retired xhci
+            # PORTPMSC range, low 0x70/0x71 bank (the trustworthy one on Zen).
+            # 0x60 <- CR2 bits 31:24
+            store8(stub + 61, 0xB0); store8(stub + 62, 0x60);
+            store8(stub + 63, 0xE6); store8(stub + 64, 0x70);
+            store8(stub + 65, 0x0F); store8(stub + 66, 0x20); store8(stub + 67, 0xD0);             # mov rax,cr2
+            store8(stub + 68, 0x48); store8(stub + 69, 0xC1); store8(stub + 70, 0xE8); store8(stub + 71, 0x18);  # shr rax,24
+            store8(stub + 72, 0xE6); store8(stub + 73, 0x71);
+            # 0x61 <- CR2 bits 39:32
+            store8(stub + 74, 0xB0); store8(stub + 75, 0x61);
+            store8(stub + 76, 0xE6); store8(stub + 77, 0x70);
+            store8(stub + 78, 0x0F); store8(stub + 79, 0x20); store8(stub + 80, 0xD0);             # mov rax,cr2
+            store8(stub + 81, 0x48); store8(stub + 82, 0xC1); store8(stub + 83, 0xE8); store8(stub + 84, 0x20);  # shr rax,32
+            store8(stub + 85, 0xE6); store8(stub + 86, 0x71);
+            # 0x62 <- CR2 bits 47:40
+            store8(stub + 87, 0xB0); store8(stub + 88, 0x62);
+            store8(stub + 89, 0xE6); store8(stub + 90, 0x70);
+            store8(stub + 91, 0x0F); store8(stub + 92, 0x20); store8(stub + 93, 0xD0);             # mov rax,cr2
+            store8(stub + 94, 0x48); store8(stub + 95, 0xC1); store8(stub + 96, 0xE8); store8(stub + 97, 0x28);  # shr rax,40
+            store8(stub + 98, 0xE6); store8(stub + 99, 0x71);
+            tail = 100;
         }
         # cli ; hlt ; jmp $-1            (mask + halt, loop back onto hlt)
         store8(stub + tail + 0, 0xFA);
