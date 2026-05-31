@@ -113,6 +113,19 @@ echo "  --- ext2w self-test lines from boot log ---"
 strings "$LOG" | grep -E "^ext2w:" | sed 's/^/  /'
 echo ""
 
+# Wrong-build guard. The ext2 write self-test only exists in a kernel built
+# with EXT2_WRITE_SELFTEST=1; a production / other-selftest build boots fine
+# but emits ZERO `ext2w:` lines, so the gates below cascade red as if the ext2
+# backend were broken (the exFAT analogue was misfiled as the mkfs-1.3.2-drift
+# issue). Distinguish "kernel booted but selftest absent" from a real result.
+if ! strings "$LOG" | grep -q "^ext2w:"; then
+    echo "  ERROR: kernel booted but produced NO 'ext2w:' lines — this build does"
+    echo "         NOT contain the ext2 write self-test. Rebuild with the flag:"
+    echo "             EXT2_WRITE_SELFTEST=1 ./scripts/build.sh"
+    echo "         (a leftover production / other-selftest build/agnos is the usual cause). Log: $LOG"
+    exit 2
+fi
+
 rc=0
 
 # Bite 2 (1.33.1): crc32c Castagnoli primitive — known iSCSI vector.

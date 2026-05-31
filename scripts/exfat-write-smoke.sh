@@ -98,6 +98,22 @@ echo "  --- exfat write lines from boot log ---"
 strings "$LOG" | grep -E "^exfat:|^exfatw:" | sed 's/^/  /'
 echo ""
 
+# Wrong-build guard. The exFAT write self-test only exists in a kernel built
+# with EXFAT_WRITE_SELFTEST=1; a production / EXEC_SELFTEST build boots fine
+# but emits ZERO `exfatw:` lines, so AGNOS never mutates the volume. Without
+# this guard that surfaces as 25 red gates + "fsck clean but no file counted"
+# — a misleading cascade that reads like an exFAT-backend / mkfs-format bug
+# (it was misfiled exactly that way as the 2026-05-31 mkfs-1.3.2-drift issue,
+# whose real cause was the smoke run against a leftover exec-iron build).
+# Distinguish "kernel booted but selftest absent" from a genuine result.
+if ! strings "$LOG" | grep -q "^exfatw:"; then
+    echo "  ERROR: kernel booted but produced NO 'exfatw:' lines — this build does"
+    echo "         NOT contain the exFAT write self-test. Rebuild with the flag:"
+    echo "             EXFAT_WRITE_SELFTEST=1 ./scripts/build.sh"
+    echo "         (a leftover production / EXEC_SELFTEST build/agnos is the usual cause). Log: $LOG"
+    exit 2
+fi
+
 # Extract the mutated exFAT partition back out of the image and fsck it.
 EXAFTER="$WORK/exfat-after.part"
 dd if="$IMG" of="$EXAFTER" bs=512 skip="$P2_FIRST" count="$P2_SECTORS" status=none

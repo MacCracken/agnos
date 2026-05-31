@@ -87,6 +87,19 @@ echo "  --- fat lines from boot log ---"
 strings "$LOG" | grep -E "^fat: mounted|^fatw:" | sed 's/^/  /'
 echo ""
 
+# Wrong-build guard. The FAT write self-test only exists in a kernel built
+# with FATFS_WRITE_SELFTEST=1; a production / other-selftest build boots fine
+# but emits ZERO `fatw:` lines, so the gates below cascade red as if the FAT
+# backend were broken (the exFAT analogue was misfiled as the mkfs-1.3.2-drift
+# issue). Distinguish "kernel booted but selftest absent" from a real result.
+if ! strings "$LOG" | grep -q "^fatw:"; then
+    echo "  ERROR: kernel booted but produced NO 'fatw:' lines — this build does"
+    echo "         NOT contain the FAT write self-test. Rebuild with the flag:"
+    echo "             FATFS_WRITE_SELFTEST=1 FAT_ALLOW_ESP_WRITE=1 ./scripts/build.sh"
+    echo "         (a leftover production / other-selftest build/agnos is the usual cause). Log: $LOG"
+    exit 2
+fi
+
 rc=0
 
 # 1. self-test reported clean create (3a) + write (3b)
