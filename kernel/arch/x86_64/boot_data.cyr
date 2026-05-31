@@ -12,6 +12,17 @@ var gdt_ptr[16];
 # Read via `load64(&boot_info_ptr)` once the kernel reaches main code.
 # Unused in ELF32 multiboot1 builds; the 8 bytes are harmless overhead.
 var boot_info_ptr[8];
+# Low (<4 GB) kernel-resident copy of gnoboot's boot_info struct. gnoboot is
+# a UEFI PE app that firmware loads at an arbitrary base — on a RAM-rich Zen
+# box (archaemenid) that base is >=4 GB, so RDI/&boot_info >= 4 GB. The kernel
+# reads boot_info in place, which works during boot (UEFI's all-RAM identity
+# map is live) but FAULTS once exec switches to a per-process CR3 that maps
+# only 0-4 GB (pt_init's ceiling) — fb_fb_phys #PF'd reading boot_info+0x48
+# during prog2's first write (1.40.9 iron #PF, CR2 ~0x140006190). boot_info_
+# capture_rdi memcpy's the struct here at capture time and repoints
+# boot_info_ptr at this low buffer, making every later read CR3-independent.
+# [16]=128 B covers gnoboot's 120 B (var boot_info[15]) struct.
+var boot_info_copy[16];
 var tss[104];      # x86_64 TSS is 104 bytes
 var idt[4096];     # 256 vectors x 16 bytes each
 var idt_ptr[16];

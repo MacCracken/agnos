@@ -43,6 +43,21 @@ fn boot_info_capture_rdi(): i64 {
     asm {
         0x48; 0x89; 0x38;            # mov [rax], rdi
     }
+    # boot_info_ptr now holds gnoboot's &boot_info — the runtime load address
+    # of gnoboot's PE image, which UEFI places >=4 GB on a RAM-rich Zen box.
+    # Reading it in place works HERE (UEFI's all-RAM identity map is still the
+    # live CR3) but the per-process CR3 used during exec maps only 0-4 GB
+    # (pt_init's ceiling), so fb_fb_phys's load64(boot_info+0x48) #PF'd during
+    # prog2's first write (1.40.9 iron #PF, RIP=fb_fb_phys, CR2 ~0x140006190).
+    # Copy the struct into a LOW (<4 GB) kernel buffer and repoint, so every
+    # later read is CR3-independent. The copy must run now, before any
+    # per-process CR3 is loaded — this top-level call is the first thing after
+    # the boot shim, long before exec. memcpy(dst, src, n).
+    var src = load64(&boot_info_ptr);
+    if (src != 0) {
+        memcpy(&boot_info_copy, src, 128);
+        store64(&boot_info_ptr, &boot_info_copy);
+    }
     return 0;
 }
 #endif
