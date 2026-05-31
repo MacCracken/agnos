@@ -64,6 +64,20 @@ fn is_user_range(ptr, len) {
 fn kernel_resume() {
     kernel_return_rsp = 0;
     kernel_return_rip = 0;
+    # 1.40.10 bite 2 — restore the kernel main thread (proc 0) as current after a
+    # program exits. sh_cmd_run sets proc_current = the exec pid for exit-code
+    # attribution; without this reset proc_current stays on that now-dead
+    # (state=0) proc, and the next timer tick's do_context_switch (sched.cyr)
+    # takes it as `old` and unconditionally marks it ready again (line 150,
+    # deliberately unconditional per iron Attempt 14 — do NOT make it conditional),
+    # resurrecting a dead exec proc that sched_next could then switch into → an
+    # iretq into ring-3 user code under CS=0x08. Pointing proc_current back at
+    # proc 0 (the kmain thread registered before sched_active=1) keeps every
+    # post-exit timer tick switching kmain↔idle only. Exit-code attribution is
+    # unaffected: sh_cmd_run reads the local pid (shell.cyr:765), not proc_current,
+    # and the exit code was already stamped before kernel_resume was called. During
+    # the boot exec selftest sched_active=0 (no scheduling) so this is a no-op there.
+    proc_current = 0;
     # 1.40.6: restore the BOOT kernel CR3 (0x1000). On the program's exit the
     # SYSCALL stub left CR3 = the per-process CR3, which mirrors only 0-1 GB +
     # PDPT[1..3] — it does NOT map the device MMIO (NVMe BAR ~0xC0000010xx) that
