@@ -2246,6 +2246,15 @@ fn ext2_dir_remove(dir_ino, name, name_len) {
 # → init inode → insert dirent; rolls back the inode if the dirent fails.
 fn ext2_create(dir_ino, name, name_len) {
     if (ext2_write_ok == 0) { return 0 - 1; }
+    # Duplicate-dirent guard (the 1409 e2fsck finding). ext2_link/ext2_rename
+    # already refuse an existing name; ext2_create did NOT — so re-creating the
+    # same name (a selftest seed re-run across reboots on a persistent FS, or a
+    # shell `touch` of an existing file) appended a SECOND dirent with the same
+    # name, which e2fsck flagged as "Duplicate entry" / "non-unique filename".
+    # POSIX open(O_CREAT)-without-O_EXCL: an existing name is RETURNED, not
+    # recreated. Idempotent + no dirent duplication.
+    var existing = ext2_dir_lookup(dir_ino, name, name_len);
+    if (existing > 0) { return existing; }
     var ino = ext2_alloc_inode(0);
     if (ino <= 0) { return 0 - 1; }
 
@@ -2345,6 +2354,16 @@ fn ext2_dir_is_empty(dir_ino) {
 # number (>0) or -1. Rolls back the inode+block if the parent insert fails.
 fn ext2_mkdir(parent_ino, name, name_len) {
     if (ext2_write_ok == 0) { return 0 - 1; }
+    # Duplicate-dirent guard (the 1409 e2fsck finding — see ext2_create). If the
+    # name already exists, return it when it's a directory (idempotent mkdir),
+    # else it's a real file/dir-name conflict → refuse. Without this, a seed
+    # re-run appended duplicate 'bin'/'shdir'/… dirents across reboots.
+    var existing = ext2_dir_lookup(parent_ino, name, name_len);
+    if (existing > 0) {
+        if (ext2_get_inode(existing, &ext2_inode_buf) != 0) { return 0 - 1; }
+        if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0x4000) { return existing; }
+        return 0 - 1;
+    }
     var ino = ext2_alloc_inode(1);                 # is_dir → bg_used_dirs++
     if (ino <= 0) { return 0 - 1; }
     var db = ext2_alloc_block(0);

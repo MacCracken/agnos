@@ -101,14 +101,53 @@ fn exc_handlers_init() {
         # mov al,0xE5 ; out 0x71,al      (magic: exception caught this boot)
         store8(stub + 12, 0xB0); store8(stub + 13, 0xE5);
         store8(stub + 14, 0xE6); store8(stub + 15, 0x71);
+        # 1.40.9 follow-on: #PF (v==14) ALSO captures the fault address (CR2) +
+        # the on-stack error code — the datum the 1409 re-burn proved we need
+        # (it read CMOS[0x54]=0x0E = #PF, but "which page?" needs CR2). CR2 = the
+        # faulting linear addr; [rsp] at handler entry = the CPU-pushed #PF error
+        # code (bit0 P, bit1 W/R, bit2 U/S, bit3 RSVD, bit4 I/D). All via the
+        # PROVEN low CMOS bank (port 0x70/0x71): the extended 0x72/0x73 bank read
+        # back noise at the 1409 burn (CMOS[0x86]=0x5A, not the 0xCC sentinel),
+        # so it is NOT trustworthy. Slots 0x5C-0x5F are r8169 RX post-mortem on a
+        # normal boot, but the r8169 path runs at boot — long before exec — so on
+        # a #PF-halt boot (0x55=0xE5, 0x54=0x0E) they safely carry CR2/errcode as
+        # the last writer (same overload pattern as 0x54/0x55; read-boot-log
+        # decodes the dual meaning). Register-only except [rsp]; robust at fault
+        # time. CR2 bits 23:16 alone discriminate code (0x40) vs stack (0x80/0xC0).
+        var tail = 16;
+        if (v == 14) {
+            # 0x5C <- CR2 bits 23:16
+            store8(stub + 16, 0xB0); store8(stub + 17, 0x5C);
+            store8(stub + 18, 0xE6); store8(stub + 19, 0x70);
+            store8(stub + 20, 0x0F); store8(stub + 21, 0x20); store8(stub + 22, 0xD0);             # mov rax,cr2
+            store8(stub + 23, 0x48); store8(stub + 24, 0xC1); store8(stub + 25, 0xE8); store8(stub + 26, 0x10);  # shr rax,16
+            store8(stub + 27, 0xE6); store8(stub + 28, 0x71);
+            # 0x5D <- CR2 bits 15:8
+            store8(stub + 29, 0xB0); store8(stub + 30, 0x5D);
+            store8(stub + 31, 0xE6); store8(stub + 32, 0x70);
+            store8(stub + 33, 0x0F); store8(stub + 34, 0x20); store8(stub + 35, 0xD0);             # mov rax,cr2
+            store8(stub + 36, 0x48); store8(stub + 37, 0xC1); store8(stub + 38, 0xE8); store8(stub + 39, 0x08);  # shr rax,8
+            store8(stub + 40, 0xE6); store8(stub + 41, 0x71);
+            # 0x5E <- CR2 bits 7:0
+            store8(stub + 42, 0xB0); store8(stub + 43, 0x5E);
+            store8(stub + 44, 0xE6); store8(stub + 45, 0x70);
+            store8(stub + 46, 0x0F); store8(stub + 47, 0x20); store8(stub + 48, 0xD0);             # mov rax,cr2
+            store8(stub + 49, 0xE6); store8(stub + 50, 0x71);
+            # 0x5F <- #PF error code (low byte) = [rsp] at entry
+            store8(stub + 51, 0xB0); store8(stub + 52, 0x5F);
+            store8(stub + 53, 0xE6); store8(stub + 54, 0x70);
+            store8(stub + 55, 0x48); store8(stub + 56, 0x8B); store8(stub + 57, 0x04); store8(stub + 58, 0x24);  # mov rax,[rsp]
+            store8(stub + 59, 0xE6); store8(stub + 60, 0x71);
+            tail = 61;
+        }
         # cli ; hlt ; jmp $-1            (mask + halt, loop back onto hlt)
-        store8(stub + 16, 0xFA);
-        store8(stub + 17, 0xF4);
-        store8(stub + 18, 0xEB); store8(stub + 19, 0xFD);
+        store8(stub + tail + 0, 0xFA);
+        store8(stub + tail + 1, 0xF4);
+        store8(stub + tail + 2, 0xEB); store8(stub + tail + 3, 0xFD);
         # Install as a 64-bit interrupt gate, kernel CS 0x08, present DPL0
         # (0x8E). CPU-generated exceptions ignore the gate DPL, so DPL0 is fine.
         idt_set_gate(&idt + v * 16, stub, 0x08, 0x8E);
-        off = off + 20;
+        off = off + tail + 4;
     }
     return 0;
 }
