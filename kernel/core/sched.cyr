@@ -176,3 +176,26 @@ fn do_context_switch(isr_rsp) {
 
     return 0;
 }
+
+# === Kernel idle thread (1.40.10) ===
+# A real, schedulable kernel thread that does nothing but hlt-and-yield.
+# Registered as proc 1 alongside the kernel main thread (proc 0) right
+# before sched_active=1 in the production boot path (main.cyr). It exists so
+# the round-robin always has a valid runnable proc to fall back to: before
+# this, the exec-from-disk selftest (1.40.x) left only dead exec procs in the
+# table, so the first timer tick after scheduler activation (the DHCP DISCOVER
+# hlt-wait on iron) context-switched into a dead exec proc — cr3_load'd its
+# stale per-process CR3 and iretq'd into a user RIP in ring 0 → triple-fault
+# reset. With kmain + idle both carrying the boot CR3 (0x1000), do_context_switch's
+# new_cr3 != old_cr3 guard never fires, so preemption is pure register
+# save/restore in one shared address space (kernel-threads model; the
+# per-process-AS preemption story is the future multi-threading arc).
+# Its own kernel stack (module-scope var X[N] = N*u64 = 4096 B).
+var kernel_idle_stack[512];
+
+fn kernel_idle_loop() {
+    while (1) {
+        arch_wait();   # hlt; the timer ISR preempts and the scheduler yields back
+    }
+    return 0;
+}

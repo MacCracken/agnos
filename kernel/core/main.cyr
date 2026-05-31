@@ -1313,6 +1313,26 @@ kprint_num(timer_ticks);
 kprintln("", 0);
 
 kprintln("Activating scheduler...", 23);
+
+# 1.40.10 — register the kernel main thread + an idle thread as real procs
+# before activating preemption (production path; KTEST builds set up their own
+# proc_a/proc_b above). The exec-from-disk selftest leaves dead exec procs in
+# slots 0..N with proc_current on the last one; without a valid runnable proc
+# the first timer tick after sched_active=1 (the DHCP DISCOVER hlt-wait on iron)
+# fell back to a dead exec proc, cr3_load'd its stale per-process CR3 and
+# iretq'd into a ring-3 RIP in ring 0 → triple-fault reset. Build proc 0 = this
+# kernel main thread (already running) + proc 1 = the hlt idle thread, both on
+# the boot CR3 (0x1000, where kernel_resume left us post-exec) so the equal-CR3
+# guard in do_context_switch skips cr3_load entirely — preemption is pure
+# register save/restore in one shared address space. See sched.cyr kernel_idle_loop.
+#ifndef KTEST
+proc_count = 0;
+proc_current = 0;
+proc_create(0);                 # proc 0 = kernel main (running now; context saved on first switch-away)
+proc_set_state(0, 2);           # running
+proc_create_full(&kernel_idle_loop, &kernel_idle_stack + 4096);  # proc 1 = idle (ready)
+#endif
+
 sched_active = 1;
 
 # === CMOS kernel checkpoint 16 (scheduler armed) ===
