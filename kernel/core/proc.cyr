@@ -209,10 +209,27 @@ fn proc_create_address_space() {
         var entry = load64(0x3000 + i * 8);
         store64(new_pd + i * 8, entry);
     }
-    # Mirror kernel PDPT[1..3] (1 GB huge pages for 1–4 GB) too, so any
-    # kernel access >1 GB while CR3 = per-process also resolves.
-    for (var pi = 1; pi < 4; pi = pi + 1) {
+    # Mirror ALL present kernel PDPT entries [1..511], not just the 1–4 GB
+    # huge pages. vmm_remap_uc_2mb / vmm_remap_wc_2mb (vmm.cyr) install
+    # device-MMIO and ≥4 GB BARs at arbitrary pdpt_idx in the kernel PDPT,
+    # and a running program's syscalls do kernel-side work (console, device
+    # I/O) under THIS per-process CR3. Copying only [1..3] left every mapping
+    # ≥4 GB absent → the 1.40.6 NVMe-BAR fault (worked around by kernel_resume
+    # restoring the boot CR3 on exit). Making the per-process CR3 a faithful
+    # superset of the kernel map removes that whole class of "mapped under the
+    # boot CR3, not under exec_cr3_g" faults. Kernel PDPT entries carry U/S=0,
+    # so ring 3 still can't reach them — protection holds. (Entries that are
+    # absent in the kernel PDPT copy as 0 = not-present, which is harmless.)
+    for (var pi = 1; pi < 512; pi = pi + 1) {
         store64(new_pdpt + pi * 8, load64(0x2000 + pi * 8));
+    }
+    # Mirror present kernel PML4 entries [1..511] too — vmm_remap_*'s
+    # pml4_idx > 0 branch (phys ≥ 512 GB) installs whole high PDPTs directly
+    # in the kernel PML4 @ 0x1000. Without these the per-process CR3 cannot
+    # reach them. PML4[0] stays our custom new_pdpt (set above); [1..511]
+    # share the kernel's (supervisor-only, so ring 3 is still walled off).
+    for (var mi = 1; mi < 512; mi = mi + 1) {
+        store64(new_pml4 + mi * 8, load64(0x1000 + mi * 8));
     }
 
     # S8 (KPTI): Allocate separate user page tables with minimal kernel mappings
