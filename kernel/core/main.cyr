@@ -50,6 +50,11 @@ kprintln("TSS loaded (ring 3 ready)", 25);
 
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x82; 0xE6; 0x71; }   # CP 0x82: pre-idt
 idt_init();
+# 1.40.9: replace the bare-iretq default on vectors 0-31 with real handlers
+# that stamp the faulting vector to CMOS[0x54] + halt — so a CPU exception
+# during the ring-3 exec transition stops triple-faulting into a silent reset
+# and instead leaves a readable cause. See exc_handlers_init in idt.cyr.
+exc_handlers_init();
 kprintln("IDT loaded", 10);
 
 # === CMOS kernel checkpoint 6 (arch interrupts ready: GDT+TSS+IDT) ===

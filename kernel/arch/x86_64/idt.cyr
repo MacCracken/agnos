@@ -34,3 +34,81 @@ fn idt_init() {
     asm { lidt [rax]; }
     return 0;
 }
+
+# 1.40.9: real CPU-exception handlers for vectors 0-31.
+#
+# WHY: idt_init() points every vector at `isr_stub` = a bare `iretq`. For a
+# fault that pushes an error code (#GP 13, #PF 14, #DF 8, #SS 12, #NP 11) the
+# bare iretq pops the WRONG frame (the error code is still on the stack) and
+# returns to garbage -> a second fault -> #DF -> #TF -> silent CPU **reset**.
+# That amplifier is exactly the 1408 exec-from-disk iron failure: the boot
+# reached the ring-3 transition (`CMOS[0x50]=0x20`, stamped at ring3.cyr just
+# before the iretq into ring 3) and then the box spontaneously rebooted with no
+# panic and no `EXEC-DISK-OK`. Whatever Zen-strict condition the iretq/first-
+# instruction/first-syscall trips, the broken IDT turned it into a reset. QEMU
+# `-cpu max` never tripped it, so the broken IDT was never exercised there.
+#
+# A correct kernel HALTS on an unexpected CPU exception instead of returning.
+# Each handler is self-contained: select CMOS slot 0x54, write the vector
+# number; select 0x55, write magic 0xE5 ("a real exception was caught this
+# boot" — disambiguates a fresh stamp from a stale 0x54 byte); then `cli; hlt`
+# in a loop. Pure port I/O (CR3-independent) + halt: no memory deref, no FB, no
+# return. The only stack use is the CPU's exception-frame push to TSS RSP0
+# (0x200000), which is mapped writable under the per-process CR3. After a burn,
+# read slot 0x54 via agnosticos `read-boot-log.sh --verbose`:
+#   0x55==0xE5 AND 0x54==0x0D -> #GP   (bad segment/selector at iretq/sysret)
+#                 0x54==0x0E -> #PF   (CR2 = the unmapped VA; entry page perms)
+#                 0x54==0x06 -> #UD   (bad opcode — e.g. SYSCALL w/o SCE)
+#                 0x54==0x08 -> #DF   (a fault during fault delivery — RSP0?)
+# This is the diagnostic that the silent reset denied us, and it is also the
+# correct permanent behavior (vectors 0-31 must not silently iretq).
+#
+# Installs ONLY the protection/fault vectors that a broken ring-3 transition
+# raises and that CANNOT legitimately fire during normal kernel boot:
+#   6  #UD  invalid opcode (e.g. SYSCALL with EFER.SCE clear)
+#   8  #DF  double fault (a fault during fault delivery — bad TSS RSP0 / IST)
+#   10 #TS  invalid TSS
+#   11 #NP  segment not present (bad selector in the iretq frame)
+#   12 #SS  stack-segment fault (bad SS / RSP)
+#   13 #GP  general protection (bad CS/SS descriptor type at iretq/sysret)
+#   14 #PF  page fault (unmapped entry/stack VA — CR2 holds the address)
+# Deliberately NOT installed: 0-5,7,9,15-31 stay at the bare-iretq default.
+# Installing ALL 32 halts normal boot because a benign vector (e.g. #NM/7 from
+# SSE use, or a reserved/NMI slot) legitimately fires early; this curated set
+# never does. Timer (32) + keyboard (33) gates are installed later in main.
+fn exc_handlers_init() {
+    var base = &exc_stub;
+    var nvec = 7;
+    var off = 0;
+    for (var k = 0; k < nvec; k = k + 1) {
+        var v = 6;
+        if (k == 1) { v = 8; }
+        if (k == 2) { v = 10; }
+        if (k == 3) { v = 11; }
+        if (k == 4) { v = 12; }
+        if (k == 5) { v = 13; }
+        if (k == 6) { v = 14; }
+        var stub = base + off;
+        # mov al,0x54 ; out 0x70,al      (select CMOS slot 0x54)
+        store8(stub + 0, 0xB0); store8(stub + 1, 0x54);
+        store8(stub + 2, 0xE6); store8(stub + 3, 0x70);
+        # mov al,v ; out 0x71,al         (write the faulting vector number)
+        store8(stub + 4, 0xB0); store8(stub + 5, v);
+        store8(stub + 6, 0xE6); store8(stub + 7, 0x71);
+        # mov al,0x55 ; out 0x70,al      (select CMOS slot 0x55)
+        store8(stub + 8, 0xB0); store8(stub + 9, 0x55);
+        store8(stub + 10, 0xE6); store8(stub + 11, 0x70);
+        # mov al,0xE5 ; out 0x71,al      (magic: exception caught this boot)
+        store8(stub + 12, 0xB0); store8(stub + 13, 0xE5);
+        store8(stub + 14, 0xE6); store8(stub + 15, 0x71);
+        # cli ; hlt ; jmp $-1            (mask + halt, loop back onto hlt)
+        store8(stub + 16, 0xFA);
+        store8(stub + 17, 0xF4);
+        store8(stub + 18, 0xEB); store8(stub + 19, 0xFD);
+        # Install as a 64-bit interrupt gate, kernel CS 0x08, present DPL0
+        # (0x8E). CPU-generated exceptions ignore the gate DPL, so DPL0 is fine.
+        idt_set_gate(&idt + v * 16, stub, 0x08, 0x8E);
+        off = off + 20;
+    }
+    return 0;
+}

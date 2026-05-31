@@ -5,7 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.40.9] — 2026-05-30
+## [1.40.9] — 2026-05-31 (**Exec-from-disk — iron-reset triage: real CPU-exception handlers.** The 1408 combined VFS+exec iron burn passed 3/4 first try — storage trio, ext2-write suite, jbd2-clean, shtest, and the ENOEXEC refusal (A1/A2) all green — but A3 (the `/bin/prog2` ring-3 run) **spontaneously reset the box** with no panic and no `EXEC-DISK-OK`. CMOS bisection (existing `ring3.cyr` pre-iretq stamp, `CMOS[0x50]=0x20`) proved the **entire load path succeeded** — the fault is the ring-3 transition itself, on real AMD Zen, where QEMU `-cpu max` passes 7/7. Root cause of the *reset* (vs a diagnosable fault): the IDT pointed all 256 vectors at a bare `iretq`, so any fault during the transition mis-returned → re-faulted → #DF → #TF → silent reset. This cut installs real handlers so the next burn reports the cause instead of rebooting.)
+
+### Fixed
+- **CPU exceptions no longer triple-fault into a silent reset.** `idt_init` left every vector on a 2-byte `iretq` stub; for an error-code fault (#GP/#PF/#DF/#SS/#NP) the bare iretq pops the wrong frame and returns to garbage → guaranteed triple-fault → CPU reset. New `exc_handlers_init` (`idt.cyr`) installs self-contained handlers on the seven protection/fault vectors a broken ring-3 transition raises and that cannot legitimately fire during normal boot: **#UD(6), #DF(8), #TS(10), #NP(11), #SS(12), #GP(13), #PF(14)**. Each stamps its vector to `CMOS[0x54]` + magic `0xE5` to `CMOS[0x55]`, then `cli; hlt` (pure port I/O — CR3-independent, no memory deref, robust at fault time). Vectors 0-5/7/9/15-31 stay on the bare default (installing all 32 halts boot — benign vectors like #NM/7 fire in normal boot). Correct permanent kernel behavior **and** the diagnostic the silent reset denied us.
+
+### Added
+- **Exception-cause CMOS slots 0x54 (vector) + 0x55 (0xE5 magic)** — read via agnosticos `read-boot-log.sh --verbose`. On the next iron burn an A3 fault reads back as e.g. `0x54=0x0D` (#GP — bad CS/SS descriptor at iretq/sysret), `0x0E` (#PF — CR2 = the unmapped VA), or `0x06` (#UD — bad opcode, e.g. SYSCALL w/ EFER.SCE clear) instead of a reset.
+
+### Validation
+- `scripts/exec-smoke.sh` **7/7**, `scripts/check.sh` **11/11** — handlers are dormant in QEMU (no fault fires; the transition works there), so zero regression on the exec/ext2 path. Production build 1,034,768 B → **1,036,592 B**.
+- Pre-existing red (NOT this change): `scripts/exfat-write-smoke.sh` fails on the **clean baseline** too — host `exfatprogs 1.3.2` `mkfs.exfat` format drift the AGNOS exFAT backend no longer recognizes (same class as the jbd2 CSUM_V3 host-default surprise). Tracked separately; orthogonal to exec.
+
+### Boot-pipeline note
+- agnosticos `scripts/cyrius.cyml` graduated 5.11.59 → 6.0.14 (the long-deferred boot-side sweep; rebuilding `read-boot-log` for this triage was its next touch).
+
+### Still follow-on
+- **The 1.40.9 re-burn** — flash the EXEC selftest kernel, reproduce A3, read `CMOS[0x54]/0x55` for the real Zen fault vector, then fix that root cause.
+- exFAT-write host-format drift (above) — diagnose the `mkfs.exfat` 1.3.2 mismatch.
+- Process teardown (free 2 MB pages on exit; lifts the 2-exec-per-boot ceiling) — unchanged from 1.40.8.
 
 ## [1.40.8] — 2026-05-29 (**Exec-from-disk — bite 8 (arc harden + burn prep).** Fixes a real argv bug the 1.40.7 smoke could not catch, adds an argv-dereference gate, and ships a one-command iron burn-prep script. The 1.39.x VFS + 1.40.x exec arcs are now iron-ready.)
 

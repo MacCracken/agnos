@@ -16,6 +16,7 @@ var tss[104];      # x86_64 TSS is 104 bytes
 var idt[4096];     # 256 vectors x 16 bytes each
 var idt_ptr[16];
 var isr_stub[16];
+var exc_stub[96];  # 1.40.9: per-vector CPU-exception handlers (32 x 20 B = 640 B; 96 u64 = 768 B)
 var timer_ticks = 0;
 var timer_isr[64];
 var kb_isr[96];    # keyboard ISR machine code (~83 bytes)
