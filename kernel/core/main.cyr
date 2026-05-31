@@ -1074,11 +1074,15 @@ if (exfat_active == 1) {
 }
 #endif
 
-# WRITE arc 1.33.x — W1 write-path self-test (compile-gated, opt-in via
-# EXT2_WRITE_SELFTEST=1 ./scripts/build.sh). Non-destructive: proves the
-# write primitives + inode RMW + bitmap/free-count reads against a live
-# ext2 mount without changing FS content (e2fsck stays clean). Off in
-# production builds — same gate discipline as AHCI_RW_DEMO / MSC_RW_DEMO.
+# WRITE arc 1.33.x — write-path self-test (compile-gated, opt-in via
+# EXT2_WRITE_SELFTEST=1 ./scripts/build.sh). IDEMPOTENT: a PRE-CLEAN
+# (ext2_wst_clean) wipes any fixtures a prior boot left, so every create-side
+# assertion fires fresh and the suite re-runs correctly on a PERSISTENT FS (an
+# --update flash, not just a pristine hard reflash). It then creates fixtures
+# and asserts the write primitives / inode RMW / dir + link / symlink /
+# bitmap+free-count behavior, leaving the fixtures on disk for the smoke's
+# host-side debugfs verification. Off in production builds — same gate
+# discipline as AHCI_RW_DEMO / MSC_RW_DEMO.
 #ifdef EXT2_WRITE_SELFTEST
 ext2_write_selftest();
 sh_write_selftest();

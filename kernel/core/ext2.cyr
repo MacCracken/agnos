@@ -3020,6 +3020,21 @@ fn ext2_truncate_zero(inode_num) {
         return 0 - 1;
     }
 
+    # FAST SYMLINK guard: a symlink with i_blocks == 0 stores its target string
+    # INLINE in the i_block[] area — those words are ASCII, NOT block pointers.
+    # Walking them below would free garbage blocks derived from the target's
+    # bytes (e.g. "/hl_b.txt" → i_block[2] = 0x00000074 = block 116, an
+    # inode-table block → e2fsck "multiply-claimed block / off-by-one free").
+    # A fast symlink owns zero data blocks, so there is nothing to free.
+    if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) == 0xA000) {
+        if (ext2_inode_blocks_lo(&ext2_inode_buf) == 0) {
+            ext2_inode_set_size_lo(&ext2_inode_buf, 0);
+            ext2_store32_le(&ext2_inode_buf, 108, 0);       # i_size_high = 0
+            if (ext2_put_inode(inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+            return 0;
+        }
+    }
+
     var ptrs = ext2_blocksize / 4;
     var freed = 0;
 
@@ -3072,6 +3087,48 @@ fn ext2_truncate_zero(inode_num) {
 #      back UNCHANGED, re-read, assert byte-identical — exercises
 #      ext2_write_block + ext2_put_inode end-to-end with zero net change.
 # Driven from main.cyr right after ext2_init() under the #ifdef.
+
+# Idempotency cleanup (1.40.x "B" fix): the write suite below CREATES named
+# fixtures and historically LEFT them on disk ("kept for host verify"). On a
+# persistent FS re-mounted across boots (an --update flash — vs a hard disk
+# reflash that starts pristine) those leftovers made every create-side
+# assertion read MISMATCH: a name that already exists no-ops the dup-guarded
+# ext2_create, so the i_blocks / nlink / refuse-on-dup deltas the subtests
+# assert on never fire. This helper best-effort removes every fixture name so
+# the suite re-derives from a clean slate. Called at BOTH ends — pre (heals a
+# prior run that died mid-suite, e.g. a later-boot fault) and post (leaves FS
+# content net-unchanged → e2fsck clean, safe to re-run). Every removal ignores
+# its return: a missing name is the expected common case, not an error.
+fn ext2_wst_clean() {
+    if (ext2_write_ok == 0) { return 0; }
+    # nested fixtures first (children before parents)
+    var t = ext2_dir_lookup(2, "w5tmp", 5);
+    if (t > 0) { ext2_unlink(t, "f", 1); }
+    ext2_rmdir(2, "w5tmp", 5);
+    var p = ext2_dir_lookup(2, "rnp", 3);
+    if (p > 0) { ext2_rmdir(p, "rnd", 3); }
+    ext2_rmdir(2, "rnp", 3);
+    ext2_rmdir(2, "rnd", 3);          # only at root if a prior xdir-move failed
+    # root regular-file + symlink fixtures
+    ext2_unlink(2, "w3a.txt", 7);
+    ext2_unlink(2, "w3b.txt", 7);
+    ext2_unlink(2, "w4keep.txt", 10);
+    ext2_unlink(2, "w4tmp.txt", 9);
+    ext2_unlink(2, "rnsrc.txt", 9);
+    ext2_unlink(2, "rndst.txt", 9);
+    ext2_unlink(2, "rnx.txt", 7);
+    ext2_unlink(2, "rny.txt", 7);
+    ext2_unlink(2, "hl_a.txt", 8);
+    ext2_unlink(2, "hl_b.txt", 8);
+    ext2_unlink(2, "sl_f", 4);
+    ext2_unlink(2, "sl_s", 4);
+    ext2_unlink(2, "rl", 2);
+    ext2_unlink(2, "lp", 2);
+    # root directory fixtures
+    ext2_rmdir(2, "w5keep", 6);
+    ext2_rmdir(2, "hl_d", 4);
+    return 0;
+}
 
 fn ext2_write_selftest() {
     # crc32c primitive self-test (1.33.1 bite 2) — mount-independent, so it
@@ -3263,6 +3320,15 @@ fn ext2_write_selftest() {
     } else {
         kprintln("ext2w: W2 alloc/free round-trip MISMATCH", 40);
     }
+
+    # PRE-CLEAN: wipe any fixtures a prior (possibly interrupted) run left, so
+    # every create-side assertion below fires fresh regardless of FS history.
+    # Placed HERE — after the W1 identity checks + W2 allocator round-trip, and
+    # before the first fixture-creating test — because those earlier checks hold
+    # live data in the shared scratch buffers (ext2_block_buf holds the block
+    # bitmap across the 3a read→write-back pair); running cleanup mid-sequence
+    # would clobber them. No fixture-creating test runs before this point.
+    ext2_wst_clean();
 
     # === W3: file-data write (ext2_write_at) + sparse alloc + truncate ===
     # W3 targets files the self-test CREATES (always indirect-mapped — see
