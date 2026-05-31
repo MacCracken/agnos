@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.9] — 2026-05-30
+
 ## [1.40.8] — 2026-05-29 (**Exec-from-disk — bite 8 (arc harden + burn prep).** Fixes a real argv bug the 1.40.7 smoke could not catch, adds an argv-dereference gate, and ships a one-command iron burn-prep script. The 1.39.x VFS + 1.40.x exec arcs are now iron-ready.)
 
 ### Fixed
