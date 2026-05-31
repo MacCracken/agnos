@@ -5,6 +5,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.40.13] — 2026-05-31 (**Track-B prep: `fatfs_init` now prefers a non-ESP FAT data partition over the boot ESP.** Required to verify FAT writes on a real AGNOS drive — and correct for real use, since the boot ESP should never be the default *writable* FAT volume.)
+
+### Fixed
+- **`fatfs_init` mounted the boot ESP as the FAT volume instead of a FAT data partition.** On a real AGNOS drive, `p1` is the FAT32 ESP (the boot volume — write-guarded) and any FAT *data* lives in a later MSFT-Basic partition. The old single-pass scan took the *first* FAT GUID it saw (the ESP), so every FAT write hit the ESP guard and failed (caught while prepping the Track-B boot-drive burn: `fat: mounted … partition_lba=2048` = the ESP). Now a two-pass scan: **pass 1** mounts the first non-ESP MSFT-Basic FAT (writable data partition; `fatfs_probe_backend` self-excludes a sibling exFAT MSFT-Basic partition, so it's skipped automatically), **pass 2** falls back to the ESP only if no FAT data partition exists. Single-ESP layouts — the QEMU smokes, boot-only USBs — are **unaffected** (pass 1 finds nothing → pass 2 mounts the ESP with `fat_on_esp=1`, exactly as before). With a non-ESP FAT data partition present, all FAT write gates now pass against it (no `FAT_ALLOW_ESP_WRITE` override needed).
+
+### Validation
+- Full `scripts/sweep.sh` **7/7** (FAT read/write, exFAT read/write, ext2 write, exec — no regression; the FAT smokes still mount the single ESP via the pass-2 fallback). `check.sh` 11/11, `test.sh` 4/4. Also validated against an iron-shaped layout in QEMU (one disk = ESP + FAT32 data + exFAT data): FAT now mounts the data partition (`partition_lba` = the data part, not 2048) and all `fatw:` gates pass; `fsck.fat`/`fsck.exfat -n` clean on both.
+
+### Notes — Track-B (FAT/exFAT) iron verification plan
+- **Two thin burns** (chosen because AGNOS's VFS mounts only ONE secondary FS at a time — a single kernel can't fully exercise both filesystems' shell verbs in one boot; with both present the shell verbs route to one and the other's gates miss). Each burn provisions **one** MSFT-Basic data partition in the boot drive's unallocated tail (no second stick; `archaemenid` = `nvme0n1`, ~906 GB free after `agnos-fs`), reformats it per FS, flashes the matching selftest kernel to the ESP via `install-usb.sh --update`, boots AGNOS, photographs the `fatw:`/`exfatw:`/`exfatu:` FB lines, then reboots to Linux and runs host `fsck`. Burn 1 = FAT32 + `FATFS_WRITE_SELFTEST`; burn 2 = exFAT + `EXFAT_WRITE_SELFTEST`. User-driven; rides alongside the still-pending 1.40.12 boot-stack re-burn (any boot-to-shell confirms that too).
+
 ## [1.40.12] — 2026-05-31 (**Boot-stack memory-safety fix: the kernel stack was growing down into its own `.rodata` string literals. Surfaced as the long-standing red exFAT-read `upcase-checksum` smoke row — but the root cause was general kernel memory corruption near the 2 MB line, not anything exFAT-specific.** The exFAT read path was correct all along; its success message just happened to be one of the literals the stack was stomping. Full `sweep.sh` now **7/7** (was 6/7).)
 
 ### Fixed

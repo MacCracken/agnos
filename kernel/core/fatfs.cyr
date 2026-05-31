@@ -167,22 +167,45 @@ fn fatfs_init() {
 
         # Partition-aware: GPT is parsed only against blk_active (ext2's
         # same constraint). Gate on ESP / MSFT-Basic type GUIDs — FAT
-        # doesn't live in a Linux-FS partition. Record whether the matched
-        # partition is the ESP (→ write-protected by the guard).
+        # doesn't live in a Linux-FS partition.
+        #
+        # PREFER a non-ESP MSFT-Basic FAT (a writable data partition) over the
+        # boot ESP: on a real AGNOS drive p1 is the FAT32 ESP (the boot volume,
+        # write-guarded) and any FAT *data* lives in a later MSFT-Basic
+        # partition. Taking the first FAT found would mount the ESP and make
+        # every FAT write hit the guard. So: pass 1 scans for a non-ESP FAT
+        # (fatfs_probe_backend self-excludes exFAT, so a sibling exFAT
+        # MSFT-Basic partition is skipped automatically); only if none exists
+        # do we fall back to the ESP. Single-ESP layouts (the QEMU smokes,
+        # boot-only USBs) are unaffected — pass 1 finds nothing, pass 2 mounts
+        # the ESP with fat_on_esp=1 exactly as before.
         if (gpt_present == 1) {
             if (tag == blk_active) {
+                var esp_lba = 0;
+                var esp_seen = 0;
                 for (var pi = 0; pi < gpt_partition_count; pi = pi + 1) {
                     if (gpt_partition_info(pi) != 1) { continue; }
-                    var is_fat = 0;
                     var is_esp = 0;
+                    var is_msft = 0;
                     if (gpt_q_type_lo == GPT_TYPE_ESP_LO) {
-                        if (gpt_q_type_hi == GPT_TYPE_ESP_HI) { is_fat = 1; is_esp = 1; }
+                        if (gpt_q_type_hi == GPT_TYPE_ESP_HI) { is_esp = 1; }
                     }
                     if (gpt_q_type_lo == GPT_TYPE_MSFT_BASIC_LO) {
-                        if (gpt_q_type_hi == GPT_TYPE_MSFT_BASIC_HI) { is_fat = 1; }
+                        if (gpt_q_type_hi == GPT_TYPE_MSFT_BASIC_HI) { is_msft = 1; }
                     }
-                    if (is_fat == 0) { continue; }
-                    if (fatfs_probe_backend(tag, gpt_q_first_lba) == 1) { fat_on_esp = is_esp; matched = 1; break; }
+                    if (is_msft == 1) {
+                        # Writable FAT data partition — preferred. (exFAT here
+                        # fails fatfs_probe_backend and we keep scanning.)
+                        if (fatfs_probe_backend(tag, gpt_q_first_lba) == 1) { fat_on_esp = 0; matched = 1; break; }
+                    } else {
+                        if (is_esp == 1) { if (esp_seen == 0) { esp_lba = gpt_q_first_lba; esp_seen = 1; } }
+                    }
+                }
+                # Fallback: no non-ESP FAT data partition — mount the ESP.
+                if (matched == 0) {
+                    if (esp_seen == 1) {
+                        if (fatfs_probe_backend(tag, esp_lba) == 1) { fat_on_esp = 1; matched = 1; }
+                    }
                 }
             }
         }
