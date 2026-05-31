@@ -22,7 +22,8 @@
 # docs/development/proposals/2026-04-27-cc5-kernel-boot-shim-regression.md.
 #
 # Sequence:
-#   1. Set up 32-bit stack at 0x200000.
+#   1. Set up 32-bit stack at 0x380000 (NOT 0x200000 — the >2 MB kernel's
+#      .rodata sits just below 0x200000; see step 12).
 #   2. Init COM1 UART (0x3F8) so the kernel can print before paging.
 #   3. Zero 12 KB of page tables at 0x1000–0x4000.
 #   4. Build PML4 / PDPT / PD entries identity-mapping 0x0–0x400000
@@ -42,11 +43,14 @@
 #   9. Build a 24-byte GDT at 0x4000 (null + 64-bit CS + DS).
 #   10. Far-jump through the 64-bit CS to switch to true long mode.
 #   11. Reload DS/ES/SS with 0x10 (64-bit data selector).
-#   12. Set up 64-bit stack at 0x200000, fall through to kernel code.
+#   12. Set up 64-bit stack at 0x380000, fall through to kernel code.
 
 asm {
-    # 1. 32-bit stack at 0x200000
-    0xBC; 0x00; 0x00; 0x20; 0x00;                          # mov esp, 0x200000
+    # 1. 32-bit stack at 0x380000 (see the 64-bit step 12 below for why NOT
+    #    0x200000 — the kernel image crossed 2 MB and its .rodata now sits
+    #    immediately below 0x200000, so a downward-growing stack there stomps
+    #    string literals).
+    0xBC; 0x00; 0x00; 0x38; 0x00;                          # mov esp, 0x380000
 
     # 2. COM1 UART init (port 0x3F8)
     0xBA; 0xF9; 0x03; 0x00; 0x00; 0xB0; 0x00; 0xEE;        # mov edx, 0x3F9; mov al, 0; out dx, al   ; IER  = 0 (mask all UART IRQs)
@@ -129,8 +133,16 @@ asm {
     0x8E; 0xC0;                                            # mov es, ax
     0x8E; 0xD0;                                            # mov ss, ax
 
-    # 12. 64-bit stack at 0x200000; mov rbp, rsp so callees see a stable frame
-    0x48; 0xBC; 0x00; 0x00; 0x20; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x200000
+    # 12. 64-bit stack at 0x380000; mov rbp, rsp so callees see a stable frame.
+    #     NOT 0x200000: the kernel image grew past 2 MB, so .rodata (string
+    #     literals) now lives at ~0x1faee8-0x1fff4c, immediately below 0x200000.
+    #     A stack based at 0x200000 grows DOWN straight into those literals and
+    #     silently corrupts them (caught via a gdb watchpoint: `push` at rsp=
+    #     0x1ffbf8 overwrote "exfatu: upcase-checksum OK"). 0x380000 sits in the
+    #     PMM-reserved region 1 (0x200000-0x400000), above the image top
+    #     (~0x210000) with ~1.4 MB of downward headroom, and below the fixed
+    #     syscall kstack at 0x3F0000 — clear of both.
+    0x48; 0xBC; 0x00; 0x00; 0x38; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x380000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 }
 #endif
@@ -209,8 +221,11 @@ asm {
     # = 2 ("past canary") — is gone too. Existing CP labels >= 3 are kept
     # at their current numeric values so read-boot-log keeps reading.)
 
-    # 1. 64-bit stack at 0x200000; mov rbp, rsp
-    0x48; 0xBC; 0x00; 0x00; 0x20; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x200000
+    # 1. 64-bit stack at 0x380000 (NOT 0x200000 — see the legacy path's step 12
+    #    note: the >2 MB kernel image's .rodata sits just below 0x200000, so a
+    #    stack there grows down into the string literals. 0x380000 is in the
+    #    PMM-reserved region 1, above the image, below the 0x3F0000 syscall kstack).
+    0x48; 0xBC; 0x00; 0x00; 0x38; 0x00; 0x00; 0x00; 0x00; 0x00;  # mov rsp, 0x380000
     0x48; 0x89; 0xE5;                                      # mov rbp, rsp
 
     # === Checkpoint 3 (past stack setup) ===
