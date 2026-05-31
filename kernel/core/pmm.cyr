@@ -83,14 +83,26 @@ fn pmm_init() {
     memset(&pmm_bitmap, 0, 512);
     pmm_total = 4096;
     pmm_used = 0;
-    # Mark first 2MB as used (kernel + page tables + stack)
-    # 2MB / 4KB = 512 pages = pages 0-511 = 64 bytes of bitmap, all 0xFF
-    memset(&pmm_bitmap, 0xFF, 64);
-    pmm_used = 512;
+    # Mark the first 4 MB as used: kernel image + page tables + stacks.
+    # 1.40.9: was 2 MB (pages 0-511), but the kernel image (LOAD MemSiz) now
+    # reaches 0x20F540 — it CROSSED the 2 MB line, so pages 512-527
+    # (0x200000-0x210000) are live .bss the old reservation left "free." On iron
+    # the KASLR-seeded next-free hint + the boot allocs (pmm test / vmm_alloc_at /
+    # heap_init at main.cyr:150-163) could then disturb region 1 before
+    # syscall_kstack_reserve pinned its stack there, relocating the syscall kstack
+    # to 0x400000 — a user VA the per-process CR3 overrides — so the syscall path
+    # ran on a stack not identity-mapped under the user CR3 → corrupted ret → wild
+    # #PF (the 1.40.x ring-3 iron reset: RIP=0x22220202 / CR2 >= 4 GB). Reserving
+    # the first two 2 MB regions (pages 0-1023 = 4 MB) covers the >2 MB kernel AND
+    # region 1, which holds the now-FIXED syscall kstack (see syscall_kstack_reserve).
+    # 128 bytes of bitmap = 1024 bits, all 0xFF. NOTE: bump this if the kernel
+    # image ever crosses 4 MB (check `readelf -l build/agnos` LOAD MemSiz).
+    memset(&pmm_bitmap, 0xFF, 128);
+    pmm_used = 1024;
 
     # KASLR: seed next-free hint from RDRAND so dynamic allocations
-    # land at a randomized offset within the available 2-16 MB range
-    # (pages 512-4095; 3584 valid pages). pmm_alloc walks forward from
+    # land at a randomized offset within the available 4-16 MB range
+    # (pages 1024-4095; 3072 valid pages). pmm_alloc walks forward from
     # the hint and wraps around the bitmap, so first-fit still works —
     # the randomization just shifts where "first" is per boot.
     #
@@ -99,7 +111,7 @@ fn pmm_init() {
     # which would land outside the valid page range.
     var seed = kaslr_seed();
     if (seed < 0) { seed = 0 - seed; }
-    pmm_next_free = 512 + (seed % 3584);
+    pmm_next_free = 1024 + (seed % 3072);   # pages 1024-4095 (3072 free pages)
     return 0;
 }
 
@@ -148,8 +160,9 @@ fn pmm_free(addr) {
 # VMM is 2 MB huge pages only; a huge page must be backed by a fully-reserved
 # 2 MB region or it aliases (the ELF/stack idiom reserves only 1 of the 512
 # pages — a latent hazard mmap must not inherit). Scans the eight 2 MB-aligned
-# regions (512 pages each; region 0 is the kernel) for one that is entirely
-# free, marks all 512, returns the 2 MB-aligned base — or 0 if none is free
+# regions (512 pages each; regions 0-1 are the kernel + the fixed syscall kstack,
+# reserved at pmm_init, so r=1 always reads non-free and is skipped) for one that
+# is entirely free, marks all 512, returns the 2 MB-aligned base — or 0 if none is free
 # (the 16 MB pool fragments under single-page allocs, so this can fail; mmap
 # treats 0 as MAP_FAILED).
 fn pmm_alloc_2mb() {

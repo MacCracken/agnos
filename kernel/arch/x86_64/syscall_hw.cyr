@@ -28,11 +28,21 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3) {
 # 0-1 GB the per-process CR3 mirrors), writable. Idempotent.
 fn syscall_kstack_reserve() {
     if (syscall_kstack_top != 0) { return 0; }
-    var ks = pmm_alloc_2mb();
-    if (ks != 0) {
-        if (vmm_is_mapped(ks) == 0) { vmm_map(ks, ks, 0x83); }
-        syscall_kstack_top = ks + 0x1F0000;   # near the top of the 2 MB region
-    }
+    # 1.40.9: FIXED kstack at the top of region 1 (0x200000-0x400000), which
+    # pmm_init now reserves as kernel (the image crossed 2 MB, and region 1 also
+    # holds this stack). Was pmm_alloc_2mb(), which only landed at 0x200000 when
+    # region 1 happened to be entirely free at this point in boot — and the
+    # KASLR-seeded next-free hint + the boot allocs before this call differ
+    # between QEMU and real Zen, so on iron it sometimes relocated to 0x400000.
+    # 0x400000 is the user-code VA base: the per-process CR3 maps it to the user
+    # code page, OVERRIDING the identity mapping the kstack needs, so the syscall
+    # handler (which runs under that CR3) pushed onto a stack that wasn't there →
+    # corrupted ret → wild #PF (the 1.40.x ring-3 reset: RIP=0x22220202, CR2>=4 GB).
+    # A FIXED 0x3F0000 is deterministic, sits in the boot 0-1 GB identity 2 MB-page
+    # map (P|RW, mirrored into every per-process CR3), and is BELOW the 0x400000
+    # user-VA base so no per-process mapping ever overrides it. No alloc needed —
+    # region 1 is kernel-reserved.
+    syscall_kstack_top = 0x3F0000;
     return 0;
 }
 
