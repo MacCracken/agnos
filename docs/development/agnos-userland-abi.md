@@ -121,12 +121,14 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
 
 ### 3.1 Changed behavior (same numbers)
 
-- **`read`(5) on `fd 0` → blocking keyboard stdin** (1.41.1). When `fd==0`, the kernel services the keyboard
-  (the in-kernel `kb_has_key`/`kb_read_scancode`/`scancode_to_ascii` loop, moved behind the syscall),
-  **re-enabling interrupts in ring 0 while it waits** (SFMASK masked them on entry). Returns up to `len`
-  bytes; blocks until at least 1 byte is available. **Line discipline = RAW (DECIDED O1)** — no kernel echo;
-  agnsh does its own echo + backspace editing via `completion.cyr`/`history.cyr`. Today fd 0 → serial; this
-  makes it the console keyboard.
+- **🔒 `read`(5) on `fd 0` → blocking keyboard stdin** (**IMPLEMENTED 1.41.1** — `kbd_read_blocking`). When
+  `fd==0`, the kernel blocks until at least one real character is typed, drains any further buffered keys (up
+  to `len`), and returns the count. **Line discipline = RAW (O1)** — no kernel echo; agnsh does its own echo +
+  editing via `completion.cyr`/`history.cyr`. Mechanism: busy-polls `kb_has_key()` → `hid_poll()` (a
+  cooperative MMIO drain of the xHCI HID transfer ring), so it works with **interrupts MASKED** (SFMASK clears
+  IF on entry) — no `sti`, no `hlt`, no scheduler preemption mid-syscall. (Power follow-on: a `sti`+`hlt`
+  idle-wait needs the preemptive-ring-3 arc; until then a blocked read spins one core.) Other fds keep the
+  `vfs_read` path.
 - **`open`(7) → mount-routed** (1.41.2). Re-route from `initrd_open`-only to `vfs_resolve_mount` →
   `ext2_open` (inode-wise) or `vfs_open_on` (FAT/exFAT), with `initrd` as the bare-name fallback. **Gains a
   flags arg** (a3) — see 3.3. Opening a **directory** returns a dir-fd usable by `getdents` (29).

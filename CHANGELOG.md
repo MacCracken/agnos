@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.1] — 2026-05-31 (**Shell-separation bite 1: blocking keyboard stdin from ring 3.** `read(fd=0)` now blocks on the keyboard and returns typed characters to a userland process — the first *interactive* (blocks-on-input, not run-to-completion) ring-3 syscall, and the agnos-side capability the userland `agnsh` REPL needs. Implements ABI decision **O1 (RAW)**. Pre-built ahead of `CYRIUS_TARGET_AGNOS` so there's no agnos-side blocker when agnoshi builds for the agnos ABI.)
+
+### Added
+- **`kbd_read_blocking(buf, count)` (`syscall.cyr`)** — `read(fd=0)` routes here (other fds keep the `vfs_read` path). Blocks until at least one real character is typed, drains any further buffered keys (up to `count`), returns the count. **RAW line discipline** (ABI O1): no kernel echo, no line buffering — the userland shell (agnsh's `completion.cyr`/`history.cyr`) owns echo + editing. `scancode_to_ascii` returns 0 for modifier/release codes; those are consumed but never counted, so a blocked read never returns 0-length.
+- **Cooperative HID drain — no interrupt/preemption dependency.** The loop busy-polls `kb_has_key()`, which calls `hid_poll()` (an MMIO poll of the xHCI HID transfer ring), so it drains the USB keyboard with **interrupts MASKED** (SYSCALL/SFMASK clears IF on entry). No `sti`, no `hlt`, no scheduler preemption mid-syscall — sidesteps the preemptive-ring-3 arc entirely. Works under the per-process CR3 (the xHCI BAR is mirrored in the superset map, same as exec's console writes).
+
+### ABI
+- **`read(fd=0)` moves 🔒 FROZEN** in `docs/development/agnos-userland-abi.md` §3.1 (was ✅ DECIDED). The cyrius `CYRIUS_TARGET_AGNOS` peer can now mirror a *live* stdin contract.
+
+### Known follow-on (not a blocker)
+- **Busy-spin while idle** — a blocked `read(fd=0)` spins one core until a key arrives (functionally correct, not power-friendly). A `sti`+`hlt` wakeup (sleep until a timer/HID IRQ, then re-poll) needs interrupts enabled mid-syscall → the **preemptive-ring-3** arc. Acceptable under the single-foreground-program model until then.
+
+### Validation
+- **Build clean** (production **1,050,824 B**, banner `v1.41.1`); `kbd_read_blocking` wired into `read`. **`read(fd=0)` is dormant in every existing smoke** (none read stdin) → `scripts/sweep.sh` is the no-regression gate, not a functional stdin test. **No automated stdin test is possible** (can't be driven without real keystrokes; a seeded test would hang a headless QEMU — the same reason the in-kernel keyboard loop was never headless-tested). Functional validation is **iron-burn-pending**, combined with the first `agnsh`-on-agnos boot once `CYRIUS_TARGET_AGNOS` lands.
+
 ## [1.41.0] — 2026-05-31 (**Shell-separation arc OPEN — boundary audit + staging mechanism.** The interactive shell moves out of the kernel: the in-kernel ring-0 `shell()` REPL gives way to the userland **`agnsh`** (agnoshi) binary exec'd from disk via the 1.40.x exec path, with the in-kernel shell shrinking to a permanent emergency/recovery fallback. This cut is the arc-open — **audit + scaffolding, no kernel code** — and it surfaced the gating prerequisite. The first userland binary promoted to a system component; the kernel-slimming counterpart to 1.40.x exec, mirroring the 1.37.5 font→`kashi` move.)
 
 ### Added

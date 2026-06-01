@@ -114,6 +114,37 @@ fn kernel_resume() {
     return 0;
 }
 
+# === Blocking keyboard stdin (1.41.1 — shell-separation arc) ===
+# read(fd=0) for a ring-3 process: block until at least one real character is
+# typed, drain any further buffered keys (up to `count`), return. RAW line
+# discipline (ABI decision O1) — no kernel echo, no line buffering; the userland
+# shell (agnsh — completion.cyr / history.cyr) owns echo + editing. Cooperatively
+# drains the USB-HID keyboard via kb_has_key() -> hid_poll() (an MMIO poll of the
+# xHCI transfer ring), so it works with interrupts MASKED (SYSCALL/SFMASK clears
+# IF) — no sti, no hlt, no preemptive-ring-3 dependency. The busy-spin while
+# waiting is a deliberate first cut: a power-friendly sti+hlt wakeup waits on the
+# preemptive-ring-3 arc (it would take a timer IRQ mid-syscall to wake). Until
+# then "shell idle = one core spinning" is acceptable for the single-foreground
+# program model. scancode_to_ascii returns 0 for modifier/release codes — those
+# are consumed but never counted as input bytes (so we never return a 0-length
+# read after blocking).
+fn kbd_read_blocking(buf, count) {
+    if (count <= 0) { return 0; }
+    var n = 0;
+    while (n < count) {
+        while (kb_has_key() == 0) { }             # busy-poll (drains HID); blocks for a key
+        var sc = kb_read_scancode();
+        var ch = scancode_to_ascii(sc);
+        if (ch != 0) {
+            store8(buf + n, ch);
+            n = n + 1;
+            if (kb_has_key() == 0) { return n; }  # nothing more buffered -> return >=1 byte
+        }
+        # ch == 0 (modifier/release): keep blocking for a real character
+    }
+    return n;
+}
+
 fn ksyscall(num, arg1, arg2, arg3) {
     var canary = stack_canary_secret;
     if (num == 0) {
@@ -167,6 +198,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 > 0) {
             if (is_user_range(arg2, arg3) == 0) { return 0 - 1; }
         }
+        # 1.41.1: fd 0 = blocking keyboard stdin (RAW), the dispositive new
+        # capability for the userland shell. Other fds keep the vfs_read path.
+        if (arg1 == 0) { return kbd_read_blocking(arg2, arg3); }
         return vfs_read(arg1, arg2, arg3);
     }
     if (num == 6) { return vfs_close(arg1); }
