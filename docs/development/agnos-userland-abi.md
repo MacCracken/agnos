@@ -1,19 +1,40 @@
 # AGNOS Userland↔Kernel Syscall ABI — Contract
 
 > **The canonical source is `kernel/core/syscall.cyr` (the `ksyscall` dispatch) in this repo.** This doc is the
-> frozen interface both sides code against: the agnos kernel *implements* it; the Cyrius `CYRIUS_TARGET_AGNOS`
+> interface both sides code against: the agnos kernel *implements* it; the Cyrius `CYRIUS_TARGET_AGNOS`
 > stdlib peer (`lib/syscalls_x86_64_agnos.cyr`) *mirrors* it. **One drifts → silent wrong-syscall** (the exact
 > failure the cyrius per-arch `syscalls.cyr` split was created to prevent). When the two disagree, the kernel
 > wins and this doc is corrected to match it.
 >
-> **Status legend**: 🔒 FROZEN (live in the kernel today, mirror now) · 🔧 STUB (number reserved, returns a
-> constant — see notes) · 🧪 PROPOSED (1.41.x; spec below is the agreement, may refine during implementation —
-> re-freeze when it lands) · 🩺 DIAGNOSTIC (kernel-internal; not part of the userland shell surface).
+> **A row is only 🔒 FROZEN once it's IMPLEMENTED in the kernel.** A *decided spec* that isn't built yet is
+> ✅ DECIDED, not frozen — the cyrius peer can mirror a DECIDED row, but it can change until the kernel lands it
+> (then it freezes). You cannot freeze an ABI that still has open decisions — so the design decisions
+> (the 4th-arg register, stdin discipline, dir-fds, FAT degradation) are **settled in §0 below** before any
+> 1.41.x code is written.
+>
+> **Status legend**: 🔒 FROZEN (implemented + live in the kernel — mirror exactly, won't change) · ✅ DECIDED
+> (spec agreed, **not yet implemented** — mirror-able, freezes when the kernel lands it) · 🔧 STUB (number
+> reserved, returns a constant — see notes) · 🩺 DIAGNOSTIC (kernel-internal; not part of the userland shell surface).
+>
+> **Decision log**: O1–O4 settled **2026-05-31 (agnos-side)** — see §0. The 1.41.x surface (§3) is ✅ DECIDED;
+> each row moves to 🔒 FROZEN as 1.41.1/1.41.2 implement it.
 >
 > Companion: agnosticos [`shell-separation-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/shell-separation-prior-art.md)
 > (why this ABI is needed — the boundary audit) · [`roadmap.md`](roadmap.md) § *1.41.x — Shell Separation Arc*.
 
-## 1. Calling convention (x86-64, FROZEN)
+## 0. Decisions (settled 2026-05-31, agnos-side)
+
+These were open questions; they're now decided so the cyrius peer has a real target. Recorded here, applied
+throughout the doc below.
+
+| # | Decision | Rationale |
+|---|----------|-----------|
+| **O2** | **`a4 = r10`** — the syscall ABI grows from 3 args to 4; the 4th is in `r10`. | `rename(old,oldlen,new,newlen)` is inherently 4-arg. `r10` is the natural 4th-arg register (SYSCALL clobbers `rcx`, which is exactly why Linux picked `r10` — we adopt the *register*, not their numbers). Additive; entry stub saves `r10`, `syscall_handler`/`ksyscall` gain `a4`. Lands with 1.41.2. |
+| **O1** | **stdin = RAW** — `read(fd=0)` returns raw bytes, blocks until ≥1, **no kernel echo**. | `agnsh` ships its own `completion.cyr` + `history.cyr` line-editing — it needs raw keystrokes; cooked mode would fight its line editor. agnsh echoes. The in-kernel *emergency* shell keeps its own cooked loop (reads the keyboard directly, not via stdin). |
+| **O3** | **`open(AO_DIRECTORY)` returns a normal fd** that `getdents` (29) consumes. | Reuse the `vfs_table` slot model + a dir tag — matches the existing fd plumbing; no separate dir-handle type. |
+| **O4** | **FAT/exFAT `stat`/`link` degrade gracefully.** `stat` fills `st_ino=0` + size/type from the dirent; `link` is ext2-only (returns -1 on FAT). | Inherent — FAT has no inodes or hard links. `ls -l` on FAT shows size/type, ino 0. |
+
+## 1. Calling convention (x86-64)
 
 From `kernel/arch/x86_64/syscall_hw.cyr`:
 
@@ -42,15 +63,14 @@ From `kernel/arch/x86_64/syscall_hw.cyr`:
   Note this is **agnos exit = 0**, *not* Linux `exit_group`/`60` — the Cyrius `CYRIUS_TARGET_AGNOS` runtime
   `_start`/`exit` shim must use agnos numbers, not the Linux `syscall(60, …)` epilogue.
 
-### 1a. 🧪 PROPOSED ABI extension — 4th argument (`a4` = `r10`)
+### 1a. ✅ DECIDED (O2) — 4th argument (`a4` = `r10`)
 
-`rename(old, oldlen, new, newlen)` needs **four** arguments, which the current 3-arg ABI can't carry. The
-recommended extension: add `a4 = r10` (the Linux choice of `r10`-not-`rcx` is forced by the same SYSCALL
-`rcx`-clobber, so it's the natural register — agnos adopts the *register*, not Linux's numbers). This is a
-small, additive kernel change (the entry stub saves `r10`, `syscall_handler`/`ksyscall` gain `a4`) that lands
-with 1.41.2. Alternatives considered + rejected: NUL-terminated names (breaks the explicit-length invariant
-every agnos syscall holds); a packed args-struct pointer (extra indirection for one call). **Decision needed
-before 1.41.2 codes `rename`** — recommend `a4 = r10`.
+`rename(old, oldlen, new, newlen)` needs **four** arguments, which the original 3-arg ABI couldn't carry.
+**Decision: `a4 = r10`** — `r10` is the natural 4th-arg register (SYSCALL clobbers `rcx`, which is exactly why
+Linux uses `r10`; agnos adopts the *register*, not Linux's numbers). Additive kernel change (the entry stub
+saves `r10`, `syscall_handler`/`ksyscall` gain `a4`); lands with 1.41.2. Rejected alternatives: NUL-terminated
+names (breaks the explicit-length invariant every agnos syscall holds); a packed args-struct pointer (extra
+indirection for one call). **The cyrius peer's agnos syscall wrappers pass the 4th arg in `r10`.**
 
 ## 2. 🔒 FROZEN syscall table (0–28, live today)
 
@@ -94,18 +114,19 @@ structs through user pointers — mirror the exact byte offsets above (they're a
 `struct epoll_event`/`itimerspec` layouts). `dup`/`getuid`/`mount`/`umount` are stubs — the peer may expose
 them but must not rely on real behavior.
 
-## 3. 🧪 PROPOSED — 1.41.x additions + changes (the shell-separation surface)
+## 3. ✅ DECIDED — 1.41.x additions + changes (not yet implemented; the shell-separation surface)
 
-These are the agnos-side bites (1.41.1 stdin, 1.41.2 FS). Spec is the agreement; both agents code to it and
-re-freeze (move to 🔒, update §2) as each lands.
+These are the agnos-side bites (1.41.1 stdin, 1.41.2 FS). The spec is **decided** (§0 settled O1–O4) and
+mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update §2) as the kernel lands it**.
 
 ### 3.1 Changed behavior (same numbers)
 
 - **`read`(5) on `fd 0` → blocking keyboard stdin** (1.41.1). When `fd==0`, the kernel services the keyboard
   (the in-kernel `kb_has_key`/`kb_read_scancode`/`scancode_to_ascii` loop, moved behind the syscall),
   **re-enabling interrupts in ring 0 while it waits** (SFMASK masked them on entry). Returns up to `len`
-  bytes; blocks until at least 1 byte is available. **Line discipline = RAW** (agnsh does its own echo +
-  backspace editing) — see open question O1. Today fd 0 → serial; this makes it the console keyboard.
+  bytes; blocks until at least 1 byte is available. **Line discipline = RAW (DECIDED O1)** — no kernel echo;
+  agnsh does its own echo + backspace editing via `completion.cyr`/`history.cyr`. Today fd 0 → serial; this
+  makes it the console keyboard.
 - **`open`(7) → mount-routed** (1.41.2). Re-route from `initrd_open`-only to `vfs_resolve_mount` →
   `ext2_open` (inode-wise) or `vfs_open_on` (FAT/exFAT), with `initrd` as the bare-name fallback. **Gains a
   flags arg** (a3) — see 3.3. Opening a **directory** returns a dir-fd usable by `getdents` (29).
@@ -126,7 +147,7 @@ re-freeze (move to 🔒, update §2) as each lands.
 subsuming `touch` (CREAT) and `echo >` (CREAT|TRUNC). `chdir`/`getcwd` are **not** in the ABI: **CWD is
 userland-owned** — `agnsh` tracks its own CWD and passes **absolute paths** to every syscall.
 
-### 3.3 🧪 `open` flags (a3) — agnos-native bits
+### 3.3 ✅ `open` flags (a3) — agnos-native bits
 
 Access mode in the low 2 bits; modifiers above. **These are AGNOS values, not Linux's** (don't copy
 `O_CREAT=0x40` etc. — the peer defines `AO_*` to match this table):
@@ -141,7 +162,7 @@ Access mode in the low 2 bits; modifiers above. **These are AGNOS values, not Li
 | `AO_APPEND` | `0x400` | seek to end on each write |
 | `AO_DIRECTORY` | `0x800` | must be a directory (for `getdents`) |
 
-## 4. 🧪 Struct layouts (agnos-native — mirror exactly)
+## 4. ✅ Struct layouts (agnos-native — mirror exactly)
 
 ### 4.1 `stat` struct (48 bytes, 8-byte fields)
 
@@ -182,12 +203,9 @@ Compact + 8-byte-record-aligned. Agnos-native (not Linux `dirent64`'s `d_off`/19
 3. **Re-freeze on every change**: whoever changes a number/signature/layout updates §2/§3/§4 here in the same
    change. The kernel is canonical; the doc tracks it; the peer tracks the doc.
 
-## 6. Open questions
+## 6. Decisions (resolved — see §0)
 
-- **O1 — stdin line discipline** (1.41.1): RAW (agnsh echoes + edits — recommended, Unix-honest) vs COOKED
-  (kernel reuses the existing in-kernel echo/backspace loop). The §3.1 spec assumes RAW.
-- **O2 — `a4 = r10` extension** (§1a): confirm before 1.41.2 codes `rename`. Recommended.
-- **O3 — directory fds**: does `open(AO_DIRECTORY)` return a normal fd that `getdents` consumes (assumed), or
-  a distinct dir-handle? The vfs `vfs_table` slot model supports a dir-fd tag cleanly — recommend reusing it.
-- **O4 — FAT/exFAT `stat`/`link`**: `link` is ext2-only initially (FAT has no hard links); `stat` on FAT/exFAT
-  fills `st_ino=0` + size/type from the dirent. Confirm the FAT degradation is acceptable for `ls -l`.
+O1 (stdin RAW), O2 (`a4 = r10`), O3 (`open(AO_DIRECTORY)` → normal fd), O4 (FAT `stat`/`link` degradation)
+were all **settled 2026-05-31 (agnos-side)** and are recorded in **§0** + applied in §1a/§3. No open ABI
+decisions remain; the 1.41.x surface is ✅ DECIDED and freezes per-syscall as 1.41.1/1.41.2 implement it.
+New questions get appended here until decided, then moved to §0.
