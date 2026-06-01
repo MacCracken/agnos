@@ -470,6 +470,13 @@ fatfs_init();
 # this bite. See agnosticos/docs/development/exfat-prior-art.md.
 exfat_init();
 
+# Mount-point namespace (1.40.13). Build the {prefix->backend} routing table
+# now that ext2/fat/exfat have each set their *_active flags: ext2 at "/",
+# FAT/exFAT also under /mnt/... so shell verbs can reach them WHILE ext2 owns
+# "/". Longest-prefix match in vfs_resolve_mount does the routing — replaces
+# the old ext2_active-flag toggle that hid FAT/exFAT behind a mounted ext2.
+vfs_mount_init();
+
 # FAT read self-test (1.34.x bite 2, compile-gated via FATFS_SELFTEST).
 # Gates the FAT32 + chain-traversal read path: list the root, find the
 # seeded multi-cluster FATTEST.BIN (3000 B, byte[i] = i & 0xFF), read it
@@ -506,19 +513,18 @@ if (fatfs_active == 1) {
     } else {
         kprintln("fatr: FATTEST.BIN not found", 27);
     }
-    # 1.39.1 VFS-lift bite 1: drive the real shell `cat` verb against a FAT
-    # file. ext2 is unmounted on this volume, so sh_cmd_cat skips its ext2
-    # arm and falls through to vfs_open_secondary -> fatfs_open. The file's
-    # content ("VFS-CAT-FAT-OK") printing below proves the shell read path
-    # now reaches FAT (previously ext2-or-initrd only). fat-smoke.sh gates it.
+    # 1.40.13 mount-namespace: drive the real shell `cat` verb against the FAT
+    # mount. sh_cmd_cat -> vfs_resolve_mount -> FS_FAT -> vfs_open_on -> fatfs_open.
+    # The file's content ("VFS-CAT-FAT-OK") proves the shell read path reaches
+    # FAT through an explicit /mnt/fat path even when ext2 owns "/". fat-smoke.sh.
+    sh_cwd_init();
     kprintln("vfscat: shell cat over FAT ->", 29);
-    sh_exec("cat CATTEST.TXT", 15);
-    # 1.39.2 VFS-lift bite 2: drive the real shell `ls` verb. ext2 is
-    # unmounted, so sh_cmd_ls falls through to vfs_print_dir_secondary ->
-    # fatfs_ls (now FB-visible). The 8.3 names (CATTEST.TXT, FATTEST.BIN)
-    # printing below prove `ls` lists a FAT root. fat-smoke.sh gates it.
+    sh_exec("cat /mnt/fat/CATTEST.TXT", 24);
+    # `ls` the FAT mount root — sh_cmd_ls -> FS_FAT -> vfs_print_dir_on -> fatfs_ls.
+    # The 8.3 names (CATTEST.TXT, FATTEST.BIN) prove `ls /mnt/fat` lists the FAT
+    # root regardless of what owns "/". fat-smoke.sh gates it.
     kprintln("vfsls: shell ls over FAT ->", 27);
-    sh_exec("ls", 2);
+    sh_exec("ls /mnt/fat", 11);
 }
 #endif
 
@@ -656,47 +662,43 @@ if (fatfs_active == 1) {
     }
     if (rxn_ok == 1) { kprintln("fatw: fatrootext readback OK", 28); }
     else { kprintln("fatw: fatrootext readback FAIL", 30); }
-    # 1.39.3 VFS-lift bite 3: drive the real shell write verbs. ext2 is
-    # unmounted, so sh_cmd_touch / sh_echo_redirect fall through to
-    # vfs_create_secondary / vfs_write_secondary -> fatfs_create /
-    # fatfs_write_file. fat-write-smoke.sh fsck's + mtype-checks the results
-    # (SHTOUCH.TXT empty-create, SHECHO.TXT content "SHELL-FAT-WROTE").
+    # 1.40.13 mount-namespace: drive the real shell write verbs against the FAT
+    # mount at /mnt/fat. This is the routing fix's whole point — the verbs reach
+    # FAT *through the shell while ext2 owns "/"* (exactly the iron config: ext2
+    # carries /bin, FAT is the data partition). Previously these used bare names
+    # and only worked when ext2 was absent (the ext2-less QEMU smoke); on iron,
+    # ext2 mounted, every verb fell into the ext2 branch and failed (the
+    # 14013_boot_cmd_fails burn). sh_cmd_touch/echo/... -> vfs_resolve_mount ->
+    # FS_FAT -> vfs_create_on/... -> fatfs_*. Files land at the FAT root (=/mnt/
+    # fat), so fat-write-smoke.sh's mdir/fsck checks (SHTOUCH.TXT empty-create,
+    # SHECHO.TXT "SHELL-FAT-WROTE") are unchanged. CWD init'd for any bare path.
+    sh_cwd_init();
     kprintln("vfsw: shell touch+echo over FAT ->", 34);
-    sh_exec("touch SHTOUCH.TXT", 17);
-    sh_exec("echo SHELL-FAT-WROTE > SHECHO.TXT", 33);
-    # 1.39.4 VFS-lift bite 4: shell `rm` over FAT (sh_cmd_rm ->
-    # vfs_delete_secondary -> fatfs_delete). Dedicated target so the bite-3
-    # SHTOUCH/SHECHO gates stay valid; fat-write-smoke.sh checks it's gone.
-    sh_exec("touch SHRMTGT.TXT", 17);
-    sh_exec("rm SHRMTGT.TXT", 14);
-    # 1.39.5 VFS-lift bite 5: shell mkdir/rmdir over FAT (sh_cmd_mkdir/rmdir
-    # -> vfs_mkdir_secondary/vfs_rmdir_secondary -> fatfs_mkdir/fatfs_rmdir).
-    # SHKEEP is kept (smoke confirms it's a navigable dir); SHRMD is created
-    # then removed (smoke confirms it's gone). fsck.fat validates ./.. + chains.
-    sh_exec("mkdir SHKEEP", 12);
-    sh_exec("mkdir SHRMD", 11);
-    sh_exec("rmdir SHRMD", 11);
-    # 1.39.7 VFS-lift bite 7: shell mv (rename) + sync over FAT (sh_cmd_mv ->
-    # vfs_rename_secondary -> fatfs_rename in-place dirent rewrite; sh_cmd_sync
-    # -> vfs_sync_secondary -> blk flush). SHMVA→SHMVB; smoke checks B present,
-    # A gone, fsck clean.
-    sh_exec("touch SHMVA", 11);
-    sh_exec("mv SHMVA SHMVB", 14);
+    sh_exec("touch /mnt/fat/SHTOUCH.TXT", 26);
+    sh_exec("echo SHELL-FAT-WROTE > /mnt/fat/SHECHO.TXT", 42);
+    # `rm` over FAT — dedicated target so the SHTOUCH/SHECHO gates stay valid.
+    sh_exec("touch /mnt/fat/SHRMTGT.TXT", 26);
+    sh_exec("rm /mnt/fat/SHRMTGT.TXT", 23);
+    # mkdir/rmdir over FAT. SHKEEP kept (navigable dir); SHRMD created+removed.
+    sh_exec("mkdir /mnt/fat/SHKEEP", 21);
+    sh_exec("mkdir /mnt/fat/SHRMD", 20);
+    sh_exec("rmdir /mnt/fat/SHRMD", 20);
+    # mv (rename) + sync over FAT. SHMVA→SHMVB; smoke checks B present, A gone.
+    sh_exec("touch /mnt/fat/SHMVA", 20);
+    sh_exec("mv /mnt/fat/SHMVA /mnt/fat/SHMVB", 32);
     sh_exec("sync", 4);
-    # 1.39.9 VFS-lift bite 9: subdirectory paths. Create a dir, then drive the
-    # shell verbs against slashed paths inside it — exercises
-    # fatfs_resolve_parent + the *_in_dir finders end-to-end (create/write/cat/
-    # mkdir/rmdir/mv/rm in a subdir). fat-write-smoke.sh fsck's clean +
-    # mtype-checks SHSUB/SUBKEEP.TXT content, confirms SHSUB/SUBRM.TXT gone +
-    # SHSUB/SUBD2 (renamed dir) present, and greps the `cat` output.
-    sh_exec("mkdir SHSUB", 11);
-    sh_exec("echo SUBDIR-FAT-OK > SHSUB/SUBKEEP.TXT", 38);
-    sh_exec("touch SHSUB/SUBRM.TXT", 21);
-    sh_exec("rm SHSUB/SUBRM.TXT", 18);
-    sh_exec("mkdir SHSUB/SUBD1", 17);
-    sh_exec("mv SHSUB/SUBD1 SHSUB/SUBD2", 26);
+    # Subdirectory paths under the FAT mount — exercises fatfs_resolve_parent
+    # end-to-end (create/write/cat/mkdir/rmdir/mv/rm in a subdir). smoke fsck's
+    # clean + mtype-checks SHSUB/SUBKEEP.TXT content, confirms SHSUB/SUBRM.TXT
+    # gone + SHSUB/SUBD2 (renamed dir) present, and greps the `cat` output.
+    sh_exec("mkdir /mnt/fat/SHSUB", 20);
+    sh_exec("echo SUBDIR-FAT-OK > /mnt/fat/SHSUB/SUBKEEP.TXT", 47);
+    sh_exec("touch /mnt/fat/SHSUB/SUBRM.TXT", 30);
+    sh_exec("rm /mnt/fat/SHSUB/SUBRM.TXT", 27);
+    sh_exec("mkdir /mnt/fat/SHSUB/SUBD1", 26);
+    sh_exec("mv /mnt/fat/SHSUB/SUBD1 /mnt/fat/SHSUB/SUBD2", 44);
     kprintln("vfsw: subdir paths over FAT done", 32);
-    sh_exec("cat SHSUB/SUBKEEP.TXT", 21);
+    sh_exec("cat /mnt/fat/SHSUB/SUBKEEP.TXT", 30);
     # 1.40.1 exec-from-disk bite 1: whole-file read past the 4 KB memfile cap
     # (vfs_read_file). Write a 6000-byte pattern file, read it back fully into
     # an 8 KB buffer, verify length + bytes past offset 4096 (the old cap).
@@ -771,13 +773,15 @@ if (exfat_active == 1) {
     } else {
         kprintln("exfatr: no seeded file (mount + upcase gates only)", 49);
     }
-    # 1.39.2 VFS-lift bite 2: drive the real shell `ls` over exFAT. ext2 is
-    # unmounted -> sh_cmd_ls falls through to vfs_print_dir_secondary ->
-    # exfat_print_dir (name reconstruction, a mirror of the validated
-    # exfat_find set-walk). On an unseeded volume it prints no file names but
-    # proves the dispatch runs clean; under EXFAT_SEED=1 the seeded name lists.
+    # 1.40.13 mount-namespace: drive the real shell `ls` over the exFAT mount.
+    # sh_cmd_ls -> FS_EXFAT -> vfs_print_dir_on -> exfat_print_dir (name
+    # reconstruction, a mirror of the validated exfat_find set-walk). On an
+    # unseeded volume it prints no file names but proves the dispatch runs
+    # clean; under EXFAT_SEED=1 the seeded name lists. `ls /mnt/exfat` reaches
+    # the exFAT root regardless of what owns "/".
+    sh_cwd_init();
     kprintln("vfsls: shell ls over exFAT ->", 29);
-    sh_exec("ls", 2);
+    sh_exec("ls /mnt/exfat", 13);
 }
 #endif
 
@@ -967,14 +971,15 @@ if (exfat_active == 1) {
     }
     if (u_ok == 1) { kprintln("exfatw: unicode find+read OK", 28); }
     else { kprintln("exfatw: unicode find+read FAIL", 30); }
-    # 1.39.3 VFS-lift bite 3: drive the real shell write verbs over exFAT.
-    # ext2 unmounted -> sh_cmd_touch / sh_echo_redirect fall through to
-    # vfs_create_secondary / vfs_write_secondary -> exfat_create /
-    # exfat_write_file. Verify in-kernel (find-back + content read-back);
-    # exfat-write-smoke.sh also fsck.exfat -n's the result.
+    # 1.40.13 mount-namespace: drive the real shell write verbs against the
+    # exFAT mount at /mnt/exfat. sh_cmd_touch/echo -> vfs_resolve_mount ->
+    # FS_EXFAT -> vfs_create_on/vfs_write_on -> exfat_create / exfat_write_file.
+    # Files land at the exFAT root (=/mnt/exfat), so the find-back verifications
+    # below and exfat-write-smoke.sh's fsck.exfat -n are unchanged.
     kprintln("vfsw: shell touch+echo over exFAT ->", 36);
-    sh_exec("touch SHTOUCH.TXT", 17);
-    sh_exec("echo SHELL-EXFAT-WR > SHECHO.TXT", 32);
+    sh_cwd_init();
+    sh_exec("touch /mnt/exfat/SHTOUCH.TXT", 28);
+    sh_exec("echo SHELL-EXFAT-WR > /mnt/exfat/SHECHO.TXT", 43);
     var sht_res[24];
     if (exfat_find("SHTOUCH.TXT", 11, &sht_res) == 1) { kprintln("exfatw: shell touch find-back OK", 32); }
     else { kprintln("exfatw: shell touch find-back FAIL", 34); }
@@ -1000,32 +1005,32 @@ if (exfat_active == 1) {
         if (she_ok == 1) { kprintln("exfatw: shell echo round-trip OK", 32); }
         else { kprintln("exfatw: shell echo round-trip FAIL", 34); }
     } else { kprintln("exfatw: shell echo find-back FAIL", 33); }
-    # 1.39.4 VFS-lift bite 4: shell `rm` over exFAT (sh_cmd_rm ->
-    # vfs_delete_secondary -> exfat_delete). Create a dedicated target, rm it,
-    # confirm in-kernel it's gone; exfat-write-smoke.sh also fsck-checks.
-    sh_exec("touch SHRMTGT.TXT", 17);
-    sh_exec("rm SHRMTGT.TXT", 14);
+    # shell `rm` over exFAT (sh_cmd_rm -> FS_EXFAT -> vfs_delete_on ->
+    # exfat_delete). Create a dedicated target, rm it, confirm in-kernel it's
+    # gone; exfat-write-smoke.sh also fsck-checks.
+    sh_exec("touch /mnt/exfat/SHRMTGT.TXT", 28);
+    sh_exec("rm /mnt/exfat/SHRMTGT.TXT", 25);
     var shrm_res[24];
     if (exfat_find("SHRMTGT.TXT", 11, &shrm_res) == 1) { kprintln("exfatw: shell rm still-present FAIL", 35); }
     else { kprintln("exfatw: shell rm gone OK", 24); }
-    # 1.39.6 VFS-lift bite 6: shell mkdir/rmdir over exFAT (sh_cmd_mkdir/rmdir
-    # -> vfs_mkdir_secondary/vfs_rmdir_secondary -> exfat_mkdir/exfat_rmdir).
+    # shell mkdir/rmdir over exFAT (sh_cmd_mkdir/rmdir -> FS_EXFAT ->
+    # vfs_mkdir_on/vfs_rmdir_on -> exfat_mkdir/exfat_rmdir).
     # SHEXDIR kept (find-back confirms the dir-set); SHEXRMD created then
     # removed (find-miss confirms). exfat-write-smoke.sh also fsck-checks.
-    sh_exec("mkdir SHEXDIR", 13);
+    sh_exec("mkdir /mnt/exfat/SHEXDIR", 24);
     var shmd_res[24];
     if (exfat_find("SHEXDIR", 7, &shmd_res) == 1) { kprintln("exfatw: shell mkdir find-back OK", 32); }
     else { kprintln("exfatw: shell mkdir find-back FAIL", 34); }
-    sh_exec("mkdir SHEXRMD", 13);
-    sh_exec("rmdir SHEXRMD", 13);
+    sh_exec("mkdir /mnt/exfat/SHEXRMD", 24);
+    sh_exec("rmdir /mnt/exfat/SHEXRMD", 24);
     var shrd_res[24];
     if (exfat_find("SHEXRMD", 7, &shrd_res) == 1) { kprintln("exfatw: shell rmdir still-present FAIL", 38); }
     else { kprintln("exfatw: shell rmdir gone OK", 27); }
-    # 1.39.7 VFS-lift bite 7: shell mv (rename) + sync over exFAT (sh_cmd_mv ->
-    # vfs_rename_secondary -> exfat_rename re-emit-at-same-clusters). SHMVA→SHMVB;
-    # in-kernel: dst present + src gone. exfat-write-smoke.sh also fsck-checks.
-    sh_exec("touch SHMVA", 11);
-    sh_exec("mv SHMVA SHMVB", 14);
+    # shell mv (rename) + sync over exFAT (sh_cmd_mv -> FS_EXFAT -> vfs_rename_on
+    # -> exfat_rename re-emit-at-same-clusters). SHMVA→SHMVB; in-kernel: dst
+    # present + src gone. exfat-write-smoke.sh also fsck-checks.
+    sh_exec("touch /mnt/exfat/SHMVA", 22);
+    sh_exec("mv /mnt/exfat/SHMVA /mnt/exfat/SHMVB", 36);
     var shmv_b[24];
     var shmv_a[24];
     if (exfat_find("SHMVB", 5, &shmv_b) == 1) {
@@ -1038,11 +1043,11 @@ if (exfat_active == 1) {
     # exfat_resolve_parent + the *_in_dir finders + emit_set_in. Validated
     # in-kernel (find-back inside SHEXDIR's cluster) + via the `cat` output
     # ("SUBDIR-EXFAT-OK") in the boot log; exfat-write-smoke.sh fsck-checks.
-    sh_exec("echo SUBDIR-EXFAT-OK > SHEXDIR/SUBKEEP.TXT", 42);
-    sh_exec("touch SHEXDIR/SUBRM.TXT", 23);
-    sh_exec("rm SHEXDIR/SUBRM.TXT", 20);
-    sh_exec("mkdir SHEXDIR/SUBD1", 19);
-    sh_exec("mv SHEXDIR/SUBD1 SHEXDIR/SUBD2", 30);
+    sh_exec("echo SUBDIR-EXFAT-OK > /mnt/exfat/SHEXDIR/SUBKEEP.TXT", 53);
+    sh_exec("touch /mnt/exfat/SHEXDIR/SUBRM.TXT", 34);
+    sh_exec("rm /mnt/exfat/SHEXDIR/SUBRM.TXT", 31);
+    sh_exec("mkdir /mnt/exfat/SHEXDIR/SUBD1", 30);
+    sh_exec("mv /mnt/exfat/SHEXDIR/SUBD1 /mnt/exfat/SHEXDIR/SUBD2", 52);
     var shx_dir[24];
     if (exfat_find("SHEXDIR", 7, &shx_dir) == 1) {
         var shx_clus = load64(&shx_dir);
@@ -1056,7 +1061,7 @@ if (exfat_active == 1) {
         if (exfat_find_in_dir(shx_clus, "SUBD2", 5, &shx_d2) == 1) { kprintln("exfatw: subdir renamed-dir OK", 29); }
         else { kprintln("exfatw: subdir renamed-dir FAIL", 31); }
     } else { kprintln("exfatw: subdir parent-missing FAIL", 34); }
-    sh_exec("cat SHEXDIR/SUBKEEP.TXT", 23);
+    sh_exec("cat /mnt/exfat/SHEXDIR/SUBKEEP.TXT", 34);
     # 1.40.1 exec-from-disk bite 1: whole-file read past the 4 KB memfile cap
     # (vfs_read_file) over exFAT.
     var xrfi = 0;

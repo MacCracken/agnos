@@ -319,43 +319,19 @@ fn sh_cmd_bench() {
 fn sh_cmd_cat(arg, arglen) {
     if (arglen < 1) { kprintln("usage: cat <file>", 17); return 0; }
     var fd = 0 - 1;
-    # ext2 path-handling:
-    #  - absolute path (starts with `/`) → hand directly to ext2_open
-    #  - bare name → prefix with `/` (root scoping) and try ext2
-    #    (1.31.7 bite C will reroute this against sh_cwd_inode)
-    # On any ext2 miss, fall back to initrd_open with the ORIGINAL arg
-    # (initrd uses bare names, not paths).
-    if (ext2_active == 1) {
-        if (load8(arg) == 47) {
-            fd = ext2_open(arg, arglen);
-        } else {
-            # Bare name: prefix with sh_cwd_path (CWD scoping per 1.31.7 bite C)
-            # then try ext2. Worst-case length = sh_cwd_len + 1 (separator) + arglen,
-            # bounded by pbuf[256].
-            if (sh_cwd_len + arglen + 1 < 256) {
-                var pbuf[256];
-                var plen = 0;
-                for (var i = 0; i < sh_cwd_len; i = i + 1) {
-                    store8(&pbuf + plen, load8(&sh_cwd_path + i));
-                    plen = plen + 1;
-                }
-                if (sh_cwd_len > 1) {
-                    store8(&pbuf + plen, 47);
-                    plen = plen + 1;
-                }
-                for (var i = 0; i < arglen; i = i + 1) {
-                    store8(&pbuf + plen, load8(arg + i));
-                    plen = plen + 1;
-                }
-                fd = ext2_open(&pbuf, plen);
-            }
+    # Route by mount (1.40.13): build the absolute path (bare name → CWD-scoped,
+    # absolute → as-is, both via sh_abspath), then dispatch to whichever
+    # filesystem owns it — ext2 (inode/path) or FAT/exFAT (mount-relative path).
+    if (sh_abspath(arg, arglen) >= 0) {
+        var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
+        if (be == FS_EXT2) { fd = ext2_open(&sh_path_buf, sh_path_len); }
+        if (be == FS_FAT || be == FS_EXFAT) {
+            fd = vfs_open_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff);
         }
     }
-    # ext2 missed (or not mounted): fall through to the generic secondary
-    # read-dispatch — FAT -> exFAT -> initrd (1.39.1 VFS lift bite 1). This
-    # is what lets `cat` reach a FAT/exFAT volume's root files for the first
-    # time; previously only ext2 + initrd were reachable.
-    if (fd < 0) { fd = vfs_open_secondary(arg, arglen); }
+    # Miss: fall back to initrd with the ORIGINAL bare arg (initrd is not a
+    # mount — it uses bare names, and carries the boot programs).
+    if (fd < 0) { fd = initrd_open(arg, arglen); }
     if (fd < 0) { kprintln("file not found", 14); return 0; }
     var cbuf[64];
     var n = vfs_read(fd, &cbuf, 512);
@@ -368,17 +344,9 @@ fn sh_cmd_cat(arg, arglen) {
 }
 
 fn sh_cmd_ls(arg, arglen) {
-    if (ext2_active == 0) {
-        # Single-primary fallthrough (1.39.2 VFS lift bite 2): no ext2 ->
-        # list a FAT/exFAT primary's root instead (FB-visible names + sizes).
-        # Subdir paths on FAT/exFAT are deferred; root listing is the win.
-        if (vfs_print_dir_secondary() >= 0) { return 0; }
-        kprintln("ls: no filesystem mounted", 25); return 0;
-    }
-    # Parse args: skip leading whitespace, then any flag tokens
-    # (start with `-`). Flags are accepted syntactically but produce
-    # no behavioral change yet — Phase-3 listing format is fixed.
-    # Whatever remains after the flag tokens is treated as a path.
+    # Parse args: skip leading whitespace, then any flag tokens (start with
+    # `-`). Flags are accepted syntactically but produce no behavioral change
+    # yet. Whatever remains after the flag tokens is treated as a path.
     var i = 0;
     while (i < arglen) {
         if (load8(arg + i) != 32) { break; }
@@ -401,35 +369,31 @@ fn sh_cmd_ls(arg, arglen) {
         if (load8(path + path_len - 1) != 32) { break; }
         path_len = path_len - 1;
     }
-    var target_inode = sh_cwd_inode;   # CWD default (1.31.7 bite C)
-    if (path_len > 0) {
-        if (load8(path) == 47) {
-            # Absolute path
-            target_inode = ext2_path_lookup(path, path_len);
-        } else {
-            # Bare name: prefix with sh_cwd_path
-            if (sh_cwd_len + path_len + 1 < 256) {
-                var pbuf[256];
-                var plen = 0;
-                for (var j = 0; j < sh_cwd_len; j = j + 1) {
-                    store8(&pbuf + plen, load8(&sh_cwd_path + j));
-                    plen = plen + 1;
-                }
-                if (sh_cwd_len > 1) {
-                    store8(&pbuf + plen, 47);
-                    plen = plen + 1;
-                }
-                for (var j = 0; j < path_len; j = j + 1) {
-                    store8(&pbuf + plen, load8(path + j));
-                    plen = plen + 1;
-                }
-                target_inode = ext2_path_lookup(&pbuf, plen);
-            } else {
-                target_inode = 0 - 1;
-            }
-        }
-        if (target_inode <= 0) { kprintln("ls: not found", 13); return 0; }
+
+    # No path → list the CWD. CWD is ext2-centric (sh_cwd_inode); if ext2 is
+    # mounted, list that inode, else list the root-mount FS (FAT/exFAT at "/").
+    if (path_len == 0) {
+        if (ext2_active != 0) { ext2_print_dir(sh_cwd_inode); return 0; }
+        var rbe = vfs_resolve_mount("/", 1);
+        if (rbe == FS_FAT || rbe == FS_EXFAT) { if (vfs_print_dir_on(rbe) >= 0) { return 0; } }
+        kprintln("ls: no filesystem mounted", 25); return 0;
     }
+
+    # Path given → route by mount (1.40.13).
+    if (sh_abspath(path, path_len) < 0) { kprintln("ls: bad path", 12); return 0; }
+    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
+    if (be == FS_FAT || be == FS_EXFAT) {
+        # Subdir listing on FAT/exFAT is a deferred follow-on; only the mount
+        # root lists (relative path empty or "/").
+        if (sh_path_len - vfs_mnt_reloff <= 1) {
+            if (vfs_print_dir_on(be) >= 0) { return 0; }
+            kprintln("ls: not found", 13); return 0;
+        }
+        kprintln("ls: subdir listing on FAT/exFAT not yet supported", 49); return 0;
+    }
+    if (be != FS_EXT2) { kprintln("ls: not found", 13); return 0; }
+    var target_inode = ext2_path_lookup(&sh_path_buf, sh_path_len);
+    if (target_inode <= 0) { kprintln("ls: not found", 13); return 0; }
     ext2_print_dir(target_inode);
     return 0;
 }
@@ -455,6 +419,11 @@ fn sh_trim(p, l) {
 # bare → sh_cwd_path + "/" + arg). Returns plen (>0) or -1.
 fn sh_abspath(arg, arglen) {
     if (arglen < 1) { return 0 - 1; }
+    # Lazy-init the CWD to root if a verb runs before sh_cwd_init (e.g. a
+    # boot selftest driving sh_exec directly). Without this a bare name would
+    # build with no leading '/', and sh_split_parent / vfs_resolve_mount would
+    # both reject it — the second half of the 1.40.13 FAT iron failure.
+    if (sh_cwd_len < 1) { store8(&sh_cwd_path, 47); sh_cwd_len = 1; sh_cwd_inode = 2; }
     var plen = 0;
     if (load8(arg) == 47) {
         if (arglen > 512) { return 0 - 1; }
@@ -489,17 +458,16 @@ fn sh_split_parent(plen) {
 }
 
 fn sh_cmd_touch(arg, arglen) {
-    if (ext2_active == 0) {
-        # Single-primary fallthrough (1.39.3): no ext2 -> create a bare-named
-        # file in the FAT/exFAT root via vfs_create_secondary. Root-only.
-        sh_trim(arg, arglen);
-        if (sh_trim_len < 1) { kprintln("usage: touch <file>", 19); return 0; }
-        if (vfs_create_secondary(arg + sh_trim_off, sh_trim_len) == 0) { return 0; }
-        kprintln("touch: no fs", 12); return 0;
-    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: touch <file>", 19); return 0; }
     if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("touch: bad path", 15); return 0; }
+    # Route by mount (1.40.13): which filesystem owns this absolute path?
+    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
+    if (be == FS_FAT || be == FS_EXFAT) {
+        if (vfs_create_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff) == 0) { return 0; }
+        kprintln("touch: failed", 13); return 0;
+    }
+    if (be != FS_EXT2) { kprintln("touch: no fs", 12); return 0; }
     var parent = sh_split_parent(sh_path_len);
     if (parent <= 0) { kprintln("touch: no such directory", 24); return 0; }
     if (ext2_dir_lookup(parent, &sh_path_buf + sh_base_off, sh_base_len) > 0) { return 0; }  # exists → no-op
@@ -508,17 +476,15 @@ fn sh_cmd_touch(arg, arglen) {
 }
 
 fn sh_cmd_rm(arg, arglen) {
-    if (ext2_active == 0) {
-        # Single-primary fallthrough (1.39.4): no ext2 -> delete a bare-named
-        # file in the FAT/exFAT root via vfs_delete_secondary. Root-only.
-        sh_trim(arg, arglen);
-        if (sh_trim_len < 1) { kprintln("usage: rm <file>", 16); return 0; }
-        if (vfs_delete_secondary(arg + sh_trim_off, sh_trim_len) == 0) { return 0; }
-        kprintln("rm: no fs", 9); return 0;
-    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: rm <file>", 16); return 0; }
     if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("rm: bad path", 12); return 0; }
+    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
+    if (be == FS_FAT || be == FS_EXFAT) {
+        if (vfs_delete_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff) == 0) { return 0; }
+        kprintln("rm: failed", 10); return 0;
+    }
+    if (be != FS_EXT2) { kprintln("rm: no fs", 9); return 0; }
     var parent = sh_split_parent(sh_path_len);
     if (parent <= 0) { kprintln("rm: no such path", 16); return 0; }
     if (ext2_unlink(parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) { kprintln("rm: failed", 10); }
@@ -526,18 +492,15 @@ fn sh_cmd_rm(arg, arglen) {
 }
 
 fn sh_cmd_mkdir(arg, arglen) {
-    if (ext2_active == 0) {
-        # Single-primary fallthrough (1.39.5): no ext2 -> create a bare-named
-        # directory in the FAT root via vfs_mkdir_secondary. Root-only;
-        # exFAT mkdir lands at 1.39.6 (returns failure until then).
-        sh_trim(arg, arglen);
-        if (sh_trim_len < 1) { kprintln("usage: mkdir <dir>", 18); return 0; }
-        if (vfs_mkdir_secondary(arg + sh_trim_off, sh_trim_len) == 0) { return 0; }
-        kprintln("mkdir: failed", 13); return 0;
-    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: mkdir <dir>", 18); return 0; }
     if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("mkdir: bad path", 15); return 0; }
+    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
+    if (be == FS_FAT || be == FS_EXFAT) {
+        if (vfs_mkdir_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff) == 0) { return 0; }
+        kprintln("mkdir: failed", 13); return 0;
+    }
+    if (be != FS_EXT2) { kprintln("mkdir: no fs", 12); return 0; }
     var parent = sh_split_parent(sh_path_len);
     if (parent <= 0) { kprintln("mkdir: no such parent", 21); return 0; }
     if (ext2_mkdir(parent, &sh_path_buf + sh_base_off, sh_base_len) <= 0) { kprintln("mkdir: failed", 13); }
@@ -545,17 +508,15 @@ fn sh_cmd_mkdir(arg, arglen) {
 }
 
 fn sh_cmd_rmdir(arg, arglen) {
-    if (ext2_active == 0) {
-        # Single-primary fallthrough (1.39.5): no ext2 -> remove an empty
-        # bare-named directory in the FAT root via vfs_rmdir_secondary.
-        sh_trim(arg, arglen);
-        if (sh_trim_len < 1) { kprintln("usage: rmdir <dir>", 18); return 0; }
-        if (vfs_rmdir_secondary(arg + sh_trim_off, sh_trim_len) == 0) { return 0; }
-        kprintln("rmdir: failed (not empty?)", 26); return 0;
-    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: rmdir <dir>", 18); return 0; }
     if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("rmdir: bad path", 15); return 0; }
+    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
+    if (be == FS_FAT || be == FS_EXFAT) {
+        if (vfs_rmdir_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff) == 0) { return 0; }
+        kprintln("rmdir: failed (not empty?)", 26); return 0;
+    }
+    if (be != FS_EXT2) { kprintln("rmdir: no fs", 12); return 0; }
     var parent = sh_split_parent(sh_path_len);
     if (parent <= 0) { kprintln("rmdir: no such path", 19); return 0; }
     if (ext2_rmdir(parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) { kprintln("rmdir: failed (not empty?)", 26); }
@@ -566,25 +527,6 @@ fn sh_cmd_rmdir(arg, arglen) {
 # first space. SRC's basename is copied to a local before DST is resolved,
 # because sh_abspath/sh_split_parent reuse the shared sh_path_buf.
 fn sh_cmd_mv(arg, arglen) {
-    if (ext2_active == 0) {
-        # Single-primary fallthrough (1.39.7): no ext2 -> rename within the
-        # FAT/exFAT root via vfs_rename_secondary. Bare src/dst names, root-only.
-        sh_trim(arg, arglen);
-        if (sh_trim_len < 1) { kprintln("usage: mv <src> <dst>", 21); return 0; }
-        var mts = arg + sh_trim_off;
-        var mtl = sh_trim_len;
-        var msp = 0 - 1;
-        var mi = 0;
-        while (mi < mtl) { if (load8(mts + mi) == 32) { msp = mi; break; } mi = mi + 1; }
-        if (msp < 0) { kprintln("usage: mv <src> <dst>", 21); return 0; }
-        var mdoff = msp + 1;
-        while (mdoff < mtl) { if (load8(mts + mdoff) != 32) { break; } mdoff = mdoff + 1; }
-        if (mdoff >= mtl) { kprintln("usage: mv <src> <dst>", 21); return 0; }
-        var mdl = mtl - mdoff;
-        while (mdl > 0) { if (load8(mts + mdoff + mdl - 1) != 32) { break; } mdl = mdl - 1; }
-        if (vfs_rename_secondary(mts, msp, mts + mdoff, mdl) == 0) { return 0; }
-        kprintln("mv: failed", 10); return 0;
-    }
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: mv <src> <dst>", 21); return 0; }
     var ts = arg + sh_trim_off;
@@ -596,23 +538,46 @@ fn sh_cmd_mv(arg, arglen) {
     var doff = sp + 1;
     while (doff < tl) { if (load8(ts + doff) != 32) { break; } doff = doff + 1; }
     if (doff >= tl) { kprintln("usage: mv <src> <dst>", 21); return 0; }
+    var dl = tl - doff;
+    while (dl > 0) { if (load8(ts + doff + dl - 1) != 32) { break; } dl = dl - 1; }
 
-    # resolve SRC → parent + copy basename to a local
+    # resolve SRC → abspath + owning mount. Save a copy of the source (FAT/exFAT
+    # relpath, OR ext2 parent-inode + basename) BEFORE the DST resolve clobbers
+    # the shared sh_path_buf. srcsave doubles as both (relpath for FAT, basename
+    # for ext2 — never both at once).
     if (sh_abspath(ts, sp) < 0) { kprintln("mv: bad src path", 16); return 0; }
-    var src_parent = sh_split_parent(sh_path_len);
-    if (src_parent <= 0) { kprintln("mv: no such src directory", 25); return 0; }
-    var src_nl = sh_base_len;
-    if (src_nl > 255) { kprintln("mv: src name too long", 21); return 0; }
-    var srcname[256];
-    var k = 0;
-    while (k < src_nl) { store8(&srcname + k, load8(&sh_path_buf + sh_base_off + k)); k = k + 1; }
+    var be_src = vfs_resolve_mount(&sh_path_buf, sh_path_len);
+    var srcsave[256];
+    var srcsave_len = 0;
+    var src_parent = 0;
+    if (be_src == FS_FAT || be_src == FS_EXFAT) {
+        srcsave_len = sh_path_len - vfs_mnt_reloff;
+        if (srcsave_len > 255) { kprintln("mv: src path too long", 21); return 0; }
+        var k = 0;
+        while (k < srcsave_len) { store8(&srcsave + k, load8(&sh_path_buf + vfs_mnt_reloff + k)); k = k + 1; }
+    }
+    if (be_src == FS_EXT2) {
+        src_parent = sh_split_parent(sh_path_len);
+        if (src_parent <= 0) { kprintln("mv: no such src directory", 25); return 0; }
+        srcsave_len = sh_base_len;
+        if (srcsave_len > 255) { kprintln("mv: src name too long", 21); return 0; }
+        var k = 0;
+        while (k < srcsave_len) { store8(&srcsave + k, load8(&sh_path_buf + sh_base_off + k)); k = k + 1; }
+    }
+    if (be_src != FS_FAT && be_src != FS_EXFAT && be_src != FS_EXT2) { kprintln("mv: no fs", 9); return 0; }
 
-    # resolve DST → parent + basename (left in sh_path_buf)
-    if (sh_abspath(ts + doff, tl - doff) < 0) { kprintln("mv: bad dst path", 16); return 0; }
+    # resolve DST → abspath + owning mount; rename is within one filesystem only.
+    if (sh_abspath(ts + doff, dl) < 0) { kprintln("mv: bad dst path", 16); return 0; }
+    var be_dst = vfs_resolve_mount(&sh_path_buf, sh_path_len);
+    if (be_dst != be_src) { kprintln("mv: cross-filesystem move unsupported", 37); return 0; }
+
+    if (be_src == FS_FAT || be_src == FS_EXFAT) {
+        if (vfs_rename_on(be_src, &srcsave, srcsave_len, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff) == 0) { return 0; }
+        kprintln("mv: failed", 10); return 0;
+    }
     var dst_parent = sh_split_parent(sh_path_len);
     if (dst_parent <= 0) { kprintln("mv: no such dst directory", 25); return 0; }
-
-    if (ext2_rename(src_parent, &srcname, src_nl, dst_parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) {
+    if (ext2_rename(src_parent, &srcsave, srcsave_len, dst_parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) {
         kprintln("mv: failed (no such src / dst exists / dir loop?)", 49);
     }
     return 0;
@@ -770,32 +735,28 @@ fn sh_cmd_run(arg, arglen) {
 # `echo TEXT > FILE` — write TEXT + newline to FILE (create or truncate).
 # `text`/`textlen` = the bytes before '>'; `fname`/`fnamelen` = after.
 fn sh_echo_redirect(text, textlen, fname, fnamelen) {
-    if (ext2_active == 0) {
-        # Single-primary fallthrough (1.39.3): no ext2 -> create+write a
-        # bare-named file in the FAT/exFAT root. FAT/exFAT writes are
-        # whole-file (overwrite), so assemble text + "\n" into one buffer and
-        # hand it to vfs_write_secondary in a single call. Root-only.
-        sh_trim(text, textlen);
-        var et_off = sh_trim_off; var et_len = sh_trim_len;
-        sh_trim(fname, fnamelen);
-        if (sh_trim_len < 1) { kprintln("echo: no redirect target", 24); return 0; }
-        var ebuf[512];                       # function-local: 512 bytes
-        var ew = 0;
-        var ek = 0;
-        while (ek < et_len) {
-            if (ew >= 511) { break; }
-            store8(&ebuf + ew, load8(text + et_off + ek));
-            ew = ew + 1; ek = ek + 1;
-        }
-        if (ew < 511) { store8(&ebuf + ew, 10); ew = ew + 1; }   # trailing '\n'
-        if (vfs_write_secondary(fname + sh_trim_off, sh_trim_len, &ebuf, ew) >= 0) { return 0; }
-        kprintln("echo: no fs for redirect", 24); return 0;
-    }
     sh_trim(text, textlen);
     var t_off = sh_trim_off; var t_len = sh_trim_len;
     sh_trim(fname, fnamelen);
     if (sh_trim_len < 1) { kprintln("echo: no redirect target", 24); return 0; }
     if (sh_abspath(fname + sh_trim_off, sh_trim_len) < 0) { kprintln("echo: bad path", 14); return 0; }
+    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
+    if (be == FS_FAT || be == FS_EXFAT) {
+        # FAT/exFAT writes are whole-file (overwrite): assemble text + "\n" into
+        # one buffer and hand the mount-relative path to vfs_write_on.
+        var ebuf[512];                       # function-local: 512 bytes
+        var ew = 0;
+        var ek = 0;
+        while (ek < t_len) {
+            if (ew >= 511) { break; }
+            store8(&ebuf + ew, load8(text + t_off + ek));
+            ew = ew + 1; ek = ek + 1;
+        }
+        if (ew < 511) { store8(&ebuf + ew, 10); ew = ew + 1; }   # trailing '\n'
+        if (vfs_write_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff, &ebuf, ew) >= 0) { return 0; }
+        kprintln("echo: write failed", 18); return 0;
+    }
+    if (be != FS_EXT2) { kprintln("echo: no fs for redirect", 24); return 0; }
     var parent = sh_split_parent(sh_path_len);
     if (parent <= 0) { kprintln("echo: no such directory", 23); return 0; }
 

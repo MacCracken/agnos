@@ -71,23 +71,10 @@ fn vfs_create_memfile(data, size) {
     return idx;
 }
 
-# === Generic read-dispatch (1.39.1 — VFS generic-write lift, bite 1) ===
-# ext2 is opened path-aware by the caller (the shell owns CWD scoping); this
-# dispatches the remaining read backends by bare name in priority order —
-# FAT -> exFAT -> initrd — so the shell read verbs reach FAT/exFAT volumes
-# for the first time (previously ext2-or-initrd only). Each backend
-# self-guards on its own mount flag (returns -1 if not mounted) and yields a
-# ready VFS fd (FAT/exFAT via vfs_create_memfile; initrd via its own
-# memfile) or -1 on miss. First hit wins. This is the read seam the write
-# bites (1.39.4+) extend; the dispatch lives here, not scattered in shell.
-fn vfs_open_secondary(name, namelen) {
-    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
-    var fd = fatfs_open(name, namelen);
-    if (fd >= 0) { return fd; }
-    fd = exfat_open(name, namelen);
-    if (fd >= 0) { return fd; }
-    return initrd_open(name, namelen);
-}
+# NOTE (1.40.13): vfs_open_secondary (the bare-name FAT->exFAT->initrd read
+# dispatcher) was RETIRED here — `cat` now routes by mount (vfs_resolve_mount ->
+# vfs_open_on for FAT/exFAT, ext2_open for ext2, initrd as the bare-name
+# fallback). See vfs_open_on / vfs_print_dir_on below.
 
 # === Secondary mount registry (1.39.8 — VFS lift bite 8, consolidation) ===
 # Bites 2-7 each repeated the same four-line non-ESP-preference if-chain
@@ -117,6 +104,169 @@ fn vfs_secondary_select() {
     if (fatfs_active != 0)  { return SEC_FAT; }
     if (exfat_active != 0)  { return SEC_EXFAT; }
     return SEC_NONE;
+}
+
+# === Mount-point namespace (1.40.13 — the routing "non-goal §5" finally built)
+# The 1.39.x verb surface routed by the ext2_active *flag*: ext2-when-mounted,
+# else the sole secondary FAT/exFAT. That made FAT/exFAT unreachable through
+# the shell whenever ext2 was mounted (i.e. every real boot — ext2 carries the
+# exec arc's /bin), which the ext2-less QEMU smoke hid. The 1.40.13 FAT iron
+# burn exposed it. This is the real VFS routing it was always supposed to be:
+# a {prefix -> backend} mount table + longest-prefix match, so the verbs route
+# by MOUNT. ext2 mounts at "/"; FAT/exFAT also mount under /mnt/... so all are
+# live at once. When ext2 is absent, the sole data FS also takes "/" so bare
+# CWD paths still resolve (preserves the ext2-less smoke, byte-for-byte).
+enum FsBackend {
+    FS_NONE  = 0;
+    FS_EXT2  = 1;
+    FS_FAT   = 2;
+    FS_EXFAT = 3;
+}
+
+# Up to 8 mounts. Module-global `var X[N]` = N×u64, so these are 8 u64 slots
+# each (indexed by slot*8 via store64/load64); vfs_mnt_prefix is 64 u64 = 512 B
+# = 8 slots × 64 bytes of prefix string (indexed by slot*64 via store8/load8).
+var vfs_mnt_count       = 0;
+var vfs_mnt_backend[8];        # FsBackend id per slot
+var vfs_mnt_prefix_len[8];     # prefix byte length per slot
+var vfs_mnt_prefix[64];        # prefix strings, 64 bytes/slot
+var vfs_mnt_reloff      = 0;   # set by vfs_resolve_mount: byte offset within the
+                               # queried path where the mount-relative path begins
+
+fn vfs_mount_add(prefix, prefixlen, backend) {
+    if (vfs_mnt_count >= 8) { return 0 - 1; }
+    if (prefixlen < 1)      { return 0 - 1; }
+    if (prefixlen > 63)     { return 0 - 1; }
+    var slot = vfs_mnt_count;
+    var dst = &vfs_mnt_prefix + slot * 64;
+    var k = 0;
+    while (k < prefixlen) { store8(dst + k, load8(prefix + k)); k = k + 1; }
+    store64(&vfs_mnt_prefix_len + slot * 8, prefixlen);
+    store64(&vfs_mnt_backend + slot * 8, backend);
+    vfs_mnt_count = vfs_mnt_count + 1;
+    return 0;
+}
+
+# Build the routing table from whatever mounted. Called once at boot after
+# ext2_init / fatfs_init / exfat_init.
+fn vfs_mount_init() {
+    vfs_mnt_count = 0;
+    # Root "/": ext2 if present, else the primary secondary data FS (so the
+    # ext2-less smoke's bare CWD paths still resolve to FAT/exFAT at root).
+    if (ext2_active != 0) {
+        vfs_mount_add("/", 1, FS_EXT2);
+    } else {
+        var sec = vfs_secondary_select();
+        if (sec == SEC_FAT)   { vfs_mount_add("/", 1, FS_FAT); }
+        if (sec == SEC_EXFAT) { vfs_mount_add("/", 1, FS_EXFAT); }
+    }
+    # Explicit mountpoints so FAT/exFAT stay reachable through shell verbs even
+    # while ext2 owns "/". Longest-prefix match routes /mnt/fat/x -> FAT and
+    # /x -> root. (If ext2 is absent and FAT/exFAT already took "/", these are
+    # harmless redundant aliases — both slots route to the same backend.)
+    if (fatfs_active != 0)  { vfs_mount_add("/mnt/fat", 8, FS_FAT); }
+    if (exfat_active != 0)  { vfs_mount_add("/mnt/exfat", 10, FS_EXFAT); }
+    return 0;
+}
+
+# Longest-prefix mount lookup. `path` must be absolute (leading '/'). Returns
+# the FsBackend that owns it and sets vfs_mnt_reloff to the offset within
+# `path` where the mount-relative path starts: 0 for the root mount (the whole
+# abspath is relative — ext2 resolves it inode-wise, FAT/exFAT strip the lead
+# '/'), or the prefix length for a /mnt/... mount (strip the mountpoint). A
+# prefix matches only at a path-component boundary ('/mnt/fat' matches
+# '/mnt/fat' and '/mnt/fat/x' but never '/mnt/fatx'). FS_NONE if nothing owns it.
+fn vfs_resolve_mount(path, pathlen) {
+    if (pathlen < 1)        { return FS_NONE; }
+    if (load8(path) != 47)  { return FS_NONE; }    # must be absolute
+    var best = 0 - 1;
+    var best_len = 0 - 1;
+    var i = 0;
+    while (i < vfs_mnt_count) {
+        var plen = load64(&vfs_mnt_prefix_len + i * 8);
+        var pp = &vfs_mnt_prefix + i * 64;
+        var ok = 0;
+        if (plen == 1 && load8(pp) == 47) {
+            ok = 1;                                # root "/" owns everything
+        } else {
+            if (pathlen >= plen) {
+                var m = 1;
+                var k = 0;
+                while (k < plen) { if (load8(path + k) != load8(pp + k)) { m = 0; break; } k = k + 1; }
+                if (m == 1) {
+                    if (pathlen == plen)            { ok = 1; }       # exact mountpoint
+                    else { if (load8(path + plen) == 47) { ok = 1; } }  # boundary
+                }
+            }
+        }
+        if (ok == 1 && plen > best_len) { best_len = plen; best = i; }
+        i = i + 1;
+    }
+    if (best < 0) { return FS_NONE; }
+    var bplen = load64(&vfs_mnt_prefix_len + best * 8);
+    if (bplen == 1) { vfs_mnt_reloff = 0; }        # root mount: whole abspath
+    else { vfs_mnt_reloff = bplen; }               # strip the mountpoint prefix
+    return load64(&vfs_mnt_backend + best * 8);
+}
+
+# Backend-parameterized FAT/exFAT dispatch (1.40.13 mount routing). Each takes
+# an explicit FsBackend (from vfs_resolve_mount) + a mount-relative path that
+# MAY carry a leading '/' (the FAT/exFAT resolve_parent walkers strip it). This
+# is the FAT/exFAT arm of the mount-routed shell verbs; ext2 is dispatched
+# inode-wise by the shell on the absolute path. FS_NONE / FS_EXT2 -> -1 here
+# (not handled by these — the caller routes ext2 itself). These supersede the
+# vfs_*_secondary helpers, which routed by vfs_secondary_select (ext2-flag era)
+# and are kept only for any remaining single-primary callers.
+fn vfs_create_on(be, name, namelen) {
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (be == FS_FAT)   { return fatfs_create(name, namelen); }
+    if (be == FS_EXFAT) { return exfat_create(name, namelen); }
+    return 0 - 1;
+}
+fn vfs_write_on(be, name, namelen, src, len) {
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (be == FS_FAT)   { return fatfs_write_file(name, namelen, src, len); }
+    if (be == FS_EXFAT) { return exfat_write_file(name, namelen, src, len); }
+    return 0 - 1;
+}
+fn vfs_delete_on(be, name, namelen) {
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (be == FS_FAT)   { return fatfs_delete(name, namelen); }
+    if (be == FS_EXFAT) { return exfat_delete(name, namelen); }
+    return 0 - 1;
+}
+fn vfs_mkdir_on(be, name, namelen) {
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (be == FS_FAT)   { return fatfs_mkdir(name, namelen); }
+    if (be == FS_EXFAT) { return exfat_mkdir(name, namelen); }
+    return 0 - 1;
+}
+fn vfs_rmdir_on(be, name, namelen) {
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (be == FS_FAT)   { return fatfs_rmdir(name, namelen); }
+    if (be == FS_EXFAT) { return exfat_rmdir(name, namelen); }
+    return 0 - 1;
+}
+fn vfs_rename_on(be, oldname, oldlen, newname, newlen) {
+    if (vfs_sec_name_ok(oldlen) == 0) { return 0 - 1; }
+    if (vfs_sec_name_ok(newlen) == 0) { return 0 - 1; }
+    if (be == FS_FAT)   { return fatfs_rename(oldname, oldlen, newname, newlen); }
+    if (be == FS_EXFAT) { return exfat_rename(oldname, oldlen, newname, newlen); }
+    return 0 - 1;
+}
+fn vfs_open_on(be, name, namelen) {
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    if (be == FS_FAT)   { return fatfs_open(name, namelen); }
+    if (be == FS_EXFAT) { return exfat_open(name, namelen); }
+    return 0 - 1;
+}
+# Root-only directory listing for a FAT/exFAT mount (subdir `ls` on FAT/exFAT
+# is a deferred follow-on; the backends list their root). Returns entry count
+# or -1.
+fn vfs_print_dir_on(be) {
+    if (be == FS_FAT)   { return fatfs_ls(); }
+    if (be == FS_EXFAT) { return exfat_print_dir(); }
+    return 0 - 1;
 }
 
 # === Whole-file read (1.40.1 — exec-from-disk, bite 1) ===
@@ -238,80 +388,13 @@ fn vfs_sec_name_ok(namelen) {
     return 1;
 }
 
-# Generic directory-listing dispatch for the non-ext2 primary case (1.39.2 —
-# bite 2; consolidated at bite 8). ext2 is listed by the caller (path/CWD-
-# aware, via ext2_print_dir on a resolved inode); this lists the FAT or
-# exFAT *root* when one of them is the selected secondary primary. Returns
-# the entry count, or -1 when no secondary FS is mounted.
-fn vfs_print_dir_secondary() {
-    var fs = vfs_secondary_select();
-    if (fs == SEC_FAT)   { return fatfs_ls(); }
-    if (fs == SEC_EXFAT) { return exfat_print_dir(); }
-    return 0 - 1;
-}
-
-# Generic create/write dispatch for the non-ext2 primary (1.39.3 — bite 3;
-# consolidated at bite 8). Creates/writes a bare-named file in the selected
-# FAT/exFAT *root*. FAT/exFAT writes self-gate on the ESP-write guard
-# (refused on a boot ESP unless FAT_ALLOW_ESP_WRITE). Returns 0 / bytes on
-# success, -1 on miss-or-failure.
-fn vfs_create_secondary(name, namelen) {
-    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
-    var fs = vfs_secondary_select();
-    if (fs == SEC_FAT)   { return fatfs_create(name, namelen); }
-    if (fs == SEC_EXFAT) { return exfat_create(name, namelen); }
-    return 0 - 1;
-}
-fn vfs_write_secondary(name, namelen, src, len) {
-    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
-    var fs = vfs_secondary_select();
-    if (fs == SEC_FAT)   { return fatfs_write_file(name, namelen, src, len); }
-    if (fs == SEC_EXFAT) { return exfat_write_file(name, namelen, src, len); }
-    return 0 - 1;
-}
-
-# Generic delete dispatch for the non-ext2 primary (1.39.4 — bite 4, `rm`;
-# consolidated at bite 8). Returns 0 on success, -1 on miss-or-failure.
-fn vfs_delete_secondary(name, namelen) {
-    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
-    var fs = vfs_secondary_select();
-    if (fs == SEC_FAT)   { return fatfs_delete(name, namelen); }
-    if (fs == SEC_EXFAT) { return exfat_delete(name, namelen); }
-    return 0 - 1;
-}
-
-# Generic directory create/remove dispatch (1.39.5 FAT + 1.39.6 exFAT —
-# bites 5/6, mkdir/rmdir; consolidated at bite 8).
-fn vfs_mkdir_secondary(name, namelen) {
-    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
-    var fs = vfs_secondary_select();
-    if (fs == SEC_FAT)   { return fatfs_mkdir(name, namelen); }
-    if (fs == SEC_EXFAT) { return exfat_mkdir(name, namelen); }
-    return 0 - 1;
-}
-fn vfs_rmdir_secondary(name, namelen) {
-    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
-    var fs = vfs_secondary_select();
-    if (fs == SEC_FAT)   { return fatfs_rmdir(name, namelen); }
-    if (fs == SEC_EXFAT) { return exfat_rmdir(name, namelen); }
-    return 0 - 1;
-}
-
-# Generic rename + sync dispatch for the non-ext2 primary (1.39.7 — bite 7;
-# rename consolidated at bite 8). Rename: FAT does an in-place dirent
-# rewrite, exFAT re-emits the dir-set over the same clusters (neither has
-# POSIX-atomic rename). Sync: FAT/exFAT writes go straight to the block
-# layer, so sync is a durability barrier (blk flush). Sync flushes whichever
-# backend is active *regardless of ESP* (a durability barrier must reach the
-# boot ESP too), so it does NOT route through the non-ESP selector.
-fn vfs_rename_secondary(oldname, oldlen, newname, newlen) {
-    if (vfs_sec_name_ok(oldlen) == 0) { return 0 - 1; }
-    if (vfs_sec_name_ok(newlen) == 0) { return 0 - 1; }
-    var fs = vfs_secondary_select();
-    if (fs == SEC_FAT)   { return fatfs_rename(oldname, oldlen, newname, newlen); }
-    if (fs == SEC_EXFAT) { return exfat_rename(oldname, oldlen, newname, newlen); }
-    return 0 - 1;
-}
+# NOTE (1.40.13): the per-verb vfs_*_secondary dispatchers (create/write/delete/
+# mkdir/rmdir/rename/print_dir) were RETIRED here. They routed by
+# vfs_secondary_select (the ext2-flag era: FAT/exFAT reachable only when ext2
+# was absent) and were superseded by the mount-routed vfs_*_on helpers above,
+# which the shell now drives via vfs_resolve_mount. Only the sync barrier keeps
+# a "_secondary" form — sync is a global durability flush, not a path lookup, so
+# it never routed by mount in the first place.
 fn vfs_sync_secondary() {
     if (fatfs_active != 0) { blk_flush_on(fat_backend); return 0; }
     if (exfat_active != 0) { blk_flush_on(exfat_backend); return 0; }
