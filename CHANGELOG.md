@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.0] — 2026-05-31 (**Shell-separation arc OPEN — boundary audit + staging mechanism.** The interactive shell moves out of the kernel: the in-kernel ring-0 `shell()` REPL gives way to the userland **`agnsh`** (agnoshi) binary exec'd from disk via the 1.40.x exec path, with the in-kernel shell shrinking to a permanent emergency/recovery fallback. This cut is the arc-open — **audit + scaffolding, no kernel code** — and it surfaced the gating prerequisite. The first userland binary promoted to a system component; the kernel-slimming counterpart to 1.40.x exec, mirroring the 1.37.5 font→`kashi` move.)
+
+### Added
+- **`scripts/stage-agnsh.sh`** — staging mechanism: builds/places the `agnsh` shell binary at `build/rootfs/bin/agnsh` (the agnos-fs staging tree consumed by QEMU-smoke fs-population, `install-usb.sh --update`, or iron mount-modify). Validates a static x86-64 ELF64. Output tree is gitignored (build product).
+
+### Audit / planning (no behavior change)
+- **Boundary audit** (agnosticos `shell-separation-prior-art.md`): inventoried all 35 in-kernel shell verbs and classified the boundary — user-facing verbs (`cat`/`ls`/`cd`/`echo`/`touch`/`rm`/`mkdir`/`rmdir`/`mv`/`ln`/`sync`/`run`/`dns`/`ping`/`date`/…) move to `agnsh` via syscalls; deep kernel diagnostics (`lspci`/`blkread`/`disk`/`parts`/`bench`/`jbd2`) stay in the emergency shell where the data lives.
+- **Syscall gap analysis**: `agnsh`'s builtins need a mount-routed FS surface that doesn't exist yet — `open`(7) routes to `initrd_open` **only** (can't reach the agnos-fs); `getdents`/`unlink`/`rename`/`link`/`stat`/`create` are **missing**; `mkdir`(9)/`rmdir`(10)/`sync`(12) are **stubs returning 0**. Plus a **blocking keyboard `read(fd=0)`** (today fd 0 → serial). CWD is decided **userland-owned** (no kernel `chdir`/`getcwd`). exec-by-path, network syscalls, and the AI/`hoosh` layer are explicitly deferred.
+- **Gating prerequisite surfaced — `CYRIUS_TARGET_AGNOS` (cyrius-side).** `agnsh` is an OS-agnostic shell (zsh/bash-class); the Cyrius stdlib syscall layer only targets `CYRIUS_TARGET_LINUX`/`_WIN` today (Linux was the host target available to build against), so the current `agnsh` speaks the **Linux** syscall ABI and won't run on AGNOS's sovereign 28-syscall surface. The port is "add a Cyrius agnos target" (a `lib/syscalls_*_agnos.cyr` peer emitting agnos numbers), **not** "agnos answers Linux syscalls" (which would break the sovereign-surface invariant). Cyrius-gated, driven with the cyrius agent — same class as PIE/TLS. The agnos-side bites (1.41.1 stdin, 1.41.2 FS syscalls) are necessary but not sufficient until that target lands.
+- **Emergency-shell trigger decided** (user): fires on **any** boot-to-shell failure (exec-fail of `/bin/agnsh` being the immediate case) **plus a future user key-chord** to summon it on demand.
+
+### Notes
+- No `VERSION`/`version.cyr` engineering change beyond the cycle-open bump (1.40.14 → 1.41.0); production build byte-behavior unchanged (only the version banner strings differ). Bite ladder + dependencies: `docs/development/roadmap.md` § *1.41.x — Shell Separation Arc*.
+
 ## [1.40.14] — 2026-05-31 (**1.40.x arc closeout — process teardown/reaping + hardening.** The `14013_final*` iron burn validated the whole arc at once: exec-from-disk (1.40.9), the scheduler-reset fix (1.40.10), the boot-stack relocation (1.40.12), and the mount-namespace routing (1.40.13) — the box runs `/bin/prog2` + `/bin/argv` in ring 3, drives FAT shell verbs while ext2 owns `/`, and rides clean through `Activating scheduler...` → DHCP lease → `Launching kybernet`. This closeout reclaims the one resource the exec path still leaked: per-process memory + proc-table slots. **NOTE: touches the exec/address-space path — needs an iron re-burn to declare iron-validated; folds into the already-pending 1.40.13 Track-B burn.**)
 
 ### Added — process teardown / reaping (the deferred 1.40.10 follow-on)
