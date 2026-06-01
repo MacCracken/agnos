@@ -1156,6 +1156,11 @@ fn exec_disk_selftest() {
     if (nino > 0) { ext2_write_at(nino, 0, eb + 100, 100); }
     ext2_sync();
 
+    # 1.40.14: baseline proc_count before the runs. prog2 + argv each
+    # create-then-reap one proc; with LIFO slot reclaim working, proc_count is
+    # unchanged across the whole sequence (asserted after the argv run below).
+    var pc0 = proc_count;
+
     # ENOEXEC — elf_load_from_file rejects the non-ELF; sh_cmd_run prints
     # "run: not an executable" and returns normally (no exec_and_wait).
     kprintln("exec: running /notelf", 21);
@@ -1190,6 +1195,42 @@ fn exec_disk_selftest() {
     if (vino > 0) { ext2_write_at(vino, 0, eb, 138); ext2_sync(); }
     kprintln("exec: running /bin/argv Z", 25);
     sh_exec("run /bin/argv Z", 15);
+
+    # 1.40.14 reap validation. (A) slot reclaim: the create-then-reap of prog2 +
+    # argv must leave proc_count where it started (LIFO reclaim). (B) address-space
+    # leak: directly exercise proc_free_address_space (3 PT pages + one mapped user
+    # huge page) in a tight loop and assert the PMM free counts (4 KB pool + 2 MB
+    # regions) return to baseline. Together these gate the reap path in
+    # exec-smoke.sh / sweep.sh without an interactive shell. One line each; quiet
+    # success-or-fail so a regression is grep-visible.
+    if (proc_count == pc0) {
+        kprintln("reap: slot reclaim OK (pc stable)", 33);
+    } else {
+        kprintln("reap: slot LEAK (pc grew)", 25);
+    }
+    var f4_before = pmm_free_count();
+    var f2_before = pmm_count_2mb_free();
+    var rc = 0;
+    while (rc < 6) {
+        var tcr3 = proc_create_address_space();
+        if (tcr3 != 0) {
+            var tph = pmm_alloc_2mb();
+            if (tph != 0) { proc_map_page(tcr3, 0x400000, tph); }
+            proc_free_address_space(tcr3);
+        }
+        rc = rc + 1;
+    }
+    var f4_after = pmm_free_count();
+    var f2_after = pmm_count_2mb_free();
+    if (f4_before == f4_after) {
+        if (f2_before == f2_after) {
+            kprintln("reap: 6x AS+page cycle, free stable OK", 38);
+        } else {
+            kprintln("reap: 2mb-region LEAK", 21);
+        }
+    } else {
+        kprintln("reap: 4k-page LEAK", 18);
+    }
 
     kprintln("exec: selftest done", 19);
     return 0;

@@ -128,9 +128,11 @@ var kpti_user_cr3 = 0x1000;
 
 # Repair (J) — Attempt 23: PMM-allocation CMOS-stamp call counter.
 # Distinguishes successive `proc_create_address_space` invocations so each
-# call's 6 pmm_alloc results land in a different CMOS slot range:
-#   call 1 (AS1)  → slots 0x56..0x5B
-#   call 2 (AS2)  → slots 0x5C..0x61
+# call's pmm_alloc results land in a different CMOS slot range:
+#   call 1 (AS1)  → slots 0x56..0x58 (3 page-table pages; was 0x56..0x5B
+#                   before 1.40.14 dropped the dead u_* alloc — slots +3..+5
+#                   no longer stamped)
+#   call 2 (AS2)  → slots 0x5C..0x5E
 #   call 3+       → no stamps (out of CMOS scratch budget)
 # Each stamp writes byte 2 of the returned phys addr — `(addr >> 16) & 0xFF`.
 # Reading 0x00 from any stamp = pmm_alloc returned a phys < 0x10000, which is
@@ -232,39 +234,96 @@ fn proc_create_address_space() {
         store64(new_pml4 + mi * 8, load64(0x1000 + mi * 8));
     }
 
-    # S8 (KPTI): Allocate separate user page tables with minimal kernel mappings
-    var u_pml4 = pmm_alloc();
-    if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 3); outb(0x71, (u_pml4 >> 16) & 0xFF); }
-    if (u_pml4 == 0) { return new_pml4; }  # Fallback: no KPTI for this process
-    var u_pdpt = pmm_alloc();
-    if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 4); outb(0x71, (u_pdpt >> 16) & 0xFF); }
-    if (u_pdpt == 0) { pmm_free(u_pml4); return new_pml4; }
-    var u_pd = pmm_alloc();
-    if (pca_stamp_base != 0) { outb(0x70, pca_stamp_base + 5); outb(0x71, (u_pd >> 16) & 0xFF); }
-    if (u_pd == 0) { pmm_free(u_pml4); pmm_free(u_pdpt); return new_pml4; }
-
-    memset(u_pml4, 0, 4096);
-    memset(u_pdpt, 0, 4096);
-    memset(u_pd, 0, 4096);
-
-    store64(u_pml4, u_pdpt | 0x07);
-    store64(u_pdpt, u_pd | 0x07);
-
-    # User PD: only entry 0 (0-2MB) for SYSCALL/ISR trampoline — supervisor-only
-    store64(u_pd, load64(0x3000) & (0 - 1 - 0x04));  # Copy entry 0, clear U/S bit
-
-    # 1.40.3: collapse the KPTI split for ring-3 bring-up. The minimal user CR3
-    # (u_pml4, only 0-2MB supervisor) never mapped the user code/stack a running
-    # ring-3 process needs, and the SYSCALL/interrupt CR3-swap paths are unproven
-    # hand-asm that triple-faulted. Stash the FULL per-process CR3 (new_pml4) as
-    # the "user" CR3: it maps kernel pages supervisor (U/S=0 → ring 3 still can't
-    # touch them, so protection holds), user pages U/S=1 (ring 3 runs), the
-    # SYSCALL stub (0-2MB), the user stack, and the Local APIC (PDPT[3]). The
-    # stub's CR3 switches become safe no-ops. Only the Meltdown side-channel
-    # defense is deferred — KPTI-proper is its own arc.
+    # 1.40.3 collapsed the KPTI split for ring-3 bring-up: the minimal user CR3
+    # (only 0-2MB supervisor) never mapped the user code/stack a running ring-3
+    # process needs, and the SYSCALL/interrupt CR3-swap paths were unproven
+    # hand-asm that triple-faulted. So we stash the FULL per-process CR3 (new_pml4)
+    # as the "user" CR3 in PD entry 511: it maps kernel pages supervisor (U/S=0 →
+    # ring 3 still can't touch them, so protection holds), user pages U/S=1 (ring 3
+    # runs), the SYSCALL stub (0-2MB), the user stack, and the Local APIC (PDPT[3]).
+    # proc_get_user_cr3 reads this slot back; the stub's CR3 switches are safe no-ops.
+    # Only the Meltdown side-channel defense is deferred — KPTI-proper is its own arc.
+    #
+    # 1.40.14: the three separate u_pml4/u_pdpt/u_pd pages this block used to
+    # allocate (the minimal KPTI user tables) were ORPHANED the moment the stash
+    # above started storing new_pml4 instead of u_pml4 — nothing ever read them
+    # (proc_get_user_cr3 / proc_map_page resolve PD[511] = new_pml4, the same
+    # table). They were a silent 3-page-per-exec leak that proc_reap could not
+    # reclaim (orphaned = unreachable from the CR3 chain). Removed: per-process
+    # address-space construction now allocates exactly 3 page-table pages
+    # (new_pml4/new_pdpt/new_pd), all reachable and all freed by
+    # proc_free_address_space on teardown.
     store64(new_pd + 511 * 8, new_pml4);
 
     return new_pml4;
+}
+
+# === Per-Process Address-Space Teardown (1.40.14) ===
+# Free every physical page a per-process address space owns: the user huge
+# pages (ELF segments + stack + any un-munmap'd anonymous mmap) and the three
+# page-table pages (PML4/PDPT/PD). Inverse of proc_create_address_space +
+# the loader's proc_map_page calls. Returns 0, or -1 on a kernel/boot CR3.
+#
+# How user pages are found: a per-process PD covers 0-1 GB (512 x 2 MB). At
+# AS-creation we copy the kernel identity PD (flag 0x83 — supervisor, NO user
+# bit) into entries [0..510]; the loader then OVERWRITES specific entries with
+# user huge pages via proc_map_page (flag 0x87 — the U/S user bit 0x04 SET).
+# So "present (0x01) AND user (0x04)" cleanly identifies exactly the pages the
+# loader allocated, regardless of physical address — a divergence-from-kernel
+# scan is unreliable because the first pmm_alloc_2mb commonly returns region 2
+# (0x400000), which equals the code segment's own identity vaddr. munmap'd
+# pages are not-present (0x01 clear) so they're skipped (already freed); the
+# kernel-mirrored identity entries are supervisor (0x04 clear) so they're left
+# untouched; index 511 is the user-CR3 stash slot (new_pml4, not a mapping).
+fn proc_free_address_space(cr3) {
+    if (cr3 == 0) { return 0 - 1; }
+    if (cr3 == 0x1000) { return 0 - 1; }   # boot/kernel CR3 — never free its tables
+    var pml4e = load64(cr3);
+    var pdpt = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt);
+    var pd = pdpte & 0xFFFFFFFFF000;
+    # Free user huge pages: present + user-bit set, indices 1..510.
+    for (var i = 1; i < 511; i = i + 1) {
+        var e = load64(pd + i * 8);
+        if ((e & 0x01) != 0) {
+            if ((e & 0x04) != 0) {
+                pmm_free_2mb(e & 0xFFFFFFFFFFE00000);
+            }
+        }
+    }
+    # Free the three page-table pages (4 KB each).
+    pmm_free(pd);
+    pmm_free(pdpt);
+    pmm_free(cr3);
+    return 0;
+}
+
+# Reap an exited process: tear down its address space and hand its proc_table
+# slot back. Called from sh_cmd_run after exec_and_wait returns (the program
+# has exit()ed; kernel_resume already restored the boot CR3 and reset
+# proc_current to 0), so we are running on the boot CR3 — freeing the per-process
+# tables is safe (the CPU is not walking them).
+#
+# Order matters for scheduler-safety on the single-core model: mark the slot
+# dead (state 0) FIRST so a timer tick mid-reap can never select it (sched_next
+# only returns state==1 procs), THEN detach its CR3 and free the pages. The
+# interactive `run` path is run-to-completion and one-at-a-time, so the reaped
+# proc is always the TOP slot (pid == proc_count-1); a LIFO proc_count decrement
+# returns the slot to proc_create_full. Without this, each `run` permanently
+# consumed 2 of the 6 usable 2 MB regions (code + stack) — so the 4th run hit
+# pmm_alloc_2mb exhaustion ("run: not an executable") and, further out, the
+# 16-slot proc_table filled. (The kmain/idle procs carry CR3 0x1000, so
+# proc_free_address_space refuses them even if a stray pid 0/1 ever arrived.)
+fn proc_reap(pid) {
+    if (pid >= proc_count) { return 0 - 1; }
+    var cr3 = proc_get_cr3(pid);
+    proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
+    if (proc_current == pid) { proc_current = 0; }
+    proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
+    if (cr3 != 0x1000) { proc_free_address_space(cr3); }
+    # LIFO slot reclaim: hand the top dead slot back to the allocator.
+    if (pid == proc_count - 1) { proc_count = proc_count - 1; }
+    return 0;
 }
 
 # Retrieve user CR3 from kernel page tables (stored in PD entry 511)

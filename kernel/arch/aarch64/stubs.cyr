@@ -207,6 +207,8 @@ fn rdmsr(msr) { return 0; }
 # Page table helpers
 fn pt_map_2mb(base, idx, addr) { return 0; }
 fn proc_create_address_space() { return 0; }
+fn proc_free_address_space(cr3) { return 0; }   # AS teardown is x86-only (1.40.14)
+fn proc_reap(pid) { return 0; }                 # process reaping is x86-only (1.40.14)
 fn proc_map_page(cr3, virt, phys) { return 0; }
 fn sys_mmap(length) { return 0; }   # anonymous mmap is x86-only (1.35.3)
 fn sys_munmap(addr, length) { return 0; }   # munmap is x86-only (1.35.4)

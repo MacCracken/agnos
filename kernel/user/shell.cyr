@@ -729,6 +729,12 @@ fn sh_cmd_run(arg, arglen) {
     kprint("run: exit ", 10);
     kprint_num(proc_get_exit_code(pid));
     kprintln("", 0);
+    # 1.40.14: reap the exited process — free its address space (ELF + stack
+    # huge pages + the 3 page-table pages) and hand its proc_table slot back.
+    # Read the exit code FIRST (above) — proc_reap clears the slot. Without this
+    # every `run` permanently consumed 2 of the 6 usable 2 MB regions, so the
+    # 4th run failed with pmm_alloc_2mb exhaustion; now `run` is unbounded.
+    proc_reap(pid);
     return 0;
 }
 
