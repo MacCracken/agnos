@@ -178,8 +178,8 @@ fn vfs_mount_init() {
 # '/mnt/fat' and '/mnt/fat/x' but never '/mnt/fatx'). FS_NONE if nothing owns it.
 fn vfs_resolve_mount(path, pathlen) {
     vfs_mnt_reloff = 0;     # 1.40.14: deterministic on every exit path — a
-                            # caller that reads reloff after an FS_NONE return
-                            # gets 0, not a stale offset from a prior resolve.
+    # caller that reads reloff after an FS_NONE return
+    # gets 0, not a stale offset from a prior resolve.
     if (pathlen < 1)        { return FS_NONE; }
     if (load8(path) != 47)  { return FS_NONE; }    # must be absolute
     var best = 0 - 1;
