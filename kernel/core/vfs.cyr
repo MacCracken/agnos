@@ -131,7 +131,7 @@ var vfs_mnt_backend[8];        # FsBackend id per slot
 var vfs_mnt_prefix_len[8];     # prefix byte length per slot
 var vfs_mnt_prefix[64];        # prefix strings, 64 bytes/slot
 var vfs_mnt_reloff      = 0;   # set by vfs_resolve_mount: byte offset within the
-                               # queried path where the mount-relative path begins
+# queried path where the mount-relative path begins
 
 fn vfs_mount_add(prefix, prefixlen, backend) {
     if (vfs_mnt_count >= 8) { return 0 - 1; }
