@@ -8,6 +8,7 @@ var acpi_xsdt_addr = 0;
 var acpi_dmar_addr = 0;
 var acpi_dmar_len = 0;
 var acpi_iommu_base = 0;  # Physical address of first DRHD register set
+var acpi_rsdp_via_bootinfo = 0;  # 1 if RSDP came from gnoboot boot_info, not legacy scan
 
 # Check 16-byte aligned address for RSDP signature "RSD PTR "
 fn acpi_check_rsdp(addr) {
@@ -123,9 +124,28 @@ fn acpi_init() {
     acpi_xsdt_addr = 0;
     acpi_dmar_addr = 0;
     acpi_iommu_base = 0;
+    acpi_rsdp_via_bootinfo = 0;
 
     # Find RSDP
     var rsdp = acpi_find_rsdp();
+    if (rsdp == 0) {
+        # Legacy EBDA / 0xE0000 ROM scan found nothing — under UEFI it
+        # never will: firmware publishes the RSDP via the EFI Configuration
+        # Table, not the legacy BIOS areas. Fall back to gnoboot's boot_info
+        # acpi_rsdp_phys (offset 0x38, populated from the EFI cfg table since
+        # gnoboot v0.5.0). Validate signature + checksum before trusting a
+        # firmware-supplied pointer; bi==0 (non-Path-C boot) is handled.
+        var bi = load64(&boot_info_ptr);
+        if (bi != 0) {
+            var bi_rsdp = load64(bi + 0x38);
+            if (bi_rsdp != 0) {
+                if (acpi_check_rsdp(bi_rsdp) == 1) {
+                    rsdp = bi_rsdp;
+                    acpi_rsdp_via_bootinfo = 1;
+                }
+            }
+        }
+    }
     if (rsdp == 0) { return 0 - 1; }
     acpi_rsdp_addr = rsdp;
 

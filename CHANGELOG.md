@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.2] — 2026-06-03 (**boot_info consumers: canary + ACPI RSDP fallback — the agnos half of gnoboot v0.5.0.** A *parallel side-bite*, not shell-separation work: gnoboot v0.5.0 began filling the sovereign `boot_info` fields (`initramfs_phys`/`size`, `cmdline_phys`, `acpi_rsdp_phys`); this cut makes the kernel *read* them — a boot-time canary reporting all three (proving the gnoboot→agnos wire), plus the one cheap real consumer: `acpi_init` falls back to `boot_info`'s RSDP when the legacy BIOS scan finds nothing, which is exactly the UEFI case. Validated end-to-end in QEMU — the ACPI fallback genuinely fires under OVMF.)
+
+### Added
+
+- **boot_info canary (`core/main.cyr`, after `dev_init`)** — reads `initramfs_phys` (0x10), `initramfs_size` (0x18), `cmdline_phys` (0x20), `acpi_rsdp_phys` (0x38) from the low <4 GB `boot_info_copy` and prints them (dual serial + FB) so gnoboot's pre-EBS fills are observable on QEMU (serial) and iron (FB). Guards `bi==0` + the `'AGNO'` magic, so a non-Path-C boot (bare `-kernel`, no gnoboot) reports `boot_info: absent` / `bad magic` instead of printing garbage.
+- **ACPI RSDP boot_info fallback (`acpi_init`, `core/acpi.cyr`)** — when `acpi_find_rsdp()`'s legacy EBDA / `0xE0000` ROM scan returns 0 (the UEFI case — firmware publishes the RSDP via the EFI Configuration Table, not the legacy BIOS areas), fall back to `boot_info+0x38`, **validated** with the existing `acpi_check_rsdp` signature + checksum before trust. New `acpi_rsdp_via_bootinfo` flag; `main.cyr` appends `(boot_info)` to the `ACPI: RSDP at …` line when the fallback fired.
+
+### Verified
+
+- `scripts/sweep.sh` **7/7** (baseline check + FAT/exFAT read+write + ext2 write + exec-from-disk) — no regression.
+- **End-to-end** in the exec-smoke OVMF boot (booting gnoboot v0.5.0 → agnos): canary prints `initramfs=0x0 sz=0x0` / `cmdline=0x0` (no ESP files) / `rsdp=0x1fb7e014` (gnoboot filled it from OVMF's ACPI table), and the **ACPI fallback actually fired** — `ACPI: RSDP at … (boot_info)` — because OVMF/q35 places the RSDP at ~531 MB, above the legacy scan range. Boot reaches `agnos>` cleanly.
+- aarch64 untouched — `core/main.cyr` + `core/acpi.cyr` are `#ifdef ARCH_X86_64`.
+
+### Notes
+
+- The kernel still does **not** consume `initramfs_phys` / `cmdline_phys` (no INDR-from-`boot_info` mount, no cmdline parser); those remain follow-ons. This cut wires the *one* cheap real consumer (ACPI) plus the canary. The initramfs **format contract** (sovereign INDR, not Linux `cpio.gz`) is still unsettled — see the agnosticos roadmap.
+- **Parallel to the shell-separation arc.** Taking the next patch slot (1.41.2) for this side-bite shifts the planned shell-separation bites down one: FS syscalls → **1.41.3**, `kybernet` execs `/bin/agnsh` → **1.41.4**, shrink in-kernel shell → **1.41.5**, arc-close + iron burn → **1.41.6**.
+
 ## [1.41.1] — 2026-05-31 (**Shell-separation bite 1: blocking keyboard stdin from ring 3.** `read(fd=0)` now blocks on the keyboard and returns typed characters to a userland process — the first *interactive* (blocks-on-input, not run-to-completion) ring-3 syscall, and the agnos-side capability the userland `agnsh` REPL needs. Implements ABI decision **O1 (RAW)**. Pre-built ahead of `CYRIUS_TARGET_AGNOS` so there's no agnos-side blocker when agnoshi builds for the agnos ABI.)
 
 ### Added
