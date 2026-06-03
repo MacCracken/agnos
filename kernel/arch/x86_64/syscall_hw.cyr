@@ -12,10 +12,17 @@ var syscall_kstack_top = 0;
 var kernel_return_rsp = 0;
 var kernel_return_rip = 0;
 var ibrs_supported = 0;  # S9: set to 1 if IBRS is available
+# 1.41.3 (a4=r10): the syscall's 4th argument (rename/link need four). The entry
+# stub preserves the user's r10 into r9 (the SysV 6th-arg register) before the
+# CR3-switch scratch destroys r10, so it arrives here as sc_arg4. We stash it in
+# this global, which the 4-arg ksyscall reads for rename/link — keeping
+# ksyscall's arity (and its many in-kernel 3-arg callers) unchanged.
+var ksyscall_a4 = 0;
 
 # C-level handler called from the syscall entry stub.
 # user_rsp = the caller's RSP (saved before switching to kernel stack)
-fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3) {
+fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
+    ksyscall_a4 = sc_arg4;
     var result = ksyscall(sc_num, sc_arg1, sc_arg2, sc_arg3);
     return result;
 }
@@ -141,6 +148,15 @@ fn syscall_init() {
     var handler = &syscall_handler;
     var kcr3_addr = &kpti_kernel_cr3;
     var ucr3_addr = &kpti_user_cr3;
+
+    # 1.41.3 (a4=r10): FIRST instruction — preserve the user's r10 (4th syscall
+    # arg) into r9 before the CR3-switch scratch below overwrites r10. r9 is
+    # untouched by the entire entry path (CR3 switch / stack switch / IBRS /
+    # arg shuffle all avoid it), so it arrives at `call syscall_handler` as the
+    # natural SysV 6th argument (sc_arg4). r9 is caller-saved, so clobbering it
+    # is ABI-safe — same posture as the stub's existing r8 clobber.
+    # mov r9, r10 — 4D 89 D1
+    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xD1); eoff = eoff + 3;
 
     # S8 (KPTI): Switch from user CR3 to kernel CR3 FIRST.
     # We're ring-0 (SYSCALL changed CPL), user page tables have PD entry 0

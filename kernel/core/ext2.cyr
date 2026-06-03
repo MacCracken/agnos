@@ -207,6 +207,21 @@ fn ext2_inode_filesize(inode) {
     return lo | (hi << 32);
 }
 
+# Fill the 48-byte agnos stat struct (agnos-userland-abi.md §4.1) for inode
+# `ino` into `statbuf`. st_mode keeps ext2's i_mode (already POSIX type+perm
+# bits: 0x8000=file / 0x4000=dir / 0xA000=symlink). Returns 0 / -1.
+# Backend for the stat(33) syscall (1.41.3). `statbuf` is a validated user ptr.
+fn ext2_fill_stat(ino, statbuf) {
+    if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    store64(statbuf +  0, ext2_inode_mode(&ext2_inode_buf));
+    store64(statbuf +  8, ext2_inode_links_count(&ext2_inode_buf));
+    store64(statbuf + 16, ext2_inode_filesize(&ext2_inode_buf));
+    store64(statbuf + 24, ino);
+    store64(statbuf + 32, ext2_inode_blocks_lo(&ext2_inode_buf));
+    store64(statbuf + 40, ext2_load32_le(&ext2_inode_buf, 16));   # i_mtime
+    return 0;
+}
+
 # --- Mount -------------------------------------------------------------
 #
 # Reads superblock @ byte 1024 of partition (= LBA 2-3 of partition's
@@ -2847,6 +2862,94 @@ fn ext2_open(path, path_len) {
     kpayload_set(base, 1, fsize);      # size
     kpayload_set(base, 2, inode_num);  # inode_num
     return fd;
+}
+
+# Open a DIRECTORY for getdents(29): look up `path`, verify it's a directory,
+# create a VFS_EXT2_DIR fd (payload[0]=read byte-offset, payload[2]=dir inode).
+# Returns the fd, or -1. (1.41.3 — open(AO_DIRECTORY).)
+fn ext2_open_dir(path, path_len) {
+    var ino = ext2_path_lookup(path, path_len);
+    if (ino <= 0) { return 0 - 1; }
+    if (ext2_get_inode(ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x4000) { return 0 - 1; }
+    var fd = vfs_alloc();
+    if (fd < 0) { return 0 - 1; }
+    var base = &vfs_table + fd * 32;
+    ktag_set(base, VFS_EXT2_DIR);
+    kpayload_set(base, 0, 0);          # read offset (bytes into the dir)
+    kpayload_set(base, 1, 0);          # unused
+    kpayload_set(base, 2, ino);        # dir inode
+    return fd;
+}
+
+# Map an ext2 dirent file_type to an agnos getdents type (§4.2):
+# 1=file 2=dir 3=symlink 0=unknown.
+fn ext2_gd_type(ft) {
+    if (ft == 1) { return 1; }
+    if (ft == 2) { return 2; }
+    if (ft == 7) { return 3; }
+    return 0;
+}
+
+# Enumerate directory `dir_ino` from byte offset `start_off`, emitting agnos
+# getdents records (§4.2: reclen u16, type u8, namelen u8, ino u32, name[],
+# pad to 8) into the user buffer `ubuf` (at most `ubufsize` bytes). Returns
+# bytes written (0 at end of dir, -1 on error); sets ext2_gd_next to the
+# offset the next call resumes from. (1.41.3 getdents(29) backend.)
+var ext2_gd_next = 0;
+fn ext2_getdents(dir_ino, start_off, ubuf, ubufsize) {
+    ext2_gd_next = start_off;
+    if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x4000) { return 0 - 1; }
+    var dir_size = ext2_inode_filesize(&ext2_inode_buf);
+    var written = 0;
+    var off = start_off;
+    while (off < dir_size) {
+        var logical = off / ext2_blocksize;
+        var within = off - logical * ext2_blocksize;
+        if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+        var phys = ext2_logical_to_physical(&ext2_inode_buf, logical);
+        if (phys == 0 - 1) { return 0 - 1; }
+        if (phys == 0) {
+            off = (logical + 1) * ext2_blocksize;
+            ext2_gd_next = off;
+            continue;
+        }
+        if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return 0 - 1; }
+        var bo = within;
+        while (bo < ext2_blocksize) {
+            var d = &ext2_dir_buf + bo;
+            var inum = ext2_load32_le(d, 0);
+            var rec_len = ext2_load16_le(d, 4);
+            var name_len = load8(d + 6);
+            var ftype = load8(d + 7);
+            if (ext2_dirent_valid(bo, rec_len, name_len) == 0) { break; }
+            if (inum != 0) {
+                var reclen = 8 + name_len;
+                reclen = (reclen + 7) & (0 - 8);          # round up to 8
+                if (written + reclen > ubufsize) {
+                    ext2_gd_next = logical * ext2_blocksize + bo;
+                    return written;
+                }
+                var rec = ubuf + written;
+                store8(rec + 0, reclen & 0xFF);
+                store8(rec + 1, (reclen >> 8) & 0xFF);
+                store8(rec + 2, ext2_gd_type(ftype));
+                store8(rec + 3, name_len);
+                store32(rec + 4, inum);
+                var k = 0;
+                while (k < name_len) { store8(rec + 8 + k, load8(d + 8 + k)); k = k + 1; }
+                var pk = 8 + name_len;
+                while (pk < reclen) { store8(rec + pk, 0); pk = pk + 1; }
+                written = written + reclen;
+            }
+            bo = bo + rec_len;
+        }
+        off = (logical + 1) * ext2_blocksize;
+        ext2_gd_next = off;
+    }
+    ext2_gd_next = dir_size;
+    return written;
 }
 
 # === File-data write + truncate (WRITE arc 1.33.x — W3) ===============

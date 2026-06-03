@@ -5,6 +5,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.3] — 2026-06-03 (**Shell-separation bite 2: real FS syscalls.** The mount-routed VFS gets a ring-3 syscall face — `agnsh`'s filesystem builtins (`ls`/`mkdir`/`rm`/`mv`/`stat`/…) now have kernel calls to reach. Nine syscalls land against the frozen [`agnos-userland-abi.md`](docs/development/agnos-userland-abi.md): `open`(7) re-routed from initrd-only to mount-routed + flags, `mkdir`(9)/`rmdir`(10)/`sync`(12) made real (were stubs), and new `getdents`(29)/`unlink`(30)/`rename`(31)/`link`(32)/`stat`(33). Includes the **`a4=r10` ABI extension** (the syscall ABI grows 3→4 args for `rename`/`link`, per decision O2). All validated end-to-end in QEMU via a kernel-side selftest that drives every syscall through `ksyscall` with a real user-range scratch + ext2 side-effect verification — `fssys: ALL PASS`; sweep 7/7 no-regression.)
+
+### Added
+
+- **`getdents`(29)** — new. `open(AO_DIRECTORY)` returns a `VFS_EXT2_DIR` fd; `getdents` walks it from a saved byte-offset and emits **agnos-native dirent records** (§4.2: `reclen`u16/`type`u8/`namelen`u8/`ino`u32/`name`, padded to 8) into the user buffer, resuming across calls. ext2 (the primary FS); FAT/exFAT dir-fd is a follow-on. New `ext2_open_dir` + `ext2_getdents` + `ext2_gd_type` (`core/ext2.cyr`).
+- **`stat`(33)** — new. Fills the 48-byte agnos stat struct (§4.1: `st_mode`/`nlink`/`size`/`ino`/`blocks`/`mtime`) from the ext2 inode via new `ext2_fill_stat`. FAT/exFAT degrade to -1 for now (O4's `ino=0`+size/type fill is a follow-on).
+- **`unlink`(30)** — new. Mount-routed: ext2 via a new kernel-layer `vfs_ext2_parent` path-split (the syscall mirror of the shell's `sh_split_parent`, operating on a validated user pointer) → `ext2_unlink`; FAT/exFAT → `vfs_delete_on`.
+- **`rename`(31)** — new. Within one filesystem; uses **`a4`** for `newlen`. ext2 (`ext2_rename` with src/dst parent+basename) + FAT/exFAT (`vfs_rename_on`). Cross-FS rename refused.
+- **`link`(32)** — new. Hard link, **ext2-only** (`ext2_link`); FAT/exFAT return -1 (O4 — no inodes/hard links). Uses `a4`.
+- **`a4=r10` syscall ABI extension (decision O2).** The entry stub (`syscall_hw.cyr`) preserves the user's `r10` into `r9` as its first instruction (before the CR3-switch scratch clobbers `r10`); `r9` is untouched through the entry path and arrives as `syscall_handler`'s SysV 6th arg, stashed into a new `ksyscall_a4` global that `rename`/`link` read. **`ksyscall`'s 4-arg signature — and its many in-kernel callers — are unchanged.**
+- **`FS_SYSCALL_SELFTEST`** kernel-side selftest (`core/main.cyr`, gated) + `build.sh` flag. Drives all nine syscalls through `ksyscall` with a `pmm_alloc_2mb` user-range scratch and verifies side effects on disk.
+
+### Changed
+
+- **`open`(7) re-routed** from `initrd_open`-only to `vfs_resolve_mount` → `ext2_open` / `vfs_open_on` (FAT/exFAT), with `initrd` as the bare-name fallback. Gained the **flags arg** (a3): `AO_CREAT`(0x100) creates, `AO_TRUNC`(0x200) zeroes an existing file, `AO_DIRECTORY`(0x800) returns a dir-fd. No existing consumer depended on the initrd-only behavior (the bare-name fallback preserves it).
+- **`mkdir`(9) / `rmdir`(10) / `sync`(12)** — were tier-1 stubs returning 0; now real (mount-routed `ext2_mkdir`/`ext2_rmdir`/`vfs_*_on`; `sync` = `ext2_sync` + `blk_flush`).
+- New `VFS_EXT2_DIR` fd type (8) in `core/vfs.cyr`.
+
+### ABI / compatibility
+
+The syscall **numbers and struct layouts are unchanged** from the frozen `agnos-userland-abi.md` (these rows were already DECIDED there); this cut implements them and adds the `a4=r10` register. The `a4` change is **additive** — 3-arg syscalls are byte-identical in behavior; only `rename`/`link` read the 4th. `r9` is now clobbered by every syscall (it was already the case for `r8`), which is ABI-safe (both are SysV caller-saved). The ABI doc's "lands at 1.41.2" annotations are corrected to **1.41.3** (the boot_info side-bite took 1.41.2).
+
+### Verified
+
+- **`fssys: ALL PASS`** — kernel-side selftest: `mkdir`→`open`(CREAT)→`stat`→`rename`→`getdents`(finds the renamed entry)→`unlink`→`rmdir`→`sync`, each verified against `ext2_path_lookup` on disk.
+- `scripts/sweep.sh` **7/7** — the `a4=r10` stub change (runs on *every* syscall) and the `open`(7) re-route are non-regressing; the exec-from-disk gate (real ring-3 `write`/`exit`) stays green.
+- The a4=r10 **register** delivery (r10→r9→`sc_arg4`→`ksyscall_a4`) is exercised in the selftest at the backend (`ksyscall_a4` set directly) and is proven at the register level by analogy to the existing 5th arg already carried in `r8`; its first ring-3 consumer is `agnsh`'s `mv`.
+
+### Notes
+
+- **chdir/getcwd are intentionally NOT syscalls** (ABI §3.2 — CWD is userland-owned; `agnsh` tracks its own and passes absolute paths). The roadmap's earlier "chdir/getcwd" mention for this bite is superseded by the frozen ABI.
+- Shell-separation arc bite numbering after the 1.41.2 boot_info side-bite: **1.41.3 (this, FS syscalls) → 1.41.4 `kybernet` execs `/bin/agnsh` → 1.41.5 shrink in-kernel shell → 1.41.6 arc-close + iron burn.** Still gated on the cyrius-side `CYRIUS_TARGET_AGNOS` target before `agnsh` can actually run.
+
 ## [1.41.2] — 2026-06-03 (**boot_info consumers: canary + ACPI RSDP fallback — the agnos half of gnoboot v0.5.0.** A *parallel side-bite*, not shell-separation work: gnoboot v0.5.0 began filling the sovereign `boot_info` fields (`initramfs_phys`/`size`, `cmdline_phys`, `acpi_rsdp_phys`); this cut makes the kernel *read* them — a boot-time canary reporting all three (proving the gnoboot→agnos wire), plus the one cheap real consumer: `acpi_init` falls back to `boot_info`'s RSDP when the legacy BIOS scan finds nothing, which is exactly the UEFI case. Validated end-to-end in QEMU — the ACPI fallback genuinely fires under OVMF.)
 
 ### Added

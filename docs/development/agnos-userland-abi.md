@@ -17,7 +17,7 @@
 > reserved, returns a constant — see notes) · 🩺 DIAGNOSTIC (kernel-internal; not part of the userland shell surface).
 >
 > **Decision log**: O1–O4 settled **2026-05-31 (agnos-side)** — see §0. The 1.41.x surface (§3) is ✅ DECIDED;
-> each row moves to 🔒 FROZEN as 1.41.1/1.41.2 implement it.
+> each row moves to 🔒 FROZEN as 1.41.1/1.41.3 implement it.
 >
 > Companion: agnosticos [`shell-separation-prior-art.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/shell-separation-prior-art.md)
 > (why this ABI is needed — the boundary audit) · [`roadmap.md`](roadmap.md) § *1.41.x — Shell Separation Arc*.
@@ -29,7 +29,7 @@ throughout the doc below.
 
 | # | Decision | Rationale |
 |---|----------|-----------|
-| **O2** | **`a4 = r10`** — the syscall ABI grows from 3 args to 4; the 4th is in `r10`. | `rename(old,oldlen,new,newlen)` is inherently 4-arg. `r10` is the natural 4th-arg register (SYSCALL clobbers `rcx`, which is exactly why Linux picked `r10` — we adopt the *register*, not their numbers). Additive; entry stub saves `r10`, `syscall_handler`/`ksyscall` gain `a4`. Lands with 1.41.2. |
+| **O2** | **`a4 = r10`** — the syscall ABI grows from 3 args to 4; the 4th is in `r10`. | `rename(old,oldlen,new,newlen)` is inherently 4-arg. `r10` is the natural 4th-arg register (SYSCALL clobbers `rcx`, which is exactly why Linux picked `r10` — we adopt the *register*, not their numbers). Additive; entry stub saves `r10`, `syscall_handler`/`ksyscall` gain `a4`. Lands with 1.41.3. |
 | **O1** | **stdin = RAW** — `read(fd=0)` returns raw bytes, blocks until ≥1, **no kernel echo**. | `agnsh` ships its own `completion.cyr` + `history.cyr` line-editing — it needs raw keystrokes; cooked mode would fight its line editor. agnsh echoes. The in-kernel *emergency* shell keeps its own cooked loop (reads the keyboard directly, not via stdin). |
 | **O3** | **`open(AO_DIRECTORY)` returns a normal fd** that `getdents` (29) consumes. | Reuse the `vfs_table` slot model + a dir tag — matches the existing fd plumbing; no separate dir-handle type. |
 | **O4** | **FAT/exFAT `stat`/`link` degrade gracefully.** `stat` fills `st_ino=0` + size/type from the dirent; `link` is ext2-only (returns -1 on FAT). | Inherent — FAT has no inodes or hard links. `ls -l` on FAT shows size/type, ino 0. |
@@ -68,7 +68,7 @@ From `kernel/arch/x86_64/syscall_hw.cyr`:
 `rename(old, oldlen, new, newlen)` needs **four** arguments, which the original 3-arg ABI couldn't carry.
 **Decision: `a4 = r10`** — `r10` is the natural 4th-arg register (SYSCALL clobbers `rcx`, which is exactly why
 Linux uses `r10`; agnos adopts the *register*, not Linux's numbers). Additive kernel change (the entry stub
-saves `r10`, `syscall_handler`/`ksyscall` gain `a4`); lands with 1.41.2. Rejected alternatives: NUL-terminated
+saves `r10`, `syscall_handler`/`ksyscall` gain `a4`); lands with 1.41.3. Rejected alternatives: NUL-terminated
 names (breaks the explicit-length invariant every agnos syscall holds); a packed args-struct pointer (extra
 indirection for one call). **The cyrius peer's agnos syscall wrappers pass the 4th arg in `r10`.**
 
@@ -86,12 +86,12 @@ will use; "🩺" marks kernel-diagnostic-only.
 | 4 | `waitpid` | pid | — | — | exit_code / -1 | busy-waits until `state==0`. **shell** |
 | 5 | `read` | fd | buf | len | bytes / -1 | `vfs_read`. **fd 0 = stdin** — see §5 (currently → serial; 1.41.1 makes it the keyboard). **shell** |
 | 6 | `close` | fd | — | — | 0 / -1 | `vfs_close`. **shell** |
-| 7 | `open` | name | namelen | — | fd / -1 | **currently `initrd_open` ONLY** (can't reach the agnos-fs). 1.41.2 re-routes — see §5. **shell** |
+| 7 | `open` | name | namelen | — | fd / -1 | **currently `initrd_open` ONLY** (can't reach the agnos-fs). 1.41.3 re-routes — see §5. **shell** |
 | 8 | `dup` | fd | — | — | fd | 🔧 stub: returns `a1` unchanged. |
-| 9 | `mkdir` | path | pathlen | — | 0 | 🔧 stub → 0. 1.41.2 makes it real. **shell** |
-| 10 | `rmdir` | path | pathlen | — | 0 | 🔧 stub → 0. 1.41.2 makes it real. **shell** |
+| 9 | `mkdir` | path | pathlen | — | 0 | 🔧 stub → 0. 1.41.3 makes it real. **shell** |
+| 10 | `rmdir` | path | pathlen | — | 0 | 🔧 stub → 0. 1.41.3 makes it real. **shell** |
 | 11 | `mount` | — | — | — | 0 | 🔧 stub (no-op). |
-| 12 | `sync` | — | — | — | 0 | 🔧 stub → 0. 1.41.2 wires to `vfs_sync`. **shell** |
+| 12 | `sync` | — | — | — | 0 | 🔧 stub → 0. 1.41.3 wires to `vfs_sync`. **shell** |
 | 13 | `reboot` | — | — | — | (halts) | `serial_println` + `arch_halt`. **shell** (`halt`) |
 | 14 | `pause` | — | — | — | 0 | `arch_wait` (one hlt). |
 | 15 | `getuid` | — | — | — | 0 | 🔧 stub (always root=0). |
@@ -116,7 +116,7 @@ them but must not rely on real behavior.
 
 ## 3. ✅ DECIDED — 1.41.x additions + changes (not yet implemented; the shell-separation surface)
 
-These are the agnos-side bites (1.41.1 stdin, 1.41.2 FS). The spec is **decided** (§0 settled O1–O4) and
+These are the agnos-side bites (1.41.1 stdin, 1.41.3 FS). The spec is **decided** (§0 settled O1–O4) and
 mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update §2) as the kernel lands it**.
 
 ### 3.1 Changed behavior (same numbers)
@@ -129,10 +129,10 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
   IF on entry) — no `sti`, no `hlt`, no scheduler preemption mid-syscall. (Power follow-on: a `sti`+`hlt`
   idle-wait needs the preemptive-ring-3 arc; until then a blocked read spins one core.) Other fds keep the
   `vfs_read` path.
-- **`open`(7) → mount-routed** (1.41.2). Re-route from `initrd_open`-only to `vfs_resolve_mount` →
+- **`open`(7) → mount-routed** (1.41.3). Re-route from `initrd_open`-only to `vfs_resolve_mount` →
   `ext2_open` (inode-wise) or `vfs_open_on` (FAT/exFAT), with `initrd` as the bare-name fallback. **Gains a
   flags arg** (a3) — see 3.3. Opening a **directory** returns a dir-fd usable by `getdents` (29).
-- **`mkdir`(9) / `rmdir`(10) / `sync`(12) → real** (1.41.2): wire to `vfs_mkdir_on`/`vfs_rmdir_on` (mount-routed)
+- **`mkdir`(9) / `rmdir`(10) / `sync`(12) → real** (1.41.3): wire to `vfs_mkdir_on`/`vfs_rmdir_on` (mount-routed)
   and `vfs_sync`. Signatures unchanged (`mkdir`/`rmdir` take `path`,`pathlen`; `sync` takes none).
 
 ### 3.2 New syscalls (numbers assigned from the next free slots, 29+)
@@ -197,7 +197,7 @@ Compact + 8-byte-record-aligned. Agnos-native (not Linux `dirent64`'s `d_off`/19
 
 ## 5. Coordination protocol (two-agent)
 
-1. **agnos lands the agnos-side** (1.41.1 stdin → 1.41.2 FS surface), implementing §3 and moving each entry
+1. **agnos lands the agnos-side** (1.41.1 stdin → 1.41.3 FS surface), implementing §3 and moving each entry
    to 🔒 in §2 as it ships.
 2. **cyrius builds `CYRIUS_TARGET_AGNOS`** (`lib/syscalls_x86_64_agnos.cyr` + the `PP_PREDEFINE` target macro)
    mirroring **this doc** — numbers, the 3→4 arg convention (§1a), the `AO_*` flags (§3.3), and the struct
@@ -209,5 +209,5 @@ Compact + 8-byte-record-aligned. Agnos-native (not Linux `dirent64`'s `d_off`/19
 
 O1 (stdin RAW), O2 (`a4 = r10`), O3 (`open(AO_DIRECTORY)` → normal fd), O4 (FAT `stat`/`link` degradation)
 were all **settled 2026-05-31 (agnos-side)** and are recorded in **§0** + applied in §1a/§3. No open ABI
-decisions remain; the 1.41.x surface is ✅ DECIDED and freezes per-syscall as 1.41.1/1.41.2 implement it.
+decisions remain; the 1.41.x surface is ✅ DECIDED and freezes per-syscall as 1.41.1/1.41.3 implement it.
 New questions get appended here until decided, then moved to §0.

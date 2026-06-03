@@ -205,17 +205,73 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 6) { return vfs_close(arg1); }
     if (num == 7) {
-        # open(name=arg1, namelen=arg2)
-        if (arg2 > 0) {
-            if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
+        # open(name=arg1, namelen=arg2, flags=arg3) — mount-routed (1.41.3).
+        # Re-routes from initrd-only: ext2 / FAT / exFAT by mount, with initrd
+        # as the bare-name fallback. AO_DIRECTORY(0x800)→dir-fd (getdents);
+        # AO_CREAT(0x100) creates if absent; AO_TRUNC(0x200) zeroes existing.
+        if (arg2 < 1) { return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
+        var be7 = vfs_resolve_mount(arg1, arg2);
+        if (be7 == FS_EXT2) {
+            if ((arg3 & 0x800) != 0) { return ext2_open_dir(arg1, arg2); }
+            var ino7 = ext2_path_lookup(arg1, arg2);
+            if (ino7 <= 0) {
+                if ((arg3 & 0x100) == 0) { return 0 - 1; }
+                var par7 = vfs_ext2_parent(arg1, arg2);
+                if (par7 <= 0) { return 0 - 1; }
+                if (ext2_create(par7, arg1 + vfs_base_off, vfs_base_len) <= 0) { return 0 - 1; }
+            } else {
+                if ((arg3 & 0x200) != 0) { ext2_truncate_zero(ino7); }
+            }
+            return ext2_open(arg1, arg2);
         }
+        if (be7 == FS_FAT || be7 == FS_EXFAT) {
+            var roff = arg1 + vfs_mnt_reloff;
+            var rlen = arg2 - vfs_mnt_reloff;
+            if ((arg3 & 0x100) != 0) { vfs_create_on(be7, roff, rlen); }
+            return vfs_open_on(be7, roff, rlen);
+        }
+        # bare-name / unmounted fallback (legacy initrd)
         return initrd_open(arg1, arg2);
     }
     # Tier 1: stubs
     if (num == 8) { return arg1; }           # dup(fd) -> return same fd
-    if (num == 9) { return 0; }              # mkdir
-    if (num == 10) { return 0; }             # rmdir
-    if (num == 12) { return 0; }             # sync
+    if (num == 9) {
+        # mkdir(path=arg1, pathlen=arg2) — real, mount-routed (1.41.3).
+        if (arg2 < 1) { return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
+        var be9 = vfs_resolve_mount(arg1, arg2);
+        if (be9 == FS_FAT) { return vfs_mkdir_on(be9, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
+        if (be9 == FS_EXFAT) { return vfs_mkdir_on(be9, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
+        if (be9 == FS_EXT2) {
+            var par9 = vfs_ext2_parent(arg1, arg2);
+            if (par9 <= 0) { return 0 - 1; }
+            if (ext2_mkdir(par9, arg1 + vfs_base_off, vfs_base_len) > 0) { return 0; }
+            return 0 - 1;
+        }
+        return 0 - 1;
+    }
+    if (num == 10) {
+        # rmdir(path=arg1, pathlen=arg2) — real, mount-routed (1.41.3).
+        if (arg2 < 1) { return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
+        var be10 = vfs_resolve_mount(arg1, arg2);
+        if (be10 == FS_FAT) { return vfs_rmdir_on(be10, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
+        if (be10 == FS_EXFAT) { return vfs_rmdir_on(be10, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
+        if (be10 == FS_EXT2) {
+            var par10 = vfs_ext2_parent(arg1, arg2);
+            if (par10 <= 0) { return 0 - 1; }
+            return ext2_rmdir(par10, arg1 + vfs_base_off, vfs_base_len);
+        }
+        return 0 - 1;
+    }
+    if (num == 12) {
+        # sync() — flush ext2 metadata + all block devices to stable media
+        # (1.41.3 — was a stub returning 0).
+        if (ext2_active != 0) { ext2_sync(); }
+        blk_flush();
+        return 0;
+    }
     if (num == 15) { return 0; }             # getuid (root)
     if (num == 24) { return 0; }             # umount
     # Tier 2: simple
@@ -397,6 +453,100 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # physical 2 MB pages (1.35.4). Returns 0 / -1. See proc.cyr sys_munmap.
         stack_canary_check(canary);
         return sys_munmap(arg1, arg2);
+    }
+    if (num == 30) {
+        # unlink(path=arg1, pathlen=arg2) — remove a file, mount-routed (1.41.3).
+        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var be30 = vfs_resolve_mount(arg1, arg2);
+        if (be30 == FS_FAT) { stack_canary_check(canary); return vfs_delete_on(be30, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
+        if (be30 == FS_EXFAT) { stack_canary_check(canary); return vfs_delete_on(be30, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
+        if (be30 == FS_EXT2) {
+            var par30 = vfs_ext2_parent(arg1, arg2);
+            if (par30 <= 0) { stack_canary_check(canary); return 0 - 1; }
+            stack_canary_check(canary);
+            return ext2_unlink(par30, arg1 + vfs_base_off, vfs_base_len);
+        }
+        stack_canary_check(canary);
+        return 0 - 1;
+    }
+    if (num == 29) {
+        # getdents(dir_fd=arg1, buf=arg2, bufsize=arg3) — emit agnos dirent
+        # records (§4.2) from a VFS_EXT2_DIR fd (open AO_DIRECTORY). Returns
+        # bytes written, 0 at end of dir, -1 on error. (1.41.3)
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg1 >= 32) { stack_canary_check(canary); return 0 - 1; }
+        if (arg3 < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var gbase = &vfs_table + arg1 * 32;
+        if (ktag(gbase) != VFS_EXT2_DIR) { stack_canary_check(canary); return 0 - 1; }
+        var gn = ext2_getdents(kpayload(gbase, 2), kpayload(gbase, 0), arg2, arg3);
+        if (gn >= 0) { kpayload_set(gbase, 0, ext2_gd_next); }
+        stack_canary_check(canary);
+        return gn;
+    }
+    if (num == 33) {
+        # stat(path=arg1, pathlen=arg2, statbuf=arg3) — fills the 48-byte agnos
+        # stat struct (§4.1). ext2 fully; FAT/exFAT degrade to -1 for now (O4's
+        # ino=0+size/type fill is a follow-on). (1.41.3)
+        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg3, 48) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var be33 = vfs_resolve_mount(arg1, arg2);
+        if (be33 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        var sino = ext2_path_lookup(arg1, arg2);
+        if (sino <= 0) { stack_canary_check(canary); return 0 - 1; }
+        var sr = ext2_fill_stat(sino, arg3);
+        stack_canary_check(canary);
+        return sr;
+    }
+    if (num == 31) {
+        # rename(old=arg1, oldlen=arg2, new=arg3, newlen=a4) — within one
+        # filesystem (a4=r10 via ksyscall_a4, 1.41.3).
+        var a4r = ksyscall_a4;
+        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (a4r < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg3, a4r) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var beo = vfs_resolve_mount(arg1, arg2);
+        var ro = vfs_mnt_reloff;
+        var ben = vfs_resolve_mount(arg3, a4r);
+        var rn = vfs_mnt_reloff;
+        if (beo != ben) { stack_canary_check(canary); return 0 - 1; }   # cross-FS
+        if (beo == FS_FAT || beo == FS_EXFAT) {
+            stack_canary_check(canary);
+            return vfs_rename_on(beo, arg1 + ro, arg2 - ro, arg3 + rn, a4r - rn);
+        }
+        if (beo == FS_EXT2) {
+            var sp = vfs_ext2_parent(arg1, arg2);
+            if (sp <= 0) { stack_canary_check(canary); return 0 - 1; }
+            var s_off = vfs_base_off;
+            var s_len = vfs_base_len;
+            var dp = vfs_ext2_parent(arg3, a4r);
+            if (dp <= 0) { stack_canary_check(canary); return 0 - 1; }
+            stack_canary_check(canary);
+            return ext2_rename(sp, arg1 + s_off, s_len, dp, arg3 + vfs_base_off, vfs_base_len);
+        }
+        stack_canary_check(canary);
+        return 0 - 1;
+    }
+    if (num == 32) {
+        # link(target=arg1, targetlen=arg2, linkpath=arg3, linkpathlen=a4) —
+        # hard link, ext2-only (a4=r10 via ksyscall_a4, 1.41.3). FAT/exFAT → -1
+        # (O4: no inodes/hard links).
+        var a4l = ksyscall_a4;
+        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (a4l < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg3, a4l) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (vfs_resolve_mount(arg1, arg2) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        if (vfs_resolve_mount(arg3, a4l) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        var tino = ext2_path_lookup(arg1, arg2);
+        if (tino <= 0) { stack_canary_check(canary); return 0 - 1; }
+        var ldp = vfs_ext2_parent(arg3, a4l);
+        if (ldp <= 0) { stack_canary_check(canary); return 0 - 1; }
+        stack_canary_check(canary);
+        return ext2_link(tino, ldp, arg3 + vfs_base_off, vfs_base_len);
     }
     stack_canary_check(canary);
     return 0 - 1;

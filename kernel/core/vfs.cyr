@@ -26,6 +26,7 @@ enum VfsType {
     VFS_TIMERFD   = 5;
     VFS_PIPE      = 6;
     VFS_EXT2_FILE = 7;   # payload[0]=pos, [1]=size, [2]=inode_num
+    VFS_EXT2_DIR  = 8;   # payload[0]=read offset, [2]=dir inode (getdents, 1.41.3)
 }
 
 var vfs_table[1024];  # 32 entries x 32 bytes each
@@ -210,6 +211,28 @@ fn vfs_resolve_mount(path, pathlen) {
     if (bplen == 1) { vfs_mnt_reloff = 0; }        # root mount: whole abspath
     else { vfs_mnt_reloff = bplen; }               # strip the mountpoint prefix
     return load64(&vfs_mnt_backend + best * 8);
+}
+
+# Basename split for ext2 syscall paths — the kernel-layer mirror of the
+# shell's sh_split_parent, but operating on an ARBITRARY (user or kernel)
+# buffer so the ring-3 FS syscalls (mkdir/rmdir/unlink/rename/link) can use
+# it on a validated user pointer. Sets vfs_base_off/vfs_base_len (the
+# basename within `path`) and returns the parent directory inode (>0), or
+# -1. Absolute paths only (the ABI has agnsh pass absolute paths).
+var vfs_base_off = 0;
+var vfs_base_len = 0;
+fn vfs_ext2_parent(path, pathlen) {
+    var plen = pathlen;
+    while (plen > 1) { if (load8(path + plen - 1) != 47) { break; } plen = plen - 1; }
+    var last = 0 - 1;
+    var i = 0;
+    while (i < plen) { if (load8(path + i) == 47) { last = i; } i = i + 1; }
+    if (last == 0 - 1) { return 0 - 1; }
+    vfs_base_off = last + 1;
+    vfs_base_len = plen - (last + 1);
+    if (vfs_base_len < 1) { return 0 - 1; }
+    if (last == 0) { return 2; }                   # parent is root "/"
+    return ext2_path_lookup(path, last);
 }
 
 # Backend-parameterized FAT/exFAT dispatch (1.40.13 mount routing). Each takes

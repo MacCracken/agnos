@@ -1266,6 +1266,87 @@ fn exec_disk_selftest() {
 exec_disk_selftest();
 #endif
 
+# 1.41.3 — FS-syscall self-test (compile-gated, FS_SYSCALL_SELFTEST=1). Drives
+# the new real FS syscalls (mkdir/open+CREAT/stat/rename/getdents/unlink/rmdir/
+# sync) through ksyscall() with a real >=2 MB user-range scratch (pmm_alloc_2mb
+# returns an identity-mapped phys >= 0x200000, so is_user_range accepts it), and
+# verifies side effects via ext2_path_lookup. Validates the handler+backend
+# logic for all 9 syscalls (this sets ksyscall_a4 directly for rename; the
+# a4=r10 REGISTER delivery rides syscall_handler's SysV 6th arg in r9 — proven
+# by analogy to the existing 5th arg already in r8 — and gets its first ring-3
+# consumer when agnsh calls rename). Needs a writable ext2.
+#ifdef FS_SYSCALL_SELFTEST
+fn fs_syscall_selftest() {
+    if (ext2_active == 0)   { kprintln("fssys: no ext2 SKIP", 19); return 0; }
+    if (ext2_write_ok == 0) { kprintln("fssys: ro ext2 SKIP", 19); return 0; }
+    var u = pmm_alloc_2mb();
+    if (u == 0)         { kprintln("fssys: no scratch FAIL", 22); return 0 - 1; }
+    if (u < 0x200000)   { kprintln("fssys: scratch low FAIL", 23); return 0 - 1; }
+    memcpy(u + 0,   "/fss", 4);      # dir
+    memcpy(u + 64,  "/fss/a", 6);    # file
+    memcpy(u + 128, "/fss/b", 6);    # rename target
+    var ok = 1;
+
+    # mkdir("/fss") + verify it exists on disk.
+    if (ksyscall(9, u + 0, 4) != 0)        { kprintln("fssys: mkdir FAIL", 17); ok = 0; }
+    if (ext2_path_lookup(u + 0, 4) <= 0)   { kprintln("fssys: mkdir verify FAIL", 24); ok = 0; }
+
+    # open("/fss/a", AO_CREAT) -> fd, close; verify the file exists.
+    var fd = ksyscall(7, u + 64, 6, 0x100);
+    if (fd < 0)                            { kprintln("fssys: open-creat FAIL", 22); ok = 0; }
+    else { ksyscall(6, fd, 0, 0); }
+    if (ext2_path_lookup(u + 64, 6) <= 0)  { kprintln("fssys: creat verify FAIL", 24); ok = 0; }
+
+    # stat("/fss/a") -> statbuf @ u+256; st_mode top nibble must say regular file.
+    if (ksyscall(33, u + 64, 6, u + 256) != 0) { kprintln("fssys: stat FAIL", 16); ok = 0; }
+    else { if ((load64(u + 256) & 0xF000) != 0x8000) { kprintln("fssys: stat mode FAIL", 21); ok = 0; } }
+
+    # rename("/fss/a" -> "/fss/b"): backend logic with a4=newlen via ksyscall_a4.
+    ksyscall_a4 = 6;
+    if (ksyscall(31, u + 64, 6, u + 128) != 0) { kprintln("fssys: rename FAIL", 18); ok = 0; }
+    if (ext2_path_lookup(u + 128, 6) <= 0)     { kprintln("fssys: rename dst FAIL", 22); ok = 0; }
+    if (ext2_path_lookup(u + 64, 6) > 0)       { kprintln("fssys: rename src-left FAIL", 27); ok = 0; }
+
+    # getdents("/fss") via an AO_DIRECTORY fd; scan records for the renamed "b".
+    var dfd = ksyscall(7, u + 0, 4, 0x800);
+    if (dfd < 0) { kprintln("fssys: opendir FAIL", 19); ok = 0; }
+    else {
+        var gb = ksyscall(29, dfd, u + 512, 1024);
+        ksyscall(6, dfd, 0, 0);
+        if (gb <= 0) { kprintln("fssys: getdents empty FAIL", 26); ok = 0; }
+        else {
+            var found = 0;
+            var off = 0;
+            while (off < gb) {
+                var rl = load8(u + 512 + off) | (load8(u + 512 + off + 1) << 8);
+                if (rl < 8) { break; }
+                if (load8(u + 512 + off + 3) == 1) {
+                    if (load8(u + 512 + off + 8) == 98) { found = 1; }   # 'b'
+                }
+                off = off + rl;
+            }
+            if (found == 0) { kprintln("fssys: getdents no b FAIL", 25); ok = 0; }
+        }
+    }
+
+    # unlink("/fss/b") + verify gone.
+    if (ksyscall(30, u + 128, 6) != 0)     { kprintln("fssys: unlink FAIL", 18); ok = 0; }
+    if (ext2_path_lookup(u + 128, 6) > 0)  { kprintln("fssys: unlink-left FAIL", 23); ok = 0; }
+
+    # rmdir("/fss") + verify gone.
+    if (ksyscall(10, u + 0, 4) != 0)       { kprintln("fssys: rmdir FAIL", 17); ok = 0; }
+    if (ext2_path_lookup(u + 0, 4) > 0)    { kprintln("fssys: rmdir-left FAIL", 22); ok = 0; }
+
+    ksyscall(12, 0, 0);   # sync
+
+    pmm_free_2mb(u);
+    if (ok == 1) { kprintln("fssys: ALL PASS", 15); }
+    else { kprintln("fssys: FAIL", 11); }
+    return 0;
+}
+fs_syscall_selftest();
+#endif
+
 # 1.37.0 — ext4 extent-ALLOCATION self-test (compile-gated). Appends past EOF
 # of a seed EXTENTS_FL file to exercise ext2_extent_append_block. Gated by
 # scripts/ext-extent-smoke.sh (host e2fsck -fn clean + grow/byte verify).
