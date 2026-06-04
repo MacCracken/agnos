@@ -5,6 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.9] — 2026-06-04 (**The in-kernel shell shrinks to a recovery REPL — the permanent kernel↔userland shell boundary is locked.** With agnsh (userland) now the interactive shell (1.41.4) and the FS-write test harness decoupled from the shell verbs (1.41.8), the non-recovery verbs in the in-kernel `shell()` are deleted. `kernel/user/shell.cyr` drops **1149 → 813 LOC (−336)** and the production kernel **1,084,312 → 1,070,288 B (−14 KB)**. The kernel shell is now strictly a recovery fallback: it owns just enough to inspect and repair a broken `/bin/agnsh`. The full verb surface + AI/intent features live in agnsh. This is the kernel-slimming half of the shell-separation arc.)
+
+### Removed
+
+- **Non-recovery verb handlers + dispatch (`kernel/user/shell.cyr`).** Deleted `sh_cmd_touch`, `sh_cmd_mkdir`, `sh_cmd_rmdir`, `sh_cmd_ln`, `sh_cmd_bench` (+ its sole helper `bench_report`), `sh_cmd_ps`, `sh_cmd_free`, `sh_cmd_jbd2`, and `sh_echo_redirect`, plus each one's `sh_exec` dispatch line and its entry in the `help` menu text. The `echo` verb shrinks to a bare print (the `> FILE` redirect path is gone). The dead `sh_write_selftest` (redundant since 1.41.8 migrated the ext2 shell-write test to syscalls) is also removed.
+- **Kept (the recovery set):** `help`, `cd`, `pwd`, `ls`, `cat`, `run`, `mv`, `rm`, `sync`, `reboot`, plus the non-write diagnostics/utility verbs (uptime / lspci / cpus / net / parts / date / clear / version / …). `rm` and `mv` stay because repairing a broken `/bin/agnsh` means deleting it and moving a backup into place. The shared path helpers (`sh_trim` / `sh_abspath` / `sh_split_parent` / `sh_cwd_*` / `sh_is_dir` / `sh_streq` / `sh_parse_ipv4`) stay — still used by the kept verbs.
+
+### Validated
+
+- `scripts/sweep.sh` **7/7** — the FAT/exFAT/ext2 write smokes boot **into** the in-kernel recovery shell (no `/bin/agnsh` seeded), so they directly exercise the shrunk shell + the kept verbs (`cat`/`rm`/`mv`/`sync`); all green. `FS_SYSCALL_SELFTEST` **`fssys: ALL PASS`**, `SYSCALL_HARDEN_SELFTEST` **`shsys: ALL PASS`**, the recovery `agnos>` prompt comes up, `scripts/agnsh-smoke.sh` **PASS** (boot-to-agnsh still launches agnsh, no fallback), `check.sh` 11/11.
+- The deletion was performed by a subagent from the 1.41.8 completeness spec, then **independently re-verified**: a grep confirms zero remaining references to any deleted symbol (no dangling dispatch / caller), all 9 recovery verb handlers are present, and the kernel builds clean.
+
+### Notes
+
+- This **locks the permanent boundary**: kernel shell = recovery only; agnsh = full interactive. It does not collapse — the emergency shell is the boot fallback whenever no userland shell is reachable. Remaining arc work: **1.41.10** — arc-close hardening + the combined iron burn (agnsh interactive on real Zen).
+
+
 ## [1.41.8] — 2026-06-04 (**Decouple the FS-write test harness from the in-kernel shell verbs.** The migrate half of the shell-shrink, done first for safety (migrate-then-delete). The FAT/exFAT/ext2 write **selftests** drove the shell's write verbs via `sh_exec("touch /mnt/fat/…")`, so those verbs couldn't be deleted without breaking the smokes. They now drive the write path via **syscalls** — the same path agnsh uses — so the verbs are undriven by any test and 1.41.9 can delete them with zero coverage loss. The smokes pass **unchanged** (same backend → identical on-disk files); sweep 7/7. Planned by a multi-agent map + adversarial completeness spec, which caught — and which I then re-derived past — an off-by-one path length the spec text itself miscounted.)
 
 ### Changed

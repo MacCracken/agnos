@@ -177,8 +177,6 @@ fn sh_cmd_help() {
     kprintln("AGNOS Shell commands:", 21);
     kprintln("  help    - this message", 24);
     kprintln("  echo    - print text", 22);
-    kprintln("  ps      - process list", 24);
-    kprintln("  free    - memory info", 23);
     kprintln("  cat     - read file", 21);
     kprintln("  uptime  - timer ticks", 23);
     kprintln("  lspci   - PCI devices", 23);
@@ -191,7 +189,6 @@ fn sh_cmd_help() {
     kprintln("  ping    - ICMP echo a host", 28);
     kprintln("  ntp     - SNTP time sync", 25);
     kprintln("  date    - show synced UTC time", 32);
-    kprintln("  jbd2    - show journal-superblock state", 41);
     kprintln("  pipe    - test pipe IPC", 25);
     kprintln("  blkread - read disk sector", 28);
     kprintln("  parts   - list GPT partitions", 31);
@@ -199,120 +196,8 @@ fn sh_cmd_help() {
     kprintln("  cd      - change directory", 28);
     kprintln("  pwd     - print working dir", 29);
     kprintln("  disk    - disk info", 21);
-    kprintln("  bench   - run benchmarks", 26);
     kprintln("  test    - run test suite", 26);
     kprintln("  halt    - shutdown", 20);
-    return 0;
-}
-
-fn sh_cmd_ps() {
-    kprintln("PID  STATE", 10);
-    for (var i = 0; i < proc_count; i = i + 1) {
-        kprint_num(i);
-        kprint("    ", 4);
-        var st = proc_get_state(i);
-        if (st == 0) { kprintln("halted", 6); }
-        if (st == 1) { kprintln("ready", 5); }
-        if (st == 2) { kprintln("running", 7); }
-    }
-    return 0;
-}
-
-fn sh_cmd_free() {
-    kprint("PMM: ", 5);
-    kprint_num(pmm_free_count());
-    kprint("/", 1);
-    kprint_num(pmm_total);
-    kprintln(" pages (4KB each)", 17);
-    kprint("Heap: ", 6);
-    kprint_num(heap_allocs);
-    kprint(" allocs, ", 9);
-    kprint_num(heap_frees);
-    kprintln(" frees", 6);
-    return 0;
-}
-
-fn bench_report(name, nlen, cycles, ops) {
-    kprint(name, nlen);
-    kprint_num(cycles / ops);
-    kprintln(" cycles/op", 10);
-    return 0;
-}
-
-fn sh_cmd_bench() {
-    kprintln("=== AGNOS Benchmarks (3-tier) ===", 33);
-    var t0 = 0;
-    var t1 = 0;
-    kprintln("[tier1] core", 12);
-    t0 = rdtsc();
-    for (var i = 0; i < 1000; i = i + 1) { var pg = pmm_alloc(); pmm_free(pg); }
-    t1 = rdtsc();
-    bench_report("  pmm_alloc_free: ", 18, t1 - t0, 1000);
-    t0 = rdtsc();
-    for (var i = 0; i < 1000; i = i + 1) { var p = kmalloc(32); kfree_sized(p, 32); }
-    t1 = rdtsc();
-    bench_report("  heap_32B: ", 12, t1 - t0, 1000);
-    t0 = rdtsc();
-    for (var i = 0; i < 1000; i = i + 1) { var p = kmalloc(256); kfree_sized(p, 256); }
-    t1 = rdtsc();
-    bench_report("  heap_256B: ", 13, t1 - t0, 1000);
-    t0 = rdtsc();
-    for (var i = 0; i < 1000; i = i + 1) { var p = kmalloc(4096); kfree_sized(p, 4096); }
-    t1 = rdtsc();
-    bench_report("  heap_4096B: ", 14, t1 - t0, 1000);
-    var mem_pg = pmm_alloc();
-    # Guard: pmm_alloc() returns 0 on exhaustion (pmm.cyr). Dereferencing a 0
-    # base would store 0xDEADBEEF across physical 0..4095 — clobbering the
-    # IVT/low page tables/structures and faulting LATER (e.g. on the next timer
-    # context-switch), a classic delayed-idle lockup. Skip the bench instead.
-    if (mem_pg == 0) {
-        kprintln("  memwrite_1MB: skipped (no page)", 33);
-    } else {
-        t0 = rdtsc();
-        for (var i = 0; i < 256; i = i + 1) {
-            for (var j = 0; j < 4096; j = j + 8) { store64(mem_pg + j, 0xDEADBEEF); }
-        }
-        t1 = rdtsc();
-        pmm_free(mem_pg);
-        kprint("  memwrite_1MB: ", 16);
-        kprint_num((t1 - t0) / 1000);
-        kprintln(" Kcycles", 8);
-    }
-    kprintln("[tier2] subsystems", 18);
-    t0 = rdtsc();
-    for (var i = 0; i < 10000; i = i + 1) { ksyscall(2, 0, 0, 0); }
-    t1 = rdtsc();
-    bench_report("  syscall_getpid: ", 18, t1 - t0, 10000);
-    t0 = rdtsc();
-    for (var i = 0; i < 1000; i = i + 1) { ksyscall(15, 0, 0, 0); }
-    t1 = rdtsc();
-    bench_report("  syscall_getuid: ", 18, t1 - t0, 1000);
-    t0 = rdtsc();
-    for (var i = 0; i < 1000; i = i + 1) { ksyscall(1, 0, ".", 1); }
-    t1 = rdtsc();
-    kprintln("", 0);
-    bench_report("  syscall_write1: ", 18, t1 - t0, 1000);
-    t0 = rdtsc();
-    for (var i = 0; i < 100; i = i + 1) {
-        var fd = vfs_create_memfile("test", 4);
-        # Guard: vfs_create_memfile returns -1 if the 32-slot vfs_table is full.
-        # vfs_read(-1, ...) would index &vfs_table + (-1)*32 = 32 bytes BEFORE
-        # the table (OOB read of a bogus tag/payload pointer) — don't.
-        if (fd >= 0) {
-            var rb[8];
-            vfs_read(fd, &rb, 4);
-            vfs_close(fd);
-        }
-    }
-    t1 = rdtsc();
-    bench_report("  vfs_open_read_close: ", 23, t1 - t0, 100);
-    kprintln("[tier3] integration", 19);
-    t0 = rdtsc();
-    for (var i = 0; i < 1000; i = i + 1) { kputc(46); }
-    t1 = rdtsc();
-    kprintln("", 0);
-    bench_report("  serial_putc: ", 15, t1 - t0, 1000);
-    kprintln("=== done ===", 12);
     return 0;
 }
 
@@ -457,24 +342,6 @@ fn sh_split_parent(plen) {
     return ext2_path_lookup(&sh_path_buf, last);       # dirname → inode
 }
 
-fn sh_cmd_touch(arg, arglen) {
-    sh_trim(arg, arglen);
-    if (sh_trim_len < 1) { kprintln("usage: touch <file>", 19); return 0; }
-    if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("touch: bad path", 15); return 0; }
-    # Route by mount (1.40.13): which filesystem owns this absolute path?
-    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
-    if (be == FS_FAT || be == FS_EXFAT) {
-        if (vfs_create_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff) == 0) { return 0; }
-        kprintln("touch: failed", 13); return 0;
-    }
-    if (be != FS_EXT2) { kprintln("touch: no fs", 12); return 0; }
-    var parent = sh_split_parent(sh_path_len);
-    if (parent <= 0) { kprintln("touch: no such directory", 24); return 0; }
-    if (ext2_dir_lookup(parent, &sh_path_buf + sh_base_off, sh_base_len) > 0) { return 0; }  # exists → no-op
-    if (ext2_create(parent, &sh_path_buf + sh_base_off, sh_base_len) <= 0) { kprintln("touch: failed", 13); }
-    return 0;
-}
-
 fn sh_cmd_rm(arg, arglen) {
     sh_trim(arg, arglen);
     if (sh_trim_len < 1) { kprintln("usage: rm <file>", 16); return 0; }
@@ -488,38 +355,6 @@ fn sh_cmd_rm(arg, arglen) {
     var parent = sh_split_parent(sh_path_len);
     if (parent <= 0) { kprintln("rm: no such path", 16); return 0; }
     if (ext2_unlink(parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) { kprintln("rm: failed", 10); }
-    return 0;
-}
-
-fn sh_cmd_mkdir(arg, arglen) {
-    sh_trim(arg, arglen);
-    if (sh_trim_len < 1) { kprintln("usage: mkdir <dir>", 18); return 0; }
-    if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("mkdir: bad path", 15); return 0; }
-    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
-    if (be == FS_FAT || be == FS_EXFAT) {
-        if (vfs_mkdir_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff) == 0) { return 0; }
-        kprintln("mkdir: failed", 13); return 0;
-    }
-    if (be != FS_EXT2) { kprintln("mkdir: no fs", 12); return 0; }
-    var parent = sh_split_parent(sh_path_len);
-    if (parent <= 0) { kprintln("mkdir: no such parent", 21); return 0; }
-    if (ext2_mkdir(parent, &sh_path_buf + sh_base_off, sh_base_len) <= 0) { kprintln("mkdir: failed", 13); }
-    return 0;
-}
-
-fn sh_cmd_rmdir(arg, arglen) {
-    sh_trim(arg, arglen);
-    if (sh_trim_len < 1) { kprintln("usage: rmdir <dir>", 18); return 0; }
-    if (sh_abspath(arg + sh_trim_off, sh_trim_len) < 0) { kprintln("rmdir: bad path", 15); return 0; }
-    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
-    if (be == FS_FAT || be == FS_EXFAT) {
-        if (vfs_rmdir_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff) == 0) { return 0; }
-        kprintln("rmdir: failed (not empty?)", 26); return 0;
-    }
-    if (be != FS_EXT2) { kprintln("rmdir: no fs", 12); return 0; }
-    var parent = sh_split_parent(sh_path_len);
-    if (parent <= 0) { kprintln("rmdir: no such path", 19); return 0; }
-    if (ext2_rmdir(parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) { kprintln("rmdir: failed (not empty?)", 26); }
     return 0;
 }
 
@@ -579,100 +414,6 @@ fn sh_cmd_mv(arg, arglen) {
     if (dst_parent <= 0) { kprintln("mv: no such dst directory", 25); return 0; }
     if (ext2_rename(src_parent, &srcsave, srcsave_len, dst_parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) {
         kprintln("mv: failed (no such src / dst exists / dir loop?)", 49);
-    }
-    return 0;
-}
-
-# `ln SRC NEWNAME` — hard-link (1.33.3 bite 2). SRC must exist; resolve it
-# to an inode BEFORE the second sh_abspath reuses sh_path_buf for NEWNAME.
-fn sh_cmd_ln(arg, arglen) {
-    if (ext2_active == 0) { kprintln("ln: no fs", 9); return 0; }
-    sh_trim(arg, arglen);
-    if (sh_trim_len < 1) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
-    var ts = arg + sh_trim_off;
-    var tl = sh_trim_len;
-
-    # detect a leading "-s " → symlink mode; advance past it
-    var symmode = 0;
-    if (tl >= 2) {
-        if (load8(ts) == 45) { if (load8(ts + 1) == 115) {           # "-s"
-            if (tl == 2) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
-            if (load8(ts + 2) != 32) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
-            symmode = 1;
-            var adv = 3;
-            while (adv < tl) { if (load8(ts + adv) != 32) { break; } adv = adv + 1; }
-            ts = ts + adv;
-            tl = tl - adv;
-        } }
-    }
-
-    # split the remaining text into two tokens on the first space
-    var sp = 0 - 1;
-    var i = 0;
-    while (i < tl) { if (load8(ts + i) == 32) { sp = i; break; } i = i + 1; }
-    if (sp < 0) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
-    var doff = sp + 1;
-    while (doff < tl) { if (load8(ts + doff) != 32) { break; } doff = doff + 1; }
-    if (doff >= tl) { kprintln("usage: ln [-s] <a> <b>", 22); return 0; }
-
-    if (symmode == 1) {
-        # SYMLINK: token A = target string (stored verbatim, NOT resolved);
-        # token B = link path. Copy the target to a local before sh_abspath(B)
-        # reuses sh_path_buf.
-        var tgt_len = sp;
-        if (tgt_len > 255) { kprintln("ln: target too long", 19); return 0; }
-        var tgtbuf[256];
-        var c = 0;
-        while (c < tgt_len) { store8(&tgtbuf + c, load8(ts + c)); c = c + 1; }
-        if (sh_abspath(ts + doff, tl - doff) < 0) { kprintln("ln: bad link path", 17); return 0; }
-        var lparent = sh_split_parent(sh_path_len);
-        if (lparent <= 0) { kprintln("ln: no such link directory", 26); return 0; }
-        if (ext2_symlink(lparent, &sh_path_buf + sh_base_off, sh_base_len, &tgtbuf, tgt_len) <= 0) {
-            kprintln("ln: symlink failed (exists?)", 28);
-        }
-        return 0;
-    }
-
-    # HARDLINK: SRC must exist; resolve to an inode before reusing sh_path_buf
-    if (sh_abspath(ts, sp) < 0) { kprintln("ln: bad src path", 16); return 0; }
-    var src_ino = ext2_path_lookup(&sh_path_buf, sh_path_len);
-    if (src_ino <= 0) { kprintln("ln: no such src", 15); return 0; }
-    if (sh_abspath(ts + doff, tl - doff) < 0) { kprintln("ln: bad dst path", 16); return 0; }
-    var dst_parent = sh_split_parent(sh_path_len);
-    if (dst_parent <= 0) { kprintln("ln: no such dst directory", 25); return 0; }
-    if (ext2_link(src_ino, dst_parent, &sh_path_buf + sh_base_off, sh_base_len) != 0) {
-        kprintln("ln: failed (dir / dst exists?)", 30);
-    }
-    return 0;
-}
-
-# `jbd2` — show the parsed JBD2 journal-superblock state captured at mount
-# (1.38.1). Reads module-scope vars populated by ext2_jbd2_probe; emits
-# `none` if no journal feature, `DIRTY` vs `clean` per s_start.
-fn sh_cmd_jbd2() {
-    if (ext2_active == 0) { kprintln("jbd2: no fs mounted", 19); return 0; }
-    if (ext2_jbd2_present == 0) { kprintln("jbd2: no journal on mounted FS", 30); return 0; }
-    kprint("jbd2: ino=", 10); kprint_num(ext2_jbd2_inum);
-    kprint(" size=", 6); kprint_num(ext2_jbd2_size); kprint(" blocks", 7);
-    kprint(" blocksize=", 11); kprint_num(ext2_blocksize); kprintln("", 0);
-    kprint("jbd2: state=", 12);
-    if (ext2_jbd2_clean == 1) { kprintln("clean", 5); }
-    else                      { kprintln("DIRTY (needs replay -- not yet implemented)", 43); }
-    # 1.38.2: when dirty, dump the parsed log (descriptor / commit / revoke
-    # walker; non-mutating). Replay still pending (1.38.3).
-    if (ext2_jbd2_clean == 0) {
-        ext2_jbd2_log_walk_and_trace();
-    }
-    kprint("jbd2: start=", 12); kprint_num(ext2_jbd2_start);
-    kprint(" first=", 7); kprint_num(ext2_jbd2_first);
-    kprint(" seq=", 5); kprint_num(ext2_jbd2_sequence); kprintln("", 0);
-    kprint("jbd2: nr_users=", 15); kprint_num(ext2_jbd2_nr_users); kprintln("", 0);
-    kprint("jbd2: features compat=", 22); kprint_num(ext2_jbd2_feature_compat);
-    kprint(" incompat=", 10); kprint_num(ext2_jbd2_feature_incompat);
-    kprint(" ro_compat=", 11); kprint_num(ext2_jbd2_feature_ro_compat); kprintln("", 0);
-    if (ext2_jbd2_csum_type != 0) {
-        kprint("jbd2: csum_type=", 16); kprint_num(ext2_jbd2_csum_type);
-        kprintln(" (validated at mount)", 21);
     }
     return 0;
 }
@@ -738,51 +479,6 @@ fn sh_cmd_run(arg, arglen) {
     return 0;
 }
 
-# `echo TEXT > FILE` — write TEXT + newline to FILE (create or truncate).
-# `text`/`textlen` = the bytes before '>'; `fname`/`fnamelen` = after.
-fn sh_echo_redirect(text, textlen, fname, fnamelen) {
-    sh_trim(text, textlen);
-    var t_off = sh_trim_off; var t_len = sh_trim_len;
-    sh_trim(fname, fnamelen);
-    if (sh_trim_len < 1) { kprintln("echo: no redirect target", 24); return 0; }
-    if (sh_abspath(fname + sh_trim_off, sh_trim_len) < 0) { kprintln("echo: bad path", 14); return 0; }
-    var be = vfs_resolve_mount(&sh_path_buf, sh_path_len);
-    if (be == FS_FAT || be == FS_EXFAT) {
-        # FAT/exFAT writes are whole-file (overwrite): assemble text + "\n" into
-        # one buffer and hand the mount-relative path to vfs_write_on.
-        var ebuf[512];                       # function-local: 512 bytes
-        var ew = 0;
-        var ek = 0;
-        while (ek < t_len) {
-            if (ew >= 511) { break; }
-            store8(&ebuf + ew, load8(text + t_off + ek));
-            ew = ew + 1; ek = ek + 1;
-        }
-        if (ew < 511) { store8(&ebuf + ew, 10); ew = ew + 1; }   # trailing '\n'
-        if (vfs_write_on(be, &sh_path_buf + vfs_mnt_reloff, sh_path_len - vfs_mnt_reloff, &ebuf, ew) >= 0) { return 0; }
-        kprintln("echo: write failed", 18); return 0;
-    }
-    if (be != FS_EXT2) { kprintln("echo: no fs for redirect", 24); return 0; }
-    var parent = sh_split_parent(sh_path_len);
-    if (parent <= 0) { kprintln("echo: no such directory", 23); return 0; }
-
-    # create if absent, else truncate (overwrite semantics)
-    var ino = ext2_dir_lookup(parent, &sh_path_buf + sh_base_off, sh_base_len);
-    if (ino <= 0) {
-        if (ext2_create(parent, &sh_path_buf + sh_base_off, sh_base_len) <= 0) { kprintln("echo: create failed", 19); return 0; }
-    } else {
-        ext2_truncate_zero(ino);
-    }
-
-    # open via VFS and write through the vfs_write EXT2 arm, then "\n"
-    var fd = ext2_open(&sh_path_buf, sh_path_len);
-    if (fd < 0) { kprintln("echo: open failed", 17); return 0; }
-    if (t_len > 0) { vfs_write(fd, text + t_off, t_len); }
-    vfs_write(fd, "\n", 1);
-    vfs_close(fd);
-    return 0;
-}
-
 fn sh_exec(buf, len) {
     if (len < 1) { return 0; }
     # Find command end (first space or end)
@@ -801,8 +497,6 @@ fn sh_exec(buf, len) {
     var arglen = len - cmd_end;
 
     if (sh_streq(buf, clen, "help", 4) == 1) { return sh_cmd_help(); }
-    if (sh_streq(buf, clen, "ps", 2) == 1) { return sh_cmd_ps(); }
-    if (sh_streq(buf, clen, "free", 4) == 1) { return sh_cmd_free(); }
     if (sh_streq(buf, clen, "uptime", 6) == 1) {
         kprint_num(timer_ticks);
         kprintln(" ticks", 6);
@@ -813,24 +507,14 @@ fn sh_exec(buf, len) {
     if (sh_streq(buf, clen, "cd", 2) == 1) { return sh_cmd_cd(arg, arglen); }
     if (sh_streq(buf, clen, "pwd", 3) == 1) { return sh_cmd_pwd(); }
     if (sh_streq(buf, clen, "echo", 4) == 1) {
-        # `echo TEXT > FILE` redirect (WRITE arc): split on the first '>'.
-        var g = 0 - 1;
-        var gi = 0;
-        while (gi < arglen) { if (load8(arg + gi) == 62) { g = gi; break; } gi = gi + 1; }
-        if (g >= 0) { return sh_echo_redirect(arg, g, arg + g + 1, arglen - g - 1); }
         kprint(arg, arglen);
         kprintln("", 0);
         return 0;
     }
-    if (sh_streq(buf, clen, "touch", 5) == 1) { return sh_cmd_touch(arg, arglen); }
     if (sh_streq(buf, clen, "rm", 2) == 1)    { return sh_cmd_rm(arg, arglen); }
-    if (sh_streq(buf, clen, "mkdir", 5) == 1) { return sh_cmd_mkdir(arg, arglen); }
-    if (sh_streq(buf, clen, "rmdir", 5) == 1) { return sh_cmd_rmdir(arg, arglen); }
     if (sh_streq(buf, clen, "mv", 2) == 1)    { return sh_cmd_mv(arg, arglen); }
-    if (sh_streq(buf, clen, "ln", 2) == 1)    { return sh_cmd_ln(arg, arglen); }
     if (sh_streq(buf, clen, "sync", 4) == 1)  { return sh_cmd_sync(); }
     if (sh_streq(buf, clen, "run", 3) == 1)   { return sh_cmd_run(arg, arglen); }
-    if (sh_streq(buf, clen, "jbd2", 4) == 1)  { return sh_cmd_jbd2(); }
     if (sh_streq(buf, clen, "lspci", 5) == 1) {
         for (var i = 0; i < pci_count; i = i + 1) {
             var base = &pci_devs + i * 32;
@@ -1079,7 +763,6 @@ fn sh_exec(buf, len) {
         gpt_print_all_partitions();
         return 0;
     }
-    if (sh_streq(buf, clen, "bench", 5) == 1) { return sh_cmd_bench(); }
     #ifdef TEST
     if (sh_streq(buf, clen, "test", 4) == 1) { return sh_cmd_test(); }
     #endif
@@ -1126,24 +809,5 @@ fn shell() {
         var result = sh_exec(&sh_buf, sh_len);
         if (result == 0 - 99) { sh_running = 0; }
     }
-    return 0;
-}
-
-# === Shell write-verb self-test (compile-gated EXT2_WRITE_SELFTEST) =====
-# Drives the real verb path via sh_exec with canned commands — exercises
-# echo-redirect (create + vfs_write), cat (read-back), mkdir, touch, rm
-# headlessly (the interactive input loop reads HID, not driveable in a
-# headless QEMU). The `cat` output ("SHELL-WROTE-IT") is the verification
-# the smoke greps; /shdir/keep.txt is left for host debugfs to confirm.
-fn sh_write_selftest() {
-    kprintln("shtest: begin", 13);
-    sh_cwd_init();
-    sh_exec("mkdir /shdir", 12);
-    sh_exec("echo SHELL-WROTE-IT > /shdir/keep.txt", 37);
-    kprint("shtest cat: ", 12);
-    sh_exec("cat /shdir/keep.txt", 19);
-    sh_exec("touch /shtmp", 12);
-    sh_exec("rm /shtmp", 9);
-    kprintln("shtest: end", 11);
     return 0;
 }
