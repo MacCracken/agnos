@@ -556,6 +556,56 @@ if (fatfs_active == 1) {
 }
 #endif
 
+# 1.41.8 — syscall-driven FS-verb helpers for the FAT/exFAT write selftests.
+# These replace the sh_exec("touch/echo>/mkdir/rmdir ...") drives so the selftests
+# no longer depend on the in-kernel shell's write verbs (deleted by the shell-
+# shrink). Each takes a >=2 MB pmm_alloc_2mb scratch `su` (passes is_user_range):
+# the mount-relative absolute path goes at su+0, echo content at su+64. `plen` is
+# the PATH byte-length (NOT a shell arg-count). The syscalls mount-route to
+# FAT/exFAT exactly as the verbs did, producing identical on-disk files. Ungated
+# (tiny; DCE drops them when no selftest is compiled).
+fn sc_touch(path) {
+    var su = pmm_alloc_2mb();
+    if (su == 0) { return 0 - 1; }
+    var plen = strlen(path);
+    memcpy(su, path, plen);
+    var fd = ksyscall(7, su, plen, 0x100);              # open AO_CREAT (empty file)
+    if (fd >= 0) { ksyscall(6, fd, 0, 0); }
+    pmm_free_2mb(su);
+    return 0;
+}
+fn sc_echo(path, content) {
+    var su = pmm_alloc_2mb();
+    if (su == 0) { return 0 - 1; }
+    var plen = strlen(path);
+    var clen = strlen(content);
+    memcpy(su, path, plen);
+    memcpy(su + 64, content, clen);
+    store8(su + 64 + clen, 10);                          # trailing '\n' like the echo verb
+    var fd = ksyscall(7, su, plen, 0x301);              # open AO_WRONLY|AO_CREAT|AO_TRUNC
+    if (fd >= 0) { ksyscall(1, fd, su + 64, clen + 1); ksyscall(6, fd, 0, 0); }
+    pmm_free_2mb(su);
+    return 0;
+}
+fn sc_mkdir(path) {
+    var su = pmm_alloc_2mb();
+    if (su == 0) { return 0 - 1; }
+    var plen = strlen(path);
+    memcpy(su, path, plen);
+    var rc = ksyscall(9, su, plen);                     # mkdir
+    pmm_free_2mb(su);
+    return rc;
+}
+fn sc_rmdir(path) {
+    var su = pmm_alloc_2mb();
+    if (su == 0) { return 0 - 1; }
+    var plen = strlen(path);
+    memcpy(su, path, plen);
+    var rc = ksyscall(10, su, plen);                    # rmdir
+    pmm_free_2mb(su);
+    return rc;
+}
+
 # FAT write self-test (1.34.x bite 3, compile-gated via FATFS_WRITE_SELFTEST).
 # Creates an empty 8.3 file in the mounted FAT root; fat-write-smoke.sh
 # then gates on fsck.fat -n clean + mdir showing NEWFILE.TXT.
@@ -701,38 +751,38 @@ if (fatfs_active == 1) {
     # fat), so fat-write-smoke.sh's mdir/fsck checks (SHTOUCH.TXT empty-create,
     # SHECHO.TXT "SHELL-FAT-WROTE") are unchanged. CWD init'd for any bare path.
     sh_cwd_init();
-    kprintln("vfsw: shell touch+echo over FAT ->", 34);
-    sh_exec("touch /mnt/fat/SHTOUCH.TXT", 26);
-    sh_exec("echo SHELL-FAT-WROTE > /mnt/fat/SHECHO.TXT", 42);
-    # `rm` over FAT — dedicated target so the SHTOUCH/SHECHO gates stay valid.
-    sh_exec("touch /mnt/fat/SHRMTGT.TXT", 26);
-    sh_exec("rm /mnt/fat/SHRMTGT.TXT", 23);
-    # mkdir/rmdir over FAT. SHKEEP kept (navigable dir); SHRMD created+removed.
-    sh_exec("mkdir /mnt/fat/SHKEEP", 21);
-    sh_exec("mkdir /mnt/fat/SHRMD", 20);
-    sh_exec("rmdir /mnt/fat/SHRMD", 20);
-    # mv (rename) + sync over FAT. SHMVA→SHMVB; smoke checks B present, A gone.
-    sh_exec("touch /mnt/fat/SHMVA", 20);
-    sh_exec("mv /mnt/fat/SHMVA /mnt/fat/SHMVB", 32);
-    sh_exec("sync", 4);
-    # Subdirectory paths under the FAT mount — exercises fatfs_resolve_parent
-    # end-to-end (create/write/cat/mkdir/rmdir/mv/rm in a subdir). smoke fsck's
-    # clean + mtype-checks SHSUB/SUBKEEP.TXT content, confirms SHSUB/SUBRM.TXT
-    # gone + SHSUB/SUBD2 (renamed dir) present, and greps the `cat` output.
-    sh_exec("mkdir /mnt/fat/SHSUB", 20);
-    sh_exec("echo SUBDIR-FAT-OK > /mnt/fat/SHSUB/SUBKEEP.TXT", 47);
-    sh_exec("touch /mnt/fat/SHSUB/SUBRM.TXT", 30);
-    sh_exec("rm /mnt/fat/SHSUB/SUBRM.TXT", 27);
-    sh_exec("mkdir /mnt/fat/SHSUB/SUBD1", 26);
-    sh_exec("mv /mnt/fat/SHSUB/SUBD1 /mnt/fat/SHSUB/SUBD2", 44);
-    kprintln("vfsw: subdir paths over FAT done", 32);
-    sh_exec("cat /mnt/fat/SHSUB/SUBKEEP.TXT", 30);
-    # 1.41.7 — SYSCALL-driven FAT write: open(AO_WRONLY|CREAT|TRUNC) -> write ->
-    # close (flush) -> read back. Proves agnsh's write reaches FAT via the syscall
-    # ABI (vfs_sec_wfile + vfs_write_on), not only the shell verbs. User-range
-    # scratch from pmm_alloc_2mb (>=2 MB, passes is_user_range).
+    # 1.41.8 — the FAT write verbs are now driven by SYSCALLS (sc_touch/sc_echo/
+    # sc_mkdir/sc_rmdir → ksyscall), decoupling the selftest from the in-kernel
+    # shell write verbs (deleted by the shell-shrink). rm/mv/sync/cat stay shell
+    # verbs (recovery set). Same backend path + identical on-disk files, so
+    # fat-write-smoke's mdir/mtype/fsck checks are unchanged. One su scratch for
+    # the whole block (path@su+0, content@su+64, syswr readback@su+128).
     var su = pmm_alloc_2mb();
     if (su != 0) {
+        kprintln("vfsw: syscall touch+echo over FAT ->", 36);
+        sc_touch("/mnt/fat/SHTOUCH.TXT");
+        sc_echo("/mnt/fat/SHECHO.TXT", "SHELL-FAT-WROTE");
+        # `rm` (KEPT recovery verb) — dedicated target so SHTOUCH/SHECHO stay valid.
+        sc_touch("/mnt/fat/SHRMTGT.TXT");
+        sh_exec("rm /mnt/fat/SHRMTGT.TXT", 23);
+        # mkdir/rmdir over FAT. SHKEEP kept (navigable dir); SHRMD created+removed.
+        sc_mkdir("/mnt/fat/SHKEEP");
+        sc_mkdir("/mnt/fat/SHRMD");
+        sc_rmdir("/mnt/fat/SHRMD");
+        # mv (KEPT) + sync (KEPT). SHMVA→SHMVB; smoke checks B present, A gone.
+        sc_touch("/mnt/fat/SHMVA");
+        sh_exec("mv /mnt/fat/SHMVA /mnt/fat/SHMVB", 32);
+        sh_exec("sync", 4);
+        # Subdirectory paths under the FAT mount (fatfs_resolve_parent end-to-end).
+        sc_mkdir("/mnt/fat/SHSUB");
+        sc_echo("/mnt/fat/SHSUB/SUBKEEP.TXT", "SUBDIR-FAT-OK");
+        sc_touch("/mnt/fat/SHSUB/SUBRM.TXT");
+        sh_exec("rm /mnt/fat/SHSUB/SUBRM.TXT", 27);
+        sc_mkdir("/mnt/fat/SHSUB/SUBD1");
+        sh_exec("mv /mnt/fat/SHSUB/SUBD1 /mnt/fat/SHSUB/SUBD2", 44);
+        kprintln("vfsw: subdir paths over FAT done", 32);
+        sh_exec("cat /mnt/fat/SHSUB/SUBKEEP.TXT", 30);
+        # 1.41.7 — SYSCALL-driven FAT write+readback (shares the su scratch).
         memcpy(su + 0,  "/mnt/fat/SYSWR.TXT", 18);
         memcpy(su + 64, "SYSCALL-FAT-WR", 14);
         var swfd = ksyscall(7, su + 0, 18, 0x301);          # AO_WRONLY|AO_CREAT|AO_TRUNC
@@ -1035,8 +1085,8 @@ if (exfat_active == 1) {
     # below and exfat-write-smoke.sh's fsck.exfat -n are unchanged.
     kprintln("vfsw: shell touch+echo over exFAT ->", 36);
     sh_cwd_init();
-    sh_exec("touch /mnt/exfat/SHTOUCH.TXT", 28);
-    sh_exec("echo SHELL-EXFAT-WR > /mnt/exfat/SHECHO.TXT", 43);
+    sc_touch("/mnt/exfat/SHTOUCH.TXT");
+    sc_echo("/mnt/exfat/SHECHO.TXT", "SHELL-EXFAT-WR");
     var sht_res[24];
     if (exfat_find("SHTOUCH.TXT", 11, &sht_res) == 1) { kprintln("exfatw: shell touch find-back OK", 32); }
     else { kprintln("exfatw: shell touch find-back FAIL", 34); }
@@ -1065,7 +1115,7 @@ if (exfat_active == 1) {
     # shell `rm` over exFAT (sh_cmd_rm -> FS_EXFAT -> vfs_delete_on ->
     # exfat_delete). Create a dedicated target, rm it, confirm in-kernel it's
     # gone; exfat-write-smoke.sh also fsck-checks.
-    sh_exec("touch /mnt/exfat/SHRMTGT.TXT", 28);
+    sc_touch("/mnt/exfat/SHRMTGT.TXT");
     sh_exec("rm /mnt/exfat/SHRMTGT.TXT", 25);
     var shrm_res[24];
     if (exfat_find("SHRMTGT.TXT", 11, &shrm_res) == 1) { kprintln("exfatw: shell rm still-present FAIL", 35); }
@@ -1074,19 +1124,19 @@ if (exfat_active == 1) {
     # vfs_mkdir_on/vfs_rmdir_on -> exfat_mkdir/exfat_rmdir).
     # SHEXDIR kept (find-back confirms the dir-set); SHEXRMD created then
     # removed (find-miss confirms). exfat-write-smoke.sh also fsck-checks.
-    sh_exec("mkdir /mnt/exfat/SHEXDIR", 24);
+    sc_mkdir("/mnt/exfat/SHEXDIR");
     var shmd_res[24];
     if (exfat_find("SHEXDIR", 7, &shmd_res) == 1) { kprintln("exfatw: shell mkdir find-back OK", 32); }
     else { kprintln("exfatw: shell mkdir find-back FAIL", 34); }
-    sh_exec("mkdir /mnt/exfat/SHEXRMD", 24);
-    sh_exec("rmdir /mnt/exfat/SHEXRMD", 24);
+    sc_mkdir("/mnt/exfat/SHEXRMD");
+    sc_rmdir("/mnt/exfat/SHEXRMD");
     var shrd_res[24];
     if (exfat_find("SHEXRMD", 7, &shrd_res) == 1) { kprintln("exfatw: shell rmdir still-present FAIL", 38); }
     else { kprintln("exfatw: shell rmdir gone OK", 27); }
     # shell mv (rename) + sync over exFAT (sh_cmd_mv -> FS_EXFAT -> vfs_rename_on
     # -> exfat_rename re-emit-at-same-clusters). SHMVA→SHMVB; in-kernel: dst
     # present + src gone. exfat-write-smoke.sh also fsck-checks.
-    sh_exec("touch /mnt/exfat/SHMVA", 22);
+    sc_touch("/mnt/exfat/SHMVA");
     sh_exec("mv /mnt/exfat/SHMVA /mnt/exfat/SHMVB", 36);
     var shmv_b[24];
     var shmv_a[24];
@@ -1100,10 +1150,10 @@ if (exfat_active == 1) {
     # exfat_resolve_parent + the *_in_dir finders + emit_set_in. Validated
     # in-kernel (find-back inside SHEXDIR's cluster) + via the `cat` output
     # ("SUBDIR-EXFAT-OK") in the boot log; exfat-write-smoke.sh fsck-checks.
-    sh_exec("echo SUBDIR-EXFAT-OK > /mnt/exfat/SHEXDIR/SUBKEEP.TXT", 53);
-    sh_exec("touch /mnt/exfat/SHEXDIR/SUBRM.TXT", 34);
+    sc_echo("/mnt/exfat/SHEXDIR/SUBKEEP.TXT", "SUBDIR-EXFAT-OK");
+    sc_touch("/mnt/exfat/SHEXDIR/SUBRM.TXT");
     sh_exec("rm /mnt/exfat/SHEXDIR/SUBRM.TXT", 31);
-    sh_exec("mkdir /mnt/exfat/SHEXDIR/SUBD1", 30);
+    sc_mkdir("/mnt/exfat/SHEXDIR/SUBD1");
     sh_exec("mv /mnt/exfat/SHEXDIR/SUBD1 /mnt/exfat/SHEXDIR/SUBD2", 52);
     # 1.41.7 — SYSCALL-driven exFAT write (same VFS_SEC_WFILE path → vfs_write_on
     # → exfat_write_file). Proves agnsh's write reaches exFAT via the syscall ABI.
@@ -1175,7 +1225,19 @@ if (exfat_active == 1) {
 # discipline as AHCI_RW_DEMO / MSC_RW_DEMO.
 #ifdef EXT2_WRITE_SELFTEST
 ext2_write_selftest();
-sh_write_selftest();
+# 1.41.8 — the ext2 shell-write check (was sh_write_selftest, which drove the
+# now-deleted verbs) is syscall-driven. ext2 write is also covered by
+# ext2_write_selftest + fssys; this keeps ext2-write-smoke's shtest: marker +
+# /shdir/keep.txt content + /shtmp-absent disk checks valid. cat/rm are KEPT
+# recovery verbs; mkdir/echo>/touch route via the syscall helpers (→ ext2).
+kprintln("shtest: begin", 13);
+sc_mkdir("/shdir");
+sc_echo("/shdir/keep.txt", "SHELL-WROTE-IT");
+kprint("shtest cat: ", 12);
+sh_exec("cat /shdir/keep.txt", 19);
+sc_touch("/shtmp");
+sh_exec("rm /shtmp", 9);
+kprintln("shtest: end", 11);
 #endif
 
 # 1.40.2 — exec-from-disk self-test (compile-gated, EXEC_SELFTEST=1). Builds a

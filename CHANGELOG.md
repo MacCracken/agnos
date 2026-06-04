@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.8] — 2026-06-04 (**Decouple the FS-write test harness from the in-kernel shell verbs.** The migrate half of the shell-shrink, done first for safety (migrate-then-delete). The FAT/exFAT/ext2 write **selftests** drove the shell's write verbs via `sh_exec("touch /mnt/fat/…")`, so those verbs couldn't be deleted without breaking the smokes. They now drive the write path via **syscalls** — the same path agnsh uses — so the verbs are undriven by any test and 1.41.9 can delete them with zero coverage loss. The smokes pass **unchanged** (same backend → identical on-disk files); sweep 7/7. Planned by a multi-agent map + adversarial completeness spec, which caught — and which I then re-derived past — an off-by-one path length the spec text itself miscounted.)
+
+### Changed
+
+- **FAT/exFAT/ext2 write selftests → syscall-driven (`core/main.cyr`).** New ungated helpers `sc_touch`/`sc_echo`/`sc_mkdir`/`sc_rmdir` issue the real syscalls (`open(AO_CREAT)` / `open(AO_WRONLY|CREAT|TRUNC)`+`write` / `ksyscall(9)` / `ksyscall(10)`) against a self-allocated `pmm_alloc_2mb` user-range scratch, with `strlen`-computed path lengths (no hardcoded-length bugs — the failure mode the planning spec warned about and itself tripped on). The FATFS_WRITE / EXFAT_WRITE selftest drives for `touch`/`echo>`/`mkdir`/`rmdir` now call these helpers; `rm`/`mv`/`sync`/`cat` stay as `sh_exec` (they remain recovery-shell verbs). The exFAT `exfat_find` find-back checks + `exfatw:` markers are unchanged (the smoke greps them).
+- **`sh_write_selftest` retired (`core/main.cyr` call site).** The ext2 shell-verb write self-test (redundant with `ext2_write_selftest` + `fssys`) is replaced by a syscall-driven block producing the same `/shdir/keep.txt` (content `SHELL-WROTE-IT`) + `/shtmp`-create-then-`rm`, so `ext2-write-smoke`'s `shtest:` marker + disk-state checks stay valid. The `sh_write_selftest` function in `shell.cyr` is now dead (deleted with the verbs in 1.41.9).
+
+### Validated
+
+- `scripts/sweep.sh` **7/7** — FAT write, exFAT write, and ext2 W1-W5 smokes all pass with the syscall-driven drives (identical on-disk files: SHTOUCH/SHECHO/SHKEEP/SHRMD/SHMV*/SHSUB on FAT, the `exfatw:` find-backs on exFAT, `/shdir/keep.txt` + `/shtmp`-absent on ext2). No smoke-script changes were needed.
+
+### Notes
+
+- The in-kernel shell still has its full verb set this cut — **nothing is removed yet**. 1.41.9 deletes the now-undriven non-recovery verbs (`touch`/`echo>`/`mkdir`/`rmdir`/`ln`/`bench`/`ps`/`free`/`jbd2` + `bench_report` + the dead `sh_write_selftest`), shrinking the shell to its recovery set (`help`/`cd`/`pwd`/`ls`/`cat`/`run`/`mv`/`rm`/`sync`/`reboot` + non-write verbs).
+
+
 ## [1.41.7] — 2026-06-04 (**FAT/exFAT content-write via the syscall ABI.** Surfaced while planning the shell-shrink (1.41.8): `vfs_write` — the `write(fd)` syscall — handled only `VFS_EXT2_FILE`/pipe/device, so FAT/exFAT *content*-write was reachable **only** from the in-kernel shell's `echo>` (`vfs_write_secondary`). That meant agnsh couldn't write a data partition, and the FAT/exFAT write tests were shell-coupled — which would have stranded the capability when the shell verbs are deleted. So this lands first: a real write path so the shrink is clean. New `VFS_SEC_WFILE` write-fd — `open(7)` with write-access on a FAT/exFAT mount returns a fd that buffers content and flushes the whole file to the backend on close. New syscall-driven `syswr:` selftests write+read-back real content on **both** FAT and exFAT disks. Validated: `sweep.sh` 7/7 (FAT + exFAT write smokes now gate `syswr:`), `fssys`/`shsys` PASS, `agnsh-smoke` PASS, `check.sh` 11/11.)
 
 ### Added
