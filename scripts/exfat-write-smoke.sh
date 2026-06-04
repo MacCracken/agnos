@@ -224,6 +224,11 @@ strings "$LOG" | grep -q "SUBDIR-EXFAT-OK" \
 strings "$LOG" | grep -q "^vfsrf: exFAT whole-file read past 4KB OK" \
     && echo "  PASS: 1.40.1 vfs_read_file whole-file read past 4 KB cap (exFAT)" \
     || { echo "  FAIL: 1.40.1 vfs_read_file over exFAT (no 'whole-file read past 4KB OK')"; rc=1; }
+# 1.41.7: syscall write path over exFAT — open(AO_WRONLY|CREAT|TRUNC)+write+close
+# (VFS_SEC_WFILE -> vfs_write_on -> exfat_write_file) then read-back.
+strings "$LOG" | grep -q "^syswr: exFAT write+readback OK" \
+    && echo "  PASS: 1.41.7 syscall write+read-back over exFAT (open/write/close ABI)" \
+    || { echo "  FAIL: 1.41.7 syscall exFAT write (no 'syswr: exFAT write+readback OK')"; rc=1; }
 # fsck must report clean AND see at least the one created file.
 if echo "$FSCK_OUT" | grep -qi "clean"; then
     if echo "$FSCK_OUT" | grep -qiE "files? (1|[1-9][0-9]*)"; then

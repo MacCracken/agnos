@@ -259,7 +259,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (be7 == FS_FAT || be7 == FS_EXFAT) {
             var roff = arg1 + vfs_mnt_reloff;
             var rlen = arg2 - vfs_mnt_reloff;
-            if ((arg3 & 0x100) != 0) { vfs_create_on(be7, roff, rlen); }
+            if ((arg3 & 0x100) != 0) { vfs_create_on(be7, roff, rlen); }   # AO_CREAT
+            # 1.41.7: write-access (AO_WRONLY/AO_RDWR, low 2 bits) → a write-back
+            # fd that buffers content + flushes the whole file via vfs_write_on at
+            # close, so agnsh can write a FAT/exFAT data partition. Else a read
+            # memfile. AO_TRUNC is implicit (whole-file replace); AO_APPEND TODO.
+            if ((arg3 & 0x3) != 0) { return vfs_sec_wfile_open(be7, roff, rlen); }
             return vfs_open_on(be7, roff, rlen);
         }
         # bare-name / unmounted fallback (legacy initrd)

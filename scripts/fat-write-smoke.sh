@@ -367,6 +367,13 @@ if grep -q "^vfsrf: FAT whole-file read past 4KB OK" "$LOG" 2>/dev/null; then
 else
     echo "  FAIL: 1.40.1 vfs_read_file over FAT (no 'whole-file read past 4KB OK')"; rc=1
 fi
+# 1.41.7: syscall write path over FAT — open(AO_WRONLY|CREAT|TRUNC)+write+close
+# (VFS_SEC_WFILE -> vfs_write_on) then read-back. agnsh writes FAT via syscalls.
+if grep -q "^syswr: FAT write+readback OK" "$LOG" 2>/dev/null; then
+    echo "  PASS: 1.41.7 syscall write+read-back over FAT (open/write/close ABI)"
+else
+    echo "  FAIL: 1.41.7 syscall FAT write (no 'syswr: FAT write+readback OK')"; rc=1
+fi
 
 echo ""
 echo "=========================================="

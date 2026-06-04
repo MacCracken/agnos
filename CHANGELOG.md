@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.7] — 2026-06-04 (**FAT/exFAT content-write via the syscall ABI.** Surfaced while planning the shell-shrink (1.41.8): `vfs_write` — the `write(fd)` syscall — handled only `VFS_EXT2_FILE`/pipe/device, so FAT/exFAT *content*-write was reachable **only** from the in-kernel shell's `echo>` (`vfs_write_secondary`). That meant agnsh couldn't write a data partition, and the FAT/exFAT write tests were shell-coupled — which would have stranded the capability when the shell verbs are deleted. So this lands first: a real write path so the shrink is clean. New `VFS_SEC_WFILE` write-fd — `open(7)` with write-access on a FAT/exFAT mount returns a fd that buffers content and flushes the whole file to the backend on close. New syscall-driven `syswr:` selftests write+read-back real content on **both** FAT and exFAT disks. Validated: `sweep.sh` 7/7 (FAT + exFAT write smokes now gate `syswr:`), `fssys`/`shsys` PASS, `agnsh-smoke` PASS, `check.sh` 11/11.)
+
+### Added
+
+- **`VFS_SEC_WFILE` — FAT/exFAT write-back fd (`core/vfs.cyr`, `core/syscall.cyr`).** `open(7)` with an access mode of `AO_WRONLY`/`AO_RDWR` (the low 2 ABI flag bits) on a path that mount-routes to FAT/exFAT now returns a write-back fd instead of the read-only memfile. `vfs_write` appends into the fd's buffer; `vfs_close` flushes the whole file via `vfs_write_on` (→ `fatfs_write_file`/`exfat_write_file`). `AO_CREAT` still creates first; `AO_TRUNC` is implicit (whole-file replace). This is the first time a userland program can write a FAT/exFAT (non-ext2) filesystem.
+- **Static write-fd pool (`sec_wfile_buf` / `sec_wfile_inuse`).** Backing store is 4 reusable 4360-byte blocks **freed on close**, not `kmalloc` — the kernel heap is alloc-only (no `kfree`), so a per-fd `kmalloc` both leaks *and* exhausts under repeated writes (this is exactly what the first cut hit: an 8 KB `kmalloc` failing late in the selftest). 4 concurrent write fds suits the single-foreground run-to-completion model.
+- **Syscall-driven FAT + exFAT write selftests (`syswr:`, `core/main.cyr`).** Drive `open(AO_WRONLY|CREAT|TRUNC)` → `write` → `close` → read-back through `ksyscall` on the `/mnt/fat` and `/mnt/exfat` mounts; the FAT case lands `SYSCALL-FAT-WR` (14 B) and exFAT `SYSCALL-EXFAT-WR` (16 B) on real disks. Gated in `fat-write-smoke.sh` + `exfat-write-smoke.sh`.
+
+### Notes
+
+- **Limits (follow-ons):** the write fd is whole-file with a **4 KB content cap** per fd; larger files (streaming writes) and `AO_APPEND` (load-existing-then-append) are deferred. A freeing allocator would let the pool grow / the buffer be `kmalloc`'d without leaking.
+- This unblocks the shell-shrink (1.41.8): FAT/exFAT write is now syscall-reachable and its tests are syscall-driven, so the in-kernel shell's write verbs can be deleted without losing coverage.
+
+
 ## [1.41.6] — 2026-06-04 (**Refactor + exec-hardening — the deferred half of the 1.41.5 sweep.** 1.41.5 shipped the hardening/security but punted the *refactoring* and one medium exec-path fix; this cut finishes them as a dedicated, independently-validated pass rather than letting them ride the far-off arc-close. First a **safety net**: a new `SYSCALL_HARDEN_SELFTEST` (`shsys: ALL PASS`) that regression-locks every 1.41.5 security fix AND covers the epoll/timerfd/signalfd region, which had no other smoke — so the dispatcher refactors run against a real test. Then the deferred items, each behavior-preserving and verified by `shsys` + `fssys` + `sweep` + `agnsh-smoke`. The risky #23 single-tail canary rewrite stays **rejected** (documented) — it's a non-vuln cosmetic that would mean rewriting ~25 early-returns in the security-critical dispatcher.)
 
 ### Added

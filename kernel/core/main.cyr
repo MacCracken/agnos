@@ -727,6 +727,35 @@ if (fatfs_active == 1) {
     sh_exec("mv /mnt/fat/SHSUB/SUBD1 /mnt/fat/SHSUB/SUBD2", 44);
     kprintln("vfsw: subdir paths over FAT done", 32);
     sh_exec("cat /mnt/fat/SHSUB/SUBKEEP.TXT", 30);
+    # 1.41.7 — SYSCALL-driven FAT write: open(AO_WRONLY|CREAT|TRUNC) -> write ->
+    # close (flush) -> read back. Proves agnsh's write reaches FAT via the syscall
+    # ABI (vfs_sec_wfile + vfs_write_on), not only the shell verbs. User-range
+    # scratch from pmm_alloc_2mb (>=2 MB, passes is_user_range).
+    var su = pmm_alloc_2mb();
+    if (su != 0) {
+        memcpy(su + 0,  "/mnt/fat/SYSWR.TXT", 18);
+        memcpy(su + 64, "SYSCALL-FAT-WR", 14);
+        var swfd = ksyscall(7, su + 0, 18, 0x301);          # AO_WRONLY|AO_CREAT|AO_TRUNC
+        if (swfd < 0) { kprintln("syswr: open-w FAIL", 18); }
+        else {
+            var swn = ksyscall(1, swfd, su + 64, 14);        # write
+            ksyscall(6, swfd, 0, 0);                          # close -> flush whole file
+            if (swn != 14) { kprintln("syswr: write-len FAIL", 21); }
+            else {
+                var srfd = ksyscall(7, su + 0, 18, 0);      # AO_RDONLY read-back
+                if (srfd < 0) { kprintln("syswr: open-r FAIL", 18); }
+                else {
+                    var srn = ksyscall(5, srfd, su + 128, 64);
+                    ksyscall(6, srfd, 0, 0);
+                    if (srn != 14) { kprintln("syswr: read-len FAIL", 20); }
+                    elif (load8(su + 128) != 83) { kprintln("syswr: content-S FAIL", 21); }
+                    elif (load8(su + 128 + 13) != 82) { kprintln("syswr: content-R FAIL", 21); }
+                    else { kprintln("syswr: FAT write+readback OK", 28); }
+                }
+            }
+        }
+        pmm_free_2mb(su);
+    }
     # 1.40.1 exec-from-disk bite 1: whole-file read past the 4 KB memfile cap
     # (vfs_read_file). Write a 6000-byte pattern file, read it back fully into
     # an 8 KB buffer, verify length + bytes past offset 4096 (the old cap).
@@ -1076,6 +1105,33 @@ if (exfat_active == 1) {
     sh_exec("rm /mnt/exfat/SHEXDIR/SUBRM.TXT", 31);
     sh_exec("mkdir /mnt/exfat/SHEXDIR/SUBD1", 30);
     sh_exec("mv /mnt/exfat/SHEXDIR/SUBD1 /mnt/exfat/SHEXDIR/SUBD2", 52);
+    # 1.41.7 — SYSCALL-driven exFAT write (same VFS_SEC_WFILE path → vfs_write_on
+    # → exfat_write_file). Proves agnsh's write reaches exFAT via the syscall ABI.
+    var xu = pmm_alloc_2mb();
+    if (xu != 0) {
+        memcpy(xu + 0,  "/mnt/exfat/SYSWR.TXT", 20);
+        memcpy(xu + 64, "SYSCALL-EXFAT-WR", 16);
+        var xwfd = ksyscall(7, xu + 0, 20, 0x301);          # AO_WRONLY|AO_CREAT|AO_TRUNC
+        if (xwfd < 0) { kprintln("syswr: exFAT open-w FAIL", 24); }
+        else {
+            var xwn = ksyscall(1, xwfd, xu + 64, 16);
+            ksyscall(6, xwfd, 0, 0);                          # close -> flush
+            if (xwn != 16) { kprintln("syswr: exFAT write-len FAIL", 27); }
+            else {
+                var xrfd = ksyscall(7, xu + 0, 20, 0);      # read-back
+                if (xrfd < 0) { kprintln("syswr: exFAT open-r FAIL", 24); }
+                else {
+                    var xrn = ksyscall(5, xrfd, xu + 128, 64);
+                    ksyscall(6, xrfd, 0, 0);
+                    if (xrn != 16) { kprintln("syswr: exFAT read-len FAIL", 26); }
+                    elif (load8(xu + 128) != 83) { kprintln("syswr: exFAT content FAIL", 25); }
+                    elif (load8(xu + 128 + 15) != 82) { kprintln("syswr: exFAT content FAIL", 25); }
+                    else { kprintln("syswr: exFAT write+readback OK", 30); }
+                }
+            }
+        }
+        pmm_free_2mb(xu);
+    }
     var shx_dir[24];
     if (exfat_find("SHEXDIR", 7, &shx_dir) == 1) {
         var shx_clus = load64(&shx_dir);

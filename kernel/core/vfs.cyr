@@ -27,6 +27,88 @@ enum VfsType {
     VFS_PIPE      = 6;
     VFS_EXT2_FILE = 7;   # payload[0]=pos, [1]=size, [2]=inode_num
     VFS_EXT2_DIR  = 8;   # payload[0]=read offset, [2]=dir inode (getdents, 1.41.3)
+    VFS_SEC_WFILE = 9;   # FAT/exFAT write-back fd (1.41.7): payload[0]=content
+    #   pos, [1]=backend, [2]=static-pool block {namelen,
+    #   name[256], content[4096]}; flushed whole-file via
+    #   vfs_write_on at close. Mirrors the shell echo> write.
+}
+
+# 1.41.7 — FAT/exFAT write-back fd. The secondary-FS backends write WHOLE files
+# (fatfs_write_file/exfat_write_file replace content), and the syscall write(fd)
+# path (vfs_write) had no FAT/exFAT arm — so agnsh could not write a data
+# partition. This fd buffers writes and flushes the whole file on close.
+#
+# Backing store is a STATIC POOL, not kmalloc: the kernel heap is alloc-only (no
+# kfree), so per-fd kmalloc both leaks AND exhausts under repeated writes. The
+# pool gives 4 reusable 4360-byte blocks freed on close (free-on-close marker in
+# sec_wfile_inuse). 4 concurrent write fds is ample for the single-foreground
+# run-to-completion model. Block layout (inlined offsets — no nonzero gvar-init
+# reliance): [0..7]=namelen, [8..263]=mount-relative name (vfs_sec_name_ok bounds
+# it <=255), [264..]=content (up to 4096 B). >4 KB writes (streaming) + AO_APPEND
+# are follow-ons (this is whole-file/truncate write).
+var sec_wfile_buf[2180];     # 4 blocks × 4360 bytes (module-scope = u64 units)
+var sec_wfile_inuse[4];      # per-block in-use flag (0 free / 1 used)
+
+# Claim a free pool block; returns its index or -1 if all 4 are busy.
+fn vfs_sec_wfile_alloc_slot() {
+    var i = 0;
+    while (i < 4) {
+        if (load64(&sec_wfile_inuse + i * 8) == 0) {
+            store64(&sec_wfile_inuse + i * 8, 1);
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# Open a FAT/exFAT file for writing. `name`/`namelen` is the mount-relative path
+# (the caller already ran vfs_create_on for AO_CREAT). Returns a VFS_SEC_WFILE
+# fd, or -1.
+fn vfs_sec_wfile_open(be, name, namelen) {
+    if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
+    var slot = vfs_sec_wfile_alloc_slot();
+    if (slot < 0) { return 0 - 1; }          # all 4 write-fd blocks busy
+    var sfd = vfs_alloc();
+    if (sfd < 0) { store64(&sec_wfile_inuse + slot * 8, 0); return 0 - 1; }   # release
+    var blk = &sec_wfile_buf + slot * 4360;
+    store64(blk, namelen);
+    var i = 0;
+    while (i < namelen) { store8(blk + 8 + i, load8(name + i)); i = i + 1; }
+    var base = &vfs_table + sfd * 32;
+    ktag_set(base, VFS_SEC_WFILE);
+    kpayload_set(base, 0, 0);                # content pos
+    kpayload_set(base, 1, be);               # backend
+    kpayload_set(base, 2, blk);              # name+content block
+    return sfd;
+}
+
+# Append `count` bytes from `buf` (a validated user pointer) to a VFS_SEC_WFILE's
+# content buffer. Bounded by the 4096-byte content cap. Returns bytes accepted.
+fn vfs_sec_wfile_write(base, buf, count) {
+    var pos = kpayload(base, 0);
+    var room = 4096 - pos;
+    if (room <= 0) { return 0; }
+    var n = count;
+    if (n > room) { n = room; }
+    var blk = kpayload(base, 2);
+    var dst = blk + 264 + pos;
+    memcpy(dst, buf, n);
+    kpayload_set(base, 0, pos + n);
+    return n;
+}
+
+# Flush a VFS_SEC_WFILE's buffered content to the backend file (whole-file write
+# via vfs_write_on) and release its pool block. Called from vfs_close.
+fn vfs_sec_wfile_flush(base) {
+    var blk = kpayload(base, 2);
+    var be  = kpayload(base, 1);
+    var pos = kpayload(base, 0);
+    var namelen = load64(blk);
+    var rc = vfs_write_on(be, blk + 8, namelen, blk + 264, pos);
+    var slot = (blk - &sec_wfile_buf) / 4360;     # release the pool block
+    if (slot >= 0) { if (slot < 4) { store64(&sec_wfile_inuse + slot * 8, 0); } }
+    return rc;
 }
 
 var vfs_table[1024];  # 32 entries x 32 bytes each
@@ -593,6 +675,11 @@ fn vfs_write(fd_idx, buf, count) {
         }
         return n;
     }
+    if (ftype == VFS_SEC_WFILE) {
+        # 1.41.7 — FAT/exFAT write-back fd: buffer the bytes; the whole file is
+        # flushed to the backend at close (vfs_sec_wfile_flush).
+        return vfs_sec_wfile_write(base, buf, count);
+    }
     return 0 - 1;
 }
 
@@ -627,9 +714,13 @@ fn vfs_create_pipe(fds_ptr) {
 fn vfs_close(fd_idx) {
     if (fd_idx < 0) { return 0 - 1; }
     if (fd_idx >= 32) { return 0 - 1; }
+    var base = &vfs_table + fd_idx * 32;
+    # 1.41.7: a FAT/exFAT write-back fd flushes its buffered content (whole-file
+    # via vfs_write_on) to the backend before the slot is reclaimed.
+    if (ktag(base) == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
     # Zero the entire slot (tag → VFS_FREE, payload all 0) so reuse
     # via vfs_alloc finds a clean entry. ktag_clear zeroes the full
     # 32-byte slot.
-    ktag_clear(&vfs_table + fd_idx * 32, 32);
+    ktag_clear(base, 32);
     return 0;
 }
