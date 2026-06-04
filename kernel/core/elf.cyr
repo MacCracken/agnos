@@ -39,6 +39,30 @@ fn elf_load(elf_addr, elf_size) {
     if (phoff >= elf_size) { return 0 - 1; }
     if (phoff + phnum * phentsize > elf_size) { return 0 - 1; }
 
+    # 1.41.6 (#11): validate every PT_LOAD segment's bounds in a PRE-PASS, before
+    # allocating the address space. Previously these checks were interleaved with
+    # mapping (below, AFTER proc_create_address_space) — so a malformed segment
+    # leaked the new page tables + any pages already mapped. Rejecting up front
+    # means a bad ELF returns with ZERO allocations to leak. (The mapping loop
+    # keeps the same checks as defensive no-ops for valid input.)
+    for (var vphi = 0; vphi < phnum; vphi = vphi + 1) {
+        var vph = elf_addr + phoff + vphi * phentsize;
+        if (load32(vph) == 1) {
+            var v_offset = load64(vph + 8);
+            var v_vaddr  = load64(vph + 16);
+            var v_filesz = load64(vph + 32);
+            var v_memsz  = load64(vph + 40);
+            if (v_offset >= elf_size) { return 0 - 1; }
+            if (v_filesz > elf_size) { return 0 - 1; }
+            if (v_offset + v_filesz > elf_size) { return 0 - 1; }
+            if (v_memsz < v_filesz) { return 0 - 1; }
+            if (v_vaddr + v_memsz < v_vaddr) { return 0 - 1; }
+            if (v_vaddr < 0x200000) { return 0 - 1; }
+            if (v_memsz > 0x2000000) { return 0 - 1; }
+            if (v_vaddr + v_memsz > 0x10000000) { return 0 - 1; }
+        }
+    }
+
     # Create per-process address space
     var new_cr3 = proc_create_address_space();
     if (new_cr3 == 0) { return 0 - 1; }
@@ -164,6 +188,27 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     # The phdr table must lie within the bytes we staged into the 4 KB buffer.
     if (phoff >= hgot) { return 0 - 1; }
     if (phoff + phnum * phentsize > hgot) { return 0 - 1; }
+
+    # 1.41.6 (#11): pre-pass-validate every PT_LOAD segment BEFORE allocating the
+    # address space, so a malformed on-disk ELF is rejected with zero allocations
+    # to leak (the per-segment checks below run AFTER proc_create_address_space).
+    for (var vphi = 0; vphi < phnum; vphi = vphi + 1) {
+        var vph = hdr + phoff + vphi * phentsize;
+        if (load32(vph) == 1) {
+            var v_offset = load64(vph + 8);
+            var v_vaddr  = load64(vph + 16);
+            var v_filesz = load64(vph + 32);
+            var v_memsz  = load64(vph + 40);
+            if (v_offset >= fsize) { return 0 - 1; }
+            if (v_filesz > fsize) { return 0 - 1; }
+            if (v_offset + v_filesz > fsize) { return 0 - 1; }
+            if (v_memsz < v_filesz) { return 0 - 1; }
+            if (v_vaddr + v_memsz < v_vaddr) { return 0 - 1; }
+            if (v_vaddr < 0x200000) { return 0 - 1; }
+            if (v_memsz > 0x2000000) { return 0 - 1; }
+            if (v_vaddr + v_memsz > 0x10000000) { return 0 - 1; }
+        }
+    }
 
     var new_cr3 = proc_create_address_space();
     if (new_cr3 == 0) { return 0 - 1; }

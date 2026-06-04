@@ -167,6 +167,7 @@ else
         [ -n "$EXT2_EXTENT_WRITE_SELFTEST" ] && echo '#define EXT2_EXTENT_WRITE_SELFTEST'
         [ -n "$EXEC_SELFTEST" ]      && echo '#define EXEC_SELFTEST'
         [ -n "$FS_SYSCALL_SELFTEST" ] && echo '#define FS_SYSCALL_SELFTEST'
+        [ -n "$SYSCALL_HARDEN_SELFTEST" ] && echo '#define SYSCALL_HARDEN_SELFTEST'
         [ -n "$FATFS_SELFTEST" ] && echo '#define FATFS_SELFTEST'
         [ -n "$FATFS_WRITE_SELFTEST" ] && echo '#define FATFS_WRITE_SELFTEST'
         [ -n "$EXFAT_SELFTEST" ] && echo '#define EXFAT_SELFTEST'

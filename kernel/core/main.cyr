@@ -1347,6 +1347,76 @@ fn fs_syscall_selftest() {
 fs_syscall_selftest();
 #endif
 
+# 1.41.6 — syscall-ingress HARDENING self-test (compile-gated,
+# SYSCALL_HARDEN_SELFTEST=1). Regression-locks the 1.41.5 security fixes AND
+# serves as the safety net for the 1.41.6 dispatcher refactors, because the
+# epoll/timerfd/signalfd syscalls have NO other smoke coverage. Drives the
+# security-REJECTION paths (must return -1) + the happy paths through ksyscall()
+# with a real >=2 MB user-range scratch. Needs a writable ext2 (to mint a
+# non-epoll fd for the type-confusion checks). "rej" = the call MUST be refused.
+#ifdef SYSCALL_HARDEN_SELFTEST
+fn syscall_harden_selftest() {
+    if (ext2_active == 0)   { kprintln("shsys: no ext2 SKIP", 19); return 0; }
+    if (ext2_write_ok == 0) { kprintln("shsys: ro ext2 SKIP", 19); return 0; }
+    var u = pmm_alloc_2mb();
+    if (u == 0) { kprintln("shsys: no scratch FAIL", 22); return 0 - 1; }
+    var ok = 1;
+
+    # --- is_user_range / is_user_ptr 1 GB ceiling (#4) ---
+    if (is_user_range(u, 16) != 1)          { kprintln("shsys: range valid FAIL", 23); ok = 0; }
+    if (is_user_range(0x40000000, 1) != 0)  { kprintln("shsys: range ceiling FAIL", 25); ok = 0; }
+    if (is_user_range(0x100000, 1) != 0)    { kprintln("shsys: range low FAIL", 21); ok = 0; }
+    if (is_user_ptr(0x40000000) != 0)       { kprintln("shsys: ptr ceiling FAIL", 23); ok = 0; }
+
+    # --- mint a NON-epoll fd to abuse: open a real file ---
+    memcpy(u + 0, "/shs", 4);
+    var ffd = ksyscall(7, u + 0, 4, 0x100);    # open("/shs", AO_CREAT) -> VFS_EXT2_FILE
+    if (ffd < 0) { kprintln("shsys: setup open FAIL", 22); ok = 0; }
+
+    # --- epoll fd type-confusion rejection (#1/#2/#3/#8/#10) ---
+    var efd = ksyscall(19, 0, 0, 0);           # epoll_create -> VFS_EPOLL
+    if (efd < 0) { kprintln("shsys: epoll_create FAIL", 24); ok = 0; }
+    # epoll_ctl on a NON-epoll fd must be refused
+    if (ffd >= 0) { if (ksyscall(20, ffd, 1, efd) == 0) { kprintln("shsys: epoll_ctl typeconf rej FAIL", 33); ok = 0; } }
+    # epoll_ctl on the real epoll fd with an in-range watch fd must succeed
+    if (efd >= 0) { if (ksyscall(20, efd, 1, efd) != 0) { kprintln("shsys: epoll_ctl valid FAIL", 27); ok = 0; } }
+    # epoll_ctl with an out-of-range watch fd must be refused (vs vfs_table OOB)
+    if (efd >= 0) { if (ksyscall(20, efd, 1, 9999) == 0) { kprintln("shsys: epoll wfd-bound rej FAIL", 30); ok = 0; } }
+    # epoll_wait on a non-epoll fd must be refused
+    if (ffd >= 0) { if (ksyscall(21, ffd, u + 256, 4) != (0 - 1)) { kprintln("shsys: epoll_wait typeconf rej FAIL", 35); ok = 0; } }
+
+    # --- timerfd fd type-confusion rejection (#18) ---
+    var tfd = ksyscall(22, 0, 0, 0);           # timerfd_create -> VFS_TIMERFD
+    if (tfd < 0) { kprintln("shsys: timerfd_create FAIL", 26); ok = 0; }
+    store64(u + 320, 0); store64(u + 336, 1);  # new_value: interval=0s, initial=1s
+    if (ffd >= 0) { if (ksyscall(23, ffd, 0, u + 320) == 0) { kprintln("shsys: timerfd typeconf rej FAIL", 32); ok = 0; } }
+    if (tfd >= 0) { if (ksyscall(23, tfd, 0, u + 320) != 0) { kprintln("shsys: timerfd valid FAIL", 25); ok = 0; } }
+
+    # --- signalfd happy path (mask range-validated, #5) ---
+    store64(u + 400, 6);                       # mask
+    var sfd = ksyscall(18, 0, u + 400, 0);
+    if (sfd < 0) { kprintln("shsys: signalfd FAIL", 20); ok = 0; }
+
+    # --- ext2 basename 255-cap (#6/#7): "/" + 256*'a' = 257 bytes, mkdir refused ---
+    store8(u + 1024, 47);                       # '/'
+    var bi = 0;
+    while (bi < 256) { store8(u + 1024 + 1 + bi, 97); bi = bi + 1; }   # 'a' * 256
+    if (ksyscall(9, u + 1024, 257) == 0) { kprintln("shsys: basename-cap rej FAIL", 28); ok = 0; }
+
+    # --- cleanup ---
+    if (sfd >= 0) { ksyscall(6, sfd, 0, 0); }
+    if (tfd >= 0) { ksyscall(6, tfd, 0, 0); }
+    if (efd >= 0) { ksyscall(6, efd, 0, 0); }
+    if (ffd >= 0) { ksyscall(6, ffd, 0, 0); ksyscall(30, u + 0, 4); }  # close + unlink /shs
+
+    pmm_free_2mb(u);
+    if (ok == 1) { kprintln("shsys: ALL PASS", 15); }
+    else { kprintln("shsys: FAIL", 11); }
+    return 0;
+}
+syscall_harden_selftest();
+#endif
+
 # 1.37.0 — ext4 extent-ALLOCATION self-test (compile-gated). Appends past EOF
 # of a seed EXTENTS_FL file to exercise ext2_extent_append_block. Gated by
 # scripts/ext-extent-smoke.sh (host e2fsck -fn clean + grow/byte verify).

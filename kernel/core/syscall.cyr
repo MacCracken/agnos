@@ -64,6 +64,16 @@ fn is_user_range(ptr, len) {
     return 1;
 }
 
+# 1.41.6 (#22): the path-argument preamble every mount-routed FS syscall shares —
+# a non-empty length AND a valid user range. Returns 1 if (ptr,len) is an
+# acceptable path argument, 0 otherwise. Pure factoring of the duplicated
+# `if (len < 1) ... if (is_user_range(ptr,len) == 0) ...` pair; callers keep
+# their own canary/return conventions on the reject.
+fn sc_path_ok(ptr, len) {
+    if (len < 1) { return 0; }
+    return is_user_range(ptr, len);
+}
+
 # Resume kernel execution after a user process exits, by performing
 # exec_and_wait's epilogue: ret_rsp is exec_and_wait's OWN rbp, so
 # `mov rsp, ret_rsp; pop rbp; ret` restores the caller's rbp and returns into
@@ -155,6 +165,15 @@ fn kbd_read_blocking(buf, count) {
 }
 
 fn ksyscall(num, arg1, arg2, arg3) {
+    # Stack-canary backstop: snapshot at entry, re-checked before returning on the
+    # syscalls that do the most pointer/buffer work (the 1.41.3 FS group + pipe/
+    # mmap/munmap). Coverage is deliberately NOT uniform across every branch
+    # (audit 1.41.6 #14/#23): ksyscall itself has no local array buffer for a
+    # smash to corrupt, so these checks are a backstop against a *callee* (ext2_*/
+    # elf_*) overrunning back into this frame — the leaf functions that own real
+    # buffers (e.g. elf_load) carry their own canary. A single-tail collapse was
+    # rejected: it would require rewriting ~25 early-returns in this security-
+    # critical dispatcher with no clean Cyrius idiom, for a non-vuln cosmetic gain.
     var canary = stack_canary_secret;
     if (num == 0) {
         # exit — halt current process, return to kernel if context saved
@@ -222,8 +241,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # Re-routes from initrd-only: ext2 / FAT / exFAT by mount, with initrd
         # as the bare-name fallback. AO_DIRECTORY(0x800)→dir-fd (getdents);
         # AO_CREAT(0x100) creates if absent; AO_TRUNC(0x200) zeroes existing.
-        if (arg2 < 1) { return 0 - 1; }
-        if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
+        if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
         var be7 = vfs_resolve_mount(arg1, arg2);
         if (be7 == FS_EXT2) {
             if ((arg3 & 0x800) != 0) { return ext2_open_dir(arg1, arg2); }
@@ -251,11 +269,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 8) { return arg1; }           # dup(fd) -> return same fd
     if (num == 9) {
         # mkdir(path=arg1, pathlen=arg2) — real, mount-routed (1.41.3).
-        if (arg2 < 1) { return 0 - 1; }
-        if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
+        if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
         var be9 = vfs_resolve_mount(arg1, arg2);
-        if (be9 == FS_FAT) { return vfs_mkdir_on(be9, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
-        if (be9 == FS_EXFAT) { return vfs_mkdir_on(be9, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
+        if (be9 == FS_FAT || be9 == FS_EXFAT) { return vfs_mkdir_on(be9, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
         if (be9 == FS_EXT2) {
             var par9 = vfs_ext2_parent(arg1, arg2);
             if (par9 <= 0) { return 0 - 1; }
@@ -266,11 +282,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 10) {
         # rmdir(path=arg1, pathlen=arg2) — real, mount-routed (1.41.3).
-        if (arg2 < 1) { return 0 - 1; }
-        if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
+        if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
         var be10 = vfs_resolve_mount(arg1, arg2);
-        if (be10 == FS_FAT) { return vfs_rmdir_on(be10, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
-        if (be10 == FS_EXFAT) { return vfs_rmdir_on(be10, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
+        if (be10 == FS_FAT || be10 == FS_EXFAT) { return vfs_rmdir_on(be10, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
         if (be10 == FS_EXT2) {
             var par10 = vfs_ext2_parent(arg1, arg2);
             if (par10 <= 0) { return 0 - 1; }
@@ -499,22 +513,6 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return sys_munmap(arg1, arg2);
     }
-    if (num == 30) {
-        # unlink(path=arg1, pathlen=arg2) — remove a file, mount-routed (1.41.3).
-        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
-        var be30 = vfs_resolve_mount(arg1, arg2);
-        if (be30 == FS_FAT) { stack_canary_check(canary); return vfs_delete_on(be30, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
-        if (be30 == FS_EXFAT) { stack_canary_check(canary); return vfs_delete_on(be30, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
-        if (be30 == FS_EXT2) {
-            var par30 = vfs_ext2_parent(arg1, arg2);
-            if (par30 <= 0) { stack_canary_check(canary); return 0 - 1; }
-            stack_canary_check(canary);
-            return ext2_unlink(par30, arg1 + vfs_base_off, vfs_base_len);
-        }
-        stack_canary_check(canary);
-        return 0 - 1;
-    }
     if (num == 29) {
         # getdents(dir_fd=arg1, buf=arg2, bufsize=arg3) — emit agnos dirent
         # records (§4.2) from a VFS_EXT2_DIR fd (open AO_DIRECTORY). Returns
@@ -530,29 +528,26 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return gn;
     }
-    if (num == 33) {
-        # stat(path=arg1, pathlen=arg2, statbuf=arg3) — fills the 48-byte agnos
-        # stat struct (§4.1). ext2 fully; FAT/exFAT degrade to -1 for now (O4's
-        # ino=0+size/type fill is a follow-on). (1.41.3)
-        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (is_user_range(arg3, 48) == 0) { stack_canary_check(canary); return 0 - 1; }
-        var be33 = vfs_resolve_mount(arg1, arg2);
-        if (be33 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
-        var sino = ext2_path_lookup(arg1, arg2);
-        if (sino <= 0) { stack_canary_check(canary); return 0 - 1; }
-        var sr = ext2_fill_stat(sino, arg3);
+    if (num == 30) {
+        # unlink(path=arg1, pathlen=arg2) — remove a file, mount-routed (1.41.3).
+        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var be30 = vfs_resolve_mount(arg1, arg2);
+        if (be30 == FS_FAT || be30 == FS_EXFAT) { stack_canary_check(canary); return vfs_delete_on(be30, arg1 + vfs_mnt_reloff, arg2 - vfs_mnt_reloff); }
+        if (be30 == FS_EXT2) {
+            var par30 = vfs_ext2_parent(arg1, arg2);
+            if (par30 <= 0) { stack_canary_check(canary); return 0 - 1; }
+            stack_canary_check(canary);
+            return ext2_unlink(par30, arg1 + vfs_base_off, vfs_base_len);
+        }
         stack_canary_check(canary);
-        return sr;
+        return 0 - 1;
     }
     if (num == 31) {
         # rename(old=arg1, oldlen=arg2, new=arg3, newlen=a4) — within one
         # filesystem (a4=r10 via ksyscall_a4, 1.41.3).
         var a4r = ksyscall_a4;
-        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (a4r < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (is_user_range(arg3, a4r) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (sc_path_ok(arg3, a4r) == 0) { stack_canary_check(canary); return 0 - 1; }
         var beo = vfs_resolve_mount(arg1, arg2);
         var ro = vfs_mnt_reloff;
         var ben = vfs_resolve_mount(arg3, a4r);
@@ -580,10 +575,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # hard link, ext2-only (a4=r10 via ksyscall_a4, 1.41.3). FAT/exFAT → -1
         # (O4: no inodes/hard links).
         var a4l = ksyscall_a4;
-        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (a4l < 1) { stack_canary_check(canary); return 0 - 1; }
-        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (is_user_range(arg3, a4l) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (sc_path_ok(arg3, a4l) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (vfs_resolve_mount(arg1, arg2) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
         if (vfs_resolve_mount(arg3, a4l) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
         var tino = ext2_path_lookup(arg1, arg2);
@@ -592,6 +585,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (ldp <= 0) { stack_canary_check(canary); return 0 - 1; }
         stack_canary_check(canary);
         return ext2_link(tino, ldp, arg3 + vfs_base_off, vfs_base_len);
+    }
+    if (num == 33) {
+        # stat(path=arg1, pathlen=arg2, statbuf=arg3) — fills the 48-byte agnos
+        # stat struct (§4.1). ext2 fully; FAT/exFAT degrade to -1 for now (O4's
+        # ino=0+size/type fill is a follow-on). (1.41.3)
+        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg3, 48) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var be33 = vfs_resolve_mount(arg1, arg2);
+        if (be33 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        var sino = ext2_path_lookup(arg1, arg2);
+        if (sino <= 0) { stack_canary_check(canary); return 0 - 1; }
+        var sr = ext2_fill_stat(sino, arg3);
+        stack_canary_check(canary);
+        return sr;
     }
     stack_canary_check(canary);
     return 0 - 1;
