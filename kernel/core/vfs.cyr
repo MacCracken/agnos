@@ -723,10 +723,16 @@ fn vfs_close(fd_idx) {
     var base = &vfs_table + fd_idx * 32;
     # 1.41.7: a FAT/exFAT write-back fd flushes its buffered content (whole-file
     # via vfs_write_on) to the backend before the slot is reclaimed.
-    if (ktag(base) == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
+    # 1.41.11 (audit #4): SURFACE the flush result. Previously vfs_close always
+    # returned 0, swallowing a failed backend write (ENOSPC / write-protected) so
+    # close() reported success while the data was silently dropped. Return the
+    # flush rc instead. The slot is STILL reclaimed below even on flush failure,
+    # and the success path is unchanged (vfs_write_on returns 0 on success).
+    var rc = 0;
+    if (ktag(base) == VFS_SEC_WFILE) { rc = vfs_sec_wfile_flush(base); }
     # Zero the entire slot (tag → VFS_FREE, payload all 0) so reuse
     # via vfs_alloc finds a clean entry. ktag_clear zeroes the full
     # 32-byte slot.
     ktag_clear(base, 32);
-    return 0;
+    return rc;
 }

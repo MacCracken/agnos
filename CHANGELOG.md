@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.11] — 2026-06-04 (**Clean + iron-burn prep — the 1.41.x shell-separation arc is software-complete.** The residual low finding from the 1.41.10 audit, plus staging the arc's first full hardware validation. agnsh is the interactive shell exec'd from disk in ring 3, the in-kernel shell is a recovery REPL, FAT/exFAT content-write reaches the syscall ABI, and the whole ring-3→ring-0 surface is hardened — all QEMU-green. Only the user-driven iron burn on archaemenid remains.)
+
+### Fixed
+
+- **Audit #4 — `vfs_close` swallowed the write-fd flush result (low, robustness).** Closing a `VFS_SEC_WFILE` fd always returned 0, so a failed backend write (ENOSPC / write-protected volume) reported **success** to `close()` while the data was silently dropped. `vfs_close` now returns the flush rc. The success path is unchanged (`vfs_write_on` returns 0 on success) and the pool slot is still reclaimed even on a flush failure. (The audit's *primary* proposed fix — reject the write-open when `vfs_create_on` fails — was **unsound**: `fatfs_create` returns -1 on a name collision, i.e. the normal overwrite case, so that fix would have broken overwriting any existing file. Only the sound secondary fix was taken.) (`core/vfs.cyr`.)
+
+### Added
+
+- **1.41.x arc-burn tracker** (agnosticos [`iron-nuc-zen-log.md#tracker-141x-cycle`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md#tracker-141x-cycle)). Stages the combined hardware validation with the A1-A4 dispositive rubric: **A1** boot-to-agnsh in ring 3 (no `#UD`, no fallback), **A2** recovery `agnos>` shell reachable when `/bin/agnsh` is absent, **A3** FAT/exFAT write from agnsh survives a power-cycle + host-`fsck` clean, **A4** no exec/storage/net regression vs the iron-validated 1.40.x baseline. Flash the production `build/agnos` via `install-usb.sh --update` with `/bin/agnsh` (`agnoshi/build/agnsh_agnos`) on the ext2 root. User-driven per the iron-burns-block-other-work discipline.
+
+### Validated
+
+- `scripts/sweep.sh` **7/7** (the `vfs_close` change touches every fd close — FAT/exFAT/ext2 write + exec all green), `FS_SYSCALL_SELFTEST` **`fssys: ALL PASS`**, `SYSCALL_HARDEN_SELFTEST` **`shsys: ALL PASS`**, `scripts/agnsh-smoke.sh` **PASS**, `check.sh` 11/11. Build **1,070,720 B**.
+
+### Notes
+
+- **The 1.41.x shell-separation arc is software-complete (1.41.1 → 1.41.11).** It is the first userland binary promoted to a system component and locks the permanent kernel↔userland shell boundary (kernel = recovery only, agnsh = full interactive). Iron burn PENDING (staged above).
+
+
 ## [1.41.10] — 2026-06-04 (**Arc-close hardening — audit the write path the 1.41.5 sweep predated.** The 1.41.5 security sweep ran *before* 1.41.7 added the `VFS_SEC_WFILE` FAT/exFAT write-fd, so that whole surface — open-routing, the `vfs_write`/`vfs_close` arms, the static pool, the flush — had never been audited. A 3-dimension multi-agent adversarial audit surfaced **4 real findings** (3 medium / 1 low, 0 refuted); the regression-recheck dimension confirmed the 1.41.5 fixes are all intact after the 1.41.6 dedup/reorder + the 1.41.8/1.41.9 shell work. 3 fixed here; the 1 low rolls to 1.41.11. Every fix behavior-preserving — sweep 7/7, `fssys`/`shsys` PASS, agnsh-smoke PASS.)
 
 ### Fixed
