@@ -231,6 +231,12 @@ fn vfs_ext2_parent(path, pathlen) {
     vfs_base_off = last + 1;
     vfs_base_len = plen - (last + 1);
     if (vfs_base_len < 1) { return 0 - 1; }
+    # 1.41.5: ext2's max filename is 255 bytes (EXT2_NAME_LEN). An uncapped
+    # basename from a ring-3 path would overflow ext2_dir_buf (512 u64 = 4 KB)
+    # in the fresh-block dirent append path (mkdir / open-O_CREAT / rename-dst /
+    # link-dst). Refuse over-long names at this single ingress for every
+    # FS-mutation syscall (behavior-preserving — no valid name exceeds 255).
+    if (vfs_base_len > 255) { return 0 - 1; }
     if (last == 0) { return 2; }                   # parent is root "/"
     return ext2_path_lookup(path, last);
 }

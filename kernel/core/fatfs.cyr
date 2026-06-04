@@ -600,9 +600,15 @@ fn fatfs_read(cluster, buf, maxlen) {
     var max_cluster = fatfs_count_of_clusters + 2;
     var total = 0;
     var clus = cluster;
+    var guard = 0;
     while (clus >= 2) {
-        if (clus >= max_cluster) { return total; }    # corrupt-chain guard
+        if (clus >= max_cluster) { return total; }    # corrupt-chain guard (range)
         if (total >= maxlen) { return total; }
+        # 1.41.5: cycle guard — a corrupt FAT chain that loops among in-range
+        # clusters would otherwise re-read the same data until maxlen. Bound the
+        # walk to the cluster count (mirrors exfat_read's iteration guard).
+        guard = guard + 1;
+        if (guard > max_cluster) { return total; }
         var base = fatfs_first_sector_of_cluster(clus);
         for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
             if (total >= maxlen) { return total; }

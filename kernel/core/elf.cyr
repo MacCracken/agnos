@@ -65,6 +65,11 @@ fn elf_load(elf_addr, elf_size) {
             if (p_vaddr < 0x200000) { return 0 - 1; }
             # Security: cap segment size to prevent exhausting physical memory
             if (p_memsz > 0x2000000) { return 0 - 1; }
+            # 1.41.5: keep the segment below the mmap arena base (0x10000000) so a
+            # crafted p_vaddr can't land a segment inside [0x10000000,0x40000000)
+            # and alias the process's own future mmap/munmap. Legit segments are
+            # well under 256 MB (p_vaddr >= 2 MB, p_memsz <= 32 MB).
+            if (p_vaddr + p_memsz > 0x10000000) { return 0 - 1; }
 
             # Allocate 2MB pages for this segment in the process's address space
             var page_start = p_vaddr & 0xFFFFFFFFFFE00000;
@@ -179,6 +184,9 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             if (p_vaddr + p_memsz < p_vaddr) { return 0 - 1; }
             if (p_vaddr < 0x200000) { return 0 - 1; }
             if (p_memsz > 0x2000000) { return 0 - 1; }
+            # 1.41.5: keep the segment below the mmap arena base (0x10000000) — a
+            # crafted on-disk p_vaddr must not alias the process's mmap arena.
+            if (p_vaddr + p_memsz > 0x10000000) { return 0 - 1; }
 
             # Map + populate 2 MB pages WITHOUT a CR3 switch. Each page is
             # pmm_alloc'd and identity-mapped in the kernel (vmm_map phys→phys),

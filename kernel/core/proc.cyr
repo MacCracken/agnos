@@ -419,6 +419,11 @@ var mmap_next_vaddr = 0x10000000;
 # accessible memory into the calling process's address space; return the base
 # vaddr or 0 (MAP_FAILED). Anonymous only — addr/prot/flags/fd/offset ignored.
 fn sys_mmap(length) {
+    # 1.41.5: reject any length beyond the whole arena (1 GB) BEFORE rounding.
+    # Without this, `length + 0x1FFFFF` on a near-u64 length wraps to a small
+    # value, sailing past the `(mmap_next_vaddr + len) > 0x40000000` guard below
+    # (and the npages pre-count) — the arena is only ~768 MB usable anyway.
+    if (length > 0x40000000) { return 0; }
     var len = (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;   # round up to 2 MB
     if (len < 0x200000) { len = 0x200000; }
     var npages = len / 0x200000;

@@ -32,6 +32,11 @@ fn dns_u16(ptr) {
 # terminated by a zero byte. Returns bytes written (incl. terminator), or
 # 0-1 on a malformed name. "www.example.com" -> 03 www 07 example 03 com 00
 fn dns_qname_encode(out, host, host_len) {
+    # 1.41.5: bound the hostname before encoding. The caller's query buffer is
+    # 320 bytes; the encoding writes ~host_len + one length byte per label + a
+    # terminator, so an over-long host could overrun it. DNS names max 253 bytes;
+    # cap at 255 (behavior-preserving — no valid hostname is longer).
+    if (host_len > 255) { return 0 - 1; }
     var w = 0;
     var seg_start = 0;
     var i = 0;

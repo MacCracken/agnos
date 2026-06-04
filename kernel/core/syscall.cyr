@@ -42,16 +42,25 @@ fn stack_canary_check(canary) {
 
 var sys_exit_code = 0;
 
-# Security: validate userspace pointer is outside kernel region (0x0-0x200000).
-# Returns 1 if pointer is safe, 0 if it points into kernel memory.
+# Security: a userspace pointer must lie in the user VA window [0x200000, 0x40000000):
+# above the kernel low region (0-2 MB) and below the 1 GB arena ceiling. EVERY
+# legitimate user address is below 1 GB — ELF segments (p_vaddr >= 2 MB, p_memsz
+# <= 32 MB, so < 34 MB), the per-pid user stack (0x800000 + pid*0x400000, < 72 MB
+# for the 16-process cap), and the mmap arena [0x10000000, 0x40000000). Device
+# MMIO / PCI BARs (e.g. NVMe ~0xC0000000) and the 1-4 GB PDPT range the per-process
+# CR3 ALSO mirrors all sit ABOVE the ceiling — so without the upper bound a ring-3
+# caller could aim a kernel load64/store64 at MMIO or high kernel memory (1.41.5).
+# Returns 1 if the pointer/range is safe, 0 otherwise.
 fn is_user_ptr(ptr) {
     if (ptr < 0x200000) { return 0; }
+    if (ptr >= 0x40000000) { return 0; }   # above the 1 GB user ceiling
     return 1;
 }
 
 fn is_user_range(ptr, len) {
     if (ptr < 0x200000) { return 0; }
-    if (ptr + len < ptr) { return 0; }  # overflow check
+    if (ptr + len < ptr) { return 0; }          # wrap check
+    if (ptr + len > 0x40000000) { return 0; }    # above the 1 GB user ceiling
     return 1;
 }
 
@@ -174,8 +183,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 2) { return proc_current; }
     if (num == 3) {
-        # spawn(elf_addr, elf_size) — load ELF and create user process
-        # Returns new pid or -1 on error
+        # spawn(elf_addr, elf_size) — load an in-memory ELF + create a user process.
+        # Returns new pid or -1. 1.41.5: the ELF image is a USER buffer — validate
+        # the whole (addr,size) range so elf_load's load8/load64 can't be aimed at
+        # kernel memory (a ring-3 caller passing a kernel addr would disclose it).
+        if (arg2 < 1) { return 0 - 1; }
+        if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
         var new_pid = elf_load(arg1, arg2);
         if (new_pid >= 0) {
             # Mark as ready; will be scheduled on next timer tick
@@ -307,10 +320,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 17) {
         # sigprocmask(how=arg1, set=arg2, oldset=arg3)
-        # Security: validate userspace pointers
-        if (is_user_ptr(arg2) == 0) { return 0 - 1; }
+        # Security: validate userspace pointers for the full 8 bytes touched
+        # (load64(arg2) / store64(arg3) below). 1.41.5: range not bare ptr.
+        if (is_user_range(arg2, 8) == 0) { return 0 - 1; }
         if (arg3 != 0) {
-            if (is_user_ptr(arg3) == 0) { return 0 - 1; }
+            if (is_user_range(arg3, 8) == 0) { return 0 - 1; }
         }
         var old_mask = load64(&proc_sigmask + proc_current * 8);
         if (arg3 != 0) { store64(arg3, old_mask); }
@@ -322,8 +336,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 18) {
         # signalfd(fd=arg1, mask_ptr=arg2, flags=arg3)
-        # Security: validate userspace pointer
-        if (is_user_ptr(arg2) == 0) { return 0 - 1; }
+        # Security: validate the 8 bytes read (load64(arg2)). 1.41.5: range.
+        if (is_user_range(arg2, 8) == 0) { return 0 - 1; }
         var sfd = vfs_alloc();
         if (sfd < 0) { return 0 - 1; }
         var sbase = &vfs_table + sfd * 32;
@@ -337,9 +351,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var efd = vfs_alloc();
         if (efd < 0) { return 0 - 1; }
         var ebase = &vfs_table + efd * 32;
+        # 1.41.5: allocate the watch list BEFORE claiming the slot — on OOM the
+        # slot stays VFS_FREE (vfs_alloc doesn't mark it) so nothing leaks and we
+        # never hand back an epoll fd with a NULL watch list.
+        var wl = kmalloc(128);
+        if (wl == 0) { return 0 - 1; }
         ktag_set(ebase, VFS_EPOLL);
         kpayload_set(ebase, 0, 0);              # watch count
-        var wl = kmalloc(128);
         kpayload_set(ebase, 2, wl);             # watch list ptr
         return efd;
     }
@@ -348,17 +366,29 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= 32) { return 0 - 1; }
         var ebase = &vfs_table + arg1 * 32;
+        # 1.41.5: the epfd MUST be an epoll instance. Without this a ring-3 caller
+        # could pass ANY allocated fd whose payload[2] is a kernel heap pointer
+        # (pipe/memfile) or a small integer (an ext2 fd's inode number) — the
+        # store64s below would then write an attacker-controlled value to that
+        # address: an arbitrary kernel write. Mirrors the getdents VFS_EXT2_DIR
+        # tag check.
+        if (ktag(ebase) != VFS_EPOLL) { return 0 - 1; }
         var wl = kpayload(ebase, 2);
         if (wl == 0) { return 0 - 1; }
         var wc = kpayload(ebase, 0);
         if (arg2 == 1) {
             # Max 8 watches (128 bytes / 16 bytes per watch)
             if (wc >= 8) { return 0 - 1; }
+            # 1.41.5: the watched fd is later used as &vfs_table + wfd*32 in
+            # epoll_wait — bound it to a real fd slot so it can't index OOB.
+            if (arg3 < 0) { return 0 - 1; }
+            if (arg3 >= 32) { return 0 - 1; }
             store64(wl + wc * 16, arg3);
             store64(wl + wc * 16 + 8, arg3);
             kpayload_set(ebase, 0, wc + 1);
         }
         if (arg2 == 2) {
+            # EPOLL_CTL_DEL — current impl clears ALL watches (not just arg3).
             kpayload_set(ebase, 0, 0);
         }
         return 0;
@@ -368,26 +398,38 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # Security: validate fd bounds and userspace pointer
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= 32) { return 0 - 1; }
-        if (is_user_ptr(arg2) == 0) { return 0 - 1; }
         if (arg3 < 0) { return 0 - 1; }
         if (arg3 > 16) { arg3 = 16; }
+        # 1.41.5: validate the events buffer for the bytes actually written (each
+        # event record is 12 bytes, up to arg3 of them) — not a single ptr.
+        if (is_user_range(arg2, arg3 * 12) == 0) { return 0 - 1; }
         var ebase = &vfs_table + arg1 * 32;
+        # 1.41.5: epfd must be a real epoll instance, else wl/wc below are a
+        # foreign fd's payload — wl used as a base address gives arbitrary
+        # kernel reads and wc (e.g. a file's pos) an attacker-driven loop count.
+        if (ktag(ebase) != VFS_EPOLL) { return 0 - 1; }
         var wl = kpayload(ebase, 2);
         var wc = kpayload(ebase, 0);
         var found = 0;
         for (var wi = 0; wi < wc; wi = wi + 1) {
             var wfd = load64(wl + wi * 16);
             var wdata = load64(wl + wi * 16 + 8);
-            var wbase = &vfs_table + wfd * 32;
-            var wtype = ktag(wbase);
             var rdy = 0;
-            if (wtype == VFS_SIGNALFD) {
-                var smask = kpayload(wbase, 2);
-                var spend = load64(&proc_signals + proc_current * 8);
-                if ((spend & smask) != 0) { rdy = 1; }
+            # 1.41.5: defense-in-depth — only consult a watched fd that indexes a
+            # real slot (epoll_ctl now bounds it at insert time as well).
+            if (wfd >= 0) {
+            if (wfd < 32) {
+                var wbase = &vfs_table + wfd * 32;
+                var wtype = ktag(wbase);
+                if (wtype == VFS_SIGNALFD) {
+                    var smask = kpayload(wbase, 2);
+                    var spend = load64(&proc_signals + proc_current * 8);
+                    if ((spend & smask) != 0) { rdy = 1; }
+                }
+                if (wtype == VFS_TIMERFD) {
+                    if (timer_ticks >= kpayload(wbase, 1)) { rdy = 1; }
+                }
             }
-            if (wtype == VFS_TIMERFD) {
-                if (timer_ticks >= kpayload(wbase, 1)) { rdy = 1; }
             }
             if (rdy == 1) {
                 if (found < arg3) {
@@ -417,6 +459,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 >= 32) { return 0 - 1; }
         if (is_user_range(arg3, 24) == 0) { return 0 - 1; }
         var tbase = &vfs_table + arg1 * 32;
+        # 1.41.5: fd must be a timerfd, else kpayload_set below writes into a
+        # foreign fd's payload (corrupting a file's pos/inode or a pipe's ptrs).
+        if (ktag(tbase) != VFS_TIMERFD) { return 0 - 1; }
         var int_sec = load64(arg3);
         var init_sec = load64(arg3 + 16);
         kpayload_set(tbase, 0, int_sec * 100);            # interval
