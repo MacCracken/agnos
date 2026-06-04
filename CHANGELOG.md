@@ -5,6 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.10] — 2026-06-04 (**Arc-close hardening — audit the write path the 1.41.5 sweep predated.** The 1.41.5 security sweep ran *before* 1.41.7 added the `VFS_SEC_WFILE` FAT/exFAT write-fd, so that whole surface — open-routing, the `vfs_write`/`vfs_close` arms, the static pool, the flush — had never been audited. A 3-dimension multi-agent adversarial audit surfaced **4 real findings** (3 medium / 1 low, 0 refuted); the regression-recheck dimension confirmed the 1.41.5 fixes are all intact after the 1.41.6 dedup/reorder + the 1.41.8/1.41.9 shell work. 3 fixed here; the 1 low rolls to 1.41.11. Every fix behavior-preserving — sweep 7/7, `fssys`/`shsys` PASS, agnsh-smoke PASS.)
+
+### Fixed
+
+- **Write-fd pool leak → ring-3 DoS of FAT/exFAT writes (medium, security).** The `VFS_SEC_WFILE` write-fd is backed by a finite 4-slot static pool, released only by `vfs_close`. But process exit (`syscall(0)`) and `proc_reap` never walked the fd table — so a buggy/malicious ring-3 program could `open(AO_WRONLY)` four FAT/exFAT files and `exit()` without closing, permanently exhausting the pool (every later write-open returns -1 until reboot). `proc_reap` now **sweeps fds 3-31 of the exiting process and `vfs_close`s any still-open** (POSIX `exit()` semantics; `vfs_close` is idempotent so a program that closed its own fds sees a no-op). Safe under the single-foreground run-to-completion model — the kernel shell closes its fds synchronously, so at reap any open fd belongs to the just-exited process. (`core/proc.cyr`.)
+- **Write-fd returned 0 at the content cap, spinning a conforming writer (medium, hardening).** `vfs_sec_wfile_write` returned `0` once the 4 KB whole-file cap filled — a standard ring-3 `while (off < total) off += write(...)` loop would then spin forever the moment a file exceeded 4 KB. It now returns an **error** (`-1`) when the cap is full and bytes remain, so a >4 KB write fails visibly (the 4 KB cap is a known follow-on limit). (`core/vfs.cyr`.)
+- **Write-open of a directory corrupted the filesystem (medium, correctness).** A write-open whose path resolved to an existing **directory** flushed through `fatfs_write_file` / `exfat_write_file`, which cleared the directory's dirent and freed its cluster chain — on-disk FS corruption. Both backends now **refuse to overwrite a directory** (the `attr & 0x10` directory bit: FAT at the matched dirent +11; exFAT by re-reading the set primary's `FileAttributes` +4, mirroring `exfat_rmdir`). Only fires on the malformed write-to-a-dir case. (`core/fatfs.cyr`, `core/exfat.cyr`.)
+
+### Validated
+
+- `scripts/sweep.sh` **7/7** — the FAT/exFAT/ext2 write smokes (write-fd + the dir-guards on the normal write path) and exec-from-disk (which exercises the new `proc_reap` fd-sweep on every `run`) all pass. `FS_SYSCALL_SELFTEST` **`fssys: ALL PASS`**, `SYSCALL_HARDEN_SELFTEST` **`shsys: ALL PASS`**, `scripts/agnsh-smoke.sh` **PASS**, `check.sh` 11/11. Build 1,070,288 → **1,070,720 B**.
+
+### Notes
+
+- **Rolled to 1.41.11** (the clean cut): the 1 low finding — `open(7)` AO_CREAT on FAT/exFAT ignores `vfs_create_on`'s result before opening a write-back fd (the audit's proposed fix was not behavior-sound, so it gets a careful pass) — plus final polish + iron-burn staging.
+
+
 ## [1.41.9] — 2026-06-04 (**The in-kernel shell shrinks to a recovery REPL — the permanent kernel↔userland shell boundary is locked.** With agnsh (userland) now the interactive shell (1.41.4) and the FS-write test harness decoupled from the shell verbs (1.41.8), the non-recovery verbs in the in-kernel `shell()` are deleted. `kernel/user/shell.cyr` drops **1149 → 813 LOC (−336)** and the production kernel **1,084,312 → 1,070,288 B (−14 KB)**. The kernel shell is now strictly a recovery fallback: it owns just enough to inspect and repair a broken `/bin/agnsh`. The full verb surface + AI/intent features live in agnsh. This is the kernel-slimming half of the shell-separation arc.)
 
 ### Removed

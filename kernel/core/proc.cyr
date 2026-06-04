@@ -316,6 +316,21 @@ fn proc_free_address_space(cr3) {
 # proc_free_address_space refuses them even if a stray pid 0/1 ever arrived.)
 fn proc_reap(pid) {
     if (pid >= proc_count) { return 0 - 1; }
+    # 1.41.10: reclaim any fds the exiting process left open (POSIX exit()
+    # semantics). Critical for VFS_SEC_WFILE write-fds — their finite 4-slot
+    # pool would otherwise leak to permanent exhaustion (a buggy/malicious ring-3
+    # program that opens write-fds and exits without close would DoS all
+    # FAT/exFAT writes until reboot). vfs_close flushes + frees and is idempotent
+    # (an already-FREE slot is a no-op, so a program that closed its own fds sees
+    # a pure no-op). Safe under the single-foreground run-to-completion model: the
+    # kernel shell closes its own fds synchronously, so at reap any non-FREE fd in
+    # 3..31 belongs to the just-exited process. (Per-process fd ownership is a
+    # prerequisite to generalize this for the future multi-threading/SMP arc.)
+    var rfd = 3;
+    while (rfd < 32) {
+        if (kis_tag(&vfs_table + rfd * 32, VFS_FREE) == 0) { vfs_close(rfd); }
+        rfd = rfd + 1;
+    }
     var cr3 = proc_get_cr3(pid);
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
     if (proc_current == pid) { proc_current = 0; }

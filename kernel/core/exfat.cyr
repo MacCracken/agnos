@@ -1095,6 +1095,12 @@ fn exfat_write_file(name, namelen, src, len) {
         ov_slot = exfat_set_slot;
         ov_count = exfat_set_count;
         if (ov_slot + ov_count > 16) { return 0 - 1; }   # spanning set (follow-on)
+        # 1.41.10: refuse to overwrite a DIRECTORY (FileAttributes bit 0x10) —
+        # would clear its dir-set + free its cluster chain → on-disk FS
+        # corruption. Re-read the set primary's block (find may have scanned past
+        # it; mirrors exfat_rmdir's dir-confirm). Only fires on write-to-a-dir.
+        if (exfat_blk_read(ov_sec, &exfat_dir_buf) != 0) { return 0 - 1; }
+        if ((load8(&exfat_dir_buf + ov_slot * 32 + 4) & 0x10) != 0) { return 0 - 1; }
     }
 
     # Allocate + write the new data (old data untouched until we repoint).

@@ -853,6 +853,11 @@ fn fatfs_write_file(name, namelen, src, len) {
         # dirent → freed chain. New content is written below.
         if (fat_blk_read(target_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }
         var oep = &fatfs_dir_buf + target_slot * 32;
+        # 1.41.10: refuse to overwrite a DIRECTORY (attr bit 0x10). Without this,
+        # a write-open of a dir path (e.g. agnsh open(AO_WRONLY) on a directory)
+        # would clear the dir's dirent + free its cluster chain here → on-disk FS
+        # corruption. Only fires on the malformed write-to-a-dir case.
+        if ((load8(oep + 11) & 0x10) != 0) { return 0 - 1; }
         store8(oep + 20, 0); store8(oep + 21, 0); store8(oep + 26, 0); store8(oep + 27, 0);
         store8(oep + 28, 0); store8(oep + 29, 0); store8(oep + 30, 0); store8(oep + 31, 0);
         if (fat_blk_write(target_sec, &fatfs_dir_buf) != 0) { return 0 - 1; }

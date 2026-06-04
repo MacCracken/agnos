@@ -88,7 +88,13 @@ fn vfs_sec_wfile_open(be, name, namelen) {
 fn vfs_sec_wfile_write(base, buf, count) {
     var pos = kpayload(base, 0);
     var room = 4096 - pos;
-    if (room <= 0) { return 0; }
+    if (room <= 0) {
+        # 1.41.10: cap full. Returning 0 for a count>0 write would spin a
+        # conforming ring-3 write-until-done loop forever — return an error so a
+        # >4 KB write fails visibly (the 4 KB cap is a known follow-on limit).
+        if (count > 0) { return 0 - 1; }
+        return 0;
+    }
     var n = count;
     if (n > room) { n = room; }
     var blk = kpayload(base, 2);
