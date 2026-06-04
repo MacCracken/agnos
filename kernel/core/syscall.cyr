@@ -418,18 +418,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # 1.41.5: defense-in-depth — only consult a watched fd that indexes a
             # real slot (epoll_ctl now bounds it at insert time as well).
             if (wfd >= 0) {
-            if (wfd < 32) {
-                var wbase = &vfs_table + wfd * 32;
-                var wtype = ktag(wbase);
-                if (wtype == VFS_SIGNALFD) {
-                    var smask = kpayload(wbase, 2);
-                    var spend = load64(&proc_signals + proc_current * 8);
-                    if ((spend & smask) != 0) { rdy = 1; }
+                if (wfd < 32) {
+                    var wbase = &vfs_table + wfd * 32;
+                    var wtype = ktag(wbase);
+                    if (wtype == VFS_SIGNALFD) {
+                        var smask = kpayload(wbase, 2);
+                        var spend = load64(&proc_signals + proc_current * 8);
+                        if ((spend & smask) != 0) { rdy = 1; }
+                    }
+                    if (wtype == VFS_TIMERFD) {
+                        if (timer_ticks >= kpayload(wbase, 1)) { rdy = 1; }
+                    }
                 }
-                if (wtype == VFS_TIMERFD) {
-                    if (timer_ticks >= kpayload(wbase, 1)) { rdy = 1; }
-                }
-            }
             }
             if (rdy == 1) {
                 if (found < arg3) {
