@@ -1,14 +1,78 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> **Last Updated**: 2026-05-27 (v1.35.4 — `munmap` added at slot 28)
+> **Last Updated**: 2026-06-04 (v1.41.11 — surface is now **0–33, 34 syscalls**; the 1.41.x shell-separation arc added the FS-syscall surface `agnsh` needs)
 >
-> The 26-call kybernet surface (0–25) was complete at v1.21.0; kybernet (currently v1.2.1) runs on AGNOS as PID 1. Three dispatch entries have been added **since** v1.21.0, all outside that kybernet set: slot **26** `write_boot_checkpoint(byte)` (a CMOS-write diagnostic added during iron-boot bring-up), slot **27** `mmap(length)` (anonymous, 2 MB-granular memory; v1.35.3), and slot **28** `munmap(addr, length)` (its pair; v1.35.4). The dispatch table is now **29 entries (0–28)**.
+> The 26-call kybernet surface (0–25) was complete at v1.21.0; kybernet (currently v1.2.1) runs on AGNOS as PID 1. The dispatch table has since grown to **34 entries (0–33)** in three rounds:
+> - slot **26** `write_boot_checkpoint(byte)` — a CMOS-write diagnostic added during iron-boot bring-up (🩺 not part of the userland shell surface);
+> - slot **27** `mmap(length)` (anonymous, 2 MB-granular memory; v1.35.3) + slot **28** `munmap(addr, length)` (its pair; v1.35.4);
+> - slots **29–33** + the `open`(7) re-route + the `mkdir`(9)/`rmdir`(10)/`sync`(12) made-real + the **`a4=r10`** 4th-arg ABI extension, all at **v1.41.3** — the FS-syscall buildout for the shell-separation arc (see below).
 >
-> **Status**: This doc is the implementation reference for the v1.21.0 syscall buildout — historical record of how each syscall got wired in `kernel/core/syscall.cyr`. Current syscall surface lives in [`state.md` § Syscall surface](state.md). The 26-call kybernet set was untouched through the entire v1.27.x → v1.34.x arc — security hardening (S1-S13 13/13 at v1.28.0), the Path-C sovereign-struct kernel ABI break (v1.30.0), native xHCI + USB-HID-boot (v1.30.x), the storage stack (v1.31.x), networking (v1.32.x), and the ext2/4 + FAT-family **write** arcs (v1.33.x / v1.34.x) all reuse it (FS mutation rides `open`/`write`/`mkdir`/`mount`/`sync`). The first *new functional* syscalls since v1.21.0 are `mmap` (27, v1.35.3) + `munmap` (28, v1.35.4) — a pure memory facility, not socket/crypto surface. API expansion stays deliberate.
+> **Status**: This doc is the implementation reference for the v1.21.0 kybernet buildout (the tier-by-tier history below) plus the later additions. **The canonical current surface is the `ksyscall` dispatch in `kernel/core/syscall.cyr`** (every `if (num == N)`); the normative interface contract is [`agnos-userland-abi.md`](agnos-userland-abi.md); the live snapshot is [`state.md`](state.md). The 26-call kybernet set was untouched through the entire v1.27.x → v1.34.x arc — security hardening (S1-S13 13/13 at v1.28.0), the Path-C sovereign-struct kernel ABI break (v1.30.0), native xHCI + USB-HID-boot (v1.30.x), the storage stack (v1.31.x), networking (v1.32.x), and the ext2/4 + FAT-family **write** arcs (v1.33.x / v1.34.x) all reused it. The first *new functional* syscalls since v1.21.0 were `mmap` (27, v1.35.3) + `munmap` (28, v1.35.4) — a pure memory facility. The big expansion is **v1.41.3's FS surface** (slots 29–33 + the `open`/`mkdir`/`rmdir`/`sync` upgrades), the syscalls the userland `agnsh` shell (exec'd from disk in ring 3 at v1.41.4) needs to reach the mount-routed VFS now that the interactive shell lives in userland. API expansion stays deliberate.
 
-## Current State
+## Current Surface — 0–33 (34 syscalls)
 
-**AGNOS kernel** (`kernel/core/syscall.cyr`) implements the 26-call kybernet surface below (slots 0–25, all tiers complete), plus three later additions: `write_boot_checkpoint` (26, diagnostic), `mmap` (27, v1.35.3), and `munmap` (28, v1.35.4) — see the header note.
+The live `ksyscall` dispatch in `kernel/core/syscall.cyr`. `a1/a2/a3/a4` give argument meaning; `→` is the return (`rax` ≥ 0 on success, `-1`/`0-1` on error — **AGNOS does not use Linux `-errno`**). Argument calling convention is `rdi`/`rsi`/`rdx` for `a1`/`a2`/`a3`, and (since v1.41.3) **`r10` for `a4`** — see the ABI extension note. "🩺" = kernel-diagnostic-only, not part of the userland shell surface; "🔧" = stub (number reserved, returns a constant). Normative contract: [`agnos-userland-abi.md`](agnos-userland-abi.md).
+
+| # | Name | a1 | a2 | a3 | a4 | → | Landed | Notes |
+|---|------|----|----|----|----|---|--------|-------|
+| 0 | `exit` | code | — | — | — | (no return) | v1.0.0 | resumes kernel via `kernel_resume` |
+| 1 | `write` | fd | buf | len | — | bytes / -1 | v1.0.0 | `vfs_write`; fd 1/2 → console; FAT/exFAT content-write via the `VFS_SEC_WFILE` write-fd at **v1.41.7** (was ext2/pipe/device-only before) |
+| 2 | `getpid` | — | — | — | — | pid | v1.0.0 | returns `proc_current` |
+| 3 | `spawn` | elf_addr | elf_size | — | — | pid / -1 | v1.0.0 | loads an **in-memory** ELF (not a path) |
+| 4 | `waitpid` | pid | — | — | — | exit_code / -1 | v1.0.0 | busy-waits until `state==0` |
+| 5 | `read` | fd | buf | len | — | bytes / -1 | v1.0.0 | `vfs_read`; **fd 0 = blocking keyboard stdin, RAW** since **v1.41.1** (`kbd_read_blocking`; no kernel echo) |
+| 6 | `close` | fd | — | — | — | 0 / -1 | v1.0.0 | `vfs_close`; v1.41.11 surfaces the write-fd flush rc |
+| 7 | `open` | name | namelen | flags | — | fd / -1 | v1.0.0 (re-route **v1.41.3**) | **mount-routed** (`vfs_resolve_mount` → ext2 / FAT / exFAT, initrd bare-name fallback) since v1.41.3; gained the **flags** arg (a3) — see `AO_*` below. Write-access → a write-back fd (v1.41.7) |
+| 8 | `dup` | fd | — | — | — | fd | v1.1.0 | 🔧 returns `a1` unchanged |
+| 9 | `mkdir` | path | pathlen | — | — | 0 / -1 | v1.1.0 (**real v1.41.3**) | stub → 0 until v1.41.3; now real, mount-routed (`ext2_mkdir` / `vfs_mkdir_on`) |
+| 10 | `rmdir` | path | pathlen | — | — | 0 / -1 | v1.1.0 (**real v1.41.3**) | stub → 0 until v1.41.3; now real, mount-routed (`ext2_rmdir` / `vfs_rmdir_on`) |
+| 11 | `mount` | — | — | — | — | 0 | v1.1.0 | 🔧 no-op |
+| 12 | `sync` | — | — | — | — | 0 | v1.1.0 (**real v1.41.3**) | stub → 0 until v1.41.3; now `ext2_sync` + `blk_flush` |
+| 13 | `reboot` | — | — | — | — | (halts) | v1.1.0 | `serial_println` + `arch_halt` |
+| 14 | `pause` | — | — | — | — | 0 | v1.1.0 | `arch_wait` (one hlt) |
+| 15 | `getuid` | — | — | — | — | 0 | v1.1.0 | 🔧 always root=0 |
+| 16 | `kill` | pid | sig | — | — | 0 / -1 | v1.1.0 | pid 0 protected, self/child only |
+| 17 | `sigprocmask` | how | set_ptr | oldset_ptr | — | 0 / -1 | v1.1.0 | how: 0=BLOCK, 1=UNBLOCK |
+| 18 | `signalfd` | fd | mask_ptr | flags | — | fd / -1 | v1.1.0 | allocates a `VFS_SIGNALFD` |
+| 19 | `epoll_create` | — | — | — | — | fd / -1 | v1.1.0 | allocates a `VFS_EPOLL` (8-watch list) |
+| 20 | `epoll_ctl` | epfd | op | fd | — | 0 / -1 | v1.1.0 | op: 1=ADD, 2=clear. max 8 watches |
+| 21 | `epoll_wait` | epfd | events_ptr | max | — | nready | v1.1.0 | event rec = `{u32 mask; u64 data}` @ 12 B stride; `max`≤16 |
+| 22 | `timerfd_create` | — | — | — | — | fd / -1 | v1.1.0 | allocates a `VFS_TIMERFD` |
+| 23 | `timerfd_settime` | fd | flags | val_ptr | — | 0 / -1 | v1.1.0 | `val_ptr`→`{u64 interval_sec; _; u64 initial_sec}` (24 B) |
+| 24 | `umount` | — | — | — | — | 0 | v1.1.0 | 🔧 no-op |
+| 25 | `pipe` | fds_ptr | — | — | — | 0 / -1 | v1.11.0 | writes 2× u64 fds at `fds_ptr` (16 B); `vfs_create_pipe` |
+| 26 | `write_boot_checkpoint` | byte | — | — | — | 0 | iron-boot bring-up | 🩺 writes `CMOS[0x50]=byte&0xFF` |
+| 27 | `mmap` | length | — | — | — | base_vaddr / 0 | **v1.35.3** | anonymous, zero-filled, **2 MB-granular**; `0` = MAP_FAILED |
+| 28 | `munmap` | addr | length | — | — | 0 / -1 | **v1.35.4** | frees an mmap region (2 MB-granular) |
+| 29 | `getdents` | dir_fd | buf | bufsize | — | bytes / 0 (end) / -1 | **v1.41.3** | emits agnos-native dirent records (`reclen`u16/`type`u8/`namelen`u8/`ino`u32/`name`) from a `VFS_EXT2_DIR` fd; ext2 (FAT/exFAT dir-fd is a follow-on). `agnsh`'s `ls` |
+| 30 | `unlink` | path | pathlen | — | — | 0 / -1 | **v1.41.3** | mount-routed: ext2 via `vfs_ext2_parent` → `ext2_unlink`; FAT/exFAT → `vfs_delete_on`. `agnsh`'s `rm` |
+| 31 | `rename` | old | oldlen | new | newlen | 0 / -1 | **v1.41.3** | within one filesystem (uses **a4** for `newlen`); cross-FS refused; ext2 (`ext2_rename`) + FAT/exFAT (`vfs_rename_on`). `agnsh`'s `mv` |
+| 32 | `link` | target | targetlen | linkpath | linkpathlen | 0 / -1 | **v1.41.3** | hard link (uses **a4**), **ext2-only** (`ext2_link`); FAT/exFAT → -1 (O4 — no inodes/hard links). `agnsh`'s `ln` |
+| 33 | `stat` | path | pathlen | statbuf | — | 0 / -1 | **v1.41.3** | fills the 48-byte agnos stat struct (`st_mode`/`nlink`/`size`/`ino`/`blocks`/`mtime`) via `ext2_fill_stat`; FAT/exFAT → -1 for now (O4 follow-on). `agnsh`'s `ls -l` |
+
+### `open` flags (a3) — agnos-native bits (v1.41.3)
+
+Access mode in the low 2 bits, modifiers above. **AGNOS values, not Linux's.** From `agnos-userland-abi.md` §3.3:
+
+| Flag | Value | Meaning |
+|------|-------|---------|
+| `AO_RDONLY` | `0x0` | read only (default) |
+| `AO_WRONLY` | `0x1` | write only |
+| `AO_RDWR` | `0x2` | read+write |
+| `AO_CREAT` | `0x100` | create if absent (subsumes `touch`) |
+| `AO_TRUNC` | `0x200` | truncate to zero on open (with CREAT = `echo >`) |
+| `AO_APPEND` | `0x400` | seek to end on each write (TODO — not yet honored) |
+| `AO_DIRECTORY` | `0x800` | must be a directory (returns a dir-fd for `getdents`) |
+
+`create` is **not** a separate syscall — file creation is `open(7)` with `AO_CREAT`. `chdir`/`getcwd` are **intentionally not syscalls**: CWD is userland-owned (`agnsh` tracks its own and passes absolute paths to every syscall).
+
+### `a4 = r10` — 4th-argument ABI extension (v1.41.3, decision O2)
+
+`rename`(31) and `link`(32) are inherently 4-arg. v1.41.3 grew the syscall ABI from 3 args to 4, putting the 4th in **`r10`** (the natural 4th-arg register — `SYSCALL` clobbers `rcx`, which is exactly why Linux picks `r10`; AGNOS adopts the *register*, not Linux's numbers). The entry stub (`kernel/arch/x86_64/syscall_hw.cyr`) preserves the user's `r10` into `r9` as its first instruction (before the CR3-switch scratch clobbers `r10`); `r9` arrives as `syscall_handler`'s SysV 6th arg and is stashed into a new `ksyscall_a4` global that `rename`/`link` read. **`ksyscall`'s 4-arg signature and its in-kernel callers are unchanged** — the change is additive, so 3-arg syscalls are byte-identical in behavior; only `rename`/`link` read the 4th.
+
+## Historical State (v1.21.0 kybernet buildout)
+
+**AGNOS kernel** (`kernel/core/syscall.cyr`) implemented the 26-call kybernet surface below (slots 0–25, all tiers complete) by v1.21.0; the later additions (26–33) are catalogued in the table above.
 
 ### Original 8 (v1.0.0):
 
@@ -285,15 +349,18 @@ if (num == 23) {
 
 ## Summary
 
-All tiers implemented. 26-call kybernet surface (8 original + 18 new). (Slots 26 `write_boot_checkpoint`, 27 `mmap`, and 28 `munmap` were added later — outside the kybernet set; see the header note.)
+The kybernet buildout (26-call surface, slots 0–25 = 8 original + 18 new) is fully implemented. Slots 26–33 were added later — see the **Current Surface** table above for the complete 0–33 (34-syscall) list with per-slot landing versions.
 
 | Tier | Syscalls | Status |
 |------|----------|--------|
-| 1: Stubs | 8,9,10,12,15,24 (6) | DONE (v1.1.0) |
+| 1: Stubs | 8,9,10,12,15,24 (6) | DONE (v1.1.0) — `mkdir`(9)/`rmdir`(10)/`sync`(12) **made real at v1.41.3** |
 | 2: Simple | 11,13,14 (3) | DONE (v1.1.0) |
 | 3: Signals | 16,17,18 (3) | DONE (v1.1.0) |
 | 4: Events | 19,20,21,22,23 (5) | DONE (v1.1.0) |
 | 5: IPC | 25 (1) | DONE (v1.11.0) |
+| 6: Diagnostic | 26 `write_boot_checkpoint` (1) | DONE (iron-boot bring-up) |
+| 7: Memory | 27 `mmap`, 28 `munmap` (2) | DONE (v1.35.3 / v1.35.4) |
+| 8: FS surface | 29 `getdents`, 30 `unlink`, 31 `rename`, 32 `link`, 33 `stat` (5) + `open`(7) re-route + `a4=r10` | DONE (v1.41.3) |
 
 ## Files to modify
 

@@ -15,7 +15,7 @@ fn test_proc_a() {
     # CMOS CP 0x20: context switch into test_proc_a succeeded (pre-loop reached).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x20; 0xE6; 0x71; }
     var iter = 0;
-    if (0 == 1) {
+    while (1 == 1) {
         serial_print("A", 1);
         if (iter == 0) {
             # CMOS CP 0x21: first serial_print in proc context returned.
@@ -35,7 +35,7 @@ fn test_proc_b() {
     # CMOS CP 0x23: sched_next rotated from test_proc_a → test_proc_b
     # (proves the round-robin is alive between user procs).
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x23; 0xE6; 0x71; }
-    if (0 == 1) {
+    while (1 == 1) {
         serial_print("B", 1);
         arch_wait();
     }

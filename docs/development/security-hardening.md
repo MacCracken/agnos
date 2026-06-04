@@ -1,6 +1,6 @@
 # Security Hardening Implementation Guide
 
-> **Last Updated**: 2026-05-18 (S7 KASLR shipped at v1.28.0 — status block flipped to 13/13)
+> **Last Updated**: 2026-06-04 (1.41.x sweep — added a "Since this was written" note on the separate ring-3-ingress hardening front [1.41.5/.6/.10]; the S1-S13 v1.28.0 framework below is unchanged)
 >
 > From the 2026-04-13 audit. See [`../audit/2026-04-13-security-audit.md`](../audit/2026-04-13-security-audit.md) for findings; [`roadmap.md`](roadmap.md) for the tracking table; [`state.md`](state.md) for live state.
 
@@ -9,6 +9,8 @@
 ## Status (v1.28.0+ — fully closed)
 
 **13 of 13 items are Done** as of v1.28.0. KASLR shipped via the data-only variant (Option B per [`proposals/2026-05-11-kaslr-scope.md`](proposals/2026-05-11-kaslr-scope.md)); the full PIE-binary variant (Option A) is deferred to cyrius v6.1.x where PIE codegen lands. This guide is the historical implementation reference — what shipped, how, and the dependencies between items. For the current state, see `roadmap.md` § Security Hardening.
+
+> **Since this was written (1.41.x shell-separation arc).** S1-S13 hardened the *kernel's own* memory/process model (v1.28.0). A **second, distinct hardening front** opened with the 1.41.x arc, when a real userland shell (`agnsh`) moved to the far side of the syscall boundary and 1.41.3 added nine FS syscalls taking user pointers — i.e. the **ring-3 → ring-0 syscall ingress** became a genuine attack surface. Three adversarial-audit passes cover it, tracked in CHANGELOG (not re-listed here): **1.41.5** (10 high findings — epoll/timerfd/signalfd fd **type-confusion** → arbitrary kernel write/read, closed with `VFS_*` tag checks; a **1 GB user-VA ceiling** on `is_user_range`/`is_user_ptr`; the ext2 basename overflow; `spawn`/ELF/`mmap` bounds), **1.41.6** (the `SYSCALL_HARDEN_SELFTEST` regression net — `shsys: ALL PASS` — + the ELF-leak validation pre-pass), and **1.41.10** (the never-before-audited `VFS_SEC_WFILE` write-fd: pool-leak DoS, write-cap spin, directory-overwrite FS-corruption). Full audit: agnosticos [`kernel-1415-hardening-audit.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/prior-art/kernel-1415-hardening-audit.md). The S1-S13 framework below is unchanged and still accurate for what it covers.
 
 | # | Item | Status | Notes |
 |---|------|--------|-------|

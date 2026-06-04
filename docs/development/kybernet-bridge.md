@@ -1,6 +1,6 @@
 # Kybernet Bridge Plan
 
-> **Last Updated**: 2026-05-26 (v1.35.0 docs sweep — design unchanged since v1.21.0; kybernet pin 1.2.1)
+> **Last Updated**: 2026-06-04 (1.41.x sweep — kernel surface grew to 0-33; `open`/`mkdir`/`rmdir`/`sync` made real at v1.41.3 and the post-kybernet additions 26-33 listed; the bridge *design* is unchanged since v1.21.0)
 >
 > Make kybernet run on both Linux and AGNOS via a switchable syscall backend.
 >
@@ -22,7 +22,7 @@ kybernet (PID 1)
 
 ## Syscall Status
 
-All 26 AGNOS syscalls are implemented (v1.21.0). kybernet can run on AGNOS as PID 1.
+The original **26-call set (0-25)** kybernet's bridge was built against is implemented (v1.21.0); kybernet can run on AGNOS as PID 1. The **kernel syscall surface has since grown to 0-33 (34 calls)** — `mmap`(27)/`munmap`(28) at v1.35.3/.4, then the v1.41.3 FS group (`getdents`(29)/`unlink`(30)/`rename`(31)/`link`(32)/`stat`(33) + the `open`(7) mount-route + `mkdir`(9)/`rmdir`(10)/`sync`(12) made real + the `a4=r10` 4th-arg ABI extension) — the syscalls the **userland `agnsh` shell** needs now that the interactive shell is exec'd from disk in ring 3 (v1.41.4). kybernet itself still uses only its original subset; the full current surface is the per-slot table in [`syscall-additions.md`](syscall-additions.md). The tier tables below are kybernet's bridge set (numbers + names unchanged); the **Notes** column reflects the current kernel implementation.
 
 ### Tier 1: Original (v1.0.0) -- DONE
 | Syscall | AGNOS # | Notes |
@@ -34,16 +34,16 @@ All 26 AGNOS syscalls are implemented (v1.21.0). kybernet can run on AGNOS as PI
 | waitpid | 4 | Busy-wait |
 | read | 5 | Via VFS |
 | close | 6 | Via VFS |
-| open | 7 | Via initrd |
+| open | 7 | Mount-routed: ext2 / FAT / exFAT, initrd bare-name fallback; gained `AO_*` flags (v1.41.3) |
 
 ### Tier 2: Stubs + simple (v1.1.0) -- DONE
 | Syscall | AGNOS # | Notes |
 |---------|---------|-------|
 | dup | 8 | Return same fd |
-| mkdir | 9 | Noop (initrd read-only) |
-| rmdir | 10 | Noop |
+| mkdir | 9 | Real, mount-routed to ext2 / FAT / exFAT (v1.41.3; was a noop) |
+| rmdir | 10 | Real, mount-routed (v1.41.3; was a noop) |
 | mount | 11 | Register VFS mount point |
-| sync | 12 | Noop (no disk) |
+| sync | 12 | Real: flush ext2 metadata + all block devices (v1.41.3; was a noop) |
 | reboot | 13 | cli; hlt |
 | pause | 14 | hlt until interrupt |
 | getuid | 15 | Return 0 (root) |
@@ -70,6 +70,19 @@ All 26 AGNOS syscalls are implemented (v1.21.0). kybernet can run on AGNOS as PI
 |---------|---------|-------|
 | pipe | 25 | Create read/write fd pair, 4KB circular buffer |
 
+### Post-kybernet additions (26-33) -- NOT part of the kybernet bridge
+Added after the original kybernet set, for iron-boot diagnostics, memory, and the userland `agnsh` shell's FS surface. kybernet does not call these; listed for surface-completeness (canonical detail in [`syscall-additions.md`](syscall-additions.md)).
+| Syscall | AGNOS # | Notes |
+|---------|---------|-------|
+| write_boot_checkpoint | 26 | `CMOS[0x50] = byte` — iron-boot progress diagnostic |
+| mmap | 27 | Anonymous, zero-filled, 2 MB-granular (v1.35.3) |
+| munmap | 28 | Release an mmap region + free its 2 MB pages (v1.35.4) |
+| getdents | 29 | Dir-fd readdir → agnos-native dirent records (v1.41.3) |
+| unlink | 30 | Remove a file, mount-routed (v1.41.3) |
+| rename | 31 | Within one filesystem; `newlen` via `a4=r10` (v1.41.3) |
+| link | 32 | Hard link, ext2-only; `a4=r10` (v1.41.3) |
+| stat | 33 | Fills the 48-byte agnos stat struct, ext2 (v1.41.3) |
+
 ### Integration -- READY
 - Build kybernet with `-D AGNOS`
 - Package kybernet ELF in AGNOS initrd
@@ -82,7 +95,7 @@ All 26 AGNOS syscalls are implemented (v1.21.0). kybernet can run on AGNOS as PI
 AGNOS uses its own syscall numbers (not Linux's). The `syscalls_agnos.cyr` backend maps:
 
 ```
-AGNOS syscall table (26 syscalls):
+AGNOS syscall table — kybernet's original 26-call subset (full surface is 0-33; see syscall-additions.md):
  0 = exit          8 = dup           16 = kill
  1 = write         9 = mkdir         17 = sigprocmask
  2 = getpid       10 = rmdir         18 = signalfd

@@ -1,0 +1,1921 @@
+# === 64-bit Cyrius kernel code ===
+
+# Remap the framebuffer as Write-Combining (WC) BEFORE the first paint.
+# gnoboot's GOP capture leaves fb_phys at the firmware-default mapping
+# (WB-cached PAT entry 0 under the archaemenid PAT MSR). WB on a
+# framebuffer means CPU pixel writes batch through L1/L2 and reach the
+# display controller on eviction — visible as refresh-noise / bench-
+# scroll pixel-pattern artifacts (Attempt 68 photo).
+#
+# WC remap (PAT entry 1) coalesces sequential CPU writes into burst
+# transactions, eliminating the cache-eviction-timing artifacts. Range
+# spans `pitch * height` bytes — the full GOP region.
+#
+# If fb_fb_phys() returns 0 (no GOP / serial-only headless), the range
+# loop sees end == start and exits without remap; downstream paints
+# are no-ops via the same fb_phys==0 guard.
+#
+# Attempt 73: range now sourced from fb_size_or_fallback() — prefers
+# the firmware-authoritative GOP Mode->FrameBufferSize (gnoboot 0.4.0+,
+# UEFI 2.10 §11.9.1) over the computed pitch*height. Closes the case
+# where firmware-reported BAR extent differs from the geometry product
+# (BAR padded for alignment, or BAR sized to the next mode up). Under
+# pre-Attempt-73 gnoboots fb_size_or_fallback() returns the legacy
+# pitch*height value — backward-compatible.
+vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
+
+# Populate the 8x8 font in BSS so fb_putc renders glyphs once shell()
+# starts emitting through kprint. Pure data fill — safe to run before
+# any subsystem is up. Now paints into the WC-remapped FB above.
+fb_console_init();
+
+print_agnos_kernel_banner();
+kprintln("64-bit long mode", 16);
+
+# Per-stage CMOS stamps survive hangs and are decoded by
+# agnosticos/scripts/read-boot-log.sh. Slot map: 0x50 = kernel CP,
+# 0x51 = kernel magic, 0x52/0x53 = gnoboot. cp_fb() visual cells were
+# stripped Attempt-29-post: shell-on-iron made the per-stage colored
+# grid noise — kprint mirrors everything to the fb console already.
+# cp_fb() the function remains in fb.cyr; re-add a call here if a new
+# stage needs visual bisection.
+
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x80; 0xE6; 0x71; }   # CP 0x80: pre-gdt
+gdt_init();
+kprintln("GDT loaded", 10);
+
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x81; 0xE6; 0x71; }   # CP 0x81: pre-tss
+tss_init();
+kprintln("TSS loaded (ring 3 ready)", 25);
+
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x82; 0xE6; 0x71; }   # CP 0x82: pre-idt
+idt_init();
+# 1.40.9: replace the bare-iretq default on vectors 0-31 with real handlers
+# that stamp the faulting vector to CMOS[0x54] + halt — so a CPU exception
+# during the ring-3 exec transition stops triple-faulting into a silent reset
+# and instead leaves a readable cause. See exc_handlers_init in idt.cyr.
+exc_handlers_init();
+kprintln("IDT loaded", 10);
+
+# === CMOS kernel checkpoint 6 (arch interrupts ready: GDT+TSS+IDT) ===
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x06; 0xE6; 0x71; }
+
+pic_init();
+kprintln("PIC remapped", 12);
+
+timer_ticks = 0;
+timer_isr_build();
+idt_set_gate(&idt + 32 * 16, &timer_isr, 0x08, 0x8E);
+kprintln("Timer ISR installed", 19);
+
+# Initialize Local APIC (keeps PIC for keyboard IRQ1)
+apic_init();
+# Start APIC timer on vector 32 (same as PIT), ~100Hz
+# QEMU bus freq varies; 10000000 gives roughly 100Hz
+apic_timer_init(32, 10000000);
+kprint("APIC: id=", 9);
+kprint_num(cpu_id);
+kprintln(" timer active", 13);
+
+# === CMOS kernel checkpoint 7 (APIC + timer live) ===
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x07; 0xE6; 0x71; }
+
+# Start Application Processors
+cpu_count = 1;
+ap_ready = 0;
+smp_lock = 0;
+smp_start_aps();
+kprint("SMP: ", 5);
+kprint_num(cpu_count);
+kprintln(" CPUs online", 12);
+
+kb_head = 0;
+kb_tail = 0;
+kb_shift = 0;
+kb_caps = 0;
+kb_ctrl = 0;
+kb_init_tables();
+kb_isr_build();
+idt_set_gate(&idt + 33 * 16, &kb_isr, 0x08, 0x8E);
+kprintln("Keyboard ISR installed (full US QWERTY)", 39);
+
+pt_init();
+kprint("Page tables: ", 13);
+kprint_num(pt_get_mapped_mb());
+kprintln("MB mapped", 9);
+
+# === CMOS kernel checkpoint 8 (page tables built — historical stall point) ===
+# Pre-RDRAND-fix (cyrius 5.11.x, missing -cpu max in QEMU smoke) this was
+# the visible stall. Iron may surface the same or different geometry —
+# CP 8 == reached, CP 8 not reached == pt_init internals faulted.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x08; 0xE6; 0x71; }
+
+pmm_init();
+kprint("PMM: ", 5);
+kprint_num(pmm_free_count());
+kprint(" free / ", 8);
+kprint_num(pmm_total);
+kprintln(" pages", 6);
+
+# 1.30.11 hardening: re-attempt WC remap of the FB, then verify WC took.
+# The line-17 vmm_remap_wc_range above succeeds for FBs in the 32-bit
+# hole (< 1 GB — inline PDE rewrite at 0x3000, no allocation needed)
+# but silently fails for FBs at phys >= 1 GB because vmm_remap_wc_2mb's
+# high-mem path needs pmm_alloc for a fresh PD, and pmm wasn't ready
+# that early in boot. Now that pmm_init has returned, retry: no-op on
+# iron archaemenid (FB BAR sits in the 32-bit hole, PDE already 0x8B
+# from the line-17 call), succeeds on QEMU q35 (FB BAR at 0x80000000)
+# and any future target placing the FB BAR above 1 GB. FB briefly
+# paints WB-cached in the high-BAR case until this retry — benign,
+# display reads from physical memory regardless of cache type.
+#
+# Attempt 73: same fb_size_or_fallback() switch as the line-17 call
+# above. Both call sites must agree on the remap extent or the second
+# call would (under a pre-Attempt-73 gnoboot) shrink/grow coverage
+# differently from the first.
+vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
+fb_verify_wc();
+
+# === CMOS kernel checkpoint 9 (physical memory manager up) ===
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x09; 0xE6; 0x71; }
+
+# KASLR probe — emits the randomized next-free hint so two consecutive
+# boots can be diffed for "did randomization actually fire". Asserted
+# by .github/workflows/ci.yml's boot-test job (two-boot-diff check).
+# v1.28.0.
+kprint("KASLR: pmm_next_free=", 21);
+kprint_num(pmm_next_free);
+kprintln("", 0);
+
+var pg1 = pmm_alloc();
+pmm_free(pg1);
+kprint("PMM test: ", 10);
+kprint_num(pmm_free_count());
+kprintln(" free", 5);
+
+vmm_alloc_at(0x1000000);
+store64(0x1000000, 0xDEAD);
+kprint("VMM: ", 5);
+kprint_num(load64(0x1000000));
+kprintln(" (expect 57005)", 15);
+
+# Initialize kernel heap
+heap_init();
+kprintln("Heap initialized", 16);
+
+# Set the SYSCALL kernel-stack pointer. 1.40.9: this is now a FIXED address
+# (0x3F0000, top of region 1) that pmm_init reserves as kernel — no allocation,
+# no dependency on boot alloc order. The old pmm_alloc_2mb() form pinned to
+# 0x200000 only when region 1 was free here; the KASLR-seeded hint + the allocs
+# above (pmm test / vmm_alloc_at / heap_init) differ on real Zen, so it sometimes
+# relocated to 0x400000 (a user VA the per-process CR3 overrides) → the syscall
+# path faulted on iron (the 1.40.x ring-3 reset). See syscall_kstack_reserve.
+syscall_kstack_reserve();
+
+# === CMOS kernel checkpoint 10 (heap up — kmalloc usable) ===
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0A; 0xE6; 0x71; }
+
+dev_init();
+kprintln("Devices registered", 18);
+
+# === boot_info canary (gnoboot v0.5.0 fill validation) ===
+# Report the sovereign boot_info fields gnoboot fills pre-EBS, so the
+# gnoboot->agnos wire is observable on QEMU (serial) and iron (FB). All
+# reads come from the low <4 GB boot_info_copy (CR3-safe). bi==0 or a
+# wrong magic => not a gnoboot Path-C boot (e.g. bare -kernel) -> report
+# and skip rather than print garbage.
+var bican = load64(&boot_info_ptr);
+if (bican == 0) {
+    kprintln("boot_info: absent", 17);
+} else {
+    if (load32(bican) != 0x41474E4F) {
+        kprintln("boot_info: bad magic", 20);
+    } else {
+        kprint("boot_info: initramfs=0x", 23);
+        kprint_hex(load64(bican + 0x10));
+        kprint(" sz=0x", 6);
+        kprint_hex(load64(bican + 0x18));
+        kprintln("", 0);
+        kprint("boot_info: cmdline=0x", 21);
+        kprint_hex(load64(bican + 0x20));
+        kprint(" rsdp=0x", 8);
+        kprint_hex(load64(bican + 0x38));
+        kprintln("", 0);
+    }
+}
+
+# Parse ACPI tables (RSDP, RSDT, DMAR) for hardware discovery
+acpi_init();
+if (acpi_rsdp_addr != 0) {
+    kprint("ACPI: RSDP at ", 14);
+    kprint_num(acpi_rsdp_addr);
+    if (acpi_rsdp_via_bootinfo != 0) { kprint(" (boot_info)", 12); }
+    kprintln("", 0);
+    if (acpi_dmar_addr != 0) {
+        kprint("ACPI: DMAR at ", 14);
+        kprint_num(acpi_dmar_addr);
+        kprint(" IOMMU base=", 12);
+        kprint_num(acpi_iommu_base);
+        kprintln("", 0);
+    }
+} else {
+    kprintln("ACPI: no RSDP found", 19);
+}
+
+pci_scan();
+kprint("PCI: ", 5);
+kprint_num(pci_count);
+kprintln(" devices", 8);
+
+# === CMOS kernel checkpoint 11 (ACPI + PCI enumerated) ===
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0B; 0xE6; 0x71; }
+
+# Repair (GG) 2026-05-17 — disable AMD-Vi before any device DMA. On
+# AMD Renoir 1022:1639 (archaemenid) firmware enables AMD-Vi by default;
+# without OS-side DTE setup ALL device DMA is silently blocked. AGNOS
+# only ships Intel VT-d below this point. amd_iommu_disable() pokes the
+# IOMMU cap at PCI 0:0.2, finds the MMIO base, and writes the Control
+# Register to 0 — passthrough for everyone. Intel boxes no-op (no cap
+# 0x0F at 0:0.2). See iron-nuc-zen-log.md § Attempt 57 → 58.
+amd_iommu_disable();
+
+# xHCI Phase 1 — locate the USB 3.x host controller (if present),
+# identity-map already covered by pt_init (0–4 GB), read capability
+# window, cache MaxSlots/MaxIntrs/MaxPorts/CSZ/DBOFF/RTSOFF as module
+# globals for later phases. Probe-only — no controller reset, no DMA,
+# no port enumeration. CMOS checkpoint 0x30 stamps on success.
+xhci_probe();
+
+# xHCI Phase 2 (halt + reset bite) — clear R/S, wait HCH, write HCRST,
+# wait for it to self-clear, then wait for CNR. Leaves the controller
+# in the spec-defined "halted, reset clean" state that DMA-structure
+# programming (DCBAA / cmd ring / event ring) assumes. No-op if the
+# probe didn't find a controller. CMOS checkpoint 0x31 stamps on
+# success. See planning/usb-hid-keyboard-driver.md § Phase 2.
+xhci_init();
+
+# xHCI Phase 3 — port enumeration. Walks the root hub, resets any
+# connected port, issues Enable Slot + Address Device, fetches the
+# device descriptor, and flags HID boot keyboards. One framebuffer
+# line per connected port; CMOS checkpoint 0x32 stamps when at least
+# one device is addressed. See planning/usb-hid-keyboard-driver.md
+# § Phase 3.
+xhci_enumerate();
+
+# HID-boot keyboard layer (Phase 4 + Phase 5 per
+# planning/usb-hid-keyboard-driver.md). Phase 4 walks the configuration
+# descriptor on every addressed slot, issues Configure Endpoint +
+# SET_PROTOCOL=boot on the first HID-boot-keyboard interface found, and
+# arms the interrupt-IN transfer ring. Phase 5 is poll-driven from
+# kb_has_key() — the existing scancode_to_ASCII path consumes the
+# resulting PS/2 byte stream unchanged.
+#
+# Iterating slots (rather than only inspecting xhci_kbd_slot_id) catches
+# the common case where bDeviceClass=0 and HID class lives on the
+# interface descriptor — hid_kbd_configure's config-descriptor walk
+# does the actual class triple match. First-success wins; subsequent
+# addressed slots are skipped because hid_kbd_slot_id != 0 short-circuits
+# hid_kbd_configure on entry.
+hid_kbd_init();
+for (var s = 1; s <= 64; s = s + 1) {
+    if (hid_kbd_slot_id != 0) { break; }
+    var sctx = xhci_slot_get(xhci_slot_input_ctx, s);
+    if (sctx != 0) {
+        hid_kbd_configure(s);
+    }
+}
+
+# USB Mass Storage Phase 1 (1.31.2 storage arc — discovery only). Walks
+# every addressed xHCI slot, matches the MSC-BBB class triple
+# (0x08/0x06/0x50) on each interface, captures bulk-IN + bulk-OUT
+# endpoints and MaxLUN. Pure read-only — no bulk transfers, no SCSI yet.
+# Phase 2 (CBW/CSW + bulk Normal TRBs) + Phase 3 (INQUIRY / READ
+# CAPACITY) + Phase 4 (READ(10) / WRITE(10) + block-layer registration)
+# follow under the same 1.31.2 cycle.
+msc_enumerate();
+
+# Initialize IOMMU if DMAR table found (S10: restrict DMA)
+if (acpi_iommu_base != 0) {
+    if (iommu_init() == 0) {
+        kprintln("IOMMU: VT-d enabled, DMA restricted", 35);
+    } else {
+        kprintln("IOMMU: init failed", 18);
+    }
+}
+
+# r8169 (RTL8111/8168/8169) Phases 1-3 — runs alongside VirtIO-net.
+# Iron only — silent no-op in QEMU's virtio-net-pci config. On
+# archaemenid (10ec:8168 rev 15 at 0000:01:00.0 per lspci): Phase 1
+# probe (PCI + MAC + reset), then RX ring init, then TX ring init.
+# Phase 4 nic_send/nic_poll dispatcher in r8169.cyr already routes
+# net.cyr's egress/ingress through whichever NIC is up.
+if (r8169_probe() == 1) {
+    r8169_init_rx();
+    r8169_init_tx();
+}
+
+if (pci_find(0x1AF4, 0x1000) >= 0) {
+    if (virtio_net_init() == 0) {
+        kprint("VirtIO-net: MAC=", 16);
+        for (var mi = 0; mi < 6; mi = mi + 1) {
+            kprint_byte(load8(&vnet_mac + mi));
+            if (mi < 5) { kprint(":", 1); }
+        }
+        kprintln("", 0);
+        net_init(ip4(10,0,2,15), ip4(10,0,2,2), ip4(255,255,255,0));
+        kprintln("Net: 10.0.2.15/24 gw 10.0.2.2", 29);
+        # TCP_LISTEN_SMOKE hook runs LATER (post-interrupt-enable, just
+        # before kybernet launch) so arch_wait() actually waits instead
+        # of HLT-hanging on no-IRQ. See the gated block ~line 660.
+    }
+}
+
+# FIX #2 (1.32.1 per dhcp-end-to-end-audit.md): on the iron path (r8169 active,
+# virtio absent) the virtio branch above never runs, so net_init() was never
+# called and net_ip / net_gateway / net_netmask stayed at module-default zero.
+# Net_ip=0 is correct for DHCP DISCOVER (RFC 2131 §4.4.1 — client has no lease)
+# but leaving the stack in a never-initialized state means latent breakage for
+# any post-DHCP ARP / route decision. Idempotent — last write wins; if the
+# virtio branch ran above this overwrites with zeros, which is fine pre-DHCP
+# (dhcp_init() will fill the real values on success).
+if (nic_ready() == 1) {
+    if (vnet_active == 0) {
+        # Real-iron path — net_init wasn't called by virtio. Initialize the
+        # net stack with zeros so dhcp_init can fill in the real lease.
+        net_init(0, 0, 0);
+    }
+}
+# RTC boot clock (1.35.5) — seed the wall clock locally from the CMOS RTC so the
+# kernel knows the time with no network. Independent of the NIC; the timer has
+# been live since checkpoint 7. A later `ntp <server>` refines/overrides it.
+# See agnosticos/docs/development/rtc-boot-clock-prior-art.md.
+var rtc_t = net_clock_seed_rtc();
+if (rtc_t != 0) {
+    kprint("Wall clock: RTC seed Unix ", 26);
+    kprint_num(rtc_t);
+    kprintln("", 0);
+}
+if ((pci_find(0x1AF4, 0x1042) >= 0) | (pci_find(0x1AF4, 0x1001) >= 0)) {
+    if (virtio_blk_init() == 0) {
+        kprint("VirtIO-blk: ", 12);
+        kprint_num(vblk_capacity);
+        kprintln(" sectors", 8);
+    }
+}
+# RAM-disk Phase 1 (1.31.4) — pure-RAM block backend, build-flag gated. When
+# RAMDISK_ENABLE=1 is set at compile time (`RAMDISK_ENABLE=1 ./scripts/build.sh`),
+# preallocates 64 pages (256 KB) at boot via pmm_alloc and registers as the
+# lowest-priority block backend. Production boots leave this off — zero pmm
+# cost. See agnosticos/docs/development/ramdisk-virtio-modern-prior-art.md.
+#ifdef RAMDISK_ENABLE
+if (ramdisk_init() == 0) {
+    ramdisk_register_block_dev();
+}
+#endif
+# NVMe Phase 1 — locate the NVMe controller (if present), remap BAR0
+# as UC, read CAP + VS, decode capability fields, drive the controller
+# into the disabled state (CC.EN=0, CSTS.RDY=0). Probe-only — no admin
+# queue, no DMA, no namespace I/O. CMOS checkpoints 0x40 / 0x41 stamp
+# on success of each stage. No-op if no NVMe device is present.
+nvme_probe();
+nvme_disable();
+# NVMe Phase 2 — allocate Admin SQ + Admin CQ + IDENTIFY scratch,
+# program AQA/ASQ/ACQ, set CC.EN=1, wait CSTS.RDY=1, submit
+# IDENTIFY CONTROLLER (CNS=0x01) + IDENTIFY NAMESPACE NSID=1
+# (CNS=0x00), parse VID / SN / MN / FR / NN / MDTS / NSZE / LBA size.
+# Polling-only (MSI-X is Phase 5). CMOS checkpoints 0x42 (admin
+# ready) and 0x43 (both IDENTIFY commands completed) stamp on
+# success. No-op if Phase 1 didn't find a controller. Phase 3 adds
+# I/O queue creation + blocking read.
+if (nvme_admin_init() == 1) {
+    nvme_identify_ctrl();
+    nvme_identify_ns(1);
+    # NVMe Phase 3 — Create I/O CQ + Create I/O SQ via admin commands
+    # (qid=1, 64 entries each, polling-only — MSI-X is Phase 5). CMOS
+    # checkpoint 0x44 stamps when both creates land.
+    #
+    # NVMe Phase 4 — adds the write path + multi-LBA + PRP2 + PRP list
+    # (coded; PRP2/list not boot-demo'd until block_dev callers in
+    # Phase 5 ask for larger transfers). The R/W demo here exercises
+    # three round-trips: LBA 0 read (Phase 3 carry-forward, kcp 0x45),
+    # LBA 5 single-LBA write-then-read (kcp 0x46), LBA 20-27 multi-LBA
+    # (8 LBAs = one page, PRP1-only path, kcp 0x47). PASS/FAIL prints
+    # to serial; mismatches don't halt — the visual receipt is the
+    # post-mortem signal.
+    if (nvme_io_queue_init() == 1) {
+        nvme_rw_demo();
+        # NVMe Phase 5 — register NVMe with the block-dispatch layer.
+        # Overrides whatever virtio-blk_init registered earlier so
+        # NVMe is the production-bound block backend; virtio is the
+        # QEMU-only fallback. CMOS kcp 0x48 stamps on success.
+        nvme_register_block_dev();
+    }
+}
+# GPT Phase 1 — probe the active block backend (NVMe-first by override
+# policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
+# decode + walk the first 4 KB of the partition entry array, print a one-
+# line summary. No-op if no block backend is active, LBA 1 read fails,
+# or the signature check fails (typical on unpartitioned disks — e.g.,
+# archaemenid's NVMe at iron debut, where LBA 0 = all zeros). CMOS kcps
+# 0x49 (header valid) / 0x4A (array walked) extend NVMe's 0x40-0x48
+# sequence.
+# AHCI Phase 1 — locate the AHCI/SATA controller (if present), remap
+# BAR5 (ABAR) as UC, read CAP/GHC/VS/PI, walk implemented ports for
+# SSTS/SIG. Read-only probe — no HBA reset, no port init, no command
+# list, no IDENTIFY. Mirrors NVMe Phase 1's shape. CMOS kcps 0x4B / 0x4C
+# stamp on each stage. No-op if no AHCI device is present (QEMU
+# NVMe-only smoke) — typical for archaemenid's M.2-NVMe-as-only-disk
+# initial bring-up; will light up when SATA `sda` is on the bus.
+if (ahci_probe() == 1) {
+    ahci_enum_ports();
+    # AHCI Phase 2 — per-port CL+FIS allocation + spin-up + start for
+    # each implemented SATA port (DET=3, SIG=SATA). ATAPI/PM/SEMB
+    # ports skipped. HBA reset is OPTIONAL per spec §10.1.2 and skipped
+    # here — UEFI/gnoboot left the controller in a working state and a
+    # reset would force PHY re-handshake for no gain.
+    if (ahci_init_all() > 0) {
+        # AHCI Phase 3 — issue ATA IDENTIFY DEVICE (cmd 0xEC) on each
+        # initialized SATA port, parse model / serial / firmware /
+        # LBA48 capacity. First exercise of the CL+FIS path; CMOS kcp
+        # 0x4F stamps on first successful IDENTIFY.
+        ahci_identify_all();
+        # AHCI Phase 4 — boot-time R/W round-trip demo on the first
+        # initialized port (mirrors nvme_rw_demo). Then register with
+        # the block layer; policy is "don't override NVMe" so on a
+        # box with both, AHCI registers as secondary visibility only
+        # (blk_active stays BLK_NVME). CMOS kcp 0x50 stamps on
+        # registration.
+        ahci_read_demo();
+        #ifdef AHCI_RW_DEMO
+        ahci_write_demo();
+        #endif
+        ahci_register_block_dev();
+    }
+}
+
+# USB Mass Storage Phase 4 — block-layer registration. Tertiary backend
+# (after NVMe + AHCI); takes the slot only when neither is present, OR
+# when only VIRTIO holds it (real-iron USB beats paravirt). The MSC
+# class driver's Phase 3 (INQUIRY + READ CAPACITY) has already populated
+# the per-slot row's last_lba + lba_bytes by the time control reaches
+# here.
+msc_register_block_dev();
+msc_read_demo();
+#ifdef MSC_RW_DEMO
+msc_write_demo();
+#endif
+
+if (gpt_init() == 1) {
+    # Phase 2 — dump the full partition table at boot so iron + QEMU
+    # bring-up runs see the same surface as the `parts` shell command
+    # without needing keyboard injection. Costs one extra 16 KB of disk
+    # reads (4 chunks × 4 KB scratch). Negligible vs the value of having
+    # the table visible on every boot during the storage arc.
+    gpt_print_all_partitions();
+}
+vfs_init();
+kprintln("VFS initialized", 15);
+
+# ext2 / ext4 read-only filesystem mount attempt. Quiet on non-ext2
+# disks (most boots); logs geometry on success. Reads superblock + BGDT
+# + caches inode geometry; file IO surfaces via the `ls`/`cat` shell
+# verbs that consume ext2_open + vfs_read. See agnosticos/docs/development/
+# ext2-ext4-extents-prior-art.md for the multi-source convergent port.
+ext2_init();
+
+# FAT-family mount (1.34.x) — backend-agnostic, partition-aware probe
+# (lifted out of the old virtio-only branch). Runs after the block
+# backends register + GPT parse so it can find a FAT on any backend or
+# in the ESP / MSFT-Basic partition. Silent on no-FAT (prints its own
+# "fat: mounted FAT.." line on success). Independent of the ext2 mount.
+fatfs_init();
+
+# exFAT mount (1.34.1) — a FAT-family SIBLING module, near-zero shared
+# code with fatfs (allocation bitmap, typed dir-entry sets, no BPB). Runs
+# after fatfs_init: fatfs self-excludes exFAT (BytsPerSec@11 == 0), so the
+# two coexist on one disk (FAT32 ESP + exFAT MSFT-Basic partition). Silent
+# on no-exFAT; prints its own "exfat: mounted .." on success. Read only in
+# this bite. See agnosticos/docs/development/exfat-prior-art.md.
+exfat_init();
+
+# Mount-point namespace (1.40.13). Build the {prefix->backend} routing table
+# now that ext2/fat/exfat have each set their *_active flags: ext2 at "/",
+# FAT/exFAT also under /mnt/... so shell verbs can reach them WHILE ext2 owns
+# "/". Longest-prefix match in vfs_resolve_mount does the routing — replaces
+# the old ext2_active-flag toggle that hid FAT/exFAT behind a mounted ext2.
+vfs_mount_init();
+
+# FAT read self-test (1.34.x bite 2, compile-gated via FATFS_SELFTEST).
+# Gates the FAT32 + chain-traversal read path: list the root, find the
+# seeded multi-cluster FATTEST.BIN (3000 B, byte[i] = i & 0xFF), read it
+# back via the cluster chain, byte-verify at offsets that prove we read
+# PAST the first 512-byte cluster (the old reader's cap). fat-smoke.sh.
+#ifdef FATFS_SELFTEST
+if (fatfs_active == 1) {
+    var fst_lc = fatfs_ls();
+    kprint("fatr: mounted type=", 19);
+    kprint_num(fatfs_type);
+    kprint(" lscount=", 9);
+    kprint_num(fst_lc);
+    kprintln("", 0);
+    var fst_name = "FATTEST.BIN";
+    var fst_res[16];
+    if (fatfs_find_root(fst_name, 11, &fst_res) == 1) {
+        var fst_cl = load64(&fst_res);
+        var fst_sz = load64(&fst_res + 8);
+        var fst_got = fatfs_read(fst_cl, &fatfs_file_buf, 3000);
+        kprint("fatr: FATTEST.BIN size=", 23);
+        kprint_num(fst_sz);
+        kprint(" got=", 5);
+        kprint_num(fst_got);
+        kprintln("", 0);
+        var fst_ok = 1;
+        if (fst_got != 3000) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 0) != 0) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 255) != 255) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 256) != 0) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 1000) != (1000 & 0xFF)) { fst_ok = 0; }
+        if (load8(&fatfs_file_buf + 2999) != (2999 & 0xFF)) { fst_ok = 0; }
+        if (fst_ok == 1) { kprintln("fatr: chain-read OK", 19); }
+        else { kprintln("fatr: chain-read FAIL", 21); }
+    } else {
+        kprintln("fatr: FATTEST.BIN not found", 27);
+    }
+    # 1.40.13 mount-namespace: drive the real shell `cat` verb against the FAT
+    # mount. sh_cmd_cat -> vfs_resolve_mount -> FS_FAT -> vfs_open_on -> fatfs_open.
+    # The file's content ("VFS-CAT-FAT-OK") proves the shell read path reaches
+    # FAT through an explicit /mnt/fat path even when ext2 owns "/". fat-smoke.sh.
+    sh_cwd_init();
+    kprintln("vfscat: shell cat over FAT ->", 29);
+    sh_exec("cat /mnt/fat/CATTEST.TXT", 24);
+    # `ls` the FAT mount root — sh_cmd_ls -> FS_FAT -> vfs_print_dir_on -> fatfs_ls.
+    # The 8.3 names (CATTEST.TXT, FATTEST.BIN) prove `ls /mnt/fat` lists the FAT
+    # root regardless of what owns "/". fat-smoke.sh gates it.
+    kprintln("vfsls: shell ls over FAT ->", 27);
+    sh_exec("ls /mnt/fat", 11);
+}
+#endif
+
+# 1.41.8 — syscall-driven FS-verb helpers for the FAT/exFAT write selftests.
+# These replace the sh_exec("touch/echo>/mkdir/rmdir ...") drives so the selftests
+# no longer depend on the in-kernel shell's write verbs (deleted by the shell-
+# shrink). Each takes a >=2 MB pmm_alloc_2mb scratch `su` (passes is_user_range):
+# the mount-relative absolute path goes at su+0, echo content at su+64. `plen` is
+# the PATH byte-length (NOT a shell arg-count). The syscalls mount-route to
+# FAT/exFAT exactly as the verbs did, producing identical on-disk files. Ungated
+# (tiny; DCE drops them when no selftest is compiled).
+fn sc_touch(path) {
+    var su = pmm_alloc_2mb();
+    if (su == 0) { return 0 - 1; }
+    var plen = strlen(path);
+    memcpy(su, path, plen);
+    var fd = ksyscall(7, su, plen, 0x100);              # open AO_CREAT (empty file)
+    if (fd >= 0) { ksyscall(6, fd, 0, 0); }
+    pmm_free_2mb(su);
+    return 0;
+}
+fn sc_echo(path, content) {
+    var su = pmm_alloc_2mb();
+    if (su == 0) { return 0 - 1; }
+    var plen = strlen(path);
+    var clen = strlen(content);
+    memcpy(su, path, plen);
+    memcpy(su + 64, content, clen);
+    store8(su + 64 + clen, 10);                          # trailing '\n' like the echo verb
+    var fd = ksyscall(7, su, plen, 0x301);              # open AO_WRONLY|AO_CREAT|AO_TRUNC
+    if (fd >= 0) { ksyscall(1, fd, su + 64, clen + 1); ksyscall(6, fd, 0, 0); }
+    pmm_free_2mb(su);
+    return 0;
+}
+fn sc_mkdir(path) {
+    var su = pmm_alloc_2mb();
+    if (su == 0) { return 0 - 1; }
+    var plen = strlen(path);
+    memcpy(su, path, plen);
+    var rc = ksyscall(9, su, plen);                     # mkdir
+    pmm_free_2mb(su);
+    return rc;
+}
+fn sc_rmdir(path) {
+    var su = pmm_alloc_2mb();
+    if (su == 0) { return 0 - 1; }
+    var plen = strlen(path);
+    memcpy(su, path, plen);
+    var rc = ksyscall(10, su, plen);                    # rmdir
+    pmm_free_2mb(su);
+    return rc;
+}
+
+# FAT write self-test (1.34.x bite 3, compile-gated via FATFS_WRITE_SELFTEST).
+# Creates an empty 8.3 file in the mounted FAT root; fat-write-smoke.sh
+# then gates on fsck.fat -n clean + mdir showing NEWFILE.TXT.
+#ifdef FATFS_WRITE_SELFTEST
+if (fatfs_active == 1) {
+    # 3a — empty-file create (dirent only)
+    var fw_name = "NEWFILE.TXT";
+    var fw_rc = fatfs_create(fw_name, 11);
+    kprint("fatw: create NEWFILE.TXT rc=", 28);
+    kprint_num(fw_rc);
+    kprintln("", 0);
+    # 3b — multi-cluster content write (3000 B, byte[i] = i & 0xFF). The
+    # byte-exact readback check is the harness's job (fat-write-smoke.sh
+    # fsck.fat's the FS + mtype-diffs WTEST.BIN against the host pattern);
+    # here we just drive the write + report rc.
+    var wi = 0;
+    while (wi < 3000) { store8(&fatfs_file_buf + wi, wi & 0xFF); wi = wi + 1; }
+    var fw2_name = "WTEST.BIN";
+    var fw2_rc = fatfs_write_file(fw2_name, 9, &fatfs_file_buf, 3000);
+    kprint("fatw: write WTEST.BIN rc=", 25);
+    kprint_num(fw2_rc);
+    kprintln("", 0);
+    # 3c — delete + truncate. Separate files (DELME / TRUNC) so the 3b
+    # WTEST.BIN content check stays valid. fatfs_file_buf still holds the
+    # pattern (write_file doesn't mutate src), so reuse its first 2000 B.
+    var dl_name = "DELME.BIN";
+    var dl_wrc = fatfs_write_file(dl_name, 9, &fatfs_file_buf, 2000);
+    var dl_drc = fatfs_delete(dl_name, 9);
+    kprint("fatw: delete DELME.BIN wrc=", 27);
+    kprint_num(dl_wrc);
+    kprint(" drc=", 5);
+    kprint_num(dl_drc);
+    kprintln("", 0);
+    var tr_name = "TRUNC.BIN";
+    var tr_wrc = fatfs_write_file(tr_name, 9, &fatfs_file_buf, 2000);
+    var tr_rc = fatfs_truncate_zero(tr_name, 9);
+    kprint("fatw: trunc TRUNC.BIN wrc=", 26);
+    kprint_num(tr_wrc);
+    kprint(" trc=", 5);
+    kprint_num(tr_rc);
+    kprintln("", 0);
+    # 3d — LFN create (long name needing 2 LFN entries; mtools/fsck
+    # reconstruct + checksum-validate the name on the host).
+    var lf_name = "LongFileName12345.txt";
+    var lf_rc = fatfs_create_lfn(lf_name, 21);
+    kprint("fatw: lfn create rc=", 20);
+    kprint_num(lf_rc);
+    kprintln("", 0);
+    # 3e — overwrite-existing + arbitrary-length truncate. fatfs_file_buf
+    # still holds the i&0xFF pattern. WOVER: write 1000 B then overwrite
+    # with 2000 B (must free the old chain + replace). TRUNC2: write 3000 B
+    # then truncate to 1000 B (must free the tail clusters).
+    var ov_name = "WOVER.BIN";
+    var ov_rc1 = fatfs_write_file(ov_name, 9, &fatfs_file_buf, 1000);
+    var ov_rc2 = fatfs_write_file(ov_name, 9, &fatfs_file_buf, 2000);
+    kprint("fatw: overwrite WOVER.BIN rc1=", 30);
+    kprint_num(ov_rc1);
+    kprint(" rc2=", 5);
+    kprint_num(ov_rc2);
+    kprintln("", 0);
+    var t2_name = "TRUNC2.BIN";
+    var t2_wrc = fatfs_write_file(t2_name, 10, &fatfs_file_buf, 3000);
+    var t2_rc = fatfs_truncate(t2_name, 10, 1000);
+    kprint("fatw: trunc2 TRUNC2.BIN wrc=", 28);
+    kprint_num(t2_wrc);
+    kprint(" trc=", 5);
+    kprint_num(t2_rc);
+    kprintln("", 0);
+    # 1.34.3 bite 1 — LFN-with-content: a long-named file carrying 3000 B
+    # (fatfs_file_buf still holds the i&0xFF pattern). fat-write-smoke.sh
+    # mtype-reads it back by its long name + fsck.fat -n clean.
+    var lc_name = "LongContent12345.bin";
+    var lc_rc = fatfs_write_file_lfn(lc_name, 20, &fatfs_file_buf, 3000);
+    kprint("fatw: lfn-content rc=", 21);
+    kprint_num(lc_rc);
+    kprintln("", 0);
+    # 1.34.3 bite 2 — LFN-name overwrite-match: write a long-named file, then
+    # overwrite it BY ITS LONG NAME (find must reassemble the long name, not
+    # 8.3-mangle the query). 3000 B → 2000 B; the smoke verifies the result is
+    # the 2000-B content + a SINGLE dir entry (no duplicate long name).
+    var lo_name = "LfnOver12345.bin";
+    var lo_r1 = fatfs_write_file_lfn(lo_name, 16, &fatfs_file_buf, 3000);
+    var lo_r2 = fatfs_write_file_lfn(lo_name, 16, &fatfs_file_buf, 2000);
+    kprint("fatw: lfn-overwrite rc1=", 24);
+    kprint_num(lo_r1);
+    kprint(" rc2=", 5);
+    kprint_num(lo_r2);
+    kprintln("", 0);
+    # 1.34.3 bite 3 — grow-truncate: write 1000 B, grow to 3000 B. The grown
+    # region [1000,3000) must read as zeros; fat-write-smoke.sh verifies.
+    var gr_name = "GROW.BIN";
+    var gr_w = fatfs_write_file(gr_name, 8, &fatfs_file_buf, 1000);
+    var gr_t = fatfs_truncate(gr_name, 8, 3000);
+    kprint("fatw: grow GROW.BIN w=", 22);
+    kprint_num(gr_w);
+    kprint(" t=", 3);
+    kprint_num(gr_t);
+    kprintln("", 0);
+    # 1.34.4 (FAT side) — FAT32 root extension + cross-sector LFN runs: create
+    # 40 LFN-named files (`LfNN_longx.dat`, 3 dir entries each = 120, far past
+    # what the host pre-allocated for the root) with content. Distinct 6-char
+    # bases (`LFNN_L`) so the ~N alias generator doesn't collide. All must
+    # create rc=0; fat-write-smoke.sh gates fsck.fat -n clean + readback —
+    # forces the root to grow + LFN sets to straddle cluster boundaries.
+    var lnb[16];
+    store8(&lnb + 0, 76); store8(&lnb + 1, 102);        # "Lf"
+    store8(&lnb + 4, 95); store8(&lnb + 5, 108); store8(&lnb + 6, 111);  # "_lo"
+    store8(&lnb + 7, 110); store8(&lnb + 8, 103); store8(&lnb + 9, 120); # "ngx"
+    store8(&lnb + 10, 46); store8(&lnb + 11, 100); store8(&lnb + 12, 97); store8(&lnb + 13, 116);  # ".dat"
+    var rxn_fail = 0;
+    var rxn = 0;
+    while (rxn < 40) {
+        store8(&lnb + 2, 48 + (rxn / 10));              # tens digit (varies the basis)
+        store8(&lnb + 3, 48 + (rxn % 10));              # ones digit
+        if (fatfs_write_file_lfn(&lnb, 14, &fatfs_file_buf, 50) != 0) { rxn_fail = rxn_fail + 1; }
+        rxn = rxn + 1;
+    }
+    kprint("fatw: fatrootext 40 lfn files nfail=", 36);
+    kprint_num(rxn_fail);
+    kprintln("", 0);
+    # read Lf39_longx.dat back (last created — in an extended root cluster).
+    store8(&lnb + 2, 51); store8(&lnb + 3, 57);         # "39"
+    var rxn_res[16];
+    var rxn_ok = 0;
+    if (fatfs_find_lfn(&lnb, 14, &rxn_res) == 1) {
+        var rxn_cl = load64(&rxn_res);
+        var rxn_got = fatfs_read(rxn_cl, &fatfs_file_buf, 50);
+        rxn_ok = 1;
+        if (rxn_got != 50) { rxn_ok = 0; }
+        if (load8(&fatfs_file_buf + 0) != 0) { rxn_ok = 0; }
+        if (load8(&fatfs_file_buf + 49) != (49 & 0xFF)) { rxn_ok = 0; }
+    }
+    if (rxn_ok == 1) { kprintln("fatw: fatrootext readback OK", 28); }
+    else { kprintln("fatw: fatrootext readback FAIL", 30); }
+    # 1.40.13 mount-namespace: drive the real shell write verbs against the FAT
+    # mount at /mnt/fat. This is the routing fix's whole point — the verbs reach
+    # FAT *through the shell while ext2 owns "/"* (exactly the iron config: ext2
+    # carries /bin, FAT is the data partition). Previously these used bare names
+    # and only worked when ext2 was absent (the ext2-less QEMU smoke); on iron,
+    # ext2 mounted, every verb fell into the ext2 branch and failed (the
+    # 14013_boot_cmd_fails burn). sh_cmd_touch/echo/... -> vfs_resolve_mount ->
+    # FS_FAT -> vfs_create_on/... -> fatfs_*. Files land at the FAT root (=/mnt/
+    # fat), so fat-write-smoke.sh's mdir/fsck checks (SHTOUCH.TXT empty-create,
+    # SHECHO.TXT "SHELL-FAT-WROTE") are unchanged. CWD init'd for any bare path.
+    sh_cwd_init();
+    # 1.41.8 — the FAT write verbs are now driven by SYSCALLS (sc_touch/sc_echo/
+    # sc_mkdir/sc_rmdir → ksyscall), decoupling the selftest from the in-kernel
+    # shell write verbs (deleted by the shell-shrink). rm/mv/sync/cat stay shell
+    # verbs (recovery set). Same backend path + identical on-disk files, so
+    # fat-write-smoke's mdir/mtype/fsck checks are unchanged. One su scratch for
+    # the whole block (path@su+0, content@su+64, syswr readback@su+128).
+    var su = pmm_alloc_2mb();
+    if (su != 0) {
+        kprintln("vfsw: syscall touch+echo over FAT ->", 36);
+        sc_touch("/mnt/fat/SHTOUCH.TXT");
+        sc_echo("/mnt/fat/SHECHO.TXT", "SHELL-FAT-WROTE");
+        # `rm` (KEPT recovery verb) — dedicated target so SHTOUCH/SHECHO stay valid.
+        sc_touch("/mnt/fat/SHRMTGT.TXT");
+        sh_exec("rm /mnt/fat/SHRMTGT.TXT", 23);
+        # mkdir/rmdir over FAT. SHKEEP kept (navigable dir); SHRMD created+removed.
+        sc_mkdir("/mnt/fat/SHKEEP");
+        sc_mkdir("/mnt/fat/SHRMD");
+        sc_rmdir("/mnt/fat/SHRMD");
+        # mv (KEPT) + sync (KEPT). SHMVA→SHMVB; smoke checks B present, A gone.
+        sc_touch("/mnt/fat/SHMVA");
+        sh_exec("mv /mnt/fat/SHMVA /mnt/fat/SHMVB", 32);
+        sh_exec("sync", 4);
+        # Subdirectory paths under the FAT mount (fatfs_resolve_parent end-to-end).
+        sc_mkdir("/mnt/fat/SHSUB");
+        sc_echo("/mnt/fat/SHSUB/SUBKEEP.TXT", "SUBDIR-FAT-OK");
+        sc_touch("/mnt/fat/SHSUB/SUBRM.TXT");
+        sh_exec("rm /mnt/fat/SHSUB/SUBRM.TXT", 27);
+        sc_mkdir("/mnt/fat/SHSUB/SUBD1");
+        sh_exec("mv /mnt/fat/SHSUB/SUBD1 /mnt/fat/SHSUB/SUBD2", 44);
+        kprintln("vfsw: subdir paths over FAT done", 32);
+        sh_exec("cat /mnt/fat/SHSUB/SUBKEEP.TXT", 30);
+        # 1.41.7 — SYSCALL-driven FAT write+readback (shares the su scratch).
+        memcpy(su + 0,  "/mnt/fat/SYSWR.TXT", 18);
+        memcpy(su + 64, "SYSCALL-FAT-WR", 14);
+        var swfd = ksyscall(7, su + 0, 18, 0x301);          # AO_WRONLY|AO_CREAT|AO_TRUNC
+        if (swfd < 0) { kprintln("syswr: open-w FAIL", 18); }
+        else {
+            var swn = ksyscall(1, swfd, su + 64, 14);        # write
+            ksyscall(6, swfd, 0, 0);                          # close -> flush whole file
+            if (swn != 14) { kprintln("syswr: write-len FAIL", 21); }
+            else {
+                var srfd = ksyscall(7, su + 0, 18, 0);      # AO_RDONLY read-back
+                if (srfd < 0) { kprintln("syswr: open-r FAIL", 18); }
+                else {
+                    var srn = ksyscall(5, srfd, su + 128, 64);
+                    ksyscall(6, srfd, 0, 0);
+                    if (srn != 14) { kprintln("syswr: read-len FAIL", 20); }
+                    elif (load8(su + 128) != 83) { kprintln("syswr: content-S FAIL", 21); }
+                    elif (load8(su + 128 + 13) != 82) { kprintln("syswr: content-R FAIL", 21); }
+                    else { kprintln("syswr: FAT write+readback OK", 28); }
+                }
+            }
+        }
+        pmm_free_2mb(su);
+    }
+    # 1.40.1 exec-from-disk bite 1: whole-file read past the 4 KB memfile cap
+    # (vfs_read_file). Write a 6000-byte pattern file, read it back fully into
+    # an 8 KB buffer, verify length + bytes past offset 4096 (the old cap).
+    var rfi = 0;
+    while (rfi < 6000) { store8(&vfs_scratch_buf + rfi, rfi & 0xFF); rfi = rfi + 1; }
+    fatfs_write_file("BIGRF.BIN", 9, &vfs_scratch_buf, 6000);
+    var rfz = 0;
+    while (rfz < 8192) { store8(&vfs_scratch_buf + rfz, 0); rfz = rfz + 1; }   # clear so a short read can't pass on stale bytes
+    var rfn = vfs_read_file("BIGRF.BIN", 9, &vfs_scratch_buf, 8192);
+    var rfok = 1;
+    if (rfn != 6000) { rfok = 0; }
+    if (load8(&vfs_scratch_buf + 0) != 0) { rfok = 0; }
+    if (load8(&vfs_scratch_buf + 5000) != (5000 & 0xFF)) { rfok = 0; }   # past the 4 KB cap
+    if (load8(&vfs_scratch_buf + 5999) != (5999 & 0xFF)) { rfok = 0; }
+    if (rfok == 1) { kprintln("vfsrf: FAT whole-file read past 4KB OK", 38); }
+    else { kprintln("vfsrf: FAT whole-file read FAIL", 31); }
+}
+#endif
+
+# exFAT read self-test (1.34.1 bite 2, compile-gated via EXFAT_SELFTEST).
+# Gates the read substrate against an EMPTY mkfs.exfat volume — no file
+# seeding, no root needed (exfat has no mtools-equivalent): (1) mount +
+# locate the 0x81 bitmap / 0x82 upcase system files, (2) read the up-case
+# table back over its FAT chain and reproduce the TableChecksum baked in
+# by mkfs.exfat — an independent oracle for the multi-cluster chain-read
+# path. If a file WAS seeded (EXFAT_SEED_FILE on the image), also read it
+# back. exfat-smoke.sh.
+#ifdef EXFAT_SELFTEST
+if (exfat_active == 1) {
+    var ex_lc = exfat_ls();
+    kprint("exfatr: lscount=", 16);
+    kprint_num(ex_lc);
+    kprint(" bitmap_clus=", 13);
+    kprint_num(exfat_bitmap_cluster);
+    kprint(" upcase_clus=", 13);
+    kprint_num(exfat_upcase_cluster);
+    kprint(" upcase_len=", 12);
+    kprint_num(exfat_upcase_length);
+    kprintln("", 0);
+    # Multi-cluster FAT-chain read validated against the upcase TableChecksum.
+    var ex_uc = exfat_verify_upcase();
+    if (ex_uc == 1) { kprintln("exfatu: upcase-checksum OK", 26); }
+    else {
+        if (ex_uc == 0) { kprintln("exfatu: upcase-checksum MISMATCH", 32); }
+        else { kprintln("exfatu: upcase-checksum ERROR", 29); }
+    }
+    # Opportunistic file readback (only if EXFTEST.BIN was seeded into the
+    # volume; an empty mkfs.exfat image has no file sets → "not found").
+    var ex_fn = "EXFTEST.BIN";
+    var ex_res[24];
+    if (exfat_find(ex_fn, 11, &ex_res) == 1) {
+        var ex_first = load64(&ex_res);
+        var ex_sz = load64(&ex_res + 8);
+        var ex_nfc = load64(&ex_res + 16);
+        var ex_got = exfat_read(ex_first, ex_nfc, &exfat_file_buf, 3000);
+        kprint("exfatr: EXFTEST.BIN size=", 25);
+        kprint_num(ex_sz);
+        kprint(" got=", 5);
+        kprint_num(ex_got);
+        kprint(" nfc=", 5);
+        kprint_num(ex_nfc);
+        kprintln("", 0);
+        var ex_ok = 1;
+        if (ex_got != 3000) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 0) != 0) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 255) != 255) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 256) != 0) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 1000) != (1000 & 0xFF)) { ex_ok = 0; }
+        if (load8(&exfat_file_buf + 2999) != (2999 & 0xFF)) { ex_ok = 0; }
+        if (ex_ok == 1) { kprintln("exfatr: file-read OK", 20); }
+        else { kprintln("exfatr: file-read FAIL", 22); }
+    } else {
+        kprintln("exfatr: no seeded file (mount + upcase gates only)", 49);
+    }
+    # 1.40.13 mount-namespace: drive the real shell `ls` over the exFAT mount.
+    # sh_cmd_ls -> FS_EXFAT -> vfs_print_dir_on -> exfat_print_dir (name
+    # reconstruction, a mirror of the validated exfat_find set-walk). On an
+    # unseeded volume it prints no file names but proves the dispatch runs
+    # clean; under EXFAT_SEED=1 the seeded name lists. `ls /mnt/exfat` reaches
+    # the exFAT root regardless of what owns "/".
+    sh_cwd_init();
+    kprintln("vfsls: shell ls over exFAT ->", 29);
+    sh_exec("ls /mnt/exfat", 13);
+}
+#endif
+
+# exFAT write self-test (1.34.1 bite 3, compile-gated via EXFAT_WRITE_SELFTEST).
+# 3a — empty-file create (the dir-set write primitive: 0x85+0xC0+0xC1 with
+# SetChecksum + NameHash). exfat-write-smoke.sh extracts the partition after
+# boot and gates on fsck.exfat -n clean (structure + checksum oracle).
+#ifdef EXFAT_WRITE_SELFTEST
+if (exfat_active == 1) {
+    # 3a — empty-file create.
+    var exw_name = "EXWRITE.BIN";
+    var exw_rc = exfat_create(exw_name, 11);
+    kprint("exfatw: create EXWRITE.BIN rc=", 30);
+    kprint_num(exw_rc);
+    kprintln("", 0);
+    var exw_res[24];
+    if (exfat_find(exw_name, 11, &exw_res) == 1) { kprintln("exfatw: create find-back OK", 27); }
+    else { kprintln("exfatw: create find-back FAIL", 29); }
+    # 3b — multi-cluster content write (3000 B, byte[i] = i & 0xFF), then
+    # AGNOS reads it back byte-exact (round-trip); fsck.exfat -n confirms
+    # the bitmap allocation + dir-set on the host (exfat-write-smoke.sh).
+    var wi = 0;
+    while (wi < 3000) { store8(&exfat_file_buf + wi, wi & 0xFF); wi = wi + 1; }
+    var exwc_name = "EXDATA.BIN";
+    var exwc_rc = exfat_write_file(exwc_name, 10, &exfat_file_buf, 3000);
+    kprint("exfatw: write EXDATA.BIN rc=", 28);
+    kprint_num(exwc_rc);
+    kprintln("", 0);
+    var exwc_res[24];
+    if (exfat_find(exwc_name, 10, &exwc_res) == 1) {
+        var exwc_first = load64(&exwc_res);
+        var exwc_len = load64(&exwc_res + 8);
+        var exwc_nfc = load64(&exwc_res + 16);
+        # Read the file back into exfat_file_buf (exfat_read uses exfat_data_buf
+        # as its sector scratch, so this is safe) and verify against the
+        # deterministic pattern byte[i] = i & 0xFF — no need to keep the
+        # source. Offsets past 512 prove the multi-cluster contiguous read.
+        var got = exfat_read(exwc_first, exwc_nfc, &exfat_file_buf, 3000);
+        var exwc_ok = 1;
+        if (exwc_len != 3000) { exwc_ok = 0; }
+        if (got != 3000) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 0) != 0) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 255) != 255) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 256) != 0) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 1000) != (1000 & 0xFF)) { exwc_ok = 0; }
+        if (load8(&exfat_file_buf + 2999) != (2999 & 0xFF)) { exwc_ok = 0; }
+        kprint("exfatw: EXDATA.BIN len=", 23);
+        kprint_num(exwc_len);
+        kprint(" got=", 5);
+        kprint_num(got);
+        kprint(" nfc=", 5);
+        kprint_num(exwc_nfc);
+        kprintln("", 0);
+        if (exwc_ok == 1) { kprintln("exfatw: write round-trip OK", 27); }
+        else { kprintln("exfatw: write round-trip FAIL", 29); }
+    } else { kprintln("exfatw: write find-back FAIL", 28); }
+    # 3c — delete + truncate-to-zero. Separate files (EXDELME / EXTRUNC) so
+    # the 3b EXDATA.BIN check stays valid; exfat_file_buf still holds the
+    # i&0xFF pattern. fsck.exfat -n must stay clean after freeing the
+    # clusters (no leaked / cross-linked cluster, no orphaned dir-set).
+    var exd_name = "EXDELME.BIN";
+    var exd_wrc = exfat_write_file(exd_name, 11, &exfat_file_buf, 2000);
+    var exd_drc = exfat_delete(exd_name, 11);
+    kprint("exfatw: delete EXDELME.BIN wrc=", 31);
+    kprint_num(exd_wrc);
+    kprint(" drc=", 5);
+    kprint_num(exd_drc);
+    kprintln("", 0);
+    var ext_name = "EXTRUNC.BIN";
+    var ext_wrc = exfat_write_file(ext_name, 11, &exfat_file_buf, 2000);
+    var ext_trc = exfat_truncate_zero(ext_name, 11);
+    kprint("exfatw: trunc EXTRUNC.BIN wrc=", 30);
+    kprint_num(ext_wrc);
+    kprint(" trc=", 5);
+    kprint_num(ext_trc);
+    kprintln("", 0);
+    # 1.34.2 — overwrite-existing (in place, no new dir slot): EXDATA.BIN
+    # 3000 B -> 2000 B (the 3b round-trip already validated its content).
+    # Overwrite/truncate operate on an EXISTING file by design, so reusing
+    # EXDATA avoids exhausting the single-cluster root (root-extension is a
+    # 1.34.4 item). exfat_file_buf still holds the i&0xFF pattern.
+    var exov_r = exfat_write_file(exwc_name, 10, &exfat_file_buf, 2000);
+    var exov_res[24];
+    var exov_ok = 0;
+    if (exfat_find(exwc_name, 10, &exov_res) == 1) {
+        var exov_first = load64(&exov_res);
+        var exov_len = load64(&exov_res + 8);
+        var exov_nfc = load64(&exov_res + 16);
+        var ng = exfat_read(exov_first, exov_nfc, &exfat_file_buf, exov_len);
+        exov_ok = 1;
+        if (exov_len != 2000) { exov_ok = 0; }
+        if (ng != 2000) { exov_ok = 0; }
+        if (load8(&exfat_file_buf + 0) != 0) { exov_ok = 0; }
+        if (load8(&exfat_file_buf + 1999) != (1999 & 0xFF)) { exov_ok = 0; }
+    }
+    kprint("exfatw: overwrite EXDATA.BIN rc=", 32);
+    kprint_num(exov_r);
+    kprintln("", 0);
+    if (exov_ok == 1) { kprintln("exfatw: overwrite round-trip OK", 31); }
+    else { kprintln("exfatw: overwrite round-trip FAIL", 33); }
+    # 1.34.2 — arbitrary-length truncate (in place): EXDATA.BIN 2000 -> 1000.
+    var extr_t = exfat_truncate(exwc_name, 10, 1000);
+    var extr_res[24];
+    var extr_ok = 0;
+    if (exfat_find(exwc_name, 10, &extr_res) == 1) {
+        var extr_first = load64(&extr_res);
+        var extr_len = load64(&extr_res + 8);
+        var extr_nfc = load64(&extr_res + 16);
+        var tg = exfat_read(extr_first, extr_nfc, &exfat_file_buf, extr_len);
+        extr_ok = 1;
+        if (extr_len != 1000) { extr_ok = 0; }
+        if (tg != 1000) { extr_ok = 0; }
+        if (load8(&exfat_file_buf + 999) != (999 & 0xFF)) { extr_ok = 0; }
+    }
+    kprint("exfatw: trunc EXDATA.BIN t=", 27);
+    kprint_num(extr_t);
+    kprintln("", 0);
+    if (extr_ok == 1) { kprintln("exfatw: truncate round-trip OK", 30); }
+    else { kprintln("exfatw: truncate round-trip FAIL", 32); }
+    # 1.34.2 — ENOSPC rollback: request a file larger than the volume; alloc
+    # must fail BEFORE publishing anything (no partial file, fsck stays clean).
+    var exns_name = "EXNOSPC.BIN";
+    var exns_rc = exfat_write_file(exns_name, 11, &exfat_file_buf, 100000000);
+    kprint("exfatw: enospc EXNOSPC.BIN rc=", 30);
+    kprint_num(exns_rc);
+    kprintln("", 0);
+    var exns_res[24];
+    if (exfat_find(exns_name, 11, &exns_res) == 1) { kprintln("exfatw: enospc file present FAIL", 32); }
+    else { kprintln("exfatw: enospc clean -- no partial file", 39); }
+    # 1.34.4 bite 1 — root-directory extension: create 10 NEW files (EXN0.BIN
+    # .. EXN9.BIN, 3 dir entries each = 30, well past the single-cluster root's
+    # 16). All must create rc=0 + fsck clean + read back — re-enables the
+    # new-file-create path 1.34.2 had to defer to in-place ops.
+    var nb[16];
+    store8(&nb + 0, 69); store8(&nb + 1, 88); store8(&nb + 2, 78);   # "EXN"
+    store8(&nb + 4, 46); store8(&nb + 5, 66); store8(&nb + 6, 73); store8(&nb + 7, 78);   # ".BIN"
+    var nfail = 0;
+    var ni = 0;
+    while (ni < 10) {
+        store8(&nb + 3, 48 + ni);                       # '0' + ni
+        if (exfat_write_file(&nb, 8, &exfat_file_buf, 100) != 0) { nfail = nfail + 1; }
+        ni = ni + 1;
+    }
+    kprint("exfatw: rootext 10 new files nfail=", 35);
+    kprint_num(nfail);
+    kprintln("", 0);
+    store8(&nb + 3, 57);                                 # '9' — read EXN9.BIN back
+    var rx_res[24];
+    var rx_ok = 0;
+    if (exfat_find(&nb, 8, &rx_res) == 1) {
+        var rx_first = load64(&rx_res);
+        var rx_len = load64(&rx_res + 8);
+        var rx_nfc = load64(&rx_res + 16);
+        var rg = exfat_read(rx_first, rx_nfc, &exfat_file_buf, rx_len);
+        rx_ok = 1;
+        if (rx_len != 100) { rx_ok = 0; }
+        if (rg != 100) { rx_ok = 0; }
+        if (load8(&exfat_file_buf + 0) != 0) { rx_ok = 0; }
+        if (load8(&exfat_file_buf + 99) != (99 & 0xFF)) { rx_ok = 0; }
+    }
+    if (rx_ok == 1) { kprintln("exfatw: rootext readback OK", 27); }
+    else { kprintln("exfatw: rootext readback FAIL", 29); }
+    # 1.34.5 — Unicode (non-ASCII) name: "Caf<U+00E9>.txt" (byte 0xE9 = 'é').
+    # The NameHash must use the volume's up-case table (é→É U+00C9); ASCII
+    # upcase would leave 0xE9 → wrong hash → fsck.exfat "name hash mismatch".
+    # fsck-clean on this file is the discriminating oracle.
+    var unb[16];
+    store8(&unb + 0, 67); store8(&unb + 1, 97); store8(&unb + 2, 102);  # "Caf"
+    store8(&unb + 3, 233);                              # 0xE9 = 'é' (Latin-1)
+    store8(&unb + 4, 46); store8(&unb + 5, 116); store8(&unb + 6, 120); store8(&unb + 7, 116);  # ".txt"
+    var u_rc = exfat_write_file(&unb, 8, &exfat_file_buf, 200);
+    kprint("exfatw: unicode Cafe-acute rc=", 30);
+    kprint_num(u_rc);
+    kprintln("", 0);
+    var u_res[24];
+    var u_ok = 0;
+    if (exfat_find(&unb, 8, &u_res) == 1) {             # find by the non-ASCII name
+        var u_first = load64(&u_res);
+        var u_len = load64(&u_res + 8);
+        var u_nfc = load64(&u_res + 16);
+        var u_got = exfat_read(u_first, u_nfc, &exfat_file_buf, u_len);
+        u_ok = 1;
+        if (u_len != 200) { u_ok = 0; }
+        if (u_got != 200) { u_ok = 0; }
+        if (load8(&exfat_file_buf + 0) != 0) { u_ok = 0; }
+        if (load8(&exfat_file_buf + 199) != (199 & 0xFF)) { u_ok = 0; }
+    }
+    if (u_ok == 1) { kprintln("exfatw: unicode find+read OK", 28); }
+    else { kprintln("exfatw: unicode find+read FAIL", 30); }
+    # 1.40.13 mount-namespace: drive the real shell write verbs against the
+    # exFAT mount at /mnt/exfat. sh_cmd_touch/echo -> vfs_resolve_mount ->
+    # FS_EXFAT -> vfs_create_on/vfs_write_on -> exfat_create / exfat_write_file.
+    # Files land at the exFAT root (=/mnt/exfat), so the find-back verifications
+    # below and exfat-write-smoke.sh's fsck.exfat -n are unchanged.
+    kprintln("vfsw: shell touch+echo over exFAT ->", 36);
+    sh_cwd_init();
+    sc_touch("/mnt/exfat/SHTOUCH.TXT");
+    sc_echo("/mnt/exfat/SHECHO.TXT", "SHELL-EXFAT-WR");
+    var sht_res[24];
+    if (exfat_find("SHTOUCH.TXT", 11, &sht_res) == 1) { kprintln("exfatw: shell touch find-back OK", 32); }
+    else { kprintln("exfatw: shell touch find-back FAIL", 34); }
+    var she_res[24];
+    if (exfat_find("SHECHO.TXT", 10, &she_res) == 1) {
+        var she_first = load64(&she_res);
+        var she_len = load64(&she_res + 8);
+        var she_nfc = load64(&she_res + 16);
+        var she_got = exfat_read(she_first, she_nfc, &exfat_file_buf, 64);
+        var she_ok = 1;
+        if (she_got < 14) { she_ok = 0; }
+        # Content-match the 14 chars of "SHELL-EXFAT-WR" (robust to the
+        # trailing-newline length detail). echo writes text + '\n'.
+        var she_ref = "SHELL-EXFAT-WR";
+        var she_ci = 0;
+        while (she_ci < 14) {
+            if (load8(&exfat_file_buf + she_ci) != load8(she_ref + she_ci)) { she_ok = 0; }
+            she_ci = she_ci + 1;
+        }
+        kprint("exfatw: shell echo len=", 23);
+        kprint_num(she_len);
+        kprintln("", 0);
+        if (she_ok == 1) { kprintln("exfatw: shell echo round-trip OK", 32); }
+        else { kprintln("exfatw: shell echo round-trip FAIL", 34); }
+    } else { kprintln("exfatw: shell echo find-back FAIL", 33); }
+    # shell `rm` over exFAT (sh_cmd_rm -> FS_EXFAT -> vfs_delete_on ->
+    # exfat_delete). Create a dedicated target, rm it, confirm in-kernel it's
+    # gone; exfat-write-smoke.sh also fsck-checks.
+    sc_touch("/mnt/exfat/SHRMTGT.TXT");
+    sh_exec("rm /mnt/exfat/SHRMTGT.TXT", 25);
+    var shrm_res[24];
+    if (exfat_find("SHRMTGT.TXT", 11, &shrm_res) == 1) { kprintln("exfatw: shell rm still-present FAIL", 35); }
+    else { kprintln("exfatw: shell rm gone OK", 24); }
+    # shell mkdir/rmdir over exFAT (sh_cmd_mkdir/rmdir -> FS_EXFAT ->
+    # vfs_mkdir_on/vfs_rmdir_on -> exfat_mkdir/exfat_rmdir).
+    # SHEXDIR kept (find-back confirms the dir-set); SHEXRMD created then
+    # removed (find-miss confirms). exfat-write-smoke.sh also fsck-checks.
+    sc_mkdir("/mnt/exfat/SHEXDIR");
+    var shmd_res[24];
+    if (exfat_find("SHEXDIR", 7, &shmd_res) == 1) { kprintln("exfatw: shell mkdir find-back OK", 32); }
+    else { kprintln("exfatw: shell mkdir find-back FAIL", 34); }
+    sc_mkdir("/mnt/exfat/SHEXRMD");
+    sc_rmdir("/mnt/exfat/SHEXRMD");
+    var shrd_res[24];
+    if (exfat_find("SHEXRMD", 7, &shrd_res) == 1) { kprintln("exfatw: shell rmdir still-present FAIL", 38); }
+    else { kprintln("exfatw: shell rmdir gone OK", 27); }
+    # shell mv (rename) + sync over exFAT (sh_cmd_mv -> FS_EXFAT -> vfs_rename_on
+    # -> exfat_rename re-emit-at-same-clusters). SHMVA→SHMVB; in-kernel: dst
+    # present + src gone. exfat-write-smoke.sh also fsck-checks.
+    sc_touch("/mnt/exfat/SHMVA");
+    sh_exec("mv /mnt/exfat/SHMVA /mnt/exfat/SHMVB", 36);
+    var shmv_b[24];
+    var shmv_a[24];
+    if (exfat_find("SHMVB", 5, &shmv_b) == 1) {
+        if (exfat_find("SHMVA", 5, &shmv_a) == 1) { kprintln("exfatw: shell mv src-remains FAIL", 33); }
+        else { kprintln("exfatw: shell mv OK", 19); }
+    } else { kprintln("exfatw: shell mv dst-missing FAIL", 33); }
+    sh_exec("sync", 4);
+    # 1.39.9 VFS-lift bite 9: subdirectory paths. SHEXDIR was created above.
+    # Drive shell verbs against slashed paths inside it — exercises
+    # exfat_resolve_parent + the *_in_dir finders + emit_set_in. Validated
+    # in-kernel (find-back inside SHEXDIR's cluster) + via the `cat` output
+    # ("SUBDIR-EXFAT-OK") in the boot log; exfat-write-smoke.sh fsck-checks.
+    sc_echo("/mnt/exfat/SHEXDIR/SUBKEEP.TXT", "SUBDIR-EXFAT-OK");
+    sc_touch("/mnt/exfat/SHEXDIR/SUBRM.TXT");
+    sh_exec("rm /mnt/exfat/SHEXDIR/SUBRM.TXT", 31);
+    sc_mkdir("/mnt/exfat/SHEXDIR/SUBD1");
+    sh_exec("mv /mnt/exfat/SHEXDIR/SUBD1 /mnt/exfat/SHEXDIR/SUBD2", 52);
+    # 1.41.7 — SYSCALL-driven exFAT write (same VFS_SEC_WFILE path → vfs_write_on
+    # → exfat_write_file). Proves agnsh's write reaches exFAT via the syscall ABI.
+    var xu = pmm_alloc_2mb();
+    if (xu != 0) {
+        memcpy(xu + 0,  "/mnt/exfat/SYSWR.TXT", 20);
+        memcpy(xu + 64, "SYSCALL-EXFAT-WR", 16);
+        var xwfd = ksyscall(7, xu + 0, 20, 0x301);          # AO_WRONLY|AO_CREAT|AO_TRUNC
+        if (xwfd < 0) { kprintln("syswr: exFAT open-w FAIL", 24); }
+        else {
+            var xwn = ksyscall(1, xwfd, xu + 64, 16);
+            ksyscall(6, xwfd, 0, 0);                          # close -> flush
+            if (xwn != 16) { kprintln("syswr: exFAT write-len FAIL", 27); }
+            else {
+                var xrfd = ksyscall(7, xu + 0, 20, 0);      # read-back
+                if (xrfd < 0) { kprintln("syswr: exFAT open-r FAIL", 24); }
+                else {
+                    var xrn = ksyscall(5, xrfd, xu + 128, 64);
+                    ksyscall(6, xrfd, 0, 0);
+                    if (xrn != 16) { kprintln("syswr: exFAT read-len FAIL", 26); }
+                    elif (load8(xu + 128) != 83) { kprintln("syswr: exFAT content FAIL", 25); }
+                    elif (load8(xu + 128 + 15) != 82) { kprintln("syswr: exFAT content FAIL", 25); }
+                    else { kprintln("syswr: exFAT write+readback OK", 30); }
+                }
+            }
+        }
+        pmm_free_2mb(xu);
+    }
+    var shx_dir[24];
+    if (exfat_find("SHEXDIR", 7, &shx_dir) == 1) {
+        var shx_clus = load64(&shx_dir);
+        var shx_kept[24];
+        if (exfat_find_in_dir(shx_clus, "SUBKEEP.TXT", 11, &shx_kept) == 1) { kprintln("exfatw: subdir find-back OK", 27); }
+        else { kprintln("exfatw: subdir find-back FAIL", 29); }
+        var shx_rm[24];
+        if (exfat_find_in_dir(shx_clus, "SUBRM.TXT", 9, &shx_rm) == 1) { kprintln("exfatw: subdir rm-remains FAIL", 30); }
+        else { kprintln("exfatw: subdir rm gone OK", 25); }
+        var shx_d2[24];
+        if (exfat_find_in_dir(shx_clus, "SUBD2", 5, &shx_d2) == 1) { kprintln("exfatw: subdir renamed-dir OK", 29); }
+        else { kprintln("exfatw: subdir renamed-dir FAIL", 31); }
+    } else { kprintln("exfatw: subdir parent-missing FAIL", 34); }
+    sh_exec("cat /mnt/exfat/SHEXDIR/SUBKEEP.TXT", 34);
+    # 1.40.1 exec-from-disk bite 1: whole-file read past the 4 KB memfile cap
+    # (vfs_read_file) over exFAT.
+    var xrfi = 0;
+    while (xrfi < 6000) { store8(&vfs_scratch_buf + xrfi, xrfi & 0xFF); xrfi = xrfi + 1; }
+    exfat_write_file("BIGRF.BIN", 9, &vfs_scratch_buf, 6000);
+    var xrfz = 0;
+    while (xrfz < 8192) { store8(&vfs_scratch_buf + xrfz, 0); xrfz = xrfz + 1; }
+    var xrfn = vfs_read_file("BIGRF.BIN", 9, &vfs_scratch_buf, 8192);
+    var xrfok = 1;
+    if (xrfn != 6000) { xrfok = 0; }
+    if (load8(&vfs_scratch_buf + 0) != 0) { xrfok = 0; }
+    if (load8(&vfs_scratch_buf + 5000) != (5000 & 0xFF)) { xrfok = 0; }   # past the 4 KB cap
+    if (load8(&vfs_scratch_buf + 5999) != (5999 & 0xFF)) { xrfok = 0; }
+    if (xrfok == 1) { kprintln("vfsrf: exFAT whole-file read past 4KB OK", 40); }
+    else { kprintln("vfsrf: exFAT whole-file read FAIL", 33); }
+}
+#endif
+
+# WRITE arc 1.33.x — write-path self-test (compile-gated, opt-in via
+# EXT2_WRITE_SELFTEST=1 ./scripts/build.sh). IDEMPOTENT: a PRE-CLEAN
+# (ext2_wst_clean) wipes any fixtures a prior boot left, so every create-side
+# assertion fires fresh and the suite re-runs correctly on a PERSISTENT FS (an
+# --update flash, not just a pristine hard reflash). It then creates fixtures
+# and asserts the write primitives / inode RMW / dir + link / symlink /
+# bitmap+free-count behavior, leaving the fixtures on disk for the smoke's
+# host-side debugfs verification. Off in production builds — same gate
+# discipline as AHCI_RW_DEMO / MSC_RW_DEMO.
+#ifdef EXT2_WRITE_SELFTEST
+ext2_write_selftest();
+# 1.41.8 — the ext2 shell-write check (was sh_write_selftest, which drove the
+# now-deleted verbs) is syscall-driven. ext2 write is also covered by
+# ext2_write_selftest + fssys; this keeps ext2-write-smoke's shtest: marker +
+# /shdir/keep.txt content + /shtmp-absent disk checks valid. cat/rm are KEPT
+# recovery verbs; mkdir/echo>/touch route via the syscall helpers (→ ext2).
+kprintln("shtest: begin", 13);
+sc_mkdir("/shdir");
+sc_echo("/shdir/keep.txt", "SHELL-WROTE-IT");
+kprint("shtest cat: ", 12);
+sh_exec("cat /shdir/keep.txt", 19);
+sc_touch("/shtmp");
+sh_exec("rm /shtmp", 9);
+kprintln("shtest: end", 11);
+#endif
+
+# 1.40.2 — exec-from-disk self-test (compile-gated, EXEC_SELFTEST=1). Builds a
+# minimal static ELF64 (write(1,"EXEC-DISK-OK\n",13) then exit(42)) into the
+# scratch buffer, writes it to ext2 as /prog, then `run /prog` — exercising
+# elf_load_from_file (streaming load) + exec_and_wait end-to-end. Gated by
+# exec-smoke.sh on the "EXEC-DISK-OK" marker + "run: exit 42".
+#ifdef EXEC_SELFTEST
+# 1.40.5: the exec selftest is a real FUNCTION (not inline main-body code), so
+# exec_and_wait returns into a normal stack frame and multiple sequential runs
+# work — the same shape as the real shell loop. (Inline main-body return was the
+# 1.40.4 multi-run limitation.)
+fn exec_disk_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    var eb = &vfs_scratch_buf;
+    var ez = 0;
+    while (ez < 256) { store8(eb + ez, 0); ez = ez + 1; }
+    # ELF64 header
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);      # class=64, LE, version
+    store8(eb + 16, 2);                                            # e_type = ET_EXEC
+    store8(eb + 18, 0x3E);                                         # e_machine = x86-64
+    store8(eb + 20, 1);                                            # e_version
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64);                                           # e_phoff = 64
+    store8(eb + 52, 64);                                           # e_ehsize
+    store8(eb + 54, 56);                                           # e_phentsize
+    store8(eb + 56, 1);                                            # e_phnum = 1
+    # Program header @64 (PT_LOAD, whole file at 0x400000)
+    store8(eb + 64, 1);                                            # p_type = PT_LOAD
+    store8(eb + 68, 5);                                            # p_flags = R+X
+    store8(eb + 82, 0x40);                                         # p_vaddr  = 0x400000
+    store8(eb + 90, 0x40);                                         # p_paddr  = 0x400000
+    store8(eb + 96, 182);                                          # p_filesz = 182
+    store8(eb + 104, 182);                                         # p_memsz  = 182
+    store8(eb + 113, 0x10);                                        # p_align  = 0x1000
+    # Code @120 (zeros between the 4 stored opcode bytes complete each imm32)
+    var c = 120;
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC0); store8(eb + c + 3, 0x01); c = c + 7;  # mov rax,1 (write)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC7); store8(eb + c + 3, 0x01); c = c + 7;  # mov rdi,1 (fd)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xBE); store8(eb + c + 2, 0xA9); store8(eb + c + 4, 0x40); c = c + 10; # movabs rsi,0x4000A9 (msg)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC2); store8(eb + c + 3, 0x0D); c = c + 7;  # mov rdx,13 (len)
+    store8(eb + c, 0x0F); store8(eb + c + 1, 0x05); c = c + 2;                                                     # syscall
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC0); store8(eb + c + 3, 0x00); c = c + 7;  # mov rax,0 (exit)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC7); store8(eb + c + 3, 0x2A); c = c + 7;  # mov rdi,42 (code)
+    store8(eb + c, 0x0F); store8(eb + c + 1, 0x05);                                                                # syscall
+    # Message @169: "EXEC-DISK-OK\n"
+    store8(eb + 169, 69); store8(eb + 170, 88); store8(eb + 171, 69); store8(eb + 172, 67);   # EXEC
+    store8(eb + 173, 45);                                                                      # -
+    store8(eb + 174, 68); store8(eb + 175, 73); store8(eb + 176, 83); store8(eb + 177, 75);   # DISK
+    store8(eb + 178, 45);                                                                      # -
+    store8(eb + 179, 79); store8(eb + 180, 75); store8(eb + 181, 10);                          # OK\n
+    # Write the ELF to a SUBDIRECTORY (/bin/prog2) + a non-ELF (/notelf).
+    ext2_mkdir(2, "bin", 3);
+    var bino = ext2_path_lookup("/bin", 4);
+    var p2 = 0;
+    if (bino > 0) { p2 = ext2_create(bino, "prog2", 5); }
+    if (p2 > 0) { ext2_write_at(p2, 0, eb, 182); }
+    # non-ELF: 100 bytes from eb+100 (inside the ELF/zero region; byte0 != 0x7F).
+    var nino = ext2_create(2, "notelf", 6);
+    if (nino > 0) { ext2_write_at(nino, 0, eb + 100, 100); }
+    ext2_sync();
+
+    # 1.40.14: baseline proc_count before the runs. prog2 + argv each
+    # create-then-reap one proc; with LIFO slot reclaim working, proc_count is
+    # unchanged across the whole sequence (asserted after the argv run below).
+    var pc0 = proc_count;
+
+    # ENOEXEC — elf_load_from_file rejects the non-ELF; sh_cmd_run prints
+    # "run: not an executable" and returns normally (no exec_and_wait).
+    kprintln("exec: running /notelf", 21);
+    sh_exec("run /notelf", 11);
+
+    # Subdir exec — load + run /bin/prog2 from a subdirectory in ring 3
+    # (EXEC-DISK-OK + run: exit 42).
+    kprintln("exec: running /bin/prog2", 24);
+    sh_exec("run /bin/prog2", 14);
+
+    # 1.40.8: argv DEREF — build /bin/av (exit argv[1][0]) and `run /bin/av Z`
+    # → exit 0x5A (90). Proves argv[i] POINTERS resolve to the actual arg STRING
+    # bytes in the user stack; argc alone could not catch a wrong-buffer write.
+    var di = 0;
+    while (di < 200) { store8(eb + di, 0); di = di + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 138); store8(eb + 104, 138);                  # p_filesz/memsz = 138
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120: mov rsi,[rsp+0x10] (argv[1]) ; movzx rdi,byte[rsi] ; mov rax,0 ; syscall
+    store8(eb + 120, 0x48); store8(eb + 121, 0x8B); store8(eb + 122, 0x74); store8(eb + 123, 0x24); store8(eb + 124, 0x10);
+    store8(eb + 125, 0x48); store8(eb + 126, 0x0F); store8(eb + 127, 0xB6); store8(eb + 128, 0x3E);
+    store8(eb + 129, 0x48); store8(eb + 130, 0xC7); store8(eb + 131, 0xC0);
+    store8(eb + 136, 0x0F); store8(eb + 137, 0x05);
+    var vino = 0;
+    if (bino > 0) { vino = ext2_create(bino, "argv", 4); }
+    if (vino > 0) { ext2_write_at(vino, 0, eb, 138); ext2_sync(); }
+    kprintln("exec: running /bin/argv Z", 25);
+    sh_exec("run /bin/argv Z", 15);
+
+    # 1.40.14 reap validation. (A) slot reclaim: the create-then-reap of prog2 +
+    # argv must leave proc_count where it started (LIFO reclaim). (B) address-space
+    # leak: directly exercise proc_free_address_space (3 PT pages + one mapped user
+    # huge page) in a tight loop and assert the PMM free counts (4 KB pool + 2 MB
+    # regions) return to baseline. Together these gate the reap path in
+    # exec-smoke.sh / sweep.sh without an interactive shell. One line each; quiet
+    # success-or-fail so a regression is grep-visible.
+    if (proc_count == pc0) {
+        kprintln("reap: slot reclaim OK (pc stable)", 33);
+    } else {
+        kprintln("reap: slot LEAK (pc grew)", 25);
+    }
+    var f4_before = pmm_free_count();
+    var f2_before = pmm_count_2mb_free();
+    var rc = 0;
+    while (rc < 6) {
+        var tcr3 = proc_create_address_space();
+        if (tcr3 != 0) {
+            var tph = pmm_alloc_2mb();
+            if (tph != 0) { proc_map_page(tcr3, 0x400000, tph); }
+            proc_free_address_space(tcr3);
+        }
+        rc = rc + 1;
+    }
+    var f4_after = pmm_free_count();
+    var f2_after = pmm_count_2mb_free();
+    if (f4_before == f4_after) {
+        if (f2_before == f2_after) {
+            kprintln("reap: 6x AS+page cycle, free stable OK", 38);
+        } else {
+            kprintln("reap: 2mb-region LEAK", 21);
+        }
+    } else {
+        kprintln("reap: 4k-page LEAK", 18);
+    }
+
+    kprintln("exec: selftest done", 19);
+    return 0;
+}
+exec_disk_selftest();
+#endif
+
+# 1.41.3 — FS-syscall self-test (compile-gated, FS_SYSCALL_SELFTEST=1). Drives
+# the new real FS syscalls (mkdir/open+CREAT/stat/rename/getdents/unlink/rmdir/
+# sync) through ksyscall() with a real >=2 MB user-range scratch (pmm_alloc_2mb
+# returns an identity-mapped phys >= 0x200000, so is_user_range accepts it), and
+# verifies side effects via ext2_path_lookup. Validates the handler+backend
+# logic for all 9 syscalls (this sets ksyscall_a4 directly for rename; the
+# a4=r10 REGISTER delivery rides syscall_handler's SysV 6th arg in r9 — proven
+# by analogy to the existing 5th arg already in r8 — and gets its first ring-3
+# consumer when agnsh calls rename). Needs a writable ext2.
+#ifdef FS_SYSCALL_SELFTEST
+fn fs_syscall_selftest() {
+    if (ext2_active == 0)   { kprintln("fssys: no ext2 SKIP", 19); return 0; }
+    if (ext2_write_ok == 0) { kprintln("fssys: ro ext2 SKIP", 19); return 0; }
+    var u = pmm_alloc_2mb();
+    if (u == 0)         { kprintln("fssys: no scratch FAIL", 22); return 0 - 1; }
+    if (u < 0x200000)   { kprintln("fssys: scratch low FAIL", 23); return 0 - 1; }
+    memcpy(u + 0,   "/fss", 4);      # dir
+    memcpy(u + 64,  "/fss/a", 6);    # file
+    memcpy(u + 128, "/fss/b", 6);    # rename target
+    var ok = 1;
+
+    # mkdir("/fss") + verify it exists on disk.
+    if (ksyscall(9, u + 0, 4) != 0)        { kprintln("fssys: mkdir FAIL", 17); ok = 0; }
+    if (ext2_path_lookup(u + 0, 4) <= 0)   { kprintln("fssys: mkdir verify FAIL", 24); ok = 0; }
+
+    # open("/fss/a", AO_CREAT) -> fd, close; verify the file exists.
+    var fd = ksyscall(7, u + 64, 6, 0x100);
+    if (fd < 0)                            { kprintln("fssys: open-creat FAIL", 22); ok = 0; }
+    else { ksyscall(6, fd, 0, 0); }
+    if (ext2_path_lookup(u + 64, 6) <= 0)  { kprintln("fssys: creat verify FAIL", 24); ok = 0; }
+
+    # stat("/fss/a") -> statbuf @ u+256; st_mode top nibble must say regular file.
+    if (ksyscall(33, u + 64, 6, u + 256) != 0) { kprintln("fssys: stat FAIL", 16); ok = 0; }
+    else { if ((load64(u + 256) & 0xF000) != 0x8000) { kprintln("fssys: stat mode FAIL", 21); ok = 0; } }
+
+    # rename("/fss/a" -> "/fss/b"): backend logic with a4=newlen via ksyscall_a4.
+    ksyscall_a4 = 6;
+    if (ksyscall(31, u + 64, 6, u + 128) != 0) { kprintln("fssys: rename FAIL", 18); ok = 0; }
+    if (ext2_path_lookup(u + 128, 6) <= 0)     { kprintln("fssys: rename dst FAIL", 22); ok = 0; }
+    if (ext2_path_lookup(u + 64, 6) > 0)       { kprintln("fssys: rename src-left FAIL", 27); ok = 0; }
+
+    # getdents("/fss") via an AO_DIRECTORY fd; scan records for the renamed "b".
+    var dfd = ksyscall(7, u + 0, 4, 0x800);
+    if (dfd < 0) { kprintln("fssys: opendir FAIL", 19); ok = 0; }
+    else {
+        var gb = ksyscall(29, dfd, u + 512, 1024);
+        ksyscall(6, dfd, 0, 0);
+        if (gb <= 0) { kprintln("fssys: getdents empty FAIL", 26); ok = 0; }
+        else {
+            var found = 0;
+            var off = 0;
+            while (off < gb) {
+                var rl = load8(u + 512 + off) | (load8(u + 512 + off + 1) << 8);
+                if (rl < 8) { break; }
+                if (load8(u + 512 + off + 3) == 1) {
+                    if (load8(u + 512 + off + 8) == 98) { found = 1; }   # 'b'
+                }
+                off = off + rl;
+            }
+            if (found == 0) { kprintln("fssys: getdents no b FAIL", 25); ok = 0; }
+        }
+    }
+
+    # unlink("/fss/b") + verify gone.
+    if (ksyscall(30, u + 128, 6) != 0)     { kprintln("fssys: unlink FAIL", 18); ok = 0; }
+    if (ext2_path_lookup(u + 128, 6) > 0)  { kprintln("fssys: unlink-left FAIL", 23); ok = 0; }
+
+    # rmdir("/fss") + verify gone.
+    if (ksyscall(10, u + 0, 4) != 0)       { kprintln("fssys: rmdir FAIL", 17); ok = 0; }
+    if (ext2_path_lookup(u + 0, 4) > 0)    { kprintln("fssys: rmdir-left FAIL", 22); ok = 0; }
+
+    ksyscall(12, 0, 0);   # sync
+
+    pmm_free_2mb(u);
+    if (ok == 1) { kprintln("fssys: ALL PASS", 15); }
+    else { kprintln("fssys: FAIL", 11); }
+    return 0;
+}
+fs_syscall_selftest();
+#endif
+
+# 1.41.6 — syscall-ingress HARDENING self-test (compile-gated,
+# SYSCALL_HARDEN_SELFTEST=1). Regression-locks the 1.41.5 security fixes AND
+# serves as the safety net for the 1.41.6 dispatcher refactors, because the
+# epoll/timerfd/signalfd syscalls have NO other smoke coverage. Drives the
+# security-REJECTION paths (must return -1) + the happy paths through ksyscall()
+# with a real >=2 MB user-range scratch. Needs a writable ext2 (to mint a
+# non-epoll fd for the type-confusion checks). "rej" = the call MUST be refused.
+#ifdef SYSCALL_HARDEN_SELFTEST
+fn syscall_harden_selftest() {
+    if (ext2_active == 0)   { kprintln("shsys: no ext2 SKIP", 19); return 0; }
+    if (ext2_write_ok == 0) { kprintln("shsys: ro ext2 SKIP", 19); return 0; }
+    var u = pmm_alloc_2mb();
+    if (u == 0) { kprintln("shsys: no scratch FAIL", 22); return 0 - 1; }
+    var ok = 1;
+
+    # --- is_user_range / is_user_ptr 1 GB ceiling (#4) ---
+    if (is_user_range(u, 16) != 1)          { kprintln("shsys: range valid FAIL", 23); ok = 0; }
+    if (is_user_range(0x40000000, 1) != 0)  { kprintln("shsys: range ceiling FAIL", 25); ok = 0; }
+    if (is_user_range(0x100000, 1) != 0)    { kprintln("shsys: range low FAIL", 21); ok = 0; }
+    if (is_user_ptr(0x40000000) != 0)       { kprintln("shsys: ptr ceiling FAIL", 23); ok = 0; }
+
+    # --- mint a NON-epoll fd to abuse: open a real file ---
+    memcpy(u + 0, "/shs", 4);
+    var ffd = ksyscall(7, u + 0, 4, 0x100);    # open("/shs", AO_CREAT) -> VFS_EXT2_FILE
+    if (ffd < 0) { kprintln("shsys: setup open FAIL", 22); ok = 0; }
+
+    # --- epoll fd type-confusion rejection (#1/#2/#3/#8/#10) ---
+    var efd = ksyscall(19, 0, 0, 0);           # epoll_create -> VFS_EPOLL
+    if (efd < 0) { kprintln("shsys: epoll_create FAIL", 24); ok = 0; }
+    # epoll_ctl on a NON-epoll fd must be refused
+    if (ffd >= 0) { if (ksyscall(20, ffd, 1, efd) == 0) { kprintln("shsys: epoll_ctl typeconf rej FAIL", 33); ok = 0; } }
+    # epoll_ctl on the real epoll fd with an in-range watch fd must succeed
+    if (efd >= 0) { if (ksyscall(20, efd, 1, efd) != 0) { kprintln("shsys: epoll_ctl valid FAIL", 27); ok = 0; } }
+    # epoll_ctl with an out-of-range watch fd must be refused (vs vfs_table OOB)
+    if (efd >= 0) { if (ksyscall(20, efd, 1, 9999) == 0) { kprintln("shsys: epoll wfd-bound rej FAIL", 30); ok = 0; } }
+    # epoll_wait on a non-epoll fd must be refused
+    if (ffd >= 0) { if (ksyscall(21, ffd, u + 256, 4) != (0 - 1)) { kprintln("shsys: epoll_wait typeconf rej FAIL", 35); ok = 0; } }
+
+    # --- timerfd fd type-confusion rejection (#18) ---
+    var tfd = ksyscall(22, 0, 0, 0);           # timerfd_create -> VFS_TIMERFD
+    if (tfd < 0) { kprintln("shsys: timerfd_create FAIL", 26); ok = 0; }
+    store64(u + 320, 0); store64(u + 336, 1);  # new_value: interval=0s, initial=1s
+    if (ffd >= 0) { if (ksyscall(23, ffd, 0, u + 320) == 0) { kprintln("shsys: timerfd typeconf rej FAIL", 32); ok = 0; } }
+    if (tfd >= 0) { if (ksyscall(23, tfd, 0, u + 320) != 0) { kprintln("shsys: timerfd valid FAIL", 25); ok = 0; } }
+
+    # --- signalfd happy path (mask range-validated, #5) ---
+    store64(u + 400, 6);                       # mask
+    var sfd = ksyscall(18, 0, u + 400, 0);
+    if (sfd < 0) { kprintln("shsys: signalfd FAIL", 20); ok = 0; }
+
+    # --- ext2 basename 255-cap (#6/#7): "/" + 256*'a' = 257 bytes, mkdir refused ---
+    store8(u + 1024, 47);                       # '/'
+    var bi = 0;
+    while (bi < 256) { store8(u + 1024 + 1 + bi, 97); bi = bi + 1; }   # 'a' * 256
+    if (ksyscall(9, u + 1024, 257) == 0) { kprintln("shsys: basename-cap rej FAIL", 28); ok = 0; }
+
+    # --- cleanup ---
+    if (sfd >= 0) { ksyscall(6, sfd, 0, 0); }
+    if (tfd >= 0) { ksyscall(6, tfd, 0, 0); }
+    if (efd >= 0) { ksyscall(6, efd, 0, 0); }
+    if (ffd >= 0) { ksyscall(6, ffd, 0, 0); ksyscall(30, u + 0, 4); }  # close + unlink /shs
+
+    pmm_free_2mb(u);
+    if (ok == 1) { kprintln("shsys: ALL PASS", 15); }
+    else { kprintln("shsys: FAIL", 11); }
+    return 0;
+}
+syscall_harden_selftest();
+#endif
+
+# 1.37.0 — ext4 extent-ALLOCATION self-test (compile-gated). Appends past EOF
+# of a seed EXTENTS_FL file to exercise ext2_extent_append_block. Gated by
+# scripts/ext-extent-smoke.sh (host e2fsck -fn clean + grow/byte verify).
+#ifdef EXT2_EXTENT_WRITE_SELFTEST
+ext2_extent_write_selftest();
+#endif
+
+# === CMOS kernel checkpoint 12 (VFS up) ===
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0C; 0xE6; 0x71; }
+
+var h1 = kmalloc(16);
+var h2 = kmalloc(100);
+var h3 = kmalloc(4096);
+kprint("Heap: ", 6);
+kprint_num(h1);
+kprint(" ", 1);
+kprint_num(h2);
+kprint(" ", 1);
+kprint_num(h3);
+kprintln("", 0);
+kfree_sized(h2, 100);
+
+# Initialize SYSCALL/SYSRET
+syscall_init();
+kprintln("SYSCALL/SYSRET initialized", 26);
+
+# Initialize stack canary secret (S13)
+stack_canary_init();
+kprintln("Stack canary initialized", 24);
+
+# === CMOS kernel checkpoint 13 (SYSCALL + stack canary) ===
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0D; 0xE6; 0x71; }
+
+#ifdef KTEST
+# Syscall test (direct call — still works)
+kernel_return_rsp = 0;
+kernel_return_rip = 0;
+proc_count = 0;
+proc_current = 0;
+var p0 = proc_create(0x100000);
+proc_set_state(0, 2);  # kernel "process" is running
+
+var pid = ksyscall(2, 0, 0, 0);
+kprint("Syscall getpid=", 15);
+kprint_num(pid);
+kprintln("", 0);
+
+ksyscall(1, 0, "Syscall write works!\n", 21);
+
+ksyscall(0, 42, 0, 0);
+kprint("Exit code: ", 11);
+kprint_num(sys_exit_code);
+kprintln("", 0);
+
+# Hardware SYSCALL test (from kernel mode — same privilege, tests the plumbing).
+# test_hw_syscall() prints intermediate detail to serial; one bare digit (the
+# getpid result) lands on the kprint channel inside the call, so we close the
+# "HW syscall test: " prefix with an explicit kprintln. Without this the next
+# kprintln collides on the same FB row producing "0Creating test...".
+kprint("HW syscall test: ", 17);
+test_hw_syscall();
+kprintln("", 0);
+#endif
+
+#ifdef KTEST
+# === Context Switch Test ===
+# Create two test processes with dedicated stacks.
+# Process stacks at 0x800000 + pid * 0x10000, 64KB apart.
+# Stack grows down, so stack_top is base + size.
+kprintln("Creating test processes...", 26);
+
+proc_count = 0;
+proc_current = 0;
+
+# Process 0: kernel idle (the code running right now)
+var kern_pid = proc_create(0);
+proc_set_state(0, 2);  # running
+
+# Process 1: test_proc_a
+var stack_a = 0x800000 + 1 * 0x10000;
+if (vmm_is_mapped(stack_a) == 0) { vmm_alloc_at(stack_a); }
+var pa = proc_create_full(&test_proc_a, stack_a + 0x4000);
+kprint("Process A (pid=", 15);
+kprint_num(pa);
+kprintln(") created", 9);
+
+# Process 2: test_proc_b
+var stack_b = 0x800000 + 2 * 0x10000;
+if (vmm_is_mapped(stack_b) == 0) { vmm_alloc_at(stack_b); }
+var pb = proc_create_full(&test_proc_b, stack_b + 0x4000);
+kprint("Process B (pid=", 15);
+kprint_num(pb);
+kprintln(") created", 9);
+
+kprint("Processes: ", 11);
+kprint_num(proc_count);
+kprint(" total, ", 8);
+kprint_num(proc_count_by_state(1));
+kprintln(" ready", 6);
+
+# === CMOS kernel checkpoint 14 (test procs created) ===
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0E; 0xE6; 0x71; }
+#endif
+
+# Enable interrupts and activate scheduler
+asm { sti; }
+kprintln("Interrupts enabled", 18);
+
+# === CMOS kernel checkpoint 15 (interrupts enabled — sti executed) ===
+# CP 15 reached but CP 16 not = scheduler activation faulted, or a flood
+# of interrupts post-sti is preventing forward progress.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0F; 0xE6; 0x71; }
+
+# Wait a few ticks before activating scheduler
+arch_wait();
+arch_wait();
+kprint("Timer ticks before sched: ", 26);
+kprint_num(timer_ticks);
+kprintln("", 0);
+
+kprintln("Activating scheduler...", 23);
+
+# 1.40.10 — register the kernel main thread + an idle thread as real procs
+# before activating preemption (production path; KTEST builds set up their own
+# proc_a/proc_b above). The exec-from-disk selftest leaves dead exec procs in
+# slots 0..N with proc_current on the last one; without a valid runnable proc
+# the first timer tick after sched_active=1 (the DHCP DISCOVER hlt-wait on iron)
+# fell back to a dead exec proc, cr3_load'd its stale per-process CR3 and
+# iretq'd into a ring-3 RIP in ring 0 → triple-fault reset. Build proc 0 = this
+# kernel main thread (already running) + proc 1 = the hlt idle thread, both on
+# the boot CR3 (0x1000, where kernel_resume left us post-exec) so the equal-CR3
+# guard in do_context_switch skips cr3_load entirely — preemption is pure
+# register save/restore in one shared address space. See sched.cyr kernel_idle_loop.
+#ifndef KTEST
+proc_count = 0;
+proc_current = 0;
+proc_create(0);                 # proc 0 = kernel main (running now; context saved on first switch-away)
+proc_set_state(0, 2);           # running
+proc_create_full(&kernel_idle_loop, &kernel_idle_stack + 4096);  # proc 1 = idle (ready)
+#endif
+
+sched_active = 1;
+
+# === CMOS kernel checkpoint 16 (scheduler armed) ===
+# This is the AGNOS MVP closed-beta gate: reaching CP 16 means kernel
+# init succeeded end-to-end through scheduler activation. Subsequent
+# stall (no CP 17 ever emitted, no shell prompt) is a scheduler /
+# context-switch issue, not an init issue. Held since Attempt 16.
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
+
+#ifdef KTEST
+# Kernel idle loop: halts, wakes on timer, scheduler switches to A or B
+# After enough ticks, deactivate and report
+var idle_count = 0;
+while (idle_count < 50) {
+    arch_wait();
+    if (idle_count == 0) {
+        # CMOS CP 0x12: first hlt returned — timer ISR + first context-switch round-trip OK
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
+    }
+    if (idle_count == 9) {
+        # CMOS CP 0x13: 10 hlts done — matches QEMU's known-good count under gnoboot
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x13; 0xE6; 0x71; }
+    }
+    if (idle_count == 24) {
+        # CMOS CP 0x14: 25 hlts done — between QEMU known-good and loop end
+        asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
+    }
+    idle_count = idle_count + 1;
+}
+
+# Deactivate scheduler, report results
+sched_active = 0;
+# CMOS CP 0x11: post-scheduler idle loop completed
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x11; 0xE6; 0x71; }
+kprintln("", 0);
+kprint("Scheduler test done. Timer ticks: ", 34);
+kprint_num(timer_ticks);
+kprintln("", 0);
+#endif
+
+#ifdef KTEST
+# === Memory Isolation Test ===
+# VFS + initrd test
+kprint("VFS write: ", 11);
+vfs_write(0, "OK\n", 3);
+
+# Build and mount test initrd at 0x6000 (free page table area)
+initrd_build_test(0x6000);
+var nfiles = initrd_init(0x6000);
+kprint("Initrd: ", 8);
+kprint_num(nfiles);
+kprintln(" files", 6);
+
+# Open and read hello.txt
+var hfd = initrd_open("hello.txt", 9);
+var hbuf[16];
+var hn = vfs_read(hfd, &hbuf, 14);
+kprint("initrd hello.txt: ", 18);
+kprint(&hbuf, hn);
+vfs_close(hfd);
+
+# Open and read test
+var tfd = initrd_open("test", 4);
+var tbuf[8];
+var tn = vfs_read(tfd, &tbuf, 5);
+kprint("initrd test: ", 13);
+kprint(&tbuf, tn);
+vfs_close(tfd);
+var mf = vfs_create_memfile("HELLO", 5);
+var rbuf[8];
+var rn = vfs_read(mf, &rbuf, 5);
+kprint("VFS memfile read: ", 18);
+kprint(&rbuf, rn);
+kprintln("", 0);
+vfs_close(mf);
+# CMOS CP 0x12: post-VFS / initrd / memfile tests
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x12; 0xE6; 0x71; }
+#endif
+
+# Memory-isolation test removed 2026-05-15 (Attempt 27). The AS1/AS2 build + CR3
+# dance was post-MVP verification, not boot infrastructure. Under restored kernel
+# CR3 the test pegged kcp at 0x19 for 9 repair letters (F-N); per UEFI handoff
+# contract (docs/development/uefi-boot-prior-art.md §6), early kernels inherit
+# UEFI's identity map — pt_init's 0-4GB mapping doesn't cover the GOP FB BAR
+# the way UEFI's did. Mem-iso correctness is post-closed-beta work.
+
+#ifdef KTEST
+# === Userland Exec Test ===
+# Spawn user_test_proc as a proper isolated process with its own address space
+kprintln("Userland exec test...", 21);
+var exec_pid = spawn_user_proc(&user_test_proc);
+kprint("Spawned pid=", 12);
+kprint_num(exec_pid);
+kprintln("", 0);
+
+if (exec_pid >= 0) {
+    var ep = &proc_table + exec_pid * 176;
+    var exec_entry = load64(ep + 24);
+    var exec_rsp = load64(ep + 16);
+    var exec_cr3 = load64(ep + 160);
+    # skipped
+    kprintln("Userland exec complete", 22);
+}
+# CMOS CP 0x14: post-userland-exec test (spawn done, exec_and_wait still bypassed)
+asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x14; 0xE6; 0x71; }
+#endif
+
+# TCP listen-accept smoke (1.32.0 bite A). Build-flag-gated so production
+# boots don't bind a port. With TCP_LISTEN_SMOKE=1: listen on 8080, poll
+# briefly for one incoming connection, on accept send a banner + close.
+# Pairs with scripts/tcp-listen-smoke.sh's host-side TCP probe.
+# Placed post-interrupt-enable so arch_wait() (= HLT) actually waits for
+# a timer tick rather than hanging on no-IRQ. Pre-kybernet so the test
+# completes before the shell loop swallows the boot serial.
+# DHCP client (1.32.0 bite G, re-enabled 1.32.9) — the standard way to
+# get an IP: SLIRP serves it in QEMU, real LANs serve it on iron. The
+# 1.32.3 STATIC bypass that sat here is removed: its OFFER timeout was
+# the r8169 unicast-RX drop fixed at 1.32.7 (RX ring 16->64; both on-LAN
+# and off-LAN TCP handshakes complete on iron), not a DHCP-layer bug.
+# See the 1.32.7 CHANGELOG entry + r8169-iron-burn-audit.md.
+if (vnet_active != 0 || nic_ready() != 0) {
+    # Iron fallback: seed a workable STATIC address before the DHCP
+    # exchange (192.168.1.222 — the 1.32.3 bypass IP, distinct from
+    # Linux's lease; the EEPROM hardware MAC claiming it draws gateway
+    # ARP replies even with Linux's lease active). On the iron path the
+    # pre-DHCP net_init was net_init(0,0,0), which is not a workable
+    # fallback if DHCP misses. QEMU keeps its 10.0.2.15 SLIRP fallback
+    # from the virtio branch above.
+    if (vnet_active == 0) {
+        net_init(ip4(192,168,1,222), ip4(192,168,1,1), ip4(255,255,255,0));
+    }
+    # dhcp_init() sends DISCOVER from 0.0.0.0 and, on ACK, overwrites
+    # net_ip/net_gateway/net_netmask with the real lease (returns 0,
+    # printing "dhcp: ACK ip=..."). On timeout/NAK it returns nonzero
+    # and the fallback above stays in place.
+    if (dhcp_init() != 0) {
+        kprintln("net: DHCP failed -- using static fallback", 41);
+    }
+    # Resolve the gateway MAC for off-LAN routing. net_gateway now holds
+    # the DHCP-leased gateway (or the static fallback) — the ARP probe
+    # targets whichever we ended with.
+    arp_request(net_gateway);
+    kprintln("arp: request -> gateway", 23);
+    var arp_start = timer_ticks;
+    var arp_got = 0;
+    # Honest-self-test counters (1325): record what RX actually delivered
+    # during the gateway-probe wait, not just whether the gateway replied.
+    # attempt_4 pcap proved broadcast RX + the ARP responder fire on iron
+    # while THIS very gate times out -- the old flat "L1/L2 FAILED" verdict
+    # hid a live NIC for the whole arc. rx_frames = any frame net_poll
+    # handled; arp_seen = inbound ARP frames; net_arp_replies_sent (net.cyr)
+    # = replies we TX'd in response.
+    var rx_frames = 0;
+    var arp_seen = 0;
+    # ARP request retransmit schedule (RFC 1122 §2.3.2.1). A single request
+    # that is missed or not yet elicited would otherwise time out the whole
+    # 5 s window with no retry — and ARP replies are only sent in response to
+    # a request, so a missed first reply is never re-offered. Every prior-art
+    # stack (Linux neigh, iPXE, lwIP etharp, *BSD) re-sends ~1/sec until
+    # reply/timeout. next_retx = the next tick (100 Hz timer → 100 ticks = 1 s)
+    # to re-send; 4 retransmits across the window (initial + @100/200/300/400).
+    var next_retx = 100;
+    while ((timer_ticks - arp_start) < 500) {
+        var pr = net_poll();
+        if (pr > 0) { rx_frames = rx_frames + 1; }
+        if (pr == 1) { arp_seen = arp_seen + 1; }
+        if (arp_pending_ip == 0) { arp_got = 1; break; }
+        if ((timer_ticks - arp_start) >= next_retx) {
+            arp_request(net_gateway);
+            next_retx = next_retx + 100;
+        }
+        arch_wait();
+    }
+    if (arp_got == 1) {
+        # Persist the gateway MAC into the route helper's slot — every
+        # off-LAN packet (1.1.1.1, etc.) now resolves through this.
+        memcpy(&net_gateway_mac, &arp_cache_mac, 6);
+        net_gateway_mac_valid = 1;
+        kprint("arp: REPLY gw_mac=", 18);
+        kprint_byte(load8(&arp_cache_mac + 0)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 1)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 2)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 3)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 4)); kprint(":", 1);
+        kprint_byte(load8(&arp_cache_mac + 5));
+        kprintln("", 0);
+        kprintln("net: L2 OK -- gateway MAC cached", 32);
+
+        # --- Net diagnostics behind NET_VERBOSE (1.32.8 cleanup) ----------
+        # The 1.32.x r8169 unicast-RX arc is CLOSED (1.32.7: ring 16->64, both
+        # on-LAN and off-LAN handshakes complete on iron). Its two diagnostic
+        # instruments stay available for future debugging but are compiled out
+        # of the production boot so the FB ends cleanly at "net: L2 OK":
+        #   - the 1.1.1.1:80 outbound-TCP smoke (proves TX-to-gateway-MAC +
+        #     off-LAN routing + unicast RX of the reply + the 3-way handshake)
+        #   - the r8169 silicon tally readback (rx_uc/rx_bc/rx_mc + missed)
+        # The .121 on-LAN-peer discriminator (1.32.7 bite-2) was removed
+        # entirely with this cleanup -- it required the mbp-lan-probe harness
+        # running during boot and is not reproducible without it.
+        #ifdef NET_VERBOSE
+        # Outbound TCP test: 1.1.1.1:80. SYN+ACK proves r8169 TX unicast
+        # to gateway-MAC, off-LAN routing, r8169 RX of the unicast reply, and
+        # the TCP three-way handshake all at once.
+        kprintln("tcp: connect 1.1.1.1:80", 23);
+        var conn = tcp_connect(ip4(1,1,1,1), 80, 49152);
+        if (conn >= 0) {
+            kprintln("net: L3+TCP OK -- outbound TCP handshake established", 52);
+            tcp_close(conn);
+        } else {
+            kprintln("net: L3+TCP FAIL -- SYN sent but no SYN+ACK", 43);
+        }
+
+        # r8169 silicon accept-counter readback (FreeBSD re_sysctl_stats /
+        # RTL8168 datasheet 6.8.4): rx_uc/rx_bc/rx_mc split by frame class +
+        # missed (RxMissed FIFO overflow). r8169-only (QEMU uses virtio_net
+        # and has no RTL8168 to count).
+        if (r8169_present == 1) {
+            r8169_print_stats();
+        }
+        #endif
+    } else {
+        # Gateway unicast reply never arrived -- but that is NOT "RX dead".
+        # Report what RX did so the FB distinguishes a silent NIC from a
+        # live one still waiting on one unicast round-trip.
+        kprintln("arp: gateway reply not seen within ~5s", 38);
+        if (rx_frames > 0) {
+            kprint("net: L2 RX ALIVE rx=", 20);
+            kprint_num(rx_frames);
+            kprint(" arp_in=", 8);
+            kprint_num(arp_seen);
+            kprint(" arp_ans=", 9);
+            kprint_num(net_arp_replies_sent);
+            kprintln(" -- gateway unicast reply pending", 33);
+        } else {
+            kprintln("net: L2 RX SILENT -- 0 frames in ~5s", 36);
+        }
+    }
+}
+
+# === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===
+# main.cyr is now the boot-init sequence only. See core/selftests.cyr (compile-
+# gated checks) and core/boot_finish.cyr (kybernet launch), included after this
+# file in agnos.cyr in that order. FS/KTEST selftests stay inline (mid-sequence).
