@@ -1,5 +1,12 @@
 # AGNOS Userland↔Kernel Syscall ABI — Contract
 
+> **⚠ OPEN cyrius-side blocker (2026-06-03):** the *syscall* peer (`lib/syscalls_x86_64_agnos.cyr`)
+> is complete + verified, but the higher-level cyrius stdlib modules **`lib/args.cyr` and
+> `lib/io.cyr` have no `CYRIUS_TARGET_AGNOS` branch** — so `agnsh`'s startup `args_init()` hits a
+> `ud2` → `#UD` in ring 3 and boot-to-agnsh (1.41.4) can't complete. The kernel exec path is
+> proven correct. Full diagnosis + fix direction:
+> [`issue/2026-06-03-cyrius-agnos-stdlib-args-io-gap.md`](issue/2026-06-03-cyrius-agnos-stdlib-args-io-gap.md).
+>
 > **The canonical source is `kernel/core/syscall.cyr` (the `ksyscall` dispatch) in this repo.** This doc is the
 > interface both sides code against: the agnos kernel *implements* it; the Cyrius `CYRIUS_TARGET_AGNOS`
 > stdlib peer (`lib/syscalls_x86_64_agnos.cyr`) *mirrors* it. **One drifts → silent wrong-syscall** (the exact
