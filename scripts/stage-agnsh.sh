@@ -2,50 +2,50 @@
 # stage-agnsh.sh — build + stage the agnoshi shell binary for inclusion on the
 # agnos-fs as /bin/agnsh (1.41.x shell-separation arc).
 #
-# agnoshi is an OS-AGNOSTIC shell (zsh/bash-class portability): the same source
-# builds for whatever target the Cyrius toolchain provides. Today that's
-# CYRIUS_TARGET_LINUX (and _WIN) — Linux was simply the host target available to
-# build against — so the binary this stages currently speaks the LINUX syscall
-# ABI and will NOT execute on AGNOS's sovereign 28-syscall surface yet.
+# agnoshi is an OS-AGNOSTIC shell: the SAME source builds for whatever target the
+# Cyrius toolchain provides. For agnos we build the CYRIUS_TARGET_AGNOS profile
+# (agnos's sovereign syscall numbers + struct layouts), which landed at cyrius
+# 6.0.55/56 — so this stages a binary that REALLY RUNS on the agnos kernel in
+# ring 3.
 #
-# >>> PREREQUISITE (cyrius-side, hands-off): a CYRIUS_TARGET_AGNOS stdlib syscall
-# >>> profile (lib/syscalls_*_agnos.cyr emitting agnos syscall numbers + agnos
-# >>> struct layouts) so `agnsh` can be rebuilt for the agnos ABI. Until that
-# >>> lands, this script validates the STAGING MECHANISM (build → place on the
-# >>> rootfs tree the fs-population steps consume); it does not produce a binary
-# >>> that runs on agnos. See agnosticos docs/development/shell-separation-prior-art.md § ABI.
+# IMPORTANT: this stages ../agnoshi/build/agnsh_agnos (the --agnos build), NOT
+# ../agnoshi/build/agnsh (the host CYRIUS_TARGET_LINUX build). The host binary is
+# a perfectly good x86-64 static ELF but speaks the LINUX syscall ABI — deploying
+# it to the agnos-fs makes /bin/agnsh crash on its first syscall in ring 3. The
+# two are distinguishable by size (agnos ≈ 283 KB, host ≈ 297 KB) but the only
+# reliable thing is to build the right one, which is what --build does here.
 #
 # Output: build/rootfs/bin/agnsh — the agnos-fs staging tree. fs-population
 # consumes it three ways:
-#   - QEMU smoke/sweep : mke2fs -d build/rootfs ... (or e2cp/debugfs into the image)
-#   - iron (--update)  : install-usb.sh copies build/rootfs/* onto the ESP-adjacent fs
+#   - QEMU smoke/sweep   : mke2fs -d build/rootfs ... (or e2cp/debugfs into the image)
+#   - iron (--update-fs) : install-media.sh copies build/rootfs/* onto the agnos-fs by label
 #   - iron (mount-modify): mount the agnos-fs from Linux, cp build/rootfs/bin/agnsh /bin/
-#     (the preferred iron iteration path — feedback_prefer_mount_modify_over_reflash)
+#     (per feedback_prefer_mount_modify_over_reflash)
 #
 # Usage: scripts/stage-agnsh.sh [--build]
-#   (default) stage the existing ../agnoshi/build/agnsh
-#   --build   rebuild agnsh first via `cyrius build` (needs the lib/ snapshot;
-#             run `cyrius deps` in ../agnoshi once if lib/ is absent)
+#   (default) stage the existing ../agnoshi/build/agnsh_agnos
+#   --build   rebuild it first: cyrius build --agnos src/agnsh.cyr build/agnsh_agnos
+#             (needs the lib/ snapshot; run `cyrius deps`/`cyrius update` in ../agnoshi if absent)
 
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AGNOSHI="${AGNOSHI_ROOT:-$ROOT/../agnoshi}"
-SRC="$AGNOSHI/build/agnsh"
+SRC="$AGNOSHI/build/agnsh_agnos"     # CYRIUS_TARGET_AGNOS build — NOT build/agnsh (host/Linux ABI)
 DEST_DIR="$ROOT/build/rootfs/bin"
 DEST="$DEST_DIR/agnsh"
 
 [ -d "$AGNOSHI" ] || { echo "ERROR: agnoshi repo not found at $AGNOSHI (set AGNOSHI_ROOT)"; exit 1; }
 
 if [ "${1:-}" = "--build" ]; then
-    echo "Building agnsh in $AGNOSHI ..."
+    echo "Building agnsh (agnos target) in $AGNOSHI ..."
     [ -d "$AGNOSHI/lib" ] || { echo "ERROR: $AGNOSHI/lib snapshot missing — run 'cyrius deps' in agnoshi first"; exit 1; }
-    ( cd "$AGNOSHI" && cyrius build src/agnsh.cyr build/agnsh ) || { echo "ERROR: agnsh build failed"; exit 1; }
+    ( cd "$AGNOSHI" && cyrius build --agnos src/agnsh.cyr build/agnsh_agnos ) \
+        || { echo "ERROR: agnsh (agnos) build failed"; exit 1; }
 fi
 
-[ -f "$SRC" ] || { echo "ERROR: $SRC not present — run with --build (or build agnsh in agnoshi)"; exit 1; }
+[ -f "$SRC" ] || { echo "ERROR: $SRC not present — run with --build (or 'cyrius build --agnos src/agnsh.cyr build/agnsh_agnos' in agnoshi)"; exit 1; }
 
-# Sanity: must be a static x86_64 ELF (the agnos primary arch; exec-from-disk
-# loads static ELF64 only — no dynamic linker exists).
+# Sanity: must be a static x86_64 ELF (agnos exec-from-disk loads static ELF64 only).
 DESC="$(file -b "$SRC" 2>/dev/null)"
 case "$DESC" in
     *"ELF 64-bit"*"x86-64"*"statically linked"*) : ;;
@@ -54,8 +54,8 @@ esac
 
 mkdir -p "$DEST_DIR"
 cp "$SRC" "$DEST"
+chmod +x "$DEST"
 SZ="$(stat -c%s "$DEST")"
 echo "staged: $DEST ($SZ bytes)"
-echo "  source: $SRC"
-echo "  ABI:    LINUX (CYRIUS_TARGET_LINUX) — NOT yet agnos-runnable; pending CYRIUS_TARGET_AGNOS"
-echo "  next:   fs-population copies build/rootfs/* onto the agnos-fs (smoke / install-usb / mount-modify)"
+echo "  source: $SRC  (CYRIUS_TARGET_AGNOS — agnos-runnable)"
+echo "  next:   fs-population copies build/rootfs/* onto the agnos-fs (smoke / install-media --update-fs / mount-modify)"
