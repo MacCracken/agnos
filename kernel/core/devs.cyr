@@ -51,9 +51,16 @@ fn serial_dev_read(buf, count) {
     return n;
 }
 
+# Ring-3 stdout/stderr (fd 1/2) and the recovery shell route here. Mirror to
+# BOTH serial and the framebuffer via kprint — same as every kernel kprintln.
+# Until 1.41.x this was serial_print-only, so a ring-3 program's write(1,…)
+# never reached the FB; on a serial-less box (archaemenid) the agnsh banner was
+# invisible and the boot LOOKED hung at "kybernet: exec /bin/agnsh" though agnsh
+# was running. 1.40.9 already proved ring-3→fb works (boot_info_copy fix), so
+# this just re-activates that path. kprint no-ops fb when fb_console_ready == 0.
 fn serial_dev_write(buf, count) {
     if (count > 4096) { count = 4096; }
-    serial_print(buf, count);
+    kprint(buf, count);
     return count;
 }
 

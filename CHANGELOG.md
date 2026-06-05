@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.41.12] — 2026-06-04 (**Iron burn #1 of the 1.41.x arc → ring-3 stdout FB-mirror fix.** The `14111_stallout` burn on archaemenid rode clean through storage + a real DHCP lease + kybernet init to `kybernet: exec /bin/agnsh`, then the FB froze — no `#UD`, no reset, no emergency-shell fallback. **Not a hang:** agnsh loads (69-block ext2 single-indirect read), enters ring 3, and prints its banner — but ring-3 stdout was serial-only, invisible on the serial-less box. Behavioral one-liner; agnsh is now visible on the FB. Tag held until the next burn confirms it on iron.)
+
+### Fixed
+
+- **Ring-3 stdout/stderr was serial-only → the agnsh banner was invisible on iron (the `14111` "stall").** A userland program's `write(1,…)`/`write(2,…)` routes `vfs_write` → `dev_write(0)` → `serial_dev_write`, which called `serial_print` **only** — never `fb_print`. On archaemenid (no serial cable, per [[feedback_no_serial_on_iron]]) the agnsh banner went nowhere, so the boot *looked* hung at the last kernel `kprint` line (`kybernet: exec /bin/agnsh`) even though agnsh was alive in ring 3 (no `#UD`, no reset, no emergency fallback — all consistent). A **regression from the 1.41.x write-surface refactor**: at 1.40.9 ring-3 `write(1)` went straight to `kputc`/`fb_putc` and was iron-visible (`EXEC-DISK-OK`, `run: exit 42/90` on the FB); the real-FS-syscall + FAT/exFAT-write bites rerouted stdout through the serial-only console device. `serial_dev_write` now calls `kprint` (serial **+** framebuffer, the same path as every kernel `kprintln`; `fb_print` no-ops until `fb_console_ready`). The QEMU `agnsh-smoke` **serial** log was the dispositive evidence — it prints the full `agnoshi 1.3.5` banner after exec, exonerating the ext2 single-indirect read, KPTI page-map, and `mmap` paths. (`core/devs.cyr`.)
+
+### Validated
+
+- `scripts/agnsh-smoke.sh` **PASS** — banner still reaches serial (`kprint` retains `serial_print`); no emergency-shell fallback. Build **1,070,704 B** (1,070,720 → 1,070,704). x86_64 multiboot2 OK.
+
+### Notes
+
+- **Next iron burn (A1) is now OBSERVABLE.** Expect `kybernet: exec /bin/agnsh` → `agnoshi 1.3.5` / `AI-native shell…` on the **FB**. agnsh then blocks on `read(fd 0)` → `kbd_read_blocking` — the **empty USB-HID keyboard ring** on archaemenid (`boot_finish.cyr`: "Attempt 29 — shell visible, kbd ring empty"), a pre-existing input blocker NOT introduced by 1.41.x. So expect: banner + prompt visible, then no keystrokes. That xhci-HID-on-iron input path is a **separate arc** — deliberately not bundled into this fix.
+
 ## [1.41.11] — 2026-06-04 (**Clean + iron-burn prep — the 1.41.x shell-separation arc is software-complete.** The residual low finding from the 1.41.10 audit, plus staging the arc's first full hardware validation. agnsh is the interactive shell exec'd from disk in ring 3, the in-kernel shell is a recovery REPL, FAT/exFAT content-write reaches the syscall ABI, and the whole ring-3→ring-0 surface is hardened — all QEMU-green. Only the user-driven iron burn on archaemenid remains.)
 
 ### Fixed
