@@ -401,6 +401,23 @@ fn proc_map_page(cr3, virt, phys) {
 }
 
 # Unmap a 2MB page in a process's page directory (for guard pages)
+#
+# 1.41.13 — guard-page unmap must NEVER punch the kernel identity map. A user
+# stack's guard page (stack_base - 0x200000) can land on a VA whose PD entry is
+# the kernel's SUPERVISOR identity mapping rather than a user page. Concretely:
+# pid 2's stack is at 0x1000000 (PD[8]) so its guard is 0xE00000 = PD[7], which
+# identity-maps physical region 7 (14-16 MB) — and under top-down pmm_alloc that
+# is exactly where this process's own page-table pages (PML4/PDPT/PD) live.
+# Zeroing that supervisor entry is BOTH useless and catastrophic:
+#   - useless: a supervisor PD entry (U/S=0) already faults any ring-3 access, so
+#     the overflow guard is ALREADY enforced by the protection bit;
+#   - catastrophic: it removes the kernel's own path to the page-table pages under
+#     this CR3, so the very next proc_map_page (e.g. sys_mmap) does load64(cr3) and
+#     #PFs at CR2 = PML4-phys (a region-7 VA) → silent triple fault, no banner.
+# So clear the entry ONLY when it is a USER page (bit 0x04 set) — a real user
+# mapping below the stack. Supervisor/identity entries are left intact. This is
+# what was killing agnsh after exec (CR2=0x?fee000 / CR3=same): the loader's
+# guard unmap on pid 2 deleted PD[7], the home of agnsh's page tables.
 fn proc_unmap_page(cr3, virt) {
     # x86 page-table walk — see #ifdef ARCH_X86_64 above
     var pml4e = load64(cr3);
@@ -408,15 +425,21 @@ fn proc_unmap_page(cr3, virt) {
     var pdpte = load64(pdpt_addr);
     var pd_addr = pdpte & 0xFFFFFFFFF000;
     var pd_idx = (virt >> 21) & 0x1FF;
-    store64(pd_addr + pd_idx * 8, 0);
-    # S8 (KPTI): also unmap in user page tables
+    var k_entry = load64(pd_addr + pd_idx * 8);
+    if ((k_entry & 0x04) != 0) {            # user page only — never a kernel PDE
+        store64(pd_addr + pd_idx * 8, 0);
+    }
+    # S8 (KPTI): also unmap in user page tables (same user-only guard)
     var u_cr3 = load64(pd_addr + 511 * 8);
     if (u_cr3 != 0) {
         var u_pml4e = load64(u_cr3);
         var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
         var u_pdpte = load64(u_pdpt);
         var u_pd = u_pdpte & 0xFFFFFFFFF000;
-        store64(u_pd + pd_idx * 8, 0);
+        var u_entry = load64(u_pd + pd_idx * 8);
+        if ((u_entry & 0x04) != 0) {
+            store64(u_pd + pd_idx * 8, 0);
+        }
     }
     return 0;
 }
