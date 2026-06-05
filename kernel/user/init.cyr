@@ -32,7 +32,7 @@ fn kybernet() {
     # 1.41.4: PID 1 runs the userland shell /bin/agnsh from disk. On any
     # failure to launch (no rootfs / missing / not an ELF) OR a non-zero exit,
     # fall back to the in-kernel emergency shell — the permanent recovery path
-    # (the in-kernel shell becomes recovery-only at 1.41.5).
+    # (the in-kernel shell was narrowed to recovery-only across 1.41.8–1.41.9).
     kprintln("kybernet: exec /bin/agnsh", 25);
     var rc = kybernet_exec_agnsh();
     if (rc != 0) {

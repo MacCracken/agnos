@@ -404,15 +404,14 @@ ext2_jbd2_crash_selftest();
 #   - if SLIRP delivers a SYN, the passive-open path + SYN_RCVD branch
 #     transition the conn to ESTABLISHED and tcp_accept() returns it
 #
-# Note (1.32.0 cycle-open): the "accept-success" scenario in
-# scripts/tcp-listen-smoke.sh currently fails because QEMU SLIRP isn't
-# delivering inbound TCP to the guest NIC under this kernel's hostfwd
-# config. Listener-functional + no-spurious-accept (scenario 2) DOES
-# pass, validating the kernel-side LISTEN/tcp_listen/timeout path.
-# The accept-success surface is deferred to either (a) a deeper SLIRP
-# debug session OR (b) iron testing once a real-NIC driver lands in a
-# later bite. Either path validates the same code; this smoke is the
-# kernel-side regression net, not the load-bearing test.
+# Note: the "accept-success" scenario in scripts/tcp-listen-smoke.sh does
+# not pass under QEMU SLIRP — SLIRP isn't delivering inbound TCP to the guest
+# NIC under this kernel's hostfwd config. Listener-functional + no-spurious-
+# accept (scenario 2) DOES pass, validating the kernel-side LISTEN/tcp_listen/
+# timeout path. The r8169 driver + DHCP are iron-verified (1.32.x), so the
+# accept-success surface is best exercised on iron with a real inbound peer;
+# this smoke remains the kernel-side regression net, not the load-bearing
+# accept test.
 {
     kprintln("tcp_listen smoke: start", 23);
     # Gratuitous ARP so SLIRP learns our MAC (needed for inbound hostfwd

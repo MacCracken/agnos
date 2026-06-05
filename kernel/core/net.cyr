@@ -13,8 +13,10 @@ var arp_pending_ip = 0;  # Security: track which IP we sent an ARP request for
 # Count of ARP replies the responder has TX'd. A live signal for the boot
 # self-test: a non-zero value is proof the full inbound path fired (RX
 # delivered a request -> net_handle_arp matched our IP -> we sent a reply).
-# 1325 attempt_4 pcap: this round-trip happens on iron while the
-# gateway-unicast-reply gate times out, so the FB must report it.
+# 1325 attempt_4 pcap (pre-1.32.7): the inbound round-trip fired on iron
+# while the gateway-unicast-reply gate still timed out, so the FB self-test
+# reports this counter. The r8169 unicast-RX arc closed at 1.32.7 (RX ring
+# 16->64) and the gate now succeeds on iron; the counter stays as a signal.
 var net_arp_replies_sent = 0;
 var net_rx_pkt[256];
 var net_udp_buf[256];

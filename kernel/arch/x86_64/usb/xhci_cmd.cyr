@@ -58,13 +58,14 @@ var XHCI_DIAG_SUBMIT_MAX   = 2;
 # spec doesn't define a hard ceiling but contemporary controllers
 # complete Enable Slot / Address Device in microseconds.
 #
-# 2026-05-18 Attempt 64 (QEMU repro): converted from `var = 10000000` to
-# enum constant. Same gvar-init-order bug class as XHCI_EVT_RING_SEGMENT_SIZE
-# in xhci_ring.cyr — if the top-level `var = N` initializer doesn't run
-# before xhci_cmd_wait's first call, the spin loop `while (wait < X)` reads
-# X=0 and exits immediately without ever inspecting the event ring. Bug
-# class is suspected to be in the Cyrius compiler's module-load ordering;
-# see cyrius/docs/development/issues/2026-05-18-gvar-init-order-zero-reads.md.
+# 2026-05-18 Attempt 64: converted from `var = 10000000` to an enum constant
+# after the gvar-init-order bug (same class as XHCI_EVT_RING_SEGMENT_SIZE in
+# xhci_ring.cyr) — a top-level `var = N` could read BSS-zero on first access if
+# its initializer hadn't run, so the spin loop `while (wait < X)` read X=0 and
+# exited immediately without ever inspecting the event ring. That was a real
+# Cyrius compiler bug (kmode PARSE_PROG ran before EMIT_GVAR_INITS); FIXED at
+# cyrius v5.11.64. The enum form sidesteps it permanently and is kept as the
+# convention. Issue: cyrius/docs/development/issues/2026-05-18-gvar-init-order-zero-reads.md.
 enum XhciCmdSpins {
     XHCI_CMD_TIMEOUT_SPINS = 10000000;
 }

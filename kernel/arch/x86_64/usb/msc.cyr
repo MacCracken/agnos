@@ -11,9 +11,10 @@
 # Commands (SPC-4) + SCSI Block Commands (SBC-3) are the command-set
 # references for Phase 3+.
 #
-# Phase split (mirrors NVMe Phase 1-5 / AHCI Phase 1-4):
-#   Phase 1 (this cut): class-interface discovery + bulk-EP enumeration +
-#                       GET_MAX_LUN class request. Read-only; no I/O.
+# Phase split (mirrors NVMe Phase 1-5 / AHCI Phase 1-4) — all landed; USB-MS
+# iron-debuted on archaemenid in the 1.31.x storage arc:
+#   Phase 1:            class-interface discovery + bulk-EP enumeration +
+#                       GET_MAX_LUN class request (discovery only, no block I/O).
 #   Phase 2:            bulk transfer primitives (Normal TRBs on bulk EPs,
 #                       transfer-event polling), CBW issue + CSW receipt
 #                       roundtrip skeleton. SCSI command field stays empty.

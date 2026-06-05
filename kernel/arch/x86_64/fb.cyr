@@ -9,21 +9,22 @@
 # Why color-coded cells, not text:
 #   - Phase 1 surface: ~30 lines, no font, no glyph walker — bug-surface
 #     dwarfed by a font + cursor implementation.
-#   - Existing boot_shim canary (256-pixel white stripe at y=0) already
-#     proves that fb_phys + 32-bpp pixel writes work on iron. cp_fb()
-#     extends that proven pattern to a 16×N cell grid.
+#   - The boot_shim canary (256-pixel white stripe at y=0, removed v1.30.1)
+#     demonstrated that fb_phys + 32-bpp pixel writes work on iron; cp_fb()
+#     reuses that proven pattern as a 16×N cell grid.
 #   - At-a-glance diagnostic: stop-point color tells you which layer
 #     stalled (white=boot_shim, yellow=arch, green=subsys, cyan=sched,
 #     magenta=post-sched). Pairs with CMOS read for exact CP index.
 #
 # Layout:
-#   Row 0 (y=0..7)    — boot_shim canary stripe (256 white pixels)
+#   Row 0 (y=0..7)    — formerly the boot_shim canary stripe (removed
+#                       v1.30.1); now plain text-console territory
 #   Row 1+ (y=8,16…)  — cp_fb cell grid. 16 cells per row, 8px stride,
 #                       4×4 painted area per cell.
 #   Cell (col, row)   — col = idx & 0xF, row = (idx >> 4) + 1
 #
 # Color palette (callers pick per layer):
-#   WHITE   0x00FFFFFF — boot_shim (already painted by canary)
+#   WHITE   0x00FFFFFF — boot_shim layer
 #   YELLOW  0x00FFFF00 — early arch (GDT/TSS/IDT)
 #   GREEN   0x0000FF00 — subsystem init (APIC, paging, PMM, heap, …)
 #   CYAN    0x0000FFFF — scheduler arming (closed-beta gate)
@@ -38,7 +39,8 @@
 #   - y past framebuffer height       → off-screen guard, early return
 #
 # This file MUST come after boot_data.cyr (declares boot_info_ptr) and
-# before boot_shim.cyr / core/main.cyr (which will call cp_fb).
+# before boot_shim.cyr / core/main.cyr (so cp_fb resolves if a visual-
+# bisection call is re-added there; no live callers at present).
 # Ordering enforced by include order in kernel/agnos.cyr.
 #
 # Phase 2 (8x8 bitmap font + fb_print mirroring serial_println) lives in

@@ -2,11 +2,15 @@
 # The final boot act: launch kybernet (PID 1, runs the shell loop). Must be
 # included AFTER core/selftests.cyr so test builds run their checks first.
 
-# Launch kybernet (PID 1) — enters the shell loop, which reads scancodes
-# from the kbd ring and dispatches commands. Shell I/O mirrors to fb via
-# kprint (Repair P, Attempt 29) so iron sees both serial and on-screen.
-# Open: USB-keyboard PS/2 emulation under UEFI legacy SMM not confirmed
-# on archaemenid as of Attempt 29 — shell visible, kbd ring empty.
+# Launch kybernet (PID 1). kybernet execs the userland shell /bin/agnsh in
+# ring 3 (1.41.x shell-separation); the in-kernel shell() is now a recovery
+# REPL. Both read keystrokes via kb_has_key()/kb_read_scancode(). Shell I/O
+# mirrors to the framebuffer via kprint so a serial-less box sees output.
+# Keyboard on archaemenid arrives via IRQ1 (kb_isr): the firmware's UEFI
+# USB-legacy support emulates an i8042 at port 0x60 for the USB keyboard, so
+# any reader running with interrupts enabled gets keystrokes. (The xHCI
+# USB-HID event ring that hid_poll() also drains stays empty on this iron
+# because the firmware owns the device — it is a fallback, not the producer.)
 kprintln("Launching kybernet...", 21);
 # CMOS CP 0x15: reached kybernet-launch site (kybernet() runs the shell loop)
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x15; 0xE6; 0x71; }

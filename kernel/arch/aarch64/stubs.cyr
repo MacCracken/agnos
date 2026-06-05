@@ -12,6 +12,10 @@ var cpu_id = 0;
 # Timer (referenced by core/sched.cyr via timer_handler)
 fn apic_eoi() { return 0; }
 
+# i8042 polled drain (referenced by core/syscall.cyr's kbd_read_blocking).
+# x86-only (i8042 is an x86 legacy device); no-op on aarch64.
+fn kb_poll_i8042() { return 0; }
+
 # Context switch stubs (x86-specific register save/restore)
 fn proc_save_context(pid, isr_rsp) { return 0; }
 fn proc_restore_context(pid, isr_rsp) { return 0; }

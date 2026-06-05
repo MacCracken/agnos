@@ -272,8 +272,8 @@ fn ext2_probe_backend(tag, partition_lba) {
 #
 # Constraint: the GPT module currently parses GPT against `blk_active`,
 # so this partition-aware mount can only see partitions on the backend
-# holding blk_active. For Attempt 90 on archaemenid that's the NVMe
-# (with its 3-partition layout including p3 = `agnos-fs` ext4 carve).
+# holding blk_active — whichever backend the boot selected (on iron this
+# has typically been the NVMe carrying the GPT-partitioned agnos-fs).
 # Partitions on other backends (the AHCI/SATA `agnos-fs` carve at
 # sda1) are NOT reachable via this path; they'd need either a separate
 # GPT parse-per-backend or a whole-disk mkfs.ext4 on a non-GPT'd

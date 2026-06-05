@@ -103,10 +103,10 @@ fn rdrand_u64() {
 }
 
 # Write 64-bit value to an x86 MSR. ecx=msr, edx:eax=value (high:low).
-# Used by fb_mtrr_install_wc to plant a variable MTRR for the UMA FB region
-# so PAT-WC can take effect on AMD APUs where firmware leaves the FB BAR
-# under default WB (which can flip to UC on quiet-boot paths). msr=-0x08,
-# val=-0x10.
+# Generic helper; msr=-0x08, val=-0x10. (No current caller: framebuffer
+# write-combining is done via PAT in the leaf PTE — see vmm_remap_wc_2mb /
+# fb_console.cyr — not via an MTRR, which would #GP under AMD MtrrLock once
+# firmware has locked the variable-MTRR set.)
 fn wrmsr(msr, val) {
     asm {
         0x48; 0x8B; 0x4D; 0xF8;       # mov rcx, [rbp-0x08]   ; ecx = msr#

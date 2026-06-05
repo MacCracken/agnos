@@ -531,11 +531,14 @@ fn xhci_init() {
 #   9. Wait USBSTS.HCH = 0
 #
 # INTE=1 is harmless under poll-mode Phase 5: events queue to the event
-# ring; we drain them on a timer tick instead of via MSI-X. IMAN.IE=1 is
-# *also* required (Repair FF) — Attempt 56 instrumentation proved AMD
-# FCH 1022:1639 will not post events to the ring when IE=0, regardless
-# of poll-vs-MSI mode. MSI-X function-mask suppresses actual IRQ delivery
-# until an ISR + IDT vector are wired in a later phase.
+# ring; we drain them on a timer tick instead of via MSI-X. We also set
+# IMAN.IE=1 to match 3-of-4 convergent prior art (FreeBSD/Haiku/EDK2) plus
+# OVMF empirical behavior. NOTE: the "IE=0 blocks event posting" hypothesis
+# (Repair FF, Attempt 56) was FALSIFIED at Attempt 57 — IE was NOT the gate.
+# The real cause of the no-events-posted arc was ERST Ring Segment Size
+# reading 0 (a gvar-init-order bug); see xhci_ring.cyr:52-62. Do not treat
+# IMAN.IE as a proven event-posting requirement. MSI-X function-mask
+# suppresses actual IRQ delivery until an ISR + IDT vector are wired later.
 #
 # Iron-test gate: framebuffer line `xhci: controller running, HCH=0,
 # ERDP=0xXXXXXXXX` and CMOS[0x40] kcp = 0x31.

@@ -170,32 +170,23 @@ fn smp_start_aps() {
         var stack_addr = 0x300000 + i * 0x10000;
         if (vmm_is_mapped(stack_addr) == 0) { vmm_alloc_at(stack_addr); }
     }
-    # INIT-SIPI-SIPI to wake APs — GATED FOR ATTEMPT 10 DIAGNOSTIC.
-    #
-    # Attempt 9 (2026-05-14) on iron Zen / archaemenid died between kernel
-    # CMOS checkpoint 0x07 (APIC + timer live) and 0x08 (pt_init returned).
-    # The candidate fault sites are: this function, the keyboard-ISR build,
-    # `idt_set_gate(kb_isr)`, and `pt_init()`. This block is the strongest
-    # suspect — it is the first time on iron that INIT-SIPI-SIPI is fired
-    # at real Zen APs, and three concrete hazards exist:
-    #   1. The trampoline's 32-bit stage hardcodes CR3 = 0x1000, but pt_init
-    #      has not yet run, so APs share gnoboot's bootstrap page tables.
-    #      If those don't identity-map 0xFEE00000, every AP triple-faults
-    #      on its first APIC-ID read.
+    # INIT-SIPI-SIPI to wake APs — GATED OFF. SMP-AP wakeup on real hardware
+    # is parked carry-forward; single-core is the relied-upon invariant (no
+    # locking, shared scratch buffers). When this is eventually un-gated,
+    # three concrete hazards must be addressed first:
+    #   1. The trampoline's 32-bit stage hardcodes CR3 = 0x1000; if APs are
+    #      woken before pt_init they share gnoboot's bootstrap page tables,
+    #      which must identity-map 0xFEE00000 or every AP triple-faults on
+    #      its first APIC-ID read.
     #   2. The inter-IPI delay loops are not volatile; INIT requires ~10ms
     #      quiescence per SDM, SIPI window is ~200µs. Loop bodies may not
     #      provide either timing on Zen.
     #   3. Trampoline page (0x8000-0x8200) writeability depends on gnoboot's
     #      bootstrap mappings.
     #
-    # Gating this block isolates AP wakeup from `smp_build_trampoline` and
-    # the AP-stack `vmm_alloc_at` calls above. If Attempt 10 reaches CMOS
-    # checkpoint ≥ 0x08, the AP-wakeup IPI is confirmed as the fault and
-    # we patch one of the three hazards above. If we still die at 0x07,
-    # the fault is in trampoline build / stack alloc and Attempt 11 will
-    # instrument those.
-    #
-    # See: agnosticos/docs/development/iron-nuc-zen-log.md § Attempt 9.
+    # (Historical: an early iron bring-up briefly gated this block to bisect
+    # a Zen boot fault; that fault was elsewhere. The block stays gated
+    # because SMP is out of scope for the single-core invariant.)
     # for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_init(ap); }
     # for (var w = 0; w < 2000000; w = w + 1) { }
     # for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_sipi(ap, 0x08); }

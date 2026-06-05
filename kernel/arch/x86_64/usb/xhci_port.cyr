@@ -546,8 +546,10 @@ fn xhci_port_reset(port_num, proto) {
     # eliminated cache-attribute (F5/X/V''), aliased mapping (a/V''),
     # spec-visible controller gate (b/W — USBSTS/USBCMD spec-clean),
     # and multi-SupProto routing (b'/Attempt 48 — extra SupProto caps
-    # cover USB3 ports 5/6, NOT the failing USB2 ports 1+3). Z is the
-    # last behavioral hypothesis in the silent-absorb trio.
+    # cover USB3 ports 5/6, NOT the failing USB2 ports 1+3). This ~10 ms
+    # PR-write delay is RETAINED as correct AMD-FCH timing; the silent-
+    # absorb arc was resolved (the ERST Ring-Segment-Size=0 fix in
+    # xhci_ring.cyr was the deepest root cause), so Z is not an open question.
     #
     # Sentinel stamp [0x7F]=0xAA proves the site executed (survives
     # future edits / DCE / build-mismatch). Last-write-wins is fine —

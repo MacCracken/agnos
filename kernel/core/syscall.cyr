@@ -137,27 +137,45 @@ fn kernel_resume() {
 # read(fd=0) for a ring-3 process: block until at least one real character is
 # typed, drain any further buffered keys (up to `count`), return. RAW line
 # discipline (ABI decision O1) — no kernel echo, no line buffering; the userland
-# shell (agnsh — completion.cyr / history.cyr) owns echo + editing. Cooperatively
-# drains the USB-HID keyboard via kb_has_key() -> hid_poll() (an MMIO poll of the
-# xHCI transfer ring), so it works with interrupts MASKED (SYSCALL/SFMASK clears
-# IF) — no sti, no hlt, no preemptive-ring-3 dependency. The busy-spin while
-# waiting is a deliberate first cut: a power-friendly sti+hlt wakeup waits on the
-# preemptive-ring-3 arc (it would take a timer IRQ mid-syscall to wake). Until
-# then "shell idle = one core spinning" is acceptable for the single-foreground
-# program model. scancode_to_ascii returns 0 for modifier/release codes — those
-# are consumed but never counted as input bytes (so we never return a 0-length
-# read after blocking).
+# shell (agnsh — completion.cyr / history.cyr) owns echo + editing.
+#
+# This runs with interrupts MASKED — SYSCALL clears IF via SFMASK (=0x200, set
+# in syscall_init) and we do NOT re-enable them: an `sti` here lets the xHCI
+# controller raise an interrupt the kernel only expects to POLL, which corrupts
+# the event-ring drain (it broke QEMU typing in testing). So both keystroke
+# sources are PURE-POLLED, no ISR involved:
+#   * kb_poll_i8042() reads the i8042 output buffer (ports 0x60/0x64) straight
+#     into kb_buf. This is the iron producer: on archaemenid the keyboard is USB
+#     but the firmware's UEFI USB-legacy support emulates an i8042 that answers
+#     polled reads, so we get scancodes with IF masked (the IRQ1 ISR, which the
+#     in-kernel shell relies on, cannot fire while IF=0 — that masking, not a
+#     dead keyboard, is why an earlier all-hid_poll cut hung at the prompt on
+#     iron while the in-kernel shell typed fine).
+#   * kb_has_key() calls hid_poll() to drain the xHCI USB-HID event ring. This
+#     is the QEMU producer (its usb-kbd posts there) and the native-xHCI path
+#     once firmware legacy support is off; it is a polled MMIO read, no ISR.
+# On a given box exactly one of the two has data (the other's source is empty),
+# so draining both is race-free and never double-counts. No timer masking is
+# needed because IF stays 0 — no timer tick, hence no preemption of this
+# ring-0 syscall (preemptive ring-3 is a later arc). The busy-spin costs one
+# core while the prompt is idle, acceptable for the single-foreground model.
+# scancode_to_ascii returns 0 for modifier/release codes — consumed but never
+# counted, so we never return a 0-length read after blocking.
 fn kbd_read_blocking(buf, count) {
     if (count <= 0) { return 0; }
     var n = 0;
     while (n < count) {
-        while (kb_has_key() == 0) { }             # busy-poll (drains HID); blocks for a key
+        kb_poll_i8042();                              # iron: polled i8042 (USB-legacy emulation)
+        while (kb_has_key() == 0) {                   # QEMU: hid_poll() drains xHCI; checks ring
+            kb_poll_i8042();
+        }
         var sc = kb_read_scancode();
         var ch = scancode_to_ascii(sc);
         if (ch != 0) {
             store8(buf + n, ch);
             n = n + 1;
-            if (kb_has_key() == 0) { return n; }  # nothing more buffered -> return >=1 byte
+            kb_poll_i8042();
+            if (kb_has_key() == 0) { return n; }      # nothing more buffered -> return >=1 byte
         }
         # ch == 0 (modifier/release): keep blocking for a real character
     }

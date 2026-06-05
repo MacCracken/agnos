@@ -25,10 +25,8 @@
 # Polled-only — same posture as virtio_blk: no MSI-X plumbing, no ISR byte
 # read; watch used->idx directly via net_poll callers.
 #
-# Legacy interface left in tree as a deferred 1.34.x cleanup (third-bug
-# investigation: doorbell reaches QEMU but virtio_net_handle_tx never fires;
-# layout + bus-master fix didn't surface the missing piece). Per user
-# direction 2026-05-23: switch to modern now, revisit legacy in 1.34.x.
+# This driver uses the MODERN virtio interface (chosen over the legacy path
+# 2026-05-23; the modern COMMON_CFG registers below are §4.1.4.3).
 
 # COMMON_CFG register offsets (§ 4.1.4.3) -----------------------------
 var VNET_DEV_FEAT_SEL    = 0x00;  # le32 RW
