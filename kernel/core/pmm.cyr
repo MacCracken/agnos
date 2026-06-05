@@ -117,22 +117,23 @@ fn pmm_init() {
 
 fn pmm_alloc() {
     pmm_spin_lock();
-    # Find first free page, starting from hint for O(1) best-case
-    for (var i = pmm_next_free; i < 4096; i = i + 1) {
+    # 1.41.12: allocate 4 KB pages TOP-DOWN (from page 4095 toward 1024) so
+    # page-table / DMA-ring pages cluster in the HIGH 2 MB regions, while
+    # pmm_alloc_2mb scans LOW-to-high (region 1→7) and keeps the low regions
+    # intact for ELF code / user stacks / mmap heap. They only meet if total
+    # demand exhausts the 12 MB pool. This is what eliminated the flaky agnsh
+    # ring-3 #PF: the OLD bottom-up first-fit, seeded by the KASLR-randomized
+    # pmm_next_free, scattered a 4 KB page into a random 2 MB region every boot —
+    # one set page makes pmm_alloc_2mb skip that whole region, so on ~half of
+    # boots agnsh couldn't get its 3 contiguous regions (code/stack/heap) and the
+    # shell faulted right after its banner. Top-down keeps 4 KB allocs out of the
+    # regions 2 MB allocs consume first, deterministically. GDB ground truth: a
+    # fixed (non-KASLR) hint made the fault vanish 14/14; this preserves KASLR
+    # entropy in the high pages while removing the cross-class fragmentation.
+    for (var i = 4095; i >= 1024; i = i - 1) {
         if (pmm_test(i) == 0) {
             pmm_set(i);
             pmm_used = pmm_used + 1;
-            pmm_next_free = i + 1;
-            pmm_spin_unlock();
-            return i * 0x1000;
-        }
-    }
-    # Wrap around and search from beginning (fragmentation case)
-    for (var i = 0; i < pmm_next_free; i = i + 1) {
-        if (pmm_test(i) == 0) {
-            pmm_set(i);
-            pmm_used = pmm_used + 1;
-            pmm_next_free = i + 1;
             pmm_spin_unlock();
             return i * 0x1000;
         }
