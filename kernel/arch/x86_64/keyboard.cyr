@@ -56,17 +56,16 @@ fn kb_isr_build() {
 }
 
 fn kb_has_key() {
-    # kb_buf has TWO producers, both feeding the same consumer contract:
-    #   1. The IRQ1 ISR (kb_isr) — fired by an i8042 at port 0x60. On
-    #      archaemenid the keyboard is USB but the firmware's UEFI USB-legacy
-    #      support emulates an i8042, so this is the producer that actually
-    #      delivers keystrokes on iron (and requires interrupts enabled).
-    #   2. hid_poll() — drains the xHCI USB-HID event ring (this call). Works
-    #      in QEMU (whose keyboard posts to that ring) and is the path for
-    #      native xHCI HID once firmware legacy support is off; no-op when no
-    #      HID keyboard was configured (hid_kbd_slot_id == 0 inside hid_poll).
-    # We drain (2) here so a caller polling this function also services xHCI;
-    # (1) fills kb_buf asynchronously via the ISR.
+    # kb_buf has two producers feeding one consumer (scancode_to_ascii):
+    #   1. kb_isr — the IRQ1 handler. Reads a scancode from port 0x60 on each
+    #      keyboard interrupt and appends it to kb_buf. This is the producer
+    #      that delivers on archaemenid (the in-kernel shell + the read(0) path
+    #      both type via it); it requires IF=1.
+    #   2. hid_poll() — drains the xHCI USB-HID event ring (this call). The
+    #      QEMU producer (its usb-kbd DMAs reports into that ring); no-op when
+    #      no HID keyboard was configured (hid_kbd_slot_id == 0 inside hid_poll).
+    # Drain (2) here so a polling caller also services xHCI; (1) fills kb_buf
+    # asynchronously via the ISR.
     hid_poll();
     if (kb_head != kb_tail) { return 1; }
     return 0;
@@ -78,34 +77,13 @@ fn kb_read_scancode() {
     return sc;
 }
 
-# Poll the i8042 output buffer directly into kb_buf, WITHOUT relying on IRQ1.
-# This is the producer for the ring-3 read(0) path (kbd_read_blocking), which
-# runs with interrupts masked (SYSCALL/SFMASK clears IF) so the IRQ1 ISR
-# (kb_isr) cannot fire. On archaemenid the keyboard is USB but the firmware's
-# UEFI USB-legacy support emulates an i8042 at ports 0x60/0x64, and that
-# emulation answers POLLED reads (OBF = 0x64 bit 0; data at 0x60) exactly as
-# PS/2 hardware does — it is how a bootloader/BIOS reads a USB keyboard before
-# the OS owns xHCI. Status bit 5 (AUXB) flags a PS/2-mouse byte; we skip those.
-# The drain is bounded (<=16) so a box with no i8042 — where the open bus reads
-# 0xFF, making OBF look permanently set — can never spin forever here (and the
-# 0xFF bytes carry the AUXB bit, so they're skipped, never injected as input).
-# Safe to poll ONLY with IF masked: with the ISR live (IF=1) it would race the
-# ISR for port 0x60, so interrupts-enabled callers must keep using the ISR path.
-fn kb_poll_i8042() {
-    var drained = 0;
-    var st = inb(0x64);
-    while ((st & 0x01) != 0) {
-        if (drained >= 16) { return 0; }
-        var data = inb(0x60);
-        if ((st & 0x20) == 0) {
-            store8(&kb_buf + kb_head, data & 0xFF);
-            kb_head = (kb_head + 1) & 0xFF;
-        }
-        drained = drained + 1;
-        st = inb(0x64);
-    }
-    return 0;
-}
+# Enable / disable maskable interrupts (sti / cli) around the blocking-stdin
+# read. kbd_read_blocking (core/syscall.cyr) re-enables interrupts so IRQ1 ->
+# kb_isr delivers keystrokes — the SYSCALL instruction masks IF on entry, which
+# would otherwise lock out the only keystroke source on real hardware. Arch-
+# factored so core/syscall.cyr stays portable (aarch64 stubs these out).
+fn kbd_irq_enable()  { asm { 0xFB; } return 0; }   # sti
+fn kbd_irq_disable() { asm { 0xFA; } return 0; }   # cli
 
 # === Scancode-to-ASCII (US QWERTY, Set 1) ===
 # Full keyboard map with shift support.

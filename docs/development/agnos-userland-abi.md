@@ -128,14 +128,20 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
 
 ### 3.1 Changed behavior (same numbers)
 
-- **🔒 `read`(5) on `fd 0` → blocking keyboard stdin** (**IMPLEMENTED 1.41.1** — `kbd_read_blocking`). When
-  `fd==0`, the kernel blocks until at least one real character is typed, drains any further buffered keys (up
-  to `len`), and returns the count. **Line discipline = RAW (O1)** — no kernel echo; agnsh does its own echo +
-  editing via `completion.cyr`/`history.cyr`. Mechanism: busy-polls `kb_has_key()` → `hid_poll()` (a
-  cooperative MMIO drain of the xHCI HID transfer ring), so it works with **interrupts MASKED** (SFMASK clears
-  IF on entry) — no `sti`, no `hlt`, no scheduler preemption mid-syscall. (Power follow-on: a `sti`+`hlt`
-  idle-wait needs the preemptive-ring-3 arc; until then a blocked read spins one core.) Other fds keep the
-  `vfs_read` path.
+- **🔒 `read`(5) on `fd 0` → blocking keyboard stdin** (**IMPLEMENTED 1.41.1** — `kbd_read_blocking`; **mechanism
+  corrected 1.41.14**). When `fd==0`, the kernel blocks until at least one real character is typed, drains any
+  further buffered keys (up to `len`), and returns the count. **Line discipline = RAW (O1)** — no kernel echo;
+  agnsh does its own echo + editing via `completion.cyr`/`history.cyr`. **Mechanism**: the syscall re-enables
+  interrupts (`sti`) for the duration of the read so the **IRQ1 handler (`kb_isr`) fills `kb_buf`** — the
+  keystroke producer on real hardware (the in-kernel recovery shell types the same way; proven on archaemenid).
+  Preemption is suspended (`sched_active=0`) around the window so the timer ISR can't context-switch the
+  non-reentrant syscall (it still EOIs + advances `timer_ticks`). `kb_has_key()` additionally drains the xHCI
+  HID ring via `hid_poll()` — the QEMU producer (events DMA into the ring regardless of interrupts). Busy-poll,
+  no `hlt`, so a blocked read spins one core (single-foreground model). **NB — this is a kernel-internal
+  mechanism change; the observable ABI (RAW, blocks until ≥1, returns count) is unchanged, so the cyrius peer is
+  unaffected.** *(The original 1.41.1 spec polled `hid_poll()` with **IF MASKED** — correct in QEMU, but on real
+  hardware keystrokes arrive only via IRQ1, which IF-masking structurally blocks; that QEMU-only assumption is
+  what made the 1.41.12/1.41.13 iron burns reach the prompt with dead typing.)* Other fds keep the `vfs_read` path.
 - **`open`(7) → mount-routed** (1.41.3). Re-route from `initrd_open`-only to `vfs_resolve_mount` →
   `ext2_open` (inode-wise) or `vfs_open_on` (FAT/exFAT), with `initrd` as the bare-name fallback. **Gains a
   flags arg** (a3) — see 3.3. Opening a **directory** returns a dir-fd usable by `getdents` (29).

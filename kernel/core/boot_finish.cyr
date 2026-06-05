@@ -6,11 +6,11 @@
 # ring 3 (1.41.x shell-separation); the in-kernel shell() is now a recovery
 # REPL. Both read keystrokes via kb_has_key()/kb_read_scancode(). Shell I/O
 # mirrors to the framebuffer via kprint so a serial-less box sees output.
-# Keyboard on archaemenid arrives via IRQ1 (kb_isr): the firmware's UEFI
-# USB-legacy support emulates an i8042 at port 0x60 for the USB keyboard, so
-# any reader running with interrupts enabled gets keystrokes. (The xHCI
-# USB-HID event ring that hid_poll() also drains stays empty on this iron
-# because the firmware owns the device — it is a fallback, not the producer.)
+# Both the recovery REPL and agnsh's read(0) get keystrokes from kb_buf, filled
+# by the IRQ1 handler (kb_isr) — proven on archaemenid. hid_poll() additionally
+# drains the xHCI USB-HID ring (the QEMU path). Either way the reader must run
+# with interrupts enabled for IRQ1 to fire (the in-kernel shell already does;
+# kbd_read_blocking now does too, see core/syscall.cyr).
 kprintln("Launching kybernet...", 21);
 # CMOS CP 0x15: reached kybernet-launch site (kybernet() runs the shell loop)
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x15; 0xE6; 0x71; }

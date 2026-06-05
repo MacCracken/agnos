@@ -139,46 +139,54 @@ fn kernel_resume() {
 # discipline (ABI decision O1) — no kernel echo, no line buffering; the userland
 # shell (agnsh — completion.cyr / history.cyr) owns echo + editing.
 #
-# This runs with interrupts MASKED — SYSCALL clears IF via SFMASK (=0x200, set
-# in syscall_init) and we do NOT re-enable them: an `sti` here lets the xHCI
-# controller raise an interrupt the kernel only expects to POLL, which corrupts
-# the event-ring drain (it broke QEMU typing in testing). So both keystroke
-# sources are PURE-POLLED, no ISR involved:
-#   * kb_poll_i8042() reads the i8042 output buffer (ports 0x60/0x64) straight
-#     into kb_buf. This is the iron producer: on archaemenid the keyboard is USB
-#     but the firmware's UEFI USB-legacy support emulates an i8042 that answers
-#     polled reads, so we get scancodes with IF masked (the IRQ1 ISR, which the
-#     in-kernel shell relies on, cannot fire while IF=0 — that masking, not a
-#     dead keyboard, is why an earlier all-hid_poll cut hung at the prompt on
-#     iron while the in-kernel shell typed fine).
-#   * kb_has_key() calls hid_poll() to drain the xHCI USB-HID event ring. This
-#     is the QEMU producer (its usb-kbd posts there) and the native-xHCI path
-#     once firmware legacy support is off; it is a polled MMIO read, no ISR.
-# On a given box exactly one of the two has data (the other's source is empty),
-# so draining both is race-free and never double-counts. No timer masking is
-# needed because IF stays 0 — no timer tick, hence no preemption of this
-# ring-0 syscall (preemptive ring-3 is a later arc). The busy-spin costs one
-# core while the prompt is idle, acceptable for the single-foreground model.
-# scancode_to_ascii returns 0 for modifier/release codes — consumed but never
-# counted, so we never return a 0-length read after blocking.
+# KEYSTROKE SOURCE (the one that delivers on real hardware): IRQ1 -> kb_isr ->
+# kb_buf. This is EXACTLY how the in-kernel recovery shell types on archaemenid
+# — proven on iron. It requires IF=1. The SYSCALL instruction masks IF via
+# SFMASK (=0x200) on entry, so this path lands here with interrupts OFF and that
+# producer is locked out. We re-enable interrupts (kbd_irq_enable) for the
+# duration of the blocking read, then disable them again before returning.
+#
+# Why a plain `sti` is safe here even though we're in a ring-3 process's
+# syscall: the only interrupt unsafe to take mid-syscall is the TIMER — its
+# handler calls do_context_switch and the kernel is not reentrant across a
+# context switch taken on the syscall stack. We suspend preemption by clearing
+# sched_active: the timer ISR still fires (keeps EOIing + advancing timer_ticks,
+# so net/NTP timing keeps moving) but do_context_switch early-returns, so no
+# switch happens. The in-kernel shell runs with IF=1 and the SAME xHCI MSI-X
+# enabled and types fine on iron, so xHCI interrupts were never the hazard the
+# old comment claimed here — the timer was.
+#
+# kb_has_key() also calls hid_poll() to drain the xHCI USB-HID event ring, which
+# is how QEMU's usb-kbd delivers (events DMA into the ring regardless of any
+# interrupt). So one loop serves both: iron fills kb_buf via IRQ1, QEMU via the
+# polled hid_poll drain. We busy-poll (no hlt) so the QEMU path needs no wake
+# interrupt; the spin costs one core while the prompt is idle, acceptable for
+# the single-foreground model. scancode_to_ascii returns 0 for modifier/release
+# codes — consumed but never counted, so we never return a 0-length read.
 fn kbd_read_blocking(buf, count) {
     if (count <= 0) { return 0; }
+    var saved_sched = sched_active;
+    sched_active = 0;          # suspend preemption: timer ISR still EOIs + ticks,
+                               # but do_context_switch early-returns (no switch)
+    kbd_irq_enable();          # IF=1 — IRQ1 -> kb_isr now fills kb_buf (iron)
     var n = 0;
     while (n < count) {
-        kb_poll_i8042();                              # iron: polled i8042 (USB-legacy emulation)
-        while (kb_has_key() == 0) {                   # QEMU: hid_poll() drains xHCI; checks ring
-            kb_poll_i8042();
-        }
+        while (kb_has_key() == 0) { }   # IRQ1 fills kb_buf (iron); hid_poll drains ring (QEMU)
         var sc = kb_read_scancode();
         var ch = scancode_to_ascii(sc);
         if (ch != 0) {
             store8(buf + n, ch);
             n = n + 1;
-            kb_poll_i8042();
-            if (kb_has_key() == 0) { return n; }      # nothing more buffered -> return >=1 byte
+            if (kb_has_key() == 0) {    # nothing more buffered -> return >=1 byte
+                kbd_irq_disable();
+                sched_active = saved_sched;
+                return n;
+            }
         }
         # ch == 0 (modifier/release): keep blocking for a real character
     }
+    kbd_irq_disable();
+    sched_active = saved_sched;
     return n;
 }
 
