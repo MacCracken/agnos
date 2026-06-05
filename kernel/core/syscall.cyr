@@ -167,7 +167,7 @@ fn kbd_read_blocking(buf, count) {
     if (count <= 0) { return 0; }
     var saved_sched = sched_active;
     sched_active = 0;          # suspend preemption: timer ISR still EOIs + ticks,
-                               # but do_context_switch early-returns (no switch)
+    # but do_context_switch early-returns (no switch)
     kbd_irq_enable();          # IF=1 — IRQ1 -> kb_isr now fills kb_buf (iron)
     var n = 0;
     while (n < count) {
