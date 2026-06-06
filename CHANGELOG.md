@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.6] — 2026-06-06 (**Track B: ship agnsh 1.4.2 with working FS verbs as the userland shell + an agnos-side verb test against the live kernel FS.** The kernel **source is unchanged** from 1.42.5 — the FS verbs needed no new syscalls (open/read/write/close/mkdir/rmdir/unlink/rename/getdents/stat/sync all already exist) — this cut ships the verbs-enabled userland binary + proves it on the real filesystem.)
+
+### Changed
+
+- **`build/rootfs/bin/agnsh` re-seeded to agnoshi 1.4.2** — the AI shell now carries in-process FS verbs (`ls cat cp mv rm mkdir rmdir touch echo wc find grep`). They're builtins (not external binaries) because external-binary exec waits on ring-3 `execwait` (1.43.x). Destructive verbs (`rm`/`mv`/overwriting `cp`) honor the shell mode: execute directly in auto/assist, prompt `[y/N]` in human/strict; read-only/create verbs never prompt. Full agnoshi-side detail in the agnoshi `[1.4.2]` CHANGELOG.
+
+### Added
+
+- **`scripts/agnsh-verb-test.py`** — drives the verbs on the **real kernel ext2 root** in QEMU (xHCI keyboard via HMP `sendkey`): `echo VERBPROOF > /vtest` then `ls /` (must list the newly-created `vtest`) then `cat /vtest` (must print `VERBPROOF`). **PASS** — the verb→syscall→ext2 roundtrip works end-to-end on the live kernel, not just the agnoshi host smoke.
+
+### Validated
+
+- `scripts/agnsh-verb-test.py` **PASS** (`ls /` → `lost+found bin vtest`; `cat /vtest` → `VERBPROOF`; banner `agnoshi 1.4.2`). `scripts/agnsh-smoke.sh` **PASS** (the larger verbs-enabled binary boots to `[ASSIST] >`). `scripts/sweep.sh` **7/7** (kernel regression — code unchanged from 1.42.5). Kernel build **1,074,288 B** (banner-only delta vs 1.42.5), x86_64 multiboot2 OK.
+
+### Notes
+
+- **Deferred (Track-B follow-on, not this cut):** linking `commandress`/`bannermanor`/`mihi`/`iam` as agnsh builtins — each needs its own `CYRIUS_TARGET_AGNOS` build, and **mihi/iam sysinfo needs new kernel syscalls** (no `uname`/`sysinfo`/`meminfo` exists today). That's its own kernel+userland bite.
+
+
 ## [1.42.5] — 2026-06-06 (**Track A perf: heap allocator zeroing — `kmalloc` is now O(1)-zero instead of O(block_size).** First measurement-gated perf bite, on the bench harness 1.42.1 restored. The slab allocator double-zeroed: `kmalloc` re-zeroed the whole block on every alloc, but `kfree_sized` already scrubs the full block on free — so the alloc-time re-zero was redundant.)
 
 ### Changed
