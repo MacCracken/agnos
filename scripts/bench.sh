@@ -130,8 +130,15 @@ else
     mcopy -i "$IMG"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
     mcopy -i "$IMG"@@1048576 "$ROOT/build/agnos_bench" ::boot/agnos
     cp "$OVMF_VARS_SRC" "$BWORK/vars.fd"; chmod +w "$BWORK/vars.fd"
+    # Accel: prefer KVM (-cpu host) for stable, real-cycle rdtsc. TCG's
+    # rdtsc is host-TSC-based and swings ~5x run-to-run, which makes fine
+    # perf deltas unmeasurable. Fall back to -cpu max (TCG) when /dev/kvm is
+    # absent or BENCH_KVM=0. The CSV records kvm_enabled so KVM and TCG rows
+    # stay non-comparable on purpose.
+    BENCH_ACCEL="-cpu max"
+    if [ -r /dev/kvm ] && [ "${BENCH_KVM:-1}" = "1" ]; then BENCH_ACCEL="-enable-kvm -cpu host"; fi
     OUTPUT=$(timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
-        -machine q35 -m 512M -cpu max \
+        -machine q35 -m 512M $BENCH_ACCEL \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
         -drive "if=pflash,format=raw,file=$BWORK/vars.fd" \
         -drive "file=$IMG,format=raw,if=none,id=disk0" \
@@ -152,7 +159,7 @@ QEMU_VERSION=$(qemu-system-x86_64 --version 2>/dev/null | head -1 | awk '{print 
 CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //; s/,/;/g' || echo "unknown")
 HOST_ARCH=$(uname -m 2>/dev/null || echo "unknown")
 KVM_ENABLED=0
-if [ -r /dev/kvm ] && echo "$QEMU_FLAGS" | grep -q '\-enable-kvm'; then
+if echo "${BENCH_ACCEL:-}" | grep -q '\-enable-kvm'; then
     KVM_ENABLED=1
 fi
 CYRIUS_VERSION=$(grep -oE '^cyrius = "[^"]+"' "$ROOT/cyrius.cyml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' || echo "unknown")

@@ -53,6 +53,14 @@ fn slab_grow(class_idx) {
     if (vmm_is_mapped(page) == 0) {
         vmm_map(page, page, 0x83);
     }
+    # Zero the whole fresh page ONCE here (amortized over blocks_per_page
+    # blocks). Combined with kfree_sized's full-block scrub, this establishes
+    # the heap invariant: every block on a free list is fully zero EXCEPT its
+    # first 8 bytes (the next-pointer). That lets kmalloc clear only those 8
+    # bytes instead of re-zeroing the whole block — the 1.42.5 heap-zeroing win
+    # (O(1) alloc-zero vs the old O(block_size)). pmm_alloc does not guarantee a
+    # zeroed page, so this zero is required for the invariant on fresh slabs.
+    for (var z = 0; z < 4096; z = z + 8) { store64(page + z, 0); }
     # Divide page into blocks, chain them as a free list
     var blocks_per_page = 4096 / block_size;
     if (blocks_per_page < 1) { blocks_per_page = 1; }
@@ -85,18 +93,30 @@ fn kmalloc(size) {
     # Pop first free block
     var next = load64(head);
     store64(&slab_free + class_idx * 8, next);
-    # Zero only the requested size (security: don't leak old data)
-    # Round up to 8-byte boundary for store64 alignment
-    var zero_len = (size + 7) & (0 - 8);
-    for (var i = 0; i < zero_len; i = i + 8) {
-        store64(head + i, 0);
-    }
+    # The block body is already zero — kfree_sized scrubs the full block on
+    # free, and slab_grow zeros each fresh page — so only the first 8 bytes
+    # (which held the free-list next-pointer) need clearing. This is O(1)
+    # instead of the old O(block_size) re-zero (the dominant cost for large
+    # classes: kmalloc(4096) re-zeroed 512 store64s every alloc), and it gives
+    # a STRONGER guarantee than the old `zero only [0,size)` loop — the FULL
+    # block is zero, so a caller reading [size,block_size) can't see stale data.
+    # Invariant (every free block is zero except its next-pointer) is held by
+    # slab_grow's page-zero + kfree_sized's full scrub. (1.42.5 heap-zeroing.)
+    store64(head, 0);
     heap_allocs = heap_allocs + 1;
     return head;
 }
 
 # Free a pointer back to the heap. Caller must provide the original alloc size
 # (or we scan — but for now, require size for simplicity).
+#
+# CONTRACT (load-bearing since the 1.42.5 zeroing optimization): `size` MUST map
+# to the SAME size-class as the kmalloc that produced `ptr`. The scrub below
+# zeros block_size-from-class bytes; since kmalloc no longer re-zeros the body on
+# the next alloc (it clears only the 8-byte next-pointer, trusting this scrub),
+# freeing a class-N block with a smaller-class `size` would under-scrub and leak
+# the tail into a later allocation. Every current caller passes a matching size
+# (audited 1.42.5). A future per-block size header would make this structural.
 fn kfree_sized(ptr, size) {
     if (ptr == 0) { return 0; }
     var class_idx = slab_class_for(size);

@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.5] — 2026-06-06 (**Track A perf: heap allocator zeroing — `kmalloc` is now O(1)-zero instead of O(block_size).** First measurement-gated perf bite, on the bench harness 1.42.1 restored. The slab allocator double-zeroed: `kmalloc` re-zeroed the whole block on every alloc, but `kfree_sized` already scrubs the full block on free — so the alloc-time re-zero was redundant.)
+
+### Changed
+
+- **`kmalloc` clears only the 8-byte free-list next-pointer instead of re-zeroing the whole block.** `slab_grow` now zeros each fresh 4 KB page once (before chaining), establishing the invariant *every block on a free list is fully zero except its first 8 bytes (the next-pointer)*; `kfree_sized` (unchanged) maintains it by scrubbing the full block on free. `kmalloc` therefore only clears the popped block's next-pointer — **O(1) vs the old O(block_size)** (a 4096 B alloc dropped from 512 store64s to 1). It's also a *stronger* guarantee than the old `zero only [0,size)` loop: the **full** block is now zero, so a caller reading `[size, block_size)` can't see stale data. (`kernel/core/heap.cyr`.)
+- **`kfree_sized` documents the size-class contract** (now load-bearing): `size` must map to the same class as the originating `kmalloc`, else the scrub under-covers (kmalloc no longer re-zeros to compensate). All current callers pass a matching size — **adversarially audited** (two independent auditors + adjudicator: every `&slab_free` writer enumerated, no `kcalloc`/`krealloc`/`kfree`-without-scrub path, invariant holds by induction; verdict **safe**, zero required fixes).
+
+### Performance
+
+- **Heap alloc/free zeroing (KVM `-cpu host`, min-of-N, archaemenid Zen):**
+
+  | class | before | after | Δ |
+  |---|---|---|---|
+  | `kmalloc/kfree(4096)` | 5719 c/op | **2855** | **−50%** (2.0×) |
+  | `kmalloc/kfree(256)` | 489 c/op | **313** | −36% |
+  | `kmalloc/kfree(32)` | 132 c/op | **112** | −15% |
+
+  The win scales with block size (zeroing-dominated); 32 B is fixed-overhead-bound. Measured via the min-of-N estimator because even KVM rdtsc is preemption-sensitive on longer loops.
+
+### Added
+
+- **`bench.sh` gains a KVM accel path** (`-enable-kvm -cpu host` when `/dev/kvm` is present, else `-cpu max` TCG; `BENCH_KVM=0` forces TCG). TCG's host-TSC-based rdtsc swings ~5× run-to-run (`pmm_alloc_free` 7782–40742), which made fine perf deltas unmeasurable; KVM gives real, stable cycles (`pmm_alloc_free` ~800–1100). `kvm_enabled` is recorded in `bench-history.csv` so KVM and TCG rows stay non-comparable on purpose.
+
+### Notes
+
+- **Deferred Track-A targets (surveyed, with reasons):** `fb_console` scroll is already u64-block-optimized — its real win is a RAM-side shadow buffer, an architectural change tied to the parked AMD-Zen-scanout eval, not a 1.42.5 bite. `pmm_spin_lock`'s atomic `xchg` is dead weight on a single core but is deliberate SMP-future-proofing (the coming multithreading arc) — not stripped unilaterally. The PMM top-down scan is correctness-load-bearing (the 1.41.12 fragmentation fix); a free-page hint risks reintroducing that bug for a win the bench barely exercises — deferred.
+- `scripts/sweep.sh` **7/7**, `agnsh-smoke` PASS, build **1,074,288 B** (−16 B). No iron burn needed (heap-internal); rides the next burn for free.
+
 ## [1.42.4] — 2026-06-06 (**Hardening (c): reap leftovers — the in-memory spawn/elf_load procs are now reaped, and the mmap-arena teardown covers the full arena.** Closes the two process-teardown leaks carried from 1.40.14. Pre-1.42 the `run`/`elf_load_from_file` (from-disk) path reaped on exit, but the `spawn`/`elf_load` (in-memory) path's children leaked their whole address space + proc-table slot for the boot; and the AS-teardown free-loop stopped at PD index 510, one short of the arena's top page at PD 511.)
 
 ### Fixed
