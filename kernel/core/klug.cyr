@@ -43,6 +43,16 @@ fn klug_append(buf, len) {
     return 0;
 }
 
+# Leveled log helpers (1.42.12). Prefix the line with a severity tag then route
+# through kprint — so the message is BOTH shown (serial+fb) AND captured into
+# klug (via the kprint tap), and the prefix is the userland grep key (a
+# `klug | grep '[E]'` shows only errors). [I] info / [W] warn / [E] err; terse
+# single-char tags keep the log dense. The API is the bite-2 deliverable —
+# adopt it gradually across the kernel, not in a mass conversion.
+fn klog_info(buf, len) { kprint("[I] ", 4); kprintln(buf, len); return 0; }
+fn klog_warn(buf, len) { kprint("[W] ", 4); kprintln(buf, len); return 0; }
+fn klog_err(buf, len)  { kprint("[E] ", 4); kprintln(buf, len); return 0; }
+
 # Validation (KLUG_SELFTEST): re-emit the captured ring between markers so a
 # smoke can confirm the boot log was unified into klug. Emits via serial_print/
 # fb_print DIRECTLY (not kprint), so the dump's own output is NOT re-captured

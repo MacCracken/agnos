@@ -1382,6 +1382,42 @@ fn exec_disk_selftest() {
     kprintln("exec: running /bin/sysi", 23);
     sh_exec("run /bin/sysi", 13);
 
+    # 1.42.12 — klug bite 2. Exercise the leveled-log API (each line is shown +
+    # captured into klug with its [I]/[W]/[E] grep-key prefix), then validate the
+    # klog#36 read syscall from ring 3: /bin/klog calls klog(buf, 200) and exits
+    # with the byte count it returned. The boot log is far more than 200 B by now,
+    # so klog returns exactly 200 → "run: exit 200" proves the syscall copied the
+    # requested tail of the unified ring into a user buffer (bounds + count).
+    klog_info("klug: level API live", 20);
+    klog_warn("klug: warn channel", 18);
+    klog_err("klug: err channel", 17);
+    var ki = 0;
+    while (ki < 200) { store8(eb + ki, 0); ki = ki + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 158); store8(eb + 104, 158);                  # p_filesz/memsz = 158
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 — 38 bytes, no jumps: klog(rsp,200) then exit(rax)
+    var kc = 120;
+    store8(eb+kc,0x48); store8(eb+kc+1,0x81); store8(eb+kc+2,0xEC); store8(eb+kc+4,0x01); kc=kc+7;  # sub rsp,0x100
+    store8(eb+kc,0x48); store8(eb+kc+1,0xC7); store8(eb+kc+2,0xC0); store8(eb+kc+3,0x24); kc=kc+7;  # mov rax,36 (klog)
+    store8(eb+kc,0x48); store8(eb+kc+1,0x89); store8(eb+kc+2,0xE7); kc=kc+3;                        # mov rdi,rsp (buf)
+    store8(eb+kc,0x48); store8(eb+kc+1,0xC7); store8(eb+kc+2,0xC6); store8(eb+kc+3,0xC8); kc=kc+7;  # mov rsi,200 (len)
+    store8(eb+kc,0x0F); store8(eb+kc+1,0x05); kc=kc+2;                                              # syscall
+    store8(eb+kc,0x48); store8(eb+kc+1,0x89); store8(eb+kc+2,0xC7); kc=kc+3;                        # mov rdi,rax (exit code = count)
+    store8(eb+kc,0x48); store8(eb+kc+1,0xC7); store8(eb+kc+2,0xC0); store8(eb+kc+3,0x00); kc=kc+7;  # mov rax,0 (exit)
+    store8(eb+kc,0x0F); store8(eb+kc+1,0x05);                                                       # syscall — exit(rdi)
+    var klino = 0;
+    if (bino > 0) { klino = ext2_create(bino, "klog", 4); }
+    if (klino > 0) { ext2_write_at(klino, 0, eb, 158); ext2_sync(); }
+    kprintln("exec: running /bin/klog", 23);
+    sh_exec("run /bin/klog", 13);
+
     # 1.40.14 reap validation. (A) slot reclaim: the create-then-reap of prog2 +
     # argv must leave proc_count where it started (LIFO reclaim). (B) address-space
     # leak: directly exercise proc_free_address_space (3 PT pages + one mapped user

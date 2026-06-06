@@ -140,6 +140,16 @@ if strings "$LOG" | grep -q "^run: exit 66"; then
 else
     echo "  FAIL: no 'run: exit 66' (uname#34 / sysinfo#35 didn't write the expected struct bytes)"; rc=1
 fi
+# 1.42.12: klog#36 — /bin/klog is exec #4; it calls klog(buf, 200) and exits with
+# the byte count returned. The boot log is >> 200 B by now, so klog returns 200,
+# proving the syscall copied the requested tail of the unified klug ring into a
+# user buffer (bounds + count). The [I]/[W]/[E] level lines emitted just before
+# also confirm the leveled-log API is captured.
+if strings "$LOG" | grep -q "^run: exit 200"; then
+    echo "  PASS: klog#36 — /bin/klog copied 200 B of the unified klug ring to a user buffer (exit 200)"
+else
+    echo "  FAIL: no 'run: exit 200' (klog#36 didn't copy the requested ring bytes to userland)"; rc=1
+fi
 # Clean return after BOTH runs — "selftest done" proves exec_and_wait returned
 # into its caller frame each time (multi-run + shell-loop shape).
 if strings "$LOG" | grep -q "^exec: selftest done"; then

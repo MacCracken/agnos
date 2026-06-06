@@ -164,6 +164,7 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
 | 33 | `stat` | path | pathlen | statbuf | — | 0 / -1 | fills `statbuf` (§4.1, ≥0x200000) with the agnos stat struct. **shell** (`ls -l`, type) |
 | 34 | `uname` | buf | len (≥64) | — | — | 0 / -1 | writes the 64-byte identity struct (§4.3) into `buf`: sysname/nodename/release/machine. Static boot-time identity. **mihi/iam** (1.42.10) |
 | 35 | `sysinfo` | buf | len (≥40) | — | — | 0 / -1 | writes the 40-byte counters struct (§4.4) into `buf`: uptime_secs / total+free RAM bytes / procs / cpus. Live snapshot; kernel does the unit conversion. **mihi/iam/chakshu** (1.42.10) |
+| 36 | `klog` | buf | len | — | — | bytes / -1 | copies the unified **klug** kernel-log ring (§4.5) into `buf`, oldest→newest; when `len` < the log fill, returns the **newest** `len` bytes (dmesg tail). Returns bytes written. **klug/dmesg tool** (1.42.12) |
 
 **34 `uname` / 35 `sysinfo` are IMPLEMENTED (1.42.10)** — the sovereign sysinfo surface for the native system-info tools. Split (identity vs counters) so a monitor like `chakshu` can poll `sysinfo` repeatedly without re-copying the static strings; each struct is single-shaped (all-string / all-u64) to avoid mixed-width padding. Both reject `is_user_range(buf,N)==0` or `len<N`. Kept *out* of the kernel deliberately: CPU brand string (userland CPUID), GPU manifest (userland PCI), distro (rootfs `/etc/os-release`), load-avg/swap (no native source). Userland calls them via the raw `syscall(34/35, buf, len)` builtin (no cyrius stdlib change required).
 
@@ -243,6 +244,15 @@ Written by syscall 35. The kernel does the unit conversion (ticks→seconds at 1
 | 32 | `cpus` | u64 | `cpu_count` (=1 until SMP enumeration lands) |
 
 All-u64 (no sub-word fields → no Cyrius struct-padding ambiguity, same rule §4.1 follows). No Linux `mem_unit` scaling field (AGNOS uses fixed u64 byte counts — no 32-bit overflow), no `_f[]` padding, and no swap/buffer/highmem fields (AGNOS has none — omitted). Future fields append at the tail and bump the minimum `len`; the existing offsets are frozen ABI the moment a consumer reads them.
+
+### 4.5 `klog` read (syscall 36 — variable-length log copy, not a struct)
+
+`klog(buf, len)` copies the unified **klug** kernel-log ring (`core/klug.cyr`, a 16 KB circular byte buffer fed by every `kprint`/`kputc`/`kprintln`) into the user `buf`, **oldest→newest** (chronological). It is not a fixed struct — it returns raw log text and the byte count:
+
+- Returns `min(len, ring_fill)` — the number of bytes written — or `-1` if `is_user_range(buf, len)` fails.
+- When `len` < the current ring fill, returns the **newest** `len` bytes (the dmesg tail) so a small buffer still shows the most recent lines.
+- The ring wraps at 16 KB (old lines age out); the kernel unwraps oldest→newest so the userland reader always sees chronological order regardless of the wrap point.
+- Leveled lines carry an `[I]`/`[W]`/`[E]` prefix (from `klog_info`/`klog_warn`/`klog_err`) — the userland `klug`/`dmesg` tool greps on that prefix (the kernel does **no** filtering: it unifies the log; grep stays userland).
 
 ## 5. Coordination protocol (two-agent)
 

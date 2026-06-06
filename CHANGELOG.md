@@ -5,6 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.12] — 2026-06-06 (**klug bite 2: the kernel logging layer is complete — leveled logging (`klog_info`/`klog_warn`/`klog_err`) + the `klog`#36 read syscall.** Userland can now read the unified kernel log and grep it; the kernel does no filtering.)
+
+### Added
+
+- **Leveled log API** (`kernel/core/klug.cyr`) — `klog_info`/`klog_warn`/`klog_err` prefix `[I]`/`[W]`/`[E]` and route through `kprint`, so a line is BOTH shown (serial+fb) AND captured into klug with its grep-key prefix (`klug | grep '[E]'` shows only errors). Available for gradual kernel-wide adoption.
+- **syscall 36 `klog(buf, len)`** (`kernel/core/syscall.cyr`) — copies the unified klug ring into the user buffer, oldest→newest; when `len` < the ring fill it returns the **newest** `len` bytes (the dmesg tail). Returns bytes written / -1. The `& 0x3FFF` mask unwraps the linear and wrapped cases uniformly; it reads only `klug_buf` (no cross-object info-leak). Same `is_user_range` gate as the sysinfo syscalls.
+- **`/bin/klog` ring-3 validator** in the `EXEC_SELFTEST` self-seed — calls `klog(buf, 200)` and exits the byte count; `exec-smoke.sh` gates on `run: exit 200`.
+
+### Validated
+
+- `exec-smoke.sh` **9/9** incl. `run: exit 200` (klog#36 copied the requested tail to userland) and the `[I]`/`[W]`/`[E] klug:…` level lines captured — and `/bin/klog` is exec **#4**, reconfirming sequential-exec reaping. `scripts/sweep.sh` **7/7**.
+- **Adversarial review (3 independent lenses) — 0 findings.** Memory-safety: no OOB-read/write, no info-leak (the mask bounds every `klug_buf` index; `kl_w < kl_want ≤ arg2` keeps writes inside the `is_user_range`-validated buffer; reads are confined to `klug_buf`). Unwrap-correctness: **65,679+ simulated cases** across every `klug_head` residue × request length, linear AND the boot-untested **wrapped** path — all return the newest `min(len,avail)` bytes in chronological order. Integer-edge: negative `arg2` rejected by `is_user_range`'s wrap check, huge `arg2` clamped, `(avail-want)` never underflows. ABI doc §3.2 row 36 + §4.5 updated. Kernel build **1,096,464 B**, x86_64 multiboot2 OK.
+
+### Notes
+
+- **The kernel logging layer is now complete** (klug ring buffer 1.42.11 + levels & read syscall 1.42.12). Remaining klug consumer: a userland `klug`/`dmesg` tool that reads via `klog`#36 and greps via the agnsh `grep` builtin — joins the userland-tools queue alongside wiring `mihi`/`iam` to the `uname`#34/`sysinfo`#35 struct offsets.
+
 ## [1.42.11] — 2026-06-06 (**klug — Kernel Logs Unified Grep, bite 1: the unified in-kernel log ring buffer.** Every byte `kprint`/`kputc`/`kprintln` mirror to serial+fb is now also captured in one greppable place. "klug" = the logs UNIFIED in the kernel; GREP stays a userland capability.)
 
 ### Added
