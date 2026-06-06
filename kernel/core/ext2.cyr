@@ -562,15 +562,15 @@ fn ext2_block_to_lba(block_num) {
 
 fn ext2_read_block(block_num, buf) {
     var lba = ext2_block_to_lba(block_num);
-    for (var i = 0; i < ext2_sectors_per_block; i = i + 1) {
-        # Bite (G) — explicit per-backend dispatch via ext2_blk_read
-        # ensures the read lands on the backend that probed positive,
-        # not whatever holds blk_active.
-        if (ext2_blk_read(lba + i, buf + i * 512) != 0) {
-            return 0 - 1;
-        }
-    }
-    return 0;
+    # One multi-sector read per FS block instead of ext2_sectors_per_block
+    # single-LBA reads. Per-backend dispatch via ext2_backend (same as the
+    # single-sector ext2_blk_read path — the read lands on the backend that
+    # probed positive, not whatever holds blk_active). On NVMe this is ONE
+    # multi-LBA command (the backend bounces through its 4 KB DMA scratch +
+    # one word-wide copy) vs 8 submit/poll round-trips — the ~8x win on every
+    # block read (exec-load, path lookup, cat/ls, indirect-block walks). AHCI
+    # already issued one command per block; this brings NVMe to parity.
+    return blk_read_sectors_on(ext2_backend, lba, ext2_sectors_per_block, buf);
 }
 
 # --- Block write (WRITE arc 1.33.x — mirror of ext2_read_block) -------
@@ -2038,9 +2038,14 @@ fn ext2_dir_lookup(dir_inode_num, name, name_len) {
     var dir_size = ext2_inode_filesize(&ext2_inode_buf);
     if (dir_size == 0) { return 0; }
 
+    # The dir inode is already in ext2_inode_buf from the fetch above, and
+    # nothing in this loop clobbers it: ext2_logical_to_physical reads indirect
+    # blocks into ext2_indirect_buf_l1/l2/l3 and the dirent scan reads into
+    # ext2_dir_buf — both distinct buffers. So the per-iteration re-fetch the
+    # original code did (1 BGDT read + 1 inode-table read = 16 NVMe sector
+    # round-trips per extra dir block) was redundant; hoisted out.
     var bytes_done = 0;
     while (bytes_done < dir_size) {
-        if (ext2_get_inode(dir_inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
         var logical = bytes_done / ext2_blocksize;
         var phys = ext2_logical_to_physical(&ext2_inode_buf, logical);
         if (phys == 0 - 1) { return 0 - 1; }

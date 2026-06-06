@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.8] — 2026-06-06 (**Track A perf: fs read-path — every ext2 block read collapses 8 single-LBA NVMe commands into one multi-LBA transfer, and `ext2_dir_lookup` stops re-reading the directory inode on every block.** The universal FS read primitive behind exec-load, path lookup, `cat`, `ls`, and the indirect-block walks.)
+
+### Changed
+
+- **`ext2_read_block` issues one multi-sector read per FS block** instead of `ext2_sectors_per_block` single-LBA reads (`kernel/core/ext2.cyr`), routed through the new `blk_read_sectors_on(ext2_backend, …)` per-backend dispatcher. On NVMe the backend collapses the whole block to ONE multi-LBA command (build SQE + ring doorbell + spin CQ — once instead of 8×) by bouncing through the 4 KB DMA scratch + one word-wide copy; AHCI already issued one command per block, so this brings NVMe to parity. An ext2 block is ≤ 4096 B = ≤ 8 sectors = exactly one scratch page, so every block takes the single-command fast path.
+- **`nvme_blk_read_sectors` fast path** (`kernel/core/nvme.cyr`): a read that fits the 4 KB scratch (≤ 8 LBAs) goes out as one `nvme_read_sectors` command + one `memcpy` out, vs the old per-sector bounce loop. Reads > 4 KB keep the loop (correct for any count). The block-layer API still can't promise a DMA-safe caller buffer, so the bounce is what makes the single-command path usable here.
+- **`ext2_dir_lookup` hoists the directory-inode fetch out of its per-block loop** (`kernel/core/ext2.cyr`). The inode is already in `ext2_inode_buf` and nothing in the loop clobbers it (`ext2_logical_to_physical` reads indirect blocks into `ext2_indirect_buf_l1/l2/l3`, the dirent scan uses `ext2_dir_buf` — distinct buffers), so the per-iteration re-fetch (1 BGDT read + 1 inode-table read = 16 NVMe sector round-trips per extra dir block) was redundant. Multi-block directories (`/bin`, `/`) now fetch the inode once.
+
+### Added
+
+- **`blk_read_sectors_on(tag, start, count, buf)`** (`kernel/core/block.cyr`) — per-backend multi-sector read, the sectors-API mirror of `blk_read_on`. Same registered-bit gate.
+- **`block_read_amp` bench tier + `nvme_io_submit_count`** (`kernel/core/bench.cyr`, `nvme.cyr`) — reads the same 8 raw LBAs as one multi-LBA command vs 8 single-LBA reads and counts NVMe SQ submissions. The structural proof of the collapse (analog of `memset_1MB ≈ memwrite_1MB`); `bench.sh`'s display grep now forwards the `submits` line.
+
+### Performance
+
+- **`block_read_amp`: multi=1 single=8 nvme submits / 4 KB block** (bench, NVMe). Every ext2 block read — exec ELF-load, `ext2_path_lookup`, `cat`, `ls`, indirect-block walks — drops from 8 submit/poll round-trips to 1 on NVMe. The win is round-trip count (doorbell MMIO + CQ-poll latency dominate the per-block cost), not raw cycles; `vfs_open_read_close` is a MEMFILE microbench and intentionally doesn't move.
+
+### Validated
+
+- `scripts/sweep.sh` **7/7** — `check.sh`, FAT/exFAT read+write+subdir, ext2 WRITE (W1–W5), and **exec-from-disk** (the `/bin/prog2` ELF is read off ext2 through the new multi-LBA path — a green ring-3 load is the correctness proof) with **`e2fsck -fn` clean**. `block_read_amp` multi=1 / single=8 confirmed. Kernel build **1,076,952 B**, x86_64 multiboot2 OK.
+
 ## [1.42.7] — 2026-06-06 (**Track A perf: memory-core hot path — pmm bitmap ops inlined, the single-core PMM spinlock retired to a no-op, and `memset`/`memcpy` made word-wide.** Three orthogonal wins on the allocator + raw-memory primitives that back every exec/fork/mmap. The spinlock removal is **user-authorized** — "pmm spinlock is a no-op until after multi-thread/SMP work later" (2026-06-06): AGNOS is single-threaded single-core, so the atomic `xchg` was pure overhead.)
 
 ### Changed

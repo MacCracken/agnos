@@ -671,8 +671,15 @@ fn nvme_io_queue_init() {
 # commands need PRP2 + CDW10/11/12/13 (Read/Write carry the 64-bit
 # SLBA across CDW10+11 and the NLB in CDW12). PRP2 is 0 when the
 # transfer fits inside PRP1's page (offset 0 + ≤4 KB).
+# Count of I/O submission-queue commands issued. A submit = build SQE + ring
+# the SQ doorbell + (caller) spin the CQ — the dominant per-block cost. Used by
+# the block_read_amp bench tier to prove the multi-LBA collapse (8 single-LBA
+# submits per 4 KB block → 1). Free-running; bench resets it around a window.
+var nvme_io_submit_count = 0;
+
 fn nvme_io_submit(opcode, nsid, prp1, prp2, cdw10, cdw11, cdw12) {
     if (nvme_io_ready == 0) { return 0 - 1; }
+    nvme_io_submit_count = nvme_io_submit_count + 1;
     var slot = nvme_iosq_phys + nvme_iosq_tail * NVME_SQE_SIZE;
     for (var i = 0; i < 8; i = i + 1) { store64(slot + i * 8, 0); }
 
@@ -993,10 +1000,26 @@ fn nvme_blk_flush() {
 }
 
 fn nvme_blk_read_sectors(start, count, buf) {
-    # Loop single-sector dispatch — matches virtio's shape. Multi-LBA
-    # in one NVMe command stays available via direct nvme_read_sectors
-    # for callers that pass page-aligned buffers; the block-layer API
-    # currently can't promise that.
+    if (nvme_io_ready == 0) { return 0 - 1; }
+    # Fast path: a read that fits the 4 KB DMA scratch goes out as ONE
+    # multi-LBA NVMe command instead of `count` single-LBA round-trips (each
+    # = build SQE + ring the SQ doorbell + spin the CQ). This is the universal
+    # ext2 block primitive (sectors_per_block <= 8 = 4 KB), so it cuts ~8x the
+    # submit/poll round-trips off every FS block read (exec-load, path lookup,
+    # cat, ls, indirect-block walks). Bounce once through the DMA-safe scratch
+    # page, then one word-wide copy into the caller's (possibly non-DMA) buffer
+    # — the block-layer API still can't promise a page-aligned/physical buf, so
+    # the bounce is what makes the single-command path usable here.
+    var bytes = count * nvme_ns1_lba_bytes;
+    if (count >= 1) {
+        if (bytes <= 4096) {
+            if (nvme_read_sectors(start, count, nvme_read_scratch) == 0) { return 0 - 1; }
+            memcpy(buf, nvme_read_scratch, bytes);
+            return 0;
+        }
+    }
+    # Fallback (> 4 KB): the old per-sector bounce loop. Correct for any count;
+    # only ext2's <= 8-sector blocks take the single-command fast path above.
     for (var i = 0; i < count; i = i + 1) {
         var r = nvme_blk_read(start + i, buf + i * 512);
         if (r != 0) { return 0 - 1; }

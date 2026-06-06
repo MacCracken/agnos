@@ -5,34 +5,35 @@
 
 | | Current |
 |---|---|
-| **Date** | `2026-06-06T18:15:04Z` |
-| **Commit** | `effbf32` |
-| **Version** | 1.42.6 |
+| **Date** | `2026-06-06T18:34:46Z` |
+| **Commit** | `227df43` |
+| **Version** | 1.42.7 |
 | **Environment** | QEMU x86_64, rdtsc cycles |
 
 ## core
 
-| Benchmark | `effbf32` |
+| Benchmark | `227df43` |
 |---|---|
-| pmm_alloc_free | 402 cycles/op |
-| heap_32B | 149 cycles/op |
-| heap_256B | 488 cycles/op |
-| heap_4096B | 3692 cycles/op |
-| memwrite_1MB | 1092 Kcycles |
-| memset_1MB | 1069 Kcycles |
+| pmm_alloc_free | 463 cycles/op |
+| heap_32B | 167 cycles/op |
+| heap_256B | 519 cycles/op |
+| heap_4096B | 5015 cycles/op |
+| memwrite_1MB | 1222 Kcycles |
+| memset_1MB | 924 Kcycles |
+| block_read_amp | multi=1 single=8 nvme submits/4KB |
 
 ## subsystems
 
-| Benchmark | `effbf32` |
+| Benchmark | `227df43` |
 |---|---|
 | syscall_getpid | 23 cycles/op |
-| syscall_getuid | 52 cycles/op |
-| syscall_write1 | 249664 cycles/op |
-| vfs_open_read_close | 433 cycles/op |
+| syscall_getuid | 128 cycles/op |
+| syscall_write1 | 200806 cycles/op |
+| vfs_open_read_close | 669 cycles/op |
 
 ## integration
 
-| Benchmark | `effbf32` |
+| Benchmark | `227df43` |
 |---|---|
-| serial_putc | 246811 cycles/op |
+| serial_putc | 194244 cycles/op |
 

@@ -95,6 +95,33 @@ fn bench_run_all() {
         kprint_num((t1 - t0) / 1000);
         kprintln(" Kcycles", 8);
     }
+    # block_read_amp (1.42.8): reads the same 8 raw LBAs two ways and counts
+    # NVMe SQ submissions — once as a single multi-LBA command (the new
+    # ext2_read_block fast path) vs 8 single-LBA reads. Expect multi=1,
+    # single=8: the structural proof of the per-block round-trip collapse, the
+    # analog of memset_1MB ≈ memwrite_1MB. Raw LBA 0-7 read of the blank bench
+    # disk (read-only, no FS needed). Skips if the bench nvme isn't ready.
+    if (nvme_io_ready == 0) {
+        kprintln("  block_read_amp: skipped (no nvme)", 35);
+    } else {
+        var amp_pg = pmm_alloc();
+        if (amp_pg == 0) {
+            kprintln("  block_read_amp: skipped (no page)", 35);
+        } else {
+            nvme_io_submit_count = 0;
+            blk_read_sectors_on(BLK_NVME, 0, 8, amp_pg);
+            var submits_multi = nvme_io_submit_count;
+            nvme_io_submit_count = 0;
+            for (var i = 0; i < 8; i = i + 1) { blk_read_on(BLK_NVME, i, amp_pg + i * 512); }
+            var submits_single = nvme_io_submit_count;
+            pmm_free(amp_pg);
+            kprint("  block_read_amp: multi=", 24);
+            kprint_num(submits_multi);
+            kprint(" single=", 8);
+            kprint_num(submits_single);
+            kprintln(" nvme submits/4KB", 17);
+        }
+    }
 
     # --- tier2: subsystems (syscall / vfs) ---
     kprintln("[tier2] subsystems", 18);

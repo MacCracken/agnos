@@ -168,7 +168,7 @@ echo ""
 echo "=== AGNOS Benchmarks v$VERSION ($COMMIT) ==="
 # `|| true`: a zero-match grep exits 1, which would kill the script under
 # `set -e` (e.g. if the boot produced no markers). Display is best-effort.
-echo "$OUTPUT" | grep -E "cycles/op|Kcycles|\[tier" || true
+echo "$OUTPUT" | grep -E "cycles/op|Kcycles|submits|\[tier" || true
 if ! echo "$OUTPUT" | grep -qE "cycles/op|Kcycles|\[tier"; then
     echo "WARN: no benchmark markers in boot output — BENCHMARKS.md sections will be empty." >&2
 fi
