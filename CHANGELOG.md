@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.9] — 2026-06-06 (**Track A perf: fb_console glyph blit — the per-pixel address multiply is strength-reduced to add-stride, and `fb_putc` stops re-reading `fb_height` per character.** The iron-critical output path: archaemenid has no serial, so the framebuffer console is the only visible output. Marginal by design — the glyph paint is dominated by the WC-mapped `store32` traffic, not the address arithmetic — but pure overhead on the one path that matters on iron.)
+
+### Changed
+
+- **Glyph blit address is now incremental** (`kernel/arch/x86_64/fb_console.cyr`). Cyrius has no loop-invariant code motion, so the old inner-loop `scan = fb + (y_px + row*s + dy)*pitch + (x_px + col*s)*4` emitted ~3 `imul`s per inner iteration (up to ~768/glyph at scale 2). Now the only multiplies per glyph are the four base terms; the row advances by `s*pitch`, columns by `s*4`, scanlines by `pitch`, pixels by 4 — all adds. Pixel output is byte-identical.
+- **`fb_putc` inlines `fb_scale()`** against the `height` it already read, dropping a redundant `fb_height()` (a second `boot_info_ptr` deref) per character.
+
+### Validated
+
+- **FB screendump** (`qemu-fb-smoke.sh --capture-vis`): the entire boot log — "PIC remapped" through "AGNOS shell v1.42.9" and the `agnos>` prompt — renders crisp and correctly positioned through the strength-reduced blit (hundreds of `fb_putc` calls), confirming byte-identical output. `scripts/sweep.sh` **7/7** (FAT/exFAT read+write+subdir, ext2 WRITE W1–W5, exec-from-disk, `e2fsck` clean) — no regression. Kernel build **1,077,096 B**, x86_64 multiboot2 OK.
+
+### Notes
+
+- Closes the 1.42.x Track-A perf list's high-confidence items: heap-zeroing (1.42.5) / memory-core (1.42.7) / fs-read-path (1.42.8) / fb_console (1.42.9). Remaining perf candidates (scheduler/context-switch, syscall-entry ladder) are marginal — dwarfed by the KPTI CR3 switches on the real syscall path — and deferred. `fb_scroll`'s WC-uncached-read cost is real but its shadow-buffer fix was rejected (eats the 2 MB-region budget); a write-only / text-shadow redesign is parked.
+
 ## [1.42.8] — 2026-06-06 (**Track A perf: fs read-path — every ext2 block read collapses 8 single-LBA NVMe commands into one multi-LBA transfer, and `ext2_dir_lookup` stops re-reading the directory inode on every block.** The universal FS read primitive behind exec-load, path lookup, `cat`, `ls`, and the indirect-block walks.)
 
 ### Changed
