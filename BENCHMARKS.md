@@ -5,33 +5,34 @@
 
 | | Current |
 |---|---|
-| **Date** | `2026-06-06T10:24:31Z` |
-| **Commit** | `a8a24ca` |
-| **Version** | 1.42.5 |
+| **Date** | `2026-06-06T18:15:04Z` |
+| **Commit** | `effbf32` |
+| **Version** | 1.42.6 |
 | **Environment** | QEMU x86_64, rdtsc cycles |
 
 ## core
 
-| Benchmark | `a8a24ca` |
+| Benchmark | `effbf32` |
 |---|---|
-| pmm_alloc_free | 789 cycles/op |
-| heap_32B | 120 cycles/op |
-| heap_256B | 391 cycles/op |
-| heap_4096B | 3012 cycles/op |
-| memwrite_1MB | 823 Kcycles |
+| pmm_alloc_free | 402 cycles/op |
+| heap_32B | 149 cycles/op |
+| heap_256B | 488 cycles/op |
+| heap_4096B | 3692 cycles/op |
+| memwrite_1MB | 1092 Kcycles |
+| memset_1MB | 1069 Kcycles |
 
 ## subsystems
 
-| Benchmark | `a8a24ca` |
+| Benchmark | `effbf32` |
 |---|---|
-| syscall_getpid | 25 cycles/op |
-| syscall_getuid | 67 cycles/op |
-| syscall_write1 | 200777 cycles/op |
-| vfs_open_read_close | 400 cycles/op |
+| syscall_getpid | 23 cycles/op |
+| syscall_getuid | 52 cycles/op |
+| syscall_write1 | 249664 cycles/op |
+| vfs_open_read_close | 433 cycles/op |
 
 ## integration
 
-| Benchmark | `a8a24ca` |
+| Benchmark | `effbf32` |
 |---|---|
-| serial_putc | 199726 cycles/op |
+| serial_putc | 246811 cycles/op |
 

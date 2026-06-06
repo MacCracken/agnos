@@ -273,3 +273,36 @@ date,commit,version,tier,benchmark,value,unit,qemu_version,cpu_model,host_arch,k
 2026-06-06T10:24:31Z,a8a24ca,1.42.5,,syscall_write1,200777,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
 2026-06-06T10:24:31Z,a8a24ca,1.42.5,,vfs_open_read_close,400,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
 2026-06-06T10:24:31Z,a8a24ca,1.42.5,,serial_putc,199726,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,pmm_alloc_free,327,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,heap_32B,192,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,heap_256B,459,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,heap_4096B,3669,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,memwrite_1MB,832,Kcycles,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,memset_1MB,829,Kcycles,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,syscall_getpid,23,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,syscall_getuid,46,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,syscall_write1,195252,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,vfs_open_read_close,413,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:08:16Z,effbf32,1.42.6,,serial_putc,195467,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,pmm_alloc_free,365,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,heap_32B,128,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,heap_256B,355,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,heap_4096B,37816,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,memwrite_1MB,847,Kcycles,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,memset_1MB,787,Kcycles,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,syscall_getpid,21,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,syscall_getuid,136,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,syscall_write1,204019,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,vfs_open_read_close,739,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:13:23Z,effbf32,1.42.6,,serial_putc,199236,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,pmm_alloc_free,402,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,heap_32B,149,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,heap_256B,488,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,heap_4096B,3692,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,memwrite_1MB,1092,Kcycles,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,memset_1MB,1069,Kcycles,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,syscall_getpid,23,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,syscall_getuid,52,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,syscall_write1,249664,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,vfs_open_read_close,433,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56
+2026-06-06T18:15:04Z,effbf32,1.42.6,,serial_putc,246811,cycles/op,11.0.1,AMD Ryzen 7 5800H with Radeon Graphics,x86_64,1,6.0.56

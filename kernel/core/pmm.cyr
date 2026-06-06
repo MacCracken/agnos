@@ -7,29 +7,20 @@ var pmm_used = 0;
 var pmm_next_free = 0;
 var pmm_lock = 0;
 
-# SMP-safe spinlock for PMM using atomic xchg.
-# Must NOT be called from interrupt context (deadlock risk).
+# PMM spinlock — NO-OP until the multi-threading / preemptive-sched / SMP arc.
+# AGNOS is single-threaded single-core today, so no concurrent PMM access is
+# possible and the atomic xchg + its serializing memory fence were pure overhead
+# (the CHANGELOG measured the locked-xchg pair at ~+58% on pmm_alloc_free). The
+# user authorized stripping it to a no-op "until after multi-thread/SMP work
+# later" (2026-06-06). The call sites in pmm_alloc/pmm_free/pmm_alloc_2mb/etc.
+# stay intact, so restoring real locking when SMP unwinds the single-core
+# invariant is a one-place change here (see project_multithreading_future_arc).
+# The original xchg-based bodies are preserved in git history (pre-1.42.7).
 fn pmm_spin_lock() {
-    var old = 1;
-    while (old == 1) {
-        var addr = &pmm_lock;
-        asm {
-            0x48; 0x8B; 0x45; 0xF0;      # mov rax, [rbp-0x10] (addr)
-            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;  # mov rcx, 1
-            0x48; 0x87; 0x08;              # xchg [rax], rcx
-            0x48; 0x89; 0x4D; 0xF8;       # mov [rbp-0x08], rcx (old)
-        }
-    }
     return 0;
 }
 
 fn pmm_spin_unlock() {
-    var addr = &pmm_lock;
-    asm {
-        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
-        0x48; 0x31; 0xC9;              # xor rcx, rcx
-        0x48; 0x87; 0x08;              # xchg [rax], rcx
-    }
     return 0;
 }
 
@@ -130,9 +121,18 @@ fn pmm_alloc() {
     # regions 2 MB allocs consume first, deterministically. GDB ground truth: a
     # fixed (non-KASLR) hint made the fault vanish 14/14; this preserves KASLR
     # entropy in the high pages while removing the cross-class fragmentation.
+    # Hot path: pmm_test+pmm_set inlined. i is provably in [1024,4095] here, so
+    # the pmm_page_valid bounds-check both helpers run is redundant; the byte/bit
+    # index math (>>3 / &7 strength-reduced from /8 / %8) and the bitmap byte load
+    # are computed once and the load is reused for the set, instead of 4 call
+    # frames + 2 redundant div/mod + 2 loads per allocated page (~789→~550 cyc/op
+    # on the pmm_alloc_free bench). Behavior is byte-identical to the helper form.
     for (var i = 4095; i >= 1024; i = i - 1) {
-        if (pmm_test(i) == 0) {
-            pmm_set(i);
+        var byte = i >> 3;
+        var bit = i & 7;
+        var b = load8(&pmm_bitmap + byte);
+        if (((b >> bit) & 1) == 0) {
+            store8(&pmm_bitmap + byte, b | (1 << bit));
             pmm_used = pmm_used + 1;
             pmm_spin_unlock();
             return i * 0x1000;
@@ -147,9 +147,15 @@ fn pmm_free(addr) {
     # Security: validate page index
     if (pmm_page_valid(page) == 0) { return 0 - 1; }
     pmm_spin_lock();
+    # Hot path: pmm_test+pmm_clear inlined. page already passed pmm_page_valid,
+    # so the helpers' re-validation + duplicate byte/bit math + second byte load
+    # are redundant; compute byte/bit once and reuse the load for the clear.
+    var byte = page >> 3;
+    var bit = page & 7;
+    var b = load8(&pmm_bitmap + byte);
     # Security: detect double-free (page must be allocated to free it)
-    if (pmm_test(page) != 1) { pmm_spin_unlock(); return 0 - 1; }
-    pmm_clear(page);
+    if (((b >> bit) & 1) != 1) { pmm_spin_unlock(); return 0 - 1; }
+    store8(&pmm_bitmap + byte, b & ((0 - 1 - (1 << bit)) & 0xFF));
     pmm_used = pmm_used - 1;
     # Update hint so next alloc finds this freed page quickly
     if (page < pmm_next_free) { pmm_next_free = page; }

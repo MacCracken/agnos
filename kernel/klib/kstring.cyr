@@ -25,18 +25,55 @@ fn memeq(a, b, n) {
     return 1;
 }
 
-# Copy n bytes from src to dst
+# Copy n bytes from src to dst.
+# Word-wide: byte head until dst is 8-aligned, then 8 bytes/iteration for the
+# bulk, byte tail for the remainder — ~8x fewer load/store pairs than the old
+# byte-at-a-time loop on the exec/fork ELF-segment copies. Forward-copy
+# semantics are unchanged (same as the old loop): valid for non-overlapping or
+# dst<src; overlapping dst>src was never supported here. The page-aligned hot
+# callers (elf.cyr segment loads) hit the head loop 0 times.
 fn memcpy(dst, src, n) {
-    for (var i = 0; i < n; i = i + 1) {
+    var i = 0;
+    while (i < n) {
+        if (((dst + i) & 7) == 0) { break; }
         store8(dst + i, load8(src + i));
+        i = i + 1;
+    }
+    while (i + 8 <= n) {
+        store64(dst + i, load64(src + i));
+        i = i + 8;
+    }
+    while (i < n) {
+        store8(dst + i, load8(src + i));
+        i = i + 1;
     }
     return dst;
 }
 
-# Fill n bytes at dst with val
+# Fill n bytes at dst with val.
+# Word-wide: replicate the byte across a u64 and store 8 bytes/iteration for the
+# bulk (byte head to 8-align dst, byte tail for the remainder) — ~8x fewer
+# stores than the byte loop. This is the dominant cost in 2 MB anonymous-mmap
+# zeroing (proc.cyr) and per-process page-table clears; those callers are
+# 2 MB / page aligned so the head loop runs 0 times. Result is byte-identical.
 fn memset(dst, val, n) {
-    for (var i = 0; i < n; i = i + 1) {
-        store8(dst + i, val);
+    var v = val & 0xFF;
+    var i = 0;
+    while (i < n) {
+        if (((dst + i) & 7) == 0) { break; }
+        store8(dst + i, v);
+        i = i + 1;
+    }
+    var word = v | (v << 8);
+    word = word | (word << 16);
+    word = word | (word << 32);   # byte replicated across all 8 lanes
+    while (i + 8 <= n) {
+        store64(dst + i, word);
+        i = i + 8;
+    }
+    while (i < n) {
+        store8(dst + i, v);
+        i = i + 1;
     }
     return dst;
 }

@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.7] — 2026-06-06 (**Track A perf: memory-core hot path — pmm bitmap ops inlined, the single-core PMM spinlock retired to a no-op, and `memset`/`memcpy` made word-wide.** Three orthogonal wins on the allocator + raw-memory primitives that back every exec/fork/mmap. The spinlock removal is **user-authorized** — "pmm spinlock is a no-op until after multi-thread/SMP work later" (2026-06-06): AGNOS is single-threaded single-core, so the atomic `xchg` was pure overhead.)
+
+### Changed
+
+- **`pmm_alloc`/`pmm_free` inline the bitmap test+set/clear** (`kernel/core/pmm.cyr`). In the alloc loop the index is provably in `[1024,4095]`, so the `pmm_page_valid` bounds-check that `pmm_test`+`pmm_set` *each* re-ran is redundant; the byte/bit index math (`>>3`/`&7`, strength-reduced from `/8`/`%8`) and the bitmap-byte load are computed once and the load is reused for the store — instead of 4 call frames + 2 redundant div/mod + 2 loads per allocated page. `pmm_free` collapses the same `pmm_test`+`pmm_clear` redundancy after its one real `pmm_page_valid` check. Byte-identical behavior; the public `pmm_test`/`pmm_set`/`pmm_clear` helpers stay for their other callers.
+- **PMM spinlock → no-op** (`kernel/core/pmm.cyr`, **user-authorized**). `pmm_spin_lock`/`pmm_spin_unlock` are now empty bodies; the call sites in `pmm_alloc`/`pmm_free`/`pmm_alloc_2mb`/`pmm_free_2mb`/`pmm_count_2mb_free` stay intact as the **single restore point** for the future multi-threading / preemptive-sched / SMP arc. On single-core there is no concurrent PMM access, so the locked `xchg` + its serializing memory fence were pure overhead (a prior cut measured the pair at ~+58% on `pmm_alloc_free`). Original `xchg`-based bodies are preserved in git history (pre-1.42.7).
+- **`memcpy`/`memset` are word-wide** (`kernel/klib/kstring.cyr`). Byte head to 8-align the destination, then 8 bytes/iteration (`store64`/`load64`) for the bulk, byte tail for the remainder — vs the old byte-at-a-time loops. ~8× fewer stores on the 2 MB anonymous-mmap zeroing + per-process page-table clears (`proc.cyr`) and ELF segment copies (`elf.cyr`); those hot callers are page/2 MB-aligned, so the head loop runs 0 times. Results are byte-identical; forward-copy semantics unchanged (overlapping `dst>src` was never supported here, same as the old loop).
+
+### Added
+
+- **`memset_1MB` bench tier** (`kernel/core/bench.cyr`) — 256×4 KB routed through the `memset` primitive: the same 1 MB of work as the existing inline-`store64` `memwrite_1MB`. It lands ≈ `memwrite_1MB` when memset is word-wide and would read ~8× higher if the primitive ever regressed to byte-at-a-time — the standing regression guard for that change.
+
+### Performance
+
+- **Memory-core hot path** (QEMU `-enable-kvm -cpu host`, archaemenid Zen 3; rdtsc, 3 runs):
+
+  | benchmark | 1.42.6 baseline | 1.42.7 | Δ |
+  |---|---|---|---|
+  | `pmm_alloc_free` | 789 c/op | **327 / 365 / 402** | **≈ −50%** (pmm inline + spinlock no-op) |
+  | `memset_1MB` (new) | — | **≈ `memwrite_1MB`** (e.g. 829 vs 832 Kcyc) | word-wide confirmed |
+
+  The two changed metrics held steady across all three runs. Untouched metrics (`heap_*`, `getuid`, `vfs_*`) swung widely run-to-run from KVM vCPU host-preemption (this laptop was under session load) — noise, not regressions.
+
+### Validated
+
+- `scripts/sweep.sh` **7/7** — baseline `check.sh`, FAT/exFAT read+write+subdir, ext2 WRITE (W1–W5), and **exec-from-disk** (ring-3 `run /bin/prog2`, exit-code capture, argv deref, **`e2fsck -fn` clean**). The exec path exercises every changed primitive — `pmm_alloc`/`pmm_alloc_2mb` for the userland code/stack/heap, `memcpy`/`memset` for ELF segment load + BSS zero — so a green sweep is the correctness proof. Kernel build **1,075,456 B**, x86_64 multiboot2 OK.
+
 ## [1.42.6] — 2026-06-06 (**Track B: ship agnsh 1.4.2 with working FS verbs as the userland shell + an agnos-side verb test against the live kernel FS.** The kernel **source is unchanged** from 1.42.5 — the FS verbs needed no new syscalls (open/read/write/close/mkdir/rmdir/unlink/rename/getdents/stat/sync all already exist) — this cut ships the verbs-enabled userland binary + proves it on the real filesystem.)
 
 ### Changed
