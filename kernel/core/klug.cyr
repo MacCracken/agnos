@@ -1,0 +1,63 @@
+# klug — Kernel Logs Unified Grep. The unified in-kernel log ring buffer.
+#
+# Every byte that kprint/kputc/kprintln mirror to serial+fb (core/kprint.cyr)
+# is ALSO appended here, so the whole boot log + runtime kernel output lives in
+# one place. Userland reads it via the `klog` syscall (1.42.12) and greps it
+# with the existing toolchain (agnsh `grep`) — the kernel itself does NOT filter.
+# That's the sovereign split the name encodes: the kernel UNIFIES the logs; GREP
+# stays a userland capability, so no string-matching machinery enters the kernel.
+#
+# 16 KB circular byte buffer. NOTE the Cyrius var-array unit rule (CLAUDE.md):
+# a module-global `var X[N]` allocates N * u64 = 8N bytes, so `var klug_buf[2048]`
+# is 2048 * 8 = 16384 bytes, indexed as bytes [0, 16383] via store8/load8. The
+# size is 2^14 so the wrap is a mask (& 0x3FFF), not a modulo. When the ring
+# fills, the oldest bytes are overwritten (dmesg-style aging). 16 KB holds the
+# whole boot log (~4 KB) several times over; sized modestly because Cyrius emits
+# module-global arrays as file-resident zero-data (not .bss), so the buffer costs
+# its full size in the kernel image — bump KLUG bytes/mask/cap together if a
+# deeper runtime log is wanted and the image budget allows.
+
+var klug_buf[2048];        # 16 KB (2048 * 8)
+var klug_head = 0;         # next write offset, 0..16383
+var klug_count = 0;        # total bytes captured, saturates at 16384 (wrap flag)
+
+# Append one byte. The whole capture path is pure store8 + integer math — it must
+# never call kprint/serial/fb (that would recurse through the tap), so it can run
+# safely from the earliest boot, before any console backend is up.
+fn klug_putc(ch) {
+    store8(&klug_buf + klug_head, ch & 0xFF);
+    klug_head = (klug_head + 1) & 0x3FFF;
+    if (klug_count < 16384) { klug_count = klug_count + 1; }
+    return 0;
+}
+
+# Append a (buf, len) run.
+fn klug_append(buf, len) {
+    var i = 0;
+    while (i < len) {
+        store8(&klug_buf + klug_head, load8(buf + i));
+        klug_head = (klug_head + 1) & 0x3FFF;
+        if (klug_count < 16384) { klug_count = klug_count + 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Validation (KLUG_SELFTEST): re-emit the captured ring between markers so a
+# smoke can confirm the boot log was unified into klug. Emits via serial_print/
+# fb_print DIRECTLY (not kprint), so the dump's own output is NOT re-captured
+# into the ring it is reading — that avoids a read-during-write on the snapshot.
+# Linear case (boot log << 16 KB, never wrapped) is the validated path; the
+# wrapped-ring unwrap (oldest→newest from klug_head) lands with the klog syscall
+# in 1.42.12. The call site is gated; this fn is DCE'd out of normal builds.
+fn klug_dump() {
+    var begin = "KLUG-DUMP-BEGIN\n";
+    serial_print(begin, 16); fb_print(begin, 16);
+    var n = klug_head;
+    if (klug_count >= 16384) { n = 16384; }     # wrapped — emit the whole ring (best-effort)
+    serial_print(&klug_buf, n);
+    fb_print(&klug_buf, n);
+    var endm = "\nKLUG-DUMP-END\n";
+    serial_print(endm, 15); fb_print(endm, 15);
+    return 0;
+}

@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.11] — 2026-06-06 (**klug — Kernel Logs Unified Grep, bite 1: the unified in-kernel log ring buffer.** Every byte `kprint`/`kputc`/`kprintln` mirror to serial+fb is now also captured in one greppable place. "klug" = the logs UNIFIED in the kernel; GREP stays a userland capability.)
+
+### Added
+
+- **`kernel/core/klug.cyr`** — a 16 KB circular byte ring buffer (`klug_buf` + `klug_putc`/`klug_append`). `core/kprint.cyr`'s `kputc`/`kprint`/`kprintln` now tap it, so *all* kernel output (boot log + runtime) is unified into klug alongside the existing serial+fb mirror. The capture path is pure `store8`/integer math (never calls `kprint` → no tap recursion), so it's safe from the earliest boot, before any console backend is up. Wraps at 16 KB (mask, not modulo) — old lines age out dmesg-style.
+- **`KLUG_SELFTEST` gate + `klug_dump`** (registered in `scripts/build.sh`) — re-emits the captured ring between `KLUG-DUMP-BEGIN`/`KLUG-DUMP-END` markers, via serial/fb directly (so the dump isn't re-captured), for validation.
+
+### Design
+
+- **Userland owns "grep."** The kernel only UNIFIES the logs (this ring buffer) and — at 1.42.12 — exposes them via a `klog` read syscall; filtering is the existing agnsh `grep` builtin over the dump. No string-matching enters the kernel (sovereign; the kernel grows per native workload). Buffer sized 16 KB deliberately: Cyrius emits module-global arrays as file-resident zero-data (not `.bss`), so the buffer costs its full size in the kernel image — 16 KB holds the ~4 KB boot log several times over; bump the bytes/mask/cap together for deeper runtime depth.
+
+### Validated
+
+- `KLUG_SELFTEST` boot (`qemu-fb-smoke.sh`) — the captured boot log (`PIC remapped` … `VFS initialized` … `Launching kybernet...`) re-emits correctly *between* the dump markers, proving the tap unifies all output. `scripts/sweep.sh` **7/7** (the kprint tap touches every output path — no regression). Kernel build **1,095,568 B** (+~16 KB for the ring buffer), x86_64 multiboot2 OK.
+
+### Notes
+
+- NEXT (1.42.12 — klug bite 2): leveled logging (`klog_info`/`klog_warn`/`klog_err`) + the `klog`#36 read syscall (struct/buffer-write like `sysinfo`#35) + a userland `klug` tool that reads it and greps via the agnsh `grep` builtin.
+
 ## [1.42.10] — 2026-06-06 (**Track B: the sovereign sysinfo syscall surface — `uname`(#34) + `sysinfo`(#35) — that unblocks the native system-info tools (mihi/iam/chakshu).** Two terse struct-write syscalls; the kernel exposes binary structs, NOT a synthetic `/proc` filesystem (a Linux-ism the growth rules forbid).)
 
 ### Added

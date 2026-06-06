@@ -7,18 +7,22 @@
 fn kputc(ch) {
     serial_putc(ch);
     fb_putc(ch);
+    klug_putc(ch);            # unify into the klug ring buffer (core/klug.cyr)
     return 0;
 }
 
 fn kprint(buf, len) {
     serial_print(buf, len);
     fb_print(buf, len);
+    klug_append(buf, len);
     return 0;
 }
 
 fn kprintln(buf, len) {
     serial_println(buf, len);
     fb_println(buf, len);
+    klug_append(buf, len);    # capture the line + the newline serial/fb_println add
+    klug_putc(10);
     return 0;
 }
 

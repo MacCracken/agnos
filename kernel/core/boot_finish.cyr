@@ -14,6 +14,12 @@
 kprintln("Launching kybernet...", 21);
 # CMOS CP 0x15: reached kybernet-launch site (kybernet() runs the shell loop)
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x15; 0xE6; 0x71; }
+# KLUG_SELFTEST: re-emit the captured klug ring so a smoke can confirm the boot
+# log was unified into klug (the boot log appears a 2nd time, bracketed by
+# KLUG-DUMP-BEGIN/END). Gated — DCE'd out of normal + bench builds.
+#ifdef KLUG_SELFTEST
+klug_dump();
+#endif
 kybernet(); arch_halt();
 
 kprintln("Halted.", 7);
