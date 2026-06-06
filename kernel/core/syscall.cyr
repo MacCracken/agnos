@@ -212,6 +212,31 @@ fn kbd_read_blocking(buf, count) {
     return n;
 }
 
+# System hostname — read-only identity for uname(34).nodename. Seeded to
+# "agnos"; no sethostname syscall yet (added only when a native workload needs a
+# mutable hostname — kernel grows per workload, not by Linux default). A gvar
+# string literal, safe to read from a syscall (post-gvar-init, like _AGNOS_VERSION).
+var kernel_hostname = "agnos";
+
+# Copy a NUL-terminated kernel string literal into a fixed `max`-byte user field,
+# NUL-padding the remainder. Stops at the source NUL or `max` bytes, whichever
+# comes first — never reads past a short literal. `dst` is part of a user buffer
+# the caller already validated with is_user_range. Used by uname(34).
+fn sysinfo_put_str(dst, src, max) {
+    var copying = 1;
+    var i = 0;
+    while (i < max) {
+        var c = 0;
+        if (copying == 1) {
+            c = load8(src + i);
+            if (c == 0) { copying = 0; }   # hit end of source — pad zeros from here
+        }
+        store8(dst + i, c);
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn ksyscall(num, arg1, arg2, arg3) {
     # Stack-canary backstop: snapshot at entry, re-checked before returning on the
     # syscalls that do the most pointer/buffer work (the 1.41.3 FS group + pipe/
@@ -666,6 +691,37 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var sr = ext2_fill_stat(sino, arg3);
         stack_canary_check(canary);
         return sr;
+    }
+    if (num == 34) {
+        # uname(buf=arg1, len=arg2) — writes the 64-byte identity struct: four
+        # 16-byte NUL-padded fields at offsets 0/16/32/48 = sysname / nodename /
+        # release / machine. Static boot-time identity; invoked from ring 3 so
+        # the string gvars (_AGNOS_VERSION, kernel_hostname) are post-init-live.
+        # a3 unused. Read by fixed offset, NOT NUL-terminated-variable. (sysinfo ABI)
+        if (is_user_range(arg1, 64) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg2 < 64) { stack_canary_check(canary); return 0 - 1; }
+        sysinfo_put_str(arg1 +  0, "AGNOS", 16);          # sysname (kernel name)
+        sysinfo_put_str(arg1 + 16, kernel_hostname, 16);  # nodename (hostname)
+        sysinfo_put_str(arg1 + 32, _AGNOS_VERSION, 16);   # release (kernel version)
+        sysinfo_put_str(arg1 + 48, "x86_64", 16);         # machine (arch; aarch64 build would #ifdef)
+        stack_canary_check(canary);
+        return 0;
+    }
+    if (num == 35) {
+        # sysinfo(buf=arg1, len=arg2) — writes the 40-byte counters struct: 5x
+        # u64 LE at offsets 0/8/16/24/32 = uptime_secs / totalram / freeram /
+        # procs / cpus. Live volatile snapshot; single-core so no lock. The
+        # kernel does the unit conversion (ticks→sec at 100 Hz, pages→bytes at
+        # 4 KB) so userland never re-derives units. a3 unused.
+        if (is_user_range(arg1, 40) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg2 < 40) { stack_canary_check(canary); return 0 - 1; }
+        store64(arg1 +  0, timer_ticks / 100);            # uptime seconds (100 Hz)
+        store64(arg1 +  8, pmm_total * 4096);             # total RAM bytes (4 KB pages)
+        store64(arg1 + 16, pmm_free_count() * 4096);      # free RAM bytes
+        store64(arg1 + 24, proc_count);                   # live process count
+        store64(arg1 + 32, cpu_count);                    # online CPUs (=1 until SMP enumerates)
+        stack_canary_check(canary);
+        return 0;
     }
     stack_canary_check(canary);
     return 0 - 1;

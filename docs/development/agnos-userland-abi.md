@@ -162,6 +162,10 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
 | 31 | `rename` | old | oldlen | new | newlen | 0 / -1 | rename within one filesystem (uses **a4** — §1a). **shell** (`mv`) |
 | 32 | `link` | target | targetlen | linkpath | linkpathlen | 0 / -1 | hard link (a4); ext2 only initially. **shell** (`ln`) |
 | 33 | `stat` | path | pathlen | statbuf | — | 0 / -1 | fills `statbuf` (§4.1, ≥0x200000) with the agnos stat struct. **shell** (`ls -l`, type) |
+| 34 | `uname` | buf | len (≥64) | — | — | 0 / -1 | writes the 64-byte identity struct (§4.3) into `buf`: sysname/nodename/release/machine. Static boot-time identity. **mihi/iam** (1.42.10) |
+| 35 | `sysinfo` | buf | len (≥40) | — | — | 0 / -1 | writes the 40-byte counters struct (§4.4) into `buf`: uptime_secs / total+free RAM bytes / procs / cpus. Live snapshot; kernel does the unit conversion. **mihi/iam/chakshu** (1.42.10) |
+
+**34 `uname` / 35 `sysinfo` are IMPLEMENTED (1.42.10)** — the sovereign sysinfo surface for the native system-info tools. Split (identity vs counters) so a monitor like `chakshu` can poll `sysinfo` repeatedly without re-copying the static strings; each struct is single-shaped (all-string / all-u64) to avoid mixed-width padding. Both reject `is_user_range(buf,N)==0` or `len<N`. Kept *out* of the kernel deliberately: CPU brand string (userland CPUID), GPU manifest (userland PCI), distro (rootfs `/etc/os-release`), load-avg/swap (no native source). Userland calls them via the raw `syscall(34/35, buf, len)` builtin (no cyrius stdlib change required).
 
 `create` is **not** a separate syscall — file creation is `open(7)` with the `AO_CREAT` flag (§3.3),
 subsuming `touch` (CREAT) and `echo >` (CREAT|TRUNC). `chdir`/`getcwd` are **not** in the ABI: **CWD is
@@ -212,6 +216,33 @@ Packed records back-to-back in the caller's `buf`; advance by `reclen`:
 | 8+namelen | pad | — | to the next 8-byte boundary; `reclen` accounts for it |
 
 Compact + 8-byte-record-aligned. Agnos-native (not Linux `dirent64`'s `d_off`/19-byte header).
+
+### 4.3 `uname` struct (64 bytes, 4× 16-byte fixed-width NUL-padded string fields)
+
+Written by syscall 34. Each field is a fixed 16-byte slot, the string copied from a kernel literal and NUL-padded to fill the slot (**not** NUL-terminated-and-variable — read by fixed offset):
+
+| Offset | Field | Width | Value |
+|--------|-------|-------|-------|
+| 0 | `sysname` | 16 | `"AGNOS"` (kernel name) |
+| 16 | `nodename` | 16 | hostname — `kernel_hostname`, default `"agnos"` (no `sethostname` yet) |
+| 32 | `release` | 16 | kernel version — `_AGNOS_VERSION` (e.g. `"1.42.10"`) |
+| 48 | `machine` | 16 | arch — `"x86_64"` (the aarch64 build would emit `"aarch64"`) |
+
+16 bytes/field is generous headroom (longest current value is `"aarch64"`=7); the 64-byte struct is a clean power of two. Conceptually mirrors Linux `utsname` but renumbered to AGNOS slot 34, with our explicit-(buf,len) + fixed-16 layout instead of Linux's 65-byte FQDN-sized fields.
+
+### 4.4 `sysinfo` struct (40 bytes, 5× u64 little-endian)
+
+Written by syscall 35. The kernel does the unit conversion (ticks→seconds at 100 Hz, pages→bytes at 4 KB) so userland never re-derives:
+
+| Offset | Field | Type | Source |
+|--------|-------|------|--------|
+| 0 | `uptime_secs` | u64 | `timer_ticks / 100` (100 Hz; nominal, not wall-clock-precise) |
+| 8 | `totalram` | u64 | `pmm_total * 4096` (bytes; the kernel-managed page pool) |
+| 16 | `freeram` | u64 | `pmm_free_count() * 4096` (bytes) |
+| 24 | `procs` | u64 | `proc_count` (live process-table count) |
+| 32 | `cpus` | u64 | `cpu_count` (=1 until SMP enumeration lands) |
+
+All-u64 (no sub-word fields → no Cyrius struct-padding ambiguity, same rule §4.1 follows). No Linux `mem_unit` scaling field (AGNOS uses fixed u64 byte counts — no 32-bit overflow), no `_f[]` padding, and no swap/buffer/highmem fields (AGNOS has none — omitted). Future fields append at the tail and bump the minimum `len`; the existing offsets are frozen ABI the moment a consumer reads them.
 
 ## 5. Coordination protocol (two-agent)
 

@@ -5,6 +5,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.10] — 2026-06-06 (**Track B: the sovereign sysinfo syscall surface — `uname`(#34) + `sysinfo`(#35) — that unblocks the native system-info tools (mihi/iam/chakshu).** Two terse struct-write syscalls; the kernel exposes binary structs, NOT a synthetic `/proc` filesystem (a Linux-ism the growth rules forbid).)
+
+### Added
+
+- **syscall 34 `uname(buf, len≥64)`** (`kernel/core/syscall.cyr`) — writes a 64-byte identity struct: four 16-byte NUL-padded fields at offsets 0/16/32/48 = `sysname`("AGNOS") / `nodename`(hostname) / `release`(`_AGNOS_VERSION`) / `machine`("x86_64"). Static boot-time identity, read by fixed offset (not NUL-terminated-variable).
+- **syscall 35 `sysinfo(buf, len≥40)`** — writes a 40-byte counters struct: 5× u64 LE = `uptime_secs`(`timer_ticks/100`) / `totalram`(`pmm_total*4096`) / `freeram`(`pmm_free_count()*4096`) / `procs`(`proc_count`) / `cpus`(`cpu_count`). Live snapshot; the kernel does the unit conversion (ticks→sec at 100 Hz, pages→bytes at 4 KB) so userland never re-derives. Single-core → no lock on the snapshot.
+- **`kernel_hostname` global** (`"agnos"`, read-only — no `sethostname` until a native workload needs one) + **`sysinfo_put_str` helper** (copy a kernel string literal into a fixed user field, NUL-padded, bounded by the field width so it never reads past a short literal) — the one kernel gap the surface needed.
+- **`/bin/sysi` ring-3 validator** in the `EXEC_SELFTEST` self-seed (`kernel/core/main.cyr`) — calls both syscalls into a user-stack scratch buffer and exits `sysname[0]`(0x41) + `totalram` byte 3 (0x01 of the 0x01000000 pool) = **66**. `exec-smoke.sh` gates on `run: exit 66`.
+
+### Design
+
+- **Split (identity vs counters), not combined** — a monitor like `chakshu` polls `sysinfo` repeatedly without re-copying the static strings, and each struct is single-shaped (all-string / all-u64) to dodge the mixed-width struct-padding trap. Mirrors the Linux `uname`/`sysinfo` *conceptual* split but renumbered to AGNOS slots with explicit `(buf,len)` (not NUL-terminated) and our own numbers. Both reject `is_user_range(buf,N)==0` or `len<N` — the exact mechanism `stat`#33 uses. Kept OUT of the kernel deliberately: CPU brand string (userland CPUID), GPU manifest (userland PCI), distro (rootfs `/etc/os-release`), load-avg/swap (no native source) — the kernel grows per native workload, not by Linux default.
+- **Userland calls via the raw `syscall(34/35, buf, len)` builtin — zero cyrius stdlib edit** (the builtin emits the x86-64 syscall ABI for any number; mihi's `agnosys.cyr` already uses this pattern). The cyrius peer is allowed to lag the kernel ABI.
+
+### Validated
+
+- `exec-smoke.sh` **8/8** incl. the new `run: exit 66` (both syscalls write the expected struct bytes from ring 3) — and `/bin/sysi` is exec **#3** in one boot, confirming the 1.42.4 reap work lifted the old 2-exec-per-boot cap. `scripts/sweep.sh` **7/7** (no FS-syscall-dispatcher regression). ABI doc §3.2 (rows 34/35) + §4.3/§4.4 (struct layouts) updated. Kernel build **1,078,176 B**, x86_64 multiboot2 OK.
+
+### Notes
+
+- NEXT (1.42.x): a **kernel logging layer** (user-requested), then wiring mihi/iam's `CYRIUS_TARGET_AGNOS` backend to read these struct offsets so `iam` renders Host/Kernel/Memory/Uptime natively.
+
 ## [1.42.9] — 2026-06-06 (**Track A perf: fb_console glyph blit — the per-pixel address multiply is strength-reduced to add-stride, and `fb_putc` stops re-reading `fb_height` per character.** The iron-critical output path: archaemenid has no serial, so the framebuffer console is the only visible output. Marginal by design — the glyph paint is dominated by the WC-mapped `store32` traffic, not the address arithmetic — but pure overhead on the one path that matters on iron.)
 
 ### Changed
