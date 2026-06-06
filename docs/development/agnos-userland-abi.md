@@ -37,7 +37,7 @@ throughout the doc below.
 | # | Decision | Rationale |
 |---|----------|-----------|
 | **O2** | **`a4 = r10`** — the syscall ABI grows from 3 args to 4; the 4th is in `r10`. | `rename(old,oldlen,new,newlen)` is inherently 4-arg. `r10` is the natural 4th-arg register (SYSCALL clobbers `rcx`, which is exactly why Linux picked `r10` — we adopt the *register*, not their numbers). Additive; entry stub saves `r10`, `syscall_handler`/`ksyscall` gain `a4`. Lands with 1.41.3. |
-| **O1** | **stdin = RAW** — `read(fd=0)` returns raw bytes, blocks until ≥1, **no kernel echo**. | `agnsh` ships its own `completion.cyr` + `history.cyr` line-editing — it needs raw keystrokes; cooked mode would fight its line editor. agnsh echoes. The in-kernel *emergency* shell keeps its own cooked loop (reads the keyboard directly, not via stdin). |
+| **O1** | **stdin = canonical-lite** — `read(fd=0)` blocks until Enter, **echoes** printable bytes + handles backspace, returns the line incl. its trailing `\n`. *(Revised 1.41.15; originally RAW + no-echo.)* | RAW was settled assuming the QEMU `hid_poll` model (polled, IF-independent). On **iron** keystrokes arrive only via IRQ1 and ring 3 runs **IF=0 between syscalls** (`ring3.cyr` sets RFLAGS=0x002), so RAW byte-by-byte is *structurally impossible* — any scancode arriving while `agnsh` is in userland is lost (the `14114` "Command: D" stuck-shift collapse). A continuous-IF whole-line read is the only shape that types on iron, and once the read is line-buffered echo must be kernel-side (the shell can't see chars until the line completes) — so the kernel mirrors the proven in-kernel recovery shell's echo loop. A richer `agnsh` line editor (`completion.cyr`) that needs raw keystrokes returns when the future multithreading arc lets ring 3 run IF=1 + safe preemption; O1 reverts to RAW then. Observable syscall numbers unchanged → no cyrius peer change. |
 | **O3** | **`open(AO_DIRECTORY)` returns a normal fd** that `getdents` (29) consumes. | Reuse the `vfs_table` slot model + a dir tag — matches the existing fd plumbing; no separate dir-handle type. |
 | **O4** | **FAT/exFAT `stat`/`link` degrade gracefully.** `stat` fills `st_ino=0` + size/type from the dirent; `link` is ext2-only (returns -1 on FAT). | Inherent — FAT has no inodes or hard links. `ls -l` on FAT shows size/type, ino 0. |
 
@@ -128,20 +128,25 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
 
 ### 3.1 Changed behavior (same numbers)
 
-- **🔒 `read`(5) on `fd 0` → blocking keyboard stdin** (**IMPLEMENTED 1.41.1** — `kbd_read_blocking`; **mechanism
-  corrected 1.41.14**). When `fd==0`, the kernel blocks until at least one real character is typed, drains any
-  further buffered keys (up to `len`), and returns the count. **Line discipline = RAW (O1)** — no kernel echo;
-  agnsh does its own echo + editing via `completion.cyr`/`history.cyr`. **Mechanism**: the syscall re-enables
-  interrupts (`sti`) for the duration of the read so the **IRQ1 handler (`kb_isr`) fills `kb_buf`** — the
-  keystroke producer on real hardware (the in-kernel recovery shell types the same way; proven on archaemenid).
-  Preemption is suspended (`sched_active=0`) around the window so the timer ISR can't context-switch the
+- **🔒 `read`(5) on `fd 0` → blocking keyboard stdin** (**IMPLEMENTED 1.41.1**; **IRQ1 mechanism corrected
+  1.41.14**; **line discipline + echo 1.41.15**). When `fd==0`, the kernel blocks until **Enter**, drains the
+  whole line under one continuous interrupt-enabled window, and returns the bytes incl. the trailing `\n` (or a
+  short line if the caller's `len` fills first). **Line discipline = canonical-lite (O1, revised 1.41.15)** —
+  the kernel **echoes** printable bytes via `kputc` (serial + GOP framebuffer), handles **backspace** as
+  `BS SP BS`, and terminates on newline; `kb_shift`/`kb_ctrl` are reset on entry. This is the in-kernel recovery
+  shell's input loop, lifted into the syscall. **Mechanism**: `sti` for the whole-line read so the **IRQ1
+  handler (`kb_isr`) fills `kb_buf`** — the keystroke producer on real hardware. Holding IF=1 across the entire
+  line (not per-byte) is the load-bearing change: every make/break is processed in-window, so a shift-release is
+  never stranded across the ring-3 IF=0 gap (`ring3.cyr` enters ring 3 with RFLAGS=0x002; SYSRET restores it).
+  The 1.41.14 per-byte read returned after the first char, and that IF=0 inter-byte gap dropped shift-release
+  breaks → `kb_shift` latched → `d`→`D`, every line collapsing to a single stuck char (the `14114` "Command: D"
+  burn). Preemption is suspended (`sched_active=0`) around the window so the timer ISR can't context-switch the
   non-reentrant syscall (it still EOIs + advances `timer_ticks`). `kb_has_key()` additionally drains the xHCI
-  HID ring via `hid_poll()` — the QEMU producer (events DMA into the ring regardless of interrupts). Busy-poll,
-  no `hlt`, so a blocked read spins one core (single-foreground model). **NB — this is a kernel-internal
-  mechanism change; the observable ABI (RAW, blocks until ≥1, returns count) is unchanged, so the cyrius peer is
-  unaffected.** *(The original 1.41.1 spec polled `hid_poll()` with **IF MASKED** — correct in QEMU, but on real
-  hardware keystrokes arrive only via IRQ1, which IF-masking structurally blocks; that QEMU-only assumption is
-  what made the 1.41.12/1.41.13 iron burns reach the prompt with dead typing.)* Other fds keep the `vfs_read` path.
+  HID ring via `hid_poll()` — the QEMU producer. Busy-poll, no `hlt`, so a blocked read spins one core
+  (single-foreground model). **NB — observable syscall numbers/arg-passing are unchanged (the *line discipline*
+  changed, not the call shape), so the cyrius peer is unaffected.** *(History: the original 1.41.1 spec polled
+  `hid_poll()` with IF MASKED — QEMU-only; 1.41.14 fixed that to IRQ1+`sti`; 1.41.15 made it whole-line +
+  echoed after the `14114` stuck-shift collapse.)* Other fds keep the `vfs_read` path.
 - **`open`(7) → mount-routed** (1.41.3). Re-route from `initrd_open`-only to `vfs_resolve_mount` →
   `ext2_open` (inode-wise) or `vfs_open_on` (FAT/exFAT), with `initrd` as the bare-name fallback. **Gains a
   flags arg** (a3) — see 3.3. Opening a **directory** returns a dir-fd usable by `getdents` (29).

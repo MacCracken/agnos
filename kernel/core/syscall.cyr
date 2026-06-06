@@ -133,58 +133,80 @@ fn kernel_resume() {
     return 0;
 }
 
-# === Blocking keyboard stdin (1.41.1 — shell-separation arc) ===
-# read(fd=0) for a ring-3 process: block until at least one real character is
-# typed, drain any further buffered keys (up to `count`), return. RAW line
-# discipline (ABI decision O1) — no kernel echo, no line buffering; the userland
-# shell (agnsh — completion.cyr / history.cyr) owns echo + editing.
+# === Blocking keyboard stdin (1.41.1 — shell-separation arc; line discipline 1.41.15) ===
+# read(fd=0) for a ring-3 process: block, read a WHOLE LINE in ONE continuous
+# interrupts-enabled window, echo as we go, return when Enter (newline) is seen
+# or the caller's buffer fills. Canonical-lite line discipline (ABI O1, revised
+# 1.41.15): kernel echoes printable bytes + handles backspace + terminates on
+# newline — the userland shell consumes a ready-made line. This is a deliberate
+# move AWAY from the original RAW per-byte design, for the reason below.
 #
-# KEYSTROKE SOURCE (the one that delivers on real hardware): IRQ1 -> kb_isr ->
-# kb_buf. This is EXACTLY how the in-kernel recovery shell types on archaemenid
-# — proven on iron. It requires IF=1. The SYSCALL instruction masks IF via
-# SFMASK (=0x200) on entry, so this path lands here with interrupts OFF and that
-# producer is locked out. We re-enable interrupts (kbd_irq_enable) for the
-# duration of the blocking read, then disable them again before returning.
+# WHY THE PER-BYTE RAW DESIGN BROKE ON IRON (the 1.41.14 `14114` "Command: D"
+# burn): keystrokes on archaemenid arrive via IRQ1 -> kb_isr -> kb_buf (the UEFI
+# USB-legacy i8042 emulation; hid_poll's xHCI ring stays empty on that box). The
+# in-kernel recovery shell types correctly there because it holds IF=1 across the
+# ENTIRE line in one loop, so every scancode — including the SHIFT-RELEASE break
+# (0xAA) — is processed in-window and kb_shift is cleared. The old userland path
+# returned after the FIRST char, and ring 3 runs with IF=0 between syscalls
+# (ring3.cyr:108 sets RFLAGS=0x002; SYSRET restores it via R11). In that IF=0
+# inter-byte gap IRQ1 is masked, so a shift-release landing there was DROPPED:
+# kb_shift latched at 1, and scancode 0x20 ('d') resolved through sc_shifted to
+# 'D'=68 — every typed line collapsed to a stuck shift+d. The fix is to stop
+# diverging from the proven reference: drain the whole line under one continuous
+# sti window, exactly like shell.cyr's input loop.
 #
-# Why a plain `sti` is safe here even though we're in a ring-3 process's
-# syscall: the only interrupt unsafe to take mid-syscall is the TIMER — its
-# handler calls do_context_switch and the kernel is not reentrant across a
-# context switch taken on the syscall stack. We suspend preemption by clearing
-# sched_active: the timer ISR still fires (keeps EOIing + advancing timer_ticks,
-# so net/NTP timing keeps moving) but do_context_switch early-returns, so no
-# switch happens. The in-kernel shell runs with IF=1 and the SAME xHCI MSI-X
-# enabled and types fine on iron, so xHCI interrupts were never the hazard the
-# old comment claimed here — the timer was.
+# Why `sti` is safe in a ring-3 syscall: the only unsafe interrupt mid-syscall
+# is the TIMER (its handler calls do_context_switch; the kernel is not reentrant
+# across a switch on the syscall stack). We clear sched_active for the duration:
+# the timer ISR still fires (EOIs + advances timer_ticks, so net/NTP timing keeps
+# moving) but do_context_switch early-returns. Held across the whole line, same
+# regime the in-kernel shell runs in.
 #
-# kb_has_key() also calls hid_poll() to drain the xHCI USB-HID event ring, which
-# is how QEMU's usb-kbd delivers (events DMA into the ring regardless of any
-# interrupt). So one loop serves both: iron fills kb_buf via IRQ1, QEMU via the
-# polled hid_poll drain. We busy-poll (no hlt) so the QEMU path needs no wake
-# interrupt; the spin costs one core while the prompt is idle, acceptable for
-# the single-foreground model. scancode_to_ascii returns 0 for modifier/release
-# codes — consumed but never counted, so we never return a 0-length read.
+# kb_has_key() also calls hid_poll() to drain the xHCI USB-HID event ring (how
+# QEMU's usb-kbd delivers — events DMA in regardless of any interrupt). One loop
+# serves both: iron fills kb_buf via IRQ1, QEMU via the polled hid_poll drain. We
+# busy-poll (no hlt) so the QEMU path needs no wake interrupt. Echo uses kputc
+# (serial + GOP framebuffer mirror) — the same fb path write(1) uses from a
+# ring-3 syscall since 1.41.12, so it renders under the unified exec CR3 on iron.
 fn kbd_read_blocking(buf, count) {
     if (count <= 0) { return 0; }
     var saved_sched = sched_active;
     sched_active = 0;          # suspend preemption: timer ISR still EOIs + ticks,
     # but do_context_switch early-returns (no switch)
-    kbd_irq_enable();          # IF=1 — IRQ1 -> kb_isr now fills kb_buf (iron)
+    kb_shift = 0; kb_ctrl = 0; # defensive: never enter a read with a stranded
+    # modifier from a prior partial read (continuous drain below keeps it honest
+    # within the line; this just guarantees a clean start)
+    kbd_irq_enable();          # IF=1 for the WHOLE line — IRQ1 -> kb_isr fills
+    # kb_buf (iron); hid_poll drains the ring (QEMU). Held continuously so every
+    # scancode incl. shift-release breaks is processed in-window.
     var n = 0;
     while (n < count) {
         while (kb_has_key() == 0) { }   # IRQ1 fills kb_buf (iron); hid_poll drains ring (QEMU)
         var sc = kb_read_scancode();
         var ch = scancode_to_ascii(sc);
-        if (ch != 0) {
+        if (ch == 10) {                 # Enter: terminate the line. Echo newline,
+            kputc(10);                  # store it as the terminator, return.
+            store8(buf + n, 10);
+            n = n + 1;
+            kbd_irq_disable();
+            sched_active = saved_sched;
+            return n;
+        }
+        if (ch == 8) {                  # Backspace: erase one cell + drop one byte
+            if (n > 0) {                # (BS SP BS), mirrors shell.cyr:797.
+                n = n - 1;
+                kputc(8); kputc(32); kputc(8);
+            }
+        } elif (ch > 31) {              # Printable: store + echo (shell.cyr:800-805)
             store8(buf + n, ch);
             n = n + 1;
-            if (kb_has_key() == 0) {    # nothing more buffered -> return >=1 byte
-                kbd_irq_disable();
-                sched_active = saved_sched;
-                return n;
-            }
+            kputc(ch);
         }
-        # ch == 0 (modifier/release): keep blocking for a real character
+        # ch == 0 (modifier/release) or other control (<32, non-LF/BS): consumed
+        # in-window, never stored — so the whole make/break stream is drained here
+        # and kb_shift can't strand across a syscall boundary.
     }
+    # Buffer filled before a newline arrived — return the partial line.
     kbd_irq_disable();
     sched_active = saved_sched;
     return n;
