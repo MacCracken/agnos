@@ -1378,6 +1378,39 @@ fn exec_disk_selftest() {
         kprintln("reap: 4k-page LEAK", 18);
     }
 
+    # 1.42.x mmap-on-exit reap validation. The (B) cycle above maps a LOW page
+    # (0x400000, PD index 2 — ELF/stack territory). This separate cycle maps an
+    # ANONYMOUS-ARENA page (0x10000000, PD index 128 — exactly where sys_mmap
+    # installs pages) into a fresh address space and tears it down WITHOUT a
+    # munmap, simulating a process that mmap'd then exited. Pre-1.42 the
+    # free-loop stopped at PD index 510, but index 128 IS covered — so this
+    # specifically gates the FULL-arena sweep including the [128..511] range the
+    # bound extension added (a page at 0x3FE00000 = PD 511 would have leaked
+    # before). Free counts must return to baseline = arena page reclaimed.
+    var mf4_before = pmm_free_count();
+    var mf2_before = pmm_count_2mb_free();
+    var mrc = 0;
+    while (mrc < 6) {
+        var mcr3 = proc_create_address_space();
+        if (mcr3 != 0) {
+            var mph = pmm_alloc_2mb();
+            if (mph != 0) { proc_map_page(mcr3, 0x10000000, mph); }   # arena base (PD 128)
+            proc_free_address_space(mcr3);
+        }
+        mrc = mrc + 1;
+    }
+    var mf4_after = pmm_free_count();
+    var mf2_after = pmm_count_2mb_free();
+    if (mf4_before == mf4_after) {
+        if (mf2_before == mf2_after) {
+            kprintln("reap: 6x mmap-arena page reclaimed, free stable OK", 49);
+        } else {
+            kprintln("reap: mmap-arena 2mb-region LEAK", 32);
+        }
+    } else {
+        kprintln("reap: mmap-arena 4k-page LEAK", 29);
+    }
+
     kprintln("exec: selftest done", 19);
     return 0;
 }

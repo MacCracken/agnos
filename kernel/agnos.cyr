@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.42.0
+# agnos.cyr — AGNOS kernel v1.42.4
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
@@ -104,6 +104,7 @@ include "core/fatfs.cyr"
 include "core/exfat.cyr"
 include "core/ext2.cyr"
 include "core/syscall.cyr"
+include "core/bench.cyr"         # 3-tier rdtsc benchmarks (build-time entry; inert unless scripts/bench.sh rewrites boot_finish.cyr to call bench_run_all)
 include "user/test_procs.cyr"
 # Boot shim must be the first top-level statement emitted: it transitions
 # the CPU from multiboot1's 32-bit protected mode to long mode, so 64-bit

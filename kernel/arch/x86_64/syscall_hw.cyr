@@ -183,6 +183,21 @@ fn syscall_init() {
     store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0xBC); eoff = eoff + 2;
     store64(ep + eoff, syscall_kstack_top); eoff = eoff + 8;
 
+    # 1.42.x (RBP smash, CR2=0x37fed8): preserve the user's RBP across the
+    # kstack switch. SYSCALL doesn't save RBP, and the C-ABI syscall_handler
+    # (and its ksyscall callees) use RBP as a frame pointer
+    # (push rbp; mov rbp,rsp; … ; leave) — so once we `call syscall_handler`
+    # RBP holds a KERNEL-stack frame value (~0x37ff00, just under the kstack
+    # top 0x3F0000). In ~1/52 boots that leaked-kernel RBP survived back to
+    # ring 3 and agnsh's mmap-wrapper epilogue (`mov -0x28(%rbp),%r15`)
+    # #PF'd on the smashed RBP while RSP was healthy. We are now on the
+    # kernel stack (RSP=kstack), so push the user RBP here and pop it back
+    # below right before the user-RSP restore + SYSRET (popped while RSP is
+    # still the kstack). Mirrors the existing rcx/r11 save-for-SYSRET block;
+    # the push is balanced by the matching pop in the exit path, keeping the
+    # SYSRET RSP intact. push rbp — 0x55
+    store8(ep + eoff, 0x55); eoff = eoff + 1;
+
     # S9: Set IBRS (Spectre v2 mitigation) if supported
     # Now on kernel stack so we can use push/pop to preserve regs.
     # push rax; push rcx; push rdx; mov ecx,0x48; xor edx,edx; mov eax,1; wrmsr; pop rdx; pop rcx; pop rax
@@ -253,6 +268,14 @@ fn syscall_init() {
     store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x5B); eoff = eoff + 2;
     # pop rcx — 59
     store8(ep + eoff, 0x59); eoff = eoff + 1;
+
+    # 1.42.x (RBP smash): restore the user's RBP, saved on entry just after
+    # the kstack switch. We are still on the kernel stack (RSP=kstack) here —
+    # the entry order was push rbp; (IBRS bal.); push rcx; push r11, and the
+    # exit unwinds pop r11; pop rcx; pop rbp — so this pop sees the user RBP
+    # at the bottom of the saved block, with the stack now balanced back to
+    # syscall_kstack_top before we reload the user RSP below. pop rbp — 0x5D
+    store8(ep + eoff, 0x5D); eoff = eoff + 1;
 
     # Restore caller RSP
     # mov r10, imm64(kernel_rsp_save addr)

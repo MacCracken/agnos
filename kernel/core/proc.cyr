@@ -198,18 +198,38 @@ fn proc_create_address_space() {
     # PDPT[0] → PD (present + writable + user)
     store64(new_pdpt, new_pd | 0x07);
 
-    # Copy kernel PD entries [0..510] from kernel PD at 0x3000 — covers
-    # 0 GB through (1 GB - 2 MB), the same range pt_init populates as of
-    # v1.25.0. Entry 511 is reserved as the user-CR3 stash slot
-    # (see store64(new_pd + 511 * 8, u_pml4) below — proc_get_user_cr3
-    # reads it back). Pre-v1.25.1 this loop only copied [0..7] (16 MB)
-    # to mirror the old kernel identity-map ceiling, which left every
-    # per-process address space unable to reach kernel data above 16 MB
-    # — surfaced as a #PF triple-fault in the memory-isolation test
-    # once the kernel started living past 16 MB.
-    for (var i = 0; i < 511; i = i + 1) {
+    # Copy kernel PD entries [0..127] from kernel PD at 0x3000 — covers
+    # 0 GB through 256 MB (0x10000000), the kernel/identity half of the
+    # per-process PD where the kernel text/data/heap and the SYSCALL kstack
+    # (0x3F0000) live. These MUST stay identity-mapped: the syscall handler
+    # and kstack run under THIS per-process CR3 and need a faithful phys==VA
+    # map. Entry 511 is reserved as the user-CR3 stash slot (see
+    # store64(new_pd + 511 * 8, new_pml4) below — proc_get_user_cr3 reads it
+    # back). Pre-v1.25.1 this loop only copied [0..7] (16 MB) to mirror the
+    # old kernel identity-map ceiling, which left every per-process address
+    # space unable to reach kernel data above 16 MB — surfaced as a #PF
+    # triple-fault in the memory-isolation test once the kernel started
+    # living past 16 MB.
+    for (var i = 0; i < 128; i = i + 1) {
         var entry = load64(0x3000 + i * 8);
         store64(new_pd + i * 8, entry);
+    }
+    # Direction B (page-map fragility, issue 2026-06-04): leave the mmap-arena
+    # PD slots [128..510] — covering [0x10000000, 0x3FE00000), the arena
+    # sys_mmap bumps through (base 0x10000000 = mmap_next_vaddr, ceiling
+    # 0x40000000; pd_idx = VA>>21, so 0x10000000>>21 = 128) — NOT-PRESENT (0)
+    # rather than inheriting pt_init's present-SUPERVISOR identity entries
+    # (0x83). Every process was otherwise born with the whole arena as
+    # present-supervisor 2 MB pages, so when proc_map_page's user-PDE write
+    # went astray (the wrong-CR3 walk) the stale supervisor PDE "won" and a
+    # ring-3 heap store faulted e=0007 (US-protection on a PRESENT page)
+    # instead of a clean e=0006 (not-present). sys_mmap/proc_map_page now
+    # populate these slots as user pages (0x87) on demand; an un-mapped arena
+    # access faults cleanly e=0006 and there is no stale supervisor PDE to
+    # win. Kernel slots [0..127] are untouched above. Entry 511 is the
+    # user-CR3 stash (overwritten below), so this loop stops at 510.
+    for (var ai = 128; ai < 511; ai = ai + 1) {
+        store64(new_pd + ai * 8, 0);
     }
     # Mirror ALL present kernel PDPT entries [1..511], not just the 1–4 GB
     # huge pages. vmm_remap_uc_2mb / vmm_remap_wc_2mb (vmm.cyr) install
@@ -258,23 +278,41 @@ fn proc_create_address_space() {
     return new_pml4;
 }
 
-# === Per-Process Address-Space Teardown (1.40.14) ===
+# === Per-Process Address-Space Teardown (1.40.14; mmap-arena sweep 1.42.x) ===
 # Free every physical page a per-process address space owns: the user huge
-# pages (ELF segments + stack + any un-munmap'd anonymous mmap) and the three
+# pages (ELF segments + stack + ANY un-munmap'd anonymous mmap) and the three
 # page-table pages (PML4/PDPT/PD). Inverse of proc_create_address_space +
-# the loader's proc_map_page calls. Returns 0, or -1 on a kernel/boot CR3.
+# the loader's proc_map_page calls AND sys_mmap's proc_map_page calls. Returns
+# 0, or -1 on a kernel/boot CR3.
 #
 # How user pages are found: a per-process PD covers 0-1 GB (512 x 2 MB). At
 # AS-creation we copy the kernel identity PD (flag 0x83 — supervisor, NO user
 # bit) into entries [0..510]; the loader then OVERWRITES specific entries with
-# user huge pages via proc_map_page (flag 0x87 — the U/S user bit 0x04 SET).
-# So "present (0x01) AND user (0x04)" cleanly identifies exactly the pages the
-# loader allocated, regardless of physical address — a divergence-from-kernel
-# scan is unreliable because the first pmm_alloc_2mb commonly returns region 2
-# (0x400000), which equals the code segment's own identity vaddr. munmap'd
-# pages are not-present (0x01 clear) so they're skipped (already freed); the
-# kernel-mirrored identity entries are supervisor (0x04 clear) so they're left
-# untouched; index 511 is the user-CR3 stash slot (new_pml4, not a mapping).
+# user huge pages via proc_map_page (flag 0x87 — the U/S user bit 0x04 SET),
+# and sys_mmap likewise installs anonymous arena pages via proc_map_page (also
+# flag 0x87). So "present (0x01) AND user (0x04)" cleanly identifies exactly the
+# pages the loader+mmap allocated, regardless of physical address — a
+# divergence-from-kernel scan is unreliable because the first pmm_alloc_2mb
+# commonly returns region 2 (0x400000), which equals the code segment's own
+# identity vaddr.
+#
+# 1.42.x mmap-on-exit fix: the anonymous mmap arena [0x10000000, 0x40000000)
+# occupies PD indices 128..511 (0x10000000>>21 == 128 ; the top page at vaddr
+# 0x3FE00000 is PD index 511). The pre-1.42 loop stopped at index 510, so a
+# process that exited WITHOUT munmap'ing left every still-mapped arena page in
+# the PMM permanently (the heapstress symptom: ~3 interactive runs, then
+# pmm_alloc_2mb exhaustion). The scan now covers the FULL user PD range [1..511]
+# — `present AND user` still discriminates correctly at every index:
+#   - munmap'd / never-mapped arena pages are not-present (0x01 clear) -> skipped
+#     (this is exactly B2's "arena not-present until mapped" layout: harmless);
+#   - the kernel-mirrored identity entries are supervisor (0x04 clear) -> skipped
+#     (never freed — they belong to the shared kernel map, not this process);
+#   - index 511 is the user-CR3 stash slot (raw page-aligned new_pml4 with NO
+#     flag bits, so both present and user read 0) -> skipped, never freed as a
+#     huge page even though it now falls inside the scan.
+# So the sweep is correct under BOTH the current (arena pre-copied as supervisor
+# identity, then overwritten user-on-map) and B2's (arena not-present until
+# mapped) PD-seeding layouts — it only ever frees PRESENT+USER entries.
 fn proc_free_address_space(cr3) {
     if (cr3 == 0) { return 0 - 1; }
     if (cr3 == 0x1000) { return 0 - 1; }   # boot/kernel CR3 — never free its tables
@@ -282,8 +320,11 @@ fn proc_free_address_space(cr3) {
     var pdpt = pml4e & 0xFFFFFFFFF000;
     var pdpte = load64(pdpt);
     var pd = pdpte & 0xFFFFFFFFF000;
-    # Free user huge pages: present + user-bit set, indices 1..510.
-    for (var i = 1; i < 511; i = i + 1) {
+    # Free user huge pages: present + user-bit set, across the FULL user PD range
+    # 1..511 (covers ELF/stack AND the whole mmap arena 128..511). Supervisor
+    # (kernel-mirror) and not-present entries are skipped; the index-511 stash
+    # slot has no flag bits so it's skipped too.
+    for (var i = 1; i < 512; i = i + 1) {
         var e = load64(pd + i * 8);
         if ((e & 0x01) != 0) {
             if ((e & 0x04) != 0) {
@@ -337,6 +378,49 @@ fn proc_reap(pid) {
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
     if (cr3 != 0x1000) { proc_free_address_space(cr3); }
     # LIFO slot reclaim: hand the top dead slot back to the allocator.
+    if (pid == proc_count - 1) { proc_count = proc_count - 1; }
+    return 0;
+}
+
+# Reap a waited-on CHILD process (spawn / elf_load in-memory path, 1.42.x).
+#
+# The from-disk path (sh_cmd_run / kybernet_exec_agnsh) is the synchronous
+# foreground model: exec_and_wait runs the child to completion ON the caller's
+# stack, the kernel resumes, the caller reads the exit code and calls proc_reap.
+# The IN-MEMORY path (syscall 3 spawn -> elf_load, then syscall 4 waitpid) is
+# the PARENT/child model: the child is created ready, the SCHEDULER runs it, and
+# the parent blocks in waitpid until the child's exit() sets state 0. Pre-1.42
+# nothing ever reaped these — the child's address space (ELF + stack + any mmap
+# huge pages) and proc_table slot leaked for the whole boot. waitpid now calls
+# this AFTER it has captured the exit code, making the in-memory path symmetric
+# with the from-disk path: slot + address space + ALL user pages reclaimed.
+#
+# Why a SEPARATE helper rather than reusing proc_reap: proc_reap's fd-reclaim
+# loop (closes every non-FREE fd in 3..31) is correct ONLY under the single-
+# foreground run-to-completion model, where any open fd at reap belongs to the
+# just-exited program. In the parent/child model the PARENT is alive and may
+# hold its own fds — sweeping 3..31 here would wrongly flush+free the parent's
+# fds. The child's own fds are its responsibility to close on exit (POSIX
+# exit() closes them; a future per-process fd table will let us reclaim a
+# child's leaked fds without touching the parent's). So this reap does the
+# address-space + slot reclaim only, leaving the fd table alone.
+#
+# Scheduler-safety mirrors proc_reap: the child is already dead (waitpid only
+# returns once proc_get_state(pid)==0), so sched_next can never select it; and
+# the child's per-process CR3 is distinct from the parent's, so freeing its page
+# tables never frees tables the CPU is currently walking. We mark state 0
+# (idempotent) before detaching/freeing for the same ordering guarantee.
+fn proc_reap_child(pid) {
+    if (pid >= proc_count) { return 0 - 1; }
+    if (pid == proc_current) { return 0 - 1; }   # never reap the running proc here
+    var cr3 = proc_get_cr3(pid);
+    proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
+    proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
+    if (cr3 != 0x1000) { proc_free_address_space(cr3); }
+    # LIFO slot reclaim: hand the top dead slot back to the allocator (same rule
+    # as proc_reap — only the topmost slot collapses, so a non-top child that
+    # exits early keeps its slot until the slots above it drain; the address
+    # space + pages are still freed regardless).
     if (pid == proc_count - 1) { proc_count = proc_count - 1; }
     return 0;
 }

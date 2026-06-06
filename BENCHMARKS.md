@@ -5,33 +5,33 @@
 
 | | Current |
 |---|---|
-| **Date** | `2026-05-11T22:16:31Z` |
-| **Commit** | `5cdc10a` |
-| **Version** | 1.28.0 |
+| **Date** | `2026-06-06T09:55:18Z` |
+| **Commit** | `9748304` |
+| **Version** | 1.42.4 |
 | **Environment** | QEMU x86_64, rdtsc cycles |
 
 ## core
 
-| Benchmark | `5cdc10a` |
+| Benchmark | `9748304` |
 |---|---|
-| pmm_alloc_free | 2320 cycles/op |
-| heap_32B | 1341 cycles/op |
-| heap_256B | 3584 cycles/op |
-| heap_4096B | 37736 cycles/op |
-| memwrite_1MB | 5917 Kcycles |
+| pmm_alloc_free | 40742 cycles/op |
+| heap_32B | 1241 cycles/op |
+| heap_256B | 4589 cycles/op |
+| heap_4096B | 70285 cycles/op |
+| memwrite_1MB | 6163 Kcycles |
 
 ## subsystems
 
-| Benchmark | `5cdc10a` |
+| Benchmark | `9748304` |
 |---|---|
-| syscall_getpid | 299 cycles/op |
-| syscall_getuid | 827 cycles/op |
-| syscall_write1 | 593 cycles/op |
-| vfs_open_read_close | 5763 cycles/op |
+| syscall_getpid | 223 cycles/op |
+| syscall_getuid | 970 cycles/op |
+| syscall_write1 | 502942 cycles/op |
+| vfs_open_read_close | 21413 cycles/op |
 
 ## integration
 
-| Benchmark | `5cdc10a` |
+| Benchmark | `9748304` |
 |---|---|
-| serial_putc | 7485 cycles/op |
+| serial_putc | 498129 cycles/op |
 

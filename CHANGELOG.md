@@ -5,6 +5,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.4] — 2026-06-06 (**Hardening (c): reap leftovers — the in-memory spawn/elf_load procs are now reaped, and the mmap-arena teardown covers the full arena.** Closes the two process-teardown leaks carried from 1.40.14. Pre-1.42 the `run`/`elf_load_from_file` (from-disk) path reaped on exit, but the `spawn`/`elf_load` (in-memory) path's children leaked their whole address space + proc-table slot for the boot; and the AS-teardown free-loop stopped at PD index 510, one short of the arena's top page at PD 511.)
+
+### Fixed
+
+- **`proc_reap_child` reaps the in-memory-spawned child on `waitpid`.** The in-memory parent/child model (`spawn` → scheduler runs the child → parent blocks in `waitpid`) never reaped anything — every `spawn()`ed child's ELF + stack + any mmap huge pages + proc-table slot leaked for the whole boot. `waitpid` (syscall 4) now reads the exit code first, then calls `proc_reap_child(pid)` to reclaim the child's address space + slot — making the in-memory path leak-symmetric with the from-disk path's `sh_cmd_run` → `proc_reap`. A **separate** helper (not `proc_reap`) deliberately, because `proc_reap`'s fd-reclaim sweep (close fds 3..31) is correct only under the single-foreground run-to-completion model; in the parent/child model the *parent* is alive and may hold its own fds, so this reap does address-space + slot reclaim only. `waitpid` also gained a self-wait guard (`arg1 == proc_current` → `-1`) so a process can't block forever on itself and then free its own running address space. (`core/syscall.cyr`, `core/proc.cyr`; aarch64 stub in `arch/aarch64/stubs.cyr`.)
+- **`proc_free_address_space` munmap-on-exit sweep covers the full mmap arena.** The anonymous mmap arena `[0x10000000, 0x40000000)` spans PD indices 128..511; the free-loop ran `1..510`, so a process that exited *without* `munmap` leaked every still-mapped arena page (the heapstress symptom: ~3 interactive `run`s, then `pmm_alloc_2mb` exhaustion). The loop now scans the full user range `1..511`; the `present AND user` predicate still discriminates correctly at every index — not-present / never-mapped arena entries are skipped (this is exactly the [1.42.2] "arena not-present until mapped" layout), supervisor kernel-mirror entries are skipped, and the index-511 user-CR3 stash slot (a flagless page-aligned phys) is skipped. Correct under both the pre-[1.42.2] (arena pre-seeded supervisor) and [1.42.2] (arena not-present) PD layouts. (`core/proc.cyr`.)
+
+### Validated
+
+- `scripts/sweep.sh` **7/7**. EXEC_SELFTEST exec-smoke **PASS** with the new reap-validation cycle reporting `reap: 6x mmap-arena page reclaimed, free stable OK` (free-page + 2 MB-region counts stable across 6 map/teardown cycles — no leak). Build **1,074,304 B**, x86_64 multiboot2 OK.
+
+## [1.42.3] — 2026-06-06 (**Hardening (b): the rare SYSCALL-path RBP smash (`CR2=0x37fed8`) — user RBP is now preserved across the kstack switch.** Residual bug #2 from the 1.41.12 `#PF` investigation: ~1/52 boots faulted in agnsh's mmap-wrapper epilogue with the user RBP smashed to ~`0x37ff00` (just under the SYSCALL kstack top `0x3F0000`) while RSP was healthy.)
+
+### Fixed
+
+- **`syscall_init` preserves the user's RBP across the kstack switch.** SYSCALL doesn't save RBP, and the C-ABI `syscall_handler` (+ `ksyscall` callees) frame on RBP (`push rbp; mov rbp,rsp; …; leave`) — so after `call syscall_handler` the RBP register holds a *kernel-stack* frame value (~`0x37ff00`). In ~1/52 boots that leaked-kernel RBP survived back to ring 3 and agnsh's epilogue (`mov -0x28(%rbp),%r15`) `#PF`'d on it. The hand-assembled entry now `push rbp` (`0x55`) immediately after switching RSP to `syscall_kstack_top`, and `pop rbp` (`0x5D`) immediately before the user-RSP restore — a balanced pair (the intervening `push rcx`/`push r11` + `pop r11`/`pop rcx` save-for-SYSRET block nets to zero), so the SYSRET stack is intact and the user's RBP is recovered. (`arch/x86_64/syscall_hw.cyr`.)
+
+### Validated
+
+- `scripts/rbp-repro.sh` (boots the agnsh image N=40 under `qemu -d int`, scans for a ring-3 `#PF` with CR2 in the kstack window `0x37fxxx`): **40/40 reached the `[ASSIST] >` prompt, 0 RBP-smash faults, 0 total `v=0e`.** (The bug is ~1/52, so a clean N=40 is strong corroboration of the structural fix, not a proof of absence.) `scripts/sweep.sh` **7/7** (a regression here breaks *every* syscall — sweep + agnsh-smoke green). `agnsh-smoke` PASS. Build **1,074,304 B**.
+
+## [1.42.2] — 2026-06-06 (**Hardening (a), direction B: the mmap arena is no longer seeded present-supervisor in per-process page tables.** Removes the latent present-supervisor trap behind the 1.41.12 top-down `pmm_alloc` fix (issue `2026-06-04-agnsh-ring3-pf-pmm-fragmentation.md`). Direction A — editing page tables under the boot CR3 — was tested and rejected in the issue (it replaced the fault with a deterministic `CR2=0x8`); this is direction B, a correctness improvement that pairs with it.)
+
+### Fixed
+
+- **`proc_create_address_space` leaves the mmap-arena PD slots not-present instead of inheriting `pt_init`'s present-supervisor identity entries.** Every per-process PD previously copied kernel PD `[0..510]`, inheriting `pt_init`'s present-SUPERVISOR (`0x83`) 2 MB identity mapping for the *whole* 0–1 GB range — including the mmap arena `[0x10000000, 0x40000000)` (PD indices 128..511). So when `proc_map_page`'s user-PDE write went astray (the wrong-CR3 walk), the stale supervisor PDE "won" and a ring-3 heap store faulted `e=0007` (US-protection on a *present* page) instead of a clean `e=0006` (not-present). The create path now copies only the kernel/identity slots `[0..127]` (`[0, 0x10000000)` — kernel text/data/heap + the SYSCALL kstack at `0x3F0000`, which must stay identity-mapped under the per-process CR3) and **blanks the arena slots `[128..510]` to not-present (0)**; `sys_mmap`/`proc_map_page` populate them as user pages (`0x87`) on demand, and an un-mapped arena access now faults cleanly `e=0006` with no stale supervisor PDE to win. Slot 511 remains the user-CR3 stash. (`core/proc.cyr`.)
+
+### Validated
+
+- `scripts/repro-ring3-pf.sh` (boots the real agnsh kernel N=20 under `qemu -d int`, tallies ring-3 `#PF`): **0 ring-3 `#PF` / 20 boots, reached-exec 20/20** (signature `CR2=0x10000000`:0, `CR2=0x8`:0) — holds the 0/52 baseline the top-down `pmm_alloc` fix established, now with the supervisor trap removed. `scripts/sweep.sh` **7/7**, `agnsh-smoke` PASS. Build **1,074,304 B**.
+
+## [1.42.1] — 2026-06-06 (**Track A step 0: `scripts/bench.sh` reconstructed — the kernel benchmark harness builds + emits numbers again.** It was double-broken: the 1.37.5 kashi fold-in left its kernel-build invocation kashi-unaware, and the 1.41.9 shell-shrink deleted the `bench`/`bench_report` verbs it drove. `BENCHMARKS.md` had been frozen since 2026-05-11.)
+
+### Added
+
+- **`kernel/core/bench.cyr` — a compile-gated 3-tier benchmark entry (`bench_run_all`).** The tier code (core / subsystems / integration; rdtsc cycles/op; the `[tier1]`/`[tier2]`/`[tier3]` markers `bench.sh` parses) was recovered byte-for-byte from the pre-1.41.9 in-kernel `bench`/`bench_report` verbs (git `2a71754^:kernel/user/shell.cyr`) and re-homed as a build-time entry — **not** a recovery-shell verb (the shell's shrink to recovery-only is permanent). Included from `kernel/agnos.cyr`; behaviorally inert in the production build (no reachable caller — `boot_finish.cyr` still launches `kybernet()`), at the cost of +2,656 B / +2 dead fns, exactly how every other unreachable kernel fn lives in the binary.
+
+### Fixed
+
+- **`scripts/bench.sh` rewired for the post-1.41.9 / post-1.37.5 kernel.** The call-site rewrite is now `kybernet(); arch_halt();` → `bench_run_all(); arch_halt();` (the launch site moved to `boot_finish.cyr` at the 1.36.2 split), and the build uses the kashi-aware path (a bare `cyrius build agnos.cyr` fails on `undefined KASHI_FONT_VGA_8X16` since the 1.37.5 fold-in). Added a fail-loud match-guard on the call-site rewrite (so a future launch-site rename can't silently no-op and emit an empty `BENCHMARKS.md`) and removed a dead variable; the existing `test_procs` no-op guard + EXIT/INT/TERM source-restore trap are preserved (sources left byte-identical to HEAD).
+
+### Validated
+
+- `scripts/bench.sh` runs end-to-end (exit 0): builds the production ELF64 kernel with the bench entry wired in, boots gnoboot+OVMF on an NVMe/GPT/ext2 image, parses the full 3-tier table (pmm/heap/memwrite/syscall/vfs/serial), writes a populated 3-section `BENCHMARKS.md`, and appends the 12-column-provenance `bench-history.csv`. Production kernel + `sweep.sh` **7/7** unaffected (the include is inert).
+
 ## [1.42.0] — 2026-06-06 (**Cycle-open: kernel perf + hardening (Track A) ∥ userland environment (Track B).** The 1.41.x shell-separation arc is **iron-complete** — burn `14115` (2026-06-06) on archaemenid typed `help`/`mode`/`version` at `[ASSIST] >` with correct echo + dispatch, past a real DHCP lease; the userland AI shell is now typeable on hardware. Two non-blocking residuals open the new cycle's backlog. This is the cycle-open marker; the engineering bites — `bench.sh` reconstruction + measurement-gated perf tuning, the three carry-forward hardening items, and the Track-B agnsh verb buildout — land as 1.42.1+.)
 
 ### Notes
