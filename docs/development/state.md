@@ -6,9 +6,9 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-06-05 · kernel **1.41.14** (build **1,070,736 B**, x86_64 multiboot2 OK) · cyrius pin **6.0.56**.
+> **Last refresh**: 2026-06-06 · kernel **1.42.0** (build **1,070,960 B**, x86_64 multiboot2 OK) · cyrius pin **6.0.56**.
 >
-> **Active arc — 1.41.x shell-separation: SOFTWARE-COMPLETE, iron-burn pending.** `agnsh` (agnoshi) is the ring-3 interactive shell exec'd from the ext2 root by PID 1 `kybernet`; the in-kernel `shell()` is a recovery REPL; FAT/exFAT content-write reaches the syscall ABI; the ring-3→ring-0 surface is hardened. **1.41.14** = agnsh typing-on-iron fix — `read(0)` re-enables interrupts (`sti` + `sched_active=0`) so IRQ1→`kb_isr` fills `kb_buf` like the in-kernel shell. QEMU green (smoke + type-test + sweep 7/7); **iron burn pending** on archaemenid.
+> **Active arc — 1.42.x kernel perf + hardening (Track A) ∥ userland environment (Track B).** Just opened 2026-06-06 as the cycle-open marker; engineering bites land at 1.42.1+. **Track A**: `bench.sh` reconstruction (broke at the 1.37.5 kashi fold-in AND the 1.41.9 shell-shrink deleted its `bench`/`bench_report` verbs) → measurement-gated perf tuning (PMM/slab, scheduler/context-switch, syscall entry/exit, block-IO, ext2/4 hot loops, `fb_console` scroll); three carry-forward hardening items — (a) deeper page-map fragility (`sys_mmap`/`proc_map_page` edit PTs under per-process CR3, issue `2026-06-04-agnsh-ring3-pf-pmm-fragmentation.md`), (b) rare SYSCALL-path RBP smash (`CR2=0x37fed8`, `syscall_hw.cyr`), (c) 1.40.14 reap leftovers (anon mmap pages + `spawn`/`elf_load` procs). **Track B**: agnsh core verbs over the 1.41.3 FS syscalls + `cmdrs`/`bnrmr`/`mihi`/`iam` as agnsh-linked libs (buildout in agnoshi). **Backlog from the 1.41.x iron-close (burn `14115`):** backspace-on-iron (shared keyboard-delivery layer — Backspace not arriving as `0x0E` on archaemenid's UEFI emulation; recovery-shell probe rides the next burn) + derive agnoshi `VERSION_STR` from `VERSION`. **1.41.x shell-separation arc is iron-complete** — `14115` typed `help`/`mode`/`version` with echo + dispatch on archaemenid.
 >
 > **History lives elsewhere — this file is current-truth + pointers, NOT a log.** Per-release detail → [`CHANGELOG.md`](../../CHANGELOG.md). Forward plan → [`roadmap.md`](roadmap.md). Iron-burn attempts → agnosticos [`iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md). ABI contract → [`agnos-userland-abi.md`](agnos-userland-abi.md).
 >
@@ -20,9 +20,9 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.41.15** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.42.0** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **6.0.56** | `cyrius.cyml [package].cyrius` |
-| **Released** | 2026-06-05 | [`CHANGELOG.md`](../../CHANGELOG.md) |
+| **Released** | 2026-06-06 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-25 (archaemenid NUC AMD — **MVP gate green since Attempt 68 / 1.30.9**; **1.32.x networking arc iron-COMPLETE**: r8169 unicast-RX solved at 1.32.7 + DHCP real lease `.142` iron-verified at 1.32.9; storage trio + GPT + ext4 + shell byte-clean). The 1.33.x ext2/4-WRITE + 1.34.x FAT-family arcs are QEMU/`fsck`-validated; their final-bite iron burns stay user-driven (pending). | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB) + 80-91 (storage arc) + 92+ (networking arc — DHCP iron-verified 1.32.9) |
 
 ## Open investigations
