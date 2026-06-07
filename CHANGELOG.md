@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.14] — 2026-06-06 (**hardening / audit / security sweep — pre-burn.** A multi-dimension security audit of the agnos kernel's attack surface, the 1.42.x additions in focus: the new struct-write syscalls (`uname`#34 / `sysinfo`#35 / `klog`#36), the perf rewrites (PMM inline + no-op spinlock, multi-LBA fs-read, fb-blit), the klug ring, and the ring-3→ring-0 ingress. Findings + fixes land below as they confirm; rides the existing 1.42.x H1–H5 ride-along burn.)
+
+### Security
+
+- **CRITICAL — ring-3 arbitrary kernel write via signalfd/timerfd reads, FIXED** (`core/vfs.cyr`, `core/syscall.cyr`). `read(sigfd, ADDR, 0)` reached `vfs_read_signalfd`/`vfs_read_timerfd` with `ADDR` ring-3-controlled and UNVALIDATED — read#5 ran `is_user_range` only when `len > 0`, and the two helpers `store32`/`store64`'d a fixed 4/8 bytes ignoring `count`. A ring-0 arbitrary-write primitive: `signalfd`(#18) + `kill`-self(#16) to set a pending bit + `read(sigfd, target, 0)` → `store32(target, signum)` (timerfd: a constant `1` to any 8-byte address). The weaker form `read(sigfd, buf, 1)` passed `is_user_range(buf, 1)` yet still wrote 4 bytes (3 past the validated range). **Fix:** the helpers now require `count ≥ 4`/`≥ 8` before the store, and read#5 rejects `arg3 < 0` — both error forms refuse the store, so it can only land inside the `is_user_range`-checked region. (Every other user-pointer arm — write/stat#33/uname#34/sysinfo#35/klog#36/getdents/epoll/sigprocmask/… — was confirmed to validate its exact byte count with no overflow or kernel-memory leak.)
+- **MEDIUM — SMAP disabled across post-exit kernel work, FIXED** (`core/syscall.cyr`). The entry stub's `STAC` (AC=1, SMAP off for the user-copy window) is paired with `CLAC` only on the normal return; the exit syscall longjmps out via `kernel_resume` and never reached it, so the kernel ran all post-exit work (the next `run`, ext2/VFS) with SMAP off until the following syscall. **Fix:** `kernel_resume` emits `clac` on entry.
+- **LOW — SFMASK hardened** (`arch/x86_64/syscall_hw.cyr`). SYSCALL entry masked only IF (`0x200`), letting a ring-3 caller carry TF/DF/AC into ring 0. **Fix:** widened to `0x40700` (IF|TF|DF|AC) so the kernel begins every syscall with single-step off, DF=0, and SMAP enforced.
+- **Surfaced (cyrius-side, HIGH, not an agnos fix):** `lib/cyml.cyr`'s `cyml_parse` has a stack overflow — function-local `var entry_starts[256]` (= 256 bytes) written at 8-byte strides ×256 → a 1792-byte OOB from untrusted CYML — affecting the `cmdrs`/`bnrmr` tools that vendor it. Filed `cyrius/docs/development/issues/2026-06-06-cyml-parse-entry-starts-var-array-overflow.md`; the var-array footgun class gets a **language-level fix in cyrius 6.0.79**, after which the tools re-vendor. `klug` is unaffected (never calls `cyml_parse`).
+- The **FS-write + exec** dimension (ELF loader segment validation, ext2 dirent/stat bounds, proc-reap UAF/double-free, VFS write-back buffers) audited **clean** — no critical/high findings.
+
+### Validated
+
+- The audit was a 6-dimension multi-agent sweep (10 raw findings → 6 confirmed after adversarial verification against the agnos threat model — single-core, sovereign ABI, var-array units — which rejected the false positives).
+- Rebuilt + `sweep.sh` **7/7** (baseline check, FAT/exFAT read+write, ext2 WRITE regression, exec-from-disk) — the syscall entry (SFMASK), exit (`clac`), and read paths all intact. Rides the existing 1.42.x H1–H5 ride-along burn.
+
 ## [1.42.13] — 2026-06-06 (**klug userland reader — the `klog`#36 consumer ships; a sovereign `dmesg`.** Closes the *Kernel Logs Unified Grep* loop: 1.42.11–12 built the kernel ring + read syscall, this banks the userland tool that dumps it.)
 
 ### Added

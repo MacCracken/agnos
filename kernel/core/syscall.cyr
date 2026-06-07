@@ -81,6 +81,15 @@ fn sc_path_ok(ptr, len) {
 # letting the kernel/shell continue (run more programs) instead of halting on a
 # garbage rbp. (1.40.4 — the old version jmp'd without restoring rbp.)
 fn kernel_resume() {
+    # 1.42.14 SECURITY (audit #3): the SYSCALL entry stub's STAC (AC=1, SMAP off
+    # for the user-copy window) is paired with a CLAC only on the NORMAL return.
+    # The exit syscall (num==0) reaches here and longjmps out (jmp rdx below) —
+    # it never returns to the stub, so AC would stay 1 and ALL post-exit kernel
+    # work (the next `run`, ext2/VFS) would execute with SMAP disabled. Re-enable
+    # SMAP here so the exit path resumes with the backstop intact.
+    asm {
+        0x0F; 0x01; 0xCA;   # clac
+    }
     kernel_return_rsp = 0;
     kernel_return_rip = 0;
     # 1.40.10 bite 2 — restore the kernel main thread (proc 0) as current after a
@@ -314,6 +323,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 5) {
         # read(fd=arg1, buf=arg2, len=arg3)
+        # 1.42.14: reject negative len explicitly (defense-in-depth — the fd-type
+        # read helpers now also enforce their own minimum count, so a too-small
+        # buffer can no longer drive a fixed-size store past the validated range).
+        if (arg3 < 0) { return 0 - 1; }
         if (arg3 > 0) {
             if (is_user_range(arg2, arg3) == 0) { return 0 - 1; }
         }

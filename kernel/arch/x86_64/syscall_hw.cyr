@@ -95,10 +95,16 @@ fn syscall_init() {
         0x0F; 0x30;                     # wrmsr (edx:eax -> LSTAR; eax = rax low32)
     }
 
-    # Write SFMASK (MSR 0xC0000084) = 0x200 (clear IF)
+    # Write SFMASK (MSR 0xC0000084) = 0x40700 (clear IF|TF|DF|AC on SYSCALL entry).
+    # 1.42.14 SECURITY (audit #4/#5): masking ONLY IF (0x200) let a ring-3 caller
+    # carry TF/DF/AC into ring 0 — TF=1 single-steps the kernel into the bare-iretq
+    # #DB gate, DF=1 would reverse any future rep-string op into an OOB write, and
+    # AC=1 pre-disables SMAP ahead of the stub's STAC. Clearing all four on entry
+    # makes the kernel begin every syscall with single-step off, DF=0, and SMAP
+    # enforced (0x40700 = IF 0x200 | TF 0x100 | DF 0x400 | AC 0x40000).
     asm {
         0xB9; 0x84; 0x00; 0x00; 0xC0;
-        0xB8; 0x00; 0x02; 0x00; 0x00;
+        0xB8; 0x00; 0x07; 0x04; 0x00;
         0xBA; 0x00; 0x00; 0x00; 0x00;
         0x0F; 0x30;
     }

@@ -521,7 +521,15 @@ fn vfs_sync_secondary() {
     return 0 - 1;
 }
 
-fn vfs_read_signalfd(base, buf) {
+# 1.42.14 SECURITY: honor `count`. This helper store32's 4 fixed bytes into
+# `buf`; without a count check, read(sigfd, ADDR, 0) reaches here via read#5's
+# `if (arg3 > 0)` validation skip with ADDR fully ring-3-controlled and
+# UNVALIDATED — a ring-0 arbitrary 4-byte write. read(sigfd, buf, 1) is the
+# weaker form: is_user_range(buf,1) passes but store32 writes 3 bytes past it.
+# Requiring count >= 4 makes the store land only inside the is_user_range-checked
+# region (read#5 validates [buf, buf+count) for count > 0).
+fn vfs_read_signalfd(base, buf, count) {
+    if (count < 4) { return 0 - 1; }
     var sigmask = load64(base + 24);
     var pending = load64(&proc_signals + proc_current * 8);
     var matched = pending & sigmask;
@@ -537,7 +545,10 @@ fn vfs_read_signalfd(base, buf) {
     return 0;
 }
 
-fn vfs_read_timerfd(base, buf) {
+# 1.42.14 SECURITY: honor `count` — store64's 8 fixed bytes; same ring-3
+# arbitrary-write / overrun class as vfs_read_signalfd. Require count >= 8.
+fn vfs_read_timerfd(base, buf, count) {
+    if (count < 8) { return 0 - 1; }
     var next_fire = load64(base + 16);
     if (timer_ticks >= next_fire) {
         var interval = load64(base + 8);
@@ -628,10 +639,10 @@ fn vfs_read(fd_idx, buf, count) {
         return count;
     }
     if (ftype == VFS_SIGNALFD) {
-        return vfs_read_signalfd(base, buf);
+        return vfs_read_signalfd(base, buf, count);
     }
     if (ftype == VFS_TIMERFD) {
-        return vfs_read_timerfd(base, buf);
+        return vfs_read_timerfd(base, buf, count);
     }
     if (ftype == VFS_PIPE) {
         # Read end has is_write_end=0 (payload[1])
