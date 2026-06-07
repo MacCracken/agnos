@@ -341,8 +341,75 @@ fn fb_size_or_fallback() {
 # come back — one-line change, no other call sites depend on a
 # specific value.
 var FB_CONSOLE_Y0 = 0;
-var FB_FG = 0x00FFFFFF;  # white
-var FB_BG = 0x00000000;  # black
+var FB_FG = 0x00FFFFFF;  # white (default foreground)
+var FB_BG = 0x00000000;  # black (default background)
+
+# === ANSI/CSI/SGR state (1.43.1) ===
+# The console now interprets the escape sequences userland emits — SGR colour
+# (anuenue's per-char rainbow, any coloured tool), ED/`ESC[2J` (agnsh `clear`),
+# and CUP/`ESC[H` cursor positioning — instead of dropping the escape bytes as
+# sub-0x20 non-printables (which printed nothing for `clear` and raw garbage for
+# colour). fb_ansi_feed() is a small 3-state machine in front of fb_putc's glyph
+# path; the *current* fg/bg are packed pixel values the glyph render reads
+# directly (no per-pixel cost added). Defaults match the historical white-on-black.
+var fb_fg_color = 0x00FFFFFF;   # current foreground, PACKED for the FB pixel format
+var fb_bg_color = 0x00000000;   # current background,  PACKED for the FB pixel format
+var fb_ansi_state = 0;          # 0 = normal, 1 = saw ESC, 2 = inside CSI (ESC[…)
+var fb_ansi_params[8];          # CSI numeric params (module-global → 8×u64); >8 capped
+var fb_ansi_nparam = 0;         # index of the param currently being accumulated
+var fb_ansi_have_digit = 0;     # 1 if the current param slot has seen ≥1 digit
+
+# Pack an (r,g,b) triple (each 0..255) into the 32bpp FB pixel value, honouring
+# the EFI pixel format: pf 1 = BGRX (byte0=B,1=G,2=R) → 0x00RRGGBB; pf 0 = RGBX
+# (byte0=R,1=G,2=B) → R and B swapped. White/black are symmetric (why the old
+# fixed FB_FG/FB_BG worked under both), but real colours need this.
+fn fb_pack(r, g, b) {
+    if (fb_pf() == 0) { return (b << 16) | (g << 8) | r; }   # RGBX
+    return (r << 16) | (g << 8) | b;                          # BGRX (and pf default)
+}
+
+# The 16 standard ANSI colours (xterm/VGA-ish palette), idx 0..15 → packed pixel.
+# 0-7 normal, 8-15 bright. Used by SGR 30-37/40-47/90-97/100-107 and 256-idx 0-15.
+fn fb_ansi16(idx) {
+    if (idx == 0)  { return fb_pack(0, 0, 0); }
+    if (idx == 1)  { return fb_pack(170, 0, 0); }
+    if (idx == 2)  { return fb_pack(0, 170, 0); }
+    if (idx == 3)  { return fb_pack(170, 85, 0); }
+    if (idx == 4)  { return fb_pack(0, 0, 170); }
+    if (idx == 5)  { return fb_pack(170, 0, 170); }
+    if (idx == 6)  { return fb_pack(0, 170, 170); }
+    if (idx == 7)  { return fb_pack(170, 170, 170); }
+    if (idx == 8)  { return fb_pack(85, 85, 85); }
+    if (idx == 9)  { return fb_pack(255, 85, 85); }
+    if (idx == 10) { return fb_pack(85, 255, 85); }
+    if (idx == 11) { return fb_pack(255, 255, 85); }
+    if (idx == 12) { return fb_pack(85, 85, 255); }
+    if (idx == 13) { return fb_pack(255, 85, 255); }
+    if (idx == 14) { return fb_pack(85, 255, 255); }
+    return fb_pack(255, 255, 255);   # 15 bright white
+}
+
+# 256-colour index → packed pixel. 0-15 = the base 16; 16-231 = 6×6×6 cube;
+# 232-255 = 24-step grayscale ramp (standard xterm 256 layout). This is the
+# path anuenue's `ESC[38;5;Nm` rainbow drives.
+fn fb_256_rgb(n) {
+    if (n < 16) { return fb_ansi16(n); }
+    if (n < 232) {
+        var c = n - 16;
+        var r6 = (c / 36) % 6;
+        var g6 = (c / 6) % 6;
+        var b6 = c % 6;
+        var r = 0;
+        if (r6 != 0) { r = 55 + r6 * 40; }
+        var g = 0;
+        if (g6 != 0) { g = 55 + g6 * 40; }
+        var b = 0;
+        if (b6 != 0) { b = 55 + b6 * 40; }
+        return fb_pack(r, g, b);
+    }
+    var gray = 8 + (n - 232) * 10;
+    return fb_pack(gray, gray, gray);
+}
 
 # Glyph scale factor derived from display height. With the 1.30.12 swap
 # to a real 8x16 bitmap font, scale=1 is already legible at 1080p (cell
@@ -411,24 +478,183 @@ fn fb_scroll_up() {
             store64(dst + x * 8, load64(src + x * 8));
         }
     }
-    # Clear new bottom cell_h-px row to FB_BG. FB_BG is 0x00000000 today,
-    # so the packed-pair u64 value is also 0 — no shift. If FB_BG ever
-    # becomes non-zero, repack as (FB_BG << 32) | (FB_BG & 0xFFFFFFFF).
+    # Clear the new bottom cell_h-px row to the CURRENT background colour (1.43.1:
+    # was hardcoded FB_BG=0). Pack two pixels per u64; black → 0, identical to before.
     var clear_y = FB_CONSOLE_Y0 + rows_to_copy;
+    var bg64 = (fb_bg_color << 32) | fb_bg_color;
     for (var y = 0; y < cell_h; y = y + 1) {
         for (var x = 0; x < stride_u64; x = x + 1) {
-            store64(fb + (clear_y + y) * pitch + x * 8, 0);
+            store64(fb + (clear_y + y) * pitch + x * 8, bg64);
         }
     }
     return 0;
 }
 
+# Read CSI param `i`. Module-global `var X[N]` is N×u64, accessed by explicit
+# load64(&X + i*8) (the kernel's exec_ctx convention; `X[i]` indexing isn't a
+# thing for module globals here).
+fn fb_ansi_p(i) {
+    return load64(&fb_ansi_params + i * 8);
+}
+
+# Clear the whole framebuffer to the current background colour + home the
+# cursor. Backs `ESC[2J`. Mirrors fb_console_init's clear loop but packs the
+# current bg into the u64 block-store (black today → 0, identical to before).
+fn fb_console_clear() {
+    var fb = fb_fb_phys();
+    if (fb == 0) { fb_cur_x = 0; fb_cur_y = 0; return 0; }
+    var pitch = fb_pitch();
+    var height = fb_height();
+    var stride_u64 = pitch / 8;
+    var bg64 = (fb_bg_color << 32) | fb_bg_color;   # two packed pixels per u64
+    for (var py = 0; py < height; py = py + 1) {
+        var scan = fb + py * pitch;
+        for (var px = 0; px < stride_u64; px = px + 1) {
+            store64(scan + px * 8, bg64);
+        }
+    }
+    fb_cur_x = 0;
+    fb_cur_y = 0;
+    return 0;
+}
+
+# Apply an SGR (`ESC[…m`) parameter list to the current fg/bg colour state.
+# Supports: 0/bare = reset, 30-37/90-97 fg + 40-47/100-107 bg (16 colours),
+# 39/49 default fg/bg, 38;5;N / 48;5;N (256-colour), 38;2;R;G;B / 48;2;R;G;B
+# (truecolour). Unsupported attrs (bold/underline/reverse) are skipped — colour
+# is what the tools need. `np` is the param count (0 == bare `ESC[m`).
+fn fb_ansi_sgr(np) {
+    if (np == 0) { fb_fg_color = FB_FG; fb_bg_color = FB_BG; return 0; }
+    var i = 0;
+    while (i < np) {
+        var p = fb_ansi_p(i);
+        if (p == 0) { fb_fg_color = FB_FG; fb_bg_color = FB_BG; }
+        elif (p == 38) {
+            if (i + 1 < np) {
+                var m = fb_ansi_p(i + 1);
+                if (m == 5) {
+                    if (i + 2 < np) { fb_fg_color = fb_256_rgb(fb_ansi_p(i + 2)); }
+                    i = i + 2;
+                } elif (m == 2) {
+                    if (i + 4 < np) { fb_fg_color = fb_pack(fb_ansi_p(i + 2), fb_ansi_p(i + 3), fb_ansi_p(i + 4)); }
+                    i = i + 4;
+                }
+            }
+        }
+        elif (p == 48) {
+            if (i + 1 < np) {
+                var m2 = fb_ansi_p(i + 1);
+                if (m2 == 5) {
+                    if (i + 2 < np) { fb_bg_color = fb_256_rgb(fb_ansi_p(i + 2)); }
+                    i = i + 2;
+                } elif (m2 == 2) {
+                    if (i + 4 < np) { fb_bg_color = fb_pack(fb_ansi_p(i + 2), fb_ansi_p(i + 3), fb_ansi_p(i + 4)); }
+                    i = i + 4;
+                }
+            }
+        }
+        elif (p == 39) { fb_fg_color = FB_FG; }
+        elif (p == 49) { fb_bg_color = FB_BG; }
+        elif (p >= 30 && p <= 37)   { fb_fg_color = fb_ansi16(p - 30); }
+        elif (p >= 40 && p <= 47)   { fb_bg_color = fb_ansi16(p - 40); }
+        elif (p >= 90 && p <= 97)   { fb_fg_color = fb_ansi16(p - 90 + 8); }
+        elif (p >= 100 && p <= 107) { fb_bg_color = fb_ansi16(p - 100 + 8); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Dispatch a completed CSI sequence by its final byte. SGR (`m`), ED (`J`,
+# only the `2` = whole-screen form), CUP (`H`/`f`). Everything else no-ops
+# (safer than mis-rendering); extend as tools need cursor moves / EL.
+fn fb_ansi_dispatch(cmd, np) {
+    if (cmd == 0x6D) { fb_ansi_sgr(np); return 0; }     # 'm'
+    if (cmd == 0x4A) {                                   # 'J' (ED)
+        var pj = 0;
+        if (np > 0) { pj = fb_ansi_p(0); }
+        if (pj == 2) { fb_console_clear(); }
+        return 0;
+    }
+    if (cmd == 0x48 || cmd == 0x66) {                    # 'H' / 'f' (CUP)
+        var row = 1;
+        var col = 1;
+        if (np > 0 && fb_ansi_p(0) > 0) { row = fb_ansi_p(0); }
+        if (np > 1 && fb_ansi_p(1) > 0) { col = fb_ansi_p(1); }
+        var s = 1;
+        if (fb_height() > 1200) { s = 2; }
+        var max_cols = fb_width() / (8 * s);
+        var max_rows = (fb_height() - FB_CONSOLE_Y0) / (16 * s);
+        var ry = row - 1;
+        var cx = col - 1;
+        if (ry < 0) { ry = 0; }
+        if (cx < 0) { cx = 0; }
+        if (ry >= max_rows) { ry = max_rows - 1; }
+        if (cx >= max_cols) { cx = max_cols - 1; }
+        fb_cur_y = ry;
+        fb_cur_x = cx;
+        return 0;
+    }
+    return 0;
+}
+
+# Feed one byte to the ANSI state machine. Returns 1 if the byte was CONSUMED
+# as part of an escape sequence (caller must not render it), 0 if it's a normal
+# byte the caller should render. 3 states: normal → ESC (0x1B) → CSI (`[`).
+fn fb_ansi_feed(ch) {
+    if (fb_ansi_state == 0) {
+        if (ch == 0x1B) { fb_ansi_state = 1; return 1; }
+        return 0;
+    }
+    if (fb_ansi_state == 1) {           # saw ESC
+        if (ch == 0x5B) {               # '[' → begin CSI param collection
+            fb_ansi_state = 2;
+            fb_ansi_nparam = 0;
+            store64(&fb_ansi_params, 0);
+            fb_ansi_have_digit = 0;
+            return 1;
+        }
+        # ESC + non-'[' (charset designators, ESC c, etc.) — unsupported, drop
+        # both the ESC and this byte so a stray designator can't render.
+        fb_ansi_state = 0;
+        return 1;
+    }
+    # state 2: collecting a CSI sequence
+    if (ch >= 0x30 && ch <= 0x39) {     # digit → accumulate into the current param
+        if (fb_ansi_nparam < 8) {
+            store64(&fb_ansi_params + fb_ansi_nparam * 8, load64(&fb_ansi_params + fb_ansi_nparam * 8) * 10 + (ch - 0x30));
+        }
+        fb_ansi_have_digit = 1;
+        return 1;
+    }
+    if (ch == 0x3B) {                   # ';' → next param slot (cap at 8)
+        if (fb_ansi_nparam < 7) {
+            fb_ansi_nparam = fb_ansi_nparam + 1;
+            store64(&fb_ansi_params + fb_ansi_nparam * 8, 0);
+        }
+        fb_ansi_have_digit = 0;
+        return 1;
+    }
+    if (ch >= 0x40 && ch <= 0x7E) {     # final byte → dispatch
+        var np = 0;
+        if (fb_ansi_have_digit == 1 || fb_ansi_nparam > 0) { np = fb_ansi_nparam + 1; }
+        fb_ansi_dispatch(ch, np);
+        fb_ansi_state = 0;
+        return 1;
+    }
+    # intermediate / junk byte (0x20-0x2F or stray < 0x30): consume, stay in CSI.
+    return 1;
+}
+
 # Render one glyph for `ch` at the current cursor position. Handles
-# newline (10), carriage return (13), backspace (8). Non-printable bytes
-# outside 0x20..0x7F are silently dropped. Advances cursor; wraps to next
-# row at end of line; scrolls when bottom reached.
+# newline (10), carriage return (13), backspace (8). ANSI escapes (ESC=0x1B
+# and the CSI bytes that follow) are intercepted by fb_ansi_feed first. Other
+# non-printable bytes outside 0x20..0x7F are silently dropped. Advances cursor;
+# wraps to next row at end of line; scrolls when bottom reached.
 fn fb_putc(ch) {
     if (fb_console_ready == 0) { return 0; }
+    # ANSI/CSI interception (1.43.1): consume ESC + CSI bytes (colour, clear,
+    # cursor). Returns 1 when the byte was part of a sequence → nothing to draw.
+    if (fb_ansi_feed(ch) == 1) { return 0; }
     var fb = fb_fb_phys();
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
@@ -463,7 +689,7 @@ fn fb_putc(ch) {
     if (ch == 8) {
         if (fb_cur_x > 0) {
             fb_cur_x = fb_cur_x - 1;
-            fb_fill_cell(fb_cur_x, FB_CONSOLE_Y0 + fb_cur_y * cell_h, FB_BG);
+            fb_fill_cell(fb_cur_x, FB_CONSOLE_Y0 + fb_cur_y * cell_h, fb_bg_color);
         }
         return 0;
     }
@@ -503,8 +729,8 @@ fn fb_putc(ch) {
         var scan0 = row_top;             # this glyph-row's top scanline, col 0
         for (var col = 0; col < 8; col = col + 1) {
             var on = (bits >> (7 - col)) & 1;
-            var color = FB_BG;
-            if (on == 1) { color = FB_FG; }
+            var color = fb_bg_color;
+            if (on == 1) { color = fb_fg_color; }
             var scan = scan0;
             for (var dy = 0; dy < s; dy = dy + 1) {
                 var px = scan;
@@ -534,3 +760,82 @@ fn fb_println(buf, len) {
     fb_putc(10);
     return 0;
 }
+
+#ifdef FB_ANSI_SELFTEST
+# 1.43.1 — ANSI/CSI/SGR parser selftest (compile-gated). Feeds escape sequences
+# through fb_ansi_feed() and asserts the resulting colour / cursor STATE — a
+# deterministic parser gate that needs no pixel inspection. Emits one
+# `fb-ansi: PASS/FAIL <case>` line per check to serial (captured by
+# scripts/fb-ansi-smoke.sh). Uses fb_ansi_feed directly (not fb_putc) so the SGR
+# checks don't depend on fb_console_ready; the CUP check uses the live FB geometry
+# (present under QEMU OVMF GOP). Resets colour state at the end so the boot
+# console continues clean.
+fn fb_ansi_feed_str(s, len) {
+    var i = 0;
+    while (i < len) { fb_ansi_feed(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn fb_ansi_check(name, namelen, got, want) {
+    if (got == want) {
+        serial_print("fb-ansi: PASS ", 14);
+        serial_println(name, namelen);
+    } else {
+        serial_print("fb-ansi: FAIL ", 14);
+        serial_print(name, namelen);
+        serial_print(" got=", 5);
+        kfmt_hex0x(got);
+        serial_print(" want=", 6);
+        kfmt_hex0x(want);
+        serial_println("", 0);
+    }
+    return 0;
+}
+fn fb_ansi_selftest() {
+    fb_ansi_state = 0;
+    fb_fg_color = FB_FG;
+    fb_bg_color = FB_BG;
+    fb_cur_x = 0;
+    fb_cur_y = 0;
+
+    # SGR 31 → red foreground (16-colour)
+    fb_ansi_feed_str("\x1b[31m", 5);
+    fb_ansi_check("sgr31-red-fg", 12, fb_fg_color, fb_ansi16(1));
+
+    # SGR 0 → reset to default white
+    fb_ansi_feed_str("\x1b[0m", 4);
+    fb_ansi_check("sgr0-reset-fg", 13, fb_fg_color, FB_FG);
+
+    # SGR 38;5;196 → 256-colour index 196 (the path anuenue's rainbow drives)
+    fb_ansi_feed_str("\x1b[38;5;196m", 11);
+    fb_ansi_check("sgr256-196-fg", 13, fb_fg_color, fb_256_rgb(196));
+
+    # SGR 38;2;10;20;30 → truecolour
+    fb_ansi_feed_str("\x1b[38;2;10;20;30m", 16);
+    fb_ansi_check("sgr-truecolor-fg", 16, fb_fg_color, fb_pack(10, 20, 30));
+
+    # SGR 42 → green background
+    fb_ansi_feed_str("\x1b[42m", 5);
+    fb_ansi_check("sgr42-green-bg", 14, fb_bg_color, fb_ansi16(2));
+
+    # CUP 5;10 → cursor row 5 col 10 (1-based) → cur_y=4, cur_x=9 (0-based)
+    fb_ansi_feed_str("\x1b[5;10H", 7);
+    fb_ansi_check("cup-row-y4", 10, fb_cur_y, 4);
+    fb_ansi_check("cup-col-x9", 10, fb_cur_x, 9);
+
+    # ED 2J → clears + homes the cursor
+    fb_cur_x = 7;
+    fb_cur_y = 7;
+    fb_ansi_feed_str("\x1b[2J", 4);
+    fb_ansi_check("ed2j-home-x0", 12, fb_cur_x, 0);
+    fb_ansi_check("ed2j-home-y0", 12, fb_cur_y, 0);
+
+    # Leave the console in a clean default state for the rest of boot.
+    fb_ansi_state = 0;
+    fb_fg_color = FB_FG;
+    fb_bg_color = FB_BG;
+    fb_cur_x = 0;
+    fb_cur_y = 0;
+    serial_println("fb-ansi: selftest done", 22);
+    return 0;
+}
+#endif

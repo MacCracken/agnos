@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.1] — 2026-06-07
+
+**ANSI/CSI/SGR interpreter in the FB console — colour + `clear` actually work now.** The framebuffer console dropped every escape byte as a sub-0x20 non-printable, so `ESC[2J` (agnsh `clear`) printed nothing and any colour sequence (anuenue's per-char rainbow, every coloured tool) rendered as raw garbage. This is the foundational piece for the whole colour/TUI lane.
+
+### Added
+
+- **`fb_ansi_feed()` — a 3-state CSI parser** (normal → ESC → CSI) in front of `fb_putc`'s glyph path (`arch/x86_64/fb_console.cyr`). It intercepts `ESC` (0x1B) + the CSI bytes that follow and dispatches completed sequences; normal bytes pass straight through (two comparisons per char on the hot path). Supported:
+  - **SGR (`ESC[…m`) colour** → current fg/bg state the glyph render reads directly: reset (`0`/bare), 16-colour (`30-37`/`40-47` + bright `90-97`/`100-107`), default fg/bg (`39`/`49`), **256-colour** (`38;5;N` / `48;5;N`, incl. the 6×6×6 cube + grayscale ramp — the path anuenue drives), and **truecolour** (`38;2;R;G;B` / `48;2;R;G;B`).
+  - **ED `ESC[2J`** → clear the whole framebuffer to the current bg + home the cursor (fixes agnsh `clear`).
+  - **CUP `ESC[r;cH` / `…f`** → cursor positioning (1-based → 0-based, clamped to the grid).
+  - Unsupported sequences (cursor moves, EL, bold/underline attrs) no-op rather than mis-render — extend as tools need them.
+- **Pixel-format-aware colour packing** (`fb_pack`) — honours EFI BGRX (pf 1) vs RGBX (pf 0) so real colours land on the right channels (white/black were symmetric, which is why the old fixed `FB_FG`/`FB_BG` worked under both). Current fg/bg are stored pre-packed, so no per-pixel cost is added.
+- **`FB_ANSI_SELFTEST` parser gate** (`scripts/fb-ansi-smoke.sh`) — feeds escape sequences through `fb_ansi_feed` and asserts the resulting colour/cursor **state** via serial markers (no pixel inspection): **9/9** checks pass (16-colour/reset/256/truecolour fg+bg, CUP, ED-2J-home). Full **sweep 7/7** — the parser sits in every output path with zero regression to normal text. Iron rides the next burn.
+
+### Changed
+
+- The glyph render + backspace-clear + scroll-bottom-clear now use the **current** fg/bg colour state (`fb_fg_color`/`fb_bg_color`, default white-on-black) instead of the fixed `FB_FG`/`FB_BG` constants — identical output until a tool sets a colour.
+
 ## [1.43.0] — 2026-06-07
 
 **1.43.x arc OPEN — graphics path + the first real userland app ("agnsh launches DOOM").** The non-threading half: ring-3 blocking exec, a framebuffer/blit syscall, a ring-3 timing face, `envp`, and `cyrius-doom --agnos`. Bite 1 is **`execwait` (#37)** — the ring-3 blocking-exec primitive that un-gates agnoshi's `run` builtin (agnoshi 1.4.3's `RUN_EXECWAIT_READY`) and is the foundation for agnsh launching any on-disk program.

@@ -29,6 +29,12 @@ vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 # any subsystem is up. Now paints into the WC-remapped FB above.
 fb_console_init();
 
+#ifdef FB_ANSI_SELFTEST
+# 1.43.1 — ANSI/CSI/SGR parser gate. Runs right after fb_console_init (FB geometry
+# is live) and emits `fb-ansi: PASS/FAIL` markers to serial for fb-ansi-smoke.sh.
+fb_ansi_selftest();
+#endif
+
 print_agnos_kernel_banner();
 kprintln("64-bit long mode", 16);
 
