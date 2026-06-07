@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.2] — 2026-06-07
+
+**envp on the exec stack — `getenv()` can resolve on agnos (kernel half).** The exec ABI staged an *empty* envp (an immediate NULL) since 1.40.7, so `getenv("HOME")` always returned 0 in ring 3 — the gap behind `.agnshrc` and commandress's `$PWD`/`getcwd`. The kernel now stages a real env. The cyrius-side `getenv()` agnos branch (reading this envp via `_agnos_init_rsp`) is the paired language-work half, owned by the cyrius agent.
+
+### Added
+
+- **`elf_load_from_file` stages a minimal envp** (`HOME=/`, `PWD=/`) on the SysV init stack (`core/elf.cyr`): the envp pointer array follows the argv NULL, NULL-terminated, then the AT_NULL auxv; the `KEY=VALUE` strings share the argv string region (`0x3100..0x4000`). A uniform kernel-default env for now (every exec'd program — kybernet→agnsh→children — gets it); per-process propagation (threading env through `execwait`) is a follow-on.
+  - **ABI contract** (for cyrius `getenv`): from the captured init rsp, `argc = [rsp]`, `argv[i] = [rsp+8+i*8]`, argv NULL at `[rsp+8+argc*8]`, then **`envp[i] = [rsp+8+(argc+1+i)*8]`** (NULL-terminated). Standard SysV — exactly the layout `args_agnos.cyr` already documents.
+- **`/bin/envtest` ring-3 validator** (`core/main.cyr`, `EXEC_SELFTEST`): run with no args (argc=1), it reads `envp[0]` at `[rsp+0x18]` and exits with its first byte — `'H'` = 0x48 = **72**. `scripts/exec-smoke.sh` gates on `run: exit 72` (distinct from argv0's `'/'`=47, so it proves it read *envp*, not argv). **exec-smoke green + sweep 7/7.** Iron rides the next burn.
+
 ## [1.43.1] — 2026-06-07
 
 **ANSI/CSI/SGR interpreter in the FB console — colour + `clear` actually work now.** The framebuffer console dropped every escape byte as a sub-0x20 non-printable, so `ESC[2J` (agnsh `clear`) printed nothing and any colour sequence (anuenue's per-char rainbow, every coloured tool) rendered as raw garbage. This is the foundational piece for the whole colour/TUI lane.

@@ -318,9 +318,38 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     }
     store64(stack_phys + 0x3000, argc);                          # argc
     store64(stack_phys + 0x3008 + argc * 8, 0);                  # argv NULL
-    store64(stack_phys + 0x3008 + (argc + 1) * 8, 0);            # envp NULL
-    store64(stack_phys + 0x3008 + (argc + 2) * 8, 0);            # auxv AT_NULL type
-    store64(stack_phys + 0x3008 + (argc + 3) * 8, 0);            # auxv AT_NULL val
+
+    # 1.43.2: stage a minimal envp (HOME=/ , PWD=/) so ring-3 getenv() resolves on
+    # agnos — previously envp was an immediate NULL, so getenv("HOME") always
+    # returned 0 (the .agnshrc / commandress $PWD gap). SysV layout: the envp
+    # pointer array follows the argv NULL, NULL-terminated, then the AT_NULL auxv.
+    # The "KEY=VALUE" strings share the 0x3100..0x4000 string region (str_o = the
+    # next free offset after the argv strings). cyrius's agnos runtime reads these
+    # via `_agnos_init_rsp + 8 + (argc+1+i)*8` (args_agnos.cyr) once getenv() gains
+    # its agnos branch (cyrius-side, 1.43.2 language work). A uniform kernel-default
+    # env for now; per-process propagation (thread env through execwait) is a
+    # follow-on. ASCII: H=72 O=79 M=77 E=69 '='=61 '/'=47 ; P=80 W=87 D=68.
+    var envc = 0;
+    if (str_o + 7 < 0x4000) {                                    # "HOME=/" + NUL
+        store8(stack_phys + str_o + 0, 72);  store8(stack_phys + str_o + 1, 79);
+        store8(stack_phys + str_o + 2, 77);  store8(stack_phys + str_o + 3, 69);
+        store8(stack_phys + str_o + 4, 61);  store8(stack_phys + str_o + 5, 47);
+        store8(stack_phys + str_o + 6, 0);
+        store64(stack_phys + 0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
+        str_o = str_o + 7;
+        envc = envc + 1;
+    }
+    if (str_o + 6 < 0x4000) {                                    # "PWD=/" + NUL
+        store8(stack_phys + str_o + 0, 80);  store8(stack_phys + str_o + 1, 87);
+        store8(stack_phys + str_o + 2, 68);  store8(stack_phys + str_o + 3, 61);
+        store8(stack_phys + str_o + 4, 47);  store8(stack_phys + str_o + 5, 0);
+        store64(stack_phys + 0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
+        str_o = str_o + 6;
+        envc = envc + 1;
+    }
+    store64(stack_phys + 0x3008 + (argc + 1 + envc) * 8, 0);     # envp NULL
+    store64(stack_phys + 0x3008 + (argc + 2 + envc) * 8, 0);     # auxv AT_NULL type
+    store64(stack_phys + 0x3008 + (argc + 3 + envc) * 8, 0);     # auxv AT_NULL val
     var stack_top = stack_base + 0x3000;                         # rsp -> argc
 
     var new_pid = proc_create_full(entry, stack_top);

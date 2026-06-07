@@ -1541,6 +1541,34 @@ fn exec_disk_selftest() {
     kprintln("exec: running /bin/exwv", 23);
     sh_exec("run /bin/exwv", 13);
 
+    # 1.43.2 — envp validator (/bin/envtest). A ring-3 program run with NO extra
+    # args (argc=1: argv[0]=path), so its stack is [rsp]=1, [rsp+8]=argv0,
+    # [rsp+0x10]=argv NULL, [rsp+0x18]=envp[0] → "HOME=/". It reads envp[0][0] and
+    # exits with it: 'H' = 0x48 = 72. "run: exit 72" proves the kernel staged a
+    # real envp the ring-3 program can read at the SysV offset (and NOT argv — argv0
+    # starts '/' = 47, so 72 is distinctive). Mirrors /bin/argv but reads envp[0].
+    var ti = 0;
+    while (ti < 200) { store8(eb + ti, 0); ti = ti + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 138); store8(eb + 104, 138);                  # p_filesz/memsz = 138
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120: mov rsi,[rsp+0x18] (envp[0]) ; movzx rdi,byte[rsi] ; mov rax,0 ; syscall
+    store8(eb + 120, 0x48); store8(eb + 121, 0x8B); store8(eb + 122, 0x74); store8(eb + 123, 0x24); store8(eb + 124, 0x18);
+    store8(eb + 125, 0x48); store8(eb + 126, 0x0F); store8(eb + 127, 0xB6); store8(eb + 128, 0x3E);
+    store8(eb + 129, 0x48); store8(eb + 130, 0xC7); store8(eb + 131, 0xC0);
+    store8(eb + 136, 0x0F); store8(eb + 137, 0x05);
+    var tino = 0;
+    if (bino > 0) { tino = ext2_create(bino, "envtest", 7); }
+    if (tino > 0) { ext2_write_at(tino, 0, eb, 138); ext2_sync(); }
+    kprintln("exec: running /bin/envtest", 26);
+    sh_exec("run /bin/envtest", 16);
+
     kprintln("exec: selftest done", 19);
     return 0;
 }

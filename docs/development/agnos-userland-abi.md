@@ -165,7 +165,7 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
 | 34 | `uname` | buf | len (≥64) | — | — | 0 / -1 | writes the 64-byte identity struct (§4.3) into `buf`: sysname/nodename/release/machine. Static boot-time identity. **mihi/iam** (1.42.10) |
 | 35 | `sysinfo` | buf | len (≥40) | — | — | 0 / -1 | writes the 40-byte counters struct (§4.4) into `buf`: uptime_secs / total+free RAM bytes / procs / cpus. Live snapshot; kernel does the unit conversion. **mihi/iam/chakshu** (1.42.10) |
 | 36 | `klog` | buf | len | — | — | bytes / -1 | copies the unified **klug** kernel-log ring (§4.5) into `buf`, oldest→newest; when `len` < the log fill, returns the **newest** `len` bytes (dmesg tail). Returns bytes written. **klug/dmesg tool** (1.42.12) |
-| 37 | `execwait` | path | pathlen | — | — | child exit code / -1 | loads a static ELF64 from the ext2 root, runs it to completion **in ring 3**, returns the child's exit code. Synchronous `elf_load_from_file` + `exec_and_wait` (no preemption); the FIRST such exec from a live ring-3 syscall frame, so the handler preserves the caller's resume context (H1) + runs the child on a disjoint second SYSCALL kstack (H2). No argv/envp yet (path only — the envp bite is a 1.43.x follow-on). **agnsh `run`** (1.43.0) |
+| 37 | `execwait` | path | pathlen | — | — | child exit code / -1 | loads a static ELF64 from the ext2 root, runs it to completion **in ring 3**, returns the child's exit code. Synchronous `elf_load_from_file` + `exec_and_wait` (no preemption); the FIRST such exec from a live ring-3 syscall frame, so the handler preserves the caller's resume context (H1) + runs the child on a disjoint second SYSCALL kstack (H2). `execwait` passes only the program path (no caller-supplied argv); the kernel stages a uniform default envp (`HOME=/`, `PWD=/`) on every exec as of **1.43.2** — see §4.6. **agnsh `run`** (1.43.0) |
 
 **37 `execwait` is IMPLEMENTED (1.43.0)** — the ring-3 blocking-exec primitive that lets a userland shell launch an on-disk program. It is the syscall behind agnoshi's gated `run` builtin (un-gated at agnoshi 1.4.4 by flipping `RUN_EXECWAIT_READY` + routing `process_agnos.cyr`'s `run()` through `syscall(37, path, len)`). Reuses the proven recovery-shell exec path; the novelty is being invoked from a *live ring-3 syscall frame*, handled by snapshotting the caller's resume-context globals + swapping to a disjoint second syscall kstack (`0x3D0000`) for the nested child. `EXEC_SELFTEST`'s `/bin/exwv` gates the full ring-3-caller path.
 
@@ -256,6 +256,22 @@ All-u64 (no sub-word fields → no Cyrius struct-padding ambiguity, same rule §
 - When `len` < the current ring fill, returns the **newest** `len` bytes (the dmesg tail) so a small buffer still shows the most recent lines.
 - The ring wraps at 16 KB (old lines age out); the kernel unwraps oldest→newest so the userland reader always sees chronological order regardless of the wrap point.
 - Leveled lines carry an `[I]`/`[W]`/`[E]` prefix (from `klog_info`/`klog_warn`/`klog_err`) — the userland `klug`/`dmesg` tool greps on that prefix (the kernel does **no** filtering: it unifies the log; grep stays userland).
+
+### 4.6 exec init stack — argv + envp (1.43.2)
+
+`elf_load_from_file` builds a standard SysV process init stack; `rsp` at entry points at `argc`. cyrius's agnos runtime captures it as `_agnos_init_rsp` (`args_agnos.cyr`). Layout (each slot a u64):
+
+| offset from rsp | contents |
+|-----------------|----------|
+| `0` | `argc` (≤ 8) |
+| `8 + i*8` | `argv[i]` → string VA (i = 0 .. argc-1) |
+| `8 + argc*8` | argv NULL terminator |
+| `8 + (argc+1+j)*8` | **`envp[j]`** → `"KEY=VALUE"` string VA (j = 0 .. envc-1) |
+| `8 + (argc+1+envc)*8` | envp NULL terminator |
+| `8 + (argc+2+envc)*8` | auxv `AT_NULL` type (0) |
+| `8 + (argc+3+envc)*8` | auxv `AT_NULL` val (0) |
+
+The `KEY=VALUE` and argv strings live higher in the stack page (`0x3100..0x4000`). **envp (1.43.2):** the kernel stages a uniform default — `envp[0]="HOME=/"`, `envp[1]="PWD=/"` — on every exec (was an empty envp NULL pre-1.43.2). **cyrius half:** `getenv()`'s agnos branch reads `envp[j] = load64(_agnos_init_rsp + 8 + (argc+1+j)*8)` and walks `KEY=VALUE` to NULL — the language-work the cyrius agent owns. Per-process env propagation (threading a caller-supplied env through `execwait`) is a kernel follow-on.
 
 ## 5. Coordination protocol (two-agent)
 

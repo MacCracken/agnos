@@ -169,6 +169,14 @@ if [ "$EXIT42_N" -ge 2 ]; then
 else
     echo "  FAIL: execwait #37 — only $EXIT42_N 'run: exit 42' (exwv did not resume/propagate; H1/H2 regression)"; rc=1
 fi
+# 1.43.2: envp — /bin/envtest reads envp[0][0] (the kernel-staged "HOME=/") and
+# exits with it: 'H' = 0x48 = 72. Proves the exec stack now carries a real envp at
+# the SysV offset cyrius's getenv() reads (and NOT argv — argv0 starts '/' = 47).
+if strings "$LOG" | grep -q "^run: exit 72"; then
+    echo "  PASS: envp — /bin/envtest read kernel-staged envp[0] \"HOME=/\" from ring 3 (exit 72='H')"
+else
+    echo "  FAIL: no 'run: exit 72' (envp not staged / not readable at the SysV offset)"; rc=1
+fi
 # Clean return after BOTH runs — "selftest done" proves exec_and_wait returned
 # into its caller frame each time (multi-run + shell-loop shape).
 if strings "$LOG" | grep -q "^exec: selftest done"; then
