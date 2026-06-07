@@ -5,6 +5,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.42.13] — 2026-06-06 (**klug userland reader — the `klog`#36 consumer ships; a sovereign `dmesg`.** Closes the *Kernel Logs Unified Grep* loop: 1.42.11–12 built the kernel ring + read syscall, this banks the userland tool that dumps it.)
+
+### Added
+
+- **`klug` userland reader** — a new standalone tool (its own repo, `klug` 0.1.0) that dumps the kernel log to stdout via the `klog`#36 syscall: one read drains the full 16 KB ring (oldest→newest). A sovereign `dmesg`. Severity lens `-w`/`-e` keys off the `[I]`/`[W]`/`[E]` prefixes; filtering past that stays the shell's job (`klug | grep panic`) — the kernel UNIFIES, GREP stays userland. Builds `--agnos` (static ELF64, 51 KB) and on Linux dogfoods via `/dev/kmsg`. 11/11 tests.
+- **Banked onto the agnos-fs `/bin`** alongside agnsh/bnrmr/cmdrs via `scripts/stage-tools.sh` (now a 3-tool table). Runnable through the in-kernel recovery shell's `run /bin/klug` exec-from-disk path; the next archaemenid burn validates it as tracker item **H5** (`run /bin/klug` → the boot log re-emits on the FB).
+
+### Changed
+
+- No kernel-logic change — klug consumes the existing `klog`#36 (1.42.12). The kernel binary differs from 1.42.12 only in the `uname`#34 version string (`_AGNOS_VERSION` → 1.42.13, regenerated `kernel/version.cyr`).
+
 ## [1.42.12] — 2026-06-06 (**klug bite 2: the kernel logging layer is complete — leveled logging (`klog_info`/`klog_warn`/`klog_err`) + the `klog`#36 read syscall.** Userland can now read the unified kernel log and grep it; the kernel does no filtering.)
 
 ### Added
