@@ -62,13 +62,13 @@ var ew37_a4 = 0;          # ksyscall_a4 (defense-in-depth)
 var ew37_pid = 0;         # proc_current (agnsh's pid)
 var ew37_cr3 = 0;         # agnsh's CR3 (kpti_user_cr3 the exit stub reloads into CR3)
 var ew37_cpid = 0;        # child pid — MUST be a global (a [rbp-N] local survives via
-                          # the disjoint kstack, but globals are the contract here)
+# the disjoint kstack, but globals are the contract here)
 var ew37_code = 0;        # child exit code captured post-resume
 var ew37_busy = 0;        # re-entrancy guard: 1 while a #37 nested exec is in flight
 var ew37_path[16];        # kernel copy of the caller's path cstr (128 B). elf_load_from_file
-                          # does ext2/NVMe I/O under boot CR3 (the user VA + the NVMe BAR are
-                          # NOT both mapped under one CR3), so the path is copied here from the
-                          # user buffer BEFORE the CR3 switch — mirroring sh_cmd_run's sh_path_buf.
+# does ext2/NVMe I/O under boot CR3 (the user VA + the NVMe BAR are
+# NOT both mapped under one CR3), so the path is copied here from the
+# user buffer BEFORE the CR3 switch — mirroring sh_cmd_run's sh_path_buf.
 
 # Security: a userspace pointer must lie in the user VA window [0x200000, 0x40000000):
 # above the kernel low region (0-2 MB) and below the 1 GB arena ceiling. EVERY
