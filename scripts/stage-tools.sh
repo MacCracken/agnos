@@ -47,7 +47,8 @@ stage_one() {
 }
 
 rc=0
-stage_one bannermanor src/main.cyr bnrmr || rc=1
-stage_one commandress  src/main.cyr cmdrs || rc=1
-stage_one klug         src/main.cyr klug  || rc=1
+stage_one bannermanor src/main.cyr bnrmr    || rc=1
+stage_one commandress  src/main.cyr cmdrs    || rc=1
+stage_one klug         src/main.cyr klug     || rc=1
+stage_one anuenue      src/main.cyr anuenue  || rc=1
 exit $rc
