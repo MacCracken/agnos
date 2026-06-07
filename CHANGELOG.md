@@ -17,7 +17,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - **CUP `ESC[r;cH` / `…f`** → cursor positioning (1-based → 0-based, clamped to the grid).
   - Unsupported sequences (cursor moves, EL, bold/underline attrs) no-op rather than mis-render — extend as tools need them.
 - **Pixel-format-aware colour packing** (`fb_pack`) — honours EFI BGRX (pf 1) vs RGBX (pf 0) so real colours land on the right channels (white/black were symmetric, which is why the old fixed `FB_FG`/`FB_BG` worked under both). Current fg/bg are stored pre-packed, so no per-pixel cost is added.
-- **`FB_ANSI_SELFTEST` parser gate** (`scripts/fb-ansi-smoke.sh`) — feeds escape sequences through `fb_ansi_feed` and asserts the resulting colour/cursor **state** via serial markers (no pixel inspection): **9/9** checks pass (16-colour/reset/256/truecolour fg+bg, CUP, ED-2J-home). Full **sweep 7/7** — the parser sits in every output path with zero regression to normal text. Iron rides the next burn.
+- **`FB_ANSI_SELFTEST` parser gate** (`scripts/fb-ansi-smoke.sh`) — feeds escape sequences through `fb_ansi_feed` and asserts the resulting colour/cursor **state** via serial markers (no pixel inspection): **9/9** checks pass (16-colour/reset/256/truecolour fg+bg, CUP, ED-2J-home). Full **sweep 7/7** — the parser sits in every output path with zero regression to normal text.
+- **`FB_ANSI_VISUAL` screendump gate** (`scripts/fb-ansi-screendump.sh`) — paints colour swatches through the real `fb_putc` render path + halts; a QEMU screendump (1280×800, pf=1 BGRX) **visually confirmed** all modes paint correctly: 16-colour + bright, the 256-cube rainbow bar (anuenue's path), bg-colour swatches, truecolour, and a clean `ESC[2J` screen. Iron rides the next burn.
 
 ### Changed
 

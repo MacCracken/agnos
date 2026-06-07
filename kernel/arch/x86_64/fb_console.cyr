@@ -839,3 +839,54 @@ fn fb_ansi_selftest() {
     return 0;
 }
 #endif
+
+#ifdef FB_ANSI_VISUAL
+# 1.43.1 — VISUAL render of the ANSI console for a QEMU screendump (compile-gated,
+# separate from the headless parser selftest). Paints colour swatches through the
+# REAL render path (fb_putc → fb_ansi_feed → coloured glyphs) then cli/hlt-loops so
+# the framebuffer stays static for capture. Run via scripts/fb-ansi-screendump.sh.
+fn fb_puts0(s) {
+    var i = 0;
+    while (load8(s + i) != 0) { fb_putc(load8(s + i)); i = i + 1; }
+    return 0;
+}
+fn fb_emit_dec(n) {
+    if (n >= 100) { fb_putc(0x30 + (n / 100)); }
+    if (n >= 10)  { fb_putc(0x30 + ((n / 10) % 10)); }
+    fb_putc(0x30 + (n % 10));
+    return 0;
+}
+# Emit `ESC[38;5;<n>m` (256-colour foreground select).
+fn fb_fg256(n) {
+    fb_putc(0x1B); fb_putc(0x5B);
+    fb_putc(0x33); fb_putc(0x38); fb_putc(0x3B); fb_putc(0x35); fb_putc(0x3B);  # "38;5;"
+    fb_emit_dec(n);
+    fb_putc(0x6D);   # 'm'
+    return 0;
+}
+fn fb_ansi_visual() {
+    fb_puts0("\x1b[2J\x1b[H");
+    fb_puts0("AGNOS 1.43.1  --  FB ANSI / CSI / SGR console\n\n");
+    fb_puts0("16-color:  \x1b[31mRED \x1b[32mGREEN \x1b[33mYELLOW \x1b[34mBLUE \x1b[35mMAGENTA \x1b[36mCYAN\x1b[0m\n");
+    fb_puts0("bright:    \x1b[91mRED \x1b[92mGREEN \x1b[93mYELLOW \x1b[94mBLUE \x1b[95mMAGENTA \x1b[96mCYAN\x1b[0m\n\n");
+    # 256-colour rainbow gradient bar (the path anuenue's lolcat rainbow drives) —
+    # a hand-picked sweep through the 6x6x6 cube, each cell a solid block.
+    fb_puts0("256 cube:  ");
+    fb_fg256(196); fb_putc(0x23); fb_fg256(202); fb_putc(0x23); fb_fg256(208); fb_putc(0x23);
+    fb_fg256(214); fb_putc(0x23); fb_fg256(220); fb_putc(0x23); fb_fg256(226); fb_putc(0x23);
+    fb_fg256(190); fb_putc(0x23); fb_fg256(154); fb_putc(0x23); fb_fg256(118); fb_putc(0x23);
+    fb_fg256(82);  fb_putc(0x23); fb_fg256(46);  fb_putc(0x23); fb_fg256(48);  fb_putc(0x23);
+    fb_fg256(50);  fb_putc(0x23); fb_fg256(51);  fb_putc(0x23); fb_fg256(45);  fb_putc(0x23);
+    fb_fg256(39);  fb_putc(0x23); fb_fg256(33);  fb_putc(0x23); fb_fg256(27);  fb_putc(0x23);
+    fb_fg256(21);  fb_putc(0x23); fb_fg256(57);  fb_putc(0x23); fb_fg256(93);  fb_putc(0x23);
+    fb_fg256(129); fb_putc(0x23); fb_fg256(165); fb_putc(0x23); fb_fg256(201); fb_putc(0x23);
+    fb_puts0("\x1b[0m\n\n");
+    fb_puts0("bg test:   \x1b[41;97m RED-BG \x1b[0m \x1b[42;30m GREEN-BG \x1b[0m \x1b[44;97m BLUE-BG \x1b[0m\n\n");
+    fb_puts0("truecolor: \x1b[38;2;255;128;0mORANGE 255,128,0\x1b[0m   \x1b[38;2;128;0;255mVIOLET 128,0,255\x1b[0m\n\n");
+    fb_puts0("clear (ESC[2J) + cursor (ESC[H) work; this screen IS the ESC[2J result.\n");
+    serial_println("fb-ansi-visual: painted swatches, halting for screendump", 56);
+    # Freeze: cli + hlt loop so nothing else paints over the swatches.
+    while (1 == 1) { asm { 0xFA; 0xF4; } }
+    return 0;
+}
+#endif

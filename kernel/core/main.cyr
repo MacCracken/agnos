@@ -35,6 +35,12 @@ fb_console_init();
 fb_ansi_selftest();
 #endif
 
+#ifdef FB_ANSI_VISUAL
+# 1.43.1 — VISUAL: paint colour swatches through the real render path + halt, so a
+# QEMU screendump captures them. Halts here (does not continue boot).
+fb_ansi_visual();
+#endif
+
 print_agnos_kernel_banner();
 kprintln("64-bit long mode", 16);
 

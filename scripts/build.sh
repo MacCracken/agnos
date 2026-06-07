@@ -167,6 +167,7 @@ else
         [ -n "$EXT2_EXTENT_WRITE_SELFTEST" ] && echo '#define EXT2_EXTENT_WRITE_SELFTEST'
         [ -n "$EXEC_SELFTEST" ]      && echo '#define EXEC_SELFTEST'
         [ -n "$FB_ANSI_SELFTEST" ]   && echo '#define FB_ANSI_SELFTEST'
+        [ -n "$FB_ANSI_VISUAL" ]     && echo '#define FB_ANSI_VISUAL'
         [ -n "$KLUG_SELFTEST" ]      && echo '#define KLUG_SELFTEST'
         [ -n "$FS_SYSCALL_SELFTEST" ] && echo '#define FS_SYSCALL_SELFTEST'
         [ -n "$SYSCALL_HARDEN_SELFTEST" ] && echo '#define SYSCALL_HARDEN_SELFTEST'
