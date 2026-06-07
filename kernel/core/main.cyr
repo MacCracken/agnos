@@ -1487,6 +1487,48 @@ fn exec_disk_selftest() {
         kprintln("reap: mmap-arena 4k-page LEAK", 29);
     }
 
+    # 1.43.x — execwait #37 ring-3 validator (/bin/exwv). exwv is a ring-3 program
+    # that calls execwait(37) on /bin/prog2 (the exit-42 child) and exits with the
+    # code execwait returns. Because exwv runs in ring 3, its execwait(37) is a REAL
+    # SYSCALL, so prog2's own syscalls (write + exit) nest UNDER exwv's live #37
+    # frame — exercising the full ring-3-caller path: H1 (the #37 handler preserves
+    # exwv's kernel resume context across the nested exec, so exwv's OWN exit() still
+    # resumes sh_cmd_run) AND H2 (prog2 runs on the disjoint second kstack
+    # 0x3D0000, so it cannot smash exwv's suspended #37 frame / SYSRET cells on
+    # 0x3F0000). If either failed, exwv could not resume to exit 42. exec-smoke gates
+    # on a SECOND "run: exit 42" (prog2's own direct run above is the first).
+    # No register is held across a 2nd syscall (the kernel handler clobbers
+    # caller-saved r8-r11) — exwv just propagates rax straight into exit.
+    var xi = 0;
+    while (xi < 200) { store8(eb + xi, 0); xi = xi + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 170); store8(eb + 104, 170);                  # p_filesz/memsz = 170
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 — 38 bytes, no jumps: execwait("/bin/prog2",10) then exit(rax)
+    var xc = 120;
+    store8(eb+xc,0x48); store8(eb+xc+1,0xC7); store8(eb+xc+2,0xC0); store8(eb+xc+3,0x25); xc=xc+7;  # mov rax,37 (execwait)
+    store8(eb+xc,0x48); store8(eb+xc+1,0xBF); store8(eb+xc+2,0xA0); store8(eb+xc+4,0x40); xc=xc+10; # movabs rdi,0x4000A0 (path VA)
+    store8(eb+xc,0x48); store8(eb+xc+1,0xC7); store8(eb+xc+2,0xC6); store8(eb+xc+3,0x0A); xc=xc+7;  # mov rsi,10 (pathlen)
+    store8(eb+xc,0x0F); store8(eb+xc+1,0x05); xc=xc+2;                                              # syscall (execwait) -> rax=child code
+    store8(eb+xc,0x48); store8(eb+xc+1,0x89); store8(eb+xc+2,0xC7); xc=xc+3;                        # mov rdi,rax (child code -> exit arg)
+    store8(eb+xc,0x48); store8(eb+xc+1,0xC7); store8(eb+xc+2,0xC0); store8(eb+xc+3,0x00); xc=xc+7;  # mov rax,0 (exit)
+    store8(eb+xc,0x0F); store8(eb+xc+1,0x05); xc=xc+2;                                              # syscall — exit(child code)
+    # path "/bin/prog2" @160 (VA 0x4000A0)
+    store8(eb+160,0x2F); store8(eb+161,0x62); store8(eb+162,0x69); store8(eb+163,0x6E);            # "/bin"
+    store8(eb+164,0x2F); store8(eb+165,0x70); store8(eb+166,0x72); store8(eb+167,0x6F);            # "/pro"
+    store8(eb+168,0x67); store8(eb+169,0x32);                                                       # "g2"
+    var xvino = 0;
+    if (bino > 0) { xvino = ext2_create(bino, "exwv", 4); }
+    if (xvino > 0) { ext2_write_at(xvino, 0, eb, 170); ext2_sync(); }
+    kprintln("exec: running /bin/exwv", 23);
+    sh_exec("run /bin/exwv", 13);
+
     kprintln("exec: selftest done", 19);
     return 0;
 }

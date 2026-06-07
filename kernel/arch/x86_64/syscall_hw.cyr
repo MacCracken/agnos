@@ -8,6 +8,22 @@ var kernel_rsp_save = 0;
 # image (corruption / read-only push fault). Allocated once in syscall_init from
 # a fresh 2 MB region; the stub switches RSP here on entry from ring 3.
 var syscall_kstack_top = 0;
+# 1.43.x execwait #37: a SECOND, disjoint SYSCALL kernel stack for the nested
+# exec_and_wait(child). execwait is the first exec_and_wait ever invoked FROM a
+# live ring-3 SYSCALL frame (agnsh). While agnsh's #37 handler is suspended in
+# exec_and_wait, the child's OWN syscalls re-enter the stub and reload
+# rsp=syscall_kstack_top — if that were still 0x3F0000 they'd grow down through
+# agnsh's suspended #37 frame AND the stub-pushed SYSRET rcx/r11/rbp cells (which
+# have no global mirror), so agnsh would resume on smashed control state. The #37
+# handler swaps syscall_kstack_top to THIS second top for the nested run; the swap
+# is baked into the child's stub by exec_and_wait's own syscall_init() rebuild, so
+# the child grows down a DIFFERENT page (0x3D0000) and never touches agnsh's frame.
+# Fixed at 0x3D0000: top of kernel-reserved region 1 (0x200000-0x400000, boot
+# identity 2 MB map, mirrored into every per-process CR3), 0x20000 (128 KB) below
+# the primary 0x3F0000 — far above the kernel image and far below 0x3F0000, so
+# neither stack overlaps. No alloc (same determinism rationale as 0x3F0000 above;
+# a pmm_alloc_2mb would reintroduce the QEMU↔iron next-free flake 1.40.9 fixed).
+var syscall_kstack_top2 = 0x3D0000;
 # Saved kernel context for returning from user mode on exit
 var kernel_return_rsp = 0;
 var kernel_return_rip = 0;

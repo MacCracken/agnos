@@ -5,6 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.0] — 2026-06-07
+
+**1.43.x arc OPEN — graphics path + the first real userland app ("agnsh launches DOOM").** The non-threading half: ring-3 blocking exec, a framebuffer/blit syscall, a ring-3 timing face, `envp`, and `cyrius-doom --agnos`. Bite 1 is **`execwait` (#37)** — the ring-3 blocking-exec primitive that un-gates agnoshi's `run` builtin (agnoshi 1.4.3's `RUN_EXECWAIT_READY`) and is the foundation for agnsh launching any on-disk program.
+
+### Added
+
+- **`execwait` (syscall #37) — blocking ring-3 exec** (`core/syscall.cyr`, `arch/x86_64/syscall_hw.cyr`). `execwait(path, pathlen)` loads a static ELF64 from the active ext2 root, runs it to completion in ring 3, and returns the child's exit code (or -1). It reuses the proven synchronous `elf_load_from_file` + `exec_and_wait` model (the in-kernel recovery shell's `run`) — **no scheduler, no preemption** — but is the FIRST `exec_and_wait` invoked from a *live ring-3 SYSCALL frame* (the caller, e.g. agnsh, is itself a process exec'd by its parent). That introduces two hazards a from-kernel caller never had, both handled in the handler:
+  - **(H1) resume-context preservation.** The nested `exec_and_wait` overwrites the single-slot resume globals (`exec_ctx` + `kernel_return_*` + `kpti_*` + `kernel_rsp_save`) that hold the *caller's parent's* armed frame — the frame the caller's OWN `exit()` must longjmp into. The handler snapshots all of them before the nested exec and restores them (re-arming `kernel_return_rsp`) after the child exits, so the caller's later `exit()` still resumes its parent.
+  - **(H2) disjoint syscall kstack.** The kernel uses one fixed SYSCALL stack (`0x3F0000`); the child's own syscalls would grow down through the caller's suspended #37 frame AND its stub-pushed SYSRET `rcx`/`r11`/`rbp` cells (which have no global mirror). The handler swaps `syscall_kstack_top` to a **second, disjoint kstack** (`syscall_kstack_top2 = 0x3D0000`) for the nested run — `exec_and_wait`'s own `syscall_init()` rebuild bakes the swap into the child's stub — then restores + rebuilds for the caller on resume. No SYSCALL-stub hot-path opcode change: the existing rebuild does the work.
+  - Runs `elf_load_from_file` (ext2/NVMe I/O) under the **boot CR3** (`0x1000`), since the per-process CR3 doesn't map the NVMe BAR; the path is copied into a kernel buffer first (while the caller's CR3 + SMAP AC are live), mirroring `sh_cmd_run`'s `sh_path_buf`. A re-entrancy guard (`ew37_busy`) refuses a child that itself calls `execwait` (single-slot save = one level; recursive exec waits on the multithreading arc).
+- **`/bin/exwv` ring-3 validator** (`core/main.cyr`, gated by `EXEC_SELFTEST`). A ring-3 program that `execwait`s `/bin/prog2` and propagates its code — so prog2's syscalls nest under exwv's live #37 frame, exercising the full ring-3-caller path (H1 + H2), not just dispatch. `scripts/exec-smoke.sh` gates on a SECOND `run: exit 42` (count == 2) + clean `selftest done`. **QEMU sweep 7/7**, exec-smoke green; iron rides the next burn.
+
+### Notes
+
+- **`envp` + argv-to-children** are a deliberate follow-on bite (the exec ABI gains an env array; kybernet seeds HOME/PWD). `execwait(path, pathlen)` passes only the program path for now (`sys_spawn`/from-disk exec have never staged envp), matching agnoshi `run`'s existing "args not passable on agnos yet."
+- **agnoshi un-gate** (1.4.4, separate cut, AFTER this lands on iron): swap `process_agnos.cyr`'s `run()` onto `sys_execwait(path,len)` + flip `RUN_EXECWAIT_READY = 1`.
+
 ## [1.42.14] — 2026-06-06 (**hardening / audit / security sweep — pre-burn.** A multi-dimension security audit of the agnos kernel's attack surface, the 1.42.x additions in focus: the new struct-write syscalls (`uname`#34 / `sysinfo`#35 / `klog`#36), the perf rewrites (PMM inline + no-op spinlock, multi-LBA fs-read, fb-blit), the klug ring, and the ring-3→ring-0 ingress. Findings + fixes land below as they confirm; rides the existing 1.42.x H1–H5 ride-along burn.)
 
 ### Security

@@ -1,15 +1,19 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> **Last Updated**: 2026-06-04 (v1.41.11 — surface is now **0–33, 34 syscalls**; the 1.41.x shell-separation arc added the FS-syscall surface `agnsh` needs)
+> **Last Updated**: 2026-06-07 (v1.43.0 — surface is now **0–37, 38 syscalls**; the 1.43.x graphics/userland-app arc added `execwait`#37)
 >
-> The 26-call kybernet surface (0–25) was complete at v1.21.0; kybernet (currently v1.2.1) runs on AGNOS as PID 1. The dispatch table has since grown to **34 entries (0–33)** in three rounds:
+> The 26-call kybernet surface (0–25) was complete at v1.21.0; kybernet (currently v1.2.1) runs on AGNOS as PID 1. The dispatch table has since grown to **38 entries (0–37)** in these rounds:
 > - slot **26** `write_boot_checkpoint(byte)` — a CMOS-write diagnostic added during iron-boot bring-up (🩺 not part of the userland shell surface);
 > - slot **27** `mmap(length)` (anonymous, 2 MB-granular memory; v1.35.3) + slot **28** `munmap(addr, length)` (its pair; v1.35.4);
-> - slots **29–33** + the `open`(7) re-route + the `mkdir`(9)/`rmdir`(10)/`sync`(12) made-real + the **`a4=r10`** 4th-arg ABI extension, all at **v1.41.3** — the FS-syscall buildout for the shell-separation arc (see below).
+> - slots **29–33** + the `open`(7) re-route + the `mkdir`(9)/`rmdir`(10)/`sync`(12) made-real + the **`a4=r10`** 4th-arg ABI extension, all at **v1.41.3** — the FS-syscall buildout for the shell-separation arc (see below);
+> - slots **34 `uname` / 35 `sysinfo`** (sovereign sysinfo structs; v1.42.10) + **36 `klog`** (klug log-ring read; v1.42.12) — see [`agnos-userland-abi.md`](agnos-userland-abi.md) §3/§4 for the struct/contract detail;
+> - slot **37 `execwait(path, pathlen)`** (v1.43.0) — the ring-3 blocking-exec primitive (synchronous `elf_load_from_file` + `exec_and_wait`, caller-resume-context preserved + disjoint second SYSCALL kstack for the nested child); the syscall behind agnoshi's `run` builtin.
 >
 > **Status**: This doc is the implementation reference for the v1.21.0 kybernet buildout (the tier-by-tier history below) plus the later additions. **The canonical current surface is the `ksyscall` dispatch in `kernel/core/syscall.cyr`** (every `if (num == N)`); the normative interface contract is [`agnos-userland-abi.md`](agnos-userland-abi.md); the live snapshot is [`state.md`](state.md). The 26-call kybernet set was untouched through the entire v1.27.x → v1.34.x arc — security hardening (S1-S13 13/13 at v1.28.0), the Path-C sovereign-struct kernel ABI break (v1.30.0), native xHCI + USB-HID-boot (v1.30.x), the storage stack (v1.31.x), networking (v1.32.x), and the ext2/4 + FAT-family **write** arcs (v1.33.x / v1.34.x) all reused it. The first *new functional* syscalls since v1.21.0 were `mmap` (27, v1.35.3) + `munmap` (28, v1.35.4) — a pure memory facility. The big expansion is **v1.41.3's FS surface** (slots 29–33 + the `open`/`mkdir`/`rmdir`/`sync` upgrades), the syscalls the userland `agnsh` shell (exec'd from disk in ring 3 at v1.41.4) needs to reach the mount-routed VFS now that the interactive shell lives in userland. API expansion stays deliberate.
 
-## Current Surface — 0–33 (34 syscalls)
+## Current Surface — 0–37 (38 syscalls)
+
+> Rows 34–37 (`uname`/`sysinfo`/`klog`/`execwait`) are catalogued in [`agnos-userland-abi.md`](agnos-userland-abi.md) §3.2; the table below predates them — the `ksyscall` dispatch in `kernel/core/syscall.cyr` is canonical.
 
 The live `ksyscall` dispatch in `kernel/core/syscall.cyr`. `a1/a2/a3/a4` give argument meaning; `→` is the return (`rax` ≥ 0 on success, `-1`/`0-1` on error — **AGNOS does not use Linux `-errno`**). Argument calling convention is `rdi`/`rsi`/`rdx` for `a1`/`a2`/`a3`, and (since v1.41.3) **`r10` for `a4`** — see the ABI extension note. "🩺" = kernel-diagnostic-only, not part of the userland shell surface; "🔧" = stub (number reserved, returns a constant). Normative contract: [`agnos-userland-abi.md`](agnos-userland-abi.md).
 

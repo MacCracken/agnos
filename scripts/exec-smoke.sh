@@ -150,6 +150,25 @@ if strings "$LOG" | grep -q "^run: exit 200"; then
 else
     echo "  FAIL: no 'run: exit 200' (klog#36 didn't copy the requested ring bytes to userland)"; rc=1
 fi
+# 1.43.x: execwait #37 — /bin/exwv is a RING-3 program that calls execwait(37) on
+# /bin/prog2 and exits with the returned code. Because exwv runs in ring 3, its
+# execwait is a real SYSCALL and prog2's own syscalls nest under exwv's live #37
+# frame — so this exercises the full ring-3-caller path (H1 resume-context
+# save/restore + H2 disjoint second kstack), not just dispatch. The gate is a
+# SECOND "run: exit 42": prog2's direct run above prints the first; exwv resuming
+# correctly across the nested exec and propagating prog2's code prints the second.
+# If H1/H2 were broken, exwv would fault/hang/wrong-exit and this count stays at 1.
+if strings "$LOG" | grep -q "^exec: running /bin/exwv"; then
+    echo "  PASS: execwait #37 — /bin/exwv (ring-3 caller) dispatched"
+else
+    echo "  FAIL: /bin/exwv not attempted (execwait validator missing)"; rc=1
+fi
+EXIT42_N=$(strings "$LOG" | grep -c "^run: exit 42")
+if [ "$EXIT42_N" -ge 2 ]; then
+    echo "  PASS: execwait #37 — exwv resumed across the nested exec + propagated prog2's exit 42 (count=$EXIT42_N)"
+else
+    echo "  FAIL: execwait #37 — only $EXIT42_N 'run: exit 42' (exwv did not resume/propagate; H1/H2 regression)"; rc=1
+fi
 # Clean return after BOTH runs — "selftest done" proves exec_and_wait returned
 # into its caller frame each time (multi-run + shell-loop shape).
 if strings "$LOG" | grep -q "^exec: selftest done"; then
