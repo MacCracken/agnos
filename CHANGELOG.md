@@ -5,6 +5,60 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.6] — 2026-06-08
+
+**DOOM renders on AGNOS — the first real userland application.** The 1.43.x arc
+finale: `cyrius-doom --agnos` (0.28.2) exec's from disk in ring 3, slurps the
+4.2 MB `DOOM1.WAD` into memory, parses it, and blits a 240-colour title screen to
+the framebuffer via `fbinfo`#38 / `blit`#39 — "agnsh launches DOOM." Validated by
+`scripts/doom-smoke.sh` (gnoboot+OVMF+NVMe, ring-3 exec, WAD load, non-blank
+framebuffer screendump). Two kernel changes carried a memory-hungry app the kernel
+had never run before.
+
+### Changed
+
+- **PMM 2 MB pool 16 MB → 128 MB** (`kernel/core/pmm.cyr`, committed as the
+  "heap fix" bite). The old pool (4096 pages, ~12 MB usable, six 2 MB regions)
+  couldn't satisfy DOOM's ~24 MB (a 4.2 MB WAD as one contiguous `alloc` + zone
+  + scaled framebuffer). Surgical enlargement: `pmm_total = 32768`,
+  `pmm_alloc_2mb` / `pmm_count_2mb_free` scan regions `r = 1..63`,
+  `pmm_page_valid` ceiling 32768, `memset(&pmm_bitmap, 0, 4096)` — the **4 KB
+  allocator (`pmm_alloc`) is unchanged at `4095`-down**, so page tables / slabs
+  stay in 4–16 MB and the 1.41.12 anti-fragmentation invariant holds.
+  `pmm_bitmap[512]` was already 4096 bytes (8N module-scope convention); only the
+  constants moved. agnsh boots with 31727 free pages (was ~3072).
+
+### Fixed
+
+- **Per-process CR3 now maps the whole PMM range** (`kernel/core/proc.cyr`).
+  `sys_mmap` zero-fills a freshly-allocated 2 MB region via its **identity**
+  address (`memset(phys, 0, 2 MB)`) under the per-process CR3 — but that CR3
+  inherited a boot identity map covering only **0–16 MB** (PD[0..7]). With the
+  enlarged pool, a 2 MB region at phys ≥16 MB faulted **ring-0 #PF → #DF** (the
+  exact mechanism behind DOOM's 4.2 MB WAD-alloc crash; pinned via `qemu -d int`:
+  `e=0002 cpl=0 CR2=0x011f0000`). `proc_create_address_space` now also maps
+  **PD[8..63] = 16–128 MB as identity-supervisor 2 MB pages** after the PD[0..127]
+  copy, so the kernel can reach the entire pool. U/S=0 keeps ring 3 out; user
+  code/stack live in PD[2]/PD[4] and the mmap arena in PD[128+], so no user VA
+  aliases these slots. Sweep 7/7 (no exec / FS regression).
+- **exec-smoke `sysi` gate** now expects exit **73** (was 66) — the `/bin/sysi`
+  validator derives its exit code from `sysinfo`'s `totalram`, which legitimately
+  changed from the 16 MB to the 128 MB pool.
+
+### Known issues — workaround in place, NOT yet repaired
+
+- **First-`mmap`-return RIP=0 (kernel SYSRET-path bug).** The FIRST `mmap` syscall
+  from a freshly-exec'd ring-3 process returns with a corrupted ring-3 register /
+  return state — the process faults at **RIP=0, RBP=0** immediately after
+  `alloc_init`'s first `mmap` (`-d int`: `v=0e e=0015 cpl=3 RIP=0`, kernel values
+  left in RDI/RSI). agnsh is unaffected because its first syscall is a `write`.
+  **cyrius-doom 0.28.2 carries a one-line warm-up `mmap` workaround** (a throwaway
+  `mmap` before `alloc_init` so the real heap `mmap` is the second syscall) — this
+  is *not* a kernel fix and **needs further repair**. Next: `-d int` a minimal
+  first-`mmap` repro and fix the SYSRET return-state restore in the kernel, then
+  remove the doom probe. Tracked in
+  `docs/development/planning/doom-on-agnos-render-blockers.md`.
+
 ## [1.43.5] — 2026-06-08
 
 **Ring-3 timing — a monotonic clock + a working sleep.** The 1.43.x arc's third graphics-path bite: a ring-3 program can now read elapsed time and pace itself, the frame clock + `tick_wait` substrate for `cyrius-doom --agnos`. The genuinely hard part wasn't the read — it was making time *advance* for a ring-3 loop in AGNOS's no-preempt model, where user code runs `IF=0` (so `timer_ticks` is frozen during ring-3 compute) and a naive `hlt` is the `waitpid` hard-hang. The fix mirrors `kbd_read_blocking`'s proven recipe.
