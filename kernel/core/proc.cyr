@@ -214,6 +214,18 @@ fn proc_create_address_space() {
         var entry = load64(0x3000 + i * 8);
         store64(new_pd + i * 8, entry);
     }
+    # 1.43.x: the boot identity map the copy above inherits only covers 0-16MB
+    # (PD[0..7]). The PMM 2MB pool now reaches 128MB (regions 8-63 = phys
+    # 16-128MB), and sys_mmap zeroes a freshly-allocated region via its IDENTITY
+    # address — memset(phys, 0, 2MB) — under THIS per-process CR3. A region >=16MB
+    # was therefore unmapped here → ring-0 #PF on the memset → #DF (caught on iron
+    # as cyrius-doom's 4.2MB WAD alloc). Map PD[8..63] = 16-128MB as identity-
+    # SUPERVISOR 2MB pages so the kernel can reach the whole pmm range. U/S=0 keeps
+    # ring 3 out; user code/stack live in PD[2]/PD[4] and the mmap arena in
+    # PD[128+], so no user VA resolves through these slots (no aliasing).
+    for (var hi = 8; hi < 64; hi = hi + 1) {
+        store64(new_pd + hi * 8, (hi * 0x200000) | 0x83);
+    }
     # Direction B (page-map fragility, issue 2026-06-04): leave the mmap-arena
     # PD slots [128..510] — covering [0x10000000, 0x3FE00000), the arena
     # sys_mmap bumps through (base 0x10000000 = mmap_next_vaddr, ceiling
