@@ -229,6 +229,17 @@ fn kbd_read_blocking(buf, count) {
             sched_active = saved_sched;
             return n;
         }
+        if (ch == 4) {                  # Ctrl-D (EOF). Canonical tty semantics:
+            # at line start (n==0) signal end-of-input by returning 0 — this is
+            # the ONLY path by which read(fd 0) can return 0 on agnos, so it's
+            # what lets a stdin filter (anuenue, cat) terminate; without it a
+            # filter loops forever (no pipes, no other EOF). Mid-line (n>0) it
+            # delivers the bytes typed so far WITHOUT a terminating LF, so a
+            # second Ctrl-D at the fresh line start then yields EOF. Not echoed.
+            kbd_irq_disable();
+            sched_active = saved_sched;
+            return n;
+        }
         if (ch == 8) {                  # Backspace: erase one cell + drop one byte
             if (n > 0) {                # (BS SP BS), mirrors shell.cyr:797.
                 n = n - 1;

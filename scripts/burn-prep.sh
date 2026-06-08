@@ -3,8 +3,9 @@
 # 1.39.x VFS + 1.40.x exec iron burn. It:
 #   1. runs the full arc sweep (scripts/sweep.sh) — ALL gates must be green;
 #      a red sweep aborts the prep (don't burn a broken tree);
-#   2. builds the iron EXEC selftest kernel (EXEC_SELFTEST + EXT2_WRITE_SELFTEST)
-#      as build/agnos — the artifact you flash for track A (exec-from-disk);
+#   2. builds build/agnos — the artifact you flash. DEFAULT is a BARE production
+#      kernel (no compile-gated selftests). Set BURN_SELFTESTS=1 to bake the
+#      EXEC_SELFTEST + EXT2_WRITE_SELFTEST validation suites back in;
 #   3. prints freshness (size + mtime) and the exact flash + watch steps,
 #      pointing at docs/development/exec-iron-manual-tests.md (in agnosticos).
 #
@@ -40,9 +41,21 @@ else
     echo ""
 fi
 
-# --- 2. Build the iron EXEC selftest kernel (the track-A artifact) -----------
-echo "[2/2] Building the iron EXEC selftest kernel (EXEC_SELFTEST + EXT2_WRITE_SELFTEST)..."
-if ! env EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 sh scripts/build.sh >/tmp/burn-prep-build.log 2>&1; then
+# --- 2. Build the kernel -----------------------------------------------------
+# Default is a BARE production kernel — no compile-gated selftests baked in. The
+# selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
+# ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
+# Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
+if [ -n "${BURN_SELFTESTS:-}" ]; then
+    echo "[2/2] Building the iron EXEC selftest kernel (BURN_SELFTESTS: EXEC_SELFTEST + EXT2_WRITE_SELFTEST)..."
+    BUILD_ENV="EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1"
+    BUILD_TAG="EXEC_SELFTEST"
+else
+    echo "[2/2] Building the BARE production kernel (no selftests — set BURN_SELFTESTS=1 to re-enable)..."
+    BUILD_ENV=""
+    BUILD_TAG="bare"
+fi
+if ! env $BUILD_ENV sh scripts/build.sh >/tmp/burn-prep-build.log 2>&1; then
     echo "burn-prep: BUILD-FAIL (see /tmp/burn-prep-build.log)"
     exit 1
 fi
@@ -50,7 +63,7 @@ fi
 SZ="$(stat -c %s build/agnos 2>/dev/null)"
 MT="$(stat -c %y build/agnos 2>/dev/null | cut -d. -f1)"
 VER="$(cat VERSION 2>/dev/null)"
-echo "  build/agnos: $SZ bytes, built $MT  (AGNOS $VER, EXEC_SELFTEST)"
+echo "  build/agnos: $SZ bytes, built $MT  (AGNOS $VER, $BUILD_TAG)"
 echo ""
 
 # --- Flash + watch instructions ---------------------------------------------
