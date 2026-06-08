@@ -5,6 +5,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.7] — 2026-06-08
+
+**`execwait`#37 carries argv — `run /bin/<prog> arg…` passes its arguments.** Iron
+burn `1436` showed every ring-3 launch *with an argument* failing `run: failed to
+launch program` (arg-less launches worked). Root cause: the `execwait`#37 handler
+called `elf_load_from_file(pdst, arg2, pdst, arg2)` — using the *whole* command line
+(e.g. `"/bin/bnrmr AGNOS"`, len 16) as BOTH the file-open name AND the argv source.
+`elf_load_from_file` already tokenizes argv from a separate `(argv_src, argv_len)`;
+only the file open needed to stop at the path token. So the open ENOENT'd on the
+16-byte literal `"/bin/bnrmr AGNOS"` and returned -1, while a space-free
+`run /bin/bnrmr` resolved the real inode and ran.
+
+### Fixed
+
+- **`core/syscall.cyr` `execwait`#37 splits the path token from argv.** Before calling
+  `elf_load_from_file`, scan the copied command line to the first space (skipping any
+  leading spaces, matching the tokenizer's own behavior) → open **that path token**
+  while still passing the **whole line** as `argv_src`. The kernel-side argv staging
+  (`core/elf.cyr`, ≤8 space-split args) is unchanged. This makes #37 mirror the proven
+  in-kernel recovery-shell `sh_cmd_run` split (`user/shell.cyr`), which already passed
+  `run /bin/argv Z` → exit 90. An all-spaces / empty path token fails closed (-1). No
+  space-rejecting guard was added anywhere — spaces must flow through. Consumed by
+  agnoshi 1.4.7's `src/run_agnos.cyr` (`sh_exec_line` hands the whole `"PATH args"`
+  line to `execwait`).
+
+### Verified
+
+- **Positive argv-through-#37 test:** the `EXEC_SELFTEST` `/bin/exwv` ring-3 validator
+  (`core/main.cyr`) now execwaits **`/bin/argv Z`** (an arg-bearing child) instead of
+  the no-arg `/bin/prog2`, so it proves H1/H2 nested-exec resume **and** the argv split
+  in one shot: the #37 handler opens `/bin/argv` and stages `argv[1]="Z"`, and
+  `/bin/argv` exits `argv[1][0]='Z'=90`. exec-smoke gates on a second `run: exit 90`
+  (`scripts/exec-smoke.sh`). **exec-smoke 13/13, `sweep.sh` 7/7.** The `#37` split is
+  unconditional (in the bare production burn kernel); the `exwv`-carries-argv change is
+  `EXEC_SELFTEST`-gated (not in the burn artifact). Rides the next iron burn.
+
 ## [1.43.6] — 2026-06-08
 
 **DOOM renders on AGNOS — the first real userland application.** The 1.43.x arc
