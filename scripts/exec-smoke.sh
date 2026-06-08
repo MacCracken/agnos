@@ -151,23 +151,26 @@ else
     echo "  FAIL: no 'run: exit 200' (klog#36 didn't copy the requested ring bytes to userland)"; rc=1
 fi
 # 1.43.x: execwait #37 — /bin/exwv is a RING-3 program that calls execwait(37) on
-# /bin/prog2 and exits with the returned code. Because exwv runs in ring 3, its
-# execwait is a real SYSCALL and prog2's own syscalls nest under exwv's live #37
-# frame — so this exercises the full ring-3-caller path (H1 resume-context
-# save/restore + H2 disjoint second kstack), not just dispatch. The gate is a
-# SECOND "run: exit 42": prog2's direct run above prints the first; exwv resuming
-# correctly across the nested exec and propagating prog2's code prints the second.
-# If H1/H2 were broken, exwv would fault/hang/wrong-exit and this count stays at 1.
+# "/bin/argv Z" (a child WITH an argument) and exits with the returned code. Because
+# exwv runs in ring 3, its execwait is a real SYSCALL and /bin/argv's own syscalls
+# nest under exwv's live #37 frame — so this exercises the full ring-3-caller path
+# (H1 resume-context save/restore + H2 disjoint second kstack), not just dispatch.
+# Passing an ARG also validates the 1436-burn argv fix: the #37 handler must open the
+# path TOKEN ("/bin/argv") while staging the whole line as argv, so /bin/argv sees
+# argv[1]="Z" and exits argv[1][0]='Z'=90. The gate is a SECOND "run: exit 90": the
+# direct "run /bin/argv Z" above prints the first; exwv resuming correctly across the
+# nested exec AND carrying argv through #37 prints the second. If H1/H2 or the argv
+# split were broken, exwv would fault/hang/wrong-exit and this count stays at 1.
 if strings "$LOG" | grep -q "^exec: running /bin/exwv"; then
     echo "  PASS: execwait #37 — /bin/exwv (ring-3 caller) dispatched"
 else
     echo "  FAIL: /bin/exwv not attempted (execwait validator missing)"; rc=1
 fi
-EXIT42_N=$(strings "$LOG" | grep -c "^run: exit 42")
-if [ "$EXIT42_N" -ge 2 ]; then
-    echo "  PASS: execwait #37 — exwv resumed across the nested exec + propagated prog2's exit 42 (count=$EXIT42_N)"
+EXIT90_N=$(strings "$LOG" | grep -c "^run: exit 90")
+if [ "$EXIT90_N" -ge 2 ]; then
+    echo "  PASS: execwait #37 — exwv resumed across the nested exec + carried argv through #37 (run: exit 90 count=$EXIT90_N)"
 else
-    echo "  FAIL: execwait #37 — only $EXIT42_N 'run: exit 42' (exwv did not resume/propagate; H1/H2 regression)"; rc=1
+    echo "  FAIL: execwait #37 — only $EXIT90_N 'run: exit 90' (exwv did not resume/propagate, or argv was dropped through #37)"; rc=1
 fi
 # 1.43.2: envp — /bin/envtest reads envp[0][0] (the kernel-staged "HOME=/") and
 # exits with it: 'H' = 0x48 = 72. Proves the exec stack now carries a real envp at

@@ -855,8 +855,31 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # argv[0] = the path, matches sh_cmd_run). On failure nothing else was
         # clobbered (no exec_and_wait, no kstack swap) — restore the caller CR3,
         # clear the guard, return -1.
+        #
+        # 1.43.x argv: the caller's buffer pdst[0..arg2) is the WHOLE command line
+        # ("PATH arg1 arg2 .."). elf_load_from_file opens the file by (path,namelen)
+        # but tokenizes argv from a SEPARATE (argv_src,argv_len) — so the file open
+        # must use the PATH TOKEN ONLY (up to the first space) while the WHOLE line is
+        # passed as argv_src for the elf.cyr space-tokenizer. This mirrors the proven
+        # recovery shell sh_cmd_run (user/shell.cyr:447-455): plen-to-first-space for
+        # the open, whole tail for argv. Before this split the open name was the entire
+        # "PATH arg" string, so `run /bin/bnrmr AGNOS` ENOENT'd on the literal 16-byte
+        # "/bin/bnrmr AGNOS" while bare `run /bin/bnrmr` (no space) worked — exactly the
+        # 1436-burn symptom. Leading-space skip matches the tokenizer's own (elf.cyr:303)
+        # so argv[0] stays the path token regardless of where the open pointer starts.
         cr3_load(0x1000);
-        var cpid = elf_load_from_file(pdst, arg2, pdst, arg2);
+        var ew_ps = 0;
+        while (ew_ps < arg2) { if (load8(pdst + ew_ps) != 32) { break; } ew_ps = ew_ps + 1; }   # skip leading spaces
+        var ew_pe = ew_ps;
+        while (ew_pe < arg2) { if (load8(pdst + ew_pe) == 32) { break; } ew_pe = ew_pe + 1; }     # to first space
+        var ew_plen = ew_pe - ew_ps;
+        if (ew_plen < 1) {                          # empty / all-spaces path token
+            cr3_load(ew37_cr3);
+            ew37_busy = 0;
+            stack_canary_check(canary);
+            return 0 - 1;
+        }
+        var cpid = elf_load_from_file(pdst + ew_ps, ew_plen, pdst, arg2);
         if (cpid < 0) {
             cr3_load(ew37_cr3);
             ew37_busy = 0;
