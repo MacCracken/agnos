@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.5] — 2026-06-08
+
+**Ring-3 timing — a monotonic clock + a working sleep.** The 1.43.x arc's third graphics-path bite: a ring-3 program can now read elapsed time and pace itself, the frame clock + `tick_wait` substrate for `cyrius-doom --agnos`. The genuinely hard part wasn't the read — it was making time *advance* for a ring-3 loop in AGNOS's no-preempt model, where user code runs `IF=0` (so `timer_ticks` is frozen during ring-3 compute) and a naive `hlt` is the `waitpid` hard-hang. The fix mirrors `kbd_read_blocking`'s proven recipe.
+
+### Added
+
+- **`uptime_ms` syscall (#40)** — `uptime_ms()` returns monotonic **milliseconds since boot** in `rax` (no buffer, like `getpid`#2): `timer_ticks * 10` (the 100 Hz PIT/APIC tick = 10 ms/tick). Strictly non-decreasing; the ring-3 frame clock (`DG_GetTicksMs`).
+- **`sleep_ms` syscall (#41)** — `sleep_ms(ms)` blocks the caller ~`ms` ms by halting until the timer advances `timer_ticks` to the target. Because ring 3 runs `IF=0`, this is also the **only** way a ring-3 loop lets time pass (the pacing primitive, `DG_SleepMs`). Recipe: `sched_active=0` (the timer ISR still ticks + EOIs but `do_context_switch` early-returns, so the syscall can't be switched off-stack on this single core) → **`sti` before `hlt`** (an `IF=0` `hlt` is the hard-hang) → `cli` + restore on the way out. `ms` rounds up to whole ticks (sleeps ≥ `ms`), rejects negative, caps at 1 h. `SYSRET` restores the user's `IF=0` from R11 regardless.
+
+### Validated
+
+- **`/bin/timetest`** (`core/main.cyr`, `EXEC_SELFTEST`) reads the clock, sleeps 50 ms, reads again, exits `t1−t0`. The tick delta is exactly 5 (`sl_target = ticks+5`), so the ms delta is a deterministic **50** — and a frozen clock / broken sleep window would instead exit 0. `exec-smoke.sh` gates on `run: exit 50`: **exec-smoke green + sweep 7/7.** Iron rides the next burn.
+- **Adversarial review (2 lenses, 0 findings):** `sleep_ms` is liveness-safe (timer unmasked before the selftest; `hlt` wakes on the delivered IRQ regardless of context switch — the early-return is what makes it *safe*, not a hang); no IF leak (`SYSRET` restores user `IF=0`; the `sti` window runs under kernel CR3 so `apic_eoi` can't triple-fault); `sched_active` restored on every path; `uptime_ms` monotonic, no overflow.
+
+### Notes
+
+- **No language bump** — kernel holds cyrius **6.0.56**. 10 ms granularity is playable for DOOM's 35 Hz (28.57 ms) tics — `cyrius-doom`'s `tick_wait` sleeps the *remainder* and self-corrects against the read clock. Next bite: **`cyrius-doom --agnos`** (a cyrius `fbinfo`/`blit`/`uptime_ms`/`sleep_ms` wrapper, then DOOM renders) — the last 1.43.x item.
+
 ## [1.43.4] — 2026-06-08
 
 **Graphics path — a ring-3 binary can draw pixels to the framebuffer.** The 1.43.x arc's headline non-threading bite: two new syscalls let a userland program query the screen and blit pixels into it, the substrate for `cyrius-doom --agnos`. Designed from a 4-source convergent prior-art audit (Linux fbdev/simpledrm, BSD wsfb, EDK2 GOP, doomgeneric) — **kernel-mediated blit, not FB-mmap**: the kernel copies the caller's buffer into `fb_phys` under its own privilege, so the raw scanout is never mapped into ring 3. The CR3 question that gated the design was a non-issue — the handler writes `fb_phys` exactly as `fb_putc` already does for ring-3 stdout (same dispatcher, same per-process CR3, no switch, no new mapping); a 3-lens adversarial review re-derived this as sound on **both QEMU and iron** (archaemenid GPU BAR → PDPT[3], inherited into every per-process CR3).

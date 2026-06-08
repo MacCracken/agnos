@@ -1612,6 +1612,46 @@ fn exec_disk_selftest() {
     kprintln("exec: running /bin/fbtest", 25);
     sh_exec("run /bin/fbtest", 15);
 
+    # 1.43.5 — uptime_ms(40) + sleep_ms(41) validator (/bin/timetest). Reads the
+    # monotonic ms clock (t0), sleeps 50 ms (= 5 ticks), reads it again (t1), and
+    # exits with t1-t0 = 50. "run: exit 50" proves BOTH syscalls dispatch from
+    # ring 3 AND that sleep_ms actually ADVANCED the clock — a frozen clock (e.g. a
+    # broken sti+hlt window) would leave t1==t0 → exit 0. The tick delta is exactly
+    # 5 (sl_target = ticks+5; the loop exits at ticks+5), so the ms delta is a
+    # deterministic 50 regardless of tick phase. No jumps / no strings — 58 code
+    # bytes. exec-smoke gates on "run: exit 50".
+    var gi = 0;
+    while (gi < 200) { store8(eb + gi, 0); gi = gi + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 178); store8(eb + 104, 178);                 # p_filesz/memsz = 178
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 — 58 bytes (pre-zeroed buffer completes each imm32)
+    var gc = 120;
+    store8(eb+gc,0x48); store8(eb+gc+1,0x83); store8(eb+gc+2,0xEC); store8(eb+gc+3,0x10); gc=gc+4;  # sub rsp,0x10
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC0); store8(eb+gc+3,0x28); gc=gc+7;  # mov rax,40 (uptime_ms)
+    store8(eb+gc,0x0F); store8(eb+gc+1,0x05); gc=gc+2;                                              # syscall -> t0
+    store8(eb+gc,0x48); store8(eb+gc+1,0x89); store8(eb+gc+2,0x04); store8(eb+gc+3,0x24); gc=gc+4;  # mov [rsp],rax (save t0)
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC0); store8(eb+gc+3,0x29); gc=gc+7;  # mov rax,41 (sleep_ms)
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC7); store8(eb+gc+3,0x32); gc=gc+7;  # mov rdi,50 (ms)
+    store8(eb+gc,0x0F); store8(eb+gc+1,0x05); gc=gc+2;                                              # syscall -> sleep 50 ms
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC0); store8(eb+gc+3,0x28); gc=gc+7;  # mov rax,40 (uptime_ms)
+    store8(eb+gc,0x0F); store8(eb+gc+1,0x05); gc=gc+2;                                              # syscall -> t1
+    store8(eb+gc,0x48); store8(eb+gc+1,0x2B); store8(eb+gc+2,0x04); store8(eb+gc+3,0x24); gc=gc+4;  # sub rax,[rsp] (t1-t0)
+    store8(eb+gc,0x48); store8(eb+gc+1,0x89); store8(eb+gc+2,0xC7); gc=gc+3;                        # mov rdi,rax (exit = delta)
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC0); store8(eb+gc+3,0x00); gc=gc+7;  # mov rax,0 (exit)
+    store8(eb+gc,0x0F); store8(eb+gc+1,0x05);                                                       # syscall -> exit(50)
+    var gino = 0;
+    if (bino > 0) { gino = ext2_create(bino, "timetest", 8); }
+    if (gino > 0) { ext2_write_at(gino, 0, eb, 178); ext2_sync(); }
+    kprintln("exec: running /bin/timetest", 27);
+    sh_exec("run /bin/timetest", 17);
+
     kprintln("exec: selftest done", 19);
     return 0;
 }

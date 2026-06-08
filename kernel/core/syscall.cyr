@@ -1009,6 +1009,42 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return 0;
     }
+    if (num == 40) {
+        # uptime_ms() — monotonic milliseconds since boot, returned in rax (no
+        # buffer, like getpid#2). timer_ticks is the 100 Hz tick counter (10 ms/
+        # tick, pic.cyr), so ms = timer_ticks * 10. Monotonic non-decreasing (the
+        # counter only ever increments). The ring-3 frame clock for cyrius-doom
+        # (DG_GetTicksMs). a1..a3 unused.
+        stack_canary_check(canary);
+        return timer_ticks * 10;
+    }
+    if (num == 41) {
+        # sleep_ms(ms=arg1) — block the caller ~ms ms by halting until the 100 Hz
+        # timer advances timer_ticks to the target. In the no-preempt ring-3 model
+        # user code runs IF=0 (ring3.cyr) so the clock only moves inside a kernel
+        # sti window — this is therefore ALSO the only way a ring-3 loop lets time
+        # pass (the pacing primitive, DG_SleepMs). Mirrors kbd_read_blocking's
+        # proven recipe: sched_active=0 so the timer ISR still ticks+EOIs but
+        # do_context_switch early-returns (we can't be preempted off mid-sleep on
+        # this single core); sti BEFORE the hlt (an IF=0 hlt is the waitpid hard-
+        # hang); cli on the way out. SYSRET restores the user's IF=0 from R11
+        # regardless, so the cli is just handler-tail hygiene. ms rounds UP to whole
+        # ticks (sleep >= ms). a2..a3 unused.
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }   # reject negative
+        var sl_ms = arg1;
+        if (sl_ms > 3600000) { sl_ms = 3600000; }                    # cap 1 h (sanity)
+        var sl_target = timer_ticks + (sl_ms + 9) / 10;              # round ms up to ticks
+        var sl_saved = sched_active;
+        sched_active = 0;                # suspend preemption (timer still ticks+EOIs)
+        asm { sti; }                     # IF=1 so the timer IRQ fires + wakes the hlt
+        while (timer_ticks < sl_target) {
+            arch_wait();                 # hlt until the next IRQ (timer @ 100 Hz)
+        }
+        asm { cli; }                     # restore IF=0 for the handler tail
+        sched_active = sl_saved;
+        stack_canary_check(canary);
+        return 0;
+    }
     stack_canary_check(canary);
     return 0 - 1;
 }

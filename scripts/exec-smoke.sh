@@ -186,6 +186,15 @@ if strings "$LOG" | grep -q "^run: exit 88"; then
 else
     echo "  FAIL: no 'run: exit 88' (fbinfo/blit didn't dispatch, or blit returned -1 / no FB)"; rc=1
 fi
+# 1.43.5 — uptime_ms(40)+sleep_ms(41). /bin/timetest reads the ms clock, sleeps
+# 50 ms (5 ticks), reads again, exits t1-t0 = 50. Proves both syscalls dispatch
+# AND that sleep_ms advanced the clock via its sti+hlt window (exit 0 would mean
+# a frozen clock / broken sleep window — the waitpid IF=0 hard-hang class).
+if strings "$LOG" | grep -q "^run: exit 50"; then
+    echo "  PASS: uptime_ms+sleep_ms — /bin/timetest slept 50 ms and the monotonic clock advanced 50 ms (exit 50)"
+else
+    echo "  FAIL: no 'run: exit 50' (timing syscalls didn't dispatch, or sleep_ms didn't advance the clock)"; rc=1
+fi
 # Clean return after ALL runs — "selftest done" proves exec_and_wait returned
 # into its caller frame each time (multi-run + shell-loop shape).
 if strings "$LOG" | grep -q "^exec: selftest done"; then
