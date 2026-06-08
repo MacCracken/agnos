@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.3] — 2026-06-08
+
+**Stdin EOF + `anuenue` banked; the envp arc item closed end-to-end (userland side).** A small companion cut after **agnoshi 1.4.6** consumed the 1.43.2 envp. **No language bump** — the kernel deliberately holds cyrius **6.0.56** (it is the envp *producer*, not a `getenv` consumer; only agnoshi advanced to 6.0.87 to read the env). This versions the kernel + harness work that landed just after the 1.43.2 tag.
+
+### Added
+
+- **`kbd_read_blocking` Ctrl-D / EOF branch** (`core/syscall.cyr`) — at line start (`n==0`), `read(fd 0)` returns 0. That is the *only* EOF path on agnos (no pipes, no other end-of-input), so a pure stdin filter (`anuenue`, `cat`) can terminate instead of looping forever; mid-line, Ctrl-D delivers the bytes typed so far *without* a terminating LF, and a second Ctrl-D at the fresh line then yields EOF. Not echoed. (The semantics were described under 1.43.2; the code landed just after that tag and is versioned here.)
+- **`anuenue` staged onto the agnos-fs `/bin`** (`scripts/stage-tools.sh`) — joins `bnrmr`/`cmdrs`/`klug` as a banked AGNOS-tic userland tool. Runs via `run /bin/anuenue TEXT` (anuenue 1.1.1's positional-text mode, since agnos has no pipe to feed a stdin filter).
+
+### Changed
+
+- **`scripts/burn-prep.sh` defaults to a BARE production kernel** — no compile-gated selftests baked into the burn artifact now that the exec/EXT2 arc is iron-validated. Opt back in for a validation burn with `BURN_SELFTESTS=1` (re-enables `EXEC_SELFTEST` + `EXT2_WRITE_SELFTEST`). The selftest code stays in-tree, just not enabled by default.
+- **Docs: the `envp` arc item is marked consumed end-to-end** (`roadmap.md`, `state.md`). agnos 1.43.2 stages the env (`HOME=/`, `PWD=/`), cyrius 6.0.87 added the agnos `getenv()` walk, and **agnoshi 1.4.6** re-vendored so `getenv()` resolves `$HOME` on agnos. Per-process env propagation (kybernet seeds a caller envp threaded through `execwait`) stays a deferred follow-on — moot until a per-process env source exists.
+
 ## [1.43.2] — 2026-06-07
 
 **envp on the exec stack — `getenv()` can resolve on agnos (kernel half).** The exec ABI staged an *empty* envp (an immediate NULL) since 1.40.7, so `getenv("HOME")` always returned 0 in ring 3 — the gap behind `.agnshrc` and commandress's `$PWD`/`getcwd`. The kernel now stages a real env. The cyrius-side `getenv()` agnos branch (reading this envp via `_agnos_init_rsp`) is the paired language-work half, owned by the cyrius agent.
