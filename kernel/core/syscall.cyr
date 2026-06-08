@@ -930,6 +930,85 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # child code from the GLOBAL.
         return ew37_code;
     }
+    if (num == 38) {
+        # fbinfo(buf=arg1, len=arg2) — write the 24-byte framebuffer geometry
+        # struct so a ring-3 program (cyrius-doom, /bin/fbtest) can size + format
+        # its pixels before blitting. 6x u32 LE at offsets 0/4/8/12/16/20:
+        #   +0  width   (px)        +12 bpp           (always 32)
+        #   +4  height  (px)        +16 pixel_format  (0=RGBX 1=BGRX — caller's byte order)
+        #   +8  pitch   (bytes/row) +20 flags         (bit0 = framebuffer present)
+        # fb_phys is DELIBERATELY not exposed — the FB stays unmappable from ring 3;
+        # pixels reach it only through blit(#39) under the kernel. a3 unused. Mirrors
+        # the uname#34 / sysinfo#35 struct-write pattern (validate, len-check, store).
+        if (is_user_range(arg1, 24) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg2 < 24) { stack_canary_check(canary); return 0 - 1; }
+        var fbi_present = 0;
+        if (fb_fb_phys() != 0) { fbi_present = 1; }
+        store32(arg1 +  0, fb_width());
+        store32(arg1 +  4, fb_height());
+        store32(arg1 +  8, fb_pitch());
+        store32(arg1 + 12, 32);                 # bpp — gnoboot only hands 32bpp
+        store32(arg1 + 16, fb_pf());            # 0=RGBX / 1=BGRX
+        store32(arg1 + 20, fbi_present);        # flags: bit0 = FB present
+        stack_canary_check(canary);
+        return 0;
+    }
+    if (num == 39) {
+        # blit(src=arg1, w=arg2, h=arg3, dstxy=arg4) — copy a w×h block of 32bpp
+        # pixels from the ring-3 buffer `src` (tightly packed, w*4 bytes/row) into
+        # the framebuffer at (dst_x, dst_y) where arg4 = (dst_y<<16)|dst_x. The dest
+        # rect is CLIPPED to the FB bounds (off-screen rows/cols dropped), so both
+        # the src reads and the FB writes are provably in range. Pixels copy RAW (no
+        # format conversion) — the caller supplies fbinfo's reported byte order. The
+        # write goes straight to fb_phys, EXACTLY as fb_putc does from ring-3 stdout
+        # (the proven path): the handler runs in the same syscall context that already
+        # both reads user buffers (uname/sysinfo) and writes fb_phys (write#1→fb_putc),
+        # so no CR3 switch and no new mapping are needed. Returns 0 (incl. fully-clipped
+        # no-op) or -1 (bad src / no FB / bad geometry). arg4 read via ksyscall_a4.
+        var bl_w = arg2;
+        var bl_h = arg3;
+        if (bl_w < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (bl_h < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (bl_w > 8192) { stack_canary_check(canary); return 0 - 1; }   # sanity cap (w*h*4 can't overflow)
+        if (bl_h > 8192) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg1, bl_w * bl_h * 4) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var bl_fb = fb_fb_phys();
+        if (bl_fb == 0) { stack_canary_check(canary); return 0 - 1; }    # no framebuffer
+        var bl_fw = fb_width();
+        var bl_fh = fb_height();
+        var bl_pitch = fb_pitch();
+        # Fail-closed on a malformed GOP: the in-bounds write proof needs
+        # pitch >= width*4 (UEFI guarantees PixelsPerScanLine >= HorizontalResolution,
+        # and gnoboot sets pitch = ppl*4 — not ring-3-reachable). Asserting it here
+        # makes the FB-write bound independent of the firmware invariant, so a quirky/
+        # spec-violating GOP can't spill the last clipped row past fb + pitch*height.
+        if (bl_pitch < bl_fw * 4) { stack_canary_check(canary); return 0 - 1; }
+        var bl_dstxy = ksyscall_a4;
+        var bl_dx = bl_dstxy & 0xFFFF;
+        var bl_dy = (bl_dstxy >> 16) & 0xFFFF;
+        if (bl_dx >= bl_fw) { stack_canary_check(canary); return 0; }    # fully off-screen → no-op OK
+        if (bl_dy >= bl_fh) { stack_canary_check(canary); return 0; }
+        var bl_cw = bl_w;                                                # clip width to FB right edge
+        if (bl_dx + bl_cw > bl_fw) { bl_cw = bl_fw - bl_dx; }
+        var bl_ch = bl_h;                                               # clip height to FB bottom edge
+        if (bl_dy + bl_ch > bl_fh) { bl_ch = bl_fh - bl_dy; }
+        var bl_r = 0;
+        var bl_srow = 0;
+        var bl_drow = 0;
+        var bl_c = 0;
+        while (bl_r < bl_ch) {
+            bl_srow = arg1 + (bl_r * bl_w) * 4;                          # src row (packed w*4)
+            bl_drow = bl_fb + (bl_dy + bl_r) * bl_pitch + bl_dx * 4;     # dest row in FB
+            bl_c = 0;
+            while (bl_c < bl_cw) {
+                store32(bl_drow + bl_c * 4, load32(bl_srow + bl_c * 4));
+                bl_c = bl_c + 1;
+            }
+            bl_r = bl_r + 1;
+        }
+        stack_canary_check(canary);
+        return 0;
+    }
     stack_canary_check(canary);
     return 0 - 1;
 }

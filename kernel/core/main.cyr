@@ -1569,6 +1569,49 @@ fn exec_disk_selftest() {
     kprintln("exec: running /bin/envtest", 26);
     sh_exec("run /bin/envtest", 16);
 
+    # 1.43.4 — framebuffer fbinfo(38) + blit(39) validator (/bin/fbtest). Queries
+    # geometry into a stack buffer, then blits a 4x4 block from the stack to FB
+    # (0,0), and exits with bpp(=32, @struct+12) + blit_rc(=0) + 56 = 88. "run:
+    # exit 88" proves BOTH syscalls dispatch from ring 3, fbinfo writes the struct
+    # (bpp=32 is format/resolution-independent), and blit copies into fb_phys and
+    # returns 0 without faulting — under gnoboot+OVMF q35 the GOP FB is present so
+    # blit succeeds (a -1 here would surface as exit 87, not 88). The 4x4 paint is
+    # a negligible console corner. No jumps / no strings — 80 code bytes, sequential.
+    var fi = 0;
+    while (fi < 200) { store8(eb + fi, 0); fi = fi + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 200); store8(eb + 104, 200);                 # p_filesz/memsz = 200
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 — 80 bytes (pre-zeroed buffer completes each imm32)
+    var fc = 120;
+    store8(eb+fc,0x48); store8(eb+fc+1,0x81); store8(eb+fc+2,0xEC); store8(eb+fc+3,0x80); fc=fc+7;  # sub rsp,0x80
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC0); store8(eb+fc+3,0x26); fc=fc+7;  # mov rax,38 (fbinfo)
+    store8(eb+fc,0x48); store8(eb+fc+1,0x89); store8(eb+fc+2,0xE7); fc=fc+3;                        # mov rdi,rsp (buf)
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC6); store8(eb+fc+3,0x18); fc=fc+7;  # mov rsi,24 (len)
+    store8(eb+fc,0x0F); store8(eb+fc+1,0x05); fc=fc+2;                                              # syscall (fbinfo)
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC0); store8(eb+fc+3,0x27); fc=fc+7;  # mov rax,39 (blit)
+    store8(eb+fc,0x48); store8(eb+fc+1,0x8D); store8(eb+fc+2,0x7C); store8(eb+fc+3,0x24); store8(eb+fc+4,0x18); fc=fc+5;  # lea rdi,[rsp+24] (src)
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC6); store8(eb+fc+3,0x04); fc=fc+7;  # mov rsi,4 (w)
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC2); store8(eb+fc+3,0x04); fc=fc+7;  # mov rdx,4 (h)
+    store8(eb+fc,0x49); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC2); store8(eb+fc+3,0x00); fc=fc+7;  # mov r10,0 (dstxy=0,0)
+    store8(eb+fc,0x0F); store8(eb+fc+1,0x05); fc=fc+2;                                              # syscall (blit)
+    store8(eb+fc,0x0F); store8(eb+fc+1,0xB6); store8(eb+fc+2,0x7C); store8(eb+fc+3,0x24); store8(eb+fc+4,0x0C); fc=fc+5;  # movzx edi,byte[rsp+12] (bpp=32)
+    store8(eb+fc,0x01); store8(eb+fc+1,0xC7); fc=fc+2;                                              # add edi,eax (blit rc)
+    store8(eb+fc,0x83); store8(eb+fc+1,0xC7); store8(eb+fc+2,0x38); fc=fc+3;                        # add edi,56 -> 88
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC0); store8(eb+fc+3,0x00); fc=fc+7;  # mov rax,0 (exit)
+    store8(eb+fc,0x0F); store8(eb+fc+1,0x05);                                                       # syscall — exit(edi=88)
+    var fino = 0;
+    if (bino > 0) { fino = ext2_create(bino, "fbtest", 6); }
+    if (fino > 0) { ext2_write_at(fino, 0, eb, 200); ext2_sync(); }
+    kprintln("exec: running /bin/fbtest", 25);
+    sh_exec("run /bin/fbtest", 15);
+
     kprintln("exec: selftest done", 19);
     return 0;
 }

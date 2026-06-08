@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.4] — 2026-06-08
+
+**Graphics path — a ring-3 binary can draw pixels to the framebuffer.** The 1.43.x arc's headline non-threading bite: two new syscalls let a userland program query the screen and blit pixels into it, the substrate for `cyrius-doom --agnos`. Designed from a 4-source convergent prior-art audit (Linux fbdev/simpledrm, BSD wsfb, EDK2 GOP, doomgeneric) — **kernel-mediated blit, not FB-mmap**: the kernel copies the caller's buffer into `fb_phys` under its own privilege, so the raw scanout is never mapped into ring 3. The CR3 question that gated the design was a non-issue — the handler writes `fb_phys` exactly as `fb_putc` already does for ring-3 stdout (same dispatcher, same per-process CR3, no switch, no new mapping); a 3-lens adversarial review re-derived this as sound on **both QEMU and iron** (archaemenid GPU BAR → PDPT[3], inherited into every per-process CR3).
+
+### Added
+
+- **`fbinfo` syscall (#38)** — `fbinfo(buf, len)` writes a 24-byte geometry struct (6× u32 LE): `width` / `height` / `pitch` / `bpp` (32) / `pixel_format` (0=RGBX, 1=BGRX) / `flags` (bit0 = FB present). `fb_phys` is **deliberately not exposed** — the FB stays unmappable from ring 3. Mirrors the `uname`#34 / `sysinfo`#35 struct-write pattern (validate `is_user_range`, len-check, fixed-offset stores, canary).
+- **`blit` syscall (#39)** — `blit(src, w, h, dstxy)` where `dstxy = (dst_y<<16)|dst_x`. Copies a `w×h` block of 32bpp pixels from the ring-3 buffer `src` (tightly packed, `w*4`/row) into the framebuffer at `(dst_x, dst_y)`, **clipped** to the FB bounds. Pixels copy raw (no format conversion — caller supplies `fbinfo`'s reported byte order). Validates `src` for the full `w*h*4` extent; the clip makes both the src reads and FB writes provably in-range. `arg4` via `ksyscall_a4`.
+- **`/bin/fbtest` ring-3 validator** (`core/main.cyr`, `EXEC_SELFTEST`) — queries `fbinfo`, blits a 4×4 block to FB `(0,0)`, exits `bpp(32) + blit_rc(0) + 56` = **88**. `exec-smoke.sh` gates on `run: exit 88` (a `-1`/no-FB blit would surface as 87, distinguishing real dispatch from the default unknown-syscall path). **exec-smoke green + sweep 7/7.** Iron rides the next burn.
+
+### Security
+
+- **`blit` fail-closes on a malformed GOP** — the in-bounds write proof needs `pitch >= width*4` (UEFI guarantees `PixelsPerScanLine >= HorizontalResolution`; firmware-set, not ring-3-reachable). The handler now asserts it (`if (bl_pitch < bl_fw*4) return -1`), so the FB-write bound is independent of the firmware invariant — a quirky/spec-violating GOP can't spill the last clipped row. (Low / not attacker-reachable; defense-in-depth, surfaced by the 1.43.4 adversarial review — which otherwise found **0** ring-3-reachable OOB read/write.)
+
+### Notes
+
+- **No language bump** — kernel holds cyrius **6.0.56**. Scaling (DOOM's 320×200 → panel) and the zero-copy FB-mmap fast path are deferred follow-ons; the MVP is a 1:1 kernel-mediated blit. The userland consumer side (`cyrius-doom --agnos` + a cyrius `fbinfo`/`blit` wrapper) is the next bite.
+
 ## [1.43.3] — 2026-06-08
 
 **Stdin EOF + `anuenue` banked; the envp arc item closed end-to-end (userland side).** A small companion cut after **agnoshi 1.4.6** consumed the 1.43.2 envp. **No language bump** — the kernel deliberately holds cyrius **6.0.56** (it is the envp *producer*, not a `getenv` consumer; only agnoshi advanced to 6.0.87 to read the env). This versions the kernel + harness work that landed just after the 1.43.2 tag.

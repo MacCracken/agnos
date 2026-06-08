@@ -177,7 +177,16 @@ if strings "$LOG" | grep -q "^run: exit 72"; then
 else
     echo "  FAIL: no 'run: exit 72' (envp not staged / not readable at the SysV offset)"; rc=1
 fi
-# Clean return after BOTH runs — "selftest done" proves exec_and_wait returned
+# 1.43.4 — framebuffer fbinfo(38)+blit(39). /bin/fbtest queries geometry, blits a
+# 4x4 block to FB(0,0), exits bpp(32)+blit_rc(0)+56 = 88. Proves BOTH new syscalls
+# dispatch from ring 3, fbinfo writes the struct (bpp=32), and blit copies into
+# fb_phys + returns 0 (exit 87 would mean blit returned -1 / no FB present).
+if strings "$LOG" | grep -q "^run: exit 88"; then
+    echo "  PASS: fbinfo+blit — /bin/fbtest queried geometry + blitted to the framebuffer from ring 3 (exit 88)"
+else
+    echo "  FAIL: no 'run: exit 88' (fbinfo/blit didn't dispatch, or blit returned -1 / no FB)"; rc=1
+fi
+# Clean return after ALL runs — "selftest done" proves exec_and_wait returned
 # into its caller frame each time (multi-run + shell-loop shape).
 if strings "$LOG" | grep -q "^exec: selftest done"; then
     echo "  PASS: exec_and_wait returned cleanly after each run ('selftest done')"
