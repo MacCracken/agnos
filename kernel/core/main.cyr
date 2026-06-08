@@ -1658,6 +1658,19 @@ fn exec_disk_selftest() {
 exec_disk_selftest();
 #endif
 
+#ifdef DOOM_SELFTEST
+# 1.43.x — cyrius-doom render bring-up (the first real userland APP). /bin/doom
+# + /DOOM1.WAD are seeded onto the ext2 root by scripts/doom-smoke.sh; run the
+# 584 KB ELF from disk in ring 3. doom loops forever (the 35 Hz game loop),
+# rendering to the framebuffer via fbinfo#38 + blit#39 and pacing via uptime_ms
+# #40 / sleep_ms#41 — so the boot intentionally "parks" here while doom renders;
+# doom-smoke.sh screendumps the live framebuffer. "exec: doom returned" only
+# prints if doom exits (it shouldn't, with no quit input).
+kprintln("exec: running /bin/doom", 23);
+sh_exec("run /bin/doom", 13);
+kprintln("exec: doom returned", 19);
+#endif
+
 # 1.41.3 — FS-syscall self-test (compile-gated, FS_SYSCALL_SELFTEST=1). Drives
 # the new real FS syscalls (mkdir/open+CREAT/stat/rename/getdents/unlink/rmdir/
 # sync) through ksyscall() with a real >=2 MB user-range scratch (pmm_alloc_2mb

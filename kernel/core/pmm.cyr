@@ -28,7 +28,7 @@ fn pmm_spin_unlock() {
 # to prevent negative indices and out-of-bounds access.
 fn pmm_page_valid(page) {
     if (page < 0) { return 0; }
-    if (page >= 4096) { return 0; }
+    if (page >= 32768) { return 0; }
     return 1;
 }
 
@@ -71,8 +71,8 @@ fn kaslr_seed() {
 
 fn pmm_init() {
     # Zero bitmap (all free)
-    memset(&pmm_bitmap, 0, 512);
-    pmm_total = 4096;
+    memset(&pmm_bitmap, 0, 4096);
+    pmm_total = 32768;
     pmm_used = 0;
     # Mark the first 4 MB as used: kernel image + page tables + stacks.
     # 1.40.9: was 2 MB (pages 0-511), but the kernel image (LOAD MemSiz) now
@@ -174,7 +174,7 @@ fn pmm_free(addr) {
 # treats 0 as MAP_FAILED).
 fn pmm_alloc_2mb() {
     pmm_spin_lock();
-    for (var r = 1; r < 8; r = r + 1) {
+    for (var r = 1; r < 64; r = r + 1) {
         var base = r * 512;
         var free = 1;
         for (var i = 0; i < 512; i = i + 1) {
@@ -197,7 +197,7 @@ fn pmm_alloc_2mb() {
 fn pmm_count_2mb_free() {
     pmm_spin_lock();
     var count = 0;
-    for (var r = 1; r < 8; r = r + 1) {
+    for (var r = 1; r < 64; r = r + 1) {
         var base = r * 512;
         var free = 1;
         for (var i = 0; i < 512; i = i + 1) {
@@ -215,7 +215,7 @@ fn pmm_free_2mb(addr) {
     var base = addr / 0x1000;
     if (base % 512 != 0) { return 0 - 1; }   # not 2 MB-aligned
     if (base < 512) { return 0 - 1; }         # region 0 is the kernel
-    if (base >= 4096) { return 0 - 1; }
+    if (base >= 32768) { return 0 - 1; }
     pmm_spin_lock();
     for (var i = 0; i < 512; i = i + 1) {
         if (pmm_test(base + i) == 1) {

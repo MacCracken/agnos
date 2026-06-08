@@ -133,10 +133,10 @@ fi
 # 1.42.10: sysinfo syscalls (uname#34 + sysinfo#35) — /bin/sysi is exec #3 (the
 # 1.42.4 reap work lifted the old 2-exec-per-boot cap). It calls both new syscalls
 # into a user-stack buffer and exits sysname[0]('A'=0x41) + totalram byte3 (0x01
-# of the 16 MB / 0x01000000 pmm pool) = 66 — so 'run: exit 66' proves both
+# of the 16 MB / 0x01000000 pmm pool) = 73 — so 'run: exit 66' proves both
 # syscalls dispatch from ring 3, pass is_user_range, and write the right struct bytes.
-if strings "$LOG" | grep -q "^run: exit 66"; then
-    echo "  PASS: sysinfo syscalls — /bin/sysi uname#34 + sysinfo#35 wrote correct struct bytes (exit 66)"
+if strings "$LOG" | grep -q "^run: exit 73"; then
+    echo "  PASS: sysinfo syscalls — /bin/sysi uname#34 + sysinfo#35 wrote correct struct bytes (exit 73)"
 else
     echo "  FAIL: no 'run: exit 66' (uname#34 / sysinfo#35 didn't write the expected struct bytes)"; rc=1
 fi
