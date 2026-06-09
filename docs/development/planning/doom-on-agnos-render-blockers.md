@@ -38,17 +38,34 @@ SUPERVISOR 2 MB pages**, so the kernel can reach the whole pmm range. U/S=0 keep
 ring 3 out; user code/stack live in PD[2]/PD[4], the mmap arena in PD[128+], so no
 user VA aliases these slots.
 
-## The one remaining bug — worked around, not yet fixed
+## The "first-mmap RIP=0" bug — ROOT-CAUSED + FIXED (2026-06-09)
 
-**First-`mmap`-return RIP=0** *(open; doom carries a one-line workaround)*. Without
-a warm-up `mmap`, doom faults at **ring-3 RIP=0, RBP=0** immediately after
-`alloc_init`'s first `mmap` syscall returns (`-d int`: `v=0e e=0015 cpl=3 RIP=0`,
-with kernel values left in RDI/RSI — looks like the first SYSRET not restoring the
-ring-3 register/return state). agnsh is unaffected (its first syscall is a
-`write`). doom 0.28.2 absorbs it with a throwaway `mmap` before `alloc_init`
-(`main.cyr`, agnos-only, documented). **Next:** `-d int` a minimal first-`mmap`
-repro; compare the SYSRET path register/stack restore for the first vs second
-syscall; fix in the kernel and remove the doom probe.
+**It was never a first-mmap or SYSRET bug — it was the user stack living in the
+kernel identity-mapped range.** `elf.cyr` placed user stacks at
+`0x800000 + pid*0x400000`; for **pid ≥ 2** that is **≥ 16 MB**, inside the
+`PD[8..63]` identity-**SUPERVISOR** pmm pool. `proc_map_page` then overrode that
+PD slot to point at `stack_phys`, **breaking the identity map for that VA**. So
+when a later `sys_mmap` did `memset(phys, 0, 2 MB)` on a page whose *identity* VA
+aliased the stack VA, it wrote to the **live ring-3 stack** instead of the new
+page, zeroing the saved return addresses → the next ring-3 `ret` jumped to
+**RIP=0** (`v=0e e=0015 cpl=3 RIP=0`).
+
+**Why it hid:** doom-smoke runs doom via the in-kernel recovery `run` (lower pid
+→ stack below 16 MB → no aliasing), so it always rendered; the user hit it via
+`agnsh` → `execwait` #37 (higher pid → stack at ~20 MB, in the pool). A
+multi-page mmap (the 4.2 MB WAD) reliably grabs a region whose identity VA hits
+the stack; the warm-up mmap only papered over the recovery path.
+
+**Fix (`elf.cyr` + `proc.cyr`):** user stacks now live at the **top of the
+non-identity arena** (`0x3FC00000`, PD[510]); the mmap ceiling dropped to
+`0x3FA00000` (below the stack + its guard page). Each process has its own CR3 so
+a fixed stack VA is safe, and no pmm phys aliases the arena. `proc_map_page` also
+gained an explicit `invlpg` after the PDE store (latent-TLB hardening). The doom
+warm-up workaround is **removed** (cyrius-doom `main.cyr`). Validated in QEMU:
+the mm-repro + doom via **both** `execwait` and recovery `run` render with **0
+RIP=0 faults**; `sweep.sh` **7/7**; `doom-smoke` PASS. **Iron burn pending** — the
+QEMU repro of the exact iron-failure path (agnsh→execwait, multi-page WAD mmap)
+now passes.
 
 ## Validation harness (kept)
 

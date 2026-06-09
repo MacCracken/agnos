@@ -279,9 +279,18 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
         }
     }
 
-    # User stack — 2 MB-aligned region (same huge-page aliasing rule as above).
+    # User stack — at the TOP of the non-identity mmap arena (PD[510], 0x3FC00000),
+    # NOT in the low identity range. RATIONALE (first-mmap-RIP=0 root cause): the
+    # old `0x800000 + pid*0x400000` put pid>=2 stacks at >=16 MB, inside the
+    # PD[8..63] identity-supervisor pmm pool. proc_map_page then overrode that VA
+    # to point at stack_phys, BREAKING the identity map for that slot — so a later
+    # sys_mmap memset(phys,0,2MB) whose identity VA == stack_base wrote to the live
+    # stack instead of the new page, zeroing the ring-3 return addresses → `ret`
+    # to RIP=0. Each process has its own CR3, so a fixed VA is safe; the arena
+    # (PD[128..510]) is non-identity, so no pmm phys aliases it. mmap bumps up from
+    # 0x10000000 with a ceiling (0x3FA00000) below this stack + its guard page.
     var pid = proc_count;
-    var stack_base = 0x800000 + pid * 0x400000;
+    var stack_base = 0x3FC00000;
     var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }
     if (vmm_is_mapped(stack_phys) == 0) { vmm_map(stack_phys, stack_phys, 0x83); }

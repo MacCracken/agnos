@@ -475,6 +475,21 @@ fn proc_check_pending_signals(pid) {
     return unmasked;
 }
 
+# Invalidate the TLB entry for a single virtual address. `va` is the first
+# param (at [rbp-8] per the Cyrius calling convention, same shape as cr3_load).
+# proc_map_page flips a previously NOT-PRESENT arena PDE to present; without
+# this flush a stale (negative/global) 2 MB TLB entry for `virt` can survive,
+# and on a multi-page mmap that desyncs the freshly-installed mapping (the
+# first-mmap-return RIP=0 class). vmm_map's own invlpg is dead on the mmap path
+# (pt_init pre-maps all 512 boot-PD slots, so vmm_is_mapped is always true).
+fn invlpg_va(va) {
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;   # mov rax, [rbp-8]  (va)
+        0x0F; 0x01; 0x38;         # invlpg [rax]
+    }
+    return 0;
+}
+
 fn proc_map_page(cr3, virt, phys) {
     # Get PD address from PML4 → PDPT → PD chain (x86 — see #ifdef above)
     var pml4e = load64(cr3);
@@ -493,6 +508,7 @@ fn proc_map_page(cr3, virt, phys) {
         var u_pd = u_pdpte & 0xFFFFFFFFF000;
         store64(u_pd + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
     }
+    invlpg_va(virt);            # flush the (possibly stale not-present) 2 MB TLB entry
     return 0;
 }
 
@@ -563,7 +579,7 @@ fn sys_mmap(length) {
     var npages = len / 0x200000;
     var cr3 = proc_get_cr3(proc_current);
     if (cr3 == 0) { return 0; }
-    if ((mmap_next_vaddr + len) > 0x40000000) { return 0; }    # arena exhausted (>1 GB)
+    if ((mmap_next_vaddr + len) > 0x3FA00000) { return 0; }    # arena ceiling (below the user stack @0x3FC00000 + its guard @0x3FA00000)
     if (pmm_count_2mb_free() < npages) { return 0; }            # not enough physical
     var base_vaddr = mmap_next_vaddr;
     for (var i = 0; i < npages; i = i + 1) {

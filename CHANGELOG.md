@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **"first-mmap RIP=0" / DOOM locks up via `agnsh`→`execwait` — ROOT-CAUSED + FIXED.** The fault (`v=0e e=0015 cpl=3 RIP=0`) was **not** a first-mmap or SYSRET bug: user stacks were placed at `0x800000 + pid*0x400000` (`elf.cyr`), so for **pid ≥ 2** the stack VA was **≥ 16 MB — inside the `PD[8..63]` identity-SUPERVISOR pmm pool**. `proc_map_page` overrode that PD slot to `stack_phys`, breaking the identity map for that VA; a later `sys_mmap` `memset(phys,0,2 MB)` whose identity VA aliased the stack then zeroed the **live ring-3 stack**, so the next `ret` jumped to RIP=0. Recovery-shell `run` (low pid, stack < 16 MB) never aliased — which is why `doom-smoke` always passed while the user's `agnsh`-launched doom (higher pid, multi-page WAD mmap) locked up. **Fix:** user stacks relocated to the top of the **non-identity arena** (`0x3FC00000`, PD[510]); mmap ceiling lowered to `0x3FA00000` (below the stack + guard); `proc_map_page` gained an explicit `invlpg` after the PDE store (latent-TLB hardening). The cyrius-doom warm-up workaround is removed. Validated in QEMU: doom renders via **both** `execwait` and recovery `run` with **0 RIP=0 faults**; `sweep.sh` 7/7; `doom-smoke` PASS. Iron burn pending (the exact iron-failure path now passes under QEMU). Detail → `docs/development/planning/doom-on-agnos-render-blockers.md`.
+
 ## [1.43.7] — 2026-06-08
 
 **`execwait`#37 carries argv — `run /bin/<prog> arg…` passes its arguments.** Iron
