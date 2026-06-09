@@ -1,6 +1,8 @@
 # cyrius (agnos target): `argc()`/`argv()` return 0/null in non-trivial programs — init-rsp capture grabs a shifted rsp
 
-> **FILE INTO:** `cyrius/docs/development/issues/2026-06-08-...md` — written here (agnos) only because the discovering session is hands-off on the cyrius repo. Two distinct agnos-target codegen bugs, both QEMU-reproduced against a real agnos 1.43.7 kernel. No iron needed to reproduce.
+> **STATUS: RESOLVED — archived 2026-06-09.** Bug 1 fixed in **cyrius 6.1.14** (capture moved to after `EMIT_GVAR_INITS`); the residual `var r = main();` idiom (main runs as a gvar-init *before* the capture) is permanently handled consumer-side by the **bare-call entry idiom** (`_agnos_entry();`), now the documented standard in agnosticos CLAUDE.md and applied across bannermanor/agnoshi/commandress/klug/anuenue. Bug 2 closed as a consumer error (agnos `exit` is syscall **0**, not 60 — see Notes). The only open item is the *optional* cyrius hardening (§6.1.14 follow-up) to make `var r = main()` work natively; moot now that bare-call is canonical, kept here only as a ready-to-file enhancement if cyrius wants it.
+
+> **FILE INTO (if pursuing the optional hardening):** `cyrius/docs/development/issues/2026-06-08-...md` — written here (agnos) only because the discovering session is hands-off on the cyrius repo. Two agnos-target findings, both QEMU-reproduced against a real agnos 1.43.7 kernel. No iron needed to reproduce.
 
 - **Severity:** HIGH (Bug 1 — blocks the entire argv-reading agnos userland: `bnrmr`, `cmdrs`, and any tool that reads command-line arguments). MEDIUM/latent (Bug 2).
 - **Target:** `--agnos`, x86_64. Other targets unaffected.
