@@ -67,9 +67,35 @@ RIP=0 faults**; `sweep.sh` **7/7**; `doom-smoke` PASS. **Iron burn pending** —
 QEMU repro of the exact iron-failure path (agnsh→execwait, multi-page WAD mmap)
 now passes.
 
+## Keyboard input — LANDED (2026-06-09)
+
+Burn `1438` rendered the title screen but DOOM **sat on it, taking no input** —
+`input_poll`'s agnos branch returned no keys by design (the only stdin path,
+`read`#5, is blocking + line-disciplined + cooked — it would freeze the 35 Hz
+loop and drops key-up). Fixed with a new **`kbscan`#42** kernel syscall
+(`core/syscall.cyr`): a **non-blocking** drain of up to `max` raw Set-1 scancodes
+(make + break, incl. `0xE0` prefixes) from `kb_buf` → user buffer, returning the
+count. It opens a brief **bounded** IRQ1 window (same `sched_active=0`+`sti`
+recipe as `sleep_ms`#41 / `kbd_read_blocking`, but no `hlt` so a poll never stalls
+a frame) so an iron keystroke whose IRQ1 the PIC latched during the ring-3 `IF=0`
+gap gets serviced into `kb_buf`, and `hid_poll` drains the xHCI ring under QEMU.
+
+cyrius-doom `input.cyr` decodes make/break into a **persistent** `key_state`
+(held up/down, unlike the Linux press-then-clear path). Validated end-to-end in
+QEMU by `scripts/doom-input-test.py` (USB-xHCI kbd + HMP `sendkey`): `w` advances
+title→main menu (framebuffer changes), `q` quits (`menu_run`→`doom_exit`). The
+QEMU usb-kbd path emits the *same* Set-1 make/break via `hid_poll`→`kb_buf` that
+iron's IRQ1/`kb_isr` produces, so the decode + held-state are fully exercised;
+the only iron-specific unknown is the IRQ1-latch-across-`IF=0` timing, which
+reuses the `kbd_read_blocking` primitives already iron-proven at burn `14115`.
+**Iron burn pending.** Known follow-on: menu navigation uses held-state (no
+edge-debounce), so the cursor moves once per frame while a key is held — playable
+but fast; edge-triggered menu nav is a refinement, not a blocker.
+
 ## Validation harness (kept)
 
 - `main.cyr` `#ifdef DOOM_SELFTEST` gate (`sh_exec("run /bin/doom")`),
   `build.sh` `DOOM_SELFTEST=1` flag, `scripts/doom-smoke.sh` (the full
   exec→WAD→render gate). Re-validate any change with `doom-smoke.sh`; gate kernel
-  regressions with `sweep.sh` (7/7).
+  regressions with `sweep.sh` (7/7). Input: `scripts/doom-input-test.py` (sendkey
+  → title-advance + quit).

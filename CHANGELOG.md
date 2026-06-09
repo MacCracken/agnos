@@ -5,6 +5,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.43.9] — 2026-06-09
+
+### Added
+
+- **`kbscan`#42 — non-blocking raw-scancode keyboard syscall for ring-3 game loops.**
+  Iron burn `1438` showed cyrius-doom rendering its title screen but **frozen on it,
+  taking no keyboard input** — by design: `input_poll`'s agnos branch returned no keys
+  because the only stdin path, `read`#5 on fd 0, is **blocking + line-disciplined +
+  cooked-to-ASCII** (right for a shell, fatal in a 35 Hz frame loop — it would freeze
+  the loop and drops key-up). `kbscan(buf, max)` drains up to `max` raw Set-1 scancodes
+  (make **and** break, incl. `0xE0` extended prefixes) from the kernel `kb_buf` into the
+  user buffer and returns the count — **never blocks, never cooks** — so the caller
+  maintains its own held-key (up/down) state. The kernel keeps no key state here; it's a
+  pure byte pipe off the same `kb_buf` the shell drains. It opens a brief bounded IRQ1
+  window (the proven `sched_active=0` + `sti` recipe from `sleep_ms`#41 / `kbd_read_blocking`,
+  but with **no `hlt`** so a poll never stalls a frame) so a scancode the PIC latched
+  during the ring-3 `IF=0` gap (iron) is serviced into `kb_buf`, and `hid_poll` drains
+  the xHCI ring (QEMU). `kernel/core/syscall.cyr`. Validated end-to-end in QEMU
+  (`scripts/doom-input-test.py`, USB-xHCI keyboard + HMP `sendkey`): sending **`w`**
+  advances DOOM past the title to the main menu (framebuffer changes), and **`q`** quits
+  it (`input_quit` → `menu_run` → `doom_exit`, "quit from menu" on serial). `sweep.sh`
+  7/7; `doom-smoke` still PASS (render unaffected). **Iron burn pending** — QEMU exercises
+  the real Set-1 make/break path (`hid_poll`→`kb_buf`), but the iron IRQ1-latch-across-the-
+  `IF=0`-gap is validated only on hardware (it reuses the `kbd_read_blocking` primitives
+  already iron-proven at burn `14115`).
+
 ## [1.43.8] — 2026-06-09
 
 ### Fixed

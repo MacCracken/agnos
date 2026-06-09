@@ -5,7 +5,7 @@
 # ext2 root, boots gnoboot+OVMF+NVMe with a DOOM_SELFTEST kernel that runs
 # `/bin/doom` from disk, then screendumps the live framebuffer.
 #
-# Gates: doom prints "cyrius-doom v0.28.2" (started) + "wad loaded" (the
+# Gates: doom prints "cyrius-doom v0.28.3" (started) + "wad loaded" (the
 # in-memory WAD slurp + parse succeeded — the load-bearing port claim), and the
 # framebuffer screendump is non-blank (something rendered). Saves a PNG for eyes.
 
@@ -102,7 +102,7 @@ echo "  --- doom serial lines ---"
 strings "$SLOG" | grep -E "doom|wad|cyrius-doom|exec:|PANIC|FAULT|#PF" | sed 's/^/  /' | head -20
 
 rc=0
-if strings "$SLOG" | grep -q "cyrius-doom v0.28.2"; then
+if strings "$SLOG" | grep -q "cyrius-doom v0.28.3"; then
     echo "  PASS: /bin/doom started (584 KB ELF exec'd from disk in ring 3)"
 else
     echo "  FAIL: doom never started (exec-from-disk of the 584 KB binary failed)"; rc=1

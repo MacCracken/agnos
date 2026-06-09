@@ -1068,6 +1068,48 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return 0;
     }
+    if (num == 42) {
+        # kbscan(buf=arg1, max=arg2) — NON-BLOCKING raw-scancode drain for ring-3
+        # game loops (cyrius-doom's input_poll). Copies up to `max` raw Set-1
+        # scancodes (make + break, incl. 0xE0 extended prefixes) buffered since the
+        # last call into the user buffer; returns the count in rax (0 = none). This
+        # is the up/down-aware counterpart to read#5: read#5 is BLOCKING + line-
+        # disciplined + cooked-to-ASCII (good for a shell, fatal in a frame loop —
+        # it would freeze the game and drops key-up); kbscan never blocks, never
+        # cooks, and preserves break codes so the caller maintains its own held-key
+        # state. The kernel keeps NO key-state here — it's a pure byte pipe off the
+        # same kb_buf the shell drains, so it can't strand a modifier across calls.
+        #
+        # The window: ring-3 runs IF=0 (ring3.cyr), so on iron a keystroke's IRQ1
+        # is only *latched* in the PIC IRR during the gap between syscalls; it's
+        # serviced (kb_isr -> kb_buf) only inside a kernel sti window. Open a brief
+        # one here — same sched_active=0 + sti recipe as sleep_ms#41, but BOUNDED
+        # (no hlt) so a poll never stalls a frame. The spin both (a) gives the CPU
+        # post-sti instructions to take a pending IRQ1 (sti enables IF only after
+        # the *next* instruction, so `sti; cli` alone leaves no window) and (b)
+        # drives hid_poll to drain the xHCI USB-HID ring (the QEMU producer). Then
+        # cli and copy whatever landed. Anything still queued in hardware drains on
+        # the next frame's poll — fine at human key rates vs the 35 Hz tic. a3
+        # unused. (tick_wait's per-frame sleep_ms#41 also fills kb_buf, so this
+        # window is belt-and-suspenders, not the sole capture path.)
+        if (arg2 <= 0) { stack_canary_check(canary); return 0; }
+        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var ks_saved = sched_active;
+        sched_active = 0;                # suspend preemption (timer still ticks+EOIs)
+        kbd_irq_enable();                # sti — service any PIC-latched IRQ1 into kb_buf
+        var ks_w = 0;
+        while (ks_w < 256) { hid_poll(); ks_w = ks_w + 1; }  # bounded window: take IRQ1 + drain xHCI ring
+        kbd_irq_disable();               # cli — restore IF=0 for the handler tail
+        sched_active = ks_saved;
+        var ks_n = 0;
+        while (ks_n < arg2) {
+            if (kb_has_key() == 0) { stack_canary_check(canary); return ks_n; }
+            store8(arg1 + ks_n, kb_read_scancode());
+            ks_n = ks_n + 1;
+        }
+        stack_canary_check(canary);
+        return ks_n;
+    }
     stack_canary_check(canary);
     return 0 - 1;
 }
