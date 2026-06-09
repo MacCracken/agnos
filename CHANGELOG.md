@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.43.9] — 2026-06-09
+## [1.43.8] — 2026-06-09
 
 ### Added
 
@@ -30,8 +30,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the real Set-1 make/break path (`hid_poll`→`kb_buf`), but the iron IRQ1-latch-across-the-
   `IF=0`-gap is validated only on hardware (it reuses the `kbd_read_blocking` primitives
   already iron-proven at burn `14115`).
-
-## [1.43.8] — 2026-06-09
 
 ### Fixed
 
