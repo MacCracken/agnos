@@ -89,6 +89,10 @@ fn proc_save_context(pid, isr_rsp) {
     store64(p + 24, load64(isr_rsp + 120));  # rip
     store64(p + 152, load64(isr_rsp + 136)); # rflags
     store64(p + 16, load64(isr_rsp + 144));  # rsp
+    # 1.44.3: persist the interrupted proc's CS/SS (was discarded) so the resume
+    # can return it to its real privilege level instead of a hardcoded ring-0.
+    store64(&proc_cs + pid * 8, load64(isr_rsp + 128));   # cs @ frame+128
+    store64(&proc_ss + pid * 8, load64(isr_rsp + 152));   # ss @ frame+152
     return 0;
 }
 
@@ -119,12 +123,13 @@ fn proc_restore_context(pid, isr_rsp) {
     store64(isr_rsp, load64(p + 144));        # r15
     # Hardware frame
     store64(isr_rsp + 120, load64(p + 24));   # rip
-    # CS = 0x08 (kernel code segment)
-    store64(isr_rsp + 128, 0x08);
+    # 1.44.3: CS from the proc table (ring-0 0x08 / ring-3 0x1B) — was hardcoded
+    # 0x08, which iretq'd every switched-to proc into ring 0 regardless of privilege.
+    store64(isr_rsp + 128, load64(&proc_cs + pid * 8));
     store64(isr_rsp + 136, load64(p + 152));  # rflags
     store64(isr_rsp + 144, load64(p + 16));   # rsp
-    # SS = 0x10 (kernel data segment)
-    store64(isr_rsp + 152, 0x10);
+    # 1.44.3: SS from the proc table (ring-0 0x10 / ring-3 0x23) — was hardcoded 0x10.
+    store64(isr_rsp + 152, load64(&proc_ss + pid * 8));
     return 0;
 }
 

@@ -5,6 +5,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.3] — 2026-06-09 (1.44.x — per-process CS/SS: remove the ring-0 context-switch hardcode)
+
+Fourth multi-threading-arc bite, and the first step toward preemptive ring-3
+time-slicing: the scheduler can now resume a proc to its REAL privilege level
+instead of forcing ring-0. Behavior-preserving — every current proc is ring-0.
+
+### Changed
+
+- **`proc_restore_context` reads CS/SS from the proc table instead of hardcoding
+  `CS=0x08` / `SS=0x10`** (`core/sched.cyr`), and `proc_save_context` now persists the
+  interrupted proc's CS/SS (it had discarded them). The selectors live in pid-indexed
+  parallel arrays `proc_cs[]` / `proc_ss[]` (`core/proc.cyr`), like `proc_signals` —
+  NOT new `Process`-struct fields, which would push the slot past 176 B and force
+  changing the `pid * 176` stride at ~16 sites. `proc_create` / `proc_create_full`
+  default both to ring-0 (0x08/0x10), so every kmain/idle/kthread proc round-trips
+  byte-identically. This bite is purely the removal of the hardcode wall — the
+  prerequisite blocker for ring-3 preemption. Nothing yet sets ring-3 selectors or
+  makes ring-3 code preemptible (IF stays 0 at ring-3 entry); those are the next
+  staged bites.
+
+### Notes
+
+- Designed via a multi-agent map + adversarial-review pass. Key correction: the feared
+  KPTI hazard is a non-issue — agnos runs **collapsed KPTI** (the per-proc CR3 is a full
+  kernel superset incl. the APIC at PDPT[3]), so a timer firing in ring 3 reads kernel
+  data + EOIs with no CR3 switch. The real wall was just this CS/SS hardcode. The genuine
+  remaining wall is the single shared TSS RSP0 (0x200000) + shared syscall kstack — two
+  preemptible ring-3 procs making syscalls would collide, which needs per-proc kernel
+  stacks (a later bite). Next: ring-3 selectors on `spawn_user_proc` → IF=1 + a
+  syscall-free two-ring-3-proc selftest (the capability proof) → per-proc RSP0.
+- Validated (the `proc_save/restore_context` path is regalloc-sensitive — a break is a
+  cold-boot triple-fault, so a clean boot is load-bearing): `thread-smoke` (ring-0
+  kthreads round-trip the table-driven CS/SS) + `agnsh-smoke` (clean boot to
+  `[ASSIST] >`, single ring-3 via `exec_and_wait`) + `doom-smoke` (single ring-3 render)
+  + `sweep.sh` **7/7** (exec-from-disk + FS) — all green. `exec_and_wait` builds its own
+  iretq frame and longjmps over the scheduler (never reaches `proc_restore_context`), so
+  the change is invisible to it. +560 B.
+
 ## [1.44.2] — 2026-06-09 (1.44.x — reentrancy gate applied: the FS write-fd slot allocator)
 
 Third multi-threading-arc bite: apply the 1.44.0 preempt gate to the first piece of

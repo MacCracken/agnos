@@ -32,6 +32,17 @@ var proc_current = 0;
 var sched_active = 0;
 var proc_signals[128];  # 16 processes x 8 bytes
 var proc_sigmask[128];  # 16 processes x 8 bytes
+# 1.44.3 (multi-threading): per-process saved CS/SS selectors so the scheduler can
+# resume a proc to its REAL privilege level — ring-0 (0x08/0x10) for kmain/idle/
+# kthreads, ring-3 (0x1B/0x23) for user procs — instead of proc_restore_context
+# hardcoding ring-0. Parallel pid-indexed arrays (like proc_signals), NOT new
+# Process-struct fields: that would push the slot past 176 B and require changing
+# the `pid * 176` stride at ~16 sites. Default ring-0 so every existing proc
+# round-trips byte-identically (this bite is behavior-preserving); spawn_user_proc
+# will set ring-3 in a later bite. proc_save_context persists the interrupted
+# proc's CS/SS here; proc_restore_context reads them back into the iretq frame.
+var proc_cs[16];        # saved CS per pid (default 0x08 = ring-0 kernel code)
+var proc_ss[16];        # saved SS per pid (default 0x10 = ring-0 kernel data)
 var pending_signal_flag = 0;  # Set by scheduler ISR, read by main — benign race (atomic store on x86_64)
 
 # === 1.44.x multi-threading (opening) — preempt gate ===
@@ -63,6 +74,9 @@ fn proc_create(entry) {
     store64(p + 152, 0x200);
     # Default: use kernel page tables
     store64(p + 160, 0x1000);
+    # 1.44.3: default ring-0 selectors (kmain/idle/kthreads). spawn_user_proc overrides.
+    store64(&proc_cs + idx * 8, 0x08);
+    store64(&proc_ss + idx * 8, 0x10);
     proc_count = proc_count + 1;
     return idx;
 }
@@ -103,6 +117,9 @@ fn proc_create_full(entry, stack_top) {
     store64(p + 80, stack_top);
     # Default: use kernel page tables
     store64(p + 160, 0x1000);
+    # 1.44.3: default ring-0 selectors (kmain/idle/kthreads). spawn_user_proc overrides.
+    store64(&proc_cs + idx * 8, 0x08);
+    store64(&proc_ss + idx * 8, 0x10);
     proc_count = proc_count + 1;
     return idx;
 }
