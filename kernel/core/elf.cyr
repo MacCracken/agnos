@@ -131,7 +131,6 @@ fn elf_load(elf_addr, elf_size) {
     # makes a fixed VA safe. MANDATORY pairing: pmm_alloc_2mb (NOT pmm_alloc) — proc_map_page
     # installs a 2 MB huge page, so a 4 KB phys would alias to floor_2MB(phys) (now that the
     # VA actually resolves) and proc_free_address_space's pmm_free_2mb needs 2 MB alignment.
-    var pid = proc_count;
     var stack_base = 0x3FC00000;
     var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }
@@ -294,7 +293,6 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     # to RIP=0. Each process has its own CR3, so a fixed VA is safe; the arena
     # (PD[128..510]) is non-identity, so no pmm phys aliases it. mmap bumps up from
     # 0x10000000 with a ceiling (0x3FA00000) below this stack + its guard page.
-    var pid = proc_count;
     var stack_base = 0x3FC00000;
     var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }

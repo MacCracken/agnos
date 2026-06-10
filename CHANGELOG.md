@@ -5,6 +5,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.12] — 2026-06-10 (1.44.x — non-LIFO proc-table-slot reclaim: out-of-order background-job exits)
+
+The next "schedulable agnsh" blocker, cleared: an out-of-order background-job exit reaped a NON-TOP
+proc-table slot, but append-only allocation never reused it — leaking the 16-slot table even though
+the memory was freed. Slot allocation now recycles dead slots.
+
+### Fixed
+
+- **Non-LIFO proc-table-slot reclaim** (`core/proc.cyr`). `proc_reap`/`proc_reap_child` free the address
+  space + pages and mark the slot `state==0`, but reclaimed the slot INDEX only LIFO (`if pid==proc_count-1`),
+  so a non-top reap left a dead hole that append-only `proc_create`/`proc_create_full` never reused — the
+  16-slot table leaks/exhausts under out-of-order background exits. **Fix:** a new `proc_alloc_slot()` scans
+  `[0,proc_count)` for the first `state==0` slot and REUSES it (else appends at the high-water mark, cap 16);
+  both create paths call it. The LIFO collapse stays in both reapers as a harmless tightening optimization.
+  The **foreground iron path is byte-identical** — sequential `run` exec is create-at-top → run → LIFO-collapse,
+  so no hole is ever created and the scan finds nothing (the 1.40.14 `reap: slot reclaim OK (pc stable)`
+  assertion stays green). `sched_next` already skips `state!=1` holes, so it needed no change.
+- **Recycled-slot signal hygiene** (the regression non-LIFO reuse exposes): `proc_signals[idx]`/`proc_sigmask[idx]`
+  were cleared on neither create nor reap (the create paths reset `proc_cs`/`proc_ss` but not these). Latent under
+  LIFO; under reuse a recycled slot would inherit the prior occupant's pending signals + mask. `proc_alloc_slot`
+  now zeros both for the returned slot.
+
+### Changed
+
+- Cleanup: deleted 3 dead `var pid = proc_count` reads (`elf.cyr` ×2, `ring3.cyr`) — vestigial striped-VA-era
+  leftovers (the VAs are fixed constants since 1.44.11), now also a foot-gun since `pid != proc_count` under reuse.
+- `sysinfo`#35's `proc_count` field comment corrected: it's the proc-table high-water mark (≥ live count; non-LIFO
+  holes may make it over-report) — a cosmetic ring-3 stat, no control flow depends on it.
+
+### Added
+
+- **`RING3_SELFTEST` non-LIFO proof** (`core/main.cyr` + `scripts/ring3-smoke.sh`). On a dense table: spawn A (exits)
+  below B (stays alive) → reap A NON-TOP → spawn C must REUSE A's slot (`pidC==pidA`, `proc_count` unchanged), and a
+  pending signal stamped on A's slot must NOT survive into C. New asserts **`ring3: nonlifo reuse OK`** +
+  **`ring3: nonlifo signal clear OK`**. Before/after verified: with append-only allocation C appends (`C=4, pc grows`)
+  → FAIL; with the fix `C=2` (reused) → PASS.
+
+### Notes
+
+- Validated: `ring3-smoke` **7/7** + `exec-smoke` 9/9 (foreground reap-stability byte-identical) + `sweep` 7/7 +
+  `check.sh` 11/11. Production 1,141,840 B. **PID-RECYCLE caveat** (documented in the `proc_alloc_slot` header):
+  a pid is a slot index, so reuse recycles a pid — safe today because reuse only follows a reap done BY the reaper
+  (waitpid#4/execwait#37) after it captured the exit code; a FUTURE consumer caching a pid across a yield (a real
+  blocking waitpid, an agnsh job table, kill-by-saved-pid) must re-validate the slot. The scan+reuse is atomic only
+  under the single-core no-preempt invariant; the SMP arc must add a lock / per-CPU free-list. With this + the
+  1.44.11 page-table fix, the remaining "schedulable agnsh" work is wiring `spawn_path`#43 into agnsh `&` behind a
+  prompt-key-wait that drops `preempt_disable` (so bg jobs aren't frozen at the prompt). Iron rides the next burn.
+
 ## [1.44.11] — 2026-06-10 (1.44.x — page-table VA-collision fix: many concurrent ring-3 procs)
 
 The foundational multi-proc blocker for "schedulable agnsh" (and the broader multi-threading

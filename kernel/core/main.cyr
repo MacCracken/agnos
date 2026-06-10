@@ -2266,7 +2266,66 @@ fn ring3_spawn_idle() {
     proc_set_ring3(pid);
     return pid;
 }
+# 1.44.x non-LIFO reap proof: a minimal exit-only ring-3 payload (no memory write → no
+# counter map needed): mov eax,0; xor edi,edi; syscall(exit 0); jmp $ (spin until reaped).
+var ring3_exit_payload[16];
+fn ring3_exit_fill() {
+    store8(&ring3_exit_payload + 0, 0xB8);   # mov eax, 0 (exit)
+    store8(&ring3_exit_payload + 1, 0x00);
+    store8(&ring3_exit_payload + 2, 0x00);
+    store8(&ring3_exit_payload + 3, 0x00);
+    store8(&ring3_exit_payload + 4, 0x00);
+    store8(&ring3_exit_payload + 5, 0x31);   # xor edi, edi (code 0)
+    store8(&ring3_exit_payload + 6, 0xFF);
+    store8(&ring3_exit_payload + 7, 0x0F);   # syscall
+    store8(&ring3_exit_payload + 8, 0x05);
+    store8(&ring3_exit_payload + 9, 0xEB);   # jmp -2 (spin)
+    store8(&ring3_exit_payload + 10, 0xFE);
+    return 0;
+}
+# Prove the NON-LIFO proc-table-slot reclaim. Runs FIRST in selftest-setup on a DENSE table
+# (only proc 0 + idle, no holes) for deterministic pids, then fully cleans up so the main
+# selftest starts fresh. Spawn A (exits) then B (stays alive) — A takes the lower slot so it
+# sits BELOW B; reaping A is a NON-TOP reap → A's slot becomes a mid-range hole; the next spawn
+# (C) must REUSE that hole (pidC == pidA, proc_count unchanged) rather than append. Also proves
+# proc_alloc_slot CLEARS the recycled slot's pending-signal state. Pre-fix: C appends (pidC !=
+# pidA, proc_count grows, A's slot leaks) and a stale signal survives. KERNEL context (direct
+# spawn/reap, not ring-3 syscalls).
+fn ring3_nonlifo_check() {
+    ring3_exit_fill();
+    var pidA = spawn_user_proc(&ring3_exit_payload);   # A: exits (lower slot — spawned first)
+    if (pidA < 0) { kprintln("ring3: FAIL nonlifo (no A)", 26); return 0; }
+    proc_set_ring3(pidA);
+    var pidB = ring3_spawn_idle();                     # B: stays alive, ABOVE A → A non-top
+    if (pidB < 0) { kprintln("ring3: FAIL nonlifo (no B)", 26); return 0; }
+    var w = 0;                                         # drive scheduler until A exits, bounded
+    while (w < 3000) {
+        if (proc_get_state(pidA) == 0) { w = 3000; } else { arch_wait(); w = w + 1; }
+    }
+    proc_send_signal(pidA, 10);                        # stamp a pending signal on A's (dead) slot
+    proc_reap_child(pidA);                             # NON-TOP reap (B above) → A's slot is a hole
+    var pc1 = proc_count;                              # high-water mark AFTER the non-top reap
+    var pidC = spawn_user_proc(&ring3_exit_payload);   # C: must REUSE A's hole (created, not run)
+    var sig = proc_check_pending_signals(pidC);        # must be 0 — proc_alloc_slot cleared it
+    kprint("ring3: nl A=", 12); kprint_num(pidA); kprint(" B=", 3); kprint_num(pidB); kprint(" C=", 3); kprint_num(pidC); kprint(" pc1=", 5); kprint_num(pc1); kprint(" pc=", 4); kprint_num(proc_count); kprintln("", 0);
+    if (pidC == pidA) {
+        if (proc_count == pc1) { kprintln("ring3: nonlifo reuse OK", 23); }   # reused, no append
+        else { kprintln("ring3: FAIL nonlifo leak", 24); }
+    } else { kprintln("ring3: FAIL nonlifo leak", 24); }
+    if (sig == 0) { kprintln("ring3: nonlifo signal clear OK", 30); } else { kprintln("ring3: FAIL nonlifo signal", 26); }
+    # Clean up TOP-DOWN so the LIFO collapse returns proc_count to its pre-check value (dense
+    # table for the main selftest). Higher pid first: B then C.
+    if (pidB > pidC) {
+        proc_set_state(pidB, 0); proc_reap_child(pidB);
+        proc_set_state(pidC, 0); proc_reap_child(pidC);
+    } else {
+        proc_set_state(pidC, 0); proc_reap_child(pidC);
+        proc_set_state(pidB, 0); proc_reap_child(pidB);
+    }
+    return 0;
+}
 fn ring3_selftest_setup() {
+    ring3_nonlifo_check();                            # non-LIFO slot-reuse proof on a dense table (cleans up after)
     ring3_counter_a = pmm_alloc_2mb();               # 2 MB-aligned — proc_map_page maps a 2 MB page
     ring3_counter_b = pmm_alloc_2mb();
     if (ring3_counter_a == 0) { return 0; }

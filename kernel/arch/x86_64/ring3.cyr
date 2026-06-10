@@ -154,7 +154,6 @@ fn spawn_user_proc(entry_fn) {
     # 16-128 MB SMAP-faulted on context switch (proc_get_user_cr3). Each proc has its OWN
     # CR3, so a fixed VA is safe (no inter-proc aliasing) — same VA elf_load_from_file's
     # segment uses (elf.cyr:163).
-    var pid = proc_count;
     var code_va = 0x400000;
     proc_map_page(new_cr3, code_va, code_phys);
 

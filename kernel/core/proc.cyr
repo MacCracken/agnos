@@ -60,9 +60,40 @@ fn preempt_disable() { preempt_count = preempt_count + 1; return 0; }
 fn preempt_enable() { if (preempt_count > 0) { preempt_count = preempt_count - 1; } return 0; }
 fn preempt_enabled() { if (preempt_count == 0) { return 1; } return 0; }
 
+# Allocate a proc_table slot. NON-LIFO (1.44.x): REUSE the first dead (state==0) slot in
+# [0,proc_count) so an out-of-order background-job reap does not leak its slot; else APPEND
+# at proc_count (cap 16). Returns the slot index, or -1 if the table is full. CLEARS the
+# pid-indexed signal arrays (proc_signals/proc_sigmask) for the slot so a RECYCLED slot does
+# not inherit the prior occupant's pending signals or mask — the create paths reset
+# proc_cs/proc_ss but NOT these two, which were never cleared (latent under the old LIFO-only
+# reclaim, live under reuse).
+#   INVARIANT: scan+reuse is atomic w.r.t. the scheduler on the single-core no-preempt model
+#   (do_context_switch no-ops while preempt_count>0; the reap paths run IF=0 in-handler / under
+#   boot CR3). The multi-threading/SMP arc ([[project_multithreading_future_arc]]) must add a
+#   lock or per-CPU free-list here.
+#   PID-RECYCLE: a pid IS a slot index, so a reused slot RECYCLES that pid. Safe today because
+#   reuse only follows a reap done BY the reaper (waitpid#4 / execwait#37) AFTER it captured the
+#   exit code. A FUTURE consumer caching a pid across a yield (real blocking waitpid, an agnsh
+#   job table, kill-by-saved-pid) MUST re-validate the slot still names the same logical process.
+fn proc_alloc_slot() {
+    var i = 0;
+    var idx = 0 - 1;
+    while (i < proc_count) {
+        if (load64(&proc_table + i * 176 + 8) == 0) { idx = i; i = proc_count; }   # reuse a dead slot
+        else { i = i + 1; }
+    }
+    if (idx < 0) {
+        if (proc_count >= 16) { return 0 - 1; }
+        idx = proc_count;
+        proc_count = proc_count + 1;
+    }
+    store64(&proc_signals + idx * 8, 0);
+    store64(&proc_sigmask + idx * 8, 0);
+    return idx;
+}
 fn proc_create(entry) {
-    if (proc_count >= 16) { return 0 - 1; }
-    var idx = proc_count;
+    var idx = proc_alloc_slot();
+    if (idx < 0) { return 0 - 1; }
     var p = &proc_table + idx * 176;
     store64(p, idx);          # pid
     store64(p + 8, 1);        # state: 1=ready
@@ -77,8 +108,7 @@ fn proc_create(entry) {
     # 1.44.3: default ring-0 selectors (kmain/idle/kthreads). spawn_user_proc overrides.
     store64(&proc_cs + idx * 8, 0x08);
     store64(&proc_ss + idx * 8, 0x10);
-    proc_count = proc_count + 1;
-    return idx;
+    return idx;                          # 1.44.x: slot + proc_count handled by proc_alloc_slot
 }
 
 fn proc_get_state(pid) {
@@ -115,8 +145,8 @@ fn proc_count_by_state(st) {
 
 # Extended process creation with stack
 fn proc_create_full(entry, stack_top) {
-    if (proc_count >= 16) { return 0 - 1; }
-    var idx = proc_count;
+    var idx = proc_alloc_slot();         # 1.44.x: non-LIFO slot reuse (else append, cap 16)
+    if (idx < 0) { return 0 - 1; }
     var p = &proc_table + idx * 176;
     store64(p, idx);          # pid
     store64(p + 8, 1);        # state: 1=ready
@@ -133,8 +163,7 @@ fn proc_create_full(entry, stack_top) {
     # 1.44.3: default ring-0 selectors (kmain/idle/kthreads). spawn_user_proc overrides.
     store64(&proc_cs + idx * 8, 0x08);
     store64(&proc_ss + idx * 8, 0x10);
-    proc_count = proc_count + 1;
-    return idx;
+    return idx;                          # 1.44.x: slot + proc_count handled by proc_alloc_slot
 }
 
 # === 1.44.x multi-threading (opening) — kernel-thread primitive ===

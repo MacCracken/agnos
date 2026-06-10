@@ -810,7 +810,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         store64(arg1 +  0, timer_ticks / 100);            # uptime seconds (100 Hz)
         store64(arg1 +  8, pmm_total * 4096);             # total RAM bytes (4 KB pages)
         store64(arg1 + 16, pmm_free_count() * 4096);      # free RAM bytes
-        store64(arg1 + 24, proc_count);                   # live process count
+        store64(arg1 + 24, proc_count);                   # proc-table high-water mark (1.44.x: ≥ live count — non-LIFO holes may make it over-report; cosmetic stat field, no control flow depends on it)
         store64(arg1 + 32, cpu_count);                    # online CPUs (=1 until SMP enumerates)
         stack_canary_check(canary);
         return 0;
