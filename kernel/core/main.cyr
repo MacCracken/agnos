@@ -1995,60 +1995,96 @@ fn thread_selftest_verify() {
 #endif
 
 #ifdef RING3_SELFTEST
-# === 1.44.4 RING3_SELFTEST — first scheduler-entered ring-3 proc, preempted + resumed ===
-# A single ring-3 proc (its OWN per-process CR3, IF=1) runs a syscall-free tight loop
-# incrementing a u64 at user VA 0x2000000. The selftest maps that VA (user-writable in
-# the proc's CR3) onto a kernel-readable physical page. If the counter advances while
-# kmain hlt-waits, the timer preempted the ring-3 proc UNDER ITS OWN CR3 and the
-# scheduler iretq'd back into ring 3 (CS=0x23 — the 1.44.3 table-driven restore + the
-# 1.44.4 proc_set_ring3). Then preempt_disable() must FREEZE it (the gate covers ring-3
-# too). Syscall-free so a preemption never lands on the shared syscall kstack (the
-# deferred RSP0 wall).
+# === RING3_SELFTEST — preemptive ring-3 (1.44.4 one proc · 1.44.5 two procs · 1.44.6 syscalls) ===
+# Spawn TWO ring-3 procs, each with its OWN per-process CR3 + IF=1, each running the SAME
+# raw-machine-code loop: a getpid SYSCALL (1.44.6) then increment a u64 at user VA 0x2000000.
+# Because each proc has a distinct CR3, that one user VA maps to a DIFFERENT physical
+# counter per proc — so two advancing counters proves (a) the scheduler round-robins
+# ring-3 <-> ring-3 across two DIFFERENT per-proc CR3s (cr3_load A->B->A every slice),
+# (b) per-proc address-space isolation (same VA, separate memory), and (c) a PREEMPTIBLE
+# ring-3 proc can SYSCALL safely. The timer preempts each under its own CR3 and the
+# scheduler iretq's back into ring 3 (CS=0x23 — the 1.44.3 table-driven restore + the
+# 1.44.4 proc_set_ring3). preempt_disable() must FREEZE both.
+#
+# 1.44.6 dissolved the supposed "shared-kstack wall": syscall handlers run IF=0 (SFMASK
+# clears IF on SYSCALL entry) and the few sti-window syscalls are preempt-gated (1.44.1),
+# so NO syscall is ever preempted mid-handler — the shared syscall kstack (0x3F0000) is
+# serial, and no per-proc kernel stack is needed.
 #
 # The payload is RAW machine code in a byte array, NOT a Cyrius fn: a compiled fn's
 # prologue does a relocate-sensitive access (CR2=0 #PF at the entry) once spawn_user_proc
 # memcpy's it to the user code page at a different VA. Raw bytes have no prologue and the
 # only address they touch is the absolute imm64 0x2000000, so they survive the relocation.
-var ring3_counter_phys = 0;
-var ring3_test_pid = 0;
-var ring3_payload[16];          # raw ring-3 code; only the first 15 bytes are used
+var ring3_counter_a = 0;
+var ring3_counter_b = 0;
+var ring3_pid_a = 0;
+var ring3_pid_b = 0;
+var ring3_payload[16];          # raw ring-3 code; first 22 bytes are used
+fn ring3_payload_fill() {
+    # 1.44.6: each loop iteration makes a getpid SYSCALL (#2), THEN increments the
+    # counter — proving a PREEMPTIBLE ring-3 proc can syscall safely. The handler runs
+    # IF=0 (SFMASK clears IF on SYSCALL entry) so it is never preempted mid-syscall, and
+    # the few sti-window syscalls are preempt-gated (1.44.1) — so the shared syscall
+    # kstack (0x3F0000) stays serial, no per-proc kstack needed. The body re-loads the
+    # counter addr each iteration because the syscall clobbers rax/rcx/r11 (rbx is
+    # reloaded too, so it does not depend on the handler preserving callee-saved regs):
+    #   mov eax,2 ; syscall ; movabs rbx,0x2000000 ; inc qword [rbx] ; jmp -22
+    store8(&ring3_payload + 0, 0xB8);  store8(&ring3_payload + 1, 0x02);   # mov eax, 2 (getpid)
+    store8(&ring3_payload + 2, 0x00);  store8(&ring3_payload + 3, 0x00);  store8(&ring3_payload + 4, 0x00);
+    store8(&ring3_payload + 5, 0x0F);  store8(&ring3_payload + 6, 0x05);   # syscall
+    store8(&ring3_payload + 7, 0x48);  store8(&ring3_payload + 8, 0xBB);   # movabs rbx, 0x2000000
+    store8(&ring3_payload + 9, 0x00);  store8(&ring3_payload + 10, 0x00); store8(&ring3_payload + 11, 0x00); store8(&ring3_payload + 12, 0x02);
+    store8(&ring3_payload + 13, 0x00); store8(&ring3_payload + 14, 0x00); store8(&ring3_payload + 15, 0x00); store8(&ring3_payload + 16, 0x00);
+    store8(&ring3_payload + 17, 0x48); store8(&ring3_payload + 18, 0xFF); store8(&ring3_payload + 19, 0x03);   # inc qword [rbx]
+    store8(&ring3_payload + 20, 0xEB); store8(&ring3_payload + 21, 0xEA);  # jmp -22 (back to mov eax,2)
+    return 0;
+}
+# Spawn one syscall-free ring-3 proc and map its 0x2000000 onto `counter_phys`. -1 on fail.
+fn ring3_spawn_one(counter_phys) {
+    var pid = spawn_user_proc(&ring3_payload);       # per-proc CR3 + user code/stack, state=ready
+    if (pid < 0) { return 0 - 1; }
+    proc_map_page(proc_get_cr3(pid), 0x2000000, counter_phys);   # this proc's OWN CR3 -> its own counter
+    proc_set_ring3(pid);                             # CS=0x23 / SS=0x1B (else it would iretq into ring 0)
+    return pid;
+}
 fn ring3_selftest_setup() {
-    # movabs rax, 0x2000000 ; inc qword [rax] ; jmp -5  (back to the inc — loop forever)
-    store8(&ring3_payload + 0, 0x48);  store8(&ring3_payload + 1, 0xB8);
-    store8(&ring3_payload + 2, 0x00);  store8(&ring3_payload + 3, 0x00);
-    store8(&ring3_payload + 4, 0x00);  store8(&ring3_payload + 5, 0x02);
-    store8(&ring3_payload + 6, 0x00);  store8(&ring3_payload + 7, 0x00);
-    store8(&ring3_payload + 8, 0x00);  store8(&ring3_payload + 9, 0x00);
-    store8(&ring3_payload + 10, 0x48); store8(&ring3_payload + 11, 0xFF); store8(&ring3_payload + 12, 0x00);
-    store8(&ring3_payload + 13, 0xEB); store8(&ring3_payload + 14, 0xFB);
-    ring3_counter_phys = pmm_alloc_2mb();           # 2 MB-aligned — proc_map_page maps a 2 MB page
-    if (ring3_counter_phys == 0) { return 0; }
-    if (vmm_is_mapped(ring3_counter_phys) == 0) { vmm_map(ring3_counter_phys, ring3_counter_phys, 0x83); }
-    store64(ring3_counter_phys, 0);                  # zero the counter
-    ring3_test_pid = spawn_user_proc(&ring3_payload);   # per-proc CR3 + user code/stack, state=ready
-    if (ring3_test_pid < 0) { return 0; }
-    # Map the counter user-writable at 0x2000000 in the proc's address space
-    # (clear of its code 0x400000+ and stack 0x800000+ bands).
-    proc_map_page(proc_get_cr3(ring3_test_pid), 0x2000000, ring3_counter_phys);
-    proc_set_ring3(ring3_test_pid);                  # CS=0x23 / SS=0x1B (else it would iretq into ring 0)
+    ring3_payload_fill();
+    ring3_counter_a = pmm_alloc_2mb();               # 2 MB-aligned — proc_map_page maps a 2 MB page
+    ring3_counter_b = pmm_alloc_2mb();
+    if (ring3_counter_a == 0) { return 0; }
+    if (ring3_counter_b == 0) { return 0; }
+    if (vmm_is_mapped(ring3_counter_a) == 0) { vmm_map(ring3_counter_a, ring3_counter_a, 0x83); }
+    if (vmm_is_mapped(ring3_counter_b) == 0) { vmm_map(ring3_counter_b, ring3_counter_b, 0x83); }
+    store64(ring3_counter_a, 0);
+    store64(ring3_counter_b, 0);
+    ring3_pid_a = ring3_spawn_one(ring3_counter_a);
+    ring3_pid_b = ring3_spawn_one(ring3_counter_b);
     return 0;
 }
 fn ring3_selftest_verify() {
     var i = 0;
-    while (i < 60) { arch_wait(); i = i + 1; }       # timer round-robins kmain -> ring-3 proc -> kmain
-    var c = load64(ring3_counter_phys);
-    kprint("ring3: counter=", 15); kprint_num(c); kprintln("", 0);
-    if (c > 0) { kprintln("ring3: preempt OK", 17); }
-    else { kprintln("ring3: FAIL no advance", 22); }
-    # Preempt gate covers ring-3: under preempt_disable the counter must FREEZE.
-    var snap = load64(ring3_counter_phys);
+    while (i < 80) { arch_wait(); i = i + 1; }        # round-robin kmain -> idle -> ring3-A -> ring3-B -> ...
+    var ca = load64(ring3_counter_a);
+    var cb = load64(ring3_counter_b);
+    kprint("ring3: A=", 9); kprint_num(ca); kprint(" B=", 3); kprint_num(cb); kprintln("", 0);
+    # BOTH advancing => two ring-3 procs with DIFFERENT CR3s time-sliced (ring-3<->ring-3).
+    if (ca > 0) {
+        if (cb > 0) { kprintln("ring3: preempt OK", 17); }
+        else { kprintln("ring3: FAIL B", 13); }
+    } else { kprintln("ring3: FAIL A", 13); }
+    # Preempt gate covers ring-3: under preempt_disable BOTH counters must FREEZE.
+    var sa = load64(ring3_counter_a);
+    var sb = load64(ring3_counter_b);
     preempt_disable();
     var g = 0;
     while (g < 20) { arch_wait(); g = g + 1; }
     preempt_enable();
-    if (load64(ring3_counter_phys) == snap) { kprintln("ring3: gate held", 16); }
-    else { kprintln("ring3: gate LEAK", 16); }
-    proc_set_state(ring3_test_pid, 0);               # retire the ring-3 proc; boot continues
+    if (load64(ring3_counter_a) == sa) {
+        if (load64(ring3_counter_b) == sb) { kprintln("ring3: gate held", 16); }
+        else { kprintln("ring3: gate LEAK", 16); }
+    } else { kprintln("ring3: gate LEAK", 16); }
+    proc_set_state(ring3_pid_a, 0);                  # retire both ring-3 procs; boot continues
+    proc_set_state(ring3_pid_b, 0);
     kprintln("ring3: done", 11);
     return 0;
 }

@@ -5,6 +5,59 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.6] — 2026-06-10 (1.44.x — preemptible ring-3 procs make syscalls safely; the "kstack wall" dissolves)
+
+Proves the FULL preemptive-ring-3 capability: two ring-3 procs, each preemptible (IF=1)
+with its own CR3, now make real syscalls in a loop — concurrently, with no corruption.
+The supposed "per-proc kernel stack" wall turns out not to exist.
+
+### Changed
+
+- **`RING3_SELFTEST` payload now makes a `getpid` syscall (#2) each iteration** before
+  incrementing its counter (`core/main.cyr`). `ring3-smoke` green: both procs reach
+  ~86–90 K loops (far below 1.44.5's ~127 M pure-increment — each iteration now traps to
+  ring 0 and back, confirming real syscalls), both freeze under `preempt_disable()`, no
+  crash. So a PREEMPTIBLE ring-3 proc can syscall safely, and two can do so concurrently.
+
+### Notes
+
+- **The shared-kstack "wall" was a non-issue.** A syscall handler can't be preempted
+  mid-flight: `SFMASK` (0x40700) clears IF on every `SYSCALL` entry, so handlers run with
+  interrupts OFF, and the only handlers that re-open an IF window (`kbd_read_blocking`,
+  `sleep_ms`, `kbscan`) are `preempt_disable()`'d (1.44.1). So no syscall is ever
+  context-switched away — the shared syscall kstack (0x3F0000) and TSS RSP0 (0x200000)
+  stay serial, and **no per-proc kernel stack is needed**. The 1.44.3 design note that
+  flagged this as the blocking wall is superseded. Residual (a checklist item, not a
+  wall): any *future* syscall that opens an IF window must adopt the 1.44.1 preempt-gate.
+- Production **byte-identical** (all changes gated under `RING3_SELFTEST`). `check.sh`
+  11/11 (size unchanged 1,123,624 B); `ring3-smoke` green.
+
+## [1.44.5] — 2026-06-10 (1.44.x — two concurrent ring-3 procs time-slice with isolated address spaces)
+
+Extends the 1.44.4 preemptive-ring-3 milestone to TWO procs: the scheduler now
+round-robins ring-3 ↔ ring-3 across two DIFFERENT per-process CR3s.
+
+### Changed
+
+- **`RING3_SELFTEST` spawns two ring-3 procs** (`core/main.cyr`), each with its own
+  per-process CR3 + IF=1, each running the SAME syscall-free raw-machine-code loop
+  incrementing user VA `0x2000000`. Because the address spaces are distinct, that one VA
+  maps to a DIFFERENT physical counter per proc — so both counters advancing
+  (`ring3-smoke`: A≈183 M, B≈224 M) proves (a) the scheduler `cr3_load`s A→B→A every slice
+  (ring-3↔ring-3, not just ring-3↔ring-0-idle as in 1.44.4) and (b) per-proc
+  address-space isolation (same VA, separate memory). Both freeze together under
+  `preempt_disable()` (`ring3: gate held`). Refactored into `ring3_payload_fill` +
+  `ring3_spawn_one(counter_phys)` helpers.
+
+### Notes
+
+- Production is **byte-identical to 1.44.4** — every change is inside `#ifdef
+  RING3_SELFTEST` (gated off in production). `check.sh` 11/11 (size unchanged 1,123,624 B);
+  `ring3-smoke` green. Two syscall-free procs share the single TSS RSP0 safely because each
+  timer ISR fully completes (save→switch→restore→iretq) before the next interrupt
+  (single-core serial ISR completion); the RSP0 wall is specifically about being preempted
+  MID-SYSCALL — still the next bite (per-proc kernel stacks + RSP0).
+
 ## [1.44.4] — 2026-06-09 (1.44.x — preemptive ring-3: a user proc time-slices under the scheduler)
 
 The central multi-threading milestone: a ring-3 process with its OWN per-process CR3

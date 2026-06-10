@@ -1,13 +1,14 @@
 #!/bin/bash
-# ring3-smoke (1.44.4) — boots the agnos kernel under qemu + OVMF + gnoboot with
-# RING3_SELFTEST=1 and asserts the first scheduler-entered ring-3 proc is preempted
-# and resumed:
-#   "ring3: preempt OK" — a single ring-3 proc (its OWN per-process CR3, IF=1)
-#                         runs a SYSCALL-FREE loop incrementing a counter at user
-#                         VA 0x2000000; the counter advances while kmain hlt-waits
-#                         => the timer preempted ring-3 code under the proc's CR3
-#                         and the scheduler iretq'd back into ring 3 (CS=0x23).
-#   "ring3: gate held"  — under preempt_disable() the counter FREEZES => the
+# ring3-smoke (1.44.4 one proc / 1.44.5 two procs) — boots agnos under qemu + OVMF +
+# gnoboot with RING3_SELFTEST=1 and asserts preemptive ring-3 time-slicing:
+#   "ring3: preempt OK" — TWO ring-3 procs, each its OWN per-process CR3 + IF=1, each
+#                         running a loop that makes a getpid SYSCALL (1.44.6) then
+#                         increments user VA 0x2000000. BOTH counters advance while kmain
+#                         hlt-waits => the scheduler round-robins ring-3 <-> ring-3 across
+#                         two DIFFERENT CR3s (iretq into ring 3, CS=0x23), the same VA maps
+#                         to distinct per-proc memory (AS isolation), AND a preemptible
+#                         ring-3 proc syscalls safely (handler IF=0, shared kstack serial).
+#   "ring3: gate held"  — under preempt_disable() BOTH counters FREEZE => the
 #                         1.44.0 preempt gate covers ring-3 too.
 #
 # Build first:  RING3_SELFTEST=1 ./scripts/build.sh
@@ -55,6 +56,6 @@ timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
 
 echo "--- serial (ring3 lines) ---"; strings "$LOG" | grep "ring3:" | sed 's/^/  /'
 rc=0
-if strings "$LOG" | grep -q "ring3: preempt OK"; then echo "PASS: a ring-3 proc with its own CR3 was preempted + resumed by the timer/scheduler"; else echo "FAIL: 'ring3: preempt OK' not found — the ring-3 proc never advanced (or triple-faulted)"; rc=1; fi
-if strings "$LOG" | grep -q "ring3: gate held"; then echo "PASS: the preempt gate freezes a ring-3 proc too"; else echo "FAIL: 'ring3: gate held' not found — preempt gate regression for ring-3"; rc=1; fi
+if strings "$LOG" | grep -q "ring3: preempt OK"; then echo "PASS: two ring-3 procs (distinct CR3s) time-sliced ring-3<->ring-3 while making syscalls"; else echo "FAIL: 'ring3: preempt OK' not found — a ring-3 proc never advanced (or triple-faulted)"; rc=1; fi
+if strings "$LOG" | grep -q "ring3: gate held"; then echo "PASS: the preempt gate freezes ring-3 procs too"; else echo "FAIL: 'ring3: gate held' not found — preempt gate regression for ring-3"; rc=1; fi
 exit $rc
