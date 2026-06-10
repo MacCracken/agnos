@@ -1958,12 +1958,53 @@ kprintln("Activating scheduler...", 23);
 # the boot CR3 (0x1000, where kernel_resume left us post-exec) so the equal-CR3
 # guard in do_context_switch skips cr3_load entirely — preemption is pure
 # register save/restore in one shared address space. See sched.cyr kernel_idle_loop.
+#ifdef THREAD_SELFTEST
+# === 1.44.x THREAD_SELFTEST — preemptive kernel-thread time-slicing (opening bite) ===
+# Two kernel threads tight-loop bumping their own counters; they NEVER yield, so if
+# BOTH counters advance, the TIMER preempted + round-robined them — preemptive
+# time-slicing on the shared kernel AS via kthread_create. Then verify the preempt
+# gate: under preempt_disable() the counters must FREEZE (do_context_switch no-ops).
+# Compile-gated: `THREAD_SELFTEST=1 ./scripts/build.sh`.
+var thr_counter_a = 0;
+var thr_counter_b = 0;
+var thr_pid_a = 0;
+var thr_pid_b = 0;
+fn thread_test_a() { while (1 == 1) { thr_counter_a = thr_counter_a + 1; } return 0; }
+fn thread_test_b() { while (1 == 1) { thr_counter_b = thr_counter_b + 1; } return 0; }
+fn thread_selftest_verify() {
+    var i = 0;
+    while (i < 40) { arch_wait(); i = i + 1; }   # yield: timer round-robins kmain->A->B->kmain
+    kprint("thr: A=", 7); kprint_num(thr_counter_a);
+    kprint(" B=", 3); kprint_num(thr_counter_b); kprintln("", 0);
+    if (thr_counter_a > 0) { if (thr_counter_b > 0) { kprintln("thr: preempt OK", 15); } }
+    if (thr_counter_a == 0) { kprintln("thr: A starved", 14); }
+    if (thr_counter_b == 0) { kprintln("thr: B starved", 14); }
+    # Preempt gate: counters must NOT advance while preemption is disabled.
+    var snap_a = thr_counter_a;
+    preempt_disable();
+    var g = 0;
+    while (g < 20) { arch_wait(); g = g + 1; }    # timer wakes the hlt but must NOT switch
+    preempt_enable();
+    if (thr_counter_a == snap_a) { kprintln("thr: gate held", 14); }
+    else { kprintln("thr: gate LEAK", 14); }
+    proc_set_state(thr_pid_a, 0);                 # retire the test threads (skip-on-dead)
+    proc_set_state(thr_pid_b, 0);
+    kprintln("thr: done", 9);
+    return 0;
+}
+#endif
+
 #ifndef KTEST
 proc_count = 0;
 proc_current = 0;
 proc_create(0);                 # proc 0 = kernel main (running now; context saved on first switch-away)
 proc_set_state(0, 2);           # running
 proc_create_full(&kernel_idle_loop, &kernel_idle_stack + 4096);  # proc 1 = idle (ready)
+#ifdef THREAD_SELFTEST
+# 1.44.0 opening bite: spawn two kernel threads on the shared AS (tight-loopers).
+thr_pid_a = kthread_create(&thread_test_a);
+thr_pid_b = kthread_create(&thread_test_b);
+#endif
 #endif
 
 sched_active = 1;
@@ -1974,6 +2015,12 @@ sched_active = 1;
 # stall (no CP 17 ever emitted, no shell prompt) is a scheduler /
 # context-switch issue, not an init issue. Held since Attempt 16.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
+
+#ifdef THREAD_SELFTEST
+# 1.44.0 opening bite: prove preemptive kernel-thread time-slicing + the preempt
+# gate on the live scheduler, then retire the test threads so boot continues.
+thread_selftest_verify();
+#endif
 
 #ifdef KTEST
 # Kernel idle loop: halts, wakes on timer, scheduler switches to A or B

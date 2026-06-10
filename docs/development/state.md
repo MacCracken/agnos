@@ -6,9 +6,9 @@ type: state
 
 # AGNOS — Live State
 
-> **Last refresh**: 2026-06-09 (PM) · kernel **1.44.0** (open cycle; bare production build **1,109,976 B**, x86_64 multiboot2 OK) · cyrius pin **6.0.56**. **1.44.x — userland coreutils delegation**: agnsh (agnoshi **1.5.0**) drops its in-process file verbs; a bareword `cp`/`ls`/`rm`/… resolves through the `/bin` bareword launcher to the staged **kriya** dispatcher (11 `/bin/<verb>` symlinks → `/bin/kriya`) and **owl** is AGNOS's `cat`. Kernel side is staging only — every op already has a syscall (`open`#7/`read`#5/`write`#1/`mkdir`#9/`rmdir`#10/`unlink`#30/`rename`#31/`stat`#33/`getdents`#29); `symlink`#43 (kriya `ln -s`) deferred to backlog. **1.43.x — DOOM plays on iron** (just closed): burn `1438` rendered the title on real Zen, `kbscan`#42 + cyrius-doom 0.28.3 took keyboard input, burn **`1439`** is **in-game E1M1, keyboard-driven** — the "agnsh launches DOOM" milestone is iron-complete.
+> **Last refresh**: 2026-06-09 (PM) · kernel **1.44.0** (open cycle; bare production build **1,127,112 B**, x86_64 multiboot2 OK) · cyrius pin **6.0.56**. **1.44.x — multi-threading / preemptive scheduling**: opening bite landed — `kthread_create` (kernel-thread primitive, generalizes the 1.40.10 idle proc) + a `preempt_count` gate in `do_context_switch` (the "reentrant-or-gated" foundation for the single-core no-lock invariant); `scripts/thread-smoke.sh` proves two kthreads preemptively time-slice on the shared AS (counters in the tens of millions while the timer round-robins them) and FREEZE under `preempt_disable()`. Absorbs the 1.43.x carry-forward (per-process env, FB scaling, zero-copy FB-mmap; first-`mmap` RIP=0 already repaired at 1.43.8). Its **userland testing surface** is the **kriya/owl coreutils delegation** (agnoshi **1.5.0** dropped its in-process verbs → kriya `/bin` dispatcher + owl `cat`; END-TO-END QEMU-green via `agnsh-delegation-test.py`; two consumer fixes kriya 1.1.2 / owl 1.3.8 — the 1.42.x Track-B tail, not the arc itself). **1.43.x — DOOM plays on iron** (just closed): burn `1438` rendered the title on real Zen, `kbscan`#42 + cyrius-doom 0.28.3 took keyboard input, burn **`1439`** is **in-game E1M1, keyboard-driven** — the "agnsh launches DOOM" milestone is iron-complete.
 >
-> **Active arc — 1.44.x userland coreutils delegation.** agnoshi **1.5.0** removed the 12 in-process FS verbs (the 1.42.6 stopgap "until ring-3 execwait") + `src/verbs.cyr` — agnsh is now a pure launcher. **kriya** (`kriya_agnos`, BusyBox-style dispatcher) + **owl** (`owl_agnos`, cat) are staged onto the agnos-fs `/bin` via `scripts/stage-tools.sh`, with 11 `/bin/<verb>` → `kriya` symlinks; a typed `cat` nudges to owl. QEMU-validated via `scripts/agnsh-delegation-test.py` (bareword `mkdir`/`ls`/`touch` → kriya, `owl -p` → cat); iron rides the user's next archaemenid burn (agnosticos [`#tracker-144x-cycle`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md)). Known limit: the execwait argv tokenizer caps at 8 tokens. **Recently closed (detail in CHANGELOG):** **1.43.x graphics/DOOM** — iron-complete, burn `1439` plays DOOM in-game on real Zen (title `1438` + `kbscan`#42 + cyrius-doom 0.28.3 input); **1.42.x kernel perf + hardening ∥ sysinfo/klug** — Track-A perf bites (heap-zeroing 1.42.5 / memory-core 1.42.7 / fs-read 1.42.8 / fb_console 1.42.9) + carry-forward hardening (page-map 1.42.2 / RBP-smash 1.42.3 / reap 1.42.4) all landed, and the `uname`#34 / `sysinfo`#35 / `klog`#36 syscalls + the klug unified log ring shipped (Track-A perf iron-pending; sweep 7/7 throughout). **Backlog:** backspace-on-iron (1.41.x UEFI keyboard-delivery); `symlink`#43 → `lstat`#44 / `readlink`#45 (kriya `ln -s`); raise the execwait 8-arg cap; a `klug`/`dmesg` reader tool + wiring `cmdrs`/`bnrmr`/`mihi`/`iam` to `uname`#34/`sysinfo`#35.
+> **Active arc — 1.44.x multi-threading / preemptive scheduling.** The deep transition from the cooperative single-core model to preemptive multi-threading ([[project_multithreading_future_arc]]). **Opening (1.44.0):** `kthread_create` — a kernel-thread primitive on the shared AS (CR3 0x1000, IF=1) from a static stack pool, generalizing the hand-rolled 1.40.10 idle proc — plus the **preempt gate** (`preempt_count` + `preempt_disable`/`preempt_enable`, wired into `do_context_switch`): a timer tick inside a `preempt_disable()` section is a no-op switch, so the shared scratch buffers / non-reentrant FS code can stay atomic under preemption (the "reentrant-or-gated" foundation that unwinds the no-lock invariant). `THREAD_SELFTEST` / `scripts/thread-smoke.sh` QEMU-green: two kthreads tight-loop to tens-of-millions while the timer round-robins them; both freeze under `preempt_disable()`. **Production unchanged** (`preempt_count`=0 → `do_context_switch` byte-identical; the kthread pool is inert until a thread spawns). **Next bites:** per-process-AS preemptive ring-3 time-slicing (different-CR3 switch mid-slice); the FS-scratch reentrancy audit/gating; `kthread_yield`; concurrent ring-3 `spawn`+`waitpid` (DOOM while the shell stays live); SMP-AP wakeup. **Absorbs 1.43.x carry-forward:** per-process env, FB scaling, zero-copy FB-mmap. **Userland testing surface (done):** the kriya/owl coreutils delegation — agnoshi **1.5.0** dropped its in-process verbs → kriya `/bin` dispatcher (11 `/bin/<verb>` symlinks) + owl `cat`; END-TO-END QEMU-green (`scripts/agnsh-delegation-test.py`); fixed kriya 1.1.2 + owl 1.3.8 (stale-`fnptr` allocator gap). **Recently closed (detail in CHANGELOG):** **1.43.x graphics/DOOM** — iron-complete, burn `1439` plays DOOM in-game on real Zen; **1.42.x perf + hardening ∥ sysinfo/klug** — Track-A perf bites (1.42.5/7/8/9) + carry-forward hardening (1.42.2/3/4) + `uname`#34/`sysinfo`#35/`klog`#36 + the klug log ring (Track-A perf iron-pending). **Backlog:** backspace-on-iron (1.41.x); `symlink`#43 → `lstat`#44/`readlink`#45 (kriya `ln -s`); execwait 8-arg cap; `klug`/`dmesg` reader + wiring `cmdrs`/`bnrmr`/`mihi`/`iam` to `uname`#34/`sysinfo`#35.
 >
 > **History lives elsewhere — this file is current-truth + pointers, NOT a log.** Per-release detail → [`CHANGELOG.md`](../../CHANGELOG.md). Forward plan → [`roadmap.md`](roadmap.md). Iron-burn attempts → agnosticos [`iron-nuc-zen-log.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md). ABI contract → [`agnos-userland-abi.md`](agnos-userland-abi.md).
 >
@@ -27,22 +27,23 @@ type: state
 
 ## Open investigations
 
-The kernel cleared boot-to-shell-on-iron at Attempt 68 (agnos 1.30.9) and stays green; the 1.31.x storage + 1.32.x networking arcs are iron-COMPLETE (DHCP real lease iron-verified at 1.32.9, agnosticos [`#tracker-1329-cycle`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log-mvp2.md#tracker-1329-cycle)). **No MVP blockers.** Two live items:
-
-- **First-`mmap`-return RIP=0 (1.43.6 — workaround-only, NEEDS REPAIR).** The FIRST
-  `mmap` syscall from a freshly-exec'd ring-3 process returns with a corrupted
-  ring-3 register/return state → the process faults at **RIP=0, RBP=0** right after
-  its first heap `mmap` (`-d int`: `v=0e e=0015 cpl=3 RIP=0`). agnsh dodges it (its
-  first syscall is a `write`); cyrius-doom hit it head-on. **cyrius-doom 0.28.2
-  carries a one-line warm-up `mmap` workaround** to ship the DOOM-render milestone —
-  this is NOT a kernel fix. Next: `-d int` a minimal first-`mmap` repro, fix the
-  SYSRET return-state restore in the kernel, remove the doom probe. Tracked in
-  [`docs/development/planning/doom-on-agnos-render-blockers.md`](planning/doom-on-agnos-render-blockers.md).
+The kernel cleared boot-to-shell-on-iron at Attempt 68 (agnos 1.30.9) and stays green; the 1.31.x storage + 1.32.x networking arcs are iron-COMPLETE (DHCP real lease iron-verified at 1.32.9, agnosticos [`#tracker-1329-cycle`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log-mvp2.md#tracker-1329-cycle)). **No MVP blockers.** One live item:
 
 - **AMD Zen scanout residue (Quiet Boot legibility)** — parked at gnoboot 0.4.2 / agnos 1.30.12 with the bug surviving. Two GOP-side SetMode lever variants falsified (Attempt 78 closed the bounce form). Next-cycle resumption options: HUBP `clear_tiling` port (Linux `drivers/gpu/drm/amd/display/` analog) OR architectural eval of a shadow-buffer FB-console model (simpledrm-style). Pin: [`project_amd_zen_scanout_residue`](../../../../.claude/projects/-home-macro-Repos-agnosticos/memory/project_amd_zen_scanout_residue.md). VGA-spec path stays MVP-legible.
 
 ### Resolved (historical, kept as audit trail)
 
+- **2026-06-08 first-`mmap`-return RIP=0 (repaired at 1.43.8)**: was NOT a SYSRET
+  return-state bug — it was user-stack **aliasing**. User stacks sat at
+  `0x800000 + pid*0x400000`, so for pid ≥ 2 the stack VA landed inside the
+  `PD[8..63]` identity-supervisor pmm pool; a later `sys_mmap` `memset(phys,0,2 MB)`
+  whose identity VA aliased the stack zeroed the live ring-3 stack → next `ret`
+  jumped to RIP=0. Recovery-shell `run` (low pid) never aliased — which is why
+  `doom-smoke` passed while agnsh-launched doom (higher pid) locked up. Fixed by
+  relocating user stacks to `0x3FC00000` (top of the non-identity arena) + mmap
+  ceiling `0x3FA00000` + `invlpg` after the PDE store; the cyrius-doom warm-up-`mmap`
+  workaround was removed. Validated: doom renders via both `execwait` and recovery
+  `run` with 0 RIP=0 faults (1.44.x carry-forward, closed). See CHANGELOG [1.43.8].
 - **2026-05-13 RDRAND under default qemu64 CPU**: kernel stalled at `Page tables: 1024MB mapped` because the smoke test missed `-cpu max` (default `qemu64` lacks RDRAND, `pmm_init` → `kaslr_seed` → `rdrand_u64` faulted silently). Real iron supports RDRAND. Fixed in `gnoboot/tests/ovmf_smoke.sh` with `-cpu max`.
 - **2026-05-13/14 Timer-driven context switch under UEFI+gnoboot**: traced to `test_proc_a/b` returning into uninitialized stack memory exposed by gnoboot's pre-handoff state. Closed by Phase 4/5 progression (real user procs replaced test stubs in the boot path) and the iron-validation milestone 2026-05-15 which cleared all 17 init checkpoints + `sched_active=1` + first hlt + context-switch loop on real Zen silicon.
 - **2026-05-17 Phase 3 USB silent-absorb (Repair EE)**: 13-hypothesis arc through Attempts 32-54 chasing a "controller absorbs PORTSC.PR writes" hypothesis. Root cause: `xhci_portsc_write` inner re-mask `& XHCI_PORTSC_NEUTRAL` stripping the RW1S PR bit. One-line fix in `agnos@41ee6dc`. See CHANGELOG [1.30.5] for the narrative.
@@ -108,9 +109,9 @@ All subsystems are **code-complete** through 1.34.6 (1.35.0 cycle just opened). 
 | PMM | Bitmap, 4,096 pages, next-free hint |
 | VMM | map/unmap/alloc, user-accessible pages, UC + WC remap helpers |
 | Kernel Heap | Slab allocator, 8 size classes (32–4,096 B) |
-| Process Table | 16 slots, 168 B context, CR3 per-process |
-| Context Switch | Full register save/restore, CR3 switch |
-| Scheduler | Round-robin |
+| Process Table | 16 slots, 176 B context, CR3 per-process; `kthread_create` spawns shared-AS kernel threads from a static stack pool (1.44.0) |
+| Context Switch | Full register save/restore, CR3 switch (timer-ISR-driven) |
+| Scheduler | Preemptive round-robin; `preempt_count` gate (`preempt_disable`/`preempt_enable`) makes reentrancy-critical sections atomic vs. preemption (1.44.0 multi-threading opening) |
 | SYSCALL/SYSRET | MSR setup, ring 3 transition |
 | ELF Loader | Static ELF64, per-process address space |
 | VFS | File table, device/memfile/signalfd/epoll/timerfd/pipe types |

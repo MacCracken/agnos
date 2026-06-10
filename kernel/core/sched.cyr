@@ -132,6 +132,11 @@ fn proc_restore_context(pid, isr_rsp) {
 # isr_rsp = stack pointer after ISR has pushed all caller-saved regs.
 fn do_context_switch(isr_rsp) {
     if (sched_active == 0) { return 0; }
+    # 1.44.x preempt gate: a critical section that ran preempt_disable() (shared
+    # scratch buffers / non-reentrant FS) must not be switched away from. A timer
+    # tick inside it is a no-op switch; the pending reschedule lands on the next
+    # tick after preempt_enable() drops the count to 0.
+    if (preempt_count > 0) { return 0; }
     if (proc_count < 2) { return 0; }
 
     var old = proc_current;

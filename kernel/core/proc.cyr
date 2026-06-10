@@ -34,6 +34,21 @@ var proc_signals[128];  # 16 processes x 8 bytes
 var proc_sigmask[128];  # 16 processes x 8 bytes
 var pending_signal_flag = 0;  # Set by scheduler ISR, read by main — benign race (atomic store on x86_64)
 
+# === 1.44.x multi-threading (opening) — preempt gate ===
+# `preempt_count > 0` makes the timer's do_context_switch a no-op (sched.cyr), so
+# a critical section that touches shared scratch buffers / non-reentrant FS state
+# can wrap itself in preempt_disable()/preempt_enable() and stay atomic w.r.t.
+# preemption. This is the "reentrant-or-gated" foundation the cooperative →
+# preemptive transition needs — the single-core no-lock invariant the FS code
+# relies on ([[project_multithreading_future_arc]]). It generalizes the ad-hoc
+# "the timer handler's do_context_switch early-returns while a syscall runs" guard
+# in syscall.cyr into one counted, nestable primitive. Plain i64 (single-core:
+# no atomic needed yet; SMP later makes it a per-CPU/atomic field).
+var preempt_count = 0;
+fn preempt_disable() { preempt_count = preempt_count + 1; return 0; }
+fn preempt_enable() { if (preempt_count > 0) { preempt_count = preempt_count - 1; } return 0; }
+fn preempt_enabled() { if (preempt_count == 0) { return 1; } return 0; }
+
 fn proc_create(entry) {
     if (proc_count >= 16) { return 0 - 1; }
     var idx = proc_count;
@@ -90,6 +105,25 @@ fn proc_create_full(entry, stack_top) {
     store64(p + 160, 0x1000);
     proc_count = proc_count + 1;
     return idx;
+}
+
+# === 1.44.x multi-threading (opening) — kernel-thread primitive ===
+# A kernel thread is a schedulable proc on the SHARED kernel address space
+# (CR3 0x1000) with IF=1, so the timer preempts and round-robins it. This
+# generalizes the hand-rolled idle proc (main.cyr proc 1) into a real spawn API.
+# Stacks come from a static pool so the create path takes no PMM/heap allocation
+# (scheduler-path-safe). `entry` is a `fn(): i64` that loops forever — a kthread
+# does not return; it is retired via proc_set_state(pid, 0). Returns pid / -1.
+var KTHREAD_MAX = 4;
+var KTHREAD_STACK_U64 = 512;           # 4 KB per kthread kernel stack (= the idle stack)
+var kthread_stacks[2048];              # KTHREAD_MAX x KTHREAD_STACK_U64 (= 16 KB)
+var kthread_next = 0;
+fn kthread_create(entry) {
+    if (kthread_next >= KTHREAD_MAX) { return 0 - 1; }
+    # Stacks grow down: top = base of this slot + 8 KB.
+    var stack_top = &kthread_stacks + (kthread_next + 1) * KTHREAD_STACK_U64 * 8;
+    kthread_next = kthread_next + 1;
+    return proc_create_full(entry, stack_top);   # CR3 0x1000, IF=1, state=ready
 }
 
 # Set a process's CR3 (page table root)

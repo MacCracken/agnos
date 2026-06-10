@@ -5,44 +5,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.44.0] — 2026-06-09 (1.44.x — userland coreutils delegation: agnsh → kriya/owl)
+## [1.44.0] — 2026-06-09 (1.44.x — multi-threading / preemptive scheduling: opening)
 
-Cycle open. The 1.44.x arc moves AGNOS's coreutils out of the shell and onto
-`/bin`: agnoshi 1.5.0 drops its in-process file verbs and delegates to the kriya
-dispatcher + owl (cat). The kernel side is staging + an optional symlink#43
-syscall; no other kernel change is required — every operation kriya/owl perform
-(`open`#7 / `read`#5 / `write`#1 / `close`#6 / `mkdir`#9 / `rmdir`#10 /
-`unlink`#30 / `rename`#31 / `link`#32 / `stat`#33 / `getdents`#29) already has a
-syscall, and exec-from-disk + argv (1.40.x / burn `1439`) carry the launch.
+Opens the 1.44.x multi-threading arc — the deep transition from the cooperative
+single-core model to preemptive multi-threading ([[project_multithreading_future_arc]]).
+This first bite lands the foundation; per-process-AS ring-3 preemption, the FS
+reentrancy gating, concurrent `spawn`+`waitpid` (DOOM running while the shell stays
+live), and SMP-AP wakeup follow across the 1.44.x line. The arc **absorbs the 1.43.x
+carry-forward** (per-process env, FB scaling, zero-copy FB-mmap; the first-`mmap`
+RIP=0 repair already landed at 1.43.8).
 
 ### Added
 
-- **kriya + owl staged onto the agnos-fs `/bin`** (`scripts/stage-tools.sh`). The
-  BusyBox-style kriya dispatcher (`kriya_agnos`, static ELF64) lands at `/bin/kriya`
-  with **11 relative symlinks** (`cp mv rm mkdir rmdir touch echo wc find grep ls`)
-  pointing at it — exactly the verbs agnsh 1.5.0 removed. owl (`owl_agnos`) lands at
-  `/bin/owl` as AGNOS's `cat`. kriya dispatches on `basename(argv[0])`, so exec'ing
-  `/bin/cp` (argv[0] = `/bin/cp`) routes to the cp applet; the rest of kriya's
-  surface stays reachable as `kriya <applet>`. `install-media.sh`'s `cp -a`
-  preserves the symlinks into the ext2 image, and the ext2 open path follows the
-  symlink inode to the dispatcher. `cat` is intentionally unstaged (owl owns it).
+- **`kthread_create` — kernel-thread primitive** (`core/proc.cyr`). A schedulable
+  proc on the shared kernel address space (CR3 0x1000, IF=1) built from a static
+  stack pool (scheduler-path-safe — no PMM/heap in the create path). Generalizes the
+  hand-rolled idle proc (1.40.10) into a real spawn API — the basis for background
+  jobs / job-control.
+- **Preempt gate** (`core/proc.cyr` + `core/sched.cyr`) — `preempt_count` +
+  `preempt_disable()` / `preempt_enable()` / `preempt_enabled()`, wired into
+  `do_context_switch` (a timer tick with `preempt_count > 0` is a no-op switch). The
+  **"reentrant-or-gated" foundation**: a critical section touching shared scratch
+  buffers / non-reentrant FS state wraps itself in `preempt_disable()` and stays
+  atomic under preemption — the mechanism that unwinds the single-core no-lock
+  invariant safely. Formalizes the ad-hoc "do_context_switch early-returns while a
+  syscall runs" guard in `syscall.cyr` into one counted, nestable primitive.
+- **`THREAD_SELFTEST` + `scripts/thread-smoke.sh`** — two kernel threads tight-loop
+  bumping counters (they NEVER yield); BOTH advance → the timer preempted +
+  round-robined them (preemptive time-slicing PROVEN, `thr: A=… B=…` in the tens of
+  millions), and under `preempt_disable()` the counters FREEZE (`thr: gate held`).
+  QEMU-green.
+
+### Userland (the testing surface for this arc)
+
+- The **kriya/owl coreutils delegation** — the concurrent-tools story preemption
+  unlocks — landed as the userland substrate: agnoshi **1.5.0** dropped its in-process
+  file verbs → kriya `/bin` dispatcher + owl `cat`, staged via `scripts/stage-tools.sh`
+  with 11 `/bin/<verb>` → kriya symlinks. END-TO-END QEMU-GREEN via
+  `scripts/agnsh-delegation-test.py` (bareword `mkdir`/`cp`/`ls` → kriya, `owl -p` cat,
+  cat→owl nudge — all PASS). It surfaced + fixed two AGNOS-only consumer bugs
+  (**kriya 1.1.2**, **owl 1.3.8** — the stale-`fnptr.cyr` allocator gap from a pre-6.1.14
+  cyrius pin; owl also the `var r = main()` → bare-call entry). This is the 1.42.x
+  Track-B "kriya supersedes the verbs" tail, **not** the multi-threading arc itself.
+  `symlink`#43 (kriya `ln -s`) deferred to the userland-tools backlog.
 
 ### Notes
 
-- **No kernel ABI change this cycle.** `symlink`#43 (exposing the already-implemented
-  `ext2_symlink`) is deferred to the 1.44.x backlog — kriya's agnos branch sets
-  `K_HAVE_SYMLINK=0` and returns ENOSYS for `ln -s`, so delegation needs zero new
-  syscalls. `lstat`#44 / `readlink`#45 ride `symlink`#43.
-- **Delegation is END-TO-END QEMU-GREEN** via the new `scripts/agnsh-delegation-test.py`
-  (headless, HMP `sendkey`): it self-builds a rootfs-seeded image and drives bareword
-  `mkdir`/`cp`/`ls` → kriya, `owl -p` cat, and the cat→owl nudge — all PASS on the live
-  ext2 root. The smoke surfaced + fixed two AGNOS-only **consumer** bugs (not kernel):
-  **kriya 1.1.2** and **owl 1.3.8**, both the stale-`fnptr.cyr` allocator gap from a
-  pre-6.1.14 cyrius pin (owl also needed the `var r = main()` → bare-call entry fix) —
-  same class as agnoshi 1.4.9. The iron leg rides the user's next archaemenid burn under
-  the agnosticos `#tracker-144x-cycle`. Known limitation: the execwait argv tokenizer
-  caps argv at 8 tokens — long `grep`/`cp`/`find` lines truncate silently (future kernel
-  work).
+- **Production behavior unchanged**: `preempt_count` stays 0 (nothing calls
+  `preempt_disable()` yet), so `do_context_switch` is byte-identical; the kthread
+  stack pool is inert until a thread spawns. `sweep.sh` green; iron rides the next burn.
 
 ## [1.43.8] — 2026-06-09
 
