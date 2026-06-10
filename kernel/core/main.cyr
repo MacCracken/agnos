@@ -2019,7 +2019,8 @@ var ring3_counter_a = 0;
 var ring3_counter_b = 0;
 var ring3_pid_a = 0;
 var ring3_pid_b = 0;
-var ring3_payload[16];          # raw ring-3 code; first 22 bytes are used
+var ring3_payload[16];          # raw ring-3 code (proc A, getpid loop); first 22 bytes used
+var ring3_elf[24];              # a minimal in-memory ELF64 for proc B (159 bytes used)
 fn ring3_payload_fill() {
     # 1.44.6: each loop iteration makes a getpid SYSCALL (#2), THEN increments the
     # counter — proving a PREEMPTIBLE ring-3 proc can syscall safely. The handler runs
@@ -2039,27 +2040,51 @@ fn ring3_payload_fill() {
     store8(&ring3_payload + 20, 0xEB); store8(&ring3_payload + 21, 0xEA);  # jmp -22 (back to mov eax,2)
     return 0;
 }
-# 1.44.7: re-fill the SAME ring3_payload array with the FINITE payload — count the
-# counter up to N=0x1000000, then EXIT (syscall #0), then jmp-self (spin until the
-# scheduler retires the now-dead proc). spawn_user_proc memcpy's the array at spawn
-# time, so filling getpid → spawn A → filling finite → spawn B gives each proc its
-# own code without a second array (the 1.44.7-attempt-1 refactor that broke).
+# 1.44.8: build a minimal in-memory ELF64 for proc B — a real ELF that elf_load (the
+# spawn #3 loader) parses, so this exercises the actual ELF-spawn path, not a raw memcpy.
+# One PT_LOAD segment covers the whole 159-byte image at vaddr 0x400000 (header+phdr+code);
+# e_entry = 0x400078 (the code, at file offset 120 = 64-byte ehdr + 56-byte phdr). The code
+# is the same finite payload: count the counter to N=0x1000000, exit (#0), spin.
 #   movabs rbx,0x2000000 ; movabs rcx,0x1000000 ; .L: inc [rbx]; dec rcx; jnz .L
 #   ; mov eax,0 ; xor edi,edi ; syscall(exit) ; jmp -2 (spin)
-fn ring3_payload_fill_finite() {
-    store8(&ring3_payload + 0, 0x48);  store8(&ring3_payload + 1, 0xBB);   # movabs rbx, 0x2000000
-    store8(&ring3_payload + 2, 0x00);  store8(&ring3_payload + 3, 0x00);  store8(&ring3_payload + 4, 0x00); store8(&ring3_payload + 5, 0x02);
-    store8(&ring3_payload + 6, 0x00);  store8(&ring3_payload + 7, 0x00);  store8(&ring3_payload + 8, 0x00); store8(&ring3_payload + 9, 0x00);
-    store8(&ring3_payload + 10, 0x48); store8(&ring3_payload + 11, 0xB9);  # movabs rcx, 0x1000000
-    store8(&ring3_payload + 12, 0x00); store8(&ring3_payload + 13, 0x00); store8(&ring3_payload + 14, 0x00); store8(&ring3_payload + 15, 0x01);
-    store8(&ring3_payload + 16, 0x00); store8(&ring3_payload + 17, 0x00); store8(&ring3_payload + 18, 0x00); store8(&ring3_payload + 19, 0x00);
-    store8(&ring3_payload + 20, 0x48); store8(&ring3_payload + 21, 0xFF); store8(&ring3_payload + 22, 0x03);  # inc qword [rbx]
-    store8(&ring3_payload + 23, 0x48); store8(&ring3_payload + 24, 0xFF); store8(&ring3_payload + 25, 0xC9);  # dec rcx
-    store8(&ring3_payload + 26, 0x75); store8(&ring3_payload + 27, 0xF8);  # jnz -8 (back to inc)
-    store8(&ring3_payload + 28, 0xB8); store8(&ring3_payload + 29, 0x00); store8(&ring3_payload + 30, 0x00); store8(&ring3_payload + 31, 0x00); store8(&ring3_payload + 32, 0x00);  # mov eax, 0 (exit)
-    store8(&ring3_payload + 33, 0x31); store8(&ring3_payload + 34, 0xFF);  # xor edi, edi (exit code 0)
-    store8(&ring3_payload + 35, 0x0F); store8(&ring3_payload + 36, 0x05);  # syscall
-    store8(&ring3_payload + 37, 0xEB); store8(&ring3_payload + 38, 0xFE);  # jmp -2 (spin until descheduled)
+fn ring3_elf_fill() {
+    memset(&ring3_elf, 0, 192);
+    # --- ELF64 header (64 bytes) ---
+    store8(&ring3_elf + 0, 0x7F); store8(&ring3_elf + 1, 0x45); store8(&ring3_elf + 2, 0x4C); store8(&ring3_elf + 3, 0x46);  # \x7FELF
+    store8(&ring3_elf + 4, 0x02);   # EI_CLASS = ELFCLASS64
+    store8(&ring3_elf + 5, 0x01);   # EI_DATA = little-endian
+    store8(&ring3_elf + 6, 0x01);   # EI_VERSION
+    store8(&ring3_elf + 16, 0x02);  # e_type = ET_EXEC
+    store8(&ring3_elf + 18, 0x3E);  # e_machine = x86-64
+    store8(&ring3_elf + 20, 0x01);  # e_version
+    store8(&ring3_elf + 24, 0x78); store8(&ring3_elf + 25, 0x00); store8(&ring3_elf + 26, 0x40);  # e_entry = 0x400078
+    store8(&ring3_elf + 32, 0x40);  # e_phoff = 64
+    store8(&ring3_elf + 52, 0x40);  # e_ehsize = 64
+    store8(&ring3_elf + 54, 0x38);  # e_phentsize = 56
+    store8(&ring3_elf + 56, 0x01);  # e_phnum = 1
+    # --- Program header PT_LOAD (56 bytes at offset 64) ---
+    store8(&ring3_elf + 64, 0x01);  # p_type = PT_LOAD
+    store8(&ring3_elf + 68, 0x07);  # p_flags = R|W|X
+    # p_offset = 0 (offset 72, already zero)
+    store8(&ring3_elf + 82, 0x40);  # p_vaddr  = 0x400000  (byte 80+2)
+    store8(&ring3_elf + 90, 0x40);  # p_paddr  = 0x400000  (byte 88+2)
+    store8(&ring3_elf + 96, 0x9F);  # p_filesz = 159 (0x9F)
+    store8(&ring3_elf + 104, 0x9F); # p_memsz  = 159
+    store8(&ring3_elf + 113, 0x10); # p_align  = 0x1000   (byte 112+1)
+    # --- code @ file offset 120 → vaddr 0x400078 ---
+    store8(&ring3_elf + 120, 0x48); store8(&ring3_elf + 121, 0xBB);  # movabs rbx, 0x2000000
+    store8(&ring3_elf + 122, 0x00); store8(&ring3_elf + 123, 0x00); store8(&ring3_elf + 124, 0x00); store8(&ring3_elf + 125, 0x02);
+    store8(&ring3_elf + 126, 0x00); store8(&ring3_elf + 127, 0x00); store8(&ring3_elf + 128, 0x00); store8(&ring3_elf + 129, 0x00);
+    store8(&ring3_elf + 130, 0x48); store8(&ring3_elf + 131, 0xB9);  # movabs rcx, 0x1000000
+    store8(&ring3_elf + 132, 0x00); store8(&ring3_elf + 133, 0x00); store8(&ring3_elf + 134, 0x00); store8(&ring3_elf + 135, 0x01);
+    store8(&ring3_elf + 136, 0x00); store8(&ring3_elf + 137, 0x00); store8(&ring3_elf + 138, 0x00); store8(&ring3_elf + 139, 0x00);
+    store8(&ring3_elf + 140, 0x48); store8(&ring3_elf + 141, 0xFF); store8(&ring3_elf + 142, 0x03);  # inc qword [rbx]
+    store8(&ring3_elf + 143, 0x48); store8(&ring3_elf + 144, 0xFF); store8(&ring3_elf + 145, 0xC9);  # dec rcx
+    store8(&ring3_elf + 146, 0x75); store8(&ring3_elf + 147, 0xF8);  # jnz -8 (back to inc)
+    store8(&ring3_elf + 148, 0xB8); store8(&ring3_elf + 149, 0x00); store8(&ring3_elf + 150, 0x00); store8(&ring3_elf + 151, 0x00); store8(&ring3_elf + 152, 0x00);  # mov eax, 0 (exit)
+    store8(&ring3_elf + 153, 0x31); store8(&ring3_elf + 154, 0xFF);  # xor edi, edi (exit code 0)
+    store8(&ring3_elf + 155, 0x0F); store8(&ring3_elf + 156, 0x05);  # syscall
+    store8(&ring3_elf + 157, 0xEB); store8(&ring3_elf + 158, 0xFE);  # jmp -2 (spin until descheduled)
     return 0;
 }
 # Spawn one ring-3 proc and map its 0x2000000 onto `counter_phys`. -1 on fail.
@@ -2080,9 +2105,12 @@ fn ring3_selftest_setup() {
     store64(ring3_counter_a, 0);
     store64(ring3_counter_b, 0);
     ring3_payload_fill();                            # getpid (infinite)
-    ring3_pid_a = ring3_spawn_one(ring3_counter_a);  # A = infinite background ("stays live")
-    ring3_payload_fill_finite();                     # re-fill the SAME array with finite+exit
-    ring3_pid_b = ring3_spawn_one(ring3_counter_b);  # B = counts N then exit()s
+    ring3_pid_a = ring3_spawn_one(ring3_counter_a);  # A = infinite background ("stays live"), raw payload
+    # B = a real in-memory ELF (finite count + exit) loaded by elf_load — the spawn #3
+    # loader, which (1.44.8) sets ring-3 selectors + state=ready (proc_create_full).
+    ring3_elf_fill();
+    ring3_pid_b = elf_load(&ring3_elf, 159);
+    if (ring3_pid_b >= 0) { proc_map_page(proc_get_cr3(ring3_pid_b), 0x2000000, ring3_counter_b); }
     return 0;
 }
 fn ring3_selftest_verify() {

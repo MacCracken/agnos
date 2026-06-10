@@ -1,11 +1,12 @@
 #!/bin/bash
 # ring3-smoke (1.44.4 one proc / .5 two procs / .6 syscalls / .7 concurrent exec+exit) —
 # boots agnos under qemu + OVMF + gnoboot with RING3_SELFTEST=1 and asserts:
-#   "ring3: child exited"— proc B (own CR3, IF=1) runs a FINITE program (count to N then
-#                          getpid-free `exit` syscall #0) to completion and is cleanly
-#                          retired (state=0, NOT resurrected), WHILE proc A (a second
-#                          ring-3 proc making getpid syscalls) keeps running. The
-#                          "a program runs to completion while another stays live" core.
+#   "ring3: child exited"— proc B (1.44.8: a real in-memory ELF64 loaded by elf_load, the
+#                          spawn-#3 loader; own CR3, IF=1) runs a FINITE program (count to
+#                          N then `exit` #0) to completion and is cleanly retired (state=0,
+#                          NOT resurrected), WHILE proc A (a second ring-3 proc making
+#                          getpid syscalls) keeps running. The "a program runs to completion
+#                          while another stays live" core, from an actual ELF binary.
 #   "ring3: preempt OK" — proc A stayed live + preemptible through B's exit (counter > 0).
 #   "ring3: gate held"  — under preempt_disable() proc A's counter FREEZES => the
 #                          1.44.0 preempt gate covers ring-3 too.

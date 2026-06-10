@@ -5,6 +5,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.8] — 2026-06-10 (1.44.x — real ELF spawn: a scheduled ring-3 proc runs from an actual ELF image)
+
+The spawn `#3` path now produces a working scheduled ring-3 proc from a real ELF — the
+step from "raw machine-code payload" (1.44.7) to "an actual ELF binary." Found + fixed
+two latent `elf_load` bugs the never-exercised spawn `#3` path was carrying.
+
+### Fixed
+
+- **`elf_load` (the in-memory ELF loader behind spawn `#3`) was doubly broken**
+  (`core/elf.cyr`) — latent because spawn `#3` was never exercised on iron or in a smoke:
+  - **SMAP fault** — it did `mov cr3, new_cr3` then `memcpy`'d the segment to the USER
+    vaddr; a kernel write to a user-mapped page #PFs under SMAP (`CR2=p_vaddr`, supervisor
+    write, `cpl=0`).
+  - **2 MB aliasing** — `pmm_alloc` (4 KB) under a 2 MB `proc_map_page` points the mapping
+    at `floor_2MB(phys)`, so the bytes landed elsewhere (the same hazard fixed in
+    `spawn_user_proc` at 1.44.4).
+  Rewrote the segment loop to mirror the proven `elf_load_from_file`: `pmm_alloc_2mb` +
+  `memset(phys)` + `memcpy` from the in-memory ELF **into the physical page** (kernel
+  identity, supervisor — no SMAP), no CR3 switch. The process sees the bytes at `p_vaddr`.
+
+### Added
+
+- **`elf_load` sets ring-3 selectors** (`proc_set_ring3` after `proc_set_cr3`) — so a
+  spawned ELF runs in ring 3 when the scheduler picks it up (the default was the ring-0
+  latent bug). `elf_load_from_file` (exec_and_wait) is a separate path with its own
+  `enter_ring3` frame, unaffected.
+- **`RING3_SELFTEST` proc B is now a real in-memory ELF64** (`core/main.cyr`) — a 64-byte
+  ehdr + 56-byte PT_LOAD phdr wrapping the finite count-then-`exit` code, loaded via
+  `elf_load`. `ring3-smoke` green (`ring3: child exited`): the ELF proc reaches N and exits
+  (state 0) while proc A stays live.
+
+### Notes
+
+- Production unaffected: `elf_load` is spawn-`#3`-only (unexercised in production); exec /
+  DOOM / agnsh use `elf_load_from_file`. Validated: `ring3-smoke` + `thread-smoke` +
+  `agnsh-smoke` + `doom-smoke` + `sweep.sh` **7/7** + `check.sh` 11/11. +160 B.
+
 ## [1.44.7] — 2026-06-10 (1.44.x — concurrent ring-3 execution: a program runs to completion + exits while another stays live)
 
 The headline payoff of the arc: a scheduled ring-3 proc now runs a finite program to
