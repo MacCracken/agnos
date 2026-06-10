@@ -5,6 +5,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.0] — 2026-06-09 (1.44.x — userland coreutils delegation: agnsh → kriya/owl)
+
+Cycle open. The 1.44.x arc moves AGNOS's coreutils out of the shell and onto
+`/bin`: agnoshi 1.5.0 drops its in-process file verbs and delegates to the kriya
+dispatcher + owl (cat). The kernel side is staging + an optional symlink#43
+syscall; no other kernel change is required — every operation kriya/owl perform
+(`open`#7 / `read`#5 / `write`#1 / `close`#6 / `mkdir`#9 / `rmdir`#10 /
+`unlink`#30 / `rename`#31 / `link`#32 / `stat`#33 / `getdents`#29) already has a
+syscall, and exec-from-disk + argv (1.40.x / burn `1439`) carry the launch.
+
+### Added
+
+- **kriya + owl staged onto the agnos-fs `/bin`** (`scripts/stage-tools.sh`). The
+  BusyBox-style kriya dispatcher (`kriya_agnos`, static ELF64) lands at `/bin/kriya`
+  with **11 relative symlinks** (`cp mv rm mkdir rmdir touch echo wc find grep ls`)
+  pointing at it — exactly the verbs agnsh 1.5.0 removed. owl (`owl_agnos`) lands at
+  `/bin/owl` as AGNOS's `cat`. kriya dispatches on `basename(argv[0])`, so exec'ing
+  `/bin/cp` (argv[0] = `/bin/cp`) routes to the cp applet; the rest of kriya's
+  surface stays reachable as `kriya <applet>`. `install-media.sh`'s `cp -a`
+  preserves the symlinks into the ext2 image, and the ext2 open path follows the
+  symlink inode to the dispatcher. `cat` is intentionally unstaged (owl owns it).
+
+### Notes
+
+- **No kernel ABI change this cycle.** `symlink`#43 (exposing the already-implemented
+  `ext2_symlink`) is deferred to the 1.44.x backlog — kriya's agnos branch sets
+  `K_HAVE_SYMLINK=0` and returns ENOSYS for `ln -s`, so delegation needs zero new
+  syscalls. `lstat`#44 / `readlink`#45 ride `symlink`#43.
+- **Delegation is END-TO-END QEMU-GREEN** via the new `scripts/agnsh-delegation-test.py`
+  (headless, HMP `sendkey`): it self-builds a rootfs-seeded image and drives bareword
+  `mkdir`/`cp`/`ls` → kriya, `owl -p` cat, and the cat→owl nudge — all PASS on the live
+  ext2 root. The smoke surfaced + fixed two AGNOS-only **consumer** bugs (not kernel):
+  **kriya 1.1.2** and **owl 1.3.8**, both the stale-`fnptr.cyr` allocator gap from a
+  pre-6.1.14 cyrius pin (owl also needed the `var r = main()` → bare-call entry fix) —
+  same class as agnoshi 1.4.9. The iron leg rides the user's next archaemenid burn under
+  the agnosticos `#tracker-144x-cycle`. Known limitation: the execwait argv tokenizer
+  caps argv at 8 tokens — long `grep`/`cp`/`find` lines truncate silently (future kernel
+  work).
+
 ## [1.43.8] — 2026-06-09
 
 ### Added

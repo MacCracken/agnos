@@ -51,4 +51,25 @@ stage_one bannermanor src/main.cyr bnrmr    || rc=1
 stage_one commandress  src/main.cyr cmdrs    || rc=1
 stage_one klug         src/main.cyr klug     || rc=1
 stage_one anuenue      src/main.cyr anuenue  || rc=1
+# 1.44.x userland coreutils delegation: agnsh 1.5.0 dropped its in-process file
+# verbs and now delegates them to these two. kriya is the BusyBox-style coreutils
+# dispatcher; owl is AGNOS's cat.
+stage_one kriya        src/main.cyr kriya    || rc=1
+stage_one owl          src/main.cyr owl      || rc=1
+
+# kriya dispatches on basename(argv[0]), so each delegated verb needs a
+# /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
+# symlinks (-> kriya) in the rootfs: install-media.sh's `cp -a` preserves them
+# into the ext2 image, and the agnos ext2 open path follows the symlink inode to
+# the dispatcher (so exec'ing /bin/cp loads kriya with argv[0]="/bin/cp"). These
+# 11 are exactly the verbs agnsh 1.5.0 removed; `cat` is intentionally absent
+# (owl is AGNOS's cat — agnsh nudges `cat` -> owl). The rest of kriya's surface
+# (head/tail/sort/stat/ln/...) stays reachable via `kriya <applet>`; add more
+# names here if they earn a bareword. NB `ln` would ENOSYS until symlink#43.
+if [ -f "$DEST_DIR/kriya" ]; then
+    for u in cp mv rm mkdir rmdir touch echo wc find grep ls; do
+        ln -sf kriya "$DEST_DIR/$u"
+    done
+    echo "linked: $DEST_DIR/{cp,mv,rm,mkdir,rmdir,touch,echo,wc,find,grep,ls} -> kriya"
+fi
 exit $rc
