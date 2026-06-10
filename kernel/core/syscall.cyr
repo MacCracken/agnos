@@ -81,6 +81,13 @@ var ew37_path[16];        # kernel copy of the caller's path cstr (128 B). elf_l
 # block). 16 KB bounds an in-memory payload; real binaries load from disk (#37).
 var spawn_elf_buf[2048];
 
+# 1.44.11: spawn_path(#43) path/argv staging buffer (128 B = 16 u64, like ew37_path).
+# Holds the caller's "PATH [args..]" line for the NON-BLOCKING from-disk spawn — copied
+# here under the caller CR3 BEFORE the boot-CR3 switch (the user VA won't resolve once
+# CR3 is the NVMe-BAR-mapping boot CR3). A DEDICATED buffer (not ew37_path) so a #43 from
+# a bg proc can never collide with agnsh's in-flight #37 frame.
+var spawn_path_buf[128];
+
 # Security: a userspace pointer must lie in the user VA window [0x200000, 0x40000000):
 # above the kernel low region (0-2 MB) and below the 1 GB arena ceiling. EVERY
 # legitimate user address is below 1 GB — ELF segments (p_vaddr >= 2 MB, p_memsz
@@ -1139,6 +1146,71 @@ fn ksyscall(num, arg1, arg2, arg3) {
         }
         stack_canary_check(canary);
         return ks_n;
+    }
+    if (num == 43) {
+        # spawn_path(path=arg1, len=arg2) — NON-BLOCKING from-disk spawn (1.44.x WIP).
+        # STATUS: written + compiles + zero production regression (dead code — no caller
+        # yet). END-TO-END VALIDATION IS BLOCKED by two PRE-EXISTING multi-proc kernel
+        # limitations the scheduler-driven selftest exposed (NOT bugs in this handler):
+        #   (1) elf_load's per-pid VA scheme `stack_base/code_va = base + pid*step` collides
+        #       with the pmm page-table region at high pid counts — a ≥16 MB 2 MB USER
+        #       segment makes the 4 KB PML4/PT pages allocated there user-flagged, so the
+        #       context-switch `proc_get_user_cr3` kernel load64(PML4) SMAP-faults (#PF
+        #       cpl=0 e=1, CR2 in the PD[8..] range). Needs a supervisor-only page-table
+        #       pool OR a non-pid-striped user-VA map.
+        #   (2) proc_reap_child is LIFO-only (proc.cyr:496) — out-of-order background exits
+        #       break the top-slot-collapse assumption.
+        # These are the REAL "schedulable agnsh" blockers (see the bite's scope workflow);
+        # this primitive lands once they're fixed.
+        #
+        # The from-disk analog of spawn(#3): load a static ELF64 from the ext2 root (with
+        # argv) + create a READY ring-3 proc the SCHEDULER picks up, returning its pid
+        # IMMEDIATELY — so the caller (agnsh) stays live and reaps it via the non-blocking
+        # waitpid(#4). This is spawn(#3)'s exact shape (copy → boot CR3 → load → restore
+        # caller CR3 → return pid) with the in-memory copy+elf_load swapped for
+        # execwait(#37)'s path-staging + elf_load_from_file. It DROPS all of #37's blocking
+        # machinery (the H1 resume-ctx snapshot/restore, the H2 disjoint-kstack swap +
+        # syscall_init, proc_current=child, exec_and_wait run-to-completion, the in-handler
+        # reap) — there is no nested run to protect, so proc_current STAYS the caller and
+        # reaping is waitpid(#4)'s job. Like every handler it runs IF=0 and NVMe completion
+        # POLLS (no sti window), so the shared FS scratch (spawn_path_buf / elf_hdr_buf /
+        # VFS) can't be raced mid-load — the serial invariant spawn(#3)/execwait(#37) rely on.
+        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg2 > 127) { stack_canary_check(canary); return 0 - 1; }
+        if (ext2_active == 0) { stack_canary_check(canary); return 0 - 1; }
+        # (a) copy the user (path + argv) line into the kernel buffer NOW, while the caller
+        # CR3 resolves the user VA + SMAP AC=1 — BEFORE the boot-CR3 switch (under boot CR3
+        # the user VA won't resolve; the per-proc CR3 does not map the NVMe BAR).
+        var spp = &spawn_path_buf;
+        var spi = 0;
+        while (spi < arg2) { store8(spp + spi, load8(arg1 + spi)); spi = spi + 1; }
+        # (b) switch to boot CR3 (maps the NVMe BAR) for the disk I/O, then split the path
+        # TOKEN (open name, up to the first space) from the WHOLE line (argv) — mirrors
+        # execwait#37 / sh_cmd_run. elf_load_from_file builds the per-proc address space +
+        # SysV argc/argv/envp stack and returns a READY pid (proc_create_full: state=1/IF=1)
+        # or -1.
+        var spcr3 = proc_get_cr3(proc_current);
+        cr3_load(0x1000);
+        var sp_ps = 0;
+        while (sp_ps < arg2) { if (load8(spp + sp_ps) != 32) { break; } sp_ps = sp_ps + 1; }   # skip leading spaces
+        var sp_pe = sp_ps;
+        while (sp_pe < arg2) { if (load8(spp + sp_pe) == 32) { break; } sp_pe = sp_pe + 1; }     # to first space
+        var sp_plen = sp_pe - sp_ps;
+        if (sp_plen < 1) { cr3_load(spcr3); stack_canary_check(canary); return 0 - 1; }
+        var sp_pid = elf_load_from_file(spp + sp_ps, sp_plen, spp, arg2);
+        # (c) restore the caller CR3 on EVERY path (incl. the load-failure path) so the
+        # handler tail + SYSRET run under the caller's mappings (skipping this reproduces
+        # the spawn#3 1.44.9 #UD/arena-fault class).
+        cr3_load(spcr3);
+        if (sp_pid >= 0) {
+            # (d) elf_load_from_file does NOT set ring-3 selectors (unlike in-memory
+            # elf_load) — it was only ever hand-run by execwait's own ring-3 frame. The
+            # SCHEDULER restores this proc, so it MUST carry CS=0x23/SS=0x1B or the iretq
+            # lands a user RIP under ring-0 CS=0x08 → fault. (State is already ready.)
+            proc_set_ring3(sp_pid);
+        }
+        stack_canary_check(canary);
+        return sp_pid;
     }
     stack_canary_check(canary);
     return 0 - 1;
