@@ -5,15 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.44.1] — 2026-06-09 (1.44.x — reentrant-or-gated syscalls: unify on the preempt gate)
+## [1.44.1] — 2026-06-09 (1.44.x — reentrant-or-gated syscalls + dogfood the kthread primitive)
 
-Second bite of the multi-threading arc: retire the ad-hoc preemption-suspends and
-route them through the 1.44.0 `preempt_count` gate, so "suspend preemption for this
-critical section" is one nestable primitive (the roadmap's "reentrant-or-gated
-syscalls" item).
+Two small multi-threading-arc bites: unify the ad-hoc preemption-suspends on the
+1.44.0 `preempt_count` gate, and route the production idle thread through
+`kthread_create` so the 1.44.0 primitive is exercised in the real boot path.
 
 ### Changed
 
+- **The production idle thread is spawned via `kthread_create(&kernel_idle_loop)`**
+  (`core/main.cyr`) instead of a hand-rolled `proc_create_full` + a separate
+  `kernel_idle_stack[512]` (`core/sched.cyr`, removed). Dogfoods the 1.44.0 thread
+  primitive in production (its stack comes from the kthread static pool, slot 0) —
+  no behavioral change (the idle proc is the same shared-AS, CR3 0x1000, IF=1 thread
+  the scheduler falls back to), −4 KB binary (the separate idle stack is gone).
 - **The three `sti`-window syscalls now use `preempt_disable()` / `preempt_enable()`**
   instead of the old `saved = sched_active; sched_active = 0; … ; sched_active = saved`
   toggle (`core/syscall.cyr`): `kbd_read_blocking` (read#5 line discipline — all three

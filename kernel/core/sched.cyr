@@ -195,8 +195,9 @@ fn do_context_switch(isr_rsp) {
 # new_cr3 != old_cr3 guard never fires, so preemption is pure register
 # save/restore in one shared address space (kernel-threads model; the
 # per-process-AS preemption story is the future multi-threading arc).
-# Its own kernel stack (module-scope var X[N] = N*u64 = 4096 B).
-var kernel_idle_stack[512];
+# 1.44.1: the idle thread is now spawned via `kthread_create(&kernel_idle_loop)` in
+# the boot path, so its stack comes from the kthread static pool — dogfooding the
+# 1.44.0 thread primitive in production; no separate idle stack to maintain.
 
 fn kernel_idle_loop() {
     while (1) {
