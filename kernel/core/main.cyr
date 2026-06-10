@@ -2071,7 +2071,7 @@ fn ring3_elf_fill() {
     store8(&ring3_elf + 96, 0x9F);  # p_filesz = 159 (0x9F)
     store8(&ring3_elf + 104, 0x9F); # p_memsz  = 159
     store8(&ring3_elf + 113, 0x10); # p_align  = 0x1000   (byte 112+1)
-    # --- code @ file offset 120 → vaddr 0x400078 ---
+    # --- code @ file offset 120 → vaddr 0x400078: count to N then exit ---
     store8(&ring3_elf + 120, 0x48); store8(&ring3_elf + 121, 0xBB);  # movabs rbx, 0x2000000
     store8(&ring3_elf + 122, 0x00); store8(&ring3_elf + 123, 0x00); store8(&ring3_elf + 124, 0x00); store8(&ring3_elf + 125, 0x02);
     store8(&ring3_elf + 126, 0x00); store8(&ring3_elf + 127, 0x00); store8(&ring3_elf + 128, 0x00); store8(&ring3_elf + 129, 0x00);
@@ -2104,8 +2104,8 @@ fn ring3_selftest_setup() {
     if (vmm_is_mapped(ring3_counter_b) == 0) { vmm_map(ring3_counter_b, ring3_counter_b, 0x83); }
     store64(ring3_counter_a, 0);
     store64(ring3_counter_b, 0);
-    ring3_payload_fill();                            # getpid (infinite)
-    ring3_pid_a = ring3_spawn_one(ring3_counter_a);  # A = infinite background ("stays live"), raw payload
+    ring3_payload_fill();                            # A: getpid (infinite "stays live")
+    ring3_pid_a = ring3_spawn_one(ring3_counter_a);
     # B = a real in-memory ELF (finite count + exit) loaded by elf_load — the spawn #3
     # loader, which (1.44.8) sets ring-3 selectors + state=ready (proc_create_full).
     ring3_elf_fill();
@@ -2116,6 +2116,7 @@ fn ring3_selftest_setup() {
 fn ring3_selftest_verify() {
     # Run the scheduler until proc B (finite) exits, or a generous tick budget. A loops
     # forever (the "stays live" proc); B counts to N then exit()s — both time-sliced.
+    # Run the scheduler until proc B (the ELF) exits, or a tick budget. A loops forever.
     var i = 0;
     while (i < 400) {
         if (proc_get_state(ring3_pid_b) == 0) { i = 400; }   # B exited — stop early
@@ -2125,14 +2126,14 @@ fn ring3_selftest_verify() {
     var cb = load64(ring3_counter_b);
     var bstate = proc_get_state(ring3_pid_b);
     kprint("ring3: A=", 9); kprint_num(ca); kprint(" B=", 3); kprint_num(cb); kprint(" Bst=", 5); kprint_num(bstate); kprintln("", 0);
-    # B ran to completion (counter == N=0x1000000) and exited (state 0) WHILE A kept running.
+    # B (real ELF) ran to completion (counter == N) and exited (state 0) WHILE A kept running.
     if (bstate == 0) {
         if (cb == 16777216) {
             if (ca > 0) { kprintln("ring3: child exited", 19); }
             else { kprintln("ring3: FAIL A idle", 18); }
         } else { kprintln("ring3: FAIL B partial", 21); }
     } else { kprintln("ring3: FAIL B hung", 18); }
-    # A is still live + preemptible — proves "another proc stays live" through B's exit.
+    # A is still live + preemptible — proves "another proc stays live".
     if (ca > 0) { kprintln("ring3: preempt OK", 17); } else { kprintln("ring3: FAIL no A", 16); }
     # Preempt gate still covers the live proc A.
     var sa = load64(ring3_counter_a);

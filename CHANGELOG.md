@@ -5,6 +5,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.9] — 2026-06-10 (1.44.x — non-blocking waitpid; the ring-3 parent spawn+waitpid blocker scoped)
+
+Groundwork toward a ring-3 PARENT driving `spawn`(#3) + `waitpid`(#4): `waitpid` is now a
+non-blocking poll, and the remaining blocker — `elf_load` run from `spawn`(#3) under the
+parent's CR3 — is precisely located. The full parent-driven selftest is deferred to that
+fix; the 1.44.8 kernel-side ELF-spawn selftest is restored (green).
+
+### Changed
+
+- **`waitpid`(#4) is now a non-blocking poll** (`core/syscall.cyr`): returns the child's
+  exit code if it has exited (state 0), or **-2 (WOULD_BLOCK)** if still alive. A ring-3
+  parent polls this FROM RING 3 — between calls it holds no kernel state, so a child's
+  syscalls can't clobber a blocked-in-kernel waitpid frame on the shared syscall kstack
+  (the classic BLOCKING form needs per-proc kernel stacks first). The old busy-wait
+  `while (state != 0) hlt` would have hung anyway (the handler runs IF=0, so the hlt never
+  wakes). Unexercised in production (only `spawn`-#3 children use it); `sweep` 7/7.
+
+### Notes (deferred — ring-3 parent spawn+waitpid)
+
+- A ring-3 parent payload that `spawn`(#3)s a child ELF + poll-`waitpid`s it triple-faulted
+  on the **child** (#UD at its entry). Diagnosed: the child ELF's bytes load **correctly**
+  (instrumented `phys[entry] == 0xB8`), yet the child still #UDs — so `elf_load` run from
+  *inside* `spawn`(#3) **under the parent's CR3** lays the segment down right but mis-wires
+  the child's **page tables**. Root cause: the per-process CR3 mirrors only 0–256 MB
+  (PD[0..127]) + the GB ranges, leaving a 256 MB–1 GB gap, so the child's page-table pages
+  aren't all reachable under the parent's CR3 (1.44.8's kernel-side `elf_load` ran under
+  the kernel CR3, which maps everything). **Fix (next bite):** `spawn`(#3) copies the user
+  ELF to a kernel buffer, then runs `elf_load` under the kernel CR3. Selftest reverted to
+  the 1.44.8 kernel-side form (`ring3-smoke` green) pending that.
+
 ## [1.44.8] — 2026-06-10 (1.44.x — real ELF spawn: a scheduled ring-3 proc runs from an actual ELF image)
 
 The spawn `#3` path now produces a working scheduled ring-3 proc from a real ELF — the

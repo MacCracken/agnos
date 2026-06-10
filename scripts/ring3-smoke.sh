@@ -56,7 +56,7 @@ timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
 
 echo "--- serial (ring3 lines) ---"; strings "$LOG" | grep "ring3:" | sed 's/^/  /'
 rc=0
-if strings "$LOG" | grep -q "ring3: child exited"; then echo "PASS: a scheduled ring-3 proc ran a finite program to completion + exit()ed cleanly while another stayed live"; else echo "FAIL: 'ring3: child exited' not found — concurrent exec / exit() regression"; rc=1; fi
+if strings "$LOG" | grep -q "ring3: child exited"; then echo "PASS: a scheduled ring-3 proc (real ELF via elf_load) ran to completion + exit()ed cleanly while another stayed live"; else echo "FAIL: 'ring3: child exited' not found — concurrent exec / exit() regression"; rc=1; fi
 if strings "$LOG" | grep -q "ring3: preempt OK"; then echo "PASS: the surviving ring-3 proc stayed live + preemptible through the child's exit"; else echo "FAIL: 'ring3: preempt OK' not found — the live proc never advanced (or triple-faulted)"; rc=1; fi
 if strings "$LOG" | grep -q "ring3: gate held"; then echo "PASS: the preempt gate freezes ring-3 procs too"; else echo "FAIL: 'ring3: gate held' not found — preempt gate regression for ring-3"; rc=1; fi
 exit $rc

@@ -339,16 +339,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return new_pid;
     }
     if (num == 4) {
-        # waitpid(pid) — wait for a process to exit (state=0)
-        # Simple busy-wait for now; returns per-process exit code
+        # waitpid(pid) — NON-BLOCKING poll (1.44.9). Returns the child's exit code if it
+        # has exited (state 0), or -2 (WOULD_BLOCK) if it is still alive. A ring-3 parent
+        # polls this FROM RING 3 — between calls it holds no kernel state, so the child's
+        # syscalls can't clobber a blocked-in-kernel waitpid frame on the shared syscall
+        # kstack. (The classic BLOCKING form, which sleeps the parent in the kernel, needs
+        # per-proc kernel stacks first — deferred.) Was a busy-wait `while(state!=0) hlt`,
+        # which would hang anyway: the handler runs IF=0, so the hlt never wakes.
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= proc_count) { return 0 - 1; }
-        # Never wait on (and never reap) the caller itself — that would block
-        # forever and, post-loop, free the running proc's own address space.
+        # Never wait on (and never reap) the caller itself.
         if (arg1 == proc_current) { return 0 - 1; }
-        while (proc_get_state(arg1) != 0) {
-            arch_wait();
-        }
+        if (proc_get_state(arg1) != 0) { return 0 - 2; }   # still alive → WOULD_BLOCK
         # 1.42.x: reap the in-memory-spawned child here — the symmetric point to
         # the from-disk path's "read exit code in sh_cmd_run, then proc_reap".
         # Read the exit code FIRST (proc_reap_child may collapse the slot), then
