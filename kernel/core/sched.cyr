@@ -156,8 +156,12 @@ fn do_context_switch(isr_rsp) {
     # never re-selected, consistent with proc 0's state somehow being read
     # as non-2 here. Unconditional set removes that variable. See
     # iron-nuc-zen-log § Attempt 14 + state.md sub-case 3b.
+    # 1.44.7: guard on `!= 0` so a proc that called exit() (state 0 = dead) is NOT
+    # resurrected to ready — otherwise sched_next() never retires it. Keeps the
+    # Attempt-14 fix (any running/ready proc → ready). Raw load64, NOT proc_get_state()
+    # — this is the cc5 regalloc-sensitive path, an extra call can clobber a live reg.
     proc_save_context(old, isr_rsp);
-    proc_set_state(old, 1);  # running → ready (unconditional)
+    if (load64(&proc_table + old * 176 + 8) != 0) { proc_set_state(old, 1); }  # not-dead → ready; dead stays dead
 
     # Load new process state
     proc_current = new_pid;

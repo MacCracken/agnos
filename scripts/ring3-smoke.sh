@@ -1,15 +1,14 @@
 #!/bin/bash
-# ring3-smoke (1.44.4 one proc / 1.44.5 two procs) — boots agnos under qemu + OVMF +
-# gnoboot with RING3_SELFTEST=1 and asserts preemptive ring-3 time-slicing:
-#   "ring3: preempt OK" — TWO ring-3 procs, each its OWN per-process CR3 + IF=1, each
-#                         running a loop that makes a getpid SYSCALL (1.44.6) then
-#                         increments user VA 0x2000000. BOTH counters advance while kmain
-#                         hlt-waits => the scheduler round-robins ring-3 <-> ring-3 across
-#                         two DIFFERENT CR3s (iretq into ring 3, CS=0x23), the same VA maps
-#                         to distinct per-proc memory (AS isolation), AND a preemptible
-#                         ring-3 proc syscalls safely (handler IF=0, shared kstack serial).
-#   "ring3: gate held"  — under preempt_disable() BOTH counters FREEZE => the
-#                         1.44.0 preempt gate covers ring-3 too.
+# ring3-smoke (1.44.4 one proc / .5 two procs / .6 syscalls / .7 concurrent exec+exit) —
+# boots agnos under qemu + OVMF + gnoboot with RING3_SELFTEST=1 and asserts:
+#   "ring3: child exited"— proc B (own CR3, IF=1) runs a FINITE program (count to N then
+#                          getpid-free `exit` syscall #0) to completion and is cleanly
+#                          retired (state=0, NOT resurrected), WHILE proc A (a second
+#                          ring-3 proc making getpid syscalls) keeps running. The
+#                          "a program runs to completion while another stays live" core.
+#   "ring3: preempt OK" — proc A stayed live + preemptible through B's exit (counter > 0).
+#   "ring3: gate held"  — under preempt_disable() proc A's counter FREEZES => the
+#                          1.44.0 preempt gate covers ring-3 too.
 #
 # Build first:  RING3_SELFTEST=1 ./scripts/build.sh
 # Requires: qemu-system-x86_64, OVMF firmware, mtools, parted, gnoboot built.
@@ -56,6 +55,7 @@ timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
 
 echo "--- serial (ring3 lines) ---"; strings "$LOG" | grep "ring3:" | sed 's/^/  /'
 rc=0
-if strings "$LOG" | grep -q "ring3: preempt OK"; then echo "PASS: two ring-3 procs (distinct CR3s) time-sliced ring-3<->ring-3 while making syscalls"; else echo "FAIL: 'ring3: preempt OK' not found — a ring-3 proc never advanced (or triple-faulted)"; rc=1; fi
+if strings "$LOG" | grep -q "ring3: child exited"; then echo "PASS: a scheduled ring-3 proc ran a finite program to completion + exit()ed cleanly while another stayed live"; else echo "FAIL: 'ring3: child exited' not found — concurrent exec / exit() regression"; rc=1; fi
+if strings "$LOG" | grep -q "ring3: preempt OK"; then echo "PASS: the surviving ring-3 proc stayed live + preemptible through the child's exit"; else echo "FAIL: 'ring3: preempt OK' not found — the live proc never advanced (or triple-faulted)"; rc=1; fi
 if strings "$LOG" | grep -q "ring3: gate held"; then echo "PASS: the preempt gate freezes ring-3 procs too"; else echo "FAIL: 'ring3: gate held' not found — preempt gate regression for ring-3"; rc=1; fi
 exit $rc

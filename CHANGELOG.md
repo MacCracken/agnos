@@ -5,6 +5,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.7] — 2026-06-10 (1.44.x — concurrent ring-3 execution: a program runs to completion + exits while another stays live)
+
+The headline payoff of the arc: a scheduled ring-3 proc now runs a finite program to
+completion, calls `exit()`, and is cleanly retired — WHILE a second ring-3 proc stays
+live. The "DOOM runs while the shell stays live" core, with scheduler-run `exit()` working.
+
+### Fixed
+
+- **`do_context_switch` no longer resurrects an exited proc** (`core/sched.cyr`). It
+  unconditionally set the switched-away proc to `ready` (the Attempt-14 round-robin fix);
+  a proc that called `exit()` (state 0 = dead) was therefore revived to `ready` and could
+  never be retired. Now guarded on `!= 0` (raw `load64`, NOT `proc_get_state()` — the cc5
+  regalloc-sensitive path; an extra call there clobbers a live reg and triple-faults), so
+  a dead proc stays dead and `sched_next()` retires it while every running/ready proc
+  still → ready. Behavior-identical in production (no proc exits via the scheduler there —
+  `exec_and_wait` children longjmp out, never reaching this path).
+
+### Changed
+
+- **`RING3_SELFTEST` proves concurrent exec + clean exit** (`core/main.cyr`,
+  `scripts/ring3-smoke.sh`). Proc A is the infinite "stays-live" proc (getpid loop); proc
+  B runs a FINITE payload — count to N=0x1000000, then `exit` (#0), then spin.
+  `ring3-smoke` green (`ring3: child exited`): B reaches exactly N and ends in state 0
+  (dead/retired) while A keeps running (`preempt OK`) and the gate still freezes A
+  (`gate held`). The two payloads share ONE array, re-filled between spawns (getpid →
+  spawn A → finite → spawn B) since `spawn_user_proc` memcpys at spawn time.
+
+### Notes
+
+- `exit()` for a scheduler-run proc: it sets state 0 and (with `kernel_return_rsp=0`, i.e.
+  no `exec_and_wait` parent) returns + SYSRETs into the proc's own spin; the next timer
+  tick deschedules it via the dead-guard and it is never re-run. No per-proc kernel stack
+  needed (the 1.44.6 finding holds — `exit`, like every syscall, runs IF=0).
+- A first selftest refactor (a 2nd payload array + a 2-param spawn helper) triple-faulted;
+  **rigorously ruled out a cycc 6.1.23 regression** (the exact 1.44.6 selftest rebuilds
+  green under it) and reverted to the 1-array-refill design. Validated: `ring3-smoke` +
+  `thread-smoke` + `agnsh-smoke` + `doom-smoke` + `sweep.sh` **7/7** + `check.sh` 11/11.
+  +64 B.
+
 ## [1.44.6] — 2026-06-10 (1.44.x — preemptible ring-3 procs make syscalls safely; the "kstack wall" dissolves)
 
 Proves the FULL preemptive-ring-3 capability: two ring-3 procs, each preemptible (IF=1)

@@ -2039,7 +2039,30 @@ fn ring3_payload_fill() {
     store8(&ring3_payload + 20, 0xEB); store8(&ring3_payload + 21, 0xEA);  # jmp -22 (back to mov eax,2)
     return 0;
 }
-# Spawn one syscall-free ring-3 proc and map its 0x2000000 onto `counter_phys`. -1 on fail.
+# 1.44.7: re-fill the SAME ring3_payload array with the FINITE payload — count the
+# counter up to N=0x1000000, then EXIT (syscall #0), then jmp-self (spin until the
+# scheduler retires the now-dead proc). spawn_user_proc memcpy's the array at spawn
+# time, so filling getpid → spawn A → filling finite → spawn B gives each proc its
+# own code without a second array (the 1.44.7-attempt-1 refactor that broke).
+#   movabs rbx,0x2000000 ; movabs rcx,0x1000000 ; .L: inc [rbx]; dec rcx; jnz .L
+#   ; mov eax,0 ; xor edi,edi ; syscall(exit) ; jmp -2 (spin)
+fn ring3_payload_fill_finite() {
+    store8(&ring3_payload + 0, 0x48);  store8(&ring3_payload + 1, 0xBB);   # movabs rbx, 0x2000000
+    store8(&ring3_payload + 2, 0x00);  store8(&ring3_payload + 3, 0x00);  store8(&ring3_payload + 4, 0x00); store8(&ring3_payload + 5, 0x02);
+    store8(&ring3_payload + 6, 0x00);  store8(&ring3_payload + 7, 0x00);  store8(&ring3_payload + 8, 0x00); store8(&ring3_payload + 9, 0x00);
+    store8(&ring3_payload + 10, 0x48); store8(&ring3_payload + 11, 0xB9);  # movabs rcx, 0x1000000
+    store8(&ring3_payload + 12, 0x00); store8(&ring3_payload + 13, 0x00); store8(&ring3_payload + 14, 0x00); store8(&ring3_payload + 15, 0x01);
+    store8(&ring3_payload + 16, 0x00); store8(&ring3_payload + 17, 0x00); store8(&ring3_payload + 18, 0x00); store8(&ring3_payload + 19, 0x00);
+    store8(&ring3_payload + 20, 0x48); store8(&ring3_payload + 21, 0xFF); store8(&ring3_payload + 22, 0x03);  # inc qword [rbx]
+    store8(&ring3_payload + 23, 0x48); store8(&ring3_payload + 24, 0xFF); store8(&ring3_payload + 25, 0xC9);  # dec rcx
+    store8(&ring3_payload + 26, 0x75); store8(&ring3_payload + 27, 0xF8);  # jnz -8 (back to inc)
+    store8(&ring3_payload + 28, 0xB8); store8(&ring3_payload + 29, 0x00); store8(&ring3_payload + 30, 0x00); store8(&ring3_payload + 31, 0x00); store8(&ring3_payload + 32, 0x00);  # mov eax, 0 (exit)
+    store8(&ring3_payload + 33, 0x31); store8(&ring3_payload + 34, 0xFF);  # xor edi, edi (exit code 0)
+    store8(&ring3_payload + 35, 0x0F); store8(&ring3_payload + 36, 0x05);  # syscall
+    store8(&ring3_payload + 37, 0xEB); store8(&ring3_payload + 38, 0xFE);  # jmp -2 (spin until descheduled)
+    return 0;
+}
+# Spawn one ring-3 proc and map its 0x2000000 onto `counter_phys`. -1 on fail.
 fn ring3_spawn_one(counter_phys) {
     var pid = spawn_user_proc(&ring3_payload);       # per-proc CR3 + user code/stack, state=ready
     if (pid < 0) { return 0 - 1; }
@@ -2048,7 +2071,6 @@ fn ring3_spawn_one(counter_phys) {
     return pid;
 }
 fn ring3_selftest_setup() {
-    ring3_payload_fill();
     ring3_counter_a = pmm_alloc_2mb();               # 2 MB-aligned — proc_map_page maps a 2 MB page
     ring3_counter_b = pmm_alloc_2mb();
     if (ring3_counter_a == 0) { return 0; }
@@ -2057,34 +2079,41 @@ fn ring3_selftest_setup() {
     if (vmm_is_mapped(ring3_counter_b) == 0) { vmm_map(ring3_counter_b, ring3_counter_b, 0x83); }
     store64(ring3_counter_a, 0);
     store64(ring3_counter_b, 0);
-    ring3_pid_a = ring3_spawn_one(ring3_counter_a);
-    ring3_pid_b = ring3_spawn_one(ring3_counter_b);
+    ring3_payload_fill();                            # getpid (infinite)
+    ring3_pid_a = ring3_spawn_one(ring3_counter_a);  # A = infinite background ("stays live")
+    ring3_payload_fill_finite();                     # re-fill the SAME array with finite+exit
+    ring3_pid_b = ring3_spawn_one(ring3_counter_b);  # B = counts N then exit()s
     return 0;
 }
 fn ring3_selftest_verify() {
+    # Run the scheduler until proc B (finite) exits, or a generous tick budget. A loops
+    # forever (the "stays live" proc); B counts to N then exit()s — both time-sliced.
     var i = 0;
-    while (i < 80) { arch_wait(); i = i + 1; }        # round-robin kmain -> idle -> ring3-A -> ring3-B -> ...
+    while (i < 400) {
+        if (proc_get_state(ring3_pid_b) == 0) { i = 400; }   # B exited — stop early
+        else { arch_wait(); i = i + 1; }
+    }
     var ca = load64(ring3_counter_a);
     var cb = load64(ring3_counter_b);
-    kprint("ring3: A=", 9); kprint_num(ca); kprint(" B=", 3); kprint_num(cb); kprintln("", 0);
-    # BOTH advancing => two ring-3 procs with DIFFERENT CR3s time-sliced (ring-3<->ring-3).
-    if (ca > 0) {
-        if (cb > 0) { kprintln("ring3: preempt OK", 17); }
-        else { kprintln("ring3: FAIL B", 13); }
-    } else { kprintln("ring3: FAIL A", 13); }
-    # Preempt gate covers ring-3: under preempt_disable BOTH counters must FREEZE.
+    var bstate = proc_get_state(ring3_pid_b);
+    kprint("ring3: A=", 9); kprint_num(ca); kprint(" B=", 3); kprint_num(cb); kprint(" Bst=", 5); kprint_num(bstate); kprintln("", 0);
+    # B ran to completion (counter == N=0x1000000) and exited (state 0) WHILE A kept running.
+    if (bstate == 0) {
+        if (cb == 16777216) {
+            if (ca > 0) { kprintln("ring3: child exited", 19); }
+            else { kprintln("ring3: FAIL A idle", 18); }
+        } else { kprintln("ring3: FAIL B partial", 21); }
+    } else { kprintln("ring3: FAIL B hung", 18); }
+    # A is still live + preemptible — proves "another proc stays live" through B's exit.
+    if (ca > 0) { kprintln("ring3: preempt OK", 17); } else { kprintln("ring3: FAIL no A", 16); }
+    # Preempt gate still covers the live proc A.
     var sa = load64(ring3_counter_a);
-    var sb = load64(ring3_counter_b);
     preempt_disable();
     var g = 0;
     while (g < 20) { arch_wait(); g = g + 1; }
     preempt_enable();
-    if (load64(ring3_counter_a) == sa) {
-        if (load64(ring3_counter_b) == sb) { kprintln("ring3: gate held", 16); }
-        else { kprintln("ring3: gate LEAK", 16); }
-    } else { kprintln("ring3: gate LEAK", 16); }
-    proc_set_state(ring3_pid_a, 0);                  # retire both ring-3 procs; boot continues
-    proc_set_state(ring3_pid_b, 0);
+    if (load64(ring3_counter_a) == sa) { kprintln("ring3: gate held", 16); } else { kprintln("ring3: gate LEAK", 16); }
+    proc_set_state(ring3_pid_a, 0);                  # retire the surviving proc A; boot continues
     kprintln("ring3: done", 11);
     return 0;
 }
