@@ -5,6 +5,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.2] — 2026-06-09 (1.44.x — reentrancy gate applied: the FS write-fd slot allocator)
+
+Third multi-threading-arc bite: apply the 1.44.0 preempt gate to the first piece of
+real non-reentrant shared state — the FAT/exFAT write-fd pool's slot allocator.
+
+### Changed
+
+- **`vfs_sec_wfile_alloc_slot` now claims a pool block under `preempt_disable()`**
+  (`core/vfs.cyr`). The allocator finds a free `sec_wfile_inuse[]` flag and claims it
+  with a **non-atomic test-and-set** (`if (flag==0) { flag=1; }`) — shared state with
+  no lock that relied on the single-core no-preemption invariant. A timer preemption
+  between the test and the claim would let two threads grab the same 4360-byte write
+  block and clobber each other's buffer. The gate makes the find-and-claim atomic; the
+  window is tiny (≤ 4 iterations, no I/O). Release stays ungated (a single aligned
+  `store64` is atomic). First real adopter of the "reentrant-or-gated" pattern — the
+  FS scratch-buffer class the multi-threading arc has to make concurrency-safe.
+
+### Notes
+
+- Behavior-preserving + validated: `sweep.sh` **7/7** (the FAT/exFAT write smokes drive
+  the secondary write-fd → this allocator). Atomicity follows from the proven gate
+  freeze (1.44.0 `thread-smoke`). Same-pattern allocators that still rely on IF=0
+  (`vfs_alloc` fd table, the proc-slot / kthread-slot claims) are gating follow-ons —
+  safe today (IF=0 syscalls / boot-time), gated when concurrent access reaches them.
+
 ## [1.44.1] — 2026-06-09 (1.44.x — reentrant-or-gated syscalls + dogfood the kthread primitive)
 
 Two small multi-threading-arc bites: unify the ad-hoc preemption-suspends on the
