@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.1] — 2026-06-09 (1.44.x — reentrant-or-gated syscalls: unify on the preempt gate)
+
+Second bite of the multi-threading arc: retire the ad-hoc preemption-suspends and
+route them through the 1.44.0 `preempt_count` gate, so "suspend preemption for this
+critical section" is one nestable primitive (the roadmap's "reentrant-or-gated
+syscalls" item).
+
+### Changed
+
+- **The three `sti`-window syscalls now use `preempt_disable()` / `preempt_enable()`**
+  instead of the old `saved = sched_active; sched_active = 0; … ; sched_active = saved`
+  toggle (`core/syscall.cyr`): `kbd_read_blocking` (read#5 line discipline — all three
+  return points balanced), `sleep_ms`#41 (DOOM frame pacing), and `kbscan`#42 (the
+  bounded IRQ1 drain). Normal syscalls run IF=0 so the timer can't preempt them; only
+  these open an `sti` window, which is exactly where the gate belongs. The counted gate
+  is **nestable** (the toggle was not — a nested section's restore re-enabled preemption
+  early) and **composes with the boot `sched_active=0`** (`do_context_switch` returns on
+  either), so the manual save/restore drops out. Semantically identical at the
+  single-level case.
+
+### Notes
+
+- Behavior-preserving + validated: `thread-smoke` (gate) green; `agnsh-delegation-test`
+  PASS (the agnsh typing path *is* `kbd_read_blocking`); `doom-smoke` PASS (frame pacing
+  is `sleep_ms`#41); `sweep.sh` **7/7**. `sched_active` is now written only at boot
+  (master scheduler on/off) — never toggled mid-syscall.
+
 ## [1.44.0] — 2026-06-09 (1.44.x — multi-threading / preemptive scheduling: opening)
 
 Opens the 1.44.x multi-threading arc — the deep transition from the cooperative

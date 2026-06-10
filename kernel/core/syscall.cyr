@@ -207,9 +207,11 @@ fn kernel_resume() {
 # ring-3 syscall since 1.41.12, so it renders under the unified exec CR3 on iron.
 fn kbd_read_blocking(buf, count) {
     if (count <= 0) { return 0; }
-    var saved_sched = sched_active;
-    sched_active = 0;          # suspend preemption: timer ISR still EOIs + ticks,
-    # but do_context_switch early-returns (no switch)
+    preempt_disable();         # 1.44.1: suspend preemption for the whole line read.
+    # The timer ISR still EOIs + ticks, but do_context_switch is a no-op while
+    # preempt_count>0. Replaces the old `sched_active=0`/save+restore toggle: the
+    # counted gate is nestable and composes with the boot sched_active=0 (which keeps
+    # do_context_switch returning regardless) — no manual save/restore needed.
     kb_shift = 0; kb_ctrl = 0; # defensive: never enter a read with a stranded
     # modifier from a prior partial read (continuous drain below keeps it honest
     # within the line; this just guarantees a clean start)
@@ -226,7 +228,7 @@ fn kbd_read_blocking(buf, count) {
             store8(buf + n, 10);
             n = n + 1;
             kbd_irq_disable();
-            sched_active = saved_sched;
+            preempt_enable();
             return n;
         }
         if (ch == 4) {                  # Ctrl-D (EOF). Canonical tty semantics:
@@ -237,7 +239,7 @@ fn kbd_read_blocking(buf, count) {
             # delivers the bytes typed so far WITHOUT a terminating LF, so a
             # second Ctrl-D at the fresh line start then yields EOF. Not echoed.
             kbd_irq_disable();
-            sched_active = saved_sched;
+            preempt_enable();
             return n;
         }
         if (ch == 8) {                  # Backspace: erase one cell + drop one byte
@@ -256,7 +258,7 @@ fn kbd_read_blocking(buf, count) {
     }
     # Buffer filled before a newline arrived — return the partial line.
     kbd_irq_disable();
-    sched_active = saved_sched;
+    preempt_enable();
     return n;
 }
 
@@ -1057,14 +1059,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var sl_ms = arg1;
         if (sl_ms > 3600000) { sl_ms = 3600000; }                    # cap 1 h (sanity)
         var sl_target = timer_ticks + (sl_ms + 9) / 10;              # round ms up to ticks
-        var sl_saved = sched_active;
-        sched_active = 0;                # suspend preemption (timer still ticks+EOIs)
+        preempt_disable();               # suspend preemption (timer still ticks+EOIs)
         asm { sti; }                     # IF=1 so the timer IRQ fires + wakes the hlt
         while (timer_ticks < sl_target) {
             arch_wait();                 # hlt until the next IRQ (timer @ 100 Hz)
         }
         asm { cli; }                     # restore IF=0 for the handler tail
-        sched_active = sl_saved;
+        preempt_enable();
         stack_canary_check(canary);
         return 0;
     }
@@ -1094,13 +1095,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # window is belt-and-suspenders, not the sole capture path.)
         if (arg2 <= 0) { stack_canary_check(canary); return 0; }
         if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
-        var ks_saved = sched_active;
-        sched_active = 0;                # suspend preemption (timer still ticks+EOIs)
+        preempt_disable();               # suspend preemption (timer still ticks+EOIs)
         kbd_irq_enable();                # sti — service any PIC-latched IRQ1 into kb_buf
         var ks_w = 0;
         while (ks_w < 256) { hid_poll(); ks_w = ks_w + 1; }  # bounded window: take IRQ1 + drain xHCI ring
         kbd_irq_disable();               # cli — restore IF=0 for the handler tail
-        sched_active = ks_saved;
+        preempt_enable();
         var ks_n = 0;
         while (ks_n < arg2) {
             if (kb_has_key() == 0) { stack_canary_check(canary); return ks_n; }
