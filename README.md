@@ -2,7 +2,7 @@
 
 > Sovereign operating system kernel. Written in Cyrius. Assembly up. Zero C, zero Rust, zero LLVM.
 
-**Status**: boots to a typeable interactive shell on real AMD hardware (the MVP gate, since v1.30.9). Storage (NVMe / SATA / USB-MS), networking (TCP/IP + DHCP + DNS + NTP + ICMP over a real-iron NIC), and read+write filesystems (ext2/ext4 incl. **ext4 extent allocation** + **JBD2 journaling — crash-safe metadata writes**, FAT12/16/32, exFAT) are all landed — the storage trio, networking, ext4 read+write+extent-alloc, and **exec-from-disk** (a static ELF64 loaded from the filesystem runs in ring 3, 1.40.x) are iron-validated on archaemenid; the FAT-family + JBD2 stacks are QEMU/`fsck`-validated. The headline since is **shell separation** (1.41.x): PID 1 (kybernet) `exec`s `/bin/agnsh` — the userland [agnoshi](https://github.com/MacCracken/agnoshi) shell — in ring 3 off the ext2 root, so the full interactive shell is now a userland binary while the in-kernel `shell()` shrank to a minimal **recovery REPL** (the boot fallback only); FAT/exFAT content-write also reached the syscall ABI (1.41.7). The latest headline is **DOOM rendering on AGNOS** (1.43.6): `cyrius-doom --agnos` exec's from disk in ring 3, loads a 4.2 MB WAD, and blits a 240-colour frame to the framebuffer via two new kernel syscalls (`fbinfo`#38 / `blit`#39) — "agnsh launches DOOM," the **first real userland application** on the OS (QEMU-validated; iron burn pending). The console-font subsystem is **vendored from [kashi](https://github.com/MacCracken/kashi) 1.0.0** (freestanding glyph core consumed via `[deps.kashi]`). Current version in [`VERSION`](VERSION); live capability snapshot in [`docs/development/state.md`](docs/development/state.md).
+**Status**: boots to a typeable interactive shell on real AMD hardware (the MVP gate, since v1.30.9). Storage (NVMe / SATA / USB-MS), networking (TCP/IP + DHCP + DNS + NTP + ICMP over a real-iron NIC), and read+write filesystems (ext2/ext4 incl. **ext4 extent allocation** + **JBD2 journaling — crash-safe metadata writes**, FAT12/16/32, exFAT) are all landed — the storage trio, networking, ext4 read+write+extent-alloc, and **exec-from-disk** (a static ELF64 loaded from the filesystem runs in ring 3, 1.40.x) are iron-validated on archaemenid; the FAT-family + JBD2 stacks are QEMU/`fsck`-validated. The headline since is **shell separation** (1.41.x): PID 1 (kybernet) `exec`s `/bin/agnsh` — the userland [agnoshi](https://github.com/MacCracken/agnoshi) shell — in ring 3 off the ext2 root, so the full interactive shell is now a userland binary while the in-kernel `shell()` shrank to a minimal **recovery REPL** (the boot fallback only); FAT/exFAT content-write also reached the syscall ABI (1.41.7). **DOOM plays on AGNOS** (1.43.x): `cyrius-doom --agnos` exec's from disk in ring 3, loads a 4.2 MB WAD, and renders via new kernel syscalls (`fbinfo`#38 / `blit`#39 / `uptime_ms`#40 / `sleep_ms`#41 / `kbscan`#42) — "agnsh launches DOOM," the **first real userland application**, is **iron-complete** (burn `1439` plays DOOM in-game on real Zen, keyboard-driven). The latest arc is **1.44.x — preemptive multi-threading**: the scheduler moved from a cooperative single-core round-robin to **preemptive ring-3 time-slicing** — a finite ring-3 program runs to completion + `exit()`s cleanly while a second ring-3 proc (each on its own CR3, both making syscalls) stays live, including a scheduled proc spawned from a real in-memory ELF64 (QEMU-validated via `scripts/ring3-smoke.sh` + `scripts/thread-smoke.sh`; iron-pending). The console-font subsystem is **vendored from [kashi](https://github.com/MacCracken/kashi) 1.0.0** (freestanding glyph core consumed via `[deps.kashi]`). Current version in [`VERSION`](VERSION); live capability snapshot in [`docs/development/state.md`](docs/development/state.md).
 
 ## Quick Start
 
@@ -65,10 +65,14 @@ Common:
   -> console-font: kashi 1.0.0 freestanding glyph core (vendored via [deps.kashi])
   -> Native xHCI + USB-HID-boot keyboard driver (Phase 1-5)
   -> SMP infrastructure (APIC, IPI, trampoline, per-CPU stacks)
-  -> 34 syscalls 0-33 (signals, epoll, timerfd, pipes, anonymous mmap/munmap,
-       + FS syscalls getdents/unlink/rename/link/stat, 1.41.3)
+  -> 43 syscalls 0-42 (signals, epoll, timerfd, pipes, anonymous mmap/munmap,
+       FS syscalls getdents/unlink/rename/link/stat (1.41.3),
+       sysinfo uname/sysinfo/klog (1.42.x), execwait + graphics/timing/input
+       fbinfo/blit/uptime_ms/sleep_ms/kbscan (1.43.x))
   -> kybernet (PID 1) -> execs /bin/agnsh (userland shell) in ring 3;
        in-kernel shell() is the recovery REPL fallback (1.41.x)
+  -> preemptive ring-3 scheduler: kthread_create + preempt gate, per-proc
+       CS/SS context switch, timer-driven time-slicing (1.44.x)
 ```
 
 ## Subsystems (40+)
@@ -95,7 +99,7 @@ Common:
 | Context Switch | Full register save/restore, CR3 switch |
 | SYSCALL/SYSRET | MSR setup, ring 3 transition |
 | ELF Loader | Static ELF64, per-process address space. **Exec-from-disk** (1.40.x): `vfs_read_file` slurps a whole ELF off the FS → `elf_load_from_file` → `exec_and_wait` runs it in **ring 3** (SYSCALL/SYSRET/iretq, SMAP STAC/CLAC). Iron-validated on archaemenid (`/bin/prog2`/`/bin/argv` ran ring-3). A malformed-segment validation pre-pass (1.41.6) rejects bad ELFs with zero allocations leaked. |
-| Exec / process lifecycle | `run <path>` (kernel recovery shell) + `spawn`(3)/`exec`-via-`sys_spawn` (userland) load + run a ring-3 program and collect its exit code; multi-`run` per boot. Process teardown + **`proc_reap`** (1.40.14) reclaims per-process pages (U/S-bit scan) + proc-table slots on exit, and sweeps any still-open fds (1.41.10). Run-to-completion / single-foreground (preemptive ring 3 is a later arc). |
+| Exec / process lifecycle | `run <path>` (kernel recovery shell) + `spawn`(3)/`exec`-via-`sys_spawn` (userland) load + run a ring-3 program and collect its exit code; multi-`run` per boot. Process teardown + **`proc_reap`** (1.40.14) reclaims per-process pages (U/S-bit scan) + proc-table slots on exit, and sweeps any still-open fds (1.41.10). **Preemptive ring-3 time-slicing landed (1.44.x)**: ring-3 procs with distinct CR3s are preempted by the timer and resumed, a finite program runs to completion + `exit()`s cleanly while another stays live, incl. a scheduled proc from a real in-memory ELF64 (`exec_and_wait` remains the run-to-completion path; ring-3 parent `spawn`+`waitpid` is the in-progress next bite). |
 | VFS | File table, device/memfile/signalfd/epoll/timerfd/pipe types + `VFS_EXT2_DIR` dir-fd (1.41.3) + `VFS_SEC_WFILE` FAT/exFAT write-back fd (1.41.7). **Mount-namespace routing** (1.40.13): verbs/syscalls route by mount-point, so FAT/exFAT are reachable while ext2 owns `/`. Generic per-FS write/dir dispatch (`vfs_*_on`, 1.39.x) reaches FAT32 + exFAT. |
 | Device Drivers | Serial char device |
 | Initrd | Flat format, name lookup |
@@ -123,11 +127,11 @@ Common:
 | Timerfd | timerfd_create, timerfd_settime |
 | Scheduler | Round-robin |
 | Shell | **Shell separation (1.41.x).** The full interactive shell is now **agnsh** — the userland [agnoshi](https://github.com/MacCracken/agnoshi) build, exec'd from `/bin/agnsh` in ring 3 off the ext2 root (first userland binary promoted to a system component; locks the permanent kernel↔userland shell boundary). The in-kernel `shell()` shrank to a minimal **recovery REPL** (`kernel/user/shell.cyr` 1149 → 813 LOC at 1.41.9) — the boot fallback only, reached when `/bin/agnsh` is absent/unloadable. Recovery verb set: `help` `cd` `pwd` `ls` `cat` `run` `mv` `rm` `sync` `reboot` + non-write diagnostics (`uptime`/`lspci`/`cpus`/`net`/`parts`/`date`/`clear`/`version`/…). |
-| kybernet Init | PID 1: `exec`s `/bin/agnsh` in ring 3 (`kybernet_exec_agnsh`, 1.41.4) and falls back to the in-kernel recovery shell only on load failure. 34 kernel syscalls ready (0-33). |
+| kybernet Init | PID 1: `exec`s `/bin/agnsh` in ring 3 (`kybernet_exec_agnsh`, 1.41.4) and falls back to the in-kernel recovery shell only on load failure. 43 kernel syscalls ready (0-42). |
 
-## Syscalls (34, 0-33)
+## Syscalls (43, 0-42)
 
-The FS group (`getdents`/`unlink`/`rename`/`link`/`stat`) + the `open`(7) re-route to the mount-routed VFS + making `mkdir`(9)/`rmdir`(10)/`sync`(12) real landed at **1.41.3** (with the **`a4=r10` ABI extension** — a 4th syscall arg carried in `r10`, used by `rename`/`link`). `mmap`(27)/`munmap`(28) landed earlier (1.35.x).
+The FS group (`getdents`/`unlink`/`rename`/`link`/`stat`) + the `open`(7) re-route to the mount-routed VFS + making `mkdir`(9)/`rmdir`(10)/`sync`(12) real landed at **1.41.3** (with the **`a4=r10` ABI extension** — a 4th syscall arg carried in `r10`, used by `rename`/`link`). `mmap`(27)/`munmap`(28) landed earlier (1.35.x). The 1.42.x sysinfo group (`uname`/`sysinfo`/`klog`, 34-36) and the 1.43.x exec/graphics/timing/input group (`execwait`/`fbinfo`/`blit`/`uptime_ms`/`sleep_ms`/`kbscan`, 37-42) followed; `waitpid`(4) became a **non-blocking poll** at 1.44.9.
 
 | Number | Name | Description |
 |--------|------|-------------|
@@ -135,7 +139,7 @@ The FS group (`getdents`/`unlink`/`rename`/`link`/`stat`) + the `open`(7) re-rou
 | 1 | write | Write to file descriptor |
 | 2 | getpid | Get process ID |
 | 3 | spawn | Create new process |
-| 4 | waitpid | Wait for child process |
+| 4 | waitpid | Wait for child — non-blocking poll since 1.44.9 (exit code, or -2 = WOULD_BLOCK) |
 | 5 | read | Read from file descriptor |
 | 6 | close | Close file descriptor |
 | 7 | open | Open file |
@@ -143,7 +147,7 @@ The FS group (`getdents`/`unlink`/`rename`/`link`/`stat`) + the `open`(7) re-rou
 | 9 | mkdir | Create directory |
 | 10 | rmdir | Remove directory |
 | 11 | mount | Mount filesystem |
-| 12 | sync | Sync to disk (noop) |
+| 12 | sync | Sync to disk (made real, mount-routed, 1.41.3) |
 | 13 | reboot | Reboot system |
 | 14 | pause | Pause until signal |
 | 15 | getuid | Get user ID (always root) |
@@ -165,6 +169,15 @@ The FS group (`getdents`/`unlink`/`rename`/`link`/`stat`) + the `open`(7) re-rou
 | 31 | rename | Rename within one filesystem; uses `a4` for `newlen` (1.41.3) |
 | 32 | link | Hard link, ext2-only; uses `a4` (1.41.3) |
 | 33 | stat | Fill the 48-byte agnos stat struct from the inode — ext2 (1.41.3) |
+| 34 | uname | System name / kernel version info (1.42.x) |
+| 35 | sysinfo | Memory / uptime / process-count info struct (1.42.x) |
+| 36 | klog | Copy the unified `klug` log ring to a user buffer (1.42.x) |
+| 37 | execwait | Nested `exec_and_wait` from a ring-3 syscall frame, run-to-completion on a disjoint kstack (1.43.0) |
+| 38 | fbinfo | Framebuffer geometry query (24-byte struct; `fb_phys` not exposed) (1.43.x) |
+| 39 | blit | Kernel-mediated ring-3 → framebuffer 32bpp pixel copy, clipped to FB bounds (1.43.x) |
+| 40 | uptime_ms | Monotonic milliseconds (`timer_ticks * 10`) (1.43.x) |
+| 41 | sleep_ms | Pacing primitive — sleep to a target ms (1.43.x) |
+| 42 | kbscan | Read a keyboard scancode (ring-3 input, e.g. DOOM) (1.43.x) |
 
 > `open`(7) was re-routed at 1.41.3 from initrd-only to the mount-routed VFS (`AO_CREAT`/`AO_TRUNC`/`AO_DIRECTORY` flags via a3, initrd as bare-name fallback); `mkdir`(9)/`rmdir`(10)/`sync`(12) were tier-1 stubs returning 0 and are now real (mount-routed).
 
@@ -194,7 +207,7 @@ for the methodology caveat (closed at v1.28.1 — kept as audit trail).
 
 | Kernel | Language | Scope |
 |--------|----------|-------|
-| **AGNOS** | Cyrius | 40+ subsystems, 34 syscalls (0-33), TCP/IP + DHCP + DNS + NTP + ICMP, real-iron NIC (r8169), full storage stack (NVMe / AHCI / USB-MS / VirtIO-blk + 5-backend block layer + GPT), read+write filesystems (ext2/ext4 incl. extent allocation + **JBD2 crash-safe journaling**, FAT12/16/32, exFAT), SMP, ELF loader + **exec-from-disk** (ring-3 ELF off the FS), ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, vendored kashi 1.0.0 console-font core, **userland shell (agnsh) exec'd in ring 3** + in-kernel recovery REPL |
+| **AGNOS** | Cyrius | 40+ subsystems, 43 syscalls (0-42), TCP/IP + DHCP + DNS + NTP + ICMP, real-iron NIC (r8169), full storage stack (NVMe / AHCI / USB-MS / VirtIO-blk + 5-backend block layer + GPT), read+write filesystems (ext2/ext4 incl. extent allocation + **JBD2 crash-safe journaling**, FAT12/16/32, exFAT), SMP, ELF loader + **exec-from-disk** (ring-3 ELF off the FS), ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, vendored kashi 1.0.0 console-font core, **userland shell (agnsh) exec'd in ring 3** + in-kernel recovery REPL |
 | xv6 (MIT) | C | 21 syscalls, no networking, no SMP, no real FS |
 | seL4 (verified) | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
 | MINIX 3 | C | Microkernel + basic drivers |

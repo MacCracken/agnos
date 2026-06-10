@@ -95,7 +95,7 @@ Added after the original kybernet set, for iron-boot diagnostics, memory, and th
 AGNOS uses its own syscall numbers (not Linux's). The `syscalls_agnos.cyr` backend maps:
 
 ```
-AGNOS syscall table — kybernet's original 26-call subset (full surface is 0-33; see syscall-additions.md):
+AGNOS syscall table — kybernet's original 26-call subset (full surface is 0-42; see syscall-additions.md):
  0 = exit          8 = dup           16 = kill
  1 = write         9 = mkdir         17 = sigprocmask
  2 = getpid       10 = rmdir         18 = signalfd

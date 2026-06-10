@@ -5,6 +5,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.10] — 2026-06-10 (1.44.x — ring-3 parent spawn+waitpid: the spawn#3 kernel-CR3 fix, end-to-end)
+
+The deferred 1.44.9 blocker is cleared: a ring-3 **parent** now `spawn`(#3)s a child ELF and
+poll-`waitpid`(#4)s it to exit — **entirely from ring 3** — with the child running correctly
+under the parent's CR3 (the #UD-at-child-entry triple-fault is gone). This is the "background
+job / a program runs while the shell stays live" core of the arc.
+
+### Fixed
+
+- **`spawn`(#3) now runs `elf_load` under the KERNEL CR3** (`core/syscall.cyr`). A ring-3
+  parent's per-process CR3 mirrors only 0–256 MB + the GB ranges, so the child's fresh
+  page-table pages (allocated anywhere in phys by `proc_create_address_space` /
+  `proc_map_page`) could land in the unmapped 256 MB–1 GB gap — the bytes loaded correctly
+  but the child's tables were mis-wired, #UD'ing at its entry (the precisely-located 1.44.9
+  blocker). The handler now copies the user ELF into a 16 KB kernel staging buffer
+  (`spawn_elf_buf`) **while the caller CR3 still resolves `arg1`** (SMAP AC=1 from the entry
+  STAC), switches to boot CR3 `0x1000` (identity-maps all phys → every PT page `elf_load`
+  writes is reachable — the proven 1.44.8 kernel-side condition), runs `elf_load`, then
+  restores the caller CR3. Mirrors the `execwait`#37 copy-then-boot-CR3 idiom; no kstack
+  swap / resume-context since `spawn` does not block. Bounded by the staging buffer
+  (`arg2 > 16384` → -1). A **kernel** caller (the `RING3_SELFTEST` loads proc B via `elf_load`
+  directly) does not reach this path, so the 1.44.8 kernel-side selftest is unaffected.
+
+### Added
+
+- **`RING3_SELFTEST` proc P — a ring-3 PARENT driving `spawn`+`waitpid`** (`core/main.cyr`).
+  A position-independent (RIP-relative) raw-machine-code parent embeds a minimal exit-only
+  child ELF64 inline, `spawn`(#3)s it, poll-`waitpid`(#4)s until the child exits, then
+  `exit(0xABCD)`. Success is the **parent's exit code** (read by the verify via
+  `proc_get_exit_code` — kernel-side, needing no fragile user-memory mapping under the parent
+  CR3). `ring3-smoke` now asserts a 4th line, **`ring3: parent spawn+wait OK`**, proving the
+  fix end-to-end (child spawned + run + reaped, all observed from ring 3).
+
+### Notes
+
+- Validated: `ring3-smoke` **4/4** + `thread-smoke` 2/2 + `agnsh-smoke` PASS + `doom-smoke`
+  PASS + `sweep.sh` **7/7** + `check.sh` **11/11**. Production build byte-stable (the selftest
+  parent/child are `RING3_SELFTEST`-gated, DCE'd out of production). Iron-burn rides the next
+  archaemenid burn. Two engineering notes surfaced building the selftest (both Cyrius 6.0.56
+  facts, not AGNOS bugs): (1) a module-global `var X[N]` here reserves ~N **bytes**, so two
+  adjacent fill-buffer arrays overlapped — folded into a single oversized array; (2) `exit`
+  RETURNS to ring 3 (the scheduler retires the state-0 proc on the next tick), so a ring-3
+  payload must `jmp $`-spin after its `exit` syscall, never fall into trailing bytes.
+
 ## [1.44.9] — 2026-06-10 (1.44.x — non-blocking waitpid; the ring-3 parent spawn+waitpid blocker scoped)
 
 Groundwork toward a ring-3 PARENT driving `spawn`(#3) + `waitpid`(#4): `waitpid` is now a

@@ -2087,6 +2087,148 @@ fn ring3_elf_fill() {
     store8(&ring3_elf + 157, 0xEB); store8(&ring3_elf + 158, 0xFE);  # jmp -2 (spin until descheduled)
     return 0;
 }
+# 1.44.10: a ring-3 PARENT (proc P) that drives spawn(#3) + poll-waitpid(#4) entirely
+# from RING 3 — the proof that the spawn#3 kernel-CR3 fix (syscall.cyr) lets elf_load,
+# run under the PARENT's CR3, reach the child's page tables. Previously this triple-
+# faulted on the child (#UD at entry) because the parent CR3 has a 256 MB-1 GB mirror gap.
+#
+# The parent payload is RIP-relative (position-independent): it `lea`s the embedded child
+# ELF off RIP, so it needs no knowledge of the pid-dependent code_va. The child is a
+# MINIMAL exit-only ELF (no memory writes → no per-child mapping needed). The parent writes
+# the sentinel 0xABCD to its 0x2000000 ONLY after a SUCCESSFUL waitpid (rax>=0) — i.e. only
+# if the child actually ran to exit AND the parent observed it via waitpid from ring 3.
+#
+#   lea  rdi, [rip+0xF9]      ; &child_elf (payload+256)
+#   mov  esi, 0x83           ; child size = 131
+#   mov  eax, 3 ; syscall    ; spawn -> rax = child pid (or -1)
+#   test rax, rax ; js .fail  ; bail on spawn failure (no sentinel)
+#   mov  rbx, rax
+# .poll:
+#   mov  eax, 4 ; mov rdi, rbx ; syscall   ; waitpid -> rax = exit code or -2 (WOULD_BLOCK)
+#   cmp  rax, -2 ; je .poll                 ; spin in ring 3 until the child exits
+#   movabs rbx, 0x2000000 ; mov dword [rbx], 0xABCD   ; sentinel = "saw child exit"
+# .fail:
+#   mov  eax, 0 ; xor edi, edi ; syscall    ; exit(0)
+#   jmp  $
+# ONE array only. Under cyrius 6.0.56 a module-global `var X[N]` reserves ~N bytes
+# (NOT N×u64) — a separate spawn_child_elf[24] overlapped this buffer and clobbered it
+# (delta=32, not 192). So the child ELF is built INLINE at offset 256 of this same array.
+# Sized [4096] so the parent's used region [0,387) never reaches the next global and so
+# spawn_user_proc's 4096-byte memcpy stays in bounds.
+var spawn_parent_payload[4096];   # parent code @0, child ELF @256 (one 4 KB code page)
+var spawn_parent_pid = 0;
+fn spawn_parent_fill() {
+    memset(&spawn_parent_payload, 0, 4096);
+    # memset zeroed the page, so store ONLY the non-zero bytes, ONE store8 per line.
+    # (A line packing many store8;-statements had trailing stores silently dropped by
+    # the parser — P0/P2 came back wrong while a re-stored P1 on its own line was right.)
+    # Success is signalled via the parent's EXIT CODE (kernel-side, read by the verify with
+    # proc_get_exit_code) — NOT a user-memory counter, because the FB and an arbitrary user
+    # page mapping are both unreliable under the parent CR3. The parent exit(0xABCD) ONLY
+    # after a successful waitpid (child ran + exited); exit(1) if spawn itself failed.
+    # lea rdi, [rip+0xF9]  (child ELF @256; disp = 256-7 = 249 = 0xF9)
+    store8(&spawn_parent_payload + 0, 0x48);
+    store8(&spawn_parent_payload + 1, 0x8D);
+    store8(&spawn_parent_payload + 2, 0x3D);
+    store8(&spawn_parent_payload + 3, 0xF9);
+    # mov esi, 131
+    store8(&spawn_parent_payload + 7, 0xBE);
+    store8(&spawn_parent_payload + 8, 0x83);
+    # mov eax, 3 (spawn)
+    store8(&spawn_parent_payload + 12, 0xB8);
+    store8(&spawn_parent_payload + 13, 0x03);
+    # syscall
+    store8(&spawn_parent_payload + 17, 0x0F);
+    store8(&spawn_parent_payload + 18, 0x05);
+    # mov rbx, rax (save child pid; rbx survives the waitpid syscalls)
+    store8(&spawn_parent_payload + 19, 0x48);
+    store8(&spawn_parent_payload + 20, 0x89);
+    store8(&spawn_parent_payload + 21, 0xC3);
+    # test ebx, ebx  (32-bit: spawn failed if negative)
+    store8(&spawn_parent_payload + 22, 0x85);
+    store8(&spawn_parent_payload + 23, 0xDB);
+    # js .fail (rel +0x1D -> off 55)
+    store8(&spawn_parent_payload + 24, 0x78);
+    store8(&spawn_parent_payload + 25, 0x1D);
+    # .poll @ off 26: mov eax, 4 (waitpid)
+    store8(&spawn_parent_payload + 26, 0xB8);
+    store8(&spawn_parent_payload + 27, 0x04);
+    # mov rdi, rbx
+    store8(&spawn_parent_payload + 31, 0x48);
+    store8(&spawn_parent_payload + 32, 0x89);
+    store8(&spawn_parent_payload + 33, 0xDF);
+    # syscall
+    store8(&spawn_parent_payload + 34, 0x0F);
+    store8(&spawn_parent_payload + 35, 0x05);
+    # cmp eax, -2  (32-bit WOULD_BLOCK check)
+    store8(&spawn_parent_payload + 36, 0x83);
+    store8(&spawn_parent_payload + 37, 0xF8);
+    store8(&spawn_parent_payload + 38, 0xFE);
+    # je .poll (rel -15 = 0xF1 -> off 26)
+    store8(&spawn_parent_payload + 39, 0x74);
+    store8(&spawn_parent_payload + 40, 0xF1);
+    # child exited: mov eax, 0 (exit)
+    store8(&spawn_parent_payload + 41, 0xB8);
+    # mov edi, 0xABCD (success exit code)
+    store8(&spawn_parent_payload + 46, 0xBF);
+    store8(&spawn_parent_payload + 47, 0xCD);
+    store8(&spawn_parent_payload + 48, 0xAB);
+    # syscall (exit 0xABCD)
+    store8(&spawn_parent_payload + 51, 0x0F);
+    store8(&spawn_parent_payload + 52, 0x05);
+    # jmp -2 (spin until descheduled — exit() RETURNS to ring 3; the scheduler retires the
+    # state-0 proc on the next tick, so the proc must spin here, not fall into zero bytes)
+    store8(&spawn_parent_payload + 53, 0xEB);
+    store8(&spawn_parent_payload + 54, 0xFE);
+    # .fail @ off 55: mov eax, 0 (exit)
+    store8(&spawn_parent_payload + 55, 0xB8);
+    # mov edi, 1 (failure exit code)
+    store8(&spawn_parent_payload + 60, 0xBF);
+    store8(&spawn_parent_payload + 61, 0x01);
+    # syscall (exit 1)
+    store8(&spawn_parent_payload + 65, 0x0F);
+    store8(&spawn_parent_payload + 66, 0x05);
+    # jmp -2 (spin)
+    store8(&spawn_parent_payload + 67, 0xEB);
+    store8(&spawn_parent_payload + 68, 0xFE);
+    # --- child ELF built INLINE at payload offset 256 (the lea target): a minimal
+    # exit-only ELF64 (no memory writes → needs no per-child page mapping). 131 bytes.
+    # memset already zeroed this region; store only the non-zero bytes, one per line.
+    # ehdr:
+    store8(&spawn_parent_payload + 256, 0x7F);
+    store8(&spawn_parent_payload + 257, 0x45);
+    store8(&spawn_parent_payload + 258, 0x4C);
+    store8(&spawn_parent_payload + 259, 0x46);
+    store8(&spawn_parent_payload + 260, 0x02);
+    store8(&spawn_parent_payload + 261, 0x01);
+    store8(&spawn_parent_payload + 262, 0x01);
+    store8(&spawn_parent_payload + 272, 0x02);
+    store8(&spawn_parent_payload + 274, 0x3E);
+    store8(&spawn_parent_payload + 276, 0x01);
+    store8(&spawn_parent_payload + 280, 0x78);
+    store8(&spawn_parent_payload + 282, 0x40);
+    store8(&spawn_parent_payload + 288, 0x40);
+    store8(&spawn_parent_payload + 308, 0x40);
+    store8(&spawn_parent_payload + 310, 0x38);
+    store8(&spawn_parent_payload + 312, 0x01);
+    # phdr (offset 64 within the child → payload 320):
+    store8(&spawn_parent_payload + 320, 0x01);
+    store8(&spawn_parent_payload + 324, 0x07);
+    store8(&spawn_parent_payload + 338, 0x40);
+    store8(&spawn_parent_payload + 346, 0x40);
+    store8(&spawn_parent_payload + 352, 0x83);
+    store8(&spawn_parent_payload + 360, 0x83);
+    store8(&spawn_parent_payload + 369, 0x10);
+    # code (file offset 120 within the child → payload 376): exit(0), spin
+    store8(&spawn_parent_payload + 376, 0xB8);
+    store8(&spawn_parent_payload + 381, 0x31);
+    store8(&spawn_parent_payload + 382, 0xFF);
+    store8(&spawn_parent_payload + 383, 0x0F);
+    store8(&spawn_parent_payload + 384, 0x05);
+    store8(&spawn_parent_payload + 385, 0xEB);
+    store8(&spawn_parent_payload + 386, 0xFE);
+    return 0;
+}
 # Spawn one ring-3 proc and map its 0x2000000 onto `counter_phys`. -1 on fail.
 fn ring3_spawn_one(counter_phys) {
     var pid = spawn_user_proc(&ring3_payload);       # per-proc CR3 + user code/stack, state=ready
@@ -2111,16 +2253,29 @@ fn ring3_selftest_setup() {
     ring3_elf_fill();
     ring3_pid_b = elf_load(&ring3_elf, 159);
     if (ring3_pid_b >= 0) { proc_map_page(proc_get_cr3(ring3_pid_b), 0x2000000, ring3_counter_b); }
+    # P = a ring-3 PARENT that spawn(#3)s + poll-waitpid(#4)s a child ELF entirely from
+    # ring 3 (1.44.10). Unlike B (loaded by a KERNEL-context elf_load), P invokes spawn as
+    # a SYSCALL under its own CR3 — the path the kernel-CR3 fix unblocks. P makes no memory
+    # writes (only spawn/waitpid/exit syscalls), so it needs NO 0x2000000 mapping; success
+    # is its exit code 0xABCD (read by the verify via proc_get_exit_code). proc_create_full
+    # already left it state=ready; only proc_set_ring3 (ring-3 selectors) is needed.
+    spawn_parent_fill();
+    spawn_parent_pid = spawn_user_proc(&spawn_parent_payload);
+    if (spawn_parent_pid >= 0) { proc_set_ring3(spawn_parent_pid); }
     return 0;
 }
 fn ring3_selftest_verify() {
-    # Run the scheduler until proc B (finite) exits, or a generous tick budget. A loops
-    # forever (the "stays live" proc); B counts to N then exit()s — both time-sliced.
-    # Run the scheduler until proc B (the ELF) exits, or a tick budget. A loops forever.
+    # Run the scheduler until BOTH proc B (the kernel-loaded ELF) exits AND the ring-3
+    # PARENT P has written its sentinel (child spawned + waitpid'd from ring 3), or a
+    # generous tick budget. A loops forever (the "stays live" proc); B counts to N then
+    # exit()s; P spawns C, polls waitpid, then exits — all time-sliced. Budget is larger
+    # than the B-only era (400) because four procs now share the round-robin.
     var i = 0;
-    while (i < 400) {
-        if (proc_get_state(ring3_pid_b) == 0) { i = 400; }   # B exited — stop early
-        else { arch_wait(); i = i + 1; }
+    while (i < 1500) {
+        if (proc_get_state(ring3_pid_b) == 0) {
+            if (proc_get_state(spawn_parent_pid) == 0) { i = 1500; }   # both done — stop early
+            else { arch_wait(); i = i + 1; }
+        } else { arch_wait(); i = i + 1; }
     }
     var ca = load64(ring3_counter_a);
     var cb = load64(ring3_counter_b);
@@ -2135,6 +2290,14 @@ fn ring3_selftest_verify() {
     } else { kprintln("ring3: FAIL B hung", 18); }
     # A is still live + preemptible — proves "another proc stays live".
     if (ca > 0) { kprintln("ring3: preempt OK", 17); } else { kprintln("ring3: FAIL no A", 16); }
+    # P (ring-3 PARENT) spawn(#3)ed a child ELF + poll-waitpid(#4)ed it to exit, all from
+    # ring 3, then exit(0xABCD). The exit code is set ONLY after a successful waitpid, so
+    # 0xABCD proves the spawn#3 kernel-CR3 fix end-to-end (the child's tables were wired
+    # correctly under the parent's CR3; the #UD-at-child blocker is gone). Pst 0 = P exited.
+    var pcode = proc_get_exit_code(spawn_parent_pid);
+    var pstate = proc_get_state(spawn_parent_pid);
+    kprint("ring3: Pcode=", 13); kprint_num(pcode); kprint(" Pst=", 5); kprint_num(pstate); kprintln("", 0);
+    if (pcode == 0xABCD) { kprintln("ring3: parent spawn+wait OK", 27); } else { kprintln("ring3: FAIL parent spawn", 24); }
     # Preempt gate still covers the live proc A.
     var sa = load64(ring3_counter_a);
     preempt_disable();

@@ -1,19 +1,22 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> **Last Updated**: 2026-06-07 (v1.43.0 — surface is now **0–37, 38 syscalls**; the 1.43.x graphics/userland-app arc added `execwait`#37)
+> **Last Updated**: 2026-06-10 (through v1.44.9 — surface is now **0–42, 43 syscalls**; the 1.43.x graphics/timing/input group added `fbinfo`#38 / `blit`#39 / `uptime_ms`#40 / `sleep_ms`#41 / `kbscan`#42 alongside `execwait`#37, and `waitpid`#4 became a non-blocking poll at v1.44.9)
 >
-> The 26-call kybernet surface (0–25) was complete at v1.21.0; kybernet (currently v1.2.1) runs on AGNOS as PID 1. The dispatch table has since grown to **38 entries (0–37)** in these rounds:
+> The 26-call kybernet surface (0–25) was complete at v1.21.0; kybernet (currently v1.2.1) runs on AGNOS as PID 1. The dispatch table has since grown to **43 entries (0–42)** in these rounds:
 > - slot **26** `write_boot_checkpoint(byte)` — a CMOS-write diagnostic added during iron-boot bring-up (🩺 not part of the userland shell surface);
 > - slot **27** `mmap(length)` (anonymous, 2 MB-granular memory; v1.35.3) + slot **28** `munmap(addr, length)` (its pair; v1.35.4);
 > - slots **29–33** + the `open`(7) re-route + the `mkdir`(9)/`rmdir`(10)/`sync`(12) made-real + the **`a4=r10`** 4th-arg ABI extension, all at **v1.41.3** — the FS-syscall buildout for the shell-separation arc (see below);
-> - slots **34 `uname` / 35 `sysinfo`** (sovereign sysinfo structs; v1.42.10) + **36 `klog`** (klug log-ring read; v1.42.12) — see [`agnos-userland-abi.md`](agnos-userland-abi.md) §3/§4 for the struct/contract detail;
-> - slot **37 `execwait(path, pathlen)`** (v1.43.0) — the ring-3 blocking-exec primitive (synchronous `elf_load_from_file` + `exec_and_wait`, caller-resume-context preserved + disjoint second SYSCALL kstack for the nested child); the syscall behind agnoshi's `run` builtin.
+> - slots **34 `uname` / 35 `sysinfo`** (sovereign sysinfo structs; v1.42.10) + **36 `klog`** (klug log-ring read; v1.42.12) — the 1.42.x sysinfo/klug group; see [`agnos-userland-abi.md`](agnos-userland-abi.md) §3/§4 for the struct/contract detail;
+> - slot **37 `execwait(path, pathlen)`** (v1.43.0) — the ring-3 blocking-exec primitive (synchronous `elf_load_from_file` + `exec_and_wait`, caller-resume-context preserved + disjoint second SYSCALL kstack for the nested child); the syscall behind agnoshi's `run` builtin;
+> - slots **38 `fbinfo` / 39 `blit` / 40 `uptime_ms` / 41 `sleep_ms` / 42 `kbscan`** — the **1.43.x graphics/timing/input group** behind the first real userland app (FB geometry query, kernel-mediated ring-3→FB pixel copy, monotonic-ms clock, the `sleep_ms` pacing primitive, and a non-blocking keyboard-scancode drain), culminating in **cyrius-doom exec'd from disk in ring 3** (iron-complete, burn 1439 plays DOOM in-game on real Zen, keyboard-driven).
+>
+> **Semantic change (v1.44.9)**: `waitpid`#4 became a **non-blocking poll** — it returns the child's exit code if the child has exited, or `-2` (WOULD_BLOCK) if it is still alive — so a ring-3 parent can poll a child from ring 3 without holding a blocked-in-kernel frame on the shared syscall kstack. This rides the **1.44.x preemptive-ring-3 arc** (kthread + a `preempt_count` gate, per-process CS/SS in the context switch, preemptive time-slicing of two ring-3 procs each with its own CR3 — QEMU-validated via `scripts/ring3-smoke.sh` + `scripts/thread-smoke.sh`, iron-pending).
 >
 > **Status**: This doc is the implementation reference for the v1.21.0 kybernet buildout (the tier-by-tier history below) plus the later additions. **The canonical current surface is the `ksyscall` dispatch in `kernel/core/syscall.cyr`** (every `if (num == N)`); the normative interface contract is [`agnos-userland-abi.md`](agnos-userland-abi.md); the live snapshot is [`state.md`](state.md). The 26-call kybernet set was untouched through the entire v1.27.x → v1.34.x arc — security hardening (S1-S13 13/13 at v1.28.0), the Path-C sovereign-struct kernel ABI break (v1.30.0), native xHCI + USB-HID-boot (v1.30.x), the storage stack (v1.31.x), networking (v1.32.x), and the ext2/4 + FAT-family **write** arcs (v1.33.x / v1.34.x) all reused it. The first *new functional* syscalls since v1.21.0 were `mmap` (27, v1.35.3) + `munmap` (28, v1.35.4) — a pure memory facility. The big expansion is **v1.41.3's FS surface** (slots 29–33 + the `open`/`mkdir`/`rmdir`/`sync` upgrades), the syscalls the userland `agnsh` shell (exec'd from disk in ring 3 at v1.41.4) needs to reach the mount-routed VFS now that the interactive shell lives in userland. API expansion stays deliberate.
 
-## Current Surface — 0–37 (38 syscalls)
+## Current Surface — 0–42 (43 syscalls)
 
-> Rows 34–37 (`uname`/`sysinfo`/`klog`/`execwait`) are catalogued in [`agnos-userland-abi.md`](agnos-userland-abi.md) §3.2; the table below predates them — the `ksyscall` dispatch in `kernel/core/syscall.cyr` is canonical.
+> Rows 34–42 (`uname`/`sysinfo`/`klog`/`execwait` + the graphics/timing/input group `fbinfo`/`blit`/`uptime_ms`/`sleep_ms`/`kbscan`) are also catalogued in [`agnos-userland-abi.md`](agnos-userland-abi.md) §3.2; the `ksyscall` dispatch in `kernel/core/syscall.cyr` is canonical.
 
 The live `ksyscall` dispatch in `kernel/core/syscall.cyr`. `a1/a2/a3/a4` give argument meaning; `→` is the return (`rax` ≥ 0 on success, `-1`/`0-1` on error — **AGNOS does not use Linux `-errno`**). Argument calling convention is `rdi`/`rsi`/`rdx` for `a1`/`a2`/`a3`, and (since v1.41.3) **`r10` for `a4`** — see the ABI extension note. "🩺" = kernel-diagnostic-only, not part of the userland shell surface; "🔧" = stub (number reserved, returns a constant). Normative contract: [`agnos-userland-abi.md`](agnos-userland-abi.md).
 
@@ -23,7 +26,7 @@ The live `ksyscall` dispatch in `kernel/core/syscall.cyr`. `a1/a2/a3/a4` give ar
 | 1 | `write` | fd | buf | len | — | bytes / -1 | v1.0.0 | `vfs_write`; fd 1/2 → console; FAT/exFAT content-write via the `VFS_SEC_WFILE` write-fd at **v1.41.7** (was ext2/pipe/device-only before) |
 | 2 | `getpid` | — | — | — | — | pid | v1.0.0 | returns `proc_current` |
 | 3 | `spawn` | elf_addr | elf_size | — | — | pid / -1 | v1.0.0 | loads an **in-memory** ELF (not a path) |
-| 4 | `waitpid` | pid | — | — | — | exit_code / -1 | v1.0.0 | busy-waits until `state==0` |
+| 4 | `waitpid` | pid | — | — | — | exit_code / -1 / **-2** | v1.0.0 (**non-blocking poll v1.44.9**) | was a busy-wait until `state==0`; since **v1.44.9** a **non-blocking poll** — returns the child's exit code if it has exited, **`-2` (WOULD_BLOCK)** if still alive, `-1` on a bad pid. Reaps the in-memory-spawned child on exit. Lets a ring-3 parent poll from ring 3 without a blocked-in-kernel frame on the shared syscall kstack |
 | 5 | `read` | fd | buf | len | — | bytes / -1 | v1.0.0 | `vfs_read`; **fd 0 = blocking keyboard stdin, RAW** since **v1.41.1** (`kbd_read_blocking`; no kernel echo) |
 | 6 | `close` | fd | — | — | — | 0 / -1 | v1.0.0 | `vfs_close`; v1.41.11 surfaces the write-fd flush rc |
 | 7 | `open` | name | namelen | flags | — | fd / -1 | v1.0.0 (re-route **v1.41.3**) | **mount-routed** (`vfs_resolve_mount` → ext2 / FAT / exFAT, initrd bare-name fallback) since v1.41.3; gained the **flags** arg (a3) — see `AO_*` below. Write-access → a write-back fd (v1.41.7) |
@@ -53,6 +56,15 @@ The live `ksyscall` dispatch in `kernel/core/syscall.cyr`. `a1/a2/a3/a4` give ar
 | 31 | `rename` | old | oldlen | new | newlen | 0 / -1 | **v1.41.3** | within one filesystem (uses **a4** for `newlen`); cross-FS refused; ext2 (`ext2_rename`) + FAT/exFAT (`vfs_rename_on`). `agnsh`'s `mv` |
 | 32 | `link` | target | targetlen | linkpath | linkpathlen | 0 / -1 | **v1.41.3** | hard link (uses **a4**), **ext2-only** (`ext2_link`); FAT/exFAT → -1 (O4 — no inodes/hard links). `agnsh`'s `ln` |
 | 33 | `stat` | path | pathlen | statbuf | — | 0 / -1 | **v1.41.3** | fills the 48-byte agnos stat struct (`st_mode`/`nlink`/`size`/`ino`/`blocks`/`mtime`) via `ext2_fill_stat`; FAT/exFAT → -1 for now (O4 follow-on). `agnsh`'s `ls -l` |
+| 34 | `uname` | buf | len | — | — | 0 / -1 | **v1.42.10** | writes the 64-byte identity struct (4× 16-byte NUL-padded fields: `sysname`/`nodename`/`release`/`machine` from `_AGNOS_VERSION`/`kernel_hostname`). Static boot-time identity. (sysinfo ABI; abi §3.2) |
+| 35 | `sysinfo` | buf | len | — | — | 0 / -1 | **v1.42.10** | writes the 40-byte counters struct (5× u64 LE: `uptime_secs`/`totalram`/`freeram`/`procs`/`cpus`). Live volatile snapshot; kernel does the tick→sec / page→byte conversion |
+| 36 | `klog` | buf | len | — | — | bytes / -1 | **v1.42.12** | copies the unified klug log ring (`core/klug.cyr`) into the user buffer oldest→newest; when smaller than the log, returns the **newest `len` bytes** (the dmesg tail). Reads only `klug_buf` |
+| 37 | `execwait` | path | pathlen | — | — | exit_code / -1 | **v1.43.0** | ring-3 **blocking-exec** primitive: loads a static ELF64 from the active ext2 root, runs it to completion in ring 3, returns its exit code. The first `exec_and_wait` from a live ring-3 SYSCALL frame; the syscall behind agnoshi's `run` builtin |
+| 38 | `fbinfo` | buf | len | — | — | 0 / -1 | **v1.43.x** | writes the 24-byte framebuffer-geometry struct (6× u32 LE: `width`/`height`/`pitch`/`bpp=32`/`pixel_format` 0=RGBX/1=BGRX/`flags` bit0=FB present). `fb_phys` is deliberately NOT exposed — pixels reach the FB only through `blit`(#39) |
+| 39 | `blit` | src | w | h | dstxy | 0 / -1 | **v1.43.x** | kernel-mediated ring-3→FB **pixel copy**: copies a w×h block of 32bpp pixels (packed w*4/row) to the FB at `dstxy = (dst_y<<16)\|dst_x` (a4). Dest rect **clipped** to FB bounds; raw copy (no format conversion). The only ring-3 path to the framebuffer |
+| 40 | `uptime_ms` | — | — | — | — | ms | **v1.43.x** | monotonic milliseconds since boot in `rax` (no buffer, like `getpid`#2); `timer_ticks * 10` at 100 Hz. The ring-3 frame clock for cyrius-doom (`DG_GetTicksMs`) |
+| 41 | `sleep_ms` | ms | — | — | — | 0 / -1 | **v1.43.x** | blocks the caller ~`ms` ms by halting until the 100 Hz timer reaches the target (rounds up to whole ticks). The **pacing primitive** (`DG_SleepMs`) and the only way a ring-3 loop (IF=0) lets time pass |
+| 42 | `kbscan` | buf | max | — | — | count | **v1.43.x** | **non-blocking** raw Set-1 scancode drain (make + break, incl. `0xE0` prefixes) for ring-3 game loops (cyrius-doom's `input_poll`); copies up to `max` scancodes buffered since the last call, returns the count. The up/down-aware, never-blocking counterpart to `read`#5 |
 
 ### `open` flags (a3) — agnos-native bits (v1.41.3)
 
@@ -353,7 +365,7 @@ if (num == 23) {
 
 ## Summary
 
-The kybernet buildout (26-call surface, slots 0–25 = 8 original + 18 new) is fully implemented. Slots 26–33 were added later — see the **Current Surface** table above for the complete 0–33 (34-syscall) list with per-slot landing versions.
+The kybernet buildout (26-call surface, slots 0–25 = 8 original + 18 new) is fully implemented. Slots 26–42 were added later — see the **Current Surface** table above for the complete 0–42 (43-syscall) list with per-slot landing versions.
 
 | Tier | Syscalls | Status |
 |------|----------|--------|
@@ -365,6 +377,10 @@ The kybernet buildout (26-call surface, slots 0–25 = 8 original + 18 new) is f
 | 6: Diagnostic | 26 `write_boot_checkpoint` (1) | DONE (iron-boot bring-up) |
 | 7: Memory | 27 `mmap`, 28 `munmap` (2) | DONE (v1.35.3 / v1.35.4) |
 | 8: FS surface | 29 `getdents`, 30 `unlink`, 31 `rename`, 32 `link`, 33 `stat` (5) + `open`(7) re-route + `a4=r10` | DONE (v1.41.3) |
+| 9: Sysinfo / klug | 34 `uname`, 35 `sysinfo`, 36 `klog` (3) | DONE (v1.42.10 / v1.42.12) — QEMU-validated, iron-pending |
+| 10: Graphics / timing / input | 37 `execwait`, 38 `fbinfo`, 39 `blit`, 40 `uptime_ms`, 41 `sleep_ms`, 42 `kbscan` (6) | DONE (v1.43.x) — **iron-complete** (burn 1439 plays cyrius-doom in ring 3 on Zen) |
+
+> **Semantic change beyond the tiers**: `waitpid`#4 became a **non-blocking poll** at **v1.44.9** (returns exit code, or `-2`=WOULD_BLOCK if the child is alive) — part of the **1.44.x preemptive-ring-3** arc (kthread + `preempt_count` gate, per-process CS/SS, two ring-3 procs time-sliced each with its own CR3). QEMU-validated (`ring3-smoke.sh` + `thread-smoke.sh`), iron-pending.
 
 ## Files to modify
 

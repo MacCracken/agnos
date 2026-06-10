@@ -70,6 +70,17 @@ var ew37_path[16];        # kernel copy of the caller's path cstr (128 B). elf_l
 # NOT both mapped under one CR3), so the path is copied here from the
 # user buffer BEFORE the CR3 switch — mirroring sh_cmd_run's sh_path_buf.
 
+# 1.44.10: spawn(#3) in-memory-ELF staging buffer (16 KB = 2048 u64). A ring-3
+# PARENT calling spawn runs the handler under the PARENT's CR3, which mirrors only
+# 0-256 MB + the GB ranges — so elf_load's fresh page-table pages (allocated
+# anywhere in phys) may land in the 256 MB-1 GB gap the parent CR3 does NOT map,
+# mis-wiring the child's tables (the 1.44.9 #UD-at-child-entry blocker). The user
+# ELF is copied here while the caller CR3 still resolves it, then elf_load runs
+# under boot CR3 0x1000 (maps all phys) — the proven 1.44.8 kernel-side condition.
+# Mirrors the execwait#37 copy-then-boot-CR3 idiom (no kstack swap — spawn does not
+# block). 16 KB bounds an in-memory payload; real binaries load from disk (#37).
+var spawn_elf_buf[2048];
+
 # Security: a userspace pointer must lie in the user VA window [0x200000, 0x40000000):
 # above the kernel low region (0-2 MB) and below the 1 GB arena ceiling. EVERY
 # legitimate user address is below 1 GB — ELF segments (p_vaddr >= 2 MB, p_memsz
@@ -331,7 +342,24 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # kernel memory (a ring-3 caller passing a kernel addr would disclose it).
         if (arg2 < 1) { return 0 - 1; }
         if (is_user_range(arg1, arg2) == 0) { return 0 - 1; }
-        var new_pid = elf_load(arg1, arg2);
+        # 1.44.10: bound by the staging buffer, then run elf_load under the KERNEL CR3.
+        # A ring-3 parent's CR3 mirrors only 0-256 MB + the GB ranges, so the child's
+        # fresh page-table pages can land in the 256 MB-1 GB gap (the 1.44.9 #UD-at-child
+        # blocker). Copy the user ELF to spawn_elf_buf NOW (caller CR3 resolves arg1, SMAP
+        # AC=1 from the entry STAC), switch to boot CR3 0x1000 (maps all phys, so every PT
+        # page elf_load writes is reachable — the proven 1.44.8 condition), elf_load the
+        # kernel copy, then restore the caller CR3. Mirrors the execwait#37 idiom; no
+        # kstack swap / resume-ctx since spawn does not block. From a KERNEL caller (the
+        # RING3_SELFTEST loads its B proc via elf_load directly, not this path) this code
+        # is not reached.
+        if (arg2 > 16384) { return 0 - 1; }
+        var sp_caller_cr3 = proc_get_cr3(proc_current);
+        var sp_dst = &spawn_elf_buf;
+        var sp_i = 0;
+        while (sp_i < arg2) { store8(sp_dst + sp_i, load8(arg1 + sp_i)); sp_i = sp_i + 1; }
+        cr3_load(0x1000);
+        var new_pid = elf_load(sp_dst, arg2);
+        cr3_load(sp_caller_cr3);
         if (new_pid >= 0) {
             # Mark as ready; will be scheduled on next timer tick
             proc_set_state(new_pid, 1);

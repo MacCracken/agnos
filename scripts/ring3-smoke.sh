@@ -59,4 +59,5 @@ rc=0
 if strings "$LOG" | grep -q "ring3: child exited"; then echo "PASS: a scheduled ring-3 proc (real ELF via elf_load) ran to completion + exit()ed cleanly while another stayed live"; else echo "FAIL: 'ring3: child exited' not found — concurrent exec / exit() regression"; rc=1; fi
 if strings "$LOG" | grep -q "ring3: preempt OK"; then echo "PASS: the surviving ring-3 proc stayed live + preemptible through the child's exit"; else echo "FAIL: 'ring3: preempt OK' not found — the live proc never advanced (or triple-faulted)"; rc=1; fi
 if strings "$LOG" | grep -q "ring3: gate held"; then echo "PASS: the preempt gate freezes ring-3 procs too"; else echo "FAIL: 'ring3: gate held' not found — preempt gate regression for ring-3"; rc=1; fi
+if strings "$LOG" | grep -q "ring3: parent spawn+wait OK"; then echo "PASS: a ring-3 PARENT spawn(#3)ed a child ELF + poll-waitpid(#4)ed it to exit — entirely from ring 3 (spawn#3 kernel-CR3 fix end-to-end)"; else echo "FAIL: 'ring3: parent spawn+wait OK' not found — ring-3 spawn+waitpid regression (child #UD / mis-wired tables under parent CR3)"; rc=1; fi
 exit $rc
