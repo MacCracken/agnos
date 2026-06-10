@@ -146,13 +146,24 @@ fn spawn_user_proc(entry_fn) {
     }
     # Copy up to 4KB of function code from kernel to the new page
     memcpy(code_phys, entry_fn, 4096);
-    # Map at user-visible VA in process address space (user+exec)
+    # Map at user-visible VA in process address space (user+exec). 1.44.x page-table
+    # VA-collision fix: code at a FIXED 0x400000 (PD[2]), NOT the old pid-striped
+    # 0x400000 + pid*0x200000 — that put pid>=6 code at >=16 MB (PD[8..63]), where
+    # proc_map_page OVERWROTE the identity-SUPERVISOR map of the pmm pool (proc.cyr:290)
+    # with a USER mapping, so a later kernel load64 of a page-table page physically in
+    # 16-128 MB SMAP-faulted on context switch (proc_get_user_cr3). Each proc has its OWN
+    # CR3, so a fixed VA is safe (no inter-proc aliasing) — same VA elf_load_from_file's
+    # segment uses (elf.cyr:163).
     var pid = proc_count;
-    var code_va = 0x400000 + pid * 0x200000;
+    var code_va = 0x400000;
     proc_map_page(new_cr3, code_va, code_phys);
 
-    # Allocate user stack (2 MB-aligned — same huge-page aliasing rule as code)
-    var stack_base = 0x800000 + pid * 0x400000;
+    # Allocate user stack (2 MB-aligned — same huge-page aliasing rule as code). 1.44.x:
+    # FIXED 0x3FC00000 (PD[510], top of the non-identity mmap arena), NOT the old striped
+    # 0x800000 + pid*0x400000 (>=16 MB for pid>=2, inside PD[8..63]). Mirrors
+    # elf_load_from_file (elf.cyr:291); the arena ceiling (0x3FA00000) sits one guard slot
+    # below, so no mmap collision.
+    var stack_base = 0x3FC00000;
     var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }
     if (vmm_is_mapped(stack_phys) == 0) {

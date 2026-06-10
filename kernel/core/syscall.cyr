@@ -81,12 +81,13 @@ var ew37_path[16];        # kernel copy of the caller's path cstr (128 B). elf_l
 # block). 16 KB bounds an in-memory payload; real binaries load from disk (#37).
 var spawn_elf_buf[2048];
 
-# 1.44.11: spawn_path(#43) path/argv staging buffer (128 B = 16 u64, like ew37_path).
-# Holds the caller's "PATH [args..]" line for the NON-BLOCKING from-disk spawn — copied
-# here under the caller CR3 BEFORE the boot-CR3 switch (the user VA won't resolve once
-# CR3 is the NVMe-BAR-mapping boot CR3). A DEDICATED buffer (not ew37_path) so a #43 from
-# a bg proc can never collide with agnsh's in-flight #37 frame.
-var spawn_path_buf[128];
+# 1.44.11: spawn_path(#43) path/argv staging buffer ([16] = 16 u64 = 128 B, exactly like
+# ew37_path — a module-global var X[N] is N*u64 = 8N bytes). Holds the caller's "PATH
+# [args..]" line (capped ≤127 by the arg2>127 guard) for the NON-BLOCKING from-disk spawn —
+# copied here under the caller CR3 BEFORE the boot-CR3 switch (the user VA won't resolve once
+# CR3 is the NVMe-BAR-mapping boot CR3). A DEDICATED buffer (not ew37_path) so a #43 from a
+# bg proc can never collide with agnsh's in-flight #37 frame.
+var spawn_path_buf[16];
 
 # Security: a userspace pointer must lie in the user VA window [0x200000, 0x40000000):
 # above the kernel low region (0-2 MB) and below the 1 GB arena ceiling. EVERY
@@ -1149,19 +1150,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
     }
     if (num == 43) {
         # spawn_path(path=arg1, len=arg2) — NON-BLOCKING from-disk spawn (1.44.x WIP).
-        # STATUS: written + compiles + zero production regression (dead code — no caller
-        # yet). END-TO-END VALIDATION IS BLOCKED by two PRE-EXISTING multi-proc kernel
-        # limitations the scheduler-driven selftest exposed (NOT bugs in this handler):
-        #   (1) elf_load's per-pid VA scheme `stack_base/code_va = base + pid*step` collides
-        #       with the pmm page-table region at high pid counts — a ≥16 MB 2 MB USER
-        #       segment makes the 4 KB PML4/PT pages allocated there user-flagged, so the
-        #       context-switch `proc_get_user_cr3` kernel load64(PML4) SMAP-faults (#PF
-        #       cpl=0 e=1, CR2 in the PD[8..] range). Needs a supervisor-only page-table
-        #       pool OR a non-pid-striped user-VA map.
-        #   (2) proc_reap_child is LIFO-only (proc.cyr:496) — out-of-order background exits
-        #       break the top-slot-collapse assumption.
-        # These are the REAL "schedulable agnsh" blockers (see the bite's scope workflow);
-        # this primitive lands once they're fixed.
+        # STATUS: written + compiles + zero production regression (dead code — no caller yet).
+        # Blocker (1) — the elf_load per-pid VA collision that SMAP-faulted on context switch
+        # at high pid counts — is FIXED (1.44.x page-table fix: code/stack de-striped to fixed
+        # 0x400000/0x3FC00000, validated by ring3-smoke's >=8-proc stress assert). So this
+        # primitive is now VALIDATABLE: drive it from a ring-3 parent against an ext2-seeded
+        # path with a NO-REAP selftest (avoid blocker (2) — proc_reap_child is still LIFO-only,
+        # proc.cyr:500, so out-of-order background-job exits need a non-LIFO reap first). The
+        # remaining work to wire it into agnsh `&` also needs the prompt-key-wait to drop
+        # preempt_disable so bg jobs aren't frozen at the prompt (the bite-2 owner decision).
         #
         # The from-disk analog of spawn(#3): load a static ELF64 from the ext2 root (with
         # argv) + create a READY ring-3 proc the SCHEDULER picks up, returning its pid

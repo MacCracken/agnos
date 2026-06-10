@@ -5,6 +5,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.11] — 2026-06-10 (1.44.x — page-table VA-collision fix: many concurrent ring-3 procs)
+
+The foundational multi-proc blocker for "schedulable agnsh" (and the broader multi-threading
+arc): the in-memory loaders' **per-pid user VAs collided with the kernel's identity-supervisor
+map of the pmm pool**, SMAP-faulting on context switch once ≥~6 ring-3 procs coexisted. De-striped
+to fixed VAs; **≥8 concurrent ring-3 procs now run without faulting**. Also stages the (now-unblocked)
+`spawn_path`#43 non-blocking from-disk spawn primitive as documented dead-code.
+
+### Fixed
+
+- **Page-table / user-VA collision** (`arch/x86_64/ring3.cyr`, `core/elf.cyr`). `proc_create_address_space`
+  maps **PD[8..63] = 16–128 MB as identity-SUPERVISOR** 2 MB pages (the "DOOM fix") — the kernel's only
+  reach to the pmm pool under a per-process CR3, used by `proc_get_user_cr3`'s raw `load64(PML4)` walk on
+  every context switch. But `spawn_user_proc` (`code_va = 0x400000 + pid*0x200000`, `stack = 0x800000 +
+  pid*0x400000`) and `elf_load` (same striped stack) placed **2 MB USER pages at ≥16 MB for pid≥2/≥6**,
+  and `proc_map_page` **overwrote** the supervisor identity PDE with a USER mapping (`0x87`). Once the pmm
+  pushed a page-table page (PML4/PDPT/PD) physically into 16–128 MB, a kernel `load64` of it resolved
+  through that U/S=1 PTE → **`#PF cpl=0 e=0001`** on the next switch (and read the wrong phys). **Fix:**
+  de-stripe to FIXED VAs outside PD[8..63] — code → `0x400000` (PD[2]), stack → `0x3FC00000` (PD[510]) —
+  mirroring `elf_load_from_file`, which already dodged this. Each proc has its own CR3, so a fixed VA is
+  safe (no inter-proc aliasing). **Coupled mandatory edit:** `elf_load`'s stack alloc `pmm_alloc()` →
+  `pmm_alloc_2mb()` (a `proc_map_page` 2 MB huge page needs a 2 MB-aligned phys, and `proc_free_address_space`'s
+  `pmm_free_2mb` needs 2 MB alignment — a latent 4 KB-under-2 MB defect the broken striped VA had masked).
+  The self-guarding guard-page unmaps (now at `0x3FA00000` = a not-present arena slot) are unchanged.
+
+### Added
+
+- **`spawn_path`#43 — non-blocking from-disk spawn** (`core/syscall.cyr`), staged as documented dead-code
+  (no caller yet). The from-disk analog of `spawn`#3: `elf_load_from_file` under boot CR3 + `proc_set_ring3`,
+  returning a READY ring-3 pid the scheduler runs, leaving reaping to `waitpid`#4 — none of execwait#37's
+  blocking machinery. Blocker (1) above (which prevented its scheduler-driven validation) is now fixed; it
+  awaits a non-LIFO reap (proc.cyr:500) + the prompt-preempt decision before wiring into agnsh `&`.
+- **`RING3_SELFTEST` >=8-proc stress assert** (`core/main.cyr` + `scripts/ring3-smoke.sh`): 4 extra getpid-loop
+  procs push pids into PD[8..63]; `ring3: stress OK` proves all stay live across many context switches.
+  Before/after verified: the striped VAs triple-fault at scheduler activation (no output); de-striped, 5/5.
+
+### Notes
+
+- Validated: `ring3-smoke` **5/5** + `exec-smoke` 9/9 (exec-from-disk + envp + execwait intact) + `sweep` 7/7
+  + `check.sh` 11/11. Production byte-stable-ish (`elf_load`/`spawn_user_proc` are boot-path; iron-validated
+  boot-to-shell unaffected — fixed VAs pass `is_user_ptr`, sit below the mmap ceiling, free cleanly).
+  Follow-on (tracked, out of scope): a single shared `USER_STACK_BASE` constant (the `0x3FC00000` literal is
+  now in 3 places); rejecting on-disk ELF `p_vaddr` in [16 MB,128 MB); the non-LIFO reap; the prompt-preempt
+  for bg jobs. Iron-burn rides the next archaemenid burn.
+
 ## [1.44.10] — 2026-06-10 (1.44.x — ring-3 parent spawn+waitpid: the spawn#3 kernel-CR3 fix, end-to-end)
 
 The deferred 1.44.9 blocker is cleared: a ring-3 **parent** now `spawn`(#3)s a child ELF and

@@ -2237,6 +2237,35 @@ fn ring3_spawn_one(counter_phys) {
     proc_set_ring3(pid);                             # CS=0x23 / SS=0x1B (else it would iretq into ring 0)
     return pid;
 }
+# 1.44.x page-table-fix validation: a NO-WRITE getpid-loop payload for STRESS procs that
+# push the pid count to >=8, so the in-memory loaders' user code/stack land in PD[8..63]
+# (>=16 MB) — the exact region whose identity-SUPERVISOR map the OLD striped VAs overwrote.
+# Pure compute + syscall (no memory write → no per-proc counter needed): each loops
+# `getpid` forever, staying ready so the scheduler keeps context-switching to it. PRE-fix,
+# the context-switch proc_get_user_cr3(corrupted CR3) SMAP-faults (triple fault → no output);
+# POST-fix all stress procs stay live. mov eax,2; syscall; jmp -9 (back to mov).
+var ring3_idle_payload[16];
+var ring3_stress_first = 0;
+var ring3_stress_count = 0;
+fn ring3_idle_fill() {
+    store8(&ring3_idle_payload + 0, 0xB8);   # mov eax, 2 (getpid)
+    store8(&ring3_idle_payload + 1, 0x02);
+    store8(&ring3_idle_payload + 2, 0x00);
+    store8(&ring3_idle_payload + 3, 0x00);
+    store8(&ring3_idle_payload + 4, 0x00);
+    store8(&ring3_idle_payload + 5, 0x0F);   # syscall
+    store8(&ring3_idle_payload + 6, 0x05);
+    store8(&ring3_idle_payload + 7, 0xEB);   # jmp -9 (back to off 0)
+    store8(&ring3_idle_payload + 8, 0xF7);
+    return 0;
+}
+# Spawn one stress proc (no counter, no 0x2000000 map). -1 on fail.
+fn ring3_spawn_idle() {
+    var pid = spawn_user_proc(&ring3_idle_payload);
+    if (pid < 0) { return 0 - 1; }
+    proc_set_ring3(pid);
+    return pid;
+}
 fn ring3_selftest_setup() {
     ring3_counter_a = pmm_alloc_2mb();               # 2 MB-aligned — proc_map_page maps a 2 MB page
     ring3_counter_b = pmm_alloc_2mb();
@@ -2262,6 +2291,19 @@ fn ring3_selftest_setup() {
     spawn_parent_fill();
     spawn_parent_pid = spawn_user_proc(&spawn_parent_payload);
     if (spawn_parent_pid >= 0) { proc_set_ring3(spawn_parent_pid); }
+    # STRESS: spawn 4 extra ring-3 procs (pids ~5-8) so the in-memory loaders' user code
+    # (0x400000 striped → 16 MB at pid 6 pre-fix) + stack land in PD[8..63]. With ~9 procs
+    # the pmm pushes page-table pages into the same 16-128 MB region — so PRE-fix a context
+    # switch SMAP-faults; POST-fix all stay live. Created AFTER P so P's spawn-child (created
+    # when P runs) stays the TOP proc-table slot → P's waitpid reap LIFO stays valid.
+    ring3_idle_fill();
+    ring3_stress_first = ring3_spawn_idle();
+    ring3_stress_count = 1;
+    var ski = 1;
+    while (ski < 4) {
+        if (ring3_spawn_idle() >= 0) { ring3_stress_count = ring3_stress_count + 1; }
+        ski = ski + 1;
+    }
     return 0;
 }
 fn ring3_selftest_verify() {
@@ -2271,9 +2313,9 @@ fn ring3_selftest_verify() {
     # exit()s; P spawns C, polls waitpid, then exits — all time-sliced. Budget is larger
     # than the B-only era (400) because four procs now share the round-robin.
     var i = 0;
-    while (i < 1500) {
+    while (i < 3000) {
         if (proc_get_state(ring3_pid_b) == 0) {
-            if (proc_get_state(spawn_parent_pid) == 0) { i = 1500; }   # both done — stop early
+            if (proc_get_state(spawn_parent_pid) == 0) { i = 3000; }   # both done — stop early
             else { arch_wait(); i = i + 1; }
         } else { arch_wait(); i = i + 1; }
     }
@@ -2298,6 +2340,22 @@ fn ring3_selftest_verify() {
     var pstate = proc_get_state(spawn_parent_pid);
     kprint("ring3: Pcode=", 13); kprint_num(pcode); kprint(" Pst=", 5); kprint_num(pstate); kprintln("", 0);
     if (pcode == 0xABCD) { kprintln("ring3: parent spawn+wait OK", 27); } else { kprintln("ring3: FAIL parent spawn", 24); }
+    # STRESS / page-table-fix proof: every extra proc (pids pushed into PD[8..63]) is still
+    # ALIVE (state 1) after the scheduler round-robined to it many times. Reaching this print
+    # AT ALL means no context switch SMAP-faulted (pre-fix the machine triple-faults here and
+    # NOTHING prints). All-alive = the de-striped VAs kept the identity-supervisor pool map
+    # intact across >=8 concurrent ring-3 procs.
+    var salive = 0;
+    var spi = 0;
+    while (spi < ring3_stress_count) {
+        if (proc_get_state(ring3_stress_first + spi) == 1) { salive = salive + 1; }
+        spi = spi + 1;
+    }
+    kprint("ring3: stress alive=", 20); kprint_num(salive); kprint("/", 1); kprint_num(ring3_stress_count); kprintln("", 0);
+    if (salive == ring3_stress_count) { kprintln("ring3: stress OK", 16); } else { kprintln("ring3: FAIL stress", 18); }
+    # Retire the stress procs (they loop forever) so boot continues.
+    var srp = 0;
+    while (srp < ring3_stress_count) { proc_set_state(ring3_stress_first + srp, 0); srp = srp + 1; }
     # Preempt gate still covers the live proc A.
     var sa = load64(ring3_counter_a);
     preempt_disable();

@@ -123,10 +123,17 @@ fn elf_load(elf_addr, elf_size) {
         }
     }
 
-    # Allocate user stack with 4MB spacing (S6: room for guard page below)
+    # User stack: 1.44.x page-table VA-collision fix — FIXED 0x3FC00000 (PD[510], top of
+    # the non-identity mmap arena), NOT the old striped 0x800000 + pid*0x400000 which put
+    # pid>=2 stacks at >=16 MB (PD[8..63]), overwriting the identity-SUPERVISOR map of the
+    # pmm pool with a USER mapping → a later kernel load64 of a page-table page in 16-128 MB
+    # SMAP-faulted on context switch. Mirrors elf_load_from_file (elf.cyr:291); own CR3
+    # makes a fixed VA safe. MANDATORY pairing: pmm_alloc_2mb (NOT pmm_alloc) — proc_map_page
+    # installs a 2 MB huge page, so a 4 KB phys would alias to floor_2MB(phys) (now that the
+    # VA actually resolves) and proc_free_address_space's pmm_free_2mb needs 2 MB alignment.
     var pid = proc_count;
-    var stack_base = 0x800000 + pid * 0x400000;
-    var stack_phys = pmm_alloc();
+    var stack_base = 0x3FC00000;
+    var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }
     if (vmm_is_mapped(stack_phys) == 0) {
         vmm_map(stack_phys, stack_phys, 0x83);
