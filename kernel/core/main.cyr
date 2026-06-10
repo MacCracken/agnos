@@ -1994,6 +1994,66 @@ fn thread_selftest_verify() {
 }
 #endif
 
+#ifdef RING3_SELFTEST
+# === 1.44.4 RING3_SELFTEST — first scheduler-entered ring-3 proc, preempted + resumed ===
+# A single ring-3 proc (its OWN per-process CR3, IF=1) runs a syscall-free tight loop
+# incrementing a u64 at user VA 0x2000000. The selftest maps that VA (user-writable in
+# the proc's CR3) onto a kernel-readable physical page. If the counter advances while
+# kmain hlt-waits, the timer preempted the ring-3 proc UNDER ITS OWN CR3 and the
+# scheduler iretq'd back into ring 3 (CS=0x23 — the 1.44.3 table-driven restore + the
+# 1.44.4 proc_set_ring3). Then preempt_disable() must FREEZE it (the gate covers ring-3
+# too). Syscall-free so a preemption never lands on the shared syscall kstack (the
+# deferred RSP0 wall).
+#
+# The payload is RAW machine code in a byte array, NOT a Cyrius fn: a compiled fn's
+# prologue does a relocate-sensitive access (CR2=0 #PF at the entry) once spawn_user_proc
+# memcpy's it to the user code page at a different VA. Raw bytes have no prologue and the
+# only address they touch is the absolute imm64 0x2000000, so they survive the relocation.
+var ring3_counter_phys = 0;
+var ring3_test_pid = 0;
+var ring3_payload[16];          # raw ring-3 code; only the first 15 bytes are used
+fn ring3_selftest_setup() {
+    # movabs rax, 0x2000000 ; inc qword [rax] ; jmp -5  (back to the inc — loop forever)
+    store8(&ring3_payload + 0, 0x48);  store8(&ring3_payload + 1, 0xB8);
+    store8(&ring3_payload + 2, 0x00);  store8(&ring3_payload + 3, 0x00);
+    store8(&ring3_payload + 4, 0x00);  store8(&ring3_payload + 5, 0x02);
+    store8(&ring3_payload + 6, 0x00);  store8(&ring3_payload + 7, 0x00);
+    store8(&ring3_payload + 8, 0x00);  store8(&ring3_payload + 9, 0x00);
+    store8(&ring3_payload + 10, 0x48); store8(&ring3_payload + 11, 0xFF); store8(&ring3_payload + 12, 0x00);
+    store8(&ring3_payload + 13, 0xEB); store8(&ring3_payload + 14, 0xFB);
+    ring3_counter_phys = pmm_alloc_2mb();           # 2 MB-aligned — proc_map_page maps a 2 MB page
+    if (ring3_counter_phys == 0) { return 0; }
+    if (vmm_is_mapped(ring3_counter_phys) == 0) { vmm_map(ring3_counter_phys, ring3_counter_phys, 0x83); }
+    store64(ring3_counter_phys, 0);                  # zero the counter
+    ring3_test_pid = spawn_user_proc(&ring3_payload);   # per-proc CR3 + user code/stack, state=ready
+    if (ring3_test_pid < 0) { return 0; }
+    # Map the counter user-writable at 0x2000000 in the proc's address space
+    # (clear of its code 0x400000+ and stack 0x800000+ bands).
+    proc_map_page(proc_get_cr3(ring3_test_pid), 0x2000000, ring3_counter_phys);
+    proc_set_ring3(ring3_test_pid);                  # CS=0x23 / SS=0x1B (else it would iretq into ring 0)
+    return 0;
+}
+fn ring3_selftest_verify() {
+    var i = 0;
+    while (i < 60) { arch_wait(); i = i + 1; }       # timer round-robins kmain -> ring-3 proc -> kmain
+    var c = load64(ring3_counter_phys);
+    kprint("ring3: counter=", 15); kprint_num(c); kprintln("", 0);
+    if (c > 0) { kprintln("ring3: preempt OK", 17); }
+    else { kprintln("ring3: FAIL no advance", 22); }
+    # Preempt gate covers ring-3: under preempt_disable the counter must FREEZE.
+    var snap = load64(ring3_counter_phys);
+    preempt_disable();
+    var g = 0;
+    while (g < 20) { arch_wait(); g = g + 1; }
+    preempt_enable();
+    if (load64(ring3_counter_phys) == snap) { kprintln("ring3: gate held", 16); }
+    else { kprintln("ring3: gate LEAK", 16); }
+    proc_set_state(ring3_test_pid, 0);               # retire the ring-3 proc; boot continues
+    kprintln("ring3: done", 11);
+    return 0;
+}
+#endif
+
 #ifndef KTEST
 proc_count = 0;
 proc_current = 0;
@@ -2004,6 +2064,10 @@ kthread_create(&kernel_idle_loop);  # proc 1 = idle (ready) — 1.44.1: via the 
 # 1.44.0 opening bite: spawn two kernel threads on the shared AS (tight-loopers).
 thr_pid_a = kthread_create(&thread_test_a);
 thr_pid_b = kthread_create(&thread_test_b);
+#endif
+#ifdef RING3_SELFTEST
+# 1.44.4: spawn + map + ring-3-ify a single user proc before the scheduler arms.
+ring3_selftest_setup();
 #endif
 #endif
 
@@ -2020,6 +2084,11 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
 # 1.44.0 opening bite: prove preemptive kernel-thread time-slicing + the preempt
 # gate on the live scheduler, then retire the test threads so boot continues.
 thread_selftest_verify();
+#endif
+
+#ifdef RING3_SELFTEST
+# 1.44.4: prove a ring-3 proc (own CR3, IF=1) is preempted + resumed by the scheduler.
+ring3_selftest_verify();
 #endif
 
 #ifdef KTEST

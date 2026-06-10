@@ -131,8 +131,14 @@ fn spawn_user_proc(entry_fn) {
     var new_cr3 = proc_create_address_space();
     if (new_cr3 == 0) { return 0 - 1; }
 
-    # Allocate a physical page for user code and copy kernel function to it
-    var code_phys = pmm_alloc();
+    # Allocate a physical page for user code and copy kernel function to it.
+    # 1.44.4: pmm_alloc_2mb (NOT pmm_alloc) — proc_map_page maps a 2 MB huge page,
+    # so the backing phys MUST be 2 MB-aligned or code_va aliases to the 2 MB base
+    # (a 4 KB pmm_alloc page sits at a sub-2MB offset → the user proc fetches the
+    # region base = zeros and #PFs at entry). This is the aliasing hazard pmm.cyr's
+    # pmm_alloc_2mb comment warns about; spawn_user_proc inherited it (latent — its
+    # only caller before RING3_SELFTEST never actually ran the spawned proc).
+    var code_phys = pmm_alloc_2mb();
     if (code_phys == 0) { return 0 - 1; }
     # Map in kernel space for copying
     if (vmm_is_mapped(code_phys) == 0) {
@@ -145,9 +151,9 @@ fn spawn_user_proc(entry_fn) {
     var code_va = 0x400000 + pid * 0x200000;
     proc_map_page(new_cr3, code_va, code_phys);
 
-    # Allocate user stack
+    # Allocate user stack (2 MB-aligned — same huge-page aliasing rule as code)
     var stack_base = 0x800000 + pid * 0x400000;
-    var stack_phys = pmm_alloc();
+    var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }
     if (vmm_is_mapped(stack_phys) == 0) {
         vmm_map(stack_phys, stack_phys, 0x83);

@@ -5,6 +5,52 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.4] — 2026-06-09 (1.44.x — preemptive ring-3: a user proc time-slices under the scheduler)
+
+The central multi-threading milestone: a ring-3 process with its OWN per-process CR3
+is now preempted by the timer and resumed by the scheduler — the first time agnos
+context-switches INTO ring 3 (every prior switch was ring-0 on the shared CR3 0x1000).
+
+### Added
+
+- **`proc_set_ring3(pid)`** (`core/proc.cyr`) — flips a proc's saved selectors to ring-3
+  (CS=0x23 / SS=0x1B in the 1.44.3 `proc_cs[]` / `proc_ss[]` arrays) so
+  `proc_restore_context` iretq's it into ring 3 instead of forcing ring 0.
+- **`RING3_SELFTEST`** (`core/main.cyr` + `scripts/ring3-smoke.sh` + `build.sh` gate) —
+  spawns one ring-3 proc (own CR3, IF=1) running a SYSCALL-FREE **raw-machine-code** loop
+  that increments a counter at user VA `0x2000000` (mapped user-writable in the proc's CR3
+  onto a kernel-readable page). QEMU-green: the counter reaches ~127 M while kmain
+  hlt-waits (`ring3: preempt OK` — the timer preempted ring-3 code under the proc's CR3
+  and the scheduler iretq'd back into ring 3), and FREEZES under `preempt_disable()`
+  (`ring3: gate held` — the 1.44.0 gate covers ring-3 too). The payload is raw bytes, not
+  a Cyrius fn: a compiled fn's prologue does a relocate-sensitive access that #PFs once
+  `memcpy`'d to a different user VA.
+
+### Fixed
+
+- **`spawn_user_proc` huge-page aliasing** (`arch/x86_64/ring3.cyr`) — it backed user
+  code + stack with `pmm_alloc()` (4 KB-aligned) but `proc_map_page` maps **2 MB** pages,
+  so `code_va` aliased to the 2 MB-region *base* (zeros) rather than the page `memcpy`
+  wrote. A scheduler-entered proc fetched `00 00` (`add [rax],al`, rax=0) and #PF'd at
+  entry (`v=0e cpl=3 CR2=0`). Now uses `pmm_alloc_2mb()` — the 2 MB-aligned allocator
+  `pmm.cyr`'s own comment prescribes for huge-page backing. **Latent** since the primitive
+  shipped: its only prior caller (`#ifdef KTEST` `user_test_proc`) is "# skipped", so the
+  spawned proc was never actually run. Found by RING3_SELFTEST via `qemu -d int`.
+
+### Notes
+
+- Designed + adversarially stress-tested by a multi-agent pass before any edit — it killed
+  the KPTI fear (collapsed KPTI: the per-proc CR3 is a full kernel superset, so the timer
+  ISR needs no CR3 switch from ring 3) and staged the arc. Still deferred (the genuine
+  wall): per-proc kernel stacks + per-proc RSP0 — the selftest payload is syscall-free
+  precisely so a preemption never lands on the shared TSS RSP0 / syscall kstack. A
+  preemptible ring-3 proc that makes syscalls needs that bite first.
+- Behavior-preserving for production: `RING3_SELFTEST` is gated off, and `spawn_user_proc`
+  is called only by the (skipped) KTEST path — never in production or by `exec_and_wait`
+  (which builds its own iretq frame and longjmps over the scheduler). Validated:
+  `ring3-smoke` + `thread-smoke` + `agnsh-smoke` (clean boot) + `doom-smoke` + `sweep.sh`
+  **7/7** + `check.sh` 11/11. +208 B.
+
 ## [1.44.3] — 2026-06-09 (1.44.x — per-process CS/SS: remove the ring-0 context-switch hardcode)
 
 Fourth multi-threading-arc bite, and the first step toward preemptive ring-3

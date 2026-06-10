@@ -92,6 +92,19 @@ fn proc_set_state(pid, st) {
     return 0;
 }
 
+# 1.44.4: flip a proc's saved selectors to ring-3 (CS=0x23, SS=0x1B) so the
+# scheduler's proc_restore_context (1.44.3 table-driven) iretq's it into ring 3
+# (default is ring-0 0x08/0x10). The proc must already carry a per-process CR3 +
+# a user-VA RIP/RSP + IF=1 in its saved rflags (spawn_user_proc + proc_create_full
+# provide these). Only safe to make a ring-3 proc PREEMPTIBLE if its work is
+# syscall-free until per-proc kernel stacks land (the shared-RSP0 wall).
+fn proc_set_ring3(pid) {
+    if (pid >= proc_count) { return 0 - 1; }
+    store64(&proc_cs + pid * 8, 0x23);
+    store64(&proc_ss + pid * 8, 0x1B);
+    return 0;
+}
+
 fn proc_count_by_state(st) {
     var n: i64 = 0;
     for (var i = 0; i < proc_count; i = i + 1) {
