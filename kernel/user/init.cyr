@@ -15,6 +15,10 @@ fn kybernet_exec_agnsh() {
     var r = load64(ep + 16);      # rsp
     var c = load64(ep + 160);     # cr3
     proc_current = pid;
+    # 1.44.14: launch agnsh PREEMPTIBLE (IF=1 in ring 3) so the timer time-slices its prompt
+    # against #43 background jobs (the "shell stays live while a bg job runs" goal). enter_ring3
+    # consumes + clears this, so agnsh's own foreground `run /bin/X` (execwait#37) stays IF=0.
+    exec_preempt = 1;
     exec_and_wait(e, r, c);
     var code = proc_get_exit_code(pid);
     proc_reap(pid);

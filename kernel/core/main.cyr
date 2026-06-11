@@ -1788,7 +1788,7 @@ fn nbread_selftest() {
     nbread_inject(0x23);
     nbread_inject(0x17);
     var r2 = kbd_read_nonblock(u, 256);
-    if (r2 == 0 - 2) {
+    if (r2 == 0 - 3) {                                   # 1.44.14: -3 = partial line buffered (was -2)
         if (nbline_pos == 2) { kprintln("nbread: partial accumulate OK", 29); }
         else { kprintln("nbread: FAIL partial pos", 24); ok = 0; }
     } else { kprintln("nbread: FAIL partial ret", 24); ok = 0; }

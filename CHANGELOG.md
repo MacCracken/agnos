@@ -5,6 +5,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.14] — 2026-06-10 (1.44.x — schedulable agnsh WORKS: the shell stays live while a bg job runs)
+
+The user-visible milestone the whole 1.44.x arc built toward: `prog &` launches a background job that
+actually **gets CPU** while the agnsh prompt stays live, and is reaped with `[n] Done`. End-to-end on the
+real kernel (`agnsh-bg-test.py`): `sleeper &` → `[1] 3` (prompt returns immediately) → `version` responds
+**while the bg job runs** → `SLEEPER-DONE` (the job ran to completion) → `[1] Done` (agnsh reaped it). The
+1.44.13 primitives shipped but delivered ZERO CPU to bg jobs (the prompt-poll comment ASSERTED a yield the
+code didn't deliver); this cut makes it real. The agnsh `&` userland is agnoshi 1.6.0 (sibling repo).
+
+### Fixed
+
+- **agnsh runs PREEMPTIVELY (`arch/x86_64/ring3.cyr` + `user/init.cyr`).** The root cause: kybernet launches
+  agnsh via `exec_and_wait` → `enter_ring3` with RFLAGS=`0x002` (**IF=0**), so the timer could never preempt
+  it and a `spawn_path`#43 bg proc, though READY, was never scheduled. **Fix:** a consumed-then-cleared
+  `exec_preempt` gate — kybernet sets it for the `/bin/agnsh` launch so `enter_ring3` starts agnsh with
+  IF=1 (`0x202`); the timer preempts agnsh **in ring 3 between its prompt-poll syscalls** and the scheduler
+  hands the bg proc a slice. The iron-validated **foreground** exec path (`execwait`#37 / `run /bin/X`, DOOM)
+  stays IF=0 byte-for-byte. Chose the kstack-SAFE design (preempt in ring 3, never mid-handler — the 1.44.6
+  IF=0 syscall invariant holds, so the shared syscall kstack stays serial) over a rejected in-handler yield
+  (which would let a bg proc's syscall clobber agnsh's suspended frame). No `proc_set_ring3` needed: the first
+  preemption's `proc_save_context` captures agnsh's real ring-3 CS=0x23/SS=0x1B (`sched.cyr:94`).
+- **A bg proc's `exit` no longer hijacks agnsh's resume (`core/syscall.cyr` exit#0 + `ring3.cyr`).** exit#0
+  fired `kernel_resume()` whenever `kernel_return_rsp != 0` — armed by agnsh's `exec_and_wait` launch — so a
+  scheduled bg job's `exit()` resumed kybernet **as if agnsh had exited** (the shell died on the first bg-job
+  completion). **Fix:** a new `exec_resume_pid` (the foreground proc `exec_and_wait` is run-to-completion
+  waiting on); exit#0 fires `kernel_resume` only when `proc_current == exec_resume_pid`. A bg proc exits with
+  `proc_current` = its own pid (the scheduler set it) → no resume → it goes state 0 for `waitpid`#4. Saved/
+  restored across `execwait`#37 nesting (`ew37_resume_pid`).
+- **Mid-line bg-job drain no longer corrupts the command (`core/syscall.cyr` `kbd_read_nonblock` + agnoshi).**
+  When the last bg job drained mid-keystroke, agnsh switched from the non-blocking poll to the blocking read —
+  orphaning the half-typed line in the kernel `nbline_buf` accumulator (the blocking read uses a different
+  buffer), so `version` split + misparsed as an intent. **Fix:** the non-blocking read returns **-3** (partial
+  line buffered) vs **-2** (truly empty); agnsh keeps polling on -3 (never switches to blocking mid-line) and
+  only blocks on -2 with no live jobs.
+
+### Notes
+
+- Validated: **`agnsh-bg-test.py` PASS** (launched + prompt-live + ran-to-completion + reaped) · `exec-smoke`
+  **16/16** (foreground exec + execwait#37 nesting + exit#0 gate) · `ring3-smoke` 7/7 · `nbread-smoke` 4/4
+  (partial→-3) · `agnsh-smoke` PASS (agnsh boots IF=1) · `sweep` 7/7 · `check.sh` 11/11. Production 1,147,584 B.
+  DOOM path (foreground IF=0 + `kbscan`#42) unaffected by reasoning (not re-run here — `cyrius-doom` binary).
+  **Iron:** the foreground exec surface is byte-identical so no re-burn is forced for it; agnsh's launch path
+  is now preemptive (QEMU-validated, confirm on the next archaemenid burn). **Follow-on:** multi-bg-job
+  out-of-order reap (`proc_reap_child` is still LIFO-asymmetric — single bg job is fine; audit before `&` on >1).
+
 ## [1.44.13] — 2026-06-10 (1.44.x — schedulable agnsh: both KERNEL halves)
 
 The two kernel primitives the agnsh `&` background-job wiring needs, both validated. (The agnsh

@@ -6,7 +6,7 @@
 #
 # Sequence (xHCI keyboard via HMP sendkey, ASSIST mode = no confirm prompts):
 #   sleeper &     -> "[1] <pid>" prints + the prompt RETURNS (non-blocking #43, not execwait)
-#   version       -> agnsh responds WHILE the bg job runs (prompt is live; 2nd "agnoshi 1.5.0")
+#   version       -> agnsh responds WHILE the bg job runs (prompt is live; 2nd "agnoshi 1.6.0")
 #   (wait)        -> "SLEEPER-DONE" (the bg job ran to completion) then "[1] Done" (agnsh reaped it)
 # PASS = "[1]" launched + the version response printed BEFORE SLEEPER-DONE (concurrency) +
 #        "SLEEPER-DONE" + "[1] Done". Builds its own image from build/rootfs + a seeded /bin/sleeper.
@@ -174,11 +174,11 @@ try:
     bg_seg = run_wait("sleeper &\n", "[1]", timeout=25)
     launched = "[1]" in bg_seg
     done_before_version = "SLEEPER-DONE" in bg_seg
-    # 2) prompt LIVE while the bg job runs — version responds (a fresh "agnoshi 1.5.0") BEFORE done.
-    ver_seg = run_wait("version\n", "agnoshi 1.5.0", timeout=20)
-    ver_live = "agnoshi 1.5.0" in ver_seg
+    # 2) prompt LIVE while the bg job runs — version responds (a fresh "agnoshi 1.6.0") BEFORE done.
+    ver_seg = run_wait("version\n", "agnoshi 1.6.0", timeout=20)
+    ver_live = "agnoshi 1.6.0" in ver_seg
     ver_before_done = ver_live and ("SLEEPER-DONE" not in ver_seg or
-                                    ver_seg.index("agnoshi 1.5.0") < ver_seg.index("SLEEPER-DONE"))
+                                    ver_seg.index("agnoshi 1.6.0") < ver_seg.index("SLEEPER-DONE"))
     # 3) the bg job runs to completion + agnsh reaps it.
     m = len(ser())
     tail = ""

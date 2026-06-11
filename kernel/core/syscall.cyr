@@ -60,6 +60,7 @@ var ew37_kr_rip = 0;      # kernel_return_rip
 var ew37_rsp_save = 0;    # kernel_rsp_save — agnsh's user RSP (the exit stub reloads it pre-SYSRET)
 var ew37_a4 = 0;          # ksyscall_a4 (defense-in-depth)
 var ew37_pid = 0;         # proc_current (agnsh's pid)
+var ew37_resume_pid = 0;  # 1.44.14: exec_resume_pid (agnsh) saved across the nested exec
 var ew37_cr3 = 0;         # agnsh's CR3 (kpti_user_cr3 the exit stub reloads into CR3)
 var ew37_cpid = 0;        # child pid — MUST be a global (a [rbp-N] local survives via
 # the disjoint kstack, but globals are the contract here)
@@ -339,6 +340,15 @@ fn kbd_read_nonblock(buf, count) {
     }
     kbd_irq_disable();
     preempt_enable();
+    # 1.44.14: distinguish "no complete line, but a PARTIAL line is buffered here" (-3) from
+    # "nothing buffered at all" (-2). The accumulator (nbline_buf) persists ACROSS poll calls, so
+    # if agnsh's last background job drains mid-line and agnsh switched to the BLOCKING read (which
+    # accumulates into the USER buffer, NOT nbline_buf), the half-typed line would be ORPHANED and
+    # the command would split + misparse. -3 tells agnsh to KEEP polling (never switch to blocking)
+    # until this line completes; -2 (truly empty) is safe to block on.
+    if (ret == 0 - 2) {
+        if (nbline_pos > 0) { ret = 0 - 3; }
+    }
     return ret;
 }
 
@@ -390,9 +400,17 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 proc_send_signal(ppid, 17);
             }
         }
-        # If we have a saved kernel return point, jump back to it
+        # If we have a saved kernel return point, jump back to it — but ONLY when the EXITING
+        # proc is the one exec_and_wait is run-to-completion waiting on (exec_resume_pid). 1.44.14:
+        # a PREEMPTIVELY-scheduled #43 background job exit()s with proc_current = ITS pid (the
+        # scheduler set it), which != exec_resume_pid (agnsh) — so it must NOT fire agnsh's
+        # kernel_resume (that would resume kybernet as if agnsh exited). It already went state 0
+        # above, so its parent's waitpid#4 reaps it. Pre-1.44.14 this gate was just
+        # `kernel_return_rsp != 0`, which fired for ANY exit while a resume was armed.
         if (kernel_return_rsp != 0) {
-            kernel_resume();
+            if (proc_current == exec_resume_pid) {
+                kernel_resume();
+            }
         }
         return 0;
     }
@@ -955,6 +973,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         ew37_rsp_save = kernel_rsp_save;            # agnsh's user RSP
         ew37_a4       = ksyscall_a4;
         ew37_pid      = proc_current;               # agnsh's pid
+        ew37_resume_pid = exec_resume_pid;          # 1.44.14: save agnsh's resume-pid; the nested
+        # exec_and_wait(child) overwrites exec_resume_pid = child, restored below post-resume.
         ew37_cr3      = proc_get_cr3(proc_current); # agnsh's CR3 (robust source)
         ew37_busy     = 1;
 
@@ -1048,6 +1068,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         kernel_rsp_save   = ew37_rsp_save;           # the exit stub does `mov rsp,[kernel_rsp_save]` pre-SYSRET
         ksyscall_a4       = ew37_a4;
         proc_current      = ew37_pid;                # agnsh's pid (its write/exit attribute to agnsh)
+        exec_resume_pid   = ew37_resume_pid;         # 1.44.14: agnsh is the resume target again, so
+        # agnsh's later exit() (proc_current==exec_resume_pid) fires kernel_resume to kybernet
 
         # (k) reload the LIVE CR3 to agnsh now (kernel_resume left boot 0x1000) so
         # this handler tail + the exit stub run under agnsh's mappings. cr3_load

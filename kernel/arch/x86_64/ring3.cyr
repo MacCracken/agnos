@@ -4,6 +4,22 @@
 var exec_entry_g = 0;
 var exec_rsp_g = 0;
 var exec_cr3_g = 0;
+# 1.44.14 PREEMPTIVE AGNSH: when nonzero, enter_ring3 starts the program with IF=1 (RFLAGS bit 9)
+# so the 100 Hz timer can PREEMPT it in ring 3 -> the scheduler time-slices a #43 background job
+# alongside it (the "shell stays live while a bg job runs" goal). Set ONLY by kybernet for the
+# long-running /bin/agnsh launch (init.cyr) and consumed-then-cleared on the next enter_ring3, so
+# the iron-validated FOREGROUND exec path (execwait#37 / `run /bin/X`, DOOM) stays IF=0 byte-for-byte.
+# SAFE because: agnsh is preempted in RING 3 (between syscalls), NOT mid-handler — the 1.44.6 IF=0
+# syscall invariant still holds, so the shared syscall kstack stays serial (a bg proc's syscalls
+# never clobber agnsh's frame); agnsh's CR3 maps the APIC so the timer ISR EOIs cleanly; and the
+# FIRST preemption's proc_save_context captures agnsh's real ring-3 CS=0x23/SS=0x1B (sched.cyr:94),
+# so no proc_set_ring3 is needed and the resume iretq lands in ring 3. (NOT the rejected in-handler
+# yield, which WOULD break the kstack-serial invariant.)
+var exec_preempt = 0;
+# 1.44.14: the proc whose exit() should fire kernel_resume (the run-to-completion FOREGROUND proc
+# exec_and_wait is waiting on). Set at exec_and_wait entry; gated in exit#0 so a preemptively-
+# scheduled #43 background job's exit() never hijacks agnsh's resume. Saved/restored by execwait#37.
+var exec_resume_pid = 0;
 
 # 1.40.4: full kernel resume context (setjmp/longjmp). Saved by exec_and_wait
 # before entering ring 3; restored by kernel_resume when the program exits, so
@@ -38,6 +54,12 @@ fn exec_and_wait(entry, rsp, cr3) {
     }
     kernel_return_rsp = 1;   # nonzero = "a kernel resume context is armed" (ksyscall exit checks this)
     kernel_return_rip = 0;
+    # 1.44.14: remember WHICH proc this resume context belongs to (the foreground proc being
+    # run-to-completion — proc_current is it at entry: agnsh for kybernet's launch, the child for
+    # execwait#37). exit#0 fires kernel_resume ONLY for this proc, so a PREEMPTIVELY-scheduled
+    # background job (#43) that exit()s while agnsh is the armed resume target does NOT hijack
+    # agnsh's resume (it just goes state 0 for waitpid#4). Saved/restored across execwait#37 nesting.
+    exec_resume_pid = proc_current;
 
     # Pass params to enter_ring3 via globals (avoid param clobber in asm).
     exec_entry_g = entry;
@@ -96,16 +118,24 @@ fn enter_ring3(entry, user_rsp) {
     # Layout: [0]=RIP [8]=CS [16]=RFLAGS [24]=RSP [32]=SS
     store64(0x7000, entry);
     store64(0x7008, 0x23);
-    # RFLAGS = 0x002 (reserved bit only — IF CLEARED). exec_and_wait is a
-    # synchronous run-to-completion model (the shell blocks until the program's
-    # exit() resumes the kernel), and AGNOS is single-threaded (preemption is a
-    # future arc), so the program is not meant to be preempted. Masking
-    # interrupts in ring 3 avoids a timer ISR running under the minimal user
-    # CR3 — which lacks the Local APIC and triple-faulted on EOI (1.40.3).
-    # SYSCALL is unaffected by IF, so write()/exit() still work. Preemptive
-    # ring 3 (needs the interrupt entry path to swap to the kernel CR3) lands
-    # with the multithreading arc.
-    store64(0x7010, 0x002);
+    # RFLAGS: bit 1 (reserved) always set. IF (bit 9) gates preemption in ring 3.
+    # FOREGROUND exec (exec_preempt==0) keeps IF CLEARED (0x002) — the iron-validated
+    # run-to-completion model: exec_and_wait blocks until exit()/kernel_resume, and a
+    # foreground program is not meant to be preempted. (Pre-1.40.3 a timer ISR under the
+    # MINIMAL user CR3 lacked the Local APIC and triple-faulted on EOI; SYSCALL is
+    # IF-independent so write()/exit() still work with IF=0.)
+    # 1.44.14 PREEMPTIVE AGNSH (exec_preempt!=0, set by kybernet for /bin/agnsh only): start
+    # with IF=1 (0x202) so the timer preempts agnsh in RING 3 between its prompt-poll syscalls
+    # and the scheduler hands a #43 background job a slice. Safe now (vs the 1.40.3 era) because
+    # agnsh runs under a FULL per-proc CR3 c that maps the kernel + Local APIC (proc.cyr), so the
+    # timer ISR EOIs cleanly with no CR3 swap; do_context_switch save/restore is identical to any
+    # scheduled proc (proc_current==agnsh_pid, slot CR3==c). The flag is consumed-then-cleared so
+    # only THIS first entry is affected (resumes go through the normal ISR iretq); foreground #37
+    # stays IF=0.
+    var rflags_start = 0x002;
+    if (exec_preempt != 0) { rflags_start = 0x202; }
+    exec_preempt = 0;                       # consume — foreground execs after this stay IF=0
+    store64(0x7010, rflags_start);
     store64(0x7018, user_rsp);
     store64(0x7020, 0x1B);
 
