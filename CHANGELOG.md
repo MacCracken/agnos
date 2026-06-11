@@ -5,6 +5,61 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.16] — 2026-06-10 (1.44.x — `sched_yield`#44: voluntary end-of-slice from ring 3)
+
+The arc-tail yield primitive. A ring-3 proc donates the REMAINDER of its 10 ms timer slice to the
+next ready proc instead of busy-spinning it away. The consumer: agnsh's bg-job poll loop now polls
+once + yields, so background jobs get the CPU the shell was burning at the prompt. **Benchmark
+(QEMU TCG, same host, `agnsh-bg-test.py` N=2×10⁹ busy-count sleeper): 22.8 s → 12.8 s wall-clock,
+×1.78 faster** — matching the predicted ~33%→~50% bg-share gain for yield alone (the idle kthread
+still burns a full hlt slice per rotation; removing THAT is the deferred follow-on below).
+
+### Added
+
+- **`sched_yield`(#44)** — abandon-frame yield, NOT suspend-frame (`arch/x86_64/syscall_hw.cyr` +
+  `core/sched.cyr`). The 1.44.6 serial-kstack invariant forbids suspending a handler frame (why the
+  1.44.14 in-handler yield was rejected), so #44 completes the syscall *logically* before switching:
+  the entry stub now captures, at entry, the user state a resumed caller needs — `rcx` (post-SYSCALL
+  RIP), `r11` (RFLAGS), and the SysV callee-saved set `rbx/rbp/r12-r15` (cyrius auto-regalloc keeps
+  locals there; handler prologues clobber them, so stub-time is the only robust capture point) — into
+  `sc_entry_regs` (41 bytes of straight-line stores at the one point where r10 is free scratch;
+  unconditional — dwarfed by the KPTI `mov cr3` pair per the 1.42.9 survey). The handler writes the
+  yielder's proc slot AS IF the syscall had SYSRET'd (resume RIP, `rax`=0, SYSRET-parity `rcx`/`r11`,
+  CS/SS as ring-3 literals), then switches to `sched_next()` through a synthesized 20-slot ISR frame
+  in a dedicated kernel global + the timer ISR's own pops+iretq epilogue. The abandoned kstack frame
+  is dead — the serial-kstack invariant holds. Dispatched in `syscall_handler` (stub-reachable only;
+  in-kernel `ksyscall(44)` falls to -1). Guards (each = successful no-op, return 0): `sched_active`,
+  `preempt_count`, `ew37_busy` (a #37-nested yield could resume suspended agnsh incoherently), IF=0
+  callers (foreground exec children keep their no-switch model), next==self, and non-ready `next`
+  (sched_next's fallback returns suspended kmain's STALE slot — restoring it would time-travel).
+- **The reversed-label slot map, documented in code** (`core/sched.cyr`): the proc-slot caller-saved
+  fields restore into the REVERSE of their historical labels (`p+112`→rax, `p+104`→rcx, `p+32`→r11, …)
+  — harmless for the symmetric timer save/restore, load-bearing for the yield's direct slot write
+  (rax=0 goes to p+112, NOT the field labeled "rax").
+- **`RING3_SELFTEST` yielder proof** + `ring3-smoke.sh` assert #8: a yielder payload (yield → check
+  `rax==0` → bump counter → loop; a nonzero return freezes the counter) vs the non-yielder A.
+  Observed `Y=12 A=14154` (~1180× — Y donated every slice; 12 clean abandon-frame round trips).
+  The RATIO is TCG-speed-independent. **ring3-smoke 8/8.**
+
+### Changed
+
+- **agnsh poll loop yields (agnoshi 1.6.1, sibling repo)**: `syscall(44)` after each unproductive
+  poll round (the -2 reap-and-retry arm and the -3 partial-line arm). Keystroke latency unaffected
+  (latched in `kb_buf`, drained next poll, ≤~2 ticks). Also fixed there: the 1.6.0 `SYS_SPAWN_PATH`
+  enum lived in the gitignored, `cyrius update`-regenerated `lib/` snapshot and would have been lost
+  on regeneration — replaced with the committed-src literal-43 (the literal-37 precedent).
+
+### Notes
+
+- Validated: ring3-smoke **8/8** (new `ring3: yield OK`) · exec-smoke 16/16 · nbread 4/4 · thread 2/2
+  · agnsh-smoke PASS · agnsh-bg-test PASS (~12.3 s) · agnsh-multijob-test PASS · sweep 7/7 ·
+  `check.sh` 11/11. The old (non-yielding) agnsh also passes on this kernel — #44 is purely additive.
+  **Deferred (1.44.17 candidate):** idle-deprioritization in `sched_next` (the idle kthread burns a
+  full hlt slice per rotation, capping bg share near ~50%; a two-pass skip would push it toward ~95%
+  — touches the cc5-regalloc-sensitive hot path, kept out of this cut deliberately). **Doc-debt:**
+  `agnos-userland-abi.md`'s syscall table stops at #37 — rows 38-44 ride the next doc sweep. Iron
+  rides the next burn (the stub changed for every syscall — exec/DOOM paths re-validated in QEMU).
+
 ## [1.44.15] — 2026-06-10 (1.44.x — multiple concurrent `&` jobs validated; out-of-order reap)
 
 Validates schedulable agnsh at **>1 background job** — the one follow-on flagged at 1.44.14. It works

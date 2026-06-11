@@ -2395,6 +2395,48 @@ fn ring3_spawn_one(counter_phys) {
 var ring3_idle_payload[16];
 var ring3_stress_first = 0;
 var ring3_stress_count = 0;
+# 1.44.16 sched_yield(#44) proof: a YIELDER payload — yield, check rax==0, bump the
+# counter, loop. The rax check bakes the return-value contract into the assertion: a
+# nonzero return jumps to the spin and FREEZES the counter (test fails). Its counter
+# advances ~1 per rotation (it donates every slice), so the non-yielder A's counter must
+# dwarf it — the RATIO is the slice-donation proof, and it's TCG-speed-independent.
+#   .top: mov eax,44; syscall; test rax,rax; jnz .spin; movabs rbx,0x2000000;
+#         inc qword [rbx]; jmp .top;  .spin: jmp $
+var ring3_yield_payload[64];
+var ring3_counter_y = 0;
+var ring3_pid_y = 0;
+fn ring3_yield_fill() {
+    store8(&ring3_yield_payload + 0, 0xB8);    # mov eax, 44 (sched_yield)
+    store8(&ring3_yield_payload + 1, 0x2C);
+    store8(&ring3_yield_payload + 2, 0x00);
+    store8(&ring3_yield_payload + 3, 0x00);
+    store8(&ring3_yield_payload + 4, 0x00);
+    store8(&ring3_yield_payload + 5, 0x0F);    # syscall
+    store8(&ring3_yield_payload + 6, 0x05);
+    store8(&ring3_yield_payload + 7, 0x48);    # test rax, rax
+    store8(&ring3_yield_payload + 8, 0x85);
+    store8(&ring3_yield_payload + 9, 0xC0);
+    store8(&ring3_yield_payload + 10, 0x75);   # jnz +15 -> .spin (nonzero return = freeze)
+    store8(&ring3_yield_payload + 11, 0x0F);
+    store8(&ring3_yield_payload + 12, 0x48);   # movabs rbx, 0x2000000 (the counter VA)
+    store8(&ring3_yield_payload + 13, 0xBB);
+    store8(&ring3_yield_payload + 14, 0x00);
+    store8(&ring3_yield_payload + 15, 0x00);
+    store8(&ring3_yield_payload + 16, 0x00);
+    store8(&ring3_yield_payload + 17, 0x02);
+    store8(&ring3_yield_payload + 18, 0x00);
+    store8(&ring3_yield_payload + 19, 0x00);
+    store8(&ring3_yield_payload + 20, 0x00);
+    store8(&ring3_yield_payload + 21, 0x00);
+    store8(&ring3_yield_payload + 22, 0x48);   # inc qword [rbx]
+    store8(&ring3_yield_payload + 23, 0xFF);
+    store8(&ring3_yield_payload + 24, 0x03);
+    store8(&ring3_yield_payload + 25, 0xEB);   # jmp -27 -> .top
+    store8(&ring3_yield_payload + 26, 0xE5);
+    store8(&ring3_yield_payload + 27, 0xEB);   # .spin: jmp $
+    store8(&ring3_yield_payload + 28, 0xFE);
+    return 0;
+}
 fn ring3_idle_fill() {
     store8(&ring3_idle_payload + 0, 0xB8);   # mov eax, 2 (getpid)
     store8(&ring3_idle_payload + 1, 0x02);
@@ -2498,6 +2540,19 @@ fn ring3_selftest_setup() {
     spawn_parent_fill();
     spawn_parent_pid = spawn_user_proc(&spawn_parent_payload);
     if (spawn_parent_pid >= 0) { proc_set_ring3(spawn_parent_pid); }
+    # Y = the 1.44.16 sched_yield(#44) YIELDER (own counter at its 0x2000000, like A).
+    # Spawned BEFORE the stress block so the stress pids stay contiguous.
+    ring3_counter_y = pmm_alloc_2mb();
+    if (ring3_counter_y != 0) {
+        if (vmm_is_mapped(ring3_counter_y) == 0) { vmm_map(ring3_counter_y, ring3_counter_y, 0x83); }
+        store64(ring3_counter_y, 0);
+        ring3_yield_fill();
+        ring3_pid_y = spawn_user_proc(&ring3_yield_payload);
+        if (ring3_pid_y >= 0) {
+            proc_map_page(proc_get_cr3(ring3_pid_y), 0x2000000, ring3_counter_y);
+            proc_set_ring3(ring3_pid_y);
+        }
+    }
     # STRESS: spawn 4 extra ring-3 procs (pids ~5-8) so the in-memory loaders' user code
     # (0x400000 striped → 16 MB at pid 6 pre-fix) + stack land in PD[8..63]. With ~9 procs
     # the pmm pushes page-table pages into the same 16-128 MB region — so PRE-fix a context
@@ -2592,6 +2647,22 @@ fn ring3_selftest_verify() {
     # Retire the stress procs (they loop forever) so boot continues.
     var srp = 0;
     while (srp < ring3_stress_count) { proc_set_state(ring3_stress_first + srp, 0); srp = srp + 1; }
+    # 1.44.16 sched_yield(#44): the YIELDER Y donated every slice. (i) cy > 0 proves the
+    # abandon-frame round trip — Y was resumed in ring 3 at the post-SYSCALL RIP with
+    # rax==0 AND its callee-saved/RSP state intact (any breakage spins, faults, or freezes
+    # the counter). (ii) ca >> cy (10x) proves the yield actually ENDS the slice — a
+    # silently-non-switching yield (all guards refusing) would make Y a busy increment
+    # loop with cy ~= ca and FAIL the ratio. The RATIO is TCG-speed-independent.
+    if (ring3_pid_y > 0) {
+        var cy = load64(ring3_counter_y);
+        var cay = load64(ring3_counter_a);
+        kprint("ring3: Y=", 9); kprint_num(cy); kprint(" A=", 3); kprint_num(cay); kprintln("", 0);
+        if (cy > 0) {
+            if (cay > cy * 10) { kprintln("ring3: yield OK", 15); }
+            else { kprintln("ring3: FAIL yield ratio", 23); }
+        } else { kprintln("ring3: FAIL yield dead", 22); }
+        proc_set_state(ring3_pid_y, 0);              # retire Y; boot continues
+    }
     # Preempt gate still covers the live proc A.
     var sa = load64(ring3_counter_a);
     preempt_disable();

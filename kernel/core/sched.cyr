@@ -214,3 +214,138 @@ fn kernel_idle_loop() {
     }
     return 0;
 }
+
+# === 1.44.16 — sched_yield(#44): voluntary end-of-slice from ring 3 ===
+#
+# A ring-3 proc donates the REMAINDER of its timer slice to the next ready proc.
+# The consumer: agnsh's bg-job poll loop — instead of busy-spinning its whole 10 ms
+# slice between non-blocking polls, it polls once + yields, so background jobs get
+# nearly all the CPU while the shell idles at the prompt.
+#
+# MECHANISM — abandon-frame, NOT suspend-frame. The 1.44.6 serial-kstack invariant
+# forbids suspending a handler frame (the next proc's syscall resets rsp to
+# syscall_kstack_top and would clobber it — why the 1.44.14 in-handler yield was
+# rejected). Instead the #44 handler completes the syscall "logically" BEFORE the
+# switch: it writes the yielder's proc slot AS IF the syscall had already SYSRET'd
+# (resume RIP = the post-SYSCALL rcx the entry stub captured into sc_entry_regs;
+# rax = 0 = the yield return value), then switches to the next ready proc through a
+# SYNTHESIZED ISR frame + the timer ISR's own pops+iretq epilogue. The abandoned
+# kstack frame is dead — nothing ever returns through it, so a later overwrite is
+# harmless and the serial-kstack invariant holds. When the rotation comes back, the
+# normal scheduler restore iretqs the yielder into ring 3 at the post-SYSCALL RIP
+# with rax=0 — it observes sched_yield() == 0.
+#
+# REVERSED-LABEL SLOT MAP (load-bearing): the proc-slot caller-saved fields restore
+# into the REVERSE of their labels (derived from the ISR pop order, pic.cyr:94-110,
+# vs proc_restore_context's writes above): p+32→r11, p+48→r10, p+56→r9, p+64→r8,
+# p+72→rdi, p+88→rsi, p+96→rdx, p+104→rcx, p+112→rax. So the rax=0 return value goes
+# to p+112 (NOT p+32). Harmless for the symmetric timer save/restore; critical here.
+# Callee-saved labels are clean (p+40=rbx, p+80=rbp, p+120..144=r12-r15).
+
+# The synthesized 20-slot ISR frame (160 B needed). A DEDICATED kernel global — NOT
+# kstack-relative scratch (proc_restore_context's own call frame grows down the live
+# kstack and could overlap it). Identity-mapped supervisor under every per-proc CR3
+# (the PD[0..127] kernel mirror), so it stays readable after the cr3_load below.
+# IF=0 (SFMASK) guarantees exclusive use. Oversized allocation (margin on principle).
+var yield_frame[160];
+
+# Load the synthesized frame and run the timer ISR's exact restore epilogue
+# (pic.cyr:94-112 byte-for-byte): 15 pops + iretq. Never returns. First param via
+# the proven stack-relative [rbp-8] idiom (mirrors cr3_load, proc.cyr — robust
+# under cycc regalloc).
+fn yield_frame_iretq(fp) {
+    asm {
+        0x48; 0x8B; 0x65; 0xF8;   # mov rsp, [rbp-8]   (fp = &yield_frame)
+        0x41; 0x5F;               # pop r15
+        0x41; 0x5E;               # pop r14
+        0x41; 0x5D;               # pop r13
+        0x41; 0x5C;               # pop r12
+        0x5D;                     # pop rbp
+        0x5B;                     # pop rbx
+        0x41; 0x5B;               # pop r11
+        0x41; 0x5A;               # pop r10
+        0x41; 0x59;               # pop r9
+        0x41; 0x58;               # pop r8
+        0x5F;                     # pop rdi
+        0x5E;                     # pop rsi
+        0x5A;                     # pop rdx
+        0x59;                     # pop rcx
+        0x58;                     # pop rax
+        0x48; 0xCF;               # iretq
+    }
+    return 0;
+}
+
+# The #44 handler. Dispatched from syscall_handler (syscall_hw.cyr) ONLY — never from
+# ksyscall, which in-kernel code (bench, recovery shell) calls directly with stale
+# sc_entry_regs. Every guard returns 0 = a SUCCESSFUL NO-OP yield (plain SYSRET).
+# Raw load64/store64 throughout (the cc5-regalloc-sensitive-path convention above).
+fn sys_sched_yield() {
+    if (sched_active == 0) { return 0; }
+    if (preempt_count > 0) { return 0; }
+    # Refuse during an execwait#37 nested exec: suspended agnsh sits state-1
+    # (SCHEDULABLE) with its real continuation frozen in the #37 kstack frame — a
+    # yield-switch could select its STALE slot and resume the shell incoherently.
+    if (ew37_busy != 0) { return 0; }
+    # Refuse IF=0 callers (foreground exec/execwait children): their no-context-switch
+    # model is load-bearing; yield is a no-op there, not an error.
+    if ((load64(&sc_entry_regs + 8) & 0x200) == 0) { return 0; }
+    var yp = proc_current;
+    var next = sched_next();
+    if (next == yp) { return 0; }                      # nothing else ready — keep the slice
+    # sched_next's no-ready fallback returns 0 (kmain), which is state 2 with a STALE
+    # slot while suspended in exec_and_wait — restoring it would time-travel kmain.
+    # Only a genuinely READY (state 1) proc may be switched to from here.
+    if (proc_get_state(next) != 1) { return 0; }
+    # --- Write the yielder's slot AS IF the syscall had returned (SYSRET parity) ---
+    var p = &proc_table + yp * 176;
+    store64(p + 24, load64(&sc_entry_regs + 0));       # resume RIP = post-SYSCALL rcx
+    store64(p + 152, load64(&sc_entry_regs + 8));      # RFLAGS = captured r11 (carries IF=1)
+    store64(p + 16, kernel_rsp_save);                  # user RSP (stub-saved at entry)
+    store64(p + 40, load64(&sc_entry_regs + 16));      # rbx   (callee-saved: clean labels)
+    store64(p + 80, load64(&sc_entry_regs + 24));      # rbp
+    store64(p + 120, load64(&sc_entry_regs + 32));     # r12
+    store64(p + 128, load64(&sc_entry_regs + 40));     # r13
+    store64(p + 136, load64(&sc_entry_regs + 48));     # r14
+    store64(p + 144, load64(&sc_entry_regs + 56));     # r15
+    store64(p + 112, 0);                               # → ring-3 RAX = 0 (the return value)
+    store64(p + 104, load64(&sc_entry_regs + 0));      # → ring-3 RCX = RIP (SYSRET parity)
+    store64(p + 32, load64(&sc_entry_regs + 8));       # → ring-3 R11 = RFLAGS (SYSRET parity)
+    store64(p + 48, 0);                                # → r10 (dead caller-saved: zero, don't
+    store64(p + 56, 0);                                # → r9   leak kernel register contents)
+    store64(p + 64, 0);                                # → r8
+    store64(p + 72, 0);                                # → rdi
+    store64(p + 88, 0);                                # → rsi
+    store64(p + 96, 0);                                # → rdx
+    # CS/SS as LITERALS: SYSCALL entry proves the caller is ring 3, but the arrays
+    # hold ring-0 defaults until the FIRST timer preemption persists the real ones —
+    # a first-poll yield can precede that (the #43 proc_set_ring3 bug class).
+    store64(&proc_cs + yp * 8, 0x23);
+    store64(&proc_ss + yp * 8, 0x1B);
+    # --- Switch (mirrors do_context_switch's proven order + tail) ---
+    proc_set_state(yp, 1);                             # yielder: running → ready
+    proc_current = next;
+    proc_set_state(next, 2);                           # next: ready → running
+    var fp = &yield_frame;
+    proc_restore_context(next, fp);                    # fill the synthesized ISR frame
+    var new_cr3 = proc_get_cr3(next);
+    var old_cr3 = proc_get_cr3(yp);
+    if (new_cr3 != old_cr3) { cr3_load(new_cr3); }
+    kpti_kernel_cr3 = new_cr3;                         # OMITTING these re-enters the YIELDER's
+    kpti_user_cr3 = proc_get_user_cr3(new_cr3);        # CR3 on next's first syscall (1.40.x class)
+    proc_check_pending_signals(next);
+    # CLAC: the entry stub's STAC pairs with CLAC only on the SYSRET tail we never
+    # reach (the kernel_resume precedent, 1.42.14 audit #3).
+    asm { 0x0F; 0x01; 0xCA; }
+    # IBRS off before returning to user (mirrors the SYSRET tail), if supported.
+    if (ibrs_supported == 1) {
+        asm {
+            0xB9; 0x48; 0x00; 0x00; 0x00;   # mov ecx, 0x48 (IA32_SPEC_CTRL)
+            0x31; 0xD2;                       # xor edx, edx
+            0x31; 0xC0;                       # xor eax, eax
+            0x0F; 0x30;                       # wrmsr (IBRS = 0)
+        }
+    }
+    yield_frame_iretq(fp);                             # never returns
+    return 0;
+}

@@ -174,21 +174,28 @@ try:
     bg_seg = run_wait("sleeper &\n", "[1]", timeout=25)
     launched = "[1]" in bg_seg
     done_before_version = "SLEEPER-DONE" in bg_seg
+    t_launch = time.time()   # the job has been running since "[1]" appeared just above
     # 2) prompt LIVE while the bg job runs — version responds (a fresh "agnoshi 1.6.0") BEFORE done.
     ver_seg = run_wait("version\n", "agnoshi 1.6.0", timeout=20)
     ver_live = "agnoshi 1.6.0" in ver_seg
     ver_before_done = ver_live and ("SLEEPER-DONE" not in ver_seg or
                                     ver_seg.index("agnoshi 1.6.0") < ver_seg.index("SLEEPER-DONE"))
-    # 3) the bg job runs to completion + agnsh reaps it.
+    # 3) the bg job runs to completion + agnsh reaps it. Time launch -> SLEEPER-DONE on the
+    # host clock (1.44.16 sched_yield measurement: agnsh donating its slice should cut this
+    # vs the busy-polling baseline; same N + same host = comparable across runs).
     m = len(ser())
     tail = ""
+    t_done = None
     deadline = time.time() + 150
     while time.time() < deadline:
         tail = ser()
+        if t_done is None and "SLEEPER-DONE" in tail: t_done = time.time()
         if "SLEEPER-DONE" in tail and "[1] Done" in tail: break
         time.sleep(0.5)
     sleeper_ran = "SLEEPER-DONE" in tail
     reaped = "[1] Done" in tail
+    if t_done is not None:
+        p(f"bg wall-clock (launch->SLEEPER-DONE, incl. version probe): ~{t_done - t_launch:.1f}s (N={SLEEP_N})")
 
     p("=========== sleeper & segment ==========="); p(bg_seg if bg_seg.strip() else "(empty)")
     p("=========== version segment ==========="); p(ver_seg if ver_seg.strip() else "(empty)")
