@@ -522,10 +522,14 @@ fn proc_reap_child(pid) {
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
     if (cr3 != 0x1000) { proc_free_address_space(cr3); }
-    # LIFO slot reclaim: hand the top dead slot back to the allocator (same rule
-    # as proc_reap — only the topmost slot collapses, so a non-top child that
-    # exits early keeps its slot until the slots above it drain; the address
-    # space + pages are still freed regardless).
+    # LIFO slot reclaim: hand the top dead slot back to the allocator (same rule as proc_reap —
+    # ONLY the topmost slot collapses). A non-top child that exits early keeps its slot until the
+    # slots above it drain; proc_alloc_slot (1.44.12) reuses that hole so nothing leaks. The address
+    # space + pages are freed regardless. NOTE: a multi-collapse "while trailing-dead" was tried at
+    # 1.44.15 and REVERTED — it would reclaim the slot of an EXITED-BUT-NOT-YET-`waitpid`'d proc when
+    # a later reap trailed into it, so the parent's pending waitpid(pid) would find the proc gone
+    # (pid >= proc_count -> -1) and its address space would leak. A proc's slot must persist until
+    # ITS OWN waitpid reaps it. (Multi-background-jobs validated WITHOUT it — agnsh-multijob-test.)
     if (pid == proc_count - 1) { proc_count = proc_count - 1; }
     return 0;
 }

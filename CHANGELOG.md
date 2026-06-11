@@ -5,6 +5,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.15] — 2026-06-10 (1.44.x — multiple concurrent `&` jobs validated; out-of-order reap)
+
+Validates schedulable agnsh at **>1 background job** — the one follow-on flagged at 1.44.14. It works
+as-is: the kernel is **byte-identical to 1.44.14** (no fix needed). The 1.44.12 non-LIFO `proc_alloc_slot`
++ the 1.44.14 `exec_resume_pid` gate + agnsh's job-table compaction already handle concurrent jobs and
+out-of-order exits. The `>1`-job caution is cleared.
+
+### Added
+
+- **`scripts/agnsh-multijob-test.py`** — two concurrent `&` jobs (`/bin/sleep1` short + `/bin/sleep2`
+  long, built as inline busy-loop ELFs). `sleep1` (the LOWER proc-table slot, launched first) finishes
+  FIRST, so reaping it is a **NON-TOP / out-of-order** reap while `sleep2` is still live. Asserts both
+  launch (`[1]`/`[2]`), `sleep1` reaps out-of-order (`[1] Done` before `[2] Done`), the prompt stays live
+  mid-run (`version` responds), and `sleep2` reaps. **PASS** on the current kernel.
+
+### Changed
+
+- **`core/proc.cyr` — documented a reverted experiment** (`proc_reap_child`). A "collapse ALL trailing
+  dead slots" optimization (vs the LIFO top-only collapse) was tried to keep `proc_count` tight under
+  out-of-order exits, and **reverted as unsafe**: it would reclaim the slot of an **exited-but-not-yet-
+  `waitpid`'d** proc when a later reap trailed into it, so the parent's pending `waitpid(pid)` would find
+  the proc gone (`pid >= proc_count` → -1) and its address space would leak. A proc's slot must persist
+  until ITS OWN `waitpid` reaps it. The comment records this so it isn't re-attempted. (Out-of-order slot
+  *reclamation* is already correct via `proc_alloc_slot`'s hole reuse — no leak, the high-water mark just
+  stays inflated until the top drains, which is harmless.)
+
+### Notes
+
+- Kernel byte-identical to 1.44.14 (1,147,584 B). Validated: `agnsh-multijob-test` PASS · exec-smoke 16/16
+  · ring3-smoke 7/7 · check 11/11. agnsh's job table caps at 8 concurrent jobs. The 1.44.x arc's remaining
+  tail: `kthread_yield`/`sched_yield`; SMP-AP wakeup.
+
 ## [1.44.14] — 2026-06-10 (1.44.x — schedulable agnsh WORKS: the shell stays live while a bg job runs)
 
 The user-visible milestone the whole 1.44.x arc built toward: `prog &` launches a background job that
