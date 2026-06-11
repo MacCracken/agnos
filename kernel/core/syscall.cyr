@@ -98,6 +98,10 @@ var spawn_path_buf[16];
 # [128] = 128 u64 = 1024 B each (the 8N module-global rule).
 var ew37_env[128];        # execwait(#37) env staging
 var spawn_env_buf[128];   # spawn_path(#43) env staging
+# 1.44.20: blit#39 scaled-row staging — ONE expanded src row (w*scale px, 32bpp). [4096] =
+# 4096 u64 = 32 KB (8N), the invariant the handler's `w*scale <= 8192` gate enforces (NOT
+# "max FB row" — the expanded width is what lands here). Single-core IF=0 handler scratch.
+var fb_scale_rowbuf[4096];
 
 # Security: a userspace pointer must lie in the user VA window [0x200000, 0x40000000):
 # above the kernel low region (0-2 MB) and below the 1 GB arena ceiling. EVERY
@@ -1202,25 +1206,86 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var bl_dstxy = ksyscall_a4;
         var bl_dx = bl_dstxy & 0xFFFF;
         var bl_dy = (bl_dstxy >> 16) & 0xFFFF;
+        # 1.44.20: a4 bits [39:32] = INTEGER SCALE (0 or 1 = the 1:1 path, byte-identical for
+        # every existing caller — doom's 4-arg syscall pins the full 64-bit a4 with yoff bits
+        # [23:16]=0; fbtest hand-emits mov r10,0; no shorter-arity blit caller exists). Each
+        # src pixel becomes a scale×scale block; the dst rect is (dx, dy, w*scale, h*scale),
+        # clipped exactly like 1:1. scale > 16 is a LOUD reject (catches a future garbage-r10
+        # caller at its first frame instead of silently misrendering — the env-a3/a4 class).
+        var bl_scale = (bl_dstxy >> 32) & 0xFF;
+        if (bl_scale == 0) { bl_scale = 1; }
+        if (bl_scale > 16) { stack_canary_check(canary); return 0 - 1; }
+        # THE memory-safety gate: fb_scale_rowbuf holds one EXPANDED SRC row (w*scale px).
+        # w<=8192 with scale<=16 would allow 512 KB — 16× the 32 KB buffer (a ring-3-reachable
+        # BSS smash) — so the EXPANDED width is capped to the buffer BEFORE any write. Never
+        # fires for scale<=1 (w<=8192 already enforced above): back-compat is exact.
+        if (bl_w * bl_scale > 8192) { stack_canary_check(canary); return 0 - 1; }
         if (bl_dx >= bl_fw) { stack_canary_check(canary); return 0; }    # fully off-screen → no-op OK
         if (bl_dy >= bl_fh) { stack_canary_check(canary); return 0; }
-        var bl_cw = bl_w;                                                # clip width to FB right edge
+        var bl_cw = bl_w * bl_scale;                                     # clip SCALED width to FB right edge
         if (bl_dx + bl_cw > bl_fw) { bl_cw = bl_fw - bl_dx; }
-        var bl_ch = bl_h;                                               # clip height to FB bottom edge
+        var bl_ch = bl_h * bl_scale;                                     # clip SCALED height to FB bottom edge
         if (bl_dy + bl_ch > bl_fh) { bl_ch = bl_fh - bl_dy; }
         var bl_r = 0;
         var bl_srow = 0;
         var bl_drow = 0;
         var bl_c = 0;
-        while (bl_r < bl_ch) {
-            bl_srow = arg1 + (bl_r * bl_w) * 4;                          # src row (packed w*4)
-            bl_drow = bl_fb + (bl_dy + bl_r) * bl_pitch + bl_dx * 4;     # dest row in FB
-            bl_c = 0;
-            while (bl_c < bl_cw) {
-                store32(bl_drow + bl_c * 4, load32(bl_srow + bl_c * 4));
-                bl_c = bl_c + 1;
+        if (bl_scale <= 1) {
+            # 1:1 — the pre-1.44.20 loop VERBATIM (structural byte-identity for legacy callers;
+            # bl_cw/bl_ch equal the unscaled values when scale==1).
+            while (bl_r < bl_ch) {
+                bl_srow = arg1 + (bl_r * bl_w) * 4;                          # src row (packed w*4)
+                bl_drow = bl_fb + (bl_dy + bl_r) * bl_pitch + bl_dx * 4;     # dest row in FB
+                bl_c = 0;
+                while (bl_c < bl_cw) {
+                    store32(bl_drow + bl_c * 4, load32(bl_srow + bl_c * 4));
+                    bl_c = bl_c + 1;
+                }
+                bl_r = bl_r + 1;
             }
-            bl_r = bl_r + 1;
+        } else {
+            # scale>=2 — src-major with the row buffer: expand each SRC row ONCE into
+            # fb_scale_rowbuf (cached RAM — per-pixel divides stay out of the hot loops), then
+            # copy the clipped row (cw*4 bytes, NEVER pitch — pitch slack would spill into the
+            # next row) to each of the `scale` dst rows, stopping at the clip. No FB read-back
+            # (the FB is WC-mapped). In-bounds: dx*4 + cw*4 <= fw*4 <= pitch (asserted above);
+            # src reads stay in [0, w) per row and [0, h) rows by construction. The shared
+            # rowbuf is safe under the single-core IF=0 syscall invariant (the SMP arc must
+            # add this to its unwind list).
+            var bl_s = 0;
+            while (bl_s < bl_h) {
+                if (bl_s * bl_scale >= bl_ch) { bl_s = bl_h; }           # rest fully clipped — done
+                else {
+                    bl_srow = arg1 + (bl_s * bl_w) * 4;
+                    var bl_x = 0;                                        # expand: each px scale times
+                    var bl_o = 0;
+                    while (bl_x < bl_w) {
+                        var bl_px = load32(bl_srow + bl_x * 4);
+                        var bl_k = 0;
+                        while (bl_k < bl_scale) {
+                            store32(&fb_scale_rowbuf + bl_o * 4, bl_px);
+                            bl_o = bl_o + 1;
+                            bl_k = bl_k + 1;
+                        }
+                        bl_x = bl_x + 1;
+                    }
+                    var bl_kr = 0;                                       # emit `scale` dst rows
+                    while (bl_kr < bl_scale) {
+                        bl_r = bl_s * bl_scale + bl_kr;
+                        if (bl_r >= bl_ch) { bl_kr = bl_scale; }         # clipped — stop this block
+                        else {
+                            bl_drow = bl_fb + (bl_dy + bl_r) * bl_pitch + bl_dx * 4;
+                            bl_c = 0;
+                            while (bl_c < bl_cw) {
+                                store32(bl_drow + bl_c * 4, load32(&fb_scale_rowbuf + bl_c * 4));
+                                bl_c = bl_c + 1;
+                            }
+                            bl_kr = bl_kr + 1;
+                        }
+                    }
+                    bl_s = bl_s + 1;
+                }
+            }
         }
         stack_canary_check(canary);
         return 0;

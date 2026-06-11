@@ -193,6 +193,7 @@ else
         [ -n "$THREAD_SELFTEST" ]    && echo '#define THREAD_SELFTEST'
         [ -n "$RING3_SELFTEST" ]     && echo '#define RING3_SELFTEST'
         [ -n "$NBREAD_SELFTEST" ]    && echo '#define NBREAD_SELFTEST'
+        [ -n "$FBSCALE_SELFTEST" ]   && echo '#define FBSCALE_SELFTEST'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include

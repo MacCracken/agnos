@@ -5,6 +5,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.20] — 2026-06-11 (1.44.x — kernel-scaled blit: a4[39:32] integer scale on #39)
+
+Carry-forward 2 of 3 (FB scaling). `blit`#39 gains an INTEGER SCALE in a4 bits [39:32] (0 or 1 =
+the 1:1 path, byte-identical): each src pixel becomes a scale×scale block, dst rect clipped exactly
+like 1:1. The consumer win is cyrius-doom 0.29.0: it drops its userland scaler (which was CAPPED at
+3 by its heap budget) — the panel's natural integer scale now applies (7 on 2560×1440), ring 3
+writes **64K pixels/frame instead of scale²·64K**, and the conversion buffer is a fixed 256 KB
+instead of scale²·256 KB.
+
+### Added
+
+- **Scale decode + two-path copy (`core/syscall.cyr` #39):** scale ≤1 keeps the pre-1.44.20 loop
+  VERBATIM (structural byte-identity for every legacy caller — verified: doom's 4-arg syscall pins
+  the full 64-bit a4 with zero high bits, fbtest hand-emits `mov r10,0`, no shorter-arity caller
+  exists). scale ≥2 runs src-major through a row buffer: each src row expands ONCE in cached RAM,
+  then copies (cw·4 bytes, never pitch) to each of the `scale` clipped dst rows — no per-pixel
+  divides in the hot loops, no FB read-back (the FB is WC-mapped). scale >16 is a LOUD -1 (catches
+  a future garbage-r10 caller at its first frame — the env-a3/a4 lesson).
+- **The rowbuf memory-safety gate — the adversarial review's catch:** the design originally sized
+  the 32 KB row buffer to "the max FB row," but the buffer holds the EXPANDED SRC row — up to
+  8192×16 px = 512 KB, a **ring-3-reachable kernel BSS smash**. The handler now rejects
+  `w*scale > 8192` (-1) after scale decode and before any buffer write; never fires for scale ≤1,
+  so back-compat is exact.
+- **`FBSCALE_SELFTEST` + `scripts/fbscale-smoke.sh`:** kernel-context blits assert the exact 4×4
+  expansion of a 2×2 @ scale 2, the right-edge clip (both visible columns map to src col 0), and
+  both loud rejects. Test discipline per the review: `ksyscall_a4` staged explicitly per call
+  (3-arg `ksyscall`; stale-a4 hazard), all fb_phys read-backs into locals BEFORE any kprint (console
+  output scrolls the FB), clean SKIP without a FB. **`fbscale: ALL PASS` first boot.**
+
+### Fixed
+
+- `scripts/doom-smoke.sh` greps `cyrius-doom v` instead of a hard-pinned `v0.28.3` (the pin rotted
+  on every doom cut — it flagged a fully-working boot as "doom never started").
+
+### Notes
+
+- Validated: fbscale-smoke PASS · exec-smoke 17/17 (fbtest's 1:1 unchanged) · **doom-smoke PASS**
+  (240 colors rendered through the scaled blit, userland scaler deleted) · agnsh-smoke · smp 3/3 ·
+  sweep 7/7 · `check.sh` 11/11. Production 1,193,072 B (+32 KB rowbuf). The shared rowbuf rides the
+  single-core IF=0 syscall invariant — on the SMP arc's unwind list. An OLD kernel ignores the scale
+  bits (unscaled, centered-offset placement — degraded but harmless), so doom 0.29.0 ships with
+  kernel ≥1.44.20. **Carry-forward 3 (zero-copy FB-mmap) CLOSED — superseded by this cut** (user
+  decision 2026-06-11): kernel scaling removed its motivation (fixed 256 KB + one syscall per frame,
+  DOOM 9× under frame budget), and mapped scanout would both undo the scaling win (userland would
+  re-scale into WC memory) and reverse the deliberate hardening posture (`fb_phys` not exposed;
+  blit#39 stays THE ring-3 FB path — preferred: a hardened kernel). The FB story applies to ANY
+  shell-launched game, so buffer considerations may return (kernel-side double-buffer for tear-free
+  flips) — backlogged, triggered by observed tearing on iron or future game consumers; always
+  kernel-mediated. The 1.43.x carry-forward ledger is now EMPTY.
+
 ## [1.44.19] — 2026-06-11 (1.44.x — per-process env: caller envp through execwait#37 / spawn_path#43)
 
 The first 1.43.x carry-forward. A caller passes a real environment to its children — env becomes

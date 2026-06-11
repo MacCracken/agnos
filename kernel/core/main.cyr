@@ -1856,6 +1856,65 @@ fn nbread_selftest() {
 nbread_selftest();
 #endif
 
+# 1.44.20 — scaled-blit self-test (compile-gated, FBSCALE_SELFTEST=1). Drives blit#39 with
+# the a4[39:32] scale channel from kernel context: (1) a 2x2 pattern at scale 2 at (0,0) must
+# expand to the exact 4x4 block; (2) the same blit at dx=fw-2 clips to cw=2 with BOTH visible
+# columns mapping to src col 0; (3) scale>16 and w*scale>8192 must reject -1 (the rowbuf
+# memory-safety gate). DISCIPLINE (per the adversarial review): ksyscall is 3-arg, so
+# ksyscall_a4 MUST be staged explicitly before each call (stale-a4 hazard — the
+# fs_syscall_selftest rename precedent); ALL fb_phys read-backs land in locals BEFORE any
+# kprint (console output can scroll/rewrite the whole FB); skip cleanly with no FB.
+#ifdef FBSCALE_SELFTEST
+fn fbscale_selftest() {
+    if (fb_fb_phys() == 0) { kprintln("fbscale: no FB SKIP", 19); return 0; }
+    var u = pmm_alloc_2mb();
+    if (u == 0)       { kprintln("fbscale: no scratch FAIL", 24); return 0 - 1; }
+    if (u < 0x200000) { kprintln("fbscale: scratch low FAIL", 25); return 0 - 1; }
+    # src 2x2: A B / C D (distinct 32bpp values)
+    store32(u + 0,  0x11111111); store32(u + 4,  0x22222222);
+    store32(u + 8,  0x33333333); store32(u + 12, 0x44444444);
+    var fb = fb_fb_phys();
+    var fw = fb_width();
+    var pitch = fb_pitch();
+    var ok = 1;
+    # (1) scale 2 at (0,0) -> 4x4 expansion
+    ksyscall_a4 = 2 << 32;                               # scale=2, dx=dy=0
+    var r1 = ksyscall(39, u, 2, 2);
+    # read back FIRST (locals), print after
+    var p00 = load32(fb + 0);            var p01 = load32(fb + 4);
+    var p02 = load32(fb + 8);            var p10 = load32(fb + pitch);
+    var p20 = load32(fb + 2 * pitch);    var p22 = load32(fb + 2 * pitch + 8);
+    var p33 = load32(fb + 3 * pitch + 12);
+    if (r1 != 0)               { kprintln("fbscale: FAIL rc1", 17); ok = 0; }
+    if (p00 != 0x11111111)     { kprintln("fbscale: FAIL 00", 16); ok = 0; }
+    if (p01 != 0x11111111)     { kprintln("fbscale: FAIL 01", 16); ok = 0; }
+    if (p02 != 0x22222222)     { kprintln("fbscale: FAIL 02", 16); ok = 0; }
+    if (p10 != 0x11111111)     { kprintln("fbscale: FAIL 10", 16); ok = 0; }
+    if (p20 != 0x33333333)     { kprintln("fbscale: FAIL 20", 16); ok = 0; }
+    if (p22 != 0x44444444)     { kprintln("fbscale: FAIL 22", 16); ok = 0; }
+    if (p33 != 0x44444444)     { kprintln("fbscale: FAIL 33", 16); ok = 0; }
+    # (2) right-edge clip: dx=fw-2, scale 2 -> cw_eff=2, BOTH cols = src col 0 (c/2==0)
+    ksyscall_a4 = (2 << 32) | (fw - 2);
+    var r2 = ksyscall(39, u, 2, 2);
+    var q0 = load32(fb + (fw - 2) * 4);
+    var q1 = load32(fb + (fw - 1) * 4);
+    var q2 = load32(fb + 2 * pitch + (fw - 2) * 4);
+    if (r2 != 0)               { kprintln("fbscale: FAIL rc2", 17); ok = 0; }
+    if (q0 != 0x11111111)      { kprintln("fbscale: FAIL e0", 16); ok = 0; }
+    if (q1 != 0x11111111)      { kprintln("fbscale: FAIL e1", 16); ok = 0; }
+    if (q2 != 0x33333333)      { kprintln("fbscale: FAIL e2", 16); ok = 0; }
+    # (3) loud rejects: scale>16; expanded width over the rowbuf (w*scale>8192)
+    ksyscall_a4 = 17 << 32;
+    if (ksyscall(39, u, 2, 2) != 0 - 1)      { kprintln("fbscale: FAIL s17", 17); ok = 0; }
+    ksyscall_a4 = 2 << 32;
+    if (ksyscall(39, u, 8192, 1) != 0 - 1)   { kprintln("fbscale: FAIL wcap", 18); ok = 0; }
+    pmm_free_2mb(u);
+    if (ok == 1) { kprintln("fbscale: ALL PASS", 17); } else { kprintln("fbscale: FAIL", 13); }
+    return 0;
+}
+fbscale_selftest();
+#endif
+
 # 1.41.6 — syscall-ingress HARDENING self-test (compile-gated,
 # SYSCALL_HARDEN_SELFTEST=1). Regression-locks the 1.41.5 security fixes AND
 # serves as the safety net for the 1.41.6 dispatcher refactors, because the

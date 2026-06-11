@@ -102,7 +102,7 @@ echo "  --- doom serial lines ---"
 strings "$SLOG" | grep -E "doom|wad|cyrius-doom|exec:|PANIC|FAULT|#PF" | sed 's/^/  /' | head -20
 
 rc=0
-if strings "$SLOG" | grep -q "cyrius-doom v0.28.3"; then
+if strings "$SLOG" | grep -q "cyrius-doom v"; then
     echo "  PASS: /bin/doom started (584 KB ELF exec'd from disk in ring 3)"
 else
     echo "  FAIL: doom never started (exec-from-disk of the 584 KB binary failed)"; rc=1
