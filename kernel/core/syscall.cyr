@@ -1069,7 +1069,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
             }
         }
         exec_env_src = ew_env;                       # globals, consumed-at-entry by the loader
-        exec_env_len = ew_elen;                      # (see elf.cyr — the 6-arg call shape miscompiled)
+        exec_env_len = ew_elen;
         var cpid = elf_load_from_file(pdst + ew_ps, ew_plen, pdst, arg2);
         if (cpid < 0) {
             cr3_load(ew37_cr3);

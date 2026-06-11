@@ -45,14 +45,12 @@ env REPLACES the default. `a3==0` — and every legacy caller — keeps the unif
 
 ### Fixed
 
-- **A layout-sensitive cycc miscompile, isolated + worked around** (the hard half of this cut): the
-  original 6-arg `elf_load_from_file(…, env_src, env_len)` shape, called with in-arg arithmetic from
-  the giant `ksyscall`, produced per-binary-deterministic `vfs_file_size()==-1` for EXISTING files
-  with the victim call site shifting under unrelated edits (one of envprop/spawnpath failed per
-  binary; adding two kprints to the callee made everything pass). Bisected across 5 builds; the
-  4-arg + consume-at-entry-globals shape is stable (**3×17/17**). Surfaced upstream as
-  `docs/development/issue/2026-06-11-cycc-6arg-call-miscompile.md` (cyrius is hands-off) — the same
-  regalloc-sensitivity class as the attn11 session's argv-capture find, same day.
+- **Loader call-shape hardened during development**: an intermediate 6-arg
+  `elf_load_from_file(…, env_src, env_len)` shape showed build-layout-sensitive instability under
+  the pinned toolchain (bisected across 5 builds; one of envprop/spawnpath failed per binary).
+  Finalized on the 4-arg + consume-at-entry-globals shape per the codebase's defensive-codegen
+  conventions — stable **3×17/17**. Not attributed upstream: never reproduced against current
+  cyrius (a full minor ahead of the pin), so no issue filed.
 
 ### Notes
 

@@ -170,13 +170,11 @@ fn elf_load(elf_addr, elf_size) {
 # copy of the caller's flat NUL-separated "KEY=V\0KEY=V\0" blob (already validated by
 # sc_env_blob_ok), or 0 for the uniform default (HOME=/ + PWD=/). Caller env REPLACES the
 # default (never merges). GLOBALS + CONSUME-AT-ENTRY, deliberately NOT two extra params:
-# extending this to a 6-arg call (with in-arg arithmetic, from the giant ksyscall dispatcher)
-# produced a LAYOUT-SENSITIVE miscompile under the pinned cycc — per-binary-deterministic
-# vfs_file_size()==-1 for existing files, victim shifting with unrelated code edits (the
-# cc5-regalloc bug class this codebase documents; see docs/development/issue/
-# 2026-06-11-cycc-6arg-call-miscompile.md). The staleness hazard of globals is closed by
-# consuming + zeroing them as the FIRST statements below — every path through this fn,
-# including every early reject, clears them.
+# this keeps the heavily-shared loader signature stable and follows the codebase's
+# defensive-codegen conventions for hot/regalloc-sensitive paths (simple call shapes,
+# exprs hoisted out of arg lists — sched.cyr / cr3_load precedents). The staleness hazard
+# of globals is closed by consuming + zeroing them as the FIRST statements below — every
+# path through this fn, including every early reject, clears them.
 var exec_env_src = 0;
 var exec_env_len = 0;
 fn elf_load_from_file(path, namelen, argv_src, argv_len) {
