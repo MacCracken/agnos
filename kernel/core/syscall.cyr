@@ -350,18 +350,33 @@ fn kbd_read_nonblock(buf, count) {
             var ch = scancode_to_ascii(sc);
             if (ch == 10) {                          # Enter: flush the accumulated line + LF
                 kputc(10);
+                # 1.44.21 HARDENING: clamp the flush to THIS call's validated buffer. nbline_buf +
+                # nbline_pos PERSIST across poll calls, but `buf` is range-checked only for THIS
+                # call's `count` (read#5: is_user_range(arg2, arg3)). A ring-3 caller can accumulate
+                # under a large count, then flush under a SMALLER count — copying nbline_pos+1 bytes
+                # would then write PAST [buf, buf+count) (an OOB write into the caller's AS, or a
+                # fatal kernel #PF under STAC on an unmapped/over-ceiling page). Clamp to count-1 (LF
+                # takes the last slot). count>=1 here (the count<=0 guard returns at fn entry).
+                # FOREGROUND agnsh polls with a fixed prompt count >= the line, so flush_n==nbline_pos
+                # and this is byte-identical; only a shrinking-count caller truncates (safe).
+                var flush_n = nbline_pos;
+                if (flush_n > count - 1) { flush_n = count - 1; }
                 var k = 0;
-                while (k < nbline_pos) { store8(buf + k, load8(&nbline_buf + k)); k = k + 1; }
-                store8(buf + nbline_pos, 10);
-                ret = nbline_pos + 1;
+                while (k < flush_n) { store8(buf + k, load8(&nbline_buf + k)); k = k + 1; }
+                store8(buf + flush_n, 10);
+                ret = flush_n + 1;
                 nbline_pos = 0;
                 draining = 0;
             } elif (ch == 4) {                       # Ctrl-D: canonical EOF (mirror kbd_read_blocking)
                 if (nbline_pos == 0) { ret = 0; }    # at line start -> EOF (return 0)
                 else {                                # mid-line -> deliver typed bytes, no LF
+                    # 1.44.21 HARDENING: clamp to THIS call's validated count (no LF on this path,
+                    # so the full count is available for data). Same cross-call rationale as Enter.
+                    var flush_n2 = nbline_pos;
+                    if (flush_n2 > count) { flush_n2 = count; }
                     var k2 = 0;
-                    while (k2 < nbline_pos) { store8(buf + k2, load8(&nbline_buf + k2)); k2 = k2 + 1; }
-                    ret = nbline_pos;
+                    while (k2 < flush_n2) { store8(buf + k2, load8(&nbline_buf + k2)); k2 = k2 + 1; }
+                    ret = flush_n2;
                     nbline_pos = 0;
                 }
                 draining = 0;
@@ -941,7 +956,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         store64(arg1 +  8, pmm_total * 4096);             # total RAM bytes (4 KB pages)
         store64(arg1 + 16, pmm_free_count() * 4096);      # free RAM bytes
         store64(arg1 + 24, proc_count);                   # proc-table high-water mark (1.44.x: ≥ live count — non-LIFO holes may make it over-report; cosmetic stat field, no control flow depends on it)
-        store64(arg1 + 32, cpu_count);                    # online CPUs (=1 until SMP enumerates)
+        # cpu_count = ENUMERATED CPUs (BSP + APs that checked in via smp_start_aps). 1.44.18+ the
+        # APs are woken then PARK (IF=0 hlt) — exactly ONE CPU (the BSP) ever schedules — so this
+        # OVER-reports usable parallelism (e.g. 4 with -smp 4). Cosmetic stat; no scheduler decision
+        # reads it. A separate "schedulable CPUs" lands with the SMP arc that actually unparks APs.
+        store64(arg1 + 32, cpu_count);                    # online (enumerated) CPUs
         stack_canary_check(canary);
         return 0;
     }
@@ -1367,16 +1386,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return ks_n;
     }
     if (num == 43) {
-        # spawn_path(path=arg1, len=arg2) — NON-BLOCKING from-disk spawn (1.44.x WIP).
-        # STATUS: written + compiles + zero production regression (dead code — no caller yet).
-        # Blocker (1) — the elf_load per-pid VA collision that SMAP-faulted on context switch
-        # at high pid counts — is FIXED (1.44.x page-table fix: code/stack de-striped to fixed
-        # 0x400000/0x3FC00000, validated by ring3-smoke's >=8-proc stress assert). So this
-        # primitive is now VALIDATABLE: drive it from a ring-3 parent against an ext2-seeded
-        # path with a NO-REAP selftest (avoid blocker (2) — proc_reap_child is still LIFO-only,
-        # proc.cyr:500, so out-of-order background-job exits need a non-LIFO reap first). The
-        # remaining work to wire it into agnsh `&` also needs the prompt-key-wait to drop
-        # preempt_disable so bg jobs aren't frozen at the prompt (the bite-2 owner decision).
+        # spawn_path(path=arg1, len=arg2) — NON-BLOCKING from-disk spawn.
+        # STATUS (1.44.22): LIVE PRODUCTION PATH — kybernet/agnsh drive it for `&` background jobs.
+        # Validated end-to-end at 1.44.13 (a ring-3 parent #43s a from-disk ELF + poll-waitpid#4s
+        # it to exit) and wired into agnsh `&` at 1.44.14-15 (agnsh-bg-test / agnsh-multijob-test
+        # PASS). Both original blockers are CLEARED: the elf_load per-pid VA collision that
+        # SMAP-faulted on context switch (de-striped to fixed 0x400000/0x3FC00000 at 1.44.11,
+        # ring3-smoke's >=8-proc stress assert) and the LIFO-only proc_reap_child (proc_alloc_slot's
+        # non-LIFO slot reuse at 1.44.12). The prompt poll drops preempt_disable via the non-blocking
+        # read (kbd_read_nonblock) so bg jobs aren't frozen at the prompt (1.44.13-14).
         #
         # The from-disk analog of spawn(#3): load a static ELF64 from the ext2 root (with
         # argv) + create a READY ring-3 proc the SCHEDULER picks up, returning its pid

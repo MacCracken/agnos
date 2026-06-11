@@ -5,6 +5,92 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.22] — 2026-06-11 (1.44.x arc-closing sweep — clarity/correctness, batch 2 of 2)
+
+Second of the two arc-closing cuts. **Comment-only — the production binary is byte-identical to
+1.44.21 except the version string** (verified: `cmp` of the pre/post-edit 1.44.21 build matches). No
+behavioral change; one iron burn of 1.44.22 validates both cuts. These correct stale/misleading
+in-source documentation surfaced by the arc audit (a future-agent footgun, two stale status notes).
+
+### Changed
+
+- **Corrected the `var X[N]` sizing CAUTION in `core/main.cyr`** (the audit's highest-value
+  doc fix). The `spawn_parent_payload` comment asserted a module-global `var X[N]` "reserves ~N bytes
+  (NOT N×u64)" — the **exact opposite** of the codebase-wide rule and a buffer-undersizing footgun (a
+  future agent could size a buffer 8× too small from it). Empirically settled under BOTH cyrius 6.0.56
+  and 6.1.34 (`&b - &a == 80` for `var a[10]`): the rule is **N×u64 = 8N bytes**. Comment now states
+  the correct rule + the empirical check; the working inline-child-ELF layout is unchanged.
+- **`#43 spawn_path` status comment (`core/syscall.cyr`)** updated from "dead code — no caller yet" to
+  reflect reality: it is a **live production path** (kybernet/agnsh drive it for `&` background jobs,
+  validated at 1.44.13 and wired at 1.44.14-15). Both originally-noted blockers (the VA collision; the
+  LIFO-only reap) are cleared.
+- **`sysinfo`#35 `cpu_count` comment (`core/syscall.cyr`)** corrected from "=1 until SMP enumerates" —
+  since 1.44.18 it enumerates all CPUs (4 with `-smp 4`) but the APs PARK, so exactly one (the BSP)
+  schedules. The field is now annotated as ENUMERATED (over-reports usable parallelism); a separate
+  "schedulable CPUs" is deferred to the SMP arc that unparks APs. (Value unchanged — no ABI churn in a
+  closing sweep.)
+
+### Notes
+
+- Binary byte-identical to 1.44.21 (build **1,193,424 B**) modulo the version banner. Closes the
+  1.44.x preemptive-scheduling / multi-threading arc. **Iron-burn pending on archaemenid** —
+  validates 1.44.21's `kbd_read_nonblock` OOB clamp + the APIC delivery-status timeout (the AP-wake's
+  flagged riskiest item) in one burn.
+- **Audit-deferred (documented, NOT fixed here):** waitpid#4 ownership gate (blocked on real
+  `proc_get_ppid` tracking — a stub today; the gate would break agnsh `&` reaping), MADT-based AP
+  enumeration, the triplicated-loader DRY-up, and the `sched_next` single-pass + context-switch
+  micro-opts — all rejected by the audit's adversarial pass as not worth perturbing
+  byte-identical-foreground / hot-path / single-core invariants for marginal gain.
+
+## [1.44.21] — 2026-06-11 (1.44.x arc-closing sweep — security + iron hardening, batch 1 of 2)
+
+First of two arc-closing hardening cuts (the refactor/clarity residue lands in 1.44.22). A
+multi-dimension audit of the whole 1.44.x preemptive-scheduling surface (`1.43.8..HEAD`) found the
+arc fundamentally solid — the ELF loader's untrusted-header pre-pass, the env-blob fault-proof copy,
+and the blit `w*scale ≤ 8192` gate all hold. It surfaced **one genuine ring-3-reachable security
+bug** and **one newly-live boot-hang risk**; both are fixed here. (Several proposed micro-opts and a
+loader DRY-up were *rejected* by the audit's own adversarial pass as not worth perturbing
+byte-identical-foreground / hot-path / single-core invariants in a closing sweep. The waitpid#4
+ownership gate is **deferred** — `proc_get_ppid` is a stub returning 0, so the gate would break
+agnsh `&` reaping; it needs real ppid tracking, a multi-parent-userland-arc feature.)
+
+### Fixed
+
+- **`kbd_read_nonblock` cross-call OOB flush (`core/syscall.cyr`) — ring-3-reachable OOB write / kernel
+  #PF DoS.** The non-blocking cooked-line read (read#5 with a4≠0, the schedulable-agnsh prompt poll)
+  accumulates typed bytes into the MODULE-GLOBAL `nbline_buf` (4096 B) across poll calls — `nbline_pos`
+  persists. But the line-flush copied `nbline_pos+1` bytes into the *current* call's user buffer,
+  bounded only by the per-char gate's CURRENT `count`; the flush itself was **unclamped**. A ring-3
+  caller could accumulate under a large `count` (no Enter → returns -3), then send Enter under a
+  *smaller* `count` whose `buf` was range-checked only for that smaller window — the flush then wrote
+  past `[buf, buf+count)` (an OOB write into the caller's address space, or a fatal kernel #PF under
+  STAC on an unmapped/over-ceiling page). The Enter and Ctrl-D mid-line paths had the identical
+  defect. **Fix:** clamp both flushes to the current call's validated `count` (Enter: `count-1` to
+  leave the LF slot; Ctrl-D: full `count`, no LF). Byte-identical for the foreground agnsh path (it
+  polls with a fixed prompt `count` ≥ the line, so the clamp never fires); only a shrinking-`count`
+  attacker truncates. (Surfaced independently by two audit dimensions; both adversarial lenses
+  confirmed real + production-reachable.) Validated: `nbread-smoke` 4/4, `agnsh-bg-test` PASS.
+
+### Hardened
+
+- **APIC INIT/SIPI delivery-status poll bounded (`arch/x86_64/apic.cyr`) — fail-safe AP wake.** The
+  ICR delivery-status (bit 12) waits in `apic_send_init`/`apic_send_sipi` were unbounded `while`
+  spins. They were **dead before 1.44.18**; the SMP-AP wake un-gated `smp_start_aps` (their only
+  caller), so they now run on every boot. A non-accepting target or a real-Zen INIT-SIPI timing quirk
+  would spin forever → **boot hang** (the next iron burn's flagged riskiest item). Now bounded by
+  `ICR_DELIVERY_WAIT` (1,000,000 MMIO-paced iterations): the status clears in ~µs on real cores so the
+  bound NEVER fires on success (byte-identical to the unbounded loop), but a stuck IPI now gives up and
+  moves on — a non-responding AP simply never checks in, harmless under the parked-AP design (which
+  already tolerates absent IDs). Validated: `smp-smoke` 3/3 (`-smp 4` → 4 CPUs online, parked, boot
+  continues).
+
+### Notes
+
+- Validated green: `nbread-smoke` 4/4 · `ring3-smoke` 8/8 · `agnsh-smoke` · `agnsh-bg-test` PASS ·
+  `smp-smoke` 3/3 · `check.sh` 11/11 · arc `sweep` 7/7. Production build **1,193,424 B** (+352 B vs
+  1.44.20's 1,193,072 B — the two clamp/bound additions). **Iron-burn pending on archaemenid** (paired
+  with the 1.44.22 cut).
+
 ## [1.44.20] — 2026-06-11 (1.44.x — kernel-scaled blit: a4[39:32] integer scale on #39)
 
 Carry-forward 2 of 3 (FB scaling). `blit`#39 gains an INTEGER SCALE in a4 bits [39:32] (0 or 1 =

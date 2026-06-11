@@ -2277,11 +2277,14 @@ fn ring3_elf_fill() {
 # .fail:
 #   mov  eax, 0 ; xor edi, edi ; syscall    ; exit(0)
 #   jmp  $
-# ONE array only. Under cyrius 6.0.56 a module-global `var X[N]` reserves ~N bytes
-# (NOT N×u64) — a separate spawn_child_elf[24] overlapped this buffer and clobbered it
-# (delta=32, not 192). So the child ELF is built INLINE at offset 256 of this same array.
-# Sized [4096] so the parent's used region [0,387) never reaches the next global and so
-# spawn_user_proc's 4096-byte memcpy stays in bounds.
+# ONE array only — the child ELF is built INLINE at offset 256 of this same array (an earlier
+# two-array layout with a separate spawn_child_elf clobbered this buffer; building inline
+# sidesteps any inter-global layout assumption). CAUTION: a module-global `var X[N]` reserves
+# N×u64 = 8N BYTES — the codebase-wide rule (CLAUDE.md), empirically confirmed on cyrius 6.0.56
+# AND 6.1.34 (`&b - &a == 80` for `var a[10]`). An earlier revision of THIS comment asserted the
+# opposite ("~N bytes, NOT N×u64") — that was WRONG; do not size a buffer from it (the original
+# two-array clobber had a different cause). So [4096] reserves 32 KB — ample for the parent's
+# used region [0,387) and for spawn_user_proc's 4096-byte memcpy.
 var spawn_parent_payload[4096];   # parent code @0, child ELF @256 (one 4 KB code page)
 var spawn_parent_pid = 0;
 fn spawn_parent_fill() {

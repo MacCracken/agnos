@@ -51,14 +51,28 @@ fn apic_timer_init(vector, count) {
     return 0;
 }
 
+# 1.44.21 HARDENING: bound the ICR delivery-status (bit 12) wait. The 1.44.18 AP-wake
+# un-gated smp_start_aps — the ONLY caller of these two fns — so this poll now runs on
+# EVERY boot (it was dead before). On real Zen the status clears in ~µs (≈tens of
+# iterations), so the bound NEVER fires on success → byte-identical to the unbounded
+# loop. But a non-accepting target / firmware quirk would otherwise SPIN FOREVER and
+# hang the boot (the next burn's flagged riskiest item: real-Zen INIT-SIPI timing). The
+# bound makes it fail-SAFE: give up and move on — a non-responding AP simply never checks
+# in (harmless under the parked-AP design; smp_start_aps already tolerates absent IDs).
+# ICR_DELIVERY_WAIT: ~µs success exit; the cap is a generous failure backstop (MMIO-read-
+# paced, ~hundreds of ms worst case per stuck IPI), not a calibrated delay.
+var ICR_DELIVERY_WAIT = 1000000;
+
 fn apic_send_init(target) {
     apic_write(0x310, target << 24);
     # INIT: delivery=5, level=assert, trigger=level
     apic_write(0x300, 0x00C500);
-    while ((apic_read(0x300) & 0x1000) != 0) { }
+    var w0 = 0;
+    while ((apic_read(0x300) & 0x1000) != 0) { if (w0 >= ICR_DELIVERY_WAIT) { break; } w0 = w0 + 1; }
     # Deassert
     apic_write(0x300, 0x008500);
-    while ((apic_read(0x300) & 0x1000) != 0) { }
+    var w1 = 0;
+    while ((apic_read(0x300) & 0x1000) != 0) { if (w1 >= ICR_DELIVERY_WAIT) { break; } w1 = w1 + 1; }
     return 0;
 }
 
@@ -66,6 +80,7 @@ fn apic_send_sipi(target, vector) {
     apic_write(0x310, target << 24);
     # SIPI: delivery=6, vector = page number (e.g., 0x08 -> AP starts at 0x8000)
     apic_write(0x300, 0x000600 | vector);
-    while ((apic_read(0x300) & 0x1000) != 0) { }
+    var w2 = 0;
+    while ((apic_read(0x300) & 0x1000) != 0) { if (w2 >= ICR_DELIVERY_WAIT) { break; } w2 = w2 + 1; }
     return 0;
 }
