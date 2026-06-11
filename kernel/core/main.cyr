@@ -1284,31 +1284,36 @@ fn exec_disk_selftest() {
     store8(eb + 68, 5);                                            # p_flags = R+X
     store8(eb + 82, 0x40);                                         # p_vaddr  = 0x400000
     store8(eb + 90, 0x40);                                         # p_paddr  = 0x400000
-    store8(eb + 96, 182);                                          # p_filesz = 182
-    store8(eb + 104, 182);                                         # p_memsz  = 182
+    store8(eb + 96, 184);                                          # p_filesz = 184 (msg moved +2 for the #43 spin)
+    store8(eb + 104, 184);                                         # p_memsz  = 184
     store8(eb + 113, 0x10);                                        # p_align  = 0x1000
     # Code @120 (zeros between the 4 stored opcode bytes complete each imm32)
     var c = 120;
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC0); store8(eb + c + 3, 0x01); c = c + 7;  # mov rax,1 (write)
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC7); store8(eb + c + 3, 0x01); c = c + 7;  # mov rdi,1 (fd)
-    store8(eb + c, 0x48); store8(eb + c + 1, 0xBE); store8(eb + c + 2, 0xA9); store8(eb + c + 4, 0x40); c = c + 10; # movabs rsi,0x4000A9 (msg)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xBE); store8(eb + c + 2, 0xAB); store8(eb + c + 4, 0x40); c = c + 10; # movabs rsi,0x4000AB (msg @171)
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC2); store8(eb + c + 3, 0x0D); c = c + 7;  # mov rdx,13 (len)
     store8(eb + c, 0x0F); store8(eb + c + 1, 0x05); c = c + 2;                                                     # syscall
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC0); store8(eb + c + 3, 0x00); c = c + 7;  # mov rax,0 (exit)
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC7); store8(eb + c + 3, 0x2A); c = c + 7;  # mov rdi,42 (code)
     store8(eb + c, 0x0F); store8(eb + c + 1, 0x05);                                                                # syscall
-    # Message @169: "EXEC-DISK-OK\n"
-    store8(eb + 169, 69); store8(eb + 170, 88); store8(eb + 171, 69); store8(eb + 172, 67);   # EXEC
-    store8(eb + 173, 45);                                                                      # -
-    store8(eb + 174, 68); store8(eb + 175, 73); store8(eb + 176, 83); store8(eb + 177, 75);   # DISK
-    store8(eb + 178, 45);                                                                      # -
-    store8(eb + 179, 79); store8(eb + 180, 75); store8(eb + 181, 10);                          # OK\n
+    # 1.44.x: jmp $ spin @169 (right after the exit syscall). Harmless under execwait (#37):
+    # exit→kernel_resume never returns to ring 3, so the spin is never reached. REQUIRED under
+    # spawn_path (#43, scheduled): there exit RETURNS to ring 3 (RIP=0x4000A9=offset 169), so
+    # without this the proc would run the message bytes as code + never reach state 0.
+    store8(eb + 169, 0xEB); store8(eb + 170, 0xFE);                                            # jmp -2 (spin)
+    # Message @171: "EXEC-DISK-OK\n" (moved +2 to make room for the spin; movabs rsi=0x4000AB)
+    store8(eb + 171, 69); store8(eb + 172, 88); store8(eb + 173, 69); store8(eb + 174, 67);   # EXEC
+    store8(eb + 175, 45);                                                                      # -
+    store8(eb + 176, 68); store8(eb + 177, 73); store8(eb + 178, 83); store8(eb + 179, 75);   # DISK
+    store8(eb + 180, 45);                                                                      # -
+    store8(eb + 181, 79); store8(eb + 182, 75); store8(eb + 183, 10);                          # OK\n
     # Write the ELF to a SUBDIRECTORY (/bin/prog2) + a non-ELF (/notelf).
     ext2_mkdir(2, "bin", 3);
     var bino = ext2_path_lookup("/bin", 4);
     var p2 = 0;
     if (bino > 0) { p2 = ext2_create(bino, "prog2", 5); }
-    if (p2 > 0) { ext2_write_at(p2, 0, eb, 182); }
+    if (p2 > 0) { ext2_write_at(p2, 0, eb, 184); }
     # non-ELF: 100 bytes from eb+100 (inside the ELF/zero region; byte0 != 0x7F).
     var nino = ext2_create(2, "notelf", 6);
     if (nino > 0) { ext2_write_at(nino, 0, eb + 100, 100); }
@@ -1753,6 +1758,58 @@ fn fs_syscall_selftest() {
     return 0;
 }
 fs_syscall_selftest();
+#endif
+
+# 1.44.x — NON-BLOCKING cooked-line read self-test (compile-gated, NBREAD_SELFTEST=1).
+# Validates kbd_read_nonblock's poll semantics WITHOUT a real keyboard by injecting
+# scancodes straight into kb_buf (the same ring kb_isr/hid_poll fill): (1) no input ->
+# -2/WOULD_BLOCK (NOT 0 = EOF); (2) partial 'h''i' with no Enter -> still -2 + the
+# accumulator holds 2; (3) Enter -> returns the 3-byte line "hi\n" + the accumulator
+# resets. Proves the WOULD_BLOCK sentinel, cross-call accumulation, and the Enter flush —
+# the kernel half schedulable agnsh polls. Needs no ext2 (pure in-kernel injection).
+#ifdef NBREAD_SELFTEST
+fn nbread_inject(sc) {
+    store8(&kb_buf + kb_head, sc);          # push one scancode (mirror kb_isr's append)
+    kb_head = (kb_head + 1) & 0xFF;
+    return 0;
+}
+fn nbread_selftest() {
+    var u = pmm_alloc_2mb();
+    if (u == 0)       { kprintln("nbread: no scratch FAIL", 23); return 0 - 1; }
+    if (u < 0x200000) { kprintln("nbread: scratch low FAIL", 24); return 0 - 1; }
+    nbline_pos = 0;
+    kb_head = 0; kb_tail = 0;                # deterministic empty ring
+    var ok = 1;
+    # (1) nothing buffered -> WOULD_BLOCK (-2), distinct from Ctrl-D EOF (0).
+    var r1 = kbd_read_nonblock(u, 256);
+    if (r1 == 0 - 2) { kprintln("nbread: no-input WOULD_BLOCK OK", 31); }
+    else { kprintln("nbread: FAIL no-input", 21); ok = 0; }
+    # (2) inject 'h'(sc 0x23) 'i'(sc 0x17), NO Enter -> still -2, accumulator holds 2.
+    nbread_inject(0x23);
+    nbread_inject(0x17);
+    var r2 = kbd_read_nonblock(u, 256);
+    if (r2 == 0 - 2) {
+        if (nbline_pos == 2) { kprintln("nbread: partial accumulate OK", 29); }
+        else { kprintln("nbread: FAIL partial pos", 24); ok = 0; }
+    } else { kprintln("nbread: FAIL partial ret", 24); ok = 0; }
+    # (3) inject Enter(sc 0x1C) -> returns 3, buf = "hi\n" (104,105,10), accumulator resets.
+    nbread_inject(0x1C);
+    var r3 = kbd_read_nonblock(u, 256);
+    if (r3 == 3) {
+        if (load8(u) == 104) {
+            if (load8(u + 1) == 105) {
+                if (load8(u + 2) == 10) {
+                    if (nbline_pos == 0) { kprintln("nbread: enter line OK", 21); }
+                    else { kprintln("nbread: FAIL pos reset", 22); ok = 0; }
+                } else { kprintln("nbread: FAIL no LF", 18); ok = 0; }
+            } else { kprintln("nbread: FAIL byte1", 18); ok = 0; }
+        } else { kprintln("nbread: FAIL byte0", 18); ok = 0; }
+    } else { kprintln("nbread: FAIL enter ret", 22); ok = 0; }
+    pmm_free_2mb(u);
+    if (ok == 1) { kprintln("nbread: ALL PASS", 16); } else { kprintln("nbread: FAIL", 12); }
+    return 0;
+}
+nbread_selftest();
 #endif
 
 # 1.41.6 — syscall-ingress HARDENING self-test (compile-gated,
@@ -2229,6 +2286,97 @@ fn spawn_parent_fill() {
     store8(&spawn_parent_payload + 386, 0xFE);
     return 0;
 }
+# 1.44.x schedulable-agnsh — validate spawn_path(#43) end-to-end. The from-disk analog of
+# the spawn_parent (#3) proof above: a ring-3 PARENT issues spawn_path(#43) on an ext2 path
+# ("/bin/prog2", seeded by exec_disk_selftest), poll-waitpid(#4)s the returned pid, and EXITs
+# with the child's exit code (prog2 = 42) — proving #43 made a READY ring-3 proc the scheduler
+# picked up AND the parent reaped it via the non-blocking #4 (the exact pair agnsh `&` will use).
+# This is what agnsh `&` does in kernel form; agnsh must NOT be the thing that first proves #43.
+# Identical structure to spawn_parent_fill EXCEPT: mov eax,43 (not 3); arg2=10 (path len); the
+# lea target is an inline cstring "/bin/prog2" (not a child ELF); exit propagates rax (child
+# code) so a green assert is the literal 42 round-tripped through #43+#4. Runs ONLY when
+# ext2_active (the exec-smoke disk profile) — no-op under the ring3-smoke VirtIO profile.
+var spawn_path_parent_payload[4096];   # parent code @0, "/bin/prog2" cstring @256
+var spawn_path_parent_pid = 0;
+fn spawn_path_parent_fill() {
+    memset(&spawn_path_parent_payload, 0, 4096);
+    # store ONLY non-zero bytes, ONE store8 per line (multi-store8-per-line parser-drop caveat).
+    # lea rdi, [rip+0xF9]  (cstring @256; disp = 256-7 = 249 = 0xF9 — same as spawn_parent's lea)
+    store8(&spawn_path_parent_payload + 0, 0x48);
+    store8(&spawn_path_parent_payload + 1, 0x8D);
+    store8(&spawn_path_parent_payload + 2, 0x3D);
+    store8(&spawn_path_parent_payload + 3, 0xF9);
+    # mov esi, 10  (path length of "/bin/prog2")
+    store8(&spawn_path_parent_payload + 7, 0xBE);
+    store8(&spawn_path_parent_payload + 8, 0x0A);
+    # mov eax, 43 (spawn_path)
+    store8(&spawn_path_parent_payload + 12, 0xB8);
+    store8(&spawn_path_parent_payload + 13, 0x2B);
+    # syscall
+    store8(&spawn_path_parent_payload + 17, 0x0F);
+    store8(&spawn_path_parent_payload + 18, 0x05);
+    # mov rbx, rax (save child pid; survives waitpid syscalls)
+    store8(&spawn_path_parent_payload + 19, 0x48);
+    store8(&spawn_path_parent_payload + 20, 0x89);
+    store8(&spawn_path_parent_payload + 21, 0xC3);
+    # test ebx, ebx  (spawn failed if negative)
+    store8(&spawn_path_parent_payload + 22, 0x85);
+    store8(&spawn_path_parent_payload + 23, 0xDB);
+    # js .fail (rel +0x1A -> off 52)
+    store8(&spawn_path_parent_payload + 24, 0x78);
+    store8(&spawn_path_parent_payload + 25, 0x1A);
+    # .poll @ off 26: mov eax, 4 (waitpid)
+    store8(&spawn_path_parent_payload + 26, 0xB8);
+    store8(&spawn_path_parent_payload + 27, 0x04);
+    # mov rdi, rbx
+    store8(&spawn_path_parent_payload + 31, 0x48);
+    store8(&spawn_path_parent_payload + 32, 0x89);
+    store8(&spawn_path_parent_payload + 33, 0xDF);
+    # syscall
+    store8(&spawn_path_parent_payload + 34, 0x0F);
+    store8(&spawn_path_parent_payload + 35, 0x05);
+    # cmp eax, -2  (WOULD_BLOCK while child alive)
+    store8(&spawn_path_parent_payload + 36, 0x83);
+    store8(&spawn_path_parent_payload + 37, 0xF8);
+    store8(&spawn_path_parent_payload + 38, 0xFE);
+    # je .poll (rel -15 = 0xF1 -> off 26)
+    store8(&spawn_path_parent_payload + 39, 0x74);
+    store8(&spawn_path_parent_payload + 40, 0xF1);
+    # child exited: mov edi, eax (propagate the child's exit code = prog2's 42)
+    store8(&spawn_path_parent_payload + 41, 0x89);
+    store8(&spawn_path_parent_payload + 42, 0xC7);
+    # mov eax, 0 (exit)
+    store8(&spawn_path_parent_payload + 43, 0xB8);
+    # syscall (exit child-code)
+    store8(&spawn_path_parent_payload + 48, 0x0F);
+    store8(&spawn_path_parent_payload + 49, 0x05);
+    # jmp -2 (spin until descheduled)
+    store8(&spawn_path_parent_payload + 50, 0xEB);
+    store8(&spawn_path_parent_payload + 51, 0xFE);
+    # .fail @ off 52: mov eax, 0 (exit)
+    store8(&spawn_path_parent_payload + 52, 0xB8);
+    # mov edi, 1 (failure exit code — distinguishes a #43 spawn-fail from a real child code)
+    store8(&spawn_path_parent_payload + 57, 0xBF);
+    store8(&spawn_path_parent_payload + 58, 0x01);
+    # syscall (exit 1)
+    store8(&spawn_path_parent_payload + 62, 0x0F);
+    store8(&spawn_path_parent_payload + 63, 0x05);
+    # jmp -2 (spin)
+    store8(&spawn_path_parent_payload + 64, 0xEB);
+    store8(&spawn_path_parent_payload + 65, 0xFE);
+    # cstring "/bin/prog2" @256 (the lea target; len 10, no NUL needed — #43 is length-based)
+    store8(&spawn_path_parent_payload + 256, 0x2F);   # '/'
+    store8(&spawn_path_parent_payload + 257, 0x62);   # 'b'
+    store8(&spawn_path_parent_payload + 258, 0x69);   # 'i'
+    store8(&spawn_path_parent_payload + 259, 0x6E);   # 'n'
+    store8(&spawn_path_parent_payload + 260, 0x2F);   # '/'
+    store8(&spawn_path_parent_payload + 261, 0x70);   # 'p'
+    store8(&spawn_path_parent_payload + 262, 0x72);   # 'r'
+    store8(&spawn_path_parent_payload + 263, 0x6F);   # 'o'
+    store8(&spawn_path_parent_payload + 264, 0x67);   # 'g'
+    store8(&spawn_path_parent_payload + 265, 0x32);   # '2'
+    return 0;
+}
 # Spawn one ring-3 proc and map its 0x2000000 onto `counter_phys`. -1 on fail.
 fn ring3_spawn_one(counter_phys) {
     var pid = spawn_user_proc(&ring3_payload);       # per-proc CR3 + user code/stack, state=ready
@@ -2363,6 +2511,15 @@ fn ring3_selftest_setup() {
         if (ring3_spawn_idle() >= 0) { ring3_stress_count = ring3_stress_count + 1; }
         ski = ski + 1;
     }
+    # 1.44.x: spawn_path(#43) validator — ONLY under the exec-smoke disk profile (ext2_active),
+    # where exec_disk_selftest has already seeded /bin/prog2. Spawned LAST so the stress procs
+    # keep their contiguous slots; its from-disk child + P's child reap out-of-order, exercising
+    # the 1.44.12 non-LIFO reclaim. No-op under the ring3-smoke VirtIO profile (ext2_active==0).
+    if (ext2_active != 0) {
+        spawn_path_parent_fill();
+        spawn_path_parent_pid = spawn_user_proc(&spawn_path_parent_payload);
+        if (spawn_path_parent_pid >= 0) { proc_set_ring3(spawn_path_parent_pid); }
+    }
     return 0;
 }
 fn ring3_selftest_verify() {
@@ -2373,8 +2530,18 @@ fn ring3_selftest_verify() {
     # than the B-only era (400) because four procs now share the round-robin.
     var i = 0;
     while (i < 3000) {
+        var bp_done = 0;
         if (proc_get_state(ring3_pid_b) == 0) {
-            if (proc_get_state(spawn_parent_pid) == 0) { i = 3000; }   # both done — stop early
+            if (proc_get_state(spawn_parent_pid) == 0) { bp_done = 1; }
+        }
+        # spawn_path_parent (#43 validator) loads prog2 from DISK — slower than B/P's in-memory
+        # spawn — so the early-exit must wait for it too (else verify reads a still-running SP).
+        var sp_done = 1;
+        if (spawn_path_parent_pid > 0) {
+            if (proc_get_state(spawn_path_parent_pid) != 0) { sp_done = 0; }
+        }
+        if (bp_done == 1) {
+            if (sp_done == 1) { i = 3000; }                # all done — stop early
             else { arch_wait(); i = i + 1; }
         } else { arch_wait(); i = i + 1; }
     }
@@ -2399,6 +2566,16 @@ fn ring3_selftest_verify() {
     var pstate = proc_get_state(spawn_parent_pid);
     kprint("ring3: Pcode=", 13); kprint_num(pcode); kprint(" Pst=", 5); kprint_num(pstate); kprintln("", 0);
     if (pcode == 0xABCD) { kprintln("ring3: parent spawn+wait OK", 27); } else { kprintln("ring3: FAIL parent spawn", 24); }
+    # spawn_path(#43) end-to-end: the ring-3 SP-parent issued spawn_path(#43) on "/bin/prog2"
+    # (from DISK, non-blocking), poll-waitpid(#4)ed it, and exited with prog2's code (42). 42
+    # proves #43 made a READY ring-3 proc the scheduler ran AND #4 reaped its real exit code —
+    # the exact non-blocking spawn+reap agnsh `&` uses. Only present under the ext2 disk profile.
+    if (spawn_path_parent_pid > 0) {
+        var spcode = proc_get_exit_code(spawn_path_parent_pid);
+        var spstate = proc_get_state(spawn_path_parent_pid);
+        kprint("ring3: SPcode=", 14); kprint_num(spcode); kprint(" SPst=", 6); kprint_num(spstate); kprintln("", 0);
+        if (spcode == 42) { kprintln("ring3: spawnpath OK", 19); } else { kprintln("ring3: FAIL spawnpath", 21); }
+    }
     # STRESS / page-table-fix proof: every extra proc (pids pushed into PD[8..63]) is still
     # ALIVE (state 1) after the scheduler round-robined to it many times. Reaching this print
     # AT ALL means no context switch SMAP-faulted (pre-fix the machine triple-faults here and

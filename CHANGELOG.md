@@ -5,6 +5,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.13] — 2026-06-10 (1.44.x — schedulable agnsh: both KERNEL halves)
+
+The two kernel primitives the agnsh `&` background-job wiring needs, both validated. (The agnsh
+consumer + the end-to-end `sendkey` test land separately as agnoshi 1.6.0.) Prompt-preempt is
+**Option B** (agnsh polls in ring 3; a yielding blocking read needs per-proc kstacks — deferred).
+
+### Added
+
+- **`spawn_path`(#43) validated end-to-end** (`core/main.cyr` + `scripts/exec-smoke.sh`). #43 (the
+  non-blocking from-disk spawn, staged dead-code since 1.44.11) gets its first driver: a `RING3_SELFTEST`
+  ring-3 PARENT issues `spawn_path`(#43) on `/bin/prog2` (from disk), poll-`waitpid`(#4)s it, and exits
+  with prog2's code (42) — the exact non-blocking spawn+reap agnsh `&` will use. Run under the exec-smoke
+  disk profile (`EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 RING3_SELFTEST=1`); asserts `ring3: spawnpath OK`
+  (`SPcode=42`) + `EXEC-DISK-OK` ×2 (prog2 ran in ring 3 both foreground and via #43). No-op under the
+  ring3-smoke VirtIO profile (`ext2_active==0`).
+- **Non-blocking cooked-line read** (`core/syscall.cyr` `kbd_read_nonblock` + `boot_data.cyr`
+  `nbline_buf`/`nbline_pos` + `scripts/nbread-smoke.sh`). `read(fd=0)` with `a4=r10`(`ksyscall_a4`)≠0
+  selects it: drains whatever is in `kb_buf` (cook + echo + line-edit into a kernel partial-line
+  accumulator that persists across calls) and returns the line length on Enter or **-2/WOULD_BLOCK**
+  (distinct from Ctrl-D EOF=0) when no full line is ready — so agnsh can poll stdin without freezing bg
+  jobs at the prompt. The preempt-disable window is **short** (drain-what's-there, never spin) so bg procs
+  time-slice in the ring-3 gap between polls. `a4==0` keeps the efficient blocking read (the default).
+  `NBREAD_SELFTEST` injects scancodes straight into `kb_buf` and asserts no-input→-2, partial→-2+accumulate,
+  Enter→`"hi\n"` flush+reset (`nbread: ALL PASS`).
+
+### Fixed
+
+- **prog2 made scheduled-safe** (`core/main.cyr`, `EXEC_SELFTEST`). It was execwait-only (`write; exit`
+  with the message bytes immediately after the exit syscall). Under #43 (scheduled), `exit` RETURNS to
+  ring 3 → RIP landed on the message → prog2 ran it as garbage code + never reached state 0 (the parent's
+  waitpid spun forever). Added a `jmp $` spin right after the exit (offset 169) + shifted the message +2
+  (`movabs rsi`=0x4000AB, `p_filesz`/`p_memsz`/write-len → 184). Harmless to execwait (exit→resume never
+  reaches the spin); the `run /bin/prog2` exit-42 + EXEC-DISK-OK asserts stay green.
+
+### Notes
+
+- Validated: `exec-smoke` **16/16** (incl. the 2 new #43 asserts) · `ring3-smoke` **7/7** · `nbread-smoke`
+  **4/4** · `agnsh-smoke` PASS (blocking read#5 unaffected) · `sweep` 7/7 · `check.sh` 11/11. Production
+  1,147,200 B (`kbd_read_nonblock` + the dispatch ship; the selftests are compile-gated). **Remaining for
+  the user-visible feature (agnoshi 1.6.0):** trailing-`&` parse + a bg-job table + `sh_run_program_bg`
+  (launch via #43) + `read_line` poll mode (non-blocking read interleaved with `waitpid`#4, reaping +
+  `[n] Done`), then an e2e QEMU `sendkey` test. Iron rides the next burn.
+
 ## [1.44.12] — 2026-06-10 (1.44.x — non-LIFO proc-table-slot reclaim: out-of-order background-job exits)
 
 The next "schedulable agnsh" blocker, cleared: an out-of-order background-job exit reaped a NON-TOP

@@ -281,6 +281,67 @@ fn kbd_read_blocking(buf, count) {
     return n;
 }
 
+# 1.44.x — NON-BLOCKING cooked-line stdin read for schedulable agnsh (Option B). The blocking
+# read above busy-spins `while kb_has_key()==0` holding preempt_disable for the WHOLE line — so a
+# background job CANNOT run while agnsh waits at the prompt. This variant instead DRAINS whatever
+# is already in kb_buf (cook + echo + line-edit into the nbline_buf accumulator), and returns:
+#   - the line length (incl. the trailing LF) when Enter completes a line, OR
+#   - -2 (WOULD_BLOCK) when no complete line is ready yet — DISTINCT from Ctrl-D EOF (0).
+# agnsh polls this between bg-job waitpid(#4) polls; bg jobs time-slice in the preemptible RING-3
+# gap between agnsh's polls. CRITICAL: the preempt_disable window is SHORT (drain-what's-there,
+# NEVER spin) and released before every return, so the scheduler can run bg procs between calls.
+fn kbd_read_nonblock(buf, count) {
+    if (count <= 0) { return 0; }
+    preempt_disable();             # SHORT window — drain only, never spin (see header).
+    kbd_irq_enable();              # IF=1 so IRQ1 -> kb_isr (iron) / hid_poll (QEMU) can fill kb_buf.
+    if (nbline_pos == 0) { kb_shift = 0; kb_ctrl = 0; }   # clean modifiers ONLY at a fresh line
+    # (never mid-line — a shift HELD across a poll boundary must survive into the next drain).
+    var ret = 0 - 2;               # default WOULD_BLOCK — NOT 0 (0 is reserved for Ctrl-D EOF).
+    var draining = 1;
+    while (draining == 1) {
+        if (kb_has_key() == 0) { draining = 0; }    # nothing buffered -> stop (do NOT spin)
+        else {
+            var sc = kb_read_scancode();
+            var ch = scancode_to_ascii(sc);
+            if (ch == 10) {                          # Enter: flush the accumulated line + LF
+                kputc(10);
+                var k = 0;
+                while (k < nbline_pos) { store8(buf + k, load8(&nbline_buf + k)); k = k + 1; }
+                store8(buf + nbline_pos, 10);
+                ret = nbline_pos + 1;
+                nbline_pos = 0;
+                draining = 0;
+            } elif (ch == 4) {                       # Ctrl-D: canonical EOF (mirror kbd_read_blocking)
+                if (nbline_pos == 0) { ret = 0; }    # at line start -> EOF (return 0)
+                else {                                # mid-line -> deliver typed bytes, no LF
+                    var k2 = 0;
+                    while (k2 < nbline_pos) { store8(buf + k2, load8(&nbline_buf + k2)); k2 = k2 + 1; }
+                    ret = nbline_pos;
+                    nbline_pos = 0;
+                }
+                draining = 0;
+            } elif (ch == 8) {                       # Backspace: drop one accumulated byte + erase cell
+                if (nbline_pos > 0) {
+                    nbline_pos = nbline_pos - 1;
+                    kputc(8); kputc(32); kputc(8);
+                }
+            } elif (ch > 31) {                       # Printable: accumulate + echo (cap: leave room for LF)
+                if (nbline_pos + 1 < count) {
+                    if (nbline_pos < 4095) {         # nbline_buf capacity (512 u64 = 4096 B)
+                        store8(&nbline_buf + nbline_pos, ch);
+                        nbline_pos = nbline_pos + 1;
+                        kputc(ch);
+                    }
+                }
+            }
+            # ch == 0 (modifier/release) or other control: consumed in-window, never stored.
+        }
+    }
+    kbd_irq_disable();
+    preempt_enable();
+    return ret;
+}
+
 # System hostname — read-only identity for uname(34).nodename. Seeded to
 # "agnos"; no sethostname syscall yet (added only when a native workload needs a
 # mutable hostname — kernel grows per workload, not by Linux default). A gvar
@@ -409,9 +470,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 > 0) {
             if (is_user_range(arg2, arg3) == 0) { return 0 - 1; }
         }
-        # 1.41.1: fd 0 = blocking keyboard stdin (RAW), the dispositive new
-        # capability for the userland shell. Other fds keep the vfs_read path.
-        if (arg1 == 0) { return kbd_read_blocking(arg2, arg3); }
+        # 1.41.1: fd 0 = line-disciplined keyboard stdin. Other fds keep the vfs_read path.
+        # 1.44.x: a4=r10 (ksyscall_a4) != 0 selects the NON-BLOCKING cooked-line read — returns
+        # -2/WOULD_BLOCK until a full line, so schedulable agnsh can poll stdin without freezing
+        # background jobs at the prompt. a4==0 keeps the efficient blocking read (the default,
+        # used when agnsh has no live bg jobs). The syscall entry stub resets ksyscall_a4 per
+        # ring-3 entry (syscall_hw.cyr), so a stale a4 can't mis-route a later blocking read.
+        if (arg1 == 0) {
+            if (ksyscall_a4 != 0) { return kbd_read_nonblock(arg2, arg3); }
+            return kbd_read_blocking(arg2, arg3);
+        }
         return vfs_read(arg1, arg2, arg3);
     }
     if (num == 6) { return vfs_close(arg1); }

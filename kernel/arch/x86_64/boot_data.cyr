@@ -34,3 +34,10 @@ var kb_isr[96];    # keyboard ISR machine code (~83 bytes)
 var kb_buf[256];
 var kb_head = 0;
 var kb_tail = 0;
+# 1.44.x non-blocking cooked-line read (kbd_read_nonblock): a kernel partial-line accumulator
+# that persists ACROSS poll calls — each call drains what's in kb_buf (cook+echo into here) and
+# returns -2/WOULD_BLOCK until Enter completes a line. [512] = 4096 B (8N), covers agnsh's 4095
+# read. Single-reader-only (single-core invariant, [[project_multithreading_future_arc]]): a
+# second concurrent reader would interleave into this one accumulator — the SMP arc must unwind.
+var nbline_buf[512];
+var nbline_pos = 0;

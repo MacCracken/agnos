@@ -206,6 +206,27 @@ else
     echo "  FAIL: no 'exec: selftest done' (exec_and_wait did not return cleanly)"; rc=1
 fi
 
+# 1.44.x spawn_path(#43) end-to-end — ONLY when the kernel was ALSO built with RING3_SELFTEST
+# (EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1 RING3_SELFTEST=1 ./scripts/build.sh). The RING3 setup's
+# spawn_path_parent issues #43 on /bin/prog2 (from disk, non-blocking), poll-waitpid(#4)s it,
+# and exits with prog2's code (42) — the exact spawn+reap agnsh `&` will use. The default
+# EXEC-only build lacks the "ring3: spawnpath OK" string, so this whole block is skipped there.
+if strings "$AGNOS" | grep -q "ring3: spawnpath OK"; then
+    if strings "$LOG" | grep -q "ring3: spawnpath OK"; then
+        echo "  PASS: spawn_path #43 — ring-3 parent launched /bin/prog2 non-blocking + poll-waitpid#4 reaped its exit 42 (entirely from ring 3)"
+    else
+        echo "  FAIL: no 'ring3: spawnpath OK' (#43 from-disk spawn or the #4 poll-reap failed — see SPcode= line)"; rc=1
+    fi
+    # Corroborate the #43 child actually RAN in ring 3: prog2's write(1) "EXEC-DISK-OK" must
+    # now appear TWICE (once from the foreground `run /bin/prog2`, once from the #43 spawn).
+    EXEC_OK_N=$(strings "$LOG" | grep -c "^EXEC-DISK-OK")
+    if [ "$EXEC_OK_N" -ge 2 ]; then
+        echo "  PASS: the #43-spawned /bin/prog2 ran in ring 3 — EXEC-DISK-OK appeared $EXEC_OK_N times (foreground + #43)"
+    else
+        echo "  FAIL: EXEC-DISK-OK count $EXEC_OK_N < 2 (the #43-spawned prog2's write(1) never reached the console)"; rc=1
+    fi
+fi
+
 # Post-boot fsck: the writes (/bin/prog2 + /notelf) must leave the FS clean.
 dd if="$IMG" bs=1M skip=33 count=67 of="$WORK/part-post.img" status=none
 if e2fsck -fn "$WORK/part-post.img" > "$LOGS/fsck.log" 2>&1; then
