@@ -1,6 +1,8 @@
 #!/bin/bash
-# burn-prep.sh — one command to get archaemenid-ready for the combined
-# 1.39.x VFS + 1.40.x exec iron burn. It:
+# burn-prep.sh — one command to stage the CURRENT kernel for an archaemenid
+# iron burn (version-agnostic; the live burn target is whatever's open in
+# state.md + the iron-nuc-zen-log tracker — currently the 1.44.x preemptive-
+# scheduling arc, SMP-AP wake the riskiest item). It:
 #   1. runs the full arc sweep (scripts/sweep.sh) — ALL gates must be green;
 #      a red sweep aborts the prep (don't burn a broken tree);
 #   2. builds build/agnos — the artifact you flash. DEFAULT is a BARE production
@@ -23,7 +25,7 @@ ROOT="$(pwd)"
 set -u
 
 echo ""
-echo "=== AGNOS burn-prep — 1.39.x VFS + 1.40.x exec iron burn ==="
+echo "=== AGNOS burn-prep — stage the current kernel for an archaemenid iron burn ==="
 echo ""
 
 # --- 1. Sweep gate -----------------------------------------------------------
@@ -68,25 +70,24 @@ echo ""
 
 # --- Flash + watch instructions ---------------------------------------------
 echo "=========================================="
-echo "  IRON KERNEL READY — track A (exec-from-disk)"
+echo "  IRON KERNEL READY — bare production AGNOS"
 echo "=========================================="
 echo ""
 echo "  Flash (from agnosticos):  sh scripts/install-usb.sh --update"
 echo "    (--update is ESP-only — the agnos-fs partition survives, per"
-echo "     [[feedback_prefer_mount_modify_over_reflash]])"
+echo "     feedback_prefer_mount_modify_over_reflash)"
 echo ""
-echo "  On boot, watch the FB console for (track A):"
-echo "    exec: running /notelf        -> run: not an executable   (ENOEXEC)"
-echo "    exec: running /bin/prog2     -> EXEC-DISK-OK / run: exit 42"
-echo "    exec: running /bin/argv Z    -> run: exit 90              (argv[1] deref)"
-echo "    exec: selftest done"
-echo "  Dispositive bar: EXEC-DISK-OK + run: exit 42 on real Zen."
-echo "  (2 real execs/boot — a 3rd exhausts the 2 MB-page pool; teardown is a follow-on.)"
+echo "  The live burn rubric (hypothesis + falsification + watch-steps) lives in the"
+echo "  OPEN cycle's tracker — read it before flashing, NOT a hardcoded list here (it"
+echo "  would rot, per feedback_script_preambles_are_forward_looking). Source of truth:"
+echo "    agnosticos/docs/development/iron-nuc-zen-log.md  (newest #tracker-*-cycle)"
 echo ""
-echo "  Track B (FAT/exFAT verbs) — SEPARATE flashes, non-ESP USB data stick:"
-echo "    FATFS_WRITE_SELFTEST=1 sh scripts/build.sh   # FAT32 stick"
-echo "    EXFAT_WRITE_SELFTEST=1 sh scripts/build.sh   # exFAT stick"
-echo ""
-echo "  Full checklist: agnosticos/docs/development/exec-iron-manual-tests.md"
+echo "  Current open cycle (1.44.x preemptive-scheduling) — watch the FB console for:"
+echo "    smp: cpus online: N     (BSP + woken APs — the SMP-AP wake, the RISKIEST item)"
+echo "    -> clean boot through 'Activating scheduler' to the agnsh '[ASSIST] >' prompt"
+echo "  Dispositive: APs counted in + a typeable agnsh prompt on real Zen (no hang/reset)."
+echo "    (1.44.21 made the wake fail-safe — a stuck IPI bounds-out instead of hanging.)"
+echo "  Re-gate fallback if the wake hangs INSIDE the trampoline: comment the INIT-SIPI"
+echo "  loop in smp_start_aps (one line; everything else is inert without it)."
 echo "=========================================="
 exit 0
