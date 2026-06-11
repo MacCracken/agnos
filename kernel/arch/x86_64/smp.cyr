@@ -2,6 +2,11 @@
 var cpu_count = 1;
 var ap_ready = 0;  # Set by APs on wakeup; read by BSP to confirm AP APIC ID
 var smp_lock = 0;
+# 1.44.18: bitmask of APIC IDs that completed ap_entry (bit per id, ids 0-3). Dual duty:
+# (a) idempotence — a late second SIPI RE-ENTERS the trampoline and re-runs ap_entry;
+# only the FIRST arrival may count, or cpu_count double-increments; (b) the BSP skips
+# the second SIPI for APs that already checked in (the Linux/SeaBIOS shape).
+var ap_online_mask = 0;
 
 fn spin_lock() {
     # Simple spinlock: test-and-set via xchg
@@ -30,26 +35,37 @@ fn spin_unlock() {
     return 0;
 }
 
-# AP entry point — called after trampoline transitions to long mode.
-# Each AP sets up its APIC and enters idle loop.
+# AP entry point — called after the trampoline transitions to long mode.
+# 1.44.18 WAKE + PARK: the AP comes online, reports in, and PARKS — it must NOT arm
+# its APIC timer and must NOT sti. A second CPU taking timer interrupts would run
+# do_context_switch CONCURRENTLY with the BSP — shared kstack, proc_current, no locks —
+# violating the single-core invariant the whole kernel relies on. The multithreading/SMP
+# arc ([[project_multithreading_future_arc]]) unwinds that deliberately, with locking;
+# until then a parked AP (IF=0 + hlt = sleeps until INIT/NMI, i.e. forever) proves the
+# wake path on QEMU + iron without touching the execution model.
+# (Pre-1.44.18 this armed the AP's APIC timer + sti'd — catastrophic had the wake ever
+# been un-gated against the scheduler.)
 fn ap_entry() {
-    # Enable this AP's local APIC
+    # Enable this AP's local APIC (spurious vector reg) — no interrupt sources armed.
     store32(0xFEE000F0, 0x1FF);
-    # Set up APIC timer (same vector and rate as BSP)
-    store32(0xFEE003E0, 0x0B);
-    store32(0xFEE00320, 0x20020);
-    store32(0xFEE00380, 10000000);
     # Read our APIC ID
     var my_id = (load32(0xFEE00020) >> 24) & 0xFF;
-    # Initialize per-CPU TSS (S2: each CPU gets its own kernel stack via TSS)
+    # Initialize per-CPU TSS (S2) — per-id GDT slots, disjoint; sequential bring-up
+    # means no two APs run this concurrently.
     if (my_id < 4) { tss_init_cpu(my_id); }
-    # Increment CPU count (with spinlock)
+    # Report in (spinlock'd; the BSP polls these). Idempotence: only the FIRST
+    # arrival counts — a late second SIPI re-enters the trampoline + re-runs this fn.
     spin_lock();
-    cpu_count = cpu_count + 1;
-    ap_ready = my_id;
+    if (my_id < 4) {
+        var bit = 1 << my_id;
+        if ((ap_online_mask & bit) == 0) {
+            ap_online_mask = ap_online_mask | bit;
+            cpu_count = cpu_count + 1;
+            ap_ready = my_id;
+        }
+    }
     spin_unlock();
-    # Idle loop — hlt until timer fires
-    asm { sti; }
+    # PARK: IF=0 (the trampoline never sti'd) + hlt — the AP sleeps permanently.
     while (1 == 1) { asm { hlt; } }
     return 0;
 }
@@ -68,11 +84,25 @@ fn smp_build_trampoline() {
     for (var i = 0; i < 512; i = i + 8) { store64(t + i, 0); }
 
     # --- Data structures after all code ---
-    # GDT pointer for 16/32-bit (6 bytes: limit16 + base32) at 0x8180
-    store16(0x8180, 55);
-    store32(0x8182, &gdt & 0xFFFFFFFF);
-    # GDT pointer for 64-bit (10 bytes: limit16 + base64) at 0x8190
-    store16(0x8190, 55);
+    # 1.44.18: a DEDICATED trampoline GDT at 0x81B0 (4 entries, 32 B). The old code lgdt'd
+    # the KERNEL GDT for the 16->32 transition — but kernel CS 0x08 is the 64-bit descriptor
+    # (0x00AF..., L=1 D=0): in LEGACY protected mode L is ignored and D=0 means the "32-bit"
+    # stage at 0x8040 decoded as 16-BIT code -> the AP crashed on its first instruction
+    # (latent: the wake was gated before this ever ran). Entries:
+    #   0x08 code32 (D=1) — the 16->32 far jmp target
+    #   0x10 data32       — stage-2 data segs
+    #   0x18 code64 (L=1) — the 32->64 far jmp target
+    store64(0x81B0, 0);                       # null
+    store64(0x81B8, 0x00CF9A000000FFFF);      # 0x08: code32, base 0, limit 4G, D=1
+    store64(0x81C0, 0x00CF92000000FFFF);      # 0x10: data32
+    store64(0x81C8, 0x00AF9A000000FFFF);      # 0x18: code64 (L=1)
+    # GDT pointer for the 16/32-bit stages (limit16 + base32) at 0x8180 -> the trampoline GDT
+    store16(0x8180, 31);
+    store32(0x8182, 0x81B0);
+    # GDT pointer for the 64-bit stage at 0x8190 -> the KERNEL GDT. 1.44.18: limit was a
+    # stale 55 — the kernel GDT is 104 B (5 segments + 4 TSS descriptors); ltr in
+    # tss_init_cpu reaches descriptors ABOVE byte 55 and would #GP under the short limit.
+    store16(0x8190, 103);
     store64(0x8192, &gdt);
     # IDT pointer for 64-bit at 0x81A0
     store16(0x81A0, 4095);
@@ -120,8 +150,10 @@ fn smp_build_trampoline() {
     store8(p+off, 0x0F); store8(p+off+1, 0x20); store8(p+off+2, 0xC0); off = off + 3;
     store8(p+off, 0x0D); store32(p+off+1, 0x80000000); off = off + 5;
     store8(p+off, 0x0F); store8(p+off+1, 0x22); store8(p+off+2, 0xC0); off = off + 3;
-    # jmp far 0x08:0x80C0 (enter 64-bit)
-    store8(p+off, 0xEA); store32(p+off+1, 0x80C0); store16(p+off+5, 0x08); off = off + 7;
+    # jmp far 0x18:0x80C0 (enter 64-bit — 0x18 = the trampoline GDT's code64/L=1 entry;
+    # 1.44.18: was 0x08, which is code32 in the trampoline GDT — the jump must land in an
+    # L=1 segment for IA-32e to activate)
+    store8(p+off, 0xEA); store32(p+off+1, 0x80C0); store16(p+off+5, 0x18); off = off + 7;
 
     # --- 64-bit long mode at 0x80C0 (77 bytes) ---
     p = 0x80C0;
@@ -164,34 +196,53 @@ fn smp_build_trampoline() {
     return 0;
 }
 
+# Real elapsed time for the IPI protocol, via the BSP's 100 Hz timer. ONLY valid at the
+# 1.44.18 call site: AFTER `sti`/"Interrupts enabled" (ticks deliver) and BEFORE scheduler
+# activation (sched_active==0, so the tick's do_context_switch no-ops — kmain just sleeps
+# through the hlt and resumes). One tick = 10 ms.
+fn smp_wait_ticks(n) {
+    # IF=1 throughout, and EXIT with IF=1: the call site (post-"Interrupts enabled") runs the
+    # whole rest of boot with IF=1 — the selftest drive loops + scheduler activation arch_wait
+    # (hlt) on the timer, so leaving here with IF=0 would sleep them forever. (A trailing cli
+    # was tried and did exactly that: ring3/thread smokes hung at their first arch_wait.)
+    var t0 = timer_ticks;
+    while (timer_ticks < t0 + n) {
+        asm { sti; hlt; }
+    }
+    return 0;
+}
+
+# 1.44.18 — SMP-AP WAKE + PARK (the parked carry-forward, un-gated). Wakes APs 1-3 via
+# the SDM INIT-SIPI-SIPI protocol (the Linux smpboot / SeaBIOS / xv6 convergence) with
+# REAL tick-based delays, counts them in, and leaves them PARKED (see ap_entry — the
+# single-core invariant is untouched; no AP ever runs the scheduler).
+# The three historical gate hazards are now addressed:
+#   1. CR3 0x1000: the call site moved to AFTER pt_init + "Interrupts enabled" (main.cyr)
+#      — 0x1000 is the kernel PML4, identity 0-4 GB incl. the 0xFEE00000 APIC.
+#   2. Timing: smp_wait_ticks gives real >=10 ms INIT quiescence + inter-SIPI spacing
+#      (the old non-volatile spin loops guaranteed nothing on Zen).
+#   3. Trampoline 0x8000: inside the kernel map's writable 0-2 MB identity region.
+# Sequential per-AP bring-up (one at a time — simpler diagnosis, no concurrent ap_entry);
+# an absent APIC ID simply never responds (QEMU default -smp 1 boots lose ~120 ms, no fault).
 fn smp_start_aps() {
     smp_build_trampoline();
     for (var i = 1; i < 4; i = i + 1) {
         var stack_addr = 0x300000 + i * 0x10000;
         if (vmm_is_mapped(stack_addr) == 0) { vmm_alloc_at(stack_addr); }
     }
-    # INIT-SIPI-SIPI to wake APs — GATED OFF. SMP-AP wakeup on real hardware
-    # is parked carry-forward; single-core is the relied-upon invariant (no
-    # locking, shared scratch buffers). When this is eventually un-gated,
-    # three concrete hazards must be addressed first:
-    #   1. The trampoline's 32-bit stage hardcodes CR3 = 0x1000; if APs are
-    #      woken before pt_init they share gnoboot's bootstrap page tables,
-    #      which must identity-map 0xFEE00000 or every AP triple-faults on
-    #      its first APIC-ID read.
-    #   2. The inter-IPI delay loops are not volatile; INIT requires ~10ms
-    #      quiescence per SDM, SIPI window is ~200µs. Loop bodies may not
-    #      provide either timing on Zen.
-    #   3. Trampoline page (0x8000-0x8200) writeability depends on gnoboot's
-    #      bootstrap mappings.
-    #
-    # (Historical: an early iron bring-up briefly gated this block to bisect
-    # a Zen boot fault; that fault was elsewhere. The block stays gated
-    # because SMP is out of scope for the single-core invariant.)
-    # for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_init(ap); }
-    # for (var w = 0; w < 2000000; w = w + 1) { }
-    # for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_sipi(ap, 0x08); }
-    # for (var w = 0; w < 200000; w = w + 1) { }
-    # for (var ap = 1; ap < 4; ap = ap + 1) { apic_send_sipi(ap, 0x08); }
-    # for (var w = 0; w < 2000000; w = w + 1) { }
+    for (var ap = 1; ap < 4; ap = ap + 1) {
+        var bit = 1 << ap;
+        apic_send_init(ap);
+        smp_wait_ticks(2);                       # >=10 ms INIT quiescence (SDM)
+        apic_send_sipi(ap, 0x08);                # SIPI vector 0x08 -> trampoline 0x8000
+        smp_wait_ticks(1);
+        if ((ap_online_mask & bit) == 0) {       # not in yet -> the SDM second SIPI
+            apic_send_sipi(ap, 0x08);
+            smp_wait_ticks(1);
+        }
+    }
+    kprint("smp: cpus online: ", 18);
+    kprint_num(cpu_count);
+    kprintln("", 0);
     return cpu_count;
 }

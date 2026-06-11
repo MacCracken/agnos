@@ -180,6 +180,15 @@ if strings "$LOG" | grep -q "^run: exit 72"; then
 else
     echo "  FAIL: no 'run: exit 72' (envp not staged / not readable at the SysV offset)"; rc=1
 fi
+# 1.44.19 — per-process env propagation: /bin/envprop calls execwait#37 on /bin/envtest with
+# a caller env blob "Q=1\0" via (a3=ptr, a4=len); the caller env REPLACES the default, so the
+# child's envp[0] = "Q=1" and envtest exits 'Q'=81. The exit-72 gate above stays as the
+# permanent default/fallback regression gate (env-less + garbage-a3/a4 callers keep HOME=/).
+if strings "$LOG" | grep -q "^run: exit 81"; then
+    echo "  PASS: per-process env — caller blob propagated through #37 a3/a4 to the child's envp[0] (exit 81='Q')"
+else
+    echo "  FAIL: no 'run: exit 81' (caller env blob did not reach the child — gate chain or elf staging broke)"; rc=1
+fi
 # 1.43.4 — framebuffer fbinfo(38)+blit(39). /bin/fbtest queries geometry, blits a
 # 4x4 block to FB(0,0), exits bpp(32)+blit_rc(0)+56 = 88. Proves BOTH new syscalls
 # dispatch from ring 3, fbinfo writes the struct (bpp=32), and blit copies into

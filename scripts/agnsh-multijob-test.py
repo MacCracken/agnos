@@ -159,7 +159,7 @@ try:
     j1 = waitfor(["SLEEP1-DONE", "[1] Done"], 90)
     # prompt LIVE with job 2 still running.
     base = len(ser()); typ("version\n", settle=1.0)
-    ver = waitfor(["agnoshi 1.6.1"], 25) and ("agnoshi 1.6.1" in ser()[base:])
+    ver = waitfor(["agnoshi 1.7.0"], 25) and ("agnoshi 1.7.0" in ser()[base:])
     # job 2 finishes + reaped.
     j2 = waitfor(["SLEEP2-DONE", "[2] Done"], 150)
 

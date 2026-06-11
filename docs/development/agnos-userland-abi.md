@@ -165,7 +165,7 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
 | 34 | `uname` | buf | len (≥64) | — | — | 0 / -1 | writes the 64-byte identity struct (§4.3) into `buf`: sysname/nodename/release/machine. Static boot-time identity. **mihi/iam** (1.42.10) |
 | 35 | `sysinfo` | buf | len (≥40) | — | — | 0 / -1 | writes the 40-byte counters struct (§4.4) into `buf`: uptime_secs / total+free RAM bytes / procs / cpus. Live snapshot; kernel does the unit conversion. **mihi/iam/chakshu** (1.42.10) |
 | 36 | `klog` | buf | len | — | — | bytes / -1 | copies the unified **klug** kernel-log ring (§4.5) into `buf`, oldest→newest; when `len` < the log fill, returns the **newest** `len` bytes (dmesg tail). Returns bytes written. **klug/dmesg tool** (1.42.12) |
-| 37 | `execwait` | path | pathlen | — | — | child exit code / -1 | loads a static ELF64 from the ext2 root, runs it to completion **in ring 3**, returns the child's exit code. Synchronous `elf_load_from_file` + `exec_and_wait` (no preemption); the FIRST such exec from a live ring-3 syscall frame, so the handler preserves the caller's resume context (H1) + runs the child on a disjoint second SYSCALL kstack (H2). `execwait` passes only the program path (no caller-supplied argv); the kernel stages a uniform default envp (`HOME=/`, `PWD=/`) on every exec as of **1.43.2** — see §4.6. **agnsh `run`** (1.43.0) |
+| 37 | `execwait` | path | pathlen | env blob (opt, 1.44.19) | env len (a4=r10) | child exit code / -1 | loads a static ELF64 from the ext2 root, runs it to completion **in ring 3**, returns the child's exit code. Synchronous `elf_load_from_file` + `exec_and_wait` (no preemption); the FIRST such exec from a live ring-3 syscall frame, so the handler preserves the caller's resume context (H1) + runs the child on a disjoint second SYSCALL kstack (H2). `execwait` passes only the program path (no caller-supplied argv); the kernel stages a uniform default envp (`HOME=/`, `PWD=/`) on every exec as of **1.43.2** — see §4.6. **agnsh `run`** (1.43.0) |
 
 **37 `execwait` is IMPLEMENTED (1.43.0)** — the ring-3 blocking-exec primitive that lets a userland shell launch an on-disk program. It is the syscall behind agnoshi's gated `run` builtin (un-gated at agnoshi 1.4.4 by flipping `RUN_EXECWAIT_READY` + routing `process_agnos.cyr`'s `run()` through `syscall(37, path, len)`). Reuses the proven recovery-shell exec path; the novelty is being invoked from a *live ring-3 syscall frame*, handled by snapshotting the caller's resume-context globals + swapping to a disjoint second syscall kstack (`0x3D0000`) for the nested child. `EXEC_SELFTEST`'s `/bin/exwv` gates the full ring-3-caller path.
 
@@ -272,6 +272,17 @@ All-u64 (no sub-word fields → no Cyrius struct-padding ambiguity, same rule §
 | `8 + (argc+3+envc)*8` | auxv `AT_NULL` val (0) |
 
 The `KEY=VALUE` and argv strings live higher in the stack page (`0x3100..0x4000`). **envp (1.43.2):** the kernel stages a uniform default — `envp[0]="HOME=/"`, `envp[1]="PWD=/"` — on every exec (was an empty envp NULL pre-1.43.2). **cyrius half:** `getenv()`'s agnos branch reads `envp[j] = load64(_agnos_init_rsp + 8 + (argc+1+j)*8)` and walks `KEY=VALUE` to NULL — the language-work the cyrius agent owns. Per-process env propagation (threading a caller-supplied env through `execwait`) is a kernel follow-on.
+
+**Per-process env wire format (1.44.19, #37 + #43):** `a3` = user pointer to a flat NUL-separated
+`KEY=VALUE\0KEY=VALUE\0` blob, `a4` (= r10) = blob byte length. Caps: **<=1024 bytes, 1..16
+entries**, every entry `KEY=...` with `=` at index >=1, trailing NUL required. The caller env
+**REPLACES** the default (never merges); `a3==0` (or ANY validation failure) falls back to the
+uniform default — **fallback-only, never -1**, because legacy 3-arg callers deliver garbage a3/a4
+(the cyrius `syscall()` builtin pops exactly N arg registers; old-agnsh-on-new-kernel is the normal
+ESP-only deployment). The kernel copies the blob via a fault-proof page-table walk of the caller's
+CR3 (garbage pointers are rejected, not dereferenced). The 16-entry cap is load-bearing: the envp
+pointer array (`0x3008+(argc+3+envc)*8`) must stay below the 0x3100 string base. Consumers: build
+within the caps client-side (an oversized blob silently degrades to the default env).
 
 ## 5. Coordination protocol (two-agent)
 

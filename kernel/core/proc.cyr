@@ -609,6 +609,42 @@ fn proc_map_page(cr3, virt, phys) {
     return 0;
 }
 
+# 1.44.19 — fault-PROOF copy from a (possibly garbage) user VA range, for the per-process
+# env blob on execwait(#37)/spawn_path(#43). WHY not the ew37_path-style copy-under-caller-CR3:
+# legacy 3-arg syscall() callers deliver GARBAGE in a3/a4 (the cyrius builtin pops exactly N
+# arg regs — verified in the compiler's emitter; agnoshi 1.6.1 binaries on a new kernel are
+# the NORMAL ESP-only deployment), and a blind load8 of an unmapped-but-in-range garbage VA
+# would #PF the handler. This walks the CALLER's page tables under boot-CR3 identity instead
+# (table pages are physical addresses — the same chain proc_map_page writes above), requires
+# each 2 MB PDE to be Present+User+PS, and copies via the identity-mapped physical page.
+# Returns 1 on success, 0 on ANY absent/non-user/non-huge mapping — the caller treats 0 as
+# "no env" (fallback to the default), never an error. VAs are < 1 GB (is_user_range), so
+# PML4[0]/PDPT[0] indices are 0 — mirroring proc_map_page's walk.
+fn proc_copy_from_user(cr3, dst, uva, len) {
+    var copied = 0;
+    while (copied < len) {
+        var va = uva + copied;
+        var pml4e = load64(cr3);
+        if ((pml4e & 1) == 0) { return 0; }
+        var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+        var pdpte = load64(pdpt_addr);
+        if ((pdpte & 1) == 0) { return 0; }
+        var pd_addr = pdpte & 0xFFFFFFFFF000;
+        var pde = load64(pd_addr + ((va >> 21) & 0x1FF) * 8);
+        if ((pde & 1) == 0) { return 0; }      # not present
+        if ((pde & 4) == 0) { return 0; }      # not a user page
+        if ((pde & 0x80) == 0) { return 0; }   # not a 2 MB huge page (unexpected shape)
+        var page_phys = pde & 0xFFFFFFFFFFE00000;
+        var off = va & 0x1FFFFF;
+        var chunk = 0x200000 - off;
+        if (chunk > len - copied) { chunk = len - copied; }
+        var k = 0;
+        while (k < chunk) { store8(dst + copied + k, load8(page_phys + off + k)); k = k + 1; }
+        copied = copied + chunk;
+    }
+    return 1;
+}
+
 # Unmap a 2MB page in a process's page directory (for guard pages)
 #
 # 1.41.13 — guard-page unmap must NEVER punch the kernel identity map. A user

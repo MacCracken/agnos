@@ -92,11 +92,13 @@ kprintln(" timer active", 13);
 # === CMOS kernel checkpoint 7 (APIC + timer live) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x07; 0xE6; 0x71; }
 
-# Start Application Processors
+# SMP state init. 1.44.18: the ACTUAL wake (smp_start_aps) moved late — to after
+# pt_init + "Interrupts enabled" — so the trampoline's hardcoded CR3 0x1000 is the
+# kernel PML4 (identity 0-4 GB incl. the APIC; the old pre-pt_init wake site was
+# gate-hazard #1) and timer_ticks advances for the real SDM delays.
 cpu_count = 1;
 ap_ready = 0;
 smp_lock = 0;
-smp_start_aps();
 kprint("SMP: ", 5);
 kprint_num(cpu_count);
 kprintln(" CPUs online", 12);
@@ -1577,6 +1579,48 @@ fn exec_disk_selftest() {
     kprintln("exec: running /bin/envtest", 26);
     sh_exec("run /bin/envtest", 16);
 
+    # 1.44.19 — per-process env validator (/bin/envprop). A ring-3 program that calls
+    # execwait(37) on "/bin/envtest" WITH a caller env blob: a3 = VA of "Q=1\0" (embedded
+    # in its OWN code page — user-mapped, so the fault-proof page-walk copy accepts it),
+    # a4 = 4. The child is the EXISTING envtest, which exits envp[0][0] — with the caller
+    # env REPLACING the default, envp[0] = "Q=1" → exit 'Q' = 0x51 = 81 (distinct from the
+    # default's 'H' = 72, which the run above keeps asserting as the fallback gate).
+    # "run: exit 81" therefore proves the WHOLE chain: ring-3 a3/a4 → fault-proof copy →
+    # blob validation → elf.cyr staging → child getenv-visible envp. Sequential, no jumps.
+    var pi2 = 0;
+    while (pi2 < 200) { store8(eb + pi2, 0); pi2 = pi2 + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 196); store8(eb + 104, 196);                  # p_filesz/memsz = 196
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 (55 B, sequential): execwait("/bin/envtest",12, blob,4) then exit(rax)
+    var pc2 = 120;
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xC7); store8(eb+pc2+2,0xC0); store8(eb+pc2+3,0x25); pc2=pc2+7;  # mov rax,37
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xBF); store8(eb+pc2+2,0xB0); store8(eb+pc2+4,0x40); pc2=pc2+10; # movabs rdi,0x4000B0 (path @176)
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xC7); store8(eb+pc2+2,0xC6); store8(eb+pc2+3,0x0C); pc2=pc2+7;  # mov rsi,12
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xBA); store8(eb+pc2+2,0xC0); store8(eb+pc2+4,0x40); pc2=pc2+10; # movabs rdx,0x4000C0 (blob @192 = a3)
+    store8(eb+pc2,0x49); store8(eb+pc2+1,0xC7); store8(eb+pc2+2,0xC2); store8(eb+pc2+3,0x04); pc2=pc2+7;  # mov r10,4 (a4 = blob len)
+    store8(eb+pc2,0x0F); store8(eb+pc2+1,0x05); pc2=pc2+2;                                                # syscall -> rax = child code
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0x89); store8(eb+pc2+2,0xC7); pc2=pc2+3;                         # mov rdi,rax
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xC7); store8(eb+pc2+2,0xC0); store8(eb+pc2+3,0x00); pc2=pc2+7;  # mov rax,0 (exit)
+    store8(eb+pc2,0x0F); store8(eb+pc2+1,0x05);                                                            # syscall — exit(child code)
+    # path "/bin/envtest" @176 (VA 0x4000B0), 12 bytes
+    store8(eb+176,0x2F); store8(eb+177,0x62); store8(eb+178,0x69); store8(eb+179,0x6E);                   # "/bin"
+    store8(eb+180,0x2F); store8(eb+181,0x65); store8(eb+182,0x6E); store8(eb+183,0x76);                   # "/env"
+    store8(eb+184,0x74); store8(eb+185,0x65); store8(eb+186,0x73); store8(eb+187,0x74);                   # "test"
+    # env blob "Q=1\0" @192 (VA 0x4000C0), 4 bytes — one entry, NUL-terminated
+    store8(eb+192,0x51); store8(eb+193,0x3D); store8(eb+194,0x31); store8(eb+195,0x00);                   # "Q=1\0"
+    var ppino = 0;
+    if (bino > 0) { ppino = ext2_create(bino, "envprop", 7); }
+    if (ppino > 0) { ext2_write_at(ppino, 0, eb, 196); ext2_sync(); }
+    kprintln("exec: running /bin/envprop", 26);
+    sh_exec("run /bin/envprop", 16);
+
     # 1.43.4 — framebuffer fbinfo(38) + blit(39) validator (/bin/fbtest). Queries
     # geometry into a stack buffer, then blits a 4x4 block from the stack to FB
     # (0,0), and exits with bpp(=32, @struct+12) + blit_rc(=0) + 56 = 88. "run:
@@ -2001,6 +2045,13 @@ arch_wait();
 kprint("Timer ticks before sched: ", 26);
 kprint_num(timer_ticks);
 kprintln("", 0);
+
+# 1.44.18 — wake + park the APs (see smp.cyr). HERE because: pt_init has run (the
+# trampoline's CR3 0x1000 = the kernel PML4, identity 0-4 GB incl. the APIC), IF=1
+# windows exist (smp_wait_ticks' real SDM delays), and sched_active is still 0 (the
+# wait's ticks no-op in do_context_switch). APs report in and PARK (IF=0 hlt) — the
+# single-core invariant is untouched; "smp: cpus online: N" is the proof line.
+smp_start_aps();
 
 kprintln("Activating scheduler...", 23);
 

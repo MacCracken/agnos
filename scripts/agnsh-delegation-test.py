@@ -122,7 +122,7 @@ try:
         return ser()[m:]
 
     ok = False
-    for _ in range(280):                 # ~70s TCG boot + DHCP
+    for _ in range(480):                 # ~70s TCG boot + DHCP
         if "agnoshi" in ser(): ok = True; break
         time.sleep(0.25)
     p("banner seen:", ok)

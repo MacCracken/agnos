@@ -89,6 +89,15 @@ var spawn_elf_buf[2048];
 # CR3 is the NVMe-BAR-mapping boot CR3). A DEDICATED buffer (not ew37_path) so a #43 from a
 # bg proc can never collide with agnsh's in-flight #37 frame.
 var spawn_path_buf[16];
+# 1.44.19: per-process env staging — kernel copies of the caller's flat "KEY=V\0KEY=V\0"
+# blob (a3=ptr, a4=len on #37/#43; <=1024 B, <=16 entries). DEDICATED buffers per the
+# spawn_path_buf rationale above (a bg-proc #43 must never collide with agnsh's in-flight
+# #37 frame). No ew37-style save/restore needed: the blob is fully consumed onto the
+# child's stack page INSIDE elf_load_from_file, which returns before exec_and_wait runs
+# the child — by the time any nested syscall exists, these contents are dead.
+# [128] = 128 u64 = 1024 B each (the 8N module-global rule).
+var ew37_env[128];        # execwait(#37) env staging
+var spawn_env_buf[128];   # spawn_path(#43) env staging
 
 # Security: a userspace pointer must lie in the user VA window [0x200000, 0x40000000):
 # above the kernel low region (0-2 MB) and below the 1 GB arena ceiling. EVERY
@@ -120,6 +129,37 @@ fn is_user_range(ptr, len) {
 fn sc_path_ok(ptr, len) {
     if (len < 1) { return 0; }
     return is_user_range(ptr, len);
+}
+
+# 1.44.19: validate a KERNEL COPY of a caller env blob — flat NUL-separated "KEY=V\0KEY=V\0".
+# Rules: the last byte MUST be NUL; every NUL-split entry must be non-empty with '=' (61) at
+# index >= 1 (a KEY exists); 1..16 entries. The 16-entry cap is LOAD-BEARING, not stylistic:
+# the SysV envp pointer array ends at stack offset 0x3008+(argc+3+envc)*8 and must stay below
+# the 0x3100 string base (elf.cyr) — with argc<=8, envc=16 tops out at 0x30E0; envc>=20 would
+# overwrite the first string bytes. Enforced HERE on the kernel copy, never trusted from
+# caller-side counts. Returns 1 ok / 0 reject (the callers fall back to the default env).
+fn sc_env_blob_ok(buf, len) {
+    if (len < 1) { return 0; }
+    if (load8(buf + len - 1) != 0) { return 0; }     # must end on a NUL
+    var entries = 0;
+    var i = 0;
+    while (i < len) {
+        var es = i;
+        while (i < len) { if (load8(buf + i) == 0) { break; } i = i + 1; }
+        var el = i - es;                              # entry [es, es+el), NUL at i
+        if (el > 0) {
+            # require a '=' at index >= 1 within the entry
+            var eq = 0;
+            var j = es + 1;
+            while (j < es + el) { if (load8(buf + j) == 61) { eq = 1; break; } j = j + 1; }
+            if (eq == 0) { return 0; }
+            entries = entries + 1;
+            if (entries > 16) { return 0; }
+        }
+        i = i + 1;                                    # skip the NUL
+    }
+    if (entries < 1) { return 0; }
+    return 1;
 }
 
 # Resume kernel execution after a user process exits, by performing
@@ -1007,6 +1047,29 @@ fn ksyscall(num, arg1, arg2, arg3) {
             stack_canary_check(canary);
             return 0 - 1;
         }
+        # 1.44.19 per-process env: a3 = caller env-blob VA, a4 = blob len ("KEY=V\0KEY=V\0",
+        # <=1024 B, <=16 entries). FALLBACK-ONLY semantics — any gate failure means "no env"
+        # (the uniform default), NEVER -1: legacy 3-arg callers (agnoshi <=1.6.1 — the NORMAL
+        # ESP-only deployment) deliver GARBAGE a3/a4 (cyrius syscall() pops exactly N arg
+        # regs), so proc_copy_from_user is the fault-PROOF page-walking copy (a blind deref
+        # of a garbage in-range VA would #PF the handler). Runs under boot CR3 (identity),
+        # walking the CALLER's tables via ew37_cr3.
+        var ew_eptr = arg3;
+        var ew_elen = ksyscall_a4;
+        var ew_env = 0;
+        if (ew_eptr != 0) {
+            if (ew_elen >= 1) {
+                if (ew_elen <= 1024) {
+                    if (is_user_range(ew_eptr, ew_elen) == 1) {
+                        if (proc_copy_from_user(ew37_cr3, &ew37_env, ew_eptr, ew_elen) == 1) {
+                            if (sc_env_blob_ok(&ew37_env, ew_elen) == 1) { ew_env = &ew37_env; }
+                        }
+                    }
+                }
+            }
+        }
+        exec_env_src = ew_env;                       # globals, consumed-at-entry by the loader
+        exec_env_len = ew_elen;                      # (see elf.cyr — the 6-arg call shape miscompiled)
         var cpid = elf_load_from_file(pdst + ew_ps, ew_plen, pdst, arg2);
         if (cpid < 0) {
             cr3_load(ew37_cr3);
@@ -1284,6 +1347,25 @@ fn ksyscall(num, arg1, arg2, arg3) {
         while (sp_pe < arg2) { if (load8(spp + sp_pe) == 32) { break; } sp_pe = sp_pe + 1; }     # to first space
         var sp_plen = sp_pe - sp_ps;
         if (sp_plen < 1) { cr3_load(spcr3); stack_canary_check(canary); return 0 - 1; }
+        # 1.44.19 per-process env — the #37 gate's twin (see there): a3/a4 = blob ptr/len,
+        # FALLBACK-ONLY (garbage a3/a4 from legacy callers → default env, never -1),
+        # fault-proof page-walking copy into the DEDICATED spawn_env_buf.
+        var sp_eptr = arg3;
+        var sp_elen = ksyscall_a4;
+        var sp_env = 0;
+        if (sp_eptr != 0) {
+            if (sp_elen >= 1) {
+                if (sp_elen <= 1024) {
+                    if (is_user_range(sp_eptr, sp_elen) == 1) {
+                        if (proc_copy_from_user(spcr3, &spawn_env_buf, sp_eptr, sp_elen) == 1) {
+                            if (sc_env_blob_ok(&spawn_env_buf, sp_elen) == 1) { sp_env = &spawn_env_buf; }
+                        }
+                    }
+                }
+            }
+        }
+        exec_env_src = sp_env;                       # globals, consumed-at-entry by the loader
+        exec_env_len = sp_elen;
         var sp_pid = elf_load_from_file(spp + sp_ps, sp_plen, spp, arg2);
         # (c) restore the caller CR3 on EVERY path (incl. the load-failure path) so the
         # handler tail + SYSRET run under the caller's mappings (skipping this reproduces

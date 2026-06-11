@@ -5,6 +5,110 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.19] — 2026-06-11 (1.44.x — per-process env: caller envp through execwait#37 / spawn_path#43)
+
+The first 1.43.x carry-forward. A caller passes a real environment to its children — env becomes
+per-process instead of a kernel constant. Wire format: `a3` = user pointer to a flat NUL-separated
+`KEY=V\0KEY=V\0` blob, `a4` = blob length (≤1024 B, ≤16 entries), on BOTH #37 and #43; the caller
+env REPLACES the default. `a3==0` — and every legacy caller — keeps the uniform `HOME=/`+`PWD=/`.
+
+### Added
+
+- **The env gate (`core/syscall.cyr` #37 + #43), FALLBACK-ONLY by design:** any validation failure
+  means "no env" (the default), NEVER -1 — because legacy 3-arg callers (agnoshi ≤1.6.1, the NORMAL
+  ESP-only deployment) deliver **garbage a3/a4**: the cyrius `syscall()` builtin pops exactly N arg
+  registers (verified in the compiler's emitter — the scoping workflow caught the opposite claim and
+  refuted it against source). Hence **`proc_copy_from_user`** (`core/proc.cyr`): a fault-PROOF copy
+  that walks the CALLER's page tables under boot-CR3 identity, requiring Present+User+PS on each
+  2 MB PDE — a garbage in-range pointer is rejected gracefully where a blind dereference would #PF
+  the handler. Blob validation (`sc_env_blob_ok`) runs on the KERNEL copy: trailing NUL, every entry
+  `KEY=…` with `=` at index ≥1, 1..16 entries — the **16-entry cap is load-bearing** (the SysV envp
+  pointer array must stay below the 0x3100 string base; ≥20 entries would overwrite string bytes).
+  Dedicated staging buffers per the spawn_path_buf precedent (`ew37_env` / `spawn_env_buf`); no
+  ew37-style save/restore needed (the blob is consumed inside `elf_load_from_file`, before any
+  nested syscall exists).
+- **Loader staging (`core/elf.cyr`):** env flows via `exec_env_src`/`exec_env_len` globals with
+  **consume-at-entry** discipline (copied to locals + zeroed as the loader's first statements — no
+  stale env survives any early-reject path). The caller blob is NUL-split into the 0x3100..0x4000
+  string region (shared with argv — bounds enforced; attn11-style long argv lines keep room under
+  the 1024-B blob cap). `env_src==0` runs the 1.43.2 default block byte-identically.
+- **kybernet seeds agnsh's env (`user/init.cyr`):** explicitly stages `HOME=/`+`PWD=/` (13 B,
+  byte-identical content) — env POLICY now lives at the init layer; the loader default is just the
+  fallback. PATH/TERM additions deliberately left as user-decision candidates.
+- **`/bin/envprop` propagation proof (`core/main.cyr` + `scripts/exec-smoke.sh`):** a ring-3 caller
+  passes `"Q=1\0"` via #37 a3/a4 to the EXISTING `/bin/envtest`, whose envp[0] becomes `Q=1` →
+  exit **81**='Q' (vs the default's 72='H', which stays asserted as the permanent fallback gate).
+  exec-smoke is now **17 asserts**.
+- **GPR zeroing at ring-3 entry (`arch/x86_64/ring3.cyr`):** `enter_ring3` zeroes all 15 GPRs
+  before the iretq — fresh foreground execs no longer inherit kernel register contents (a leak),
+  and hand-assembled callers get deterministic a3=a4=0 (aligns with #43's zeroed proc-slot regs).
+
+### Fixed
+
+- **A layout-sensitive cycc miscompile, isolated + worked around** (the hard half of this cut): the
+  original 6-arg `elf_load_from_file(…, env_src, env_len)` shape, called with in-arg arithmetic from
+  the giant `ksyscall`, produced per-binary-deterministic `vfs_file_size()==-1` for EXISTING files
+  with the victim call site shifting under unrelated edits (one of envprop/spawnpath failed per
+  binary; adding two kprints to the callee made everything pass). Bisected across 5 builds; the
+  4-arg + consume-at-entry-globals shape is stable (**3×17/17**). Surfaced upstream as
+  `docs/development/issue/2026-06-11-cycc-6arg-call-miscompile.md` (cyrius is hands-off) — the same
+  regalloc-sensitivity class as the attn11 session's argv-capture find, same day.
+
+### Notes
+
+- Validated: exec-smoke **17/17 ×3** (exit-81 propagation + exit-72 fallback + all priors) · ring3
+  8/8 · nbread 4/4 · thread 2/2 · agnsh-smoke PASS (seeded boot env behaviorally identical) ·
+  smp 3/3 · bg-test ~9.8 s (legacy agnsh's garbage-a3/a4 → fallback, byte-identical behavior) ·
+  sweep 7/7 · `check.sh` 11/11. **Consumer next (agnoshi 1.7.0):** `sh_build_env_blob` (walk own
+  envp) + the explicit 5-arg `syscall(37/43, …, blob, blen)` forms. ABI doc updated in-change
+  (row 37 a3/a4 + the §4.6 wire format; row 43 rides the 38-44 backfill debt). Iron rides the next burn.
+
+## [1.44.18] — 2026-06-11 (1.44.x — SMP-AP wake + park: all 4 CPUs online, single-core invariant untouched)
+
+The arc's last parked item, un-gated. The BSP wakes APs 1-3 via the SDM INIT-SIPI-SIPI protocol
+(the Linux smpboot / SeaBIOS / xv6 convergence) with REAL tick-timed delays; each AP comes up
+through the 16→32→64-bit trampoline, enables its LAPIC, takes its per-CPU TSS, counts in through
+the spinlock, and **PARKS (IF=0 hlt — no AP ever takes a timer interrupt or runs the scheduler)**.
+The single-core no-lock invariant is deliberately untouched; full SMP scheduling remains the
+dedicated multithreading arc. New `smp-smoke.sh` (-smp 4): **`smp: cpus online: 4`** + full boot
+continuity. Runtime unaffected (`agnsh-bg-test` still ~9.8 s).
+
+### Fixed
+
+- **Two latent trampoline bugs (`arch/x86_64/smp.cyr` — this path had never executed; the wake
+  was gated since its first iron bring-up):** (1) the 16→32-bit stage `lgdt`'d the KERNEL GDT,
+  whose CS 0x08 is the 64-bit descriptor (`0x00AF…`, L=1 **D=0**) — in legacy protected mode L is
+  ignored and D=0 decodes the "32-bit" stage as **16-bit code**, crashing the AP on its first
+  instruction (and freezing the whole machine under QEMU). Now a dedicated 4-entry trampoline GDT
+  at 0x81B0 (null / code32 D=1 / data32 / code64 L=1), with the 32→64 far-jump via selector 0x18.
+  (2) the 64-bit stage's kernel-GDT pointer carried a stale **limit 55** — the kernel GDT is 104 B
+  (TSS descriptors live above byte 55), so `ltr` in `tss_init_cpu` would have #GP'd. Now 103.
+- **`ap_entry` made invariant-safe:** it used to arm the AP's APIC timer + `sti` — a second CPU
+  taking timer interrupts would run `do_context_switch` concurrently with the BSP (shared kstack,
+  `proc_current`, no locks). Now: LAPIC spurious-enable only, APIC-ID read, per-CPU TSS, a
+  spinlock'd count-in with an **idempotence mask** (a late second SIPI re-enters the trampoline;
+  only the first arrival counts), then park.
+- **The three historical gate hazards, addressed:** (1) the trampoline's hardcoded CR3 0x1000 —
+  the wake **call site moved** from pre-`pt_init` (where 0x1000 wasn't the kernel PML4) to after
+  "Interrupts enabled", where 0x1000 identity-maps 0-4 GB incl. the 0xFEE00000 APIC; (2) timing —
+  `smp_wait_ticks` gives real ≥10 ms INIT quiescence + inter-SIPI spacing off the 100 Hz timer
+  (the old non-volatile spin loops guaranteed nothing on Zen); (3) trampoline 0x8000 writability —
+  inside the kernel map's writable 0-2 MB identity region. Sequential per-AP bring-up; an absent
+  AP never responds (default `-smp 1` boots lose ~120 ms of bounded waits, no fault).
+- **`smp_wait_ticks` exits IF=1** (a trailing `cli` was tried and hung every later `arch_wait` —
+  the ring3/thread selftest drive loops slept forever; the post-sti boot contract is IF=1).
+
+### Notes
+
+- Validated: **smp-smoke 3/3** (`-smp 4`: online 4 + scheduler + kybernet) · ring3-smoke 8/8 ·
+  thread-smoke 2/2 · exec-smoke 16/16 · nbread 4/4 · agnsh-smoke PASS · agnsh-bg-test PASS (~9.8 s,
+  unchanged) · sweep 7/7 · `check.sh` 11/11 — the whole battery at default `-smp 1` proves the
+  un-gated wake is harmless single-CPU. **Iron:** the wake now rides the next archaemenid burn —
+  the riskiest item on it (real-Zen INIT-SIPI timing + ≥4 cores will report `smp: cpus online: 4`,
+  capped by the 4-CPU stack/TSS sizing). `sysinfo`#35's `cpus` field now reports the real count.
+  **The 1.44.x arc tail is EMPTY** — next: the 1.43.x carry-forwards (per-process env, FB scaling,
+  zero-copy FB-mmap), then the cyrius-audit crossover items at 1.45.x.
+
 ## [1.44.17] — 2026-06-10 (1.44.x — idle-deprioritization: idle runs only when nothing else is ready)
 
 The companion to 1.44.16's `sched_yield`. The idle kthread was a round-robin PEER: switched in at a

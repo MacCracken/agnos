@@ -6,8 +6,23 @@
 # Returns agnsh's exit code (>=0) if it ran, or -1 if it couldn't be launched
 # (no rootfs / missing / not an ELF). The path is absolute so no sh_abspath
 # is needed.
+# 1.44.19: kybernet SEEDS agnsh's env explicitly — "HOME=/\0PWD=/\0" (13 B), byte-identical
+# to the kernel default, but the POLICY now lives at the init layer (the design point of
+# per-process env: the loader default is just the fallback for env-less execs). Candidates
+# like PATH=/bin or TERM are deliberately NOT added unprompted — user-decision scope.
+var kyb_env[2];
 fn kybernet_exec_agnsh() {
     if (ext2_active == 0) { return 0 - 1; }
+    # "HOME=/" 72 79 77 69 61 47 NUL + "PWD=/" 80 87 68 61 47 NUL
+    store8(&kyb_env + 0, 72);  store8(&kyb_env + 1, 79);
+    store8(&kyb_env + 2, 77);  store8(&kyb_env + 3, 69);
+    store8(&kyb_env + 4, 61);  store8(&kyb_env + 5, 47);
+    store8(&kyb_env + 6, 0);
+    store8(&kyb_env + 7, 80);  store8(&kyb_env + 8, 87);
+    store8(&kyb_env + 9, 68);  store8(&kyb_env + 10, 61);
+    store8(&kyb_env + 11, 47); store8(&kyb_env + 12, 0);
+    exec_env_src = &kyb_env;            # consumed-at-entry by the loader
+    exec_env_len = 13;
     var pid = elf_load_from_file("/bin/agnsh", 10, "/bin/agnsh", 10);
     if (pid < 0) { return 0 - 1; }
     var ep = &proc_table + pid * 176;

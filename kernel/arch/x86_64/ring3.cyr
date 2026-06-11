@@ -144,8 +144,31 @@ fn enter_ring3(entry, user_rsp) {
     # never reaches 0x20 on iron, no ring-3 transition was attempted.
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x20; 0xE6; 0x71; }
 
+    # 1.44.19: zero ALL GPRs before entering ring 3 — a fresh exec'd program otherwise
+    # inherits whatever the kernel left in them. Two payoffs: (1) hand-assembled callers
+    # that set only the regs they use (the selftest ELFs; legacy 3-arg agnsh syscalls)
+    # now deliver DETERMINISTIC a3/rdx = a4/r10 = 0 instead of kernel garbage — the env
+    # fallback gate sees a clean 0, not a random pointer; (2) no kernel register contents
+    # leak to ring 3 (aligns the foreground exec path with #43's zeroed proc-slot regs).
+    # Placed LAST: params entry/user_rsp were consumed by the 0x7000 frame stores above,
+    # and nothing rbp-relative executes after this block.
     # Set RSP to 0x7000 and iretq
     asm {
+        0x48; 0x31; 0xC0;          # xor rax, rax
+        0x48; 0x31; 0xDB;          # xor rbx, rbx
+        0x48; 0x31; 0xC9;          # xor rcx, rcx
+        0x48; 0x31; 0xD2;          # xor rdx, rdx
+        0x48; 0x31; 0xF6;          # xor rsi, rsi
+        0x48; 0x31; 0xFF;          # xor rdi, rdi
+        0x48; 0x31; 0xED;          # xor rbp, rbp
+        0x4D; 0x31; 0xC0;          # xor r8, r8
+        0x4D; 0x31; 0xC9;          # xor r9, r9
+        0x4D; 0x31; 0xD2;          # xor r10, r10
+        0x4D; 0x31; 0xDB;          # xor r11, r11
+        0x4D; 0x31; 0xE4;          # xor r12, r12
+        0x4D; 0x31; 0xED;          # xor r13, r13
+        0x4D; 0x31; 0xF6;          # xor r14, r14
+        0x4D; 0x31; 0xFF;          # xor r15, r15
         0x48; 0xC7; 0xC4; 0x00; 0x70; 0x00; 0x00;  # mov rsp, 0x7000
         0x48; 0xCF;                                    # iretq
     }
