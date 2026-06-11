@@ -4,19 +4,41 @@
 # the ISR stack frame into the old process's slot, then loads the new process's
 # saved state onto the stack for iretq to restore.
 
+# 1.44.17: the idle kthread's pid (set at its kthread_create in main.cyr; -1 until then,
+# which matches no slot). sched_next DEPRIORITIZES it: idle's hlt burns a full tick period
+# doing nothing, so as a round-robin PEER it was eating ~1/3 of the CPU whenever real procs
+# were ready (the bg-job share cap the 1.44.16 benchmark hit at ~50% even with agnsh
+# yielding). Idle now runs ONLY when nothing else is ready.
+var sched_idle_pid = 0 - 1;
+
 fn sched_next() {
-    # Round-robin: find next ready (state==1) process after current.
+    # Pass 1 (1.44.17): round-robin over READY (state==1) procs, SKIPPING the idle kthread —
+    # real work must never lose a slice to a proc that exists only to hlt.
     var start = proc_current + 1;
     var si = 0;
     while (si < proc_count) {
         var idx = start + si;
         if (idx >= proc_count) { idx = idx - proc_count; }
-        if (proc_get_state(idx) == 1) {
-            return idx;
+        if (idx != sched_idle_pid) {
+            if (proc_get_state(idx) == 1) {
+                return idx;
+            }
         }
         si = si + 1;
     }
-    # No other ready proc — fall back to proc 0 (kernel idle).
+    # Pass 2: nothing else ready — the original scan WITH idle included, so idle still runs
+    # whenever it's the only ready proc (the boot-era kmain<->idle rotation is byte-identical:
+    # pass 1 finds nothing, pass 2 picks idle).
+    si = 0;
+    while (si < proc_count) {
+        var idx2 = start + si;
+        if (idx2 >= proc_count) { idx2 = idx2 - proc_count; }
+        if (proc_get_state(idx2) == 1) {
+            return idx2;
+        }
+        si = si + 1;
+    }
+    # No ready proc at all — fall back to proc 0 (kernel idle).
     # Previously returned proc_current, which let busy-looping ring-0 user
     # procs starve the kernel idle loop indefinitely (iron Attempt 14
     # sub-case 3b). Falling back to proc 0 guarantees kernel idle gets

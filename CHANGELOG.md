@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.17] — 2026-06-10 (1.44.x — idle-deprioritization: idle runs only when nothing else is ready)
+
+The companion to 1.44.16's `sched_yield`. The idle kthread was a round-robin PEER: switched in at a
+tick boundary, it hlts until the NEXT tick — burning a full 10 ms slice doing nothing whenever real
+procs were ready. That capped a background job's CPU share even with agnsh yielding. **Benchmark
+(same harness as 1.44.16 — `agnsh-bg-test.py`, N=2×10⁹, QEMU TCG): 12.3 s → 9.8 s (×1.26; stable
+across 2 runs). Cumulative vs the 1.44.15 busy-poll baseline: 22.8 s → 9.8 s = ×2.3.**
+
+### Changed
+
+- **`sched_next` two-pass scan** (`core/sched.cyr`): a new `sched_idle_pid` (registered at the
+  idle kthread's `kthread_create` in `main.cyr`; -1 until then) is SKIPPED in pass 1 — real work
+  never loses a slice to a proc that exists only to hlt. Pass 2 is the original scan WITH idle, so
+  idle still runs whenever it's the only ready proc: the boot-era kmain↔idle rotation and the
+  single-worker agnsh↔idle alternation are byte-identical (pass 1 empty → pass 2 picks idle), and
+  the iron Attempt-14 sub-case-3b proc-0 fallback is preserved verbatim. Only multi-proc rotations
+  change. Call-free/raw in the regalloc-sensitive hot path, per the file's convention.
+
+### Notes
+
+- Validated: ring3-smoke **8/8** (the yield ratio improved — `A=15268` vs 14154, idle's slices
+  redistributed to real work) · thread-smoke 2/2 · exec-smoke 16/16 · agnsh-bg-test PASS ×2 ·
+  agnsh-multijob-test PASS · agnsh-smoke PASS · sweep 7/7 · `check.sh` 11/11. The measured bg share
+  (~75%) lands below the idealized ~95% — the residual is agnsh's per-rotation poll work + TCG
+  switch overhead, acceptable; revisit only if a real workload cares. The 1.44.x arc tail is now
+  just **SMP-AP wakeup** (parked, out-of-cycle). Iron rides the next burn.
+
 ## [1.44.16] — 2026-06-10 (1.44.x — `sched_yield`#44: voluntary end-of-slice from ring 3)
 
 The arc-tail yield primitive. A ring-3 proc donates the REMAINDER of its 10 ms timer slice to the

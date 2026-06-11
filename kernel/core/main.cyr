@@ -2681,7 +2681,7 @@ proc_count = 0;
 proc_current = 0;
 proc_create(0);                 # proc 0 = kernel main (running now; context saved on first switch-away)
 proc_set_state(0, 2);           # running
-kthread_create(&kernel_idle_loop);  # proc 1 = idle (ready) — 1.44.1: via the kthread primitive (pool stack)
+sched_idle_pid = kthread_create(&kernel_idle_loop);  # proc 1 = idle (ready) — 1.44.1: via the kthread primitive (pool stack); 1.44.17: registered so sched_next deprioritizes it (idle runs only when nothing else is ready)
 #ifdef THREAD_SELFTEST
 # 1.44.0 opening bite: spawn two kernel threads on the shared AS (tight-loopers).
 thr_pid_a = kthread_create(&thread_test_a);
