@@ -42,16 +42,29 @@ fn gdt_init() {
 # === Per-CPU TSS (Task State Segment) ===
 # 4 TSS structures, 104 bytes each (RSP0 at offset 4, IOPB at offset 100).
 # Each CPU gets its own TSS with its own RSP0 (kernel stack).
-#   CPU 0 (BSP): RSP0 = 0x200000
-#   CPU 1:       RSP0 = 0x310000
-#   CPU 2:       RSP0 = 0x320000
-#   CPU 3:       RSP0 = 0x330000
+#   CPU 0 (BSP): RSP0 = 0x3C0000  (was 0x200000 — relocated, see note below)
+#   CPU 1:       RSP0 = 0x320000
+#   CPU 2:       RSP0 = 0x330000
+#   CPU 3:       RSP0 = 0x340000
 
 var tss_array[416];  # 4 CPUs x 104 bytes each
-var tss_kernel_stack = 0x200000;  # BSP default (kept for backward compat)
+# BSP kernel interrupt stack (TSS.RSP0) — the ring-0 stack the CPU switches to on a
+# CPL3->CPL0 interrupt (e.g. the 100 Hz timer preempting a ring-3 proc). RELOCATED
+# 0x200000 -> 0x3C0000 (1.44.x iron fix): the kernel image+BSS now spans
+# [0x100000..0x2334E8) (LOAD MemSiz 0x1334E8), so the legacy 0x200000 sat ~210 KB
+# INSIDE live .bss. It never mattered while ring-3 ran IF=0 (foreground exec / DOOM
+# never take a CPL3 interrupt) or when the only CPL3 fault — the 1.40.9 #PF — just
+# cli;hlt'd. But 1.44.14 made agnsh the first IF=1 ring-3 proc: the first timer tick
+# pushes the 5-word frame + 15-GPR ISR save + the whole do_context_switch call tree
+# DOWN from RSP0 into live kernel globals -> corrupt switch -> triple fault -> the
+# "locks up right after the agnoshi banner" iron symptom. 0x3C0000 is above the image
+# end (0x2334E8), below the syscall kstacks (0x3D0000/0x3F0000), clear of the AP RSP0
+# stacks (0x320000-0x340000), and in PD[1] (mirrored identity-supervisor-writable into
+# every per-proc CR3) — the same reserved-region-1 placement the syscall kstack uses.
+var tss_kernel_stack = 0x3C0000;
 
 fn tss_get_cpu_stack(cpu_id) {
-    if (cpu_id == 0) { return 0x200000; }
+    if (cpu_id == 0) { return 0x3C0000; }   # BSP — relocated out of live .bss (see tss_kernel_stack note)
     return 0x300000 + cpu_id * 0x10000 + 0x10000;
 }
 

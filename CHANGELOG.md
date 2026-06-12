@@ -5,6 +5,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **BSP kernel interrupt stack (`TSS.RSP0`) relocated out of live kernel `.bss`: `0x200000` → `0x3C0000`**
+  (`arch/x86_64/gdt.cyr`, both `tss_kernel_stack` and the `tss_get_cpu_stack(0)` return). **Fixes the
+  first 1.44.x iron burn (2026-06-12): boot reached the `agnoshi 1.7.0` banner then locked up** — no
+  shell header, no `[ASSIST] >` prompt (a freeze, not a reset). Reaching the banner means the whole
+  pre-scheduler boot path, **including the SMP-AP wake (1.44.18, the flagged riskiest item), PASSED on
+  real Zen**; the failure was the next-new-on-iron path. Root cause: the kernel image+BSS spans
+  `[0x100000..0x2334E8)` (ELF LOAD `MemSiz=0x1334E8`), so the legacy BSP `RSP0=0x200000` sat ~210 KB
+  **inside live `.bss`**. agnsh is the first ring-3 proc to run preemptible (IF=1, 1.44.14), so the
+  first 100 Hz timer tick took the first cross-privilege (CPL3→CPL0) interrupt that does real work:
+  the CPU pushes the 5-word frame, the ISR (`pic.cyr`) pushes 15 GPRs, and `timer_handler` →
+  `do_context_switch` runs its whole call tree on RSP0 — all growing **down into live kernel globals**;
+  `do_context_switch` then reads the now-corrupt `sched_active`/`preempt_count`/`proc_count` → corrupt
+  switch → #DF via the same poisoned RSP0 → triple-fault → freeze, exactly between the banner and the
+  header. **Invisible in QEMU** (TCG counts ticks in retired instructions, so agnsh reaches its
+  blocking `read()` first) — `agnsh-smoke` prints the full banner + prompt before and after the fix.
+  The new `0x3C0000` is above the image end (`0x2334E8`), below the syscall kstacks
+  (`0x3D0000`/`0x3F0000`), clear of the AP RSP0 stacks (`0x320000`-`0x340000`), and in PD[1]
+  (identity-supervisor-writable in every per-process CR3) + the PMM-reserved region 1 — the same
+  placement the syscall kstack already uses (the kernel had already moved its boot 32-bit stack and
+  syscall kstack off `0x200000` for this exact "live .bss" reason per `pmm.cyr:80` / `boot_shim.cyr:25`;
+  this finishes the set). **SAFE** for the IF=0 foreground exec path (never takes a CPL3 interrupt →
+  RSP0 unused → byte-for-byte behavior) and single-core (only the BSP value changes; parked-AP RSP0s
+  untouched). Diagnosed via a 6-reader + adversarial-3-lens diagnostic workflow; two alternative fixes
+  (mask the legacy PIC; a scheduler `kmain rip=0` guard) were adversarially **refuted and NOT applied**
+  — the PIC mask would have killed keyboard IRQ1 (the iron-proven input path), and the scheduler-guard
+  premise is false (proc 0 holds a real saved context by agnsh-launch time). Production binary
+  **1,193,424 B** (size-identical to 1.44.22 — same immediate encoding). Regression (QEMU — cannot
+  reproduce the iron timing, no-regression gate only): `ring3-smoke` 8/8, `smp-smoke` 3/3, `agnsh-smoke`
+  PASS, `check.sh` 11/11, `sweep.sh` 7/7. **Iron re-burn pending** →
+  `agnosticos/docs/development/iron-nuc-zen-log.md#tracker-144x-cycle`.
+
 ## [1.44.22] — 2026-06-11 (1.44.x arc-closing sweep — clarity/correctness, batch 2 of 2)
 
 Second of the two arc-closing cuts. **Comment-only — the production binary is byte-identical to
