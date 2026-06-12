@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.23] — 2026-06-12 (iron burn-1 fix — BSP TSS.RSP0 relocated out of live kernel .bss)
+
+The first 1.44.x iron burn reached agnsh (so the SMP-AP wake, the flagged riskiest item, **passed on
+real Zen**) but locked up at the `agnoshi 1.7.0` banner. Single behavioral fix; the production binary
+is size-identical to 1.44.22 (the only delta is one immediate). One re-burn validates the whole arc.
+
 ### Fixed
 
 - **BSP kernel interrupt stack (`TSS.RSP0`) relocated out of live kernel `.bss`: `0x200000` → `0x3C0000`**
