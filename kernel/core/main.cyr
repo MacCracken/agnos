@@ -2115,7 +2115,25 @@ kprintln("", 0);
 # windows exist (smp_wait_ticks' real SDM delays), and sched_active is still 0 (the
 # wait's ticks no-op in do_context_switch). APs report in and PARK (IF=0 hlt) — the
 # single-core invariant is untouched; "smp: cpus online: N" is the proof line.
-smp_start_aps();
+#
+# GATED OFF (iron multi-verb keyboard-death bisect). The "keyboard dies after the
+# first command" regression is IRON-ONLY — it does NOT reproduce in QEMU even over
+# the exact IRQ1/kb_isr keystroke path with -smp 4 + a 30 s dwell (see
+# scripts/agnsh-irq1-repro.py) — and bisects to THIS wake: multi-verb typing worked
+# on archaemenid at 14115 (1.41.15) and 1439 (DOOM, 1.43.8), both PRE-1.44.18, the
+# only sessions where AGNOS never woke the other Zen cores. Hypothesis: a woken-but-
+# parked AP (LAPIC enabled in ap_entry, but its LVT LINT0/timer left at the INIT
+# reset state, never explicitly masked) competes for / swallows the BSP's 8259 IRQ1
+# (keyboard) on real Zen. SMP buys NOTHING for cooperative-agnsh boot-to-shell (the
+# MVP gate), so gating the wake OFF is BOTH the discriminator AND — if confirmed —
+# the MVP fix. Flip smp_wake_enabled back to 1 to restore the wake (the documented
+# 1.44.18 one-line fallback; everything downstream is inert without it).
+var smp_wake_enabled = 0;
+if (smp_wake_enabled != 0) {
+    smp_start_aps();
+} else {
+    kprintln("smp: AP wake gated (MVP single-core)", 36);
+}
 
 kprintln("Activating scheduler...", 23);
 
