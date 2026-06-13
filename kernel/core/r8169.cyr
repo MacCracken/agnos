@@ -318,8 +318,37 @@ fn r8169_cfg_lock() {
 # CR.RST = 0x10, poll until clear. FreeBSD also writes 0x82=1 if MACRESET
 # flag (8168E_VL and later); we skip that branch — the bigger init story
 # (CPlusCmd + ring + RxConfig late-enable) is the load-bearing path.
+#
+# WARM-REBOOT DMA QUIESCE (added for the AGNOS->AGNOS warm-reboot path).
+# A warm reboot (a clean `reboot`, or the CPU reset from a kernel triple-fault)
+# does NOT power-cycle the PCIe NIC, so the chip keeps CR.RE/CR.TE set with the
+# previous boot's 64-descriptor RX/TX ring DMA still live, pointing at now-stale
+# memory. Issuing a bare CR.RST over a running DMA engine leaves the MAC in an
+# undefined state: RX comes up but delivers no frames, so the next boot's DHCP
+# never sees an OFFER and stalls at "dhcp: DISCOVER" until the long timeout —
+# THE "locks up at DHCP on every reboot" symptom. (Cold boot is fine: power-on
+# clears RE/TE, so the quiesce below is a no-op there.) This was masked until
+# now because every prior "multi-boot" interleaved a Linux install-USB flash,
+# whose r8169 re-init quiesced the chip for us; pure AGNOS->AGNOS warm reboots
+# were never exercised. Multi-source convergent fix — halt DMA BEFORE reset:
+# FreeBSD re_stop(), Linux rtl_rx_close()/rtl8169_hw_reset, OpenBSD re_stop,
+# U-Boot rtl8169 (its comment cites this exact "DHCP failures after kernel
+# reboots" signature, same as the post-reset RXDV-gate clear in r8169_init_rx).
 
 fn r8169_reset() {
+    # 1. Halt the RX/TX DMA engines first (clear RE|TE, keep the other CR bits).
+    #    `0xFF - RE - TE` = the bit-clear mask (the r8169_aspm_disable idiom).
+    var cr0 = r8169_read8(R8169_REG_CR);
+    r8169_write8(R8169_REG_CR, cr0 & (0xFF - R8169_CR_RE - R8169_CR_TE));
+    # 2. Let in-flight DMA drain. No ms-granularity sleep (timer is 100 Hz /
+    #    10 ms/tick), so spin on a non-posted MMIO read like the RXDV-gate settle
+    #    in r8169_init_rx does — each read round-trips the PCIe link (~0.5-1 us,
+    #    CPU-speed-independent); 8000 reads ~= 4-8 ms, comfortably past the ~ms
+    #    in-flight-DMA drain window even on fast Zen silicon.
+    for (var d = 0; d < 8000; d = d + 1) {
+        r8169_read8(R8169_REG_CR);
+    }
+    # 3. Now the hardware reset is safe — datasheet requires DMA halted first.
     r8169_write8(R8169_REG_CR, R8169_CR_RST);
     for (var i = 0; i < 1000; i = i + 1) {
         var cr = r8169_read8(R8169_REG_CR);
