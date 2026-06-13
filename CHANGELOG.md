@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.24] — 2026-06-13 (iron burn-3 fix — mask the legacy PIT once the LAPIC timer owns the timebase)
+
+Iron burn 3 (2026-06-13) was the **biggest 1.44.x iron advance**: with preemptive agnsh disabled
+(`exec_preempt=0`, the prior "return to shell" repair), agnsh launched FULLY on real Zen — banner,
+header, a live `[ASSIST] >` prompt, and `help` rendered. It exposed one iron-only failure: **keyboard
+input dies after the first program or builtin runs.** Root-caused (17-agent adversarial workflow +
+source) to a PIT/LAPIC interrupt-controller mismatch. Single behavioral fix; no instrumentation.
+
+### Fixed
+
+- **Mask the legacy PIT (IRQ0) at the 8259 once the LAPIC timer owns the timebase** (`pic_mask_pit()`
+  in `arch/x86_64/pic.cyr`, called from `core/main.cyr` right after `apic_timer_init`; master mask
+  `0xFC → 0xFD`, keeping IRQ1/keyboard live). **Fixes iron burn 3: keyboard input dies after the first
+  program/builtin.** `pic_init` left the PIT free-running on IRQ0 AND unmasked, and `apic_timer_init`
+  put the LAPIC timer on the *same* vector (INT32); `timer_handler` always `apic_eoi`s (never PIC-EOIs),
+  so a PIT-delivered IRQ0 sticks the 8259's IRQ0 in-service bit forever → the PIC then refuses the
+  lower-priority IRQ1 (keyboard), while the LAPIC timer keeps the prompt alive. On archaemenid the
+  keystroke path is `kb_isr`/IRQ1/PIC (QEMU types via USB `hid_poll`), so the wedge is **invisible in
+  every QEMU smoke**. The dispositive proof it is the PIC and not any context-switch/resume path: `help`
+  (a pure builtin — no exec, no context switch) loses the keyboard identically. Prior art: Linux
+  (`pit_shutdown`/clockevents), xv6 (PIC mask on LAPIC takeover), SeaBIOS (PIT disable). The LAPIC timer
+  (INT32) never traverses the PIC, so the timebase is unaffected (early "ticks before sched" already come
+  from the LAPIC); placed while IF=0 so no IRQ0 was ever latched. Cannot regress the IF=0 paths.
+  - *Pairs with kriya 1.1.3 (separate repo): bare `ls` on agnos also failed — `cmd_ls` passed the literal
+    `"."`, which the AGNOS VFS rejects (requires an absolute path). Fixed kriya-side via `k_getcwd`.*
+  - *NOT in this cut: re-enabling preemptive IF=1 agnsh (`exec_preempt=1`) — that needs the CPL3→CPL0
+    interrupt path + per-process kernel stacks iron-validated; its own deferred arc.*
+
 ## [1.44.23] — 2026-06-12 (iron burn-1 fix — BSP TSS.RSP0 relocated out of live kernel .bss)
 
 The first 1.44.x iron burn reached agnsh (so the SMP-AP wake, the flagged riskiest item, **passed on

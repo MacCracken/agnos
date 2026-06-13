@@ -29,6 +29,24 @@ fn pic_init() {
     return 0;
 }
 
+# Mask the legacy PIT (IRQ0) at the master PIC once the LAPIC timer owns the
+# timebase. pic_init leaves the PIT free-running (mode-2 rate generator) AND
+# unmasks IRQ0, and apic_timer_init puts the LAPIC timer on the SAME vector
+# (INT32). Because timer_handler always EOIs the LAPIC when apic_enabled==1,
+# a PIT-delivered IRQ0 would leave the 8259's IRQ0 in-service bit set forever
+# -> the PIC then refuses to deliver the lower-priority IRQ1 (keyboard) ->
+# keyboard input dies on iron. kb_isr/IRQ1 IS the archaemenid keystroke path
+# (keyboard.cyr); QEMU types via the USB hid_poll ring, so the wedge is
+# invisible in every QEMU smoke. Fix: mask IRQ0, keep IRQ1 (master mask
+# 0xFC -> 0xFD). The LAPIC timer (INT32) never traverses the PIC, so the
+# timebase is unaffected. Prior art: Linux/xv6/SeaBIOS all disable the PIT
+# when switching the timebase to the LAPIC timer. Call AFTER apic_timer_init,
+# while IF=0 (no IRQ0 can have been delivered yet, so no unwedge is needed).
+fn pic_mask_pit() {
+    asm { 0xB0; 0xFD; 0xBA; 0x21; 0x00; 0x00; 0x00; 0xEE; }  # out 0x21, 0xFD (IRQ0 masked, IRQ1 keyboard live)
+    return 0;
+}
+
 # Timer ISR handler — called from the ISR bytecode after regs are pushed.
 # rsp_after_push is the stack pointer with all 9 regs + hardware frame on it.
 fn timer_handler(rsp_after_push) {

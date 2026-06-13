@@ -85,6 +85,11 @@ apic_init();
 # Start APIC timer on vector 32 (same as PIT), ~100Hz
 # QEMU bus freq varies; 10000000 gives roughly 100Hz
 apic_timer_init(32, 10000000);
+# The LAPIC timer now owns vector 32 — mask the legacy PIT (IRQ0) so its
+# free-running ticks can't wedge the 8259's in-service register and block the
+# keyboard's IRQ1 (the iron keystroke path). See pic_mask_pit(). IF is still 0
+# here, so no PIT IRQ0 can have been delivered/latched yet.
+pic_mask_pit();
 kprint("APIC: id=", 9);
 kprint_num(cpu_id);
 kprintln(" timer active", 13);
