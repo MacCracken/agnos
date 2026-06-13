@@ -30,10 +30,19 @@ fn kybernet_exec_agnsh() {
     var r = load64(ep + 16);      # rsp
     var c = load64(ep + 160);     # cr3
     proc_current = pid;
-    # 1.44.14: launch agnsh PREEMPTIBLE (IF=1 in ring 3) so the timer time-slices its prompt
-    # against #43 background jobs (the "shell stays live while a bg job runs" goal). enter_ring3
-    # consumes + clears this, so agnsh's own foreground `run /bin/X` (execwait#37) stays IF=0.
-    exec_preempt = 1;
+    # 1.44.23 IRON FIX — launch agnsh NON-PREEMPTIBLE (IF=0), the iron-proven foreground model.
+    # WHY: 1.44.14 launched agnsh PREEMPTIBLE (IF=1) so the timer time-slices its prompt against
+    # #43 background jobs. That works in QEMU but is the ONE thing in the boot-to-shell path never
+    # validated on real hardware: an IF=1 ring-3 agnsh takes the first-ever CPL3->CPL0 hardware
+    # interrupt (the 100 Hz timer) on Zen, and that froze archaemenid at the banner (burn 1442x:
+    # .22 = banner then freeze, .23 = freeze before the banner). The IF=0 foreground launch takes
+    # NO ring-3 interrupt (the timer only fires while in ring 0, CPL0->CPL0, no RSP0 stack switch),
+    # which is exactly how agnsh typed + dispatched on archaemenid at burn 14115 (2026-06-06) and
+    # how DOOM runs on Zen at burn 1439 (1.43.x) — both iron-proven. So boot-to-shell is restored.
+    # TRADEOFF (deferred, not lost): preemptive `&` background jobs (1.44.14-17) need the CPL3->CPL0
+    # interrupt path working on iron — a separate bring-up arc. Re-enable with `exec_preempt = 1`
+    # here once that path is iron-validated. Foreground `run /bin/X` (execwait#37) was already IF=0.
+    # exec_preempt stays 0 (its default) — leaving it unset is the whole change.
     exec_and_wait(e, r, c);
     var code = proc_get_exit_code(pid);
     proc_reap(pid);
