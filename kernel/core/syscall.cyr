@@ -1527,6 +1527,95 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return rtc_read_unix();
     }
+    if (num == 47) {
+        # sock_connect(dst_ip=arg1, dst_port=arg2, src_port=arg3) — open a
+        # client TCP connection over the polled r8169/IPv4 stack (1.32.x) and
+        # return the kernel conn_id (0..7) in rax, or -1 on failure (conn table
+        # full, SYN-ACK timeout ~8 s, or RST). The third of the three 1.45.x TLS
+        # prereqs — the transport tls_native's send/recv bind to. dst_ip is the
+        # IPv4 packed as (oct1<<24)|(oct2<<16)|(oct3<<8)|oct4 (the kernel ip4()
+        # form); the userland/cyrius peer supplies it post-DNS. src_port<=0 (or
+        # out of range) auto-assigns an ephemeral port (49152 + a 14-bit timer-
+        # derived offset). dst_port must be 1..65535.
+        #
+        # tcp_connect BLOCKS up to ~8 s polling net_poll() for the SYN-ACK and
+        # arch_wait()s (hlt) between polls — so it needs the timer advancing +
+        # an IF=1 hlt-wake. Open the proven sleep_ms#41 window: preempt_disable
+        # (sched suspended, so the timer ISR ticks+EOIs but never switches us
+        # off mid-handshake — the serial-kstack invariant holds) + sti, run the
+        # blocking connect, then cli + preempt_enable. The NIC is IRQ-less
+        # (IMR=0, pure poll), so the only IRQ in the window is the timer. No
+        # other proc is scheduled while connecting (preempt held) — acceptable
+        # in the cooperative-iron model; true overlap waits on the 1.46.x kstacks.
+        if (arg2 <= 0) { stack_canary_check(canary); return 0 - 1; }      # dst_port low
+        if (arg2 > 65535) { stack_canary_check(canary); return 0 - 1; }   # dst_port high
+        var sc_sport = arg3;
+        if (sc_sport <= 0) { sc_sport = 49152 + (timer_ticks & 0x3FFF); }
+        if (sc_sport > 65535) { sc_sport = 49152 + (timer_ticks & 0x3FFF); }
+        preempt_disable();
+        asm { sti; }
+        var sc_cid = tcp_connect(arg1, arg2, sc_sport);
+        asm { cli; }
+        preempt_enable();
+        stack_canary_check(canary);
+        return sc_cid;
+    }
+    if (num == 48) {
+        # sock_send(conn_id=arg1, buf=arg2, len=arg3) — send len bytes from the
+        # user buffer over an ESTABLISHED conn; returns bytes accepted (may be <
+        # len if the conn drops mid-send) or -1 (bad user range). tcp_send
+        # segments to the effective MSS and BLOCKS for each chunk's ACK (one in
+        # flight, ~8 s ceiling) — same IF=1 + preempt-held window as #47. The
+        # user range is validated before the window; tcp_send reads `buf`
+        # directly under the caller CR3 (mapped in the handler, like getrandom
+        # #45's stores). a4 unused.
+        if (arg3 <= 0) { stack_canary_check(canary); return 0; }
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
+        preempt_disable();
+        asm { sti; }
+        var ss_n = tcp_send(arg1, arg2, arg3);
+        asm { cli; }
+        preempt_enable();
+        stack_canary_check(canary);
+        return ss_n;
+    }
+    if (num == 49) {
+        # sock_recv(conn_id=arg1, buf=arg2, maxlen=arg3) — NON-BLOCKING receive:
+        # drain up to maxlen bytes already buffered for the conn into the user
+        # buffer, returning the count (0 = nothing right now / WOULD_BLOCK) or
+        # -1 (bad user range, or the peer has fully closed the conn = EOF).
+        # tcp_recv net_poll()s once (the NIC is polled) and copies from the
+        # per-conn RX ring — no hlt, no deadline — so it's safe IF=0 with no sti
+        # window. The TLS record layer polls this against its own time_unix#46 /
+        # uptime#40 timeout; the 0-vs-(-1) split lets it tell a slow peer from a
+        # closed one (tcp_recv alone returns 0 for both). a4 unused.
+        if (arg3 <= 0) { stack_canary_check(canary); return 0; }
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        # 1.45.2: out-of-range conn_id is an ERROR (-1), not WOULD_BLOCK. tcp_recv
+        # AND tcp_conn_dead both return 0 for conn_id >= tcp_conn_count, so without
+        # this guard a bogus id would read as WOULD_BLOCK (0) forever, breaking the
+        # WOULD_BLOCK-vs-EOF contract (sock_send/#50 are already safe — tcp_send/
+        # tcp_close bounds-check internally and return -1).
+        if (arg1 >= tcp_conn_count) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var sr_n = tcp_recv(arg1, arg2, arg3);
+        if (sr_n > 0) { stack_canary_check(canary); return sr_n; }
+        if (tcp_conn_dead(arg1) != 0) { stack_canary_check(canary); return 0 - 1; }   # EOF
+        stack_canary_check(canary);
+        return 0;                                                        # WOULD_BLOCK
+    }
+    if (num == 50) {
+        # sock_close(conn_id=arg1) — close the conn (FIN+ACK if ESTABLISHED,
+        # else tear down) and free its per-conn RX/retx buffers. Returns 0, or
+        # -1 on a bad conn_id. Non-blocking: tcp_close sends one FIN + arms its
+        # (flag-only) retransmit and frees buffers without polling, so no sti
+        # window. a2..a4 unused.
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        var scl_r = tcp_close(arg1);
+        stack_canary_check(canary);
+        return scl_r;
+    }
     stack_canary_check(canary);
     return 0 - 1;
 }

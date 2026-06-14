@@ -337,17 +337,37 @@ fn tcp_retx_tick() {
     return 0;
 }
 
-fn tcp_connect(dst_ip, dst_port, src_port) {
+# Allocate a connection slot (1.45.2): reuse a CLOSED slot (state 0) below the
+# high-water mark, else extend the mark (cap 8). Returns conn_id or -1 (table
+# full). Used by BOTH tcp_connect (client) and net_handle_tcp's passive-open
+# (server) — mirrors proc_alloc_slot's non-LIFO reuse (1.44.12). Before this,
+# tcp_connect/passive-open only ever incremented tcp_conn_count and tcp_close
+# never reclaimed, so after 8 connect/accept-then-close cycles every later
+# connection failed forever (the slot-exhaustion bug a ring-3 TLS/ark-fetch or
+# agora/telnet consumer would hit). Reclaim is alias-safe: tcp_find_conn skips
+# state==0 slots, a reused slot is re-initialised with a fresh 4-tuple, and
+# tcp_close NULLs the per-conn buffers + disarms the retx before marking CLOSED
+# (no double-free, no stray retransmit from a reclaimed slot).
+fn tcp_alloc_conn_slot() {
+    for (var i = 0; i < tcp_conn_count; i = i + 1) {
+        if (load64(tcp_conn_base(i)) == 0) { return i; }
+    }
     if (tcp_conn_count >= 8) { return 0 - 1; }
-    var conn_id = tcp_conn_count;
+    var id = tcp_conn_count;
     tcp_conn_count = tcp_conn_count + 1;
+    return id;
+}
+
+fn tcp_connect(dst_ip, dst_port, src_port) {
+    var conn_id = tcp_alloc_conn_slot();
+    if (conn_id < 0) { return 0 - 1; }
     var cb = tcp_conn_base(conn_id);
     # Allocate per-connection receive RING (S5: prevent shared-buffer corruption)
     var rx_buf = kmalloc(TCP_RX_RING);
-    if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0 - 1; }
+    if (rx_buf == 0) { store64(cb, 0); return 0 - 1; }      # leave slot CLOSED/reclaimable
     # Retransmit hold buffer (B2).
     var retx_buf = kmalloc(TCP_RETX_BUF);
-    if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); tcp_conn_count = tcp_conn_count - 1; return 0 - 1; }
+    if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); store64(cb, 0); return 0 - 1; }
     # Use timer_ticks for initial seq randomization (reduces spoofing risk)
     var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
     store64(cb, 1);             # state = SYN_SENT
@@ -450,6 +470,19 @@ fn tcp_recv(conn_id, buf, maxlen) {
     return take;
 }
 
+# Ring-3 recv helper (1.45.1): 1 if conn_id names a fully CLOSED/reset
+# connection (state 0). Lets sock_recv#49 distinguish a peer-closed socket
+# (EOF → return -1) from a momentarily-empty receive ring (WOULD_BLOCK →
+# return 0). A live/closing conn (states 1-5) or an out-of-range id reports 0
+# (not dead) — the syscall wrapper bounds-checks the id separately.
+fn tcp_conn_dead(conn_id) {
+    if (conn_id < 0) { return 0; }
+    if (conn_id >= tcp_conn_count) { return 0; }
+    var cb = tcp_conn_base(conn_id);
+    if (load64(cb) == 0) { return 1; }
+    return 0;
+}
+
 fn tcp_close(conn_id) {
     if (conn_id < 0) { return 0 - 1; }
     if (conn_id >= tcp_conn_count) { return 0 - 1; }
@@ -481,6 +514,16 @@ fn tcp_close(conn_id) {
         kfree_sized(retx_buf, TCP_RETX_BUF);
         store64(cb + 136, 0);
     }
+    # 1.45.2: force the slot CLOSED + disarm any armed retx so it is IMMEDIATELY
+    # reclaimable by tcp_alloc_conn_slot (its per-conn buffers are freed above).
+    # The FIN was sent once by the state branch above (best-effort — this stack
+    # does not implement graceful FIN_WAIT/TIME_WAIT, and a FIN_WAIT slot whose
+    # rx ring is already freed could not receive anyway). Without this, the
+    # 8-slot table leaks one slot per connect/close cycle and the ring-3
+    # consumer exhausts it after 8 connections. Idempotent on a re-close
+    # (state already 0, buffers already NULL).
+    store64(cb, 0);                 # state = CLOSED (reclaimable)
+    store64(cb + 128, 0);           # disarm retx (no FIN resend from a reused slot)
     return 0;
 }
 
@@ -601,16 +644,16 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         if ((flags & 0x10) != 0) { return 0; }
         var listen_id = tcp_find_listen(dst_port);
         if (listen_id < 0) { return 0; }
-        # Allocate a new conn slot for the incoming peer.
-        if (tcp_conn_count >= 8) { return 0; }
-        var new_id = tcp_conn_count;
-        tcp_conn_count = tcp_conn_count + 1;
+        # Allocate a new conn slot for the incoming peer (1.45.2: reclaim-aware,
+        # shared with tcp_connect — passive opens no longer leak slots either).
+        var new_id = tcp_alloc_conn_slot();
+        if (new_id < 0) { return 0; }
         var ncb = tcp_conn_base(new_id);
         # Per-connection receive ring + retransmit hold (matches tcp_connect).
         var rx_buf = kmalloc(TCP_RX_RING);
-        if (rx_buf == 0) { tcp_conn_count = tcp_conn_count - 1; return 0; }
+        if (rx_buf == 0) { store64(ncb, 0); return 0; }       # leave slot CLOSED/reclaimable
         var retx_buf = kmalloc(TCP_RETX_BUF);
-        if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); tcp_conn_count = tcp_conn_count - 1; return 0; }
+        if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); store64(ncb, 0); return 0; }
         # ISN — same timer-driven random as tcp_connect.
         var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
         store64(ncb, 6);                       # state = SYN_RCVD

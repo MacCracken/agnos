@@ -5,6 +5,93 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.2] — 2026-06-14 (socket review fixes: conn-slot reclaim + sock_recv bounds)
+
+Fixes the two confirmed findings from the 1.45.1 adversarial socket-syscall review (4-lens, each finding
+adversarially verified; the other candidate findings — cross-process confused-deputy, no-true-KPTI, a
+retx use-after-free, double-close — were correctly refuted as documented MVP limitations or non-bugs).
+
+### Fixed
+
+- **CRITICAL — TCP connection-slot exhaustion** (`core/net_tcp.cyr`): `tcp_connect` (client) and the
+  `net_handle_tcp` passive-open (server) both allocated a slot by `conn_id = tcp_conn_count++` and `tcp_close`
+  **never reclaimed it** — so after 8 connect/accept-then-close cycles every subsequent connection failed
+  with −1 *forever*, until reboot. A ring-3 TLS/`ark`-fetch consumer (multi-resource fetch, retry) or an
+  `agora`/telnet server (Phase B) would wedge after 8 connections. Fix: a shared **`tcp_alloc_conn_slot()`**
+  helper that reuses a CLOSED slot (state 0) below the high-water mark and only extends the mark (cap 8) when
+  no hole exists — mirrors `proc_alloc_slot`'s non-LIFO reuse (1.44.12). `tcp_close` now force-marks the slot
+  CLOSED + disarms its retransmit after freeing the per-conn buffers, so the slot is immediately reclaimable.
+  Both the client and the server allocation paths use the one helper, so the fix covers Phase A *and* Phase B.
+  The reclaim is alias-safe: `tcp_find_conn` already skips state-0 slots and matches by full 4-tuple, and a
+  reused slot is fully re-initialised with a fresh tuple — so no stale in-flight segment can alias a reclaimed
+  slot (the review's refuted "stale alias" stays refuted under reclaim). `kmalloc`-failure rollbacks switched
+  from the now-incorrect `tcp_conn_count--` (which would corrupt the water-mark for a reclaimed hole) to
+  leaving the slot CLOSED.
+- **HIGH — `sock_recv`#49 returned WOULD_BLOCK for an out-of-range conn_id** (`core/syscall.cyr`): the handler
+  guarded `conn_id < 0` but not `conn_id >= tcp_conn_count`, and *both* `tcp_recv` and `tcp_conn_dead` return 0
+  for an out-of-range id — so a bogus conn_id read as `0` (WOULD_BLOCK) forever instead of −1 (error), breaking
+  the WOULD_BLOCK-vs-EOF contract the TLS record layer relies on. Added the upper-bound guard → −1. (`sock_send`
+  #48 / `sock_close`#50 were already safe — `tcp_send`/`tcp_close` bounds-check internally and return −1.)
+
+### Notes
+
+- **Verification**: `build.sh` OK (`build/agnos` 1,196,616 B, +208 over 1.45.1); `check.sh` 11/11; the hermetic
+  `TCP_SELFTEST` smoke (`tcp-smoke.sh`) 4/4 — ring/retx/MSS/window logic byte-intact after the `net_tcp.cyr`
+  rework. A live 8+-connection exhaustion test lands with the first userland consumer (`whirl`/`ark`-fetch).
+- **Carried forward, by design** (review-confirmed, deferred not bugs): the 8 conn slots have no per-process
+  ownership (single-consumer MVP; per-proc sockets ride the 1.46.x kernel-stack arc) and the shared-CR3 KPTI
+  posture (true KPTI is the 1.46.x+ arc) — both documented, neither introduced here.
+
+## [1.45.1] — 2026-06-14 (TLS prereq syscalls: the four ring-3 socket hooks)
+
+The third (and largest) of the three TLS-prereq hook groups — the **client TCP socket surface** ring-3
+TLS binds its transport to. agnos has had a TCP stack kernel-side since 1.32.x (`tcp_connect`/`tcp_send`/
+`tcp_recv`/`tcp_close` over the polled r8169/IPv4 path) but exposed **no socket syscall to ring 3**. This
+cut wires those four kernel calls to syscalls #47–#50. With entropy (#45) and wall-clock (#46) from 1.45.0,
+**all three syscall-hook groups `tls_native` needs now exist** — the remaining TLS work is the
+`CYRIUS_TARGET_AGNOS` stdlib peer (cyrius-side, hands-off) binding `tls_native`'s send/recv/connect/close/
+random/now to these numbers, then the HTTPS client + `ark`-fetch + the `yo`/`dig`/`whirl` net-tools tail.
+
+### Added
+
+- **`sock_connect`(dst_ip, dst_port, src_port) — syscall #47** (`core/syscall.cyr`): open a client TCP
+  connection and return the kernel conn_id (0..7) in `rax`, or −1 (conn table full / SYN-ACK timeout ~8 s
+  / RST). `dst_ip` is the IPv4 packed `(oct1<<24)|(oct2<<16)|(oct3<<8)|oct4` (the kernel `ip4()` form, supplied
+  post-DNS by the caller); `dst_port` must be 1..65535; `src_port<=0`/out-of-range auto-assigns an ephemeral
+  port (49152 + a 14-bit `timer_ticks`-derived offset). `tcp_connect` **blocks** polling `net_poll()` for the
+  SYN-ACK and `arch_wait()`s (hlt) between polls, so the handler wraps it in the proven `sleep_ms`#41 window —
+  `preempt_disable()` (sched suspended → the timer ISR ticks+EOIs but never context-switches mid-handshake,
+  the serial-kstack invariant) + `sti` (IF=1 so `timer_ticks` advances + the hlt wakes) + `cli` +
+  `preempt_enable()`. The NIC is IRQ-less (IMR=0, pure poll) so the only in-window IRQ is the timer.
+- **`sock_send`(conn_id, buf, len) — syscall #48**: send `len` bytes from the user buffer over an ESTABLISHED
+  conn; returns bytes accepted (`<len` if the conn drops mid-send) or −1 (bad user range). `tcp_send` segments
+  to the effective MSS and blocks per-chunk for its ACK — same IF=1 + preempt-held window as #47. The user
+  range is validated (`is_user_range`) before the window; `tcp_send` reads `buf` directly under the caller CR3.
+- **`sock_recv`(conn_id, buf, maxlen) — syscall #49**: NON-BLOCKING — drain up to `maxlen` already-buffered
+  bytes into the user buffer, returning the count (**0 = nothing yet / WOULD_BLOCK**) or **−1 (bad user range,
+  or peer fully closed = EOF)**. `tcp_recv` `net_poll()`s once + copies from the per-conn RX ring (no hlt, no
+  deadline) so it's safe IF=0 with no sti window. The 0-vs-(−1) split (via the new `tcp_conn_dead` helper)
+  lets the TLS record layer tell a slow peer from a closed one — `tcp_recv` alone returns 0 for both. The TLS
+  layer polls this against its own `time_unix`#46 / `uptime`#40 timeout.
+- **`sock_close`(conn_id) — syscall #50**: close the conn (FIN+ACK if ESTABLISHED, else tear down) and free
+  its per-conn RX/retx buffers. Returns 0 or −1 (bad conn_id). Non-blocking — `tcp_close` sends one FIN, arms
+  its flag-only retransmit, and frees buffers without polling, so no sti window.
+- **`tcp_conn_dead`(conn_id) helper** (`core/net_tcp.cyr`): 1 iff `conn_id` names a fully CLOSED/reset
+  connection (state 0); a live/closing conn (states 1-5) or an out-of-range id reports 0. Backs the #49 EOF
+  signal.
+
+### Notes
+
+- **Blocking semantics + the single-core model**: while a `sock_connect`/`sock_send` window is open, preemption
+  is held, so no other proc (incl. an `&` bg job) is scheduled for the call's duration (≤8 s ceiling per
+  segment). Acceptable in the cooperative-iron model; true overlap (concurrent connections from independent
+  procs) waits on the 1.46.x per-process kernel stacks. The 8 global conn slots are not per-process-owned —
+  fine for the MVP one-fetch-at-a-time `ark` consumer; documented for when concurrency lands.
+- **Verification**: `build.sh` OK (`build/agnos` 1,196,408 B, +1,528 over 1.45.0); `check.sh` 11/11; the
+  unreachable-fn count dropped 119→116 as the TCP funcs became reachable. A live socket smoke (QEMU SLIRP, or
+  iron LAN) lands with the first userland consumer (`yo`/`dig`) — the syscalls have no current ring-3 caller, so
+  there is no behavioral regression surface, but the blocking-window path is QEMU-exercisable once a consumer drives it.
+
 ## [1.45.0] — 2026-06-14 (1.45.x cycle OPEN — TLS prereq syscalls: entropy + wall-clock)
 
 Opens the **1.45.x TLS → HTTPS → `ark`-fetch** arc — the first network-consuming app track. The TLS
