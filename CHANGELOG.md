@@ -5,6 +5,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.0] — 2026-06-14 (1.45.x cycle OPEN — TLS prereq syscalls: entropy + wall-clock)
+
+Opens the **1.45.x TLS → HTTPS → `ark`-fetch** arc — the first network-consuming app track. The TLS
+protocol/crypto already ships, hardened + live-verified, in cyrius 6.2.2 / `sigil` 3.7.13 (`tls_native`
+— full TLS 1.3 handshake, Cloudflare-verified, OpenSSL `s_client` interop). `tls_native` is transport/
+entropy/clock-**agnostic** — it calls abstract `send`/`recv`/`random`/`now` that a per-target stdlib peer
+binds to OS syscalls — so the long pole is AGNOS-side: expose the ring-3 syscall hooks it needs, none of
+which existed. This cut lands **two of the three** (the trivial, fully-grounded pair — both thin wrappers
+over already-tested kernel primitives); the socket hooks (`connect`/`send`/`recv`/`close` over the
+1.32.x kernel TCP) are the larger 1.45.1+ bite. The arc tail consumes this surface with the **network-tools
+family** (`yo` ICMP-ping → `dig` DNS → extract `taar` → `whirl` curl/wget) — each its own repo in the
+English-wordplay naming lane, all over the Sanskrit/Hindi `taar` substrate.
+
+### Added
+
+- **`getrandom`(buf, len, flags) — syscall #45** (`core/syscall.cyr`): fills the user buffer with `len`
+  bytes of hardware entropy (Zen RDRAND, via the existing `rdrand_u64()` helper) and returns the byte
+  count in `rax` (−1 on a bad user range, 0 for `len<=0`). `flags` accepted + ignored — there is no
+  blocking entropy pool; RDRAND is the sole source (the CPU on-die DRBG), so the call never blocks and
+  never short-returns. The ring-3 randomness hook `tls_native` binds to (handshake nonces / key material
+  / GCM IV). RDRAND zeroes its destination on a transient failure (Intel SDM); the handler retries up to
+  10× per qword, then (only if still wedged) whitens from `timer_ticks` + buffer position so a stuck
+  RDRAND can never hand back a zeroed buffer — bounded, so the handler cannot hang. User range validated
+  via `is_user_range` before any store.
+- **`time_unix`() — syscall #46** (`core/syscall.cyr`): wall-clock seconds since the Unix epoch (UTC),
+  returned in `rax` (no buffer, like `uptime`#40 / `getpid`#2). Reads the RTC/CMOS via `rtc_read_unix()`
+  (the 1.35.5 clock); returns 0 if the RTC is mid-update/unreadable. Unlike `uptime`#40 (monotonic-since-
+  boot, for frame pacing) this is the **absolute** wall clock TLS cert-validity windows need
+  (`notBefore`/`notAfter`). The second of the three TLS prereqs.
+
+### Notes
+
+- **AGNOS owns the syscall ABI; cyrius mirrors it** — the `CYRIUS_TARGET_AGNOS` stdlib peer that binds
+  `tls_native`'s `random`/`now` to #45/#46 is cyrius-side (same pattern as the 1.41.x shell target).
+  Cyrius stays hands-off here.
+- **Verification**: `build.sh` OK (`build/agnos` 1,194,880 B, +816 B over 1.44.26); `check.sh` 11/11.
+  QEMU's deterministic environment can't meaningfully exercise RDRAND quality or a real RTC, so these get
+  a smoke once the socket hooks land and a userland consumer (`yo`/`dig`) can call them end-to-end.
+
 ## [1.44.26] — 2026-06-14 (strip the kbd-read diagnostic FB markers)
 
 Housekeeping cut after the 1.44.25 tag. The burn-5 localization instrumentation in `kbd_read_blocking`

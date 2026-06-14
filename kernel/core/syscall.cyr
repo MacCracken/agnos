@@ -1479,6 +1479,54 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return sp_pid;
     }
+    if (num == 45) {
+        # getrandom(buf=arg1, len=arg2, flags=arg3) — fill the user buffer with
+        # `len` bytes of hardware entropy (Zen RDRAND) and return the byte count
+        # in rax (or -1 on a bad user range, 0 for len<=0). flags are accepted +
+        # ignored: there is no blocking entropy pool — RDRAND is the sole source
+        # (the CPU's on-die DRBG), so the call never blocks and never short-
+        # returns. The ring-3 randomness hook tls_native binds to (handshake
+        # nonces / key material / the GCM IV) — the first of the three 1.45.x TLS
+        # prereqs. RDRAND zeroes its destination on a transient failure (Intel
+        # SDM); we retry up to 10x per qword, then (only if still wedged) whiten
+        # from the monotonic timer + buffer position so a stuck RDRAND can never
+        # hand back a zeroed buffer — bounded, so the handler can't hang. Runs
+        # IF=0 like every syscall; the user range is validated before any store.
+        if (arg2 <= 0) { stack_canary_check(canary); return 0; }
+        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var gr_w = 0;
+        while (gr_w < arg2) {
+            var gr_v = rdrand_u64();
+            var gr_try = 0;
+            while (gr_v == 0 && gr_try < 10) {
+                gr_v = rdrand_u64();
+                gr_try = gr_try + 1;
+            }
+            if (gr_v == 0) {
+                gr_v = (timer_ticks + gr_w + 1) * 2654435761 + 1;   # degraded last-resort whitener
+            }
+            var gr_b = 0;
+            while (gr_b < 8 && gr_w < arg2) {
+                store8(arg1 + gr_w, gr_v & 0xFF);
+                gr_v = gr_v >> 8;
+                gr_b = gr_b + 1;
+                gr_w = gr_w + 1;
+            }
+        }
+        stack_canary_check(canary);
+        return arg2;
+    }
+    if (num == 46) {
+        # time_unix() — wall-clock seconds since the Unix epoch (UTC), returned
+        # in rax (no buffer, like uptime#40 / getpid#2). Read from the RTC/CMOS
+        # (rtc_read_unix, net_rtc.cyr — the 1.35.5 clock); returns 0 if the RTC
+        # is mid-update/unreadable. Unlike uptime#40 (monotonic-since-boot, for
+        # frame pacing) this is the ABSOLUTE wall clock that TLS cert-validity
+        # windows need (notBefore/notAfter) — the second of the three 1.45.x TLS
+        # prereqs. a1..a3 unused.
+        stack_canary_check(canary);
+        return rtc_read_unix();
+    }
     stack_canary_check(canary);
     return 0 - 1;
 }
