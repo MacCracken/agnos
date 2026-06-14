@@ -95,6 +95,16 @@ fn rtc_read_unix() {
     if (cent >= 19) { if (cent <= 21) { year = cent * 100 + yr; } }
     if (year < 1970) { return 0; }                   # implausible — let NTP handle it
     if (year > 2200) { return 0; }                   # garbage century/year reg — NTP handles it (arc-close hardening pass 2)
+    # 1.45.6 audit fix: validate month + day before civil_to_unix. An out-of-range
+    # CMOS month (0 / 13+ / 0xFF) or day (0 / 32+) — bad battery, corrupt NVRAM, a
+    # hostile/garbage RTC — would otherwise feed civil_to_unix and yield a wildly
+    # wrong Unix time, which time_unix#46 hands to TLS cert-validity (notBefore/
+    # notAfter) → a security-relevant mis-validation. Return 0 (unknown) so NTP /
+    # the caller's clamp handles it, same posture as the year checks above.
+    if (mon < 1) { return 0; }
+    if (mon > 12) { return 0; }
+    if (day < 1) { return 0; }
+    if (day > 31) { return 0; }
     return civil_to_unix(year, mon, day, hour, mins, sec);
 }
 

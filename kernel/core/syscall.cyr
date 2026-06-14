@@ -1642,6 +1642,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # the cached gateway MAC (no inline ARP wait) then nic_send — no sti window.
         var us_len = ksyscall_a4;
         if (us_len <= 0) { stack_canary_check(canary); return 0; }
+        # 1.45.6 (CRITICAL audit fix): cap the payload to the wire MTU. udp_build
+        # does ONE unbounded memcpy of data_len bytes into the fixed net_pkt
+        # buffer (net_pkt+42 after eth/ip/udp headers); a valid-but-oversized
+        # ring-3 buffer would OOB-write past net_pkt into kernel BSS (conn/listener
+        # tables, ARP cache, gateway MAC). 1472 = 1500 MTU − 20 IP − 8 UDP; AGNOS
+        # does no IP fragmentation, so an over-MTU datagram is rejected, not split.
+        if (us_len > 1472) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg3, us_len) == 0) { stack_canary_check(canary); return 0 - 1; }
         var us_sport = (arg2 >> 16) & 0xFFFF;
         var us_dport = arg2 & 0xFFFF;

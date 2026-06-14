@@ -5,6 +5,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.6] — 2026-06-14 (1.45.x net-syscall hardening/security sweep)
+
+Arc-closing adversarial security sweep of the **complete 1.45.x ring-3 net-syscall surface** (#45–#57: entropy,
+wall-clock, TCP client, UDP, ICMP, Phase-B server sockets). 6-lens multi-agent review (memory-safety / arg-validation
+/ resource-DoS / sti-window / entropy-crypto / lifecycle), each finding adversarially verified, reviewers re-deriving
+correct behaviour rather than trusting the code comments. **4 real fixes landed**; the rest were correctly refuted or
+re-derived as false positives (incl. an internally-inconsistent sti-window pair — the verifier refuted the #47 form
+but "confirmed" the byte-identical #48/#55; all three are non-bugs, the `cli`/`preempt_enable` run unconditionally
+after the wrapped call returns).
+
+### Fixed
+
+- **CRITICAL — `udp_send`#52 kernel-BSS overflow** (`core/syscall.cyr`): the handler validated the *user* buffer via
+  `is_user_range` but never bounded the payload against the fixed `net_pkt` buffer — `udp_build` does one unbounded
+  `memcpy` of `data_len` bytes at `net_pkt+42`, so a ring-3 caller with a valid-but-oversized buffer (>~2006 B)
+  OOB-wrote past `net_pkt` into kernel BSS (conn/listener tables, ARP cache, gateway MAC). Added an MTU cap:
+  `us_len > 1472` → −1 (1500 MTU − 20 IP − 8 UDP; AGNOS does no IP fragmentation). DNS/normal UDP is far under it.
+- **CRITICAL — `time_unix`#46 accepts out-of-range RTC month/day** (`core/net_rtc.cyr`): `rtc_read_unix` bounded the
+  year but not month (`[1..12]`) or day (`[1..31]`). A bad-battery / corrupt-NVRAM / hostile RTC (month 0/13/0xFF,
+  day 0/32) fed `civil_to_unix` a garbage Unix time → which `time_unix`#46 hands to TLS cert-validity
+  (`notBefore`/`notAfter`) → a security-relevant mis-validation. Now returns 0 (unknown, NTP/caller handles it),
+  matching the existing year-bounds posture.
+- **CRITICAL — LISTEN-slot reuse aliasing** (`core/net_tcp.cyr`, exposed by the 1.45.5 `tcp_listen` reclaim): closing
+  a LISTEN socket left its **pending un-accepted children** (passive-opens parented at that slot) live; when the
+  reclaim handed the slot to a new `tcp_listen`, `tcp_accept` on the new listener could scan up the old child (it
+  carries the slot index in `parent_listen_id`) and return it — aliasing a connection from the *previous* listener.
+  `tcp_close` of a LISTEN slot now reaps its pending un-accepted children (frees buffers + marks CLOSED). Already-
+  accepted children (bit 10) are owned by the app + skipped by `tcp_accept`, so they can't alias.
+- **HIGH — weak TCP ISN entropy** (`core/net_tcp.cyr`, both `tcp_connect` + the passive-open): the Initial Sequence
+  Number was a pure `timer_ticks` LCG, and `timer_ticks` is ring-3-observable via `uptime`#40 → off-path sequence
+  prediction / data injection. ISN now seeds from `rdrand_u64()` (XOR the timer-LCG as a fallback if RDRAND returns 0).
+
+### Known limitations (documented, not fixed this cut)
+
+- **SYN_RCVD half-open exhaustion (HIGH, MVP-class)**: an inbound SYN to a LISTEN port allocates a slot + buffers in
+  SYN_RCVD; an attacker who never completes the handshake holds it ~31 s (5 RTO retries). 8 such SYNs fill the table
+  → legit connects fail for that window. This is the same family as the documented 8-slot single-consumer cap; the
+  proper fix (SYN-cookies / a real backlog / a short SYN_RCVD timeout) is a later arc, tracked in the
+  [Docker service-sweep harness plan](https://github.com/MacCracken/agnosticos) (the sweep will measure it).
+
+### Notes
+
+- **Refuted / re-derived as non-bugs** (sample): #47/#48/#55 sti-window "IF leak" (early returns are from the wrapped
+  *function*, not the syscall — `cli`/`preempt_enable` run unconditionally); the getrandom degraded-whitener "weak
+  entropy" (fail-closed, RDRAND-primary, fallback is last-resort + XOR'd); passive-open re-entrancy; uninitialised
+  RCV.NXT; TCP ACK-wrap; TCP/UDP high-water-mark "leak" (the reclaim reuses sub-watermark slots, no exhaustion).
+- **Verification**: `build.sh` OK (`build/agnos` 1,199,976 B, +864 over 1.45.5); `check.sh` 11/11; `tcp-smoke` 4/4 ·
+  `tcp-listen-smoke` 2/2 · `dns-smoke` 3/3 (live, UDP cap intact) · `rtc-smoke` 1/1 (clock validation intact).
+
 ## [1.45.5] — 2026-06-14 (Phase-B server sockets — AGNOS can ACCEPT; the container-usage unlock)
 
 Exposes the kernel's server-side TCP (1.32.0 bite A — `tcp_listen`/`tcp_bind`/`tcp_accept`, the LISTEN/passive-open

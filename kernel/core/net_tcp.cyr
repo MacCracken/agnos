@@ -368,8 +368,11 @@ fn tcp_connect(dst_ip, dst_port, src_port) {
     # Retransmit hold buffer (B2).
     var retx_buf = kmalloc(TCP_RETX_BUF);
     if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); store64(cb, 0); return 0 - 1; }
-    # Use timer_ticks for initial seq randomization (reduces spoofing risk)
-    var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
+    # 1.45.6 audit fix: seed the ISN from RDRAND, XOR a timer-LCG as the
+    # fallback if RDRAND returns 0. The old timer_ticks-only LCG was predictable
+    # (timer_ticks is ring-3-observable via uptime#40) → off-path TCP sequence
+    # prediction / data injection. RDRAND makes the ISN unguessable.
+    var isn = (rdrand_u64() ^ (timer_ticks * 64017 + 1)) & 0xFFFFFFFF;
     store64(cb, 1);             # state = SYN_SENT
     store64(cb + 8, src_port);
     store64(cb + 16, dst_port);
@@ -488,6 +491,31 @@ fn tcp_close(conn_id) {
     if (conn_id >= tcp_conn_count) { return 0 - 1; }
     var cb = tcp_conn_base(conn_id);
     var state = load64(cb);
+    # 1.45.6 audit fix (LISTEN-slot reuse aliasing): closing a LISTEN socket must
+    # reap its PENDING un-accepted children (passive-opens parented at this slot
+    # that were never accept()ed). Without this, the 1.45.5 reclaim could hand
+    # this slot to a NEW tcp_listen, and tcp_accept on the new listener would scan
+    # up the old, still-ESTABLISHED-but-unaccepted child (it carries this slot's
+    # index in parent_listen_id, flags bits 16-23) and return it — aliasing a
+    # connection from the previous listener into the new one. Already-accepted
+    # children (bit 10 set) are skipped: the app owns them, and tcp_accept skips
+    # accepted conns anyway, so they can't alias.
+    if (state == 5) {
+        for (var lci = 0; lci < tcp_conn_count; lci = lci + 1) {
+            if (lci == conn_id) { continue; }
+            var lcc = tcp_conn_base(lci);
+            var lcm = load64(lcc + 72);
+            if ((lcm & 0x200) == 0) { continue; }          # not a passive-open
+            if ((lcm & 0x400) != 0) { continue; }          # already accepted — owned by the app
+            if (((lcm >> 16) & 0xFF) != conn_id) { continue; }  # not parented here
+            var lcr = load64(lcc + 48);
+            if (lcr != 0) { kfree_sized(lcr, TCP_RX_RING); store64(lcc + 48, 0); }
+            var lct = load64(lcc + 136);
+            if (lct != 0) { kfree_sized(lct, TCP_RETX_BUF); store64(lcc + 136, 0); }
+            store64(lcc, 0);            # CLOSED (reclaimable)
+            store64(lcc + 128, 0);     # disarm retx
+        }
+    }
     if (state == 2) {
         # Send FIN+ACK (flags = 0x11), advance SND.NXT, arm the FIN retransmit
         # (flag-only — retx_len 0, so it never dereferences the held buffer).
@@ -655,8 +683,10 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
         if (rx_buf == 0) { store64(ncb, 0); return 0; }       # leave slot CLOSED/reclaimable
         var retx_buf = kmalloc(TCP_RETX_BUF);
         if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); store64(ncb, 0); return 0; }
-        # ISN — same timer-driven random as tcp_connect.
-        var isn = (timer_ticks * 64017 + 1) & 0xFFFFFFFF;
+        # ISN — RDRAND-seeded (XOR timer-LCG fallback), 1.45.6 audit fix: same
+        # unguessable-ISN treatment as tcp_connect (server side matters more —
+        # an off-path attacker injecting into a server conn is the worse case).
+        var isn = (rdrand_u64() ^ (timer_ticks * 64017 + 1)) & 0xFFFFFFFF;
         store64(ncb, 6);                       # state = SYN_RCVD
         store64(ncb + 8, dst_port);            # our src_port = listener's port
         store64(ncb + 16, src_port);           # peer's port
