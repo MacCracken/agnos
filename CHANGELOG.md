@@ -5,6 +5,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.7] — 2026-06-14 (toolchain: cyrius pin 6.0.56 → 6.2.2 — onto the current toolchain, byte-identical)
+
+Moves the agnos `cyrius.cyml` toolchain pin from **6.0.56** (held-known-working since the 1.41.x shell-separation
+arc) to **6.2.2** (current cyrius release). **Zero-risk, proven**: the agnos kernel compiles to a **byte-identical**
+binary under both pins (`cmp` clean, 1,199,976 B), so the iron-validated 6.0.56 artifact *is* the 6.2.2 artifact
+bit-for-bit — no iron re-validation cost. The jump lands *past* the 6.1.14–6.1.36 large-binary miscompile window
+(fixed ≥6.1.37, per `project_cyrius_pinlag_large_agnos_binary_miscompile`), on the safe side. This puts the agnos
+kernel on the same toolchain as the rest of the leading-edge ecosystem so it can cleanly consume the forthcoming
+`CYRIUS_TARGET_AGNOS` net-syscall peer (the cyrius-side mirror of the 1.45.x #45-#57 surface).
+
+### Changed
+
+- **`cyrius.cyml` pin 6.0.56 → 6.2.2** (toolchain only — no kernel source change). Solicited + byte-identity-verified
+  (not pin-drift-chasing): user-directed after a clean confirmation pass. The deliberate "don't chase the pin"
+  discipline still holds for *unprompted* nudges; this was an explicit, validated adoption.
+
+### Notes
+
+- **Verification on 6.2.2**: `build.sh` OK · `cmp` byte-identical to the 6.0.56 build · `check.sh` 11/11 ·
+  `agnsh-smoke` boot-to-shell PASS · `ring3-smoke` all green (spawn+wait / stress 4/4 / yield) · `tcp-listen-smoke`
+  2/2 · `tcp`/`dns`/`rtc` smokes green. `build/agnos` 1,199,976 B (byte-identical modulo the `v1.45.6→v1.45.7` banner).
+
 ## [1.45.6] — 2026-06-14 (1.45.x net-syscall hardening/security sweep)
 
 Arc-closing adversarial security sweep of the **complete 1.45.x ring-3 net-syscall surface** (#45–#57: entropy,
