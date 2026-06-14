@@ -5,13 +5,70 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.25] — 2026-06-14 (production cut — warm-reboot DHCP fix + xHCI keyboard-ring fix; boots to shell, no auto-run selftest)
+
+The production cut to review the post-burn-3 fixes. **This is a plain `scripts/build.sh` kernel — it
+boots straight to the agnsh prompt and auto-runs nothing.** (The artifact flashed for the prior review
+was inadvertently a `DOOM_SELFTEST=1` build, which parks at the DOOM render and never reaches the
+shell or the DHCP path — a *test* build, not production. All selftests, DOOM included, are
+compile-gated behind their `*_SELFTEST` flags in `scripts/build.sh`; production sets none of them.)
+QEMU `agnsh-smoke` confirms boot-to-`[ASSIST] >` with no program launched. `build/agnos` 1,194,296 B.
+
+### Fixed
+
+- **Warm-reboot DHCP lockup: halt the r8169 RX/TX DMA engines before issuing CR.RST** (`core/r8169.cyr`
+  `r8169_reset`). A warm reboot (clean `reboot`, or the CPU reset from a kernel triple-fault) does **not**
+  power-cycle the PCIe NIC, so the chip keeps `CR.RE`/`CR.TE` set with the previous boot's 64-descriptor
+  RX/TX ring DMA still live and pointing at now-stale memory. Issuing a bare `CR.RST` over a running DMA
+  engine leaves the MAC undefined — RX comes up but delivers no frames, so the next boot's DHCP never
+  sees an OFFER and **stalls at `dhcp: DISCOVER` until the long timeout** (the "locks up at DHCP on every
+  reboot" symptom). Cold boot is unaffected (power-on clears RE/TE → the new quiesce is a no-op there);
+  this was masked until now because every prior multi-boot interleaved a Linux install-USB flash whose
+  r8169 re-init quiesced the chip for us — pure AGNOS→AGNOS warm reboots were never exercised. Fix halts
+  DMA first (clear RE|TE), spins ~4–8 ms on non-posted MMIO reads to let in-flight DMA drain (no
+  ms-granularity sleep available at 100 Hz; same idiom as the RXDV-gate settle in `r8169_init_rx`), then
+  resets. Multi-source convergent: FreeBSD `re_stop()`, Linux `rtl_rx_close()`/`rtl8169_hw_reset`,
+  OpenBSD `re_stop`, U-Boot rtl8169 (whose comment cites this exact "DHCP failures after kernel reboots"
+  signature).
+- **THE iron fix for "keyboard dies after the first command": arm the xHCI keyboard transfer ring 16
+  TRBs deep (was 1) + re-kick the endpoint at each read** (`arch/x86_64/usb/hid.cyr` `hid_kbd_configure`
+  + new `hid_kbd_kick()`, called from `core/syscall.cyr:kbd_read_blocking`). **archaemenid is
+  USB-keyboard-only** (no PS/2 / i8042 — IRQ1/`kb_isr`/PIC is *dead code* on this box); keystrokes
+  arrive via the xHCI `hid_poll` ring. The keyboard interrupt-IN endpoint was armed **one TRB deep**, so
+  it empties during the IF=0 command-execution gap between two prompt reads (ring 3 runs IF=0 between
+  syscalls; `hid_poll` runs only from the read spin). The controller hits the empty ring at the next
+  service interval and **stalls the endpoint**, and a bare re-arm+doorbell does not reliably restart a
+  stalled interrupt EP on real silicon → keyboard wedges after command 1 (frozen-not-rebooted, CPU alive
+  on the timer). Same **ring-exhaustion EP-stall class** `hid.cyr:247-258` already documents (the 1.33.4
+  interactive lockup), different trigger (gap-depletion vs running off the page end), identical cure:
+  keep the ring from emptying. Depth 16 ≫ the ≤1 report a builtin's gap can consume (1 report/bInterval,
+  gap is ms); `hid_poll` keeps it topped up; `hid_kbd_kick()` restarts a stalled-but-armed EP (spec no-op
+  if Running). **Endpoint-specific, not a global ring/SMM issue:** MSC storage (ext2/fat) rides the *same*
+  shared event ring via `xhci_wait_transfer_event` and works throughout boot + commands. Also killed the
+  false "IRQ1 fills kb_buf on iron" comment in `syscall.cyr` that misdirected the prior three burns.
+  QEMU's usb-kbd cannot model the stall, so the gate is no-regression only: `check.sh` 11/11 ·
+  `agnsh-smoke` · `agnsh-type-test` multi-command · `doom-smoke` (240 colors, same `hid_poll`/`kbscan`
+  path) · `ext2-smoke` 5/5.
+  - *Supersedes the burn-3 `pic_mask_pit()` (1.44.24) and the burn-5 `hlt`-park (`arch_wait`) hypotheses
+    — both were burned and **FALSIFIED on iron** (the keyboard still died after command 1) because both
+    targeted the dead IRQ1/PIC/SMM path. They stay in the tree (harmless: `pic_mask_pit` masks an unused
+    PIT, `arch_wait` is a benign `hlt`) but are NOT the fix.*
+
+### Changed
+
+- **SMP AP wake gated to single-core for the MVP boot** (`core/main.cyr`: `smp_wake_enabled = 0` →
+  prints `smp: AP wake gated (MVP single-core)` instead of `smp_start_aps()`). The 1.44.18 INIT-SIPI-SIPI
+  wake stays in the tree but is held off on iron — it removes a real-Zen variable from the boot-to-shell
+  path (the burn-4 discriminator confirmed the AP wake is not the keyboard-death cause; the gate is kept
+  because cooperative-agnsh boot-to-shell needs no APs). Re-enable when SMP is the active arc.
+
 ## [1.44.24] — 2026-06-13 (iron burn-3 fix — mask the legacy PIT once the LAPIC timer owns the timebase)
 
 Iron burn 3 (2026-06-13) was the **biggest 1.44.x iron advance**: with preemptive agnsh disabled
 (`exec_preempt=0`, the prior "return to shell" repair), agnsh launched FULLY on real Zen — banner,
 header, a live `[ASSIST] >` prompt, and `help` rendered. It exposed one iron-only failure: **keyboard
-input dies after the first program or builtin runs.** Root-caused (17-agent adversarial workflow +
-source) to a PIT/LAPIC interrupt-controller mismatch. Single behavioral fix; no instrumentation.
+input dies after the first program or builtin runs.** The burn-3 fix below (`pic_mask_pit`) targeted it
+but was **later falsified on iron** — the real fix is the xHCI keyboard-ring repair in 1.44.25.
 
 ### Fixed
 
