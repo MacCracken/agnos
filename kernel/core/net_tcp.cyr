@@ -546,9 +546,10 @@ fn tcp_find_listen(listen_port) {
 fn tcp_listen(port) {
     # Refuse duplicate-bind: already-listening on this port → return -1.
     if (tcp_find_listen(port) >= 0) { return 0 - 1; }
-    if (tcp_conn_count >= 8) { return 0 - 1; }
-    var conn_id = tcp_conn_count;
-    tcp_conn_count = tcp_conn_count + 1;
+    # 1.45.5: allocate via the reclaim helper (1.45.2) so a listen/close churn
+    # reuses freed slots instead of leaking the 8-slot table (was tcp_conn_count++).
+    var conn_id = tcp_alloc_conn_slot();
+    if (conn_id < 0) { return 0 - 1; }
     var cb = tcp_conn_base(conn_id);
     store64(cb, 5);             # state = LISTEN
     store64(cb + 8, port);      # src_port = listening port

@@ -1709,6 +1709,42 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return ie_ticks * 10;          # 100 Hz ticks -> milliseconds
     }
+    if (num == 56) {
+        # sock_listen(port=arg1) — bind + listen on a local TCP port and return
+        # the listen_id (0..7) in rax, or -1 (port already bound / conn table
+        # full). **Phase-B — the inbound unlock**: lets a ring-3 server (agora /
+        # descent / sandhi / web) ACCEPT connections, i.e. BE a network service —
+        # the prerequisite for AGNOS container usage ("sockets are the major
+        # hurdle to container usage"). AGNOS merges bind+listen: tcp_listen
+        # creates the LISTEN-state slot on net_ip (the kernel's tcp_bind is just
+        # tcp_listen, ip unused), so BSD bind()+listen() both fold onto this one
+        # call (a separate sock_bind is deferred until a bind-without-listen
+        # consumer surfaces). Pair with sock_accept#57; the accepted conn_id
+        # reuses sock_send#48 / sock_recv#49 / sock_close#50. Non-blocking. a2..a4
+        # unused.
+        if (arg1 <= 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg1 > 65535) { stack_canary_check(canary); return 0 - 1; }
+        var sl_id = tcp_listen(arg1);
+        stack_canary_check(canary);
+        return sl_id;
+    }
+    if (num == 57) {
+        # sock_accept(listen_id=arg1) — NON-BLOCKING accept: return the conn_id
+        # (0..7) of the next ESTABLISHED inbound connection on this listen socket
+        # (a passive-open not yet accepted), or -1 if none is pending yet
+        # (WOULD_BLOCK — the server poll-loops) / listen_id is bad / it is not a
+        # LISTEN slot. The returned conn_id is a normal connection usable with
+        # sock_send#48 / sock_recv#49 / sock_close#50. We net_poll() FIRST so the
+        # passive-open handshake actually progresses (SYN -> SYN_RCVD -> ESTABLISHED
+        # all run inside net_handle_tcp under net_poll; tcp_accept itself only
+        # scans + marks the slot accepted, bit 10). The NIC is polled so net_poll
+        # is IF=0-safe (same as sock_recv#49) — no sti-window. a2..a4 unused.
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        net_poll();                     # drive the inbound SYN handshake to ESTABLISHED
+        var sa_cid = tcp_accept(arg1);
+        stack_canary_check(canary);
+        return sa_cid;
+    }
     stack_canary_check(canary);
     return 0 - 1;
 }

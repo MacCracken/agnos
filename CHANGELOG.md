@@ -5,6 +5,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.5] — 2026-06-14 (Phase-B server sockets — AGNOS can ACCEPT; the container-usage unlock)
+
+Exposes the kernel's server-side TCP (1.32.0 bite A — `tcp_listen`/`tcp_bind`/`tcp_accept`, the LISTEN/passive-open
+path) to ring 3. **This is the inbound unlock**: with #56/#57 a ring-3 server (agora BBS / descent MUD / sandhi web
+/ sit-serve) can `accept()` connections — i.e. *be* a network service — which is the prerequisite for AGNOS
+**container usage** ("sockets are the major hurdle to container usage"). Pairs with the 1.45.x client sockets
+(#47-50) to make AGNOS a full TCP peer. Validated end-to-end: `tcp-listen-smoke` 2/2 — a host netcat connects to
+the AGNOS listener through QEMU SLIRP, the kernel accepts + sends a banner, the host receives it.
+
+### Added
+
+- **`sock_listen`(port) — syscall #56** (`core/syscall.cyr`): bind + listen on a local TCP port → listen_id (0..7)
+  in `rax`, or −1 (port already bound / conn table full). AGNOS **merges bind+listen** (`tcp_listen` creates the
+  LISTEN-state slot on `net_ip`; the kernel `tcp_bind` is just `tcp_listen`, `ip` unused), so BSD `bind()+listen()`
+  both fold onto this one call — a separate `sock_bind` is deferred until a bind-without-listen consumer surfaces.
+  Non-blocking.
+- **`sock_accept`(listen_id) — syscall #57**: NON-BLOCKING accept → the conn_id (0..7) of the next ESTABLISHED
+  inbound connection on this listen socket, or −1 (none pending yet = WOULD_BLOCK, the server poll-loops / bad
+  listen_id / not a LISTEN slot). The returned conn_id is a normal connection usable with `sock_send`#48 /
+  `sock_recv`#49 / `sock_close`#50. The handler **`net_poll()`s first** so the passive-open handshake actually
+  progresses (SYN → SYN_RCVD → ESTABLISHED runs inside `net_handle_tcp` under `net_poll`; `tcp_accept` itself only
+  scans + marks the slot accepted) — IF=0-safe (polled NIC, same as `sock_recv`), no sti-window.
+
+### Fixed
+
+- **`tcp_listen` slot allocation now uses the 1.45.2 reclaim helper** (`core/net_tcp.cyr`): was the old append-only
+  `tcp_conn_count++`; switched to `tcp_alloc_conn_slot()` so a listen/close churn reuses freed slots instead of
+  leaking the 8-slot table (the same exhaustion class the 1.45.2 client/UDP fixes closed).
+
+### Notes
+
+- **Verification**: `build.sh` OK (`build/agnos` 1,199,112 B, +496 over 1.45.4); `check.sh` 11/11; `tcp-listen-smoke`
+  **2/2** (host→AGNOS accept + the no-connection-timeout path). The syscalls have no ring-3 caller yet (the cyrius
+  `CYRIUS_TARGET_AGNOS` peer + a test server drive them) — a ring-3 sock_listen/accept smoke lands with the peer.
+- **Concurrency is a service/peer concern, not the kernel's**: agora's fork-per-accept model needs an AGNOS-specific
+  path (AGNOS has `spawn`#3/#43 + `waitpid`#4, not Unix `fork`); descent's single-thread epoll model maps cleanly.
+  The kernel just provides listen/accept/send/recv/close; how a server structures concurrency is downstream.
+- Cyrius-side peer for #56/#57 added to the net-syscall proposal (`cyrius/docs/development/proposals/2026-06-14-agnos-net-entropy-clock-syscalls.md`).
+
 ## [1.45.4] — 2026-06-14 (ICMP-echo ring-3 syscall — the `yo`/ping prerequisite)
 
 Exposes the kernel's `icmp_ping` (1.35.x — `net_icmp.cyr`, internal-only until now) to ring 3 as the ping hook
