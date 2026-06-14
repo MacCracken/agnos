@@ -5,6 +5,48 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.3] — 2026-06-14 (UDP-53 ring-3 syscalls — the `dig`/DNS prerequisite)
+
+Exposes the kernel's server-side UDP transport (1.32.0 bite F — `udp_send` / the 8-entry listener table /
+`udp_recv_from`, used internally by DHCP/DNS/NTP) to ring 3, the one net-stack gap the Phase-A `dig` tool
+needs (DNS over UDP-53). All four are non-blocking — `udp_send` reads the cached gateway MAC (no inline ARP
+wait) and `udp_recv_from` polls the NIC once + drains the mailbox — so unlike the TCP client sockets none need
+an sti window. Also closes the same slot-exhaustion class the 1.45.2 TCP fix did, on the UDP listener table.
+
+### Added
+
+- **`udp_bind`(port) — syscall #51** (`core/syscall.cyr` + `core/net.cyr`): register a UDP listener on a local
+  port → listener_id (0..7) in `rax`, or −1 (already bound / table full). The listener captures the most-recent
+  inbound datagram for that port in a kernel mailbox for `udp_recv`#53. Non-blocking.
+- **`udp_send`(dst_ip, ports, buf, len) — syscall #52**: send one datagram → nic byte count / −1. The two 16-bit
+  ports are **packed into one arg** (`src_port = (arg2>>16)&0xFFFF`, `dst_port = arg2&0xFFFF`) since the 4-arg
+  `ksyscall` ABI can't pass five separates and `dst_ip` needs a full 32 bits (`ip4()` packed form, `arg1`);
+  `len` rides `ksyscall_a4`. `src_port` should match a `udp_bind` port so the reply routes back. User buffer
+  `is_user_range`-validated. Non-blocking.
+- **`udp_recv`(listener_id, buf, maxlen, addr_out) — syscall #53**: NON-BLOCKING drain of the listener's pending
+  datagram → byte count (0 = none yet / WOULD_BLOCK) or −1 (bad listener_id / bad user range). `addr_out`
+  (`ksyscall_a4`), if non-zero, is a 16-byte user region receiving peer `src_ip`@+0 / `src_port`@+8 (0 to skip);
+  both the buffer and `addr_out` are `is_user_range`-validated.
+- **`udp_unbind`(listener_id) — syscall #54** + the **`udp_unbind`** kernel fn (`core/net.cyr`): free the
+  listener's recv buffer + mark the slot reclaimable → 0 / −1 (bad id); idempotent. The reclaim pair for
+  `udp_bind`.
+
+### Fixed
+
+- **UDP listener-slot exhaustion** (`core/net.cyr`): same class as the 1.45.2 TCP conn-slot bug — `udp_bind`
+  only ever incremented `udp_listener_count` and nothing freed a slot, so a consumer binding an ephemeral port
+  per query (`dig`) would exhaust the 8-listener table. Added a shared **`udp_alloc_listener_slot()`** (reuse a
+  free slot below the high-water mark, else extend, cap 8) used by `udp_bind`, plus `udp_unbind` to release.
+  The `kmalloc`-failure rollback switched from the now-incorrect `udp_listener_count--` to leaving the slot free.
+
+### Notes
+
+- **Verification**: `build.sh` OK (`build/agnos` 1,198,616 B, +2,000 over 1.45.2); `check.sh` 11/11; the
+  `DNS_SELFTEST` smoke (`dns-smoke.sh`) 3/3 incl. a **live SLIRP lookup** (`dns: live=104.20.23.154`) — which
+  drives the exact `udp_bind → udp_send → udp_recv_from` path the refactor touched, end-to-end.
+- The listener mailbox holds **one** datagram per port (most-recent-wins) — correct for DNS request/response
+  (one in flight); a multi-datagram queue is deferred until a consumer needs it.
+
 ## [1.45.2] — 2026-06-14 (socket review fixes: conn-slot reclaim + sock_recv bounds)
 
 Fixes the two confirmed findings from the 1.45.1 adversarial socket-syscall review (4-lens, each finding

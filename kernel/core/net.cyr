@@ -222,11 +222,25 @@ fn udp_find_listener(port) {
     return 0 - 1;
 }
 
+# Allocate a UDP listener slot (1.45.3): reuse a free slot (state 0) below the
+# high-water mark, else extend the mark (cap 8). Returns listener_id or -1.
+# Mirrors the TCP tcp_alloc_conn_slot reclaim — without it (and udp_unbind),
+# a ring-3 consumer that binds an ephemeral port per query (dig) leaks one of
+# the 8 listener slots per query and exhausts the table.
+fn udp_alloc_listener_slot() {
+    for (var i = 0; i < udp_listener_count; i = i + 1) {
+        if (load64(udp_listener_base(i)) == 0) { return i; }
+    }
+    if (udp_listener_count >= 8) { return 0 - 1; }
+    var id = udp_listener_count;
+    udp_listener_count = udp_listener_count + 1;
+    return id;
+}
+
 fn udp_bind(port) {
     if (udp_find_listener(port) >= 0) { return 0 - 1; }  # already bound
-    if (udp_listener_count >= 8) { return 0 - 1; }
-    var listener_id = udp_listener_count;
-    udp_listener_count = udp_listener_count + 1;
+    var listener_id = udp_alloc_listener_slot();
+    if (listener_id < 0) { return 0 - 1; }
     var lb = udp_listener_base(listener_id);
     # (1.32.2 FIX #8 per dhcp-end-to-end-audit.md FINDING #8) 1024-byte
     # per-listener recv buffer. Pre-fix kmalloc(256) was too small for
@@ -239,7 +253,7 @@ fn udp_bind(port) {
     # other UDP traffic this kernel needs.
     var buf = kmalloc(1024);
     if (buf == 0) {
-        udp_listener_count = udp_listener_count - 1;
+        store64(lb, 0);        # leave slot free/reclaimable (do NOT shrink the water-mark)
         return 0 - 1;
     }
     store64(lb, 1);            # bound
@@ -270,6 +284,23 @@ fn udp_recv_from(listener_id, buf, maxlen, src_ip_out, src_port_out) {
     if (src_port_out != 0) { store64(src_port_out, load64(lb + 40)); }
     store64(lb + 24, 0);  # consumed
     return copy_len;
+}
+
+# Release a UDP listener (1.45.3): free its 1024-byte recv buffer and mark the
+# slot free so udp_alloc_listener_slot can reuse it. Returns 0, or -1 for a bad
+# listener_id; idempotent on an already-free slot. The reclaim pair for
+# udp_bind — a ring-3 consumer that binds an ephemeral port per query (dig)
+# must unbind after each, or the 8-listener table exhausts.
+fn udp_unbind(listener_id) {
+    if (listener_id < 0) { return 0 - 1; }
+    if (listener_id >= udp_listener_count) { return 0 - 1; }
+    var lb = udp_listener_base(listener_id);
+    if (load64(lb) == 0) { return 0; }            # already free (idempotent)
+    var buf = load64(lb + 16);
+    if (buf != 0) { kfree_sized(buf, 1024); store64(lb + 16, 0); }
+    store64(lb, 0);            # state = free (reclaimable)
+    store64(lb + 24, 0);       # drop any pending datagram
+    return 0;
 }
 
 # === per-protocol + ingress + TCP split into siblings (1.36.x net.cyr refactor) ===

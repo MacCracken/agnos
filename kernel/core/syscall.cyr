@@ -1616,6 +1616,76 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return scl_r;
     }
+    if (num == 51) {
+        # udp_bind(port=arg1) — register a UDP listener on a local port and return
+        # its listener_id (0..7) in rax, or -1 (port already bound / table full).
+        # The listener captures the most-recent inbound datagram for that port in
+        # a kernel mailbox for udp_recv#53 to drain. `dig` binds an ephemeral port
+        # to catch the DNS reply before sending the query. Non-blocking. Pair with
+        # udp_unbind#54 — the 1.45.3 listener-slot reclaim lets a per-query
+        # bind/unbind loop reuse slots instead of exhausting the 8-listener table.
+        # a2..a4 unused.
+        if (arg1 <= 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg1 > 65535) { stack_canary_check(canary); return 0 - 1; }
+        var ub_id = udp_bind(arg1);
+        stack_canary_check(canary);
+        return ub_id;
+    }
+    if (num == 52) {
+        # udp_send(dst_ip=arg1, ports=arg2, buf=arg3, len=a4) — send one UDP
+        # datagram; returns the nic byte count or -1 (NIC down / bad user range /
+        # len<=0 returns 0). The two 16-bit ports are PACKED into arg2 (the 4-arg
+        # ksyscall ABI can't pass five separates and dst_ip needs a full 32 bits):
+        #   src_port = (arg2 >> 16) & 0xFFFF , dst_port = arg2 & 0xFFFF.
+        # dst_ip is the ip4() packed form; src_port should match a udp_bind#51 port
+        # so the reply routes back to that listener. Non-blocking: udp_send reads
+        # the cached gateway MAC (no inline ARP wait) then nic_send — no sti window.
+        var us_len = ksyscall_a4;
+        if (us_len <= 0) { stack_canary_check(canary); return 0; }
+        if (is_user_range(arg3, us_len) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var us_sport = (arg2 >> 16) & 0xFFFF;
+        var us_dport = arg2 & 0xFFFF;
+        var us_r = udp_send(arg1, us_sport, us_dport, arg3, us_len);
+        stack_canary_check(canary);
+        return us_r;
+    }
+    if (num == 53) {
+        # udp_recv(listener_id=arg1, buf=arg2, maxlen=arg3, addr_out=a4) — NON-
+        # BLOCKING: drain the listener's pending datagram into the user buffer,
+        # returning the byte count (0 = none yet / WOULD_BLOCK) or -1 (bad
+        # listener_id / bad user range). If addr_out (a4) is non-zero it must be a
+        # 16-byte user region: peer src_ip is written at +0, src_port at +8 (pass
+        # a4=0 to skip). udp_recv_from net_poll()s once then copies — safe IF=0, no
+        # sti window. The mailbox holds only the most-recent datagram (one DNS
+        # query/response in flight). The DNS layer polls this against its own
+        # time_unix#46 timeout.
+        if (arg3 <= 0) { stack_canary_check(canary); return 0; }
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg1 >= udp_listener_count) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
+        var ur_addr = ksyscall_a4;
+        if (ur_addr != 0) {
+            if (is_user_range(ur_addr, 16) == 0) { stack_canary_check(canary); return 0 - 1; }
+            var ur_n = udp_recv_from(arg1, arg2, arg3, ur_addr, ur_addr + 8);
+            stack_canary_check(canary);
+            return ur_n;
+        }
+        var ur_n2 = udp_recv_from(arg1, arg2, arg3, 0, 0);
+        stack_canary_check(canary);
+        return ur_n2;
+    }
+    if (num == 54) {
+        # udp_unbind(listener_id=arg1) — release a UDP listener (free its recv
+        # buffer + mark the slot reclaimable). Returns 0 or -1 (bad listener_id);
+        # idempotent on an already-free slot. Pair with udp_bind#51 so a per-query
+        # bind/unbind loop (dig) reuses slots rather than exhausting the table.
+        # a2..a4 unused.
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg1 >= udp_listener_count) { stack_canary_check(canary); return 0 - 1; }
+        var uu_r = udp_unbind(arg1);
+        stack_canary_check(canary);
+        return uu_r;
+    }
     stack_canary_check(canary);
     return 0 - 1;
 }
