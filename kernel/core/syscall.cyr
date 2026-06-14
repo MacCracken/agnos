@@ -293,7 +293,14 @@ fn kbd_read_blocking(buf, count) {
     # scancode incl. shift-release breaks is processed in-window.
     var n = 0;
     while (n < count) {
-        while (kb_has_key() == 0) { }   # IRQ1 fills kb_buf (iron); hid_poll drains ring (QEMU)
+        while (kb_has_key() == 0) { arch_wait(); }   # hlt-park until timer/kbd IRQ — NOT a busy-spin.
+        # A continuous IF=1 ring-0 CPU busy-spin starves the firmware's SMM USB-legacy keyboard
+        # emulation on real Zen (it injects i8042 scancodes via periodic SMIs, which a never-yielding
+        # spin can't let run) -> keyboard dies after the first line; invisible in QEMU (no SMM legacy
+        # emulation). hlt yields the pipeline so SMM runs, and is the proven-on-iron recipe used by
+        # sleep_ms#41 (DOOM frame pacing) + kbscan#42 (DOOM input). IF=1 (sti above) so the 100 Hz
+        # timer guarantees a wake even with no key; a keystroke's own IRQ1 wakes hlt immediately.
+        # preempt_count>0 (preempt_disable above) so the timer ISR ticks+EOIs but never switches.
         var sc = kb_read_scancode();
         kputc(124);                     # TEMP DIAGNOSTIC '|' — a scancode reached the spin
         var ch = scancode_to_ascii(sc);
