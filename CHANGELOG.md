@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.4] — 2026-06-14 (ICMP-echo ring-3 syscall — the `yo`/ping prerequisite)
+
+Exposes the kernel's `icmp_ping` (1.35.x — `net_icmp.cyr`, internal-only until now) to ring 3 as the ping hook
+`yo` (the Phase-A ICMP net-tool) needs. With this, **all of Phase A is kernel-unblocked** (`yo` ICMP · `dig`
+UDP · `whirl` TCP+TLS+HTTP). `net_icmp.cyr` is untouched — this is a pure expose-to-ring-3 syscall.
+
+### Added
+
+- **`icmp_echo`(dst_ip) — syscall #55** (`core/syscall.cyr`): send one ICMP echo request (ping) to `dst_ip`
+  (the `ip4()` packed form) and block ~3 s (bounded) for the matching reply; returns the round-trip time in
+  **milliseconds** (≥ 0) or −1 (timeout / NIC down). RTT resolution is the 100 Hz tick (10 ms) — a sub-10 ms
+  reply returns 0. Like `sock_connect`#47, the underlying `icmp_ping` polls `net_poll()` + `arch_wait()`s on a
+  `timer_ticks` deadline, so the handler wraps it in the proven `sleep_ms`#41 sti-window (`preempt_disable` →
+  timer ISR ticks+EOIs but never context-switches mid-ping → `sti` so the deadline advances + the hlt wakes →
+  `cli` → `preempt_enable`; the NIC is IRQ-less/polled so the only in-window IRQ is the timer). No user buffer.
+  The ~3 s timeout is `icmp_ping`'s fixed bound; a configurable `-W` (parameterising `icmp_ping`) is a future
+  enhancement.
+
+### Notes
+
+- **Verification**: `build.sh` OK (`build/agnos` 1,198,792 B, +176 over 1.45.3); `check.sh` 11/11. `icmp_ping`
+  itself is byte-unchanged (the `icmp-smoke` ICMP build/checksum path is unaffected); a live RTT smoke lands
+  with `yo` as the first ring-3 caller.
+- The cyrius-side `CYRIUS_TARGET_AGNOS` peer for #55 is added to the net/entropy/clock proposal
+  (`cyrius/docs/development/proposals/2026-06-14-agnos-net-entropy-clock-syscalls.md`) — `yo` is no longer an
+  AGNOS-side gap.
+
 ## [1.45.3] — 2026-06-14 (UDP-53 ring-3 syscalls — the `dig`/DNS prerequisite)
 
 Exposes the kernel's server-side UDP transport (1.32.0 bite F — `udp_send` / the 8-entry listener table /

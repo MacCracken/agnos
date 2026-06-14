@@ -1686,6 +1686,29 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return uu_r;
     }
+    if (num == 55) {
+        # icmp_echo(dst_ip=arg1) — send one ICMP echo request (ping) to dst_ip and
+        # block (~3 s bounded) for the matching reply; returns the round-trip time
+        # in MILLISECONDS (>= 0) or -1 (timeout / NIC down). The ring-3 ping hook
+        # for `yo` (the Phase-A net-tool). dst_ip is the ip4() packed form. Like
+        # sock_connect#47, icmp_ping polls net_poll() + arch_wait()s on a
+        # timer_ticks deadline, so it runs in the proven sleep_ms#41 sti-window:
+        # preempt_disable (timer ISR ticks+EOIs but never context-switches mid-
+        # ping — the serial-kstack invariant) + sti (IF=1 so timer_ticks advances
+        # + the hlt wakes) + cli + preempt_enable. The NIC is IRQ-less (IMR=0,
+        # pure poll), so the only in-window IRQ is the timer. RTT resolution is the
+        # 100 Hz tick (10 ms); a sub-10 ms reply returns 0. a2..a4 unused. (The
+        # ~3 s timeout is icmp_ping's fixed bound; a configurable -W is a future
+        # enhancement that would parameterise icmp_ping.)
+        preempt_disable();
+        asm { sti; }
+        var ie_ticks = icmp_ping(arg1);
+        asm { cli; }
+        preempt_enable();
+        if (ie_ticks < 0) { stack_canary_check(canary); return 0 - 1; }
+        stack_canary_check(canary);
+        return ie_ticks * 10;          # 100 Hz ticks -> milliseconds
+    }
     stack_canary_check(canary);
     return 0 - 1;
 }
