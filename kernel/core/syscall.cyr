@@ -269,8 +269,17 @@ fn kernel_resume() {
 # busy-poll (no hlt) so the QEMU path needs no wake interrupt. Echo uses kputc
 # (serial + GOP framebuffer mirror) — the same fb path write(1) uses from a
 # ring-3 syscall since 1.41.12, so it renders under the unified exec CR3 on iron.
+# TEMP DIAGNOSTIC (iron freeze-after-first-command localization) — remove after the burn.
+# rb_diag_n counts kbd_read_blocking invocations so the FB shows [rb1>...] [rb2>...] etc.
+# On iron: [rb2> appearing after command 1 = agnsh DID reach the 2nd read (freeze is in the
+# read spin or after it); [rb2> NOT appearing = agnsh wedged in its own dispatch before the
+# 2nd read. The per-scancode '|' marks every scancode the spin actually consumes, so we can
+# see whether keys arrive in read#2 even if echo is broken.
+var rb_diag_n = 0;
 fn kbd_read_blocking(buf, count) {
     if (count <= 0) { return 0; }
+    rb_diag_n = rb_diag_n + 1;
+    kprint("[rb", 3); kprint_num(rb_diag_n); kprint(">", 1);   # TEMP DIAGNOSTIC
     preempt_disable();         # 1.44.1: suspend preemption for the whole line read.
     # The timer ISR still EOIs + ticks, but do_context_switch is a no-op while
     # preempt_count>0. Replaces the old `sched_active=0`/save+restore toggle: the
@@ -286,6 +295,7 @@ fn kbd_read_blocking(buf, count) {
     while (n < count) {
         while (kb_has_key() == 0) { }   # IRQ1 fills kb_buf (iron); hid_poll drains ring (QEMU)
         var sc = kb_read_scancode();
+        kputc(124);                     # TEMP DIAGNOSTIC '|' — a scancode reached the spin
         var ch = scancode_to_ascii(sc);
         if (ch == 10) {                 # Enter: terminate the line. Echo newline,
             kputc(10);                  # store it as the terminator, return.
@@ -293,6 +303,7 @@ fn kbd_read_blocking(buf, count) {
             n = n + 1;
             kbd_irq_disable();
             preempt_enable();
+            kprint("ent]", 4);          # TEMP DIAGNOSTIC — returned via Enter
             return n;
         }
         if (ch == 4) {                  # Ctrl-D (EOF). Canonical tty semantics:
@@ -304,6 +315,7 @@ fn kbd_read_blocking(buf, count) {
             # second Ctrl-D at the fresh line start then yields EOF. Not echoed.
             kbd_irq_disable();
             preempt_enable();
+            kprint("eof]", 4);          # TEMP DIAGNOSTIC — returned via Ctrl-D
             return n;
         }
         if (ch == 8) {                  # Backspace: erase one cell + drop one byte
@@ -323,6 +335,7 @@ fn kbd_read_blocking(buf, count) {
     # Buffer filled before a newline arrived — return the partial line.
     kbd_irq_disable();
     preempt_enable();
+    kprint("full]", 5);             # TEMP DIAGNOSTIC — returned on buffer-full
     return n;
 }
 
