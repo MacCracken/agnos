@@ -234,14 +234,36 @@ fn hid_kbd_configure(slot_id) {
     #   p_lo / p_hi = report_buf phys
     #   status      = TRB Transfer Length = mps (8) | Interrupter Target=0
     #   ctrl        = IOC=1 (bit 5) | type=Normal(1)<<10 | cycle=1
-    var trb = xfer_ring;
-    store64(trb + 0, report_buf);
-    store32(trb + 8, mps & 0x1FFFF);
-    # IOC=bit 5, ISP=bit 2 (Interrupt on Short Packet — Linux always sets
-    # ISP for IN data; defensive against a HID device returning <mps bytes).
-    var trb_ctrl = (1 << 5) | (1 << 2) | (XHCI_TRB_NORMAL << 10) | 0x1;
-    store32(trb + 12, trb_ctrl);
-    hid_kbd_xfer_idx   = 1;   # next free TRB slot (we just filled 0)
+    # KBD-RING-DEPTH FIX (1.44.x iron "keyboard dies after the first command").
+    # Arm a BATCH of Normal TRBs, not just one. A 1-deep interrupt-IN ring goes
+    # EMPTY the instant polling pauses — the IF=0 command-execution gap between
+    # two prompt reads (ring 3 runs IF=0 between syscalls; hid_poll only runs
+    # from the read spin). The lone TRB is consumed by a key release during the
+    # gap, the controller hits the empty ring at the next service interval and
+    # STALLS the endpoint, and a bare re-arm+doorbell does NOT reliably restart
+    # a stalled interrupt EP on real xHCI -> keyboard wedges after command 1
+    # (frozen-not-rebooted; CPU alive on the timer). This is the SAME
+    # EP-stall-on-ring-exhaustion class as the 1.33.4 run-off-the-end lockup the
+    # Link TRB below fixed — different trigger (gap-depletion vs page-end wrap),
+    # identical cure: keep the ring from emptying. Depth 16 >> the <=1 report a
+    # builtin's gap can consume (the device sends at most one report per
+    # bInterval and the gap is milliseconds), so the controller always finds a
+    # valid TRB and never stalls. All TRBs point at the shared report_buf: only
+    # one IN transaction completes per interval so reports never overlap
+    # in flight; a gap that coalesces >1 report keeps only the LAST (the resting
+    # key state once the user lifts off command 1) — applied once, clean, no
+    # stranded keys. IOC=bit 5, ISP=bit 2 (Interrupt on Short Packet — Linux
+    # always sets ISP for IN data; defensive against <mps bytes). cycle=1.
+    var depth = 16;
+    var di = 0;
+    while (di < depth) {
+        var dtrb = xfer_ring + di * 16;
+        store64(dtrb + 0, report_buf);
+        store32(dtrb + 8, mps & 0x1FFFF);
+        store32(dtrb + 12, (1 << 5) | (1 << 2) | (XHCI_TRB_NORMAL << 10) | 0x1);
+        di = di + 1;
+    }
+    hid_kbd_xfer_idx   = depth;   # next free TRB slot (we just filled 0..depth-1)
     hid_kbd_xfer_cycle = 1;
 
     # Link TRB at slot 255 wraps the transfer ring back to slot 0 (xHCI 1.2
@@ -346,6 +368,20 @@ fn hid_arm_xfer_trb() {
         hid_kbd_xfer_idx = 0;
     }
     return 1;
+}
+
+# Restart kick for the kbd interrupt-IN endpoint: ring its doorbell so the
+# controller re-evaluates the transfer ring. Ringing a Running endpoint's
+# doorbell is a spec-defined no-op; ringing a STALLED-but-armed one resumes it.
+# Called at the start of every blocking read so a read entered after an idle
+# command-execution gap explicitly re-kicks the EP — belt-and-suspenders with
+# the deep ring (which prevents the stall in the first place). KBD-RING-DEPTH FIX.
+fn hid_kbd_kick() {
+    if (hid_kbd_slot_id == 0) { return 0; }
+    var our_dci = xhci_dci_for_ep(hid_kbd_ep_addr);
+    var db_addr = xhci_mmio_base + xhci_db_off + hid_kbd_slot_id * 4;
+    store32(db_addr, our_dci & 0xFF);
+    return 0;
 }
 
 # Phase 5 poll entry — drain the event ring, processing any Transfer

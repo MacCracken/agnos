@@ -288,9 +288,17 @@ fn kbd_read_blocking(buf, count) {
     kb_shift = 0; kb_ctrl = 0; # defensive: never enter a read with a stranded
     # modifier from a prior partial read (continuous drain below keeps it honest
     # within the line; this just guarantees a clean start)
-    kbd_irq_enable();          # IF=1 for the WHOLE line — IRQ1 -> kb_isr fills
-    # kb_buf (iron); hid_poll drains the ring (QEMU). Held continuously so every
-    # scancode incl. shift-release breaks is processed in-window.
+    kbd_irq_enable();          # IF=1 for the WHOLE line so the spin can take the
+    # timer wake. INPUT PATH (corrected 1.44.x): archaemenid is USB-keyboard-only
+    # (no PS/2 / i8042), so keystrokes arrive via the xHCI USB-HID ring that
+    # kb_has_key()->hid_poll() drains; the IRQ1/kb_isr/PIC path is DEAD CODE on
+    # this hardware (QEMU's usb-kbd delivers via the same hid_poll ring). The old
+    # "IRQ1 fills kb_buf on iron" comment here was wrong and misdirected five
+    # iron burns — see project_archaemenid_keystroke_path_usb_only.
+    hid_kbd_kick();            # KBD-RING-DEPTH FIX: re-kick the kbd EP in case it
+    # stalled during the IF=0 command-execution gap since the previous read. The
+    # deep transfer ring (hid_kbd_configure) prevents the stall; this restarts the
+    # EP if one ever happens anyway. No-op if no HID kbd (slot 0) / already Running.
     var n = 0;
     while (n < count) {
         while (kb_has_key() == 0) { arch_wait(); }   # hlt-park until timer/kbd IRQ — NOT a busy-spin.
