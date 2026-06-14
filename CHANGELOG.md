@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.44.26] — 2026-06-14 (strip the kbd-read diagnostic FB markers)
+
+Housekeeping cut after the 1.44.25 tag. The burn-5 localization instrumentation in `kbd_read_blocking`
+has served its purpose (the freeze was root-caused to the xHCI keyboard-ring stall, fixed in 1.44.25),
+so the temporary framebuffer markers come out. No behavioral change — the read loop, the `hid_kbd_kick()`
+re-kick, and the `arch_wait` hlt-park all stay exactly as they were.
+
+### Removed
+
+- **Stripped the `kbd_read_blocking` diagnostic FB markers** (`core/syscall.cyr`): the `rb_diag_n`
+  invocation counter + `[rbN>` entry print, the per-scancode `|` (`kputc(124)`), and the `ent]` / `eof]` /
+  `full]` return tags. These were the burn-5 "freeze-after-first-command" localization aids that proved
+  agnsh reached read#2 (`[rb2>|` on the burn-5 FB) and pinned the wedge to the keyboard endpoint, not the
+  shell. With the EP-stall fix landed (1.44.25) they're noise on every prompt read. `check.sh` 11/11 ·
+  `agnsh-smoke` boot-to-shell PASS.
+
 ## [1.44.25] — 2026-06-14 (production cut — warm-reboot DHCP fix + xHCI keyboard-ring fix; boots to shell, no auto-run selftest)
 
 The production cut to review the post-burn-3 fixes. **This is a plain `scripts/build.sh` kernel — it

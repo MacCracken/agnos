@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.44.25
+# agnos.cyr — AGNOS kernel v1.44.26
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
