@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.8] — 2026-06-14 (toolchain: cyrius pin 6.2.2 → 6.2.5 — onto the latest cyrius)
+
+Refreshes the toolchain pin to **6.2.5** (the current cyrius release — it carries the AGNOS net/entropy/clock
+syscall peer at v6.2.3 + the agnos `tls_native` cross-build at v6.2.5, the cyrius-side mirror of the 1.45.x
+#45-#57 surface). **Byte-identical** kernel under 6.2.2 vs 6.2.5 (`cmp`-clean, 1,199,976 B) — and equal to the
+6.0.56 build too, so the chain 6.0.56 ≡ 6.2.2 ≡ 6.2.5 holds bit-for-bit: zero iron-revalidation cost, the kernel
+binary is unchanged. Puts agnos on the same toolchain its userland net consumers (`dig`/`yo`/…) now build against.
+
+### Changed
+
+- **`cyrius.cyml` pin 6.2.2 → 6.2.5** (toolchain only — no kernel source change). Same byte-identity-verified,
+  user-directed move as 1.45.7; the "don't chase the pin" discipline holds for *unprompted* nudges.
+
+### Notes
+
+- **Verification on 6.2.5**: `build.sh` OK · `cmp` byte-identical to the 6.2.2 (and 6.0.56) build · `check.sh`
+  11/11 · `agnsh`/`ring3`/`tcp-listen` smokes green (run during the 1.45.7→6.2.5 confirmation pass).
+
 ## [1.45.7] — 2026-06-14 (toolchain: cyrius pin 6.0.56 → 6.2.2 — onto the current toolchain, byte-identical)
 
 Moves the agnos `cyrius.cyml` toolchain pin from **6.0.56** (held-known-working since the 1.41.x shell-separation
