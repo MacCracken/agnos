@@ -57,6 +57,26 @@ fn kybernet() {
     kprint("kybernet: ", 10);
     kprint_num(pmm_free_count());
     kprintln(" free pages", 11);
+    # NET_SELFTEST (1.45.x): exec the staged net tool /bin/dig with a fixed DNS
+    # query against the SLIRP resolver (10.0.2.3) so a smoke can confirm the
+    # ring-3 UDP syscalls (#51-54) resolve a real name END-TO-END from a real
+    # userland net tool. argv tokenized by elf_load_from_file (argc=3). Runs to
+    # completion, then falls through to the normal agnsh launch below.
+    #ifdef NET_SELFTEST
+    kprintln("kybernet: NET_SELFTEST exec /bin/dig", 36);
+    if (ext2_active != 0) {
+        var nstp = elf_load_from_file("/bin/dig", 8, "/bin/dig @10.0.2.3 example.com", 30);
+        if (nstp >= 0) {
+            var nste = &proc_table + nstp * 176;
+            proc_current = nstp;
+            exec_and_wait(load64(nste + 24), load64(nste + 16), load64(nste + 160));
+            proc_reap(nstp);
+            kprintln("kybernet: NET_SELFTEST dig done", 31);
+        } else {
+            kprintln("kybernet: NET_SELFTEST dig load FAIL", 36);
+        }
+    }
+    #endif
     # 1.41.4: PID 1 runs the userland shell /bin/agnsh from disk. On any
     # failure to launch (no rootfs / missing / not an ELF) OR a non-zero exit,
     # fall back to the in-kernel emergency shell — the permanent recovery path

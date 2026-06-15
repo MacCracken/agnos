@@ -5,6 +5,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.9] — 2026-06-14 (toolchain: cyrius pin 6.2.5 → 6.2.6 — chrono agnos monotonic/sleep fix)
+
+Refreshes the pin to **6.2.6**, which lands the chrono fix filed from the net-tool runtime
+(`cyrius/docs/development/issues/2026-06-14-chrono-agnos-monotonic-sleep-stale-stubs.md`): chrono's agnos
+`clock_now_*`/`sleep_ms` are now bound to the real `uptime_ms`#40 / `sleep_ms`#41 kernel syscalls (+ new
+`sys_uptime_ms`/`sys_sleep_ms` peer wrappers), so agnos consumers no longer need the direct-syscall workaround.
+**No kernel-source change here** — this is a toolchain refresh; the agnos kernel codegen is **byte-identical**
+under 6.2.5 vs 6.2.6 (`cmp`-clean at the same version string), so the chain 6.0.56 ≡ 6.2.2 ≡ 6.2.5 ≡ 6.2.6 holds
+bit-for-bit (zero iron-revalidation cost). The consumer side (dig/yo) drops its `syscall(40)/(41)` workaround at
+dig 0.3.2 / yo 0.5.4.
+
+### Changed
+
+- **`cyrius.cyml` pin 6.2.5 → 6.2.6** (toolchain only). Same byte-identity-verified, user-directed move as
+  1.45.7/1.45.8.
+
+### Notes
+
+- **Verification on 6.2.6**: `build.sh` OK · same-version `cmp` byte-identical to the 6.2.5 build · `check.sh`
+  11/11. The chrono fix is validated end-to-end through a real consumer by `net-tool-smoke` (dig resolves
+  `example.com`) once dig/yo drop the workaround.
+
 ## [1.45.8] — 2026-06-14 (toolchain: cyrius pin 6.2.2 → 6.2.5 — onto the latest cyrius)
 
 Refreshes the toolchain pin to **6.2.5** (the current cyrius release — it carries the AGNOS net/entropy/clock
