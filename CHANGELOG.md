@@ -5,12 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.45.10] — 2026-06-15 (doc/tracking: cyrius 6.2.7 missing-syscalls map + the Linux-number-overlap hazard)
+## [1.45.10] — 2026-06-15 (cyrius pin → 6.2.7 + the stdlib-completeness missing-syscalls map + the Linux-number-overlap hazard)
 
-A **doc/tracking cut — no kernel-source change**. Records the kernel-gap map the cyrius **6.2.7**
-stdlib-completeness pass surfaced (the same pass that resolved the **sandhi** socket-backend cascade
-filed 2026-06-14 — every missing primitive now fail-closes cleanly cyrius-side). Nothing here blocks
-AGNOS; the gaps are opportunistic.
+**Toolchain pin 6.2.6 → 6.2.7** (the stdlib agnos-completeness pass) plus a **doc/tracking** cut — **no
+kernel-source change**. The 6.2.6 → 6.2.7 move is **byte-identical** for the agnos kernel (`cmp`-clean,
+**1,199,984 B** under both pins — extends the proven `6.0.56 ≡ 6.2.2 ≡ 6.2.5 ≡ 6.2.6 ≡ 6.2.7` chain),
+so the iron-validated artifact is unchanged. 6.2.7 is the pass that resolved the **sandhi**
+socket-backend cascade filed 2026-06-14 (every missing primitive now fail-closes cleanly cyrius-side)
+and surfaced the kernel-gap map recorded below. Nothing here blocks AGNOS; the gaps are opportunistic.
 
 ### Documented
 - **`docs/development/issues/2026-06-15-cyrius-stdlib-missing-syscalls.md`** (tracked) — the
@@ -28,6 +30,8 @@ AGNOS; the gaps are opportunistic.
   the catalog's "0–42" header predates the live 1.45.x net band 45–55.
 
 ### Changed
+- **Toolchain pin `6.2.6` → `6.2.7`** — byte-identical agnos kernel codegen (`cmp`-verified, 1,199,984 B
+  both); the pin now matches the toolchain that ran the stdlib agnos-completeness pass.
 - **Consolidated the issue-tracking folder `docs/development/issue/` → `docs/development/issues/`**
   (singular → plural — the new `2026-06-15-cyrius-stdlib-missing-syscalls.md` had been filed under the
   plural form, so plural is now canonical). All 11 docs moved (5 active + the 5-file `archive/`); the
