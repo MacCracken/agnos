@@ -27,6 +27,16 @@ AGNOS; the gaps are opportunistic.
 - **`syscall-additions.md`** — a kernel-gap tracking note (→ the issue + O5) and a surface note that
   the catalog's "0–42" header predates the live 1.45.x net band 45–55.
 
+### Changed
+- **Consolidated the issue-tracking folder `docs/development/issue/` → `docs/development/issues/`**
+  (singular → plural — the new `2026-06-15-cyrius-stdlib-missing-syscalls.md` had been filed under the
+  plural form, so plural is now canonical). All 11 docs moved (5 active + the 5-file `archive/`); the
+  singular folder removed. Live references updated: `CLAUDE.md` (the issue-dir convention),
+  `docs/doc-health.md` (ledger + Tier-5 table + archive-on-resolution note), `README.md` (link + repo
+  dir-tree), `agnos-userland-abi.md` (relative link). **Older CHANGELOG entries deliberately retain the
+  historical `issue/` path** — this ledger is append-only and several entries *narrate* the folder when
+  it was named `issue/`; their deep-links now resolve to the relocated files under `issues/`.
+
 ### Notes
 - **No kernel codegen change** beyond the version banner string — gaps are *tracked, not filled*.
   cyrius's fail-closed contract (6.2.7) is the intended steady state until a consumer path
