@@ -144,11 +144,11 @@ These are *how the world is*, not *what we chose*. Reading the code alone won't 
 - [`docs/audit/`](docs/audit/) — security audit reports (`YYYY-MM-DD-*.md`).
 - [`docs/development/roadmap.md`](docs/development/roadmap.md) — completed, active, planned.
 - [`docs/development/state.md`](docs/development/state.md) — live state snapshot, refreshed every release.
-- [`docs/development/issue/`](docs/development/issue/) — open bug-investigation docs (one file per issue). `archive/` holds resolved ones with resolution notes.
+- [`docs/development/issues/`](docs/development/issues/) — open bug-investigation docs (one file per issue). `archive/` holds resolved ones with resolution notes.
 - [`docs/development/proposals/`](docs/development/proposals/) — pre-decision design drafts.
 - [`docs/development/kybernet-bridge.md`](docs/development/kybernet-bridge.md), [`security-hardening.md`](docs/development/security-hardening.md), [`syscall-additions.md`](docs/development/syscall-additions.md) — long-form design notes.
 - [`docs/doc-health.md`](docs/doc-health.md) — fresh / stale / archive / open-question ledger across this whole repo's docs. Refreshed in place when docs are touched.
 
-New non-obvious invariants land in `docs/architecture/`. New deferred bugs land in `docs/development/issue/` with the date-stamped naming convention. **Never renumber numbered series.**
+New non-obvious invariants land in `docs/architecture/`. New deferred bugs land in `docs/development/issues/` with the date-stamped naming convention. **Never renumber numbered series.**
 
 Full doc-tree convention: [first-party-documentation.md](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/first-party-documentation.md).

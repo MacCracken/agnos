@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.10] — 2026-06-15 (doc/tracking: cyrius 6.2.7 missing-syscalls map + the Linux-number-overlap hazard)
+
+A **doc/tracking cut — no kernel-source change**. Records the kernel-gap map the cyrius **6.2.7**
+stdlib-completeness pass surfaced (the same pass that resolved the **sandhi** socket-backend cascade
+filed 2026-06-14 — every missing primitive now fail-closes cleanly cyrius-side). Nothing here blocks
+AGNOS; the gaps are opportunistic.
+
+### Documented
+- **`docs/development/issues/2026-06-15-cyrius-stdlib-missing-syscalls.md`** (tracked) — the
+  missing-AGNOS-syscall inventory grouped by consumer (POSIX process model, BSD socket options, IPv4
+  multicast, readiness/non-blocking), each with cyrius's current fail-closed behavior and what AGNOS
+  *could* add. Priority **low/opportunistic**: the only addition with real consumer pull is
+  **fd-redirect + argv/envp on `spawn`#3 / `execwait`#37** (capturing subprocess helpers); the
+  socket-option/multicast groups are gated on Phase-B inbound-TCP / mDNS-QM, neither wanted yet.
+- **`agnos-userland-abi.md` decision O5** — the structural **Linux↔AGNOS syscall-number-overlap
+  hazard**: AGNOS's compact `0–55` surface reuses Linux ABI numbers (`read`#0 = `exit`, `socket`#41 =
+  `sleep_ms`, `getsockopt`#55 = `icmp_echo`, …), so a raw Linux number in stdlib **silently
+  mis-dispatches** — consumers MUST use the cyrius `sys_*` wrappers. cyrius 6.2.7 routes everything
+  through those wrappers + the tagged-fd adapter, so nothing mis-dispatches today.
+- **`syscall-additions.md`** — a kernel-gap tracking note (→ the issue + O5) and a surface note that
+  the catalog's "0–42" header predates the live 1.45.x net band 45–55.
+
+### Notes
+- **No kernel codegen change** beyond the version banner string — gaps are *tracked, not filled*.
+  cyrius's fail-closed contract (6.2.7) is the intended steady state until a consumer path
+  (capturing subprocess, inbound-TCP server, mDNS-QM) is actually wanted on AGNOS.
+
 ## [1.45.9] — 2026-06-14 (toolchain: cyrius pin 6.2.5 → 6.2.6 — chrono agnos monotonic/sleep fix)
 
 Refreshes the pin to **6.2.6**, which lands the chrono fix filed from the net-tool runtime

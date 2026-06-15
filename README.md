@@ -200,7 +200,7 @@ The legacy `-kernel build/agnos` flow was retired with multiboot1.
 
 `rdtsc`-measured (x86_64). `serial_putc` is dominated by QEMU UART
 emulation latency, not codegen — see
-[`docs/development/issue/archive/2026-04-27-serial-putc-cc5-regression.md`](docs/development/issue/archive/2026-04-27-serial-putc-cc5-regression.md)
+[`docs/development/issues/archive/2026-04-27-serial-putc-cc5-regression.md`](docs/development/issues/archive/2026-04-27-serial-putc-cc5-regression.md)
 for the methodology caveat (closed at v1.28.1 — kept as audit trail).
 
 ## Size Comparison
@@ -260,7 +260,7 @@ agnos/
 │   ├── development/
 │   │   ├── roadmap.md       # Shipped arcs (the at-a-glance ledger) + open items + future slots
 │   │   ├── state.md         # Live state snapshot, bumped every release
-│   │   ├── issue/           # Open bug investigations (archive/ for resolved)
+│   │   ├── issues/          # Open bug investigations (archive/ for resolved)
 │   │   └── proposals/       # Pre-decision design drafts
 │   └── doc-health.md        # Doc-currency ledger across the whole tree
 └── .github/workflows/
