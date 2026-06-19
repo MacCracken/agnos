@@ -59,9 +59,13 @@ stage_one owl          src/main.cyr owl      || rc=1
 
 # 1.45.x network-tools family: the first net consumers of the ring-3 socket /
 # UDP / ICMP syscalls (#45-#57, cyrius >= 6.2.5 net peer). dig = DNS resolver
-# over udp_bind/send/recv/unbind (#51-54); yo = ICMP ping over icmp_echo (#55).
+# over udp_bind/send/recv/unbind (#51-54); yo = ICMP ping over icmp_echo (#55);
+# whirl = curl+wget (HTTP over sock_connect/send/recv/close #47-50 + DNS via
+# taar's udp path; HTTPS via tls_native composed over the sock transport with
+# the time_unix#46 cert clock). All three share the taar substrate library.
 stage_one dig          src/main.cyr dig      || rc=1
 stage_one yo           src/main.cyr yo       || rc=1
+stage_one whirl        src/main.cyr whirl    || rc=1
 
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE

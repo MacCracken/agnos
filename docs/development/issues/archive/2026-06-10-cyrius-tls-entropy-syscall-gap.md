@@ -1,9 +1,11 @@
 # AGNOS has no entropy syscall — cyrius native TLS + all crypto on the agnos target have no RNG source
 
-> **Status**: OPEN — **kernel-side ABI ask** (filed agnos-side per the cross-repo
-> issue convention; **kernel agent please review** — this needs a new syscall the
-> kernel must provide. Cyrius can't fix it alone). This repo's kernel source is
-> hands-off w.r.t. cyrius; cyrius will mirror whatever ABI the kernel lands.
+> **Status**: RESOLVED — `getrandom#45` landed at agnos 1.45.0 (`kernel/core/syscall.cyr`,
+> Zen RDRAND with bounded retry); cyrius mirrored it at v6.2.3 (`SYS_GETRANDOM=45`,
+> `random.cyr` un-fail-closed). **Design deviation from the ask**: instead of `-1`-when-no-
+> entropy, the kernel chose a bounded RDRAND-with-timer-fallback whitener so the handler
+> never hangs (documented in the agnos CHANGELOG). Live across 10 patch cycles
+> (agnos 1.45.10 / cyrius 6.2.21). Audit-confirmed + archived 2026-06-18.
 > **Filed**: 2026-06-10 (cyrius deep-dive review, v6.1.31)
 > **Severity**: HIGH — keys/nonces with no real entropy on the agnos userspace
 > target. Not boot-blocking; bites the moment any crypto/TLS runs in ring 3 on agnos.

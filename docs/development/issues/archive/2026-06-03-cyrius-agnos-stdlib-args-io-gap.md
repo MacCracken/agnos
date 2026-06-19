@@ -1,7 +1,10 @@
 # cyrius `CYRIUS_TARGET_AGNOS` stdlib gap: `lib/args.cyr` + `lib/io.cyr` (blocks boot-to-agnsh / agnos 1.41.4)
 
-> **Status**: OPEN — **cyrius-side** (filed agnos-side per the issue convention; cyrius agent
-> please pick up. This repo is hands-off w.r.t. cyrius.)
+> **Status**: RESOLVED 2026-06-03 (cyrius 6.0.55 — its CHANGELOG names this exact file).
+> `lib/args_agnos.cyr` init-stack argc/argv reader + `sys_chmod` no-op + `io.cyr` O_*→AO_*
+> bridge all shipped; consumer-validated — agnsh reaches the `[ASSIST] >` prompt and
+> `agnsh-smoke.sh` PASS (agnos 1.41.12-1.41.13). The cyrius tracking copy is archived,
+> marked RESOLVED v6.0.55. Audit-confirmed + archived 2026-06-18.
 > **Filed**: 2026-06-03 (agnos 1.41.4 shell-separation work)
 > **Severity**: Blocks the agnsh-on-agnos boot (the dispositive "first boot-to-agnsh-on-disk").
 > **NOT a kernel bug** — the agnos exec path is correct (proven below). **NOT a syscall-ABI

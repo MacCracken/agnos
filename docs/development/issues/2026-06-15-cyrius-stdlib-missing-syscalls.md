@@ -1,6 +1,12 @@
 # cyrius stdlib — missing AGNOS syscalls surfaced by the 6.2.7 agnos-completeness pass
 
 **Status**: Filed (informational / kernel-gap tracking) — **nothing here blocks AGNOS today**.
+**Update 2026-06-18**: the inbound-TCP-server premise in §2 ("only if inbound-TCP server
+(Phase B) lands") is now **superseded** — the kernel landed `sock_listen#56`/`sock_accept#57`
+(agnos 1.45.5/.6) and inbound TCP IS now wanted (the closed-beta founder server-sweep).
+That work is tracked separately in `2026-06-18-cyrius-agnos-server-socket-peer.md`. The
+`setsockopt`/`shutdown` socket-options in §2 remain genuinely optional. Everything else here
+stays correctly fail-closed/steady-state.
 **Date**: 2026-06-15
 **From**: cyrius 6.2.7 (the stdlib agnos-completeness pass that resolved sandhi's
 filed cascade — see cyrius `docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md`).
@@ -70,6 +76,23 @@ test harness in ring 3 is not a real AGNOS workload.
 |---|---|---|---|
 | `fcntl` O_NONBLOCK toggle | `lib/async.cyr`, `net.cyr` non-blocking connect | async is peer-split (`async_agnos.cyr`, serial); `net_connect_nb` uses the blocking `sock_connect`#47 on AGNOS | **nothing** — AGNOS's blocking `#47` + non-blocking `recv`#49 model is sufficient; cyrius adapts to it |
 | `epoll_create1(flags)` | `async.cyr` epoll loop | AGNOS has `epoll_create`#19 (no-arg); the `1`/flags variant is absent. async is unused on the AGNOS client path so the peer skips epoll entirely | nothing — `#19` suffices; cyrius sidesteps it |
+
+### 5. File-I/O hardening niceties — `O_NOFOLLOW`, `fstat`, per-fd `fsync` (surfaced by attn11)
+
+attn11 (the ML/training reference) ported its file-I/O to the agnos target and
+**accepted + disclosed** three weaker-than-Linux guarantees inherent to the frozen
+ABI (`attn11/docs/guides/agnos.md` + `attn11/docs/audit/2026-06-10-agnos-audit.md`).
+Logged here 2026-06-18 (cross-repo sweep) so the central kernel-gap tracker has them;
+**none block attn11** — all degrade safely.
+
+| Primitive | Why a consumer wants it | agnos today | AGNOS could add |
+|---|---|---|---|
+| `O_NOFOLLOW` open flag | symlink-refusal hardening on `secure_read_file`/`secure_write_atomic` | the `AO_*` flag set has no nofollow bit; the `io.cyr` bridge drops it → no symlink refusal on agnos | a nofollow bit in the `AO_*` flags consumed by `open`#7. Exposure bounded today by the single-user model + no user-writable symlink farms |
+| `fstat(fd)` | stat an already-open fd (no TOCTOU between open and stat) | only path-`stat`#33 exists; `_file_size` must re-stat the *path* after open → size races the open (bounded — used only as an alloc cap; the read stops at real EOF, never overflows) | an fd-based stat variant |
+| per-fd `fsync(fd)` | durability of one file without a global flush | falls back to global `sys_sync` (the atomic rename still aborts on a sync failure) | a per-fd `fsync` |
+
+**Priority: LOW / opportunistic.** All three are robustness/security niceties attn11
+already shipped around; surface them only if a second consumer wants the same.
 
 ## Cross-cutting hazard: the Linux↔AGNOS syscall-number overlap
 

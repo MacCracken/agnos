@@ -1,10 +1,13 @@
-# Issue (DRAFT): Non-zero `var X = literal;` initializer at module scope not honored at runtime
+# Issue (RESOLVED): Non-zero `var X = literal;` initializer at module scope not honored at runtime
 
-**Status**: **DRAFT — pending Attempt 29 verification.** Surface to cyrius
-once iron burn confirms Repair (P) fixes the visual symptom. Per agnosticos
-memory `feedback_cyrius_hands_off`, this file documents the bug from
-agnos's side — actual filing into `cyrius/docs/development/issues/` is the
-user's call after verification.
+**Status**: **RESOLVED 2026-05-18 (cyrius 5.11.64).** Cyrius fixed the root cause —
+static-init for top-level `var X = INT_LITERAL` (cyrius CHANGELOG 5.11.64), so the
+literal is emitted into the binary image and the first read returns the value
+regardless of init-order. The cyrius-side issue is filed + archived
+(`cyrius/docs/development/issues/archived/2026-05-18-gvar-init-order-zero-reads.md`).
+The agnos Repair-P workaround (re-assignments in `fb_console_init`) was deleted at
+agnos 1.30.11; top-level non-zero literal gvar inits now take effect correctly
+(agnos pins cyrius 6.2.7, far past the fix). Audit-confirmed + archived 2026-06-18.
 
 **Date**: 2026-05-15
 **Cyrius**: 5.11.55 (`agnos/cyrius.cyml` pin)
