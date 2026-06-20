@@ -24,7 +24,8 @@ BUILD=0
 
 # Tool table: <repo> <src-entry> <name>. `name` matches the tool's cyrius.cyml
 # [build] output; the agnos binary is staged at <repo>/build/<name>_agnos. Add a
-# row here as each tool gains an agnos build (mihi/iam/chakshu ride 1.43.x).
+# row here as each tool gains an agnos build. (mihi is a LIBRARY — no standalone
+# binary; it is compiled INTO iam. chakshu/shu still pending an agnos build.)
 stage_one() {
     repo="$1"; src="$2"; name="$3"
     rdir="$SIBLINGS/$repo"
@@ -67,6 +68,12 @@ stage_one dig          src/main.cyr dig      || rc=1
 stage_one yo           src/main.cyr yo       || rc=1
 stage_one whirl        src/main.cyr whirl    || rc=1
 
+# System-info display: iam (fastfetch-equivalent) reads every fact through the
+# mihi probe library (agnos sysinfo#35 / uname#34); mihi has no standalone binary
+# — it is compiled into iam. Both agnos-verified at iam 1.1.2 / mihi 1.1.2
+# (Distro: AGNOS, Memory via sysinfo#35; agnos scripts/iam-agnos-verify.py).
+stage_one iam          src/main.cyr iam      || rc=1
+
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
 # symlinks (-> kriya) in the rootfs: install-media.sh's `cp -a` preserves them
@@ -82,4 +89,20 @@ if [ -f "$DEST_DIR/kriya" ]; then
     done
     echo "linked: $DEST_DIR/{cp,mv,rm,mkdir,rmdir,touch,echo,wc,find,grep,ls} -> kriya"
 fi
+
+# CA trust store for the verifying HTTPS clients (whirl). tls_native verifies the
+# server chain fail-closed (CVE-18) against /etc/ssl/cert.pem on the agnos-fs —
+# without it, every https:// handshake fails with no roots. Stage the host's
+# bundle at the path tls_native probes first. (whirl 0.6.2's _agnos_ca_hook reads
+# it with the correct agnos sys_open ABI — see the cyrius set-ca-system issue.)
+CA_DEST="$ROOT/build/rootfs/etc/ssl/cert.pem"
+for ca in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem; do
+    if [ -f "$ca" ]; then
+        mkdir -p "$(dirname "$CA_DEST")"
+        cp -L "$ca" "$CA_DEST"
+        echo "staged: $CA_DEST ($(stat -c%s "$CA_DEST") bytes) <- $ca"
+        break
+    fi
+done
+[ -f "$CA_DEST" ] || echo "WARNING: no host CA bundle found — whirl HTTPS will fail (no trust roots on the agnos-fs)"
 exit $rc

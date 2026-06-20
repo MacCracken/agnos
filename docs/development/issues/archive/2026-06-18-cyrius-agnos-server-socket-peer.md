@@ -1,6 +1,6 @@
 # cyrius stdlib — wire the AGNOS server-socket peer to kernel sock_listen#56 / sock_accept#57
 
-**Status**: Filed (request — cyrius-side work, hands-off from agnos sessions per `feedback_cyrius_hands_off`; driven by the user / cyrius agent).
+**Status**: ✅ **RESOLVED 2026-06-19** — cyrius **v6.2.22** landed the agnos server-socket peer in `lib/net.cyr` (a real `#ifdef CYRIUS_TARGET_AGNOS` impl over kernel `sock_listen#56` / `sock_accept#57`; `sock_accept` returns `Err(_NET_EAGAIN)` when a non-blocking #57 finds no pending conn). cyrius is now 6.2.28; the fail-loud server shims are gone — `--agnos` services (agora / descent / sandhi) can now host sockets. Originally filed as a cyrius-side request (hands-off per `feedback_cyrius_hands_off`); the cyrius agent shipped it. **Archived.**
 **Date**: 2026-06-18
 **Priority**: **HIGH — closed-beta Phase-1 gate.** This is the one remaining piece between "the AGNOS kernel can `accept()`" and "an AGNOS *service binary* can `accept()`." The 2026-06-14 beta rescope makes the founder **Docker AGNOS service-sweep at the server base** (agora / descent / sandhi / web accepting connections) the closed-beta opening gate (Late June / Early July 2026). Until this peer lands, no Cyrius service compiled `--agnos` can host a socket, regardless of kernel readiness.
 **From**: agnos 1.45.10 (kernel) vs cyrius 6.2.21 (`lib/net.cyr`).
