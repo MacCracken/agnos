@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.12] — 2026-06-20
+
+### Added
+- **`SCHED_STRESS_SELFTEST`** (`kernel/core/main.cyr` + `scripts/build.sh` flag) — a
+  **concurrent-proc scheduler stress selftest** (the race-finder, complementing the
+  2-proc `THREAD_SELFTEST`): a **12-proc kernel-thread storm** near the 16-slot
+  proc-table cap, **3 rounds** of spawn / work / yield / exit (~720 context switches)
+  churning `proc_alloc_slot`'s hole-reuse, then asserting four invariants a real
+  scheduler race would corrupt — **count** (exact per-pid counters, no torn/lost
+  increment or save-restore corruption), **leak** (proc_count stays bounded across
+  rounds = slot reclaim works), **starve** (every proc ran + exited, `sched_next`
+  visited the full table), **canary** (no wild write). Each worker derives its counter
+  slot from `proc_current` (race-free). Driven repeatedly under the agnosticos
+  `docker/sched-sweep/` harness — **3/3 PASS** (the scheduler is robust under the
+  storm). `#ifdef`-gated → **production byte-identical** (1,200,544 B, zero selftest
+  strings). Deferred: a cap-invariant over-spawn probe (needs distinct throwaway stacks).
+
+### Changed
+- **Cyrius toolchain pin `6.2.7` → `6.2.30`** (`cyrius.cyml`) — making the pin **honest**.
+  `scripts/build.sh` invokes the `~/.cyrius/bin/cyrius` wrapper without `--strict-pin`, so it
+  builds with the *installed* cycc (6.2.30, the latest released tag) and merely **warned** that
+  the pin said 6.2.7 — i.e. every recent build, including the released 1.45.11, was already a
+  6.2.30 build while the pin claimed 6.2.7. **Verified safe + a no-op for the binary:** agnos
+  built with 6.2.7 vs 6.2.30 is **`cmp`-byte-identical** (1,200,544 B both — the chain
+  `6.0.56 ≡ 6.2.2 ≡ 6.2.5 ≡ 6.2.6 ≡ 6.2.7 ≡ 6.2.30` holds), so the kernel is unchanged and the
+  pin now reflects what actually builds it (the pin-drift warning is gone). 1.45.12's production
+  kernel is byte-identical to 1.45.11 modulo the version banner.
+
 ## [1.45.11] — 2026-06-19 (TCP server slot-leak fix + persistent HTTP listen-smoke)
 
 The first **founder Docker net-sweep** of the kernel TCP server (AGNOS-in-QEMU-in-Docker,

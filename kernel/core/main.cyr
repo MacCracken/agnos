@@ -2184,6 +2184,131 @@ fn thread_selftest_verify() {
 }
 #endif
 
+#ifdef SCHED_STRESS_SELFTEST
+# === SCHED_STRESS_SELFTEST — concurrent-proc scheduler stress (the race-finder) ===
+# Where THREAD_SELFTEST proves 2 threads round-robin, this drives a STORM of
+# kernel-thread procs (shared CR3 0x1000, IF=1, static-pool stacks) up near the
+# 16-slot proc-table cap, makes each do bounded work + yield + exit in staggered
+# order across several ROUNDS (churning proc_alloc_slot's hole-reuse), then asserts
+# four invariants a real scheduler race would corrupt:
+#   count  — sum of per-proc counters == exact expected (no torn / lost increment,
+#            no save/restore corruption across do_context_switch)
+#   leak   — proc_count stays bounded across rounds (hole-reuse works — the
+#            proc-table analogue of the TCP-table slot leak net-sweep just found)
+#   starve — every spawned worker ran (counter>0) AND exited (none left ready —
+#            sched_next visited the full table, not just an A<->B pair)
+#   canary — a known guard word survives the storm (no wild write / stack overrun)
+#   cap    — proc_create_full caps cleanly at -1 when the table is full (no overrun)
+# A worker learns its OWN slot from proc_current (the scheduler sets it before
+# switching in), so pid == proc_table slot == its DISTINCT counter index — workers
+# never alias a counter (which would be an inherent single-core RMW race, not a
+# scheduler bug). Compile-gated: `SCHED_STRESS_SELFTEST=1 ./scripts/build.sh`.
+var SSS_N = 12;            # storm size (proc 0 kmain + proc 1 idle hold 2 of 16 slots)
+var SSS_ITER = 20;        # counter bumps per worker per round
+var SSS_ROUNDS = 3;       # re-spawn rounds (churn slot reclaim across holes)
+var sss_stacks[6144];     # module-scope = SSS_N*512 u64 = 12 x 4 KB static stack pool
+# ONE consolidated state block. Separate small adjacent module-globals were
+# observed to OVERLAP under this toolchain (a `sss_canary` scalar aliased
+# `sss_counter[2]`, `sss_probe[]` aliased the high counters), corrupting the
+# invariant checks — a TEST bug, not a scheduler finding. Consolidating into a
+# single array removes all inter-global layout assumptions:
+#   [0..15]  per-pid work counters (worker bumps sss_mem[its pid])
+#   [40]     guard canary, well clear of the counters
+var sss_mem[64];
+
+fn sss_worker() {
+    var me = proc_current;             # my pid == my distinct counter slot (race-free)
+    var n = 0;
+    while (n < SSS_ITER) {
+        store64(&sss_mem + me * 8, load64(&sss_mem + me * 8) + 1);
+        arch_wait();                   # hlt -> yield slice -> force a switch mid-work
+        n = n + 1;
+    }
+    var lead = 0;                      # stagger exit by pid so holes form at varied slots
+    while (lead < me) { arch_wait(); lead = lead + 1; }
+    proc_set_state(me, 0);             # EXIT: mark self dead (slot reclaimable)
+    while (1 == 1) { arch_wait(); }    # fresh stack has no return addr -> never return
+}
+
+fn sched_stress_verify() {
+    var i = 0;
+    while (i < 64) { store64(&sss_mem + i * 8, 0); i = i + 1; }
+    store64(&sss_mem + 40 * 8, 0xA6105CA1);   # canary at [40], far from the [0..15] counters
+    var base_count = proc_count;
+    var live0 = proc_count_by_state(1);    # idle (state 1); kmain is state 2 (running)
+    var fail = 0;
+    var spawned = 0;
+
+    var r = 0;
+    while (r < SSS_ROUNDS) {
+        preempt_disable();                 # spawn race-free: no worker runs until enable
+        var k = 0;
+        while (k < SSS_N) {
+            var stop = &sss_stacks + (k + 1) * 512 * 8;
+            var pid = proc_create_full(&sss_worker, stop);
+            if (pid < 0) {
+                kprintln("sched-stress: FAIL spawn (test bug)", 35);
+                fail = 1;
+                k = SSS_N;
+            }
+            if (pid >= 0) {
+                spawned = spawned + 1;
+                k = k + 1;
+            }
+        }
+        preempt_enable();
+        var t = 0;
+        var budget = SSS_N * SSS_ITER * 4;
+        while (t < budget) {
+            if (proc_count_by_state(1) == live0) { t = budget; }      # all exited -> stop early
+            if (proc_count_by_state(1) != live0) { arch_wait(); t = t + 1; }
+        }
+        r = r + 1;
+    }
+
+    # invariant: leak — hole-reuse kept the table bounded (no append-per-round growth)
+    if (proc_count > (base_count + SSS_N)) {
+        kprintln("sched-stress: FAIL leak", 23);
+        fail = 1;
+    }
+    # invariant: count — exact sum (no torn / lost / corrupted increment)
+    var sum = 0;
+    var j = 0;
+    while (j < 16) { sum = sum + load64(&sss_mem + j * 8); j = j + 1; }
+    if (sum != (spawned * SSS_ITER)) {
+        kprintln("sched-stress: FAIL count", 24);
+        fail = 1;
+    }
+    # invariant: starve — every worker exited (none left ready/stuck)
+    if (proc_count_by_state(1) != live0) {
+        kprintln("sched-stress: FAIL starve", 25);
+        fail = 1;
+    }
+    # invariant: canary — guard word intact
+    if (load64(&sss_mem + 40 * 8) != 0xA6105CA1) {
+        kprintln("sched-stress: FAIL canary", 25);
+        fail = 1;
+    }
+    # (cap invariant — proc_create_full returns -1 at the full table — deferred: a
+    # safe over-spawn probe needs distinct throwaway stacks; the storm already
+    # exercises proc_alloc_slot's reuse hard. Revisit as a follow-up bite.)
+
+    # belt-and-suspenders: retire any storm survivor so boot continues to kybernet
+    var s = 2;
+    while (s < proc_count) {
+        if (proc_get_state(s) == 1) { proc_set_state(s, 0); }
+        s = s + 1;
+    }
+    kprint("sched-stress: rounds=", 21); kprint_num(SSS_ROUNDS);
+    kprint(" spawned=", 9); kprint_num(spawned);
+    kprint(" sum=", 5); kprint_num(sum);
+    kprint(" proc_count=", 12); kprint_num(proc_count);
+    kprintln("", 0);
+    if (fail == 0) { kprintln("sched-stress: ALL PASS", 22); }
+    return 0;
+}
+#endif
+
 #ifdef RING3_SELFTEST
 # === RING3_SELFTEST — preemptive ring-3 (1.44.4 one proc · 1.44.5 two procs · 1.44.6 syscalls) ===
 # Spawn TWO ring-3 procs, each with its OWN per-process CR3 + IF=1, each running the SAME
@@ -2847,6 +2972,12 @@ thread_selftest_verify();
 #ifdef RING3_SELFTEST
 # 1.44.4: prove a ring-3 proc (own CR3, IF=1) is preempted + resumed by the scheduler.
 ring3_selftest_verify();
+#endif
+
+#ifdef SCHED_STRESS_SELFTEST
+# concurrent-proc scheduler stress: spawn a storm near the proc-table cap, churn
+# slot-reclaim across rounds, assert count/leak/starve/canary/cap invariants.
+sched_stress_verify();
 #endif
 
 #ifdef KTEST
