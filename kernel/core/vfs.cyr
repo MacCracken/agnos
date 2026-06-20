@@ -737,10 +737,90 @@ fn vfs_create_pipe(fds_ptr) {
     return 0;
 }
 
+# === Advisory file locking (flock#59, 1.46.x) ===
+# A 16-slot table of {inode, holder pid, mode}; an inode==0 slot is free. Keyed by
+# the VFS_EXT2_FILE inode so a SH/EX lock is whole-file + cross-process (the
+# fork-per-accept consumer agora needs; libro/patra crash-safety). Single-core
+# run-to-completion can't block in-kernel, so a contended lock returns -1
+# (WOULD_BLOCK) and the ring-3 caller poll-spins. Released in vfs_close + on proc exit.
+var flock_inode[16];   # inode each lock guards (0 = free slot)
+var flock_pid[16];     # holder pid (proc_current at lock time)
+var flock_mode[16];    # 1 = LOCK_SH, 2 = LOCK_EX
+
+fn flock_apply(inode, pid, op) {
+    if ((op & 8) != 0) {                       # LOCK_UN — drop this pid's lock on inode
+        var u = 0;
+        while (u < 16) {
+            if (load64(&flock_inode + u * 8) == inode) {
+                if (load64(&flock_pid + u * 8) == pid) { store64(&flock_inode + u * 8, 0); }
+            }
+            u = u + 1;
+        }
+        return 0;
+    }
+    var want_ex = 0;
+    if ((op & 2) != 0) { want_ex = 1; }
+    if ((op & 1) == 0) {                        # no SH and no EX (and not UN) → invalid op
+        if (want_ex == 0) { return 0 - 1; }
+    }
+    var i = 0;                                  # conflict scan against OTHER holders
+    while (i < 16) {
+        if (load64(&flock_inode + i * 8) == inode) {
+            if (load64(&flock_pid + i * 8) != pid) {
+                if (want_ex != 0) { return 0 - 1; }                       # EX vs any holder
+                if (load64(&flock_mode + i * 8) == 2) { return 0 - 1; }   # SH vs their EX
+            }
+        }
+        i = i + 1;
+    }
+    var mode = 1;
+    if (want_ex != 0) { mode = 2; }
+    var e = 0;                                  # re-lock / upgrade this pid's own entry
+    while (e < 16) {
+        if (load64(&flock_inode + e * 8) == inode) {
+            if (load64(&flock_pid + e * 8) == pid) { store64(&flock_mode + e * 8, mode); return 0; }
+        }
+        e = e + 1;
+    }
+    var f = 0;                                  # else take a free slot
+    while (f < 16) {
+        if (load64(&flock_inode + f * 8) == 0) {
+            store64(&flock_inode + f * 8, inode);
+            store64(&flock_pid + f * 8, pid);
+            store64(&flock_mode + f * 8, mode);
+            return 0;
+        }
+        f = f + 1;
+    }
+    return 0 - 1;                               # lock table full
+}
+
+fn flock_release_inode(inode, pid) {           # vfs_close: drop pid's lock on this inode
+    var ri = 0;
+    while (ri < 16) {
+        if (load64(&flock_inode + ri * 8) == inode) {
+            if (load64(&flock_pid + ri * 8) == pid) { store64(&flock_inode + ri * 8, 0); }
+        }
+        ri = ri + 1;
+    }
+    return 0;
+}
+
+fn flock_release_pid(pid) {                     # proc exit: drop ALL of pid's locks
+    var rp = 0;
+    while (rp < 16) {
+        if (load64(&flock_pid + rp * 8) == pid) { store64(&flock_inode + rp * 8, 0); }
+        rp = rp + 1;
+    }
+    return 0;
+}
+
 fn vfs_close(fd_idx) {
     if (fd_idx < 0) { return 0 - 1; }
     if (fd_idx >= 32) { return 0 - 1; }
     var base = &vfs_table + fd_idx * 32;
+    # flock#59: release any advisory lock the calling proc holds on this fd's inode.
+    if (ktag(base) == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), proc_current); }
     # 1.41.7: a FAT/exFAT write-back fd flushes its buffered content (whole-file
     # via vfs_write_on) to the backend before the slot is reclaimed.
     # 1.41.11 (audit #4): SURFACE the flush result. Previously vfs_close always

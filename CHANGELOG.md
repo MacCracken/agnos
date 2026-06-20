@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **`lseek`#58 + `flock`#59 — ring-3 file seek + advisory locking** (`kernel/core/syscall.cyr`
+  + `kernel/core/vfs.cyr`), the shared kernel infra the server-stage apps need (descent's
+  libro/patra persistence + agora's `flock`'d shared-world door games — see
+  `agnosticos/.../planning/server-app-ports.md`).
+  - **`lseek(fd, offset, whence)`** — `SEEK_SET`/`CUR`/`END` reposition of a `VFS_EXT2_FILE`
+    cursor (the fd already carries `pos` at `payload[0]`, `size` at `[1]`, so this just sets
+    it); returns the new absolute position or −1 (bad fd / not seekable / bad whence / negative).
+  - **`flock(fd, op)`** — BSD advisory whole-file locking (`LOCK_SH`/`EX`/`UN` ± `LOCK_NB`),
+    keyed by the file's inode (`payload[2]`) in a 16-slot table, holder = `proc_current`.
+    EX is exclusive, SH coexist, EX-vs-SH conflicts. NON-BLOCKING at the kernel boundary
+    (single-core run-to-completion can't sleep) → a contended lock returns −1 (WOULD_BLOCK) and
+    the ring-3 caller poll-spins. **Released in `vfs_close` (close#6) AND on proc exit**
+    (`flock_release_pid`, so a fork-per-accept worker that dies mid-turn can't strand the
+    shared world). Verified by `FLOCK_SELFTEST` (acquire / conflict / shared-coexist / UN /
+    release-by-pid). `check.sh` 11/11; binary 1,203,984 B (size-sanity ceiling bumped 1.2M→1.4M
+    in `check.sh` + `test.sh`).
+
 ## [1.45.12] — 2026-06-20
 
 ### Added

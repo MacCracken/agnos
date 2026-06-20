@@ -462,3 +462,32 @@ ext2_jbd2_crash_selftest();
     kprintln(m_end, strlen(m_end));
 }
 #endif
+
+#ifdef FLOCK_SELFTEST
+# flock#59 conflict/release logic (1.46.x). Exercises flock_apply directly with
+# synthetic inodes/pids — the CROSS-PROCESS semantics a single boot can't reach via
+# the syscall (one proc never conflicts with itself): EX is exclusive, SH coexist,
+# EX-vs-SH conflict, UN + release_pid free the slots. Compile-gated:
+# FLOCK_SELFTEST=1 sh scripts/build.sh.
+{
+    var fok = 1;
+    # inode 100: EX by pid 2 acquires; pid 3's EX and SH both conflict with it
+    if (flock_apply(100, 2, 2) != 0) { fok = 0; }
+    if (flock_apply(100, 3, 2) != (0 - 1)) { fok = 0; }
+    if (flock_apply(100, 3, 1) != (0 - 1)) { fok = 0; }
+    if (flock_apply(100, 2, 8) != 0) { fok = 0; }          # pid 2 unlocks
+    if (flock_apply(100, 3, 2) != 0) { fok = 0; }          # now pid 3's EX acquires
+    # inode 200: SH by pid 4 + pid 5 coexist; pid 6's EX conflicts with the holders
+    if (flock_apply(200, 4, 1) != 0) { fok = 0; }
+    if (flock_apply(200, 5, 1) != 0) { fok = 0; }
+    if (flock_apply(200, 6, 2) != (0 - 1)) { fok = 0; }
+    # release-by-pid frees everything (the on-exit sweep), then pid 6's EX acquires
+    flock_release_pid(3);
+    flock_release_pid(4);
+    flock_release_pid(5);
+    if (flock_apply(200, 6, 2) != 0) { fok = 0; }
+    flock_release_pid(6);                                   # leave the table clean
+    if (fok == 1) { kprintln("flock: ALL PASS", 15); }
+    if (fok == 0) { kprintln("flock: FAIL", 11); }
+}
+#endif

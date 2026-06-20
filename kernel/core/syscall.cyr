@@ -39,6 +39,12 @@ fn stack_canary_check(canary) {
 #    (a pure memory syscall) does not add.
 # 28=munmap(addr, length) — release an mmap region + free its physical 2 MB
 #    pages (1.35.4). The natural pair to 27; same pure-memory posture.
+# 45-57 = the net band (getrandom / time_unix / sock_* / udp_* / icmp_echo) — see
+#    the inline handlers below + cyrius lib/syscalls_x86_64_agnos.cyr for the full map.
+# 58=lseek(fd, offset, whence) — VFS_EXT2_FILE read/write cursor reposition (1.46.x).
+# 59=flock(fd, op) — BSD advisory whole-file lock, inode-keyed, non-blocking, released
+#    on close#6 + proc exit (1.46.x). Both serve the server-stage persistence/locking
+#    consumers (descent libro/patra, agora shared-world door games).
 
 var sys_exit_code = 0;
 
@@ -466,6 +472,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # exit — halt current process, return to kernel if context saved
         sys_exit_code = arg1;
         proc_set_exit_code(proc_current, arg1);
+        # flock#59: release every advisory lock held by the exiting proc (so a
+        # fork-per-accept worker that dies mid-turn can't strand the shared world).
+        flock_release_pid(proc_current);
         if (proc_current < proc_count) {
             proc_set_state(proc_current, 0);
             # Send SIGCHLD (signal 17) to parent process
@@ -1751,6 +1760,48 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var sa_cid = tcp_accept(arg1);
         stack_canary_check(canary);
         return sa_cid;
+    }
+    if (num == 58) {
+        # lseek(fd=arg1, offset=arg2, whence=arg3) — reposition a seekable file's
+        # read/write cursor. whence 0=SEEK_SET / 1=SEEK_CUR / 2=SEEK_END. Returns the
+        # new absolute position, or -1 (bad fd / not a VFS_EXT2_FILE / bad whence /
+        # negative result). VFS_EXT2_FILE already carries the cursor at payload[0]
+        # (size at [1]); read#5 / the ext2 write path advance it, so this only sets
+        # it. Added (1.46.x) for the seek-based storage backend (libro / patra) the
+        # server-stage apps need — descent persistence + agora. a4 unused.
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg1 >= 32) { stack_canary_check(canary); return 0 - 1; }
+        if (arg3 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg3 > 2) { stack_canary_check(canary); return 0 - 1; }
+        var lk_base = &vfs_table + arg1 * 32;
+        if (ktag(lk_base) != VFS_EXT2_FILE) { stack_canary_check(canary); return 0 - 1; }
+        var lk_new = arg2;                                          # SEEK_SET (whence 0)
+        if (arg3 == 1) { lk_new = kpayload(lk_base, 0) + arg2; }    # SEEK_CUR
+        if (arg3 == 2) { lk_new = kpayload(lk_base, 1) + arg2; }    # SEEK_END
+        if (lk_new < 0) { stack_canary_check(canary); return 0 - 1; }
+        kpayload_set(lk_base, 0, lk_new);
+        stack_canary_check(canary);
+        return lk_new;
+    }
+    if (num == 59) {
+        # flock(fd=arg1, op=arg2) — advisory whole-file lock (BSD flock(2)). op:
+        # LOCK_SH=1 / LOCK_EX=2 / LOCK_UN=8, OR'd with LOCK_NB=4. Keyed by the file's
+        # inode (VFS_EXT2_FILE payload[2]) in a 16-slot lock table; the holder is
+        # proc_current. NON-BLOCKING at the kernel boundary — single-core run-to-
+        # completion can't sleep, so a contended SH/EX returns -1 (WOULD_BLOCK) and
+        # the ring-3 caller poll-spins (yielding so the holder can release). Released
+        # in vfs_close#6 and on proc exit (flock_release_pid). Added (1.46.x) for the
+        # shared-world serialization agora's door games need + libro/patra crash-safety.
+        # a3/a4 unused.
+        if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
+        if (arg1 >= 32) { stack_canary_check(canary); return 0 - 1; }
+        var fl_base = &vfs_table + arg1 * 32;
+        if (ktag(fl_base) != VFS_EXT2_FILE) { stack_canary_check(canary); return 0 - 1; }
+        var fl_ino = kpayload(fl_base, 2);
+        if (fl_ino == 0) { stack_canary_check(canary); return 0 - 1; }
+        var fl_rc = flock_apply(fl_ino, proc_current, arg2);
+        stack_canary_check(canary);
+        return fl_rc;
     }
     stack_canary_check(canary);
     return 0 - 1;

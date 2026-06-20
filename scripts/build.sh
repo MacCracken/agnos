@@ -194,6 +194,7 @@ else
         [ -n "$THREAD_SELFTEST" ]    && echo '#define THREAD_SELFTEST'
         [ -n "$RING3_SELFTEST" ]     && echo '#define RING3_SELFTEST'
         [ -n "$SCHED_STRESS_SELFTEST" ] && echo '#define SCHED_STRESS_SELFTEST'
+        [ -n "$FLOCK_SELFTEST" ]     && echo '#define FLOCK_SELFTEST'
         [ -n "$NBREAD_SELFTEST" ]    && echo '#define NBREAD_SELFTEST'
         [ -n "$FBSCALE_SELFTEST" ]   && echo '#define FBSCALE_SELFTEST'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
