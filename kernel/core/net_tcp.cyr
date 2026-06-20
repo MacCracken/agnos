@@ -814,8 +814,34 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
             var rcv = load64(cb + 40);
             if (((seq + data_len) & 0xFFFFFFFF) == rcv) {
                 store64(cb + 40, (rcv + 1) & 0xFFFFFFFF);
-                tcp_send_pkt(conn_id, 0x10, 0, 0);
-                store64(cb, 4);  # CLOSE_WAIT
+                # SLOT-LEAK FIX (1.45.11): if the peer closes a passive-open conn
+                # we NEVER accepted, no application is waiting for it. tcp_accept
+                # returns only ESTABLISHED (state 2) conns, and a CLOSE_WAIT conn
+                # arms no retransmit — so tcp_retx_tick (which only reaps conns
+                # with an armed retx) would never reap it, and the 8-slot table
+                # leaks one slot per abandoned-before-accept conn until the
+                # listener wedges permanently. Found burn-free by the docker
+                # net-sweep concurrency dimension: a >8-way burst whose clients
+                # time out (FIN) before the single-threaded serve loop accepts
+                # them. Reap it now — ACK + our FIN, free the per-conn buffers,
+                # mark CLOSED (immediately reclaimable by tcp_alloc_conn_slot).
+                var fmeta = load64(cb + 72);
+                var f_reaped = 0;
+                if ((fmeta & 0x200) != 0) {            # passive-open
+                    if ((fmeta & 0x400) == 0) {        # never accept()ed
+                        tcp_send_pkt(conn_id, 0x11, 0, 0);   # FIN+ACK — we close too
+                        var frx = load64(cb + 48);
+                        if (frx != 0) { kfree_sized(frx, TCP_RX_RING); store64(cb + 48, 0); }
+                        var ftx = load64(cb + 136);
+                        if (ftx != 0) { kfree_sized(ftx, TCP_RETX_BUF); store64(cb + 136, 0); }
+                        store64(cb, 0);                # CLOSED (reclaimable)
+                        store64(cb + 128, 0);          # disarm retx
+                        f_reaped = 1;
+                    }
+                }
+                if (f_reaped == 1) { return 1; }
+                tcp_send_pkt(conn_id, 0x10, 0, 0);   # ACK the FIN
+                store64(cb, 4);  # CLOSE_WAIT (an accepted conn — the app will close it)
             }
         }
         # Preserve upper-bit metadata (is_listening/passive_open/accepted/

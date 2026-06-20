@@ -398,51 +398,67 @@ ext2_jbd2_crash_selftest();
 #endif
 
 #ifdef TCP_LISTEN_SMOKE
-# TCP server-side smoke (1.32.0 bite A). Validates that:
-#   - tcp_listen(port) allocates a LISTEN slot
-#   - the listener doesn't spuriously accept on quiet wire
-#   - if SLIRP delivers a SYN, the passive-open path + SYN_RCVD branch
-#     transition the conn to ESTABLISHED and tcp_accept() returns it
+# TCP server-side smoke → PERSISTENT HTTP listener (rewritten 1.45.x).
 #
-# Note: the "accept-success" scenario in scripts/tcp-listen-smoke.sh does
-# not pass under QEMU SLIRP — SLIRP isn't delivering inbound TCP to the guest
-# NIC under this kernel's hostfwd config. Listener-functional + no-spurious-
-# accept (scenario 2) DOES pass, validating the kernel-side LISTEN/tcp_listen/
-# timeout path. The r8169 driver + DHCP are iron-verified (1.32.x), so the
-# accept-success surface is best exercised on iron with a real inbound peer;
-# this smoke remains the kernel-side regression net, not the load-bearing
-# accept test.
+# History: this was a 1.32.0-era ~8 s one-shot raw-banner probe whose banner was
+# frozen at the literal "AGNOS 1.32.1" with a hardcoded 30-byte send length —
+# stale by 13 minor versions, and the window was far too short for a human or a
+# load generator to actually reach. The accept path itself is proven: the
+# agnosticos docker net-sweep harness (host → docker → qemu/SLIRP → guest) gets
+# the banner back, so LISTEN → SYN → SYN_RCVD → ESTABLISHED → accept → send →
+# close all work under SLIRP, not only on iron. (The old "doesn't pass under
+# SLIRP" note here was wrong / stale — net-sweep disproved it.)
+#
+# Now: a long-lived HTTP/1.0 server. Serves for as long as the box is up (the
+# qemu timeout or a power-cycle ends it), net_poll()-ing every spin so ARP
+# replies + ICMP echo stay answered too — the box is pingable AND curl-able the
+# whole time. Banner is version-derived (_AGNOS_VERSION); every length is
+# strlen-computed, never a literal. Build-flag-gated, so production is untouched.
 {
-    kprintln("tcp_listen smoke: start", 23);
-    # Gratuitous ARP so SLIRP learns our MAC (needed for inbound hostfwd
-    # delivery; doesn't fully fix SLIRP forwarding but doesn't hurt).
+    var m_start = "tcp_listen smoke: start";
+    kprintln(m_start, strlen(m_start));
+    # Gratuitous ARP up front so the switch / peer learns our MAC for inbound
+    # delivery (helps SLIRP hostfwd + real-LAN; harmless if ignored).
     arp_request(net_ip);
     var lid = tcp_listen(8080);
-    kprint("tcp_listen(8080) lid=", 21);
+    var m_lid = "tcp_listen(8080) lid=";
+    kprint(m_lid, strlen(m_lid));
     kprint_num(lid);
     kprintln("", 0);
     if (lid >= 0) {
-        var got = 0;
-        # ~8s wait window. Timer-tick anchored for portability.
-        var start_tick = timer_ticks;
-        while ((timer_ticks - start_tick) < 800) {
+        var m_serv = "http: serving :8080 (persistent) -- curl + ping live";
+        kprintln(m_serv, strlen(m_serv));
+        var served = 0;
+        # Serve forever: a human-driven curl, a load generator, or the docker
+        # net-sweep harness can all reach us; harness qemu-timeout / power ends it.
+        while (1 == 1) {
             net_poll();
             var c = tcp_accept(lid);
             if (c >= 0) {
-                kprint("tcp_accept: conn_id=", 20);
+                var m_acc = "tcp_accept: conn_id=";
+                kprint(m_acc, strlen(m_acc));
                 kprint_num(c);
                 kprintln("", 0);
-                tcp_send(c, "AGNOS 1.32.1 tcp_listen smoke\n", 30);
+                # Minimal HTTP/1.0 200 so `curl http://<ip>:8080` returns a body
+                # and closes. Version-derived + strlen-sized — no stale literal,
+                # no hardcoded send length (the two bugs the old banner had).
+                var hdr = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nAGNOS ";
+                var tail = " tcp_listen smoke\n";
+                var ver = agnos_version_str();   # program-body-safe (not the gvar)
+                tcp_send(c, hdr, strlen(hdr));
+                tcp_send(c, ver, strlen(ver));
+                tcp_send(c, tail, strlen(tail));
                 tcp_close(c);
-                got = 1;
-                break;
+                served = served + 1;
+                var m_served = "http: served conn=";
+                kprint(m_served, strlen(m_served));
+                kprint_num(served);
+                kprintln("", 0);
             }
             arch_wait();
         }
-        if (got == 0) {
-            kprintln("tcp_listen smoke: no connection within timeout", 46);
-        }
     }
-    kprintln("tcp_listen smoke: done", 22);
+    var m_end = "tcp_listen smoke: done";
+    kprintln(m_end, strlen(m_end));
 }
 #endif
