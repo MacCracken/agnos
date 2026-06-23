@@ -737,7 +737,7 @@ fn vfs_create_pipe(fds_ptr) {
     return 0;
 }
 
-# === Advisory file locking (flock#59, 1.46.x) ===
+# === Advisory file locking (flock#59, 1.45.13) ===
 # A 16-slot table of {inode, holder pid, mode}; an inode==0 slot is free. Keyed by
 # the VFS_EXT2_FILE inode so a SH/EX lock is whole-file + cross-process (the
 # fork-per-accept consumer agora needs; libro/patra crash-safety). Single-core

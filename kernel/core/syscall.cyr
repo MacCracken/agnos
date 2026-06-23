@@ -41,10 +41,14 @@ fn stack_canary_check(canary) {
 #    pages (1.35.4). The natural pair to 27; same pure-memory posture.
 # 45-57 = the net band (getrandom / time_unix / sock_* / udp_* / icmp_echo) — see
 #    the inline handlers below + cyrius lib/syscalls_x86_64_agnos.cyr for the full map.
-# 58=lseek(fd, offset, whence) — VFS_EXT2_FILE read/write cursor reposition (1.46.x).
+# 58=lseek(fd, offset, whence) — VFS_EXT2_FILE read/write cursor reposition (1.45.13).
 # 59=flock(fd, op) — BSD advisory whole-file lock, inode-keyed, non-blocking, released
-#    on close#6 + proc exit (1.46.x). Both serve the server-stage persistence/locking
+#    on close#6 + proc exit (1.45.13). Both serve the server-stage persistence/locking
 #    consumers (descent libro/patra, agora shared-world door games).
+# 60=winsize() — console char grid packed as (cols<<16 | rows) from the live
+#    framebuffer (fb_width/fb_height/fb_scale, 8×16 glyph), or -1 (FB not up). No
+#    args, no buffer (like uptime#40). Lets a ring-3 TUI size to the real console
+#    instead of a hardcoded 80×24 (darshana tty_winsize on agnos → kii/cyim/chakshu). (1.45.13)
 
 var sys_exit_code = 0;
 
@@ -1767,7 +1771,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # new absolute position, or -1 (bad fd / not a VFS_EXT2_FILE / bad whence /
         # negative result). VFS_EXT2_FILE already carries the cursor at payload[0]
         # (size at [1]); read#5 / the ext2 write path advance it, so this only sets
-        # it. Added (1.46.x) for the seek-based storage backend (libro / patra) the
+        # it. Added (1.45.13) for the seek-based storage backend (libro / patra) the
         # server-stage apps need — descent persistence + agora. a4 unused.
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg1 >= 32) { stack_canary_check(canary); return 0 - 1; }
@@ -1790,7 +1794,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # proc_current. NON-BLOCKING at the kernel boundary — single-core run-to-
         # completion can't sleep, so a contended SH/EX returns -1 (WOULD_BLOCK) and
         # the ring-3 caller poll-spins (yielding so the holder can release). Released
-        # in vfs_close#6 and on proc exit (flock_release_pid). Added (1.46.x) for the
+        # in vfs_close#6 and on proc exit (flock_release_pid). Added (1.45.13) for the
         # shared-world serialization agora's door games need + libro/patra crash-safety.
         # a3/a4 unused.
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
@@ -1802,6 +1806,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var fl_rc = flock_apply(fl_ino, proc_current, arg2);
         stack_canary_check(canary);
         return fl_rc;
+    }
+    if (num == 60) {
+        # winsize() — return the console character grid packed as (cols<<16 | rows),
+        # or -1 if the framebuffer isn't up. No args, no user buffer: a pure read of
+        # the boot-info FB geometry (fb_winsize → fb_width/fb_height/fb_scale), like
+        # uptime_ms#40, so no pointer validation / SMAP window and no preempt/sti
+        # window (no subsystem call, no blocking). darshana's tty_winsize unpacks
+        # this on agnos so kii/cyim/chakshu size to the real console instead of a
+        # hardcoded 80×24. a1..a4 unused. (1.45.13)
+        var ws_packed = fb_winsize();
+        stack_canary_check(canary);
+        return ws_packed;
     }
     stack_canary_check(canary);
     return 0 - 1;

@@ -464,7 +464,7 @@ ext2_jbd2_crash_selftest();
 #endif
 
 #ifdef FLOCK_SELFTEST
-# flock#59 conflict/release logic (1.46.x). Exercises flock_apply directly with
+# flock#59 conflict/release logic (1.45.13). Exercises flock_apply directly with
 # synthetic inodes/pids — the CROSS-PROCESS semantics a single boot can't reach via
 # the syscall (one proc never conflicts with itself): EX is exclusive, SH coexist,
 # EX-vs-SH conflict, UN + release_pid free the slots. Compile-gated:
@@ -489,5 +489,45 @@ ext2_jbd2_crash_selftest();
     flock_release_pid(6);                                   # leave the table clean
     if (fok == 1) { kprintln("flock: ALL PASS", 15); }
     if (fok == 0) { kprintln("flock: FAIL", 11); }
+}
+#endif
+
+#ifdef WINSIZE_SELFTEST
+# winsize#60 console-grid math (1.45.13). Reads the LIVE framebuffer geometry (FB
+# is up by the time selftests run — kprintln paints the console) and asserts
+# fb_winsize() packs (cols<<16 | rows) matching fb_putc's own cell math
+# (cols = w/(8*s), rows = (h - FB_CONSOLE_Y0)/(16*s)). Prints the grid so the
+# QEMU/iron smoke can eyeball it against the known resolution. Compile-gated:
+# WINSIZE_SELFTEST=1 sh scripts/build.sh.
+{
+    var ws_w = fb_width();
+    var ws_h = fb_height();
+    var ws_s = fb_scale();
+    var ws_exp_cols = ws_w / (8 * ws_s);
+    var ws_exp_rows = (ws_h - FB_CONSOLE_Y0) / (16 * ws_s);
+    var ws_packed = fb_winsize();
+    var ws_got_cols = (ws_packed >> 16) & 0xFFFF;
+    var ws_got_rows = ws_packed & 0xFFFF;
+    var wok = 1;
+    if (ws_packed < 0) { wok = 0; }
+    if (ws_got_cols != ws_exp_cols) { wok = 0; }
+    if (ws_got_rows != ws_exp_rows) { wok = 0; }
+    if (ws_got_cols <= 0) { wok = 0; }
+    if (ws_got_rows <= 0) { wok = 0; }
+    var ws_m = "winsize: cols=";
+    kprint(ws_m, strlen(ws_m));
+    kprint_num(ws_got_cols);
+    var ws_m2 = " rows=";
+    kprint(ws_m2, strlen(ws_m2));
+    kprint_num(ws_got_rows);
+    kprintln("", 0);
+    if (wok == 1) {
+        var ws_pass = "winsize: ALL PASS";
+        kprintln(ws_pass, strlen(ws_pass));
+    }
+    if (wok == 0) {
+        var ws_fail = "winsize: FAIL";
+        kprintln(ws_fail, strlen(ws_fail));
+    }
 }
 #endif

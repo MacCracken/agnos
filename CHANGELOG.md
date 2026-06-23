@@ -5,7 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.13] — 2026-06-22
+
 ### Added
+- **`winsize`#60 — ring-3 terminal/console window size** (`kernel/arch/x86_64/fb_console.cyr`
+  `fb_winsize()` + `kernel/core/syscall.cyr` dispatch). agnos has no `ioctl(TIOCGWINSZ)`, so a
+  ring-3 TUI had no way to learn the console grid and fell back to a hardcoded 80×24. `winsize()`
+  returns the live framebuffer's character grid packed as `(cols<<16 | rows)` in `rax`
+  (`cols = fb_width()/(8·scale)`, `rows = (fb_height()−FB_CONSOLE_Y0)/(16·scale)`, 8×16 glyph —
+  mirroring `fb_putc`'s own cell math), or `-1` if the framebuffer isn't up. No args, no user
+  buffer (a pure read of the boot-info FB geometry, like `uptime_ms`#40) → no pointer-validation
+  or SMAP surface, no preempt/sti window. Consumed by **`darshana`'s `tty_winsize` on agnos**
+  (new `#ifdef CYRIUS_TARGET_AGNOS` branch over the raw `syscall(60)`), which unblocks
+  **kii / cyim / chakshu** sizing to the real console instead of 80×24. Verified by
+  `WINSIZE_SELFTEST` (asserts the packed grid matches `fb_putc`'s cell math against the live FB).
 - **`lseek`#58 + `flock`#59 — ring-3 file seek + advisory locking** (`kernel/core/syscall.cyr`
   + `kernel/core/vfs.cyr`), the shared kernel infra the server-stage apps need (descent's
   libro/patra persistence + agora's `flock`'d shared-world door games — see

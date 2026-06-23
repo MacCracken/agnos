@@ -426,6 +426,34 @@ fn fb_scale() {
     return 2;
 }
 
+# Console character grid (cols × rows) of the live framebuffer, packed for the
+# winsize#60 syscall. Mirrors fb_putc's own cell math EXACTLY — cell = 8*scale ×
+# 16*scale, same FB_CONSOLE_Y0 top offset — so a ring-3 TUI that sizes itself to
+# this value lays out against the real console geometry rather than a hardcoded
+# 80×24. The two 16-bit counts are returned packed in one i64: high 16 = cols,
+# low 16 = rows (cols = rax>>16 & 0xFFFF, rows = rax & 0xFFFF). Both fit in 16
+# bits with enormous margin (8K = 960 cols / 135 rows). Returns -1 if the
+# framebuffer isn't up yet (boot_info absent → fb_width()/fb_height() == 0). The
+# packed return avoids a user-buffer write — no pointer to validate, no SMAP
+# window — matching uptime_ms#40's bufferless style. (1.45.13 — darshana tty_winsize.)
+fn fb_winsize() {
+    var w = fb_width();
+    var h = fb_height();
+    if (w == 0) { return 0 - 1; }
+    if (h == 0) { return 0 - 1; }
+    var s = fb_scale();
+    var cols = w / (8 * s);
+    var rows = (h - FB_CONSOLE_Y0) / (16 * s);
+    # Defensive 16-bit clamp before packing. Each count gets a 16-bit field, so a
+    # pathological boot_info reporting an absurd geometry (cols>0xFFFF needs width
+    # >524280 px — ~68× beyond 8K, reachable only via corrupt firmware data, never
+    # real hardware) must not overflow cols into the rows field. Mirrors blit#39's
+    # memory-safety-gate posture; a no-op on every real display.
+    if (cols > 0xFFFF) { cols = 0xFFFF; }
+    if (rows > 0xFFFF) { rows = 0xFFFF; }
+    return (cols << 16) | rows;
+}
+
 # Paint a solid-color cell (8*scale × 16*scale) at (cell_x, abs_y_px).
 # Used by scroll bottom-row clear and backspace; not by glyph render
 # (which interleaves FG/BG per font bit).
