@@ -5,6 +5,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.16] — 2026-06-23
+
+### Added
+- **`net_config(field)` syscall (#61)** (`kernel/core/syscall.cyr`) — a non-blocking, buffer-less
+  getter (same shape as `uptime_ms`#40 / `winsize`#60) returning a kernel network-config datum in
+  `rax`: field `0`=`net_ip`, `1`=`net_netmask`, `2`=`net_gateway`, `3`=`net_dns_server` (the
+  DHCP option-6 resolver, else the leased gateway). Each is a packed IPv4 in `[0, 0xFFFFFFFF]`
+  (`0`=unconfigured, `-1`=unknown field); IF=0-safe pure read of the `net.cyr` globals populated by
+  `net_dhcp.cyr` on ACK. **Why:** lets a ring-3 resolver target the DHCP-leased **on-subnet**
+  resolver instead of a hardcoded **off-subnet** public IP (1.1.1.1 / 8.8.8.8) — the off-subnet
+  fallback needs working gateway-MAC egress + a reachable public resolver, the QEMU-passed /
+  iron-failed gap that froze `yo google.com` / `whirl https://google.com` on real hardware (QEMU's
+  `dig` smoke used an explicit on-subnet `@10.0.2.3`, never exercising the fallback). A cyrius
+  `sys_net_config` wrapper is requested (`cyrius/docs/development/issues/2026-06-23-agnos-net-config-syscall-wrapper.md`)
+  so consumers drop the interim raw `syscall(61, …)`.
+- **Net-path fault canary** (diagnostic, FB-over-CMOS — strip once the net path is iron-clean):
+  - `fb_dbg_beacon(code)` (`kernel/arch/x86_64/fb_console.cyr`) paints a 32×32 px color-coded square
+    in the top-right FB corner at each low-frequency net-syscall stage — `net_config`#61 (green),
+    `udp_send`#52 / DNS tx (yellow), `sock_connect`#47 (orange), `sock_send`#48 / TLS+HTTP (cyan),
+    `icmp_echo`#55 / ping (magenta) — so the **last net stage a frozen tool reached is visible on the
+    burn photo**. Normal kernel context (FB mapped under the per-process CR3), not the recv poll loops.
+  - The 7 CPU-exception stubs (`kernel/arch/x86_64/idt.cyr`) now paint a wide FB bar (`rep stosd`, one
+    microcoded instruction) **after** their CMOS vector stamp, before `cli; hlt` — a **caught fault is
+    now visible on the framebuffer** (bar across the top), distinguishing a **FAULT** from a **SPIN**
+    (only the corner beacon shows). The CMOS stamp is written first, so the paint can only add a
+    signal, never lose the vector/CR2/RIP; a null-guard (`fb_dbg_phys`) skips the paint pre-console.
+
+### Changed
+- **`taar` (whirl) + `yo` DNS resolver discovery prefers the kernel-leased resolver on AGNOS.**
+  `taar`'s `_taar_resolv_discover` (`src/socket.cyr` `_taar_plat_dns_server` + `src/dns.cyr`) and
+  `yo`'s `_dns_choose_nameserver` (`src/platform_agnos.cyr` `platform_dns_server` + `src/dns.cyr`) now
+  call `net_config(3)` first and use it when `> 0`, falling back to `/etc/resolv.conf` then the public
+  IP only when the kernel reports no lease. Linux backends return `0`, so the resolv.conf path is
+  unchanged there. (Requires the new tools staged onto the agnos-fs `/bin` alongside the #61 kernel.)
+
 ## [1.45.15] — 2026-06-23
 
 ### Fixed

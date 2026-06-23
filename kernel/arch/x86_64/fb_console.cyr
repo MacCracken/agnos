@@ -223,6 +223,10 @@ fn fb_console_init() {
     fb_cur_x = 0;
     fb_cur_y = 0;
     fb_console_ready = 1;
+    # 1.45.16: stash the FB base for the idt.cyr CPU-exception fault-bar (it runs
+    # in a raw asm stub that can't call fb_fb_phys()). 0 until here → the stub's
+    # null-guard skips the paint, so an early-boot fault still just CMOS-stamps.
+    fb_dbg_phys = fb_fb_phys();
     # PAT-state confirmation is deferred to fb_verify_wc(), called from
     # kernel/core/main.cyr AFTER pmm_init returns. The early WC remap
     # at main.cyr line 17 takes effect immediately for FBs in the 32-bit
@@ -295,6 +299,42 @@ fn fb_pf() {
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
     return load32(bi + 0x5C);
+}
+# 1.45.16 net-stage canary beacon. Paints a 32x32 px solid block in the TOP-RIGHT
+# FB corner, colored by `code`, so the LAST net stage a ring-3 tool reached is
+# visible on the framebuffer photo (FB-over-CMOS). Called from the low-frequency
+# net-syscall entry points (net_config#61 / udp_send#52 / sock_connect#47 /
+# sock_send#48 / icmp_echo#55) — NOT the recv poll loops. Normal kernel context
+# (post-SYSCALL; the FB is mapped under the per-process CR3, like the console), so
+# a plain store32 is safe. If the box FREEZES showing a given corner color, that is
+# the stage it hung in: a SPIN shows ONLY this beacon; a caught CPU FAULT ALSO
+# paints the idt.cyr fault-bar across the top. Diagnostic — strip once the net path
+# is iron-clean (cf. the 1.44.x kbd_read FB markers). The color is a raw 0x00RRGGBB
+# dword; under a BGRX FB (fb_pf==1) R/B swap but each stays a distinct bright hue.
+fn fb_dbg_beacon(code) {
+    var fb = fb_fb_phys();
+    if (fb == 0) { return 0; }
+    var pitch = fb_pitch();
+    var w = fb_width();
+    if (w < 32) { return 0; }
+    var color = 0x00FFFFFF;                  # white   — unknown code
+    if (code == 1) { color = 0x0000FF00; }   # green   — resolver fetched (net_config#61)
+    if (code == 2) { color = 0x00FFFF00; }   # yellow  — DNS/UDP tx (udp_send#52)
+    if (code == 3) { color = 0x00FF8000; }   # orange  — TCP connect (sock_connect#47)
+    if (code == 4) { color = 0x0000FFFF; }   # cyan    — TCP send / TLS+HTTP (sock_send#48)
+    if (code == 5) { color = 0x00FF00FF; }   # magenta — ICMP echo / ping (icmp_echo#55)
+    var x0 = (w - 32) * 4;
+    var y = 0;
+    while (y < 32) {
+        var rowp = fb + y * pitch + x0;
+        var x = 0;
+        while (x < 32) {
+            store32(rowp + x * 4, color);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return 0;
 }
 # GOP Mode->Mode (UINT32) — which mode the firmware booted with. Primary
 # signal for the quiet-boot-vs-VGA-spec divergence: if the two paths land

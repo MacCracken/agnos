@@ -1565,6 +1565,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var sc_sport = arg3;
         if (sc_sport <= 0) { sc_sport = 49152 + (timer_ticks & 0x3FFF); }
         if (sc_sport > 65535) { sc_sport = 49152 + (timer_ticks & 0x3FFF); }
+        fb_dbg_beacon(3);                    # 1.45.16 canary: TCP connect stage
         preempt_disable();
         asm { sti; }
         var sc_cid = tcp_connect(arg1, arg2, sc_sport);
@@ -1585,6 +1586,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 <= 0) { stack_canary_check(canary); return 0; }
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
+        fb_dbg_beacon(4);                    # 1.45.16 canary: TCP send (TLS/HTTP) stage
         preempt_disable();
         asm { sti; }
         var ss_n = tcp_send(arg1, arg2, arg3);
@@ -1665,6 +1667,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (is_user_range(arg3, us_len) == 0) { stack_canary_check(canary); return 0 - 1; }
         var us_sport = (arg2 >> 16) & 0xFFFF;
         var us_dport = arg2 & 0xFFFF;
+        fb_dbg_beacon(2);                    # 1.45.16 canary: DNS/UDP tx stage
         var us_r = udp_send(arg1, us_sport, us_dport, arg3, us_len);
         stack_canary_check(canary);
         return us_r;
@@ -1720,6 +1723,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # 100 Hz tick (10 ms); a sub-10 ms reply returns 0. a2..a4 unused. (The
         # ~3 s timeout is icmp_ping's fixed bound; a configurable -W is a future
         # enhancement that would parameterise icmp_ping.)
+        fb_dbg_beacon(5);                    # 1.45.16 canary: ICMP echo (ping) stage
         preempt_disable();
         asm { sti; }
         var ie_ticks = icmp_ping(arg1);
@@ -1818,6 +1822,32 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var ws_packed = fb_winsize();
         stack_canary_check(canary);
         return ws_packed;
+    }
+    if (num == 61) {
+        # net_config(field=arg1) — return a kernel network-config datum in rax, or
+        # -1 for an unknown field. No buffer, no blocking, IF=0-safe: a pure read of
+        # the net.cyr globals (like uptime_ms#40 / winsize#60), no pointer/SMAP
+        # surface, no preempt/sti window.
+        #   field 0 = net_ip         (this host's IPv4, ip4()-packed)
+        #   field 1 = net_netmask
+        #   field 2 = net_gateway    (default-route next hop)
+        #   field 3 = net_dns_server (DHCP option-6 resolver, else the leased gateway)
+        # The DHCP lease (net_dhcp.cyr) populates all four on ACK; before a lease they
+        # carry the static fallback (192.168.1.222 / .1 / /24). Each value is a packed
+        # IPv4 in [0, 0xFFFFFFFF] (always a positive i64); 0 = unconfigured, so a ring-3
+        # caller treats <=0 as "fall back". **Why this exists**: lets a ring-3 resolver
+        # (`yo`, and `taar`→`whirl`) target the DHCP-leased ON-SUBNET resolver instead
+        # of a hardcoded OFF-SUBNET public IP (1.1.1.1 / 8.8.8.8). The off-subnet
+        # fallback needs working gateway routing + a reachable public resolver — the
+        # exact QEMU-passed / iron-failed gap that froze `yo google.com` /
+        # `whirl https://google.com` (QEMU's dig smoke used an on-subnet @10.0.2.3).
+        # a2..a4 unused. (1.45.16)
+        if (arg1 == 0) { stack_canary_check(canary); return net_ip; }
+        if (arg1 == 1) { stack_canary_check(canary); return net_netmask; }
+        if (arg1 == 2) { stack_canary_check(canary); return net_gateway; }
+        if (arg1 == 3) { fb_dbg_beacon(1); stack_canary_check(canary); return net_dns_server; }
+        stack_canary_check(canary);
+        return 0 - 1;
     }
     stack_canary_check(canary);
     return 0 - 1;

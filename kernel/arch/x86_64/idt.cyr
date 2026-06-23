@@ -198,14 +198,53 @@ fn exc_handlers_init() {
             store8(stub + 154, 0xE6); store8(stub + 155, 0x71);
             tail = 156;
         }
+        # 1.45.16 fault canary — paint a wide FB bar before halting so a CAUGHT CPU
+        # exception is visible ON THE FRAMEBUFFER (photo-readable), not only in CMOS
+        # 0x54/0x55. The CMOS stamp(s) above are written FIRST, so even if this FB
+        # write itself faults (FB not mapped under the faulting CR3 → #PF → #DF) the
+        # vector/CR2/RIP evidence already persisted — this paint can only ADD a
+        # signal, never lose one. `fb_dbg_phys` = the FB base captured at
+        # fb_console_init (0 until the console is up → the null-guard skips the paint,
+        # so an early-boot fault still just CMOS-stamps). `rep stosd` is ONE
+        # microcoded instruction — no hand-rolled loop to mis-assemble. The bar means
+        # "a fault was caught here": it distinguishes a FAULT (bar across the top)
+        # from a SPIN (only the fb_dbg_beacon net-stage corner square shows). The
+        # exact vector stays in CMOS 0x54 (read-boot-log decodes it).
+        var fbp = &fb_dbg_phys;
+        # mov rax, imm64(&fb_dbg_phys)              48 B8 <addr64 LE>
+        store8(stub + tail + 0, 0x48); store8(stub + tail + 1, 0xB8);
+        store8(stub + tail + 2, fbp & 0xFF);
+        store8(stub + tail + 3, (fbp >> 8) & 0xFF);
+        store8(stub + tail + 4, (fbp >> 16) & 0xFF);
+        store8(stub + tail + 5, (fbp >> 24) & 0xFF);
+        store8(stub + tail + 6, (fbp >> 32) & 0xFF);
+        store8(stub + tail + 7, (fbp >> 40) & 0xFF);
+        store8(stub + tail + 8, (fbp >> 48) & 0xFF);
+        store8(stub + tail + 9, (fbp >> 56) & 0xFF);
+        # mov rdi, [rax]                            48 8B 38   (rdi = FB base value)
+        store8(stub + tail + 10, 0x48); store8(stub + tail + 11, 0x8B); store8(stub + tail + 12, 0x38);
+        # test rdi, rdi ; jz +13 → cli              48 85 FF ; 74 0D
+        store8(stub + tail + 13, 0x48); store8(stub + tail + 14, 0x85); store8(stub + tail + 15, 0xFF);
+        store8(stub + tail + 16, 0x74); store8(stub + tail + 17, 0x0D);
+        # mov eax, 0x000000FF (bright primary)      B8 FF 00 00 00
+        store8(stub + tail + 18, 0xB8);
+        store8(stub + tail + 19, 0xFF); store8(stub + tail + 20, 0x00);
+        store8(stub + tail + 21, 0x00); store8(stub + tail + 22, 0x00);
+        # mov ecx, 0x00008000 (32768 px ≈ thick bar, fits any FB ≥128 KB)  B9 00 80 00 00
+        store8(stub + tail + 23, 0xB9);
+        store8(stub + tail + 24, 0x00); store8(stub + tail + 25, 0x80);
+        store8(stub + tail + 26, 0x00); store8(stub + tail + 27, 0x00);
+        # cld ; rep stosd                           FC ; F3 AB
+        store8(stub + tail + 28, 0xFC);
+        store8(stub + tail + 29, 0xF3); store8(stub + tail + 30, 0xAB);
         # cli ; hlt ; jmp $-1            (mask + halt, loop back onto hlt)
-        store8(stub + tail + 0, 0xFA);
-        store8(stub + tail + 1, 0xF4);
-        store8(stub + tail + 2, 0xEB); store8(stub + tail + 3, 0xFD);
+        store8(stub + tail + 31, 0xFA);
+        store8(stub + tail + 32, 0xF4);
+        store8(stub + tail + 33, 0xEB); store8(stub + tail + 34, 0xFD);
         # Install as a 64-bit interrupt gate, kernel CS 0x08, present DPL0
         # (0x8E). CPU-generated exceptions ignore the gate DPL, so DPL0 is fine.
         idt_set_gate(&idt + v * 16, stub, 0x08, 0x8E);
-        off = off + tail + 4;
+        off = off + tail + 35;
     }
     return 0;
 }
