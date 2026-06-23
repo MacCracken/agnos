@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.14] — 2026-06-22
+
+### Changed
+- **cyrius toolchain pin `6.2.30` → `6.2.36`** (`cyrius.cyml`). Picks up the agnos
+  correctness fixes in the 6.2.31–6.2.36 stdlib: **6.2.36** made `io.cyr`'s file-lock
+  helpers (`file_lock` / `file_append_locked`) portable — they were `CYRIUS_TARGET_LINUX`-only
+  raw `syscall(73)` and thus **`ud2`/SIGILL trap stubs on agnos** (an agnos boot-trap class),
+  now routed through agnos `flock`#59; **6.2.35** fixed the agnos mutex + `time`#201 →
+  `time_unix`#46 and removed the last raw `syscall(SYS_FUTEX)` that "made stale-pinned
+  consumers fail `--agnos`". The **kernel binary is byte-identical** (1,204,416 B) — cycc
+  codegen is byte-identical across 6.2.30→6.2.36 and the freestanding kernel links no host
+  stdlib (`stdlib = []`); the fixes land in the agnos **userland** programs (smokes, bundled
+  tools) that link the cyrius stdlib. The pin is now honest (matches the installed/CI toolchain).
+  `check.sh` 11/11, `agnsh-smoke` PASS.
+
 ## [1.45.13] — 2026-06-22
 
 ### Added
