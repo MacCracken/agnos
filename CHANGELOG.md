@@ -5,6 +5,47 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.15] — 2026-06-23
+
+### Fixed
+- **ext2/ext4 multi-chunk BGDT walk — inodes & blocks beyond the first block-group-descriptor-table
+  chunk are now reachable** (`kernel/core/ext2.cyr`). The Phase-1 driver only ever read/wrote the
+  **first** BGDT block, which holds `blocksize/desc_size` group descriptors = **64 groups** for a
+  default `mkfs.ext4` (4 KB block, 64-byte 64BIT descriptor) = the first **~8 GiB**. The real
+  agnos-fs root is **25 GiB (~200 groups)**, so any inode in group ≥ 64 was unreachable:
+  `ext2_get_inode` printed `ext2: block_group beyond first BGDT chunk (Phase 1 limit)` and returned
+  `-1`. On the 1.45.x close-out iron burn this surfaced as **`yo google.com` and `whirl https://google.com`
+  both failing exec-from-disk** — Linux's allocator had placed `/bin/yo` and `/bin/whirl` in high
+  block groups during `cp -a` staging, so the kernel couldn't load their inodes (the binaries never
+  ran). The whole single-chunk assumption is lifted:
+  - The 4 KB `ext2_bgdt_buf` now holds **one BGDT chunk at a time**, tracked by an
+    `ext2_bgdt_loaded_chunk` marker; `ext2_load_bgdt_chunk(chunk)` / `ext2_bgdt_load_for_group(group)`
+    swap chunks in on demand (short-circuiting if already resident, invalidating the marker on a
+    failed read so a partial buffer can't be reused). `ext2_grp_off` is now **chunk-relative**
+    (`group − loaded_chunk·groups_per_block`) — byte-identical for chunk 0, so all single-group paths
+    are unchanged.
+  - `ext2_get_inode` / `ext2_put_inode` load the target group's chunk instead of refusing; the stale
+    `(blocksize/32)·inodes_per_group` cap is replaced with a true `s_inodes_count` bound (new
+    `ext2_sb_inodes_count` accessor, s_inodes_count @ sb+0).
+  - `ext2_write_bgdt` persists the **resident** chunk and `ext2_bgdt_recsum` recomputes bg_checksums
+    for that chunk's **absolute** group range — correct `crc32c` seed per group on any chunk. The four
+    allocators (`ext2_alloc_block` / `ext2_free_block` / `ext2_alloc_inode` / `ext2_free_inode`) load
+    each group's chunk per iteration, which also closes a **latent out-of-bounds read**: the alloc
+    scan walked `g` to `ngroups` (~200) while `ext2_grp_off(g)` indexed past the 4 KB buffer into
+    adjacent BSS for `g ≥ 64` (masked only because low groups always had free space).
+  - META_BG (non-contiguous BGDT, hundreds-of-MB descriptor tables) stays mount-refused by the
+    existing incompat mask, so the contiguous `first_data_block+1+chunk` formula is exact for every
+    FS that mounts.
+- **Validation:** new **`scripts/ext2-multichunk-smoke.sh`** (+ `MULTICHUNK_SELFTEST` build flag)
+  boots a genuine **4-chunk image** (197 groups via `-g 256`, default `mkfs.ext4` profile —
+  metadata_csum + 64bit + extent) and confirms a **high-group inode READ** (inode 1057 in group 66 /
+  chunk 1 → `mode=0x81a4` regular file — the exact iron failure mode), a **negative bound** (inode
+  past `s_inodes_count` rejected), a **high-group block alloc/free** (block 16896 in group 66 →
+  allocator + `write_bgdt` + recsum on chunk 1), and **`e2fsck -fn` clean** post-boot. The existing
+  single-chunk smokes are byte-equivalent and stay green: `ext2-smoke` 5/5, `ext2-write-smoke`,
+  `ext2-uninit-smoke`, `exec-smoke`, `check.sh` 11/11. Production `build/agnos` **1,207,096 B**.
+  Pending the next archaemenid burn to confirm `yo`/`whirl` exec-from-disk on real iron.
+
 ## [1.45.14] — 2026-06-22
 
 ### Changed

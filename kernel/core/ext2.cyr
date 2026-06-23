@@ -45,7 +45,7 @@ var ext2_backend            = 0;    # BLK_NONE; set during probe
 # allocates N u64 = 8N bytes (vs function-local var X[N] which is N
 # bytes — see kprint_num's var buf[24] for the locals convention).
 var ext2_sb_buf[128];      # 1024 bytes — superblock at byte 1024 of FS
-var ext2_bgdt_buf[512];    # 4096 bytes — one BGDT block (32 BGDT entries × 32 bytes legacy fits in 1 KB; up to 128 entries fit in 4 KB)
+var ext2_bgdt_buf[512];    # 4096 bytes — ONE BGDT chunk (= one FS block of group descriptors: 128 × 32B legacy or 64 × 64B 64BIT). Multi-chunk walk swaps chunks through this buffer (1.45.15).
 var ext2_inode_buf[32];    # 256 bytes — one inode (covers both 128-legacy + 256-modern)
 var ext2_block_buf[512];   # 4096 bytes — scratch for one data block
 
@@ -70,6 +70,22 @@ var ext2_extent_buf[512];
 # distinct from ext2_block_buf / ext2_bgdt_buf so an allocator can hold
 # the BGDT block, the bitmap block, and a data block live at once.
 var ext2_bitmap_buf[512];
+
+# --- multi-chunk BGDT geometry (1.45.15) ---------------------------------
+# The primary BGDT is a CONTIGUOUS array of desc_size-byte descriptors at FS
+# block (first_data_block+1). It spans >1 FS block when ngroups exceeds
+# blocksize/desc_size — e.g. the 25 GiB agnos-fs root: ~200 groups, 64 per 4K
+# block → ~4 chunks. The single 4096-byte ext2_bgdt_buf holds ONE chunk at a
+# time; the marker records which absolute chunk is resident (0-1 = none /
+# pre-mount). META_BG (non-contiguous BGDT) is mount-refused (incompat 0x10 is
+# not in supported_mask 0x67C6), so the contiguous +1+chunk formula is always
+# valid here. NOTE (single-threaded invariant, [[project_multithreading_future_arc]]):
+# the resident-chunk cache assumes no concurrent FS access; it joins the other
+# shared scratch buffers that the SMP/threading arc must revisit.
+var ext2_groups_per_block  = 0;     # blocksize / desc_size (groups per BGDT block)
+var ext2_total_groups      = 0;     # cached ext2_ngroups()
+var ext2_bgdt_blocks       = 0;     # ceil(total_groups / groups_per_block)
+var ext2_bgdt_loaded_chunk = 0 - 1; # absolute chunk currently in ext2_bgdt_buf; -1 = none
 
 # --- Endian-aware byte helpers (ext2/ext4 is little-endian on disk) -
 
@@ -104,6 +120,7 @@ fn ext2_store32_le(ptr, off, val) {
 
 # --- Superblock field accessors (Haiku-style — endian-handled at boundary) -
 
+fn ext2_sb_inodes_count(sb)      { return ext2_load32_le(sb, 0); }
 fn ext2_sb_blocks_count(sb)      { return ext2_load32_le(sb, 4); }
 fn ext2_sb_first_data_block(sb)  { return ext2_load32_le(sb, 20); }
 fn ext2_sb_log_block_size(sb)    { return ext2_load32_le(sb, 24); }
@@ -509,6 +526,17 @@ fn ext2_init() {
         return 0 - 1;
     }
 
+    # Multi-chunk BGDT geometry (1.45.15). blocksize / desc_size /
+    # blocks_per_group / first_data_block are all final by here. groups_per_block
+    # can't be 0 (desc_size 32..64, blocksize 1024..4096). META_BG is
+    # mount-refused above, so the BGDT is contiguous and the resident chunk for
+    # group g is g / groups_per_block at FS block first_data_block+1+chunk.
+    ext2_groups_per_block = ext2_blocksize / ext2_desc_size;
+    var grp_total_blocks  = ext2_sb_blocks_count(&ext2_sb_buf) - ext2_first_data_block;
+    ext2_total_groups     = (grp_total_blocks + ext2_blocks_per_group - 1) / ext2_blocks_per_group;
+    ext2_bgdt_blocks      = (ext2_total_groups + ext2_groups_per_block - 1) / ext2_groups_per_block;
+    ext2_bgdt_loaded_chunk = 0 - 1;   # force the first grp access to load its chunk
+
     # Mount complete. Log geometry for diagnostic continuity.
     kprint("ext2: mounted (blocksize=", 25);
     kprint_num(ext2_blocksize);
@@ -673,16 +701,11 @@ fn ext2_get_inode(inode_num, out_buf) {
     if (ext2_active == 0) { return 0 - 1; }
     if (inode_num == 0)   { return 0 - 1; }
 
-    # Bite (A) input validation: cap inode_num against the maximum
-    # representable in our Phase 1 BGDT chunk. The BGDT block holds up to
-    # (blocksize / 32) groups; each covers inodes_per_group inodes. For a
-    # 4K-block FS that's 128 groups × inodes_per_group. Beyond this,
-    # `ext2_get_inode` would fall through the block_group bounds check
-    # below anyway, but checking up front avoids the BGDT read on
-    # obviously-bogus inode numbers (defense vs malformed dirent
-    # walks, fuzz inputs, etc).
-    var max_inodes_in_chunk = (ext2_blocksize / 32) * ext2_inodes_per_group;
-    if (inode_num > max_inodes_in_chunk) {
+    # Input validation: cap inode_num against the FS's total inode count
+    # (s_inodes_count @ sb+0). mkfs guarantees a valid inode_num is in
+    # [1, s_inodes_count]; its block group's BGDT chunk is loaded on demand
+    # below (multi-chunk walk, 1.45.15), so there is no per-chunk inode ceiling.
+    if (inode_num > ext2_sb_inodes_count(&ext2_sb_buf)) {
         return 0 - 1;
     }
 
@@ -690,28 +713,19 @@ fn ext2_get_inode(inode_num, out_buf) {
     var block_group  = n / ext2_inodes_per_group;
     var idx_in_group = n - block_group * ext2_inodes_per_group;  # n % per_group
 
-    # Read BGDT block. Lives at FS block (first_data_block + 1).
-    # Phase 1 reads exactly one BGDT block; that holds the first
-    # (blocksize / 32) groups. For a 4K-block FS that's 128 groups,
-    # which covers FSes up to 128 * blocks_per_group * 4 KB = 128 *
-    # 32768 * 4 KB = 16 GB. Larger FSes need Phase 4+ work (META_BG
-    # or multi-chunk BGDT walk).
-    var bgdt_block = ext2_first_data_block + 1;
-    if (ext2_read_block(bgdt_block, &ext2_bgdt_buf) != 0) {
+    # Load the BGDT chunk owning block_group (multi-chunk walk, 1.45.15). The
+    # primary BGDT is contiguous from (first_data_block+1); group g's descriptor
+    # lives in chunk g/groups_per_block at in-chunk slot g%groups_per_block.
+    # META_BG is mount-refused, so this is exact for any FS we can mount.
+    if (ext2_bgdt_load_for_group(block_group) != 0) {
         return 0 - 1;
     }
 
-    # BGDT entries are 32 bytes (legacy ext2) or s_desc_size bytes
-    # (ext4 64BIT — typically 64). bg_inode_table is at byte offset 8
-    # regardless; bg_inode_table_hi at offset 40 only exists when
-    # desc_size==64 and gates the Phase 6 unlock for >16 TB FSes.
-    var bgdt_entry_size = ext2_desc_size;
-    var max_groups_in_chunk = ext2_blocksize / bgdt_entry_size;
-    if (block_group >= max_groups_in_chunk) {
-        kprintln("ext2: block_group beyond first BGDT chunk (Phase 1 limit)", 57);
-        return 0 - 1;
-    }
-    var bgdt_off = &ext2_bgdt_buf + block_group * bgdt_entry_size;
+    # BGDT entries are 32 bytes (legacy ext2) or s_desc_size bytes (ext4 64BIT
+    # — typically 64). bg_inode_table is at byte offset 8 regardless;
+    # bg_inode_table_hi at offset 40 only exists when desc_size==64 and gates
+    # the >16 TB unlock for very large FSes.
+    var bgdt_off = ext2_grp_off(block_group);
     var inode_table_block = ext2_load32_le(bgdt_off, 8);
 
     # Phase 5 (1.31.7 bite A): 64BIT mode has a bg_inode_table_hi at byte
@@ -760,20 +774,16 @@ fn ext2_put_inode(inode_num, in_buf) {
     if (ext2_write_ok == 0) { return 0 - 1; }   # refuse while write is gated (metadata_csum until bite 7; §§ 10, 14)
     if (inode_num == 0)     { return 0 - 1; }
 
-    var max_inodes_in_chunk = (ext2_blocksize / 32) * ext2_inodes_per_group;
-    if (inode_num > max_inodes_in_chunk) { return 0 - 1; }
+    if (inode_num > ext2_sb_inodes_count(&ext2_sb_buf)) { return 0 - 1; }
 
     var n            = inode_num - 1;
     var block_group  = n / ext2_inodes_per_group;
     var idx_in_group = n - block_group * ext2_inodes_per_group;
 
-    var bgdt_block = ext2_first_data_block + 1;
-    if (ext2_read_block(bgdt_block, &ext2_bgdt_buf) != 0) { return 0 - 1; }
-
-    var bgdt_entry_size = ext2_desc_size;
-    var max_groups_in_chunk = ext2_blocksize / bgdt_entry_size;
-    if (block_group >= max_groups_in_chunk) { return 0 - 1; }
-    var bgdt_off = &ext2_bgdt_buf + block_group * bgdt_entry_size;
+    # Load the BGDT chunk owning block_group (multi-chunk walk, 1.45.15);
+    # mirrors ext2_get_inode. Location math is identical — put is the RMW twin.
+    if (ext2_bgdt_load_for_group(block_group) != 0) { return 0 - 1; }
+    var bgdt_off = ext2_grp_off(block_group);
     var inode_table_block = ext2_load32_le(bgdt_off, 8);
     if (ext2_desc_size == 64) {
         if (ext2_load32_le(bgdt_off, 40) != 0) { return 0 - 1; }
@@ -829,13 +839,41 @@ fn ext2_metadata_write_or_log(blocknr, buf) {
 # LAST — so a crash leaks (fsck-reclaimable) but never dangles. Free
 # reverses. All gated on ext2_write_ok.
 
-# --- BGDT block read / write (descriptor table at first_data_block+1) ---
-fn ext2_read_bgdt()  { return ext2_read_block(ext2_first_data_block + 1, &ext2_bgdt_buf); }
+# --- multi-chunk BGDT load / store (descriptor table at first_data_block+1) ---
+#
+# Load BGDT chunk `chunk` (absolute) into ext2_bgdt_buf, short-circuiting if it
+# is already resident. Sets the loaded-chunk marker on success; leaves it
+# unchanged (the just-evicted-but-unread state can't occur) on a read failure.
+# Returns 0 / -1.
+#
+# CONTRACT (the load → mutate → write transaction the crash-safe commit order
+# leans on): a caller loads the chunk owning a group BEFORE any ext2_grp_*(group)
+# access, mutates at most ONE group's descriptor, then calls ext2_write_bgdt()
+# (which persists THIS resident chunk). NEVER load a different chunk between a
+# grp_set_* and its write_bgdt — the second load evicts the unwritten mutation.
+fn ext2_load_bgdt_chunk(chunk) {
+    if (chunk == ext2_bgdt_loaded_chunk) { return 0; }      # already resident
+    if (ext2_read_block(ext2_first_data_block + 1 + chunk, &ext2_bgdt_buf) != 0) {
+        # A failed read may have partially overwritten the buffer. Invalidate
+        # the marker so a later same-chunk request can't short-circuit against
+        # corrupt bytes — it forces a clean re-read once the device recovers.
+        ext2_bgdt_loaded_chunk = 0 - 1;
+        return 0 - 1;
+    }
+    ext2_bgdt_loaded_chunk = chunk;
+    return 0;
+}
+# Load the chunk owning absolute block-group `group`.
+fn ext2_bgdt_load_for_group(group) {
+    return ext2_load_bgdt_chunk(group / ext2_groups_per_block);
+}
+# Legacy chunk-0 wrapper (byte-identical for the group-0-only callers).
+fn ext2_read_bgdt()  { return ext2_load_bgdt_chunk(0); }
+# Persist the CURRENTLY-RESIDENT chunk (recompute its bg_checksums first when
+# csum is on — no-op otherwise). The marker names which FS block to write.
 fn ext2_write_bgdt() {
-    # metadata_csum (bite 3): recompute each group's bg_checksum before the
-    # write. No-op on a non-csum FS.
     if (ext2_csum_on != 0) { ext2_bgdt_recsum(); }
-    return ext2_write_block(ext2_first_data_block + 1, &ext2_bgdt_buf);
+    return ext2_write_block(ext2_first_data_block + 1 + ext2_bgdt_loaded_chunk, &ext2_bgdt_buf);
 }
 
 # Group-descriptor field access within the loaded ext2_bgdt_buf. Counts
@@ -843,7 +881,14 @@ fn ext2_write_bgdt() {
 # at 0x2C/0x2E/0x30 and are 0 on any <16 TB FS — the lo store touches only
 # 2 bytes, so the whole-block RMW preserves the zeroed _hi, leaving lo the
 # whole value (1.33.1 bite 1, audit § 14.4).
-fn ext2_grp_off(group)              { return &ext2_bgdt_buf + group * ext2_desc_size; }
+fn ext2_grp_off(group) {
+    # Chunk-relative: ext2_bgdt_buf holds chunk ext2_bgdt_loaded_chunk, whose
+    # first descriptor is absolute group (loaded_chunk*groups_per_block). The
+    # caller MUST have loaded `group`'s chunk (load → mutate → write contract).
+    # For chunk 0 (loaded_chunk==0) gic==group — byte-identical to pre-1.45.15.
+    var gic = group - ext2_bgdt_loaded_chunk * ext2_groups_per_block;
+    return &ext2_bgdt_buf + gic * ext2_desc_size;
+}
 fn ext2_grp_block_bitmap(group)     { return ext2_load32_le(ext2_grp_off(group), 0); }
 fn ext2_grp_inode_bitmap(group)     { return ext2_load32_le(ext2_grp_off(group), 4); }
 fn ext2_grp_inode_table(group)      { return ext2_load32_le(ext2_grp_off(group), 8); }
@@ -896,17 +941,22 @@ fn ext2_grp_csum_compute(group) {
     return crc & 0xFFFF;
 }
 
-# Recompute bg_checksum for every valid group present in the loaded BGDT
-# block — called from ext2_write_bgdt before the write when csum is on. The
-# loaded block is the first BGDT block (groups 0 .. blocksize/desc_size-1);
-# only [0, ngroups) are real. Cheap (≤64 descriptors) and safe — untouched
-# descriptors recompute to their existing value.
+# Recompute bg_checksum for every valid group in the CURRENTLY-RESIDENT BGDT
+# chunk — called from ext2_write_bgdt before the write when csum is on. The
+# resident chunk holds absolute groups [base, base+groups_per_block) where
+# base = loaded_chunk*groups_per_block; only [base, ngroups) are real. Each
+# csum is seeded with the ABSOLUTE group number (ext2_grp_csum_compute(g)),
+# while ext2_grp_off(g) resolves the in-chunk slot — so the recompute is
+# correct for any chunk, not just chunk 0. Cheap (≤64 descriptors) and safe —
+# untouched descriptors recompute to their existing value.
 fn ext2_bgdt_recsum() {
-    var per_block = ext2_blocksize / ext2_desc_size;
-    var ng = ext2_ngroups();
-    if (ng > per_block) { ng = per_block; }
-    var g = 0;
-    while (g < ng) {
+    var gpb  = ext2_groups_per_block;
+    var base = ext2_bgdt_loaded_chunk * gpb;
+    var lim  = base + gpb;
+    var ng   = ext2_ngroups();
+    if (lim > ng) { lim = ng; }
+    var g = base;
+    while (g < lim) {
         ext2_store16_le(ext2_grp_off(g), 0x1E, ext2_grp_csum_compute(g));
         g = g + 1;
     }
@@ -1042,6 +1092,10 @@ fn ext2_itable_blocks() {
 # group has none in use — group 0, which holds reserved inodes, is never
 # uninit), with bits beyond inodes_per_group padded to 1 (ext4_mark_bitmap_end).
 # Writes the bitmap, sets its csum, clears INODE_UNINIT. Returns 0 / -1.
+# PRECONDITION (multi-chunk, 1.45.15): the caller must have loaded g's BGDT
+# chunk (ext2_bgdt_load_for_group(g)) before calling — the ext2_grp_*(g)
+# accesses here are chunk-relative. The allocator does; the only writes are
+# into the separate ext2_bitmap_buf, so g's resident chunk survives the call.
 fn ext2_materialize_inode_bitmap(g) {
     var nbits = ext2_blocksize * 8;
     var z = 0;
@@ -1060,6 +1114,8 @@ fn ext2_materialize_inode_bitmap(g) {
 # padding beyond blocks_per_group marked used. REFUSES (-1 → allocator skips
 # the group) if the group could carry metadata — a super backup, or its own
 # bitmaps/inode-table landing in-group — so "all free" is never wrong.
+# PRECONDITION (multi-chunk, 1.45.15): caller loaded g's BGDT chunk first; the
+# ext2_grp_*(g) reads here are chunk-relative and only touch ext2_bitmap_buf.
 fn ext2_materialize_block_bitmap(g) {
     if (ext2_group_has_super(g) != 0) { return 0 - 1; }    # backup group → has meta
     var bpg     = ext2_blocks_per_group;
@@ -1111,7 +1167,7 @@ fn ext2_alloc_block(goal) {
         var group = start + gi;
         if (group >= ng) { group = group - ng; }      # wrap
 
-        if (ext2_read_bgdt() != 0) { return 0 - 1; }
+        if (ext2_bgdt_load_for_group(group) != 0) { return 0 - 1; }   # multi-chunk (1.45.15)
         if (ext2_grp_free_blocks(group) > 0) {
             # Materialize an uninit block group before trusting its on-disk
             # bitmap; skip it (try the next group) if it can't be safely
@@ -1155,7 +1211,7 @@ fn ext2_free_block(block_num) {
     var group = rel / ext2_blocks_per_group;
     var b     = rel - group * ext2_blocks_per_group;
 
-    if (ext2_read_bgdt() != 0) { return 0 - 1; }
+    if (ext2_bgdt_load_for_group(group) != 0) { return 0 - 1; }   # multi-chunk (1.45.15)
     var bbmp = ext2_grp_block_bitmap(group);
     if (ext2_read_block(bbmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
     if (ext2_bitmap_get(&ext2_bitmap_buf, b) == 0) { return 0 - 1; }   # double-free guard
@@ -1182,7 +1238,7 @@ fn ext2_alloc_inode(is_dir) {
     var ng = ext2_ngroups();
     var group = 0;
     while (group < ng) {
-        if (ext2_read_bgdt() != 0) { return 0 - 1; }
+        if (ext2_bgdt_load_for_group(group) != 0) { return 0 - 1; }   # multi-chunk (1.45.15)
         if (ext2_grp_free_inodes(group) > 0) {
             # Materialize an INODE_UNINIT group's bitmap (all-free) + clear the
             # flag before trusting the on-disk bitmap. 1.33.4 bite 3.
@@ -1229,7 +1285,7 @@ fn ext2_free_inode(inode_num, is_dir) {
     var group = n / ext2_inodes_per_group;
     var b     = n - group * ext2_inodes_per_group;
 
-    if (ext2_read_bgdt() != 0) { return 0 - 1; }
+    if (ext2_bgdt_load_for_group(group) != 0) { return 0 - 1; }   # multi-chunk (1.45.15)
     var ibmp = ext2_grp_inode_bitmap(group);
     if (ext2_read_block(ibmp, &ext2_bitmap_buf) != 0) { return 0 - 1; }
     if (ext2_bitmap_get(&ext2_bitmap_buf, b) == 0) { return 0 - 1; }   # double-free guard
@@ -3253,9 +3309,10 @@ fn ext2_write_selftest() {
     kprint("ext2w: csum on=", 15); kprint_num(ext2_csum_on);
     kprint(" seed=", 6); kprint_hex(ext2_csum_seed); kprintln("", 0);
 
-    # 1. group-0 BGDT accounting (group 0 entry is first in the block).
-    var bgdt_block = ext2_first_data_block + 1;
-    if (ext2_read_block(bgdt_block, &ext2_bgdt_buf) != 0) {
+    # 1. group-0 BGDT accounting (group 0 entry is first in chunk 0). Route
+    # through the loader (not a raw ext2_read_block) so ext2_bgdt_loaded_chunk
+    # stays honest — a stale marker here would mis-resolve a later grp_off.
+    if (ext2_load_bgdt_chunk(0) != 0) {
         kprintln("ext2w: BGDT read FAIL", 21); return 0 - 1;
     }
     var g0 = &ext2_bgdt_buf;
@@ -3724,27 +3781,43 @@ fn ext2_write_selftest() {
     # be steered to a high group — the block path proves the integration).
     var wun = 1;
     var did_uninit = 0;
-    if (ext2_read_bgdt() == 0) {
-        var ung = ext2_ngroups();
-        var gi = 0 - 1;
-        var gb = 0 - 1;
-        var ug = 0;
-        while (ug < ung) {
-            var fl = ext2_grp_bg_flags(ug);
-            if (gi < 0) { if ((fl & 0x1) != 0) { gi = ug; } }
-            if (gb < 0) { if ((fl & 0x2) != 0) { gb = ug; } }
-            ug = ug + 1;
+    var ung = ext2_ngroups();
+    var gpb = ext2_groups_per_block;
+    var gi = 0 - 1;
+    var gb = 0 - 1;
+    # Chunk-then-group scan (multi-chunk walk, 1.45.15): the BGDT may span
+    # several FS blocks, so iterate each chunk and the absolute groups it holds.
+    var c = 0;
+    var scan_ok = 1;
+    while (c < ext2_bgdt_blocks) {
+        if (ext2_load_bgdt_chunk(c) != 0) { scan_ok = 0; c = ext2_bgdt_blocks; }
+        else {
+            var base = c * gpb;
+            var lim  = base + gpb;
+            if (lim > ung) { lim = ung; }
+            var ug = base;
+            while (ug < lim) {
+                var fl = ext2_grp_bg_flags(ug);
+                if (gi < 0) { if ((fl & 0x1) != 0) { gi = ug; } }
+                if (gb < 0) { if ((fl & 0x2) != 0) { gb = ug; } }
+                ug = ug + 1;
+            }
+            c = c + 1;
         }
+    }
+    if (scan_ok == 1) {
         # BLOCK_UNINIT: force an allocation into gb (goal) → materialize+alloc.
         if (gb > 0) {
             did_uninit = 1;
             var goal = ext2_first_data_block + gb * ext2_blocks_per_group;
-            var blk = ext2_alloc_block(goal);
+            var blk = ext2_alloc_block(goal);            # self-loads gb's chunk internally
             if (blk <= 0) { wun = 0; }
             else {
                 var bgrp = (blk - ext2_first_data_block) / ext2_blocks_per_group;
                 if (bgrp != gb) { wun = 0; }                 # alloc must land in gb
-                if (ext2_read_bgdt() != 0) { wun = 0; }
+                # alloc_block left ITS group's chunk resident — re-load gb's
+                # chunk before reading gb's flag (was a chunk-0 reload bug).
+                if (ext2_bgdt_load_for_group(gb) != 0) { wun = 0; }
                 else { if ((ext2_grp_bg_flags(gb) & 0x2) != 0) { wun = 0; } }  # flag cleared
                 ext2_free_block(blk);                        # restore free count
             }
@@ -3752,14 +3825,14 @@ fn ext2_write_selftest() {
         # INODE_UNINIT: materialize directly + persist via ext2_write_bgdt.
         if (gi > 0) {
             did_uninit = 1;
-            if (ext2_read_bgdt() != 0) { wun = 0; }
+            if (ext2_bgdt_load_for_group(gi) != 0) { wun = 0; }
             else {
                 if (ext2_materialize_inode_bitmap(gi) != 0) { wun = 0; }
-                if (ext2_write_bgdt() != 0) { wun = 0; }
+                if (ext2_write_bgdt() != 0) { wun = 0; }     # persists gi's chunk
                 if ((ext2_grp_bg_flags(gi) & 0x1) != 0) { wun = 0; }  # flag cleared
             }
         }
-    }
+    } else { wun = 0; }
     if (did_uninit == 0) { kprintln("ext2w: Wuninit SKIP (single-group image)", 40); }
     else {
         if (wun == 1) { kprintln("ext2w: Wuninit materialize OK", 29); }
@@ -3779,6 +3852,79 @@ fn ext2_write_selftest() {
     if (wsy == 1) { kprintln("ext2w: Wsync state OK", 21); }
     else          { kprintln("ext2w: Wsync state MISMATCH", 27); }
 
+    return 0;
+}
+
+# === multi-chunk BGDT regression self-test (1.45.15, MULTICHUNK_SELFTEST=1) ===
+#
+# Exercises the path the existing single-group smokes CANNOT: descriptors and
+# inodes in BGDT chunk >= 1. Needs an image with ngroups > blocksize/desc_size
+# (the host harness builds one with small per-group sizing). Three checks, all
+# printed as "mc:" lines for the host smoke to grep, then host e2fsck -fn:
+#   READ     — ext2_get_inode for an inode whose block_group lives in chunk >= 1
+#              (the exact failure mode of the iron burn: /bin/yo, /bin/whirl).
+#   NEGATIVE — an inode past s_inodes_count is rejected (the new bound).
+#   WRITE    — goal-directed ext2_alloc_block into a high group lands in chunk
+#              >= 1, then frees it (allocator chunk-load + write_bgdt + recsum
+#              on a high chunk).
+fn ext2_multichunk_selftest() {
+    if (ext2_active == 0) { kprintln("mc: not mounted -- skip", 23); return 0; }
+    kprint("mc: gpb=", 8);           kprint_num(ext2_groups_per_block);
+    kprint(" ngroups=", 9);          kprint_num(ext2_total_groups);
+    kprint(" bgdt_blocks=", 13);     kprint_num(ext2_bgdt_blocks);
+    kprint(" ipg=", 5);              kprint_num(ext2_inodes_per_group);
+    kprintln("", 0);
+
+    if (ext2_bgdt_blocks < 2) {
+        kprintln("mc: NOT MULTICHUNK (bgdt_blocks<2) -- SKIP", 42);
+        return 0;
+    }
+
+    # READ: group (gpb+2) is in chunk 1; its first inode is (gpb+2)*ipg + 1.
+    # The host seeds enough files that this inode is allocated, so a correct
+    # multi-chunk read returns a populated inode (i_mode != 0, i_links > 0).
+    var hg   = ext2_groups_per_block + 2;
+    var hino = hg * ext2_inodes_per_group + 1;
+    var rd     = ext2_get_inode(hino, &ext2_inode_buf);
+    var imode  = ext2_load16_le(&ext2_inode_buf, 0);     # i_mode @ 0
+    var ilinks = ext2_load16_le(&ext2_inode_buf, 0x1A);  # i_links_count @ 0x1A
+    if (rd != 0) { kprintln("mc: high-inode read FAIL (get_inode -1)", 39); }
+    else {
+        if (imode == 0)      { kprintln("mc: high-inode mode==0 FAIL", 27); }
+        else {
+            if (ilinks == 0) { kprintln("mc: high-inode links==0 FAIL", 28); }
+            else {
+                kprint("mc: high-inode read OK ino=", 27); kprint_num(hino);
+                kprint(" grp=", 5);  kprint_num(hg);
+                kprint(" mode=", 6); kprint_hex(imode);
+                kprintln("", 0);
+            }
+        }
+    }
+
+    # NEGATIVE: an inode past s_inodes_count must be rejected.
+    var oob = ext2_sb_inodes_count(&ext2_sb_buf) + 1;
+    if (ext2_get_inode(oob, &ext2_inode_buf) == 0 - 1) { kprintln("mc: oob-inode reject OK", 23); }
+    else                                               { kprintln("mc: oob-inode reject FAIL", 25); }
+
+    # WRITE: goal-directed alloc into a high group → must land in chunk >= 1.
+    if (ext2_write_ok == 0) { kprintln("mc: write gated -- skip alloc", 29); }
+    else {
+        var goal = ext2_first_data_block + hg * ext2_blocks_per_group;
+        var blk  = ext2_alloc_block(goal);
+        if (blk <= 0) { kprintln("mc: high-alloc FAIL (alloc_block<=0)", 35); }
+        else {
+            var bgrp = (blk - ext2_first_data_block) / ext2_blocks_per_group;
+            if (bgrp >= ext2_groups_per_block) {
+                kprint("mc: high-alloc OK blk=", 22); kprint_num(blk);
+                kprint(" grp=", 5); kprint_num(bgrp); kprintln("", 0);
+            } else {
+                kprint("mc: high-alloc LANDED LOW grp=", 30); kprint_num(bgrp); kprintln("", 0);
+            }
+            ext2_free_block(blk);
+        }
+    }
+    kprintln("mc: selftest done", 17);
     return 0;
 }
 

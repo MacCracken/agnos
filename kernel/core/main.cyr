@@ -1259,6 +1259,15 @@ sh_exec("rm /shtmp", 9);
 kprintln("shtest: end", 11);
 #endif
 
+# 1.45.15 — multi-chunk BGDT regression self-test (compile-gated,
+# MULTICHUNK_SELFTEST=1). Exercises BGDT chunks >= 1 (read/alloc/free of
+# inodes & blocks in groups the old Phase-1 single-chunk reader couldn't
+# reach). Needs the host harness's >64-group image; SKIPs (no failure) on a
+# single-chunk FS. Off in production — same gate discipline as the others.
+#ifdef MULTICHUNK_SELFTEST
+ext2_multichunk_selftest();
+#endif
+
 # 1.40.2 — exec-from-disk self-test (compile-gated, EXEC_SELFTEST=1). Builds a
 # minimal static ELF64 (write(1,"EXEC-DISK-OK\n",13) then exit(42)) into the
 # scratch buffer, writes it to ext2 as /prog, then `run /prog` — exercising
