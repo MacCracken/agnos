@@ -74,6 +74,19 @@ stage_one whirl        src/main.cyr whirl    || rc=1
 # (Distro: AGNOS, Memory via sysinfo#35; agnos scripts/iam-agnos-verify.py).
 stage_one iam          src/main.cyr iam      || rc=1
 
+# Terminal display + editing: kii renders PNG → ANSI half-block art, sizing to the
+# live console via darshana's tty_winsize over winsize#60; cyim is the modal editor.
+# Both agnos-runtime-verified in QEMU (kii 1.0.3 / cyim 1.7.5 — `<tool> --version`
+# loads, runs, exits cleanly off ext2). darshana / mihi / kavach are LIBRARIES
+# (consumed by kii / iam — no standalone binary to stage).
+#
+# NOTE: chakshu/shu is deliberately NOT staged — its TUI is built on the Linux
+# signalfd + epoll model (SIGWINCH resize), so it has no agnos build yet; agnos-
+# native resize/signal handling is tracked as backlog in
+# chakshu/docs/development/roadmap.md.
+stage_one kii          src/main.cyr kii      || rc=1
+stage_one cyim         src/main.cyr cyim     || rc=1
+
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
 # symlinks (-> kriya) in the rootfs: install-media.sh's `cp -a` preserves them

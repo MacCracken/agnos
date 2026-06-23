@@ -2,7 +2,7 @@
 
 > Sovereign operating system kernel. Written in Cyrius. Assembly up. Zero C, zero Rust, zero LLVM.
 
-**Status**: boots to a typeable interactive shell on real AMD hardware (the MVP gate, since v1.30.9). Storage (NVMe / SATA / USB-MS), networking (TCP/IP + DHCP + DNS + NTP + ICMP over a real-iron NIC), and read+write filesystems (ext2/ext4 incl. **ext4 extent allocation** + **JBD2 journaling — crash-safe metadata writes**, FAT12/16/32, exFAT) are all landed — the storage trio, networking, ext4 read+write+extent-alloc, and **exec-from-disk** (a static ELF64 loaded from the filesystem runs in ring 3, 1.40.x) are iron-validated on archaemenid; the FAT-family + JBD2 stacks are QEMU/`fsck`-validated. The headline since is **shell separation** (1.41.x): PID 1 (kybernet) `exec`s `/bin/agnsh` — the userland [agnoshi](https://github.com/MacCracken/agnoshi) shell — in ring 3 off the ext2 root, so the full interactive shell is now a userland binary while the in-kernel `shell()` shrank to a minimal **recovery REPL** (the boot fallback only); FAT/exFAT content-write also reached the syscall ABI (1.41.7). **DOOM plays on AGNOS** (1.43.x): `cyrius-doom --agnos` exec's from disk in ring 3, loads a 4.2 MB WAD, and renders via new kernel syscalls (`fbinfo`#38 / `blit`#39 / `uptime_ms`#40 / `sleep_ms`#41 / `kbscan`#42) — "agnsh launches DOOM," the **first real userland application**, is **iron-complete** (burn `1439` plays DOOM in-game on real Zen, keyboard-driven). The latest arc is **1.44.x — preemptive multi-threading**: the scheduler moved from a cooperative single-core round-robin to **preemptive ring-3 time-slicing** — a finite ring-3 program runs to completion + `exit()`s cleanly while a second ring-3 proc (each on its own CR3, both making syscalls) stays live, including a scheduled proc spawned from a real in-memory ELF64 (QEMU-validated via `scripts/ring3-smoke.sh` + `scripts/thread-smoke.sh`; iron-pending). The console-font subsystem is **vendored from [kashi](https://github.com/MacCracken/kashi) 1.0.0** (freestanding glyph core consumed via `[deps.kashi]`). Current version in [`VERSION`](VERSION); live capability snapshot in [`docs/development/state.md`](docs/development/state.md).
+**Status**: boots to a typeable interactive shell on real AMD hardware (the MVP gate, since v1.30.9). Storage (NVMe / SATA / USB-MS), networking (TCP/IP + DHCP + DNS + NTP + ICMP over a real-iron NIC), and read+write filesystems (ext2/ext4 incl. **ext4 extent allocation** + **JBD2 journaling — crash-safe metadata writes**, FAT12/16/32, exFAT) are all landed — the storage trio, networking, ext4 read+write+extent-alloc, and **exec-from-disk** (a static ELF64 loaded from the filesystem runs in ring 3, 1.40.x) are iron-validated on archaemenid; the FAT-family + JBD2 stacks are QEMU/`fsck`-validated. The headline since is **shell separation** (1.41.x): PID 1 (kybernet) `exec`s `/bin/agnsh` — the userland [agnoshi](https://github.com/MacCracken/agnoshi) shell — in ring 3 off the ext2 root, so the full interactive shell is now a userland binary while the in-kernel `shell()` shrank to a minimal **recovery REPL** (the boot fallback only); FAT/exFAT content-write also reached the syscall ABI (1.41.7). **DOOM plays on AGNOS** (1.43.x): `cyrius-doom --agnos` exec's from disk in ring 3, loads a 4.2 MB WAD, and renders via new kernel syscalls (`fbinfo`#38 / `blit`#39 / `uptime_ms`#40 / `sleep_ms`#41 / `kbscan`#42) — "agnsh launches DOOM," the **first real userland application**, is **iron-complete** (burn `1439` plays DOOM in-game on real Zen, keyboard-driven). The **1.44.x** arc brought **preemptive multi-threading**: the scheduler moved from a cooperative single-core round-robin to **preemptive ring-3 time-slicing** — a finite ring-3 program runs to completion + `exit()`s cleanly while a second ring-3 proc (each on its own CR3, both making syscalls) stays live, including a scheduled proc spawned from a real in-memory ELF64 (QEMU-validated via `scripts/ring3-smoke.sh` + `scripts/thread-smoke.sh`; iron-pending). Since then **1.45.x** opened the ring-3 **net/entropy/clock surface** (`getrandom` / `time_unix` / client `sock_*` + `udp_*` + `icmp_echo` + server `sock_listen`/`sock_accept`, syscalls 45-57 — AGNOS can now *be* a network service, the container-usage unlock) and the **file group** (`lseek`#58 / `flock`#59 / `winsize`#60), bringing the kernel to **61 syscalls** (0–60). The console-font subsystem is **vendored from [kashi](https://github.com/MacCracken/kashi) 1.0.0** (freestanding glyph core consumed via `[deps.kashi]`). Current version in [`VERSION`](VERSION); live capability snapshot in [`docs/development/state.md`](docs/development/state.md).
 
 ## Quick Start
 
@@ -30,7 +30,7 @@ sh scripts/test.sh --all
 
 ## Architecture
 
-Multi-arch kernel: `kernel/klib/` (3 files — `kstring`, `kfmt`, `ktagged`; freestanding syscall-free stdlib), `kernel/arch/x86_64/` (17 files + `usb/` subdir with 9 xHCI/HID files), `kernel/arch/aarch64/` (9 files), `kernel/core/` (35 files — storage, networking-split-into-8-protocol-files at 1.36.0/.1, filesystem stacks, selftests-split-out at 1.36.2), `kernel/user/` (4 files), plus `kernel/agnos.cyr` orchestrator, `kernel/version.cyr` auto-generated banner module (v1.30.2+), and `kernel/kernel_hello.cyr` smoke test. **External dep**: kashi 1.0.0 freestanding font-data core (`[deps.kashi]` in `cyrius.cyml`; 1.37.5 fold-in).
+Multi-arch kernel: `kernel/klib/` (3 files — `kstring`, `kfmt`, `ktagged`; freestanding syscall-free stdlib), `kernel/arch/x86_64/` (17 files + `usb/` subdir with 9 xHCI/HID files), `kernel/arch/aarch64/` (9 files), `kernel/core/` (37 files — storage, networking-split-into-8-protocol-files at 1.36.0/.1, filesystem stacks, selftests-split-out at 1.36.2), `kernel/user/` (4 files), plus `kernel/agnos.cyr` orchestrator, `kernel/version.cyr` auto-generated banner module (v1.30.2+), and `kernel/kernel_hello.cyr` smoke test. **External dep**: kashi 1.0.0 freestanding font-data core (`[deps.kashi]` in `cyrius.cyml`; 1.37.5 fold-in).
 
 The build script wraps `cyrius build` with a `#define ARCH_X86_64` /
 `#define ARCH_AARCH64` prepend, since `cyrius build -D NAME` doesn't
@@ -65,10 +65,11 @@ Common:
   -> console-font: kashi 1.0.0 freestanding glyph core (vendored via [deps.kashi])
   -> Native xHCI + USB-HID-boot keyboard driver (Phase 1-5)
   -> SMP infrastructure (APIC, IPI, trampoline, per-CPU stacks)
-  -> 43 syscalls 0-42 (signals, epoll, timerfd, pipes, anonymous mmap/munmap,
+  -> 61 syscalls (0-60) (signals, epoll, timerfd, pipes, anonymous mmap/munmap,
        FS syscalls getdents/unlink/rename/link/stat (1.41.3),
        sysinfo uname/sysinfo/klog (1.42.x), execwait + graphics/timing/input
-       fbinfo/blit/uptime_ms/sleep_ms/kbscan (1.43.x))
+       fbinfo/blit/uptime_ms/sleep_ms/kbscan (1.43.x), ring-3 net/entropy/clock
+       getrandom/time_unix/sock_*/udp_*/icmp_echo (1.45.x), lseek/flock/winsize (1.45.13))
   -> kybernet (PID 1) -> execs /bin/agnsh (userland shell) in ring 3;
        in-kernel shell() is the recovery REPL fallback (1.41.x)
   -> preemptive ring-3 scheduler: kthread_create + preempt gate, per-proc
@@ -127,11 +128,11 @@ Common:
 | Timerfd | timerfd_create, timerfd_settime |
 | Scheduler | Round-robin |
 | Shell | **Shell separation (1.41.x).** The full interactive shell is now **agnsh** — the userland [agnoshi](https://github.com/MacCracken/agnoshi) build, exec'd from `/bin/agnsh` in ring 3 off the ext2 root (first userland binary promoted to a system component; locks the permanent kernel↔userland shell boundary). The in-kernel `shell()` shrank to a minimal **recovery REPL** (`kernel/user/shell.cyr` 1149 → 813 LOC at 1.41.9) — the boot fallback only, reached when `/bin/agnsh` is absent/unloadable. Recovery verb set: `help` `cd` `pwd` `ls` `cat` `run` `mv` `rm` `sync` `reboot` + non-write diagnostics (`uptime`/`lspci`/`cpus`/`net`/`parts`/`date`/`clear`/`version`/…). |
-| kybernet Init | PID 1: `exec`s `/bin/agnsh` in ring 3 (`kybernet_exec_agnsh`, 1.41.4) and falls back to the in-kernel recovery shell only on load failure. 43 kernel syscalls ready (0-42). |
+| kybernet Init | PID 1: `exec`s `/bin/agnsh` in ring 3 (`kybernet_exec_agnsh`, 1.41.4) and falls back to the in-kernel recovery shell only on load failure. 61 kernel syscalls ready (0-60). |
 
-## Syscalls (43, 0-42)
+## Syscalls (61, 0-60)
 
-The FS group (`getdents`/`unlink`/`rename`/`link`/`stat`) + the `open`(7) re-route to the mount-routed VFS + making `mkdir`(9)/`rmdir`(10)/`sync`(12) real landed at **1.41.3** (with the **`a4=r10` ABI extension** — a 4th syscall arg carried in `r10`, used by `rename`/`link`). `mmap`(27)/`munmap`(28) landed earlier (1.35.x). The 1.42.x sysinfo group (`uname`/`sysinfo`/`klog`, 34-36) and the 1.43.x exec/graphics/timing/input group (`execwait`/`fbinfo`/`blit`/`uptime_ms`/`sleep_ms`/`kbscan`, 37-42) followed; `waitpid`(4) became a **non-blocking poll** at 1.44.9.
+The FS group (`getdents`/`unlink`/`rename`/`link`/`stat`) + the `open`(7) re-route to the mount-routed VFS + making `mkdir`(9)/`rmdir`(10)/`sync`(12) real landed at **1.41.3** (with the **`a4=r10` ABI extension** — a 4th syscall arg carried in `r10`, used by `rename`/`link`). `mmap`(27)/`munmap`(28) landed earlier (1.35.x). The 1.42.x sysinfo group (`uname`/`sysinfo`/`klog`, 34-36) and the 1.43.x exec/graphics/timing/input group (`execwait`/`fbinfo`/`blit`/`uptime_ms`/`sleep_ms`/`kbscan`, 37-42) followed; `waitpid`(4) became a **non-blocking poll** at 1.44.9. The 1.44.x `spawn_path`(43) from-disk background spawn, the 1.45.x ring-3 net/entropy/clock surface (`getrandom`/`time_unix`/`sock_*`/`udp_*`/`icmp_echo`, 45-57), and the 1.45.13 file group (`lseek`#58 / `flock`#59 / `winsize`#60) brought the count to **61** (0–60; `sched_yield`#44 routes through the ring-3 SYSCALL stub rather than `ksyscall`).
 
 | Number | Name | Description |
 |--------|------|-------------|
@@ -178,6 +179,23 @@ The FS group (`getdents`/`unlink`/`rename`/`link`/`stat`) + the `open`(7) re-rou
 | 40 | uptime_ms | Monotonic milliseconds (`timer_ticks * 10`) (1.43.x) |
 | 41 | sleep_ms | Pacing primitive — sleep to a target ms (1.43.x) |
 | 42 | kbscan | Read a keyboard scancode (ring-3 input, e.g. DOOM) (1.43.x) |
+| 43 | spawn_path | NON-BLOCKING from-disk spawn — agnsh `&` background jobs (1.44.x) |
+| 45 | getrandom | Fill user buffer with hardware entropy (Zen RDRAND) (1.45.x) |
+| 46 | time_unix | Wall-clock seconds since the Unix epoch (UTC), from the RTC (1.45.x) |
+| 47 | sock_connect | Open a client TCP connection over the polled r8169/IPv4 stack → conn_id (1.45.x) |
+| 48 | sock_send | Send bytes over an ESTABLISHED conn; blocks per-chunk for ACK (1.45.x) |
+| 49 | sock_recv | NON-BLOCKING drain of buffered conn bytes into the user buffer (1.45.x) |
+| 50 | sock_close | Close a conn (FIN+ACK) + free its RX/retx buffers (1.45.x) |
+| 51 | udp_bind | Register a UDP listener on a local port → listener_id (0..7) (1.45.x) |
+| 52 | udp_send | Send one UDP datagram (dst_ip + packed ports + buf) (1.45.x) |
+| 53 | udp_recv | NON-BLOCKING drain of a listener's pending datagram (1.45.x) |
+| 54 | udp_unbind | Release a UDP listener slot (1.45.x) |
+| 55 | icmp_echo | Send one ICMP echo (ping), block ~3 s for reply → round-trip ms (1.45.x) |
+| 56 | sock_listen | Bind + listen on a local TCP port → listen_id (the inbound unlock) (1.45.x) |
+| 57 | sock_accept | NON-BLOCKING accept → conn_id of the next ESTABLISHED inbound conn (1.45.x) |
+| 58 | lseek | Reposition a seekable file's cursor (SEEK_SET/CUR/END) (1.45.13) |
+| 59 | flock | BSD advisory whole-file locking (LOCK_SH/EX/UN ± LOCK_NB) (1.45.13) |
+| 60 | winsize | Console character grid packed as (cols<<16 \| rows) from the FB (1.45.13) |
 
 > `open`(7) was re-routed at 1.41.3 from initrd-only to the mount-routed VFS (`AO_CREAT`/`AO_TRUNC`/`AO_DIRECTORY` flags via a3, initrd as bare-name fallback); `mkdir`(9)/`rmdir`(10)/`sync`(12) were tier-1 stubs returning 0 and are now real (mount-routed).
 
@@ -207,7 +225,7 @@ for the methodology caveat (closed at v1.28.1 — kept as audit trail).
 
 | Kernel | Language | Scope |
 |--------|----------|-------|
-| **AGNOS** | Cyrius | 40+ subsystems, 43 syscalls (0-42), TCP/IP + DHCP + DNS + NTP + ICMP, real-iron NIC (r8169), full storage stack (NVMe / AHCI / USB-MS / VirtIO-blk + 5-backend block layer + GPT), read+write filesystems (ext2/ext4 incl. extent allocation + **JBD2 crash-safe journaling**, FAT12/16/32, exFAT), SMP, ELF loader + **exec-from-disk** (ring-3 ELF off the FS), ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, vendored kashi 1.0.0 console-font core, **userland shell (agnsh) exec'd in ring 3** + in-kernel recovery REPL |
+| **AGNOS** | Cyrius | 40+ subsystems, 61 syscalls (0-60), TCP/IP + DHCP + DNS + NTP + ICMP, real-iron NIC (r8169), full storage stack (NVMe / AHCI / USB-MS / VirtIO-blk + 5-backend block layer + GPT), read+write filesystems (ext2/ext4 incl. extent allocation + **JBD2 crash-safe journaling**, FAT12/16/32, exFAT), SMP, ELF loader + **exec-from-disk** (ring-3 ELF off the FS), ACPI, IOMMU, native xHCI + USB-HID-boot keyboard, sovereign UEFI handoff, vendored kashi 1.0.0 console-font core, **userland shell (agnsh) exec'd in ring 3** + in-kernel recovery REPL |
 | xv6 (MIT) | C | 21 syscalls, no networking, no SMP, no real FS |
 | seL4 (verified) | C/Isabelle | Microkernel only — no drivers, no FS, no networking |
 | MINIX 3 | C | Microkernel + basic drivers |
