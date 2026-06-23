@@ -112,8 +112,17 @@ CA_DEST="$ROOT/build/rootfs/etc/ssl/cert.pem"
 for ca in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem; do
     if [ -f "$ca" ]; then
         mkdir -p "$(dirname "$CA_DEST")"
-        cp -L "$ca" "$CA_DEST"
-        echo "staged: $CA_DEST ($(stat -c%s "$CA_DEST") bytes) <- $ca"
+        # A previous run leaves cert.pem mode 0444 (read-only), which a plain `cp`
+        # can't reopen for writing → "Permission denied". `cp -f` removes the
+        # read-only dest first (the dir is writable, so no sudo needed); we then
+        # chmod it 0644 so re-runs don't hit the same wall. Verify the result
+        # instead of reporting "staged" unconditionally (the old `cp; echo` printed
+        # success even when the cp failed, masking the error).
+        if cp -fL "$ca" "$CA_DEST" 2>/dev/null && chmod 0644 "$CA_DEST" 2>/dev/null; then
+            echo "staged: $CA_DEST ($(stat -c%s "$CA_DEST") bytes) <- $ca"
+        else
+            echo "ERROR: could not stage CA bundle $ca -> $CA_DEST"; rc=1
+        fi
         break
     fi
 done
