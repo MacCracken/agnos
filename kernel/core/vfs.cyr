@@ -540,13 +540,13 @@ fn vfs_sync_secondary() {
 fn vfs_read_signalfd(base, buf, count) {
     if (count < 4) { return 0 - 1; }
     var sigmask = load64(base + 24);
-    var pending = load64(&proc_signals + proc_current * 8);
+    var pending = load64(&proc_signals + proc_current_get() * 8);
     var matched = pending & sigmask;
     if (matched == 0) { return 0; }
     for (var s = 1; s < 32; s = s + 1) {
         var bit = 1 << s;
         if ((matched & bit) != 0) {
-            store64(&proc_signals + proc_current * 8, pending & (0 - 1 - bit));
+            store64(&proc_signals + proc_current_get() * 8, pending & (0 - 1 - bit));
             store32(buf, s);
             return 4;
         }
@@ -744,7 +744,7 @@ fn vfs_create_pipe(fds_ptr) {
 # run-to-completion can't block in-kernel, so a contended lock returns -1
 # (WOULD_BLOCK) and the ring-3 caller poll-spins. Released in vfs_close + on proc exit.
 var flock_inode[16];   # inode each lock guards (0 = free slot)
-var flock_pid[16];     # holder pid (proc_current at lock time)
+var flock_pid[16];     # holder pid (proc_current_get() at lock time)
 var flock_mode[16];    # 1 = LOCK_SH, 2 = LOCK_EX
 
 fn flock_apply(inode, pid, op) {
@@ -820,7 +820,7 @@ fn vfs_close(fd_idx) {
     if (fd_idx >= 32) { return 0 - 1; }
     var base = &vfs_table + fd_idx * 32;
     # flock#59: release any advisory lock the calling proc holds on this fd's inode.
-    if (ktag(base) == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), proc_current); }
+    if (ktag(base) == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), proc_current_get()); }
     # 1.41.7: a FAT/exFAT write-back fd flushes its buffered content (whole-file
     # via vfs_write_on) to the backend before the slot is reclaimed.
     # 1.41.11 (audit #4): SURFACE the flush result. Previously vfs_close always

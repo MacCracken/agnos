@@ -69,7 +69,7 @@ var ew37_kr_rsp = 0;      # kernel_return_rsp (==1 armed)
 var ew37_kr_rip = 0;      # kernel_return_rip
 var ew37_rsp_save = 0;    # kernel_rsp_save — agnsh's user RSP (the exit stub reloads it pre-SYSRET)
 var ew37_a4 = 0;          # ksyscall_a4 (defense-in-depth)
-var ew37_pid = 0;         # proc_current (agnsh's pid)
+var ew37_pid = 0;         # proc_current_get() (agnsh's pid)
 var ew37_resume_pid = 0;  # 1.44.14: exec_resume_pid (agnsh) saved across the nested exec
 var ew37_cr3 = 0;         # agnsh's CR3 (kpti_user_cr3 the exit stub reloads into CR3)
 var ew37_cpid = 0;        # child pid — MUST be a global (a [rbp-N] local survives via
@@ -234,19 +234,19 @@ fn kernel_resume() {
     kernel_return_rsp = 0;
     kernel_return_rip = 0;
     # 1.40.10 bite 2 — restore the kernel main thread (proc 0) as current after a
-    # program exits. sh_cmd_run sets proc_current = the exec pid for exit-code
-    # attribution; without this reset proc_current stays on that now-dead
+    # program exits. sh_cmd_run sets proc_current_get() = the exec pid for exit-code
+    # attribution; without this reset proc_current_get() stays on that now-dead
     # (state=0) proc, and the next timer tick's do_context_switch (sched.cyr)
     # takes it as `old` and unconditionally marks it ready again (line 150,
     # deliberately unconditional per iron Attempt 14 — do NOT make it conditional),
     # resurrecting a dead exec proc that sched_next could then switch into → an
-    # iretq into ring-3 user code under CS=0x08. Pointing proc_current back at
+    # iretq into ring-3 user code under CS=0x08. Pointing proc_current_get() back at
     # proc 0 (the kmain thread registered before sched_active=1) keeps every
     # post-exit timer tick switching kmain↔idle only. Exit-code attribution is
-    # unaffected: sh_cmd_run reads the local pid (shell.cyr:765), not proc_current,
+    # unaffected: sh_cmd_run reads the local pid (shell.cyr:765), not proc_current_get(),
     # and the exit code was already stamped before kernel_resume was called. During
     # the boot exec selftest sched_active=0 (no scheduling) so this is a no-op there.
-    proc_current = 0;
+    proc_current_set(0);
     # 1.40.6: restore the BOOT kernel CR3 (0x1000). On the program's exit the
     # SYSCALL stub left CR3 = the per-process CR3, which mirrors only 0-1 GB +
     # PDPT[1..3] — it does NOT map the device MMIO (NVMe BAR ~0xC0000010xx) that
@@ -514,27 +514,27 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 0) {
         # exit — halt current process, return to kernel if context saved
         sys_exit_code = arg1;
-        proc_set_exit_code(proc_current, arg1);
+        proc_set_exit_code(proc_current_get(), arg1);
         # flock#59: release every advisory lock held by the exiting proc (so a
         # fork-per-accept worker that dies mid-turn can't strand the shared world).
-        flock_release_pid(proc_current);
-        if (proc_current < proc_count) {
-            proc_set_state(proc_current, 0);
+        flock_release_pid(proc_current_get());
+        if (proc_current_get() < proc_count) {
+            proc_set_state(proc_current_get(), 0);
             # Send SIGCHLD (signal 17) to parent process
-            var ppid = proc_get_ppid(proc_current);
+            var ppid = proc_get_ppid(proc_current_get());
             if (ppid >= 0) {
                 proc_send_signal(ppid, 17);
             }
         }
         # If we have a saved kernel return point, jump back to it — but ONLY when the EXITING
         # proc is the one exec_and_wait is run-to-completion waiting on (exec_resume_pid). 1.44.14:
-        # a PREEMPTIVELY-scheduled #43 background job exit()s with proc_current = ITS pid (the
+        # a PREEMPTIVELY-scheduled #43 background job exit()s with proc_current_get() = ITS pid (the
         # scheduler set it), which != exec_resume_pid (agnsh) — so it must NOT fire agnsh's
         # kernel_resume (that would resume kybernet as if agnsh exited). It already went state 0
         # above, so its parent's waitpid#4 reaps it. Pre-1.44.14 this gate was just
         # `kernel_return_rsp != 0`, which fired for ANY exit while a resume was armed.
         if (kernel_return_rsp != 0) {
-            if (proc_current == exec_resume_pid) {
+            if (proc_current_get() == exec_resume_pid) {
                 kernel_resume();
             }
         }
@@ -547,7 +547,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         }
         return vfs_write(arg1, arg2, arg3);
     }
-    if (num == 2) { return proc_current; }
+    if (num == 2) { return proc_current_get(); }
     if (num == 3) {
         # spawn(elf_addr, elf_size) — load an in-memory ELF + create a user process.
         # Returns new pid or -1. 1.41.5: the ELF image is a USER buffer — validate
@@ -566,7 +566,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # RING3_SELFTEST loads its B proc via elf_load directly, not this path) this code
         # is not reached.
         if (arg2 > 16384) { return 0 - 1; }
-        var sp_caller_cr3 = proc_get_cr3(proc_current);
+        var sp_caller_cr3 = proc_get_cr3(proc_current_get());
         var sp_dst = &spawn_elf_buf;
         var sp_i = 0;
         while (sp_i < arg2) { store8(sp_dst + sp_i, load8(arg1 + sp_i)); sp_i = sp_i + 1; }
@@ -590,7 +590,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= proc_count) { return 0 - 1; }
         # Never wait on (and never reap) the caller itself.
-        if (arg1 == proc_current) { return 0 - 1; }
+        if (arg1 == proc_current_get()) { return 0 - 1; }
         if (proc_get_state(arg1) != 0) { return 0 - 2; }   # still alive → WOULD_BLOCK
         # 1.42.x: reap the in-memory-spawned child here — the symmetric point to
         # the from-disk path's "read exit code in sh_cmd_run, then proc_reap".
@@ -599,7 +599,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # huge pages) and proc_table slot. Without this, every spawn()ed child
         # leaked its whole address space for the boot; with it the in-memory
         # path is leak-symmetric with elf_load_from_file's run/reap. Safe: the
-        # child is confirmed dead (loop above) and is not proc_current (guarded),
+        # child is confirmed dead (loop above) and is not proc_current_get() (guarded),
         # so its distinct CR3 is not the one the CPU is walking.
         var wcode = proc_get_exit_code(arg1);
         proc_reap_child(arg1);
@@ -714,14 +714,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg2 >= 64) { return 0 - 1; }
         # Security: non-init processes cannot signal PID 0 (init)
         if (arg1 == 0) {
-            if (proc_current != 0) { return 0 - 1; }
+            if (proc_current_get() != 0) { return 0 - 1; }
         }
         # Security: processes can only signal themselves or children
         # For now, allow signaling own process or if sender is PID 0 (init)
-        if (proc_current != 0) {
-            if (arg1 != proc_current) {
+        if (proc_current_get() != 0) {
+            if (arg1 != proc_current_get()) {
                 var target_ppid = proc_get_ppid(arg1);
-                if (target_ppid != proc_current) { return 0 - 1; }
+                if (target_ppid != proc_current_get()) { return 0 - 1; }
             }
         }
         var sig_pending = load64(&proc_signals + arg1 * 8);
@@ -736,12 +736,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg3 != 0) {
             if (is_user_range(arg3, 8) == 0) { return 0 - 1; }
         }
-        var old_mask = load64(&proc_sigmask + proc_current * 8);
+        var old_mask = load64(&proc_sigmask + proc_current_get() * 8);
         if (arg3 != 0) { store64(arg3, old_mask); }
         var new_bits = load64(arg2);
         if (arg1 == 0) { new_bits = old_mask | new_bits; }
         if (arg1 == 1) { new_bits = old_mask & (0 - 1 - new_bits); }
-        store64(&proc_sigmask + proc_current * 8, new_bits);
+        store64(&proc_sigmask + proc_current_get() * 8, new_bits);
         return 0;
     }
     if (num == 18) {
@@ -833,7 +833,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
                     var wtype = ktag(wbase);
                     if (wtype == VFS_SIGNALFD) {
                         var smask = kpayload(wbase, 2);
-                        var spend = load64(&proc_signals + proc_current * 8);
+                        var spend = load64(&proc_signals + proc_current_get() * 8);
                         if ((spend & smask) != 0) { rdy = 1; }
                     }
                     if (wtype == VFS_TIMERFD) {
@@ -1110,7 +1110,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         while (pi < arg2) { store8(pdst + pi, load8(arg1 + pi)); pi = pi + 1; }
 
         # (c) snapshot agnsh's resume context (H1) BEFORE the nested exec_and_wait
-        # clobbers it. proc_current is still agnsh here.
+        # clobbers it. proc_current_get() is still agnsh here.
         var s37 = &ew37_ctx;
         var es  = &exec_ctx;
         var si = 0;
@@ -1119,10 +1119,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         ew37_kr_rip   = kernel_return_rip;
         ew37_rsp_save = kernel_rsp_save;            # agnsh's user RSP
         ew37_a4       = ksyscall_a4;
-        ew37_pid      = proc_current;               # agnsh's pid
+        ew37_pid      = proc_current_get();               # agnsh's pid
         ew37_resume_pid = exec_resume_pid;          # 1.44.14: save agnsh's resume-pid; the nested
         # exec_and_wait(child) overwrites exec_resume_pid = child, restored below post-resume.
-        ew37_cr3      = proc_get_cr3(proc_current); # agnsh's CR3 (robust source)
+        ew37_cr3      = proc_get_cr3(proc_current_get()); # agnsh's CR3 (robust source)
         ew37_busy     = 1;
 
         # (d) switch to the BOOT CR3 (maps all phys incl. the NVMe BAR) for the disk
@@ -1208,9 +1208,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
 
         # (g) make the child current (so ITS exit() stamps the code on ITS pid),
         # then run to completion. The child's exit() -> kernel_resume longjmps back
-        # to the line after this call with CR3=boot 0x1000, proc_current=0,
+        # to the line after this call with CR3=boot 0x1000, proc_current_get()=0,
         # kernel_return_*=0, kpti_*=child, kernel_rsp_save=child's last user RSP.
-        proc_current = cpid;
+        proc_current_set(cpid);
         exec_and_wait(ce, cr, cc);
         # ===== RESUME POINT (child exited) =====
 
@@ -1229,7 +1229,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # (i) read the child's exit code (from the GLOBAL pid) BEFORE reaping (reap
         # collapses the slot), then reap: proc_reap_child frees the child's address
         # space + LIFO slot only (NOT proc_reap, which sweeps fds). Safe: child is
-        # dead, proc_current==0 (!=cpid) so its guard passes, CPU is on boot CR3.
+        # dead, proc_current_get()==0 (!=cpid) so its guard passes, CPU is on boot CR3.
         ew37_code = proc_get_exit_code(ew37_cpid);
         proc_reap_child(ew37_cpid);
 
@@ -1247,9 +1247,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         kpti_user_cr3     = ew37_cr3;                # the value the exit stub reloads into CR3 pre-SYSRET
         kernel_rsp_save   = ew37_rsp_save;           # the exit stub does `mov rsp,[kernel_rsp_save]` pre-SYSRET
         ksyscall_a4       = ew37_a4;
-        proc_current      = ew37_pid;                # agnsh's pid (its write/exit attribute to agnsh)
+        proc_current_set(ew37_pid);                # agnsh's pid (its write/exit attribute to agnsh)
         exec_resume_pid   = ew37_resume_pid;         # 1.44.14: agnsh is the resume target again, so
-        # agnsh's later exit() (proc_current==exec_resume_pid) fires kernel_resume to kybernet
+        # agnsh's later exit() (proc_current_get()==exec_resume_pid) fires kernel_resume to kybernet
 
         # (k) reload the LIVE CR3 to agnsh now (kernel_resume left boot 0x1000) so
         # this handler tail + the exit stub run under agnsh's mappings. cr3_load
@@ -1497,8 +1497,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # caller CR3 → return pid) with the in-memory copy+elf_load swapped for
         # execwait(#37)'s path-staging + elf_load_from_file. It DROPS all of #37's blocking
         # machinery (the H1 resume-ctx snapshot/restore, the H2 disjoint-kstack swap +
-        # syscall_init, proc_current=child, exec_and_wait run-to-completion, the in-handler
-        # reap) — there is no nested run to protect, so proc_current STAYS the caller and
+        # syscall_init, proc_current_get()=child, exec_and_wait run-to-completion, the in-handler
+        # reap) — there is no nested run to protect, so proc_current_get() STAYS the caller and
         # reaping is waitpid(#4)'s job. Like every handler it runs IF=0 and NVMe completion
         # POLLS (no sti window), so the shared FS scratch (spawn_path_buf / elf_hdr_buf /
         # VFS) can't be raced mid-load — the serial invariant spawn(#3)/execwait(#37) rely on.
@@ -1516,7 +1516,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # execwait#37 / sh_cmd_run. elf_load_from_file builds the per-proc address space +
         # SysV argc/argv/envp stack and returns a READY pid (proc_create_full: state=1/IF=1)
         # or -1.
-        var spcr3 = proc_get_cr3(proc_current);
+        var spcr3 = proc_get_cr3(proc_current_get());
         cr3_load(0x1000);
         var sp_ps = 0;
         while (sp_ps < arg2) { if (load8(spp + sp_ps) != 32) { break; } sp_ps = sp_ps + 1; }   # skip leading spaces
@@ -1861,7 +1861,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # flock(fd=arg1, op=arg2) — advisory whole-file lock (BSD flock(2)). op:
         # LOCK_SH=1 / LOCK_EX=2 / LOCK_UN=8, OR'd with LOCK_NB=4. Keyed by the file's
         # inode (VFS_EXT2_FILE payload[2]) in a 16-slot lock table; the holder is
-        # proc_current. NON-BLOCKING at the kernel boundary — single-core run-to-
+        # proc_current_get(). NON-BLOCKING at the kernel boundary — single-core run-to-
         # completion can't sleep, so a contended SH/EX returns -1 (WOULD_BLOCK) and
         # the ring-3 caller poll-spins (yielding so the holder can release). Released
         # in vfs_close#6 and on proc exit (flock_release_pid). Added (1.45.13) for the
@@ -1873,7 +1873,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (ktag(fl_base) != VFS_EXT2_FILE) { stack_canary_check(canary); return 0 - 1; }
         var fl_ino = kpayload(fl_base, 2);
         if (fl_ino == 0) { stack_canary_check(canary); return 0 - 1; }
-        var fl_rc = flock_apply(fl_ino, proc_current, arg2);
+        var fl_rc = flock_apply(fl_ino, proc_current_get(), arg2);
         stack_canary_check(canary);
         return fl_rc;
     }

@@ -462,10 +462,10 @@ fn sh_cmd_run(arg, arglen) {
     var r = load64(ep + 16);
     var c = load64(ep + 160);
     # 1.40.6: make this the current process so the program's exit() syscall
-    # (proc_set_exit_code(proc_current, …)) records the code on THIS pid — without
-    # it, a second sequential `run` left proc_current on the prior pid and the
+    # (proc_set_exit_code(proc_current_get(), …)) records the code on THIS pid — without
+    # it, a second sequential `run` left proc_current_get() on the prior pid and the
     # exit code came back 0.
-    proc_current = pid;
+    proc_current_set(pid);
     exec_and_wait(e, r, c);
     kprint("run: exit ", 10);
     kprint_num(proc_get_exit_code(pid));

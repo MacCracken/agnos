@@ -38,7 +38,7 @@ fn spin_unlock() {
 # AP entry point — called after the trampoline transitions to long mode.
 # 1.44.18 WAKE + PARK: the AP comes online, reports in, and PARKS — it must NOT arm
 # its APIC timer and must NOT sti. A second CPU taking timer interrupts would run
-# do_context_switch CONCURRENTLY with the BSP — shared kstack, proc_current, no locks —
+# do_context_switch CONCURRENTLY with the BSP — shared kstack, proc_current_get(), no locks —
 # violating the single-core invariant the whole kernel relies on. The multithreading/SMP
 # arc ([[project_multithreading_future_arc]]) unwinds that deliberately, with locking;
 # until then a parked AP (IF=0 + hlt = sleeps until INIT/NMI, i.e. forever) proves the

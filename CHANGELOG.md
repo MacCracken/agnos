@@ -58,6 +58,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   per-CPU syscall stub → lock FS/devices → AP-runs-scheduler → flip) + the design review's mandatory
   corrections are recorded in `docs/development/smp-arc-plan.md`. `check.sh` 11/11, agnsh-smoke PASS.
   `build/agnos` 1,211,424 B.
+- **SMP arc sub-bite 2 — per-CPU scheduler identity** (`proc.cyr`/`sched.cyr` + ~70 call sites). The single
+  globals `proc_current`, `preempt_count`, and `sched_idle_pid` became per-CPU arrays (`pcpu_curproc[4]`/
+  `pcpu_preempt[4]`/`pcpu_idle[4]`) indexed by APIC id, with `*_get()`/`*_set()` accessors. **Single-core fast
+  path:** while `cpu_count < 2` (every state up to the sub-bite-7 wake flip) the accessors hit slot 0 with NO
+  APIC read → byte-for-byte the old globals. The old global *names were removed* so any unconverted read fails
+  to COMPILE (the design review's forcing-function — it caught the full ~70-site set; build is clean). `kpti_*`
+  deliberately stay global until sub-bite 4 (the syscall stub reads them via baked imm64 — they can't be arrays
+  until it's regenerated). APs still parked. Validated: `agnsh-smoke` PASS, `check.sh` 11/11, `ring3-smoke` 8/8
+  (multi-proc preemption exercises `proc_current` through every context switch + the per-CPU preempt gate +
+  idle deprioritization). `build/agnos` 1,212,336 B.
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a

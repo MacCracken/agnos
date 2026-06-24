@@ -55,11 +55,11 @@ fn exec_and_wait(entry, rsp, cr3) {
     kernel_return_rsp = 1;   # nonzero = "a kernel resume context is armed" (ksyscall exit checks this)
     kernel_return_rip = 0;
     # 1.44.14: remember WHICH proc this resume context belongs to (the foreground proc being
-    # run-to-completion — proc_current is it at entry: agnsh for kybernet's launch, the child for
+    # run-to-completion — proc_current_get() is it at entry: agnsh for kybernet's launch, the child for
     # execwait#37). exit#0 fires kernel_resume ONLY for this proc, so a PREEMPTIVELY-scheduled
     # background job (#43) that exit()s while agnsh is the armed resume target does NOT hijack
     # agnsh's resume (it just goes state 0 for waitpid#4). Saved/restored across execwait#37 nesting.
-    exec_resume_pid = proc_current;
+    exec_resume_pid = proc_current_get();
 
     # Pass params to enter_ring3 via globals (avoid param clobber in asm).
     exec_entry_g = entry;
@@ -99,14 +99,14 @@ fn exec_and_wait(entry, rsp, cr3) {
     # tss_set_rsp0 reads the Local APIC (0xFEE00020) for the CPU id, which the
     # user CR3 does not map — reading it AFTER the switch faulted (→ #PF → #DF →
     # triple fault, the ring-3 bring-up blocker). Done here under the kernel CR3.
-    # 1.46.1: per-proc RSP0 — the foreground proc (proc_current: agnsh for kybernet's
+    # 1.46.1: per-proc RSP0 — the foreground proc (proc_current_get(): agnsh for kybernet's
     # launch, the child for execwait#37) takes its CPL3->CPL0 interrupts on ITS OWN
     # region-7 stack. Falls back to 0x3C0000 (= tss_kernel_stack) for an unassigned
     # slot, so this is byte-identical where it used to pass tss_kernel_stack. Inert
     # at IF=0 (foreground run-to-completion takes no timer interrupt); forward-correct
     # for when exec_preempt=1 makes agnsh preemptible. Kept BEFORE the CR3 switch (the
     # APIC-read rule above).
-    tss_set_rsp0(proc_rsp0_top(proc_current));
+    tss_set_rsp0(proc_rsp0_top(proc_current_get()));
 
     # Switch CR3 and enter ring 3 (use user CR3 for KPTI). After the switch
     # enter_ring3 only writes the iretq frame at 0x7000 (in the 0-2 MB
@@ -136,7 +136,7 @@ fn enter_ring3(entry, user_rsp) {
     # and the scheduler hands a #43 background job a slice. Safe now (vs the 1.40.3 era) because
     # agnsh runs under a FULL per-proc CR3 c that maps the kernel + Local APIC (proc.cyr), so the
     # timer ISR EOIs cleanly with no CR3 swap; do_context_switch save/restore is identical to any
-    # scheduled proc (proc_current==agnsh_pid, slot CR3==c). The flag is consumed-then-cleared so
+    # scheduled proc (proc_current_get()==agnsh_pid, slot CR3==c). The flag is consumed-then-cleared so
     # only THIS first entry is affected (resumes go through the normal ISR iretq); foreground #37
     # stays IF=0.
     var rflags_start = 0x002;

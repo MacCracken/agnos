@@ -28,7 +28,27 @@ struct Process { pid; state; rsp; rip; rax; rbx; rcx; rdx; rsi; rdi; rbp; r8; r9
 
 var proc_table[2816];  # 16 processes x 176 bytes each
 var proc_count = 0;
-var proc_current = 0;
+# 1.46.x SMP sub-bite 2 — per-CPU "current proc pid". Was a single global `proc_current_get()`;
+# under SMP each CPU runs a different proc, so it is indexed by APIC id (the tss_array
+# template). Single-core FAST PATH: while cpu_count<2 (APs not woken — every state up to the
+# sub-bite-7 flip) the accessors hit slot 0 with NO APIC read, so this is byte-for-byte the old
+# global. The old `var proc_current_get()` is REMOVED so any unconverted read fails to COMPILE (the
+# review's forcing-function safety net). kpti_*/syscall-stub stay global until sub-bite 4 (the
+# stub reads them via baked imm64 — they can't be arrays until it's regenerated).
+var pcpu_curproc[4];     # per-CPU current-proc pid, indexed by APIC id (slot 0 = single-core)
+fn proc_current_get() {
+    if (cpu_count < 2) { return load64(&pcpu_curproc); }
+    var c = tss_get_current_cpu_id();
+    if (c >= 4) { c = 0; }
+    return load64(&pcpu_curproc + c * 8);
+}
+fn proc_current_set(v) {
+    if (cpu_count < 2) { store64(&pcpu_curproc, v); return 0; }
+    var c = tss_get_current_cpu_id();
+    if (c >= 4) { c = 0; }
+    store64(&pcpu_curproc + c * 8, v);
+    return 0;
+}
 var sched_active = 0;
 var proc_signals[128];  # 16 processes x 8 bytes
 var proc_sigmask[128];  # 16 processes x 8 bytes
@@ -71,10 +91,20 @@ var pending_signal_flag = 0;  # Set by scheduler ISR, read by main — benign ra
 # "the timer handler's do_context_switch early-returns while a syscall runs" guard
 # in syscall.cyr into one counted, nestable primitive. Plain i64 (single-core:
 # no atomic needed yet; SMP later makes it a per-CPU/atomic field).
-var preempt_count = 0;
-fn preempt_disable() { preempt_count = preempt_count + 1; return 0; }
-fn preempt_enable() { if (preempt_count > 0) { preempt_count = preempt_count - 1; } return 0; }
-fn preempt_enabled() { if (preempt_count == 0) { return 1; } return 0; }
+# 1.46.x SMP sub-bite 2: per-CPU preempt-disable nesting count (was a single global).
+# Each CPU has its own count — a preempt_disable on CPU N must not gate CPU M's switch.
+# cpu_count<2 fast path = slot 0, no APIC read -> byte-for-byte the old global single-core.
+var pcpu_preempt[4];
+fn preempt_cpu_slot() {
+    if (cpu_count < 2) { return &pcpu_preempt; }
+    var c = tss_get_current_cpu_id();
+    if (c >= 4) { c = 0; }
+    return &pcpu_preempt + c * 8;
+}
+fn preempt_count_get() { return load64(preempt_cpu_slot()); }
+fn preempt_disable() { var s = preempt_cpu_slot(); store64(s, load64(s) + 1); return 0; }
+fn preempt_enable() { var s = preempt_cpu_slot(); var v = load64(s); if (v > 0) { store64(s, v - 1); } return 0; }
+fn preempt_enabled() { if (load64(preempt_cpu_slot()) == 0) { return 1; } return 0; }
 
 # Allocate a proc_table slot. NON-LIFO (1.44.x): REUSE the first dead (state==0) slot in
 # [0,proc_count) so an out-of-order background-job reap does not leak its slot; else APPEND
@@ -474,7 +504,7 @@ fn proc_free_address_space(cr3) {
 # Reap an exited process: tear down its address space and hand its proc_table
 # slot back. Called from sh_cmd_run after exec_and_wait returns (the program
 # has exit()ed; kernel_resume already restored the boot CR3 and reset
-# proc_current to 0), so we are running on the boot CR3 — freeing the per-process
+# proc_current_get() to 0), so we are running on the boot CR3 — freeing the per-process
 # tables is safe (the CPU is not walking them).
 #
 # Order matters for scheduler-safety on the single-core model: mark the slot
@@ -506,7 +536,7 @@ fn proc_reap(pid) {
     }
     var cr3 = proc_get_cr3(pid);
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
-    if (proc_current == pid) { proc_current = 0; }
+    if (proc_current_get() == pid) { proc_current_set(0); }
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
     if (cr3 != 0x1000) { proc_free_address_space(cr3); }
     # LIFO slot reclaim: hand the top dead slot back to the allocator.
@@ -544,7 +574,7 @@ fn proc_reap(pid) {
 # (idempotent) before detaching/freeing for the same ordering guarantee.
 fn proc_reap_child(pid) {
     if (pid >= proc_count) { return 0 - 1; }
-    if (pid == proc_current) { return 0 - 1; }   # never reap the running proc here
+    if (pid == proc_current_get()) { return 0 - 1; }   # never reap the running proc here
     var cr3 = proc_get_cr3(pid);
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
@@ -737,7 +767,7 @@ fn sys_mmap(length) {
     var len = (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;   # round up to 2 MB
     if (len < 0x200000) { len = 0x200000; }
     var npages = len / 0x200000;
-    var cr3 = proc_get_cr3(proc_current);
+    var cr3 = proc_get_cr3(proc_current_get());
     if (cr3 == 0) { return 0; }
     if ((mmap_next_vaddr + len) > 0x3FA00000) { return 0; }    # arena ceiling (below the user stack @0x3FC00000 + its guard @0x3FA00000)
     if (pmm_count_2mb_free() < npages) { return 0; }            # not enough physical
@@ -767,7 +797,7 @@ fn sys_munmap(addr, length) {
     var len = (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;       # round up to 2 MB
     if (len < 0x200000) { len = 0x200000; }
     if ((addr + len) > 0x40000000) { return 0 - 1; }          # past the ceiling
-    var cr3 = proc_get_cr3(proc_current);
+    var cr3 = proc_get_cr3(proc_current_get());
     if (cr3 == 0) { return 0 - 1; }
     # Walk PML4 -> PDPT -> PD once; the whole arena shares one PD (covers 0-1 GB).
     var pml4e = load64(cr3);

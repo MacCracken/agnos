@@ -29,7 +29,7 @@ fn kybernet_exec_agnsh() {
     var e = load64(ep + 24);      # entry
     var r = load64(ep + 16);      # rsp
     var c = load64(ep + 160);     # cr3
-    proc_current = pid;
+    proc_current_set(pid);
     # 1.46.x BITE 2 — RE-ENABLE preemptive agnsh (IF=1) on the per-proc RSP0 foundation (bite 1).
     # HISTORY: 1.44.14 launched agnsh IF=1 so the timer time-slices its prompt against #43 background
     # jobs. That froze archaemenid at the banner (burn 1442x: .22 banner-then-freeze, .23 freeze
@@ -68,7 +68,7 @@ fn kybernet() {
         var nstp = elf_load_from_file("/bin/dig", 8, "/bin/dig @10.0.2.3 example.com", 30);
         if (nstp >= 0) {
             var nste = &proc_table + nstp * 176;
-            proc_current = nstp;
+            proc_current_set(nstp);
             exec_and_wait(load64(nste + 24), load64(nste + 16), load64(nste + 160));
             proc_reap(nstp);
             kprintln("kybernet: NET_SELFTEST dig done", 31);

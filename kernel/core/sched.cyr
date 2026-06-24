@@ -9,17 +9,31 @@
 # doing nothing, so as a round-robin PEER it was eating ~1/3 of the CPU whenever real procs
 # were ready (the bg-job share cap the 1.44.16 benchmark hit at ~50% even with agnsh
 # yielding). Idle now runs ONLY when nothing else is ready.
-var sched_idle_pid = 0 - 1;
+# 1.46.x SMP sub-bite 2: per-CPU idle-proc pid (was a single global, default -1). Each CPU
+# gets its own idle (slot 0 = BSP, created at boot; slots 1-3 created in the AP-bring-up
+# sub-bite). sched_next deprioritizes the CALLING CPU's idle. cpu_count<2 fast path = slot 0,
+# byte-for-byte the old global single-core. Arrays zero-init but the default MUST be -1 (no
+# idle yet => skip nothing), so sched_idle_init() sets all 4 slots = -1 at boot pre-scheduling.
+var pcpu_idle[4];
+fn sched_idle_cpu_slot() {
+    if (cpu_count < 2) { return &pcpu_idle; }
+    var c = tss_get_current_cpu_id();
+    if (c >= 4) { c = 0; }
+    return &pcpu_idle + c * 8;
+}
+fn sched_idle_pid_get() { return load64(sched_idle_cpu_slot()); }
+fn sched_idle_pid_set(v) { store64(sched_idle_cpu_slot(), v); return 0; }
+fn sched_idle_init() { var i = 0; while (i < 4) { store64(&pcpu_idle + i * 8, 0 - 1); i = i + 1; } return 0; }
 
 fn sched_next() {
     # Pass 1 (1.44.17): round-robin over READY (state==1) procs, SKIPPING the idle kthread —
     # real work must never lose a slice to a proc that exists only to hlt.
-    var start = proc_current + 1;
+    var start = proc_current_get() + 1;
     var si = 0;
     while (si < proc_count) {
         var idx = start + si;
         if (idx >= proc_count) { idx = idx - proc_count; }
-        if (idx != sched_idle_pid) {
+        if (idx != sched_idle_pid_get()) {
             if (proc_get_state(idx) == 1) {
                 return idx;
             }
@@ -39,7 +53,7 @@ fn sched_next() {
         si = si + 1;
     }
     # No ready proc at all — fall back to proc 0 (kernel idle).
-    # Previously returned proc_current, which let busy-looping ring-0 user
+    # Previously returned proc_current_get(), which let busy-looping ring-0 user
     # procs starve the kernel idle loop indefinitely (iron Attempt 14
     # sub-case 3b). Falling back to proc 0 guarantees kernel idle gets
     # picked when no test proc is ready; proc 0 will hlt and yield again.
@@ -163,10 +177,10 @@ fn do_context_switch(isr_rsp) {
     # scratch buffers / non-reentrant FS) must not be switched away from. A timer
     # tick inside it is a no-op switch; the pending reschedule lands on the next
     # tick after preempt_enable() drops the count to 0.
-    if (preempt_count > 0) { return 0; }
+    if (preempt_count_get() > 0) { return 0; }
     if (proc_count < 2) { return 0; }
 
-    var old = proc_current;
+    var old = proc_current_get();
     var new_pid = sched_next();
     if (new_pid == old) { return 0; }
 
@@ -186,7 +200,7 @@ fn do_context_switch(isr_rsp) {
     if (load64(&proc_table + old * 176 + 8) != 0) { proc_set_state(old, 1); }  # not-dead → ready; dead stays dead
 
     # Load new process state
-    proc_current = new_pid;
+    proc_current_set(new_pid);
     proc_set_state(new_pid, 2);  # → running
     proc_restore_context(new_pid, isr_rsp);
 
@@ -312,7 +326,7 @@ fn yield_frame_iretq(fp) {
 # Raw load64/store64 throughout (the cc5-regalloc-sensitive-path convention above).
 fn sys_sched_yield() {
     if (sched_active == 0) { return 0; }
-    if (preempt_count > 0) { return 0; }
+    if (preempt_count_get() > 0) { return 0; }
     # Refuse during an execwait#37 nested exec: suspended agnsh sits state-1
     # (SCHEDULABLE) with its real continuation frozen in the #37 kstack frame — a
     # yield-switch could select its STALE slot and resume the shell incoherently.
@@ -320,7 +334,7 @@ fn sys_sched_yield() {
     # Refuse IF=0 callers (foreground exec/execwait children): their no-context-switch
     # model is load-bearing; yield is a no-op there, not an error.
     if ((load64(&sc_entry_regs + 8) & 0x200) == 0) { return 0; }
-    var yp = proc_current;
+    var yp = proc_current_get();
     var next = sched_next();
     if (next == yp) { return 0; }                      # nothing else ready — keep the slice
     # sched_next's no-ready fallback returns 0 (kmain), which is state 2 with a STALE
@@ -354,7 +368,7 @@ fn sys_sched_yield() {
     store64(&proc_ss + yp * 8, 0x1B);
     # --- Switch (mirrors do_context_switch's proven order + tail) ---
     proc_set_state(yp, 1);                             # yielder: running → ready
-    proc_current = next;
+    proc_current_set(next);
     proc_set_state(next, 2);                           # next: ready → running
     var fp = &yield_frame;
     proc_restore_context(next, fp);                    # fill the synthesized ISR frame

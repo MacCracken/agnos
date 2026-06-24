@@ -2065,7 +2065,7 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0D; 0xE6; 0x71; }
 kernel_return_rsp = 0;
 kernel_return_rip = 0;
 proc_count = 0;
-proc_current = 0;
+proc_current_set(0);
 var p0 = proc_create(0x100000);
 proc_set_state(0, 2);  # kernel "process" is running
 
@@ -2099,7 +2099,7 @@ kprintln("", 0);
 kprintln("Creating test processes...", 26);
 
 proc_count = 0;
-proc_current = 0;
+proc_current_set(0);
 
 # Process 0: kernel idle (the code running right now)
 var kern_pid = proc_create(0);
@@ -2177,7 +2177,7 @@ kprintln("Activating scheduler...", 23);
 # 1.40.10 — register the kernel main thread + an idle thread as real procs
 # before activating preemption (production path; KTEST builds set up their own
 # proc_a/proc_b above). The exec-from-disk selftest leaves dead exec procs in
-# slots 0..N with proc_current on the last one; without a valid runnable proc
+# slots 0..N with proc_current_get() on the last one; without a valid runnable proc
 # the first timer tick after sched_active=1 (the DHCP DISCOVER hlt-wait on iron)
 # fell back to a dead exec proc, cr3_load'd its stale per-process CR3 and
 # iretq'd into a ring-3 RIP in ring 0 → triple-fault reset. Build proc 0 = this
@@ -2236,7 +2236,7 @@ fn thread_selftest_verify() {
 #            sched_next visited the full table, not just an A<->B pair)
 #   canary — a known guard word survives the storm (no wild write / stack overrun)
 #   cap    — proc_create_full caps cleanly at -1 when the table is full (no overrun)
-# A worker learns its OWN slot from proc_current (the scheduler sets it before
+# A worker learns its OWN slot from proc_current_get() (the scheduler sets it before
 # switching in), so pid == proc_table slot == its DISTINCT counter index — workers
 # never alias a counter (which would be an inherent single-core RMW race, not a
 # scheduler bug). Compile-gated: `SCHED_STRESS_SELFTEST=1 ./scripts/build.sh`.
@@ -2254,7 +2254,7 @@ var sss_stacks[6144];     # module-scope = SSS_N*512 u64 = 12 x 4 KB static stac
 var sss_mem[64];
 
 fn sss_worker() {
-    var me = proc_current;             # my pid == my distinct counter slot (race-free)
+    var me = proc_current_get();             # my pid == my distinct counter slot (race-free)
     var n = 0;
     while (n < SSS_ITER) {
         store64(&sss_mem + me * 8, load64(&sss_mem + me * 8) + 1);
@@ -2976,10 +2976,10 @@ fn ring3_selftest_verify() {
 
 #ifndef KTEST
 proc_count = 0;
-proc_current = 0;
+proc_current_set(0);
 proc_create(0);                 # proc 0 = kernel main (running now; context saved on first switch-away)
 proc_set_state(0, 2);           # running
-sched_idle_pid = kthread_create(&kernel_idle_loop);  # proc 1 = idle (ready) — 1.44.1: via the kthread primitive (pool stack); 1.44.17: registered so sched_next deprioritizes it (idle runs only when nothing else is ready)
+sched_idle_init(); sched_idle_pid_set(kthread_create(&kernel_idle_loop));  # proc 1 = idle (ready) — 1.44.1: via the kthread primitive (pool stack); 1.44.17: registered so sched_next deprioritizes it (idle runs only when nothing else is ready)
 #ifdef THREAD_SELFTEST
 # 1.44.0 opening bite: spawn two kernel threads on the shared AS (tight-loopers).
 thr_pid_a = kthread_create(&thread_test_a);
