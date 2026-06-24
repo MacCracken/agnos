@@ -7,20 +7,45 @@ var pmm_used = 0;
 var pmm_next_free = 0;
 var pmm_lock = 0;
 
-# PMM spinlock — NO-OP until the multi-threading / preemptive-sched / SMP arc.
-# AGNOS is single-threaded single-core today, so no concurrent PMM access is
-# possible and the atomic xchg + its serializing memory fence were pure overhead
-# (the CHANGELOG measured the locked-xchg pair at ~+58% on pmm_alloc_free). The
-# user authorized stripping it to a no-op "until after multi-thread/SMP work
-# later" (2026-06-06). The call sites in pmm_alloc/pmm_free/pmm_alloc_2mb/etc.
-# stay intact, so restoring real locking when SMP unwinds the single-core
-# invariant is a one-place change here (see project_multithreading_future_arc).
-# The original xchg-based bodies are preserved in git history (pre-1.42.7).
+# PMM spinlock — RESTORED at 1.46.x (SMP arc, sub-bite 1: the locking-primitive
+# foundation; APs still parked, so this is single-core behavior-preserving). The
+# xchg test-and-set was no-op'd at 1.42.7 for perf (~+58% on pmm_alloc_free) "until
+# after multi-thread/SMP work later" (user, 2026-06-06) — that time is now. Bodies
+# are structured IDENTICALLY to smp.cyr's iron-proven spin_lock/spin_unlock (the
+# AP-checkin lock): same locals, NO parameter, so the hardcoded [rbp-N] frame
+# offsets are guaranteed correct (a parameterized spin_lock_at would spill the param
+# and shift them — the SMP design review's critical finding; generalization deferred
+# to the multi-lock sub-bite with objdump verification). Locks &pmm_lock so the
+# bitmap RMW (pmm_alloc/_free/_alloc_2mb, ~14 call sites, already intact) is atomic
+# across CPUs once APs run; xchg carries an IMPLICIT LOCK prefix (atomic + full
+# fence), so no separate fence. Single-core: the xchg always wins uncontended →
+# behavior-identical (the +58% is re-incurred deliberately as the foundation).
+# LOCK ORDER (for the locks landing in later sub-bites): pmm is the LEAF / innermost
+# lock — kmalloc takes heap_lock THEN calls pmm_alloc, so pmm is acquired LAST and
+# must be HIGHEST in an acquire-low->high order (heap < pmm), NOT lowest (the design
+# review corrected the original plan here). The original bodies were preserved in
+# git history (pre-1.42.7); this restores them.
 fn pmm_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &pmm_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;  # mov rcx, 1
+            0x48; 0x87; 0x08;              # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;       # mov [rbp-0x08], rcx (old)
+        }
+    }
     return 0;
 }
 
 fn pmm_spin_unlock() {
+    var addr = &pmm_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
     return 0;
 }
 

@@ -47,6 +47,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fix. Validated in QEMU: `agnsh-bg-test` (sleeper & — prompt stays live, reaps `[1] Done`),
   `agnsh-multijob-test` (2 concurrent jobs, out-of-order reap), `agnsh-smoke`, `check.sh` 11/11.
   **Iron-pending** — QEMU can't reproduce the Zen-specific freeze, so the next burn is the real test.
+- **SMP arc sub-bite 1 — restored the xchg spinlock primitive** (`kernel/core/pmm.cyr`). `pmm_spin_lock`/
+  `pmm_spin_unlock` were no-op'd at 1.42.7 for perf (~+58% on `pmm_alloc_free`) "until the SMP arc" — that
+  time is now. Restored to the iron-proven xchg test-and-set on `&pmm_lock`, structured identically to
+  smp.cyr's AP-checkin `spin_lock` (same locals, no parameter → the hardcoded `[rbp-N]` frame offsets are
+  guaranteed correct; verified byte-identical in the binary). The ~14 PMM call sites were already intact, so
+  this is the one-place restoration the 1.42.7 no-op was designed for. Single-core behavior-preserving (the
+  xchg always wins uncontended), APs still parked. This is the locking-primitive foundation for the rest of
+  the SMP arc — the full 7-sub-bite decomposition (per-CPU scheduler identity → lock shared structures →
+  per-CPU syscall stub → lock FS/devices → AP-runs-scheduler → flip) + the design review's mandatory
+  corrections are recorded in `docs/development/smp-arc-plan.md`. `check.sh` 11/11, agnsh-smoke PASS.
+  `build/agnos` 1,211,424 B.
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a

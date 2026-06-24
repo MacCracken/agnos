@@ -1838,8 +1838,8 @@ fn exec_redirect_selftest() {
     var got[8]; store64(&got, 0);
     var n = vfs_read(rfd, &got, 8);
     if (n == 2) { if (load8(&got) == 72) { if (load8(&got + 1) == 73) {
-        kprintln("redir: capture OK", 17); return 0;
-    } } }
+                kprintln("redir: capture OK", 17); return 0;
+            } } }
     kprintln("redir: FAIL capture", 19);
     return 0;
 }
