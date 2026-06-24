@@ -5,6 +5,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.45.17] — 2026-06-23
+
+### Fixed
+- **NIC RX ring is now drained from the timer ISR — fixes real-hardware packet loss**
+  (`kernel/arch/x86_64/pic.cyr` `timer_handler` + `kernel/core/net_ingress.cyr`). The RX ring was
+  serviced **only** while a ring-3 tool sat in its own `net_poll()` loop. During `sleep_ms` ping
+  pacing, between commands, and at the idle prompt the r8169 ring went unserviced, so on a live LAN
+  broadcast/multicast chatter overran the 64-deep ring (`missed`=FIFO-overflow) and the NIC dropped
+  frames — **including the tools' DNS/ICMP/TCP replies**. Iron signature (1.45.16 burn `14516_*`):
+  `yo google.com` → 2/4, **50% loss**; `dig google.com` → "no servers could be reached"; `whirl
+  https://google.com` → "connection failed". The bug was **invisible in QEMU** because SLIRP is
+  point-to-point and chatter-free, so the ring never filled — the "passes in QEMU, drops on iron" gap.
+- **Fix:** the 100 Hz `timer_handler` now calls a new `net_rx_drain()` every tick, so the ring stays
+  drained regardless of userland activity. `net_poll()` keeps its exact prior contract (TX retransmits
+  + RX drain) for all existing tool/recv-loop callers; `net_rx_drain()` is the RX-only inner loop,
+  factored out so the ISR issues **no TX** from interrupt context. A `net_poll_busy` re-entrancy guard
+  makes a timer tick that lands mid-drain (tool poll loops run IF=1 in the `sleep_ms` sti-window) a
+  no-op rather than re-enter and corrupt the shared `net_rx_pkt` / `r8169_rx_idx`; single-core + a
+  synchronous ISR ⇒ the flag fully serializes the two callers. Drains before `do_context_switch`
+  (kernel context established at ISR entry, pre-CR3-swap) and is `nic_ready()`-gated (no-op until the
+  NIC is up → early-boot ticks safe). **Validation:** QEMU regression-clean — boot-to-shell, `yo`/`dig`
+  0% loss on virtio, both DNS paths NOERROR, `check.sh` 11/11, `agnsh-smoke` PASS. The 50%→0% on real
+  hardware confirms on the next archaemenid burn (kernel-only change — rides `install-usb.sh --update`,
+  no agnos-fs mount-copy).
+
 ## [1.45.16] — 2026-06-23
 
 ### Added

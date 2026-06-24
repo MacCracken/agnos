@@ -111,11 +111,35 @@ fn ip_safe_payload_len(ip_total, ip_ihl, avail) {
     return total - ip_ihl;
 }
 
+# Tool / recv-loop entry point: TX retransmits + RX drain. The 100 Hz timer ISR
+# (timer_handler, pic.cyr) calls net_rx_drain() directly instead, so it never
+# issues TX from interrupt context.
 fn net_poll() {
     if (nic_ready() == 0) { return 0; }
     # B2: drive TCP retransmits before draining RX (cheap ≤8-conn scan; only
     # acts when a held segment's RTO has elapsed).
     tcp_retx_tick();
+    return net_rx_drain();
+}
+
+# RX-ring drain — guarded inner loop, shared by net_poll() (above) and the timer
+# ISR. Split out so the timer can keep the r8169 ring drained even when no ring-3
+# tool is in a poll loop: during sleep_ms pacing / between commands / idle the
+# ring went unserviced, so on a real LAN broadcast+multicast chatter overran the
+# 64-deep ring (missed=FIFO-overflow) and the NIC dropped frames — including the
+# tools' replies. That is the iron 50%-loss; QEMU's chatter-free point-to-point
+# SLIRP kept the ring empty so it never reproduced there. RX-only (no
+# tcp_retx_tick) so the ISR issues no TX and can't race a tool's in-flight
+# nic_send. net_poll_busy turns a timer tick landing mid-drain (tool poll loops
+# run IF=1 in the sleep_ms sti-window) into a no-op instead of re-entering and
+# corrupting net_rx_pkt / r8169_rx_idx; single-core + a synchronous ISR ⇒ the
+# flag fully serializes the two callers.
+var net_poll_busy = 0;
+
+fn net_rx_drain() {
+    if (net_poll_busy != 0) { return 0; }
+    if (nic_ready() == 0) { return 0; }
+    net_poll_busy = 1;
     # Drain the WHOLE RX ring per call, not one frame. FreeBSD re_rxeof and
     # iPXE realtek_poll both loop until the next NIC-owned descriptor; AGNOS
     # returned after the first good frame, so under LAN chatter the 16-deep
@@ -130,7 +154,7 @@ fn net_poll() {
     while (budget > 0) {
         budget = budget - 1;
         var pkt_len = nic_poll(&net_rx_pkt, 2048);
-        if (pkt_len < 14) { return drained; }   # ring empty (or runt) — done
+        if (pkt_len < 14) { net_poll_busy = 0; return drained; }   # ring empty (or runt) — done
         var et_hi = load8(&net_rx_pkt + 12);
         var et_lo = load8(&net_rx_pkt + 13);
         var ethertype = (et_hi << 8) | et_lo;
@@ -162,6 +186,7 @@ fn net_poll() {
         }
         drained = drained + 1;
     }
+    net_poll_busy = 0;
     return drained;
 }
 
