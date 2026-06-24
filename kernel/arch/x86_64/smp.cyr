@@ -35,31 +35,25 @@ fn spin_unlock() {
     return 0;
 }
 
-# === 1.46.x SMP sub-bite 3 — named subsystem locks + a parameterized spinlock ===
-# spin_lock_at(addr)/spin_unlock_at(addr) take the lock-variable ADDRESS so the named locks
-# share one implementation. SAME local layout as spin_lock/spin_unlock above (outer `old`,
-# inner `addr`): the param arrives in rdi and does NOT shift the local frame — the cr3_load
-# precedent (a param + local keeps the local at [rbp-8]) — so the hardcoded [rbp-N] offsets
-# hold; behaviorally confirmed because kmalloc (under heap_lock) is exercised on every boot
-# alloc, so a wrong offset triple-faults boot. xchg carries an IMPLICIT LOCK (atomic + full
-# fence). LOCK ORDER (acquire strictly low->high, never backwards; the design review corrected
-# the original pmm<heap to heap<pmm): heap_lock < pmm_lock — kmalloc holds heap_lock then
-# calls pmm_alloc (slab_grow), so pmm is the allocator LEAF and is HIGHEST. proctab_lock and
-# vfs_lock is SHORT, non-nesting (its critical section is a 4-iteration test-and-set with NO
-# calls inside — provably re-entry-free). RULE: critical sections stay short — never hold a
-# lock across a context switch, a blocking device poll, or a kprint that scrolls.
-# ⚠ RE-ENTRANCY HAZARD (found 2026-06-24): a spinlock DEADLOCKS on same-CPU re-entry where the
-# old preempt_disable COUNTER did not. heap_lock around kmalloc/kfree was tried + DEADLOCKED
-# the boot right after the FAT mount — some path re-enters kmalloc while heap_lock is held (the
-# re-entry site is subtle; not slab_grow/pmm/vmm, which were traced clean). So heap_lock is
-# DEFERRED until that re-entry is found + the lock is made re-entrancy-safe (recursive, or the
-# re-enter eliminated). Only locks around PROVABLY re-entry-free scopes are wired now (vfs).
-var heap_lock = 0;       # DEFERRED — see the re-entrancy hazard above (kmalloc re-enters it)
+# === 1.46.x SMP sub-bite 3 — named subsystem locks (FIXED-GLOBAL xchg spinlocks) ===
+# ⚠ A PARAMETERIZED spin_lock_at(addr) is BROKEN here and was removed: cyrius spills the param
+# to the local frame, which SHIFTS the `old`/`addr` locals off the hardcoded [rbp-N] offsets
+# the asm uses — so the asm read its "addr" from the slot holding `old` (=1) and xchg'd ADDRESS
+# 1 (low memory), locking a bogus address. It only "passed" for vfs because [1] happened to be
+# 0; it DEADLOCKED in kmalloc once [1] became 1 (root-caused 2026-06-24 via the QEMU monitor:
+# RIP in the spin loop, RAX=1 = the xchg target). FIX = one FIXED-GLOBAL lock fn pair per lock,
+# each structurally identical to the proven pmm_spin_lock (NO parameter → frame matches spin_lock
+# → the [rbp-N] offsets are correct). xchg carries an IMPLICIT LOCK (atomic + full fence).
+# LOCK ORDER (acquire low->high, never backwards): heap_lock < pmm_lock — kmalloc holds heap_lock
+# then calls pmm_alloc (slab_grow), so pmm is the allocator LEAF and is HIGHEST. proctab_lock +
+# vfs_lock are SHORT, non-nesting. RULE: critical sections stay short — never hold a lock across
+# a context switch, a blocking poll, or a kprint that scrolls.
+var heap_lock = 0;
 var vfs_lock = 0;
-fn spin_lock_at(lockaddr) {
+fn heap_spin_lock() {
     var old = 1;
     while (old == 1) {
-        var addr = lockaddr;
+        var addr = &heap_lock;
         asm {
             0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
             0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
@@ -69,8 +63,30 @@ fn spin_lock_at(lockaddr) {
     }
     return 0;
 }
-fn spin_unlock_at(lockaddr) {
-    var addr = lockaddr;
+fn heap_spin_unlock() {
+    var addr = &heap_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+fn vfs_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &vfs_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn vfs_spin_unlock() {
+    var addr = &vfs_lock;
     asm {
         0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
         0x48; 0x31; 0xC9;              # xor rcx, rcx

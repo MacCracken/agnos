@@ -81,13 +81,18 @@ fn kmalloc(size) {
     var class_idx = slab_class_for(size);
     if (class_idx < 0) { return 0; }
 
+    # 1.46.x SMP sub-bite 3: serialize the free-list RMW (+ slab_grow, which runs UNDER this
+    # lock and acquires pmm_lock — heap < pmm, the leaf-last order). slab_grow does NOT call
+    # kmalloc/kfree (traced: pmm_alloc/vmm_map only), so no re-entry. Fixed-global lock (no
+    # param → correct frame offsets, unlike the removed spin_lock_at). Single-core: no-op.
+    heap_spin_lock();
     # Check free list
     var head = load64(&slab_free + class_idx * 8);
     if (head == 0) {
         # No free blocks — grow the slab
-        if (slab_grow(class_idx) < 0) { return 0; }
+        if (slab_grow(class_idx) < 0) { heap_spin_unlock(); return 0; }
         head = load64(&slab_free + class_idx * 8);
-        if (head == 0) { return 0; }
+        if (head == 0) { heap_spin_unlock(); return 0; }
     }
 
     # Pop first free block
@@ -104,6 +109,7 @@ fn kmalloc(size) {
     # slab_grow's page-zero + kfree_sized's full scrub. (1.42.5 heap-zeroing.)
     store64(head, 0);
     heap_allocs = heap_allocs + 1;
+    heap_spin_unlock();
     return head;
 }
 
@@ -127,10 +133,13 @@ fn kfree_sized(ptr, size) {
     for (var i = 0; i < zero_len; i = i + 8) {
         store64(ptr + i, 0);
     }
-    # Push onto free list
+    # Push onto free list (1.46.x SMP sub-bite 3: under heap_lock; the scrub above is on the
+    # caller-owned block, so it stays outside the lock — short critical section).
+    heap_spin_lock();
     var head = load64(&slab_free + class_idx * 8);
     store64(ptr, head);
     store64(&slab_free + class_idx * 8, ptr);
     heap_frees = heap_frees + 1;
+    heap_spin_unlock();
     return 0;
 }

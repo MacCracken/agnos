@@ -61,17 +61,17 @@ fn vfs_sec_wfile_alloc_slot() {
     # (provably re-entry-free — unlike the kmalloc heap_lock that deadlocked, see smp.cyr), so it
     # is deadlock-safe. Single-core: behaviorally identical (both serialize same-CPU). Release of
     # an allocated slot is a single atomic store64 elsewhere — no lock needed there.
-    spin_lock_at(&vfs_lock);
+    vfs_spin_lock();
     var i = 0;
     while (i < 4) {
         if (load64(&sec_wfile_inuse + i * 8) == 0) {
             store64(&sec_wfile_inuse + i * 8, 1);
-            spin_unlock_at(&vfs_lock);
+            vfs_spin_unlock();
             return i;
         }
         i = i + 1;
     }
-    spin_unlock_at(&vfs_lock);
+    vfs_spin_unlock();
     return 0 - 1;
 }
 
