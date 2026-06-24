@@ -152,6 +152,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **★ This completes sub-bite 4 — the per-CPU SYSCALL stub (4a split + 4b kstack/RSP + 4c CR3/capture + 4d
   guard), the SMP arc's hardest piece, is fully done. Remaining: sub-bite 5 (lock FS/devices/console),
   6 (AP runs the scheduler), 7 (the iron-gated wake flip).**
+- **SMP arc sub-bite 5 PHASE 1 — coarse non-ISR subsystem locks** (`smp.cyr`/`vfs.cyr`/`syscall.cyr`/`nvme.cyr`/`ahci.cyr`/`kprint.cyr`/`net_icmp.cyr`).
+  A 4-subsystem locking-map workflow classified every shared mutable structure on the FS/block/net/console
+  paths by ISR-exposure and produced a verified plan (global lock order: `fs < tcp < vfs < proctab <
+  console < input < nvme < ahci < heap < pmm`). PHASE 1 wires the four **pure non-ISR plain spinlocks**
+  (grep-proved no timer/`net_rx_drain`/xHCI/fault handler touches them → no cli/sti, INERT single-core):
+  **`fs_lock`** (one coarse lock at the VFS-dispatch boundary covering all ext2/fat/exfat scratch buffers +
+  jbd2 + caches, held across blocking device polls — safe precisely because no ISR touches FS), **`nvme_lock`**
+  + **`ahci_lock`** (whole-controller, polling-only), **`console_lock`** (at `kprint`/`kputc`/`kprintln`).
+  The fs_lock re-entry safety rests on a call-graph proof (the ext2/fat/exfat backends are leaves w.r.t. the
+  VFS boundary; the lone `vfs_close→flush→vfs_write_on` nest is single-acquire because `vfs_write_on` stays a
+  helper) and the console_lock on the "no ISR calls kprint" invariant — which was actually **restored** by
+  routing two ISR-reachable `net_handle_icmp` diagnostics to `serial_println` (a real latent issue the map
+  surfaced). Lock fns are byte-copies of the proven no-param `pmm_spin_lock`.
+  - **Process:** worktree-implemented incrementally (build + agnsh-smoke after each lock so a deadlock
+    isolates), three-lens adversarial review (re-entry/nesting, order/missed-unlock, console-invariant/
+    inertness) — all SOUND, zero fatal bugs. Re-verified on main: agnsh + check.sh 11/11 + exec (FS write
+    through fs_lock + device locks) + fat-write (the vfs flush nest) + ring3 all green. The map flagged the
+    **timer ISR actually transmits** (so several net structures need cli/sti — net-revisit scope) and a few
+    future-SMP races (link#32, nvme fast path, lseek#58) to fix before the wake flip; both inert now.
+    **Remaining sub-bite 5: the ISR-touched `input_lock` (kb_buf, cli/sti) + net cli/sti family.**
+    `build/agnos` 1,218,464 B.
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a

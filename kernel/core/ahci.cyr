@@ -692,7 +692,21 @@ fn ahci_print_id_string(id_buf, off, len) {
 
 # --- Issue IDENTIFY DEVICE on one port -------------------------------
 
+# SMP sub-bite 5: whole-HBA lock via the INNER-WRAPPER pattern. ahci_identify_device
+# has 6 return points (idle-fail, 2x pmm-alloc-fail, task-file ERR, timeout, success)
+# and heavy kprint on the success path — a hand-placed unlock at every return is
+# error-prone, so the body is ahci_identify_device_inner and this thin wrapper does
+# ONE lock/unlock around it (single acquire/release, no multi-return-unlock hazard).
+# Runs ONLY at single-core boot probe (before APs exist), so the success-path kprint
+# under ahci_lock (console < ahci backward) is a boot-only residual with no cycle
+# (console-lock holders never do device I/O). Polling-only HBA (never writes PxIE).
 fn ahci_identify_device(port) {
+    ahci_spin_lock();
+    var r = ahci_identify_device_inner(port);
+    ahci_spin_unlock();
+    return r;
+}
+fn ahci_identify_device_inner(port) {
     if (ahci_present == 0) { return 0; }
     if (port < 0) { return 0; }
     if (port >= AHCI_MAX_PORTS) { return 0; }
@@ -923,7 +937,20 @@ fn ahci_build_rw_fis(ct_phys, opcode, lba, count) {
 # Internal common path for READ/WRITE DMA EXT. Returns 1 on success,
 # 0 on any failure (PxCI never set, task-file ERR, timeout).
 
+# SMP sub-bite 5: whole-HBA lock via the INNER-WRAPPER pattern (4 return points after
+# the lock point — single lock/unlock around the inner body avoids hand-placing an
+# unlock at each). Locks at the TOP (before ahci_port_wait_idle) so the check-then-act
+# TOCTOU on PxCI is closed. Slot-0 command list/table/PRDT/FIS + PxCI are shared HBA
+# state. Polling-only HBA (never writes PxIE, no MSI/IDT vector → no ISR contends).
+# fs_lock is held ABOVE this when FS reads/writes a block (fs < ahci, forward order).
+# No kprint inside → no console-order concern.
 fn ahci_issue_rw(port, opcode, lba, count, data_phys, is_write) {
+    ahci_spin_lock();
+    var r = ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write);
+    ahci_spin_unlock();
+    return r;
+}
+fn ahci_issue_rw_inner(port, opcode, lba, count, data_phys, is_write) {
     if (ahci_present == 0) { return 0; }
     if (port < 0) { return 0; }
     if (port >= AHCI_MAX_PORTS) { return 0; }
@@ -1017,7 +1044,15 @@ fn ahci_write_lba(port, lba, count, buf) {
 # and the completion poll uses the generous flush ceiling. Returns 1 on
 # success, 0 on PxTFD.ERR / stuck CI / timeout. 1.33.5 fsync barrier
 # (per flush-cache-prior-art.md § 2.2).
+# SMP sub-bite 5: whole-HBA lock via the INNER-WRAPPER pattern (same multi-return
+# rationale as ahci_issue_rw). No kprint inside → no console-order concern.
 fn ahci_issue_nodata(port, opcode) {
+    ahci_spin_lock();
+    var r = ahci_issue_nodata_inner(port, opcode);
+    ahci_spin_unlock();
+    return r;
+}
+fn ahci_issue_nodata_inner(port, opcode) {
     if (ahci_present == 0) { return 0; }
     if (port < 0) { return 0; }
     if (port >= AHCI_MAX_PORTS) { return 0; }

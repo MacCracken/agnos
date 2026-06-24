@@ -53,8 +53,15 @@ fn net_handle_icmp(pkt, icmp_off, icmp_len, src_ip) {
         return 0;
     }
     # Basic error awareness — no socket-delivery path yet, so just surface it.
-    if (t == 3) { kprintln("icmp: dest unreachable", 22); }
-    if (t == 11) { kprintln("icmp: time exceeded", 19); }
+    # SMP sub-bite 5 (console_lock): net_handle_icmp is reachable FROM THE TIMER ISR
+    # (timer_handler -> net_rx_drain -> net_handle_icmp), so it MUST NOT call the
+    # console_lock'd line emitters (kprint/kputc/kprintln) — a timer tick landing
+    # while a thread holds console_lock would same-CPU DEADLOCK on the re-acquire.
+    # Route these two diagnostics to serial_println, which is pure UART port I/O
+    # (stateless, no fb cursor / ANSI parser / klug — NOT under console_lock). This
+    # preserves the console_lock invariant "no ISR calls kprint" (grep-verified).
+    if (t == 3) { serial_println("icmp: dest unreachable", 22); }
+    if (t == 11) { serial_println("icmp: time exceeded", 19); }
     return 0;
 }
 

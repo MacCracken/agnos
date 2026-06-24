@@ -121,6 +121,136 @@ fn proctab_spin_unlock() {
     return 0;
 }
 
+# === 1.46.x SMP sub-bite 5 PHASE 1 — pure non-ISR coarse subsystem locks ===
+# FOUR more FIXED-GLOBAL xchg spinlocks (each a byte-copy of pmm_spin_lock /
+# pmm_spin_unlock with the lock global renamed — NO parameter, so the asm [rbp-N]
+# offsets are the proven-correct old@[rbp-0x08]/addr@[rbp-0x10]). All four are PURE
+# NON-ISR (a 4-subsystem locking-map grep proved no timer/net_rx_drain/xHCI-hid_poll/
+# fault handler touches any of these), so they are PLAIN spinlocks (NO cli/sti) and
+# INERT single-core (the xchg always wins uncontended → byte-identical boot).
+#
+# GLOBAL LOCK ORDER (acquire low->high, never backwards):
+#   fs_lock < vfs_lock < proctab_lock < console_lock < nvme_lock < ahci_lock < heap_lock < pmm_lock
+# fs_lock is the OUTERMOST FS lock: an FS op that reads a block takes fs_lock, then
+# (inside, via blk_read_on) nvme_lock/ahci_lock, then (via kmalloc) heap_lock then
+# pmm_lock — all forward (fs < nvme/ahci < heap < pmm). console_lock sits between
+# proctab and nvme; FS code that kprints (fs held) acquires console forward (fs<console).
+#
+# RE-ENTRY PROOFS (load-bearing — a plain same-CPU re-acquire DEADLOCKS):
+#  * fs_lock: the locked boundary fns (vfs_read/vfs_write FS arms, vfs_open_on,
+#    vfs_read_file, vfs_read_file_at, vfs_print_dir_on, vfs_close, and the ext2/FAT/
+#    exFAT path-mutation syscall arms) NEVER call another locked boundary fn while
+#    holding fs_lock. The ext2/fat/exfat BACKENDS are leaves w.r.t. the VFS boundary
+#    (grep: zero vfs_* boundary calls in ext2.cyr/fatfs.cyr/exfat.cyr). The one
+#    intra-vfs nest, vfs_close -> vfs_sec_wfile_flush -> vfs_write_on, is SAFE:
+#    vfs_write_on is a HELPER, not an fs_lock boundary (never independently locked).
+#  * console_lock: locked ONLY at the three line emitters kprint/kputc/kprintln —
+#    they do NOT call each other (kprintln/kputc/kprint each call serial_*/fb_*/klug_*
+#    directly), so no double-acquire. kprint_num/kprint_byte/kprint_hex call kprint
+#    and are therefore NOT locked (they'd double-acquire). The "no ISR calls kprint"
+#    invariant held by grep AFTER routing the two ISR-reachable net_handle_icmp
+#    diagnostics to serial_println (see net_icmp.cyr) — every other kprint reachable
+#    from timer_handler/net_rx_drain is in init/discover flow, not the rx-handler path.
+#  * nvme_lock: locked at nvme_blk_read/nvme_blk_write/nvme_read_sectors — these do
+#    NOT call each other (each calls nvme_read_lba/nvme_write_lba/nvme_rw_internal,
+#    none locked). nvme_blk_read_sectors (UNWRAPPED) calls the wrapped leaves
+#    sequentially — no nest.
+#  * ahci_lock: locked at ahci_issue_rw/ahci_issue_nodata/ahci_identify_device.
+#    ahci_issue_rw/nodata do not call each other or identify; ahci_blk_read/write
+#    (unwrapped) call ahci_issue_rw once — no nest.
+var fs_lock = 0;
+var console_lock = 0;
+var nvme_lock = 0;
+var ahci_lock = 0;
+fn fs_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &fs_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn fs_spin_unlock() {
+    var addr = &fs_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+fn console_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &console_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn console_spin_unlock() {
+    var addr = &console_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+fn nvme_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &nvme_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn nvme_spin_unlock() {
+    var addr = &nvme_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+fn ahci_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &ahci_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn ahci_spin_unlock() {
+    var addr = &ahci_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+
 # AP entry point — called after the trampoline transitions to long mode.
 # 1.44.18 WAKE + PARK: the AP comes online, reports in, and PARKS — it must NOT arm
 # its APIC timer and must NOT sti. A second CPU taking timer interrupts would run

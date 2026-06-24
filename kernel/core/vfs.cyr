@@ -350,12 +350,27 @@ fn vfs_ext2_parent(path, pathlen) {
 # (not handled by these — the caller routes ext2 itself). These supersede the
 # vfs_*_secondary helpers, which routed by vfs_secondary_select (ext2-flag era)
 # and are kept only for any remaining single-primary callers.
+# SMP sub-bite 5 (fs_lock): the FAT/exFAT path-mutation helpers each take fs_lock via
+# INNER-WRAPPER (multiple returns) — they are the path-mutation boundary for FAT/exFAT
+# (the ext2 path-mutations are locked at the syscall arm instead, since ext2_* are
+# called directly there). Each is a LEAF w.r.t. the VFS boundary (calls fatfs_*/exfat_*
+# only, which never call back into a locked vfs_* boundary fn → no double-acquire).
+# vfs_write_on is NOT locked here: it is reached (a) from vfs_close (already fs_lock
+# held) -> would double-acquire, and (b) it is otherwise a helper, never a syscall
+# entry. Leaving it unlocked keeps the vfs_close flush path single-acquire.
 fn vfs_create_on(be, name, namelen) {
+    fs_spin_lock();
+    var r = vfs_create_on_inner(be, name, namelen);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_create_on_inner(be, name, namelen) {
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
     if (be == FS_FAT)   { return fatfs_create(name, namelen); }
     if (be == FS_EXFAT) { return exfat_create(name, namelen); }
     return 0 - 1;
 }
+# vfs_write_on: UNLOCKED (helper reached under fs_lock from vfs_close; see note above).
 fn vfs_write_on(be, name, namelen, src, len) {
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
     if (be == FS_FAT)   { return fatfs_write_file(name, namelen, src, len); }
@@ -363,31 +378,64 @@ fn vfs_write_on(be, name, namelen, src, len) {
     return 0 - 1;
 }
 fn vfs_delete_on(be, name, namelen) {
+    fs_spin_lock();
+    var r = vfs_delete_on_inner(be, name, namelen);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_delete_on_inner(be, name, namelen) {
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
     if (be == FS_FAT)   { return fatfs_delete(name, namelen); }
     if (be == FS_EXFAT) { return exfat_delete(name, namelen); }
     return 0 - 1;
 }
 fn vfs_mkdir_on(be, name, namelen) {
+    fs_spin_lock();
+    var r = vfs_mkdir_on_inner(be, name, namelen);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_mkdir_on_inner(be, name, namelen) {
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
     if (be == FS_FAT)   { return fatfs_mkdir(name, namelen); }
     if (be == FS_EXFAT) { return exfat_mkdir(name, namelen); }
     return 0 - 1;
 }
 fn vfs_rmdir_on(be, name, namelen) {
+    fs_spin_lock();
+    var r = vfs_rmdir_on_inner(be, name, namelen);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_rmdir_on_inner(be, name, namelen) {
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
     if (be == FS_FAT)   { return fatfs_rmdir(name, namelen); }
     if (be == FS_EXFAT) { return exfat_rmdir(name, namelen); }
     return 0 - 1;
 }
 fn vfs_rename_on(be, oldname, oldlen, newname, newlen) {
+    fs_spin_lock();
+    var r = vfs_rename_on_inner(be, oldname, oldlen, newname, newlen);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_rename_on_inner(be, oldname, oldlen, newname, newlen) {
     if (vfs_sec_name_ok(oldlen) == 0) { return 0 - 1; }
     if (vfs_sec_name_ok(newlen) == 0) { return 0 - 1; }
     if (be == FS_FAT)   { return fatfs_rename(oldname, oldlen, newname, newlen); }
     if (be == FS_EXFAT) { return exfat_rename(oldname, oldlen, newname, newlen); }
     return 0 - 1;
 }
+# SMP sub-bite 5 (fs_lock): INNER-WRAPPER — fatfs_open/exfat_open use the fatfs/exfat
+# scratch buffers + FAT single-entry caches. Multiple returns → one lock/unlock around
+# the inner body. Leaf w.r.t. the boundary (the FS backends never call a locked VFS fn).
 fn vfs_open_on(be, name, namelen) {
+    fs_spin_lock();
+    var r = vfs_open_on_inner(be, name, namelen);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_open_on_inner(be, name, namelen) {
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
     if (be == FS_FAT)   { return fatfs_open(name, namelen); }
     if (be == FS_EXFAT) { return exfat_open(name, namelen); }
@@ -396,7 +444,16 @@ fn vfs_open_on(be, name, namelen) {
 # Root-only directory listing for a FAT/exFAT mount (subdir `ls` on FAT/exFAT
 # is a deferred follow-on; the backends list their root). Returns entry count
 # or -1.
+# SMP sub-bite 5 (fs_lock): INNER-WRAPPER — fatfs_ls/exfat_print_dir walk the dir
+# scratch buffers. NOTE: these backends kprint the listing (fs_lock held -> console
+# forward order fs<console, safe). Multiple returns → one lock/unlock.
 fn vfs_print_dir_on(be) {
+    fs_spin_lock();
+    var r = vfs_print_dir_on_inner(be);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_print_dir_on_inner(be) {
     if (be == FS_FAT)   { return fatfs_ls(); }
     if (be == FS_EXFAT) { return exfat_print_dir(); }
     return 0 - 1;
@@ -414,7 +471,17 @@ fn vfs_print_dir_on(be) {
 # Precedence mirrors `cat`: ext2 first when mounted, else the selected
 # secondary FS. initrd is intentionally NOT covered here (its programs already
 # exec from memory via the boot path).
+# SMP sub-bite 5 (fs_lock): INNER-WRAPPER — whole-file read resolves path->inode and
+# reads via ext2_read_at / fatfs_read / exfat_read (all FS scratch). Many returns →
+# one lock/unlock. This is the exec-from-disk load primitive (elf.cyr), so it must be
+# robust; leaf w.r.t. the VFS boundary.
 fn vfs_read_file(path, namelen, dst, cap) {
+    fs_spin_lock();
+    var r = vfs_read_file_inner(path, namelen, dst, cap);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_read_file_inner(path, namelen, dst, cap) {
     if (dst == 0)   { return 0 - 1; }
     if (cap <= 0)   { return 0 - 1; }
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
@@ -472,7 +539,16 @@ fn vfs_read_file(path, namelen, dst, cap) {
 # only ext2 supports (ext2_read_at takes an offset); FAT/exFAT read from the
 # chain start only, so exec-from-FAT/exFAT is a follow-on (the agnos-fs root
 # is ext2, so this covers the real case). Both return -1 outside ext2.
+# SMP sub-bite 5 (fs_lock): INNER-WRAPPER — offset read used by the streaming ELF
+# loader (elf.cyr reads the header then each PT_LOAD). ext2 only. Many returns →
+# one lock/unlock around the inner body.
 fn vfs_read_file_at(path, namelen, offset, dst, len) {
+    fs_spin_lock();
+    var r = vfs_read_file_at_inner(path, namelen, offset, dst, len);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_read_file_at_inner(path, namelen, offset, dst, len) {
     if (dst == 0)    { return 0 - 1; }
     if (len <= 0)    { return 0 - 1; }
     if (offset < 0)  { return 0 - 1; }
@@ -663,14 +739,21 @@ fn vfs_read(fd_idx, buf, count) {
         return pipe_read(base, buf, count);
     }
     if (ftype == VFS_EXT2_FILE) {
+        # SMP sub-bite 5 (fs_lock): the FS arm — ext2_read_at touches the shared
+        # ext2 scratch buffers (sb/bgdt/inode/block/indirect/extent). fs_lock is
+        # the OUTERMOST FS lock: ext2_read_at -> blk_read_on -> nvme/ahci (fs<nvme,
+        # forward) and any kmalloc -> heap<pmm (forward). RE-ENTRY-SAFE: ext2_read_at
+        # never calls a locked VFS boundary fn (ext2.cyr is a leaf w.r.t. the boundary).
+        fs_spin_lock();
         var pos       = kpayload(base, 0);
         var fsize     = kpayload(base, 1);
         var inode_num = kpayload(base, 2);
-        if (pos >= fsize) { return 0; }
+        if (pos >= fsize) { fs_spin_unlock(); return 0; }
         var avail = fsize - pos;
         if (count > avail) { count = avail; }
         var n = ext2_read_at(inode_num, pos, buf, count);
         if (n > 0) { kpayload_set(base, 0, pos + n); }
+        fs_spin_unlock();
         return n;
     }
     return 0 - 1;
@@ -696,6 +779,11 @@ fn vfs_write(fd_idx, buf, count) {
         # via ext2_write_at, advance pos, grow the cached size. Mirror of
         # the VFS_EXT2_FILE read arm. (On a write-unsafe mount ext2_write_at
         # returns -1, propagated here.)
+        # SMP sub-bite 5 (fs_lock): the heaviest FS path — ext2_write_at touches the
+        # ext2 scratch buffers, the bgdt/bitmap caches, AND the jbd2 single-transaction
+        # state, then descends through blk_write_on -> nvme/ahci and kmalloc -> heap/pmm
+        # (all forward order). Leaf w.r.t. the VFS boundary → re-entry-safe.
+        fs_spin_lock();
         var pos       = kpayload(base, 0);
         var inode_num = kpayload(base, 2);
         var n = ext2_write_at(inode_num, pos, buf, count);
@@ -703,12 +791,17 @@ fn vfs_write(fd_idx, buf, count) {
             kpayload_set(base, 0, pos + n);
             if (pos + n > kpayload(base, 1)) { kpayload_set(base, 1, pos + n); }
         }
+        fs_spin_unlock();
         return n;
     }
     if (ftype == VFS_SEC_WFILE) {
         # 1.41.7 — FAT/exFAT write-back fd: buffer the bytes; the whole file is
-        # flushed to the backend at close (vfs_sec_wfile_flush).
-        return vfs_sec_wfile_write(base, buf, count);
+        # flushed to the backend at close (vfs_sec_wfile_flush). Buffers into the
+        # shared sec_wfile_buf pool → fs_lock. vfs_sec_wfile_write is a leaf.
+        fs_spin_lock();
+        var swr = vfs_sec_wfile_write(base, buf, count);
+        fs_spin_unlock();
+        return swr;
     }
     return 0 - 1;
 }
@@ -819,7 +912,19 @@ fn flock_release_pid(pid) {                     # proc exit: drop ALL of pid's l
     return 0;
 }
 
+# SMP sub-bite 5 (fs_lock): INNER-WRAPPER. vfs_close flushes a FAT/exFAT write-back fd
+# (vfs_sec_wfile_flush -> vfs_write_on -> fatfs/exfat backend = FS scratch). RE-ENTRY
+# PROOF: vfs_write_on is a HELPER, NOT an fs_lock boundary (never independently locked),
+# so vfs_close -> vfs_sec_wfile_flush -> vfs_write_on does NOT double-acquire. flock_*
+# touch only the small flock table (no FS scratch, no recursion). Many returns → one
+# lock/unlock. Callers (proc exit, vfs_create_pipe cleanup) do not hold fs_lock.
 fn vfs_close(fd_idx) {
+    fs_spin_lock();
+    var r = vfs_close_inner(fd_idx);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_close_inner(fd_idx) {
     if (fd_idx < 0) { return 0 - 1; }
     if (fd_idx >= 32) { return 0 - 1; }
     var base = &vfs_table + fd_idx * 32;

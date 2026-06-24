@@ -818,9 +818,17 @@ fn nvme_write_lba(lba, buf) {
 fn nvme_read_sectors(lba, count, buf) {
     if (nvme_io_ready == 0) { return 0; }
     if (count == 0) { return 0; }
+    # SMP sub-bite 5: whole-controller lock around submit+poll (PRP list scratch +
+    # the IO SQ/CQ are shared). Polling-only, no ISR. nvme_blk_read_sectors calls
+    # this UNWRAPPED, so there is no nvme_lock nest. The error-path kprint runs
+    # under nvme_lock -> console_lock (console < nvme is backward in the global
+    # order, but console-lock holders never do device I/O, so no cycle forms;
+    # documented residual on the device-FAILURE path only).
+    nvme_spin_lock();
     var bytes = count * nvme_ns1_lba_bytes;
     var st = nvme_rw_internal(0x02, lba, count - 1, buf, bytes);
     if (st != 0) {
+        nvme_spin_unlock();
         kprint("nvme: read_sectors LBA ", 23);
         kprint_num(lba);
         kprint(" count=", 7);
@@ -830,6 +838,7 @@ fn nvme_read_sectors(lba, count, buf) {
         kprintln("", 0);
         return 0;
     }
+    nvme_spin_unlock();
     return 1;
 }
 
@@ -964,22 +973,30 @@ fn nvme_rw_demo() {
 
 fn nvme_blk_read(sector, buf) {
     if (nvme_io_ready == 0) { return 0 - 1; }
-    if (nvme_read_lba(sector, nvme_read_scratch) == 0) { return 0 - 1; }
+    # SMP sub-bite 5: whole-controller lock — bounce(scratch)+PRP+submit+poll+copy-out
+    # is one atomic section (nvme_read_scratch is a shared bounce page). Polling-only
+    # (IO-CQ IEN=0, no MSI/IDT vector), so no ISR contends → plain spinlock is safe.
+    # fs_lock is held ABOVE this when FS reads a block (fs < nvme, forward order).
+    nvme_spin_lock();
+    if (nvme_read_lba(sector, nvme_read_scratch) == 0) { nvme_spin_unlock(); return 0 - 1; }
     # Copy LBA bytes from scratch into caller's buffer. 8-byte stride
     # mirrors virtio_blk's loop — 512 / 8 = 64 iterations.
     for (var i = 0; i < 64; i = i + 1) {
         store64(buf + i * 8, load64(nvme_read_scratch + i * 8));
     }
+    nvme_spin_unlock();
     return 0;
 }
 
 fn nvme_blk_write(sector, buf) {
     if (nvme_io_ready == 0) { return 0 - 1; }
+    nvme_spin_lock();
     # Copy caller's buffer into page-aligned scratch first.
     for (var i = 0; i < 64; i = i + 1) {
         store64(nvme_read_scratch + i * 8, load64(buf + i * 8));
     }
-    if (nvme_write_lba(sector, nvme_read_scratch) == 0) { return 0 - 1; }
+    if (nvme_write_lba(sector, nvme_read_scratch) == 0) { nvme_spin_unlock(); return 0 - 1; }
+    nvme_spin_unlock();
     return 0;
 }
 

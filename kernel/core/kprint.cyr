@@ -4,25 +4,43 @@
 # framebuffer. Either is safe to call before its backend is up:
 # - serial_* no-ops if UART not initialized
 # - fb_putc no-ops if fb_console_ready == 0 or fb_phys == 0
+# SMP sub-bite 5 PHASE 1 — console_lock wraps the THREE line emitters (kputc/kprint/
+# kprintln) so the fb cursor/scroll state + the stateful ANSI/CSI/SGR parser (fb_*)
+# + the klug ring buffer are mutated atomically per emit. Locked HERE (line level),
+# NOT inside fb_putc per-char — the whole serial+fb+scroll+klug run is one held
+# section. RE-ENTRY PROOF: these three do NOT call each other (each calls serial_*/
+# fb_*/klug_* directly), so no double-acquire. kprint_num/kprint_byte/kprint_hex
+# (below) call kprint and are therefore deliberately NOT locked — locking them too
+# would double-acquire. SAFE ONLY while "no ISR calls kprint" holds: grep-verified
+# after routing the two ISR-reachable net_handle_icmp diagnostics to serial_println
+# (net_icmp.cyr); the timer ISR is otherwise console-silent, kb_isr is asm-only, and
+# the fault handlers paint raw CMOS then halt. ORDER: console_lock sits between
+# proctab and nvme; FS code that kprints (fs_lock held) acquires console forward.
 fn kputc(ch) {
+    console_spin_lock();
     serial_putc(ch);
     fb_putc(ch);
     klug_putc(ch);            # unify into the klug ring buffer (core/klug.cyr)
+    console_spin_unlock();
     return 0;
 }
 
 fn kprint(buf, len) {
+    console_spin_lock();
     serial_print(buf, len);
     fb_print(buf, len);
     klug_append(buf, len);
+    console_spin_unlock();
     return 0;
 }
 
 fn kprintln(buf, len) {
+    console_spin_lock();
     serial_println(buf, len);
     fb_println(buf, len);
     klug_append(buf, len);    # capture the line + the newline serial/fb_println add
     klug_putc(10);
+    console_spin_unlock();
     return 0;
 }
 
