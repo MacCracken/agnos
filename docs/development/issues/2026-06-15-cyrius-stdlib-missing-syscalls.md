@@ -7,6 +7,14 @@
 That work is tracked separately in `2026-06-18-cyrius-agnos-server-socket-peer.md`. The
 `setsockopt`/`shutdown` socket-options in §2 remain genuinely optional. Everything else here
 stays correctly fail-closed/steady-state.
+**Update 2026-06-24**: §1's **fd-redirect (the "high-value one") is RESOLVED** — `exec_redirect`#62
+landed (agnos 1.46.x): a one-shot fd redirect armed before `execwait`#37 routes the child's writes
+to a chosen fd (e.g. 1=stdout) into an open file/pipe, so a parent can **capture** a tool's output
+and read it back after #37 returns (save/swap/restore of the global `vfs_table` entry around the
+run-to-completion child run — no per-proc fd layer). `argv`+`envp` on `execwait`#37 already shipped
+(1.43.7 / 1.44.19). The remaining §1 items (`fork`, `chdir`, `dup2` for the *non-blocking* spawn#3)
+stay out-of-scope by the cooperative-single-CR3 design as recommended below. Validated:
+`EXEC_REDIRECT_SELFTEST` + `scripts/exec-redirect-smoke.sh` (`redir: capture OK`).
 **Date**: 2026-06-15
 **From**: cyrius 6.2.7 (the stdlib agnos-completeness pass that resolved sandhi's
 filed cascade — see cyrius `docs/development/issues/2026-06-15-cyrius-thread-agnos-clone-dispatch.md`).

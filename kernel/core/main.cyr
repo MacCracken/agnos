@@ -1818,6 +1818,34 @@ fn fs_syscall_selftest() {
 fs_syscall_selftest();
 #endif
 
+# 1.46.x — fd-redirect (exec_redirect#62) capture self-test (compile-gated, EXEC_REDIRECT_SELFTEST=1).
+# Validates the capture mechanism end-to-end WITHOUT a child ELF: create a pipe, arm a redirect of
+# fd 20 -> the pipe write end, apply it, write "HI" to fd 20 (must route to the pipe, NOT the
+# console), restore, then read the pipe's read end and assert "HI". The execwait#37 hook uses the
+# SAME exec_redirect_apply/restore around the child run, so this proves a redirected fd's writes
+# land in the dst backend. fd 20 avoids the pipe's own freshly-allocated fds.
+#ifdef EXEC_REDIRECT_SELFTEST
+fn exec_redirect_selftest() {
+    var fds[16];
+    if (vfs_create_pipe(&fds) != 0) { kprintln("redir: FAIL pipe", 16); return 0; }
+    var rfd = load64(&fds);
+    var wfd = load64(&fds + 8);
+    var msg[8]; store8(&msg, 72); store8(&msg + 1, 73);    # "HI"
+    redir_src_fd = 20; redir_dst_fd = wfd; redir_pending = 1;
+    exec_redirect_apply();
+    vfs_write(20, &msg, 2);                                  # routes to the pipe write end via slot 20
+    exec_redirect_restore();
+    var got[8]; store64(&got, 0);
+    var n = vfs_read(rfd, &got, 8);
+    if (n == 2) { if (load8(&got) == 72) { if (load8(&got + 1) == 73) {
+        kprintln("redir: capture OK", 17); return 0;
+    } } }
+    kprintln("redir: FAIL capture", 19);
+    return 0;
+}
+exec_redirect_selftest();
+#endif
+
 # 1.44.x — NON-BLOCKING cooked-line read self-test (compile-gated, NBREAD_SELFTEST=1).
 # Validates kbd_read_nonblock's poll semantics WITHOUT a real keyboard by injecting
 # scancodes straight into kb_buf (the same ring kb_isr/hid_poll fill): (1) no input ->

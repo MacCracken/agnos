@@ -38,6 +38,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `exec_preempt=1` (a later bite) makes agnsh preemptive. Validated: `ring3-smoke` 8/8 (IF=1 procs
   take real preempts onto distinct region-7 stacks — a misplaced stack would #DF the preempt),
   `agnsh-smoke` PASS, `check.sh` 11/11, `thread-smoke` PASS. `build/agnos` 1,210,368 B.
+- **Bite 2 — IF=1 preemptive `agnsh` re-enabled (`exec_preempt=1`, `kernel/user/init.cyr`).** agnsh
+  again launches preemptible (IF=1) so the 100 Hz timer time-slices its prompt against `&` background
+  jobs (`enter_ring3` consumes the flag, so only agnsh's launch is preemptive; foreground
+  execwait#37 / `run /bin/X` stay IF=0). This is the milestone 1.44.23 reverted — the first
+  CPL3→CPL0 timer tick took its ISR frame on the shared `RSP0=0x3C0000` which sat in live kernel
+  `.bss`, freezing archaemenid at the banner. Bite 1's per-proc region-7 RSP0 is the hypothesized
+  fix. Validated in QEMU: `agnsh-bg-test` (sleeper & — prompt stays live, reaps `[1] Done`),
+  `agnsh-multijob-test` (2 concurrent jobs, out-of-order reap), `agnsh-smoke`, `check.sh` 11/11.
+  **Iron-pending** — QEMU can't reproduce the Zen-specific freeze, so the next burn is the real test.
+
+### Added (from the kernel-gap issue backlog)
+- **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a
+  ONE-SHOT redirect consumed by the next `execwait`#37: the child's writes to `src_fd` (e.g.
+  1=stdout) route to `dst_fd`'s backend (an open writable file/pipe), so a parent can run a tool
+  and **capture its stdout**, then read it back after #37 returns. Implemented as a save/swap/
+  restore of the global `vfs_table` entry around the run-to-completion child run (`exec_redirect_apply`/
+  `exec_redirect_restore` bracket the `exec_and_wait` call) — no per-proc fd layer needed, and
+  byte-identical to the prior #37 when nothing is armed. Resolves the **"high-value one"** in
+  `docs/development/issues/2026-06-15-cyrius-stdlib-missing-syscalls.md` group 1 (the `dup2`/fd-redirect
+  gap that blocked cyrius's regression test-runner capture + shakti session logging). Not applied to
+  the non-blocking `spawn`#3 (the child runs later → a per-proc redirect is the follow-on). Validated:
+  new `EXEC_REDIRECT_SELFTEST` + `scripts/exec-redirect-smoke.sh` boot-prove the capture end-to-end via
+  a pipe (`redir: capture OK` — write to a redirected fd, read it back from the pipe); `agnsh-smoke`
+  PASS (the #37 `run` path unchanged), `check.sh` 11/11. `build/agnos` 1,211,392 B.
 
 ## [1.45.17] — 2026-06-23
 

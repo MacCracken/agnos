@@ -107,6 +107,45 @@ var spawn_path_buf[16];
 # the child — by the time any nested syscall exists, these contents are dead.
 # [128] = 128 u64 = 1024 B each (the 8N module-global rule).
 var ew37_env[128];        # execwait(#37) env staging
+
+# 1.46.x (fd-redirect for output capture) — issue 2026-06-15-cyrius-stdlib-missing-syscalls
+# group 1 ("the high-value one": an fd-redirect primitive for capturing subprocess helpers;
+# consumers: cyrius's regression test-runner (run-a-tool-and-read-its-stdout), shakti session
+# logging). A ONE-SHOT redirect consumed by the NEXT execwait#37: route the child's writes to
+# `redir_src_fd` (e.g. 1=stdout) to `redir_dst_fd`'s backend (an open writable file or pipe).
+# Works because #37 is run-to-completion (the parent is suspended while the child runs), so we
+# save the src fd's vfs_table entry, copy the dst entry over it for the child's run, and restore
+# on resume — no per-proc fd table needed. NOT applied to the non-blocking spawn#3 (the child
+# runs later → a per-proc redirect is the follow-on). vfs_table entry = 32 B (4 u64).
+var redir_pending = 0;    # 1 = a redirect is armed for the next execwait#37
+var redir_src_fd = 0;     # the fd the child writes to (gets repointed)
+var redir_dst_fd = 0;     # the backend the writes go to
+var redir_backup[4];      # 32-byte save of vfs_table[redir_src_fd]
+
+# Apply the armed redirect: save vfs_table[src] into redir_backup, copy vfs_table[dst] over it.
+# Called by execwait#37 right before running the child (under boot CR3 — vfs_table is kernel
+# memory, identity-mapped). No-op when nothing is armed (so #37 stays byte-identical by default).
+fn exec_redirect_apply() {
+    if (redir_pending == 0) { return 0; }
+    var rsrc = &vfs_table + redir_src_fd * 32;
+    var rdst = &vfs_table + redir_dst_fd * 32;
+    var k = 0;
+    while (k < 32) {
+        store64(&redir_backup + k, load64(rsrc + k));   # save src entry
+        store64(rsrc + k, load64(rdst + k));             # src <- dst (child's writes now route to dst)
+        k = k + 8;
+    }
+    return 0;
+}
+# Restore the src fd entry after the child run; clears the one-shot.
+fn exec_redirect_restore() {
+    if (redir_pending == 0) { return 0; }
+    var rsrc = &vfs_table + redir_src_fd * 32;
+    var k = 0;
+    while (k < 32) { store64(rsrc + k, load64(&redir_backup + k)); k = k + 8; }
+    redir_pending = 0;
+    return 0;
+}
 var spawn_env_buf[128];   # spawn_path(#43) env staging
 # 1.44.20: blit#39 scaled-row staging — ONE expanded src row (w*scale px, 32bpp). [4096] =
 # 4096 u64 = 32 KB (8N), the invariant the handler's `w*scale <= 8192` gate enforces (NOT
@@ -1015,6 +1054,23 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return kl_w;
     }
+    if (num == 62) {
+        # exec_redirect(src_fd=arg1, dst_fd=arg2) — arm a ONE-SHOT fd redirect for the
+        # NEXT execwait#37: the child's writes to src_fd (e.g. 1=stdout) route to dst_fd's
+        # backend (output capture). dst_fd should be an open writable file/pipe the caller
+        # then reads back after #37 returns. Both fds in [0,32). Cleared after the next #37
+        # (or re-armed by a later call). Returns 0, or -1 on a bad fd. AGNOS-native (a
+        # one-shot exec-time dup, not a persistent dup2 — the global fd table makes the
+        # run-to-completion swap clean without a per-proc fd layer). See the redir_* helpers.
+        if (arg1 < 0) { return 0 - 1; }
+        if (arg1 >= 32) { return 0 - 1; }
+        if (arg2 < 0) { return 0 - 1; }
+        if (arg2 >= 32) { return 0 - 1; }
+        redir_src_fd = arg1;
+        redir_dst_fd = arg2;
+        redir_pending = 1;
+        return 0;
+    }
     if (num == 37) {
         # execwait(path=arg1, pathlen=arg2) — load a static ELF64 from the active
         # ext2 root, run it to completion in ring 3, return its exit code (or -1).
@@ -1145,6 +1201,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # grow down 0x3D0000 and never touch agnsh's suspended #37 frame on 0x3F0000.
         syscall_kstack_top = syscall_kstack_top2;
 
+        # (f2) 1.46.x fd-redirect: if a redirect was armed via exec_redirect#62, repoint
+        # the src fd (e.g. stdout) to the dst backend for the child's run. No-op otherwise,
+        # so the default path is byte-identical. Restored at (h2) after the child exits.
+        exec_redirect_apply();
+
         # (g) make the child current (so ITS exit() stamps the code on ITS pid),
         # then run to completion. The child's exit() -> kernel_resume longjmps back
         # to the line after this call with CR3=boot 0x1000, proc_current=0,
@@ -1152,6 +1213,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         proc_current = cpid;
         exec_and_wait(ce, cr, cc);
         # ===== RESUME POINT (child exited) =====
+
+        # (h2) 1.46.x fd-redirect: restore the redirected src fd to its original backend
+        # (e.g. stdout back to the console) + clear the one-shot. Under boot CR3 here
+        # (vfs_table is identity-mapped kernel memory). No-op if nothing was armed.
+        exec_redirect_restore();
 
         # (h) restore the PRIMARY SYSCALL kstack and rebuild the stub so agnsh's own
         # subsequent syscalls go back on 0x3F0000 (the stub baked 0x3D0000 during

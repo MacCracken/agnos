@@ -30,19 +30,19 @@ fn kybernet_exec_agnsh() {
     var r = load64(ep + 16);      # rsp
     var c = load64(ep + 160);     # cr3
     proc_current = pid;
-    # 1.44.23 IRON FIX — launch agnsh NON-PREEMPTIBLE (IF=0), the iron-proven foreground model.
-    # WHY: 1.44.14 launched agnsh PREEMPTIBLE (IF=1) so the timer time-slices its prompt against
-    # #43 background jobs. That works in QEMU but is the ONE thing in the boot-to-shell path never
-    # validated on real hardware: an IF=1 ring-3 agnsh takes the first-ever CPL3->CPL0 hardware
-    # interrupt (the 100 Hz timer) on Zen, and that froze archaemenid at the banner (burn 1442x:
-    # .22 = banner then freeze, .23 = freeze before the banner). The IF=0 foreground launch takes
-    # NO ring-3 interrupt (the timer only fires while in ring 0, CPL0->CPL0, no RSP0 stack switch),
-    # which is exactly how agnsh typed + dispatched on archaemenid at burn 14115 (2026-06-06) and
-    # how DOOM runs on Zen at burn 1439 (1.43.x) — both iron-proven. So boot-to-shell is restored.
-    # TRADEOFF (deferred, not lost): preemptive `&` background jobs (1.44.14-17) need the CPL3->CPL0
-    # interrupt path working on iron — a separate bring-up arc. Re-enable with `exec_preempt = 1`
-    # here once that path is iron-validated. Foreground `run /bin/X` (execwait#37) was already IF=0.
-    # exec_preempt stays 0 (its default) — leaving it unset is the whole change.
+    # 1.46.x BITE 2 — RE-ENABLE preemptive agnsh (IF=1) on the per-proc RSP0 foundation (bite 1).
+    # HISTORY: 1.44.14 launched agnsh IF=1 so the timer time-slices its prompt against #43 background
+    # jobs. That froze archaemenid at the banner (burn 1442x: .22 banner-then-freeze, .23 freeze
+    # before the banner) because the first-ever CPL3->CPL0 timer tick took its ISR frame on the
+    # SHARED RSP0=0x3C0000 — which, at 1.44.23, sat in LIVE kernel .bss (the root cause) — so 1.44.23
+    # reverted to IF=0 cooperative (the iron-proven 14115/1439 model). BITE 1 (1.46.x) moved RSP0
+    # PER-PROC into region 7 (14-16 MB, clear of .bss AND mapped supervisor under the boot CR3 +
+    # every per-proc CR3), so agnsh's first timer tick now lands on agnsh's OWN stack — the
+    # hypothesized fix for the banner freeze. exec_preempt=1 makes THIS launch IF=1 (enter_ring3
+    # consumes the flag, so ONLY agnsh's launch is preemptive; foreground execwait#37 / `run /bin/X`
+    # stay IF=0). IRON-PENDING: QEMU can't reproduce the Zen freeze, so the next burn is the real
+    # test — boot-to-shell + multi-command + a live `&` background job on real Zen.
+    exec_preempt = 1;
     exec_and_wait(e, r, c);
     var code = proc_get_exit_code(pid);
     proc_reap(pid);

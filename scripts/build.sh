@@ -173,6 +173,7 @@ else
         [ -n "$FB_ANSI_VISUAL" ]     && echo '#define FB_ANSI_VISUAL'
         [ -n "$KLUG_SELFTEST" ]      && echo '#define KLUG_SELFTEST'
         [ -n "$FS_SYSCALL_SELFTEST" ] && echo '#define FS_SYSCALL_SELFTEST'
+        [ -n "$EXEC_REDIRECT_SELFTEST" ] && echo '#define EXEC_REDIRECT_SELFTEST'
         [ -n "$SYSCALL_HARDEN_SELFTEST" ] && echo '#define SYSCALL_HARDEN_SELFTEST'
         [ -n "$FATFS_SELFTEST" ] && echo '#define FATFS_SELFTEST'
         [ -n "$FATFS_WRITE_SELFTEST" ] && echo '#define FATFS_WRITE_SELFTEST'
