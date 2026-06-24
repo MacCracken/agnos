@@ -345,7 +345,7 @@ fn sys_sched_yield() {
     var p = &proc_table + yp * 176;
     store64(p + 24, load64(&sc_entry_regs + 0));       # resume RIP = post-SYSCALL rcx
     store64(p + 152, load64(&sc_entry_regs + 8));      # RFLAGS = captured r11 (carries IF=1)
-    store64(p + 16, kernel_rsp_save);                  # user RSP (stub-saved at entry)
+    store64(p + 16, load64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8));   # user RSP (stub-saved at entry, per-CPU 4b)
     store64(p + 40, load64(&sc_entry_regs + 16));      # rbx   (callee-saved: clean labels)
     store64(p + 80, load64(&sc_entry_regs + 24));      # rbp
     store64(p + 120, load64(&sc_entry_regs + 32));     # r12

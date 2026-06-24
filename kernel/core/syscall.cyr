@@ -1117,7 +1117,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         while (si < 64) { store64(s37 + si, load64(es + si)); si = si + 8; }
         ew37_kr_rsp   = kernel_return_rsp;          # == 1 (kybernet frame armed)
         ew37_kr_rip   = kernel_return_rip;
-        ew37_rsp_save = kernel_rsp_save;            # agnsh's user RSP
+        ew37_rsp_save = load64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8);   # agnsh's user RSP (per-CPU 4b)
         ew37_a4       = ksyscall_a4;
         ew37_pid      = proc_current_get();               # agnsh's pid
         ew37_resume_pid = exec_resume_pid;          # 1.44.14: save agnsh's resume-pid; the nested
@@ -1195,11 +1195,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var cc  = load64(cep + 160);
 
         # (f) SWITCH the SYSCALL kstack to the disjoint second top (H2) for the
-        # nested run. exec_and_wait calls syscall_init() (ring3.cyr:53), which
-        # rebuilds the entry stub re-reading syscall_kstack_top — so this write
-        # bakes syscall_kstack_top2 into the child's stub. The child's syscalls then
-        # grow down 0x3D0000 and never touch agnsh's suspended #37 frame on 0x3F0000.
-        syscall_kstack_top = syscall_kstack_top2;
+        # nested run. 1.46.x 4b: the stub no longer BAKES the kstack value (it reads
+        # pcpu_syscall_kstack_top at runtime via r8*8+disp32), so NO syscall_init() rebuild
+        # is needed — just point THIS CPU's primary slot at its nested top. The child's
+        # syscalls then grow down 0xF90000+cpu*0x10000 and never touch agnsh's suspended
+        # #37 frame on the primary 0xF10000+cpu. NO-MID-SYSCALL-MIGRATION (IF=0/serial)
+        # guarantees pcpu_cpu() here == the stub's entry/exit cpu for both agnsh and child.
+        store64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8, load64(&pcpu_syscall_kstack_top2 + pcpu_cpu() * 8));
 
         # (f2) 1.46.x fd-redirect: if a redirect was armed via exec_redirect#62, repoint
         # the src fd (e.g. stdout) to the dst backend for the child's run. No-op otherwise,
@@ -1209,7 +1211,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # (g) make the child current (so ITS exit() stamps the code on ITS pid),
         # then run to completion. The child's exit() -> kernel_resume longjmps back
         # to the line after this call with CR3=boot 0x1000, proc_current_get()=0,
-        # kernel_return_*=0, kpti_*=child, kernel_rsp_save=child's last user RSP.
+        # kernel_return_*=0, kpti_*=child, this CPU's pcpu_kernel_rsp_save slot=child's last user RSP.
         proc_current_set(cpid);
         exec_and_wait(ce, cr, cc);
         # ===== RESUME POINT (child exited) =====
@@ -1219,12 +1221,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # (vfs_table is identity-mapped kernel memory). No-op if nothing was armed.
         exec_redirect_restore();
 
-        # (h) restore the PRIMARY SYSCALL kstack and rebuild the stub so agnsh's own
-        # subsequent syscalls go back on 0x3F0000 (the stub baked 0x3D0000 during
-        # the child run; kernel_resume does NOT rebuild). syscall_init is idempotent
-        # (exec_and_wait calls it every exec) and safe under boot CR3.
-        syscall_kstack_top = 0x3F0000;
-        syscall_init();
+        # (h) restore THIS CPU's PRIMARY SYSCALL kstack top so agnsh's own subsequent
+        # syscalls go back on 0xF10000+cpu*0x10000. 1.46.x 4b: the stub reads
+        # pcpu_syscall_kstack_top at runtime (r8*8+disp32), so NO syscall_init() stub
+        # rebuild is needed — just re-point this CPU's slot at its primary top. (The MSR
+        # programming syscall_init also did is unchanged from boot; nothing here
+        # invalidates it, and exec_and_wait's own syscall_init already re-ran it.)
+        store64(&pcpu_syscall_kstack_top + pcpu_cpu() * 8, 0xF10000 + pcpu_cpu() * 0x10000);
 
         # (i) read the child's exit code (from the GLOBAL pid) BEFORE reaping (reap
         # collapses the slot), then reap: proc_reap_child frees the child's address
@@ -1245,7 +1248,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         kernel_return_rip = ew37_kr_rip;
         kpti_kernel_cr3   = ew37_cr3;                # agnsh's CR3 (kernel-side)
         kpti_user_cr3     = ew37_cr3;                # the value the exit stub reloads into CR3 pre-SYSRET
-        kernel_rsp_save   = ew37_rsp_save;           # the exit stub does `mov rsp,[kernel_rsp_save]` pre-SYSRET
+        store64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8, ew37_rsp_save);   # the exit stub reloads rsp from this CPU's pcpu_kernel_rsp_save slot pre-SYSRET (per-CPU 4b)
         ksyscall_a4       = ew37_a4;
         proc_current_set(ew37_pid);                # agnsh's pid (its write/exit attribute to agnsh)
         exec_resume_pid   = ew37_resume_pid;         # 1.44.14: agnsh is the resume target again, so

@@ -107,6 +107,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `-0x8(%rbp),%rax` — offsets match, IBRS detection intact. agnsh-smoke / check.sh 11/11 / ring3-smoke (#44
   yield) green. First step of the adversarially-reviewed sub-bite 4 (per-CPU SYSCALL stub); the dangerous
   per-CPU stub-byte conversion (4b-4d) follows, gated by objdump-after-each-step. `build/agnos` 1,211,472 B.
+- **SMP arc sub-bite 4b — per-CPU SYSCALL kernel stack + user-RSP save** (`syscall_hw.cyr`/`sched.cyr`/`syscall.cyr`).
+  The two values the SYSCALL entry stub baked as single globals — `kernel_rsp_save` (the user-RSP save slot)
+  and `syscall_kstack_top` (the kernel stack) — are now **per-CPU arrays** indexed by the (capped) APIC cpu
+  id the stub RE-READS at each consumer (`r8*8`/`rax*8 + &array`), so two CPUs in the stub at once no longer
+  clobber one save slot or grow down one stack. Per-CPU kstacks live in region 7 (`0xF10000`/`0xF90000 +
+  cpu*0x10000`, pmm-reserved, supervisor-mapped via the PD[0..127] copy). The chosen design re-reads the APIC
+  in three windows (entry→r8, off-100→rax, exit→r8) rather than carrying a base across `call syscall_handler`,
+  which **dissolves the old r10-must-survive hazard** entirely. The ew37 #37 nested run swaps THIS cpu's slot
+  to its second kstack top instead of rebuilding the shared stub (rebuild removed). All five C readers/writers
+  (`sched.cyr:348` #44-yield, `syscall.cyr` ew37 save/restore/swap) moved in lockstep via a capped `pcpu_cpu()`.
+  - **Process:** implemented in an isolated worktree from a 10-agent adversarially-reviewed spec, then
+    re-reviewed through four lenses (byte-decode, register-survival, C-site-lockstep, memory-residency) — all
+    SOUND, zero fatal bugs. **Runtime-buffer objdump** confirmed every `jb` lands exactly past its `xor` and
+    every disp32 emits with `store32(+4)` (the buffer-corrupting `store64(+8)` trap avoided). Re-verified on
+    main: agnsh-smoke + check.sh 11/11 + ring3-smoke (#44 yield reads the per-CPU slot) + exec-smoke (#37
+    nested swap-back) all green. SMP isolation under contention stays iron-gated (TCG can't race; cpu<4 cap
+    makes single-core byte-identical-behavior). `build/agnos` 1,215,232 B.
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a

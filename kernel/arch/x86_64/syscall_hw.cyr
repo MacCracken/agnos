@@ -2,28 +2,36 @@
 # SYSCALL: RCX=retRIP, R11=retRFLAGS, rax=num, rdi=a1, rsi=a2, rdx=a3
 
 var syscall_entry_buf[256];  # Enlarged for IBRS instructions
-var kernel_rsp_save = 0;
-# 1.40.3: dedicated kernel stack TOP for the SYSCALL entry path. The stub used
-# to switch RSP to a hardcoded 0x1F0000, which now overlaps the >1.9 MB kernel
-# image (corruption / read-only push fault). Allocated once in syscall_init from
-# a fresh 2 MB region; the stub switches RSP here on entry from ring 3.
-var syscall_kstack_top = 0;
-# 1.43.x execwait #37: a SECOND, disjoint SYSCALL kernel stack for the nested
-# exec_and_wait(child). execwait is the first exec_and_wait ever invoked FROM a
-# live ring-3 SYSCALL frame (agnsh). While agnsh's #37 handler is suspended in
-# exec_and_wait, the child's OWN syscalls re-enter the stub and reload
-# rsp=syscall_kstack_top — if that were still 0x3F0000 they'd grow down through
-# agnsh's suspended #37 frame AND the stub-pushed SYSRET rcx/r11/rbp cells (which
-# have no global mirror), so agnsh would resume on smashed control state. The #37
-# handler swaps syscall_kstack_top to THIS second top for the nested run; the swap
-# is baked into the child's stub by exec_and_wait's own syscall_init() rebuild, so
-# the child grows down a DIFFERENT page (0x3D0000) and never touches agnsh's frame.
-# Fixed at 0x3D0000: top of kernel-reserved region 1 (0x200000-0x400000, boot
-# identity 2 MB map, mirrored into every per-process CR3), 0x20000 (128 KB) below
-# the primary 0x3F0000 — far above the kernel image and far below 0x3F0000, so
-# neither stack overlaps. No alloc (same determinism rationale as 0x3F0000 above;
-# a pmm_alloc_2mb would reintroduce the QEMU↔iron next-free flake 1.40.9 fixed).
-var syscall_kstack_top2 = 0x3D0000;
+# 1.46.x SMP sub-bite 4b: the SYSCALL entry path's two baked values — the user-RSP save slot
+# and the kernel-stack top — go PER-CPU. The old single `kernel_rsp_save` / `syscall_kstack_top`
+# globals were a hard single-core invariant: two CPUs in the stub at once would clobber one save
+# slot and grow down one stack. The stub now indexes these by the (capped) APIC cpu id it RE-READS
+# at each consumer (r8/rax * 8 + &array), so each CPU has its own slot/stack with NO register
+# assumed to survive `call syscall_handler`. module-global `var X[4]` = 4*u64 = 32 bytes each.
+#
+# PD[0..127]-RESIDENCY (checkable): all three arrays live in kernel .bss (<16 MB, PD[0..7]) and the
+# baked kstack tops 0xF10000 / 0xF90000 are region-7 (PD[7], 14-16 MB) — both copied into every
+# per-proc CR3 by the proc.cyr PD[0..127] copy, so the stub (running under the still-user CR3 while
+# KPTI is collapsed) reaches them. region 7 is pmm-reserved (pmm.cyr), so the tops are never alloc'd.
+var pcpu_kernel_rsp_save[4];      # per-CPU user-RSP save slot (was global kernel_rsp_save)
+# per-CPU PRIMARY SYSCALL kernel-stack top. Was global syscall_kstack_top (single 0x3F0000). Now
+# region-7 tops 0xF10000 + cpu*0x10000 (0xF10000/0xF20000/0xF30000/0xF40000) — above the proc_rsp0
+# 0xF00000 ceiling, below 0x1000000, 64 KB apart so the four CPUs' stacks never overlap. Init in
+# syscall_kstack_reserve(); each CPU's stub bakes &pcpu_syscall_kstack_top + cpu*8 via r8*8+disp32.
+var pcpu_syscall_kstack_top[4];
+# per-CPU SECOND, disjoint SYSCALL kstack top for the nested exec_and_wait(child) (execwait #37).
+# Was global syscall_kstack_top2 (single 0x3D0000). execwait is the first exec_and_wait invoked FROM
+# a live ring-3 SYSCALL frame (agnsh): while agnsh's #37 handler is suspended, the child's OWN
+# syscalls re-enter the stub and reload rsp from pcpu_syscall_kstack_top — if that still pointed at
+# the primary 0xF10000+cpu they'd grow down through agnsh's suspended #37 frame AND the stub-pushed
+# SYSRET rcx/r11/rbp cells (no global mirror), so agnsh would resume on smashed control state. The
+# #37 handler points THIS cpu's primary slot at its nested top (0xF90000 + cpu*0x10000) for the
+# child run — NO stub rebuild — so the child grows down a DIFFERENT page and never touches agnsh's
+# frame; restored to the primary on resume. region-7 tops, 64 KB apart, pmm-reserved (see above).
+var pcpu_syscall_kstack_top2[4];
+# 1.46.x 4b: idempotency guard for syscall_kstack_reserve (was the old `syscall_kstack_top != 0`
+# self-check, which the per-CPU arrays can't double as — slot 0 being 0 is now a valid mid-init state).
+var syscall_kstack_reserved = 0;
 # Saved kernel context for returning from user mode on exit
 var kernel_return_rsp = 0;
 var kernel_return_rip = 0;
@@ -66,23 +74,35 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
 # with the user-code page (the ~17% exec flake). Mapped identity (within the
 # 0-1 GB the per-process CR3 mirrors), writable. Idempotent.
 fn syscall_kstack_reserve() {
-    if (syscall_kstack_top != 0) { return 0; }
-    # 1.40.9: FIXED kstack at the top of region 1 (0x200000-0x400000), which
-    # pmm_init now reserves as kernel (the image crossed 2 MB, and region 1 also
-    # holds this stack). Was pmm_alloc_2mb(), which only landed at 0x200000 when
-    # region 1 happened to be entirely free at this point in boot — and the
-    # KASLR-seeded next-free hint + the boot allocs before this call differ
-    # between QEMU and real Zen, so on iron it sometimes relocated to 0x400000.
-    # 0x400000 is the user-code VA base: the per-process CR3 maps it to the user
-    # code page, OVERRIDING the identity mapping the kstack needs, so the syscall
-    # handler (which runs under that CR3) pushed onto a stack that wasn't there →
-    # corrupted ret → wild #PF (the 1.40.x ring-3 reset: RIP=0x22220202, CR2>=4 GB).
-    # A FIXED 0x3F0000 is deterministic, sits in the boot 0-1 GB identity 2 MB-page
-    # map (P|RW, mirrored into every per-process CR3), and is BELOW the 0x400000
-    # user-VA base so no per-process mapping ever overrides it. No alloc needed —
-    # region 1 is kernel-reserved.
-    syscall_kstack_top = 0x3F0000;
+    if (syscall_kstack_reserved != 0) { return 0; }
+    # 1.46.x 4b: FIXED per-CPU kstacks in region 7 (0xE00000-0x1000000, 14-16 MB), which pmm_init
+    # reserves as kernel (proc.cyr PD[0..127] copy mirrors PD[7] into every per-proc CR3). The
+    # PRIMARY tops are 0xF10000 + cpu*0x10000; the SECOND (execwait #37 nested) tops are
+    # 0xF90000 + cpu*0x10000. All sit ABOVE the proc_rsp0 pool (0xE00000-0xF00000) and 64 KB apart
+    # per CPU, so no two CPUs' stacks — and neither of a CPU's two stacks — ever overlap. The old
+    # single-core values (primary 0x3F0000, nested 0x3D0000) lived in region 1; 4b moves them to
+    # region 7 (the only behavior delta — see the buffer header). No alloc needed (region 7 is
+    # kernel-reserved): same determinism rationale as the old fixed tops, avoiding the QEMU↔iron
+    # next-free flake a pmm_alloc_2mb would reintroduce (1.40.9). Deterministic + identity-mapped +
+    # below no user VA, so no per-process mapping overrides them.
+    for (var c = 0; c < 4; c = c + 1) {
+        store64(&pcpu_syscall_kstack_top + c * 8, 0xF10000 + c * 0x10000);
+        store64(&pcpu_syscall_kstack_top2 + c * 8, 0xF90000 + c * 0x10000);
+    }
+    syscall_kstack_reserved = 1;
     return 0;
+}
+
+# 1.46.x SMP sub-bite 4b: capped APIC cpu id for the C-side per-CPU SYSCALL-stack readers
+# (sched.cyr:348 / the ew37 save+restore+swap in syscall.cyr). Mirrors proc.cyr's accessor
+# pattern (cpu_count<2 fast path = slot 0, no APIC read → byte-for-byte the old single-core global;
+# >=4 caps to slot 0 since tss_get_current_cpu_id() is uncapped). The STUB caps independently via
+# its own cmp r8,4;jb;xor — both paths must cap (CPU-CAP invariant).
+fn pcpu_cpu() {
+    if (cpu_count < 2) { return 0; }
+    var c = tss_get_current_cpu_id();
+    if (c >= 4) { c = 0; }
+    return c;
 }
 
 # 1.46.x SMP sub-bite 4a: per-CPU SYSCALL MSRs (STAR/LSTAR/SFMASK/EFER). The BSP runs this via
@@ -202,7 +222,12 @@ fn syscall_stub_build() {
 
     var ep = &syscall_entry_buf;
     var eoff = 0;
-    var krs = &kernel_rsp_save;
+    # 1.46.x 4b: per-CPU base addresses for the disp32 of the r8*8 / rax*8 based loads/stores. Each
+    # is the SINGLE u64 base &array; the index register (r8 or rax, holding the capped APIC cpu) and
+    # the *8 SIB scale supply the per-CPU stride. EMITTED store32(+4), NOT store64(+8) — see the
+    # DISP32-EMIT-WIDTH rule at each emit site.
+    var krs_base  = &pcpu_kernel_rsp_save;     # mov [r8*8+disp32], rsp / mov [rax*8+disp32], rdi / mov rsp,[r8*8+disp32]
+    var kst_base  = &pcpu_syscall_kstack_top;  # mov rsp, [r8*8+disp32]  (kstack switch)
     var scr = &sc_entry_regs;
     var handler = &syscall_handler;
     var kcr3_addr = &kpti_kernel_cr3;
@@ -216,6 +241,31 @@ fn syscall_stub_build() {
     # is ABI-safe — same posture as the stub's existing r8 clobber.
     # mov r9, r10 — 4D 89 D1
     store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xD1); eoff = eoff + 3;
+
+    # 1.46.x SMP sub-bite 4b: ENTRY APIC-read-into-r8 — carry the capped APIC cpu id in r8 for the
+    # duration of the entry window (R8-AS-CPU invariant: r8 survives untouched from here through the
+    # point3 SAVE, the point4 SWITCH, and the off-100 consumer below — the IBRS-on block does NOT
+    # write r8 — first reused only at the live `mov r8,rdx` arg3 shuffle). The off-100 consumer and
+    # the exit RE-READ the APIC independently (no register assumed to survive the CR3 switch / IBRS /
+    # `call syscall_handler`). Reads the Local APIC ID register at 0xFEE00020 (the same MMIO
+    # tss_get_current_cpu_id() uses), shifts/masks to the 8-bit APIC id, then caps to 0..3 (CPU-CAP).
+    # mov r8, 0xFEE00020 — 49 B8 imm64
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xB8); eoff = eoff + 2;
+    store8(ep + eoff, 0x20); store8(ep + eoff + 1, 0x00); store8(ep + eoff + 2, 0xE0); store8(ep + eoff + 3, 0xFE);
+    store8(ep + eoff + 4, 0x00); store8(ep + eoff + 5, 0x00); store8(ep + eoff + 6, 0x00); store8(ep + eoff + 7, 0x00); eoff = eoff + 8;
+    # mov r8d, [r8] — 45 8B 00   (load 32-bit APIC ID register; zero-extends into r8)
+    store8(ep + eoff, 0x45); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x00); eoff = eoff + 3;
+    # shr r8, 24 — 49 C1 E8 18
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xC1); store8(ep + eoff + 2, 0xE8); store8(ep + eoff + 3, 0x18); eoff = eoff + 4;
+    # and r8, 0xFF — 41 81 E0 FF 00 00 00
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x81); store8(ep + eoff + 2, 0xE0);
+    store8(ep + eoff + 3, 0xFF); store8(ep + eoff + 4, 0x00); store8(ep + eoff + 5, 0x00); store8(ep + eoff + 6, 0x00); eoff = eoff + 7;
+    # cmp r8, 4 — 49 83 F8 04
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x83); store8(ep + eoff + 2, 0xF8); store8(ep + eoff + 3, 0x04); eoff = eoff + 4;
+    # jb +3 — 72 03   (if r8 < 4, skip the 3-byte xor; JB-DISPLACEMENT: lands exactly past 45 31 C0)
+    store8(ep + eoff, 0x72); store8(ep + eoff + 1, 0x03); eoff = eoff + 2;
+    # xor r8d, r8d — 45 31 C0   (cap out-of-range APIC id to slot 0)
+    store8(ep + eoff, 0x45); store8(ep + eoff + 1, 0x31); store8(ep + eoff + 2, 0xC0); eoff = eoff + 3;
 
     # S8 (KPTI): Switch from user CR3 to kernel CR3 FIRST.
     # We're ring-0 (SYSCALL changed CPL), user page tables have PD entry 0
@@ -258,18 +308,23 @@ fn syscall_stub_build() {
     # mov [r10+56], r15 — 4D 89 7A 38
     store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x7A); store8(ep + eoff + 3, 0x38); eoff = eoff + 4;
 
-    # Save user RSP into kernel_rsp_save
-    # mov r10, imm64(kernel_rsp_save addr)  — 49 BA imm64
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
-    store64(ep + eoff, krs); eoff = eoff + 8;
-    # mov [r10], rsp — 49 89 22
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x22); eoff = eoff + 3;
+    # 1.46.x 4b point3 SAVE — save user RSP into THIS CPU's pcpu_kernel_rsp_save slot. r8 holds the
+    # capped cpu (from the entry APIC block; untouched since). Was `mov r10,imm64(&kernel_rsp_save);
+    # mov [r10],rsp`. Now a single based store: mov [r8*8 + &pcpu_kernel_rsp_save], rsp.
+    # mov [r8*8+disp32], rsp — 4A 89 24 C5 <disp32>
+    store8(ep + eoff, 0x4A); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x24); store8(ep + eoff + 3, 0xC5); eoff = eoff + 4;
+    # DISP32-EMIT-WIDTH: store32(+4), NOT store64(+8). disp = the single u64 base &pcpu_kernel_rsp_save;
+    # r8*8 supplies the per-CPU stride.
+    store32(ep + eoff, krs_base); eoff = eoff + 4;
 
-    # Switch to the dedicated SYSCALL kernel stack (allocated above; not the old
-    # hardcoded 0x1F0000 that overlapped the kernel image).
-    # mov rsp, syscall_kstack_top  — 48 BC imm64
-    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0xBC); eoff = eoff + 2;
-    store64(ep + eoff, syscall_kstack_top); eoff = eoff + 8;
+    # 1.46.x 4b point4 SWITCH — switch RSP to THIS CPU's pcpu_syscall_kstack_top (region 7). r8 still
+    # holds the capped cpu. Was `mov rsp, imm64(syscall_kstack_top VALUE)` — the ONE behavior delta is
+    # the kstack value moving 0x3F0000 → 0xF10000 (+cpu*0x10000); single-core (cpu always 0) lands
+    # 0xF10000 and is otherwise byte-identical. Now a based load: mov rsp, [r8*8 + &pcpu_syscall_kstack_top].
+    # mov rsp, [r8*8+disp32] — 4A 8B 24 C5 <disp32>
+    store8(ep + eoff, 0x4A); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x24); store8(ep + eoff + 3, 0xC5); eoff = eoff + 4;
+    # DISP32-EMIT-WIDTH: store32(+4), NOT store64(+8).
+    store32(ep + eoff, kst_base); eoff = eoff + 4;
 
     # 1.42.x (RBP smash, CR2=0x37fed8): preserve the user's RBP across the
     # kstack switch. SYSCALL doesn't save RBP, and the C-ABI syscall_handler
@@ -334,8 +389,32 @@ fn syscall_stub_build() {
     store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xFA); eoff = eoff + 3;
     # mov rsi, rax   — 48 89 C6  (num → rsi)
     store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xC6); eoff = eoff + 3;
-    # mov rdi, [r10] — 49 8B 3A  (user_rsp from kernel_rsp_save → rdi)
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x3A); eoff = eoff + 3;
+    # 1.46.x 4b off-100 consumer — load user_rsp from THIS CPU's pcpu_kernel_rsp_save slot into rdi.
+    # We do NOT assume r8 still holds the cpu here (the design RE-READS the APIC at each consumer — no
+    # register is assumed to survive across the entry window's various clobbers). RAX IS FREE here:
+    # the `mov rsi,rax` above already ferried the syscall number to rsi (OFF-100-RAX-FREE invariant),
+    # so we re-read the APIC into rax, cap it, then do the based load mov rdi,[rax*8 + &pcpu_kernel_rsp_save].
+    # Was `mov rdi,[r10]` (49 8B 3A).
+    # mov rax, 0xFEE00020 — 48 B8 imm64
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0xB8); eoff = eoff + 2;
+    store8(ep + eoff, 0x20); store8(ep + eoff + 1, 0x00); store8(ep + eoff + 2, 0xE0); store8(ep + eoff + 3, 0xFE);
+    store8(ep + eoff + 4, 0x00); store8(ep + eoff + 5, 0x00); store8(ep + eoff + 6, 0x00); store8(ep + eoff + 7, 0x00); eoff = eoff + 8;
+    # mov eax, [rax] — 8B 00   (load 32-bit APIC ID register; zero-extends into rax)
+    store8(ep + eoff, 0x8B); store8(ep + eoff + 1, 0x00); eoff = eoff + 2;
+    # shr rax, 24 — 48 C1 E8 18
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0xC1); store8(ep + eoff + 2, 0xE8); store8(ep + eoff + 3, 0x18); eoff = eoff + 4;
+    # and eax, 0xFF — 25 FF 00 00 00
+    store8(ep + eoff, 0x25); store8(ep + eoff + 1, 0xFF); store8(ep + eoff + 2, 0x00); store8(ep + eoff + 3, 0x00); store8(ep + eoff + 4, 0x00); eoff = eoff + 5;
+    # cmp rax, 4 — 48 83 F8 04
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x83); store8(ep + eoff + 2, 0xF8); store8(ep + eoff + 3, 0x04); eoff = eoff + 4;
+    # jb +2 — 72 02   (if rax < 4, skip the 2-byte xor; JB-DISPLACEMENT: lands exactly past 31 C0)
+    store8(ep + eoff, 0x72); store8(ep + eoff + 1, 0x02); eoff = eoff + 2;
+    # xor eax, eax — 31 C0   (cap out-of-range APIC id to slot 0)
+    store8(ep + eoff, 0x31); store8(ep + eoff + 1, 0xC0); eoff = eoff + 2;
+    # mov rdi, [rax*8+disp32] — 48 8B 3C C5 <disp32>   (user_rsp from pcpu_kernel_rsp_save → rdi)
+    store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x3C); store8(ep + eoff + 3, 0xC5); eoff = eoff + 4;
+    # DISP32-EMIT-WIDTH: store32(+4), NOT store64(+8).
+    store32(ep + eoff, krs_base); eoff = eoff + 4;
 
     # 1.40.3: STAC before the handler — SMAP (CR4.SMAP, set on Zen/-cpu max)
     # blocks supervisor access to user (U/S=1) pages, so write()/read() copying
@@ -365,12 +444,33 @@ fn syscall_stub_build() {
     # syscall_kstack_top before we reload the user RSP below. pop rbp — 0x5D
     store8(ep + eoff, 0x5D); eoff = eoff + 1;
 
-    # Restore caller RSP
-    # mov r10, imm64(kernel_rsp_save addr)
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
-    store64(ep + eoff, krs); eoff = eoff + 8;
-    # mov rsp, [r10] — 49 8B 22
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x22); eoff = eoff + 3;
+    # 1.46.x 4b exit reload — restore the caller RSP from THIS CPU's pcpu_kernel_rsp_save slot.
+    # rax holds the syscall RETURN VALUE here, so we re-read the APIC into r8 (EXIT-R8-FREE: r8 is
+    # dead post-handler — the arg shuffle's `mov r8,rdx` value died inside the call) — NOT rax.
+    # APIC-UNDER-KERNEL-CR3: this runs BEFORE the kernel→user CR3 switch below, so the 0xFEE00020
+    # MMIO read resolves under the kernel CR3. Same 7-instruction entry-form block, then a based load.
+    # Was `mov r10,imm64(&kernel_rsp_save); mov rsp,[r10]`.
+    # mov r8, 0xFEE00020 — 49 B8 imm64
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xB8); eoff = eoff + 2;
+    store8(ep + eoff, 0x20); store8(ep + eoff + 1, 0x00); store8(ep + eoff + 2, 0xE0); store8(ep + eoff + 3, 0xFE);
+    store8(ep + eoff + 4, 0x00); store8(ep + eoff + 5, 0x00); store8(ep + eoff + 6, 0x00); store8(ep + eoff + 7, 0x00); eoff = eoff + 8;
+    # mov r8d, [r8] — 45 8B 00
+    store8(ep + eoff, 0x45); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x00); eoff = eoff + 3;
+    # shr r8, 24 — 49 C1 E8 18
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xC1); store8(ep + eoff + 2, 0xE8); store8(ep + eoff + 3, 0x18); eoff = eoff + 4;
+    # and r8, 0xFF — 41 81 E0 FF 00 00 00
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x81); store8(ep + eoff + 2, 0xE0);
+    store8(ep + eoff + 3, 0xFF); store8(ep + eoff + 4, 0x00); store8(ep + eoff + 5, 0x00); store8(ep + eoff + 6, 0x00); eoff = eoff + 7;
+    # cmp r8, 4 — 49 83 F8 04
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x83); store8(ep + eoff + 2, 0xF8); store8(ep + eoff + 3, 0x04); eoff = eoff + 4;
+    # jb +3 — 72 03   (JB-DISPLACEMENT: lands exactly past 45 31 C0)
+    store8(ep + eoff, 0x72); store8(ep + eoff + 1, 0x03); eoff = eoff + 2;
+    # xor r8d, r8d — 45 31 C0
+    store8(ep + eoff, 0x45); store8(ep + eoff + 1, 0x31); store8(ep + eoff + 2, 0xC0); eoff = eoff + 3;
+    # mov rsp, [r8*8+disp32] — 4A 8B 24 C5 <disp32>
+    store8(ep + eoff, 0x4A); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x24); store8(ep + eoff + 3, 0xC5); eoff = eoff + 4;
+    # DISP32-EMIT-WIDTH: store32(+4), NOT store64(+8).
+    store32(ep + eoff, krs_base); eoff = eoff + 4;
 
     # S8 (KPTI): Switch from kernel CR3 back to user CR3 before SYSRET.
     # rax has return value — save it, load user CR3, switch, restore.
