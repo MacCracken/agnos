@@ -55,19 +55,23 @@ fn vfs_sec_wfile_alloc_slot() {
     # shared slot flags with NO lock — it relied on the single-core no-preemption
     # invariant. A timer preemption between the `== 0` test and the `= 1` claim
     # would let two threads grab the SAME pool block and clobber each other's write
-    # buffer. preempt_disable() makes the whole test-and-set atomic; the window is
-    # tiny (<= 4 iterations, no I/O). (Release is a single atomic store64 — no gate.)
-    preempt_disable();
+    # buffer. 1.46.x SMP sub-bite 3: preempt_disable (a SAME-CPU reentrancy gate — ZERO
+    # cross-CPU exclusion) is replaced by a real spinlock (vfs_lock) so two CPUs can't grab the
+    # same pool block. The critical section is a <=4-iteration test-and-set with NO calls inside
+    # (provably re-entry-free — unlike the kmalloc heap_lock that deadlocked, see smp.cyr), so it
+    # is deadlock-safe. Single-core: behaviorally identical (both serialize same-CPU). Release of
+    # an allocated slot is a single atomic store64 elsewhere — no lock needed there.
+    spin_lock_at(&vfs_lock);
     var i = 0;
     while (i < 4) {
         if (load64(&sec_wfile_inuse + i * 8) == 0) {
             store64(&sec_wfile_inuse + i * 8, 1);
-            preempt_enable();
+            spin_unlock_at(&vfs_lock);
             return i;
         }
         i = i + 1;
     }
-    preempt_enable();
+    spin_unlock_at(&vfs_lock);
     return 0 - 1;
 }
 

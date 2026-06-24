@@ -68,6 +68,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   until it's regenerated). APs still parked. Validated: `agnsh-smoke` PASS, `check.sh` 11/11, `ring3-smoke` 8/8
   (multi-proc preemption exercises `proc_current` through every context switch + the per-CPU preempt gate +
   idle deprioritization). `build/agnos` 1,212,336 B.
+- **SMP arc sub-bite 3 (partial) — lock primitive + first shared-structure lock** (`smp.cyr`/`vfs.cyr`).
+  Added the parameterized `spin_lock_at(addr)`/`spin_unlock_at(addr)` (the named-lock primitive; the
+  parameter doesn't shift the asm's `[rbp-N]` offsets — the cr3_load precedent, confirmed because the
+  lock is exercised without faulting). Wired `vfs_lock` around `vfs_sec_wfile_alloc_slot`, replacing its
+  `preempt_disable` (a SAME-CPU reentrancy gate with ZERO cross-CPU exclusion) with a real spinlock — its
+  critical section is a provably re-entry-free 4-iteration test-and-set. Validated: agnsh-smoke PASS (no
+  boot regression), **fat-write-smoke 12 ops all rc=0** (each FAT write exercises `vfs_lock` via
+  `spin_lock_at`). **`heap_lock` DEFERRED** — wiring `kmalloc`/`kfree` under it deadlocked the boot:
+  **a spinlock deadlocks on same-CPU re-entry** where the old `preempt_disable` counter did not (some
+  path re-enters `kmalloc` while `heap_lock` is held; `slab_grow`/`pmm`/`vmm` traced clean, the re-entry
+  site is subtle). Reverted, boot restored. The rule (only lock provably-re-entry-free scopes; make the
+  allocator lock recursive or eliminate the re-enter) + the `proc_alloc_slot` claiming-state requirement
+  are recorded in `docs/development/smp-arc-plan.md`. APs still parked. `build/agnos` 1,212,608 B.
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a
