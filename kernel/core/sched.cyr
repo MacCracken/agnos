@@ -207,6 +207,14 @@ fn do_context_switch(isr_rsp) {
     kpti_kernel_cr3 = new_cr3;
     kpti_user_cr3 = proc_get_user_cr3(new_cr3);
 
+    # 1.46.1: point TSS.RSP0 at the switched-to proc's OWN kernel stack (per-proc
+    # interrupt stack, region 7). AFTER the cr3_load so tss_set_rsp0's APIC read hits
+    # a CR3 that maps the APIC; only on a real switch (new_pid != old, guarded at the
+    # top of this fn). RSP0 is consumed only on CPL3->CPL0, so this is INERT until
+    # exec_preempt=1 (a later bite) makes agnsh IF=1-preemptible. Plain call beside
+    # the kpti updates — OUTSIDE the cc5-regalloc-sensitive raw save/restore region.
+    tss_set_rsp0(proc_rsp0_top(new_pid));
+
     # Check for pending unmasked signals on the new process
     proc_check_pending_signals(new_pid);
 
@@ -355,6 +363,7 @@ fn sys_sched_yield() {
     if (new_cr3 != old_cr3) { cr3_load(new_cr3); }
     kpti_kernel_cr3 = new_cr3;                         # OMITTING these re-enters the YIELDER's
     kpti_user_cr3 = proc_get_user_cr3(new_cr3);        # CR3 on next's first syscall (1.40.x class)
+    tss_set_rsp0(proc_rsp0_top(next));                 # 1.46.1: per-proc RSP0 (inert: #44 yield is IF=1-only; agnsh is IF=0 in production)
     proc_check_pending_signals(next);
     # CLAC: the entry stub's STAC pairs with CLAC only on the SYSRET tail we never
     # reach (the kernel_resume precedent, 1.42.14 audit #3).

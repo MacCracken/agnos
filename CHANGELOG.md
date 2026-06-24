@@ -17,11 +17,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   blocking-read-yield. Folds in the **SMP-AP wake re-enable + iron-validate** (gated off at 1.44.25,
   `smp_wake_enabled=0`) and the four 1.44.22 audit-deferred cleanups (loader DRY-up, `sched_next`
   single-pass, the `waitpid`#4 ownership gate via real ppid tracking, MADT AP-enum).
-- The arc is intentionally open-ended — the **1.46.x minor grows to fit the work**. **1.46.0 is the
-  cycle-open** (VERSION + `kernel/version.cyr` banner literal + state/roadmap/iron-log tracker); no
-  kernel source changed yet, so the binary is still the 1.45.17 build. The first engineering bite is
-  per-process kernel stacks. Plan: `docs/development/roadmap.md` § 1.46.x; iron hypotheses +
-  falsification: agnosticos `iron-nuc-zen-log.md` `#tracker-146x-cycle`.
+- The arc is intentionally open-ended — the **1.46.x minor grows to fit the work**. Plan:
+  `docs/development/roadmap.md` § 1.46.x; iron hypotheses + falsification: agnosticos
+  `iron-nuc-zen-log.md` `#tracker-146x-cycle`.
+- **Bite 1 — per-process TSS.RSP0 kernel stacks (QEMU-validated; iron-pending).** Each proc slot
+  gets its own kernel interrupt stack (`proc_rsp0[16]`, `proc_rsp0_top`), assigned in
+  `proc_alloc_slot` from a dedicated pool — **region 7 (phys 0xE00000–0x1000000 = 14–16 MB)**,
+  reserved in `pmm_init`. `do_context_switch`, `sys_sched_yield`, and `exec_and_wait` now point
+  `TSS.RSP0` at the switched-to proc's own stack (after the `cr3_load`, for the APIC-read rule),
+  so a preempted ring-3 proc takes its CPL3→CPL0 timer tick on **its own** stack instead of the
+  shared `0x3C0000`. **Scoped to RSP0 only** — the SYSCALL-entry stack stays shared this bite
+  (per-proc syscall stack is deferred to the blocking-`waitpid` bite, where the global SYSRET
+  cells move per-proc as one coherent unit; an adversarial design review showed splitting them
+  would break the execwait#37 second-stack invariant and clobber `r10`/`&kernel_rsp_save` in the
+  SYSCALL stub). **Pool placement:** region 7 sits at the top of the 0–16 MB boot identity map
+  (PD[7]), so it is supervisor-mapped under the boot CR3 *and* every per-proc CR3 (which copies
+  PD[0..127]); region 8 (16 MB) is unusable because the boot `vmm_alloc_at(0x1000000)` probe
+  remaps PD[8]. **Behavior-preserving on single-core / IF=0** (RSP0 is consumed only on a CPL
+  change; the deep FS path stays on the unchanged syscall kstack), so this is inert until
+  `exec_preempt=1` (a later bite) makes agnsh preemptive. Validated: `ring3-smoke` 8/8 (IF=1 procs
+  take real preempts onto distinct region-7 stacks — a misplaced stack would #DF the preempt),
+  `agnsh-smoke` PASS, `check.sh` 11/11, `thread-smoke` PASS. `build/agnos` 1,210,368 B.
 
 ## [1.45.17] — 2026-06-23
 

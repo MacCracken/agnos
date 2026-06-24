@@ -90,6 +90,17 @@ fn pmm_init() {
     # image ever crosses 4 MB (check `readelf -l build/agnos` LOAD MemSiz).
     memset(&pmm_bitmap, 0xFF, 128);
     pmm_used = 1024;
+    # 1.46.1 (per-process kernel stacks): also reserve region 7 — pages 3584-4095 =
+    # phys 0xE00000-0x1000000 = 14-16MB — as the per-proc kernel-stack pool
+    # (proc_rsp0_top hands each proc a 64KB stack here). Region 7 is the TOP of the
+    # 0-16MB boot identity map (PD[7]), so it is supervisor-mapped under the boot CR3
+    # AND every per-proc CR3 (which copies PD[0..127]); region 8 (16MB) is NOT usable
+    # — the boot vmm_alloc_at(0x1000000) probe below remaps PD[8]. Reserving it here
+    # (before any alloc) keeps pmm_alloc / pmm_alloc_2mb out. byte 3584/8=448; 512
+    # pages = 64 bytes. NOTE: if the kernel image ever reaches 14MB this collides —
+    # check `readelf -l build/agnos` LOAD MemSiz.
+    memset(&pmm_bitmap + 448, 0xFF, 64);
+    pmm_used = pmm_used + 512;
 
     # KASLR: seed next-free hint from RDRAND so dynamic allocations
     # land at a randomized offset within the available 4-16 MB range
@@ -102,7 +113,7 @@ fn pmm_init() {
     # which would land outside the valid page range.
     var seed = kaslr_seed();
     if (seed < 0) { seed = 0 - seed; }
-    pmm_next_free = 1024 + (seed % 3072);   # pages 1024-4095 (3072 free pages)
+    pmm_next_free = 1024 + (seed % 2560);   # pages 1024-3583 (2560 free pages; region 7 = pages 3584-4095 reserved for the 1.46.1 kstack pool)
     return 0;
 }
 

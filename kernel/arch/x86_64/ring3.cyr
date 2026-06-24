@@ -99,7 +99,14 @@ fn exec_and_wait(entry, rsp, cr3) {
     # tss_set_rsp0 reads the Local APIC (0xFEE00020) for the CPU id, which the
     # user CR3 does not map — reading it AFTER the switch faulted (→ #PF → #DF →
     # triple fault, the ring-3 bring-up blocker). Done here under the kernel CR3.
-    tss_set_rsp0(tss_kernel_stack);
+    # 1.46.1: per-proc RSP0 — the foreground proc (proc_current: agnsh for kybernet's
+    # launch, the child for execwait#37) takes its CPL3->CPL0 interrupts on ITS OWN
+    # region-7 stack. Falls back to 0x3C0000 (= tss_kernel_stack) for an unassigned
+    # slot, so this is byte-identical where it used to pass tss_kernel_stack. Inert
+    # at IF=0 (foreground run-to-completion takes no timer interrupt); forward-correct
+    # for when exec_preempt=1 makes agnsh preemptible. Kept BEFORE the CR3 switch (the
+    # APIC-read rule above).
+    tss_set_rsp0(proc_rsp0_top(proc_current));
 
     # Switch CR3 and enter ring 3 (use user CR3 for KPTI). After the switch
     # enter_ring3 only writes the iretq frame at 0x7000 (in the 0-2 MB
