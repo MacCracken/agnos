@@ -85,6 +85,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     were removed.
   - **Validated:** agnsh-smoke PASS, check.sh 11/11, ring3-smoke PASS, fat-write-smoke PASS. APs still
     parked (the flip is sub-bite 7). `build/agnos` 1,212,736 B.
+- **SMP arc sub-bite 3 — `proctab_lock` + a claiming sentinel** (`smp.cyr`/`proc.cyr`). `proc_alloc_slot`'s
+  scan-for-free + claim + `proc_count`-bump now run under `proctab_lock` (fixed-global), and the chosen
+  slot is marked with a **CLAIMING sentinel (state=3)** before the lock releases. A bare lock fixes the
+  count-bump race but NOT the dead-slot-reuse race — `proc_alloc_slot` returned an *unclaimed* slot (state
+  still 0), so a second CPU's scan (which reuses only state==0) would re-grab the same index before the
+  caller (`proc_create`/`proc_create_full`) set state=1; the sentinel makes the slot invisible to both the
+  scan and `sched_next` (which selects only state==1) until it's initialized. State machine: 0=dead/free ·
+  1=ready · 2=running · 3=claiming. The reap-path `proc_count` decrements (`proc_reap`/`proc_reap_child`)
+  are also under the lock. Inert single-core (the sentinel is overwritten before any scheduler runs);
+  validated as no-regression by ring3-smoke (non-LIFO slot reuse + ≥8-proc stress) + thread-smoke +
+  check.sh 11/11 + agnsh-smoke. Completes sub-bite 3's global-structure locks (heap/vfs/proctab);
+  `sched_lock` folds into sub-bite 6/7. `build/agnos` 1,213,024 B.
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a

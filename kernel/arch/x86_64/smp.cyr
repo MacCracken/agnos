@@ -50,6 +50,7 @@ fn spin_unlock() {
 # a context switch, a blocking poll, or a kprint that scrolls.
 var heap_lock = 0;
 var vfs_lock = 0;
+var proctab_lock = 0;
 fn heap_spin_lock() {
     var old = 1;
     while (old == 1) {
@@ -87,6 +88,31 @@ fn vfs_spin_lock() {
 }
 fn vfs_spin_unlock() {
     var addr = &vfs_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+# proctab_lock guards proc_alloc_slot's scan/claim/proc_count-bump + the reap-path proc_count
+# decrement (proc_reap/proc_reap_child). Short, non-nesting (the critical sections do no I/O
+# and no allocation → no re-entry). Fixed-global (no param), like the heap/vfs pairs.
+fn proctab_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &proctab_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn proctab_spin_unlock() {
+    var addr = &proctab_lock;
     asm {
         0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
         0x48; 0x31; 0xC9;              # xor rcx, rcx
