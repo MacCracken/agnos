@@ -141,6 +141,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `store64(+8)` disp shifts the stream), so ring3-smoke #44 yield (8/8) is decisive. Runtime-buffer
     objdump confirmed the encodings (`4E 8B 14 C5`, `shl r10,6`, `41 0F 22 DA` not `44…`). Re-verified on
     main: agnsh + check.sh 11/11 + ring3 + exec all green. `build/agnos` 1,215,408 B.
+- **SMP arc sub-bite 4d — per-CPU execwait#37 guard** (`syscall.cyr`/`sched.cyr`). The single `ew37_busy`
+  re-entrancy guard (1 while a #37 nested exec is in flight) becomes `pcpu_ew37_busy[4]` with capped
+  `pcpu_ew37_busy_get()`/`_set()` accessors, so each CPU tracks its own nested-exec state. All 6 sites
+  (`syscall.cyr` ×5 + `sched.cyr:333` #44-yield gate) converted via the delete-the-global forcing function
+  (grep-clean). The ew37 `kernel_rsp_save`/`kpti_*` snapshot/restore already uses `pcpu_*[cpu]` (4b/4c);
+  the remaining `ew37_*` scratch (cr3/cpid/code/path) stays global — deferred-conservative, since only a
+  post-flip simultaneous nest collides (inert single-core). C-only, stub bytes byte-identical to 4c.
+  agnsh + check.sh 11/11 + ring3 (#44) + exec (#37) green. `build/agnos` 1,215,584 B.
+  **★ This completes sub-bite 4 — the per-CPU SYSCALL stub (4a split + 4b kstack/RSP + 4c CR3/capture + 4d
+  guard), the SMP arc's hardest piece, is fully done. Remaining: sub-bite 5 (lock FS/devices/console),
+  6 (AP runs the scheduler), 7 (the iron-gated wake flip).**
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a

@@ -330,7 +330,7 @@ fn sys_sched_yield() {
     # Refuse during an execwait#37 nested exec: suspended agnsh sits state-1
     # (SCHEDULABLE) with its real continuation frozen in the #37 kstack frame — a
     # yield-switch could select its STALE slot and resume the shell incoherently.
-    if (ew37_busy != 0) { return 0; }
+    if (pcpu_ew37_busy_get() != 0) { return 0; }
     # Refuse IF=0 callers (foreground exec/execwait children): their no-context-switch
     # model is load-bearing; yield is a no-op there, not an error.
     if ((load64(sc_scr_base() + 8) & 0x200) == 0) { return 0; }   # 4c: THIS cpu's block (base folds pcpu_cpu()*64)

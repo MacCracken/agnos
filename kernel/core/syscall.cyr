@@ -75,7 +75,16 @@ var ew37_cr3 = 0;         # agnsh's CR3 (kpti_user_cr3 the exit stub reloads int
 var ew37_cpid = 0;        # child pid — MUST be a global (a [rbp-N] local survives via
 # the disjoint kstack, but globals are the contract here)
 var ew37_code = 0;        # child exit code captured post-resume
-var ew37_busy = 0;        # re-entrancy guard: 1 while a #37 nested exec is in flight
+# 1.46.x SMP sub-bite 4d: the #37 re-entrancy guard goes PER-CPU (was a single global `ew37_busy`).
+# Each CPU tracks its OWN nested-exec state so a #37 in flight on CPU N does not block CPU M. Capped
+# via pcpu_cpu() (syscall_hw.cyr); single-core fast path = slot 0 → byte-for-byte the old global.
+# NOTE (deferred-conservative, inert single-core): the ew37_* SCRATCH globals above (ew37_cr3/_cpid/
+# _code/_path + ew37_ctx) are NOT yet per-CPU — the ew37 save/restore of kernel_rsp_save+kpti_* already
+# uses pcpu_*[cpu] (4b/4c), but two CPUs nesting #37 SIMULTANEOUSLY would collide on this scratch. That
+# only becomes reachable post-flip (sub-bite 7); make ew37_* per-CPU then if simultaneous nest enters scope.
+var pcpu_ew37_busy[4];
+fn pcpu_ew37_busy_get() { return load64(&pcpu_ew37_busy + pcpu_cpu() * 8); }
+fn pcpu_ew37_busy_set(v) { store64(&pcpu_ew37_busy + pcpu_cpu() * 8, v); return 0; }
 var ew37_path[16];        # kernel copy of the caller's path cstr (128 B). elf_load_from_file
 # does ext2/NVMe I/O under boot CR3 (the user VA + the NVMe BAR are
 # NOT both mapped under one CR3), so the path is copied here from the
@@ -1098,7 +1107,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg2 > 127) { stack_canary_check(canary); return 0 - 1; }
         if (ext2_active == 0) { stack_canary_check(canary); return 0 - 1; }
-        if (ew37_busy != 0) { stack_canary_check(canary); return 0 - 1; }
+        if (pcpu_ew37_busy_get() != 0) { stack_canary_check(canary); return 0 - 1; }
 
         # (b) COPY the user path into the kernel buffer NOW, while CR3 is still the
         # caller's (so the user VA resolves) and SMAP AC=1 (the entry stub's STAC).
@@ -1123,7 +1132,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         ew37_resume_pid = exec_resume_pid;          # 1.44.14: save agnsh's resume-pid; the nested
         # exec_and_wait(child) overwrites exec_resume_pid = child, restored below post-resume.
         ew37_cr3      = proc_get_cr3(proc_current_get()); # agnsh's CR3 (robust source)
-        ew37_busy     = 1;
+        pcpu_ew37_busy_set(1);
 
         # (d) switch to the BOOT CR3 (maps all phys incl. the NVMe BAR) for the disk
         # I/O, then load the child ELF from the kernel path copy (own address space;
@@ -1150,7 +1159,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var ew_plen = ew_pe - ew_ps;
         if (ew_plen < 1) {                          # empty / all-spaces path token
             cr3_load(ew37_cr3);
-            ew37_busy = 0;
+            pcpu_ew37_busy_set(0);
             stack_canary_check(canary);
             return 0 - 1;
         }
@@ -1180,7 +1189,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var cpid = elf_load_from_file(pdst + ew_ps, ew_plen, pdst, arg2);
         if (cpid < 0) {
             cr3_load(ew37_cr3);
-            ew37_busy = 0;
+            pcpu_ew37_busy_set(0);
             stack_canary_check(canary);
             return 0 - 1;
         }
@@ -1259,7 +1268,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # (proc.cyr:153) is the robust param-based idiom.
         cr3_load(ew37_cr3);
 
-        ew37_busy = 0;
+        pcpu_ew37_busy_set(0);
         # (l) NO post-resume canary check: the entry `canary` local was legitimately
         # handed to exec_and_wait's longjmp; ksyscall's canary guards CALLEE overruns
         # and there are no callees after this point (syscall.cyr:250-258). Return the
