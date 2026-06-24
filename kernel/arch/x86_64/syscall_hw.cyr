@@ -51,8 +51,34 @@ var ksyscall_a4 = 0;
 # Consumed only by #44 within the SAME serial IF=0 syscall — per-syscall overwrite is safe,
 # incl. under execwait#37 nesting (the suspended #37 caller's SYSRET state lives in the
 # untouched kstack cells, never here). Layout (u64): [0]=rcx [1]=r11 [2]=rbx [3]=rbp
-# [4]=r12 [5]=r13 [6]=r14 [7]=r15. Oversized allocation (paranoia margin on a hot buffer).
-var sc_entry_regs[64];
+# [4]=r12 [5]=r13 [6]=r14 [7]=r15.
+#
+# 1.46.x SMP sub-bite 4c: this capture block goes PER-CPU. The old single `sc_entry_regs`
+# global was a hard single-core invariant — two CPUs in the stub at once would clobber one
+# another's capture, and #44's SYSRET-parity slot-write would read another CPU's user state.
+# Now an 8-cell (64-byte) block per CPU: `pcpu_sc_entry_regs[32]` = 8 u64 cells * 4 CPUs, the
+# block for cpu c starting at byte c*64. The stub bakes the per-CPU base via `mov r10,r8;
+# shl r10,6` (r8 = capped APIC cpu from the 4b entry block) so [r10 + (&pcpu_sc_entry_regs+cell)]
+# = cpu*64 + base + cell. The C-side #44 reader uses sc_scr_base() (folds pcpu_cpu()*64) so the
+# existing +0/+8/.../+56 cell offsets read VERBATIM into THIS cpu's block.
+var pcpu_sc_entry_regs[32];
+
+# 1.46.x SMP sub-bite 4c: the KPTI CR3 pair the stub installs on entry (kernel CR3) and exit
+# (user CR3), now PER-CPU. The old single `kpti_kernel_cr3` / `kpti_user_cr3` globals (proc.cyr)
+# were a single-core invariant — one CPU's scheduler CR3 update would steer another CPU's stub
+# CR3 install. Each is `var X[4]` = 4 u64 (cpu c at byte c*8). The stub bakes the per-CPU base
+# via `mov r10,[r8*8+disp32]` (r8 = capped APIC cpu); the C-side writers/reader index by
+# pcpu_cpu()*8. KPTI is currently COLLAPSED (kernel==user==running CR3) so the installs are
+# same-value no-ops today, but the per-CPU plumbing is correct for when KPTI un-collapses.
+var pcpu_kpti_kernel_cr3[4];
+var pcpu_kpti_user_cr3[4];
+
+# 1.46.x SMP sub-bite 4c: THIS CPU's sc_entry_regs block base (byte &pcpu_sc_entry_regs + cpu*64).
+# Mirrors the stub's `mov r10,r8; shl r10,6` per-CPU base computation on the C side, so the #44
+# reader's existing +0..+56 cell offsets land in this CPU's 64-byte block.
+fn sc_scr_base() {
+    return &pcpu_sc_entry_regs + pcpu_cpu() * 64;
+}
 
 # C-level handler called from the syscall entry stub.
 # user_rsp = the caller's RSP (saved before switching to kernel stack)
@@ -228,10 +254,14 @@ fn syscall_stub_build() {
     # DISP32-EMIT-WIDTH rule at each emit site.
     var krs_base  = &pcpu_kernel_rsp_save;     # mov [r8*8+disp32], rsp / mov [rax*8+disp32], rdi / mov rsp,[r8*8+disp32]
     var kst_base  = &pcpu_syscall_kstack_top;  # mov rsp, [r8*8+disp32]  (kstack switch)
-    var scr = &sc_entry_regs;
+    # 1.46.x 4c: per-CPU base addresses. scr is the SINGLE u64 base &pcpu_sc_entry_regs; the stub
+    # computes THIS cpu's 64-byte block via `mov r10,r8; shl r10,6` then adds (scr+cell) as the disp32
+    # of each store. kcr3/ucr3 are loaded via `mov r10,[r8*8+disp32]` (r8 = capped APIC cpu). All three
+    # disp32s are EMITTED via store32(+4), NOT store64(+8) — see the DISP32-EMIT-WIDTH rule at each site.
+    var scr = &pcpu_sc_entry_regs;
     var handler = &syscall_handler;
-    var kcr3_addr = &kpti_kernel_cr3;
-    var ucr3_addr = &kpti_user_cr3;
+    var kcr3_addr = &pcpu_kpti_kernel_cr3;
+    var ucr3_addr = &pcpu_kpti_user_cr3;
 
     # 1.41.3 (a4=r10): FIRST instruction — preserve the user's r10 (4th syscall
     # arg) into r9 before the CR3-switch scratch below overwrites r10. r9 is
@@ -270,14 +300,17 @@ fn syscall_stub_build() {
     # S8 (KPTI): Switch from user CR3 to kernel CR3 FIRST.
     # We're ring-0 (SYSCALL changed CPL), user page tables have PD entry 0
     # mapped supervisor-only, so kernel code at 0-2MB is accessible.
-    # Save rax (syscall number) to kernel_rsp_save temporarily, load kernel CR3.
-    # mov r10, imm64(kpti_kernel_cr3 addr); mov r10, [r10]; mov cr3, r10
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
-    store64(ep + eoff, kcr3_addr); eoff = eoff + 8;
-    # mov r10, [r10] — 4D 8B 12
-    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x12); eoff = eoff + 3;
-    # mov cr3, r10 — 44 0F 22 DA
-    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;  # mov cr3, r10 — 41 (REX.B for r10) 0F 22 DA; was 0x44 (REX.R → cr11 → #UD)
+    # 1.46.x 4c POINT 1: load THIS CPU's kernel CR3 from pcpu_kpti_kernel_cr3, install it. r8 holds the
+    # capped APIC cpu (from the 4b entry block; untouched since; this runs under the STILL-user CR3, and
+    # pcpu_kpti_kernel_cr3 is kernel .bss reachable via proc.cyr's PD[0..127] copy). The SIB load folds
+    # the old `mov r10,imm64(&kpti_kernel_cr3); mov r10,[r10]` indirection into one based load.
+    # Was 3 instr; now: mov r10,[r8*8 + &pcpu_kpti_kernel_cr3]; mov cr3,r10.
+    # mov r10, [r8*8+disp32] — 4E 8B 14 C5 <disp32>
+    store8(ep + eoff, 0x4E); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x14); store8(ep + eoff + 3, 0xC5); eoff = eoff + 4;
+    # DISP32-EMIT-WIDTH: store32(+4), NOT store64(+8). disp = the single u64 base &pcpu_kpti_kernel_cr3.
+    store32(ep + eoff, kcr3_addr); eoff = eoff + 4;
+    # mov cr3, r10 — 41 0F 22 DA (REX.B for r10; NOT 0x44 = REX.R → cr11 → #UD)
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;
 
     # 1.44.16 (sched_yield #44): capture rcx/r11/rbx/rbp/r12-r15 into sc_entry_regs — see
     # the buffer's header comment. PLACEMENT IS LOAD-BEARING: r10 is free scratch ONLY here
@@ -288,25 +321,40 @@ fn syscall_stub_build() {
     # pushed, not modified). Straight-line stores: no flags effects, no branch displacement to
     # hand-maintain (the 0x44→0x41 REX bug above is the precedent for emit fragility), ~10
     # cycles — dwarfed by the mov-cr3 pair (1.42.9 perf survey).
-    # mov r10, imm64(&sc_entry_regs) — 49 BA imm64
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
-    store64(ep + eoff, scr); eoff = eoff + 8;
-    # mov [r10], rcx — 49 89 0A   (user RIP)
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x0A); eoff = eoff + 3;
-    # mov [r10+8], r11 — 4D 89 5A 08   (user RFLAGS)
-    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x5A); store8(ep + eoff + 3, 0x08); eoff = eoff + 4;
-    # mov [r10+16], rbx — 49 89 5A 10
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x5A); store8(ep + eoff + 3, 0x10); eoff = eoff + 4;
-    # mov [r10+24], rbp — 49 89 6A 18
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x6A); store8(ep + eoff + 3, 0x18); eoff = eoff + 4;
-    # mov [r10+32], r12 — 4D 89 62 20
-    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x62); store8(ep + eoff + 3, 0x20); eoff = eoff + 4;
-    # mov [r10+40], r13 — 4D 89 6A 28
-    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x6A); store8(ep + eoff + 3, 0x28); eoff = eoff + 4;
-    # mov [r10+48], r14 — 4D 89 72 30
-    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x72); store8(ep + eoff + 3, 0x30); eoff = eoff + 4;
-    # mov [r10+56], r15 — 4D 89 7A 38
-    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x7A); store8(ep + eoff + 3, 0x38); eoff = eoff + 4;
+    # 1.46.x 4c POINT 2: compute THIS CPU's 64-byte sc_entry_regs block base in r10 from r8 (capped APIC
+    # cpu). r10*64 = cpu*64 = the per-CPU byte stride; the 8 stores below then add (&pcpu_sc_entry_regs +
+    # cell) as a disp32, so each lands at cpu*64 + base + cell = this cpu's cell. Was `mov r10,imm64(
+    # &sc_entry_regs)`. NOTE the shift is 6 (*64 = 8 u64 cells), NOT any other count.
+    # mov r10, r8 — 4D 89 C2
+    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xC2); eoff = eoff + 3;
+    # shl r10, 6 — 49 C1 E2 06   (*64: 8 u64 cells = 64-byte per-CPU stride)
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xC1); store8(ep + eoff + 2, 0xE2); store8(ep + eoff + 3, 0x06); eoff = eoff + 4;
+    # The 8 capture stores: [r10 + (&pcpu_sc_entry_regs + cell)]. disp32 = scr + cell, EMITTED store32(+4),
+    # NOT store64(+8) — the +8 trap shifts every following byte → triple fault (DISP32-EMIT-WIDTH).
+    # mov [r10+disp32], rcx — 49 89 8A <scr+0>   (user RIP)
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x8A); eoff = eoff + 3;
+    store32(ep + eoff, scr + 0); eoff = eoff + 4;
+    # mov [r10+disp32], r11 — 4D 89 9A <scr+8>   (user RFLAGS)
+    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x9A); eoff = eoff + 3;
+    store32(ep + eoff, scr + 8); eoff = eoff + 4;
+    # mov [r10+disp32], rbx — 49 89 9A <scr+16>
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0x9A); eoff = eoff + 3;
+    store32(ep + eoff, scr + 16); eoff = eoff + 4;
+    # mov [r10+disp32], rbp — 49 89 AA <scr+24>
+    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xAA); eoff = eoff + 3;
+    store32(ep + eoff, scr + 24); eoff = eoff + 4;
+    # mov [r10+disp32], r12 — 4D 89 A2 <scr+32>
+    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xA2); eoff = eoff + 3;
+    store32(ep + eoff, scr + 32); eoff = eoff + 4;
+    # mov [r10+disp32], r13 — 4D 89 AA <scr+40>
+    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xAA); eoff = eoff + 3;
+    store32(ep + eoff, scr + 40); eoff = eoff + 4;
+    # mov [r10+disp32], r14 — 4D 89 B2 <scr+48>
+    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xB2); eoff = eoff + 3;
+    store32(ep + eoff, scr + 48); eoff = eoff + 4;
+    # mov [r10+disp32], r15 — 4D 89 BA <scr+56>
+    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x89); store8(ep + eoff + 2, 0xBA); eoff = eoff + 3;
+    store32(ep + eoff, scr + 56); eoff = eoff + 4;
 
     # 1.46.x 4b point3 SAVE — save user RSP into THIS CPU's pcpu_kernel_rsp_save slot. r8 holds the
     # capped cpu (from the entry APIC block; untouched since). Was `mov r10,imm64(&kernel_rsp_save);
@@ -473,14 +521,17 @@ fn syscall_stub_build() {
     store32(ep + eoff, krs_base); eoff = eoff + 4;
 
     # S8 (KPTI): Switch from kernel CR3 back to user CR3 before SYSRET.
-    # rax has return value — save it, load user CR3, switch, restore.
-    # mov r10, imm64(kpti_user_cr3 addr); mov r10, [r10]; mov cr3, r10
-    store8(ep + eoff, 0x49); store8(ep + eoff + 1, 0xBA); eoff = eoff + 2;
-    store64(ep + eoff, ucr3_addr); eoff = eoff + 8;
-    # mov r10, [r10]
-    store8(ep + eoff, 0x4D); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x12); eoff = eoff + 3;
-    # mov cr3, r10
-    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;  # mov cr3, r10 — 41 (REX.B for r10) 0F 22 DA; was 0x44 (REX.R → cr11 → #UD)
+    # 1.46.x 4c POINT 6: load THIS CPU's user CR3 from pcpu_kpti_user_cr3, install it. r8 was RE-READ by
+    # the 4b exit APIC block just above (the exit reload) and nothing between that block and here writes
+    # r8 (objdump-confirmed: the exit reload's `mov rsp,[r8*8+disp32]` is the last r8 use; the IBRS-clear
+    # block runs AFTER this). The SIB load folds the old indirection. Was 3 instr; now: mov r10,[r8*8 +
+    # &pcpu_kpti_user_cr3]; mov cr3,r10.
+    # mov r10, [r8*8+disp32] — 4E 8B 14 C5 <disp32>
+    store8(ep + eoff, 0x4E); store8(ep + eoff + 1, 0x8B); store8(ep + eoff + 2, 0x14); store8(ep + eoff + 3, 0xC5); eoff = eoff + 4;
+    # DISP32-EMIT-WIDTH: store32(+4), NOT store64(+8). disp = the single u64 base &pcpu_kpti_user_cr3.
+    store32(ep + eoff, ucr3_addr); eoff = eoff + 4;
+    # mov cr3, r10 — 41 0F 22 DA (REX.B for r10; NOT 0x44 = REX.R → cr11 → #UD)
+    store8(ep + eoff, 0x41); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x22); store8(ep + eoff + 3, 0xDA); eoff = eoff + 4;
 
     # S9: Clear IBRS before returning to user mode (avoid user-mode perf hit)
     if (ibrs_supported == 1) {

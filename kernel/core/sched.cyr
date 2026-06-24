@@ -217,9 +217,9 @@ fn do_context_switch(isr_rsp) {
     if (new_cr3 != old_cr3) {
         cr3_load(new_cr3);
     }
-    # S8 (KPTI): update global CR3 pair for SYSCALL stub
-    kpti_kernel_cr3 = new_cr3;
-    kpti_user_cr3 = proc_get_user_cr3(new_cr3);
+    # S8 (KPTI): update THIS CPU's CR3 pair for the SYSCALL stub (4c per-CPU)
+    store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, new_cr3);
+    store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, proc_get_user_cr3(new_cr3));
 
     # 1.46.1: point TSS.RSP0 at the switched-to proc's OWN kernel stack (per-proc
     # interrupt stack, region 7). AFTER the cr3_load so tss_set_rsp0's APIC read hits
@@ -333,7 +333,7 @@ fn sys_sched_yield() {
     if (ew37_busy != 0) { return 0; }
     # Refuse IF=0 callers (foreground exec/execwait children): their no-context-switch
     # model is load-bearing; yield is a no-op there, not an error.
-    if ((load64(&sc_entry_regs + 8) & 0x200) == 0) { return 0; }
+    if ((load64(sc_scr_base() + 8) & 0x200) == 0) { return 0; }   # 4c: THIS cpu's block (base folds pcpu_cpu()*64)
     var yp = proc_current_get();
     var next = sched_next();
     if (next == yp) { return 0; }                      # nothing else ready — keep the slice
@@ -343,18 +343,18 @@ fn sys_sched_yield() {
     if (proc_get_state(next) != 1) { return 0; }
     # --- Write the yielder's slot AS IF the syscall had returned (SYSRET parity) ---
     var p = &proc_table + yp * 176;
-    store64(p + 24, load64(&sc_entry_regs + 0));       # resume RIP = post-SYSCALL rcx
-    store64(p + 152, load64(&sc_entry_regs + 8));      # RFLAGS = captured r11 (carries IF=1)
+    store64(p + 24, load64(sc_scr_base() + 0));        # resume RIP = post-SYSCALL rcx (4c: THIS cpu's block)
+    store64(p + 152, load64(sc_scr_base() + 8));       # RFLAGS = captured r11 (carries IF=1)
     store64(p + 16, load64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8));   # user RSP (stub-saved at entry, per-CPU 4b)
-    store64(p + 40, load64(&sc_entry_regs + 16));      # rbx   (callee-saved: clean labels)
-    store64(p + 80, load64(&sc_entry_regs + 24));      # rbp
-    store64(p + 120, load64(&sc_entry_regs + 32));     # r12
-    store64(p + 128, load64(&sc_entry_regs + 40));     # r13
-    store64(p + 136, load64(&sc_entry_regs + 48));     # r14
-    store64(p + 144, load64(&sc_entry_regs + 56));     # r15
+    store64(p + 40, load64(sc_scr_base() + 16));       # rbx   (callee-saved: clean labels)
+    store64(p + 80, load64(sc_scr_base() + 24));       # rbp
+    store64(p + 120, load64(sc_scr_base() + 32));      # r12
+    store64(p + 128, load64(sc_scr_base() + 40));      # r13
+    store64(p + 136, load64(sc_scr_base() + 48));      # r14
+    store64(p + 144, load64(sc_scr_base() + 56));      # r15
     store64(p + 112, 0);                               # → ring-3 RAX = 0 (the return value)
-    store64(p + 104, load64(&sc_entry_regs + 0));      # → ring-3 RCX = RIP (SYSRET parity)
-    store64(p + 32, load64(&sc_entry_regs + 8));       # → ring-3 R11 = RFLAGS (SYSRET parity)
+    store64(p + 104, load64(sc_scr_base() + 0));       # → ring-3 RCX = RIP (SYSRET parity)
+    store64(p + 32, load64(sc_scr_base() + 8));        # → ring-3 R11 = RFLAGS (SYSRET parity)
     store64(p + 48, 0);                                # → r10 (dead caller-saved: zero, don't
     store64(p + 56, 0);                                # → r9   leak kernel register contents)
     store64(p + 64, 0);                                # → r8
@@ -375,8 +375,8 @@ fn sys_sched_yield() {
     var new_cr3 = proc_get_cr3(next);
     var old_cr3 = proc_get_cr3(yp);
     if (new_cr3 != old_cr3) { cr3_load(new_cr3); }
-    kpti_kernel_cr3 = new_cr3;                         # OMITTING these re-enters the YIELDER's
-    kpti_user_cr3 = proc_get_user_cr3(new_cr3);        # CR3 on next's first syscall (1.40.x class)
+    store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, new_cr3);                  # OMITTING these re-enters the YIELDER's
+    store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, proc_get_user_cr3(new_cr3)); # CR3 on next's first syscall (1.40.x class); 4c per-CPU
     tss_set_rsp0(proc_rsp0_top(next));                 # 1.46.1: per-proc RSP0 (inert: #44 yield is IF=1-only; agnsh is IF=0 in production)
     proc_check_pending_signals(next);
     # CLAC: the entry stub's STAC pairs with CLAC only on the SYSRET tail we never

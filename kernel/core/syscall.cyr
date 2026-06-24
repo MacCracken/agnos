@@ -1246,8 +1246,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         while (ri < 64) { store64(er + ri, load64(r37 + ri)); ri = ri + 8; }
         kernel_return_rsp = ew37_kr_rsp;             # re-arm (==1): agnsh's exit() resumes kybernet
         kernel_return_rip = ew37_kr_rip;
-        kpti_kernel_cr3   = ew37_cr3;                # agnsh's CR3 (kernel-side)
-        kpti_user_cr3     = ew37_cr3;                # the value the exit stub reloads into CR3 pre-SYSRET
+        store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, ew37_cr3);   # agnsh's CR3 (kernel-side); 4c per-CPU
+        store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, ew37_cr3);      # the value the exit stub reloads into CR3 pre-SYSRET
         store64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8, ew37_rsp_save);   # the exit stub reloads rsp from this CPU's pcpu_kernel_rsp_save slot pre-SYSRET (per-CPU 4b)
         ksyscall_a4       = ew37_a4;
         proc_current_set(ew37_pid);                # agnsh's pid (its write/exit attribute to agnsh)

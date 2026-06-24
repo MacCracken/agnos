@@ -282,9 +282,10 @@ fn proc_get_exit_code(pid) {
 #   User CR3:   only PD entry 0 (supervisor-only, for SYSCALL/ISR trampoline)
 #               + user-mapped pages (added later via proc_map_page)
 
-# KPTI globals: current process's CR3 pair (updated by scheduler)
-var kpti_kernel_cr3 = 0x1000;  # Default to boot page tables
-var kpti_user_cr3 = 0x1000;
+# KPTI CR3 pair: 1.46.x SMP sub-bite 4c moved this PER-CPU into pcpu_kpti_kernel_cr3 /
+# pcpu_kpti_user_cr3 (syscall_hw.cyr). The old single globals here were a single-core
+# invariant. Writers: sched.cyr (both switch paths), ring3.cyr, syscall.cyr (ew37 restore).
+# Stub installs them via r8*8 per-CPU loads. KPTI is currently COLLAPSED (kernel==user==running).
 
 # Repair (J) — Attempt 23: PMM-allocation CMOS-stamp call counter.
 # Distinguishes successive `proc_create_address_space` invocations so each

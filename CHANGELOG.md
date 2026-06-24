@@ -124,6 +124,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     main: agnsh-smoke + check.sh 11/11 + ring3-smoke (#44 yield reads the per-CPU slot) + exec-smoke (#37
     nested swap-back) all green. SMP isolation under contention stays iron-gated (TCG can't race; cpu<4 cap
     makes single-core byte-identical-behavior). `build/agnos` 1,215,232 B.
+- **SMP arc sub-bite 4c — per-CPU KPTI CR3 pair + SYSRET-capture block** (`syscall_hw.cyr`/`sched.cyr`/`ring3.cyr`/`syscall.cyr`/`proc.cyr`).
+  The last three SYSCALL-path globals go per-CPU: `kpti_kernel_cr3`/`kpti_user_cr3` (the CR3 pair the stub
+  installs on entry/exit) → `pcpu_kpti_*[4]`, and `sc_entry_regs` (the 8-cell rcx/r11/rbx/rbp/r12-r15 #44
+  capture block) → `pcpu_sc_entry_regs[32]` (8 cells × 4 CPU, cpu c at byte c*64). Stub points 1/6 become
+  `mov r10,[r8*8+disp32]; mov cr3,r10`; point 2 becomes `mov r10,r8; shl r10,6` (×64 stride) then eight
+  `[r10+disp32]` capture stores. The C readers reuse the existing `+0..+56` offsets verbatim via a
+  `sc_scr_base()` helper that folds in `pcpu_cpu()*64` (the load-bearing per-CPU byte-bias). All readers/
+  writers (`sched.cyr` context-switch + #44 yield, `ring3.cyr` exec + cr3_load, syscall.cyr ew37 restore)
+  were converted in lockstep via the **delete-the-global compile-fail forcing function** — grep confirms
+  zero bare `kpti_*`/`sc_entry_regs` refs remain. **This completes the per-CPU SYSCALL-stub conversion
+  (4a split + 4b kstack/RSP + 4c CR3/capture).**
+  - **Process:** worktree-implemented from the verified spec, four-lens adversarial review (byte-decode,
+    register-survival/r8-at-point6, c-site-lockstep/sc-bias, residency/kpti-collapse) — all SOUND, zero
+    fatal bugs. Both failure modes are **TCG-visible** (a wrong `+cpu*64` bias reads CR3 as RIP/RFLAGS; a
+    `store64(+8)` disp shifts the stream), so ring3-smoke #44 yield (8/8) is decisive. Runtime-buffer
+    objdump confirmed the encodings (`4E 8B 14 C5`, `shl r10,6`, `41 0F 22 DA` not `44…`). Re-verified on
+    main: agnsh + check.sh 11/11 + ring3 + exec all green. `build/agnos` 1,215,408 B.
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a
