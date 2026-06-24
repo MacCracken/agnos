@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.46.0] — 2026-06-24
+
+### Added
+- **1.46.x cycle opened — per-process kernel stacks → true preemptive multitasking on iron
+  (the SMP / multi-threading revisit).** The 1.44.x multi-threading arc's deferred namesake,
+  promoted to its own cycle. Each process gets its own kernel stack instead of the shared serial
+  `syscall_kstack_top` / TSS `RSP0`, which unblocks together: **IF=1 preemptive `agnsh` on iron**
+  (re-enable the `exec_preempt` gate the 1.44.x iron path runs cooperatively), **blocking `waitpid`**
+  (yield mid-wait without clobbering a suspended kernel frame), and the rejected Option-A
+  blocking-read-yield. Folds in the **SMP-AP wake re-enable + iron-validate** (gated off at 1.44.25,
+  `smp_wake_enabled=0`) and the four 1.44.22 audit-deferred cleanups (loader DRY-up, `sched_next`
+  single-pass, the `waitpid`#4 ownership gate via real ppid tracking, MADT AP-enum).
+- The arc is intentionally open-ended — the **1.46.x minor grows to fit the work**. **1.46.0 is the
+  cycle-open** (VERSION + `kernel/version.cyr` banner literal + state/roadmap/iron-log tracker); no
+  kernel source changed yet, so the binary is still the 1.45.17 build. The first engineering bite is
+  per-process kernel stacks. Plan: `docs/development/roadmap.md` § 1.46.x; iron hypotheses +
+  falsification: agnosticos `iron-nuc-zen-log.md` `#tracker-146x-cycle`.
+
 ## [1.45.17] — 2026-06-23
 
 ### Fixed
