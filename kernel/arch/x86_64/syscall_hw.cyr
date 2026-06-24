@@ -85,9 +85,12 @@ fn syscall_kstack_reserve() {
     return 0;
 }
 
-fn syscall_init() {
-    syscall_kstack_reserve();   # no-op if already reserved early in boot
-
+# 1.46.x SMP sub-bite 4a: per-CPU SYSCALL MSRs (STAR/LSTAR/SFMASK/EFER). The BSP runs this via
+# syscall_init; an AP will run it DIRECTLY at bring-up (sub-bite 6) without rebuilding the shared
+# stub. LSTAR points at syscall_entry_buf, which syscall_stub_build (BSP-once) fills. No [rbp-N]
+# hand-asm here (the LSTAR `var v=VALUE; asm{…rax…}` idiom is register-based), so the split is
+# frame-offset-safe; the only [rbp-N] hardcode (the IBRS cpuid capture) stays in syscall_init.
+fn syscall_msr_init() {
     # Program the MSRs for SYSCALL/SYSRET.
     # MSR 0xC0000081 (STAR): segment selectors
     #   Bits 47:32 = kernel CS selector (0x08) — for SYSCALL entry
@@ -149,6 +152,15 @@ fn syscall_init() {
         0x0D; 0x01; 0x00; 0x00; 0x00;
         0x0F; 0x30;
     }
+    return 0;
+}
+
+# BSP boot entry: reserve the syscall kstack, program this CPU's MSRs, detect IBRS, then build the
+# shared SYSCALL entry stub ONCE. `cpuid_edx` is the SOLE local here so it lands at [rbp-0x08] —
+# the offset the IBRS-capture asm hardcodes (the spin_unlock sole-local pattern; objdump-verified).
+fn syscall_init() {
+    syscall_kstack_reserve();   # no-op if already reserved early in boot
+    syscall_msr_init();
 
     # S9: Check CPUID for IBRS support (leaf 7, subleaf 0, EDX bit 26)
     ibrs_supported = 0;
@@ -162,7 +174,15 @@ fn syscall_init() {
     if ((cpuid_edx & (1 << 26)) != 0) {
         ibrs_supported = 1;
     }
+    syscall_stub_build();
+    return 0;
+}
 
+# BSP-ONCE: emit the shared SYSCALL entry stub into syscall_entry_buf. APs must NOT call this (they
+# share the BSP-built buffer). Pure byte emission (store8/store64) — no [rbp-N] hand-asm, so the
+# extraction is frame-offset-safe. (The syscall_stub_built once-guard + the ew37 rebuild removal
+# are coupled, deferred to 4b per the adversarial review.)
+fn syscall_stub_build() {
     # Build the SYSCALL entry stub in syscall_entry_buf.
     # On entry from SYSCALL:
     #   RCX = user RIP (return addr)

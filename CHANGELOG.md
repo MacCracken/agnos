@@ -97,6 +97,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   validated as no-regression by ring3-smoke (non-LIFO slot reuse + ≥8-proc stress) + thread-smoke +
   check.sh 11/11 + agnsh-smoke. Completes sub-bite 3's global-structure locks (heap/vfs/proctab);
   `sched_lock` folds into sub-bite 6/7. `build/agnos` 1,213,024 B.
+- **SMP arc sub-bite 4a — split `syscall_init`** (`kernel/arch/x86_64/syscall_hw.cyr`). The SYSCALL setup
+  is now `syscall_msr_init()` (per-CPU: STAR/LSTAR/SFMASK/EFER — an AP will run this directly at bring-up
+  without rebuilding the shared stub) + `syscall_stub_build()` (BSP-once: the raw-byte stub emission) +
+  `syscall_init()` (BSP orchestrator: kstack-reserve → msr-init → IBRS-detect → stub-build). Pure refactor,
+  **stub bytes unchanged**. The one frame-offset hazard — the IBRS check's `mov [rbp-0x08],rdx` cpuid
+  capture — is kept correct by leaving `cpuid_edx` as `syscall_init`'s SOLE local (the proven `spin_unlock`
+  sole-local pattern); **objdump-verified**: the asm writes `%rdx,-0x8(%rbp)` and the C reads
+  `-0x8(%rbp),%rax` — offsets match, IBRS detection intact. agnsh-smoke / check.sh 11/11 / ring3-smoke (#44
+  yield) green. First step of the adversarially-reviewed sub-bite 4 (per-CPU SYSCALL stub); the dangerous
+  per-CPU stub-byte conversion (4b-4d) follows, gated by objdump-after-each-step. `build/agnos` 1,211,472 B.
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a

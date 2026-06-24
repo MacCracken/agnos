@@ -33,6 +33,32 @@
 - **[sub-bite 6/7] Gate each AP's scheduling on a PER-CPU ready flag** the AP sets AFTER creating its idle proc + initializing `proc_current_pc[my]`, NOT on the global `sched_active` (which the BSP flips at a moment unrelated to AP readiness).
 - **[sub-bite 6] LVT mask is the LEADING-but-UNCONFIRMED keyboard-death fix** — mask AP LINT0 (0xFEE00350)/LINT1 (0xFEE00360). It's iron-only/QEMU-invisible; if it doesn't fix the regression, the flip regresses keyboard on iron → the `smp_sched_aps` kill-switch + STEP-1-alone burn is the mitigation. Also calibrate the AP LAPIC timer count per-CPU (don't blind-copy the BSP's QEMU-tuned count — real-Zen LAPIC bus differs).
 
+## Sub-bite 4 — implementation design (2026-06-24, from reading the live stub)
+
+The regenerated `syscall_entry_buf` has exactly **four baked addresses** that must become APIC-id-indexed:
+1. `kpti_kernel_cr3` (emit @ syscall_hw.cyr:206 — `mov r10,imm64; mov r10,[r10]; mov cr3,r10`, VERY early)
+2. `sc_entry_regs` (@222 — the rcx/r11/rbx/rbp/r12-15 capture base)
+3. `kernel_rsp_save` (@244 — `mov r10,imm64; mov [r10],rsp`; **r10 then MUST survive to @317 `mov rdi,[r10]`** — the hazard)
+4. `syscall_kstack_top` (@252 — `mov rsp,imm64`)
+
+Plus `kpti_user_cr3` read by the EXIT path + `ring3.cyr:114` (a C reader, not the stub).
+
+### VERIFIED via 10-agent adversarial review (2026-06-24) — Design 0 (APIC re-read), NOT a base-pointer register
+
+The review (map → 2 designs → 6 adversarial verifies → synthesis) settled the approach and **corrected three of my own errors above**: `sc_entry_regs` stride is **8 cells / 64 B, not 9** (the stub captures exactly rcx/r11/rbx/rbp/r12-15 = 8 stores); the SIB disp32 must be emitted with **`store32(+4)`, NOT `store64(+8)`** (else every following instruction shifts → corruption); and KPTI is currently **collapsed** (kpti_kernel_cr3 == kpti_user_cr3 == running CR3) so the CR3 "switches" are same-value no-ops today.
+
+**Chosen: Design 0 — carry cpu in r8 ONLY inside the entry window; RE-READ the APIC at the other two windows** (off-100 consumer → into rax; exit → into r8). 3 MMIO reads/syscall, **zero cross-call register-survival assumption**. (Design 1 parked the per-CPU base in r12 across `call syscall_handler`; cc5 *does* preserve r12 via frame-slot save/restore — so it'd work today — but it rests on a cross-kernel ABI invariant that rots as the kernel grows, and correction #27 says NEVER r12. Rejected.) **The r10 hazard is DISSOLVED**: point-3 SAVE becomes `mov [r8*8+disp32],rsp` (no r10), and the off-100 consumer re-reads the APIC into rax then `mov rdi,[rax*8+disp32]`.
+
+**Per-CPU storage** (APIC-id-indexed, cpu capped <4 in BOTH the stub and every C accessor — `tss_get_current_cpu_id` does NOT cap): `pcpu_kpti_kernel_cr3[4]`, `pcpu_kpti_user_cr3[4]`, `pcpu_kernel_rsp_save[4]`, `pcpu_sc_entry_regs[32]` (8 u64 × 4, cpu c at byte c*64), `pcpu_syscall_kstack_top[4]` = `0xF10000+cpu*0x10000`, `pcpu_syscall_kstack_top2[4]` (nested) = `0xF90000+cpu*0x10000` — region 7 (PD[7]), above the proc_rsp0 0xF00000 ceiling, pmm-reserved, in the PD[0..127] copy so supervisor-mapped under every per-proc CR3. The `pcpu_*` .bss (currently ~0x197a08-0x223328, spans PD[0]+PD[1]) is reachable at point-1 under the still-user CR3 **because proc.cyr copies PD[0..127], NOT because it's <2 MB** (the "<2MB" reviewer claim was wrong). Build-assert all `&pcpu_* < 0x10000000` (PD[127]) and `< 0x7FFFFFFF` (disp32-positive).
+
+**Decomposition — each value's stub edit AND ALL its C readers/writers land in the SAME bite** (GATE 1, both reviewers' #1 fatal: splitting a stub-writer from its C-reader = split-brain that fails the gated smokes):
+- **4a** ✅ **DONE 2026-06-24** (objdump-verified, stub bytes UNCHANGED): split `syscall_init` → `syscall_msr_init` (APs run) + `syscall_stub_build` (BSP-once) + orchestrator. Instead of the global-`g_cpuid_edx` form (which needs a symbol address inside inline asm — uncertain mechanism), the `cpuid_edx [rbp-0x08]` hardcode was kept correct by making `cpuid_edx` `syscall_init`'s SOLE local (the proven `spin_unlock` sole-local pattern); objdump confirms the asm writes `%rdx,-0x8(%rbp)` and the C reads `-0x8(%rbp),%rax` — offsets match, IBRS intact. The `syscall_stub_built` once-guard was DEFERRED (it couples with the ew37 rebuild removal in 4b; the split alone gives APs `syscall_msr_init` without rebuilding, which is 4a's goal). agnsh/check11/ring3 green.
+- **4b** (HIGHEST RISK — kstack VALUE moves 0x3F0000→0xF10000, must pass a real boot): per-CPU `kernel_rsp_save` + `syscall_kstack_top` in the stub (entry APIC→r8 block; point-3/point-4/off-100/exit rewrites) + ALL C sites (`sched.cyr:348`, ew37 snapshot `syscall.cyr:1120`/restore `:1248`) + REMOVE the ew37 runtime stub-rebuild (`syscall.cyr:1226-1227`).
+- **4c**: per-CPU `kpti_kernel_cr3`/`kpti_user_cr3`/`sc_entry_regs` (stub points 1,2,6) + ALL C sites in lockstep via the delete-the-global compile-fail forcing function (`sched.cyr:221/378` + `:336-357`, `ring3.cyr:114`/`:83-84`, syscall.cyr ew37). The `+cpu*64` sc_entry_regs bias is TCG-VISIBLE (#44 yield breaks immediately if wrong).
+- **4d** (C-only, stub byte-identical to 4c): per-CPU `ew37_busy` + the snapshot/restore set.
+
+**GATE 2 (every step):** `objdump -D -b binary -m i386:x86-64` the dumped buffer — confirm each `jb` lands EXACTLY past its `xor` (entry `jb +3` skips REX'd `45 31 C0`; off-100 `jb +2` skips `31 C0`), every disp32 leaves the next instruction decoding cleanly, `mov cr3,r10` = `41 0F 22 DA` (not `44…`→cr11→#UD), sc_entry_regs uses `shl r10,6`; 4a must be byte-IDENTICAL to pre-4a + `objdump -d` proves no surviving `[rbp-N]` for the cpuid result. Single-core agnsh/ring3/exec green at each step. **NO-GO without iron for any SMP-correctness claim** — TCG can't catch races; the cpu<4 cap only proves BSP-slot-0 byte-identity. Residual: no mid-syscall CPU migration is a relied-upon invariant (the 3 re-reads assume entry-cpu == off100-cpu == exit-cpu; true at IF=0/serial).
+
 ## Validation reality
 
 TCG smokes CANNOT catch SMP races (scheduler selftests are TCG-only; KVM races kybernet at boot). So single-core green is NECESSARY but NOT SUFFICIENT for sub-bites 4/6/7 — those need careful-KVM (`-smp 4` + 2 procs spinning getpid/write, long dwell) + iron on archaemenid (the ONLY place keyboard-death + real-Zen INIT-SIPI timing manifest). Burn order via `smp_sched_aps`: STEP 1 (wake + AP-idle-only) first, THEN STEP 2 (real procs on APs). Read the framebuffer photo for iron diagnosis, never CMOS.
