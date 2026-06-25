@@ -43,16 +43,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `proc_reap_child` refuses the running proc, so a context switch — which clears `on_cpu` — already
     happened), so the loop never iterates. ring3-smoke's spawn#3→waitpid#4→reap + 8-proc + non-LIFO
     slot-reuse paths run straight through it without deadlock.
-  - **AP LAPIC timer calibration** (`apic.cyr`/`smp.cyr`). A new `lapic_timer_calibrate()` measures the
-    LAPIC timer (divide-by-1) against a PIT-channel-2-timed 10 ms window (the fixed 1193182 Hz crystal,
-    independent of the ch0 IRQ0 timebase → the running scheduler tick is untouched, speaker bit left off)
-    and caches the ~100 Hz reload count in `lapic_timer_count_100hz`. Called on the BSP from
-    `smp_start_aps` (so it runs only under `smp_wake_enabled=1` — production single-core never touches the
-    PIT ch2 path); `ap_entry` arms its timer with the calibrated count, falling back to the QEMU-tuned
-    `10000000` only if calibration yields 0. One core crystal → the BSP-measured count is correct for
-    every AP. Replaces the hardcoded QEMU-bus `10000000` that was known-wrong on real Zen.
-  - Validated: production build (`smp_wake_enabled=0`) `build/agnos` 1,220,960 B, check.sh 11/11,
-    agnsh-smoke, ring3-smoke, thread-smoke, smp-smoke (APs parked, boot continuity) — all green.
+  - **AP LAPIC timer count inherits the BSP's configured reload** (`apic.cyr`/`smp.cyr`). `apic_timer_init`
+    now records its `count` in a `lapic_timer_count` global; `ap_entry` arms its timer with THAT instead of
+    a separately-hardcoded `10000000`, so every CPU's scheduler tick runs at the BSP's exact, iron-proven
+    rate (no AP/BSP skew). **Why not measure the LAPIC frequency:** the BSP timebase *is* the LAPIC timer
+    (pic.cyr masks the legacy PIT IRQ0 once it owns the timebase), so `timer_ticks` is driven by it — any
+    reprogram-to-measure freezes `timer_ticks` and deadlocks; a PIT-channel-2 port-0x61 readback variant
+    additionally hung under QEMU q35 (that emulation doesn't drive the ch2 OUT bit — caught by a `-smp 4`
+    QEMU boot before the burn). Inheriting the BSP's working count sidesteps both. (True Hz-calibration, if
+    ever wanted, is a separate enhancement to the BSP timebase, not AP-side.)
+  - Validated: production build (`smp_wake_enabled=0`) `build/agnos` 1,220,416 B, check.sh 11/11,
+    agnsh-smoke, ring3-smoke (8/8), thread-smoke, smp-smoke (APs parked, boot continuity) — all green; the
+    GAP-C fence is exercised by ring3's spawn/waitpid/reap. The STEP-1 burn artifact (`smp_wake_enabled=1`,
+    `smp_sched_aps=0`) boots clean under QEMU `-smp 4` to the agnsh prompt (`cpus online: 4`, APs parked).
     Still iron-gated at the flip: the LVT-mask keyboard-death efficacy + the idle double-run guard.
 
 ## [1.46.0] — 2026-06-24

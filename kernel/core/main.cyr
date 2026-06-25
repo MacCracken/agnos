@@ -2165,7 +2165,12 @@ kprintln("", 0);
 # MVP gate), so gating the wake OFF is BOTH the discriminator AND — if confirmed —
 # the MVP fix. Flip smp_wake_enabled back to 1 to restore the wake (the documented
 # 1.44.18 one-line fallback; everything downstream is inert without it).
-var smp_wake_enabled = 0;
+# 1.46.x SMP sub-bite 7 STEP-1 BURN (2026-06-24): flipped to 1 to WAKE APs 1-3.
+# smp_sched_aps stays 0 (smp.cyr) → woken APs idle-ONLY (sched_next hands them no
+# real proc). This is the STEP-1 iron burn: prove the wake + AP-idle-only boots clean
+# on real Zen and the keyboard survives (the AP LVT LINT0/LINT1 mask is the fix). Revert
+# to 0 if the wake hangs/triple-faults; STEP-2 (smp_sched_aps=1) is a SEPARATE later burn.
+var smp_wake_enabled = 1;
 if (smp_wake_enabled != 0) {
     smp_start_aps();
 } else {
