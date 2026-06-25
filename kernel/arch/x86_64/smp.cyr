@@ -121,6 +121,54 @@ fn proctab_spin_unlock() {
     return 0;
 }
 
+# === 1.46.x SMP sub-bite 6 — sched_lock (the scheduler critical-section lock) ===
+# FIXED-GLOBAL xchg spinlock (byte-copy of heap_spin_lock/heap_spin_unlock above with the
+# global renamed — NO parameter, so the asm [rbp-N] offsets are the proven-correct
+# old@[rbp-0x08]/addr@[rbp-0x10]; a parameterized variant DEADLOCKED kmalloc, smp.cyr:38-46).
+# sched_lock serializes do_context_switch + sys_sched_yield (the pick+save+state-flips+on_cpu
+# fence). The protected section does NO FS/alloc/console/nvme/ahci I/O and NEVER calls
+# proc_alloc_slot/proc_create/kthread_create (which take proctab_lock), so sched_lock never
+# nests under any subsystem lock — it is the OUTERMOST/non-leaf scheduler lock.
+# RE-ENTRY SAFETY (load-bearing): both holders run IF=0. do_context_switch runs from the
+# timer ISR (IF=0, the ISR gate clears IF). sys_sched_yield runs IF=0 because SFMASK MSR
+# 0xC0000084 = 0x40700 INCLUDES IF (0x200) so SYSCALL entry clears it (syscall_hw.cyr:179) —
+# the L336 IF=1 guard reads the CALLER's captured user RFLAGS, not the live kernel IF. So no
+# same-CPU timer can land inside a held sched_lock and re-acquire it (INV-5). If SFMASK ever
+# narrows to not mask IF, sys_sched_yield needs cli/sti around the lock.
+# INERT single-core: the xchg always wins uncontended → byte-identical boot (INV-10).
+var sched_lock = 0;
+# 1.46.x SMP sub-bite 6b (INERT until smp_wake_enabled=1 at sub-bite 7):
+# smp_sched_aps = the STEP-1/STEP-2 kill-switch. 0 = STEP-1 (a woken AP wakes + idles ONLY,
+# never picks a real proc — sched_next on a non-BSP CPU returns only that CPU's idle); 1 =
+# STEP-2 (APs run real procs). Single-core: pcpu_cpu()==0 makes the STEP-1 branch dead on the
+# BSP, so this is a no-op today.
+var smp_sched_aps = 0;
+# pcpu_ap_ready[i] = this AP finished bring-up (TSS ltr'd, idle registered, on_cpu set, LVT
+# masked) and may take scheduling ticks. Set LAST in ap_entry, just before the first sti.
+var pcpu_ap_ready[4];
+fn sched_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &sched_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;                      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;    # mov rcx, 1
+            0x48; 0x87; 0x08;                            # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;                      # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn sched_spin_unlock() {
+    var addr = &sched_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+
 # === 1.46.x SMP sub-bite 5 PHASE 1 — pure non-ISR coarse subsystem locks ===
 # FOUR more FIXED-GLOBAL xchg spinlocks (each a byte-copy of pmm_spin_lock /
 # pmm_spin_unlock with the lock global renamed — NO parameter, so the asm [rbp-N]
@@ -281,7 +329,48 @@ fn ap_entry() {
         }
     }
     spin_unlock();
-    # PARK: IF=0 (the trampoline never sti'd) + hlt — the AP sleeps permanently.
+    # ====================================================================================
+    # 1.46.x SMP sub-bite 6b — AP runs the scheduler (STEP-1: wake + idle only).
+    # ⚠ ENTIRELY INERT at the 6 cut: ap_entry is reached ONLY via the trampoline `call
+    # ap_entry` that smp_start_aps builds, and smp_start_aps is called ONLY inside
+    # `if (smp_wake_enabled != 0)` (main.cyr) — and smp_wake_enabled stays 0. So none of the
+    # code below executes until the sub-bite-7 flip. It is written + compiled now so the wake
+    # path is whole; its real validation is the sub-bite-7 iron burn.
+    # ====================================================================================
+    if (my_id >= 4) { while (1 == 1) { asm { hlt; } } }   # out-of-range APIC id: park (no per-CPU slot)
+    # TPR=0: accept all interrupt priorities on this AP's LAPIC.
+    apic_write(0x80, 0);
+    # MASK this AP's LVT LINT0 (0xFEE00350) + LINT1 (0xFEE00360) — a parked/idle AP must not
+    # let LINT compete for IRQ1 (the LEADING but IRON-UNCONFIRMED keyboard-death fix; efficacy
+    # confirmable only at the sub-bite-7 iron burn). 0x10000 = masked.
+    store32(0xFEE00350, 0x10000);
+    store32(0xFEE00360, 0x10000);
+    # Per-CPU SYSCALL MSRs (STAR/LSTAR/CSTAR/SFMASK + EFER.SCE) for this AP — so a ring-3
+    # proc scheduled here (STEP-2) can SYSCALL into the kernel with this CPU's stubs.
+    syscall_msr_init();
+    # Register this AP's idle kthread. INV-4 (lock order): ap_idle_create -> kthread_create takes
+    # proctab_lock, so it MUST run ABOVE sched_spin_lock — sched_lock never nests proctab_lock.
+    # Only the idle's state/owner/current flips go under sched_lock (so the BSP scheduler never
+    # observes a half-registered state==1/on_cpu==-1 transient idle).
+    var ap_idle = ap_idle_create();   # wrapper in sched.cyr (forward-call resolves; a forward &fn does not)
+    sched_spin_lock();
+    sched_idle_pid_set(ap_idle);                 # per-CPU idle slot (sched_idle_cpu_slot folds my_id)
+    proc_current_set(ap_idle);
+    idle_owner_set(ap_idle, my_id);              # PERSISTENT owner → foreign CPUs never pick it (INV-9)
+    on_cpu_set(ap_idle, my_id);                  # this AP owns its idle
+    proc_set_state(ap_idle, 2);                  # running
+    sched_spin_unlock();
+    # Arm this AP's LAPIC timer (vector 32 = the timer ISR). PLACEHOLDER count — the BSP's
+    # QEMU-tuned 10000000 is KNOWN-WRONG on real Zen (LAPIC bus differs); per-CPU CALIBRATE
+    # before STEP-2 iron (sub-bite-7 #1 TODO).
+    var AP_LAPIC_TIMER_COUNT = 10000000;
+    apic_timer_init(32, AP_LAPIC_TIMER_COUNT);
+    # Mark this AP fully brought up LAST, just before the first sti — so no other CPU reads a
+    # half-consistent per-CPU state (TSS ltr'd, idle registered, on_cpu set) before it is whole.
+    store64(&pcpu_ap_ready + my_id * 8, 1);
+    # sti + idle-yield loop. STEP-1 (smp_sched_aps==0): sched_next on this CPU returns only this
+    # AP's own idle, so the AP idles forever (never picks a real proc). STEP-2 flips that.
+    asm { sti; }
     while (1 == 1) { asm { hlt; } }
     return 0;
 }

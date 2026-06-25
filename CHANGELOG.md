@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **SMP arc sub-bite 6 — AP runs the scheduler** (`smp.cyr`/`sched.cyr`/`proc.cyr`/`main.cyr`/`pic.cyr`).
+  The scheduler is now SMP-safe (gated off — `smp_wake_enabled=0` — so APs stay parked and single-core
+  is byte-identical; the wake flip is sub-bite 7, iron-gated). Designed by a 10-agent adversarial workflow,
+  implemented + 3-lens-reviewed (all SOUND), re-verified on main.
+  - **6a (sched_lock + on_cpu — single-core validated):** a fixed-global `sched_lock` serializes the
+    scheduler. The hard part: `do_context_switch` returns normally but the *new* proc is entered by the
+    timer ISR's `iretq` one frame up (pic.cyr) — so the lock is **released before the restore**, with a
+    per-proc `on_cpu` fence (`on_cpu_set(new, my_cpu)` is the last mutation under the lock; `sched_next`
+    skips any proc with `on_cpu != -1`) preventing two CPUs from running the same proc across the
+    released-lock window. Every post-acquire exit unlocks (2 in `do_context_switch`, 3 in `sys_sched_yield`)
+    — a dropped unlock deadlocks the 2nd context switch, which the smoke battery proves it doesn't. The
+    `#44` yield path got the same treatment, and its global `yield_frame` is now per-CPU `pcpu_yield_frame`.
+  - **6b (AP `ap_entry` loop — inert):** `smp_sched_aps` STEP-1/STEP-2 kill-switch, `pcpu_ap_ready`, a
+    persistent `idle_owner` array (a descheduled AP idle stays excluded from foreign CPUs even after its
+    `on_cpu` clears), `sched_idx_pickable` (foreign-idle + STEP-1-AP skips, both no-ops single-core), the
+    rewritten `ap_entry` (AP idle kthread created ABOVE `sched_lock` per the lock order, AP LVT LINT0/LINT1
+    masked, LAPIC timer armed with a real-Zen calibration TODO, idle-yield loop), and `timer_handler`
+    BSP-gating (`timer_ticks`/`net_rx_drain` only on the BSP; `do_context_switch` runs per-CPU).
+  - Validated on main: agnsh-smoke, check.sh 11/11, ring3-smoke (#44 yield Y=12 = baseline), thread-smoke,
+    exec-smoke, smp-smoke (APs parked) — all green. The idle double-run guard, the GAP-C reap-vs-restore
+    ordering, the AP timer calibration, and the LVT-mask keyboard-death efficacy are all **iron-gated**
+    (validated at the sub-bite-7 flip). `build/agnos` 1,220,272 B.
+  - **Only sub-bite 7 remains in the SMP arc** — the iron-gated wake flip (`smp_wake_enabled=1` +
+    `smp_sched_aps`-staged burns on archaemenid). (Also still open in sub-bite 5: `input_lock` (blocked on
+    the input-path conflict) + the net cli/sti family (net-revisit scope).)
+
 ## [1.46.0] — 2026-06-24
 
 **★ 1.46.0 — the SMP locking foundation.** The first five sub-bites of the SMP / multi-threading arc:

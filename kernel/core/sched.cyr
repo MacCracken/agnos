@@ -25,6 +25,25 @@ fn sched_idle_pid_get() { return load64(sched_idle_cpu_slot()); }
 fn sched_idle_pid_set(v) { store64(sched_idle_cpu_slot(), v); return 0; }
 fn sched_idle_init() { var i = 0; while (i < 4) { store64(&pcpu_idle + i * 8, 0 - 1); i = i + 1; } return 0; }
 
+# 1.46.x SMP sub-bite 6b: per-idx pickability under SMP (returns 1 = pickable, 0 = skip).
+# Two skips, BOTH INERT single-core (pcpu_cpu()==0 + every idle_owner==-1):
+#  (a) FOREIGN-IDLE: an idle kthread owned by ANOTHER CPU is never picked. idle_owner is
+#      persistent (never cleared on deschedule), so a descheduled AP idle stays excluded
+#      from a foreign CPU even when its on_cpu has been reset to -1 (INV-9).
+#  (b) STEP-1 AP gate: while smp_sched_aps==0, a non-BSP CPU may pick ONLY its own idle
+#      (idx == this CPU's idle pid) — it never runs a real proc. The BSP (pcpu_cpu()==0)
+#      is unaffected. Lets sub-bite 7 wake APs that idle-only before flipping smp_sched_aps=1.
+fn sched_idx_pickable(idx) {
+    var io = idle_owner_get(idx);
+    if (io != (0 - 1)) { if (io != pcpu_cpu()) { return 0; } }      # (a) foreign idle
+    if (smp_sched_aps == 0) {
+        if (pcpu_cpu() != 0) {
+            if (idx != sched_idle_pid_get()) { return 0; }          # (b) STEP-1 AP: only its own idle
+        }
+    }
+    return 1;
+}
+
 fn sched_next() {
     # Pass 1 (1.44.17): round-robin over READY (state==1) procs, SKIPPING the idle kthread —
     # real work must never lose a slice to a proc that exists only to hlt.
@@ -35,7 +54,16 @@ fn sched_next() {
         if (idx >= proc_count) { idx = idx - proc_count; }
         if (idx != sched_idle_pid_get()) {
             if (proc_get_state(idx) == 1) {
-                return idx;
+                if (on_cpu_get(idx) == (0 - 1)) {        # 1.46.x SMP6 FENCE: skip a proc another CPU owns
+                    # 6b foreign-idle skip: a descheduled AP idle (state==1, on_cpu==-1) is still
+                    # excluded here because its idle_owner names that AP, not this CPU (INV-9).
+                    # 6b STEP-1 AP gate: with smp_sched_aps==0 a non-BSP CPU picks NO real proc in
+                    # pass 1 (it falls through to pass 2 and lands on its own idle). Both INERT
+                    # single-core: pcpu_cpu()==0, every idle_owner==-1 (INV-10).
+                    if (sched_idx_pickable(idx) == 1) {
+                        return idx;
+                    }
+                }
             }
         }
         si = si + 1;
@@ -48,7 +76,11 @@ fn sched_next() {
         var idx2 = start + si;
         if (idx2 >= proc_count) { idx2 = idx2 - proc_count; }
         if (proc_get_state(idx2) == 1) {
-            return idx2;
+            if (on_cpu_get(idx2) == (0 - 1)) {           # 1.46.x SMP6 FENCE: skip a proc another CPU owns
+                if (sched_idx_pickable(idx2) == 1) {     # 6b: foreign-idle + STEP-1-AP skips (INERT single-core)
+                    return idx2;
+                }
+            }
         }
         si = si + 1;
     }
@@ -179,10 +211,16 @@ fn do_context_switch(isr_rsp) {
     # tick after preempt_enable() drops the count to 0.
     if (preempt_count_get() > 0) { return 0; }
     if (proc_count < 2) { return 0; }
-
+    # 1.46.x SMP sub-bite 6: the three cheap guards above stay BEFORE the acquire (they return
+    # WITHOUT the lock — INV-1 only governs POST-acquire exits). sched_lock now serializes the
+    # pick+save+state-flips+on_cpu fence; it is released BEFORE the lock-free restore tail because
+    # do_context_switch RETURNS NORMALLY (the never-returning iretq is the ISR epilogue one frame
+    # up, pic.cyr:140), so a mid-fn unlock executes. INV-1: BOTH post-acquire exits (new_pid==old
+    # early-out; main path) call sched_spin_unlock(). A dropped unlock here deadlocks the 2nd tick.
+    sched_spin_lock();                                          # ACQUIRE
     var old = proc_current_get();
     var new_pid = sched_next();
-    if (new_pid == old) { return 0; }
+    if (new_pid == old) { sched_spin_unlock(); return 0; }      # RELEASE on early-out (MANDATORY — INV-1)
 
     # Save old process state. Unconditionally mark `old` as ready (1).
     # save_context implies `old` was the running proc, so the only valid
@@ -198,11 +236,16 @@ fn do_context_switch(isr_rsp) {
     # — this is the cc5 regalloc-sensitive path, an extra call can clobber a live reg.
     proc_save_context(old, isr_rsp);
     if (load64(&proc_table + old * 176 + 8) != 0) { proc_set_state(old, 1); }  # not-dead → ready; dead stays dead
+    on_cpu_set(old, 0 - 1);                                     # SMP6: old leaves this CPU (regs already saved)
 
     # Load new process state
     proc_current_set(new_pid);
     proc_set_state(new_pid, 2);  # → running
-    proc_restore_context(new_pid, isr_rsp);
+    on_cpu_set(new_pid, pcpu_cpu());                           # SMP6 FENCE: new owned by this CPU (LAST under-lock mutation — INV-6)
+    var old_cr3 = proc_get_cr3(old);                           # SMP6 GAP-A: snapshot UNDER the lock (proc_reap detaches old's CR3 if a foreign CPU reaps old after release, proc.cyr:551)
+    sched_spin_unlock();                                       # *** RELEASE *** before the lock-free restore tail (INV-1/INV-2)
+
+    proc_restore_context(new_pid, isr_rsp);                    # lock-free: new is fenced by on_cpu=mycpu
 
     # Switch page tables if different. v1.28.3 fix: call the
     # cr3_load() helper (proc.cyr) which loads CR3 via stack-relative
@@ -213,7 +256,6 @@ fn do_context_switch(isr_rsp) {
     # pattern in the memory-isolation test was fixed via cr3_load in
     # v1.26.0; this site was overlooked at the time).
     var new_cr3 = proc_get_cr3(new_pid);
-    var old_cr3 = proc_get_cr3(old);
     if (new_cr3 != old_cr3) {
         cr3_load(new_cr3);
     }
@@ -259,6 +301,14 @@ fn kernel_idle_loop() {
     return 0;
 }
 
+# 1.46.x SMP sub-bite 6b: create an AP's idle kthread. A thin wrapper so ap_entry (smp.cyr, which
+# is parsed BEFORE sched.cyr) can register an idle WITHOUT taking the address of kernel_idle_loop
+# at parse time — cyrius resolves forward CALLS across includes but NOT a forward &fn address-of
+# (smp.cyr:355 errored on `&kernel_idle_loop`). Returns the new pid. Takes proctab_lock via
+# kthread_create, so ap_entry MUST call this ABOVE sched_spin_lock (INV-4 lock order). INERT today
+# (ap_entry never runs while smp_wake_enabled=0).
+fn ap_idle_create() { return kthread_create(&kernel_idle_loop); }
+
 # === 1.44.16 — sched_yield(#44): voluntary end-of-slice from ring 3 ===
 #
 # A ring-3 proc donates the REMAINDER of its timer slice to the next ready proc.
@@ -290,8 +340,14 @@ fn kernel_idle_loop() {
 # kstack-relative scratch (proc_restore_context's own call frame grows down the live
 # kstack and could overlap it). Identity-mapped supervisor under every per-proc CR3
 # (the PD[0..127] kernel mirror), so it stays readable after the cr3_load below.
-# IF=0 (SFMASK) guarantees exclusive use. Oversized allocation (margin on principle).
-var yield_frame[160];
+# IF=0 (SFMASK) guarantees exclusive use.
+# 1.46.x SMP sub-bite 6: PER-CPU now. Two CPUs can each run sys_sched_yield concurrently
+# (their own #44), so one shared synth frame would race. 80 u64 = 640 B = 4 CPUs x 160 B/CPU
+# (module-global `var X[N]` = N x u64 = 8N bytes — cyrius var-array units); source via
+# pcpu_yield_frame_ptr() = &pcpu_yield_frame + pcpu_cpu()*160. CPU 0's slot is byte-identical
+# to the old &yield_frame, so single-core is unchanged (INV-10).
+var pcpu_yield_frame[80];
+fn pcpu_yield_frame_ptr() { return &pcpu_yield_frame + pcpu_cpu() * 160; }
 
 # Load the synthesized frame and run the timer ISR's exact restore epilogue
 # (pic.cyr:94-112 byte-for-byte): 15 pops + iretq. Never returns. First param via
@@ -334,13 +390,22 @@ fn sys_sched_yield() {
     # Refuse IF=0 callers (foreground exec/execwait children): their no-context-switch
     # model is load-bearing; yield is a no-op there, not an error.
     if ((load64(sc_scr_base() + 8) & 0x200) == 0) { return 0; }   # 4c: THIS cpu's block (base folds pcpu_cpu()*64)
+    # 1.46.x SMP sub-bite 6: acquire sched_lock here. The FOUR pre-acquire guards above
+    # (sched_active/preempt/ew37/IF=0) return WITHOUT the lock (INV-1 governs only POST-acquire
+    # exits). NO cli/sti needed: sys_sched_yield runs IF=0 (SFMASK 0x40700 clears IF on SYSCALL
+    # entry, syscall_hw.cyr:179 — the L336 IF guard reads the CALLER's captured user RFLAGS, not
+    # the live kernel IF), so no same-CPU timer re-enters a held sched_lock (INV-5). INV-1: ALL
+    # THREE post-acquire exits (next==yp; state(next)!=1; main path) call sched_spin_unlock()
+    # before returning; the main-path unlock MUST precede yield_frame_iretq (which never returns —
+    # an unlock after it is dead code → permanent hold → next-yield deadlock, INV-2).
+    sched_spin_lock();                                 # ACQUIRE
     var yp = proc_current_get();
     var next = sched_next();
-    if (next == yp) { return 0; }                      # nothing else ready — keep the slice
+    if (next == yp) { sched_spin_unlock(); return 0; }            # RELEASE on early-out (nothing else ready)
     # sched_next's no-ready fallback returns 0 (kmain), which is state 2 with a STALE
     # slot while suspended in exec_and_wait — restoring it would time-travel kmain.
     # Only a genuinely READY (state 1) proc may be switched to from here.
-    if (proc_get_state(next) != 1) { return 0; }
+    if (proc_get_state(next) != 1) { sched_spin_unlock(); return 0; }   # RELEASE on early-out
     # --- Write the yielder's slot AS IF the syscall had returned (SYSRET parity) ---
     var p = &proc_table + yp * 176;
     store64(p + 24, load64(sc_scr_base() + 0));        # resume RIP = post-SYSCALL rcx (4c: THIS cpu's block)
@@ -368,9 +433,12 @@ fn sys_sched_yield() {
     store64(&proc_ss + yp * 8, 0x1B);
     # --- Switch (mirrors do_context_switch's proven order + tail) ---
     proc_set_state(yp, 1);                             # yielder: running → ready
+    on_cpu_set(yp, 0 - 1);                             # SMP6: yielder leaves this CPU
     proc_current_set(next);
     proc_set_state(next, 2);                           # next: ready → running
-    var fp = &yield_frame;
+    on_cpu_set(next, pcpu_cpu());                      # SMP6 FENCE: next owned by this CPU (LAST under-lock mutation — INV-6)
+    sched_spin_unlock();                               # *** RELEASE *** before the no-return tail (INV-1/INV-2)
+    var fp = pcpu_yield_frame_ptr();                   # SMP6: per-CPU synthesized frame (was &yield_frame)
     proc_restore_context(next, fp);                    # fill the synthesized ISR frame
     var new_cr3 = proc_get_cr3(next);
     var old_cr3 = proc_get_cr3(yp);

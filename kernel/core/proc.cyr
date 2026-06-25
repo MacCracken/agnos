@@ -63,6 +63,28 @@ var proc_sigmask[128];  # 16 processes x 8 bytes
 # proc's CS/SS here; proc_restore_context reads them back into the iretq frame.
 var proc_cs[16];        # saved CS per pid (default 0x08 = ring-0 kernel code)
 var proc_ss[16];        # saved SS per pid (default 0x10 = ring-0 kernel data)
+# 1.46.x SMP sub-bite 6: per-pid "which CPU is running / mid-switching this proc"; -1 = none.
+# The scheduler FENCE — on_cpu_set(new, mycpu) is the LAST mutation under sched_lock, then the
+# lock releases and the lock-free restore proceeds with `new` claimed. sched_next selects only
+# procs with on_cpu==-1 (both passes), so a proc owned by another CPU is never double-picked.
+# Parallel pid-indexed array (like proc_cs/proc_ss), NOT a Process-struct field (the 176B/22-
+# field stride is frozen — proc.cyr:55-65). Default MUST be -1 (0 is a valid CPU id), so
+# proc_on_cpu_init sets all 16 at boot BEFORE sched_active=1; proc_alloc_slot resets a recycled
+# slot to -1. INERT single-core: pcpu_cpu()==0, only the running proc (state==2, already
+# excluded by the state gate) ever carries on_cpu!=-1 → sched_next byte-identical (INV-10).
+var proc_on_cpu[16];
+fn on_cpu_get(pid) { return load64(&proc_on_cpu + pid * 8); }
+fn on_cpu_set(pid, c) { store64(&proc_on_cpu + pid * 8, c); return 0; }
+# 1.46.x SMP sub-bite 6b: PERSISTENT per-pid idle-owner CPU (-1 = not an idle). UNLIKE
+# proc_on_cpu (cleared to -1 on every deschedule), idle_owner is NEVER cleared on deschedule —
+# so a descheduled AP idle (state==1, on_cpu==-1) is STILL excluded from a FOREIGN CPU's
+# sched_next (the pcpu_idle skip only deprioritizes the CALLING CPU's idle). Set in ap_entry
+# when an AP registers its idle kthread; -1 for every non-idle proc. INERT single-core: nothing
+# ever sets a non-(-1) value until an AP runs (smp_wake_enabled=0), so the skip is a no-op.
+var idle_owner[16];
+fn idle_owner_get(pid) { return load64(&idle_owner + pid * 8); }
+fn idle_owner_set(pid, c) { store64(&idle_owner + pid * 8, c); return 0; }
+fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8, 0 - 1); store64(&idle_owner + i * 8, 0 - 1); i = i + 1; } return 0; }
 # 1.46.1 (per-process kernel stacks): each proc's own TSS.RSP0 — the kernel stack
 # the CPU switches to on a CPL3->CPL0 interrupt. Foundation for IF=1 preemptive
 # agnsh (a later bite): a preempted ring-3 proc takes its timer tick on ITS OWN
@@ -146,6 +168,7 @@ fn proc_alloc_slot() {
     store64(&proc_signals + idx * 8, 0);
     store64(&proc_sigmask + idx * 8, 0);
     store64(&proc_rsp0 + idx * 8, KSTACK_POOL_BASE + (idx + 1) * KSTACK_SLOT);  # 1.46.1: per-proc RSP0 stack (region 7)
+    store64(&proc_on_cpu + idx * 8, 0 - 1);   # 1.46.x SMP6: recycled slot must not inherit a stale CPU id
     return idx;
 }
 # 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the legacy shared stack (0x3C0000
