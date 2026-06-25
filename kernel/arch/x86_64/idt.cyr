@@ -198,6 +198,89 @@ fn exc_handlers_init() {
             store8(stub + 154, 0xE6); store8(stub + 155, 0x71);
             tail = 156;
         }
+        # 1.46.x SMP sub-bite 7 (#GP localization, 2026-06-25): #GP (v==13) ALSO captures
+        # the error code + the faulting RIP + CS. The error code is the SELECTOR-INDEX form
+        # (SDM Vol.3 6.13): bits 15:3 = the GDT/LDT/IDT index, bits 2:0 = TI/IDT/EXT flags —
+        # the RPL is STRIPPED, so a fault on user CS 0x23 stamps 0x20 (index 4) and user SS
+        # 0x1b stamps 0x18 (index 3 — the SAME encoding as the 1.46.1 AP-trampoline CS=0x18
+        # bug; only the captured RIP+CS disambiguate). And it is 0 for any NON-selector #GP
+        # (non-canonical iretq RIP/SS, reserved-bit, SMAP, WP, …) — in that (common) case the
+        # RIP (0x69-0x6C) + CS (0x6D) are the reliable localizers, not the errcode. read-boot-
+        # log.cyr decodes by index + handles the errcode==0 case.
+        # The IF=1 first-preempt agnsh #GP halts right after the banner and is IRON-ONLY
+        # (QEMU TCG never reproduces it — real agnsh reaches the prompt clean under -smp 4
+        # -cpu max -d int with 0 exceptions across 245k int-log lines), so the only way to
+        # localize it is to stamp errcode+RIP+CS on the box, mirroring the v==14 #PF block.
+        # Slots 0x67-0x6F are OVERLOADED with xHCI port post-mortem stamps (xhci.cyr/
+        # xhci_port.cyr stamp them during USB enumeration at boot) — but enumeration runs
+        # long BEFORE agnsh launches, so when this #GP fires (agnsh runtime) the handler is
+        # the LAST writer to all of them; read-boot-log.cyr gates the #GP decode on 0x54=0x0D
+        # + 0x55=0xE5 (the same last-writer-wins overload the #PF block uses for r8169/xhci on
+        # 0x5C-0x66). Low 0x70/0x71 bank (Zen-trustworthy; all < 0x80).
+        # NO push/pop in this block, so the long-mode #GP frame stays [rsp]=errcode,
+        # [rsp+8]=RIP, [rsp+16]=CS throughout (same invariant the #PF block relies on).
+        # FULL 48-bit RIP (0x69-0x6F): kernel code is <16 MB and ring-3 agnsh ~0x400000, but
+        # a corrupted/non-canonical iretq RIP (a common #GP cause) can be >=4 GB — capturing to
+        # bit47 keeps it reconstructable instead of aliased (the #PF low-24-CR2 lesson, 1409).
+        # CS (0x6D) discriminates KERNEL iretq (CS=0x08) vs RING-3 (CS=0x23). read-boot-log decodes.
+        if (v == 13) {
+            # 0x67 <- errcode bits 7:0   ([rsp])
+            store8(stub + 16, 0xB0); store8(stub + 17, 0x67);
+            store8(stub + 18, 0xE6); store8(stub + 19, 0x70);
+            store8(stub + 20, 0x48); store8(stub + 21, 0x8B); store8(stub + 22, 0x04); store8(stub + 23, 0x24);  # mov rax,[rsp]
+            store8(stub + 24, 0xE6); store8(stub + 25, 0x71);
+            # 0x68 <- errcode bits 15:8
+            store8(stub + 26, 0xB0); store8(stub + 27, 0x68);
+            store8(stub + 28, 0xE6); store8(stub + 29, 0x70);
+            store8(stub + 30, 0x48); store8(stub + 31, 0x8B); store8(stub + 32, 0x04); store8(stub + 33, 0x24);  # mov rax,[rsp]
+            store8(stub + 34, 0x48); store8(stub + 35, 0xC1); store8(stub + 36, 0xE8); store8(stub + 37, 0x08);  # shr rax,8
+            store8(stub + 38, 0xE6); store8(stub + 39, 0x71);
+            # 0x69 <- RIP bits 7:0   ([rsp+8])
+            store8(stub + 40, 0xB0); store8(stub + 41, 0x69);
+            store8(stub + 42, 0xE6); store8(stub + 43, 0x70);
+            store8(stub + 44, 0x48); store8(stub + 45, 0x8B); store8(stub + 46, 0x44); store8(stub + 47, 0x24); store8(stub + 48, 0x08);  # mov rax,[rsp+8]
+            store8(stub + 49, 0xE6); store8(stub + 50, 0x71);
+            # 0x6A <- RIP bits 15:8
+            store8(stub + 51, 0xB0); store8(stub + 52, 0x6A);
+            store8(stub + 53, 0xE6); store8(stub + 54, 0x70);
+            store8(stub + 55, 0x48); store8(stub + 56, 0x8B); store8(stub + 57, 0x44); store8(stub + 58, 0x24); store8(stub + 59, 0x08);  # mov rax,[rsp+8]
+            store8(stub + 60, 0x48); store8(stub + 61, 0xC1); store8(stub + 62, 0xE8); store8(stub + 63, 0x08);  # shr rax,8
+            store8(stub + 64, 0xE6); store8(stub + 65, 0x71);
+            # 0x6B <- RIP bits 23:16
+            store8(stub + 66, 0xB0); store8(stub + 67, 0x6B);
+            store8(stub + 68, 0xE6); store8(stub + 69, 0x70);
+            store8(stub + 70, 0x48); store8(stub + 71, 0x8B); store8(stub + 72, 0x44); store8(stub + 73, 0x24); store8(stub + 74, 0x08);  # mov rax,[rsp+8]
+            store8(stub + 75, 0x48); store8(stub + 76, 0xC1); store8(stub + 77, 0xE8); store8(stub + 78, 0x10);  # shr rax,16
+            store8(stub + 79, 0xE6); store8(stub + 80, 0x71);
+            # 0x6C <- RIP bits 31:24
+            store8(stub + 81, 0xB0); store8(stub + 82, 0x6C);
+            store8(stub + 83, 0xE6); store8(stub + 84, 0x70);
+            store8(stub + 85, 0x48); store8(stub + 86, 0x8B); store8(stub + 87, 0x44); store8(stub + 88, 0x24); store8(stub + 89, 0x08);  # mov rax,[rsp+8]
+            store8(stub + 90, 0x48); store8(stub + 91, 0xC1); store8(stub + 92, 0xE8); store8(stub + 93, 0x18);  # shr rax,24
+            store8(stub + 94, 0xE6); store8(stub + 95, 0x71);
+            # 0x6D <- CS bits 7:0   ([rsp+16]) — 0x08 = fault at a kernel iretq, 0x23 = fault in ring 3
+            store8(stub + 96, 0xB0); store8(stub + 97, 0x6D);
+            store8(stub + 98, 0xE6); store8(stub + 99, 0x70);
+            store8(stub + 100, 0x48); store8(stub + 101, 0x8B); store8(stub + 102, 0x44); store8(stub + 103, 0x24); store8(stub + 104, 0x10);  # mov rax,[rsp+16]
+            store8(stub + 105, 0xE6); store8(stub + 106, 0x71);
+            # 0x6E <- RIP bits 39:32 + 0x6F <- RIP bits 47:40 (full 48-bit canonical RIP). WHY:
+            # a non-canonical / >=4 GB faulting RIP is a COMMON #GP cause (corrupted return addr,
+            # garbage iretq-frame RIP) — exactly the aliasing the #PF block hit with low-24 CR2
+            # before the 1409 burn forced bits 24-47. Capturing to bit47 means a >=4 GB or
+            # non-canonical RIP is reconstructable (bit47 set => the high half / garbage), not
+            # truncated to a misleading low value (which would cost another burn).
+            store8(stub + 107, 0xB0); store8(stub + 108, 0x6E);
+            store8(stub + 109, 0xE6); store8(stub + 110, 0x70);
+            store8(stub + 111, 0x48); store8(stub + 112, 0x8B); store8(stub + 113, 0x44); store8(stub + 114, 0x24); store8(stub + 115, 0x08);  # mov rax,[rsp+8]
+            store8(stub + 116, 0x48); store8(stub + 117, 0xC1); store8(stub + 118, 0xE8); store8(stub + 119, 0x20);  # shr rax,32
+            store8(stub + 120, 0xE6); store8(stub + 121, 0x71);
+            store8(stub + 122, 0xB0); store8(stub + 123, 0x6F);
+            store8(stub + 124, 0xE6); store8(stub + 125, 0x70);
+            store8(stub + 126, 0x48); store8(stub + 127, 0x8B); store8(stub + 128, 0x44); store8(stub + 129, 0x24); store8(stub + 130, 0x08);  # mov rax,[rsp+8]
+            store8(stub + 131, 0x48); store8(stub + 132, 0xC1); store8(stub + 133, 0xE8); store8(stub + 134, 0x28);  # shr rax,40
+            store8(stub + 135, 0xE6); store8(stub + 136, 0x71);
+            tail = 137;
+        }
         # 1.45.16 fault canary — paint a wide FB bar before halting so a CAUGHT CPU
         # exception is visible ON THE FRAMEBUFFER (photo-readable), not only in CMOS
         # 0x54/0x55. The CMOS stamp(s) above are written FIRST, so even if this FB
