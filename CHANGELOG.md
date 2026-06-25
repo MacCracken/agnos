@@ -7,6 +7,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.46.0] — 2026-06-24
 
+**★ 1.46.0 — the SMP locking foundation.** The first five sub-bites of the SMP / multi-threading arc:
+per-CPU scheduler identity (`pcpu_*` APIC-indexed) + the **per-CPU SYSCALL stub** (per-CPU kernel stack,
+user-RSP save, KPTI CR3 pair, #44 capture block, #37 guard — the arc's hardest, adversarially designed +
+reviewed + objdump-verified) + the **subsystem lock set** (xchg spinlocks: heap/pmm/vfs/proctab/fs/nvme/
+ahci/console) with the `proc_alloc_slot` claiming sentinel and the FS/NVMe race closure. Everything is
+**single-core byte-identical** (a `cpu<4` cap lands the BSP on slot 0) and the AP wake stays **gated off**
+(`smp_wake_enabled=0`) — the AP-runs-scheduler flip (sub-bites 6–7) is iron-gated and continues after this
+cut. Remaining in sub-bite 5: `input_lock` (kb_buf, blocked on an input-path memory↔code conflict) + the
+net cli/sti family (net-revisit scope). Root-caused along the way: a broken parameterized `spin_lock_at`
+that xchg'd address 1 (QEMU-monitor), and the timer ISR's hidden TX path.
+
 ### Added
 - **1.46.x cycle opened — per-process kernel stacks → true preemptive multitasking on iron
   (the SMP / multi-threading revisit).** The 1.44.x multi-threading arc's deferred namesake,

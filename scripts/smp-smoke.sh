@@ -51,7 +51,10 @@ timeout "${QEMU_TIMEOUT:-60}" qemu-system-x86_64 \
 
 echo "--- serial (smp lines) ---"; strings "$LOG" | grep -iE "smp|cpus" | sed 's/^/  /'
 rc=0
-if strings "$LOG" | grep -q "smp: cpus online: 4"; then echo "PASS: INIT-SIPI-SIPI woke APs 1-3 (tick-timed SDM protocol) — all 4 CPUs counted in via the spinlock'd ap_entry"; else echo "FAIL: 'smp: cpus online: 4' not found — AP wake or count-in failed (see smp lines above)"; rc=1; fi
+# 1.46.x: the AP wake is GATED off (smp_wake_enabled=0, since 1.44.25) until the sub-bite-7 flip —
+# so the expected count-in is 1 (BSP only) + a "AP wake gated" line, NOT 4. Accept BOTH states:
+# gated (current, MVP single-core) and un-gated (post-flip "cpus online: 4").
+if strings "$LOG" | grep -q "smp: cpus online: 4"; then echo "PASS: INIT-SIPI-SIPI woke APs 1-3 (tick-timed SDM protocol) — all 4 CPUs counted in via the spinlock'd ap_entry"; elif strings "$LOG" | grep -qi "AP wake gated"; then echo "PASS: AP wake correctly GATED (smp_wake_enabled=0, MVP single-core) — un-gates at the sub-bite-7 flip; boot stays single-core"; else echo "FAIL: neither 'cpus online: 4' (un-gated wake) nor 'AP wake gated' found — the AP path is broken"; rc=1; fi
 if strings "$LOG" | grep -q "Activating scheduler"; then echo "PASS: boot proceeded past the wake — parked APs (IF=0 hlt) don't disturb the BSP"; else echo "FAIL: scheduler activation never reached after the AP wake"; rc=1; fi
 if strings "$LOG" | grep -q "kybernet:"; then echo "PASS: kybernet launched — full boot continuity with 4 CPUs online"; else echo "FAIL: kybernet never launched post-wake"; rc=1; fi
 exit $rc
