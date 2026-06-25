@@ -2171,11 +2171,12 @@ kprintln("", 0);
 # on real Zen and the keyboard survives (the AP LVT LINT0/LINT1 mask is the fix). Revert
 # to 0 if the wake hangs/triple-faults; STEP-2 (smp_sched_aps=1) is a SEPARATE later burn.
 var smp_wake_enabled = 1;
-if (smp_wake_enabled != 0) {
-    smp_start_aps();
-} else {
-    kprintln("smp: AP wake gated (MVP single-core)", 36);
-}
+# 1.46.x sub-bite 7 (H6 fix 2026-06-24): the AP wake MOVED to just before
+# `sched_active = 1` (after the proc-table bootstrap) — see there. Waking HERE
+# (before the `proc_count = 0` reset + proc_on_cpu_init) let the BSP's reset WIPE
+# the APs' freshly-registered idle slots + reset their on_cpu, so an AP later
+# iretq'd into a half-built idle with a corrupted CS=0x18 -> #GP (deterministic
+# under QEMU -smp 4). Bootstrap-then-wake removes the race.
 
 kprintln("Activating scheduler...", 23);
 
@@ -2996,6 +2997,18 @@ thr_pid_b = kthread_create(&thread_test_b);
 ring3_selftest_setup();
 #endif
 #endif
+
+# 1.46.x sub-bite 7 (H6 fix 2026-06-24): wake APs HERE — AFTER the proc-table
+# bootstrap (proc_count / proc 0 / idle created, proc_on_cpu_init done) and BEFORE
+# sched_active=1. So each AP registers its idle kthread into the STABLE proc table
+# (no later proc_count=0 wipe), sets on_cpu without it being reset, and smp_start_aps
+# waits on pcpu_ap_ready so every AP is fully built before the scheduler arms.
+# Preconditions still hold here: pt_init done (CR3 0x1000), IF=1, sched_active still 0.
+if (smp_wake_enabled != 0) {
+    smp_start_aps();
+} else {
+    kprintln("smp: AP wake gated (MVP single-core)", 36);
+}
 
 sched_active = 1;
 

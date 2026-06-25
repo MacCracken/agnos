@@ -92,6 +92,14 @@ fn sched_next() {
     # Pairs with the unconditional state-ready transition in
     # do_context_switch above (repair A); either alone defends sub-case 3b,
     # both together are belt-and-suspenders.
+    # 1.46.x sub-bite 7 (H6 follow-on 2026-06-24): an AP (non-BSP) must NEVER fall back to
+    # proc 0 (kmain) — that runs kmain on TWO CPUs at once (shared proc-0 state + the BSP's
+    # kernel stack), which the trampoline-CS fix exposed as a #PF/#GP/#UD cascade during
+    # kybernet init under QEMU -smp 4. An AP with nothing else ready returns ITS OWN idle
+    # (== its proc_current in STEP-1), so do_context_switch sees new==old and early-outs —
+    # the AP just keeps idling. Correct for STEP-2 too (an AP idles on an empty run-queue).
+    # The BSP keeps the proc-0 fallback (the Attempt-14 sub-case-3b anti-starvation rule).
+    if (pcpu_cpu() != 0) { return sched_idle_pid_get(); }
     return 0;
 }
 

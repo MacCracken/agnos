@@ -491,7 +491,21 @@ fn smp_build_trampoline() {
     # mov rsp, rax; mov rbp, rsp
     store8(p+off, 0x48); store8(p+off+1, 0x89); store8(p+off+2, 0xC4); off = off + 3;
     store8(p+off, 0x48); store8(p+off+1, 0x89); store8(p+off+2, 0xE5); off = off + 3;
-    # mov rax, ap_entry; call rax
+    # 1.46.x sub-bite 7 (H6 ROOT FIX 2026-06-24): reload CS=0x08 (kernel-GDT code64) via a
+    # FAR RETURN — NOW that RSP is valid (set just above). The 32->64 `jmp far 0x18:..` set
+    # CS=0x18 from the TRAMPOLINE GDT (0x18=code64); `lgdt [kernel GDT]` above did NOT reload
+    # the cached CS descriptor, so ap_entry kept running with CS=0x18 — but kernel-GDT 0x18
+    # is USER DS. Every AP timer frame then pushed CS=0x18, proc_save_context persisted it
+    # into the idle's proc_cs, and the resume iretq reloaded CS=0x18 vs the kernel GDT -> a
+    # #GP(errcode 0x18) on each AP (QEMU -smp 4 deterministic; iretq into kernel_idle_loop).
+    # `lretq` pops RIP then CS, installing the kernel code64 descriptor so the AP runs ring-0.
+    var cs_off = off;
+    store8(p+off, 0x6A); store8(p+off+1, 0x08); off = off + 2;        # push 0x08 (new CS)
+    store8(p+off, 0x48); store8(p+off+1, 0xB8); off = off + 2;        # mov rax, imm64
+    store64(p+off, p + cs_off + 15); off = off + 8;                   # imm64 = addr right after lretq
+    store8(p+off, 0x50); off = off + 1;                               # push rax (target RIP)
+    store8(p+off, 0x48); store8(p+off+1, 0xCB); off = off + 2;        # lretq -> CS=0x08, RIP=after
+    # mov rax, ap_entry; call rax  (now executing with CS=0x08)
     store8(p+off, 0x48); store8(p+off+1, 0xB8); off = off + 2;
     store64(p+off, &ap_entry); off = off + 8;
     store8(p+off, 0xFF); store8(p+off+1, 0xD0); off = off + 2;
@@ -544,6 +558,23 @@ fn smp_start_aps() {
         if ((ap_online_mask & bit) == 0) {       # not in yet -> the SDM second SIPI
             apic_send_sipi(ap, 0x08);
             smp_wait_ticks(1);
+        }
+    }
+    # 1.46.x sub-bite 7 (H6 fix): wait until every AP that reported in has FINISHED
+    # bring-up. pcpu_ap_ready[ap] is set LAST in ap_entry (after idle register +
+    # on_cpu_set + LAPIC-timer arm), whereas ap_online_mask is set FIRST. Returning
+    # on the mask alone let the caller proceed to sched_active=1 mid-registration ->
+    # the AP's first post-activation tick restored a half-built idle (iretq CS=0x18
+    # #GP, QEMU -smp 4 deterministic). Bounded so a wedged AP can't hang boot.
+    for (var w = 1; w < 4; w = w + 1) {
+        var rbit = 1 << w;
+        if ((ap_online_mask & rbit) != 0) {
+            var tries = 0;
+            while (load64(&pcpu_ap_ready + w * 8) == 0) {
+                smp_wait_ticks(1);
+                tries = tries + 1;
+                if (tries > 20) { break; }
+            }
         }
     }
     kprint("smp: cpus online: ", 18);

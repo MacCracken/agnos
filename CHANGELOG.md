@@ -5,6 +5,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.46.1] — 2026-06-25
+
+**★ 1.46.1 — SMP sub-bite-7 STEP-1 #GP root-caused + fixed + QEMU-validated burn-free.** The 1.46.0
+STEP-1 iron burn (`smp_wake_enabled=1`, `smp_sched_aps=0`) woke all 4 CPUs (`cpus online: 4` ✅) but
+`agnsh` took a #GP right after its banner (the blue FB fault-canary bar; CMOS `0x54=0x0D`). Three real
+STEP-1 bugs were found and fixed — and, contrary to the "SMP is iron-only" assumption, all three were
+**reproduced and fixed entirely in QEMU `-smp 4`** (a `usb-kbd` + `-d int` harness gave the exact
+errcode + faulting `CS:RIP` for free; only the LVT keyboard-death + real-Zen LAPIC timing stay iron-only).
+
+### Fixed
+- **AP trampoline never reloaded CS — the actual #GP** (`smp.cyr`). The `jmp far 0x18:..` enters 64-bit
+  via the *trampoline* GDT (where `0x18` = code64), then `lgdt [kernel GDT]` does **not** reload the cached
+  CS — so `ap_entry` kept running with `CS=0x18`, which in the kernel GDT is **user DS**. Every AP timer
+  frame then pushed `CS=0x18`, `proc_save_context` persisted it into the idle's `proc_cs`, and the resume
+  `iretq` reloaded `CS=0x18` against the kernel GDT → **#GP (errcode `0x18`)** on each AP. **Fix:** after
+  RSP is valid, a far return (`lretq`) installs the kernel code64 descriptor (`CS=0x08`) so each AP runs
+  ring-0 correctly. (Reproduced 3/3 under QEMU `-smp 4`; iretq frame showed `CS=0x18`, GDT pristine.)
+- **An idle-only AP fell back to proc 0 (kmain)** (`sched.cyr`) — exposed once the CS fix let the APs run
+  far enough to schedule. `sched_next`'s final `return 0` ran *kmain* on two CPUs at once (shared proc-0
+  state + the BSP's kernel stack) → a `#PF`/`#GP`/`#UD` cascade during kybernet init. **Fix:** a non-BSP
+  CPU with nothing else ready returns **its own idle** (`pcpu_cpu()!=0 → sched_idle_pid_get()`), so
+  `do_context_switch` sees `new==old` and early-outs — the AP simply keeps idling. The BSP keeps the
+  proc-0 fallback (the Attempt-14 sub-case-3b anti-starvation rule). Correct for STEP-2 too.
+- **AP-bring-up vs proc-table-bootstrap boot-order race** (`main.cyr`/`smp.cyr`). `smp_start_aps` returned
+  on `ap_online_mask` (set early in `ap_entry`) while APs were still registering their idle kthreads, then
+  the `proc_count = 0` + `proc_on_cpu_init()` bootstrap (~800 lines later) **wiped** those slots and reset
+  `on_cpu`. **Fix:** wake the APs **after** the proc-table bootstrap (relocated the `smp_start_aps()` call
+  to just before `sched_active = 1`), and make `smp_start_aps` wait on `pcpu_ap_ready` (set last in
+  `ap_entry`) so the scheduler arms only once every AP is fully built.
+- **Validation (burn-free):** QEMU `-smp 4` interactive `agnsh` — prompt reached, a `&` background job
+  runs to completion while the prompt stays live, repeated `version` answered under preemption, **zero
+  guest faults** (the `#GP(0x18)` and the `#PF/#GP/#UD` cascade both gone). `check.sh` 11/11, `agnsh-smoke`,
+  `ring3-smoke` (5/5), `thread-smoke`, `smp-smoke` (`-smp 4`) all green; all three fixes are inert
+  single-core. `build/agnos` 1,221,072 B. Still iron-gated at the flip: the AP LVT LINT0/LINT1
+  keyboard-death efficacy, the real-Zen LAPIC tick rate, and the idle double-run guard — the next burn.
+
 ### Added
 - **SMP arc sub-bite 6 — AP runs the scheduler** (`smp.cyr`/`sched.cyr`/`proc.cyr`/`main.cyr`/`pic.cyr`).
   The scheduler is now SMP-safe (gated off — `smp_wake_enabled=0` — so APs stay parked and single-core
