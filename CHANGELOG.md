@@ -5,6 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.46.2] — 2026-06-25
+
+### Fixed
+- **SMP sub-bite-7 STEP-1: the IF=1 first-preempt agnsh `#GP` root-caused + fixed (iron diagnostic-burn decoded).** The 1.46.1 re-burn halted right after the agnsh banner with `#GP` errcode `0x18` (selector idx 3 = user-SS), faulting RIP `0x1bbd2d`, CS `0x08`. The RIP maps **into `.bss`** — it is the **timer ISR's own final `iretq`** (AGNOS emits ISRs into `.bss` code buffers; `boot_data.cyr var timer_isr[64]` / `pic.cyr:147`) faulting on a **restored frame whose `(CS,SS)` was a torn privilege pair** (`proc_cs[]`/`proc_ss[]` are separate `.bss` arrays, `sched.cyr` save 170-171 / restore 204,208). Surfaced only by the **1.46.x-new combination** — woken APs + the BSP's first IF=1-preemptive context switch — and is iron-only (QEMU clean across 245k int-lines). **Fix:** `sched_fix_torn_selector` (`kernel/core/sched.cyr`) normalizes the proc's `(CS,SS)` to the consistent pair its RIP privilege implies before the lock-free restore, so the iretq frame is always internally valid; zero-perturbation on a consistent pair (QEMU byte-identical). A desync is stamped to virgin low-bank CMOS `0x56-0x5B` (magic `0x7C`) for next-burn confirmation; `agnosticos read-boot-log.cyr` decodes it. QEMU regression green: `check.sh` 11/11, `ring3-smoke` 8/8, `thread-smoke` 2/2, `smp-smoke` 3/3 (`cpus online: 4`), `agnsh-smoke` PASS. Re-flash + re-burn pending. `build/agnos` 1,225,280 B.
+
 ## [1.46.1] — 2026-06-25
 
 **★ 1.46.1 — SMP sub-bite-7 STEP-1 #GP root-caused + fixed + QEMU-validated burn-free.** The 1.46.0

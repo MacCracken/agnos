@@ -209,6 +209,48 @@ fn proc_restore_context(pid, isr_rsp) {
     return 0;
 }
 
+# 1.46.x SMP sub-bite 7 (2026-06-25) — torn-selector guard + iron diagnostic.
+# The 1.46.1 re-burn #GP'd at the timer-ISR iretq (RIP ~0x1bbd2d = INSIDE the timer_isr[64]
+# .bss code buffer, pic.cyr; CS=0x08; errcode 0x18 = idx-3 user-SS) right after the agnsh
+# banner. That is the timer ISR's OWN final iretq (boot_data.cyr emits ISRs into .bss buffers)
+# faulting on a RESTORED frame whose (CS,SS) is NOT a consistent privilege pair. proc_cs[] /
+# proc_ss[] are SEPARATE .bss arrays (sched.cyr:170-171 save / 204,208 restore); under the
+# 1.46.x-NEW combination — woken APs (procs 2-4 idle on APs) + IF=1-preemptive agnsh (the BSP's
+# FIRST real preemptive switch) — one can present out-of-sync with the other, so the iretq frame
+# carries e.g. CS=0x08 (kernel) + SS=0x1B (ring-3) and #GPs (errcode = the SS selector = 0x18).
+# QEMU never reproduced it (245k int-lines clean) — iron-only timing/microarch.
+#
+# FIX: before the lock-free restore, force the proc's (CS,SS) into the consistent pair its RIP
+# privilege implies, so the iretq frame is ALWAYS internally valid (an iretq frame MUST pair
+# same-privilege CS+SS — enforcing that invariant is defensively correct regardless of HOW the
+# desync arose). DIAGNOSTIC: on a desync, stamp pid/cs/ss/rip to VIRGIN low-bank CMOS 0x56-0x5B
+# (magic 0x7C at 0x59, written LAST) so the next burn confirms the mechanism + NAMES the proc +
+# shows the actual torn (cs,ss). ZERO-PERTURBATION on a consistent pair: the body returns before
+# any store/port-I/O, so QEMU (which never desyncs) stays byte-identical and the smokes hold.
+# Boundary 0x1C0000: kernel .text < 0x19a8e0 < 0x1C0000 < user VA (agnsh code >= 0x400000), so
+# a kernel RIP classifies kernel (0x08/0x10) and a ring-3 RIP classifies ring-3 (0x23/0x1B).
+# Low bank (0x70/0x71) NOT the extended bank (cmos_ext_write 0x72/0x73 reads back noise on
+# archaemenid — project_archaemenid_cmos_map). read-boot-log.cyr decodes, gated on 0x59==0x7C.
+fn sched_fix_torn_selector(pid) {
+    var cs = load64(&proc_cs + pid * 8);
+    var ss = load64(&proc_ss + pid * 8);
+    var rip = load64(&proc_table + pid * 176 + 24);
+    var want_cs = 0x23;
+    var want_ss = 0x1B;
+    if (rip < 0x1C0000) { want_cs = 0x08; want_ss = 0x10; }
+    if (cs == want_cs) { if (ss == want_ss) { return 0; } }   # consistent pair → no-op (common path)
+    # desync detected → stamp diagnosis (low-bank CMOS), then repair the pair
+    outb(0x70, 0x56); outb(0x71, pid);                        # 0x56 = pid being restored
+    outb(0x70, 0x57); outb(0x71, cs);                         # 0x57 = torn CS (low byte)
+    outb(0x70, 0x58); outb(0x71, ss);                         # 0x58 = torn SS (low byte)
+    outb(0x70, 0x5A); outb(0x71, (rip >> 16) & 0xFF);         # 0x5A = RIP bits 23:16 (region)
+    outb(0x70, 0x5B); outb(0x71, rip & 0xFF);                 # 0x5B = RIP bits 7:0
+    outb(0x70, 0x59); outb(0x71, 0x7C);                       # 0x59 = magic (written LAST; reader gates on it)
+    store64(&proc_cs + pid * 8, want_cs);
+    store64(&proc_ss + pid * 8, want_ss);
+    return 0;
+}
+
 # High-level context switch called from timer ISR handler.
 # isr_rsp = stack pointer after ISR has pushed all caller-saved regs.
 fn do_context_switch(isr_rsp) {
@@ -229,6 +271,12 @@ fn do_context_switch(isr_rsp) {
     var old = proc_current_get();
     var new_pid = sched_next();
     if (new_pid == old) { sched_spin_unlock(); return 0; }      # RELEASE on early-out (MANDATORY — INV-1)
+
+    # 1.46.x sub-bite 7: ensure new_pid's (CS,SS) is a consistent privilege pair BEFORE the
+    # lock-free restore tail (the 1.46.1 iron timer-ISR-iretq #GP fix; also stamps a desync to
+    # CMOS 0x56-0x5B). Under the lock + before the regalloc-sensitive save/restore zone. No-op on
+    # a consistent pair (the common path — zero perturbation, QEMU byte-identical).
+    sched_fix_torn_selector(new_pid);
 
     # Save old process state. Unconditionally mark `old` as ready (1).
     # save_context implies `old` was the running proc, so the only valid
