@@ -51,6 +51,52 @@ fn apic_timer_init(vector, count) {
     return 0;
 }
 
+# 1.46.x SMP sub-bite 7 (#1): calibrate the LAPIC timer against the fixed-rate PIT.
+# The hardcoded ~100 Hz count (10000000) is tuned to QEMU's ~1 GHz APIC bus and is
+# KNOWN-WRONG on real Zen, whose LAPIC timer runs off the core crystal (different
+# base). Measure how many LAPIC ticks (divide-by-1) elapse over a PIT-timed 10 ms
+# window → that count IS the ~100 Hz periodic reload. The LAPIC timer base is the
+# same crystal on every core, so a BSP-measured count is correct for every AP.
+# Reference-free: PIT channel 2's 1193182 Hz crystal (independent of the ch0 IRQ0
+# timebase, so the running scheduler tick is untouched; speaker bit left off → silent).
+# Result cached in lapic_timer_count_100hz (0 = uncalibrated → callers fall back to the
+# QEMU default). Called on the BSP from smp_start_aps, before any AP arms its timer.
+var lapic_timer_count_100hz = 0;
+
+fn lapic_timer_calibrate() {
+    # PIT channel 2 count for a 10 ms window: 1193182 * 10 / 1000 = 11932.
+    var PIT_10MS = 11932;
+    # Port 0x61: bit0 = ch2 gate, bit1 = speaker enable, bit5 = ch2 OUT (read-only).
+    # Gate low + speaker off to start from a known state (preserve the other bits).
+    var p61 = inb(0x61) & 0xFC;
+    outb(0x61, p61);
+    # Program ch2: control word 0xB2 = ch2(10) | lo/hi byte(11) | mode 1(001) | binary(0).
+    # Mode 1 = hardware re-triggerable one-shot: OUT goes LOW on the gate rising edge,
+    # HIGH at terminal count → polling bit5 high marks 10 ms elapsed.
+    outb(0x43, 0xB2);
+    outb(0x42, PIT_10MS & 0xFF);
+    outb(0x42, (PIT_10MS >> 8) & 0xFF);
+    # LAPIC timer: divide-by-1, ONE-SHOT (LVT 0x320 bits18-17=00), vector MASKED (bit16)
+    # so the countdown raises no spurious timer IRQ during calibration.
+    apic_write(0x3E0, 0x0B);
+    apic_write(0x320, 0x10000);
+    # Trigger the ch2 one-shot: drive the gate low then high (rising edge starts mode 1),
+    # then immediately load the LAPIC count so both countdowns start together.
+    outb(0x61, p61);                       # gate low
+    outb(0x61, p61 | 0x01);                # gate high → mode-1 trigger
+    apic_write(0x380, 0xFFFFFFFF);         # LAPIC counts down from max
+    # Wait for ch2 OUT (bit5) to go high = 10 ms elapsed.
+    while ((inb(0x61) & 0x20) == 0) { }
+    # Read how far the LAPIC counted; keep it masked.
+    var cur = apic_read(0x390);            # current-count register
+    apic_write(0x320, 0x10000);
+    # Restore port 0x61 (gate low, speaker off).
+    outb(0x61, p61);
+    var elapsed = 0xFFFFFFFF - cur;        # LAPIC ticks in 10 ms = the 100 Hz reload count
+    if (elapsed > 0) { lapic_timer_count_100hz = elapsed; }
+    return elapsed;
+}
+
 # 1.44.21 HARDENING: bound the ICR delivery-status (bit 12) wait. The 1.44.18 AP-wake
 # un-gated smp_start_aps — the ONLY caller of these two fns — so this poll now runs on
 # EVERY boot (it was dead before). On real Zen the status clears in ~µs (≈tens of

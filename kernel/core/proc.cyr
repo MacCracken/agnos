@@ -75,6 +75,20 @@ var proc_ss[16];        # saved SS per pid (default 0x10 = ring-0 kernel data)
 var proc_on_cpu[16];
 fn on_cpu_get(pid) { return load64(&proc_on_cpu + pid * 8); }
 fn on_cpu_set(pid, c) { store64(&proc_on_cpu + pid * 8, c); return 0; }
+# GAP-C (1.46.x SMP sub-bite 7): reap-vs-restore fence. A reaper must NOT free a proc's
+# address space while another CPU is mid proc_restore_context on it (or still running it on
+# its own CR3) — that would fault the foreign CPU. Callers set state 0 FIRST (so sched_next
+# can no longer PICK it), then call this to wait out any IN-FLIGHT restore that already
+# passed the state gate: spin until on_cpu clears, which the owning CPU does on its next
+# deschedule (do_context_switch / sys_sched_yield set on_cpu=-1). INERT single-core: the
+# reaped proc was always descheduled (on_cpu==-1) before any reap path runs (foreground
+# reaps run cooperatively and never schedule the proc; proc_reap_child refuses the running
+# proc, so a context switch — which clears on_cpu — already happened), so the loop never
+# iterates. Must be called AFTER proc_set_state(pid,0) and BEFORE proc_free_address_space.
+fn proc_reap_off_cpu_fence(pid) {
+    while (on_cpu_get(pid) != 0 - 1) { asm { 0xF3; 0x90; } }   # pause; spin until owner deschedules
+    return 0;
+}
 # 1.46.x SMP sub-bite 6b: PERSISTENT per-pid idle-owner CPU (-1 = not an idle). UNLIKE
 # proc_on_cpu (cleared to -1 on every deschedule), idle_owner is NEVER cleared on deschedule —
 # so a descheduled AP idle (state==1, on_cpu==-1) is STILL excluded from a FOREIGN CPU's
@@ -572,6 +586,7 @@ fn proc_reap(pid) {
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
     if (proc_current_get() == pid) { proc_current_set(0); }
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
+    proc_reap_off_cpu_fence(pid);           # GAP-C: wait out any in-flight restore before freeing
     if (cr3 != 0x1000) { proc_free_address_space(cr3); }
     # LIFO slot reclaim: hand the top dead slot back to the allocator.
     proctab_spin_lock();   # 1.46.x SMP sub-bite 3: proc_count decrement vs proc_alloc_slot's bump
@@ -614,6 +629,7 @@ fn proc_reap_child(pid) {
     var cr3 = proc_get_cr3(pid);
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3
+    proc_reap_off_cpu_fence(pid);           # GAP-C: wait out any in-flight restore before freeing
     if (cr3 != 0x1000) { proc_free_address_space(cr3); }
     # LIFO slot reclaim: hand the top dead slot back to the allocator (same rule as proc_reap —
     # ONLY the topmost slot collapses). A non-top child that exits early keeps its slot until the

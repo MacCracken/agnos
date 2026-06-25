@@ -31,6 +31,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - **Only sub-bite 7 remains in the SMP arc** — the iron-gated wake flip (`smp_wake_enabled=1` +
     `smp_sched_aps`-staged burns on archaemenid). (Also still open in sub-bite 5: `input_lock` (blocked on
     the input-path conflict) + the net cli/sti family (net-revisit scope).)
+- **SMP arc sub-bite 7 prep — the two pre-STEP-2 code gates landed** (`proc.cyr`/`apic.cyr`/`smp.cyr`).
+  The flip itself is still iron-gated, but the two code items it depended on are now in the binary +
+  smoke-validated, so the next burn is build-ready:
+  - **GAP-C reap-vs-restore fence** (`proc.cyr`). A new `proc_reap_off_cpu_fence(pid)` — called by BOTH
+    `proc_reap` and `proc_reap_child` AFTER `proc_set_state(pid,0)` and BEFORE `proc_free_address_space`
+    — spins until the proc's `on_cpu` clears, so a reaper can never free an address space a foreign CPU
+    is mid `proc_restore_context` on (the STEP-2 race: child exits on an AP, parent reaps on the BSP
+    before the AP descheduled). **Inert single-core**: the reaped proc is always descheduled (`on_cpu==-1`)
+    before any reap path runs (foreground reaps run cooperatively + never schedule the proc;
+    `proc_reap_child` refuses the running proc, so a context switch — which clears `on_cpu` — already
+    happened), so the loop never iterates. ring3-smoke's spawn#3→waitpid#4→reap + 8-proc + non-LIFO
+    slot-reuse paths run straight through it without deadlock.
+  - **AP LAPIC timer calibration** (`apic.cyr`/`smp.cyr`). A new `lapic_timer_calibrate()` measures the
+    LAPIC timer (divide-by-1) against a PIT-channel-2-timed 10 ms window (the fixed 1193182 Hz crystal,
+    independent of the ch0 IRQ0 timebase → the running scheduler tick is untouched, speaker bit left off)
+    and caches the ~100 Hz reload count in `lapic_timer_count_100hz`. Called on the BSP from
+    `smp_start_aps` (so it runs only under `smp_wake_enabled=1` — production single-core never touches the
+    PIT ch2 path); `ap_entry` arms its timer with the calibrated count, falling back to the QEMU-tuned
+    `10000000` only if calibration yields 0. One core crystal → the BSP-measured count is correct for
+    every AP. Replaces the hardcoded QEMU-bus `10000000` that was known-wrong on real Zen.
+  - Validated: production build (`smp_wake_enabled=0`) `build/agnos` 1,220,960 B, check.sh 11/11,
+    agnsh-smoke, ring3-smoke, thread-smoke, smp-smoke (APs parked, boot continuity) — all green.
+    Still iron-gated at the flip: the LVT-mask keyboard-death efficacy + the idle double-run guard.
 
 ## [1.46.0] — 2026-06-24
 

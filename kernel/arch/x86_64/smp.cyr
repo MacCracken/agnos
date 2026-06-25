@@ -360,10 +360,12 @@ fn ap_entry() {
     on_cpu_set(ap_idle, my_id);                  # this AP owns its idle
     proc_set_state(ap_idle, 2);                  # running
     sched_spin_unlock();
-    # Arm this AP's LAPIC timer (vector 32 = the timer ISR). PLACEHOLDER count — the BSP's
-    # QEMU-tuned 10000000 is KNOWN-WRONG on real Zen (LAPIC bus differs); per-CPU CALIBRATE
-    # before STEP-2 iron (sub-bite-7 #1 TODO).
-    var AP_LAPIC_TIMER_COUNT = 10000000;
+    # Arm this AP's LAPIC timer (vector 32 = the timer ISR). 1.46.x SMP sub-bite 7 (#1):
+    # use the BSP's PIT-referenced calibration (lapic_timer_calibrate, run in smp_start_aps
+    # before any AP woke). One core crystal → the BSP count is correct here. Falls back to
+    # the QEMU-tuned 10000000 only if calibration produced 0 (never on real hardware).
+    var AP_LAPIC_TIMER_COUNT = lapic_timer_count_100hz;
+    if (AP_LAPIC_TIMER_COUNT == 0) { AP_LAPIC_TIMER_COUNT = 10000000; }
     apic_timer_init(32, AP_LAPIC_TIMER_COUNT);
     # Mark this AP fully brought up LAST, just before the first sti — so no other CPU reads a
     # half-consistent per-CPU state (TSS ltr'd, idle registered, on_cpu set) before it is whole.
@@ -531,6 +533,11 @@ fn smp_wait_ticks(n) {
 # an absent APIC ID simply never responds (QEMU default -smp 1 boots lose ~120 ms, no fault).
 fn smp_start_aps() {
     smp_build_trampoline();
+    # 1.46.x SMP sub-bite 7 (#1): calibrate the LAPIC timer reload on the BSP (PIT-referenced)
+    # BEFORE any AP arms its timer in ap_entry — one core crystal → one count for all CPUs.
+    # Gated with the whole wake (this fn only runs when smp_wake_enabled=1), so production
+    # single-core boot never touches the PIT ch2 calibration path.
+    lapic_timer_calibrate();
     for (var i = 1; i < 4; i = i + 1) {
         var stack_addr = 0x300000 + i * 0x10000;
         if (vmm_is_mapped(stack_addr) == 0) { vmm_alloc_at(stack_addr); }
