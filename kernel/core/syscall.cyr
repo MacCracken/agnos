@@ -1024,12 +1024,17 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (sc_path_ok(arg3, a4l) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (vfs_resolve_mount(arg1, arg2) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
         if (vfs_resolve_mount(arg3, a4l) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        # 1.46.x SMP sub-bite 5: ext2_path_lookup/vfs_ext2_parent/ext2_link use the shared ext2
+        # scratch — under fs_lock (the validation above touches no scratch). Backends are leaves.
+        fs_spin_lock();
         var tino = ext2_path_lookup(arg1, arg2);
-        if (tino <= 0) { stack_canary_check(canary); return 0 - 1; }
+        if (tino <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
         var ldp = vfs_ext2_parent(arg3, a4l);
-        if (ldp <= 0) { stack_canary_check(canary); return 0 - 1; }
+        if (ldp <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
+        var lkr = ext2_link(tino, ldp, arg3 + vfs_base_off, vfs_base_len);
+        fs_spin_unlock();
         stack_canary_check(canary);
-        return ext2_link(tino, ldp, arg3 + vfs_base_off, vfs_base_len);
+        return lkr;
     }
     if (num == 33) {
         # stat(path=arg1, pathlen=arg2, statbuf=arg3) — fills the 48-byte agnos
@@ -1039,9 +1044,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (is_user_range(arg3, 48) == 0) { stack_canary_check(canary); return 0 - 1; }
         var be33 = vfs_resolve_mount(arg1, arg2);
         if (be33 != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        # 1.46.x SMP sub-bite 5: ext2_path_lookup + ext2_fill_stat use the shared ext2 scratch.
+        fs_spin_lock();
         var sino = ext2_path_lookup(arg1, arg2);
-        if (sino <= 0) { stack_canary_check(canary); return 0 - 1; }
+        if (sino <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
         var sr = ext2_fill_stat(sino, arg3);
+        fs_spin_unlock();
         stack_canary_check(canary);
         return sr;
     }

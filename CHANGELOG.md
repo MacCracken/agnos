@@ -173,6 +173,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     future-SMP races (link#32, nvme fast path, lseek#58) to fix before the wake flip; both inert now.
     **Remaining sub-bite 5: the ISR-touched `input_lock` (kb_buf, cli/sti) + net cli/sti family.**
     `build/agnos` 1,218,464 B.
+- **SMP arc sub-bite 5 — close the FS/NVMe future-SMP races** (`syscall.cyr`/`nvme.cyr`). The PHASE-1 review
+  flagged three shared-scratch races that were inert single-core but corrupt under the wake flip; closed
+  now while the locks are fresh: (1) **link#32 + stat#33** ran `ext2_path_lookup`/`ext2_link`/`ext2_fill_stat`
+  on the shared ext2 scratch with no `fs_lock` — now wrapped (the validation above touches no scratch, the
+  backends are leaves → single-acquire). (2) **`nvme_blk_read_sectors` fast path** read into the shared
+  bounce page via `nvme_read_sectors` then memcpy'd OUTSIDE that lock (another CPU could clobber the page
+  between) — now one atomic `nvme_lock` section using the unlocked `nvme_rw_internal` primitive (mirrors
+  `nvme_blk_read`, no re-entry). (3) **`nvme_write_sectors`** was unlocked despite submitting to the shared
+  IO queue — now under `nvme_lock` (unlock before the error kprint, console < nvme). All inert single-core;
+  agnsh (nvme fast-path) + check.sh 11/11 + exec (FS write/link/stat) green. `lseek#58` left as a noted
+  lower-risk per-FD (not shared-scratch) race. `build/agnos` 1,218,576 B.
 
 ### Added (from the kernel-gap issue backlog)
 - **`exec_redirect`#62 — fd-redirect for output capture** (`kernel/core/syscall.cyr`). Arms a

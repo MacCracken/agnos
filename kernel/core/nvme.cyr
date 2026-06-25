@@ -847,7 +847,11 @@ fn nvme_write_sectors(lba, count, buf) {
     if (nvme_io_ready == 0) { return 0; }
     if (count == 0) { return 0; }
     var bytes = count * nvme_ns1_lba_bytes;
+    # 1.46.x SMP sub-bite 5: the IO SQ/CQ + PRP scratch inside nvme_rw_internal are shared —
+    # under nvme_lock (was unlocked). Unlock BEFORE the error kprint (console < nvme order).
+    nvme_spin_lock();
     var st = nvme_rw_internal(0x01, lba, count - 1, buf, bytes);
+    nvme_spin_unlock();
     if (st != 0) {
         kprint("nvme: write_sectors LBA ", 24);
         kprint_num(lba);
@@ -1030,8 +1034,15 @@ fn nvme_blk_read_sectors(start, count, buf) {
     var bytes = count * nvme_ns1_lba_bytes;
     if (count >= 1) {
         if (bytes <= 4096) {
-            if (nvme_read_sectors(start, count, nvme_read_scratch) == 0) { return 0 - 1; }
+            # 1.46.x SMP sub-bite 5: the read-into-scratch + the memcpy MUST be ONE atomic
+            # nvme_lock section — a bare nvme_read_sectors() unlocks before this memcpy, leaving
+            # another CPU free to clobber the shared bounce page in between. Mirror nvme_blk_read:
+            # take the lock, use the UNLOCKED nvme_rw_internal primitive, copy, unlock (no re-entry).
+            nvme_spin_lock();
+            var fst = nvme_rw_internal(0x02, start, count - 1, nvme_read_scratch, bytes);
+            if (fst != 0) { nvme_spin_unlock(); return 0 - 1; }
             memcpy(buf, nvme_read_scratch, bytes);
+            nvme_spin_unlock();
             return 0;
         }
     }
