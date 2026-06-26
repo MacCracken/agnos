@@ -140,7 +140,13 @@ fn syscall_msr_init() {
     # Program the MSRs for SYSCALL/SYSRET.
     # MSR 0xC0000081 (STAR): segment selectors
     #   Bits 47:32 = kernel CS selector (0x08) — for SYSCALL entry
-    #   Bits 63:48 = user CS base (0x10) — SYSRET: CS=base+16=0x20|3, SS=base+8=0x18|3
+    #   Bits 63:48 = user CS/SS base — SYSRET computes CS=base+16, SS=base+8. MUST be 0x13
+    #     (= 0x10 | 3, RPL-3 baked in), NOT 0x10. On AMD (APM Vol 3 §SYSRET) 64-bit SYSRET forces
+    #     CPL/CS.RPL=3 but does NOT force SS.RPL — SS is loaded VERBATIM as base+8. With base=0x10
+    #     SS=0x18 (RPL 0) while CPL=3, so the NEXT timer-ISR iretq returning to ring 3 #GP(0x18)'d on
+    #     real Zen (SS.RPL != CS.RPL). Intel/QEMU OR 3 into SS, so it was invisible there — the iron-only
+    #     IF=1-agnsh blocker. base=0x13 → CS=0x13+16=0x23, SS=0x13+8=0x1B, both RPL 3 (the +8/+16 don't
+    #     carry into the low 2 bits, so the baked RPL survives). Exactly Linux's MSR_STAR layout trick.
     # MSR 0xC0000082 (LSTAR): handler RIP (64-bit)
     # MSR 0xC0000084 (SFMASK): RFLAGS bits to clear on SYSCALL (mask IF so interrupts off in kernel)
 
@@ -154,7 +160,7 @@ fn syscall_msr_init() {
     asm {
         0xB9; 0x81; 0x00; 0x00; 0xC0;
         0xB8; 0x00; 0x00; 0x00; 0x00;
-        0xBA; 0x08; 0x00; 0x10; 0x00;
+        0xBA; 0x08; 0x00; 0x13; 0x00;   # edx=0x00130008: STAR[63:48]=0x13 (RPL-3 baked → SYSRET SS=0x1B on AMD), STAR[47:32]=0x08
         0x0F; 0x30;
     }
 
@@ -553,7 +559,10 @@ fn syscall_stub_build() {
     }
 
     # sysretq: atomically restores RIP from RCX, RFLAGS from R11,
-    # CS = STAR[63:48]+16 | 3 = 0x23 (user CS), SS = STAR[63:48]+8 | 3 = 0x1B (user SS)
+    # CS = STAR[63:48]+16 = 0x23 (user CS; CPL/CS.RPL forced to 3), SS = STAR[63:48]+8 = 0x1B (user SS).
+    # SS.RPL=3 comes from STAR[63:48]=0x13 being RPL-baked, NOT from a SYSRET force: AMD does NOT force
+    # SS.RPL (APM Vol 3 §SYSRET), so a base lacking RPL bits (0x10) yields SS=0x18/RPL0 → the next ring-3
+    # iretq #GP(0x18)'s on real Zen. See syscall_msr_init's STAR write for the full root-cause note.
     # sysretq (48 0F 07)
     store8(ep + eoff, 0x48); store8(ep + eoff + 1, 0x0F); store8(ep + eoff + 2, 0x07); eoff = eoff + 3;
 
