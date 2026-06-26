@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- **SHIP boot-to-shell via IF=0 cooperative agnsh (`kernel/user/init.cyr`).** The 1.46.2 torn-selector re-burn FALSIFIED the array-guard hypothesis: the #GP recurred (errcode `0x18`/RIP `0x1bbfbd`/CS `0x08`) with **no `0x59=0x7C` array stamp** — so `sched_fix_torn_selector` correctly saw `proc_cs[]`/`proc_ss[]` consistent, yet the timer-ISR `iretq` still faulted. Root cause refined (two diagnosis workflows + a prior-art workflow): the iretq validates the **LIVE on-stack frame** (`isr_rsp+128`/`+152`), which `do_context_switch` writes under the OLD CR3 (`sched.cyr:304`) and the iretq reads under the NEW CR3 after `cr3_load` (`sched.cyr:316` → `pic.cyr:147`) — a cross-CR3 produce-then-consume the array-guard is blind to. To unblock the boot-to-shell milestone, `exec_preempt = 0` launches agnsh **IF=0 cooperative** (the iron-proven 14115/1439 model; resumes go via sysret, register-only, dodging the inter-privilege ISR iretq). SMP wake is orthogonal and stays on (`cpus online: 4`). `agnsh-smoke` PASS. Flip back to `1` for an IF=1 diagnostic burn.
+
+### Added
+- **IF=1 hardening diagnostic: `sched_fix_live_frame` (`kernel/core/sched.cyr`).** Runs as the last statement of `do_context_switch` (the GPR pops touch only `isr_rsp+0..+112`, so `+128`/`+152` are exactly what the iretq loads). Reads the ACTUAL live frame CS/SS; no-ops on a consistent pair (QEMU byte-identical AND inert on the shipped IF=0 path, which only resumes CPL0→CPL0 kernel frames); on a torn frame it STAMPS the values to virgin low-bank CMOS `0x63`(CS)/`0x64`(SS)/`0x65`(magic `0x3C`, written last) and REPAIRS the pair from the frame's RIP privilege. The next IF=1 burn (flip `exec_preempt=1`) disambiguates the standing ambiguity — magic set + boot-to-shell ⟹ a cross-CR3 frame tear (repairable; adopt the `cr3_load`-before-restore reorder); no magic + still #GP ⟹ HW rejects a valid frame at the first inter-privilege ISR iretq; magic set + still #GP ⟹ escalate to a pre-iretq hand-asm stamp. `agnosticos read-boot-log.cyr` decodes it (gated `0x65==0x3C` + selector-sanity + `fvec!=14`). `agnsh-smoke` PASS (inert). `build/agnos` 1,225,728 B.
+
 ## [1.46.2] — 2026-06-25
 
 ### Fixed

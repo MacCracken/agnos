@@ -251,6 +251,50 @@ fn sched_fix_torn_selector(pid) {
     return 0;
 }
 
+# 1.46.x sub-bite 7 follow-on (2026-06-25) — LIVE-FRAME guard + iron diagnostic.
+# The 1.46.2 torn-selector ARRAY guard (sched_fix_torn_selector) NO-OP'd on the iron #GP burn (no
+# 0x59=0x7C stamp) yet the timer-ISR iretq STILL #GP'd (errcode 0x18 = user SS / GDT[3]). Refined
+# root cause (two independent diagnosis workflows): the iretq validates the LIVE on-stack frame
+# (isr_rsp+128 CS / +152 SS), NOT the proc_cs[]/proc_ss[] ARRAYS the array-guard inspects.
+# proc_restore_context writes that frame under the OLD CR3 (sched.cyr:304); cr3_load switches to the
+# NEW CR3 (sched.cyr:316); the ISR epilogue iretq reads it under the NEW CR3 (pic.cyr:147). On the
+# FIRST IF=1 cross-CR3 CPL0->CPL3 resume on real Zen the frame can present torn (kernel CS 0x08 +
+# user SS 0x1B) -> #GP(0x18). QEMU never reproduced it (TCG models the cross-CR3 frame coherence).
+#
+# This guard runs at the LAST C-level point before the ISR epilogue — the 15 GPR pops consume only
+# isr_rsp+0..+112 and never touch +128/+152, so the (CS,SS) it reads/repairs IS what the iretq loads.
+# It STAMPS the ACTUAL live frame to virgin CMOS (0x63 CS / 0x64 SS / 0x65 magic 0x3C, written LAST)
+# on a desync and REPAIRS the pair from the FRAME's own RIP privilege (boundary 0x1C0000, same as the
+# array-guard). ZERO-PERTURBATION on a consistent frame (returns before any port-I/O), so QEMU stays
+# byte-identical AND the shipped IF=0 build (agnsh cooperative -> resumes go through sysret, so the
+# timer only ever resumes CPL0->CPL0 kernel frames = always-consistent) never trips it. Classifying
+# by the frame's OWN rip (not a proc-table lookup) keeps it a pure stack read — no array dependency.
+# Next IF=1 DIAGNOSTIC burn (flip init.cyr exec_preempt back to 1) disambiguates:
+#   magic set (0x65=0x3C) + boot-to-shell = torn frame CONFIRMED + REPAIRED (root cause (a): a
+#       cross-CR3 frame tear) -> adopt the cr3_load-before-restore reorder as the principled cure;
+#   no magic + still #GP = the frame was VALID -> hardware rejects the first inter-privilege ISR
+#       iretq ([[project_agnsh_if1_preempt_iron_blocker]]) -> stay IF=0 cooperative;
+#   magic set + still #GP = a writer exists past this point -> escalate to a pre-iretq hand-asm stamp.
+# Slots 0x63-0x65 are the #PF-only RIP capture (free on a #GP / boot-to-shell run); read-boot-log.cyr
+# decodes gated on 0x65==0x3C + selector-sanity + fvec!=14. Low bank (0x70/0x71) per
+# project_archaemenid_cmos_map (the extended bank reads back noise on archaemenid).
+fn sched_fix_live_frame(isr_rsp) {
+    var cs  = load64(isr_rsp + 128);
+    var ss  = load64(isr_rsp + 152);
+    var rip = load64(isr_rsp + 120);
+    var want_cs = 0x23;
+    var want_ss = 0x1B;
+    if (rip < 0x1C0000) { want_cs = 0x08; want_ss = 0x10; }
+    if (cs == want_cs) { if (ss == want_ss) { return 0; } }   # consistent live frame -> no-op (QEMU byte-identical)
+    # desync detected -> stamp the ACTUAL frame (virgin low-bank CMOS), then repair the pair
+    outb(0x70, 0x63); outb(0x71, cs);        # 0x63 = live-frame CS (low byte)
+    outb(0x70, 0x64); outb(0x71, ss);        # 0x64 = live-frame SS (low byte)
+    outb(0x70, 0x65); outb(0x71, 0x3C);      # 0x65 = magic (written LAST; reader gates on it)
+    store64(isr_rsp + 128, want_cs);         # REPAIR: force the iretq frame into a consistent pair
+    store64(isr_rsp + 152, want_ss);
+    return 0;
+}
+
 # High-level context switch called from timer ISR handler.
 # isr_rsp = stack pointer after ISR has pushed all caller-saved regs.
 fn do_context_switch(isr_rsp) {
@@ -329,6 +373,14 @@ fn do_context_switch(isr_rsp) {
 
     # Check for pending unmasked signals on the new process
     proc_check_pending_signals(new_pid);
+
+    # 1.46.2 follow-on: validate + repair the ACTUAL iretq frame the array-guard (sched_fix_torn_selector,
+    # called pre-restore at the top of this fn) is structurally blind to. LAST point before the ISR
+    # epilogue's GPR pops + iretq (pic.cyr:147). No-op on a consistent frame -> inert on the shipped
+    # IF=0 path + QEMU byte-identical; armed only on the IF=1 cross-CR3 CPL0->CPL3 resume. Reached only
+    # on a real switch (new_pid != old; the new==old early-out returned at the top with the HW-pushed
+    # frame intact), which is exactly the suspected cross-CR3 idle->agnsh resume path.
+    sched_fix_live_frame(isr_rsp);
 
     return 0;
 }

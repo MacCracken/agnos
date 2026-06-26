@@ -42,7 +42,19 @@ fn kybernet_exec_agnsh() {
     # consumes the flag, so ONLY agnsh's launch is preemptive; foreground execwait#37 / `run /bin/X`
     # stay IF=0). IRON-PENDING: QEMU can't reproduce the Zen freeze, so the next burn is the real
     # test — boot-to-shell + multi-command + a live `&` background job on real Zen.
-    exec_preempt = 1;
+    #
+    # 2026-06-25 SHIP DECISION (user: "Both — ship + diagnose"): the 1.46.1/1.46.2 IF=1 burns BOTH
+    # #GP'd at the timer-ISR iretq right after the agnsh banner (errcode 0x18 = user SS / GDT[3]).
+    # Root-caused (two independent diagnosis workflows) to a TORN LIVE iretq frame on the first
+    # cross-CR3 CPL0->CPL3 ISR resume on real Zen — the proc_cs/proc_ss ARRAY guard
+    # (sched_fix_torn_selector) is blind to it, so the 1.46.2 fix never fired (no 0x59=0x7C stamp).
+    # SMP wake itself WORKS on iron (`cpus online: 4`). To unblock boot-to-shell NOW we launch agnsh
+    # IF=0 cooperative — the iron-proven 14115/1439 model that dodges the inter-privilege ISR iretq
+    # entirely (resumes go through sysret, register-only). The IF=1 hardening track lives in
+    # sched_fix_live_frame (sched.cyr): flip this back to 1 for a DIAGNOSTIC burn and the live-frame
+    # stamp (CMOS 0x63-0x65) disambiguates a cross-CR3 frame-tear (repairable) from a hardware
+    # rejection of a valid frame ([[project_agnsh_if1_preempt_iron_blocker]]). See state.md 1.46.x.
+    exec_preempt = 0;   # IF=0 cooperative agnsh (ship); set to 1 for an IF=1 diagnostic burn
     exec_and_wait(e, r, c);
     var code = proc_get_exit_code(pid);
     proc_reap(pid);
