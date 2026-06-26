@@ -27,15 +27,16 @@ var tss[104];      # x86_64 TSS is 104 bytes
 var idt[4096];     # 256 vectors x 16 bytes each
 var idt_ptr[16];
 var isr_stub[16];
-var exc_stub[160];  # 1.40.9: per-vector CPU-exception handlers. 1.46.x sub-bite 8 (2026-06-26):
-                    # the #GP stub grew to ~432 B (loaded-frame + CR3 + heartbeat + GDT[3] capture,
-                    # idt.cyr v==13), so total stub bytes are now ~878 (5x51 small + 432 #GP + 191 #PF).
-                    # Was [96]=768 B (sized for the old 20 B/vector stubs) — OVERFLOWED. 160 u64 =
-                    # 1280 B gives ~402 B headroom.
-var gdtr_scratch[2];  # 1.46.x sub-bite 8: 16 B sgdt target for the #GP stub (GDTR = 2 B limit + 8 B
-                      # base = 10 B). The stub sgdt's the LIVE GDTR here, then reads GDT[3]'s access
-                      # byte (base+0x1D, expect 0xF2) to CMOS 0x7F — confirms/refutes GDT-state
-                      # corruption (H2) now that the CR3-asymmetry (H1) is dead (KPTI collapsed, proc.cyr:486).
+# 1.40.9: per-vector CPU-exception handlers. 1.46.x sub-bite 8 (2026-06-26): the #GP stub grew to
+# ~432 B (loaded-frame + CR3 + heartbeat + GDT[3] capture, idt.cyr v==13), so total stub bytes are
+# now ~878 (5x51 small + 432 #GP + 191 #PF). Was [96]=768 B (sized for the old 20 B/vector stubs) —
+# OVERFLOWED. 160 u64 = 1280 B gives ~402 B headroom.
+var exc_stub[160];
+# 1.46.x sub-bite 8: 16 B sgdt target for the #GP stub (GDTR = 2 B limit + 8 B base = 10 B). The stub
+# sgdt's the LIVE GDTR here, then reads GDT[3]'s access byte (base+0x1D, expect 0xF2) to CMOS 0x7F —
+# confirms/refutes GDT-state corruption (H2) now that the CR3-asymmetry (H1) is dead (KPTI collapsed,
+# proc.cyr:486).
+var gdtr_scratch[2];
 var fb_dbg_phys = 0;  # 1.45.16: FB base captured at fb_console_init for the idt.cyr fault-bar (0 = console not up → fault paint skipped)
 var timer_ticks = 0;
 var timer_isr[64];
