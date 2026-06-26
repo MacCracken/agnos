@@ -54,7 +54,18 @@ fn kybernet_exec_agnsh() {
     # sched_fix_live_frame (sched.cyr): flip this back to 1 for a DIAGNOSTIC burn and the live-frame
     # stamp (CMOS 0x63-0x65) disambiguates a cross-CR3 frame-tear (repairable) from a hardware
     # rejection of a valid frame ([[project_agnsh_if1_preempt_iron_blocker]]). See state.md 1.46.x.
-    exec_preempt = 0;   # IF=0 cooperative agnsh (ship); set to 1 for an IF=1 diagnostic burn
+    #
+    # 2026-06-26 — SUPERSEDES the IF=0 stopgap above (which was NEVER user-authorized; the user
+    # repeatedly DENIED the IF=0 fallback). A 16-agent root-cause workflow resolved the ambiguity
+    # DECISIVELY to the repairable (a): the decoded fault frame is CS=0x08 + SS=0x1B (a TORN pair),
+    # not a valid (0x23,0x1B) one — so "hardware rejects a valid frame" (b) is refuted by the very
+    # datum it relied on. The cure is sched_fix_live_frame (sched.cyr): it runs AFTER cr3_load, under
+    # the SAME CR3 the iretq uses, and force-writes the consistent (CS,SS) pair into the exact frame
+    # bytes the iretq loads, with nothing between it and the return -> store-to-load forwarding makes
+    # it correct by construction. That cure has been in the binary since 1.46.3 but was NEVER burned
+    # at IF=1. This flip runs the STEP-1-at-IF=1 burn that confirms it (smp_sched_aps stays 0; the
+    # same cure covers STEP-2 since it lives in the shared do_context_switch path).
+    exec_preempt = 1;   # IF=1 PREEMPTIVE agnsh — load-bearing cure active (sched_fix_live_frame). Revert to 0 only for the IF=0 stopgap.
     exec_and_wait(e, r, c);
     var code = proc_get_exit_code(pid);
     proc_reap(pid);
