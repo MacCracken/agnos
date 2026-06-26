@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.46.3] — 2026-06-25
+
+**★ 1.46.3 — BOOT-TO-SHELL ON IRON.** The IF=0 cooperative-agnsh ship (`exec_preempt=0`) reached an
+interactive shell on real Zen (archaemenid, burn `1461`): past a live DHCP lease, kybernet execs
+`/bin/agnsh`, **agnsh 1.7.0 reaches its `[ASSIST] >` prompt and runs `help` + `version`** — with SMP
+wake left **on** (`smp_wake_enabled=1`, STEP-1 `cpus online: 4`). This is the milestone the whole
+1.46.x arc was grinding toward: the IF=1 first-preempt `#GP` (1.46.0–1.46.2) is *side-stepped*, not yet
+solved — agnsh resumes via `sysret` (register-only), dodging the inter-privilege ISR `iretq` that the
+torn-live-frame ambiguity poisons. **The first external-tool exec faults:** `ls` (→ `kriya`) takes a
+**`#PF`** — `CR2=0x0`, err `0x05` (protection / read / **CPL3** / data), faulting user RIP `0x00400171`
+(= the user code base `0x400000` + `0x171`; a null-pointer read in the freshly-exec'd tool, *not* a
+kernel address despite the boot-log decoder's `<16 MB` heuristic). Tracked as the next issue (userland
+exec / argv path). **Still pending in the SMP arc:** sub-bite-7 **STEP-2** (`smp_sched_aps=1` — real
+procs scheduled onto the woken APs); STEP-1 (wake + AP-idle-only) is what this burn validated.
+
 ### Changed
 - **SHIP boot-to-shell via IF=0 cooperative agnsh (`kernel/user/init.cyr`).** The 1.46.2 torn-selector re-burn FALSIFIED the array-guard hypothesis: the #GP recurred (errcode `0x18`/RIP `0x1bbfbd`/CS `0x08`) with **no `0x59=0x7C` array stamp** — so `sched_fix_torn_selector` correctly saw `proc_cs[]`/`proc_ss[]` consistent, yet the timer-ISR `iretq` still faulted. Root cause refined (two diagnosis workflows + a prior-art workflow): the iretq validates the **LIVE on-stack frame** (`isr_rsp+128`/`+152`), which `do_context_switch` writes under the OLD CR3 (`sched.cyr:304`) and the iretq reads under the NEW CR3 after `cr3_load` (`sched.cyr:316` → `pic.cyr:147`) — a cross-CR3 produce-then-consume the array-guard is blind to. To unblock the boot-to-shell milestone, `exec_preempt = 0` launches agnsh **IF=0 cooperative** (the iron-proven 14115/1439 model; resumes go via sysret, register-only, dodging the inter-privilege ISR iretq). SMP wake is orthogonal and stays on (`cpus online: 4`). `agnsh-smoke` PASS. Flip back to `1` for an IF=1 diagnostic burn.
 
