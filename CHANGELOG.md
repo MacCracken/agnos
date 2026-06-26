@@ -5,6 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.46.4] — 2026-06-25
+
+**★ 1.46.4 — WORKING COREUTILS (the 1.46.3 boot-to-shell `ls`/argv `#PF` fixed).** The 1.46.3 burn
+reached the interactive shell but the first external-tool exec faulted; this cut makes `ls`/`kriya`/
+`bnrmr`/`owl` run. Single one-line kernel fix (`pmm.cyr` reserves region 8) for an empty-argv
+regression introduced by the 1.46.1 region-7 kstack reservation; root-caused and validated entirely
+burn-free in QEMU. Iron re-burn pending. Still pending in the SMP arc: sub-bite-7 **STEP-2**
+(`smp_sched_aps=1`, real procs on the woken APs).
+
+### Fixed
+- **execwait argv corruption — `ls`/coreutils `#PF` after boot-to-shell (`kernel/core/pmm.cyr`).** The 1.46.3 iron burn reached the shell but the first external-tool exec (`ls`→`kriya`) took a `#PF` (`CR2=0`, CPL3 read, user RIP `0x00400171`). Root-caused **entirely burn-free** in QEMU (the `agnsh-delegation`/`kriya-crash-probe` harness reproduced it single-core): `bnrmr hi` printed its help instead of rendering and `kriya` faulted — both got **empty argv** (`argc=0`). Traced via page-table walk: the **1.46.1 region-7 reservation** (per-proc kstack pool, `0xE00000–0x1000000`) pushed `pmm_alloc_2mb`'s next 2 MB-aligned user-stack allocation to **phys `0x1000000` (region 8)** — which the 1.46.1 comment *claimed* to reserve but the code did not. The **boot CR3's PD[8] is not identity** (it resolves VA `0x1000000`→phys `0xC00000`; `pt_init` maps it identity but an early-boot writer clobbers it — boot PD[8]=`0xC00000|0x83` while PD[6/7/9..]=correct identity, and `proc_create_address_space` re-asserts the *per-proc* PD[8..63] identity but not the boot PD). So `elf_load_from_file`'s `store64(stack_phys+off, …)` SysV-block write (run under boot CR3) landed at phys `0xC03000`, while the child read its real stack page (raw phys `0x1003000` via its own PD[510]) → `argv(0)`=null → `path_basename_ptr(null)`→`strlen(null)`→`#PF`. **Fix:** reserve region 8 in `pmm_init` (the documented-but-missing 1.46.1 intent) so user stacks land at region 9 (phys `0x1200000`, correct identity in BOTH the boot PD and the per-proc PD) — the kernel's identity-write and the child's stack mapping agree again. (The stale boot-PD[8] writer is a separate latent bug; region 8 is now unused, so it is inert.) **Validated burn-free:** `agnsh-delegation` PASS (kriya `mkdir`/`cp`/`ls` + owl `cat` + `bnrmr hi` now *renders*), `exec-smoke` argv tests PASS (argv[1] deref + execwait#37 argv-carry), `check.sh` 11/11, `agnsh-smoke`/`ring3-smoke`/`thread-smoke`/`smp-smoke` (`cpus online: 4`) all green. `build/agnos` 1,225,808 B. Iron re-burn pending.
+
 ## [1.46.3] — 2026-06-25
 
 **★ 1.46.3 — BOOT-TO-SHELL ON IRON.** The IF=0 cooperative-agnsh ship (`exec_preempt=0`) reached an
