@@ -279,7 +279,160 @@ fn exc_handlers_init() {
             store8(stub + 126, 0x48); store8(stub + 127, 0x8B); store8(stub + 128, 0x44); store8(stub + 129, 0x24); store8(stub + 130, 0x08);  # mov rax,[rsp+8]
             store8(stub + 131, 0x48); store8(stub + 132, 0xC1); store8(stub + 133, 0xE8); store8(stub + 134, 0x28);  # shr rax,40
             store8(stub + 135, 0xE6); store8(stub + 136, 0x71);
-            tail = 137;
+            # 1.46.x SMP sub-bite 8 (2026-06-26): the DECISIVE capture for the IF=1 first-preempt
+            # agnsh #GP. The existing 0x6D is the FAULT CS (=0x08, the kernel ISR that CONTAINS the
+            # faulting iretq) — it says NOTHING about the frame the iretq is loading. So we deref the
+            # iretq's OWN rsp ([rsp+0x20] at #GP entry = the CPU-saved RSP of the faulting instr =
+            # isr_rsp+120, the timer-ISR iretq frame) and stamp the LOADED selectors/RFLAGS/RSP it was
+            # consuming, plus CR3 at fault + the live do_context_switch heartbeat. NO push/pop above,
+            # so the #GP frame is [rsp]=err, [rsp+8]=RIP, [rsp+0x10]=CS, [rsp+0x18]=RFLAGS,
+            # [rsp+0x20]=saved RSP, [rsp+0x28]=saved SS throughout (same invariant as the RIP block).
+            # The iretq frame at [[rsp+0x20]] is RIP@+0 / CS@+8 / RFLAGS@+0x10 / RSP@+0x18 / SS@+0x20.
+            # Slots 0x70-0x7E are VIRGIN low-bank scratch (BIOS touches only 0x42-0x44; cmos_dump reads
+            # them clean to 0x7F) — NO last-writer overload, unlike 0x67-0x6F. Indices < 0x80 stay in the
+            # Zen-trustworthy low bank (ports 0x70/0x71); NMI bit7=0. read-boot-log.cyr decodes, gated on
+            # 0x54=0x0D + 0x55=0xE5. DECISION: 0x71 (loaded CS) reads 0x23 => CONSISTENT frame, a genuine
+            # SS-load rejection of valid SS=0x1B (the region-7 kstack is identity-mapped same-physical in
+            # every CR3, so a cross-CR3 tear is mechanically impossible — C3 already showed no 0x3C); 0x08
+            # => torn frame (revives H-TEAR). Either way ONE burn ends the 2-week chase.
+            # 0x70 <- LOADED SS  = [[rsp+0x20]+0x20]  (expect 0x1B)
+            store8(stub + 137, 0xB0); store8(stub + 138, 0x70);
+            store8(stub + 139, 0xE6); store8(stub + 140, 0x70);
+            store8(stub + 141, 0x48); store8(stub + 142, 0x8B); store8(stub + 143, 0x44); store8(stub + 144, 0x24); store8(stub + 145, 0x20);  # mov rax,[rsp+0x20]
+            store8(stub + 146, 0x8A); store8(stub + 147, 0x40); store8(stub + 148, 0x20);  # mov al,[rax+0x20]
+            store8(stub + 149, 0xE6); store8(stub + 150, 0x71);
+            # 0x71 <- LOADED CS  = [[rsp+0x20]+0x08]  *** THE DISCRIMINATOR *** (0x23 consistent / 0x08 torn)
+            store8(stub + 151, 0xB0); store8(stub + 152, 0x71);
+            store8(stub + 153, 0xE6); store8(stub + 154, 0x70);
+            store8(stub + 155, 0x48); store8(stub + 156, 0x8B); store8(stub + 157, 0x44); store8(stub + 158, 0x24); store8(stub + 159, 0x20);  # mov rax,[rsp+0x20]
+            store8(stub + 160, 0x8A); store8(stub + 161, 0x40); store8(stub + 162, 0x08);  # mov al,[rax+0x08]
+            store8(stub + 163, 0xE6); store8(stub + 164, 0x71);
+            # 0x72 <- LOADED RFLAGS bits 7:0   = [[rsp+0x20]+0x10]  (expect 0x02)
+            store8(stub + 165, 0xB0); store8(stub + 166, 0x72);
+            store8(stub + 167, 0xE6); store8(stub + 168, 0x70);
+            store8(stub + 169, 0x48); store8(stub + 170, 0x8B); store8(stub + 171, 0x44); store8(stub + 172, 0x24); store8(stub + 173, 0x20);  # mov rax,[rsp+0x20]
+            store8(stub + 174, 0x8A); store8(stub + 175, 0x40); store8(stub + 176, 0x10);  # mov al,[rax+0x10]
+            store8(stub + 177, 0xE6); store8(stub + 178, 0x71);
+            # 0x73 <- LOADED RFLAGS bits 15:8  = [[rsp+0x20]+0x11]  (expect 0x02 => 0x0202, IF set + bit1)
+            store8(stub + 179, 0xB0); store8(stub + 180, 0x73);
+            store8(stub + 181, 0xE6); store8(stub + 182, 0x70);
+            store8(stub + 183, 0x48); store8(stub + 184, 0x8B); store8(stub + 185, 0x44); store8(stub + 186, 0x24); store8(stub + 187, 0x20);  # mov rax,[rsp+0x20]
+            store8(stub + 188, 0x8A); store8(stub + 189, 0x40); store8(stub + 190, 0x11);  # mov al,[rax+0x11]
+            store8(stub + 191, 0xE6); store8(stub + 192, 0x71);
+            # 0x74 <- LOADED target RSP bits 7:0    = [[rsp+0x20]+0x18]
+            store8(stub + 193, 0xB0); store8(stub + 194, 0x74);
+            store8(stub + 195, 0xE6); store8(stub + 196, 0x70);
+            store8(stub + 197, 0x48); store8(stub + 198, 0x8B); store8(stub + 199, 0x44); store8(stub + 200, 0x24); store8(stub + 201, 0x20);  # mov rax,[rsp+0x20]
+            store8(stub + 202, 0x8A); store8(stub + 203, 0x40); store8(stub + 204, 0x18);  # mov al,[rax+0x18]
+            store8(stub + 205, 0xE6); store8(stub + 206, 0x71);
+            # 0x75 <- LOADED target RSP bits 31:24  = [[rsp+0x20]+0x1B]  (b3~0x3F => sane agnsh user stack; 0x00 => garbage)
+            store8(stub + 207, 0xB0); store8(stub + 208, 0x75);
+            store8(stub + 209, 0xE6); store8(stub + 210, 0x70);
+            store8(stub + 211, 0x48); store8(stub + 212, 0x8B); store8(stub + 213, 0x44); store8(stub + 214, 0x24); store8(stub + 215, 0x20);  # mov rax,[rsp+0x20]
+            store8(stub + 216, 0x8A); store8(stub + 217, 0x40); store8(stub + 218, 0x1B);  # mov al,[rax+0x1B]
+            store8(stub + 219, 0xE6); store8(stub + 220, 0x71);
+            # 0x76 <- iretq FRAME POINTER bits 7:0   = the saved RSP value itself ([rsp+0x20])
+            store8(stub + 221, 0xB0); store8(stub + 222, 0x76);
+            store8(stub + 223, 0xE6); store8(stub + 224, 0x70);
+            store8(stub + 225, 0x48); store8(stub + 226, 0x8B); store8(stub + 227, 0x44); store8(stub + 228, 0x24); store8(stub + 229, 0x20);  # mov rax,[rsp+0x20]  (al = its low byte)
+            store8(stub + 230, 0xE6); store8(stub + 231, 0x71);
+            # 0x77 <- iretq FRAME POINTER bits 23:16 = saved RSP >> 16  (b2 ~0x0E-0x0F => region-7 per-proc kstack)
+            store8(stub + 232, 0xB0); store8(stub + 233, 0x77);
+            store8(stub + 234, 0xE6); store8(stub + 235, 0x70);
+            store8(stub + 236, 0x48); store8(stub + 237, 0x8B); store8(stub + 238, 0x44); store8(stub + 239, 0x24); store8(stub + 240, 0x20);  # mov rax,[rsp+0x20]
+            store8(stub + 241, 0x48); store8(stub + 242, 0xC1); store8(stub + 243, 0xE8); store8(stub + 244, 0x10);  # shr rax,16
+            store8(stub + 245, 0xE6); store8(stub + 246, 0x71);
+            # 0x78 <- CR3 bits 19:12 (mov rax,cr3; shr 12)  — per-proc pml4 fingerprint (boot CR3 0x1000 reads 0x01)
+            store8(stub + 247, 0xB0); store8(stub + 248, 0x78);
+            store8(stub + 249, 0xE6); store8(stub + 250, 0x70);
+            store8(stub + 251, 0x0F); store8(stub + 252, 0x20); store8(stub + 253, 0xD8);  # mov rax,cr3
+            store8(stub + 254, 0x48); store8(stub + 255, 0xC1); store8(stub + 256, 0xE8); store8(stub + 257, 0x0C);  # shr rax,12
+            store8(stub + 258, 0xE6); store8(stub + 259, 0x71);
+            # 0x79 <- CR3 bits 27:20 (mov rax,cr3; shr 20)
+            store8(stub + 260, 0xB0); store8(stub + 261, 0x79);
+            store8(stub + 262, 0xE6); store8(stub + 263, 0x70);
+            store8(stub + 264, 0x0F); store8(stub + 265, 0x20); store8(stub + 266, 0xD8);  # mov rax,cr3
+            store8(stub + 267, 0x48); store8(stub + 268, 0xC1); store8(stub + 269, 0xE8); store8(stub + 270, 0x14);  # shr rax,20
+            store8(stub + 271, 0xE6); store8(stub + 272, 0x71);
+            # 0x7A <- SAVED RFLAGS-at-fault bits 15:8 = [rsp+0x19]  (kernel-context IF/IOPL at the moment of fault)
+            store8(stub + 273, 0xB0); store8(stub + 274, 0x7A);
+            store8(stub + 275, 0xE6); store8(stub + 276, 0x70);
+            store8(stub + 277, 0x8A); store8(stub + 278, 0x44); store8(stub + 279, 0x24); store8(stub + 280, 0x19);  # mov al,[rsp+0x19]
+            store8(stub + 281, 0xE6); store8(stub + 282, 0x71);
+            # --- do_context_switch HEARTBEAT relay: g_switch_log (sched.cyr) -> CMOS 0x7B-0x7E ---
+            # Packed byte0=old_pid / byte1=new_pid / byte2=ctr / byte3=magic 0x5C. Reloads &g_switch_log
+            # as imm64 each stamp (mov al,IDX only touches AL, but mov rax,[rax] reloads the whole reg, so
+            # re-deref per byte is the robust form — same reload-each-time pattern as the RIP block).
+            var hbp = &g_switch_log;
+            # 0x7B <- old_pid (byte0)
+            store8(stub + 283, 0xB0); store8(stub + 284, 0x7B);
+            store8(stub + 285, 0xE6); store8(stub + 286, 0x70);
+            store8(stub + 287, 0x48); store8(stub + 288, 0xB8);                       # mov rax, imm64 &g_switch_log
+            store8(stub + 289, hbp & 0xFF); store8(stub + 290, (hbp >> 8) & 0xFF);
+            store8(stub + 291, (hbp >> 16) & 0xFF); store8(stub + 292, (hbp >> 24) & 0xFF);
+            store8(stub + 293, (hbp >> 32) & 0xFF); store8(stub + 294, (hbp >> 40) & 0xFF);
+            store8(stub + 295, (hbp >> 48) & 0xFF); store8(stub + 296, (hbp >> 56) & 0xFF);
+            store8(stub + 297, 0x48); store8(stub + 298, 0x8B); store8(stub + 299, 0x00);  # mov rax,[rax]
+            store8(stub + 300, 0xE6); store8(stub + 301, 0x71);
+            # 0x7C <- new_pid (byte1, shr 8)
+            store8(stub + 302, 0xB0); store8(stub + 303, 0x7C);
+            store8(stub + 304, 0xE6); store8(stub + 305, 0x70);
+            store8(stub + 306, 0x48); store8(stub + 307, 0xB8);
+            store8(stub + 308, hbp & 0xFF); store8(stub + 309, (hbp >> 8) & 0xFF);
+            store8(stub + 310, (hbp >> 16) & 0xFF); store8(stub + 311, (hbp >> 24) & 0xFF);
+            store8(stub + 312, (hbp >> 32) & 0xFF); store8(stub + 313, (hbp >> 40) & 0xFF);
+            store8(stub + 314, (hbp >> 48) & 0xFF); store8(stub + 315, (hbp >> 56) & 0xFF);
+            store8(stub + 316, 0x48); store8(stub + 317, 0x8B); store8(stub + 318, 0x00);  # mov rax,[rax]
+            store8(stub + 319, 0x48); store8(stub + 320, 0xC1); store8(stub + 321, 0xE8); store8(stub + 322, 0x08);  # shr rax,8
+            store8(stub + 323, 0xE6); store8(stub + 324, 0x71);
+            # 0x7D <- counter (byte2, shr 16)
+            store8(stub + 325, 0xB0); store8(stub + 326, 0x7D);
+            store8(stub + 327, 0xE6); store8(stub + 328, 0x70);
+            store8(stub + 329, 0x48); store8(stub + 330, 0xB8);
+            store8(stub + 331, hbp & 0xFF); store8(stub + 332, (hbp >> 8) & 0xFF);
+            store8(stub + 333, (hbp >> 16) & 0xFF); store8(stub + 334, (hbp >> 24) & 0xFF);
+            store8(stub + 335, (hbp >> 32) & 0xFF); store8(stub + 336, (hbp >> 40) & 0xFF);
+            store8(stub + 337, (hbp >> 48) & 0xFF); store8(stub + 338, (hbp >> 56) & 0xFF);
+            store8(stub + 339, 0x48); store8(stub + 340, 0x8B); store8(stub + 341, 0x00);  # mov rax,[rax]
+            store8(stub + 342, 0x48); store8(stub + 343, 0xC1); store8(stub + 344, 0xE8); store8(stub + 345, 0x10);  # shr rax,16
+            store8(stub + 346, 0xE6); store8(stub + 347, 0x71);
+            # 0x7E <- magic (byte3, shr 24)  — expect 0x5C; gates the read-boot-log heartbeat decode
+            store8(stub + 348, 0xB0); store8(stub + 349, 0x7E);
+            store8(stub + 350, 0xE6); store8(stub + 351, 0x70);
+            store8(stub + 352, 0x48); store8(stub + 353, 0xB8);
+            store8(stub + 354, hbp & 0xFF); store8(stub + 355, (hbp >> 8) & 0xFF);
+            store8(stub + 356, (hbp >> 16) & 0xFF); store8(stub + 357, (hbp >> 24) & 0xFF);
+            store8(stub + 358, (hbp >> 32) & 0xFF); store8(stub + 359, (hbp >> 40) & 0xFF);
+            store8(stub + 360, (hbp >> 48) & 0xFF); store8(stub + 361, (hbp >> 56) & 0xFF);
+            store8(stub + 362, 0x48); store8(stub + 363, 0x8B); store8(stub + 364, 0x00);  # mov rax,[rax]
+            store8(stub + 365, 0x48); store8(stub + 366, 0xC1); store8(stub + 367, 0xE8); store8(stub + 368, 0x18);  # shr rax,24
+            store8(stub + 369, 0xE6); store8(stub + 370, 0x71);
+            # --- GDT[3] STATE capture: sgdt the LIVE GDTR -> read GDT[3] access byte -> CMOS 0x7F ---
+            # 1.46.x sub-bite 8 (2026-06-26): now that H1 (CR3 asymmetry) is DEAD — agnos collapsed the
+            # KPTI split in 1.40.3, so proc_get_user_cr3 == proc_get_cr3 (proc.cyr:486), and the resume
+            # iretq + the proven enter_ring3 iretq run under the SAME per-proc pml4 — the live remaining
+            # questions are H3 (frame contents, captured at 0x72-0x75) and H2 (GDT[3] descriptor state).
+            # Stamp GDT[3]'s ACCESS byte read THROUGH the live GDTR (so a relocated GDTR shows up too):
+            # sgdt into gdtr_scratch (boot_data.cyr), load the 8-byte base at scratch+2, read [base+0x1D]
+            # = GDT[3] (0x18) + access-byte offset (5). Expect 0xF2 (= P=1,DPL=3,S=1,data,writable =
+            # gdt.cyr:17's 0x00CFF2000000FFFF). ANY other value ⇒ GDT[3] corrupted OR GDTR relocated (H2);
+            # 0xF2 ⇒ descriptor intact, so a loaded-CS=0x23 (0x71) frame is a GENUINE silicon rejection of
+            # a valid SS-load. sgdt is unprivileged + faultless; gdtr_scratch is kernel BSS (0x83, mapped
+            # in every CR3). Slot 0x7F is the last virgin low-bank scratch (sole writer = this stub).
+            var gsc = &gdtr_scratch;
+            # 0x7F <- GDT[3] access byte (base+0x1D)
+            store8(stub + 371, 0xB0); store8(stub + 372, 0x7F);  # mov al,0x7F
+            store8(stub + 373, 0xE6); store8(stub + 374, 0x70);  # out 0x70,al  (select CMOS 0x7F)
+            store8(stub + 375, 0x48); store8(stub + 376, 0xB8);  # mov rax, imm64 &gdtr_scratch
+            store8(stub + 377, gsc & 0xFF); store8(stub + 378, (gsc >> 8) & 0xFF);
+            store8(stub + 379, (gsc >> 16) & 0xFF); store8(stub + 380, (gsc >> 24) & 0xFF);
+            store8(stub + 381, (gsc >> 32) & 0xFF); store8(stub + 382, (gsc >> 40) & 0xFF);
+            store8(stub + 383, (gsc >> 48) & 0xFF); store8(stub + 384, (gsc >> 56) & 0xFF);
+            store8(stub + 385, 0x0F); store8(stub + 386, 0x01); store8(stub + 387, 0x00);  # sgdt [rax]  (limit@+0, base@+2)
+            store8(stub + 388, 0x48); store8(stub + 389, 0x8B); store8(stub + 390, 0x40); store8(stub + 391, 0x02);  # mov rax,[rax+2]  (GDTR base)
+            store8(stub + 392, 0x8A); store8(stub + 393, 0x40); store8(stub + 394, 0x1D);  # mov al,[rax+0x1D]  (GDT[3] access byte)
+            store8(stub + 395, 0xE6); store8(stub + 396, 0x71);  # out 0x71,al
+            tail = 397;
         }
         # 1.45.16 fault canary — paint a wide FB bar before halting so a CAUGHT CPU
         # exception is visible ON THE FRAMEBUFFER (photo-readable), not only in CMOS

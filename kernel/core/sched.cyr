@@ -15,6 +15,16 @@
 # byte-for-byte the old global single-core. Arrays zero-init but the default MUST be -1 (no
 # idle yet => skip nothing), so sched_idle_init() sets all 4 slots = -1 at boot pre-scheduling.
 var pcpu_idle[4];
+# 1.46.x sub-bite 8 (2026-06-26): do_context_switch HEARTBEAT for the IF=1 first-preempt agnsh
+# #GP. Packs the LAST real switch into one i64 so the #GP handler (idt.cyr v==13) can relay it to
+# CMOS 0x7B-0x7E, naming the EXACT faulting transition (expect old=1 BSP-idle -> new=5+ agnsh) and
+# the switch count before the fault (1-2 = first preempt => confirms the IF=1-first-resume thesis).
+# Layout: byte0 = old_pid, byte1 = new_pid, byte2 = counter (low 8), byte3 = magic 0x5C. Written by
+# a SINGLE store after sched_fix_live_frame (the last C point before the ISR epilogue iretq), a plain
+# global write that never touches the isr_rsp frame -> zero perturbation of the iretq frame, QEMU
+# byte-identical. Low bank only (the #GP relay uses ports 0x70/0x71).
+var g_switch_log = 0;
+var g_switch_ctr = 0;
 fn sched_idle_cpu_slot() {
     if (cpu_count < 2) { return &pcpu_idle; }
     var c = tss_get_current_cpu_id();
@@ -381,6 +391,12 @@ fn do_context_switch(isr_rsp) {
     # on a real switch (new_pid != old; the new==old early-out returned at the top with the HW-pushed
     # frame intact), which is exactly the suspected cross-CR3 idle->agnsh resume path.
     sched_fix_live_frame(isr_rsp);
+
+    # 1.46.x sub-bite 8: stamp the heartbeat for the #GP relay (idt.cyr v==13 -> CMOS 0x7B-0x7E).
+    # Single global store, AFTER the regalloc-sensitive save/restore zone + sched_fix_live_frame, and
+    # it does NOT touch the isr_rsp iretq frame -> inert on the shipped path, QEMU byte-identical.
+    g_switch_ctr = g_switch_ctr + 1;
+    g_switch_log = (old & 0xFF) | ((new_pid & 0xFF) << 8) | ((g_switch_ctr & 0xFF) << 16) | (0x5C << 24);
 
     return 0;
 }
