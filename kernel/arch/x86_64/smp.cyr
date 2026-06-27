@@ -142,7 +142,13 @@ var sched_lock = 0;
 # never picks a real proc — sched_next on a non-BSP CPU returns only that CPU's idle); 1 =
 # STEP-2 (APs run real procs). Single-core: pcpu_cpu()==0 makes the STEP-1 branch dead on the
 # BSP, so this is a no-op today.
-var smp_sched_aps = 0;
+# 1.46.x SMP sub-bite 7 STEP-2 (2026-06-26): FLIPPED to 1 — woken APs now pull REAL ready procs
+# from sched_next and resume them via the cross-CR3 CPL0->CPL3 timer-ISR iretq (the SAME path the
+# SYSRET STAR->0x13 fix cleared on the BSP at 1.46.5; ap_entry runs syscall_msr_init() so each AP
+# bakes the same STAR). Iron-gated: revert to 0 to fall back to STEP-1 (wake + AP-idle-only) if the
+# burn regresses. The TCG-invisible unknowns this burn settles: the idle double-run guard (idle_owner),
+# the LVT LINT0/LINT1 keyboard-death mask efficacy, and the real-Zen AP LAPIC rate.
+var smp_sched_aps = 1;
 # pcpu_ap_ready[i] = this AP finished bring-up (TSS ltr'd, idle registered, on_cpu set, LVT
 # masked) and may take scheduling ticks. Set LAST in ap_entry, just before the first sti.
 var pcpu_ap_ready[4];

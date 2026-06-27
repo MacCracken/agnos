@@ -1773,7 +1773,7 @@ fn fs_syscall_selftest() {
     else { if ((load64(u + 256) & 0xF000) != 0x8000) { kprintln("fssys: stat mode FAIL", 21); ok = 0; } }
 
     # rename("/fss/a" -> "/fss/b"): backend logic with a4=newlen via ksyscall_a4.
-    ksyscall_a4 = 6;
+    ksyscall_a4_set(6);
     if (ksyscall(31, u + 64, 6, u + 128) != 0) { kprintln("fssys: rename FAIL", 18); ok = 0; }
     if (ext2_path_lookup(u + 128, 6) <= 0)     { kprintln("fssys: rename dst FAIL", 22); ok = 0; }
     if (ext2_path_lookup(u + 64, 6) > 0)       { kprintln("fssys: rename src-left FAIL", 27); ok = 0; }
@@ -1920,7 +1920,7 @@ fn fbscale_selftest() {
     var pitch = fb_pitch();
     var ok = 1;
     # (1) scale 2 at (0,0) -> 4x4 expansion
-    ksyscall_a4 = 2 << 32;                               # scale=2, dx=dy=0
+    ksyscall_a4_set(2 << 32);                               # scale=2, dx=dy=0
     var r1 = ksyscall(39, u, 2, 2);
     # read back FIRST (locals), print after
     var p00 = load32(fb + 0);            var p01 = load32(fb + 4);
@@ -1936,7 +1936,7 @@ fn fbscale_selftest() {
     if (p22 != 0x44444444)     { kprintln("fbscale: FAIL 22", 16); ok = 0; }
     if (p33 != 0x44444444)     { kprintln("fbscale: FAIL 33", 16); ok = 0; }
     # (2) right-edge clip: dx=fw-2, scale 2 -> cw_eff=2, BOTH cols = src col 0 (c/2==0)
-    ksyscall_a4 = (2 << 32) | (fw - 2);
+    ksyscall_a4_set((2 << 32) | (fw - 2));
     var r2 = ksyscall(39, u, 2, 2);
     var q0 = load32(fb + (fw - 2) * 4);
     var q1 = load32(fb + (fw - 1) * 4);
@@ -1946,9 +1946,9 @@ fn fbscale_selftest() {
     if (q1 != 0x11111111)      { kprintln("fbscale: FAIL e1", 16); ok = 0; }
     if (q2 != 0x33333333)      { kprintln("fbscale: FAIL e2", 16); ok = 0; }
     # (3) loud rejects: scale>16; expanded width over the rowbuf (w*scale>8192)
-    ksyscall_a4 = 17 << 32;
+    ksyscall_a4_set(17 << 32);
     if (ksyscall(39, u, 2, 2) != 0 - 1)      { kprintln("fbscale: FAIL s17", 17); ok = 0; }
-    ksyscall_a4 = 2 << 32;
+    ksyscall_a4_set(2 << 32);
     if (ksyscall(39, u, 8192, 1) != 0 - 1)   { kprintln("fbscale: FAIL wcap", 18); ok = 0; }
     pmm_free_2mb(u);
     if (ok == 1) { kprintln("fbscale: ALL PASS", 17); } else { kprintln("fbscale: FAIL", 13); }
@@ -2987,6 +2987,23 @@ proc_create(0);                 # proc 0 = kernel main (running now; context sav
 proc_set_state(0, 2);           # running
 proc_on_cpu_init();             # 1.46.x SMP6: all 16 on_cpu slots = -1 BEFORE sched_active=1 (scheduler fence default)
 sched_idle_init(); sched_idle_pid_set(kthread_create(&kernel_idle_loop));  # proc 1 = idle (ready) — 1.44.1: via the kthread primitive (pool stack); 1.44.17: registered so sched_next deprioritizes it (idle runs only when nothing else is ready)
+# 1.46.x SMP sub-bite 7 STEP-2 (2026-06-26): mark the BSP idle as OWNED by cpu 0 — the exact mirror
+# of ap_entry's idle_owner_set(ap_idle, my_id) (smp.cyr:365). Without it, idle_owner[bsp_idle] stays
+# -1, so sched_idx_pickable's foreign-idle guard treats pid 1 as "not an idle" and a woken AP
+# (smp_sched_aps=1) STEALS the BSP idle: two CPUs then run kernel_idle_loop on its SINGLE kthread stack
+# (torn iretq frame), AND the BSP is starved of its own idle -> sched_next falls to `return 0` (kmain)
+# -> kmain re-run -> the QEMU -smp 4 torn-frame + #UD-at-0x1000 STEP-2 faults. cpu_count is still 1
+# here (smp_start_aps runs later), so sched_idle_pid_get() returns the just-set BSP idle (slot 0).
+idle_owner_set(sched_idle_pid_get(), 0);
+# 1.46.x SMP sub-bite 7 STEP-2 (2026-06-26): PIN proc 0 (kmain/kybernet) to the BSP. proc 0 is the
+# out-of-band BSP boot/init thread — it runs kybernet IF=1-preemptibly and execs agnsh via
+# exec_and_wait (its continuation parks in exec_ctx on the BSP stack), so it is inherently BSP-bound.
+# When the BSP timer preempts kybernet, do_context_switch sets proc 0 -> state==1/on_cpu==-1; without
+# this pin a woken AP's sched_next STEALS proc 0 and runs kybernet concurrently on the boot CR3 -> the
+# AP enters kputc and its corrupted console scroll overruns the framebuffer (#PF->#DF). Same class as
+# the BSP-idle + foreground-proc steals; idle_owner is the per-proc CPU-pin. MUST be after
+# proc_on_cpu_init() (which zeroes idle_owner). Inert single-core (sched_idx_pickable io==0==pcpu_cpu()).
+idle_owner_set(0, 0);
 #ifdef THREAD_SELFTEST
 # 1.44.0 opening bite: spawn two kernel threads on the shared AS (tight-loopers).
 thr_pid_a = kthread_create(&thread_test_a);

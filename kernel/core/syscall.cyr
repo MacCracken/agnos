@@ -649,7 +649,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # used when agnsh has no live bg jobs). The syscall entry stub resets ksyscall_a4 per
         # ring-3 entry (syscall_hw.cyr), so a stale a4 can't mis-route a later blocking read.
         if (arg1 == 0) {
-            if (ksyscall_a4 != 0) { return kbd_read_nonblock(arg2, arg3); }
+            if (ksyscall_a4_get() != 0) { return kbd_read_nonblock(arg2, arg3); }
             return kbd_read_blocking(arg2, arg3);
         }
         return vfs_read(arg1, arg2, arg3);
@@ -983,7 +983,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 31) {
         # rename(old=arg1, oldlen=arg2, new=arg3, newlen=a4) — within one
         # filesystem (a4=r10 via ksyscall_a4, 1.41.3).
-        var a4r = ksyscall_a4;
+        var a4r = ksyscall_a4_get();
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (sc_path_ok(arg3, a4r) == 0) { stack_canary_check(canary); return 0 - 1; }
         var beo = vfs_resolve_mount(arg1, arg2);
@@ -1019,7 +1019,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # link(target=arg1, targetlen=arg2, linkpath=arg3, linkpathlen=a4) —
         # hard link, ext2-only (a4=r10 via ksyscall_a4, 1.41.3). FAT/exFAT → -1
         # (O4: no inodes/hard links).
-        var a4l = ksyscall_a4;
+        var a4l = ksyscall_a4_get();
         if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (sc_path_ok(arg3, a4l) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (vfs_resolve_mount(arg1, arg2) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
@@ -1175,7 +1175,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         ew37_kr_rsp   = kernel_return_rsp;          # == 1 (kybernet frame armed)
         ew37_kr_rip   = kernel_return_rip;
         ew37_rsp_save = load64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8);   # agnsh's user RSP (per-CPU 4b)
-        ew37_a4       = ksyscall_a4;
+        ew37_a4       = ksyscall_a4_get();
         ew37_pid      = proc_current_get();               # agnsh's pid
         ew37_resume_pid = exec_resume_pid;          # 1.44.14: save agnsh's resume-pid; the nested
         # exec_and_wait(child) overwrites exec_resume_pid = child, restored below post-resume.
@@ -1219,7 +1219,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # of a garbage in-range VA would #PF the handler). Runs under boot CR3 (identity),
         # walking the CALLER's tables via ew37_cr3.
         var ew_eptr = arg3;
-        var ew_elen = ksyscall_a4;
+        var ew_elen = ksyscall_a4_get();
         var ew_env = 0;
         if (ew_eptr != 0) {
             if (ew_elen >= 1) {
@@ -1306,7 +1306,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, ew37_cr3);   # agnsh's CR3 (kernel-side); 4c per-CPU
         store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, ew37_cr3);      # the value the exit stub reloads into CR3 pre-SYSRET
         store64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8, ew37_rsp_save);   # the exit stub reloads rsp from this CPU's pcpu_kernel_rsp_save slot pre-SYSRET (per-CPU 4b)
-        ksyscall_a4       = ew37_a4;
+        ksyscall_a4_set(ew37_a4);
         proc_current_set(ew37_pid);                # agnsh's pid (its write/exit attribute to agnsh)
         exec_resume_pid   = ew37_resume_pid;         # 1.44.14: agnsh is the resume target again, so
         # agnsh's later exit() (proc_current_get()==exec_resume_pid) fires kernel_resume to kybernet
@@ -1376,7 +1376,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # makes the FB-write bound independent of the firmware invariant, so a quirky/
         # spec-violating GOP can't spill the last clipped row past fb + pitch*height.
         if (bl_pitch < bl_fw * 4) { stack_canary_check(canary); return 0 - 1; }
-        var bl_dstxy = ksyscall_a4;
+        var bl_dstxy = ksyscall_a4_get();
         var bl_dx = bl_dstxy & 0xFFFF;
         var bl_dy = (bl_dstxy >> 16) & 0xFFFF;
         # 1.44.20: a4 bits [39:32] = INTEGER SCALE (0 or 1 = the 1:1 path, byte-identical for
@@ -1588,7 +1588,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # FALLBACK-ONLY (garbage a3/a4 from legacy callers → default env, never -1),
         # fault-proof page-walking copy into the DEDICATED spawn_env_buf.
         var sp_eptr = arg3;
-        var sp_elen = ksyscall_a4;
+        var sp_elen = ksyscall_a4_get();
         var sp_env = 0;
         if (sp_eptr != 0) {
             if (sp_elen >= 1) {
@@ -1781,7 +1781,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # dst_ip is the ip4() packed form; src_port should match a udp_bind#51 port
         # so the reply routes back to that listener. Non-blocking: udp_send reads
         # the cached gateway MAC (no inline ARP wait) then nic_send — no sti window.
-        var us_len = ksyscall_a4;
+        var us_len = ksyscall_a4_get();
         if (us_len <= 0) { stack_canary_check(canary); return 0; }
         # 1.45.6 (CRITICAL audit fix): cap the payload to the wire MTU. udp_build
         # does ONE unbounded memcpy of data_len bytes into the fixed net_pkt
@@ -1812,7 +1812,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg1 >= udp_listener_count) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
-        var ur_addr = ksyscall_a4;
+        var ur_addr = ksyscall_a4_get();
         if (ur_addr != 0) {
             if (is_user_range(ur_addr, 16) == 0) { stack_canary_check(canary); return 0 - 1; }
             var ur_n = udp_recv_from(arg1, arg2, arg3, ur_addr, ur_addr + 8);

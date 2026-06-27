@@ -41,7 +41,16 @@ var ibrs_supported = 0;  # S9: set to 1 if IBRS is available
 # CR3-switch scratch destroys r10, so it arrives here as sc_arg4. We stash it in
 # this global, which the 4-arg ksyscall reads for rename/link — keeping
 # ksyscall's arity (and its many in-kernel 3-arg callers) unchanged.
-var ksyscall_a4 = 0;
+# 1.46.x SMP sub-bite 7 STEP-2 (#4, 2026-06-26): the 4th-syscall-arg scratch goes PER-CPU. The old
+# single global was set at syscall_handler entry (sc_arg4) and read DEEP inside ksyscall by every
+# 4-arg syscall (rename/link/blit/execwait/spawn/usercopy/kbd). With APs running real ring-3 procs
+# (smp_sched_aps=1) two CPUs in a syscall at once would clobber one another's a4 between the
+# entry-set and the deep read — e.g. rename with another CPU's newlen → FS corruption. Per-CPU cell
+# (cpu c at byte c*8); pcpu_cpu()'s cpu_count<2 fast path keeps single-core byte-identical. In-kernel
+# 4-arg callers (the fb-blit + fssys selftest helpers in main.cyr) run on the BSP so pcpu_cpu()==0.
+var pcpu_ksyscall_a4[4];
+fn ksyscall_a4_set(v) { store64(&pcpu_ksyscall_a4 + pcpu_cpu() * 8, v); return 0; }
+fn ksyscall_a4_get() { return load64(&pcpu_ksyscall_a4 + pcpu_cpu() * 8); }
 # 1.44.16 (sched_yield #44): per-syscall ENTRY capture of the user state an abandon-frame
 # syscall needs to resume its caller AS IF the syscall had returned. The ring-3 live-across-
 # syscall set (cyrius auto-regalloc pins locals to rbx/r12-r15; rbp is the frame pointer;
@@ -83,7 +92,7 @@ fn sc_scr_base() {
 # C-level handler called from the syscall entry stub.
 # user_rsp = the caller's RSP (saved before switching to kernel stack)
 fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
-    ksyscall_a4 = sc_arg4;
+    ksyscall_a4_set(sc_arg4);
     # 1.44.16: sched_yield(#44) dispatches HERE, not in ksyscall — syscall_handler is
     # reachable ONLY via the ring-3 entry stub, so the sc_entry_regs captures are valid
     # by construction. In-kernel code (bench, recovery shell) calls ksyscall directly

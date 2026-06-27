@@ -61,6 +61,19 @@ fn exec_and_wait(entry, rsp, cr3) {
     # agnsh's resume (it just goes state 0 for waitpid#4). Saved/restored across execwait#37 nesting.
     exec_resume_pid = proc_current_get();
 
+    # 1.46.x SMP sub-bite 7 STEP-2 (2026-06-26): PIN the foreground proc to THIS CPU.
+    # A foreground (exec_and_wait / run-to-completion) proc carries a kernel resume context
+    # (exec_ctx setjmp, above) saved on THIS CPU's kernel stack, so it must never run on another
+    # CPU. It is also entered out-of-band via enter_ring3 (below) — NOT through do_context_switch —
+    # so it lives at state==1/on_cpu==-1 while running here; under smp_sched_aps=1 a woken AP's
+    # sched_next would otherwise see it (state==1, on_cpu==-1, idle_owner==-1) and DOUBLE-RUN it on
+    # the same CR3 + user stack. idle_owner is the per-proc CPU-pin (idles were its first users):
+    # sched_idx_pickable's foreign-pin skip (sched.cyr:48) makes every OTHER CPU skip this proc, while
+    # THIS CPU still re-picks it after a preemption. Cleared on slot reuse (proc_alloc_slot). Set
+    # BEFORE enter_ring3 so the proc is excluded the moment it can be scheduled. Inert single-core
+    # (pcpu_cpu()==0; sched_idx_pickable's io==pcpu_cpu() branch keeps the BSP picking it).
+    idle_owner_set(proc_current_get(), pcpu_cpu());
+
     # Pass params to enter_ring3 via globals (avoid param clobber in asm).
     exec_entry_g = entry;
     exec_rsp_g = rsp;

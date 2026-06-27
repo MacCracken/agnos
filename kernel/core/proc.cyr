@@ -183,6 +183,7 @@ fn proc_alloc_slot() {
     store64(&proc_sigmask + idx * 8, 0);
     store64(&proc_rsp0 + idx * 8, KSTACK_POOL_BASE + (idx + 1) * KSTACK_SLOT);  # 1.46.1: per-proc RSP0 stack (region 7)
     store64(&proc_on_cpu + idx * 8, 0 - 1);   # 1.46.x SMP6: recycled slot must not inherit a stale CPU id
+    store64(&idle_owner + idx * 8, 0 - 1);     # 1.46.x STEP-2: recycled slot starts UNPINNED (a prior foreground proc may have left idle_owner=its launch CPU; a fresh proc must be free to migrate / not falsely pinned). Idles never reuse a slot, so their persistent pin is unaffected.
     return idx;
 }
 # 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the legacy shared stack (0x3C0000
