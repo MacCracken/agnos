@@ -32,9 +32,18 @@ var pcpu_syscall_kstack_top2[4];
 # 1.46.x 4b: idempotency guard for syscall_kstack_reserve (was the old `syscall_kstack_top != 0`
 # self-check, which the per-CPU arrays can't double as — slot 0 being 0 is now a valid mid-init state).
 var syscall_kstack_reserved = 0;
-# Saved kernel context for returning from user mode on exit
-var kernel_return_rsp = 0;
-var kernel_return_rip = 0;
+# Saved kernel context for returning from user mode on exit.
+# 1.46.x SMP STEP-2 (#3, 2026-06-26): PER-CPU. kernel_return_rsp (==1 = "a resume context is armed")
+# is set by exec_and_wait, checked in exit#0, and zeroed by kernel_resume — all in the context of the
+# foreground proc's (pinned) CPU. Two CPUs each running a foreground exec would clobber one another's
+# armed flag (CPU A's exit() seeing CPU B's 0 → never longjmps → agnsh never resumes kybernet). Per-CPU
+# cell (cpu c at byte c*8); pcpu_cpu() cpu_count<2 fast path = slot 0 → single-core byte-identical.
+var pcpu_kernel_return_rsp[4];
+fn kernel_return_rsp_set(v) { store64(&pcpu_kernel_return_rsp + pcpu_cpu() * 8, v); return 0; }
+fn kernel_return_rsp_get() { return load64(&pcpu_kernel_return_rsp + pcpu_cpu() * 8); }
+var pcpu_kernel_return_rip[4];
+fn kernel_return_rip_set(v) { store64(&pcpu_kernel_return_rip + pcpu_cpu() * 8, v); return 0; }
+fn kernel_return_rip_get() { return load64(&pcpu_kernel_return_rip + pcpu_cpu() * 8); }
 var ibrs_supported = 0;  # S9: set to 1 if IBRS is available
 # 1.41.3 (a4=r10): the syscall's 4th argument (rename/link need four). The entry
 # stub preserves the user's r10 into r9 (the SysV 6th-arg register) before the

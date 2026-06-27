@@ -1,9 +1,23 @@
 # === Ring 3 Transition ===
 
-# Globals for exec_and_wait to pass to enter_ring3 without param clobbering
-var exec_entry_g = 0;
-var exec_rsp_g = 0;
-var exec_cr3_g = 0;
+# Globals for exec_and_wait to pass to enter_ring3 without param clobbering.
+# 1.46.x SMP STEP-2 (#3, 2026-06-26): PER-CPU. exec_and_wait runs OUT-OF-BAND (entered via
+# enter_ring3, not do_context_switch) and sets these between the _set below and the enter_ring3
+# read at the bottom; with smp_sched_aps=1 two CPUs each in exec_and_wait would clobber one
+# another's params (CPU A's enter_ring3 reading CPU B's entry → iretq into the wrong RIP). Per-CPU
+# cell (cpu c at byte c*8); pcpu_cpu()'s cpu_count<2 fast path = slot 0 → single-core byte-identical.
+# Mirrors pcpu_ksyscall_a4 (syscall_hw.cyr). All loads happen post-CR3-switch under the per-proc CR3,
+# which maps the kernel .bss (these arrays) + the APIC (pcpu_cpu()'s id read) — same residency the
+# pre-per-CPU plain-global read already required.
+var pcpu_exec_entry_g[4];
+fn exec_entry_g_set(v) { store64(&pcpu_exec_entry_g + pcpu_cpu() * 8, v); return 0; }
+fn exec_entry_g_get() { return load64(&pcpu_exec_entry_g + pcpu_cpu() * 8); }
+var pcpu_exec_rsp_g[4];
+fn exec_rsp_g_set(v) { store64(&pcpu_exec_rsp_g + pcpu_cpu() * 8, v); return 0; }
+fn exec_rsp_g_get() { return load64(&pcpu_exec_rsp_g + pcpu_cpu() * 8); }
+var pcpu_exec_cr3_g[4];
+fn exec_cr3_g_set(v) { store64(&pcpu_exec_cr3_g + pcpu_cpu() * 8, v); return 0; }
+fn exec_cr3_g_get() { return load64(&pcpu_exec_cr3_g + pcpu_cpu() * 8); }
 # 1.44.14 PREEMPTIVE AGNSH: when nonzero, enter_ring3 starts the program with IF=1 (RFLAGS bit 9)
 # so the 100 Hz timer can PREEMPT it in ring 3 -> the scheduler time-slices a #43 background job
 # alongside it (the "shell stays live while a bg job runs" goal). Set ONLY by kybernet for the
@@ -19,14 +33,26 @@ var exec_preempt = 0;
 # 1.44.14: the proc whose exit() should fire kernel_resume (the run-to-completion FOREGROUND proc
 # exec_and_wait is waiting on). Set at exec_and_wait entry; gated in exit#0 so a preemptively-
 # scheduled #43 background job's exit() never hijacks agnsh's resume. Saved/restored by execwait#37.
-var exec_resume_pid = 0;
+# 1.46.x SMP STEP-2 (#3): PER-CPU. Each CPU's foreground exec has its OWN resume target (CPU A's
+# agnsh, CPU B's bg-proc #37 child). Set at exec_and_wait entry, read in exit#0; both run in the
+# context of the foreground proc's (pinned) CPU. pcpu_cpu() cpu_count<2 fast path = single-core identical.
+var pcpu_exec_resume_pid[4];
+fn exec_resume_pid_set(v) { store64(&pcpu_exec_resume_pid + pcpu_cpu() * 8, v); return 0; }
+fn exec_resume_pid_get() { return load64(&pcpu_exec_resume_pid + pcpu_cpu() * 8); }
 
 # 1.40.4: full kernel resume context (setjmp/longjmp). Saved by exec_and_wait
 # before entering ring 3; restored by kernel_resume when the program exits, so
 # exec_and_wait "returns" exactly as a normal call — including the callee-saved
 # registers (rbx/r12-r15) the ring-3 program clobbers. Layout (u64):
 #   [0]=rbx [1]=r12 [2]=r13 [3]=r14 [4]=r15 [5]=caller rbp [6]=return rsp [7]=return rip
-var exec_ctx[8];
+# 1.46.x SMP STEP-2 (#3): PER-CPU. exec_ctx IS a kernel-stack continuation — it holds THIS CPU's
+# kernel stack rbx/r12-r15/rbp/rsp/rip for the foreground exec parked here. A foreground proc is
+# pinned to its launch CPU (idle_owner), so its continuation is only ever saved/restored on that
+# CPU; per-CPU exec_ctx is therefore exactly the right model (CPU c's block = CPU c's continuation).
+# 8 u64 per CPU × 4 = pcpu_exec_ctx[32]; block for cpu c starts at byte c*64. exec_ctx_base() folds
+# pcpu_cpu()*64 so the hand-asm's +0/+8/.../+56 cell offsets read VERBATIM into this CPU's block.
+var pcpu_exec_ctx[32];
+fn exec_ctx_base() { return &pcpu_exec_ctx + pcpu_cpu() * 64; }
 
 # Execute a user process and wait for it to exit.
 # Saves kernel return context so exit syscall returns here.
@@ -38,7 +64,7 @@ fn exec_and_wait(entry, rsp, cr3) {
     # `var ctxp = &exec_ctx` lands the array address in rax (the proven idiom);
     # rdx is a scratch temp. [rbp]=caller rbp, [rbp+8]=return addr, [rbp+16]=
     # caller's post-call rsp.
-    var ctxp = &exec_ctx;
+    var ctxp = exec_ctx_base();
     asm {
         0x48; 0x89; 0x18;             # mov [rax], rbx
         0x4C; 0x89; 0x60; 0x08;       # mov [rax+8], r12
@@ -52,14 +78,14 @@ fn exec_and_wait(entry, rsp, cr3) {
         0x48; 0x8B; 0x55; 0x08;       # mov rdx, [rbp+8]    (return addr)
         0x48; 0x89; 0x50; 0x38;       # mov [rax+56], rdx
     }
-    kernel_return_rsp = 1;   # nonzero = "a kernel resume context is armed" (ksyscall exit checks this)
-    kernel_return_rip = 0;
+    kernel_return_rsp_set(1);   # nonzero = "a kernel resume context is armed" (ksyscall exit checks this)
+    kernel_return_rip_set(0);
     # 1.44.14: remember WHICH proc this resume context belongs to (the foreground proc being
     # run-to-completion — proc_current_get() is it at entry: agnsh for kybernet's launch, the child for
     # execwait#37). exit#0 fires kernel_resume ONLY for this proc, so a PREEMPTIVELY-scheduled
     # background job (#43) that exit()s while agnsh is the armed resume target does NOT hijack
     # agnsh's resume (it just goes state 0 for waitpid#4). Saved/restored across execwait#37 nesting.
-    exec_resume_pid = proc_current_get();
+    exec_resume_pid_set(proc_current_get());
 
     # 1.46.x SMP sub-bite 7 STEP-2 (2026-06-26): PIN the foreground proc to THIS CPU.
     # A foreground (exec_and_wait / run-to-completion) proc carries a kernel resume context
@@ -75,9 +101,9 @@ fn exec_and_wait(entry, rsp, cr3) {
     idle_owner_set(proc_current_get(), pcpu_cpu());
 
     # Pass params to enter_ring3 via globals (avoid param clobber in asm).
-    exec_entry_g = entry;
-    exec_rsp_g = rsp;
-    exec_cr3_g = cr3;
+    exec_entry_g_set(entry);
+    exec_rsp_g_set(rsp);
+    exec_cr3_g_set(cr3);
 
     # 1.40.3: re-run syscall_init right before ring 3. Ring 3 had never executed,
     # so the SYSCALL MSRs (STAR / LSTAR / SFMASK / EFER.SCE) set at boot were
@@ -93,8 +119,8 @@ fn exec_and_wait(entry, rsp, cr3) {
     # DIFFERENT, minimal CR3) while the stub switched to exec_cr3_g — so the
     # stub's `mov cr3` landed in a CR3 that didn't map the stub → fault. Making
     # both the same makes that switch a safe no-op. (KPTI-proper is a later arc.)
-    store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, exec_cr3_g);   # 4c per-CPU
-    store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, exec_cr3_g);
+    store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, exec_cr3_g_get());   # 4c per-CPU
+    store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, exec_cr3_g_get());
 
     # 1.40.3: re-assert IA32_EFER.SCE (SYSCALL enable, bit 0) right before ring 3.
     # syscall_init sets it at boot, but ring 3 had never run, so the SYSCALL path
@@ -126,7 +152,7 @@ fn exec_and_wait(entry, rsp, cr3) {
     # trampoline the user CR3 maps) + iretqs — no kernel-data access remains.
     var cr3_load = load64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8);   # 4c per-CPU
     asm { mov cr3, rax; }
-    enter_ring3(exec_entry_g, exec_rsp_g);
+    enter_ring3(exec_entry_g_get(), exec_rsp_g_get());
     return 0;
 }
 
@@ -246,10 +272,13 @@ fn spawn_user_proc(entry_fn) {
     proc_unmap_page(new_cr3, stack_base - 0x200000);
     var stack_top = stack_base + 0x4000;
 
-    # Create process with user VA entry point (not kernel address)
-    var new_pid = proc_create_full(code_va, stack_top);
+    # Create process with user VA entry point (not kernel address). 1.46.x #2: proc_create_USER
+    # leaves it state=3 (NOT schedulable) until the per-proc CR3 is wired below; flip ready last so a
+    # woken AP can't pick it mid-build (these run via the scheduler).
+    var new_pid = proc_create_user(code_va, stack_top);
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);
+        proc_set_state(new_pid, 1);   # 1.46.x #2: CR3 wired — NOW schedulable
     }
     return new_pid;
 }

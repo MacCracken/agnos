@@ -64,28 +64,53 @@ var sys_exit_code = 0;
 # single-threaded run-to-completion model (agnsh runs leaf programs); a recursive
 # execwait is refused via ew37_busy. Module-global `var X[N]` = N*u64 — the 8-u64
 # exec_ctx mirror is exactly right.
-var ew37_ctx[8];          # exec_ctx[0..7] mirror (kybernet's armed resume frame)
-var ew37_kr_rsp = 0;      # kernel_return_rsp (==1 armed)
-var ew37_kr_rip = 0;      # kernel_return_rip
-var ew37_rsp_save = 0;    # kernel_rsp_save — agnsh's user RSP (the exit stub reloads it pre-SYSRET)
-var ew37_a4 = 0;          # ksyscall_a4 (defense-in-depth)
-var ew37_pid = 0;         # proc_current_get() (agnsh's pid)
-var ew37_resume_pid = 0;  # 1.44.14: exec_resume_pid (agnsh) saved across the nested exec
-var ew37_cr3 = 0;         # agnsh's CR3 (kpti_user_cr3 the exit stub reloads into CR3)
-var ew37_cpid = 0;        # child pid — MUST be a global (a [rbp-N] local survives via
-# the disjoint kstack, but globals are the contract here)
-var ew37_code = 0;        # child exit code captured post-resume
+# 1.46.x SMP STEP-2 (#3, 2026-06-26): the ew37_* save block goes PER-CPU (the deferred note below,
+# now resolved). Each CPU nesting a #37 gets its OWN snapshot — two CPUs in a #37 simultaneously
+# (a bg-proc execwait on an AP while agnsh's #37 runs on the BSP) no longer collide on this scratch.
+# Scalars: pcpu_X[4] cell at byte cpu*8; the ew37_ctx mirror: pcpu_ew37_ctx[32], block for cpu c at
+# byte c*64 (ew37_ctx_base folds pcpu_cpu()*64 so the copy loop's +0..+56 read VERBATIM). pcpu_cpu()
+# cpu_count<2 fast path = slot 0 → single-core byte-identical.
+var pcpu_ew37_ctx[32];    # exec_ctx[0..7] mirror per CPU (kybernet's armed resume frame)
+fn ew37_ctx_base() { return &pcpu_ew37_ctx + pcpu_cpu() * 64; }
+var pcpu_ew37_kr_rsp[4];      # kernel_return_rsp (==1 armed)
+fn ew37_kr_rsp_set(v) { store64(&pcpu_ew37_kr_rsp + pcpu_cpu() * 8, v); return 0; }
+fn ew37_kr_rsp_get() { return load64(&pcpu_ew37_kr_rsp + pcpu_cpu() * 8); }
+var pcpu_ew37_kr_rip[4];      # kernel_return_rip
+fn ew37_kr_rip_set(v) { store64(&pcpu_ew37_kr_rip + pcpu_cpu() * 8, v); return 0; }
+fn ew37_kr_rip_get() { return load64(&pcpu_ew37_kr_rip + pcpu_cpu() * 8); }
+var pcpu_ew37_rsp_save[4];    # kernel_rsp_save — agnsh's user RSP (the exit stub reloads it pre-SYSRET)
+fn ew37_rsp_save_set(v) { store64(&pcpu_ew37_rsp_save + pcpu_cpu() * 8, v); return 0; }
+fn ew37_rsp_save_get() { return load64(&pcpu_ew37_rsp_save + pcpu_cpu() * 8); }
+var pcpu_ew37_a4[4];          # ksyscall_a4 (defense-in-depth)
+fn ew37_a4_set(v) { store64(&pcpu_ew37_a4 + pcpu_cpu() * 8, v); return 0; }
+fn ew37_a4_get() { return load64(&pcpu_ew37_a4 + pcpu_cpu() * 8); }
+var pcpu_ew37_pid[4];         # proc_current_get() (agnsh's pid)
+fn ew37_pid_set(v) { store64(&pcpu_ew37_pid + pcpu_cpu() * 8, v); return 0; }
+fn ew37_pid_get() { return load64(&pcpu_ew37_pid + pcpu_cpu() * 8); }
+var pcpu_ew37_resume_pid[4];  # 1.44.14: exec_resume_pid (agnsh) saved across the nested exec
+fn ew37_resume_pid_set(v) { store64(&pcpu_ew37_resume_pid + pcpu_cpu() * 8, v); return 0; }
+fn ew37_resume_pid_get() { return load64(&pcpu_ew37_resume_pid + pcpu_cpu() * 8); }
+var pcpu_ew37_cr3[4];         # agnsh's CR3 (kpti_user_cr3 the exit stub reloads into CR3)
+fn ew37_cr3_set(v) { store64(&pcpu_ew37_cr3 + pcpu_cpu() * 8, v); return 0; }
+fn ew37_cr3_get() { return load64(&pcpu_ew37_cr3 + pcpu_cpu() * 8); }
+var pcpu_ew37_cpid[4];        # child pid (per-CPU; a [rbp-N] local would survive the disjoint kstack
+fn ew37_cpid_set(v) { store64(&pcpu_ew37_cpid + pcpu_cpu() * 8, v); return 0; }   # too, but the slot is the contract)
+fn ew37_cpid_get() { return load64(&pcpu_ew37_cpid + pcpu_cpu() * 8); }
+var pcpu_ew37_code[4];        # child exit code captured post-resume
+fn ew37_code_set(v) { store64(&pcpu_ew37_code + pcpu_cpu() * 8, v); return 0; }
+fn ew37_code_get() { return load64(&pcpu_ew37_code + pcpu_cpu() * 8); }
 # 1.46.x SMP sub-bite 4d: the #37 re-entrancy guard goes PER-CPU (was a single global `ew37_busy`).
 # Each CPU tracks its OWN nested-exec state so a #37 in flight on CPU N does not block CPU M. Capped
 # via pcpu_cpu() (syscall_hw.cyr); single-core fast path = slot 0 → byte-for-byte the old global.
-# NOTE (deferred-conservative, inert single-core): the ew37_* SCRATCH globals above (ew37_cr3/_cpid/
-# _code/_path + ew37_ctx) are NOT yet per-CPU — the ew37 save/restore of kernel_rsp_save+kpti_* already
-# uses pcpu_*[cpu] (4b/4c), but two CPUs nesting #37 SIMULTANEOUSLY would collide on this scratch. That
-# only becomes reachable post-flip (sub-bite 7); make ew37_* per-CPU then if simultaneous nest enters scope.
+# RESOLVED 1.46.x STEP-2 (#3, 2026-06-26): the ew37_* SCRATCH (ew37_cr3/_cpid/_code/_path/_env + ew37_ctx
+# + the kr/rsp_save/a4/pid/resume_pid scalars) are NOW per-CPU (above + below), joining the already-per-CPU
+# kernel_rsp_save+kpti_* (4b/4c). Two CPUs nesting #37 SIMULTANEOUSLY (reachable post-flip: a bg-proc
+# execwait on an AP while agnsh's #37 runs on the BSP) each get their own slot — no scratch collision.
 var pcpu_ew37_busy[4];
 fn pcpu_ew37_busy_get() { return load64(&pcpu_ew37_busy + pcpu_cpu() * 8); }
 fn pcpu_ew37_busy_set(v) { store64(&pcpu_ew37_busy + pcpu_cpu() * 8, v); return 0; }
-var ew37_path[16];        # kernel copy of the caller's path cstr (128 B). elf_load_from_file
+var pcpu_ew37_path[64];   # 1.46.x STEP-2 (#3): PER-CPU. 16 u64 (128 B) per CPU × 4; cpu c at byte c*128.
+fn ew37_path_base() { return &pcpu_ew37_path + pcpu_cpu() * 128; }   # kernel copy of the caller's path cstr (128 B). elf_load_from_file
 # does ext2/NVMe I/O under boot CR3 (the user VA + the NVMe BAR are
 # NOT both mapped under one CR3), so the path is copied here from the
 # user buffer BEFORE the CR3 switch — mirroring sh_cmd_run's sh_path_buf.
@@ -99,7 +124,10 @@ var ew37_path[16];        # kernel copy of the caller's path cstr (128 B). elf_l
 # under boot CR3 0x1000 (maps all phys) — the proven 1.44.8 kernel-side condition.
 # Mirrors the execwait#37 copy-then-boot-CR3 idiom (no kstack swap — spawn does not
 # block). 16 KB bounds an in-memory payload; real binaries load from disk (#37).
-var spawn_elf_buf[2048];
+# 1.46.x SMP STEP-2 (#3): PER-CPU. Two CPUs each in spawn#3 (e.g. a bg-proc spawn on an AP) would
+# clobber one another's staging. 2048 u64 (16 KB) per CPU × 4; cpu c at byte c*16384.
+var pcpu_spawn_elf_buf[8192];
+fn spawn_elf_buf_base() { return &pcpu_spawn_elf_buf + pcpu_cpu() * 16384; }
 
 # 1.44.11: spawn_path(#43) path/argv staging buffer ([16] = 16 u64 = 128 B, exactly like
 # ew37_path — a module-global var X[N] is N*u64 = 8N bytes). Holds the caller's "PATH
@@ -107,7 +135,8 @@ var spawn_elf_buf[2048];
 # copied here under the caller CR3 BEFORE the boot-CR3 switch (the user VA won't resolve once
 # CR3 is the NVMe-BAR-mapping boot CR3). A DEDICATED buffer (not ew37_path) so a #43 from a
 # bg proc can never collide with agnsh's in-flight #37 frame.
-var spawn_path_buf[16];
+var pcpu_spawn_path_buf[64];   # 1.46.x STEP-2 (#3): PER-CPU. 16 u64 (128 B) per CPU × 4; cpu c at byte c*128.
+fn spawn_path_buf_base() { return &pcpu_spawn_path_buf + pcpu_cpu() * 128; }
 # 1.44.19: per-process env staging — kernel copies of the caller's flat "KEY=V\0KEY=V\0"
 # blob (a3=ptr, a4=len on #37/#43; <=1024 B, <=16 entries). DEDICATED buffers per the
 # spawn_path_buf rationale above (a bg-proc #43 must never collide with agnsh's in-flight
@@ -115,7 +144,8 @@ var spawn_path_buf[16];
 # child's stack page INSIDE elf_load_from_file, which returns before exec_and_wait runs
 # the child — by the time any nested syscall exists, these contents are dead.
 # [128] = 128 u64 = 1024 B each (the 8N module-global rule).
-var ew37_env[128];        # execwait(#37) env staging
+var pcpu_ew37_env[512];   # 1.46.x STEP-2 (#3): PER-CPU execwait(#37) env staging. 128 u64 (1024 B) per CPU × 4; cpu c at byte c*1024.
+fn ew37_env_base() { return &pcpu_ew37_env + pcpu_cpu() * 1024; }
 
 # 1.46.x (fd-redirect for output capture) — issue 2026-06-15-cyrius-stdlib-missing-syscalls
 # group 1 ("the high-value one": an fd-redirect primitive for capturing subprocess helpers;
@@ -126,21 +156,32 @@ var ew37_env[128];        # execwait(#37) env staging
 # save the src fd's vfs_table entry, copy the dst entry over it for the child's run, and restore
 # on resume — no per-proc fd table needed. NOT applied to the non-blocking spawn#3 (the child
 # runs later → a per-proc redirect is the follow-on). vfs_table entry = 32 B (4 u64).
-var redir_pending = 0;    # 1 = a redirect is armed for the next execwait#37
-var redir_src_fd = 0;     # the fd the child writes to (gets repointed)
-var redir_dst_fd = 0;     # the backend the writes go to
-var redir_backup[4];      # 32-byte save of vfs_table[redir_src_fd]
+# 1.46.x SMP STEP-2 (#3): PER-CPU. The redirect spans TWO syscalls (exec_redirect#62 arms, the
+# next execwait#37 consumes) — both run on the SAME CPU (each CPU's agnsh/bg-proc arms then execs
+# on itself), so per-CPU state keeps one CPU's armed redirect from leaking into another CPU's #37.
+var pcpu_redir_pending[4];   # 1 = a redirect is armed for the next execwait#37
+fn redir_pending_set(v) { store64(&pcpu_redir_pending + pcpu_cpu() * 8, v); return 0; }
+fn redir_pending_get() { return load64(&pcpu_redir_pending + pcpu_cpu() * 8); }
+var pcpu_redir_src_fd[4];    # the fd the child writes to (gets repointed)
+fn redir_src_fd_set(v) { store64(&pcpu_redir_src_fd + pcpu_cpu() * 8, v); return 0; }
+fn redir_src_fd_get() { return load64(&pcpu_redir_src_fd + pcpu_cpu() * 8); }
+var pcpu_redir_dst_fd[4];    # the backend the writes go to
+fn redir_dst_fd_set(v) { store64(&pcpu_redir_dst_fd + pcpu_cpu() * 8, v); return 0; }
+fn redir_dst_fd_get() { return load64(&pcpu_redir_dst_fd + pcpu_cpu() * 8); }
+var pcpu_redir_backup[16];   # 4 u64 (32-byte vfs_table entry save) per CPU × 4; cpu c at byte c*32.
+fn redir_backup_base() { return &pcpu_redir_backup + pcpu_cpu() * 32; }
 
 # Apply the armed redirect: save vfs_table[src] into redir_backup, copy vfs_table[dst] over it.
 # Called by execwait#37 right before running the child (under boot CR3 — vfs_table is kernel
 # memory, identity-mapped). No-op when nothing is armed (so #37 stays byte-identical by default).
 fn exec_redirect_apply() {
-    if (redir_pending == 0) { return 0; }
-    var rsrc = &vfs_table + redir_src_fd * 32;
-    var rdst = &vfs_table + redir_dst_fd * 32;
+    if (redir_pending_get() == 0) { return 0; }
+    var rsrc = &vfs_table + redir_src_fd_get() * 32;
+    var rdst = &vfs_table + redir_dst_fd_get() * 32;
+    var rbk = redir_backup_base();
     var k = 0;
     while (k < 32) {
-        store64(&redir_backup + k, load64(rsrc + k));   # save src entry
+        store64(rbk + k, load64(rsrc + k));   # save src entry
         store64(rsrc + k, load64(rdst + k));             # src <- dst (child's writes now route to dst)
         k = k + 8;
     }
@@ -148,14 +189,16 @@ fn exec_redirect_apply() {
 }
 # Restore the src fd entry after the child run; clears the one-shot.
 fn exec_redirect_restore() {
-    if (redir_pending == 0) { return 0; }
-    var rsrc = &vfs_table + redir_src_fd * 32;
+    if (redir_pending_get() == 0) { return 0; }
+    var rsrc = &vfs_table + redir_src_fd_get() * 32;
     var k = 0;
-    while (k < 32) { store64(rsrc + k, load64(&redir_backup + k)); k = k + 8; }
-    redir_pending = 0;
+    var rbk = redir_backup_base();
+    while (k < 32) { store64(rsrc + k, load64(rbk + k)); k = k + 8; }
+    redir_pending_set(0);
     return 0;
 }
-var spawn_env_buf[128];   # spawn_path(#43) env staging
+var pcpu_spawn_env_buf[512];   # 1.46.x STEP-2 (#3): PER-CPU spawn_path(#43) env staging. 128 u64 (1024 B) per CPU × 4; cpu c at byte c*1024.
+fn spawn_env_buf_base() { return &pcpu_spawn_env_buf + pcpu_cpu() * 1024; }
 # 1.44.20: blit#39 scaled-row staging — ONE expanded src row (w*scale px, 32bpp). [4096] =
 # 4096 u64 = 32 KB (8N), the invariant the handler's `w*scale <= 8192` gate enforces (NOT
 # "max FB row" — the expanded width is what lands here). Single-core IF=0 handler scratch.
@@ -240,8 +283,8 @@ fn kernel_resume() {
     asm {
         0x0F; 0x01; 0xCA;   # clac
     }
-    kernel_return_rsp = 0;
-    kernel_return_rip = 0;
+    kernel_return_rsp_set(0);
+    kernel_return_rip_set(0);
     # 1.40.10 bite 2 — restore the kernel main thread (proc 0) as current after a
     # program exits. sh_cmd_run sets proc_current_get() = the exec pid for exit-code
     # attribution; without this reset proc_current_get() stays on that now-dead
@@ -277,7 +320,7 @@ fn kernel_resume() {
     # Restore the full resume context exec_and_wait saved (callee-saved regs +
     # caller rbp + return rsp/rip), then jmp — exec_and_wait "returns" exactly
     # as a normal call. `var c = &exec_ctx` lands the address in rax; rdx scratch.
-    var c = &exec_ctx;
+    var c = exec_ctx_base();
     asm {
         0x48; 0x8B; 0x18;        # mov rbx, [rax]
         0x4C; 0x8B; 0x60; 0x08;  # mov r12, [rax+8]
@@ -561,8 +604,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # kernel_resume (that would resume kybernet as if agnsh exited). It already went state 0
         # above, so its parent's waitpid#4 reaps it. Pre-1.44.14 this gate was just
         # `kernel_return_rsp != 0`, which fired for ANY exit while a resume was armed.
-        if (kernel_return_rsp != 0) {
-            if (proc_current_get() == exec_resume_pid) {
+        if (kernel_return_rsp_get() != 0) {
+            if (proc_current_get() == exec_resume_pid_get()) {
                 kernel_resume();
             }
         }
@@ -595,7 +638,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # is not reached.
         if (arg2 > 16384) { return 0 - 1; }
         var sp_caller_cr3 = proc_get_cr3(proc_current_get());
-        var sp_dst = &spawn_elf_buf;
+        var sp_dst = spawn_elf_buf_base();
         var sp_i = 0;
         while (sp_i < arg2) { store8(sp_dst + sp_i, load8(arg1 + sp_i)); sp_i = sp_i + 1; }
         cr3_load(0x1000);
@@ -1123,9 +1166,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 >= 32) { return 0 - 1; }
         if (arg2 < 0) { return 0 - 1; }
         if (arg2 >= 32) { return 0 - 1; }
-        redir_src_fd = arg1;
-        redir_dst_fd = arg2;
-        redir_pending = 1;
+        redir_src_fd_set(arg1);
+        redir_dst_fd_set(arg2);
+        redir_pending_set(1);
         return 0;
     }
     if (num == 37) {
@@ -1162,24 +1205,24 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # elf_load_from_file below runs under BOOT CR3 (it needs the NVMe BAR, which
         # the per-process CR3 does not map — the same reason kernel_resume reverts to
         # 0x1000), where the user VA would NOT resolve — hence the copy up front.
-        var pdst = &ew37_path;
+        var pdst = ew37_path_base();
         var pi = 0;
         while (pi < arg2) { store8(pdst + pi, load8(arg1 + pi)); pi = pi + 1; }
 
         # (c) snapshot agnsh's resume context (H1) BEFORE the nested exec_and_wait
         # clobbers it. proc_current_get() is still agnsh here.
-        var s37 = &ew37_ctx;
-        var es  = &exec_ctx;
+        var s37 = ew37_ctx_base();
+        var es  = exec_ctx_base();
         var si = 0;
         while (si < 64) { store64(s37 + si, load64(es + si)); si = si + 8; }
-        ew37_kr_rsp   = kernel_return_rsp;          # == 1 (kybernet frame armed)
-        ew37_kr_rip   = kernel_return_rip;
-        ew37_rsp_save = load64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8);   # agnsh's user RSP (per-CPU 4b)
-        ew37_a4       = ksyscall_a4_get();
-        ew37_pid      = proc_current_get();               # agnsh's pid
-        ew37_resume_pid = exec_resume_pid;          # 1.44.14: save agnsh's resume-pid; the nested
+        ew37_kr_rsp_set(kernel_return_rsp_get());          # == 1 (kybernet frame armed)
+        ew37_kr_rip_set(kernel_return_rip_get());
+        ew37_rsp_save_set(load64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8));   # agnsh's user RSP (per-CPU 4b)
+        ew37_a4_set(ksyscall_a4_get());
+        ew37_pid_set(proc_current_get());               # agnsh's pid
+        ew37_resume_pid_set(exec_resume_pid_get());          # 1.44.14: save agnsh's resume-pid; the nested
         # exec_and_wait(child) overwrites exec_resume_pid = child, restored below post-resume.
-        ew37_cr3      = proc_get_cr3(proc_current_get()); # agnsh's CR3 (robust source)
+        ew37_cr3_set(proc_get_cr3(proc_current_get())); # agnsh's CR3 (robust source)
         pcpu_ew37_busy_set(1);
 
         # (d) switch to the BOOT CR3 (maps all phys incl. the NVMe BAR) for the disk
@@ -1206,7 +1249,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         while (ew_pe < arg2) { if (load8(pdst + ew_pe) == 32) { break; } ew_pe = ew_pe + 1; }     # to first space
         var ew_plen = ew_pe - ew_ps;
         if (ew_plen < 1) {                          # empty / all-spaces path token
-            cr3_load(ew37_cr3);
+            cr3_load(ew37_cr3_get());
             pcpu_ew37_busy_set(0);
             stack_canary_check(canary);
             return 0 - 1;
@@ -1225,8 +1268,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
             if (ew_elen >= 1) {
                 if (ew_elen <= 1024) {
                     if (is_user_range(ew_eptr, ew_elen) == 1) {
-                        if (proc_copy_from_user(ew37_cr3, &ew37_env, ew_eptr, ew_elen) == 1) {
-                            if (sc_env_blob_ok(&ew37_env, ew_elen) == 1) { ew_env = &ew37_env; }
+                        if (proc_copy_from_user(ew37_cr3_get(), ew37_env_base(), ew_eptr, ew_elen) == 1) {
+                            if (sc_env_blob_ok(ew37_env_base(), ew_elen) == 1) { ew_env = ew37_env_base(); }
                         }
                     }
                 }
@@ -1236,7 +1279,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         exec_env_len = ew_elen;
         var cpid = elf_load_from_file(pdst + ew_ps, ew_plen, pdst, arg2);
         if (cpid < 0) {
-            cr3_load(ew37_cr3);
+            cr3_load(ew37_cr3_get());
             pcpu_ew37_busy_set(0);
             stack_canary_check(canary);
             return 0 - 1;
@@ -1244,8 +1287,12 @@ fn ksyscall(num, arg1, arg2, arg3) {
 
         # (e) stash the child pid in a GLOBAL + pull entry/rsp/cr3 from its proc_table
         # row (176-B stride: entry@+24, rsp@+16, cr3@+160 — same offsets sh_cmd_run
-        # uses, shell.cyr:460-463).
-        ew37_cpid = cpid;
+        # uses, shell.cyr:460-463). 1.46.x #2: the child stays at state=3 (elf_load_from_file
+        # leaves it NOT-ready) for the WHOLE foreground run — it is entered out-of-band via
+        # exec_and_wait/enter_ring3 below (never via sched), then exit#0 flips it state=0. Never
+        # being state==1 means no woken AP can sched-pick (double-run) it; exec_and_wait's pin is
+        # the second guard. So there is deliberately NO proc_set_state(cpid,1) on this path.
+        ew37_cpid_set(cpid);
         var cep = &proc_table + cpid * 176;
         var ce  = load64(cep + 24);
         var cr  = load64(cep + 16);
@@ -1290,38 +1337,38 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # collapses the slot), then reap: proc_reap_child frees the child's address
         # space + LIFO slot only (NOT proc_reap, which sweeps fds). Safe: child is
         # dead, proc_current_get()==0 (!=cpid) so its guard passes, CPU is on boot CR3.
-        ew37_code = proc_get_exit_code(ew37_cpid);
-        proc_reap_child(ew37_cpid);
+        ew37_code_set(proc_get_exit_code(ew37_cpid_get()));
+        proc_reap_child(ew37_cpid_get());
 
         # (j) rebuild agnsh's resume world from the snapshot (H1) so agnsh's own
         # later exit() resumes kybernet, and so the exit stub reloads agnsh's CR3 +
         # user RSP (not the child's leftovers). &ew37_ctx/&exec_ctx are fresh global
         # addresses (not carried locals).
-        var r37 = &ew37_ctx;
-        var er  = &exec_ctx;
+        var r37 = ew37_ctx_base();
+        var er  = exec_ctx_base();
         var ri  = 0;
         while (ri < 64) { store64(er + ri, load64(r37 + ri)); ri = ri + 8; }
-        kernel_return_rsp = ew37_kr_rsp;             # re-arm (==1): agnsh's exit() resumes kybernet
-        kernel_return_rip = ew37_kr_rip;
-        store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, ew37_cr3);   # agnsh's CR3 (kernel-side); 4c per-CPU
-        store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, ew37_cr3);      # the value the exit stub reloads into CR3 pre-SYSRET
-        store64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8, ew37_rsp_save);   # the exit stub reloads rsp from this CPU's pcpu_kernel_rsp_save slot pre-SYSRET (per-CPU 4b)
-        ksyscall_a4_set(ew37_a4);
-        proc_current_set(ew37_pid);                # agnsh's pid (its write/exit attribute to agnsh)
-        exec_resume_pid   = ew37_resume_pid;         # 1.44.14: agnsh is the resume target again, so
+        kernel_return_rsp_set(ew37_kr_rsp_get());             # re-arm (==1): agnsh's exit() resumes kybernet
+        kernel_return_rip_set(ew37_kr_rip_get());
+        store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, ew37_cr3_get());   # agnsh's CR3 (kernel-side); 4c per-CPU
+        store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, ew37_cr3_get());      # the value the exit stub reloads into CR3 pre-SYSRET
+        store64(&pcpu_kernel_rsp_save + pcpu_cpu() * 8, ew37_rsp_save_get());   # the exit stub reloads rsp from this CPU's pcpu_kernel_rsp_save slot pre-SYSRET (per-CPU 4b)
+        ksyscall_a4_set(ew37_a4_get());
+        proc_current_set(ew37_pid_get());                # agnsh's pid (its write/exit attribute to agnsh)
+        exec_resume_pid_set(ew37_resume_pid_get());         # 1.44.14: agnsh is the resume target again, so
         # agnsh's later exit() (proc_current_get()==exec_resume_pid) fires kernel_resume to kybernet
 
         # (k) reload the LIVE CR3 to agnsh now (kernel_resume left boot 0x1000) so
         # this handler tail + the exit stub run under agnsh's mappings. cr3_load
         # (proc.cyr:153) is the robust param-based idiom.
-        cr3_load(ew37_cr3);
+        cr3_load(ew37_cr3_get());
 
         pcpu_ew37_busy_set(0);
         # (l) NO post-resume canary check: the entry `canary` local was legitimately
         # handed to exec_and_wait's longjmp; ksyscall's canary guards CALLEE overruns
         # and there are no callees after this point (syscall.cyr:250-258). Return the
         # child code from the GLOBAL.
-        return ew37_code;
+        return ew37_code_get();
     }
     if (num == 38) {
         # fbinfo(buf=arg1, len=arg2) — write the 24-byte framebuffer geometry
@@ -1568,7 +1615,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # (a) copy the user (path + argv) line into the kernel buffer NOW, while the caller
         # CR3 resolves the user VA + SMAP AC=1 — BEFORE the boot-CR3 switch (under boot CR3
         # the user VA won't resolve; the per-proc CR3 does not map the NVMe BAR).
-        var spp = &spawn_path_buf;
+        var spp = spawn_path_buf_base();
         var spi = 0;
         while (spi < arg2) { store8(spp + spi, load8(arg1 + spi)); spi = spi + 1; }
         # (b) switch to boot CR3 (maps the NVMe BAR) for the disk I/O, then split the path
@@ -1594,8 +1641,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
             if (sp_elen >= 1) {
                 if (sp_elen <= 1024) {
                     if (is_user_range(sp_eptr, sp_elen) == 1) {
-                        if (proc_copy_from_user(spcr3, &spawn_env_buf, sp_eptr, sp_elen) == 1) {
-                            if (sc_env_blob_ok(&spawn_env_buf, sp_elen) == 1) { sp_env = &spawn_env_buf; }
+                        if (proc_copy_from_user(spcr3, spawn_env_buf_base(), sp_eptr, sp_elen) == 1) {
+                            if (sc_env_blob_ok(spawn_env_buf_base(), sp_elen) == 1) { sp_env = spawn_env_buf_base(); }
                         }
                     }
                 }
@@ -1612,8 +1659,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # (d) elf_load_from_file does NOT set ring-3 selectors (unlike in-memory
             # elf_load) — it was only ever hand-run by execwait's own ring-3 frame. The
             # SCHEDULER restores this proc, so it MUST carry CS=0x23/SS=0x1B or the iretq
-            # lands a user RIP under ring-0 CS=0x08 → fault. (State is already ready.)
+            # lands a user RIP under ring-0 CS=0x08 → fault.
             proc_set_ring3(sp_pid);
+            # 1.46.x #2: elf_load_from_file returns the proc at state=3 (NOT schedulable). It is now
+            # fully wired (per-proc CR3 + ring-3 selectors), so flip it READY — under smp_sched_aps=1
+            # this is the FIRST moment a woken AP may legitimately pick it. Ordered AFTER proc_set_ring3
+            # so no AP can ever observe it ready-but-ring-0.
+            proc_set_state(sp_pid, 1);
         }
         stack_canary_check(canary);
         return sp_pid;

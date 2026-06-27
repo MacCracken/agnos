@@ -1831,7 +1831,7 @@ fn exec_redirect_selftest() {
     var rfd = load64(&fds);
     var wfd = load64(&fds + 8);
     var msg[8]; store8(&msg, 72); store8(&msg + 1, 73);    # "HI"
-    redir_src_fd = 20; redir_dst_fd = wfd; redir_pending = 1;
+    redir_src_fd_set(20); redir_dst_fd_set(wfd); redir_pending_set(1);   # 1.46.x STEP-2 (#3): per-CPU redir (slot 0 at boot)
     exec_redirect_apply();
     vfs_write(20, &msg, 2);                                  # routes to the pipe write end via slot 20
     exec_redirect_restore();
@@ -2062,8 +2062,8 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0D; 0xE6; 0x71; }
 
 #ifdef KTEST
 # Syscall test (direct call — still works)
-kernel_return_rsp = 0;
-kernel_return_rip = 0;
+kernel_return_rsp_set(0);
+kernel_return_rip_set(0);
 proc_count = 0;
 proc_current_set(0);
 var p0 = proc_create(0x100000);

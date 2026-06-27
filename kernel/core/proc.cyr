@@ -271,6 +271,33 @@ fn proc_create_full(entry, stack_top) {
     return idx;                          # 1.44.x: slot + proc_count handled by proc_alloc_slot
 }
 
+# 1.46.x SMP STEP-2 (#2, 2026-06-26): create a USER process slot that is NOT YET SCHEDULABLE.
+# Identical to proc_create_full EXCEPT it leaves the slot at state=3 (CLAIMING — the proc_alloc_slot
+# sentinel) instead of state=1 (ready). WHY: a user proc needs post-creation wiring its caller does
+# AFTER this returns — proc_set_cr3 (a real per-proc address space, not the 0x1000 default below) and,
+# for scheduled procs, proc_set_ring3 (CS=0x23/SS=0x1B). proc_create_full set state=1 BEFORE that
+# wiring, so under smp_sched_aps=1 a woken AP's sched_next could pick the half-built proc (CR3=0x1000,
+# ring-0 selectors) and iretq a user RIP under CS=0x08 → fault. With state=3 the proc is invisible to
+# BOTH sched_next (picks only ==1) and proc_alloc_slot's reuse scan (reuses only ==0) until the caller
+# flips it ready via proc_set_state(pid, 1) AFTER full wiring. Single-core inert: the same store the old
+# code did, just deferred to the caller; no scheduler runs between here and the caller's flip at slot 0.
+fn proc_create_user(entry, stack_top) {
+    var idx = proc_alloc_slot();
+    if (idx < 0) { return 0 - 1; }
+    var p = &proc_table + idx * 176;
+    store64(p, idx);          # pid
+    store64(p + 8, 3);        # state: 3=CLAIMING/building — NOT schedulable until the caller readies it
+    store64(p + 16, stack_top); # rsp
+    store64(p + 24, entry);   # rip
+    memset(p + 32, 0, 128);   # zero all register fields
+    store64(p + 152, 0x200);  # initial RFLAGS: IF=1
+    store64(p + 80, stack_top); # rbp = stack_top
+    store64(p + 160, 0x1000); # default CR3 (caller overrides via proc_set_cr3)
+    store64(&proc_cs + idx * 8, 0x08);   # default ring-0 selectors (caller overrides via proc_set_ring3)
+    store64(&proc_ss + idx * 8, 0x10);
+    return idx;
+}
+
 # === 1.44.x multi-threading (opening) — kernel-thread primitive ===
 # A kernel thread is a schedulable proc on the SHARED kernel address space
 # (CR3 0x1000) with IF=1, so the timer preempts and round-robins it. This

@@ -130,16 +130,17 @@ fn net_poll() {
 # tools' replies. That is the iron 50%-loss; QEMU's chatter-free point-to-point
 # SLIRP kept the ring empty so it never reproduced there. RX-only (no
 # tcp_retx_tick) so the ISR issues no TX and can't race a tool's in-flight
-# nic_send. net_poll_busy turns a timer tick landing mid-drain (tool poll loops
-# run IF=1 in the sleep_ms sti-window) into a no-op instead of re-entering and
-# corrupting net_rx_pkt / r8169_rx_idx; single-core + a synchronous ISR ⇒ the
-# flag fully serializes the two callers.
-var net_poll_busy = 0;
+# nic_send. 1.46.x SMP STEP-2 (#5): the old non-atomic `net_poll_busy` flag is now net_rx_lock — an
+# ATOMIC xchg TRY-lock (smp.cyr) — so the single-consumer guard is correct CROSS-CPU. Under
+# smp_sched_aps=1 a BACKGROUND net program on an AP can call a net syscall → net_poll() → net_rx_drain
+# CONCURRENTLY with the BSP timer-ISR drain (pic.cyr, pcpu_cpu()==0-gated); the old check-then-set flag
+# raced across CPUs and would let BOTH drain the one shared ring → net_rx_pkt / r8169_rx_idx corruption.
+# net_rx_trylock() returns 0=acquired / 1=already-held; a same-CPU timer landing mid-drain (tool poll
+# loops run IF=1 in the sleep_ms sti-window) still just fails the trylock → no-op, exactly as before.
 
 fn net_rx_drain() {
-    if (net_poll_busy != 0) { return 0; }
     if (nic_ready() == 0) { return 0; }
-    net_poll_busy = 1;
+    if (net_rx_trylock() != 0) { return 0; }   # another CPU/context is draining the shared ring — skip
     # Drain the WHOLE RX ring per call, not one frame. FreeBSD re_rxeof and
     # iPXE realtek_poll both loop until the next NIC-owned descriptor; AGNOS
     # returned after the first good frame, so under LAN chatter the 16-deep
@@ -154,7 +155,7 @@ fn net_rx_drain() {
     while (budget > 0) {
         budget = budget - 1;
         var pkt_len = nic_poll(&net_rx_pkt, 2048);
-        if (pkt_len < 14) { net_poll_busy = 0; return drained; }   # ring empty (or runt) — done
+        if (pkt_len < 14) { net_rx_unlock(); return drained; }   # ring empty (or runt) — done
         var et_hi = load8(&net_rx_pkt + 12);
         var et_lo = load8(&net_rx_pkt + 13);
         var ethertype = (et_hi << 8) | et_lo;
@@ -186,7 +187,7 @@ fn net_rx_drain() {
         }
         drained = drained + 1;
     }
-    net_poll_busy = 0;
+    net_rx_unlock();
     return drained;
 }
 

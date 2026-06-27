@@ -61,9 +61,9 @@ fn timer_handler(rsp_after_push) {
         # ring-3 tool is in a poll loop. Otherwise LAN broadcast/multicast chatter
         # overruns the 64-deep r8169 ring during sleep_ms / idle gaps and the NIC drops
         # replies (the iron 50%-loss; QEMU's quiet point-to-point SLIRP never showed
-        # it). net_rx_drain is RX-only + self-guarded (net_poll_busy), so it issues no
-        # TX from interrupt context and no-ops rather than re-enter a tool's in-flight
-        # drain. Runs before the context switch so it executes in the kernel context
+        # it). net_rx_drain is RX-only + self-guarded (net_rx_lock atomic try-lock, 1.46.x #5), so it
+        # issues no TX from interrupt context and no-ops (trylock fails) rather than re-enter a tool's
+        # in-flight drain — now correct cross-CPU. Runs before the context switch so it executes in the kernel context
         # established at ISR entry (pre-CR3-swap); nic_ready() gates it to a no-op
         # until the NIC is up, so early-boot ticks are safe.
         net_rx_drain();

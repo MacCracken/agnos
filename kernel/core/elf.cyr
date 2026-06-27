@@ -142,8 +142,10 @@ fn elf_load(elf_addr, elf_size) {
     proc_unmap_page(new_cr3, stack_base - 0x200000);
     var stack_top = stack_base + 0x4000;
 
-    # Create process with its own page tables
-    var new_pid = proc_create_full(entry, stack_top);
+    # Create process with its own page tables. 1.46.x #2: proc_create_USER leaves the slot at
+    # state=3 (NOT schedulable) so a woken AP can't pick it before the CR3 + ring-3 selectors below
+    # are wired; we flip it ready (state=1) as the LAST step. The spawned proc is scheduler-run.
+    var new_pid = proc_create_user(entry, stack_top);
     if (new_pid >= 0) {
         proc_set_cr3(new_pid, new_cr3);
         # 1.44.8: a spawned ELF (spawn #3 / scheduler-run) runs in ring 3 — set its
@@ -151,6 +153,7 @@ fn elf_load(elf_addr, elf_size) {
         # ring-0 0x08/0x10, the latent bug). elf_load_from_file (exec_and_wait) is a
         # separate path that builds its own ring-3 frame via enter_ring3, unaffected.
         proc_set_ring3(new_pid);
+        proc_set_state(new_pid, 1);   # 1.46.x #2: fully wired (CR3 + ring-3 selectors) — NOW schedulable
     }
     stack_canary_check(canary);
     return new_pid;
@@ -405,7 +408,15 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     store64(stack_phys + 0x3008 + (argc + 3 + envc) * 8, 0);     # auxv AT_NULL val
     var stack_top = stack_base + 0x3000;                         # rsp -> argc
 
-    var new_pid = proc_create_full(entry, stack_top);
+    # 1.46.x #2: create the proc NOT-yet-schedulable (state=3). elf_load_from_file does NOT set ring-3
+    # selectors (the caller does — #43) or it's run out-of-band (#37 via exec_and_wait), so the proc is
+    # returned at state=3 and the CALLER flips it ready (proc_set_state(pid,1)) AFTER its own wiring:
+    #   • #43 (spawn_path) — after proc_set_ring3 (scheduler-run; MUST be ready).
+    #   • #37 (execwait)   — STAYS state=3: run out-of-band via exec_and_wait/enter_ring3, never via
+    #     sched, so it must never be sched-pickable (state!=1 also blocks an AP double-running it).
+    # Closes the mid-load window where proc_create_full's premature state=1 let a woken AP pick a proc
+    # whose CR3/selectors weren't wired yet.
+    var new_pid = proc_create_user(entry, stack_top);
     if (new_pid >= 0) { proc_set_cr3(new_pid, new_cr3); }
     stack_canary_check(canary);
     return new_pid;
