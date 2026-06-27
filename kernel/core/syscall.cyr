@@ -176,8 +176,8 @@ fn redir_backup_base() { return &pcpu_redir_backup + pcpu_cpu() * 32; }
 # memory, identity-mapped). No-op when nothing is armed (so #37 stays byte-identical by default).
 fn exec_redirect_apply() {
     if (redir_pending_get() == 0) { return 0; }
-    var rsrc = vfs_fd_table() + redir_src_fd_get() * 32;
-    var rdst = vfs_fd_table() + redir_dst_fd_get() * 32;
+    var rsrc = vfs_fd_table_of(ew37_cpid_get()) + redir_src_fd_get() * 32;
+    var rdst = vfs_fd_table_of(ew37_cpid_get()) + redir_dst_fd_get() * 32;
     var rbk = redir_backup_base();
     var k = 0;
     while (k < 32) {
@@ -190,7 +190,7 @@ fn exec_redirect_apply() {
 # Restore the src fd entry after the child run; clears the one-shot.
 fn exec_redirect_restore() {
     if (redir_pending_get() == 0) { return 0; }
-    var rsrc = vfs_fd_table() + redir_src_fd_get() * 32;
+    var rsrc = vfs_fd_table_of(ew37_cpid_get()) + redir_src_fd_get() * 32;
     var k = 0;
     var rbk = redir_backup_base();
     while (k < 32) { store64(rsrc + k, load64(rbk + k)); k = k + 8; }

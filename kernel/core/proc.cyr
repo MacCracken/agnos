@@ -295,6 +295,10 @@ fn proc_create_user(entry, stack_top) {
     store64(p + 160, 0x1000); # default CR3 (caller overrides via proc_set_cr3)
     store64(&proc_cs + idx * 8, 0x08);   # default ring-0 selectors (caller overrides via proc_set_ring3)
     store64(&proc_ss + idx * 8, 0x10);
+    # 1.47.x per-proc fd tables (2b): give the child its own fd table, inheriting a COPY of its
+    # creator's (proc_current) — so it sees the parent's stdin/stdout + pipe fds, but isolated.
+    # The single inheritance point for every user proc (elf_load / elf_load_from_file / spawn).
+    vfs_fd_inherit(idx, proc_current_get());
     return idx;
 }
 
@@ -605,11 +609,11 @@ fn proc_reap(pid) {
     # kernel shell closes its own fds synchronously, so at reap any non-FREE fd in
     # 3..31 belongs to the just-exited process. (Per-process fd ownership is a
     # prerequisite to generalize this for the future multi-threading/SMP arc.)
-    var rfd = 3;
-    while (rfd < 32) {
-        if (kis_tag(vfs_fd_table() + rfd * 32, VFS_FREE) == 0) { vfs_close(rfd); }
-        rfd = rfd + 1;
-    }
+    # 1.47.x per-proc fd tables (2b): free THIS pid's own fd table (flush write-backs + release
+    # flocks first), instead of sweeping the global. The per-proc table makes "any open fd
+    # belongs to the exited proc" exact — no risk of touching the parent's fds (the very reason
+    # proc_reap_child historically never swept). Replaces the old fd-3..31 vfs_close loop.
+    proc_destroy_fd_table(pid, 1);
     var cr3 = proc_get_cr3(pid);
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
     if (proc_current_get() == pid) { proc_current_set(0); }
@@ -654,6 +658,11 @@ fn proc_reap(pid) {
 fn proc_reap_child(pid) {
     if (pid >= proc_count) { return 0 - 1; }
     if (pid == proc_current_get()) { return 0 - 1; }   # never reap the running proc here
+    # 1.47.x per-proc fd tables (2b): free the child's OWN fd table. do_flush=0 matches this
+    # path's prior behavior (it never swept fds — the global table was shared, so it couldn't
+    # safely close the parent's; the per-proc table removes that coupling). The child's table
+    # is a separate kmalloc'd copy, so freeing it never touches the parent's fds.
+    proc_destroy_fd_table(pid, 0);
     var cr3 = proc_get_cr3(pid);
     proc_set_state(pid, 0);                 # dead — scheduler skips it (set before free)
     proc_set_cr3(pid, 0x1000);              # detach the stale per-process CR3

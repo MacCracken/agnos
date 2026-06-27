@@ -132,14 +132,70 @@ fn vfs_sec_wfile_flush(base) {
 
 var vfs_table[1024];  # 32 entries x 32 bytes each
 
-# 1.47.x per-process fd tables (bite 2, sub-bite 2a — the seam). ALL fd-table access goes
-# through this accessor instead of `&vfs_table` directly. Today it returns the single global
-# table (byte-behavior-identical to the prior `&vfs_table`); sub-bite 2b changes it to return
-# a PER-PROCESS table (a parallel proc_fd_base[16], like proc_rsp0[16]) so concurrent procs +
-# pipe redirects no longer race one global table (SMP-safe / streaming / N-stage pipes). The
-# seam is mix-compatible — `&vfs_table` and `vfs_fd_table()` alias the same memory in 2a — so
-# the ~30 call sites migrate + validate independently of the per-proc behavior change.
-fn vfs_fd_table() { return &vfs_table; }
+# 1.47.x per-process fd tables (bite 2, sub-bite 2b — per-proc storage + inheritance).
+# Each process owns its OWN 32-entry fd table (parallel array, like proc_rsp0[16]); proc 0
+# (kmain/kybernet) uses the static global vfs_table (set in vfs_init). A child gets a fresh
+# kmalloc'd table at proc_create_user, INHERITING a copy of its creator's table (so it sees
+# the parent's stdin/stdout + any pipe fds) — then the child's fd ops no longer race the
+# parent's, and a pipe redirect / a buggy child close() touch only the child's table. The
+# table is freed at reap. proc_fd_base[pid]==0 → FALLBACK to the global (pre-init, kthreads,
+# or a kmalloc-failed inherit): safe degradation to the old shared-table behavior.
+var proc_fd_base[16];                                       # per-pid fd-table base (0 = use global)
+fn proc_fd_base_get(pid) { return load64(&proc_fd_base + pid * 8); }
+fn proc_fd_base_set(pid, v) { store64(&proc_fd_base + pid * 8, v); return 0; }
+
+# The current proc's fd table (the common path: read/write/close/open etc. — proc_current IS
+# the caller). Falls back to the global when no per-proc table is set.
+fn vfs_fd_table() {
+    var t = proc_fd_base_get(proc_current_get());
+    if (t == 0) { return &vfs_table; }
+    return t;
+}
+# A SPECIFIC proc's fd table — for sites where the target proc is NOT proc_current (the
+# execwait#37 redirect targets the CHILD's table while proc_current is still the parent; reap
+# targets the exited pid). Same global fallback.
+fn vfs_fd_table_of(pid) {
+    var t = proc_fd_base_get(pid);
+    if (t == 0) { return &vfs_table; }
+    return t;
+}
+# Give `child_pid` its own table, inheriting a COPY of `parent_pid`'s (the creator's) — fork-
+# like fd inheritance. kmalloc-fail leaves proc_fd_base[child]=0 (global fallback). Runs at
+# proc_create_user (proc_current == parent), under boot CR3 in the #37 path; both src + the
+# kmalloc'd dst are kernel-heap (PMM pool, PD[8..63]) mirrored into every per-proc CR3.
+fn vfs_fd_inherit(child_pid, parent_pid) {
+    var src = vfs_fd_table_of(parent_pid);
+    var dst = kmalloc(1024);                                # 32 entries x 32 B
+    if (dst == 0) { return 0; }
+    var i = 0;
+    while (i < 1024) { store64(dst + i, load64(src + i)); i = i + 8; }
+    proc_fd_base_set(child_pid, dst);
+    return 0;
+}
+# Free `pid`'s fd table at reap. do_flush=1 (proc_reap, the synchronous run-to-completion
+# path) mirrors the old fd-3..31 sweep — flush VFS_SEC_WFILE write-backs + release flocks
+# before freeing, so a program that exits with an open write-fd still persists its data.
+# do_flush=0 (proc_reap_child) matches that path's prior no-sweep behavior. Never frees the
+# static global (proc 0) — just detaches it.
+fn proc_destroy_fd_table(pid, do_flush) {
+    var t = proc_fd_base_get(pid);
+    if (t == 0) { return 0; }                               # used the global — nothing to free
+    if (t == &vfs_table) { proc_fd_base_set(pid, 0); return 0; }
+    if (do_flush == 1) {
+        var fd = 3;
+        while (fd < 32) {
+            var base = t + fd * 32;
+            if (kis_tag(base, VFS_FREE) == 0) {
+                if (ktag(base) == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), pid); }
+                if (ktag(base) == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
+            }
+            fd = fd + 1;
+        }
+    }
+    kfree_sized(t, 1024);
+    proc_fd_base_set(pid, 0);
+    return 0;
+}
 
 # Whole-file staging buffer (1.40.1 exec-from-disk). Module-global so it is
 # N×u64 = 8192 bytes — kmalloc/pmm_alloc both cap at one 4 KB page, so a
@@ -149,6 +205,7 @@ fn vfs_fd_table() { return &vfs_table; }
 var vfs_scratch_buf[1024];
 
 fn vfs_init() {
+    proc_fd_base_set(0, &vfs_table);  # 2b: proc 0 (kmain/kybernet) owns the static global table
     memset(vfs_fd_table(), 0, 1024);  # 32 entries x 32 bytes
     # FD 0 = stdin, FD 1 = stdout, FD 2 = stderr — all the serial/console device
     # (device index 0). Pre-1.40.3 only fd 0 was set, so a user program's
