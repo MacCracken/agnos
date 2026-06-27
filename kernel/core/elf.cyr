@@ -341,14 +341,18 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     # [envp NULL][auxv AT_NULL(0,0)] ; the argv strings live higher up the page.
     # Control block at stack offset 0x3000 (16-aligned → rsp 16-aligned, ~12 KB
     # of stack below it for the program); strings from 0x3100. argv_src is the
-    # raw command tail ("/bin/argc a b"); argv[0] is its first token. argc ≤ 8.
+    # raw command tail ("/bin/argc a b"); argv[0] is its first token. argc ≤ 16.
     var argc = 0;
     var str_o = 0x3100;
     var ai = 0;
     while (ai < argv_len) {
         while (ai < argv_len) { if (load8(argv_src + ai) != 32) { break; } ai = ai + 1; }   # skip spaces
         if (ai >= argv_len) { break; }
-        if (argc >= 8) { break; }
+        if (argc >= 16) { break; }   # 1.46.x: raised 8->16. The argv pointer array
+        # (0x3008..0x3100) plus the 2-entry envp hold ~27 ptr slots, so 16 is safe
+        # headroom for longer positional command lines (e.g. `anuenue <sentence>` —
+        # agnos has no working shell pipes yet, so positional argv is the only text
+        # path); the str_o < 0x4000 cap below still bounds total command length.
         var ts = ai;
         while (ai < argv_len) { if (load8(argv_src + ai) == 32) { break; } ai = ai + 1; }    # to next space
         var tl = ai - ts;
