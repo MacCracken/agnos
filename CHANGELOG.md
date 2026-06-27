@@ -5,6 +5,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.0] — 2026-06-27
+
+**▶ 1.47.x arc OPEN — fault-resilience first, then kernel perf + KASLR.** Version/docs/tracker cut only — no kernel-logic change (the auto-generated `kernel/version.cyr` banner is the only source delta; the first engineering bite lands at 1.47.1). The just-closed **1.46.x SMP arc** (STEP-2 iron-validated on archaemenid 2026-06-26) surfaced two systemic robustness gaps that the user prioritized ahead of the originally-slotted perf tail.
+
+### Added
+- **1.47.x arc framing + bite ladder.** Headline first bites:
+  1. **Proc-teardown-on-fault** — a faulting **ring-3** process must be *terminated* with control returned to the agnsh prompt, instead of the current behavior where an unhandled ring-3 `#PF`/`#GP` halts the box behind the 1.45.16 fault-canary bar. Surfaced by the cyrius-doom sustained-play `#PF` (CPL3, `err` U/S=1) on the 1.46.8 burn: a userland segfault should not take the system down, but there is **no signal-delivery / proc-teardown-on-fault path** yet ([[project_doom_on_agnos_blockers]]).
+  2. **Per-process fd tables** — filed by the 1.46.11 pipe work (`docs/development/issues/2026-06-27-agnos-pipes-per-proc-fd-streaming.md`): today's pipes are single-foreground store-and-forward over a global fd table; per-proc fd tables unlock **streaming / SMP-safe / N-stage** pipes.
+
+  Arc tail (the originally-slotted 1.47.x): the **perf-tuning remainder** — scheduler/context-switch, syscall entry/exit, block-IO batching, ext2/4 hot loops (the 1.42.x Track-A tail; heap-zeroing already landed at 1.42.5) — and **full-binary KASLR Option A** (un-gated by cyrius userland PIE v6.1.41). Tracker (hypotheses + falsification) → agnosticos iron-log `#tracker-147x-cycle`. Roadmap slot table updated; 1.46.x SMP arc marked iron-complete.
+
 ## [1.46.11] — 2026-06-27
 
 ### Fixed
