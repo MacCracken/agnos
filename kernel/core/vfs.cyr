@@ -566,7 +566,22 @@ fn vfs_read_file_at_inner(path, namelen, offset, dst, len) {
     return 0 - 1;
 }
 
+# 1.46.8 (#6, pre-burn review — HIGH): fs_lock wrapper. vfs_file_size walks the ext2 metadata scratch
+# (ext2_path_lookup + ext2_get_inode → ext2_inode_buf/ext2_block_buf/ext2_bgdt_buf/ext2_dir_buf) but its
+# sole caller, elf_load_from_file (elf.cyr), does NOT hold fs_lock — so under smp_sched_aps=1 it ran
+# concurrently with a locked vfs_read_file_at / FS-mutation on another CPU and corrupted the shared ext2
+# scratch mid-walk (wrong inode/size → a corrupt exec). Every OTHER ext2-touching entry is already
+# covered: the _inner functions by their outer vfs_*_on wrapper, and vfs_ext2_parent by the FS-mutation
+# syscall handlers' OWN fs_lock (syscall.cyr:744-748 etc.) — which is exactly why vfs_ext2_parent must
+# NOT take the lock itself (re-acquire = deadlock). vfs_file_size was the lone unlocked ext2 entry on a
+# concurrent path. Split so the single return point keeps the lock leak-free, mirroring vfs_read_file_at.
 fn vfs_file_size(path, namelen) {
+    fs_spin_lock();
+    var r = vfs_file_size_inner(path, namelen);
+    fs_spin_unlock();
+    return r;
+}
+fn vfs_file_size_inner(path, namelen) {
     if (vfs_sec_name_ok(namelen) == 0) { return 0 - 1; }
     if (ext2_active != 0) {
         var ino = ext2_path_lookup(path, namelen);

@@ -1275,8 +1275,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 }
             }
         }
-        exec_env_src = ew_env;                       # globals, consumed-at-entry by the loader
-        exec_env_len = ew_elen;
+        exec_env_src_set(ew_env);                    # 1.46.8: per-CPU, consumed-at-entry by the loader
+        exec_env_len_set(ew_elen);
         var cpid = elf_load_from_file(pdst + ew_ps, ew_plen, pdst, arg2);
         if (cpid < 0) {
             cr3_load(ew37_cr3_get());
@@ -1648,8 +1648,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 }
             }
         }
-        exec_env_src = sp_env;                       # globals, consumed-at-entry by the loader
-        exec_env_len = sp_elen;
+        exec_env_src_set(sp_env);                    # 1.46.8: per-CPU, consumed-at-entry by the loader
+        exec_env_len_set(sp_elen);
         var sp_pid = elf_load_from_file(spp + sp_ps, sp_plen, spp, arg2);
         # (c) restore the caller CR3 on EVERY path (incl. the load-failure path) so the
         # handler tail + SYSRET run under the caller's mappings (skipping this reproduces

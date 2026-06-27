@@ -7,7 +7,14 @@
 # parsing survives the segment loop, which reuses vfs_scratch_buf for the data
 # chunks. A static binary's phdr table is tiny (phoff≈64 + phnum×56), so 4 KB
 # is ample; loads whose phdr table exceeds the first 4 KB are refused.
-var elf_hdr_buf[512];
+# 1.46.8 (#5, pre-burn review): PER-CPU. elf_hdr_buf is filled under fs_lock by vfs_read_file_at but
+# PARSED (header validation + the PT_LOAD segment-map loop) WITHOUT a lock held — the "shared FS scratch
+# is serialized by the single-consumer invariant" assumption (syscall.cyr) that smp_sched_aps=1 breaks.
+# Two CPUs in elf_load_from_file at once (#37 on the BSP + #43 on an AP) would let CPU B's header read
+# overwrite the phdrs CPU A is still parsing (TOCTOU on the segment bounds). Per-CPU: 512 u64 (4 KB) per
+# CPU × 4; cpu c at byte c*4096. pcpu_cpu() cpu_count<2 fast path = single-core byte-identical.
+var pcpu_elf_hdr_buf[2048];
+fn elf_hdr_buf_base() { return &pcpu_elf_hdr_buf + pcpu_cpu() * 4096; }
 
 fn elf_load(elf_addr, elf_size) {
     var canary = stack_canary_secret;
@@ -178,18 +185,27 @@ fn elf_load(elf_addr, elf_size) {
 # exprs hoisted out of arg lists — sched.cyr / cr3_load precedents). The staleness hazard
 # of globals is closed by consuming + zeroing them as the FIRST statements below — every
 # path through this fn, including every early reject, clears them.
-var exec_env_src = 0;
-var exec_env_len = 0;
+# 1.46.8 (#1/#4, pre-burn review): PER-CPU. These carry the child's env pointer+len into the loader —
+# set in the #37/#43 handlers + init.cyr right before elf_load_from_file, consumed-at-entry below. Under
+# smp_sched_aps=1 two CPUs in #37/#43 concurrently would clobber the shared pair (CPU A's loader reads
+# CPU B's env / CPU B's child loses env); the buffers they point to (ew37_env/spawn_env_buf) are already
+# per-CPU (1.46.7), so these pointer globals must be too. pcpu_cpu() cpu_count<2 fast path = single-core identical.
+var pcpu_exec_env_src[4];
+fn exec_env_src_set(v) { store64(&pcpu_exec_env_src + pcpu_cpu() * 8, v); return 0; }
+fn exec_env_src_get() { return load64(&pcpu_exec_env_src + pcpu_cpu() * 8); }
+var pcpu_exec_env_len[4];
+fn exec_env_len_set(v) { store64(&pcpu_exec_env_len + pcpu_cpu() * 8, v); return 0; }
+fn exec_env_len_get() { return load64(&pcpu_exec_env_len + pcpu_cpu() * 8); }
 fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     var canary = stack_canary_secret;
-    var env_src = exec_env_src;     # consume-at-entry: no stale env can survive ANY exit path
-    var env_len = exec_env_len;
-    exec_env_src = 0;
-    exec_env_len = 0;
+    var env_src = exec_env_src_get();     # consume-at-entry: no stale env can survive ANY exit path
+    var env_len = exec_env_len_get();
+    exec_env_src_set(0);
+    exec_env_len_set(0);
     var fsize = vfs_file_size(path, namelen);
     if (fsize < 64) { return 0 - 1; }                 # too small for an ELF64 header
     if (fsize > 0x1000000) { return 0 - 1; }          # E2BIG — cap binaries at 16 MB (1.40.4)
-    var hdr = &elf_hdr_buf;
+    var hdr = elf_hdr_buf_base();
     var hcap = 4096;
     if (fsize < hcap) { hcap = fsize; }
     var hgot = vfs_read_file_at(path, namelen, 0, hdr, hcap);

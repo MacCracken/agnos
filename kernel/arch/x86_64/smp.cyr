@@ -194,12 +194,16 @@ fn sched_spin_unlock() {
 # (net_handle_arp/icmp/udp/tcp) touches only static arrays — no kmalloc/pmm — so net_rx_lock nests
 # under nothing (acquires no other lock). FIXED-GLOBAL (no param): old@[rbp-0x08]/addr@[rbp-0x10],
 # the proven-correct frame (smp.cyr:38-46). INERT single-core: xchg uncontended → byte-identical.
-# RESIDUAL (deferred, NOT reachable in the foreground-net model): the TX side (nic_send/tcp_send/
-# tcp_connect mutating tcp_conns/arp_cache from a net syscall) is NOT yet under this lock — closing it
-# needs short-held fine-grained conn-table locking that never spans the blocking 8 s tcp_connect poll
-# (holding net_rx_lock across that poll would STARVE the BSP RX drain) and never self-deadlocks the
-# RX-dispatch→ACK-send path. Only reachable once a net program runs on an AP (background net tool);
-# the current net stack runs foreground on the BSP (all net state BSP-serial). Tracked for a follow-on.
+# RESIDUAL (deferred, NOT reachable in the foreground-net model): two net-state accesses remain outside
+# this lock — (1) the TX side (nic_send/tcp_send/tcp_connect mutating tcp_conns/arp_cache from a net
+# syscall), and (2) the RX CONSUMER-READ side (1.46.8 pre-burn review #3): net_recv_udp/tcp_recv call
+# net_poll() — which acquires AND RELEASES net_rx_lock around the drain — then read the shared net_udp_buf
+# / tcp_conns rx-ring AFTER the release, so a concurrent ISR/AP drain could overwrite the buffer between
+# the drain and the read. Closing both needs short-held fine-grained conn-table locking that never spans
+# the blocking 8 s tcp_connect poll (holding net_rx_lock across it would STARVE the BSP RX drain) and
+# never self-deadlocks the RX-dispatch→ACK-send path (or has net_poll copy the payload out under the lock).
+# Both are only reachable once a net program runs on an AP (a background net tool); the current net stack
+# runs foreground on the BSP (all net state BSP-serial). Tracked for a follow-on.
 var net_rx_lock = 0;
 fn net_rx_trylock() {
     var old = 1;

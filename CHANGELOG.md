@@ -5,7 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.46.7] — 2026-06-26
+## [1.46.8] — 2026-06-26
+
+**★ 1.46.8 — SMP STEP-2 pre-burn review fixes (independent adversarial review of 1.46.7).**
+A second independent review (6 dimension reviewers + refute-by-default verification) of the 1.46.7
+hardening, run at the user's request before staging the iron burn, raised **6 findings — all 6
+confirmed, 0 refuted, 0 burn-blockers** (5 distinct: #1==#4). Each is a real SMP-correctness gap the
+`smp_sched_aps=1` flip makes reachable; this cut closes the four code ones + one doc clarification.
+
+### Fixed
+- **`exec_env_src` / `exec_env_len` left as bare globals — the missed per-CPU conversion (`kernel/core/elf.cyr`, `kernel/core/syscall.cyr`, `kernel/user/init.cyr`).** 1.46.7 made the env *buffers* (`ew37_env`/`spawn_env_buf`) per-CPU but not the two pointer globals that hand them to the loader. They are set in the #37/#43 handlers + `kybernet` right before `elf_load_from_file` and consumed-at-entry there; under `smp_sched_aps=1` two CPUs in #37/#43 concurrently clobber the shared pair → CPU A's child gets CPU B's env (a cross-process env leak) or B's child loses its env. Converted to `pcpu_exec_env_src[4]`/`pcpu_exec_env_len[4]` + `_get`/`_set` folding `pcpu_cpu()*8`. (No fault — the clobbered value is always a valid kernel buffer or 0 — but it is silent env corruption.)
+- **agnsh-launch preemptible unpinned gap — `proc_current_set` before the `exec_and_wait` pin (`kernel/user/init.cyr`).** `kybernet` (proc 0) runs IF=1-preemptibly; it sets `proc_current_get()` = agnsh at the kernel launch *before* `exec_and_wait` pins it (`idle_owner`). A BSP timer tick in that gap runs `do_context_switch` with `old==agnsh` (state==3, unpinned) → `sched.cyr:348` flips agnsh `state 3→1` + `on_cpu=-1`, and a woken AP's `sched_next` then steals the half-set-up agnsh (`proc_cs` still ring-0 `0x08`) and runs `kybernet`'s gap continuation on the AP. The #2 (state=3) fix narrows this but does not close it because `do_context_switch` readies `old` unconditionally. **Fix:** `cli` the gap (one byte) so it runs IF=0 — exactly how the #37 path is already immune (its whole handler is IF=0); `enter_ring3`'s iretq restores IF=1 (`rflags_start=0x202`) so agnsh still runs preemptible. Applied to both the agnsh and `NET_SELFTEST` launches. (The review's suggested pin-only / `preempt_disable` fixes were both unsound — pin loses the gap's continuation when the BSP switches away; `preempt_disable` would never re-enable → non-preemptible agnsh.)
+- **`elf_hdr_buf` shared scratch parsed unlocked (`kernel/core/elf.cyr`).** The ELF header+phdr buffer is filled under `fs_lock` by `vfs_read_file_at` but **parsed** (validation + the PT_LOAD segment-map loop) with no lock held — the "single-consumer FS scratch" invariant the flip breaks. Two concurrent `elf_load_from_file` (#37 on the BSP + #43 on an AP) let CPU B's header read overwrite the phdrs CPU A is still walking (TOCTOU on the segment bounds → a corrupt/mis-mapped child). Made per-CPU: `pcpu_elf_hdr_buf[2048]` + `elf_hdr_buf_base()` folding `pcpu_cpu()*4096`.
+- **`vfs_file_size` walks ext2 metadata scratch with no `fs_lock` (`kernel/core/vfs.cyr`) — the highest-severity finding.** `vfs_file_size` (`ext2_path_lookup` + `ext2_get_inode` → the shared `ext2_inode_buf`/`block_buf`/`bgdt_buf`/`dir_buf`) is called from `elf_load_from_file`, which does **not** hold `fs_lock` — so it raced a concurrent locked `vfs_read_file_at`/FS-mutation on another CPU and corrupted an in-flight file read. Wrapped in `fs_lock` (outer-wrapper + `vfs_file_size_inner`, single return point, mirroring `vfs_read_file_at`). Audited every other ext2-touching `vfs.cyr` entry: the `_inner` functions are covered by their `vfs_*_on` wrapper, and `vfs_ext2_parent` by the FS-mutation **syscall handlers'** own `fs_lock` (so it must *not* self-lock — re-acquire would deadlock); `vfs_file_size` was the lone unlocked ext2 entry on a concurrent path.
+
+### Changed
+- **Net residual scope note widened (`kernel/arch/x86_64/smp.cyr`, doc-only — review #3, low).** The `net_rx_lock` deferred-residual comment now also notes the RX *consumer-read* path: `net_recv_udp`/`tcp_recv` read `net_udp_buf`/`tcp_conns` **after** `net_poll()` releases `net_rx_lock`, so a concurrent drain could overwrite the buffer between drain and read. Same AP-only reachability as the TX residual; not a foreground-model burn issue. No code change.
+
+
 
 **★ 1.46.7 — SMP STEP-2 part 2: full hardening (the last 3 concurrency bugs → burn-ready).**
 Completes the STEP-2 hardening the 6-lens adversarial review surfaced. Where 1.46.6 landed the

@@ -21,14 +21,24 @@ fn kybernet_exec_agnsh() {
     store8(&kyb_env + 7, 80);  store8(&kyb_env + 8, 87);
     store8(&kyb_env + 9, 68);  store8(&kyb_env + 10, 61);
     store8(&kyb_env + 11, 47); store8(&kyb_env + 12, 0);
-    exec_env_src = &kyb_env;            # consumed-at-entry by the loader
-    exec_env_len = 13;
+    exec_env_src_set(&kyb_env);         # 1.46.8: per-CPU, consumed-at-entry by the loader (BSP=slot 0)
+    exec_env_len_set(13);
     var pid = elf_load_from_file("/bin/agnsh", 10, "/bin/agnsh", 10);
     if (pid < 0) { return 0 - 1; }
     var ep = &proc_table + pid * 176;
     var e = load64(ep + 24);      # entry
     var r = load64(ep + 16);      # rsp
     var c = load64(ep + 160);     # cr3
+    # 1.46.8 (#2, pre-burn review): CLI before making agnsh the current proc. kybernet (proc 0) runs
+    # IF=1-preemptibly, so without this a BSP timer tick in the proc_current_set..exec_and_wait gap
+    # would run do_context_switch with old==agnsh (state==3, NOT YET pinned — exec_and_wait sets the
+    # idle_owner pin) → sched.cyr:348 flips agnsh state 3→1 + on_cpu=-1, and a woken AP's sched_next
+    # then STEALS the half-set-up agnsh (proc_cs still 0x08) and runs kybernet's gap continuation on
+    # the AP. The #37 path is immune because the whole #37 handler runs IF=0; this makes the kernel
+    # launch path do the same. enter_ring3's iretq restores IF=1 for agnsh (rflags_start=0x202), so
+    # agnsh still runs PREEMPTIBLE — only the setup gap is masked. (No sti needed on the post-exit
+    # path: kernel_resume already returns here IF=0 from the exit#0 handler.)
+    asm { 0xFA; }   # cli — mask the timer for the unpinned setup gap (mirrors the IF=0 #37 path)
     proc_current_set(pid);
     # 1.46.x BITE 2 — RE-ENABLE preemptive agnsh (IF=1) on the per-proc RSP0 foundation (bite 1).
     # HISTORY: 1.44.14 launched agnsh IF=1 so the timer time-slices its prompt against #43 background
@@ -91,6 +101,7 @@ fn kybernet() {
         var nstp = elf_load_from_file("/bin/dig", 8, "/bin/dig @10.0.2.3 example.com", 30);
         if (nstp >= 0) {
             var nste = &proc_table + nstp * 176;
+            asm { 0xFA; }   # 1.46.8 (#2): cli the unpinned setup gap (see the agnsh launch above)
             proc_current_set(nstp);
             exec_and_wait(load64(nste + 24), load64(nste + 16), load64(nste + 160));
             proc_reap(nstp);
