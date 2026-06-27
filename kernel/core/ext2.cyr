@@ -1839,6 +1839,12 @@ fn ext2_extent_bmap_alloc(inode_buf, lblk, inode_num) {
 # (block# 0 is reserved by the FS) and for blocks beyond the file's
 # allocated extent; -1 on disk-read failure.
 
+# 1.47.5 — single-indirect `l1`-block read counter (perf proof, the read-path analog of
+# block_read_amp / the 1.47.2 dirlk inode-reuse). This UNCACHED path re-reads `l1` on every block;
+# `ext2_logical_to_physical_cached` below increments only on a cache MISS, so a sequential read of a
+# single-indirect file collapses N `l1` reads to 1.
+var ext2_indirect_disk_reads = 0;
+
 fn ext2_logical_to_physical(inode_buf, logical_block) {
     # Phase 4 dispatch: ext4 extents inodes take a different code path
     # (Linux switched ext4 to extents as the default in 2008).
@@ -1860,6 +1866,7 @@ fn ext2_logical_to_physical(inode_buf, logical_block) {
         var l1 = ext2_inode_block_ptr(inode_buf, 12);
         if (l1 == 0) { return 0; }   # sparse hole at the indirect-root level
         if (ext2_read_block(l1, &ext2_indirect_buf_l1) != 0) { return 0 - 1; }
+        ext2_indirect_disk_reads = ext2_indirect_disk_reads + 1;
         return ext2_load32_le(&ext2_indirect_buf_l1, ind_off * 4);
     }
 
@@ -1901,6 +1908,37 @@ fn ext2_logical_to_physical(inode_buf, logical_block) {
     # Beyond triple-indirect: file size physically impossible on ext2.
     kprintln("ext2: logical block beyond triple-indirect cap", 46);
     return 0;
+}
+
+# 1.47.5 — cached single-indirect variant for SEQUENTIAL file reads (ext2_read_at). The plain
+# (non-extent) single-indirect case re-reads the SAME `l1` block for every logical block of a file in
+# the 48 KB..4 MB range (logical 12 .. 11+ptrs); a 589 KB binary re-reads `l1` ~135x. `cached_l1_ptr`
+# holds the `l1` block currently resident in ext2_indirect_buf_l1 (0 = none); on a hit the read is
+# skipped. SAFE because the ONLY toucher of ext2_indirect_buf_l1 inside the ext2_read_at loop is this
+# function — direct / double / triple / extent blocks defer to ext2_logical_to_physical (which
+# clobbers the buffer via its d1/t1 loads), so the cache is invalidated (set 0) before deferring. No
+# global state, no cross-call cache → no shared-buffer staleness risk.
+fn ext2_logical_to_physical_cached(inode_buf, logical_block, cached_l1_ptr) {
+    var flags = ext2_inode_flags(inode_buf);
+    if ((flags & 0x80000) == 0) {
+        var ptrs = ext2_blocksize / 4;
+        if (logical_block >= 12) {
+            var ind_off = logical_block - 12;
+            if (ind_off < ptrs) {
+                var l1 = ext2_inode_block_ptr(inode_buf, 12);
+                if (l1 == 0) { return 0; }
+                if (l1 != load64(cached_l1_ptr)) {
+                    if (ext2_read_block(l1, &ext2_indirect_buf_l1) != 0) { return 0 - 1; }
+                    ext2_indirect_disk_reads = ext2_indirect_disk_reads + 1;
+                    store64(cached_l1_ptr, l1);
+                }
+                return ext2_load32_le(&ext2_indirect_buf_l1, ind_off * 4);
+            }
+        }
+    }
+    # Direct / double / triple / extent: the general path clobbers ext2_indirect_buf_l1 → invalidate.
+    store64(cached_l1_ptr, 0);
+    return ext2_logical_to_physical(inode_buf, logical_block);
 }
 
 # --- File read at arbitrary offset (Phase 2 — covers direct + indirect) --
@@ -1950,12 +1988,13 @@ fn ext2_read_at(inode_num, offset, buf, maxlen) {
     # copied. The first block may start mid-block (offset & blockmask);
     # the last block may end mid-block.
     var bytes_done = 0;
+    var cached_l1 = 0;   # 1.47.5: the l1 block resident in ext2_indirect_buf_l1 across this read
     while (bytes_done < to_read) {
         var abs_off = offset + bytes_done;
         var logical = abs_off / ext2_blocksize;
         var off_in_block = abs_off - logical * ext2_blocksize;
 
-        var phys = ext2_logical_to_physical(&ext2_inode_buf, logical);
+        var phys = ext2_logical_to_physical_cached(&ext2_inode_buf, logical, &cached_l1);
         if (phys == 0 - 1) { return 0 - 1; }   # disk-read error
 
         var remaining = to_read - bytes_done;
@@ -3888,6 +3927,33 @@ fn ext2_write_selftest() {
     kprint(" reread=", 8);
     kprint_num(dl_reread);
     kprintln(" inode-reads", 12);
+
+    # 1.47.5 perf proof — single-indirect read reuse. Write a file spanning 2 single-indirect blocks
+    # (logical 12 + 13 = offsets 48 KB + 52 KB at 4 KB blocks, both reached via the SAME l1 indirect
+    # block), then map them TWO ways + count l1 disk reads. ext2_logical_to_physical_cached (what
+    # ext2_read_at now uses) reads l1 once then reuses it (reuse=1); the plain path re-reads l1 per
+    # block (reread=2). On a 589 KB single-indirect binary that is ~135 l1 reads → 1. Read-path analog
+    # of the dirlk proof above.
+    var bino = ext2_create(2, "ind.txt", 7);
+    if (bino > 0) {
+        ext2_write_at(bino, 49152, &ext2_block_buf, 4096);   # alloc data @ logical 12 (l1[0])
+        ext2_write_at(bino, 53248, &ext2_block_buf, 4096);   # alloc data @ logical 13 (l1[1], same l1)
+        ext2_get_inode(bino, &ext2_inode_buf);
+        ext2_indirect_disk_reads = 0;
+        var cl1 = 0;
+        ext2_logical_to_physical_cached(&ext2_inode_buf, 12, &cl1);   # l1 miss -> 1 read
+        ext2_logical_to_physical_cached(&ext2_inode_buf, 13, &cl1);   # l1 hit  -> 0 reads
+        var ind_reuse = ext2_indirect_disk_reads;
+        ext2_indirect_disk_reads = 0;
+        ext2_logical_to_physical(&ext2_inode_buf, 12);               # 1 read
+        ext2_logical_to_physical(&ext2_inode_buf, 13);               # 1 read
+        var ind_reread = ext2_indirect_disk_reads;
+        kprint("ext2w: indirect reuse=", 22);
+        kprint_num(ind_reuse);
+        kprint(" reread=", 8);
+        kprint_num(ind_reread);
+        kprintln(" l1-reads", 9);
+    }
 
     return 0;
 }

@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.5] — 2026-06-27
+
+**▶ 1.47.5 — perf patch (3rd of the 1.47.x perf series): ext2 single-indirect read reuse.**
+
+### Changed
+- **`ext2_read_at` no longer re-reads the single-indirect block (`l1`) on every block of a sequential file read (`kernel/core/ext2.cyr`).** A file in the 48 KB–4 MB range keeps its data-block pointers in one single-indirect block (`i_block[12]` → `l1`); the old `ext2_logical_to_physical` re-read `l1` from disk for **every** logical block, so an exec-load of a 589 KB binary (doom / kriya) re-read `l1` ~135×. A new **`ext2_logical_to_physical_cached`** keeps `l1` resident in `ext2_indirect_buf_l1` across one `ext2_read_at` call via a **per-call local cache** (`cached_l1`) and skips the read on a hit — so a sequential single-indirect read drops from **N `l1` reads to 1**. Direct / double / triple-indirect / extent blocks defer to the original walker (which clobbers the buffer), invalidating the cache first — so there is **no global state and no shared-buffer staleness risk**. Read-path analog of 1.47.2's dir-lookup inode reuse + 1.42.8/1.47.1's block read/write-amplification collapse. Validated: new **`ext2w: indirect reuse=1 reread=2`** proof (`EXT2_WRITE_SELFTEST`); **exec-smoke 15/15** (binaries read through the cached path), ext2-write-smoke **e2fsck-clean** (the new indirect write+read exercises a previously-untested selftest path), `check.sh` 11/11. Iron rides the 1.47.x burn.
+
 ## [1.47.4] — 2026-06-27
 
 **▶ 1.47.4 — full-binary KASLR (Option A): the kernel binary's physical load base is randomized per
