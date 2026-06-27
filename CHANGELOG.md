@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.3] — 2026-06-27
+
 ## [1.47.2] — 2026-06-27
 
 **▶ 1.47.2 — perf patch (2 of the deferred 1.47.x perf series): ext2 directory-lookup inode reuse.**
