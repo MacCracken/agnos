@@ -1,6 +1,6 @@
 # KASLR Scope: Full Relocation vs Data-Only
 
-**Status**: Proposed — awaiting decision before 1.28.0 implementation.
+**Status**: Option B (data-only) shipped **1.28.0**. Option A (full-binary) **SHIPPED 1.47.4** (+ gnoboot 0.6.0) — a relocation-free PIE (ET_DYN) kernel, RDRAND-slid 2 MB-aligned base in [32 MB, 254 MB), no boot-shim relocation walk needed. The "compiler work — cyrius doesn't have a PIE mode" cost below was overtaken by cyrius v6.1.6/6.1.8 PIE codegen (`CYRIUS_PIE=1` → ET_DYN, RIP-relative). See CHANGELOG [1.47.4] + `scripts/kaslr-smoke.sh`.
 **Date**: 2026-05-11
 **Affects**: `kernel/arch/x86_64/boot_shim.cyr`, `kernel/core/pmm.cyr`, `kernel/core/heap.cyr`, `kernel/core/proc.cyr`. Possibly `kernel/agnos.cyr` and `kernel/core/main.cyr` if full relocation is chosen.
 **Related**: Security Hardening item S7 (last open from the 2026-04-13 audit); roadmap entry for v1.28.0.

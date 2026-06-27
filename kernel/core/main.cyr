@@ -44,6 +44,14 @@ fb_ansi_visual();
 print_agnos_kernel_banner();
 kprintln("64-bit long mode", 16);
 
+# KASLR probe (1.47.3 bite 2b): print the kernel's actual physical load base. gnoboot randomizes it
+# via RDRAND and passes it at boot_info+0x70 (copied CR3-independently by boot_info_capture_rdi). A
+# value in [32 MB, 254 MB) that DIFFERS across boots is the slide working; a fixed 0x100000 means a
+# non-PIE kernel or the slide fell back. RIP-relative code runs correctly wherever it landed.
+kprint("KASLR: kernel_base=", 19);
+kprint_hex(load64(load64(&boot_info_ptr) + 0x70));
+kprintln("", 0);
+
 # Per-stage CMOS stamps survive hangs and are decoded by
 # agnosticos/scripts/read-boot-log.sh. Slot map: 0x50 = kernel CP,
 # 0x51 = kernel magic, 0x52/0x53 = gnoboot. cp_fb() visual cells were

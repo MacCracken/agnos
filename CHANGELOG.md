@@ -5,7 +5,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.4] — 2026-06-27
+
+**▶ 1.47.4 — full-binary KASLR (Option A): the kernel binary's physical load base is randomized per
+boot.** Closes the last ~20% of KASLR value beyond the data-only scope shipped at 1.28.0 — ROP/JOP
+gadgets can no longer be pre-computed against a fixed kernel binary. Pairs with **gnoboot 0.6.0** (the
+slid PIE-kernel loader). Built on the 1.47.3 foundation (the PIE kernel boots at a fixed base).
+
+### Added
+- **The kernel is now buildable as a position-independent ET_DYN image** via `CYRIUS_PIE=1
+  ./scripts/build.sh` (cyrius `EMITELF64_KERNEL` ET_DYN + RIP-relative codegen — **relocation-free**, no
+  `.rela` table to walk). gnoboot loads it at an RDRAND-chosen, 2 MB-aligned base in **[32 MB, 254 MB)**
+  and jumps to `base + e_entry`; the RIP-relative code runs correctly at the random base. The default
+  (non-PIE ET_EXEC) build is byte-identical and unaffected — KASLR is opt-in at the kernel-build level and
+  driven entirely by which image gnoboot is handed.
+- **Why no kernel-side memory rework was needed:** the slide window sits *above* the kernel's fixed
+  0–18 MB boot scratch (page tables `0x1000`, boot stack `0x380000`, syscall + per-proc kstack pools) and
+  the **16 MB PMM ceiling** (`pmm_alloc` only ever touches pages 1024–4095), and *below* the **256 MB
+  per-proc-CR3 identity window** (`proc.cyr` copies PD[0..127]). So the PMM never allocates over the slid
+  image, and every CR3 — UEFI's 4 GB boot map and each per-proc CR3 — maps it. Only the RIP-relative
+  code/data slide; the kernel's absolute scratch constants stay fixed and correct.
+- **`KASLR: kernel_base=<hex>` boot probe** (`core/main.cyr`, after the banner): prints the actual load
+  base gnoboot passed at `boot_info+0x70` (copied CR3-independently by `boot_info_capture_rdi`) — the
+  per-boot slide proof + the base for crash symbolization.
+- **`scripts/kaslr-smoke.sh`** — boots the PIE kernel twice (a 3rd time only on a rare RDRAND tie) and
+  asserts the bases are in-window, 2 MB-aligned, and **distinct** (the slide is live).
+
+### Validated (QEMU; iron rides the 1.47.x burn)
+- `kaslr-smoke` PASS — distinct per-boot bases (observed 0x2C00000 / 0x5200000 / 0x9400000 / 0xD000000).
+- `exec-smoke` 15/15 on a slid kernel (ring-3 exec + path lookups under the per-proc CR3 that maps the
+  slid base); fault-kill (`exit 142` + `SURVIVED`), `dirlk`, and banner all correct at the random base;
+  `check.sh` 11/11.
+- The non-PIE ET_EXEC kernel still loads at fixed `0x100000` (`KASLR: kernel_base=100000`) and boots
+  unchanged.
+
 ## [1.47.3] — 2026-06-27
+
+**Full-binary KASLR foundation (bite 1).**
+
+### Added
+- The AGNOS kernel can be built as a position-independent **ET_DYN** image (`CYRIUS_PIE=1`) and boots
+  correctly at a *fixed* base via gnoboot — proving cyrius's PIE codegen (RIP-relative, relocation-free)
+  is correct on the real kernel. gnoboot loads an ET_DYN kernel (program-header `p_paddr=0`) at the fixed
+  `0x100000` and jumps to `base + e_entry`. The per-boot randomization lands in 1.47.4.
+
+### Changed
+- **Cyrius toolchain pin → 6.2.44** (kernel; gnoboot to match): the PIE / `EMITELF64_KERNEL` ET_DYN
+  codegen path the KASLR work relies on.
 
 ## [1.47.2] — 2026-06-27
 
