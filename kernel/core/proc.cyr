@@ -607,7 +607,7 @@ fn proc_reap(pid) {
     # prerequisite to generalize this for the future multi-threading/SMP arc.)
     var rfd = 3;
     while (rfd < 32) {
-        if (kis_tag(&vfs_table + rfd * 32, VFS_FREE) == 0) { vfs_close(rfd); }
+        if (kis_tag(vfs_fd_table() + rfd * 32, VFS_FREE) == 0) { vfs_close(rfd); }
         rfd = rfd + 1;
     }
     var cr3 = proc_get_cr3(pid);

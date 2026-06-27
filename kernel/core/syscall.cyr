@@ -176,8 +176,8 @@ fn redir_backup_base() { return &pcpu_redir_backup + pcpu_cpu() * 32; }
 # memory, identity-mapped). No-op when nothing is armed (so #37 stays byte-identical by default).
 fn exec_redirect_apply() {
     if (redir_pending_get() == 0) { return 0; }
-    var rsrc = &vfs_table + redir_src_fd_get() * 32;
-    var rdst = &vfs_table + redir_dst_fd_get() * 32;
+    var rsrc = vfs_fd_table() + redir_src_fd_get() * 32;
+    var rdst = vfs_fd_table() + redir_dst_fd_get() * 32;
     var rbk = redir_backup_base();
     var k = 0;
     while (k < 32) {
@@ -190,7 +190,7 @@ fn exec_redirect_apply() {
 # Restore the src fd entry after the child run; clears the one-shot.
 fn exec_redirect_restore() {
     if (redir_pending_get() == 0) { return 0; }
-    var rsrc = &vfs_table + redir_src_fd_get() * 32;
+    var rsrc = vfs_fd_table() + redir_src_fd_get() * 32;
     var k = 0;
     var rbk = redir_backup_base();
     while (k < 32) { store64(rsrc + k, load64(rbk + k)); k = k + 8; }
@@ -744,7 +744,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # over vfs_table[0] (tag VFS_PIPE), so a REDIRECTED stdin must fall through
             # to vfs_read -> pipe_read — the `cmd2` side of `cmd1 | cmd2`. The a4
             # non-blocking cooked-line read is keyboard-only; a piped fd 0 ignores it.
-            if (ktag(&vfs_table) == VFS_DEVICE) {
+            if (ktag(vfs_fd_table()) == VFS_DEVICE) {
                 if (ksyscall_a4_get() != 0) { return kbd_read_nonblock(arg2, arg3); }
                 return kbd_read_blocking(arg2, arg3);
             }
@@ -884,7 +884,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (is_user_range(arg2, 8) == 0) { return 0 - 1; }
         var sfd = vfs_alloc();
         if (sfd < 0) { return 0 - 1; }
-        var sbase = &vfs_table + sfd * 32;
+        var sbase = vfs_fd_table() + sfd * 32;
         ktag_set(sbase, VFS_SIGNALFD);
         kpayload_set(sbase, 2, load64(arg2));   # sigmask
         return sfd;
@@ -894,7 +894,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # epoll_create
         var efd = vfs_alloc();
         if (efd < 0) { return 0 - 1; }
-        var ebase = &vfs_table + efd * 32;
+        var ebase = vfs_fd_table() + efd * 32;
         # 1.41.5: allocate the watch list BEFORE claiming the slot — on OOM the
         # slot stays VFS_FREE (vfs_alloc doesn't mark it) so nothing leaks and we
         # never hand back an epoll fd with a NULL watch list.
@@ -909,7 +909,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # epoll_ctl(epfd=arg1, op=arg2, fd=arg3)
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= 32) { return 0 - 1; }
-        var ebase = &vfs_table + arg1 * 32;
+        var ebase = vfs_fd_table() + arg1 * 32;
         # 1.41.5: the epfd MUST be an epoll instance. Without this a ring-3 caller
         # could pass ANY allocated fd whose payload[2] is a kernel heap pointer
         # (pipe/memfile) or a small integer (an ext2 fd's inode number) — the
@@ -923,7 +923,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg2 == 1) {
             # Max 8 watches (128 bytes / 16 bytes per watch)
             if (wc >= 8) { return 0 - 1; }
-            # 1.41.5: the watched fd is later used as &vfs_table + wfd*32 in
+            # 1.41.5: the watched fd is later used as vfs_fd_table() + wfd*32 in
             # epoll_wait — bound it to a real fd slot so it can't index OOB.
             if (arg3 < 0) { return 0 - 1; }
             if (arg3 >= 32) { return 0 - 1; }
@@ -947,7 +947,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # 1.41.5: validate the events buffer for the bytes actually written (each
         # event record is 12 bytes, up to arg3 of them) — not a single ptr.
         if (is_user_range(arg2, arg3 * 12) == 0) { return 0 - 1; }
-        var ebase = &vfs_table + arg1 * 32;
+        var ebase = vfs_fd_table() + arg1 * 32;
         # 1.41.5: epfd must be a real epoll instance, else wl/wc below are a
         # foreign fd's payload — wl used as a base address gives arbitrary
         # kernel reads and wc (e.g. a file's pos) an attacker-driven loop count.
@@ -963,7 +963,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # real slot (epoll_ctl now bounds it at insert time as well).
             if (wfd >= 0) {
                 if (wfd < 32) {
-                    var wbase = &vfs_table + wfd * 32;
+                    var wbase = vfs_fd_table() + wfd * 32;
                     var wtype = ktag(wbase);
                     if (wtype == VFS_SIGNALFD) {
                         var smask = kpayload(wbase, 2);
@@ -990,7 +990,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # timerfd_create
         var tfd = vfs_alloc();
         if (tfd < 0) { return 0 - 1; }
-        var tbase = &vfs_table + tfd * 32;
+        var tbase = vfs_fd_table() + tfd * 32;
         ktag_set(tbase, VFS_TIMERFD);
         kpayload_set(tbase, 0, 0);              # interval
         kpayload_set(tbase, 1, 0);              # next_fire
@@ -1002,7 +1002,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 < 0) { return 0 - 1; }
         if (arg1 >= 32) { return 0 - 1; }
         if (is_user_range(arg3, 24) == 0) { return 0 - 1; }
-        var tbase = &vfs_table + arg1 * 32;
+        var tbase = vfs_fd_table() + arg1 * 32;
         # 1.41.5: fd must be a timerfd, else kpayload_set below writes into a
         # foreign fd's payload (corrupting a file's pos/inode or a pipe's ptrs).
         if (ktag(tbase) != VFS_TIMERFD) { return 0 - 1; }
@@ -1051,7 +1051,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 >= 32) { stack_canary_check(canary); return 0 - 1; }
         if (arg3 < 1) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg2, arg3) == 0) { stack_canary_check(canary); return 0 - 1; }
-        var gbase = &vfs_table + arg1 * 32;
+        var gbase = vfs_fd_table() + arg1 * 32;
         if (ktag(gbase) != VFS_EXT2_DIR) { stack_canary_check(canary); return 0 - 1; }
         var gn = ext2_getdents(kpayload(gbase, 2), kpayload(gbase, 0), arg2, arg3);
         if (gn >= 0) { kpayload_set(gbase, 0, ext2_gd_next); }
@@ -2013,7 +2013,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 >= 32) { stack_canary_check(canary); return 0 - 1; }
         if (arg3 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg3 > 2) { stack_canary_check(canary); return 0 - 1; }
-        var lk_base = &vfs_table + arg1 * 32;
+        var lk_base = vfs_fd_table() + arg1 * 32;
         if (ktag(lk_base) != VFS_EXT2_FILE) { stack_canary_check(canary); return 0 - 1; }
         var lk_new = arg2;                                          # SEEK_SET (whence 0)
         if (arg3 == 1) { lk_new = kpayload(lk_base, 0) + arg2; }    # SEEK_CUR
@@ -2035,7 +2035,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # a3/a4 unused.
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         if (arg1 >= 32) { stack_canary_check(canary); return 0 - 1; }
-        var fl_base = &vfs_table + arg1 * 32;
+        var fl_base = vfs_fd_table() + arg1 * 32;
         if (ktag(fl_base) != VFS_EXT2_FILE) { stack_canary_check(canary); return 0 - 1; }
         var fl_ino = kpayload(fl_base, 2);
         if (fl_ino == 0) { stack_canary_check(canary); return 0 - 1; }

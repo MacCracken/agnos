@@ -2917,7 +2917,7 @@ fn ext2_open(path, path_len) {
 
     var fd = vfs_alloc();
     if (fd < 0) { return 0 - 1; }
-    var base = &vfs_table + fd * 32;
+    var base = vfs_fd_table() + fd * 32;
     ktag_set(base, VFS_EXT2_FILE);
     kpayload_set(base, 0, 0);          # pos
     kpayload_set(base, 1, fsize);      # size
@@ -2935,7 +2935,7 @@ fn ext2_open_dir(path, path_len) {
     if ((ext2_inode_mode(&ext2_inode_buf) & 0xF000) != 0x4000) { return 0 - 1; }
     var fd = vfs_alloc();
     if (fd < 0) { return 0 - 1; }
-    var base = &vfs_table + fd * 32;
+    var base = vfs_fd_table() + fd * 32;
     ktag_set(base, VFS_EXT2_DIR);
     kpayload_set(base, 0, 0);          # read offset (bytes into the dir)
     kpayload_set(base, 1, 0);          # unused

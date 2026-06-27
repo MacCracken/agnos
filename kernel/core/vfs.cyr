@@ -88,7 +88,7 @@ fn vfs_sec_wfile_open(be, name, namelen) {
     store64(blk, namelen);
     var i = 0;
     while (i < namelen) { store8(blk + 8 + i, load8(name + i)); i = i + 1; }
-    var base = &vfs_table + sfd * 32;
+    var base = vfs_fd_table() + sfd * 32;
     ktag_set(base, VFS_SEC_WFILE);
     kpayload_set(base, 0, 0);                # content pos
     kpayload_set(base, 1, be);               # backend
@@ -132,6 +132,15 @@ fn vfs_sec_wfile_flush(base) {
 
 var vfs_table[1024];  # 32 entries x 32 bytes each
 
+# 1.47.x per-process fd tables (bite 2, sub-bite 2a — the seam). ALL fd-table access goes
+# through this accessor instead of `&vfs_table` directly. Today it returns the single global
+# table (byte-behavior-identical to the prior `&vfs_table`); sub-bite 2b changes it to return
+# a PER-PROCESS table (a parallel proc_fd_base[16], like proc_rsp0[16]) so concurrent procs +
+# pipe redirects no longer race one global table (SMP-safe / streaming / N-stage pipes). The
+# seam is mix-compatible — `&vfs_table` and `vfs_fd_table()` alias the same memory in 2a — so
+# the ~30 call sites migrate + validate independently of the per-proc behavior change.
+fn vfs_fd_table() { return &vfs_table; }
+
 # Whole-file staging buffer (1.40.1 exec-from-disk). Module-global so it is
 # N×u64 = 8192 bytes — kmalloc/pmm_alloc both cap at one 4 KB page, so a
 # staging area larger than that must be a reserved region, not an allocator
@@ -140,24 +149,24 @@ var vfs_table[1024];  # 32 entries x 32 bytes each
 var vfs_scratch_buf[1024];
 
 fn vfs_init() {
-    memset(&vfs_table, 0, 1024);  # 32 entries x 32 bytes
+    memset(vfs_fd_table(), 0, 1024);  # 32 entries x 32 bytes
     # FD 0 = stdin, FD 1 = stdout, FD 2 = stderr — all the serial/console device
     # (device index 0). Pre-1.40.3 only fd 0 was set, so a user program's
     # write(1, …) (stdout) went nowhere; wiring fd 1/2 here makes ring-3 stdout
     # reach the console (exec-from-disk). vfs_alloc starts at fd 3, leaving these
     # three reserved.
-    ktag_set(&vfs_table, VFS_DEVICE);
-    kpayload_set(&vfs_table, 2, 0);
-    ktag_set(&vfs_table + 32, VFS_DEVICE);
-    kpayload_set(&vfs_table + 32, 2, 0);
-    ktag_set(&vfs_table + 64, VFS_DEVICE);
-    kpayload_set(&vfs_table + 64, 2, 0);
+    ktag_set(vfs_fd_table(), VFS_DEVICE);
+    kpayload_set(vfs_fd_table(), 2, 0);
+    ktag_set(vfs_fd_table() + 32, VFS_DEVICE);
+    kpayload_set(vfs_fd_table() + 32, 2, 0);
+    ktag_set(vfs_fd_table() + 64, VFS_DEVICE);
+    kpayload_set(vfs_fd_table() + 64, 2, 0);
     return 0;
 }
 
 fn vfs_alloc() {
     for (var i = 1; i < 32; i = i + 1) {
-        if (kis_tag(&vfs_table + i * 32, VFS_FREE) == 1) { return i; }
+        if (kis_tag(vfs_fd_table() + i * 32, VFS_FREE) == 1) { return i; }
     }
     return 0 - 1;
 }
@@ -165,7 +174,7 @@ fn vfs_alloc() {
 fn vfs_create_memfile(data, size) {
     var idx = vfs_alloc();
     if (idx < 0) { return 0 - 1; }
-    var base = &vfs_table + idx * 32;
+    var base = vfs_fd_table() + idx * 32;
     ktag_set(base, VFS_MEMFILE);
     kpayload_set(base, 0, 0);       # pos
     kpayload_set(base, 1, size);
@@ -723,7 +732,7 @@ fn vfs_read(fd_idx, buf, count) {
     if (fd_idx >= 32) { return 0 - 1; }
     if (buf == 0) { return 0 - 1; }
     if (count < 0) { return 0 - 1; }
-    var base = &vfs_table + fd_idx * 32;
+    var base = vfs_fd_table() + fd_idx * 32;
     var ftype = ktag(base);
     if (ftype == VFS_FREE) { return 0 - 1; }
     if (ftype == VFS_DEVICE) {
@@ -779,7 +788,7 @@ fn vfs_write(fd_idx, buf, count) {
     if (fd_idx >= 32) { return 0 - 1; }
     if (buf == 0) { return 0 - 1; }
     if (count < 0) { return 0 - 1; }
-    var base = &vfs_table + fd_idx * 32;
+    var base = vfs_fd_table() + fd_idx * 32;
     var ftype = ktag(base);
     if (ftype == VFS_DEVICE) {
         return dev_write(kpayload(base, 2), buf, count);
@@ -830,7 +839,7 @@ fn vfs_create_pipe(fds_ptr) {
     # Allocate read end fd
     var rfd = vfs_alloc();
     if (rfd < 0) { kfree_sized(pipe_buf, 4096); return 0 - 1; }
-    var rbase = &vfs_table + rfd * 32;
+    var rbase = vfs_fd_table() + rfd * 32;
     ktag_set(rbase, VFS_PIPE);
     kpayload_set(rbase, 0, 0);       # read tail
     kpayload_set(rbase, 1, 0);       # is_write_end = 0
@@ -838,7 +847,7 @@ fn vfs_create_pipe(fds_ptr) {
     # Allocate write end fd
     var wfd = vfs_alloc();
     if (wfd < 0) { vfs_close(rfd); kfree_sized(pipe_buf, 4096); return 0 - 1; }
-    var wbase = &vfs_table + wfd * 32;
+    var wbase = vfs_fd_table() + wfd * 32;
     ktag_set(wbase, VFS_PIPE);
     kpayload_set(wbase, 0, 0);
     kpayload_set(wbase, 1, 1);       # is_write_end = 1
@@ -942,7 +951,7 @@ fn vfs_close(fd_idx) {
 fn vfs_close_inner(fd_idx) {
     if (fd_idx < 0) { return 0 - 1; }
     if (fd_idx >= 32) { return 0 - 1; }
-    var base = &vfs_table + fd_idx * 32;
+    var base = vfs_fd_table() + fd_idx * 32;
     # flock#59: release any advisory lock the calling proc holds on this fd's inode.
     if (ktag(base) == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), proc_current_get()); }
     # 1.41.7: a FAT/exFAT write-back fd flushes its buffered content (whole-file

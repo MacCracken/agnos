@@ -150,7 +150,7 @@ fn test_vfs() {
     serial_println("[vfs]", 5);
 
     # FD 0 is pre-allocated (serial device)
-    var fd0_type = load64(&vfs_table);
+    var fd0_type = load64(vfs_fd_table());
     test_assert_eq(fd0_type, 1, "fd 0 is device type", 19);
 
     # Create memfile and read back
@@ -167,7 +167,7 @@ fn test_vfs() {
 
     # Close and verify type cleared
     vfs_close(fd);
-    var closed_type = load64(&vfs_table + fd * 32);
+    var closed_type = load64(vfs_fd_table() + fd * 32);
     test_assert_eq(closed_type, 0, "close clears fd type", 20);
 
     # Read on closed fd returns -1
