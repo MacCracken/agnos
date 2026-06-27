@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.46.10] — 2026-06-26
+
 ### Changed
 - **Raised the exec argv cap 8 → 16 tokens (`kernel/core/elf.cyr`).** `elf_load_from_file` builds the SysV init stack from the command tail and broke the tokenize loop at `argc >= 8`, so `<tool> a b c d e f g h …` silently dropped every token past the 8th — e.g. `anuenue something longer to test the length of project` (9 tokens) lost the last word ("cuts off after a few words"). agnos has no working shell pipes yet (an agnoshi follow-up), so positional argv is the only way to pass text to a tool, and 8 was too low for a sentence. The argv pointer array (`0x3008..0x3100`) plus the 2-entry envp hold ~27 ptr slots, so 16 is safe headroom; the existing `str_o < 0x4000` string-region cap still bounds total command length. Validated: `check.sh` 11/11, `agnsh-delegation` PASS, `exec-smoke` (EXEC_SELFTEST) PASS; `build/agnos` byte-size-identical (1-byte immediate). Surfaced by the anuenue rainbow "cuts off after a few words" report.
 
