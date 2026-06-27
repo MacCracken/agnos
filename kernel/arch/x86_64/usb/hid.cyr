@@ -54,8 +54,14 @@ fn hid_kbd_init() {
 # (kernel/arch/x86_64/keyboard.cyr:3) implements for the PS/2 ISR path —
 # producer changes (HID), consumer (scancode_to_ascii) doesn't.
 fn hid_kb_push(scancode) {
+    # input_lock (keyboard.cyr): serialize the kb_head RMW vs the kb_isr IRQ1 producer
+    # (same-CPU, excluded by cli-first) and a foreign-CPU accessor (cross-CPU spinlock).
+    var f = kbd_irq_save();
+    input_spin_lock();
     store8(&kb_buf + kb_head, scancode & 0xFF);
     kb_head = (kb_head + 1) & 0xFF;
+    input_spin_unlock();
+    kbd_irq_restore(f);
     return 0;
 }
 

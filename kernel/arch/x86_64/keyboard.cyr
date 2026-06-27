@@ -1,5 +1,70 @@
 # === Keyboard ===
 
+# === input_lock — kb_buf SMP/ISR serialization (1.46.x SMP arc, sub-bite 5) ===
+# kb_buf is an SPSC-ish ring with MULTIPLE producers advancing kb_head — kb_isr
+# (the IRQ1 PS/2 ISR, hand-asm below) AND hid_kb_push (the xHCI USB path, hid.cyr)
+# — plus one consumer advancing kb_tail (kb_read_scancode). The `(idx+1)&0xFF`
+# index update is a non-atomic load-modify-store, so a producer interleaving another
+# producer/consumer (an IRQ1 mid-RMW same-CPU, or a foreign CPU once APs run real
+# procs at STEP-2) loses or corrupts a keystroke. input_lock serializes the kb_buf
+# critical sections: **cli FIRST** (mask the same-CPU IRQ1 producer so a plain
+# spinlock can never self-deadlock against kb_isr) **THEN the xchg spinlock** (the
+# cross-CPU guard). Structured byte-identically to pmm_spin_lock — NO parameter, so
+# the hardcoded [rbp-N] frame offsets are exact (a parameterized spin_lock_at spills
+# the param and shifts them — the SMP review's confirmed-broken finding).
+#
+# kb_isr itself is LEFT UNMODIFIED: it runs at IF=0 (ISR), so any C-path holding
+# input_lock with cli excludes it on the same CPU, and IRQ1 is PIC/IOAPIC-routed to
+# the BSP while the kb_buf consumers (agnsh read loop) run BSP-pinned (foreground,
+# via idle_owner) — so kb_isr never contends cross-CPU under the current single-IRQ1
+# routing. (If IRQ1 is ever redirected to an AP, kb_isr must take input_lock too —
+# that means emitting the xchg inline in its hand-asm stub.) The kb_has_key compare
+# stays unlocked: a single consumer owns kb_tail, producers only grow kb_head, so a
+# stale read is benign (the key is seen on the next poll).
+var input_lock = 0;
+fn input_spin_lock() {
+    var old = 1;
+    while (old == 1) {
+        var addr = &input_lock;
+        asm {
+            0x48; 0x8B; 0x45; 0xF0;      # mov rax, [rbp-0x10] (addr)
+            0x48; 0xC7; 0xC1; 0x01; 0x00; 0x00; 0x00;  # mov rcx, 1
+            0x48; 0x87; 0x08;              # xchg [rax], rcx
+            0x48; 0x89; 0x4D; 0xF8;       # mov [rbp-0x08], rcx (old)
+        }
+    }
+    return 0;
+}
+fn input_spin_unlock() {
+    var addr = &input_lock;
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;      # mov rax, [rbp-0x08] (addr)
+        0x48; 0x31; 0xC9;              # xor rcx, rcx
+        0x48; 0x87; 0x08;              # xchg [rax], rcx
+    }
+    return 0;
+}
+# IRQ-save/restore (sole-local frame shape, like pmm_spin_unlock's addr). kbd_irq_save
+# captures RFLAGS THEN cli's; kbd_irq_restore re-enables ONLY if IF (bit 9) was set —
+# so an input_lock critical section is correct even from a future IF=0 caller (e.g.
+# hid_poll serviced from the timer ISR), not just the current IF=1 read-loop callers.
+fn kbd_irq_save() {
+    var f = 0;
+    asm {
+        0x9C;                          # pushfq
+        0x58;                          # pop rax
+        0x48; 0x89; 0x45; 0xF8;        # mov [rbp-0x08], rax  (f = RFLAGS)
+        0xFA;                          # cli
+    }
+    return f;
+}
+fn kbd_irq_restore(f) {
+    if ((f & 0x200) != 0) {
+        asm { 0xFB; }                  # sti (IF was set on entry)
+    }
+    return 0;
+}
+
 fn kb_isr_build() {
     # Keyboard ISR: save regs, read scancode, store in ring buf, EOI, restore, iretq
     var p = &kb_isr;
@@ -72,8 +137,14 @@ fn kb_has_key() {
 }
 
 fn kb_read_scancode() {
+    # input_lock: serialize the kb_tail RMW vs a producer (kb_isr/hid_kb_push) on
+    # another CPU; cli-first excludes the same-CPU IRQ1 producer (see input_lock hdr).
+    var f = kbd_irq_save();
+    input_spin_lock();
     var sc = load8(&kb_buf + kb_tail);
     kb_tail = (kb_tail + 1) & 0xFF;
+    input_spin_unlock();
+    kbd_irq_restore(f);
     return sc;
 }
 
