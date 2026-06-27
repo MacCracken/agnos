@@ -76,6 +76,16 @@ fn idt_init() {
 # Installing ALL 32 halts normal boot because a benign vector (e.g. #NM/7 from
 # SSE use, or a reserved/NMI slot) legitimately fires early; this curated set
 # never does. Timer (32) + keyboard (33) gates are installed later in main.
+
+# 1.47.x proc-teardown-on-fault: indirect hook to syscall.cyr's fault_kill_current.
+# idt.cyr is included (agnos.cyr:14) long BEFORE syscall.cyr (:107), so a direct
+# `&fault_kill_current` here can't resolve — Cyrius resolves symbol-ADDRESS refs in parse
+# order (forward CALLS resolve globally, address-of does NOT). So the stub calls INDIRECTLY
+# through this fn-pointer global, which core/main.cyr (parsed last) points at
+# fault_kill_current during boot init. 0 until set → the CPL3 branch is inert pre-init
+# (no ring-3 proc runs that early anyway).
+var exc_ring3_kill_fn = 0;
+
 fn exc_handlers_init() {
     var base = &exc_stub;
     var nvec = 7;
@@ -433,6 +443,54 @@ fn exc_handlers_init() {
             store8(stub + 392, 0x8A); store8(stub + 393, 0x40); store8(stub + 394, 0x1D);  # mov al,[rax+0x1D]  (GDT[3] access byte)
             store8(stub + 395, 0xE6); store8(stub + 396, 0x71);  # out 0x71,al
             tail = 397;
+        }
+        # 1.47.x proc-teardown-on-fault: for the ring-3-recoverable vectors (#UD 6, #GP 13,
+        # #PF 14), gate the canary+halt on PRIVILEGE — a CPL3 (ring-3) fault routes to
+        # fault_kill_current (kill the proc + return to the agnsh prompt) instead of halting
+        # the box; a CPL0 (kernel) fault falls through to the canary+halt below, UNCHANGED.
+        # The saved-frame CS sits at [rsp+16] for the errcode-pushing vectors (#GP/#PF) and
+        # [rsp+8] for #UD (no errcode) — same frame invariant the diagnostic blocks above use
+        # (this stub does no push/pop). On CPL3 we 16-align rsp (the exception frame is
+        # abandoned — fault_kill_current either kernel_resume()s away or returns to halt) and
+        # `call &fault_kill_current` (the &fn-from-hand-asm pattern, cf. main.cyr &timer_isr).
+        # If it RETURNS (a bg-job fault, not the foreground child), control falls through to
+        # the canary+halt — bg-proc fault teardown is a follow-on. Emitted at the current
+        # `tail`, then `tail += 34` so the canary block + `off` below shift past it unchanged.
+        if (v == 6 || v == 13 || v == 14) {
+            var csoff = 16;                 # #GP/#PF push an errcode → saved CS at [rsp+16]
+            if (v == 6) { csoff = 8; }      # #UD: no errcode → saved CS at [rsp+8]
+            var fk = &exc_ring3_kill_fn;    # indirect hook (resolved in core/main.cyr; see above)
+            # mov rax,[rsp+csoff]           48 8B 44 24 <csoff>
+            store8(stub + tail + 0, 0x48); store8(stub + tail + 1, 0x8B);
+            store8(stub + tail + 2, 0x44); store8(stub + tail + 3, 0x24); store8(stub + tail + 4, csoff);
+            # and eax,3                     83 E0 03
+            store8(stub + tail + 5, 0x83); store8(stub + tail + 6, 0xE0); store8(stub + tail + 7, 0x03);
+            # cmp eax,3                     83 F8 03
+            store8(stub + tail + 8, 0x83); store8(stub + tail + 9, 0xF8); store8(stub + tail + 10, 0x03);
+            # jne +24 → fall through to the canary (CPL0: not ring 3)   75 18
+            store8(stub + tail + 11, 0x75); store8(stub + tail + 12, 0x18);
+            # and rsp,~15  (16-align; the exception frame is abandoned)  48 83 E4 F0
+            store8(stub + tail + 13, 0x48); store8(stub + tail + 14, 0x83);
+            store8(stub + tail + 15, 0xE4); store8(stub + tail + 16, 0xF0);
+            # mov edi, vector  (arg1)       BF <imm32 LE>
+            store8(stub + tail + 17, 0xBF);
+            store8(stub + tail + 18, v & 0xFF); store8(stub + tail + 19, 0x00);
+            store8(stub + tail + 20, 0x00); store8(stub + tail + 21, 0x00);
+            # mov rax, imm64(&exc_ring3_kill_fn)    48 B8 <addr64 LE>
+            store8(stub + tail + 22, 0x48); store8(stub + tail + 23, 0xB8);
+            store8(stub + tail + 24, fk & 0xFF);
+            store8(stub + tail + 25, (fk >> 8) & 0xFF);
+            store8(stub + tail + 26, (fk >> 16) & 0xFF);
+            store8(stub + tail + 27, (fk >> 24) & 0xFF);
+            store8(stub + tail + 28, (fk >> 32) & 0xFF);
+            store8(stub + tail + 29, (fk >> 40) & 0xFF);
+            store8(stub + tail + 30, (fk >> 48) & 0xFF);
+            store8(stub + tail + 31, (fk >> 56) & 0xFF);
+            # mov rax,[rax]  (deref the hook → fault_kill_current)   48 8B 00
+            store8(stub + tail + 32, 0x48); store8(stub + tail + 33, 0x8B); store8(stub + tail + 34, 0x00);
+            # call rax                      FF D0
+            store8(stub + tail + 35, 0xFF); store8(stub + tail + 36, 0xD0);
+            tail = tail + 37;
         }
         # 1.45.16 fault canary — paint a wide FB bar before halting so a CAUGHT CPU
         # exception is visible ON THE FRAMEBUFFER (photo-readable), not only in CMOS

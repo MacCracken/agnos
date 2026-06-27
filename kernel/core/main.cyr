@@ -66,6 +66,11 @@ idt_init();
 # that stamp the faulting vector to CMOS[0x54] + halt — so a CPU exception
 # during the ring-3 exec transition stops triple-faulting into a silent reset
 # and instead leaves a readable cause. See exc_handlers_init in idt.cyr.
+# 1.47.x proc-teardown-on-fault: point idt.cyr's indirect hook at the teardown handler
+# (fault_kill_current in syscall.cyr) BEFORE the exception stubs go live, so a ring-3
+# (CPL3) #PF/#GP/#UD kills the proc + returns to the agnsh prompt instead of halting the
+# box. main.cyr is parsed last (agnos.cyr:117), so &fault_kill_current resolves here.
+exc_ring3_kill_fn = &fault_kill_current;
 exc_handlers_init();
 kprintln("IDT loaded", 10);
 
@@ -1722,6 +1727,56 @@ fn exec_disk_selftest() {
     return 0;
 }
 exec_disk_selftest();
+#endif
+
+#ifdef FAULT_SELFTEST
+# 1.47.x — proc-teardown-on-fault self-test (compile-gated, FAULT_SELFTEST=1). Builds a
+# minimal static ELF64 whose entry READS an unmapped 5 GB address (movabs rdi,0x140000000;
+# mov rax,[rdi]) → a RING-3 (CPL3) #PF. The idt.cyr #PF stub's CPL3 gate must route it to
+# fault_kill_current (kill the proc + kernel_resume back here) INSTEAD of painting the blue
+# canary bar + halting. PASS = the box SURVIVES: "run: exit 142" (128+14 = the #PF kill code)
+# prints, AND "fault: SURVIVED back in kernel" prints after — i.e. exec_and_wait resumed the
+# kernel after a ring-3 fault. FAIL = a blue canary bar + halt (no "fault: SURVIVED").
+# Gated by scripts/fault-kill-smoke.sh. Mirrors exec_disk_selftest's ELF-build shape.
+fn fault_disk_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    var eb = &vfs_scratch_buf;
+    var ez = 0;
+    while (ez < 256) { store8(eb + ez, 0); ez = ez + 1; }
+    # ELF64 header (ET_EXEC, x86-64, 1 PT_LOAD @ 0x400000, entry 0x400078)
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 160); store8(eb + 104, 160);                  # p_filesz/memsz = 160
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120: movabs rdi,0x140000000 ; mov rax,[rdi] (RING-3 #PF) ; (unreached) exit(87)
+    var c = 120;
+    store8(eb+c,0x48); store8(eb+c+1,0xBF);
+    store8(eb+c+2,0x00); store8(eb+c+3,0x00); store8(eb+c+4,0x00); store8(eb+c+5,0x40);
+    store8(eb+c+6,0x01); store8(eb+c+7,0x00); store8(eb+c+8,0x00); store8(eb+c+9,0x00); c=c+10;  # movabs rdi,0x140000000
+    store8(eb+c,0x48); store8(eb+c+1,0x8B); store8(eb+c+2,0x07); c=c+3;                          # mov rax,[rdi] -> #PF
+    store8(eb+c,0x48); store8(eb+c+1,0xC7); store8(eb+c+2,0xC0); store8(eb+c+3,0x00); c=c+7;     # mov rax,0  (exit)
+    store8(eb+c,0x48); store8(eb+c+1,0xC7); store8(eb+c+2,0xC7); store8(eb+c+3,0x57); c=c+7;     # mov rdi,87 (fallback)
+    store8(eb+c,0x0F); store8(eb+c+1,0x05);                                                      # syscall
+    # write /bin/faulter
+    ext2_mkdir(2, "bin", 3);
+    var bino = ext2_path_lookup("/bin", 4);
+    var fino = 0;
+    if (bino > 0) { fino = ext2_create(bino, "faulter", 7); }
+    if (fino > 0) { ext2_write_at(fino, 0, eb, 160); ext2_sync(); }
+    kprintln("fault: running /bin/faulter", 27);
+    sh_exec("run /bin/faulter", 16);
+    # If the box SURVIVED the ring-3 fault, control reaches here (exec_and_wait resumed via
+    # fault_kill_current -> kernel_resume). A canary-bar HALT never prints this line.
+    kprintln("fault: SURVIVED back in kernel", 30);
+    return 0;
+}
+fault_disk_selftest();
 #endif
 
 #ifdef DOOM_SELFTEST

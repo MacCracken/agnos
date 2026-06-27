@@ -335,6 +335,53 @@ fn kernel_resume() {
     return 0;
 }
 
+# === proc-teardown-on-fault (1.47.x fault-resilience arc) ===
+# A RING-3 (CPL3) CPU exception (#PF/#GP/#UD) is routed here by the idt.cyr exception
+# stub, which calls this ONLY when the saved-frame CS has RPL==3 (a ring-3 fault), instead
+# of painting the 1.45.16 fault-canary bar and halting the box. We mirror exit#0's teardown
+# for the FAULTING proc, then — when it is the foreground exec_and_wait child (the common
+# case: agnsh exec'd a tool that segfaulted, e.g. the cyrius-doom OOB #PF) — kernel_resume()
+# back into agnsh EXACTLY as a clean exit would (restores boot CR3 + the saved continuation;
+# DOES NOT RETURN). A userland segfault must not take the whole system down.
+#
+# Scope (first bite): the foreground child case. A CPL3 fault in a `&` BACKGROUND job
+# (proc_current != exec_resume_pid) returns to the stub, which halts — bg-proc fault teardown
+# needs a scheduler-yield-from-fault path (follow-on, same arc). A KERNEL (CPL0) fault never
+# reaches here (the stub gates on RPL==3), so a real kernel bug still halts loudly behind the
+# canary bar — the CPL0 path is deliberately untouched.
+#
+# Runs on the faulting proc's OWN per-proc RSP0 kstack (1.46.x region-7) with the proc's CR3
+# still loaded — identical to exit#0, which also runs its teardown on the child's CR3 before
+# kernel_resume switches to boot CR3. The IDT interrupt gate cleared IF on entry, so the
+# teardown is uninterruptible (no preemption mid-teardown), matching exit#0's IF=0 handler.
+#
+# Exit code = 128 + vector (POSIX-ish): a fault-killed proc is distinguishable from a small
+# clean exit code. agnsh surfaces it via its normal "run: exit N" path; a dedicated
+# "killed (#PF)" message is a userland (agnoshi) follow-on (kprint here is unsafe — the FB
+# may be unmapped under the faulting proc's CR3, per the idt.cyr canary-paint #DF note).
+fn fault_kill_current(vector) {
+    var pid = proc_current_get();
+    var code = 128 + vector;
+    sys_exit_code = code;
+    proc_set_exit_code(pid, code);
+    flock_release_pid(pid);                       # release advisory locks (mirror exit#0)
+    if (pid < proc_count) {
+        proc_set_state(pid, 0);                   # mark dead — sched_next won't pick it
+        var ppid = proc_get_ppid(pid);
+        if (ppid >= 0) { proc_send_signal(ppid, 17); }   # SIGCHLD to parent
+    }
+    # Foreground exec child → resume agnsh's exec_and_wait as a clean exit would.
+    # kernel_resume restores boot CR3 + the saved continuation and NEVER returns.
+    if (kernel_return_rsp_get() != 0) {
+        if (pid == exec_resume_pid_get()) {
+            kernel_resume();
+        }
+    }
+    # bg job or no armed resume: return to the stub (which halts). Follow-on: yield to the
+    # scheduler here instead of halting.
+    return 0;
+}
+
 # === Blocking keyboard stdin (1.41.1 — shell-separation arc; line discipline 1.41.15) ===
 # read(fd=0) for a ring-3 process: block, read a WHOLE LINE in ONE continuous
 # interrupts-enabled window, echo as we go, return when Enter (newline) is seen
