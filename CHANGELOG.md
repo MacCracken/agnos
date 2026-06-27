@@ -5,7 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-_SMP STEP-2 (`smp_sched_aps=1`, real procs scheduled onto the woken APs) is next — it rides the same SYSRET fix this release confirmed (an AP resumes a ring-3 proc via the identical cross-CR3 CPL0→CPL3 timer-ISR `iretq`). Lands its own cut after its iron burn passes._
+_SMP STEP-2 hardening, part 2 → **1.46.7**: per-CPU `exec_and_wait`/#37 resume+staging context (`exec_ctx`/`exec_resume_pid`/`kernel_return_*`/the `ew37_*` block/`spawn_elf_buf`/staging), the rare proc-creation/mid-load readiness window, and net-stack cross-CPU locking (`net_rx_drain`/rings/`tcp_conns`). STEP-2 is **not burn-ready until 1.46.7 lands and `-smp 4 -d int` is clean** — `smp_sched_aps=0` reverts to STEP-1 at any time._
+
+## [1.46.6] — 2026-06-26
+
+**★ 1.46.6 — SMP STEP-2 part 1: the flip + dominant double-run hardening (clean `-smp 4` boot).**
+Flips `smp_sched_aps=1` so woken APs pull real ring-3 procs from `sched_next` — and fixes the bugs the
+flip exposes. The flip is **not** a one-liner: a 6-lens adversarial review (16 agents) + a QEMU
+`-smp 4 -d int` repro (single-core = 0 exceptions; `-smp 4` reproduced torn frames + `#UD`/`#DF`)
+surfaced **5 concurrency bugs**. This cut lands the always-reachable ones — the dominant *double-run*
+class that broke the boot, plus per-CPU `ksyscall_a4` — and reaches a **deterministic clean boot to the
+`[ASSIST] >` prompt under `-smp 4` (3/3 runs, 0 exceptions)**, matching single-core. The remaining two
+(per-CPU exec-resume context, net cross-CPU locking) + the rare mid-load window land at **1.46.7**;
+**do not burn until then.** `smp_sched_aps=0` is the kill-switch (full revert to the STEP-1 MVP).
+
+### Fixed
+- **The double-run class: out-of-band, BSP-bound, preemptible procs ran *unpinned* → a woken AP stole them (`kernel/core/main.cyr`, `kernel/arch/x86_64/ring3.cyr`, `kernel/core/proc.cyr`).** A proc entered via `enter_ring3` (not `do_context_switch`) runs at `state==1`/`on_cpu==-1`; under `smp_sched_aps=1` an AP's `sched_next` saw it as a ready unowned proc and ran it concurrently on the same CR3/stack — the QEMU `-smp 4` faults (torn ring-3 frame `IP=SP=0x1caa49`; an AP stealing `kybernet` → `kputc` overran the framebuffer → `#PF`/`#DF`; `kmain` re-run → `#UD` at `0x1000`). **Fix:** pin every out-of-band BSP-bound proc to its launch CPU via `idle_owner` (the per-proc CPU-pin `sched_idx_pickable` already honors — idles were its first users): the **BSP idle** and **proc 0/kmain** at boot (`main.cyr`, after `proc_on_cpu_init` which zeroes `idle_owner`), and every **foreground (`exec_and_wait`) proc** to its launch CPU (`ring3.cyr`, before `enter_ring3`). `proc_alloc_slot` now resets `idle_owner` on slot reuse so a recycled slot starts unpinned (`proc.cyr`). Foreground procs carry a launch-CPU-bound kernel resume context (`exec_ctx`), so pinning is also *correctness* — they must never migrate. Inert single-core (`sched_idx_pickable`'s `io==pcpu_cpu()` branch keeps the BSP picking its own pinned procs); validated by 3/3 clean `-smp 4 -d int` boots.
+- **Per-CPU `ksyscall_a4` — concurrent 4-arg-syscall race (`kernel/arch/x86_64/syscall_hw.cyr`, `kernel/core/syscall.cyr`, `kernel/core/main.cyr`).** The single global 4th-syscall-arg scratch (set at `syscall_handler` entry, read deep in `ksyscall` by rename/link/blit/execwait/spawn/usercopy/kbd) would be clobbered between set and read by a second CPU's syscall → e.g. `rename` with the wrong `newlen` → FS corruption. Converted to `pcpu_ksyscall_a4[4]` + `ksyscall_a4_get`/`_set` folding `pcpu_cpu()*8`, mirroring `pcpu_sc_entry_regs`/`sc_scr_base`; `pcpu_cpu()`'s `cpu_count<2` fast path keeps it byte-identical single-core.
+
+### Changed
+- **`smp_sched_aps=1` (`kernel/arch/x86_64/smp.cyr`) — woken APs now schedule real ring-3 procs** (SMP sub-bite-7 STEP-2). Rides the 1.46.5 SYSRET fix (`ap_entry` runs `syscall_msr_init` so each AP bakes `STAR=0x13`). Kill-switch: revert to `0` for STEP-1 (wake + AP-idle-only).
 
 ## [1.46.5] — 2026-06-26
 
