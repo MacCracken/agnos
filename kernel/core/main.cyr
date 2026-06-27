@@ -1779,6 +1779,29 @@ fn fault_disk_selftest() {
 fault_disk_selftest();
 #endif
 
+#ifdef PIPE_RC_SELFTEST
+# 1.47.x — pipe buffer refcount self-test (bite 2, sub-bite 2c). Proves the OWNER's LAST close
+# frees the shared 4 KB pipe buffer (the leak fix) — NOT the first close — and that a double
+# close is a safe no-op (no double-free / no crash). Uses heap_frees (bumped by kfree_sized) as
+# the free witness. PASS = "piperc: buffer FREED OK" + "piperc: double-close safe".
+fn pipe_rc_selftest() {
+    var fds[16];                                  # rfd@[0], wfd@[8]
+    var f0 = heap_frees;
+    if (vfs_create_pipe(&fds) != 0) { kprintln("piperc: create FAIL", 19); return 0; }
+    var rfd = load64(&fds);
+    var wfd = load64(&fds + 8);
+    vfs_close(rfd);                               # owner close 1 of 2 — buffer NOT yet freed
+    if (heap_frees != f0) { kprintln("piperc: freed too EARLY", 23); return 0; }
+    vfs_close(wfd);                               # owner close 2 of 2 — buffer freed here
+    if (heap_frees > f0) { kprintln("piperc: buffer FREED OK", 23); }
+    else { kprintln("piperc: LEAK not freed", 22); return 0; }
+    vfs_close(rfd);                               # double close — must be a safe no-op
+    kprintln("piperc: double-close safe", 25);
+    return 0;
+}
+pipe_rc_selftest();
+#endif
+
 #ifdef DOOM_SELFTEST
 # 1.43.x — cyrius-doom render bring-up (the first real userland APP). /bin/doom
 # + /DOOM1.WAD are seeded onto the ext2 root by scripts/doom-smoke.sh; run the

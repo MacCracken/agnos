@@ -188,6 +188,10 @@ fn proc_destroy_fd_table(pid, do_flush) {
             if (kis_tag(base, VFS_FREE) == 0) {
                 if (ktag(base) == VFS_EXT2_FILE) { flock_release_inode(kpayload(base, 2), pid); }
                 if (ktag(base) == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
+                if (ktag(base) == VFS_PIPE) {     # 2c: free the OWNER's pipe buffer if still open at exit
+                    var pb2 = kpayload(base, 2);
+                    if (pipe_rc_release(pb2, pid) == 1) { kfree_sized(pb2, 4096); }
+                }
             }
             fd = fd + 1;
         }
@@ -887,6 +891,55 @@ fn vfs_write(fd_idx, buf, count) {
     return 0 - 1;
 }
 
+# 1.47.x pipe buffer refcount (bite 2, sub-bite 2c) — frees the shared 4 KB pipe buffer (kills
+# the prior leak: vfs_close had no VFS_PIPE arm, so every pipeline leaked one kmalloc'd 4 KB
+# buffer). With per-proc fd tables (2b) a child inherits transient COPIES of the pipe ends and
+# the execwait#37 redirect DUPLICATES one over fd0/1, so a naive per-entry count would mis-count.
+# Instead each buffer is OWNED by its creator (the proc that called pipe()#25): only the OWNER's
+# two closes (rfd + wfd) decrement, and the buffer is freed at 0. A child closing an inherited
+# copy (proc_current != owner) is IGNORED — that copy just vanishes when its table is freed, and
+# children always finish + are reaped BEFORE the creator closes (store-and-forward), so there is
+# never a dangling reference. 8 concurrent pipes tracked; an untracked buffer (table full)
+# degrades to the old leak, never a crash or double-free.
+var pipe_rc_buf[8];     # tracked buffer ptr (0 = free slot)
+var pipe_rc_owner[8];   # creating proc's pid
+var pipe_rc_cnt[8];     # OWNER ends still open (starts at 2 = rfd + wfd)
+fn pipe_rc_register(buf, owner) {
+    var i = 0;
+    while (i < 8) {
+        if (load64(&pipe_rc_buf + i * 8) == 0) {
+            store64(&pipe_rc_buf + i * 8, buf);
+            store64(&pipe_rc_owner + i * 8, owner);
+            store64(&pipe_rc_cnt + i * 8, 2);
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;   # table full → untracked (degrades to leak, never a crash)
+}
+# Decrement buf's count IF pid is its owner; return 1 when it hits 0 (the caller kfree's the
+# buffer), else 0. A non-owner close (an inherited child copy) OR an untracked/already-freed
+# buffer returns 0 — so a child copy and a double close never double-free.
+fn pipe_rc_release(buf, pid) {
+    var i = 0;
+    while (i < 8) {
+        if (load64(&pipe_rc_buf + i * 8) == buf) {
+            if (load64(&pipe_rc_owner + i * 8) != pid) { return 0; }   # not the owner → ignore
+            var c = load64(&pipe_rc_cnt + i * 8) - 1;
+            if (c <= 0) {
+                store64(&pipe_rc_buf + i * 8, 0);
+                store64(&pipe_rc_owner + i * 8, 0);
+                store64(&pipe_rc_cnt + i * 8, 0);
+                return 1;
+            }
+            store64(&pipe_rc_cnt + i * 8, c);
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn vfs_create_pipe(fds_ptr) {
     # Allocate a 4KB pipe buffer
     var pipe_buf = kmalloc(4096);
@@ -909,6 +962,8 @@ fn vfs_create_pipe(fds_ptr) {
     kpayload_set(wbase, 0, 0);
     kpayload_set(wbase, 1, 1);       # is_write_end = 1
     kpayload_set(wbase, 2, pipe_buf);
+    # 2c: track the buffer owned by THIS proc (rfd+wfd = count 2) so its last close frees it.
+    pipe_rc_register(pipe_buf, proc_current_get());
     # Write fd numbers to user pointer
     store64(fds_ptr, rfd);
     store64(fds_ptr + 8, wfd);
@@ -1020,6 +1075,12 @@ fn vfs_close_inner(fd_idx) {
     # and the success path is unchanged (vfs_write_on returns 0 on success).
     var rc = 0;
     if (ktag(base) == VFS_SEC_WFILE) { rc = vfs_sec_wfile_flush(base); }
+    # 2c: a pipe end — drop the owner's refcount; the OWNER's last close frees the shared 4 KB
+    # buffer (kills the prior leak). A non-owner close (inherited child copy) is a no-op release.
+    if (ktag(base) == VFS_PIPE) {
+        var pb = kpayload(base, 2);
+        if (pipe_rc_release(pb, proc_current_get()) == 1) { kfree_sized(pb, 4096); }
+    }
     # Zero the entire slot (tag → VFS_FREE, payload all 0) so reuse
     # via vfs_alloc finds a clean entry. ktag_clear zeroes the full
     # 32-byte slot.
