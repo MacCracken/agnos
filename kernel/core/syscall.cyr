@@ -692,8 +692,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # used when agnsh has no live bg jobs). The syscall entry stub resets ksyscall_a4 per
         # ring-3 entry (syscall_hw.cyr), so a stale a4 can't mis-route a later blocking read.
         if (arg1 == 0) {
-            if (ksyscall_a4_get() != 0) { return kbd_read_nonblock(arg2, arg3); }
-            return kbd_read_blocking(arg2, arg3);
+            # fd 0 is the keyboard ONLY while it is still the console device. A pipe
+            # redirect (exec_redirect#62) copies the pipe read-end's vfs_table entry
+            # over vfs_table[0] (tag VFS_PIPE), so a REDIRECTED stdin must fall through
+            # to vfs_read -> pipe_read — the `cmd2` side of `cmd1 | cmd2`. The a4
+            # non-blocking cooked-line read is keyboard-only; a piped fd 0 ignores it.
+            if (ktag(&vfs_table) == VFS_DEVICE) {
+                if (ksyscall_a4_get() != 0) { return kbd_read_nonblock(arg2, arg3); }
+                return kbd_read_blocking(arg2, arg3);
+            }
         }
         return vfs_read(arg1, arg2, arg3);
     }

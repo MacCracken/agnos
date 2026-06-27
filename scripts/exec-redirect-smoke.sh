@@ -31,6 +31,14 @@ else
     rc=1
 fi
 
+if strings "$LOG" 2>/dev/null | grep -q "redir: stdin-pipe OK"; then
+    echo "  PASS: a redirected fd 0 read from the pipe, not the keyboard (redir: stdin-pipe OK)"
+else
+    echo "  FAIL: stdin-from-pipe selftest did not pass (read#5 VFS_DEVICE tag guard)"
+    strings "$LOG" 2>/dev/null | grep -i "redir:" || echo "  (no redir line)"
+    rc=1
+fi
+
 echo "Restoring production kernel (selftest gated off)..."
 sh "$ROOT/scripts/build.sh" >/dev/null 2>&1
 

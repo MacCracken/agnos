@@ -5,6 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.46.11] — 2026-06-27
+
+### Fixed
+- **`read#5` now honors a redirected fd 0 — the stdin side of shell pipes (`kernel/core/syscall.cyr`).** `read(0)` hardcoded the keyboard path (`kbd_read_blocking`/`kbd_read_nonblock`), so even after `exec_redirect#62` copied a pipe read-end's entry over `vfs_table[0]`, a child's `read(0)` still read the keyboard — the `cmd2` side of `cmd1 | cmd2` could never consume its piped stdin. Now the keyboard path is taken **only while fd 0 is still the console device** (`ktag(&vfs_table) == VFS_DEVICE`); a redirected fd 0 (tag `VFS_PIPE`) falls through to `vfs_read → pipe_read`. The interactive keyboard is unchanged (fd 0 is `VFS_DEVICE` at the prompt). This completes the kernel half of two-stage pipes — the stdout→pipe direction (`write#1` tag-dispatch + `exec_redirect#62`/`execwait#37` apply-restore) was already proven. Validated: `exec-redirect-smoke` now asserts `redir: stdin-pipe OK` (a redirected fd 0 reads the pipe, not the keyboard — added to the `EXEC_REDIRECT_SELFTEST`), keyboard no-regression (`agnsh-type-test`), `check.sh` 11/11, and a new end-to-end `scripts/pipe-smoke.py` (`owl -p /hello.txt | anuenue` → owl's `OWLPROOF` reaches anuenue's stdin and is truecolor-rainbow'd on the console). Pipe semantics (store-and-forward, 4088-byte buffer, single-foreground) + the two follow-ons (pipe-buffer refcount free-on-close; per-process fd tables for streaming/SMP-safe pipes) are tracked in `docs/development/issues/2026-06-27-agnos-pipe-buffer-leak-refcount.md` + `…-pipes-per-proc-fd-streaming.md`. agnoshi's `sh_run_pipeline` driver is the consumer.
+
 ## [1.46.10] — 2026-06-26
 
 ### Changed

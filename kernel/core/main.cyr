@@ -1837,10 +1837,31 @@ fn exec_redirect_selftest() {
     exec_redirect_restore();
     var got[8]; store64(&got, 0);
     var n = vfs_read(rfd, &got, 8);
-    if (n == 2) { if (load8(&got) == 72) { if (load8(&got + 1) == 73) {
-                kprintln("redir: capture OK", 17); return 0;
+    var stdout_ok = 0;
+    if (n == 2) { if (load8(&got) == 72) { if (load8(&got + 1) == 73) { stdout_ok = 1; } } }
+    if (stdout_ok == 0) { kprintln("redir: FAIL capture", 19); return 0; }
+    kprintln("redir: capture OK", 17);
+
+    # stdin-from-pipe (the read#5 VFS_DEVICE tag guard — the `cmd2` side of a pipe):
+    # write "PI" into a fresh pipe, redirect fd 0 -> the pipe READ end, then drive the
+    # ACTUAL read syscall ksyscall(5, fd=0, ...). With the tag guard, fd 0's tag is now
+    # VFS_PIPE (not VFS_DEVICE), so read(0) must reach pipe_read and return "PI" instead
+    # of blocking on the keyboard. fd 0 is restored to the console on exec_redirect_restore.
+    var fds2[16];
+    if (vfs_create_pipe(&fds2) != 0) { kprintln("redir: FAIL pipe2", 17); return 0; }
+    var rfd2 = load64(&fds2);
+    var wfd2 = load64(&fds2 + 8);
+    var msg2[8]; store8(&msg2, 80); store8(&msg2 + 1, 73);   # "PI"
+    vfs_write(wfd2, &msg2, 2);                               # fill the pipe buffer first
+    redir_src_fd_set(0); redir_dst_fd_set(rfd2); redir_pending_set(1);   # fd 0 <- pipe read end
+    exec_redirect_apply();
+    var sin[8]; store64(&sin, 0);
+    var sn = ksyscall(5, 0, &sin, 8);                        # read(0) — must hit pipe_read, not kbd
+    exec_redirect_restore();
+    if (sn == 2) { if (load8(&sin) == 80) { if (load8(&sin + 1) == 73) {
+                kprintln("redir: stdin-pipe OK", 20); return 0;
             } } }
-    kprintln("redir: FAIL capture", 19);
+    kprintln("redir: FAIL stdin-pipe", 22);
     return 0;
 }
 exec_redirect_selftest();
