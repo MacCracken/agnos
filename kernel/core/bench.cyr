@@ -147,6 +147,33 @@ fn bench_run_all() {
             kprintln(" nvme submits/4KB", 17);
         }
     }
+    # block_coalesce_amp (1.47.6): read 16 contiguous blocks (128 sectors = 64 KB) two ways + count
+    # NVMe submits. blk_read_sectors_direct DMAs the whole run into a DMA-safe 2 MB-region dest in ONE
+    # multi-LBA command (multi=1); 16 separate block reads = 16 commands (perblk=16). The cross-block
+    # mirror of block_read_amp (which collapses the 8 sectors WITHIN a block) — the win ext2_read_at's
+    # multi-block coalescing realizes on a contiguous exec-load. Raw LBA 0-127 of the blank bench
+    # disk; temp 2 MB DMA-safe dest (freed). Skips if the bench nvme isn't ready.
+    if (nvme_io_ready == 0) {
+        kprintln("  block_coalesce_amp: skipped (no nvme)", 39);
+    } else {
+        var camp = pmm_alloc_2mb();
+        if (camp == 0) {
+            kprintln("  block_coalesce_amp: skipped (no 2MB region)", 45);
+        } else {
+            nvme_io_submit_count = 0;
+            blk_read_sectors_direct(BLK_NVME, 0, 128, camp);
+            var cmulti = nvme_io_submit_count;
+            nvme_io_submit_count = 0;
+            for (var cb = 0; cb < 16; cb = cb + 1) { blk_read_sectors_on(BLK_NVME, cb * 8, 8, camp); }
+            var cperblk = nvme_io_submit_count;
+            pmm_free_2mb(camp);
+            kprint("  block_coalesce_amp: multi=", 28);
+            kprint_num(cmulti);
+            kprint(" perblk=", 8);
+            kprint_num(cperblk);
+            kprintln(" nvme submits/64KB", 18);
+        }
+    }
 
     # --- tier2: subsystems (syscall / vfs) ---
     kprintln("[tier2] subsystems", 18);

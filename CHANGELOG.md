@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.6] — 2026-06-27
+
+**▶ 1.47.6 — perf patch (4th of the 1.47.x perf series): ext2 multi-block read coalescing.**
+
+### Changed
+- **`ext2_read_at` now coalesces physically-contiguous block runs into ONE direct multi-LBA DMA (`kernel/core/ext2.cyr` + `kernel/core/block.cyr`).** The prior path issued one NVMe command per FS block (1.42.8's `block_read_amp` collapsed the 8 sectors *within* a block, but not across blocks), so a contiguous 589 KB exec-load was ~147 commands. `ext2_read_at` now scans forward for a run of contiguous physical blocks and reads up to **16 blocks (64 KB) in one multi-LBA NVMe command** via the new **`blk_read_sectors_direct`** — DMA'd straight into the caller's buffer with **no bounce scratch and no PMM cost**. It is gated for safety: the dest must be **page-aligned and inside the 0–256 MB per-proc-CR3 identity window** (phys==virt → physically contiguous = DMA-safe), and the IOMMU must be inactive (`iommu_active == 0` — AMD Zen disables AMD-Vi + QEMU has no IOMMU; **Intel VT-d falls back to the per-block bounce path**). A sparse/partial block or a high/unaligned dest (e.g. a >256 MB user buffer) also falls through to the single-block path. **`ext2_read_coalesce_max`** is the kill-switch (set to 1 to force single-block). Cross-block mirror of `block_read_amp`. Validated: new **`block_coalesce_amp: multi=1 perblk=16`** bench proof; **exec-smoke 15/15** (binaries read through the coalesced path), ext2-write-smoke **e2fsck-clean**, `check.sh` 11/11. **Iron-DMA validation rides the 1.47.x burn** — this is the first ext2-read use of the NVMe >2-page PRP-list path, which QEMU can't validate against real NVMe; the kill-switch is the fallback.
+
 ## [1.47.5] — 2026-06-27
 
 **▶ 1.47.5 — perf patch (3rd of the 1.47.x perf series): ext2 single-indirect read reuse.**

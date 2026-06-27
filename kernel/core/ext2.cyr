@@ -1845,6 +1845,11 @@ fn ext2_extent_bmap_alloc(inode_buf, lblk, inode_num) {
 # single-indirect file collapses N `l1` reads to 1.
 var ext2_indirect_disk_reads = 0;
 
+# 1.47.6 — max blocks coalesced into one direct multi-LBA read in ext2_read_at (16 = 64 KB at 4 KB
+# blocks). Kill-switch: set to 1 to force the single-block path (e.g. if a real-NVMe + IOMMU burn
+# shows the >2-page PRP-list DMA misbehaves where QEMU didn't).
+var ext2_read_coalesce_max = 16;
+
 fn ext2_logical_to_physical(inode_buf, logical_block) {
     # Phase 4 dispatch: ext4 extents inodes take a different code path
     # (Linux switched ext4 to extents as the default in 2008).
@@ -1998,6 +2003,37 @@ fn ext2_read_at(inode_num, offset, buf, maxlen) {
         if (phys == 0 - 1) { return 0 - 1; }   # disk-read error
 
         var remaining = to_read - bytes_done;
+
+        # 1.47.6 — multi-block coalescing. When this is a full, block-aligned, non-sparse block whose
+        # dest sits page-aligned inside the 0-256MB per-proc-CR3 identity window (phys==virt → buf is
+        # physically contiguous = DMA-safe), scan forward for a run of physically-contiguous blocks
+        # and DMA the whole run straight into buf in ONE multi-LBA command (no bounce scratch). For a
+        # contiguous exec-load of a big binary this collapses M nvme commands → 1. Falls through to
+        # the single-block path for a sparse/partial block or a high/unaligned dest (e.g. a >256MB
+        # user buffer). Also gated on `iommu_active == 0`: a direct DMA needs no IOTLB entry for the
+        # dest, which holds on AMD Zen (AMD-Vi disabled, iommu.cyr) + QEMU (no IOMMU) but NOT under
+        # Intel VT-d — so VT-d safely falls back to the bounce path. `ext2_read_coalesce_max` is the
+        # kill-switch (set to 1 to force single-block).
+        var dst = buf + bytes_done;
+        if (iommu_active == 0 && off_in_block == 0 && phys != 0 && remaining >= ext2_blocksize
+            && (dst & 0xFFF) == 0 && (dst + ext2_blocksize) <= 0x10000000) {
+            var run = 1;
+            while (run < ext2_read_coalesce_max
+                   && (bytes_done + (run + 1) * ext2_blocksize) <= to_read
+                   && (dst + (run + 1) * ext2_blocksize) <= 0x10000000) {
+                var np = ext2_logical_to_physical_cached(&ext2_inode_buf, logical + run, &cached_l1);
+                if (np != phys + run) { break; }   # non-contiguous, sparse, or error → end the run
+                run = run + 1;
+            }
+            if (run >= 2) {
+                if (blk_read_sectors_direct(ext2_backend, ext2_block_to_lba(phys), run * ext2_sectors_per_block, dst) != 0) {
+                    return 0 - 1;
+                }
+                bytes_done = bytes_done + run * ext2_blocksize;
+                continue;
+            }
+        }
+
         var chunk = ext2_blocksize - off_in_block;
         if (chunk > remaining) { chunk = remaining; }
 
