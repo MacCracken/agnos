@@ -2016,11 +2016,11 @@ fn ext2_read_at(inode_num, offset, buf, maxlen) {
         # kill-switch (set to 1 to force single-block).
         var dst = buf + bytes_done;
         if (iommu_active == 0 && off_in_block == 0 && phys != 0 && remaining >= ext2_blocksize
-            && (dst & 0xFFF) == 0 && (dst + ext2_blocksize) <= 0x10000000) {
+        && (dst & 0xFFF) == 0 && (dst + ext2_blocksize) <= 0x10000000) {
             var run = 1;
             while (run < ext2_read_coalesce_max
-                   && (bytes_done + (run + 1) * ext2_blocksize) <= to_read
-                   && (dst + (run + 1) * ext2_blocksize) <= 0x10000000) {
+            && (bytes_done + (run + 1) * ext2_blocksize) <= to_read
+            && (dst + (run + 1) * ext2_blocksize) <= 0x10000000) {
                 var np = ext2_logical_to_physical_cached(&ext2_inode_buf, logical + run, &cached_l1);
                 if (np != phys + run) { break; }   # non-contiguous, sparse, or error → end the run
                 run = run + 1;
