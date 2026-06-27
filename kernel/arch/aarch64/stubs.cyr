@@ -118,6 +118,7 @@ fn nvme_register_block_dev() { return 0; }
 fn nvme_blk_read(a, b) { return 0 - 1; }
 fn nvme_blk_write(a, b) { return 0 - 1; }
 fn nvme_blk_read_sectors(a, b, c) { return 0 - 1; }
+fn nvme_blk_write_sectors(a, b, c) { return 0 - 1; }
 
 # AHCI/SATA stubs (1.31.1 storage arc — Phase 1 + 2 + 3 + 4)
 var ahci_present = 0;

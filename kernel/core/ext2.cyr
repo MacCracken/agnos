@@ -614,12 +614,11 @@ fn ext2_blk_write(sector, buf) {
 fn ext2_write_block(block_num, buf) {
     ext2_mark_dirty();          # 1.33.3 bite 4: first write of the mount clears s_state VALID_FS
     var lba = ext2_block_to_lba(block_num);
-    for (var i = 0; i < ext2_sectors_per_block; i = i + 1) {
-        if (ext2_blk_write(lba + i, buf + i * 512) != 0) {
-            return 0 - 1;
-        }
-    }
-    return 0;
+    # 1.47.1 perf: ONE multi-sector write (the mirror of ext2_read_block's blk_read_sectors_on
+    # fast path) instead of `ext2_sectors_per_block` single-sector submits — ~8x fewer NVMe
+    # round-trips per block write. blk_write_sectors_on falls back to the per-sector loop on
+    # non-NVMe backends, so behavior is identical there.
+    return blk_write_sectors_on(ext2_backend, lba, ext2_sectors_per_block, buf);
 }
 
 # Write the in-memory superblock (ext2_sb_buf, 1024 bytes) back to disk.

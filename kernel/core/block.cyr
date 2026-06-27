@@ -229,3 +229,19 @@ fn blk_read_sectors_on(tag, start, count, buf) {
     if (tag == BLK_RAMDISK) { return ramdisk_blk_read_sectors(start, count, buf); }
     return 0 - 1;
 }
+
+# 1.47.1 perf — multi-sector WRITE dispatch, the mirror of blk_read_sectors_on. NVMe takes the
+# single multi-LBA command (nvme_blk_write_sectors) collapsing `count` submits → 1; the other
+# backends keep the per-sector loop (they don't show NVMe's submit/poll-per-sector amplification —
+# AHCI/USB issue ~1 command per sector regardless, and a multi-sector adapter can be added per
+# backend if a bench shows it matters). Used by ext2_write_block for <= 8-sector (4 KB) blocks.
+fn blk_write_sectors_on(tag, start, count, buf) {
+    if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
+    if (tag == BLK_NVME) { return nvme_blk_write_sectors(start, count, buf); }
+    var i = 0;
+    while (i < count) {
+        if (blk_write_on(tag, start + i, buf + i * 512) != 0) { return 0 - 1; }
+        i = i + 1;
+    }
+    return 0;
+}

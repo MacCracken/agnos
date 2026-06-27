@@ -122,6 +122,31 @@ fn bench_run_all() {
             kprintln(" nvme submits/4KB", 17);
         }
     }
+    # block_write_amp (1.47.1): the WRITE-side mirror — writes 8 LBAs two ways + counts NVMe SQ
+    # submissions. Expect multi=1, single=8 (the per-block write round-trip collapse, the analog
+    # of block_read_amp). Writes the blank bench disk's raw LBA 0-7 (no FS, pure scratch). Skips
+    # if the bench nvme isn't ready.
+    if (nvme_io_ready == 0) {
+        kprintln("  block_write_amp: skipped (no nvme)", 36);
+    } else {
+        var wamp_pg = pmm_alloc();
+        if (wamp_pg == 0) {
+            kprintln("  block_write_amp: skipped (no page)", 36);
+        } else {
+            nvme_io_submit_count = 0;
+            blk_write_sectors_on(BLK_NVME, 0, 8, wamp_pg);
+            var wsubmits_multi = nvme_io_submit_count;
+            nvme_io_submit_count = 0;
+            for (var wj = 0; wj < 8; wj = wj + 1) { blk_write_on(BLK_NVME, wj, wamp_pg + wj * 512); }
+            var wsubmits_single = nvme_io_submit_count;
+            pmm_free(wamp_pg);
+            kprint("  block_write_amp: multi=", 25);
+            kprint_num(wsubmits_multi);
+            kprint(" single=", 8);
+            kprint_num(wsubmits_single);
+            kprintln(" nvme submits/4KB", 17);
+        }
+    }
 
     # --- tier2: subsystems (syscall / vfs) ---
     kprintln("[tier2] subsystems", 18);

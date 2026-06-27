@@ -1055,6 +1055,36 @@ fn nvme_blk_read_sectors(start, count, buf) {
     return 0;
 }
 
+# 1.47.1 perf — multi-sector WRITE, the mirror of nvme_blk_read_sectors. A write that fits the
+# 4 KB DMA scratch goes out as ONE multi-LBA NVMe command instead of `count` single-LBA round-
+# trips (each = build SQE + ring the SQ doorbell + spin the CQ). Copy the caller's (possibly
+# non-DMA-safe) buf INTO the DMA-safe scratch, then one write — the REVERSE of the read's read-
+# then-copy. Under nvme_lock so the shared scratch + IO SQ/CQ can't be clobbered cross-CPU; the
+# read bounce reuses the SAME nvme_read_scratch, so the lock is what serializes the two. This is
+# the universal ext2 block-write primitive (sectors_per_block <= 8 = 4 KB) → ~8x fewer submit/
+# poll round-trips on every block write (file create, dir update, jbd2 commits, self-host build).
+fn nvme_blk_write_sectors(start, count, buf) {
+    if (nvme_io_ready == 0) { return 0 - 1; }
+    var bytes = count * nvme_ns1_lba_bytes;
+    if (count >= 1) {
+        if (bytes <= 4096) {
+            nvme_spin_lock();
+            memcpy(nvme_read_scratch, buf, bytes);
+            var st = nvme_rw_internal(0x01, start, count - 1, nvme_read_scratch, bytes);
+            nvme_spin_unlock();
+            if (st != 0) { return 0 - 1; }
+            return 0;
+        }
+    }
+    # Fallback (> 4 KB): the per-sector loop. Correct for any count.
+    var i = 0;
+    while (i < count) {
+        if (nvme_blk_write(start + i, buf + i * 512) != 0) { return 0 - 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 # Register NVMe with the block layer. Always overrides whatever's
 # there — virtio is the fallback for QEMU-only environments; NVMe is
 # the production-bound backend.

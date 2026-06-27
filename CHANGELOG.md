@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.1] — 2026-06-27
+
+**▶ 1.47.1 — perf patch (1 of the deferred 1.47.x perf series): ext2 block-write batching.** First of the per-item performance patches deferred from the 1.47.0 cut.
+
+### Changed
+- **ext2 block writes now issue ONE multi-LBA NVMe command per 4 KB block instead of 8 single-sector submits (`kernel/core/ext2.cyr`, `block.cyr`, `nvme.cyr`).** The write-side mirror of the 1.42.8 read fast-path: `ext2_write_block` looped `ext2_sectors_per_block` (8) single-sector `blk_write_on` calls (8 NVMe submit/poll round-trips per block) while the read path already batched. New **`nvme_blk_write_sectors`** (mirror of `nvme_blk_read_sectors` — copies the caller's possibly-non-DMA-safe buffer into the DMA-safe `nvme_read_scratch` under `nvme_lock`, then one multi-LBA write; the read bounce reuses the same scratch, the lock serializes them) + **`blk_write_sectors_on`** dispatch (NVMe → the fast path; other backends keep the per-sector loop — AHCI/USB already issue ~1 command/sector, no amplification to collapse). `ext2_write_block` now calls `blk_write_sectors_on` → **~8× fewer NVMe round-trips on every block write** (file create, directory update, jbd2 journal commits, the self-hosting build's write load). Validated: new **`block_write_amp` benchmark = `multi=1 single=8`** (the structural proof, the analog of `block_read_amp`); **ext2-write-smoke PASS** (all 19 write ops produce correct on-disk data + clean superblock — the batched DMA-bounce write is correct); `check.sh` 11/11. Behavior-identical on non-NVMe backends (the fallback loop). Iron-burn rides the 1.47.x burn.
+
 ## [1.47.0] — 2026-06-27
 
 **▶ 1.47.0 — fault-resilience + per-process fd tables.** Cut on the current work: the two systemic-robustness bites the just-closed **1.46.x SMP arc** (STEP-2 iron-validated on archaemenid 2026-06-26) surfaced — **(1) proc-teardown-on-fault** and **(2) per-process fd tables** (2a seam → 2b storage+inheritance → 2c pipe refcount) — both QEMU-validated; iron burn pending. The **perf tail + full-binary KASLR Option A are DEFERRED to 1.47.x PATCHES** (per user 2026-06-27: cut 1.47.0 on the current work, performance lands per-patch); any iron-burn fixes also land as 1.47.x patches.
