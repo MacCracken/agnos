@@ -696,9 +696,14 @@ fn ext2_sync() {
 # Reserved inode numbers: 1 = bad blocks, 2 = root dir (every path
 # lookup starts here), 11 = lost+found typical. Inode 0 is invalid.
 
+# 1.47.2 perf counter: inode fetches that hit the disk (each = 1 BGDT + 1 inode-table block
+# read). ext2_path_lookup's per-component inode REUSE drives this down — measured in
+# EXT2_WRITE_SELFTEST (dir_lookup inode-reads/component: with-reread=1 vs reuse=0).
+var ext2_inode_disk_reads = 0;
 fn ext2_get_inode(inode_num, out_buf) {
     if (ext2_active == 0) { return 0 - 1; }
     if (inode_num == 0)   { return 0 - 1; }
+    ext2_inode_disk_reads = ext2_inode_disk_reads + 1;
 
     # Input validation: cap inode_num against the FS's total inode count
     # (s_inodes_count @ sb+0). mkfs guarantees a valid inode_num is in
@@ -2083,26 +2088,24 @@ fn ext2_print_dir(dir_inode_num) {
 
 # Find a named entry inside a directory inode. Returns the entry's inode
 # number on hit, 0 if not found, -1 on error.
-fn ext2_dir_lookup(dir_inode_num, name, name_len) {
-    if (ext2_active == 0) { return 0 - 1; }
-    if (ext2_get_inode(dir_inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
-
-    var mode = ext2_inode_mode(&ext2_inode_buf);
+# 1.47.2 perf — the directory name-scan given the dir inode ALREADY in `inode_buf`. Split out of
+# ext2_dir_lookup so ext2_path_lookup can REUSE the inode it already holds (root / the prior
+# component's symlink-check read) instead of re-fetching it per component — ~halving the inode
+# reads (each = 1 BGDT + 1 inode-table block) on a deep-path walk. The scan never clobbers
+# inode_buf: ext2_logical_to_physical reads the indirect/extent bufs, the dirent scan reads
+# ext2_dir_buf — both distinct — so a caller's PERSISTENT inode buffer survives the call (this is
+# also why the original per-block re-fetch was already hoisted; now it's hoisted across components).
+fn ext2_dir_lookup_in(inode_buf, name, name_len) {
+    var mode = ext2_inode_mode(inode_buf);
     if ((mode & 0xF000) != 0x4000) { return 0 - 1; }
 
-    var dir_size = ext2_inode_filesize(&ext2_inode_buf);
+    var dir_size = ext2_inode_filesize(inode_buf);
     if (dir_size == 0) { return 0; }
 
-    # The dir inode is already in ext2_inode_buf from the fetch above, and
-    # nothing in this loop clobbers it: ext2_logical_to_physical reads indirect
-    # blocks into ext2_indirect_buf_l1/l2/l3 and the dirent scan reads into
-    # ext2_dir_buf — both distinct buffers. So the per-iteration re-fetch the
-    # original code did (1 BGDT read + 1 inode-table read = 16 NVMe sector
-    # round-trips per extra dir block) was redundant; hoisted out.
     var bytes_done = 0;
     while (bytes_done < dir_size) {
         var logical = bytes_done / ext2_blocksize;
-        var phys = ext2_logical_to_physical(&ext2_inode_buf, logical);
+        var phys = ext2_logical_to_physical(inode_buf, logical);
         if (phys == 0 - 1) { return 0 - 1; }
         if (phys == 0)     { bytes_done = bytes_done + ext2_blocksize; continue; }
 
@@ -2129,6 +2132,14 @@ fn ext2_dir_lookup(dir_inode_num, name, name_len) {
         bytes_done = bytes_done + ext2_blocksize;
     }
     return 0;   # not found
+}
+
+# Public wrapper: fetch the dir inode (into ext2_inode_buf), then scan. Used by every dir-lookup
+# caller EXCEPT ext2_path_lookup's inner loop, which holds the inode resident + calls _in directly.
+fn ext2_dir_lookup(dir_inode_num, name, name_len) {
+    if (ext2_active == 0) { return 0 - 1; }
+    if (ext2_get_inode(dir_inode_num, &ext2_inode_buf) != 0) { return 0 - 1; }
+    return ext2_dir_lookup_in(&ext2_inode_buf, name, name_len);
 }
 
 # === Directory mutation + create / unlink (WRITE arc 1.33.x — W4a) =====
@@ -2829,6 +2840,11 @@ fn ext2_path_lookup(path, path_len) {
 
     var nfollow = 0;
     var current_inode = 2;   # root
+    # 1.47.2 perf: keep current_inode's inode resident in ext2_symres_inode so each component's
+    # ext2_dir_lookup_in REUSES it (no per-component re-fetch). Seeded with root here; the loop
+    # keeps it current — the symlink-check read below leaves next_inode (= the next current) in
+    # it, and a symlink follow re-syncs it.
+    if (ext2_get_inode(2, &ext2_symres_inode) != 0) { return 0 - 1; }
     var i = 1;               # skip leading '/'
 
     while (i < wl) {
@@ -2850,7 +2866,7 @@ fn ext2_path_lookup(path, path_len) {
         if (comp_len > 255) { return 0 - 1; }   # ext2 max name_len = 255
 
         # Walk the current dir to find the component.
-        var next_inode = ext2_dir_lookup(current_inode, &ext2_symres_work + comp_start, comp_len);
+        var next_inode = ext2_dir_lookup_in(&ext2_symres_inode, &ext2_symres_work + comp_start, comp_len);   # 1.47.2: reuse the resident inode
         if (next_inode == 0 - 1) { return 0 - 1; }
         if (next_inode == 0)     { return 0; }    # not found
 
@@ -2881,6 +2897,10 @@ fn ext2_path_lookup(path, path_len) {
             # Absolute target restarts at root; relative continues from the
             # directory that contained the link (current_inode, unchanged).
             if (wl > 0) { if (load8(&ext2_symres_work) == 47) { current_inode = 2; } }
+            # 1.47.2 perf: the follow changed current_inode (→ root if absolute, else the link's
+            # parent), but ext2_symres_inode still holds the LINK's inode — re-sync it to the new
+            # current so the per-component reuse stays correct.
+            if (ext2_get_inode(current_inode, &ext2_symres_inode) != 0) { return 0 - 1; }
             i = 0;
             continue;
         }
@@ -3850,6 +3870,24 @@ fn ext2_write_selftest() {
     if ((st_clean & 0x0001) == 0) { wsy = 0; }              # expect VALID_FS SET (clean)
     if (wsy == 1) { kprintln("ext2w: Wsync state OK", 21); }
     else          { kprintln("ext2w: Wsync state MISMATCH", 27); }
+
+    # 1.47.2 perf proof — dir-lookup inode reuse. Scan root for a (missing) name TWO ways + count
+    # inode disk fetches: ext2_dir_lookup re-fetches the dir inode (reread=1); ext2_dir_lookup_in
+    # reuses an already-resident inode (reuse=0), which is what ext2_path_lookup now does per
+    # component — so a K-component path drops from ~2K to ~K+1 inode reads (each = BGDT + inode-
+    # table block). The analog of block_write_amp's multi=1/single=8 structural proof.
+    ext2_inode_disk_reads = 0;
+    ext2_dir_lookup(2, "zz", 2);
+    var dl_reread = ext2_inode_disk_reads;
+    ext2_get_inode(2, &ext2_inode_buf);             # make root resident (as path_lookup keeps it)
+    ext2_inode_disk_reads = 0;
+    ext2_dir_lookup_in(&ext2_inode_buf, "zz", 2);
+    var dl_reuse = ext2_inode_disk_reads;
+    kprint("ext2w: dirlk reuse=", 19);
+    kprint_num(dl_reuse);
+    kprint(" reread=", 8);
+    kprint_num(dl_reread);
+    kprintln(" inode-reads", 12);
 
     return 0;
 }

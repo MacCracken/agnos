@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.2] — 2026-06-27
+
+**▶ 1.47.2 — perf patch (2 of the deferred 1.47.x perf series): ext2 directory-lookup inode reuse.**
+
+### Changed
+- **`ext2_path_lookup` no longer re-fetches each directory inode per path component (`kernel/core/ext2.cyr`).** Walking `/a/b/c` read every intermediate inode TWICE: once for the symlink check (`ext2_get_inode(next_inode)`), then again at the next component's `ext2_dir_lookup` (which re-fetched the same inode). `ext2_dir_lookup` is split into **`ext2_dir_lookup_in(inode_buf, name, len)`** (the name-scan given an already-resident dir inode — the scan never clobbers `inode_buf`, since `ext2_logical_to_physical` uses the indirect/extent bufs and the dirent scan uses `ext2_dir_buf`) + a thin `ext2_dir_lookup` wrapper that fetches then calls it. `ext2_path_lookup` now keeps the current dir's inode **resident in `ext2_symres_inode`** (pre-read root once; the symlink-check read leaves `next_inode` — the next current — in it; a symlink follow re-syncs it) and calls `ext2_dir_lookup_in` per component — so a **K-component path drops from ~2K to ~K+1 inode reads** (each = 1 BGDT + 1 inode-table block). Read-only optimization — no caching, no write-invalidation risk (path lookup never writes). Validated: new **`ext2w: dirlk reuse=0 reread=1`** proof in `EXT2_WRITE_SELFTEST` (the per-component inode read is elided — the analog of `block_write_amp`); **ext2-write-smoke PASS** (all path-lookup + symlink cases correct — fast/relative/slow symlinks, ELOOP, cross-parent dir move — + e2fsck clean); exec-smoke 15/15; check.sh 11/11. Iron rides the 1.47.x burn.
+
 ## [1.47.1] — 2026-06-27
 
 **▶ 1.47.1 — perf patch (1 of the deferred 1.47.x perf series): ext2 block-write batching.** First of the per-item performance patches deferred from the 1.47.0 cut.
