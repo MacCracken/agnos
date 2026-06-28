@@ -5,6 +5,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.11] — 2026-06-28
+
+**▶ 1.49.11 — full-RAM extension, bite 3c: >256 MB RAM comes online. Dynamic RAM-backed PMM bitmap + the 2 MB user-page allocator lifted to the full machine RAM, now that 1.49.10 proved the direct-map works.**
+
+### Added
+- **Dynamic RAM-backed PMM bitmap (`kernel/core/pmm.cyr` `pmm_migrate_bitmap` + `pmm_bitmap_ptr`/`pmm_bitmap_pages`).** The static 8 KB `pmm_bitmap` is now only a **bootstrap** (256 MB) — it breaks the allocator-needs-a-bitmap-to-allocate-the-bitmap chicken-and-egg. After the RAM probe, if RAM > 256 MB, `pmm_migrate_bitmap` allocates one 2 MB region (`pmm_alloc_2mb`, ≤256 MB so it stays identity-reachable under every CR3), copies the 0–256 MB reserved/used state into it, reserves non-conventional memmap regions in (256 MB, ram_top], switches `pmm_bitmap_ptr`, and lifts `pmm_bitmap_pages`/`pmm_total`/`pmm_2mb_top_region` to the full RAM. One 2 MB bitmap covers **64 GB** (RAM beyond that is capped + logged, not silent — a multi-region bitmap is the follow-on). This is the storage approach chosen over a static `var[N]` array, which would inflate the kernel binary past its size budget. All bitmap access (set/clear/test, alloc/free, init, extend) was routed through the pointer first (behavior-neutral indirection), then the migration swapped it.
+- **`PMM_HIRAM_SELFTEST` (`pmm_hiram_selftest`) + `scripts/`-side QEMU validation.** Allocates 2 MB regions bottom-up until one lands at/above the 256 MB identity ceiling, round-trips it through the direct-map under the kernel CR3 (`dm_roundtrip_kernel_cr3`), then frees all. Verified in QEMU `-m 1024M`: `PMM: 2mb_top_region=511` (was 128), `HIRAM: allocs=120 hi=10000000` (region at phys 256 MB), `HIRAM: rd@hi=f00dcafe` (round-trip through `DIRECTMAP_BASE + 256 MB`), `HIRAM: >256MB alloc+directmap OK`, boots to shell.
+
+### Changed
+- **`pmm_alloc_2mb`'s 256 MB cap (`pmm_2mb_top_region`) is lifted to the full RAM after migration.** User 2 MB pages (ELF code / stack / mmap heap) now reach above the 256 MB identity ceiling; the kernel zeroes/loads them via `DIRECTMAP_BASE + phys` (`pmm_kva_for_access`) under the caller's per-proc CR3, which carries the direct-map. The 4 KB allocator (`pmm_alloc`, kernel page tables / DMA) **deliberately stays** in the 256 MB identity window — only direct-map-reachable user pages go higher. ≤256 MB RAM keeps the bootstrap bitmap unchanged (`directmap: installed`).
+- **Regression scope checked:** `ram-probe-smoke` (4/4, incl. the corrected >256 MB round-trip), `pmm-fullram-smoke` (4/4), and `agnsh-smoke` (boot-to-shell) all pass with and without the feature. `exec-smoke` and `mmap-smoke`'s `munmap: pmm-reuse` fail on this box, but they **fail identically on the 1.49.9 baseline** (pre-existing, unrelated to this change).
+
+## [1.49.10] — 2026-06-28
+
+**▶ 1.49.10 — full-RAM extension, bite 3c: the >256 MB direct-map WORKS — 1.49.9's "cyrius high-VA limit" was a misdiagnosis. The blocker was a false-positive boot probe running under the wrong page tables. cyrius fully exonerated.**
+
+### Fixed
+- **Root-caused the >256 MB direct-map "failure" — it was never broken, and never a cyrius bug.** The boot-time probe runs under **gnoboot's transient boot CR3 (`0x3fc01000`), not the kernel's PML4 (`0x1000`)** where the direct-map is installed. gnoboot's `PDPT[8] = 0x2000000e3` is a **1 GB identity huge page → phys 8 GB** (unbacked at <8 GB RAM → reads 0, drops writes, *no fault* because it's a present mapping) — so every >256 MB direct-map access at boot hit that phantom page. Under **CR3 `0x1000`** the identical `store64`/`load64` to `DIRECTMAP_BASE + 320 MB` (`0x214000000`) round-trips perfectly (verified `0xcafebabe` in QEMU `-m 1024M`). The 1.49.9 `directmap: low+hi OK` probe was a **two-zeros false match** (both the direct-map read and the identity read returned 0 under the boot CR3), which is what got mis-attributed to a cyrius load/store truncation. The direct-map is correct and reachable in every runtime context: kernel threads run at CR3 `0x1000`, and every per-proc CR3 copies `PDPT[1..511]` from `0x2000` (`proc.cyr`), inheriting `PDPT[8]`. gnoboot's CR3 is never captured or reloaded after the first context switch, and touches no >256 MB page. Empirical A/B/C/D/E walk + full analysis: `docs/development/issue/2026-06-28-cyrius-high-va-load-store.md`.
+- **Replaced the false-positive direct-map boot probe (`kernel/core/main.cyr`).** It now round-trips a true >256 MB VA (phys 320 MB, low bits non-aliasing) **under the kernel CR3 `0x1000`** — the context the direct-map's consumers actually run in — then restores the live CR3. Gated on `RAM > 320 MB && RSP < 256 MB` so the brief CR3 switch is always stack-safe (the boot stack is identity-mapped <256 MB under `0x1000`); otherwise a structural "`PDPT[8]` installed" check. New boot lines: `directmap: >256MB OK (kernel CR3)` (QEMU `-m 1024M`) / `directmap: installed` (≤320 MB). Helpers added in `vmm.cyr`: `dm_read_cr3`, `dm_read_rsp`, `dm_roundtrip_kernel_cr3`.
+
+### Changed
+- **The >256 MB RAM extension is unblocked.** It needs only mechanical work, **no VM redesign**: lift `pmm_alloc_2mb`'s 256 MB cap (`pmm_2mb_top_region`) to the real RAM ceiling, and re-grow the 4 KB PMM bitmap past 256 MB. The bitmap re-grow needs a storage decision (the prior 4 GB bitmap was a *static* array that blew the ~1.4 MB kernel-size budget — candidates: BSS-backed, on-demand 2-level, or 2 MB-granularity-only tracking above the identity ceiling). `pmm_alloc_2mb` held at 256 MB this bite; the direct-map fix is the prerequisite, now done.
+
 ## [1.49.9] — 2026-06-28
 
 **▶ 1.49.9 — full-RAM extension, bite 3b: the >256 MB path is blocked by a cyrius high-VA limit; held at 256 MB with the groundwork in place.**

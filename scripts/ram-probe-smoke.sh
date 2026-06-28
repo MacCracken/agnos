@@ -98,10 +98,15 @@ else
     # (2) scales with -m: the 1024M boot must report meaningfully more than the 256M boot.
     if [ "$MB_LARGE" -gt "$((MB_SMALL * 2))" ]; then echo "PASS: 1024M boot reports ${MB_LARGE} MB (> 2x the 256M boot — scales with -m)"
     else echo "FAIL: 1024M boot reports ${MB_LARGE} MB (not > 2x ${MB_SMALL} — doesn't scale)"; fail=1; fi
-    # (3) the kernel direct-map (1.49.7): physical RAM mapped at DIRECTMAP_BASE + phys; the probe read
-    #     phys 0 + 100 MB through it and matched the identity map (proves the direct-map is live).
-    if strings "$LOGS/ram-256M.log" | grep -q "directmap: low+hi OK"; then echo "PASS: kernel direct-map active (DIRECTMAP_BASE+phys == identity for phys 0 + 100 MB)"
-    else echo "FAIL: 'directmap: low+hi OK' not found (direct-map not active)"; fail=1; fi
+    # (3) the kernel direct-map (1.49.7, validation corrected 1.49.10): a TRUE >256 MB access. The
+    #     1024M boot round-trips phys 320 MB through DIRECTMAP_BASE + 320 MB *under the kernel CR3 0x1000*
+    #     (the context consumers run in — NOT gnoboot's boot CR3, whose PDPT[8] is a 1 GB identity page to
+    #     unbacked phys 8 GB; that was the 1.49.9 false-positive that got mis-blamed on cyrius). The 256M
+    #     boot has no >256 MB RAM so it reports the structural "directmap: installed" instead.
+    if strings "$LOGS/ram-1024M.log" | grep -q "directmap: >256MB OK (kernel CR3)"; then echo "PASS: >256 MB direct-map round-trips under kernel CR3 (phys 320 MB via DIRECTMAP_BASE — the real test)"
+    else echo "FAIL: 'directmap: >256MB OK (kernel CR3)' not found in 1024M boot (direct-map >256 MB access broken)"; fail=1; fi
+    if strings "$LOGS/ram-256M.log" | grep -q "directmap: installed"; then echo "PASS: 256M boot installs the direct-map PDPT[8] (structural check)"
+    else echo "FAIL: 'directmap: installed' not found in 256M boot"; fail=1; fi
 fi
 
 echo ""

@@ -8,6 +8,13 @@
 # >=4 GB fix lands: regrow (4 GB = var[16384]) + bump the validity/free bounds + lift pmm_2mb_top_region.
 # The page count (65536), validity bound, pmm_total + the 2 MB-free bound all track this.
 var pmm_bitmap[1024];
+# 1.49.11 (dynamic RAM-backed bitmap): the 8 KB `pmm_bitmap` above is now only the BOOTSTRAP bitmap
+# (256 MB) — it breaks the allocator-needs-a-bitmap-to-allocate-the-bitmap chicken-and-egg. All bitmap
+# access goes through `pmm_bitmap_ptr` (= `&pmm_bitmap` until pmm_migrate_bitmap swaps it for a
+# RAM-backed region covering the full machine RAM). `pmm_bitmap_pages` is the page count the live bitmap
+# can track (the pmm_page_valid bound); bumped on migration. See pmm_migrate_bitmap + main.cyr.
+var pmm_bitmap_ptr = 0;
+var pmm_bitmap_pages = 65536;
 var pmm_total = 0;
 # 1.49.1 (full RAM init, bite 1) — UEFI memory-map discovery results, set by pmm_probe_memmap and
 # consumed in bite 2 to size the PMM to the machine's actual RAM. Pure discovery; no alloc change yet.
@@ -68,7 +75,7 @@ fn pmm_spin_unlock() {
 # to prevent negative indices and out-of-bounds access.
 fn pmm_page_valid(page) {
     if (page < 0) { return 0; }
-    if (page >= 65536) { return 0; }              # 256 MB bitmap (1.49.9 4 GB revert — cyrius high-VA blocker)
+    if (page >= pmm_bitmap_pages) { return 0; }   # live bitmap bound (256 MB bootstrap → full RAM after migration)
     return 1;
 }
 
@@ -76,7 +83,7 @@ fn pmm_set(page) {
     if (pmm_page_valid(page) == 0) { return 0 - 1; }
     var byte = page / 8;
     var bit = page % 8;
-    store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) | (1 << bit));
+    store8(pmm_bitmap_ptr + byte, load8(pmm_bitmap_ptr + byte) | (1 << bit));
     return 0;
 }
 
@@ -84,7 +91,7 @@ fn pmm_clear(page) {
     if (pmm_page_valid(page) == 0) { return 0 - 1; }
     var byte = page / 8;
     var bit = page % 8;
-    store8(&pmm_bitmap + byte, load8(&pmm_bitmap + byte) & ((0 - 1 - (1 << bit)) & 0xFF));
+    store8(pmm_bitmap_ptr + byte, load8(pmm_bitmap_ptr + byte) & ((0 - 1 - (1 << bit)) & 0xFF));
     return 0;
 }
 
@@ -92,7 +99,7 @@ fn pmm_test(page) {
     if (pmm_page_valid(page) == 0) { return 0; }
     var byte = page / 8;
     var bit = page % 8;
-    return (load8(&pmm_bitmap + byte) >> bit) & 1;
+    return (load8(pmm_bitmap_ptr + byte) >> bit) & 1;
 }
 
 # KASLR (S7) — seed source for the randomized PMM next-free hint.
@@ -167,7 +174,7 @@ fn pmm_extend_to_memmap(bi) {
         if (kbase < 0x10000000) {                  # 1.49.6: kernel-image reservation now covers the full KASLR range in the 256 MB bitmap (was 0x8000000 = 128 MB)
             var kp = kbase / 4096;
             var kpend = kp + 4096;             # 16 MB window (image is a few MB; generous margin)
-            if (kpend > 65536) { kpend = 65536; }  # clamp to the 256 MB bitmap
+            if (kpend > pmm_bitmap_pages) { kpend = pmm_bitmap_pages; }  # clamp to the live bitmap
             while (kp < kpend) {
                 pmm_set(kp);
                 kp = kp + 1;
@@ -188,7 +195,7 @@ fn pmm_extend_to_memmap(bi) {
                         var pg = load64(e + 8) / 4096;
                         var pgend = pg + load64(e + 24);
                         if (pg < 4608) { pg = 4608; }       # 0-18 MB is pmm_init's domain
-                        if (pgend > 65536) { pgend = 65536; }
+                        if (pgend > pmm_bitmap_pages) { pgend = pmm_bitmap_pages; }
                         while (pg < pgend) {
                             pmm_set(pg);
                             pg = pg + 1;
@@ -205,16 +212,75 @@ fn pmm_extend_to_memmap(bi) {
     if (topp > 65535) { topp = 65535; }        # 1.49.9: KEEP 256 MB — the 4 KB allocator stays in the identity window; pmm_alloc_2mb uses the direct-map above
     if (topp <= 4095) { return 0; }            # <= 16 MB RAM -> keep the safe baseline cap
     pmm_alloc_top = topp;
-    # 1.49.9: the 2 MB user-page allocator reaches the conventional-RAM top (up to the 4 GB bitmap = 2048
-    # regions). pmm_alloc_2mb scans bottom-up; the kernel touches >256 MB pages (ELF load) via
-    # DIRECTMAP_BASE + phys (pmm_kva_for_access), which every CR3 reaches.
-    # 1.49.9: pmm_alloc_2mb is CAPPED at 256 MB (128 regions). >256 MB needs the kernel to touch each page
-    # via the direct-map (DIRECTMAP_BASE @ 8 GB), but cyrius load64/store64 don't reach an 8 GB VA — a
-    # write there returns 0 with no fault (bite-2's <=100 MB probe aliased the identity and passed
-    # falsely). Held at the 256 MB identity ceiling pending cyrius 64-bit addressing OR a <=4 GB kmap
-    # window. The 4 GB bitmap + pmm_kva_for_access groundwork stay for when that access path lands.
+    # The 2 MB user-page allocator's bootstrap ceiling is 256 MB (128 regions) — the identity window. If
+    # RAM > 256 MB, pmm_migrate_bitmap (called next from main.cyr) swaps in a RAM-backed bitmap and lifts
+    # this to the full RAM; pages above 256 MB are zeroed/loaded by the kernel via DIRECTMAP_BASE + phys
+    # (pmm_kva_for_access), which every per-proc CR3 reaches (1.49.10 proved the direct-map works under the
+    # kernel CR3 — the 1.49.9 "cyrius high-VA limit" was a false-positive boot probe). If migration doesn't
+    # run (<=256 MB RAM) or can't get a bitmap region, this 128 stays and user RAM holds at 256 MB.
     pmm_2mb_top_region = 128;
     return topp;
+}
+
+# 1.49.11 (RAM-arc bite 3c): migrate the 256 MB BOOTSTRAP bitmap to a RAM-backed bitmap covering the full
+# machine RAM, so pmm_alloc_2mb can hand out (and track) 2 MB regions above the 256 MB identity ceiling.
+# The bitmap STORAGE stays <=256 MB (one 2 MB region from pmm_alloc_2mb, identity-reachable under every
+# CR3); only the PAGES it tracks extend higher (reached by consumers via the direct-map). Called from
+# main.cyr AFTER pmm_extend_to_memmap (so every <=256 MB reservation — kernel image, kstacks,
+# non-conventional regions — is already in the bootstrap bitmap and pmm_alloc_2mb won't place the new
+# bitmap on top of any of them). Returns the new page count, or 0 if it stays on the bootstrap bitmap
+# (<=256 MB RAM, or no free 2 MB region). One 2 MB bitmap = 16,777,216 pages = 64 GB of coverage; RAM
+# beyond that is capped (logged, not silent) until a multi-region contiguous bitmap is wired.
+fn pmm_migrate_bitmap(bi) {
+    var ram_pages = pmm_memmap_ram_top / 0x1000;
+    if (ram_pages <= 65536) { return 0; }                 # <= 256 MB: the bootstrap bitmap already covers it
+    var cap_pages = 16777216;                             # one 2 MB bitmap (2 MB * 8 bits) = 64 GB / 4 KB
+    if (ram_pages > cap_pages) {
+        kprint("PMM: RAM > 64 GB — bitmap capped at 64 GB (", 47);
+        kprint_num(ram_pages); kprintln(" pages requested)", 16);
+        ram_pages = cap_pages;
+    }
+    var nb = pmm_alloc_2mb();                             # <= 256 MB, identity-reachable; all reservations done -> safe
+    if (nb == 0) { return 0; }                            # no free 2 MB region -> stay on the 256 MB bootstrap
+    # Build the new bitmap: free-by-default, then carry the 0-256 MB reserved/used state (incl. nb's own
+    # region, which pmm_alloc_2mb just marked used) over from the bootstrap.
+    memset(nb, 0, 0x200000);                              # 2 MB all-free
+    memcpy(nb, pmm_bitmap_ptr, 8192);                     # carry 0-256 MB (the bootstrap's full 8 KB)
+    pmm_bitmap_ptr = nb;
+    pmm_bitmap_pages = ram_pages;
+    pmm_total = ram_pages;                                # free_count now reflects the full pool
+    # Reserve non-conventional memmap regions in (256 MB, ram_top] so pmm_alloc_2mb never hands out MMIO /
+    # reserved space. Same free-by-default + reserve-non-conventional policy the bootstrap uses below
+    # 256 MB (pmm_extend reservation 2); <= 256 MB is already covered by the memcpy above.
+    var mm = load64(bi + 0x28);
+    var count = load32(bi + 0x30);
+    var entsize = load32(bi + 0x34);
+    if (mm != 0) {
+        if (count > 0) {
+            if (entsize >= 40) {
+                var i = 0;
+                while (i < count) {
+                    var e = mm + i * entsize;
+                    if (load32(e) != 7) {                 # not EfiConventionalMemory -> reserve
+                        var pg = load64(e + 8) / 4096;
+                        var pgend = pg + load64(e + 24);
+                        if (pg < 65536) { pg = 65536; }   # <= 256 MB already carried by the memcpy
+                        if (pgend > pmm_bitmap_pages) { pgend = pmm_bitmap_pages; }
+                        while (pg < pgend) {
+                            pmm_set(pg);
+                            pg = pg + 1;
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    # Lift the 2 MB user-page allocator to the full RAM (region = 512 pages). pmm_alloc (4 KB, kernel
+    # page tables / DMA) deliberately stays in the 256 MB identity window — only 2 MB user pages, which
+    # the kernel reaches via the direct-map, go higher.
+    pmm_2mb_top_region = pmm_bitmap_pages / 512;
+    return pmm_bitmap_pages;
 }
 
 # 1.49.2 self-test (compile-gated via PMM_FULLRAM_SELFTEST) — prove the 4 KB allocator now serves the
@@ -271,9 +337,45 @@ fn pmm_fullram_selftest() {
     return 0;
 }
 
+#ifdef PMM_HIRAM_SELFTEST
+# 1.49.11 (RAM-arc bite 3c) end-to-end: prove pmm_alloc_2mb hands out a 2 MB region ABOVE the 256 MB
+# identity ceiling after the bitmap migration, AND that the region round-trips through the direct-map
+# (the kernel's >256 MB page-access path, validated under the kernel CR3 in 1.49.10). Boot QEMU -m 1024M.
+# Allocates bottom-up until a region phys >= 256 MB appears, round-trips it under CR3 0x1000, frees all.
+fn pmm_hiram_selftest() {
+    if (pmm_2mb_top_region <= 128) { kprintln("HIRAM: skip (<=256MB RAM)", 25); return 0; }
+    var hr[2048];                       # function-local var[N] = N bytes = 256 u64 slots
+    var n = 0;
+    var hi = 0;
+    while (n < 256) {
+        var r = pmm_alloc_2mb();
+        if (r == 0) { break; }
+        store64(&hr + n * 8, r);
+        n = n + 1;
+        if (r >= 0x10000000) { hi = r; break; }      # first region at/above 256 MB
+    }
+    kprint("HIRAM: allocs=", 14); kprint_num(n); kprint(" hi=", 4); kprint_hex(hi); kprintln("", 0);
+    var ok = 0;
+    if (hi != 0) {
+        var rb = dm_roundtrip_kernel_cr3(DIRECTMAP_BASE + hi, 0xF00DCAFE);
+        kprint("HIRAM: rd@hi=", 13); kprint_hex(rb); kprintln("", 0);
+        if (rb == 0xF00DCAFE) { ok = 1; }
+    }
+    var k = 0;
+    while (k < n) { pmm_free_2mb(load64(&hr + k * 8)); k = k + 1; }
+    if (ok == 1) { kprintln("HIRAM: >256MB alloc+directmap OK", 32); }
+    else { kprintln("HIRAM: >256MB FAIL", 18); }
+    return hi;
+}
+#endif
+
 fn pmm_init() {
+    # Live bitmap starts as the BOOTSTRAP (static, 256 MB); pmm_migrate_bitmap swaps it for a RAM-backed
+    # region once the RAM size is known. Set the pointer + bound FIRST — every bitmap helper reads them.
+    pmm_bitmap_ptr = &pmm_bitmap;
+    pmm_bitmap_pages = 65536;
     # Zero bitmap (all free)
-    memset(&pmm_bitmap, 0, 8192);                 # zero the full 256 MB bitmap
+    memset(pmm_bitmap_ptr, 0, 8192);              # zero the full 256 MB bootstrap bitmap
     pmm_total = 65536;                            # 256 MB
     pmm_used = 0;
     # Mark the first 4 MB as used: kernel image + page tables + stacks.
@@ -290,7 +392,7 @@ fn pmm_init() {
     # region 1, which holds the now-FIXED syscall kstack (see syscall_kstack_reserve).
     # 128 bytes of bitmap = 1024 bits, all 0xFF. NOTE: bump this if the kernel
     # image ever crosses 4 MB (check `readelf -l build/agnos` LOAD MemSiz).
-    memset(&pmm_bitmap, 0xFF, 128);
+    memset(pmm_bitmap_ptr, 0xFF, 128);
     pmm_used = 1024;
     # 1.46.1 (per-process kernel stacks): also reserve region 7 — pages 3584-4095 =
     # phys 0xE00000-0x1000000 = 14-16MB — as the per-proc kernel-stack pool
@@ -299,7 +401,7 @@ fn pmm_init() {
     # AND every per-proc CR3 (which copies PD[0..127]). byte 3584/8=448; 512
     # pages = 64 bytes. NOTE: if the kernel image ever reaches 14MB this collides —
     # check `readelf -l build/agnos` LOAD MemSiz.
-    memset(&pmm_bitmap + 448, 0xFF, 64);
+    memset(pmm_bitmap_ptr + 448, 0xFF, 64);
     pmm_used = pmm_used + 512;
     # 1.46.3 (argv-corruption fix): ALSO reserve region 8 — pages 4096-4607 = phys
     # 0x1000000-0x1200000 = 16-18MB. The 1.46.1 comment CLAIMED to keep allocs out of
@@ -319,7 +421,7 @@ fn pmm_init() {
     # boot PD and the per-proc PD), so the kernel write and the child read agree again.
     # (The stale boot-PD[8] writer is a separate latent bug; region 8 is unused so it is
     # now inert.) byte 4096/8=512; 512 pages = 64 bytes.
-    memset(&pmm_bitmap + 512, 0xFF, 64);
+    memset(pmm_bitmap_ptr + 512, 0xFF, 64);
     pmm_used = pmm_used + 512;
 
     # KASLR: seed next-free hint from RDRAND so dynamic allocations
@@ -361,9 +463,9 @@ fn pmm_alloc() {
     for (var i = pmm_alloc_top; i >= 1024; i = i - 1) {     # 1.49.2: top raised from 4095 (16 MB)
         var byte = i >> 3;
         var bit = i & 7;
-        var b = load8(&pmm_bitmap + byte);
+        var b = load8(pmm_bitmap_ptr + byte);
         if (((b >> bit) & 1) == 0) {
-            store8(&pmm_bitmap + byte, b | (1 << bit));
+            store8(pmm_bitmap_ptr + byte, b | (1 << bit));
             pmm_used = pmm_used + 1;
             pmm_spin_unlock();
             return i * 0x1000;
@@ -383,10 +485,10 @@ fn pmm_free(addr) {
     # are redundant; compute byte/bit once and reuse the load for the clear.
     var byte = page >> 3;
     var bit = page & 7;
-    var b = load8(&pmm_bitmap + byte);
+    var b = load8(pmm_bitmap_ptr + byte);
     # Security: detect double-free (page must be allocated to free it)
     if (((b >> bit) & 1) != 1) { pmm_spin_unlock(); return 0 - 1; }
-    store8(&pmm_bitmap + byte, b & ((0 - 1 - (1 << bit)) & 0xFF));
+    store8(pmm_bitmap_ptr + byte, b & ((0 - 1 - (1 << bit)) & 0xFF));
     pmm_used = pmm_used - 1;
     # Update hint so next alloc finds this freed page quickly
     if (page < pmm_next_free) { pmm_next_free = page; }
@@ -452,7 +554,7 @@ fn pmm_free_2mb(addr) {
     var base = addr / 0x1000;
     if (base % 512 != 0) { return 0 - 1; }   # not 2 MB-aligned
     if (base < 512) { return 0 - 1; }         # region 0 is the kernel
-    if (base >= 65536) { return 0 - 1; }      # 256 MB bitmap, so pmm_alloc_2mb regions up to 4 GB free cleanly
+    if (base >= pmm_bitmap_pages) { return 0 - 1; }   # within the live bitmap (256 MB bootstrap → full RAM after migration)
     pmm_spin_lock();
     for (var i = 0; i < 512; i = i + 1) {
         if (pmm_test(base + i) == 1) {

@@ -216,6 +216,39 @@ fn vmm_remap_wc_range(phys, size) {
 # identity-reachable under the boot CR3). Bite 2 switches the PMM/heap to hand out DIRECTMAP_BASE + phys
 # pointers. Returns 1 on success, 0 on pmm_alloc failure.
 var DIRECTMAP_BASE = 0x200000000;
+
+# Diagnostic: read the live CR3 (active PML4 phys + flags). Single-local frame -> result at [rbp-8].
+fn dm_read_cr3() {
+    var result = 0;
+    asm {
+        0x0F; 0x20; 0xD8;          # mov rax, cr3
+        0x48; 0x89; 0x45; 0xF8;    # mov [rbp-8], rax
+    }
+    return result;
+}
+
+# Diagnostic: read the live RSP. Single-local frame -> result at [rbp-8].
+fn dm_read_rsp() {
+    var result = 0;
+    asm {
+        0x48; 0x89; 0x65; 0xF8;    # mov [rbp-8], rsp
+    }
+    return result;
+}
+
+# Diagnostic: round-trip `val` to `va` under the KERNEL PML4 (0x1000), which carries the directmap,
+# then restore the live CR3. Mirrors the address space kernel threads run under (proc default CR3=0x1000)
+# and a faithful subset of every per-proc CR3 (proc.cyr copies PDPT[1..511] from 0x2000). Code + this
+# frame's stack must be identity-mapped <256 MB under 0x1000 (PD[0..127]) — caller gates on RSP<256 MB.
+fn dm_roundtrip_kernel_cr3(va, val) {
+    var saved = dm_read_cr3();
+    cr3_load(0x1000);
+    store64(va, val);
+    var rb = load64(va);
+    cr3_load(saved);
+    return rb;
+}
+
 fn pmm_setup_directmap(top_phys) {
     var ngb = (top_phys + 0x3FFFFFFF) / 0x40000000;       # round phys up to whole GBs
     if (ngb < 1) { ngb = 1; }

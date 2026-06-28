@@ -173,6 +173,7 @@ else
         [ -n "$NET_SELFTEST" ]       && echo '#define NET_SELFTEST'
         [ -n "$LOOPBACK_SELFTEST" ]  && echo '#define LOOPBACK_SELFTEST'
         [ -n "$PMM_FULLRAM_SELFTEST" ] && echo '#define PMM_FULLRAM_SELFTEST'
+        [ -n "$PMM_HIRAM_SELFTEST" ] && echo '#define PMM_HIRAM_SELFTEST'
         [ -n "$FB_ANSI_SELFTEST" ]   && echo '#define FB_ANSI_SELFTEST'
         [ -n "$FB_ANSI_VISUAL" ]     && echo '#define FB_ANSI_VISUAL'
         [ -n "$KLUG_SELFTEST" ]      && echo '#define KLUG_SELFTEST'

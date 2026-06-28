@@ -168,21 +168,47 @@ kprint("PMM: alloc_top=", 15);
 kprint_num(pmm_alloc_top);
 kprintln("", 0);
 
+# 1.49.11 (RAM-arc bite 3c): if RAM > 256 MB, migrate the bootstrap bitmap to a RAM-backed one covering
+# the full machine RAM + lift pmm_alloc_2mb's ceiling, so user 2 MB pages reach above the 256 MB identity
+# ceiling (zeroed/loaded via the direct-map, validated in 1.49.10). <=256 MB RAM keeps the bootstrap.
+pmm_migrate_bitmap(load64(&boot_info_ptr));
+kprint("PMM: 2mb_top_region=", 20);
+kprint_num(pmm_2mb_top_region);
+kprintln("", 0);
+
 # 1.49.7 (kernel direct-map, bite 1): map all physical RAM at DIRECTMAP_BASE + phys (the per-proc CR3
 # inherits it via the PML4 mirror), then probe it against the identity map. No PMM/heap change yet
 # (bite 2 switches consumers to direct-map pointers). Always-on; the directmap page tables are a few
 # pages from the <=256 MB pool.
 pmm_setup_directmap(pmm_memmap_ram_top);
-var dm_ok = 1;
-if (load64(DIRECTMAP_BASE) != load64(0)) { dm_ok = 0; }                          # phys 0 via directmap == identity
-if (load64(DIRECTMAP_BASE + 0x6400000) != load64(0x6400000)) { dm_ok = 0; }      # phys 100 MB via directmap == identity
-# NOTE (1.49.9): this probe only exercises <=256 MB, where the direct-map VA's low bits alias the live
-# identity map — so it does NOT prove a true >256 MB direct-map access. A write to DIRECTMAP_BASE + 320 MB
-# returns 0 (cyrius load64/store64 don't reach the 8 GB VA). >256 MB RAM is blocked on that; see pmm.cyr.
-if (dm_ok == 1) { kprintln("directmap: low+hi OK", 20); }
-else { kprintln("directmap: low+hi FAIL", 22); }
+# 1.49.10: validate the direct-map in the context its consumers ACTUALLY run under — the kernel PML4
+# (CR3 0x1000), which carries PDPT[8..]. The OLD always-on probe (load64(DIRECTMAP_BASE+phys) ==
+# load64(phys)) was a FALSE POSITIVE: it ran under gnoboot's boot CR3, whose PDPT[8] is a 1 GB IDENTITY
+# page to phys 8 GB (usually unbacked) — so BOTH sides read 0 and matched. That false pass is what made
+# the >256 MB direct-map look "live" while every real >256 MB access returned 0, and is what got
+# mis-attributed to a cyrius load/store truncation. cyrius is EXONERATED (the SAME store64/load64 emit
+# round-trips fine under 0x1000); the bug was active-table geometry. Full root cause + the empirical
+# A/B/C/D/E walk that nailed it: docs/development/issue/2026-06-28-cyrius-high-va-load-store.md.
+#
+# Test a TRUE >256 MB VA (phys 320 MB) whose low bits do NOT alias the <=256 MB identity map, round-trip
+# it under 0x1000 (boot stack <256 MB stays mapped via PD[0..127]), then restore the live CR3. Gated on
+# RAM>320 MB + RSP<256 MB so the brief CR3 switch is always stack-safe; otherwise fall back to a
+# structural check that PDPT[8] is installed in the kernel PDPT.
+if (pmm_memmap_ram_top > 0x14000000 && dm_read_rsp() < 0x10000000) {
+    var dm_rb = dm_roundtrip_kernel_cr3(DIRECTMAP_BASE + 0x14000000, 0xCAFEBABE);
+    if (dm_rb == 0xCAFEBABE) { kprintln("directmap: >256MB OK (kernel CR3)", 33); }
+    else { kprintln("directmap: >256MB FAIL", 22); }
+} else {
+    if ((load64(0x2000 + 8 * 8) & 1) == 1) { kprintln("directmap: installed", 20); }
+    else { kprintln("directmap: NOT installed", 24); }
+}
 #ifdef PMM_FULLRAM_SELFTEST
 pmm_fullram_selftest();
+#endif
+#ifdef PMM_HIRAM_SELFTEST
+# Runs AFTER pmm_setup_directmap — pmm_hiram_selftest round-trips the >256 MB region through the
+# direct-map under CR3 0x1000, which must be installed first.
+pmm_hiram_selftest();
 #endif
 
 # 1.30.11 hardening: re-attempt WC remap of the FB, then verify WC took.
