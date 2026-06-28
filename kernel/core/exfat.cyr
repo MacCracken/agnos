@@ -53,6 +53,13 @@ fn exfat_blk_read(sector, buf) {
     return blk_read_on(exfat_backend, exfat_partition_first_lba + sector, buf);
 }
 
+# 1.48.0 — multi-sector read (the cluster-read collapse, mirror of ext2's blk_read_sectors_on use).
+# `count` partition-relative sectors from `sector` into buf in ONE backend call: on NVMe a <=4 KB run
+# is a single multi-LBA command (block_read_amp), a larger run bounces per-sector (no regression).
+fn exfat_blk_read_sectors(sector, count, buf) {
+    return blk_read_sectors_on(exfat_backend, exfat_partition_first_lba + sector, count, buf);
+}
+
 # Little-endian 32-bit field read from a buffer.
 fn exfat_rd32(p, off) {
     return load8(p + off) | (load8(p + off + 1) << 8) | (load8(p + off + 2) << 16) | (load8(p + off + 3) << 24);
@@ -262,15 +269,22 @@ fn exfat_read(first_cluster, no_fat_chain, buf, maxlen) {
         if (clus >= max_c) { return total; }         # corrupt-chain guard
         if (total >= maxlen) { return total; }
         var base = exfat_cluster_sector(clus);
-        for (var s = 0; s < exfat_sectors_per_cluster; s = s + 1) {
-            if (total >= maxlen) { return total; }
-            if (exfat_blk_read(base + s, &exfat_data_buf) != 0) { return total; }
-            var chunk = 512;
-            if (maxlen - total < chunk) { chunk = maxlen - total; }
-            for (var i = 0; i < chunk; i = i + 1) {
-                store8(buf + total + i, load8(&exfat_data_buf + i));
-            }
-            total = total + chunk;
+        # 1.48.0 — read this cluster's FULL sectors in ONE multi-sector read straight into buf
+        # (collapses the per-sector loop + the byte-copy; the FAT/exFAT analog of block_read_amp —
+        # a <=4 KB cluster goes out as 1 NVMe command vs sectors_per_cluster). The partial tail sector
+        # (when maxlen ends mid-sector) bounces through the 512 B scratch.
+        var want = exfat_sectors_per_cluster * 512;
+        if (maxlen - total < want) { want = maxlen - total; }
+        var fsec = want / 512;
+        var rem = want - fsec * 512;
+        if (fsec > 0) {
+            if (exfat_blk_read_sectors(base, fsec, buf + total) != 0) { return total; }
+            total = total + fsec * 512;
+        }
+        if (rem > 0) {
+            if (exfat_blk_read(base + fsec, &exfat_data_buf) != 0) { return total; }
+            memcpy(buf + total, &exfat_data_buf, rem);
+            total = total + rem;
         }
         if (no_fat_chain == 1) { clus = clus + 1; }   # contiguous run
         else { clus = exfat_next_cluster(clus); }

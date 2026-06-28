@@ -39,6 +39,13 @@ fn fat_blk_read(sector, buf) {
     return blk_read_on(fat_backend, fat_partition_first_lba + sector, buf);
 }
 
+# 1.48.0 — multi-sector read (the cluster-read collapse, mirror of exfat_blk_read_sectors). `count`
+# partition-relative sectors from `sector` into buf in ONE backend call: on NVMe a <=4 KB run is a
+# single multi-LBA command (block_read_amp), a larger run bounces per-sector (no regression).
+fn fat_blk_read_sectors(sector, count, buf) {
+    return blk_read_sectors_on(fat_backend, fat_partition_first_lba + sector, count, buf);
+}
+
 # Partition-relative block write — the mirror of fat_blk_read for the
 # 1.34.x FAT write path. Routes through blk_write_on (+ the 1.33.5
 # blk_flush durability barrier is available via blk_flush_on(fat_backend)).
@@ -610,15 +617,21 @@ fn fatfs_read(cluster, buf, maxlen) {
         guard = guard + 1;
         if (guard > max_cluster) { return total; }
         var base = fatfs_first_sector_of_cluster(clus);
-        for (var s = 0; s < fatfs_sectors_per_cluster; s = s + 1) {
-            if (total >= maxlen) { return total; }
-            if (fat_blk_read(base + s, &fatfs_data_buf) != 0) { return total; }
-            var chunk = 512;
-            if (maxlen - total < chunk) { chunk = maxlen - total; }
-            for (var i = 0; i < chunk; i = i + 1) {
-                store8(buf + total + i, load8(&fatfs_data_buf + i));
-            }
-            total = total + chunk;
+        # 1.48.0 — one multi-sector read per cluster straight into buf (collapses the per-sector loop
+        # + the byte-copy; the FAT/exFAT analog of block_read_amp — a <=4 KB cluster goes out as 1
+        # NVMe command vs sectors_per_cluster). Partial tail sector via the 512 B scratch.
+        var want = fatfs_sectors_per_cluster * 512;
+        if (maxlen - total < want) { want = maxlen - total; }
+        var fsec = want / 512;
+        var rem = want - fsec * 512;
+        if (fsec > 0) {
+            if (fat_blk_read_sectors(base, fsec, buf + total) != 0) { return total; }
+            total = total + fsec * 512;
+        }
+        if (rem > 0) {
+            if (fat_blk_read(base + fsec, &fatfs_data_buf) != 0) { return total; }
+            memcpy(buf + total, &fatfs_data_buf, rem);
+            total = total + rem;
         }
         clus = fat_next_cluster(clus);
     }

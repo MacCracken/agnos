@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.48.0] — 2026-06-27
+
+**▶ 1.48.0 — opens the other-FS perf review arc (FAT/exFAT): cluster-read amplification collapse.**
+
+The 1.47.x ext2 I/O perf wins now extend to the non-ext2 FS drivers (FAT16/FAT32 + exFAT), which read **per-sector** — the same amplification ext2 had pre-1.42.8.
+
+### Changed
+- **`exfat_read` + `fatfs_read` now read each cluster in ONE multi-sector backend call instead of sector-by-sector (`kernel/core/exfat.cyr` + `kernel/core/fatfs.cyr`).** Both walked a cluster with an inner `for s < sectors_per_cluster` loop — one `blk_read_on` per 512-byte sector + a byte-at-a-time copy into the caller's buffer. They now read the cluster's full sectors in one **`exfat_blk_read_sectors`/`fat_blk_read_sectors`** call (the new multi-sector helpers, mirroring the single-sector ones) **straight into `buf`** — eliminating both the per-sector round-trips AND the byte-copy; on NVMe a ≤4 KB cluster goes out as **1 multi-LBA command vs `sectors_per_cluster`** (the FAT/exFAT analog of 1.42.8's `block_read_amp`, already proven). The partial tail sector (when the read ends mid-sector) still bounces through the 512-byte scratch. Larger clusters (>4 KB) fall to the per-sector path with **no regression**. Validated: **exfat-smoke PASS** (mount + multi-cluster FAT-chain read with the upcase TableChecksum reproduced + shell ls), **fat-smoke PASS** (mount + multi-cluster chain read byte-exact + cat + ls), `check.sh` 11/11. First item of the **1.48.x other-FS perf review** — multi-cluster coalescing, FAT-write-path copy elimination, and FAT/cluster-chain re-read reuse follow as 1.48.x patches.
+
 ## [1.47.8] — 2026-06-27
 
 **▶ 1.47.8 — perf patch (6th of the 1.47.x perf series): scheduler single-pass round-robin.**
