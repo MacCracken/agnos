@@ -59,3 +59,5 @@ emitted load/store instruction's effective address, not the value computation.
 A minimal standalone repro (no agnos): map any phys page at a ≥4 GB VA in a fresh PML4/PDPT/PD,
 reload CR3, then `store64`/`load64` the high VA and compare — it should round-trip and currently
 will not.
+
+**Also filed upstream in cyrius:** `cyrius/docs/development/issues/2026-06-28-agnos-high-va-load-store.md`.
