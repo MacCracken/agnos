@@ -537,6 +537,10 @@ exfat_init();
 # the old ext2_active-flag toggle that hid FAT/exFAT behind a mounted ext2.
 vfs_mount_init();
 
+#ifdef LOOPBACK_SELFTEST
+loopback_selftest();
+#endif
+
 # FAT read self-test (1.34.x bite 2, compile-gated via FATFS_SELFTEST).
 # Gates the FAT32 + chain-traversal read path: list the root, find the
 # seeded multi-cluster FATTEST.BIN (3000 B, byte[i] = i & 0xFF), read it

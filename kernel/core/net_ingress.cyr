@@ -95,6 +95,28 @@ fn net_handle_udp(pkt, ip_off, ip_payload_len, src_ip) {
     return udp_data_len;
 }
 
+# 1.49.0 loopback bite 1 self-test (called from main boot under LOOPBACK_SELFTEST). Proves a UDP
+# datagram to 127.0.0.1 loops back INTERNALLY: udp_send → net_tx routes it to the lo queue (NOT
+# nic_send) → net_poll's net_lo_drain runs it through net_demux_frame → net_handle_udp → net_udp_buf,
+# with NO wire peer. In QEMU SLIRP a 127.0.0.1 datagram put on the NIC would never return, so a
+# populated net_udp_buf proves the internal loop. loopback-smoke.sh greps "lo: UDP loopback OK".
+fn loopback_selftest() {
+    var lo_msg = "AGNOS-LO-PING";
+    net_udp_buf_len = 0;
+    udp_send(ip4(127, 0, 0, 1), 4444, 5555, lo_msg, 13);
+    net_poll();
+    kprint("lo: got=", 8);
+    kprint_num(net_udp_buf_len);
+    kprintln("", 0);
+    var lo_ok = 1;
+    if (net_udp_buf_len != 13) { lo_ok = 0; }
+    if (load8(&net_udp_buf + 0) != 65) { lo_ok = 0; }      # 'A'
+    if (load8(&net_udp_buf + 12) != 71) { lo_ok = 0; }     # 'G' (last byte of "AGNOS-LO-PING")
+    if (lo_ok == 1) { kprintln("lo: UDP loopback OK", 19); }
+    else { kprintln("lo: UDP loopback FAIL", 21); }
+    return 0;
+}
+
 # Hardening (1.35.7, arc-close pass 1): an IPv4 header's total-length field is
 # attacker-controlled; never let a handler read past the bytes actually received.
 # Given the claimed total length, the header length, and bytes available
@@ -114,12 +136,42 @@ fn ip_safe_payload_len(ip_total, ip_ihl, avail) {
 # Tool / recv-loop entry point: TX retransmits + RX drain. The 100 Hz timer ISR
 # (timer_handler, pic.cyr) calls net_rx_drain() directly instead, so it never
 # issues TX from interrupt context.
+# net_demux_frame — ethertype dispatch for ONE received (or looped-back) frame. Extracted from
+# net_rx_drain (1.49.0 loopback bite 1) so the loopback queue drains through the SAME demux path as
+# the NIC ring. `pkt` is the eth frame (eth(14) + ip + payload); `pkt_len` its byte length.
+fn net_demux_frame(pkt, pkt_len) {
+    var ethertype = (load8(pkt + 12) << 8) | load8(pkt + 13);
+    if (ethertype == 0x0806) {
+        net_handle_arp(pkt, pkt_len);
+    }
+    if (ethertype == 0x0800) {
+        if (pkt_len >= 34) {
+            var ip_hdr = pkt + 14;
+            var ip_ihl = (load8(ip_hdr) & 0x0F) * 4;
+            var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
+            var ip_proto = load8(ip_hdr + 9);
+            var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
+            # Clamp/validate the claimed IP length against what we actually received (1.35.7).
+            var ip_payload_len = ip_safe_payload_len(ip_total, ip_ihl, pkt_len - 14);
+            if (ip_payload_len >= 0) {
+                if (ip_proto == 1) { net_handle_icmp(pkt, 14 + ip_ihl, ip_payload_len, ip_src); }
+                if (ip_proto == 17) { net_handle_udp(pkt, 14 + ip_ihl, ip_payload_len, ip_src); }
+                if (ip_proto == 6) { net_handle_tcp(pkt, 14 + ip_ihl, ip_payload_len, ip_src); }
+            }
+        }
+    }
+    return 0;
+}
+
 fn net_poll() {
-    if (nic_ready() == 0) { return 0; }
+    # 1.49.0 loopback bite 1: drain the loopback queue even with no physical NIC up (lo works
+    # without any wire). net_lo_drain processes frames net_tx enqueued for 127.x / our own net_ip.
+    if (nic_ready() == 0) { return net_lo_drain(); }
     # B2: drive TCP retransmits before draining RX (cheap ≤8-conn scan; only
     # acts when a held segment's RTO has elapsed).
     tcp_retx_tick();
-    return net_rx_drain();
+    var d = net_rx_drain();
+    return d + net_lo_drain();
 }
 
 # RX-ring drain — guarded inner loop, shared by net_poll() (above) and the timer
@@ -156,35 +208,7 @@ fn net_rx_drain() {
         budget = budget - 1;
         var pkt_len = nic_poll(&net_rx_pkt, 2048);
         if (pkt_len < 14) { net_rx_unlock(); return drained; }   # ring empty (or runt) — done
-        var et_hi = load8(&net_rx_pkt + 12);
-        var et_lo = load8(&net_rx_pkt + 13);
-        var ethertype = (et_hi << 8) | et_lo;
-        if (ethertype == 0x0806) {
-            net_handle_arp(&net_rx_pkt, pkt_len);
-        }
-        if (ethertype == 0x0800) {
-            if (pkt_len >= 34) {
-                var ip_hdr = &net_rx_pkt + 14;
-                var ip_ihl = (load8(ip_hdr) & 0x0F) * 4;
-                var ip_total = (load8(ip_hdr + 2) << 8) | load8(ip_hdr + 3);
-                var ip_proto = load8(ip_hdr + 9);
-                var ip_src = (load8(ip_hdr + 12) << 24) | (load8(ip_hdr + 13) << 16) | (load8(ip_hdr + 14) << 8) | load8(ip_hdr + 15);
-                # Clamp/validate the claimed IP length against what we actually
-                # received before any handler trusts it (1.35.7 hardening).
-                var ip_payload_len = ip_safe_payload_len(ip_total, ip_ihl, pkt_len - 14);
-                if (ip_payload_len >= 0) {
-                    if (ip_proto == 1) {
-                        net_handle_icmp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
-                    }
-                    if (ip_proto == 17) {
-                        net_handle_udp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
-                    }
-                    if (ip_proto == 6) {
-                        net_handle_tcp(&net_rx_pkt, 14 + ip_ihl, ip_payload_len, ip_src);
-                    }
-                }
-            }
-        }
+        net_demux_frame(&net_rx_pkt, pkt_len);
         drained = drained + 1;
     }
     net_rx_unlock();

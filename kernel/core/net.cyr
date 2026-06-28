@@ -10,6 +10,16 @@ var net_pkt[256];
 var arp_cache_ip = 0;
 var arp_cache_mac[8];
 var arp_pending_ip = 0;  # Security: track which IP we sent an ARP request for
+
+# 1.49.0 loopback (lo) — frames destined to 127.0.0.0/8 or our own net_ip are queued here by net_tx
+# and drained through net_demux_frame by net_lo_drain on the poll loop, instead of hitting the wire
+# via nic_send. 8 slots × 1536 B (module-global var[N] = N×u64 = 8N bytes, so lo_ring = 8×1536).
+var lo_ring[1536];
+var lo_lens[8];
+var lo_head = 0;
+var lo_tail = 0;
+var lo_count = 0;
+var lo_dropped = 0;
 # Count of ARP replies the responder has TX'd. A live signal for the boot
 # self-test: a non-zero value is proof the full inbound path fired (RX
 # delivered a request -> net_handle_arp matched our IP -> we sent a reply).
@@ -160,8 +170,62 @@ fn route_next_hop_mac(dst_ip, out_mac) {
     return 0 - 1;
 }
 
+# An IPv4 dst that loops back: 127.0.0.0/8 (canonical loopback) or our OWN assigned net_ip (a packet
+# to self short-circuits the wire). 1.49.0 loopback bite 1.
+fn net_is_loopback(dst_ip) {
+    if (((dst_ip >> 24) & 0xFF) == 127) { return 1; }
+    if (net_ip != 0 && dst_ip == net_ip) { return 1; }
+    return 0;
+}
+
+# Copy a fully-framed eth frame into the loopback queue (drop + count on full). 1.49.0 loopback bite 1.
+fn net_lo_enqueue(buf, len) {
+    if (lo_count >= 8) { lo_dropped = lo_dropped + 1; return 0 - 1; }
+    if (len > 1536) { len = 1536; }
+    var slot = &lo_ring + lo_tail * 1536;
+    memcpy(slot, buf, len);
+    store64(&lo_lens + lo_tail * 8, len);
+    lo_tail = (lo_tail + 1) & 7;
+    lo_count = lo_count + 1;
+    return 0;
+}
+
+# Drain the loopback queue through net_demux_frame (the SAME demux the NIC ring uses). Bounded budget;
+# the loop also processes frames the demux just enqueued (a TCP SYN's SYN-ACK, etc.), so a full
+# handshake completes here without net_tx ever recursing. 1.49.0 loopback bite 1.
+fn net_lo_drain() {
+    var drained = 0;
+    var budget = 64;
+    while (budget > 0) {
+        budget = budget - 1;
+        if (lo_count == 0) { return drained; }
+        var slot = &lo_ring + lo_head * 1536;
+        var slen = load64(&lo_lens + lo_head * 8);
+        lo_head = (lo_head + 1) & 7;
+        lo_count = lo_count - 1;
+        net_demux_frame(slot, slen);
+        drained = drained + 1;
+    }
+    return drained;
+}
+
+# net_tx — the TX chokepoint. An IPv4 frame whose dst is loopback (net_is_loopback) is queued for the
+# loopback drain instead of the wire; everything else (ARP, off-box IP) goes to nic_send. 1.49.0
+# loopback bite 1. The dst IP sits at eth(14) + ip-dst-offset(16) = frame offset 30.
+fn net_tx(buf, len) {
+    if (len >= 34) {
+        var ethertype = (load8(buf + 12) << 8) | load8(buf + 13);
+        if (ethertype == 0x0800) {
+            var dst = (load8(buf + 30) << 24) | (load8(buf + 31) << 16) | (load8(buf + 32) << 8) | load8(buf + 33);
+            if (net_is_loopback(dst) == 1) { return net_lo_enqueue(buf, len); }
+        }
+    }
+    return nic_send(buf, len);
+}
+
 fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
-    if (nic_ready() == 0) { return 0 - 1; }
+    # 1.49.0 loopback: a loopback dst doesn't need a NIC up; only gate non-loopback sends on nic_ready.
+    if (nic_ready() == 0 && net_is_loopback(dst_ip) == 0) { return 0 - 1; }
     # Default to broadcast MAC — correct for QEMU SLIRP and any actual
     # broadcast destination. For non-broadcast dst_ip, consult the route
     # helper; if resolved, use the next-hop MAC instead.
@@ -176,7 +240,7 @@ fn udp_send(dst_ip, src_port, dst_port, data, data_len) {
     var off = eth_build(p, &dst_mac, &kmac, 0x0800);
     var udp_len = udp_build(p + off + 20, src_port, dst_port, data, data_len);
     ip_build(p + off, net_ip, dst_ip, 17, udp_len);
-    return nic_send(p, off + 20 + udp_len);
+    return net_tx(p, off + 20 + udp_len);
 }
 
 # Send a UDP datagram with an explicit src_ip override (for DHCP, where

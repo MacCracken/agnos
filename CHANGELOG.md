@@ -5,6 +5,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.0] — 2026-06-27
+
+**▶ 1.49.0 — opens the kernel-capability-gaps arc.** The 1.47.x perf series and the 1.48.x FAT/exFAT review are closed; this arc turns to the real capability gaps surfaced 2026-06-27 — the items that only became visible because the storage/net/FS foundation is now solid enough to expose them. Staged across 1.49.x–1.50.x ("plenty of numbers to use"):
+
+- **(1) Full RAM initialization** — `pmm_init` hardcodes `pmm_total=32768` and `pmm_alloc` caps at page 4095 (**16 MB**), ignoring the boot_info memmap; size the PMM to the machine's actual RAM (parse `memmap_phys`/`count`/`entsize`) + lift the alloc cap. Unblocks server/desktop workloads + the self-hosting "build agnos on agnos" goal. *(Foundational + self-contained — the recommended first gap.)*
+- **(2) Loopback interface** — no `lo` / 127.0.0.1 today (the net stack is physical-NIC-only); add a loopback so a server + a local client on one box (and socket-IPC) work without the wire.
+- **(3) Socket-as-VFS-fd bridge** — accepted connections are `conn_id`s (the `sock_accept`#57 return), not VFS fds, so they aren't epoll-able; bridge them into the per-process fd table (a `VFS_SOCK` tag) so `epoll`/`read`/`write`/`close` work uniformly. Pairs with broader VFS-fd unification (may share this block or take its own minor).
+
+**Staggering confirmed (user, 2026-06-27): loopback first.**
+
+### Added
+- **Loopback interface (`lo`) — bite 1: the core mechanism + UDP (`kernel/core/net.cyr` + `net_ingress.cyr`).** Frames destined to **127.0.0.0/8 or our own `net_ip`** now loop back internally instead of hitting the wire: a new **`net_tx`** TX-chokepoint wrapper detects a loopback IP frame and **queues** it (an 8-slot ring) rather than calling `nic_send`; **`net_lo_drain`** (wired into `net_poll`, and runnable with **no physical NIC up**) drains the queue through **`net_demux_frame`** — the ethertype dispatch extracted from `net_rx_drain` so a looped frame takes the *same* path as the NIC ring. Queuing (not synchronous inject) means a future TCP handshake's replies re-enter `net_tx` without recursion. `udp_send` is routed through `net_tx` (its `nic_ready` gate relaxed for loopback dsts). Validated: **loopback-smoke PASS** in QEMU — a UDP datagram to 127.0.0.1 round-trips through the queue + demux into `net_udp_buf` with *no wire peer* (QEMU SLIRP never returns a 127.0.0.1 datagram, so the populated buffer proves the internal loop); **dns-smoke 3/3** (DHCP + DNS unregressed — the demux refactor + `net_tx` are transparent to the NIC path); `check.sh` 11/11. New: `scripts/loopback-smoke.sh`, `LOOPBACK_SELFTEST` build gate.
+- **Bite 2 (next):** route `tcp_output` + ICMP through `net_tx`; validate a local TCP listen+connect over `lo` and a loopback ping.
+
 ## [1.48.2] — 2026-06-27
 
 **▶ 1.48.2 — other-FS perf review (3rd item, closes the set): FAT/exFAT multi-cluster read coalescing.** (The 4th planned item — cluster-chain re-read reuse — was found ALREADY DONE.)
