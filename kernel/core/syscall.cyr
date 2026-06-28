@@ -973,6 +973,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
                     if (wtype == VFS_TIMERFD) {
                         if (timer_ticks >= kpayload(wbase, 1)) { rdy = 1; }
                     }
+                    if (wtype == VFS_SOCK) {        # 1.49.5 socket readiness -> EPOLLIN when readable
+                        if (tcp_readable(kpayload(wbase, 0)) == 1) { rdy = 1; }
+                    }
                 }
             }
             if (rdy == 1) {

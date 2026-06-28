@@ -486,6 +486,19 @@ fn tcp_conn_dead(conn_id) {
     return 0;
 }
 
+# 1.49.5 (socket-as-VFS-fd, epoll) — readiness probe for a VFS_SOCK fd: 1 if the conn has buffered RX
+# data to read OR is dead (so read returns EOF), else 0. net_poll FIRST so freshly-arrived bytes show.
+# epoll_wait consults this for a VFS_SOCK watch; matches tcp_recv's ring math (rx_write-rx_read @ cb+64/+80).
+fn tcp_readable(conn_id) {
+    if (conn_id < 0) { return 0; }
+    if (conn_id >= tcp_conn_count) { return 0; }
+    net_poll();
+    var cb = tcp_conn_base(conn_id);
+    if (load64(cb + 64) - load64(cb + 80) > 0) { return 1; }   # rx ring has bytes
+    if (load64(cb) == 0) { return 1; }                          # conn dead -> readable (EOF)
+    return 0;
+}
+
 fn tcp_close(conn_id) {
     if (conn_id < 0) { return 0 - 1; }
     if (conn_id >= tcp_conn_count) { return 0 - 1; }

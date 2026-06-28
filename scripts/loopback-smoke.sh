@@ -125,6 +125,7 @@ check "lo: UDP loopback OK"       "UDP datagram to 127.0.0.1 looped back (net_tx
 check "lo: ICMP ping loopback OK" "ICMP echo to net_ip self-looped (request + reply both via the lo queue)"       "ICMP loopback regression"
 check "lo: TCP loopback OK"       "TCP handshake to net_ip completed over lo (SYN/SYN-ACK/ACK via the lo queue)"  "TCP loopback handshake regression"
 check "lo: socket-as-VFS-fd OK"   "sock_accept returns a VFS_SOCK fd; read#5 through the fd got the client's bytes; close OK" "socket-as-VFS-fd dispatch regression"
+check "lo: epoll sock-ready OK"   "epoll readiness on a VFS_SOCK fd flips 0->1 across the client send (epoll_wait would fire EPOLLIN)" "epoll socket-readiness regression"
 
 echo ""
 echo "=== loopback-smoke: $pass passed, $fail failed ==="

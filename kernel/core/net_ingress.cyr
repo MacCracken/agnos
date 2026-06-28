@@ -136,13 +136,19 @@ fn loopback_selftest() {
         var sconn = tcp_accept(lid);
         if (sconn >= 0) {
             var sfd = vfs_create_sock(sconn);
+            var erdy0 = tcp_readable(sconn);            # 1.49.5: epoll readiness BEFORE data -> 0
             var smsg = "SOCKFD";
             tcp_send(cid, smsg, 6);
             net_poll();
+            var erdy1 = tcp_readable(sconn);            # AFTER data -> 1 (epoll_wait fires EPOLLIN)
             var rbuf[16];
             var got = vfs_read(sfd, &rbuf, 16);
             kprint("lo: sockfd got=", 15);
             kprint_num(got);
+            kprint(" rdy ", 5);
+            kprint_num(erdy0);
+            kprint("->", 2);
+            kprint_num(erdy1);
             kprintln("", 0);
             var sok = 1;
             if (sfd < 0) { sok = 0; }
@@ -152,6 +158,11 @@ fn loopback_selftest() {
             vfs_close(sfd);
             if (sok == 1) { kprintln("lo: socket-as-VFS-fd OK", 23); }
             else { kprintln("lo: socket-as-VFS-fd FAIL", 25); }
+            var eok = 1;
+            if (erdy0 != 0) { eok = 0; }                # must be NOT readable before the send
+            if (erdy1 != 1) { eok = 0; }                # must be readable after the send
+            if (eok == 1) { kprintln("lo: epoll sock-ready OK", 23); }
+            else { kprintln("lo: epoll sock-ready FAIL", 25); }
         }
     }
     return 0;

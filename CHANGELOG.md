@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.5] — 2026-06-27
+
+**▶ 1.49.5 — capability gap 3, socket-as-VFS-fd bite 2: VFS_SOCK fds are epoll-ready. Gap 3 COMPLETE.**
+
+### Added
+- **`epoll_wait` #21 now reports a VFS_SOCK fd as readable when its TCP conn has RX data or is dead (`kernel/core/syscall.cyr` + `net_tcp.cyr`).** A new **`tcp_readable(conn_id)`** probe — `net_poll`, then `rx_write - rx_read > 0` (data buffered) OR conn-dead (EOF) — backs an added VFS_SOCK arm in `epoll_wait`'s per-watch readiness loop, so a socket fd in an epoll set wakes `epoll_wait` with EPOLLIN exactly when a `read#5` would return data. Additive: the signalfd/timerfd readiness arms + the watch-fd bounds checks are byte-identical. This **completes the socket-as-VFS-fd keystone** — an accepted TCP connection is now a uniform, **epoll-able** fd (`sock_accept`→fd; `read`/`write`/`close`; and epoll), the event-loop primitive a real network service / container host needs. Validated: **loopback-smoke 5/5** — over `lo`, the readiness flips **0→1 across the client send** (`rdy 0->1`), i.e. it reports not-ready until data arrives then ready, byte-exact read-back unchanged; `check.sh` 11/11. (`tcp_readable` — the exact function the epoll arm calls — is probed directly in the selftest; the full ring-3 `epoll_wait`-on-socket path needs a user events buffer unavailable at the boot selftest.) Gap 3 of the 1.49.x capability-gaps arc is done. **Still owed in 1.49.x: the >128 MB RAM extension** (bigger/relocated PMM bitmap + per-proc CR3 identity past 256 MB).
+
 ## [1.49.4] — 2026-06-27
 
 **▶ 1.49.4 — capability gap 3, socket-as-VFS-fd bite 1: accepted TCP connections are now fds.**
