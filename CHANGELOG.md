@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.7] — 2026-06-27
+
+**▶ 1.47.7 — perf patch (5th of the 1.47.x perf series): ext2 multi-block write coalescing (the write mirror of 1.47.6).**
+
+### Changed
+- **`ext2_write_at` now coalesces physically-contiguous full-block writes into ONE direct multi-LBA DMA, and the non-coalesced bounce copy is now word-wide (`kernel/core/ext2.cyr` + `kernel/core/block.cyr`).** The prior path wrote one NVMe command per FS block AND copied each block src→`ext2_block_buf` with a **byte-at-a-time 4 KB loop** before the bounce. Now, for a run of full, block-aligned writes from a DMA-safe src (page-aligned + in the 0–256 MB per-proc-CR3 identity window, IOMMU inactive), `ext2_write_at` allocates the run and — if the blocks are physically contiguous — writes the whole run **straight from src in one multi-LBA NVMe command** via the new **`blk_write_sectors_direct`**, skipping both the per-block copy and the bounce. The non-coalesced fallback (partial/unaligned/high/extent writes) now uses **word-wide `memcpy`/`memset`** instead of the byte loops. Gated identically to the 1.47.6 read coalescing; shares the **`ext2_read_coalesce_max`** kill-switch. Validated: new **`block_coalesce_write_amp: multi=1 perblk=16`** bench proof + **`ext2w: write-coalesce 32KB round-trip OK`** (data read back byte-identical — e2fsck checks metadata, this checks content); ext2-write-smoke e2fsck-clean, exec-smoke 15/15, `check.sh` 11/11. **Iron-DMA validation rides the 1.47.x burn** alongside 1.47.6 (same NVMe >2-page PRP-list path; kill-switch is the fallback).
+
 ## [1.47.6] — 2026-06-27
 
 **▶ 1.47.6 — perf patch (4th of the 1.47.x perf series): ext2 multi-block read coalescing.**

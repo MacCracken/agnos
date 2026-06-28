@@ -3215,6 +3215,34 @@ fn ext2_write_at(inode_num, offset, src, len) {
         var chunk = ext2_blocksize - boff;
         if (chunk > rem) { chunk = rem; }
 
+        # 1.47.7 — multi-block write coalescing (the write mirror of 1.47.6). For a run of FULL,
+        # block-aligned writes from a DMA-safe src (page-aligned + in the 0-256 MB per-proc-CR3
+        # identity window → physically contiguous; IOMMU inactive), allocate the run and — if the
+        # allocated blocks are physically contiguous — write the whole run straight FROM src in ONE
+        # multi-LBA NVMe command, skipping BOTH the per-block src→ext2_block_buf copy and the bounce.
+        # Indirect inodes only (extents keep the per-block path). `ext2_read_coalesce_max` (shared
+        # with the read path) is the kill-switch. Falls through to the single-block path for a
+        # partial/unaligned/high/extent write.
+        var srcp = src + written;
+        if (is_extent == 0 && boff == 0 && chunk == ext2_blocksize && iommu_active == 0
+        && (srcp & 0xFFF) == 0 && (srcp + ext2_blocksize) <= 0x10000000) {
+            var rphys = ext2_bmap_alloc(&ext2_inode_buf, lblk);
+            if (rphys <= 0) { break; }   # ENOSPC — return partial
+            var wrun = 1;
+            while (wrun < ext2_read_coalesce_max
+            && (written + (wrun + 1) * ext2_blocksize) <= len
+            && (srcp + (wrun + 1) * ext2_blocksize) <= 0x10000000) {
+                var nphys = ext2_bmap_alloc(&ext2_inode_buf, lblk + wrun);
+                if (nphys != rphys + wrun) { break; }   # non-contiguous / ENOSPC → end the run
+                wrun = wrun + 1;
+            }
+            if (blk_write_sectors_direct(ext2_backend, ext2_block_to_lba(rphys), wrun * ext2_sectors_per_block, srcp) != 0) { break; }
+            written = written + wrun * ext2_blocksize;
+            cur = cur + wrun * ext2_blocksize;
+            rem = rem - wrun * ext2_blocksize;
+            continue;
+        }
+
         var phys = 0;
         if (is_extent == 1) { phys = ext2_extent_bmap_alloc(&ext2_inode_buf, lblk, inode_num); }
         else                { phys = ext2_bmap_alloc(&ext2_inode_buf, lblk); }
@@ -3222,25 +3250,15 @@ fn ext2_write_at(inode_num, offset, src, len) {
         var was_new = ext2_bmap_was_new;
 
         if (chunk == ext2_blocksize) {
-            # full-block overwrite — no need to preserve anything
-            var c = 0;
-            while (c < ext2_blocksize) {
-                store8(&ext2_block_buf + c, load8(src + written + c));
-                c = c + 1;
-            }
+            # full-block overwrite — no need to preserve anything (word-wide memcpy, 1.47.7)
+            memcpy(&ext2_block_buf, srcp, ext2_blocksize);
         } else {
             # partial block: zero a freshly-born block, else RMW the old one
-            if (was_new == 1) {
-                var zz = 0;
-                while (zz < ext2_blocksize) { store8(&ext2_block_buf + zz, 0); zz = zz + 1; }
-            } else {
+            if (was_new == 1) { memset(&ext2_block_buf, 0, ext2_blocksize); }
+            else {
                 if (ext2_read_block(phys, &ext2_block_buf) != 0) { break; }
             }
-            var c2 = 0;
-            while (c2 < chunk) {
-                store8(&ext2_block_buf + boff + c2, load8(src + written + c2));
-                c2 = c2 + 1;
-            }
+            memcpy(&ext2_block_buf + boff, srcp, chunk);
         }
         if (ext2_write_block(phys, &ext2_block_buf) != 0) { break; }
 
@@ -3989,6 +4007,37 @@ fn ext2_write_selftest() {
         kprint(" reread=", 8);
         kprint_num(ind_reread);
         kprintln(" l1-reads", 9);
+    }
+
+    # 1.47.7 — multi-block write coalescing correctness. Write an 8-block (32 KB) file from a
+    # page-aligned DMA-safe src (a 2 MB pmm region) — exercising the coalescing direct-write path —
+    # then read it back and verify the byte pattern survives. (e2fsck checks metadata; this checks
+    # DATA: a wrong-LBA / wrong-length coalesced write would corrupt content e2fsck can't see.)
+    var wcsrc = pmm_alloc_2mb();
+    if (wcsrc > 0) {
+        var wci = 0;
+        while (wci < 32768) {
+            store8(wcsrc + wci, (wci * 7 + 3) & 0xFF);
+            wci = wci + 1;
+        }
+        var wcok = 1;
+        var wcino = ext2_create(2, "wcoal.dat", 9);
+        if (wcino > 0) {
+            if (ext2_write_at(wcino, 0, wcsrc, 32768) != 32768) { wcok = 0; }
+            var wcdst = pmm_alloc_2mb();
+            if (wcdst > 0) {
+                if (ext2_read_at(wcino, 0, wcdst, 32768) != 32768) { wcok = 0; }
+                var wcj = 0;
+                while (wcj < 32768) {
+                    if (load8(wcdst + wcj) != ((wcj * 7 + 3) & 0xFF)) { wcok = 0; wcj = 32768; }
+                    wcj = wcj + 1;
+                }
+                pmm_free_2mb(wcdst);
+            } else { wcok = 0; }
+        } else { wcok = 0; }
+        pmm_free_2mb(wcsrc);
+        if (wcok == 1) { kprintln("ext2w: write-coalesce 32KB round-trip OK", 40); }
+        else { kprintln("ext2w: write-coalesce 32KB round-trip MISMATCH", 46); }
     }
 
     return 0;

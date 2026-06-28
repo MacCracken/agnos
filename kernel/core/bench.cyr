@@ -174,6 +174,32 @@ fn bench_run_all() {
             kprintln(" nvme submits/64KB", 18);
         }
     }
+    # block_coalesce_write_amp (1.47.7): write 16 contiguous blocks (128 sectors = 64 KB) two ways +
+    # count NVMe submits. blk_write_sectors_direct DMAs the whole run straight FROM a DMA-safe 2 MB
+    # src in ONE multi-LBA command (multi=1); 16 separate block writes = 16 commands (perblk=16). The
+    # write mirror of block_coalesce_amp — the win ext2_write_at's multi-block coalescing realizes on a
+    # contiguous large-file write. Writes raw LBA 0-127 of the blank bench disk; temp 2 MB DMA src.
+    if (nvme_io_ready == 0) {
+        kprintln("  block_coalesce_write_amp: skipped (no nvme)", 45);
+    } else {
+        var cwamp = pmm_alloc_2mb();
+        if (cwamp == 0) {
+            kprintln("  block_coalesce_write_amp: skipped (no 2MB region)", 51);
+        } else {
+            nvme_io_submit_count = 0;
+            blk_write_sectors_direct(BLK_NVME, 0, 128, cwamp);
+            var cwmulti = nvme_io_submit_count;
+            nvme_io_submit_count = 0;
+            for (var cwb = 0; cwb < 16; cwb = cwb + 1) { blk_write_sectors_on(BLK_NVME, cwb * 8, 8, cwamp); }
+            var cwperblk = nvme_io_submit_count;
+            pmm_free_2mb(cwamp);
+            kprint("  block_coalesce_write_amp: multi=", 34);
+            kprint_num(cwmulti);
+            kprint(" perblk=", 8);
+            kprint_num(cwperblk);
+            kprintln(" nvme submits/64KB", 18);
+        }
+    }
 
     # --- tier2: subsystems (syscall / vfs) ---
     kprintln("[tier2] subsystems", 18);

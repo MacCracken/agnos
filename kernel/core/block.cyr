@@ -247,6 +247,19 @@ fn blk_read_sectors_direct(tag, start, count, buf) {
     return blk_read_sectors_on(tag, start, count, buf);
 }
 
+# 1.47.7 perf — no-bounce multi-sector WRITE, the mirror of blk_read_sectors_direct. Caller
+# guarantees `buf` (the SOURCE here) is DMA-safe (page-aligned + physically contiguous). NVMe DMAs
+# the whole run straight FROM buf in one multi-LBA command — skipping both the per-block
+# src→scratch copy and the bounce. Other backends fall back to blk_write_sectors_on.
+fn blk_write_sectors_direct(tag, start, count, buf) {
+    if ((blk_registered & (1 << tag)) == 0) { return 0 - 1; }
+    if (tag == BLK_NVME) {
+        if (nvme_write_sectors(start, count, buf) == 1) { return 0; }
+        return 0 - 1;
+    }
+    return blk_write_sectors_on(tag, start, count, buf);
+}
+
 # 1.47.1 perf — multi-sector WRITE dispatch, the mirror of blk_read_sectors_on. NVMe takes the
 # single multi-LBA command (nvme_blk_write_sectors) collapsing `count` submits → 1; the other
 # backends keep the per-sector loop (they don't show NVMe's submit/poll-per-sector amplification —
