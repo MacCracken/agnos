@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.6] — 2026-06-27
+
+**▶ 1.49.6 — full-RAM extension, bite 1: 128 → 256 MB (the per-proc identity's full window).**
+
+### Changed
+- **The PMM now manages up to 256 MB instead of 128 MB (`kernel/core/pmm.cyr` + `proc.cyr`).** The blocker was never the bitmap — it's the per-proc CR3, which reaches PMM pages only via their identity VA during a syscall. `proc_create_address_space` re-asserted the per-proc identity for PD[8..63] (16–128 MB); it now re-asserts **PD[8..127] (16–256 MB)** as supervisor identity — the full low window before the user mmap arena (which starts at 256 MB), so no VA conflict. The PMM bitmap grows 512→**1024 u64** (256 MB = 65536 pages), and every size-dependent constant tracks it (validity bound 65536, alloc-cap clamp 65535, `pmm_total`, and the kernel-image reservation now covers the full KASLR range within the bitmap). **Result: ~198 MB of usable 4 KB pages** (50877 free above 16 MB at `-m 256M`, up from ~104 MB). Validated: **pmm-fullram-smoke** alloc_top=65535 (256 MB) + boot-to-shell; **exec-smoke PASS non-PIE AND PIE** (proc creation + exec-from-disk + e2fsck-clean; a KASLR'd kernel at 122 MB *inside* the bitmap was reservation-protected); `check.sh` 11/11. (`exec-smoke`'s sysi gate moved 73→81 — `/bin/sysi` exits `'A' + (pmm_total*4096 >> 24)`, which the 256 MB pool shifts to 0x10 → 81; kernel correct, the test just pinned the old size.)
+- **Next (1.49.7+): the high-half kernel direct-map.** 256 MB is the ceiling of the identity design — above it the kernel's identity VA collides with the user mmap arena (256 MB–1 GB). Mapping all physical RAM at a high kernel VA, shared across CR3s, with the PMM/heap returning high-half pointers, decouples kernel RAM access from the low-half user VAs → the **full available RAM**. The foundational sub-arc that reaches "the available".
+
 ## [1.49.5] — 2026-06-27
 
 **▶ 1.49.5 — capability gap 3, socket-as-VFS-fd bite 2: VFS_SOCK fds are epoll-ready. Gap 3 COMPLETE.**

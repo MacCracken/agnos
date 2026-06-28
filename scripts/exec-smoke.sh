@@ -131,14 +131,15 @@ else
     echo "  FAIL: no 'run: exit 90' (argv[i] pointers don't resolve to arg strings)"; rc=1
 fi
 # 1.42.10: sysinfo syscalls (uname#34 + sysinfo#35) — /bin/sysi is exec #3 (the
-# 1.42.4 reap work lifted the old 2-exec-per-boot cap). It calls both new syscalls
-# into a user-stack buffer and exits sysname[0]('A'=0x41) + totalram byte3 (0x01
-# of the 16 MB / 0x01000000 pmm pool) = 73 — so 'run: exit 66' proves both
-# syscalls dispatch from ring 3, pass is_user_range, and write the right struct bytes.
-if strings "$LOG" | grep -q "^run: exit 73"; then
-    echo "  PASS: sysinfo syscalls — /bin/sysi uname#34 + sysinfo#35 wrote correct struct bytes (exit 73)"
+# 1.42.4 reap work lifted the old 2-exec-per-boot cap). It calls both new syscalls into a user-stack
+# buffer and exits sysname[0]('A'=0x41=65) + totalram byte3. totalram = pmm_total*4096; since 1.49.6
+# the PMM bitmap is 256 MB (pmm_total=65536) so totalram=0x10000000, byte3=0x10=16, exit = 65+16 = 81.
+# (Tracks the PMM-pool size — bump as the RAM arc grows the bitmap: 1 GB -> byte3 0x40 -> exit 129.)
+# Proves both syscalls dispatch from ring 3, pass is_user_range, and write the right struct bytes.
+if strings "$LOG" | grep -q "^run: exit 81"; then
+    echo "  PASS: sysinfo syscalls — /bin/sysi uname#34 + sysinfo#35 wrote correct struct bytes (exit 81, 256 MB pool)"
 else
-    echo "  FAIL: no 'run: exit 66' (uname#34 / sysinfo#35 didn't write the expected struct bytes)"; rc=1
+    echo "  FAIL: no 'run: exit 81' (uname#34 / sysinfo#35 didn't write the expected struct bytes for the 256 MB PMM pool)"; rc=1
 fi
 # 1.42.12: klog#36 — /bin/klog is exec #4; it calls klog(buf, 200) and exits with
 # the byte count returned. The boot log is >> 200 B by now, so klog returns 200,

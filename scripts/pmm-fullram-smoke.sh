@@ -63,8 +63,8 @@ chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else ech
 
 TOP=$(strings "$LOG" | grep -oE "PMM: alloc_top=[0-9]+" | head -1 | grep -oE "[0-9]+")
 echo ""
-if [ -n "$TOP" ] && [ "$TOP" -gt 4095 ]; then echo "PASS: alloc_top=${TOP} (> 4095 — cap raised past 16 MB)"; pass=$((pass+1));
-else echo "FAIL: alloc_top=${TOP:-?} not raised past 4095"; fail=$((fail+1)); fi
+if [ -n "$TOP" ] && [ "$TOP" -gt 32767 ]; then echo "PASS: alloc_top=${TOP} (> 32767 — cap raised past the old 128 MB bitmap into the 256 MB window)"; pass=$((pass+1));
+else echo "FAIL: alloc_top=${TOP:-?} not raised past 32767 (256 MB extension regressed to <= 128 MB)"; fail=$((fail+1)); fi
 chk "PMM ext: >16MB alloc OK" "two 4 KB allocs landed > 16 MB, distinct, freed" "PMM extension alloc regression"
 chk "AGNOS shell"             "kernel booted to shell with the extension (kernel image not clobbered)" "boot did not reach shell — possible self-clobber"
 

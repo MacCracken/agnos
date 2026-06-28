@@ -1,7 +1,10 @@
 # === Physical Memory Manager ===
 # Bitmap allocator: 1 bit per 4KB page
-# 16MB = 4096 pages = 512 bytes bitmap
-var pmm_bitmap[512];
+# 1.49.6: 256 MB bitmap = 65536 pages = 8192 bytes = 1024 u64 (module-global var[N] = N u64). Grown
+# from the 128 MB (512-u64) bitmap to use the FULL per-proc CR3 identity window (0-256 MB; proc.cyr
+# re-asserts PD[8..127]). >256 MB needs a high-half kernel direct-map (next sub-arc). The page count
+# (65536), validity bound, alloc-cap clamp (65535) + the kernel-image reservation bound all track this.
+var pmm_bitmap[1024];
 var pmm_total = 0;
 # 1.49.1 (full RAM init, bite 1) — UEFI memory-map discovery results, set by pmm_probe_memmap and
 # consumed in bite 2 to size the PMM to the machine's actual RAM. Pure discovery; no alloc change yet.
@@ -61,7 +64,7 @@ fn pmm_spin_unlock() {
 # to prevent negative indices and out-of-bounds access.
 fn pmm_page_valid(page) {
     if (page < 0) { return 0; }
-    if (page >= 32768) { return 0; }
+    if (page >= 65536) { return 0; }              # 1.49.6: 256 MB bitmap (was 32768 = 128 MB)
     return 1;
 }
 
@@ -155,10 +158,10 @@ fn pmm_extend_to_memmap(bi) {
     # (1) reserve the KASLR'd kernel image if it lands in the bitmap's 18-128 MB window, so top-down
     #     pmm_alloc never clobbers it (the non-PIE kernel at 1 MB is already in pmm_init's reservation).
     if (kbase >= 0x1200000) {
-        if (kbase < 0x8000000) {
+        if (kbase < 0x10000000) {                  # 1.49.6: kernel-image reservation now covers the full KASLR range in the 256 MB bitmap (was 0x8000000 = 128 MB)
             var kp = kbase / 4096;
             var kpend = kp + 4096;             # 16 MB window (image is a few MB; generous margin)
-            if (kpend > 32768) { kpend = 32768; }
+            if (kpend > 65536) { kpend = 65536; }  # 1.49.6: clamp to the 256 MB bitmap
             while (kp < kpend) {
                 pmm_set(kp);
                 kp = kp + 1;
@@ -179,7 +182,7 @@ fn pmm_extend_to_memmap(bi) {
                         var pg = load64(e + 8) / 4096;
                         var pgend = pg + load64(e + 24);
                         if (pg < 4608) { pg = 4608; }       # 0-18 MB is pmm_init's domain
-                        if (pgend > 32768) { pgend = 32768; }
+                        if (pgend > 65536) { pgend = 65536; }
                         while (pg < pgend) {
                             pmm_set(pg);
                             pg = pg + 1;
@@ -192,7 +195,7 @@ fn pmm_extend_to_memmap(bi) {
     }
     # raise the 4 KB-allocator cap to the discovered top, clamped to the 128 MB bitmap.
     var topp = pmm_memmap_top / 4096;
-    if (topp > 32767) { topp = 32767; }        # clamp to the 128 MB bitmap (full-RAM > 128 MB = bite 3)
+    if (topp > 65535) { topp = 65535; }        # 1.49.6: clamp to the 256 MB bitmap (>256 MB = high-half direct-map sub-arc)
     if (topp <= 4095) { return 0; }            # <= 16 MB RAM -> keep the safe baseline cap
     pmm_alloc_top = topp;
     return topp;
@@ -231,8 +234,8 @@ fn pmm_fullram_selftest() {
 
 fn pmm_init() {
     # Zero bitmap (all free)
-    memset(&pmm_bitmap, 0, 4096);
-    pmm_total = 32768;
+    memset(&pmm_bitmap, 0, 8192);                 # 1.49.6: zero the full 256 MB bitmap (was 4096)
+    pmm_total = 65536;                            # 1.49.6: 256 MB (was 32768 = 128 MB)
     pmm_used = 0;
     # Mark the first 4 MB as used: kernel image + page tables + stacks.
     # 1.40.9: was 2 MB (pages 0-511), but the kernel image (LOAD MemSiz) now

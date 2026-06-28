@@ -453,7 +453,7 @@ fn proc_create_address_space() {
     # SUPERVISOR 2MB pages so the kernel can reach the whole pmm range. U/S=0 keeps
     # ring 3 out; user code/stack live in PD[2]/PD[4] and the mmap arena in
     # PD[128+], so no user VA resolves through these slots (no aliasing).
-    for (var hi = 8; hi < 64; hi = hi + 1) {
+    for (var hi = 8; hi < 128; hi = hi + 1) {     # 1.49.6: 16-256MB (was 16-128MB) — full identity window
         store64(new_pd + hi * 8, (hi * 0x200000) | 0x83);
     }
     # Direction B (page-map fragility, issue 2026-06-04): leave the mmap-arena
