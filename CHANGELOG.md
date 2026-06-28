@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.4] — 2026-06-27
+
+**▶ 1.49.4 — capability gap 3, socket-as-VFS-fd bite 1: accepted TCP connections are now fds.**
+
+### Changed
+- **`sock_accept` #57 now returns an epoll-able VFS_SOCK fd instead of a raw conn_id, and `read#5` / `write` / `close#6` dispatch uniformly to the TCP layer (`kernel/core/vfs.cyr` + `syscall.cyr`).** A new **`VFS_SOCK` (tag 10)** fd carries a TCP `conn_id` in `payload[0]`; `vfs_create_sock` wraps an accepted conn, and `vfs_read`/`vfs_write`/`vfs_close` route it to **`tcp_recv`/`tcp_send`/`tcp_close`**. So an accepted connection is a normal VFS handle — the same `read`/`write`/`close` a file or pipe uses (and, next bite, epoll), the prerequisite for AGNOS to be a network service / container host. The legacy conn_id-based `sock_send`#48 / `sock_recv`#49 / `sock_close`#50 stay for raw-conn_id code. Validated: **loopback-smoke 4/4** — over `lo`, `sock_accept` returns an fd, a client send is read back **through the fd** (`read#5` → `tcp_recv`, 6 bytes byte-exact), and `close` tears the conn down; **exec-smoke PASS** (the file/pipe read/write/close arms unregressed); `check.sh` 11/11. **Bite 2 (next): epoll** — make a VFS_SOCK fd readiness-reportable so `epoll_wait` fires when a socket is readable/writable (the keystone for an event-loop server).
+
 ## [1.49.3] — 2026-06-27
 
 **▶ 1.49.3 — full RAM init, bite 3: enable the PMM extension for PIE/KASLR kernels.**

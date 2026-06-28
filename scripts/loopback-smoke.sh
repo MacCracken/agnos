@@ -124,6 +124,7 @@ echo ""
 check "lo: UDP loopback OK"       "UDP datagram to 127.0.0.1 looped back (net_tx queue + net_lo_drain demux)"     "UDP loopback regression (check 'lo: got=')"
 check "lo: ICMP ping loopback OK" "ICMP echo to net_ip self-looped (request + reply both via the lo queue)"       "ICMP loopback regression"
 check "lo: TCP loopback OK"       "TCP handshake to net_ip completed over lo (SYN/SYN-ACK/ACK via the lo queue)"  "TCP loopback handshake regression"
+check "lo: socket-as-VFS-fd OK"   "sock_accept returns a VFS_SOCK fd; read#5 through the fd got the client's bytes; close OK" "socket-as-VFS-fd dispatch regression"
 
 echo ""
 echo "=== loopback-smoke: $pass passed, $fail failed ==="

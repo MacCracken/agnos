@@ -31,6 +31,7 @@ enum VfsType {
     #   pos, [1]=backend, [2]=static-pool block {namelen,
     #   name[256], content[4096]}; flushed whole-file via
     #   vfs_write_on at close. Mirrors the shell echo> write.
+    VFS_SOCK      = 10;  # 1.49.4 socket fd: payload[0]=TCP conn_id (read->tcp_recv / write->tcp_send / close->tcp_close)
 }
 
 # 1.41.7 — FAT/exFAT write-back fd. The secondary-FS backends write WHOLE files
@@ -240,6 +241,19 @@ fn vfs_create_memfile(data, size) {
     kpayload_set(base, 0, 0);       # pos
     kpayload_set(base, 1, size);
     kpayload_set(base, 2, data);
+    return idx;
+}
+
+# 1.49.4 (socket-as-VFS-fd) — wrap an accepted TCP conn_id in a VFS_SOCK fd so the generic read#5 /
+# write / close#6 (and, next bite, epoll) work uniformly on it. payload[0] = the conn_id. Returns the
+# fd index, or -1 (bad conn / fd table full). sock_accept#57 returns this instead of the raw conn_id.
+fn vfs_create_sock(conn_id) {
+    if (conn_id < 0) { return 0 - 1; }
+    var idx = vfs_alloc();
+    if (idx < 0) { return 0 - 1; }
+    var base = vfs_fd_table() + idx * 32;
+    ktag_set(base, VFS_SOCK);
+    kpayload_set(base, 0, conn_id);
     return idx;
 }
 
@@ -823,6 +837,9 @@ fn vfs_read(fd_idx, buf, count) {
         if (kpayload(base, 1) != 0) { return 0 - 1; }
         return pipe_read(base, buf, count);
     }
+    if (ftype == VFS_SOCK) {            # 1.49.4 socket fd -> drain the TCP receive ring
+        return tcp_recv(kpayload(base, 0), buf, count);
+    }
     if (ftype == VFS_EXT2_FILE) {
         # SMP sub-bite 5 (fs_lock): the FS arm — ext2_read_at touches the shared
         # ext2 scratch buffers (sb/bgdt/inode/block/indirect/extent). fs_lock is
@@ -858,6 +875,9 @@ fn vfs_write(fd_idx, buf, count) {
         # Write end has is_write_end=1 (payload[1])
         if (kpayload(base, 1) != 1) { return 0 - 1; }
         return pipe_write(base, buf, count);
+    }
+    if (ftype == VFS_SOCK) {            # 1.49.4 socket fd -> TCP send
+        return tcp_send(kpayload(base, 0), buf, count);
     }
     if (ftype == VFS_EXT2_FILE) {
         # WRITE arc (1.33.x): write `count` bytes at the current position
@@ -1081,6 +1101,7 @@ fn vfs_close_inner(fd_idx) {
         var pb = kpayload(base, 2);
         if (pipe_rc_release(pb, proc_current_get()) == 1) { kfree_sized(pb, 4096); }
     }
+    if (ktag(base) == VFS_SOCK) { tcp_close(kpayload(base, 0)); }   # 1.49.4 tear down the TCP conn
     # Zero the entire slot (tag → VFS_FREE, payload all 0) so reuse
     # via vfs_alloc finds a clean entry. ktag_clear zeroes the full
     # 32-byte slot.

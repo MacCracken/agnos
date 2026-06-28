@@ -1989,8 +1989,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # (0..7) of the next ESTABLISHED inbound connection on this listen socket
         # (a passive-open not yet accepted), or -1 if none is pending yet
         # (WOULD_BLOCK — the server poll-loops) / listen_id is bad / it is not a
-        # LISTEN slot. The returned conn_id is a normal connection usable with
-        # sock_send#48 / sock_recv#49 / sock_close#50. We net_poll() FIRST so the
+        # LISTEN slot. 1.49.4: the returned fd is a uniform VFS handle — read#5 -> tcp_recv,
+        # write -> tcp_send, close#6 -> tcp_close (epoll next bite); the legacy conn_id-based
+        # sock_send#48 / sock_recv#49 / sock_close#50 stay for raw-conn_id code. We net_poll() FIRST so the
         # passive-open handshake actually progresses (SYN -> SYN_RCVD -> ESTABLISHED
         # all run inside net_handle_tcp under net_poll; tcp_accept itself only
         # scans + marks the slot accepted, bit 10). The NIC is polled so net_poll
@@ -1998,8 +1999,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         net_poll();                     # drive the inbound SYN handshake to ESTABLISHED
         var sa_cid = tcp_accept(arg1);
+        var sa_fd = sa_cid;             # 1.49.4 socket-as-VFS-fd: wrap the accepted conn in a
+        if (sa_cid >= 0) { sa_fd = vfs_create_sock(sa_cid); }   # VFS_SOCK fd (-1 stays -1)
         stack_canary_check(canary);
-        return sa_cid;
+        return sa_fd;
     }
     if (num == 58) {
         # lseek(fd=arg1, offset=arg2, whence=arg3) — reposition a seekable file's

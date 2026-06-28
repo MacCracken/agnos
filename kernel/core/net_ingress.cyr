@@ -126,10 +126,34 @@ fn loopback_selftest() {
     }
     if (icmp_ping(net_ip) >= 0) { kprintln("lo: ICMP ping loopback OK", 25); }
     else { kprintln("lo: ICMP ping loopback FAIL", 27); }
-    tcp_listen(7777);
+    var lid = tcp_listen(7777);
     var cid = tcp_connect(net_ip, 7777, 33333);
     if (cid >= 0) { kprintln("lo: TCP loopback OK", 19); }
     else { kprintln("lo: TCP loopback FAIL", 21); }
+    # 1.49.4 socket-as-VFS-fd: accept the server side as a VFS_SOCK fd, send from the client conn, read
+    # it back THROUGH THE FD (vfs_read -> tcp_recv), then close the fd (vfs_close -> tcp_close).
+    if (cid >= 0) {
+        var sconn = tcp_accept(lid);
+        if (sconn >= 0) {
+            var sfd = vfs_create_sock(sconn);
+            var smsg = "SOCKFD";
+            tcp_send(cid, smsg, 6);
+            net_poll();
+            var rbuf[16];
+            var got = vfs_read(sfd, &rbuf, 16);
+            kprint("lo: sockfd got=", 15);
+            kprint_num(got);
+            kprintln("", 0);
+            var sok = 1;
+            if (sfd < 0) { sok = 0; }
+            if (got != 6) { sok = 0; }
+            if (load8(&rbuf + 0) != 83) { sok = 0; }    # 'S'
+            if (load8(&rbuf + 5) != 68) { sok = 0; }    # 'D'
+            vfs_close(sfd);
+            if (sok == 1) { kprintln("lo: socket-as-VFS-fd OK", 23); }
+            else { kprintln("lo: socket-as-VFS-fd FAIL", 25); }
+        }
+    }
     return 0;
 }
 
