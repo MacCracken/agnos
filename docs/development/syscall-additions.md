@@ -1,6 +1,6 @@
 # AGNOS Syscall Additions — Required for Kybernet
 
-> **Last Updated**: 2026-06-10 (through v1.44.9 — surface is now **0–42, 43 syscalls**; the 1.43.x graphics/timing/input group added `fbinfo`#38 / `blit`#39 / `uptime_ms`#40 / `sleep_ms`#41 / `kbscan`#42 alongside `execwait`#37, and `waitpid`#4 became a non-blocking poll at v1.44.9)
+> **Last Updated**: 2026-06-27 (through v1.45.x — surface is now **0–60, 61 syscalls**). Since the v1.44.9 catalogue below (0–42), the **1.45.x net/entropy/clock band** added `getrandom`#45 / `time_unix`#46 / TCP client `sock_connect`#47–`sock_close`#50 / UDP `udp_bind`#51–`udp_unbind`#54 / `icmp_echo`#55 / **server `sock_listen`#56 + `sock_accept`#57** (AGNOS can *accept* inbound TCP — it can *be* a network service) + the file group `lseek`#58 / `flock`#59 / `winsize`#60. The 43–60 band defers to the canonical `ksyscall` dispatch in `syscall.cyr` + the live snapshot in `state.md`; the table below catalogues 0–42. (The 1.43.x graphics/timing/input group `fbinfo`#38 / `blit`#39 / `uptime_ms`#40 / `sleep_ms`#41 / `kbscan`#42 + `execwait`#37, and the v1.44.9 non-blocking `waitpid`#4 poll, are catalogued in the table.)
 >
 > The 26-call kybernet surface (0–25) was complete at v1.21.0; kybernet (currently v1.2.1) runs on AGNOS as PID 1. The dispatch table has since grown to **43 entries (0–42)** in these rounds:
 > - slot **26** `write_boot_checkpoint(byte)` — a CMOS-write diagnostic added during iron-boot bring-up (🩺 not part of the userland shell surface);
