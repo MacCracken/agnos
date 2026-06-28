@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Stale `munmap: pmm-reuse` selftest (`kernel/core/selftests.cyr`).** Its out-of-range guard test freed `pmm_free_2mb(0x1000000)` (16 MB) expecting a "≥ pool" rejection, but the 2 MB allocator's pool grew from 16 MB to 256 MB+ (and now full RAM, 1.49.11) — so 16 MB is IN-pool and the call no longer rejects, failing the test. Changed to `0x1000000000` (64 GB), which is above the bitmap's 64 GB cap and always rejects. `mmap-smoke` is green again (2/2). (Investigation also confirmed `exec-smoke`'s apparent failure was a build-flag mistake — it needs `EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1`; it passes cleanly when built correctly. Neither was a regression.)
+
+### Docs
+- **Purged the stale ">256 MB blocked by a cyrius high-VA limit" framing** left over from 1.49.9, now that 1.49.10 root-caused it as a false-positive boot probe and 1.49.11 shipped >256 MB RAM. Updated `kernel/core/pmm.cyr` (the module header + the `pmm_fullram_selftest` comment) and `docs/development/roadmap.md` (the 1.49.x "Full RAM initialization" capability-gap slot + the active-arc and decade-map pointer lines now mark it ✅ shipped 1.49.11). The direct-map works under the kernel / per-proc CR3; cyrius is exonerated.
+
 ## [1.49.11] — 2026-06-28
 
 **▶ 1.49.11 — full-RAM extension, bite 3c: >256 MB RAM comes online. Dynamic RAM-backed PMM bitmap + the 2 MB user-page allocator lifted to the full machine RAM, now that 1.49.10 proved the direct-map works.**

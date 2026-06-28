@@ -1,12 +1,14 @@
 # === Physical Memory Manager ===
-# Bitmap allocator: 1 bit per 4KB page
-# 256 MB bitmap = 65536 pages = 8192 bytes = 1024 u64 (module-global var[N] = N u64) — the full per-proc
-# CR3 identity window (0-256 MB; proc.cyr re-asserts PD[8..127]). 1.49.9 grew this to 4 GB for the >256 MB
-# extension, but that's BLOCKED — cyrius load64/store64 can't reach the 8 GB direct-map VA (see the
-# pmm_extend comment + docs/development/issue/2026-06-28-cyrius-high-va-load-store.md), and the 4 GB bitmap
-# is stored static (not BSS) so it blew the kernel-size budget — so it's back at 256 MB. When the cyrius
-# >=4 GB fix lands: regrow (4 GB = var[16384]) + bump the validity/free bounds + lift pmm_2mb_top_region.
-# The page count (65536), validity bound, pmm_total + the 2 MB-free bound all track this.
+# Bitmap allocator: 1 bit per 4KB page.
+# `pmm_bitmap` (8 KB = 65536 pages = 256 MB) is the BOOTSTRAP bitmap — the per-proc CR3 identity window
+# (0-256 MB; proc.cyr re-asserts PD[8..127]). On a machine with >256 MB RAM, pmm_migrate_bitmap (1.49.11)
+# swaps the live bitmap for a RAM-backed region covering the FULL machine RAM, so the 2 MB user-page
+# allocator reaches above the 256 MB identity ceiling — the kernel touches those pages via the 8 GB
+# direct-map (DIRECTMAP_BASE + phys), which every per-proc CR3 carries. (1.49.9 wrongly thought this path
+# was blocked by a cyrius high-VA limit; 1.49.10 root-caused that as a false-positive boot probe running
+# under gnoboot's CR3 — the direct-map works fine under the kernel CR3. See the issue doc.) The static
+# 4 GB bitmap idea was dropped: it blew the kernel-size budget, so the RAM-backed bitmap is allocated at
+# boot instead. All access goes through `pmm_bitmap_ptr` / `pmm_bitmap_pages` (below).
 var pmm_bitmap[1024];
 # 1.49.11 (dynamic RAM-backed bitmap): the 8 KB `pmm_bitmap` above is now only the BOOTSTRAP bitmap
 # (256 MB) — it breaks the allocator-needs-a-bitmap-to-allocate-the-bitmap chicken-and-egg. All bitmap
@@ -313,8 +315,8 @@ fn pmm_fullram_selftest() {
     else { kprintln("PMM ext: >16MB alloc FAIL", 25); }
     # 1.49.8: prove pmm_alloc_2mb reaches above the OLD 128 MB region cap (regions 64..127 = 128-256 MB).
     # It allocs bottom-up, so we fill the low regions and watch the max address cross 128 MB, then free all.
-    # (1.49.9 found the >256 MB path needs the 8 GB direct-map, which cyrius load64/store64 can't reach —
-    # so user RAM holds at 256 MB; this remains the 256 MB-ceiling proof.)
+    # This bounds the test at the 256 MB-bitmap window (allocs[128]); the >256 MB path (RAM-backed bitmap +
+    # direct-map) is proven separately by pmm_hiram_selftest under PMM_HIRAM_SELFTEST (1.49.11).
     var allocs[1024];               # up to 128 region addrs (function-local var[N] = N bytes = 128 u64 slots)
     var n2 = 0;
     var max2 = 0;

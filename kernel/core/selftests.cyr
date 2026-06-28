@@ -302,9 +302,11 @@
 # those proven primitives (no live user proc at boot to drive a real unmap).
 {
     var m = 1;
-    if (pmm_free_2mb(0x201000) == 0) { m = 0; }      # page 513 — not 2 MB-aligned → reject
-    if (pmm_free_2mb(0x0) == 0) { m = 0; }            # kernel region (base 0 < 512) → reject
-    if (pmm_free_2mb(0x1000000) == 0) { m = 0; }      # 16 MB, base 4096 ≥ pool → reject
+    if (pmm_free_2mb(0x201000) == 0) { m = 0; }        # page 513 — not 2 MB-aligned → reject
+    if (pmm_free_2mb(0x0) == 0) { m = 0; }             # kernel region (base 0 < 512) → reject
+    if (pmm_free_2mb(0x1000000000) == 0) { m = 0; }    # 64 GB — base ≥ bitmap (caps at 64 GB) → out-of-range reject
+                                                       #   (was 0x1000000 = 16 MB; stale once the 2 MB pool grew from
+                                                       #    16 MB to 256 MB+ — 16 MB is now IN-pool, not a reject case)
     var c0 = pmm_count_2mb_free();
     var x = pmm_alloc_2mb();
     if (x == 0) { m = 0; }
