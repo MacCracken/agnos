@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.3] — 2026-06-27
+
+**▶ 1.49.3 — full RAM init, bite 3: enable the PMM extension for PIE/KASLR kernels.**
+
+### Changed
+- **Removed the conservative 1.49.2 PIE auto-disable — the 4 KB-allocator extension now applies to BOTH non-PIE and KASLR'd (PIE) kernels (`kernel/core/pmm.cyr`).** The 1.49.2 deferral was a **false alarm**: the apparent PIE boot failure was the full-RAM smoke's FAT-only ESP (no ext2 root, so kybernet can't `exec /bin/agnsh` — non-PIE falls to the emergency shell, PIE doesn't), NOT the extension. With a proper ext2 root, a PIE kernel slid **inside** the bitmap (kernel_base=0x3a00000 = 58 MB) + the extension (alloc_top=32767) + the kernel-image reservation boots-to-shell and execs from disk **e2fsck-clean** — top-down `pmm_alloc` correctly skips the reserved 16 MB kernel-image window. Validated: **exec-smoke full pass** under `CYRIUS_PIE=1` (58 MB base, in-bitmap → reservation load-bearing); **kaslr-smoke PASS** with the extension live (bases 132/252 MB, above-bitmap → slide varies + boots). So every KASLR'd kernel — image inside OR above the 128 MB bitmap — now gets the full ~104 MB extension safely. **>128 MB RAM** (a bigger/relocated bitmap) remains the one open follow-up.
+
 ## [1.49.2] — 2026-06-27
 
 **▶ 1.49.2 — full RAM init, bite 2: open the 4 KB allocator to the discovered RAM (non-PIE).**
