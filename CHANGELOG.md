@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.2] — 2026-06-27
+
+**▶ 1.49.2 — full RAM init, bite 2: open the 4 KB allocator to the discovered RAM (non-PIE).**
+
+### Changed
+- **The PMM's 4 KB allocator now serves up to the full 128 MB bitmap instead of capping at 16 MB (`kernel/core/pmm.cyr`).** `pmm_alloc` scanned a hardcoded page-4095 (16 MB) top; it now scans `pmm_alloc_top`, which **`pmm_extend_to_memmap`** raises to the discovered memmap top, clamped to the 128 MB bitmap (page 32767). The extend is **additive** — `pmm_init`'s proven 0–18 MB reservations are byte-identical; it only opens the new 18–128 MB window, reserving non-EfiConventionalMemory memmap regions (firmware/ACPI/MMIO holes) there first. **Result: ~104 MB of newly-usable 4 KB pages** (the selftest counts 26752 free pages above 16 MB at `-m 256M`). `pmm_alloc_2mb` (user 2 MB allocs) is unchanged — still the low 2–16 MB. Validated: **pmm-fullram-smoke** (new) — `alloc_top=32767`, two allocs land > 16 MB distinct + freed, boot-to-shell; **exec-smoke** full pass (boot-to-shell + exec-from-disk + envp + framebuffer + clock + **e2fsck-clean**) with the extension live; `check.sh` 11/11.
+- **Auto-disabled for a KASLR'd (PIE) kernel (`kbase ≥ 32 MB`), conservatively.** PIE boot-to-shell couldn't be cleanly confirmed *with* the extension — the only full-RAM smoke uses a FAT-only ESP that fails PIE boot-to-shell even with the extension **disabled** (pre-existing; non-PIE falls to the emergency shell there, PIE doesn't). Production is non-PIE (`CYRIUS_PIE` is opt-in, only kaslr-smoke); the auto-disable makes the PIE path **byte-identical to before** — **kaslr-smoke PASS** (slide live, unregressed). Enabling the extension for PIE (a proper PIE + ext2-root validation) and **>128 MB RAM** (a bigger/relocated bitmap) are follow-up bites.
+
 ## [1.49.1] — 2026-06-27
 
 **▶ 1.49.1 — full RAM initialization, bite 1: UEFI memory-map discovery.**

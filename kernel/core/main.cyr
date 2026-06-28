@@ -160,6 +160,17 @@ kprint(" free / ", 8);
 kprint_num(pmm_total);
 kprintln(" pages", 6);
 
+# 1.49.2 (full RAM init, bite 2): open the 4 KB allocator to the discovered RAM (up to the 128 MB
+# bitmap), reserving the KASLR'd kernel image + non-conventional memmap regions in the new 18-128 MB
+# window. Always-on; pmm_alloc_2mb (user 2 MB allocs) stays in the low 2-16 MB regions.
+pmm_extend_to_memmap(load64(&boot_info_ptr));
+kprint("PMM: alloc_top=", 15);
+kprint_num(pmm_alloc_top);
+kprintln("", 0);
+#ifdef PMM_FULLRAM_SELFTEST
+pmm_fullram_selftest();
+#endif
+
 # 1.30.11 hardening: re-attempt WC remap of the FB, then verify WC took.
 # The line-17 vmm_remap_wc_range above succeeds for FBs in the 32-bit
 # hole (< 1 GB — inline PDE rewrite at 0x3000, no allocation needed)

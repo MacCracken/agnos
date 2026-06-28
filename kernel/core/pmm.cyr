@@ -7,6 +7,10 @@ var pmm_total = 0;
 # consumed in bite 2 to size the PMM to the machine's actual RAM. Pure discovery; no alloc change yet.
 var pmm_memmap_usable = 0;    # total EfiConventionalMemory pages = free RAM
 var pmm_memmap_top = 0;       # top-of-RAM physical address (highest phys_start + num_pages*4 KB)
+# 1.49.2 (full RAM init, bite 2) — the top page pmm_alloc scans (raised from 4095 = 16 MB to the
+# memmap top, clamped to 32767 = the 128 MB bitmap, by pmm_extend_to_memmap). Default = the safe
+# 16 MB baseline until extended.
+var pmm_alloc_top = 4095;
 var pmm_used = 0;
 var pmm_next_free = 0;
 var pmm_lock = 0;
@@ -130,6 +134,102 @@ fn pmm_probe_memmap(bi) {
     return usable;
 }
 
+# 1.49.2 (full RAM init, bite 2) — open the 4 KB allocator to the discovered RAM up to the 128 MB
+# bitmap limit. ADDITIVE: pmm_init's proven 0-18 MB reservations stay byte-identical; this only touches
+# the NEW [18 MB, 128 MB) window. Two reservations make raising the cap safe:
+#   (1) the kernel image — KASLR loads it at a RANDOM 2 MB-aligned base in [32 MB, 254 MB) (boot_info
+#       +0x70), so top-down pmm_alloc would clobber it; reserve a generous 16 MB window at kbase.
+#   (2) non-EfiConventionalMemory memmap regions in the window (firmware / ACPI / MMIO holes).
+# Then raise pmm_alloc_top from 4095 (16 MB) to the memmap top, clamped to 32767 (128 MB). The 2 MB
+# allocator (pmm_alloc_2mb, user code/stack/heap) is unchanged — it still serves the low 2-16 MB.
+# `bi` is the boot_info base, passed in (not via &boot_info_ptr — parse-order, as in pmm_probe_memmap).
+fn pmm_extend_to_memmap(bi) {
+    if (bi == 0) { return 0; }
+    var kbase = load64(bi + 0x70);
+    # 1.49.2: AUTO-DISABLE for a KASLR'd (PIE) kernel — conservative. PIE boot-to-shell could not be
+    # cleanly confirmed WITH the extension active: the only full-RAM smoke uses a FAT-only ESP, which
+    # fails PIE boot-to-shell even with the extension DISABLED (pre-existing — non-PIE falls to the
+    # emergency shell there, PIE does not). Production is non-PIE anyway (default build.sh links the
+    # kernel at 0x100000, inside pmm_init's 0-4 MB reservation; CYRIUS_PIE is opt-in, only kaslr-smoke),
+    # and it is validated to the full 128 MB bitmap. Enabling PIE needs a PIE + ext2-root validation.
+    if (kbase >= 0x2000000) { return 0; }      # kernel base >= 32 MB -> KASLR'd -> keep the safe 16 MB cap
+    # (1) reserve the kernel image if linked into the bitmap's 18-128 MB window (defensive; inert for
+    #     the current non-PIE kernel at 1 MB, which pmm_init's 0-4 MB reservation already covers).
+    if (kbase >= 0x1200000) {
+        if (kbase < 0x8000000) {
+            var kp = kbase / 4096;
+            var kpend = kp + 4096;             # 16 MB window (image is a few MB; generous margin)
+            if (kpend > 32768) { kpend = 32768; }
+            while (kp < kpend) {
+                pmm_set(kp);
+                kp = kp + 1;
+            }
+        }
+    }
+    # (2) reserve non-conventional memmap regions inside [18 MB, 128 MB).
+    var mm = load64(bi + 0x28);
+    var count = load32(bi + 0x30);
+    var entsize = load32(bi + 0x34);
+    if (mm != 0) {
+        if (count > 0) {
+            if (entsize >= 40) {
+                var i = 0;
+                while (i < count) {
+                    var e = mm + i * entsize;
+                    if (load32(e) != 7) {       # not EfiConventionalMemory -> reserve (clamped to window)
+                        var pg = load64(e + 8) / 4096;
+                        var pgend = pg + load64(e + 24);
+                        if (pg < 4608) { pg = 4608; }       # 0-18 MB is pmm_init's domain
+                        if (pgend > 32768) { pgend = 32768; }
+                        while (pg < pgend) {
+                            pmm_set(pg);
+                            pg = pg + 1;
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    # raise the 4 KB-allocator cap to the discovered top, clamped to the 128 MB bitmap.
+    var topp = pmm_memmap_top / 4096;
+    if (topp > 32767) { topp = 32767; }        # clamp to the 128 MB bitmap (full-RAM > 128 MB = bite 3)
+    if (topp <= 4095) { return 0; }            # <= 16 MB RAM -> keep the safe baseline cap
+    pmm_alloc_top = topp;
+    return topp;
+}
+
+# 1.49.2 self-test (compile-gated via PMM_FULLRAM_SELFTEST) — prove the 4 KB allocator now serves the
+# region ABOVE the old 16 MB cap: count newly-free pages, then alloc two and confirm both land beyond
+# 16 MB (page >= 4096, phys >= 0x1000000), are distinct, and free cleanly. pmm-fullram-smoke.sh greps.
+fn pmm_fullram_selftest() {
+    var freecnt = 0;
+    var i = 4096;
+    while (i <= pmm_alloc_top) {
+        if (pmm_test(i) == 0) { freecnt = freecnt + 1; }
+        i = i + 1;
+    }
+    var p1 = pmm_alloc();
+    var p2 = pmm_alloc();
+    kprint("PMM ext: top_page=", 18);
+    kprint_num(pmm_alloc_top);
+    kprint(" free_gt16M=", 12);
+    kprint_num(freecnt);
+    kprint(" a1=", 4);
+    kprint_hex(p1);
+    kprintln("", 0);
+    var ok = 1;
+    if (p1 < 0x1000000) { ok = 0; }       # first 4 KB alloc should land in the lifted (>16 MB) region
+    if (p2 < 0x1000000) { ok = 0; }
+    if (p1 == p2) { ok = 0; }
+    if (freecnt < 2048) { ok = 0; }        # at least ~8 MB of newly-usable free pages above 16 MB
+    pmm_free(p1);
+    pmm_free(p2);
+    if (ok == 1) { kprintln("PMM ext: >16MB alloc OK", 23); }
+    else { kprintln("PMM ext: >16MB alloc FAIL", 25); }
+    return 0;
+}
+
 fn pmm_init() {
     # Zero bitmap (all free)
     memset(&pmm_bitmap, 0, 4096);
@@ -217,7 +317,7 @@ fn pmm_alloc() {
     # are computed once and the load is reused for the set, instead of 4 call
     # frames + 2 redundant div/mod + 2 loads per allocated page (~789→~550 cyc/op
     # on the pmm_alloc_free bench). Behavior is byte-identical to the helper form.
-    for (var i = 4095; i >= 1024; i = i - 1) {
+    for (var i = pmm_alloc_top; i >= 1024; i = i - 1) {     # 1.49.2: top raised from 4095 (16 MB)
         var byte = i >> 3;
         var bit = i & 7;
         var b = load8(&pmm_bitmap + byte);
