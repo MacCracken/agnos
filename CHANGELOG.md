@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.48.1] — 2026-06-27
+
+**▶ 1.48.1 — other-FS perf review (2nd item): FAT/exFAT cluster-WRITE amplification collapse (the write mirror of 1.48.0).**
+
+### Changed
+- **`fatfs_write_file` + `exfat_write_file` now write each cluster's full data sectors in ONE multi-sector write straight from `src` instead of sector-by-sector (`kernel/core/fatfs.cyr` + `kernel/core/exfat.cyr`).** Both filled each 512-byte sector with a byte-at-a-time copy then wrote it per-sector. They now write the full data sectors in one **`fat_blk_write_sectors`/`exfat_blk_write_sectors`** call (the new multi-sector write helpers, the write mirrors of the 1.48.0 read helpers) **directly from `src`** — collapsing the per-sector writes AND eliminating the byte-copy; on NVMe a ≤4 KB cluster's data goes out as **1 multi-LBA command vs `sectors_per_cluster`** (the FAT/exFAT analog of ext2's `block_write_amp` 1.47.1). The partial tail data sector is filled (data + zero-pad) via `memcpy`/`memset` + a single-sector write. exFAT's clusters are contiguous (`exfat_alloc_contiguous`), so the whole extent's data writes in one call spanning all clusters (the cluster slack is zero-padded as before). Larger clusters (>4 KB) fall to the per-sector bounce, **no regression**. Validated: **fat-write-smoke PASS** (syscall write + read-back over FAT + whole-file + subdir ops), **exfat-write-smoke PASS** (write + read-back + **fsck.exfat -n clean** — structure + SetChecksum/NameHash valid), `check.sh` 11/11.
+
 ## [1.48.0] — 2026-06-27
 
 **▶ 1.48.0 — opens the other-FS perf review arc (FAT/exFAT): cluster-read amplification collapse.**

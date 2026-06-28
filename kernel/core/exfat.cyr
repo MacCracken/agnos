@@ -60,6 +60,13 @@ fn exfat_blk_read_sectors(sector, count, buf) {
     return blk_read_sectors_on(exfat_backend, exfat_partition_first_lba + sector, count, buf);
 }
 
+# 1.48.1 — multi-sector write (the cluster-write collapse, mirror of exfat_blk_read_sectors). `count`
+# partition-relative sectors from buf to `sector` in ONE backend call (blk_write_sectors_on): on NVMe
+# a <=4 KB run is a single multi-LBA command, a larger run bounces per-sector (no regression).
+fn exfat_blk_write_sectors(sector, count, buf) {
+    return blk_write_sectors_on(exfat_backend, exfat_partition_first_lba + sector, count, buf);
+}
+
 # Little-endian 32-bit field read from a buffer.
 fn exfat_rd32(p, off) {
     return load8(p + off) | (load8(p + off + 1) << 8) | (load8(p + off + 2) << 16) | (load8(p + off + 3) << 24);
@@ -1125,23 +1132,33 @@ fn exfat_write_file(name, namelen, src, len) {
         var nclus = (len + bpc - 1) / bpc;
         first = exfat_alloc_contiguous(nclus);
         if (first == 0) { return 0 - 1; }            # ENOSPC — nothing published, no leak
-        var pos = 0;
-        var ci = 0;
-        while (ci < nclus) {
-            var base = exfat_cluster_sector(first + ci);
-            var s = 0;
-            while (s < exfat_sectors_per_cluster) {
-                var k = 0;
-                while (k < 512) {
-                    if (pos + k < len) { store8(&exfat_data_buf + k, load8(src + pos + k)); }
-                    else { store8(&exfat_data_buf + k, 0); }     # zero-pad slack
-                    k = k + 1;
-                }
-                if (exfat_blk_write(base + s, &exfat_data_buf) != 0) { return 0 - 1; }
-                pos = pos + 512;
-                s = s + 1;
+        # 1.48.1 — cluster-write amp (the write mirror of 1.48.0). The clusters are CONTIGUOUS
+        # (exfat_alloc_contiguous), so write ALL the full data sectors of the whole extent directly
+        # from src in ONE multi-sector write (collapses every per-sector write + the byte-copy across
+        # all clusters; on NVMe a <=4 KB run is 1 multi-LBA command). The partial tail data sector is
+        # filled (data + zero) via the scratch; the remaining cluster SLACK sectors are zero-padded
+        # (preserving the original "write the whole allocated extent" behavior).
+        var base0 = exfat_cluster_sector(first);
+        var total_sectors = nclus * exfat_sectors_per_cluster;
+        var efull = len / 512;
+        var epart = len - efull * 512;
+        var ews = 0;
+        if (efull > 0) {
+            if (exfat_blk_write_sectors(base0, efull, src) != 0) { return 0 - 1; }
+            ews = efull;
+        }
+        if (epart > 0) {
+            memcpy(&exfat_data_buf, src + efull * 512, epart);
+            memset(&exfat_data_buf + epart, 0, 512 - epart);
+            if (exfat_blk_write(base0 + ews, &exfat_data_buf) != 0) { return 0 - 1; }
+            ews = ews + 1;
+        }
+        if (ews < total_sectors) {
+            memset(&exfat_data_buf, 0, 512);
+            while (ews < total_sectors) {
+                if (exfat_blk_write(base0 + ews, &exfat_data_buf) != 0) { return 0 - 1; }
+                ews = ews + 1;
             }
-            ci = ci + 1;
         }
         flags = 0x03;                                # AllocationPossible | NoFatChain
     }

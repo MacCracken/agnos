@@ -46,6 +46,13 @@ fn fat_blk_read_sectors(sector, count, buf) {
     return blk_read_sectors_on(fat_backend, fat_partition_first_lba + sector, count, buf);
 }
 
+# 1.48.1 — multi-sector write (the cluster-write collapse, mirror of fat_blk_read_sectors). `count`
+# partition-relative sectors from buf to `sector` in ONE backend call (blk_write_sectors_on): on NVMe
+# a <=4 KB run is a single multi-LBA command, a larger run bounces per-sector (no regression).
+fn fat_blk_write_sectors(sector, count, buf) {
+    return blk_write_sectors_on(fat_backend, fat_partition_first_lba + sector, count, buf);
+}
+
 # Partition-relative block write — the mirror of fat_blk_read for the
 # 1.34.x FAT write path. Routes through blk_write_on (+ the 1.33.5
 # blk_flush durability barrier is available via blk_flush_on(fat_backend)).
@@ -894,20 +901,25 @@ fn fatfs_write_file(name, namelen, src, len) {
         else { if (fat_set_entry(prev, c) != 0) { return 0 - 1; } }   # link prev → c
         prev = c;
         var base = fatfs_first_sector_of_cluster(c);
-        var s = 0;
-        while (s < fatfs_sectors_per_cluster) {
-            if (pos >= len) { s = fatfs_sectors_per_cluster; }   # file ended mid-cluster
-            else {
-                var k = 0;
-                while (k < 512) {
-                    if (pos + k < len) { store8(&fatfs_data_buf + k, load8(src + pos + k)); }
-                    else { store8(&fatfs_data_buf + k, 0); }   # zero-pad slack
-                    k = k + 1;
-                }
-                if (fat_blk_write(base + s, &fatfs_data_buf) != 0) { return 0 - 1; }
-                pos = pos + 512;
-                s = s + 1;
-            }
+        # 1.48.1 — cluster-write amp (the write mirror of 1.48.0). Write this cluster's FULL data
+        # sectors directly from src in ONE multi-sector write (collapses the per-sector writes + the
+        # byte-copy; on NVMe a <=4 KB cluster goes out as 1 multi-LBA command vs sectors_per_cluster).
+        # The partial tail sector (file ends mid-sector) is filled — data + zero-pad slack — via the
+        # scratch + a single-sector write. fatfs never writes the cluster's slack SECTORS (the old
+        # loop exited at pos>=len, and this advances pos to len the same way).
+        var cbytes = fatfs_sectors_per_cluster * 512;
+        if (len - pos < cbytes) { cbytes = len - pos; }
+        var full = cbytes / 512;
+        var part = cbytes - full * 512;
+        if (full > 0) {
+            if (fat_blk_write_sectors(base, full, src + pos) != 0) { return 0 - 1; }
+            pos = pos + full * 512;
+        }
+        if (part > 0) {
+            memcpy(&fatfs_data_buf, src + pos, part);
+            memset(&fatfs_data_buf + part, 0, 512 - part);
+            if (fat_blk_write(base + full, &fatfs_data_buf) != 0) { return 0 - 1; }
+            pos = pos + part;
         }
     }
     # Last allocated cluster is already EOC (fat_alloc set it; we only
