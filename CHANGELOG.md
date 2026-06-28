@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.47.8] — 2026-06-27
+
+**▶ 1.47.8 — perf patch (6th of the 1.47.x perf series): scheduler single-pass round-robin.**
+
+### Changed
+- **`sched_next` collapses its two-pass idle-deprioritization scan into a single pass (`kernel/core/sched.cyr`).** The scheduler ran TWO full round-robin scans over the proc table per tick: pass 1 (skip the idle kthread, so real work is never starved by a hlt-only proc), then pass 2 (the same scan WITH idle included, so idle still runs when it's the only ready proc). The single pass scans once: the first ready+pickable **non-idle** proc wins immediately; the first ready+pickable **idle** is remembered and returned only if no non-idle was ready — **byte-identical selection** to pass-1-then-pass-2 (when pass 1 found nothing, pass 2's first ready proc could only be an idle, since no non-idle was ready), at **half the per-tick iterations in the idle-only case** (the common boot-era kmain↔idle rotation). All SMP fences unchanged (`state==1`, `on_cpu==-1` foreign-CPU skip, `sched_idx_pickable` foreign-idle + STEP-1-AP skips). The behavior-preserving cleanup flagged in the 1.44.22 audit. Validated: **ring3-smoke** (spawn/exec/wait/preempt/stress all OK), **thread-smoke** PASS (kthread time-slicing + preempt gate), **agnsh-smoke** PASS (boot-to-shell), `check.sh` 11/11.
+
 ## [1.47.7] — 2026-06-27
 
 **▶ 1.47.7 — perf patch (5th of the 1.47.x perf series): ext2 multi-block write coalescing (the write mirror of 1.47.6).**

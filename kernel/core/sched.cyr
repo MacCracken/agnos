@@ -55,45 +55,33 @@ fn sched_idx_pickable(idx) {
 }
 
 fn sched_next() {
-    # Pass 1 (1.44.17): round-robin over READY (state==1) procs, SKIPPING the idle kthread —
-    # real work must never lose a slice to a proc that exists only to hlt.
+    # 1.47.8 — single-pass round-robin (collapses the former two-pass idle-deprio scan, the
+    # behavior-preserving cleanup flagged in the 1.44.22 audit). ONE scan from `start`: the FIRST
+    # ready+pickable NON-idle proc wins immediately (real work never loses a slice to the hlt-only
+    # idle); the first ready+pickable IDLE is remembered as the fallback. If no non-idle was ready,
+    # return that idle — byte-identical selection to the old pass-1-then-pass-2 (when pass 1 found
+    # nothing, pass 2's first ready proc could ONLY be an idle, since no non-idle was ready), at
+    # HALF the per-tick iterations in the idle-only case. SMP fences unchanged: state==1, on_cpu==-1
+    # (skip a proc another CPU owns), sched_idx_pickable (6b foreign-idle + STEP-1-AP skips; a
+    # descheduled AP idle's idle_owner names that AP, not this CPU, so it stays excluded).
     var start = proc_current_get() + 1;
+    var idle = sched_idle_pid_get();
+    var idle_pick = 0 - 1;
     var si = 0;
     while (si < proc_count) {
         var idx = start + si;
         if (idx >= proc_count) { idx = idx - proc_count; }
-        if (idx != sched_idle_pid_get()) {
-            if (proc_get_state(idx) == 1) {
-                if (on_cpu_get(idx) == (0 - 1)) {        # 1.46.x SMP6 FENCE: skip a proc another CPU owns
-                    # 6b foreign-idle skip: a descheduled AP idle (state==1, on_cpu==-1) is still
-                    # excluded here because its idle_owner names that AP, not this CPU (INV-9).
-                    # 6b STEP-1 AP gate: with smp_sched_aps==0 a non-BSP CPU picks NO real proc in
-                    # pass 1 (it falls through to pass 2 and lands on its own idle). Both INERT
-                    # single-core: pcpu_cpu()==0, every idle_owner==-1 (INV-10).
-                    if (sched_idx_pickable(idx) == 1) {
-                        return idx;
-                    }
+        if (proc_get_state(idx) == 1) {
+            if (on_cpu_get(idx) == (0 - 1)) {
+                if (sched_idx_pickable(idx) == 1) {
+                    if (idx != idle) { return idx; }                    # pass-1: first non-idle ready wins
+                    if (idle_pick == (0 - 1)) { idle_pick = idx; }      # pass-2: remember idle for the fallback
                 }
             }
         }
         si = si + 1;
     }
-    # Pass 2: nothing else ready — the original scan WITH idle included, so idle still runs
-    # whenever it's the only ready proc (the boot-era kmain<->idle rotation is byte-identical:
-    # pass 1 finds nothing, pass 2 picks idle).
-    si = 0;
-    while (si < proc_count) {
-        var idx2 = start + si;
-        if (idx2 >= proc_count) { idx2 = idx2 - proc_count; }
-        if (proc_get_state(idx2) == 1) {
-            if (on_cpu_get(idx2) == (0 - 1)) {           # 1.46.x SMP6 FENCE: skip a proc another CPU owns
-                if (sched_idx_pickable(idx2) == 1) {     # 6b: foreign-idle + STEP-1-AP skips (INERT single-core)
-                    return idx2;
-                }
-            }
-        }
-        si = si + 1;
-    }
+    if (idle_pick != (0 - 1)) { return idle_pick; }    # only idle was ready
     # No ready proc at all — fall back to proc 0 (kernel idle).
     # Previously returned proc_current_get(), which let busy-looping ring-0 user
     # procs starve the kernel idle loop indefinitely (iron Attempt 14
