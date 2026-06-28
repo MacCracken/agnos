@@ -238,6 +238,18 @@ fn pmm_setup_directmap(top_phys) {
     return 1;
 }
 
+# 1.49.9 (RAM-arc bite 3b): return a kernel VA the CURRENT CR3 can read/write to reach physical page
+# `phys` (ELF segment copy, page zeroing, argv staging). <=256 MB: the identity map (per-proc PD[8..127]),
+# ensured on demand. >256 MB: the direct-map (DIRECTMAP_BASE + phys) — at >256 MB the identity slot
+# PD[128..510] is the user's own mmap arena (zeroed per-proc), so identity is unusable there, but EVERY
+# CR3 inherits the direct-map PDPT[8+] (proc.cyr mirrors kernel PDPT[1..511]). Pairs with proc_map_page,
+# which stores the raw `phys` in the USER PTE; this is only the kernel's private access handle.
+fn pmm_kva_for_access(phys) {
+    if (phys >= 0x10000000) { return DIRECTMAP_BASE + phys; }
+    if (vmm_is_mapped(phys) == 0) { vmm_map(phys, phys, 0x83); }
+    return phys;
+}
+
 fn vmm_unmap(virt) {
     var pd_idx = (virt >> 21) & 0x1FF;
     store64(0x3000 + pd_idx * 8, 0);

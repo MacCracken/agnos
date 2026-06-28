@@ -5,6 +5,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.9] — 2026-06-28
+
+**▶ 1.49.9 — full-RAM extension, bite 3b: the >256 MB path is blocked by a cyrius high-VA limit; held at 256 MB with the groundwork in place.**
+
+### Discovered
+- **The 1.49.7 kernel direct-map does NOT work above 256 MB — bite 2's validation was a false positive.** Building the >256 MB user-page path surfaced it: `pmm_alloc_2mb` reaches >256 MB fine and the direct-map page-table chain is correct (read back live: `PD[160]=0x14000083` → phys 320 MB), but a `store64`/`load64` to `DIRECTMAP_BASE (8 GB) + 320 MB` returns 0 **with no fault** — the MMU mapping is right, yet the access never reaches the mapped page. Bite 2's `directmap: low+hi OK` probe only tested ≤100 MB, where the 8 GB VA's low bits **alias the live identity map**, so it read the identity and passed regardless. The strong inference: **cyrius `load64`/`store64` don't address a ≥4 GB virtual address correctly** (they appear to operate on the low bits). Filed: `docs/development/issue/2026-06-28-cyrius-high-va-load-store.md`.
+
+### Changed
+- **`pmm_alloc_2mb` held at the 256 MB ceiling** (`pmm_2mb_top_region = 128`) — user RAM stays at the working 256 MB identity window (1.49.8 behavior), since the kernel can't touch a >256 MB page during ELF load without the (cyrius-blocked) 8 GB direct-map. Verified: pmm-fullram 4/4 + exec-smoke PASS at 256 MB; `check.sh`/fmt clean.
+- **Groundwork retained for when cyrius ≥4 GB addressing lands**: `pmm_kva_for_access` (identity ≤256 MB / direct-map above) + the `elf.cyr` access-handle split (`phys`/`kva`, `stack_phys`/`stack_kva`). The PMM bitmap stays at **256 MB** — cyrius stores the array static (not BSS), so the 4 GB version blew the 1.4 MB kernel-size budget (1.47 MB); re-growing it (`var[16384]` + the validity/free bounds) + lifting the `pmm_2mb_top_region` cap then brings >256 MB online with **no new VM design**.
+- **Next**: the cyrius ≥4 GB load/store fix (the proper path to the box's full 60 GB), or — if it's needed sooner — a ≤4 GB kmap window (caps at ~3 GB).
+
 ## [1.49.8] — 2026-06-28
 
 **▶ 1.49.8 — full-RAM extension, bite 3a: user pages reach the full 256 MB (the user-facing half of 1.49.6).**

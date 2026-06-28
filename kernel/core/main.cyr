@@ -176,6 +176,9 @@ pmm_setup_directmap(pmm_memmap_ram_top);
 var dm_ok = 1;
 if (load64(DIRECTMAP_BASE) != load64(0)) { dm_ok = 0; }                          # phys 0 via directmap == identity
 if (load64(DIRECTMAP_BASE + 0x6400000) != load64(0x6400000)) { dm_ok = 0; }      # phys 100 MB via directmap == identity
+# NOTE (1.49.9): this probe only exercises <=256 MB, where the direct-map VA's low bits alias the live
+# identity map — so it does NOT prove a true >256 MB direct-map access. A write to DIRECTMAP_BASE + 320 MB
+# returns 0 (cyrius load64/store64 don't reach the 8 GB VA). >256 MB RAM is blocked on that; see pmm.cyr.
 if (dm_ok == 1) { kprintln("directmap: low+hi OK", 20); }
 else { kprintln("directmap: low+hi FAIL", 22); }
 #ifdef PMM_FULLRAM_SELFTEST

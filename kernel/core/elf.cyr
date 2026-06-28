@@ -292,11 +292,11 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                 # read as #UD in ring 3 at 1.40.3.
                 var phys = pmm_alloc_2mb();
                 if (phys == 0) { return 0 - 1; }
-                if (vmm_is_mapped(phys) == 0) { vmm_map(phys, phys, 0x83); }
+                var kva = pmm_kva_for_access(phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
                 proc_map_page(new_cr3, pg, phys);
                 # Zero the whole page first (covers BSS + any slack), then copy
                 # the slice of file-backed data that lands in [pg, pg+2MB).
-                memset(phys, 0, 0x200000);
+                memset(kva, 0, 0x200000);
                 var lo = p_vaddr;  if (pg > lo) { lo = pg; }
                 var hi = seg_v1;   if (pg + 0x200000 < hi) { hi = pg + 0x200000; }
                 if (hi > lo) {
@@ -307,7 +307,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                     while (done < copy_len) {
                         var chunk = copy_len - done;
                         if (chunk > 65536) { chunk = 65536; }
-                        var rn = vfs_read_file_at(path, namelen, file_off + done, phys + phys_off + done, chunk);
+                        var rn = vfs_read_file_at(path, namelen, file_off + done, kva + phys_off + done, chunk);
                         if (rn != chunk) { return 0 - 1; }
                         done = done + chunk;
                     }
@@ -330,13 +330,13 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     var stack_base = 0x3FC00000;
     var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }
-    if (vmm_is_mapped(stack_phys) == 0) { vmm_map(stack_phys, stack_phys, 0x83); }
+    var stack_kva = pmm_kva_for_access(stack_phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
     proc_map_page(new_cr3, stack_base, stack_phys);
     proc_unmap_page(new_cr3, stack_base - 0x200000);
 
     # 1.40.7: build the SysV process init stack so the program gets argc/argv.
     # The stack page maps stack_base -> stack_phys 1:1 (both 2 MB-aligned), so we
-    # write the layout via stack_phys (identity) and the program reads it at
+    # write the layout via stack_kva (identity <=256 MB, direct-map above) and the program reads it at
     # stack_base+off. Layout at entry: rsp -> [argc][argv0]..[argvN-1][NULL]
     # [envp NULL][auxv AT_NULL(0,0)] ; the argv strings live higher up the page.
     # Control block at stack offset 0x3000 (16-aligned → rsp 16-aligned, ~12 KB
@@ -360,14 +360,14 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
         # 0x4000) — a long command line can't write past the stack region.
         if (str_o + tl + 1 >= 0x4000) { break; }
         var k = 0;
-        while (k < tl) { store8(stack_phys + str_o + k, load8(argv_src + ts + k)); k = k + 1; }
-        store8(stack_phys + str_o + tl, 0);                                                   # NUL
-        store64(stack_phys + 0x3008 + argc * 8, stack_base + str_o);                          # argv[argc] -> string VA
+        while (k < tl) { store8(stack_kva +str_o + k, load8(argv_src + ts + k)); k = k + 1; }
+        store8(stack_kva +str_o + tl, 0);                                                   # NUL
+        store64(stack_kva +0x3008 + argc * 8, stack_base + str_o);                          # argv[argc] -> string VA
         str_o = str_o + tl + 1;
         argc = argc + 1;
     }
-    store64(stack_phys + 0x3000, argc);                          # argc
-    store64(stack_phys + 0x3008 + argc * 8, 0);                  # argv NULL
+    store64(stack_kva +0x3000, argc);                          # argc
+    store64(stack_kva +0x3008 + argc * 8, 0);                  # argv NULL
 
     # 1.43.2: stage a minimal envp (HOME=/ , PWD=/) so ring-3 getenv() resolves on
     # agnos — previously envp was an immediate NULL, so getenv("HOME") always
@@ -383,19 +383,19 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     if (env_src == 0) {
         # No caller env: the uniform kernel default (the 1.43.2 behavior, byte-identical).
         if (str_o + 7 < 0x4000) {                                # "HOME=/" + NUL
-            store8(stack_phys + str_o + 0, 72);  store8(stack_phys + str_o + 1, 79);
-            store8(stack_phys + str_o + 2, 77);  store8(stack_phys + str_o + 3, 69);
-            store8(stack_phys + str_o + 4, 61);  store8(stack_phys + str_o + 5, 47);
-            store8(stack_phys + str_o + 6, 0);
-            store64(stack_phys + 0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
+            store8(stack_kva +str_o + 0, 72);  store8(stack_kva +str_o + 1, 79);
+            store8(stack_kva +str_o + 2, 77);  store8(stack_kva +str_o + 3, 69);
+            store8(stack_kva +str_o + 4, 61);  store8(stack_kva +str_o + 5, 47);
+            store8(stack_kva +str_o + 6, 0);
+            store64(stack_kva +0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
             str_o = str_o + 7;
             envc = envc + 1;
         }
         if (str_o + 6 < 0x4000) {                                # "PWD=/" + NUL
-            store8(stack_phys + str_o + 0, 80);  store8(stack_phys + str_o + 1, 87);
-            store8(stack_phys + str_o + 2, 68);  store8(stack_phys + str_o + 3, 61);
-            store8(stack_phys + str_o + 4, 47);  store8(stack_phys + str_o + 5, 0);
-            store64(stack_phys + 0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
+            store8(stack_kva +str_o + 0, 80);  store8(stack_kva +str_o + 1, 87);
+            store8(stack_kva +str_o + 2, 68);  store8(stack_kva +str_o + 3, 61);
+            store8(stack_kva +str_o + 4, 47);  store8(stack_kva +str_o + 5, 0);
+            store64(stack_kva +0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
             str_o = str_o + 6;
             envc = envc + 1;
         }
@@ -414,18 +414,18 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                 if (envc >= 16) { break; }
                 if (str_o + el + 1 >= 0x4000) { break; }
                 var ek = 0;
-                while (ek < el) { store8(stack_phys + str_o + ek, load8(env_src + es + ek)); ek = ek + 1; }
-                store8(stack_phys + str_o + el, 0);
-                store64(stack_phys + 0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
+                while (ek < el) { store8(stack_kva +str_o + ek, load8(env_src + es + ek)); ek = ek + 1; }
+                store8(stack_kva +str_o + el, 0);
+                store64(stack_kva +0x3008 + (argc + 1 + envc) * 8, stack_base + str_o);
                 str_o = str_o + el + 1;
                 envc = envc + 1;
             }
             ei = ei + 1;
         }
     }
-    store64(stack_phys + 0x3008 + (argc + 1 + envc) * 8, 0);     # envp NULL
-    store64(stack_phys + 0x3008 + (argc + 2 + envc) * 8, 0);     # auxv AT_NULL type
-    store64(stack_phys + 0x3008 + (argc + 3 + envc) * 8, 0);     # auxv AT_NULL val
+    store64(stack_kva +0x3008 + (argc + 1 + envc) * 8, 0);     # envp NULL
+    store64(stack_kva +0x3008 + (argc + 2 + envc) * 8, 0);     # auxv AT_NULL type
+    store64(stack_kva +0x3008 + (argc + 3 + envc) * 8, 0);     # auxv AT_NULL val
     var stack_top = stack_base + 0x3000;                         # rsp -> argc
 
     # 1.46.x #2: create the proc NOT-yet-schedulable (state=3). elf_load_from_file does NOT set ring-3

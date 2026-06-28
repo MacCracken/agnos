@@ -1,9 +1,12 @@
 # === Physical Memory Manager ===
 # Bitmap allocator: 1 bit per 4KB page
-# 1.49.6: 256 MB bitmap = 65536 pages = 8192 bytes = 1024 u64 (module-global var[N] = N u64). Grown
-# from the 128 MB (512-u64) bitmap to use the FULL per-proc CR3 identity window (0-256 MB; proc.cyr
-# re-asserts PD[8..127]). >256 MB needs a high-half kernel direct-map (next sub-arc). The page count
-# (65536), validity bound, alloc-cap clamp (65535) + the kernel-image reservation bound all track this.
+# 256 MB bitmap = 65536 pages = 8192 bytes = 1024 u64 (module-global var[N] = N u64) — the full per-proc
+# CR3 identity window (0-256 MB; proc.cyr re-asserts PD[8..127]). 1.49.9 grew this to 4 GB for the >256 MB
+# extension, but that's BLOCKED — cyrius load64/store64 can't reach the 8 GB direct-map VA (see the
+# pmm_extend comment + docs/development/issue/2026-06-28-cyrius-high-va-load-store.md), and the 4 GB bitmap
+# is stored static (not BSS) so it blew the kernel-size budget — so it's back at 256 MB. When the cyrius
+# >=4 GB fix lands: regrow (4 GB = var[16384]) + bump the validity/free bounds + lift pmm_2mb_top_region.
+# The page count (65536), validity bound, pmm_total + the 2 MB-free bound all track this.
 var pmm_bitmap[1024];
 var pmm_total = 0;
 # 1.49.1 (full RAM init, bite 1) — UEFI memory-map discovery results, set by pmm_probe_memmap and
@@ -65,7 +68,7 @@ fn pmm_spin_unlock() {
 # to prevent negative indices and out-of-bounds access.
 fn pmm_page_valid(page) {
     if (page < 0) { return 0; }
-    if (page >= 65536) { return 0; }              # 1.49.6: 256 MB bitmap (was 32768 = 128 MB)
+    if (page >= 65536) { return 0; }              # 256 MB bitmap (1.49.9 4 GB revert — cyrius high-VA blocker)
     return 1;
 }
 
@@ -164,7 +167,7 @@ fn pmm_extend_to_memmap(bi) {
         if (kbase < 0x10000000) {                  # 1.49.6: kernel-image reservation now covers the full KASLR range in the 256 MB bitmap (was 0x8000000 = 128 MB)
             var kp = kbase / 4096;
             var kpend = kp + 4096;             # 16 MB window (image is a few MB; generous margin)
-            if (kpend > 65536) { kpend = 65536; }  # 1.49.6: clamp to the 256 MB bitmap
+            if (kpend > 65536) { kpend = 65536; }  # clamp to the 256 MB bitmap
             while (kp < kpend) {
                 pmm_set(kp);
                 kp = kp + 1;
@@ -196,11 +199,21 @@ fn pmm_extend_to_memmap(bi) {
             }
         }
     }
-    # raise the 4 KB-allocator cap to the discovered top, clamped to the 128 MB bitmap.
+    # raise the 4 KB-allocator cap to the discovered top, clamped to 256 MB — pmm_alloc (kernel page
+    # tables / DMA) MUST stay identity-reachable, so it never allocates above the 256 MB identity window.
     var topp = pmm_memmap_top / 4096;
-    if (topp > 65535) { topp = 65535; }        # 1.49.6: clamp to the 256 MB bitmap (>256 MB = high-half direct-map sub-arc)
+    if (topp > 65535) { topp = 65535; }        # 1.49.9: KEEP 256 MB — the 4 KB allocator stays in the identity window; pmm_alloc_2mb uses the direct-map above
     if (topp <= 4095) { return 0; }            # <= 16 MB RAM -> keep the safe baseline cap
     pmm_alloc_top = topp;
+    # 1.49.9: the 2 MB user-page allocator reaches the conventional-RAM top (up to the 4 GB bitmap = 2048
+    # regions). pmm_alloc_2mb scans bottom-up; the kernel touches >256 MB pages (ELF load) via
+    # DIRECTMAP_BASE + phys (pmm_kva_for_access), which every CR3 reaches.
+    # 1.49.9: pmm_alloc_2mb is CAPPED at 256 MB (128 regions). >256 MB needs the kernel to touch each page
+    # via the direct-map (DIRECTMAP_BASE @ 8 GB), but cyrius load64/store64 don't reach an 8 GB VA — a
+    # write there returns 0 with no fault (bite-2's <=100 MB probe aliased the identity and passed
+    # falsely). Held at the 256 MB identity ceiling pending cyrius 64-bit addressing OR a <=4 GB kmap
+    # window. The 4 GB bitmap + pmm_kva_for_access groundwork stay for when that access path lands.
+    pmm_2mb_top_region = 128;
     return topp;
 }
 
@@ -234,6 +247,8 @@ fn pmm_fullram_selftest() {
     else { kprintln("PMM ext: >16MB alloc FAIL", 25); }
     # 1.49.8: prove pmm_alloc_2mb reaches above the OLD 128 MB region cap (regions 64..127 = 128-256 MB).
     # It allocs bottom-up, so we fill the low regions and watch the max address cross 128 MB, then free all.
+    # (1.49.9 found the >256 MB path needs the 8 GB direct-map, which cyrius load64/store64 can't reach —
+    # so user RAM holds at 256 MB; this remains the 256 MB-ceiling proof.)
     var allocs[1024];               # up to 128 region addrs (function-local var[N] = N bytes = 128 u64 slots)
     var n2 = 0;
     var max2 = 0;
@@ -258,8 +273,8 @@ fn pmm_fullram_selftest() {
 
 fn pmm_init() {
     # Zero bitmap (all free)
-    memset(&pmm_bitmap, 0, 8192);                 # 1.49.6: zero the full 256 MB bitmap (was 4096)
-    pmm_total = 65536;                            # 1.49.6: 256 MB (was 32768 = 128 MB)
+    memset(&pmm_bitmap, 0, 8192);                 # zero the full 256 MB bitmap
+    pmm_total = 65536;                            # 256 MB
     pmm_used = 0;
     # Mark the first 4 MB as used: kernel image + page tables + stacks.
     # 1.40.9: was 2 MB (pages 0-511), but the kernel image (LOAD MemSiz) now
@@ -437,7 +452,7 @@ fn pmm_free_2mb(addr) {
     var base = addr / 0x1000;
     if (base % 512 != 0) { return 0 - 1; }   # not 2 MB-aligned
     if (base < 512) { return 0 - 1; }         # region 0 is the kernel
-    if (base >= 65536) { return 0 - 1; }      # 1.49.8: 256 MB bitmap (was 32768 = 128 MB), so pmm_alloc_2mb regions up to 256 MB free cleanly
+    if (base >= 65536) { return 0 - 1; }      # 256 MB bitmap, so pmm_alloc_2mb regions up to 4 GB free cleanly
     pmm_spin_lock();
     for (var i = 0; i < 512; i = i + 1) {
         if (pmm_test(base + i) == 1) {
