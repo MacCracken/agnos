@@ -98,6 +98,10 @@ else
     # (2) scales with -m: the 1024M boot must report meaningfully more than the 256M boot.
     if [ "$MB_LARGE" -gt "$((MB_SMALL * 2))" ]; then echo "PASS: 1024M boot reports ${MB_LARGE} MB (> 2x the 256M boot — scales with -m)"
     else echo "FAIL: 1024M boot reports ${MB_LARGE} MB (not > 2x ${MB_SMALL} — doesn't scale)"; fail=1; fi
+    # (3) the kernel direct-map (1.49.7): physical RAM mapped at DIRECTMAP_BASE + phys; the probe read
+    #     phys 0 + 100 MB through it and matched the identity map (proves the direct-map is live).
+    if strings "$LOGS/ram-256M.log" | grep -q "directmap: low+hi OK"; then echo "PASS: kernel direct-map active (DIRECTMAP_BASE+phys == identity for phys 0 + 100 MB)"
+    else echo "FAIL: 'directmap: low+hi OK' not found (direct-map not active)"; fail=1; fi
 fi
 
 echo ""

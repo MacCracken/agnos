@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.7] — 2026-06-28
+
+**▶ 1.49.7 — full-RAM extension, bite 2: the kernel direct-map (the access path past the 256 MB identity ceiling).**
+
+### Added
+- **A kernel direct-map of physical RAM (`kernel/core/vmm.cyr` `pmm_setup_directmap` + `pmm.cyr` `pmm_memmap_ram_top` + `main.cyr`).** 256 MB (1.49.6) is the per-proc *identity* limit — beyond it the kernel's identity VA collides with the user mmap arena (256 MB–1 GB). The direct-map decouples kernel RAM access from the low-half user VAs: all physical RAM is mapped at **`DIRECTMAP_BASE (8 GB) + phys`**, as 2 MB WB supervisor pages, in the *existing* kernel PDPT @ 0x2000 (PDPT[8..511] = 504 GB of reach). The per-proc CR3 mirrors kernel PDPT[1..511], so the direct-map propagates to **every CR3** — the kernel can reach any physical page via `DIRECTMAP_BASE + phys` during any syscall, regardless of the mmap arena. `pmm_memmap_ram_top` (the conventional-RAM top, **not** the MMIO-inflated memmap top, which is TB-range from 64-bit BARs) bounds the mapping.
+- **Placement rationale (hard-won; three attempts).** The conventional spot is the canonical HIGH half (`0xFFFF8...`), but that VA has **bit 63 set = a negative i64**, and cyrius's signed `load64`/`store64` faulted on it *despite a verified-correct page-table chain*. A 16 TB low-half base (PML4[32], a **new PML4 entry**) also faulted — large-address codegen and/or a new-PML4-entry paging-structure-cache subtlety the CR3 reload doesn't clear. The working placement: **8 GB — a GB-range address in the existing PDPT @ 0x2000**, the exact pattern `apic.cyr` uses for the LAPIC (PDPT[3]) and proven to work.
+- Validated: **ram-probe-smoke** `directmap: low+hi OK` (phys 0 + 100 MB read through the direct-map == the identity map) + boot-to-shell (new gate (3)); **exec-smoke PASS non-PIE AND PIE** (the direct-map rides the per-proc CR3 through proc creation + exec-from-disk); pmm-fullram 3/3; `check.sh` clean.
+- **Next (1.49.8+): switch the PMM/heap to return `DIRECTMAP_BASE + phys` pointers + grow the bitmap to `pmm_memmap_ram_top`.** That's bite 3 — where RAM above 256 MB actually comes online (the direct-map is the *access path*; bite 3 makes the allocator hand it out).
+
 ## [1.49.6] — 2026-06-27
 
 **▶ 1.49.6 — full-RAM extension, bite 1: 128 → 256 MB (the per-proc identity's full window).**

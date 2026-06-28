@@ -203,6 +203,41 @@ fn vmm_remap_wc_range(phys, size) {
     return 1;
 }
 
+# 1.49.7 (kernel direct-map, bite 1) — map ALL physical RAM (0..top_phys) at the kernel VA
+# DIRECTMAP_BASE + phys, as 2 MB WB SUPERVISOR pages. DIRECTMAP_BASE = 0x200000000 (8 GB), which lives
+# in the EXISTING kernel PDPT @ 0x2000 (PML4[0] -> PDPT@0x2000): VA (8 GB + phys) -> PDPT index 8 + the
+# GB number. Rationale for the placement: (a) it's a GB-range address (cyrius load64 addresses GB BARs
+# fine; the 16 TB PML4[32] attempt faulted despite a verified-correct chain — large-address codegen
+# and/or new-PML4-entry paging-cache subtleties); (b) writing PDPT entries to 0x2000 + a CR3 reload is
+# the EXACT pattern apic.cyr uses (PDPT[3] for the LAPIC) and is proven to work; (c) PDPT[8..511] = 504
+# GB of reach, far above user space (PDPT[0], 0-1 GB) so no conflict. The per-proc CR3 mirrors kernel
+# PDPT[1..511] (proc.cyr), so PDPT[8+] propagates -> the kernel reaches ANY physical page via
+# DIRECTMAP_BASE + phys under EVERY CR3. Runs after pmm_init (needs pmm_alloc; the PDs live <=256 MB,
+# identity-reachable under the boot CR3). Bite 2 switches the PMM/heap to hand out DIRECTMAP_BASE + phys
+# pointers. Returns 1 on success, 0 on pmm_alloc failure.
+var DIRECTMAP_BASE = 0x200000000;
+fn pmm_setup_directmap(top_phys) {
+    var ngb = (top_phys + 0x3FFFFFFF) / 0x40000000;       # round phys up to whole GBs
+    if (ngb < 1) { ngb = 1; }
+    if (ngb > 504) { ngb = 504; }                         # PDPT[8..511] reaches 504 GB
+    var gb = 0;
+    while (gb < ngb) {
+        var dm_pd = pmm_alloc();
+        if (dm_pd == 0) { return 0; }
+        var gb_base = gb * 0x40000000;
+        var j = 0;
+        while (j < 512) {
+            store64(dm_pd + j * 8, (gb_base + j * 0x200000) | 0x83);   # VA(DIRECTMAP+phys) -> phys, WB supervisor 2 MB
+            j = j + 1;
+        }
+        store64(0x2000 + (8 + gb) * 8, dm_pd | 0x03);     # PDPT[8+gb] in the kernel PDPT @ 0x2000 (apic.cyr-proven site)
+        gb = gb + 1;
+    }
+    asm { mov rax, cr3; }
+    asm { mov cr3, rax; }                                 # flush TLB so the new PDPT[8+] entries take effect
+    return 1;
+}
+
 fn vmm_unmap(virt) {
     var pd_idx = (virt >> 21) & 0x1FF;
     store64(0x3000 + pd_idx * 8, 0);

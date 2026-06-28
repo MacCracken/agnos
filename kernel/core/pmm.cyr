@@ -9,6 +9,7 @@ var pmm_total = 0;
 # 1.49.1 (full RAM init, bite 1) — UEFI memory-map discovery results, set by pmm_probe_memmap and
 # consumed in bite 2 to size the PMM to the machine's actual RAM. Pure discovery; no alloc change yet.
 var pmm_memmap_usable = 0;    # total EfiConventionalMemory pages = free RAM
+var pmm_memmap_ram_top = 0;   # 1.49.7: top of CONVENTIONAL RAM (type 7) — the directmap maps THIS, not pmm_memmap_top (which is the highest memmap entry incl. high 64-bit MMIO/reserved → TB-range)
 var pmm_memmap_top = 0;       # top-of-RAM physical address (highest phys_start + num_pages*4 KB)
 # 1.49.2 (full RAM init, bite 2) — the top page pmm_alloc scans (raised from 4095 = 16 MB to the
 # memmap top, clamped to 32767 = the 128 MB bitmap, by pmm_extend_to_memmap). Default = the safe
@@ -121,6 +122,7 @@ fn pmm_probe_memmap(bi) {
     if (entsize < 40) { return 0; }       # EFI_MEMORY_DESCRIPTOR is >= 40 bytes
     var usable = 0;
     var top = 0;
+    var ramtop = 0;
     var i = 0;
     while (i < count) {
         var e = mm + i * entsize;
@@ -129,11 +131,12 @@ fn pmm_probe_memmap(bi) {
         var npages = load64(e + 24);
         var pend = pstart + npages * 4096;
         if (pend > top) { top = pend; }
-        if (etype == 7) { usable = usable + npages; }    # EfiConventionalMemory
+        if (etype == 7) { usable = usable + npages; if (pend > ramtop) { ramtop = pend; } }    # EfiConventionalMemory
         i = i + 1;
     }
     pmm_memmap_usable = usable;
     pmm_memmap_top = top;
+    pmm_memmap_ram_top = ramtop;
     return usable;
 }
 

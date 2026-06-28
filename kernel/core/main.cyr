@@ -167,6 +167,17 @@ pmm_extend_to_memmap(load64(&boot_info_ptr));
 kprint("PMM: alloc_top=", 15);
 kprint_num(pmm_alloc_top);
 kprintln("", 0);
+
+# 1.49.7 (kernel direct-map, bite 1): map all physical RAM at DIRECTMAP_BASE + phys (the per-proc CR3
+# inherits it via the PML4 mirror), then probe it against the identity map. No PMM/heap change yet
+# (bite 2 switches consumers to direct-map pointers). Always-on; the directmap page tables are a few
+# pages from the <=256 MB pool.
+pmm_setup_directmap(pmm_memmap_ram_top);
+var dm_ok = 1;
+if (load64(DIRECTMAP_BASE) != load64(0)) { dm_ok = 0; }                          # phys 0 via directmap == identity
+if (load64(DIRECTMAP_BASE + 0x6400000) != load64(0x6400000)) { dm_ok = 0; }      # phys 100 MB via directmap == identity
+if (dm_ok == 1) { kprintln("directmap: low+hi OK", 20); }
+else { kprintln("directmap: low+hi FAIL", 22); }
 #ifdef PMM_FULLRAM_SELFTEST
 pmm_fullram_selftest();
 #endif
