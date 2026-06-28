@@ -3,6 +3,10 @@
 # 16MB = 4096 pages = 512 bytes bitmap
 var pmm_bitmap[512];
 var pmm_total = 0;
+# 1.49.1 (full RAM init, bite 1) — UEFI memory-map discovery results, set by pmm_probe_memmap and
+# consumed in bite 2 to size the PMM to the machine's actual RAM. Pure discovery; no alloc change yet.
+var pmm_memmap_usable = 0;    # total EfiConventionalMemory pages = free RAM
+var pmm_memmap_top = 0;       # top-of-RAM physical address (highest phys_start + num_pages*4 KB)
 var pmm_used = 0;
 var pmm_next_free = 0;
 var pmm_lock = 0;
@@ -92,6 +96,38 @@ fn kaslr_seed() {
         seed = rdtsc() ^ 0xDEAD1337CAFE4242;
     }
     return seed;
+}
+
+# 1.49.1 (full RAM init, bite 1) — read the UEFI memory map gnoboot passes in boot_info (0x28
+# memmap_phys / 0x30 count / 0x34 entsize; each entry is an EFI_MEMORY_DESCRIPTOR: type@0,
+# phys_start@8, num_pages@24) and compute (a) total EfiConventionalMemory (type 7) pages = free RAM,
+# (b) the top-of-RAM phys address. `bi` is the boot_info base (passed in, NOT read via &boot_info_ptr —
+# that global lives in a later-parsed file, so an address-ref here would break parse-order resolution).
+# Discovery only — no allocation change; bite 2 sizes the PMM to this.
+fn pmm_probe_memmap(bi) {
+    if (bi == 0) { return 0; }
+    var mm = load64(bi + 0x28);
+    var count = load32(bi + 0x30);
+    var entsize = load32(bi + 0x34);
+    if (mm == 0) { return 0; }
+    if (count == 0) { return 0; }
+    if (entsize < 40) { return 0; }       # EFI_MEMORY_DESCRIPTOR is >= 40 bytes
+    var usable = 0;
+    var top = 0;
+    var i = 0;
+    while (i < count) {
+        var e = mm + i * entsize;
+        var etype = load32(e);
+        var pstart = load64(e + 8);
+        var npages = load64(e + 24);
+        var pend = pstart + npages * 4096;
+        if (pend > top) { top = pend; }
+        if (etype == 7) { usable = usable + npages; }    # EfiConventionalMemory
+        i = i + 1;
+    }
+    pmm_memmap_usable = usable;
+    pmm_memmap_top = top;
+    return usable;
 }
 
 fn pmm_init() {

@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.1] — 2026-06-27
+
+**▶ 1.49.1 — full RAM initialization, bite 1: UEFI memory-map discovery.**
+
+### Added
+- **`pmm_probe_memmap` reads the UEFI memory map gnoboot passes in boot_info and reports the machine's actual RAM (`kernel/core/pmm.cyr` + an always-on boot log in `main.cyr`).** gnoboot already hands the kernel `memmap_phys`/`count`/`entsize` (boot_info `0x28`/`0x30`/`0x34`); the probe walks the `EFI_MEMORY_DESCRIPTOR` entries (type@0, phys_start@8, num_pages@24), summing **EfiConventionalMemory (type 7)** pages = free RAM and tracking the top-of-RAM phys address, then logs `RAM: usable=<N>MB top=<addr>`. **Discovery only — no allocation change**: the PMM still allocates from its 4–16 MB pool (`pmm_alloc` scans pages 1024–4095 of the fixed 128 MB `pmm_bitmap`). The discovered values are stored (`pmm_memmap_usable` / `pmm_memmap_top`) for **bite 2**, which sizes the PMM to actual RAM. Validated: **ram-probe-smoke** (new) boots the same kernel at `-m 256M` → **205 MB** and `-m 1024M` → **973 MB**, asserting the reported RAM exceeds the old hardcoded 128 MB and scales with `-m`; `check.sh` 11/11. (`bi` is passed in, not read via `&boot_info_ptr`, to avoid the cross-file global-address parse-order trap.)
+
 ## [1.49.0] — 2026-06-27
 
 **▶ 1.49.0 — opens the kernel-capability-gaps arc.** The 1.47.x perf series and the 1.48.x FAT/exFAT review are closed; this arc turns to the real capability gaps surfaced 2026-06-27 — the items that only became visible because the storage/net/FS foundation is now solid enough to expose them. Staged across 1.49.x–1.50.x ("plenty of numbers to use"):

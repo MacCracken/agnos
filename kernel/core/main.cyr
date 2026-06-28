@@ -52,6 +52,17 @@ kprint("KASLR: kernel_base=", 19);
 kprint_hex(load64(load64(&boot_info_ptr) + 0x70));
 kprintln("", 0);
 
+# Full RAM init (1.49.1 bite 1): probe the UEFI memory map gnoboot passed + report the machine's
+# actual RAM (free EfiConventionalMemory pages -> MB, and the top-of-RAM phys addr). Discovery only —
+# the PMM still allocates from the 4-16 MB pool; bite 2 sizes it to this. ram-probe-smoke.sh asserts
+# the MB scales with QEMU -m (vs the old hardcoded 128 MB bitmap).
+pmm_probe_memmap(load64(&boot_info_ptr));
+kprint("RAM: usable=", 12);
+kprint_num(pmm_memmap_usable / 256);
+kprint("MB top=", 7);
+kprint_hex(pmm_memmap_top);
+kprintln("", 0);
+
 # Per-stage CMOS stamps survive hangs and are decoded by
 # agnosticos/scripts/read-boot-log.sh. Slot map: 0x50 = kernel CP,
 # 0x51 = kernel magic, 0x52/0x53 = gnoboot. cp_fb() visual cells were
