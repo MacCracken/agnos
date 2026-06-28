@@ -12,7 +12,7 @@ var pmm_memmap_usable = 0;    # total EfiConventionalMemory pages = free RAM
 var pmm_memmap_ram_top = 0;   # 1.49.7: top of CONVENTIONAL RAM (type 7) — the directmap maps THIS, not pmm_memmap_top (which is the highest memmap entry incl. high 64-bit MMIO/reserved → TB-range)
 var pmm_memmap_top = 0;       # top-of-RAM physical address (highest phys_start + num_pages*4 KB)
 # 1.49.2 (full RAM init, bite 2) — the top page pmm_alloc scans (raised from 4095 = 16 MB to the
-# memmap top, clamped to 32767 = the 128 MB bitmap, by pmm_extend_to_memmap). Default = the safe
+# memmap top, clamped to 65535 = the 256 MB bitmap, by pmm_extend_to_memmap). Default = the safe
 # 16 MB baseline until extended.
 var pmm_alloc_top = 4095;
 var pmm_used = 0;
@@ -146,7 +146,7 @@ fn pmm_probe_memmap(bi) {
 #   (1) the kernel image — KASLR loads it at a RANDOM 2 MB-aligned base in [32 MB, 254 MB) (boot_info
 #       +0x70), so top-down pmm_alloc would clobber it; reserve a generous 16 MB window at kbase.
 #   (2) non-EfiConventionalMemory memmap regions in the window (firmware / ACPI / MMIO holes).
-# Then raise pmm_alloc_top from 4095 (16 MB) to the memmap top, clamped to 32767 (128 MB). The 2 MB
+# Then raise pmm_alloc_top from 4095 (16 MB) to the memmap top, clamped to 65535 (256 MB). The 2 MB
 # allocator (pmm_alloc_2mb, user code/stack/heap) is unchanged — it still serves the low 2-16 MB.
 # `bi` is the boot_info base, passed in (not via &boot_info_ptr — parse-order, as in pmm_probe_memmap).
 fn pmm_extend_to_memmap(bi) {
@@ -232,6 +232,27 @@ fn pmm_fullram_selftest() {
     pmm_free(p2);
     if (ok == 1) { kprintln("PMM ext: >16MB alloc OK", 23); }
     else { kprintln("PMM ext: >16MB alloc FAIL", 25); }
+    # 1.49.8: prove pmm_alloc_2mb reaches above the OLD 128 MB region cap (regions 64..127 = 128-256 MB).
+    # It allocs bottom-up, so we fill the low regions and watch the max address cross 128 MB, then free all.
+    var allocs[1024];               # up to 128 region addrs (function-local var[N] = N bytes = 128 u64 slots)
+    var n2 = 0;
+    var max2 = 0;
+    while (n2 < 120) {
+        var pa = pmm_alloc_2mb();
+        if (pa == 0) { break; }
+        store64(&allocs + n2 * 8, pa);
+        if (pa > max2) { max2 = pa; }
+        n2 = n2 + 1;
+    }
+    var fi = 0;
+    while (fi < n2) { pmm_free_2mb(load64(&allocs + fi * 8)); fi = fi + 1; }
+    kprint("PMM 2mb: regions=", 17);
+    kprint_num(n2);
+    kprint(" max=", 5);
+    kprint_hex(max2);
+    kprintln("", 0);
+    if (max2 > 0x8000000) { kprintln("PMM 2mb: >128MB OK", 18); }
+    else { kprintln("PMM 2mb: >128MB FAIL", 20); }
     return 0;
 }
 
@@ -367,9 +388,15 @@ fn pmm_free(addr) {
 # is entirely free, marks all 512, returns the 2 MB-aligned base — or 0 if none is free
 # (the 16 MB pool fragments under single-page allocs, so this can fail; mmap
 # treats 0 as MAP_FAILED).
+# 1.49.8 (RAM-arc bite 3a): the 2 MB user-page allocator's region ceiling. Was hardcoded r<64 (regions
+# 1..63 = 2-128 MB) — so user RAM stayed capped at 128 MB even after 1.49.6 grew the bitmap + per-proc
+# identity to 256 MB. 128 regions × 2 MB = the full 256 MB bitmap; regions 1..127 = 2-256 MB. 256 MB is
+# identity-mapped (per-proc PD[8..127] + elf.cyr's on-demand vmm_map covers 0-1 GB), so NO direct-map is
+# needed here. Bite 3b (>256 MB) raises this to the full RAM + routes kernel page-access via DIRECTMAP_BASE.
+var pmm_2mb_top_region = 128;
 fn pmm_alloc_2mb() {
     pmm_spin_lock();
-    for (var r = 1; r < 64; r = r + 1) {
+    for (var r = 1; r < pmm_2mb_top_region; r = r + 1) {
         var base = r * 512;
         var free = 1;
         for (var i = 0; i < 512; i = i + 1) {
@@ -392,7 +419,7 @@ fn pmm_alloc_2mb() {
 fn pmm_count_2mb_free() {
     pmm_spin_lock();
     var count = 0;
-    for (var r = 1; r < 64; r = r + 1) {
+    for (var r = 1; r < pmm_2mb_top_region; r = r + 1) {     # 1.49.8: track the same 256 MB ceiling as pmm_alloc_2mb
         var base = r * 512;
         var free = 1;
         for (var i = 0; i < 512; i = i + 1) {
@@ -410,7 +437,7 @@ fn pmm_free_2mb(addr) {
     var base = addr / 0x1000;
     if (base % 512 != 0) { return 0 - 1; }   # not 2 MB-aligned
     if (base < 512) { return 0 - 1; }         # region 0 is the kernel
-    if (base >= 32768) { return 0 - 1; }
+    if (base >= 65536) { return 0 - 1; }      # 1.49.8: 256 MB bitmap (was 32768 = 128 MB), so pmm_alloc_2mb regions up to 256 MB free cleanly
     pmm_spin_lock();
     for (var i = 0; i < 512; i = i + 1) {
         if (pmm_test(base + i) == 1) {

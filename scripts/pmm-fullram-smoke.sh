@@ -55,7 +55,7 @@ timeout "${QEMU_TIMEOUT:-40}" qemu-system-x86_64 \
     -serial stdio -display none -no-reboot 2>/dev/null > "$LOG"
 
 echo "--- PMM / KASLR / shell lines ---"
-strings "$LOG" | grep -E "KASLR: kernel_base|RAM: usable|PMM: alloc_top|PMM ext:|AGNOS shell" | head
+strings "$LOG" | grep -E "KASLR: kernel_base|RAM: usable|PMM: alloc_top|PMM ext:|PMM 2mb:|AGNOS shell" | head
 echo "---------------------------------"
 
 pass=0; fail=0
@@ -66,6 +66,7 @@ echo ""
 if [ -n "$TOP" ] && [ "$TOP" -gt 32767 ]; then echo "PASS: alloc_top=${TOP} (> 32767 — cap raised past the old 128 MB bitmap into the 256 MB window)"; pass=$((pass+1));
 else echo "FAIL: alloc_top=${TOP:-?} not raised past 32767 (256 MB extension regressed to <= 128 MB)"; fail=$((fail+1)); fi
 chk "PMM ext: >16MB alloc OK" "two 4 KB allocs landed > 16 MB, distinct, freed" "PMM extension alloc regression"
+chk "PMM 2mb: >128MB OK"      "pmm_alloc_2mb (user pages) reaches above the old 128 MB cap into 128-256 MB" "2 MB user-page allocator still capped at 128 MB"
 chk "AGNOS shell"             "kernel booted to shell with the extension (kernel image not clobbered)" "boot did not reach shell — possible self-clobber"
 
 echo ""

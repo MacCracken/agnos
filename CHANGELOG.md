@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.8] — 2026-06-28
+
+**▶ 1.49.8 — full-RAM extension, bite 3a: user pages reach the full 256 MB (the user-facing half of 1.49.6).**
+
+### Changed
+- **`pmm_alloc_2mb` (the 2 MB user-page allocator) now serves regions 1..127 = 2–256 MB, not the hardcoded 2–128 MB (`kernel/core/pmm.cyr`).** 1.49.6 grew the bitmap + per-proc identity to 256 MB, but `pmm_alloc_2mb` was still capped at region 63 (128 MB) — so user processes (ELF code / stack / mmap heap, all from this allocator) stayed capped at 128 MB despite the larger bitmap. Lifted to a `pmm_2mb_top_region` (= 128 regions = 256 MB); `pmm_count_2mb_free` (the mmap pre-check) tracks the same ceiling, and `pmm_free_2mb`'s 128 MB bound (`base >= 32768`) → 256 MB (`>= 65536`) so the new regions free cleanly. **No direct-map needed here**: 256 MB is identity-mapped (the per-proc PD[8..127] re-assert + `elf.cyr`'s on-demand `vmm_map(phys,phys)`, which covers 0–1 GB), so the kernel reaches every user page during ELF load via the existing path. Validated: **pmm-fullram-smoke** `PMM 2mb: >128MB OK` (**102 regions allocated, max `0xda00000` ≈ 218 MB** at `-m 256M`) + boot-to-shell (new smoke gate); **exec-smoke PASS non-PIE AND PIE**; `check.sh` 11/11.
+- **Next (1.49.9): bite 3b — the >256 MB extension.** Grow the bitmap past 256 MB and route the kernel's user-page access (ELF load, stack, argv) through `DIRECTMAP_BASE + phys` (the 1.49.7 direct-map) instead of the identity map — above 256 MB the identity collides with the user mmap arena, which is exactly what the direct-map was built to sidestep.
+
 ## [1.49.7] — 2026-06-28
 
 **▶ 1.49.7 — full-RAM extension, bite 2: the kernel direct-map (the access path past the 256 MB identity ceiling).**
