@@ -624,10 +624,26 @@ fn fatfs_read(cluster, buf, maxlen) {
         guard = guard + 1;
         if (guard > max_cluster) { return total; }
         var base = fatfs_first_sector_of_cluster(clus);
-        # 1.48.0 — one multi-sector read per cluster straight into buf (collapses the per-sector loop
-        # + the byte-copy; the FAT/exFAT analog of block_read_amp — a <=4 KB cluster goes out as 1
-        # NVMe command vs sectors_per_cluster). Partial tail sector via the 512 B scratch.
-        var want = fatfs_sectors_per_cluster * 512;
+        # 1.48.2 — coalesce a physically-contiguous cluster RUN into one multi-sector read (the
+        # cluster-level 1.47.6 analog, on top of 1.48.0's per-cluster collapse). Scan the FAT chain
+        # forward while it stays contiguous (next == cur+1), CAPPED so the run stays <= 4 KB — the read
+        # is then one bounce command, never a >4 KB per-sector regression. For small clusters (spc=1)
+        # this folds up to 8 contiguous clusters into 1 NVMe command; spc >= 8 is a single cluster
+        # (== 1.48.0). The scan's FAT reads hit the already-cached FAT block (fatfs_fat_buf) for
+        # clusters in the same block. Partial tail sector via the 512 B scratch.
+        var spc = fatfs_sectors_per_cluster;
+        var run_cap = 8 / spc;
+        if (run_cap < 1) { run_cap = 1; }
+        var run = 1;
+        var last = clus;
+        while (run < run_cap) {
+            var nc = fat_next_cluster(last);
+            if (nc != last + 1) { break; }     # non-contiguous / EOC → stop the run at the real length
+            if (nc >= max_cluster) { break; }
+            last = nc;
+            run = run + 1;
+        }
+        var want = run * spc * 512;
         if (maxlen - total < want) { want = maxlen - total; }
         var fsec = want / 512;
         var rem = want - fsec * 512;
@@ -640,7 +656,7 @@ fn fatfs_read(cluster, buf, maxlen) {
             memcpy(buf + total, &fatfs_data_buf, rem);
             total = total + rem;
         }
-        clus = fat_next_cluster(clus);
+        clus = fat_next_cluster(last);
     }
     return total;
 }

@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.48.2] — 2026-06-27
+
+**▶ 1.48.2 — other-FS perf review (3rd item, closes the set): FAT/exFAT multi-cluster read coalescing.** (The 4th planned item — cluster-chain re-read reuse — was found ALREADY DONE.)
+
+### Changed
+- **`exfat_read` + `fatfs_read` now coalesce a physically-contiguous cluster RUN into one multi-sector read, on top of 1.48.0's per-cluster collapse (`kernel/core/exfat.cyr` + `kernel/core/fatfs.cyr`).** Each scans forward while the chain stays contiguous (`next == cur+1`; exFAT `no_fat_chain` runs are contiguous by definition, no FAT read), **capped so the run stays ≤4 KB** — the read is then one bounce command and there is **never a >4 KB per-sector regression**. For small clusters (spc=1) this folds up to **8 contiguous clusters into 1 NVMe command** (vs 8 per-cluster reads at 1.48.0); spc≥8 (≥4 KB cluster) stays one cluster (== 1.48.0). The scan's FAT reads hit the **already-cached FAT block** (`fatfs_fat_buf`/`exfat_fat_buf`); the run advances `clus` en bloc. The cluster-level analog of ext2's 1.47.6 multi-block read coalescing. Validated: **exfat-smoke PASS** (multi-cluster FAT-chain read, upcase TableChecksum reproduced), **fat-smoke PASS** (multi-cluster chain read byte-exact past the first cluster), `check.sh` 11/11. *(A self-caught `break`-vs-`run=cap` bug — which would have read non-contiguous clusters as one run — was fixed before build.)*
+- **The 4th planned 1.48.x item (cluster-chain re-read reuse) was found already implemented** — both drivers cache the current FAT block (`fatfs_fat_buf`/`exfat_fat_buf`) and re-read only on a FAT-block change, so consecutive clusters in the same block already hit the cache (the FAT/exFAT analog of 1.47.5's indirect-block reuse). **The 1.48.x FAT/exFAT perf review is now complete**: read-amp (1.48.0) + write-amp (1.48.1) + multi-cluster coalescing (1.48.2) + FAT-block reuse (pre-existing).
+
 ## [1.48.1] — 2026-06-27
 
 **▶ 1.48.1 — other-FS perf review (2nd item): FAT/exFAT cluster-WRITE amplification collapse (the write mirror of 1.48.0).**
