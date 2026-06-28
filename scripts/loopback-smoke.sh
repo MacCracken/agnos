@@ -113,15 +113,19 @@ echo "--- serial log (lo lines) ---"
 grep -E "lo:" "$LOG" || echo "(no lo lines captured)"
 echo "-----------------------------"
 
-if grep -q "lo: UDP loopback OK" "$LOG"; then
-    echo ""
-    echo "PASS: UDP datagram to 127.0.0.1 looped back internally (net_tx queue + net_lo_drain demux)"
-    echo "=== loopback-smoke: 1 passed, 0 failed ==="
-    exit 0
-fi
+pass=0
+fail=0
+check() {
+    if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass + 1));
+    else echo "FAIL: '$1' not found — $3"; fail=$((fail + 1)); fi
+}
 
 echo ""
-echo "FAIL: 'lo: UDP loopback OK' not found — loopback queue/demux regression"
-echo "      (a 'lo: UDP loopback FAIL' line means the packet didn't round-trip; check 'lo: got=')"
-echo "=== loopback-smoke: 0 passed, 1 failed ==="
+check "lo: UDP loopback OK"       "UDP datagram to 127.0.0.1 looped back (net_tx queue + net_lo_drain demux)"     "UDP loopback regression (check 'lo: got=')"
+check "lo: ICMP ping loopback OK" "ICMP echo to net_ip self-looped (request + reply both via the lo queue)"       "ICMP loopback regression"
+check "lo: TCP loopback OK"       "TCP handshake to net_ip completed over lo (SYN/SYN-ACK/ACK via the lo queue)"  "TCP loopback handshake regression"
+
+echo ""
+echo "=== loopback-smoke: $pass passed, $fail failed ==="
+[ "$fail" -eq 0 ] && exit 0
 exit 1

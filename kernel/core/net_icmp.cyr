@@ -33,7 +33,7 @@ fn icmp_send_echo_reply(src_ip, icmp_msg, icmp_len) {
     store8(p + off + 20 + 2, (ck >> 8) & 0xFF);
     store8(p + off + 20 + 3, ck & 0xFF);
     ip_build(p + off, net_ip, src_ip, 1, icmp_len);
-    return nic_send(p, off + 20 + icmp_len);
+    return net_tx(p, off + 20 + icmp_len);           # 1.49.0 loopback bite 2: echo reply loops too
 }
 
 # IP demux hook for proto 1. icmp_off = offset of the ICMP message in pkt.
@@ -68,7 +68,8 @@ fn net_handle_icmp(pkt, icmp_off, icmp_len, src_ip) {
 # Send one echo request to dst_ip and wait (bounded ~3s) for the matching
 # reply. Returns elapsed timer_ticks (>= 0) on success, 0-1 on timeout/no-NIC.
 fn icmp_ping(dst_ip) {
-    if (nic_ready() == 0) { return 0 - 1; }
+    # 1.49.0 loopback bite 2: a loopback dst (our own net_ip / 127.x) needs no NIC up.
+    if (nic_ready() == 0 && net_is_loopback(dst_ip) == 0) { return 0 - 1; }
     icmp_seq = (icmp_seq + 1) & 0xFFFF;
 
     var dst_mac[8];
@@ -91,7 +92,7 @@ fn icmp_ping(dst_ip) {
 
     icmp_reply_seen = 0;
     var start = timer_ticks;
-    if (nic_send(p, off + 20 + icmp_len) < 0) { return 0 - 1; }
+    if (net_tx(p, off + 20 + icmp_len) < 0) { return 0 - 1; }
     while ((timer_ticks - start) < 300) {     # ~3s at the 100 Hz timer
         net_poll();
         if (icmp_reply_seen == 1) { return timer_ticks - start; }

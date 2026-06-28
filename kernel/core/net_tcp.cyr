@@ -270,7 +270,7 @@ fn tcp_send_pkt(conn_id, flags, data, data_len) {
     store8(p + tcp_off + 17, cksum & 0xFF);
     # Build IP header (proto=6 for TCP)
     ip_build(p + off, net_ip, dst_ip, 6, tcp_total);
-    return nic_send(p, off + 20 + tcp_total);
+    return net_tx(p, off + 20 + tcp_total);          # 1.49.0 loopback bite 2: 127.x/net_ip → lo queue
 }
 
 # === TCP retransmit (B2) — one in-flight segment, fixed RTO + ×2 backoff ===

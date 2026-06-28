@@ -114,6 +114,22 @@ fn loopback_selftest() {
     if (load8(&net_udp_buf + 12) != 71) { lo_ok = 0; }     # 'G' (last byte of "AGNOS-LO-PING")
     if (lo_ok == 1) { kprintln("lo: UDP loopback OK", 19); }
     else { kprintln("lo: UDP loopback FAIL", 21); }
+
+    # bite 2 — ICMP ping + TCP handshake to our own net_ip (self-loop). The reply's dst is the
+    # request's src (net_ip), which net_is_loopback also catches, so replies loop with NO source
+    # selection. Wait (bounded) for DHCP to assign net_ip first — a self-loop is the cleanest target.
+    var dl = timer_ticks + 800;
+    while (net_ip == 0 && timer_ticks < dl) { net_poll(); arch_wait(); }
+    if (net_ip == 0) {
+        kprintln("lo: net_ip=0 skip", 17);
+        return 0;
+    }
+    if (icmp_ping(net_ip) >= 0) { kprintln("lo: ICMP ping loopback OK", 25); }
+    else { kprintln("lo: ICMP ping loopback FAIL", 27); }
+    tcp_listen(7777);
+    var cid = tcp_connect(net_ip, 7777, 33333);
+    if (cid >= 0) { kprintln("lo: TCP loopback OK", 19); }
+    else { kprintln("lo: TCP loopback FAIL", 21); }
     return 0;
 }
 
