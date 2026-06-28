@@ -304,9 +304,10 @@
     var m = 1;
     if (pmm_free_2mb(0x201000) == 0) { m = 0; }        # page 513 — not 2 MB-aligned → reject
     if (pmm_free_2mb(0x0) == 0) { m = 0; }             # kernel region (base 0 < 512) → reject
-    if (pmm_free_2mb(0x1000000000) == 0) { m = 0; }    # 64 GB — base ≥ bitmap (caps at 64 GB) → out-of-range reject
-                                                       #   (was 0x1000000 = 16 MB; stale once the 2 MB pool grew from
-                                                       #    16 MB to 256 MB+ — 16 MB is now IN-pool, not a reject case)
+    # Out-of-range guard: was pmm_free_2mb(0x1000000) (16 MB) expecting a ">= pool" reject, but the 2 MB
+    # pool grew from 16 MB to 256 MB+ (now the full machine RAM) so 16 MB is IN-pool. Use 64 GB — above
+    # the bitmap's 64 GB cap, so base >= pmm_bitmap_pages always holds → reject.
+    if (pmm_free_2mb(0x1000000000) == 0) { m = 0; }    # 64 GB — base ≥ bitmap → out-of-range reject
     var c0 = pmm_count_2mb_free();
     var x = pmm_alloc_2mb();
     if (x == 0) { m = 0; }
