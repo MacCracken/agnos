@@ -84,6 +84,7 @@ fn elf_load(elf_addr, elf_size) {
             var p_vaddr = load64(ph + 16);
             var p_filesz = load64(ph + 32);
             var p_memsz = load64(ph + 40);
+            var p_flags = load32(ph + 4);             # 1.50.6 W^X: PF_X=0x1 (executable)
 
             # Security: validate segment bounds within ELF file
             if (p_offset >= elf_size) { return 0 - 1; }
@@ -120,7 +121,8 @@ fn elf_load(elf_addr, elf_size) {
                 # 1.49.12: kernel access handle (identity <=256 MB / direct-map above) — same >256 MB
                 # raw-phys #PF fix as sys_mmap + elf_load_from_file. proc_map_page still stores raw `phys`.
                 var kva = pmm_kva_for_access(phys);
-                proc_map_page(new_cr3, pg, phys);
+                if ((p_flags & 1) != 0) { proc_map_page(new_cr3, pg, phys); }   # PF_X — executable code
+                else { proc_map_page_nx(new_cr3, pg, phys); }                   # 1.50.6: non-PF_X data segment -> NX (W^X)
                 memset(kva, 0, 0x200000);            # zero whole page (BSS + slack)
                 var lo = p_vaddr;  if (pg > lo) { lo = pg; }
                 var hi = seg_v1;   if (pg + 0x200000 < hi) { hi = pg + 0x200000; }
@@ -150,7 +152,7 @@ fn elf_load(elf_addr, elf_size) {
     if (stack_phys < 0x10000000) {
         if (vmm_is_mapped(stack_phys) == 0) { vmm_map(stack_phys, stack_phys, 0x83); }
     }
-    proc_map_page(new_cr3, stack_base, stack_phys);
+    proc_map_page_nx(new_cr3, stack_base, stack_phys);   # 1.50.6 W^X: stack is data -> NX
     # S6: unmap guard page below stack to trap overflow
     proc_unmap_page(new_cr3, stack_base - 0x200000);
     var stack_top = stack_base + 0x4000;
@@ -265,6 +267,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
             var p_vaddr  = load64(ph + 16);
             var p_filesz = load64(ph + 32);
             var p_memsz  = load64(ph + 40);
+            var p_flags  = load32(ph + 4);             # 1.50.6 W^X: PF_X=0x1 (executable) / PF_W=0x2 / PF_R=0x4
             # Same security bounds as elf_load, validated against the file size.
             if (p_offset >= fsize) { return 0 - 1; }
             if (p_filesz > fsize) { return 0 - 1; }
@@ -299,7 +302,12 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
                 var phys = pmm_alloc_2mb();
                 if (phys == 0) { return 0 - 1; }
                 var kva = pmm_kva_for_access(phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
-                proc_map_page(new_cr3, pg, phys);
+                # 1.50.6 W^X: PF_X segments stay executable; non-executable (data-only) segments are NX.
+                # NOTE: cyrius/cyrld currently emits ONE RWE PT_LOAD per binary (code+data+bss together), so
+                # this segment IS PF_X → executable (no change); true segment W^X needs cyrius to emit
+                # separate RX-code / RW-data segments. The STACK NX below is the live W^X win for now.
+                if ((p_flags & 1) != 0) { proc_map_page(new_cr3, pg, phys); }
+                else { proc_map_page_nx(new_cr3, pg, phys); }
                 # Zero the whole page first (covers BSS + any slack), then copy
                 # the slice of file-backed data that lands in [pg, pg+2MB).
                 memset(kva, 0, 0x200000);
@@ -337,7 +345,7 @@ fn elf_load_from_file(path, namelen, argv_src, argv_len) {
     var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }
     var stack_kva = pmm_kva_for_access(stack_phys);   # 1.49.9: kernel access handle — identity <=256 MB, direct-map above
-    proc_map_page(new_cr3, stack_base, stack_phys);
+    proc_map_page_nx(new_cr3, stack_base, stack_phys);   # 1.50.6 W^X: the user stack is data -> NX (blocks stack shellcode; no signal trampoline runs there)
     proc_unmap_page(new_cr3, stack_base - 0x200000);
 
     # 1.40.7: build the SysV process init stack so the program gets argc/argv.
