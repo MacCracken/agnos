@@ -570,7 +570,7 @@ fn proc_free_address_space(cr3) {
         var e = load64(pd + i * 8);
         if ((e & 0x01) != 0) {
             if ((e & 0x04) != 0) {
-                pmm_free_2mb(e & 0xFFFFFFFFFFE00000);
+                pmm_free_2mb(e & 0x000FFFFFFFE00000);
             }
         }
     }
@@ -592,7 +592,7 @@ fn proc_free_address_space(cr3) {
                     var he = load64(hpd + hj * 8);
                     if ((he & 0x01) != 0) {
                         if ((he & 0x04) != 0) {
-                            pmm_free_2mb(he & 0xFFFFFFFFFFE00000);
+                            pmm_free_2mb(he & 0x000FFFFFFFE00000);
                         }
                     }
                 }
@@ -783,6 +783,33 @@ fn proc_map_page(cr3, virt, phys) {
     return 0;
 }
 
+# proc_map_page_nx(cr3, virt, phys) — like proc_map_page, but maps the page
+# NON-EXECUTABLE (NX, bit 63 set: flag 0x8000000000000087 = the canonical user
+# data/stack flag from vmm.cyr). 1.50.5 W^X: used by sys_mmap for the LOW anonymous
+# arena (pure heap data — a program never executes its mmap'd memory), so a heap
+# spray can't be jumped into. (EFER.NXE is set at boot — boot_shim.cyr.) Code stays
+# on proc_map_page (0x87, executable). Every site that later EXTRACTS phys from one
+# of these PDEs must mask with 0x000FFFFFFFE00000 (bits 21-51), NOT 0xFFFF...E00000,
+# or it would grab the NX bit and free/read a corrupt address.
+fn proc_map_page_nx(cr3, virt, phys) {
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpte = load64(pdpt_addr);
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pd_idx = (virt >> 21) & 0x1FF;
+    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x8000000000000087);
+    var u_cr3 = load64(pd_addr + 511 * 8);
+    if (u_cr3 != 0) {
+        var u_pml4e = load64(u_cr3);
+        var u_pdpt = u_pml4e & 0xFFFFFFFFF000;
+        var u_pdpte = load64(u_pdpt);
+        var u_pd = u_pdpte & 0xFFFFFFFFF000;
+        store64(u_pd + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x8000000000000087);
+    }
+    invlpg_va(virt);
+    return 0;
+}
+
 # proc_map_page_hi(cr3, virt, phys) — like proc_map_page, but for the HIGH user
 # mmap arena (VA >= USER_HIMMAP_BASE = 128 GB). proc_map_page only ever touches
 # PDPT[0]'s single 0-1 GB PD; a high VA needs its OWN per-process PDPT entry +
@@ -812,7 +839,7 @@ fn proc_map_page_hi(cr3, virt, phys) {
         pd_addr = pdpte & 0xFFFFFFFFF000;
     }
     var pd_idx = (virt >> 21) & 0x1FF;
-    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
+    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x8000000000000087);   # NX (1.50.5 W^X — anon arena)
     invlpg_va(virt);
     return 0;
 }
@@ -836,7 +863,7 @@ fn proc_unmap_2mb_hi(cr3, virt) {
     var entry = load64(pd_addr + pd_idx * 8);
     if ((entry & 0x01) == 0) { return 0; }              # PDE not present
     if ((entry & 0x04) == 0) { return 0; }              # not user — never free a kernel page
-    var phys = entry & 0xFFFFFFFFFFE00000;
+    var phys = entry & 0x000FFFFFFFE00000;
     store64(pd_addr + pd_idx * 8, 0);                   # clear the PDE
     invlpg_va(virt);
     pmm_free_2mb(phys);
@@ -868,7 +895,7 @@ fn proc_copy_from_user(cr3, dst, uva, len) {
         if ((pde & 1) == 0) { return 0; }      # not present
         if ((pde & 4) == 0) { return 0; }      # not a user page
         if ((pde & 0x80) == 0) { return 0; }   # not a 2 MB huge page (unexpected shape)
-        var page_phys = pde & 0xFFFFFFFFFFE00000;
+        var page_phys = pde & 0x000FFFFFFFE00000;
         var off = va & 0x1FFFFF;
         var chunk = 0x200000 - off;
         if (chunk > len - copied) { chunk = len - copied; }
@@ -986,7 +1013,7 @@ fn sys_mmap(length) {
             # 1.49.12: zero via the kernel access handle — identity <=256 MB, direct-map above.
             var kva = pmm_kva_for_access(phys);
             memset(kva, 0, 0x200000);               # zero-fill (anonymous contract)
-            proc_map_page(cr3, mmap_next_vaddr, phys);
+            proc_map_page_nx(cr3, mmap_next_vaddr, phys);
             mmap_next_vaddr = mmap_next_vaddr + 0x200000;
         }
         return base_vaddr;
@@ -1052,7 +1079,7 @@ fn sys_munmap(addr, length) {
         var pd_idx = (vaddr >> 21) & 0x1FF;
         var entry = load64(pd_addr + pd_idx * 8);
         if ((entry & 1) != 0) {                               # present -> unmap + free
-            var phys = entry & 0xFFFFFFFFFFE00000;
+            var phys = entry & 0x000FFFFFFFE00000;
             proc_unmap_page(cr3, vaddr);                      # clears kernel + KPTI user PD
             flush = vaddr;
             asm { invlpg [rax]; }                             # drop the stale huge-page TLB entry

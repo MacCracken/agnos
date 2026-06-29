@@ -354,9 +354,10 @@
         if ((pde1 & 1) == 0) { ok = 0; }                 # present
         if ((pde1 & 4) == 0) { ok = 0; }                 # user
         if ((pde1 & 0x80) == 0) { ok = 0; }              # 2 MB page
-        if ((pde1 & 0xFFFFFFFFFFE00000) != (p1 & 0xFFFFFFFFFFE00000)) { ok = 0; }   # correct phys
+        if ((pde1 & 0x000FFFFFFFE00000) != (p1 & 0x000FFFFFFFE00000)) { ok = 0; }   # correct phys (NX bit 63 masked out)
+        if ((pde1 & 0x8000000000000000) == 0) { ok = 0; }                          # 1.50.5: NX set (W^X — anon arena is non-executable)
         var pde2 = load64(pd + (((hva + 0x200000) >> 21) & 0x1FF) * 8);
-        if ((pde2 & 0xFFFFFFFFFFE00000) != (p2 & 0xFFFFFFFFFFE00000)) { ok = 0; }   # sibling reused same PD
+        if ((pde2 & 0x000FFFFFFFE00000) != (p2 & 0x000FFFFFFFE00000)) { ok = 0; }   # sibling reused same PD
     }
     if (p1 != 0) { pmm_free_2mb(p1); }
     if (p2 != 0) { pmm_free_2mb(p2); }

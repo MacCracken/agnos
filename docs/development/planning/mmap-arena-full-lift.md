@@ -38,8 +38,8 @@ User pages are reached by ring 3 through the high VA → per-proc PD → phys (a
 - **Follow-ons (1.50.x patches):**
   - ✅ **1.50.3 — high-range `sys_munmap`** (`proc_unmap_2mb_hi`; per-page PDPT walk, free + clear PDE, idempotent; LIFO cursor rewind). `mmap-himunmap: PASS`.
   - ✅ **1.50.4 — per-process cursor** (`proc_himmap_next[16]` + `himmap_reserve(pid,len)` replaces the global `himmap_next_vaddr`; each proc gets its own `[128 GB,512 GB)`). `mmap-himem-perproc: PASS`.
-  - ⏳ **NX on anonymous arena pages (W^X)** — set NX on high-arena PDEs (`proc_map_page_hi`) + the low-arena anonymous path. CARE: `proc_map_page` (low arena) is also the general user-page mapper — must NOT NX ELF *code* segments, so this needs an anonymous-only path/flag, not a blanket change. Audit callers first.
-  - ⏳ **ring-3 userland >1 GB program** — the live-path iron cherry (a real proc `mmap`s >1 GB via the syscall, touches it, `munmap`s). Cross-repo (a test binary staged on disk). The kernel mechanism is already iron-proven via `MMAP_HIMEM_E2E_SELFTEST`.
+  - ✅ **1.50.5 — NX on anonymous arena pages (W^X)** — new `proc_map_page_nx` backs the low arena, `proc_map_page_hi` NX's the high arena; ELF code stays executable on `proc_map_page`. Every arena-PDE phys extraction switched to the bit-63-safe mask `0x000FFFFFFFE00000`. `mmap-himem: chain PASS` asserts NX; `exec-smoke` 15/15. (Remaining W^X: ELF data/stack still `0x87` — needs a PF_X-aware loader, a separate change.)
+  - ⏸ **ring-3 userland >1 GB program — DEFERRED** (user 2026-06-29: nothing in the cyrius ecosystem demands >1 GB RAM yet; desktop is the natural trigger). The kernel mechanism is iron-proven via `MMAP_HIMEM_E2E_SELFTEST`; revisit when a desktop workload needs it.
 
 ## Risks / notes
 
