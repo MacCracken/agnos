@@ -117,13 +117,15 @@ fn elf_load(elf_addr, elf_size) {
             while (pg < page_end) {
                 var phys = pmm_alloc_2mb();
                 if (phys == 0) { return 0 - 1; }
-                if (vmm_is_mapped(phys) == 0) { vmm_map(phys, phys, 0x83); }
+                # 1.49.12: kernel access handle (identity <=256 MB / direct-map above) — same >256 MB
+                # raw-phys #PF fix as sys_mmap + elf_load_from_file. proc_map_page still stores raw `phys`.
+                var kva = pmm_kva_for_access(phys);
                 proc_map_page(new_cr3, pg, phys);
-                memset(phys, 0, 0x200000);            # zero whole page (BSS + slack)
+                memset(kva, 0, 0x200000);            # zero whole page (BSS + slack)
                 var lo = p_vaddr;  if (pg > lo) { lo = pg; }
                 var hi = seg_v1;   if (pg + 0x200000 < hi) { hi = pg + 0x200000; }
                 if (hi > lo) {
-                    memcpy(phys + (lo - pg), elf_addr + p_offset + (lo - p_vaddr), hi - lo);
+                    memcpy(kva + (lo - pg), elf_addr + p_offset + (lo - p_vaddr), hi - lo);
                 }
                 pg = pg + 0x200000;
             }
@@ -141,8 +143,12 @@ fn elf_load(elf_addr, elf_size) {
     var stack_base = 0x3FC00000;
     var stack_phys = pmm_alloc_2mb();
     if (stack_phys == 0) { return 0 - 1; }
-    if (vmm_is_mapped(stack_phys) == 0) {
-        vmm_map(stack_phys, stack_phys, 0x83);
+    # 1.49.12: only the USER touches this stack (via proc_map_page below — the in-memory elf_load
+    # stages no argv here), so the kernel needs no access handle. Keep the legacy identity vmm_map for
+    # a <=256 MB stack, but NEVER for a >256 MB phys — vmm_map(high,high) would write a bogus low-VA→
+    # high-phys entry into the boot PD (aliasing). >256 MB stacks reach ring 3 fine via proc_map_page.
+    if (stack_phys < 0x10000000) {
+        if (vmm_is_mapped(stack_phys) == 0) { vmm_map(stack_phys, stack_phys, 0x83); }
     }
     proc_map_page(new_cr3, stack_base, stack_phys);
     # S6: unmap guard page below stack to trap overflow

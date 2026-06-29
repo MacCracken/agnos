@@ -866,8 +866,12 @@ fn sys_mmap(length) {
     for (var i = 0; i < npages; i = i + 1) {
         var phys = pmm_alloc_2mb();
         if (phys == 0) { return 0; }            # pre-counted, but guard anyway
-        if (vmm_is_mapped(phys) == 0) { vmm_map(phys, phys, 0x83); }
-        memset(phys, 0, 0x200000);              # zero-fill (anonymous contract)
+        # 1.49.12: zero via the kernel access handle — identity <=256 MB, direct-map above. The old
+        # memset(phys,...) treated the raw phys as an identity VA, which #PF-halted once pmm_alloc_2mb
+        # could return a >256 MB region (the 1.49.11 cap lift) — the agnsh-launch lockup on the iron
+        # burn (CR2 in the multi-GB range). pmm_kva_for_access does the <=256 MB vmm_map internally.
+        var kva = pmm_kva_for_access(phys);
+        memset(kva, 0, 0x200000);               # zero-fill (anonymous contract)
         proc_map_page(cr3, mmap_next_vaddr, phys);
         mmap_next_vaddr = mmap_next_vaddr + 0x200000;
     }

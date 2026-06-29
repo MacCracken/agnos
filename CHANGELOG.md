@@ -5,7 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.49.12] — 2026-06-28
+
+**▶ 1.49.12 — iron-burn fix: the 1.49.11 >256 MB RAM extension exposed three raw-physical-address access sites that #PF-halted once allocations crossed 256 MB. The 64 GB iron burn locked up launching agnoshi; root-caused + fixed + reproduced/verified in QEMU.**
+
 ### Fixed
+- **>256 MB raw-physical-address access in `sys_mmap` + `elf_load` (`kernel/core/proc.cyr`, `kernel/core/elf.cyr`) — the agnsh-launch lockup on the 64 GB iron burn.** 1.49.9 introduced `pmm_kva_for_access` (identity ≤256 MB / direct-map above) and converted `elf_load_from_file`, but **three sibling sites kept accessing freshly-allocated 2 MB pages via their raw physical address as an identity VA**: `sys_mmap`'s zero-fill (`memset(phys, 0, 2 MB)`), and `elf_load`'s segment copy (`memset`/`memcpy(phys, …)`) + stack `vmm_map(phys, phys)`. While `pmm_alloc_2mb` was capped at 256 MB these were always identity-mapped, so they were latent. **1.49.11 lifted the cap to the full machine RAM** — so a >256 MB region now reaches those sites and the raw-phys access #PF's at a multi-GB linear address (identity only covers ≤256 MB) → the fault handler kpanic-halts (`HLT`, `IF=0`). On the 64 GB iron burn the kernel booted fully (RAM migration ✅ `16177224 free pages`, SMP ✅ `cpus online: 4`, net ✅, FS ✅) then locked up right after `kybernet: exec /bin/agnsh` — agnsh loads via the already-correct `elf_load_from_file`, enters ring 3, and its **first heap `mmap` hits `sys_mmap`**. Fix: route all three sites through `pmm_kva_for_access` (the user PTE still gets the raw `phys` via `proc_map_page`; only the kernel's transient zero/copy access uses the handle). **Reproduced in QEMU at `-m 8G` (hung, RIP in the halt loop, `CR2` ~6.2 GB, 2 MB op) and verified fixed at `-m 8G` and `-m 32G` (both reach the agnsh prompt); `-m 512M` baseline unaffected.** No regression: `agnsh-smoke`, `mmap-smoke` 2/2, `exec-smoke`, `ram-probe-smoke`, `check.sh` 11/11.
+
+### Fixed (docs-cycle, folded in)
 - **Stale `munmap: pmm-reuse` selftest (`kernel/core/selftests.cyr`).** Its out-of-range guard test freed `pmm_free_2mb(0x1000000)` (16 MB) expecting a "≥ pool" rejection, but the 2 MB allocator's pool grew from 16 MB to 256 MB+ (and now full RAM, 1.49.11) — so 16 MB is IN-pool and the call no longer rejects, failing the test. Changed to `0x1000000000` (64 GB), which is above the bitmap's 64 GB cap and always rejects. `mmap-smoke` is green again (2/2). (Investigation also confirmed `exec-smoke`'s apparent failure was a build-flag mistake — it needs `EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1`; it passes cleanly when built correctly. Neither was a regression.)
 
 ### Docs
