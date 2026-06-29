@@ -249,23 +249,28 @@ pdpt_guard_selftest();
 vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 fb_verify_wc();
 
-#ifdef BOOTCR3_OWN_PML4
-# 1.50.0 (RAM full-usage arc, bite 2) — switch the kernel onto its OWN complete PML4 (0x1000) instead of
-# continuing to run boot/idle on gnoboot's TRANSIENT boot CR3. Why HERE (LATE), not right after pt_init:
-# every gnoboot-CR3-relative access the boot makes must already be relocated low / done BEFORE the switch,
-# because 0x1000 is identity 0-4 GB ONLY (pt_init's ceiling) and CANNOT see gnoboot's high mappings. By
-# this point all of them are satisfied:
+#ifndef BOOTCR3_KEEP_GNOBOOT_CR3
+# 1.50.x (RAM full-usage arc, bite 2) — switch the kernel onto its OWN complete PML4 (0x1000) instead of
+# continuing to run boot/idle on gnoboot's TRANSIENT boot CR3. **DEFAULT-ON since 1.50.1** (iron-validated
+# on real 64 GB Zen 2026-06-29 — full FB-render boot to the agnsh prompt + live keyboard + 62 GB RAM);
+# build `BOOTCR3_KEEP_GNOBOOT_CR3=1` to opt OUT (revert to gnoboot's boot CR3) if a future target regresses.
+# Why HERE (LATE), not right after pt_init: every gnoboot-CR3-relative access the boot makes must already be
+# relocated low / done BEFORE the switch, because 0x1000 is identity 0-4 GB ONLY (pt_init's ceiling) and
+# CANNOT see gnoboot's high mappings. By this point all of them are satisfied:
 #   (a) UEFI memmap — sits near the TOP of RAM (5.4 GB @ -m 8G); read ONLY by pmm_probe/extend/migrate/
 #       setup_directmap (lines 59..184, all ABOVE) under gnoboot's full-identity CR3. Nothing dereferences
 #       the high memmap_phys (boot_info+0x28) after this — so no low copy is needed.
 #   (b) gnoboot boot_info — already copied into the low (<4 GB) boot_info_copy + boot_info_ptr repointed by
 #       boot_info_capture_rdi() (mbi.cyr) at the very top of boot, so every later read is CR3-independent.
-#   (c) framebuffer — the vmm_remap_wc_range above just (re)mapped the FB WC in 0x1000's tree; under
-#       gnoboot's CR3 the FB was WC, but 0x1000's pt_init maps it as a 1 GB WB huge page (PDPT[2], FB BAR
-#       @ ~0x87000000 on QEMU q35). WB = FB writes batch in cache and NEVER reach the display → the
-#       earlier-attempt "freeze at Page tables: 1024MB mapped" was NOT a crash (serial showed full boot),
-#       it was the WB-cached FB. Remapping WC first, THEN switching, fixes it.
-#   (d) device BARs — dev_init() runs AFTER this, so it maps every BAR into the now-active 0x1000 tree.
+#   (c) framebuffer — the vmm_remap_wc_range above just (re)mapped the FB WC in 0x1000's tree. 0x1000's
+#       pt_init maps the FB's GB as a 1 GB WB huge page (QEMU q35 FB @ 0x80000000 = PDPT[2]; real archaemenid
+#       GOP FB @ ~0xd0000000 = PDPT[3]); WB = writes batch in cache and never reach the display → the early-
+#       switch "freeze at Page tables" was that WB FB, not a crash. The WC remap shatters the 1 GB page so
+#       the FB chunk is WC BEFORE the switch — and the vmm_remap_uc_2mb idempotency guard (1.50.0) keeps a
+#       later device's UC remap into the SAME 1 GB PDPT entry from re-shattering it back to WB (the iron
+#       FB+all-device-BARs-share-PDPT[3] clobber the pre-burn review caught; load-bearing on real silicon).
+#   (d) device BARs — dev_init() runs AFTER this, so it maps every BAR into the now-active 0x1000 tree; ACPI
+#       ≥4 GB firmware reads go through acpi_va() (acpi.cyr), which direct-maps them under 0x1000.
 # pmm_setup_directmap (line 184) installed the direct-map into 0x1000's PDPT@0x2000, so >256 MB phys is
 # reachable from the boot/idle context directly after the switch — closing the "boot CR3 can't see kernel
 # VM edits" class structurally (it was the 1.49.9 misdiagnosis root). Per-proc CR3s already copy 0x1000's

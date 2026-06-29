@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.50.1] — 2026-06-29
+
+**▶ 1.50.1 — promote the boot-CR3 → own-PML4 switch to DEFAULT-ON (iron-validated).** The 1.50.0 switch (gated `BOOTCR3_OWN_PML4`, off by default) passed its iron burn on real 64 GB Zen 2026-06-29: the framebuffer rendered the *entire* post-`dev_init` boot to the agnsh prompt (no freeze — the `vmm_remap_uc_2mb` guard fix held on real silicon while NVMe/AHCI/xHCI/net all UC-remapped into the FB's shared PDPT[3] 1 GB entry), the **keyboard worked** (`iam` typed + ran → `Memory: 61 GiB`), and ~62 GB of RAM was online (`kybernet: 16177229 free pages`) under the switch, with SMP-4 / DHCP lease / ext2+jbd2+FAT all green. So the kernel now runs boot/idle on its **own** complete PML4 (`0x1000`) by default rather than gnoboot's transient boot CR3.
+
+### Changed
+- **Boot-CR3 → own-PML4 switch is now DEFAULT-ON.** The gate inverted from opt-in `#ifdef BOOTCR3_OWN_PML4` to opt-**out** `#ifndef BOOTCR3_KEEP_GNOBOOT_CR3` (`kernel/core/main.cyr`); a plain `./scripts/build.sh` now boots on `0x1000`. **Opt-out escape hatch:** `BOOTCR3_KEEP_GNOBOOT_CR3=1 ./scripts/build.sh` reverts to running boot/idle on gnoboot's transient boot CR3, for bringing up a future hardware target that regresses. This realizes the deliverable the 1.49.9 directmap misdiagnosis pointed at: the boot/idle context is now consistent with the per-proc CR3s (which already copy `0x1000`'s `PDPT[1..511]`) and reaches >256 MB phys directly. Validated: default build prints `kernel CR3: own PML4 (0x1000)` and boots to `[ASSIST]` at `-m 8G`; the opt-out build omits the switch and still boots; `check.sh` 11/11, `agnsh-smoke` PASS. **Soak:** a second clean iron burn of the default-on kernel gates the *next* RAM items (user mmap-arena) per the user.
+
 ## [1.50.0] — 2026-06-28
 
 **▶ 1.50.0 — opens the RAM full-usage continuation arc.** The 1.49.x full-RAM arc is **iron-validated + CLOSED**: the re-burn of 1.49.12 boots to the agnsh prompt on real 64 GB Zen with >256 MB RAM online (the dynamic RAM-backed PMM bitmap + the >256 MB direct-map, after the 1.49.12 raw-phys fix). That made RAM *allocatable + direct-map-reachable*; this arc makes it *fully usable* end-to-end. Two walls remain, in different layers:

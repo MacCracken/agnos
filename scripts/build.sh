@@ -175,7 +175,9 @@ else
         [ -n "$PMM_FULLRAM_SELFTEST" ] && echo '#define PMM_FULLRAM_SELFTEST'
         [ -n "$PMM_HIRAM_SELFTEST" ] && echo '#define PMM_HIRAM_SELFTEST'
         [ -n "$PMM_RAMSTRESS_SELFTEST" ] && echo '#define PMM_RAMSTRESS_SELFTEST'
-        [ -n "$BOOTCR3_OWN_PML4" ] && echo '#define BOOTCR3_OWN_PML4'
+        # Boot-CR3 → own-PML4 switch is DEFAULT-ON since 1.50.1 (iron-validated). Opt OUT with
+        # BOOTCR3_KEEP_GNOBOOT_CR3=1 to keep running boot/idle on gnoboot's transient boot CR3.
+        [ -n "$BOOTCR3_KEEP_GNOBOOT_CR3" ] && echo '#define BOOTCR3_KEEP_GNOBOOT_CR3'
         [ -n "$PDPT_GUARD_SELFTEST" ] && echo '#define PDPT_GUARD_SELFTEST'
         [ -n "$FB_ANSI_SELFTEST" ]   && echo '#define FB_ANSI_SELFTEST'
         [ -n "$FB_ANSI_VISUAL" ]     && echo '#define FB_ANSI_VISUAL'
