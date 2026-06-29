@@ -147,6 +147,34 @@ kprint("Page tables: ", 13);
 kprint_num(pt_get_mapped_mb());
 kprintln("MB mapped", 9);
 
+#ifdef BOOTCR3_OWN_PML4
+# 1.50.0 (RAM full-usage arc, bite 2 — WIP, gated OFF by default; build BOOTCR3_OWN_PML4=1 to enable).
+# Switch the kernel onto its OWN complete PML4 (0x1000) instead of running boot on gnoboot's TRANSIENT
+# CR3, so the 4 KB allocator can reach >256 MB via the direct-map and the "boot CR3 can't see kernel VM
+# edits" class closes (the 1.49.9 misdiagnosis root). pt_init built 0x1000 as identity 0-4 GB.
+#
+# STATUS: works at -m 512M; at large RAM it needs every gnoboot-CR3-relative access relocated low first.
+# DONE: (a) the UEFI memmap (sits near top of RAM — 5.4 GB @ -m 8G) + (b) gnoboot's boot_info struct
+# (its `boot_info_ptr` is a VA gnoboot maps NON-identity) are copied into <256 MB .data here and the
+# pointers repointed. With those, the boot runs on 0x1000 through device init / FS / scheduler-activate
+# at -m 8G/32G. OPEN BLOCKER: the kybernet() entry then faults under 0x1000 (deterministic — not a
+# preemption; `cli` doesn't avoid it), printing `2618854`. The remaining link is whatever kybernet's
+# launch path touches that 0x1000 doesn't map (vs gnoboot's CR3) — the next step of this campaign.
+# Low kernel buffers boot_info + the memmap are relocated into (<256 MB .data, identity under 0x1000):
+var ki_boot_info[16];   # 128 B — covers gnoboot's 15-u64 boot_info struct
+var ki_memmap[2048];    # 16 KB — matches gnoboot's mm_buf[2048]
+var bcm_bi = load64(&boot_info_ptr);
+var bcm_mm = load64(bcm_bi + 0x28);
+var bcm_bytes = load32(bcm_bi + 0x30) * load32(bcm_bi + 0x34);   # count * entsize
+if (bcm_bytes > 16384) { bcm_bytes = 16384; }
+memcpy(&ki_boot_info, bcm_bi, 128);                # the struct
+memcpy(&ki_memmap, bcm_mm, bcm_bytes);             # the memmap
+store64(&ki_boot_info + 0x28, &ki_memmap);         # copy's memmap_phys -> low memmap
+store64(&boot_info_ptr, &ki_boot_info);            # boot_info_ptr -> low struct
+cr3_load(0x1000);
+kprintln("kernel CR3: own PML4 (0x1000)", 28);
+#endif
+
 # === CMOS kernel checkpoint 8 (page tables built — historical stall point) ===
 # Pre-RDRAND-fix (cyrius 5.11.x, missing -cpu max in QEMU smoke) this was
 # the visible stall. Iron may surface the same or different geometry —
