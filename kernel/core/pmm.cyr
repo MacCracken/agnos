@@ -244,16 +244,22 @@ fn pmm_migrate_bitmap(bi) {
     }
     var nb = pmm_alloc_2mb();                             # <= 256 MB, identity-reachable; all reservations done -> safe
     if (nb == 0) { return 0; }                            # no free 2 MB region -> stay on the 256 MB bootstrap
-    # Build the new bitmap: free-by-default, then carry the 0-256 MB reserved/used state (incl. nb's own
-    # region, which pmm_alloc_2mb just marked used) over from the bootstrap.
-    memset(nb, 0, 0x200000);                              # 2 MB all-free
-    memcpy(nb, pmm_bitmap_ptr, 8192);                     # carry 0-256 MB (the bootstrap's full 8 KB)
+    # Build the new bitmap. <=256 MB: carry the bootstrap's state verbatim (memcpy). >256 MB:
+    # RESERVE-BY-DEFAULT, then FREE only the EfiConventionalMemory (type 7) RAM. The old "free-by-default
+    # + reserve non-conventional ENTRIES" policy was WRONG above 256 MB: a memmap GAP (an address range
+    # ABSENT from the memmap — e.g. the 2-4 GB PCI hole) is not a reserved *entry*, so it stayed free and
+    # pmm_alloc_2mb handed out unbacked hole regions whose direct-map access hit MMIO. Found by the 1.50.0
+    # full-RAM stress (firstbad at phys 0x81000000 = the 2 GB hole). Reserve-default + free-conventional
+    # handles gaps AND reserved entries uniformly. (<=256 MB has no such gap, so the bootstrap's
+    # free-default policy there is fine and the memcpy preserves it.)
+    memcpy(nb, pmm_bitmap_ptr, 8192);                    # carry 0-256 MB (the bootstrap's full 8 KB)
+    var bm_bytes = (ram_pages + 7) / 8;                  # total bitmap bytes for the full RAM
+    memset(nb + 8192, 0xFF, bm_bytes - 8192);            # pages [65536, ram_pages) reserved (byte 8192 = page 65536)
     pmm_bitmap_ptr = nb;
     pmm_bitmap_pages = ram_pages;
-    pmm_total = ram_pages;                                # free_count now reflects the full pool
-    # Reserve non-conventional memmap regions in (256 MB, ram_top] so pmm_alloc_2mb never hands out MMIO /
-    # reserved space. Same free-by-default + reserve-non-conventional policy the bootstrap uses below
-    # 256 MB (pmm_extend reservation 2); <= 256 MB is already covered by the memcpy above.
+    pmm_total = ram_pages;                               # free_count: full-pool ceiling (reserved gaps over-count, as below 256 MB)
+    # Free the EfiConventionalMemory (type 7) regions above 256 MB. Byte-memset the 8-page-aligned middle
+    # of each region (fast for multi-GB regions); bit-clear the unaligned edges.
     var mm = load64(bi + 0x28);
     var count = load32(bi + 0x30);
     var entsize = load32(bi + 0x34);
@@ -263,15 +269,15 @@ fn pmm_migrate_bitmap(bi) {
                 var i = 0;
                 while (i < count) {
                     var e = mm + i * entsize;
-                    if (load32(e) != 7) {                 # not EfiConventionalMemory -> reserve
+                    if (load32(e) == 7) {                 # EfiConventionalMemory -> free (clear)
                         var pg = load64(e + 8) / 4096;
                         var pgend = pg + load64(e + 24);
                         if (pg < 65536) { pg = 65536; }   # <= 256 MB already carried by the memcpy
                         if (pgend > pmm_bitmap_pages) { pgend = pmm_bitmap_pages; }
-                        while (pg < pgend) {
-                            pmm_set(pg);
-                            pg = pg + 1;
-                        }
+                        while (pg < pgend && (pg & 7) != 0) { pmm_clear(pg); pg = pg + 1; }   # leading edge
+                        var mid = (pgend - pg) / 8;       # whole free bytes (8 pages each)
+                        if (mid > 0) { memset(nb + pg / 8, 0, mid); pg = pg + mid * 8; }
+                        while (pg < pgend) { pmm_clear(pg); pg = pg + 1; }                    # trailing edge
                     }
                     i = i + 1;
                 }
@@ -368,6 +374,57 @@ fn pmm_hiram_selftest() {
     if (ok == 1) { kprintln("HIRAM: >256MB alloc+directmap OK", 32); }
     else { kprintln("HIRAM: >256MB FAIL", 18); }
     return hi;
+}
+#endif
+
+#ifdef PMM_RAMSTRESS_SELFTEST
+# 1.50.0 (RAM full-usage arc, bite 1 — full-RAM stress). Allocate up to 16384 2 MB regions (≤32 GB)
+# spread across the machine RAM, write a per-region sentinel at the START and the last 8 bytes (END) of
+# each via the direct-map, read both back + verify, then free all. Proves full-RAM alloc + >256 MB
+# direct-map access AT SCALE — the 1.49.12 raw-phys fix proved ONE region; this hits thousands across
+# many GB, catching any per-region mis-mapping / overlap / bitmap-at-scale bug. Runs entirely under the
+# KERNEL CR3 (0x1000) — the boot CR3 lacks the direct-map (the 1.49.10 finding), which is exactly why
+# bite 2 makes the kernel own its boot PML4. Results land in module globals (no kprint under 0x1000,
+# where the FB BAR isn't mapped); the caller prints after the CR3 is restored. NOTE: `pmm_alloc_2mb`
+# scans bottom-up with no next-free hint → bulk 2 MB allocation is O(n²) region-checks (cheap per check —
+# a filled region breaks on page 0 — but a hint would make it O(1) amortized; a full-usage perf follow-on).
+var ramstress_n = 0;       # regions allocated + verified
+var ramstress_bad = 0;     # sentinel mismatches (0 = all reachable + distinct)
+var ramstress_firstbad = 0;  # phys of the first region whose direct-map sentinel failed (0 = none)
+fn pmm_ramstress_run() {
+    var saved = dm_read_cr3();
+    cr3_load(0x1000);
+    var ab = pmm_alloc_2mb();                       # one region holds the address list (≤32 K addrs << 2 MB)
+    if (ab == 0) { cr3_load(saved); ramstress_n = 0; ramstress_bad = 0; return 0; }
+    var ab_kva = DIRECTMAP_BASE + ab;
+    var i = 0;
+    while (i < 16384) {
+        var r = pmm_alloc_2mb();
+        if (r == 0) { break; }                      # RAM exhausted (small box) — stop, verify what we got
+        store64(ab_kva + i * 8, r);
+        store64(DIRECTMAP_BASE + r, 0x1111000000000000 + i);             # sentinel at region start
+        store64(DIRECTMAP_BASE + r + 0x1FFFF8, 0x2222000000000000 + i);  # sentinel at region end (last 8 B)
+        i = i + 1;
+    }
+    var bad = 0;
+    var firstbad = 0;
+    var j = 0;
+    while (j < i) {
+        var rr = load64(ab_kva + j * 8);
+        var b0 = 0;
+        if (load64(DIRECTMAP_BASE + rr) != 0x1111000000000000 + j) { bad = bad + 1; b0 = 1; }
+        if (load64(DIRECTMAP_BASE + rr + 0x1FFFF8) != 0x2222000000000000 + j) { bad = bad + 1; b0 = 1; }
+        if (b0 == 1 && firstbad == 0) { firstbad = rr; }
+        j = j + 1;
+    }
+    var k = 0;
+    while (k < i) { pmm_free_2mb(load64(ab_kva + k * 8)); k = k + 1; }
+    pmm_free_2mb(ab);
+    cr3_load(saved);
+    ramstress_n = i;
+    ramstress_bad = bad;
+    ramstress_firstbad = firstbad;
+    return 0;
 }
 #endif
 

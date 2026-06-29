@@ -210,6 +210,18 @@ pmm_fullram_selftest();
 # direct-map under CR3 0x1000, which must be installed first.
 pmm_hiram_selftest();
 #endif
+#ifdef PMM_RAMSTRESS_SELFTEST
+# 1.50.0 bite 1: full-RAM stress — allocate thousands of 2 MB regions across the machine RAM and
+# verify each is reachable + distinct through the direct-map (under CR3 0x1000). Boot QEMU -m 16G+.
+if (pmm_2mb_top_region > 128 && dm_read_rsp() < 0x10000000) {
+    pmm_ramstress_run();
+    kprint("ramstress: regions=", 19); kprint_num(ramstress_n);
+    kprint(" (~", 3); kprint_num(ramstress_n / 512); kprint(" GB) bad=", 9); kprint_num(ramstress_bad);
+    kprint(" firstbad_phys=", 15); kprint_hex(ramstress_firstbad); kprintln("", 0);
+    if (ramstress_bad == 0) { kprintln("ramstress: full-RAM directmap OK", 32); }
+    else { kprintln("ramstress: full-RAM directmap FAIL", 34); }
+} else { kprintln("ramstress: skip (<=256MB or RSP high)", 37); }
+#endif
 
 # 1.30.11 hardening: re-attempt WC remap of the FB, then verify WC took.
 # The line-17 vmm_remap_wc_range above succeeds for FBs in the 32-bit

@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.50.0] — 2026-06-28
+
+**▶ 1.50.0 — opens the RAM full-usage continuation arc.** The 1.49.x full-RAM arc is **iron-validated + CLOSED**: the re-burn of 1.49.12 boots to the agnsh prompt on real 64 GB Zen with >256 MB RAM online (the dynamic RAM-backed PMM bitmap + the >256 MB direct-map, after the 1.49.12 raw-phys fix). That made RAM *allocatable + direct-map-reachable*; this arc makes it *fully usable* end-to-end. Two walls remain, in different layers:
+- **User side** — a per-process mmap arena bounded to ~1 GB (one PD page, `[0x10000000, 0x40000000)`), so a single process can't use more than ~1 GB of heap regardless of machine RAM.
+- **Kernel side** — `pmm_alloc` (4 KB: page tables, DMA rings, kernel buffers) capped at the 256 MB identity window, because the kernel still runs on gnoboot's *transient* boot CR3 and can't reach a >256 MB 4 KB page there. Lifting this is gated on the **boot-CR3 → own complete PML4** cleanup (the kernel running on its own `0x1000` tables, which also closes the "boot CR3 can't see kernel VM edits" class that caused the 1.49.9 misdiagnosis).
+- **Edge** — the single 2 MB PMM bitmap caps coverage at 64 GB; >64 GB needs a multi-region contiguous bitmap (the 64 GB dev box fits, so this is deferred until bigger hardware).
+
+Bite plan (user 2026-06-28): **1.50.0 = full-RAM stress (de-risk) → boot-CR3 own-PML4 foundation; 1.50.1 = user mmap arena expansion.** Decade-map: `1.50 RAM continuation` ([roadmap](docs/development/roadmap.md)). Tracker → agnosticos iron-log `#tracker-150x-cycle`.
+
+### Added
+- **Full-RAM stress self-test (`PMM_RAMSTRESS_SELFTEST`, `kernel/core/pmm.cyr` `pmm_ramstress_run`).** Allocates up to 16384 2 MB regions (≤32 GB) across the machine RAM, writes a per-region sentinel at the start + end of each through the direct-map (under CR3 0x1000), reads both back + verifies, frees all. Where the 1.49.12 fix proved *one* >256 MB region, this exercises *thousands* across many GB — catching per-region mis-mapping, overlap, and reservation bugs at scale. Reports `ramstress: regions=N (~G GB) bad=B firstbad_phys=…`.
+
+### Fixed
+- **PMM bitmap migration left memmap GAPS free above 256 MB → `pmm_alloc_2mb` handed out unbacked regions (memory-corruption latent).** The 1.49.11 `pmm_migrate_bitmap` reserved non-conventional memmap *entries* but not *gaps* — an address range simply ABSENT from the UEFI memmap (e.g. the **2–4 GB PCI hole**) is not a reserved entry, so it stayed free and `pmm_alloc_2mb` could return a 2 MB region there; the kernel's direct-map access to that region then hit MMIO/unbacked phys. Invisible to the agnsh/exec smokes (their allocations stay low), it surfaced **immediately** under the new full-RAM stress at `-m 32G`: `bad=1770`, `firstbad_phys=0x81000000` (the 2 GB hole). Fix: above 256 MB the migration now **reserves by default and frees only `EfiConventionalMemory` (type 7) RAM** (byte-`memset` the 8-page-aligned middle of each region, bit-clear the edges), so gaps *and* reserved entries are excluded uniformly. Re-stress at `-m 32G`: `regions=16354 (~32 GB) bad=0`. (Known cosmetic follow-on: `free_count` still counts reserved gaps toward `pmm_total`, so the reported free pages over-count by the hole size — same approximate accounting as below 256 MB. Perf follow-on: `pmm_alloc_2mb` scans bottom-up with no next-free hint, so bulk allocation is O(n²) region-checks.) No regression: `agnsh-smoke`, `mmap-smoke` 2/2, `ram-probe-smoke`, `check.sh` 11/11; agnsh still launches at `-m 32G`.
+
 ## [1.49.12] — 2026-06-28
 
 **▶ 1.49.12 — iron-burn fix: the 1.49.11 >256 MB RAM extension exposed three raw-physical-address access sites that #PF-halted once allocations crossed 256 MB. The 64 GB iron burn locked up launching agnoshi; root-caused + fixed + reproduced/verified in QEMU.**
