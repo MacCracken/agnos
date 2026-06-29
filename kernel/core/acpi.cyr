@@ -10,20 +10,60 @@ var acpi_dmar_len = 0;
 var acpi_iommu_base = 0;  # Physical address of first DRHD register set
 var acpi_rsdp_via_bootinfo = 0;  # 1 if RSDP came from gnoboot boot_info, not legacy scan
 
+# === Firmware-pointer access (direct-map aware) — hardening, 2026-06-29 ===
+# Every address an ACPI table hands us is a RAW PHYSICAL firmware pointer: the
+# RSDP body, the RSDT/XSDT pointer arrays (and the entries they hold), and the
+# DMAR body. acpi_init() runs in BOOT context (no proc) at main.cyr — AFTER the
+# 1.50.0 BOOTCR3_OWN_PML4 switch (cr3_load(0x1000)) when that build flag is set.
+# The kernel's own PML4 (0x1000) maps only 0-4 GB identity + the direct-map
+# (DIRECTMAP_BASE + phys, installed by pmm_setup_directmap). A firmware pointer
+# at/above 4 GB is therefore NOT identity-mapped, and dereferencing it raw would
+# #PF and HALT the box — the proc-teardown-on-fault handler only catches RING-3
+# faults, never a boot-context one. (Same bug class fixed at 1.40.9 for boot_info
+# in mbi.cyr; mirror of the iommu >=4 GB skip-guard in iommu.cyr.)
+#
+# Currently latent: archaemenid's RSDP is at 0xF0010 and all its tables sit < 4 GB
+# (AMD boxes ship no DMAR), and QEMU q35 keeps ACPI low too. But UEFI ACPI-reclaim
+# RAM is free to land above 4 GB, and an XSDT entry (load64) can point that high.
+#
+# Resolution: route every firmware dereference through acpi_va(), which keeps
+# phys < 4 GB on the identity map (UNCHANGED — archaemenid + q35 land here, no
+# behavior change) and translates phys >= 4 GB to its direct-map VA so high tables
+# stay READABLE rather than #PF'ing the box.
+#
+# The direct-map lives ONLY in the kernel PML4 (0x1000). When BOOTCR3_OWN_PML4 is
+# not set the boot still runs on gnoboot's full-RAM identity CR3, where >=4 GB phys
+# is already identity-mapped and the direct-map is absent from the active tree. So
+# gate the translation on "are we actually on the kernel PML4?" — read CR3 live and
+# compare its base to 0x1000 — rather than the build flag. Correct under BOTH boot
+# CR3 regimes; cyrius lacks #else so a runtime check is also cleaner than #ifdef.
+fn acpi_va(phys) {
+    if (phys < 0x100000000) { return phys; }               # < 4 GB: identity under every boot CR3
+    if ((dm_read_cr3() & 0xFFFFFFFFFFFFF000) == 0x1000) {   # on kernel PML4 -> direct-map carries it
+        return DIRECTMAP_BASE + phys;
+    }
+    return phys;                                            # legacy gnoboot full-RAM identity CR3
+}
+
+fn acpi_load8(phys)  { return load8(acpi_va(phys)); }
+fn acpi_load16(phys) { return load16(acpi_va(phys)); }
+fn acpi_load32(phys) { return load32(acpi_va(phys)); }
+fn acpi_load64(phys) { return load64(acpi_va(phys)); }
+
 # Check 16-byte aligned address for RSDP signature "RSD PTR "
 fn acpi_check_rsdp(addr) {
-    if (load8(addr) != 0x52) { return 0; }      # 'R'
-    if (load8(addr + 1) != 0x53) { return 0; }  # 'S'
-    if (load8(addr + 2) != 0x44) { return 0; }  # 'D'
-    if (load8(addr + 3) != 0x20) { return 0; }  # ' '
-    if (load8(addr + 4) != 0x50) { return 0; }  # 'P'
-    if (load8(addr + 5) != 0x54) { return 0; }  # 'T'
-    if (load8(addr + 6) != 0x52) { return 0; }  # 'R'
-    if (load8(addr + 7) != 0x20) { return 0; }  # ' '
+    if (acpi_load8(addr) != 0x52) { return 0; }      # 'R'
+    if (acpi_load8(addr + 1) != 0x53) { return 0; }  # 'S'
+    if (acpi_load8(addr + 2) != 0x44) { return 0; }  # 'D'
+    if (acpi_load8(addr + 3) != 0x20) { return 0; }  # ' '
+    if (acpi_load8(addr + 4) != 0x50) { return 0; }  # 'P'
+    if (acpi_load8(addr + 5) != 0x54) { return 0; }  # 'T'
+    if (acpi_load8(addr + 6) != 0x52) { return 0; }  # 'R'
+    if (acpi_load8(addr + 7) != 0x20) { return 0; }  # ' '
     # Verify checksum (sum of first 20 bytes must be 0 mod 256)
     var sum = 0;
     for (var i = 0; i < 20; i = i + 1) {
-        sum = sum + load8(addr + i);
+        sum = sum + acpi_load8(addr + i);
     }
     if ((sum & 0xFF) != 0) { return 0; }
     return 1;
@@ -32,7 +72,7 @@ fn acpi_check_rsdp(addr) {
 # Scan for RSDP in standard locations
 fn acpi_find_rsdp() {
     # 1. Check EBDA (Extended BIOS Data Area) — pointer at 0x040E (segment)
-    var ebda_seg = load16(0x040E);
+    var ebda_seg = acpi_load16(0x040E);
     var ebda_base = ebda_seg * 16;
     if (ebda_base > 0x80000) { ebda_base = 0x80000; }
     if (ebda_base >= 0x1000) {
@@ -49,22 +89,22 @@ fn acpi_find_rsdp() {
 
 # Check if 4-byte ACPI table signature matches
 fn acpi_sig_match(table_addr, c0, c1, c2, c3) {
-    if (load8(table_addr) != c0) { return 0; }
-    if (load8(table_addr + 1) != c1) { return 0; }
-    if (load8(table_addr + 2) != c2) { return 0; }
-    if (load8(table_addr + 3) != c3) { return 0; }
+    if (acpi_load8(table_addr) != c0) { return 0; }
+    if (acpi_load8(table_addr + 1) != c1) { return 0; }
+    if (acpi_load8(table_addr + 2) != c2) { return 0; }
+    if (acpi_load8(table_addr + 3) != c3) { return 0; }
     return 1;
 }
 
 # Walk RSDT (32-bit pointers) to find a table by signature
 fn acpi_rsdt_find(rsdt, sig0, sig1, sig2, sig3) {
-    var len = load32(rsdt + 4);
+    var len = acpi_load32(rsdt + 4);
     # Validate length
     if (len < 36) { return 0; }
     if (len > 0x10000) { return 0; }
     var entries = (len - 36) / 4;
     for (var i = 0; i < entries; i = i + 1) {
-        var entry_addr = load32(rsdt + 36 + i * 4);
+        var entry_addr = acpi_load32(rsdt + 36 + i * 4);
         if (entry_addr != 0) {
             if (acpi_sig_match(entry_addr, sig0, sig1, sig2, sig3) == 1) {
                 return entry_addr;
@@ -76,12 +116,12 @@ fn acpi_rsdt_find(rsdt, sig0, sig1, sig2, sig3) {
 
 # Walk XSDT (64-bit pointers) to find a table by signature
 fn acpi_xsdt_find(xsdt, sig0, sig1, sig2, sig3) {
-    var len = load32(xsdt + 4);
+    var len = acpi_load32(xsdt + 4);
     if (len < 36) { return 0; }
     if (len > 0x10000) { return 0; }
     var entries = (len - 36) / 8;
     for (var i = 0; i < entries; i = i + 1) {
-        var entry_addr = load64(xsdt + 36 + i * 8);
+        var entry_addr = acpi_load64(xsdt + 36 + i * 8);
         if (entry_addr != 0) {
             if (acpi_sig_match(entry_addr, sig0, sig1, sig2, sig3) == 1) {
                 return entry_addr;
@@ -97,18 +137,18 @@ fn acpi_xsdt_find(xsdt, sig0, sig1, sig2, sig3) {
 #   offset 48: remapping structures (variable-length entries)
 # DRHD entry: type(2)=0 length(2) flags(1) reserved(1) segment(2) register_base(8)
 fn acpi_parse_dmar(dmar) {
-    var dmar_len = load32(dmar + 4);
+    var dmar_len = acpi_load32(dmar + 4);
     if (dmar_len < 48) { return 0; }
     var offset = 48;
     while (offset + 4 <= dmar_len) {
-        var entry_type = load16(dmar + offset);
-        var entry_len = load16(dmar + offset + 2);
+        var entry_type = acpi_load16(dmar + offset);
+        var entry_len = acpi_load16(dmar + offset + 2);
         if (entry_len < 4) { break; }  # Prevent infinite loop
         if (entry_type == 0) {
             # DRHD: DMA Remapping Hardware Unit Definition
             # offset+4: flags(1), offset+5: reserved(1), offset+6: segment(2)
             # offset+8: register_base_address(8)
-            var reg_base = load64(dmar + offset + 8);
+            var reg_base = acpi_load64(dmar + offset + 8);
             if (reg_base != 0) {
                 return reg_base;
             }
@@ -150,14 +190,14 @@ fn acpi_init() {
     acpi_rsdp_addr = rsdp;
 
     # RSDP revision: 0 = ACPI 1.0 (RSDT only), >= 2 = ACPI 2.0+ (XSDT available)
-    var revision = load8(rsdp + 15);
+    var revision = acpi_load8(rsdp + 15);
 
     # Read RSDT address (always present, 32-bit at offset 16)
-    acpi_rsdt_addr = load32(rsdp + 16);
+    acpi_rsdt_addr = acpi_load32(rsdp + 16);
 
     # Try XSDT first if revision >= 2 (64-bit at offset 24)
     if (revision >= 2) {
-        acpi_xsdt_addr = load64(rsdp + 24);
+        acpi_xsdt_addr = acpi_load64(rsdp + 24);
     }
 
     # Find DMAR table — try XSDT first, fall back to RSDT
@@ -174,7 +214,7 @@ fn acpi_init() {
 
     if (dmar != 0) {
         acpi_dmar_addr = dmar;
-        acpi_dmar_len = load32(dmar + 4);
+        acpi_dmar_len = acpi_load32(dmar + 4);
         # Parse DMAR to find IOMMU register base
         acpi_iommu_base = acpi_parse_dmar(dmar);
     }

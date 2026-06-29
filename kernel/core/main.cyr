@@ -224,6 +224,12 @@ if (pmm_2mb_top_region > 128 && dm_read_rsp() < 0x10000000) {
 } else { kprintln("ramstress: skip (<=256MB or RSP high)", 37); }
 #endif
 
+#ifdef PDPT_GUARD_SELFTEST
+# 1.50.0 pre-burn: prove the vmm_remap_uc_2mb idempotency-guard fix in QEMU (the
+# FB+device shared-PDPT-entry WB-clobber that BOOTCR3_OWN_PML4 would expose on iron).
+pdpt_guard_selftest();
+#endif
+
 # 1.30.11 hardening: re-attempt WC remap of the FB, then verify WC took.
 # The line-17 vmm_remap_wc_range above succeeds for FBs in the 32-bit
 # hole (< 1 GB — inline PDE rewrite at 0x3000, no allocation needed)

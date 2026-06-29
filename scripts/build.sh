@@ -176,6 +176,7 @@ else
         [ -n "$PMM_HIRAM_SELFTEST" ] && echo '#define PMM_HIRAM_SELFTEST'
         [ -n "$PMM_RAMSTRESS_SELFTEST" ] && echo '#define PMM_RAMSTRESS_SELFTEST'
         [ -n "$BOOTCR3_OWN_PML4" ] && echo '#define BOOTCR3_OWN_PML4'
+        [ -n "$PDPT_GUARD_SELFTEST" ] && echo '#define PDPT_GUARD_SELFTEST'
         [ -n "$FB_ANSI_SELFTEST" ]   && echo '#define FB_ANSI_SELFTEST'
         [ -n "$FB_ANSI_VISUAL" ]     && echo '#define FB_ANSI_VISUAL'
         [ -n "$KLUG_SELFTEST" ]      && echo '#define KLUG_SELFTEST'

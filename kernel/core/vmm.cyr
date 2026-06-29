@@ -89,6 +89,25 @@ fn vmm_remap_uc_2mb(phys) {
             pdpt_base = pml4e & 0xFFFFFFFFFFFFF000;
         }
     }
+    # Idempotency (mirrors vmm_remap_wc_2mb's guard): if the PDPT entry is already
+    # shattered (Present + not a 1 GB huge page), REUSE the existing PD and edit only
+    # the target PDE to UC — do NOT re-shatter into a fresh PD, which rebuilds all 512
+    # PDEs as WB (0x83) and CLOBBERS any sibling 2 MB chunk an earlier remap set WC/UC.
+    # On iron archaemenid the GOP framebuffer (~0xd0000000, PDPT[3]) shares ONE 1 GB
+    # PDPT entry with EVERY device BAR (NVMe/AHCI/xHCI/r8169/IOMMU, all 0xC..-0xF..):
+    # without this guard the first device's UC remap after the FB WC remap reverts the
+    # FB to WB → frozen display once the kernel runs on its own PML4 (BOOTCR3_OWN_PML4),
+    # and it leaks one PD per call. Surfaced by the 1.50.0 pre-burn review; QEMU can't
+    # see it (its FB is PDPT[2], its lone NVMe PDPT[3] — never the same 1 GB entry).
+    var existing = load64(pdpt_base + pdpt_idx * 8);
+    if ((existing & 1) != 0 && (existing & 0x80) == 0) {
+        var pd_base = existing & 0xFFFFFFFFFFFFF000;
+        var pd_idx2 = (phys >> 21) & 0x1FF;
+        store64(pd_base + pd_idx2 * 8, chunk | 0x9B);
+        var flush_v = phys;
+        asm { invlpg [rax]; }
+        return 1;
+    }
     var new_pd = pmm_alloc();
     if (new_pd == 0) { return 0; }
     var pdpt_va_base = pml4_idx * 0x8000000000 + pdpt_idx * 0x40000000;
@@ -179,6 +198,36 @@ fn vmm_remap_wc_2mb(phys) {
     asm { mov rax, cr3; }
     asm { mov cr3, rax; }
     return 1;
+}
+
+# 1.50.0 pre-burn self-test (gated PDPT_GUARD_SELFTEST): reproduce the shared-
+# 1GB-PDPT-entry cache-type collision that the iron GOP framebuffer (~0xd0000000)
+# + EVERY device BAR (NVMe/AHCI/xHCI/r8169/IOMMU, all 0xC..-0xF.. = PDPT[3]) hit on
+# real Zen — and that QEMU CANNOT (its FB is PDPT[2], its lone NVMe PDPT[3], so they
+# never share a 1GB PDPT entry). Force the collision: WC a chunk, then UC its SIBLING
+# in the SAME 1GB PDPT entry, and assert the WC chunk SURVIVED (PWT still set). Uses
+# PDPT[4] (4-5 GB, untouched by pt_init) so it disturbs no real FB/device/RAM mapping;
+# restores PDPT[4] after. Pre-fix (vmm_remap_uc_2mb lacking the idempotency guard its
+# WC twin has) this FAILS — the UC re-shatter rebuilds the PD WB and clobbers the WC
+# chunk. Post-fix it PASSES. Zero iron cost; reproduces what the QEMU screendump can't.
+fn pdpt_guard_selftest() {
+    var a = 0x100000000;          # 4 GB        — PDPT[4], PD index 0
+    var b = 0x100200000;          # 4 GB + 2 MB — PDPT[4], PD index 1 (SAME 1 GB entry)
+    vmm_remap_wc_2mb(a);          # a -> WC (shatters PDPT[4] into a fresh PD)
+    vmm_remap_uc_2mb(b);          # b -> UC (must REUSE the PD, not re-shatter + clobber a)
+    var pdpt_e = load64(0x2000 + 4 * 8);
+    var ok = 0;
+    if ((pdpt_e & 1) != 0 && (pdpt_e & 0x80) == 0) {
+        var pd_base = pdpt_e & 0xFFFFFFFFFFFFF000;
+        var pde_a = load64(pd_base);              # PD index 0 = a's PDE
+        if ((pde_a & 0x8) != 0) { ok = 1; }       # PWT(bit3) set => still WC/UC, not WB
+    }
+    if (ok != 0) { kprintln("pdpt-guard PASS (WC survived UC sibling)", 40); }
+    else { kprintln("pdpt-guard FAIL (WC clobbered to WB)", 36); }
+    store64(0x2000 + 4 * 8, 0);   # restore PDPT[4] unmapped (one-shot; the test PD leaks)
+    asm { mov rax, cr3; }
+    asm { mov cr3, rax; }
+    return 0;
 }
 
 # Remap [phys, phys+size) as Write-Combining. Iterates 2MB chunks;
