@@ -451,11 +451,14 @@ fn exc_handlers_init() {
         # The saved-frame CS sits at [rsp+16] for the errcode-pushing vectors (#GP/#PF) and
         # [rsp+8] for #UD (no errcode) — same frame invariant the diagnostic blocks above use
         # (this stub does no push/pop). On CPL3 we 16-align rsp (the exception frame is
-        # abandoned — fault_kill_current either kernel_resume()s away or returns to halt) and
+        # abandoned — fault_kill_current never returns through it: a FOREGROUND child
+        # kernel_resume()s back to agnsh, a BACKGROUND child sti+hlt-loops until the next
+        # timer tick context-switches it away — see fault_kill_current, syscall.cyr) and
         # `call &fault_kill_current` (the &fn-from-hand-asm pattern, cf. main.cyr &timer_isr).
-        # If it RETURNS (a bg-job fault, not the foreground child), control falls through to
-        # the canary+halt — bg-proc fault teardown is a follow-on. Emitted at the current
-        # `tail`, then `tail += 34` so the canary block + `off` below shift past it unchanged.
+        # 1.50.7: fault_kill_current NO LONGER returns for a bg-job fault (it yields to the
+        # scheduler instead of halting), so the canary+halt below is now reached ONLY by a
+        # CPL0 (kernel) fault — exactly its intent. Emitted at the current `tail`, then
+        # `tail += 34` so the canary block + `off` below shift past it unchanged.
         if (v == 6 || v == 13 || v == 14) {
             var csoff = 16;                 # #GP/#PF push an errcode → saved CS at [rsp+16]
             if (v == 6) { csoff = 8; }      # #UD: no errcode → saved CS at [rsp+8]

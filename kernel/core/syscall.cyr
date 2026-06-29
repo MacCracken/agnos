@@ -377,9 +377,28 @@ fn fault_kill_current(vector) {
             kernel_resume();
         }
     }
-    # bg job or no armed resume: return to the stub (which halts). Follow-on: yield to the
-    # scheduler here instead of halting.
-    return 0;
+    # 1.50.7 bg-job fault teardown: a BACKGROUND (`&`) proc faulted — it is NOT the
+    # foreground exec child (no armed kernel_resume for it), so control reached here
+    # instead of the kernel_resume() above. The proc is already torn down (state 0 +
+    # SIGCHLD to its parent), so the box must NOT halt: a server running concurrent bg
+    # services has to survive one service's ring-3 fault. Yield to the scheduler via the
+    # PROVEN timer-preemption path — enable interrupts and halt; the next timer tick's
+    # do_context_switch saves this now-dead slot (harmless), declines to revive it
+    # (state 0, sched.cyr:336 guard), and context-switches to the next ready proc
+    # (agnsh / idle) through the timer ISR's OWN pop+iretq epilogue. We never return
+    # through the abandoned exception frame.
+    #
+    # Why sti+hlt and not a direct switch here: do_context_switch restores the next proc
+    # INTO an isr_rsp frame and relies on the timer ISR's epilogue (pic.cyr) to iretq it
+    # — this fault stub has no such epilogue (it `call`s us, then falls through to halt).
+    # Letting the REAL timer tick drive the switch reuses that epilogue intact (lowest-
+    # risk; the roadmap-blessed "existing sched_next/do_context_switch path"). preempt_count
+    # is 0 here — only a CPL3 fault reaches this fn (the idt.cyr stub gates on saved-CS
+    # RPL==3, so the faulter was in ring 3, never mid kernel critical-section) — so
+    # do_context_switch is not preempt-gated and WILL switch. Mirrors the smp.cyr:586 /
+    # kernel_idle_loop idle pattern (sti;hlt) until that switch fires.
+    while (1) { asm { sti; hlt; } }
+    return 0;                             # unreachable — kept for the type checker
 }
 
 # === Blocking keyboard stdin (1.41.1 — shell-separation arc; line discipline 1.41.15) ===
@@ -846,18 +865,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 >= proc_count) { return 0 - 1; }
         if (arg2 < 0) { return 0 - 1; }
         if (arg2 >= 64) { return 0 - 1; }
-        # Security: non-init processes cannot signal PID 0 (init)
-        if (arg1 == 0) {
-            if (proc_current_get() != 0) { return 0 - 1; }
-        }
-        # Security: processes can only signal themselves or children
-        # For now, allow signaling own process or if sender is PID 0 (init)
-        if (proc_current_get() != 0) {
-            if (arg1 != proc_current_get()) {
-                var target_ppid = proc_get_ppid(arg1);
-                if (target_ppid != proc_current_get()) { return 0 - 1; }
-            }
-        }
+        # Security (1.50.7): authorization = proc_may_signal (proc.cyr) — init signals anyone;
+        # a non-init caller may signal only itself or its own direct child. Now a REAL gate:
+        # proc_get_ppid returns the actual parent (was stubbed 0, leaving this inert). Arg
+        # bounds (above) stay here; the ownership policy is the extracted, selftested predicate.
+        if (proc_may_signal(proc_current_get(), arg1) == 0) { return 0 - 1; }
         var sig_pending = load64(&proc_signals + arg1 * 8);
         store64(&proc_signals + arg1 * 8, sig_pending | (1 << arg2));
         return 0;

@@ -199,6 +199,7 @@ else
         [ -n "$MMAP_HIMEM_E2E_SELFTEST" ] && echo '#define MMAP_HIMEM_E2E_SELFTEST'
         [ -n "$MMAP_HIMUNMAP_SELFTEST" ] && echo '#define MMAP_HIMUNMAP_SELFTEST'
         [ -n "$MMAP_HIMEM_PERPROC_SELFTEST" ] && echo '#define MMAP_HIMEM_PERPROC_SELFTEST'
+        [ -n "$PPID_SELFTEST" ]  && echo '#define PPID_SELFTEST'
         [ -n "$RTC_SELFTEST" ]   && echo '#define RTC_SELFTEST'
         [ -n "$HARDENING_SELFTEST" ] && echo '#define HARDENING_SELFTEST'
         [ -n "$JBD2_LOGDUMP" ]       && echo '#define JBD2_LOGDUMP'

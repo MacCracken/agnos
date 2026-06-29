@@ -63,6 +63,15 @@ var proc_sigmask[128];  # 16 processes x 8 bytes
 # proc's CS/SS here; proc_restore_context reads them back into the iretq frame.
 var proc_cs[16];        # saved CS per pid (default 0x08 = ring-0 kernel code)
 var proc_ss[16];        # saved SS per pid (default 0x10 = ring-0 kernel data)
+# 1.50.7: parent pid per pid (default 0 = init). Filled at proc_create_user from the
+# CREATOR pid (the single user-proc inheritance point, the same source vfs_fd_inherit
+# uses), reset to 0 for a recycled slot in proc_alloc_slot, and read back by
+# proc_get_ppid — which makes kill#16's "may only signal your children" gate REAL (it
+# was inert while proc_get_ppid stubbed 0). Parallel pid-indexed array like proc_cs/
+# proc_ss, NOT a Process-struct field (that would change the 176 B stride at ~16 sites).
+# GUARDRAIL ([[project_agnos_auth_posture]]): signal-ownership hardening ONLY — must NOT
+# grow into pgid/sid or kill(-pgid, …); process-group semantics WOULD be Unix projection.
+var proc_ppid[16];      # saved parent pid per pid (default 0 = init)
 # 1.46.x SMP sub-bite 6: per-pid "which CPU is running / mid-switching this proc"; -1 = none.
 # The scheduler FENCE — on_cpu_set(new, mycpu) is the LAST mutation under sched_lock, then the
 # lock releases and the lock-free restore proceeds with `new` claimed. sched_next selects only
@@ -184,6 +193,7 @@ fn proc_alloc_slot() {
     store64(&proc_rsp0 + idx * 8, KSTACK_POOL_BASE + (idx + 1) * KSTACK_SLOT);  # 1.46.1: per-proc RSP0 stack (region 7)
     store64(&proc_on_cpu + idx * 8, 0 - 1);   # 1.46.x SMP6: recycled slot must not inherit a stale CPU id
     store64(&idle_owner + idx * 8, 0 - 1);     # 1.46.x STEP-2: recycled slot starts UNPINNED (a prior foreground proc may have left idle_owner=its launch CPU; a fresh proc must be free to migrate / not falsely pinned). Idles never reuse a slot, so their persistent pin is unaffected.
+    store64(&proc_ppid + idx * 8, 0);          # 1.50.7: recycled slot must not inherit a stale parent (default init; proc_create_user sets the real creator)
     return idx;
 }
 # 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the legacy shared stack (0x3C0000
@@ -298,6 +308,11 @@ fn proc_create_user(entry, stack_top) {
     # 1.47.x per-proc fd tables (2b): give the child its own fd table, inheriting a COPY of its
     # creator's (proc_current) — so it sees the parent's stdin/stdout + pipe fds, but isolated.
     # The single inheritance point for every user proc (elf_load / elf_load_from_file / spawn).
+    # 1.50.7: record the same creator pid as the child's PARENT — the one place every user proc
+    # is born, so kill#16's child-only gate sees a real parent. (proc_current_get() reads a
+    # per-CPU global, NOT CR3-derived, so it is still the spawner even when the #3 path has
+    # cr3_load(0x1000)'d to boot CR3 for the disk read.)
+    store64(&proc_ppid + idx * 8, proc_current_get());
     vfs_fd_inherit(idx, proc_current_get());
     return idx;
 }
@@ -718,10 +733,32 @@ fn proc_get_user_cr3(kernel_cr3) {
     return load64(pd_addr + 511 * 8);
 }
 
-# Map a 2MB page in a process's page directory (user-accessible)
+# 1.50.7: the proc's REAL parent pid (was a stub returning 0 always, which left kill#16's
+# "may only signal your children" gate inert — a non-init proc could effectively only
+# signal itself). Recorded at proc_create_user from the creator pid; 0 (= init) for kernel
+# threads and unset slots. Read by the kill#16 gate (syscall.cyr) + fault_kill_current's
+# SIGCHLD-to-parent (syscall.cyr).
 fn proc_get_ppid(pid) {
-    # All processes are children of init (pid 0) for now
     if (pid >= proc_count) { return 0 - 1; }
+    return load64(&proc_ppid + pid * 8);
+}
+
+# 1.50.7: the kill#16 authorization predicate, EXTRACTED so it has one definition the
+# selftest exercises (the gate was previously inline in ksyscall, untestable). Returns 1 if
+# `caller` may post a signal to `target`, else 0. Capability/ownership policy — NOT Unix
+# uid/pgid ([[project_agnos_auth_posture]]):
+#   • init (pid 0) may signal ANY proc.
+#   • a non-init caller may signal ONLY itself or its own DIRECT child (proc_get_ppid==caller).
+#   • init may be signalled ONLY by itself (subsumed by the child rule — target 0's parent is
+#     0, so a non-init caller fails it — but the explicit early-out documents the intent).
+# GUARDRAIL: must stay child-only; no process-group / session reach (that WOULD be projection).
+# Behavior-preserving refactor of the prior inline ksyscall #16 gate (arg1 bounds + sig
+# validation stay at the call site — they validate syscall args, not authorization policy).
+fn proc_may_signal(caller, target) {
+    if (caller == 0) { return 1; }                       # init signals anyone
+    if (target == 0) { return 0; }                       # non-init may never signal init
+    if (target == caller) { return 1; }                  # self
+    if (proc_get_ppid(target) == caller) { return 1; }   # own direct child
     return 0;
 }
 
