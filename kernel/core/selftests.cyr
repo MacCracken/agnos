@@ -414,6 +414,50 @@
 }
 #endif
 
+#ifdef MMAP_HIMUNMAP_SELFTEST
+# Hermetic test of the HIGH-arena munmap path (1.50.3 proc_unmap_2mb_hi). Maps 4
+# high pages, unmaps the middle two, asserts the 2 MB free-count rose by exactly 2,
+# the unmapped PDEs are cleared while the kept ones stay present, and re-unmapping is
+# idempotent (returns 0); then tears the AS down and asserts the count is fully
+# restored. Only 8 MB — runs at any -m. Drives the helpers directly (no proc context).
+{
+    var u = 1;
+    var before = pmm_count_2mb_free();
+    var cr3 = proc_create_address_space();
+    if (cr3 == 0) { u = 0; }
+    var hva = 0x2000000000;
+    var p0 = pmm_alloc_2mb();
+    var p1 = pmm_alloc_2mb();
+    var p2 = pmm_alloc_2mb();
+    var p3 = pmm_alloc_2mb();
+    if (p0 == 0) { u = 0; }
+    if (p1 == 0) { u = 0; }
+    if (p2 == 0) { u = 0; }
+    if (p3 == 0) { u = 0; }
+    if (cr3 != 0) {
+        proc_map_page_hi(cr3, hva, p0);
+        proc_map_page_hi(cr3, hva + 0x200000, p1);
+        proc_map_page_hi(cr3, hva + 0x400000, p2);
+        proc_map_page_hi(cr3, hva + 0x600000, p3);
+        if (pmm_count_2mb_free() != before - 4) { u = 0; }       # 4 allocated
+        if (proc_unmap_2mb_hi(cr3, hva + 0x200000) != 1) { u = 0; }   # unmap page 1
+        if (proc_unmap_2mb_hi(cr3, hva + 0x400000) != 1) { u = 0; }   # unmap page 2
+        if (pmm_count_2mb_free() != before - 2) { u = 0; }       # 2 freed back
+        var pml4e = load64(cr3);
+        var pd = load64((pml4e & 0xFFFFFFFFF000) + 128 * 8) & 0xFFFFFFFFF000;
+        if ((load64(pd + 0 * 8) & 0x01) == 0) { u = 0; }         # page 0 still present
+        if ((load64(pd + 1 * 8) & 0x01) != 0) { u = 0; }         # page 1 cleared
+        if ((load64(pd + 2 * 8) & 0x01) != 0) { u = 0; }         # page 2 cleared
+        if ((load64(pd + 3 * 8) & 0x01) == 0) { u = 0; }         # page 3 still present
+        if (proc_unmap_2mb_hi(cr3, hva + 0x200000) != 0) { u = 0; }   # idempotent re-unmap
+        proc_free_address_space(cr3);                            # frees pages 0,3 + the PD
+    }
+    if (pmm_count_2mb_free() != before) { u = 0; }               # teardown restored everything
+    if (u == 1) { kprintln("mmap-himunmap: PASS", 19); }
+    if (u == 0) { kprintln("mmap-himunmap: FAIL", 19); }
+}
+#endif
+
 #ifdef RTC_SELFTEST
 # RTC boot-clock self-test (1.35.5). Hermetic civil_to_unix anchors (shared with
 # the NTP test) + BCD decode, plus a live-bounded rtc_read_unix() sanity check

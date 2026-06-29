@@ -5,6 +5,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.50.3] — 2026-06-29
+
+**▶ 1.50.3 — high-range `munmap` (mmap-arena follow-on #1).** `sys_munmap` now handles the high arena `[128 GB, 512 GB)`, not just the low arena. Where the low arena shares one 0–1 GB PD (a single walk), each high page may sit in a different per-proc PDPT entry, so the high path unmaps **per-page** via a new `proc_unmap_2mb_hi(cr3, virt)` (walk PML4→PDPT[hi]→PD; if the PDE is present+user, clear it, flush the TLB, free the 2 MB phys; user-bit guard so a kernel/absent entry is never freed; idempotent). LIFO cursor reclaim rewinds `himmap_next_vaddr` when the freed range was the most-recent map. The PD page is left allocated (it may hold siblings; `proc_free_address_space` reclaims an emptied PD at exit — bounded at ≤384 × 4 KB). Previously a high `munmap` returned -1 (pages reclaimed only at process exit); now it frees eagerly. Verified by `MMAP_HIMUNMAP_SELFTEST` (`mmap-himunmap: PASS`): maps 4 high pages, unmaps the middle 2 (free-count +2, those PDEs cleared, neighbors kept), re-unmap is idempotent, teardown restores the count. No regression: `check.sh` 11/11, `mmap-smoke` 2/2 (low pmm/rounding/munmap), `agnsh-smoke` PASS. The low-arena `munmap` path is byte-preserved (relocated into a branch).
+
 ## [1.50.2] — 2026-06-29
 
 **▶ 1.50.2 — opens the user mmap-arena full lift (let one process mmap many GB, up to machine RAM).** The anonymous mmap arena is `[256 MB, ~1 GB)` in the per-process 0–1 GB PD — so a single process tops out at ~768 MB of heap regardless of the 62 GB machine. The full lift (user's call) adds a **high-VA arena backed by the direct-map**, placed at PDPT[128..511] (≥128 GB, within PML4[0]) — chosen ABOVE the ≤64 GB direct-map (PDPT[8..71]) and clear of every device BAR + the framebuffer (all PDPT[0..3]), so a present entry there is unambiguously a per-process arena PD (never a shared kernel entry — which is what lets teardown free it safely). Plan + bite breakdown: [`docs/development/planning/mmap-arena-full-lift.md`](docs/development/planning/mmap-arena-full-lift.md).

@@ -817,6 +817,32 @@ fn proc_map_page_hi(cr3, virt, phys) {
     return 0;
 }
 
+# proc_unmap_2mb_hi(cr3, virt) — unmap + free ONE 2 MB page in the HIGH user mmap
+# arena (VA >= 128 GB; the inverse of proc_map_page_hi). Walks PML4 -> PDPT[hi] ->
+# PD; if the target PDE is present + USER, clears it, flushes the TLB, and frees the
+# 2 MB phys. The user-bit guard means a kernel/absent entry is never freed (defence
+# in depth — the high range is per-process anyway). The PD page is LEFT allocated
+# (it may still hold siblings; proc_free_address_space reclaims an emptied PD at
+# process exit — bounded: <=384 PDs * 4 KB for the whole arena). 1.50.3. Returns 1
+# if a page was freed, 0 otherwise (absent / already-unmapped — idempotent).
+fn proc_unmap_2mb_hi(cr3, virt) {
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpt_idx = (virt >> 30) & 0x1FF;
+    var pdpte = load64(pdpt_addr + pdpt_idx * 8);
+    if ((pdpte & 0x01) == 0) { return 0; }              # PDPT entry absent — nothing mapped
+    var pd_addr = pdpte & 0xFFFFFFFFF000;
+    var pd_idx = (virt >> 21) & 0x1FF;
+    var entry = load64(pd_addr + pd_idx * 8);
+    if ((entry & 0x01) == 0) { return 0; }              # PDE not present
+    if ((entry & 0x04) == 0) { return 0; }              # not user — never free a kernel page
+    var phys = entry & 0xFFFFFFFFFFE00000;
+    store64(pd_addr + pd_idx * 8, 0);                   # clear the PDE
+    invlpg_va(virt);
+    pmm_free_2mb(phys);
+    return 1;
+}
+
 # 1.44.19 — fault-PROOF copy from a (possibly garbage) user VA range, for the per-process
 # env blob on execwait(#37)/spawn_path(#43). WHY not the ew37_path-style copy-under-caller-CR3:
 # legacy 3-arg syscall() callers deliver GARBAGE in a3/a4 (the cyrius builtin pops exactly N
@@ -972,18 +998,31 @@ fn sys_mmap(length) {
 # Returns 0 on success, -1 on a bad request. See mmap-prior-art.md § 7.
 fn sys_munmap(addr, length) {
     if ((addr & 0x1FFFFF) != 0) { return 0 - 1; }            # not 2 MB-aligned
-    if (addr < 0x10000000) { return 0 - 1; }                  # below the arena
     var len = (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;       # round up to 2 MB
     if (len < 0x200000) { len = 0x200000; }
-    if ((addr + len) > 0x40000000) { return 0 - 1; }          # past the ceiling
     var cr3 = proc_get_cr3(proc_current_get());
     if (cr3 == 0) { return 0 - 1; }
-    # Walk PML4 -> PDPT -> PD once; the whole arena shares one PD (covers 0-1 GB).
+    var npages = len / 0x200000;
+    # HIGH arena [128 GB, 512 GB) (1.50.3): each 2 MB page may sit in a DIFFERENT
+    # PDPT[hi] entry, so unmap per-page via proc_unmap_2mb_hi (idempotent — it skips
+    # already-unmapped pages). The PDs themselves are reclaimed at process exit.
+    if (addr >= 0x2000000000) {
+        if ((addr + len) > 0x8000000000) { return 0 - 1; }   # past the 512 GB ceiling
+        for (var hi = 0; hi < npages; hi = hi + 1) {
+            proc_unmap_2mb_hi(cr3, addr + hi * 0x200000);
+        }
+        # LIFO vaddr reclaim: rewind the high cursor if this was the most-recent map.
+        if ((addr + len) == himmap_next_vaddr) { himmap_next_vaddr = addr; }
+        return 0;
+    }
+    # LOW arena [256 MB, 1 GB) — the original path (the whole low arena shares one
+    # 0-1 GB PD, so walk PML4 -> PDPT[0] -> PD once).
+    if (addr < 0x10000000) { return 0 - 1; }                  # below the arena
+    if ((addr + len) > 0x40000000) { return 0 - 1; }          # past the low ceiling
     var pml4e = load64(cr3);
     var pdpt_addr = pml4e & 0xFFFFFFFFF000;
     var pdpte = load64(pdpt_addr);
     var pd_addr = pdpte & 0xFFFFFFFFF000;
-    var npages = len / 0x200000;
     var flush = 0;
     for (var i = 0; i < npages; i = i + 1) {
         var vaddr = addr + i * 0x200000;
