@@ -365,6 +365,55 @@
 }
 #endif
 
+#ifdef MMAP_HIMEM_E2E_SELFTEST
+# End-to-end (1.50.2 bite 1b): a >1 GB CONTIGUOUS high-arena allocation + teardown.
+# Maps 513 sibling 2 MB pages (1.026 GB) at 128 GB via proc_map_page_hi — spanning
+# PDPT[128] (512 pages) AND PDPT[129] (1 page), proving the >768 MB single-process
+# cap is lifted and on-demand PD alloc works ACROSS a PDPT boundary — then tears the
+# whole address space down (proc_free_address_space) and asserts the 2 MB free-count
+# is restored (the leak fix). Gated on >=600 free regions so it SKIPS cleanly at
+# small -m (boot at -m 4G to exercise it). Frees the test AS, so no leak.
+{
+    var e = 1;
+    var before = pmm_count_2mb_free();
+    if (before < 600) {
+        kprintln("mmap-himem-e2e: skip (<1.2GB free)", 34);
+    } else {
+        var cr3 = proc_create_address_space();
+        if (cr3 == 0) { e = 0; }
+        var hva = 0x2000000000;                          # 128 GB
+        var n = 513;                                     # 1.026 GB — spans PDPT[128] + PDPT[129]
+        var mapped = 0;
+        var bad = 0;
+        if (cr3 != 0) {
+            for (var k = 0; k < n; k = k + 1) {
+                if (bad == 0) {
+                    var ph = pmm_alloc_2mb();
+                    if (ph == 0) { bad = 1; }
+                    else {
+                        if (proc_map_page_hi(cr3, hva + k * 0x200000, ph) != 0) { bad = 1; }
+                        else { mapped = mapped + 1; }
+                    }
+                }
+            }
+        }
+        if (bad != 0) { e = 0; }
+        if (mapped != n) { e = 0; }
+        if (pmm_count_2mb_free() != before - n) { e = 0; }    # all n actually allocated
+        if (cr3 != 0) {
+            var pml4e = load64(cr3);
+            var pdpt = pml4e & 0xFFFFFFFFF000;
+            if ((load64(pdpt + 128 * 8) & 0x05) != 0x05) { e = 0; }   # PDPT[128] present + user
+            if ((load64(pdpt + 129 * 8) & 0x05) != 0x05) { e = 0; }   # PDPT[129] present + user (boundary)
+            proc_free_address_space(cr3);                              # teardown: frees high PDs + pages
+        }
+        if (pmm_count_2mb_free() != before) { e = 0; }        # teardown restored the count → no leak
+        if (e == 1) { kprintln("mmap-himem-e2e: >1GB map+free PASS", 34); }
+        if (e == 0) { kprintln("mmap-himem-e2e: >1GB map+free FAIL", 34); }
+    }
+}
+#endif
+
 #ifdef RTC_SELFTEST
 # RTC boot-clock self-test (1.35.5). Hermetic civil_to_unix anchors (shared with
 # the NTP test) + BCD decode, plus a live-bounded rtc_read_unix() sanity check

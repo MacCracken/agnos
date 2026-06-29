@@ -574,6 +574,32 @@ fn proc_free_address_space(cr3) {
             }
         }
     }
+    # 1.50.2 bite 1b — free the HIGH user mmap arena. proc_map_page_hi installs
+    # per-process PDs at PDPT[128..511] (VA >= 128 GB) on demand; the 0-1 GB PD
+    # sweep above only walks PDPT[0]'s PD, so without this every process that
+    # touched the high arena would leak its PDs + 2 MB pages on exit. The kernel
+    # never uses PDPT[128..511] (the <=64 GB direct-map tops at PDPT[71]), so any
+    # entry here that is PRESENT + USER (proc_map_page_hi sets 0x07, kernel entries
+    # are supervisor) is a per-process arena PD: free its present+user 2 MB pages,
+    # then the PD page itself. Procs that never mmap'd high find all-zero entries
+    # (one cheap 384-entry scan).
+    for (var hpi = 128; hpi < 512; hpi = hpi + 1) {
+        var hpe = load64(pdpt + hpi * 8);
+        if ((hpe & 0x01) != 0) {
+            if ((hpe & 0x04) != 0) {
+                var hpd = hpe & 0xFFFFFFFFF000;
+                for (var hj = 0; hj < 512; hj = hj + 1) {
+                    var he = load64(hpd + hj * 8);
+                    if ((he & 0x01) != 0) {
+                        if ((he & 0x04) != 0) {
+                            pmm_free_2mb(he & 0xFFFFFFFFFFE00000);
+                        }
+                    }
+                }
+                pmm_free(hpd);
+            }
+        }
+    }
     # Free the three page-table pages (4 KB each).
     pmm_free(pd);
     pmm_free(pdpt);
@@ -880,36 +906,60 @@ fn proc_unmap_page(cr3, virt) {
 # agnosticos/docs/development/mmap-prior-art.md.
 var mmap_next_vaddr = 0x10000000;
 
+# 1.50.2 bite 1b — HIGH user mmap arena cursor. [128 GB, 512 GB), backed by the
+# direct-map, mapped via proc_map_page_hi into per-proc PDPT[128..511]. 128 GB is
+# ABOVE the <=64 GB direct-map (PDPT[8..71]) and clear of every device BAR + the
+# FB (PDPT[0..3]), so its PDs are unambiguously per-process (freed by
+# proc_free_address_space). Global monotonic cursor like the low arena — each AS
+# is independent (own CR3) so the same VA never collides across processes.
+var himmap_next_vaddr = 0x2000000000;
+
 # sys_mmap(length): map `length` (rounded up to 2 MB) of zero-filled, user-
 # accessible memory into the calling process's address space; return the base
 # vaddr or 0 (MAP_FAILED). Anonymous only — addr/prot/flags/fd/offset ignored.
+# Small allocs use the proven LOW arena [256 MB, ~1 GB) (one PD); a request that
+# doesn't fit there (big, or the low cursor is exhausted) SPILLS to the HIGH arena
+# [128 GB, 512 GB) — the 1.50.2 lift of the ~768 MB single-process cap to machine
+# RAM. (munmap of a HIGH region is not yet supported — returns -1; its pages are
+# reclaimed at process exit by proc_free_address_space.)
 fn sys_mmap(length) {
-    # 1.41.5: reject any length beyond the whole arena (1 GB) BEFORE rounding.
-    # Without this, `length + 0x1FFFFF` on a near-u64 length wraps to a small
-    # value, sailing past the `(mmap_next_vaddr + len) > 0x40000000` guard below
-    # (and the npages pre-count) — the arena is only ~768 MB usable anyway.
-    if (length > 0x40000000) { return 0; }
+    # Sanity cap BEFORE rounding: no single alloc can exceed machine RAM (the
+    # bitmap caps RAM at 64 GB), which also blocks the `length + 0x1FFFFF` near-u64
+    # round-up wrap. 64 GB is well within the 384 GB high-arena VA window.
+    if (length > 0x1000000000) { return 0; }             # > 64 GB
     var len = (length + 0x1FFFFF) & 0xFFFFFFFFFFE00000;   # round up to 2 MB
     if (len < 0x200000) { len = 0x200000; }
     var npages = len / 0x200000;
     var cr3 = proc_get_cr3(proc_current_get());
     if (cr3 == 0) { return 0; }
-    if ((mmap_next_vaddr + len) > 0x3FA00000) { return 0; }    # arena ceiling (below the user stack @0x3FC00000 + its guard @0x3FA00000)
-    if (pmm_count_2mb_free() < npages) { return 0; }            # not enough physical
-    var base_vaddr = mmap_next_vaddr;
-    for (var i = 0; i < npages; i = i + 1) {
-        var phys = pmm_alloc_2mb();
-        if (phys == 0) { return 0; }            # pre-counted, but guard anyway
-        # 1.49.12: zero via the kernel access handle — identity <=256 MB, direct-map above. The old
-        # memset(phys,...) treated the raw phys as an identity VA, which #PF-halted once pmm_alloc_2mb
-        # could return a >256 MB region (the 1.49.11 cap lift) — the agnsh-launch lockup on the iron
-        # burn (CR2 in the multi-GB range). pmm_kva_for_access does the <=256 MB vmm_map internally.
-        var kva = pmm_kva_for_access(phys);
-        memset(kva, 0, 0x200000);               # zero-fill (anonymous contract)
-        proc_map_page(cr3, mmap_next_vaddr, phys);
-        mmap_next_vaddr = mmap_next_vaddr + 0x200000;
+    if (pmm_count_2mb_free() < npages) { return 0; }       # not enough physical (pre-count)
+    # LOW arena first (the proven path) when it still fits under the stack-guard
+    # ceiling (0x3FA00000, below the user stack @0x3FC00000).
+    if ((mmap_next_vaddr + len) <= 0x3FA00000) {
+        var base_vaddr = mmap_next_vaddr;
+        for (var i = 0; i < npages; i = i + 1) {
+            var phys = pmm_alloc_2mb();
+            if (phys == 0) { return 0; }            # pre-counted, but guard anyway
+            # 1.49.12: zero via the kernel access handle — identity <=256 MB, direct-map above.
+            var kva = pmm_kva_for_access(phys);
+            memset(kva, 0, 0x200000);               # zero-fill (anonymous contract)
+            proc_map_page(cr3, mmap_next_vaddr, phys);
+            mmap_next_vaddr = mmap_next_vaddr + 0x200000;
+        }
+        return base_vaddr;
     }
-    return base_vaddr;
+    # HIGH arena: the request is bigger than the low arena's remaining room.
+    if ((himmap_next_vaddr + len) > 0x8000000000) { return 0; }   # 512 GB ceiling (PML4[0] top)
+    var hbase = himmap_next_vaddr;
+    for (var j = 0; j < npages; j = j + 1) {
+        var hphys = pmm_alloc_2mb();
+        if (hphys == 0) { return 0; }
+        var hkva = pmm_kva_for_access(hphys);       # direct-map handle for the >256 MB zero-fill
+        memset(hkva, 0, 0x200000);
+        if (proc_map_page_hi(cr3, himmap_next_vaddr, hphys) != 0) { return 0; }   # on-demand PDPT+PD
+        himmap_next_vaddr = himmap_next_vaddr + 0x200000;
+    }
+    return hbase;
 }
 
 # sys_munmap(addr, length): release a region previously returned by sys_mmap

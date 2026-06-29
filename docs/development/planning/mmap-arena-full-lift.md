@@ -29,12 +29,13 @@ User pages are reached by ring 3 through the high VA → per-proc PD → phys (a
 ## Bites
 
 - **1a — `proc_map_page_hi` (DONE, 1.50.2).** On-demand per-proc PDPT-entry + PD allocation for VA ≥ 128 GB; sibling maps reuse the PD. Dormant (not wired into `sys_mmap`). Verified hermetically by `MMAP_HIMEM_SELFTEST` (`mmap-himem: chain PASS`). Production byte-unaffected; `check.sh` 11/11.
-- **1b — wire + teardown + end-to-end (NEXT).**
-  1. `sys_mmap`: remove the `length > 1 GB` reject; route allocs that don't fit the low arena (length > ~768 MB, or low cursor exhausted) to the high arena via a cursor `himmap_next_vaddr` (start `USER_HIMMAP_BASE`, ceiling 512 GB) + `proc_map_page_hi`. Keep the proven low arena for small allocs (backward-compatible).
-  2. `proc_free_address_space`: after the 0–1 GB PD sweep, walk per-proc **PDPT[128..511]**; for each present entry, free its PD's present 2 MB user pages, then free the PD page. (Safe because kernel PDPT[128..511] are 0.)
-  3. `sys_munmap`: extend to the high range (walk PDPT[hi]→PD, free + unmap; high VAs are ≥128 GB so the existing `< 0x10000000` / `> 0x40000000` guards must branch on the high range).
-  4. End-to-end test: a ring-3 selftest (or userland program) that `mmap`s **> 1 GB**, writes + reads sentinels across it, frees, at large `-m`. This is the real proof (the 1a selftest only checks the page-table chain).
-- **1c — iron burn.** Per-proc-CR3 page-table change → iron-gated. FB-photo: a >1 GB mmap workload runs on real Zen.
+- **1b — wire + teardown + end-to-end (DONE, 1.50.2, QEMU-validated).**
+  1. ✅ `sys_mmap`: dropped the `length > 1 GB` reject; small allocs use the low arena, big/overflow spill to the high arena via `himmap_next_vaddr` + `proc_map_page_hi` (zero-filled through the direct-map handle). Single sanity cap `length ≤ 64 GB`.
+  2. ✅ `proc_free_address_space`: sweeps per-proc **PDPT[128..511]**, freeing each present+user arena PD's 2 MB pages + the PD page. (Safe because kernel PDPT[128..511] are 0 / supervisor.)
+  3. ⏳ `sys_munmap` high range — **DEFERRED** (a high `addr ≥ 128 GB` falls through the existing `> 0x40000000` guard → returns -1; no leak, the teardown above reclaims at exit). Follow-on.
+  4. ✅ `MMAP_HIMEM_E2E_SELFTEST`: 1.026 GB contiguous (513 × 2 MB) spanning PDPT[128]+[129], free-count drops by 513, teardown restores it fully — `mmap-himem-e2e: >1GB map+free PASS` at `-m 4G`. No regression: `check.sh` 11/11, `agnsh-smoke` + 8G boot-to-prompt. (A *ring-3* >1 GB read/write test is bite 1c / a userland program — the selftest drives `proc_map_page_hi` + teardown directly.)
+- **1c — iron burn (NEXT).** Per-proc-CR3 page-table change → iron-gated. Build a burn with `MMAP_HIMEM_E2E_SELFTEST=1` to run the >1 GB map+free on real silicon, and/or a userland program that `mmap`s >1 GB + touches it.
+- **Follow-ons:** high-range `sys_munmap`; per-proc cursor (vs the global `himmap_next_vaddr`); optional NX on anonymous arena pages (W^X).
 
 ## Risks / notes
 
