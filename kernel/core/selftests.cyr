@@ -322,6 +322,49 @@
 }
 #endif
 
+#ifdef MMAP_HIMEM_SELFTEST
+# Hermetic chain-verification of proc_map_page_hi (high user mmap arena, 1.50.2
+# bite 1a). Builds a throwaway per-process address space, maps two SIBLING 128 GB
+# VAs, and walks PML4->PDPT->PD to assert: the on-demand PDPT[128] entry came up
+# present+user (the alloc-PD-on-miss path), the sibling reuses the SAME PD (one PD
+# per 1 GB, no re-shatter), and each PDE is present+user+2MB+correct-phys. NOT wired
+# into sys_mmap yet (bite 1b) — proves the mapper in isolation. Teardown of the high
+# PDs is bite 1b, so this leaks the test AS + its one PD (acceptable one-shot); the
+# two 2 MB data pages are returned. No CR3 switch — purely a structural page-walk via
+# identity (all tables are pmm_alloc'd <=256 MB).
+{
+    var ok = 1;
+    var cr3 = proc_create_address_space();
+    if (cr3 == 0) { ok = 0; }
+    var hva = 0x2000000000;                              # 128 GB — PDPT index 128
+    var p1 = pmm_alloc_2mb();
+    var p2 = pmm_alloc_2mb();
+    if (p1 == 0) { ok = 0; }
+    if (p2 == 0) { ok = 0; }
+    if (cr3 != 0) {
+        if (proc_map_page_hi(cr3, hva, p1) != 0) { ok = 0; }
+        if (proc_map_page_hi(cr3, hva + 0x200000, p2) != 0) { ok = 0; }
+        var pml4e = load64(cr3);
+        var pdpt = pml4e & 0xFFFFFFFFF000;
+        var pdpte = load64(pdpt + ((hva >> 30) & 0x1FF) * 8);
+        if ((pdpte & 1) == 0) { ok = 0; }                # PDPT[128] present (on-demand alloc worked)
+        if ((pdpte & 4) == 0) { ok = 0; }                # user
+        var pd = pdpte & 0xFFFFFFFFF000;
+        var pde1 = load64(pd + ((hva >> 21) & 0x1FF) * 8);
+        if ((pde1 & 1) == 0) { ok = 0; }                 # present
+        if ((pde1 & 4) == 0) { ok = 0; }                 # user
+        if ((pde1 & 0x80) == 0) { ok = 0; }              # 2 MB page
+        if ((pde1 & 0xFFFFFFFFFFE00000) != (p1 & 0xFFFFFFFFFFE00000)) { ok = 0; }   # correct phys
+        var pde2 = load64(pd + (((hva + 0x200000) >> 21) & 0x1FF) * 8);
+        if ((pde2 & 0xFFFFFFFFFFE00000) != (p2 & 0xFFFFFFFFFFE00000)) { ok = 0; }   # sibling reused same PD
+    }
+    if (p1 != 0) { pmm_free_2mb(p1); }
+    if (p2 != 0) { pmm_free_2mb(p2); }
+    if (ok == 1) { kprintln("mmap-himem: chain PASS", 22); }
+    if (ok == 0) { kprintln("mmap-himem: chain FAIL", 22); }
+}
+#endif
+
 #ifdef RTC_SELFTEST
 # RTC boot-clock self-test (1.35.5). Hermetic civil_to_unix anchors (shared with
 # the NTP test) + BCD decode, plus a live-bounded rtc_read_unix() sanity check

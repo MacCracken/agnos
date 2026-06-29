@@ -757,6 +757,40 @@ fn proc_map_page(cr3, virt, phys) {
     return 0;
 }
 
+# proc_map_page_hi(cr3, virt, phys) — like proc_map_page, but for the HIGH user
+# mmap arena (VA >= USER_HIMMAP_BASE = 128 GB). proc_map_page only ever touches
+# PDPT[0]'s single 0-1 GB PD; a high VA needs its OWN per-process PDPT entry +
+# PD, neither of which exists until the first map. The high arena lives at
+# PDPT[128..511] (>= 128 GB) — chosen ABOVE the <=64 GB direct-map (PDPT[8..71])
+# and clear of every device BAR + the framebuffer (all PDPT[0..3]), so a PRESENT
+# entry in that range is unambiguously a per-process arena PD, never a shared
+# kernel entry. That is what lets teardown free it safely (proc_free_address_space).
+# On-demand: if the per-proc PDPT[hi] is absent, allocate a zero-filled PD
+# (pmm_alloc — 4 KB, <=256 MB identity, so reachable by its phys==VA here) and
+# install it user (0x07); then write the 2 MB user PDE (0x87). KPTI is collapsed
+# (PD[511]==new_pml4==this CR3), so there is no separate user table to mirror.
+# Bite 1a (1.50.2): the mapper itself, verified hermetically by MMAP_HIMEM_SELFTEST;
+# sys_mmap routing + teardown are bite 1b. Returns 0 on success, -1 on PD-alloc fail.
+fn proc_map_page_hi(cr3, virt, phys) {
+    var pml4e = load64(cr3);
+    var pdpt_addr = pml4e & 0xFFFFFFFFF000;
+    var pdpt_idx = (virt >> 30) & 0x1FF;
+    var pdpte = load64(pdpt_addr + pdpt_idx * 8);
+    var pd_addr = 0;
+    if ((pdpte & 1) == 0) {
+        pd_addr = pmm_alloc();
+        if (pd_addr == 0) { return 0 - 1; }
+        for (var z = 0; z < 512; z = z + 1) { store64(pd_addr + z * 8, 0); }
+        store64(pdpt_addr + pdpt_idx * 8, pd_addr | 0x07);     # present + RW + user
+    } else {
+        pd_addr = pdpte & 0xFFFFFFFFF000;
+    }
+    var pd_idx = (virt >> 21) & 0x1FF;
+    store64(pd_addr + pd_idx * 8, (phys & 0xFFFFFFFFFFE00000) | 0x87);
+    invlpg_va(virt);
+    return 0;
+}
+
 # 1.44.19 — fault-PROOF copy from a (possibly garbage) user VA range, for the per-process
 # env blob on execwait(#37)/spawn_path(#43). WHY not the ew37_path-style copy-under-caller-CR3:
 # legacy 3-arg syscall() callers deliver GARBAGE in a3/a4 (the cyrius builtin pops exactly N
