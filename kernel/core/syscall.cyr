@@ -728,6 +728,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 >= proc_count) { return 0 - 1; }
         # Never wait on (and never reap) the caller itself.
         if (arg1 == proc_current_get()) { return 0 - 1; }
+        # 1.50.8: ownership — only the parent (or init) may reap, else -1 (not your child).
+        # Stops a non-parent from stealing the exit code + collapsing the slot out from under
+        # the real parent's pending waitpid. BEFORE the alive/dead check so a non-child gets
+        # -1 regardless of state. Unblocked by 1.50.7's real proc_get_ppid (inert while it
+        # stubbed 0 → the 1.44.22 audit deferral). agnsh IS the parent of its `&` jobs (set at
+        # proc_create_user), so this preserves bg-job reaping; ring3-smoke parent-spawn+wait
+        # + agnsh-bg/multijob exercise it. (proc_may_reap: proc.cyr.)
+        if (proc_may_reap(proc_current_get(), arg1) == 0) { return 0 - 1; }
         if (proc_get_state(arg1) != 0) { return 0 - 2; }   # still alive → WOULD_BLOCK
         # 1.42.x: reap the in-memory-spawned child here — the symmetric point to
         # the from-disk path's "read exit code in sh_cmd_run, then proc_reap".

@@ -5,6 +5,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.50.8] — 2026-06-29
+
+**▶ 1.50.8 — waitpid#4 ownership gate (1.44.22 multi-threading-cleanup item, un-blocked by 1.50.7).** The sibling of the 1.50.7 kill#16 child-gate, on the same `proc_ppid` infra. This was one of four items the 1.44.22 audit deferred; the others' status: **`sched_next` single-pass already landed at 1.47.8**, and **MADT AP-enumeration + loader DRY-up** were never `proc_get_ppid`-blocked (they stay deferred — SMP-boot / iron-validated-loader refactors with risk and no functional gain). Only waitpid#4 was un-blocked by 1.50.7's real `proc_get_ppid`.
+
+### Fixed
+- **waitpid#4 ownership gate.** `waitpid(pid)`#4 had **no ownership check** — any proc could reap any *dead* proc, stealing its exit code and collapsing the slot out from under the real parent's pending `waitpid`. The gate (`proc_may_reap`) was deferred at the 1.44.22 audit because `proc_get_ppid` stubbed `0`: enforcing parent-ownership then would have meant "only init may reap" and **broken agnsh `&`-job reaping**. Now that 1.50.7 made `proc_get_ppid` real, agnsh **is** the parent of its `&` jobs, so it reaps them and a non-parent cannot. New `proc_may_reap(caller, target)` (proc.cyr, sibling of `proc_may_signal`): **init reaps anyone** (the orphan reaper), a non-init caller reaps **only its own direct child** (no "self" clause — waitpid#4 already rejects `target==caller`). The gate is checked **before** the alive/dead test, so a non-child gets `-1` regardless of state. **Guardrail:** child-only, no process-group reach ([[project_agnos_auth_posture]]).
+
+### Added
+- `PPID_SELFTEST` extended with the `proc_may_reap` truth table (init / parent / stranger), alongside the existing `proc_may_signal` checks — one hermetic block now covers both child-gates (`ppid: child-gate PASS`).
+
+### Notes
+- Validation: `check.sh` 11/11, **`ring3-smoke` PASS incl. `ring3: parent spawn+wait OK`** (a ring-3 parent `spawn`#3's a child then `waitpid`#4-reaps it to exit — the gate's exact happy path: parent reaps its own child, must pass), extended `ppid: child-gate PASS`, `agnsh-bg-test` / `agnsh-multijob-test` (agnsh reaping its `&` jobs — the real consumer). Behavior-preserving for every working reap flow (foreground exec uses the kernel-internal `proc_reap`, not #4). Iron rides the next burn alongside 1.50.7.
+
 ## [1.50.7] — 2026-06-29
 
 **▶ 1.50.7 — process-isolation hardening: bg-job fault teardown + real `proc_get_ppid`.** Two small sovereign items surfaced + adversarially verified by the 2026-06-29 kavach↔agnos compat audit ([`agnosticos/.../kavach-agnos-compat.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/kavach-agnos-compat.md)). Both are capability/ownership hardening — **no Linux projection**.

@@ -762,6 +762,23 @@ fn proc_may_signal(caller, target) {
     return 0;
 }
 
+# 1.50.8: the waitpid#4 ownership predicate — sibling of proc_may_signal, same proc_ppid
+# infra. Returns 1 if `caller` may REAP `target` (collect its exit code + free its slot +
+# address space), else 0. Only the parent reaps its child: a non-parent reaping would steal
+# the exit code AND collapse the slot out from under the real parent's pending waitpid.
+#   • init (pid 0) may reap ANY proc — the orphan reaper (a child whose parent already exited).
+#   • a non-init caller may reap ONLY its own DIRECT child (proc_get_ppid(target) == caller).
+# There is NO "self" clause (unlike proc_may_signal): waitpid#4 already rejects target==caller
+# at the call site. Unblocked by 1.50.7's real proc_get_ppid (this gate was inert — and so
+# deferred at the 1.44.22 audit — while the getter stubbed 0, which would have meant "only
+# init may reap" → broke agnsh `&`-job reaping; now agnsh IS the parent of its `&` jobs, so
+# it reaps them and a stranger cannot). GUARDRAIL: child-only, no process-group reach.
+fn proc_may_reap(caller, target) {
+    if (caller == 0) { return 1; }                       # init reaps orphans / anyone
+    if (proc_get_ppid(target) == caller) { return 1; }   # own direct child
+    return 0;
+}
+
 fn proc_send_signal(pid, sig) {
     if (pid >= proc_count) { return 0 - 1; }
     if (sig < 0) { return 0 - 1; }
