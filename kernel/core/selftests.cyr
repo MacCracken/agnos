@@ -458,6 +458,32 @@
 }
 #endif
 
+#ifdef MMAP_HIMEM_PERPROC_SELFTEST
+# Hermetic test of the PER-PROCESS high cursor (1.50.4 himmap_reserve). Each pid has
+# its OWN bump cursor (proc_himmap_next[pid]), so two processes both start at 128 GB
+# independently — that's what stops a long-lived multi-proc system from globally
+# exhausting the arena. Uses scratch pids 14/15 (reset before + after, so no real proc
+# is perturbed; 0 = lazy-init to base). Pure cursor arithmetic — no allocation.
+{
+    var c = 1;
+    store64(&proc_himmap_next + 14 * 8, 0);
+    store64(&proc_himmap_next + 15 * 8, 0);
+    var a14 = himmap_reserve(14, 0x200000);              # pid 14: first 2 MB
+    var a15 = himmap_reserve(15, 0x400000);              # pid 15: first 4 MB — INDEPENDENT
+    var a14b = himmap_reserve(14, 0x200000);             # pid 14: advances by its own 2 MB
+    if (a14 != 0x2000000000) { c = 0; }                  # base
+    if (a15 != 0x2000000000) { c = 0; }                  # pid 15 ALSO starts at base, not after pid 14
+    if (a14b != 0x2000200000) { c = 0; }                 # pid 14 advanced by 2 MB only
+    store64(&proc_himmap_next + 14 * 8, 0x7FFFE00000);   # 512 GB - 2 MB (near ceiling)
+    if (himmap_reserve(14, 0x400000) != 0) { c = 0; }    # +4 MB passes 512 GB -> exhausted -> 0
+    if (himmap_reserve(16, 0x200000) != 0) { c = 0; }    # bad pid -> 0
+    store64(&proc_himmap_next + 14 * 8, 0);
+    store64(&proc_himmap_next + 15 * 8, 0);
+    if (c == 1) { kprintln("mmap-himem-perproc: PASS", 24); }
+    if (c == 0) { kprintln("mmap-himem-perproc: FAIL", 24); }
+}
+#endif
+
 #ifdef RTC_SELFTEST
 # RTC boot-clock self-test (1.35.5). Hermetic civil_to_unix anchors (shared with
 # the NTP test) + BCD decode, plus a live-bounded rtc_read_unix() sanity check

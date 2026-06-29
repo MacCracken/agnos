@@ -35,7 +35,11 @@ User pages are reached by ring 3 through the high VA → per-proc PD → phys (a
   3. ⏳ `sys_munmap` high range — **DEFERRED** (a high `addr ≥ 128 GB` falls through the existing `> 0x40000000` guard → returns -1; no leak, the teardown above reclaims at exit). Follow-on.
   4. ✅ `MMAP_HIMEM_E2E_SELFTEST`: 1.026 GB contiguous (513 × 2 MB) spanning PDPT[128]+[129], free-count drops by 513, teardown restores it fully — `mmap-himem-e2e: >1GB map+free PASS` at `-m 4G`. No regression: `check.sh` 11/11, `agnsh-smoke` + 8G boot-to-prompt. (A *ring-3* >1 GB read/write test is bite 1c / a userland program — the selftest drives `proc_map_page_hi` + teardown directly.)
 - **1c — iron burn (NEXT).** Per-proc-CR3 page-table change → iron-gated. Build a burn with `MMAP_HIMEM_E2E_SELFTEST=1` to run the >1 GB map+free on real silicon, and/or a userland program that `mmap`s >1 GB + touches it.
-- **Follow-ons:** high-range `sys_munmap`; per-proc cursor (vs the global `himmap_next_vaddr`); optional NX on anonymous arena pages (W^X).
+- **Follow-ons (1.50.x patches):**
+  - ✅ **1.50.3 — high-range `sys_munmap`** (`proc_unmap_2mb_hi`; per-page PDPT walk, free + clear PDE, idempotent; LIFO cursor rewind). `mmap-himunmap: PASS`.
+  - ✅ **1.50.4 — per-process cursor** (`proc_himmap_next[16]` + `himmap_reserve(pid,len)` replaces the global `himmap_next_vaddr`; each proc gets its own `[128 GB,512 GB)`). `mmap-himem-perproc: PASS`.
+  - ⏳ **NX on anonymous arena pages (W^X)** — set NX on high-arena PDEs (`proc_map_page_hi`) + the low-arena anonymous path. CARE: `proc_map_page` (low arena) is also the general user-page mapper — must NOT NX ELF *code* segments, so this needs an anonymous-only path/flag, not a blanket change. Audit callers first.
+  - ⏳ **ring-3 userland >1 GB program** — the live-path iron cherry (a real proc `mmap`s >1 GB via the syscall, touches it, `munmap`s). Cross-repo (a test binary staged on disk). The kernel mechanism is already iron-proven via `MMAP_HIMEM_E2E_SELFTEST`.
 
 ## Risks / notes
 
