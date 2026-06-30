@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.51.1] — 2026-06-30
+
 **▶ ark v2 item (a) symlink — COMPLETE + on-agnos round-trip proven; large-binary exec UNBLOCKED (the kstack VA-collision fix).** 2026-06-30, on top of 1.51.0.
 
 ### Fixed
