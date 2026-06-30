@@ -292,6 +292,22 @@ kprintln("kernel CR3: own PML4 (0x1000)", 28);
 pmm_bitmap_use_directmap();
 #endif
 
+# 1.50.10 hardening — guard the 1.50.9 bitmap-VA-shadow fix on EVERY boot (cheap; mirrors the always-on
+# directmap probe). When the bitmap migrated (RAM > 256 MB) it MUST now be reached via the direct-map
+# (>= DIRECTMAP_BASE), never its identity VA (which a per-proc CR3 shadows at PD[2]=0x400000). Reading it
+# here (own-PML4 build is on 0x1000 with the direct-map live) also confirms a non-zero free-2MB count —
+# the exact symptom the bug produced (0 under a per-proc CR3 -> agnsh mmap returned 0). The else branch
+# only fires in a BOOTCR3_KEEP_GNOBOOT_CR3 build (rebase gated off, ptr stays identity): >256 MB user
+# mmap WILL fault under a per-proc CR3 there — switch to the own-PML4 default. Runs in both builds (after
+# the #endif): own-PML4 reads the dm ptr under 0x1000; KEEP_GNOBOOT reads the identity ptr under boot CR3.
+if (pmm_bitmap_phys != 0) {
+    if (pmm_bitmap_ptr >= DIRECTMAP_BASE) {
+        kprint("pmm: bitmap-dm OK free2mb=", 26); kprint_num(pmm_count_2mb_free()); kprintln("", 0);
+    } else {
+        kprintln("pmm: WARN bitmap on identity VA (KEEP_GNOBOOT >256MB) - mmap faults under per-proc CR3", 86);
+    }
+}
+
 # === CMOS kernel checkpoint 9 (physical memory manager up) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x09; 0xE6; 0x71; }
 

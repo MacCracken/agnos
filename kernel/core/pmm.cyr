@@ -313,6 +313,16 @@ fn pmm_migrate_bitmap(bi) {
 # every per-proc CR3 mirrors and NEVER overrides, so it resolves to the real bitmap under EVERY CR3.
 # The direct-map maps from phys 0 (pmm_setup_directmap's gb loop starts at 0), so a <=256 MB phys is
 # covered. After this, ALL bitmap helpers (pmm_set/clear/test, the 2 MB scan) are CR3-stable.
+#
+# SIBLING AUDIT (1.50.10): the ONLY per-proc PDE override inside the kernel-identity range PD[0..127]
+# (0-256 MB) is PD[2] (ring-3 code @ 0x400000); user stack (PD[510]) + the mmap arena (PD[128..510]) are
+# above that range (proc_create_address_space copies PD[0..127] verbatim, zeroes PD[128..510], overrides
+# only PD[2] via the loader). So the bitmap was the UNIQUE victim — the sole pmm_alloc_2mb'd KERNEL
+# structure read by its identity VA during a syscall, and it could land on region 2. GENERAL PRINCIPLE:
+# any kernel datum touched while running under a per-proc CR3 (i.e. during a syscall/fault) must be
+# reached via the direct-map (pmm_kva_for_access / DIRECTMAP_BASE+phys), never a <=256 MB identity VA,
+# or a future allocation at region 2 re-opens this class. The kernel heap (~PD[127]) + .bss are below
+# PD[2]-aliasing risk only by luck of placement; new dynamic kernel structures should follow the rule.
 fn pmm_bitmap_use_directmap() {
     if (pmm_bitmap_phys == 0) { return 0; }              # never migrated -> static .bss bitmap, already safe
     pmm_bitmap_ptr = DIRECTMAP_BASE + pmm_bitmap_phys;

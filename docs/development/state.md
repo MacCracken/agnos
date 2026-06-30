@@ -20,7 +20,7 @@ type: state
 
 | Field | Value | Source |
 |---|---|---|
-| **Kernel** | **1.50.9** | [`VERSION`](../../VERSION) |
+| **Kernel** | **1.50.10** | [`VERSION`](../../VERSION) |
 | **Cyrius toolchain pin** | **6.2.36** | `cyrius.cyml [package].cyrius` |
 | **Released** | 2026-06-29 | [`CHANGELOG.md`](../../CHANGELOG.md) |
 | **Iron-validated** | 2026-05-25 (archaemenid NUC AMD — **MVP gate green since Attempt 68 / 1.30.9**; **1.32.x networking arc iron-COMPLETE**: r8169 unicast-RX solved at 1.32.7 + DHCP real lease `.142` iron-verified at 1.32.9; storage trio + GPT + ext4 + shell byte-clean). The 1.33.x ext2/4-WRITE + 1.34.x FAT-family arcs are QEMU/`fsck`-validated; their final-bite iron burns stay user-driven (pending). | NUC AMD Attempts 68 (MVP gate) + 71-77 (FB) + 80-91 (storage arc) + 92+ (networking arc — DHCP iron-verified 1.32.9) |

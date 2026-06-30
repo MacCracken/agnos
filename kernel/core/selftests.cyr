@@ -486,13 +486,14 @@
 #endif
 
 #ifdef PPID_SELFTEST
-# 1.50.7 proc-ppid + kill#16 child-gate self-test (1.50.8 extends it with the waitpid#4
-# reap gate). Hermetic: the getter's out-of-range guard, a save/restore roundtrip of
+# 1.50.7 proc-ppid + kill#16 child-gate self-test (1.50.8 adds the waitpid#4 reap gate; 1.50.10 adds
+# the reap-off-cpu fence). Hermetic: the getter's out-of-range guard, a save/restore roundtrip of
 # proc_get_ppid through a live in-range slot (pid 1 = idle; the scheduler never reads ppid,
-# so the temporary value is invisible to it), and BOTH extracted child-gate predicates —
+# so the temporary value is invisible to it), BOTH extracted child-gate predicates —
 # proc_may_signal (kill#16) + proc_may_reap (waitpid#4) — across init / self / own-child /
-# stranger callers. Proves proc_get_ppid is no longer the always-0 stub and that both
-# child-only gates are now real. No proc creation/teardown.
+# stranger callers, and the proc_reap_off_cpu_fence SELF-OWNED fast path. Proves proc_get_ppid is no
+# longer the always-0 stub, both child-only gates are real, and the fence can't self-deadlock. No
+# proc creation/teardown (pid-1 slot save/restored).
 {
     var ok = 1;
     # (1) out-of-range pid -> -1 guard (independent of array contents)
@@ -514,6 +515,15 @@
     if (proc_may_reap(7, 1) != 1) { ok = 0; }        # parent 7 may reap its child 1
     if (proc_may_reap(5, 1) != 0) { ok = 0; }        # stranger 5 may NOT reap child-of-7
     store64(&proc_ppid + 1 * 8, s1);                 # restore — no live proc perturbed
+    # (5) 1.50.10 reap-off-cpu fence SELF-OWNED fast path (proc.cyr proc_reap_off_cpu_fence). A proc
+    # that dies via kernel_resume (ring-3 fault / foreground exit) leaves on_cpu pointing at THIS cpu
+    # (no do_context_switch deschedule); the fence MUST clear it + return, never spin (the 1.50.9
+    # box-hang). Save/restore pid 1's on_cpu slot (sched_active is still 0 here, so no live reader).
+    var c1 = load64(&proc_on_cpu + 1 * 8);
+    store64(&proc_on_cpu + 1 * 8, pcpu_cpu());       # pretend pid 1 terminated while running on this cpu
+    proc_reap_off_cpu_fence(1);                       # must RETURN (a foreign owner would spin; self-owned clears)
+    if (on_cpu_get(1) != (0 - 1)) { ok = 0; }         # the self-owned fast path cleared on_cpu
+    store64(&proc_on_cpu + 1 * 8, c1);               # restore — no live proc perturbed
     if (ok == 1) { kprintln("ppid: child-gate PASS", 21); }
     if (ok == 0) { kprintln("ppid: child-gate FAIL", 21); }
 }
