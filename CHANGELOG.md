@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.51.2] — 2026-06-30
+
+**▶ Cyrius pin → 6.3.9 (symlink-feature coherence) + ark v2 M3 PROVEN on agnos.** 2026-06-30, on top of 1.51.1.
+
+### Changed
+- **`cyrius.cyml` pin 6.2.44 → 6.3.9.** The freestanding kernel is `cmp`-byte-identical across pins (`build/agnos` stays 1,359,960 B), so this is provenance-only — BUT the `symlink`#63 syscall (1.51.0) created a hard floor: its userland peer `sys_symlink` exists only in cyrius ≥ 6.3.6. agnos is the home of the syscall and ships the `symtest` exerciser that *calls* the peer, so its pin must be ≥ 6.3.6 or "build agnos per its pin" can't produce userland that uses the syscall it added. agnos + ark + `symtest` now all pin 6.3.9.
+
+### Added
+- **`ARK_INSTALL_SELFTEST` gate + `scripts/ark-install-smoke.sh` — the ark v2 M3 milestone proof.** The hook runs `ark install --root /arkroot /symlink-test.ark` (the real ~16 MB ark + a takumi-built symlink-bearing `.ark`, both staged on ext2). ark reads + verifies the package, lays the file down, and creates the symlink via `ark_symlink` → `sys_symlink`#63 → `ext2_symlink` — ON THE AGNOS-FS. Verified host-side: `/arkroot/lib/libfoo.so.1` (file, 19 B) + `/arkroot/lib/libfoo.so` → `libfoo.so.1` (symlink) both land, `e2fsck -fn` clean. **This is the first full userland install path exercising the symlink syscall end-to-end on agnos** — the `sovereign ark → agnova → server` critical path, demonstrated. (Surfaced + fixed an ark-side ABI gap: `apkg_mkdir_p` used the host 2-arg `sys_mkdir(path, mode)`; agnos `sys_mkdir`#9 is `(path, pathlen)` — fixed in ark via an `ark_mkdir` portable shim, ark CHANGELOG.)
+
 ## [1.51.1] — 2026-06-30
 
 **▶ ark v2 item (a) symlink — COMPLETE + on-agnos round-trip proven; large-binary exec UNBLOCKED (the kstack VA-collision fix).** 2026-06-30, on top of 1.51.0.

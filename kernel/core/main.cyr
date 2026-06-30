@@ -1928,6 +1928,30 @@ fn ark_run_selftest() {
 ark_run_selftest();
 #endif
 
+#ifdef ARK_INSTALL_SELFTEST
+# The ark v2 M3 milestone: an on-agnos install of a prebuilt `.ark` that CARRIES
+# a symlink entry, end to end. ark runs `install --root /arkroot /symlink-test.ark`
+# (both staged by scripts/ark-install-smoke.sh): it reads + verifies the unsigned
+# `.ark` (takumi-built, a regular file `/lib/libfoo.so.1` + a symlink
+# `/lib/libfoo.so` -> `libfoo.so.1`), lays the file down (pass 1), then in pass 2
+# calls `ark_symlink` -> the cyrius `sys_symlink`#63 agnos peer -> kernel
+# `symlink`#63 -> `ext2_symlink`, creating the symlink ON THE AGNOS-FS. The smoke
+# then verifies host-side that `/arkroot/lib/libfoo.so` is a symlink to
+# `libfoo.so.1` and the partition is e2fsck-clean — the true M3 round-trip
+# ([[feedback_qemu_test_agnos_userland]]). This is the first real consumer of the
+# symlink syscall through a full userland install path, not a bespoke exerciser.
+fn ark_install_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    kprintln("exec: running ark install", 25);
+    sh_exec("run /bin/ark install --root /arkroot /symlink-test.ark", 54);
+    ext2_sync();
+    kprintln("exec: ark install selftest done", 31);
+    return 0;
+}
+ark_install_selftest();
+#endif
+
 #ifdef FAULT_SELFTEST
 # 1.47.x — proc-teardown-on-fault self-test (compile-gated, FAULT_SELFTEST=1). Builds a
 # minimal static ELF64 whose entry READS an unmapped 5 GB address (movabs rdi,0x140000000;
