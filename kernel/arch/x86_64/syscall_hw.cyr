@@ -119,19 +119,22 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
 # 0-1 GB the per-process CR3 mirrors), writable. Idempotent.
 fn syscall_kstack_reserve() {
     if (syscall_kstack_reserved != 0) { return 0; }
-    # 1.46.x 4b: FIXED per-CPU kstacks in region 7 (0xE00000-0x1000000, 14-16 MB), which pmm_init
-    # reserves as kernel (proc.cyr PD[0..127] copy mirrors PD[7] into every per-proc CR3). The
-    # PRIMARY tops are 0xF10000 + cpu*0x10000; the SECOND (execwait #37 nested) tops are
-    # 0xF90000 + cpu*0x10000. All sit ABOVE the proc_rsp0 pool (0xE00000-0xF00000) and 64 KB apart
-    # per CPU, so no two CPUs' stacks — and neither of a CPU's two stacks — ever overlap. The old
-    # single-core values (primary 0x3F0000, nested 0x3D0000) lived in region 1; 4b moves them to
-    # region 7 (the only behavior delta — see the buffer header). No alloc needed (region 7 is
-    # kernel-reserved): same determinism rationale as the old fixed tops, avoiding the QEMU↔iron
-    # next-free flake a pmm_alloc_2mb would reintroduce (1.40.9). Deterministic + identity-mapped +
-    # below no user VA, so no per-process mapping overrides them.
+    # 1.46.x 4b: FIXED per-CPU kstacks whose PHYS lives in region 7 (0xE00000-0x1000000, 14-16 MB),
+    # reserved as kernel in pmm_init. The PRIMARY phys tops are 0xF10000 + cpu*0x10000; the SECOND
+    # (execwait #37 nested) phys tops are 0xF90000 + cpu*0x10000. All sit ABOVE the proc_rsp0 pool
+    # (phys 0xE00000-0xF00000) and 64 KB apart per CPU, so no two CPUs' stacks — and neither of a
+    # CPU's two stacks — ever overlap. **1.51.x: the stub loads RSP from these table entries via the
+    # DIRECT-MAP VA (DIRECTMAP_BASE + phys, 8 GB+), NOT the low identity VA.** Region 7's identity VA
+    # (14-16 MB) is inside the user-segment range (elf_load maps PT_LOADs to 256 MB), so a large binary
+    # like ark (segment to ~20 MB) overrode PD[7] in its per-proc CR3 and clobbered the syscall kstack
+    # -> the exec path #PF'd at SP=0xF10000 (CPL0) -> #DF -> triple fault. The direct-map (PDPT[8..71],
+    # mirrored into every per-proc CR3, vmm.cyr) is above ALL user VA and never segment-overridden, so
+    # the kstack is always reachable. The stub's load is `mov rsp, [r8*8 + &table]` (a 64-bit load), so
+    # storing 8 GB+ VAs here needs NO stub change. Phys stays region-7-reserved (same determinism as the
+    # old fixed tops, no pmm_alloc_2mb next-free flake; 1.40.9).
     for (var c = 0; c < 4; c = c + 1) {
-        store64(&pcpu_syscall_kstack_top + c * 8, 0xF10000 + c * 0x10000);
-        store64(&pcpu_syscall_kstack_top2 + c * 8, 0xF90000 + c * 0x10000);
+        store64(&pcpu_syscall_kstack_top + c * 8, DIRECTMAP_BASE + 0xF10000 + c * 0x10000);
+        store64(&pcpu_syscall_kstack_top2 + c * 8, DIRECTMAP_BASE + 0xF90000 + c * 0x10000);
     }
     syscall_kstack_reserved = 1;
     return 0;

@@ -124,14 +124,18 @@ fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8
 # stack. RSP0 is consumed ONLY on a CPL change, so this is INERT in the current
 # IF=0-cooperative config (the deep FS path stays on the UNCHANGED syscall kstack;
 # only the interrupt stack — shallow ISR->do_context_switch — goes per-proc here).
-# Pool = region 7 (14-16MB), reserved in pmm_init: it sits at the TOP of the 0-16MB
-# boot identity map (PD[7]), so it is supervisor-mapped under the boot CR3 AND every
-# per-proc CR3 (which copies PD[0..127], proc.cyr). NOT region 8 (16MB) — the boot
-# vmm_alloc_at(0x1000000) probe (main.cyr) remaps PD[8]. The SYSCALL-entry kstack
-# stays SHARED this bite (per-proc syscall stack is deferred to the blocking-waitpid
-# bite, where the global SYSRET cells move per-proc as one coherent unit).
+# Pool PHYS = region 7 (14-16MB), reserved in pmm_init. **1.51.x: RSP0 points at the
+# region-7 phys via its DIRECT-MAP alias (DIRECTMAP_BASE + phys, 8 GB+), NOT its low
+# identity VA.** The identity VA (14-16MB) sits INSIDE the user-segment range — elf_load
+# maps PT_LOADs up to 256 MB, and proc_map_page OVERRIDES the per-proc PD entries it
+# covers — so a large binary (e.g. ark's ~16 MB image, segment to ~20 MB) clobbered PD[7]
+# in its own CR3 and the next CPL3->CPL0 interrupt #PF'd on the vanished stack -> #DF ->
+# triple fault (the "ark won't run" bug). The direct-map (PDPT[8..71], mirrored into every
+# per-proc CR3, vmm.cyr pmm_setup_directmap) is at 8 GB+, far above ANY user VA (segments
+# <=256 MB, mmap/stack <=~1 GB), and is NEVER overridden by a user segment, so RSP0 is
+# always reachable. The phys stays reserved in region 7; only the VA the CPU loads moves up.
 var proc_rsp0[16];      # per-pid TSS.RSP0 top (0 = unassigned -> 0x3C0000 fallback)
-var KSTACK_POOL_BASE = 0xE00000;   # region 7 base (14 MB)
+var KSTACK_POOL_BASE = 0xE00000;   # region 7 PHYS base (14 MB) — RSP0 = DIRECTMAP_BASE + this
 var KSTACK_SLOT = 0x10000;         # 64 KB per proc (interrupt stack is shallow)
 var pending_signal_flag = 0;  # Set by scheduler ISR, read by main — benign race (atomic store on x86_64)
 
@@ -199,7 +203,7 @@ fn proc_alloc_slot() {
     proctab_spin_unlock();
     store64(&proc_signals + idx * 8, 0);
     store64(&proc_sigmask + idx * 8, 0);
-    store64(&proc_rsp0 + idx * 8, KSTACK_POOL_BASE + (idx + 1) * KSTACK_SLOT);  # 1.46.1: per-proc RSP0 stack (region 7)
+    store64(&proc_rsp0 + idx * 8, DIRECTMAP_BASE + KSTACK_POOL_BASE + (idx + 1) * KSTACK_SLOT);  # 1.46.1 region-7 phys, 1.51.x via direct-map VA (8 GB+, clear of user segments)
     store64(&proc_on_cpu + idx * 8, 0 - 1);   # 1.46.x SMP6: recycled slot must not inherit a stale CPU id
     store64(&idle_owner + idx * 8, 0 - 1);     # 1.46.x STEP-2: recycled slot starts UNPINNED (a prior foreground proc may have left idle_owner=its launch CPU; a fresh proc must be free to migrate / not falsely pinned). Idles never reuse a slot, so their persistent pin is unaffected.
     store64(&proc_ppid + idx * 8, 0);          # 1.50.7: recycled slot must not inherit a stale parent (default init; proc_create_user sets the real creator)

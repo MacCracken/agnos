@@ -1173,6 +1173,35 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return sr;
     }
+    if (num == 63) {
+        # 1.51.0 (sovereign-package-manager kernel surface, ark v2 / agnova prerequisite — DO-FIRST):
+        # symlink(target=arg1, targetlen=arg2, linkpath=arg3, linkpathlen=a4) — create a symbolic link
+        # `linkpath` whose contents are the TEXT in `target`. The target is link TEXT, NOT a path to
+        # resolve (a symlink may point at a nonexistent / relative target), so it is validated as a
+        # bounded USER BUFFER (is_user_range, 1..one-ext2-block — ext2_symlink re-caps at blocksize),
+        # NOT via sc_path_ok. The LINKPATH is a real path: ext2-only (symlinks need inodes; FAT/exFAT
+        # have none → -1), sc_path_ok'd, parent+basename resolved via vfs_ext2_parent (sets
+        # vfs_base_off/len) — the EXACT shape as #32 link below it. ext2_symlink (1.33.3, fast<60 inline
+        # / slow=one block) does the inode+dirent work, e2fsck-clean. Consumed by ark_pkg_install pass-2
+        # (`.so → .so.N`). Returns 0 on success / -1. ⚠ TWO-SIDED: ring 3 cannot call this until cyrius
+        # adds the matching `sys_symlink`#63 peer (lib/syscalls_x86_64_agnos.cyr has sys_link but NO
+        # sys_symlink) — that half is HANDS-OFF, flagged to the user; (a) is not "done" until both ship
+        # AND an on-agnos .ark-with-symlinks install round-trips ([[feedback_qemu_test_agnos_userland]]).
+        var a4sl = ksyscall_a4_get();
+        if (arg2 < 1) { stack_canary_check(canary); return 0 - 1; }
+        if (arg2 > 4096) { stack_canary_check(canary); return 0 - 1; }            # one ext2 block max
+        if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }   # target = link TEXT buffer
+        if (sc_path_ok(arg3, a4sl) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (vfs_resolve_mount(arg3, a4sl) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        fs_spin_lock();
+        var sldp = vfs_ext2_parent(arg3, a4sl);
+        if (sldp <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
+        var slr = ext2_symlink(sldp, arg3 + vfs_base_off, vfs_base_len, arg1, arg2);
+        fs_spin_unlock();
+        stack_canary_check(canary);
+        if (slr > 0) { return 0; }
+        return 0 - 1;
+    }
     if (num == 34) {
         # uname(buf=arg1, len=arg2) — writes the 64-byte identity struct: four
         # 16-byte NUL-padded fields at offsets 0/16/32/48 = sysname / nodename /

@@ -1,0 +1,17 @@
+[package]
+name = "symtest"
+version = "0.1.0"
+description = "agnos symlink#63 round-trip exerciser — drives the cyrius sys_symlink peer (#63, cyrius 6.3.6) against the kernel symlink#63 + ext2 traversal (1.51.x ark v2 item (a))."
+license = "GPL-3.0-only"
+language = "cyrius"
+# The agnos symlink syscall peer landed cyrius 6.3.6; pin the current 6.3.9.
+cyrius = "6.3.9"
+
+[build]
+entry = "symtest.cyr"
+output = "build/symtest"
+
+[deps]
+# Syscall ABI only — under `--agnos` this resolves to lib/syscalls_x86_64_agnos.cyr
+# (SYS_SYMLINK=63 / sys_open#7 / sys_read#5 / sys_write#1 / sys_close#6 / SYS_EXIT=0).
+stdlib = ["syscalls"]

@@ -1,0 +1,65 @@
+# symtest — agnos symlink#63 round-trip exerciser.
+#
+# The ark v2 / agnova DO-FIRST item (a) is TWO-SIDED: the agnos kernel
+# symlink#63 (ext2_symlink, 1.51.0) is a no-op to userland until the cyrius
+# `sys_symlink` peer (lib/syscalls_x86_64_agnos.cyr, #63) exposes the number —
+# that peer landed cyrius 6.3.6. This program is the on-agnos round-trip the
+# item's done-criteria demands ([[feedback_qemu_test_agnos_userland]] —
+# compiling != working): a real `--agnos` program that CALLS sys_symlink, with
+# the symlink landing on the agnos-fs, resolving on traversal, and (host-side,
+# in symlink-smoke.sh) surviving `e2fsck -fn`.
+#
+# Sequence:
+#   1. sys_symlink("/etc/hostname", "/hn_link")  -> create the symlink, ret 0.
+#   2. open("/hn_link") + read                    -> ext2_path_lookup FOLLOWS the
+#      symlink to /etc/hostname (seeded "archaemenid"), returning its bytes.
+# Markers on fd 1 let the smoke distinguish the create stage from the traverse
+# stage; the exit code identifies the failing stage (0 = full PASS).
+#
+# Run by the SYMLINK_SELFTEST kernel hook via `run /bin/symtest`.
+
+# Byte-compare two buffers for `n` bytes (no stdlib string dep).
+fn streqn(a, b, n): i64 {
+    var i = 0;
+    while (i < n) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn main(): i64 {
+    # 1. create /hn_link whose link TEXT is "/etc/hostname".
+    #    sys_symlink(target, targetlen, linkpath, linkpathlen) -> 0 / -1.
+    var r = sys_symlink("/etc/hostname", 13, "/hn_link", 8);
+    if (r != 0) {
+        sys_write(1, "SYMLINK-CREATE-FAIL\n", 20);
+        return 11;
+    }
+    sys_write(1, "SYMLINK-CREATE-OK\n", 18);
+
+    # 2. open the symlink path; the kernel's ext2_path_lookup follows it to
+    #    /etc/hostname and reads that file's contents.
+    var fd = sys_open("/hn_link", 8, 0);
+    if (fd < 0) {
+        sys_write(1, "SYMLINK-OPEN-FAIL\n", 18);
+        return 12;
+    }
+    var buf[64];
+    var n = sys_read(fd, &buf, 64);
+    sys_close(fd);
+    if (n < 11) {
+        sys_write(1, "SYMLINK-READ-SHORT\n", 19);
+        return 13;
+    }
+    # The smoke seeds /etc/hostname = "archaemenid"; the first 11 bytes must match.
+    if (streqn(&buf, "archaemenid", 11) == 0) {
+        sys_write(1, "SYMLINK-TRAVERSE-MISMATCH\n", 25);
+        return 14;
+    }
+    sys_write(1, "SYMLINK-TRAVERSE-OK\n", 20);
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

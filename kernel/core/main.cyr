@@ -1881,6 +1881,53 @@ fn exec_disk_selftest() {
 exec_disk_selftest();
 #endif
 
+#ifdef SYMLINK_SELFTEST
+# 1.51.x — symlink#63 round-trip self-test (compile-gated, SYMLINK_SELFTEST=1).
+# The ark v2 / agnova DO-FIRST item (a). Unlike the hand-asm selftests around it,
+# the exerciser is a REAL cyrius `--agnos` program (tests/symlink/symtest.cyr)
+# staged at /bin/symtest by the smoke's mkfs seed — so this exercises the cyrius
+# `sys_symlink`#63 PEER (lib/syscalls_x86_64_agnos.cyr, landed cyrius 6.3.6), NOT
+# a raw hand-asm syscall. symtest creates /hn_link -> "/etc/hostname", then opens
+# the symlink and reads it back (ext2_path_lookup follows the link to the seeded
+# hostname file), printing SYMLINK-CREATE-OK / SYMLINK-TRAVERSE-OK and exiting 0.
+# Proves the cyrius peer + kernel symlink#63 (ext2_symlink, 1.51.0) end-to-end.
+# Gated by scripts/symlink-smoke.sh on the markers + "run: exit 0" + a host-side
+# readlink/e2fsck pass ([[feedback_qemu_test_agnos_userland]]).
+fn symlink_disk_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    kprintln("exec: running /bin/symtest", 26);
+    sh_exec("run /bin/symtest", 16);
+    # Flush the symlink inode+dirent to the platter so the host-side readlink /
+    # e2fsck pass sees them after QEMU is killed (the ring-3 program cannot sync;
+    # the selftest harness does, mirroring exec/ext2-write selftests).
+    ext2_sync();
+    kprintln("exec: symlink selftest done", 27);
+    return 0;
+}
+symlink_disk_selftest();
+#endif
+
+#ifdef ARK_SELFTEST
+# Server-stage probe (compile-gated, ARK_SELFTEST=1): does the real ~16 MB ark
+# binary LOAD + RUN in ring 3 on agnos? ark is by far the largest binary attempted
+# (kriya 934 KB / doom 589 KB are the prior ceiling) and the ark v2 M3 on-agnos
+# `.ark` install rides on it. Staged at /bin/ark by scripts/ark-run-smoke.sh; run
+# with NO args here, so ark prints its "Unknown command. Available: ..." command
+# list and exits — `run: exit N` proves exec-from-disk streamed + elf_load mapped
+# the 16 MB image (incl. its ~14 MB static .bss) and ring-3 code reached write(1).
+# Deterministic (no agnsh keystrokes — sendkey dropped chars on a 16 MB target).
+fn ark_run_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    kprintln("exec: running /bin/ark", 22);
+    sh_exec("run /bin/ark", 12);
+    kprintln("exec: ark selftest done", 23);
+    return 0;
+}
+ark_run_selftest();
+#endif
+
 #ifdef FAULT_SELFTEST
 # 1.47.x — proc-teardown-on-fault self-test (compile-gated, FAULT_SELFTEST=1). Builds a
 # minimal static ELF64 whose entry READS an unmapped 5 GB address (movabs rdi,0x140000000;
