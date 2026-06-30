@@ -89,13 +89,22 @@ fn on_cpu_set(pid, c) { store64(&proc_on_cpu + pid * 8, c); return 0; }
 # its own CR3) — that would fault the foreign CPU. Callers set state 0 FIRST (so sched_next
 # can no longer PICK it), then call this to wait out any IN-FLIGHT restore that already
 # passed the state gate: spin until on_cpu clears, which the owning CPU does on its next
-# deschedule (do_context_switch / sys_sched_yield set on_cpu=-1). INERT single-core: the
-# reaped proc was always descheduled (on_cpu==-1) before any reap path runs (foreground
-# reaps run cooperatively and never schedule the proc; proc_reap_child refuses the running
-# proc, so a context switch — which clears on_cpu — already happened), so the loop never
-# iterates. Must be called AFTER proc_set_state(pid,0) and BEFORE proc_free_address_space.
+# deschedule (do_context_switch / sys_sched_yield set on_cpu=-1). Must be called AFTER
+# proc_set_state(pid,0) and BEFORE proc_free_address_space.
+#
+# 1.50.9 SELF-OWNED FAST PATH (deadlock fix): a proc that terminates via kernel_resume — a ring-3
+# FAULT (fault_kill_current) or exit#0 on the FOREGROUND exec child — leaves the CPU WITHOUT going
+# through do_context_switch, so its on_cpu is NEVER cleared and still points at the CURRENT CPU. Under
+# exec_preempt=1 (preemptive agnsh, init.cyr) that child WAS scheduled by do_context_switch, so on_cpu
+# was set — and the old unconditional spin then waited forever for a deschedule that can't happen
+# (we ARE the owner, spinning here IF=0, single core → hard hang right after the agnsh banner — the
+# 1.46.x fence regression that turned an agnsh fault/exit into a frozen box). If THIS CPU owns the
+# (now-dead) proc, there is no FOREIGN in-flight restore to wait out — clear on_cpu and proceed. A
+# DIFFERENT CPU's ownership still spins (the real SMP race the fence guards). Single-core: pcpu_cpu()==0
+# always equals the self-owned case, so the loop never iterates.
 fn proc_reap_off_cpu_fence(pid) {
-    while (on_cpu_get(pid) != 0 - 1) { asm { 0xF3; 0x90; } }   # pause; spin until owner deschedules
+    if (on_cpu_get(pid) == pcpu_cpu()) { on_cpu_set(pid, 0 - 1); }   # self-owned (kernel_resume exit/fault) → no foreign restore
+    while (on_cpu_get(pid) != 0 - 1) { asm { 0xF3; 0x90; } }   # pause; spin until a FOREIGN owner deschedules
     return 0;
 }
 # 1.46.x SMP sub-bite 6b: PERSISTENT per-pid idle-owner CPU (-1 = not an idle). UNLIKE

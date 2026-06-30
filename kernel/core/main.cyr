@@ -277,6 +277,19 @@ fb_verify_wc();
 # PDPT[1..511], so this makes the boot/idle context consistent with them. [[feedback_dont_dodge_large_items]]
 cr3_load(0x1000);
 kprintln("kernel CR3: own PML4 (0x1000)", 28);
+# 1.50.9: the kernel now runs on 0x1000, which carries the direct-map (PDPT[8+]) — so rebase the
+# migrated PMM bitmap pointer off its IDENTITY VA onto DIRECTMAP_BASE + phys. REQUIRED because the
+# migrated bitmap lives in the <=256 MB pool and its identity VA can alias a per-process user VA — a
+# ring-3 ELF maps its code at the fixed VA 0x400000 (PD[2]), OVERRIDDEN in every per-proc CR3. A
+# syscall (mmap) runs under the CALLER's CR3, so the bitmap-by-identity-VA would read the caller's
+# code there -> pmm_count_2mb_free saw 0 free regions -> agnsh's first heap mmap returned 0 ->
+# null-deref #PF right after its banner. The direct-map window is mirrored by every per-proc CR3 and
+# never overridden, so the bitmap reads correctly under EVERY CR3. MUST be AFTER this cr3_load(0x1000):
+# the direct-map is only active under 0x1000 (gnoboot's boot CR3 maps PDPT[8] to an unrelated identity
+# GB), so the boot-time pmm_alloc's BEFORE the switch keep using the identity VA (no proc runs yet, so
+# identity is unshadowed). No-op if RAM <=256 MB (bitmap stayed in .bss). Only inside the own-PML4
+# build: a BOOTCR3_KEEP_GNOBOOT_CR3 boot never gets the direct-map in its boot/idle context.
+pmm_bitmap_use_directmap();
 #endif
 
 # === CMOS kernel checkpoint 9 (physical memory manager up) ===

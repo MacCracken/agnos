@@ -17,6 +17,16 @@ var pmm_bitmap[1024];
 # can track (the pmm_page_valid bound); bumped on migration. See pmm_migrate_bitmap + main.cyr.
 var pmm_bitmap_ptr = 0;
 var pmm_bitmap_pages = 65536;
+# 1.50.9: the PHYSICAL base of the migrated RAM-backed bitmap (0 = still on the static bootstrap
+# bitmap, no migration). pmm_migrate_bitmap allocates the new bitmap from the <=256 MB pool, so its
+# IDENTITY VA aliases a per-process user VA (a ring-3 ELF loads its code at the fixed VA 0x400000 =
+# PD[2], which every per-proc CR3 OVERRIDES). A syscall (e.g. mmap) runs under the CALLER's CR3, so a
+# bitmap accessed by its identity VA would read the caller's CODE, not the bitmap (pmm_count_2mb_free
+# saw 0 free regions -> agnsh's first heap mmap failed -> #PF after the banner). pmm_bitmap_use_directmap
+# (called once the direct-map is live) rebases pmm_bitmap_ptr onto DIRECTMAP_BASE + this phys — the
+# kernel PDPT[8+] window every per-proc CR3 mirrors and NEVER overrides, so the bitmap reads correctly
+# under EVERY CR3. See [[bug 1.50.x agnsh-banner mmap=0]].
+var pmm_bitmap_phys = 0;
 var pmm_total = 0;
 # 1.49.1 (full RAM init, bite 1) — UEFI memory-map discovery results, set by pmm_probe_memmap and
 # consumed in bite 2 to size the PMM to the machine's actual RAM. Pure discovery; no alloc change yet.
@@ -255,7 +265,8 @@ fn pmm_migrate_bitmap(bi) {
     memcpy(nb, pmm_bitmap_ptr, 8192);                    # carry 0-256 MB (the bootstrap's full 8 KB)
     var bm_bytes = (ram_pages + 7) / 8;                  # total bitmap bytes for the full RAM
     memset(nb + 8192, 0xFF, bm_bytes - 8192);            # pages [65536, ram_pages) reserved (byte 8192 = page 65536)
-    pmm_bitmap_ptr = nb;
+    pmm_bitmap_ptr = nb;                                 # identity VA for now (boot CR3, no proc yet); rebased onto
+    pmm_bitmap_phys = nb;                                # the direct-map by pmm_bitmap_use_directmap() after pmm_setup_directmap
     pmm_bitmap_pages = ram_pages;
     pmm_total = ram_pages;                               # free_count: full-pool ceiling (reserved gaps over-count, as below 256 MB)
     # Free the EfiConventionalMemory (type 7) regions above 256 MB. Byte-memset the 8-page-aligned middle
@@ -289,6 +300,23 @@ fn pmm_migrate_bitmap(bi) {
     # the kernel reaches via the direct-map, go higher.
     pmm_2mb_top_region = pmm_bitmap_pages / 512;
     return pmm_bitmap_pages;
+}
+
+# 1.50.9: rebase the migrated bitmap pointer onto the DIRECT-MAP. Called from main.cyr ONCE,
+# immediately AFTER pmm_setup_directmap (the direct-map must be live first). No-op if the bitmap
+# never migrated (<=256 MB RAM: it stays the static `pmm_bitmap` in kernel .bss, whose VA is below
+# every user mapping and so is never shadowed). WHY THIS IS REQUIRED: pmm_migrate_bitmap allocates the
+# RAM-backed bitmap from the <=256 MB pool, so its identity VA can land on a per-process user VA — a
+# ring-3 ELF maps its code at the FIXED VA 0x400000 (PD[2]), which every per-proc CR3 overrides. A
+# syscall runs under the CALLER's CR3, so reaching the bitmap by its identity VA there reads the
+# caller's code instead of the bitmap. DIRECTMAP_BASE + phys lives in the kernel PDPT[8+] window that
+# every per-proc CR3 mirrors and NEVER overrides, so it resolves to the real bitmap under EVERY CR3.
+# The direct-map maps from phys 0 (pmm_setup_directmap's gb loop starts at 0), so a <=256 MB phys is
+# covered. After this, ALL bitmap helpers (pmm_set/clear/test, the 2 MB scan) are CR3-stable.
+fn pmm_bitmap_use_directmap() {
+    if (pmm_bitmap_phys == 0) { return 0; }              # never migrated -> static .bss bitmap, already safe
+    pmm_bitmap_ptr = DIRECTMAP_BASE + pmm_bitmap_phys;
+    return 0;
 }
 
 # 1.49.2 self-test (compile-gated via PMM_FULLRAM_SELFTEST) — prove the 4 KB allocator now serves the

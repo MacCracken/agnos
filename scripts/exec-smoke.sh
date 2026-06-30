@@ -75,7 +75,13 @@ mkfs.ext2 -F -q -L AGNOS-EXEC -b 4096 -m 0 \
 echo "Booting EXEC_SELFTEST kernel (NVMe + GPT ext2)..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
 LOG="$LOGS/exec-selftest.log"
-timeout "${QEMU_TIMEOUT:-30}" qemu-system-x86_64 \
+# QEMU_TIMEOUT default raised 30 -> 90 (1.50.9): under the RING3_SELFTEST profile the boot reaches the
+# `ring3: spawnpath OK` (#43) verdict only AFTER the scheduler selftest's preemption proc B counts to
+# 2^24 while time-sliced against A/P/SP/stress — that runs ~tens of seconds under QEMU's TCG, so 30 s
+# truncated QEMU mid-selftest and the gate FALSELY read as a spawnpath failure (no `ring3:` line ever
+# printed). This is a harness-timeout artifact, NOT a #43 fault. The EXEC-only profile (no ring3
+# selftest) finishes far sooner — pass a lower QEMU_TIMEOUT for it if you want a quicker run.
+timeout "${QEMU_TIMEOUT:-90}" qemu-system-x86_64 \
     -machine q35 -m 512M -cpu max \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
