@@ -5,6 +5,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.51.3] — 2026-07-01
+
+**▶ TCP connect/send latency floor removed (busy-poll before hlt).** Root-caused
+while benchmarking `hoosh` API-connect latency on agnos vs Linux (agnos was ~500×
+slower — the floor, not the code). The net wait loops (`tcp_connect` SYN-ACK wait,
+`tcp_send` per-chunk ACK wait) polled `net_poll(); arch_wait()`, and `arch_wait()`
+is `hlt`. With **no NIC RX interrupt yet** (RX is drained only by the 100 Hz timer
+ISR), `hlt` only woke on the timer — so every TCP round-trip was floored at ~one
+10 ms tick regardless of the real handshake speed (a SLIRP/loopback reply is
+sub-millisecond).
+
+### Fixed
+- **`net_tcp.cyr` — connect + send wait loops busy-poll before hlt.** They spin
+  `net_poll()` for the first `NET_BUSY_SPINS` (20000) iterations — catching a fast
+  reply in µs — then fall back to `arch_wait()` (hlt, timer-paced) for the tail, so
+  a live peer is fast and a lost/slow SYN still recovers via the B2 retransmits
+  without burning the CPU to the ~8 s deadline. The timer keeps ticking under IF=1,
+  so the deadline stays enforced during the spin. New `net_wait_backoff(spins)`.
+
+### Added
+- **`BASESTACK_SELFTEST` boot hook + `scripts/basestack-run-smoke.sh`** — the
+  "runs, not just builds" gate for the base security stack: stages a `--agnos`
+  binary at `/bin/probe`, boots it in ring 3, and asserts its output + clean exit +
+  no fault (deterministic, no agnsh keystrokes). Proved **hoosh** (14.9 MB ELF)
+  loads + runs + prints its version + exits cleanly on agnos.
+
+### Notes
+- The **proper** fix — **NIC RX interrupts** (virtio-net / r8169 raise an RX IRQ
+  that wakes `hlt` on packet arrival, making the timer HZ irrelevant to net latency)
+  — is queued for **1.51.4** with an iron burn. A 1000 Hz-timer stopgap was
+  considered and dropped: kernel-wide blast radius, wants iron validation, and the
+  NIC-IRQ fix obsoletes it.
+- recv-side polling lives in the cyrius userland (`_agnos_sock_recv_block`), not the
+  kernel — a separate follow-on if recv latency needs the same treatment.
+
 ## [1.51.2] — 2026-06-30
 
 **▶ Cyrius pin → 6.3.9 (symlink-feature coherence) + ark v2 M3 PROVEN on agnos.** 2026-06-30, on top of 1.51.1.

@@ -70,6 +70,21 @@ var TCP_RX_RING = 2048;
 var TCP_RETX_BUF = 1460;
 var TCP_RTO_BASE = 100;        # ticks (1 s at the 100 Hz timer)
 var TCP_RTO_RETRIES = 5;       # resends before declaring the conn dead
+
+# 1.51.3 — busy-poll budget before falling back to hlt in the TCP wait loops.
+# agnos has no NIC RX interrupt yet (that lands 1.51.4), so a bare arch_wait()=hlt
+# only wakes on the 100 Hz timer → every TCP round-trip was floored at ~one 10 ms
+# tick regardless of the real handshake speed (a SLIRP/loopback reply is sub-ms).
+# The connect/send loops now spin net_poll() for the first NET_BUSY_SPINS iterations
+# (catching a fast reply in µs) before hlt-pacing the tail — a live peer is fast, a
+# dead/slow peer still recovers via the B2 retransmits without burning the CPU to the
+# deadline (the timer keeps ticking under IF=1, so the deadline is still enforced
+# during the spin). Tuned for QEMU/SLIRP; revisit with the 1.51.4 NIC-IRQ work + bench.
+var NET_BUSY_SPINS = 20000;
+fn net_wait_backoff(spins) {
+    if (spins >= NET_BUSY_SPINS) { arch_wait(); }   # window spent → hlt (timer-paced)
+    return 0;
+}
 # MSS (B3): the value we advertise on our SYN/SYN-ACK (Ethernet MTU 1500 − IP
 # 20 − TCP 20). TCP_MSS_DEFAULT is the RFC 9293 fallback when a peer's SYN
 # omits the MSS option.
@@ -400,13 +415,15 @@ fn tcp_connect(dst_ip, dst_port, src_port) {
     store64(cb + 32, (isn + 1) & 0xFFFFFFFF);
     # Wait for SYN-ACK. Poll on a timer deadline (not a fixed iteration count)
     # so the B2 retransmits (1 s, 2 s, …) have time to recover a lost SYN.
-    var deadline = timer_ticks + 800;   # ~8 s
+    var deadline = timer_ticks + 800;   # ~8 s ceiling (retransmit budget)
+    var spins = 0;
     while (timer_ticks < deadline) {
         net_poll();
         var state = load64(cb);
         if (state == 2) { return conn_id; }
         if (state == 0) { return 0 - 1; }
-        arch_wait();
+        net_wait_backoff(spins);        # busy-poll the window, then hlt-pace
+        spins = spins + 1;
     }
     # Timeout
     store64(cb, 0);
@@ -433,11 +450,13 @@ fn tcp_send(conn_id, data, len) {
         tcp_arm_retx(cb, seq, 0x18, data + sent, chunk);
         sent = sent + chunk;
         var deadline = timer_ticks + 800;       # ~8 s ceiling per chunk
+        var spins = 0;
         while (timer_ticks < deadline) {
             net_poll();
             if (load64(cb + 128) == 0) { break; }   # retx disarmed = ACKed
             if (load64(cb) != 2) { break; }         # conn left ESTABLISHED
-            arch_wait();
+            net_wait_backoff(spins);                # busy-poll the window, then hlt-pace
+            spins = spins + 1;
         }
         if (load64(cb) != 2) { return sent; }       # closed/reset mid-send
     }
