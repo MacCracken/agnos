@@ -1,8 +1,6 @@
 # cyrius/AGNOS — no file-seek syscall: `patra` (→ libro → t-ron) fails to link on `--agnos`
 
-**Status**: Filed — **this one BLOCKS a downstream consumer's AGNOS target** (unlike
-the 2026-06-15 networking gaps, which fail-close cleanly). It is a **hard link error**,
-not a runtime fail-closed stub.
+**Status**: ✅ **RESOLVED — both sides shipped (closed 2026-06-30, archived).** The agnos kernel added **`lseek`#58** (`lseek(fd, offset, whence)`, whence 0=SET/1=CUR/2=END) at **1.45.13**, and the cyrius agnos peer now exposes **`SYS_LSEEK = 58` + `fn sys_lseek(fd, off, whence)`** in `lib/syscalls_x86_64_agnos.cyr`. So `patra`'s `syscall(SYS_LSEEK, fd, off, whence)` links + works on `--agnos` — the hard link error is gone. (Original status below: *Filed — BLOCKS a downstream consumer's AGNOS target; a hard link error, not a runtime fail-closed stub.*)
 **Date**: 2026-06-16
 **From**: thoth (the agentic-coding TUI) — reconfirmed on cyrius **6.2.15**.
 **AGNOS surface at filing**: 1.45.x — syscalls 0–42 (frozen base + 1.43.x graphics/

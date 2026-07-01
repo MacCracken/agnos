@@ -1,8 +1,6 @@
 # cyrius/AGNOS — agnos syscall peer omits signal-number constants (`SIGHUP`, …): `t-ron` fails to link on `--agnos`
 
-**Status**: Filed — **BLOCKS a downstream consumer's AGNOS target** (a hard link
-error, not a fail-closed runtime stub). The signal *infrastructure* exists; only the
-userland *number constants* are missing from the cyrius peer.
+**Status**: ✅ **RESOLVED — cyrius added the signal constants (closed 2026-06-30, archived).** `cyrius/lib/syscalls_x86_64_agnos.cyr` now defines the signal-number enum with the POSIX/Linux numbering the agnos kernel uses — `SIGHUP=1`, `SIGINT=2`, `SIGTERM=15`, `SIGCHLD=17`, … plus `SIG_BLOCK` and `SFD_NONBLOCK` (with a "agnos kernel uses POSIX/Linux numbering" comment confirming the values). So `sigset_add(mask, SIGHUP)` resolves on `--agnos` and t-ron/thoth's `--agnos` lane links — zero downstream change, exactly as predicted. (Original status below: *Filed — BLOCKS a downstream consumer's AGNOS target; the signal infrastructure exists, only the userland number constants are missing from the cyrius peer.*)
 **Date**: 2026-06-23
 **From**: thoth (the agentic-coding TUI) — found cross-verifying its `--agnos` lane on cyrius **6.2.37**.
 **Affects**: `cyrius/lib/syscalls_x86_64_agnos.cyr` (the cyrius stdlib's agnos syscall

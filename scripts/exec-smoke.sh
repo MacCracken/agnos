@@ -147,15 +147,15 @@ if strings "$LOG" | grep -q "^run: exit 81"; then
 else
     echo "  FAIL: no 'run: exit 81' (uname#34 / sysinfo#35 didn't write the expected struct bytes for the 256 MB PMM pool)"; rc=1
 fi
-# 1.42.12: klog#36 — /bin/klog is exec #4; it calls klog(buf, 200) and exits with
-# the byte count returned. The boot log is >> 200 B by now, so klog returns 200,
+# 1.42.12: klug#36 — /bin/klug is exec #4; it calls klug(buf, 200) and exits with
+# the byte count returned. The boot log is >> 200 B by now, so klug returns 200,
 # proving the syscall copied the requested tail of the unified klug ring into a
 # user buffer (bounds + count). The [I]/[W]/[E] level lines emitted just before
 # also confirm the leveled-log API is captured.
 if strings "$LOG" | grep -q "^run: exit 200"; then
-    echo "  PASS: klog#36 — /bin/klog copied 200 B of the unified klug ring to a user buffer (exit 200)"
+    echo "  PASS: klug#36 — /bin/klug copied 200 B of the unified klug ring to a user buffer (exit 200)"
 else
-    echo "  FAIL: no 'run: exit 200' (klog#36 didn't copy the requested ring bytes to userland)"; rc=1
+    echo "  FAIL: no 'run: exit 200' (klug#36 didn't copy the requested ring bytes to userland)"; rc=1
 fi
 # 1.43.x: execwait #37 — /bin/exwv is a RING-3 program that calls execwait(37) on
 # "/bin/argv Z" (a child WITH an argument) and exits with the returned code. Because

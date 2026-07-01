@@ -1,12 +1,6 @@
 # Cyrius PIE codegen has shipped — AGNOS `--pie` boot harness is the remaining gate for full KASLR (Option A)
 
-> **Status**: OPEN — **kernel-side harness ask** (filed agnos-side per the
-> cross-repo issue convention; **kernel agent please review**). The cyrius
-> compiler dependency that `proposals/2026-05-11-kaslr-scope.md` Option A was
-> blocked on is now **MET**; what remains is an agnos-side boot harness, which is
-> kernel-repo work. Cyrius will not ship the kernel-PIE wrapper blind — per
-> "never trust a checkmark over running it on hardware," it needs this harness to
-> validate.
+> **Status**: ✅ **RESOLVED — the harness was built + the kernel-PIE path boot-validated (closed 2026-06-30, archived).** The agnos-side boot harness this ask requested is **`scripts/kaslr-smoke.sh`**, and **full-binary KASLR (Option A) shipped + boot-tested at 1.47.3/1.47.4**: `CYRIUS_PIE=1` builds a relocation-free ET_DYN / RIP-relative kernel, gnoboot 0.6.0 picks an RDRAND-slid 2 MB-aligned base, and `kaslr-smoke.sh` proves a two-boot base-diff PASS with `exec-smoke` full-pass under PIE (boot-to-shell + exec-from-disk, e2fsck-clean, on a slid kernel). So the kernel-PIE wrapper is no longer "structurally validated but never booted" — it boots. (Original status below: *OPEN — kernel-side harness ask; the cyrius PIE dependency is MET, what remains is an agnos-side boot harness.*)
 > **Filed**: 2026-06-10 (cyrius deep-dive review, v6.1.31)
 > **Severity**: MEDIUM — unblocks full-binary KASLR (audit S7 / kaslr-scope
 > Option A); not MVP-gating (data-only KASLR shipped v1.28.0).

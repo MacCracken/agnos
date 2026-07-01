@@ -2,7 +2,7 @@
 #
 # Every byte that kprint/kputc/kprintln mirror to serial+fb (core/kprint.cyr)
 # is ALSO appended here, so the whole boot log + runtime kernel output lives in
-# one place. Userland reads it via the `klog` syscall (1.42.12) and greps it
+# one place. Userland reads it via the `klug` syscall (1.42.12) and greps it
 # with the existing toolchain (agnsh `grep`) — the kernel itself does NOT filter.
 # That's the sovereign split the name encodes: the kernel UNIFIES the logs; GREP
 # stays a userland capability, so no string-matching machinery enters the kernel.
@@ -49,16 +49,16 @@ fn klug_append(buf, len) {
 # `klug | grep '[E]'` shows only errors). [I] info / [W] warn / [E] err; terse
 # single-char tags keep the log dense. The API is the bite-2 deliverable —
 # adopt it gradually across the kernel, not in a mass conversion.
-fn klog_info(buf, len) { kprint("[I] ", 4); kprintln(buf, len); return 0; }
-fn klog_warn(buf, len) { kprint("[W] ", 4); kprintln(buf, len); return 0; }
-fn klog_err(buf, len)  { kprint("[E] ", 4); kprintln(buf, len); return 0; }
+fn klug_info(buf, len) { kprint("[I] ", 4); kprintln(buf, len); return 0; }
+fn klug_warn(buf, len) { kprint("[W] ", 4); kprintln(buf, len); return 0; }
+fn klug_err(buf, len)  { kprint("[E] ", 4); kprintln(buf, len); return 0; }
 
 # Validation (KLUG_SELFTEST): re-emit the captured ring between markers so a
 # smoke can confirm the boot log was unified into klug. Emits via serial_print/
 # fb_print DIRECTLY (not kprint), so the dump's own output is NOT re-captured
 # into the ring it is reading — that avoids a read-during-write on the snapshot.
 # Linear case (boot log << 16 KB, never wrapped) is the validated path; the
-# wrapped-ring unwrap (oldest→newest from klug_head) lands with the klog syscall
+# wrapped-ring unwrap (oldest→newest from klug_head) lands with the klug syscall
 # in 1.42.12. The call site is gated; this fn is DCE'd out of normal builds.
 fn klug_dump() {
     var begin = "KLUG-DUMP-BEGIN\n";

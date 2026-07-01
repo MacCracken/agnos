@@ -1238,7 +1238,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return 0;
     }
     if (num == 36) {
-        # klog(buf=arg1, len=arg2) — copy the unified klug log ring (core/klug.cyr)
+        # klug(buf=arg1, len=arg2) — copy the unified klug log ring (core/klug.cyr)
         # into the user buffer, OLDEST→NEWEST. Returns bytes written (≤ len, ≤ the
         # ring fill), or -1 on a bad buffer. When the buffer is smaller than the
         # log, returns the NEWEST `len` bytes (the dmesg tail). Linear fill: oldest

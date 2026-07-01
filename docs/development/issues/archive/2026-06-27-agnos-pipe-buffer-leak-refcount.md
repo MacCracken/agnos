@@ -1,6 +1,6 @@
 # agnos — pipe buffer leaked on close (`vfs_close` has no `VFS_PIPE` arm)
 
-**Status**: Filed (follow-on to the 1.46.x two-stage shell-pipe feature). Non-blocking for the MVP `iam | anuenue` case; a per-pipeline 4096-byte heap leak.
+**Status**: ✅ **RESOLVED at 1.47.0 (bite 2c) — closed 2026-06-30, archived.** `vfs_close` gained the `VFS_PIPE` arm with an **owner-keyed refcount (`pipe_rc_*`)**: each pipe buffer is owned by its creator, only the owner's two closes decrement, freed at 0 — killing the prior 4 KB-per-pipeline leak (a child closing an inherited copy is a no-op; the owner's reap also frees). Proven by the new `PIPE_RC_SELFTEST` (buffer frees on the owner's LAST close, heap-frees witness; double-close-safe) + `pipe-smoke` PASS. (Original status: *Filed (follow-on to the 1.46.x two-stage shell-pipe feature); a per-pipeline 4096-byte heap leak.*)
 
 ## Symptom
 `vfs_create_pipe` (`kernel/core/vfs.cyr:824`) `kmalloc(4096)`s **one** shared buffer for the pipe's read-end + write-end fds. `vfs_close_inner` (`vfs.cyr:942`) has arms for `VFS_EXT2_FILE` (flock release) and `VFS_SEC_WFILE` (flush), then `ktag_clear` — but **no `VFS_PIPE` arm**. So closing the rfd and wfd zeroes the two 32-byte fd-table slots and **never `kfree`s the 4096-byte pipe buffer**. Each `cmd1 | cmd2` pipeline leaks 4096 bytes.

@@ -165,7 +165,7 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
 | 33 | `stat` | path | pathlen | statbuf | — | 0 / -1 | fills `statbuf` (§4.1, ≥0x200000) with the agnos stat struct. **shell** (`ls -l`, type) |
 | 34 | `uname` | buf | len (≥64) | — | — | 0 / -1 | writes the 64-byte identity struct (§4.3) into `buf`: sysname/nodename/release/machine. Static boot-time identity. **mihi/iam** (1.42.10) |
 | 35 | `sysinfo` | buf | len (≥40) | — | — | 0 / -1 | writes the 40-byte counters struct (§4.4) into `buf`: uptime_secs / total+free RAM bytes / procs / cpus. Live snapshot; kernel does the unit conversion. **mihi/iam/chakshu** (1.42.10) |
-| 36 | `klog` | buf | len | — | — | bytes / -1 | copies the unified **klug** kernel-log ring (§4.5) into `buf`, oldest→newest; when `len` < the log fill, returns the **newest** `len` bytes (dmesg tail). Returns bytes written. **klug/dmesg tool** (1.42.12) |
+| 36 | `klug` | buf | len | — | — | bytes / -1 | copies the unified **klug** kernel-log ring (§4.5) into `buf`, oldest→newest; when `len` < the log fill, returns the **newest** `len` bytes (dmesg tail). Returns bytes written. **klug/dmesg tool** (1.42.12) |
 | 37 | `execwait` | path | pathlen | env blob (opt, 1.44.19) | env len (a4=r10) | child exit code / -1 | loads a static ELF64 from the ext2 root, runs it to completion **in ring 3**, returns the child's exit code. Synchronous `elf_load_from_file` + `exec_and_wait` (no preemption); the FIRST such exec from a live ring-3 syscall frame, so the handler preserves the caller's resume context (H1) + runs the child on a disjoint second SYSCALL kstack (H2). `execwait` passes only the program path (no caller-supplied argv); the kernel stages a uniform default envp (`HOME=/`, `PWD=/`) on every exec as of **1.43.2** — see §4.6. **agnsh `run`** (1.43.0) |
 | 38 | `fbinfo` | buf | len (≥24) | — | — | 0 / -1 | writes the 24-byte framebuffer geometry struct (width / height / pitch / bpp / fmt) into `buf`. The ring-3 query before a `blit`. **cyrius-doom / fbtest** (1.43.4) |
 | 39 | `blit` | src | w | h | dstxy `+`scale | 0 / -1 | copies a `w`×`h` block of 32bpp pixels from `src` (packed `w*4`/row) to the framebuffer at (dx,dy); `a4` = `(scale[39:32]<<32)\|(dy[31:16]<<16)\|dx[15:0]`. `scale` 0/1 = 1:1 (byte-identical), ≥2 = integer block scale via a 32 KB src-major rowbuf; dst rect clipped to FB. Memory-safety gate `w*scale ≤ 8192`; `scale > 16` rejects. THE ring-3 FB path (`fb_phys` stays unexposed). **cyrius-doom** (1.43.4; scale 1.44.20) |
@@ -261,14 +261,14 @@ Written by syscall 35. The kernel does the unit conversion (ticks→seconds at 1
 
 All-u64 (no sub-word fields → no Cyrius struct-padding ambiguity, same rule §4.1 follows). No Linux `mem_unit` scaling field (AGNOS uses fixed u64 byte counts — no 32-bit overflow), no `_f[]` padding, and no swap/buffer/highmem fields (AGNOS has none — omitted). Future fields append at the tail and bump the minimum `len`; the existing offsets are frozen ABI the moment a consumer reads them.
 
-### 4.5 `klog` read (syscall 36 — variable-length log copy, not a struct)
+### 4.5 `klug` read (syscall 36 — variable-length log copy, not a struct)
 
-`klog(buf, len)` copies the unified **klug** kernel-log ring (`core/klug.cyr`, a 16 KB circular byte buffer fed by every `kprint`/`kputc`/`kprintln`) into the user `buf`, **oldest→newest** (chronological). It is not a fixed struct — it returns raw log text and the byte count:
+`klug(buf, len)` copies the unified **klug** kernel-log ring (`core/klug.cyr`, a 16 KB circular byte buffer fed by every `kprint`/`kputc`/`kprintln`) into the user `buf`, **oldest→newest** (chronological). It is not a fixed struct — it returns raw log text and the byte count:
 
 - Returns `min(len, ring_fill)` — the number of bytes written — or `-1` if `is_user_range(buf, len)` fails.
 - When `len` < the current ring fill, returns the **newest** `len` bytes (the dmesg tail) so a small buffer still shows the most recent lines.
 - The ring wraps at 16 KB (old lines age out); the kernel unwraps oldest→newest so the userland reader always sees chronological order regardless of the wrap point.
-- Leveled lines carry an `[I]`/`[W]`/`[E]` prefix (from `klog_info`/`klog_warn`/`klog_err`) — the userland `klug`/`dmesg` tool greps on that prefix (the kernel does **no** filtering: it unifies the log; grep stays userland).
+- Leveled lines carry an `[I]`/`[W]`/`[E]` prefix (from `klug_info`/`klug_warn`/`klug_err`) — the userland `klug`/`dmesg` tool greps on that prefix (the kernel does **no** filtering: it unifies the log; grep stays userland).
 
 ### 4.6 exec init stack — argv + envp (1.43.2)
 

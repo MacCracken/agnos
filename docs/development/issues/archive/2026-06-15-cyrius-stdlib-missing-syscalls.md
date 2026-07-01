@@ -1,6 +1,8 @@
 # cyrius stdlib — missing AGNOS syscalls surfaced by the 6.2.7 agnos-completeness pass
 
-**Status**: Filed (informational / kernel-gap tracking) — **nothing here blocks AGNOS today**.
+**Status**: ✅ **RESOLVED / ARCHIVED 2026-06-30 — nothing here is an open agnos item.** This is a *cyrius-side* tracker: every gap it enumerates was already carried on the cyrius side by the 6.2.7 completeness pass (peer-split / `#ifdef CYRIUS_TARGET_AGNOS` guard / portable `sys_*` wrappers — all fail-closed), the one high-value ask (**fd-redirect**) landed as **`exec_redirect`#62** (1.46.x, §1 update below), and the rest are **out-of-scope by design** (no `fork` in the cooperative single-CR3 model) or informational. Per the standing rule — cyrius-side gaps get *surfaced to cyrius* and don't linger as agnos "open" items — there is no agnos-side action here, so it's archived. Original informational body preserved below.
+
+**Status (original)**: Filed (informational / kernel-gap tracking) — **nothing here blocks AGNOS today**.
 **Update 2026-06-18**: the inbound-TCP-server premise in §2 ("only if inbound-TCP server
 (Phase B) lands") is now **superseded** — the kernel landed `sock_listen#56`/`sock_accept#57`
 (agnos 1.45.5/.6) and inbound TCP IS now wanted (the closed-beta founder server-sweep).

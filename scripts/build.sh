@@ -170,6 +170,7 @@ else
         [ -n "$SYMLINK_SELFTEST" ]   && echo '#define SYMLINK_SELFTEST'
         [ -n "$ARK_SELFTEST" ]       && echo '#define ARK_SELFTEST'
         [ -n "$ARK_INSTALL_SELFTEST" ] && echo '#define ARK_INSTALL_SELFTEST'
+        [ -n "$BASESTACK_SELFTEST" ] && echo '#define BASESTACK_SELFTEST'
         [ -n "$FAULT_SELFTEST" ]     && echo '#define FAULT_SELFTEST'
         [ -n "$PIPE_RC_SELFTEST" ]   && echo '#define PIPE_RC_SELFTEST'
         [ -n "$DOOM_SELFTEST" ]      && echo '#define DOOM_SELFTEST'
