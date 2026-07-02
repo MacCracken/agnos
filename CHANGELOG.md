@@ -33,6 +33,14 @@ passed an adversarial pre-burn review.
   by writing back the read snapshot, so the chip re-arms and can post the next edge
   MSI. Guarded on `r8169_present` + `r8169_mmio_base` → a strict no-op on the
   QEMU/virtio path (no bogus MMIO read).
+- **RX-IRQ-LIVE one-shot latch** (`pic.cyr` `nic_rx_irq_seen` set in `nic_rx_handler`;
+  printed once from `net_poll` in `net_ingress.cyr`): the ISR sets a single-word flag on
+  its first delivery (no print in interrupt context); `net_poll` prints `r8169: RX MSI
+  LIVE …` (or `virtio-net: RX MSI-X LIVE …`) exactly once. **Dispositive proof the RX
+  interrupt actually FIRES on silicon** — QEMU can't run the r8169 MSI path, and both the
+  busy-poll and the timer-tick drain would otherwise mask a dead MSI (working-net ≠
+  MSI-fired). Permanent product log line (the always-on `pmm: bitmap-dm OK` guard is the
+  precedent), not throwaway burn instrumentation.
 
 ### Changed
 - **`r8169_init_tx` step 12** (`r8169.cyr`): was pure-poll (`IMR = 0`). Now drains

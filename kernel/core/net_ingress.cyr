@@ -215,6 +215,21 @@ fn net_demux_frame(pkt, pkt_len) {
 }
 
 fn net_poll() {
+    # 1.51.6 — flush the one-shot RX-IRQ-LIVE latch from NON-ISR context. nic_rx_handler
+    # (the vector-0x50 ISR) sets nic_rx_irq_seen on the first MSI/MSI-X delivery; we print
+    # the dispositive LIVE line here exactly once (a print in the ISR itself is unsafe). On
+    # iron this is the proof the r8169 MSI fired on real silicon; on QEMU it confirms the
+    # virtio-net MSI-X. r8169_present picks the accurate device name.
+    if (nic_rx_irq_seen != 0) {
+        if (nic_rx_irq_printed == 0) {
+            nic_rx_irq_printed = 1;
+            if (r8169_present != 0) {
+                kprintln("r8169: RX MSI LIVE (first hardware IRQ serviced, vector 0x50)", 61);
+            } else {
+                kprintln("virtio-net: RX MSI-X LIVE (first IRQ serviced, vector 0x50)", 59);
+            }
+        }
+    }
     # 1.49.0 loopback bite 1: drain the loopback queue even with no physical NIC up (lo works
     # without any wire). net_lo_drain processes frames net_tx enqueued for 127.x / our own net_ip.
     if (nic_ready() == 0) { return net_lo_drain(); }

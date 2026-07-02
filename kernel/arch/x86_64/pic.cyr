@@ -148,6 +148,17 @@ fn timer_isr_build() {
     return 0;
 }
 
+# 1.51.6 — one-shot RX-interrupt "LIVE" latch. The vector-0x50 ISR (nic_rx_handler)
+# sets nic_rx_irq_seen on its FIRST delivery — a safe single-word write; NO print in
+# interrupt context. net_poll() (non-ISR) prints the LIVE line exactly once. This is the
+# DISPOSITIVE proof the NIC RX MSI/MSI-X actually FIRES on silicon: on iron the r8169 MSI
+# path never runs in QEMU (virtio there), and both the 1.51.3 busy-poll and the 100 Hz
+# timer-tick drain would otherwise mask a dead MSI (working-net ≠ MSI-fired). It's a
+# permanent product log line (the always-on `pmm: bitmap-dm OK` guard is the precedent),
+# not throwaway burn instrumentation.
+var nic_rx_irq_seen = 0;
+var nic_rx_irq_printed = 0;
+
 # 1.51.5 — NIC RX MSI-X interrupt handler. Same body the 100 Hz timer tick runs
 # (net_rx_drain), but triggered by the NIC on packet arrival so a blocked hlt wakes
 # immediately instead of on the next tick — the proper fix for the tick-paced net
@@ -163,6 +174,7 @@ fn nic_rx_handler() {
     # so the virtio-net MSI-X path is untouched (its used/avail ring self-re-arms).
     r8169_irq_ack();
     net_rx_drain();
+    nic_rx_irq_seen = 1;   # latch — this ISR only runs on a real MSI/MSI-X delivery; printed once from net_poll (non-ISR)
     apic_eoi();
     return 0;
 }

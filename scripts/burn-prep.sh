@@ -1,15 +1,16 @@
 #!/bin/bash
 # burn-prep.sh — one command to stage the CURRENT kernel for an archaemenid
 # iron burn (version-agnostic; the live burn target is whatever's open in
-# state.md + the iron-nuc-zen-log tracker — currently the 1.44.x preemptive-
-# scheduling arc, SMP-AP wake the riskiest item). It:
+# state.md + the iron-nuc-zen-log tracker — read the NEWEST #tracker-*-cycle
+# for the hypothesis + rubric, never a cycle name hardcoded here). It:
 #   1. runs the full arc sweep (scripts/sweep.sh) — ALL gates must be green;
 #      a red sweep aborts the prep (don't burn a broken tree);
 #   2. builds build/agnos — the artifact you flash. DEFAULT is a BARE production
 #      kernel (no compile-gated selftests). Set BURN_SELFTESTS=1 to bake the
 #      EXEC_SELFTEST + EXT2_WRITE_SELFTEST validation suites back in;
-#   3. prints freshness (size + mtime) and the exact flash + watch steps,
-#      pointing at docs/development/exec-iron-manual-tests.md (in agnosticos).
+#   3. prints freshness (size + mtime) and the flash command, pointing at the
+#      OPEN cycle's tracker in agnosticos/docs/development/iron-nuc-zen-log.md
+#      for the watch rubric (kept OUT of this script so it can't rot).
 #
 # Track B (FAT/exFAT verb burn) uses SEPARATE selftest kernels — this script
 # prints the build lines for them but leaves build/agnos as the track-A kernel
@@ -73,7 +74,7 @@ echo "=========================================="
 echo "  IRON KERNEL READY — bare production AGNOS"
 echo "=========================================="
 echo ""
-echo "  Flash (from agnosticos):  sh scripts/install-usb.sh --update"
+echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update"
 echo "    (--update is ESP-only — the agnos-fs partition survives, per"
 echo "     feedback_prefer_mount_modify_over_reflash)"
 echo ""
@@ -82,12 +83,8 @@ echo "  OPEN cycle's tracker — read it before flashing, NOT a hardcoded list h
 echo "  would rot, per feedback_script_preambles_are_forward_looking). Source of truth:"
 echo "    agnosticos/docs/development/iron-nuc-zen-log.md  (newest #tracker-*-cycle)"
 echo ""
-echo "  Current open cycle (1.44.x preemptive-scheduling) — watch the FB console for:"
-echo "    smp: cpus online: N     (BSP + woken APs — the SMP-AP wake, the RISKIEST item)"
-echo "    -> clean boot through 'Activating scheduler' to the agnsh '[ASSIST] >' prompt"
-echo "  Dispositive: APs counted in + a typeable agnsh prompt on real Zen (no hang/reset)."
-echo "    (1.44.21 made the wake fail-safe — a stuck IPI bounds-out instead of hanging.)"
-echo "  Re-gate fallback if the wake hangs INSIDE the trampoline: comment the INIT-SIPI"
-echo "  loop in smp_start_aps (one line; everything else is inert without it)."
+echo "  Baseline (cycle-agnostic): a clean boot to the agnsh '[ASSIST] >' prompt on real"
+echo "  Zen, keyboard live, no hang / reset / canary bar. The OPEN cycle's tracker adds"
+echo "  the dispositive FB line + falsification branches for THIS burn — read it (above)."
 echo "=========================================="
 exit 0
