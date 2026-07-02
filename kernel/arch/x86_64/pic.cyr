@@ -157,6 +157,11 @@ fn timer_isr_build() {
 # exactly as the timer ISR's drain already does). nic_ready() gates net_rx_drain to
 # a no-op before the NIC is up. LAPIC-EOI (MSI-X delivers via the LAPIC).
 fn nic_rx_handler() {
+    # r8169 (iron) needs a device-side W1C ISR ack BEFORE the drain so the chip
+    # re-arms and can post the next edge MSI — ack-then-drain (1.51.6). No-op when
+    # r8169 is absent (QEMU/virtio: r8169_present==0 → returns immediately, no MMIO),
+    # so the virtio-net MSI-X path is untouched (its used/avail ring self-re-arms).
+    r8169_irq_ack();
     net_rx_drain();
     apic_eoi();
     return 0;

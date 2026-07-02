@@ -256,6 +256,60 @@ fn pci_enable_msix_unmasked(idx) {
     return 0;
 }
 
+# Program the device's legacy-MSI capability (PCI cap 0x05) to deliver a single
+# message to IDT `vector` on the BSP LAPIC, then enable MSI. Unlike the MSI
+# fallback inside pci_enable_msix_{masked,unmasked} — which only flips the Enable
+# bit and NEVER programs the message address/data, so the interrupt is enabled but
+# unrouted — this writes the message address + data so the interrupt actually
+# reaches `vector`. Used by the r8169 RX-interrupt path (1.51.6): the chip has no
+# MSI-X table we populate the way virtio does, so route its single RX message here.
+#
+# MSI cap layout (PCI 3.0 §6.8.1), config-space dword view:
+#   cap+0x00: [cap_id:8=0x05][next:8][Message Control:16]  — Control = dword bits 31:16
+#     Control bit 0  (dword bit 16) = MSI Enable
+#     Control bits 6:4 (dword bits 22:20) = Multiple Message Enable (force 0 = 1 vector)
+#     Control bit 7  (dword bit 23) = 64-bit Address Capable
+#   cap+0x04: Message Address Lo (0xFEE00000 = LAPIC, BSP APIC ID 0, physical fixed)
+#   64-bit: cap+0x08 = Message Address Hi (0), cap+0x0C = Message Data (16-bit)
+#   32-bit: cap+0x08 = Message Data (16-bit)
+# Message Data = vector for a Fixed/edge message (DM=000, TM=0) — e.g. 0x50, matching
+# the virtio-net MSI-X wiring verbatim so the same IDT gate + stub are reused.
+#
+# Bus Master (Command bit 2) MUST already be set (an MSI IS a memory write) — the
+# r8169 probe calls pci_enable_bus_master_idx first. INTx-Disable (Command bit 10)
+# is NOT required: setting MSI Enable makes the function stop asserting INTx (they
+# are mutually exclusive). Config-space writes go through CF8/CFC (non-posted), so
+# no UC readback flush is needed (unlike the MSI-X BAR table writes). Enable is set
+# LAST so address/data are valid before the device can post its first message.
+#
+# Returns 1 if MSI was programmed, 0 if the device advertises no MSI capability
+# (caller then relies on the timer-tick drain — never worse than the tick floor).
+fn pci_enable_msi_vector(idx, vector) {
+    var slot = PciDev_slot(&pci_devs + idx * 32);
+    var bf = load64(&pci_busfunc + idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    var off = pci_find_cap(idx, 0x05);
+    if (off == 0) { return 0; }
+
+    var hdr = pci_read32(bus, slot, func, off);
+    var is64 = hdr & 0x00800000;                          # Control bit 7 → 64-bit capable
+
+    pci_write32(bus, slot, func, off + 0x04, 0xFEE00000); # Message Address Lo
+    if (is64 != 0) {
+        pci_write32(bus, slot, func, off + 0x08, 0);              # Address Hi = 0
+        pci_write32(bus, slot, func, off + 0x0C, vector & 0xFFFF); # Data at 0x0C (64-bit layout)
+    } else {
+        pci_write32(bus, slot, func, off + 0x08, vector & 0xFFFF); # Data at 0x08 (32-bit layout)
+    }
+
+    # Enable LAST: clear MME (dword bits 22:20 → 1 vector) and set MSI Enable
+    # (dword bit 16). ~0x00700000 = 0xFF8FFFFF; then OR 0x00010000.
+    var newhdr = (hdr & 0xFF8FFFFF) | 0x00010000;
+    pci_write32(bus, slot, func, off, newhdr);
+    return 1;
+}
+
 # Capture one (bus, slot, func) device into pci_devs[pci_count].
 # Returns 1 if a real device was recorded, 0 if absent or table full.
 # Factored out of pci_scan() so the multi-bus / multifunction loop reads

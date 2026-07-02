@@ -5,6 +5,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.51.6] — 2026-07-01
+
+**▶ r8169 RX interrupt (MSI) — the iron half of the net-latency fix.** The RTL8168H
+NIC on archaemenid now routes its RX interrupt to the SAME IDT vector 0x50 the
+virtio-net path uses (1.51.5), via legacy MSI (PCI cap 0x05, single vector,
+message-addr `0xFEE00000` / data `0x50`). So a blocked `hlt` on iron wakes on packet
+arrival instead of the next 100 Hz tick — completing the tick-paced net-latency fix
+that 1.51.5 delivered for QEMU/virtio. **Strictly additive**: if the MSI never posts,
+the timer-tick whole-ring drain still pulls RX exactly as before — this can never
+cause an RX outage, only at worst leave latency at the pre-existing tick floor.
+
+**Iron-pending.** QEMU presents virtio, not r8169, so this MSI path is unexercised in
+QEMU and awaits validation on an archaemenid burn. The change was derived from
+multi-source convergent prior art (Linux r8169 `IntrStatus`/`IntrMask` bits, FreeBSD
+`if_rlreg.h`, PCI 3.0 §6.8.1 MSI cap, Intel SDM Vol.3 §10.11 message format) and
+passed an adversarial pre-burn review.
+
+### Added
+- **`pci_enable_msi_vector(idx, vector)`** (`pci.cyr`): programs a device's legacy-MSI
+  capability (message address `0xFEE00000` = BSP LAPIC physical/fixed, message data =
+  vector) and enables MSI with Multiple-Message-Enable = 0. 32/64-bit-address-aware
+  (r8169 is 64-bit-capable → Data at cap+0x0C, Addr-Hi = 0 at cap+0x08). Unlike the
+  MSI *fallback* inside `pci_enable_msix_*` (which only flips the Enable bit and never
+  routes), this actually programs the message so the interrupt reaches the vector.
+- **`r8169_irq_ack()`** (`r8169.cyr`): W1C-acknowledges the 16-bit `IntrStatus` (0x3E)
+  by writing back the read snapshot, so the chip re-arms and can post the next edge
+  MSI. Guarded on `r8169_present` + `r8169_mmio_base` → a strict no-op on the
+  QEMU/virtio path (no bogus MMIO read).
+
+### Changed
+- **`r8169_init_tx` step 12** (`r8169.cyr`): was pure-poll (`IMR = 0`). Now drains
+  stale `IntrStatus`, sets `IMR = RxOK|RxErr` (`R8169_IMR_RXWAKE` = 0x0003), and calls
+  `pci_enable_msi_vector(pci_idx, 0x50)`. `RxDescUnavail`/`RxFIFOOver` are
+  **deliberately excluded** from the mask — they don't self-clear on W1C until the
+  drain relieves the ring/FIFO condition, so masking them into an ack-before-drain
+  edge handler would storm on exactly the burst-overflow case; overflow recovery stays
+  with the proven timer-tick drain.
+- **`nic_rx_handler`** (`pic.cyr`): now calls `r8169_irq_ack()` before `net_rx_drain()`
+  — **ack-then-drain**, so a frame arriving after the ISR read re-latches `RxOK` and
+  re-posts a fresh MSI (no lost frame). No-op on the virtio path (r8169 absent).
+
+### Verified
+- **QEMU (virtio, no regression):** connect bench 2000/2000 at **~1.21 ms/connect**
+  (vs 1.51.5's 1.205 ms — within noise), full DHCP DISCOVER→ACK, confirming the shared
+  `nic_rx_handler` change is a clean no-op on the virtio RX MSI-X path. loopback-smoke
+  5/5. Release kernel builds clean.
+- **Iron (r8169 MSI path):** PENDING — archaemenid burn to confirm the MSI actually
+  fires and RX latency drops below the tick floor on hardware.
+
 ## [1.51.5] — 2026-07-01
 
 **▶ virtio-net RX interrupt (MSI-X) — the proper net-latency fix.** The NIC now

@@ -107,6 +107,28 @@ var R8169_MISC_RXDV_GATED   = 0x00080000;
 # TPPoll (byte at 0x38) — NPQ = normal-priority-queue kick.
 var R8169_TPPOLL_NPQ        = 0x40;
 
+# === Interrupt bits (16-bit IntrStatus @ ISR 0x3E / IntrMask @ IMR 0x3C) =======
+#
+# Linux r8169 IntrStatus #defines (RxOK/RxErr/RxDescUnavail/RxFIFOOver…) +
+# FreeBSD RL_ISR_* — identical layout for INTx and MSI (only the DELIVERY
+# mechanism differs). 1.51.6 wakes a blocked hlt on RX by routing these to MSI.
+var R8169_INTR_ROK          = 0x0001;   # RxOK — a good frame reached a host-owned descriptor
+var R8169_INTR_RER          = 0x0002;   # RxErr — CRC/runt/align (drain skips + re-arms; W1C clean)
+var R8169_INTR_RDU          = 0x0010;   # RxDescUnavail / RX overflow — condition-latched (see below)
+var R8169_INTR_FOVW         = 0x0040;   # RxFIFOOver — condition-latched (see below)
+#
+# MSI RX-wake mask = ROK | RER ONLY. RDU (0x10) and FOVW (0x40) are DELIBERATELY
+# EXCLUDED: they do NOT self-clear on W1C until the drain relieves the ring-full /
+# FIFO-overflow condition, so masking them into an edge-MSI handler that acks
+# BEFORE draining would re-post a fresh MSI the instant the drain frees a
+# descriptor — an interrupt storm on exactly the burst-overflow case. Overflow
+# recovery stays with the proven 100 Hz timer-tick whole-ring drain (net_rx_drain
+# pulls the entire ring every tick). ROK/RER are per-frame-latched and W1C
+# cleanly, so ack-then-drain is storm-free for this set. (Adversarial-review
+# derived, 2026-07-01; if iron shows overflow dead-stall, the fix is a CR.RE
+# off/on bounce in an FOVW branch, NOT masking FOVW into this handler.)
+var R8169_IMR_RXWAKE        = 0x0003;   # ROK | RER
+
 # PHY access (PHYAR dword at 0x60).
 var R8169_PHYAR_FLAG        = 0x80000000;
 var R8169_PHYAR_REG_SHIFT   = 16;
@@ -762,12 +784,35 @@ fn r8169_init_tx() {
     r8169_read32(R8169_REG_IDR0);                    # rtl_pci_commit — flush posted write
     r8169_cfg_lock();
 
-    # --- 12. Mask all interrupts (pure-poll mode) -----------------
+    # --- 12. RX interrupt enable (MSI → IDT vector 0x50) — 1.51.6 --
     #
-    # We don't service IRQs from this driver. iPXE leaves IMR=0 in
-    # its PXE/poll environment; we do the same on archaemenid.
-    r8169_write16(R8169_REG_IMR, 0);
-    r8169_write16(R8169_REG_ISR, 0xFFFF);                  # W1C — drain stale bits
+    # Was pure-poll (IMR=0, iPXE PXE-environment style). Now route the chip's RX
+    # interrupt to the SAME IDT vector 0x50 the virtio-net path uses (agnos 1.51.5):
+    # legacy MSI (PCI cap 0x05, single vector, message-addr 0xFEE00000 / data 0x50)
+    # posts to the BSP LAPIC → nic_rx_handler, which r8169_irq_ack's this ISR then
+    # drains the ring. So a blocked hlt wakes on packet arrival instead of the next
+    # 100 Hz tick — the IRON half of the tick-paced net-latency fix (virtio-net was
+    # the QEMU half; see [[project_agnos_net_latency_tick_paced]]).
+    #
+    # Ordering (adversarial-review derived 2026-07-01): drain stale ISR → set IMR to
+    # the RX-wake bits → enable MSI LAST (message addr/data are programmed before the
+    # Enable bit inside pci_enable_msi_vector). IMR = ROK|RER only (R8169_IMR_RXWAKE);
+    # RDU/FOVW are left to the timer-tick drain — see the R8169_IMR_RXWAKE note
+    # (they'd storm an ack-before-drain edge handler).
+    #
+    # STRICTLY ADDITIVE / never worse than the tick floor: if the MSI never posts
+    # (mis-programmed, or the chip advertises no MSI cap) the 100 Hz timer-tick
+    # whole-ring drain still pulls RX exactly as before 1.51.6 — this can never
+    # cause an RX outage, only at worst leave latency at the pre-existing ~10 ms
+    # tick floor. VALIDATION PENDING IRON: QEMU exercises virtio, not r8169, so this
+    # MSI path is unproven until the archaemenid burn confirms the message fires.
+    r8169_write16(R8169_REG_ISR, 0xFFFF);               # drain stale bits (one-shot 0xFFFF is fine here)
+    r8169_write16(R8169_REG_IMR, R8169_IMR_RXWAKE);     # unmask ROK|RER
+    if (pci_enable_msi_vector(r8169_pci_idx, 0x50) == 0) {
+        kprintln("r8169: no MSI cap — RX stays timer-tick-drained", 47);
+    } else {
+        kprintln("r8169: RX MSI armed -> IDT vector 0x50", 37);
+    }
 
     r8169_tx_idx = 0;
     kprintln("r8169: TX ring up (16 desc × 2KB buf)", 36);
@@ -954,6 +999,28 @@ fn r8169_print_stats() {
     kprint_num(load32(sb + 0x38));
     kprintln("", 0);
     return 0;
+}
+
+# === RX interrupt acknowledge (1.51.6) =========================================
+#
+# W1C-acknowledge the 16-bit IntrStatus (0x3E) so the chip can post the NEXT edge
+# MSI. Called from the SHARED vector-0x50 handler (pic.cyr nic_rx_handler) BEFORE
+# net_rx_drain — ack-then-drain. Reads the ISR snapshot and writes exactly that
+# snapshot back, clearing only the bits seen: a frame arriving AFTER the read
+# re-sets ROK and stays latched, so the chip posts a FRESH MSI and the handler
+# runs again — no lost frame. Do NOT write 0xFFFF here (it would clobber a
+# mid-read ROK); 0xFFFF is only for the one-shot stale-drain in r8169_init_tx.
+#
+# Guarded on r8169_present AND r8169_mmio_base so the QEMU/virtio path (r8169
+# absent, mmio_base 0) does NO bogus MMIO read — nic_rx_handler calls this
+# unconditionally and it no-ops there. On archaemenid virtio is absent, so this
+# IS the RX interrupt ack. Returns the acked ISR snapshot (0 if r8169 absent).
+fn r8169_irq_ack() {
+    if (r8169_present == 0) { return 0; }
+    if (r8169_mmio_base == 0) { return 0; }
+    var s = r8169_read16(R8169_REG_ISR);
+    r8169_write16(R8169_REG_ISR, s);   # W1C the snapshot — clears only the bits we saw
+    return s;
 }
 
 # === NIC backend dispatcher ====================================================
