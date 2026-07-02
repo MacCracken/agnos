@@ -85,6 +85,13 @@ fn net_wait_backoff(spins) {
     if (spins >= NET_BUSY_SPINS) { arch_wait(); }   # window spent → hlt (timer-paced)
     return 0;
 }
+
+# 1.51.4 — per-connect ephemeral source-port counter (see the sock_connect#47 handler
+# in syscall.cyr). Incremented on each auto-assigned client connect so rapid
+# reconnects don't reuse the same port within a 100 Hz tick — which, once the 1.51.3
+# busy-poll fix made connects sub-ms, collided on a 4-tuple still in the peer's
+# TIME_WAIT (dropped SYN → 8 s timeout, ~half of rapid reconnects failing).
+var tcp_ephemeral_ctr = 0;
 # MSS (B3): the value we advertise on our SYN/SYN-ACK (Ethernet MTU 1500 − IP
 # 20 − TCP 20). TCP_MSS_DEFAULT is the RFC 9293 fallback when a peer's SYN
 # omits the MSS option.

@@ -5,6 +5,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.51.4] — 2026-07-01
+
+**▶ Rapid-reconnect connect failures fixed (per-connect ephemeral source port).**
+Surfaced by the 1.51.3 busy-poll fix: with connects now sub-millisecond, a
+back-to-back connect→close→connect benchmark saw ~half the attempts stall the full
+~8 s `tcp_connect` deadline. Root cause: `sock_connect`#47 derived the auto-assigned
+ephemeral source port from `timer_ticks` (`49152 + (timer_ticks & 0x3FFF)`), which
+only changes every 10 ms at 100 Hz — so multiple sub-ms connects within one tick got
+the **same** source port → the 4-tuple was still in the peer's TIME_WAIT → the SYN was
+dropped → 8 s timeout. (Pre-1.51.3 this never showed: each connect took ~a full tick,
+so consecutive connects fell on different ticks / different ports.)
+
+### Fixed
+- **`syscall.cyr` #47 + `net_tcp.cyr`**: auto-assigned ephemeral ports now come from a
+  per-connect counter (`tcp_ephemeral_ctr`, seeded by `timer_ticks`) instead of the
+  timer alone, so each rapid reconnect uses a fresh port. `(ctr + timer_ticks)` is
+  strictly increasing → no collision until the 14-bit range wraps (16384 connects —
+  the ephemeral ceiling, as on any host). A caller-supplied `src_port` is unchanged.
+
+### Verified
+- **hoosh connect bench through virtio-net + SLIRP: `N=2000 ok=2000`, avg ≈ 1.13 ms/
+  connect** (was `ok=5/10`, ~4 s avg from the 8 s stalls). The two net fixes compound:
+  1.51.3 removed the ~10 ms tick floor (successful connects → sub-ms), 1.51.4 made
+  rapid reconnects reliable. Linux native on the same path is ~38 µs; the ~30× gap is
+  QEMU's user-mode (SLIRP) TCP stack, not the agnos stack. New `scripts/
+  bench-connect-smoke.sh` + hoosh's `bench` command.
+
+### Notes
+- The proper NIC RX-interrupt fix (wakes `hlt` on packet arrival, making the timer HZ
+  irrelevant to net latency) moves to a later patch + iron burn.
+
 ## [1.51.3] — 2026-07-01
 
 **▶ TCP connect/send latency floor removed (busy-poll before hlt).** Root-caused

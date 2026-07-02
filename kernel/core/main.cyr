@@ -1973,6 +1973,33 @@ fn basestack_run_selftest() {
 basestack_run_selftest();
 #endif
 
+#ifdef BENCH_CONNECT_SELFTEST
+# Connect-latency benchmark probe (compile-gated): run hoosh's `bench` connect loop
+# against the SLIRP host gateway (10.0.2.2) so agnos connect latency (post-1.51.3
+# busy-poll) is measurable vs Linux native. Needs QEMU virtio-net + a host listener
+# on :18085 (scripts/bench-connect-smoke.sh); DHCP is up by here (net init runs
+# earlier in boot). Prints "bench: … avg=Nus/connect" to serial.
+fn bench_connect_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    # Read the command from /etc/probe-cmd (staged by bench-connect-smoke.sh) so the
+    # target IP / connect count can vary without a kernel rebuild. Strip trailing NL/CR.
+    var cmdbuf[128];    # function-local → 128 bytes on the stack (var-bomb aware)
+    var n = vfs_read_file("/etc/probe-cmd", 14, &cmdbuf, 127);
+    if (n <= 0) { kprintln("bench: no /etc/probe-cmd", 24); return 0; }
+    while (n > 0) {
+        var c = load8(&cmdbuf + n - 1);
+        if (c == 10 || c == 13 || c == 0) { n = n - 1; } else { break; }
+    }
+    store8(&cmdbuf + n, 0);
+    kprintln("exec: running probe-cmd", 23);
+    sh_exec(&cmdbuf, n);
+    kprintln("exec: bench selftest done", 25);
+    return 0;
+}
+bench_connect_selftest();
+#endif
+
 #ifdef FAULT_SELFTEST
 # 1.47.x — proc-teardown-on-fault self-test (compile-gated, FAULT_SELFTEST=1). Builds a
 # minimal static ELF64 whose entry READS an unmapped 5 GB address (movabs rdi,0x140000000;

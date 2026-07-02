@@ -1847,8 +1847,19 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg2 <= 0) { stack_canary_check(canary); return 0 - 1; }      # dst_port low
         if (arg2 > 65535) { stack_canary_check(canary); return 0 - 1; }   # dst_port high
         var sc_sport = arg3;
-        if (sc_sport <= 0) { sc_sport = 49152 + (timer_ticks & 0x3FFF); }
-        if (sc_sport > 65535) { sc_sport = 49152 + (timer_ticks & 0x3FFF); }
+        # src_port<=0/out-of-range → auto-assign a UNIQUE ephemeral port PER CONNECT.
+        # 1.51.4: the old `49152 + (timer_ticks & 0x3FFF)` only varied per 100 Hz tick;
+        # once the 1.51.3 busy-poll fix made connects sub-ms, many complete within one
+        # tick and got the SAME port → the 4-tuple was still in the peer's TIME_WAIT →
+        # dropped SYN → 8 s timeout (intermittent rapid-reconnect failures). A per-connect
+        # counter (seeded by timer_ticks so it doesn't always start the same) gives each
+        # rapid reconnect a fresh port; (ctr + timer_ticks) is strictly increasing, so no
+        # collision until the 14-bit range wraps (16384 connects — the ephemeral ceiling,
+        # as on any host).
+        if (sc_sport <= 0 || sc_sport > 65535) {
+            sc_sport = 49152 + ((tcp_ephemeral_ctr + timer_ticks) & 0x3FFF);
+            tcp_ephemeral_ctr = tcp_ephemeral_ctr + 1;
+        }
         fb_dbg_beacon(3);                    # 1.45.16 canary: TCP connect stage
         preempt_disable();
         asm { sti; }
