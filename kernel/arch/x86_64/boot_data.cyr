@@ -41,6 +41,7 @@ var fb_dbg_phys = 0;  # 1.45.16: FB base captured at fb_console_init for the idt
 var timer_ticks = 0;
 var timer_isr[64];
 var kb_isr[96];    # keyboard ISR machine code (~83 bytes)
+var nic_rx_isr[64];  # NIC RX MSI-X ISR machine code (~62 bytes) — 1.51.5
 var kb_buf[256];
 var kb_head = 0;
 var kb_tail = 0;

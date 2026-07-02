@@ -147,3 +147,67 @@ fn timer_isr_build() {
     store8(p + off, 0x48); store8(p + off + 1, 0xCF);
     return 0;
 }
+
+# 1.51.5 — NIC RX MSI-X interrupt handler. Same body the 100 Hz timer tick runs
+# (net_rx_drain), but triggered by the NIC on packet arrival so a blocked hlt wakes
+# immediately instead of on the next tick — the proper fix for the tick-paced net
+# latency floor (obsoletes the 1.51.3 busy-poll for the common case). RX-only,
+# self-guarded (net_rx_lock trylock), issues no TX, and NEVER schedules — so it is
+# safe in the preempt-held connect/recv window (the serial-kstack invariant holds,
+# exactly as the timer ISR's drain already does). nic_ready() gates net_rx_drain to
+# a no-op before the NIC is up. LAPIC-EOI (MSI-X delivers via the LAPIC).
+fn nic_rx_handler() {
+    net_rx_drain();
+    apic_eoi();
+    return 0;
+}
+
+# Build the NIC RX ISR stub (machine code) into nic_rx_isr. Mirrors timer_isr_build
+# EXACTLY (15-register push → 16-byte-aligned call, the proven layout) minus the
+# `mov rdi,rsp` (nic_rx_handler takes no arg) and the do_context_switch (no schedule).
+fn nic_rx_isr_build() {
+    var p = &nic_rx_isr;
+    var handler_addr = &nic_rx_handler;
+    var off = 0;
+    # caller-saved: rax rcx rdx rsi rdi r8 r9 r10 r11
+    store8(p + off, 0x50); off = off + 1;  # push rax
+    store8(p + off, 0x51); off = off + 1;  # push rcx
+    store8(p + off, 0x52); off = off + 1;  # push rdx
+    store8(p + off, 0x56); off = off + 1;  # push rsi
+    store8(p + off, 0x57); off = off + 1;  # push rdi
+    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;  # push r8
+    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;  # push r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;  # push r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;  # push r11
+    # callee-saved: rbx rbp r12 r13 r14 r15 (→ 15 pushes, matches timer's alignment)
+    store8(p + off, 0x53); off = off + 1;  # push rbx
+    store8(p + off, 0x55); off = off + 1;  # push rbp
+    store8(p + off, 0x41); store8(p + off + 1, 0x54); off = off + 2;  # push r12
+    store8(p + off, 0x41); store8(p + off + 1, 0x55); off = off + 2;  # push r13
+    store8(p + off, 0x41); store8(p + off + 1, 0x56); off = off + 2;  # push r14
+    store8(p + off, 0x41); store8(p + off + 1, 0x57); off = off + 2;  # push r15
+    # call nic_rx_handler: mov rax, imm64; call rax
+    store8(p + off, 0x48); store8(p + off + 1, 0xB8); off = off + 2;
+    store64(p + off, handler_addr); off = off + 8;
+    store8(p + off, 0xFF); store8(p + off + 1, 0xD0); off = off + 2;  # call rax
+    # pop callee-saved: r15 r14 r13 r12 rbp rbx
+    store8(p + off, 0x41); store8(p + off + 1, 0x5F); off = off + 2;  # pop r15
+    store8(p + off, 0x41); store8(p + off + 1, 0x5E); off = off + 2;  # pop r14
+    store8(p + off, 0x41); store8(p + off + 1, 0x5D); off = off + 2;  # pop r13
+    store8(p + off, 0x41); store8(p + off + 1, 0x5C); off = off + 2;  # pop r12
+    store8(p + off, 0x5D); off = off + 1;  # pop rbp
+    store8(p + off, 0x5B); off = off + 1;  # pop rbx
+    # pop caller-saved: r11 r10 r9 r8 rdi rsi rdx rcx rax
+    store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;  # pop r11
+    store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;  # pop r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x59); off = off + 2;  # pop r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x58); off = off + 2;  # pop r8
+    store8(p + off, 0x5F); off = off + 1;  # pop rdi
+    store8(p + off, 0x5E); off = off + 1;  # pop rsi
+    store8(p + off, 0x5A); off = off + 1;  # pop rdx
+    store8(p + off, 0x59); off = off + 1;  # pop rcx
+    store8(p + off, 0x58); off = off + 1;  # pop rax
+    # iretq
+    store8(p + off, 0x48); store8(p + off + 1, 0xCF);
+    return 0;
+}

@@ -5,6 +5,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.51.5] — 2026-07-01
+
+**▶ virtio-net RX interrupt (MSI-X) — the proper net-latency fix.** The NIC now
+raises IDT vector 0x50 on packet arrival, so a blocked `hlt` (in `tcp_connect` /
+`tcp_send` / recv) wakes immediately instead of on the next 100 Hz timer tick. This
+retires the tick-paced net-latency floor the 1.51.3 busy-poll worked around —
+connect latency is now bounded by the wire/SLIRP round-trip, not the timer, with no
+CPU spin. First interrupt-driven device on agnos beyond the timer/keyboard.
+
+### Added
+- **NIC RX MSI-X ISR** (`pic.cyr` `nic_rx_handler` + `nic_rx_isr_build`, vector 0x50,
+  wired in `main.cyr`): the ISR runs `net_rx_drain()` (the same body the 100 Hz tick
+  runs) + LAPIC-EOI. RX-only, self-guarded, never schedules → safe in the
+  preempt-held connect/recv window (mirrors the timer ISR's drain; the serial-kstack
+  invariant holds). Stub machine-code mirrors `timer_isr_build`.
+- **virtio-net MSI-X enable** (`virtio_net.cyr` `vnet_msix_enable_rx`): programs the
+  device's MSI-X table entry 0 (BSP LAPIC, vector 0x50, per-vector unmasked), clears
+  FuncMask, and routes RX queue 0 to it. Called from `virtio_net_init` after the RX
+  ring primes. Reuses the `pci_enable_msix_unmasked` table-write pattern.
+
+### Verified
+- QEMU connect bench with the **busy-poll disabled** (so *only* the IRQ can wake
+  `hlt`): 2000/2000 connects at **~1.2 ms/connect** — matching the busy-poll number
+  but with no CPU spin, proving the RX IRQ carries the load. loopback-smoke 5/5 in the
+  release config (busy-poll + MSI-X), no regression. New `scripts/bench-connect-smoke.sh`
+  (guestfwd + file-driven `/etc/probe-cmd` hook) + hoosh's `bench` command.
+
+### Notes
+- The 1.51.3 busy-poll stays as belt-and-suspenders (`NET_BUSY_SPINS=20000`) — still
+  needed for **r8169 on iron**, whose RX IRQ lands at ~1.51.6 (with an iron burn).
+  Once that ships, the busy-poll can be trimmed.
+
 ## [1.51.4] — 2026-07-01
 
 **▶ Rapid-reconnect connect failures fixed (per-connect ephemeral source port).**

@@ -295,6 +295,43 @@ fn vnet_rx_prime() {
     return 0;
 }
 
+# 1.51.5 — enable virtio-net RX MSI-X so the device raises IDT vector 0x50 on each
+# packet arrival, waking a blocked hlt immediately (nic_rx_handler → net_rx_drain)
+# instead of waiting for the next 100 Hz tick — the proper fix for the tick-paced net
+# latency floor. Mirrors pci_enable_msix_unmasked but programs THIS device's table
+# entry 0 with vector 0x50 UNMASKED, then routes the RX queue (0) to that entry. The
+# RX avail ring leaves flags=0 (no NO_INTERRUPT), so the device posts on every
+# used-ring advance. MSI-X table writes must land in UC (the device BARs are
+# UC-remapped, 1.50.x). Returns 0, or -1 if the device advertises no MSI-X cap
+# (caller then relies on the timer-tick drain + the 1.51.3 busy-poll).
+fn vnet_msix_enable_rx(idx) {
+    var slot = PciDev_slot(&pci_devs + idx * 32);
+    var bf = load64(&pci_busfunc + idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    var msix_off = pci_find_cap(idx, 0x11);
+    if (msix_off == 0) { return 0 - 1; }
+    var hdr = pci_read32(bus, slot, func, msix_off);
+    # Phase 1 — MSI-X Enable + FuncMask (the MaskAll window, Linux ordering).
+    pci_write32(bus, slot, func, msix_off, (hdr & 0x3FFFFFFF) | 0xC0000000);
+    # Phase 2 — program table entry 0: BSP LAPIC, IDT vector 0x50, per-vector UNMASKED.
+    var tob = pci_read32(bus, slot, func, msix_off + 4);
+    var bir = tob & 0x07;
+    var tbl_off = tob & 0xFFFFFFF8;
+    var tbl = pci_bar_64(idx, bir) + tbl_off;
+    store32(tbl + 0,  0xFEE00000);   # msg addr low — LAPIC, BSP, physical delivery
+    store32(tbl + 4,  0);            # msg addr high
+    store32(tbl + 8,  0x50);         # msg data — IDT vector 0x50, fixed delivery
+    store32(tbl + 12, 0);            # vector control — 0 = UNMASKED
+    var flush = load32(tbl + 12);    # readback flush (UC table write completes)
+    # Phase 3 — clear FuncMask; Enable stays.
+    pci_write32(bus, slot, func, msix_off, (hdr & 0x3FFFFFFF) | 0x80000000);
+    # Route RX queue (0) → MSI-X table entry 0.
+    store16(vnet_common_cfg + VNET_QUEUE_SEL, 0);
+    store16(vnet_common_cfg + VNET_QUEUE_MSIX_VEC, 0);
+    return 0;
+}
+
 # ---------------------------------------------------------------------
 # Top-level init (8 steps per § 3.1.1)
 # ---------------------------------------------------------------------
@@ -329,6 +366,11 @@ fn virtio_net_init() {
     &vnet_txq_notify) < 0) { return 0 - 1; }
 
     vnet_rx_prime();
+
+    # 1.51.5 — enable RX MSI-X (→ IDT vector 0x50) so the device wakes a blocked hlt
+    # on packet arrival instead of the next timer tick. Best-effort: -1 (no MSI-X cap)
+    # just leaves the timer-tick drain + busy-poll as before.
+    vnet_msix_enable_rx(idx);
 
     store8(vnet_common_cfg + VNET_DEV_STATUS,
     VNET_STATUS_ACK | VNET_STATUS_DRIVER | VNET_STATUS_FEATURES_OK | VNET_STATUS_DRIVER_OK);

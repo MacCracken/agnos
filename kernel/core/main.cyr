@@ -142,6 +142,11 @@ kb_isr_build();
 idt_set_gate(&idt + 33 * 16, &kb_isr, 0x08, 0x8E);
 kprintln("Keyboard ISR installed (full US QWERTY)", 39);
 
+# 1.51.5: NIC RX MSI-X ISR at vector 0x50 (80) — built + registered here; dormant
+# until virtio_net_init points the NIC's MSI-X table entry at this vector (bite 2).
+nic_rx_isr_build();
+idt_set_gate(&idt + 80 * 16, &nic_rx_isr, 0x08, 0x8E);
+
 pt_init();
 kprint("Page tables: ", 13);
 kprint_num(pt_get_mapped_mb());
