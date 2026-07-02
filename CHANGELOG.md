@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.51.7] — 2026-07-02
+
+**▶ RX-IRQ-LIVE latch — makes the 1.51.6 iron burn dispositive.** 1.51.6 shipped the
+r8169 MSI RX interrupt, but on iron neither "net works" nor `r8169: RX MSI armed` proves
+the MSI actually *fired*: the 1.51.3 busy-poll and the 100 Hz timer-tick `net_rx_drain`
+both carry RX regardless, so a dead MSI would look identical to a live one (and QEMU can't
+run the r8169 path at all). This adds a one-shot latch that prints a **dispositive** LIVE
+line the first time the RX interrupt is serviced.
+
+### Added
+- **RX-IRQ-LIVE one-shot latch.** `nic_rx_handler` (the vector-0x50 ISR) sets a single-word
+  flag `nic_rx_irq_seen` on its first delivery (`pic.cyr`) — a safe flag write, **no print
+  in interrupt context**. `net_poll` (`net_ingress.cyr`, non-ISR) then prints, exactly once,
+  `r8169: RX MSI LIVE (first hardware IRQ serviced, vector 0x50)` on iron, or
+  `virtio-net: RX MSI-X LIVE (first IRQ serviced, vector 0x50)` in QEMU (`r8169_present`
+  picks the accurate name). On a live LAN, ambient broadcast/multicast chatter fires it
+  within seconds at the prompt. It is a **permanent product log line** (the always-on
+  `pmm: bitmap-dm OK` guard is the precedent), NOT throwaway burn instrumentation —
+  it stays useful on any r8169 machine as a "RX interrupt is live" confirmation.
+
+### Verified
+- **QEMU (virtio):** the bench serial log now carries `virtio-net: RX MSI-X LIVE (first IRQ
+  serviced, vector 0x50)` ahead of `bench: N=500 ok=500 … avg=1160us/connect` — proving the
+  ISR-sets-flag → `net_poll`-prints-once path fires end-to-end (the exact mechanism the iron
+  burn relies on for the r8169). No regression; boots clean to the `agnos>` prompt.
+- **Iron (r8169):** PENDING — this is what makes the archaemenid burn dispositive: after
+  boot, `r8169: RX MSI LIVE …` on the FB proves the r8169 MSI delivered on real silicon.
+
 ## [1.51.6] — 2026-07-01
 
 **▶ r8169 RX interrupt (MSI) — the iron half of the net-latency fix.** The RTL8168H
@@ -33,14 +61,6 @@ passed an adversarial pre-burn review.
   by writing back the read snapshot, so the chip re-arms and can post the next edge
   MSI. Guarded on `r8169_present` + `r8169_mmio_base` → a strict no-op on the
   QEMU/virtio path (no bogus MMIO read).
-- **RX-IRQ-LIVE one-shot latch** (`pic.cyr` `nic_rx_irq_seen` set in `nic_rx_handler`;
-  printed once from `net_poll` in `net_ingress.cyr`): the ISR sets a single-word flag on
-  its first delivery (no print in interrupt context); `net_poll` prints `r8169: RX MSI
-  LIVE …` (or `virtio-net: RX MSI-X LIVE …`) exactly once. **Dispositive proof the RX
-  interrupt actually FIRES on silicon** — QEMU can't run the r8169 MSI path, and both the
-  busy-poll and the timer-tick drain would otherwise mask a dead MSI (working-net ≠
-  MSI-fired). Permanent product log line (the always-on `pmm: bitmap-dm OK` guard is the
-  precedent), not throwaway burn instrumentation.
 
 ### Changed
 - **`r8169_init_tx` step 12** (`r8169.cyr`): was pure-poll (`IMR = 0`). Now drains
