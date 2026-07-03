@@ -598,6 +598,11 @@ hda_probe();
 # presence. No-op if hda_probe didn't bind a controller. Prints
 # `hda: reset OK, codecs=0xNNNN`. Polled (INTCTL stays 0).
 hda_reset();
+# HDA audio Phase B2a (1.52.2) — CORB/RIRB verb-ring transport: init the rings
+# and read the first codec's VENDOR_ID + NODECOUNT (proves the command/response
+# path). No-op if no codec present. Polled. The ALC897 widget-graph walk +
+# front-pin route is B2b (iron-gated).
+hda_codec_probe();
 # GPT Phase 1 — probe the active block backend (NVMe-first by override
 # policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
 # decode + walk the first 4 KB of the partition entry array, print a one-

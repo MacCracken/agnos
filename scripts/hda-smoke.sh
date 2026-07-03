@@ -108,6 +108,29 @@ else
     rc=1
 fi
 
+# B2a — CORB/RIRB verb-ring transport (codec VENDOR_ID / NODECOUNT round-trip).
+# ("hda: codec[0-9]" avoids matching the B1 "codecs=" reset line.)
+CDC_LINE="$(grep -a -m1 "hda: codec[0-9]" "$SER" 2>/dev/null)"
+if [ -n "$CDC_LINE" ]; then
+    echo "  codec: $CDC_LINE"
+    VID="$(echo "$CDC_LINE" | sed -n 's/.*vendor=0x\([0-9A-Fa-f]*\).*/\1/p')"
+    NODES="$(echo "$CDC_LINE" | sed -n 's/.*nodes=\([0-9][0-9]*\).*/\1/p')"
+    if [ -z "$VID" ] || [ "$VID" = "0" ] || [ "$VID" = "00000000" ]; then
+        echo "  FAIL: codec line but bad vendor (0x$VID)"; rc=1
+    elif [ -z "$NODES" ] || [ "$NODES" -lt 1 ] || [ "$NODES" -ge 100 ]; then
+        # nodes==255 is the '2nd verb timed out (-1 & 0xFF)' signature — guards
+        # the RINTCNT/RIRBSTS consecutive-verb fix from regressing.
+        echo "  FAIL: 2nd verb bad (nodes=$NODES; 255 = timeout regression)"; rc=1
+    else
+        echo "  PASS: verb ring round-trip OK (consecutive verbs), vendor=0x$VID nodes=$NODES — B2a gate met"
+    fi
+else
+    echo "  FAIL: no 'hda: codec' line (verb-ring round-trip failed)"
+    grep -a -m1 "hda: WARN codec verb" "$SER" 2>/dev/null
+    grep -a -m1 -E "hda: (CORB|RIRB) alloc" "$SER" 2>/dev/null
+    rc=1
+fi
+
 echo "  --- hda lines from serial ---"
 grep -a -iE "^hda:" "$SER" 2>/dev/null | sed 's/^/    /'
 echo "  full serial: $SER"

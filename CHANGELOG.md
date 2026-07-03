@@ -5,7 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — 1.52.x audio arc (→ 1.52.1)
+### Added — 1.52.x audio arc (→ 1.52.2)
+- **B2a — CORB/RIRB verb-ring transport** (`hda_ring_init` / `hda_verb` / `hda_codec_probe` in
+  `kernel/core/hda.cyr`; `hda_codec_probe()` wired into `main.cyr` after `hda_reset`). 256-entry
+  CORB (command) + RIRB (response) DMA rings, WB/coherent (the nvme admin-ring mapping:
+  `pmm_alloc` → `vmm_map(…,0x83)` → `iommu_register_dma` → zero), the CORBRP two-step reset, and
+  a verb send/poll with **no phase bit** (software rp vs RIRBWP, manual 256-wrap). Reads the
+  first present codec's VENDOR_ID + NODECOUNT. **QEMU-PASS: `hda: codec0 vendor=0x1af40022
+  nodes=1`** (consecutive verbs). The ALC897 graph walk is B2b (iron-gated).
+- **Fixed: consecutive-verb stall.** QEMU's `intel_hda_corb_run` stops draining the CORB once
+  `rirb_count == RINTCNT`, so `RINTCNT=1` processed exactly one verb then stalled (the 2nd verb
+  timed out → `nodes=255`). Now `RINTCNT=0xFF` + a per-verb **RIRBSTS ack** (W1C RINTFL+overrun)
+  keeps it draining — essential for B2b's many-verb graph walk. Correct on real HW too (which
+  doesn't gate CORB drain on this). `hda-smoke.sh` guards `nodes != 255` as a regression check.
+
+**Next bite: B2b** — the ALC897 widget-graph walk (enumerate widgets → DAC + front output pin via
+`CONFIG_DEFAULT` → connection-list trace → power/unmute/EAPD/COEF). Iron-gated: QEMU's trivial
+3-node codec proves the ring transport only, not the ALC897 routing.
+
+## [1.52.1] — 2026-07-03
+
+### Added
 - **B1 — HDA reset handshake + codec presence** (`kernel/core/hda.cyr`; `hda_reset()` wired
   into `main.cyr` device-init right after `hda_probe`). GCTL.CRST enter-reset (write `GCTL=0`,
   the `azx_reset` idiom) → poll bit0→0 → **PLL settle (budget 200 µs)** → exit-reset (CRST=1) →
@@ -19,9 +39,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `udelay`), the `xhci_port.cyr:562` idiom, `HDA_TSC_MHZ=3000` (invariant TSC, ~2× settle margin).
 - `hda-smoke.sh` extended: attaches an `hda-duplex` codec (null audiodev) and adds the B1
   gate (reset-OK line + `codecs != 0x0000`). B0+B1 both green.
-
-**Next bite: B2** — CORB/RIRB verb ring + the ALC897 widget-graph walk to a DAC + front output
-pin (the one genuinely-novel bite; QEMU proves ring round-trip only, the graph walk is iron-gated).
 
 ## [1.52.0] — 2026-07-03
 

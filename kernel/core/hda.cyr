@@ -31,6 +31,31 @@ var HDA_STATESTS = 0x0E; # State Change Status (16-bit): codec-present bitmask
 var GCTL_CRST     = 0x1;      # GCTL bit0: 0 = in reset, 1 = run
 var STATESTS_MASK = 0x7FFF;   # 15 valid codec-address bits
 
+# --- CORB/RIRB verb-ring registers (B2) ---
+var HDA_CORBLBASE = 0x40;     # CORB base low32 (32-bit)
+var HDA_CORBUBASE = 0x44;     # CORB base high32 (32-bit)
+var HDA_CORBWP    = 0x48;     # CORB write pointer (16-bit)
+var HDA_CORBRP    = 0x4A;     # CORB read pointer (16-bit, bit15 = reset)
+var HDA_CORBCTL   = 0x4C;     # CORB control (8-bit, bit1 = DMA run)
+var HDA_CORBSIZE  = 0x4E;     # CORB size (8-bit)
+var HDA_RIRBLBASE = 0x50;     # RIRB base low32 (32-bit)
+var HDA_RIRBUBASE = 0x54;     # RIRB base high32 (32-bit)
+var HDA_RIRBWP    = 0x58;     # RIRB write pointer (16-bit, bit15 = reset)
+var HDA_RINTCNT   = 0x5A;     # RIRB response interrupt count (8-bit)
+var HDA_RIRBSTS   = 0x5D;     # RIRB status (8-bit, W1C: bit0 RINTFL, bit2 overrun)
+var HDA_RIRBCTL   = 0x5C;     # RIRB control (8-bit, bit1 = DMA en)
+var HDA_RIRBSIZE  = 0x5E;     # RIRB size (8-bit)
+var CORBRP_RST    = 0x8000;   # CORBRP bit15 — read-pointer reset
+var RIRBWP_RST    = 0x8000;   # RIRBWP bit15 — write-pointer reset
+var CORBCTL_RUN   = 0x2;      # CORBCTL bit1 — CORB DMA engine run
+var RIRBCTL_DMAEN = 0x2;      # RIRBCTL bit1 — RIRB DMA engine run (IRQ bit0 = 0)
+var HDA_RING256   = 0x2;      # CORBSIZE/RIRBSIZE code for 256 entries
+
+# --- verb encoding ---
+var V_GET_PARAM   = 0xF00;    # 12-bit verb: Get Parameter
+var P_VENDOR      = 0x00;     # param: Vendor/Device ID
+var P_NODECOUNT   = 0x04;     # param: Subordinate Node Count
+
 # --- Known controller PCI identities (B0 probe order) ---
 # Exact IDs disambiguate the analog HDA controller from the same-class
 # HDMI-audio (04:00.1) / ACP-DSP (04:00.5) functions on archaemenid, and
@@ -53,6 +78,13 @@ var hda_codec_mask = 0;       # STATESTS codec-present bitmask (set by hda_reset
 # are ~2x the spec floor to absorb per-box TSC-rate variance. QEMU/KVM: rdtsc
 # reads the host TSC.
 var HDA_TSC_MHZ = 3000;
+
+# --- B2 verb-ring state ---
+var hda_corb_phys = 0;
+var hda_rirb_phys = 0;
+var hda_corb_wp   = 0;        # software CORB write index (0..255)
+var hda_rirb_rp   = 0;        # software RIRB read index  (0..255)
+var hda_codec0    = 0;        # first present codec address
 
 # === MMIO accessors (r8169 clone; UC register file) ===========================
 # Reads are bare loads; writes carry a readback-flush (added B1).
@@ -230,4 +262,133 @@ fn hda_reset() {
     if (sts == 0) { kprint(" (none - timing?)", 17); }
     kprintln("", 0);
     return sts;
+}
+
+# === B2 — CORB/RIRB verb ring + codec probe (roadmap 1.52.2) ==================
+# B2a: the verb command/response ring transport (nvme SQ/CQ doorbell-poll twin,
+# but RIRB has NO phase/ownership bit — track a software rp vs RIRBWP). Sends
+# GET_PARAM(VENDOR_ID / NODECOUNT) to the first present codec and prints them.
+# QEMU proves the round-trip (its own codec vendor, not ALC897); the ALC897
+# widget-graph walk + front-pin route + COEF/EAPD is B2b (iron-gated).
+
+fn hda_zero_page(p) {
+    var i = 0;
+    while (i < 512) { store64(p + i * 8, 0); i = i + 1; }
+    return 0;
+}
+
+# Bring up the CORB (command) + RIRB (response) DMA rings, 256 entries each,
+# WB/coherent (the nvme admin-ring mapping). IRQ stays off (polled posture).
+fn hda_ring_init() {
+    var corb = pmm_alloc();
+    var rirb = pmm_alloc();
+    if (corb == 0) { kprintln("hda: CORB alloc failed (PMM OOM)", 32); return 0; }
+    if (rirb == 0) { kprintln("hda: RIRB alloc failed (PMM OOM)", 32); return 0; }
+    if (vmm_is_mapped(corb) == 0) { vmm_map(corb, corb, 0x83); }
+    if (vmm_is_mapped(rirb) == 0) { vmm_map(rirb, rirb, 0x83); }
+    iommu_register_dma(corb);
+    iommu_register_dma(rirb);
+    hda_zero_page(corb);
+    hda_zero_page(rirb);
+    hda_corb_phys = corb;
+    hda_rirb_phys = rirb;
+
+    # Stop both rings before reprogramming their bases.
+    hda_write8(HDA_CORBCTL, 0);
+    hda_write8(HDA_RIRBCTL, 0);
+
+    # CORB: base + 256-entry size + WP=0 + the two-step RP reset.
+    hda_write32(HDA_CORBLBASE, corb & 0xFFFFFFFF);
+    hda_write32(HDA_CORBUBASE, (corb >> 32) & 0xFFFFFFFF);
+    hda_write8(HDA_CORBSIZE, HDA_RING256);
+    hda_write16(HDA_CORBWP, 0);
+    hda_write16(HDA_CORBRP, CORBRP_RST);      # set reset bit15
+    var i = 0;
+    while (i < 1000) {
+        if ((hda_read16(HDA_CORBRP) & CORBRP_RST) == CORBRP_RST) { break; }
+        hda_udelay(1);
+        i = i + 1;
+    }
+    hda_write16(HDA_CORBRP, 0);                # clear it
+    i = 0;
+    while (i < 1000) {
+        if ((hda_read16(HDA_CORBRP) & CORBRP_RST) == 0) { break; }
+        hda_udelay(1);
+        i = i + 1;
+    }
+    hda_corb_wp = 0;
+    hda_write8(HDA_CORBCTL, CORBCTL_RUN);
+
+    # RIRB: base + 256-entry size + WP reset + DMA-enable (no IRQ).
+    hda_write32(HDA_RIRBLBASE, rirb & 0xFFFFFFFF);
+    hda_write32(HDA_RIRBUBASE, (rirb >> 32) & 0xFFFFFFFF);
+    hda_write8(HDA_RIRBSIZE, HDA_RING256);
+    hda_write16(HDA_RIRBWP, RIRBWP_RST);      # reset write pointer (self-clearing)
+    # RINTCNT high: QEMU's corb_run stops draining the CORB once rirb_count
+    # reaches RINTCNT (the response-interrupt threshold), so RINTCNT=1 processes
+    # exactly one verb then stalls. Polled mode never services the IRQ; a high
+    # threshold + per-verb RIRBSTS ack (in hda_verb) keeps it draining. Safe on
+    # real HW (which doesn't gate corb drain on this).
+    hda_write8(HDA_RINTCNT, 0xFF);
+    hda_write8(HDA_RIRBCTL, RIRBCTL_DMAEN);   # bit1 only — IRQ bit0 stays 0
+    hda_rirb_rp = 0;
+    return 1;
+}
+
+# Send one verb to (codec,nid), return the 32-bit response or -1 on timeout.
+# cmd = (codec<<28)|(nid<<20)|verb20. No phase bit: a response is ready when
+# RIRBWP has advanced past our software rp (manual 256-wrap).
+fn hda_verb(codec, nid, verb20) {
+    var cmd = (codec << 28) | (nid << 20) | (verb20 & 0xFFFFF);
+    hda_corb_wp = (hda_corb_wp + 1) & 0xFF;
+    store32(hda_corb_phys + hda_corb_wp * 4, cmd);
+    hda_write16(HDA_CORBWP, hda_corb_wp);     # doorbell (SQ-tail twin)
+    # ~100 ms budget: real HW drains the CORB immediately on the doorbell, but
+    # QEMU's intel-hda drains it from a periodic timer, so the poll must span a
+    # tick. Generous cap keeps consecutive verbs (the B2b graph walk) reliable.
+    var i = 0;
+    while (i < 100000) {
+        var wp = hda_read16(HDA_RIRBWP) & 0xFF;
+        if (wp != hda_rirb_rp) {
+            hda_rirb_rp = (hda_rirb_rp + 1) & 0xFF;
+            var resp = load32(hda_rirb_phys + hda_rirb_rp * 8);   # dword0 = response
+            hda_write8(HDA_RIRBSTS, 0x5);   # ack RINTFL+overrun (W1C) → resets
+                                            # QEMU's rirb_count so corb_run keeps draining
+            return resp;
+        }
+        hda_udelay(1);
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# B2a top-level: init the ring, read the first codec's VENDOR_ID + NODECOUNT.
+fn hda_codec_probe() {
+    if (hda_present == 0) { return 0; }
+    if (hda_codec_mask == 0) { return 0; }
+    # first present codec = lowest set bit in the STATESTS mask.
+    var codec = 0;
+    while (codec < 15) {
+        if ((hda_codec_mask & (1 << codec)) != 0) { break; }
+        codec = codec + 1;
+    }
+    hda_codec0 = codec;
+    if (hda_ring_init() == 0) { return 0; }
+
+    var vid = hda_verb(codec, 0, (V_GET_PARAM << 8) | P_VENDOR);
+    if (vid == 0 || vid == (0 - 1)) {
+        kprintln("hda: WARN codec verb round-trip failed", 38);
+        return 0;
+    }
+    var nodes  = hda_verb(codec, 0, (V_GET_PARAM << 8) | P_NODECOUNT);
+    var ncount = nodes & 0xFF;                 # total subordinate node count
+
+    kprint("hda: codec", 10);
+    kprint_num(codec);
+    kprint(" vendor=0x", 10);
+    kprint_hex(vid & 0xFFFFFFFF);
+    kprint(" nodes=", 7);
+    kprint_num(ncount);
+    kprintln("", 0);
+    return 1;
 }
