@@ -71,18 +71,28 @@ var TCP_RETX_BUF = 1460;
 var TCP_RTO_BASE = 100;        # ticks (1 s at the 100 Hz timer)
 var TCP_RTO_RETRIES = 5;       # resends before declaring the conn dead
 
-# 1.51.3 — busy-poll budget before falling back to hlt in the TCP wait loops.
-# agnos has no NIC RX interrupt yet (that lands 1.51.4), so a bare arch_wait()=hlt
-# only wakes on the 100 Hz timer → every TCP round-trip was floored at ~one 10 ms
-# tick regardless of the real handshake speed (a SLIRP/loopback reply is sub-ms).
-# The connect/send loops now spin net_poll() for the first NET_BUSY_SPINS iterations
-# (catching a fast reply in µs) before hlt-pacing the tail — a live peer is fast, a
-# dead/slow peer still recovers via the B2 retransmits without burning the CPU to the
-# deadline (the timer keeps ticking under IF=1, so the deadline is still enforced
-# during the spin). Tuned for QEMU/SLIRP; revisit with the 1.51.4 NIC-IRQ work + bench.
-var NET_BUSY_SPINS = 20000;
+# 1.51.3, trimmed 1.51.8 — busy-poll window before falling back to hlt in the TCP
+# connect/send wait loops. ORIGINALLY (1.51.3) this was the load-bearing latency fix:
+# agnos had no NIC RX interrupt, so a bare arch_wait()=hlt only woke on the 100 Hz timer
+# → every TCP round-trip was floored at ~one 10 ms tick regardless of real handshake
+# speed. That root cause is now FIXED by the RX interrupt — virtio-net MSI-X (1.51.5) +
+# r8169 MSI (1.51.6), IRON-PROVEN 1.51.7 on archaemenid (the `r8169: RX MSI LIVE` line +
+# sub-tick `yo` RTTs) — so a blocked hlt now wakes on packet arrival via IDT vector 0x50.
+# The busy-poll is therefore no longer the primary mechanism for the WIRE path.
+#
+# It stays as belt-and-suspenders, TRIMMED 20000 → 512, for two things the RX IRQ does
+# NOT cover: (1) LOOPBACK (127.x / self net_ip) rides the net_lo_drain SOFTWARE queue,
+# which raises NO interrupt — a lo handshake/ACK MUST complete inside the spin window or
+# it tick-paces; 512 is ~50× the ~3-10 net_poll()s a lo phase needs (`spins` resets per
+# handshake + per send-chunk, so 512 is per-phase, not per-connection). (2) it catches a
+# near-instant wire reply in the first few spins without the LAPIC→IDT→ISR round-trip. A
+# wire wait past the window hlt-pauses and the RX IRQ wakes it; a dead/slow peer still
+# recovers via the B2 retransmits without burning the CPU to the deadline (the timer
+# keeps ticking under IF=1, so the ~8 s deadline stays enforced during the spin).
+# Iron-tunable if a future no-IRQ NIC or a CPU-burn concern surfaces.
+var NET_BUSY_SPINS = 512;
 fn net_wait_backoff(spins) {
-    if (spins >= NET_BUSY_SPINS) { arch_wait(); }   # window spent → hlt (timer-paced)
+    if (spins >= NET_BUSY_SPINS) { arch_wait(); }   # window spent → hlt (RX-IRQ-woken; timer-paced for loopback)
     return 0;
 }
 

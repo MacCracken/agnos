@@ -5,6 +5,117 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.52.0] — 2026-07-03
+
+**▶ 1.52.0 — OPENS the audio-output (HDA/Azalia) arc** (roadmap hardware/feature lane →
+Active). The **1.51.x sovereign-package-manager-kernel-surface + net-latency arc is CLOSED +
+iron-validated**: it opened as the ark-v2/agnova prerequisite surface (symlink`#63`, the
+`#58-62` fs/net-config/redirect band) and absorbed the **NIC RX-interrupt latency fix**
+(1.51.3 busy-poll → 1.51.5 virtio-net MSI-X → 1.51.6 r8169 MSI → **1.51.7 `r8169: RX MSI
+LIVE` on archaemenid** → 1.51.8 busy-poll trim → 1.51.9 bote-serve-on-kernel test infra) —
+the base/server kernel surface is squared away. This arc turns to **audio**: the first sound
+out of sovereign agnos. Fully scoped in
+[`agnosticos/.../planning/audio-arc-152x.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/audio-arc-152x.md)
+(2026-06-29 multi-agent research, source-grounded against live `lspci` / `/proc/asound`).
+
+**Target hardware (archaemenid, verified live):** `04:00.6` AMD Ryzen HD Audio `[1022:15e3]`
+— a standard **HDA/Azalia** controller (Intel HD-Audio register spec, portable) with a
+**Realtek ALC897** codec `[0x10ec0897]`; output = the **front headphone jack** (the codec's
+line-out pin widget). NOT the ACP DSP (`04:00.5`) or HDMI audio (`04:00.1`) — those are out
+of scope, as are capture/mic, USB-audio, and MIDI. Output-first only.
+
+**The four gates:**
+- **Gate 1 — kernel HDA driver** (`kernel/core/hda.cyr`, single flat file like `nvme.cyr`/
+  `r8169.cyr`), reusing the iron-proven PCI/DMA/MMIO pattern verbatim; **polled, no IRQ**
+  (r8169 `IMR=0` precedent). **Six bites, each a kernel patch minor:** **B0** PCI class-probe
+  + BAR map + GCAP read (read-only, lowest risk — the next bite) · **B1** GCTL.CRST reset +
+  STATESTS codec presence · **B2** CORB/RIRB verb ring + codec widget-graph walk to a DAC +
+  front-panel output Pin Complex (*the one genuinely-novel bite* — the ALC897 graph is the
+  iron-only part QEMU's trivial codec can't exercise) · **B3** BDL DMA ring + WC-mapped PCM
+  ring + stream descriptor (SDnFMT `0x4011` = 48k/16/2ch) · **B4** first tone (precomputed
+  sine loop — QEMU `-audiodev wav` RMS assert **and** archaemenid front jack) · **B5**
+  double-buffered streamed PCM (gap-free multi-second playback; closes Gate 1).
+- **Gate 2 — ring-3 audio syscall band `#64–#69`** (`snd_open`/`snd_config`/`snd_write`/
+  `snd_close`/`snd_drain`/`snd_avail`), mirroring the net-band template (flat dispatch arm,
+  `is_user_range` gating, `a4=r10`, `sock_connect#47` sti-window for the blocking calls, a
+  `snd_id 0..3` slot table auto-released on proc exit). **Note:** the plan doc says `#63–#68`,
+  but `symlink#63` took `#63` at 1.51.0 — the audio band shifts to **`#64–#69`** (next free
+  contiguous band after `#63`).
+- **Gate 3 — cyrius `vani` agnos backend** (`vani/src/alsa.cyr`, per-fn `#ifdef
+  CYRIUS_TARGET_AGNOS` split mirroring `cyrius/lib/net.cyr`). **⚠ Two-sided — the cyrius half
+  is HANDS-OFF**: cyrius must add the `sys_snd_*` peer band in `lib/syscalls_x86_64_agnos.cyr`
+  (exactly the `sys_symlink#63` two-sided pattern). Surfaced to the user, not landed here.
+- **Gate 4 — proof-app = `cyrius-doom`** (already vani-wired + plays real DOOM sound on
+  Linux; disabled on agnos *only* by the three `#ifdef CYRIUS_TARGET_AGNOS → return 0` guards
+  in `audio.cyr`). Gate-4 = land gates 1–3, remove those guards → DOOM's shotgun out the
+  archaemenid front jack. **Arc headline acceptance = "it runs DOOM *with sound*" on sovereign
+  agnos.** `vanitone` (hand-rolled i16 sine smoke) is the gates-1–2 QEMU unit test.
+
+### Added
+- **B0 — HDA controller probe landed** (`kernel/core/hda.cyr`, new; `hda_probe()` wired into
+  device-init in `main.cyr` right after `nvme_probe`). Read-only, polled (INTCTL stays 0):
+  locates the controller, maps BAR0 UC (`vmm_remap_uc_2mb`), enables bus-master, reads GCAP +
+  version. **Probe order matches both targets** — exact `pci_find(0x1022,0x15e3)` (archaemenid
+  AMD) → `pci_find(0x8086,0x2668)` (QEMU intel-hda / ICH6) → `pci_find_by_class(0x04,0x03,0x00)`
+  fallback; a bare class-probe is deliberately NOT tried first because on archaemenid the
+  same-class HDMI-audio function (`04:00.1`) enumerates before the real controller (`04:00.6`).
+  Prints `hda: found <vid>:<did> OSS=N ISS=M v<maj>.<min>`; success gate OSS≥1.
+- **`hda-smoke.sh`** (new) — boots the kernel under QEMU with `-device intel-hda` and asserts
+  the found-line + OSS≥1. **QEMU-PASS: `hda: found 8086:2668 OSS=4 ISS=4 v1.0`.** (Runs QEMU
+  synchronously under `timeout`; greps `-a` since the serial carries OVMF/fb-console ANSI bytes.)
+- **`pci_vendor(idx)` / `pci_device(idx)`** (`core/pci.cyr`) — small public by-idx accessors so
+  drivers can log/verify their bound function without reaching `pci_devs`'s internal stride.
+
+**Next bite: B1** — GCTL.CRST reset handshake + STATESTS codec presence (`hda: reset OK,
+codecs=0xNN`). The post-CRST settle timing (521 µs / 25-frame §4.3 floor) is the iron-only
+correctness knob QEMU can't exercise.
+
+## [1.51.9] — 2026-07-03
+
+### Added
+- **▶ `BOTE_SELFTEST` — MCP-serve-on-real-kernel probe (test infra, compile-gated) — the
+  1.51.x arc-closing cut.** New
+boot-time selftest (`kernel/core/main.cyr`, `#ifdef BOTE_SELFTEST`) + harness
+(`scripts/bote-mcp-smoke.sh`, registered in `scripts/build.sh`) proving `/bin/bote` (the
+MCP core, cross-built `--agnos`) actually **serves** the JSON-RPC MCP protocol on the real
+agnos kernel — not just LOAD (basestack-run-smoke), and beyond mirshi's host-kernel syscall
+emulation. It stands up two kernel pipes, preloads an MCP `initialize` + `tools/call
+bote_echo` request into bote's stdin, points the child's fd0/fd1 at the pipes (direct
+fd-table entry copy, the same 32-B entry the execwait#37 redirect swaps), runs bote to EOF,
+and paints its JSON responses to serial. PASS = serial shows bote's `serverInfo` reply + the
+echoed `agnos-kernel` argument + `exit 0`, no fault/panic. Exercises the freelist `mmap#27`
+path (bote's `libro chain_new → sha256 → fl_alloc`) on the actual agnos mmap. No effect on
+the production kernel (gated out by default). Composes `ark_run_selftest` (exec-from-disk) +
+`exec_redirect_selftest` (pipe fd plumbing).
+
+## [1.51.8] — 2026-07-02
+
+**▶ Trim the busy-poll to belt-and-suspenders — the net-latency arc's cleanup cut.** The
+1.51.3 busy-poll was the load-bearing latency fix while agnos had no NIC RX interrupt.
+Now that the RX interrupt is done and **iron-proven** (virtio-net MSI-X 1.51.5 + r8169 MSI
+1.51.6, `r8169: RX MSI LIVE` on archaemenid 1.51.7), a blocked `hlt` wakes on packet
+arrival, so the long busy-poll window is redundant for the wire path and just burns CPU.
+
+### Changed
+- **`NET_BUSY_SPINS` 20000 → 512** (`net_tcp.cyr`): the TCP connect/send wait loops now spin
+  at most 512 `net_poll()`s before `hlt`-pausing (RX-IRQ-woken), down from 20000 — ~97% less
+  CPU spin per wait. **Not removed**, because it still covers two things the RX IRQ does not:
+  (1) **loopback** (`127.x` / self `net_ip`) rides the `net_lo_drain` software queue, which
+  raises no interrupt — a lo handshake/ACK must complete inside the window or it tick-paces;
+  512 is ~50× the ~3–10 `net_poll()`s a lo phase needs (`spins` resets per handshake and per
+  send-chunk, so 512 is per-phase). (2) it still catches a near-instant wire reply in the
+  first few spins without the LAPIC→IDT→ISR round-trip. Iron-tunable if a future no-IRQ NIC
+  or a CPU-burn concern surfaces.
+- **Comment cleanup** (`net_tcp.cyr`): the busy-poll header no longer claims "no NIC RX
+  interrupt yet (that lands 1.51.4)" — a stale, wrong reference (the IRQ landed 1.51.5/1.51.6,
+  iron-proven 1.51.7; 1.51.4 was the ephemeral-src-port fix). Rewritten to describe the
+  belt-and-suspenders role + the loopback-has-no-interrupt reason it can't go to zero.
+
+### Verified
+- QEMU: loopback-smoke 5/5 (the lo handshake still completes inside the trimmed window — the
+  correctness bar for the trim) and connect bench 500/500 through virtio (wire path unaffected
+  — the MSI-X carries the tail past the window). No regression; boots clean.
+
 ## [1.51.7] — 2026-07-02
 
 **▶ RX-IRQ-LIVE latch — makes the 1.51.6 iron burn dispositive.** 1.51.6 shipped the
@@ -30,8 +141,12 @@ line the first time the RX interrupt is serviced.
   serviced, vector 0x50)` ahead of `bench: N=500 ok=500 … avg=1160us/connect` — proving the
   ISR-sets-flag → `net_poll`-prints-once path fires end-to-end (the exact mechanism the iron
   burn relies on for the r8169). No regression; boots clean to the `agnos>` prompt.
-- **Iron (r8169):** PENDING — this is what makes the archaemenid burn dispositive: after
-  boot, `r8169: RX MSI LIVE …` on the FB proves the r8169 MSI delivered on real silicon.
+- **Iron (r8169): ✅ PASSED 2026-07-02 (archaemenid, real Zen).** The FB shows `r8169: RX MSI
+  LIVE (first hardware IRQ serviced, vector 0x50)` printing between `dhcp: DISCOVER` and
+  `dhcp: OFFER 192.168.1.195` — the r8169 MSI serviced the DHCP OFFER's RX on hardware
+  (dispositive: the tick-drain would not print this). Real lease, `net: L2 OK`, `[ASSIST] >`,
+  `yo google.com` = 4/4 0% loss (three RTTs at sub-tick `0.00 ms`), no interrupt storm / no
+  hang / no canary. Validated **both 1.51.6 (the MSI) and 1.51.7 (the latch)** in one artifact.
 
 ## [1.51.6] — 2026-07-01
 
@@ -79,8 +194,10 @@ passed an adversarial pre-burn review.
   (vs 1.51.5's 1.205 ms — within noise), full DHCP DISCOVER→ACK, confirming the shared
   `nic_rx_handler` change is a clean no-op on the virtio RX MSI-X path. loopback-smoke
   5/5. Release kernel builds clean.
-- **Iron (r8169 MSI path):** PENDING — archaemenid burn to confirm the MSI actually
-  fires and RX latency drops below the tick floor on hardware.
+- **Iron (r8169 MSI path): ✅ PASSED 2026-07-02 (archaemenid, real Zen)** — validated via the
+  1.51.7 latch burn: `r8169: RX MSI LIVE` fired servicing the DHCP OFFER, real lease `.195`,
+  `yo` 4/4 0% loss (sub-tick RTTs), no storm/hang. The MSI fires on hardware and the RX-IRQ
+  path is safe in the preempt-held window. See [1.51.7].
 
 ## [1.51.5] — 2026-07-01
 

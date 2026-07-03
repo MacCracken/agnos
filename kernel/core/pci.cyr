@@ -437,6 +437,12 @@ fn pci_find_by_class(class_code, subclass, prog_if) {
     return 0 - 1;
 }
 
+# Vendor / device of the device at pci_devs[idx] — small public accessors so
+# drivers can log/verify their bound function without reaching pci_devs's
+# internal 32-byte stride (added 1.52.0 for hda_probe's found-line).
+fn pci_vendor(idx) { return PciDev_vendor(&pci_devs + idx * 32); }
+fn pci_device(idx) { return PciDev_device(&pci_devs + idx * 32); }
+
 # Return the full 64-bit phys for BAR(bir) of the device at pci_devs[idx].
 # Flag bits already masked at probe time (pci_record). For 32-bit BARs the
 # high half is zero so the return is bit-equivalent to the masked low half;

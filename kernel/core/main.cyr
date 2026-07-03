@@ -588,6 +588,12 @@ if (nvme_admin_init() == 1) {
         nvme_register_block_dev();
     }
 }
+# HDA audio Phase B0 (1.52.0) — locate the HD-Audio controller (if present),
+# map BAR0 UC, enable bus-master, read GCAP + version. Read-only probe — no
+# reset, no codec enum, no DMA (those are B1+). Polled posture (INTCTL stays
+# 0). No-op if no controller present (QEMU smoke without -device intel-hda).
+# See kernel/core/hda.cyr + agnosticos audio-arc-152x-plan.md.
+hda_probe();
 # GPT Phase 1 — probe the active block backend (NVMe-first by override
 # policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
 # decode + walk the first 4 KB of the partition entry array, print a one-
@@ -1976,6 +1982,80 @@ fn basestack_run_selftest() {
     return 0;
 }
 basestack_run_selftest();
+#endif
+
+#ifdef BOTE_SELFTEST
+# MCP-SERVE-on-real-kernel probe (compile-gated, BOTE_SELFTEST=1): does /bin/bote
+# (the MCP core, cross-built --agnos) actually SERVE the JSON-RPC MCP protocol on
+# the REAL agnos kernel — not just LOAD (basestack) and not merely under mirshi's
+# host-kernel syscall emulation? This exercises the freelist `mmap#27` fix on the
+# ACTUAL agnos mmap (bote's libro chain_new -> sha256 -> fl_alloc was the crash;
+# see the bote 6.3.38 migration). Driven deterministically (no keystrokes): we
+# stand up two kernel pipes, PRELOAD an MCP `initialize` + `tools/call bote_echo`
+# request into the stdin pipe, load bote, point the child's fd0 <- stdin-pipe-read
+# and fd1 <- stdout-pipe-write (direct fd-table entry copy — same 32-B entry the
+# execwait#37 redirect swaps), run it to EOF (empty stdin pipe -> read 0), then
+# read the stdout pipe and paint bote's JSON responses to serial. PASS (checked by
+# scripts/bote-mcp-smoke.sh) = serial shows bote's `serverInfo` + the echoed
+# `agnos-kernel` argument. Staged at /bin/bote by the smoke. Mirrors
+# ark_run_selftest (exec-from-disk) + exec_redirect_selftest (pipe fd plumbing).
+var _bote_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"k\",\"version\":\"1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"bote_echo\",\"arguments\":{\"on\":\"agnos-kernel\"}}}\n";
+fn bote_mcp_selftest() {
+    if (ext2_active == 0) { kprintln("bote: no ext2", 13); return 0; }
+    syscall_init();
+    var boot_pid = proc_current_get();
+    var boottab = vfs_fd_table_of(boot_pid);
+    # stdin pipe — preload the MCP request into the write end
+    var fin[16];
+    if (vfs_create_pipe(&fin) != 0) { kprintln("bote: FAIL pipe-in", 18); return 0; }
+    var rfd_in = load64(&fin);
+    var wfd_in = load64(&fin + 8);
+    var reqlen = strlen(_bote_req);
+    vfs_write(wfd_in, _bote_req, reqlen);
+    # stdout pipe — bote's responses land here
+    var fout[16];
+    if (vfs_create_pipe(&fout) != 0) { kprintln("bote: FAIL pipe-out", 19); return 0; }
+    var rfd_out = load64(&fout);
+    var wfd_out = load64(&fout + 8);
+    # load bote from disk
+    if (sh_abspath("/bin/bote", 9) < 0) { kprintln("bote: bad path", 14); return 0; }
+    var pid = elf_load_from_file(&sh_path_buf, sh_path_len, "/bin/bote", 9);
+    if (pid < 0) { kprintln("bote: not an executable", 23); return 0; }
+    # Redirect the child's fd0 <- stdin-pipe read end, fd1 <- stdout-pipe write end,
+    # by copying the boot table's pipe fd entries (32 B each) into the child's fd0/fd1.
+    var ctab = vfs_fd_table_of(pid);
+    var k = 0;
+    while (k < 32) { store64(ctab + k, load64(boottab + rfd_in * 32 + k)); k = k + 8; }
+    k = 0;
+    while (k < 32) { store64(ctab + 32 + k, load64(boottab + wfd_out * 32 + k)); k = k + 8; }
+    # run bote in ring 3; it reads the request from fd0, writes responses to fd1,
+    # then reads fd0 again -> empty pipe returns 0 -> EOF -> exits.
+    kprintln("bote: exec /bin/bote (MCP serve)", 32);
+    var ep = &proc_table + pid * 176;
+    var e = load64(ep + 24);
+    var r = load64(ep + 16);
+    var c = load64(ep + 160);
+    proc_current_set(pid);
+    exec_and_wait(e, r, c);
+    proc_current_set(boot_pid);
+    kprint("bote: exit ", 11);
+    kprint_num(proc_get_exit_code(pid));
+    kprintln("", 0);
+    # drain the stdout pipe and paint bote's JSON responses to serial
+    var resp[512];
+    var n = vfs_read(rfd_out, &resp, 511);
+    if (n > 0) {
+        kprintln("bote: mcp-response-begin", 24);
+        kprintln(&resp, n);
+        kprintln("bote: mcp-response-end", 22);
+    } else {
+        kprintln("bote: NO mcp response", 21);
+    }
+    proc_reap(pid);
+    kprintln("bote: mcp selftest done", 23);
+    return 0;
+}
+bote_mcp_selftest();
 #endif
 
 #ifdef BENCH_CONNECT_SELFTEST

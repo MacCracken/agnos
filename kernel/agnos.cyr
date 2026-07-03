@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.51.7
+# agnos.cyr — AGNOS kernel v1.52.0
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
@@ -93,6 +93,7 @@ include "core/ramdisk.cyr"
 include "core/block.cyr"
 include "core/gpt.cyr"
 include "core/r8169.cyr"
+include "core/hda.cyr"          # HD-Audio (Azalia) output driver — 1.52.x audio arc
 include "core/net.cyr"          # L2/L3 core: eth/arp/ipv4/udp transport + UDP listener table
 include "core/net_dhcp.cyr"      # net.cyr split (1.36.1) — order preserved → byte-identical
 include "core/net_icmp.cyr"

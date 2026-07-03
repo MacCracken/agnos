@@ -1,0 +1,115 @@
+# === Intel HDA / Azalia audio-output driver ===================================
+#
+# Sovereign polled HD-Audio output driver. Target: archaemenid PCI 04:00.6
+# [1022:15e3] AMD Ryzen HD Audio, codec Realtek ALC897 (0x10ec0897), front
+# headphone jack. Structurally a standard Intel HD Audio 1.0a controller
+# (portable AMD/Intel) — the AMD ACP DSP (04:00.5) and HDMI-audio (04:00.1)
+# are OUT of scope.
+#
+# Model: POLLED / no-IRQ (the r8169 IMR=0 posture) — INTCTL@0x20 stays 0 for
+# the whole 1.52.x arc; streams are serviced from the 100 Hz timer tick or
+# inside a blocking snd_write window. Reuses the iron-proven PCI/DMA machinery
+# the NVMe / r8169 drivers established verbatim (no platform bring-up).
+#
+# Source priority: Intel HD Audio 1.0a spec + Linux sound/pci/hda (convergence)
+# + FreeBSD snd_hda. Adversarially-verified implementation plan:
+#   agnosticos/docs/development/planning/audio-arc-152x-plan.md  (the "how")
+#   agnosticos/docs/development/planning/audio-arc-152x.md        (the "why/scope")
+#
+# Arc bites: B0 probe (this cut) -> B1 reset+codec presence -> B2 verb ring +
+# ALC897 widget-graph walk -> B3 stream/BDL arm -> B4 first tone -> B5 refill.
+# Constants + accessors grow per bite (small-bites convention).
+
+# --- Controller MMIO register offsets (Intel HDA 1.0a; only B0's are here) ---
+var HDA_GCAP = 0x00;    # Global Capabilities (16-bit): OSS/ISS/BSS/64OK
+var HDA_VMIN = 0x02;    # Minor Version (8-bit)
+var HDA_VMAJ = 0x03;    # Major Version (8-bit)
+
+# --- Known controller PCI identities (B0 probe order) ---
+# Exact IDs disambiguate the analog HDA controller from the same-class
+# HDMI-audio (04:00.1) / ACP-DSP (04:00.5) functions on archaemenid, and
+# from QEMU's Intel ICH6 model — a bare class-probe returns the FIRST class
+# match, which on archaemenid is the HDMI-audio function, not our controller.
+var HDA_VENDOR_AMD    = 0x1022;   # archaemenid AMD Ryzen HD Audio
+var HDA_DEV_AMD_15E3  = 0x15E3;
+var HDA_VENDOR_INTEL  = 0x8086;   # QEMU -device intel-hda (ICH6)
+var HDA_DEV_INTEL_ICH6 = 0x2668;
+
+# --- Driver state ---
+var hda_present   = 0;
+var hda_pci_idx   = 0 - 1;
+var hda_mmio_base = 0;
+
+# === MMIO accessors (r8169 clone; UC register file) ===========================
+# Write accessors + the readback-flush land in B1 (first register write).
+
+fn hda_read8(off) {
+    return load8(hda_mmio_base + off);
+}
+
+fn hda_read16(off) {
+    return load16(hda_mmio_base + off);
+}
+
+fn hda_read32(off) {
+    return load32(hda_mmio_base + off);
+}
+
+# === B0 — Probe (roadmap 1.52.0) ==============================================
+# Locate the controller, map BAR0 UC, enable bus-master, read GCAP + version.
+# Read-only, lowest-risk bite. Returns 1 on success, 0 if absent/unusable.
+# Success gate: OSS >= 1, version 1.0. QEMU (-device intel-hda) resets
+# GCAP=0x4401 -> OSS=4 ISS=4 64OK=1.
+fn hda_probe() {
+    # Prefer exact vendor:device (archaemenid, then QEMU), fall back to the
+    # generic HDA class (0x04 multimedia / 0x03 audio / 0x00) for other boards.
+    var idx = pci_find(HDA_VENDOR_AMD, HDA_DEV_AMD_15E3);
+    if (idx < 0) { idx = pci_find(HDA_VENDOR_INTEL, HDA_DEV_INTEL_ICH6); }
+    if (idx < 0) { idx = pci_find_by_class(0x04, 0x03, 0x00); }
+    if (idx < 0) {
+        kprintln("hda: no controller found", 24);
+        return 0;
+    }
+
+    # HDA MMIO is always BAR0, 64-bit.
+    var bar = pci_bar_64(idx, 0);
+    if (bar == 0) {
+        kprintln("hda: no MMIO BAR0", 17);
+        return 0;
+    }
+
+    # CORB/RIRB/BDL are all bus-master DMA — mandatory, silent without it.
+    pci_enable_bus_master_idx(idx);
+
+    hda_present   = 1;
+    hda_pci_idx   = idx;
+    hda_mmio_base = bar;
+
+    # Register file is uncacheable.
+    vmm_remap_uc_2mb(bar);
+
+    var gcap = hda_read16(HDA_GCAP);
+    var oss  = (gcap >> 12) & 0xF;    # output stream count
+    var iss  = (gcap >> 8) & 0xF;     # input stream count
+    var vmaj = hda_read8(HDA_VMAJ);
+    var vmin = hda_read8(HDA_VMIN);
+
+    kprint("hda: found ", 11);
+    kprint_hex(pci_vendor(idx));
+    kprint(":", 1);
+    kprint_hex(pci_device(idx));
+    kprint(" OSS=", 5);
+    kprint_num(oss);
+    kprint(" ISS=", 5);
+    kprint_num(iss);
+    kprint(" v", 2);
+    kprint_num(vmaj);
+    kprint(".", 1);
+    kprint_num(vmin);
+    kprintln("", 0);
+
+    if (oss < 1) {
+        kprintln("hda: WARN OSS=0 (no output streams advertised)", 46);
+    }
+    return 1;
+}

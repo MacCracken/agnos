@@ -57,7 +57,7 @@ except FileNotFoundError: pass
 print("built iam-verify image:", IMG)
 
 qemu = subprocess.Popen([
-    "qemu-system-x86_64","-machine","q35","-m","512M","-cpu","max",
+    "qemu-system-x86_64","-machine","q35","-m","512M","-enable-kvm","-cpu","host",
     "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
     "-drive", f"if=pflash,format=raw,file={WORK}/vars.fd",
     "-drive", f"file={IMG},format=raw,if=none,id=disk0",
@@ -98,8 +98,28 @@ try:
     p("agnsh banner seen:", ok)
     if not ok: p("FAIL: no agnsh banner"); sys.exit(1)
 
+    # Type `iam` RELIABLY. The first keystroke after the prompt intermittently drops
+    # over HMP sendkey (agnsh then saw "am" → NL-intent path, iam never ran), so: prime
+    # a fresh prompt, type char-by-char, VERIFY the echo shows "iam", and retype on a
+    # drop before committing with Enter. echo appears on serial ("[ASSIST] > iam").
+    def type_iam():
+        for _attempt in range(6):
+            s.sendall(b"sendkey ret\n"); time.sleep(0.7); drain()
+            base = len(ser())
+            for ch in "iam":
+                s.sendall(("sendkey "+ch+"\n").encode()); time.sleep(0.15); drain()
+            time.sleep(0.5)
+            echoed = ser()[base:].split("[ASSIST] >")[-1]
+            if "iam" in echoed:
+                return True
+            for _ in range(8):                      # dropped a key → clear the line, retry
+                s.sendall(b"sendkey backspace\n"); time.sleep(0.05)
+            drain()
+        return False
+    if not type_iam():
+        p("FAIL: could not type 'iam' cleanly over sendkey (6 tries)"); s.sendall(b"quit\n"); sys.exit(1)
     m = len(ser())
-    typ("iam\n", settle=1.0)                       # bareword iam -> /bin/iam (402 KB ELF off ext2, TCG-slow)
+    s.sendall(b"sendkey ret\n"); time.sleep(1.0)   # commit → run /bin/iam (402 KB ELF off ext2, TCG-slow)
     deadline = time.time() + 60
     seg = ""
     while time.time() < deadline:
