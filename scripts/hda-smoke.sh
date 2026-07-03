@@ -1,7 +1,9 @@
 #!/bin/bash
-# hda-smoke — B0 acceptance for the 1.52.x audio arc. Boots a production AGNOS
-# kernel in QEMU with a QEMU Intel HD-Audio controller (-device intel-hda) and
-# asserts the boot-time HDA probe finds it and reads a sane GCAP.
+# hda-smoke — B0+B1 acceptance for the 1.52.x audio arc. Boots a production
+# AGNOS kernel in QEMU with a QEMU Intel HD-Audio controller (-device intel-hda)
+# + an attached codec (hda-duplex) and asserts: (B0) the boot-time HDA probe
+# finds the controller and reads a sane GCAP; (B1) the CRST reset handshake
+# completes and STATESTS reports the codec present (codecs != 0x0000).
 #
 # B0 is a read-only probe wired unconditionally into device-init (kernel/core/
 # hda.cyr → hda_probe() in main.cyr), so NO build flag is needed — a normal
@@ -62,7 +64,9 @@ timeout "$DWELL" qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
     -drive "file=$IMG,format=raw,if=none,id=disk0" \
     -device "nvme,drive=disk0,serial=AGNOS-HDA" \
+    -audiodev "none,id=snd0" \
     -device "intel-hda,id=hda0" \
+    -device "hda-duplex,bus=hda0.0,audiodev=snd0" \
     -serial "file:$SER" -display none -no-reboot >/dev/null 2>&1 || true
 sync
 
@@ -85,6 +89,25 @@ else
     grep -a -m1 "hda: no controller found" "$SER" 2>/dev/null && echo "  (probe ran but found no controller — check -device intel-hda)"
     rc=1
 fi
+
+# B1 — reset handshake + codec presence (STATESTS). Needs the hda-duplex codec
+# attached above; without it STATESTS=0 and codecs=0x0000 (correct-but-empty).
+RST_LINE="$(grep -a -m1 "hda: reset OK, codecs=0x" "$SER" 2>/dev/null)"
+if [ -n "$RST_LINE" ]; then
+    echo "  reset: $RST_LINE"
+    CODECS="$(echo "$RST_LINE" | sed -n 's/.*codecs=0x\([0-9A-Fa-f][0-9A-Fa-f]*\).*/\1/p')"
+    if [ -n "$CODECS" ] && [ "$CODECS" != "0000" ]; then
+        echo "  PASS: codec present, codecs=0x$CODECS — B1 gate met"
+    else
+        echo "  FAIL: reset ran but no codec present (codecs=0x$CODECS)"; rc=1
+    fi
+else
+    echo "  FAIL: no 'hda: reset OK' line (reset handshake failed)"
+    grep -a -m1 "hda: reset FAIL" "$SER" 2>/dev/null
+    grep -a -m1 "hda: reset WARN" "$SER" 2>/dev/null
+    rc=1
+fi
+
 echo "  --- hda lines from serial ---"
 grep -a -iE "^hda:" "$SER" 2>/dev/null | sed 's/^/    /'
 echo "  full serial: $SER"

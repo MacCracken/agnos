@@ -20,10 +20,16 @@
 # ALC897 widget-graph walk -> B3 stream/BDL arm -> B4 first tone -> B5 refill.
 # Constants + accessors grow per bite (small-bites convention).
 
-# --- Controller MMIO register offsets (Intel HDA 1.0a; only B0's are here) ---
-var HDA_GCAP = 0x00;    # Global Capabilities (16-bit): OSS/ISS/BSS/64OK
-var HDA_VMIN = 0x02;    # Minor Version (8-bit)
-var HDA_VMAJ = 0x03;    # Major Version (8-bit)
+# --- Controller MMIO register offsets (Intel HDA 1.0a) ---
+var HDA_GCAP = 0x00;     # Global Capabilities (16-bit): OSS/ISS/BSS/64OK
+var HDA_VMIN = 0x02;     # Minor Version (8-bit)
+var HDA_VMAJ = 0x03;     # Major Version (8-bit)
+var HDA_GCTL = 0x08;     # Global Control (32-bit): bit0 = CRST
+var HDA_STATESTS = 0x0E; # State Change Status (16-bit): codec-present bitmask
+
+# --- Bit fields ---
+var GCTL_CRST     = 0x1;      # GCTL bit0: 0 = in reset, 1 = run
+var STATESTS_MASK = 0x7FFF;   # 15 valid codec-address bits
 
 # --- Known controller PCI identities (B0 probe order) ---
 # Exact IDs disambiguate the analog HDA controller from the same-class
@@ -36,12 +42,20 @@ var HDA_VENDOR_INTEL  = 0x8086;   # QEMU -device intel-hda (ICH6)
 var HDA_DEV_INTEL_ICH6 = 0x2668;
 
 # --- Driver state ---
-var hda_present   = 0;
-var hda_pci_idx   = 0 - 1;
-var hda_mmio_base = 0;
+var hda_present    = 0;
+var hda_pci_idx    = 0 - 1;
+var hda_mmio_base  = 0;
+var hda_codec_mask = 0;       # STATESTS codec-present bitmask (set by hda_reset, B1)
+
+# rdtsc cycles per microsecond. The TSC is invariant (fixed base rate, not the
+# boost frequency), so this is ~constant per box; 3000 = 3 GHz matches the
+# xhci_port spin baseline (xhci_port.cyr:558). The reset settle budgets below
+# are ~2x the spec floor to absorb per-box TSC-rate variance. QEMU/KVM: rdtsc
+# reads the host TSC.
+var HDA_TSC_MHZ = 3000;
 
 # === MMIO accessors (r8169 clone; UC register file) ===========================
-# Write accessors + the readback-flush land in B1 (first register write).
+# Reads are bare loads; writes carry a readback-flush (added B1).
 
 fn hda_read8(off) {
     return load8(hda_mmio_base + off);
@@ -53,6 +67,37 @@ fn hda_read16(off) {
 
 fn hda_read32(off) {
     return load32(hda_mmio_base + off);
+}
+
+# Writes carry a readback-flush (load the reg back, discard) to push the store
+# past any posted-write reordering — the nvme_mmio_write32 convention
+# (nvme.cyr:83-91). The UC mapping makes it defensive-redundant; one read/write.
+fn hda_write8(off, val) {
+    store8(hda_mmio_base + off, val);
+    var flush = load8(hda_mmio_base + off);
+    return 0;
+}
+
+fn hda_write16(off, val) {
+    store16(hda_mmio_base + off, val);
+    var flush = load16(hda_mmio_base + off);
+    return 0;
+}
+
+fn hda_write32(off, val) {
+    store32(hda_mmio_base + off, val);
+    var flush = load32(hda_mmio_base + off);
+    return 0;
+}
+
+# hda_udelay(us) — busy-spin >= us microseconds via an rdtsc cycle count
+# (GAP-1: agnos has no udelay/usleep). The xhci_port.cyr:562 idiom. Used for
+# the HDA reset settle floors (PLL 100us, codec-discovery 521us).
+fn hda_udelay(us) {
+    var t0 = rdtsc();
+    var target = us * HDA_TSC_MHZ;
+    while ((rdtsc() - t0) < target) { }
+    return 0;
 }
 
 # === B0 — Probe (roadmap 1.52.0) ==============================================
@@ -112,4 +157,77 @@ fn hda_probe() {
         kprintln("hda: WARN OSS=0 (no output streams advertised)", 46);
     }
     return 1;
+}
+
+# === B1 — Reset + codec presence (roadmap 1.52.1) =============================
+# CRST reset handshake + STATESTS codec-present read. Polled, INTCTL stays 0.
+# Sets hda_codec_mask. Returns the codec bitmask (>0) on success, 0 if no codec
+# responded (settle/timing suspect), -1 on stuck-CRST or an all-ones (link-down)
+# read. QEMU sets STATESTS bit0 instantly; the settle-timing is iron-only.
+fn hda_reset() {
+    if (hda_present == 0) { return 0; }
+
+    # If the controller is already running, clear stale codec-status bits
+    # BEFORE reset (never write STATESTS while in reset — LKML erratum).
+    if ((hda_read32(HDA_GCTL) & GCTL_CRST) == GCTL_CRST) {
+        hda_write16(HDA_STATESTS, STATESTS_MASK);
+    }
+
+    # Enter reset: write GCTL=0 (clears CRST + all controls, the reset value —
+    # the azx_reset idiom). Poll bit0 -> 0 (bounded ~ a few ms).
+    hda_write32(HDA_GCTL, 0);
+    var i = 0;
+    while (i < 1000) {
+        if ((hda_read32(HDA_GCTL) & GCTL_CRST) == 0) { break; }
+        hda_udelay(10);
+        i = i + 1;
+    }
+    if ((hda_read32(HDA_GCTL) & GCTL_CRST) != 0) {
+        kprintln("hda: reset FAIL (CRST high)", 27);
+        return 0 - 1;
+    }
+
+    # Settle #1 — PLL / codec-reset, spec floor 100us (budget 200us).
+    hda_udelay(200);
+
+    # Exit reset: CRST=1. Poll bit0 -> 1 (do not assume instantaneous).
+    hda_write32(HDA_GCTL, GCTL_CRST);
+    i = 0;
+    while (i < 1000) {
+        if ((hda_read32(HDA_GCTL) & GCTL_CRST) == GCTL_CRST) { break; }
+        hda_udelay(10);
+        i = i + 1;
+    }
+    if ((hda_read32(HDA_GCTL) & GCTL_CRST) == 0) {
+        kprintln("hda: reset FAIL (CRST low)", 26);
+        return 0 - 1;
+    }
+
+    # Settle #2 — codec discovery, spec floor 521us / 25 frames (budget 1500us).
+    hda_udelay(1500);
+
+    # Read STATESTS in a re-read loop; nonzero = codec-present bitmask.
+    var sts = 0;
+    i = 0;
+    while (i < 100) {
+        sts = hda_read16(HDA_STATESTS) & STATESTS_MASK;
+        if (sts != 0) { break; }
+        hda_udelay(100);
+        i = i + 1;
+    }
+
+    # All 15 bits set = floating / failed read (link down), not 15 real codecs.
+    if (sts == STATESTS_MASK) {
+        kprintln("hda: reset WARN codecs=0x7FFF (link down?)", 42);
+        hda_codec_mask = 0;
+        return 0 - 1;
+    }
+
+    hda_codec_mask = sts;
+    kprint("hda: reset OK, codecs=0x", 24);
+    kprint_byte((sts >> 8) & 0xFF);
+    kprint_byte(sts & 0xFF);
+    if (sts == 0) { kprint(" (none - timing?)", 17); }
+    kprintln("", 0);
+    return sts;
 }

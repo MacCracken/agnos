@@ -594,6 +594,10 @@ if (nvme_admin_init() == 1) {
 # 0). No-op if no controller present (QEMU smoke without -device intel-hda).
 # See kernel/core/hda.cyr + agnosticos audio-arc-152x-plan.md.
 hda_probe();
+# HDA audio Phase B1 (1.52.1) — GCTL.CRST reset handshake + STATESTS codec
+# presence. No-op if hda_probe didn't bind a controller. Prints
+# `hda: reset OK, codecs=0xNNNN`. Polled (INTCTL stays 0).
+hda_reset();
 # GPT Phase 1 — probe the active block backend (NVMe-first by override
 # policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
 # decode + walk the first 4 KB of the partition entry array, print a one-

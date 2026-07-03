@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — 1.52.x audio arc (→ 1.52.1)
+- **B1 — HDA reset handshake + codec presence** (`kernel/core/hda.cyr`; `hda_reset()` wired
+  into `main.cyr` device-init right after `hda_probe`). GCTL.CRST enter-reset (write `GCTL=0`,
+  the `azx_reset` idiom) → poll bit0→0 → **PLL settle (budget 200 µs)** → exit-reset (CRST=1) →
+  poll bit0→1 → **codec-discovery settle (budget 1500 µs, ≥ the 521 µs / 25-frame §4.3 floor)** →
+  STATESTS re-read loop for the codec-present bitmask. Branches `0` (settle/timing suspect) vs
+  all-ones `0x7FFF` (link down) vs a real mask; sets `hda_codec_mask`; prints
+  `hda: reset OK, codecs=0xNNNN`. Polled — INTCTL stays 0. **QEMU-PASS: `codecs=0x0001`**
+  (one codec at addr 0). Settle-timing correctness is iron-only (QEMU sets STATESTS instantly).
+- **MMIO write accessors** `hda_write8/16/32` (r8169 clone + the `nvme_mmio_write32`
+  readback-flush) and **`hda_udelay(us)`** — an rdtsc-calibrated busy-spin (GAP-1: agnos has no
+  `udelay`), the `xhci_port.cyr:562` idiom, `HDA_TSC_MHZ=3000` (invariant TSC, ~2× settle margin).
+- `hda-smoke.sh` extended: attaches an `hda-duplex` codec (null audiodev) and adds the B1
+  gate (reset-OK line + `codecs != 0x0000`). B0+B1 both green.
+
+**Next bite: B2** — CORB/RIRB verb ring + the ALC897 widget-graph walk to a DAC + front output
+pin (the one genuinely-novel bite; QEMU proves ring round-trip only, the graph walk is iron-gated).
+
 ## [1.52.0] — 2026-07-03
 
 **▶ 1.52.0 — OPENS the audio-output (HDA/Azalia) arc** (roadmap hardware/feature lane →
