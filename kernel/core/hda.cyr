@@ -352,8 +352,9 @@ fn hda_verb(codec, nid, verb20) {
         if (wp != hda_rirb_rp) {
             hda_rirb_rp = (hda_rirb_rp + 1) & 0xFF;
             var resp = load32(hda_rirb_phys + hda_rirb_rp * 8);   # dword0 = response
-            hda_write8(HDA_RIRBSTS, 0x5);   # ack RINTFL+overrun (W1C) → resets
-                                            # QEMU's rirb_count so corb_run keeps draining
+            # ack RINTFL+overrun (W1C) → resets QEMU's rirb_count so corb_run
+            # keeps draining the CORB (the RINTCNT gate, see hda_ring_init).
+            hda_write8(HDA_RIRBSTS, 0x5);
             return resp;
         }
         hda_udelay(1);
