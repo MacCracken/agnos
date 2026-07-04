@@ -40,6 +40,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   aligning the manifest with the installed `cycc` and unblocking the cyrius-doom (B7) userland build.
   Same-size codegen; check.sh 11/11, hda-smoke + snd-smoke green.
 
+### Fixed — B7: the band's first ring-3 exercise (**first cyrius-doom sound on AGNOS**)
+- **PCM ring CPU-access VA was a low identity VA absent from per-process CR3 → every `snd_*` call
+  from ring 3 `#PF`'d.** `hda.cyr` cached the ring's write VA as `pmm_kva_for_access(pcm)`, which for
+  `phys < 256 MB` (the ring lands at `0x600000` = 6 MB) returns the **identity** VA `0x600000`. Per
+  the VM design (`vmm.cyr`/`proc.cyr`) low identity lives in each process's **own** `PDPT[0]` low PDs
+  — it is *not* in a ring-3 process's page table — so the instant cyrius-doom (ring 3) called
+  `snd_open#64`, whose 64 KB cold-start zero-fill writes the ring, the write faulted (doom died with
+  `run: exit 142` = 128 + `#PF`). **`SND_SELFTEST` never caught this** because it drives the band from
+  *kernel* context (kernel CR3, where the identity map is present) — exactly the ring-3 gap
+  snd-smoke.sh flagged as "gets its real exercise from cyrius-doom (B7)". Fix: cache the ring's
+  **direct-map alias** `DIRECTMAP_BASE + phys` instead — the direct-map (`PDPT[8+]`) is mirrored into
+  **every** CR3 (`proc.cyr`), so all `snd_*` handlers reach the ring under the *caller's* CR3. The BDL
+  still hands the controller `hda_pcm_phys`, so DMA is unchanged — this only moves CPU access to the
+  every-CR3 alias.
+- **Validated end-to-end in QEMU** via a new `DOOM_AUDIO_SELFTEST` kernel + `scripts/doom-audio-smoke.sh`:
+  it stages `/bin/doom` (cyrius-doom `--agnos`) + `/DOOM1.WAD` on the ext2 root, boots gnoboot+OVMF+NVMe,
+  runs `/bin/doom /DOOM1.WAD --audio-test` from disk (ring 3), and captures the `intel-hda` output to a
+  wav. All 8 test SFX play (pistol/shotgun/door/pickup/pain/explosion + L/R pan) and the capture is
+  loud and clean — **PEAK=24287, RMS≈2798** over ~2.1 MB — real DOOM WAD SFX reaching the DAC through
+  `mixer → sys_snd_write_nb#66 → the ring-3 band → HDA ring → codec`. First cyrius-doom sound on AGNOS,
+  and the first real ring-3 exercise of `snd_open#64`/`config#65`/`write_nb#66`/`close#67`/`drain#68`.
+  (Paired cyrius-doom **0.31.0**: the `audio_write→sys_snd_*` retarget + 11025→48000 Bresenham
+  upsample, plus two `#ifdef` fall-throughs where the agnos `audio_init`/`audio_shutdown` branches ran
+  the ALSA-only tail on a fake handle.)
+
 ## [1.52.6] — 2026-07-03
 
 ### Added — 1.52.x audio arc

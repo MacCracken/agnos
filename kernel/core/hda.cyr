@@ -1007,7 +1007,15 @@ fn hda_stream_arm() {
     var pcm = pmm_alloc_2mb();
     if (pcm == 0) { kprintln("hda: PCM ring alloc failed", 26); return 0; }
     iommu_register_dma(pcm);
-    var pcm_va = pmm_kva_for_access(pcm);   # coherent WB VA (identity <=256MB / direct-map above)
+    # Ring CPU-access VA: ALWAYS the direct-map alias (DIRECTMAP_BASE + phys), NOT
+    # pmm_kva_for_access's identity-for-<256MB result. The ring is written from the
+    # ring-3 snd_* handlers (#64/#66) which run under the CALLER's per-proc CR3, and
+    # only the direct-map (PDPT[8+]) is mirrored into every CR3 — the low identity map
+    # (phys<256MB, e.g. this 0x600000 ring) lives in the per-proc PDPT[0]'s OWN low PDs,
+    # absent from a ring-3 process's table -> a #PF the moment snd_open zero-fills it.
+    # The direct-map covers ALL RAM (pmm_setup_directmap 0..top_phys) so phys<256MB is
+    # aliased there too; DMA still uses hda_pcm_phys, so this only changes CPU access.
+    var pcm_va = DIRECTMAP_BASE + pcm;
     hda_pcm_phys = pcm;
     hda_pcm_va = pcm_va;                    # cache the ring VA for the B5 refill servicer
     hda_ring_half = 0x8000;                 # 32 KB double-buffer unit (== `half` below)

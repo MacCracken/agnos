@@ -2198,6 +2198,21 @@ sh_exec("run /bin/doom", 13);
 kprintln("exec: doom returned", 19);
 #endif
 
+#ifdef DOOM_AUDIO_SELFTEST
+# 1.52.7 — cyrius-doom audio bring-up (the FIRST real ring-3 exercise of the
+# snd_write#66 user-buffer path — snd-smoke drives the band from kernel context,
+# doom drives it from ring 3). Runs `/bin/doom /DOOM1.WAD --audio-test`: doom's
+# --audio-test opens sys_snd_open#64 / config#65, then plays 6 real WAD SFX + an
+# L/R pan over ~8s via sys_snd_write_nb#66, then closes (#67). The wad path is
+# passed EXPLICITLY as argv[1] so --audio-test lands at argv[2] (doom's flag loop
+# starts at ai=2); scripts/doom-audio-smoke.sh captures the HDA output to a wav
+# and asserts it's non-silent. doom exits when the ~8s test finishes, so the boot
+# does NOT park here (unlike DOOM_SELFTEST's forever game loop).
+kprintln("exec: running /bin/doom --audio-test", 36);
+sh_exec("run /bin/doom /DOOM1.WAD --audio-test", 38);
+kprintln("exec: doom audio-test returned", 30);
+#endif
+
 # 1.41.3 — FS-syscall self-test (compile-gated, FS_SYSCALL_SELFTEST=1). Drives
 # the new real FS syscalls (mkdir/open+CREAT/stat/rename/getdents/unlink/rmdir/
 # sync) through ksyscall() with a real >=2 MB user-range scratch (pmm_alloc_2mb
