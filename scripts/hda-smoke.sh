@@ -5,7 +5,9 @@
 # finds the controller and reads a sane GCAP; (B1) the CRST reset handshake
 # completes and STATESTS reports the codec present; (B2a) the CORB/RIRB verb
 # ring round-trips consecutive verbs (VENDOR_ID + NODECOUNT); (B2b-1) the AFG
-# widget walk classifies DAC/Pin and dumps each output pin's CONFIG_DEFAULT.
+# widget walk classifies DAC/Pin and dumps each output pin's CONFIG_DEFAULT;
+# (B2b-2) pin-select + DAC-trace + output-enable run; (B3) an output DMA stream
+# arms and SD_LPIB advances.
 #
 # B0 is a read-only probe wired unconditionally into device-init (kernel/core/
 # hda.cyr → hda_probe() in main.cyr), so NO build flag is needed — a normal
@@ -161,6 +163,19 @@ if [ -n "$ROUTE_LINE" ] && grep -aq "hda: output path enabled" "$SER" 2>/dev/nul
 else
     echo "  FAIL: output path not enabled"
     grep -a -m1 -E "hda: no output pin|hda: no DAC for pin" "$SER" 2>/dev/null
+    rc=1
+fi
+
+# B3 — stream + BDL DMA-arm: SD_LPIB advancing proves the controller is fetching
+# the PCM ring over DMA (QEMU-verifiable). Wrong SDnFMT still passes here (QEMU
+# resamples) — pitch correctness is iron-only; B4 is the audible gate.
+STREAM_LINE="$(grep -a -m1 "hda: stream sd=0x" "$SER" 2>/dev/null)"
+if [ -n "$STREAM_LINE" ] && grep -aq "hda: stream running (LPIB advancing)" "$SER" 2>/dev/null; then
+    echo "  stream: $STREAM_LINE"
+    echo "  PASS: output stream armed, SD_LPIB advancing (DMA fetching) — B3 gate met"
+else
+    echo "  FAIL: stream not running / LPIB not advancing"
+    grep -a -m1 -E "hda: stream armed|hda: OSS=0|hda: BDL alloc|hda: PCM ring alloc" "$SER" 2>/dev/null
     rc=1
 fi
 

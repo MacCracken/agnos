@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — 1.52.x audio arc (→ 1.52.3)
+- **B3 — output stream + BDL DMA-arm** (`hda_stream_arm` in `kernel/core/hda.cyr`, wired into
+  `main.cyr` after `hda_codec_route`). Allocates a BDL ring (WB, `pmm_alloc`) + a WC-mapped PCM ring
+  (`pmm_alloc_2mb` + `vmm_remap_wc_2mb`, the framebuffer WC path), programs the output stream
+  descriptor at **`0x80 + ISS*0x20`** (SDO0; ISS from live GCAP, not hardcoded): SRST handshake →
+  stream tag → CBL → **SDnFMT `0x0011`** (48k/16/2ch — NOT `0x4011`/44.1 kHz) → LVI → BDL base →
+  RUN (tag preserved). Binds the DAC both sides (codec `SET_CONVERTER_FORMAT` = same `0x0011`,
+  `SET_STREAMID` = `tag<<4`). Device reads phys (BDL/PCM); driver accesses via `pmm_kva_for_access`
+  (identity ≤256 MB / direct-map above). **QEMU-PASS:** `hda: stream sd=0x100 tag=1 fifos=256
+  lpib=196` + `hda: stream running (LPIB advancing)` — the DMA engine is fetching the ring.
+- **Spec-verified against Intel HDA 1.0a** (5-agent adversarial pass, derive-from-spec then diff):
+  **5/5 CONFIRMED, 0 defects** on the iron-only traps QEMU can't catch — SDnFMT pitch (0x0011 vs the
+  0x4011 44.1 kHz trap) + controller/codec format-match, the `0x80+ISS*0x20` sd_base, the SRST
+  handshake + tag-before-RUN + tag-preserved-on-RUN ordering, the BDL 16-byte/128-align/LVI/CBL
+  layout, and the phys-for-DMA vs `pmm_kva_for_access`-for-CPU discipline.
+
+**Next bite: B4** — first tone: precompute an i16 sine into the WC ring, loop the BDL. Headline —
+first sound from sovereign agnos: QEMU `-audiodev wav` RMS assert **and** the archaemenid front jack.
+
 ## [1.52.2] — 2026-07-03
 
 ### Added — 1.52.x audio arc

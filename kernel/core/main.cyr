@@ -612,6 +612,10 @@ hda_codec_enum();
 # output-enable sequence (COEF/power/pinctl/EAPD/unmute). QEMU exercises the
 # machinery; the ALC897 amp/EAPD/COEF effects are iron-only. Polled.
 hda_codec_route();
+# HDA audio Phase B3 (1.52.3) — arm an output DMA stream: BDL ring + WC PCM ring
+# + stream descriptor (48k/16/2ch, SDnFMT=0x0011), bind tag<->DAC, RUN. Gate:
+# SD_LPIB advances (DMA fetching). Silence now; B4 fills a sine. Polled.
+hda_stream_arm();
 # GPT Phase 1 — probe the active block backend (NVMe-first by override
 # policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
 # decode + walk the first 4 KB of the partition entry array, print a one-

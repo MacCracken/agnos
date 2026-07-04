@@ -90,6 +90,25 @@ var AMP_OUT_UNMUTE = 0xB000;  # SET_AMP: OUTPUT|LEFT|RIGHT, mute bit7=0, gain[6:
 var COEF_CLR_BIT5  = 0xFFFFFFDF; # mask to clear bit5 (no '~' operator in cyrius)
 var NID_ALC_COEF   = 0x20;    # Realtek ALC vendor widget carrying the EAPD COEF
 
+# --- B3: stream descriptor + BDL ---
+var HDA_SD_BASE   = 0x80;     # first stream descriptor register block
+var HDA_SD_STRIDE = 0x20;     # bytes per stream descriptor
+var SD_CTL        = 0x00;     # SDnCTL (bits 23:0) + SDnSTS (byte at +0x03)
+var SD_LPIB       = 0x04;     # link position in buffer (read-only)
+var SD_CBL        = 0x08;     # cyclic buffer length (bytes)
+var SD_LVI        = 0x0C;     # last valid BDL index (16-bit)
+var SD_FIFOS      = 0x10;     # FIFO size (16-bit)
+var SD_FMT        = 0x12;     # stream format (16-bit)
+var SD_BDPL       = 0x18;     # BDL base low (32-bit)
+var SD_BDPU       = 0x1C;     # BDL base high (32-bit)
+var SD_SRST       = 0x1;      # SDnCTL bit0: stream reset
+var SD_RUN        = 0x2;      # SDnCTL bit1: stream run
+var SD_TAG_SHIFT  = 20;       # SDnCTL stream tag position (bits 23:20)
+var HDA_FMT_48K_16_2 = 0x0011; # 48k base (bit14=0) | 16-bit (001<<4) | 2ch (chan-1=1)
+var BDL_IOC       = 0x1;      # BDL entry flags bit0: interrupt-on-completion
+var V_SET_STREAM_FMT = 0x2;   # 4-bit verb: Set Converter Format
+var V_SET_STREAMID   = 0x706; # 12-bit verb: Set Converter Stream/Channel
+
 # --- Known controller PCI identities (B0 probe order) ---
 # Exact IDs disambiguate the analog HDA controller from the same-class
 # HDMI-audio (04:00.1) / ACP-DSP (04:00.5) functions on archaemenid, and
@@ -125,6 +144,12 @@ var hda_w_start   = 0;        # AFG widget range start
 var hda_w_count   = 0;        # AFG widget count
 var hda_out_pin   = 0;        # selected output pin (set by hda_codec_route)
 var hda_out_dac   = 0;        # DAC feeding the selected pin
+var hda_oss       = 0;        # GCAP output stream count (set by hda_probe)
+var hda_iss       = 0;        # GCAP input stream count (output SDs start after these)
+var hda_bdl_phys  = 0;        # BDL ring phys
+var hda_pcm_phys  = 0;        # WC PCM ring phys
+var hda_sd_base   = 0;        # output stream descriptor register base offset
+var hda_stream_tag = 1;       # stream tag binding DAC <-> stream
 
 # === MMIO accessors (r8169 clone; UC register file) ===========================
 # Reads are bare loads; writes carry a readback-flush (added B1).
@@ -208,6 +233,8 @@ fn hda_probe() {
     var gcap = hda_read16(HDA_GCAP);
     var oss  = (gcap >> 12) & 0xF;    # output stream count
     var iss  = (gcap >> 8) & 0xF;     # input stream count
+    hda_oss  = oss;
+    hda_iss  = iss;
     var vmaj = hda_read8(HDA_VMAJ);
     var vmin = hda_read8(HDA_VMIN);
 
@@ -633,4 +660,94 @@ fn hda_codec_route() {
     kprintln("", 0);
     kprintln("hda: output path enabled", 24);
     return 1;
+}
+
+# === B3 — stream + BDL DMA-arm (roadmap 1.52.3) ===============================
+# Allocate a BDL ring (WB) + a WC-mapped PCM ring, program the OUTPUT stream
+# descriptor at 0x80 + ISS*0x20 (48k/16/2ch — SDnFMT=0x0011, NOT 0x4011 which is
+# 44.1kHz), bind the stream tag to the DAC on BOTH sides (controller SDnFMT +
+# codec SET_STREAM_FMT must MATCH or the stream faults), then set RUN. Gate:
+# SD_LPIB advances (DMA fetching). Silence for now; B4 fills a sine (first tone).
+fn hda_stream_arm() {
+    if (hda_present == 0 || hda_out_dac == 0) { return 0; }
+    if (hda_oss == 0) { kprintln("hda: OSS=0, no output stream", 28); return 0; }
+    var sd = HDA_SD_BASE + hda_iss * HDA_SD_STRIDE;   # output SDs follow ISS inputs
+    hda_sd_base = sd;
+
+    # BDL: one WB page (128-byte-aligned — a page satisfies it).
+    var bdl = pmm_alloc();
+    if (bdl == 0) { kprintln("hda: BDL alloc failed", 21); return 0; }
+    if (vmm_is_mapped(bdl) == 0) { vmm_map(bdl, bdl, 0x83); }
+    iommu_register_dma(bdl);
+    var bdl_va = pmm_kva_for_access(bdl);
+    hda_zero_page(bdl_va);
+    hda_bdl_phys = bdl;
+
+    # PCM ring: 2 MB contiguous, WC-mapped (the framebuffer path). Use a 64 KB
+    # window (2 x 32 KB BDL entries) — ~333 ms at 48k/16/2, ample for B3/B4.
+    var pcm = pmm_alloc_2mb();
+    if (pcm == 0) { kprintln("hda: PCM ring alloc failed", 26); return 0; }
+    iommu_register_dma(pcm);
+    vmm_remap_wc_2mb(pcm);
+    var pcm_va = pmm_kva_for_access(pcm);   # valid CPU VA (identity <=256MB / direct-map above)
+    hda_pcm_phys = pcm;
+    var zi = 0;
+    while (zi < 8192) { store64(pcm_va + zi * 8, 0); zi = zi + 1; }   # zero 64 KB = silence
+
+    # BDL: 2 entries x 32 KB, each pointing at a half of the 64 KB window. Entries
+    # carry the PCM *phys* (the controller DMA-reads phys); written via bdl_va.
+    var half = 0x8000;
+    store32(bdl_va + 0,  pcm & 0xFFFFFFFF);
+    store32(bdl_va + 4,  (pcm >> 32) & 0xFFFFFFFF);
+    store32(bdl_va + 8,  half);
+    store32(bdl_va + 12, BDL_IOC);
+    store32(bdl_va + 16, (pcm + half) & 0xFFFFFFFF);
+    store32(bdl_va + 20, ((pcm + half) >> 32) & 0xFFFFFFFF);
+    store32(bdl_va + 24, half);
+    store32(bdl_va + 28, BDL_IOC);
+
+    # Stream reset (SRST set -> poll 1, clear -> poll 0).
+    hda_write32(sd + SD_CTL, SD_SRST);
+    var i = 0;
+    while (i < 1000) { if ((hda_read32(sd + SD_CTL) & SD_SRST) != 0) { break; } hda_udelay(1); i = i + 1; }
+    hda_write32(sd + SD_CTL, 0);
+    i = 0;
+    while (i < 1000) { if ((hda_read32(sd + SD_CTL) & SD_SRST) == 0) { break; } hda_udelay(1); i = i + 1; }
+
+    # Program: stream tag (RUN off) -> CBL -> FMT -> LVI -> BDL base.
+    hda_write32(sd + SD_CTL, hda_stream_tag << SD_TAG_SHIFT);
+    hda_write32(sd + SD_CBL, half * 2);
+    hda_write16(sd + SD_FMT, HDA_FMT_48K_16_2);
+    hda_write16(sd + SD_LVI, 1);
+    hda_write32(sd + SD_BDPL, bdl & 0xFFFFFFFF);
+    hda_write32(sd + SD_BDPU, (bdl >> 32) & 0xFFFFFFFF);
+    var fifos = hda_read16(sd + SD_FIFOS);
+
+    # Codec side: identical format + stream/channel on the DAC (must match SDnFMT).
+    hda_verb(hda_codec0, hda_out_dac, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
+    hda_verb(hda_codec0, hda_out_dac, (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
+
+    # RUN.
+    hda_write32(sd + SD_CTL, (hda_stream_tag << SD_TAG_SHIFT) | SD_RUN);
+
+    # Gate: LPIB advances = DMA fetching.
+    var lpib0 = hda_read32(sd + SD_LPIB);
+    hda_udelay(2000);
+    var lpib1 = hda_read32(sd + SD_LPIB);
+
+    kprint("hda: stream sd=0x", 17);
+    kprint_hex(sd);
+    kprint(" tag=", 5);
+    kprint_num(hda_stream_tag);
+    kprint(" fifos=", 7);
+    kprint_num(fifos);
+    kprint(" lpib=", 6);
+    kprint_num(lpib1);
+    kprintln("", 0);
+    if (lpib1 > lpib0) {
+        kprintln("hda: stream running (LPIB advancing)", 36);
+        return 1;
+    }
+    kprintln("hda: stream armed, LPIB not advancing", 37);
+    return 0;
 }
