@@ -5,6 +5,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.52.7] — 2026-07-04
+
 ### Added — 1.52.x audio arc (Gate 2)
 - **Gate 2 — the ring-3 `snd_*` audio syscall band `#64–#69`** (`snd_open`/`config`/`write`/`close`/
   `drain`/`avail` in `kernel/core/syscall.cyr` + the ring/slot state & helpers in `hda.cyr`). Lets
@@ -32,6 +34,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `_drain`/`_avail` in `lib/syscalls_x86_64_agnos.cyr`) — zero drift, the `sys_symlink` two-sided
   discipline. **Next: B7** — retarget cyrius-doom's `audio_write` onto `sys_snd_*` (+ its 11025→48000
   fractional upsample) for first cyrius-doom sound.
+
+### Changed
+- **Toolchain pin → 6.4.2** (`cyrius.cyml`) — adopt the cyrius release carrying the `sys_snd_*` peer,
+  aligning the manifest with the installed `cycc` and unblocking the cyrius-doom (B7) userland build.
+  Same-size codegen; check.sh 11/11, hda-smoke + snd-smoke green.
 
 ## [1.52.6] — 2026-07-03
 
