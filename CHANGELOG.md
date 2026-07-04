@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.52.4] — 2026-07-03
+
+### Added — 1.52.x audio arc
+- **B4 — first tone (first sound from sovereign agnos)** (`hda_stream_arm`, build-gated `HDA_TONE`).
+  Fills the WC PCM ring with a ~375 Hz integer triangle (128 frames/period × 128 whole periods in the
+  64 KB window → click-free BDL loop; i16 L+R via `store16` straight into the ring, avoiding the
+  module-global var-array unit trap) instead of silence, then arms the stream (B3). **Gated so
+  production boots stay silent** — the default (no-`HDA_TONE`) build is `cmp`-byte-identical to 1.52.3.
+  New `scripts/hda-tone-smoke.sh` builds `HDA_TONE=1`, boots under QEMU `-audiodev wav`, and asserts the
+  captured audio is non-silent. **QEMU-PASS: RMS=5135** — the tone reached DMA → stream → codec DAC →
+  output. Real PCM comes from producers (vani / cyrius-doom via `snd_write`) later. **Iron gate:** the
+  same `HDA_TONE` kernel drives the archaemenid ALC897 front jack (audible) — pending burn.
+
+**Next bite: B5** — streamed PCM + refill (double-buffer: refill the consumed BDL half as LPIB crosses
+the midpoint). Gate: gap-free multi-second playback. Closes Gate 1 (the kernel HDA driver).
+
 ## [1.52.3] — 2026-07-03
 
 ### Added — 1.52.x audio arc

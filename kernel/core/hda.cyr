@@ -691,8 +691,28 @@ fn hda_stream_arm() {
     vmm_remap_wc_2mb(pcm);
     var pcm_va = pmm_kva_for_access(pcm);   # valid CPU VA (identity <=256MB / direct-map above)
     hda_pcm_phys = pcm;
+    #ifdef HDA_TONE
+    # B4 first-tone (build-gated so production boots stay silent): a ~375 Hz
+    # integer triangle — 128 frames/period, 128 whole periods in the 64 KB window
+    # so the BDL loop is click-free. i16 L+R per frame, store16 straight into the
+    # WC ring (the r8169 pattern — avoids the module-global var-array unit trap).
+    # A real sine/PCM comes from producers (vani / cyrius-doom) via snd_write later.
+    var amp = 12000;
+    var f = 0;
+    while (f < 16384) {                     # 64 KB / 4 bytes-per-frame
+        var ph = f % 128;
+        var s = 0;
+        if (ph < 64) { s = (0 - amp) + (4 * amp * ph) / 128; }
+        else { s = amp - (4 * amp * (ph - 64)) / 128; }
+        store16(pcm_va + f * 4, s & 0xFFFF);
+        store16(pcm_va + f * 4 + 2, s & 0xFFFF);
+        f = f + 1;
+    }
+    kprintln("hda: tone 375Hz filled", 22);
+    #else
     var zi = 0;
     while (zi < 8192) { store64(pcm_va + zi * 8, 0); zi = zi + 1; }   # zero 64 KB = silence
+    #endif
 
     # BDL: 2 entries x 32 KB, each pointing at a half of the 64 KB window. Entries
     # carry the PCM *phys* (the controller DMA-reads phys); written via bdl_va.

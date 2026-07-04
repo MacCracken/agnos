@@ -221,6 +221,11 @@ else
         [ -n "$WINSIZE_SELFTEST" ]   && echo '#define WINSIZE_SELFTEST'
         [ -n "$NBREAD_SELFTEST" ]    && echo '#define NBREAD_SELFTEST'
         [ -n "$FBSCALE_SELFTEST" ]   && echo '#define FBSCALE_SELFTEST'
+        # HDA_TONE=1 — B4 first-tone: hda_stream_arm fills the PCM ring with a
+        # ~375 Hz triangle instead of silence. Gated so production boots stay
+        # silent. Drives scripts/hda-tone-smoke.sh (QEMU -audiodev wav RMS) and
+        # the archaemenid front-jack audible test.
+        [ -n "$HDA_TONE" ]           && echo '#define HDA_TONE'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include
