@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — 1.52.x audio arc (Gate 2)
+- **Gate 2 — the ring-3 `snd_*` audio syscall band `#64–#69`** (`snd_open`/`config`/`write`/`close`/
+  `drain`/`avail` in `kernel/core/syscall.cyr` + the ring/slot state & helpers in `hda.cyr`). Lets
+  userland (ultimately `vani` → cyrius-doom) feed PCM to the HDA output over the B5 ring. Single-
+  producer (`snd_write`) / single-consumer (DMA) with **linear 64-bit counters** (`snd_appl` producer
+  head, `snd_hw_frames` consumer head) so full-vs-empty is wrap-unambiguous. **Lock-free by design:**
+  the 100 Hz timer ISR (`hda_stream_service`) is the *sole* writer of `snd_hw_frames` + the LPIB-wrap
+  state (tracked at tick rate whenever a producer owns the ring), and the handlers are the *sole*
+  writer of `snd_appl` — disjoint atomic scalars, so the B5 review's "add a lock" finding is
+  discharged without a lock. `snd_open` disables the HDA_TONE tone-gen (`hda_stream_on=0`) to become
+  the sole ring writer; slots `0..3` (one active), auto-released on proc-exit at both exit sites
+  (mirroring `flock_release_pid`). Blocking `snd_write`/`snd_drain` use the `sock_connect#47`
+  sti-window with bounded deadlines; format fixed 48k/16/2 (producers convert). **A 3-lens design +
+  2-pass adversarial-verify workflow caught three blockers before implementation** — a pid-0
+  free-slot sentinel collision (fixed with a separate `snd_slot_used[]` flag), a wrap under-sampling
+  bug that would silence cyrius-doom after one SFX (fixed by the tick-rate ISR tracker), and an
+  XRUN-resync that broke `snd_drain` (resync now lives in write/avail only). **QEMU-validated** via a
+  hermetic `SND_SELFTEST` + `scripts/snd-smoke.sh`: the handlers return correctly (`open→0`,
+  `config(48k/16/2)→0`, bad-rate/foreign-slot/double-open all `→-1`, `avail→14335` = the exact free
+  count), and a 375 Hz square driven through `snd_copy_frames` reaches the DAC (**RMS=7344**). Fixed a
+  `snd_active_slot=-1` sentinel that a declarative module-init didn't take → runtime-init in
+  `hda_stream_arm`. check.sh 11/11, hda-smoke/tone-smoke green.
+- **Two-sided ABI frozen + cyrius peer landed.** The `#64–#69` signatures were filed as a cyrius issue
+  and implemented verbatim in **cyrius v6.4.2** (`sys_snd_open`/`_config`/`_write`/`_write_nb`/`_close`/
+  `_drain`/`_avail` in `lib/syscalls_x86_64_agnos.cyr`) — zero drift, the `sys_symlink` two-sided
+  discipline. **Next: B7** — retarget cyrius-doom's `audio_write` onto `sys_snd_*` (+ its 11025→48000
+  fractional upsample) for first cyrius-doom sound.
+
 ## [1.52.6] — 2026-07-03
 
 ### Added — 1.52.x audio arc

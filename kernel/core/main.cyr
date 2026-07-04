@@ -616,6 +616,11 @@ hda_codec_route();
 # + stream descriptor (48k/16/2ch, SDnFMT=0x0011), bind tag<->DAC, RUN. Gate:
 # SD_LPIB advances (DMA fetching). Silence now; B4 fills a sine. Polled.
 hda_stream_arm();
+#ifdef SND_SELFTEST
+# Gate-2 (B6) hermetic snd_* band self-test — drives the #64-69 handlers + fills the
+# ring with a tone the DMA loops for the WAV smoke. Build: SND_SELFTEST=1 build.sh.
+hda_snd_selftest();
+#endif
 # GPT Phase 1 — probe the active block backend (NVMe-first by override
 # policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
 # decode + walk the first 4 KB of the partition entry array, print a one-

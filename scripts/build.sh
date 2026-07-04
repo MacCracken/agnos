@@ -226,6 +226,10 @@ else
         # silent. Drives scripts/hda-tone-smoke.sh (QEMU -audiodev wav RMS) and
         # the archaemenid front-jack audible test.
         [ -n "$HDA_TONE" ]           && echo '#define HDA_TONE'
+        # SND_SELFTEST=1 — Gate 2 (B6): hermetic snd_* band self-test (hda_snd_selftest
+        # in hda.cyr) — drives the #64-69 handlers + fills the ring with a tone the DMA
+        # loops. Drives scripts/snd-smoke.sh (QEMU -audiodev wav + serial PASS marker).
+        [ -n "$SND_SELFTEST" ]       && echo '#define SND_SELFTEST'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include

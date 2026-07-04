@@ -365,6 +365,7 @@ fn fault_kill_current(vector) {
     sys_exit_code = code;
     proc_set_exit_code(pid, code);
     flock_release_pid(pid);                       # release advisory locks (mirror exit#0)
+    snd_release_pid(pid);                         # release any snd#64 audio slot (Gate 2)
     if (pid < proc_count) {
         proc_set_state(pid, 0);                   # mark dead — sched_next won't pick it
         var ppid = proc_get_ppid(pid);
@@ -655,6 +656,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # flock#59: release every advisory lock held by the exiting proc (so a
         # fork-per-accept worker that dies mid-turn can't strand the shared world).
         flock_release_pid(proc_current_get());
+        snd_release_pid(proc_current_get());      # release any snd#64 audio slot (Gate 2)
         if (proc_current_get() < proc_count) {
             proc_set_state(proc_current_get(), 0);
             # Send SIGCHLD (signal 17) to parent process
@@ -2146,6 +2148,129 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (arg1 == 3) { fb_dbg_beacon(1); stack_canary_check(canary); return net_dns_server; }
         stack_canary_check(canary);
         return 0 - 1;
+    }
+    # === Gate 2 — ring-3 audio syscall band #64-69 (frozen ABI; see §header) ======
+    # Single-producer (snd_write) / single-consumer (DMA) over the B5 64 KB ring.
+    # The timer ISR (hda_stream_service) is the SOLE writer of snd_hw_frames; these
+    # handlers are the SOLE writer of snd_appl — disjoint atomic 64-bit scalars,
+    # lock-free. Format fixed 48k/16/2 (bpf 4); producers convert. Slots 0..3, one
+    # active drives the single armed stream. Ownership = used[]!=0 && pid[]==caller.
+    if (num == 64) {
+        # snd_open() -> slot 0..3, or -1 (no device / busy / table full). a1..a4 unused.
+        # Runs IF=0 (SYSCALL SFMASK) → atomic vs the timer ISR, so the servicer-off
+        # handoff + counter init can't tear; no sti window (net_config#61 shape).
+        if (hda_present == 0 || hda_out_dac == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (snd_active_slot != (0 - 1)) { stack_canary_check(canary); return 0 - 1; }   # one live stream
+        var so_s = 0; var so_got = 0 - 1;
+        while (so_s < 4) { if (load64(&snd_slot_used + so_s * 8) == 0) { so_got = so_s; break; } so_s = so_s + 1; }
+        if (so_got == (0 - 1)) { stack_canary_check(canary); return 0 - 1; }
+        hda_stream_on = 0;                              # disable HDA_TONE tone-gen: snd_write is sole writer
+        var so_zi = 0;
+        while (so_zi < 8192) { store64(hda_pcm_va + so_zi * 8, 0); so_zi = so_zi + 1; }   # cold-start silence (64 KB)
+        var so_raw = hda_read32(hda_sd_base + SD_LPIB) & 0xFFFF;
+        snd_last_raw = so_raw; snd_wrap_epochs = 0;
+        snd_hw_frames = so_raw / 4;
+        snd_appl = snd_hw_frames + 2048;               # start ~43 ms AHEAD of the play head (into zeroed silence)
+        store64(&snd_slot_used + so_got * 8, 1);
+        store64(&snd_slot_pid + so_got * 8, proc_current_get());
+        snd_active_slot = so_got;                      # ISR tracks snd_hw_frames from the next tick
+        stack_canary_check(canary);
+        return so_got;
+    }
+    if (num == 65) {
+        # snd_config(slot=a1, rate=a2, fmt=a3) -> 0 / -1. Pure validation: the stream
+        # is hard-armed 48k/16/2, so only that tuple passes. fmt = (bits<<8)|ch = 0x1002.
+        if (arg1 < 0 || arg1 >= 4) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_used + arg1 * 8) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_pid + arg1 * 8) != proc_current_get()) { stack_canary_check(canary); return 0 - 1; }
+        if (arg2 != 48000) { stack_canary_check(canary); return 0 - 1; }
+        if (((arg3 >> 8) & 0xFF) != 16) { stack_canary_check(canary); return 0 - 1; }
+        if ((arg3 & 0xFF) != 2) { stack_canary_check(canary); return 0 - 1; }
+        stack_canary_check(canary);
+        return 0;
+    }
+    if (num == 66) {
+        # snd_write(slot=a1, buf=a2, frames=a3) -> frames written (>=0) / -1. a4 bit0 = NONBLOCK.
+        if (arg3 <= 0) { stack_canary_check(canary); return 0; }
+        if (arg1 < 0 || arg1 >= 4) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_used + arg1 * 8) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_pid + arg1 * 8) != proc_current_get()) { stack_canary_check(canary); return 0 - 1; }
+        if (arg3 > 1048576) { stack_canary_check(canary); return 0 - 1; }              # sane cap; no frames*4 overflow
+        if (is_user_range(arg2, arg3 * 4) == 0) { stack_canary_check(canary); return 0 - 1; }   # bpf=4, validated FIRST
+        var sw_nb = ksyscall_a4_get() & 1;
+        if (sw_nb == 1) {
+            if (snd_hw_frames > snd_appl) { snd_appl = snd_hw_frames; }                # underrun resync
+            var sw_f0 = 16384 - (snd_appl - snd_hw_frames) - 1;
+            var sw_n0 = arg3; if (sw_n0 > sw_f0) { sw_n0 = sw_f0; }
+            if (sw_n0 > 0) { snd_copy_frames(arg2, sw_n0); }
+            stack_canary_check(canary);
+            return sw_n0;                                                             # may be 0 = WOULD_BLOCK
+        }
+        var sw_written = 0;
+        var sw_start = timer_ticks;
+        var sw_cap = arg3 / 480 + 300;                                               # bounded DMA-stall deadline
+        preempt_disable();
+        asm { sti; }
+        while (sw_written < arg3) {
+            if (snd_hw_frames > snd_appl) { snd_appl = snd_hw_frames; }
+            var sw_fr = 16384 - (snd_appl - snd_hw_frames) - 1;
+            if (sw_fr > 0) {
+                var sw_c = arg3 - sw_written; if (sw_c > sw_fr) { sw_c = sw_fr; }
+                snd_copy_frames(arg2 + sw_written * 4, sw_c);
+                sw_written = sw_written + sw_c;
+            }
+            if (sw_written >= arg3) { break; }
+            if ((timer_ticks - sw_start) > sw_cap) { break; }
+            arch_wait();
+        }
+        asm { cli; }
+        preempt_enable();
+        stack_canary_check(canary);
+        return sw_written;
+    }
+    if (num == 67) {
+        # snd_close(slot=a1) -> 0 / -1. Free the slot; if it owned the stream, drop
+        # snd_active_slot (ISR stops tracking; the ring loops its last content — a
+        # continuous producer leaves silence — until the next snd_open zero-fills it).
+        if (arg1 < 0 || arg1 >= 4) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_used + arg1 * 8) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_pid + arg1 * 8) != proc_current_get()) { stack_canary_check(canary); return 0 - 1; }
+        store64(&snd_slot_used + arg1 * 8, 0);
+        store64(&snd_slot_pid + arg1 * 8, 0);
+        if (arg1 == snd_active_slot) { snd_active_slot = 0 - 1; }
+        stack_canary_check(canary);
+        return 0;
+    }
+    if (num == 68) {
+        # snd_drain(slot=a1) -> 0. Block until the queued audio plays out (snd_hw
+        # reaches the snapshot of snd_appl), bounded ~1s (LPIB loops forever). NO
+        # resync here — it would corrupt the completion test.
+        if (arg1 < 0 || arg1 >= 4) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_used + arg1 * 8) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_pid + arg1 * 8) != proc_current_get()) { stack_canary_check(canary); return 0 - 1; }
+        var sd_target = snd_appl;
+        var sd_start = timer_ticks;
+        preempt_disable();
+        asm { sti; }
+        while ((timer_ticks - sd_start) < 100) {                                     # ~1s cap (full ring ~34 ticks)
+            if (snd_hw_frames >= sd_target) { break; }
+            arch_wait();
+        }
+        asm { cli; }
+        preempt_enable();
+        stack_canary_check(canary);
+        return 0;
+    }
+    if (num == 69) {
+        # snd_avail(slot=a1) -> free frames (>=0) / -1. Non-blocking, IF=0-safe.
+        if (arg1 < 0 || arg1 >= 4) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_used + arg1 * 8) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&snd_slot_pid + arg1 * 8) != proc_current_get()) { stack_canary_check(canary); return 0 - 1; }
+        if (snd_hw_frames > snd_appl) { snd_appl = snd_hw_frames; }
+        var sa_free = 16384 - (snd_appl - snd_hw_frames) - 1;
+        if (sa_free < 0) { sa_free = 0; }
+        stack_canary_check(canary);
+        return sa_free;
     }
     stack_canary_check(canary);
     return 0 - 1;

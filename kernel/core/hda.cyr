@@ -164,6 +164,24 @@ var hda_last_half = 0;        # BDL half the DMA was last observed in (0 or 1)
 var hda_refills   = 0;        # refill count (diagnostic)
 var hda_gen_acc   = 0;        # HDA_TONE sweep NCO phase accumulator (16-bit)
 var hda_gen_inc   = 300;      # HDA_TONE sweep NCO phase increment (~freq), ramps
+# --- Gate 2: ring-3 snd_* syscall band (#64-69) state ---
+# The 64 KB ring is a single-producer (ring-3 snd_write) / single-consumer (DMA)
+# linear-counter buffer. Two heads, DISJOINT single-writers, so no lock:
+#   snd_appl      — PRODUCER head, total frames ever written; written ONLY by snd_write.
+#   snd_hw_frames — CONSUMER head, total frames played; written ONLY by the timer ISR
+#                   (hda_stream_service), which samples SD_LPIB at 100 Hz and tracks the
+#                   ~341 ms ring wrap so sparse ring-3 reads never miss one. Ring-3 only
+#                   READS it. free = CBL_FRAMES - (snd_appl - snd_hw_frames) - 1 (1-frame
+#                   guard) is wrap-unambiguous. CBL_FRAMES = 65536/4 = 16384.
+var snd_slot_used[4];         # 0 = free, 1 = allocated (NOT keyed on pid: pid 0 is real)
+var snd_slot_pid[4];          # owner pid (only meaningful when used[]=1)
+var snd_active_slot = 0 - 1;  # the one slot driving the single HW stream; -1 = idle
+var snd_appl        = 0;      # producer head (frames), ring-3-written
+var snd_hw_frames   = 0;      # consumer head (frames), ISR-written
+var snd_last_raw    = 0;      # last SD_LPIB byte offset seen by the ISR (wrap detect)
+var snd_wrap_epochs = 0;      # CBL wraps the ISR has counted (linearizes snd_hw_frames)
+var SND_CBL_FRAMES  = 16384;  # 64 KB / 4 bytes-per-frame (48k/16/2)
+var SND_BPF         = 4;      # bytes per frame (S16 stereo) — hard-wired
 
 # === MMIO accessors (r8169 clone; UC register file) ===========================
 # Reads are bare loads; writes carry a readback-flush (added B1).
@@ -840,11 +858,19 @@ fn hda_refill_half(h) {
 # until Gate 2 wires snd_write#66. ISR context (IF=0): an MMIO read every tick, and
 # on a crossing a full-half refill (8192 frames, tens of µs at 3 GHz — HDA_TONE-only;
 # a shipping producer must generate off-ISR, see hda_refill_half). WB stores are
-# cache-coherent (no fence). GATE-2 PREREQ: when snd_write#66 also writes the ring +
-# hda_last_half/hda_gen_* from ring-3 (IF=1), add an atomic try-lock here mirroring
-# `net_rx_lock` (or make this the sole writer + have snd_write only enqueue) — today
-# this is the SOLE caller (BSP timer), so no lock is needed yet.
+# cache-coherent (no fence). GATE-2: this ISR is the SOLE writer of snd_hw_frames +
+# the wrap state — it tracks the DMA consumer head at tick rate whenever a ring-3
+# producer owns the stream (snd_active_slot != -1), so sparse ring-3 snd_* reads
+# never miss a ~341 ms ring wrap. ring-3 writes only snd_appl (disjoint scalar,
+# atomic 64-bit) → lock-free, discharging the B5 review's lock finding.
 fn hda_stream_service() {
+    # Gate-2 consumer-head tracking (ISR = sole writer of snd_hw_frames/wrap state).
+    if (snd_active_slot != (0 - 1)) {
+        var raw = hda_read32(hda_sd_base + SD_LPIB) & 0xFFFF;   # LPIB byte offset 0..CBL-1
+        if (raw < snd_last_raw) { snd_wrap_epochs = snd_wrap_epochs + 1; }
+        snd_last_raw = raw;
+        snd_hw_frames = (snd_wrap_epochs * 65536 + raw) / 4;
+    }
     if (hda_stream_on == 0) { return 0; }
     var lpib = hda_read32(hda_sd_base + SD_LPIB);
     var cur = 0;
@@ -857,6 +883,95 @@ fn hda_stream_service() {
     return 0;
 }
 
+# === Gate 2 helpers (snd_* syscall band #64-69 support) =======================
+# Copy nbytes (a multiple of 4) from src to dst as 4-byte frames. src may be a
+# USER pointer (caller CR3 active in the handler; validated by is_user_range first).
+fn snd_blk_copy(dst, src, nbytes) {
+    var i = 0;
+    while (i < nbytes) { store32(dst + i, load32(src + i)); i = i + 4; }
+    return 0;
+}
+
+# Copy n frames (n*4 bytes) from the user buffer `uptr` into the ring at the current
+# producer head, handling the physical wrap in <=2 runs, then PUBLISH by advancing
+# snd_appl LAST (store-store order — the consumer/ISR reads snd_appl only for free-
+# space, never mid-copy). Caller guarantees n <= free (won't overrun the DMA head).
+fn snd_copy_frames(uptr, n) {
+    var start_byte = (snd_appl & 16383) * 4;          # (snd_appl mod CBL_FRAMES) * bpf
+    var nbytes = n * 4;
+    var tail = 65536 - start_byte;                     # bytes from here to the ring end (CBL=64K)
+    var run1 = nbytes;
+    if (run1 > tail) { run1 = tail; }
+    snd_blk_copy(hda_pcm_va + start_byte, uptr, run1);
+    if (nbytes > run1) { snd_blk_copy(hda_pcm_va, uptr + run1, nbytes - run1); }
+    snd_appl = snd_appl + n;                            # publish last
+    return 0;
+}
+
+# Release any snd slot owned by `pid` (proc-exit / fault-kill). Mirrors
+# flock_release_pid; called from BOTH syscall.cyr exit sites. If the released slot
+# owned the live stream, drop snd_active_slot so the ISR stops tracking.
+fn snd_release_pid(pid) {
+    var s = 0;
+    while (s < 4) {
+        if (load64(&snd_slot_used + s * 8) != 0) {
+            if (load64(&snd_slot_pid + s * 8) == pid) {
+                store64(&snd_slot_used + s * 8, 0);
+                store64(&snd_slot_pid + s * 8, 0);
+                if (s == snd_active_slot) { snd_active_slot = 0 - 1; }
+            }
+        }
+        s = s + 1;
+    }
+    return 0;
+}
+
+#ifdef SND_SELFTEST
+# Hermetic Gate-2 band self-test (B6). Drives the snd_* HANDLERS via ksyscall for
+# the non-buffer ops (open/config/avail/close — ownership + counter logic + the
+# pid-0-owner case the used[] flag was added for), and exercises snd_copy_frames'
+# ring fill + physical wrap directly (is_user_range blocks a kernel buffer through
+# snd_write#66, so the user-copy path is covered by the ring-3 producer, cyrius-doom,
+# not here). Fills the ring with a 375 Hz square so the DMA loops an audible tone for
+# the smoke's WAV capture. Runs at boot as proc 0 (proc_current_get()==0 = the owner).
+var snd_tone_buf[64];         # 512 B = 128 frames (one 375 Hz period), module scope
+fn hda_snd_selftest() {
+    if (hda_present == 0 || hda_out_dac == 0) { kprintln("snd: selftest FAIL", 18); return 0; }
+    var slot = ksyscall(64, 0, 0, 0);                                # snd_open -> slot
+    var c48  = ksyscall(65, slot, 48000, 0x1002);                    # config OK -> 0
+    var c44  = ksyscall(65, slot, 44100, 0x1002);                    # bad rate -> -1
+    var frn  = ksyscall(69, slot + 1, 0, 0);                         # foreign slot -> -1
+    var dbl  = ksyscall(64, 0, 0, 0);                                # double-open -> -1
+    var av0  = ksyscall(69, slot, 0, 0);                             # fresh free frames
+    kprint("snd: dbg slot=", 14); kprint_num(slot);
+    kprint(" c48=", 5); kprint_num(c48); kprint(" c44=", 5); kprint_num(c44);
+    kprint(" frn=", 5); kprint_num(frn); kprint(" dbl=", 5); kprint_num(dbl);
+    kprint(" av0=", 5); kprint_num(av0); kprintln("", 0);
+    if (slot < 0) { kprintln("snd: selftest FAIL", 18); return 0; }
+    if (c48 != 0) { kprintln("snd: selftest FAIL", 18); return 0; }
+    if (c44 != (0 - 1)) { kprintln("snd: selftest FAIL", 18); return 0; }
+    if (frn != (0 - 1)) { kprintln("snd: selftest FAIL", 18); return 0; }
+    if (dbl != (0 - 1)) { kprintln("snd: selftest FAIL", 18); return 0; }
+    # Build one 375 Hz square period (128 frames) then snd_copy_frames it 128x = 16384
+    # frames = the whole 64 KB, so the fill crosses the ring end and exercises the wrap.
+    var amp = 10000;
+    var i = 0;
+    while (i < 128) {
+        var s = amp; if (i >= 64) { s = 0 - amp; }
+        store16(&snd_tone_buf + i * 4, s & 0xFFFF);
+        store16(&snd_tone_buf + i * 4 + 2, s & 0xFFFF);
+        i = i + 1;
+    }
+    var k = 0;
+    while (k < 128) { snd_copy_frames(&snd_tone_buf, 128); k = k + 1; }
+    var av1 = ksyscall(69, slot, 0, 0);                              # should have dropped toward 0
+    kprint("snd: avail ", 11); kprint_num(av0); kprint(" -> ", 4); kprint_num(av1); kprintln("", 0);
+    kprintln("snd: selftest PASS", 18);
+    # Leave the slot OPEN + the ring full of tone → the DMA loops it for the WAV capture.
+    return 0;
+}
+#endif
+
 # === B3 — stream + BDL DMA-arm (roadmap 1.52.3) ===============================
 # Allocate a BDL ring + a PCM ring (both WB/coherent), program the OUTPUT stream
 # descriptor at 0x80 + ISS*0x20 (48k/16/2ch — SDnFMT=0x0011, NOT 0x4011 which is
@@ -866,6 +981,7 @@ fn hda_stream_service() {
 fn hda_stream_arm() {
     if (hda_present == 0 || hda_out_dac == 0) { return 0; }
     if (hda_oss == 0) { kprintln("hda: OSS=0, no output stream", 28); return 0; }
+    snd_active_slot = 0 - 1;   # Gate-2: -1 sentinel (declarative module-init doesn't take; init at runtime)
     var sd = HDA_SD_BASE + hda_iss * HDA_SD_STRIDE;   # output SDs follow ISS inputs
     hda_sd_base = sd;
 
