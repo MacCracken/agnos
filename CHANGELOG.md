@@ -5,7 +5,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — 1.52.x audio arc (→ 1.52.2)
+## [1.52.2] — 2026-07-03
+
+### Added — 1.52.x audio arc
 - **B2a — CORB/RIRB verb-ring transport** (`hda_ring_init` / `hda_verb` / `hda_codec_probe` in
   `kernel/core/hda.cyr`; `hda_codec_probe()` wired into `main.cyr` after `hda_reset`). 256-entry
   CORB (command) + RIRB (response) DMA rings, WB/coherent (the nvme admin-ring mapping:
@@ -19,9 +21,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   keeps it draining — essential for B2b's many-verb graph walk. Correct on real HW too (which
   doesn't gate CORB drain on this). `hda-smoke.sh` guards `nodes != 255` as a regression check.
 
-**Next bite: B2b** — the ALC897 widget-graph walk (enumerate widgets → DAC + front output pin via
-`CONFIG_DEFAULT` → connection-list trace → power/unmute/EAPD/COEF). Iron-gated: QEMU's trivial
-3-node codec proves the ring transport only, not the ALC897 routing.
+- **B2b-1 — codec widget enumeration + CONFIG_DEFAULT dump** (`hda_codec_enum` in
+  `kernel/core/hda.cyr`, wired into `main.cyr` after `hda_codec_probe`). Walks root → Audio
+  Function Group → widgets, classifies DAC / Pin Complex, and dumps each output-capable pin's
+  decoded CONFIG_DEFAULT (`dev`/`conn`/`loc`). **QEMU-PASS:** `hda: afg 0x01 dacs=1 pins=2
+  outpins=1` + `hda: pin 0x03 cfg=0x4010 dev=0 conn=0 loc=0x00`. The dump is the **mandatory iron
+  pre-flight** — a live archaemenid dump reveals which nid is the ALC897 front jack (HP-Out
+  `dev=0x2` vs Line-Out `dev=0x0` @ Front) before B2b-2 freezes routing.
+
+- **B2b-2 — pin select + DAC trace + output-enable** (`hda_codec_route` in `kernel/core/hda.cyr`,
+  wired into `main.cyr` after `hda_codec_enum`). Scores output pins (accept HP-Out + Line-Out,
+  reject `port_conn==NONE`, prefer HP-Out + Front + jack-detect — no hardcoded nid), traces the
+  DAC via the connection list (short form, selector/mixer hops), then runs the enable sequence:
+  Realtek COEF init (vendor-gated on `0x10EC`) → power D0 → PIN_CTL out+HP → EAPD (PINCAP-gated) →
+  unmute + ~75% gain on DAC & pin amps. **QEMU-PASS:** `hda: route pin=0x03 dac=0x02 dev=0` +
+  `hda: output path enabled` (machinery runs). **The ALC897 amp/EAPD/COEF effects + front-jack
+  routing are iron-only** — QEMU's trivial codec models none of them; validated on an archaemenid
+  burn. **B2 (verb ring + full codec graph walk) COMPLETE.**
+
+**Next bite: B3** — stream + BDL DMA-arm (BDL ring + WC-mapped PCM ring + stream descriptor at
+`0x80 + ISS*0x20`, `SDnFMT=0x0011` = 48k/16/2ch, bind stream tag → DAC). Gate: `SD_LPIB` advances
+(DMA fetching). QEMU-verifiable (LPIB advance); first tone (B4) is the audible iron gate.
+
+### Changed
+- **cyrius pin 6.3.9 → 6.3.43** (`cyrius.cyml`) — onto near-latest before the v6.3.x closeout.
+  `build/agnos` is **`cmp`-byte-identical** across the bump (the freestanding kernel has no
+  per-thread stacks, so 6.3.13's array-locals-to-stack default-on doesn't touch it) — provenance
+  only. hda-smoke (5/5 audio gates) + agnsh-smoke (boot-to-shell + ring-3 exec) re-confirmed green.
 
 ## [1.52.1] — 2026-07-03
 

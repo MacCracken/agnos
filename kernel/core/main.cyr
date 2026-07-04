@@ -603,6 +603,15 @@ hda_reset();
 # path). No-op if no codec present. Polled. The ALC897 widget-graph walk +
 # front-pin route is B2b (iron-gated).
 hda_codec_probe();
+# HDA audio Phase B2b-1 (1.52.2) — walk the codec's AFG widgets, classify
+# DAC/Pin, and dump each output pin's CONFIG_DEFAULT (the iron pre-flight that
+# reveals the ALC897 front-jack node). Route/enable is B2b-2. Polled.
+hda_codec_enum();
+# HDA audio Phase B2b-2 (1.52.2) — select an output pin (HP-Out/Line-Out, prefer
+# Front+jack-detect), trace the DAC via the connection list, and run the
+# output-enable sequence (COEF/power/pinctl/EAPD/unmute). QEMU exercises the
+# machinery; the ALC897 amp/EAPD/COEF effects are iron-only. Polled.
+hda_codec_route();
 # GPT Phase 1 — probe the active block backend (NVMe-first by override
 # policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
 # decode + walk the first 4 KB of the partition entry array, print a one-

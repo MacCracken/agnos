@@ -53,8 +53,42 @@ var HDA_RING256   = 0x2;      # CORBSIZE/RIRBSIZE code for 256 entries
 
 # --- verb encoding ---
 var V_GET_PARAM   = 0xF00;    # 12-bit verb: Get Parameter
+var V_GET_CFGDEF  = 0xF1C;    # 12-bit verb: Get Configuration Default
 var P_VENDOR      = 0x00;     # param: Vendor/Device ID
 var P_NODECOUNT   = 0x04;     # param: Subordinate Node Count
+var P_FNTYPE      = 0x05;     # param: Function Group Type
+var P_WCAP        = 0x09;     # param: Audio Widget Capabilities
+var P_PINCAP      = 0x0C;     # param: Pin Capabilities
+# widget type = WCAP bits 23:20
+var WID_DAC       = 0x0;      # Audio Output (DAC)
+var WID_PIN       = 0x4;      # Pin Complex
+var PINCAP_OUT    = 0x10;     # PINCAP bit4: output-capable
+var PINCAP_EAPD   = 0x10000;  # PINCAP bit16: EAPD-capable
+var FGTYPE_AFG    = 0x01;     # FNTYPE: Audio Function Group
+
+# --- B2b-2: routing + output-enable verbs/params ---
+var V_GET_CONNLIST = 0xF02;   # Get Connection List Entry (4 short entries/verb)
+var V_GET_CONNSEL  = 0xF01;   # Get Connection Select (active input index)
+var V_GET_PINSENSE = 0xF09;   # Get Pin Sense (bit31 = jack present)
+var V_GET_PROC_COEF = 0xC00;  # Get Processing Coefficient (Realtek COEF read)
+var V_SET_CONNSEL  = 0x701;   # Set Connection Select
+var V_SET_POWER    = 0x705;   # Set Power State (0 = D0)
+var V_SET_PINCTL   = 0x707;   # Set Pin Widget Control
+var V_SET_EAPD     = 0x70C;   # Set EAPD/BTL enable
+var V_SET_AMP      = 0x3;     # Set Amp Gain/Mute (4-bit verb, 16-bit data)
+var V_SET_COEF_IDX = 0x5;     # Set Coefficient Index (4-bit verb)
+var V_SET_PROC_COEF = 0x4;    # Set Processing Coefficient (4-bit verb)
+var P_CONNLEN      = 0x0E;    # param: Connection List Length
+var P_AMP_OUT_CAP  = 0x12;    # param: Output Amp Capabilities
+var DEV_LINEOUT    = 0x0;     # CONFIG_DEFAULT default_device: Line-Out
+var DEV_HPOUT      = 0x2;     # CONFIG_DEFAULT default_device: HP-Out
+var LOC_FRONT      = 0x2;     # location geometric nibble: Front
+var PINCTL_OUT_EN  = 0x40;    # pin widget control: output enable
+var PINCTL_HP_EN   = 0x80;    # pin widget control: headphone-drive enable
+var EAPD_ENABLE    = 0x02;    # SET_EAPD payload bit1
+var AMP_OUT_UNMUTE = 0xB000;  # SET_AMP: OUTPUT|LEFT|RIGHT, mute bit7=0, gain[6:0]
+var COEF_CLR_BIT5  = 0xFFFFFFDF; # mask to clear bit5 (no '~' operator in cyrius)
+var NID_ALC_COEF   = 0x20;    # Realtek ALC vendor widget carrying the EAPD COEF
 
 # --- Known controller PCI identities (B0 probe order) ---
 # Exact IDs disambiguate the analog HDA controller from the same-class
@@ -85,6 +119,12 @@ var hda_rirb_phys = 0;
 var hda_corb_wp   = 0;        # software CORB write index (0..255)
 var hda_rirb_rp   = 0;        # software RIRB read index  (0..255)
 var hda_codec0    = 0;        # first present codec address
+var hda_vendor    = 0;        # codec vendor:device (set by hda_codec_probe)
+var hda_afg       = 0;        # Audio Function Group nid (set by hda_codec_enum)
+var hda_w_start   = 0;        # AFG widget range start
+var hda_w_count   = 0;        # AFG widget count
+var hda_out_pin   = 0;        # selected output pin (set by hda_codec_route)
+var hda_out_dac   = 0;        # DAC feeding the selected pin
 
 # === MMIO accessors (r8169 clone; UC register file) ===========================
 # Reads are bare loads; writes carry a readback-flush (added B1).
@@ -381,6 +421,7 @@ fn hda_codec_probe() {
         kprintln("hda: WARN codec verb round-trip failed", 38);
         return 0;
     }
+    hda_vendor = vid & 0xFFFFFFFF;
     var nodes  = hda_verb(codec, 0, (V_GET_PARAM << 8) | P_NODECOUNT);
     var ncount = nodes & 0xFF;                 # total subordinate node count
 
@@ -391,5 +432,205 @@ fn hda_codec_probe() {
     kprint(" nodes=", 7);
     kprint_num(ncount);
     kprintln("", 0);
+    return 1;
+}
+
+# === B2b — ALC897 widget-graph walk (roadmap 1.52.2) ==========================
+# B2b-1 (this cut): enumerate the codec's Audio Function Group widgets, classify
+# DAC / Pin Complex, and dump each output-capable pin's CONFIG_DEFAULT. QEMU
+# exercises the walk machinery (its AFG + DAC + pin); the dump is the mandatory
+# IRON PRE-FLIGHT — a live archaemenid dump reveals which nid is the ALC897
+# front jack (HP-Out dev=0x2 vs Line-Out dev=0x0 @ Front) before B2b-2 freezes
+# routing. Pin-select + DAC-trace + power/unmute/EAPD/COEF is B2b-2 (iron-gated).
+fn hda_codec_enum() {
+    if (hda_present == 0) { return 0; }
+    if (hda_codec_mask == 0) { return 0; }
+    var codec = hda_codec0;
+
+    # root node 0 → function-group list.
+    var rnc = hda_verb(codec, 0, (V_GET_PARAM << 8) | P_NODECOUNT);
+    var fg_start = (rnc >> 16) & 0xFF;
+    var fg_count = rnc & 0xFF;
+
+    # find the Audio Function Group (first FG whose type == AFG).
+    var afg = 0;
+    var fi = 0;
+    while (fi < fg_count) {
+        var fnid = fg_start + fi;
+        var ft = hda_verb(codec, fnid, (V_GET_PARAM << 8) | P_FNTYPE);
+        if ((ft & 0xFF) == FGTYPE_AFG) { afg = fnid; break; }
+        fi = fi + 1;
+    }
+    if (afg == 0) {
+        kprintln("hda: no AFG found", 17);
+        return 0;
+    }
+
+    # AFG widget range.
+    var anc = hda_verb(codec, afg, (V_GET_PARAM << 8) | P_NODECOUNT);
+    var w_start = (anc >> 16) & 0xFF;
+    var w_count = anc & 0xFF;
+    hda_afg = afg;
+    hda_w_start = w_start;
+    hda_w_count = w_count;
+
+    var ndac = 0;
+    var npin = 0;
+    var noutpin = 0;
+    var wi = 0;
+    while (wi < w_count) {
+        var nid = w_start + wi;
+        var wcap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_WCAP);
+        var wtype = (wcap >> 20) & 0xF;
+        if (wtype == WID_DAC) { ndac = ndac + 1; }
+        if (wtype == WID_PIN) {
+            npin = npin + 1;
+            var pincap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_PINCAP);
+            if ((pincap & PINCAP_OUT) != 0) {
+                noutpin = noutpin + 1;
+                var cfg   = hda_verb(codec, nid, (V_GET_CFGDEF << 8) | 0);
+                var ddev  = (cfg >> 20) & 0xF;     # 0=Line-Out 1=Speaker 2=HP-Out
+                var pconn = (cfg >> 30) & 0x3;     # 0=Jack 1=NONE 2=Fixed 3=Both
+                var loc   = (cfg >> 24) & 0x3F;    # geometry+location (Front/Rear/…)
+                kprint("hda: pin 0x", 11);
+                kprint_byte(nid);
+                kprint(" cfg=0x", 7);
+                kprint_hex(cfg & 0xFFFFFFFF);
+                kprint(" dev=", 5);
+                kprint_num(ddev);
+                kprint(" conn=", 6);
+                kprint_num(pconn);
+                kprint(" loc=0x", 7);
+                kprint_byte(loc);
+                kprintln("", 0);
+            }
+        }
+        wi = wi + 1;
+    }
+
+    kprint("hda: afg 0x", 11);
+    kprint_byte(afg);
+    kprint(" dacs=", 6);
+    kprint_num(ndac);
+    kprint(" pins=", 6);
+    kprint_num(npin);
+    kprint(" outpins=", 9);
+    kprint_num(noutpin);
+    kprintln("", 0);
+    return 1;
+}
+
+# === B2b-2 — pin select + DAC trace + output-enable (roadmap 1.52.2) ===========
+# The iron-gated heart. Selects an analog output pin (accept HP-Out AND Line-Out,
+# reject port_conn==NONE, prefer HP-Out + Front + jack-detect — the ALC897 front
+# jack is usually HP-Out and pin 0x14 is often retasked to Speaker, so NO hardcoded
+# nid), traces the DAC feeding it through the connection list, then runs the enable
+# sequence: Realtek COEF init (vendor-gated) -> power D0 -> PIN_CTL out+HP -> EAPD
+# (PINCAP-gated) -> unmute + ~75% gain on DAC & pin amps. QEMU exercises the
+# machinery on its trivial codec; the ALC897 amp/EAPD/COEF effects are iron-only.
+fn hda_codec_route() {
+    if (hda_present == 0 || hda_codec_mask == 0) { return 0; }
+    if (hda_afg == 0 || hda_w_count == 0) { return 0; }
+    var codec = hda_codec0;
+
+    # --- select output pin (scored; no hardcoded nid) ---
+    var best_pin = 0;
+    var best_dev = 0;
+    var best_score = 0 - 1;
+    var wi = 0;
+    while (wi < hda_w_count) {
+        var nid = hda_w_start + wi;
+        var wcap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_WCAP);
+        if (((wcap >> 20) & 0xF) == WID_PIN) {
+            var pincap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_PINCAP);
+            if ((pincap & PINCAP_OUT) != 0) {
+                var cfg   = hda_verb(codec, nid, (V_GET_CFGDEF << 8) | 0);
+                var ddev  = (cfg >> 20) & 0xF;
+                var pconn = (cfg >> 30) & 0x3;
+                var loc   = (cfg >> 24) & 0x3F;
+                # candidate: HP-Out or Line-Out with a connector present (not NONE).
+                if ((ddev == DEV_HPOUT || ddev == DEV_LINEOUT) && pconn != 1) {
+                    var score = 10;
+                    if (ddev == DEV_HPOUT) { score = score + 4; }
+                    if ((loc & 0xF) == LOC_FRONT) { score = score + 4; }
+                    if (pconn == 0) { score = score + 1; }
+                    var sense = hda_verb(codec, nid, (V_GET_PINSENSE << 8) | 0);
+                    if ((sense & 0x80000000) != 0) { score = score + 2; }
+                    if (score > best_score) {
+                        best_score = score;
+                        best_pin = nid;
+                        best_dev = ddev;
+                    }
+                }
+            }
+        }
+        wi = wi + 1;
+    }
+    if (best_pin == 0) {
+        kprintln("hda: no output pin", 18);
+        return 0;
+    }
+    hda_out_pin = best_pin;
+
+    # --- trace the DAC feeding the pin (follow the connection list, short form) ---
+    var node = best_pin;
+    var dac = 0;
+    var hops = 0;
+    while (hops < 8) {
+        var clen = hda_verb(codec, node, (V_GET_PARAM << 8) | P_CONNLEN) & 0x7F;
+        if (clen == 0) { break; }
+        var sel = hda_verb(codec, node, (V_GET_CONNSEL << 8) | 0) & 0xFF;
+        if (sel >= clen) { sel = 0; }
+        var lw = hda_verb(codec, node, (V_GET_CONNLIST << 8) | (sel & 0xFC));
+        var entry = (lw >> ((sel & 0x3) * 8)) & 0xFF;
+        if (entry == 0) { break; }
+        var ew = hda_verb(codec, entry, (V_GET_PARAM << 8) | P_WCAP);
+        if (((ew >> 20) & 0xF) == WID_DAC) { dac = entry; break; }
+        node = entry;                          # hop through mixer/selector
+        hops = hops + 1;
+    }
+    if (dac == 0) {
+        kprintln("hda: no DAC for pin", 19);
+        return 0;
+    }
+    hda_out_dac = dac;
+
+    # --- output-enable sequence ---
+    # 1. Realtek COEF init (ALC897 puts EAPD under verb control): clear bit5 of
+    #    COEF index 0x7 on the vendor widget. Vendor-gated — QEMU's non-Realtek
+    #    codec skips it; omitting it on a real ALC897 is a known no-output cause.
+    if (((hda_vendor >> 16) & 0xFFFF) == 0x10EC) {
+        hda_verb(codec, NID_ALC_COEF, (V_SET_COEF_IDX << 16) | 0x0007);
+        var cf = hda_verb(codec, NID_ALC_COEF, (V_GET_PROC_COEF << 8) | 0);
+        hda_verb(codec, NID_ALC_COEF, (V_SET_COEF_IDX << 16) | 0x0007);
+        hda_verb(codec, NID_ALC_COEF, (V_SET_PROC_COEF << 16) | (cf & COEF_CLR_BIT5 & 0xFFFF));
+    }
+    # 2. Power up AFG, DAC, pin to D0.
+    hda_verb(codec, hda_afg,  (V_SET_POWER << 8) | 0x00);
+    hda_verb(codec, dac,      (V_SET_POWER << 8) | 0x00);
+    hda_verb(codec, best_pin, (V_SET_POWER << 8) | 0x00);
+    # 3. Pin control: output enable + headphone drive.
+    hda_verb(codec, best_pin, (V_SET_PINCTL << 8) | (PINCTL_OUT_EN | PINCTL_HP_EN));
+    # 4. EAPD — only if the pin advertises it (iron-only silent-failure gate).
+    var pcap = hda_verb(codec, best_pin, (V_GET_PARAM << 8) | P_PINCAP);
+    if ((pcap & PINCAP_EAPD) != 0) {
+        hda_verb(codec, best_pin, (V_SET_EAPD << 8) | EAPD_ENABLE);
+    }
+    # 5. Unmute + ~75% gain on the DAC and pin output amps (never gain 0 = floor).
+    var acap = hda_verb(codec, dac, (V_GET_PARAM << 8) | P_AMP_OUT_CAP);
+    var steps = (acap >> 8) & 0x7F;
+    var gain = (steps * 3) / 4;
+    if (gain == 0) { gain = steps; }
+    hda_verb(codec, dac,      (V_SET_AMP << 16) | AMP_OUT_UNMUTE | (gain & 0x7F));
+    hda_verb(codec, best_pin, (V_SET_AMP << 16) | AMP_OUT_UNMUTE | (gain & 0x7F));
+
+    kprint("hda: route pin=0x", 17);
+    kprint_byte(best_pin);
+    kprint(" dac=0x", 7);
+    kprint_byte(dac);
+    kprint(" dev=", 5);
+    kprint_num(best_dev);
+    kprintln("", 0);
+    kprintln("hda: output path enabled", 24);
     return 1;
 }

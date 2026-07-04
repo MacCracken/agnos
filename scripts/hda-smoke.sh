@@ -1,9 +1,11 @@
 #!/bin/bash
-# hda-smoke — B0+B1 acceptance for the 1.52.x audio arc. Boots a production
+# hda-smoke — B0/B1/B2 acceptance for the 1.52.x audio arc. Boots a production
 # AGNOS kernel in QEMU with a QEMU Intel HD-Audio controller (-device intel-hda)
 # + an attached codec (hda-duplex) and asserts: (B0) the boot-time HDA probe
 # finds the controller and reads a sane GCAP; (B1) the CRST reset handshake
-# completes and STATESTS reports the codec present (codecs != 0x0000).
+# completes and STATESTS reports the codec present; (B2a) the CORB/RIRB verb
+# ring round-trips consecutive verbs (VENDOR_ID + NODECOUNT); (B2b-1) the AFG
+# widget walk classifies DAC/Pin and dumps each output pin's CONFIG_DEFAULT.
 #
 # B0 is a read-only probe wired unconditionally into device-init (kernel/core/
 # hda.cyr → hda_probe() in main.cyr), so NO build flag is needed — a normal
@@ -128,6 +130,37 @@ else
     echo "  FAIL: no 'hda: codec' line (verb-ring round-trip failed)"
     grep -a -m1 "hda: WARN codec verb" "$SER" 2>/dev/null
     grep -a -m1 -E "hda: (CORB|RIRB) alloc" "$SER" 2>/dev/null
+    rc=1
+fi
+
+# B2b-1 — widget enumeration + per-output-pin CONFIG_DEFAULT dump (the iron
+# pre-flight probe). QEMU's trivial codec has 1 DAC + 1 output pin.
+AFG_LINE="$(grep -a -m1 "hda: afg 0x" "$SER" 2>/dev/null)"
+if [ -n "$AFG_LINE" ]; then
+    echo "  enum: $AFG_LINE"
+    DACS="$(echo "$AFG_LINE" | sed -n 's/.*dacs=\([0-9][0-9]*\).*/\1/p')"
+    OUTPINS="$(echo "$AFG_LINE" | sed -n 's/.*outpins=\([0-9][0-9]*\).*/\1/p')"
+    if [ -n "$DACS" ] && [ "$DACS" -ge 1 ] && [ -n "$OUTPINS" ] && [ "$OUTPINS" -ge 1 ]; then
+        echo "  PASS: AFG walk OK, dacs=$DACS outpins=$OUTPINS — B2b-1 gate met"
+    else
+        echo "  FAIL: AFG walk but dacs=$DACS outpins=$OUTPINS (need >=1 each)"; rc=1
+    fi
+    grep -a "hda: pin 0x" "$SER" 2>/dev/null | sed 's/^/    pin-dump: /'
+else
+    echo "  FAIL: no 'hda: afg' line (widget walk failed)"
+    grep -a -m1 "hda: no AFG found" "$SER" 2>/dev/null
+    rc=1
+fi
+
+# B2b-2 — pin select + DAC trace + output-enable machinery (ALC897 amp/EAPD/COEF
+# effects are iron-only; QEMU validates that select/trace/enable RUN without fault).
+ROUTE_LINE="$(grep -a -m1 "hda: route pin=0x" "$SER" 2>/dev/null)"
+if [ -n "$ROUTE_LINE" ] && grep -aq "hda: output path enabled" "$SER" 2>/dev/null; then
+    echo "  route: $ROUTE_LINE"
+    echo "  PASS: pin-select + DAC-trace + output-enable ran — B2b-2 gate met (ALC897 effects iron-only)"
+else
+    echo "  FAIL: output path not enabled"
+    grep -a -m1 -E "hda: no output pin|hda: no DAC for pin" "$SER" 2>/dev/null
     rc=1
 fi
 
