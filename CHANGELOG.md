@@ -5,6 +5,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.52.5] — 2026-07-03
+
+### Added — 1.52.x audio arc
+- **★ FIRST SOUND FROM SOVEREIGN AGNOS — iron-validated.** The B4 375 Hz tone is **audible out the
+  archaemenid front jack** (Realtek ALC897, AMD Ryzen HD Audio `1022:15e3`). The B2b-2 codec
+  output-enable path is complete and correct on real silicon. QEMU's trivial codec (RMS=5135) was
+  necessary-not-sufficient — every fix below is an iron-only trap it cannot model.
+
+### Fixed — ALC897 output-enable (B2b-2)
+- **Jack-detect over config-default (THE fix).** Pin selection now weights the codec's live jack-presence
+  (`GET_PIN_SENSE` bit31) **above every CONFIG_DEFAULT heuristic**. This generic-Realtek Beelink BIOS
+  mislabels the physical front jack as pin `0x14` ("rear line-out") and tags the *empty* `0x1b` as
+  "front HP" — so scoring by the label drove an unplugged pin. The codec reported the plug on `0x14`
+  (`sense=1`) and nothing on `0x1b` (`sense=0`); routing to where the cable actually is lit the jack.
+  HP-Out/Front/jack tiebreak among multiple live jacks and are the sole signal when jack-detect is unwired.
+- **Whole-path unmute through the summing mixer.** A summing Audio-Mixer (widget type 2, e.g. `0x0c`) has
+  no Connection-Select, so `GET_CONNSEL` is meaningless; the enable pass now unmutes **every** mixer input
+  index (`0..connlen-1`), so the DAC-carrying input (power-on MUTED on Realtek) is lit regardless of its
+  index. WCAP-presence-gated (no-op where absent; QEMU's direct path=1 never enters the loop).
+- **EAPD broadcast to all output pins.** `alc_auto_setup_eapd` (ALC897 == `patch_alc662`) asserts EAPD
+  (verb `0x70C`=2) on the output-pin *set*, not the HP pin. We now assert EAPD on **every** output-capable
+  pin (Realtek unconditional) rather than the single selected pin — powering the shared analog stage
+  (EAPD latches on `0x14`).
+- **Realtek vendor COEF** (index `0x07`, clear bit5 on nid `0x20` — the `alc_fill_eapd_coef` sequence for
+  the ALC662/892/897 family) confirmed correct + load-bearing (readback `coef7=0xf808`, bit5 clear).
+
+### Changed
+- **HDA boot logging trimmed** to the operational essentials (found / reset / codec / afg / route /
+  output-path / stream). The B4-bring-up instrumentation — per-widget amp/pinctl/EAPD/power/sense/connlist
+  dump, GPIO dump, and the COEF + PCM-ring readbacks — is removed; the per-pin `CONFIG_DEFAULT` pre-flight
+  dump is now build-gated behind `HDA_TONE`. Production boots stay concise; the tone build keeps the
+  pre-flight. Dead `hda_path_sel` (superseded by the all-index unmute) removed. Production `build/agnos`
+  1,350,744 B.
+
+### Method note
+Four iron burns localized this with build-gated read-back instrumentation (no in-kernel debugger) — each
+burn either produced sound or dumped the exact dark stage. Converged via a multi-source derivation
+(Linux `patch_realtek`/`patch_alc662`, FreeBSD `hdaa`, Intel HDA 1.0a spec) + adversarial verification.
+The decisive datum was the all-output-pins dump showing `sense=1` on `0x14`: the wrong pin was scored, not
+a wrong amp/EAPD/COEF/DMA. The PCM-ring readback (`pcm[0]=0xd120`) retired the DMA-delivery hypothesis.
+
+**Next bite: B5** — streamed PCM + refill (double-buffer: refill the consumed BDL half as LPIB crosses the
+midpoint). Gate: gap-free multi-second playback. Closes Gate 1 (the kernel HDA driver); then Gate 2 = the
+ring-3 `snd_*` syscall band `#64-69`.
+
 ## [1.52.4] — 2026-07-03
 
 ### Added — 1.52.x audio arc

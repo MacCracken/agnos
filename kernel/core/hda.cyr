@@ -93,13 +93,6 @@ var AMP_IN_UNMUTE  = 0x7000;  # SET_AMP: INPUT|LEFT|RIGHT, mute bit7=0 (| idx<<8
 var COEF_CLR_BIT5  = 0xFFFFFFDF; # mask to clear bit5 (no '~' operator in cyrius)
 var NID_ALC_COEF   = 0x20;    # Realtek ALC vendor widget carrying the EAPD COEF
 var P_AMP_IN_CAP   = 0x0D;    # param: Input Amp Capabilities (num-steps in [14:8])
-# --- B4 iron-debug: state read-back verbs (all pure GET, zero side effects) ---
-var V_GET_AMP      = 0xB;     # Get Amp Gain/Mute (4-bit verb, 16-bit payload)
-var V_GET_PINCTL   = 0xF07;   # Get Pin Widget Control
-var V_GET_EAPD     = 0xF0C;   # Get EAPD/BTL enable (response bit1 = EAPD)
-var V_GET_POWER    = 0xF05;   # Get Power State (response [3:0] = actual state)
-var GETAMP_OUT_L   = 0xA000;  # GET_AMP payload: output(bit15) | left(bit13)
-var GETAMP_OUT_R   = 0x8000;  # GET_AMP payload: output(bit15) | right(bit13=0)
 
 # --- B3: stream descriptor + BDL ---
 var HDA_SD_BASE   = 0x80;     # first stream descriptor register block
@@ -163,7 +156,6 @@ var hda_sd_base   = 0;        # output stream descriptor register base offset
 var hda_stream_tag = 1;       # stream tag binding DAC <-> stream
 var hda_path_n    = 0;        # node count in the pin->DAC signal path (excl DAC)
 var hda_path[8];              # path node ids, pin-first (module scope: 8xu64)
-var hda_path_sel[8];          # input-select index used at each path node
 
 # === MMIO accessors (r8169 clone; UC register file) ===========================
 # Reads are bare loads; writes carry a readback-flush (added B1).
@@ -529,6 +521,10 @@ fn hda_codec_enum() {
             var pincap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_PINCAP);
             if ((pincap & PINCAP_OUT) != 0) {
                 noutpin = noutpin + 1;
+                # Per-pin CONFIG_DEFAULT dump — a bring-up pre-flight (which nid is
+                # which jack); routing is now automatic via jack-detect, so this is
+                # debug-only. Build-gated so production boots stay concise.
+                #ifdef HDA_TONE
                 var cfg   = hda_verb(codec, nid, (V_GET_CFGDEF << 8) | 0);
                 var ddev  = (cfg >> 20) & 0xF;     # 0=Line-Out 1=Speaker 2=HP-Out
                 var pconn = (cfg >> 30) & 0x3;     # 0=Jack 1=NONE 2=Fixed 3=Both
@@ -544,6 +540,7 @@ fn hda_codec_enum() {
                 kprint(" loc=0x", 7);
                 kprint_byte(loc);
                 kprintln("", 0);
+                #endif
             }
         }
         wi = wi + 1;
@@ -600,40 +597,6 @@ fn hda_unmute_in(codec, nid, idx) {
     return 0;
 }
 
-# Read back one widget's live analog state (post-enable). Pure GET verbs — the
-# iron-debug instrument: shows which stage is dark when the stream runs silent
-# (muted amp / unpowered / pinctl clear / EAPD off / jack absent).
-fn hda_dump_node(codec, nid) {
-    var wcap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_WCAP);
-    var wtype = (wcap >> 20) & 0xF;
-    var oL = hda_verb(codec, nid, (V_GET_AMP << 16) | GETAMP_OUT_L) & 0xFF;
-    var oR = hda_verb(codec, nid, (V_GET_AMP << 16) | GETAMP_OUT_R) & 0xFF;
-    var pc = hda_verb(codec, nid, (V_GET_PINCTL << 8) | 0) & 0xFF;
-    var ea = hda_verb(codec, nid, (V_GET_EAPD << 8) | 0) & 0xFF;
-    var pw = hda_verb(codec, nid, (V_GET_POWER << 8) | 0) & 0xFF;
-    var sn = hda_verb(codec, nid, (V_GET_PINSENSE << 8) | 0);
-    var present = 0;
-    if ((sn & 0x80000000) != 0) { present = 1; }
-    kprint("hda: nid=0x", 11);
-    kprint_byte(nid);
-    kprint(" type=", 6);
-    kprint_num(wtype);
-    kprint(" oL=0x", 6);
-    kprint_byte(oL);
-    kprint(" oR=0x", 6);
-    kprint_byte(oR);
-    kprint(" pinctl=0x", 10);
-    kprint_byte(pc);
-    kprint(" eapd=0x", 8);
-    kprint_byte(ea);
-    kprint(" pwr=0x", 7);
-    kprint_byte(pw);
-    kprint(" sense=", 7);
-    kprint_num(present);
-    kprintln("", 0);
-    return 0;
-}
-
 # === B2b-2 — pin select + DAC trace + output-enable (roadmap 1.52.2) ===========
 # The iron-gated heart. Selects an analog output pin (accept HP-Out AND Line-Out,
 # reject port_conn==NONE, prefer HP-Out + Front + jack-detect — the ALC897 front
@@ -668,8 +631,16 @@ fn hda_codec_route() {
                     if (ddev == DEV_HPOUT) { score = score + 4; }
                     if ((loc & 0xF) == LOC_FRONT) { score = score + 4; }
                     if (pconn == 0) { score = score + 1; }
+                    # Jack-detect is GROUND TRUTH — a pin the codec reports a plug on
+                    # (presence bit31) OUTWEIGHS every config-default heuristic. Generic
+                    # Realtek mini-PC BIOSes (this Beelink) mislabel the physical front
+                    # jack 0x14 as "rear line-out" and leave the empty 0x1b tagged
+                    # "front HP" — routing by the label drives an unplugged pin. Route
+                    # the audio to where the cable ACTUALLY is; HP/Front/pconn remain
+                    # tiebreakers among multiple live jacks and the sole signal when
+                    # jack-detect is unwired (no pin reports a plug).
                     var sense = hda_verb(codec, nid, (V_GET_PINSENSE << 8) | 0);
-                    if ((sense & 0x80000000) != 0) { score = score + 2; }
+                    if ((sense & 0x80000000) != 0) { score = score + 1000; }
                     if (score > best_score) {
                         best_score = score;
                         best_pin = nid;
@@ -703,7 +674,6 @@ fn hda_codec_route() {
         if (entry == 0) { break; }
         if (hda_path_n < 8) {
             store64(&hda_path + hda_path_n * 8, node);
-            store64(&hda_path_sel + hda_path_n * 8, sel);
             hda_path_n = hda_path_n + 1;
         }
         var ew = hda_verb(codec, entry, (V_GET_PARAM << 8) | P_WCAP);
@@ -738,17 +708,32 @@ fn hda_codec_route() {
     hda_verb(codec, best_pin, (V_SET_POWER << 8) | 0x00);
     # 3. Pin control: output enable + headphone drive.
     hda_verb(codec, best_pin, (V_SET_PINCTL << 8) | (PINCTL_OUT_EN | PINCTL_HP_EN));
-    # 4. EAPD. ALC897 honors SET_EAPD on its output pins even when PINCAP does NOT
-    #    advertise EAPD-capable (it's vendor/COEF-gated, not pin-advertised) — a
-    #    known iron-only silent-failure — so assert it unconditionally for Realtek;
-    #    other vendors keep the PINCAP gate.
-    var pcap = hda_verb(codec, best_pin, (V_GET_PARAM << 8) | P_PINCAP);
-    if (((hda_vendor >> 16) & 0xFFFF) == 0x10EC) {
-        hda_verb(codec, best_pin, (V_SET_EAPD << 8) | EAPD_ENABLE);
-    } else {
-        if ((pcap & PINCAP_EAPD) != 0) {
-            hda_verb(codec, best_pin, (V_SET_EAPD << 8) | EAPD_ENABLE);
+    # 4. EAPD — assert on EVERY output-capable pin, not just the selected HP pin.
+    #    Linux's alc_auto_setup_eapd (ALC897 == patch_alc662 path) drives EAPD
+    #    (verb 0x70C=2) on the fixed output-pin set {0x0f,0x10,0x14,0x15,0x17} and
+    #    pointedly NOT on the HP pin 0x1b — the ALC897 analog output-driver amp is
+    #    powered by EAPD on the line-out / vendor output pins, which the codec fans
+    #    out to the front-tasked jack. We had been EAPD'ing ONLY 0x1b (the one pin
+    #    Linux never touches), leaving the shared analog output stage powered down
+    #    while every upstream stage read correct + DMA advanced. Broadcast is
+    #    monotone (EAPD to a pin without the amp is inert) and nid-agnostic.
+    var ei = 0;
+    while (ei < hda_w_count) {
+        var enid = hda_w_start + ei;
+        var ewc = hda_verb(codec, enid, (V_GET_PARAM << 8) | P_WCAP);
+        if (((ewc >> 20) & 0xF) == WID_PIN) {
+            var epc = hda_verb(codec, enid, (V_GET_PARAM << 8) | P_PINCAP);
+            if ((epc & PINCAP_OUT) != 0) {
+                if (((hda_vendor >> 16) & 0xFFFF) == 0x10EC) {
+                    hda_verb(codec, enid, (V_SET_EAPD << 8) | EAPD_ENABLE);
+                } else {
+                    if ((epc & PINCAP_EAPD) != 0) {
+                        hda_verb(codec, enid, (V_SET_EAPD << 8) | EAPD_ENABLE);
+                    }
+                }
+            }
         }
+        ei = ei + 1;
     }
     # 5. Unmute the endpoints (DAC + pin output amps, ~75% of the DAC's steps) —
     #    byte-identical to the pre-B4 form the QEMU tone-smoke passed at RMS=5135.
@@ -767,7 +752,20 @@ fn hda_codec_route() {
     pk = 1;
     while (pk < hda_path_n) {
         var pn = load64(&hda_path + pk * 8);
-        hda_unmute_in(codec, pn, load64(&hda_path_sel + pk * 8));
+        # ROOT-CAUSE FIX (4-source convergent): a summing Audio-Mixer sums ALL its
+        # inputs and has NO Connection-Select, so GET_CONNSEL (the old single index)
+        # is meaningless — the input carrying the DAC sits at an a-priori-unknown
+        # index and powers on MUTED. Unmute EVERY input index (hda_unmute_in is
+        # WCAP-gated, so a no-op where no input amp exists; idx in bits[11:8], and
+        # real mixers have <16 inputs so the 4-bit field never truncates) — this
+        # lights the DAC-carrying input regardless of where it sits. Other (silent,
+        # source-muted) mixer inputs merely sum to zero.
+        var pclen = hda_verb(codec, pn, (V_GET_PARAM << 8) | P_CONNLEN) & 0x7F;
+        var j = 0;
+        while (j < pclen) {
+            hda_unmute_in(codec, pn, j);
+            j = j + 1;
+        }
         hda_unmute_out(codec, pn);
         pk = pk + 1;
     }
@@ -782,16 +780,6 @@ fn hda_codec_route() {
     kprint_num(hda_path_n);
     kprintln("", 0);
     kprintln("hda: output path enabled", 24);
-    # B4 iron-debug: dump the live post-enable state of the DAC + every path node,
-    # so a silent burn tells us the exact dark stage (gated with the tone build).
-    #ifdef HDA_TONE
-    hda_dump_node(codec, dac);
-    var dk = 0;
-    while (dk < hda_path_n) {
-        hda_dump_node(codec, load64(&hda_path + dk * 8));
-        dk = dk + 1;
-    }
-    #endif
     return 1;
 }
 
