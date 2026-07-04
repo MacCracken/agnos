@@ -182,4 +182,5 @@ fi
 echo "  --- hda lines from serial ---"
 grep -a -iE "^hda:" "$SER" 2>/dev/null | sed 's/^/    /'
 echo "  full serial: $SER"
+[ "$rc" -eq 0 ] && echo "hda-smoke: PASS" || echo "hda-smoke: FAIL"
 exit $rc

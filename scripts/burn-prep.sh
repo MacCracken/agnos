@@ -49,7 +49,11 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_SELFTESTS:-}" ]; then
+if [ -n "${BURN_HDA_TONE:-}" ]; then
+    echo "[2/2] Building the HDA_TONE first-tone kernel (hda_stream_arm fills a ~375 Hz triangle -> audible out the codec)..."
+    BUILD_ENV="HDA_TONE=1"
+    BUILD_TAG="HDA_TONE"
+elif [ -n "${BURN_SELFTESTS:-}" ]; then
     echo "[2/2] Building the iron EXEC selftest kernel (BURN_SELFTESTS: EXEC_SELFTEST + EXT2_WRITE_SELFTEST)..."
     BUILD_ENV="EXEC_SELFTEST=1 EXT2_WRITE_SELFTEST=1"
     BUILD_TAG="EXEC_SELFTEST"
@@ -71,7 +75,7 @@ echo ""
 
 # --- Flash + watch instructions ---------------------------------------------
 echo "=========================================="
-echo "  IRON KERNEL READY — bare production AGNOS"
+echo "  IRON KERNEL READY — AGNOS $VER ($BUILD_TAG)"
 echo "=========================================="
 echo ""
 echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update"
