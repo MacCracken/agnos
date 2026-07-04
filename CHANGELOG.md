@@ -5,7 +5,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — 1.52.x audio arc (→ 1.52.3)
+## [1.52.3] — 2026-07-03
+
+### Added — 1.52.x audio arc
 - **B3 — output stream + BDL DMA-arm** (`hda_stream_arm` in `kernel/core/hda.cyr`, wired into
   `main.cyr` after `hda_codec_route`). Allocates a BDL ring (WB, `pmm_alloc`) + a WC-mapped PCM ring
   (`pmm_alloc_2mb` + `vmm_remap_wc_2mb`, the framebuffer WC path), programs the output stream
