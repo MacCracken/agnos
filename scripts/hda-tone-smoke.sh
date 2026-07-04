@@ -65,10 +65,10 @@ sync
 echo ""
 echo "=== verdict ==="
 rc=0
-if grep -a -q "hda: tone 375Hz filled" "$SER" 2>/dev/null && grep -a -q "hda: stream running" "$SER" 2>/dev/null; then
-    echo "  kernel: tone filled + stream running (LPIB advancing)"
+if grep -a -q "hda: sweep streaming" "$SER" 2>/dev/null && grep -a -q "hda: stream running" "$SER" 2>/dev/null; then
+    echo "  kernel: sweep filled + stream running (LPIB advancing)"
 else
-    echo "  FAIL: kernel did not fill the tone / arm the stream"; rc=1
+    echo "  FAIL: kernel did not fill the sweep / arm the stream"; rc=1
 fi
 
 if [ ! -s "$WAV" ]; then
@@ -101,6 +101,41 @@ PY
         echo "  PASS: captured audio is non-silent (RMS=$RMS > 500) — B4 gate met (first sound!)"
     else
         echo "  FAIL: captured audio is silent (RMS=$RMS) — tone did not reach output"; rc=1
+    fi
+fi
+
+# B5 gate: prove NEW data actually STREAMED via double-buffer refill (not the two
+# pre-filled halves looping — a servicer whose writes were lost would still loop
+# them and pass RMS). The HDA_TONE producer is a rising sweep whose frequency only
+# reaches ~1 kHz AFTER the servicer has refilled past the initial 64 KB (which alone
+# tops out ~400 Hz). So: measure the peak instantaneous frequency in out.wav; >600 Hz
+# proves the sweep progressed = refill delivered fresh PCM. A stale loop stays <=~400.
+if [ -s "$WAV" ]; then
+    MAXF="$(python3 - "$WAV" <<'PY'
+import sys, struct
+raw = open(sys.argv[1], "rb").read()
+off = 44
+i = raw.find(b"data")
+if 0 <= i and i + 8 <= len(raw): off = i + 8
+pcm = raw[off:]
+n = len(pcm) // 2
+if n < 4096: print("0"); sys.exit(0)
+if n > 4000000: n = 4000000
+vals = struct.unpack("<%dh" % n, pcm[:n*2])[0::2]   # left channel of interleaved L,R
+fs, win, maxf, k = 48000, 2048, 0.0, 0
+while k + win <= len(vals):
+    zc = sum(1 for j in range(k+1, k+win) if (vals[j-1] < 0) != (vals[j] < 0))
+    f = (zc / 2.0) * (fs / float(win))
+    if f > maxf: maxf = f
+    k += win
+print("%.0f" % maxf)
+PY
+)"
+    echo "  peak sweep frequency: ${MAXF:-0} Hz (initial 64 KB fill alone tops out ~400 Hz)"
+    if [ "${MAXF:-0}" -ge 600 ] 2>/dev/null; then
+        echo "  PASS: sweep progressed past the initial fill (peak ${MAXF} Hz > 600) — B5 refill streamed NEW data"
+    else
+        echo "  FAIL: sweep stuck low (peak ${MAXF:-0} Hz <= 600) — refill did not stream new PCM (stale loop)"; rc=1
     fi
 fi
 echo "  --- hda lines ---"; grep -a -iE "^hda:" "$SER" 2>/dev/null | sed 's/^/    /'

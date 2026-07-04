@@ -156,6 +156,14 @@ var hda_sd_base   = 0;        # output stream descriptor register base offset
 var hda_stream_tag = 1;       # stream tag binding DAC <-> stream
 var hda_path_n    = 0;        # node count in the pin->DAC signal path (excl DAC)
 var hda_path[8];              # path node ids, pin-first (module scope: 8xu64)
+# --- B5: streamed PCM double-buffer refill (roadmap 1.52.6) ---
+var hda_stream_on = 0;        # 1 = the 100 Hz timer-tick refill servicer is active
+var hda_pcm_va    = 0;        # cached CPU VA of the WC PCM ring (for refill writes)
+var hda_ring_half = 0x8000;   # bytes per BDL half (32 KB) — the double-buffer unit
+var hda_last_half = 0;        # BDL half the DMA was last observed in (0 or 1)
+var hda_refills   = 0;        # refill count (diagnostic)
+var hda_gen_acc   = 0;        # HDA_TONE sweep NCO phase accumulator (16-bit)
+var hda_gen_inc   = 300;      # HDA_TONE sweep NCO phase increment (~freq), ramps
 
 # === MMIO accessors (r8169 clone; UC register file) ===========================
 # Reads are bare loads; writes carry a readback-flush (added B1).
@@ -783,8 +791,74 @@ fn hda_codec_route() {
     return 1;
 }
 
+# === B5 — streamed PCM double-buffer refill (roadmap 1.52.6) ==================
+# Refill one 32 KB BDL half (`h` = 0/1) with the next chunk of PCM. B5's producer
+# is HDA_TONE's phase-continuous sweep (a rising ~220 Hz→1 kHz whoop — the running
+# `hda_gen_acc`/`hda_gen_inc` NCO carries across refills, so it's click-free AND
+# visibly NOT a static loop, proving the refill actually feeds the stream). In a
+# production (non-HDA_TONE) build the producer is snd_write#66 (Gate 2) — until
+# then the half is zero-filled (silence) and the servicer stays disarmed.
+fn hda_refill_half(h) {
+    var base = hda_pcm_va + h * hda_ring_half;
+    #ifdef HDA_TONE
+    var amp = 12000;
+    var fi = 0;
+    while (fi < 8192) {                     # 32 KB / 4 bytes-per-frame
+        var acc = hda_gen_acc & 0xFFFF;
+        var s = 0;
+        if (acc < 32768) { s = (0 - amp) + (2 * amp * acc) / 32768; }
+        else { s = amp - (2 * amp * (acc - 32768)) / 32768; }
+        store16(base + fi * 4, s & 0xFFFF);
+        store16(base + fi * 4 + 2, s & 0xFFFF);
+        hda_gen_acc = (hda_gen_acc + hda_gen_inc) & 0xFFFF;
+        # Ramp the frequency every 64 frames for a slow (~1.5 s) rising sweep,
+        # wrapping for a repeating whoop. Phase (`acc`) stays continuous across the
+        # wrap, so no click; 8192 is a multiple of 64 so the cadence is seamless
+        # across refill boundaries too.
+        if ((fi & 0x3F) == 0) {
+            hda_gen_inc = hda_gen_inc + 1;
+            if (hda_gen_inc > 1400) { hda_gen_inc = 300; }
+        }
+        fi = fi + 1;
+    }
+    #else
+    var zi = 0;
+    while (zi < 4096) { store64(base + zi * 8, 0); zi = zi + 1; }   # 32 KB silence
+    #endif
+    return 0;
+}
+
+# Serviced from the 100 Hz timer tick (pic.cyr timer_handler, BSP-gated). Reads
+# SD_LPIB; when the DMA crosses the BDL midpoint into a new half, the half it just
+# LEFT is fully consumed — refill it (the DMA now has ~170 ms on the other half vs
+# the ~10 ms tick, so the ring is oversized ~17x: a missed tick can't underrun into
+# silence). The 2-state (ping-pong) detector assumes at most ONE half-boundary is
+# crossed per service — true at the 17x margin under any non-broken tick rate; a
+# >=17-tick timer stall (a catastrophic, everything-else-breaks condition) would
+# only cause a self-healing stale-replay glitch, never a hang. No-op until a producer
+# arms `hda_stream_on`, so production/audio-idle ticks pay just one load+compare
+# until Gate 2 wires snd_write#66. ISR context (IF=0): an MMIO read every tick, and
+# on a crossing a full-half refill (8192 frames, tens of µs at 3 GHz — HDA_TONE-only;
+# a shipping producer must generate off-ISR, see hda_refill_half). WB stores are
+# cache-coherent (no fence). GATE-2 PREREQ: when snd_write#66 also writes the ring +
+# hda_last_half/hda_gen_* from ring-3 (IF=1), add an atomic try-lock here mirroring
+# `net_rx_lock` (or make this the sole writer + have snd_write only enqueue) — today
+# this is the SOLE caller (BSP timer), so no lock is needed yet.
+fn hda_stream_service() {
+    if (hda_stream_on == 0) { return 0; }
+    var lpib = hda_read32(hda_sd_base + SD_LPIB);
+    var cur = 0;
+    if (lpib >= hda_ring_half) { cur = 1; }
+    if (cur != hda_last_half) {
+        hda_refill_half(hda_last_half);
+        hda_last_half = cur;
+        hda_refills = hda_refills + 1;
+    }
+    return 0;
+}
+
 # === B3 — stream + BDL DMA-arm (roadmap 1.52.3) ===============================
-# Allocate a BDL ring (WB) + a WC-mapped PCM ring, program the OUTPUT stream
+# Allocate a BDL ring + a PCM ring (both WB/coherent), program the OUTPUT stream
 # descriptor at 0x80 + ISS*0x20 (48k/16/2ch — SDnFMT=0x0011, NOT 0x4011 which is
 # 44.1kHz), bind the stream tag to the DAC on BOTH sides (controller SDnFMT +
 # codec SET_STREAM_FMT must MATCH or the stream faults), then set RUN. Gate:
@@ -804,32 +878,38 @@ fn hda_stream_arm() {
     hda_zero_page(bdl_va);
     hda_bdl_phys = bdl;
 
-    # PCM ring: 2 MB contiguous, WC-mapped (the framebuffer path). Use a 64 KB
-    # window (2 x 32 KB BDL entries) — ~333 ms at 48k/16/2, ample for B3/B4.
+    # PCM ring: 2 MB contiguous, **WB / coherent** — like the BDL + CORB/RIRB rings
+    # (all `0x83`) and every other agnos DMA ring (NVMe/AHCI/r8169). x86 PCIe DMA is
+    # cache-coherent (the controller already DMA-reads the WB BDL fine → LPIB advances),
+    # so WB PCM is read coherently with NO cache flush or sfence. (An earlier
+    # `vmm_remap_wc_2mb(pcm)` was a mis-copied framebuffer pattern — the FB uses WC to
+    # avoid polluting cache with a huge surface, irrelevant for a 64 KB ring — and it
+    # silently WC'd the identity alias while the refill writes go through the direct-map
+    # WB alias `pmm_kva_for_access` returns, so it was a no-op that B4 nonetheless played
+    # cleanly *because* WB is coherent. Dropped: the ring is now honestly WB.) Use a
+    # 64 KB window (2 x 32 KB BDL entries) — ~333 ms at 48k/16/2, ample for B3/B4/B5.
     var pcm = pmm_alloc_2mb();
     if (pcm == 0) { kprintln("hda: PCM ring alloc failed", 26); return 0; }
     iommu_register_dma(pcm);
-    vmm_remap_wc_2mb(pcm);
-    var pcm_va = pmm_kva_for_access(pcm);   # valid CPU VA (identity <=256MB / direct-map above)
+    var pcm_va = pmm_kva_for_access(pcm);   # coherent WB VA (identity <=256MB / direct-map above)
     hda_pcm_phys = pcm;
+    hda_pcm_va = pcm_va;                    # cache the ring VA for the B5 refill servicer
+    hda_ring_half = 0x8000;                 # 32 KB double-buffer unit (== `half` below)
     #ifdef HDA_TONE
-    # B4 first-tone (build-gated so production boots stay silent): a ~375 Hz
-    # integer triangle — 128 frames/period, 128 whole periods in the 64 KB window
-    # so the BDL loop is click-free. i16 L+R per frame, store16 straight into the
-    # WC ring (the r8169 pattern — avoids the module-global var-array unit trap).
-    # A real sine/PCM comes from producers (vani / cyrius-doom) via snd_write later.
-    var amp = 12000;
-    var f = 0;
-    while (f < 16384) {                     # 64 KB / 4 bytes-per-frame
-        var ph = f % 128;
-        var s = 0;
-        if (ph < 64) { s = (0 - amp) + (4 * amp * ph) / 128; }
-        else { s = amp - (4 * amp * (ph - 64)) / 128; }
-        store16(pcm_va + f * 4, s & 0xFFFF);
-        store16(pcm_va + f * 4 + 2, s & 0xFFFF);
-        f = f + 1;
-    }
-    kprintln("hda: tone 375Hz filled", 22);
+    # B4/B5 (build-gated so production boots stay silent): fill both BDL halves with
+    # the opening of HDA_TONE's phase-continuous sweep, then arm the 100 Hz refill
+    # servicer (hda_stream_service) so playback STREAMS gap-free via double-buffer
+    # refill instead of looping a static 64 KB window. store16 straight into the WB
+    # ring (the r8169 pattern — avoids the module-global var-array unit trap). Real
+    # PCM comes from producers (vani / cyrius-doom) via snd_write#66 once Gate 2 lands,
+    # driving the SAME refill path.
+    hda_gen_acc = 0;
+    hda_gen_inc = 300;
+    hda_refill_half(0);
+    hda_refill_half(1);
+    hda_last_half = 0;
+    hda_stream_on = 1;
+    kprintln("hda: sweep streaming (B5 refill armed)", 38);
     #else
     var zi = 0;
     while (zi < 8192) { store64(pcm_va + zi * 8, 0); zi = zi + 1; }   # zero 64 KB = silence

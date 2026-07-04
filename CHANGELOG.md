@@ -5,6 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.52.6] — 2026-07-03
+
+### Added — 1.52.x audio arc
+- **B5 — streamed PCM double-buffer refill** (closes Gate 1, the kernel HDA driver). A servicer
+  (`hda_stream_service`, `kernel/core/hda.cyr`) polled from the 100 Hz timer tick (`pic.cyr`
+  `timer_handler`, BSP-gated alongside `net_rx_drain`) watches `SD_LPIB`; when the DMA crosses the BDL
+  midpoint it refills the just-consumed 32 KB half (`hda_refill_half`). This is the exact machinery
+  `snd_write#66` (Gate 2) will drive — B5 proves it with an `HDA_TONE` phase-continuous **frequency
+  sweep** (~220 Hz→1 kHz rising whoop) so a working refill is *observably* distinct from a static loop.
+  The ring is oversized ~17× (a half = ~170 ms vs the 10 ms tick), so a missed tick can't underrun.
+  **Production/audio-idle boots pay only one load+compare** — the servicer self-gates off
+  (`hda_stream_on=0`) until a producer arms it. **QEMU-PASS** (`hda-tone-smoke.sh`): sweep streaming,
+  RMS=5131, and a wav frequency-progression gate shows **peak 1102 Hz** — only reachable if refill
+  streamed PCM *past* the initial 64 KB fill (which alone tops out ~400 Hz), so it proves NEW data
+  flowed, not a stale loop. check.sh 11/11, agnsh/smp/hda smokes green. Iron gate: an audible rising
+  sweep out the archaemenid front jack.
+- **Pre-burn adversarial review (3-lens + synthesis) caught a burn-blocker before iron.** The PCM ring
+  was `vmm_remap_wc_2mb`'d — a mis-copied framebuffer pattern that silently WC'd the *identity* alias
+  while the refill writes go through the WB *direct-map* alias `pmm_kva_for_access` returns (a no-op that
+  B4 nonetheless played cleanly). **Fixed: the PCM ring is now honestly WB/coherent** like the BDL +
+  CORB/RIRB and every agnos DMA ring — x86 PCIe DMA is cache-coherent (the controller already DMA-reads
+  the WB BDL fine), so no WC/sfence is needed. Also from the review: the servicer's ISR serial heartbeat
+  was dropped (replaced by the wav frequency-progression gate, avoiding an IF=0 THR-poll stall on the
+  cable-less iron target), the true in-ISR refill cost documented, and the Gate-2 lock prerequisite
+  (an atomic try-lock mirroring `net_rx_lock` once `snd_write#66` writes the ring from ring-3) flagged.
+
+**Next: Gate 2** — the ring-3 `snd_*` syscall band `#64-69` (`snd_open`/`config`/`write`/`close`/
+`drain`/`avail`), driving the same refill path from userland.
+
 ## [1.52.5] — 2026-07-03
 
 ### Added — 1.52.x audio arc
