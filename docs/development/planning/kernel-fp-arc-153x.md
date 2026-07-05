@@ -11,7 +11,7 @@ SSE2 is x86-64 baseline, so this rides the **archaemenid AMD Zen** target the
 | Bite | Cut | What | State |
 |------|-----|------|-------|
 | **B1** | **1.53.0** | Enable SSE per core (BSP + every AP); FP-free-kernel invariant; ring-0 f64 proof | **✅ DONE + QEMU 4/4 (2026-07-05)** |
-| **B2** | 1.53.1 | Per-proc FXSAVE state array + per-CPU `fpu_owner` + boot-captured default image | Planned |
+| **B2** | **1.53.1** | Per-proc FXSAVE state array + per-CPU `fpu_owner` + **hand-built** default image | **✅ DONE + QEMU 2/2 (2026-07-05)** |
 | **B3** | 1.53.2 | Lazy `#NM` handler + `CR0.TS`-on-both-switch-paths + `fpu_owner` + deschedule-FXSAVE + `#XM` handler | Planned — **highest-risk (iron-gated)** |
 | **B4** | 1.53.3 | Ring-3 f64 first-touch FXRSTOR (single-owner, end to end) | Planned |
 | **B5** | 1.53.4 | Two-proc FP-preservation stress (timer / cooperative-yield / `-smp` migration) | Planned |
@@ -171,7 +171,13 @@ kept as the record:*
   `fp: ring0 OK`.
 - **Repo:** agnos kernel.
 
-### B2 — Per-proc FP-state array + per-proc `fninit` init (pure additive state)
+### B2 — Per-proc FP-state array + per-proc `fninit` init (pure additive state) — ✅ SHIPPED 1.53.1 (2026-07-05)
+*As shipped:* `fpu_state[1026]` + `fpu_owner[4]` in `proc.cyr` + `fpu_area(pid)`
+(16-align) + `fpu_area_reset`/`fpu_area_init` (hand-built fninit-equiv default:
+`FCW=0x037F`, `MXCSR=0x1F80`, **no `fxsave`** → production stays FP-free);
+`fpu_area_init()` at boot after `fpu_enable`, `proc_alloc_slot` resets recycled slots.
+`FP_AREA_SELFTEST` + `fp-area-smoke.sh` → `fp: area OK`, 2/2 green. Also fixed a stale
+`proc.cyr` IF=0-cooperative comment. *Original plan below:*
 - Add `var fpu_state[1026];` + `var fpu_owner[4];` (default -1) to `proc.cyr`,
   documented like the `proc_cs`/`proc_ss` siblings. Add `fpu_area(pid)` with the
   16-byte align-up. **Zero + write an `fninit`-derived default FXSAVE image**
@@ -181,12 +187,14 @@ kept as the record:*
 - **Gate:** `FP_AREA_SELFTEST` asserts `fpu_area(pid)` is 16-aligned for all 16
   pids **and** each slot's default MXCSR == `0x1F80`. `exec-smoke` + `agnsh-smoke`
   stay green (additive only).
-- **[2026-07-05] refinement:** do NOT hand-build the FXSAVE default image — CAPTURE
-  it once at boot via a real `FXSAVE` (after B1's `fpu_enable`, so it inherits the
-  clean `fninit` x87 + `0x1F80` MXCSR), then `memcpy` into all 16 slots from a
-  single `fpu_area_init()` at boot (mirroring `proc_on_cpu_init`), NOT per-
-  `proc_alloc_slot`. And **reset a recycled slot's image on reuse** or a new proc
-  inherits the previous occupant's saved XMM (a latent B3/B5 bug).
+- **[2026-07-05] decision (as shipped):** the grounded pass suggested capturing a
+  real `FXSAVE` at boot (to guarantee FXRSTOR-legality); B2 instead **hand-builds**
+  the default (zeroed + `FCW=0x037F` + `MXCSR=0x1F80`) via plain stores — this keeps
+  the kernel FP-free through B2 (no `fxsave` until B3's `#NM` handler) and the image
+  is FXRSTOR-legal (MXCSR valid under any MXCSR_MASK, reserved area zeroed). One
+  `fpu_area_init()` seeds all 16 at boot; `proc_alloc_slot` resets a recycled slot so
+  a new proc never inherits the previous occupant's saved XMM. **If B4's
+  first-FXRSTOR test ever `#GP`s, B3 switches to a boot-captured image.**
 - **Repo:** agnos kernel.
 
 ### B3 — Lazy `#NM` handler + `CR0.TS`-on-switch + per-CPU `fpu_owner` (the core)

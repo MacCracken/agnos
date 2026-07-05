@@ -171,6 +171,12 @@ kprintln("SSE enabled", 11);
 #ifdef FP_SELFTEST
 fpu_selftest();
 #endif
+# 1.53.x B2: seed all 16 per-proc FXSAVE areas (fninit-equiv default) + per-CPU FP
+# owners (-1). Pure memory init — no FP instruction, so production stays FP-free.
+fpu_area_init();
+#ifdef FP_AREA_SELFTEST
+fpu_area_selftest();
+#endif
 
 
 # === CMOS kernel checkpoint 8 (page tables built — historical stall point) ===

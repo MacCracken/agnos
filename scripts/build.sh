@@ -180,6 +180,7 @@ else
         [ -n "$TONEGEN_SELFTEST" ]   && echo '#define TONEGEN_SELFTEST'
         [ -n "$VANITONE_AUDIO_SELFTEST" ] && echo '#define VANITONE_AUDIO_SELFTEST'
         [ -n "$FP_SELFTEST" ]        && echo '#define FP_SELFTEST'
+        [ -n "$FP_AREA_SELFTEST" ]   && echo '#define FP_AREA_SELFTEST'
 
         [ -n "$NET_SELFTEST" ]       && echo '#define NET_SELFTEST'
         [ -n "$LOOPBACK_SELFTEST" ]  && echo '#define LOOPBACK_SELFTEST'

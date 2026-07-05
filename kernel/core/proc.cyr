@@ -121,11 +121,11 @@ fn idle_owner_set(pid, c) { store64(&idle_owner + pid * 8, c); return 0; }
 fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8, 0 - 1); store64(&idle_owner + i * 8, 0 - 1); i = i + 1; } return 0; }
 # 1.46.1 (per-process kernel stacks): each proc's own TSS.RSP0 — the kernel stack
 # the CPU switches to on a CPL3->CPL0 interrupt. Foundation for IF=1 preemptive
-# agnsh (a later bite): a preempted ring-3 proc takes its timer tick on ITS OWN
-# stack instead of the shared 0x3C0000, so two procs never grow down one interrupt
-# stack. RSP0 is consumed ONLY on a CPL change, so this is INERT in the current
-# IF=0-cooperative config (the deep FS path stays on the UNCHANGED syscall kstack;
-# only the interrupt stack — shallow ISR->do_context_switch — goes per-proc here).
+# agnsh (LIVE since 1.44.14, exec_preempt=1): a preempted ring-3 proc takes its
+# timer tick on ITS OWN stack instead of the shared 0x3C0000, so two procs never
+# grow down one interrupt stack. RSP0 is consumed on a CPL3->CPL0 preemption; the
+# deep FS path still stays on the UNCHANGED shared syscall kstack (only the shallow
+# interrupt stack — ISR->do_context_switch — goes per-proc here).
 # Pool PHYS = region 7 (14-16MB), reserved in pmm_init. **1.51.x: RSP0 points at the
 # region-7 phys via its DIRECT-MAP alias (DIRECTMAP_BASE + phys, 8 GB+), NOT its low
 # identity VA.** The identity VA (14-16MB) sits INSIDE the user-segment range — elf_load
@@ -139,6 +139,63 @@ fn proc_on_cpu_init() { var i = 0; while (i < 16) { store64(&proc_on_cpu + i * 8
 var proc_rsp0[16];      # per-pid TSS.RSP0 top (0 = unassigned -> 0x3C0000 fallback)
 var KSTACK_POOL_BASE = 0xE00000;   # region 7 PHYS base (14 MB) — RSP0 = DIRECTMAP_BASE + this
 var KSTACK_SLOT = 0x10000;         # 64 KB per proc (interrupt stack is shallow)
+
+# === 1.53.x FP/SIMD arc (B2) — per-proc FP (FXSAVE) state + per-CPU FP owner ===
+# Each proc gets a 512-byte FXSAVE area (x87 + XMM + MXCSR) for the lazy #NM
+# save/restore B3 installs. A SEPARATE module-global sibling array — never the
+# 176-byte proc slot (the proc_cs/proc_ss/proc_rsp0 precedent) — because FXSAVE
+# needs 16-byte alignment and the slot stride is 176. Module-global `var X[N]` is
+# N*u64, so [1026] = 8208 B = 16 procs * 512 + 16 align slop. fpu_area(pid) 16-aligns
+# the base (512 is a multiple of 16, so every per-pid slot stays aligned).
+var fpu_state[1026];
+# Per-CPU (NOT per-pid) live-FP owner: fpu_owner[cpu] = the pid whose XMM is live on
+# that core, -1 = kernel/none. Per-CPU like pcpu_curproc — a single global would
+# corrupt XMM across cores once APs run real procs. B3 maintains it; B2 seeds it -1.
+var fpu_owner[4];
+fn fpu_area(pid): i64 {
+    var base = (&fpu_state + 15) & (0 - 16);   # 16-align the array base up
+    return base + pid * 512;
+}
+# Seed a proc's FXSAVE area with the fninit-equivalent default: zeroed, FCW=0x037F
+# (x87 control word), MXCSR=0x1F80 (all six SSE exceptions masked). HAND-BUILT via
+# plain stores — NO fxsave — so the production kernel stays FP-free through B2 (the
+# first real fxsave/fxrstor arrive with the #NM handler in B3). FXRSTOR-legal (MXCSR
+# valid under any MXCSR_MASK; reserved header/area zeroed); B4's first-FXRSTOR test
+# is the confirmation. Also reused by proc_alloc_slot to reset a recycled slot.
+fn fpu_area_reset(pid): i64 {
+    var area = fpu_area(pid);
+    var i = 0;
+    while (i < 512) { store64(area + i, 0); i = i + 8; }
+    store32(area, 0x037F);        # offset 0:  FCW=0x037F, FSW=0
+    store32(area + 24, 0x1F80);   # offset 24: MXCSR default (0x18)
+    return 0;
+}
+# Boot-time init (called once from main.cyr after fpu_enable): seed all 16 areas +
+# set every per-CPU FP owner to -1 (none). Pure memory init — no FP instruction.
+fn fpu_area_init(): i64 {
+    var pid = 0;
+    while (pid < 16) { fpu_area_reset(pid); pid = pid + 1; }
+    var c = 0;
+    while (c < 4) { store64(&fpu_owner + c * 8, 0 - 1); c = c + 1; }
+    return 0;
+}
+#ifdef FP_AREA_SELFTEST
+# B2 proof: every pid's FXSAVE area is 16-aligned and carries the default FCW+MXCSR.
+fn fpu_area_selftest(): i64 {
+    var ok = 1;
+    var pid = 0;
+    while (pid < 16) {
+        var area = fpu_area(pid);
+        if ((area & 15) != 0) { ok = 0; }               # 16-byte aligned
+        if (load32(area + 24) != 0x1F80) { ok = 0; }    # default MXCSR
+        if (load32(area) != 0x037F) { ok = 0; }         # default FCW (low 16, FSW=0)
+        pid = pid + 1;
+    }
+    if (ok == 1) { kprintln("fp: area OK", 11); } else { kprintln("fp: area FAIL", 13); }
+    return 0;
+}
+#endif
+
 var pending_signal_flag = 0;  # Set by scheduler ISR, read by main — benign race (atomic store on x86_64)
 
 # === 1.44.x multi-threading (opening) — preempt gate ===
@@ -209,6 +266,7 @@ fn proc_alloc_slot() {
     store64(&proc_on_cpu + idx * 8, 0 - 1);   # 1.46.x SMP6: recycled slot must not inherit a stale CPU id
     store64(&idle_owner + idx * 8, 0 - 1);     # 1.46.x STEP-2: recycled slot starts UNPINNED (a prior foreground proc may have left idle_owner=its launch CPU; a fresh proc must be free to migrate / not falsely pinned). Idles never reuse a slot, so their persistent pin is unaffected.
     store64(&proc_ppid + idx * 8, 0);          # 1.50.7: recycled slot must not inherit a stale parent (default init; proc_create_user sets the real creator)
+    fpu_area_reset(idx);                        # 1.53.x B2: recycled slot must not inherit the prior occupant's saved XMM — reset to the fninit-equivalent default (matters once B3's #NM restore is live)
     return idx;
 }
 # 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the legacy shared stack (0x3C0000

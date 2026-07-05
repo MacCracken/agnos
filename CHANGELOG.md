@@ -5,6 +5,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.1] — 2026-07-05 — FP/SIMD arc B2: per-proc FXSAVE state
+
+Adds the per-proc FP-state infrastructure the lazy `#NM` save/restore (B3) will use.
+Pure additive state — **no context-switch change and no FP instruction** — so the
+production kernel stays FP-free (`objdump -Ec 'xmm|fxsave|fxrstor'` == 0).
+
+### Added — B2: per-proc FXSAVE areas + per-CPU FP owner
+- **`fpu_state[1026]` + `fpu_owner[4]`** in `kernel/core/proc.cyr` — a separate
+  module-global sibling array (the `proc_cs`/`proc_ss`/`proc_rsp0` precedent), never
+  the 176-byte proc slot: FXSAVE needs 16-byte alignment and 512 B per proc, which
+  the slot stride can't carry. `[1026]` u64 = 8208 B = 16 × 512 + align slop.
+- **`fpu_area(pid)`** 16-aligns the array base (`(&fpu_state + 15) & ~15`); 512 is a
+  multiple of 16 so every per-pid slot stays aligned.
+- **`fpu_area_reset(pid)` / `fpu_area_init()`** seed each area with the
+  fninit-equivalent default (zeroed, `FCW=0x037F`, `MXCSR=0x1F80` — all six SSE
+  exceptions masked), **hand-built via plain stores, no `fxsave`** — so B2 keeps the
+  kernel literally FP-free (the first real `fxsave`/`fxrstor` arrive with the `#NM`
+  handler in B3). `fpu_area_init()` runs once at boot after `fpu_enable()`, and
+  `proc_alloc_slot` calls `fpu_area_reset` so a recycled slot never inherits the
+  prior occupant's saved XMM. `fpu_owner[cpu]` seeded to -1 (none) — per-CPU, not a
+  global, so APs won't corrupt each other's live XMM once B3 lands.
+- **Deliberate deviation from the plan's "capture via real FXSAVE" refinement**: the
+  hand-built image keeps production FP-free through B2 and is FXRSTOR-legal (MXCSR
+  valid under any MXCSR_MASK, reserved header/area zeroed). B4's
+  first-FXRSTOR-doesn't-`#GP` assertion is the confirmation; if it ever faults, B3
+  switches to a boot-captured image.
+
+### Testing
+- **`FP_AREA_SELFTEST`** (env → `#define`, in `build.sh`'s allow-list) asserts every
+  `fpu_area(pid)` is 16-aligned and carries the default `FCW`/`MXCSR`.
+  **`scripts/fp-area-smoke.sh`** (gnoboot+OVMF+QEMU) → `fp: area OK` + boot-to-shell.
+  **2/2 green.** Registered in `sweep.sh`.
+
+### Fixed
+- Stale comment in `proc.cyr`: the per-proc RSP0 block claimed it was "INERT in the
+  current IF=0-cooperative config" — but agnsh has run IF=1-preemptive
+  (`exec_preempt=1`) since 1.44.14. Reworded to the live preemptive reality (part of
+  an ongoing stale-comment sweep alongside the SMP "AP INERT" reconciliation).
+
 ## [1.53.0] — 2026-07-05 — FP/SIMD arc opens: SSE enabled per core (bite B1)
 
 Opens the **1.53.x kernel FP/SIMD arc** (`f64` in ring-3). Today the kernel enables
