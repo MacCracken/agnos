@@ -359,6 +359,61 @@ only; the FXSAVE-of-previous-owner limb is B5. *Original plan below:*
   generated).
 - **Repo:** agnos kernel.
 
+#### B5 — VERIFIED DESIGN (adversarial workflow, 2026-07-05) — the implementation blueprint
+
+The false-green model is **CONFIRMED sound** *if* built on the preemptive
+`spawn_user_proc` / `sched_active=1` path (NOT the IF=0 foreground `exec_and_wait`/#37
+trap): two ring-3 procs co-scheduled, so "A runs to completion then B" is structurally
+impossible. Concurrent read-back syscalls are already per-CPU-safe; nested-`#NM`/`#DF` is
+safe (vector-7 0x8E gate clears IF, IST=0 + clear-TS-first + always-mapped `fpu_area`).
+**Fixes to implement:**
+
+**Structure** — a kernel `FP_CTXSW_SELFTEST` block (modeled 1:1 on `RING3_SELFTEST`):
+`fpctxsw_selftest_setup()` spawns TWO procs via the `ring3_spawn_one` recipe
+(`main.cyr:3252` — `spawn_user_proc` + `proc_map_page(cr3, 0x2000000, witness)` +
+`proc_set_ring3`), BEFORE `sched_active` so they co-schedule. Each proc's raw payload
+plants a distinct pattern (A=`0x1111…`, B=`0x2222…`), loads it into XMM, interleaves,
+re-reads, and stores survived/corrupt counts into its witness page. `fpctxsw_selftest_verify()`
+reads both witness pages (`load64(counter_phys)`), asserts both survived≥K & corrupt==0,
+prints `fp: ctxsw A OK`/`B OK`. **TS-arming grounding fix:** these spawned procs enter ring 3
+via the scheduler restore, so their first `#NM` is armed by `fpu_set_ts()` on the switch
+paths (`sched.cyr:378`/`:570`), NOT `enter_ring3:198`.
+
+**★ CRITICAL/HIGH — the rigorous false-green fix (a survived-round MUST prove the peer
+overwrote the physical XMM between this proc's write and re-read):** the ring-3 payload can't
+read the kernel's `fpu_switch_count` (kernel `.bss`, not user-mapped) to self-gate, so use a
+**HANDSHAKE**: each proc writes its pattern → sets its "wrote" flag in a SHARED page mapped
+into both CR3s → spins/`yield#44` until the PEER's flag shows the peer wrote ITS pattern →
+only THEN re-reads. That forces the interleave (the physical XMM is provably clobbered by the
+peer before the re-read), so a survived-round proves a real FXSAVE+FXRSTOR. Make **mode (b)
+`sched_yield#44` the load-bearing HARD gate** (deterministic switch); mode (a) timer is
+corroboration.
+
+**★ HIGH — migration witness (mode c):** the sketch diffs `proc_on_cpu`, which
+`on_cpu_set(pid,-1)` clears on EVERY deschedule (`sched.cyr:342/557`) → never witnesses a
+transition. Add a **persistent `proc_last_cpu[16]`** stamped with `pcpu_cpu()` at the pick
+site in `do_context_switch` (`sched.cyr:347`) + `sys_sched_yield` (`:560`); the verify diffs
+THAT. **Mode (c) is a SOFT gate** (report `fp: A cpuX→cpuY`, do NOT fail rc): `smp_sched_aps=1`
+is live but the real-Zen migration is iron-unvalidated (`main.cyr:2739` is a stale STEP-1
+comment — ignore it). The scheduler has no affinity so migration is probabilistic; to make it
+deterministic later, add a test-only anti-affinity (refuse to re-pick a proc on its last core)
+or 3 procs on `-smp 2`. The mode-(c) HARD promotion is the **dispositive B3 iron burn**.
+
+**★ HIGH — XMM coverage:** sweep several regs (e.g. `xmm0`/`xmm3`/`xmm7` + one high
+`xmm8`/`xmm15` for FXSAVE-completeness), not just `xmm3` — a one-register witness can't catch a
+partial save. `xmm8-15` need **REX.B** on the `movsd`/`movq` (hand-verify against `objdump` of
+the payload page, the `mov-cr3` REX.B precedent). *Note:* cyrius scalar-f64 codegen only ever
+uses `xmm0-3` (`float.cyr`), so the low file is the naad-relevant coverage; high regs are
+FXSAVE-completeness only.
+
+**★ MEDIUM — FP-free-audit self-sabotage:** every B5 kernel helper (setup/verify/counters/
+latches) must be **`i64` + `load64`/`store64` ONLY** — no `f64` local / float compare, or cyrius
+emits an xmm op and breaks the "exactly 2 sanctioned `fxsave`/`fxrstor`, 0 stray xmm" audit.
+Post-build grep asserts it. Keep `#DF`/`#NM`-loop/`#PF`/PANIC as HARD smoke gates (they cover
+the prev≠cur FXSAVE-of-PREVIOUS-owner limb, first exercised here), with a distinct
+"survived-stuck-at-0" FAIL sentinel to diagnose a `#NM`-loop vs corruption. **This is an
+intricate hand-asm bite (two-proc payloads + handshake) — its own focused pass.**
+
 ### B6 — naad build + run on agnos ring-3 (the green end-proof)
 - Cross-build `naad` `--agnos`, run an oscillator/synth exerciser in ring-3 under
   QEMU (`naad-smoke.sh`), assert **finite non-NaN samples** out. In **parallel,
