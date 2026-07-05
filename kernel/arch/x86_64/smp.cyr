@@ -405,6 +405,10 @@ fn ap_entry() {
     # Per-CPU SYSCALL MSRs (STAR/LSTAR/CSTAR/SFMASK + EFER.SCE) for this AP — so a ring-3
     # proc scheduled here (STEP-2) can SYSCALL into the kernel with this CPU's stubs.
     syscall_msr_init();
+    # SSE/FP enable for this AP (1.53.x FP/SIMD arc, B1) — same per-core enable
+    # as the BSP; SSE2 is x86-64 baseline so every AP gets CR4.OSFXSR before any
+    # f64 could run on it. Idempotent, no XMM touched (kernel stays FP-free).
+    fpu_enable();
     # Register this AP's idle kthread. INV-4 (lock order): ap_idle_create -> kthread_create takes
     # proctab_lock, so it MUST run ABOVE sched_spin_lock — sched_lock never nests proctab_lock.
     # Only the idle's state/owner/current flips go under sched_lock (so the BSP scheduler never

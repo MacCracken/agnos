@@ -161,6 +161,17 @@ kprint("Page tables: ", 13);
 kprint_num(pt_get_mapped_mb());
 kprintln("MB mapped", 9);
 
+# === SSE / FP enable (1.53.x FP/SIMD arc, B1) — after pt_init(), CR3 live. ===
+# Clears the ring-3 f64 #UD wall (CR0.EM off, CR0.MP on, CR4.OSFXSR|OSXMMEXCPT
+# on, fninit). The production kernel stays FP-free (fpu_enable uses only raw CR
+# opcodes + fninit, no xmm); the movsd + ring-0 f64 proofs are gated behind
+# FP_SELFTEST. Per-proc FXSAVE + lazy #NM save/restore land in B2/B3.
+fpu_enable();
+kprintln("SSE enabled", 11);
+#ifdef FP_SELFTEST
+fpu_selftest();
+#endif
+
 
 # === CMOS kernel checkpoint 8 (page tables built — historical stall point) ===
 # Pre-RDRAND-fix (cyrius 5.11.x, missing -cpu max in QEMU smoke) this was
@@ -2232,6 +2243,19 @@ kprintln("exec: doom audio-test returned", 30);
 kprintln("exec: running /bin/tonegen", 26);
 sh_exec("run /bin/tonegen", 16);
 kprintln("exec: tonegen returned", 22);
+#endif
+
+#ifdef VANITONE_AUDIO_SELFTEST
+# vani-core backend proof (Gate 3/4 of the 1.52.x audio arc). Runs /bin/vanitone,
+# a doom-style consumer of vani's dist/vani-core.cyr — the FIRST audio through the
+# cyrius `vani` audio lib's agnos backend (audio_open_playback/set_params/write/
+# drain/close → sys_snd_* #64-69), as opposed to doom/tonegen's hand-rolled direct
+# syscalls. vanitone blocking-streams a 1.5s 440 Hz square through the shim, then
+# drains + closes. scripts/vani-tone-smoke.sh captures the HDA output + asserts a
+# non-silent wav (continuous tone → strong RMS). Exits when the tone finishes.
+kprintln("exec: running /bin/vanitone", 27);
+sh_exec("run /bin/vanitone", 17);
+kprintln("exec: vanitone returned", 23);
 #endif
 
 # 1.41.3 — FS-syscall self-test (compile-gated, FS_SYSCALL_SELFTEST=1). Drives

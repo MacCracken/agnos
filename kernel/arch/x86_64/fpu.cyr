@@ -1,0 +1,66 @@
+# fpu.cyr — x86-64 SSE / FP-state enablement (1.53.x FP/SIMD arc, bite B1).
+#
+# WHY: cyrius emits hardware SSE for scalar `f64` (addsd/mulsd/divsd on xmm),
+# but boot_shim brought the CPU up with CR4.OSFXSR clear and never ran fninit,
+# so the very first `movsd` in ring-3 (or ring-0) #UDs. `naad` builds --agnos
+# clean yet carries 26,647 XMM instructions and faults on the first SSE op;
+# the same wall blocks nidhi + all on-device-ML f64. B1 removes that wall by
+# ENABLING SSE per core. Per-proc FXSAVE state + lazy #NM save/restore (so two
+# f64 procs don't corrupt each other's XMM) land in B2/B3.
+#
+# FP-FREE INVARIANT: the production kernel must stay FP-free — `objdump -d
+# build/agnos | grep -c xmm` == 0. fpu_enable() uses ONLY raw CR opcodes +
+# fninit (no xmm mnemonic), so it holds. The movsd probe + the ring-0 f64
+# proof live behind FP_SELFTEST and never reach the production binary.
+#
+# The raw-opcode read-modify-write mirrors the boot_shim CR4 block
+# (0F 20 = mov r64,cr ; 0F 22 = mov cr,r64). In 64-bit mode these are ALWAYS
+# 64-bit CR moves (no REX.W needed); the 32-bit `eax` RMW zeros RAX[63:32].
+# boot_shim's analogous RMW runs in 32-bit submode so it isn't an exact
+# precedent for the high-half zeroing, but the zeroing is safe here because
+# every defined CR0/CR4 bit lives in [0:31] (CR0 PG/PE/WP/MP/EM…; CR4
+# PAE5/SMEP20/SMAP21/CET23…) and [63:32] are reserved-MBZ — a no-op write.
+# The FP_SELFTEST 4/4 boot (SMEP/SMAP stay set, box doesn't fault) confirms it.
+#
+# OSXMMEXCPT (bit 10) routes UNMASKED SSE numeric exceptions to #XM (vector 19)
+# rather than #UD. Vector 19 is intentionally left on the bare-iretq default
+# stub for B1: MXCSR defaults to 0x1F80 (all six SSE exception masks set), so no
+# #XM can fire, and #XM pushes no error code (a stray one would iretq cleanly,
+# not #DF). A real halting #XM handler installs alongside the #NM handler at B3,
+# when ring-3 f64 workloads that could clear an MXCSR mask actually arrive.
+
+fn fpu_enable(): i64 {
+    asm {
+        0x0F; 0x20; 0xC0;               # mov rax, cr0
+        0x25; 0xFB; 0xFF; 0xFF; 0xFF;   # and eax, 0xFFFFFFFB   (clear CR0.EM  bit2)
+        0x0D; 0x02; 0x00; 0x00; 0x00;   # or  eax, 0x2          (set   CR0.MP  bit1)
+        0x0F; 0x22; 0xC0;               # mov cr0, rax
+        0x0F; 0x20; 0xE0;               # mov rax, cr4
+        0x0D; 0x00; 0x06; 0x00; 0x00;   # or  eax, 0x600        (CR4.OSFXSR bit9 | OSXMMEXCPT bit10)
+        0x0F; 0x22; 0xE0;               # mov cr4, rax
+        0xDB; 0xE3;                     # fninit
+    }
+    return 0;
+}
+
+#ifdef FP_SELFTEST
+# B1 proof — FP_SELFTEST-only, so xmm/f64 stay OUT of the production kernel.
+#   (1) a raw `movsd xmm0,xmm0` that #UDs iff SSE is not live (empirical proof
+#       the enable took), then
+#   (2) a cyrius scalar-f64 multiply proving ring-0 f64 codegen actually runs
+#       once SSE is on (3.0 * 2.0 must equal 6.0, computed on xmm via mulsd).
+# Both run AFTER fpu_enable(). Greps: "fp: movsd OK" + "fp: ring0 OK".
+fn fpu_selftest(): i64 {
+    asm { 0xF2; 0x0F; 0x10; 0xC0; }     # movsd xmm0, xmm0  (SSE2 — #UD if SSE off)
+    kprintln("fp: movsd OK", 12);
+    var a: f64 = 3.0;
+    var b: f64 = 2.0;
+    var c: f64 = a * b;
+    if (c == 6.0) {
+        kprintln("fp: ring0 OK", 12);
+    } else {
+        kprintln("fp: ring0 FAIL", 14);
+    }
+    return 0;
+}
+#endif

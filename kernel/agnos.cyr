@@ -1,4 +1,4 @@
-# agnos.cyr — AGNOS kernel v1.52.8
+# agnos.cyr — AGNOS kernel v1.53.0
 # Boot: qemu-system-x86_64 -kernel build/agnos -serial stdio -display none
 
 kernel;
@@ -14,6 +14,7 @@ include "arch/x86_64/gdt.cyr"
 include "arch/x86_64/idt.cyr"
 include "arch/x86_64/pic.cyr"
 include "arch/x86_64/apic.cyr"
+include "arch/x86_64/fpu.cyr"
 include "arch/x86_64/smp.cyr"
 include "arch/x86_64/keyboard.cyr"
 include "arch/x86_64/paging.cyr"

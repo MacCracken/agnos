@@ -5,6 +5,63 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.0] — 2026-07-05 — FP/SIMD arc opens: SSE enabled per core (bite B1)
+
+Opens the **1.53.x kernel FP/SIMD arc** (`f64` in ring-3). Today the kernel enables
+no FP at all — cyrius emits hardware SSE for scalar `f64` (`addsd`/`mulsd`/`divsd`
+on `xmm`), but `boot_shim` left `CR4.OSFXSR` clear and never ran `fninit`, so the
+first `movsd` in any ring-3 `f64` program `#UD`s. `naad` (the f64 audio-synth lib)
+builds `--agnos` clean yet carries 26,647 XMM instructions and faults on the first
+SSE op; `nidhi` and the on-device-ML `f64` future (`rosnet`/`tyche`/`hisab`) inherit
+the same wall. This arc builds the XMM-state infrastructure to remove it. Plan +
+6-bite breakdown: [`docs/development/planning/kernel-fp-arc-153x.md`](docs/development/planning/kernel-fp-arc-153x.md).
+
+### Added — B1: enable SSE on the BSP and every AP
+- **`fpu_enable()`** in a new **`kernel/arch/x86_64/fpu.cyr`** — clears `CR0.EM`
+  (bit 2), sets `CR0.MP` (bit 1), sets `CR4.OSFXSR` (bit 9) + `CR4.OSXMMEXCPT`
+  (bit 10), then `fninit`. Raw CR opcodes mirroring the boot_shim `mov cr4` RMW
+  (in 64-bit mode `0F 20`/`0F 22` are 64-bit CR moves; the 32-bit `eax` RMW zeros
+  `RAX[63:32]`, safe because the CR0/CR4 high halves are reserved-0). Called on the
+  **BSP** in `core/main.cyr` right after `pt_init()` (CR3 live, before any ring-3
+  entry) and on **every AP** in `smp.cyr` `ap_entry()` beside `syscall_msr_init()`
+  — CR0/CR4 are per-core, so the enable must run on all cores. Does **not** touch
+  either hand-assembled trampoline.
+- The two hand-assembled trampolines (`boot_shim` CR4 block, AP trampoline) are
+  left untouched — enabling one instruction later in high-level Cyrius is far lower
+  risk than editing the boot-critical raw-opcode path.
+- `OSXMMEXCPT` is set, but the `#XM` (vector 19) handler is **deferred to B3** —
+  it's unreachable under the reset MXCSR default (`0x1F80`, all SSE exceptions
+  masked) and `#XM` pushes no error code, so a stray one would `iretq` cleanly; the
+  real halting handler installs alongside the `#NM` handler when ring-3 f64
+  workloads that could clear an MXCSR mask arrive. Documented in `fpu.cyr`.
+  Adversarial re-verification (multi-agent, 2026-07-05): every opcode re-derived
+  byte-for-byte, the 32-bit `eax` CR-RMW is safe (all defined CR0/CR4 bits in
+  `[0:31]`), `fninit` correct — B1 confirmed ship-safe.
+
+### Invariant — the production kernel stays FP-free
+- `fpu_enable()` uses only raw CR opcodes + `fninit` (no `xmm` mnemonic), so
+  `objdump -d build/agnos | grep -c xmm` == **0** on the production build — audited
+  green this cut. This is now a **standing gate** across the whole arc: once
+  `CR0.TS`-on-switch ships (B3), any kernel-side `f64` would `#NM` on the interrupt
+  path, so no steady-state kernel path may use `f64`.
+
+### Testing
+- **`FP_SELFTEST`** build (env → `#define`, registered in `build.sh`'s allow-list)
+  adds an FP-only proof, kept OUT of the production binary: a raw `movsd xmm0,xmm0`
+  that `#UD`s iff SSE is not live, plus a cyrius scalar-`f64` multiply
+  (`3.0 * 2.0 == 6.0`, computed on `xmm` via `mulsd`/`ucomisd`) proving ring-0 f64
+  codegen runs once SSE is on.
+- **`scripts/fp-selftest-smoke.sh`** (gnoboot+OVMF+QEMU, `-cpu max`) — greps
+  `SSE enabled` + `fp: movsd OK` + `fp: ring0 OK` + boot-to-shell. **4/4 green.**
+  Registered in `sweep.sh` after the audio HDA gate.
+
+### Remaining (this arc)
+- **B2** per-proc FXSAVE state array + `fninit` default image · **B3** lazy `#NM`
+  handler + `CR0.TS`-on-both-switch-paths + per-CPU `fpu_owner` (highest-risk;
+  iron burn is the real gate) · **B4** ring-3 f64 first-touch restore · **B5**
+  two-proc FP-preservation stress (timer / cooperative / `-smp` migration) · **B6**
+  `naad` on agnos ring-3 (the green end-proof) + the one cyrius issue-doc.
+
 ## [1.52.8] — 2026-07-04
 
 ### Fixed — the LAPIC timebase was UNCALIBRATED (~12× slow on real Zen) — the true root of the audio glitches
