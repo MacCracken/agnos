@@ -53,8 +53,10 @@ fn timer_handler(rsp_after_push) {
     # 1.46.x SMP sub-bite 6b: the BSP owns the wall clock + the single NIC ring. An AP's
     # timer tick must NOT bump timer_ticks (one global clock) nor re-enter net_rx_drain (one
     # shared r8169 ring, single-consumer). Gate both behind pcpu_cpu()==0. ALWAYS-TRUE
-    # single-core (pcpu_cpu()==0), so this is byte-identical today; INERT until an AP arms its
-    # APIC timer at sub-bite 7. do_context_switch runs on EVERY CPU (each schedules its own).
+    # single-core (pcpu_cpu()==0), so this is byte-identical there; LOAD-BEARING on multi-core since
+    # sub-bite 7 — a woken AP arms its own APIC timer (smp.cyr) and takes ticks, and this gate keeps
+    # that AP tick off the BSP-owned wall clock + single NIC ring. do_context_switch runs on EVERY
+    # CPU (each schedules its own).
     if (pcpu_cpu() == 0) {
         timer_ticks = timer_ticks + 1;
         # Service the NIC RX ring every tick (100 Hz) so it stays drained even when no

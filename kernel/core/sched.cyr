@@ -417,8 +417,8 @@ fn kernel_idle_loop() {
 # is parsed BEFORE sched.cyr) can register an idle WITHOUT taking the address of kernel_idle_loop
 # at parse time — cyrius resolves forward CALLS across includes but NOT a forward &fn address-of
 # (smp.cyr:355 errored on `&kernel_idle_loop`). Returns the new pid. Takes proctab_lock via
-# kthread_create, so ap_entry MUST call this ABOVE sched_spin_lock (INV-4 lock order). INERT today
-# (ap_entry never runs while smp_wake_enabled=0).
+# kthread_create, so ap_entry MUST call this ABOVE sched_spin_lock (INV-4 lock order). LIVE since
+# the sub-bite-7 flip (smp_wake_enabled=1): every woken AP calls this to register its idle kthread.
 fn ap_idle_create() { return kthread_create(&kernel_idle_loop); }
 
 # === 1.44.16 — sched_yield(#44): voluntary end-of-slice from ring 3 ===

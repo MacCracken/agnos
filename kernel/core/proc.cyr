@@ -30,9 +30,10 @@ var proc_table[2816];  # 16 processes x 176 bytes each
 var proc_count = 0;
 # 1.46.x SMP sub-bite 2 — per-CPU "current proc pid". Was a single global `proc_current_get()`;
 # under SMP each CPU runs a different proc, so it is indexed by APIC id (the tss_array
-# template). Single-core FAST PATH: while cpu_count<2 (APs not woken — every state up to the
-# sub-bite-7 flip) the accessors hit slot 0 with NO APIC read, so this is byte-for-byte the old
-# global. The old `var proc_current_get()` is REMOVED so any unconverted read fails to COMPILE (the
+# template). Single-core FAST PATH: while cpu_count<2 (single-core, or before the APs wake) the
+# accessors hit slot 0 with NO APIC read, so this is byte-for-byte the old global. Post-wake on
+# multi-core (cpu_count>=2, live since the sub-bite-7 flip) the accessor does the real per-CPU APIC
+# read. The old `var proc_current_get()` is REMOVED so any unconverted read fails to COMPILE (the
 # review's forcing-function safety net). kpti_*/syscall-stub stay global until sub-bite 4 (the
 # stub reads them via baked imm64 — they can't be arrays until it's regenerated).
 var pcpu_curproc[4];     # per-CPU current-proc pid, indexed by APIC id (slot 0 = single-core)
@@ -111,8 +112,9 @@ fn proc_reap_off_cpu_fence(pid) {
 # proc_on_cpu (cleared to -1 on every deschedule), idle_owner is NEVER cleared on deschedule —
 # so a descheduled AP idle (state==1, on_cpu==-1) is STILL excluded from a FOREIGN CPU's
 # sched_next (the pcpu_idle skip only deprioritizes the CALLING CPU's idle). Set in ap_entry
-# when an AP registers its idle kthread; -1 for every non-idle proc. INERT single-core: nothing
-# ever sets a non-(-1) value until an AP runs (smp_wake_enabled=0), so the skip is a no-op.
+# when an AP registers its idle kthread; -1 for every non-idle proc. Single-core: no AP wakes, so
+# nothing sets a non-(-1) value and the skip is a no-op. Multi-core (smp_wake_enabled=1, live since
+# the sub-bite-7 flip): each woken AP sets its idle's owner here and the skip becomes load-bearing.
 var idle_owner[16];
 fn idle_owner_get(pid) { return load64(&idle_owner + pid * 8); }
 fn idle_owner_set(pid, c) { store64(&idle_owner + pid * 8, c); return 0; }

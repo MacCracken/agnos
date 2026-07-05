@@ -357,15 +357,15 @@ fn ahci_spin_unlock() {
 }
 
 # AP entry point — called after the trampoline transitions to long mode.
-# 1.44.18 WAKE + PARK: the AP comes online, reports in, and PARKS — it must NOT arm
-# its APIC timer and must NOT sti. A second CPU taking timer interrupts would run
-# do_context_switch CONCURRENTLY with the BSP — shared kstack, proc_current_get(), no locks —
-# violating the single-core invariant the whole kernel relies on. The multithreading/SMP
-# arc ([[project_multithreading_future_arc]]) unwinds that deliberately, with locking;
-# until then a parked AP (IF=0 + hlt = sleeps until INIT/NMI, i.e. forever) proves the
-# wake path on QEMU + iron without touching the execution model.
-# (Pre-1.44.18 this armed the AP's APIC timer + sti'd — catastrophic had the wake ever
-# been un-gated against the scheduler.)
+# AP entry — 1.44.18 originally WOKE + PARKED the AP (HISTORICAL; superseded by the
+# STEP-2 block below): it came online, reported in, and PARKED (no APIC timer, no sti) so a
+# second CPU couldn't run do_context_switch concurrently with the BSP and violate the
+# single-core no-lock invariant. The 1.46.x multithreading/SMP arc
+# ([[project_multithreading_future_arc]]) then unwound that WITH locking (per-CPU sched
+# identity + the subsystem lock set) and FLIPPED the wake LIVE — so an AP now DOES arm its
+# timer, sti, register an idle, and run the scheduler (STEP-2, iron-validated in 1.46.x; the
+# 1.53.x FP arc B1 also enables SSE per-AP here). See the "sub-bite 7 STEP-2 — AP runs the
+# scheduler (LIVE)" block below for the current behavior.
 fn ap_entry() {
     # Enable this AP's local APIC (spurious vector reg) — no interrupt sources armed.
     store32(0xFEE000F0, 0x1FF);
@@ -387,12 +387,13 @@ fn ap_entry() {
     }
     spin_unlock();
     # ====================================================================================
-    # 1.46.x SMP sub-bite 6b — AP runs the scheduler (STEP-1: wake + idle only).
-    # ⚠ ENTIRELY INERT at the 6 cut: ap_entry is reached ONLY via the trampoline `call
-    # ap_entry` that smp_start_aps builds, and smp_start_aps is called ONLY inside
-    # `if (smp_wake_enabled != 0)` (main.cyr) — and smp_wake_enabled stays 0. So none of the
-    # code below executes until the sub-bite-7 flip. It is written + compiled now so the wake
-    # path is whole; its real validation is the sub-bite-7 iron burn.
+    # 1.46.x SMP sub-bite 7 STEP-2 — AP runs the scheduler (LIVE: wake + real ring-3 procs).
+    # ✅ LIVE since the sub-bite-7 flip: smp_wake_enabled=1 (main.cyr) and smp_sched_aps=1
+    # (above) — both iron-validated in the 1.46.x arc. ap_entry is reached via the trampoline
+    # `call ap_entry` that smp_start_aps builds, and smp_start_aps runs inside `if
+    # (smp_wake_enabled != 0)` (main.cyr) — now TRUE, so APs 1-3 wake, bring up their per-CPU
+    # state below, and pull REAL ready procs from sched_next (STEP-2). The 1.53.x FP arc B1 also
+    # enables SSE per-AP here (fpu_enable() below). NOT inert — a live boot path on multi-core Zen.
     # ====================================================================================
     if (my_id >= 4) { while (1 == 1) { asm { hlt; } } }   # out-of-range APIC id: park (no per-CPU slot)
     # TPR=0: accept all interrupt priorities on this AP's LAPIC.
@@ -592,10 +593,11 @@ fn smp_wait_ticks(n) {
     return 0;
 }
 
-# 1.44.18 — SMP-AP WAKE + PARK (the parked carry-forward, un-gated). Wakes APs 1-3 via
+# 1.44.18 — SMP-AP WAKE (the parked carry-forward, un-gated). Wakes APs 1-3 via
 # the SDM INIT-SIPI-SIPI protocol (the Linux smpboot / SeaBIOS / xv6 convergence) with
-# REAL tick-based delays, counts them in, and leaves them PARKED (see ap_entry — the
-# single-core invariant is untouched; no AP ever runs the scheduler).
+# REAL tick-based delays and counts them in. APs originally PARKED here; since the 1.46.x
+# sub-bite-7 flip (smp_sched_aps=1) a woken AP runs the scheduler and pulls real procs
+# (STEP-2, iron-validated) — see ap_entry.
 # The three historical gate hazards are now addressed:
 #   1. CR3 0x1000: the call site moved to AFTER pt_init + "Interrupts enabled" (main.cyr)
 #      — 0x1000 is the kernel PML4, identity 0-4 GB incl. the 0xFEE00000 APIC.
