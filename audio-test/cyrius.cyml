@@ -1,0 +1,16 @@
+[package]
+name = "tonegen"
+version = "0.1.0"
+description = "agnos audio-path test — clean generated waveforms (sine/square/saw/triangle/sweep) streamed through the snd_* band with BLOCKING writes."
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.4.2"
+
+[build]
+src = "tonegen.cyr"
+output = "build/tonegen"
+
+# syscalls -> sys_snd_* + SYS_EXIT ; alloc -> the chunk buffer ; sakshi -> console
+# progress lines (visible on the iron FB as each tone plays) ; string -> sakshi dep.
+[deps]
+stdlib = ["string", "alloc", "syscalls", "sakshi"]

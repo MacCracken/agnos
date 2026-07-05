@@ -177,6 +177,7 @@ else
         [ -n "$PIPE_RC_SELFTEST" ]   && echo '#define PIPE_RC_SELFTEST'
         [ -n "$DOOM_SELFTEST" ]      && echo '#define DOOM_SELFTEST'
         [ -n "$DOOM_AUDIO_SELFTEST" ] && echo '#define DOOM_AUDIO_SELFTEST'
+        [ -n "$TONEGEN_SELFTEST" ]   && echo '#define TONEGEN_SELFTEST'
         [ -n "$NET_SELFTEST" ]       && echo '#define NET_SELFTEST'
         [ -n "$LOOPBACK_SELFTEST" ]  && echo '#define LOOPBACK_SELFTEST'
         [ -n "$PMM_FULLRAM_SELFTEST" ] && echo '#define PMM_FULLRAM_SELFTEST'

@@ -2229,15 +2229,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return sw_written;
     }
     if (num == 67) {
-        # snd_close(slot=a1) -> 0 / -1. Free the slot; if it owned the stream, drop
-        # snd_active_slot (ISR stops tracking; the ring loops its last content — a
-        # continuous producer leaves silence — until the next snd_open zero-fills it).
+        # snd_close(slot=a1) -> 0 / -1. Free the slot; if it owned the stream, ZERO
+        # the ring so the free-running DMA loops SILENCE, then drop snd_active_slot.
+        # (Previously it left the last-written content in the ring, so the DMA looped
+        # the final tone/sound FOREVER after the producer exited — audible bug.)
         if (arg1 < 0 || arg1 >= 4) { stack_canary_check(canary); return 0 - 1; }
         if (load64(&snd_slot_used + arg1 * 8) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (load64(&snd_slot_pid + arg1 * 8) != proc_current_get()) { stack_canary_check(canary); return 0 - 1; }
         store64(&snd_slot_used + arg1 * 8, 0);
         store64(&snd_slot_pid + arg1 * 8, 0);
-        if (arg1 == snd_active_slot) { snd_active_slot = 0 - 1; }
+        if (arg1 == snd_active_slot) {
+            var sc_zi = 0;
+            while (sc_zi < 8192) { store64(hda_pcm_va + sc_zi * 8, 0); sc_zi = sc_zi + 1; }   # 64 KB ring -> silence
+            snd_active_slot = 0 - 1;
+        }
         stack_canary_check(canary);
         return 0;
     }

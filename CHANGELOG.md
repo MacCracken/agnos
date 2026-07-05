@@ -5,6 +5,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.52.8] — 2026-07-04
+
+### Fixed — the LAPIC timebase was UNCALIBRATED (~12× slow on real Zen) — the true root of the audio glitches
+- **Boot-time LAPIC-timer calibration against the PIT** (`kernel/arch/x86_64/apic.cyr`,
+  `kernel/core/main.cyr`). The kernel's system timebase is the LAPIC timer, armed with a
+  **hardcoded reload count `10000000`** — a magic number tuned to QEMU's ~1 GHz emulated LAPIC.
+  On real Zen (Beelink SER5, Ryzen 7 5800H) the LAPIC input is ~12× lower, so 10M yielded
+  **~8.3 Hz, not 100 Hz** — the whole system clock ran ~12× slow (a 6-hour soak showed ~30 min
+  uptime). That starved the 100 Hz HDA audio servicer (`hda_stream_service`) against the
+  free-running 48 kHz DAC (the real cause of the cyrius-doom echo/dropouts chased for many
+  iterations) and made `sleep_ms` ~12× too long. **QEMU never showed it** — its LAPIC rate makes
+  10M ≈ 100 Hz — and no prior burn was timing-sensitive enough to catch it; the audio arc + a
+  standalone tone test (`tonegen`) exposed it. Fix: `lapic_calibrate()` measures the ÷1 LAPIC
+  input against the still-running **PIT channel-0** counter (a non-destructive latch-read —
+  touches neither port 0x61 nor ch2, so it avoids the q35 ch2-OUT-bit hang the old code warned
+  of) over 8 ch0 periods; since one ch0 period == 10 ms == one 100 Hz tick, LAPIC ticks per
+  period **is** the reload — no scaling multiply, no overflow. `lapic_reload_100hz()` (called
+  inline from the boot sequence so it runs in PARSE_PROG order, not a gvar-init var) falls back
+  to the 10M literal on an implausible measure, so a bad calibration can never brick boot. A
+  new **`LAPIC: reload=`** boot line self-documents the result (QEMU ~10,000,000; real Zen
+  ~830,000). Multi-agent-designed + adversarially verified (deadlock / q35-hang / overflow /
+  SMP / boot-order all cleared); QEMU measured `reload=9999814` (0.002% off the old literal → no
+  regression); AP inherits the calibrated `lapic_timer_count` unchanged. **On iron this makes
+  cyrius-doom audio clean ("all doom sounds perfect") + uptime real-time.** check.sh + arc sweep
+  8/8, tonegen-smoke green.
+- **`snd_close#67` now silences the ring on close** (`kernel/core/syscall.cyr`). It previously
+  left the last-written PCM in the ring, so the free-running DMA **looped the final sound forever**
+  after the producer exited. Now it zeros the 64 KB ring on close of the active slot → the DMA
+  loops silence.
+
+### Added
+- **`tonegen`** (`audio-test/tonegen.cyr` → `/bin/tonegen`) — a standalone ring-3 audio-PATH test.
+  BLOCKING-streams clean generated waveforms (sine/square/saw/triangle + a sweep, integer/Bhaskara
+  since agnos ring-3 has no FP-state save) through the `snd_*` band. Blocking writes are
+  kernel-paced, so it isolates the ring/DAC path from a producer's timing — the missing rung
+  between the kernel `HDA_TONE` (no ring 3) and cyrius-doom (non-blocking, mixer, WAD, game loop).
+  It is what pinned the glitch to the timebase, not doom. `scripts/tonegen-smoke.sh` (+ a
+  `TONEGEN_SELFTEST` kernel gate) builds + boots + captures the HDA output and checks the tones
+  are clean; `install-media.sh` stages `/bin/tonegen` alongside `/bin/doom`.
+
 ## [1.52.7] — 2026-07-04
 
 ### Added — 1.52.x audio arc (Gate 2)

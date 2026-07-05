@@ -865,6 +865,10 @@ fn hda_refill_half(h) {
 # atomic 64-bit) → lock-free, discharging the B5 review's lock finding.
 fn hda_stream_service() {
     # Gate-2 consumer-head tracking (ISR = sole writer of snd_hw_frames/wrap state).
+    # snd_hw_frames = frames the DAC has played, read from SD_LPIB's ABSOLUTE value
+    # (robust to servicer-cadence jitter — it reads the current position, not a per-call
+    # delta). A timer-rate delta approach (SND_HW_PER_TICK) was tried + REGRESSED on iron
+    # (over-counted -> more replay), so LPIB-absolute stands.
     if (snd_active_slot != (0 - 1)) {
         var raw = hda_read32(hda_sd_base + SD_LPIB) & 0xFFFF;   # LPIB byte offset 0..CBL-1
         if (raw < snd_last_raw) { snd_wrap_epochs = snd_wrap_epochs + 1; }

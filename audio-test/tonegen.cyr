@@ -1,0 +1,144 @@
+# tonegen — agnos audio-PATH test (internal diagnostic).
+#
+# Streams clean, generated waveforms — sine, square, saw, triangle, and a sine
+# sweep — through the ring-3 snd_* band (#64-69) using BLOCKING sys_snd_write.
+#
+# WHY THIS EXISTS (the missing middle rung): the kernel HDA_TONE is a never-ending
+# hardware-generated tone with NO ring-3 involvement; cyrius-doom is the opposite
+# extreme — non-blocking streaming, a full software mixer, and compressed WAD SFX,
+# all paced by a 35 Hz game loop. This tool sits between them: a controlled signal
+# through the real ring-3 band, kernel-paced by BLOCKING writes.
+#
+# WHY BLOCKING WRITES: sys_snd_write BLOCKS until the ring accepts the frames, so
+# the producer is paced by the DAC — it cannot under- or over-produce. That isolates
+# the ring/DAC PATH from a producer's timing: if a sustained tone here glitches, the
+# agnos audio path itself is broken; if it is clean, the path is solid and any doom
+# glitch is doom's non-blocking-under-a-game-loop problem, not agnos.
+#
+# WHY TONES not a sample: a pure sine/square/saw/triangle makes ANY glitch — a click,
+# a gap, a wobble — instantly audible. A sample can't distinguish a real dropout from
+# a genuinely-quiet passage. All integer/fixed-point (agnos ring-3 has no FP state
+# save, so f64 libs like naad can't run here — same constraint as doom's mixer).
+
+enum Tg {
+    RATE   = 48000,   # the agnos HDA stream's hard-armed rate (48k/16/2)
+    AMP    = 8000,    # S16 amplitude — comfortable, well under the 32767 clip point
+    CHUNK  = 2048,    # frames per blocking write (~43 ms); ring holds ~8 of these
+    W_SINE = 0,
+    W_SQR  = 1,
+    W_SAW  = 2,
+    W_TRI  = 3,
+    W_SIL  = 4,       # silence (all-zero) — pre-roll + inter-tone gaps
+}
+
+# 256-entry sine table (module-global var[N] = N*8 bytes = 2048 B), built at startup.
+var sine_tab[256];
+
+# Fill sine_tab via Bhaskara I's approximation (no FP): for a half-cycle d in [0,180],
+# sin(d) ~= 4p/(40500-p) where p = d*(180-d); scaled by AMP (4*AMP = 32000), negated
+# on the second half. Peak error < 0.2% — inaudible for a test tone.
+fn tg_build_sine(): i64 {
+    var i = 0;
+    while (i < 256) {
+        var deg = i * 360 / 256;
+        var half = deg;
+        var neg = 0;
+        if (deg > 180) { half = deg - 180; neg = 1; }
+        var p = half * (180 - half);          # 0..8100
+        var v = 32000 * p / (40500 - p);      # 0..AMP
+        if (neg == 1) { v = 0 - v; }
+        store64(&sine_tab + i * 8, v);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Generate `frames` of waveform `wf` at `freq` Hz into `buf` (S16 stereo, both
+# channels equal). 16.16-ish phase accumulator: one cycle per 65536 phase units.
+# Returns the advanced phase so a sustained tone is phase-continuous across chunks.
+fn tg_gen(buf, frames, wf, freq, phase): i64 {
+    var inc = freq * 65536 / RATE;   # phase step per frame
+    var oi = 0;
+    var f = 0;
+    while (f < frames) {
+        var ph = phase & 0xFFFF;      # 0..65535 within one cycle
+        var s = 0;
+        if (wf == W_SINE) {
+            s = load64(&sine_tab + ((ph >> 8) & 0xFF) * 8);
+        }
+        elif (wf == W_SQR) {
+            if (ph < 32768) { s = AMP; } else { s = 0 - AMP; }
+        }
+        elif (wf == W_SAW) {
+            s = ph * (2 * AMP) / 65536 - AMP;             # ramp -AMP..+AMP
+        }
+        elif (wf == W_TRI) {
+            if (ph < 32768) { s = ph * (2 * AMP) / 32768 - AMP; }
+            else { s = AMP - (ph - 32768) * (2 * AMP) / 32768; }
+        }
+        # else W_SIL: s stays 0 (silence)
+        var s16 = s & 0xFFFF;
+        store16(buf + oi, s16);        # left
+        store16(buf + oi + 2, s16);    # right
+        oi = oi + 4;
+        phase = phase + inc;
+        f = f + 1;
+    }
+    return phase;
+}
+
+# Play `wf` at `freq` for ~`ms` ms via BLOCKING writes (kernel-paced to the DAC).
+fn tg_play(slot, buf, wf, freq, ms): i64 {
+    var total = RATE * ms / 1000;     # total frames
+    var phase = 0;
+    var done = 0;
+    while (done < total) {
+        var n = CHUNK;
+        if (done + n > total) { n = total - done; }
+        phase = tg_gen(buf, n, wf, freq, phase);
+        # Loop on the return: sys_snd_write BLOCKS but can short-write on its
+        # bounded deadline; write the remainder so the tone is never truncated.
+        var w = 0;
+        while (w < n) {
+            var got = sys_snd_write(slot, buf + w * 4, n - w);
+            if (got <= 0) { break; }
+            w = w + got;
+        }
+        done = done + n;
+    }
+    return 0;
+}
+
+fn tonegen_main(): i64 {
+    sakshi_info("tonegen: audio-path test", 24);
+    tg_build_sine();
+
+    var slot = sys_snd_open();
+    if (slot < 0) { sakshi_error("tonegen: snd_open failed (no HDA?)", 34); return 1; }
+    sys_snd_config(slot, RATE, 0x1002);   # 48000 Hz, 16-bit, 2ch
+    var buf = alloc(CHUNK * 4);           # S16 stereo chunk (8 KB)
+
+    # Pre-roll: 300 ms of silence so the ring + servicer settle at stream start
+    # before the first tone (else the first tones can mis-pace on real hardware).
+    tg_play(slot, buf, W_SIL, 0, 300);
+
+    # Sustained pure tones at 440 Hz, each FOLLOWED by a 250 ms silence gap so they
+    # are cleanly separated (no run-together). Any glitch is instantly audible.
+    sakshi_info("tonegen: SINE 440 (2s)", 22);      tg_play(slot, buf, W_SINE, 440, 2000);  tg_play(slot, buf, W_SIL, 0, 250);
+    sakshi_info("tonegen: SQUARE 440 (2s)", 24);    tg_play(slot, buf, W_SQR, 440, 2000);   tg_play(slot, buf, W_SIL, 0, 250);
+    sakshi_info("tonegen: SAW 440 (2s)", 21);       tg_play(slot, buf, W_SAW, 440, 2000);   tg_play(slot, buf, W_SIL, 0, 250);
+    sakshi_info("tonegen: TRIANGLE 440 (2s)", 26);  tg_play(slot, buf, W_TRI, 440, 2000);   tg_play(slot, buf, W_SIL, 0, 250);
+
+    # Sine sweep 220 -> 990 Hz — continuous (no gaps between steps).
+    sakshi_info("tonegen: SINE sweep 220-990", 27);
+    var swf = 220;
+    while (swf <= 990) { tg_play(slot, buf, W_SINE, swf, 100); swf = swf + 10; }
+
+    sys_snd_drain(slot);
+    sys_snd_close(slot);
+    sakshi_info("tonegen: done", 13);
+    return 0;
+}
+
+tonegen_main();
+syscall(SYS_EXIT, 0);

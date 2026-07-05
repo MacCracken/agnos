@@ -106,9 +106,13 @@ kprintln("Timer ISR installed", 19);
 
 # Initialize Local APIC (keeps PIC for keyboard IRQ1)
 apic_init();
-# Start APIC timer on vector 32 (same as PIT), ~100Hz
-# QEMU bus freq varies; 10000000 gives roughly 100Hz
-apic_timer_init(32, 10000000);
+# Start APIC timer on vector 32 (same as PIT). CALIBRATE the div1 LAPIC input
+# against PIT ch0 (still free-running here, pre-pic_mask_pit) for a TRUE 100Hz.
+# On real Zen the LAPIC input is ~12x below QEMU's ~1GHz, so the old hardcoded 10M
+# gave ~8.3Hz -> 12x-slow uptime + a starved 100Hz audio servicer (found via a
+# 6h soak + tonegen). Called INLINE (boot-sequence order, not a gvar-init var);
+# lapic_reload_100hz falls back to 10M on an implausible measure.
+apic_timer_init(32, lapic_reload_100hz());
 # The LAPIC timer now owns vector 32 — mask the legacy PIT (IRQ0) so its
 # free-running ticks can't wedge the 8259's in-service register and block the
 # keyboard's IRQ1 (the iron keystroke path). See pic_mask_pit(). IF is still 0
@@ -117,6 +121,11 @@ pic_mask_pit();
 kprint("APIC: id=", 9);
 kprint_num(cpu_id);
 kprintln(" timer active", 13);
+# Self-documenting: the calibrated LAPIC reload (lapic_timer_count set by
+# apic_timer_init). QEMU ~10000000; real Zen ~830000 (the 12x-slow-clock fix).
+kprint("LAPIC: reload=", 14);
+kprint_num(lapic_timer_count);
+kprintln("", 0);
 
 # === CMOS kernel checkpoint 7 (APIC + timer live) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x07; 0xE6; 0x71; }
@@ -2211,6 +2220,18 @@ kprintln("exec: doom returned", 19);
 kprintln("exec: running /bin/doom --audio-test", 36);
 sh_exec("run /bin/doom /DOOM1.WAD --audio-test", 38);
 kprintln("exec: doom audio-test returned", 30);
+#endif
+
+#ifdef TONEGEN_SELFTEST
+# audio-path isolation test — runs /bin/tonegen (agnos/audio-test) from disk. It
+# BLOCKING-streams clean generated waveforms (sine/square/saw/triangle + a sweep)
+# through the snd_* band. Blocking writes are kernel-paced, so this tests the ring/
+# DAC PATH itself, decoupled from any producer's timing (unlike doom's non-blocking
+# game-loop path). scripts/tonegen-smoke.sh captures the HDA output + checks the
+# waveforms are clean. tonegen exits when the tones finish, so the boot doesn't park.
+kprintln("exec: running /bin/tonegen", 26);
+sh_exec("run /bin/tonegen", 16);
+kprintln("exec: tonegen returned", 22);
 #endif
 
 # 1.41.3 — FS-syscall self-test (compile-gated, FS_SYSCALL_SELFTEST=1). Drives

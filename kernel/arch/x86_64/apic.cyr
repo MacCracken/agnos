@@ -58,6 +58,87 @@ fn apic_timer_init(vector, count) {
     return 0;
 }
 
+# Non-destructive latch-read of the running PIT channel-0 16-bit down-counter.
+# ch0 is the legacy IRQ0 mode-2 rate generator pic_init() left free-running
+# (divisor 11932, ~100Hz). Latch cmd 0x00 = channel 0 (bits7-6=00) + latch-count
+# (bits5-4=00); read data port 0x40 lo then hi. Latch snapshots a stable 16-bit
+# value into an internal register that survives both reads (no lo/hi tearing) and
+# does NOT reload or perturb the counter — IRQ0 cadence is untouched. Driven by
+# QEMU q35 (it drives ch0 to deliver IRQ0) and by real hardware alike. Touches
+# NEITHER port 0x61 NOR ch2, so it avoids the q35 ch2-OUT-bit hang (apic.cyr note).
+fn pit_ch0_read() {
+    outb(0x43, 0x00);
+    var lo = inb(0x40) & 0xFF;
+    var hi = inb(0x40) & 0xFF;
+    return (hi << 8) | lo;
+}
+
+# Calibrate the LAPIC timer's divide-by-1 input frequency at boot against PIT
+# channel 0, returning the periodic reload count for a TRUE 100 Hz. Runs ONCE,
+# AFTER apic_init() (LAPIC mapped) and BEFORE apic_timer_init()+pic_mask_pit()
+# (ch0 must still be free-running; IF=0 so no ISR races the reads). Arms the LAPIC
+# timer MASKED (no IRQ) one-shot from 0xFFFFFFFF at div1 and reads its current-count
+# delta over an integer number of ch0 periods. One ch0 period (11932/1193182 s) ==
+# 10 ms == one 100Hz tick, so LAPIC ticks per period IS the 100Hz reload — no scaling
+# multiply (no i64-overflow path). apic_read(0x390) zero-extends the 32-bit count so
+# the down-count delta is always a clean positive i64. Returns 0 on an implausible
+# measure; the caller falls back to the QEMU-proven 10000000 literal so a bad calib
+# never bricks boot. QEMU div1 ~1GHz -> reload ~10,000,000 (no-op-equivalent); real
+# Zen div1 ~83MHz -> reload ~830,000 (fixes the ~8.3Hz / 12x-slow clock).
+fn lapic_calibrate() {
+    apic_write(0x3E0, 0x0B);           # divide config = divide-by-1 (same domain apic_timer_init uses)
+    apic_write(0x320, 0x10000);        # LVT timer: bit16 mask=1, bit17 periodic=0 (one-shot) — no IRQ
+    apic_write(0x380, 0xFFFFFFFF);     # initial count -> starts the one-shot down-counter
+
+    # Sync to a ch0 period boundary (a reload shows as cur > prev — the count jumped up).
+    var prev = pit_ch0_read();
+    var synced = 0;
+    var guard = 0;
+    while (synced == 0) {
+        var c0 = pit_ch0_read();
+        if (c0 > prev) { synced = 1; }
+        prev = c0;
+        guard = guard + 1;
+        if (guard >= 20000000) { return 0; }   # PIT frozen/absent -> bail to fallback
+    }
+
+    var start_lapic = apic_read(0x390);          # LAPIC current-count at the aligned start
+
+    # Count 8 full ch0 periods (~80 ms), each a cur > prev wrap.
+    var periods = 0;
+    guard = 0;
+    while (periods < 8) {
+        var c1 = pit_ch0_read();
+        if (c1 > prev) { periods = periods + 1; }
+        prev = c1;
+        guard = guard + 1;
+        if (guard >= 200000000) { return 0; }   # window never completes -> bail to fallback
+    }
+
+    var end_lapic = apic_read(0x390);
+    var delta = start_lapic - end_lapic;         # LAPIC counted DOWN; div1 => 1 tick per input clock
+    if (delta <= 0) { return 0; }
+    var reload = delta / 8;                      # ticks per ch0 period == ticks per 10ms == the 100Hz reload
+
+    # Sanity band: reject garbage. Floor 100000 admits down to a ~10MHz-class LAPIC
+    # (real Zen div1 ~83MHz -> ~830000; QEMU ~1GHz -> ~10000000). Ceil rejects runaway.
+    if (reload < 100000) { return 0; }
+    elif (reload > 200000000) { return 0; }
+    return reload;
+}
+
+# Calibrated 100Hz reload with a safe fallback. Called INLINE from main.cyr's boot
+# sequence — apic_timer_init(32, lapic_reload_100hz()) — so it runs in PARSE_PROG
+# order (after apic_init, PIT still live), NOT as a module-scope `var x = call()`
+# (that would run during gvar-init, before apic_init — the doom-argv gvar-init trap).
+# `r` is function-local, so no gvar-init concern. On a bad/absent measure calibrate
+# returns 0 -> fall back to the QEMU-proven 10000000 literal (never bricks boot).
+fn lapic_reload_100hz() {
+    var r = lapic_calibrate();
+    if (r == 0) { return 10000000; }
+    return r;
+}
+
 # 1.46.x SMP sub-bite 7 (#1): the LAPIC timer reload count the BSP configured (captured in
 # apic_timer_init). An AP inherits THIS in ap_entry (smp.cyr) so every CPU's scheduler tick
 # runs at the BSP's exact, iron-proven rate — no independently-hardcoded AP literal that could
