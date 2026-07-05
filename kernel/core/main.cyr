@@ -177,6 +177,14 @@ fpu_area_init();
 #ifdef FP_AREA_SELFTEST
 fpu_area_selftest();
 #endif
+# 1.53.x B3: install the #NM (vector 7) handler for lazy per-proc FP save/restore.
+# INERT until B3b sets CR0.TS on the switch paths — production never #NMs today (TS
+# is only ever set by the FP_NM_SELFTEST probe below). Areas are already seeded above.
+nm_isr_build();
+idt_set_gate(&idt + 7 * 16, &nm_isr, 0x08, 0x8E);
+#ifdef FP_NM_SELFTEST
+fpu_nm_selftest();
+#endif
 
 
 # === CMOS kernel checkpoint 8 (page tables built — historical stall point) ===

@@ -64,3 +64,147 @@ fn fpu_selftest(): i64 {
     return 0;
 }
 #endif
+
+# === 1.53.x FP/SIMD arc (B3) — lazy #NM per-proc FP context switch ===
+# B1 enabled SSE; B2 gave each proc a 512-byte FXSAVE area. B3 makes the XMM state
+# PER-PROC via lazy save/restore: a context switch sets CR0.TS so the NEXT proc's
+# first SSE op faults #NM (vector 7); nm_handler FXSAVEs the departing FP owner and
+# FXRSTORs the incoming proc. A proc that never touches FP never pays a save/restore.
+#
+# REGALLOC SAFETY (load-bearing): the FXSAVE/FXRSTOR address goes through a
+# single-param leaf fn whose asm reads ONLY [rbp-8] (the proven cr3_load prologue
+# `48 8B 45 F8`). NEVER add a 2nd local/param to fpu_do_fxsave/fpu_do_fxrstor — a
+# spill would shift the ABI slot off [rbp-8] and revive the v1.28.3 / parameterized-
+# spin_lock bug class (smp.cyr:38-46). These two fns are the ONLY fxsave/fxrstor in
+# the production kernel — the FP-free audit becomes "exactly 2 sanctioned, 0 stray xmm".
+
+fn fpu_do_fxsave(addr): i64 {
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;   # mov rax, [rbp-8]  (addr = 16-aligned fpu_area)
+        0x0F; 0xAE; 0x00;         # fxsave  [rax]      (0F AE /0)
+    }
+    return 0;
+}
+fn fpu_do_fxrstor(addr): i64 {
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;   # mov rax, [rbp-8]  (addr)
+        0x0F; 0xAE; 0x08;         # fxrstor [rax]      (0F AE /1)
+    }
+    return 0;
+}
+# CR0.TS (bit 3) set/clear — raw RMW, fpu_enable's style (high-half zero is a no-op).
+fn fpu_set_ts(): i64 {
+    asm {
+        0x0F; 0x20; 0xC0;               # mov rax, cr0
+        0x0D; 0x08; 0x00; 0x00; 0x00;   # or  eax, 0x8    (set CR0.TS)
+        0x0F; 0x22; 0xC0;               # mov cr0, rax
+    }
+    return 0;
+}
+fn fpu_clear_ts(): i64 {
+    asm {
+        0x0F; 0x20; 0xC0;               # mov rax, cr0
+        0x25; 0xF7; 0xFF; 0xFF; 0xFF;   # and eax, 0xFFFFFFF7  (clear CR0.TS)
+        0x0F; 0x22; 0xC0;               # mov cr0, rax
+    }
+    return 0;
+}
+
+# One-shot #NM-serviced latch (the r8169 RX-MSI-LIVE flag-in-handler technique):
+# set by nm_handler, read by FP_NM_SELFTEST — proves the #NM path actually ran.
+var nm_serviced = 0;
+
+# #NM (device-not-available, vector 7) handler. Fires on the first SSE op after a
+# switch set CR0.TS. Clears TS, then if the incoming proc differs from this CPU's FP
+# owner, FXSAVEs the owner + FXRSTORs the incoming proc + records the new owner. Runs
+# IF=0 (the 0x8E gate clears IF), so no timer/switch can land mid-save. `rsp` (the ISR
+# frame) is unused — kept only to mirror timer_handler's signature exactly.
+fn nm_handler(rsp) {
+    fpu_clear_ts();
+    var cpu = pcpu_cpu();
+    var prev = load64(&fpu_owner + cpu * 8);
+    var cur = proc_current_get();
+    if (prev != cur) {
+        if (prev != (0 - 1)) { fpu_do_fxsave(fpu_area(prev)); }
+        fpu_do_fxrstor(fpu_area(cur));
+        store64(&fpu_owner + cpu * 8, cur);
+    }
+    nm_serviced = 1;
+    return 0;
+}
+
+# Build the vector-7 ISR stub into nm_isr[64] — byte-for-byte timer_isr_build
+# (pic.cyr:88): push 15 GPRs, mov rdi,rsp, call nm_handler, pop 15, iretq. #NM pushes
+# NO error code and the return-frame RIP already points at the faulting SSE op, so the
+# plain iretq RETRIES it (now succeeds — TS cleared, XMM restored).
+fn nm_isr_build() {
+    var p = &nm_isr;
+    var handler_addr = &nm_handler;
+    var off = 0;
+    store8(p + off, 0x50); off = off + 1;  # push rax
+    store8(p + off, 0x51); off = off + 1;  # push rcx
+    store8(p + off, 0x52); off = off + 1;  # push rdx
+    store8(p + off, 0x56); off = off + 1;  # push rsi
+    store8(p + off, 0x57); off = off + 1;  # push rdi
+    store8(p + off, 0x41); store8(p + off + 1, 0x50); off = off + 2;  # push r8
+    store8(p + off, 0x41); store8(p + off + 1, 0x51); off = off + 2;  # push r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x52); off = off + 2;  # push r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x53); off = off + 2;  # push r11
+    store8(p + off, 0x53); off = off + 1;  # push rbx
+    store8(p + off, 0x55); off = off + 1;  # push rbp
+    store8(p + off, 0x41); store8(p + off + 1, 0x54); off = off + 2;  # push r12
+    store8(p + off, 0x41); store8(p + off + 1, 0x55); off = off + 2;  # push r13
+    store8(p + off, 0x41); store8(p + off + 1, 0x56); off = off + 2;  # push r14
+    store8(p + off, 0x41); store8(p + off + 1, 0x57); off = off + 2;  # push r15
+    store8(p + off, 0x48); store8(p + off + 1, 0x89); store8(p + off + 2, 0xE7); off = off + 3;  # mov rdi, rsp
+    store8(p + off, 0x48); store8(p + off + 1, 0xB8); off = off + 2;  # mov rax, imm64
+    store64(p + off, handler_addr); off = off + 8;
+    store8(p + off, 0xFF); store8(p + off + 1, 0xD0); off = off + 2;  # call rax
+    store8(p + off, 0x41); store8(p + off + 1, 0x5F); off = off + 2;  # pop r15
+    store8(p + off, 0x41); store8(p + off + 1, 0x5E); off = off + 2;  # pop r14
+    store8(p + off, 0x41); store8(p + off + 1, 0x5D); off = off + 2;  # pop r13
+    store8(p + off, 0x41); store8(p + off + 1, 0x5C); off = off + 2;  # pop r12
+    store8(p + off, 0x5D); off = off + 1;  # pop rbp
+    store8(p + off, 0x5B); off = off + 1;  # pop rbx
+    store8(p + off, 0x41); store8(p + off + 1, 0x5B); off = off + 2;  # pop r11
+    store8(p + off, 0x41); store8(p + off + 1, 0x5A); off = off + 2;  # pop r10
+    store8(p + off, 0x41); store8(p + off + 1, 0x59); off = off + 2;  # pop r9
+    store8(p + off, 0x41); store8(p + off + 1, 0x58); off = off + 2;  # pop r8
+    store8(p + off, 0x5F); off = off + 1;  # pop rdi
+    store8(p + off, 0x5E); off = off + 1;  # pop rsi
+    store8(p + off, 0x5A); off = off + 1;  # pop rdx
+    store8(p + off, 0x59); off = off + 1;  # pop rcx
+    store8(p + off, 0x58); off = off + 1;  # pop rax
+    store8(p + off, 0x48); store8(p + off + 1, 0xCF);  # iretq (no errcode on #NM)
+    return 0;
+}
+
+# fpu_deschedule_save(old): eager-FXSAVE the descheduling proc IF this CPU holds its
+# live XMM, then clear the owner so a migration to another core restores a FRESH area
+# (not a stale one this core never saved). `clts` first so the save never depends on
+# ambient TS. B3b wires this UNDER sched_lock, BEFORE on_cpu_set(old,-1), on BOTH
+# switch paths. (Unreachable until B3b — the leaf fxsave it calls is already present
+# via nm_handler, so this does not add a 3rd sanctioned site.)
+fn fpu_deschedule_save(old): i64 {
+    var cpu = pcpu_cpu();
+    if (load64(&fpu_owner + cpu * 8) == old) {
+        asm { 0x0F; 0x06; }   # clts — clear CR0.TS so the eager fxsave is never TS-gated
+        fpu_do_fxsave(fpu_area(old));
+        store64(&fpu_owner + cpu * 8, 0 - 1);
+    }
+    return 0;
+}
+
+#ifdef FP_NM_SELFTEST
+# B3a proof: force CR0.TS, execute an SSE op → it must #NM; nm_handler services it
+# (clears TS, FXRSTORs), the op retries + completes, and we reach here with the latch
+# set and NO infinite #NM loop / #DF. Requires the vector-7 gate installed first.
+fn fpu_nm_selftest(): i64 {
+    nm_serviced = 0;
+    fpu_set_ts();
+    asm { 0xF2; 0x0F; 0x10; 0xC0; }   # movsd xmm0, xmm0 — #NMs under TS=1, retries after service
+    if (nm_serviced == 1) { kprintln("fp: #NM serviced", 16); }
+    else { kprintln("fp: #NM MISSED", 14); }
+    return 0;
+}
+#endif

@@ -232,6 +232,83 @@ kept as the record:*
   BSP-installed vector-7 gate is live on APs automatically.
 - **Repo:** agnos kernel.
 
+#### B3 — VERIFIED DESIGN (adversarial workflow, 2026-07-05) — the implementation blueprint
+
+> **B3a SHIPPED + QEMU 3/3 (2026-07-05, uncut — toward 1.53.2):** the additive `#NM`
+> machinery — `fpu_do_fxsave`/`fpu_do_fxrstor` (leaf `[rbp-8]` helpers), `fpu_set_ts`/
+> `fpu_clear_ts`, `nm_handler`, `nm_isr_build` (→ `nm_isr[64]`), `fpu_deschedule_save`
+> (defined, unwired), and the vector-7 IDT gate (main.cyr, after `fpu_area_init`).
+> `FP_NM_SELFTEST` forces `CR0.TS` → `movsd` `#NM`s → serviced → retries → `fp: #NM
+> serviced` + boot-to-shell (`scripts/fp-nm-smoke.sh`, in `sweep.sh`/`build.sh`).
+> Production audit is now **exactly 2 sanctioned fxsave/fxrstor, 0 stray xmm**; the box
+> still boots normally because nothing sets `CR0.TS` yet (the machinery is INERT until
+> B3b wires the switch paths). **Remaining for B3:** `#XM` (vector 19) + **B3b** — wire
+> `fpu_deschedule_save`/`fpu_set_ts` into the two sched.cyr paths + the completeness
+> sites (`enter_ring3`, `kernel_resume`, death-paths, `proc_alloc_slot` sweep). B3b is
+> the context-switch-raw-zone edit (iron-only-regression class) + the scheduler-behavior
+> change, so it lands as its own careful pass with the full smoke battery + an iron burn.
+
+
+Core mechanism **CONFIRMED** (leaf-helper regalloc isolation; no-errcode `#NM` iretq
+retries the faulting op; nested-`#NM` impossible — the 0x8E gate clears IF so no
+timer lands mid-handler; production stays FP-free except the sanctioned sites; the
+`#XM`/AP-resume paths are correct). **3 HIGH fixes reshape the wiring — implement THIS,
+not the raw plan:**
+
+**Regalloc-safe leaf helpers** (`fpu.cyr`) — each a standalone single-param fn, byte-identical
+prologue to the proven `cr3_load` (`48 8B 45 F8` = `mov rax,[rbp-8]`). **MUST NOT gain a second
+local/param** (shifts the ABI slot off `[rbp-8]` → revives the v1.28.3/spill class):
+- `fpu_do_fxsave(addr)`: `mov rax,[rbp-8]` + `0F AE 00` (`fxsave [rax]`).
+- `fpu_do_fxrstor(addr)`: `mov rax,[rbp-8]` + `0F AE 08` (`fxrstor [rax]`). *(These are the FIRST
+  `fxsave`/`fxrstor` in production — B3 flips the audit from 0 to exactly 2 sanctioned sites.)*
+- `fpu_set_ts()` / `fpu_clear_ts()`: CR0 raw RMW (`0F 20 C0` / `or eax,8` \| `and eax,~8` / `0F 22 C0`).
+- `clts` (`0F 06`) immediately before every eager `fxsave` — so the save never depends on ambient
+  `TS` (drops the unproven "fxsave isn't TS-gated" assumption).
+
+**`nm_handler(rsp)`** — `fpu_clear_ts(); cpu=pcpu_cpu(); prev=fpu_owner[cpu]; cur=proc_current_get();
+if prev!=cur { if prev!=-1: fpu_do_fxsave(fpu_area(prev)); fpu_do_fxrstor(fpu_area(cur));
+fpu_owner[cpu]=cur }`. `fpu_area(...)` is the pure-arithmetic B2 fn, passed BY VALUE into the
+`[rbp-8]` helper. **`nm_isr_build()`** mirrors `timer_isr_build` (pic.cyr:88) byte-for-byte into a
+new `nm_isr[64]` (boot_data.cyr), `handler=&nm_handler`, keep `mov rdi,rsp`, plain `iretq` (no
+errcode); wire `idt_set_gate(&idt + 7*16, &nm_isr, 0x08, 0x8E)` in main.cyr after `fpu_area_init()`.
+
+**`#XM` (vector 19)** — extend `exc_handlers_init` (idt.cyr) to `nvec=8` with `v=19`: it takes the
+plain CMOS-stamp + FB-canary + `cli;hlt` tail (not in the `{6,13,14}` ring3-kill set).
+
+**★ HIGH-1 — SPLIT the deschedule-save from the TS-set** (they go at DIFFERENT sites; combining them
+is the stale-area race):
+- `fpu_deschedule_save(old)`: `cpu=pcpu_cpu(); if fpu_owner[cpu]==old { clts; fpu_do_fxsave(fpu_area(old));
+  fpu_owner[cpu]=-1 }`. Placed **UNDER `sched_lock`, BEFORE the `on_cpu_set(...,-1)` unfence** — at
+  `sched.cyr:337` (do_context_switch, after `proc_save_context(old)`) AND `sched.cyr:548`
+  (sys_sched_yield, before `on_cpu_set(yp,-1)`). *(If placed after the unfence/unlock at :370, CPU1 can
+  pick `old` and FXRSTOR a stale area before CPU0 saves it — the migration race B3 exists to close.)*
+- `fpu_set_ts()`: post-restore, beside `tss_set_rsp0` at `sched.cyr:370` (do_context_switch) AND
+  `sched.cyr:560` (yield). Pure register RMW, no area — safe outside the raw zone.
+
+**★ HIGH-2 — TS-completeness: cover the out-of-band ring-3 entries + the exec-return.** `fpu_mark_switch`
+on the two scheduler paths is NOT enough — the running proc also changes via `proc_current_set(pid);
+exec_and_wait → enter_ring3 → iretq` at SIX sites (init/shell/syscall/main) that never set `CR0.TS`.
+Two sequential f64 procs (`run /bin/naad` then `/bin/nidhi`) would leak XMM. Fix at the **two
+chokepoints**, not the six call sites:
+- `fpu_set_ts()` in **`enter_ring3`** right before its final `iretq` (~ring3.cyr:201) — covers all six
+  exec/spawn entries.
+- `fpu_set_ts()` in **`kernel_resume`** after `proc_current_set(0)` (syscall.cyr:301) — the
+  foreground-exec-return to the parent shell.
+
+**★ HIGH-3 — clear `fpu_owner` on death** (else a recycled slot's same-pid `prev==cur` fast-path SKIPS
+the restore → silent XMM leak into a new proc). Mandatory, NO fxsave (dying XMM is garbage):
+- After `proc_set_state(pid,0)` in `fault_kill_current` (syscall.cyr:370) AND `exit#0` (syscall.cyr:661):
+  `var _c=pcpu_cpu(); if load64(&fpu_owner+_c*8)==pid { store64(&fpu_owner+_c*8,-1) }`.
+- Belt-and-suspenders: `proc_alloc_slot` sweeps `fpu_owner[0..3]`, clearing any `==idx`, right after
+  `fpu_area_reset(idx)`.
+
+**Gates:** `FP_NM_SELFTEST` (force TS, XMM op, assert one-shot `fp: #NM serviced` latch + no loop/`#DF`,
++ a nested-#NM stress) + a **disassembly gate** grepping the built helpers for the exact `48 8B 45 F8`
+prologue (catches a future cyrius regalloc move before iron) + the **FP-free audit hardened to "== exactly
+2 sanctioned `fxsave`/`fxrstor`, 0 stray xmm"** (a build assertion, not a comment). **DISPOSITIVE EXIT
+CRITERION: the migration-race fix is UNVALIDATABLE on single-core QEMU — B3 sign-off gates on an `-smp 4`
+iron migration soak (an FP proc observed moving CPU0→CPU1 preserving XMM), folded into B5.**
+
 ### B4 — Ring-3 `f64` selftest (first-touch restore, end to end)
 - A tiny ring-3 exerciser proc does an `f64` mul (via the `f64_*` helpers naad
   uses) and syscalls the result back; `FP_RING3_SELFTEST` + `fp-ring3-smoke.sh`
