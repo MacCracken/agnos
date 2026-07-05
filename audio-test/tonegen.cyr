@@ -17,8 +17,10 @@
 #
 # WHY TONES not a sample: a pure sine/square/saw/triangle makes ANY glitch — a click,
 # a gap, a wobble — instantly audible. A sample can't distinguish a real dropout from
-# a genuinely-quiet passage. All integer/fixed-point (agnos ring-3 has no FP state
-# save, so f64 libs like naad can't run here — same constraint as doom's mixer).
+# a genuinely-quiet passage. All integer/fixed-point — deliberately: a fixed waveform
+# keeps the audio-path probe independent of the FP stack (the 1.53.x arc DID add agnos
+# ring-3 f64, so "can't run f64 here" is no longer the reason — integer is just the
+# cleaner probe, same reasoning as doom's mixer).
 
 enum Tg {
     RATE   = 48000,   # the agnos HDA stream's hard-armed rate (48k/16/2)

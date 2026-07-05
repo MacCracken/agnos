@@ -1,0 +1,17 @@
+[package]
+name = "fpex"
+version = "0.1.0"
+description = "agnos ring-3 f64 first-touch exerciser (1.53.x FP/SIMD arc, bite B4) — real f64 arithmetic in ring 3; exits 84 iff correct, proving the B1→B3 FP stack end to end."
+license = "GPL-3.0-only"
+language = "cyrius"
+cyrius = "6.4.2"
+
+[build]
+src = "fpex.cyr"
+output = "build/fpex"
+
+# syscalls -> SYS_EXIT + the syscall() bindings. Nothing else: the result IS the exit
+# code, checked via the exec path's "run: exit N" (no console/alloc/f64-lib needed —
+# the f64 arithmetic is native cyrius codegen, the whole point of the test).
+[deps]
+stdlib = ["syscalls"]

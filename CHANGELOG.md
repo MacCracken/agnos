@@ -5,6 +5,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.3] — 2026-07-05 — FP/SIMD arc B4: real cyrius f64 runs in ring 3
+
+The end-to-end proof of the arc's foundation. A real cross-built cyrius f64 program now
+runs correctly in agnos ring 3 — the wall the whole arc set out to remove ("the first
+`movsd` in any ring-3 f64 program `#UD`s") is gone.
+
+### Added
+- **`fp-test/fpex.cyr`** — a ring-3 f64 first-touch exerciser (built `--agnos`, staged
+  `/bin/fpex`). It computes `7*3=21`, `+1=22`, `/2=11` with native cyrius f64 codegen
+  (mulsd/addsd/divsd/comisd) and exits 84 iff all three are correct. Being a compiled
+  cyrius program (not a hand-assembled ELF) it exercises the same f64 codegen naad uses
+  (the B6 end-proof).
+- **`FP_RING3_SELFTEST`** kernel block (`main.cyr`, env → `#define`, in `build.sh`) +
+  **`scripts/fp-ring3-smoke.sh`** — exec's `/bin/fpex` from disk (gnoboot+OVMF+NVMe) and
+  asserts `run: exit 84`. **PASS.** Registered in `sweep.sh`.
+
+### What it proves
+- The full B1→B3 stack works end to end: SSE enabled per core (B1) → this proc's
+  512-byte FXSAVE area (B2) → `enter_ring3` sets `CR0.TS` → the first f64 op faults
+  `#NM` → `nm_handler` FXRSTORs fpex's area (B3) → the f64 computes correctly in ring 3.
+- The B2 **hand-built default FXSAVE image is FXRSTOR-legal** — a `#GP` on the first
+  FXRSTOR of a never-run proc would have crashed fpex before `exit 84`; it didn't (this
+  was the plan's fallback trigger to switch to a boot-captured image — not needed).
+- Scope: a SINGLE f64 proc (first-touch FXRSTOR only). The FXSAVE-of-the-previous-owner
+  limb + the two-proc XMM-preservation proof (and the `-smp` iron migration soak that
+  clears B3's SMP gate) are **B5**.
+
+### Fixed
+- Stale comment in `audio-test/tonegen.cyr` ("agnos ring-3 has no FP state save, so f64
+  libs like naad can't run here") — the 1.53.x arc added ring-3 f64; tonegen stays
+  integer as a cleaner audio-path probe, not because f64 can't run. Part of the ongoing
+  stale-comment sweep.
+
+### Kernel unchanged
+- The kernel binary is untouched by B4 (fpex is userland) — production still has exactly
+  2 sanctioned `fxsave`/`fxrstor`, 0 stray xmm.
+
 ## [1.53.2] — 2026-07-05 — FP/SIMD arc B3: lazy #NM per-proc FP context switch
 
 The arc's core bite. Makes the XMM state per-proc via lazy save/restore keyed on

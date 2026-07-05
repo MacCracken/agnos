@@ -2259,6 +2259,17 @@ sh_exec("run /bin/tonegen", 16);
 kprintln("exec: tonegen returned", 22);
 #endif
 
+#ifdef FP_RING3_SELFTEST
+# 1.53.x B4: ring-3 f64 first-touch. Runs /bin/fpex (fp-test/, built --agnos) — a cyrius
+# f64 program that computes 7*3=21, +1=22, /2=11 in ring 3 and exits 84 iff all correct.
+# Proves the B1→B3 FP stack end to end: enter_ring3 sets CR0.TS → the first f64 op #NMs
+# → nm_handler FXRSTORs fpex's per-proc area → the f64 computes → "run: exit 84". A #GP on
+# the first FXRSTOR (an illegal B2 default image) would crash here instead of exit 84.
+kprintln("exec: running /bin/fpex", 23);
+sh_exec("run /bin/fpex", 13);
+kprintln("exec: fpex returned", 19);
+#endif
+
 #ifdef VANITONE_AUDIO_SELFTEST
 # vani-core backend proof (Gate 3/4 of the 1.52.x audio arc). Runs /bin/vanitone,
 # a doom-style consumer of vani's dist/vani-core.cyr — the FIRST audio through the

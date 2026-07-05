@@ -74,6 +74,9 @@ run_gate "1.53.x FP-area (per-proc FXSAVE state)" "FP_AREA_SELFTEST=1" "fp-area-
 # --- 1.53.x FP/SIMD B3: lazy #NM handler services a forced FP-trap (CR0.TS-on-switch live) ---
 run_gate "1.53.x FP-#NM (lazy save/restore serviced)" "FP_NM_SELFTEST=1" "fp-nm-smoke.sh"
 
+# --- 1.53.x FP/SIMD B4: real cyrius f64 runs in ring 3 (exec /bin/fpex from disk → run: exit 84) ---
+run_gate "1.53.x FP-ring3 (real f64 in ring 3)" "FP_RING3_SELFTEST=1" "fp-ring3-smoke.sh"
+
 # --- Restore the plain production build as the working artifact ---
 echo ""
 echo "Restoring plain production build..."

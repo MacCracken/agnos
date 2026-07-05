@@ -1,0 +1,33 @@
+# fpex — agnos ring-3 f64 first-touch exerciser (1.53.x FP/SIMD arc, bite B4).
+#
+# A ring-3 cyrius program that does real f64 arithmetic and exits with a distinctive
+# code IFF the results are correct. It proves the whole B1→B3 FP stack end to end:
+#   B1  SSE enabled per core (else the first movsd #UDs)
+#   B2  this proc has a 512-byte FXSAVE area seeded with the fninit-equiv default
+#   B3  enter_ring3 set CR0.TS → the first f64 op below #NMs → nm_handler FXRSTORs
+#       THIS proc's area → the op retries and computes correctly in ring 3
+# Because it's a CROSS-BUILT cyrius program (not a hand-assembled ELF) it exercises the
+# same mulsd/addsd/divsd/comisd codegen naad uses (the B6 end-proof), and its clean run
+# also proves the B2 hand-built default image is FXRSTOR-legal (a first FXRSTOR of a
+# never-run proc that #GP'd would crash here instead of reaching exit 84).
+#
+# Scope: SINGLE f64 proc only. The FXSAVE-of-the-PREVIOUS-owner limb + the two-proc
+# XMM-preservation proof are B5. Returns a FIXED small int (84), never a raw f64
+# bit-pattern — the signed-kprint_num readout trap the design flagged.
+
+fn fpex_main(): i64 {
+    var a: f64 = 7.0;
+    var b: f64 = 3.0;
+    var c: f64 = a * b;       # 21.0  (mulsd)
+    var d: f64 = c + 1.0;     # 22.0  (addsd)
+    var e: f64 = d / 2.0;     # 11.0  (divsd)
+    var ok = 1;
+    if (c != 21.0) { ok = 0; }   # comisd/ucomisd
+    if (d != 22.0) { ok = 0; }
+    if (e != 11.0) { ok = 0; }
+    if (ok == 1) { return 84; }  # 0x54 — distinctive "ring-3 f64 OK"
+    return 1;                    # a wrong result (XMM not restored, etc.)
+}
+
+fn _entry(): i64 { var r = fpex_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

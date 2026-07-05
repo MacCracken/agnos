@@ -13,7 +13,7 @@ SSE2 is x86-64 baseline, so this rides the **archaemenid AMD Zen** target the
 | **B1** | **1.53.0** | Enable SSE per core (BSP + every AP); FP-free-kernel invariant; ring-0 f64 proof | **✅ DONE + QEMU 4/4 (2026-07-05)** |
 | **B2** | **1.53.1** | Per-proc FXSAVE state array + per-CPU `fpu_owner` + **hand-built** default image | **✅ DONE + QEMU 2/2 (2026-07-05)** |
 | **B3** | **1.53.2** | Lazy `#NM` handler + `CR0.TS`-on-both-switch-paths + `fpu_owner` + deschedule-FXSAVE + `#XM` handler | **✅ DONE + QEMU (2026-07-05) — iron-gated (SMP migration → B5 burn)** |
-| **B4** | 1.53.3 | Ring-3 f64 first-touch FXRSTOR (single-owner, end to end) | Planned |
+| **B4** | **1.53.3** | Ring-3 f64 first-touch FXRSTOR (single-owner, end to end) | **✅ DONE + QEMU (2026-07-05) — real cyrius f64 in ring 3, `run: exit 84`** |
 | **B5** | 1.53.4 | Two-proc FP-preservation stress (timer / cooperative-yield / `-smp` migration) | Planned |
 | **B6** | 1.53.5 | `naad` on agnos ring-3 (the green end-proof) + cyrius issue-doc confirm + iron burn | Planned — arc-closing |
 
@@ -312,7 +312,15 @@ prologue (catches a future cyrius regalloc move before iron) + the **FP-free aud
 CRITERION: the migration-race fix is UNVALIDATABLE on single-core QEMU — B3 sign-off gates on an `-smp 4`
 iron migration soak (an FP proc observed moving CPU0→CPU1 preserving XMM), folded into B5.**
 
-### B4 — Ring-3 `f64` selftest (first-touch restore, end to end)
+### B4 — Ring-3 `f64` selftest (first-touch restore, end to end) — ✅ SHIPPED 1.53.3 (2026-07-05)
+*As shipped:* `fp-test/fpex.cyr` (built `--agnos`, staged `/bin/fpex`) — a **compiled
+cyrius** program (not hand-asm, per the refinement) that computes `7*3=21`, `+1=22`,
+`/2=11` with native f64 codegen (mulsd/addsd/divsd/comisd) and exits 84 iff all correct.
+`FP_RING3_SELFTEST` kernel block exec's it from disk; `scripts/fp-ring3-smoke.sh` asserts
+`run: exit 84` — **PASS**. Proves B1→B3 end to end (enable → area → `#NM` restore →
+ring-3 f64) AND that the B2 hand-built default image is FXRSTOR-legal (no `#GP` on the
+first restore → the boot-captured-image fallback was not needed). Single-owner first-touch
+only; the FXSAVE-of-previous-owner limb is B5. *Original plan below:*
 - A tiny ring-3 exerciser proc does an `f64` mul (via the `f64_*` helpers naad
   uses) and syscalls the result back; `FP_RING3_SELFTEST` + `fp-ring3-smoke.sh`
   assert the byte-pattern. Proves BSP-enable → per-proc-area → `#NM`-restore →
