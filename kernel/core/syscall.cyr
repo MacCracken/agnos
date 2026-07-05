@@ -299,6 +299,11 @@ fn kernel_resume() {
     # and the exit code was already stamped before kernel_resume was called. During
     # the boot exec selftest sched_active=0 (no scheduling) so this is a no-op there.
     proc_current_set(0);
+    # 1.53.x B3b: arm #NM for the resumed context — the foreground-exec-return longjmps
+    # back to the parent WITHOUT passing through enter_ring3 or the scheduler, so its
+    # next SSE op must fault to FXRSTOR its FP area rather than run on the reaped child's
+    # stale XMM. Bare CR0.TS RMW; the kernel is FP-free so TS=1 is inert until that op.
+    fpu_set_ts();
     # 1.40.6: restore the BOOT kernel CR3 (0x1000). On the program's exit the
     # SYSCALL stub left CR3 = the per-process CR3, which mirrors only 0-1 GB +
     # PDPT[1..3] — it does NOT map the device MMIO (NVMe BAR ~0xC0000010xx) that
@@ -368,6 +373,11 @@ fn fault_kill_current(vector) {
     snd_release_pid(pid);                         # release any snd#64 audio slot (Gate 2)
     if (pid < proc_count) {
         proc_set_state(pid, 0);                   # mark dead — sched_next won't pick it
+        # 1.53.x B3b: clear this CPU's FP owner if it named the dying proc, so a recycled
+        # slot (same pid) doesn't hit nm_handler's prev==cur fast-path and SKIP the restore
+        # (a silent XMM leak into the new occupant). No fxsave — the dying XMM is garbage.
+        var _fkc = pcpu_cpu();
+        if (load64(&fpu_owner + _fkc * 8) == pid) { store64(&fpu_owner + _fkc * 8, 0 - 1); }
         var ppid = proc_get_ppid(pid);
         if (ppid >= 0) { proc_send_signal(ppid, 17); }   # SIGCHLD to parent
     }
@@ -659,6 +669,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         snd_release_pid(proc_current_get());      # release any snd#64 audio slot (Gate 2)
         if (proc_current_get() < proc_count) {
             proc_set_state(proc_current_get(), 0);
+            # 1.53.x B3b: clear this CPU's FP owner if it named the exiting proc (same
+            # recycled-slot prev==cur hazard as fault_kill). No fxsave (exiting XMM garbage).
+            var _xc = pcpu_cpu();
+            if (load64(&fpu_owner + _xc * 8) == proc_current_get()) { store64(&fpu_owner + _xc * 8, 0 - 1); }
             # Send SIGCHLD (signal 17) to parent process
             var ppid = proc_get_ppid(proc_current_get());
             if (ppid >= 0) {

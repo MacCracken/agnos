@@ -5,6 +5,59 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.2] — 2026-07-05 — FP/SIMD arc B3: lazy #NM per-proc FP context switch
+
+The arc's core bite. Makes the XMM state per-proc via lazy save/restore keyed on
+`CR0.TS`: a context switch sets `CR0.TS` so the incoming proc's first SSE op faults
+`#NM` (vector 7); the handler FXSAVEs the departing FP owner + FXRSTORs the incoming
+proc. A proc that never touches FP never pays a save/restore, and two sequential f64
+procs no longer corrupt each other's floating state across a switch. The design + 3
+HIGH-severity fixes came from an adversarial workflow (see the plan-doc B3 blueprint).
+
+### Added — B3a: the #NM machinery
+- Leaf FXSAVE/FXRSTOR helpers (`fpu_do_fxsave`/`fpu_do_fxrstor`, `kernel/arch/x86_64/fpu.cyr`)
+  reading the 16-aligned area via the proven `mov rax,[rbp-8]` prologue — regalloc-safe
+  (a 2nd local would shift the ABI slot + revive the v1.28.3 spill class). These are the
+  FIRST + ONLY `fxsave`/`fxrstor` in production: the FP-free audit shifts from 0 to
+  **exactly 2 sanctioned sites, 0 stray xmm**.
+- `nm_handler` (clear TS → if incoming ≠ per-CPU owner: FXSAVE owner, FXRSTOR incoming,
+  record owner) + `nm_isr_build` (a vector-7 stub byte-identical to `timer_isr_build`;
+  `#NM` pushes no error code so the plain `iretq` retries the faulting op) + the IDT gate.
+- `fpu_set_ts`/`fpu_clear_ts` (CR0.TS RMW) + `clts` before every eager save.
+- **#XM (vector 19)** halting handler — B1 set `CR4.OSXMMEXCPT` but left vector 19 on the
+  bare-iretq default (silently swallowing a real SSE fault); it now takes the CMOS-stamp
+  + canary + halt like `#UD`.
+
+### Added — B3b: wire it live
+- `fpu_deschedule_save(old)` — eager-FXSAVE the descheduling proc + clear its owner,
+  UNDER `sched_lock` BEFORE the `on_cpu` unfence (sched.cyr:337/556), so a migration
+  restores a freshly-saved area, not a stale one (the SMP-migration race).
+- `fpu_set_ts()` post-restore on both scheduler paths (`do_context_switch`,
+  `sys_sched_yield`) plus the out-of-band ring-3 entry chokepoint `enter_ring3` and the
+  foreground-exec-return `kernel_resume` — the adversarial-found completeness gap (two
+  f64 procs across an exec boundary would otherwise leak XMM).
+- Clear `fpu_owner` on the death paths (`fault_kill_current`, `exit#0`) + a
+  `proc_alloc_slot` sweep — else a recycled same-pid slot hits the `prev==cur` fast-path
+  and skips the restore (a silent XMM leak into a new proc).
+
+### Testing
+- **`FP_NM_SELFTEST`** + `scripts/fp-nm-smoke.sh` (in `sweep.sh`/`build.sh`): forces
+  `CR0.TS`, an SSE op `#NM`s, the handler services it, the op retries + completes —
+  **3/3 green**. Full battery green with the machinery live: agnsh-smoke, ring3-smoke
+  (6/6 — do_context_switch preemption, sched_yield#44, slot recycle), exec-smoke (death
+  paths), FP_SELFTEST 4/4, FP_AREA 2/2. Production stays FP-free-except-the-2-sanctioned.
+
+### Iron-gated
+- The SMP-migration fix is **unvalidatable on single-core QEMU** — an `-smp 4` iron
+  migration soak (an f64 proc observed moving CPU0→CPU1 preserving XMM) is the dispositive
+  exit criterion, folded into B5. B3 also edits the context-switch raw zone (the iron-only
+  1.46.1 `iretq #GP` class), so an iron burn is load-bearing.
+
+### Fixed
+- Stale "INERT until exec_preempt=1 (a later bite)" comment in `sched.cyr`
+  `do_context_switch` (agnsh has been IF=1-preemptive since 1.44.14) — part of the ongoing
+  stale-comment sweep.
+
 ## [1.53.1] — 2026-07-05 — FP/SIMD arc B2: per-proc FXSAVE state
 
 Adds the per-proc FP-state infrastructure the lazy `#NM` save/restore (B3) will use.

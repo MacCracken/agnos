@@ -12,7 +12,7 @@ SSE2 is x86-64 baseline, so this rides the **archaemenid AMD Zen** target the
 |------|-----|------|-------|
 | **B1** | **1.53.0** | Enable SSE per core (BSP + every AP); FP-free-kernel invariant; ring-0 f64 proof | **✅ DONE + QEMU 4/4 (2026-07-05)** |
 | **B2** | **1.53.1** | Per-proc FXSAVE state array + per-CPU `fpu_owner` + **hand-built** default image | **✅ DONE + QEMU 2/2 (2026-07-05)** |
-| **B3** | 1.53.2 | Lazy `#NM` handler + `CR0.TS`-on-both-switch-paths + `fpu_owner` + deschedule-FXSAVE + `#XM` handler | Planned — **highest-risk (iron-gated)** |
+| **B3** | **1.53.2** | Lazy `#NM` handler + `CR0.TS`-on-both-switch-paths + `fpu_owner` + deschedule-FXSAVE + `#XM` handler | **✅ DONE + QEMU (2026-07-05) — iron-gated (SMP migration → B5 burn)** |
 | **B4** | 1.53.3 | Ring-3 f64 first-touch FXRSTOR (single-owner, end to end) | Planned |
 | **B5** | 1.53.4 | Two-proc FP-preservation stress (timer / cooperative-yield / `-smp` migration) | Planned |
 | **B6** | 1.53.5 | `naad` on agnos ring-3 (the green end-proof) + cyrius issue-doc confirm + iron burn | Planned — arc-closing |
@@ -234,19 +234,22 @@ kept as the record:*
 
 #### B3 — VERIFIED DESIGN (adversarial workflow, 2026-07-05) — the implementation blueprint
 
-> **B3a SHIPPED + QEMU 3/3 (2026-07-05, uncut — toward 1.53.2):** the additive `#NM`
-> machinery — `fpu_do_fxsave`/`fpu_do_fxrstor` (leaf `[rbp-8]` helpers), `fpu_set_ts`/
-> `fpu_clear_ts`, `nm_handler`, `nm_isr_build` (→ `nm_isr[64]`), `fpu_deschedule_save`
-> (defined, unwired), and the vector-7 IDT gate (main.cyr, after `fpu_area_init`).
-> `FP_NM_SELFTEST` forces `CR0.TS` → `movsd` `#NM`s → serviced → retries → `fp: #NM
-> serviced` + boot-to-shell (`scripts/fp-nm-smoke.sh`, in `sweep.sh`/`build.sh`).
-> Production audit is now **exactly 2 sanctioned fxsave/fxrstor, 0 stray xmm**; the box
-> still boots normally because nothing sets `CR0.TS` yet (the machinery is INERT until
-> B3b wires the switch paths). **Remaining for B3:** `#XM` (vector 19) + **B3b** — wire
-> `fpu_deschedule_save`/`fpu_set_ts` into the two sched.cyr paths + the completeness
-> sites (`enter_ring3`, `kernel_resume`, death-paths, `proc_alloc_slot` sweep). B3b is
-> the context-switch-raw-zone edit (iron-only-regression class) + the scheduler-behavior
-> change, so it lands as its own careful pass with the full smoke battery + an iron burn.
+> **B3 SHIPPED (a+b) + QEMU-validated (2026-07-05, cut 1.53.2):** the full lazy-`#NM`
+> per-proc FP context switch is wired LIVE. **B3a** (additive machinery) —
+> `fpu_do_fxsave`/`fpu_do_fxrstor` (leaf `[rbp-8]` helpers), `fpu_set_ts`/`fpu_clear_ts`,
+> `nm_handler`, `nm_isr_build` (→ `nm_isr[64]`), `fpu_deschedule_save`, the vector-7 IDT
+> gate, and the **#XM (vector 19)** halting handler. **B3b** (wire it live) —
+> `fpu_deschedule_save` under-lock-BEFORE-unfence at sched.cyr:337/556; `fpu_set_ts`
+> post-restore on `do_context_switch` + `sys_sched_yield` + the completeness chokepoints
+> `enter_ring3` and `kernel_resume`; `fpu_owner` cleared on the `fault_kill_current` /
+> `exit#0` death paths + a `proc_alloc_slot` sweep. Production audit is now **exactly 2
+> sanctioned fxsave/fxrstor, 0 stray xmm**. **Validated:** `FP_NM_SELFTEST` /
+> `fp-nm-smoke.sh` 3/3 (forced `#NM` serviced + op retried), full battery green with the
+> machinery LIVE (agnsh-smoke, ring3-smoke 6/6 — do_context_switch preemption +
+> sched_yield#44 + slot recycle, exec-smoke death paths, FP_SELFTEST 4/4, FP_AREA 2/2).
+> **IRON-GATED:** the SMP-migration fix is unvalidatable on single-core QEMU — an `-smp 4`
+> migration soak + the context-switch-raw-zone burn are the dispositive B3 exit criteria
+> (folded into B5). Also fixed a stale sched.cyr "INERT until exec_preempt" comment.
 
 
 Core mechanism **CONFIRMED** (leaf-helper regalloc isolation; no-errcode `#NM` iretq

@@ -190,6 +190,13 @@ fn enter_ring3(entry, user_rsp) {
     # never reaches 0x20 on iron, no ring-3 transition was attempted.
     asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x20; 0xE6; 0x71; }
 
+    # 1.53.x B3b: arm #NM for this proc — its first SSE op in ring 3 FXRSTORs its own FP
+    # area. This is the single choke point for the out-of-band exec/spawn entries
+    # (proc_current_set(pid) → exec_and_wait → enter_ring3) that NEVER pass through the
+    # scheduler's fpu_set_ts; without it two sequential f64 procs would leak XMM across
+    # the exec boundary. rax clobber is harmless — the GPR-zeroing block below zeros it.
+    fpu_set_ts();
+
     # 1.44.19: zero ALL GPRs before entering ring 3 — a fresh exec'd program otherwise
     # inherits whatever the kernel left in them. Two payoffs: (1) hand-assembled callers
     # that set only the regs they use (the selftest ELFs; legacy 3-arg agnsh syscalls)

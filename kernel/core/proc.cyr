@@ -267,6 +267,11 @@ fn proc_alloc_slot() {
     store64(&idle_owner + idx * 8, 0 - 1);     # 1.46.x STEP-2: recycled slot starts UNPINNED (a prior foreground proc may have left idle_owner=its launch CPU; a fresh proc must be free to migrate / not falsely pinned). Idles never reuse a slot, so their persistent pin is unaffected.
     store64(&proc_ppid + idx * 8, 0);          # 1.50.7: recycled slot must not inherit a stale parent (default init; proc_create_user sets the real creator)
     fpu_area_reset(idx);                        # 1.53.x B2: recycled slot must not inherit the prior occupant's saved XMM — reset to the fninit-equivalent default (matters once B3's #NM restore is live)
+    # 1.53.x B3b: belt-and-suspenders for the dangling-owner hazard — if any CPU's FP
+    # owner still names this recycled pid (a death path that didn't clear it), drop it so
+    # the new occupant's first #NM restores its fresh area, not the prev==cur skip.
+    var _oc = 0;
+    while (_oc < 4) { if (load64(&fpu_owner + _oc * 8) == idx) { store64(&fpu_owner + _oc * 8, 0 - 1); } _oc = _oc + 1; }
     return idx;
 }
 # 1.46.1: the per-proc TSS.RSP0 top for `pid`, or the legacy shared stack (0x3C0000

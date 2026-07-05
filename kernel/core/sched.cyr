@@ -334,6 +334,11 @@ fn do_context_switch(isr_rsp) {
     # — this is the cc5 regalloc-sensitive path, an extra call can clobber a live reg.
     proc_save_context(old, isr_rsp);
     if (load64(&proc_table + old * 176 + 8) != 0) { proc_set_state(old, 1); }  # not-dead → ready; dead stays dead
+    # 1.53.x B3b: eager-FXSAVE old's live XMM (only if this CPU owns it) + clear the
+    # owner, UNDER the lock, BEFORE the on_cpu unfence below — so if `old` migrates to
+    # another core, that core's #NM FXRSTORs a FRESHLY-saved area, not a stale one CPU0
+    # never wrote (the SMP migration race). No-op unless old touched FP this slice.
+    fpu_deschedule_save(old);
     on_cpu_set(old, 0 - 1);                                     # SMP6: old leaves this CPU (regs already saved)
 
     # Load new process state
@@ -364,10 +369,13 @@ fn do_context_switch(isr_rsp) {
     # 1.46.1: point TSS.RSP0 at the switched-to proc's OWN kernel stack (per-proc
     # interrupt stack, region 7). AFTER the cr3_load so tss_set_rsp0's APIC read hits
     # a CR3 that maps the APIC; only on a real switch (new_pid != old, guarded at the
-    # top of this fn). RSP0 is consumed only on CPL3->CPL0, so this is INERT until
-    # exec_preempt=1 (a later bite) makes agnsh IF=1-preemptible. Plain call beside
-    # the kpti updates — OUTSIDE the cc5-regalloc-sensitive raw save/restore region.
+    # top of this fn). RSP0 is consumed on a CPL3->CPL0 preemption (LIVE since agnsh
+    # went IF=1-preemptible, exec_preempt=1, 1.44.14). Plain call beside the kpti
+    # updates — OUTSIDE the cc5-regalloc-sensitive raw save/restore region.
     tss_set_rsp0(proc_rsp0_top(new_pid));
+    # 1.53.x B3b: arm #NM for new_pid — its first SSE op faults, nm_handler FXRSTORs its
+    # FP area. Bare CR0.TS RMW (no area), outside the raw zone like tss_set_rsp0 above.
+    fpu_set_ts();
 
     # Check for pending unmasked signals on the new process
     proc_check_pending_signals(new_pid);
@@ -545,6 +553,7 @@ fn sys_sched_yield() {
     store64(&proc_ss + yp * 8, 0x1B);
     # --- Switch (mirrors do_context_switch's proven order + tail) ---
     proc_set_state(yp, 1);                             # yielder: running → ready
+    fpu_deschedule_save(yp);                           # 1.53.x B3b: eager-FXSAVE yielder's XMM (if this CPU owns it) + clear owner, UNDER lock, BEFORE the unfence below (SMP migration safety)
     on_cpu_set(yp, 0 - 1);                             # SMP6: yielder leaves this CPU
     proc_current_set(next);
     proc_set_state(next, 2);                           # next: ready → running
@@ -558,6 +567,7 @@ fn sys_sched_yield() {
     store64(&pcpu_kpti_kernel_cr3 + pcpu_cpu() * 8, new_cr3);                  # OMITTING these re-enters the YIELDER's
     store64(&pcpu_kpti_user_cr3 + pcpu_cpu() * 8, proc_get_user_cr3(new_cr3)); # CR3 on next's first syscall (1.40.x class); 4c per-CPU
     tss_set_rsp0(proc_rsp0_top(next));                 # 1.46.1: per-proc RSP0 (inert: #44 yield is IF=1-only; agnsh is IF=0 in production)
+    fpu_set_ts();                                      # 1.53.x B3b: arm #NM for next — its first SSE op FXRSTORs its FP area
     proc_check_pending_signals(next);
     # CLAC: the entry stub's STAC pairs with CLAC only on the SYSRET tail we never
     # reach (the kernel_resume precedent, 1.42.14 audit #3).

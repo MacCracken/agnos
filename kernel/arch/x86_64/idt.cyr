@@ -88,7 +88,7 @@ var exc_ring3_kill_fn = 0;
 
 fn exc_handlers_init() {
     var base = &exc_stub;
-    var nvec = 7;
+    var nvec = 8;   # 1.53.x B3: +v=19 (#XM, SSE numeric exception) — was 7
     var off = 0;
     for (var k = 0; k < nvec; k = k + 1) {
         var v = 6;
@@ -98,6 +98,10 @@ fn exc_handlers_init() {
         if (k == 4) { v = 12; }
         if (k == 5) { v = 13; }
         if (k == 6) { v = 14; }
+        if (k == 7) { v = 19; }   # 1.53.x B3: #XM (SSE numeric exception). B1 set CR4.OSXMMEXCPT
+                                  # but left vector 19 on the bare-iretq default (silently swallowed
+                                  # a real SSE fault); now it takes the CMOS-stamp + canary + halt like
+                                  # #UD (no error code, NOT in the {6,13,14} ring3-kill set). 51 B, fits.
         var stub = base + off;
         # mov al,0x54 ; out 0x70,al      (select CMOS slot 0x54)
         store8(stub + 0, 0xB0); store8(stub + 1, 0x54);
