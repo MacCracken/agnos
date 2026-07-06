@@ -361,6 +361,25 @@ only; the FXSAVE-of-previous-owner limb is B5. *Original plan below:*
 
 #### B5 — VERIFIED DESIGN (adversarial workflow, 2026-07-05) — the implementation blueprint
 
+> **⚠ B5 IMPLEMENTATION IN PROGRESS (2026-07-05) — and it already caught a real B3 bug.**
+> The harness is written + gated (`FP_CTXSW_SELFTEST`): `main.cyr` `fpctxsw_*` (86-byte
+> handshake payload — disassembly-verified byte-exact; setup spawns two procs via the
+> `ring3_spawn_one` recipe with a per-proc witness page at `0x2000000` + a SHARED handshake
+> page at `0x2200000`; verify), `sched.cyr` `proc_last_cpu[16]`+migration stamp, `fpu.cyr`
+> `fpu_switch_count`, `build.sh`, `scripts/fp-ctxsw-smoke.sh`. **Isolation bisect (single-core
+> QEMU):** (a) a MINIMAL counter payload → both procs alive, counters fly, kmain scheduled
+> fine → **the spawn/map/verify harness is correct**; (b) an **SSE-only** payload (movq
+> xmm3/xmm15 + inc, no handshake) → `sw=11` FP switches happen, then **proc A FAULTS dead
+> (`Ast=0`) after ~11 rounds** while B stays alive. **This is the FIRST genuine 2-proc FP
+> alternation — the exact FXSAVE-of-PREVIOUS-owner limb of B3 that single-proc B4 + the forced
+> B3a test could NOT reach — and it faults.** So B5 is doing its job: it surfaced a real bug in
+> the B3 lazy-#NM save/restore under alternation. **Next pass:** capture the fault vector with a
+> NON-locking channel (kprint in fault context deadlocks the console lock — use the CMOS `0x54`
+> stamp read post-boot, or `serial_println`), root-cause the nm_handler/fpu_deschedule_save
+> alternation fault, fix it, then finalize the verify latches + run the smoke. **B1–B4 (1.53.3)
+> + production are UNAFFECTED — all B5 code is `#ifdef FP_CTXSW_SELFTEST`-gated (audit still == 2).**
+
+
 The false-green model is **CONFIRMED sound** *if* built on the preemptive
 `spawn_user_proc` / `sched_active=1` path (NOT the IF=0 foreground `exec_and_wait`/#37
 trap): two ring-3 procs co-scheduled, so "A runs to completion then B" is structurally

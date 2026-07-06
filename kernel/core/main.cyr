@@ -3547,6 +3547,128 @@ fn ring3_selftest_verify() {
 }
 #endif
 
+#ifdef FP_CTXSW_SELFTEST
+# === 1.53.x B5 — two-proc FP-preservation stress (correctness proof for lazy #NM) ===
+# Two ring-3 procs, each loaded with a DISTINCT pattern in xmm3 (low, naad-relevant) +
+# xmm15 (high, FXSAVE-completeness), co-scheduled preemptively (spawn_user_proc + IF=1
+# via proc_set_ring3, NOT the foreground #37 trap). Each round: write pattern → set my
+# handshake flag in the SHARED page (0x2200000) → yield#44 (hand the peer a slice) →
+# spin until the peer's flag shows it wrote ITS pattern → re-read xmm3/xmm15 (the first
+# SSE op #NMs, FXRSTOR-ing this proc's area) → compare to the pattern. SURVIVED (==own
+# pattern) proves B3 saved+restored across the peer's FP use; a mismatch (==peer pattern)
+# = corrupt. The handshake GUARANTEES the peer overwrote the physical XMM between this
+# proc's write and re-read, so a survived-round can't be a no-switch false-green.
+# ONE parameterized payload; the kernel plants pattern/flags per-proc into the witness
+# page. Witness layout: [0]survived [8]corrupt [16]pattern [24]my_flag [32]peer_flag.
+var fpctxsw_payload[24];        # raw ring-3 code (113 bytes used)
+var fpctxsw_wit_a = 0;
+var fpctxsw_wit_b = 0;
+var fpctxsw_shared = 0;
+var fpctxsw_pid_a = 0;
+var fpctxsw_pid_b = 0;
+fn fpctxsw_payload_fill() {
+    var p = &fpctxsw_payload;
+    # No yield#44 — the two procs interleave via TIMER preemption (fair round-robin, so the
+    # verify/kmain isn't starved) + the handshake flag: write pattern → set my flag → SPIN
+    # until the peer's flag shows the peer wrote → re-read. The timer preempts the spin to
+    # let the peer run; the handshake guarantees the peer overwrote the physical XMM before
+    # this proc re-reads. GP regs (rbx/rdx/r8/rcx) survive timer preemption via the context
+    # save, so no reload is needed after a preempt.
+    # 0: movabs rbx, 0x2000000  (witness page: config + counters)
+    store8(p + 0, 0x48); store8(p + 1, 0xBB);
+    store8(p + 2, 0x00); store8(p + 3, 0x00); store8(p + 4, 0x00); store8(p + 5, 0x02);
+    store8(p + 6, 0x00); store8(p + 7, 0x00); store8(p + 8, 0x00); store8(p + 9, 0x00);
+    store8(p + 10, 0x4C); store8(p + 11, 0x8B); store8(p + 12, 0x43); store8(p + 13, 0x10);  # mov r8, [rbx+0x10]  (pattern)
+    store8(p + 14, 0x66); store8(p + 15, 0x49); store8(p + 16, 0x0F); store8(p + 17, 0x6E); store8(p + 18, 0xD8);  # movq xmm3, r8
+    store8(p + 19, 0x66); store8(p + 20, 0x4D); store8(p + 21, 0x0F); store8(p + 22, 0x6E); store8(p + 23, 0xF8);  # movq xmm15, r8
+    # 24: movabs rdx, 0x2200000  (shared handshake page)
+    store8(p + 24, 0x48); store8(p + 25, 0xBA);
+    store8(p + 26, 0x00); store8(p + 27, 0x00); store8(p + 28, 0x20); store8(p + 29, 0x02);
+    store8(p + 30, 0x00); store8(p + 31, 0x00); store8(p + 32, 0x00); store8(p + 33, 0x00);
+    store8(p + 34, 0x48); store8(p + 35, 0x8B); store8(p + 36, 0x43); store8(p + 37, 0x18);  # mov rax, [rbx+0x18]  (my_flag)
+    store8(p + 38, 0x88); store8(p + 39, 0x02);                                              # mov [rdx], al
+    store8(p + 40, 0x48); store8(p + 41, 0x8B); store8(p + 42, 0x4B); store8(p + 43, 0x20);  # mov rcx, [rbx+0x20]  (peer_flag)
+    store8(p + 44, 0x0F); store8(p + 45, 0xB6); store8(p + 46, 0x02);                        # wait: movzx eax, byte [rdx]
+    store8(p + 47, 0x39); store8(p + 48, 0xC8);                                              # cmp eax, ecx
+    store8(p + 49, 0x75); store8(p + 50, 0xF9);                                              # jne wait (-> 44)
+    store8(p + 51, 0x4C); store8(p + 52, 0x8B); store8(p + 53, 0x43); store8(p + 54, 0x10);  # mov r8, [rbx+0x10]  (pattern reload)
+    store8(p + 55, 0x66); store8(p + 56, 0x48); store8(p + 57, 0x0F); store8(p + 58, 0x7E); store8(p + 59, 0xD8);  # movq rax, xmm3
+    store8(p + 60, 0x4C); store8(p + 61, 0x39); store8(p + 62, 0xC0);                        # cmp rax, r8
+    store8(p + 63, 0x75); store8(p + 64, 0x0F);                                              # jne corrupt (-> 80)
+    store8(p + 65, 0x66); store8(p + 66, 0x4C); store8(p + 67, 0x0F); store8(p + 68, 0x7E); store8(p + 69, 0xF8);  # movq rax, xmm15
+    store8(p + 70, 0x4C); store8(p + 71, 0x39); store8(p + 72, 0xC0);                        # cmp rax, r8
+    store8(p + 73, 0x75); store8(p + 74, 0x05);                                              # jne corrupt (-> 80)
+    store8(p + 75, 0x48); store8(p + 76, 0xFF); store8(p + 77, 0x03);                        # inc qword [rbx]      (survived++)
+    store8(p + 78, 0xEB); store8(p + 79, 0xB0);                                              # jmp top (-> 0)
+    store8(p + 80, 0x48); store8(p + 81, 0xFF); store8(p + 82, 0x43); store8(p + 83, 0x08);  # corrupt: inc qword [rbx+8]  (corrupt++)
+    store8(p + 84, 0xEB); store8(p + 85, 0xAA);                                              # jmp top (-> 0)
+    return 0;
+}
+fn fpctxsw_wit_init(w, pat, myf, peerf) {
+    if (vmm_is_mapped(w) == 0) { vmm_map(w, w, 0x83); }   # map into the kernel CR3 so the verify can read it
+    store64(w + 0, 0); store64(w + 8, 0);                 # survived / corrupt
+    store64(w + 16, pat); store64(w + 24, myf); store64(w + 32, peerf);
+    return 0;
+}
+fn fpctxsw_spawn(wit) {
+    var pid = spawn_user_proc(&fpctxsw_payload);
+    if (pid < 0) { return pid; }
+    proc_map_page(proc_get_cr3(pid), 0x2000000, wit);            # this proc's OWN witness page
+    proc_map_page(proc_get_cr3(pid), 0x2200000, fpctxsw_shared); # the SHARED handshake page (both procs)
+    proc_set_ring3(pid);
+    return pid;
+}
+fn fpctxsw_selftest_setup() {
+    fpctxsw_wit_a = pmm_alloc_2mb();
+    fpctxsw_wit_b = pmm_alloc_2mb();
+    fpctxsw_shared = pmm_alloc_2mb();
+    if (fpctxsw_wit_a == 0) { return 0; }
+    if (fpctxsw_wit_b == 0) { return 0; }
+    if (fpctxsw_shared == 0) { return 0; }
+    fpctxsw_wit_init(fpctxsw_wit_a, 0x1111111111111111, 1, 2);   # A: pattern 0x1111.., flag 1, waits for 2
+    fpctxsw_wit_init(fpctxsw_wit_b, 0x2222222222222222, 2, 1);   # B: pattern 0x2222.., flag 2, waits for 1
+    if (vmm_is_mapped(fpctxsw_shared) == 0) { vmm_map(fpctxsw_shared, fpctxsw_shared, 0x83); }
+    store64(fpctxsw_shared + 0, 0);
+    var i = 0;
+    while (i < 16) { store64(&proc_last_cpu + i * 8, 0 - 1); i = i + 1; }   # migration witness init
+    fpctxsw_migrations = 0;
+    fpctxsw_payload_fill();
+    fpctxsw_pid_a = fpctxsw_spawn(fpctxsw_wit_a);
+    fpctxsw_pid_b = fpctxsw_spawn(fpctxsw_wit_b);
+    return 0;
+}
+fn fpctxsw_selftest_verify() {
+    kprint("fp: ctxsw pids A=", 17); kprint_num(fpctxsw_pid_a); kprint(" B=", 3); kprint_num(fpctxsw_pid_b); kprintln("", 0);
+    var t0 = timer_ticks;
+    var i = 0;
+    while (i < 10) { arch_wait(); i = i + 1; }
+    kprint("fp: ctxsw DBG ticks=", 20); kprint_num(timer_ticks - t0);
+    kprint(" sw=", 4); kprint_num(fpu_switch_count);
+    kprint(" Ast=", 5); kprint_num(proc_get_state(fpctxsw_pid_a));
+    kprint(" Bst=", 5); kprint_num(proc_get_state(fpctxsw_pid_b));
+    kprint(" sa=", 4); kprint_num(load64(fpctxsw_wit_a + 0));
+    kprint(" sb=", 4); kprint_num(load64(fpctxsw_wit_b + 0));
+    kprint(" ca=", 4); kprint_num(load64(fpctxsw_wit_a + 8));
+    kprint(" cb=", 4); kprint_num(load64(fpctxsw_wit_b + 8)); kprintln("", 0);
+    var sa = load64(fpctxsw_wit_a + 0);
+    var ca = load64(fpctxsw_wit_a + 8);
+    var sb = load64(fpctxsw_wit_b + 0);
+    var cb = load64(fpctxsw_wit_b + 8);
+    kprint("fp: ctxsw sa=", 13); kprint_num(sa); kprint(" ca=", 4); kprint_num(ca);
+    kprint(" sb=", 4); kprint_num(sb); kprint(" cb=", 4); kprint_num(cb);
+    kprint(" sw=", 4); kprint_num(fpu_switch_count); kprintln("", 0);
+    if (ca > 0) { kprintln("fp: ctxsw A CORRUPT", 19); }
+    else { if (sa >= 5) { kprintln("fp: ctxsw A OK", 14); } else { kprintln("fp: ctxsw A STUCK", 17); } }
+    if (cb > 0) { kprintln("fp: ctxsw B CORRUPT", 19); }
+    else { if (sb >= 5) { kprintln("fp: ctxsw B OK", 14); } else { kprintln("fp: ctxsw B STUCK", 17); } }
+    kprint("fp: ctxsw migrations=", 21); kprint_num(fpctxsw_migrations); kprintln("", 0);   # >0 under -smp = a real cross-core FP migration (soft gate)
+    proc_set_state(fpctxsw_pid_a, 0);
+    proc_set_state(fpctxsw_pid_b, 0);
+    kprintln("fp: ctxsw done", 14);
+    return 0;
+}
+#endif
+
 #ifndef KTEST
 proc_count = 0;
 proc_current_set(0);
@@ -3580,6 +3702,10 @@ thr_pid_b = kthread_create(&thread_test_b);
 # 1.44.4: spawn + map + ring-3-ify a single user proc before the scheduler arms.
 ring3_selftest_setup();
 #endif
+#ifdef FP_CTXSW_SELFTEST
+# 1.53.x B5: spawn the two FP-preservation procs BEFORE the scheduler arms so they co-schedule.
+fpctxsw_selftest_setup();
+#endif
 #endif
 
 # 1.46.x sub-bite 7 (H6 fix 2026-06-24): wake APs HERE — AFTER the proc-table
@@ -3612,6 +3738,11 @@ thread_selftest_verify();
 #ifdef RING3_SELFTEST
 # 1.44.4: prove a ring-3 proc (own CR3, IF=1) is preempted + resumed by the scheduler.
 ring3_selftest_verify();
+#endif
+
+#ifdef FP_CTXSW_SELFTEST
+# 1.53.x B5: let the two FP procs interleave under the live scheduler, then assert XMM survival + latch.
+fpctxsw_selftest_verify();
 #endif
 
 #ifdef SCHED_STRESS_SELFTEST

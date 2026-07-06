@@ -185,12 +185,18 @@ fn nm_isr_build() {
 # ambient TS. B3b wires this UNDER sched_lock, BEFORE on_cpu_set(old,-1), on BOTH
 # switch paths. (Unreachable until B3b — the leaf fxsave it calls is already present
 # via nm_handler, so this does not add a 3rd sanctioned site.)
+#ifdef FP_CTXSW_SELFTEST
+var fpu_switch_count = 0;   # 1.53.x B5: ++ ONLY on a real inter-proc FXSAVE (owner-change) — the switch-count witness
+#endif
 fn fpu_deschedule_save(old): i64 {
     var cpu = pcpu_cpu();
     if (load64(&fpu_owner + cpu * 8) == old) {
         asm { 0x0F; 0x06; }   # clts — clear CR0.TS so the eager fxsave is never TS-gated
         fpu_do_fxsave(fpu_area(old));
         store64(&fpu_owner + cpu * 8, 0 - 1);
+        #ifdef FP_CTXSW_SELFTEST
+        fpu_switch_count = fpu_switch_count + 1;
+        #endif
     }
     return 0;
 }

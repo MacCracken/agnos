@@ -293,6 +293,14 @@ fn sched_fix_live_frame(isr_rsp) {
     return 0;
 }
 
+#ifdef FP_CTXSW_SELFTEST
+# 1.53.x B5 migration witness — a PERSISTENT per-pid last-cpu (NOT proc_on_cpu, which
+# on_cpu_set clears to -1 on every deschedule, so it can never witness a cpuX->cpuY move).
+# Stamped at the pick site below; the -smp verify reports fpctxsw_migrations (a SOFT gate).
+var proc_last_cpu[16];
+var fpctxsw_migrations = 0;
+#endif
+
 # High-level context switch called from timer ISR handler.
 # isr_rsp = stack pointer after ISR has pushed all caller-saved regs.
 fn do_context_switch(isr_rsp) {
@@ -345,6 +353,12 @@ fn do_context_switch(isr_rsp) {
     proc_current_set(new_pid);
     proc_set_state(new_pid, 2);  # → running
     on_cpu_set(new_pid, pcpu_cpu());                           # SMP6 FENCE: new owned by this CPU (LAST under-lock mutation — INV-6)
+    #ifdef FP_CTXSW_SELFTEST
+    var _flc = load64(&proc_last_cpu + new_pid * 8);           # 1.53.x B5: witness a real cross-core migration
+    var _fcc = pcpu_cpu();
+    if (_flc != (0 - 1)) { if (_flc != _fcc) { fpctxsw_migrations = fpctxsw_migrations + 1; } }
+    store64(&proc_last_cpu + new_pid * 8, _fcc);
+    #endif
     var old_cr3 = proc_get_cr3(old);                           # SMP6 GAP-A: snapshot UNDER the lock (proc_reap detaches old's CR3 if a foreign CPU reaps old after release, proc.cyr:551)
     sched_spin_unlock();                                       # *** RELEASE *** before the lock-free restore tail (INV-1/INV-2)
 

@@ -183,6 +183,7 @@ else
         [ -n "$FP_AREA_SELFTEST" ]   && echo '#define FP_AREA_SELFTEST'
         [ -n "$FP_NM_SELFTEST" ]     && echo '#define FP_NM_SELFTEST'
         [ -n "$FP_RING3_SELFTEST" ]  && echo '#define FP_RING3_SELFTEST'
+        [ -n "$FP_CTXSW_SELFTEST" ]  && echo '#define FP_CTXSW_SELFTEST'
 
         [ -n "$NET_SELFTEST" ]       && echo '#define NET_SELFTEST'
         [ -n "$LOOPBACK_SELFTEST" ]  && echo '#define LOOPBACK_SELFTEST'
