@@ -5,6 +5,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.4] — 2026-07-06 — FP/SIMD arc B5+B6: two-proc XMM preservation + naad DSP in ring 3 (arc QEMU-complete)
+
+Closes the FP/SIMD arc (QEMU). B5 proves the lazy `#NM` machinery preserves each proc's
+XMM across real preemptive context switches; B6 proves a real shipping-library f64 DSP
+workload (naad's oscillator) runs correctly in ring 3. Cut B5 (1.53.4) and B6 (1.53.5)
+together as **1.53.4**. The one remaining item is the archaemenid iron burn.
+
+### Added — B5: two-proc FP-preservation stress
+- **`FP_CTXSW_SELFTEST`** kernel block (`main.cyr`, gated; `fpctxsw_*` harness + `fpu_deschedule_save`
+  wiring exercised) + **`scripts/fp-ctxsw-smoke.sh`** — spawns TWO preemptively-scheduled ring-3
+  procs, each writing a distinct pattern into `xmm3`+`xmm15`, burning long enough to be preempted
+  (the peer runs with a DIFFERENT XMM), then re-reading and asserting its own pattern survived.
+  20 rounds/proc, 14–18 real inter-proc FP switches: **`sa=20 ca=0 sb=20 cb=0`** — zero corruption,
+  single-core (hard gate) AND `-smp 4` (soft gate). **fp-ctxsw-smoke 8/8.** Registered in `sweep.sh`.
+
+### What B5 proves
+- **B3's lazy `#NM` FXSAVE/FXRSTOR is sound** — two f64 procs do not corrupt each other's XMM. The
+  FXSAVE-of-the-previous-owner limb (unreachable by single-proc B4) is exercised and correct.
+- The leaked value in a (deliberately induced) failure is the *reset-area default* `0x0`, never the
+  peer's pattern → per-proc isolation holds. The `-smp` cross-core migration COUNT remains **iron-gated**
+  (QEMU TCG affinity is sticky; the dispositive migration proof is the archaemenid `-smp` burn).
+
+### Added — B6: naad oscillator ring-3 end-proof (arc-closer)
+- **`naad/naadex.cyr`** — builds naad's 440 Hz **sine oscillator** (`osc_new(WAVEFORM_SINE, …)`),
+  generates **256 samples** (`osc_next_sample` → `f64_sin`/`f64_mul`/…), asserts every one
+  `naad_is_finite`, and exits **88** (via the `SYS_EXIT` bare-call form) iff all 256 are finite.
+- **`NAAD_RING3_SELFTEST`** kernel block (`main.cyr`, in `build.sh`) + **`scripts/naad-ring3-smoke.sh`** —
+  builds `naadex --agnos` from the naad repo, stages `/bin/naadex`, boots gnoboot+OVMF+NVMe, asserts
+  **`run: exit 88`** + no `#PF/#GP/#UD/PANIC`. **PASS.** Registered in `sweep.sh`.
+
+### What B6 proves
+- A **real shipping library's XMM-heavy DSP** (naad carries ~26k SSE instructions, 0 YMM → FXSAVE
+  sufficient) runs correctly in agnos ring 3, end to end on the B1→B5 FP stack. naad builds
+  `--agnos` clean (only dead `sys_fork`/`sys_execve` warnings). The arc's foundational wall
+  ("naad `#UD`s on the first SSE op") is gone — the whole chain B1 enable → B2 area → B3 `#NM`
+  restore → B4 first-touch → B5 two-proc preservation → **B6 real library** is QEMU-green.
+
+### Fixed
+- **cyrius top-level bare-`var X[N]` 8× under-size** (filed `cyrius/docs/development/issues/2026-07-05-toplevel-bare-array-8x-undersize.md`,
+  **fixed in cyrius 6.4.10**). A bare `var X[N]` global after the first bare top-level statement was
+  sized N bytes instead of N×8 (a two-pass parser split: pass-1 `PARSE_GVAR_ARR` vs pass-2
+  `PARSE_ARRAY`). It surfaced as a B5 ring-3 `#PF` (a `var fpctxsw_payload[24]` = 24 B overflowed a
+  103-byte payload into neighboring globals → corrupt witness PDE). Two earlier misdiagnoses ("a B3
+  bug", "a pmm/.bss-aliasing bug") were **retracted** — B3 and pmm are both sound. The kernel now
+  builds against cyrius 6.4.10.
+- B5 harness self-corrections: `fpctxsw_payload[24]`→`[256]`; the `exit` syscall now self-loops so a
+  returning `SYS_EXIT` cannot fall through into the corrupt handler (which had produced a false `ca=1`).
+
 ## [1.53.3] — 2026-07-05 — FP/SIMD arc B4: real cyrius f64 runs in ring 3
 
 The end-to-end proof of the arc's foundation. A real cross-built cyrius f64 program now
