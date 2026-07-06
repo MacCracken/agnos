@@ -240,6 +240,11 @@ else
         # in hda.cyr) — drives the #64-69 handlers + fills the ring with a tone the DMA
         # loops. Drives scripts/snd-smoke.sh (QEMU -audiodev wav + serial PASS marker).
         [ -n "$SND_SELFTEST" ]       && echo '#define SND_SELFTEST'
+        # HDA_HDMI=1 — HDMI-audio arc bite 2b: probe + enumerate a SECOND HD-Audio
+        # controller as instance 1 (archaemenid 04:00.1 HDMI/DP, or a 2nd QEMU
+        # -device intel-hda). Instance 0 (analog) stays the default sink. Gated so the
+        # production/MVP kernel stays single-controller. Drives scripts/hda-dual-smoke.sh.
+        [ -n "$HDA_HDMI" ]           && echo '#define HDA_HDMI'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include

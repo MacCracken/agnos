@@ -2173,7 +2173,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # snd_open() -> slot 0..3, or -1 (no device / busy / table full). a1..a4 unused.
         # Runs IF=0 (SYSCALL SFMASK) → atomic vs the timer ISR, so the servicer-off
         # handoff + counter init can't tear; no sti window (net_config#61 shape).
-        if (hda_present == 0 || hda_out_dac == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_out_dac + hda_active_ctl * 8) == 0) { stack_canary_check(canary); return 0 - 1; }
         if (snd_active_slot != (0 - 1)) { stack_canary_check(canary); return 0 - 1; }   # one live stream
         var so_s = 0; var so_got = 0 - 1;
         while (so_s < 4) { if (load64(&snd_slot_used + so_s * 8) == 0) { so_got = so_s; break; } so_s = so_s + 1; }

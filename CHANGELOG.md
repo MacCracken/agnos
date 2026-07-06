@@ -42,6 +42,43 @@ route + ELD → sink-select) follow; bites 3–4 are iron-gated on a connected H
   (smallest ISR-touching diff, write-once selector = cleanest ISR-safety proof) over indexed-
   threaded-param and context-swap alternatives; realized here in the codebase's named-array idiom.
 
+### HDMI-audio arc — bite 2: probe + enumerate a second HDA controller as instance 1
+
+Bite 2 makes the driver actually bind + enumerate a SECOND controller (instance 1). QEMU-validated
+with two `-device intel-hda`; archaemenid's real HDMI/DP codec route is bite 3 (iron-gated).
+
+#### 2a — remaining codec/stream fields graduated to per-instance (behavior-identical)
+- The codec-graph/stream fields (`hda_present`, `hda_pci_idx`, `hda_codec_mask`, `hda_vendor`,
+  `hda_afg`, `hda_w_start`/`hda_w_count`, `hda_oss`/`hda_iss`, `hda_out_pin`/`hda_out_dac`,
+  `hda_path[8]`→`[16]`, `hda_path_n`) become per-instance `var X[2]` (path is 2×8 nodes, node k
+  of instance ci at `&hda_path + (ci*8 + k)*8`). Every read/write in `hda_probe`/`hda_reset`/
+  `hda_codec_probe`/`hda_codec_enum`/`hda_codec_route`/`hda_stream_arm`/`hda_snd_selftest` + the
+  `snd_open` guard now indexes `hda_active_ctl` (inline — these are boot/syscall-context, not the
+  ISR). Necessary so an instance-1 probe cannot clobber instance-0's `present`/`codec_mask`/
+  `vendor`/`afg`/`out_dac`. `hda_stream_tag` stays a shared scalar (constant 1, both controllers).
+  The driver is now **fully** instance-aware (24 per-instance fields across bites 1–2).
+
+#### 2b — instance-1 probe (`HDA_HDMI`-gated)
+- **`hda_find_next_controller(skip_idx)`** — finds an HDA-class (`04:03:00`) controller whose PCI
+  index isn't instance 0's. All AMD/Intel HDA functions share the class, so the discriminator is
+  "not the already-bound index" (works for archaemenid's `04:00.1` and a 2nd QEMU `intel-hda`).
+- **`hda_probe` is instance-aware**: `hda_active_ctl==0` runs the analog exact-ID ladder (unchanged);
+  `==1` calls `hda_find_next_controller` skipping instance 0. A silent no-controller for instance 1
+  (a single-HDA box legitimately has none).
+- **`main.cyr` `#ifdef HDA_HDMI` block** (after the instance-0 sequence): sets `hda_active_ctl=1`,
+  probes → resets → codec-probes → codec-enumerates instance 1, prints `hda: ctl1 bound codecs=0xNNNN
+  afg=0xNN`, restores `hda_active_ctl=0`. Gated so the default/MVP kernel stays single-controller
+  until the HDMI path is iron-proven (the `HDA_TONE` precedent). `HDA_HDMI=1` added to `build.sh`.
+
+### What bite 2 proves (QEMU)
+- **2a behavior-identity**: default build **OK** (1,373,208 B), `hda-smoke`/`hda-tone`(RMS=5131.3)/
+  `snd-smoke`(RMS=7344.3)/`agnsh-smoke` all **PASS** — byte-identical driver behavior at `ctl≡0`.
+- **2b multi-instance**: new **`scripts/hda-dual-smoke.sh`** (self-builds `HDA_HDMI=1` + boots QEMU
+  with two `intel-hda`) **PASS** — instance 0 (analog) binds + routes + streams, then instance 1
+  binds the *second* controller and enumerates independently (`hda: ctl1 bound codecs=0x0001 afg=0x01`),
+  proving `find_next_controller` skip-bound + per-instance state isolation. Registered in `sweep.sh`.
+- Default build still boots to shell (`agnsh-smoke` PASS); the `HDA_HDMI` block is gated off in production.
+
 ## [1.53.4] — 2026-07-06 — FP/SIMD arc B5+B6: two-proc XMM preservation + naad DSP in ring 3 (arc QEMU-complete)
 
 Closes the FP/SIMD arc (QEMU). B5 proves the lazy `#NM` machinery preserves each proc's

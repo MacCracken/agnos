@@ -124,8 +124,8 @@ var HDA_VENDOR_INTEL  = 0x8086;   # QEMU -device intel-hda (ICH6)
 var HDA_DEV_INTEL_ICH6 = 0x2668;
 
 # --- Driver state ---
-var hda_present    = 0;
-var hda_pci_idx    = 0 - 1;
+var hda_present[2];           # [per-instance] 1 = controller bound
+var hda_pci_idx[2];           # [per-instance] PCI enumeration index (set by hda_probe)
 # --- Multi-instance selector (HDMI-audio arc, bite 1) ---
 # hda_active_ctl picks the LIVE controller instance; the MMIO accessors + every
 # per-instance `var X[2]` below index by it (`&X + hda_active_ctl*8`, module-global
@@ -137,7 +137,7 @@ var hda_pci_idx    = 0 - 1;
 var HDA_NCTL       = 2;       # controller-instance capacity (analog + HDMI)
 var hda_active_ctl = 0;       # live instance selector; bite 1 never moves it
 var hda_mmio_base[2];         # [per-instance] controller MMIO base — steers every hda_read*/write*
-var hda_codec_mask = 0;       # STATESTS codec-present bitmask (set by hda_reset, B1)
+var hda_codec_mask[2];        # [per-instance] STATESTS codec-present bitmask (set by hda_reset, B1)
 
 # rdtsc cycles per microsecond. The TSC is invariant (fixed base rate, not the
 # boost frequency), so this is ~constant per box; 3000 = 3 GHz matches the
@@ -152,20 +152,20 @@ var hda_rirb_phys[2];         # [per-instance] RIRB ring phys
 var hda_corb_wp[2];           # [per-instance] software CORB write index (0..255)
 var hda_rirb_rp[2];           # [per-instance] software RIRB read index  (0..255)
 var hda_codec0[2];            # [per-instance] first present codec address
-var hda_vendor    = 0;        # codec vendor:device (set by hda_codec_probe)
-var hda_afg       = 0;        # Audio Function Group nid (set by hda_codec_enum)
-var hda_w_start   = 0;        # AFG widget range start
-var hda_w_count   = 0;        # AFG widget count
-var hda_out_pin   = 0;        # selected output pin (set by hda_codec_route)
-var hda_out_dac   = 0;        # DAC feeding the selected pin
-var hda_oss       = 0;        # GCAP output stream count (set by hda_probe)
-var hda_iss       = 0;        # GCAP input stream count (output SDs start after these)
+var hda_vendor[2];            # [per-instance] codec vendor:device (set by hda_codec_probe)
+var hda_afg[2];               # [per-instance] Audio Function Group nid (set by hda_codec_enum)
+var hda_w_start[2];           # [per-instance] AFG widget range start
+var hda_w_count[2];           # [per-instance] AFG widget count
+var hda_out_pin[2];           # [per-instance] selected output pin (set by hda_codec_route)
+var hda_out_dac[2];           # [per-instance] DAC feeding the selected pin
+var hda_oss[2];               # [per-instance] GCAP output stream count (set by hda_probe)
+var hda_iss[2];               # [per-instance] GCAP input stream count (output SDs start after these)
 var hda_bdl_phys  = 0;        # BDL ring phys
 var hda_pcm_phys  = 0;        # WC PCM ring phys
 var hda_sd_base[2];           # [per-instance] output stream descriptor register base offset
 var hda_stream_tag = 1;       # stream tag binding DAC <-> stream
-var hda_path_n    = 0;        # node count in the pin->DAC signal path (excl DAC)
-var hda_path[8];              # path node ids, pin-first (module scope: 8xu64)
+var hda_path_n[2];            # [per-instance] node count in the pin->DAC signal path (excl DAC)
+var hda_path[16];             # [per-instance] path node ids (2 instances x 8 nodes); node k of instance ci at &hda_path + (ci*8 + k)*8
 # --- B5: streamed PCM double-buffer refill (roadmap 1.52.6) ---
 var hda_stream_on[2];         # [per-instance] 1 = the 100 Hz timer-tick refill servicer is active
 var hda_pcm_va[2];            # [per-instance] cached CPU VA of the WC PCM ring (for refill writes)
@@ -242,19 +242,46 @@ fn hda_udelay(us) {
     return 0;
 }
 
+# Find an HD-Audio-class controller (0x04/0x03/0x00) whose PCI index != skip_idx.
+# Instance 0 binds one HDA controller by exact ID; this finds the NEXT same-class
+# controller for instance 1 = archaemenid's HDMI/DP function (04:00.1) or a 2nd
+# QEMU -device intel-hda. All AMD/Intel HDA functions share class 04:03:00, so the
+# discriminator is "not the already-bound index", not a device ID.
+fn hda_find_next_controller(skip_idx) {
+    var want = (0x04 << 16) | (0x03 << 8) | 0x00;
+    var i = 0;
+    while (i < pci_count) {
+        if (i != skip_idx) {
+            if (load64(&pci_class + i * 8) == want) { return i; }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
 # === B0 — Probe (roadmap 1.52.0) ==============================================
 # Locate the controller, map BAR0 UC, enable bus-master, read GCAP + version.
 # Read-only, lowest-risk bite. Returns 1 on success, 0 if absent/unusable.
 # Success gate: OSS >= 1, version 1.0. QEMU (-device intel-hda) resets
 # GCAP=0x4401 -> OSS=4 ISS=4 64OK=1.
 fn hda_probe() {
-    # Prefer exact vendor:device (archaemenid, then QEMU), fall back to the
-    # generic HDA class (0x04 multimedia / 0x03 audio / 0x00) for other boards.
-    var idx = pci_find(HDA_VENDOR_AMD, HDA_DEV_AMD_15E3);
-    if (idx < 0) { idx = pci_find(HDA_VENDOR_INTEL, HDA_DEV_INTEL_ICH6); }
-    if (idx < 0) { idx = pci_find_by_class(0x04, 0x03, 0x00); }
+    var idx = 0 - 1;
+    if (hda_active_ctl == 0) {
+        # instance 0 = the analog controller: prefer exact vendor:device
+        # (archaemenid 04:00.6, then QEMU ICH6), fall back to the generic HDA
+        # class (0x04 multimedia / 0x03 audio / 0x00) for other boards.
+        idx = pci_find(HDA_VENDOR_AMD, HDA_DEV_AMD_15E3);
+        if (idx < 0) { idx = pci_find(HDA_VENDOR_INTEL, HDA_DEV_INTEL_ICH6); }
+        if (idx < 0) { idx = pci_find_by_class(0x04, 0x03, 0x00); }
+    } else {
+        # instance 1 = HDMI/DP (04:00.1) or a 2nd QEMU intel-hda: the first
+        # HDA-class controller that ISN'T instance 0's bound function.
+        idx = hda_find_next_controller(load64(&hda_pci_idx + 0 * 8));
+    }
     if (idx < 0) {
-        kprintln("hda: no controller found", 24);
+        # Silent for instance 1 (a single-HDA box legitimately has no 2nd
+        # controller); only the analog instance's absence is worth a line.
+        if (hda_active_ctl == 0) { kprintln("hda: no controller found", 24); }
         return 0;
     }
 
@@ -268,8 +295,8 @@ fn hda_probe() {
     # CORB/RIRB/BDL are all bus-master DMA — mandatory, silent without it.
     pci_enable_bus_master_idx(idx);
 
-    hda_present   = 1;
-    hda_pci_idx   = idx;
+    store64(&hda_present + hda_active_ctl * 8, 1);
+    store64(&hda_pci_idx + hda_active_ctl * 8, idx);
     store64(&hda_mmio_base + hda_active_ctl * 8, bar);
 
     # Register file is uncacheable.
@@ -278,8 +305,8 @@ fn hda_probe() {
     var gcap = hda_read16(HDA_GCAP);
     var oss  = (gcap >> 12) & 0xF;    # output stream count
     var iss  = (gcap >> 8) & 0xF;     # input stream count
-    hda_oss  = oss;
-    hda_iss  = iss;
+    store64(&hda_oss + hda_active_ctl * 8, oss);
+    store64(&hda_iss + hda_active_ctl * 8, iss);
     var vmaj = hda_read8(HDA_VMAJ);
     var vmin = hda_read8(HDA_VMIN);
 
@@ -309,7 +336,7 @@ fn hda_probe() {
 # responded (settle/timing suspect), -1 on stuck-CRST or an all-ones (link-down)
 # read. QEMU sets STATESTS bit0 instantly; the settle-timing is iron-only.
 fn hda_reset() {
-    if (hda_present == 0) { return 0; }
+    if (load64(&hda_present + hda_active_ctl * 8) == 0) { return 0; }
 
     # If the controller is already running, clear stale codec-status bits
     # BEFORE reset (never write STATESTS while in reset — LKML erratum).
@@ -363,11 +390,11 @@ fn hda_reset() {
     # All 15 bits set = floating / failed read (link down), not 15 real codecs.
     if (sts == STATESTS_MASK) {
         kprintln("hda: reset WARN codecs=0x7FFF (link down?)", 42);
-        hda_codec_mask = 0;
+        store64(&hda_codec_mask + hda_active_ctl * 8, 0);
         return 0 - 1;
     }
 
-    hda_codec_mask = sts;
+    store64(&hda_codec_mask + hda_active_ctl * 8, sts);
     kprint("hda: reset OK, codecs=0x", 24);
     kprint_byte((sts >> 8) & 0xFF);
     kprint_byte(sts & 0xFF);
@@ -480,12 +507,12 @@ fn hda_verb(codec, nid, verb20) {
 
 # B2a top-level: init the ring, read the first codec's VENDOR_ID + NODECOUNT.
 fn hda_codec_probe() {
-    if (hda_present == 0) { return 0; }
-    if (hda_codec_mask == 0) { return 0; }
+    if (load64(&hda_present + hda_active_ctl * 8) == 0) { return 0; }
+    if (load64(&hda_codec_mask + hda_active_ctl * 8) == 0) { return 0; }
     # first present codec = lowest set bit in the STATESTS mask.
     var codec = 0;
     while (codec < 15) {
-        if ((hda_codec_mask & (1 << codec)) != 0) { break; }
+        if ((load64(&hda_codec_mask + hda_active_ctl * 8) & (1 << codec)) != 0) { break; }
         codec = codec + 1;
     }
     store64(&hda_codec0 + hda_active_ctl * 8, codec);
@@ -496,7 +523,7 @@ fn hda_codec_probe() {
         kprintln("hda: WARN codec verb round-trip failed", 38);
         return 0;
     }
-    hda_vendor = vid & 0xFFFFFFFF;
+    store64(&hda_vendor + hda_active_ctl * 8, vid & 0xFFFFFFFF);
     var nodes  = hda_verb(codec, 0, (V_GET_PARAM << 8) | P_NODECOUNT);
     var ncount = nodes & 0xFF;                 # total subordinate node count
 
@@ -518,8 +545,8 @@ fn hda_codec_probe() {
 # front jack (HP-Out dev=0x2 vs Line-Out dev=0x0 @ Front) before B2b-2 freezes
 # routing. Pin-select + DAC-trace + power/unmute/EAPD/COEF is B2b-2 (iron-gated).
 fn hda_codec_enum() {
-    if (hda_present == 0) { return 0; }
-    if (hda_codec_mask == 0) { return 0; }
+    if (load64(&hda_present + hda_active_ctl * 8) == 0) { return 0; }
+    if (load64(&hda_codec_mask + hda_active_ctl * 8) == 0) { return 0; }
     var codec = load64(&hda_codec0 + hda_active_ctl * 8);
 
     # root node 0 → function-group list.
@@ -545,9 +572,9 @@ fn hda_codec_enum() {
     var anc = hda_verb(codec, afg, (V_GET_PARAM << 8) | P_NODECOUNT);
     var w_start = (anc >> 16) & 0xFF;
     var w_count = anc & 0xFF;
-    hda_afg = afg;
-    hda_w_start = w_start;
-    hda_w_count = w_count;
+    store64(&hda_afg + hda_active_ctl * 8, afg);
+    store64(&hda_w_start + hda_active_ctl * 8, w_start);
+    store64(&hda_w_count + hda_active_ctl * 8, w_count);
 
     var ndac = 0;
     var npin = 0;
@@ -648,8 +675,8 @@ fn hda_unmute_in(codec, nid, idx) {
 # (PINCAP-gated) -> unmute + ~75% gain on DAC & pin amps. QEMU exercises the
 # machinery on its trivial codec; the ALC897 amp/EAPD/COEF effects are iron-only.
 fn hda_codec_route() {
-    if (hda_present == 0 || hda_codec_mask == 0) { return 0; }
-    if (hda_afg == 0 || hda_w_count == 0) { return 0; }
+    if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_codec_mask + hda_active_ctl * 8) == 0) { return 0; }
+    if (load64(&hda_afg + hda_active_ctl * 8) == 0 || load64(&hda_w_count + hda_active_ctl * 8) == 0) { return 0; }
     var codec = load64(&hda_codec0 + hda_active_ctl * 8);
 
     # --- select output pin (scored; no hardcoded nid) ---
@@ -657,8 +684,8 @@ fn hda_codec_route() {
     var best_dev = 0;
     var best_score = 0 - 1;
     var wi = 0;
-    while (wi < hda_w_count) {
-        var nid = hda_w_start + wi;
+    while (wi < load64(&hda_w_count + hda_active_ctl * 8)) {
+        var nid = load64(&hda_w_start + hda_active_ctl * 8) + wi;
         var wcap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_WCAP);
         if (((wcap >> 20) & 0xF) == WID_PIN) {
             var pincap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_PINCAP);
@@ -697,7 +724,7 @@ fn hda_codec_route() {
         kprintln("hda: no output pin", 18);
         return 0;
     }
-    hda_out_pin = best_pin;
+    store64(&hda_out_pin + hda_active_ctl * 8, best_pin);
 
     # --- trace the DAC feeding the pin + RECORD the path (pin-first) so the enable
     #     pass can power + unmute every intermediate mixer/selector, not just the
@@ -705,7 +732,7 @@ fn hda_codec_route() {
     var node = best_pin;
     var dac = 0;
     var hops = 0;
-    hda_path_n = 0;
+    store64(&hda_path_n + hda_active_ctl * 8, 0);
     while (hops < 8) {
         var clen = hda_verb(codec, node, (V_GET_PARAM << 8) | P_CONNLEN) & 0x7F;
         if (clen == 0) { break; }
@@ -714,9 +741,9 @@ fn hda_codec_route() {
         var lw = hda_verb(codec, node, (V_GET_CONNLIST << 8) | (sel & 0xFC));
         var entry = (lw >> ((sel & 0x3) * 8)) & 0xFF;
         if (entry == 0) { break; }
-        if (hda_path_n < 8) {
-            store64(&hda_path + hda_path_n * 8, node);
-            hda_path_n = hda_path_n + 1;
+        if (load64(&hda_path_n + hda_active_ctl * 8) < 8) {
+            store64(&hda_path + (hda_active_ctl * 8 + load64(&hda_path_n + hda_active_ctl * 8)) * 8, node);
+            store64(&hda_path_n + hda_active_ctl * 8, load64(&hda_path_n + hda_active_ctl * 8) + 1);
         }
         var ew = hda_verb(codec, entry, (V_GET_PARAM << 8) | P_WCAP);
         if (((ew >> 20) & 0xF) == WID_DAC) { dac = entry; break; }
@@ -727,24 +754,24 @@ fn hda_codec_route() {
         kprintln("hda: no DAC for pin", 19);
         return 0;
     }
-    hda_out_dac = dac;
+    store64(&hda_out_dac + hda_active_ctl * 8, dac);
 
     # --- output-enable sequence ---
     # 1. Realtek COEF init (ALC897 puts EAPD under verb control): clear bit5 of
     #    COEF index 0x7 on the vendor widget. Vendor-gated — QEMU's non-Realtek
     #    codec skips it; omitting it on a real ALC897 is a known no-output cause.
-    if (((hda_vendor >> 16) & 0xFFFF) == 0x10EC) {
+    if (((load64(&hda_vendor + hda_active_ctl * 8) >> 16) & 0xFFFF) == 0x10EC) {
         hda_verb(codec, NID_ALC_COEF, (V_SET_COEF_IDX << 16) | 0x0007);
         var cf = hda_verb(codec, NID_ALC_COEF, (V_GET_PROC_COEF << 8) | 0);
         hda_verb(codec, NID_ALC_COEF, (V_SET_COEF_IDX << 16) | 0x0007);
         hda_verb(codec, NID_ALC_COEF, (V_SET_PROC_COEF << 16) | (cf & COEF_CLR_BIT5 & 0xFFFF));
     }
     # 2. Power up AFG, DAC, every intermediate path node, and the pin to D0.
-    hda_verb(codec, hda_afg, (V_SET_POWER << 8) | 0x00);
+    hda_verb(codec, load64(&hda_afg + hda_active_ctl * 8), (V_SET_POWER << 8) | 0x00);
     hda_verb(codec, dac,     (V_SET_POWER << 8) | 0x00);
     var pk = 0;
-    while (pk < hda_path_n) {
-        hda_verb(codec, load64(&hda_path + pk * 8), (V_SET_POWER << 8) | 0x00);
+    while (pk < load64(&hda_path_n + hda_active_ctl * 8)) {
+        hda_verb(codec, load64(&hda_path + (hda_active_ctl * 8 + pk) * 8), (V_SET_POWER << 8) | 0x00);
         pk = pk + 1;
     }
     hda_verb(codec, best_pin, (V_SET_POWER << 8) | 0x00);
@@ -760,13 +787,13 @@ fn hda_codec_route() {
     #    while every upstream stage read correct + DMA advanced. Broadcast is
     #    monotone (EAPD to a pin without the amp is inert) and nid-agnostic.
     var ei = 0;
-    while (ei < hda_w_count) {
-        var enid = hda_w_start + ei;
+    while (ei < load64(&hda_w_count + hda_active_ctl * 8)) {
+        var enid = load64(&hda_w_start + hda_active_ctl * 8) + ei;
         var ewc = hda_verb(codec, enid, (V_GET_PARAM << 8) | P_WCAP);
         if (((ewc >> 20) & 0xF) == WID_PIN) {
             var epc = hda_verb(codec, enid, (V_GET_PARAM << 8) | P_PINCAP);
             if ((epc & PINCAP_OUT) != 0) {
-                if (((hda_vendor >> 16) & 0xFFFF) == 0x10EC) {
+                if (((load64(&hda_vendor + hda_active_ctl * 8) >> 16) & 0xFFFF) == 0x10EC) {
                     hda_verb(codec, enid, (V_SET_EAPD << 8) | EAPD_ENABLE);
                 } else {
                     if ((epc & PINCAP_EAPD) != 0) {
@@ -792,8 +819,8 @@ fn hda_codec_route() {
     # (LPIB advanced, jack silent). QEMU's path is direct (n=1) so this loop is inert
     # there; a real ALC897 mixer node is exactly what it lights.
     pk = 1;
-    while (pk < hda_path_n) {
-        var pn = load64(&hda_path + pk * 8);
+    while (pk < load64(&hda_path_n + hda_active_ctl * 8)) {
+        var pn = load64(&hda_path + (hda_active_ctl * 8 + pk) * 8);
         # ROOT-CAUSE FIX (4-source convergent): a summing Audio-Mixer sums ALL its
         # inputs and has NO Connection-Select, so GET_CONNSEL (the old single index)
         # is meaningless — the input carrying the DAC sits at an a-priori-unknown
@@ -819,7 +846,7 @@ fn hda_codec_route() {
     kprint(" dev=", 5);
     kprint_num(best_dev);
     kprint(" path=", 6);
-    kprint_num(hda_path_n);
+    kprint_num(load64(&hda_path_n + hda_active_ctl * 8));
     kprintln("", 0);
     kprintln("hda: output path enabled", 24);
     return 1;
@@ -960,7 +987,7 @@ fn snd_release_pid(pid) {
 # the smoke's WAV capture. Runs at boot as proc 0 (proc_current_get()==0 = the owner).
 var snd_tone_buf[64];         # 512 B = 128 frames (one 375 Hz period), module scope
 fn hda_snd_selftest() {
-    if (hda_present == 0 || hda_out_dac == 0) { kprintln("snd: selftest FAIL", 18); return 0; }
+    if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_out_dac + hda_active_ctl * 8) == 0) { kprintln("snd: selftest FAIL", 18); return 0; }
     var slot = ksyscall(64, 0, 0, 0);                                # snd_open -> slot
     var c48  = ksyscall(65, slot, 48000, 0x1002);                    # config OK -> 0
     var c44  = ksyscall(65, slot, 44100, 0x1002);                    # bad rate -> -1
@@ -1003,10 +1030,10 @@ fn hda_snd_selftest() {
 # codec SET_STREAM_FMT must MATCH or the stream faults), then set RUN. Gate:
 # SD_LPIB advances (DMA fetching). Silence for now; B4 fills a sine (first tone).
 fn hda_stream_arm() {
-    if (hda_present == 0 || hda_out_dac == 0) { return 0; }
-    if (hda_oss == 0) { kprintln("hda: OSS=0, no output stream", 28); return 0; }
+    if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_out_dac + hda_active_ctl * 8) == 0) { return 0; }
+    if (load64(&hda_oss + hda_active_ctl * 8) == 0) { kprintln("hda: OSS=0, no output stream", 28); return 0; }
     snd_active_slot = 0 - 1;   # Gate-2: -1 sentinel (declarative module-init doesn't take; init at runtime)
-    var sd = HDA_SD_BASE + hda_iss * HDA_SD_STRIDE;   # output SDs follow ISS inputs
+    var sd = HDA_SD_BASE + load64(&hda_iss + hda_active_ctl * 8) * HDA_SD_STRIDE;   # output SDs follow ISS inputs
     store64(&hda_sd_base + hda_active_ctl * 8, sd);
 
     # BDL: one WB page (128-byte-aligned — a page satisfies it).
@@ -1093,8 +1120,8 @@ fn hda_stream_arm() {
     var fifos = hda_read16(sd + SD_FIFOS);
 
     # Codec side: identical format + stream/channel on the DAC (must match SDnFMT).
-    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), hda_out_dac, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
-    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), hda_out_dac, (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
+    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), load64(&hda_out_dac + hda_active_ctl * 8), (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
+    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), load64(&hda_out_dac + hda_active_ctl * 8), (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
 
     # RUN.
     hda_write32(sd + SD_CTL, (hda_stream_tag << SD_TAG_SHIFT) | SD_RUN);
