@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.5] — 2026-07-06 — HDMI-audio arc bites 1–3: multi-instance HDA driver + 2nd-controller probe + HDMI/DP route (QEMU-complete; digital arm iron-gated)
+
+Makes the HD-Audio driver multi-instance and adds an HDMI/DP output path as a second controller
+instance. Bites 1–2 (instance-aware refactor + `04:00.1` probe/enumerate) are QEMU-validated end to
+end (`hda-dual-smoke`); bite 3 (the HDMI codec route) is QEMU-validated via the analog fallback, with
+the digital arm (`digi=1`, Set Digital Converter DigEn) iron-gated on a connected HDMI/DP display.
+Bite 4 (runtime analog↔HDMI sink-select) is deferred. Gated behind `HDA_HDMI` so the default/MVP
+kernel stays single-controller. Analog path byte-unchanged (`hda-tone` RMS=5131.3).
+
 ### HDMI-audio arc — bite 1: HDA driver made instance-aware (behavior-identical refactor)
 
 Opens the HDMI-audio arc (a second HD-Audio controller instance = archaemenid PCI
@@ -78,6 +87,45 @@ with two `-device intel-hda`; archaemenid's real HDMI/DP codec route is bite 3 (
   binds the *second* controller and enumerates independently (`hda: ctl1 bound codecs=0x0001 afg=0x01`),
   proving `find_next_controller` skip-bound + per-instance state isolation. Registered in `sweep.sh`.
 - Default build still boots to shell (`agnsh-smoke` PASS); the `HDA_HDMI` block is gated off in production.
+
+### HDMI-audio arc — bite 3: HDMI/DP codec route + stream (digital branch; iron-gated)
+
+Bite 3 makes instance 1's route+stream work for a real HDMI/DP codec — the digital delta from
+the analog path, derived from the HDA 1.0a spec + Linux patch_hdmi via an adversarial 2-derivation
++ reconcile design pass. QEMU-validated as far as possible (analog fallback on the 2nd intel-hda);
+the digital arm is IRON-ONLY (a real HDMI/DP codec with ELD/hotplug + a connected display).
+
+### Changed — `kernel/core/hda.cyr` + `kernel/core/main.cyr`
+- **Unified `hda_codec_route`** (not a separate `_hdmi` fn — keeps ~90% shared, gives QEMU coverage,
+  avoids Cyrius dup-fn shadowing): the pin-scorer now accepts DIGITAL output pins (PINCAP HDMI bit7 /
+  DP bit24 — hardware ground truth — OR CONFIG default_device SPDIF `0x4` / Digital-Other-Out `0x5`,
+  the BIOS label, OR'd), stores a per-instance `hda_out_digital[2]` flag, and branches ONLY the small
+  enable-delta on it: a digital pin gets `PINCTL=OUT_EN` (no HP-drive), then Set Digital Converter
+  `0x70D` DigEn + Set Converter Channel Count `0x72D` stereo — WCAP-digital-gated (`0x200`) so a
+  mis-traced non-converter can't get a spurious DigEn. The Realtek COEF/EAPD/amp steps stay
+  vendor/WCAP-gated and no-op on HDMI; the analog branch is byte-unchanged.
+- **New constants** (HDA 1.0a / hda_verbs.h): `PINCAP_HDMI`/`PINCAP_DP`, `DEV_SPDIF_OUT`/
+  `DEV_DIG_OTHER_OUT`, `V_SET_DIGI_CVT1`/`DIGEN`, `V_SET_CVT_CHANS`/`CVT_CHANS_STEREO`, `WCAP_DIGITAL`.
+  The route print gained a `digi=N` field (the branch observable).
+- **`hda_stream_arm` unchanged** — `hda_out_dac[ci]` IS the digital converter (WID_DAC-classified) and
+  the 48k/16/2 converter format is identical for HDMI LPCM.
+- **`main.cyr` `HDA_HDMI` block** now runs `hda_codec_route()` + `hda_stream_arm()` on instance 1 (inside
+  the `hda_active_ctl=1` window), then restores `hda_active_ctl=0`. Instance-1's armed stream keeps
+  running on its own controller; making HDMI the live *refill* target is bite 4.
+
+### What bite 3 proves (QEMU) + the iron gate
+- Analog path byte-identical: `hda-tone` RMS=5131.3, `hda-smoke` route `dev=0 digi=0`, `agnsh-smoke`
+  boot — all unchanged. **`hda-dual-smoke` PASS** (extended): instance 1 routes+stream-arms via the
+  analog branch (`digi=0`; both instances `output path enabled` + `stream running`), proving the shared
+  select/trace/power/stream machinery on instance 1 and that the `is_digital` classifier handles analog
+  codecs correctly. The DIGITAL branch (`digi=1`, DigEn/chan-count on a real HDMI converter) is iron-only.
+- **Iron rubric**: burn an `HDA_HDMI=1 HDA_TONE=1` kernel via `install-media.sh --update-all` to archaemenid
+  with an HDMI/DP display (speakers/AVR) on a firmware-LIT port. Serial confirms: `route ... dev=5 ... digi=1`
+  + `hda: hdmi DigEn set cvt=0x..` + `stream running`. Acceptance = the sweep whoop AUDIBLE from the DISPLAY's
+  speakers (analog front-jack sweep also plays = no analog regression). **Known limitation**: agnos has no
+  amdgpu, so a DARK port won't egress audio even with correct verbs (LPIB still advances) — test a BIOS-lit
+  port; strict-sink audio-infoframe + ELD are deferred fast-follows. Highest-risk failure = GPU/display-audio
+  coupling (right code, silent on a dark port), distinguishable in the log from a code bug.
 
 ## [1.53.4] — 2026-07-06 — FP/SIMD arc B5+B6: two-proc XMM preservation + naad DSP in ring 3 (arc QEMU-complete)
 

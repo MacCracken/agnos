@@ -656,18 +656,22 @@ hda_stream_arm();
 hda_snd_selftest();
 #endif
 #ifdef HDA_HDMI
-# HDMI-audio arc bite 2b — probe + enumerate a SECOND HD-Audio controller as
-# instance 1 (archaemenid PCI 04:00.1 HDMI/DP, or a 2nd QEMU -device intel-hda).
-# Instance 0 (analog) stays the default active sink; instance 1 is ENUMERATED only
-# (route + stream = bite 3/4, HDMI-codec-specific + iron-gated). Gated so the
-# default production/MVP kernel stays single-controller until the HDMI path is
-# iron-proven. hda_active_ctl is restored to 0 before the box goes live.
+# HDMI-audio arc bites 2b+3 — probe, enumerate, ROUTE, and arm a stream on a SECOND
+# HD-Audio controller as instance 1 (archaemenid PCI 04:00.1 HDMI/DP, or a 2nd QEMU
+# -device intel-hda). Instance 0 (analog) stays the default active sink; instance 1
+# gets the unified route (digital branch for a real HDMI codec; analog branch for
+# QEMU's 2nd intel-hda) + hda_stream_arm. Gated so the default/MVP kernel stays
+# single-controller until the HDMI path is iron-proven. hda_active_ctl is restored
+# to 0 before the box goes live (instance-1's armed stream keeps running on its own
+# controller; a sink-select to make HDMI the live refill target is bite 4).
 hda_active_ctl = 1;
 kprintln("hda: ctl1 probing 2nd controller (HDMI/DP)", 42);
 if (hda_probe() != 0) {
     hda_reset();
     hda_codec_probe();
     hda_codec_enum();
+    hda_codec_route();
+    hda_stream_arm();
     kprint("hda: ctl1 bound codecs=0x", 25);
     kprint_byte((load64(&hda_codec_mask + 1 * 8) >> 8) & 0xFF);
     kprint_byte(load64(&hda_codec_mask + 1 * 8) & 0xFF);

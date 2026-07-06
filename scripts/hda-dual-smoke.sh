@@ -117,6 +117,24 @@ else
     rc=1
 fi
 
+# Bite 3 — instance 1 was ROUTED + STREAM-ARMED. In QEMU the 2nd intel-hda is an
+# ANALOG codec, so the unified route takes the ANALOG branch (digi=0, no DigEn) — this
+# covers the shared select/trace/power/stream machinery on instance 1; the DIGITAL
+# branch itself is iron-only (a real HDMI/DP codec).
+ROUTES="$(grep -ac "hda: output path enabled" "$SER" 2>/dev/null)"
+STREAMS="$(grep -ac "hda: stream running (LPIB advancing)" "$SER" 2>/dev/null)"
+if [ "${ROUTES:-0}" -ge 2 ] && [ "${STREAMS:-0}" -ge 2 ]; then
+    echo "  PASS: both instances routed ($ROUTES) + stream-armed ($STREAMS) — instance-1 route/stream ran (bite 3)"
+else
+    echo "  FAIL: instance 1 route/stream missing (routes=$ROUTES streams=$STREAMS, expect >=2 each)"; rc=1
+fi
+# Analog fallback: QEMU has no HDMI codec, so NO route should take the digital branch.
+if grep -aq "digi=1" "$SER" 2>/dev/null; then
+    echo "  FAIL: a route took the DIGITAL branch (digi=1) — unexpected on QEMU's analog codecs"; rc=1
+else
+    echo "  PASS: all routes digi=0 (analog branch) — the is_digital classifier handled QEMU's codecs correctly"
+fi
+
 echo "  --- hda lines from serial ---"
 grep -a -iE "^hda:" "$SER" 2>/dev/null | sed 's/^/    /'
 echo "  full serial: $SER"

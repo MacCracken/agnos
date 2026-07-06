@@ -113,6 +113,21 @@ var BDL_IOC       = 0x1;      # BDL entry flags bit0: interrupt-on-completion
 var V_SET_STREAM_FMT = 0x2;   # 4-bit verb: Set Converter Format
 var V_SET_STREAMID   = 0x706; # 12-bit verb: Set Converter Stream/Channel
 
+# --- HDMI/DP digital output (bite 3) ---
+# The digital delta from the analog path: a digital pin (PINCAP HDMI/DP) fed by a
+# digital Audio-Output converter, enabled via Set Digital Converter (DigEn) — NO
+# analog amp/EAPD/COEF (vendor/WCAP-gated, naturally skipped on HDMI). Constants per
+# the HDA 1.0a spec + Linux patch_hdmi (hda_verbs.h).
+var PINCAP_HDMI       = 0x80;       # PINCAP bit7  — pin is HDMI-capable
+var PINCAP_DP         = 0x1000000;  # PINCAP bit24 — pin is DisplayPort-capable
+var DEV_SPDIF_OUT     = 0x4;        # CONFIG_DEFAULT default_device: SPDIF-Out (digital)
+var DEV_DIG_OTHER_OUT = 0x5;        # CONFIG_DEFAULT default_device: Digital-Other-Out (HDMI/DP)
+var V_SET_DIGI_CVT1   = 0x70D;      # Set Digital Converter Control 1 (8-bit payload; DigEn)
+var DIGEN             = 0x01;       # DIGI_CVT1 bit0: Digital Enable
+var V_SET_CVT_CHANS   = 0x72D;      # Set Converter Channel Count (payload = channels-1)
+var CVT_CHANS_STEREO  = 0x01;       # channels-1 for 2ch (stereo)
+var WCAP_DIGITAL      = 0x200;      # WCAP bit9: node is a digital widget (converter assert-gate)
+
 # --- Known controller PCI identities (B0 probe order) ---
 # Exact IDs disambiguate the analog HDA controller from the same-class
 # HDMI-audio (04:00.1) / ACP-DSP (04:00.5) functions on archaemenid, and
@@ -158,6 +173,7 @@ var hda_w_start[2];           # [per-instance] AFG widget range start
 var hda_w_count[2];           # [per-instance] AFG widget count
 var hda_out_pin[2];           # [per-instance] selected output pin (set by hda_codec_route)
 var hda_out_dac[2];           # [per-instance] DAC feeding the selected pin
+var hda_out_digital[2];       # [per-instance] 1 = selected pin/converter is HDMI/DP digital (bite 3)
 var hda_oss[2];               # [per-instance] GCAP output stream count (set by hda_probe)
 var hda_iss[2];               # [per-instance] GCAP input stream count (output SDs start after these)
 var hda_bdl_phys  = 0;        # BDL ring phys
@@ -682,6 +698,7 @@ fn hda_codec_route() {
     # --- select output pin (scored; no hardcoded nid) ---
     var best_pin = 0;
     var best_dev = 0;
+    var best_is_digi = 0;
     var best_score = 0 - 1;
     var wi = 0;
     while (wi < load64(&hda_w_count + hda_active_ctl * 8)) {
@@ -694,8 +711,12 @@ fn hda_codec_route() {
                 var ddev  = (cfg >> 20) & 0xF;
                 var pconn = (cfg >> 30) & 0x3;
                 var loc   = (cfg >> 24) & 0x3F;
-                # candidate: HP-Out or Line-Out with a connector present (not NONE).
-                if ((ddev == DEV_HPOUT || ddev == DEV_LINEOUT) && pconn != 1) {
+                # A pin is a DIGITAL (HDMI/DP) output if PINCAP advertises HDMI/DP
+                # (hardware ground truth) OR the CONFIG default_device is digital
+                # (SPDIF/Digital-Other-Out — the BIOS label; can be stale, so OR them).
+                var is_digi = ((pincap & (PINCAP_HDMI | PINCAP_DP)) != 0) || (ddev == DEV_SPDIF_OUT || ddev == DEV_DIG_OTHER_OUT);
+                # candidate: analog HP-Out/Line-Out OR a digital pin, connector present.
+                if ((ddev == DEV_HPOUT || ddev == DEV_LINEOUT || is_digi) && pconn != 1) {
                     var score = 10;
                     if (ddev == DEV_HPOUT) { score = score + 4; }
                     if ((loc & 0xF) == LOC_FRONT) { score = score + 4; }
@@ -714,6 +735,7 @@ fn hda_codec_route() {
                         best_score = score;
                         best_pin = nid;
                         best_dev = ddev;
+                        best_is_digi = is_digi;
                     }
                 }
             }
@@ -725,6 +747,7 @@ fn hda_codec_route() {
         return 0;
     }
     store64(&hda_out_pin + hda_active_ctl * 8, best_pin);
+    store64(&hda_out_digital + hda_active_ctl * 8, best_is_digi);
 
     # --- trace the DAC feeding the pin + RECORD the path (pin-first) so the enable
     #     pass can power + unmute every intermediate mixer/selector, not just the
@@ -775,8 +798,28 @@ fn hda_codec_route() {
         pk = pk + 1;
     }
     hda_verb(codec, best_pin, (V_SET_POWER << 8) | 0x00);
-    # 3. Pin control: output enable + headphone drive.
-    hda_verb(codec, best_pin, (V_SET_PINCTL << 8) | (PINCTL_OUT_EN | PINCTL_HP_EN));
+    # 3. Pin control: output enable. Analog pins also get headphone-drive; a DIGITAL
+    #    (HDMI/DP) pin gets OUT_EN only (HP-drive is meaningless/rejected on it).
+    var is_dig = load64(&hda_out_digital + hda_active_ctl * 8);
+    if (is_dig != 0) {
+        hda_verb(codec, best_pin, (V_SET_PINCTL << 8) | PINCTL_OUT_EN);
+        # 3b. Digital converter enable (HDMI/DP only): open the digital output stream
+        #     on the converter (DigEn) + set the channel count to stereo. WCAP-digital-
+        #     gated so a DAC-trace that landed on a non-converter can't get a spurious
+        #     DigEn (the HDMI Audio-Output converter reports WCAP bit9 set).
+        var dwc = hda_verb(codec, dac, (V_GET_PARAM << 8) | P_WCAP);
+        if ((dwc & WCAP_DIGITAL) != 0) {
+            hda_verb(codec, dac, (V_SET_DIGI_CVT1 << 8) | DIGEN);
+            hda_verb(codec, dac, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
+            #ifdef HDA_TONE
+            kprint("hda: hdmi DigEn set cvt=0x", 26);
+            kprint_byte(dac);
+            kprintln("", 0);
+            #endif
+        }
+    } else {
+        hda_verb(codec, best_pin, (V_SET_PINCTL << 8) | (PINCTL_OUT_EN | PINCTL_HP_EN));
+    }
     # 4. EAPD — assert on EVERY output-capable pin, not just the selected HP pin.
     #    Linux's alc_auto_setup_eapd (ALC897 == patch_alc662 path) drives EAPD
     #    (verb 0x70C=2) on the fixed output-pin set {0x0f,0x10,0x14,0x15,0x17} and
@@ -847,6 +890,8 @@ fn hda_codec_route() {
     kprint_num(best_dev);
     kprint(" path=", 6);
     kprint_num(load64(&hda_path_n + hda_active_ctl * 8));
+    kprint(" digi=", 6);
+    kprint_num(is_dig);
     kprintln("", 0);
     kprintln("hda: output path enabled", 24);
     return 1;
