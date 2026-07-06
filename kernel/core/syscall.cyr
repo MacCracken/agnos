@@ -2178,10 +2178,11 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var so_s = 0; var so_got = 0 - 1;
         while (so_s < 4) { if (load64(&snd_slot_used + so_s * 8) == 0) { so_got = so_s; break; } so_s = so_s + 1; }
         if (so_got == (0 - 1)) { stack_canary_check(canary); return 0 - 1; }
-        hda_stream_on = 0;                              # disable HDA_TONE tone-gen: snd_write is sole writer
+        store64(&hda_stream_on + hda_active_ctl * 8, 0);   # disable HDA_TONE tone-gen: snd_write is sole writer
         var so_zi = 0;
-        while (so_zi < 8192) { store64(hda_pcm_va + so_zi * 8, 0); so_zi = so_zi + 1; }   # cold-start silence (64 KB)
-        var so_raw = hda_read32(hda_sd_base + SD_LPIB) & 0xFFFF;
+        var so_pva = load64(&hda_pcm_va + hda_active_ctl * 8);
+        while (so_zi < 8192) { store64(so_pva + so_zi * 8, 0); so_zi = so_zi + 1; }   # cold-start silence (64 KB)
+        var so_raw = hda_read32(load64(&hda_sd_base + hda_active_ctl * 8) + SD_LPIB) & 0xFFFF;
         snd_last_raw = so_raw; snd_wrap_epochs = 0;
         snd_hw_frames = so_raw / 4;
         snd_appl = snd_hw_frames + 2048;               # start ~43 ms AHEAD of the play head (into zeroed silence)
@@ -2254,7 +2255,8 @@ fn ksyscall(num, arg1, arg2, arg3) {
         store64(&snd_slot_pid + arg1 * 8, 0);
         if (arg1 == snd_active_slot) {
             var sc_zi = 0;
-            while (sc_zi < 8192) { store64(hda_pcm_va + sc_zi * 8, 0); sc_zi = sc_zi + 1; }   # 64 KB ring -> silence
+            var sc_pva = load64(&hda_pcm_va + hda_active_ctl * 8);
+            while (sc_zi < 8192) { store64(sc_pva + sc_zi * 8, 0); sc_zi = sc_zi + 1; }   # 64 KB ring -> silence
             snd_active_slot = 0 - 1;
         }
         stack_canary_check(canary);

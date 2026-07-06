@@ -126,7 +126,17 @@ var HDA_DEV_INTEL_ICH6 = 0x2668;
 # --- Driver state ---
 var hda_present    = 0;
 var hda_pci_idx    = 0 - 1;
-var hda_mmio_base  = 0;
+# --- Multi-instance selector (HDMI-audio arc, bite 1) ---
+# hda_active_ctl picks the LIVE controller instance; the MMIO accessors + every
+# per-instance `var X[2]` below index by it (`&X + hda_active_ctl*8`, module-global
+# => one u64 per instance). Bite 1 pins it to 0 (analog ALC897 @ 04:00.6) so the
+# driver is behavior-identical to the single-instance version; bite 2 probes the
+# HDMI/DP function 04:00.1 as instance 1, and bite 4's sink-select flips it (IF=0,
+# stream quiesced first) to re-target the SINGLE snd_* ring at analog vs HDMI. The
+# snd_* ring counters stay single — only one HW stream ever plays.
+var HDA_NCTL       = 2;       # controller-instance capacity (analog + HDMI)
+var hda_active_ctl = 0;       # live instance selector; bite 1 never moves it
+var hda_mmio_base[2];         # [per-instance] controller MMIO base — steers every hda_read*/write*
 var hda_codec_mask = 0;       # STATESTS codec-present bitmask (set by hda_reset, B1)
 
 # rdtsc cycles per microsecond. The TSC is invariant (fixed base rate, not the
@@ -137,11 +147,11 @@ var hda_codec_mask = 0;       # STATESTS codec-present bitmask (set by hda_reset
 var HDA_TSC_MHZ = 3000;
 
 # --- B2 verb-ring state ---
-var hda_corb_phys = 0;
-var hda_rirb_phys = 0;
-var hda_corb_wp   = 0;        # software CORB write index (0..255)
-var hda_rirb_rp   = 0;        # software RIRB read index  (0..255)
-var hda_codec0    = 0;        # first present codec address
+var hda_corb_phys[2];         # [per-instance] CORB ring phys
+var hda_rirb_phys[2];         # [per-instance] RIRB ring phys
+var hda_corb_wp[2];           # [per-instance] software CORB write index (0..255)
+var hda_rirb_rp[2];           # [per-instance] software RIRB read index  (0..255)
+var hda_codec0[2];            # [per-instance] first present codec address
 var hda_vendor    = 0;        # codec vendor:device (set by hda_codec_probe)
 var hda_afg       = 0;        # Audio Function Group nid (set by hda_codec_enum)
 var hda_w_start   = 0;        # AFG widget range start
@@ -152,15 +162,15 @@ var hda_oss       = 0;        # GCAP output stream count (set by hda_probe)
 var hda_iss       = 0;        # GCAP input stream count (output SDs start after these)
 var hda_bdl_phys  = 0;        # BDL ring phys
 var hda_pcm_phys  = 0;        # WC PCM ring phys
-var hda_sd_base   = 0;        # output stream descriptor register base offset
+var hda_sd_base[2];           # [per-instance] output stream descriptor register base offset
 var hda_stream_tag = 1;       # stream tag binding DAC <-> stream
 var hda_path_n    = 0;        # node count in the pin->DAC signal path (excl DAC)
 var hda_path[8];              # path node ids, pin-first (module scope: 8xu64)
 # --- B5: streamed PCM double-buffer refill (roadmap 1.52.6) ---
-var hda_stream_on = 0;        # 1 = the 100 Hz timer-tick refill servicer is active
-var hda_pcm_va    = 0;        # cached CPU VA of the WC PCM ring (for refill writes)
-var hda_ring_half = 0x8000;   # bytes per BDL half (32 KB) — the double-buffer unit
-var hda_last_half = 0;        # BDL half the DMA was last observed in (0 or 1)
+var hda_stream_on[2];         # [per-instance] 1 = the 100 Hz timer-tick refill servicer is active
+var hda_pcm_va[2];            # [per-instance] cached CPU VA of the WC PCM ring (for refill writes)
+var hda_ring_half[2];         # [per-instance] bytes per BDL half (32 KB); set in hda_stream_arm (was 0x8000 default)
+var hda_last_half[2];         # [per-instance] BDL half the DMA was last observed in (0 or 1)
 var hda_refills   = 0;        # refill count (diagnostic)
 var hda_gen_acc   = 0;        # HDA_TONE sweep NCO phase accumulator (16-bit)
 var hda_gen_inc   = 300;      # HDA_TONE sweep NCO phase increment (~freq), ramps
@@ -187,35 +197,38 @@ var SND_BPF         = 4;      # bytes per frame (S16 stereo) — hard-wired
 # Reads are bare loads; writes carry a readback-flush (added B1).
 
 fn hda_read8(off) {
-    return load8(hda_mmio_base + off);
+    return load8(load64(&hda_mmio_base + hda_active_ctl * 8) + off);
 }
 
 fn hda_read16(off) {
-    return load16(hda_mmio_base + off);
+    return load16(load64(&hda_mmio_base + hda_active_ctl * 8) + off);
 }
 
 fn hda_read32(off) {
-    return load32(hda_mmio_base + off);
+    return load32(load64(&hda_mmio_base + hda_active_ctl * 8) + off);
 }
 
 # Writes carry a readback-flush (load the reg back, discard) to push the store
 # past any posted-write reordering — the nvme_mmio_write32 convention
 # (nvme.cyr:83-91). The UC mapping makes it defensive-redundant; one read/write.
 fn hda_write8(off, val) {
-    store8(hda_mmio_base + off, val);
-    var flush = load8(hda_mmio_base + off);
+    var b = load64(&hda_mmio_base + hda_active_ctl * 8);
+    store8(b + off, val);
+    var flush = load8(b + off);
     return 0;
 }
 
 fn hda_write16(off, val) {
-    store16(hda_mmio_base + off, val);
-    var flush = load16(hda_mmio_base + off);
+    var b = load64(&hda_mmio_base + hda_active_ctl * 8);
+    store16(b + off, val);
+    var flush = load16(b + off);
     return 0;
 }
 
 fn hda_write32(off, val) {
-    store32(hda_mmio_base + off, val);
-    var flush = load32(hda_mmio_base + off);
+    var b = load64(&hda_mmio_base + hda_active_ctl * 8);
+    store32(b + off, val);
+    var flush = load32(b + off);
     return 0;
 }
 
@@ -257,7 +270,7 @@ fn hda_probe() {
 
     hda_present   = 1;
     hda_pci_idx   = idx;
-    hda_mmio_base = bar;
+    store64(&hda_mmio_base + hda_active_ctl * 8, bar);
 
     # Register file is uncacheable.
     vmm_remap_uc_2mb(bar);
@@ -389,8 +402,8 @@ fn hda_ring_init() {
     iommu_register_dma(rirb);
     hda_zero_page(corb);
     hda_zero_page(rirb);
-    hda_corb_phys = corb;
-    hda_rirb_phys = rirb;
+    store64(&hda_corb_phys + hda_active_ctl * 8, corb);
+    store64(&hda_rirb_phys + hda_active_ctl * 8, rirb);
 
     # Stop both rings before reprogramming their bases.
     hda_write8(HDA_CORBCTL, 0);
@@ -415,7 +428,7 @@ fn hda_ring_init() {
         hda_udelay(1);
         i = i + 1;
     }
-    hda_corb_wp = 0;
+    store64(&hda_corb_wp + hda_active_ctl * 8, 0);
     hda_write8(HDA_CORBCTL, CORBCTL_RUN);
 
     # RIRB: base + 256-entry size + WP reset + DMA-enable (no IRQ).
@@ -430,7 +443,7 @@ fn hda_ring_init() {
     # real HW (which doesn't gate corb drain on this).
     hda_write8(HDA_RINTCNT, 0xFF);
     hda_write8(HDA_RIRBCTL, RIRBCTL_DMAEN);   # bit1 only — IRQ bit0 stays 0
-    hda_rirb_rp = 0;
+    store64(&hda_rirb_rp + hda_active_ctl * 8, 0);
     return 1;
 }
 
@@ -438,19 +451,22 @@ fn hda_ring_init() {
 # cmd = (codec<<28)|(nid<<20)|verb20. No phase bit: a response is ready when
 # RIRBWP has advanced past our software rp (manual 256-wrap).
 fn hda_verb(codec, nid, verb20) {
+    var ci = hda_active_ctl;
     var cmd = (codec << 28) | (nid << 20) | (verb20 & 0xFFFFF);
-    hda_corb_wp = (hda_corb_wp + 1) & 0xFF;
-    store32(hda_corb_phys + hda_corb_wp * 4, cmd);
-    hda_write16(HDA_CORBWP, hda_corb_wp);     # doorbell (SQ-tail twin)
+    var wp0 = (load64(&hda_corb_wp + ci * 8) + 1) & 0xFF;
+    store64(&hda_corb_wp + ci * 8, wp0);
+    store32(load64(&hda_corb_phys + ci * 8) + wp0 * 4, cmd);
+    hda_write16(HDA_CORBWP, wp0);             # doorbell (SQ-tail twin)
     # ~100 ms budget: real HW drains the CORB immediately on the doorbell, but
     # QEMU's intel-hda drains it from a periodic timer, so the poll must span a
     # tick. Generous cap keeps consecutive verbs (the B2b graph walk) reliable.
     var i = 0;
     while (i < 100000) {
         var wp = hda_read16(HDA_RIRBWP) & 0xFF;
-        if (wp != hda_rirb_rp) {
-            hda_rirb_rp = (hda_rirb_rp + 1) & 0xFF;
-            var resp = load32(hda_rirb_phys + hda_rirb_rp * 8);   # dword0 = response
+        if (wp != load64(&hda_rirb_rp + ci * 8)) {
+            var rp0 = (load64(&hda_rirb_rp + ci * 8) + 1) & 0xFF;
+            store64(&hda_rirb_rp + ci * 8, rp0);
+            var resp = load32(load64(&hda_rirb_phys + ci * 8) + rp0 * 8);   # dword0 = response
             # ack RINTFL+overrun (W1C) → resets QEMU's rirb_count so corb_run
             # keeps draining the CORB (the RINTCNT gate, see hda_ring_init).
             hda_write8(HDA_RIRBSTS, 0x5);
@@ -472,7 +488,7 @@ fn hda_codec_probe() {
         if ((hda_codec_mask & (1 << codec)) != 0) { break; }
         codec = codec + 1;
     }
-    hda_codec0 = codec;
+    store64(&hda_codec0 + hda_active_ctl * 8, codec);
     if (hda_ring_init() == 0) { return 0; }
 
     var vid = hda_verb(codec, 0, (V_GET_PARAM << 8) | P_VENDOR);
@@ -504,7 +520,7 @@ fn hda_codec_probe() {
 fn hda_codec_enum() {
     if (hda_present == 0) { return 0; }
     if (hda_codec_mask == 0) { return 0; }
-    var codec = hda_codec0;
+    var codec = load64(&hda_codec0 + hda_active_ctl * 8);
 
     # root node 0 → function-group list.
     var rnc = hda_verb(codec, 0, (V_GET_PARAM << 8) | P_NODECOUNT);
@@ -634,7 +650,7 @@ fn hda_unmute_in(codec, nid, idx) {
 fn hda_codec_route() {
     if (hda_present == 0 || hda_codec_mask == 0) { return 0; }
     if (hda_afg == 0 || hda_w_count == 0) { return 0; }
-    var codec = hda_codec0;
+    var codec = load64(&hda_codec0 + hda_active_ctl * 8);
 
     # --- select output pin (scored; no hardcoded nid) ---
     var best_pin = 0;
@@ -816,8 +832,8 @@ fn hda_codec_route() {
 # visibly NOT a static loop, proving the refill actually feeds the stream). In a
 # production (non-HDA_TONE) build the producer is snd_write#66 (Gate 2) — until
 # then the half is zero-filled (silence) and the servicer stays disarmed.
-fn hda_refill_half(h) {
-    var base = hda_pcm_va + h * hda_ring_half;
+fn hda_refill_half(ci, h) {
+    var base = load64(&hda_pcm_va + ci * 8) + h * load64(&hda_ring_half + ci * 8);
     #ifdef HDA_TONE
     var amp = 12000;
     var fi = 0;
@@ -864,24 +880,27 @@ fn hda_refill_half(h) {
 # never miss a ~341 ms ring wrap. ring-3 writes only snd_appl (disjoint scalar,
 # atomic 64-bit) → lock-free, discharging the B5 review's lock finding.
 fn hda_stream_service() {
+    var ci = hda_active_ctl;   # snapshot ONCE at ISR entry — bite-4 sink-select flips this IF=0;
+                               # every per-instance deref below uses `ci` so the ISR can never
+                               # splice instance-0 MMIO with instance-1 stream state mid-service.
     # Gate-2 consumer-head tracking (ISR = sole writer of snd_hw_frames/wrap state).
     # snd_hw_frames = frames the DAC has played, read from SD_LPIB's ABSOLUTE value
     # (robust to servicer-cadence jitter — it reads the current position, not a per-call
     # delta). A timer-rate delta approach (SND_HW_PER_TICK) was tried + REGRESSED on iron
     # (over-counted -> more replay), so LPIB-absolute stands.
     if (snd_active_slot != (0 - 1)) {
-        var raw = hda_read32(hda_sd_base + SD_LPIB) & 0xFFFF;   # LPIB byte offset 0..CBL-1
+        var raw = hda_read32(load64(&hda_sd_base + ci * 8) + SD_LPIB) & 0xFFFF;   # LPIB byte offset 0..CBL-1
         if (raw < snd_last_raw) { snd_wrap_epochs = snd_wrap_epochs + 1; }
         snd_last_raw = raw;
         snd_hw_frames = (snd_wrap_epochs * 65536 + raw) / 4;
     }
-    if (hda_stream_on == 0) { return 0; }
-    var lpib = hda_read32(hda_sd_base + SD_LPIB);
+    if (load64(&hda_stream_on + ci * 8) == 0) { return 0; }
+    var lpib = hda_read32(load64(&hda_sd_base + ci * 8) + SD_LPIB);
     var cur = 0;
-    if (lpib >= hda_ring_half) { cur = 1; }
-    if (cur != hda_last_half) {
-        hda_refill_half(hda_last_half);
-        hda_last_half = cur;
+    if (lpib >= load64(&hda_ring_half + ci * 8)) { cur = 1; }
+    if (cur != load64(&hda_last_half + ci * 8)) {
+        hda_refill_half(ci, load64(&hda_last_half + ci * 8));
+        store64(&hda_last_half + ci * 8, cur);
         hda_refills = hda_refills + 1;
     }
     return 0;
@@ -901,13 +920,14 @@ fn snd_blk_copy(dst, src, nbytes) {
 # snd_appl LAST (store-store order — the consumer/ISR reads snd_appl only for free-
 # space, never mid-copy). Caller guarantees n <= free (won't overrun the DMA head).
 fn snd_copy_frames(uptr, n) {
+    var pva = load64(&hda_pcm_va + hda_active_ctl * 8);   # live instance's ring VA (IF=0 caller → stable)
     var start_byte = (snd_appl & 16383) * 4;          # (snd_appl mod CBL_FRAMES) * bpf
     var nbytes = n * 4;
     var tail = 65536 - start_byte;                     # bytes from here to the ring end (CBL=64K)
     var run1 = nbytes;
     if (run1 > tail) { run1 = tail; }
-    snd_blk_copy(hda_pcm_va + start_byte, uptr, run1);
-    if (nbytes > run1) { snd_blk_copy(hda_pcm_va, uptr + run1, nbytes - run1); }
+    snd_blk_copy(pva + start_byte, uptr, run1);
+    if (nbytes > run1) { snd_blk_copy(pva, uptr + run1, nbytes - run1); }
     snd_appl = snd_appl + n;                            # publish last
     return 0;
 }
@@ -987,7 +1007,7 @@ fn hda_stream_arm() {
     if (hda_oss == 0) { kprintln("hda: OSS=0, no output stream", 28); return 0; }
     snd_active_slot = 0 - 1;   # Gate-2: -1 sentinel (declarative module-init doesn't take; init at runtime)
     var sd = HDA_SD_BASE + hda_iss * HDA_SD_STRIDE;   # output SDs follow ISS inputs
-    hda_sd_base = sd;
+    store64(&hda_sd_base + hda_active_ctl * 8, sd);
 
     # BDL: one WB page (128-byte-aligned — a page satisfies it).
     var bdl = pmm_alloc();
@@ -1021,8 +1041,8 @@ fn hda_stream_arm() {
     # aliased there too; DMA still uses hda_pcm_phys, so this only changes CPU access.
     var pcm_va = DIRECTMAP_BASE + pcm;
     hda_pcm_phys = pcm;
-    hda_pcm_va = pcm_va;                    # cache the ring VA for the B5 refill servicer
-    hda_ring_half = 0x8000;                 # 32 KB double-buffer unit (== `half` below)
+    store64(&hda_pcm_va + hda_active_ctl * 8, pcm_va);   # cache the ring VA for the B5 refill servicer
+    store64(&hda_ring_half + hda_active_ctl * 8, 0x8000);   # 32 KB double-buffer unit (== `half` below)
     #ifdef HDA_TONE
     # B4/B5 (build-gated so production boots stay silent): fill both BDL halves with
     # the opening of HDA_TONE's phase-continuous sweep, then arm the 100 Hz refill
@@ -1033,10 +1053,10 @@ fn hda_stream_arm() {
     # driving the SAME refill path.
     hda_gen_acc = 0;
     hda_gen_inc = 300;
-    hda_refill_half(0);
-    hda_refill_half(1);
-    hda_last_half = 0;
-    hda_stream_on = 1;
+    hda_refill_half(hda_active_ctl, 0);
+    hda_refill_half(hda_active_ctl, 1);
+    store64(&hda_last_half + hda_active_ctl * 8, 0);
+    store64(&hda_stream_on + hda_active_ctl * 8, 1);
     kprintln("hda: sweep streaming (B5 refill armed)", 38);
     #else
     var zi = 0;
@@ -1073,8 +1093,8 @@ fn hda_stream_arm() {
     var fifos = hda_read16(sd + SD_FIFOS);
 
     # Codec side: identical format + stream/channel on the DAC (must match SDnFMT).
-    hda_verb(hda_codec0, hda_out_dac, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
-    hda_verb(hda_codec0, hda_out_dac, (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
+    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), hda_out_dac, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
+    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), hda_out_dac, (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
 
     # RUN.
     hda_write32(sd + SD_CTL, (hda_stream_tag << SD_TAG_SHIFT) | SD_RUN);

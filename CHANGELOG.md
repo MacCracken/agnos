@@ -5,6 +5,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### HDMI-audio arc — bite 1: HDA driver made instance-aware (behavior-identical refactor)
+
+Opens the HDMI-audio arc (a second HD-Audio controller instance = archaemenid PCI
+`04:00.1`, AMD HDMI/DP audio — a digital converter+pin codec, distinct from the analog
+ALC897 on `04:00.6`). Bite 1 is the QEMU-validatable, **behavior-identical** groundwork:
+the single-instance driver becomes multi-instance-capable with zero functional change
+(still probes/uses only the analog controller). Bites 2–4 (probe `04:00.1` → HDMI codec
+route + ELD → sink-select) follow; bites 3–4 are iron-gated on a connected HDMI/DP display.
+
+### Changed — `kernel/core/hda.cyr` + `kernel/core/syscall.cyr`
+- **Per-instance state via `hda_active_ctl` selector.** The register-steering + ISR-read +
+  verb-ring transport fields (`hda_mmio_base`, `hda_sd_base`, `hda_corb_phys`/`hda_rirb_phys`/
+  `hda_corb_wp`/`hda_rirb_rp`, `hda_codec0`, `hda_stream_on`, `hda_ring_half`, `hda_last_half`,
+  `hda_pcm_va`) become per-instance `var X[2]` arrays indexed `&X + hda_active_ctl*8` (the
+  house `&array + idx*8` idiom, u64-per-instance at module scope). A new `hda_active_ctl`
+  scalar picks the live instance; bite 1 pins it to 0 (analog) so behavior is identical.
+- **Single snd_* ring kept (one HW stream ever plays)** — HDMI-vs-analog is a *sink* choice,
+  not concurrent playback; the `snd_*` linear-counter/slot state stays single, so bite 4's
+  sink-select is a controller/codec re-point, not a ring re-plumb.
+- **Snapshot-once ISR.** `hda_stream_service` reads `hda_active_ctl` ONCE at entry (`ci`) and
+  derefs every per-instance field off `ci`, so a future IF=0 sink-switch can never splice
+  instance-0 MMIO with instance-1 stream state mid-service. `hda_refill_half` takes the
+  snapshot as a parameter. This ISR-safety contract is baked in now for bite 4.
+- **Partial adoption**: the codec-graph/amp/DAC fields (`hda_present`, `hda_codec_mask`,
+  `hda_vendor`, `hda_afg`, `hda_out_pin`/`hda_out_dac`, `hda_path[]`, `hda_stream_tag`, …)
+  stay global for bite 1 and graduate to per-instance in bite 2 when the HDMI codec needs them.
+
+### What bite 1 proves (QEMU, behavior-identity)
+- Default build **OK** (1,372,088 B; +816 B from offset-indexing — behavior-identical, not
+  cmp-identical, as designed). `hda-smoke` **PASS** (probe/reset/codec/verb-ring/enum/route/
+  stream), `hda-tone-smoke` **PASS** (RMS=5131.3, sweep 1102 Hz — ISR refill path intact),
+  `snd-smoke` **PASS** (band + counter/ownership/wrap logic, `selftest PASS`), `check.sh`
+  **11/11**, `agnsh-smoke` **PASS** (boot-to-shell). No regression from the single-instance driver.
+- Design: an adversarial 3-architect + judge design pass selected the context-selector model
+  (smallest ISR-touching diff, write-once selector = cleanest ISR-safety proof) over indexed-
+  threaded-param and context-swap alternatives; realized here in the codebase's named-array idiom.
+
 ## [1.53.4] — 2026-07-06 — FP/SIMD arc B5+B6: two-proc XMM preservation + naad DSP in ring 3 (arc QEMU-complete)
 
 Closes the FP/SIMD arc (QEMU). B5 proves the lazy `#NM` machinery preserves each proc's
