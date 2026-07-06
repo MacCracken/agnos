@@ -3573,11 +3573,11 @@ fn ring3_selftest_verify() {
 # ONE parameterized payload; the kernel plants pattern/flags per-proc into the witness
 # page. Witness layout: [0]survived [8]corrupt [16]pattern [24]my_flag [32]peer_flag.
 var fpctxsw_payload[256];       # raw ring-3 code, <=103 bytes. MUST be generous: measured directly,
-                                # `var fpctxsw_payload[24]` allocated only 24 BYTES (a 103-byte payload
-                                # overflowed into wit_a/b -> corrupt witness PDE -> ring-3 #PF), even
-                                # though sibling `var fpu_state[1026]` measured 8208 B (=N*8). Cyrius
-                                # module `var X[N]` sizing is NOT uniform here (footgun) — verify by
-                                # &next-&this and OVER-size. Reverting to [24] re-breaks B5.
+# `var fpctxsw_payload[24]` allocated only 24 BYTES (a 103-byte payload
+# overflowed into wit_a/b -> corrupt witness PDE -> ring-3 #PF), even
+# though sibling `var fpu_state[1026]` measured 8208 B (=N*8). Cyrius
+# module `var X[N]` sizing is NOT uniform here (footgun) — verify by
+# &next-&this and OVER-size. Reverting to [24] re-breaks B5.
 var fpctxsw_wit_a = 0;
 var fpctxsw_wit_b = 0;
 var fpctxsw_shared = 0;
