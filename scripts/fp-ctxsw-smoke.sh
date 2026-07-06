@@ -46,10 +46,14 @@ mmd -i "$ESP"@@1048576 ::EFI ::EFI/BOOT ::boot
 mcopy -i "$ESP"@@1048576 "$GNOBOOT" ::EFI/BOOT/BOOTX64.EFI
 mcopy -i "$ESP"@@1048576 "$AGNOS" ::boot/agnos
 
+# Each round BURNs ~16M iters to span a 10ms timer tick and force a real inter-proc switch.
+# That's ~16ms/round under KVM but MUCH slower under TCG — so prefer KVM (realistic timing +
+# fast) and fall back to TCG with a longer timeout when /dev/kvm is absent (e.g. CI).
+if [ -w /dev/kvm ]; then ACCEL="-enable-kvm -cpu host"; DEF_TIMEOUT=50; else ACCEL="-cpu max"; DEF_TIMEOUT=180; fi
 boot_once() {   # $1 = extra qemu args (e.g. "-smp 4"), $2 = log path
     cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"
-    timeout "${QEMU_TIMEOUT:-50}" qemu-system-x86_64 \
-        -machine q35 -m 256M -cpu max $1 \
+    timeout "${QEMU_TIMEOUT:-$DEF_TIMEOUT}" qemu-system-x86_64 \
+        -machine q35 -m 256M $ACCEL $1 \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
         -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
         -drive "file=$ESP,format=raw,if=none,id=esp0" \

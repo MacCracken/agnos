@@ -2270,6 +2270,18 @@ sh_exec("run /bin/fpex", 13);
 kprintln("exec: fpex returned", 19);
 #endif
 
+#ifdef NAAD_RING3_SELFTEST
+# 1.53.x B6 (arc-closer): naad oscillator END-PROOF. Runs /bin/naadex (naad/, built --agnos) —
+# a REAL heavy-f64 DSP workload: naad's 440 Hz sine oscillator generates 256 samples via
+# f64_sin/f64_mul/... (the mulsd/sqrtsd/comisd codegen B1-B5 enabled), asserts every sample is
+# finite, exits 88 iff all 256 are. Where fpex (B4) proved 5 hand-picked ops, this proves a
+# shipping library's XMM-heavy code runs correctly in ring 3: enter_ring3 CR0.TS → first f64 op
+# #NMs → nm_handler FXRSTORs naadex's per-proc area → the DSP runs to completion → "run: exit 88".
+kprintln("exec: running /bin/naadex", 25);
+sh_exec("run /bin/naadex", 15);
+kprintln("exec: naadex returned", 21);
+#endif
+
 #ifdef VANITONE_AUDIO_SELFTEST
 # vani-core backend proof (Gate 3/4 of the 1.52.x audio arc). Runs /bin/vanitone,
 # a doom-style consumer of vani's dist/vani-core.cyr — the FIRST audio through the
@@ -3560,7 +3572,12 @@ fn ring3_selftest_verify() {
 # proc's write and re-read, so a survived-round can't be a no-switch false-green.
 # ONE parameterized payload; the kernel plants pattern/flags per-proc into the witness
 # page. Witness layout: [0]survived [8]corrupt [16]pattern [24]my_flag [32]peer_flag.
-var fpctxsw_payload[24];        # raw ring-3 code (113 bytes used)
+var fpctxsw_payload[256];       # raw ring-3 code, <=103 bytes. MUST be generous: measured directly,
+                                # `var fpctxsw_payload[24]` allocated only 24 BYTES (a 103-byte payload
+                                # overflowed into wit_a/b -> corrupt witness PDE -> ring-3 #PF), even
+                                # though sibling `var fpu_state[1026]` measured 8208 B (=N*8). Cyrius
+                                # module `var X[N]` sizing is NOT uniform here (footgun) — verify by
+                                # &next-&this and OVER-size. Reverting to [24] re-breaks B5.
 var fpctxsw_wit_a = 0;
 var fpctxsw_wit_b = 0;
 var fpctxsw_shared = 0;
@@ -3568,40 +3585,27 @@ var fpctxsw_pid_a = 0;
 var fpctxsw_pid_b = 0;
 fn fpctxsw_payload_fill() {
     var p = &fpctxsw_payload;
-    # No yield#44 — the two procs interleave via TIMER preemption (fair round-robin, so the
-    # verify/kmain isn't starved) + the handshake flag: write pattern → set my flag → SPIN
-    # until the peer's flag shows the peer wrote → re-read. The timer preempts the spin to
-    # let the peer run; the handshake guarantees the peer overwrote the physical XMM before
-    # this proc re-reads. GP regs (rbx/rdx/r8/rcx) survive timer preemption via the context
-    # save, so no reload is needed after a preempt.
-    # 0: movabs rbx, 0x2000000  (witness page: config + counters)
-    store8(p + 0, 0x48); store8(p + 1, 0xBB);
-    store8(p + 2, 0x00); store8(p + 3, 0x00); store8(p + 4, 0x00); store8(p + 5, 0x02);
-    store8(p + 6, 0x00); store8(p + 7, 0x00); store8(p + 8, 0x00); store8(p + 9, 0x00);
-    store8(p + 10, 0x4C); store8(p + 11, 0x8B); store8(p + 12, 0x43); store8(p + 13, 0x10);  # mov r8, [rbx+0x10]  (pattern)
-    store8(p + 14, 0x66); store8(p + 15, 0x49); store8(p + 16, 0x0F); store8(p + 17, 0x6E); store8(p + 18, 0xD8);  # movq xmm3, r8
-    store8(p + 19, 0x66); store8(p + 20, 0x4D); store8(p + 21, 0x0F); store8(p + 22, 0x6E); store8(p + 23, 0xF8);  # movq xmm15, r8
-    # 24: movabs rdx, 0x2200000  (shared handshake page)
-    store8(p + 24, 0x48); store8(p + 25, 0xBA);
-    store8(p + 26, 0x00); store8(p + 27, 0x00); store8(p + 28, 0x20); store8(p + 29, 0x02);
-    store8(p + 30, 0x00); store8(p + 31, 0x00); store8(p + 32, 0x00); store8(p + 33, 0x00);
-    store8(p + 34, 0x48); store8(p + 35, 0x8B); store8(p + 36, 0x43); store8(p + 37, 0x18);  # mov rax, [rbx+0x18]  (my_flag)
-    store8(p + 38, 0x88); store8(p + 39, 0x02);                                              # mov [rdx], al
-    store8(p + 40, 0x48); store8(p + 41, 0x8B); store8(p + 42, 0x4B); store8(p + 43, 0x20);  # mov rcx, [rbx+0x20]  (peer_flag)
-    store8(p + 44, 0x0F); store8(p + 45, 0xB6); store8(p + 46, 0x02);                        # wait: movzx eax, byte [rdx]
-    store8(p + 47, 0x39); store8(p + 48, 0xC8);                                              # cmp eax, ecx
-    store8(p + 49, 0x75); store8(p + 50, 0xF9);                                              # jne wait (-> 44)
-    store8(p + 51, 0x4C); store8(p + 52, 0x8B); store8(p + 53, 0x43); store8(p + 54, 0x10);  # mov r8, [rbx+0x10]  (pattern reload)
-    store8(p + 55, 0x66); store8(p + 56, 0x48); store8(p + 57, 0x0F); store8(p + 58, 0x7E); store8(p + 59, 0xD8);  # movq rax, xmm3
-    store8(p + 60, 0x4C); store8(p + 61, 0x39); store8(p + 62, 0xC0);                        # cmp rax, r8
-    store8(p + 63, 0x75); store8(p + 64, 0x0F);                                              # jne corrupt (-> 80)
-    store8(p + 65, 0x66); store8(p + 66, 0x4C); store8(p + 67, 0x0F); store8(p + 68, 0x7E); store8(p + 69, 0xF8);  # movq rax, xmm15
-    store8(p + 70, 0x4C); store8(p + 71, 0x39); store8(p + 72, 0xC0);                        # cmp rax, r8
-    store8(p + 73, 0x75); store8(p + 74, 0x05);                                              # jne corrupt (-> 80)
-    store8(p + 75, 0x48); store8(p + 76, 0xFF); store8(p + 77, 0x03);                        # inc qword [rbx]      (survived++)
-    store8(p + 78, 0xEB); store8(p + 79, 0xB0);                                              # jmp top (-> 0)
-    store8(p + 80, 0x48); store8(p + 81, 0xFF); store8(p + 82, 0x43); store8(p + 83, 0x08);  # corrupt: inc qword [rbx+8]  (corrupt++)
-    store8(p + 84, 0xEB); store8(p + 85, 0xAA);                                              # jmp top (-> 0)
+    # B5 FP-preservation round (self-terminating, deadlock-free, no fall-through). Each round:
+    # load MY pattern (witness+0x10) into xmm3+xmm15, BURN ~16M iters (> one 10ms tick) so the
+    # timer preempts + runs the PEER (whose XMM holds a DIFFERENT pattern), then re-read
+    # xmm3/xmm15 and prove they still hold MY pattern. survived++ per clean round; on any leak
+    # corrupt++ + exit. 20 clean rounds -> exit(0). The exit SELF-LOOPS (xor eax,eax; syscall;
+    # jmp) so a returning SYS_EXIT can never fall through into the corrupt handler (that
+    # fall-through was a false-corrupt artifact during bring-up). rbx/r8 survive preemption via
+    # the GP context save; xmm3/xmm15 survive via B3's lazy #NM FXSAVE/FXRSTOR -- what this proves.
+    store8(p + 0, 0x48); store8(p + 1, 0xBB); store8(p + 2, 0x00); store8(p + 3, 0x00); store8(p + 4, 0x00); store8(p + 5, 0x02); store8(p + 6, 0x00); store8(p + 7, 0x00);
+    store8(p + 8, 0x00); store8(p + 9, 0x00); store8(p + 10, 0x4C); store8(p + 11, 0x8B); store8(p + 12, 0x43); store8(p + 13, 0x10); store8(p + 14, 0x66); store8(p + 15, 0x49);
+    store8(p + 16, 0x0F); store8(p + 17, 0x6E); store8(p + 18, 0xD8); store8(p + 19, 0x66); store8(p + 20, 0x4D); store8(p + 21, 0x0F); store8(p + 22, 0x6E); store8(p + 23, 0xF8);
+    store8(p + 24, 0x48); store8(p + 25, 0xB9); store8(p + 26, 0x00); store8(p + 27, 0x00); store8(p + 28, 0x00); store8(p + 29, 0x01); store8(p + 30, 0x00); store8(p + 31, 0x00);
+    store8(p + 32, 0x00); store8(p + 33, 0x00); store8(p + 34, 0x48); store8(p + 35, 0xFF); store8(p + 36, 0xC9); store8(p + 37, 0x75); store8(p + 38, 0xFB); store8(p + 39, 0x66);
+    store8(p + 40, 0x48); store8(p + 41, 0x0F); store8(p + 42, 0x7E); store8(p + 43, 0xD8); store8(p + 44, 0x4C); store8(p + 45, 0x39); store8(p + 46, 0xC0); store8(p + 47, 0x0F);
+    store8(p + 48, 0x85); store8(p + 49, 0x26); store8(p + 50, 0x00); store8(p + 51, 0x00); store8(p + 52, 0x00); store8(p + 53, 0x66); store8(p + 54, 0x4C); store8(p + 55, 0x0F);
+    store8(p + 56, 0x7E); store8(p + 57, 0xF8); store8(p + 58, 0x4C); store8(p + 59, 0x39); store8(p + 60, 0xC0); store8(p + 61, 0x0F); store8(p + 62, 0x85); store8(p + 63, 0x18);
+    store8(p + 64, 0x00); store8(p + 65, 0x00); store8(p + 66, 0x00); store8(p + 67, 0x48); store8(p + 68, 0xFF); store8(p + 69, 0x03); store8(p + 70, 0x48); store8(p + 71, 0x81);
+    store8(p + 72, 0x3B); store8(p + 73, 0x14); store8(p + 74, 0x00); store8(p + 75, 0x00); store8(p + 76, 0x00); store8(p + 77, 0x0F); store8(p + 78, 0x8C); store8(p + 79, 0xAD);
+    store8(p + 80, 0xFF); store8(p + 81, 0xFF); store8(p + 82, 0xFF); store8(p + 83, 0x31); store8(p + 84, 0xFF); store8(p + 85, 0x31); store8(p + 86, 0xC0); store8(p + 87, 0x0F);
+    store8(p + 88, 0x05); store8(p + 89, 0xEB); store8(p + 90, 0xFA); store8(p + 91, 0x48); store8(p + 92, 0xFF); store8(p + 93, 0x43); store8(p + 94, 0x08); store8(p + 95, 0x31);
+    store8(p + 96, 0xFF); store8(p + 97, 0x31); store8(p + 98, 0xC0); store8(p + 99, 0x0F); store8(p + 100, 0x05); store8(p + 101, 0xEB); store8(p + 102, 0xFA);
     return 0;
 }
 fn fpctxsw_wit_init(w, pat, myf, peerf) {
@@ -3619,6 +3623,11 @@ fn fpctxsw_spawn(wit) {
     return pid;
 }
 fn fpctxsw_selftest_setup() {
+    # Witness pages: pmm_alloc_2mb returns valid 2MB-aligned RAM (regions >=4MB; the kernel image
+    # +.bss is <4MB and reserved by pmm_init, so these never overlap kernel memory). Each proc gets
+    # its OWN witness at 0x2000000; a shared page at 0x2200000 is mapped but the burn payload
+    # doesn't use it. (The bring-up "aliasing"/"pmm" theories were both wrong: the real bugs were a
+    # fpctxsw_payload[] buffer overflow + an exit fall-through, both fixed. B3 is sound.)
     fpctxsw_wit_a = pmm_alloc_2mb();
     fpctxsw_wit_b = pmm_alloc_2mb();
     fpctxsw_shared = pmm_alloc_2mb();
@@ -3640,16 +3649,7 @@ fn fpctxsw_selftest_setup() {
 fn fpctxsw_selftest_verify() {
     kprint("fp: ctxsw pids A=", 17); kprint_num(fpctxsw_pid_a); kprint(" B=", 3); kprint_num(fpctxsw_pid_b); kprintln("", 0);
     var t0 = timer_ticks;
-    var i = 0;
-    while (i < 10) { arch_wait(); i = i + 1; }
-    kprint("fp: ctxsw DBG ticks=", 20); kprint_num(timer_ticks - t0);
-    kprint(" sw=", 4); kprint_num(fpu_switch_count);
-    kprint(" Ast=", 5); kprint_num(proc_get_state(fpctxsw_pid_a));
-    kprint(" Bst=", 5); kprint_num(proc_get_state(fpctxsw_pid_b));
-    kprint(" sa=", 4); kprint_num(load64(fpctxsw_wit_a + 0));
-    kprint(" sb=", 4); kprint_num(load64(fpctxsw_wit_b + 0));
-    kprint(" ca=", 4); kprint_num(load64(fpctxsw_wit_a + 8));
-    kprint(" cb=", 4); kprint_num(load64(fpctxsw_wit_b + 8)); kprintln("", 0);
+    while (timer_ticks - t0 < 150) { arch_wait(); }   # ~1.5s WALL (tick-bounded, not iter-bounded, so the 2 infinite-looping procs can't starve kmain out of the loop)
     var sa = load64(fpctxsw_wit_a + 0);
     var ca = load64(fpctxsw_wit_a + 8);
     var sb = load64(fpctxsw_wit_b + 0);
@@ -3658,9 +3658,9 @@ fn fpctxsw_selftest_verify() {
     kprint(" sb=", 4); kprint_num(sb); kprint(" cb=", 4); kprint_num(cb);
     kprint(" sw=", 4); kprint_num(fpu_switch_count); kprintln("", 0);
     if (ca > 0) { kprintln("fp: ctxsw A CORRUPT", 19); }
-    else { if (sa >= 5) { kprintln("fp: ctxsw A OK", 14); } else { kprintln("fp: ctxsw A STUCK", 17); } }
+    else { if (sa >= 20) { kprintln("fp: ctxsw A OK", 14); } else { kprintln("fp: ctxsw A STUCK", 17); } }
     if (cb > 0) { kprintln("fp: ctxsw B CORRUPT", 19); }
-    else { if (sb >= 5) { kprintln("fp: ctxsw B OK", 14); } else { kprintln("fp: ctxsw B STUCK", 17); } }
+    else { if (sb >= 20) { kprintln("fp: ctxsw B OK", 14); } else { kprintln("fp: ctxsw B STUCK", 17); } }
     kprint("fp: ctxsw migrations=", 21); kprint_num(fpctxsw_migrations); kprintln("", 0);   # >0 under -smp = a real cross-core FP migration (soft gate)
     proc_set_state(fpctxsw_pid_a, 0);
     proc_set_state(fpctxsw_pid_b, 0);

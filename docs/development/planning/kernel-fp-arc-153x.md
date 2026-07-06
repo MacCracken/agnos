@@ -14,8 +14,8 @@ SSE2 is x86-64 baseline, so this rides the **archaemenid AMD Zen** target the
 | **B2** | **1.53.1** | Per-proc FXSAVE state array + per-CPU `fpu_owner` + **hand-built** default image | **✅ DONE + QEMU 2/2 (2026-07-05)** |
 | **B3** | **1.53.2** | Lazy `#NM` handler + `CR0.TS`-on-both-switch-paths + `fpu_owner` + deschedule-FXSAVE + `#XM` handler | **✅ DONE + QEMU (2026-07-05) — iron-gated (SMP migration → B5 burn)** |
 | **B4** | **1.53.3** | Ring-3 f64 first-touch FXRSTOR (single-owner, end to end) | **✅ DONE + QEMU (2026-07-05) — real cyrius f64 in ring 3, `run: exit 84`** |
-| **B5** | 1.53.4 | Two-proc FP-preservation stress (timer / cooperative-yield / `-smp` migration) | Planned |
-| **B6** | 1.53.5 | `naad` on agnos ring-3 (the green end-proof) + cyrius issue-doc confirm + iron burn | Planned — arc-closing |
+| **B5** | 1.53.4 | Two-proc FP-preservation stress (timer / cooperative-yield / `-smp` migration) | **✅ DONE + QEMU (2026-07-05) — fp-ctxsw-smoke 8/8, `sa=20 ca=0 sb=20 cb=0`, B3 PROVEN SOUND. Two harness bugs found+fixed (payload[24] overflow + exit fall-through); "B3 bug"/"pmm bug" theories retracted. -smp migration count still IRON-gated.** |
+| **B6** | 1.53.5 | `naad` on agnos ring-3 (the green end-proof) + cyrius issue-doc confirm + iron burn | **✅ QEMU-GREEN (2026-07-06, cyrius 6.4.10) — arc-closer. naad-ring3-smoke: `/bin/naadex` (naad 440Hz sine osc, 256 f64 samples via f64_sin/f64_mul) → `run: exit 88`, all finite, no faults. Real shipping-library XMM-heavy DSP runs in ring 3. cyrius array-size issue filed+FIXED (6.4.10). IRON BURN pending (user).** |
 
 **B1 adversarial re-verification (multi-agent, 2026-07-05): CONFIRMED ship-safe.**
 Every opcode byte re-derived against `objdump` ground-truth (all decode as
@@ -361,23 +361,36 @@ only; the FXSAVE-of-previous-owner limb is B5. *Original plan below:*
 
 #### B5 — VERIFIED DESIGN (adversarial workflow, 2026-07-05) — the implementation blueprint
 
-> **⚠ B5 IMPLEMENTATION IN PROGRESS (2026-07-05) — and it already caught a real B3 bug.**
-> The harness is written + gated (`FP_CTXSW_SELFTEST`): `main.cyr` `fpctxsw_*` (86-byte
-> handshake payload — disassembly-verified byte-exact; setup spawns two procs via the
-> `ring3_spawn_one` recipe with a per-proc witness page at `0x2000000` + a SHARED handshake
-> page at `0x2200000`; verify), `sched.cyr` `proc_last_cpu[16]`+migration stamp, `fpu.cyr`
-> `fpu_switch_count`, `build.sh`, `scripts/fp-ctxsw-smoke.sh`. **Isolation bisect (single-core
-> QEMU):** (a) a MINIMAL counter payload → both procs alive, counters fly, kmain scheduled
-> fine → **the spawn/map/verify harness is correct**; (b) an **SSE-only** payload (movq
-> xmm3/xmm15 + inc, no handshake) → `sw=11` FP switches happen, then **proc A FAULTS dead
-> (`Ast=0`) after ~11 rounds** while B stays alive. **This is the FIRST genuine 2-proc FP
-> alternation — the exact FXSAVE-of-PREVIOUS-owner limb of B3 that single-proc B4 + the forced
-> B3a test could NOT reach — and it faults.** So B5 is doing its job: it surfaced a real bug in
-> the B3 lazy-#NM save/restore under alternation. **Next pass:** capture the fault vector with a
-> NON-locking channel (kprint in fault context deadlocks the console lock — use the CMOS `0x54`
-> stamp read post-boot, or `serial_println`), root-cause the nm_handler/fpu_deschedule_save
-> alternation fault, fix it, then finalize the verify latches + run the smoke. **B1–B4 (1.53.3)
-> + production are UNAFFECTED — all B5 code is `#ifdef FP_CTXSW_SELFTEST`-gated (audit still == 2).**
+> **✅ B5 GREEN (2026-07-05) — B3 is PROVEN SOUND. fp-ctxsw-smoke 8/8.** Two ring-3 procs, 20
+> rounds each, 14–18 real inter-proc FP switches, **`sa=20 ca=0 sb=20 cb=0` — ZERO XMM corruption**,
+> single-core (hard gate) AND `-smp 4` (soft gate). B3's lazy `#NM` FXSAVE/FXRSTOR preserves each
+> proc's xmm3+xmm15 across preemptive context switches.
+>
+> **Both bring-up misdiagnoses are RETRACTED — the two real bugs were in the B5 HARNESS, not B3, not pmm:**
+> 1. **`fpctxsw_payload[24]` buffer overflow.** Measured directly (`&fpctxsw_wit_a - &fpctxsw_payload`),
+>    `var fpctxsw_payload[24]` allocated only **24 BYTES**, so the 52–103-byte raw payload overflowed
+>    into the adjacent `fpctxsw_wit_a/b/shared` globals, corrupting the witness pointers → the witness
+>    PDE built from a garbage phys → the ring-3 `v=0e e=000c` (User+RSVD) #PF at the witness read. The
+>    "aliasing"/"pmm hands out `.bss`" theory was WRONG: `pmm_alloc_2mb` returns valid RAM, and the
+>    kernel `.bss` is only ~2.37 MB (`readelf -l`: LOAD MemSiz ends 0x25eb28), fully inside pmm's
+>    reserved 0–4 MB. **Fix: `var fpctxsw_payload[256]`.** ⚠ Cyrius module `var X[N]` sizing is a
+>    footgun here — `[24]`→24 B (N×1) yet sibling `var fpu_state[1026]`→8208 B (N×8, measured
+>    `&fpu_owner-&fpu_state`); NOT uniform. Verify buffer sizes by `&next-&this` and over-size.
+> 2. **Exit fall-through.** The `SYS_EXIT` (`xor eax,eax; syscall`) sat immediately before the
+>    corrupt handler in the payload; a returning/late exit fell through into it, recording a false
+>    `corrupt=1` with bad value `0x0` (= the `xor eax,eax` residue) at round=20 (the exit condition).
+>    **Fix: self-loop the exit (`L: xor eax,eax; syscall; jmp L`)** so it can never fall through.
+>
+> Diagnostic ladder that cracked it (all probes since removed): `-d int` histogram (→ `v=0e` #PF, no
+> `#NM`), CR2 + PDE-walk capture in `fault_kill_current` (→ garbage witness PDE), step-traced setup
+> prints (→ witness *globals* corrupted, not the pages), `&`-address prints (→ payload buffer = 24 B),
+> bad-value/round capture (→ leaked value `0x0` not the peer pattern = isolation intact; fall-through),
+> self-loop exit (→ `ca=0`). Also learned: **kmain (idle/boot ctx) is NOT in the round-robin**, so two
+> infinite-looping ring-3 procs starve it forever — a B5 payload MUST self-terminate (`exit`,
+> SYS_EXIT=0 on agnos) for the verify to regain control; and **re-stage the ESP each boot** (a reused
+> `esp.img` booted a stale kernel and hid two edits). `fp-ctxsw-smoke.sh` prefers `-enable-kvm` (the
+> 16M burn needs realistic timing; TCG fallback bumps the timeout). **B1–B4 (1.53.3) + production
+> UNAFFECTED — all B5 code `#ifdef FP_CTXSW_SELFTEST`-gated (default build clean, FP-audit == 2).**
 
 
 The false-green model is **CONFIRMED sound** *if* built on the preemptive
@@ -433,7 +446,25 @@ the prev≠cur FXSAVE-of-PREVIOUS-owner limb, first exercised here), with a dist
 "survived-stuck-at-0" FAIL sentinel to diagnose a `#NM`-loop vs corruption. **This is an
 intricate hand-asm bite (two-proc payloads + handshake) — its own focused pass.**
 
-### B6 — naad build + run on agnos ring-3 (the green end-proof)
+### B6 — naad build + run on agnos ring-3 (the green end-proof) — ✅ QEMU-GREEN 2026-07-06
+- **DONE (QEMU), cyrius 6.4.10.** `naadex.cyr` (in the naad repo, mirrors `src/main.cyr`'s
+  include preamble: `lib/hisab.cyr` + `lib/goonj.cyr` + `dist/naad.cyr`; heap via
+  `lib/alloc_agnos.cyr` → `sys_mmap #27`) creates naad's 440 Hz **SINE oscillator**
+  (`osc_new(WAVEFORM_SINE, f64_from(440), f64_from(44100))`) and generates **256 samples**
+  (`osc_next_sample` → `f64_sin`/`f64_mul`/…), asserting every one `naad_is_finite`; exits **88**
+  (0x58, via the `SYS_EXIT` bare-call form — NOT naad main's `syscall(60,r)`, a no-op on agnos)
+  iff all 256 finite. Kernel `#ifdef NAAD_RING3_SELFTEST` block (`main.cyr`, beside FP_RING3)
+  `sh_exec`s `/bin/naadex`; `scripts/naad-ring3-smoke.sh` (fp-ring3-shaped) builds naadex from
+  the naad repo, seeds ext2, boots NVMe, asserts **`run: exit 88`** + no `#PF/#GP/#UD/PANIC`.
+  **PASS** — a real shipping-library XMM-heavy DSP workload runs correctly in agnos ring 3, the
+  arc's foundational wall gone end to end (B1 enable → B2 area → B3 #NM restore → B4 first-touch
+  → B5 two-proc preservation → **B6 real library**). Registered in `sweep.sh` (+ B5 fp-ctxsw).
+- The **cyrius issue-doc** filed in parallel turned out to be the **top-level bare-`var X[N]`
+  8× under-size** bug (`cyrius/docs/.../2026-07-05-toplevel-bare-array-8x-undersize.md`),
+  **FIXED in cyrius 6.4.10** — naadex + the whole kernel now build against the fixed compiler.
+- **IRON BURN pending (user, archaemenid):** validate `f64` on real Zen ring-3. Once burned,
+  `tonegen` can optionally swap hand-rolled integer waveforms for real `naad` oscillators.
+- *Original plan below:*
 - Cross-build `naad` `--agnos`, run an oscillator/synth exerciser in ring-3 under
   QEMU (`naad-smoke.sh`), assert **finite non-NaN samples** out. In **parallel,
   not blocking B1–B5**: file the cyrius issue-doc (below). Only after **all**
