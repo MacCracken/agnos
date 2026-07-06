@@ -881,8 +881,8 @@ fn hda_refill_half(ci, h) {
 # atomic 64-bit) → lock-free, discharging the B5 review's lock finding.
 fn hda_stream_service() {
     var ci = hda_active_ctl;   # snapshot ONCE at ISR entry — bite-4 sink-select flips this IF=0;
-                               # every per-instance deref below uses `ci` so the ISR can never
-                               # splice instance-0 MMIO with instance-1 stream state mid-service.
+    # every per-instance deref below uses `ci` so the ISR can never
+    # splice instance-0 MMIO with instance-1 stream state mid-service.
     # Gate-2 consumer-head tracking (ISR = sole writer of snd_hw_frames/wrap state).
     # snd_hw_frames = frames the DAC has played, read from SD_LPIB's ABSOLUTE value
     # (robust to servicer-cadence jitter — it reads the current position, not a per-call
