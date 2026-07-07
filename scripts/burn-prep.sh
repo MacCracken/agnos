@@ -49,7 +49,11 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_HDA_TONE:-}" ]; then
+if [ -n "${BURN_HDMI:-}" ]; then
+    echo "[2/2] Building the HDMI-audio kernel (HDA_HDMI: probe/route/stream instance 1 = 04:00.1 HDMI/DP digital sink; HDA_TONE: audible sweep). Analog instance 0 plays out the front jack; HDMI plays out a firmware-LIT display port (agnos has no amdgpu -> a dark port won't egress). Bite 3 iron gate."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE"
+elif [ -n "${BURN_HDA_TONE:-}" ]; then
     echo "[2/2] Building the HDA_TONE first-tone kernel (hda_stream_arm fills a ~375 Hz triangle -> audible out the codec)..."
     BUILD_ENV="HDA_TONE=1"
     BUILD_TAG="HDA_TONE"
