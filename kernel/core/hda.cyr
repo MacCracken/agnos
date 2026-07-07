@@ -614,6 +614,11 @@ fn hda_codec_enum() {
                 var ddev  = (cfg >> 20) & 0xF;     # 0=Line-Out 1=Speaker 2=HP-Out
                 var pconn = (cfg >> 30) & 0x3;     # 0=Jack 1=NONE 2=Fixed 3=Both
                 var loc   = (cfg >> 24) & 0x3F;    # geometry+location (Front/Rear/…)
+                # Get Pin Sense: bit31 = Presence Detect, bit30 = ELD Valid (HDMI/DP
+                # display pins). Dumped so an iron burn shows which digital pin the
+                # connected display is on — the config-defaults are identical on AMD
+                # HDMI, so presence/ELD is the ONLY disambiguator among them.
+                var psense = hda_verb(codec, nid, (V_GET_PINSENSE << 8) | 0);
                 kprint("hda: pin 0x", 11);
                 kprint_byte(nid);
                 kprint(" cfg=0x", 7);
@@ -624,6 +629,8 @@ fn hda_codec_enum() {
                 kprint_num(pconn);
                 kprint(" loc=0x", 7);
                 kprint_byte(loc);
+                kprint(" sense=0x", 9);
+                kprint_hex(psense & 0xFFFFFFFF);
                 kprintln("", 0);
                 #endif
             }
@@ -730,7 +737,12 @@ fn hda_codec_route() {
                     # tiebreakers among multiple live jacks and the sole signal when
                     # jack-detect is unwired (no pin reports a plug).
                     var sense = hda_verb(codec, nid, (V_GET_PINSENSE << 8) | 0);
-                    if ((sense & 0x80000000) != 0) { score = score + 1000; }
+                    if ((sense & 0x80000000) != 0) { score = score + 1000; }   # bit31 = presence detect
+                    # bit30 = ELD Valid — on HDMI/DP display pins the sink's audio caps
+                    # were read, so THIS pin has a real connected audio display. Among
+                    # config-identical AMD digital pins it's the only reliable signal
+                    # (outweighs presence, which AMD often leaves unset without amdgpu).
+                    if ((sense & 0x40000000) != 0) { score = score + 2000; }
                     if (score > best_score) {
                         best_score = score;
                         best_pin = nid;
@@ -742,6 +754,13 @@ fn hda_codec_route() {
         }
         wi = wi + 1;
     }
+    #ifdef HDA_HDMI_PIN
+    # Bring-up fallback: force the digital pin wired to the physically-connected
+    # display when the codec exposes no working presence/ELD (AMD HDMI without
+    # amdgpu — the config-identical pins can't be told apart). Digital instance
+    # only; build HDA_HDMI_PIN=<nid> (e.g. 0x05) and try the pins the enum dump lists.
+    if (hda_active_ctl != 0) { best_pin = HDA_HDMI_PIN; best_is_digi = 1; }
+    #endif
     if (best_pin == 0) {
         kprintln("hda: no output pin", 18);
         return 0;

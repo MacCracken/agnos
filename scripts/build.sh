@@ -245,6 +245,10 @@ else
         # -device intel-hda). Instance 0 (analog) stays the default sink. Gated so the
         # production/MVP kernel stays single-controller. Drives scripts/hda-dual-smoke.sh.
         [ -n "$HDA_HDMI" ]           && echo '#define HDA_HDMI'
+        # HDA_HDMI_PIN=<nid> — bite-3 bring-up fallback: force the digital pin wired to
+        # the connected display (e.g. HDA_HDMI_PIN=0x05) when presence/ELD can't
+        # disambiguate AMD's config-identical HDMI pins. Requires HDA_HDMI=1.
+        [ -n "$HDA_HDMI_PIN" ]       && echo "#define HDA_HDMI_PIN $HDA_HDMI_PIN"
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include
