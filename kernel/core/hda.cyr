@@ -754,13 +754,6 @@ fn hda_codec_route() {
         }
         wi = wi + 1;
     }
-    #ifdef HDA_HDMI_PIN
-    # Bring-up fallback: force the digital pin wired to the physically-connected
-    # display when the codec exposes no working presence/ELD (AMD HDMI without
-    # amdgpu — the config-identical pins can't be told apart). Digital instance
-    # only; build HDA_HDMI_PIN=<nid> (e.g. 0x05) and try the pins the enum dump lists.
-    if (hda_active_ctl != 0) { best_pin = HDA_HDMI_PIN; best_is_digi = 1; }
-    #endif
     if (best_pin == 0) {
         kprintln("hda: no output pin", 18);
         return 0;
@@ -821,20 +814,54 @@ fn hda_codec_route() {
     #    (HDMI/DP) pin gets OUT_EN only (HP-drive is meaningless/rejected on it).
     var is_dig = load64(&hda_out_digital + hda_active_ctl * 8);
     if (is_dig != 0) {
-        hda_verb(codec, best_pin, (V_SET_PINCTL << 8) | PINCTL_OUT_EN);
-        # 3b. Digital converter enable (HDMI/DP only): open the digital output stream
-        #     on the converter (DigEn) + set the channel count to stereo. WCAP-digital-
-        #     gated so a DAC-trace that landed on a non-converter can't get a spurious
-        #     DigEn (the HDMI Audio-Output converter reports WCAP bit9 set).
-        var dwc = hda_verb(codec, dac, (V_GET_PARAM << 8) | P_WCAP);
-        if ((dwc & WCAP_DIGITAL) != 0) {
-            hda_verb(codec, dac, (V_SET_DIGI_CVT1 << 8) | DIGEN);
-            hda_verb(codec, dac, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
-            #ifdef HDA_TONE
-            kprint("hda: hdmi DigEn set cvt=0x", 26);
-            kprint_byte(dac);
-            kprintln("", 0);
-            #endif
+        # 3b. Digital BROADCAST (HDMI/DP). Without amdgpu this AMD codec can't tell us
+        #     which pin the display is on — Get Pin Sense returns a uniform 0x7fffffff
+        #     on ALL pins and the config-defaults are identical. So enable EVERY live
+        #     digital output pin + bind each converter to the ONE stream tag: the
+        #     connected port plays; the rest drive empty connectors (harmless). No pin
+        #     identification needed. hda_out_pin/hda_out_dac stay the scored primary
+        #     (hda_stream_arm sets up the SD for that stream tag); this loop lights up
+        #     the whole digital fan-out onto the same tag.
+        var dgi = 0;
+        while (dgi < load64(&hda_w_count + hda_active_ctl * 8)) {
+            var dgn = load64(&hda_w_start + hda_active_ctl * 8) + dgi;
+            var dgw = hda_verb(codec, dgn, (V_GET_PARAM << 8) | P_WCAP);
+            if (((dgw >> 20) & 0xF) == WID_PIN) {
+                var dgp = hda_verb(codec, dgn, (V_GET_PARAM << 8) | P_PINCAP);
+                var dgc = hda_verb(codec, dgn, (V_GET_CFGDEF << 8) | 0);
+                var dgconn = (dgc >> 30) & 0x3;
+                var dgdev = (dgc >> 20) & 0xF;
+                var dgdig = ((dgp & (PINCAP_HDMI | PINCAP_DP)) != 0) || (dgdev == DEV_SPDIF_OUT || dgdev == DEV_DIG_OTHER_OUT);
+                if ((dgp & PINCAP_OUT) != 0 && dgdig != 0 && dgconn != 1) {
+                    # trace this pin's converter (1 hop — HDMI/DP pins connect direct)
+                    var dgcl = hda_verb(codec, dgn, (V_GET_PARAM << 8) | P_CONNLEN) & 0x7F;
+                    var dgcv = 0;
+                    if (dgcl > 0) {
+                        var dgs = hda_verb(codec, dgn, (V_GET_CONNSEL << 8) | 0) & 0xFF;
+                        if (dgs >= dgcl) { dgs = 0; }
+                        var dglw = hda_verb(codec, dgn, (V_GET_CONNLIST << 8) | (dgs & 0xFC));
+                        dgcv = (dglw >> ((dgs & 0x3) * 8)) & 0xFF;
+                    }
+                    var dgcw = hda_verb(codec, dgcv, (V_GET_PARAM << 8) | P_WCAP);
+                    if (dgcv != 0 && ((dgcw >> 20) & 0xF) == WID_DAC) {
+                        hda_verb(codec, dgcv, (V_SET_POWER << 8) | 0x00);
+                        if ((dgcw & WCAP_DIGITAL) != 0) { hda_verb(codec, dgcv, (V_SET_DIGI_CVT1 << 8) | DIGEN); }
+                        hda_verb(codec, dgcv, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
+                        hda_verb(codec, dgcv, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
+                        hda_verb(codec, dgcv, (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
+                        hda_verb(codec, dgn, (V_SET_POWER << 8) | 0x00);
+                        hda_verb(codec, dgn, (V_SET_PINCTL << 8) | PINCTL_OUT_EN);
+                        #ifdef HDA_TONE
+                        kprint("hda: hdmi enable pin=0x", 23);
+                        kprint_byte(dgn);
+                        kprint(" cvt=0x", 7);
+                        kprint_byte(dgcv);
+                        kprintln("", 0);
+                        #endif
+                    }
+                }
+            }
+            dgi = dgi + 1;
         }
     } else {
         hda_verb(codec, best_pin, (V_SET_PINCTL << 8) | (PINCTL_OUT_EN | PINCTL_HP_EN));
