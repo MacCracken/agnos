@@ -49,6 +49,13 @@ fn stack_canary_check(canary) {
 #    framebuffer (fb_width/fb_height/fb_scale, 8×16 glyph), or -1 (FB not up). No
 #    args, no buffer (like uptime#40). Lets a ring-3 TUI size to the real console
 #    instead of a hardcoded 80×24 (darshana tty_winsize on agnos → kii/cyim/chakshu). (1.45.13)
+# 61=net_config / 62=exec_redirect / 63=symlink / 64-69=HDA audio band — see the
+#    inline handlers below + cyrius lib/syscalls_x86_64_agnos.cyr for the full map.
+# 70=readlink(path, pathlen, buf, buflen) — symlink INTROSPECTION peer of #63: read a
+#    symbolic link's TEXT target into buf, returning the target byte length or -1. The
+#    final path component is resolved NO-FOLLOW (ext2_path_lookup_ex follow_last=0) so it
+#    reads the LINK, not its target; ext2-only. The ring-3 primitive a symlink manager
+#    (hapi) needs to SEE an existing link + byte-compare its target (stat#33 follows).
 
 var sys_exit_code = 0;
 
@@ -1217,6 +1224,32 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         if (slr > 0) { return 0; }
         return 0 - 1;
+    }
+    if (num == 70) {
+        # readlink(path=arg1, pathlen=arg2, buf=arg3, buflen=a4) — the symlink-INTROSPECTION
+        # peer of symlink#63: read the TEXT target of the symbolic link at `path` into `buf`,
+        # returning the target byte length (NOT NUL-terminated, ≤ buflen) or -1. The FINAL path
+        # component is resolved NO-FOLLOW (ext2_path_lookup_ex follow_last=0) — the whole point:
+        # the following stat#33 lookup would resolve a trailing symlink to its target, and then
+        # ext2_readlink would reject that (non-symlink) target. Returns -1 when: path not found,
+        # the final component is not a symlink (ext2_readlink's 0xA000 mode check), the target
+        # exceeds buflen, or the mount isn't ext2 (symlinks need inodes → FAT/exFAT never carry
+        # them). Validation shape mirrors stat#33; buf is a bounded user range like stat's statbuf.
+        # This is the ring-3 primitive a symlink manager (hapi status/reconcile) needs to SEE an
+        # existing link + byte-compare its target — impossible before (stat#33 always follows).
+        # ⚠ TWO-SIDED like symlink#63: the cyrius `sys_readlink`#70 peer is the ring-3 half.
+        var a4rl = ksyscall_a4_get();
+        if (sc_path_ok(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (is_user_range(arg3, a4rl) == 0) { stack_canary_check(canary); return 0 - 1; }
+        if (vfs_resolve_mount(arg1, arg2) != FS_EXT2) { stack_canary_check(canary); return 0 - 1; }
+        # 1.46.x SMP sub-bite 5: ext2_path_lookup_ex + ext2_readlink use the shared ext2 scratch.
+        fs_spin_lock();
+        var rlino = ext2_path_lookup_ex(arg1, arg2, 0);   # NO-FOLLOW the final component
+        if (rlino <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
+        var rln = ext2_readlink(rlino, arg3, a4rl);
+        fs_spin_unlock();
+        stack_canary_check(canary);
+        return rln;
     }
     if (num == 34) {
         # uname(buf=arg1, len=arg2) — writes the 64-byte identity struct: four

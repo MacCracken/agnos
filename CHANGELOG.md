@@ -5,6 +5,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.6] — 2026-07-08 — `readlink`#70: ring-3 symlink introspection (the read half of the #63 symlink pair)
+
+### Added — `readlink`#70
+
+`symlink`#63 (1.51.0) let a ring-3 program *create* a symbolic link but never *see* one. `stat`#33
+follows symlinks — including the final path component (`ext2_path_lookup` resolved a trailing symlink
+unconditionally) — and there was no `lstat`/`readlink`, so a symlink-to-existing reported as the
+target's type and a symlink-to-missing failed lookup → reported absent. A userland symlink manager
+(hapi, the GNU-stow equivalent) could therefore not do `status`/reconcile: it could neither detect an
+existing link nor byte-compare its target against the manifest. #70 closes that gap.
+
+- **`readlink(path, pathlen, buf, buflen)`#70** (`kernel/core/syscall.cyr`) — reads the TEXT target of
+  the symbolic link at `path` into `buf`, returning the target byte length (≤ `buflen`, not
+  NUL-terminated) or -1. Validation mirrors `stat`#33 (`sc_path_ok` on the path,
+  `is_user_range(buf, buflen)`, ext2-only mount); `buflen` rides `a4=r10`. Reuses the in-kernel
+  `ext2_readlink` (fast-inline / slow-block, extent-aware). -1 when the path is absent, the final
+  component is not a symlink (`ext2_readlink`'s `0xA000` mode check), the target exceeds `buflen`, or
+  the mount isn't ext2 (symlinks need inodes → FAT/exFAT never carry them). Placed right after the #63
+  handler; #70 is the next free number after the audio band (#64-69).
+- **No-follow-final-component path lookup** (`kernel/core/ext2.cyr`) — `ext2_path_lookup` split into an
+  `ext2_path_lookup_ex(path, len, follow_last)` core plus a `follow_last=1` wrapper (every prior caller
+  — open#7 / stat#33 / link#32 / rename / getdents / the WRITE-arc selftests — stays byte-identical).
+  #70 passes `follow_last=0` so a *trailing* symlink resolves to its OWN inode instead of its target; a
+  *mid-path* symlink still follows in both modes (follow_last gates only the last component of the
+  fully-resolved path). Without this, #70 would resolve the link to its target and `ext2_readlink` would
+  then reject the (non-symlink) target.
+- **ABI taste**: chose `readlink` over an `lstat`/`AT_SYMLINK_NOFOLLOW` variant of #33 — `readlink`
+  alone gives a symlink manager BOTH detection (success vs -1) AND the target text to byte-compare, in
+  one call with no second stat struct; the no-follow lookup it introduces is exactly what a future
+  `lstat` would reuse if a consumer ever needs no-follow *type* classification. Documented in
+  `docs/development/agnos-userland-abi.md` §3.2 (+ the `syscall.cyr` header map, extended to catch up
+  #61-#70).
+- ⚠ **TWO-SIDED** like #63: ring 3 reaches it via the cyrius `sys_readlink`#70 peer
+  (`lib/syscalls_x86_64_agnos.cyr`) — that half is cyrius-hands-off, filed as
+  `docs/development/issues/2026-07-08-cyrius-agnos-sys-readlink-peer.md`. The first consumer, **hapi**
+  `link_probe`, meanwhile calls it through a locally-defined number (the `AGNOS_SYS_SYMLINK`#63
+  pattern) and is validated under mirshi (which emulates #70 → host `readlink`/`readlinkat`).
+
 ## [1.53.5] — 2026-07-06 — HDMI-audio arc bites 1–3: multi-instance HDA driver + 2nd-controller probe + HDMI/DP route (QEMU-complete; digital arm iron-gated)
 
 Makes the HD-Audio driver multi-instance and adds an HDMI/DP output path as a second controller

@@ -2884,17 +2884,27 @@ fn ext2_readlink(inode_num, out, cap) {
 #   - leading "/" required; relative paths return -1
 #   - trailing "/" tolerated (treated as empty trailing component, skipped)
 #   - multiple consecutive "/" tolerated
-#   - symlinks ARE resolved (1.33.4): a component that resolves to a
-#     symlink inode is followed — its target (read via ext2_readlink:
+#   - symlinks ARE resolved (1.33.4): a non-final component that resolves
+#     to a symlink inode is followed — its target (read via ext2_readlink:
 #     fast inline or slow data-block) replaces the symlink + is spliced
 #     ahead of the unparsed remainder. Absolute targets restart at root;
 #     relative targets continue from the directory containing the link.
 #     ELOOP-capped at 8 follows (Linux MAXSYMLINKS=40; 8 is ample for
 #     base-stage and bounds the shared-scratch reuse).
+#   - the FINAL component is followed iff `follow_last != 0`. follow_last=1
+#     is the historical whole-path behavior (stat#33, open#7, link#32,
+#     rename all resolve a trailing symlink to its target); follow_last=0
+#     STOPS on a trailing symlink and returns the LINK's own inode — the
+#     no-follow primitive readlink#70 (and a future lstat) need to
+#     introspect a symlink rather than its target. Mid-path symlinks are
+#     followed in BOTH modes: follow_last gates ONLY the last component of
+#     the fully-resolved path (so `/a/b` with `/a`→`/x` still resolves `/a`
+#     then no-follows `b`). `ext2_path_lookup(path,len)` is the
+#     follow_last=1 wrapper every existing caller keeps using unchanged.
 #   - no ".."/"." resolution beyond their on-disk dirents (which point
 #     to the right inodes anyway, so walking through them works trivially)
 
-fn ext2_path_lookup(path, path_len) {
+fn ext2_path_lookup_ex(path, path_len, follow_last) {
     if (ext2_active == 0)                  { return 0 - 1; }
     if (path_len < 1)                      { return 0 - 1; }
     if (load8(path) != 47)                 { return 0 - 1; }  # must start with '/'
@@ -2949,6 +2959,22 @@ fn ext2_path_lookup(path, path_len) {
         # '/' before the remainder, or at wl if this was the last component.)
         if (ext2_get_inode(next_inode, &ext2_symres_inode) != 0) { return 0 - 1; }
         if ((ext2_inode_mode(&ext2_symres_inode) & 0xF000) == 0xA000) {
+            # No-follow-last: if this trailing symlink is the FINAL path
+            # component and the caller asked not to follow it (follow_last=0),
+            # return the LINK's own inode (resident in ext2_symres_inode =
+            # next_inode) instead of resolving its target. "Final" = only '/'
+            # separators (or nothing) remain in the work buffer after this
+            # component. Mid-path symlinks still follow — this gates only the
+            # last component, so readlink#70 reads the link a symlink manager
+            # points at, not whatever it targets.
+            if (follow_last == 0) {
+                var pk = i;
+                while (pk < wl) {
+                    if (load8(&ext2_symres_work + pk) != 47) { break; }
+                    pk = pk + 1;
+                }
+                if (pk >= wl) { return next_inode; }
+            }
             nfollow = nfollow + 1;
             if (nfollow > 8) { return 0 - 1; }   # ELOOP
 
@@ -2984,6 +3010,14 @@ fn ext2_path_lookup(path, path_len) {
     }
 
     return current_inode;
+}
+
+# The historical follow-everything path lookup — every caller before readlink#70
+# (open#7, stat#33, link#32, rename, getdents, the WRITE-arc selftests) resolves a
+# trailing symlink to its target. Thin wrapper over the _ex core with follow_last=1
+# so all of them stay byte-identical; only readlink#70 passes follow_last=0.
+fn ext2_path_lookup(path, path_len) {
+    return ext2_path_lookup_ex(path, path_len, 1);
 }
 
 # --- VFS-integrated open (Phase 3) ------------------------------------

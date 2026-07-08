@@ -11,8 +11,10 @@
 #   1. A REAL `--agnos` program (tests/symlink/symtest.cyr) calls the cyrius
 #      sys_symlink PEER to create /hn_link -> "/etc/hostname", then open()s the
 #      symlink and reads it back — the kernel's ext2_path_lookup FOLLOWS the link
-#      to /etc/hostname (seeded "archaemenid"). It prints SYMLINK-CREATE-OK and
-#      SYMLINK-TRAVERSE-OK and exits 0.
+#      to /etc/hostname (seeded "archaemenid"). It then readlink#70's the SAME path
+#      and gets the raw link text "/etc/hostname" back (no-follow — the introspection
+#      peer of #63). It prints SYMLINK-CREATE-OK / SYMLINK-TRAVERSE-OK / READLINK-OK
+#      and exits 0.
 #   2. Host-side, the symlink must land on the agnos-fs as a real symlink whose
 #      target is "/etc/hostname", and the partition must survive `e2fsck -fn`.
 #
@@ -109,7 +111,7 @@ timeout "${QEMU_TIMEOUT:-60}" qemu-system-x86_64 \
 
 echo ""
 echo "  --- symlink lines from boot log ---"
-strings "$LOG" | grep -E "^SYMLINK-|^exec: .*symtest|^exec: symlink|^run: exit" | sed 's/^/  /'
+strings "$LOG" | grep -E "^SYMLINK-|^READLINK-|^exec: .*symtest|^exec: symlink|^run: exit" | sed 's/^/  /'
 echo ""
 
 rc=0
@@ -125,11 +127,19 @@ if strings "$LOG" | grep -q "^SYMLINK-TRAVERSE-OK"; then
 else
     echo "  FAIL: no 'SYMLINK-TRAVERSE-OK' (open didn't resolve through the symlink to the target bytes)"; rc=1
 fi
-# Gate 3: clean ring-3 exit (0 = both stages passed inside the program).
-if strings "$LOG" | grep -q "^run: exit 0"; then
-    echo "  PASS: symtest exited 0 (both stages passed in ring 3)"
+# Gate 3: readlink#70 read the LINK TEXT (no-follow) — the introspection peer of #63.
+# The same /hn_link path that stage 2 FOLLOWED to "archaemenid" here returns its raw
+# target "/etc/hostname" (13 B), proving ext2_path_lookup_ex(follow_last=0).
+if strings "$LOG" | grep -q "^READLINK-OK"; then
+    echo "  PASS: readlink('/hn_link') returned the link text '/etc/hostname' (kernel readlink#70, no-follow)"
 else
-    echo "  WARN: no 'run: exit 0' marker (the two stage markers above are the load-bearing gate)"
+    echo "  FAIL: no 'READLINK-OK' (readlink#70 didn't return the symlink's target text; open-follows but readlink no-follows)"; rc=1
+fi
+# Gate 4: clean ring-3 exit (0 = all three stages passed inside the program).
+if strings "$LOG" | grep -q "^run: exit 0"; then
+    echo "  PASS: symtest exited 0 (create + traverse + readlink all passed in ring 3)"
+else
+    echo "  WARN: no 'run: exit 0' marker (the three stage markers above are the load-bearing gate)"
 fi
 
 # --- host verification: the symlink landed on the platter + e2fsck clean ---

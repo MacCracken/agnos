@@ -13,8 +13,12 @@
 #   1. sys_symlink("/etc/hostname", "/hn_link")  -> create the symlink, ret 0.
 #   2. open("/hn_link") + read                    -> ext2_path_lookup FOLLOWS the
 #      symlink to /etc/hostname (seeded "archaemenid"), returning its bytes.
-# Markers on fd 1 let the smoke distinguish the create stage from the traverse
-# stage; the exit code identifies the failing stage (0 = full PASS).
+#   3. readlink("/hn_link")                        -> #70 NO-FOLLOWs the final
+#      component and returns the LINK TEXT "/etc/hostname" (13 B), NOT the followed
+#      content stage 2 read. The follow (2) vs no-follow (3) contrast on the SAME
+#      path is the whole reason #70 exists (symlink introspection from ring 3).
+# Markers on fd 1 let the smoke distinguish the create/traverse/readlink stages;
+# the exit code identifies the failing stage (0 = full PASS).
 #
 # Run by the SYMLINK_SELFTEST kernel hook via `run /bin/symtest`.
 
@@ -58,6 +62,24 @@ fn main(): i64 {
         return 14;
     }
     sys_write(1, "SYMLINK-TRAVERSE-OK\n", 20);
+
+    # 3. readlink("/hn_link") — the #70 introspection path. Where stage 2's open()
+    #    FOLLOWED the link to /etc/hostname and read "archaemenid", readlink
+    #    NO-FOLLOWs the final component and returns the LINK TEXT "/etc/hostname"
+    #    (13 bytes). Same path, opposite resolution — that contrast is the point.
+    #    No cyrius `sys_readlink`#70 peer yet (hands-off), so call it raw; buflen
+    #    (64) rides a4=r10, exactly like sys_symlink's linkpathlen.
+    var lbuf[64];
+    var ln = syscall(70, "/hn_link", 8, &lbuf, 64);
+    if (ln != 13) {
+        sys_write(1, "READLINK-LEN-FAIL\n", 18);
+        return 15;
+    }
+    if (streqn(&lbuf, "/etc/hostname", 13) == 0) {
+        sys_write(1, "READLINK-TARGET-MISMATCH\n", 24);
+        return 16;
+    }
+    sys_write(1, "READLINK-OK\n", 12);
     return 0;
 }
 
