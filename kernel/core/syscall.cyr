@@ -1552,6 +1552,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # blit(src=arg1, w=arg2, h=arg3, dstxy=arg4) — copy a w×h block of 32bpp
         # pixels from the ring-3 buffer `src` (tightly packed, w*4 bytes/row) into
         # the framebuffer at (dst_x, dst_y) where arg4 = (dst_y<<16)|dst_x. The dest
+        #
+        # 1.53.7 SHADOW EXEMPT: writes the WC FB directly, NOT the fb_console shadow
+        # buffer. blit is the graphical-TAKEOVER path (doom/fbtest run full-screen +
+        # cli/loop — they never interleave with console text scroll), so mirroring
+        # every pixel into the shadow would tax doom's per-frame blit for zero benefit.
+        # CONSTRAINT: a future tool that blits INTO the live console region and then
+        # prints scrolling text would see the blit erased by the next scroll flush —
+        # such a tool must mirror here (add `store32(a + (fb_shadow - bl_fb), px)` when
+        # fb_shadow != 0) or paint via fb_putc instead.
         # rect is CLIPPED to the FB bounds (off-screen rows/cols dropped), so both
         # the src reads and the FB writes are provably in range. Pixels copy RAW (no
         # format conversion) — the caller supplies fbinfo's reported byte order. The

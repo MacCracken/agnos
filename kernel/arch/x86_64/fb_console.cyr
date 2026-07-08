@@ -52,6 +52,15 @@
 var fb_cur_x = 0;        # cursor column (in 8*scale-px cells from x=0)
 var fb_cur_y = 0;        # cursor row (in 16*scale-px cells from FB_CONSOLE_Y0)
 var fb_console_ready = 0;
+# 1.53.7 — kernel-private WB RAM shadow buffer (0 = none → every writer keeps its
+# original direct-to-WC-FB path). When set (fb_shadow_init succeeds post-pmm), each
+# writer MIRRORS its pixels here at the SAME byte offset (shadow uses the FB pitch),
+# so fb_scroll_up becomes a pure RAM memmove + one WRITE-ONLY flush instead of
+# reading the WC framebuffer back (~1M uncached WC loads/newline at 1080p). Backing
+# is one contiguous 2 MB-region run in the 0-256 MB identity window, so phys==VA
+# under both the kernel and per-process CR3s. See fb_shadow_init.
+var fb_shadow = 0;
+var fb_shadow_size = 0;  # bytes reserved (n * 2 MB); 0 until fb_shadow_init succeeds
 
 # Write one byte to the CMOS extended bank (slots 0x80..0xFF, addressed
 # via port pair 0x72=index / 0x73=data). The hardware index is the
@@ -266,6 +275,55 @@ fn fb_verify_wc() {
     return 0;
 }
 
+# 1.53.7 — allocate the kernel-private WB RAM shadow buffer that backs the text
+# console, killing the WC framebuffer READ-BACK on every scroll. Called from
+# kernel/core/main.cyr AFTER pmm_init + the post-pmm WC-remap retry + fb_verify_wc
+# (pmm must be live; the FB must already be WC so the one-time read-back sync below
+# copies the real console image, not a stale WB view).
+#
+# Model: Linux simpledrm / BSD rasops CPU-shadow. Sized to pitch*height rounded up
+# to whole 2 MB regions and allocated as one contiguous top-down run
+# (pmm_alloc_2mb_run) inside the 0-256 MB identity window, so it is addressable
+# phys==VA under both the kernel boot CR3 and every per-process CR3 (the syscall
+# path's fb_putc runs under the latter) — no vmm_map needed.
+#
+# FALLBACK: FB absent, paint-disabled, or alloc failure (headless / low-RAM /
+# fragmented pool) leaves fb_shadow = 0 and every writer keeps its original
+# direct-to-FB path — the console degrades to today's behavior, never breaks.
+fn fb_shadow_init() {
+    var phys = fb_fb_phys();
+    if (phys == 0) { return 0; }               # no framebuffer → nothing to shadow
+    if (fb_console_ready == 0) { return 0; }   # FB paint disabled (bad pf) → skip
+    var pitch  = fb_pitch();
+    var height = fb_height();
+    var need = pitch * height;
+    if (need <= 0) { return 0; }
+    # Round the frame byte-size up to whole 2 MB regions.
+    var n = (need + 0x1FFFFF) / 0x200000;
+    var base = pmm_alloc_2mb_run(n);
+    if (base == 0) {
+        serial_println("fb: shadow alloc failed, direct-paint (scroll reads WC FB)", 57);
+        return 0;
+    }
+    # One-time sync: copy the current FB image (boot log already painted) into the
+    # shadow so the first post-init scroll's flush is consistent with what's on
+    # screen. This is the ONLY WC read-back the shadow ever performs — one frame, at
+    # boot. u64 block copy (2 px/cycle); ceil to cover a non-8-aligned frame tail
+    # (the extra <=7 B stay within the FB's 2 MB-aligned WC region).
+    var words = (need + 7) / 8;
+    for (var i = 0; i < words; i = i + 1) {
+        store64(base + i * 8, load64(phys + i * 8));
+    }
+    fb_shadow = base;
+    fb_shadow_size = n * 0x200000;
+    serial_print("fb: shadow ", 11);
+    kfmt_int(n * 2);
+    serial_print(" MB @ ", 6);
+    kfmt_hex0x(base);
+    serial_println(" (scroll WC read-back eliminated)", 33);
+    return 0;
+}
+
 # Get framebuffer geometry from boot_info. Returns 0 if unavailable
 # (boot_info_ptr unset, fb_phys=0, or pixel-format incompatible). Callers
 # should early-return on 0.
@@ -311,6 +369,10 @@ fn fb_pf() {
 # paints the idt.cyr fault-bar across the top. Diagnostic — strip once the net path
 # is iron-clean (cf. the 1.44.x kbd_read FB markers). The color is a raw 0x00RRGGBB
 # dword; under a BGRX FB (fb_pf==1) R/B swap but each stays a distinct bright hue.
+#
+# 1.53.7 SHADOW EXEMPT: writes the WC FB directly, NOT the shadow — a diagnostic
+# repainted on every low-frequency net syscall, so a scroll flush that transiently
+# clears it is immediately corrected by the next paint. Deliberately not mirrored.
 fn fb_dbg_beacon(code) {
     var fb = fb_fb_phys();
     if (fb == 0) { return 0; }
@@ -507,9 +569,17 @@ fn fb_fill_cell(cell_x, abs_y, color) {
     var cell_h = 16 * s;
     var x_px = cell_x * cell_w;
     if (x_px + cell_w > width) { return 0; }
+    # Mirror into the WB shadow at the same byte offset (1.53.7). sh_delta is the
+    # loop-invariant shadow-vs-FB address bias; the have_sh branch is perfectly
+    # predicted, so the extra WB store costs ~nothing next to the WC store.
+    var have_sh = 0;
+    var sh_delta = 0;
+    if (fb_shadow != 0) { have_sh = 1; sh_delta = fb_shadow - fb; }
     for (var dy = 0; dy < cell_h; dy = dy + 1) {
         for (var dx = 0; dx < cell_w; dx = dx + 1) {
-            store32(fb + (abs_y + dy) * pitch + (x_px + dx) * 4, color);
+            var a = fb + (abs_y + dy) * pitch + (x_px + dx) * 4;
+            store32(a, color);
+            if (have_sh == 1) { store32(a + sh_delta, color); }
         }
     }
     return 0;
@@ -530,15 +600,57 @@ fn fb_scroll_up() {
     var pitch = fb_pitch();
     var height = fb_height();
     var cell_h = 16 * fb_scale();
-    # u64 block-copy: 2 pixels per cycle. At 1080p, pitch=7680 -> 960
-    # u64s per row (vs 1920 u32s). Halves both inner-loop count and
-    # WC-write-combiner burst count. Read side still pays WC-mapped
-    # FB read latency — if scroll feel doesn't improve, that's the
-    # real bottleneck and we need a RAM-side shadow buffer.
+    # u64 block-copy: 2 pixels per cycle. At 1080p, pitch=7680 -> 960 u64s per row
+    # (vs 1920 u32s). Halves both inner-loop count and WC-write-combiner burst count.
     var stride_u64 = pitch / 8;
     var rows_to_copy = height - FB_CONSOLE_Y0 - cell_h;
     if (rows_to_copy <= 0) { return 0; }
-    # Copy line-by-line, top-down (no overlap risk since src is below dst).
+    var clear_y = FB_CONSOLE_Y0 + rows_to_copy;
+    # Two packed pixels per u64 for the bottom-row clear (1.43.1: current bg, not a
+    # hardcoded FB_BG=0; black → 0, identical to before).
+    var bg64 = (fb_bg_color << 32) | fb_bg_color;
+
+    if (fb_shadow != 0) {
+        # SHADOW PATH (1.53.7). The killer optimization: the OLD path read the WC
+        # framebuffer back (~1M uncached WC loads/newline at 1080p) to source the
+        # scrolled pixels. With a WB RAM shadow the scroll is a pure RAM memmove +
+        # ONE write-only flush — zero FB reads. WC reads are far costlier than WC
+        # writes (uncombinable, pipeline-stalling), so the real-Zen win exceeds the
+        # naive "half the traffic" estimate.
+        var sh = fb_shadow;
+        # 1. Shift the shadow up by one cell row. dst is BELOW src and the ranges
+        #    overlap, so a forward (low→high) copy reads each source word before any
+        #    later store can clobber it — safe without a temp.
+        for (var y = 0; y < rows_to_copy; y = y + 1) {
+            var s_src = sh + (FB_CONSOLE_Y0 + cell_h + y) * pitch;
+            var s_dst = sh + (FB_CONSOLE_Y0 + y) * pitch;
+            for (var x = 0; x < stride_u64; x = x + 1) {
+                store64(s_dst + x * 8, load64(s_src + x * 8));
+            }
+        }
+        # 2. Clear the new bottom cell_h rows in the shadow.
+        for (var yc = 0; yc < cell_h; yc = yc + 1) {
+            var s_row = sh + (clear_y + yc) * pitch;
+            for (var xc = 0; xc < stride_u64; xc = xc + 1) {
+                store64(s_row + xc * 8, bg64);
+            }
+        }
+        # 3. Flush the whole console region [FB_CONSOLE_Y0 .. height) shadow→FB,
+        #    WRITE-ONLY (the reads hit the WB shadow, cheap; the WC stores are the
+        #    same volume the old path wrote, minus every FB read).
+        var flush_rows = height - FB_CONSOLE_Y0;
+        for (var yf = 0; yf < flush_rows; yf = yf + 1) {
+            var f_src = sh + (FB_CONSOLE_Y0 + yf) * pitch;
+            var f_dst = fb + (FB_CONSOLE_Y0 + yf) * pitch;
+            for (var xf = 0; xf < stride_u64; xf = xf + 1) {
+                store64(f_dst + xf * 8, load64(f_src + xf * 8));
+            }
+        }
+        return 0;
+    }
+
+    # FALLBACK PATH (no shadow): the original in-place WC FB copy — reads the FB
+    # back. Copy line-by-line, top-down (no overlap risk since src is below dst).
     for (var y = 0; y < rows_to_copy; y = y + 1) {
         var src = fb + (FB_CONSOLE_Y0 + cell_h + y) * pitch;
         var dst = fb + (FB_CONSOLE_Y0 + y) * pitch;
@@ -546,10 +658,6 @@ fn fb_scroll_up() {
             store64(dst + x * 8, load64(src + x * 8));
         }
     }
-    # Clear the new bottom cell_h-px row to the CURRENT background colour (1.43.1:
-    # was hardcoded FB_BG=0). Pack two pixels per u64; black → 0, identical to before.
-    var clear_y = FB_CONSOLE_Y0 + rows_to_copy;
-    var bg64 = (fb_bg_color << 32) | fb_bg_color;
     for (var y = 0; y < cell_h; y = y + 1) {
         for (var x = 0; x < stride_u64; x = x + 1) {
             store64(fb + (clear_y + y) * pitch + x * 8, bg64);
@@ -575,10 +683,17 @@ fn fb_console_clear() {
     var height = fb_height();
     var stride_u64 = pitch / 8;
     var bg64 = (fb_bg_color << 32) | fb_bg_color;   # two packed pixels per u64
+    # Mirror the clear into the WB shadow so a later scroll flush doesn't repaint
+    # stale content over a cleared screen (1.53.7).
+    var have_sh = 0;
+    var sh_delta = 0;
+    if (fb_shadow != 0) { have_sh = 1; sh_delta = fb_shadow - fb; }
     for (var py = 0; py < height; py = py + 1) {
         var scan = fb + py * pitch;
         for (var px = 0; px < stride_u64; px = px + 1) {
-            store64(scan + px * 8, bg64);
+            var a = scan + px * 8;
+            store64(a, bg64);
+            if (have_sh == 1) { store64(a + sh_delta, bg64); }
         }
     }
     fb_cur_x = 0;
@@ -792,6 +907,13 @@ fn fb_putc(ch) {
     var row_pitch = s * pitch;           # bytes one scaled glyph-row spans
     var col_stride = s * 4;              # bytes one scaled column spans (s px × 4 B)
     var row_top = fb + y_px * pitch + x_px * 4;   # byte addr of glyph (row 0, col 0)
+    # Shadow mirror (1.53.7): sh_delta is the loop-invariant shadow-vs-FB address
+    # bias; have_sh is loop-invariant so the per-pixel branch is perfectly predicted
+    # and the extra WB store hits L1 (the shadow row is hot) — negligible next to the
+    # WC store that dominates. The visible FB path is byte-identical to pre-1.53.7.
+    var have_sh = 0;
+    var sh_delta = 0;
+    if (fb_shadow != 0) { have_sh = 1; sh_delta = fb_shadow - fb; }
     for (var row = 0; row < 16; row = row + 1) {
         var bits = load8(glyph + row);
         var scan0 = row_top;             # this glyph-row's top scanline, col 0
@@ -804,6 +926,7 @@ fn fb_putc(ch) {
                 var px = scan;
                 for (var dx = 0; dx < s; dx = dx + 1) {
                     store32(px, color);
+                    if (have_sh == 1) { store32(px + sh_delta, color); }
                     px = px + 4;
                 }
                 scan = scan + pitch;     # next scanline within this scaled row

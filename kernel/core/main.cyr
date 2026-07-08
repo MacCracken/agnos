@@ -155,6 +155,11 @@ kprintln("Keyboard ISR installed (full US QWERTY)", 39);
 # until virtio_net_init points the NIC's MSI-X table entry at this vector (bite 2).
 nic_rx_isr_build();
 idt_set_gate(&idt + 80 * 16, &nic_rx_isr, 0x08, 0x8E);
+# 1.53.7: xHCI RX (USB-HID keyboard) MSI-X ISR at vector 0x51 (81) — built + registered here;
+# dormant until the xHCI MSI-X table vector is ARMED (unmasked) after hid_kbd_configure (below),
+# so it can't steal EP0 events from xhci_wait_transfer_event during enumeration.
+xhci_rx_isr_build();
+idt_set_gate(&idt + 81 * 16, &xhci_rx_isr, 0x08, 0x8E);
 
 pt_init();
 kprint("Page tables: ", 13);
@@ -287,6 +292,15 @@ pdpt_guard_selftest();
 # differently from the first.
 vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 fb_verify_wc();
+
+# 1.53.7 — allocate the WB RAM console shadow buffer (kills the WC framebuffer
+# read-back on every scroll). Post-pmm + post-WC-remap so the one-time FB→shadow
+# sync copies the real (WC) console image. Falls back to direct-paint (today's
+# behavior) if the FB is absent or the contiguous 2 MB-region run can't be had.
+# Placed BEFORE the boot-CR3 switch below, but the shadow is in the 0-256 MB
+# identity window that every CR3 (gnoboot's, 0x1000's, and per-proc) maps, so the
+# ordering is immaterial to its addressability.
+fb_shadow_init();
 
 #ifndef BOOTCR3_KEEP_GNOBOOT_CR3
 # 1.50.x (RAM full-usage arc, bite 2) — switch the kernel onto its OWN complete PML4 (0x1000) instead of
@@ -494,6 +508,15 @@ for (var s = 1; s <= 64; s = s + 1) {
     if (sctx != 0) {
         hid_kbd_configure(s);
     }
+}
+
+# 1.53.7 — the keyboard is now enumerated + configured, so ARM the xHCI RX MSI-X vector
+# (0x51) for interrupt-driven input. Deferred to here (post hid_kbd_configure) so the
+# xhci_rx_handler's hid_poll can't steal EP0 Transfer Events from xhci_wait_transfer_event
+# during the control transfers above. No-op if no keyboard was found — the box then stays
+# on the 100 Hz tick drain (timer_handler's fallback hid_poll).
+if (hid_kbd_slot_id != 0) {
+    pci_msix_arm_vector0(xhci_pci_idx, 0x51);
 }
 
 # USB Mass Storage Phase 1 (1.31.2 storage arc — discovery only). Walks

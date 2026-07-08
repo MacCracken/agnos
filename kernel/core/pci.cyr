@@ -256,6 +256,30 @@ fn pci_enable_msix_unmasked(idx) {
     return 0;
 }
 
+# 1.53.7 — arm a configured MSI-X vector for delivery: reprogram table entry 0's Message
+# Data to `vec` and CLEAR its per-vector Mask bit. Companion to pci_enable_msix_unmasked,
+# which leaves entry 0 with Message Data 0x40 + per-vector Mask=1 (configured but silent).
+# Call it AFTER the consumer's IDT vector + ISR are registered (and, for xHCI, after
+# enumeration) so the now-live interrupt has a handler and won't race the EP0 control path.
+# Recomputes the table address exactly as pci_enable_msix_unmasked Phase 2. Returns 1/0.
+fn pci_msix_arm_vector0(idx, vec) {
+    var slot = PciDev_slot(&pci_devs + idx * 32);
+    var bf = load64(&pci_busfunc + idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    var msix_off = pci_find_cap(idx, 0x11);
+    if (msix_off == 0) { return 0; }
+    var tob = pci_read32(bus, slot, func, msix_off + 4);
+    var bir = tob & 0x07;
+    var tbl_off = tob & 0xFFFFFFF8;
+    var bar = pci_bar_64(idx, bir);
+    var tbl = bar + tbl_off;
+    store32(tbl + 8, vec);      # Message Data = the IDT vector to deliver on
+    store32(tbl + 12, 0);       # clear per-vector Mask → the interrupter now posts
+    var flush = load32(tbl + 12);
+    return 1;
+}
+
 # Program the device's legacy-MSI capability (PCI cap 0x05) to deliver a single
 # message to IDT `vector` on the BSP LAPIC, then enable MSI. Unlike the MSI
 # fallback inside pci_enable_msix_{masked,unmasked} — which only flips the Enable

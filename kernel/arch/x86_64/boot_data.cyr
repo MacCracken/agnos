@@ -42,6 +42,7 @@ var timer_ticks = 0;
 var timer_isr[64];
 var kb_isr[96];    # keyboard ISR machine code (~83 bytes)
 var nic_rx_isr[64];  # NIC RX MSI-X ISR machine code (~62 bytes) — 1.51.5
+var xhci_rx_isr[64]; # xHCI RX (USB-HID) MSI-X ISR machine code (~62 bytes) — 1.53.7
 var nm_isr[64];    # #NM (vector 7) FP-context-switch ISR machine code — 1.53.x B3 (timer_isr shape)
 var kb_buf[256];
 var kb_head = 0;

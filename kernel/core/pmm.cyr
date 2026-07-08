@@ -627,6 +627,51 @@ fn pmm_alloc_2mb() {
     return 0;
 }
 
+# 1.53.7 — allocate `n` CONTIGUOUS 2 MB regions, scanning TOP-DOWN (highest region
+# first) so the run lands in the HIGH end of the pool, keeping the low regions free
+# for ELF code / user stacks / mmap heap (same fragmentation-avoidance rationale as
+# pmm_alloc's top-down 4 KB scan). Returns the 2 MB-aligned physical base of the
+# LOWEST region in the run, or 0 if no free run of `n` regions exists.
+#
+# CEILING = region 128 (256 MB), NOT pmm_2mb_top_region. The caller (fb_shadow_init)
+# addresses the run phys==VA under BOTH the kernel boot CR3 (0-4 GB via pt_init /
+# 0x1000) AND every per-process CR3 — and the per-proc identity window is only PD
+# [0..127] = 0-256 MB (proc.cyr:549). Regions above 256 MB are unmapped in per-proc
+# context, so a shadow there would #PF in the syscall-path fb_putc. Clamp lower if
+# the live bitmap is smaller (a <256 MB machine). A region counts as free only when
+# all 512 pages are free, which the pmm's reserved/unbacked-page marking guarantees
+# is backed usable RAM (the same invariant sys_mmap's pmm_alloc_2mb relies on), so a
+# free run is always physically present. Allocated once at boot; never freed.
+fn pmm_alloc_2mb_run(n) {
+    if (n < 1) { return 0; }
+    var ceil = 128;                                  # 256 MB per-proc identity ceiling
+    if (pmm_2mb_top_region < ceil) { ceil = pmm_2mb_top_region; }
+    pmm_spin_lock();
+    # `top` = highest region of a candidate run; try the top-most window first.
+    for (var top = ceil - 1; top >= n; top = top - 1) {
+        var lo = top - n + 1;
+        var free = 1;
+        for (var r = lo; r <= top; r = r + 1) {
+            var base = r * 512;
+            for (var i = 0; i < 512; i = i + 1) {
+                if (pmm_test(base + i) != 0) { free = 0; i = 512; }
+            }
+            if (free == 0) { r = top + 1; }          # short-circuit the run scan
+        }
+        if (free == 1) {
+            for (var r2 = lo; r2 <= top; r2 = r2 + 1) {
+                var b2 = r2 * 512;
+                for (var j = 0; j < 512; j = j + 1) { pmm_set(b2 + j); }
+            }
+            pmm_used = pmm_used + n * 512;
+            pmm_spin_unlock();
+            return lo * 512 * 0x1000;
+        }
+    }
+    pmm_spin_unlock();
+    return 0;
+}
+
 # Count currently-free 2 MB regions (lets sys_mmap pre-check a multi-region
 # request so its map loop can't fail part-way — single-threaded, so the count
 # stays valid through the subsequent allocs).

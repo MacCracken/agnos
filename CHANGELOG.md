@@ -5,6 +5,61 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.7] — 2026-07-08 — console-perf closeout: interrupt-driven keyboard + FB RAM shadow buffer (last 1.53.x burn)
+
+Two kernel-perf fixes cut together to ride the final 1.53.x iron burn — both attack the same
+**timer-tick-paced, WC-read-back** latency class the net RX floor had before 1.51.5. QEMU-validated
+(boot + USB-xHCI typing + long-scroll); iron numbers pending the closeout burn (QEMU understates both —
+WC read-back is cheap under QEMU, and QEMU MSI-X ≠ AMD FCH 1022:1639). Plan:
+`docs/development/planning/fb-kbd-perf-153x.md`.
+
+### Added — interrupt-driven USB-HID keyboard (the net-RX-IRQ analog)
+
+Input was **100 Hz timer-tick-paced, not event-driven**: `hid_poll()` drained the xHCI event ring only
+from the read loop, and `kbd_read_blocking` parked on `hlt` waking solely on the 100 Hz LAPIC timer
+(`timer_handler` never called `hid_poll`) — up to ~10 ms per-key lag on the USB-only target, worse under
+long syscalls. Fix mirrors the 1.51.5 NIC RX MSI-X ISR exactly.
+
+- **`xhci_rx_isr` + `xhci_rx_handler` + `xhci_rx_isr_build`** (`boot_data.cyr`, `pic.cyr`) — a byte-for-byte
+  clone of `nic_rx_isr_build` (15-reg push → `call xhci_rx_handler` → 15-reg pop → iretq). The handler
+  runs `hid_poll()` (already ISR-safe: `input_lock`/cli-first, self-gated on `hid_kbd_slot_id==0`), sets
+  the `xhci_rx_irq_seen` LIVE latch, and `apic_eoi`s. Wired to **IDT vector 0x51** (81, next to net's 0x50)
+  in `main.cyr`.
+- **`pci_msix_arm_vector0(idx, vec)`** (`pci.cyr`) — recomputes the MSI-X table address and writes Message
+  Data = 0x51 + clears the per-vector mask. Called from `main.cyr` **only after `hid_kbd_configure`
+  succeeds** (`hid_kbd_slot_id != 0`) — deferred past enumeration so the ISR's `hid_poll` can't steal EP0
+  Transfer Events from the synchronous control-transfer consumer. `pci_enable_msix_unmasked` still programs
+  the table silent (Data 0x40, mask=1); this arms it live.
+- **Tick-drain fallback** — `timer_handler` now also calls `hid_poll()` (CPU 0), so a missed/masked MSI on
+  real Zen degrades to today's tick-paced behavior, not a dead keyboard (net kept both paths too).
+- **`xhci: RX MSI LIVE (…vector 0x51)`** printed once from the non-ISR read loop (`keyboard.cyr`
+  `kb_has_key`) — the dispositive "MSI fires on silicon" proof, the keyboard analog of `r8169: RX MSI LIVE`.
+  **Printed under QEMU** (qemu-xhci delivered to 0x51, ISR serviced, typing interrupt-driven); its presence
+  on the iron burn is the archaemenid close-out check.
+
+### Changed — framebuffer console: WB RAM shadow buffer (kill the scroll WC read-back)
+
+`fb_scroll_up` **read the WC-mapped framebuffer back** every scroll (~1M uncacheable WC loads/newline at
+1080p) to source the scrolled pixels — WC reads are uncombinable and pipeline-stalling, the real scroll
+bottleneck the old inline comment already flagged.
+
+- **`pmm_alloc_2mb_run(n)`** (`pmm.cyr`) — allocates `n` CONTIGUOUS 2 MB regions top-down (keeping low
+  regions free for ELF/stack/heap), capped at the **256 MB per-proc identity ceiling** (proc.cyr:549
+  PD[0..127]) so the run is addressable `phys==VA` under both the kernel boot CR3 (0–1 GB via PD@0x3000)
+  and every per-process CR3 — no `vmm_map` needed.
+- **`fb_shadow` + `fb_shadow_init`** (`fb_console.cyr`) — a kernel-private WB shadow sized to
+  pitch×height, allocated post-pmm/post-WC-remap with a one-time FB→shadow read-back sync (Linux
+  simpledrm / BSD rasops CPU-shadow model). Every writer (`fb_putc` glyph loop, `fb_fill_cell`,
+  `fb_console_clear`) **mirrors** its pixels into the shadow at the same byte offset (branch is
+  loop-invariant; the extra WB store hits L1 — negligible next to the WC store). `fb_scroll_up` becomes a
+  pure RAM memmove + one **write-only** flush — zero FB reads.
+- **Graceful fallback** — FB absent / paint-disabled / alloc failure (headless, low-RAM, fragmented pool)
+  leaves `fb_shadow = 0` and every writer keeps its original direct-to-FB path; the console degrades to
+  today's behavior, never breaks. `blit`#39 and `fb_dbg_beacon` are documented **shadow-exempt** (the
+  graphical-takeover / transient-diagnostic paths that never interleave with console text scroll).
+- QEMU: `fb: shadow 4 MB @ 0xfa00000` (top-down at ~250 MB, region 127 skipped for the 4 KB-alloc
+  cluster), booted through a boot log far longer than one screen (many shadow-path scrolls), no fault.
+
 ## [1.53.6] — 2026-07-08 — `readlink`#70: ring-3 symlink introspection (the read half of the #63 symlink pair)
 
 ### Added — `readlink`#70
