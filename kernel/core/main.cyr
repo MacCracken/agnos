@@ -2260,6 +2260,20 @@ sh_exec("run /bin/doom", 13);
 kprintln("exec: doom returned", 19);
 #endif
 
+#ifdef AETHERSAFHA_SELFTEST
+# desktop bring-up — the sovereign compositor (the first real graphical userland
+# beyond doom). /bin/aethersafha (aethersafha built --agnos) is seeded onto the
+# ext2 root by scripts/aethersafha-smoke.sh; run the ELF from disk in ring 3. It
+# opens the bhumi backend, renders its desktop (backdrop + windows + shell panel)
+# to the framebuffer via fbinfo#38 + blit#39, and loops (the real compositor
+# loop) — so the boot intentionally "parks" here while it renders;
+# aethersafha-smoke.sh screendumps the live framebuffer. "exec: aethersafha
+# returned" only prints if it exits (it shouldn't, with the continuous loop).
+kprintln("exec: running /bin/aethersafha", 30);
+sh_exec("run /bin/aethersafha", 20);
+kprintln("exec: aethersafha returned", 26);
+#endif
+
 #ifdef DOOM_AUDIO_SELFTEST
 # 1.52.7 — cyrius-doom audio bring-up (the FIRST real ring-3 exercise of the
 # snd_write#66 user-buffer path — snd-smoke drives the band from kernel context,
