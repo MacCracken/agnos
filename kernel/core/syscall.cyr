@@ -655,6 +655,101 @@ fn sys_open_ext2_inner(arg1, arg2, arg3) {
     return ext2_open(arg1, arg2);
 }
 
+# ================================================================
+# Kernel shared-memory buffers (shm #71-74) — the sovereign shared-buffer PRESENT
+# backend (setu buf.cyr's agnos path). A client WRITEs its rendered pixels into a
+# kernel-OWNED buffer keyed by a small id, ATTACH carries the id (not the pixels),
+# and the compositor READs them back out. This sidesteps the single-CPU two-proc TCP
+# flow-control deadlock (TCP_RX_RING = 2 KB, but a surface is hundreds of KB).
+#
+# COPY-based (not shared-page-mapped) ON PURPOSE: the buffer is kmalloc'd (kernel heap,
+# present in EVERY proc's CR3 via the kernel mirror), so the client's shm_write and the
+# compositor's shm_read each reach it from their own syscall CR3 with a plain copy — no
+# cross-proc page mapping, and a client that exits right after present can't free it
+# (proc_free_address_space only frees a proc's OWN arena pages, never the kernel heap).
+# See agnosticos docs/development/planning/shared-buffer-present.md.
+var SHM_MAX = 16;
+var SHM_MAX_SIZE = 2097152;         # 2 MB — one pmm page per buffer (bite-2 cap; multi-page = follow-up)
+var shm_phys[16];                   # 2 MB physical base per slot (0 = free)
+var shm_kva[16];                    # kernel access VA for the page (kernel-mirror; every-CR3 reachable)
+var shm_size[16];                   # byte size per slot
+
+# ids are 1-BASED: 0 is the setu "inline pixels" sentinel (setu_attach arg5), so a real
+# shm buffer must never be 0. slot = id - 1.
+fn shm_slot_valid(id) {
+    if (id < 1) { return 0; }
+    if (id > SHM_MAX) { return 0; }
+    if (load64(&shm_phys + (id - 1) * 8) == 0) { return 0; }
+    return 1;
+}
+
+# Byte copy (word-fast + byte tail). Both ends are reachable in the current CR3
+# (the user range in the caller's arena + the shm page's kernel-mirror KVA).
+fn shm_copy(dst, src, n) {
+    var words = n / 8;
+    var wi = 0;
+    while (wi < words) { store64(dst + wi * 8, load64(src + wi * 8)); wi = wi + 1; }
+    var bi = words * 8;
+    while (bi < n) { store8(dst + bi, load8(src + bi)); bi = bi + 1; }
+    return 0;
+}
+
+# shm_create(size) -> slot id (0..SHM_MAX-1) or -1 (bad size / OOM / table full).
+# Backed by a single 2 MB pmm page (kmalloc caps out well below a surface); the page's
+# kernel-access VA lives in the kernel mirror, so shm_write (client CR3) and shm_read
+# (compositor CR3) both reach it with a plain copy — no cross-proc page mapping.
+fn shm_create(size) {
+    if (size <= 0) { return 0 - 1; }
+    if (size > SHM_MAX_SIZE) { return 0 - 1; }
+    var i = 0;
+    while (i < SHM_MAX) {
+        if (load64(&shm_phys + i * 8) == 0) {
+            var phys = pmm_alloc_2mb();
+            if (phys == 0) { return 0 - 1; }
+            var kva = pmm_kva_for_access(phys);
+            store64(&shm_phys + i * 8, phys);
+            store64(&shm_kva + i * 8, kva);
+            store64(&shm_size + i * 8, size);
+            return i + 1;                           # 1-based id (0 reserved for "inline")
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# shm_write(id, user_src, size) -> 0 / -1. Copies user src INTO the shm page.
+fn shm_write(id, src, size) {
+    if (shm_slot_valid(id) == 0) { return 0 - 1; }
+    var slot = id - 1;
+    if (size <= 0) { return 0 - 1; }
+    if (size > load64(&shm_size + slot * 8)) { return 0 - 1; }
+    if (is_user_range(src, size) == 0) { return 0 - 1; }
+    shm_copy(load64(&shm_kva + slot * 8), src, size);
+    return 0;
+}
+
+# shm_read(id, user_dst, size) -> 0 / -1. Copies the shm page OUT into user dst.
+fn shm_read(id, dst, size) {
+    if (shm_slot_valid(id) == 0) { return 0 - 1; }
+    var slot = id - 1;
+    if (size <= 0) { return 0 - 1; }
+    if (size > load64(&shm_size + slot * 8)) { return 0 - 1; }
+    if (is_user_range(dst, size) == 0) { return 0 - 1; }
+    shm_copy(dst, load64(&shm_kva + slot * 8), size);
+    return 0;
+}
+
+# shm_free(id) -> 0 / -1. Release the 2 MB page + the slot.
+fn shm_free(id) {
+    if (shm_slot_valid(id) == 0) { return 0 - 1; }
+    var slot = id - 1;
+    pmm_free_2mb(load64(&shm_phys + slot * 8));
+    store64(&shm_phys + slot * 8, 0);
+    store64(&shm_kva + slot * 8, 0);
+    store64(&shm_size + slot * 8, 0);
+    return 0;
+}
+
 fn ksyscall(num, arg1, arg2, arg3) {
     # Stack-canary backstop: snapshot at entry, re-checked before returning on the
     # syscalls that do the most pointer/buffer work (the 1.41.3 FS group + pipe/
@@ -1267,6 +1362,15 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return rln;
     }
+    # shm #71-74 — kernel shared-memory buffers (the sovereign shared-buffer PRESENT
+    # backend; see the shm_* helpers + planning/shared-buffer-present.md). COPY-based:
+    # the client shm_write#72s its pixels into a kmalloc'd kernel buffer, ATTACH carries
+    # the id, the compositor shm_read#73s them out — no inline TCP stream (deadlocks on
+    # agnos > TCP_RX_RING), no cross-proc page mapping (no proc-exit free hazard).
+    if (num == 71) { stack_canary_check(canary); return shm_create(arg1); }             # shm_create(size) -> id
+    if (num == 72) { stack_canary_check(canary); return shm_write(arg1, arg2, arg3); }  # shm_write(id, user_src, size)
+    if (num == 73) { stack_canary_check(canary); return shm_read(arg1, arg2, arg3); }   # shm_read(id, user_dst, size)
+    if (num == 74) { stack_canary_check(canary); return shm_free(arg1); }               # shm_free(id)
     if (num == 34) {
         # uname(buf=arg1, len=arg2) — writes the 64-byte identity struct: four
         # 16-byte NUL-padded fields at offsets 0/16/32/48 = sysname / nodename /
