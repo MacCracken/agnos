@@ -5,6 +5,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.9] — 2026-07-09 — on-device setu SHARED-BUFFER present composites end-to-end on agnos (kernel shm + the two-proc unblock)
+
+The setu display protocol now completes a full present on the sovereign kernel: a client
+CREATE→SURFACE_CREATED→ATTACH-by-id, the compositor reads the pixels from a **kernel
+shared-memory buffer** and composites them — `aethersafha-setu-smoke.sh` gate 4 green
+(`setu client CONNECTED + PRESENTED + composited on agnos`). Three kernel pieces landed to
+get there (all diagnosed against the on-device smoke, over QEMU).
+
+### Added
+
+- **Kernel shared-memory buffers — `shm_create`#71 / `shm_write`#72 / `shm_read`#73 /
+  `shm_free`#74** (`kernel/core/syscall.cyr`). The sovereign **shared-buffer present**
+  backend: a client `shm_write`s its rendered pixels into a kernel-owned buffer keyed by a
+  small id, ATTACH carries the id (not the pixels), the compositor `shm_read`s them back out.
+  A 16-slot table over single **2 MB pmm pages** (`kmalloc` caps out below a surface); ids
+  are **1-based** (0 is the setu "inline pixels" sentinel); the page's `pmm_kva_for_access`
+  KVA lives in the kernel mirror, so the client's write and the compositor's read each reach
+  it from their own syscall CR3 with a plain copy — **no cross-proc page mapping**, and a
+  client that exits right after present can't free a page the compositor is still reading
+  (unlike a mapped-into-the-arena page, which `proc_free_address_space` frees on exit). This
+  sidesteps the single-CPU two-proc **TCP flow-control deadlock** (a 240 KB inline-pixel
+  payload can't drain through the 2 KB `TCP_RX_RING` while the sender holds preemption in
+  `#48 sock_send`). The COPY is negligible vs a surface and unnecessary once agnos is
+  multi-core (the inline path stays as that fallback). Consumed by setu `buf.cyr`'s agnos
+  backend via raw `syscall(71..74)` (no cyrius change) — a cyrius `sys_shm_*` wrapper peer is
+  filed in `docs/development/issues/2026-07-09-cyrius-agnos-shm-syscall-peers.md`.
+
+### Fixed
+
+- **`pause`#14 no longer hard-hangs the core (IF=0 `hlt`).** The handler was a bare
+  `arch_wait()` = a `hlt` with interrupts disabled (SYSCALL clears IF via SFMASK), which on a
+  single core is the "IF=0 hlt hard-hang" the `sleep_ms`#41 recipe warns about — no IRQ can
+  wake it. `pause` is what cyrius's `_agnos_sock_recv_block` spins on as a poll-backoff yield,
+  so the **first would-block on any blocking socket read froze the box** (surfaced by the
+  two-proc setu present). Now routed in `syscall_handler` (like `#44 sched_yield`, where the
+  ring-3 entry stub's captures are valid by construction) to **cooperatively yield** to a
+  ready proc — a preempt-disabled `hlt` fixed IF=0 but starved the peer, so the yield is what
+  actually unblocks it; `ksyscall` case-14 keeps a **safe sti-window `hlt`** as the
+  no-ready-proc fallback so device IRQs still get a wake window.
+- **`sock_accept`#57 returns the raw conn_id again** (regression since 1.49.4). The
+  "socket-as-VFS-fd" change wrapped the accepted conn in `vfs_create_sock` and returned a
+  **VFS fd index**, but cyrius `net.cyr`'s `sock_accept` — the only `#57` consumer — treats
+  the return as a **conn_id** and drives the accepted conn via `sock_send`#48 / `sock_recv`#49
+  / `sock_close`#50. So `#49` received a VFS-fd number as its "conn_id", hit a closed slot, and
+  returned EOF → **every server-side read failed** (silently broken since 1.49.4; the setu
+  compositor was the first to exercise accept+recv on agnos). Nothing consumed the VFS-fd
+  return (the loopback selftest calls `tcp_accept` + `vfs_create_sock` directly), so returning
+  the conn_id restores the working contract.
+
 ## [1.53.8] — 2026-07-09 — loopback TCP works with no NIC + on-device setu display-protocol scaffold
 
 ### Fixed

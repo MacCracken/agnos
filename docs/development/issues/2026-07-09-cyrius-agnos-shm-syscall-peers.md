@@ -1,0 +1,105 @@
+# cyrius stdlib — add the AGNOS `sys_shm_*` peers for kernel shm `#71-74`
+
+**Status**: 🔧 **OPEN** — the agnos kernel shm half (`shm_create`#71 / `shm_write`#72 /
+`shm_read`#73 / `shm_free`#74) is **shipped + QEMU-proven** (agnos 1.53.9; `aethersafha-setu-smoke.sh`
+gate 4 green). This is the cyrius ring-3 wrapper, the ABI-completeness half. **Not blocking**:
+the first consumer (setu `buf.cyr`) already calls #71-74 via **raw `syscall(71..74)` literals**
+inside its `#ifdef CYRIUS_TARGET_AGNOS` branch — so the round-trip works today. The peer makes
+the call native (`sys_shm_create(...)` etc.) and, crucially, **canonical**: today every
+consumer that wants a shared buffer must hardcode the raw numbers `71..74`, so the primitive
+does NOT trickle out to programs the way a named wrapper does. The peer is where the numbers
+get documented + reused. **The canonical cyrius-side request belongs IN the cyrius repo** at
+`docs/development/issues/2026-07-09-agnos-sys-shm-peers.md` (cyrius house format) — the cyrius
+language agent picks it up there; this agnos-side copy is the mirror (mirrors the
+`sys_readlink`#70 precedent, `2026-07-08-cyrius-agnos-sys-readlink-peer.md`).
+**Date**: 2026-07-09
+**Priority**: **Low — ABI-completeness.** The kernel + the sole consumer are done and proven;
+only the canonical cyrius wrappers are missing. No consumer is blocked (the raw-number path is
+proven), unlike the `sys_symlink`#63 peer which *gated* ark M3.
+**From**: agnos shm `#71-74` (kernel) vs cyrius `lib/syscalls_x86_64_agnos.cyr` (the file-op /
+socket peer bands end at `SYS_READLINK`#70; there is **no `sys_shm_*`** band).
+**Related**: agnos `kernel/core/syscall.cyr` (the `shm_create`/`shm_write`/`shm_read`/`shm_free`
+helpers + the `#71-74` dispatch), setu `src/buf.cyr` (the consumer — its agnos branch calls the
+raw numbers), agnosticos `docs/development/planning/shared-buffer-present.md` (the design + why
+COPY-based), `docs/development/agnos-userland-abi.md` (the ABI table — add rows 71-74).
+
+## The gap
+
+The sovereign **shared-buffer present** (the desktop client→compositor pixel path that
+sidesteps the single-CPU two-proc TCP flow-control deadlock) needs a way for two ring-3 procs
+to hand a pixel buffer across without streaming it over the socket or mapping a shared page
+(a mapped-into-the-arena page hits a proc-exit free hazard). The agnos kernel closed that with
+COPY-based **kernel-owned** shm buffers `#71-74`; this peer is the ring-3 wrapper band for them.
+Right now setu `buf.cyr` calls `syscall(71, size)` / `syscall(72, id, src, size)` / … with bare
+literals — it works, but the numbers are invisible to every other program and to the ABI doc.
+
+## The kernel ABI to wire against (verified from `kernel/core/syscall.cyr`, QEMU-proven, 1.53.9)
+
+COPY-based, kernel-owned. A 16-slot table over single 2 MB pmm pages; **ids are 1-based** (0 is
+the setu "inline pixels" sentinel, so a real buffer is never 0). The page's `pmm_kva_for_access`
+KVA is in the kernel mirror, so `shm_write` (client CR3) and `shm_read` (compositor CR3) both
+reach it from their own syscall context with a plain copy — no cross-proc page mapping.
+
+### `shm_create` — syscall **#71**
+```
+shm_create(size = arg1) -> id (>= 1) / -1
+```
+- `arg1` = byte size (`> 0`, `<= 2 MB` = one pmm page — the bite-2 cap; multi-page is a follow-up).
+- Returns a **1-based** buffer id (`1..16`), or `-1` (bad size / pmm OOM / 16-slot table full).
+
+### `shm_write` — syscall **#72**
+```
+shm_write(id = arg1, user_src = arg2, size = arg3) -> 0 / -1
+```
+- Copies `size` bytes from the caller's `src` (validated `is_user_range`) INTO buffer `id`.
+  `-1` on bad id / `size <= 0` / `size > the buffer's size` / bad user range.
+
+### `shm_read` — syscall **#73**
+```
+shm_read(id = arg1, user_dst = arg2, size = arg3) -> 0 / -1
+```
+- Copies `size` bytes OUT of buffer `id` into the caller's `dst` (validated `is_user_range`). Same `-1`s.
+
+### `shm_free` — syscall **#74**
+```
+shm_free(id = arg1) -> 0 / -1
+```
+- Releases the 2 MB page + the slot. `-1` on bad id.
+- Numbers **#71-74** = the next free agnos band after `readlink`#70.
+
+### The cyrius peers to add (mirror the `sys_readlink` shape)
+```cyrius
+# in the agnos Sys enum, after SYS_READLINK = 70:
+    SYS_SHM_CREATE = 71;   # shm_create(size) → id (>=1) / -1  — kernel-owned shared buffer
+    SYS_SHM_WRITE  = 72;   # shm_write(id, user_src, size) → 0 / -1
+    SYS_SHM_READ   = 73;   # shm_read(id, user_dst, size)  → 0 / -1
+    SYS_SHM_FREE   = 74;   # shm_free(id) → 0 / -1
+
+# The COPY-based shared-buffer band (agnos shm #71-74). A client shm_write#72s a buffer, hands the
+# id over its own IPC, the reader shm_read#73s it — no page mapping, no socket streaming. Backs the
+# setu shared-buffer present (buf.cyr). ids are 1-based (0 = the setu "inline" sentinel).
+fn sys_shm_create(size): i64        { return syscall(SYS_SHM_CREATE, size); }
+fn sys_shm_write(id, src, size): i64 { return syscall(SYS_SHM_WRITE, id, src, size); }
+fn sys_shm_read(id, dst, size): i64  { return syscall(SYS_SHM_READ, id, dst, size); }
+fn sys_shm_free(id): i64            { return syscall(SYS_SHM_FREE, id); }
+```
+
+## Status of the other halves (all done — this is the only open piece)
+
+- **Kernel (agnos)** — `shm_create`/`shm_write`/`shm_read`/`shm_free` `#71-74` + the 16-slot pmm-page
+  table (`kernel/core/syscall.cyr`). **QEMU-proven**: `aethersafha-setu-smoke.sh` gate 4 green — a
+  setu client `shm_write`s a 320×192 frame, the compositor `shm_read`s + composites it on agnos
+  (`setu client CONNECTED + PRESENTED + composited on agnos`). agnos 1.53.9.
+- **Consumer (setu `buf.cyr`)** — copy-based backend `setu_buf_create`/`_write`/`_read`/`_close`;
+  the agnos branch calls the raw numbers `syscall(71..74)` (setu already links `syscalls`);
+  Linux branch = `/dev/shm/setu-buf-<id>` write()/read(). Builds `--agnos` + Linux; the full present
+  is proven on both.
+
+## Done-criteria
+
+The peer is done when `sys_shm_create`/`_write`/`_read`/`_free` are in
+`lib/syscalls_x86_64_agnos.cyr` and setu `buf.cyr`'s agnos branch calls the **native** wrappers
+(not the raw literals) after its next `lib/` re-sync. On landing, flip `buf.cyr`'s four
+`syscall(71..74)` sites to `sys_shm_*(...)` and archive this issue. (No mirshi peer is needed
+unless a shared-buffer consumer is run under mirshi — the shm band is agnos-kernel-only, no host
+equivalent; a mirshi consumer would use the Linux `/dev/shm` file backend instead.)
