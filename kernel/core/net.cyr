@@ -212,17 +212,11 @@ fn net_lo_drain() {
 # net_tx — the TX chokepoint. An IPv4 frame whose dst is loopback (net_is_loopback) is queued for the
 # loopback drain instead of the wire; everything else (ARP, off-box IP) goes to nic_send. 1.49.0
 # loopback bite 1. The dst IP sits at eth(14) + ip-dst-offset(16) = frame offset 30.
-var ntx_dbg = 0;
 fn net_tx(buf, len) {
     if (len >= 34) {
         var ethertype = (load8(buf + 12) << 8) | load8(buf + 13);
         if (ethertype == 0x0800) {
             var dst = (load8(buf + 30) << 24) | (load8(buf + 31) << 16) | (load8(buf + 32) << 8) | load8(buf + 33);
-            #ifdef AETHERSAFHA_SETU_SELFTEST
-            if (ntx_dbg < 8) { ntx_dbg = ntx_dbg + 1;
-                kprint("NTX len=", 8); kprint_num(len); kprint(" dst=", 5); kprint_num(dst);
-                kprint(" lo=", 4); kprint_num(net_is_loopback(dst)); kprintln("", 0); }
-            #endif
             if (net_is_loopback(dst) == 1) { return net_lo_enqueue(buf, len); }
         }
     }

@@ -397,22 +397,13 @@ fn tcp_alloc_conn_slot() {
 
 fn tcp_connect(dst_ip, dst_port, src_port) {
     var conn_id = tcp_alloc_conn_slot();
-    #ifdef AETHERSAFHA_SETU_SELFTEST
-    kprint("TCPC slot=", 10); kprint_num(conn_id); kprintln("", 0);
-    #endif
     if (conn_id < 0) { return 0 - 1; }
     var cb = tcp_conn_base(conn_id);
     # Allocate per-connection receive RING (S5: prevent shared-buffer corruption)
     var rx_buf = kmalloc(TCP_RX_RING);
-    #ifdef AETHERSAFHA_SETU_SELFTEST
-    kprint("TCPC rx=", 8); kprint_num(rx_buf); kprintln("", 0);
-    #endif
     if (rx_buf == 0) { store64(cb, 0); return 0 - 1; }      # leave slot CLOSED/reclaimable
     # Retransmit hold buffer (B2).
     var retx_buf = kmalloc(TCP_RETX_BUF);
-    #ifdef AETHERSAFHA_SETU_SELFTEST
-    kprint("TCPC retx=", 10); kprint_num(retx_buf); kprint(" dst=", 5); kprint_num(dst_ip); kprintln("", 0);
-    #endif
     if (retx_buf == 0) { kfree_sized(rx_buf, TCP_RX_RING); store64(cb, 0); return 0 - 1; }
     # 1.45.6 audit fix: seed the ISN from RDRAND, XOR a timer-LCG as the
     # fallback if RDRAND returns 0. The old timer_ticks-only LCG was predictable
@@ -461,16 +452,10 @@ fn tcp_connect(dst_ip, dst_port, src_port) {
     return 0 - 1;
 }
 
-var tcps_dbg = 0;
 fn tcp_send(conn_id, data, len) {
     if (conn_id < 0) { return 0 - 1; }
     if (conn_id >= tcp_conn_count) { return 0 - 1; }
     var cb = tcp_conn_base(conn_id);
-    #ifdef AETHERSAFHA_SETU_SELFTEST
-    if (tcps_dbg < 4) { tcps_dbg = tcps_dbg + 1;
-        kprint("TCPS cid=", 9); kprint_num(conn_id);
-        kprint(" st=", 4); kprint_num(load64(cb)); kprint(" len=", 5); kprint_num(len); kprintln("", 0); }
-    #endif
     if (load64(cb) != 2) { return 0 - 1; }
     # B3: segment into ≤ effective-MSS chunks. One in flight (B2): send a chunk,
     # arm its retransmit, then wait (bounded) for its ACK before the next — so
@@ -718,7 +703,6 @@ fn tcp_find_conn(src_port, dst_port, src_ip) {
     return 0 - 1;
 }
 
-var nht_dbg = 0;
 fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
     var canary = stack_canary_secret;
     if (ip_payload_len < 20) { return 0; }
@@ -734,12 +718,6 @@ fn net_handle_tcp(pkt, ip_off, ip_payload_len, src_ip) {
     if (tcp_hdr_len > ip_payload_len) { return 0; }
     var flags = load8(tcp + 13);
     var conn_id = tcp_find_conn(src_port, dst_port, src_ip);
-    #ifdef AETHERSAFHA_SETU_SELFTEST
-    if (nht_dbg < 12) { nht_dbg = nht_dbg + 1;
-        kprint("NHT fl=", 7); kprint_num(flags);
-        kprint(" sp=", 4); kprint_num(src_port); kprint(" dp=", 4); kprint_num(dst_port);
-        kprint(" conn=", 6); kprint_num(conn_id); kprint(" lid=", 5); kprint_num(tcp_find_listen(dst_port)); kprintln("", 0); }
-    #endif
     if (conn_id < 0) {
         # No active conn. Try the passive-open path: incoming SYN to a
         # LISTEN entry spawns a new SYN_RCVD conn. (1.32.0 bite A.)

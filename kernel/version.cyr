@@ -51,4 +51,4 @@ fn agnos_version_str() {
 # Bare version string — safe to use from any consumer that runs AFTER
 # gvar init has completed (kybernet, userspace, etc.). NOT safe to use
 # from the kernel program body (same kmode init-order constraint above).
-var _AGNOS_VERSION = "1.53.7";
+var _AGNOS_VERSION = "1.53.8";

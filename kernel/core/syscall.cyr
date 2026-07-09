@@ -371,7 +371,6 @@ fn kernel_resume() {
 # clean exit code. agnsh surfaces it via its normal "run: exit N" path; a dedicated
 # "killed (#PF)" message is a userland (agnoshi) follow-on (kprint here is unsafe — the FB
 # may be unmapped under the faulting proc's CR3, per the idt.cyr canary-paint #DF note).
-var sc47_dbg = 0;
 fn fault_kill_current(vector) {
     var pid = proc_current_get();
     var code = 128 + vector;
@@ -1925,12 +1924,6 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var sc_cid = tcp_connect(arg1, arg2, sc_sport);
         asm { cli; }
         preempt_enable();
-        #ifdef AETHERSAFHA_SETU_SELFTEST
-        if (sc47_dbg < 4) { sc47_dbg = sc47_dbg + 1;
-            kprint("SC47 cid=", 9); kprint_num(sc_cid);
-            kprint(" dst=", 5); kprint_num(arg1);
-            kprint(" net_ip=", 8); kprint_num(net_ip); kprintln("", 0); }
-        #endif
         stack_canary_check(canary);
         return sc_cid;
     }

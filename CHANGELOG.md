@@ -5,6 +5,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.8] — 2026-07-09 — loopback TCP works with no NIC + on-device setu display-protocol scaffold
+
+### Fixed
+
+- **`tcp_send_pkt` no longer drops loopback TCP on a NIC-less box.** It began with
+  `if (nic_ready() == 0) { return 0 - 1; }`, gating **every** TCP segment on a live NIC —
+  even a `127.x` / `net_ip` destination, which rides the software `net_lo_ring` and needs no
+  wire (`net_tx` already routes it there; `udp_send` already exempted loopback). So on a QEMU
+  boot with no NIC (`r8169: no controller found`) every loopback TCP segment was silently
+  dropped and the handshake never started. Now gated
+  `if (nic_ready() == 0 && net_is_loopback(dst_ip) == 0)` — loopback TCP (client SYN + server
+  SYN-ACK + data) works with no NIC. Fixes on-device loopback IPC generally, not just the setu
+  test below.
+
+### Added
+
+- **`AETHERSAFHA_SETU_SELFTEST`** (`scripts/build.sh` flag + `kernel/core/main.cyr` hook,
+  post-`sched_active`; `scripts/aethersafha-setu-smoke.sh`) — the on-device **setu display
+  protocol** end-to-end scaffold (3b bite 2; WIP). The compositor (`/bin/aethersafha`, built
+  `--agnos`) is loaded as a **background ring-3 proc under the live scheduler** and
+  `spawn_path`#43's **`/bin/puka`** (a slim setu client) as its first resident; the compositor
+  stands up a setu listener on **TCP loopback:7700** and puka **connects over TCP on-device**
+  (SYN → passive-open → SYN-ACK → ACK, verified in QEMU). Two enabling pieces landed here:
+  - **Scheduler-entry recipe for a real-ELF background proc**: the boot-CR3 dance around
+    `elf_load_from_file` + `exec_env` set for a valid argv/envp stack + an **EFER.SCE re-assert**
+    (`efer_sce_enable`, a function — the raw `rdmsr`/`wrmsr` clobbers eax/ecx/edx and must not be
+    inline in cc5's regalloc-sensitive scheduler path) so the scheduler-entered proc survives its
+    first SYSCALL.
+  - **Console-lock ordering**: flip the spawned proc `READY` only **after** kmain's last
+    `kprint`. The named spinlocks (`smp.cyr`) don't disable preemption ("never hold a lock across
+    a kprint"), so a proc made schedulable mid-`kprint` deadlocks on `console_lock` the instant it
+    writes (QEMU-monitor root-caused: RIP spinning on the lock, IF=0).
+  - Behind the flag; the normal boot and the pre-scheduler `AETHERSAFHA_SELFTEST` (3a) are
+    unaffected. The surface-present step (client `SYS_WRITE` → `tcp_send` routing for the *client*
+    fd) is the remaining piece.
+
 ## [1.53.7] — 2026-07-08 — console-perf closeout: interrupt-driven keyboard + FB RAM shadow buffer (last 1.53.x burn)
 
 Two kernel-perf fixes cut together to ride the final 1.53.x iron burn — both attack the same
