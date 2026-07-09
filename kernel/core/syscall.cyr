@@ -888,7 +888,23 @@ fn ksyscall(num, arg1, arg2, arg3) {
         arch_halt();
         return 0;
     }
-    if (num == 14) { arch_wait(); return 0; } # pause
+    if (num == 14) {                          # pause — no-ready-proc FALLBACK (safe hlt)
+        # Ring-3 pause is normally handled in syscall_handler (#14): it yields to a ready
+        # proc first, and only falls through to HERE when nothing else is ready (also the
+        # path for any in-kernel ksyscall(14)). Do ONE SAFE (IF=1) hlt so a device IRQ
+        # (e.g. NIC RX) or the 100 Hz timer wakes it. A BARE arch_wait() would be a hlt
+        # with IF=0 (SYSCALL clears IF via SFMASK 0x40700) = the "IF=0 hlt hard-hang" the
+        # sleep_ms#41 recipe warns about — it deadlocked the single core (the two-proc
+        # setu-present freeze, 1.53.9). preempt_disable keeps the timer ticking+EOIing
+        # without switching us off mid-pause; sti BEFORE the hlt; cli on the way out
+        # (SYSRET restores the caller's IF from R11 anyway).
+        preempt_disable();
+        asm { sti; }
+        arch_wait();                          # hlt until the next interrupt
+        asm { cli; }
+        preempt_enable();
+        return 0;
+    }
     # Tier 3: signals
     if (num == 16) {
         # kill(pid=arg1, sig=arg2)

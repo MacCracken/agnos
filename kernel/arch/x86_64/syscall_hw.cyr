@@ -107,6 +107,17 @@ fn syscall_handler(user_rsp, sc_num, sc_arg1, sc_arg2, sc_arg3, sc_arg4) {
     # by construction. In-kernel code (bench, recovery shell) calls ksyscall directly
     # with stale captures; a hypothetical ksyscall(44) falls to its default -1.
     if (sc_num == 44) { return sys_sched_yield(); }
+    # pause(#14) is cyrius _agnos_sock_recv_block's poll-backoff between non-blocking
+    # sock_recv#49 polls, so it must YIELD to other ready procs (a bare/preempt-disabled
+    # hlt starves them — the two-proc setu-present freeze, 1.53.9). Handle it HERE (not in
+    # ksyscall) for the SAME reason as #44: syscall_handler is reached ONLY via the ring-3
+    # entry stub, so sc_entry_regs is valid by construction for the abandon-frame yield.
+    # sys_sched_yield donates the slice when a ready proc exists (it does NOT return here
+    # then — the proc resumes in ring 3 after the syscall). If nothing else is ready it
+    # returns 0 and we fall to ksyscall(14)'s SAFE sti-window hlt (so device IRQs — e.g.
+    # the NIC RX — still get a wake window; a pure yield would busy-spin a lone blocking
+    # read and never open one).
+    if (sc_num == 14) { sys_sched_yield(); return ksyscall(sc_num, sc_arg1, sc_arg2, sc_arg3); }
     var result = ksyscall(sc_num, sc_arg1, sc_arg2, sc_arg3);
     return result;
 }
