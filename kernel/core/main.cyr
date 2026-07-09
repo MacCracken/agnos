@@ -3794,29 +3794,65 @@ sched_active = 1;
 # context-switch issue, not an init issue. Held since Attempt 16.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
 
+# EFER.SCE re-assert wrapped in a FUNCTION (clean ABI boundary) so the raw
+# rdmsr/wrmsr — which clobbers eax/ecx/edx — can't corrupt cc5's regalloc at the
+# call site (the inline form silently zeroed a live local). exec_and_wait does the
+# same re-assert right before enter_ring3; the setu-e2e selftest below needs it so
+# the SCHEDULER-entered compositor (this boot's first ring-3 proc, entered via
+# iretq not enter_ring3) survives its first SYSCALL instead of #UD'ing on a
+# never-exercised SCE. EFER is a per-CPU MSR context switches don't touch → holds.
+fn efer_sce_enable(): i64 {
+    syscall_init();
+    asm {
+        0xB9; 0x80; 0x00; 0x00; 0xC0;   # mov ecx, 0xC0000080 (IA32_EFER)
+        0x0F; 0x32;                       # rdmsr
+        0x0D; 0x01; 0x00; 0x00; 0x00;     # or eax, 1 (SCE)
+        0x0F; 0x30;                       # wrmsr
+    }
+    return 0;
+}
+
 #ifdef AETHERSAFHA_SETU_SELFTEST
 # 3b — the sovereign DISPLAY PROTOCOL end-to-end on agnos. Runs AFTER
-# sched_active=1 (unlike AETHERSAFHA_SELFTEST at ~L2286). The compositor runs
-# foreground via exec_and_wait: it stands up a setu listener on TCP loopback:7700
-# (WORKS on agnos — "setu listener up"), and spawn_path's /bin/puka as its first
-# setu client (WORKS — "launched first resident /bin/puka").
+# sched_active=1 (unlike AETHERSAFHA_SELFTEST at ~L2286) because it needs TWO
+# concurrent procs. Loads the compositor as a BACKGROUND ring-3 proc — mirroring
+# the spawn_path(#43) handler EXACTLY (boot-CR3 dance for the disk load + address
+# space; exec_env set so the loader builds a valid argv/envp stack; proc_set_ring3
+# + state=ready + EFER.SCE re-assert via efer_sce_enable) — then kmain IDLES via
+# arch_wait so the LIVE scheduler round-robins the compositor AND the /bin/puka it
+# spawn_path's. Foreground exec_and_wait would PIN kmain and starve the client.
 #
-# OPEN BLOCKER (the remaining 3b bite-2 work): the spawned puka never gets a CPU
-# slice, so the client never presents. TWO models tried, both incomplete:
-#   (1) foreground here (exec_and_wait): the compositor runs fully, but its
-#       spawn_path'd child does NOT round-robin — sys_sched_yield() from the
-#       compositor doesn't switch to it either.
-#   (2) load the compositor as a BACKGROUND proc (elf_load_from_file +
-#       proc_set_ring3 + state=ready) + kmain arch_wait-idles (the RING3_SELFTEST
-#       model): then the 14.9 MB compositor never starts under scheduler (iretq)
-#       entry — no bhumi output — even after a syscall_init() re-assert. A tiny
-#       in-memory ELF (RING3_SELFTEST's B) DOES run that way, so it is size- or
-#       disk-load- or entry-setup-specific, not the model itself.
-# Needs focused agnos scheduler/proc-entry work (concurrent real-ELF ring-3
-# procs). See agnosticos state.md + planning/native-display-protocol.md.
-kprintln("exec: running /bin/aethersafha (setu e2e)", 41);
-sh_exec("run /bin/aethersafha", 20);
-kprintln("exec: aethersafha returned", 26);
+# STATUS: the compositor now RUNS under the scheduler (reaches main / its first
+# SYSCALL — the CR3 dance + exec_env + EFER re-assert cleared scheduler ENTRY),
+# but it HANGS at alloc_init's mmap(#27). ROOT CAUSE: a scheduler-run proc runs
+# under the MINIMAL KPTI user CR3 after its first SYSRET (do_context_switch sets
+# kpti_user_cr3 = proc_get_user_cr3 = PD[511], sched.cyr:381), but sys_mmap maps
+# the fresh heap chunk into the proc's FULL CR3 — so the proc faults the instant
+# it touches that chunk. exec_and_wait sidesteps this (user==kernel==full,
+# ring3.cyr:118) but that's per-launch; a scheduler fix must make mmap visible to
+# the running CR3 (share the user PTs, or update PD[511]'s CR3 in sys_mmap, or
+# retire the minimal-user-CR3 split — KPTI-proper is deferred). See memory
+# [[project_agnos_two_proc_concurrency_blocker]]. Setting user==full in
+# do_context_switch broke the SYSCALL stub mapping (regressed the first SYSCALL),
+# so the fix is subtler than that.
+kprintln("setu-e2e: loading compositor bg", 31);
+var ae_p = "/bin/aethersafha";
+if (sh_abspath(ae_p, 16) >= 0) {
+    var spcr3 = proc_get_cr3(proc_current_get());
+    cr3_load(0x1000);                    # boot CR3 maps the NVMe BAR for the disk load
+    exec_env_src_set(0);                 # default kernel env (HOME=/ PWD=/) — valid envp stack
+    exec_env_len_set(0);
+    var ae_pid = elf_load_from_file(&sh_path_buf, sh_path_len, ae_p, 16);
+    cr3_load(spcr3);                     # restore on EVERY path (matches #43)
+    if (ae_pid >= 0) {
+        proc_set_ring3(ae_pid);          # CS=0x23 / SS=0x1B (else iretq lands ring-0)
+        proc_set_state(ae_pid, 1);       # READY — the scheduler will run it
+        efer_sce_enable();               # make the first SYSCALL from the scheduled compositor work
+        kprint("setu-e2e: ae pid=", 17); kprint_num(ae_pid); kprintln("", 0);
+        while (1 == 1) { arch_wait(); }  # kmain idles SILENTLY; scheduler drives compositor + puka
+
+    } else { kprintln("setu-e2e: load FAILED", 21); }
+} else { kprintln("setu-e2e: bad path", 18); }
 #endif
 
 #ifdef THREAD_SELFTEST
