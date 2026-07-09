@@ -99,6 +99,22 @@ s = socket.socket(socket.AF_UNIX); s.connect(sock); time.sleep(0.4)
 try: s.recv(65536)
 except Exception: pass
 s.sendall(("screendump %s\n" % out).encode()); time.sleep(2.0)
+# DBG: dump CPU state at the hang — RIP reveals where it's stuck (kmain hlt / compositor / scheduler)
+try: s.recv(65536)
+except Exception: pass
+s.sendall(b"info registers\n"); time.sleep(0.6)
+try:
+    r = s.recv(65536).decode(errors="replace")
+    print("=== QEMU info registers @ hang ===")
+    for ln in r.splitlines():
+        if any(k in ln for k in ("RIP=","RSP=","CR2=","CR3=","RAX=","CS =","SS =")): print("  ", ln)
+except Exception as e: print("regdump failed:", e)
+# DBG: dump the kernel stack — return addresses reveal the call chain (which syscall + lock)
+s.sendall(b"x/32gx $rsp\n"); time.sleep(0.6)
+try:
+    print("=== stack @ $rsp (call-chain return addrs, look for 0x1xxxxx) ===")
+    print(s.recv(65536).decode(errors="replace"))
+except Exception as e: print("stackdump failed:", e)
 s.close()
 PY
 

@@ -3822,20 +3822,25 @@ fn efer_sce_enable(): i64 {
 # arch_wait so the LIVE scheduler round-robins the compositor AND the /bin/puka it
 # spawn_path's. Foreground exec_and_wait would PIN kmain and starve the client.
 #
-# STATUS: the compositor now RUNS under the scheduler (reaches main / its first
-# SYSCALL — the CR3 dance + exec_env + EFER re-assert cleared scheduler ENTRY),
-# but it HANGS at alloc_init's mmap(#27). ROOT CAUSE: a scheduler-run proc runs
-# under the MINIMAL KPTI user CR3 after its first SYSRET (do_context_switch sets
-# kpti_user_cr3 = proc_get_user_cr3 = PD[511], sched.cyr:381), but sys_mmap maps
-# the fresh heap chunk into the proc's FULL CR3 — so the proc faults the instant
-# it touches that chunk. exec_and_wait sidesteps this (user==kernel==full,
-# ring3.cyr:118) but that's per-launch; a scheduler fix must make mmap visible to
-# the running CR3 (share the user PTs, or update PD[511]'s CR3 in sys_mmap, or
-# retire the minimal-user-CR3 split — KPTI-proper is deferred). See memory
-# [[project_agnos_two_proc_concurrency_blocker]]. Setting user==full in
-# do_context_switch broke the SYSCALL stub mapping (regressed the first SYSCALL),
-# so the fix is subtler than that.
+# STATUS: the compositor RUNS under the scheduler (reaches main + its FIRST SYSCALL
+# — the CR3 dance + exec_env + EFER re-assert cleared scheduler ENTRY). BLOCKER: its
+# SECOND syscall fails (a raw write right after the first prints; the next does not).
+# NOT a CR3/mmap issue — proc_get_user_cr3 returns out==in (agnos COLLAPSED the KPTI
+# split at proc.cyr:592-611; PD[511] = the FULL CR3 that maps the stub), so
+# kpti_user_cr3 already == the full CR3. A foreground exec_and_wait proc (agnsh,
+# enter_ring3) does thousands of syscalls fine; a SCHEDULER-entered (iretq) proc's
+# 2nd fails — the difference is the syscall / preemption-resume path (likely a stale
+# kernel-stack / RSP0 / per-CPU state after the first SYSRET). NOT root-caused. Do
+# NOT edit do_context_switch / proc_get_user_cr3 inline — their save/restore zone is
+# cc5-regalloc-sensitive (sched.cyr:341) and perturbing it regressed scheduling in a
+# way unrelated to the change's intent. See [[project_agnos_two_proc_concurrency_blocker]].
 kprintln("setu-e2e: loading compositor bg", 31);
+# No NIC in this QEMU (r8169 absent) → net_ip=0, so a loopback SYN's src_ip is 0 and
+# the peer's SYN-ACK (dst = that src_ip = 0) fails net_is_loopback (needs dst>>24==127
+# or dst==net_ip) → lost → connect times out. Set net_ip = 127.0.0.1 so the local
+# address IS loopback: both the SYN (src=127.0.0.1) and the SYN-ACK (dst=127.0.0.1)
+# are lo_ring-delivered, completing the on-device puka↔compositor handshake sans NIC.
+net_ip = 0x7F000001;
 var ae_p = "/bin/aethersafha";
 if (sh_abspath(ae_p, 16) >= 0) {
     var spcr3 = proc_get_cr3(proc_current_get());
@@ -3846,9 +3851,16 @@ if (sh_abspath(ae_p, 16) >= 0) {
     cr3_load(spcr3);                     # restore on EVERY path (matches #43)
     if (ae_pid >= 0) {
         proc_set_ring3(ae_pid);          # CS=0x23 / SS=0x1B (else iretq lands ring-0)
-        proc_set_state(ae_pid, 1);       # READY — the scheduler will run it
         efer_sce_enable();               # make the first SYSCALL from the scheduled compositor work
         kprint("setu-e2e: ae pid=", 17); kprint_num(ae_pid); kprintln("", 0);
+        # CRITICAL: flip the compositor READY *AFTER* kmain's last kprint. These named
+        # spinlocks don't disable preemption (smp.cyr:47 "never hold a lock across a
+        # context switch / a kprint"), so if the compositor were schedulable during the
+        # kprint above, a timer tick that preempts kmain mid-print (holding console_lock)
+        # would let the compositor's own first console write DEADLOCK on that held lock
+        # (QEMU-monitor-confirmed: RIP in a spin loop on lock 0x1ce670, IF=0). kmain is
+        # SILENT hereafter, so the compositor has console_lock uncontended.
+        proc_set_state(ae_pid, 1);       # READY — the scheduler will run it
         while (1 == 1) { arch_wait(); }  # kmain idles SILENTLY; scheduler drives compositor + puka
 
     } else { kprintln("setu-e2e: load FAILED", 21); }
