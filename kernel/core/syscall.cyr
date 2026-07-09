@@ -2135,11 +2135,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # is IF=0-safe (same as sock_recv#49) — no sti-window. a2..a4 unused.
         if (arg1 < 0) { stack_canary_check(canary); return 0 - 1; }
         net_poll();                     # drive the inbound SYN handshake to ESTABLISHED
+        # Return the RAW conn_id (0..7), NOT a VFS_SOCK fd. The 1.49.4 "socket-as-VFS-fd"
+        # wrap (vfs_create_sock) silently BROKE the actual ring-3 socket API: cyrius
+        # net.cyr's sock_accept — the ONLY #57 consumer — treats this return as a conn_id
+        # and drives the accepted conn via sock_send#48 / sock_recv#49 / sock_close#50
+        # (the tagged-fd band). vfs_create_sock handed back a VFS fd INDEX instead, so #49
+        # received a VFS-fd number as its "conn_id" → tcp_conn_dead on a CLOSED slot → -1
+        # (EOF) → every server-side read failed (the on-device setu compositor could never
+        # read a client's CREATE_SURFACE frame; broken since 1.49.4). Nothing consumes the
+        # VFS-fd return — the loopback selftest calls tcp_accept + vfs_create_sock directly,
+        # not via #57 — so returning the conn_id restores the working contract. A read#5-style
+        # VFS-fd-from-accept model, if ever needed, should ride a distinct call. Fixed 1.53.9.
         var sa_cid = tcp_accept(arg1);
-        var sa_fd = sa_cid;             # 1.49.4 socket-as-VFS-fd: wrap the accepted conn in a
-        if (sa_cid >= 0) { sa_fd = vfs_create_sock(sa_cid); }   # VFS_SOCK fd (-1 stays -1)
         stack_canary_check(canary);
-        return sa_fd;
+        return sa_cid;                  # raw conn_id (0..7), or -1 when none pending yet
     }
     if (num == 58) {
         # lseek(fd=arg1, offset=arg2, whence=arg3) — reposition a seekable file's
