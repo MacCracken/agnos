@@ -3794,6 +3794,31 @@ sched_active = 1;
 # context-switch issue, not an init issue. Held since Attempt 16.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
 
+#ifdef AETHERSAFHA_SETU_SELFTEST
+# 3b — the sovereign DISPLAY PROTOCOL end-to-end on agnos. Runs AFTER
+# sched_active=1 (unlike AETHERSAFHA_SELFTEST at ~L2286). The compositor runs
+# foreground via exec_and_wait: it stands up a setu listener on TCP loopback:7700
+# (WORKS on agnos — "setu listener up"), and spawn_path's /bin/puka as its first
+# setu client (WORKS — "launched first resident /bin/puka").
+#
+# OPEN BLOCKER (the remaining 3b bite-2 work): the spawned puka never gets a CPU
+# slice, so the client never presents. TWO models tried, both incomplete:
+#   (1) foreground here (exec_and_wait): the compositor runs fully, but its
+#       spawn_path'd child does NOT round-robin — sys_sched_yield() from the
+#       compositor doesn't switch to it either.
+#   (2) load the compositor as a BACKGROUND proc (elf_load_from_file +
+#       proc_set_ring3 + state=ready) + kmain arch_wait-idles (the RING3_SELFTEST
+#       model): then the 14.9 MB compositor never starts under scheduler (iretq)
+#       entry — no bhumi output — even after a syscall_init() re-assert. A tiny
+#       in-memory ELF (RING3_SELFTEST's B) DOES run that way, so it is size- or
+#       disk-load- or entry-setup-specific, not the model itself.
+# Needs focused agnos scheduler/proc-entry work (concurrent real-ELF ring-3
+# procs). See agnosticos state.md + planning/native-display-protocol.md.
+kprintln("exec: running /bin/aethersafha (setu e2e)", 41);
+sh_exec("run /bin/aethersafha", 20);
+kprintln("exec: aethersafha returned", 26);
+#endif
+
 #ifdef THREAD_SELFTEST
 # 1.44.0 opening bite: prove preemptive kernel-thread time-slicing + the preempt
 # gate on the live scheduler, then retire the test threads so boot continues.
