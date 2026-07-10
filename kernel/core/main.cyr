@@ -2335,6 +2335,17 @@ sh_exec("run /bin/fpex", 13);
 kprintln("exec: fpex returned", 19);
 #endif
 
+#ifdef BLK_RING3_SELFTEST
+# 1.53.10 Phase 1: raw block-device READ-PATH proof. Runs /bin/blkprobe (blk-test/,
+# built --agnos) — enumerates the disk via blk_enum#75, opens it RO via blk_open#76,
+# reads LBA 1 via blk_read#77, and checks the "EFI PART" GPT signature. Exits 95 iff
+# the whole ring-3 read-path works against the real (GPT) NVMe disk. A wrong number/
+# arg wiring or an unmapped-buffer fault would crash or return a 90-94 diagnostic.
+kprintln("exec: running /bin/blkprobe", 27);
+sh_exec("run /bin/blkprobe", 17);
+kprintln("exec: blkprobe returned", 23);
+#endif
+
 #ifdef NAAD_RING3_SELFTEST
 # 1.53.x B6 (arc-closer): naad oscillator END-PROOF. Runs /bin/naadex (naad/, built --agnos) —
 # a REAL heavy-f64 DSP workload: naad's 440 Hz sine oscillator generates 256 samples via

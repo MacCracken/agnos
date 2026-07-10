@@ -119,10 +119,10 @@ if strings "$SLOG" | grep -q "aethersafha: setu listener up"; then
 else
     echo "  FAIL: setu listener did not come up"; rc=1
 fi
-if strings "$SLOG" | grep -q "launched first resident /bin/puka"; then
-    echo "  PASS: compositor spawn_path'd /bin/puka"
+if strings "$SLOG" | grep -q "launched setu client"; then
+    echo "  PASS: compositor spawn_path'd the setu client(s)"
 else
-    echo "  FAIL: /bin/puka was not launched (spawn_path failed?)"; rc=1
+    echo "  FAIL: no setu client was launched (spawn_path failed?)"; rc=1
 fi
 if strings "$SLOG" | grep -q "aethersafha: setu client presented surface"; then
     echo "  PASS: setu client CONNECTED + PRESENTED + composited on agnos (3b e2e)"
