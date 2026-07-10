@@ -5,7 +5,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.55.11] — 2026-07-10 — sovereign GPT/mkfs disk tool (`gptwr`) + the native-install ARC-CLOSER: a disk AGNOS builds itself boots
+## [1.53.11] — 2026-07-10 — sovereign GPT/mkfs disk tool (`gptwr`) + the native-install ARC-CLOSER: a disk AGNOS builds itself boots
 
 The native-install primitive is now proven **end to end**. On top of the ring-3 raw
 block-device syscalls (#75-80, shipped in 1.53.10) and their `sys_blk_*` cyrius wrappers
