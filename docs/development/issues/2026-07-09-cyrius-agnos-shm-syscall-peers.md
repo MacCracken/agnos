@@ -1,10 +1,20 @@
 # cyrius stdlib — add the AGNOS `sys_shm_*` peers for kernel shm `#71-74`
 
-**Status**: 🔧 **OPEN** — the agnos kernel shm half (`shm_create`#71 / `shm_write`#72 /
-`shm_read`#73 / `shm_free`#74) is **shipped + QEMU-proven** (agnos 1.53.9; `aethersafha-setu-smoke.sh`
-gate 4 green). This is the cyrius ring-3 wrapper, the ABI-completeness half. **Not blocking**:
-the first consumer (setu `buf.cyr`) already calls #71-74 via **raw `syscall(71..74)` literals**
-inside its `#ifdef CYRIUS_TARGET_AGNOS` branch — so the round-trip works today. The peer makes
+**Status**: ✅ **RESOLVED end-to-end (2026-07-09).** cyrius **v6.4.34** added
+`SYS_SHM_CREATE/WRITE/READ/FREE` (71-74) + `sys_shm_create`/`_write`/`_read`/`_free` to
+`lib/syscalls_x86_64_agnos.cyr`. Downstream flip DONE: setu `buf.cyr`'s agnos branch now calls
+the **native `sys_shm_*` wrappers** (0 raw `syscall(71..74)` literals left); setu + aethersafha
+pins bumped 6.4.25→**6.4.34** (aethersafha needed a **`cyrius lib sync --full`** — `cyrius deps`
+alone left the materialized stdlib stale, the [[reference_stale_vendored_lib_masks_stdlib_fix]]
+pattern). Re-proven on BOTH targets: `aethersafha-setu-smoke.sh` gate 4 GREEN with fresh
+native-wrapper binaries, and the Linux `setu_serve_probe`+`present_probe` PPM (file backend,
+unchanged) still 2032 green px. Nothing left but the git (setu cut). Historical detail below.
+
+The agnos kernel shm half (`shm_create`#71 / `shm_write`#72 / `shm_read`#73 / `shm_free`#74)
+shipped + QEMU-proven (agnos 1.53.9). The cyrius ring-3 wrapper was the ABI-completeness half —
+now landed in 6.4.34. Originally the first consumer (setu `buf.cyr`) called #71-74 via **raw
+`syscall(71..74)` literals** inside its `#ifdef CYRIUS_TARGET_AGNOS` branch — worked, but the
+numbers were invisible to other programs. The peer makes
 the call native (`sys_shm_create(...)` etc.) and, crucially, **canonical**: today every
 consumer that wants a shared buffer must hardcode the raw numbers `71..74`, so the primitive
 does NOT trickle out to programs the way a named wrapper does. The peer is where the numbers

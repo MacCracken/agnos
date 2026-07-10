@@ -750,6 +750,104 @@ fn shm_free(id) {
     return 0;
 }
 
+# =============================================================================
+# 1.53.10 — raw block-device syscalls (#75-80): the native-install primitive.
+#
+# Exposes the kernel block layer (blk_read_on) to a privileged ring-3 installer so
+# agnova + sovereign mkfs/partition tools can detect disks and read raw sectors
+# WITHOUT shelling out to Linux parted/mkfs. This is the READ-PATH (Phase 1) —
+# enum / open(RO) / read / info / close, all NON-DESTRUCTIVE. blk_write#78 is
+# Phase 2 (capability-gated). Design + security posture:
+#   docs/development/issue/2026-07-09-ring3-block-device-syscalls-for-install.md
+#
+# Handle model (Phase 1): the handle IS the backend tag (BLK_VIRTIO..BLK_RAMDISK,
+# 1..5), validated against blk_registered — no per-open state. Capacity is exact
+# for the ACTIVE backend; secondary-backend capacity (0 here) is a follow-up.
+# =============================================================================
+var blk_sc_bounce[512];   # 4096 B — one-LBA bounce (backends DMA into kernel mem, not user VA)
+
+# blk_enum(buf, cap) -> registered-device count / -1. Writes {tag, capacity_lbas,
+# lba_bytes} (3xu64 = 24 B) per registered backend into the user buf, bounded by cap.
+fn blk_enum_sys(buf, cap) {
+    if (is_user_range(buf, cap) == 0) { return 0 - 1; }
+    var count = 0;
+    var tag = 1;
+    while (tag <= 5) {
+        if (blk_is_registered(tag) == 1) {
+            var off = count * 24;
+            if (off + 24 > cap) { return count; }
+            var capv = 0;
+            if (tag == blk_active) { capv = blk_capacity; }
+            store64(buf + off + 0, tag);
+            store64(buf + off + 8, capv);
+            store64(buf + off + 16, blk_lba_bytes);
+            count = count + 1;
+        }
+        tag = tag + 1;
+    }
+    return count;
+}
+
+# blk_open(tag, mode) -> handle(==tag) / -1. Phase 1: RO only (mode 0). RW (mode 1)
+# is Phase 2 and capability-gated — rejected here. Validates tag is registered.
+fn blk_open_sys(tag, mode) {
+    if (mode != 0) { return 0 - 1; }
+    if (tag < 1) { return 0 - 1; }
+    if (tag > 5) { return 0 - 1; }
+    if (blk_is_registered(tag) == 0) { return 0 - 1; }
+    return tag;
+}
+
+# blk_read(h, lba, buf, nsec) -> nsec / -1. Reads nsec LBAs from device h at lba
+# into the user buf, one LBA at a time via the kernel bounce (backends DMA into
+# kernel memory, never a user VA). fs_spin_lock serializes the shared bounce +
+# device access against FS reads (same lock ext2 takes around blk_read_on).
+fn blk_read_sys(h, lba, buf, nsec) {
+    if (h < 1) { return 0 - 1; }
+    if (h > 5) { return 0 - 1; }
+    if (blk_is_registered(h) == 0) { return 0 - 1; }
+    if (nsec <= 0) { return 0 - 1; }
+    if (lba < 0) { return 0 - 1; }
+    if (h == blk_active) {
+        if (lba + nsec > blk_capacity) { return 0 - 1; }
+    }
+    var total = nsec * blk_lba_bytes;
+    if (is_user_range(buf, total) == 0) { return 0 - 1; }
+    fs_spin_lock();
+    var rc = nsec;
+    var i = 0;
+    while (i < nsec) {
+        if (blk_read_on(h, lba + i, &blk_sc_bounce) != 0) { rc = 0 - 1; i = nsec; }
+        else {
+            shm_copy(buf + i * blk_lba_bytes, &blk_sc_bounce, blk_lba_bytes);
+            i = i + 1;
+        }
+    }
+    fs_spin_unlock();
+    return rc;
+}
+
+# blk_info(h, out) -> 0 / -1. Writes {capacity_lbas, lba_bytes} (2xu64) to out.
+fn blk_info_sys(h, out) {
+    if (h < 1) { return 0 - 1; }
+    if (h > 5) { return 0 - 1; }
+    if (blk_is_registered(h) == 0) { return 0 - 1; }
+    if (is_user_range(out, 16) == 0) { return 0 - 1; }
+    var capv = 0;
+    if (h == blk_active) { capv = blk_capacity; }
+    store64(out + 0, capv);
+    store64(out + 8, blk_lba_bytes);
+    return 0;
+}
+
+# blk_close(h) -> 0 / -1. Phase 1 RO: no per-open state; validate + no-op.
+fn blk_close_sys(h) {
+    if (h < 1) { return 0 - 1; }
+    if (h > 5) { return 0 - 1; }
+    if (blk_is_registered(h) == 0) { return 0 - 1; }
+    return 0;
+}
+
 fn ksyscall(num, arg1, arg2, arg3) {
     # Stack-canary backstop: snapshot at entry, re-checked before returning on the
     # syscalls that do the most pointer/buffer work (the 1.41.3 FS group + pipe/
@@ -1371,6 +1469,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 72) { stack_canary_check(canary); return shm_write(arg1, arg2, arg3); }  # shm_write(id, user_src, size)
     if (num == 73) { stack_canary_check(canary); return shm_read(arg1, arg2, arg3); }   # shm_read(id, user_dst, size)
     if (num == 74) { stack_canary_check(canary); return shm_free(arg1); }               # shm_free(id)
+    # --- 1.53.10 raw block-device (#75-80) — native-install primitive (READ-PATH). ---
+    # Non-destructive: enum/open(RO)/read/info/close. blk_write#78 is Phase 2 (gated).
+    if (num == 75) { stack_canary_check(canary); return blk_enum_sys(arg1, arg2); }                          # blk_enum(buf, cap) -> count
+    if (num == 76) { stack_canary_check(canary); return blk_open_sys(arg1, arg2); }                          # blk_open(tag, mode) -> handle (RO only)
+    if (num == 77) { stack_canary_check(canary); return blk_read_sys(arg1, arg2, arg3, ksyscall_a4_get()); } # blk_read(h, lba, buf, nsec) -> nsec
+    if (num == 78) { stack_canary_check(canary); return 0 - 1; }                                             # blk_write — Phase 2 (capability-gated); ENOSYS for now
+    if (num == 79) { stack_canary_check(canary); return blk_info_sys(arg1, arg2); }                          # blk_info(h, out) -> 0
+    if (num == 80) { stack_canary_check(canary); return blk_close_sys(arg1); }                               # blk_close(h) -> 0
     if (num == 34) {
         # uname(buf=arg1, len=arg2) — writes the 64-byte identity struct: four
         # 16-byte NUL-padded fields at offsets 0/16/32/48 = sysname / nodename /
