@@ -7,18 +7,17 @@
 # builds a byte-accurate GPT partition table + FAT ESP in userland and writes it through
 # sys_blk_* — replacing agnova's `parted` + `mkfs.fat` shell-outs.
 #
-# BITE 6 (this run): gptwr builds + self-verifies the full GPT (Bites 1-2), writes the complete
-# table to the live disk's UNALLOCATED TAIL (base 524288 = the 256 MiB mark, past the 240 MiB
-# live rootfs) + readback-verifies it (Bites 3a/3b), and now formats the ESP partition as FAT32
-# (Bite 6): FATSz32 via the fatgen formula, BPB + FSInfo + dual FAT, CountOfClusters >= 65525
-# guard, metadata-region zeroing, boot/FSInfo (+ backups) + FAT sector-0 writes, readback-
-# verified (exit 97). A bug can only touch throwaway tail sectors — never the live GPT/ESP/rootfs
-# at absolute LBA 0/1/2-33. Two INDEPENDENT ORACLES on the dumped bytes: sgdisk (foreign GPT impl,
-# "No problems found" + the two type GUIDs) and mtools minfo/mdir (foreign FAT impl, recognizes
-# FAT32 + parses the root) prove the tool's output is REAL, not merely self-consistent. Needs a
-# 1 GiB disk for the tail room.
+# BITE 7 (this run): gptwr builds + self-verifies the full GPT (Bites 1-2), writes it to the live
+# disk's UNALLOCATED TAIL + readback-verifies it (Bites 3a/3b), formats the ESP as FAT32 (Bite 6),
+# and now creates the \EFI subdirectory (Bite 7): allocates cluster 3, writes its '.'/'..' dirents,
+# marks it EOC in both FATs, and publishes the \EFI dirent in the root (exit 97). A bug can only
+# touch throwaway tail sectors — never the live GPT/ESP/rootfs at absolute LBA 0/1/2-33. THREE
+# INDEPENDENT ORACLES on the dumped bytes: sgdisk (foreign GPT impl, "No problems found" + the two
+# type GUIDs), mtools minfo/mdir (foreign FAT impl — FAT32 recognized, \EFI listed + descendable),
+# and fsck.fat (strict FAT checker, no errors) prove the tool's output is REAL, not merely self-
+# consistent. Needs a 1 GiB disk for the tail room.
 #
-# Gates: "exec: running /bin/gptwr" (dispatched), "run: exit 97", no faults, sgdisk + mtools clean.
+# Gates: "exec: running /bin/gptwr", "run: exit 97", no faults, sgdisk + mtools + fsck.fat clean.
 # Diagnostics: 91/92/93 CRC vector, 90 GPT sig, 89 hdr-CRC, 88 array-CRC, 87 ESP-GUID,
 #   86 rootfs-GUID, 85 backup-hdr, 84 hdr-fields, 83 protective-MBR, 79 no-disk, 78 overrun,
 #   77 arm/RW-open, 76 MBR-write, 75 MBR-readback, 74 MBR-mismatch, 73 hdr-write, 72 array-write,
@@ -95,7 +94,7 @@ strings "$SLOG" | grep -q "exec: running /bin/gptwr" \
     && echo "  PASS: /bin/gptwr dispatched (exec'd from disk in ring 3)" \
     || { echo "  FAIL: gptwr never dispatched"; rc=1; }
 if strings "$SLOG" | grep -q "run: exit 97"; then
-    echo "  PASS: run: exit 97 — the complete GPT + an empty FAT32 ESP were written to the scratch tail; every structure read back byte-identical"
+    echo "  PASS: run: exit 97 — GPT + FAT32 ESP + \\EFI, \\EFI\\BOOT, \\boot directory skeleton written to the scratch tail; every structure read back byte-identical"
 elif strings "$SLOG" | grep -qE "run: exit 91|run: exit 92|run: exit 93"; then
     echo "  FAIL: run: exit 91/92/93 — a CRC32 canonical vector mismatched (transcription bug in crc32)"; rc=1
 elif strings "$SLOG" | grep -q "run: exit 90"; then
@@ -152,6 +151,28 @@ elif strings "$SLOG" | grep -q "run: exit 62"; then
     echo "  FAIL: run: exit 62 — FAT[0..2] readback mismatch"; rc=1
 elif strings "$SLOG" | grep -q "run: exit 61"; then
     echo "  FAIL: run: exit 61 — BPB self-check failed (bytes/sec, TotSec32, RootClus, or FATSz16)"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 60"; then
+    echo "  FAIL: run: exit 60 — \\EFI directory-cluster write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 59"; then
+    echo "  FAIL: run: exit 59 — FAT re-write (allocating cluster 3) failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 58"; then
+    echo "  FAIL: run: exit 58 — root-cluster (\\EFI dirent publish) write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 57"; then
+    echo "  FAIL: run: exit 57 — FSInfo re-write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 56"; then
+    echo "  FAIL: run: exit 56 — \\EFI cluster / FAT[3] readback mismatch"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 55"; then
+    echo "  FAIL: run: exit 55 — root \\EFI dirent readback mismatch"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 54"; then
+    echo "  FAIL: run: exit 54 — \\EFI\\BOOT or \\boot directory-cluster write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 53"; then
+    echo "  FAIL: run: exit 53 — FAT re-write (allocating clusters 4/5) failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 52"; then
+    echo "  FAIL: run: exit 52 — parent-dirent publish (BOOT under \\EFI / root) write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 51"; then
+    echo "  FAIL: run: exit 51 — FSInfo re-write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 50"; then
+    echo "  FAIL: run: exit 50 — \\EFI\\BOOT / \\boot readback mismatch"; rc=1
 else
     echo "  FAIL: no 'run: exit 97' — gptwr crashed before exit (bad wiring / fault)"; rc=1
 fi
@@ -200,11 +221,23 @@ if [ "$rc" -eq 0 ]; then
     else
         echo "  FAIL: mtools minfo does not see a FAT32 filesystem"; rc=1
     fi
-    if [ "$mdirrc" -eq 0 ]; then
-        echo "  PASS: mtools mdir: parsed the FAT + listed the (empty) root directory (rc=0)"
+    if [ "$mdirrc" -eq 0 ] && grep -aqi "EFI" "$MDIR"; then
+        echo "  PASS: mtools mdir: parsed the FAT + sees the \\EFI directory in the root"
     else
-        echo "  FAIL: mtools mdir rejected the tool-written FAT (rc=$mdirrc)"; cat "$MDIR" | head -3 | sed 's/^/    /'; rc=1
+        echo "  FAIL: mtools mdir did not find \\EFI in the tool-written root (rc=$mdirrc)"; sed 's/^/    /' "$MDIR" | head -5; rc=1
     fi
+    mdir -i "$ESPIMG" ::/EFI >"$WORK/mdir-efi.out" 2>&1; mdirefirc=$?
+    if [ "$mdirefirc" -eq 0 ] && grep -aqi "BOOT" "$WORK/mdir-efi.out"; then
+        echo "  PASS: mtools mdir ::/EFI: descended in, sees the BOOT subdirectory"
+    else
+        echo "  FAIL: mtools could not descend into \\EFI or BOOT missing (rc=$mdirefirc)"; sed 's/^/    /' "$WORK/mdir-efi.out" | head -3; rc=1
+    fi
+    mdir -i "$ESPIMG" ::/EFI/BOOT >"$WORK/mdir-efiboot.out" 2>&1 \
+        && echo "  PASS: mtools mdir ::/EFI/BOOT: descended into the nested \\EFI\\BOOT directory" \
+        || { echo "  FAIL: mtools could not descend into \\EFI\\BOOT"; sed 's/^/    /' "$WORK/mdir-efiboot.out" | head -3; rc=1; }
+    mdir -i "$ESPIMG" ::/boot >"$WORK/mdir-boot.out" 2>&1 \
+        && echo "  PASS: mtools mdir ::/boot: descended into the \\boot directory" \
+        || { echo "  FAIL: mtools could not descend into \\boot"; sed 's/^/    /' "$WORK/mdir-boot.out" | head -3; rc=1; }
     # Third oracle: fsck.fat (dosfstools, the strictest FAT checker) — gating when present.
     if command -v fsck.fat >/dev/null 2>&1; then
         if fsck.fat -n "$ESPIMG" >"$WORK/fsck.out" 2>&1; then
@@ -216,5 +249,5 @@ if [ "$rc" -eq 0 ]; then
 fi
 
 echo ""
-[ "$rc" -eq 0 ] && echo "gpt-write-smoke: PASS — GPT + FAT32 ESP written to disk + validated by independent parsers (sgdisk + mtools) (1.53.x Phase 4 Bite 6)" || echo "gpt-write-smoke: FAIL"
+[ "$rc" -eq 0 ] && echo "gpt-write-smoke: PASS — GPT + FAT32 ESP + \\EFI\\BOOT + \\boot skeleton written to disk + validated by independent parsers (sgdisk + mtools + fsck.fat) (1.53.x Phase 4 Bite 8a)" || echo "gpt-write-smoke: FAIL"
 exit $rc

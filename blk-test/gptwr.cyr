@@ -30,13 +30,24 @@
 #                  this the tool-authored GPT is complete on disk; the smoke's sgdisk oracle
 #                  (Bite 5) validates it independently. Diagnostics: 73 hdr-write, 72 array-write,
 #                  71 backup-array-write, 70 backup-hdr-write, 69 readback.
-#   Bite 6 (THIS): FAT32 mkfs into the ESP partition — compute FATSz32 (fatgen formula), build the
-#                  BPB + FSInfo + FAT[0..2], guard CountOfClusters >= 65525 (else it's FAT16), zero
-#                  the metadata region, then write the boot sector (+backup @6), FSInfo (+backup
-#                  @7), and both FATs' sector 0, and readback-verify. After this the ESP is an
-#                  empty but valid FAT32; the smoke's mtools oracle validates it independently.
-#                  Diagnostics: 68 not-FAT32, 67 boot-write, 66 fsinfo-write, 65 FAT-write,
-#                  64 zeroing, 63 boot-readback, 62 FAT-readback, 61 BPB-self-check.
+#   Bite 6: FAT32 mkfs into the ESP partition — compute FATSz32 (fatgen formula), build the BPB +
+#                  FSInfo + FAT[0..2] + root-dir volume-label dirent, guard CountOfClusters >= 65525
+#                  (else it's FAT16), zero the metadata region, then write the boot sector (+backup
+#                  @6), FSInfo (+backup @7), both FATs' sector 0, and the root cluster, and readback-
+#                  verify. The ESP is now a valid FAT32 (mtools + fsck.fat clean). Diagnostics:
+#                  68 not-FAT32, 67 boot-write, 66 fsinfo-write, 65 FAT/root-write, 64 zeroing,
+#                  63 boot-readback, 62 FAT-readback, 61 BPB-self-check.
+#   Bite 7: create the \EFI subdirectory — allocate cluster 3, write its '.'/'..' dirents, mark it
+#                  EOC in both FATs, and publish the \EFI dirent in the root (the split FstClusHI@20
+#                  / FstClusLO@26 fields written as TWO store16, never a store32 that would clobber
+#                  WrtTime@22). Crash-safe order: data cluster -> FAT -> parent dirent -> FSInfo.
+#                  Diagnostics: 60 \EFI-cluster-write, 59 FAT-rewrite, 58 root-publish-write,
+#                  57 fsinfo-rewrite, 56 \EFI-readback, 55 root-dirent-readback.
+#   Bite 8a (THIS): complete the boot directory skeleton — \EFI\BOOT (cluster 4, parent \EFI) and
+#                  \boot (cluster 5, parent root), via the build_dir_cluster/put_dir_dirent helpers,
+#                  same crash-safe order. These are the parents for BOOTX64.EFI and the kernel
+#                  (Bites 8b/8c). Diagnostics: 54 dir-cluster-write, 53 FAT-rewrite, 52 parent-
+#                  publish-write, 51 fsinfo-rewrite, 50 readback.
 #
 # Bitwise CRC-32/ISO-HDLC, transcribed from the kernel's own gpt_crc32_chunk
 # (kernel/core/gpt.cyr:114-128): poly 0xEDB88320 (reflected), init/final 0xFFFFFFFF.
@@ -68,7 +79,9 @@ var fatbs[64];    #   512 B — FAT32 boot sector (BPB)
 var fsinfo[64];   #   512 B — FAT32 FSInfo sector
 var fatsec[64];   #   512 B — first sector of each FAT (holds FAT[0..2])
 var z32[2048];    # 16384 B — zero buffer for bulk-zeroing the FAT metadata region
-var rootbuf[64];  #   512 B — FAT32 root-cluster sector 0 (holds the volume-label dirent)
+var rootbuf[64];  #   512 B — FAT32 root-cluster sector 0 (volume-label dirent + \EFI dirent)
+var efidir[64];   #   512 B — the \EFI directory cluster ('.'/'..' + BOOT dirents)
+var subdir[64];   #   512 B — scratch for a freshly-built subdirectory cluster
 
 fn crc32(buf: i64, len: i64): i64 {
     var crc = 0xFFFFFFFF;
@@ -304,6 +317,41 @@ fn build_fat(esp_sectors: i64): i64 {
     return fatsz;
 }
 
+# Build a fresh FAT directory cluster in `buf`: the '.' (self) and '..' (parent; cluster 0 if
+# the parent is the root) dirents, rest zero (0x00 first byte = end-of-directory). The split
+# FstClusHI@20 / FstClusLO@26 fields are each a store16 (never a store32 over WrtTime@22).
+fn build_dir_cluster(buf: i64, self_clus: i64, parent_clus: i64): i64 {
+    zero(buf, 512);
+    store8(buf + 0, 0x2E);                           # "."
+    var i = 1;
+    while (i < 11) { store8(buf + i, 0x20); i = i + 1; }
+    store8(buf + 11, 0x10);                          # ATTR_DIRECTORY
+    store16(buf + 20, (self_clus >> 16) & 0xFFFF);
+    store16(buf + 26, self_clus & 0xFFFF);
+    store8(buf + 32, 0x2E); store8(buf + 33, 0x2E);  # ".."
+    i = 34;
+    while (i < 43) { store8(buf + i, 0x20); i = i + 1; }
+    store8(buf + 43, 0x10);
+    store16(buf + 52, (parent_clus >> 16) & 0xFFFF);
+    store16(buf + 58, parent_clus & 0xFFFF);
+    return 0;
+}
+
+# Publish an 8.3 DIRECTORY dirent into parent buffer `pbuf` at slot `slot` (offset slot*32):
+# an 8-char space-padded name (bytes n0..n7), ext = 3 spaces, ATTR_DIRECTORY, first cluster
+# (split HI/LO), FileSize 0. Used to link a subdirectory from its parent.
+fn put_dir_dirent(pbuf: i64, slot: i64, clus: i64, n0: i64, n1: i64, n2: i64, n3: i64, n4: i64, n5: i64, n6: i64, n7: i64): i64 {
+    var o = pbuf + slot * 32;
+    store8(o + 0, n0); store8(o + 1, n1); store8(o + 2, n2); store8(o + 3, n3);
+    store8(o + 4, n4); store8(o + 5, n5); store8(o + 6, n6); store8(o + 7, n7);
+    store8(o + 8, 0x20); store8(o + 9, 0x20); store8(o + 10, 0x20);   # ext = spaces
+    store8(o + 11, 0x10);                            # ATTR_DIRECTORY
+    store16(o + 20, (clus >> 16) & 0xFFFF);          # FstClusHI (split field)
+    store16(o + 26, clus & 0xFFFF);                  # FstClusLO
+    store32(o + 28, 0);                              # FileSize = 0 for a directory
+    return 0;
+}
+
 fn gptwr_main(): i64 {
     # --- Bite 1 regression: CRC32 canonical vectors (cheap; guards the whole format) ---
     var s[9];
@@ -426,9 +474,105 @@ fn gptwr_main(): i64 {
     if (load32(&fatbs + 44) != 2)           { return 61; }   # RootClus
     if (load16(&fatbs + 22) != 0)           { return 61; }   # FATSz16 must be 0 for FAT32
 
+    # --- Bite 7: create the \EFI subdirectory (cluster 3) ---
+    # Cluster N's data sector = data_start + (N-2)*SecPerClus; data_start = root_start (FAT32),
+    # SecPerClus = 1. Root = cluster 2 @ root_start; \EFI = cluster 3 @ root_start+1.
+    var EFI_CLUS = 3;
+    var efi_sec = root_start + (EFI_CLUS - 2);
+
+    # Build the \EFI directory cluster: '.' (self) and '..' (parent = root -> cluster 0).
+    zero(&efidir, 512);
+    store8(&efidir + 0, 0x2E);                       # "."
+    var di = 1;
+    while (di < 11) { store8(&efidir + di, 0x20); di = di + 1; }
+    store8(&efidir + 11, 0x10);                      # ATTR_DIRECTORY
+    store16(&efidir + 20, (EFI_CLUS >> 16) & 0xFFFF);   # FstClusHI  (split field:
+    store16(&efidir + 26, EFI_CLUS & 0xFFFF);           # FstClusLO   two store16, NOT a store32)
+    store8(&efidir + 32, 0x2E); store8(&efidir + 33, 0x2E);   # ".."
+    di = 34;
+    while (di < 43) { store8(&efidir + di, 0x20); di = di + 1; }
+    store8(&efidir + 43, 0x10);                      # ATTR_DIRECTORY (32+11)
+    store16(&efidir + 52, 0);                        # FstClusHI (32+20) = 0
+    store16(&efidir + 58, 0);                        # FstClusLO (32+26) = 0 (parent is root)
+
+    # Allocate cluster 3 in the FAT (EOC), publish the \EFI dirent in root slot 1 (offset 32).
+    store32(&fatsec + 12, 0x0FFFFFFF);               # FAT[3] EOC (cluster 3 * 4 bytes = offset 12)
+    store8(&rootbuf + 32, 0x45); store8(&rootbuf + 33, 0x46); store8(&rootbuf + 34, 0x49);  # "EFI"
+    var ri = 35;
+    while (ri < 43) { store8(&rootbuf + ri, 0x20); ri = ri + 1; }
+    store8(&rootbuf + 43, 0x10);                     # ATTR_DIRECTORY (32+11)
+    store16(&rootbuf + 52, (EFI_CLUS >> 16) & 0xFFFF);  # FstClusHI (32+20) — split field, two store16
+    store16(&rootbuf + 58, EFI_CLUS & 0xFFFF);          # FstClusLO (32+26)
+
+    # Update FSInfo free-count (clusters 2 + 3 now used).
+    store32(&fsinfo + 488, coc - 2);
+    store32(&fsinfo + 492, 4);
+
+    # Crash-safe write order: data cluster -> FAT -> parent dirent -> FSInfo (a crash leaks a
+    # cluster, never dangles a dirent).
+    if (sys_blk_write(hrw, ESP_ABS + efi_sec, &efidir, 1) != 1)    { return 60; }
+    if (sys_blk_write(hrw, ESP_ABS + 32, &fatsec, 1) != 1)         { return 59; }
+    if (sys_blk_write(hrw, ESP_ABS + 32 + fatsz, &fatsec, 1) != 1) { return 59; }
+    if (sys_blk_write(hrw, ESP_ABS + root_start, &rootbuf, 1) != 1) { return 58; }
+    if (sys_blk_write(hrw, ESP_ABS + 1, &fsinfo, 1) != 1)          { return 57; }
+    if (sys_blk_write(hrw, ESP_ABS + 7, &fsinfo, 1) != 1)          { return 57; }
+
+    # readback-verify the \EFI cluster, FAT[3], and the root \EFI dirent.
+    if (sys_blk_read(hrw, ESP_ABS + efi_sec, &rsec, 1) != 1) { return 56; }
+    if ((load8(&rsec + 0)  & 0xFF) != 0x2E) { return 56; }   # '.'
+    if ((load8(&rsec + 11) & 0xFF) != 0x10) { return 56; }   # '.' is a directory
+    if (load16(&rsec + 26) != EFI_CLUS)     { return 56; }   # '.' -> cluster 3
+    if ((load8(&rsec + 32) & 0xFF) != 0x2E) { return 56; }   # '..'
+    if ((load8(&rsec + 33) & 0xFF) != 0x2E) { return 56; }
+    if (load16(&rsec + 58) != 0)            { return 56; }   # '..' -> cluster 0 (root)
+    if (sys_blk_read(hrw, ESP_ABS + 32, &rsec, 1) != 1) { return 56; }
+    if (load32(&rsec + 12) != 0x0FFFFFFF)   { return 56; }   # FAT[3] EOC on disk
+    if (sys_blk_read(hrw, ESP_ABS + root_start, &rsec, 1) != 1) { return 55; }
+    if ((load8(&rsec + 32) & 0xFF) != 0x45) { return 55; }   # root dirent 'E'
+    if ((load8(&rsec + 43) & 0xFF) != 0x10) { return 55; }   # is a directory
+    if (load16(&rsec + 58) != EFI_CLUS)     { return 55; }   # -> cluster 3
+
+    # --- Bite 8a: create \EFI\BOOT (cluster 4) and \boot (cluster 5) directories ---
+    var EFIBOOT_CLUS = 4;
+    var BOOT_CLUS = 5;
+    var efiboot_sec = root_start + (EFIBOOT_CLUS - 2);   # cluster 4 data sector
+    var boot_sec    = root_start + (BOOT_CLUS - 2);      # cluster 5 data sector
+
+    build_dir_cluster(&subdir, EFIBOOT_CLUS, EFI_CLUS);              # \EFI\BOOT: parent = \EFI (3)
+    if (sys_blk_write(hrw, ESP_ABS + efiboot_sec, &subdir, 1) != 1) { return 54; }
+    build_dir_cluster(&subdir, BOOT_CLUS, 0);                        # \boot: parent = root (0)
+    if (sys_blk_write(hrw, ESP_ABS + boot_sec, &subdir, 1) != 1)    { return 54; }
+
+    store32(&fatsec + 16, 0x0FFFFFFF);   # FAT[4] EOC (4*4=16)
+    store32(&fatsec + 20, 0x0FFFFFFF);   # FAT[5] EOC (5*4=20)
+    if (sys_blk_write(hrw, ESP_ABS + 32, &fatsec, 1) != 1)          { return 53; }
+    if (sys_blk_write(hrw, ESP_ABS + 32 + fatsz, &fatsec, 1) != 1)  { return 53; }
+
+    put_dir_dirent(&efidir,  2, EFIBOOT_CLUS, 0x42, 0x4F, 0x4F, 0x54, 0x20, 0x20, 0x20, 0x20);  # "BOOT" under \EFI
+    put_dir_dirent(&rootbuf, 2, BOOT_CLUS,    0x42, 0x4F, 0x4F, 0x54, 0x20, 0x20, 0x20, 0x20);  # "BOOT" under root
+    if (sys_blk_write(hrw, ESP_ABS + root_start + 1, &efidir, 1) != 1) { return 52; }  # \EFI cluster
+    if (sys_blk_write(hrw, ESP_ABS + root_start, &rootbuf, 1) != 1)    { return 52; }  # root cluster
+
+    store32(&fsinfo + 488, coc - 4);     # clusters 2,3,4,5 used
+    store32(&fsinfo + 492, 6);
+    if (sys_blk_write(hrw, ESP_ABS + 1, &fsinfo, 1) != 1) { return 51; }
+    if (sys_blk_write(hrw, ESP_ABS + 7, &fsinfo, 1) != 1) { return 51; }
+
+    if (sys_blk_read(hrw, ESP_ABS + efiboot_sec, &rsec, 1) != 1) { return 50; }
+    if ((load8(&rsec + 0) & 0xFF) != 0x2E) { return 50; }            # '.' present
+    if (load16(&rsec + 58) != EFI_CLUS)    { return 50; }            # '..' -> \EFI (3)
+    if (sys_blk_read(hrw, ESP_ABS + boot_sec, &rsec, 1) != 1) { return 50; }
+    if (load16(&rsec + 58) != 0)           { return 50; }            # '..' -> root (0)
+    if (sys_blk_read(hrw, ESP_ABS + root_start + 1, &rsec, 1) != 1) { return 50; }
+    if ((load8(&rsec + 64) & 0xFF) != 0x42)      { return 50; }      # \EFI slot 2 = 'B' (BOOT)
+    if (load16(&rsec + 64 + 26) != EFIBOOT_CLUS) { return 50; }      # -> cluster 4
+    if (sys_blk_read(hrw, ESP_ABS + root_start, &rsec, 1) != 1) { return 50; }
+    if ((load8(&rsec + 64) & 0xFF) != 0x42)      { return 50; }      # root slot 2 = 'B' (boot)
+    if (load16(&rsec + 64 + 26) != BOOT_CLUS)    { return 50; }      # -> cluster 5
+
     sys_blk_close(hrw);
 
-    return 97;    # GPT + empty FAT32 ESP written to the scratch tail; every structure readback-verified
+    return 97;    # GPT + FAT32 ESP + \EFI, \EFI\BOOT, \boot directory skeleton; all readback-verified
 }
 
 # No-argv bite -> the var-r-main form is safe here (matches blkprobe/blkwr; later bites that
