@@ -1,11 +1,14 @@
 # 2026-07-10 — Directory-listing syscall `readdir` (#81) + its cyrius wrapper
 
-**Status:** 🔧 kernel half **SHIPPED — cut 1.53.13** (2026-07-10; `ext2_readdir_sys` + dispatch
-#81, QEMU-proven: crab lists real `/bin` and `/` on agnos). **cyrius-side ask OPEN** — add a
-`sys_readdir` wrapper so ring-3 Cyrius programs call it by name instead of the raw `syscall(81,
-…)`. **Cross-repo:** a copy of this ask lives in `cyrius/docs/development/issues/` (the wrapper
-must land in the cyrius stdlib to trickle to programs — same as the `sys_shm_*` / `sys_blk_*`
-wrappers before it).
+**Status:** ✅ **CLOSED** (2026-07-10) — all three legs done. **Kernel:** cut 1.53.13
+(`ext2_readdir_sys` + dispatch #81). **cyrius:** `SYS_READDIR = 81` + `sys_readdir(path, buf,
+max)` agnos-gated wrapper shipped in **v6.4.43** (see the RESOLVED copy in
+`cyrius/docs/development/issues/2026-07-10-agnos-sys-readdir-wrapper.md`). **Consumer:** crab
+migrated off the raw `syscall(81, …)` to the named `sys_readdir(…)` and cut **0.3.0** (pin
+6.4.34 → 6.4.43). QEMU-proven end-to-end on agnos: both crab panes list their real directories
+(`/bin` → `aethersafha`/`crab`/`puka`; `/` → `bin/`/`lost+found/`) and navigate (setu-nav +
+setu-pane tests PASS). Follow-ups below (fd-relative readdir, richer records, FAT) remain open
+as separate kernel work.
 
 ## Problem
 
@@ -37,7 +40,8 @@ Add a stdlib wrapper so programs write `sys_readdir(path, buf, max)` instead of 
 should return an error / not emit syscall 81, which is `fchdir` there). Mirror the existing
 `sys_shm_*` (6.4.34) and `sys_blk_*` (6.4.39) agnos wrappers in `lib/syscalls_x86_64_agnos.cyr`.
 
-Until then, crab calls the raw `syscall(81, …)` under its own `#ifdef CYRIUS_TARGET_AGNOS`.
+Done in cyrius v6.4.43; crab migrated to `sys_readdir(…)` at 0.3.0 (was the raw `syscall(81, …)`
+under its own `#ifdef CYRIUS_TARGET_AGNOS`).
 
 ## Follow-ups (kernel, later)
 

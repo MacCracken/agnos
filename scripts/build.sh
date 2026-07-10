@@ -181,6 +181,8 @@ else
         [ -n "$DOOM_AUDIO_SELFTEST" ] && echo '#define DOOM_AUDIO_SELFTEST'
         [ -n "$TONEGEN_SELFTEST" ]   && echo '#define TONEGEN_SELFTEST'
         [ -n "$VANITONE_AUDIO_SELFTEST" ] && echo '#define VANITONE_AUDIO_SELFTEST'
+        [ -n "$MISHRAN_AUDIO_SELFTEST" ] && echo '#define MISHRAN_AUDIO_SELFTEST'
+        [ -n "$MISHRAN_JALWA_SELFTEST" ] && echo '#define MISHRAN_JALWA_SELFTEST'
         [ -n "$FP_SELFTEST" ]        && echo '#define FP_SELFTEST'
         [ -n "$FP_AREA_SELFTEST" ]   && echo '#define FP_AREA_SELFTEST'
         [ -n "$FP_NM_SELFTEST" ]     && echo '#define FP_NM_SELFTEST'

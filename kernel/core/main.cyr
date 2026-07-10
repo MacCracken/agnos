@@ -2406,6 +2406,34 @@ sh_exec("run /bin/vanitone", 17);
 kprintln("exec: vanitone returned", 23);
 #endif
 
+#ifdef MISHRAN_AUDIO_SELFTEST
+# mishran mixer proof (the "route through the mixer" audio gate). Runs
+# /bin/mishtone, which opens the vani sink via an MshRouter, registers TWO app
+# streams at different Q8 gains, feeds each an integer square wave, and mixes them
+# down with msh_router_pump → vani (audio_* → sys_snd_* #64-69). Unlike vanitone
+# (vani direct), this proves the whole mixer fan-in + gain + sink write on agnos.
+# scripts/mishran-audio-smoke.sh captures the HDA output + asserts a non-silent
+# wav (sustained mixed tone → strong RMS). Exits when the tone finishes.
+kprintln("exec: running /bin/mishtone", 27);
+sh_exec("run /bin/mishtone", 17);
+kprintln("exec: mishtone returned", 23);
+#endif
+
+#ifdef MISHRAN_JALWA_SELFTEST
+# jalwa->mishran end-to-end audio proof (the "route through the mixer" gate). Runs
+# /bin/jalwa (the play-probe) as the PRIMARY via sh_exec — a 2.5 MB binary, and
+# sh_exec handles big ELFs (aethersafha is 15 MB), unlike spawn_path (proven only
+# for small children like puka/crab). jalwa spawn_path's the SMALL /bin/mishrand
+# daemon itself, waits for it to listen, then decodes a seeded /tone.wav and streams
+# its PCM to mishran (msh_client_*), which mixes it down to vani (audio_* ->
+# sys_snd_* #64-69). Two ring-3 procs concurrent over loopback — the desktop
+# primary+client model applied to audio. scripts/mishran-jalwa-audio-smoke.sh
+# captures the HDA output + asserts a non-silent wav.
+kprintln("exec: running /bin/jalwa", 24);
+sh_exec("run /bin/jalwa", 14);
+kprintln("exec: jalwa returned", 20);
+#endif
+
 # 1.41.3 — FS-syscall self-test (compile-gated, FS_SYSCALL_SELFTEST=1). Drives
 # the new real FS syscalls (mkdir/open+CREAT/stat/rename/getdents/unlink/rmdir/
 # sync) through ksyscall() with a real >=2 MB user-range scratch (pmm_alloc_2mb
