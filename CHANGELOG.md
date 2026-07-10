@@ -5,6 +5,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.10] — 2026-07-09 — raw block-device syscalls (#75-80): the native-install primitive (ring-3 disk R/W, gated)
+
+The kernel now exposes **raw block-device access to a privileged ring-3 process** — the
+primitive a native (on-agnos) installer needs so **agnova** can partition + format a
+target disk WITHOUT shelling out to Linux `parted`/`mkfs`. The design decision: expose
+raw sector I/O and let **userland** build the GPT table + `mkfs` structures (as every OS
+does — Linux `mkfs.ext4` is a userland tool writing sectors), rather than putting a
+filesystem-creator in the kernel. Both paths are QEMU-proven from ring 3 against a real
+NVMe/GPT disk. Design + security posture:
+`docs/development/issue/2026-07-09-ring3-block-device-syscalls-for-install.md`.
+
+### Added
+- **Ring-3 raw block-device syscalls #75-80** (`kernel/core/syscall.cyr`), built on the
+  existing block layer (`blk_read_on`/`blk_write_on`/`blk_is_registered`), the shm
+  user-copy convention (`is_user_range` + `shm_copy` + a one-LBA kernel bounce), and the
+  readlink#70 4-arg pattern (`ksyscall_a4_get()`), serialized by `fs_spin_lock`:
+  - **`blk_enum`#75** `(buf,cap)->count` — list registered backends {tag, capacity, lba_bytes}.
+  - **`blk_open`#76** `(tag,mode)->handle` — RO (mode 0) always; RW (mode 1) only when armed.
+  - **`blk_read`#77** `(h,lba,buf,nsec)->nsec` — raw sector read (bounds-checked).
+  - **`blk_write`#78** `(h,lba,buf,nsec)->nsec` — raw sector write + device-cache flush.
+  - **`blk_info`#79** `(h,out)->0` — capacity_lbas + lba_bytes.
+  - **`blk_close`#80** `(h)->0`.
+- **Write-path capability GATE** — raw block WRITE (and RW-open) is **OFF by default**;
+  enabled only by a deliberate arm `blk_open(_, BLK_RW_ARM_MAGIC)`. agnos has no per-proc
+  capability/uid yet (auth-posture), so default-off + explicit-magic-arm is the boundary:
+  a raw disk write can never happen accidentally, and the arm call is the exact seam where
+  an aegis/shakti installer-capability check lands when per-proc caps arrive.
+- **QEMU proofs** (`blk-test/` + two smokes, `BLK_RING3_SELFTEST` / `BLK_WRITE_SELFTEST`):
+  - **`scripts/blk-ring3-smoke.sh`** — `/bin/blkprobe` enum→open(RO)→read LBA 1→validate
+    the `EFI PART` GPT signature. **exit 95**, fault-free.
+  - **`scripts/blk-write-smoke.sh`** — `/bin/blkwr` asserts an UNARMED write/RW-open is
+    REJECTED, then arms + writes a pattern to a scratch LBA in the unallocated tail and
+    reads it back byte-identical. **exit 96**, fault-free.
+
+### Notes
+- Read-path capacity is exact for the ACTIVE backend; per-secondary-backend capacity is a
+  follow-up. Handles are the backend tag (no per-open RW encoding); the arm flag is the
+  gate. Arm stays set until reboot (disarm-after-install is a hardening follow-up).
+- **Consumers / remaining arc:** cyrius `sys_blk_*` wrappers
+  (`docs/development/issue/2026-07-09-cyrius-block-device-wrappers.md`), then the userland
+  GPT-writer + `mkfs` and the **agnova** executor port (Linux shell-outs → these syscalls),
+  then the end-to-end install proof (blank disk → partition → mkfs → install → boot).
+
 ## [1.53.9] — 2026-07-09 — on-device setu SHARED-BUFFER present composites end-to-end on agnos (kernel shm + the two-proc unblock)
 
 The setu display protocol now completes a full present on the sovereign kernel: a client

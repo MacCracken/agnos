@@ -2346,6 +2346,16 @@ sh_exec("run /bin/blkprobe", 17);
 kprintln("exec: blkprobe returned", 23);
 #endif
 
+#ifdef BLK_WRITE_SELFTEST
+# 1.53.10 Phase 2: raw block-device WRITE-PATH + capability-gate proof. Runs /bin/blkwr
+# (blk-test/, built --agnos) — asserts blk_write#78 is REJECTED while unarmed (the gate),
+# then arms via blk_open(_, BLK_RW_ARM_MAGIC), writes a known pattern to a scratch LBA in
+# the disk's unallocated tail, and reads it back. Exits 96 iff gate + write-path both hold.
+kprintln("exec: running /bin/blkwr", 24);
+sh_exec("run /bin/blkwr", 14);
+kprintln("exec: blkwr returned", 20);
+#endif
+
 #ifdef NAAD_RING3_SELFTEST
 # 1.53.x B6 (arc-closer): naad oscillator END-PROOF. Runs /bin/naadex (naad/, built --agnos) —
 # a REAL heavy-f64 DSP workload: naad's 440 Hz sine oscillator generates 256 samples via

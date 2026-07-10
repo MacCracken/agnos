@@ -1,6 +1,9 @@
 # 2026-07-09 — Ring-3 raw block-device syscalls (native-install primitive)
 
-**Status:** OPEN — planned for the **1.53.10** cut (read-path first; write-path gated).
+**Status:** ✅ Phases 1-2 DONE — **cut 1.53.10** (2026-07-09). Read-path + gated write-path
+both QEMU-proven from ring 3 (`blk-ring3-smoke` exit 95 · `blk-write-smoke` exit 96,
+unarmed writes rejected). Remaining arc: cyrius `sys_blk_*` wrappers (ph.3), userland
+GPT-writer + `mkfs` (ph.4), agnova executor port (ph.5), end-to-end install proof (ph.6).
 **Driver:** agnova (native OS installer) cannot run on agnos today — it shells out to
 Linux `parted`/`mkfs.*`/`cryptsetup` and needs raw disk access agnos doesn't expose.
 See the agnova full-install readiness survey (2026-07-09).

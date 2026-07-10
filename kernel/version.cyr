@@ -25,13 +25,13 @@
 
 #ifdef ARCH_X86_64
 fn print_agnos_kernel_banner() {
-    kprintln("AGNOS kernel v1.53.9", 20);
+    kprintln("AGNOS kernel v1.53.10", 21);
 }
 #endif
 
 #ifdef ARCH_AARCH64
 fn print_agnos_kernel_banner() {
-    serial_println("AGNOS kernel v1.53.9 [aarch64]", 30);
+    serial_println("AGNOS kernel v1.53.10 [aarch64]", 31);
 }
 #endif
 

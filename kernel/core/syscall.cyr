@@ -766,6 +766,15 @@ fn shm_free(id) {
 # =============================================================================
 var blk_sc_bounce[512];   # 4096 B — one-LBA bounce (backends DMA into kernel mem, not user VA)
 
+# Phase 2 write-path GATE. Raw block WRITE (blk_open RW + blk_write#78) is OFF by
+# default; it is enabled only after a deliberate arm — blk_open(_, BLK_RW_ARM_MAGIC).
+# agnos has no per-proc capability/uid yet (proc.cyr: "NOT Unix uid", auth-posture),
+# so this default-off + explicit-magic-arm is the boundary: a raw disk write can
+# never happen accidentally/incidentally, and the arm call is the exact seam where an
+# aegis/shakti installer-capability check lands when agnos grows per-proc caps.
+var blk_rw_armed     = 0;
+var BLK_RW_ARM_MAGIC = 0x424C4B5F5257;   # "BLK_RW" — deliberate-arm token (not a plausible mode value)
+
 # blk_enum(buf, cap) -> registered-device count / -1. Writes {tag, capacity_lbas,
 # lba_bytes} (3xu64 = 24 B) per registered backend into the user buf, bounded by cap.
 fn blk_enum_sys(buf, cap) {
@@ -788,14 +797,20 @@ fn blk_enum_sys(buf, cap) {
     return count;
 }
 
-# blk_open(tag, mode) -> handle(==tag) / -1. Phase 1: RO only (mode 0). RW (mode 1)
-# is Phase 2 and capability-gated — rejected here. Validates tag is registered.
+# blk_open(tag, mode) -> handle(==tag) / -1 / arm-ack(0). mode 0 = RO (always), mode 1
+# = RW (only when armed). mode == BLK_RW_ARM_MAGIC = the deliberate arm (sets the
+# write gate, returns 0) — the aegis/shakti capability seam. Validates tag registered.
 fn blk_open_sys(tag, mode) {
-    if (mode != 0) { return 0 - 1; }
+    if (mode == BLK_RW_ARM_MAGIC) { blk_rw_armed = 1; return 0; }   # deliberate RW arm
     if (tag < 1) { return 0 - 1; }
     if (tag > 5) { return 0 - 1; }
     if (blk_is_registered(tag) == 0) { return 0 - 1; }
-    return tag;
+    if (mode == 0) { return tag; }                                  # RO handle
+    if (mode == 1) {                                                # RW handle — gated
+        if (blk_rw_armed == 0) { return 0 - 1; }                    # EPERM: not armed
+        return tag;
+    }
+    return 0 - 1;                                                   # unknown mode
 }
 
 # blk_read(h, lba, buf, nsec) -> nsec / -1. Reads nsec LBAs from device h at lba
@@ -823,6 +838,35 @@ fn blk_read_sys(h, lba, buf, nsec) {
             i = i + 1;
         }
     }
+    fs_spin_unlock();
+    return rc;
+}
+
+# blk_write(h, lba, buf, nsec) -> nsec / -1. Phase 2: the DESTRUCTIVE write-path,
+# GATED on blk_rw_armed (off by default; armed via blk_open(_, BLK_RW_ARM_MAGIC)).
+# Copies user buf -> kernel bounce -> blk_write_on, one LBA at a time, then flushes
+# the device cache (durability). fs_spin_lock serializes with FS + the shared bounce.
+fn blk_write_sys(h, lba, buf, nsec) {
+    if (blk_rw_armed == 0) { return 0 - 1; }          # THE GATE — raw write off unless armed
+    if (h < 1) { return 0 - 1; }
+    if (h > 5) { return 0 - 1; }
+    if (blk_is_registered(h) == 0) { return 0 - 1; }
+    if (nsec <= 0) { return 0 - 1; }
+    if (lba < 0) { return 0 - 1; }
+    if (h == blk_active) {
+        if (lba + nsec > blk_capacity) { return 0 - 1; }
+    }
+    var total = nsec * blk_lba_bytes;
+    if (is_user_range(buf, total) == 0) { return 0 - 1; }
+    fs_spin_lock();
+    var rc = nsec;
+    var i = 0;
+    while (i < nsec) {
+        shm_copy(&blk_sc_bounce, buf + i * blk_lba_bytes, blk_lba_bytes);   # user -> bounce
+        if (blk_write_on(h, lba + i, &blk_sc_bounce) != 0) { rc = 0 - 1; i = nsec; }
+        else { i = i + 1; }
+    }
+    blk_flush_on(h);                                  # durability barrier (best-effort)
     fs_spin_unlock();
     return rc;
 }
@@ -1474,7 +1518,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 75) { stack_canary_check(canary); return blk_enum_sys(arg1, arg2); }                          # blk_enum(buf, cap) -> count
     if (num == 76) { stack_canary_check(canary); return blk_open_sys(arg1, arg2); }                          # blk_open(tag, mode) -> handle (RO only)
     if (num == 77) { stack_canary_check(canary); return blk_read_sys(arg1, arg2, arg3, ksyscall_a4_get()); } # blk_read(h, lba, buf, nsec) -> nsec
-    if (num == 78) { stack_canary_check(canary); return 0 - 1; }                                             # blk_write — Phase 2 (capability-gated); ENOSYS for now
+    if (num == 78) { stack_canary_check(canary); return blk_write_sys(arg1, arg2, arg3, ksyscall_a4_get()); } # blk_write(h, lba, buf, nsec) -> nsec (GATED on blk_rw_armed)
     if (num == 79) { stack_canary_check(canary); return blk_info_sys(arg1, arg2); }                          # blk_info(h, out) -> 0
     if (num == 80) { stack_canary_check(canary); return blk_close_sys(arg1); }                               # blk_close(h) -> 0
     if (num == 34) {

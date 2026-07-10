@@ -1,0 +1,59 @@
+# blkwr — agnos ring-3 block WRITE-PATH + capability-gate exerciser (1.53.10 Phase 2).
+#
+# Proves the #78 write-path AND its gate end to end from ring 3, against the real NVMe
+# disk QEMU presents. It writes ONLY to a scratch LBA in the disk's UNALLOCATED TAIL
+# (500000, well past the 240 MiB rootfs on a 256 MiB image) — never the GPT/ESP/rootfs.
+#
+# Sequence (exit 96 iff ALL hold):
+#   1. blk_write#78 while UNARMED must be REJECTED         (the safety default)
+#   2. blk_open#76 RW while UNARMED must be REJECTED       (gate on RW-open)
+#   3. arm the gate: blk_open(_, BLK_RW_ARM_MAGIC)         (deliberate)
+#   4. blk_open RW (armed) + blk_write#78 a known pattern  (the write-path)
+#   5. blk_read#77 it back and byte-compare                (durability + correctness)
+# Diagnostics: 81 no disk, 82 RO-open, 83 GATE BROKEN (unarmed write ok), 84 GATE BROKEN
+#   (unarmed RW-open ok), 85 armed RW-open fail, 86 armed write fail, 87 readback fail, 88 mismatch.
+
+fn blkwr_main(): i64 {
+    var ebuf[192];
+    var n = syscall(75, &ebuf, 192);            # blk_enum
+    if (n < 1) { return 81; }
+    var tag = load64(&ebuf);
+    var LBA = 500000;                           # scratch: unallocated tail (>240 MiB)
+
+    # Build a known 512-B pattern.
+    var sec[512];
+    var wi = 0;
+    while (wi < 64) { store64(&sec + wi * 8, 0x00C0FFEE00000000 + wi); wi = wi + 1; }
+
+    # 1) UNARMED write must be rejected.
+    var h0 = syscall(76, tag, 0);               # RO open is allowed unarmed
+    if (h0 < 0) { return 82; }
+    if (syscall(78, h0, LBA, &sec, 1) >= 0) { return 83; }   # GATE BROKEN: unarmed write succeeded
+
+    # 2) UNARMED RW-open must be rejected.
+    if (syscall(76, tag, 1) >= 0) { return 84; }             # GATE BROKEN: unarmed RW-open succeeded
+
+    # 3) Arm the write gate (deliberate magic — the aegis capability seam).
+    syscall(76, 0, 0x424C4B5F5257);             # blk_open(_, BLK_RW_ARM_MAGIC)
+
+    # 4) Armed RW-open + write.
+    var h = syscall(76, tag, 1);
+    if (h < 0) { return 85; }
+    if (syscall(78, h, LBA, &sec, 1) != 1) { return 86; }
+
+    # 5) Read back + verify.
+    var rsec[512];
+    if (syscall(77, h, LBA, &rsec, 1) != 1) { return 87; }
+    var ok = 1;
+    var ci = 0;
+    while (ci < 64) {
+        if (load64(&rsec + ci * 8) != (0x00C0FFEE00000000 + ci)) { ok = 0; ci = 64; }
+        else { ci = ci + 1; }
+    }
+    syscall(80, h);
+    if (ok == 0) { return 88; }
+    return 96;                                  # ALL PASS — gate rejects unarmed, armed write+readback OK
+}
+
+fn _entry(): i64 { var r = blkwr_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
