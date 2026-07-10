@@ -1,7 +1,8 @@
 # 2026-07-09 — cyrius: userland wrappers for agnos block-device syscalls (#75–80)
 
-**Status:** OPEN — cyrius-side ask (agnos is hands-off from the agnos agent; this doc is
-the tracking record — mirror to the cyrius repo's issue tracker).
+**Status:** OPEN — cyrius-side ask. **Filed in the cyrius repo** (the copy the cyrius agent
+acts on): `cyrius/docs/development/issues/2026-07-09-agnos-sys-blk-peers.md`. This is the
+agnos-side mirror ([[feedback_cross_repo_issues_both_repos]] — cross-repo issues go in BOTH repos).
 **Pairs with:** `2026-07-09-ring3-block-device-syscalls-for-install.md` (the agnos kernel side).
 **Driver:** the native-install primitive — agnova (and sovereign `mkfs`/`partition` tools)
 must be able to call the new agnos raw block-device syscalls from Cyrius.
