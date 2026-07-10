@@ -23,6 +23,7 @@ GNOBOOT_ROOT="${GNOBOOT_ROOT:-$ROOT/../gnoboot}"
 AE_ROOT="${AE_ROOT:-$ROOT/../aethersafha}"
 SETU_ROOT="${SETU_ROOT:-$ROOT/../setu}"
 DHANCHA_ROOT="${DHANCHA_ROOT:-$ROOT/../dhancha}"
+CRAB_ROOT="${CRAB_ROOT:-$ROOT/../crab}"
 
 OVMF_CODE=""; for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/x64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE_4M.fd; do [ -f "$c" ] && { OVMF_CODE="$c"; break; }; done
 OVMF_VARS_SRC=""; for c in /usr/share/edk2/x64/OVMF_VARS.4m.fd /usr/share/edk2/x64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS_4M.fd; do [ -f "$c" ] && { OVMF_VARS_SRC="$c"; break; }; done
@@ -35,11 +36,11 @@ GNOBOOT="$GNOBOOT_ROOT/build/BOOTX64.EFI"
 AGNOS="$ROOT/build/agnos"
 AE="$AE_ROOT/build/aethersafha-agnos"
 PP="$SETU_ROOT/build/present_probe-agnos"
-DHW="$DHANCHA_ROOT/build/setu_widget_client-agnos"       # the real dhancha widget client
+CRAB="$CRAB_ROOT/build/crab-agnos"                       # crab — the sovereign file manager (dhancha app)
 [ -f "$GNOBOOT" ] || { echo "ERROR: gnoboot not built at $GNOBOOT"; exit 1; }
 [ -f "$AE" ]      || { echo "ERROR: aethersafha-agnos not built — (cd $AE_ROOT && cyrius build --agnos src/main.cyr build/aethersafha-agnos)"; exit 1; }
 [ -f "$PP" ]      || { echo "ERROR: present_probe-agnos not built — (cd $SETU_ROOT && cyrius build --agnos programs/present_probe.cyr build/present_probe-agnos)"; exit 1; }
-[ -f "$DHW" ]     || { echo "ERROR: setu_widget_client-agnos not built — (cd $DHANCHA_ROOT && cyrius build --agnos programs/setu_widget_client.cyr build/setu_widget_client-agnos)"; exit 1; }
+[ -f "$CRAB" ]    || { echo "ERROR: crab-agnos not built — (cd $CRAB_ROOT && cyrius build --agnos src/main.cyr build/crab-agnos)"; exit 1; }
 
 echo "[1/4] Building AETHERSAFHA_SETU_SELFTEST kernel (post-sched_active hook)..."
 if ! env AETHERSAFHA_SETU_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/ae-setu-build.log 2>&1; then
@@ -59,7 +60,7 @@ echo "[2/4] Seeding ext2 with /bin/aethersafha ($(stat -c %s "$AE") B) + /bin/pu
 SEED="$WORK/seed"; mkdir -p "$SEED/bin"
 cp "$AE" "$SEED/bin/aethersafha"
 cp "$PP" "$SEED/bin/puka"
-cp "$DHW" "$SEED/bin/dhwidget"                           # /bin/dhwidget = dhancha widget client
+cp "$CRAB" "$SEED/bin/crab"                              # /bin/crab = the sovereign file manager
 
 dd if=/dev/zero of="$IMG" bs=1M count=256 status=none
 parted -s "$IMG" mklabel gpt \

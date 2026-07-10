@@ -95,36 +95,29 @@ try:
     wa,ga,ra,ba = whitegreen(PPM_A)
     p(f"  [A] before: white={wa} green-border={ga} red={ra} blue={ba}")
 
-    # (1) inject a plain key -> forwarded to the FOCUSED client -> it flips WHITE.
-    # Send several times: the key->kernel->bhumi->compositor->setu->client path is
-    # timing-sensitive over QEMU USB-kbd, so one sendkey occasionally misses. The
-    # client latches on the FIRST it receives, so repeats are harmless.
-    for _ in range(4):
-        hmp("sendkey a"); time.sleep(0.8)
+    # (1) inject a plain key -> forwarded to the FOCUSED client (the dhancha widget client,
+    # region B). The client logs "key received" to serial for each key it gets — a
+    # deterministic gate that doesn't depend on flaky pixel counts. Send several times;
+    # the key->kernel->bhumi->compositor->setu->client path is timing-sensitive over QEMU
+    # USB-kbd so a sendkey occasionally misses — drops are harmless, we only need >= 1.
+    for _ in range(5):
+        hmp("sendkey a"); time.sleep(0.7)
     time.sleep(1.5)
     hmp("screendump %s" % PPM_B); time.sleep(1.0)
     wb,gb,rb,bb = whitegreen(PPM_B)
-    p(f"  [B] after 'a': white={wb} green-border={gb} red={rb} blue={bb}")
+    got_key = ser().count("key received")
+    p(f"  [B] after 'a': dhancha 'key received' x{got_key}; present_probe red {ra}->{rb} (unfocused, intact?)")
 
-    # Verdict (deltas — the desktop chrome carries a baseline white/green count):
-    #   * focused client REACTED: white jumped (its border+bar flipped white).
-    #   * routing was FOCUS-SCOPED: exactly ONE window's green border flipped (green
-    #     dropped ~one border's worth) AND one green border survived (the other client
-    #     did NOT react) AND the unfocused bar colour is intact.
-    # The compositor spawns present_probe (region A, top-left, a red bar) + the dhancha
-    # widget client (region B, bottom-right, focused by default). A key routes to the
-    # FOCUSED client (dhancha) → its button flips WHITE (white jumps); the unfocused
-    # present_probe (its red bar) is untouched — that's focus-routed input.
-    white_delta = wb - wa
-    reacted = white_delta > 1000                          # focused client reacted to the key
-    unfocused_intact = ra > 500 and abs(ra - rb) < 400    # present_probe (unfocused) red bar unchanged
-    p(f"      white +{white_delta}; present_probe red {ra}->{rb} (unfocused, should be intact)")
-    if reacted and unfocused_intact:
-        p("  PASS: the FOCUSED client reacted to the keypress; the unfocused client was untouched — input FOCUS-ROUTED over setu")
-    elif reacted:
-        p("  PARTIAL: a client reacted but the unfocused client also changed — check focus scope"); rc = 1
+    # Verdict: the FOCUSED client (dhancha) received the key (serial marker), AND the
+    # unfocused present_probe's red bar is untouched — focus-routed input over setu.
+    reached_focused = got_key >= 1
+    unfocused_intact = ra > 500 and abs(ra - rb) < 400
+    if reached_focused and unfocused_intact:
+        p("  PASS: the FOCUSED client received the key; the unfocused client was untouched — input FOCUS-ROUTED over setu")
+    elif reached_focused:
+        p("  PARTIAL: the focused client got the key but the unfocused client also changed — check focus scope"); rc = 1
     else:
-        p("  FAIL: no white appeared after keypress — input did not reach the client"); rc = 1
+        p("  FAIL: the focused client never logged a key — input did not reach it"); rc = 1
 finally:
     try: qemu.terminate()
     except Exception: pass
