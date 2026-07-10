@@ -10,8 +10,8 @@ cyrius = "6.4.39"
 src = "blkprobe.cyr"
 output = "build/blkprobe"
 
-# syscalls -> SYS_EXIT + the syscall() binding. blkprobe calls the raw block syscall
-# NUMBERS (75-80) directly — the sys_blk_* wrappers don't exist yet (cyrius issue) —
-# so nothing else is needed; the result IS the exit code, checked via "run: exit N".
+# syscalls -> SYS_EXIT + the native sys_blk_* wrappers (cyrius 6.4.39). blkprobe/blkwr
+# call sys_blk_enum/open/read/write/info/close — no raw syscall numbers. The result IS
+# the exit code, checked via the exec path's "run: exit N" (95 read-path / 96 write-path).
 [deps]
 stdlib = ["syscalls"]
