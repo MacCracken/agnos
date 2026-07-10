@@ -5,6 +5,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.11] — 2026-07-10 — sovereign GPT/mkfs disk tool (`gptwr`) + the native-install ARC-CLOSER: a disk AGNOS builds itself boots
+
+The native-install primitive is now proven **end to end**. On top of the ring-3 raw
+block-device syscalls (#75-80, shipped in 1.53.10) and their `sys_blk_*` cyrius wrappers
+(6.4.39), a sovereign userland tool now takes a **blank disk** to a **booting AGNOS
+system** — partition table, filesystem, directory tree, bootloader, and kernel, all
+written in Cyrius through ring 3, with zero host `parted`/`mkfs.fat`/`mkfs.ext2`/`mcopy`.
+The arc-closer boots the tool-built disk to a live `/bin/agnsh` prompt.
+
+### Added
+- **`blk-test/gptwr.cyr`** — sovereign ring-3 GPT partition-table + FAT32 `mkfs` + file-
+  placement tool (the successor to `blkprobe`/`blkwr`). Builds, in RAM then to a scratch
+  region in the disk's unallocated tail (never the live table):
+  - a byte-accurate **protective MBR + primary/backup GPT header + 128-entry array**, CRC32
+    per UEFI §5.3.2 — every offset derived from the kernel's own `gpt.cyr` reader; type
+    GUIDs written as the kernel's `GPT_TYPE_*_LO/HI` u64 constants via `store64`, which
+    reproduces the mixed-endian on-disk bytes for free and stays bit-consistent with the reader;
+  - a **FAT32 filesystem** — FATSz32 via the fatgen formula, BPB + FSInfo + dual FAT +
+    root volume label, `CountOfClusters >= 65525` guard — offsets derived from `fatfs.cyr`;
+  - a **directory tree** (`\EFI`, `\EFI\BOOT`, `\boot`) with `.`/`..` chains, crash-safe
+    write order (data cluster → FAT → parent dirent → FSInfo);
+  - **file placement** — reads `BOOTX64.EFI` (gnoboot) and the kernel from the rootfs
+    (`sys_open`/`sys_lseek`/`sys_read`), streams the bodies into cluster chains (multi-FAT-
+    sector chains via `fat_write_chain`, 32-cluster batched writes), and publishes 8.3 dirents.
+  - Replaces the `parted` + `mkfs.fat` + `mcopy` toolchain.
+- **`GPT_WRITE_SELFTEST` kernel harness hook** (`kernel/core/main.cyr` + `scripts/build.sh`)
+  — execs `/bin/gptwr` from disk in ring 3 so the tool is provable against the real kernel.
+- **`scripts/gpt-write-smoke.sh`** — proves gptwr writes the whole GPT + FAT32 + tree + both
+  files, validated by **four independent foreign parsers**: `sgdisk -v` (GPT + type GUIDs),
+  `mtools` `minfo`/`mdir` (FAT32 + every path descendable), `fsck.fat` (strict, no errors),
+  and byte-identical `mcopy` read-back of both files (30 KB gnoboot + 1.4 MB kernel).
+- **`scripts/gpt-boot-smoke.sh`** — the **ARC-CLOSER**: a two-QEMU harness that runs gptwr to
+  build a complete ESP, `dd`s it to a fresh standalone disk, seeds P2 with `/bin/agnsh`, and
+  boots it. UEFI runs the **tool-written** gnoboot → loads the **tool-written** `\boot\agnos`
+  → `kybernet` (PID 1) mounts the rootfs through the real GPT reader + ext2 Linux-FS-GUID gate
+  (on tool-authored bytes) → execs `/bin/agnsh`. Boots to the `agnoshi 1.8.3` prompt, no
+  emergency-shell fallback, no fault.
+
+### Notes
+- Phase 4 of the native-install arc (sovereign GPT-writer + `mkfs` + populate + boot) is
+  **complete**. Remaining: the agnova executor port (swap its Linux shell-outs for these
+  gptwr primitives) and an end-to-end agnova install proof. ext4-rootfs `mkfs` stays deferred
+  (the rootfs is host-seeded today) — the one remaining on-disk format gap.
+
 ## [1.53.10] — 2026-07-09 — raw block-device syscalls (#75-80): the native-install primitive (ring-3 disk R/W, gated)
 
 The kernel now exposes **raw block-device access to a privileged ring-3 process** — the
