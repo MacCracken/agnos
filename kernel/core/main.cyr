@@ -2356,6 +2356,18 @@ sh_exec("run /bin/blkwr", 14);
 kprintln("exec: blkwr returned", 20);
 #endif
 
+#ifdef GPT_WRITE_SELFTEST
+# 1.53.x Phase 4: sovereign GPT/mkfs writer. Runs /bin/gptwr (blk-test/, built --agnos) — the
+# ring-3 successor to blkwr that builds a byte-accurate GPT + FAT ESP in userland and writes it
+# through sys_blk_* (kernel owns raw sectors, userland owns the on-disk format). Bite 1: CRC32
+# correctness (pure compute, NO disk) — the GPT header + partition-array CRCs gate every later
+# bite, so CRC32 is proven against canonical vectors first. Exits 97 iff CRC32("123456789")/
+# ("")/("a") all match; 91/92/93 pinpoint the failing vector.
+kprintln("exec: running /bin/gptwr", 24);
+sh_exec("run /bin/gptwr", 14);
+kprintln("exec: gptwr returned", 20);
+#endif
+
 #ifdef NAAD_RING3_SELFTEST
 # 1.53.x B6 (arc-closer): naad oscillator END-PROOF. Runs /bin/naadex (naad/, built --agnos) —
 # a REAL heavy-f64 DSP workload: naad's 440 Hz sine oscillator generates 256 samples via

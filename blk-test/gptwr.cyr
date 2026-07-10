@@ -1,0 +1,438 @@
+# gptwr — agnos ring-3 sovereign GPT partition-table + FAT32-ESP writer (1.53.x Phase 4).
+#
+# The ring-3 successor to blkprobe/blkwr: it replaces the Linux `parted mklabel/mkpart`
+# + `mkfs.fat -F32` shell-outs agnova depends on, building a byte-accurate GPT + FAT ESP
+# in userland and writing it through the sys_blk_* wrappers (the kernel exposes raw sector
+# I/O; userland owns the on-disk format — as every OS does). Built + proven on Linux-hosted
+# QEMU against a real NVMe/GPT disk via the *_SELFTEST exit-code harness.
+#
+# Uses the native cyrius `sys_blk_*` wrappers (v6.4.39) — no raw syscall numbers.
+#
+# Built in small bites, each independently exit-code-gated (97 = fresh pass; 90..70 diag).
+#   Bite 1: CRC32 correctness (canonical vectors) — the GPT CRCs gate everything.  [91/92/93]
+#   Bite 2: build the protective MBR + primary GPT header + 128-entry array + BACKUP header in
+#                  RAM for a synthetic disk, then SELF-VERIFY every structure with the kernel's
+#                  exact field offsets/CRCs (gpt.cyr). The type-GUID trick: writing the kernel's
+#                  own GPT_TYPE_*_LO/HI u64 constants via store64 reproduces the exact mixed-
+#                  endian on-disk bytes automatically, bit-consistent with the reader that will
+#                  validate them. Diagnostics: 83 MBR, 84 hdr-fields, 85 backup, 86 rootfs-GUID,
+#                  87 ESP-GUID, 88 array-CRC, 89 hdr-CRC, 90 signature.
+#   Bite 3a: the FIRST real disk write. Enumerate the single active NVMe, read its capacity, and
+#                  assert the whole synthetic image fits in the live disk's UNALLOCATED TAIL
+#                  (SCRATCH_BASE, past the 240 MiB live rootfs) — a bug can only clobber throwaway
+#                  sectors, never the live GPT/ESP/rootfs at absolute LBA 0/1/2-33. Arm the write
+#                  gate, RW-open, write ONLY the MBR (base+0), read it back, byte-compare.
+#                  Diagnostics: 79 no disk, 78 capacity overrun, 77 arm/RW-open, 76 write,
+#                  75 readback, 74 mismatch.
+#   Bite 3b: write the REST of the GPT to the scratch tail — primary header (base+1), the entry
+#                  array (base+2..33, ONE 32-sector write), the backup array (base+N-33), and the
+#                  backup header (base+N-1) — then readback-verify every region against RAM. After
+#                  this the tool-authored GPT is complete on disk; the smoke's sgdisk oracle
+#                  (Bite 5) validates it independently. Diagnostics: 73 hdr-write, 72 array-write,
+#                  71 backup-array-write, 70 backup-hdr-write, 69 readback.
+#   Bite 6 (THIS): FAT32 mkfs into the ESP partition — compute FATSz32 (fatgen formula), build the
+#                  BPB + FSInfo + FAT[0..2], guard CountOfClusters >= 65525 (else it's FAT16), zero
+#                  the metadata region, then write the boot sector (+backup @6), FSInfo (+backup
+#                  @7), and both FATs' sector 0, and readback-verify. After this the ESP is an
+#                  empty but valid FAT32; the smoke's mtools oracle validates it independently.
+#                  Diagnostics: 68 not-FAT32, 67 boot-write, 66 fsinfo-write, 65 FAT-write,
+#                  64 zeroing, 63 boot-readback, 62 FAT-readback, 61 BPB-self-check.
+#
+# Bitwise CRC-32/ISO-HDLC, transcribed from the kernel's own gpt_crc32_chunk
+# (kernel/core/gpt.cyr:114-128): poly 0xEDB88320 (reflected), init/final 0xFFFFFFFF.
+
+# --- GPT partition-type GUIDs (the load64 LE views of the on-disk 16 bytes) ----------------
+# IDENTICAL to the kernel's constants (gpt.cyr:210-215): the kernel COMPARES type GUIDs via
+# load64 against these, so writing them via store64 yields the exact on-disk bytes it expects.
+var GPT_TYPE_ESP_LO      = 0x11D2F81FC12A7328;   # ESP:      C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+var GPT_TYPE_ESP_HI      = 0x3BC93EC9A0004BBA;
+var GPT_TYPE_LINUX_FS_LO = 0x477284830FC63DAF;   # Linux FS: 0FC63DAF-8483-4772-8E79-3D69D8477DE4
+var GPT_TYPE_LINUX_FS_HI = 0xE47D47D8693D798E;
+
+# Fixed, deterministic disk/partition unique GUIDs (a sovereign installer need not randomize;
+# they only must be nonzero + distinct). Values are arbitrary.
+var DISK_GUID_LO  = 0x4E5347414E4F1D2A;
+var DISK_GUID_HI  = 0x11E6A5D0C7B3F8A0;
+var ESP_UNIQUE_LO = 0x4553501D2A7328C1;
+var ESP_UNIQUE_HI = 0x00A0C93EC93BBA4B;
+var RF_UNIQUE_LO  = 0x524F4F540FC63DAF;
+var RF_UNIQUE_HI  = 0x3D69D8477DE48E79;
+
+# --- In-RAM structure buffers (MODULE-global: var X[N] = N*8 bytes, ext2.cyr:44-46) --------
+var mbr[64];      #   512 B — protective MBR (LBA 0)
+var hdr[64];      #   512 B — primary GPT header (LBA 1)
+var pea[2048];    # 16384 B — partition entry array (128 x 128 B = 32 LBAs)
+var bhdr[64];     #   512 B — backup GPT header (LBA N-1)
+var rback[2048];  # 16384 B — readback scratch for the 32-LBA entry array
+var fatbs[64];    #   512 B — FAT32 boot sector (BPB)
+var fsinfo[64];   #   512 B — FAT32 FSInfo sector
+var fatsec[64];   #   512 B — first sector of each FAT (holds FAT[0..2])
+var z32[2048];    # 16384 B — zero buffer for bulk-zeroing the FAT metadata region
+var rootbuf[64];  #   512 B — FAT32 root-cluster sector 0 (holds the volume-label dirent)
+
+fn crc32(buf: i64, len: i64): i64 {
+    var crc = 0xFFFFFFFF;
+    var i = 0;
+    while (i < len) {
+        crc = crc ^ (load8(buf + i) & 0xFF);
+        var k = 0;
+        while (k < 8) {
+            if ((crc & 1) == 1) { crc = (crc >> 1) ^ 0xEDB88320; }   # >> is LOGICAL in Cyrius
+            else               { crc = crc >> 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;   # mask = defensive normalization, NOT sign-extend guard
+}
+
+# Zero `nbytes` (must be a multiple of 8) of a buffer via 8-byte stores.
+fn zero(buf: i64, nbytes: i64): i64 {
+    var i = 0;
+    while (i < nbytes) { store64(buf + i, 0); i = i + 8; }
+    return 0;
+}
+
+# --- Protective MBR (UEFI § 5.2.3): one 0xEE partition covering the whole disk -------------
+fn build_mbr(n: i64): i64 {
+    zero(&mbr, 512);
+    store8(&mbr + 446, 0x00);               # boot indicator (not bootable)
+    store8(&mbr + 447, 0x00);               # starting CHS = 0x000200 (LBA 1, legacy)
+    store8(&mbr + 448, 0x02);
+    store8(&mbr + 449, 0x00);
+    store8(&mbr + 450, 0xEE);               # OS type = GPT protective
+    store8(&mbr + 451, 0xFF);               # ending CHS = 0xFFFFFF (disk exceeds CHS range)
+    store8(&mbr + 452, 0xFF);
+    store8(&mbr + 453, 0xFF);
+    store32(&mbr + 454, 1);                 # starting LBA = 1
+    var sz = n - 1;                         # size in LBA = whole disk minus the MBR
+    if (sz > 0xFFFFFFFF) { sz = 0xFFFFFFFF; }
+    store32(&mbr + 458, sz);
+    store8(&mbr + 510, 0x55);               # boot signature
+    store8(&mbr + 511, 0xAA);
+    return 0;
+}
+
+# --- Primary + backup GPT header + entry array (UEFI § 5.3.2 / § 5.3.3) --------------------
+fn build_gpt(n: i64, esp_s: i64, esp_e: i64, rf_s: i64, rf_e: i64): i64 {
+    # Partition entry array — entry 0 = ESP, entry 1 = rootfs, 2..127 empty (zeroed).
+    zero(&pea, 16384);
+    store64(&pea + 0,   GPT_TYPE_ESP_LO);   # ESP type GUID (on-disk bytes via LE store64)
+    store64(&pea + 8,   GPT_TYPE_ESP_HI);
+    store64(&pea + 16,  ESP_UNIQUE_LO);     # unique GUID
+    store64(&pea + 24,  ESP_UNIQUE_HI);
+    store64(&pea + 32,  esp_s);             # first LBA
+    store64(&pea + 40,  esp_e);             # last LBA
+    store64(&pea + 48,  0);                 # attributes
+    store64(&pea + 128, GPT_TYPE_LINUX_FS_LO);   # entry 1: Linux Filesystem (rootfs)
+    store64(&pea + 136, GPT_TYPE_LINUX_FS_HI);
+    store64(&pea + 144, RF_UNIQUE_LO);
+    store64(&pea + 152, RF_UNIQUE_HI);
+    store64(&pea + 160, rf_s);
+    store64(&pea + 168, rf_e);
+    store64(&pea + 176, 0);
+
+    # Primary GPT header.
+    zero(&hdr, 512);
+    store32(&hdr + 0,  0x20494645);         # "EFI " (matches kernel GPT_SIG_LO)
+    store32(&hdr + 4,  0x54524150);         # "PART" (matches kernel GPT_SIG_HI)
+    store32(&hdr + 8,  0x00010000);         # revision 1.0 (bytes 00 00 01 00)
+    store32(&hdr + 12, 92);                 # header size
+    store32(&hdr + 16, 0);                  # header CRC32 — zero during compute
+    store32(&hdr + 20, 0);                  # reserved
+    store64(&hdr + 24, 1);                  # MyLBA = 1
+    store64(&hdr + 32, n - 1);              # AlternateLBA = last sector
+    store64(&hdr + 40, 34);                 # first usable LBA (after the 33-LBA header+array)
+    store64(&hdr + 48, n - 34);             # last usable LBA (before the backup array+header)
+    store64(&hdr + 56, DISK_GUID_LO);
+    store64(&hdr + 64, DISK_GUID_HI);
+    store64(&hdr + 72, 2);                  # partition entry array starting LBA
+    store32(&hdr + 80, 128);                # number of entries
+    store32(&hdr + 84, 128);                # size of each entry
+    var arr_crc = crc32(&pea, 16384);       # CRC over the FULL array (incl. zero entries)
+    store32(&hdr + 88, arr_crc);
+    var hc = crc32(&hdr, 92);               # header CRC over 92 bytes, field @16 zeroed
+    store32(&hdr + 16, hc);
+
+    # Backup header = copy of primary with My/Alternate LBAs swapped, array LBA moved to the
+    # tail, and the header CRC recomputed (array CRC is unchanged — same array bytes).
+    var i = 0;
+    while (i < 512) { store64(&bhdr + i, load64(&hdr + i)); i = i + 8; }
+    store64(&bhdr + 24, n - 1);             # MyLBA = last sector
+    store64(&bhdr + 32, 1);                 # AlternateLBA = primary
+    store64(&bhdr + 72, n - 33);            # backup array starts 33 LBAs before the end
+    store32(&bhdr + 16, 0);
+    var bc = crc32(&bhdr, 92);
+    store32(&bhdr + 16, bc);
+    return 0;
+}
+
+# --- Self-verify the built structures against the kernel's exact reader offsets ------------
+fn self_verify(n: i64, esp_s: i64, esp_e: i64, rf_s: i64, rf_e: i64): i64 {
+    # Protective MBR.
+    if ((load8(&mbr + 450) & 0xFF) != 0xEE) { return 83; }
+    if ((load8(&mbr + 510) & 0xFF) != 0x55) { return 83; }
+    if ((load8(&mbr + 511) & 0xFF) != 0xAA) { return 83; }
+    if (load32(&mbr + 454) != 1)            { return 83; }
+
+    # GPT signature (kernel gpt_validate_signature).
+    if (load32(&hdr + 0) != 0x20494645) { return 90; }
+    if (load32(&hdr + 4) != 0x54524150) { return 90; }
+
+    # Header field sanity (kernel gpt_decode_header offsets).
+    if (load32(&hdr + 12) != 92)        { return 84; }
+    if (load64(&hdr + 24) != 1)         { return 84; }
+    if (load64(&hdr + 32) != (n - 1))   { return 84; }
+    if (load64(&hdr + 40) != 34)        { return 84; }
+    if (load64(&hdr + 48) != (n - 34))  { return 84; }
+    if (load64(&hdr + 72) != 2)         { return 84; }
+    if (load32(&hdr + 80) != 128)       { return 84; }
+    if (load32(&hdr + 84) != 128)       { return 84; }
+
+    # Header CRC — recompute exactly like kernel gpt_validate_header_crc.
+    var saved = load32(&hdr + 16);
+    store32(&hdr + 16, 0);
+    var hc = crc32(&hdr, 92);
+    store32(&hdr + 16, saved);
+    if (hc != saved) { return 89; }
+
+    # Partition array CRC — kernel gpt_validate_array_crc streams 128*128 = 16384 bytes.
+    var ac = crc32(&pea, 16384);
+    if (ac != load32(&hdr + 88)) { return 88; }
+
+    # ESP entry: both GUID halves (kernel gates on LO AND HI) + LBAs.
+    if (load64(&pea + 0)  != GPT_TYPE_ESP_LO) { return 87; }
+    if (load64(&pea + 8)  != GPT_TYPE_ESP_HI) { return 87; }
+    if (load64(&pea + 32) != esp_s)           { return 87; }
+    if (load64(&pea + 40) != esp_e)           { return 87; }
+
+    # Rootfs entry: both GUID halves (ext2_try_partition_mount checks LO AND HI) + LBAs.
+    if (load64(&pea + 128) != GPT_TYPE_LINUX_FS_LO) { return 86; }
+    if (load64(&pea + 136) != GPT_TYPE_LINUX_FS_HI) { return 86; }
+    if (load64(&pea + 160) != rf_s)                 { return 86; }
+    if (load64(&pea + 168) != rf_e)                 { return 86; }
+
+    # Backup header: swapped LBAs, tail array LBA, same array CRC, valid own CRC.
+    if (load64(&bhdr + 24) != (n - 1))              { return 85; }
+    if (load64(&bhdr + 32) != 1)                    { return 85; }
+    if (load64(&bhdr + 72) != (n - 33))             { return 85; }
+    if (load32(&bhdr + 88) != load32(&hdr + 88))    { return 85; }
+    var bsaved = load32(&bhdr + 16);
+    store32(&bhdr + 16, 0);
+    var bc = crc32(&bhdr, 92);
+    store32(&bhdr + 16, bsaved);
+    if (bc != bsaved) { return 85; }
+
+    return 0;
+}
+
+# --- FAT32 mkfs (Microsoft FAT spec / fatgen) ---------------------------------------------
+# FATSz32 via the canonical fatgen "FAT size" formula (RootDirSectors = 0 for FAT32).
+fn fat32_fatsz(total: i64, reserved: i64, spc: i64, numfats: i64): i64 {
+    var tmpval1 = total - reserved;
+    var tmpval2 = (256 * spc + numfats) / 2;    # /2 is the FAT32 case of the fatgen formula
+    return (tmpval1 + tmpval2 - 1) / tmpval2;
+}
+
+# Build the boot sector (BPB), FSInfo, and a FAT-sector-0 for an empty FAT32 volume of
+# `esp_sectors` 512-B sectors (SecPerClus=1, RsvdSecCnt=32, NumFATs=2). Returns FATSz32.
+fn build_fat(esp_sectors: i64): i64 {
+    var fatsz = fat32_fatsz(esp_sectors, 32, 1, 2);
+
+    # --- Boot sector / BPB (offsets per the FAT spec; the kernel reads these in fatfs.cyr) ---
+    zero(&fatbs, 512);
+    store8(&fatbs + 0, 0xEB); store8(&fatbs + 1, 0x58); store8(&fatbs + 2, 0x90);   # BS_jmpBoot
+    store8(&fatbs + 3, 0x41); store8(&fatbs + 4, 0x47); store8(&fatbs + 5, 0x4E);   # OEM "AGNOS   "
+    store8(&fatbs + 6, 0x4F); store8(&fatbs + 7, 0x53); store8(&fatbs + 8, 0x20);
+    store8(&fatbs + 9, 0x20); store8(&fatbs + 10, 0x20);
+    store16(&fatbs + 11, 512);              # BytesPerSec (kernel requires 512)
+    store8(&fatbs + 13, 1);                 # SecPerClus
+    store16(&fatbs + 14, 32);               # RsvdSecCnt
+    store8(&fatbs + 16, 2);                 # NumFATs
+    store16(&fatbs + 17, 0);                # RootEntCnt = 0 (FAT32)
+    store16(&fatbs + 19, 0);                # TotSec16 = 0 -> TotSec32
+    store8(&fatbs + 21, 0xF8);              # Media (fixed disk)
+    store16(&fatbs + 22, 0);                # FATSz16 = 0 (FAT32 signal)
+    store16(&fatbs + 24, 32);               # SecPerTrk (cosmetic)
+    store16(&fatbs + 26, 8);                # NumHeads (cosmetic)
+    store32(&fatbs + 28, 0);                # HiddSec
+    store32(&fatbs + 32, esp_sectors);      # TotSec32
+    store32(&fatbs + 36, fatsz);            # FATSz32
+    store16(&fatbs + 40, 0);                # ExtFlags
+    store16(&fatbs + 42, 0);                # FSVer
+    store32(&fatbs + 44, 2);                # RootClus
+    store16(&fatbs + 48, 1);                # FSInfo sector
+    store16(&fatbs + 50, 6);                # BkBootSec
+    store8(&fatbs + 64, 0x80);              # DrvNum
+    store8(&fatbs + 66, 0x29);              # BootSig (extended)
+    store32(&fatbs + 67, 0x41474E53);       # VolID
+    store8(&fatbs + 71, 0x41); store8(&fatbs + 72, 0x47); store8(&fatbs + 73, 0x4E);  # VolLab "AGNOSBOOT  "
+    store8(&fatbs + 74, 0x4F); store8(&fatbs + 75, 0x53); store8(&fatbs + 76, 0x42);
+    store8(&fatbs + 77, 0x4F); store8(&fatbs + 78, 0x4F); store8(&fatbs + 79, 0x54);
+    store8(&fatbs + 80, 0x20); store8(&fatbs + 81, 0x20);
+    store8(&fatbs + 82, 0x46); store8(&fatbs + 83, 0x41); store8(&fatbs + 84, 0x54);  # FilSysType "FAT32   "
+    store8(&fatbs + 85, 0x33); store8(&fatbs + 86, 0x32); store8(&fatbs + 87, 0x20);
+    store8(&fatbs + 88, 0x20); store8(&fatbs + 89, 0x20);
+    store8(&fatbs + 510, 0x55); store8(&fatbs + 511, 0xAA);
+
+    # CountOfClusters (SecPerClus=1): data region / spc. Clusters are numbered 2..(coc+1);
+    # cluster 2 is the root, so free = coc - 1 and the next free cluster is 3.
+    var coc = esp_sectors - (32 + 2 * fatsz);
+
+    # --- FSInfo (sector 1) ---
+    zero(&fsinfo, 512);
+    store32(&fsinfo + 0,   0x41615252);     # FSI_LeadSig  "RRaA"
+    store32(&fsinfo + 484, 0x61417272);     # FSI_StrucSig "rrAa"
+    store32(&fsinfo + 488, coc - 1);        # FSI_Free_Count (all data clusters minus the root)
+    store32(&fsinfo + 492, 3);              # FSI_Nxt_Free (first cluster after the root)
+    store32(&fsinfo + 508, 0xAA550000);     # FSI_TrailSig (bytes 00 00 55 AA)
+
+    # --- FAT sector 0: reserved entries + root-cluster (2) end-of-chain ---
+    zero(&fatsec, 512);
+    store32(&fatsec + 0, 0x0FFFFFF8);       # FAT[0] = media byte 0xF8 in the low byte
+    store32(&fatsec + 4, 0x0FFFFFFF);       # FAT[1] = EOC / clean-shutdown flags
+    store32(&fatsec + 8, 0x0FFFFFFF);       # FAT[2] = root cluster end-of-chain
+
+    # --- Root cluster sector 0: the volume-label dirent (attr 0x08), name matches the BPB label ---
+    zero(&rootbuf, 512);
+    store8(&rootbuf + 0, 0x41); store8(&rootbuf + 1, 0x47); store8(&rootbuf + 2, 0x4E);  # "AGNOSBOOT  "
+    store8(&rootbuf + 3, 0x4F); store8(&rootbuf + 4, 0x53); store8(&rootbuf + 5, 0x42);
+    store8(&rootbuf + 6, 0x4F); store8(&rootbuf + 7, 0x4F); store8(&rootbuf + 8, 0x54);
+    store8(&rootbuf + 9, 0x20); store8(&rootbuf + 10, 0x20);
+    store8(&rootbuf + 11, 0x08);            # ATTR_VOLUME_ID
+
+    return fatsz;
+}
+
+fn gptwr_main(): i64 {
+    # --- Bite 1 regression: CRC32 canonical vectors (cheap; guards the whole format) ---
+    var s[9];
+    store8(&s + 0, 0x31); store8(&s + 1, 0x32); store8(&s + 2, 0x33);
+    store8(&s + 3, 0x34); store8(&s + 4, 0x35); store8(&s + 5, 0x36);
+    store8(&s + 6, 0x37); store8(&s + 7, 0x38); store8(&s + 8, 0x39);
+    if (crc32(&s, 9) != 0xCBF43926) { return 91; }
+    if (crc32(&s, 0) != 0x00000000) { return 92; }
+    var a[1]; store8(&a, 0x61);
+    if (crc32(&a, 1) != 0xE8B7BE43) { return 93; }
+
+    # --- Bite 2: build + self-verify a full GPT for a synthetic 128 MiB disk ---
+    # N' = 131072 sectors (64 MiB @ 512 B) — small enough that the whole nested image fits in
+    # the live disk's unallocated tail. ESP = 34 MiB (spec-honest FAT32 minimum); the rootfs
+    # fills the rest to the last usable LBA. Geometry chosen so ESP_end < LastUsable.
+    var N   = 131072;
+    var ESP_S = 2048;                       # 1 MiB alignment
+    var ESP_E = 2048 + 69632 - 1;           # 34 MiB = 69632 sectors -> end LBA 71679
+    var RF_S  = 71680;
+    var RF_E  = N - 34;                      # rootfs fills to last usable LBA (131038)
+
+    build_mbr(N);
+    build_gpt(N, ESP_S, ESP_E, RF_S, RF_E);
+    var v = self_verify(N, ESP_S, ESP_E, RF_S, RF_E);
+    if (v != 0) { return v; }
+
+    # --- Bite 3a: first real disk write — arm the gate + write/readback the MBR ---
+    # Write the nested image at SCRATCH_BASE in the live disk's UNALLOCATED TAIL: absolute
+    # sector = SCRATCH_BASE + (synthetic LBA). Base = 524288 (256 MiB) is past the live 240 MiB
+    # rootfs, so nothing here touches the boot table the kernel/gnoboot just used.
+    var SCRATCH = 524288;
+    var ebuf[192];
+    if (sys_blk_enum(&ebuf, 192) < 1) { return 79; }   # no block device enumerated
+    var tag = load64(&ebuf);                # entry 0 tag (the single active NVMe)
+    var hro = sys_blk_open(tag, 0);         # RO handle for the capacity query
+    if (hro < 0) { return 79; }
+    var dinfo[16];
+    sys_blk_info(hro, &dinfo);
+    var cap = load64(&dinfo);               # capacity in LBAs (offset 0)
+    if ((SCRATCH + N) > cap) { return 78; } # the whole synthetic image must fit the tail
+
+    sys_blk_open(0, 0x424C4B5F5257);        # arm the write gate (BLK_RW_ARM_MAGIC)
+    var hrw = sys_blk_open(tag, 1);         # RW handle (armed)
+    if (hrw < 0) { return 77; }
+    if (sys_blk_write(hrw, SCRATCH + 0, &mbr, 1) != 1) { return 76; }   # write MBR at base+0
+    var rsec[512];
+    if (sys_blk_read(hrw, SCRATCH + 0, &rsec, 1) != 1) { return 75; }   # read it back
+    var ci = 0;
+    while (ci < 64) {                       # byte-compare (64 x u64 = 512 B)
+        if (load64(&rsec + ci * 8) != load64(&mbr + ci * 8)) { return 74; }
+        ci = ci + 1;
+    }
+
+    # --- Bite 3b: write the rest of the GPT (header + array + backup), readback-verify all ---
+    if (sys_blk_write(hrw, SCRATCH + 1, &hdr, 1) != 1)           { return 73; }  # primary header @ base+1
+    if (sys_blk_write(hrw, SCRATCH + 2, &pea, 32) != 32)        { return 72; }  # entry array @ base+2..33
+    if (sys_blk_write(hrw, SCRATCH + (N - 33), &pea, 32) != 32) { return 71; }  # backup array @ base+N-33
+    if (sys_blk_write(hrw, SCRATCH + (N - 1), &bhdr, 1) != 1)   { return 70; }  # backup header @ base+N-1
+
+    # readback-verify each region against the RAM source (durability + write correctness).
+    if (sys_blk_read(hrw, SCRATCH + 1, &rsec, 1) != 1) { return 69; }
+    var vi = 0;
+    while (vi < 64)   { if (load64(&rsec  + vi*8) != load64(&hdr  + vi*8)) { return 69; } vi = vi + 1; }
+    if (sys_blk_read(hrw, SCRATCH + 2, &rback, 32) != 32) { return 69; }
+    vi = 0;
+    while (vi < 2048) { if (load64(&rback + vi*8) != load64(&pea  + vi*8)) { return 69; } vi = vi + 1; }
+    if (sys_blk_read(hrw, SCRATCH + (N - 33), &rback, 32) != 32) { return 69; }
+    vi = 0;
+    while (vi < 2048) { if (load64(&rback + vi*8) != load64(&pea  + vi*8)) { return 69; } vi = vi + 1; }
+    if (sys_blk_read(hrw, SCRATCH + (N - 1), &rsec, 1) != 1) { return 69; }
+    vi = 0;
+    while (vi < 64)   { if (load64(&rsec  + vi*8) != load64(&bhdr + vi*8)) { return 69; } vi = vi + 1; }
+
+    # --- Bite 6: FAT32 mkfs into the ESP region (partition = SCRATCH + ESP_S, sectors ESP_S..ESP_E) ---
+    var ESP_ABS = SCRATCH + ESP_S;          # absolute base LBA of the ESP partition
+    var ESP_SECTORS = ESP_E - ESP_S + 1;    # ESP length (69632 sectors = 34 MiB)
+    var fatsz = build_fat(ESP_SECTORS);
+
+    # geometry (must match the kernel's fatfs parse) + FAT-type guard
+    var root_start = 32 + 2 * fatsz;        # reserved + both FATs; data_start == root_start (FAT32)
+    var coc = (ESP_SECTORS - root_start) / 1;   # CountOfClusters (SecPerClus = 1)
+    if (coc < 65525) { return 68; }         # would parse as FAT16 — geometry bug
+
+    # zero the metadata region [0 .. root_start] (reserved + both FATs + root cluster) so the FS
+    # is clean on ANY disk (idempotent on the pre-zeroed smoke disk), in 32-sector chunks.
+    zero(&z32, 16384);
+    var zs = 0;
+    while (zs <= root_start) {
+        var zn = root_start - zs + 1;
+        if (zn > 32) { zn = 32; }
+        if (sys_blk_write(hrw, ESP_ABS + zs, &z32, zn) != zn) { return 64; }
+        zs = zs + zn;
+    }
+
+    # lay down boot sector (+ backup @6), FSInfo (+ backup @7), and both FATs' sector 0.
+    if (sys_blk_write(hrw, ESP_ABS + 0, &fatbs, 1) != 1)          { return 67; }
+    if (sys_blk_write(hrw, ESP_ABS + 6, &fatbs, 1) != 1)          { return 67; }   # backup boot
+    if (sys_blk_write(hrw, ESP_ABS + 1, &fsinfo, 1) != 1)         { return 66; }
+    if (sys_blk_write(hrw, ESP_ABS + 7, &fsinfo, 1) != 1)         { return 66; }   # backup FSInfo
+    if (sys_blk_write(hrw, ESP_ABS + 32, &fatsec, 1) != 1)         { return 65; }   # FAT #0 sector 0
+    if (sys_blk_write(hrw, ESP_ABS + 32 + fatsz, &fatsec, 1) != 1) { return 65; }   # FAT #1 sector 0
+    if (sys_blk_write(hrw, ESP_ABS + root_start, &rootbuf, 1) != 1) { return 65; }  # root cluster (vol label)
+
+    # readback-verify the boot sector + FAT sector 0 + the root cluster's volume-label dirent.
+    if (sys_blk_read(hrw, ESP_ABS + 0, &rsec, 1) != 1) { return 63; }
+    if ((load8(&rsec + 510) & 0xFF) != 0x55) { return 63; }
+    if ((load8(&rsec + 511) & 0xFF) != 0xAA) { return 63; }
+    var fi = 0;
+    while (fi < 64) { if (load64(&rsec + fi*8) != load64(&fatbs + fi*8)) { return 63; } fi = fi + 1; }
+    if (sys_blk_read(hrw, ESP_ABS + 32, &rsec, 1) != 1) { return 62; }
+    if (load32(&rsec + 0) != 0x0FFFFFF8) { return 62; }
+    if (load32(&rsec + 4) != 0x0FFFFFFF) { return 62; }
+    if (load32(&rsec + 8) != 0x0FFFFFFF) { return 62; }
+    if (sys_blk_read(hrw, ESP_ABS + root_start, &rsec, 1) != 1) { return 62; }
+    if ((load8(&rsec + 11) & 0xFF) != 0x08) { return 62; }     # root dirent attr = ATTR_VOLUME_ID
+
+    # BPB self-checks (mirror the kernel's fatfs parse expectations).
+    if (load16(&fatbs + 11) != 512)         { return 61; }
+    if (load32(&fatbs + 32) != ESP_SECTORS) { return 61; }
+    if (load32(&fatbs + 44) != 2)           { return 61; }   # RootClus
+    if (load16(&fatbs + 22) != 0)           { return 61; }   # FATSz16 must be 0 for FAT32
+
+    sys_blk_close(hrw);
+
+    return 97;    # GPT + empty FAT32 ESP written to the scratch tail; every structure readback-verified
+}
+
+# No-argv bite -> the var-r-main form is safe here (matches blkprobe/blkwr; later bites that
+# read a blob open a FIXED ROOTFS PATH, never argv, sidestepping the gvar-init argv trap).
+# SYS_EXIT (NOT literal 60): agnos exit=0, Linux exit=60 — the wrapper is correct on both.
+fn _entry(): i64 { var r = gptwr_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
