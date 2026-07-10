@@ -43,11 +43,24 @@
 #                  WrtTime@22). Crash-safe order: data cluster -> FAT -> parent dirent -> FSInfo.
 #                  Diagnostics: 60 \EFI-cluster-write, 59 FAT-rewrite, 58 root-publish-write,
 #                  57 fsinfo-rewrite, 56 \EFI-readback, 55 root-dirent-readback.
-#   Bite 8a (THIS): complete the boot directory skeleton — \EFI\BOOT (cluster 4, parent \EFI) and
-#                  \boot (cluster 5, parent root), via the build_dir_cluster/put_dir_dirent helpers,
-#                  same crash-safe order. These are the parents for BOOTX64.EFI and the kernel
-#                  (Bites 8b/8c). Diagnostics: 54 dir-cluster-write, 53 FAT-rewrite, 52 parent-
-#                  publish-write, 51 fsinfo-rewrite, 50 readback.
+#   Bite 8a: complete the boot directory skeleton — \EFI\BOOT (cluster 4, parent \EFI) and \boot
+#                  (cluster 5, parent root), via the build_dir_cluster/put_dir_dirent helpers, same
+#                  crash-safe order. These are the parents for BOOTX64.EFI and the kernel (8b/8c).
+#                  Diagnostics: 54 dir-cluster-write, 53 FAT-rewrite, 52 parent-publish-write,
+#                  51 fsinfo-rewrite, 50 readback.
+#   Bite 8b: write \EFI\BOOT\BOOTX64.EFI (gnoboot, ~30 KB) from the rootfs into the FAT — the first
+#                  real file I/O in the tool. open a FIXED ROOTFS PATH, lseek(END) for the size,
+#                  allocate a contiguous cluster run, STREAM the body 512 B at a time into the
+#                  cluster sectors, chain the FAT (fits FAT sector 0), publish the 8.3 file dirent.
+#                  The smoke mcopy's the file back out + cmp's it byte-for-byte against gnoboot.
+#                  Diagnostics: 49 open, 48 size/overrun, 47 FAT-write, 46 dirent-write, 45 body-
+#                  write, 44 short-read, 43 dirent-readback, 42 FAT-readback, 41 fsinfo-write.
+#   Bite 8c (THIS): write \boot\agnos (the ~1.4 MB kernel) the same way, but the chain spans ~22 FAT
+#                  sectors (fat_write_chain RMWs each) and the body streams 32 clusters (16 KB) per
+#                  write so we don't flush thousands of single sectors. After this the ESP holds a
+#                  complete bootable payload the tool wrote itself. The smoke mcopy+cmp's the kernel
+#                  too. Diagnostics: 39 open, 38 size/overrun, 37 FAT-chain, 36 dirent, 35 body,
+#                  34 short-read, 33 dirent-readback, 32 FAT-readback, 31 fsinfo.
 #
 # Bitwise CRC-32/ISO-HDLC, transcribed from the kernel's own gpt_crc32_chunk
 # (kernel/core/gpt.cyr:114-128): poly 0xEDB88320 (reflected), init/final 0xFFFFFFFF.
@@ -80,8 +93,11 @@ var fsinfo[64];   #   512 B — FAT32 FSInfo sector
 var fatsec[64];   #   512 B — first sector of each FAT (holds FAT[0..2])
 var z32[2048];    # 16384 B — zero buffer for bulk-zeroing the FAT metadata region
 var rootbuf[64];  #   512 B — FAT32 root-cluster sector 0 (volume-label dirent + \EFI dirent)
-var efidir[64];   #   512 B — the \EFI directory cluster ('.'/'..' + BOOT dirents)
-var subdir[64];   #   512 B — scratch for a freshly-built subdirectory cluster
+var efidir[64];     # 512 B — the \EFI directory cluster ('.'/'..' + BOOT dirent)
+var efibootdir[64]; # 512 B — the \EFI\BOOT directory cluster ('.'/'..' + BOOTX64.EFI dirent)
+var bootdir[64];    # 512 B — the \boot directory cluster ('.'/'..' + AGNOS dirent)
+var filebuf[64];    # 512 B — one-sector streaming buffer for file bodies
+var nm[8];          #  64 B — 8.3 name scratch (11 bytes used)
 
 fn crc32(buf: i64, len: i64): i64 {
     var crc = 0xFFFFFFFF;
@@ -352,6 +368,57 @@ fn put_dir_dirent(pbuf: i64, slot: i64, clus: i64, n0: i64, n1: i64, n2: i64, n3
     return 0;
 }
 
+# Read up to `want` bytes into buf from fd, looping over short reads. Returns bytes actually
+# read (< want only at EOF). vfs_read can legally return a short count mid-file, so loop.
+fn read_fill(fd: i64, buf: i64, want: i64): i64 {
+    var got = 0;
+    while (got < want) {
+        var n = sys_read(fd, buf + got, want - got);
+        if (n <= 0) { return got; }             # EOF or error
+        got = got + n;
+    }
+    return got;
+}
+
+# Publish an 8.3 dirent (11-byte name at name_ptr) into pbuf at slot: attr, first cluster
+# (split HI@20/LO@26), FileSize@28. Used for files (attr 0x20).
+fn put_dirent(pbuf: i64, slot: i64, name_ptr: i64, attr: i64, clus: i64, size: i64): i64 {
+    var o = pbuf + slot * 32;
+    var i = 0;
+    while (i < 11) { store8(o + i, load8(name_ptr + i) & 0xFF); i = i + 1; }
+    store8(o + 11, attr);
+    store16(o + 20, (clus >> 16) & 0xFFFF);
+    store16(o + 26, clus & 0xFFFF);
+    store32(o + 28, size);
+    return 0;
+}
+
+# Write a contiguous FAT32 cluster chain [first..last] to BOTH FATs, sector by sector: read each
+# touched FAT sector (to preserve entries outside the run), set this run's entries (c -> c+1, the
+# final cluster -> EOC), write it back. Handles chains that span multiple FAT sectors. Uses the
+# fatsec buffer as RMW scratch. Returns 0 / -1.
+fn fat_write_chain(hrw: i64, esp_abs: i64, fatsz: i64, first: i64, last: i64): i64 {
+    var s = (first * 4) / 512;              # first FAT sector the chain touches
+    var slast = (last * 4) / 512;
+    while (s <= slast) {
+        if (sys_blk_read(hrw, esp_abs + 32 + s, &fatsec, 1) != 1) { return 0 - 1; }
+        var c = s * 128;                    # first cluster mapped by FAT sector s
+        if (c < first) { c = first; }
+        var cend = s * 128 + 127;           # last cluster mapped by FAT sector s
+        if (cend > last) { cend = last; }
+        while (c <= cend) {
+            var val = c + 1;
+            if (c == last) { val = 0x0FFFFFFF; }        # end-of-chain on the final cluster
+            store32(&fatsec + (c * 4 - s * 512), val);  # byte offset within this FAT sector
+            c = c + 1;
+        }
+        if (sys_blk_write(hrw, esp_abs + 32 + s, &fatsec, 1) != 1)         { return 0 - 1; }
+        if (sys_blk_write(hrw, esp_abs + 32 + fatsz + s, &fatsec, 1) != 1) { return 0 - 1; }
+        s = s + 1;
+    }
+    return 0;
+}
+
 fn gptwr_main(): i64 {
     # --- Bite 1 regression: CRC32 canonical vectors (cheap; guards the whole format) ---
     var s[9];
@@ -538,10 +605,10 @@ fn gptwr_main(): i64 {
     var efiboot_sec = root_start + (EFIBOOT_CLUS - 2);   # cluster 4 data sector
     var boot_sec    = root_start + (BOOT_CLUS - 2);      # cluster 5 data sector
 
-    build_dir_cluster(&subdir, EFIBOOT_CLUS, EFI_CLUS);              # \EFI\BOOT: parent = \EFI (3)
-    if (sys_blk_write(hrw, ESP_ABS + efiboot_sec, &subdir, 1) != 1) { return 54; }
-    build_dir_cluster(&subdir, BOOT_CLUS, 0);                        # \boot: parent = root (0)
-    if (sys_blk_write(hrw, ESP_ABS + boot_sec, &subdir, 1) != 1)    { return 54; }
+    build_dir_cluster(&efibootdir, EFIBOOT_CLUS, EFI_CLUS);            # \EFI\BOOT: parent = \EFI (3)
+    if (sys_blk_write(hrw, ESP_ABS + efiboot_sec, &efibootdir, 1) != 1) { return 54; }
+    build_dir_cluster(&bootdir, BOOT_CLUS, 0);                         # \boot: parent = root (0)
+    if (sys_blk_write(hrw, ESP_ABS + boot_sec, &bootdir, 1) != 1)      { return 54; }
 
     store32(&fatsec + 16, 0x0FFFFFFF);   # FAT[4] EOC (4*4=16)
     store32(&fatsec + 20, 0x0FFFFFFF);   # FAT[5] EOC (5*4=20)
@@ -570,9 +637,115 @@ fn gptwr_main(): i64 {
     if ((load8(&rsec + 64) & 0xFF) != 0x42)      { return 50; }      # root slot 2 = 'B' (boot)
     if (load16(&rsec + 64 + 26) != BOOT_CLUS)    { return 50; }      # -> cluster 5
 
+    # --- Bite 8b: write \EFI\BOOT\BOOTX64.EFI (gnoboot) from the rootfs into the FAT ---
+    # Read the blob from a FIXED ROOTFS PATH (never argv). gnoboot is ~30 KB (~59 clusters),
+    # whose FAT chain fits FAT sector 0 alone — so this proves the whole file-write mechanism
+    # (open -> lseek-size -> allocate -> stream -> dirent) without multi-sector-FAT handling.
+    var nfree = 6;                          # first free cluster (2,3,4,5 = the skeleton)
+    var fd = sys_open("/stage/bootx64.efi", 18, 0);
+    if (fd < 0) { return 49; }
+    var bsize = sys_lseek(fd, 0, 2);        # SEEK_END -> file size
+    if (bsize <= 0) { return 48; }
+    sys_lseek(fd, 0, 0);                     # rewind to SEEK_SET 0
+    var bclus = (bsize + 511) / 512;
+    var bfirst = nfree;
+    if ((bfirst + bclus) > 128) { return 48; }   # 8b invariant: chain must fit FAT sector 0
+
+    # Stream the body into clusters bfirst..bfirst+bclus-1 (data BEFORE FAT/dirent = crash-safe).
+    var wi = 0;
+    var total = 0;
+    while (wi < bclus) {
+        zero(&filebuf, 512);
+        total = total + read_fill(fd, &filebuf, 512);   # last cluster partial; rest stays zero
+        if (sys_blk_write(hrw, ESP_ABS + root_start + (bfirst + wi - 2), &filebuf, 1) != 1) { return 45; }
+        wi = wi + 1;
+    }
+    sys_close(fd);
+    if (total != bsize) { return 44; }       # short read mid-file (should not happen)
+
+    # FAT chain: bfirst..last-1 -> next, last -> EOC (all within FAT sector 0 for gnoboot).
+    var fc = bfirst;
+    while (fc < bfirst + bclus - 1) { store32(&fatsec + fc * 4, fc + 1); fc = fc + 1; }
+    store32(&fatsec + (bfirst + bclus - 1) * 4, 0x0FFFFFFF);
+    if (sys_blk_write(hrw, ESP_ABS + 32, &fatsec, 1) != 1)         { return 47; }
+    if (sys_blk_write(hrw, ESP_ABS + 32 + fatsz, &fatsec, 1) != 1) { return 47; }
+
+    # Publish the BOOTX64.EFI 8.3 dirent in \EFI\BOOT (slot 2), re-write the directory cluster.
+    store8(&nm + 0, 0x42); store8(&nm + 1, 0x4F); store8(&nm + 2, 0x4F); store8(&nm + 3, 0x54);  # "BOOTX64 EFI"
+    store8(&nm + 4, 0x58); store8(&nm + 5, 0x36); store8(&nm + 6, 0x34); store8(&nm + 7, 0x20);
+    store8(&nm + 8, 0x45); store8(&nm + 9, 0x46); store8(&nm + 10, 0x49);
+    put_dirent(&efibootdir, 2, &nm, 0x20, bfirst, bsize);
+    if (sys_blk_write(hrw, ESP_ABS + efiboot_sec, &efibootdir, 1) != 1) { return 46; }
+
+    nfree = bfirst + bclus;
+    store32(&fsinfo + 488, coc - (nfree - 2));
+    store32(&fsinfo + 492, nfree);
+    if (sys_blk_write(hrw, ESP_ABS + 1, &fsinfo, 1) != 1) { return 41; }
+    if (sys_blk_write(hrw, ESP_ABS + 7, &fsinfo, 1) != 1) { return 41; }
+
+    # readback: the dirent fields + FAT chain endpoints.
+    if (sys_blk_read(hrw, ESP_ABS + efiboot_sec, &rsec, 1) != 1) { return 43; }
+    if ((load8(&rsec + 64) & 0xFF) != 0x42)      { return 43; }     # 'B' (BOOTX64)
+    if ((load8(&rsec + 64 + 11) & 0xFF) != 0x20) { return 43; }     # attr = ARCHIVE (a file)
+    if (load16(&rsec + 64 + 26) != bfirst)       { return 43; }     # first cluster
+    if (load32(&rsec + 64 + 28) != bsize)        { return 43; }     # file size
+    if (sys_blk_read(hrw, ESP_ABS + 32, &rsec, 1) != 1) { return 42; }
+    if (load32(&rsec + bfirst * 4) != (bfirst + 1))            { return 42; }  # chain head links on
+    if (load32(&rsec + (bfirst + bclus - 1) * 4) != 0x0FFFFFFF) { return 42; }  # chain tail is EOC
+
+    # --- Bite 8c: write \boot\agnos (the ~1.4 MB kernel) from the rootfs into the FAT ---
+    # Same mechanism as 8b, but the chain spans ~22 FAT sectors (fat_write_chain) and the body is
+    # streamed 32 clusters (16 KB) per write so we don't flush thousands of single sectors.
+    var kfd = sys_open("/stage/kernel", 13, 0);
+    if (kfd < 0) { return 39; }
+    var ksize = sys_lseek(kfd, 0, 2);        # SEEK_END -> size
+    if (ksize <= 0) { return 38; }
+    sys_lseek(kfd, 0, 0);
+    var kclus = (ksize + 511) / 512;
+    var kfirst = nfree;                      # continues after BOOTX64.EFI
+    if ((kfirst + kclus) > (coc + 2)) { return 38; }   # last valid cluster is coc+1
+
+    # Stream the kernel body in 32-cluster (16 KB) batches into the contiguous run.
+    var kwi = 0;
+    var ktotal = 0;
+    while (kwi < kclus) {
+        var chunk = kclus - kwi;
+        if (chunk > 32) { chunk = 32; }
+        zero(&rback, 16384);
+        ktotal = ktotal + read_fill(kfd, &rback, chunk * 512);   # last batch partial; rest zero
+        if (sys_blk_write(hrw, ESP_ABS + root_start + (kfirst + kwi - 2), &rback, chunk) != chunk) { return 35; }
+        kwi = kwi + chunk;
+    }
+    sys_close(kfd);
+    if (ktotal != ksize) { return 34; }
+
+    # FAT chain across all touched FAT sectors, then publish the AGNOS dirent in \boot.
+    if (fat_write_chain(hrw, ESP_ABS, fatsz, kfirst, kfirst + kclus - 1) != 0) { return 37; }
+    store8(&nm + 0, 0x41); store8(&nm + 1, 0x47); store8(&nm + 2, 0x4E); store8(&nm + 3, 0x4F);  # "AGNOS      "
+    store8(&nm + 4, 0x53); store8(&nm + 5, 0x20); store8(&nm + 6, 0x20); store8(&nm + 7, 0x20);
+    store8(&nm + 8, 0x20); store8(&nm + 9, 0x20); store8(&nm + 10, 0x20);
+    put_dirent(&bootdir, 2, &nm, 0x20, kfirst, ksize);
+    if (sys_blk_write(hrw, ESP_ABS + boot_sec, &bootdir, 1) != 1) { return 36; }
+
+    nfree = kfirst + kclus;
+    store32(&fsinfo + 488, coc - (nfree - 2));
+    store32(&fsinfo + 492, nfree);
+    if (sys_blk_write(hrw, ESP_ABS + 1, &fsinfo, 1) != 1) { return 31; }
+    if (sys_blk_write(hrw, ESP_ABS + 7, &fsinfo, 1) != 1) { return 31; }
+
+    # readback: the AGNOS dirent + the chain tail EOC in its FAT sector.
+    if (sys_blk_read(hrw, ESP_ABS + boot_sec, &rsec, 1) != 1) { return 33; }
+    if ((load8(&rsec + 64) & 0xFF) != 0x41) { return 33; }        # 'A' (AGNOS)
+    if (load16(&rsec + 64 + 26) != kfirst)  { return 33; }        # first cluster
+    if (load32(&rsec + 64 + 28) != ksize)   { return 33; }        # file size
+    var klast = kfirst + kclus - 1;
+    var ksec = (klast * 4) / 512;
+    if (sys_blk_read(hrw, ESP_ABS + 32 + ksec, &rsec, 1) != 1) { return 32; }
+    if (load32(&rsec + (klast * 4 - ksec * 512)) != 0x0FFFFFFF) { return 32; }   # chain tail EOC
+
     sys_blk_close(hrw);
 
-    return 97;    # GPT + FAT32 ESP + \EFI, \EFI\BOOT, \boot directory skeleton; all readback-verified
+    return 97;    # GPT + FAT32 ESP + directory tree + BOOTX64.EFI + the kernel written; all readback-verified
 }
 
 # No-argv bite -> the var-r-main form is safe here (matches blkprobe/blkwr; later bites that

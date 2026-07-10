@@ -7,17 +7,18 @@
 # builds a byte-accurate GPT partition table + FAT ESP in userland and writes it through
 # sys_blk_* — replacing agnova's `parted` + `mkfs.fat` shell-outs.
 #
-# BITE 7 (this run): gptwr builds + self-verifies the full GPT (Bites 1-2), writes it to the live
-# disk's UNALLOCATED TAIL + readback-verifies it (Bites 3a/3b), formats the ESP as FAT32 (Bite 6),
-# and now creates the \EFI subdirectory (Bite 7): allocates cluster 3, writes its '.'/'..' dirents,
-# marks it EOC in both FATs, and publishes the \EFI dirent in the root (exit 97). A bug can only
-# touch throwaway tail sectors — never the live GPT/ESP/rootfs at absolute LBA 0/1/2-33. THREE
-# INDEPENDENT ORACLES on the dumped bytes: sgdisk (foreign GPT impl, "No problems found" + the two
-# type GUIDs), mtools minfo/mdir (foreign FAT impl — FAT32 recognized, \EFI listed + descendable),
-# and fsck.fat (strict FAT checker, no errors) prove the tool's output is REAL, not merely self-
-# consistent. Needs a 1 GiB disk for the tail room.
+# BITE 8b (this run): gptwr partitions (GPT) + formats (FAT32) + builds the \EFI\BOOT + \boot
+# directory tree (Bites 1-8a), then writes \EFI\BOOT\BOOTX64.EFI (gnoboot, ~30 KB) from the rootfs
+# into the FAT (Bite 8b): the first real file I/O in the tool — sys_open a fixed rootfs path,
+# lseek(END) for the size, allocate a contiguous cluster run, stream the body into cluster sectors,
+# chain the FAT, publish the 8.3 file dirent (exit 97). All writes hit the live disk's UNALLOCATED
+# TAIL only. FOUR INDEPENDENT ORACLES on the dumped bytes: sgdisk (GPT clean + type GUIDs), mtools
+# minfo/mdir (FAT32 + the whole directory tree descendable), fsck.fat (strict, no errors), and —
+# the dispositive one — mcopy the file back out + cmp it byte-for-byte against gnoboot. Needs a
+# 1 GiB disk for the tail room. The rootfs is seeded with the gnoboot blob at /stage/bootx64.efi.
 #
-# Gates: "exec: running /bin/gptwr", "run: exit 97", no faults, sgdisk + mtools + fsck.fat clean.
+# Gates: "exec: running /bin/gptwr", "run: exit 97", no faults, sgdisk + mtools + fsck.fat clean,
+# and BOOTX64.EFI read back byte-identical to gnoboot.
 # Diagnostics: 91/92/93 CRC vector, 90 GPT sig, 89 hdr-CRC, 88 array-CRC, 87 ESP-GUID,
 #   86 rootfs-GUID, 85 backup-hdr, 84 hdr-fields, 83 protective-MBR, 79 no-disk, 78 overrun,
 #   77 arm/RW-open, 76 MBR-write, 75 MBR-readback, 74 MBR-mismatch, 73 hdr-write, 72 array-write,
@@ -58,7 +59,9 @@ PART_OFFSET=$(( 33 * 1048576 )); PART_BYTES=$(( 200 * 1048576 )); PART_BLOCKS=$(
 EXT2_FEATURES="^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg"
 
 echo "[2/4] Seeding a 1 GiB GPT disk (parted) with /bin/gptwr (tail past 240 MiB = gptwr scratch)..."
-SEED="$WORK/seed"; mkdir -p "$SEED/bin"; cp "$GPTWR" "$SEED/bin/gptwr"
+SEED="$WORK/seed"; mkdir -p "$SEED/bin" "$SEED/stage"; cp "$GPTWR" "$SEED/bin/gptwr"
+cp "$GNOBOOT" "$SEED/stage/bootx64.efi"     # gptwr reads this rootfs path -> writes it to the FAT ESP (Bite 8b)
+cp "$AGNOS"   "$SEED/stage/kernel"          # ... and the kernel -> \boot\agnos on the FAT ESP (Bite 8c)
 dd if=/dev/zero of="$IMG" bs=1M count=1024 status=none
 parted -s "$IMG" mklabel gpt mkpart ESP fat32 1MiB 33MiB set 1 esp on mkpart agnos-fs ext2 33MiB 240MiB
 sgdisk -t 2:8300 "$IMG" >/dev/null
@@ -71,7 +74,7 @@ mkfs.ext2 -F -q -L AGNOS-GPTWR -b 4096 -m 0 -O "$EXT2_FEATURES" -d "$SEED" -E of
 echo "[3/4] Booting gnoboot+OVMF+NVMe, running /bin/gptwr..."
 cp "$OVMF_VARS_SRC" "$WORK/vars.fd"; chmod +w "$WORK/vars.fd"; : > "$SLOG"
 KVM_ARGS=""; [ -e /dev/kvm ] && KVM_ARGS="-enable-kvm -cpu host"; [ -z "$KVM_ARGS" ] && KVM_ARGS="-cpu max"
-HARD=60; [ -e /dev/kvm ] || HARD=120
+HARD=200; [ -e /dev/kvm ] || HARD=360   # Bite 8c streams a ~1.4 MB kernel into the FAT (many writes)
 qemu-system-x86_64 -machine q35 -m 512M $KVM_ARGS \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,file=$WORK/vars.fd" \
@@ -94,7 +97,7 @@ strings "$SLOG" | grep -q "exec: running /bin/gptwr" \
     && echo "  PASS: /bin/gptwr dispatched (exec'd from disk in ring 3)" \
     || { echo "  FAIL: gptwr never dispatched"; rc=1; }
 if strings "$SLOG" | grep -q "run: exit 97"; then
-    echo "  PASS: run: exit 97 — GPT + FAT32 ESP + \\EFI, \\EFI\\BOOT, \\boot directory skeleton written to the scratch tail; every structure read back byte-identical"
+    echo "  PASS: run: exit 97 — GPT + FAT32 ESP + directory tree + BOOTX64.EFI + the ~1.4 MB kernel written to the scratch tail; every structure read back byte-identical"
 elif strings "$SLOG" | grep -qE "run: exit 91|run: exit 92|run: exit 93"; then
     echo "  FAIL: run: exit 91/92/93 — a CRC32 canonical vector mismatched (transcription bug in crc32)"; rc=1
 elif strings "$SLOG" | grep -q "run: exit 90"; then
@@ -173,6 +176,42 @@ elif strings "$SLOG" | grep -q "run: exit 51"; then
     echo "  FAIL: run: exit 51 — FSInfo re-write failed"; rc=1
 elif strings "$SLOG" | grep -q "run: exit 50"; then
     echo "  FAIL: run: exit 50 — \\EFI\\BOOT / \\boot readback mismatch"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 49"; then
+    echo "  FAIL: run: exit 49 — sys_open('/stage/bootx64.efi') failed (rootfs blob not seeded/readable)"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 48"; then
+    echo "  FAIL: run: exit 48 — file size query failed or chain overruns FAT sector 0"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 47"; then
+    echo "  FAIL: run: exit 47 — BOOTX64.EFI FAT-chain write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 46"; then
+    echo "  FAIL: run: exit 46 — BOOTX64.EFI dirent write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 45"; then
+    echo "  FAIL: run: exit 45 — a BOOTX64.EFI body-cluster write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 44"; then
+    echo "  FAIL: run: exit 44 — short read streaming the blob (bytes read != file size)"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 43"; then
+    echo "  FAIL: run: exit 43 — BOOTX64.EFI dirent readback mismatch"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 42"; then
+    echo "  FAIL: run: exit 42 — BOOTX64.EFI FAT-chain readback mismatch"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 41"; then
+    echo "  FAIL: run: exit 41 — FSInfo write after BOOTX64.EFI failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 39"; then
+    echo "  FAIL: run: exit 39 — sys_open('/stage/kernel') failed (kernel blob not seeded/readable)"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 38"; then
+    echo "  FAIL: run: exit 38 — kernel size query failed or run overruns the data region"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 37"; then
+    echo "  FAIL: run: exit 37 — kernel multi-sector FAT-chain write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 36"; then
+    echo "  FAIL: run: exit 36 — AGNOS dirent write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 35"; then
+    echo "  FAIL: run: exit 35 — a kernel body-batch write failed"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 34"; then
+    echo "  FAIL: run: exit 34 — short read streaming the kernel (bytes read != file size)"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 33"; then
+    echo "  FAIL: run: exit 33 — AGNOS dirent readback mismatch"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 32"; then
+    echo "  FAIL: run: exit 32 — kernel FAT-chain tail (EOC) readback mismatch"; rc=1
+elif strings "$SLOG" | grep -q "run: exit 31"; then
+    echo "  FAIL: run: exit 31 — FSInfo write after the kernel failed"; rc=1
 else
     echo "  FAIL: no 'run: exit 97' — gptwr crashed before exit (bad wiring / fault)"; rc=1
 fi
@@ -238,6 +277,17 @@ if [ "$rc" -eq 0 ]; then
     mdir -i "$ESPIMG" ::/boot >"$WORK/mdir-boot.out" 2>&1 \
         && echo "  PASS: mtools mdir ::/boot: descended into the \\boot directory" \
         || { echo "  FAIL: mtools could not descend into \\boot"; sed 's/^/    /' "$WORK/mdir-boot.out" | head -3; rc=1; }
+    # Bite 8b dispositive oracle: read BOOTX64.EFI back out of the tool-written FAT + byte-compare.
+    if mcopy -i "$ESPIMG" ::/EFI/BOOT/BOOTX64.EFI "$WORK/out-bootx64.efi" 2>/dev/null && cmp -s "$WORK/out-bootx64.efi" "$GNOBOOT"; then
+        echo "  PASS: mcopy ::/EFI/BOOT/BOOTX64.EFI == gnoboot byte-for-byte ($(stat -c %s "$GNOBOOT") B) — the tool wrote a real, intact file"
+    else
+        echo "  FAIL: BOOTX64.EFI read back from the tool-written FAT does not match gnoboot"; rc=1
+    fi
+    if mcopy -i "$ESPIMG" ::/boot/agnos "$WORK/out-agnos" 2>/dev/null && cmp -s "$WORK/out-agnos" "$AGNOS"; then
+        echo "  PASS: mcopy ::/boot/agnos == the kernel byte-for-byte ($(stat -c %s "$AGNOS") B) — a ~1.4 MB multi-sector-FAT-chain file, intact"
+    else
+        echo "  FAIL: /boot/agnos read back from the tool-written FAT does not match the kernel"; rc=1
+    fi
     # Third oracle: fsck.fat (dosfstools, the strictest FAT checker) — gating when present.
     if command -v fsck.fat >/dev/null 2>&1; then
         if fsck.fat -n "$ESPIMG" >"$WORK/fsck.out" 2>&1; then
@@ -249,5 +299,5 @@ if [ "$rc" -eq 0 ]; then
 fi
 
 echo ""
-[ "$rc" -eq 0 ] && echo "gpt-write-smoke: PASS — GPT + FAT32 ESP + \\EFI\\BOOT + \\boot skeleton written to disk + validated by independent parsers (sgdisk + mtools + fsck.fat) (1.53.x Phase 4 Bite 8a)" || echo "gpt-write-smoke: FAIL"
+[ "$rc" -eq 0 ] && echo "gpt-write-smoke: PASS — a complete bootable ESP (GPT + FAT32 + BOOTX64.EFI + kernel) written by the sovereign tool; validated by sgdisk + mtools + fsck.fat + byte-identical mcopy of both files (1.53.x Phase 4 Bite 8c)" || echo "gpt-write-smoke: FAIL"
 exit $rc
