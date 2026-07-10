@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 raw block-device read-path exerciser (1.53.10 Phase 1) — blk_enum#75 / blk_open#76 (RO) / blk_read#77 LBA 1 + GPT 'EFI PART' check; exits 95 iff the read-path works end to end."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.4.2"
+cyrius = "6.4.39"
 
 [build]
 src = "blkprobe.cyr"

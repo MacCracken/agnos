@@ -91,6 +91,7 @@ enum SysNr {
     SYS_SECCOMP = 317;
     SYS_GETRANDOM = 318;
     SYS_EXECVEAT = 322;
+    SYS_PIDFD_OPEN = 434;         # Linux number stubbed; macOS has no pidfd (async subprocess is Linux-only)
     SYS_LANDLOCK_CREATE_RULESET = 444;
     SYS_LANDLOCK_ADD_RULE = 445;
     SYS_LANDLOCK_RESTRICT_SELF = 446;

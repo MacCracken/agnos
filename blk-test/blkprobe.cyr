@@ -1,30 +1,27 @@
-# blkprobe — agnos ring-3 raw-block-device read-path exerciser (1.53.10, Phase 1).
+# blkprobe — agnos ring-3 raw block-device read-path exerciser (1.53.10 Phase 1).
 #
 # Proves the #75-80 READ-PATH end to end FROM RING 3, against the real GPT disk QEMU
-# presents: blk_enum#75 finds the active disk, blk_open#76 returns a RO handle,
-# blk_read#77 pulls LBA 1 (the GPT header), and its first 8 bytes are the "EFI PART"
-# GPT signature. Exits 95 iff the whole chain works; 90-94 pinpoint where it broke.
+# presents: blk_enum finds the active disk, blk_open returns a RO handle, blk_read pulls
+# LBA 1 (the GPT header), and its first 8 bytes are the "EFI PART" GPT signature.
+# Exits 95 iff the whole chain works; 90-94 pinpoint where it broke.
 #
-# Raw syscalls — the cyrius sys_blk_* wrappers don't exist yet (see the cyrius issue):
-#   75 blk_enum(buf,cap)->count   76 blk_open(tag,mode)->h   77 blk_read(h,lba,buf,nsec)->nsec
-#   79 blk_info(h,out)->0         80 blk_close(h)->0
-# blk_read is a 4-arg syscall — the 4th (nsec) rides r10 (ksyscall_a4), like readlink#70.
+# Uses the native cyrius `sys_blk_*` wrappers (added v6.4.39) — no raw syscall numbers.
 
 fn blkprobe_main(): i64 {
     var ebuf[192];                        # up to 8 entries * 24 B (function-local = 192 bytes)
-    var n = syscall(75, &ebuf, 192);      # blk_enum
+    var n = sys_blk_enum(&ebuf, 192);
     if (n < 0) { return 90; }             # enum syscall error
     if (n < 1) { return 91; }             # no block device registered
     var tag = load64(&ebuf);              # entry 0's tag (offset 0)
 
-    var h = syscall(76, tag, 0);          # blk_open(tag, RO)
+    var h = sys_blk_open(tag, 0);         # RO
     if (h < 0) { return 92; }
 
     var ibuf[16];                         # {capacity_lbas, lba_bytes} — best-effort, not gating
-    syscall(79, h, &ibuf);                # blk_info
+    sys_blk_info(h, &ibuf);
 
     var sec[512];                         # one 512-B LBA (QEMU NVMe default sector size)
-    var r = syscall(77, h, 1, &sec, 1);   # blk_read(h, lba=1, sec, nsec=1) -> the GPT header
+    var r = sys_blk_read(h, 1, &sec, 1);  # LBA 1 -> the GPT header
     if (r != 1) { return 93; }
 
     # GPT header signature at LBA 1, bytes 0..7 = "EFI PART" (45 46 49 20 50 41 52 54).
@@ -38,7 +35,7 @@ fn blkprobe_main(): i64 {
     if ((load8(&sec + 6) & 0xFF) != 0x52) { ok = 0; }   # R
     if ((load8(&sec + 7) & 0xFF) != 0x54) { ok = 0; }   # T
 
-    syscall(80, h);                       # blk_close
+    sys_blk_close(h);
     if (ok == 0) { return 94; }           # read succeeded but LBA 1 isn't a GPT header
     return 95;                            # ALL PASS — ring-3 read-path works on a real GPT disk
 }

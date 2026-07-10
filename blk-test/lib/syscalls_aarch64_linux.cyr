@@ -159,6 +159,7 @@ enum SysNr {
     SYS_PRCTL = 167;
     SYS_SECCOMP = 277;
     SYS_EXECVEAT = 281;
+    SYS_PIDFD_OPEN = 434;         # pidfd_open(pid, flags) → fd readable on child exit (Linux 5.3+)
     SYS_LANDLOCK_CREATE_RULESET = 444;
     SYS_LANDLOCK_ADD_RULE = 445;
     SYS_LANDLOCK_RESTRICT_SELF = 446;

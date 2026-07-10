@@ -176,6 +176,13 @@ fn sys_waitpid(pid, status_ptr, options): i64 {
     return syscall(SYS_WAIT4, pid, status_ptr, options, 0);
 }
 
+# pidfd_open(pid, flags) — a file descriptor for `pid` that becomes readable when
+# the process exits. Lets the async runtime await a child on the epoll reactor
+# without blocking (Linux 5.3+). v6.4.36 (P2 — async subprocess).
+fn sys_pidfd_open(pid, flags): i64 {
+    return syscall(SYS_PIDFD_OPEN, pid, flags);
+}
+
 # Wait-status decoding macros — same shape across both arches
 # (POSIX wstatus format).
 
