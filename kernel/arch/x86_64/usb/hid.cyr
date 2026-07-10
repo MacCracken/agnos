@@ -114,23 +114,31 @@ fn hid_modifier_diff(curr_mods, prev_mods) {
 # slot are silently dropped because hid_usage_to_ps2 returns 0 for those
 # unmapped HID codes.
 fn hid_report_keys_diff(curr_addr, prev_addr) {
-    # Emit makes for keys newly-present in curr
+    # Emit makes for keys newly-present in curr. Extended keys (arrows / nav
+    # cluster) get a leading 0xE0 so the byte stream is E0 + make, which bhumi's
+    # set-1-ext decoder turns back into the arrow/nav HID usage.
     for (var i = 2; i < 8; i = i + 1) {
         var code = load8(curr_addr + i);
         if (code >= 4) {
             if (hid_report_contains(prev_addr, code) == 0) {
                 var sc = hid_usage_to_ps2(code);
-                if (sc != 0) { hid_kb_push(sc); }
+                if (sc != 0) {
+                    if (hid_usage_is_ext(code) != 0) { hid_kb_push(0xE0); }
+                    hid_kb_push(sc);
+                }
             }
         }
     }
-    # Emit breaks for keys that were in prev but absent in curr
+    # Emit breaks for keys that were in prev but absent in curr (E0 + break for ext).
     for (var j = 2; j < 8; j = j + 1) {
         var pcode = load8(prev_addr + j);
         if (pcode >= 4) {
             if (hid_report_contains(curr_addr, pcode) == 0) {
                 var psc = hid_usage_to_ps2(pcode);
-                if (psc != 0) { hid_kb_push(psc | 0x80); }
+                if (psc != 0) {
+                    if (hid_usage_is_ext(pcode) != 0) { hid_kb_push(0xE0); }
+                    hid_kb_push(psc | 0x80);
+                }
             }
         }
     }

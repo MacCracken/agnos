@@ -81,7 +81,7 @@ try:
 
     # move the selection DOWN two rows (each ~32 px tall)
     for _ in range(4):
-        hmp("sendkey j"); time.sleep(0.9)
+        hmp("sendkey down"); time.sleep(0.9)
     time.sleep(1.5)
     hmp("screendump %s" % PPM_B); time.sleep(1.0)
     yb = hi_mean_y(PPM_B)

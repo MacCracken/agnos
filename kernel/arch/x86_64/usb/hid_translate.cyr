@@ -116,6 +116,22 @@ fn hid_translate_init() {
     store8(&hid_to_ps2 + 0x44, 0x57);  # F11
     store8(&hid_to_ps2 + 0x45, 0x58);  # F12
 
+    # Arrows + navigation cluster — EXTENDED keys: hid_report_keys_diff emits a
+    # leading 0xE0 (hid_usage_is_ext marks them), so the byte stream is E0 + this
+    # base make code (and E0 + base|0x80 on release). bhumi's set-1-ext table maps
+    # the base back to the HID usage (E0 0x48 → Up, E0 0x50 → Down, …), completing
+    # the round-trip so ring-3 clients (crab, etc.) receive arrow/nav keys.
+    store8(&hid_to_ps2 + 0x49, 0x52);  # Insert
+    store8(&hid_to_ps2 + 0x4A, 0x47);  # Home
+    store8(&hid_to_ps2 + 0x4B, 0x49);  # PageUp
+    store8(&hid_to_ps2 + 0x4C, 0x53);  # Delete
+    store8(&hid_to_ps2 + 0x4D, 0x4F);  # End
+    store8(&hid_to_ps2 + 0x4E, 0x51);  # PageDown
+    store8(&hid_to_ps2 + 0x4F, 0x4D);  # Right arrow
+    store8(&hid_to_ps2 + 0x50, 0x4B);  # Left arrow
+    store8(&hid_to_ps2 + 0x51, 0x50);  # Down arrow
+    store8(&hid_to_ps2 + 0x52, 0x48);  # Up arrow
+
     # Modifier byte (HID boot report byte 0):
     #   bit 0 = LCtrl  → PS/2 0x1D
     #   bit 1 = LShift → PS/2 0x2A
@@ -142,6 +158,14 @@ fn hid_translate_init() {
 fn hid_usage_to_ps2(hid_code) {
     if (hid_code >= 256) { return 0; }
     return load8(&hid_to_ps2 + hid_code);
+}
+
+# 1 if `hid_code` is an EXTENDED key (arrows + Insert/Home/PageUp/Delete/End/
+# PageDown, HID 0x49..0x52) whose set-1 make/break must be prefixed with 0xE0.
+fn hid_usage_is_ext(hid_code) {
+    if (hid_code < 0x49) { return 0; }
+    if (hid_code > 0x52) { return 0; }
+    return 1;
 }
 
 # Translate a modifier-bit position (0..7) to its PS/2 make scancode.

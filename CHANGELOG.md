@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.12] — 2026-07-10 — USB-HID arrow / navigation keys reach ring-3 clients (E0-extended scancodes)
+
+The USB-HID keyboard path now delivers the **arrow keys and the navigation cluster**
+(Insert / Home / PageUp / Delete / End / PageDown) to userland, unblocking arrow-driven
+UIs — e.g. the `crab` file manager's list navigation. These keys were **deferred** in the
+Phase-5 HID→PS/2 translation ("not required for MVP typeable shell"), so they were silently
+dropped; ring-3 clients received nothing on an arrow press while regular keys arrived fine.
+
+### Fixed
+
+- **`kernel/arch/x86_64/usb/hid_translate.cyr`** — the `hid_to_ps2` table now maps HID
+  usages `0x49`–`0x52` (arrows + nav cluster) to their set-1 **base** make codes (Up→`0x48`,
+  Down→`0x50`, Left→`0x4B`, Right→`0x4D`, …), and a new `hid_usage_is_ext()` marks them.
+- **`kernel/arch/x86_64/usb/hid.cyr`** — `hid_report_keys_diff` now prefixes a `0xE0` byte
+  before the make **and** break of an extended key, so the stream drained by `sys_kbscan`
+  (#42) is the canonical `E0 <base>` / `E0 <base|0x80>`. `bhumi`'s set-1-ext decoder maps the
+  base back to the arrow/nav HID usage, completing the round-trip (kernel `E0 0x48` → `bhumi`
+  → HID `0x52` Up). Verified on agnos: a Down arrow moves `crab`'s selection highlight.
+
 ## [1.53.11] — 2026-07-10 — sovereign GPT/mkfs disk tool (`gptwr`) + the native-install ARC-CLOSER: a disk AGNOS builds itself boots
 
 The native-install primitive is now proven **end to end**. On top of the ring-3 raw
