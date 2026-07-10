@@ -2161,6 +2161,76 @@ fn ext2_print_dir(dir_inode_num) {
     return count;
 }
 
+# ext2_readdir_sys(path, buf, max_entries) — the readdir(#81) backend. Resolves `path`
+# (a user NUL-terminated cstring) to a directory inode and writes up to max_entries FIXED
+# 64-byte records to the user buffer `buf`: bytes 0..62 = entry name (NUL-terminated,
+# truncated to 62), byte 63 = type (1 = directory, 0 = file). Skips "." and "..". Same
+# dirent-walk shape as ext2_print_dir, but copies to a ring-3 buffer instead of printing.
+# Returns the entry count (>= 0), or a negative error (-1 bad ptr / not ext2, -2 path not
+# found, -4 not a directory). The caller (a ring-3 program) reads records at buf + i*64.
+fn ext2_readdir_sys(path, buf, max_entries) {
+    if (ext2_active == 0) { return 0 - 1; }
+    if (max_entries <= 0) { return 0; }
+    if (is_user_range(path, 256) == 0) { return 0 - 1; }
+    if (is_user_range(buf, max_entries * 64) == 0) { return 0 - 1; }
+    # bounded strlen of the user path
+    var path_len = 0; var pdone = 0;
+    while ((path_len < 255) && (pdone == 0)) {
+        if (load8(path + path_len) == 0) { pdone = 1; } else { path_len = path_len + 1; }
+    }
+    var dir_ino = ext2_path_lookup(path, path_len);
+    if (dir_ino <= 0) { return 0 - 2; }
+    if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return 0 - 1; }
+    var mode = ext2_inode_mode(&ext2_inode_buf);
+    if ((mode & 0xF000) != 0x4000) { return 0 - 4; }    # not a directory
+    var dir_size = ext2_inode_filesize(&ext2_inode_buf);
+    if (dir_size == 0) { return 0; }
+
+    var count = 0;
+    var bytes_done = 0;
+    while (bytes_done < dir_size) {
+        if (count >= max_entries) { return count; }
+        if (ext2_get_inode(dir_ino, &ext2_inode_buf) != 0) { return count; }
+        var logical = bytes_done / ext2_blocksize;
+        var phys = ext2_logical_to_physical(&ext2_inode_buf, logical);
+        if (phys == 0 - 1) { return count; }
+        if (phys == 0)     { bytes_done = bytes_done + ext2_blocksize; continue; }
+        if (ext2_read_block(phys, &ext2_dir_buf) != 0) { return count; }
+
+        var off = 0;
+        while (off < ext2_blocksize) {
+            var d = &ext2_dir_buf + off;
+            var inode_num = ext2_load32_le(d, 0);
+            var rec_len   = ext2_load16_le(d, 4);
+            var name_len  = load8(d + 6);
+            var ftype     = load8(d + 7);
+            if (ext2_dirent_valid(off, rec_len, name_len) == 0) { return count; }
+            if (inode_num != 0) {
+                var skip = 0;                                  # skip "." and ".."
+                if (name_len == 1) { if (load8(d + 8) == 46) { skip = 1; } }
+                if (name_len == 2) { if (load8(d + 8) == 46) { if (load8(d + 9) == 46) { skip = 1; } } }
+                if (skip == 0) {
+                    if (count < max_entries) {
+                        var rec = buf + count * 64;
+                        var n = name_len;
+                        if (n > 62) { n = 62; }
+                        var k = 0;
+                        while (k < n) { store8(rec + k, load8(d + 8 + k)); k = k + 1; }
+                        store8(rec + n, 0);                    # NUL-terminate the name
+                        var t = 0;
+                        if (ftype == 2) { t = 1; }             # EXT2_FT_DIR
+                        store8(rec + 63, t);
+                        count = count + 1;
+                    }
+                }
+            }
+            off = off + rec_len;
+        }
+        bytes_done = bytes_done + ext2_blocksize;
+    }
+    return count;
+}
+
 # Find a named entry inside a directory inode. Returns the entry's inode
 # number on hit, 0 if not found, -1 on error.
 # 1.47.2 perf — the directory name-scan given the dir inode ALREADY in `inode_buf`. Split out of

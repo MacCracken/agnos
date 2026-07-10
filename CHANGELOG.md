@@ -5,6 +5,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.13] — 2026-07-10 — ring-3 `readdir` syscall (#81): a file manager lists the real filesystem
+
+### Added
+
+- **Ring-3 directory-listing syscall `readdir` (#81)** — `ext2_readdir_sys(path, buf, max)`
+  (`kernel/core/ext2.cyr`) resolves a user path to a directory inode (`ext2_path_lookup`),
+  walks its dirents, and writes up to `max` fixed **64-byte records** to the ring-3 buffer:
+  bytes `0..62` = entry name (NUL-terminated, ≤ 62), byte `63` = type (`1` = dir, `0` = file);
+  `.` / `..` skipped; both pointers `is_user_range`-validated. Dispatch `num == 81` returns the
+  entry count (≥ 0) or a negative error. Proven on agnos: the `crab` file manager lists the real
+  `/bin` (aethersafha / crab / puka) and `/` (bin/ · lost+found/). A cyrius `sys_readdir` wrapper
+  is filed (see `docs/development/issues/2026-07-10-readdir-syscall-cyrius-wrapper.md`).
+
 ## [1.53.12] — 2026-07-10 — USB-HID arrow / navigation keys reach ring-3 clients (E0-extended scancodes)
 
 The USB-HID keyboard path now delivers the **arrow keys and the navigation cluster**

@@ -2368,6 +2368,19 @@ sh_exec("run /bin/gptwr", 14);
 kprintln("exec: gptwr returned", 20);
 #endif
 
+#ifdef AGNOVA_INSTALL_SELFTEST
+# Phase-5 agnova NATIVE_BLOCK proof. Runs /bin/agnova (agnova repo, built --agnos) as a REAL
+# ring-3 install: it enumerates the NVMe (sys_blk_enum), arms the write gate, and writes a GPT
+# for a 768 MiB synthetic disk into the live disk's UNALLOCATED TAIL (scratch-base 524288, past
+# the live rootfs) via df_write -> sys_blk_write — proving the ACTUAL installer binary does the
+# agnos block path (not just the gptwr proof tool). --until partition keeps it fast (no 512 MiB
+# FAT zeroing over the block layer). Exits 0 iff the partition phase succeeds; the smoke then
+# dumps the tail region + sgdisk-validates the GPT agnova wrote.
+kprintln("exec: running /bin/agnova", 25);
+sh_exec("run /bin/agnova execute --device /dev/nvme0n1 --disk-backend=native-block --scratch-base 524288 --disk-sectors 1572864 --until partition --user t --i-mean-it", 157);
+kprintln("exec: agnova returned", 21);
+#endif
+
 #ifdef NAAD_RING3_SELFTEST
 # 1.53.x B6 (arc-closer): naad oscillator END-PROOF. Runs /bin/naadex (naad/, built --agnos) —
 # a REAL heavy-f64 DSP workload: naad's 440 Hz sine oscillator generates 256 samples via

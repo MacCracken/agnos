@@ -190,6 +190,7 @@ else
         [ -n "$BLK_RING3_SELFTEST" ] && echo '#define BLK_RING3_SELFTEST'
         [ -n "$BLK_WRITE_SELFTEST" ] && echo '#define BLK_WRITE_SELFTEST'
         [ -n "$GPT_WRITE_SELFTEST" ] && echo '#define GPT_WRITE_SELFTEST'
+        [ -n "$AGNOVA_INSTALL_SELFTEST" ] && echo '#define AGNOVA_INSTALL_SELFTEST'
 
         [ -n "$NET_SELFTEST" ]       && echo '#define NET_SELFTEST'
         [ -n "$LOOPBACK_SELFTEST" ]  && echo '#define LOOPBACK_SELFTEST'
