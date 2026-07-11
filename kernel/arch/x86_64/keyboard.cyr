@@ -132,19 +132,10 @@ fn kb_has_key() {
     # Drain (2) here so a polling caller also services xHCI; (1) fills kb_buf
     # asynchronously via the ISR.
     hid_poll();
-    # 1.53.7 — print the dispositive "xHCI RX MSI LIVE" proof ONCE, from THIS
-    # non-ISR read-loop context (never from xhci_rx_handler itself — no serial in an
-    # ISR). xhci_rx_handler sets xhci_rx_irq_seen on its first MSI-X delivery; on iron
-    # this line confirms the USB-HID interrupt actually FIRES on real Zen (QEMU MSI-X
-    # != AMD FCH 1022:1639) — the keyboard analog of net's "r8169: RX MSI LIVE".
-    # Absent on iron = keys arrived only via the 100 Hz timer-tick hid_poll fallback
-    # (still functional, just not interrupt-driven → the ~10 ms latency floor remains).
-    if (xhci_rx_irq_seen == 1) {
-        if (xhci_rx_irq_printed == 0) {
-            xhci_rx_irq_printed = 1;
-            kprintln("xhci: RX MSI LIVE (first USB-HID IRQ serviced, vector 0x51)", 59);
-        }
-    }
+    # 1.53.7's dispositive "xhci: RX MSI LIVE (… vector 0x51)" proof was REMOVED at 1.53.14 once the
+    # interrupt-driven USB-HID path was iron-validated on real AMD FCH — printed from this read loop,
+    # it splattered onto the shell prompt. The keyboard responding IS the live signal now, and the
+    # polled hid_poll() above still services keys if the MSI-X path ever regresses.
     if (kb_head != kb_tail) { return 1; }
     return 0;
 }

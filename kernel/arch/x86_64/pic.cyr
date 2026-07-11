@@ -251,11 +251,8 @@ fn nic_rx_isr_build() {
 # MUST only be ARMED after enumeration (the MSI-X vector stays masked until post
 # hid_kbd_configure) so this hid_poll can't steal EP0 Transfer Events from the synchronous
 # xhci_wait_transfer_event EP0 consumer used during control transfers. LAPIC-EOI (MSI-X via LAPIC).
-var xhci_rx_irq_seen = 0;    # LIVE latch — set on first delivery; printed once (non-ISR). DISPOSITIVE
-var xhci_rx_irq_printed = 0; # proof the xHCI MSI FIRES on silicon (QEMU MSI-X != AMD FCH 1022:1639).
 fn xhci_rx_handler() {
-    hid_poll();
-    xhci_rx_irq_seen = 1;   # latch — only runs on a real MSI/MSI-X delivery
+    hid_poll();               # drain the event ring + W1C IMAN.IP (re-arm, 1.53.14) + ERDP.EHB
     apic_eoi();
     return 0;
 }

@@ -25,6 +25,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ls`/`ls -l` functioning. **This closes the 1.53.x console-perf arc on hardware.** See the iron
   log tracker `#tracker-153x-closeout`.
 
+### Removed
+
+- **The 1.53.7 dispositive `xhci: RX MSI LIVE (… vector 0x51)` marker** (`keyboard.cyr` +
+  `pic.cyr`). It printed once from the shell read loop on the first USB-HID IRQ — which lands when
+  you first press a key at the prompt, so it splattered onto `[ASSIST] >`. It existed only to prove
+  the MSI-X fires on FCH; now that that's iron-validated and recorded, it's removed for a clean
+  prompt (along with the `xhci_rx_irq_seen`/`_printed` latch vars). The keyboard responding is the
+  live signal now; the polled `hid_poll()` fallback still services keys if the MSI-X ever regresses.
+  The r8169 `RX MSI LIVE` boot-log line stays (it prints during boot, not at the prompt).
+
 ## [1.53.13] — 2026-07-10 — ring-3 `readdir` syscall (#81): a file manager lists the real filesystem
 
 ### Added
