@@ -5,6 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.53.14] — 2026-07-10 — xHCI USB-HID keyboard: AMD FCH `IMAN.IP` re-arm (the 1.53.x iron closeout)
+
+### Fixed
+
+- **Interrupt-driven USB-HID keyboard hung after the first IRQ on real AMD FCH** (`1022:1639`) —
+  `kernel/arch/x86_64/usb/hid.cyr`. The xHCI MSI-X ISR (`xhci_rx_handler`) EOI'd the LAPIC and
+  updated the Event Ring Dequeue Pointer (`ERDP.EHB`) but **never write-1-cleared the interrupter's
+  `IMAN.IP`** (Interrupt Pending). Per xHCI 1.2 §5.5.2.1 an MSI-X message is generated on the IP
+  `0→1` edge; init sets `IMAN=0x3` once, but with IP left set after the first delivery the
+  controller emits **no further MSI-X**, so the keyboard fired exactly once and the `hlt`-blocked
+  shell (`kbd_read_blocking`) hung. QEMU's xHCI model regenerates the message regardless (lenient);
+  real FCH enforces the edge — so the bug was invisible in QEMU and only surfaced on the iron
+  closeout burn. **Fix:** re-arm interrupter 0 at the top of `hid_poll` (before draining, IE
+  preserved) — `xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x3)`, matching Linux `xhci_irq`. An event
+  arriving mid-drain re-sets IP (`0→1`) and queues the next message, so nothing is missed.
+  **Iron-validated on archaemenid 2026-07-10**: keyboard input works and is much snappier (the
+  1.53.7 console-perf latency win realized on FCH), FB scroll rate much better (WB-RAM shadow),
+  `ls`/`ls -l` functioning. **This closes the 1.53.x console-perf arc on hardware.** See the iron
+  log tracker `#tracker-153x-closeout`.
+
 ## [1.53.13] — 2026-07-10 — ring-3 `readdir` syscall (#81): a file manager lists the real filesystem
 
 ### Added

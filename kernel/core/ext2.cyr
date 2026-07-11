@@ -216,8 +216,11 @@ fn ext2_inode_blocks_lo(inode)           { return ext2_load32_le(inode, 28); }
 fn ext2_inode_set_blocks_lo(inode, v)    { return ext2_store32_le(inode, 28, v); }
 fn ext2_inode_set_block_ptr(inode, i, v) { return ext2_store32_le(inode, 40 + i * 4, v); }
 
-# Composite file size: low 32 + high 32 (LARGE_FILE feature) for regular files.
-# For Phase 1 we cap at 2 GB regardless (i_size_hi == 0 always on small test images).
+# Composite 64-bit file size: low 32 (@4) + high 32 (@108, the LARGE_FILE ro_compat feature) for
+# regular files. The read path (ext2_read_file), stat, and symlink resolution all consume this,
+# and the block map handles up to the triple-indirect tree — so a file past 4 GiB reads correctly
+# once i_size_hi is set. LARGE_FILE (ro_compat 0x2) is not in ro_danger, so such a fs mounts
+# read+write. (No 2 GiB cap — a prior comment here claimed one that the code never had.)
 fn ext2_inode_filesize(inode) {
     var lo = ext2_inode_size_lo(inode);
     var hi = ext2_inode_size_hi(inode);

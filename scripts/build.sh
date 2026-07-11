@@ -183,6 +183,7 @@ else
         [ -n "$VANITONE_AUDIO_SELFTEST" ] && echo '#define VANITONE_AUDIO_SELFTEST'
         [ -n "$MISHRAN_AUDIO_SELFTEST" ] && echo '#define MISHRAN_AUDIO_SELFTEST'
         [ -n "$MISHRAN_JALWA_SELFTEST" ] && echo '#define MISHRAN_JALWA_SELFTEST'
+        [ -n "$MISHRAN_DUPLEX_SELFTEST" ] && echo '#define MISHRAN_DUPLEX_SELFTEST'
         [ -n "$FP_SELFTEST" ]        && echo '#define FP_SELFTEST'
         [ -n "$FP_AREA_SELFTEST" ]   && echo '#define FP_AREA_SELFTEST'
         [ -n "$FP_NM_SELFTEST" ]     && echo '#define FP_NM_SELFTEST'

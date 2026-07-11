@@ -3941,6 +3941,53 @@ if (sh_abspath(ae_p, 16) >= 0) {
 } else { kprintln("setu-e2e: bad path", 18); }
 #endif
 
+#ifdef MISHRAN_DUPLEX_SELFTEST
+# mishran TWO-PROC audio proof — the REAL loopback wire, no jalwa (stays inside the
+# mishran repo). Runs AFTER sched_active=1 (like AETHERSAFHA_SETU_SELFTEST above)
+# because it needs TWO concurrent procs; the pre-scheduler selftest block (~L2286)
+# can't run two — sched_yield #44 no-ops (sched_active=0) and there is no timer
+# preempt, so a spawned secondary never gets CPU. Loads /bin/mishduplex (the mixer
+# SERVER) as a BACKGROUND ring-3 proc via the boot-CR3 dance (mirrors the spawn_path
+# #43 handler EXACTLY: boot-CR3 for the disk load, exec_env for a valid argv/envp
+# stack, proc_set_ring3 + EFER.SCE re-assert). mishduplex binds loopback:7701 + opens
+# the vani sink, then spawn_path's /bin/mishclient, which connects + streams a
+# square-wave tone (msh_client_*). The mixer fans it to vani (audio_* -> sys_snd_*
+# #64-69). kmain then IDLES via arch_wait so the LIVE scheduler round-robins BOTH
+# procs — the cooperative sched_yield #44 dance that replaces the old preempt-off
+# blocking writes (audio_write / sleep_ms), which starved the peer because the shared
+# per-CPU syscall kstack forbids the kernel preempting a blocking syscall (the
+# serial-kstack invariant; agnos-blocking-syscall-yield-fix). A foreground
+# exec_and_wait would PIN kmain and starve the client, so we load it as background.
+# scripts/mishran-duplex-audio-smoke.sh captures the HDA output + asserts a non-silent
+# wav = both procs interleaved, no deadlock, no starvation.
+#
+# net_ip = 127.0.0.1 (same as setu): no NIC in this QEMU (r8169 absent), so a loopback
+# SYN's src_ip would be 0 and the SYN-ACK (dst=0) fails net_is_loopback — the connect
+# would time out. Setting net_ip to loopback makes both the SYN and SYN-ACK lo_ring-
+# delivered, completing the on-device client->server handshake sans NIC.
+kprintln("mishran-duplex: loading mixer server bg", 39);
+net_ip = 0x7F000001;
+var dx_p = "/bin/mishduplex";
+if (sh_abspath(dx_p, 15) >= 0) {
+    var dx_cr3 = proc_get_cr3(proc_current_get());
+    cr3_load(0x1000);                    # boot CR3 maps the NVMe BAR for the disk load
+    exec_env_src_set(0);                 # default kernel env (HOME=/ PWD=/) — valid envp stack
+    exec_env_len_set(0);
+    var dx_pid = elf_load_from_file(&sh_path_buf, sh_path_len, dx_p, 15);
+    cr3_load(dx_cr3);                     # restore on EVERY path (matches #43)
+    if (dx_pid >= 0) {
+        proc_set_ring3(dx_pid);          # CS=0x23 / SS=0x1B (else iretq lands ring-0)
+        efer_sce_enable();               # make the scheduled server's first SYSCALL work
+        kprint("mishran-duplex: server pid=", 27); kprint_num(dx_pid); kprintln("", 0);
+        # flip READY *AFTER* the last kprint (console_lock — kmain silent hereafter so
+        # the scheduled procs' console writes never deadlock on a kmain-held lock; see
+        # the AETHERSAFHA_SETU note above).
+        proc_set_state(dx_pid, 1);       # READY — the scheduler will run it
+        while (1 == 1) { arch_wait(); }  # kmain idles SILENTLY; scheduler drives server + client
+    } else { kprintln("mishran-duplex: load FAILED", 27); }
+} else { kprintln("mishran-duplex: bad path", 24); }
+#endif
+
 #ifdef THREAD_SELFTEST
 # 1.44.0 opening bite: prove preemptive kernel-thread time-slicing + the preempt
 # gate on the live scheduler, then retire the test threads so boot continues.

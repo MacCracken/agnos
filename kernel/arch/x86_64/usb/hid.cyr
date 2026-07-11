@@ -417,6 +417,16 @@ fn hid_kbd_kick() {
 # (interrupt-driven xHCI), this loop needs to become event-type-aware.
 fn hid_poll() {
     if (hid_kbd_slot_id == 0) { return 0; }
+    # Re-arm interrupter 0 FIRST (before draining): write-1-clear IMAN.IP (bit 0), keep IE (bit 1)
+    # by writing 0x3 — the same value init used. Per xHCI 1.2 §5.5.2.1 an MSI-X message is generated
+    # on the IP 0->1 edge; if software leaves IP set the controller sends NO further MSI-X, so the
+    # interrupt-driven keyboard fires exactly ONCE and the hlt-blocked shell hangs. QEMU's xHCI
+    # model is lenient about this; real AMD FCH (1022:1639) enforces the edge — this was the iron-
+    # only "stuck after first USB-HID IRQ" hang. Clearing IP early means an event arriving mid-drain
+    # re-sets IP (0->1) and queues the next message, so nothing is missed. The slot-id guard above
+    # ensures xHCI init ran, so xhci_rt_base is valid before we touch the interrupter register.
+    var ir0 = xhci_rt_base + XHCI_RT_IR0_BASE;
+    xhci_rt_write32(ir0 + XHCI_IR_IMAN, 0x3);
     var processed = 0;
     var drained = 0;
     while (drained < 64) {       # bound — prevents runaway on corrupt cycle

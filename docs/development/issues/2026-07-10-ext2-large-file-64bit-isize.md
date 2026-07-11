@@ -4,6 +4,17 @@
 **Component:** `kernel/core/ext2.cyr` (read path)
 **Raised by:** the agnova sovereign ext2 *writer* (diskfmt `df_format_ext2` / `df_ext2_add_file`)
 
+> **RESOLVED — already implemented (2026-07-10). Filed on a stale comment, not the code.**
+> On re-derivation from the source, the kernel *already* does everything this issue asked for:
+> `ext2_inode_filesize` returns `lo | (hi << 32)` (64-bit); the read path (`ext2_read_file`), stat,
+> and symlink resolution all consume that; the block map already walks the triple-indirect tree;
+> and LARGE_FILE (ro_compat `0x2`) is **not** in `ro_danger`, so a large_file fs mounts read+write.
+> The "2 GiB cap" I quoted was a stale *comment* at `ext2.cyr:220` (since corrected) — the code never
+> capped. No kernel change is needed. The only residual is agnova-side and theoretical: its writer
+> stores 32-bit `i_size_lo` only, so a file in (4 GiB, 4.29 GiB] (its double-indirect ceiling) would
+> truncate its size and it doesn't set LARGE_FILE. No base-system file approaches that, so it is not
+> worth a change now; if ever needed, it is an agnova writer completeness item, not a kernel fix.
+
 ## Summary
 
 The kernel's ext2 reader caps a file's `i_size` at 2 GiB — `ext2_inode_size_lo` reads only

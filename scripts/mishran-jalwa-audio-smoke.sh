@@ -38,17 +38,16 @@ AGNOS="$ROOT/build/agnos"
 WORK="$ROOT/build/mishran-jalwa-smoke"; rm -rf "$WORK"; mkdir -p "$WORK"
 IMG="$WORK/agnos-mj.img"; SLOG="$WORK/serial.log"; WAV="$WORK/out.wav"
 
-echo "[1/5] Building /bin/mishrand --agnos (mixing daemon) + /bin/jalwa --agnos (play-probe)..."
-if ! ( cd "$MISHRAN_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius distlib && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build --agnos programs/mishrand.cyr build/mishrand-agnos ) >/tmp/mj-mishrand.log 2>&1; then
-    echo "  MISHRAND BUILD-FAIL (see /tmp/mj-mishrand.log)"; tail -8 /tmp/mj-mishrand.log; exit 1
+echo "[1/4] Regenerating mishran dist + building /bin/jalwa --agnos (in-process mixer proof)..."
+if ! ( cd "$MISHRAN_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius distlib ) >/tmp/mj-mishran.log 2>&1; then
+    echo "  MISHRAN DISTLIB-FAIL (see /tmp/mj-mishran.log)"; tail -8 /tmp/mj-mishran.log; exit 1
 fi
 if ! ( cd "$JALWA_ROOT" && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius deps && CYRIUS_NO_WARN_PIN_DRIFT=1 cyrius build --agnos programs/jalwa_play_probe.cyr build/jalwa-play-probe-agnos ) >/tmp/mj-jalwa.log 2>&1; then
     echo "  JALWA BUILD-FAIL (see /tmp/mj-jalwa.log)"; tail -8 /tmp/mj-jalwa.log; exit 1
 fi
-MISHRAND="$MISHRAN_ROOT/build/mishrand-agnos"
 JALWA="$JALWA_ROOT/build/jalwa-play-probe-agnos"
-[ -f "$MISHRAND" ] && [ -f "$JALWA" ] || { echo "  ERROR: a binary did not build"; exit 1; }
-echo "  /bin/mishrand $(stat -c %s "$MISHRAND") B   /bin/jalwa $(stat -c %s "$JALWA") B"
+[ -f "$JALWA" ] || { echo "  ERROR: jalwa did not build"; exit 1; }
+echo "  /bin/jalwa $(stat -c %s "$JALWA") B (mishran server+mixer is in-process)"
 
 echo "[2/5] Generating /tone.wav (S16 48k stereo 440 Hz square, ~1.5 s)..."
 python3 - "$WORK/tone.wav" <<'PY'
@@ -73,13 +72,12 @@ if ! env MISHRAN_JALWA_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/mj-kbuild.lo
 fi
 echo "  build/agnos $(stat -c %s "$AGNOS") B"
 
-echo "[4/5] Seeding ext2 (/bin/mishrand + /bin/jalwa + /tone.wav) + booting + intel-hda wav capture..."
+echo "[4/4] Seeding ext2 (/bin/jalwa + /tone.wav) + booting + intel-hda wav capture..."
 PART_OFFSET=$(( 33 * 1048576 ))
 PART_BYTES=$(( 200 * 1048576 ))
 PART_BLOCKS=$(( PART_BYTES / 4096 ))
 EXT2_FEATURES="^resize_inode,^dir_index,^metadata_csum,^64bit,^uninit_bg"
 SEED="$WORK/seed"; mkdir -p "$SEED/bin"
-cp "$MISHRAND" "$SEED/bin/mishrand"
 cp "$JALWA" "$SEED/bin/jalwa"
 cp "$WORK/tone.wav" "$SEED/tone.wav"
 
@@ -128,10 +126,10 @@ strings "$SLOG" | grep -aE "mishrand|jalwa|exec: |PANIC|FAULT|#PF" | sed 's/^/  
 rc=0
 strings "$SLOG" | grep -q "exec: running /bin/jalwa" \
     && echo "  PASS(1): jalwa started (primary, sh_exec'd)" || { echo "  FAIL(1): jalwa never started"; rc=1; }
-strings "$SLOG" | grep -q "jalwa: spawn /bin/mishrand pid=" \
-    && echo "  PASS(2): jalwa spawned the mixer daemon" || { echo "  FAIL(2): mishrand never spawned"; rc=1; }
+strings "$SLOG" | grep -q "jalwa: decoded /tone.wav" \
+    && echo "  PASS(2): jalwa decoded /tone.wav on agnos" || { echo "  FAIL(2): jalwa did not decode"; rc=1; }
 strings "$SLOG" | grep -q "jalwa: audio routed through the mishran mixer" \
-    && echo "  PASS(3): jalwa connected + routed THROUGH the mixer (not direct vani)" || { echo "  FAIL(3): jalwa did not route through the mixer"; rc=1; }
+    && echo "  PASS(3): jalwa's PCM routed THROUGH the mishran mixer (fan-in + gain + pump)" || { echo "  FAIL(3): jalwa did not route through the mixer"; rc=1; }
 if [ "$done_marker" -eq 1 ]; then
     echo "  PASS(4): jalwa play-probe ran to completion"
 else
