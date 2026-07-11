@@ -5,6 +5,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.0] — 2026-07-11 — Kernel GPU arc OPENS: bite F0 (GPU probe + register-aperture ID dump)
+
+Opens the **1.54.x kernel GPU arc** — *push pixels AND data through the GPU* (compute is the
+crown). Target: the archaemenid AMD Cezanne iGPU (`04:00.0`, `1002:1638`, gfx90c/GCN5 compute +
+DCN 2.1 display). This cut is **bite F0**, the read-only foundation the whole arc stands on;
+the register dump is **iron-only** (QEMU emulates no gfx90c/DCN). Full plan + bite ladder:
+`docs/development/planning/kernel-gpu-arc-154x.md`.
+
+### Added
+
+- **GPU probe + register-aperture ID dump (bite F0)** — `kernel/core/gpu.cyr` `gpu_probe()`:
+  locates the AMD Cezanne iGPU on PCI (exact `1002:1638`, then the other known gfx9-APU ids, then
+  an AMD display-class fallback), maps its **BAR5** (the 512 KB MMIO register aperture) UC, and
+  reads a few always-safe identity/liveness registers to prove the aperture is correctly addressed
+  before any later bite writes a page table (C1), a ring (C2), or a shader (C3): **NBIO/RCC
+  `STRAP0`** (the `[15:0]` device-id echo — the aperture-correctness anchor) + **`CONFIG_MEMSIZE`**
+  (UMA size in MB) + **GC `GB_ADDR_CONFIG`/`GRBM_STATUS`** (graphics-core liveness). Runs at boot
+  right after `hda_probe`. **Read-only** — no DMA, no firmware, no device-state writes.
+- **Renoir/gfx9 register-base table** — `kernel/core/gpu_regs.cyr`: the fixed IP base-segment
+  constants (GC `0x2000`, NBIO seg[2] `0xD20`, MMHUB, DCN seg[1] `0xC0`, MP0, SDMA0) + the F0
+  register offsets. The reg-base foundation every later bite (C0–C6 / P0–P6) builds on; derived
+  from Linux amdgpu `renoir_ip_offset.h` / `nbio_7_0_offset.h` / `gc_9_0_offset.h` +
+  `amdgpu_device.c` (BAR5 = rmmio, direct-vs-indirect access).
+- **`pci_enable_mem_space_idx`** — `kernel/core/pci.cyr`: sets PCI COMMAND bit1 (Memory Space)
+  only, **not** bit2 (Bus Master), for read-only MMIO register probes that must arm no DMA.
+  Full PCIe addressing via `idx`, like `pci_enable_bus_master_idx`.
+
+### Notes
+
+- Wired via `kernel/agnos.cyr` (includes after `hda.cyr`) + `kernel/core/main.cyr` (`gpu_probe()`
+  call after the HDA probes). **QEMU-validated**: `gpu_probe` runs at the right point and
+  gracefully no-ops on QEMU's non-AMD PCI (`gpu: no AMD GPU found`), boot stays clean to the agnsh
+  prompt, no fault. The iron dump + PASS/FALSIFY rubric live in agnosticos
+  `iron-nuc-zen-log.md#tracker-154x-f0`. `NOT` Cyrius-gated; iron-only.
+
 ## [1.53.14] — 2026-07-10 — xHCI USB-HID keyboard: AMD FCH `IMAN.IP` re-arm (the 1.53.x iron closeout)
 
 ### Fixed
