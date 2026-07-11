@@ -104,6 +104,23 @@ fn pci_enable_bus_master_idx(idx) {
     return 0;
 }
 
+# Memory-Space-only enable for read-only MMIO register probes (the GPU F0 bite,
+# 1.54.x). Sets PCI COMMAND bit1 (Memory Space) so BAR MMIO reads resolve, WITHOUT
+# bit2 (Bus Master) — a read-only probe must arm no DMA. Preserves every other
+# command bit. A GOP-lit iGPU already has bit1 set; this makes the probe
+# self-sufficient on a cold function. Full PCIe addressing via idx (bus/func from
+# the pci_busfunc side array), like pci_enable_bus_master_idx.
+fn pci_enable_mem_space_idx(idx) {
+    var slot = PciDev_slot(&pci_devs + idx * 32);
+    var bf = load64(&pci_busfunc + idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    var cmd = pci_read32(bus, slot, func, 4);
+    cmd = cmd | 0x2;   # bit1 = Memory Space Enable
+    pci_write32(bus, slot, func, 4, cmd);
+    return 0;
+}
+
 # Walk the standard PCI capability list for the device at pci_devs[idx]
 # and return the config-space offset of the first capability whose ID
 # matches `cap_id`. Returns 0 if not found. PCI 3.0 §6.7: cap list head

@@ -1,0 +1,121 @@
+# === Kernel GPU arc — bite F0: probe + register-aperture ID dump =============
+#
+# The first bite of the 1.54.x kernel GPU arc ("push pixels AND data through the
+# GPU"). F0 is the read-only foundation: find the AMD Cezanne iGPU on PCI, map
+# its BAR5 register aperture uncacheable, and read a few always-safe identity /
+# liveness registers to PROVE the aperture is correctly addressed before any
+# later bite writes a page table (C1 GPUVM), a command ring (C2 CP/MEC), or a
+# shader (C3). No DMA, no firmware, no device-state writes — the lowest-risk
+# possible first touch of the GPU.
+#
+# Iron-only: QEMU emulates no gfx90c/DCN, so on QEMU this either finds no AMD
+# display device (clean no-op) or a non-AMD VGA with no BAR5 (reported, skipped).
+# Validation: boot archaemenid, `klug > /f/gpu.txt`, read back the dump.
+#
+# Constants + the Renoir IP base table live in gpu_regs.cyr. Later bites (C0
+# firmware-reality, C1 GPUVM, C2 CP/MEC ring, P0 DCN pipe) build on this seam.
+
+var gpu_present  = 0;        # 1 = an AMD GPU was bound by F0
+var gpu_pci_idx  = 0 - 1;    # PCI enumeration index of the bound GPU
+var gpu_mmio     = 0;        # BAR5 register-aperture base (VA == PA, UC-mapped)
+
+# Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
+# DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
+# Direct path only (every F0 register has index*4 < GPU_RMMIO_SIZE); the
+# indirect PCIE_INDEX2/DATA2 (SMN) path is a later bite. Pure load — no state
+# change, so calling it does not perturb scanout or any engine.
+fn gpu_reg32(base_seg, off) {
+    return load32(gpu_mmio + (base_seg + off) * 4);
+}
+
+# Locate the iGPU: exact Cezanne id first, then the other known gfx9-APU ids,
+# then an AMD display-class fallback (guards against matching QEMU's non-AMD
+# VGA). Returns the pci_devs index, or -1.
+fn gpu_find() {
+    var idx = pci_find(GPU_VENDOR_AMD, GPU_DEV_CEZANNE);
+    if (idx >= 0) { return idx; }
+    idx = pci_find(GPU_VENDOR_AMD, GPU_DEV_RENOIR);
+    if (idx >= 0) { return idx; }
+    idx = pci_find(GPU_VENDOR_AMD, GPU_DEV_BARCELO);
+    if (idx >= 0) { return idx; }
+    idx = pci_find(GPU_VENDOR_AMD, GPU_DEV_LUCIENNE);
+    if (idx >= 0) { return idx; }
+    idx = pci_find_by_class(GPU_CLASS_DISPLAY, GPU_SUBCLASS_VGA, GPU_PROGIF_VGA);
+    if (idx >= 0) {
+        if (pci_vendor(idx) == GPU_VENDOR_AMD) { return idx; }
+    }
+    return 0 - 1;
+}
+
+# F0 — probe + ID dump. Returns 1 if the GPU was bound + aperture read, else 0.
+fn gpu_probe() {
+    var idx = gpu_find();
+    if (idx < 0) {
+        kprintln("gpu: no AMD GPU found", 21);
+        return 0;
+    }
+
+    # BAR5 = the 512 KB MMIO register aperture.
+    var bar = pci_bar_64(idx, GPU_BAR_MMIO);
+    if (bar == 0) {
+        kprintln("gpu: no MMIO BAR5", 17);
+        return 0;
+    }
+
+    # Read-only probe: enable PCI Memory-Space (so BAR reads resolve) but NOT
+    # bus-master — F0 arms no DMA. A GOP-lit iGPU already has Memory-Space set;
+    # this makes the probe self-sufficient on a cold function.
+    pci_enable_mem_space_idx(idx);
+
+    # Register file is uncacheable (the hda/ahci/nvme BAR-map idiom).
+    vmm_remap_uc_2mb(bar);
+
+    gpu_present = 1;
+    gpu_pci_idx = idx;
+    gpu_mmio    = bar;
+
+    kprint("gpu: found ", 11);
+    kprint_hex(pci_vendor(idx));
+    kprint(":", 1);
+    kprint_hex(pci_device(idx));
+    kprint(" [AMD gfx90c/DCN2.1] BAR5=0x", 28);
+    kprint_hex(bar & 0xFFFFFFFF);
+    kprintln(" UC", 3);
+
+    # NBIO/RCC — always-on bus interface; the strongest "aperture maps the right
+    # device" proof (STRAP0[15:0] echoes the PCI device id).
+    var strap0 = gpu_reg32(GPU_BASE_NBIO_2, GPU_R_RCC_STRAP0);
+    var strap_devid = strap0 & GPU_STRAP0_DEVID_MASK;
+    var strap_rev   = (strap0 >> 24) & 0xF;
+    var memsize = gpu_reg32(GPU_BASE_NBIO_2, GPU_R_CONFIG_MEMSIZE);
+
+    kprint("gpu: strap0=0x", 14);
+    kprint_hex(strap0 & 0xFFFFFFFF);
+    kprint(" devid=0x", 9);
+    kprint_hex(strap_devid);
+    kprint(" rev=", 5);
+    kprint_num(strap_rev);
+    kprint(" vram=", 6);
+    kprint_num(memsize);
+    kprintln("MB", 2);
+
+    # GC — powered pre-driver; proves the graphics-core bus responds, not just
+    # NBIO. (A power-gated GC reads 0 without meaning a mapping failure — STRAP0
+    # above is the aperture-correctness anchor; these are informational.)
+    var gbcfg = gpu_reg32(GPU_BASE_GC_0, GPU_R_GB_ADDR_CONFIG);
+    var grbm  = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
+
+    kprint("gpu: gb_addr_config=0x", 22);
+    kprint_hex(gbcfg & 0xFFFFFFFF);
+    kprint(" grbm_status=0x", 15);
+    kprint_hex(grbm & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    # F0 pass gate: the register aperture echoes THIS device's id via STRAP0.
+    if (strap_devid == pci_device(idx)) {
+        kprintln("gpu: F0 OK - register aperture live", 35);
+        return 1;
+    }
+    kprintln("gpu: F0 WARN - strap0 devid mismatch (aperture?)", 48);
+    return 1;
+}

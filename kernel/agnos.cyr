@@ -95,6 +95,8 @@ include "core/block.cyr"
 include "core/gpt.cyr"
 include "core/r8169.cyr"
 include "core/hda.cyr"          # HD-Audio (Azalia) output driver — 1.52.x audio arc
+include "core/gpu_regs.cyr"     # GPU register-base table (Renoir/gfx9 IP segments) — 1.54.x GPU arc
+include "core/gpu.cyr"          # kernel GPU arc — F0 probe + register-aperture ID dump (1.54.x)
 include "core/net.cyr"          # L2/L3 core: eth/arp/ipv4/udp transport + UDP listener table
 include "core/net_dhcp.cyr"      # net.cyr split (1.36.1) — order preserved → byte-identical
 include "core/net_icmp.cyr"

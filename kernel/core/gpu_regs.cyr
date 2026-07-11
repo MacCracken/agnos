@@ -1,0 +1,60 @@
+# === AMD GPU register-base table (Renoir / gfx9 IP family) ===================
+#
+# The reg-base foundation for the kernel GPU arc (1.54.x). AMD GPUs address
+# registers as a flat DWORD index = base_segment[IP] + register_offset, and the
+# MMIO byte offset = index * 4 into the register BAR (BAR5). Renoir/gfx9 needs
+# no runtime IP-discovery walk — the per-IP base segments are fixed silicon
+# constants (derived from Linux `renoir_ip_offset.h`; upstream reads the same
+# values from the HW discovery table). This module holds those constants plus
+# the register offsets each bite consumes; gpu.cyr does the reads.
+#
+# Target: archaemenid AMD Cezanne iGPU — PCI 1002:1638, gfx90c (GCN5 / Vega
+# ISA) compute + DCN 2.1 display. Convergent sources: Linux amdgpu
+# renoir_ip_offset.h / nbio_7_0_offset.h / gc_9_0_offset.h / dcn_2_1_0_offset.h
+# + amdgpu_device.c (BAR5 = rmmio; direct-vs-indirect access). Full plan +
+# bite ladder: agnos docs/development/planning/kernel-gpu-arc-154x.md.
+
+# --- PCI identity (function 0 = the iGPU) ---
+var GPU_VENDOR_AMD    = 0x1002;
+var GPU_DEV_CEZANNE   = 0x1638;   # Cezanne (Ryzen 7 5800H) — archaemenid
+# device-id 0x1638 is shared across the Renoir-family APUs; these are the other
+# known gfx9-APU iGPU ids used as find fallbacks before the class probe.
+var GPU_DEV_RENOIR    = 0x1636;
+var GPU_DEV_BARCELO   = 0x15E7;
+var GPU_DEV_LUCIENNE  = 0x164C;
+var GPU_CLASS_DISPLAY = 0x03;     # class: display controller
+var GPU_SUBCLASS_VGA  = 0x00;     # subclass: VGA compatible
+var GPU_PROGIF_VGA    = 0x00;
+
+# --- Register BAR ---
+# BAR5 = the MMIO register aperture (rmmio): 32-bit non-prefetchable, 512 KB
+# (0x80000). amdgpu selects BAR5 for rmmio on all gfx9 (>= CHIP_BONAIRE). For
+# context, BAR0 = VRAM/framebuffer aperture (large, 64-bit prefetchable) and
+# BAR2 = doorbell (64-bit prefetchable) — consumed by later bites (C1 GPUVM,
+# C2 CP/MEC doorbell), not F0.
+var GPU_BAR_MMIO      = 5;
+var GPU_RMMIO_SIZE    = 0x80000;  # 512 KB — regs with (index*4) < this are direct
+
+# --- IP base segments (Renoir instance[0]; primary segment per IP) ---
+# Absolute DWORD index = base + register_offset. Only the segments the arc
+# actually reaches are named; add rows per bite. (renoir_ip_offset.h.)
+var GPU_BASE_GC_0     = 0x2000;   # graphics/compute core, segment 0
+var GPU_BASE_NBIO_2   = 0xD20;    # NBIO/NBIF/RCC, segment 2 (STRAP0, MEMSIZE)
+var GPU_BASE_MMHUB_0  = 0x1A000;  # GMC / memory hub, segment 0 (C1 GPUVM)
+var GPU_BASE_DCN_1    = 0xC0;     # DCE/DCN 2.1 display, segment 1 (Thrust P)
+var GPU_BASE_MP0_0    = 0x16000;  # MP0 / PSP, segment 0 (C0 firmware-reality bite)
+var GPU_BASE_SDMA0_0  = 0x1260;   # SDMA engine 0, segment 0 (fallback data path)
+
+# --- Register offsets within their IP (DWORD) ---
+# NBIO/RCC — always-on bus interface; the safest reads on the GPU.
+var GPU_R_RCC_STRAP0     = 0x0F;  # mmRCC_DEV0_EPF0_STRAP0: [15:0]=device_id, [27:24]=rev
+var GPU_R_CONFIG_MEMSIZE = 0xC3;  # mmRCC_CONFIG_MEMSIZE: framebuffer/UMA size in MB
+# GC — powered pre-driver (GFXOFF is a driver-managed feature, not yet engaged).
+var GPU_R_GRBM_STATUS    = 0x04;  # mmGRBM_STATUS: GUI_ACTIVE + per-block busy bits
+var GPU_R_GB_ADDR_CONFIG = 0x63E; # mmGB_ADDR_CONFIG: pipe/bank/SE addressing config
+var GPU_R_GB_GPU_ID      = 0x640; # mmGB_GPU_ID: [3:0] GPU_ID (0 on a single-die APU)
+# DCN — meaningful only when the display block is powered (GOP-lit → usually yes).
+var GPU_R_DCE_VERSION    = 0x5E;  # mmDCE_VERSION: DCE/DCN version constant
+
+# --- Field masks ---
+var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id
