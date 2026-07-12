@@ -347,15 +347,23 @@ fn gpu_psp_setup() {
     }
     vmm_remap_uc_2mb(region);
     iommu_register_dma(region);
-    var tmr = pmm_alloc_2mb_run(2);
-    if (tmr == 0) {
-        kprintln("gpu: C1b TMR alloc FAIL", 23);
-        return 0;
-    }
-    vmm_remap_uc_2mb(tmr);
-    vmm_remap_uc_2mb(tmr + 0x200000);
-    iommu_register_dma(tmr);
-    iommu_register_dma(tmr + 0x200000);
+    # The 4 MB TMR must live in the GPU's VRAM/UMA carveout, NOT plain system RAM
+    # (1.54.3 sent phys 0x0f800000 → TEE_ERROR_BAD_PARAMETERS). Read the carveout
+    # physical base (FB_OFFSET) + MC-aperture base/top (FB_LOCATION_BASE/TOP) from the
+    # GFXHUB regs and place the TMR at the MIDDLE of the carveout (far from the low
+    # scanout FB + any top-of-carveout firmware). buf_phy_addr = MC addr (FB_BASE+k);
+    # system_phy_addr = true phys (FB_OFF+k). The CPU never touches the TMR (PSP-only
+    # scratch), so no alloc/map — just compute + pass its address.
+    var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
+    var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
+    var r_top  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_TOP)  & GPU_FB_LOC_MASK;
+    var fb_off  = r_off << 24;
+    var fb_base = r_base << 24;
+    var fb_top  = r_top << 24;
+    var carveout = fb_top - fb_base + 0x1000000;             # inclusive top, 16 MB granule
+    var k = (carveout >> 1) & 0xFFFFFFFFFFC00000;            # middle, 4 MB-aligned
+    var tmr_mc   = fb_base + k;
+    var tmr_phys = fb_off + k;
 
     var ring  = region;
     var cmd   = region + 0x8000;   # 4 KB-aligned (region is 2 MB-aligned)
@@ -395,16 +403,21 @@ fn gpu_psp_setup() {
     i = 0;
     while (i < 512) { store64(cmd + i * 8, 0); i = i + 1; }     # zero the 4 KB cmd buffer
     store32(cmd + 8,  GPU_PSP_CMD_SETUP_TMR);
-    store32(cmd + 28, tmr & 0xFFFFFFFF);
-    store32(cmd + 32, (tmr >> 32) & 0xFFFFFFFF);
+    store32(cmd + 28, tmr_mc & 0xFFFFFFFF);              # buf_phy_addr_lo = MC/aperture addr
+    store32(cmd + 32, (tmr_mc >> 32) & 0xFFFFFFFF);      # buf_phy_addr_hi
     store32(cmd + 36, GPU_PSP_TMR_SIZE);
     store32(cmd + 40, GPU_PSP_TMR_FLAGS);
-    store32(cmd + 44, tmr & 0xFFFFFFFF);
-    store32(cmd + 48, (tmr >> 32) & 0xFFFFFFFF);
+    store32(cmd + 44, tmr_phys & 0xFFFFFFFF);            # system_phy_addr_lo = true physical
+    store32(cmd + 48, (tmr_phys >> 32) & 0xFFFFFFFF);    # system_phy_addr_hi
     var status = gpu_psp_submit(ring, cmd, fence);
 
+    kprint("gpu: C1b fb_base=0x", 19);
+    kprint_hex(r_base);
+    kprint(" fb_top=0x", 10);
+    kprint_hex(r_top);
+    kprintln("", 0);
     kprint("gpu: C1b tmr=0x", 15);
-    kprint_hex(tmr & 0xFFFFFFFF);
+    kprint_hex(tmr_phys & 0xFFFFFFFF);
     kprint(" fence=0x", 9);
     kprint_hex(load32(fence));
     kprint(" status=0x", 10);

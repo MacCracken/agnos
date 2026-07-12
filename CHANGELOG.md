@@ -5,6 +5,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.4] — 2026-07-12 — GPU arc C1b-1 fix: the TMR must live in the VRAM carveout
+
+**The 1.54.3 SETUP_TMR burn (archaemenid) was a partial win:** `fence=0x1` — the PSP DMA-read our
+command buffer and DMA-wrote our fence at raw low kernel physical addresses, so **the entire ring /
+DMA / coherence mechanism is iron-proven and plain kernel memory is PSP-DMA-reachable** (the deep
+memory-domain unknown, answered YES). But SETUP_TMR returned `status=0xffff0006` =
+`TEE_ERROR_BAD_PARAMETERS` — the PSP rejected a TMR *parameter*. This cut fixes that parameter.
+
+### Fixed
+
+- **SETUP_TMR: place the Trusted Memory Region in the GPU's VRAM/UMA carveout** (`kernel/core/gpu.cyr`
+  `gpu_psp_setup`). 1.54.3 handed the PSP a 4 MB TMR in plain system RAM (`0x0f800000`) and sent the
+  same raw physical (with `hi=0`) in **both** `buf_phy_addr` and `system_phy_addr` — but with
+  `virt_phy_addr=1` those two fields must carry **different** views (the MC/GPU-aperture address vs
+  the true physical), and the TMR must lie inside the BIOS-reserved carveout, not arbitrary RAM.
+  **Fix:** read the GFXHUB FB-location registers — `mmMC_VM_FB_OFFSET` (carveout physical base),
+  `mmMC_VM_FB_LOCATION_BASE` (MC-aperture base), `mmMC_VM_FB_LOCATION_TOP` (all GC seg0, `[23:0]<<24`)
+  — place the 4 MB TMR at the middle of the carveout (4 MB-aligned; clear of the low scanout
+  framebuffer and any top-of-carveout firmware), and send `buf_phy_addr = FB_BASE+k` (MC) +
+  `system_phy_addr = FB_OFF+k` (true physical). The ring / cmd / fence buffers stay at low physical
+  addresses (proven this burn). The TMR needs no allocation or mapping — it is PSP-only scratch, so
+  the kernel just computes and passes its address. A diagnostic line
+  `gpu: C1b fb_base=0x.. fb_top=0x..` prints the carveout so the burn self-confirms the register read.
+  Root-caused from Linux amdgpu `psp_prep_tmr_cmd_buf` / `amdgpu_gmc.c` / `gc_9_0_offset.h`.
+
+### Notes
+
+- `0xffff0006` confirmed = GlobalPlatform `TEE_ERROR_BAD_PARAMETERS` (the AMD PSP Trusted-OS returns
+  GP TEE codes in `resp.status`). Iron-only. QEMU-validated (no-op off an AMD GPU); sweep 15/15.
+  Rubric + the full investigation: agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c1b1`. Re-burn
+  CONFIRM = `gpu: C1b = SETUP_TMR OK (PSP DMA live)`; then C1b-2 (`LOAD_IP_FW` RLC_G).
+
 ## [1.54.3] — 2026-07-11 — GPU arc bite C1b-1: PSP SETUP_TMR (the first real ring command / DMA round-trip)
 
 **C1a was iron-validated on archaemenid 2026-07-11** (the 1.54.2 burn): `C1a = GPCOM ring UP (PSP

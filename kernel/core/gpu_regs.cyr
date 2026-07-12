@@ -104,3 +104,13 @@ var GPU_PSP_TMR_FLAGS       = 0x2;         # cmd_tmr.tmr_flags: virt_phy_addr=1
 var GPU_PSP_RESP_STATUS     = 0x360;       # resp.status byte offset in the 4 KB cmd buffer (0=OK)
 var GPU_PSP_RING_DW_MASK    = 0x1FFF;      # wptr wrap: (ring 0x8000 bytes)/4 - 1 = 0x2000-1
 var GPU_FW_TYPE_RLC_G       = 8;           # psp_gfx_fw_type RLC_G (C1b-2)
+
+# C1b fix (iron 1.54.3: SETUP_TMR returned TEE_ERROR_BAD_PARAMETERS for a plain-RAM
+# TMR): the TMR must live in the GPU's VRAM/UMA carveout. Read the carveout from the
+# GFXHUB FB-location regs (GC seg0; the [23:0]<<24 / 16 MB-granule form). TMR physical =
+# FB_OFFSET + k; TMR MC/GPU addr = FB_LOCATION_BASE + k. Derived from gc_9_0_offset.h +
+# mmhub_v1_0.c/gfxhub_v1_0.c (base<<24) + amdgpu_gmc.c (vram_pa = mc2pa).
+var GPU_R_MC_VM_FB_OFFSET   = 0x96B;   # [23:0]<<24 = carveout PHYSICAL base (vram_base_offset)
+var GPU_R_MC_VM_FB_LOC_BASE = 0x980;   # [23:0]<<24 = carveout MC-aperture base (vram_start)
+var GPU_R_MC_VM_FB_LOC_TOP  = 0x981;   # [23:0]<<24 = carveout MC-aperture top (inclusive, 16 MB granule)
+var GPU_FB_LOC_MASK         = 0xFFFFFF;
