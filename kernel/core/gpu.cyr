@@ -18,6 +18,9 @@
 var gpu_present  = 0;        # 1 = an AMD GPU was bound by F0
 var gpu_pci_idx  = 0 - 1;    # PCI enumeration index of the bound GPU
 var gpu_mmio     = 0;        # BAR5 register-aperture base (VA == PA, UC-mapped)
+# C1: the PSP GPCOM ring — 32 KB usable + a page of alignment slack. Module-global
+# `var X[N]` = N x u64, so [4608] = 36 KB (32 KB ring rounded up to a page + slack).
+var gpu_psp_ring[4608];
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -26,6 +29,26 @@ var gpu_mmio     = 0;        # BAR5 register-aperture base (VA == PA, UC-mapped)
 # change, so calling it does not perturb scanout or any engine.
 fn gpu_reg32(base_seg, off) {
     return load32(gpu_mmio + (base_seg + off) * 4);
+}
+
+# MMIO register WRITE (UC, readback-flush) — the write twin of gpu_reg32. The
+# readback pushes the store past any posted-write reordering (the nvme/hda idiom).
+# Used by C1's PSP mailbox handshake. Do NOT call before F0 mapped BAR5.
+fn gpu_reg32_write(base_seg, off, val) {
+    var a = gpu_mmio + (base_seg + off) * 4;
+    store32(a, val);
+    var flush = load32(a);
+    return 0;
+}
+
+# Busy-spin >= us microseconds via rdtsc (the hda_udelay idiom; agnos has no
+# udelay). The PSP handshake needs ~20 ms settles between ring ops. HDA_TSC_MHZ=3000
+# (~3 GHz archaemenid TSC); invariant-TSC, ~constant per box.
+fn gpu_udelay(us) {
+    var t0 = rdtsc();
+    var target = us * 3000;
+    while ((rdtsc() - t0) < target) { }
+    return 0;
 }
 
 # Locate the iGPU: exact Cezanne id first, then the other known gfx9-APU ids,
@@ -179,5 +202,72 @@ fn gpu_fw_probe() {
         return 1;
     }
     kprintln("gpu: C0 = CASE B (ucode NOT loaded; PSP-load)", 45);
+    return 1;
+}
+
+# === C1a — PSP GPCOM ring-create + memory-domain probe ======================
+# The first bite of the C1 firmware-load sub-arc (C0 = CASE B: the microcode is
+# NOT resident, so agnos must drive the PSP to load it). C1a stands up the OS<->PSP
+# GPCOM command ring the firmware-load (C1b) submits LOAD_IP_FW frames over. This
+# bite is REGISTER-BASED only (DESTROY_RINGS + program the ring phys + INIT_GPCOM_
+# RING via C2PMSG_64) — it does NOT yet DMA the ring, so a WB kernel buffer is fine;
+# the ring/cmd/fence DMA + coherence is C1b's problem. It is the FIRST write to the
+# PSP (F0/C0 were read-only) — but this is exactly amdgpu's own per-boot init and
+# only sets up an inert command ring (display stays GOP-lit, no compute touched).
+#
+# Pass signal (iron): C2PMSG_64 reads back bit31 (RESPONSE) with low-16 status == 0
+# after INIT_GPCOM_RING ⟹ the PSP accepted the ring — the OS<->PSP channel is up.
+# A timeout ⟹ wrong C2PMSG offset OR the PSP won't accept this ring address (the
+# memory-domain question C1a0 flags). Iron-only; no-op off an AMD GPU.
+# Derived from Linux psp_v12_0.c (ring_create) + psp_gfx_if.h. NO firmware yet.
+fn gpu_psp_ring_create() {
+    if (gpu_present == 0) { return 0; }
+    # PSP must be alive (C0 read psp=0x698e82); a 0 SOL means no sOS to talk to.
+    var sol = gpu_reg32(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_81);
+    if (sol == 0) {
+        kprintln("gpu: C1a PSP not alive (SOL=0) - skip", 37);
+        return 0;
+    }
+
+    # Page-align the ring base within the slack buffer; zero the 32 KB ring.
+    var ring_phys = (&gpu_psp_ring + 0xFFF) & 0xFFFFFFFFFFFFF000;
+    var i = 0;
+    while (i < 4096) { store64(ring_phys + i * 8, 0); i = i + 1; }   # 32 KB = 4096 x u64
+
+    # DESTROY any stale KM ring first (amdgpu always does; benign / tolerated on a
+    # virgin OS ring), settle, then program the ring phys lo/hi/size + INIT the ring.
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_64, GPU_PSP_DESTROY_RINGS);
+    gpu_udelay(20000);
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_69, ring_phys & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_70, (ring_phys >> 32) & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_71, GPU_PSP_RING_SIZE);
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_64, GPU_PSP_INIT_GPCOM_RING);
+
+    # Poll C2PMSG_64 for the RESPONSE bit (~1 s budget: 50 x 20 ms).
+    var resp = 0;
+    i = 0;
+    while (i < 50) {
+        resp = gpu_reg32(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_64);
+        if ((resp & GPU_PSP_FLAG_RESPONSE) != 0) { break; }
+        gpu_udelay(20000);
+        i = i + 1;
+    }
+    var status = resp & GPU_PSP_STATUS_MASK;
+
+    kprint("gpu: C1a ring=0x", 16);
+    kprint_hex(ring_phys & 0xFFFFFFFF);
+    kprint(" resp=0x", 8);
+    kprint_hex(resp & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    if ((resp & GPU_PSP_FLAG_RESPONSE) != 0 && status == 0) {
+        kprintln("gpu: C1a = GPCOM ring UP (PSP accepted)", 39);
+        return 1;
+    }
+    if ((resp & GPU_PSP_FLAG_RESPONSE) != 0) {
+        kprintln("gpu: C1a = ring INIT error (status != 0)", 40);
+        return 1;
+    }
+    kprintln("gpu: C1a = ring INIT TIMEOUT (no response)", 42);
     return 1;
 }

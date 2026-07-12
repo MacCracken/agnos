@@ -79,3 +79,17 @@ var GPU_R_MP0_C2PMSG_81     = 0x91;   # MP0 seg0 — PSP secure-OS sign-of-life 
 var GPU_RLC_ENABLE_F32   = 0x1;         # RLC_CNTL bit0 — RLC running with ucode
 var GPU_CP_GFX_HALT_MASK = 0x14000000;  # CP_ME_CNTL: ME_HALT|PFP_HALT (set = gfx halted)
 var GPU_CP_MEC_ME1_HALT  = 0x40000000;  # CP_MEC_CNTL bit30 (set = MEC1 halted)
+
+# --- C1: PSP GPCOM ring / firmware-load mailbox (MP0 seg[0], base 0x16000) ---
+# C2PMSG_NN dword offset = 0x40 + NN — proven by C2PMSG_81 (0x91) reading psp=0x698e82
+# at C0. All DIRECT in BAR5. Derived from Linux psp_v12_0.c + psp_gfx_if.h.
+var GPU_R_MP0_C2PMSG_64  = 0x80;   # GPCOM cmd + response (bit31=RESPONSE, low16=status)
+var GPU_R_MP0_C2PMSG_67  = 0x83;   # ring write-pointer (bare-metal KM path; C1b)
+var GPU_R_MP0_C2PMSG_69  = 0x85;   # ring buffer phys LOW
+var GPU_R_MP0_C2PMSG_70  = 0x86;   # ring buffer phys HIGH
+var GPU_R_MP0_C2PMSG_71  = 0x87;   # ring buffer size (bytes)
+var GPU_PSP_RING_SIZE       = 0x8000;      # 32 KB GPCOM ring (512 x 64-byte frames)
+var GPU_PSP_DESTROY_RINGS   = 0x00030000;  # C2PMSG_64: GFX_CTRL_CMD_ID_DESTROY_RINGS
+var GPU_PSP_INIT_GPCOM_RING = 0x00020000;  # C2PMSG_64: PSP_RING_TYPE__KM(2)<<16 = INIT_GPCOM_RING
+var GPU_PSP_FLAG_RESPONSE   = 0x80000000;  # C2PMSG_64 bit31 = PSP responded
+var GPU_PSP_STATUS_MASK     = 0xFFFF;      # C2PMSG_64 low16 = status (0 = OK)

@@ -5,6 +5,40 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.2] — 2026-07-11 — GPU arc bite C1a: PSP GPCOM ring-create (the first write to the GPU)
+
+**C0 was iron-validated on archaemenid 2026-07-11** (the 1.54.1 burn): `C0 = CASE B` — the GPU's
+CP/MEC/RLC microcode is NOT resident, so agnos must drive the on-die PSP to load AMD-signed ucode.
+The user's firmware decision (2026-07-11): **ship the AMD-signed compute blobs (~628 KB, hardware-
+required like CPU microcode) + a display-only max-sovereignty tier** — recorded in the agnosticos
+firmware-provenance ledger. This cut opens the **C1 firmware-load sub-arc** with its first bite.
+
+### Added
+
+- **PSP GPCOM ring-create (bite C1a)** — `kernel/core/gpu.cyr` `gpu_psp_ring_create()`: stands up
+  the OS↔PSP GPCOM command ring that the firmware-load (C1b) submits `LOAD_IP_FW` frames over.
+  **Register-based only** — `DESTROY_RINGS` → program the ring phys lo/hi/size into
+  `C2PMSG_69/70/71` → `INIT_GPCOM_RING` via `C2PMSG_64`, then poll `C2PMSG_64` for the response bit
+  (bit31) + status. No ring DMA and no firmware yet, so a WB kernel buffer suffices. This is the
+  **first write to the GPU** (F0/C0 were read-only), but it is exactly amdgpu's own per-boot init —
+  it sets up an inert command ring; display stays GOP-lit, no compute/display state is touched.
+  Iron-only; no-op off an AMD GPU. Pass signal: `gpu: C1a = GPCOM ring UP (PSP accepted)`.
+- **PSP mailbox register table** — `kernel/core/gpu_regs.cyr`: the `C2PMSG_64/67/69/70/71` offsets
+  (dword = `0x40 + NN`, proven by C0's `C2PMSG_81` read) + the ring/command constants
+  (`INIT_GPCOM_RING` `0x00020000`, `DESTROY_RINGS` `0x00030000`, `RESPONSE` bit31). Derived from
+  Linux `psp_v12_0.c` + `psp_gfx_if.h`.
+- **`gpu_reg32_write` + `gpu_udelay`** — `kernel/core/gpu.cyr`: the UC readback-flushed MMIO write
+  twin of `gpu_reg32`, and an rdtsc busy-delay (the hda idiom) for the PSP handshake's ~20 ms
+  settles.
+
+### Notes
+
+- Wired via `kernel/core/main.cyr` (`gpu_psp_ring_create()` after the C0 probe). QEMU-validated
+  (no-op off an AMD GPU, boot clean); sweep 15/15. The register-only handshake is complete — **C1b**
+  (the first `LOAD_IP_FW` firmware round-trip) needs real buffer allocation (pmm/carveout) + UC/HDP
+  coherence for the ring/cmd/fence + the ~4 MB TMR. Rubric: agnosticos `iron-nuc-zen-log.md`
+  `#tracker-154x-c1a`.
+
 ## [1.54.1] — 2026-07-11 — GPU arc bite C0: firmware-reality check (+ the F0 STRAP0/pass-gate iron fix)
 
 **F0 was iron-validated on archaemenid 2026-07-11** (the 1.54.0 burn): the GPU register aperture is

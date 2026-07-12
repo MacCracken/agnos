@@ -169,6 +169,23 @@ P5 needs C1/C2). Batch read-only bites per burn where safe (F0+P0+C0 are read-on
    finding reshapes the ladder. **This is the make-or-break — investigate FIRST, report honestly.**
    Fallback if PSP-load proves ahead-of-its-time: SDMA copy-engine dispatch (simpler CP) may give a
    data path before full MEC — evaluate at C0.
+   **✅ RESOLVED 2026-07-11 (iron, agnos 1.54.1):** C0 = **CASE B** — CP/MEC/RLC ucode NOT resident
+   (`rlc=0x0` RLC off · `me=0x15000000`/`mec=0x50000000` CP+MEC halted · PSP alive `psp=0x698e82` ·
+   GFX powered) — adversarially confirmed vs primary AMD sources. So **C1 = drive the PSP GPCOM
+   firmware-load handshake.** **Firmware decision (user, 2026-07-11): "ship blobs + sovereignty
+   tier"** — bundle the ~628 KB AMD-signed compute subset (`renoir_*.bin`, hardware-required firmware
+   like CPU microcode) + a display-only zero-blob max-sovereignty tier; keep the claim precise
+   ("sovereign except the vendor microcode"); firmware-provenance ledger in docs. See
+   [[project_firmware_blob_posture]]. **C1 bite ladder:** C1a0 GPU-addressable-memory probe (highest-
+   impact unknown — where PSP-DMA buffers live) → C1a PSP-ready + GPCOM ring-create + SETUP_TMR →
+   **C1b one-firmware round-trip (RLC_G, the make-or-break)** → C1c full RLC+MEC set (LOAD_IP_FW per
+   blob, PSP validates AMD's signature) → C1d start engines (RLC_CNTL bit0, then clear CP_ME_CNTL /
+   CP_MEC_CNTL halts) + Case-A re-read (the Case-B→A flip = the compute-thrust gate). **Fold in at
+   C1d:** the F0 latent bug — the Case-A guard's `mec_hdr != 0` is defeated by the `0xdef0def0`
+   no-ucode sentinel (add `GPU_CP_HEADER_EMPTY = 0xdef0def0`; or replace the FIFO accessor with a
+   positive ucode-presence read). Full C1 protocol + firmware-set + load-order + the load-bearing
+   unknowns (memory domain, TMR size, per-blob payload byte-range, HDP coherence) → the C0-verify/
+   C1-plan workflow output; re-derive against amdgpu `psp_v12_0.c` / `psp_gfx_if.h` before C1b's burn.
 2. **GPUVM page-table format** (C1) — gfx9 multi-level PTE/PDE encoding + TLB-flush must be exact;
    a wrong PTE reads garbage. Derive from `gmc_v9_0.c`.
 3. **Shader ISA** (C3) — hand-assembled gfx90c kernels are the MVP (LLVM assembler validates); a
