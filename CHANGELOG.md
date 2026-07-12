@@ -5,6 +5,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.5] — 2026-07-12 — GPU arc bite C1b-2: LOAD_IP_FW RLC_G (the first real firmware into the GPU)
+
+**C1b-1 was iron-validated on archaemenid** (the 1.54.4 re-burn): `SETUP_TMR OK (PSP DMA live)`,
+`status=0x0` — the sovereign kernel drove the PSP through a complete firmware-load command and
+established the 4 MB Trusted Memory Region in the VRAM carveout. The entire PSP firmware-load path
+(ring → RB-frame → DMA both ways → fence → a successful command) is proven end-to-end. This cut takes
+the last step before the GPU engines can run: feed the PSP a **real AMD-signed microcode blob**.
+
+### Added
+
+- **LOAD_IP_FW RLC_G — the first real firmware into the GPU (bite C1b-2)** — `kernel/core/gpu.cyr`
+  `gpu_fw_load()`: reads `renoir_rlc.bin` from the agnos-fs (`/fw/rlc.bin`), parses the amdgpu
+  `common_firmware_header` (`ucode_size_bytes` @ +0x14, `ucode_array_offset_bytes` @ +0x18), reads the
+  payload slice into a low-physical UC buffer past the ring/cmd/fence (low phys is PSP-DMA-reachable,
+  proven at 1.54.4), and submits `GFX_CMD_ID_LOAD_IP_FW` (fw_type `RLC_G`=8) over the established
+  ring + TMR via the iron-validated `gpu_psp_submit`. The PSP validates AMD's RSA signature, decrypts,
+  and DMAs the plaintext ucode into the TMR. Runs **after the FS mount** (`main.cyr`, post
+  `vfs_mount_init`) since it needs `vfs_read_file_at`; reuses the ring/TMR `gpu_psp_setup` set up early.
+  Pass signal: `gpu: C1b-2 = RLC_G LOADED (PSP validated sig)` (`status=0x0`). Derived from amdgpu
+  `amdgpu_ucode.c` (payload range) + `psp_gfx_if.h` (the cmd union).
+
+### Notes
+
+- The RLC compute microcode blob (`renoir_rlc.bin`, 39,928 B — payload 16,896 B) is staged into the
+  agnos rootfs at `build/rootfs/fw/rlc.bin` → agnos-fs `/fw/rlc.bin`; **flash with `--update-all`**
+  (ESP kernel + agnos-fs) so both the kernel and the firmware reach the box. It is AMD-signed,
+  hardware-required firmware — per the sovereignty decision + `docs/firmware-provenance.md`. Iron-only;
+  QEMU-validated (no-op off an AMD GPU); adversarially verified vs the amdgpu source. Rubric:
+  agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c1b2`. Next: C1c (the rest of the CP/MEC set) + C1d
+  (start engines → C0 flips to Case A).
+
 ## [1.54.4] — 2026-07-12 — GPU arc C1b-1 fix: the TMR must live in the VRAM carveout
 
 **The 1.54.3 SETUP_TMR burn (archaemenid) was a partial win:** `fence=0x1` — the PSP DMA-read our

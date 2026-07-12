@@ -431,3 +431,77 @@ fn gpu_psp_setup() {
     kprintln("gpu: C1b = SETUP_TMR FAIL (fence/status)", 40);
     return 1;
 }
+
+# === C1b-2 — LOAD_IP_FW (RLC_G): the first real firmware into the GPU ========
+# The finale of the C1 firmware-load sub-arc. C1b-1 established the ring + TMR
+# (iron-proven, status 0); C1b-2 submits a REAL AMD-signed microcode blob over
+# the same, now-proven ring: the PSP validates AMD's RSA signature, decrypts, and
+# DMAs the plaintext ucode into the TMR. Reads `renoir_rlc.bin` (staged into the
+# agnos-fs at /fw/rlc.bin, the AMD compute subset the firmware-provenance ledger
+# tracks): parses the amdgpu common_firmware_header (ucode_size_bytes @ +0x14,
+# ucode_array_offset_bytes @ +0x18), reads the payload slice into the low-phys UC
+# buffer past ring/cmd/fence (low phys is PSP-DMA-reachable, proven at 1.54.4), and
+# submits GFX_CMD_ID_LOAD_IP_FW (fw_type RLC_G=8). Runs AFTER the FS mount (needs
+# vfs_read_file_at), reusing gpu_psp_ring2/cmd/fence set up early by gpu_psp_setup.
+# Derived from amdgpu_ucode.c (payload range) + psp_gfx_if.h. status 0 = the PSP
+# validated the signature + loaded RLC_G — the first sovereign firmware on the GPU.
+fn gpu_fw_load() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_psp_ring2 == 0) { return 0; }   # gpu_psp_setup must have run (ring + TMR up)
+
+    var ring    = gpu_psp_ring2;
+    var cmd     = gpu_psp_cmd;
+    var fence   = gpu_psp_fence;
+    var payload = ring + 0xA000;   # UC, 4 KB-aligned, in the setup region past ring/cmd/fence
+
+    # Read the RLC blob's common_firmware_header (first 32 B) to locate its payload.
+    var hdr[32];                   # function-local var X[N] = N BYTES → 32 B
+    var rc = vfs_read_file_at("/fw/rlc.bin", 11, 0, &hdr, 32);
+    if (rc <= 0) {
+        kprintln("gpu: C1b-2 RLC blob not found (/fw/rlc.bin)", 43);
+        return 0;
+    }
+    var uc_size = load32(&hdr + 0x14) & 0xFFFFFFFF;   # ucode_size_bytes
+    var uc_off  = load32(&hdr + 0x18) & 0xFFFFFFFF;   # ucode_array_offset_bytes
+    if (uc_size == 0 || uc_size > 0x100000) {
+        kprint("gpu: C1b-2 bad RLC header size=0x", 33);
+        kprint_hex(uc_size);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # Read the payload [uc_off, uc_off+uc_size) straight into the UC payload buffer.
+    rc = vfs_read_file_at("/fw/rlc.bin", 11, uc_off, payload, uc_size);
+    if (rc <= 0) {
+        kprintln("gpu: C1b-2 RLC payload read FAIL", 32);
+        return 0;
+    }
+
+    # LOAD_IP_FW: cmd_id=0x6 @ +8; fw_phy_addr @ +28/+32 = payload; fw_size @ +36;
+    # fw_type=RLC_G(8) @ +40. Reuse the proven submit + the established TMR.
+    var i = 0;
+    while (i < 512) { store64(cmd + i * 8, 0); i = i + 1; }   # zero the 4 KB cmd buffer
+    store32(cmd + 8,  GPU_PSP_CMD_LOAD_IP_FW);
+    store32(cmd + 28, payload & 0xFFFFFFFF);
+    store32(cmd + 32, (payload >> 32) & 0xFFFFFFFF);
+    store32(cmd + 36, uc_size);
+    store32(cmd + 40, GPU_FW_TYPE_RLC_G);
+    var status = gpu_psp_submit(ring, cmd, fence);
+
+    kprint("gpu: C1b-2 rlc off=0x", 21);
+    kprint_hex(uc_off);
+    kprint(" sz=0x", 6);
+    kprint_hex(uc_size);
+    kprint(" fence=0x", 9);
+    kprint_hex(load32(fence));
+    kprint(" status=0x", 10);
+    kprint_hex(status & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    if (load32(fence) == gpu_psp_fctr && status == 0) {
+        kprintln("gpu: C1b-2 = RLC_G LOADED (PSP validated sig)", 45);
+        return 1;
+    }
+    kprintln("gpu: C1b-2 = LOAD_IP_FW FAIL", 28);
+    return 1;
+}

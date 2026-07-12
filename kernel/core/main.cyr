@@ -823,6 +823,14 @@ exfat_init();
 # the old ext2_active-flag toggle that hid FAT/exFAT behind a mounted ext2.
 vfs_mount_init();
 
+# GPU arc C1b-2 (1.54.x) — LOAD_IP_FW RLC_G: the first real firmware into the GPU.
+# Runs HERE (after the FS mounts) because it reads the AMD-signed RLC microcode from
+# the agnos-fs (/fw/rlc.bin) and feeds it to the PSP over the ring + TMR that
+# gpu_psp_setup established early (C1a/C1b-1). The PSP validates AMD's signature +
+# loads it. No-op if F0 didn't bind a GPU or the ring/TMR aren't up. Iron-only.
+# See kernel/core/gpu.cyr gpu_fw_load().
+gpu_fw_load();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif
