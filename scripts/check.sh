@@ -59,7 +59,7 @@ check "version in changelog" $?
 echo ""
 echo "--- Binary ---"
 SZ=$(wc -c < "$ROOT/build/agnos")
-test "$SZ" -gt 50000 && test "$SZ" -lt 1500000
+test "$SZ" -gt 50000 && test "$SZ" -lt 1560000
 check "binary size ($SZ bytes)" $?
 
 echo ""

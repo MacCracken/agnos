@@ -1563,19 +1563,20 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # into the user buffer, OLDEST→NEWEST. Returns bytes written (≤ len, ≤ the
         # ring fill), or -1 on a bad buffer. When the buffer is smaller than the
         # log, returns the NEWEST `len` bytes (the dmesg tail). Linear fill: oldest
-        # at offset 0. Wrapped (klug_count saturated at 16384): oldest sits at
-        # klug_head; the (idx & 0x3FFF) mask unwraps both cases uniformly. Reads
+        # at offset 0. Wrapped (klug_count saturated at 65536): oldest sits at
+        # klug_head; the (idx & 0xFFFF) mask unwraps both cases uniformly. Reads
         # ONLY klug_buf (never other kernel memory) so it can't leak past the log.
+        # 64 KB ring (klug.cyr); the userland klug tool's buffer must match.
         if (is_user_range(arg1, arg2) == 0) { stack_canary_check(canary); return 0 - 1; }
         var kl_avail = klug_count;
         var kl_want = arg2;
         if (kl_want > kl_avail) { kl_want = kl_avail; }
         var kl_oldest = 0;
-        if (klug_count >= 16384) { kl_oldest = klug_head; }
-        var kl_start = (kl_oldest + (kl_avail - kl_want)) & 0x3FFF;   # newest kl_want bytes
+        if (klug_count >= 65536) { kl_oldest = klug_head; }
+        var kl_start = (kl_oldest + (kl_avail - kl_want)) & 0xFFFF;   # newest kl_want bytes
         var kl_w = 0;
         while (kl_w < kl_want) {
-            store8(arg1 + kl_w, load8(&klug_buf + ((kl_start + kl_w) & 0x3FFF)));
+            store8(arg1 + kl_w, load8(&klug_buf + ((kl_start + kl_w) & 0xFFFF)));
             kl_w = kl_w + 1;
         }
         stack_canary_check(canary);

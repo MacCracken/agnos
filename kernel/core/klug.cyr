@@ -7,27 +7,35 @@
 # That's the sovereign split the name encodes: the kernel UNIFIES the logs; GREP
 # stays a userland capability, so no string-matching machinery enters the kernel.
 #
-# 16 KB circular byte buffer. NOTE the Cyrius var-array unit rule (CLAUDE.md):
-# a module-global `var X[N]` allocates N * u64 = 8N bytes, so `var klug_buf[2048]`
-# is 2048 * 8 = 16384 bytes, indexed as bytes [0, 16383] via store8/load8. The
-# size is 2^14 so the wrap is a mask (& 0x3FFF), not a modulo. When the ring
-# fills, the oldest bytes are overwritten (dmesg-style aging). 16 KB holds the
-# whole boot log (~4 KB) several times over; sized modestly because Cyrius emits
+# 64 KB circular byte buffer. NOTE the Cyrius var-array unit rule (CLAUDE.md):
+# a module-global `var X[N]` allocates N * u64 = 8N bytes, so `var klug_buf[8192]`
+# is 8192 * 8 = 65536 bytes, indexed as bytes [0, 65535] via store8/load8. The
+# size is 2^16 so the wrap is a mask (& 0xFFFF), not a modulo. When the ring
+# fills, the oldest bytes are overwritten (dmesg-style aging).
+#
+# ⚠ SIZED FOR THE FULL IRON BOOT LOG. The old 16 KB assumed a ~4 KB boot log, but
+# the log grew past it (GPU arc F0..C2x ~3 KB + full iron USB/device enumeration +
+# SMP push a clean iron boot to ~16-20 KB) — so the ring WRAPPED and the earliest
+# lines were lost (the `klug` tool faithfully returned the last 16 KB; the kernel
+# stops feeding the ring at the kybernet userland handoff, so the ring's newest
+# byte is ~kybernet and it held only the 16 KB before it). 64 KB holds the whole
+# boot log ~3x over with headroom for the rest of the arc. The userland `klug`
+# tool's read buffer + KLUG_RING_BYTES MUST match this size (they're bumped in
+# lockstep, else the tool only pulls its buffer's worth of the tail). Cyrius emits
 # module-global arrays as file-resident zero-data (not .bss), so the buffer costs
-# its full size in the kernel image — bump KLUG bytes/mask/cap together if a
-# deeper runtime log is wanted and the image budget allows.
+# its full size in the kernel image — the check.sh size ceiling was raised to suit.
 
-var klug_buf[2048];        # 16 KB (2048 * 8)
-var klug_head = 0;         # next write offset, 0..16383
-var klug_count = 0;        # total bytes captured, saturates at 16384 (wrap flag)
+var klug_buf[8192];        # 64 KB (8192 * 8)
+var klug_head = 0;         # next write offset, 0..65535
+var klug_count = 0;        # total bytes captured, saturates at 65536 (wrap flag)
 
 # Append one byte. The whole capture path is pure store8 + integer math — it must
 # never call kprint/serial/fb (that would recurse through the tap), so it can run
 # safely from the earliest boot, before any console backend is up.
 fn klug_putc(ch) {
     store8(&klug_buf + klug_head, ch & 0xFF);
-    klug_head = (klug_head + 1) & 0x3FFF;
-    if (klug_count < 16384) { klug_count = klug_count + 1; }
+    klug_head = (klug_head + 1) & 0xFFFF;
+    if (klug_count < 65536) { klug_count = klug_count + 1; }
     return 0;
 }
 
@@ -36,8 +44,8 @@ fn klug_append(buf, len) {
     var i = 0;
     while (i < len) {
         store8(&klug_buf + klug_head, load8(buf + i));
-        klug_head = (klug_head + 1) & 0x3FFF;
-        if (klug_count < 16384) { klug_count = klug_count + 1; }
+        klug_head = (klug_head + 1) & 0xFFFF;
+        if (klug_count < 65536) { klug_count = klug_count + 1; }
         i = i + 1;
     }
     return 0;
@@ -64,7 +72,7 @@ fn klug_dump() {
     var begin = "KLUG-DUMP-BEGIN\n";
     serial_print(begin, 16); fb_print(begin, 16);
     var n = klug_head;
-    if (klug_count >= 16384) { n = 16384; }     # wrapped — emit the whole ring (best-effort)
+    if (klug_count >= 65536) { n = 65536; }     # wrapped — emit the whole ring (best-effort)
     serial_print(&klug_buf, n);
     fb_print(&klug_buf, n);
     var endm = "\nKLUG-DUMP-END\n";
