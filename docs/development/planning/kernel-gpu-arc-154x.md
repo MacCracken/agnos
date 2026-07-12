@@ -186,6 +186,15 @@ P5 needs C1/C2). Batch read-only bites per burn where safe (F0+P0+C0 are read-on
    positive ucode-presence read). Full C1 protocol + firmware-set + load-order + the load-bearing
    unknowns (memory domain, TMR size, per-blob payload byte-range, HDP coherence) → the C0-verify/
    C1-plan workflow output; re-derive against amdgpu `psp_v12_0.c` / `psp_gfx_if.h` before C1b's burn.
+   **✅ C1 PROGRESS (iron, archaemenid):** C1a0+C1a (1.54.2) GPCOM ring UP · C1b-1 (1.54.4) SETUP_TMR
+   `status=0x0` — memory domain answered (low kernel phys IS PSP-DMA-reachable; TMR must live in the
+   VRAM carveout, placed via GFXHUB FB-location regs) · **C1b-2 (1.54.5, 2026-07-12) LOAD_IP_FW RLC_G
+   `status=0x0` — the FIRST sovereign-loaded firmware on the GPU; PSP validated AMD's signature.** The
+   make-or-break round-trip is DONE. Remaining: **C1c** = the rest of the CP/MEC set (`renoir_ce/pfp/
+   me/mec/mec2/rlc` — same `LOAD_IP_FW` path, N more blobs, PSP validates each) → **C1d** = start
+   engines (RLC_CNTL bit0, then clear CP_ME_CNTL / CP_MEC_CNTL halts) + Case-A re-read, folding in the
+   `mec_hdr != 0` / `0xdef0def0` guard fix. Payload byte-range unknown = CONFIRMED (`common_firmware_
+   header` `ucode_size_bytes`@0x14 / `ucode_array_offset_bytes`@0x18; RLC_G was `[0x100,+0x4200)`).
 2. **GPUVM page-table format** (C1) — gfx9 multi-level PTE/PDE encoding + TLB-flush must be exact;
    a wrong PTE reads garbage. Derive from `gmc_v9_0.c`.
 3. **Shader ISA** (C3) — hand-assembled gfx90c kernels are the MVP (LLVM assembler validates); a

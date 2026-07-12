@@ -831,6 +831,12 @@ vfs_mount_init();
 # See kernel/core/gpu.cyr gpu_fw_load().
 gpu_fw_load();
 
+# GPU arc C1c (1.54.x) — the rest of the CP/MEC set (CE/PFP/ME whole-body + MEC1
+# body+JT split) over the same proven ring+TMR. Renoir/gfx9.3.0 loads no MEC2; RLC
+# restore-lists (GFXOFF) deferred. Must run AFTER gpu_fw_load (RLC_G first). Iron-only.
+# See kernel/core/gpu.cyr gpu_fw_load_set().
+gpu_fw_load_set();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

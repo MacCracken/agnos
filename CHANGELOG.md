@@ -5,7 +5,53 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.6] — 2026-07-12 — GPU arc bite C1c: the rest of the CP/MEC firmware set
+
+**C1b-2 was iron-validated on archaemenid** (1.54.5): `gpu: C1b-2 = RLC_G LOADED (PSP validated
+sig)`, `status=0x0` — the first sovereign-loaded firmware on the GPU. With RLC_G proven and the
+`LOAD_IP_FW` mechanism live, this cut loads the REST of the CP/MEC microcode set over the same ring +
+TMR, so C1d can start the engines (→ C0 flips Case-B → Case-A).
+
+### Added
+
+- **The rest of the CP/MEC firmware set (bite C1c)** — `kernel/core/gpu.cyr` `gpu_fw_load_one()` +
+  `gpu_fw_load_set()`: a general `LOAD_IP_FW` primitive (whole-body / body-minus-JT / JT-slice,
+  reading `jt_offset@0x24` / `jt_size@0x28` from the gfx firmware header) driven by a load table,
+  submitting the CP engines over the iron-proven ring + TMR:
+  - **CP CE** (fw_type 3), **CP PFP** (2), **CP ME** (1) — whole-body loads (no `*_JT` split; the
+    GFX-ring engines; embedded JT rides inside the body).
+  - **CP MEC1 body** (fw_type 4, `[0x100,+0x41340)`) + **CP MEC1 jump-table** (fw_type 5,
+    `[0x41440,+0x380)`) — the compute crown, loaded as amdgpu does: the body with the trailing JT
+    stripped, then the JT as a separate submit routed to MEC jump-table RAM.
+  - **Renoir/gfx9.3.0 loads NO MEC2** (`gfx_v9_0_load_mec2_fw_bin_support()` returns false for IP
+    9.3.0; the single MEC ucode serves both pipes) — `CP_MEC_ME2` is unused. RLC restore-lists
+    (GFXOFF power-gating) deferred; keep GFXOFF off.
+  - fw_type values anchored on the iron-confirmed `RLC_G=8`; the MEC body/JT split, byte-ranges, and
+    load form derived + adversarially verified vs amdgpu `amdgpu_ucode.c` / `psp_gfx_if.h`
+    (web-confirmed, 3× `refuted=False`). `kernel/core/gpu_regs.cyr`: `GPU_FW_TYPE_CP_ME/PFP/CE/MEC/
+    MEC_ME1`.
+  - Pass signal: `gpu: C1c = ALL CP+MEC ucode LOADED (5/5, PSP validated)`.
+
+### Notes
+
+- The CP/MEC blobs (`renoir_ce/pfp/me/mec.bin` — linux-firmware gfx90c/green_sardine set) are staged
+  into the agnos rootfs at `build/rootfs/fw/{ce,pfp,me,mec}.bin` → agnos-fs `/fw/`; **flash with
+  `--update-all`** so all four reach the box (plus the existing `/fw/rlc.bin`). `mec2` is
+  byte-identical to `mec` (not separately staged; not loaded on gfx9.3.0). AMD-signed,
+  hardware-required firmware — see `docs/firmware-provenance.md`. Iron-only; QEMU no-op
+  (`gpu_present`-gated). The **MEC body-minus-JT signature-validation** is the one genuinely-new
+  thing this bite proves on iron (C1b-2 only proved a whole-body blob validates). Rubric: agnosticos
+  `iron-nuc-zen-log.md` `#tracker-154x-c1c`. Next: **C1d** (start engines — `RLC_CNTL` bit0 + clear
+  `CP_ME_CNTL` / `CP_MEC_CNTL` halts → re-read C0 for the Case-B → Case-A flip = the compute-thrust
+  gate; fold in the F0 `mec_hdr != 0` / `0xdef0def0` latent-guard fix).
+
 ## [1.54.5] — 2026-07-12 — GPU arc bite C1b-2: LOAD_IP_FW RLC_G (the first real firmware into the GPU)
+
+**✅ IRON-VALIDATED on archaemenid (2026-07-12):** `gpu: C1b-2 = RLC_G LOADED (PSP validated sig)` —
+`off=0x100 sz=0x4200 fence=0x2 status=0x0`, matching the predicted rubric exactly. The PSP validated
+AMD's RSA signature and loaded RLC_G into the GPU's secure SRAM — the **first sovereign-loaded firmware
+on the GPU**; the whole `LOAD_IP_FW` mechanism is proven on iron. Boot continued clean through it to
+`[ASSIST] >`. Unblocks C1c (rest of CP/MEC set) + C1d (start engines → Case A).
 
 **C1b-1 was iron-validated on archaemenid** (the 1.54.4 re-burn): `SETUP_TMR OK (PSP DMA live)`,
 `status=0x0` — the sovereign kernel drove the PSP through a complete firmware-load command and

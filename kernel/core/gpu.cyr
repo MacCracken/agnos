@@ -505,3 +505,109 @@ fn gpu_fw_load() {
     kprintln("gpu: C1b-2 = LOAD_IP_FW FAIL", 28);
     return 1;
 }
+
+# ── C1c — the rest of the CP/MEC firmware set ─────────────────────────────────
+# General single-firmware LOAD_IP_FW over the iron-proven ring/TMR/submit (C1b).
+# kind: 0 = whole body [uc_off, +uc_size); 1 = body-minus-JT (MEC body, strip the
+# trailing jump-table); 2 = JT slice [uc_off + jt_off*4, +jt_size*4). Reads the
+# gfx_firmware_header_v1_0 (ucode_size@0x14, ucode_array_off@0x18, jt_offset@0x24,
+# jt_size@0x28 — the last two in DWORDs). Returns 1 on PSP-accept (status 0), else 0.
+fn gpu_fw_load_one(path, path_len, fw_type, kind) {
+    if (gpu_psp_ring2 == 0) { return 0; }
+    var ring    = gpu_psp_ring2;
+    var cmd     = gpu_psp_cmd;
+    var fence   = gpu_psp_fence;
+    var payload = ring + 0xA000;   # same UC buffer C1b-2 proved DMA-reachable
+
+    var hdr[48];                   # function-local var X[N] = N BYTES; header spans to 0x2C
+    var rc = vfs_read_file_at(path, path_len, 0, &hdr, 48);
+    if (rc <= 0) {
+        kprint("gpu: C1c blob missing ft=0x", 27);
+        kprint_hex(fw_type);
+        kprintln("", 0);
+        return 0;
+    }
+    var uc_size = load32(&hdr + 0x14) & 0xFFFFFFFF;   # ucode_size_bytes
+    var uc_off  = load32(&hdr + 0x18) & 0xFFFFFFFF;   # ucode_array_offset_bytes
+    var jt_off  = load32(&hdr + 0x24) & 0xFFFFFFFF;   # jt_offset (DWORDs)
+    var jt_sz   = load32(&hdr + 0x28) & 0xFFFFFFFF;   # jt_size   (DWORDs)
+
+    var poff  = uc_off;
+    var psize = uc_size;
+    if (kind == 1) {                                  # MEC body: strip trailing JT
+        psize = uc_size - jt_sz * 4;
+    }
+    if (kind == 2) {                                  # MEC JT slice
+        poff  = uc_off + jt_off * 4;
+        psize = jt_sz * 4;
+    }
+    if (psize == 0 || psize > 0x100000) {
+        kprint("gpu: C1c bad size ft=0x", 23);
+        kprint_hex(fw_type);
+        kprint(" sz=0x", 6);
+        kprint_hex(psize);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # DMA-read the payload slice straight into the UC buffer.
+    rc = vfs_read_file_at(path, path_len, poff, payload, psize);
+    if (rc <= 0) {
+        kprint("gpu: C1c read FAIL ft=0x", 24);
+        kprint_hex(fw_type);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # LOAD_IP_FW: cmd_id @ +8; fw_phy_addr @ +28/+32; fw_size @ +36; fw_type @ +40.
+    var i = 0;
+    while (i < 512) { store64(cmd + i * 8, 0); i = i + 1; }
+    store32(cmd + 8,  GPU_PSP_CMD_LOAD_IP_FW);
+    store32(cmd + 28, payload & 0xFFFFFFFF);
+    store32(cmd + 32, (payload >> 32) & 0xFFFFFFFF);
+    store32(cmd + 36, psize);
+    store32(cmd + 40, fw_type);
+    var status = gpu_psp_submit(ring, cmd, fence);
+
+    kprint("gpu: C1c ft=0x", 14);
+    kprint_hex(fw_type);
+    kprint(" off=0x", 7);
+    kprint_hex(poff);
+    kprint(" sz=0x", 6);
+    kprint_hex(psize);
+    kprint(" st=0x", 6);
+    kprint_hex(status & 0xFFFFFFFF);
+    if (load32(fence) == gpu_psp_fctr && status == 0) {
+        kprintln(" OK", 3);
+        return 1;
+    }
+    kprintln(" FAIL", 5);
+    return 0;
+}
+
+# C1c driver — load the rest of the CP/MEC set. RLC_G already loaded (C1b-2). Renoir/
+# gfx9.3.0 loads NO MEC2 (gfx_v9_0_load_mec2_fw_bin_support()=false — the single MEC
+# ucode serves both pipes); RLC restore-lists (GFXOFF) deferred. CE/PFP/ME load WHOLE;
+# MEC = body (CP_MEC) + jump-table (CP_MEC_ME1). Order is functionally free except the
+# MEC body must precede its JT. Derived + adversarially verified vs amdgpu amdgpu_ucode.c
+# / psp_gfx_if.h (2026-07-12); the MEC body-minus-JT signature-validation is the one
+# genuinely-new thing this bite proves on iron (C1b-2 only proved a whole-body blob).
+fn gpu_fw_load_set() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_psp_ring2 == 0) { return 0; }
+    kprintln("gpu: C1c loading CP/MEC set...", 30);
+    var ok = 0;
+    ok = ok + gpu_fw_load_one("/fw/ce.bin",  10, GPU_FW_TYPE_CP_CE,      0);
+    ok = ok + gpu_fw_load_one("/fw/pfp.bin", 11, GPU_FW_TYPE_CP_PFP,     0);
+    ok = ok + gpu_fw_load_one("/fw/me.bin",  10, GPU_FW_TYPE_CP_ME,      0);
+    ok = ok + gpu_fw_load_one("/fw/mec.bin", 11, GPU_FW_TYPE_CP_MEC,     1);
+    ok = ok + gpu_fw_load_one("/fw/mec.bin", 11, GPU_FW_TYPE_CP_MEC_ME1, 2);
+    if (ok == 5) {
+        kprintln("gpu: C1c = ALL CP+MEC ucode LOADED (5/5, PSP validated)", 55);
+        return 1;
+    }
+    kprint("gpu: C1c = PARTIAL CP/MEC load ok=0x", 36);
+    kprint_hex(ok);
+    kprintln("", 0);
+    return 0;
+}
