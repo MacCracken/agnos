@@ -244,8 +244,18 @@ fn gpu_fw_probe() {
     var rlc_on     = rlc_cntl & GPU_RLC_ENABLE_F32;
     var gfx_halted = cp_me_cntl & GPU_CP_GFX_HALT_MASK;
     var mec_halted = mec_cntl & GPU_CP_MEC_ME1_HALT;
-    if (rlc_on != 0 && gfx_halted == 0 && mec_halted == 0 && mec_hdr != 0) {
-        kprintln("gpu: C0 = CASE A (ucode resident, running)", 42);
+    # Reliable Case-A = RLC running + gfx/MEC un-halted. The MEC1 header (a real value
+    # vs the 0xdef0def0 sentinel) is a BONUS ucode-fetch confirmation — the PSP DMA path
+    # may not repopulate the header-dump reg, so it does NOT gate the verdict (C1d fix:
+    # the old `mec_hdr != 0` clause both let the 0xdef0def0 sentinel through AND risked a
+    # false CASE B when a genuinely-running MEC left the header at the sentinel).
+    if (rlc_on != 0 && gfx_halted == 0 && mec_halted == 0) {
+        if (mec_hdr != 0 && mec_hdr != GPU_MEC_HDR_NONE) {
+            kprintln("gpu: C0 = CASE A (ucode running; MEC hdr live)", 46);
+        }
+        if (mec_hdr == 0 || mec_hdr == GPU_MEC_HDR_NONE) {
+            kprintln("gpu: C0 = CASE A (engines running; MEC hdr=sentinel)", 52);
+        }
         return 1;
     }
     kprintln("gpu: C0 = CASE B (ucode NOT loaded; PSP-load)", 45);
@@ -610,4 +620,96 @@ fn gpu_fw_load_set() {
     kprint_hex(ok);
     kprintln("", 0);
     return 0;
+}
+
+# ── C1d — start the engines (Case-B → Case-A flip) ────────────────────────────
+# The firmware is resident (C1c) but the engines are halted. C1d releases them:
+# RLC F32 (RLC_CNTL bit0) → CP-gfx un-halt (CP_ME_CNTL clear ME|PFP|CE) → CP-MEC1
+# un-halt (CP_MEC_CNTL=0). Order is load-bearing: RLC must run before the CP
+# un-halts (CP depends on RLC for clock/CSB state). Each write is followed by a
+# readback-guard — if a CNTL reads back unchanged the GC is clock/GFXOFF-gated and
+# we ABORT rather than un-halt into a gated pipe. Bare un-halt with NO rings/GPUVM/
+# HQD is safe (rptr==wptr==0 ⟹ no fetch ⟹ no VM walk ⟹ no CPU wedge — proven vs
+# gfx_v9_0 by the C1d derivation + 2-lens adversarial verify). No SOFT_RESET (it
+# would wipe PSP-loaded ucode); no init_csb / GFX-PG (deferred — GFXOFF stays off).
+# The reliable running-proof is halts-clear + RLC-on + GRBM idle; the MEC1 header
+# 0xdef0def0→real transition is a BONUS (the PSP DMA path may not repopulate the
+# header-dump reg, so it does NOT gate the verdict).
+fn gpu_engine_start() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_psp_ring2 == 0) { return 0; }   # firmware-load path ran (ring/TMR up)
+    kprintln("gpu: C1d starting engines...", 28);
+
+    # 1) RLC: set RLC_ENABLE_F32 (bit0) via RMW. MUST precede the CP un-halts.
+    var rlc0 = gpu_reg32(GPU_BASE_GC_1, GPU_R_RLC_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_1, GPU_R_RLC_CNTL, rlc0 | GPU_RLC_ENABLE_F32);
+    gpu_udelay(50);
+    var rlc1 = gpu_reg32(GPU_BASE_GC_1, GPU_R_RLC_CNTL);
+    kprint("gpu: C1d rlc 0x", 15);
+    kprint_hex(rlc0 & 0xFFFFFFFF);
+    kprint(" -> 0x", 6);
+    kprint_hex(rlc1 & 0xFFFFFFFF);
+    kprintln("", 0);
+    if ((rlc1 & GPU_RLC_ENABLE_F32) == 0) {
+        kprintln("gpu: C1d ABORT - RLC did not enable (CG/GFXOFF gated)", 53);
+        return 0;
+    }
+
+    # 2) CP-gfx un-halt: clear ME|PFP|CE halts (0x15000000) via RMW. Gated on RLC up.
+    var me0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_ME_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_ME_CNTL, me0 & 0xEAFFFFFF);
+    gpu_udelay(50);
+    var me1 = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_ME_CNTL);
+    kprint("gpu: C1d me  0x", 15);
+    kprint_hex(me0 & 0xFFFFFFFF);
+    kprint(" -> 0x", 6);
+    kprint_hex(me1 & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    # 3) CP-compute (MEC1 crown) un-halt: write 0 (amdgpu parity; MEC2 fused-absent
+    #    on gfx9.3.0 so clearing MEC_ME2_HALT is a no-op).
+    var mec0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL, 0);
+    gpu_udelay(50);
+    var mec1 = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL);
+    kprint("gpu: C1d mec 0x", 15);
+    kprint_hex(mec0 & 0xFFFFFFFF);
+    kprint(" -> 0x", 6);
+    kprint_hex(mec1 & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    # 4) MEC1 header — poll ~1 ms for the ucode-fetch transition. BONUS positive only.
+    var hdr = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_ME1_HEADER);
+    var t = 0;
+    while (t < 20) {
+        if (hdr != 0 && hdr != GPU_MEC_HDR_NONE) { t = 20; }
+        else { gpu_udelay(50); hdr = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_ME1_HEADER); t = t + 1; }
+    }
+    kprint("gpu: C1d mec-hdr 0x", 19);
+    kprint_hex(hdr & 0xFFFFFFFF);
+    if (hdr != 0 && hdr != GPU_MEC_HDR_NONE) {
+        kprintln(" (ucode fetch confirmed)", 24);
+    }
+    if (hdr == 0 || hdr == GPU_MEC_HDR_NONE) {
+        kprintln(" (sentinel - hdr not repopulated on PSP path)", 45);
+    }
+
+    # 5) Reliable verdict: RLC on + gfx/mec halts clear + GRBM idle (GUI_ACTIVE=0).
+    var grbm = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
+    kprint("gpu: C1d grbm 0x", 16);
+    kprint_hex(grbm & 0xFFFFFFFF);
+    kprintln("", 0);
+    var gfx_halt = me1 & GPU_CP_GFX_HALT_MASK;
+    var mec_halt = mec1 & GPU_CP_MEC_ME1_HALT;
+    var gui_busy = grbm & GPU_GRBM_GUI_ACTIVE;
+    if (gfx_halt == 0 && mec_halt == 0 && gui_busy == 0) {
+        kprintln("gpu: C1d = ENGINES RUNNING (rlc on, gfx+mec un-halted, idle)", 60);
+    }
+    if (gfx_halt != 0 || mec_halt != 0 || gui_busy != 0) {
+        kprintln("gpu: C1d = engines NOT clean (check halt/gui bits above)", 56);
+    }
+
+    # 6) Formal C0 re-read — expect the CASE B → CASE A flip.
+    gpu_fw_probe();
+    return 1;
 }

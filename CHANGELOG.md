@@ -5,7 +5,58 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.7] — 2026-07-12 — GPU arc bite C1d: start the engines (Case-B → Case-A flip)
+
+**C1c was iron-validated on archaemenid** (1.54.6): `gpu: C1c = ALL CP+MEC ucode LOADED (5/5, PSP
+validated)` — the whole compute microcode set resident in GPU engine SRAM. The engines were still
+*halted* (that's why C0 reads Case B). This cut releases them — the payoff bite of the C-thrust: when
+C0 flips Case-B → Case-A, the compute engine is running.
+
+### Added
+
+- **Start the engines (bite C1d)** — `kernel/core/gpu.cyr` `gpu_engine_start()`: RLC F32 enable
+  (`RLC_CNTL` bit0, RMW) → CP-gfx un-halt (`CP_ME_CNTL` clear `ME|PFP|CE HALT` = `0x15000000`, RMW) →
+  CP-MEC1 un-halt (`CP_MEC_CNTL = 0`; amdgpu parity — MEC2 is fused-absent on gfx9.3.0 so clearing
+  `MEC_ME2_HALT` is a no-op), each with `udelay(50)` + a **readback-guard** (a `CNTL` reading back
+  unchanged ⟹ the GC is clock/GFXOFF-gated ⟹ ABORT rather than un-halt into a gated pipe). Order is
+  load-bearing (RLC before the CP un-halts; the CP depends on the RLC for clock/CSB state). Then a
+  re-read of C0 for the **Case-B → Case-A** verdict. Bare un-halt with no rings/GPUVM/HQD is safe
+  (`rptr==wptr==0` ⟹ no fetch ⟹ no VM walk ⟹ no CPU wedge). **No `GRBM_SOFT_RESET`** (it would wipe
+  the PSP-loaded ucode); **no `init_csb` / GFX-PG** (deferred — GFXOFF stays off). Derived +
+  adversarially verified vs amdgpu `gfx_v9_0.c` (`rlc_start` / `cp_gfx_enable` / `cp_compute_enable`),
+  reconciled against the empirical C0 halt masks (`me=0x15000000`, `mec=0x50000000`); 2-lens refute
+  incl. a dedicated hang-risk pass, both `refuted=False`.
+  - Pass signal: `gpu: C1d = ENGINES RUNNING (rlc on, gfx+mec un-halted, idle)` then `gpu: C0 = CASE A`.
+
+### Fixed
+
+- **Case-A guard: the `mec_hdr != 0` clause** (`gpu_fw_probe`) — the gfx9 "no ucode fetched" value of
+  `CP_MEC_ME1_HEADER` is `0xdef0def0` (`!= 0`), which the old guard let through (false Case-A). The
+  header is now a **bonus** ucode-fetch confirmation reported separately, not a hard gate — the PSP DMA
+  load path may not repopulate the header-dump register even with a genuinely-running MEC, so a
+  sentinel-stuck header must not read as a failed start. The reliable Case-A verdict is RLC-running +
+  gfx/MEC un-halted (+ GRBM idle). `GPU_CP_GFX_HALT_MASK` widened `0x14000000 → 0x15000000` to also
+  catch a stuck `CE_HALT`. New constants: `GPU_MEC_HDR_NONE=0xdef0def0`, `GPU_GRBM_GUI_ACTIVE`.
+
+### Notes
+
+- No new firmware — C1d only starts the already-resident engines; the existing `/fw/*` staging is
+  unchanged (flash `--update-all` for the kernel). Iron-only; QEMU no-op (`gpu_present`-gated). Rubric:
+  agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c1d`. **This is the compute-thrust gate** — a Case-A
+  flip unblocks the C2+ ladder (GPUVM page tables → compute rings/HQD/doorbell → PM4 dispatch →
+  hand-assembled gfx90c shaders → rosnet/attn11 on the shader cores). Residual (only the burn decides):
+  whether the MEC1 header repopulates on the PSP path, and whether the RLC auto-engages GFXOFF/CG on a
+  bare bring-up (the readback-guards catch a gated pipe).
+
 ## [1.54.6] — 2026-07-12 — GPU arc bite C1c: the rest of the CP/MEC firmware set
+
+**✅ IRON-VALIDATED on archaemenid (2026-07-12):** `gpu: C1c = ALL CP+MEC ucode LOADED (5/5, PSP
+validated)` — all five loads `st=0x0` (CE `ft=0x3`, PFP `ft=0x2`, ME `ft=0x1`, MEC1 body `ft=0x4`
+`[0x100,+0x41340)`, MEC1 JT `ft=0x5` `[0x41440,+0x380)`), matching the predicted rubric line-for-line.
+The **MEC body-minus-JT `ft=0x4` watch-point cleared** — the PSP validated the first *JT-split* blob's
+signature on this silicon (C1b-2 only proved a whole-body blob). The entire CP/MEC compute microcode
+set is now resident in the GPU's engine SRAM; boot continued clean. Unblocks C1d (start engines →
+Case-B → Case-A flip).
 
 **C1b-2 was iron-validated on archaemenid** (1.54.5): `gpu: C1b-2 = RLC_G LOADED (PSP validated
 sig)`, `status=0x0` — the first sovereign-loaded firmware on the GPU. With RLC_G proven and the

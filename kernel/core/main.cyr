@@ -837,6 +837,13 @@ gpu_fw_load();
 # See kernel/core/gpu.cyr gpu_fw_load_set().
 gpu_fw_load_set();
 
+# GPU arc C1d (1.54.x) — start the engines: RLC F32 + CP-gfx un-halt + CP-MEC1
+# un-halt, then re-read C0 for the CASE B → CASE A flip (the compute-thrust gate).
+# Must run AFTER the CP/MEC ucode is resident (gpu_fw_load_set). Bare un-halt with
+# no rings/GPUVM is safe (no fetch → no CPU wedge). Iron-only; no-op off an AMD GPU.
+# See kernel/core/gpu.cyr gpu_engine_start().
+gpu_engine_start();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif
