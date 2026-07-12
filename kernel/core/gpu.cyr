@@ -33,6 +33,7 @@ var gpu_psp_fctr  = 0;       # monotonic fence counter (first submit = 1)
 # MC (FB-aperture) base. C2c/d build the ring/MQD here. Set by gpu_vm_setup.
 var gpu_arena_mc   = 0;      # MEC/FB-aperture MC address (pq_base = mc>>8)
 var gpu_arena_phys = 0;      # CPU physical address (UC-mapped)
+var gpu_queue_active = 0;    # C2c: 1 = MEC1/pipe0/queue0 mapped (HQD active, empty)
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -902,5 +903,97 @@ fn gpu_vm_setup() {
         return 1;
     }
     kprintln("gpu: C2b = GMC setup INCOMPLETE (check readbacks above)", 55);
+    return 0;
+}
+# ── C2c — map an EMPTY compute queue (MEC1/pipe0/queue0) ──────────────────────
+# The MEC is running (Case A) + the GMC is armed (C2b). C2c maps a compute queue via
+# DIRECT (non-HWS) HQD register programming: GRBM-select the slot, push the ~20 CP_HQD_*
+# registers from the CPU (ACTIVE written LAST), deselect. The ring stays EMPTY (wptr==
+# rptr==0) so the MEC makes ZERO memory accesses — this isolates the HQD-register recipe
+# from VM/fetch correctness (C2d rings the doorbell + does the first fetch). Offsets are
+# gfx9 gc_9_0_offset.h, anchor-validated against the iron-confirmed CP_MEC_CNTL/CP_ME_CNTL;
+# all base_idx 0. MQD/RPTR-report use FULL byte addrs; PQ/EOP bases are MC>>8. Doorbell is
+# ASSIGNED (DOORBELL_EN) but not rung. Derived + adversarially verified vs kfd_mqd_manager_v9
+# / gfx_v9_0.c; the queue is left in the carveout (FB-aperture, no page tables). Low hang-
+# risk: an active empty queue never dereferences the MQD or fetches the ring.
+fn gpu_queue_setup() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }   # C2b armed the arena
+
+    var ring_mc = gpu_arena_mc + GPU_VM_RING_SUBOFF;
+    var mqd_mc  = gpu_arena_mc + GPU_VM_MQD_SUBOFF;
+    var rptr_mc = gpu_arena_mc + GPU_VM_RPTR_SUBOFF;
+    var eop_mc  = gpu_arena_mc + GPU_VM_EOP_SUBOFF;
+    var mqd_phys  = gpu_arena_phys + GPU_VM_MQD_SUBOFF;
+    var rptr_phys = gpu_arena_phys + GPU_VM_RPTR_SUBOFF;
+    var eop_phys  = gpu_arena_phys + GPU_VM_EOP_SUBOFF;
+
+    # Zero the MQD save-area, rptr-report page, and EOP buffer (carveout, CPU UC).
+    var i = 0;
+    while (i < 512) { store64(mqd_phys  + i * 8, 0); i = i + 1; }
+    i = 0;
+    while (i < 512) { store64(rptr_phys + i * 8, 0); i = i + 1; }
+    i = 0;
+    while (i < 512) { store64(eop_phys  + i * 8, 0); i = i + 1; }
+    gpu_mfence();
+
+    # Precondition: clear the global CP wptr DMA-poll enable (so the CP never DMA-reads a
+    # memory wptr); then GRBM-select MEC1/pipe0/queue0/vmid0. The select..program..deselect
+    # must be one uninterrupted sequence (agnos is single-threaded; no lock needed).
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_PQ_WPTR_POLL_CNTL, 0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+
+    # 20 ordered HQD writes, CP_HQD_ACTIVE LAST.
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_EOP_BASE_ADDR,    (eop_mc >> 8) & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_EOP_BASE_ADDR_HI, ((eop_mc >> 8) >> 32) & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_EOP_CONTROL,      GPU_CP_HQD_EOP_CONTROL_VAL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MQD_BASE_ADDR,        mqd_mc & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MQD_BASE_ADDR_HI,     (mqd_mc >> 32) & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MQD_CONTROL,          GPU_CP_MQD_CONTROL_VAL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_BASE,          (ring_mc >> 8) & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_BASE_HI,       ((ring_mc >> 8) >> 32) & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_CONTROL,       GPU_CP_HQD_PQ_CONTROL_VAL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR_REPORT_ADDR,    rptr_mc & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR_REPORT_ADDR_HI, (rptr_mc >> 32) & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_POLL_ADDR,      0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_POLL_ADDR_HI,   0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_DOORBELL_CONTROL,    GPU_CP_HQD_DOORBELL_VAL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR,   0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, 0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_VMID,      0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PERSISTENT_STATE, GPU_CP_HQD_PERSISTENT_VAL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_ACTIVE,   0x1);   # ACTIVE — LAST
+
+    # Pass-signal readbacks WHILE selected, then deselect + read the global GRBM_STATUS.
+    var active = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_ACTIVE);
+    var rptr   = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR);
+    var db     = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_DOORBELL_CONTROL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+    var grbm = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
+
+    kprint("gpu: C2c pq=0x", 14);
+    kprint_hex((ring_mc >> 8) & 0xFFFFFFFF);
+    kprint(" mqd=0x", 7);
+    kprint_hex(mqd_mc);
+    kprintln("", 0);
+    kprint("gpu: C2c active=0x", 18);
+    kprint_hex(active & 0xFFFFFFFF);
+    kprint(" rptr=0x", 8);
+    kprint_hex(rptr & 0xFFFFFFFF);
+    kprint(" db=0x", 6);
+    kprint_hex(db & 0xFFFFFFFF);
+    kprint(" grbm=0x", 8);
+    kprint_hex(grbm & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    var act = active & 0x1;
+    var gui = grbm & GPU_GRBM_GUI_ACTIVE;
+    if (act != 0 && rptr == 0 && gui == 0) {
+        gpu_queue_active = 1;
+        kprintln("gpu: C2c = QUEUE MAPPED (MEC1 p0q0 active, empty, idle)", 55);
+        return 1;
+    }
+    kprintln("gpu: C2c = QUEUE MAP INCOMPLETE (check active/rptr/gui)", 55);
     return 0;
 }

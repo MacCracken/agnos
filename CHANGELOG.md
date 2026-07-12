@@ -5,6 +5,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.10] — 2026-07-12 — GPU arc bite C2c: map an empty compute queue + klug 64 KB log ring
+
+**C2b was iron-validated on archaemenid** (1.54.9): GMC ARMED, and the CPU can R/W the carveout DRAM
+(`cpuprobe` round-trip). This cut maps the first compute queue onto the running MEC, and — bundled —
+fixes the klug kernel-log ring that had grown too small to hold the full iron boot log.
+
+### Added
+
+- **Map an empty compute queue (bite C2c)** — `kernel/core/gpu.cyr` `gpu_queue_setup()`: builds a v9
+  compute queue on MEC1/pipe0/queue0 by **direct (non-HWS) HQD register programming** —
+  `GRBM_GFX_CNTL`-select the slot (`0x4`, MEID=1), clear the global `CP_PQ_WPTR_POLL_CNTL` DMA-poll,
+  push the ~20 `CP_HQD_*`/`CP_MQD_*` registers from the CPU (ring/MQD/rptr-report/EOP all in the C2b
+  carveout arena, addressed via the FB aperture — `PQ_BASE`/`EOP` as `MC>>8`, `MQD_BASE`/`RPTR_REPORT`
+  as full MC byte-addr), doorbell assigned (`DOORBELL_EN`, not rung), **`CP_HQD_ACTIVE=1` written
+  LAST**, then deselect. The ring stays **empty** (`wptr==rptr==0`) so the MEC makes zero memory
+  accesses — this isolates the HQD-register recipe from VM/fetch correctness (C2d rings the doorbell).
+  Pass signal: `gpu: C2c = QUEUE MAPPED (MEC1 p0q0 active, empty, idle)` — `CP_HQD_ACTIVE` bit0=1,
+  `CP_HQD_PQ_RPTR`=0, `GRBM_STATUS.GUI_ACTIVE`=0. `kernel/core/gpu_regs.cyr`: the C2c CP_HQD/CP_MQD
+  register group — offsets fetched from the full `gc_9_0_offset.h` and **anchor-validated against the
+  iron-confirmed `CP_MEC_CNTL=0x8d`/`CP_ME_CNTL=0x1b6`** (a contested gfx8-vs-gfx9 claim from the
+  adversarial pass was resolved against ground truth: `0x1245` is correct for gfx9). Low hang-risk;
+  three adversarial-verify passes (incl. a final code-level transcription check) + a boot smoke.
+
+### Fixed
+
+- **klug kernel-log ring 16 KB → 64 KB** (`core/klug.cyr` ring + mask + cap; the `core/syscall.cyr`
+  klug handler). The iron boot log outgrew 16 KB (the GPU arc + full device enumeration + SMP push a
+  clean boot to ~16–20 KB), so the ring **wrapped** dmesg-style and the earliest boot lines were lost —
+  the userland `klug` tool faithfully returned only the last 16 KB (which read as "the log stops at the
+  kybernet handoff"). The kernel ring and the userland tool's buffer + `KLUG_RING_BYTES` MUST match;
+  the tool ships as **klug 0.1.3**. The check.sh/test.sh binary-size ceiling was raised `1.5 MB → 1.56
+  MB` to fit the 48 KB-larger ring (Cyrius emits the module array as file-resident zero-data).
+
+### Notes
+
+- No new firmware; flash `--update-all` for the kernel. Iron-only; QEMU no-op (`gpu_present`-gated for
+  C2c). Rubric: agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c2c`. Next: **C2d** — write the first
+  PM4 packet + ring the doorbell (the VM-fetch gate, the one high-hang-risk bite; gets its own
+  CONFIRM/FALSIFY tracker + a watchdog).
+
 ## [1.54.9] — 2026-07-12 — GPU arc bite C2b: GFXHUB GMC setup (FB-aperture compute, zero page tables)
 
 **✅ IRON-VALIDATED on archaemenid (2026-07-12) — GMC ARMED:** `gpu: C2b = GMC ARMED (L2 on, ctx0

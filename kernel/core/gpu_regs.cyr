@@ -168,3 +168,43 @@ var GPU_VM_INVALIDATE_REQ_ALL = 0x7C0001;   # vmid0 flush: bit0 PER_VMID | L2_PT
 # caught by the C2b adversarial re-verify vs gc_9_0_sh_mask.h.)
 var GPU_VM_ARENA_OFF     = 0x80000000;      # arena 2 GB into the 3 GB carveout (clears TMR @0x60000000)
 var GPU_VM_DUMMY_SUBOFF  = 0x15000;         # dummy fault-sink page offset within the arena
+
+# --- C2c: compute-queue MQD/HQD (GC seg0; gfx9 gc_9_0_offset.h, ALL base_idx 0) ---
+# Offsets fetched from the full gc_9_0_offset.h + ANCHOR-VALIDATED against the iron-confirmed
+# CP_MEC_CNTL=0x8d / CP_ME_CNTL=0x1b6 (so this is genuinely gfx9, not gfx8 — the CP_HQD block
+# did NOT relocate from gfx8: 0x1245 is correct for both). Direct (non-HWS) HQD load: GRBM-
+# select the slot, push the MQD image registers (ACTIVE last), deselect.
+var GPU_R_GRBM_GFX_CNTL              = 0x0022;  # queue mux: MEID[3:2]/PIPEID[1:0]/QUEUEID[10:8]/VMID[7:4]
+var GPU_R_CP_PQ_WPTR_POLL_CNTL       = 0x1083;  # global: clear EN(bit31) = no CP wptr DMA-poll
+var GPU_R_CP_MQD_BASE_ADDR           = 0x1245;  # MQD save-area ptr LO (FULL byte addr)
+var GPU_R_CP_MQD_BASE_ADDR_HI        = 0x1246;
+var GPU_R_CP_HQD_ACTIVE              = 0x1247;  # bit0 = queue active — WRITE LAST
+var GPU_R_CP_HQD_VMID                = 0x1248;
+var GPU_R_CP_HQD_PERSISTENT_STATE    = 0x1249;
+var GPU_R_CP_HQD_PQ_BASE             = 0x124D;  # ring MC>>8
+var GPU_R_CP_HQD_PQ_BASE_HI          = 0x124E;
+var GPU_R_CP_HQD_PQ_RPTR             = 0x124F;  # read ptr (0 = empty)
+var GPU_R_CP_HQD_PQ_RPTR_REPORT_ADDR    = 0x1250;  # rptr writeback ptr LO (FULL byte addr)
+var GPU_R_CP_HQD_PQ_RPTR_REPORT_ADDR_HI = 0x1251;
+var GPU_R_CP_HQD_PQ_WPTR_POLL_ADDR      = 0x1252;  # 0 = poll disabled (doorbell mode)
+var GPU_R_CP_HQD_PQ_WPTR_POLL_ADDR_HI   = 0x1253;
+var GPU_R_CP_HQD_PQ_DOORBELL_CONTROL    = 0x1254;  # DOORBELL_OFFSET | DOORBELL_EN
+var GPU_R_CP_HQD_PQ_CONTROL          = 0x1256;  # QUEUE_SIZE | PRIV | KMD_QUEUE
+var GPU_R_CP_MQD_CONTROL             = 0x1267;
+var GPU_R_CP_HQD_EOP_BASE_ADDR       = 0x126A;  # EOP MC>>8
+var GPU_R_CP_HQD_EOP_BASE_ADDR_HI    = 0x126B;
+var GPU_R_CP_HQD_EOP_CONTROL         = 0x126C;  # EOP_SIZE log2
+var GPU_R_CP_HQD_PQ_WPTR_LO          = 0x127B;  # write ptr (0 = empty; gfx9 split LO/HI)
+var GPU_R_CP_HQD_PQ_WPTR_HI          = 0x127C;
+# C2c values
+var GPU_GRBM_SEL_MEC1_P0_Q0    = 0x4;         # MEID=1<<2 (MEC1, pipe0, queue0, vmid0); 1-based MEID
+var GPU_CP_HQD_PQ_CONTROL_VAL  = 0xC000050D;  # QUEUE_SIZE 0xD (64 KB ring) | PRIV_STATE | KMD_QUEUE
+var GPU_CP_HQD_DOORBELL_VAL    = 0x40000018;  # DOORBELL_OFFSET(0x06<<2=0x18) | DOORBELL_EN(1<<30)
+var GPU_CP_HQD_EOP_CONTROL_VAL = 0x9;         # EOP_SIZE 9 => 2^10 dwords = 4 KB
+var GPU_CP_HQD_PERSISTENT_VAL  = 0x5301;      # PRELOAD_REQ | PRELOAD_SIZE (inert on empty ring)
+var GPU_CP_MQD_CONTROL_VAL     = 0x100;       # PRIV_STATE, VMID 0
+# arena sub-offsets (siblings of GPU_VM_DUMMY_SUBOFF)
+var GPU_VM_RING_SUBOFF = 0x00000;   # PM4 ring (64 KB)
+var GPU_VM_MQD_SUBOFF  = 0x10000;   # MQD save-area (4 KB)
+var GPU_VM_RPTR_SUBOFF = 0x11000;   # rptr-report page
+var GPU_VM_EOP_SUBOFF  = 0x13000;   # EOP buffer (4 KB, 4 KB-aligned)

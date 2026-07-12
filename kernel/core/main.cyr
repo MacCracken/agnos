@@ -858,6 +858,13 @@ gpu_gpuvm_probe();
 # See kernel/core/gpu.cyr gpu_vm_setup().
 gpu_vm_setup();
 
+# GPU arc C2c (1.54.x) — map an EMPTY compute queue (MEC1/pipe0/queue0) via direct HQD
+# register programming (GRBM-select → 20 CP_HQD_* writes, ACTIVE last → deselect). The ring
+# stays empty (wptr==rptr==0) so the MEC makes zero memory accesses — isolates the HQD recipe
+# from VM/fetch (C2d rings the doorbell). Low hang-risk. Runs after C2b armed the arena.
+# See kernel/core/gpu.cyr gpu_queue_setup().
+gpu_queue_setup();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif
