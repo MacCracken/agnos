@@ -208,6 +208,24 @@ fn gpu_probe() {
 # stays powered even when the CP is gated, so read RLC before trusting CP zeros.
 # Derived from Linux gfx_v9_0.c (halt-bit polarity) + psp_v12_0.c (mailbox). NO
 # device-state writes — pure reads (the PSP load itself is a later bite).
+
+# Is CP_MEC_ME1_HEADER a REAL ucode header, or the dump-FIFO sentinel? The register
+# reads a 0xdefN_defN sentinel FAMILY when there is nothing real to dump — both 16-bit
+# halves equal, top-3-nibbles 0xdef, low nibble a per-read counter (iron-observed on
+# archaemenid at C1d: def0 → def1 → def2 across successive reads; the PSP DMA load path
+# does not repopulate this reg, as the C1d derivation predicted). Returns 1 only for a
+# value NOT of that family (a genuine header), else 0. Used as a BONUS positive — never
+# a hard gate (the reliable running-proof is halts-clear + RLC-on + GRBM idle).
+fn gpu_mec_hdr_is_real(hdr) {
+    var h = hdr & 0xFFFFFFFF;
+    if (h == 0) { return 0; }
+    var hi = (h >> 16) & 0xFFFF;
+    var lo = h & 0xFFFF;
+    var base = GPU_MEC_HDR_NONE & 0xFFFF;         # 0xdef0
+    if (hi == lo && (lo & 0xFFF0) == base) { return 0; }   # 0xdefX_defX sentinel family
+    return 1;
+}
+
 fn gpu_fw_probe() {
     if (gpu_present == 0) { return 0; }
 
@@ -250,10 +268,10 @@ fn gpu_fw_probe() {
     # the old `mec_hdr != 0` clause both let the 0xdef0def0 sentinel through AND risked a
     # false CASE B when a genuinely-running MEC left the header at the sentinel).
     if (rlc_on != 0 && gfx_halted == 0 && mec_halted == 0) {
-        if (mec_hdr != 0 && mec_hdr != GPU_MEC_HDR_NONE) {
+        if (gpu_mec_hdr_is_real(mec_hdr) != 0) {
             kprintln("gpu: C0 = CASE A (ucode running; MEC hdr live)", 46);
         }
-        if (mec_hdr == 0 || mec_hdr == GPU_MEC_HDR_NONE) {
+        if (gpu_mec_hdr_is_real(mec_hdr) == 0) {
             kprintln("gpu: C0 = CASE A (engines running; MEC hdr=sentinel)", 52);
         }
         return 1;
@@ -682,15 +700,15 @@ fn gpu_engine_start() {
     var hdr = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_ME1_HEADER);
     var t = 0;
     while (t < 20) {
-        if (hdr != 0 && hdr != GPU_MEC_HDR_NONE) { t = 20; }
+        if (gpu_mec_hdr_is_real(hdr) != 0) { t = 20; }
         else { gpu_udelay(50); hdr = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_ME1_HEADER); t = t + 1; }
     }
     kprint("gpu: C1d mec-hdr 0x", 19);
     kprint_hex(hdr & 0xFFFFFFFF);
-    if (hdr != 0 && hdr != GPU_MEC_HDR_NONE) {
+    if (gpu_mec_hdr_is_real(hdr) != 0) {
         kprintln(" (ucode fetch confirmed)", 24);
     }
-    if (hdr == 0 || hdr == GPU_MEC_HDR_NONE) {
+    if (gpu_mec_hdr_is_real(hdr) == 0) {
         kprintln(" (sentinel - hdr not repopulated on PSP path)", 45);
     }
 
@@ -711,5 +729,76 @@ fn gpu_engine_start() {
 
     # 6) Formal C0 re-read — expect the CASE B → CASE A flip.
     gpu_fw_probe();
+    return 1;
+}
+# ── C2a — GMC/GFXHUB VM-state probe (the reuse-vs-build decider) ───────────────
+# READ-ONLY (F0/C0 discipline — zero device writes): dumps the GFXHUB VM/aperture
+# state so C2b knows the memory design. Derived+verified verdict (gfxhub_v1_0.c): NO
+# reusable GART exists pre-amdgpu — the design is to place compute scratch in the UMA
+# carveout + address it through the BIOS-set FB aperture with ZERO page tables (the
+# VM-fault-storm wedge designed OUT), NOT to build page tables. Reports: GART
+# present/absent, translate-pipe (L1/L2) live/off, FB-aperture bounds, latched-fault
+# baseline, BAR2 doorbell presence. All GFXHUB regs are GC seg0 (proven by the adjacent
+# MC_VM_FB_* reads). Iron-only; no-op off an AMD GPU.
+fn gpu_gpuvm_probe() {
+    if (gpu_present == 0) { return 0; }
+    var l1    = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_MX_L1_TLB_CNTL);
+    var l2    = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_CNTL);
+    var ctx0  = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_CONTEXT0_CNTL);
+    var ptlo  = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_CTX0_PT_BASE_LO);
+    var pthi  = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_CTX0_PT_BASE_HI);
+    var fbb   = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE);
+    var fbt   = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_TOP);
+    var agpb  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_AGP_BOT);
+    var agpt  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_AGP_TOP);
+    var salo  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_SYS_APERTURE_LOW);
+    var sahi  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_SYS_APERTURE_HIGH);
+    var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+    var bar2  = pci_bar_64(gpu_pci_idx, 2);
+
+    kprintln("gpu: C2a GMC/GFXHUB VM probe (read-only)", 40);
+    kprint("gpu: C2a l1=0x", 14);
+    kprint_hex(l1 & 0xFFFFFFFF);
+    kprint(" l2=0x", 6);
+    kprint_hex(l2 & 0xFFFFFFFF);
+    kprint(" ctx0=0x", 8);
+    kprint_hex(ctx0 & 0xFFFFFFFF);
+    kprint(" ptb=0x", 7);
+    kprint_hex(ptlo & 0xFFFFFFFF);
+    kprintln("", 0);
+    kprint("gpu: C2a fb=0x", 14);
+    kprint_hex(fbb & 0xFFFFFFFF);
+    kprint("..0x", 4);
+    kprint_hex(fbt & 0xFFFFFFFF);
+    kprint(" agp=0x", 7);
+    kprint_hex(agpb & 0xFFFFFFFF);
+    kprint("..0x", 4);
+    kprint_hex(agpt & 0xFFFFFFFF);
+    kprintln("", 0);
+    kprint("gpu: C2a sysap=0x", 17);
+    kprint_hex(salo & 0xFFFFFFFF);
+    kprint("..0x", 4);
+    kprint_hex(sahi & 0xFFFFFFFF);
+    kprint(" fault=0x", 9);
+    kprint_hex(fault & 0xFFFFFFFF);
+    kprint(" bar2=0x", 8);
+    kprint_hex(bar2 & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    var ptb = 0;
+    if ((ptlo | pthi) != 0) { ptb = 1; }
+    if ((ctx0 & 0x1) != 0 && ptb != 0) {
+        kprintln("gpu: C2a GART=PRESENT (ctx0 live; treat STALE, rebuild)", 55);
+    }
+    if ((ctx0 & 0x1) == 0 || ptb == 0) {
+        kprintln("gpu: C2a GART=ABSENT (no page tables; walk path empty)", 54);
+    }
+    if ((l1 & 0x1) != 0 && (l2 & 0x1) != 0) {
+        kprintln("gpu: C2a PIPE=LIVE (FB-aperture reachable; C2b map-only)", 56);
+    }
+    if ((l1 & 0x1) == 0 || (l2 & 0x1) == 0) {
+        kprintln("gpu: C2a PIPE=OFF (C2b enables L1+L2; still no page tables)", 59);
+    }
+    kprintln("gpu: C2a = C2b target: UMA carveout via FB-aperture, ZERO PTEs", 62);
     return 1;
 }

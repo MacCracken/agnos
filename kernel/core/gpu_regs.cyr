@@ -130,3 +130,20 @@ var GPU_R_MC_VM_FB_OFFSET   = 0x96B;   # [23:0]<<24 = carveout PHYSICAL base (vr
 var GPU_R_MC_VM_FB_LOC_BASE = 0x980;   # [23:0]<<24 = carveout MC-aperture base (vram_start)
 var GPU_R_MC_VM_FB_LOC_TOP  = 0x981;   # [23:0]<<24 = carveout MC-aperture top (inclusive, 16 MB granule)
 var GPU_FB_LOC_MASK         = 0xFFFFFF;
+
+# --- C2a: GMC/GFXHUB VM-state probe (GC seg0; the reuse-vs-build decision) ---
+# GFXHUB VM registers, GC seg0 (0x2000), self-consistent with + adjacent to the proven
+# MC_VM_FB_* block. Verdict (derived + adversarially verified vs gfxhub_v1_0.c): NO reusable
+# GART exists pre-amdgpu — reuse the FB aperture (physical VRAM carveout), ZERO page tables,
+# so the VM-fault-storm wedge is designed OUT. Offsets web-verified vs gc_9_0_offset.h.
+# Per-reg reconstruction shifts differ: FB/AGP <<24, SYS_APERTURE <<18, PT_START/END <<12.
+var GPU_R_MC_VM_MX_L1_TLB_CNTL    = 0x987;  # bit0 ENABLE_L1_TLB — the reuse decider
+var GPU_R_VM_L2_CNTL              = 0x840;  # bit0 ENABLE_L2_CACHE (walker/cache pipe)
+var GPU_R_VM_CONTEXT0_CNTL        = 0x880;  # bit0 ENABLE_CONTEXT, [2:1] PAGE_TABLE_DEPTH
+var GPU_R_VM_CTX0_PT_BASE_LO      = 0x8EB;  # VMID0 PDE base lo (nonzero = a PT exists)
+var GPU_R_VM_CTX0_PT_BASE_HI      = 0x8EC;  # VMID0 PDE base hi
+var GPU_R_MC_VM_AGP_TOP           = 0x982;  # <<24 system-DRAM passthrough top
+var GPU_R_MC_VM_AGP_BOT           = 0x983;  # <<24 bottom (BOT>TOP = AGP disabled, expected on APU)
+var GPU_R_MC_VM_SYS_APERTURE_LOW  = 0x985;  # <<18 (256 KB granule; HIGH<LOW = closed)
+var GPU_R_MC_VM_SYS_APERTURE_HIGH = 0x986;  # <<18
+var GPU_R_VM_L2_PROT_FAULT_STATUS = 0x84B;  # nonzero = a VM protection fault already latched

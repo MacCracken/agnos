@@ -5,7 +5,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.8] — 2026-07-12 — GPU arc bite C2a: GMC/GFXHUB VM-state probe (compute dispatch opens)
+
+**C1d was iron-validated on archaemenid** (1.54.7): `gpu: C0 = CASE A` — the GPU compute engine is
+running sovereign-loaded microcode; the C1 firmware-load + engine-start sub-arc is complete. **C2
+opens: dispatch compute work to the running MEC.** C2 is where real hang-risk begins (bad GPUVM →
+VM-fault storm → CPU wedge, per the C1d verify), so it opens read-only — like F0/C0 opened the
+firmware sub-arc.
+
+### Added
+
+- **GMC/GFXHUB VM-state probe (bite C2a)** — `kernel/core/gpu.cyr` `gpu_gpuvm_probe()`: a **read-only**
+  (zero device writes, zero hang-path) dump of the GFXHUB VM/aperture state to answer the make-or-break
+  *reuse-existing-GART vs build-page-tables* question. Reads (GC seg0) `MC_VM_MX_L1_TLB_CNTL` /
+  `VM_L2_CNTL` / `VM_CONTEXT0_CNTL` / `VM_CONTEXT0_PAGE_TABLE_BASE` (the deciders), the FB / AGP /
+  system apertures, `VM_L2_PROTECTION_FAULT_STATUS` (latched-fault baseline), and BAR2 (doorbell
+  presence). Prints a verdict: `GART=ABSENT/PRESENT`, `PIPE=OFF/LIVE`, and the FB-aperture bounds C2b
+  targets. **Derived design (adversarially verified vs `gmc_v9_0.c` / `gfxhub_v1_0.c`): no reusable
+  GART exists pre-amdgpu — place compute scratch in the UMA carveout + address it through the BIOS-set
+  FB aperture with ZERO page tables**, which designs OUT the VM-fault-storm wedge (C2b becomes map-only,
+  not page-table-build). `kernel/core/gpu_regs.cyr`: the C2a GFXHUB register group (offsets web-verified
+  vs `gc_9_0_offset.h`, self-consistent with the proven `MC_VM_FB_*` block).
+
+### Fixed
+
+- **MEC header sentinel detection** (`gpu_mec_hdr_is_real`) — the C1d guard matched only the exact
+  `0xdef0def0`, but `CP_MEC_ME1_HEADER` reads a `0xdefN_defN` sentinel *family* on the PSP path (the
+  low nibble is a per-read dump-FIFO counter — iron-observed `def1`/`def2` at C1d). The check now catches
+  the whole family (`(hi==lo) && (lo & 0xFFF0)==0xdef0`) at all four sites, so the header sub-labels read
+  honest. Cosmetic — the Case-A verdict never depended on the header (it rests on halts+RLC+GRBM).
+
+### Notes
+
+- No new firmware; C2a is a read-only probe (flash `--update-all` for the kernel). Iron-only; QEMU no-op
+  (`gpu_present`-gated). Rubric: agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c2a`. Next: C2b (map
+  carveout scratch via the FB aperture) → C2c (empty compute queue) → C2d (first PM4 packet — the
+  VM-fetch gate, the one high-hang-risk bite) → C2e/C2f/C2g (fence → shader → rosnet matmul).
+
 ## [1.54.7] — 2026-07-12 — GPU arc bite C1d: start the engines (Case-B → Case-A flip)
+
+**✅ IRON-VALIDATED on archaemenid (2026-07-12) — CASE A, the GPU compute engine is RUNNING:**
+`gpu: C0 = CASE A` — RLC on (`rlc=0x1`), CP-gfx un-halted (`me 0x15000000→0`), MEC1 un-halted
+(`mec 0x50000000→0`), pipe idle (`grbm` bit31=0, `stat=0x0`), PSP alive (`psp=0x6a23fe`). The GPU
+compute engine is running sovereign-loaded microcode — the whole C1 firmware-load + engine-start
+sub-arc is complete; boot continued clean. Observations (non-blocking): the RLC was already running
+before C1d (auto-started at firmware-load — the C1d RLC-enable was an idempotent no-op); and the MEC
+`CP_MEC_ME1_HEADER` reads a `0xdefNdefN` incrementing sentinel family (not a real header — the PSP DMA
+path doesn't repopulate it, as derived), so the header sub-labels are cosmetic false-positives while
+the Case-A verdict correctly rests on the halt/RLC/GRBM signals. Follow-up: widen the sentinel check to
+the `0xdefX_defX` family. Unblocks C2 (GPUVM → compute rings → PM4 → gfx90c shaders).
 
 **C1c was iron-validated on archaemenid** (1.54.6): `gpu: C1c = ALL CP+MEC ucode LOADED (5/5, PSP
 validated)` — the whole compute microcode set resident in GPU engine SRAM. The engines were still

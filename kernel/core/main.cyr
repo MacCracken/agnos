@@ -844,6 +844,13 @@ gpu_fw_load_set();
 # See kernel/core/gpu.cyr gpu_engine_start().
 gpu_engine_start();
 
+# GPU arc C2a (1.54.x) — read-only GMC/GFXHUB VM-state probe: is there a reusable
+# GART, or must C2b build page tables? (Answer, derived: neither — place compute
+# scratch in the UMA carveout + address it through the BIOS-set FB aperture, ZERO
+# page tables.) Pure reads; zero device writes; no hang path. Iron-only; no-op off
+# an AMD GPU. See kernel/core/gpu.cyr gpu_gpuvm_probe().
+gpu_gpuvm_probe();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

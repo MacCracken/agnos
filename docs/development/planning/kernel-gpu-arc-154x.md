@@ -190,11 +190,24 @@ P5 needs C1/C2). Batch read-only bites per burn where safe (F0+P0+C0 are read-on
    `status=0x0` — memory domain answered (low kernel phys IS PSP-DMA-reachable; TMR must live in the
    VRAM carveout, placed via GFXHUB FB-location regs) · **C1b-2 (1.54.5, 2026-07-12) LOAD_IP_FW RLC_G
    `status=0x0` — the FIRST sovereign-loaded firmware on the GPU; PSP validated AMD's signature.** The
-   make-or-break round-trip is DONE. Remaining: **C1c** = the rest of the CP/MEC set (`renoir_ce/pfp/
-   me/mec/mec2/rlc` — same `LOAD_IP_FW` path, N more blobs, PSP validates each) → **C1d** = start
-   engines (RLC_CNTL bit0, then clear CP_ME_CNTL / CP_MEC_CNTL halts) + Case-A re-read, folding in the
-   `mec_hdr != 0` / `0xdef0def0` guard fix. Payload byte-range unknown = CONFIRMED (`common_firmware_
-   header` `ucode_size_bytes`@0x14 / `ucode_array_offset_bytes`@0x18; RLC_G was `[0x100,+0x4200)`).
+   make-or-break round-trip is DONE. · **C1c (1.54.6, 2026-07-12) ALL CP+MEC ucode LOADED (5/5)** —
+   CE/PFP/ME whole-body + MEC1 body+JT split; no MEC2 on gfx9.3.0; the whole compute microcode set
+   resident. · **C1d (1.54.7, 2026-07-12) CASE A — the GPU compute engine is RUNNING** (`gpu_engine_
+   start()` un-halted CP-gfx `me 0x15000000→0` + MEC1 `mec 0x50000000→0` over the already-running RLC
+   `rlc=0x1`; pipe idle `grbm` bit31=0 / `stat=0x0`; the `mec_hdr` guard fixed + widened to the
+   `0xdefX_defX` sentinel family — the PSP path leaves the header-dump reg at the sentinel, so the
+   verdict rests on halts+RLC+GRBM, not the header). **✅ THE C1 FIRMWARE-LOAD + ENGINE-START SUB-ARC
+   IS COMPLETE — the compute-thrust gate is OPEN.** Payload byte-range unknown = CONFIRMED
+   (`common_firmware_header` `ucode_size_bytes`@0x14 / `ucode_array_offset_bytes`@0x18).
+
+   **▷ C2 — DISPATCH COMPUTE (next, iron-only):** the engine is running+idle; C2 makes it do work.
+   Ladder opens with a **read-only GMC/GPUVM state probe (C2a)** — answer "is there a reusable
+   GART/VM already set up by BIOS/PSP, or must we build page tables?" (the make-or-break that shapes
+   the rest) — before any VM writes, since bad GPUVM ⟹ VM-fault storm ⟹ CPU wedge is the first REAL
+   hang-risk of the arc (flagged by the C1d verify). Then: build/reuse VM → compute queue (MQD/HQD,
+   MMIO poll-mode to dodge the BAR2 doorbell for a first bite) → PM4 dispatch (prove a packet executes)
+   → hand-assembled gfx90c shader → rosnet matmul bit-correct. Decompose + C2a derivation → the
+   `gpu-c2-decompose-derive` workflow.
 2. **GPUVM page-table format** (C1) — gfx9 multi-level PTE/PDE encoding + TLB-flush must be exact;
    a wrong PTE reads garbage. Derive from `gmc_v9_0.c`.
 3. **Shader ISA** (C3) — hand-assembled gfx90c kernels are the MVP (LLVM assembler validates); a
