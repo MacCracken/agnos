@@ -7,6 +7,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [1.54.9] — 2026-07-12 — GPU arc bite C2b: GFXHUB GMC setup (FB-aperture compute, zero page tables)
 
+**✅ IRON-VALIDATED on archaemenid (2026-07-12) — GMC ARMED:** `gpu: C2b = GMC ARMED (L2 on, ctx0
+off, fault-net, cpu-ok, idle)` — L2/UTCL2 datapath on (`l2=0x80603`), VMID0 paging still disabled
+(`ctx0=0x0`, zero page tables held), fault-net armed (`fcntl=0x1ffc`), TLB-flush ACK'd (`ack=0x1`),
+clean + idle. **The CPU-carveout premise is validated:** `cpuprobe=0xc2b0c2b0` — the CPU wrote+read the
+reserved UMA carveout DRAM (phys `0xFF0000000`, arena MC `0xF480000000`), so C2c/d's ring/MQD writes
+land there and the MEC reaches the same DRAM via the FB aperture. Both adversarial-verify fixes proven
+correct on iron. Boot continued clean. Unblocks C2c (build the MQD + map an empty compute queue).
+
 **C2a was iron-validated on archaemenid** (1.54.8): GART=ABSENT, L1-TLB on / L2 off, FB carveout MC
 `[0xF400000000, +3 GB)`, doorbell present, fault-clean — the reuse-vs-build design confirmed on
 hardware. This cut arms the GMC so a compute arena in that carveout is MEC-reachable via the FB
