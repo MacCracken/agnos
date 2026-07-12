@@ -78,15 +78,15 @@ var GPU_R_MP0_C2PMSG_81     = 0x91;   # MP0 seg0 — PSP secure-OS sign-of-life 
 # --- C0 field masks (gc_9_0_sh_mask.h) ---
 var GPU_RLC_ENABLE_F32   = 0x1;         # RLC_CNTL bit0 — RLC running with ucode
 var GPU_CP_GFX_HALT_MASK = 0x15000000;  # CP_ME_CNTL: ME_HALT|PFP_HALT|CE_HALT (set = gfx halted).
-                                        # C1d widened from 0x14000000 to catch a stuck CE_HALT too.
+# C1d widened from 0x14000000 to catch a stuck CE_HALT too.
 var GPU_CP_MEC_ME1_HALT  = 0x40000000;  # CP_MEC_CNTL bit30 (set = MEC1 halted)
 # --- C1d engine-start ---
 var GPU_MEC_HDR_NONE     = 0xdef0def0;  # CP_MEC_ME1_HEADER reset default = "no ucode fetched"
-                                        # (iron-observed at C0; the header-dump reg reads a real
-                                        # value only after the MEC F32 fetches — a BONUS positive,
-                                        # not a hard gate, since the PSP DMA path may not repopulate it)
+# (iron-observed at C0; the header-dump reg reads a real
+# value only after the MEC F32 fetches — a BONUS positive,
+# not a hard gate, since the PSP DMA path may not repopulate it)
 var GPU_GRBM_GUI_ACTIVE  = 0x80000000;  # GRBM_STATUS bit31 — gfx pipe busy (must stay 0 = idle
-                                        # after a bare un-halt with no ring mapped)
+# after a bare un-halt with no ring mapped)
 
 # --- C1: PSP GPCOM ring / firmware-load mailbox (MP0 seg[0], base 0x16000) ---
 # C2PMSG_NN dword offset = 0x40 + NN — proven by C2PMSG_81 (0x91) reading psp=0x698e82
