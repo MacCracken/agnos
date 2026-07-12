@@ -93,3 +93,14 @@ var GPU_PSP_DESTROY_RINGS   = 0x00030000;  # C2PMSG_64: GFX_CTRL_CMD_ID_DESTROY_
 var GPU_PSP_INIT_GPCOM_RING = 0x00020000;  # C2PMSG_64: PSP_RING_TYPE__KM(2)<<16 = INIT_GPCOM_RING
 var GPU_PSP_FLAG_RESPONSE   = 0x80000000;  # C2PMSG_64 bit31 = PSP responded
 var GPU_PSP_STATUS_MASK     = 0xFFFF;      # C2PMSG_64 low16 = status (0 = OK)
+
+# C1b: ring commands (RB-frame over the GPCOM ring). cmd_id lives at cmd+8 and uses
+# the RAW psp_gfx_cmd_id enum (NOT <<16 like the C2PMSG_64 CTRL commands). Derived
+# from psp_gfx_if.h / psp_v12_0.c / amdgpu_ucode.h. resp.status is read at cmd+0x360.
+var GPU_PSP_CMD_SETUP_TMR   = 0x5;         # GFX_CMD_ID_SETUP_TMR
+var GPU_PSP_CMD_LOAD_IP_FW  = 0x6;         # GFX_CMD_ID_LOAD_IP_FW (C1b-2)
+var GPU_PSP_TMR_SIZE        = 0x400000;    # TMR = 4 MB (fixed on gfx9/Renoir)
+var GPU_PSP_TMR_FLAGS       = 0x2;         # cmd_tmr.tmr_flags: virt_phy_addr=1
+var GPU_PSP_RESP_STATUS     = 0x360;       # resp.status byte offset in the 4 KB cmd buffer (0=OK)
+var GPU_PSP_RING_DW_MASK    = 0x1FFF;      # wptr wrap: (ring 0x8000 bytes)/4 - 1 = 0x2000-1
+var GPU_FW_TYPE_RLC_G       = 8;           # psp_gfx_fw_type RLC_G (C1b-2)

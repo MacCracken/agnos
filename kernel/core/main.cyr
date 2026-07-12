@@ -721,12 +721,14 @@ gpu_probe();
 # (Case A) or must be PSP-loaded (Case B — expected on a display-only-lit box).
 # No-op if F0 didn't bind a GPU. Read-only. See kernel/core/gpu.cyr gpu_fw_probe().
 gpu_fw_probe();
-# GPU arc C1a (1.54.x) — PSP GPCOM ring-create + memory-domain probe. C0 found the
-# GPU microcode is NOT resident (CASE B), so agnos must drive the PSP to load it;
-# C1a stands up the OS<->PSP command ring the firmware-load (C1b) rides over. Writes
-# the PSP mailbox (C2PMSG_64/69/70/71) — register-based, no ring DMA yet, no firmware.
-# Iron-only; no-op if F0 didn't bind a GPU. See kernel/core/gpu.cyr gpu_psp_ring_create().
-gpu_psp_ring_create();
+# GPU arc C1b-1 (1.54.x) — PSP GPCOM ring (UC) + SETUP_TMR round-trip. C0 found the
+# GPU microcode is NOT resident (CASE B), so agnos must drive the PSP to load it.
+# C1a proved the register-based ring-create (iron 1.54.2); gpu_psp_setup re-creates
+# the ring in a UC region and runs the first REAL ring command — SETUP_TMR — a full
+# RB-frame/DMA/fence round-trip that establishes the 4 MB Trusted Memory Region the
+# firmware-load (C1b-2 LOAD_IP_FW) needs, and probes the PSP DMA/coherence/addressing.
+# Iron-only; no-op if F0 didn't bind a GPU. See kernel/core/gpu.cyr gpu_psp_setup().
+gpu_psp_setup();
 # GPT Phase 1 — probe the active block backend (NVMe-first by override
 # policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
 # decode + walk the first 4 KB of the partition entry array, print a one-

@@ -5,6 +5,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.3] — 2026-07-11 — GPU arc bite C1b-1: PSP SETUP_TMR (the first real ring command / DMA round-trip)
+
+**C1a was iron-validated on archaemenid 2026-07-11** (the 1.54.2 burn): `C1a = GPCOM ring UP (PSP
+accepted)`, `resp=0x80020000` — the sovereign kernel drove the on-die PSP for the first time. This
+cut takes the next step: the first **real ring command** — a full RB-frame → PSP-DMA → fence
+round-trip — via `SETUP_TMR`, which establishes the Trusted Memory Region the firmware-load needs.
+Iron-only (QEMU has no PSP).
+
+### Added
+
+- **PSP SETUP_TMR round-trip (bite C1b-1)** — `kernel/core/gpu.cyr` `gpu_psp_setup()`: re-creates the
+  GPCOM ring in a **2 MB uncacheable region** (DMA needs UC; C1a's static ring was write-back —
+  correct for register-INIT, not for the ring the PSP DMA-reads), allocates a **4 MB Trusted Memory
+  Region** (`pmm_alloc_2mb_run(2)`), and submits `GFX_CMD_ID_SETUP_TMR` over the ring: builds the
+  64-byte `psp_gfx_rb_frame` at the C2PMSG_67 write-pointer, rings the doorbell, and polls the fence
+  word until the PSP writes back the submit index, then reads `resp.status`. This is the make-or-break
+  for the ring/DMA/coherence/addressing mechanism, and — since SETUP_TMR is the one command that
+  passes an explicit system-physical address — it doubles as the **PSP DMA-addressing probe** (can
+  the PSP DMA plain low kernel physical memory on this APU?). Pass signal:
+  `gpu: C1b = SETUP_TMR OK (PSP DMA live)`.
+- **`gpu_psp_submit` + `gpu_mfence`** — `kernel/core/gpu.cyr`: the reusable RB-frame submit + fence-poll
+  (returns `resp.status` at cmd+0x360), and the store-fence that drains writes before the doorbell.
+  **Coherence:** UC buffers + `mfence` — the HDP flush amdgpu does here is a **no-op on this APU**
+  (skipped for AMD_IS_APU), so the fence + UC mapping is the whole mechanism.
+- **Ring-command constants** — `kernel/core/gpu_regs.cyr`: `SETUP_TMR` (0x5) / `LOAD_IP_FW` (0x6) raw
+  cmd-ids, the 4 MB TMR size + `virt_phy_addr` flag, `resp.status` offset (0x360), the wptr wrap mask,
+  and `RLC_G` fw_type (8) for C1b-2. Derived from Linux `psp_gfx_if.h` / `psp_v12_0.c` / `amdgpu_psp.c`.
+
+### Notes
+
+- Wired via `kernel/core/main.cyr` (`gpu_psp_setup()` replaces the C1a `gpu_psp_ring_create()` call;
+  the C1a function is retained as the register-only record). QEMU-validated (no-op off an AMD GPU,
+  boot clean); sweep 15/15. **Adversarially verified** — every struct offset, the wptr math, the
+  fence, and the mfence placement re-derived from the amdgpu source (PASS). Next: **C1b-2**
+  (`LOAD_IP_FW` RLC_G — the first real firmware, needs the blob staged into the agnos-fs). Rubric:
+  agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c1b1`; firmware-provenance ledger tracks the blobs.
+
 ## [1.54.2] — 2026-07-11 — GPU arc bite C1a: PSP GPCOM ring-create (the first write to the GPU)
 
 **C0 was iron-validated on archaemenid 2026-07-11** (the 1.54.1 burn): `C0 = CASE B` — the GPU's

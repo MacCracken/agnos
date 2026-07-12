@@ -20,7 +20,15 @@ var gpu_pci_idx  = 0 - 1;    # PCI enumeration index of the bound GPU
 var gpu_mmio     = 0;        # BAR5 register-aperture base (VA == PA, UC-mapped)
 # C1: the PSP GPCOM ring — 32 KB usable + a page of alignment slack. Module-global
 # `var X[N]` = N x u64, so [4608] = 36 KB (32 KB ring rounded up to a page + slack).
+# (C1a's register-only probe used this static buffer; C1b re-creates the ring in a
+# UC region — DMA needs UC — so this static buffer is now the C1a-record path only.)
 var gpu_psp_ring[4608];
+# C1b: the UC command-ring buffers (allocated + UC-mapped in gpu_psp_setup; reused by
+# the later LOAD_IP_FW path). ring/cmd/fence live in one 2 MB UC region.
+var gpu_psp_ring2 = 0;       # UC GPCOM ring base
+var gpu_psp_cmd   = 0;       # 4 KB UC command buffer
+var gpu_psp_fence = 0;       # UC fence word
+var gpu_psp_fctr  = 0;       # monotonic fence counter (first submit = 1)
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -49,6 +57,45 @@ fn gpu_udelay(us) {
     var target = us * 3000;
     while ((rdtsc() - t0) < target) { }
     return 0;
+}
+
+# mfence (0F AE F0) — drain the store buffer before the doorbell so the PSP sees the
+# RB-frame/cmd writes before it observes the wptr bump. HDP flush is a NO-OP on this
+# APU (amdgpu skips it for AMD_IS_APU), so the fence + UC buffers ARE the coherence.
+fn gpu_mfence() {
+    asm { 0x0F; 0xAE; 0xF0; }
+    return 0;
+}
+
+# Submit the command in cmd_phys over the GPCOM ring, ring the doorbell (C2PMSG_67
+# wptr), wait for the PSP to write the fence word, and return resp.status (cmd+0x360;
+# 0 = OK). Buffers are UC (strongly ordered) + an mfence drains stores before the
+# doorbell. RB-frame layout + wptr math (DWORDs, +16 per 64-byte frame) + fence-poll
+# per psp_v12_0.c `psp_ring_cmd_submit` / `psp_cmd_submit_buf`. Reused by C1b-2.
+fn gpu_psp_submit(ring_phys, cmd_phys, fence_phys) {
+    gpu_psp_fctr = gpu_psp_fctr + 1;
+    var idx = gpu_psp_fctr;
+    store32(fence_phys, 0);                              # pre-zero the fence word
+    var wptr  = gpu_reg32(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_67);   # wptr in DWORDs
+    var frame = ring_phys + wptr * 4;                   # 64-byte frame at wptr_dw * 4
+    var i = 0;
+    while (i < 8) { store64(frame + i * 8, 0); i = i + 1; }       # zero the 64-byte frame
+    store32(frame + 0,  cmd_phys & 0xFFFFFFFF);         # cmd_buf_addr_lo
+    store32(frame + 4,  (cmd_phys >> 32) & 0xFFFFFFFF); # cmd_buf_addr_hi
+    store32(frame + 8,  0x1000);                        # cmd_buf_size
+    store32(frame + 12, fence_phys & 0xFFFFFFFF);       # fence_addr_lo
+    store32(frame + 16, (fence_phys >> 32) & 0xFFFFFFFF);# fence_addr_hi
+    store32(frame + 20, idx);                           # fence_value
+    gpu_mfence();
+    var nw = (wptr + 16) & GPU_PSP_RING_DW_MASK;        # +1 frame (16 dw), wrap
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_67, nw);     # doorbell
+    var t = 0;
+    while (t < 20000) {                                 # ~2 s budget (20000 x 100 us)
+        if (load32(fence_phys) == idx) { break; }
+        gpu_udelay(100);
+        t = t + 1;
+    }
+    return load32(cmd_phys + GPU_PSP_RESP_STATUS);
 }
 
 # Locate the iGPU: exact Cezanne id first, then the other known gfx9-APU ids,
@@ -269,5 +316,105 @@ fn gpu_psp_ring_create() {
         return 1;
     }
     kprintln("gpu: C1a = ring INIT TIMEOUT (no response)", 42);
+    return 1;
+}
+
+# === C1b-1 — SETUP_TMR round-trip (ring/coherence/addressing probe) ==========
+# C1a proved the register-based ring-create; C1b does the first REAL ring command:
+# a full RB-frame submit + DMA + fence round-trip. SETUP_TMR needs no firmware, so
+# it isolates the ring/coherence/addressing mechanism from the firmware parse — and
+# is a hard prerequisite for LOAD_IP_FW (the PSP DMA-writes decrypted ucode into the
+# TMR). It also DOUBLES as the physical-addressing probe: SETUP_TMR is the one command
+# that passes an explicit system-physical address, so status==0 proves the PSP
+# DMA-read our cmd buffer, DMA-wrote our fence, AND accepted a raw-phys TMR — the C1a0
+# memory-domain question. Buffers are UC (the DMA ring needs it — C1a's static ring
+# was WB, fine for register-INIT but not DMA), so C1b re-creates the ring in a fresh
+# 2 MB UC region. TMR = 4 MB via pmm_alloc_2mb_run(2). Derived from psp_v12_0.c
+# (psp_tmr_load / psp_prep_tmr_cmd_buf) + psp_gfx_if.h. NO firmware yet (that's C1b-2).
+fn gpu_psp_setup() {
+    if (gpu_present == 0) { return 0; }
+    var sol = gpu_reg32(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_81);
+    if (sol == 0) {
+        kprintln("gpu: C1b PSP not alive - skip", 29);
+        return 0;
+    }
+
+    # 2 MB UC region for ring(32 KB)+cmd(4 KB)+fence, and a 4 MB UC TMR.
+    var region = pmm_alloc_2mb();
+    if (region == 0) {
+        kprintln("gpu: C1b region alloc FAIL", 26);
+        return 0;
+    }
+    vmm_remap_uc_2mb(region);
+    iommu_register_dma(region);
+    var tmr = pmm_alloc_2mb_run(2);
+    if (tmr == 0) {
+        kprintln("gpu: C1b TMR alloc FAIL", 23);
+        return 0;
+    }
+    vmm_remap_uc_2mb(tmr);
+    vmm_remap_uc_2mb(tmr + 0x200000);
+    iommu_register_dma(tmr);
+    iommu_register_dma(tmr + 0x200000);
+
+    var ring  = region;
+    var cmd   = region + 0x8000;   # 4 KB-aligned (region is 2 MB-aligned)
+    var fence = region + 0x9000;
+    gpu_psp_ring2 = ring;
+    gpu_psp_cmd   = cmd;
+    gpu_psp_fence = fence;
+    var i = 0;
+    while (i < 4096) { store64(ring + i * 8, 0); i = i + 1; }   # zero the 32 KB ring
+
+    # Re-create the GPCOM ring in the UC region (DESTROY → program → INIT → poll) —
+    # the C1a-validated sequence, now pointing the PSP at the UC ring for DMA.
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_64, GPU_PSP_DESTROY_RINGS);
+    gpu_udelay(20000);
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_69, ring & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_70, (ring >> 32) & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_71, GPU_PSP_RING_SIZE);
+    gpu_reg32_write(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_64, GPU_PSP_INIT_GPCOM_RING);
+    gpu_udelay(20000);
+    var rr = 0;
+    i = 0;
+    while (i < 50) {
+        rr = gpu_reg32(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_64);
+        if ((rr & GPU_PSP_FLAG_RESPONSE) != 0) { break; }
+        gpu_udelay(20000);
+        i = i + 1;
+    }
+    if ((rr & GPU_PSP_FLAG_RESPONSE) == 0 || (rr & GPU_PSP_STATUS_MASK) != 0) {
+        kprint("gpu: C1b ring re-init FAIL resp=0x", 34);
+        kprint_hex(rr & 0xFFFFFFFF);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # SETUP_TMR: cmd_id=0x5 @ +8; buf_phy_addr @ +28/+32 = TMR; buf_size @ +36 = 4 MB;
+    # tmr_flags @ +40 = 0x2 (virt_phy_addr); system_phy_addr @ +44/+48 = TMR (raw phys).
+    i = 0;
+    while (i < 512) { store64(cmd + i * 8, 0); i = i + 1; }     # zero the 4 KB cmd buffer
+    store32(cmd + 8,  GPU_PSP_CMD_SETUP_TMR);
+    store32(cmd + 28, tmr & 0xFFFFFFFF);
+    store32(cmd + 32, (tmr >> 32) & 0xFFFFFFFF);
+    store32(cmd + 36, GPU_PSP_TMR_SIZE);
+    store32(cmd + 40, GPU_PSP_TMR_FLAGS);
+    store32(cmd + 44, tmr & 0xFFFFFFFF);
+    store32(cmd + 48, (tmr >> 32) & 0xFFFFFFFF);
+    var status = gpu_psp_submit(ring, cmd, fence);
+
+    kprint("gpu: C1b tmr=0x", 15);
+    kprint_hex(tmr & 0xFFFFFFFF);
+    kprint(" fence=0x", 9);
+    kprint_hex(load32(fence));
+    kprint(" status=0x", 10);
+    kprint_hex(status & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    if (load32(fence) == gpu_psp_fctr && status == 0) {
+        kprintln("gpu: C1b = SETUP_TMR OK (PSP DMA live)", 38);
+        return 1;
+    }
+    kprintln("gpu: C1b = SETUP_TMR FAIL (fence/status)", 40);
     return 1;
 }
