@@ -29,6 +29,10 @@ var gpu_psp_ring2 = 0;       # UC GPCOM ring base
 var gpu_psp_cmd   = 0;       # 4 KB UC command buffer
 var gpu_psp_fence = 0;       # UC fence word
 var gpu_psp_fctr  = 0;       # monotonic fence counter (first submit = 1)
+# C2b: the compute arena in the UMA carveout — CPU-physical base (UC-mapped) + the MEC
+# MC (FB-aperture) base. C2c/d build the ring/MQD here. Set by gpu_vm_setup.
+var gpu_arena_mc   = 0;      # MEC/FB-aperture MC address (pq_base = mc>>8)
+var gpu_arena_phys = 0;      # CPU physical address (UC-mapped)
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -801,4 +805,102 @@ fn gpu_gpuvm_probe() {
     }
     kprintln("gpu: C2a = C2b target: UMA carveout via FB-aperture, ZERO PTEs", 62);
     return 1;
+}
+# ── C2b — GFXHUB GMC setup for FB-aperture compute (first GMC write) ───────────
+# The MEC is running (Case A) but has no addressable memory. C2b arms the GMC so a
+# compute arena in the UMA carveout is reachable via the FB aperture — with ZERO page
+# tables, so the VM-fault-storm CPU-wedge is designed OUT (VM_CONTEXT0 stays DISABLED).
+# Minimal, all-confirmed-offset set (the L1-reprogram/MTYPE_UC + system-aperture default
+# page are DEFERRED — medium-confidence; coherence handled by PM4 cache ops at C2c/d).
+# Derived + adversarially verified vs gmc_v9_0.c / gfxhub_v1_0.c; the hang-risk lens
+# caught + fixed the fault-CNTL mask (0x1FFC = bits[2:12] serve-default, no-int, no-crash).
+# C2b writes GMC config only — no engine fetch — so it cannot itself wedge (verified).
+fn gpu_vm_setup() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_psp_ring2 == 0) { return 0; }
+
+    # Carveout geometry (same FB regs as the C1b-1 TMR math). fb_off = CPU-physical base;
+    # fb_base = MC (GPU/FB-aperture) base — distinct domains on this APU.
+    var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
+    var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
+    var fb_off  = r_off << 24;
+    var fb_base = r_base << 24;
+    var arena_mc   = fb_base + GPU_VM_ARENA_OFF;   # MEC side (pq_base = mc>>8)
+    var arena_phys = fb_off  + GPU_VM_ARENA_OFF;   # CPU side (UC-mapped)
+    var dummy_phys = arena_phys + GPU_VM_DUMMY_SUBOFF;
+    gpu_arena_mc   = arena_mc;
+    gpu_arena_phys = arena_phys;
+
+    # UC-map the arena (CPU side). Probe CPU access to the carveout DRAM: write a
+    # sentinel at the ring base + read it back (C2c/d write the ring/MQD here, so this
+    # premise is load-bearing). Then zero the dummy fault-sink page.
+    vmm_remap_uc_2mb(arena_phys);
+    store32(arena_phys, 0xC2B0C2B0);
+    var chk = load32(arena_phys) & 0xFFFFFFFF;
+    store32(arena_phys, 0);
+    var i = 0;
+    while (i < 512) { store64(dummy_phys + i * 8, 0); i = i + 1; }
+
+    # --- Fault-storm net (armed BEFORE enabling L2) ---
+    # Out-of-window (L2 range) fault → the dummy page; no IRQ, no pipe-crash, latch first.
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_DEF_LO, (dummy_phys >> 12) & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_DEF_HI, (dummy_phys >> 44) & 0xF);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, GPU_VM_FAULT_CNTL_ARM);
+
+    # Keep VMID0 paging DISABLED — the structural fault-storm design-out (no PT walk).
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_CONTEXT0_CNTL, 0);
+
+    # THE load-bearing write: enable the L2/UTCL2 datapath (RMW — preserve BIOS bits).
+    var l2 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_CNTL, l2 | GPU_VM_L2_ENABLE_CACHE);
+
+    # GFXHUB TLB flush (no semaphore on GFXHUB); BOUNDED ACK poll — never spin.
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_INVALIDATE_ENG0_REQ, GPU_VM_INVALIDATE_REQ_ALL);
+    var dd = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_INVALIDATE_ENG0_REQ);   # fast-GRBM false-ACK workaround
+    var t = 0;
+    var acked = 0;
+    while (t < 1000) {
+        if ((gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_INVALIDATE_ENG0_ACK) & 0x1) != 0) { acked = 1; t = 1000; }
+        else { gpu_udelay(10); t = t + 1; }
+    }
+
+    # Readback-verify.
+    var l2v  = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_CNTL);
+    var ctxv = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_CONTEXT0_CNTL);
+    var fcv  = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
+    var flt  = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+    var grbm = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
+
+    kprint("gpu: C2b arena mc=0x", 20);
+    kprint_hex(arena_mc);
+    kprint(" phys=0x", 8);
+    kprint_hex(arena_phys);
+    kprintln("", 0);
+    kprint("gpu: C2b cpuprobe=0x", 20);
+    kprint_hex(chk);
+    kprintln("", 0);
+    kprint("gpu: C2b l2=0x", 14);
+    kprint_hex(l2v & 0xFFFFFFFF);
+    kprint(" ctx0=0x", 8);
+    kprint_hex(ctxv & 0xFFFFFFFF);
+    kprint(" fcntl=0x", 9);
+    kprint_hex(fcv & 0xFFFFFFFF);
+    kprint(" ack=0x", 7);
+    kprint_hex(acked);
+    kprintln("", 0);
+    kprint("gpu: C2b fault=0x", 17);
+    kprint_hex(flt & 0xFFFFFFFF);
+    kprint(" grbm=0x", 8);
+    kprint_hex(grbm & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    var l2_on   = l2v & GPU_VM_L2_ENABLE_CACHE;
+    var ctx_off = ctxv & 0x1;
+    var gui     = grbm & GPU_GRBM_GUI_ACTIVE;
+    if (l2_on != 0 && ctx_off == 0 && flt == 0 && gui == 0 && chk == 0xC2B0C2B0) {
+        kprintln("gpu: C2b = GMC ARMED (L2 on, ctx0 off, fault-net, cpu-ok, idle)", 63);
+        return 1;
+    }
+    kprintln("gpu: C2b = GMC setup INCOMPLETE (check readbacks above)", 55);
+    return 0;
 }

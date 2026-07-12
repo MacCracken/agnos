@@ -851,6 +851,13 @@ gpu_engine_start();
 # an AMD GPU. See kernel/core/gpu.cyr gpu_gpuvm_probe().
 gpu_gpuvm_probe();
 
+# GPU arc C2b (1.54.x) — GFXHUB GMC setup: arm a carveout compute arena reachable via
+# the FB aperture (ZERO page tables — VM_CONTEXT0 stays disabled = fault-storm designed
+# out), enable the L2/UTCL2 datapath, arm the fault-net, TLB-flush. GMC config only, no
+# engine fetch — cannot itself wedge. Iron-only; no-op off an AMD GPU. Runs after C2a.
+# See kernel/core/gpu.cyr gpu_vm_setup().
+gpu_vm_setup();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

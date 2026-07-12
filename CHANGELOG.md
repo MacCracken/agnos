@@ -5,7 +5,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.9] — 2026-07-12 — GPU arc bite C2b: GFXHUB GMC setup (FB-aperture compute, zero page tables)
+
+**C2a was iron-validated on archaemenid** (1.54.8): GART=ABSENT, L1-TLB on / L2 off, FB carveout MC
+`[0xF400000000, +3 GB)`, doorbell present, fault-clean — the reuse-vs-build design confirmed on
+hardware. This cut arms the GMC so a compute arena in that carveout is MEC-reachable via the FB
+aperture, with **zero page tables** — the first GMC/GPUVM write of the arc.
+
+### Added
+
+- **GFXHUB GMC setup (bite C2b)** — `kernel/core/gpu.cyr` `gpu_vm_setup()`: arms the GMC for
+  FB-aperture compute — computes a carveout compute arena (2 GB into the 3 GB carveout, clear of the
+  C1b-1 TMR; CPU-physical base `FB_OFFSET<<24 + off`, MEC-MC base `FB_LOCATION_BASE<<24 + off`),
+  UC-maps it and **probes CPU access to the reserved UMA carveout DRAM** with a sentinel round-trip
+  (the load-bearing premise for C2c/d ring/MQD writes), then: arms the fault-net
+  (`VM_L2_PROTECTION_FAULT_CNTL=0x1FFC` — all `*_ENABLE_DEFAULT`, no interrupt, no pipe-crash + a
+  dummy-page sink), keeps `VM_CONTEXT0` **disabled** (zero page tables = the fault-storm structural
+  design-out), enables the **L2/UTCL2 datapath** (`VM_L2_CNTL` bit0, the load-bearing write), and runs
+  a bounded GFXHUB TLB-flush. Writes GMC config only — no engine fetch — so it cannot itself wedge.
+  Stores the arena base in module vars for C2c/d. Derived + **twice adversarially verified** vs
+  `gmc_v9_0.c`/`gfxhub_v1_0.c`. `kernel/core/gpu_regs.cyr`: the C2b GFXHUB register group.
+  - Pass signal: `gpu: C2b = GMC ARMED (L2 on, ctx0 off, fault-net, cpu-ok, idle)`.
+
+### Notes
+
+- The adversarial verify caught **two** wrong register values before iron: the `VM_L2_PROTECTION_FAULT_CNTL`
+  mask (would have left `CRASH_ON_*` set → a C2d fault halts the pipe → CPU wedge; fixed to `0x1FFC`),
+  and the TLB-invalidate constant (`0xF80001` was off-by-one-shifted, dropping `L2_PTES` and setting
+  `CLEAR_FAULT_STATUS`; fixed to `0x7C0001`). The L1-reprogram/`MTYPE_UC` and the `0x96C/0x96D`
+  system-aperture sink are **deferred** (medium-confidence; coherence handled by PM4 cache ops at
+  C2c/d). No new firmware; flash `--update-all` for the kernel. Iron-only; QEMU no-op
+  (`gpu_present`-gated). Rubric: agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c2b`. Next: C2c (build
+  the MQD + map an empty compute queue) → C2d (first PM4 packet — the VM-fetch gate, the one
+  high-hang-risk bite).
+
 ## [1.54.8] — 2026-07-12 — GPU arc bite C2a: GMC/GFXHUB VM-state probe (compute dispatch opens)
+
+**✅ IRON-VALIDATED on archaemenid (2026-07-12):** the probe answered reuse-vs-build — `GART=ABSENT`
+(`ctx0` bit0=0, `ptb=0x0`), L1-TLB on / L2 off (`l1=0x2501` / `l2=0x80602`), FB carveout MC
+`[0xF400000000, +3 GB)` (`fb=0xf400..0xf4bf`, matches CONFIG_MEMSIZE + the C1b-1 TMR read), system
+aperture spans the carveout (`sysap=0x3d0000..0x3d3000`), `fault=0x0` clean, doorbell `BAR2=0xE0000000`
+present. The derived carveout+FB-aperture, zero-page-table design is confirmed on hardware (C2b = map
+scratch into the carveout + enable L2, no PTEs). The **MEC-header sentinel-family fix also validated on
+iron**: `hdr=0xdef6def6` now reads `MEC hdr=sentinel` (the old exact-`0xdef0def0` guard would have
+mislabelled it "hdr live"). Boot stayed clean. Unblocks C2b.
 
 **C1d was iron-validated on archaemenid** (1.54.7): `gpu: C0 = CASE A` — the GPU compute engine is
 running sovereign-loaded microcode; the C1 firmware-load + engine-start sub-arc is complete. **C2

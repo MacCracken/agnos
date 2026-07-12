@@ -147,3 +147,24 @@ var GPU_R_MC_VM_AGP_BOT           = 0x983;  # <<24 bottom (BOT>TOP = AGP disable
 var GPU_R_MC_VM_SYS_APERTURE_LOW  = 0x985;  # <<18 (256 KB granule; HIGH<LOW = closed)
 var GPU_R_MC_VM_SYS_APERTURE_HIGH = 0x986;  # <<18
 var GPU_R_VM_L2_PROT_FAULT_STATUS = 0x84B;  # nonzero = a VM protection fault already latched
+
+# --- C2b: GFXHUB GMC setup for FB-aperture compute (GC seg0) ---
+# Arm the GMC so a carveout compute arena is MEC-reachable via the FB aperture, ZERO page
+# tables (VM_CONTEXT0 stays disabled = the fault-storm design-out). All offsets confirmed
+# vs gc_9_0_offset.h; the fault-CNTL value 0x1FFC was fixed by the hang-risk verify (the
+# derivation's first mask was the wrong register's bit layout — would have left CRASH_ON_*
+# set and wedged the pipe on a C2d fault). L1-reprogram/MTYPE_UC + system-aperture default
+# page deferred (medium-confidence; coherence handled by PM4 cache ops at C2c/d).
+var GPU_R_VM_L2_PROT_FAULT_CNTL   = 0x847;  # fault net: serve-default + no-int + no-crash + latch
+var GPU_R_VM_L2_PROT_FAULT_DEF_LO = 0x84E;  # out-of-window fault -> dummy page (phys>>12)
+var GPU_R_VM_L2_PROT_FAULT_DEF_HI = 0x84F;  # (phys>>44)
+var GPU_R_VM_INVALIDATE_ENG0_REQ  = 0x8A3;  # GFXHUB TLB-flush request
+var GPU_R_VM_INVALIDATE_ENG0_ACK  = 0x8B5;  # flush ACK (bit(1<<vmid); vmid0 = 0x1)
+var GPU_VM_L2_ENABLE_CACHE   = 0x1;         # VM_L2_CNTL bit0 ENABLE_L2_CACHE (the datapath gate)
+var GPU_VM_FAULT_CNTL_ARM    = 0x1FFC;      # bits[2:12] all *_ENABLE_DEFAULT; 0,1,13-31 clear
+var GPU_VM_INVALIDATE_REQ_ALL = 0x7C0001;   # vmid0 flush: bit0 PER_VMID | L2_PTES(18) | L2_PDE0/1/2
+# (19-21) | L1_PTES(22). (Was 0xF80001 — off-by-one-shifted:
+# dropped L2_PTES + spuriously set CLEAR_FAULT_STATUS(23);
+# caught by the C2b adversarial re-verify vs gc_9_0_sh_mask.h.)
+var GPU_VM_ARENA_OFF     = 0x80000000;      # arena 2 GB into the 3 GB carveout (clears TMR @0x60000000)
+var GPU_VM_DUMMY_SUBOFF  = 0x15000;         # dummy fault-sink page offset within the arena
