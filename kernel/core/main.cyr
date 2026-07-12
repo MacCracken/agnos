@@ -716,6 +716,11 @@ hda_active_ctl = 0;
 # via `klug > /f/gpu.txt`. See kernel/core/gpu.cyr + agnosticos
 # planning/kernel-gpu-arc-154x.md (bite F0); Thrust C/P machinery is C0+.
 gpu_probe();
+# GPU arc C0 (1.54.1) — firmware-reality check: read-only dump of CP/MEC/RLC
+# state + PSP sign-of-life to decide whether the compute microcode is resident
+# (Case A) or must be PSP-loaded (Case B — expected on a display-only-lit box).
+# No-op if F0 didn't bind a GPU. Read-only. See kernel/core/gpu.cyr gpu_fw_probe().
+gpu_fw_probe();
 # GPT Phase 1 — probe the active block backend (NVMe-first by override
 # policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
 # decode + walk the first 4 KB of the partition entry array, print a one-

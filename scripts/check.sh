@@ -53,12 +53,13 @@ check "version in changelog" $?
 # (1.33.x), FAT-family (1.34.x), and DNS (1.35.x) arcs — the kernel is ~806KB.
 # Ceiling moved to 1.2M, then 1.4M: the 1.44.x scheduler + 1.45.x net arcs closed
 # on 1.2M and the 1.46.x lseek/flock syscalls crossed it (~1,203,984 B), so the
-# bound moved 1.2M → 1.4M — still catching a runaway-bloat regression. Matches
-# scripts/test.sh (bumped in lockstep).
+# bound moved 1.2M → 1.4M. The 1.54.x GPU arc (F0 landed ~1.40M; C0+ add the
+# CP/MEC/RLC/PSP register tables) moved it 1.4M → 1.5M — still catching a
+# runaway-bloat regression. Matches scripts/test.sh (bumped in lockstep).
 echo ""
 echo "--- Binary ---"
 SZ=$(wc -c < "$ROOT/build/agnos")
-test "$SZ" -gt 50000 && test "$SZ" -lt 1400000
+test "$SZ" -gt 50000 && test "$SZ" -lt 1500000
 check "binary size ($SZ bytes)" $?
 
 echo ""

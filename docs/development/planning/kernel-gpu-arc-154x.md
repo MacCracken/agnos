@@ -155,6 +155,11 @@ P5 needs C1/C2). Batch read-only bites per burn where safe (F0+P0+C0 are read-on
   flashes for kernel changes.
 - Every bite gets a CONFIRM/FALSIFY tracker entry in agnosticos `iron-nuc-zen-log.md` **before**
   the user flashes ([[feedback_iron_testing_constraints]] — burns block user work).
+- **⚠ Build-size ceiling — LIFT IT AT C0.** `scripts/check.sh:61` caps `build/agnos` at
+  `< 1,400,000` bytes; F0 (1.54.0) landed at **1,399,536 (only 464 B headroom)**. The compute bites
+  (C0's CP/MEC register table onward) WILL cross it — raise the bound when C0 lands. It is a
+  size-discipline threshold (last set in the ~250 KB era), NOT a correctness bound. User-confirmed
+  2026-07-11 ("you will need to lift that ceiling later").
 
 ## Risks / open questions (resolve in bite order; honest, not hidden)
 

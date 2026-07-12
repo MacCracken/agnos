@@ -82,20 +82,19 @@ fn gpu_probe() {
     kprint_hex(bar & 0xFFFFFFFF);
     kprintln(" UC", 3);
 
-    # NBIO/RCC — always-on bus interface; the strongest "aperture maps the right
-    # device" proof (STRAP0[15:0] echoes the PCI device id).
+    # NBIO/RCC — always-on bus interface. CONFIG_MEMSIZE is a real UMA-size read
+    # (the aperture-correctness anchor). STRAP0's device-id mirror reads 0x0 on
+    # Cezanne (an EPF0-strap MMIO-alias quirk — amdgpu reads it the same direct
+    # way; iron 2026-07-11), so device identity comes authoritatively from PCI
+    # config, not this register; strap0 is printed raw as a diagnostic only.
     var strap0 = gpu_reg32(GPU_BASE_NBIO_2, GPU_R_RCC_STRAP0);
-    var strap_devid = strap0 & GPU_STRAP0_DEVID_MASK;
-    var strap_rev   = (strap0 >> 24) & 0xF;
     var memsize = gpu_reg32(GPU_BASE_NBIO_2, GPU_R_CONFIG_MEMSIZE);
 
     kprint("gpu: strap0=0x", 14);
     kprint_hex(strap0 & 0xFFFFFFFF);
-    kprint(" devid=0x", 9);
-    kprint_hex(strap_devid);
-    kprint(" rev=", 5);
-    kprint_num(strap_rev);
-    kprint(" vram=", 6);
+    kprint(" (pci devid=0x", 14);
+    kprint_hex(pci_device(idx));
+    kprint(") vram=", 7);
     kprint_num(memsize);
     kprintln("MB", 2);
 
@@ -111,11 +110,74 @@ fn gpu_probe() {
     kprint_hex(grbm & 0xFFFFFFFF);
     kprintln("", 0);
 
-    # F0 pass gate: the register aperture echoes THIS device's id via STRAP0.
-    if (strap_devid == pci_device(idx)) {
+    # F0 pass gate: the aperture reads REAL values (a sane VRAM size + a structured
+    # GB_ADDR_CONFIG, both non-0 / non-0xFFFFFFFF). This replaced the STRAP0 anchor
+    # (which reads 0x0 on Cezanne — see above), iron-corrected 2026-07-11.
+    var live = 0;
+    if (memsize != 0 && memsize != 0xFFFFFFFF && gbcfg != 0 && gbcfg != 0xFFFFFFFF) { live = 1; }
+    if (live != 0) {
         kprintln("gpu: F0 OK - register aperture live", 35);
         return 1;
     }
-    kprintln("gpu: F0 WARN - strap0 devid mismatch (aperture?)", 48);
+    kprintln("gpu: F0 WARN - aperture reads dead (0/FFFFFFFF)", 47);
+    return 1;
+}
+
+# === C0 — firmware-reality check (the arc's honest hard gate) ================
+# Read-only dump of the CP/MEC/RLC firmware-state registers + the PSP sign-of-
+# life, to decide whether the CP/MEC/RLC microcode is resident + running from
+# BIOS/PSP (Case A → the compute rings can proceed) or NOT loaded (Case B → agnos
+# must drive the PSP firmware-load handshake first — a substantial sub-arc that
+# reshapes the compute ladder). On a GOP-lit APU the expected answer is Case B:
+# the BIOS lit the DISPLAY via GOP but did not bring up the GFX/compute engine.
+#
+# All registers are DIRECT in BAR5. ⚠ BASE_IDX: CP_STAT/CP_ME_CNTL/CP_MEC_CNTL/
+# MEC_HEADER are GC seg[0] (0x2000); RLC_* are GC seg[1] (0xA000); the PSP mailbox
+# is MP0 seg[0] (0x16000). Gating caveat: a GFXOFF-gated GC reads 0 (looks
+# "unloaded") — F0 proved GC ungated this boot (gb_addr_config real), and RLC
+# stays powered even when the CP is gated, so read RLC before trusting CP zeros.
+# Derived from Linux gfx_v9_0.c (halt-bit polarity) + psp_v12_0.c (mailbox). NO
+# device-state writes — pure reads (the PSP load itself is a later bite).
+fn gpu_fw_probe() {
+    if (gpu_present == 0) { return 0; }
+
+    # PSP sign-of-life (MP0) + RLC state / GFXOFF discriminator (GC seg[1]).
+    var psp_sol  = gpu_reg32(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_81);
+    var rlc_cntl = gpu_reg32(GPU_BASE_GC_1, GPU_R_RLC_CNTL);
+    var rlc_gpm  = gpu_reg32(GPU_BASE_GC_1, GPU_R_RLC_GPM_STAT);
+    # CP graphics + MEC compute engine state (GC seg[0]).
+    var cp_me_cntl = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_ME_CNTL);
+    var mec_cntl   = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL);
+    var mec_hdr    = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_ME1_HEADER);
+    var cp_stat    = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_STAT);
+
+    kprint("gpu: C0 psp=0x", 14);
+    kprint_hex(psp_sol & 0xFFFFFFFF);
+    kprint(" rlc=0x", 7);
+    kprint_hex(rlc_cntl & 0xFFFFFFFF);
+    kprint(" gpm=0x", 7);
+    kprint_hex(rlc_gpm & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    kprint("gpu: C0 me=0x", 13);
+    kprint_hex(cp_me_cntl & 0xFFFFFFFF);
+    kprint(" mec=0x", 7);
+    kprint_hex(mec_cntl & 0xFFFFFFFF);
+    kprint(" hdr=0x", 7);
+    kprint_hex(mec_hdr & 0xFFFFFFFF);
+    kprint(" stat=0x", 8);
+    kprint_hex(cp_stat & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    # Verdict — halt bits SET = engine halted; RLC_CNTL bit0 = RLC running w/ ucode;
+    # MEC header nonzero = MEC1 fetched its ucode. Case A needs all four positive.
+    var rlc_on     = rlc_cntl & GPU_RLC_ENABLE_F32;
+    var gfx_halted = cp_me_cntl & GPU_CP_GFX_HALT_MASK;
+    var mec_halted = mec_cntl & GPU_CP_MEC_ME1_HALT;
+    if (rlc_on != 0 && gfx_halted == 0 && mec_halted == 0 && mec_hdr != 0) {
+        kprintln("gpu: C0 = CASE A (ucode resident, running)", 42);
+        return 1;
+    }
+    kprintln("gpu: C0 = CASE B (ucode NOT loaded; PSP-load)", 45);
     return 1;
 }

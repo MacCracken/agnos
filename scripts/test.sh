@@ -80,12 +80,13 @@ exit(0 if ok else 1)
     # sanity ceiling moved 800K → 1.2M. The 1.44.x preemptive-scheduler + 1.45.x
     # net-stack/server arcs then closed on it (1.45.10 = 1,199,984 B, 16 B under),
     # and the 1.45.11 TCP slot-leak fix + persistent HTTP listen-smoke crossed it
-    # (~1,200,544 B), so the ceiling moved 1.2M → 1.4M — generous headroom for the
-    # rest of the 1.x line while still catching a runaway-bloat regression. (Note:
-    # ~41 KB is DCE-eliminable unreachable fns — CYRIUS_DCE=1 — if a real squeeze
-    # is ever wanted; the ceiling, not DCE, is the right knob for organic growth.)
+    # (~1,200,544 B), so the ceiling moved 1.2M → 1.4M. The 1.54.x GPU arc (F0
+    # ~1.40M; C0+ add the CP/MEC/RLC/PSP register tables) moved it 1.4M → 1.5M —
+    # generous headroom for the compute bites while still catching a runaway-bloat
+    # regression. (Note: ~41 KB is DCE-eliminable unreachable fns — CYRIUS_DCE=1 —
+    # if a real squeeze is ever wanted; the ceiling, not DCE, is the growth knob.)
     SZ=$(wc -c < $ROOT/build/agnos_test 2>/dev/null || echo 0)
-    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 1400000 ]; then
+    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 1500000 ]; then
         check "x86 size reasonable (${SZ}B)" "0" "0"
     else
         check "x86 size reasonable (${SZ}B)" "0" "1"

@@ -39,6 +39,7 @@ var GPU_RMMIO_SIZE    = 0x80000;  # 512 KB — regs with (index*4) < this are di
 # Absolute DWORD index = base + register_offset. Only the segments the arc
 # actually reaches are named; add rows per bite. (renoir_ip_offset.h.)
 var GPU_BASE_GC_0     = 0x2000;   # graphics/compute core, segment 0
+var GPU_BASE_GC_1     = 0xA000;   # graphics/compute core, segment 1 (RLC + CP ucode-load iface)
 var GPU_BASE_NBIO_2   = 0xD20;    # NBIO/NBIF/RCC, segment 2 (STRAP0, MEMSIZE)
 var GPU_BASE_MMHUB_0  = 0x1A000;  # GMC / memory hub, segment 0 (C1 GPUVM)
 var GPU_BASE_DCN_1    = 0xC0;     # DCE/DCN 2.1 display, segment 1 (Thrust P)
@@ -57,4 +58,24 @@ var GPU_R_GB_GPU_ID      = 0x640; # mmGB_GPU_ID: [3:0] GPU_ID (0 on a single-die
 var GPU_R_DCE_VERSION    = 0x5E;  # mmDCE_VERSION: DCE/DCN version constant
 
 # --- Field masks ---
-var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id
+var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id (reads 0x0 on Cezanne — quirk)
+
+# --- C0: CP/MEC/RLC firmware-state + PSP mailbox (the firmware-reality gate) ---
+# All DIRECT in BAR5. ⚠ BASE_IDX matters: CP_STAT/CP_ME_CNTL/CP_MEC_CNTL/MEC_HEADER
+# are GC seg[0] (0x2000); RLC_* are GC seg[1] (0xA000); the PSP mailbox is MP0
+# seg[0] (0x16000). Derived from Linux gfx_v9_0.c + psp_v12_0.c (gc_9_0_offset.h,
+# mp_12_0_0_offset.h). Halt-bit polarity: SET = engine halted.
+var GPU_R_CP_STAT           = 0x1A0;  # GC seg0 — CP busy bits (activity, not load-state)
+var GPU_R_CP_ME_CNTL        = 0x1B6;  # GC seg0 — PFP/ME/CE run/halt gate
+var GPU_R_CP_MEC_CNTL       = 0x8D;   # GC seg0 — MEC1/2 run/halt gate
+var GPU_R_CP_CPC_STATUS     = 0x84;   # GC seg0 — compute-pipe-controller busy
+var GPU_R_CP_MEC_ME1_HEADER = 0x8E;   # GC seg0 — MEC1 ucode header readback (nonzero = fetched)
+var GPU_R_RLC_CNTL          = 0x4C00; # GC seg1 — RLC run gate (bit0 = enabled w/ ucode)
+var GPU_R_RLC_STAT          = 0x4C04; # GC seg1 — RLC coarse status
+var GPU_R_RLC_GPM_STAT      = 0x4C40; # GC seg1 — GPM status (GFX power/clock = GFXOFF discriminator)
+var GPU_R_MP0_C2PMSG_81     = 0x91;   # MP0 seg0 — PSP secure-OS sign-of-life (nonzero = PSP up)
+
+# --- C0 field masks (gc_9_0_sh_mask.h) ---
+var GPU_RLC_ENABLE_F32   = 0x1;         # RLC_CNTL bit0 — RLC running with ucode
+var GPU_CP_GFX_HALT_MASK = 0x14000000;  # CP_ME_CNTL: ME_HALT|PFP_HALT (set = gfx halted)
+var GPU_CP_MEC_ME1_HALT  = 0x40000000;  # CP_MEC_CNTL bit30 (set = MEC1 halted)

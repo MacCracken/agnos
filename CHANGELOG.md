@@ -5,6 +5,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.1] — 2026-07-11 — GPU arc bite C0: firmware-reality check (+ the F0 STRAP0/pass-gate iron fix)
+
+**F0 was iron-validated on archaemenid 2026-07-11** (the 1.54.0 burn): the GPU register aperture is
+live — `CONFIG_MEMSIZE` read a real 3072 MB UMA size and GC `GB_ADDR_CONFIG`/`GRBM_STATUS` read real
+gfx9 values, proving the Renoir reg-base table. This cut adds **C0**, the arc's honest hard gate, and
+folds in the F0 fix the burn surfaced. C0's register dump is **iron-only** (QEMU has no gfx90c/DCN).
+
+### Added
+
+- **Firmware-reality check (bite C0)** — `kernel/core/gpu.cyr` `gpu_fw_probe()`: a READ-ONLY dump of
+  the CP/MEC/RLC firmware-state registers + the PSP sign-of-life, to decide whether the compute
+  microcode is **resident + running** from BIOS/PSP (Case A → the compute rings can proceed at
+  C1/C2) or **not loaded** (Case B → agnos must drive the PSP firmware-load handshake first — a
+  substantial sub-arc that reshapes the ladder). On a GOP-lit APU (BIOS lit the display via GOP, not
+  the GFX/compute engine) the expected answer is Case B. Reads `CP_ME_CNTL`/`CP_MEC_CNTL` (PFP/ME/CE
+  + MEC halt gates), `CP_MEC_ME1_HEADER_DUMP` (MEC ucode fetch), `RLC_CNTL` (the RLC run gate that
+  gates the CP on gfx9), `RLC_GPM_STAT` (GFXOFF discriminator), and `MP0 C2PMSG_81` (PSP secure-OS
+  sign-of-life) → a `CASE A`/`CASE B` verdict. No DMA, no firmware load, no device-state writes.
+- **CP/MEC/RLC/PSP register table** — `kernel/core/gpu_regs.cyr`: GC segment 1 (`0xA000`, RLC + the
+  CP ucode-load interface) + the C0 register offsets and halt-bit masks. Derived from Linux amdgpu
+  `gfx_v9_0.c` (halt-bit polarity) + `psp_v12_0.c` (the Renoir PSP mailbox map) + `gc_9_0_offset.h` /
+  `mp_12_0_0_offset.h`; all reads direct in BAR5.
+
+### Fixed
+
+- **F0 STRAP0 device-id read + pass-gate** (`kernel/core/gpu.cyr`) — the 1.54.0 iron burn showed
+  `mmRCC_DEV0_EPF0_STRAP0` reads `0x0` on real Cezanne (an EPF0-strap MMIO-alias quirk — the offset
+  was correct; amdgpu reads it the same direct way, and `CONFIG_MEMSIZE` in the same NBIO block reads
+  fine). F0's pass-gate was keyed on that register, so it printed a false `WARN`. **Fix:** device
+  identity now comes from PCI config (authoritative), and the pass-gate keys on the proven-live reads
+  (`CONFIG_MEMSIZE` + `GB_ADDR_CONFIG`, non-0/non-`0xFFFFFFFF`) → F0 now prints `F0 OK` on the
+  validated aperture. `strap0` is still printed raw as a diagnostic.
+
+### Changed
+
+- **Kernel binary-size ceiling `1.4M → 1.5M`** (`scripts/check.sh`, `scripts/test.sh`, in lockstep) —
+  F0 landed the kernel at ~1.40 M (464 B under the old bound); C0's CP/MEC/RLC/PSP register table
+  crossed it (1,401,104 B). New ceiling gives ~99 KB headroom for the coming compute bites while
+  still catching a runaway-bloat regression.
+
 ## [1.54.0] — 2026-07-11 — Kernel GPU arc OPENS: bite F0 (GPU probe + register-aperture ID dump)
 
 Opens the **1.54.x kernel GPU arc** — *push pixels AND data through the GPU* (compute is the
