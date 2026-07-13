@@ -5,6 +5,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.21] — 2026-07-13 — ktest.sh boot-to-shell smoke harness repaired (bench.sh pattern) + kashi 1.0.3 pin
+
+The QEMU boot-to-shell functional smoke (`scripts/ktest.sh`) had rotted three independent ways
+and no longer built: (1) the 1.37.5 kashi fold-in broke the build outright — a bare `cyrius build`
+fails `undefined KASHI_FONT_VGA_8X16` because the font-data prepend lives only in `scripts/build.sh`;
+(2) since the 1.36.2 `main.cyr`→`core/boot_finish.cyr` split, two of its three `sed` patches
+silently no-op'd (the shell launch left `main.cyr`, and `sh_cmd_test` became a `#ifdef TEST` shell
+verb in `user/test.cyr`); (3) its `qemu -kernel` ELF32 boot hangs in apic_init under modern QEMU.
+Rebuilt on the proven `scripts/bench.sh` pattern. No kernel behavior change — tooling/CI only.
+
+### Changed
+
+- **`scripts/ktest.sh`** — rewritten. Rewrites the `kybernet(); arch_halt();` launch site in
+  `core/boot_finish.cyr` to `sh_cmd_test(); arch_halt();`, delegates the build to `scripts/build.sh`
+  (the single home of the kashi font-data prepend + ELF64/multiboot2 gates), and boots via
+  gnoboot + OVMF (the ELF64 path). A `trap … EXIT INT TERM` + a private `.ktestbak` suffix + a
+  launch-site match guard make the old "left a kernel source `sed`-patched when the build failed
+  under `set -e`" corruption class impossible. Runs the full PMM/heap/VFS/proc/syscall/kstdlib/
+  initrd suite end-to-end.
+- **`scripts/build.sh`** — added a `TEST=1` → `#define TEST` gate (mirrors the existing
+  `*_SELFTEST` env→define pattern). `user/test.cyr` (`sh_cmd_test` + the suite) and the shell
+  `test` verb are `#ifdef TEST`-gated; ktest.sh passes `TEST=1` so the rewritten call resolves.
+- **`scripts/build.sh` + `scripts/bench.sh`** — `KASHI_REF` pin `1.0.0` → `1.0.3` (aligns the
+  CI clone-fallback with the kashi 1.0.3 toolchain-bump cut; local builds use the `../kashi`
+  sibling, and `src/font_data.cyr` is byte-identical across the 1.0.x bumps).
+
+### Note
+
+- The restored harness surfaces **5 pre-existing test-code drift failures** (98 passed, 5 failed) —
+  not regressions from this cut. 2 PMM assertions (`user/test.cyr:81-82`) hardcode a 4096-page
+  bitmap boundary the PMM outgrew (`pmm_bitmap_pages = 65536`); 3 initrd assertions need the test
+  initrd that `core/main.cyr` builds only under `#ifdef KTEST` (and the KTEST boot path itself
+  currently hangs before `boot_finish` under gnoboot+OVMF). Both are kernel test-code fixes tracked
+  for a follow-up; the harness itself is correct.
+
 ## [1.54.20] — 2026-07-13 — GPU arc C2g-1 fix: multi-thread wave EXEC unmask + full per-thread arithmetic
 
 **C2g-1 burns 1-3** localized the multi-thread failure precisely: the 64-thread dispatch RETIRES (done-marker
