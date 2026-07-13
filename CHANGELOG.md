@@ -5,6 +5,40 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.12] — 2026-07-12 — GPU arc bite C2d: first PM4 packet + doorbell (the VM-fetch gate)
+
+**C2c was iron-validated** (1.54.10): the compute queue is mapped + active + empty on MEC1/pipe0/queue0.
+C2d makes the MEC actually *fetch* — write a PM4 packet, ring the doorbell, and watch the CP translate
+the ring address through the FB aperture for the first time. This is the make-or-break VM-fetch gate and
+the highest-hang-risk bite of the arc.
+
+### Added
+
+- **First PM4 packet + doorbell (bite C2d)** — `kernel/core/gpu.cyr` `gpu_ring_kick()`: writes one
+  8-dword `PACKET3_NOP` (`0xC0061000` + 7 zero dwords) into the ring at the carveout arena (CPU-phys,
+  UC), `gpu_mfence`, then **rings the doorbell** — a single 64-bit posted write of `wptr=8` (dwords) to
+  `BAR2 + 0x18` (`0xE0000018`). The MEC fetches + consumes the NOP, translating the ring GPUVA
+  (`0xF480000000`) through the C2b FB aperture with **no page tables**. Pre-steps: pre-flight assert the
+  ring is inside the FB window; program `CP_MEC_DOORBELL_RANGE_LOWER/UPPER` (`0x105c=0`/`0x105d=0xE8`) so
+  the MEC honors byte `0x18`; pre-clear the sticky `VM_L2_PROTECTION_FAULT_STATUS`. A **bounded watchdog**
+  (poll the memory rptr-report for `rptr==8`, 100 ms cap, never spins) + an authoritative `CP_HQD_PQ_RPTR`
+  cross-check + a register-wptr **isolation fallback** (runs only on a no-fetch, to tell doorbell-route
+  from VM-fetch failure). `kernel/core/gpu_regs.cyr`: the C2d doorbell-range + PM4 constants.
+  - Pass signal: `gpu: C2d = PM4 FETCHED (rptr 0->8; the MEC ran the ring)` (`rmem`/`rreg`=8, `fault`=0,
+    `grbm` idle) — the first sovereign PM4 dispatch.
+
+### Notes
+
+- **CPU-wedge-proven-safe** (4-agent derivation + 2-lens adversarial + final code re-verify, all
+  `refuted=False`): every CPU access hits a decoded address; the doorbell is a posted PCIe write; GPU
+  bus-master is OFF (the MEC reaches the ring only via its local MC — it cannot DMA system RAM); the C2b
+  fault-net (`0x1FFC`, ground-truth-confirmed contiguous bits[2:12]) serves the dummy page with no IRQ /
+  no crash; the sole wedge vector (unbounded spin) is eliminated by the bounded watchdog. All offsets
+  anchor-validated vs `gc_9_0_offset.h`. No new firmware; flash `--update-all`. Iron-only; QEMU no-op.
+  Rubric: agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c2d` (with the falsification table — `fault!=0`
+  ⟹ FB-aperture-no-PT bet failed, contingency is a minimal DEPTH-0 GART). Next (post-fetch): C2e
+  (WRITE_DATA/RELEASE_MEM fence) → C2f (gfx90c shader) → C2g (rosnet matmul on the GPU).
+
 ## [1.54.11] — 2026-07-12 — log-capture fixes: console-write cap + relative-path creation
 
 Two tooling bugs surfaced while capturing the C2c iron log to a file (both post-boot, neither

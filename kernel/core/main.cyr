@@ -865,6 +865,13 @@ gpu_vm_setup();
 # See kernel/core/gpu.cyr gpu_queue_setup().
 gpu_queue_setup();
 
+# GPU arc C2d (1.54.x) — first PM4 packet: write an 8-dword NOP into the ring, ring the
+# doorbell, and watch the MEC fetch it through the FB aperture (the VM-fetch gate). The
+# HIGHEST hang-risk bite — but CPU-wedge-safe (posted doorbell + fault-net + a BOUNDED
+# watchdog, never spins). Runs after C2c mapped the queue. Iron-only; no-op off an AMD GPU.
+# See kernel/core/gpu.cyr gpu_ring_kick().
+gpu_ring_kick();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

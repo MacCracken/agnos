@@ -208,3 +208,10 @@ var GPU_VM_RING_SUBOFF = 0x00000;   # PM4 ring (64 KB)
 var GPU_VM_MQD_SUBOFF  = 0x10000;   # MQD save-area (4 KB)
 var GPU_VM_RPTR_SUBOFF = 0x11000;   # rptr-report page
 var GPU_VM_EOP_SUBOFF  = 0x13000;   # EOP buffer (4 KB, 4 KB-aligned)
+
+# --- C2d: first PM4 packet + doorbell (the VM-fetch gate) ---
+# CP_MEC_DOORBELL_RANGE gates which doorbell byte-offsets the MEC honors (GC seg0).
+var GPU_R_CP_MEC_DOORBELL_RANGE_LOWER = 0x105C;  # byte-offset window low  (0)
+var GPU_R_CP_MEC_DOORBELL_RANGE_UPPER = 0x105D;  # byte-offset window high (>=0x18)
+var GPU_PM4_NOP8_HDR             = 0xC0061000;   # PACKET3(NOP, count=6) — an 8-dword type-3 NOP
+var GPU_DOORBELL_RANGE_UPPER_VAL = 0xE8;         # amdgpu (USERQUEUE_END*2)<<2; brackets our 0x18

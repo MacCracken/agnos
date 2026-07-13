@@ -34,6 +34,7 @@ var gpu_psp_fctr  = 0;       # monotonic fence counter (first submit = 1)
 var gpu_arena_mc   = 0;      # MEC/FB-aperture MC address (pq_base = mc>>8)
 var gpu_arena_phys = 0;      # CPU physical address (UC-mapped)
 var gpu_queue_active = 0;    # C2c: 1 = MEC1/pipe0/queue0 mapped (HQD active, empty)
+var gpu_ring_fetched = 0;    # C2d: 1 = the MEC fetched+consumed a PM4 packet (VM-fetch gate open)
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -995,5 +996,123 @@ fn gpu_queue_setup() {
         return 1;
     }
     kprintln("gpu: C2c = QUEUE MAP INCOMPLETE (check active/rptr/gui)", 55);
+    return 0;
+}
+# ── C2d — first PM4 packet: the VM-fetch gate ─────────────────────────────────
+# The queue is mapped + active + EMPTY (C2c). C2d writes ONE 8-dword PACKET3_NOP into
+# the ring, rings the doorbell, and watches the MEC fetch+consume it — the FIRST time
+# the MEC translates a GPUVA (the ring base) through the C2b FB aperture (no page
+# tables). THE make-or-break VM-fetch gate. CPU-wedge-SAFE (adversarially verified):
+# every CPU access hits a decoded address (carveout DRAM / BAR5 / BAR2 doorbell); the
+# doorbell is a POSTED PCIe write the CPU can't block on; the C2b fault-net (0x1FFC:
+# serve-dummy-page, no-IRQ, no-crash — CONTIGUOUS bits[2:12], ground-truth-confirmed)
+# bounds any fault to GPU-side; the ONLY wedge vector is an unbounded spin, eliminated
+# by the bounded watchdog. Derived + 2-lens adversarially verified vs PM4/gfx_v9_0.
+fn gpu_ring_kick() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_queue_active == 0) { return 0; }   # C2c mapped the queue
+    if (gpu_arena_mc == 0) { return 0; }
+    var ring_mc = gpu_arena_mc;                 # ring at arena suboffset 0
+
+    # Pre-flight: the ring MC MUST be inside the FB aperture, else the MEC fetch faults.
+    var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
+    var r_top  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_TOP)  & GPU_FB_LOC_MASK;
+    var fb_base = r_base << 24;
+    var fb_top  = (r_top << 24) + 0x1000000;
+    if (ring_mc < fb_base || ring_mc >= fb_top) {
+        kprintln("gpu: C2d ABORT - ring MC outside FB aperture", 44);
+        return 0;
+    }
+
+    # Program the MEC doorbell range so the CP honors our doorbell byte 0x18 (C2c left
+    # it unset). Global CP regs (no GRBM select). LOWER=0, UPPER=0xE8 covers [0,0xE8].
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MEC_DOORBELL_RANGE_LOWER, 0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MEC_DOORBELL_RANGE_UPPER, GPU_DOORBELL_RANGE_UPPER_VAL);
+
+    # UC-map BAR2 + the doorbell 8-byte slot (index 0x06 -> byte 0x18).
+    var bar2 = pci_bar_64(gpu_pci_idx, 2);
+    if (bar2 == 0) { kprintln("gpu: C2d ABORT - no BAR2 doorbell aperture", 42); return 0; }
+    vmm_remap_uc_2mb(bar2);
+    var db_slot = bar2 + 0x18;
+
+    # Clear any stale (sticky) VM_L2_PROTECTION_FAULT_STATUS so a post-kick fault!=0
+    # unambiguously means a C2d fetch fault (not a leftover from an earlier probe).
+    # Pulse CLEAR (bit0) then re-arm to the exact prior CNTL value (0x1FFC fault-net).
+    var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
+
+    # Write one 8-dword PACKET3_NOP into the ring (CPU UC), then fence BEFORE the kick.
+    store32(gpu_arena_phys + 0x00, GPU_PM4_NOP8_HDR);   # PACKET3(NOP, count=6) = 0xC0061000
+    store32(gpu_arena_phys + 0x04, 0);
+    store32(gpu_arena_phys + 0x08, 0);
+    store32(gpu_arena_phys + 0x0C, 0);
+    store32(gpu_arena_phys + 0x10, 0);
+    store32(gpu_arena_phys + 0x14, 0);
+    store32(gpu_arena_phys + 0x18, 0);
+    store32(gpu_arena_phys + 0x1C, 0);                  # dwords 1..7 = zero body
+    gpu_mfence();
+
+    # KICK: single 64-bit POSTED doorbell write = wptr in DWORDS (8, no shift). Fence.
+    store64(db_slot, 8);
+    gpu_mfence();
+
+    # BOUNDED watchdog (NEVER spin): poll the memory rptr-report for rptr==8, 100 ms cap.
+    var i = 0;
+    var ok = 0;
+    var rmem = 0;
+    while (i < 1000) {
+        rmem = load32(gpu_arena_phys + 0x11000) & 0xFFFFFFFF;
+        if (rmem == 8) { ok = 1; i = 1000; }
+        else { gpu_udelay(100); i = i + 1; }
+    }
+
+    # Cross-check: the AUTHORITATIVE CP_HQD_PQ_RPTR (via GRBM-select), fault, GRBM idle.
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    var rreg = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+    var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+    var grbm  = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
+    var gui   = grbm & GPU_GRBM_GUI_ACTIVE;
+
+    kprint("gpu: C2d rmem=0x", 16);
+    kprint_hex(rmem);
+    kprint(" rreg=0x", 8);
+    kprint_hex(rreg & 0xFFFFFFFF);
+    kprint(" fault=0x", 9);
+    kprint_hex(fault & 0xFFFFFFFF);
+    kprint(" grbm=0x", 8);
+    kprint_hex(grbm & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    # Isolation fallback (only on a clean no-fetch): a direct register wptr write bypasses
+    # the doorbell route — if THAT advances rptr, the doorbell routing was the gap (not VM).
+    if (rmem == 0 && (rreg & 0xFFFFFFFF) == 0 && fault == 0) {
+        gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+        gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, 8);
+        gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
+        var j = 0;
+        while (j < 200) {
+            if ((gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR) & 0xFFFFFFFF) == 8) { rreg = 8; j = 200; }
+            else { gpu_udelay(100); j = j + 1; }
+        }
+        gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+        if ((rreg & 0xFFFFFFFF) == 8) { kprintln("gpu: C2d fallback: register-wptr kick fetched (doorbell route was the gap)", 74); }
+        if ((rreg & 0xFFFFFFFF) != 8) { kprintln("gpu: C2d fallback: still no fetch (VM/ring issue, not the doorbell)", 67); }
+    }
+
+    var fetched = 0;
+    if (ok != 0) { fetched = 1; }
+    if ((rreg & 0xFFFFFFFF) == 8) { fetched = 1; }
+    if (fault != 0) {
+        kprintln("gpu: C2d = VM-FETCH FAULT (FB-aperture xlate faulted; served dummy)", 67);
+        return 0;
+    }
+    if (fetched != 0 && gui == 0) {
+        gpu_ring_fetched = 1;
+        kprintln("gpu: C2d = PM4 FETCHED (rptr 0->8; the MEC ran the ring)", 56);
+        return 1;
+    }
+    kprintln("gpu: C2d = NO FETCH (doorbell not honored / rptr stuck)", 55);
     return 0;
 }

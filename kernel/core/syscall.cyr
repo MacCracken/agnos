@@ -58,6 +58,7 @@ fn stack_canary_check(canary) {
 #    (hapi) needs to SEE an existing link + byte-compare its target (stat#33 follows).
 
 var sys_exit_code = 0;
+var dbg_kbscan_hb = 0;   # DBG — kbscan#42 heartbeat throttle counter
 
 # --- execwait #37 nested-exec save block (1.43.x) ---
 # Snapshot of agnsh's kernel resume context across the nested exec_and_wait(child).
@@ -2035,6 +2036,16 @@ fn ksyscall(num, arg1, arg2, arg3) {
         while (ks_w < 256) { hid_poll(); ks_w = ks_w + 1; }  # bounded window: take IRQ1 + drain xHCI ring
         kbd_irq_disable();               # cli — restore IF=0 for the handler tail
         preempt_enable();
+        dbg_kbscan_hb = dbg_kbscan_hb + 1;   # DBG heartbeat (~1/sec at 35 Hz)
+        if (dbg_kbscan_hb >= 35) {
+            dbg_kbscan_hb = 0;
+            kprint("kbhb drn=", 9); kprint_num(hid_dbg_drained);
+            kprint(" prc=", 5); kprint_num(hid_dbg_processed);
+            kprint(" psh=", 5); kprint_num(hid_dbg_pushed);
+            kprint(" hd=", 4); kprint_num(kb_head);
+            kprint(" tl=", 4); kprint_num(kb_tail);
+            kputc(10);
+        }
         var ks_n = 0;
         while (ks_n < arg2) {
             if (kb_has_key() == 0) { stack_canary_check(canary); return ks_n; }
