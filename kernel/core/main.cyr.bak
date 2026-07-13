@@ -29,8 +29,39 @@ vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 # any subsystem is up. Now paints into the WC-remapped FB above.
 fb_console_init();
 
+#ifdef FB_ANSI_SELFTEST
+# 1.43.1 — ANSI/CSI/SGR parser gate. Runs right after fb_console_init (FB geometry
+# is live) and emits `fb-ansi: PASS/FAIL` markers to serial for fb-ansi-smoke.sh.
+fb_ansi_selftest();
+#endif
+
+#ifdef FB_ANSI_VISUAL
+# 1.43.1 — VISUAL: paint colour swatches through the real render path + halt, so a
+# QEMU screendump captures them. Halts here (does not continue boot).
+fb_ansi_visual();
+#endif
+
 print_agnos_kernel_banner();
 kprintln("64-bit long mode", 16);
+
+# KASLR probe (1.47.3 bite 2b): print the kernel's actual physical load base. gnoboot randomizes it
+# via RDRAND and passes it at boot_info+0x70 (copied CR3-independently by boot_info_capture_rdi). A
+# value in [32 MB, 254 MB) that DIFFERS across boots is the slide working; a fixed 0x100000 means a
+# non-PIE kernel or the slide fell back. RIP-relative code runs correctly wherever it landed.
+kprint("KASLR: kernel_base=", 19);
+kprint_hex(load64(load64(&boot_info_ptr) + 0x70));
+kprintln("", 0);
+
+# Full RAM init (1.49.1 bite 1): probe the UEFI memory map gnoboot passed + report the machine's
+# actual RAM (free EfiConventionalMemory pages -> MB, and the top-of-RAM phys addr). Discovery only —
+# the PMM still allocates from the 4-16 MB pool; bite 2 sizes it to this. ram-probe-smoke.sh asserts
+# the MB scales with QEMU -m (vs the old hardcoded 128 MB bitmap).
+pmm_probe_memmap(load64(&boot_info_ptr));
+kprint("RAM: usable=", 12);
+kprint_num(pmm_memmap_usable / 256);
+kprint("MB top=", 7);
+kprint_hex(pmm_memmap_top);
+kprintln("", 0);
 
 # Per-stage CMOS stamps survive hangs and are decoded by
 # agnosticos/scripts/read-boot-log.sh. Slot map: 0x50 = kernel CP,
@@ -54,6 +85,11 @@ idt_init();
 # that stamp the faulting vector to CMOS[0x54] + halt — so a CPU exception
 # during the ring-3 exec transition stops triple-faulting into a silent reset
 # and instead leaves a readable cause. See exc_handlers_init in idt.cyr.
+# 1.47.x proc-teardown-on-fault: point idt.cyr's indirect hook at the teardown handler
+# (fault_kill_current in syscall.cyr) BEFORE the exception stubs go live, so a ring-3
+# (CPL3) #PF/#GP/#UD kills the proc + returns to the agnsh prompt instead of halting the
+# box. main.cyr is parsed last (agnos.cyr:117), so &fault_kill_current resolves here.
+exc_ring3_kill_fn = &fault_kill_current;
 exc_handlers_init();
 kprintln("IDT loaded", 10);
 
@@ -70,21 +106,37 @@ kprintln("Timer ISR installed", 19);
 
 # Initialize Local APIC (keeps PIC for keyboard IRQ1)
 apic_init();
-# Start APIC timer on vector 32 (same as PIT), ~100Hz
-# QEMU bus freq varies; 10000000 gives roughly 100Hz
-apic_timer_init(32, 10000000);
+# Start APIC timer on vector 32 (same as PIT). CALIBRATE the div1 LAPIC input
+# against PIT ch0 (still free-running here, pre-pic_mask_pit) for a TRUE 100Hz.
+# On real Zen the LAPIC input is ~12x below QEMU's ~1GHz, so the old hardcoded 10M
+# gave ~8.3Hz -> 12x-slow uptime + a starved 100Hz audio servicer (found via a
+# 6h soak + tonegen). Called INLINE (boot-sequence order, not a gvar-init var);
+# lapic_reload_100hz falls back to 10M on an implausible measure.
+apic_timer_init(32, lapic_reload_100hz());
+# The LAPIC timer now owns vector 32 — mask the legacy PIT (IRQ0) so its
+# free-running ticks can't wedge the 8259's in-service register and block the
+# keyboard's IRQ1 (the iron keystroke path). See pic_mask_pit(). IF is still 0
+# here, so no PIT IRQ0 can have been delivered/latched yet.
+pic_mask_pit();
 kprint("APIC: id=", 9);
 kprint_num(cpu_id);
 kprintln(" timer active", 13);
+# Self-documenting: the calibrated LAPIC reload (lapic_timer_count set by
+# apic_timer_init). QEMU ~10000000; real Zen ~830000 (the 12x-slow-clock fix).
+kprint("LAPIC: reload=", 14);
+kprint_num(lapic_timer_count);
+kprintln("", 0);
 
 # === CMOS kernel checkpoint 7 (APIC + timer live) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x07; 0xE6; 0x71; }
 
-# Start Application Processors
+# SMP state init. 1.44.18: the ACTUAL wake (smp_start_aps) moved late — to after
+# pt_init + "Interrupts enabled" — so the trampoline's hardcoded CR3 0x1000 is the
+# kernel PML4 (identity 0-4 GB incl. the APIC; the old pre-pt_init wake site was
+# gate-hazard #1) and timer_ticks advances for the real SDM delays.
 cpu_count = 1;
 ap_ready = 0;
 smp_lock = 0;
-smp_start_aps();
 kprint("SMP: ", 5);
 kprint_num(cpu_count);
 kprintln(" CPUs online", 12);
@@ -99,10 +151,46 @@ kb_isr_build();
 idt_set_gate(&idt + 33 * 16, &kb_isr, 0x08, 0x8E);
 kprintln("Keyboard ISR installed (full US QWERTY)", 39);
 
+# 1.51.5: NIC RX MSI-X ISR at vector 0x50 (80) — built + registered here; dormant
+# until virtio_net_init points the NIC's MSI-X table entry at this vector (bite 2).
+nic_rx_isr_build();
+idt_set_gate(&idt + 80 * 16, &nic_rx_isr, 0x08, 0x8E);
+# 1.53.7: xHCI RX (USB-HID keyboard) MSI-X ISR at vector 0x51 (81) — built + registered here;
+# dormant until the xHCI MSI-X table vector is ARMED (unmasked) after hid_kbd_configure (below),
+# so it can't steal EP0 events from xhci_wait_transfer_event during enumeration.
+xhci_rx_isr_build();
+idt_set_gate(&idt + 81 * 16, &xhci_rx_isr, 0x08, 0x8E);
+
 pt_init();
 kprint("Page tables: ", 13);
 kprint_num(pt_get_mapped_mb());
 kprintln("MB mapped", 9);
+
+# === SSE / FP enable (1.53.x FP/SIMD arc, B1) — after pt_init(), CR3 live. ===
+# Clears the ring-3 f64 #UD wall (CR0.EM off, CR0.MP on, CR4.OSFXSR|OSXMMEXCPT
+# on, fninit). The production kernel stays FP-free (fpu_enable uses only raw CR
+# opcodes + fninit, no xmm); the movsd + ring-0 f64 proofs are gated behind
+# FP_SELFTEST. Per-proc FXSAVE + lazy #NM save/restore land in B2/B3.
+fpu_enable();
+kprintln("SSE enabled", 11);
+#ifdef FP_SELFTEST
+fpu_selftest();
+#endif
+# 1.53.x B2: seed all 16 per-proc FXSAVE areas (fninit-equiv default) + per-CPU FP
+# owners (-1). Pure memory init — no FP instruction, so production stays FP-free.
+fpu_area_init();
+#ifdef FP_AREA_SELFTEST
+fpu_area_selftest();
+#endif
+# 1.53.x B3: install the #NM (vector 7) handler for lazy per-proc FP save/restore.
+# INERT until B3b sets CR0.TS on the switch paths — production never #NMs today (TS
+# is only ever set by the FP_NM_SELFTEST probe below). Areas are already seeded above.
+nm_isr_build();
+idt_set_gate(&idt + 7 * 16, &nm_isr, 0x08, 0x8E);
+#ifdef FP_NM_SELFTEST
+fpu_nm_selftest();
+#endif
+
 
 # === CMOS kernel checkpoint 8 (page tables built — historical stall point) ===
 # Pre-RDRAND-fix (cyrius 5.11.x, missing -cpu max in QEMU smoke) this was
@@ -116,6 +204,75 @@ kprint_num(pmm_free_count());
 kprint(" free / ", 8);
 kprint_num(pmm_total);
 kprintln(" pages", 6);
+
+# 1.49.2 (full RAM init, bite 2): open the 4 KB allocator to the discovered RAM (up to the 128 MB
+# bitmap), reserving the KASLR'd kernel image + non-conventional memmap regions in the new 18-128 MB
+# window. Always-on; pmm_alloc_2mb (user 2 MB allocs) stays in the low 2-16 MB regions.
+pmm_extend_to_memmap(load64(&boot_info_ptr));
+kprint("PMM: alloc_top=", 15);
+kprint_num(pmm_alloc_top);
+kprintln("", 0);
+
+# 1.49.11 (RAM-arc bite 3c): if RAM > 256 MB, migrate the bootstrap bitmap to a RAM-backed one covering
+# the full machine RAM + lift pmm_alloc_2mb's ceiling, so user 2 MB pages reach above the 256 MB identity
+# ceiling (zeroed/loaded via the direct-map, validated in 1.49.10). <=256 MB RAM keeps the bootstrap.
+pmm_migrate_bitmap(load64(&boot_info_ptr));
+kprint("PMM: 2mb_top_region=", 20);
+kprint_num(pmm_2mb_top_region);
+kprintln("", 0);
+
+# 1.49.7 (kernel direct-map, bite 1): map all physical RAM at DIRECTMAP_BASE + phys (the per-proc CR3
+# inherits it via the PML4 mirror), then probe it against the identity map. No PMM/heap change yet
+# (bite 2 switches consumers to direct-map pointers). Always-on; the directmap page tables are a few
+# pages from the <=256 MB pool.
+pmm_setup_directmap(pmm_memmap_ram_top);
+# 1.49.10: validate the direct-map in the context its consumers ACTUALLY run under — the kernel PML4
+# (CR3 0x1000), which carries PDPT[8..]. The OLD always-on probe (load64(DIRECTMAP_BASE+phys) ==
+# load64(phys)) was a FALSE POSITIVE: it ran under gnoboot's boot CR3, whose PDPT[8] is a 1 GB IDENTITY
+# page to phys 8 GB (usually unbacked) — so BOTH sides read 0 and matched. That false pass is what made
+# the >256 MB direct-map look "live" while every real >256 MB access returned 0, and is what got
+# mis-attributed to a cyrius load/store truncation. cyrius is EXONERATED (the SAME store64/load64 emit
+# round-trips fine under 0x1000); the bug was active-table geometry. Full root cause + the empirical
+# A/B/C/D/E walk that nailed it: docs/development/issue/2026-06-28-cyrius-high-va-load-store.md.
+#
+# Test a TRUE >256 MB VA (phys 320 MB) whose low bits do NOT alias the <=256 MB identity map, round-trip
+# it under 0x1000 (boot stack <256 MB stays mapped via PD[0..127]), then restore the live CR3. Gated on
+# RAM>320 MB + RSP<256 MB so the brief CR3 switch is always stack-safe; otherwise fall back to a
+# structural check that PDPT[8] is installed in the kernel PDPT.
+if (pmm_memmap_ram_top > 0x14000000 && dm_read_rsp() < 0x10000000) {
+    var dm_rb = dm_roundtrip_kernel_cr3(DIRECTMAP_BASE + 0x14000000, 0xCAFEBABE);
+    if (dm_rb == 0xCAFEBABE) { kprintln("directmap: >256MB OK (kernel CR3)", 33); }
+    else { kprintln("directmap: >256MB FAIL", 22); }
+} else {
+    if ((load64(0x2000 + 8 * 8) & 1) == 1) { kprintln("directmap: installed", 20); }
+    else { kprintln("directmap: NOT installed", 24); }
+}
+#ifdef PMM_FULLRAM_SELFTEST
+pmm_fullram_selftest();
+#endif
+#ifdef PMM_HIRAM_SELFTEST
+# Runs AFTER pmm_setup_directmap — pmm_hiram_selftest round-trips the >256 MB region through the
+# direct-map under CR3 0x1000, which must be installed first.
+pmm_hiram_selftest();
+#endif
+#ifdef PMM_RAMSTRESS_SELFTEST
+# 1.50.0 bite 1: full-RAM stress — allocate thousands of 2 MB regions across the machine RAM and
+# verify each is reachable + distinct through the direct-map (under CR3 0x1000). Boot QEMU -m 16G+.
+if (pmm_2mb_top_region > 128 && dm_read_rsp() < 0x10000000) {
+    pmm_ramstress_run();
+    kprint("ramstress: regions=", 19); kprint_num(ramstress_n);
+    kprint(" (~", 3); kprint_num(ramstress_n / 512); kprint(" GB) bad=", 9); kprint_num(ramstress_bad);
+    kprint(" firstbad_phys=", 15); kprint_hex(ramstress_firstbad); kprintln("", 0);
+    if (ramstress_bad == 0) { kprintln("ramstress: full-RAM directmap OK", 32); }
+    else { kprintln("ramstress: full-RAM directmap FAIL", 34); }
+} else { kprintln("ramstress: skip (<=256MB or RSP high)", 37); }
+#endif
+
+#ifdef PDPT_GUARD_SELFTEST
+# 1.50.0 pre-burn: prove the vmm_remap_uc_2mb idempotency-guard fix in QEMU (the
+# FB+device shared-PDPT-entry WB-clobber that BOOTCR3_OWN_PML4 would expose on iron).
+pdpt_guard_selftest();
+#endif
 
 # 1.30.11 hardening: re-attempt WC remap of the FB, then verify WC took.
 # The line-17 vmm_remap_wc_range above succeeds for FBs in the 32-bit
@@ -135,6 +292,74 @@ kprintln(" pages", 6);
 # differently from the first.
 vmm_remap_wc_range(fb_fb_phys(), fb_size_or_fallback());
 fb_verify_wc();
+
+# 1.53.7 — allocate the WB RAM console shadow buffer (kills the WC framebuffer
+# read-back on every scroll). Post-pmm + post-WC-remap so the one-time FB→shadow
+# sync copies the real (WC) console image. Falls back to direct-paint (today's
+# behavior) if the FB is absent or the contiguous 2 MB-region run can't be had.
+# Placed BEFORE the boot-CR3 switch below, but the shadow is in the 0-256 MB
+# identity window that every CR3 (gnoboot's, 0x1000's, and per-proc) maps, so the
+# ordering is immaterial to its addressability.
+fb_shadow_init();
+
+#ifndef BOOTCR3_KEEP_GNOBOOT_CR3
+# 1.50.x (RAM full-usage arc, bite 2) — switch the kernel onto its OWN complete PML4 (0x1000) instead of
+# continuing to run boot/idle on gnoboot's TRANSIENT boot CR3. **DEFAULT-ON since 1.50.1** (iron-validated
+# on real 64 GB Zen 2026-06-29 — full FB-render boot to the agnsh prompt + live keyboard + 62 GB RAM);
+# build `BOOTCR3_KEEP_GNOBOOT_CR3=1` to opt OUT (revert to gnoboot's boot CR3) if a future target regresses.
+# Why HERE (LATE), not right after pt_init: every gnoboot-CR3-relative access the boot makes must already be
+# relocated low / done BEFORE the switch, because 0x1000 is identity 0-4 GB ONLY (pt_init's ceiling) and
+# CANNOT see gnoboot's high mappings. By this point all of them are satisfied:
+#   (a) UEFI memmap — sits near the TOP of RAM (5.4 GB @ -m 8G); read ONLY by pmm_probe/extend/migrate/
+#       setup_directmap (lines 59..184, all ABOVE) under gnoboot's full-identity CR3. Nothing dereferences
+#       the high memmap_phys (boot_info+0x28) after this — so no low copy is needed.
+#   (b) gnoboot boot_info — already copied into the low (<4 GB) boot_info_copy + boot_info_ptr repointed by
+#       boot_info_capture_rdi() (mbi.cyr) at the very top of boot, so every later read is CR3-independent.
+#   (c) framebuffer — the vmm_remap_wc_range above just (re)mapped the FB WC in 0x1000's tree. 0x1000's
+#       pt_init maps the FB's GB as a 1 GB WB huge page (QEMU q35 FB @ 0x80000000 = PDPT[2]; real archaemenid
+#       GOP FB @ ~0xd0000000 = PDPT[3]); WB = writes batch in cache and never reach the display → the early-
+#       switch "freeze at Page tables" was that WB FB, not a crash. The WC remap shatters the 1 GB page so
+#       the FB chunk is WC BEFORE the switch — and the vmm_remap_uc_2mb idempotency guard (1.50.0) keeps a
+#       later device's UC remap into the SAME 1 GB PDPT entry from re-shattering it back to WB (the iron
+#       FB+all-device-BARs-share-PDPT[3] clobber the pre-burn review caught; load-bearing on real silicon).
+#   (d) device BARs — dev_init() runs AFTER this, so it maps every BAR into the now-active 0x1000 tree; ACPI
+#       ≥4 GB firmware reads go through acpi_va() (acpi.cyr), which direct-maps them under 0x1000.
+# pmm_setup_directmap (line 184) installed the direct-map into 0x1000's PDPT@0x2000, so >256 MB phys is
+# reachable from the boot/idle context directly after the switch — closing the "boot CR3 can't see kernel
+# VM edits" class structurally (it was the 1.49.9 misdiagnosis root). Per-proc CR3s already copy 0x1000's
+# PDPT[1..511], so this makes the boot/idle context consistent with them. [[feedback_dont_dodge_large_items]]
+cr3_load(0x1000);
+kprintln("kernel CR3: own PML4 (0x1000)", 29);
+# 1.50.9: the kernel now runs on 0x1000, which carries the direct-map (PDPT[8+]) — so rebase the
+# migrated PMM bitmap pointer off its IDENTITY VA onto DIRECTMAP_BASE + phys. REQUIRED because the
+# migrated bitmap lives in the <=256 MB pool and its identity VA can alias a per-process user VA — a
+# ring-3 ELF maps its code at the fixed VA 0x400000 (PD[2]), OVERRIDDEN in every per-proc CR3. A
+# syscall (mmap) runs under the CALLER's CR3, so the bitmap-by-identity-VA would read the caller's
+# code there -> pmm_count_2mb_free saw 0 free regions -> agnsh's first heap mmap returned 0 ->
+# null-deref #PF right after its banner. The direct-map window is mirrored by every per-proc CR3 and
+# never overridden, so the bitmap reads correctly under EVERY CR3. MUST be AFTER this cr3_load(0x1000):
+# the direct-map is only active under 0x1000 (gnoboot's boot CR3 maps PDPT[8] to an unrelated identity
+# GB), so the boot-time pmm_alloc's BEFORE the switch keep using the identity VA (no proc runs yet, so
+# identity is unshadowed). No-op if RAM <=256 MB (bitmap stayed in .bss). Only inside the own-PML4
+# build: a BOOTCR3_KEEP_GNOBOOT_CR3 boot never gets the direct-map in its boot/idle context.
+pmm_bitmap_use_directmap();
+#endif
+
+# 1.50.10 hardening — guard the 1.50.9 bitmap-VA-shadow fix on EVERY boot (cheap; mirrors the always-on
+# directmap probe). When the bitmap migrated (RAM > 256 MB) it MUST now be reached via the direct-map
+# (>= DIRECTMAP_BASE), never its identity VA (which a per-proc CR3 shadows at PD[2]=0x400000). Reading it
+# here (own-PML4 build is on 0x1000 with the direct-map live) also confirms a non-zero free-2MB count —
+# the exact symptom the bug produced (0 under a per-proc CR3 -> agnsh mmap returned 0). The else branch
+# only fires in a BOOTCR3_KEEP_GNOBOOT_CR3 build (rebase gated off, ptr stays identity): >256 MB user
+# mmap WILL fault under a per-proc CR3 there — switch to the own-PML4 default. Runs in both builds (after
+# the #endif): own-PML4 reads the dm ptr under 0x1000; KEEP_GNOBOOT reads the identity ptr under boot CR3.
+if (pmm_bitmap_phys != 0) {
+    if (pmm_bitmap_ptr >= DIRECTMAP_BASE) {
+        kprint("pmm: bitmap-dm OK free2mb=", 26); kprint_num(pmm_count_2mb_free()); kprintln("", 0);
+    } else {
+        kprintln("pmm: WARN bitmap on identity VA (KEEP_GNOBOOT >256MB) - mmap faults under per-proc CR3", 86);
+    }
+}
 
 # === CMOS kernel checkpoint 9 (physical memory manager up) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x09; 0xE6; 0x71; }
@@ -285,6 +510,15 @@ for (var s = 1; s <= 64; s = s + 1) {
     }
 }
 
+# 1.53.7 — the keyboard is now enumerated + configured, so ARM the xHCI RX MSI-X vector
+# (0x51) for interrupt-driven input. Deferred to here (post hid_kbd_configure) so the
+# xhci_rx_handler's hid_poll can't steal EP0 Transfer Events from xhci_wait_transfer_event
+# during the control transfers above. No-op if no keyboard was found — the box then stays
+# on the 100 Hz tick drain (timer_handler's fallback hid_poll).
+if (hid_kbd_slot_id != 0) {
+    pci_msix_arm_vector0(xhci_pci_idx, 0x51);
+}
+
 # USB Mass Storage Phase 1 (1.31.2 storage arc — discovery only). Walks
 # every addressed xHCI slot, matches the MSC-BBB class triple
 # (0x08/0x06/0x50) on each interface, captures bulk-IN + bulk-OUT
@@ -411,6 +645,90 @@ if (nvme_admin_init() == 1) {
         nvme_register_block_dev();
     }
 }
+# HDA audio Phase B0 (1.52.0) — locate the HD-Audio controller (if present),
+# map BAR0 UC, enable bus-master, read GCAP + version. Read-only probe — no
+# reset, no codec enum, no DMA (those are B1+). Polled posture (INTCTL stays
+# 0). No-op if no controller present (QEMU smoke without -device intel-hda).
+# See kernel/core/hda.cyr + agnosticos audio-arc-152x-plan.md.
+hda_probe();
+# HDA audio Phase B1 (1.52.1) — GCTL.CRST reset handshake + STATESTS codec
+# presence. No-op if hda_probe didn't bind a controller. Prints
+# `hda: reset OK, codecs=0xNNNN`. Polled (INTCTL stays 0).
+hda_reset();
+# HDA audio Phase B2a (1.52.2) — CORB/RIRB verb-ring transport: init the rings
+# and read the first codec's VENDOR_ID + NODECOUNT (proves the command/response
+# path). No-op if no codec present. Polled. The ALC897 widget-graph walk +
+# front-pin route is B2b (iron-gated).
+hda_codec_probe();
+# HDA audio Phase B2b-1 (1.52.2) — walk the codec's AFG widgets, classify
+# DAC/Pin, and dump each output pin's CONFIG_DEFAULT (the iron pre-flight that
+# reveals the ALC897 front-jack node). Route/enable is B2b-2. Polled.
+hda_codec_enum();
+# HDA audio Phase B2b-2 (1.52.2) — select an output pin (HP-Out/Line-Out, prefer
+# Front+jack-detect), trace the DAC via the connection list, and run the
+# output-enable sequence (COEF/power/pinctl/EAPD/unmute). QEMU exercises the
+# machinery; the ALC897 amp/EAPD/COEF effects are iron-only. Polled.
+hda_codec_route();
+# HDA audio Phase B3 (1.52.3) — arm an output DMA stream: BDL ring + WC PCM ring
+# + stream descriptor (48k/16/2ch, SDnFMT=0x0011), bind tag<->DAC, RUN. Gate:
+# SD_LPIB advances (DMA fetching). Silence now; B4 fills a sine. Polled.
+hda_stream_arm();
+#ifdef SND_SELFTEST
+# Gate-2 (B6) hermetic snd_* band self-test — drives the #64-69 handlers + fills the
+# ring with a tone the DMA loops for the WAV smoke. Build: SND_SELFTEST=1 build.sh.
+hda_snd_selftest();
+#endif
+#ifdef HDA_HDMI
+# HDMI-audio arc bites 2b+3 — probe, enumerate, ROUTE, and arm a stream on a SECOND
+# HD-Audio controller as instance 1 (archaemenid PCI 04:00.1 HDMI/DP, or a 2nd QEMU
+# -device intel-hda). Instance 0 (analog) stays the default active sink; instance 1
+# gets the unified route (digital branch for a real HDMI codec; analog branch for
+# QEMU's 2nd intel-hda) + hda_stream_arm. Gated so the default/MVP kernel stays
+# single-controller until the HDMI path is iron-proven. hda_active_ctl is restored
+# to 0 before the box goes live (instance-1's armed stream keeps running on its own
+# controller; a sink-select to make HDMI the live refill target is bite 4).
+hda_active_ctl = 1;
+kprintln("hda: ctl1 probing 2nd controller (HDMI/DP)", 42);
+if (hda_probe() != 0) {
+    hda_reset();
+    hda_codec_probe();
+    hda_codec_enum();
+    hda_codec_route();
+    hda_stream_arm();
+    kprint("hda: ctl1 bound codecs=0x", 25);
+    kprint_byte((load64(&hda_codec_mask + 1 * 8) >> 8) & 0xFF);
+    kprint_byte(load64(&hda_codec_mask + 1 * 8) & 0xFF);
+    kprint(" afg=0x", 7);
+    kprint_byte(load64(&hda_afg + 1 * 8));
+    kprintln("", 0);
+} else {
+    kprintln("hda: ctl1 no 2nd controller", 27);
+}
+hda_active_ctl = 0;
+#endif
+# === GPU arc F0 (1.54.x) — kernel GPU probe =================================
+# Locate the AMD Cezanne iGPU (04:00.0, 1002:1638, gfx90c compute / DCN 2.1
+# display), enable PCI Memory-Space (NOT bus-master — read-only), map its BAR5
+# register aperture UC, and dump always-safe ID registers (NBIO STRAP0 device-id
+# echo + CONFIG_MEMSIZE VRAM size + GC GB_ADDR_CONFIG / GRBM_STATUS liveness) to
+# the klug log. Read-only, lowest-risk bite — no rings, no firmware, no DMA, no
+# device-state writes. No-op off archaemenid (QEMU has no gfx90c). Iron-validated
+# via `klug > /f/gpu.txt`. See kernel/core/gpu.cyr + agnosticos
+# planning/kernel-gpu-arc-154x.md (bite F0); Thrust C/P machinery is C0+.
+gpu_probe();
+# GPU arc C0 (1.54.1) — firmware-reality check: read-only dump of CP/MEC/RLC
+# state + PSP sign-of-life to decide whether the compute microcode is resident
+# (Case A) or must be PSP-loaded (Case B — expected on a display-only-lit box).
+# No-op if F0 didn't bind a GPU. Read-only. See kernel/core/gpu.cyr gpu_fw_probe().
+gpu_fw_probe();
+# GPU arc C1b-1 (1.54.x) — PSP GPCOM ring (UC) + SETUP_TMR round-trip. C0 found the
+# GPU microcode is NOT resident (CASE B), so agnos must drive the PSP to load it.
+# C1a proved the register-based ring-create (iron 1.54.2); gpu_psp_setup re-creates
+# the ring in a UC region and runs the first REAL ring command — SETUP_TMR — a full
+# RB-frame/DMA/fence round-trip that establishes the 4 MB Trusted Memory Region the
+# firmware-load (C1b-2 LOAD_IP_FW) needs, and probes the PSP DMA/coherence/addressing.
+# Iron-only; no-op if F0 didn't bind a GPU. See kernel/core/gpu.cyr gpu_psp_setup().
+gpu_psp_setup();
 # GPT Phase 1 — probe the active block backend (NVMe-first by override
 # policy in block.cyr; virtio-blk if no NVMe) for a GPT header at LBA 1,
 # decode + walk the first 4 KB of the partition entry array, print a one-
@@ -504,6 +822,79 @@ exfat_init();
 # "/". Longest-prefix match in vfs_resolve_mount does the routing — replaces
 # the old ext2_active-flag toggle that hid FAT/exFAT behind a mounted ext2.
 vfs_mount_init();
+
+# GPU arc C1b-2 (1.54.x) — LOAD_IP_FW RLC_G: the first real firmware into the GPU.
+# Runs HERE (after the FS mounts) because it reads the AMD-signed RLC microcode from
+# the agnos-fs (/fw/rlc.bin) and feeds it to the PSP over the ring + TMR that
+# gpu_psp_setup established early (C1a/C1b-1). The PSP validates AMD's signature +
+# loads it. No-op if F0 didn't bind a GPU or the ring/TMR aren't up. Iron-only.
+# See kernel/core/gpu.cyr gpu_fw_load().
+gpu_fw_load();
+
+# GPU arc C1c (1.54.x) — the rest of the CP/MEC set (CE/PFP/ME whole-body + MEC1
+# body+JT split) over the same proven ring+TMR. Renoir/gfx9.3.0 loads no MEC2; RLC
+# restore-lists (GFXOFF) deferred. Must run AFTER gpu_fw_load (RLC_G first). Iron-only.
+# See kernel/core/gpu.cyr gpu_fw_load_set().
+gpu_fw_load_set();
+
+# GPU arc C1d (1.54.x) — start the engines: RLC F32 + CP-gfx un-halt + CP-MEC1
+# un-halt, then re-read C0 for the CASE B → CASE A flip (the compute-thrust gate).
+# Must run AFTER the CP/MEC ucode is resident (gpu_fw_load_set). Bare un-halt with
+# no rings/GPUVM is safe (no fetch → no CPU wedge). Iron-only; no-op off an AMD GPU.
+# See kernel/core/gpu.cyr gpu_engine_start().
+gpu_engine_start();
+
+# GPU arc C2a (1.54.x) — read-only GMC/GFXHUB VM-state probe: is there a reusable
+# GART, or must C2b build page tables? (Answer, derived: neither — place compute
+# scratch in the UMA carveout + address it through the BIOS-set FB aperture, ZERO
+# page tables.) Pure reads; zero device writes; no hang path. Iron-only; no-op off
+# an AMD GPU. See kernel/core/gpu.cyr gpu_gpuvm_probe().
+gpu_gpuvm_probe();
+
+# GPU arc C2b (1.54.x) — GFXHUB GMC setup: arm a carveout compute arena reachable via
+# the FB aperture (ZERO page tables — VM_CONTEXT0 stays disabled = fault-storm designed
+# out), enable the L2/UTCL2 datapath, arm the fault-net, TLB-flush. GMC config only, no
+# engine fetch — cannot itself wedge. Iron-only; no-op off an AMD GPU. Runs after C2a.
+# See kernel/core/gpu.cyr gpu_vm_setup().
+gpu_vm_setup();
+
+# GPU arc C2c (1.54.x) — map an EMPTY compute queue (MEC1/pipe0/queue0) via direct HQD
+# register programming (GRBM-select → 20 CP_HQD_* writes, ACTIVE last → deselect). The ring
+# stays empty (wptr==rptr==0) so the MEC makes zero memory accesses — isolates the HQD recipe
+# from VM/fetch (C2d rings the doorbell). Low hang-risk. Runs after C2b armed the arena.
+# See kernel/core/gpu.cyr gpu_queue_setup().
+gpu_queue_setup();
+
+# GPU arc C2d (1.54.x) — first PM4 packet: write an 8-dword NOP into the ring, ring the
+# doorbell, and watch the MEC fetch it through the FB aperture (the VM-fetch gate). The
+# HIGHEST hang-risk bite — but CPU-wedge-safe (posted doorbell + fault-net + a BOUNDED
+# watchdog, never spins). Runs after C2c mapped the queue. Iron-only; no-op off an AMD GPU.
+# See kernel/core/gpu.cyr gpu_ring_kick().
+gpu_ring_kick();
+
+# GPU arc C2e (1.54.x) — WRITE_DATA fence: after C2d proved the MEC FETCHES, C2e has it
+# EXECUTE one PACKET3_WRITE_DATA that writes a sentinel to a carveout slot the CPU reads
+# back — proving execution AND that a MEC memory write is CPU-visible (the coherence the
+# shader/matmul readbacks in C2f/C2g depend on; also disambiguates C2d's rmem=0). Gated on
+# C2d success inside gpu_fence(). Same wedge-safe envelope. See kernel/core/gpu.cyr gpu_fence().
+gpu_fence();
+
+# GPU arc C2f (1.54.x) — first hand-assembled gfx90c compute shader. A minimal single-thread
+# shader writes a constant to the carveout via global_store_dword; the CPU reads it back. First
+# arbitrary ISA on the shader cores. Ring program = SET_SH_REG compute config + DISPATCH_DIRECT +
+# CS_PARTIAL_FLUSH drain + ACQUIRE_MEM L2-writeback + WRITE_DATA done-marker. Gated on C2e (fence
+# proven) inside gpu_shader_dispatch(). Same wedge-safe envelope. See kernel/core/gpu.cyr.
+gpu_shader_dispatch();
+
+# GPU arc C2g-1 (1.54.x) — first MULTI-THREAD dispatch: 64 threads in one workgroup, each writes
+# its workitem-id to out[tid]; CPU verifies out[i]==i. First sub-bite of the C2g matmul crown —
+# proves grid/workgroup dispatch + workitem-id read + per-thread 64-bit addressing. Gated on C2f
+# (shader proven) inside gpu_shader_dispatch2(). Same wedge-safe envelope. See kernel/core/gpu.cyr.
+gpu_shader_dispatch2();
+
+#ifdef LOOPBACK_SELFTEST
+loopback_selftest();
+#endif
 
 # FAT read self-test (1.34.x bite 2, compile-gated via FATFS_SELFTEST).
 # Gates the FAT32 + chain-traversal read path: list the root, find the
@@ -878,7 +1269,7 @@ if (exfat_active == 1) {
         if (ex_ok == 1) { kprintln("exfatr: file-read OK", 20); }
         else { kprintln("exfatr: file-read FAIL", 22); }
     } else {
-        kprintln("exfatr: no seeded file (mount + upcase gates only)", 49);
+        kprintln("exfatr: no seeded file (mount + upcase gates only)", 50);
     }
     # 1.40.13 mount-namespace: drive the real shell `ls` over the exFAT mount.
     # sh_cmd_ls -> FS_EXFAT -> vfs_print_dir_on -> exfat_print_dir (name
@@ -1240,6 +1631,15 @@ sh_exec("rm /shtmp", 9);
 kprintln("shtest: end", 11);
 #endif
 
+# 1.45.15 — multi-chunk BGDT regression self-test (compile-gated,
+# MULTICHUNK_SELFTEST=1). Exercises BGDT chunks >= 1 (read/alloc/free of
+# inodes & blocks in groups the old Phase-1 single-chunk reader couldn't
+# reach). Needs the host harness's >64-group image; SKIPs (no failure) on a
+# single-chunk FS. Off in production — same gate discipline as the others.
+#ifdef MULTICHUNK_SELFTEST
+ext2_multichunk_selftest();
+#endif
+
 # 1.40.2 — exec-from-disk self-test (compile-gated, EXEC_SELFTEST=1). Builds a
 # minimal static ELF64 (write(1,"EXEC-DISK-OK\n",13) then exit(42)) into the
 # scratch buffer, writes it to ext2 as /prog, then `run /prog` — exercising
@@ -1272,31 +1672,36 @@ fn exec_disk_selftest() {
     store8(eb + 68, 5);                                            # p_flags = R+X
     store8(eb + 82, 0x40);                                         # p_vaddr  = 0x400000
     store8(eb + 90, 0x40);                                         # p_paddr  = 0x400000
-    store8(eb + 96, 182);                                          # p_filesz = 182
-    store8(eb + 104, 182);                                         # p_memsz  = 182
+    store8(eb + 96, 184);                                          # p_filesz = 184 (msg moved +2 for the #43 spin)
+    store8(eb + 104, 184);                                         # p_memsz  = 184
     store8(eb + 113, 0x10);                                        # p_align  = 0x1000
     # Code @120 (zeros between the 4 stored opcode bytes complete each imm32)
     var c = 120;
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC0); store8(eb + c + 3, 0x01); c = c + 7;  # mov rax,1 (write)
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC7); store8(eb + c + 3, 0x01); c = c + 7;  # mov rdi,1 (fd)
-    store8(eb + c, 0x48); store8(eb + c + 1, 0xBE); store8(eb + c + 2, 0xA9); store8(eb + c + 4, 0x40); c = c + 10; # movabs rsi,0x4000A9 (msg)
+    store8(eb + c, 0x48); store8(eb + c + 1, 0xBE); store8(eb + c + 2, 0xAB); store8(eb + c + 4, 0x40); c = c + 10; # movabs rsi,0x4000AB (msg @171)
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC2); store8(eb + c + 3, 0x0D); c = c + 7;  # mov rdx,13 (len)
     store8(eb + c, 0x0F); store8(eb + c + 1, 0x05); c = c + 2;                                                     # syscall
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC0); store8(eb + c + 3, 0x00); c = c + 7;  # mov rax,0 (exit)
     store8(eb + c, 0x48); store8(eb + c + 1, 0xC7); store8(eb + c + 2, 0xC7); store8(eb + c + 3, 0x2A); c = c + 7;  # mov rdi,42 (code)
     store8(eb + c, 0x0F); store8(eb + c + 1, 0x05);                                                                # syscall
-    # Message @169: "EXEC-DISK-OK\n"
-    store8(eb + 169, 69); store8(eb + 170, 88); store8(eb + 171, 69); store8(eb + 172, 67);   # EXEC
-    store8(eb + 173, 45);                                                                      # -
-    store8(eb + 174, 68); store8(eb + 175, 73); store8(eb + 176, 83); store8(eb + 177, 75);   # DISK
-    store8(eb + 178, 45);                                                                      # -
-    store8(eb + 179, 79); store8(eb + 180, 75); store8(eb + 181, 10);                          # OK\n
+    # 1.44.x: jmp $ spin @169 (right after the exit syscall). Harmless under execwait (#37):
+    # exit→kernel_resume never returns to ring 3, so the spin is never reached. REQUIRED under
+    # spawn_path (#43, scheduled): there exit RETURNS to ring 3 (RIP=0x4000A9=offset 169), so
+    # without this the proc would run the message bytes as code + never reach state 0.
+    store8(eb + 169, 0xEB); store8(eb + 170, 0xFE);                                            # jmp -2 (spin)
+    # Message @171: "EXEC-DISK-OK\n" (moved +2 to make room for the spin; movabs rsi=0x4000AB)
+    store8(eb + 171, 69); store8(eb + 172, 88); store8(eb + 173, 69); store8(eb + 174, 67);   # EXEC
+    store8(eb + 175, 45);                                                                      # -
+    store8(eb + 176, 68); store8(eb + 177, 73); store8(eb + 178, 83); store8(eb + 179, 75);   # DISK
+    store8(eb + 180, 45);                                                                      # -
+    store8(eb + 181, 79); store8(eb + 182, 75); store8(eb + 183, 10);                          # OK\n
     # Write the ELF to a SUBDIRECTORY (/bin/prog2) + a non-ELF (/notelf).
     ext2_mkdir(2, "bin", 3);
     var bino = ext2_path_lookup("/bin", 4);
     var p2 = 0;
     if (bino > 0) { p2 = ext2_create(bino, "prog2", 5); }
-    if (p2 > 0) { ext2_write_at(p2, 0, eb, 182); }
+    if (p2 > 0) { ext2_write_at(p2, 0, eb, 184); }
     # non-ELF: 100 bytes from eb+100 (inside the ELF/zero region; byte0 != 0x7F).
     var nino = ext2_create(2, "notelf", 6);
     if (nino > 0) { ext2_write_at(nino, 0, eb + 100, 100); }
@@ -1342,6 +1747,82 @@ fn exec_disk_selftest() {
     kprintln("exec: running /bin/argv Z", 25);
     sh_exec("run /bin/argv Z", 15);
 
+    # 1.42.10 — sysinfo syscall ring-3 validator (/bin/sysi). Calls uname(34)
+    # into a stack-scratch buffer + sysinfo(35) into a second region, then exits
+    # with sysname[0] ('A' = 0x41) + totalram byte 3 (0x01 of the 16 MB / 0x01000000
+    # pmm pool) = 0x42 = 66. "run: exit 66" proves BOTH new syscalls dispatch from
+    # ring 3, pass is_user_range on the user stack, and write the expected struct
+    # bytes (uname.sysname + sysinfo.totalram). No jumps / no embedded strings —
+    # pure sequential asm (64 code bytes). exec-smoke.sh gates on "run: exit 66".
+    var si = 0;
+    while (si < 200) { store8(eb + si, 0); si = si + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 184); store8(eb + 104, 184);                  # p_filesz/memsz = 184
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 — 64 bytes, no jumps. (zeros between stored opcode bytes complete each imm32)
+    var sc = 120;
+    store8(eb+sc,0x48); store8(eb+sc+1,0x83); store8(eb+sc+2,0xEC); store8(eb+sc+3,0x78); sc=sc+4;  # sub rsp,0x78
+    store8(eb+sc,0x48); store8(eb+sc+1,0xC7); store8(eb+sc+2,0xC0); store8(eb+sc+3,0x22); sc=sc+7;  # mov rax,34 (uname)
+    store8(eb+sc,0x48); store8(eb+sc+1,0x89); store8(eb+sc+2,0xE7); sc=sc+3;                        # mov rdi,rsp (buf)
+    store8(eb+sc,0x48); store8(eb+sc+1,0xC7); store8(eb+sc+2,0xC6); store8(eb+sc+3,0x40); sc=sc+7;  # mov rsi,64 (len)
+    store8(eb+sc,0x0F); store8(eb+sc+1,0x05); sc=sc+2;                                              # syscall
+    store8(eb+sc,0x48); store8(eb+sc+1,0xC7); store8(eb+sc+2,0xC0); store8(eb+sc+3,0x23); sc=sc+7;  # mov rax,35 (sysinfo)
+    store8(eb+sc,0x48); store8(eb+sc+1,0x8D); store8(eb+sc+2,0x7C); store8(eb+sc+3,0x24); store8(eb+sc+4,0x40); sc=sc+5;  # lea rdi,[rsp+64]
+    store8(eb+sc,0x48); store8(eb+sc+1,0xC7); store8(eb+sc+2,0xC6); store8(eb+sc+3,0x28); sc=sc+7;  # mov rsi,40
+    store8(eb+sc,0x0F); store8(eb+sc+1,0x05); sc=sc+2;                                              # syscall
+    store8(eb+sc,0x0F); store8(eb+sc+1,0xB6); store8(eb+sc+2,0x3C); store8(eb+sc+3,0x24); sc=sc+4;  # movzx edi,byte[rsp] (sysname[0])
+    store8(eb+sc,0x0F); store8(eb+sc+1,0xB6); store8(eb+sc+2,0x44); store8(eb+sc+3,0x24); store8(eb+sc+4,0x4B); sc=sc+5;  # movzx eax,byte[rsp+75] (totalram byte3)
+    store8(eb+sc,0x01); store8(eb+sc+1,0xC7); sc=sc+2;                                              # add edi,eax
+    store8(eb+sc,0x48); store8(eb+sc+1,0xC7); store8(eb+sc+2,0xC0); store8(eb+sc+3,0x00); sc=sc+7;  # mov rax,0 (exit)
+    store8(eb+sc,0x0F); store8(eb+sc+1,0x05);                                                       # syscall — exit(edi)
+    var siino = 0;
+    if (bino > 0) { siino = ext2_create(bino, "sysi", 4); }
+    if (siino > 0) { ext2_write_at(siino, 0, eb, 184); ext2_sync(); }
+    kprintln("exec: running /bin/sysi", 23);
+    sh_exec("run /bin/sysi", 13);
+
+    # 1.42.12 — klug bite 2. Exercise the leveled-log API (each line is shown +
+    # captured into klug with its [I]/[W]/[E] grep-key prefix), then validate the
+    # klug#36 read syscall from ring 3: /bin/klug calls klug(buf, 200) and exits
+    # with the byte count it returned. The boot log is far more than 200 B by now,
+    # so klug returns exactly 200 → "run: exit 200" proves the syscall copied the
+    # requested tail of the unified ring into a user buffer (bounds + count).
+    klug_info("klug: level API live", 20);
+    klug_warn("klug: warn channel", 18);
+    klug_err("klug: err channel", 17);
+    var ki = 0;
+    while (ki < 200) { store8(eb + ki, 0); ki = ki + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 158); store8(eb + 104, 158);                  # p_filesz/memsz = 158
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 — 38 bytes, no jumps: klug(rsp,200) then exit(rax)
+    var kc = 120;
+    store8(eb+kc,0x48); store8(eb+kc+1,0x81); store8(eb+kc+2,0xEC); store8(eb+kc+4,0x01); kc=kc+7;  # sub rsp,0x100
+    store8(eb+kc,0x48); store8(eb+kc+1,0xC7); store8(eb+kc+2,0xC0); store8(eb+kc+3,0x24); kc=kc+7;  # mov rax,36 (klug)
+    store8(eb+kc,0x48); store8(eb+kc+1,0x89); store8(eb+kc+2,0xE7); kc=kc+3;                        # mov rdi,rsp (buf)
+    store8(eb+kc,0x48); store8(eb+kc+1,0xC7); store8(eb+kc+2,0xC6); store8(eb+kc+3,0xC8); kc=kc+7;  # mov rsi,200 (len)
+    store8(eb+kc,0x0F); store8(eb+kc+1,0x05); kc=kc+2;                                              # syscall
+    store8(eb+kc,0x48); store8(eb+kc+1,0x89); store8(eb+kc+2,0xC7); kc=kc+3;                        # mov rdi,rax (exit code = count)
+    store8(eb+kc,0x48); store8(eb+kc+1,0xC7); store8(eb+kc+2,0xC0); store8(eb+kc+3,0x00); kc=kc+7;  # mov rax,0 (exit)
+    store8(eb+kc,0x0F); store8(eb+kc+1,0x05);                                                       # syscall — exit(rdi)
+    var klino = 0;
+    if (bino > 0) { klino = ext2_create(bino, "klug", 4); }
+    if (klino > 0) { ext2_write_at(klino, 0, eb, 158); ext2_sync(); }
+    kprintln("exec: running /bin/klug", 23);
+    sh_exec("run /bin/klug", 13);
+
     # 1.40.14 reap validation. (A) slot reclaim: the create-then-reap of prog2 +
     # argv must leave proc_count where it started (LIFO reclaim). (B) address-space
     # leak: directly exercise proc_free_address_space (3 PT pages + one mapped user
@@ -1378,10 +1859,679 @@ fn exec_disk_selftest() {
         kprintln("reap: 4k-page LEAK", 18);
     }
 
+    # 1.42.x mmap-on-exit reap validation. The (B) cycle above maps a LOW page
+    # (0x400000, PD index 2 — ELF/stack territory). This separate cycle maps an
+    # ANONYMOUS-ARENA page (0x10000000, PD index 128 — exactly where sys_mmap
+    # installs pages) into a fresh address space and tears it down WITHOUT a
+    # munmap, simulating a process that mmap'd then exited. Pre-1.42 the
+    # free-loop stopped at PD index 510, but index 128 IS covered — so this
+    # specifically gates the FULL-arena sweep including the [128..511] range the
+    # bound extension added (a page at 0x3FE00000 = PD 511 would have leaked
+    # before). Free counts must return to baseline = arena page reclaimed.
+    var mf4_before = pmm_free_count();
+    var mf2_before = pmm_count_2mb_free();
+    var mrc = 0;
+    while (mrc < 6) {
+        var mcr3 = proc_create_address_space();
+        if (mcr3 != 0) {
+            var mph = pmm_alloc_2mb();
+            if (mph != 0) { proc_map_page(mcr3, 0x10000000, mph); }   # arena base (PD 128)
+            proc_free_address_space(mcr3);
+        }
+        mrc = mrc + 1;
+    }
+    var mf4_after = pmm_free_count();
+    var mf2_after = pmm_count_2mb_free();
+    if (mf4_before == mf4_after) {
+        if (mf2_before == mf2_after) {
+            kprintln("reap: 6x mmap-arena page reclaimed, free stable OK", 50);
+        } else {
+            kprintln("reap: mmap-arena 2mb-region LEAK", 32);
+        }
+    } else {
+        kprintln("reap: mmap-arena 4k-page LEAK", 29);
+    }
+
+    # 1.43.x — execwait #37 ring-3 validator (/bin/exwv). exwv is a ring-3 program
+    # that calls execwait(37) on "/bin/argv Z" — a child WITH an argument — and exits
+    # with the code execwait returns. Because exwv runs in ring 3, its execwait(37) is
+    # a REAL SYSCALL, so /bin/argv's own syscalls nest UNDER exwv's live #37 frame —
+    # exercising the full ring-3-caller path: H1 (the #37 handler preserves exwv's
+    # kernel resume context across the nested exec, so exwv's OWN exit() still resumes
+    # sh_cmd_run) AND H2 (the child runs on the disjoint second kstack 0x3D0000, so it
+    # cannot smash exwv's suspended #37 frame / SYSRET cells on 0x3F0000). Passing
+    # "/bin/argv Z" (not the no-arg /bin/prog2) ALSO validates the 1436-burn argv fix:
+    # the #37 handler must open the PATH TOKEN ("/bin/argv") while staging the WHOLE
+    # line as argv, so /bin/argv sees argv[1]="Z" and exits argv[1][0]='Z'=0x5A=90.
+    # If H1/H2 OR the argv split were broken, exwv could not resume to exit 90.
+    # exec-smoke gates on a SECOND "run: exit 90" (the direct "run /bin/argv Z" above
+    # is the first). No register is held across a 2nd syscall (the kernel handler
+    # clobbers caller-saved r8-r11) — exwv just propagates rax straight into exit.
+    var xi = 0;
+    while (xi < 200) { store8(eb + xi, 0); xi = xi + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 171); store8(eb + 104, 171);                  # p_filesz/memsz = 171 ("/bin/argv Z" path runs to off 170)
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 — 38 bytes, no jumps: execwait("/bin/argv Z",11) then exit(rax)
+    var xc = 120;
+    store8(eb+xc,0x48); store8(eb+xc+1,0xC7); store8(eb+xc+2,0xC0); store8(eb+xc+3,0x25); xc=xc+7;  # mov rax,37 (execwait)
+    store8(eb+xc,0x48); store8(eb+xc+1,0xBF); store8(eb+xc+2,0xA0); store8(eb+xc+4,0x40); xc=xc+10; # movabs rdi,0x4000A0 (path VA)
+    store8(eb+xc,0x48); store8(eb+xc+1,0xC7); store8(eb+xc+2,0xC6); store8(eb+xc+3,0x0B); xc=xc+7;  # mov rsi,11 (pathlen "/bin/argv Z")
+    store8(eb+xc,0x0F); store8(eb+xc+1,0x05); xc=xc+2;                                              # syscall (execwait) -> rax=child code
+    store8(eb+xc,0x48); store8(eb+xc+1,0x89); store8(eb+xc+2,0xC7); xc=xc+3;                        # mov rdi,rax (child code -> exit arg)
+    store8(eb+xc,0x48); store8(eb+xc+1,0xC7); store8(eb+xc+2,0xC0); store8(eb+xc+3,0x00); xc=xc+7;  # mov rax,0 (exit)
+    store8(eb+xc,0x0F); store8(eb+xc+1,0x05); xc=xc+2;                                              # syscall — exit(child code)
+    # path "/bin/argv Z" @160 (VA 0x4000A0), 11 bytes incl. the ' ' arg separator
+    store8(eb+160,0x2F); store8(eb+161,0x62); store8(eb+162,0x69); store8(eb+163,0x6E);            # "/bin"
+    store8(eb+164,0x2F); store8(eb+165,0x61); store8(eb+166,0x72); store8(eb+167,0x67);            # "/arg"
+    store8(eb+168,0x76); store8(eb+169,0x20); store8(eb+170,0x5A);                                  # "v␠Z"
+    var xvino = 0;
+    if (bino > 0) { xvino = ext2_create(bino, "exwv", 4); }
+    if (xvino > 0) { ext2_write_at(xvino, 0, eb, 171); ext2_sync(); }
+    kprintln("exec: running /bin/exwv", 23);
+    sh_exec("run /bin/exwv", 13);
+
+    # 1.43.2 — envp validator (/bin/envtest). A ring-3 program run with NO extra
+    # args (argc=1: argv[0]=path), so its stack is [rsp]=1, [rsp+8]=argv0,
+    # [rsp+0x10]=argv NULL, [rsp+0x18]=envp[0] → "HOME=/". It reads envp[0][0] and
+    # exits with it: 'H' = 0x48 = 72. "run: exit 72" proves the kernel staged a
+    # real envp the ring-3 program can read at the SysV offset (and NOT argv — argv0
+    # starts '/' = 47, so 72 is distinctive). Mirrors /bin/argv but reads envp[0].
+    var ti = 0;
+    while (ti < 200) { store8(eb + ti, 0); ti = ti + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 138); store8(eb + 104, 138);                  # p_filesz/memsz = 138
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120: mov rsi,[rsp+0x18] (envp[0]) ; movzx rdi,byte[rsi] ; mov rax,0 ; syscall
+    store8(eb + 120, 0x48); store8(eb + 121, 0x8B); store8(eb + 122, 0x74); store8(eb + 123, 0x24); store8(eb + 124, 0x18);
+    store8(eb + 125, 0x48); store8(eb + 126, 0x0F); store8(eb + 127, 0xB6); store8(eb + 128, 0x3E);
+    store8(eb + 129, 0x48); store8(eb + 130, 0xC7); store8(eb + 131, 0xC0);
+    store8(eb + 136, 0x0F); store8(eb + 137, 0x05);
+    var tino = 0;
+    if (bino > 0) { tino = ext2_create(bino, "envtest", 7); }
+    if (tino > 0) { ext2_write_at(tino, 0, eb, 138); ext2_sync(); }
+    kprintln("exec: running /bin/envtest", 26);
+    sh_exec("run /bin/envtest", 16);
+
+    # 1.44.19 — per-process env validator (/bin/envprop). A ring-3 program that calls
+    # execwait(37) on "/bin/envtest" WITH a caller env blob: a3 = VA of "Q=1\0" (embedded
+    # in its OWN code page — user-mapped, so the fault-proof page-walk copy accepts it),
+    # a4 = 4. The child is the EXISTING envtest, which exits envp[0][0] — with the caller
+    # env REPLACING the default, envp[0] = "Q=1" → exit 'Q' = 0x51 = 81 (distinct from the
+    # default's 'H' = 72, which the run above keeps asserting as the fallback gate).
+    # "run: exit 81" therefore proves the WHOLE chain: ring-3 a3/a4 → fault-proof copy →
+    # blob validation → elf.cyr staging → child getenv-visible envp. Sequential, no jumps.
+    var pi2 = 0;
+    while (pi2 < 200) { store8(eb + pi2, 0); pi2 = pi2 + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 196); store8(eb + 104, 196);                  # p_filesz/memsz = 196
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 (55 B, sequential): execwait("/bin/envtest",12, blob,4) then exit(rax)
+    var pc2 = 120;
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xC7); store8(eb+pc2+2,0xC0); store8(eb+pc2+3,0x25); pc2=pc2+7;  # mov rax,37
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xBF); store8(eb+pc2+2,0xB0); store8(eb+pc2+4,0x40); pc2=pc2+10; # movabs rdi,0x4000B0 (path @176)
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xC7); store8(eb+pc2+2,0xC6); store8(eb+pc2+3,0x0C); pc2=pc2+7;  # mov rsi,12
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xBA); store8(eb+pc2+2,0xC0); store8(eb+pc2+4,0x40); pc2=pc2+10; # movabs rdx,0x4000C0 (blob @192 = a3)
+    store8(eb+pc2,0x49); store8(eb+pc2+1,0xC7); store8(eb+pc2+2,0xC2); store8(eb+pc2+3,0x04); pc2=pc2+7;  # mov r10,4 (a4 = blob len)
+    store8(eb+pc2,0x0F); store8(eb+pc2+1,0x05); pc2=pc2+2;                                                # syscall -> rax = child code
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0x89); store8(eb+pc2+2,0xC7); pc2=pc2+3;                         # mov rdi,rax
+    store8(eb+pc2,0x48); store8(eb+pc2+1,0xC7); store8(eb+pc2+2,0xC0); store8(eb+pc2+3,0x00); pc2=pc2+7;  # mov rax,0 (exit)
+    store8(eb+pc2,0x0F); store8(eb+pc2+1,0x05);                                                            # syscall — exit(child code)
+    # path "/bin/envtest" @176 (VA 0x4000B0), 12 bytes
+    store8(eb+176,0x2F); store8(eb+177,0x62); store8(eb+178,0x69); store8(eb+179,0x6E);                   # "/bin"
+    store8(eb+180,0x2F); store8(eb+181,0x65); store8(eb+182,0x6E); store8(eb+183,0x76);                   # "/env"
+    store8(eb+184,0x74); store8(eb+185,0x65); store8(eb+186,0x73); store8(eb+187,0x74);                   # "test"
+    # env blob "Q=1\0" @192 (VA 0x4000C0), 4 bytes — one entry, NUL-terminated
+    store8(eb+192,0x51); store8(eb+193,0x3D); store8(eb+194,0x31); store8(eb+195,0x00);                   # "Q=1\0"
+    var ppino = 0;
+    if (bino > 0) { ppino = ext2_create(bino, "envprop", 7); }
+    if (ppino > 0) { ext2_write_at(ppino, 0, eb, 196); ext2_sync(); }
+    kprintln("exec: running /bin/envprop", 26);
+    sh_exec("run /bin/envprop", 16);
+
+    # 1.43.4 — framebuffer fbinfo(38) + blit(39) validator (/bin/fbtest). Queries
+    # geometry into a stack buffer, then blits a 4x4 block from the stack to FB
+    # (0,0), and exits with bpp(=32, @struct+12) + blit_rc(=0) + 56 = 88. "run:
+    # exit 88" proves BOTH syscalls dispatch from ring 3, fbinfo writes the struct
+    # (bpp=32 is format/resolution-independent), and blit copies into fb_phys and
+    # returns 0 without faulting — under gnoboot+OVMF q35 the GOP FB is present so
+    # blit succeeds (a -1 here would surface as exit 87, not 88). The 4x4 paint is
+    # a negligible console corner. No jumps / no strings — 80 code bytes, sequential.
+    var fi = 0;
+    while (fi < 200) { store8(eb + fi, 0); fi = fi + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 200); store8(eb + 104, 200);                 # p_filesz/memsz = 200
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 — 80 bytes (pre-zeroed buffer completes each imm32)
+    var fc = 120;
+    store8(eb+fc,0x48); store8(eb+fc+1,0x81); store8(eb+fc+2,0xEC); store8(eb+fc+3,0x80); fc=fc+7;  # sub rsp,0x80
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC0); store8(eb+fc+3,0x26); fc=fc+7;  # mov rax,38 (fbinfo)
+    store8(eb+fc,0x48); store8(eb+fc+1,0x89); store8(eb+fc+2,0xE7); fc=fc+3;                        # mov rdi,rsp (buf)
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC6); store8(eb+fc+3,0x18); fc=fc+7;  # mov rsi,24 (len)
+    store8(eb+fc,0x0F); store8(eb+fc+1,0x05); fc=fc+2;                                              # syscall (fbinfo)
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC0); store8(eb+fc+3,0x27); fc=fc+7;  # mov rax,39 (blit)
+    store8(eb+fc,0x48); store8(eb+fc+1,0x8D); store8(eb+fc+2,0x7C); store8(eb+fc+3,0x24); store8(eb+fc+4,0x18); fc=fc+5;  # lea rdi,[rsp+24] (src)
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC6); store8(eb+fc+3,0x04); fc=fc+7;  # mov rsi,4 (w)
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC2); store8(eb+fc+3,0x04); fc=fc+7;  # mov rdx,4 (h)
+    store8(eb+fc,0x49); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC2); store8(eb+fc+3,0x00); fc=fc+7;  # mov r10,0 (dstxy=0,0)
+    store8(eb+fc,0x0F); store8(eb+fc+1,0x05); fc=fc+2;                                              # syscall (blit)
+    store8(eb+fc,0x0F); store8(eb+fc+1,0xB6); store8(eb+fc+2,0x7C); store8(eb+fc+3,0x24); store8(eb+fc+4,0x0C); fc=fc+5;  # movzx edi,byte[rsp+12] (bpp=32)
+    store8(eb+fc,0x01); store8(eb+fc+1,0xC7); fc=fc+2;                                              # add edi,eax (blit rc)
+    store8(eb+fc,0x83); store8(eb+fc+1,0xC7); store8(eb+fc+2,0x38); fc=fc+3;                        # add edi,56 -> 88
+    store8(eb+fc,0x48); store8(eb+fc+1,0xC7); store8(eb+fc+2,0xC0); store8(eb+fc+3,0x00); fc=fc+7;  # mov rax,0 (exit)
+    store8(eb+fc,0x0F); store8(eb+fc+1,0x05);                                                       # syscall — exit(edi=88)
+    var fino = 0;
+    if (bino > 0) { fino = ext2_create(bino, "fbtest", 6); }
+    if (fino > 0) { ext2_write_at(fino, 0, eb, 200); ext2_sync(); }
+    kprintln("exec: running /bin/fbtest", 25);
+    sh_exec("run /bin/fbtest", 15);
+
+    # 1.43.5 — uptime_ms(40) + sleep_ms(41) validator (/bin/timetest). Reads the
+    # monotonic ms clock (t0), sleeps 50 ms (= 5 ticks), reads it again (t1), and
+    # exits with t1-t0 = 50. "run: exit 50" proves BOTH syscalls dispatch from
+    # ring 3 AND that sleep_ms actually ADVANCED the clock — a frozen clock (e.g. a
+    # broken sti+hlt window) would leave t1==t0 → exit 0. The tick delta is exactly
+    # 5 (sl_target = ticks+5; the loop exits at ticks+5), so the ms delta is a
+    # deterministic 50 regardless of tick phase. No jumps / no strings — 58 code
+    # bytes. exec-smoke gates on "run: exit 50".
+    var gi = 0;
+    while (gi < 200) { store8(eb + gi, 0); gi = gi + 1; }
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 178); store8(eb + 104, 178);                 # p_filesz/memsz = 178
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120 — 58 bytes (pre-zeroed buffer completes each imm32)
+    var gc = 120;
+    store8(eb+gc,0x48); store8(eb+gc+1,0x83); store8(eb+gc+2,0xEC); store8(eb+gc+3,0x10); gc=gc+4;  # sub rsp,0x10
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC0); store8(eb+gc+3,0x28); gc=gc+7;  # mov rax,40 (uptime_ms)
+    store8(eb+gc,0x0F); store8(eb+gc+1,0x05); gc=gc+2;                                              # syscall -> t0
+    store8(eb+gc,0x48); store8(eb+gc+1,0x89); store8(eb+gc+2,0x04); store8(eb+gc+3,0x24); gc=gc+4;  # mov [rsp],rax (save t0)
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC0); store8(eb+gc+3,0x29); gc=gc+7;  # mov rax,41 (sleep_ms)
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC7); store8(eb+gc+3,0x32); gc=gc+7;  # mov rdi,50 (ms)
+    store8(eb+gc,0x0F); store8(eb+gc+1,0x05); gc=gc+2;                                              # syscall -> sleep 50 ms
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC0); store8(eb+gc+3,0x28); gc=gc+7;  # mov rax,40 (uptime_ms)
+    store8(eb+gc,0x0F); store8(eb+gc+1,0x05); gc=gc+2;                                              # syscall -> t1
+    store8(eb+gc,0x48); store8(eb+gc+1,0x2B); store8(eb+gc+2,0x04); store8(eb+gc+3,0x24); gc=gc+4;  # sub rax,[rsp] (t1-t0)
+    store8(eb+gc,0x48); store8(eb+gc+1,0x89); store8(eb+gc+2,0xC7); gc=gc+3;                        # mov rdi,rax (exit = delta)
+    store8(eb+gc,0x48); store8(eb+gc+1,0xC7); store8(eb+gc+2,0xC0); store8(eb+gc+3,0x00); gc=gc+7;  # mov rax,0 (exit)
+    store8(eb+gc,0x0F); store8(eb+gc+1,0x05);                                                       # syscall -> exit(50)
+    var gino = 0;
+    if (bino > 0) { gino = ext2_create(bino, "timetest", 8); }
+    if (gino > 0) { ext2_write_at(gino, 0, eb, 178); ext2_sync(); }
+    kprintln("exec: running /bin/timetest", 27);
+    sh_exec("run /bin/timetest", 17);
+
     kprintln("exec: selftest done", 19);
     return 0;
 }
 exec_disk_selftest();
+#endif
+
+#ifdef SYMLINK_SELFTEST
+# 1.51.x — symlink#63 round-trip self-test (compile-gated, SYMLINK_SELFTEST=1).
+# The ark v2 / agnova DO-FIRST item (a). Unlike the hand-asm selftests around it,
+# the exerciser is a REAL cyrius `--agnos` program (tests/symlink/symtest.cyr)
+# staged at /bin/symtest by the smoke's mkfs seed — so this exercises the cyrius
+# `sys_symlink`#63 PEER (lib/syscalls_x86_64_agnos.cyr, landed cyrius 6.3.6), NOT
+# a raw hand-asm syscall. symtest creates /hn_link -> "/etc/hostname", then opens
+# the symlink and reads it back (ext2_path_lookup follows the link to the seeded
+# hostname file), printing SYMLINK-CREATE-OK / SYMLINK-TRAVERSE-OK and exiting 0.
+# Proves the cyrius peer + kernel symlink#63 (ext2_symlink, 1.51.0) end-to-end.
+# Gated by scripts/symlink-smoke.sh on the markers + "run: exit 0" + a host-side
+# readlink/e2fsck pass ([[feedback_qemu_test_agnos_userland]]).
+fn symlink_disk_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    kprintln("exec: running /bin/symtest", 26);
+    sh_exec("run /bin/symtest", 16);
+    # Flush the symlink inode+dirent to the platter so the host-side readlink /
+    # e2fsck pass sees them after QEMU is killed (the ring-3 program cannot sync;
+    # the selftest harness does, mirroring exec/ext2-write selftests).
+    ext2_sync();
+    kprintln("exec: symlink selftest done", 27);
+    return 0;
+}
+symlink_disk_selftest();
+#endif
+
+#ifdef ARK_SELFTEST
+# Server-stage probe (compile-gated, ARK_SELFTEST=1): does the real ~16 MB ark
+# binary LOAD + RUN in ring 3 on agnos? ark is by far the largest binary attempted
+# (kriya 934 KB / doom 589 KB are the prior ceiling) and the ark v2 M3 on-agnos
+# `.ark` install rides on it. Staged at /bin/ark by scripts/ark-run-smoke.sh; run
+# with NO args here, so ark prints its "Unknown command. Available: ..." command
+# list and exits — `run: exit N` proves exec-from-disk streamed + elf_load mapped
+# the 16 MB image (incl. its ~14 MB static .bss) and ring-3 code reached write(1).
+# Deterministic (no agnsh keystrokes — sendkey dropped chars on a 16 MB target).
+fn ark_run_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    kprintln("exec: running /bin/ark", 22);
+    sh_exec("run /bin/ark", 12);
+    kprintln("exec: ark selftest done", 23);
+    return 0;
+}
+ark_run_selftest();
+#endif
+
+#ifdef ARK_INSTALL_SELFTEST
+# The ark v2 M3 milestone: an on-agnos install of a prebuilt `.ark` that CARRIES
+# a symlink entry, end to end. ark runs `install --root /arkroot /symlink-test.ark`
+# (both staged by scripts/ark-install-smoke.sh): it reads + verifies the unsigned
+# `.ark` (takumi-built, a regular file `/lib/libfoo.so.1` + a symlink
+# `/lib/libfoo.so` -> `libfoo.so.1`), lays the file down (pass 1), then in pass 2
+# calls `ark_symlink` -> the cyrius `sys_symlink`#63 agnos peer -> kernel
+# `symlink`#63 -> `ext2_symlink`, creating the symlink ON THE AGNOS-FS. The smoke
+# then verifies host-side that `/arkroot/lib/libfoo.so` is a symlink to
+# `libfoo.so.1` and the partition is e2fsck-clean — the true M3 round-trip
+# ([[feedback_qemu_test_agnos_userland]]). This is the first real consumer of the
+# symlink syscall through a full userland install path, not a bespoke exerciser.
+fn ark_install_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    kprintln("exec: running ark install", 25);
+    sh_exec("run /bin/ark install --root /arkroot /symlink-test.ark", 54);
+    ext2_sync();
+    kprintln("exec: ark install selftest done", 31);
+    return 0;
+}
+ark_install_selftest();
+#endif
+
+#ifdef BASESTACK_SELFTEST
+# Base-security-stack agnos-RUNTIME probe (compile-gated, BASESTACK_SELFTEST=1):
+# does a base-stack binary (aegis/bote/phylax/hoosh/thoth), cross-built --agnos,
+# actually LOAD + RUN in ring 3 on agnos — not merely compile `--agnos`? Staged at
+# /bin/probe by scripts/basestack-run-smoke.sh and run with `--version`, so it
+# prints its version string and exits (`run: exit N`) — proving exec-from-disk
+# streamed the multi-MB ELF, elf_load mapped it, and ring-3 code reached write(1).
+# Deterministic (no agnsh keystrokes — sendkey drops chars on 10 MB+ targets),
+# same shape as ark_run_selftest. The "runs, not just builds" gate for the
+# base-stack agnos-readiness arc ([[feedback_qemu_test_agnos_userland]]).
+fn basestack_run_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    kprintln("exec: running /bin/probe --version", 34);
+    sh_exec("run /bin/probe --version", 24);
+    kprintln("exec: basestack selftest done", 29);
+    return 0;
+}
+basestack_run_selftest();
+#endif
+
+#ifdef BOTE_SELFTEST
+# MCP-SERVE-on-real-kernel probe (compile-gated, BOTE_SELFTEST=1): does /bin/bote
+# (the MCP core, cross-built --agnos) actually SERVE the JSON-RPC MCP protocol on
+# the REAL agnos kernel — not just LOAD (basestack) and not merely under mirshi's
+# host-kernel syscall emulation? This exercises the freelist `mmap#27` fix on the
+# ACTUAL agnos mmap (bote's libro chain_new -> sha256 -> fl_alloc was the crash;
+# see the bote 6.3.38 migration). Driven deterministically (no keystrokes): we
+# stand up two kernel pipes, PRELOAD an MCP `initialize` + `tools/call bote_echo`
+# request into the stdin pipe, load bote, point the child's fd0 <- stdin-pipe-read
+# and fd1 <- stdout-pipe-write (direct fd-table entry copy — same 32-B entry the
+# execwait#37 redirect swaps), run it to EOF (empty stdin pipe -> read 0), then
+# read the stdout pipe and paint bote's JSON responses to serial. PASS (checked by
+# scripts/bote-mcp-smoke.sh) = serial shows bote's `serverInfo` + the echoed
+# `agnos-kernel` argument. Staged at /bin/bote by the smoke. Mirrors
+# ark_run_selftest (exec-from-disk) + exec_redirect_selftest (pipe fd plumbing).
+var _bote_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"k\",\"version\":\"1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"bote_echo\",\"arguments\":{\"on\":\"agnos-kernel\"}}}\n";
+fn bote_mcp_selftest() {
+    if (ext2_active == 0) { kprintln("bote: no ext2", 13); return 0; }
+    syscall_init();
+    var boot_pid = proc_current_get();
+    var boottab = vfs_fd_table_of(boot_pid);
+    # stdin pipe — preload the MCP request into the write end
+    var fin[16];
+    if (vfs_create_pipe(&fin) != 0) { kprintln("bote: FAIL pipe-in", 18); return 0; }
+    var rfd_in = load64(&fin);
+    var wfd_in = load64(&fin + 8);
+    var reqlen = strlen(_bote_req);
+    vfs_write(wfd_in, _bote_req, reqlen);
+    # stdout pipe — bote's responses land here
+    var fout[16];
+    if (vfs_create_pipe(&fout) != 0) { kprintln("bote: FAIL pipe-out", 19); return 0; }
+    var rfd_out = load64(&fout);
+    var wfd_out = load64(&fout + 8);
+    # load bote from disk
+    if (sh_abspath("/bin/bote", 9) < 0) { kprintln("bote: bad path", 14); return 0; }
+    var pid = elf_load_from_file(&sh_path_buf, sh_path_len, "/bin/bote", 9);
+    if (pid < 0) { kprintln("bote: not an executable", 23); return 0; }
+    # Redirect the child's fd0 <- stdin-pipe read end, fd1 <- stdout-pipe write end,
+    # by copying the boot table's pipe fd entries (32 B each) into the child's fd0/fd1.
+    var ctab = vfs_fd_table_of(pid);
+    var k = 0;
+    while (k < 32) { store64(ctab + k, load64(boottab + rfd_in * 32 + k)); k = k + 8; }
+    k = 0;
+    while (k < 32) { store64(ctab + 32 + k, load64(boottab + wfd_out * 32 + k)); k = k + 8; }
+    # run bote in ring 3; it reads the request from fd0, writes responses to fd1,
+    # then reads fd0 again -> empty pipe returns 0 -> EOF -> exits.
+    kprintln("bote: exec /bin/bote (MCP serve)", 32);
+    var ep = &proc_table + pid * 176;
+    var e = load64(ep + 24);
+    var r = load64(ep + 16);
+    var c = load64(ep + 160);
+    proc_current_set(pid);
+    exec_and_wait(e, r, c);
+    proc_current_set(boot_pid);
+    kprint("bote: exit ", 11);
+    kprint_num(proc_get_exit_code(pid));
+    kprintln("", 0);
+    # drain the stdout pipe and paint bote's JSON responses to serial
+    var resp[512];
+    var n = vfs_read(rfd_out, &resp, 511);
+    if (n > 0) {
+        kprintln("bote: mcp-response-begin", 24);
+        kprintln(&resp, n);
+        kprintln("bote: mcp-response-end", 22);
+    } else {
+        kprintln("bote: NO mcp response", 21);
+    }
+    proc_reap(pid);
+    kprintln("bote: mcp selftest done", 23);
+    return 0;
+}
+bote_mcp_selftest();
+#endif
+
+#ifdef BENCH_CONNECT_SELFTEST
+# Connect-latency benchmark probe (compile-gated): run hoosh's `bench` connect loop
+# against the SLIRP host gateway (10.0.2.2) so agnos connect latency (post-1.51.3
+# busy-poll) is measurable vs Linux native. Needs QEMU virtio-net + a host listener
+# on :18085 (scripts/bench-connect-smoke.sh); DHCP is up by here (net init runs
+# earlier in boot). Prints "bench: … avg=Nus/connect" to serial.
+fn bench_connect_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    # Read the command from /etc/probe-cmd (staged by bench-connect-smoke.sh) so the
+    # target IP / connect count can vary without a kernel rebuild. Strip trailing NL/CR.
+    var cmdbuf[128];    # function-local → 128 bytes on the stack (var-bomb aware)
+    var n = vfs_read_file("/etc/probe-cmd", 14, &cmdbuf, 127);
+    if (n <= 0) { kprintln("bench: no /etc/probe-cmd", 24); return 0; }
+    while (n > 0) {
+        var c = load8(&cmdbuf + n - 1);
+        if (c == 10 || c == 13 || c == 0) { n = n - 1; } else { break; }
+    }
+    store8(&cmdbuf + n, 0);
+    kprintln("exec: running probe-cmd", 23);
+    sh_exec(&cmdbuf, n);
+    kprintln("exec: bench selftest done", 25);
+    return 0;
+}
+bench_connect_selftest();
+#endif
+
+#ifdef FAULT_SELFTEST
+# 1.47.x — proc-teardown-on-fault self-test (compile-gated, FAULT_SELFTEST=1). Builds a
+# minimal static ELF64 whose entry READS an unmapped 5 GB address (movabs rdi,0x140000000;
+# mov rax,[rdi]) → a RING-3 (CPL3) #PF. The idt.cyr #PF stub's CPL3 gate must route it to
+# fault_kill_current (kill the proc + kernel_resume back here) INSTEAD of painting the blue
+# canary bar + halting. PASS = the box SURVIVES: "run: exit 142" (128+14 = the #PF kill code)
+# prints, AND "fault: SURVIVED back in kernel" prints after — i.e. exec_and_wait resumed the
+# kernel after a ring-3 fault. FAIL = a blue canary bar + halt (no "fault: SURVIVED").
+# Gated by scripts/fault-kill-smoke.sh. Mirrors exec_disk_selftest's ELF-build shape.
+fn fault_disk_selftest() {
+    if (ext2_active == 0) { return 0; }
+    syscall_init();
+    var eb = &vfs_scratch_buf;
+    var ez = 0;
+    while (ez < 256) { store8(eb + ez, 0); ez = ez + 1; }
+    # ELF64 header (ET_EXEC, x86-64, 1 PT_LOAD @ 0x400000, entry 0x400078)
+    store8(eb + 0, 0x7F); store8(eb + 1, 0x45); store8(eb + 2, 0x4C); store8(eb + 3, 0x46);
+    store8(eb + 4, 2); store8(eb + 5, 1); store8(eb + 6, 1);
+    store8(eb + 16, 2); store8(eb + 18, 0x3E); store8(eb + 20, 1);
+    store8(eb + 24, 0x78); store8(eb + 26, 0x40);                 # e_entry = 0x400078
+    store8(eb + 32, 64); store8(eb + 52, 64); store8(eb + 54, 56); store8(eb + 56, 1);
+    store8(eb + 64, 1); store8(eb + 68, 5);                       # PT_LOAD R+X
+    store8(eb + 82, 0x40); store8(eb + 90, 0x40);                 # p_vaddr/paddr = 0x400000
+    store8(eb + 96, 160); store8(eb + 104, 160);                  # p_filesz/memsz = 160
+    store8(eb + 113, 0x10);                                       # p_align
+    # code @120: movabs rdi,0x140000000 ; mov rax,[rdi] (RING-3 #PF) ; (unreached) exit(87)
+    var c = 120;
+    store8(eb+c,0x48); store8(eb+c+1,0xBF);
+    store8(eb+c+2,0x00); store8(eb+c+3,0x00); store8(eb+c+4,0x00); store8(eb+c+5,0x40);
+    store8(eb+c+6,0x01); store8(eb+c+7,0x00); store8(eb+c+8,0x00); store8(eb+c+9,0x00); c=c+10;  # movabs rdi,0x140000000
+    store8(eb+c,0x48); store8(eb+c+1,0x8B); store8(eb+c+2,0x07); c=c+3;                          # mov rax,[rdi] -> #PF
+    store8(eb+c,0x48); store8(eb+c+1,0xC7); store8(eb+c+2,0xC0); store8(eb+c+3,0x00); c=c+7;     # mov rax,0  (exit)
+    store8(eb+c,0x48); store8(eb+c+1,0xC7); store8(eb+c+2,0xC7); store8(eb+c+3,0x57); c=c+7;     # mov rdi,87 (fallback)
+    store8(eb+c,0x0F); store8(eb+c+1,0x05);                                                      # syscall
+    # write /bin/faulter
+    ext2_mkdir(2, "bin", 3);
+    var bino = ext2_path_lookup("/bin", 4);
+    var fino = 0;
+    if (bino > 0) { fino = ext2_create(bino, "faulter", 7); }
+    if (fino > 0) { ext2_write_at(fino, 0, eb, 160); ext2_sync(); }
+    kprintln("fault: running /bin/faulter", 27);
+    sh_exec("run /bin/faulter", 16);
+    # If the box SURVIVED the ring-3 fault, control reaches here (exec_and_wait resumed via
+    # fault_kill_current -> kernel_resume). A canary-bar HALT never prints this line.
+    kprintln("fault: SURVIVED back in kernel", 30);
+    return 0;
+}
+fault_disk_selftest();
+#endif
+
+#ifdef PIPE_RC_SELFTEST
+# 1.47.x — pipe buffer refcount self-test (bite 2, sub-bite 2c). Proves the OWNER's LAST close
+# frees the shared 4 KB pipe buffer (the leak fix) — NOT the first close — and that a double
+# close is a safe no-op (no double-free / no crash). Uses heap_frees (bumped by kfree_sized) as
+# the free witness. PASS = "piperc: buffer FREED OK" + "piperc: double-close safe".
+fn pipe_rc_selftest() {
+    var fds[16];                                  # rfd@[0], wfd@[8]
+    var f0 = heap_frees;
+    if (vfs_create_pipe(&fds) != 0) { kprintln("piperc: create FAIL", 19); return 0; }
+    var rfd = load64(&fds);
+    var wfd = load64(&fds + 8);
+    vfs_close(rfd);                               # owner close 1 of 2 — buffer NOT yet freed
+    if (heap_frees != f0) { kprintln("piperc: freed too EARLY", 23); return 0; }
+    vfs_close(wfd);                               # owner close 2 of 2 — buffer freed here
+    if (heap_frees > f0) { kprintln("piperc: buffer FREED OK", 23); }
+    else { kprintln("piperc: LEAK not freed", 22); return 0; }
+    vfs_close(rfd);                               # double close — must be a safe no-op
+    kprintln("piperc: double-close safe", 25);
+    return 0;
+}
+pipe_rc_selftest();
+#endif
+
+#ifdef DOOM_SELFTEST
+# 1.43.x — cyrius-doom render bring-up (the first real userland APP). /bin/doom
+# + /DOOM1.WAD are seeded onto the ext2 root by scripts/doom-smoke.sh; run the
+# 584 KB ELF from disk in ring 3. doom loops forever (the 35 Hz game loop),
+# rendering to the framebuffer via fbinfo#38 + blit#39 and pacing via uptime_ms
+# #40 / sleep_ms#41 — so the boot intentionally "parks" here while doom renders;
+# doom-smoke.sh screendumps the live framebuffer. "exec: doom returned" only
+# prints if doom exits (it shouldn't, with no quit input).
+kprintln("exec: running /bin/doom", 23);
+#ifdef DOOM_DIRECTMAP
+# Direct-map render smoke (DOOM_DIRECTMAP=1): pass an explicit WAD + map so doom's
+# direct_map path skips menu_run() and renders E1M1 at spawn — the in-game 3D
+# renderer is verified WITHOUT any keyboard input (scripts/doom-directmap-smoke.sh).
+sh_exec("run /bin/doom /DOOM1.WAD E1M1", 29);
+#endif
+#ifndef DOOM_DIRECTMAP
+sh_exec("run /bin/doom", 13);
+#endif
+kprintln("exec: doom returned", 19);
+#endif
+
+#ifdef AETHERSAFHA_SELFTEST
+# desktop bring-up — the sovereign compositor (the first real graphical userland
+# beyond doom). /bin/aethersafha (aethersafha built --agnos) is seeded onto the
+# ext2 root by scripts/aethersafha-smoke.sh; run the ELF from disk in ring 3. It
+# opens the bhumi backend, renders its desktop (backdrop + windows + shell panel)
+# to the framebuffer via fbinfo#38 + blit#39, and loops (the real compositor
+# loop) — so the boot intentionally "parks" here while it renders;
+# aethersafha-smoke.sh screendumps the live framebuffer. "exec: aethersafha
+# returned" only prints if it exits (it shouldn't, with the continuous loop).
+kprintln("exec: running /bin/aethersafha", 30);
+sh_exec("run /bin/aethersafha", 20);
+kprintln("exec: aethersafha returned", 26);
+#endif
+
+#ifdef DOOM_AUDIO_SELFTEST
+# 1.52.7 — cyrius-doom audio bring-up (the FIRST real ring-3 exercise of the
+# snd_write#66 user-buffer path — snd-smoke drives the band from kernel context,
+# doom drives it from ring 3). Runs `/bin/doom /DOOM1.WAD --audio-test`: doom's
+# --audio-test opens sys_snd_open#64 / config#65, then plays 6 real WAD SFX + an
+# L/R pan over ~8s via sys_snd_write_nb#66, then closes (#67). The wad path is
+# passed EXPLICITLY as argv[1] so --audio-test lands at argv[2] (doom's flag loop
+# starts at ai=2); scripts/doom-audio-smoke.sh captures the HDA output to a wav
+# and asserts it's non-silent. doom exits when the ~8s test finishes, so the boot
+# does NOT park here (unlike DOOM_SELFTEST's forever game loop).
+kprintln("exec: running /bin/doom --audio-test", 36);
+sh_exec("run /bin/doom /DOOM1.WAD --audio-test", 38);
+kprintln("exec: doom audio-test returned", 30);
+#endif
+
+#ifdef TONEGEN_SELFTEST
+# audio-path isolation test — runs /bin/tonegen (agnos/audio-test) from disk. It
+# BLOCKING-streams clean generated waveforms (sine/square/saw/triangle + a sweep)
+# through the snd_* band. Blocking writes are kernel-paced, so this tests the ring/
+# DAC PATH itself, decoupled from any producer's timing (unlike doom's non-blocking
+# game-loop path). scripts/tonegen-smoke.sh captures the HDA output + checks the
+# waveforms are clean. tonegen exits when the tones finish, so the boot doesn't park.
+kprintln("exec: running /bin/tonegen", 26);
+sh_exec("run /bin/tonegen", 16);
+kprintln("exec: tonegen returned", 22);
+#endif
+
+#ifdef FP_RING3_SELFTEST
+# 1.53.x B4: ring-3 f64 first-touch. Runs /bin/fpex (fp-test/, built --agnos) — a cyrius
+# f64 program that computes 7*3=21, +1=22, /2=11 in ring 3 and exits 84 iff all correct.
+# Proves the B1→B3 FP stack end to end: enter_ring3 sets CR0.TS → the first f64 op #NMs
+# → nm_handler FXRSTORs fpex's per-proc area → the f64 computes → "run: exit 84". A #GP on
+# the first FXRSTOR (an illegal B2 default image) would crash here instead of exit 84.
+kprintln("exec: running /bin/fpex", 23);
+sh_exec("run /bin/fpex", 13);
+kprintln("exec: fpex returned", 19);
+#endif
+
+#ifdef BLK_RING3_SELFTEST
+# 1.53.10 Phase 1: raw block-device READ-PATH proof. Runs /bin/blkprobe (blk-test/,
+# built --agnos) — enumerates the disk via blk_enum#75, opens it RO via blk_open#76,
+# reads LBA 1 via blk_read#77, and checks the "EFI PART" GPT signature. Exits 95 iff
+# the whole ring-3 read-path works against the real (GPT) NVMe disk. A wrong number/
+# arg wiring or an unmapped-buffer fault would crash or return a 90-94 diagnostic.
+kprintln("exec: running /bin/blkprobe", 27);
+sh_exec("run /bin/blkprobe", 17);
+kprintln("exec: blkprobe returned", 23);
+#endif
+
+#ifdef BLK_WRITE_SELFTEST
+# 1.53.10 Phase 2: raw block-device WRITE-PATH + capability-gate proof. Runs /bin/blkwr
+# (blk-test/, built --agnos) — asserts blk_write#78 is REJECTED while unarmed (the gate),
+# then arms via blk_open(_, BLK_RW_ARM_MAGIC), writes a known pattern to a scratch LBA in
+# the disk's unallocated tail, and reads it back. Exits 96 iff gate + write-path both hold.
+kprintln("exec: running /bin/blkwr", 24);
+sh_exec("run /bin/blkwr", 14);
+kprintln("exec: blkwr returned", 20);
+#endif
+
+#ifdef GPT_WRITE_SELFTEST
+# 1.53.x Phase 4: sovereign GPT/mkfs writer. Runs /bin/gptwr (blk-test/, built --agnos) — the
+# ring-3 successor to blkwr that builds a byte-accurate GPT + FAT ESP in userland and writes it
+# through sys_blk_* (kernel owns raw sectors, userland owns the on-disk format). Bite 1: CRC32
+# correctness (pure compute, NO disk) — the GPT header + partition-array CRCs gate every later
+# bite, so CRC32 is proven against canonical vectors first. Exits 97 iff CRC32("123456789")/
+# ("")/("a") all match; 91/92/93 pinpoint the failing vector.
+kprintln("exec: running /bin/gptwr", 24);
+sh_exec("run /bin/gptwr", 14);
+kprintln("exec: gptwr returned", 20);
+#endif
+
+#ifdef AGNOVA_INSTALL_SELFTEST
+# Phase-5 agnova NATIVE_BLOCK proof. Runs /bin/agnova (agnova repo, built --agnos) as a REAL
+# ring-3 install: it enumerates the NVMe (sys_blk_enum), arms the write gate, and writes a GPT
+# for a 768 MiB synthetic disk into the live disk's UNALLOCATED TAIL (scratch-base 524288, past
+# the live rootfs) via df_write -> sys_blk_write — proving the ACTUAL installer binary does the
+# agnos block path (not just the gptwr proof tool). --until partition keeps it fast (no 512 MiB
+# FAT zeroing over the block layer). Exits 0 iff the partition phase succeeds; the smoke then
+# dumps the tail region + sgdisk-validates the GPT agnova wrote.
+kprintln("exec: running /bin/agnova", 25);
+sh_exec("run /bin/agnova execute --device /dev/nvme0n1 --disk-backend=native-block --scratch-base 524288 --disk-sectors 1572864 --until partition --user t --i-mean-it", 157);
+kprintln("exec: agnova returned", 21);
+#endif
+
+#ifdef NAAD_RING3_SELFTEST
+# 1.53.x B6 (arc-closer): naad oscillator END-PROOF. Runs /bin/naadex (naad/, built --agnos) —
+# a REAL heavy-f64 DSP workload: naad's 440 Hz sine oscillator generates 256 samples via
+# f64_sin/f64_mul/... (the mulsd/sqrtsd/comisd codegen B1-B5 enabled), asserts every sample is
+# finite, exits 88 iff all 256 are. Where fpex (B4) proved 5 hand-picked ops, this proves a
+# shipping library's XMM-heavy code runs correctly in ring 3: enter_ring3 CR0.TS → first f64 op
+# #NMs → nm_handler FXRSTORs naadex's per-proc area → the DSP runs to completion → "run: exit 88".
+kprintln("exec: running /bin/naadex", 25);
+sh_exec("run /bin/naadex", 15);
+kprintln("exec: naadex returned", 21);
+#endif
+
+#ifdef VANITONE_AUDIO_SELFTEST
+# vani-core backend proof (Gate 3/4 of the 1.52.x audio arc). Runs /bin/vanitone,
+# a doom-style consumer of vani's dist/vani-core.cyr — the FIRST audio through the
+# cyrius `vani` audio lib's agnos backend (audio_open_playback/set_params/write/
+# drain/close → sys_snd_* #64-69), as opposed to doom/tonegen's hand-rolled direct
+# syscalls. vanitone blocking-streams a 1.5s 440 Hz square through the shim, then
+# drains + closes. scripts/vani-tone-smoke.sh captures the HDA output + asserts a
+# non-silent wav (continuous tone → strong RMS). Exits when the tone finishes.
+kprintln("exec: running /bin/vanitone", 27);
+sh_exec("run /bin/vanitone", 17);
+kprintln("exec: vanitone returned", 23);
+#endif
+
+#ifdef MISHRAN_AUDIO_SELFTEST
+# mishran mixer proof (the "route through the mixer" audio gate). Runs
+# /bin/mishtone, which opens the vani sink via an MshRouter, registers TWO app
+# streams at different Q8 gains, feeds each an integer square wave, and mixes them
+# down with msh_router_pump → vani (audio_* → sys_snd_* #64-69). Unlike vanitone
+# (vani direct), this proves the whole mixer fan-in + gain + sink write on agnos.
+# scripts/mishran-audio-smoke.sh captures the HDA output + asserts a non-silent
+# wav (sustained mixed tone → strong RMS). Exits when the tone finishes.
+kprintln("exec: running /bin/mishtone", 27);
+sh_exec("run /bin/mishtone", 17);
+kprintln("exec: mishtone returned", 23);
+#endif
+
+#ifdef MISHRAN_JALWA_SELFTEST
+# jalwa->mishran end-to-end audio proof (the "route through the mixer" gate). Runs
+# /bin/jalwa (the play-probe) as the PRIMARY via sh_exec — a 2.5 MB binary, and
+# sh_exec handles big ELFs (aethersafha is 15 MB), unlike spawn_path (proven only
+# for small children like puka/crab). jalwa spawn_path's the SMALL /bin/mishrand
+# daemon itself, waits for it to listen, then decodes a seeded /tone.wav and streams
+# its PCM to mishran (msh_client_*), which mixes it down to vani (audio_* ->
+# sys_snd_* #64-69). Two ring-3 procs concurrent over loopback — the desktop
+# primary+client model applied to audio. scripts/mishran-jalwa-audio-smoke.sh
+# captures the HDA output + asserts a non-silent wav.
+kprintln("exec: running /bin/jalwa", 24);
+sh_exec("run /bin/jalwa", 14);
+kprintln("exec: jalwa returned", 20);
 #endif
 
 # 1.41.3 — FS-syscall self-test (compile-gated, FS_SYSCALL_SELFTEST=1). Drives
@@ -1420,7 +2570,7 @@ fn fs_syscall_selftest() {
     else { if ((load64(u + 256) & 0xF000) != 0x8000) { kprintln("fssys: stat mode FAIL", 21); ok = 0; } }
 
     # rename("/fss/a" -> "/fss/b"): backend logic with a4=newlen via ksyscall_a4.
-    ksyscall_a4 = 6;
+    ksyscall_a4_set(6);
     if (ksyscall(31, u + 64, 6, u + 128) != 0) { kprintln("fssys: rename FAIL", 18); ok = 0; }
     if (ext2_path_lookup(u + 128, 6) <= 0)     { kprintln("fssys: rename dst FAIL", 22); ok = 0; }
     if (ext2_path_lookup(u + 64, 6) > 0)       { kprintln("fssys: rename src-left FAIL", 27); ok = 0; }
@@ -1465,6 +2615,166 @@ fn fs_syscall_selftest() {
 fs_syscall_selftest();
 #endif
 
+# 1.46.x — fd-redirect (exec_redirect#62) capture self-test (compile-gated, EXEC_REDIRECT_SELFTEST=1).
+# Validates the capture mechanism end-to-end WITHOUT a child ELF: create a pipe, arm a redirect of
+# fd 20 -> the pipe write end, apply it, write "HI" to fd 20 (must route to the pipe, NOT the
+# console), restore, then read the pipe's read end and assert "HI". The execwait#37 hook uses the
+# SAME exec_redirect_apply/restore around the child run, so this proves a redirected fd's writes
+# land in the dst backend. fd 20 avoids the pipe's own freshly-allocated fds.
+#ifdef EXEC_REDIRECT_SELFTEST
+fn exec_redirect_selftest() {
+    var fds[16];
+    if (vfs_create_pipe(&fds) != 0) { kprintln("redir: FAIL pipe", 16); return 0; }
+    var rfd = load64(&fds);
+    var wfd = load64(&fds + 8);
+    var msg[8]; store8(&msg, 72); store8(&msg + 1, 73);    # "HI"
+    redir_src_fd_set(20); redir_dst_fd_set(wfd); redir_pending_set(1);   # 1.46.x STEP-2 (#3): per-CPU redir (slot 0 at boot)
+    exec_redirect_apply();
+    vfs_write(20, &msg, 2);                                  # routes to the pipe write end via slot 20
+    exec_redirect_restore();
+    var got[8]; store64(&got, 0);
+    var n = vfs_read(rfd, &got, 8);
+    var stdout_ok = 0;
+    if (n == 2) { if (load8(&got) == 72) { if (load8(&got + 1) == 73) { stdout_ok = 1; } } }
+    if (stdout_ok == 0) { kprintln("redir: FAIL capture", 19); return 0; }
+    kprintln("redir: capture OK", 17);
+
+    # stdin-from-pipe (the read#5 VFS_DEVICE tag guard — the `cmd2` side of a pipe):
+    # write "PI" into a fresh pipe, redirect fd 0 -> the pipe READ end, then drive the
+    # ACTUAL read syscall ksyscall(5, fd=0, ...). With the tag guard, fd 0's tag is now
+    # VFS_PIPE (not VFS_DEVICE), so read(0) must reach pipe_read and return "PI" instead
+    # of blocking on the keyboard. fd 0 is restored to the console on exec_redirect_restore.
+    var fds2[16];
+    if (vfs_create_pipe(&fds2) != 0) { kprintln("redir: FAIL pipe2", 17); return 0; }
+    var rfd2 = load64(&fds2);
+    var wfd2 = load64(&fds2 + 8);
+    var msg2[8]; store8(&msg2, 80); store8(&msg2 + 1, 73);   # "PI"
+    vfs_write(wfd2, &msg2, 2);                               # fill the pipe buffer first
+    redir_src_fd_set(0); redir_dst_fd_set(rfd2); redir_pending_set(1);   # fd 0 <- pipe read end
+    exec_redirect_apply();
+    var sin[8]; store64(&sin, 0);
+    var sn = ksyscall(5, 0, &sin, 8);                        # read(0) — must hit pipe_read, not kbd
+    exec_redirect_restore();
+    if (sn == 2) { if (load8(&sin) == 80) { if (load8(&sin + 1) == 73) {
+                kprintln("redir: stdin-pipe OK", 20); return 0;
+            } } }
+    kprintln("redir: FAIL stdin-pipe", 22);
+    return 0;
+}
+exec_redirect_selftest();
+#endif
+
+# 1.44.x — NON-BLOCKING cooked-line read self-test (compile-gated, NBREAD_SELFTEST=1).
+# Validates kbd_read_nonblock's poll semantics WITHOUT a real keyboard by injecting
+# scancodes straight into kb_buf (the same ring kb_isr/hid_poll fill): (1) no input ->
+# -2/WOULD_BLOCK (NOT 0 = EOF); (2) partial 'h''i' with no Enter -> still -2 + the
+# accumulator holds 2; (3) Enter -> returns the 3-byte line "hi\n" + the accumulator
+# resets. Proves the WOULD_BLOCK sentinel, cross-call accumulation, and the Enter flush —
+# the kernel half schedulable agnsh polls. Needs no ext2 (pure in-kernel injection).
+#ifdef NBREAD_SELFTEST
+fn nbread_inject(sc) {
+    store8(&kb_buf + kb_head, sc);          # push one scancode (mirror kb_isr's append)
+    kb_head = (kb_head + 1) & 0xFF;
+    return 0;
+}
+fn nbread_selftest() {
+    var u = pmm_alloc_2mb();
+    if (u == 0)       { kprintln("nbread: no scratch FAIL", 23); return 0 - 1; }
+    if (u < 0x200000) { kprintln("nbread: scratch low FAIL", 24); return 0 - 1; }
+    nbline_pos = 0;
+    kb_head = 0; kb_tail = 0;                # deterministic empty ring
+    var ok = 1;
+    # (1) nothing buffered -> WOULD_BLOCK (-2), distinct from Ctrl-D EOF (0).
+    var r1 = kbd_read_nonblock(u, 256);
+    if (r1 == 0 - 2) { kprintln("nbread: no-input WOULD_BLOCK OK", 31); }
+    else { kprintln("nbread: FAIL no-input", 21); ok = 0; }
+    # (2) inject 'h'(sc 0x23) 'i'(sc 0x17), NO Enter -> still -2, accumulator holds 2.
+    nbread_inject(0x23);
+    nbread_inject(0x17);
+    var r2 = kbd_read_nonblock(u, 256);
+    if (r2 == 0 - 3) {                                   # 1.44.14: -3 = partial line buffered (was -2)
+        if (nbline_pos == 2) { kprintln("nbread: partial accumulate OK", 29); }
+        else { kprintln("nbread: FAIL partial pos", 24); ok = 0; }
+    } else { kprintln("nbread: FAIL partial ret", 24); ok = 0; }
+    # (3) inject Enter(sc 0x1C) -> returns 3, buf = "hi\n" (104,105,10), accumulator resets.
+    nbread_inject(0x1C);
+    var r3 = kbd_read_nonblock(u, 256);
+    if (r3 == 3) {
+        if (load8(u) == 104) {
+            if (load8(u + 1) == 105) {
+                if (load8(u + 2) == 10) {
+                    if (nbline_pos == 0) { kprintln("nbread: enter line OK", 21); }
+                    else { kprintln("nbread: FAIL pos reset", 22); ok = 0; }
+                } else { kprintln("nbread: FAIL no LF", 18); ok = 0; }
+            } else { kprintln("nbread: FAIL byte1", 18); ok = 0; }
+        } else { kprintln("nbread: FAIL byte0", 18); ok = 0; }
+    } else { kprintln("nbread: FAIL enter ret", 22); ok = 0; }
+    pmm_free_2mb(u);
+    if (ok == 1) { kprintln("nbread: ALL PASS", 16); } else { kprintln("nbread: FAIL", 12); }
+    return 0;
+}
+nbread_selftest();
+#endif
+
+# 1.44.20 — scaled-blit self-test (compile-gated, FBSCALE_SELFTEST=1). Drives blit#39 with
+# the a4[39:32] scale channel from kernel context: (1) a 2x2 pattern at scale 2 at (0,0) must
+# expand to the exact 4x4 block; (2) the same blit at dx=fw-2 clips to cw=2 with BOTH visible
+# columns mapping to src col 0; (3) scale>16 and w*scale>8192 must reject -1 (the rowbuf
+# memory-safety gate). DISCIPLINE (per the adversarial review): ksyscall is 3-arg, so
+# ksyscall_a4 MUST be staged explicitly before each call (stale-a4 hazard — the
+# fs_syscall_selftest rename precedent); ALL fb_phys read-backs land in locals BEFORE any
+# kprint (console output can scroll/rewrite the whole FB); skip cleanly with no FB.
+#ifdef FBSCALE_SELFTEST
+fn fbscale_selftest() {
+    if (fb_fb_phys() == 0) { kprintln("fbscale: no FB SKIP", 19); return 0; }
+    var u = pmm_alloc_2mb();
+    if (u == 0)       { kprintln("fbscale: no scratch FAIL", 24); return 0 - 1; }
+    if (u < 0x200000) { kprintln("fbscale: scratch low FAIL", 25); return 0 - 1; }
+    # src 2x2: A B / C D (distinct 32bpp values)
+    store32(u + 0,  0x11111111); store32(u + 4,  0x22222222);
+    store32(u + 8,  0x33333333); store32(u + 12, 0x44444444);
+    var fb = fb_fb_phys();
+    var fw = fb_width();
+    var pitch = fb_pitch();
+    var ok = 1;
+    # (1) scale 2 at (0,0) -> 4x4 expansion
+    ksyscall_a4_set(2 << 32);                               # scale=2, dx=dy=0
+    var r1 = ksyscall(39, u, 2, 2);
+    # read back FIRST (locals), print after
+    var p00 = load32(fb + 0);            var p01 = load32(fb + 4);
+    var p02 = load32(fb + 8);            var p10 = load32(fb + pitch);
+    var p20 = load32(fb + 2 * pitch);    var p22 = load32(fb + 2 * pitch + 8);
+    var p33 = load32(fb + 3 * pitch + 12);
+    if (r1 != 0)               { kprintln("fbscale: FAIL rc1", 17); ok = 0; }
+    if (p00 != 0x11111111)     { kprintln("fbscale: FAIL 00", 16); ok = 0; }
+    if (p01 != 0x11111111)     { kprintln("fbscale: FAIL 01", 16); ok = 0; }
+    if (p02 != 0x22222222)     { kprintln("fbscale: FAIL 02", 16); ok = 0; }
+    if (p10 != 0x11111111)     { kprintln("fbscale: FAIL 10", 16); ok = 0; }
+    if (p20 != 0x33333333)     { kprintln("fbscale: FAIL 20", 16); ok = 0; }
+    if (p22 != 0x44444444)     { kprintln("fbscale: FAIL 22", 16); ok = 0; }
+    if (p33 != 0x44444444)     { kprintln("fbscale: FAIL 33", 16); ok = 0; }
+    # (2) right-edge clip: dx=fw-2, scale 2 -> cw_eff=2, BOTH cols = src col 0 (c/2==0)
+    ksyscall_a4_set((2 << 32) | (fw - 2));
+    var r2 = ksyscall(39, u, 2, 2);
+    var q0 = load32(fb + (fw - 2) * 4);
+    var q1 = load32(fb + (fw - 1) * 4);
+    var q2 = load32(fb + 2 * pitch + (fw - 2) * 4);
+    if (r2 != 0)               { kprintln("fbscale: FAIL rc2", 17); ok = 0; }
+    if (q0 != 0x11111111)      { kprintln("fbscale: FAIL e0", 16); ok = 0; }
+    if (q1 != 0x11111111)      { kprintln("fbscale: FAIL e1", 16); ok = 0; }
+    if (q2 != 0x33333333)      { kprintln("fbscale: FAIL e2", 16); ok = 0; }
+    # (3) loud rejects: scale>16; expanded width over the rowbuf (w*scale>8192)
+    ksyscall_a4_set(17 << 32);
+    if (ksyscall(39, u, 2, 2) != 0 - 1)      { kprintln("fbscale: FAIL s17", 17); ok = 0; }
+    ksyscall_a4_set(2 << 32);
+    if (ksyscall(39, u, 8192, 1) != 0 - 1)   { kprintln("fbscale: FAIL wcap", 18); ok = 0; }
+    pmm_free_2mb(u);
+    if (ok == 1) { kprintln("fbscale: ALL PASS", 17); } else { kprintln("fbscale: FAIL", 13); }
+    return 0;
+}
+fbscale_selftest();
+#endif
+
 # 1.41.6 — syscall-ingress HARDENING self-test (compile-gated,
 # SYSCALL_HARDEN_SELFTEST=1). Regression-locks the 1.41.5 security fixes AND
 # serves as the safety net for the 1.41.6 dispatcher refactors, because the
@@ -1495,11 +2805,11 @@ fn syscall_harden_selftest() {
     var efd = ksyscall(19, 0, 0, 0);           # epoll_create -> VFS_EPOLL
     if (efd < 0) { kprintln("shsys: epoll_create FAIL", 24); ok = 0; }
     # epoll_ctl on a NON-epoll fd must be refused
-    if (ffd >= 0) { if (ksyscall(20, ffd, 1, efd) == 0) { kprintln("shsys: epoll_ctl typeconf rej FAIL", 33); ok = 0; } }
+    if (ffd >= 0) { if (ksyscall(20, ffd, 1, efd) == 0) { kprintln("shsys: epoll_ctl typeconf rej FAIL", 34); ok = 0; } }
     # epoll_ctl on the real epoll fd with an in-range watch fd must succeed
     if (efd >= 0) { if (ksyscall(20, efd, 1, efd) != 0) { kprintln("shsys: epoll_ctl valid FAIL", 27); ok = 0; } }
     # epoll_ctl with an out-of-range watch fd must be refused (vs vfs_table OOB)
-    if (efd >= 0) { if (ksyscall(20, efd, 1, 9999) == 0) { kprintln("shsys: epoll wfd-bound rej FAIL", 30); ok = 0; } }
+    if (efd >= 0) { if (ksyscall(20, efd, 1, 9999) == 0) { kprintln("shsys: epoll wfd-bound rej FAIL", 31); ok = 0; } }
     # epoll_wait on a non-epoll fd must be refused
     if (ffd >= 0) { if (ksyscall(21, ffd, u + 256, 4) != (0 - 1)) { kprintln("shsys: epoll_wait typeconf rej FAIL", 35); ok = 0; } }
 
@@ -1570,10 +2880,10 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0D; 0xE6; 0x71; }
 
 #ifdef KTEST
 # Syscall test (direct call — still works)
-kernel_return_rsp = 0;
-kernel_return_rip = 0;
+kernel_return_rsp_set(0);
+kernel_return_rip_set(0);
 proc_count = 0;
-proc_current = 0;
+proc_current_set(0);
 var p0 = proc_create(0x100000);
 proc_set_state(0, 2);  # kernel "process" is running
 
@@ -1607,7 +2917,7 @@ kprintln("", 0);
 kprintln("Creating test processes...", 26);
 
 proc_count = 0;
-proc_current = 0;
+proc_current_set(0);
 
 # Process 0: kernel idle (the code running right now)
 var kern_pid = proc_create(0);
@@ -1655,12 +2965,43 @@ kprint("Timer ticks before sched: ", 26);
 kprint_num(timer_ticks);
 kprintln("", 0);
 
+# 1.44.18 — wake + park the APs (see smp.cyr). HERE because: pt_init has run (the
+# trampoline's CR3 0x1000 = the kernel PML4, identity 0-4 GB incl. the APIC), IF=1
+# windows exist (smp_wait_ticks' real SDM delays), and sched_active is still 0 (the
+# wait's ticks no-op in do_context_switch). APs report in and PARK (IF=0 hlt) — the
+# single-core invariant is untouched; "smp: cpus online: N" is the proof line.
+#
+# GATED OFF (iron multi-verb keyboard-death bisect). The "keyboard dies after the
+# first command" regression is IRON-ONLY — it does NOT reproduce in QEMU even over
+# the exact IRQ1/kb_isr keystroke path with -smp 4 + a 30 s dwell (see
+# scripts/agnsh-irq1-repro.py) — and bisects to THIS wake: multi-verb typing worked
+# on archaemenid at 14115 (1.41.15) and 1439 (DOOM, 1.43.8), both PRE-1.44.18, the
+# only sessions where AGNOS never woke the other Zen cores. Hypothesis: a woken-but-
+# parked AP (LAPIC enabled in ap_entry, but its LVT LINT0/timer left at the INIT
+# reset state, never explicitly masked) competes for / swallows the BSP's 8259 IRQ1
+# (keyboard) on real Zen. SMP buys NOTHING for cooperative-agnsh boot-to-shell (the
+# MVP gate), so gating the wake OFF is BOTH the discriminator AND — if confirmed —
+# the MVP fix. Flip smp_wake_enabled back to 1 to restore the wake (the documented
+# 1.44.18 one-line fallback; everything downstream is inert without it).
+# 1.46.x SMP sub-bite 7 STEP-1 BURN (2026-06-24): flipped to 1 to WAKE APs 1-3.
+# smp_sched_aps stays 0 (smp.cyr) → woken APs idle-ONLY (sched_next hands them no
+# real proc). This is the STEP-1 iron burn: prove the wake + AP-idle-only boots clean
+# on real Zen and the keyboard survives (the AP LVT LINT0/LINT1 mask is the fix). Revert
+# to 0 if the wake hangs/triple-faults; STEP-2 (smp_sched_aps=1) is a SEPARATE later burn.
+var smp_wake_enabled = 1;
+# 1.46.x sub-bite 7 (H6 fix 2026-06-24): the AP wake MOVED to just before
+# `sched_active = 1` (after the proc-table bootstrap) — see there. Waking HERE
+# (before the `proc_count = 0` reset + proc_on_cpu_init) let the BSP's reset WIPE
+# the APs' freshly-registered idle slots + reset their on_cpu, so an AP later
+# iretq'd into a half-built idle with a corrupted CS=0x18 -> #GP (deterministic
+# under QEMU -smp 4). Bootstrap-then-wake removes the race.
+
 kprintln("Activating scheduler...", 23);
 
 # 1.40.10 — register the kernel main thread + an idle thread as real procs
 # before activating preemption (production path; KTEST builds set up their own
 # proc_a/proc_b above). The exec-from-disk selftest leaves dead exec procs in
-# slots 0..N with proc_current on the last one; without a valid runnable proc
+# slots 0..N with proc_current_get() on the last one; without a valid runnable proc
 # the first timer tick after sched_active=1 (the DHCP DISCOVER hlt-wait on iron)
 # fell back to a dead exec proc, cr3_load'd its stale per-process CR3 and
 # iretq'd into a ring-3 RIP in ring 0 → triple-fault reset. Build proc 0 = this
@@ -1668,13 +3009,955 @@ kprintln("Activating scheduler...", 23);
 # the boot CR3 (0x1000, where kernel_resume left us post-exec) so the equal-CR3
 # guard in do_context_switch skips cr3_load entirely — preemption is pure
 # register save/restore in one shared address space. See sched.cyr kernel_idle_loop.
+#ifdef THREAD_SELFTEST
+# === 1.44.x THREAD_SELFTEST — preemptive kernel-thread time-slicing (opening bite) ===
+# Two kernel threads tight-loop bumping their own counters; they NEVER yield, so if
+# BOTH counters advance, the TIMER preempted + round-robined them — preemptive
+# time-slicing on the shared kernel AS via kthread_create. Then verify the preempt
+# gate: under preempt_disable() the counters must FREEZE (do_context_switch no-ops).
+# Compile-gated: `THREAD_SELFTEST=1 ./scripts/build.sh`.
+var thr_counter_a = 0;
+var thr_counter_b = 0;
+var thr_pid_a = 0;
+var thr_pid_b = 0;
+fn thread_test_a() { while (1 == 1) { thr_counter_a = thr_counter_a + 1; } return 0; }
+fn thread_test_b() { while (1 == 1) { thr_counter_b = thr_counter_b + 1; } return 0; }
+fn thread_selftest_verify() {
+    var i = 0;
+    while (i < 40) { arch_wait(); i = i + 1; }   # yield: timer round-robins kmain->A->B->kmain
+    kprint("thr: A=", 7); kprint_num(thr_counter_a);
+    kprint(" B=", 3); kprint_num(thr_counter_b); kprintln("", 0);
+    if (thr_counter_a > 0) { if (thr_counter_b > 0) { kprintln("thr: preempt OK", 15); } }
+    if (thr_counter_a == 0) { kprintln("thr: A starved", 14); }
+    if (thr_counter_b == 0) { kprintln("thr: B starved", 14); }
+    # Preempt gate: counters must NOT advance while preemption is disabled.
+    var snap_a = thr_counter_a;
+    preempt_disable();
+    var g = 0;
+    while (g < 20) { arch_wait(); g = g + 1; }    # timer wakes the hlt but must NOT switch
+    preempt_enable();
+    if (thr_counter_a == snap_a) { kprintln("thr: gate held", 14); }
+    else { kprintln("thr: gate LEAK", 14); }
+    proc_set_state(thr_pid_a, 0);                 # retire the test threads (skip-on-dead)
+    proc_set_state(thr_pid_b, 0);
+    kprintln("thr: done", 9);
+    return 0;
+}
+#endif
+
+#ifdef SCHED_STRESS_SELFTEST
+# === SCHED_STRESS_SELFTEST — concurrent-proc scheduler stress (the race-finder) ===
+# Where THREAD_SELFTEST proves 2 threads round-robin, this drives a STORM of
+# kernel-thread procs (shared CR3 0x1000, IF=1, static-pool stacks) up near the
+# 16-slot proc-table cap, makes each do bounded work + yield + exit in staggered
+# order across several ROUNDS (churning proc_alloc_slot's hole-reuse), then asserts
+# four invariants a real scheduler race would corrupt:
+#   count  — sum of per-proc counters == exact expected (no torn / lost increment,
+#            no save/restore corruption across do_context_switch)
+#   leak   — proc_count stays bounded across rounds (hole-reuse works — the
+#            proc-table analogue of the TCP-table slot leak net-sweep just found)
+#   starve — every spawned worker ran (counter>0) AND exited (none left ready —
+#            sched_next visited the full table, not just an A<->B pair)
+#   canary — a known guard word survives the storm (no wild write / stack overrun)
+#   cap    — proc_create_full caps cleanly at -1 when the table is full (no overrun)
+# A worker learns its OWN slot from proc_current_get() (the scheduler sets it before
+# switching in), so pid == proc_table slot == its DISTINCT counter index — workers
+# never alias a counter (which would be an inherent single-core RMW race, not a
+# scheduler bug). Compile-gated: `SCHED_STRESS_SELFTEST=1 ./scripts/build.sh`.
+var SSS_N = 12;            # storm size (proc 0 kmain + proc 1 idle hold 2 of 16 slots)
+var SSS_ITER = 20;        # counter bumps per worker per round
+var SSS_ROUNDS = 3;       # re-spawn rounds (churn slot reclaim across holes)
+var sss_stacks[6144];     # module-scope = SSS_N*512 u64 = 12 x 4 KB static stack pool
+# ONE consolidated state block. Separate small adjacent module-globals were
+# observed to OVERLAP under this toolchain (a `sss_canary` scalar aliased
+# `sss_counter[2]`, `sss_probe[]` aliased the high counters), corrupting the
+# invariant checks — a TEST bug, not a scheduler finding. Consolidating into a
+# single array removes all inter-global layout assumptions:
+#   [0..15]  per-pid work counters (worker bumps sss_mem[its pid])
+#   [40]     guard canary, well clear of the counters
+var sss_mem[64];
+
+fn sss_worker() {
+    var me = proc_current_get();             # my pid == my distinct counter slot (race-free)
+    var n = 0;
+    while (n < SSS_ITER) {
+        store64(&sss_mem + me * 8, load64(&sss_mem + me * 8) + 1);
+        arch_wait();                   # hlt -> yield slice -> force a switch mid-work
+        n = n + 1;
+    }
+    var lead = 0;                      # stagger exit by pid so holes form at varied slots
+    while (lead < me) { arch_wait(); lead = lead + 1; }
+    proc_set_state(me, 0);             # EXIT: mark self dead (slot reclaimable)
+    while (1 == 1) { arch_wait(); }    # fresh stack has no return addr -> never return
+}
+
+fn sched_stress_verify() {
+    var i = 0;
+    while (i < 64) { store64(&sss_mem + i * 8, 0); i = i + 1; }
+    store64(&sss_mem + 40 * 8, 0xA6105CA1);   # canary at [40], far from the [0..15] counters
+    var base_count = proc_count;
+    var live0 = proc_count_by_state(1);    # idle (state 1); kmain is state 2 (running)
+    var fail = 0;
+    var spawned = 0;
+
+    var r = 0;
+    while (r < SSS_ROUNDS) {
+        preempt_disable();                 # spawn race-free: no worker runs until enable
+        var k = 0;
+        while (k < SSS_N) {
+            var stop = &sss_stacks + (k + 1) * 512 * 8;
+            var pid = proc_create_full(&sss_worker, stop);
+            if (pid < 0) {
+                kprintln("sched-stress: FAIL spawn (test bug)", 35);
+                fail = 1;
+                k = SSS_N;
+            }
+            if (pid >= 0) {
+                spawned = spawned + 1;
+                k = k + 1;
+            }
+        }
+        preempt_enable();
+        var t = 0;
+        var budget = SSS_N * SSS_ITER * 4;
+        while (t < budget) {
+            if (proc_count_by_state(1) == live0) { t = budget; }      # all exited -> stop early
+            if (proc_count_by_state(1) != live0) { arch_wait(); t = t + 1; }
+        }
+        r = r + 1;
+    }
+
+    # invariant: leak — hole-reuse kept the table bounded (no append-per-round growth)
+    if (proc_count > (base_count + SSS_N)) {
+        kprintln("sched-stress: FAIL leak", 23);
+        fail = 1;
+    }
+    # invariant: count — exact sum (no torn / lost / corrupted increment)
+    var sum = 0;
+    var j = 0;
+    while (j < 16) { sum = sum + load64(&sss_mem + j * 8); j = j + 1; }
+    if (sum != (spawned * SSS_ITER)) {
+        kprintln("sched-stress: FAIL count", 24);
+        fail = 1;
+    }
+    # invariant: starve — every worker exited (none left ready/stuck)
+    if (proc_count_by_state(1) != live0) {
+        kprintln("sched-stress: FAIL starve", 25);
+        fail = 1;
+    }
+    # invariant: canary — guard word intact
+    if (load64(&sss_mem + 40 * 8) != 0xA6105CA1) {
+        kprintln("sched-stress: FAIL canary", 25);
+        fail = 1;
+    }
+    # (cap invariant — proc_create_full returns -1 at the full table — deferred: a
+    # safe over-spawn probe needs distinct throwaway stacks; the storm already
+    # exercises proc_alloc_slot's reuse hard. Revisit as a follow-up bite.)
+
+    # belt-and-suspenders: retire any storm survivor so boot continues to kybernet
+    var s = 2;
+    while (s < proc_count) {
+        if (proc_get_state(s) == 1) { proc_set_state(s, 0); }
+        s = s + 1;
+    }
+    kprint("sched-stress: rounds=", 21); kprint_num(SSS_ROUNDS);
+    kprint(" spawned=", 9); kprint_num(spawned);
+    kprint(" sum=", 5); kprint_num(sum);
+    kprint(" proc_count=", 12); kprint_num(proc_count);
+    kprintln("", 0);
+    if (fail == 0) { kprintln("sched-stress: ALL PASS", 22); }
+    return 0;
+}
+#endif
+
+#ifdef RING3_SELFTEST
+# === RING3_SELFTEST — preemptive ring-3 (1.44.4 one proc · 1.44.5 two procs · 1.44.6 syscalls) ===
+# Spawn TWO ring-3 procs, each with its OWN per-process CR3 + IF=1, each running the SAME
+# raw-machine-code loop: a getpid SYSCALL (1.44.6) then increment a u64 at user VA 0x2000000.
+# Because each proc has a distinct CR3, that one user VA maps to a DIFFERENT physical
+# counter per proc — so two advancing counters proves (a) the scheduler round-robins
+# ring-3 <-> ring-3 across two DIFFERENT per-proc CR3s (cr3_load A->B->A every slice),
+# (b) per-proc address-space isolation (same VA, separate memory), and (c) a PREEMPTIBLE
+# ring-3 proc can SYSCALL safely. The timer preempts each under its own CR3 and the
+# scheduler iretq's back into ring 3 (CS=0x23 — the 1.44.3 table-driven restore + the
+# 1.44.4 proc_set_ring3). preempt_disable() must FREEZE both.
+#
+# 1.44.6 dissolved the supposed "shared-kstack wall": syscall handlers run IF=0 (SFMASK
+# clears IF on SYSCALL entry) and the few sti-window syscalls are preempt-gated (1.44.1),
+# so NO syscall is ever preempted mid-handler — the shared syscall kstack (0x3F0000) is
+# serial, and no per-proc kernel stack is needed.
+#
+# The payload is RAW machine code in a byte array, NOT a Cyrius fn: a compiled fn's
+# prologue does a relocate-sensitive access (CR2=0 #PF at the entry) once spawn_user_proc
+# memcpy's it to the user code page at a different VA. Raw bytes have no prologue and the
+# only address they touch is the absolute imm64 0x2000000, so they survive the relocation.
+var ring3_counter_a = 0;
+var ring3_counter_b = 0;
+var ring3_pid_a = 0;
+var ring3_pid_b = 0;
+var ring3_payload[16];          # raw ring-3 code (proc A, getpid loop); first 22 bytes used
+var ring3_elf[24];              # a minimal in-memory ELF64 for proc B (159 bytes used)
+fn ring3_payload_fill() {
+    # 1.44.6: each loop iteration makes a getpid SYSCALL (#2), THEN increments the
+    # counter — proving a PREEMPTIBLE ring-3 proc can syscall safely. The handler runs
+    # IF=0 (SFMASK clears IF on SYSCALL entry) so it is never preempted mid-syscall, and
+    # the few sti-window syscalls are preempt-gated (1.44.1) — so the shared syscall
+    # kstack (0x3F0000) stays serial, no per-proc kstack needed. The body re-loads the
+    # counter addr each iteration because the syscall clobbers rax/rcx/r11 (rbx is
+    # reloaded too, so it does not depend on the handler preserving callee-saved regs):
+    #   mov eax,2 ; syscall ; movabs rbx,0x2000000 ; inc qword [rbx] ; jmp -22
+    store8(&ring3_payload + 0, 0xB8);  store8(&ring3_payload + 1, 0x02);   # mov eax, 2 (getpid)
+    store8(&ring3_payload + 2, 0x00);  store8(&ring3_payload + 3, 0x00);  store8(&ring3_payload + 4, 0x00);
+    store8(&ring3_payload + 5, 0x0F);  store8(&ring3_payload + 6, 0x05);   # syscall
+    store8(&ring3_payload + 7, 0x48);  store8(&ring3_payload + 8, 0xBB);   # movabs rbx, 0x2000000
+    store8(&ring3_payload + 9, 0x00);  store8(&ring3_payload + 10, 0x00); store8(&ring3_payload + 11, 0x00); store8(&ring3_payload + 12, 0x02);
+    store8(&ring3_payload + 13, 0x00); store8(&ring3_payload + 14, 0x00); store8(&ring3_payload + 15, 0x00); store8(&ring3_payload + 16, 0x00);
+    store8(&ring3_payload + 17, 0x48); store8(&ring3_payload + 18, 0xFF); store8(&ring3_payload + 19, 0x03);   # inc qword [rbx]
+    store8(&ring3_payload + 20, 0xEB); store8(&ring3_payload + 21, 0xEA);  # jmp -22 (back to mov eax,2)
+    return 0;
+}
+# 1.44.8: build a minimal in-memory ELF64 for proc B — a real ELF that elf_load (the
+# spawn #3 loader) parses, so this exercises the actual ELF-spawn path, not a raw memcpy.
+# One PT_LOAD segment covers the whole 159-byte image at vaddr 0x400000 (header+phdr+code);
+# e_entry = 0x400078 (the code, at file offset 120 = 64-byte ehdr + 56-byte phdr). The code
+# is the same finite payload: count the counter to N=0x1000000, exit (#0), spin.
+#   movabs rbx,0x2000000 ; movabs rcx,0x1000000 ; .L: inc [rbx]; dec rcx; jnz .L
+#   ; mov eax,0 ; xor edi,edi ; syscall(exit) ; jmp -2 (spin)
+fn ring3_elf_fill() {
+    memset(&ring3_elf, 0, 192);
+    # --- ELF64 header (64 bytes) ---
+    store8(&ring3_elf + 0, 0x7F); store8(&ring3_elf + 1, 0x45); store8(&ring3_elf + 2, 0x4C); store8(&ring3_elf + 3, 0x46);  # \x7FELF
+    store8(&ring3_elf + 4, 0x02);   # EI_CLASS = ELFCLASS64
+    store8(&ring3_elf + 5, 0x01);   # EI_DATA = little-endian
+    store8(&ring3_elf + 6, 0x01);   # EI_VERSION
+    store8(&ring3_elf + 16, 0x02);  # e_type = ET_EXEC
+    store8(&ring3_elf + 18, 0x3E);  # e_machine = x86-64
+    store8(&ring3_elf + 20, 0x01);  # e_version
+    store8(&ring3_elf + 24, 0x78); store8(&ring3_elf + 25, 0x00); store8(&ring3_elf + 26, 0x40);  # e_entry = 0x400078
+    store8(&ring3_elf + 32, 0x40);  # e_phoff = 64
+    store8(&ring3_elf + 52, 0x40);  # e_ehsize = 64
+    store8(&ring3_elf + 54, 0x38);  # e_phentsize = 56
+    store8(&ring3_elf + 56, 0x01);  # e_phnum = 1
+    # --- Program header PT_LOAD (56 bytes at offset 64) ---
+    store8(&ring3_elf + 64, 0x01);  # p_type = PT_LOAD
+    store8(&ring3_elf + 68, 0x07);  # p_flags = R|W|X
+    # p_offset = 0 (offset 72, already zero)
+    store8(&ring3_elf + 82, 0x40);  # p_vaddr  = 0x400000  (byte 80+2)
+    store8(&ring3_elf + 90, 0x40);  # p_paddr  = 0x400000  (byte 88+2)
+    store8(&ring3_elf + 96, 0x9F);  # p_filesz = 159 (0x9F)
+    store8(&ring3_elf + 104, 0x9F); # p_memsz  = 159
+    store8(&ring3_elf + 113, 0x10); # p_align  = 0x1000   (byte 112+1)
+    # --- code @ file offset 120 → vaddr 0x400078: count to N then exit ---
+    store8(&ring3_elf + 120, 0x48); store8(&ring3_elf + 121, 0xBB);  # movabs rbx, 0x2000000
+    store8(&ring3_elf + 122, 0x00); store8(&ring3_elf + 123, 0x00); store8(&ring3_elf + 124, 0x00); store8(&ring3_elf + 125, 0x02);
+    store8(&ring3_elf + 126, 0x00); store8(&ring3_elf + 127, 0x00); store8(&ring3_elf + 128, 0x00); store8(&ring3_elf + 129, 0x00);
+    store8(&ring3_elf + 130, 0x48); store8(&ring3_elf + 131, 0xB9);  # movabs rcx, 0x1000000
+    store8(&ring3_elf + 132, 0x00); store8(&ring3_elf + 133, 0x00); store8(&ring3_elf + 134, 0x00); store8(&ring3_elf + 135, 0x01);
+    store8(&ring3_elf + 136, 0x00); store8(&ring3_elf + 137, 0x00); store8(&ring3_elf + 138, 0x00); store8(&ring3_elf + 139, 0x00);
+    store8(&ring3_elf + 140, 0x48); store8(&ring3_elf + 141, 0xFF); store8(&ring3_elf + 142, 0x03);  # inc qword [rbx]
+    store8(&ring3_elf + 143, 0x48); store8(&ring3_elf + 144, 0xFF); store8(&ring3_elf + 145, 0xC9);  # dec rcx
+    store8(&ring3_elf + 146, 0x75); store8(&ring3_elf + 147, 0xF8);  # jnz -8 (back to inc)
+    store8(&ring3_elf + 148, 0xB8); store8(&ring3_elf + 149, 0x00); store8(&ring3_elf + 150, 0x00); store8(&ring3_elf + 151, 0x00); store8(&ring3_elf + 152, 0x00);  # mov eax, 0 (exit)
+    store8(&ring3_elf + 153, 0x31); store8(&ring3_elf + 154, 0xFF);  # xor edi, edi (exit code 0)
+    store8(&ring3_elf + 155, 0x0F); store8(&ring3_elf + 156, 0x05);  # syscall
+    store8(&ring3_elf + 157, 0xEB); store8(&ring3_elf + 158, 0xFE);  # jmp -2 (spin until descheduled)
+    return 0;
+}
+# 1.44.10: a ring-3 PARENT (proc P) that drives spawn(#3) + poll-waitpid(#4) entirely
+# from RING 3 — the proof that the spawn#3 kernel-CR3 fix (syscall.cyr) lets elf_load,
+# run under the PARENT's CR3, reach the child's page tables. Previously this triple-
+# faulted on the child (#UD at entry) because the parent CR3 has a 256 MB-1 GB mirror gap.
+#
+# The parent payload is RIP-relative (position-independent): it `lea`s the embedded child
+# ELF off RIP, so it needs no knowledge of the pid-dependent code_va. The child is a
+# MINIMAL exit-only ELF (no memory writes → no per-child mapping needed). The parent writes
+# the sentinel 0xABCD to its 0x2000000 ONLY after a SUCCESSFUL waitpid (rax>=0) — i.e. only
+# if the child actually ran to exit AND the parent observed it via waitpid from ring 3.
+#
+#   lea  rdi, [rip+0xF9]      ; &child_elf (payload+256)
+#   mov  esi, 0x83           ; child size = 131
+#   mov  eax, 3 ; syscall    ; spawn -> rax = child pid (or -1)
+#   test rax, rax ; js .fail  ; bail on spawn failure (no sentinel)
+#   mov  rbx, rax
+# .poll:
+#   mov  eax, 4 ; mov rdi, rbx ; syscall   ; waitpid -> rax = exit code or -2 (WOULD_BLOCK)
+#   cmp  rax, -2 ; je .poll                 ; spin in ring 3 until the child exits
+#   movabs rbx, 0x2000000 ; mov dword [rbx], 0xABCD   ; sentinel = "saw child exit"
+# .fail:
+#   mov  eax, 0 ; xor edi, edi ; syscall    ; exit(0)
+#   jmp  $
+# ONE array only — the child ELF is built INLINE at offset 256 of this same array (an earlier
+# two-array layout with a separate spawn_child_elf clobbered this buffer; building inline
+# sidesteps any inter-global layout assumption). CAUTION: a module-global `var X[N]` reserves
+# N×u64 = 8N BYTES — the codebase-wide rule (CLAUDE.md), empirically confirmed on cyrius 6.0.56
+# AND 6.1.34 (`&b - &a == 80` for `var a[10]`). An earlier revision of THIS comment asserted the
+# opposite ("~N bytes, NOT N×u64") — that was WRONG; do not size a buffer from it (the original
+# two-array clobber had a different cause). So [4096] reserves 32 KB — ample for the parent's
+# used region [0,387) and for spawn_user_proc's 4096-byte memcpy.
+var spawn_parent_payload[4096];   # parent code @0, child ELF @256 (one 4 KB code page)
+var spawn_parent_pid = 0;
+fn spawn_parent_fill() {
+    memset(&spawn_parent_payload, 0, 4096);
+    # memset zeroed the page, so store ONLY the non-zero bytes, ONE store8 per line.
+    # (A line packing many store8;-statements had trailing stores silently dropped by
+    # the parser — P0/P2 came back wrong while a re-stored P1 on its own line was right.)
+    # Success is signalled via the parent's EXIT CODE (kernel-side, read by the verify with
+    # proc_get_exit_code) — NOT a user-memory counter, because the FB and an arbitrary user
+    # page mapping are both unreliable under the parent CR3. The parent exit(0xABCD) ONLY
+    # after a successful waitpid (child ran + exited); exit(1) if spawn itself failed.
+    # lea rdi, [rip+0xF9]  (child ELF @256; disp = 256-7 = 249 = 0xF9)
+    store8(&spawn_parent_payload + 0, 0x48);
+    store8(&spawn_parent_payload + 1, 0x8D);
+    store8(&spawn_parent_payload + 2, 0x3D);
+    store8(&spawn_parent_payload + 3, 0xF9);
+    # mov esi, 131
+    store8(&spawn_parent_payload + 7, 0xBE);
+    store8(&spawn_parent_payload + 8, 0x83);
+    # mov eax, 3 (spawn)
+    store8(&spawn_parent_payload + 12, 0xB8);
+    store8(&spawn_parent_payload + 13, 0x03);
+    # syscall
+    store8(&spawn_parent_payload + 17, 0x0F);
+    store8(&spawn_parent_payload + 18, 0x05);
+    # mov rbx, rax (save child pid; rbx survives the waitpid syscalls)
+    store8(&spawn_parent_payload + 19, 0x48);
+    store8(&spawn_parent_payload + 20, 0x89);
+    store8(&spawn_parent_payload + 21, 0xC3);
+    # test ebx, ebx  (32-bit: spawn failed if negative)
+    store8(&spawn_parent_payload + 22, 0x85);
+    store8(&spawn_parent_payload + 23, 0xDB);
+    # js .fail (rel +0x1D -> off 55)
+    store8(&spawn_parent_payload + 24, 0x78);
+    store8(&spawn_parent_payload + 25, 0x1D);
+    # .poll @ off 26: mov eax, 4 (waitpid)
+    store8(&spawn_parent_payload + 26, 0xB8);
+    store8(&spawn_parent_payload + 27, 0x04);
+    # mov rdi, rbx
+    store8(&spawn_parent_payload + 31, 0x48);
+    store8(&spawn_parent_payload + 32, 0x89);
+    store8(&spawn_parent_payload + 33, 0xDF);
+    # syscall
+    store8(&spawn_parent_payload + 34, 0x0F);
+    store8(&spawn_parent_payload + 35, 0x05);
+    # cmp eax, -2  (32-bit WOULD_BLOCK check)
+    store8(&spawn_parent_payload + 36, 0x83);
+    store8(&spawn_parent_payload + 37, 0xF8);
+    store8(&spawn_parent_payload + 38, 0xFE);
+    # je .poll (rel -15 = 0xF1 -> off 26)
+    store8(&spawn_parent_payload + 39, 0x74);
+    store8(&spawn_parent_payload + 40, 0xF1);
+    # child exited: mov eax, 0 (exit)
+    store8(&spawn_parent_payload + 41, 0xB8);
+    # mov edi, 0xABCD (success exit code)
+    store8(&spawn_parent_payload + 46, 0xBF);
+    store8(&spawn_parent_payload + 47, 0xCD);
+    store8(&spawn_parent_payload + 48, 0xAB);
+    # syscall (exit 0xABCD)
+    store8(&spawn_parent_payload + 51, 0x0F);
+    store8(&spawn_parent_payload + 52, 0x05);
+    # jmp -2 (spin until descheduled — exit() RETURNS to ring 3; the scheduler retires the
+    # state-0 proc on the next tick, so the proc must spin here, not fall into zero bytes)
+    store8(&spawn_parent_payload + 53, 0xEB);
+    store8(&spawn_parent_payload + 54, 0xFE);
+    # .fail @ off 55: mov eax, 0 (exit)
+    store8(&spawn_parent_payload + 55, 0xB8);
+    # mov edi, 1 (failure exit code)
+    store8(&spawn_parent_payload + 60, 0xBF);
+    store8(&spawn_parent_payload + 61, 0x01);
+    # syscall (exit 1)
+    store8(&spawn_parent_payload + 65, 0x0F);
+    store8(&spawn_parent_payload + 66, 0x05);
+    # jmp -2 (spin)
+    store8(&spawn_parent_payload + 67, 0xEB);
+    store8(&spawn_parent_payload + 68, 0xFE);
+    # --- child ELF built INLINE at payload offset 256 (the lea target): a minimal
+    # exit-only ELF64 (no memory writes → needs no per-child page mapping). 131 bytes.
+    # memset already zeroed this region; store only the non-zero bytes, one per line.
+    # ehdr:
+    store8(&spawn_parent_payload + 256, 0x7F);
+    store8(&spawn_parent_payload + 257, 0x45);
+    store8(&spawn_parent_payload + 258, 0x4C);
+    store8(&spawn_parent_payload + 259, 0x46);
+    store8(&spawn_parent_payload + 260, 0x02);
+    store8(&spawn_parent_payload + 261, 0x01);
+    store8(&spawn_parent_payload + 262, 0x01);
+    store8(&spawn_parent_payload + 272, 0x02);
+    store8(&spawn_parent_payload + 274, 0x3E);
+    store8(&spawn_parent_payload + 276, 0x01);
+    store8(&spawn_parent_payload + 280, 0x78);
+    store8(&spawn_parent_payload + 282, 0x40);
+    store8(&spawn_parent_payload + 288, 0x40);
+    store8(&spawn_parent_payload + 308, 0x40);
+    store8(&spawn_parent_payload + 310, 0x38);
+    store8(&spawn_parent_payload + 312, 0x01);
+    # phdr (offset 64 within the child → payload 320):
+    store8(&spawn_parent_payload + 320, 0x01);
+    store8(&spawn_parent_payload + 324, 0x07);
+    store8(&spawn_parent_payload + 338, 0x40);
+    store8(&spawn_parent_payload + 346, 0x40);
+    store8(&spawn_parent_payload + 352, 0x83);
+    store8(&spawn_parent_payload + 360, 0x83);
+    store8(&spawn_parent_payload + 369, 0x10);
+    # code (file offset 120 within the child → payload 376): exit(0), spin
+    store8(&spawn_parent_payload + 376, 0xB8);
+    store8(&spawn_parent_payload + 381, 0x31);
+    store8(&spawn_parent_payload + 382, 0xFF);
+    store8(&spawn_parent_payload + 383, 0x0F);
+    store8(&spawn_parent_payload + 384, 0x05);
+    store8(&spawn_parent_payload + 385, 0xEB);
+    store8(&spawn_parent_payload + 386, 0xFE);
+    return 0;
+}
+# 1.44.x schedulable-agnsh — validate spawn_path(#43) end-to-end. The from-disk analog of
+# the spawn_parent (#3) proof above: a ring-3 PARENT issues spawn_path(#43) on an ext2 path
+# ("/bin/prog2", seeded by exec_disk_selftest), poll-waitpid(#4)s the returned pid, and EXITs
+# with the child's exit code (prog2 = 42) — proving #43 made a READY ring-3 proc the scheduler
+# picked up AND the parent reaped it via the non-blocking #4 (the exact pair agnsh `&` will use).
+# This is what agnsh `&` does in kernel form; agnsh must NOT be the thing that first proves #43.
+# Identical structure to spawn_parent_fill EXCEPT: mov eax,43 (not 3); arg2=10 (path len); the
+# lea target is an inline cstring "/bin/prog2" (not a child ELF); exit propagates rax (child
+# code) so a green assert is the literal 42 round-tripped through #43+#4. Runs ONLY when
+# ext2_active (the exec-smoke disk profile) — no-op under the ring3-smoke VirtIO profile.
+var spawn_path_parent_payload[4096];   # parent code @0, "/bin/prog2" cstring @256
+var spawn_path_parent_pid = 0;
+fn spawn_path_parent_fill() {
+    memset(&spawn_path_parent_payload, 0, 4096);
+    # store ONLY non-zero bytes, ONE store8 per line (multi-store8-per-line parser-drop caveat).
+    # lea rdi, [rip+0xF9]  (cstring @256; disp = 256-7 = 249 = 0xF9 — same as spawn_parent's lea)
+    store8(&spawn_path_parent_payload + 0, 0x48);
+    store8(&spawn_path_parent_payload + 1, 0x8D);
+    store8(&spawn_path_parent_payload + 2, 0x3D);
+    store8(&spawn_path_parent_payload + 3, 0xF9);
+    # mov esi, 10  (path length of "/bin/prog2")
+    store8(&spawn_path_parent_payload + 7, 0xBE);
+    store8(&spawn_path_parent_payload + 8, 0x0A);
+    # mov eax, 43 (spawn_path)
+    store8(&spawn_path_parent_payload + 12, 0xB8);
+    store8(&spawn_path_parent_payload + 13, 0x2B);
+    # syscall
+    store8(&spawn_path_parent_payload + 17, 0x0F);
+    store8(&spawn_path_parent_payload + 18, 0x05);
+    # mov rbx, rax (save child pid; survives waitpid syscalls)
+    store8(&spawn_path_parent_payload + 19, 0x48);
+    store8(&spawn_path_parent_payload + 20, 0x89);
+    store8(&spawn_path_parent_payload + 21, 0xC3);
+    # test ebx, ebx  (spawn failed if negative)
+    store8(&spawn_path_parent_payload + 22, 0x85);
+    store8(&spawn_path_parent_payload + 23, 0xDB);
+    # js .fail (rel +0x1A -> off 52)
+    store8(&spawn_path_parent_payload + 24, 0x78);
+    store8(&spawn_path_parent_payload + 25, 0x1A);
+    # .poll @ off 26: mov eax, 4 (waitpid)
+    store8(&spawn_path_parent_payload + 26, 0xB8);
+    store8(&spawn_path_parent_payload + 27, 0x04);
+    # mov rdi, rbx
+    store8(&spawn_path_parent_payload + 31, 0x48);
+    store8(&spawn_path_parent_payload + 32, 0x89);
+    store8(&spawn_path_parent_payload + 33, 0xDF);
+    # syscall
+    store8(&spawn_path_parent_payload + 34, 0x0F);
+    store8(&spawn_path_parent_payload + 35, 0x05);
+    # cmp eax, -2  (WOULD_BLOCK while child alive)
+    store8(&spawn_path_parent_payload + 36, 0x83);
+    store8(&spawn_path_parent_payload + 37, 0xF8);
+    store8(&spawn_path_parent_payload + 38, 0xFE);
+    # je .poll (rel -15 = 0xF1 -> off 26)
+    store8(&spawn_path_parent_payload + 39, 0x74);
+    store8(&spawn_path_parent_payload + 40, 0xF1);
+    # child exited: mov edi, eax (propagate the child's exit code = prog2's 42)
+    store8(&spawn_path_parent_payload + 41, 0x89);
+    store8(&spawn_path_parent_payload + 42, 0xC7);
+    # mov eax, 0 (exit)
+    store8(&spawn_path_parent_payload + 43, 0xB8);
+    # syscall (exit child-code)
+    store8(&spawn_path_parent_payload + 48, 0x0F);
+    store8(&spawn_path_parent_payload + 49, 0x05);
+    # jmp -2 (spin until descheduled)
+    store8(&spawn_path_parent_payload + 50, 0xEB);
+    store8(&spawn_path_parent_payload + 51, 0xFE);
+    # .fail @ off 52: mov eax, 0 (exit)
+    store8(&spawn_path_parent_payload + 52, 0xB8);
+    # mov edi, 1 (failure exit code — distinguishes a #43 spawn-fail from a real child code)
+    store8(&spawn_path_parent_payload + 57, 0xBF);
+    store8(&spawn_path_parent_payload + 58, 0x01);
+    # syscall (exit 1)
+    store8(&spawn_path_parent_payload + 62, 0x0F);
+    store8(&spawn_path_parent_payload + 63, 0x05);
+    # jmp -2 (spin)
+    store8(&spawn_path_parent_payload + 64, 0xEB);
+    store8(&spawn_path_parent_payload + 65, 0xFE);
+    # cstring "/bin/prog2" @256 (the lea target; len 10, no NUL needed — #43 is length-based)
+    store8(&spawn_path_parent_payload + 256, 0x2F);   # '/'
+    store8(&spawn_path_parent_payload + 257, 0x62);   # 'b'
+    store8(&spawn_path_parent_payload + 258, 0x69);   # 'i'
+    store8(&spawn_path_parent_payload + 259, 0x6E);   # 'n'
+    store8(&spawn_path_parent_payload + 260, 0x2F);   # '/'
+    store8(&spawn_path_parent_payload + 261, 0x70);   # 'p'
+    store8(&spawn_path_parent_payload + 262, 0x72);   # 'r'
+    store8(&spawn_path_parent_payload + 263, 0x6F);   # 'o'
+    store8(&spawn_path_parent_payload + 264, 0x67);   # 'g'
+    store8(&spawn_path_parent_payload + 265, 0x32);   # '2'
+    return 0;
+}
+# Spawn one ring-3 proc and map its 0x2000000 onto `counter_phys`. -1 on fail.
+fn ring3_spawn_one(counter_phys) {
+    var pid = spawn_user_proc(&ring3_payload);       # per-proc CR3 + user code/stack, state=ready
+    if (pid < 0) { return 0 - 1; }
+    proc_map_page(proc_get_cr3(pid), 0x2000000, counter_phys);   # this proc's OWN CR3 -> its own counter
+    proc_set_ring3(pid);                             # CS=0x23 / SS=0x1B (else it would iretq into ring 0)
+    return pid;
+}
+# 1.44.x page-table-fix validation: a NO-WRITE getpid-loop payload for STRESS procs that
+# push the pid count to >=8, so the in-memory loaders' user code/stack land in PD[8..63]
+# (>=16 MB) — the exact region whose identity-SUPERVISOR map the OLD striped VAs overwrote.
+# Pure compute + syscall (no memory write → no per-proc counter needed): each loops
+# `getpid` forever, staying ready so the scheduler keeps context-switching to it. PRE-fix,
+# the context-switch proc_get_user_cr3(corrupted CR3) SMAP-faults (triple fault → no output);
+# POST-fix all stress procs stay live. mov eax,2; syscall; jmp -9 (back to mov).
+var ring3_idle_payload[16];
+var ring3_stress_first = 0;
+var ring3_stress_count = 0;
+# 1.44.16 sched_yield(#44) proof: a YIELDER payload — yield, check rax==0, bump the
+# counter, loop. The rax check bakes the return-value contract into the assertion: a
+# nonzero return jumps to the spin and FREEZES the counter (test fails). Its counter
+# advances ~1 per rotation (it donates every slice), so the non-yielder A's counter must
+# dwarf it — the RATIO is the slice-donation proof, and it's TCG-speed-independent.
+#   .top: mov eax,44; syscall; test rax,rax; jnz .spin; movabs rbx,0x2000000;
+#         inc qword [rbx]; jmp .top;  .spin: jmp $
+var ring3_yield_payload[64];
+var ring3_counter_y = 0;
+var ring3_pid_y = 0;
+fn ring3_yield_fill() {
+    store8(&ring3_yield_payload + 0, 0xB8);    # mov eax, 44 (sched_yield)
+    store8(&ring3_yield_payload + 1, 0x2C);
+    store8(&ring3_yield_payload + 2, 0x00);
+    store8(&ring3_yield_payload + 3, 0x00);
+    store8(&ring3_yield_payload + 4, 0x00);
+    store8(&ring3_yield_payload + 5, 0x0F);    # syscall
+    store8(&ring3_yield_payload + 6, 0x05);
+    store8(&ring3_yield_payload + 7, 0x48);    # test rax, rax
+    store8(&ring3_yield_payload + 8, 0x85);
+    store8(&ring3_yield_payload + 9, 0xC0);
+    store8(&ring3_yield_payload + 10, 0x75);   # jnz +15 -> .spin (nonzero return = freeze)
+    store8(&ring3_yield_payload + 11, 0x0F);
+    store8(&ring3_yield_payload + 12, 0x48);   # movabs rbx, 0x2000000 (the counter VA)
+    store8(&ring3_yield_payload + 13, 0xBB);
+    store8(&ring3_yield_payload + 14, 0x00);
+    store8(&ring3_yield_payload + 15, 0x00);
+    store8(&ring3_yield_payload + 16, 0x00);
+    store8(&ring3_yield_payload + 17, 0x02);
+    store8(&ring3_yield_payload + 18, 0x00);
+    store8(&ring3_yield_payload + 19, 0x00);
+    store8(&ring3_yield_payload + 20, 0x00);
+    store8(&ring3_yield_payload + 21, 0x00);
+    store8(&ring3_yield_payload + 22, 0x48);   # inc qword [rbx]
+    store8(&ring3_yield_payload + 23, 0xFF);
+    store8(&ring3_yield_payload + 24, 0x03);
+    store8(&ring3_yield_payload + 25, 0xEB);   # jmp -27 -> .top
+    store8(&ring3_yield_payload + 26, 0xE5);
+    store8(&ring3_yield_payload + 27, 0xEB);   # .spin: jmp $
+    store8(&ring3_yield_payload + 28, 0xFE);
+    return 0;
+}
+fn ring3_idle_fill() {
+    store8(&ring3_idle_payload + 0, 0xB8);   # mov eax, 2 (getpid)
+    store8(&ring3_idle_payload + 1, 0x02);
+    store8(&ring3_idle_payload + 2, 0x00);
+    store8(&ring3_idle_payload + 3, 0x00);
+    store8(&ring3_idle_payload + 4, 0x00);
+    store8(&ring3_idle_payload + 5, 0x0F);   # syscall
+    store8(&ring3_idle_payload + 6, 0x05);
+    store8(&ring3_idle_payload + 7, 0xEB);   # jmp -9 (back to off 0)
+    store8(&ring3_idle_payload + 8, 0xF7);
+    return 0;
+}
+# Spawn one stress proc (no counter, no 0x2000000 map). -1 on fail.
+fn ring3_spawn_idle() {
+    var pid = spawn_user_proc(&ring3_idle_payload);
+    if (pid < 0) { return 0 - 1; }
+    proc_set_ring3(pid);
+    return pid;
+}
+# 1.44.x non-LIFO reap proof: a minimal exit-only ring-3 payload (no memory write → no
+# counter map needed): mov eax,0; xor edi,edi; syscall(exit 0); jmp $ (spin until reaped).
+var ring3_exit_payload[16];
+fn ring3_exit_fill() {
+    store8(&ring3_exit_payload + 0, 0xB8);   # mov eax, 0 (exit)
+    store8(&ring3_exit_payload + 1, 0x00);
+    store8(&ring3_exit_payload + 2, 0x00);
+    store8(&ring3_exit_payload + 3, 0x00);
+    store8(&ring3_exit_payload + 4, 0x00);
+    store8(&ring3_exit_payload + 5, 0x31);   # xor edi, edi (code 0)
+    store8(&ring3_exit_payload + 6, 0xFF);
+    store8(&ring3_exit_payload + 7, 0x0F);   # syscall
+    store8(&ring3_exit_payload + 8, 0x05);
+    store8(&ring3_exit_payload + 9, 0xEB);   # jmp -2 (spin)
+    store8(&ring3_exit_payload + 10, 0xFE);
+    return 0;
+}
+# Prove the NON-LIFO proc-table-slot reclaim. Runs FIRST in selftest-setup on a DENSE table
+# (only proc 0 + idle, no holes) for deterministic pids, then fully cleans up so the main
+# selftest starts fresh. Spawn A (exits) then B (stays alive) — A takes the lower slot so it
+# sits BELOW B; reaping A is a NON-TOP reap → A's slot becomes a mid-range hole; the next spawn
+# (C) must REUSE that hole (pidC == pidA, proc_count unchanged) rather than append. Also proves
+# proc_alloc_slot CLEARS the recycled slot's pending-signal state. Pre-fix: C appends (pidC !=
+# pidA, proc_count grows, A's slot leaks) and a stale signal survives. KERNEL context (direct
+# spawn/reap, not ring-3 syscalls).
+fn ring3_nonlifo_check() {
+    ring3_exit_fill();
+    var pidA = spawn_user_proc(&ring3_exit_payload);   # A: exits (lower slot — spawned first)
+    if (pidA < 0) { kprintln("ring3: FAIL nonlifo (no A)", 26); return 0; }
+    proc_set_ring3(pidA);
+    var pidB = ring3_spawn_idle();                     # B: stays alive, ABOVE A → A non-top
+    if (pidB < 0) { kprintln("ring3: FAIL nonlifo (no B)", 26); return 0; }
+    var w = 0;                                         # drive scheduler until A exits, bounded
+    while (w < 3000) {
+        if (proc_get_state(pidA) == 0) { w = 3000; } else { arch_wait(); w = w + 1; }
+    }
+    proc_send_signal(pidA, 10);                        # stamp a pending signal on A's (dead) slot
+    proc_reap_child(pidA);                             # NON-TOP reap (B above) → A's slot is a hole
+    var pc1 = proc_count;                              # high-water mark AFTER the non-top reap
+    var pidC = spawn_user_proc(&ring3_exit_payload);   # C: must REUSE A's hole (created, not run)
+    var sig = proc_check_pending_signals(pidC);        # must be 0 — proc_alloc_slot cleared it
+    kprint("ring3: nl A=", 12); kprint_num(pidA); kprint(" B=", 3); kprint_num(pidB); kprint(" C=", 3); kprint_num(pidC); kprint(" pc1=", 5); kprint_num(pc1); kprint(" pc=", 4); kprint_num(proc_count); kprintln("", 0);
+    if (pidC == pidA) {
+        if (proc_count == pc1) { kprintln("ring3: nonlifo reuse OK", 23); }   # reused, no append
+        else { kprintln("ring3: FAIL nonlifo leak", 24); }
+    } else { kprintln("ring3: FAIL nonlifo leak", 24); }
+    if (sig == 0) { kprintln("ring3: nonlifo signal clear OK", 30); } else { kprintln("ring3: FAIL nonlifo signal", 26); }
+    # Clean up TOP-DOWN so the LIFO collapse returns proc_count to its pre-check value (dense
+    # table for the main selftest). Higher pid first: B then C.
+    if (pidB > pidC) {
+        proc_set_state(pidB, 0); proc_reap_child(pidB);
+        proc_set_state(pidC, 0); proc_reap_child(pidC);
+    } else {
+        proc_set_state(pidC, 0); proc_reap_child(pidC);
+        proc_set_state(pidB, 0); proc_reap_child(pidB);
+    }
+    return 0;
+}
+fn ring3_selftest_setup() {
+    ring3_nonlifo_check();                            # non-LIFO slot-reuse proof on a dense table (cleans up after)
+    ring3_counter_a = pmm_alloc_2mb();               # 2 MB-aligned — proc_map_page maps a 2 MB page
+    ring3_counter_b = pmm_alloc_2mb();
+    if (ring3_counter_a == 0) { return 0; }
+    if (ring3_counter_b == 0) { return 0; }
+    if (vmm_is_mapped(ring3_counter_a) == 0) { vmm_map(ring3_counter_a, ring3_counter_a, 0x83); }
+    if (vmm_is_mapped(ring3_counter_b) == 0) { vmm_map(ring3_counter_b, ring3_counter_b, 0x83); }
+    store64(ring3_counter_a, 0);
+    store64(ring3_counter_b, 0);
+    ring3_payload_fill();                            # A: getpid (infinite "stays live")
+    ring3_pid_a = ring3_spawn_one(ring3_counter_a);
+    # B = a real in-memory ELF (finite count + exit) loaded by elf_load — the spawn #3
+    # loader, which (1.44.8) sets ring-3 selectors + state=ready (proc_create_full).
+    ring3_elf_fill();
+    ring3_pid_b = elf_load(&ring3_elf, 159);
+    if (ring3_pid_b >= 0) { proc_map_page(proc_get_cr3(ring3_pid_b), 0x2000000, ring3_counter_b); }
+    # P = a ring-3 PARENT that spawn(#3)s + poll-waitpid(#4)s a child ELF entirely from
+    # ring 3 (1.44.10). Unlike B (loaded by a KERNEL-context elf_load), P invokes spawn as
+    # a SYSCALL under its own CR3 — the path the kernel-CR3 fix unblocks. P makes no memory
+    # writes (only spawn/waitpid/exit syscalls), so it needs NO 0x2000000 mapping; success
+    # is its exit code 0xABCD (read by the verify via proc_get_exit_code). proc_create_full
+    # already left it state=ready; only proc_set_ring3 (ring-3 selectors) is needed.
+    spawn_parent_fill();
+    spawn_parent_pid = spawn_user_proc(&spawn_parent_payload);
+    if (spawn_parent_pid >= 0) { proc_set_ring3(spawn_parent_pid); }
+    # Y = the 1.44.16 sched_yield(#44) YIELDER (own counter at its 0x2000000, like A).
+    # Spawned BEFORE the stress block so the stress pids stay contiguous.
+    ring3_counter_y = pmm_alloc_2mb();
+    if (ring3_counter_y != 0) {
+        if (vmm_is_mapped(ring3_counter_y) == 0) { vmm_map(ring3_counter_y, ring3_counter_y, 0x83); }
+        store64(ring3_counter_y, 0);
+        ring3_yield_fill();
+        ring3_pid_y = spawn_user_proc(&ring3_yield_payload);
+        if (ring3_pid_y >= 0) {
+            proc_map_page(proc_get_cr3(ring3_pid_y), 0x2000000, ring3_counter_y);
+            proc_set_ring3(ring3_pid_y);
+        }
+    }
+    # STRESS: spawn 4 extra ring-3 procs (pids ~5-8) so the in-memory loaders' user code
+    # (0x400000 striped → 16 MB at pid 6 pre-fix) + stack land in PD[8..63]. With ~9 procs
+    # the pmm pushes page-table pages into the same 16-128 MB region — so PRE-fix a context
+    # switch SMAP-faults; POST-fix all stay live. Created AFTER P so P's spawn-child (created
+    # when P runs) stays the TOP proc-table slot → P's waitpid reap LIFO stays valid.
+    ring3_idle_fill();
+    ring3_stress_first = ring3_spawn_idle();
+    ring3_stress_count = 1;
+    var ski = 1;
+    while (ski < 4) {
+        if (ring3_spawn_idle() >= 0) { ring3_stress_count = ring3_stress_count + 1; }
+        ski = ski + 1;
+    }
+    # 1.44.x: spawn_path(#43) validator — ONLY under the exec-smoke disk profile (ext2_active),
+    # where exec_disk_selftest has already seeded /bin/prog2. Spawned LAST so the stress procs
+    # keep their contiguous slots; its from-disk child + P's child reap out-of-order, exercising
+    # the 1.44.12 non-LIFO reclaim. No-op under the ring3-smoke VirtIO profile (ext2_active==0).
+    if (ext2_active != 0) {
+        spawn_path_parent_fill();
+        spawn_path_parent_pid = spawn_user_proc(&spawn_path_parent_payload);
+        if (spawn_path_parent_pid >= 0) { proc_set_ring3(spawn_path_parent_pid); }
+    }
+    return 0;
+}
+fn ring3_selftest_verify() {
+    # Run the scheduler until BOTH proc B (the kernel-loaded ELF) exits AND the ring-3
+    # PARENT P has written its sentinel (child spawned + waitpid'd from ring 3), or a
+    # generous tick budget. A loops forever (the "stays live" proc); B counts to N then
+    # exit()s; P spawns C, polls waitpid, then exits — all time-sliced. Budget is larger
+    # than the B-only era (400) because four procs now share the round-robin.
+    var i = 0;
+    while (i < 3000) {
+        var bp_done = 0;
+        if (proc_get_state(ring3_pid_b) == 0) {
+            if (proc_get_state(spawn_parent_pid) == 0) { bp_done = 1; }
+        }
+        # spawn_path_parent (#43 validator) loads prog2 from DISK — slower than B/P's in-memory
+        # spawn — so the early-exit must wait for it too (else verify reads a still-running SP).
+        var sp_done = 1;
+        if (spawn_path_parent_pid > 0) {
+            if (proc_get_state(spawn_path_parent_pid) != 0) { sp_done = 0; }
+        }
+        if (bp_done == 1) {
+            if (sp_done == 1) { i = 3000; }                # all done — stop early
+            else { arch_wait(); i = i + 1; }
+        } else { arch_wait(); i = i + 1; }
+    }
+    var ca = load64(ring3_counter_a);
+    var cb = load64(ring3_counter_b);
+    var bstate = proc_get_state(ring3_pid_b);
+    kprint("ring3: A=", 9); kprint_num(ca); kprint(" B=", 3); kprint_num(cb); kprint(" Bst=", 5); kprint_num(bstate); kprintln("", 0);
+    # B (real ELF) ran to completion (counter == N) and exited (state 0) WHILE A kept running.
+    if (bstate == 0) {
+        if (cb == 16777216) {
+            if (ca > 0) { kprintln("ring3: child exited", 19); }
+            else { kprintln("ring3: FAIL A idle", 18); }
+        } else { kprintln("ring3: FAIL B partial", 21); }
+    } else { kprintln("ring3: FAIL B hung", 18); }
+    # A is still live + preemptible — proves "another proc stays live".
+    if (ca > 0) { kprintln("ring3: preempt OK", 17); } else { kprintln("ring3: FAIL no A", 16); }
+    # P (ring-3 PARENT) spawn(#3)ed a child ELF + poll-waitpid(#4)ed it to exit, all from
+    # ring 3, then exit(0xABCD). The exit code is set ONLY after a successful waitpid, so
+    # 0xABCD proves the spawn#3 kernel-CR3 fix end-to-end (the child's tables were wired
+    # correctly under the parent's CR3; the #UD-at-child blocker is gone). Pst 0 = P exited.
+    var pcode = proc_get_exit_code(spawn_parent_pid);
+    var pstate = proc_get_state(spawn_parent_pid);
+    kprint("ring3: Pcode=", 13); kprint_num(pcode); kprint(" Pst=", 5); kprint_num(pstate); kprintln("", 0);
+    if (pcode == 0xABCD) { kprintln("ring3: parent spawn+wait OK", 27); } else { kprintln("ring3: FAIL parent spawn", 24); }
+    # spawn_path(#43) end-to-end: the ring-3 SP-parent issued spawn_path(#43) on "/bin/prog2"
+    # (from DISK, non-blocking), poll-waitpid(#4)ed it, and exited with prog2's code (42). 42
+    # proves #43 made a READY ring-3 proc the scheduler ran AND #4 reaped its real exit code —
+    # the exact non-blocking spawn+reap agnsh `&` uses. Only present under the ext2 disk profile.
+    if (spawn_path_parent_pid > 0) {
+        var spcode = proc_get_exit_code(spawn_path_parent_pid);
+        var spstate = proc_get_state(spawn_path_parent_pid);
+        kprint("ring3: SPcode=", 14); kprint_num(spcode); kprint(" SPst=", 6); kprint_num(spstate); kprintln("", 0);
+        if (spcode == 42) { kprintln("ring3: spawnpath OK", 19); } else { kprintln("ring3: FAIL spawnpath", 21); }
+    }
+    # STRESS / page-table-fix proof: every extra proc (pids pushed into PD[8..63]) is still
+    # ALIVE (state 1) after the scheduler round-robined to it many times. Reaching this print
+    # AT ALL means no context switch SMAP-faulted (pre-fix the machine triple-faults here and
+    # NOTHING prints). All-alive = the de-striped VAs kept the identity-supervisor pool map
+    # intact across >=8 concurrent ring-3 procs.
+    var salive = 0;
+    var spi = 0;
+    while (spi < ring3_stress_count) {
+        if (proc_get_state(ring3_stress_first + spi) == 1) { salive = salive + 1; }
+        spi = spi + 1;
+    }
+    kprint("ring3: stress alive=", 20); kprint_num(salive); kprint("/", 1); kprint_num(ring3_stress_count); kprintln("", 0);
+    if (salive == ring3_stress_count) { kprintln("ring3: stress OK", 16); } else { kprintln("ring3: FAIL stress", 18); }
+    # Retire the stress procs (they loop forever) so boot continues.
+    var srp = 0;
+    while (srp < ring3_stress_count) { proc_set_state(ring3_stress_first + srp, 0); srp = srp + 1; }
+    # 1.44.16 sched_yield(#44): the YIELDER Y donated every slice. (i) cy > 0 proves the
+    # abandon-frame round trip — Y was resumed in ring 3 at the post-SYSCALL RIP with
+    # rax==0 AND its callee-saved/RSP state intact (any breakage spins, faults, or freezes
+    # the counter). (ii) ca >> cy (10x) proves the yield actually ENDS the slice — a
+    # silently-non-switching yield (all guards refusing) would make Y a busy increment
+    # loop with cy ~= ca and FAIL the ratio. The RATIO is TCG-speed-independent.
+    if (ring3_pid_y > 0) {
+        var cy = load64(ring3_counter_y);
+        var cay = load64(ring3_counter_a);
+        kprint("ring3: Y=", 9); kprint_num(cy); kprint(" A=", 3); kprint_num(cay); kprintln("", 0);
+        if (cy > 0) {
+            if (cay > cy * 10) { kprintln("ring3: yield OK", 15); }
+            else { kprintln("ring3: FAIL yield ratio", 23); }
+        } else { kprintln("ring3: FAIL yield dead", 22); }
+        proc_set_state(ring3_pid_y, 0);              # retire Y; boot continues
+    }
+    # Preempt gate still covers the live proc A.
+    var sa = load64(ring3_counter_a);
+    preempt_disable();
+    var g = 0;
+    while (g < 20) { arch_wait(); g = g + 1; }
+    preempt_enable();
+    if (load64(ring3_counter_a) == sa) { kprintln("ring3: gate held", 16); } else { kprintln("ring3: gate LEAK", 16); }
+    proc_set_state(ring3_pid_a, 0);                  # retire the surviving proc A; boot continues
+    kprintln("ring3: done", 11);
+    return 0;
+}
+#endif
+
+#ifdef FP_CTXSW_SELFTEST
+# === 1.53.x B5 — two-proc FP-preservation stress (correctness proof for lazy #NM) ===
+# Two ring-3 procs, each loaded with a DISTINCT pattern in xmm3 (low, naad-relevant) +
+# xmm15 (high, FXSAVE-completeness), co-scheduled preemptively (spawn_user_proc + IF=1
+# via proc_set_ring3, NOT the foreground #37 trap). Each round: write pattern → set my
+# handshake flag in the SHARED page (0x2200000) → yield#44 (hand the peer a slice) →
+# spin until the peer's flag shows it wrote ITS pattern → re-read xmm3/xmm15 (the first
+# SSE op #NMs, FXRSTOR-ing this proc's area) → compare to the pattern. SURVIVED (==own
+# pattern) proves B3 saved+restored across the peer's FP use; a mismatch (==peer pattern)
+# = corrupt. The handshake GUARANTEES the peer overwrote the physical XMM between this
+# proc's write and re-read, so a survived-round can't be a no-switch false-green.
+# ONE parameterized payload; the kernel plants pattern/flags per-proc into the witness
+# page. Witness layout: [0]survived [8]corrupt [16]pattern [24]my_flag [32]peer_flag.
+var fpctxsw_payload[256];       # raw ring-3 code, <=103 bytes. MUST be generous: measured directly,
+# `var fpctxsw_payload[24]` allocated only 24 BYTES (a 103-byte payload
+# overflowed into wit_a/b -> corrupt witness PDE -> ring-3 #PF), even
+# though sibling `var fpu_state[1026]` measured 8208 B (=N*8). Cyrius
+# module `var X[N]` sizing is NOT uniform here (footgun) — verify by
+# &next-&this and OVER-size. Reverting to [24] re-breaks B5.
+var fpctxsw_wit_a = 0;
+var fpctxsw_wit_b = 0;
+var fpctxsw_shared = 0;
+var fpctxsw_pid_a = 0;
+var fpctxsw_pid_b = 0;
+fn fpctxsw_payload_fill() {
+    var p = &fpctxsw_payload;
+    # B5 FP-preservation round (self-terminating, deadlock-free, no fall-through). Each round:
+    # load MY pattern (witness+0x10) into xmm3+xmm15, BURN ~16M iters (> one 10ms tick) so the
+    # timer preempts + runs the PEER (whose XMM holds a DIFFERENT pattern), then re-read
+    # xmm3/xmm15 and prove they still hold MY pattern. survived++ per clean round; on any leak
+    # corrupt++ + exit. 20 clean rounds -> exit(0). The exit SELF-LOOPS (xor eax,eax; syscall;
+    # jmp) so a returning SYS_EXIT can never fall through into the corrupt handler (that
+    # fall-through was a false-corrupt artifact during bring-up). rbx/r8 survive preemption via
+    # the GP context save; xmm3/xmm15 survive via B3's lazy #NM FXSAVE/FXRSTOR -- what this proves.
+    store8(p + 0, 0x48); store8(p + 1, 0xBB); store8(p + 2, 0x00); store8(p + 3, 0x00); store8(p + 4, 0x00); store8(p + 5, 0x02); store8(p + 6, 0x00); store8(p + 7, 0x00);
+    store8(p + 8, 0x00); store8(p + 9, 0x00); store8(p + 10, 0x4C); store8(p + 11, 0x8B); store8(p + 12, 0x43); store8(p + 13, 0x10); store8(p + 14, 0x66); store8(p + 15, 0x49);
+    store8(p + 16, 0x0F); store8(p + 17, 0x6E); store8(p + 18, 0xD8); store8(p + 19, 0x66); store8(p + 20, 0x4D); store8(p + 21, 0x0F); store8(p + 22, 0x6E); store8(p + 23, 0xF8);
+    store8(p + 24, 0x48); store8(p + 25, 0xB9); store8(p + 26, 0x00); store8(p + 27, 0x00); store8(p + 28, 0x00); store8(p + 29, 0x01); store8(p + 30, 0x00); store8(p + 31, 0x00);
+    store8(p + 32, 0x00); store8(p + 33, 0x00); store8(p + 34, 0x48); store8(p + 35, 0xFF); store8(p + 36, 0xC9); store8(p + 37, 0x75); store8(p + 38, 0xFB); store8(p + 39, 0x66);
+    store8(p + 40, 0x48); store8(p + 41, 0x0F); store8(p + 42, 0x7E); store8(p + 43, 0xD8); store8(p + 44, 0x4C); store8(p + 45, 0x39); store8(p + 46, 0xC0); store8(p + 47, 0x0F);
+    store8(p + 48, 0x85); store8(p + 49, 0x26); store8(p + 50, 0x00); store8(p + 51, 0x00); store8(p + 52, 0x00); store8(p + 53, 0x66); store8(p + 54, 0x4C); store8(p + 55, 0x0F);
+    store8(p + 56, 0x7E); store8(p + 57, 0xF8); store8(p + 58, 0x4C); store8(p + 59, 0x39); store8(p + 60, 0xC0); store8(p + 61, 0x0F); store8(p + 62, 0x85); store8(p + 63, 0x18);
+    store8(p + 64, 0x00); store8(p + 65, 0x00); store8(p + 66, 0x00); store8(p + 67, 0x48); store8(p + 68, 0xFF); store8(p + 69, 0x03); store8(p + 70, 0x48); store8(p + 71, 0x81);
+    store8(p + 72, 0x3B); store8(p + 73, 0x14); store8(p + 74, 0x00); store8(p + 75, 0x00); store8(p + 76, 0x00); store8(p + 77, 0x0F); store8(p + 78, 0x8C); store8(p + 79, 0xAD);
+    store8(p + 80, 0xFF); store8(p + 81, 0xFF); store8(p + 82, 0xFF); store8(p + 83, 0x31); store8(p + 84, 0xFF); store8(p + 85, 0x31); store8(p + 86, 0xC0); store8(p + 87, 0x0F);
+    store8(p + 88, 0x05); store8(p + 89, 0xEB); store8(p + 90, 0xFA); store8(p + 91, 0x48); store8(p + 92, 0xFF); store8(p + 93, 0x43); store8(p + 94, 0x08); store8(p + 95, 0x31);
+    store8(p + 96, 0xFF); store8(p + 97, 0x31); store8(p + 98, 0xC0); store8(p + 99, 0x0F); store8(p + 100, 0x05); store8(p + 101, 0xEB); store8(p + 102, 0xFA);
+    return 0;
+}
+fn fpctxsw_wit_init(w, pat, myf, peerf) {
+    if (vmm_is_mapped(w) == 0) { vmm_map(w, w, 0x83); }   # map into the kernel CR3 so the verify can read it
+    store64(w + 0, 0); store64(w + 8, 0);                 # survived / corrupt
+    store64(w + 16, pat); store64(w + 24, myf); store64(w + 32, peerf);
+    return 0;
+}
+fn fpctxsw_spawn(wit) {
+    var pid = spawn_user_proc(&fpctxsw_payload);
+    if (pid < 0) { return pid; }
+    proc_map_page(proc_get_cr3(pid), 0x2000000, wit);            # this proc's OWN witness page
+    proc_map_page(proc_get_cr3(pid), 0x2200000, fpctxsw_shared); # the SHARED handshake page (both procs)
+    proc_set_ring3(pid);
+    return pid;
+}
+fn fpctxsw_selftest_setup() {
+    # Witness pages: pmm_alloc_2mb returns valid 2MB-aligned RAM (regions >=4MB; the kernel image
+    # +.bss is <4MB and reserved by pmm_init, so these never overlap kernel memory). Each proc gets
+    # its OWN witness at 0x2000000; a shared page at 0x2200000 is mapped but the burn payload
+    # doesn't use it. (The bring-up "aliasing"/"pmm" theories were both wrong: the real bugs were a
+    # fpctxsw_payload[] buffer overflow + an exit fall-through, both fixed. B3 is sound.)
+    fpctxsw_wit_a = pmm_alloc_2mb();
+    fpctxsw_wit_b = pmm_alloc_2mb();
+    fpctxsw_shared = pmm_alloc_2mb();
+    if (fpctxsw_wit_a == 0) { return 0; }
+    if (fpctxsw_wit_b == 0) { return 0; }
+    if (fpctxsw_shared == 0) { return 0; }
+    fpctxsw_wit_init(fpctxsw_wit_a, 0x1111111111111111, 1, 2);   # A: pattern 0x1111.., flag 1, waits for 2
+    fpctxsw_wit_init(fpctxsw_wit_b, 0x2222222222222222, 2, 1);   # B: pattern 0x2222.., flag 2, waits for 1
+    if (vmm_is_mapped(fpctxsw_shared) == 0) { vmm_map(fpctxsw_shared, fpctxsw_shared, 0x83); }
+    store64(fpctxsw_shared + 0, 0);
+    var i = 0;
+    while (i < 16) { store64(&proc_last_cpu + i * 8, 0 - 1); i = i + 1; }   # migration witness init
+    fpctxsw_migrations = 0;
+    fpctxsw_payload_fill();
+    fpctxsw_pid_a = fpctxsw_spawn(fpctxsw_wit_a);
+    fpctxsw_pid_b = fpctxsw_spawn(fpctxsw_wit_b);
+    return 0;
+}
+fn fpctxsw_selftest_verify() {
+    kprint("fp: ctxsw pids A=", 17); kprint_num(fpctxsw_pid_a); kprint(" B=", 3); kprint_num(fpctxsw_pid_b); kprintln("", 0);
+    var t0 = timer_ticks;
+    while (timer_ticks - t0 < 150) { arch_wait(); }   # ~1.5s WALL (tick-bounded, not iter-bounded, so the 2 infinite-looping procs can't starve kmain out of the loop)
+    var sa = load64(fpctxsw_wit_a + 0);
+    var ca = load64(fpctxsw_wit_a + 8);
+    var sb = load64(fpctxsw_wit_b + 0);
+    var cb = load64(fpctxsw_wit_b + 8);
+    kprint("fp: ctxsw sa=", 13); kprint_num(sa); kprint(" ca=", 4); kprint_num(ca);
+    kprint(" sb=", 4); kprint_num(sb); kprint(" cb=", 4); kprint_num(cb);
+    kprint(" sw=", 4); kprint_num(fpu_switch_count); kprintln("", 0);
+    if (ca > 0) { kprintln("fp: ctxsw A CORRUPT", 19); }
+    else { if (sa >= 20) { kprintln("fp: ctxsw A OK", 14); } else { kprintln("fp: ctxsw A STUCK", 17); } }
+    if (cb > 0) { kprintln("fp: ctxsw B CORRUPT", 19); }
+    else { if (sb >= 20) { kprintln("fp: ctxsw B OK", 14); } else { kprintln("fp: ctxsw B STUCK", 17); } }
+    kprint("fp: ctxsw migrations=", 21); kprint_num(fpctxsw_migrations); kprintln("", 0);   # >0 under -smp = a real cross-core FP migration (soft gate)
+    proc_set_state(fpctxsw_pid_a, 0);
+    proc_set_state(fpctxsw_pid_b, 0);
+    kprintln("fp: ctxsw done", 14);
+    return 0;
+}
+#endif
+
 #ifndef KTEST
 proc_count = 0;
-proc_current = 0;
+proc_current_set(0);
 proc_create(0);                 # proc 0 = kernel main (running now; context saved on first switch-away)
 proc_set_state(0, 2);           # running
-proc_create_full(&kernel_idle_loop, &kernel_idle_stack + 4096);  # proc 1 = idle (ready)
+proc_on_cpu_init();             # 1.46.x SMP6: all 16 on_cpu slots = -1 BEFORE sched_active=1 (scheduler fence default)
+sched_idle_init(); sched_idle_pid_set(kthread_create(&kernel_idle_loop));  # proc 1 = idle (ready) — 1.44.1: via the kthread primitive (pool stack); 1.44.17: registered so sched_next deprioritizes it (idle runs only when nothing else is ready)
+# 1.46.x SMP sub-bite 7 STEP-2 (2026-06-26): mark the BSP idle as OWNED by cpu 0 — the exact mirror
+# of ap_entry's idle_owner_set(ap_idle, my_id) (smp.cyr:365). Without it, idle_owner[bsp_idle] stays
+# -1, so sched_idx_pickable's foreign-idle guard treats pid 1 as "not an idle" and a woken AP
+# (smp_sched_aps=1) STEALS the BSP idle: two CPUs then run kernel_idle_loop on its SINGLE kthread stack
+# (torn iretq frame), AND the BSP is starved of its own idle -> sched_next falls to `return 0` (kmain)
+# -> kmain re-run -> the QEMU -smp 4 torn-frame + #UD-at-0x1000 STEP-2 faults. cpu_count is still 1
+# here (smp_start_aps runs later), so sched_idle_pid_get() returns the just-set BSP idle (slot 0).
+idle_owner_set(sched_idle_pid_get(), 0);
+# 1.46.x SMP sub-bite 7 STEP-2 (2026-06-26): PIN proc 0 (kmain/kybernet) to the BSP. proc 0 is the
+# out-of-band BSP boot/init thread — it runs kybernet IF=1-preemptibly and execs agnsh via
+# exec_and_wait (its continuation parks in exec_ctx on the BSP stack), so it is inherently BSP-bound.
+# When the BSP timer preempts kybernet, do_context_switch sets proc 0 -> state==1/on_cpu==-1; without
+# this pin a woken AP's sched_next STEALS proc 0 and runs kybernet concurrently on the boot CR3 -> the
+# AP enters kputc and its corrupted console scroll overruns the framebuffer (#PF->#DF). Same class as
+# the BSP-idle + foreground-proc steals; idle_owner is the per-proc CPU-pin. MUST be after
+# proc_on_cpu_init() (which zeroes idle_owner). Inert single-core (sched_idx_pickable io==0==pcpu_cpu()).
+idle_owner_set(0, 0);
+#ifdef THREAD_SELFTEST
+# 1.44.0 opening bite: spawn two kernel threads on the shared AS (tight-loopers).
+thr_pid_a = kthread_create(&thread_test_a);
+thr_pid_b = kthread_create(&thread_test_b);
 #endif
+#ifdef RING3_SELFTEST
+# 1.44.4: spawn + map + ring-3-ify a single user proc before the scheduler arms.
+ring3_selftest_setup();
+#endif
+#ifdef FP_CTXSW_SELFTEST
+# 1.53.x B5: spawn the two FP-preservation procs BEFORE the scheduler arms so they co-schedule.
+fpctxsw_selftest_setup();
+#endif
+#endif
+
+# 1.46.x sub-bite 7 (H6 fix 2026-06-24): wake APs HERE — AFTER the proc-table
+# bootstrap (proc_count / proc 0 / idle created, proc_on_cpu_init done) and BEFORE
+# sched_active=1. So each AP registers its idle kthread into the STABLE proc table
+# (no later proc_count=0 wipe), sets on_cpu without it being reset, and smp_start_aps
+# waits on pcpu_ap_ready so every AP is fully built before the scheduler arms.
+# Preconditions still hold here: pt_init done (CR3 0x1000), IF=1, sched_active still 0.
+if (smp_wake_enabled != 0) {
+    smp_start_aps();
+} else {
+    kprintln("smp: AP wake gated (MVP single-core)", 36);
+}
 
 sched_active = 1;
 
@@ -1684,6 +3967,148 @@ sched_active = 1;
 # stall (no CP 17 ever emitted, no shell prompt) is a scheduler /
 # context-switch issue, not an init issue. Held since Attempt 16.
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x10; 0xE6; 0x71; }
+
+# EFER.SCE re-assert wrapped in a FUNCTION (clean ABI boundary) so the raw
+# rdmsr/wrmsr — which clobbers eax/ecx/edx — can't corrupt cc5's regalloc at the
+# call site (the inline form silently zeroed a live local). exec_and_wait does the
+# same re-assert right before enter_ring3; the setu-e2e selftest below needs it so
+# the SCHEDULER-entered compositor (this boot's first ring-3 proc, entered via
+# iretq not enter_ring3) survives its first SYSCALL instead of #UD'ing on a
+# never-exercised SCE. EFER is a per-CPU MSR context switches don't touch → holds.
+fn efer_sce_enable(): i64 {
+    syscall_init();
+    asm {
+        0xB9; 0x80; 0x00; 0x00; 0xC0;   # mov ecx, 0xC0000080 (IA32_EFER)
+        0x0F; 0x32;                       # rdmsr
+        0x0D; 0x01; 0x00; 0x00; 0x00;     # or eax, 1 (SCE)
+        0x0F; 0x30;                       # wrmsr
+    }
+    return 0;
+}
+
+#ifdef AETHERSAFHA_SETU_SELFTEST
+# 3b — the sovereign DISPLAY PROTOCOL end-to-end on agnos. Runs AFTER
+# sched_active=1 (unlike AETHERSAFHA_SELFTEST at ~L2286) because it needs TWO
+# concurrent procs. Loads the compositor as a BACKGROUND ring-3 proc — mirroring
+# the spawn_path(#43) handler EXACTLY (boot-CR3 dance for the disk load + address
+# space; exec_env set so the loader builds a valid argv/envp stack; proc_set_ring3
+# + state=ready + EFER.SCE re-assert via efer_sce_enable) — then kmain IDLES via
+# arch_wait so the LIVE scheduler round-robins the compositor AND the /bin/puka it
+# spawn_path's. Foreground exec_and_wait would PIN kmain and starve the client.
+#
+# STATUS: the compositor RUNS under the scheduler (reaches main + its FIRST SYSCALL
+# — the CR3 dance + exec_env + EFER re-assert cleared scheduler ENTRY). BLOCKER: its
+# SECOND syscall fails (a raw write right after the first prints; the next does not).
+# NOT a CR3/mmap issue — proc_get_user_cr3 returns out==in (agnos COLLAPSED the KPTI
+# split at proc.cyr:592-611; PD[511] = the FULL CR3 that maps the stub), so
+# kpti_user_cr3 already == the full CR3. A foreground exec_and_wait proc (agnsh,
+# enter_ring3) does thousands of syscalls fine; a SCHEDULER-entered (iretq) proc's
+# 2nd fails — the difference is the syscall / preemption-resume path (likely a stale
+# kernel-stack / RSP0 / per-CPU state after the first SYSRET). NOT root-caused. Do
+# NOT edit do_context_switch / proc_get_user_cr3 inline — their save/restore zone is
+# cc5-regalloc-sensitive (sched.cyr:341) and perturbing it regressed scheduling in a
+# way unrelated to the change's intent. See [[project_agnos_two_proc_concurrency_blocker]].
+kprintln("setu-e2e: loading compositor bg", 31);
+# No NIC in this QEMU (r8169 absent) → net_ip=0, so a loopback SYN's src_ip is 0 and
+# the peer's SYN-ACK (dst = that src_ip = 0) fails net_is_loopback (needs dst>>24==127
+# or dst==net_ip) → lost → connect times out. Set net_ip = 127.0.0.1 so the local
+# address IS loopback: both the SYN (src=127.0.0.1) and the SYN-ACK (dst=127.0.0.1)
+# are lo_ring-delivered, completing the on-device puka↔compositor handshake sans NIC.
+net_ip = 0x7F000001;
+var ae_p = "/bin/aethersafha";
+if (sh_abspath(ae_p, 16) >= 0) {
+    var spcr3 = proc_get_cr3(proc_current_get());
+    cr3_load(0x1000);                    # boot CR3 maps the NVMe BAR for the disk load
+    exec_env_src_set(0);                 # default kernel env (HOME=/ PWD=/) — valid envp stack
+    exec_env_len_set(0);
+    var ae_pid = elf_load_from_file(&sh_path_buf, sh_path_len, ae_p, 16);
+    cr3_load(spcr3);                     # restore on EVERY path (matches #43)
+    if (ae_pid >= 0) {
+        proc_set_ring3(ae_pid);          # CS=0x23 / SS=0x1B (else iretq lands ring-0)
+        efer_sce_enable();               # make the first SYSCALL from the scheduled compositor work
+        kprint("setu-e2e: ae pid=", 17); kprint_num(ae_pid); kprintln("", 0);
+        # CRITICAL: flip the compositor READY *AFTER* kmain's last kprint. These named
+        # spinlocks don't disable preemption (smp.cyr:47 "never hold a lock across a
+        # context switch / a kprint"), so if the compositor were schedulable during the
+        # kprint above, a timer tick that preempts kmain mid-print (holding console_lock)
+        # would let the compositor's own first console write DEADLOCK on that held lock
+        # (QEMU-monitor-confirmed: RIP in a spin loop on lock 0x1ce670, IF=0). kmain is
+        # SILENT hereafter, so the compositor has console_lock uncontended.
+        proc_set_state(ae_pid, 1);       # READY — the scheduler will run it
+        while (1 == 1) { arch_wait(); }  # kmain idles SILENTLY; scheduler drives compositor + puka
+
+    } else { kprintln("setu-e2e: load FAILED", 21); }
+} else { kprintln("setu-e2e: bad path", 18); }
+#endif
+
+#ifdef MISHRAN_DUPLEX_SELFTEST
+# mishran TWO-PROC audio proof — the REAL loopback wire, no jalwa (stays inside the
+# mishran repo). Runs AFTER sched_active=1 (like AETHERSAFHA_SETU_SELFTEST above)
+# because it needs TWO concurrent procs; the pre-scheduler selftest block (~L2286)
+# can't run two — sched_yield #44 no-ops (sched_active=0) and there is no timer
+# preempt, so a spawned secondary never gets CPU. Loads /bin/mishduplex (the mixer
+# SERVER) as a BACKGROUND ring-3 proc via the boot-CR3 dance (mirrors the spawn_path
+# #43 handler EXACTLY: boot-CR3 for the disk load, exec_env for a valid argv/envp
+# stack, proc_set_ring3 + EFER.SCE re-assert). mishduplex binds loopback:7701 + opens
+# the vani sink, then spawn_path's /bin/mishclient, which connects + streams a
+# square-wave tone (msh_client_*). The mixer fans it to vani (audio_* -> sys_snd_*
+# #64-69). kmain then IDLES via arch_wait so the LIVE scheduler round-robins BOTH
+# procs — the cooperative sched_yield #44 dance that replaces the old preempt-off
+# blocking writes (audio_write / sleep_ms), which starved the peer because the shared
+# per-CPU syscall kstack forbids the kernel preempting a blocking syscall (the
+# serial-kstack invariant; agnos-blocking-syscall-yield-fix). A foreground
+# exec_and_wait would PIN kmain and starve the client, so we load it as background.
+# scripts/mishran-duplex-audio-smoke.sh captures the HDA output + asserts a non-silent
+# wav = both procs interleaved, no deadlock, no starvation.
+#
+# net_ip = 127.0.0.1 (same as setu): no NIC in this QEMU (r8169 absent), so a loopback
+# SYN's src_ip would be 0 and the SYN-ACK (dst=0) fails net_is_loopback — the connect
+# would time out. Setting net_ip to loopback makes both the SYN and SYN-ACK lo_ring-
+# delivered, completing the on-device client->server handshake sans NIC.
+kprintln("mishran-duplex: loading mixer server bg", 39);
+net_ip = 0x7F000001;
+var dx_p = "/bin/mishduplex";
+if (sh_abspath(dx_p, 15) >= 0) {
+    var dx_cr3 = proc_get_cr3(proc_current_get());
+    cr3_load(0x1000);                    # boot CR3 maps the NVMe BAR for the disk load
+    exec_env_src_set(0);                 # default kernel env (HOME=/ PWD=/) — valid envp stack
+    exec_env_len_set(0);
+    var dx_pid = elf_load_from_file(&sh_path_buf, sh_path_len, dx_p, 15);
+    cr3_load(dx_cr3);                     # restore on EVERY path (matches #43)
+    if (dx_pid >= 0) {
+        proc_set_ring3(dx_pid);          # CS=0x23 / SS=0x1B (else iretq lands ring-0)
+        efer_sce_enable();               # make the scheduled server's first SYSCALL work
+        kprint("mishran-duplex: server pid=", 27); kprint_num(dx_pid); kprintln("", 0);
+        # flip READY *AFTER* the last kprint (console_lock — kmain silent hereafter so
+        # the scheduled procs' console writes never deadlock on a kmain-held lock; see
+        # the AETHERSAFHA_SETU note above).
+        proc_set_state(dx_pid, 1);       # READY — the scheduler will run it
+        while (1 == 1) { arch_wait(); }  # kmain idles SILENTLY; scheduler drives server + client
+    } else { kprintln("mishran-duplex: load FAILED", 27); }
+} else { kprintln("mishran-duplex: bad path", 24); }
+#endif
+
+#ifdef THREAD_SELFTEST
+# 1.44.0 opening bite: prove preemptive kernel-thread time-slicing + the preempt
+# gate on the live scheduler, then retire the test threads so boot continues.
+thread_selftest_verify();
+#endif
+
+#ifdef RING3_SELFTEST
+# 1.44.4: prove a ring-3 proc (own CR3, IF=1) is preempted + resumed by the scheduler.
+ring3_selftest_verify();
+#endif
+
+#ifdef FP_CTXSW_SELFTEST
+# 1.53.x B5: let the two FP procs interleave under the live scheduler, then assert XMM survival + latch.
+fpctxsw_selftest_verify();
+#endif
+
+#ifdef SCHED_STRESS_SELFTEST
+# concurrent-proc scheduler stress: spawn a storm near the proc-table cap, churn
+# slot-reclaim across rounds, assert count/leak/starve/canary/cap invariants.
+sched_stress_verify();
+#endif
 
 #ifdef KTEST
 # Kernel idle loop: halts, wakes on timer, scheduler switches to A or B

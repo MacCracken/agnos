@@ -1385,11 +1385,14 @@ fn gpu_shader_dispatch() {
 }
 # ── C2g-1 — FIRST MULTI-THREAD compute dispatch (1 workgroup, 64 threads; out[tid]=tid) ──
 # The first parallel dispatch: 64 lanes each write their workitem-id to out[tid], CPU verifies
-# out[i]==i. Minimal delta on C2f — NUM_THREAD_X flips 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 =>
-# 64 threads in ONE workgroup), and the shader computes out[tid]=tid via v0(=workitem-id-X)<<2
-# folded into a 64-bit base (v_lshlrev + v_add_co/v_addc_co carry chain). ALL 11 shader dwords are
-# llvm-mc(-mcpu=gfx90c) ground-truth. Output ARRAY is at +0x14800 (the C2f slot) — NOT +0x15000
-# which is the dummy fault-sink page (would alias faulting stores in + corrupt the fault signal).
+# out[i]==i. Delta on C2f — NUM_THREAD_X flips 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 => 64 threads
+# in ONE workgroup) PLUS the EXEC fix: burns 1.54.17-19 showed the 64-lane wave RETIRED but stored
+# nothing (nz=0) => all lanes EXEC-masked, so the shader now sets 's_mov_b64 exec,-1' first (C2f's
+# 1-lane wave got SPI-auto EXEC=0x1; the full wave got EXEC=0 on the raw non-HWS HQD path). The
+# shader then computes out[tid]=tid via v0(=workitem-id-X)<<2 folded into a 64-bit base
+# (v_lshlrev + v_add_co/v_addc_co carry chain). ALL 12 shader dwords are llvm-mc(-mcpu=gfx90c)
+# ground-truth. Output ARRAY is at +0x16000 (GPU_SHADER_OUT2_SUBOFF — a FRESH GPU-never-written
+# slot, past the +0x15000 dummy fault-sink page, so no stale-L2 ghost can false-pass).
 # WEDGE-SAFE: straight-line shader (no loops); bus-master off (cores reach only the FB aperture);
 # a bad per-lane addr faults into the 0x1FFC dummy net (fault!=0); CPU runs a BOUNDED watchdog only.
 fn gpu_shader_dispatch2() {
@@ -1409,20 +1412,28 @@ fn gpu_shader_dispatch2() {
     var out_mc      = gpu_arena_mc   + GPU_SHADER_OUT2_SUBOFF;
     var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
 
-    # 1. ISOLATION-DIAGNOSTIC shader (8 dwords): each lane stores its workitem-id v0 to a FIXED
-    #    address out_base (NO per-thread offset — the v_lshlrev/v_add_co/v_addc_co arithmetic is
-    #    dropped). 64 lanes race into out[0]; the winner's v0 lands there. This splits the C2g-1
-    #    burn-2 result (stores didn't land): o0 in [0,63] => waves RUN and v0 IS the workitem-id
-    #    (=> the real bug is the address arithmetic); o0 stale (0xDEADBEEF, fresh slot) => zero
-    #    waves launched (=> the 64-thread dispatch config). Only C2f/C2g-1-proven encodings used.
-    store32(shader_phys + 0x00, 0x7E0202FF);              # v_mov_b32 v1, lit
-    store32(shader_phys + 0x04, out_mc & 0xFFFFFFFF);     #   = out base lo (FIXED addr)
-    store32(shader_phys + 0x08, 0x7E0402FF);              # v_mov_b32 v2, lit
-    store32(shader_phys + 0x0C, (out_mc >> 32) & 0xFFFFFFFF); # = out base hi
-    store32(shader_phys + 0x10, 0xDC718000);              # global_store_dword v[1:2],v0,off glc
-    store32(shader_phys + 0x14, 0x007F0001);              #   (VADDR=v1, VDATA=v0=workitem-id, SADDR=off)
-    store32(shader_phys + 0x18, 0xBF8C0F70);              # s_waitcnt vmcnt(0)
-    store32(shader_phys + 0x1C, 0xBF810000);              # s_endpgm
+    # 1. C2g-1 shader (12 dwords): FIX = prepend 's_mov_b64 exec,-1' to unmask all 64 lanes, then
+    #    each lane computes out[tid]=tid via v0(=workitem-id-X)<<2 folded into the 64-bit base
+    #    (v_lshlrev + v_add_co/v_addc_co carry chain) and stores v0. ALL dwords are
+    #    llvm-mc(-mcpu=gfx90c) ground-truth. Root cause of the 1.54.17-19 zero-store burns: the
+    #    64-lane wave RETIRED (done fired, ACTIVE=1) but stored nothing (nz=0) => all lanes were
+    #    EXEC-masked. C2f's 1-lane wave got SPI-auto EXEC=0x1 (lane0 stored); the full wave got
+    #    EXEC=0 on this raw non-HWS HQD path, so the explicit set is what lights all 64.
+    #    NOTE (forward-carry): 's_mov_b64 exec,-1' is correct ONLY for an EXACT full wave (64 =
+    #    exact wave64). C2g-2+ grids with a PARTIAL last wave must replace this with a real lane
+    #    mask (s_bfm / whole-wave-mode) or the surplus lanes do OOB stores.
+    store32(shader_phys + 0x00, 0xBEFE01C1);              # s_mov_b64 exec, -1   (unmask all 64 lanes)
+    store32(shader_phys + 0x04, 0x7E0202FF);              # v_mov_b32 v1, lit
+    store32(shader_phys + 0x08, out_mc & 0xFFFFFFFF);     #   = out base lo
+    store32(shader_phys + 0x0C, 0x7E0402FF);              # v_mov_b32 v2, lit
+    store32(shader_phys + 0x10, (out_mc >> 32) & 0xFFFFFFFF); # = out base hi
+    store32(shader_phys + 0x14, 0x24060082);              # v_lshlrev_b32 v3, 2, v0   (v3 = tid<<2)
+    store32(shader_phys + 0x18, 0x32020701);              # v_add_co_u32 v1, vcc, v1, v3
+    store32(shader_phys + 0x1C, 0x38040480);              # v_addc_co_u32 v2, vcc, 0, v2, vcc
+    store32(shader_phys + 0x20, 0xDC718000);              # global_store_dword v[1:2],v0,off glc
+    store32(shader_phys + 0x24, 0x007F0001);              #   (VADDR=v1, VDATA=v0=tid, SADDR=off)
+    store32(shader_phys + 0x28, 0xBF8C0F70);              # s_waitcnt vmcnt(0)
+    store32(shader_phys + 0x2C, 0xBF810000);              # s_endpgm
 
     # 2. Pre-seed all 64 output dwords + done with a NOT-YET marker (!= any tid 0..63, != done).
     var s = 0;

@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.20] — 2026-07-13 — GPU arc C2g-1 fix: multi-thread wave EXEC unmask + full per-thread arithmetic
+
+**C2g-1 burns 1-3** localized the multi-thread failure precisely: the 64-thread dispatch RETIRES (done-marker
+fires, `CP_HQD_ACTIVE=1`, full ring consumed, `fault=0`) but ZERO of the 64 output dwords store (`nz=0`) — the
+64-lane wave completes with every lane EXEC-masked, while C2f's 1-lane wave works. Data-forced: lane 0 (tid=0)
+would store to `out[0]` if EXEC were nonzero, and none of 64 changed ⟹ `EXEC=0` for the whole wave.
+
+### Fixed
+
+- **C2g-1 multi-thread wave launch** — `kernel/core/gpu.cyr` `gpu_shader_dispatch2()`: the shader now prepends
+  **`s_mov_b64 exec,-1`** (`0xBEFE01C1`) to unmask all 64 lanes, then runs the full `out[tid]=tid` per-thread
+  arithmetic (`v_lshlrev v3,2,v0` · `v_add_co` · `v_addc_co` 64-bit carry · `global_store v[1:2],v0`). Single-
+  variable change: only the 12-dword shader blob — the 39-dword ring program and register-wptr submit stay
+  byte-identical to the C2f-proven path. All dwords `llvm-mc -mcpu=gfx90c` ground-truth; no scalar→vector nop
+  needed on gfx9. Validated by a 5-lens prior-art sweep (LLVM/ROCm, Mesa, amdgpu/amdkfd, tinygrad raw-MEC,
+  GCN/gem5 ISA) + adversarial verify: the SPI auto-inits EXEC on the raw non-HWS path (proven by C2f's 1-lane
+  store + tinygrad's raw-MEC path) and there is no hardware exact-multiple off-by-one, so the symptom is a
+  genuine full-wave `EXEC=0` that `exec,-1` corrects. Ruled out by inspection: `COMPUTE_NUM_THREAD_X`=`0x40`
+  in `NUM_THREAD_FULL[15:0]`, dims `(1,1,1)` threadgroups, `RSRC2=0` ABI-correct for `v0`=workitem-id. Iron-only
+  (QEMU has no AMD GFX); flash `--update-all`. Rubric + lens consensus: agnosticos
+  `iron-nuc-zen-log.md#tracker-154x-c2g1`.
+
+### Note
+
+- `s_mov_b64 exec,-1` is correct **only** for an EXACT full wave (64 = exact wave64). C2g-2+ grids with a
+  partial last wave (or genuine per-lane divergence) must replace the blind `-1` with a real lane mask
+  (`s_bfm` / whole-wave-mode) or surplus lanes do OOB stores.
+
 ## [1.54.19] — 2026-07-13 — GPU arc C2g-1 burn 2 isolation: v0-to-fixed-slot + fresh output slot
 
 **C2g-1 burn 2** (1.54.18) showed the 64-thread shader's stores don't land: only one output dword changed
