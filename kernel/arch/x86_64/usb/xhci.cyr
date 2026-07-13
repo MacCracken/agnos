@@ -445,7 +445,7 @@ fn xhci_init() {
         wait = wait + 1;
     }
     if (wait >= 1000000) {
-        kprintln("xhci: halt timeout (HCH never set)", 35);
+        kprintln("xhci: halt timeout (HCH never set)", 34);
         return 0;
     }
 

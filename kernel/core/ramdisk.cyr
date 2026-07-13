@@ -60,9 +60,9 @@ fn ramdisk_init() {
             # pmm exhausted mid-init; abandon partial allocation, skip register
             ramdisk_npages = 0;
             ramdisk_active = 0;
-            kprint("ramdisk: pmm exhausted after ", 32);
+            kprint("ramdisk: pmm exhausted after ", 29);
             kprint_num(i);
-            kprintln(" pages — disabled", 17);
+            kprintln(" pages -- disabled", 18);
             return 0 - 1;
         }
         # Identity-map the page for kernel access (same posture as nvme.cyr's

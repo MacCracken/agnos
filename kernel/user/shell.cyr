@@ -187,7 +187,7 @@ fn sh_cmd_help() {
     kprintln("  tcp     - TCP connect test", 28);
     kprintln("  dns     - resolve hostname", 28);
     kprintln("  ping    - ICMP echo a host", 28);
-    kprintln("  ntp     - SNTP time sync", 25);
+    kprintln("  ntp     - SNTP time sync", 26);
     kprintln("  date    - show synced UTC time", 32);
     kprintln("  pipe    - test pipe IPC", 25);
     kprintln("  blkread - read disk sector", 28);

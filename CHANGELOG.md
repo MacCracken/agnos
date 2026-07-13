@@ -5,6 +5,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.13] — 2026-07-12 — GPU arc bite C2e: WRITE_DATA fence (the MEC executes + a CPU-visible write) + kernel-wide kprint log hygiene
+
+**C2d was iron-validated** (1.54.12): the MEC fetches PM4 packets (rptr 0→8), and the ring GPUVA translates
+through the FB aperture with zero page tables (`fault=0x0`). C2e goes one step further — the MEC *executes* a
+packet with an **observable side effect** and the CPU reads the result back, proving the GPU→CPU coherence that
+every downstream compute read-back (shader C2f, rosnet matmul C2g) depends on.
+
+### Added
+
+- **WRITE_DATA fence (bite C2e)** — `kernel/core/gpu.cyr` `gpu_fence()`: appends one 5-dword
+  `PACKET3_WRITE_DATA` (`[0xC0033700, 0x00100500, 0x80012000, 0x000000F4, 0xC2E0C2E0]`) at the tracked ring
+  cursor, submits via the **proven register-wptr path** (C2d showed the posted doorbell doesn't advance wptr; a
+  direct `CP_HQD_PQ_WPTR_LO` write does), and reads back a sentinel the MEC writes to the carveout slot at arena
+  `+0x12000` (MC `0xF480012000`). **`DST_SEL=5`** (memory async-direct) targets DRAM, bypassing the GL2 path a
+  `DST_SEL=2` write would strand in — so *"rptr advanced but sentinel stale"* can only mean a coherence gap.
+  `WR_CONFIRM=1` fences retirement; a bounded watchdog (100 ms cap, never spins) polls both rptr and the
+  sentinel; a pre-seeded `0xDEADBEEF` marker prevents a stale/zero false-pass. `kernel/core/gpu_regs.cyr`: the
+  C2e `WRITE_DATA` + sentinel constants (+ a *staged*, un-wired `ACQUIRE_MEM` for the row-2 coherence follow-up).
+  - Pass signal: `gpu: C2e = FENCE OK (MEC executed WRITE_DATA; CPU-visible write)` — the MEC executes packets
+    AND its memory writes are CPU-visible, retro-explaining C2d's `rmem=0` as an rptr-report-trigger artifact.
+  - Deliberately **no `ACQUIRE_MEM`/L2-flush on this burn**: it would collapse the executed-vs-coherent
+    disambiguation. A `EXECUTED, NOT COHERENT` result (rptr advances, sentinel stale) is not a failure — it
+    confirms a real GL2 coherence gap and makes the staged flush the next bite.
+
+### Fixed
+
+- **Kernel-wide `kprint`/`kprintln` log hygiene** — swept all 1,911 literal console-log calls: corrected **24**
+  byte-length mismatches (truncated lines *and* over-reads that printed 1–3 bytes of adjacent rodata past the
+  string) and ASCII-ized **6** non-ASCII literals (`×` → `x`, em-dash `—` → `--`) that both miscounted their
+  length and rendered as CP437 garbage on the framebuffer console. Boot-log text capture (`klug > file.txt`) now
+  reads clean end-to-end. Files: `r8169.cyr`, `gpt.cyr`, `ext2.cyr`, `main.cyr`, `pmm.cyr`, `nvme.cyr`,
+  `hid.cyr`, `xhci.cyr`, `ramdisk.cyr`, `bench.cyr`, `shell.cyr`.
+
+### Notes
+
+- **CPU-wedge-SAFE** (9-agent derivation + 2-lens adversarial verify, all `refuted=False`; encoding confirmed
+  verbatim vs amdgpu `soc15d.h` and the codebase's own iron-proven NOP header `0xC0061000`): same envelope as
+  C2d — bounded watchdog only; the MEC write targets our own carveout (bus-master off → cannot reach system
+  RAM); any bad translation is bounded by the `0x1FFC` dummy-page fault-net. No new firmware; flash
+  `--update-all`. Iron-only; QEMU no-op (no gfx90c). Rubric + falsification table: agnosticos
+  `iron-nuc-zen-log.md` `#tracker-154x-c2e`. Next (post-fence): C2f (hand-assembled gfx90c shader) → C2g
+  (rosnet matmul on the GPU).
+
 ## [1.54.12] — 2026-07-12 — GPU arc bite C2d: first PM4 packet + doorbell (the VM-fetch gate)
 
 **C2c was iron-validated** (1.54.10): the compute queue is mapped + active + empty on MEC1/pipe0/queue0.

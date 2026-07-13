@@ -329,7 +329,7 @@ fb_shadow_init();
 # VM edits" class structurally (it was the 1.49.9 misdiagnosis root). Per-proc CR3s already copy 0x1000's
 # PDPT[1..511], so this makes the boot/idle context consistent with them. [[feedback_dont_dodge_large_items]]
 cr3_load(0x1000);
-kprintln("kernel CR3: own PML4 (0x1000)", 28);
+kprintln("kernel CR3: own PML4 (0x1000)", 29);
 # 1.50.9: the kernel now runs on 0x1000, which carries the direct-map (PDPT[8+]) — so rebase the
 # migrated PMM bitmap pointer off its IDENTITY VA onto DIRECTMAP_BASE + phys. REQUIRED because the
 # migrated bitmap lives in the <=256 MB pool and its identity VA can alias a per-process user VA — a
@@ -872,6 +872,13 @@ gpu_queue_setup();
 # See kernel/core/gpu.cyr gpu_ring_kick().
 gpu_ring_kick();
 
+# GPU arc C2e (1.54.x) — WRITE_DATA fence: after C2d proved the MEC FETCHES, C2e has it
+# EXECUTE one PACKET3_WRITE_DATA that writes a sentinel to a carveout slot the CPU reads
+# back — proving execution AND that a MEC memory write is CPU-visible (the coherence the
+# shader/matmul readbacks in C2f/C2g depend on; also disambiguates C2d's rmem=0). Gated on
+# C2d success inside gpu_fence(). Same wedge-safe envelope. See kernel/core/gpu.cyr gpu_fence().
+gpu_fence();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif
@@ -1249,7 +1256,7 @@ if (exfat_active == 1) {
         if (ex_ok == 1) { kprintln("exfatr: file-read OK", 20); }
         else { kprintln("exfatr: file-read FAIL", 22); }
     } else {
-        kprintln("exfatr: no seeded file (mount + upcase gates only)", 49);
+        kprintln("exfatr: no seeded file (mount + upcase gates only)", 50);
     }
     # 1.40.13 mount-namespace: drive the real shell `ls` over the exFAT mount.
     # sh_cmd_ls -> FS_EXFAT -> vfs_print_dir_on -> exfat_print_dir (name
@@ -1864,7 +1871,7 @@ fn exec_disk_selftest() {
     var mf2_after = pmm_count_2mb_free();
     if (mf4_before == mf4_after) {
         if (mf2_before == mf2_after) {
-            kprintln("reap: 6x mmap-arena page reclaimed, free stable OK", 49);
+            kprintln("reap: 6x mmap-arena page reclaimed, free stable OK", 50);
         } else {
             kprintln("reap: mmap-arena 2mb-region LEAK", 32);
         }
@@ -2785,11 +2792,11 @@ fn syscall_harden_selftest() {
     var efd = ksyscall(19, 0, 0, 0);           # epoll_create -> VFS_EPOLL
     if (efd < 0) { kprintln("shsys: epoll_create FAIL", 24); ok = 0; }
     # epoll_ctl on a NON-epoll fd must be refused
-    if (ffd >= 0) { if (ksyscall(20, ffd, 1, efd) == 0) { kprintln("shsys: epoll_ctl typeconf rej FAIL", 33); ok = 0; } }
+    if (ffd >= 0) { if (ksyscall(20, ffd, 1, efd) == 0) { kprintln("shsys: epoll_ctl typeconf rej FAIL", 34); ok = 0; } }
     # epoll_ctl on the real epoll fd with an in-range watch fd must succeed
     if (efd >= 0) { if (ksyscall(20, efd, 1, efd) != 0) { kprintln("shsys: epoll_ctl valid FAIL", 27); ok = 0; } }
     # epoll_ctl with an out-of-range watch fd must be refused (vs vfs_table OOB)
-    if (efd >= 0) { if (ksyscall(20, efd, 1, 9999) == 0) { kprintln("shsys: epoll wfd-bound rej FAIL", 30); ok = 0; } }
+    if (efd >= 0) { if (ksyscall(20, efd, 1, 9999) == 0) { kprintln("shsys: epoll wfd-bound rej FAIL", 31); ok = 0; } }
     # epoll_wait on a non-epoll fd must be refused
     if (ffd >= 0) { if (ksyscall(21, ffd, u + 256, 4) != (0 - 1)) { kprintln("shsys: epoll_wait typeconf rej FAIL", 35); ok = 0; } }
 

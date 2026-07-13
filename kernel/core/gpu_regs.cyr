@@ -207,6 +207,7 @@ var GPU_CP_MQD_CONTROL_VAL     = 0x100;       # PRIV_STATE, VMID 0
 var GPU_VM_RING_SUBOFF = 0x00000;   # PM4 ring (64 KB)
 var GPU_VM_MQD_SUBOFF  = 0x10000;   # MQD save-area (4 KB)
 var GPU_VM_RPTR_SUBOFF = 0x11000;   # rptr-report page
+var GPU_VM_SENT_SUBOFF = 0x12000;   # C2e sentinel slot (free 4 KB gap, rptr 0x11000..EOP 0x13000)
 var GPU_VM_EOP_SUBOFF  = 0x13000;   # EOP buffer (4 KB, 4 KB-aligned)
 
 # --- C2d: first PM4 packet + doorbell (the VM-fetch gate) ---
@@ -215,3 +216,17 @@ var GPU_R_CP_MEC_DOORBELL_RANGE_LOWER = 0x105C;  # byte-offset window low  (0)
 var GPU_R_CP_MEC_DOORBELL_RANGE_UPPER = 0x105D;  # byte-offset window high (>=0x18)
 var GPU_PM4_NOP8_HDR             = 0xC0061000;   # PACKET3(NOP, count=6) — an 8-dword type-3 NOP
 var GPU_DOORBELL_RANGE_UPPER_VAL = 0xE8;         # amdgpu (USERQUEUE_END*2)<<2; brackets our 0x18
+
+# --- C2e: WRITE_DATA fence (MEC executes + CPU-visible write; the coherence proof) ---
+# 5-dword PACKET3_WRITE_DATA writing one sentinel dword to the carveout sentinel slot.
+# Encoding confirmed verbatim vs amdgpu soc15d.h + the codebase NOP header (0xC0061000),
+# 4-agent derive + 2-lens adversarial verify, all refuted=False.
+var GPU_PM4_WRITE_DATA_HDR = 0xC0033700; # PACKET3(WRITE_DATA=0x37, count=3) -> 5-dword packet
+var GPU_PM4_WRITE_DATA_CTL = 0x00100500; # DST_SEL=5 (memory async-direct -> DRAM, bypasses GL2) | WR_CONFIRM(1<<20); ENGINE_SEL=ME(0)
+var GPU_C2E_SENTINEL       = 0xC2E0C2E0; # value the MEC must write (the fence witness)
+var GPU_C2E_NOTYET         = 0xDEADBEEF; # pre-seed marker: distinct from sentinel AND 0 (no stale/zero false-pass)
+# STAGED (row-2 coherence follow-up ONLY; do NOT wire into the first C2e burn — it would
+# collapse the executed-vs-coherent disambiguation). Verify CP_COHER_CNTL vs local gc_9_0
+# sh_mask.h before that burn (a wrong bit makes ACQUIRE_MEM a silent no-op).
+var GPU_PM4_ACQUIRE_MEM_HDR = 0xC0055800; # PACKET3(ACQUIRE_MEM=0x58, count=5) -> 7-dword packet
+var GPU_CP_COHER_CNTL_TCWB  = 0x00840000; # TC_WB_ACTION_ENA(1<<18) | TC_ACTION_ENA(1<<23)

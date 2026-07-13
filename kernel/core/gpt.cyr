@@ -474,7 +474,7 @@ fn gpt_init() {
         gpt_decode_header(gpt_header_buf);
         gpt_header_crc_ok = gpt_validate_header_crc(gpt_header_buf);
         if (gpt_header_crc_ok == 0) {
-            kprintln("gpt: backup header CRC mismatch — both copies bad", 49);
+            kprintln("gpt: backup header CRC mismatch -- both copies bad", 50);
             return 0;
         }
         gpt_using_backup_header = 1;
@@ -487,7 +487,7 @@ fn gpt_init() {
     # --- Phase 3: validate partition array CRC (streams across chunks) ---
     gpt_array_crc_ok = gpt_validate_array_crc();
     if (gpt_array_crc_ok == 0) {
-        kprintln("gpt: partition array CRC mismatch — proceeding (trust degraded)", 63);
+        kprintln("gpt: partition array CRC mismatch -- proceeding (trust degraded)", 64);
     }
 
     # Re-read first 4 KB of the array (validate_array_crc walked all 4

@@ -248,8 +248,8 @@ fn pmm_migrate_bitmap(bi) {
     if (ram_pages <= 65536) { return 0; }                 # <= 256 MB: the bootstrap bitmap already covers it
     var cap_pages = 16777216;                             # one 2 MB bitmap (2 MB * 8 bits) = 64 GB / 4 KB
     if (ram_pages > cap_pages) {
-        kprint("PMM: RAM > 64 GB — bitmap capped at 64 GB (", 47);
-        kprint_num(ram_pages); kprintln(" pages requested)", 16);
+        kprint("PMM: RAM > 64 GB -- bitmap capped at 64 GB (", 44);
+        kprint_num(ram_pages); kprintln(" pages requested)", 17);
         ram_pages = cap_pages;
     }
     var nb = pmm_alloc_2mb();                             # <= 256 MB, identity-reachable; all reservations done -> safe

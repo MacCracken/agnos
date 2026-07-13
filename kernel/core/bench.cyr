@@ -91,7 +91,7 @@ fn bench_run_all() {
         for (var i = 0; i < 256; i = i + 1) { memset(set_pg, 0, 4096); }
         t1 = rdtsc();
         pmm_free(set_pg);
-        kprint("  memset_1MB: ", 15);
+        kprint("  memset_1MB: ", 14);
         kprint_num((t1 - t0) / 1000);
         kprintln(" Kcycles", 8);
     }

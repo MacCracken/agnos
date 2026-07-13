@@ -293,7 +293,7 @@ fn r8169_phy_read(reg) {
 fn r8169_phy_init() {
     var bmcr = r8169_phy_read(R8169_PHY_BMCR);
     if (bmcr == 0xFFFF) {
-        kprintln("r8169: PHY MDIO read failed", 26);
+        kprintln("r8169: PHY MDIO read failed", 27);
         return 0;
     }
 
@@ -310,7 +310,7 @@ fn r8169_phy_init() {
     # PDOWN bit cleared, ANENABLE + ANRESTART set.
     var new_bmcr = (bmcr | R8169_BMCR_ANENABLE | R8169_BMCR_ANRESTART) & 0xF7FF;
     if (r8169_phy_write(R8169_PHY_BMCR, new_bmcr) == 0) {
-        kprintln("r8169: PHY MDIO write failed", 27);
+        kprintln("r8169: PHY MDIO write failed", 28);
         return 0;
     }
     kprintln("r8169: PHY autoneg kicked (link async)", 38);
@@ -413,7 +413,7 @@ fn r8169_probe() {
     var mmio = pci_bar_64(idx, 2);
     if (mmio == 0) { mmio = pci_bar_64(idx, 4); }
     if (mmio == 0) {
-        kprintln("r8169: no MMIO BAR (chip exposes I/O-port only?)", 47);
+        kprintln("r8169: no MMIO BAR (chip exposes I/O-port only?)", 48);
         return 0 - 1;
     }
 
@@ -523,7 +523,7 @@ fn r8169_init_rx() {
     }
 
     r8169_rx_idx = 0;
-    kprintln("r8169: RX ring up (64 desc × 2KB buf)", 36);
+    kprintln("r8169: RX ring up (64 desc x 2KB buf)", 37);
     return 0;
 }
 
@@ -809,13 +809,13 @@ fn r8169_init_tx() {
     r8169_write16(R8169_REG_ISR, 0xFFFF);               # drain stale bits (one-shot 0xFFFF is fine here)
     r8169_write16(R8169_REG_IMR, R8169_IMR_RXWAKE);     # unmask ROK|RER
     if (pci_enable_msi_vector(r8169_pci_idx, 0x50) == 0) {
-        kprintln("r8169: no MSI cap — RX stays timer-tick-drained", 47);
+        kprintln("r8169: no MSI cap -- RX stays timer-tick-drained", 48);
     } else {
-        kprintln("r8169: RX MSI armed -> IDT vector 0x50", 37);
+        kprintln("r8169: RX MSI armed -> IDT vector 0x50", 38);
     }
 
     r8169_tx_idx = 0;
-    kprintln("r8169: TX ring up (16 desc × 2KB buf)", 36);
+    kprintln("r8169: TX ring up (16 desc x 2KB buf)", 37);
     return 0;
 }
 

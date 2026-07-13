@@ -1556,7 +1556,7 @@ fn ext2_extent_add_sibling_leaf(inode_buf, lblk, nbd, inode_num) {
     var hdr = inode_buf + 40;
     var nent = ext2_load16_le(hdr, 2);
     if (nent >= 4) {                                          # inline root index full
-        kprintln("ext2: extent root index full -- depth-2 deferred (1.37.3)", 56);
+        kprintln("ext2: extent root index full -- depth-2 deferred (1.37.3)", 57);
         return 0;
     }
     var newleaf = ext2_alloc_block(nbd);                      # goal: near the data block
@@ -1636,7 +1636,7 @@ fn ext2_extent_add_leaf_to_idxblk(idxblk, lblk, nbd, inode_num, inode_buf) {
     var inent = ext2_load16_le(&ext2_indirect_buf_l1, 2);
     var imax  = ext2_load16_le(&ext2_indirect_buf_l1, 4);
     if (inent >= imax) {                                      # index block full → deeper split deferred
-        kprintln("ext2: extent index block full -- deeper split deferred", 53);
+        kprintln("ext2: extent index block full -- deeper split deferred", 54);
         return 0;
     }
     var newleaf = ext2_alloc_block(nbd);                      # goal: near the data block
@@ -4207,7 +4207,7 @@ fn ext2_multichunk_selftest() {
     else {
         var goal = ext2_first_data_block + hg * ext2_blocks_per_group;
         var blk  = ext2_alloc_block(goal);
-        if (blk <= 0) { kprintln("mc: high-alloc FAIL (alloc_block<=0)", 35); }
+        if (blk <= 0) { kprintln("mc: high-alloc FAIL (alloc_block<=0)", 36); }
         else {
             var bgrp = (blk - ext2_first_data_block) / ext2_blocks_per_group;
             if (bgrp >= ext2_groups_per_block) {
@@ -4409,7 +4409,7 @@ fn ext2_jbd2_probe() {
 
     ext2_jbd2_inum = ext2_sb_journal_inum(&ext2_sb_buf);
     if (ext2_jbd2_inum == 0) {
-        kprintln("jbd2: has_journal set but s_journal_inum=0 -- malformed", 56);
+        kprintln("jbd2: has_journal set but s_journal_inum=0 -- malformed", 55);
         # PROBE_OUTCOME stays 0xFF (preset above)
         return 0 - 2;
     }
@@ -5002,7 +5002,7 @@ fn ext2_jbd2_commit_tx() {
     # bits) — writing a tx for those would produce a journal replay rejects.
     var supported = JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_64BIT | JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3;
     if ((ext2_jbd2_feature_incompat & supported) != ext2_jbd2_feature_incompat) {
-        kprintln("jbd2: commit_tx: unsupported journal incompat features -- aborting", 65);
+        kprintln("jbd2: commit_tx: unsupported journal incompat features -- aborting", 66);
         ext2_jbd2_abort_tx();
         return 0 - 1;
     }
@@ -5091,7 +5091,7 @@ fn ext2_jbd2_commit_tx() {
     #    simultaneously, so journal returns to empty after every commit).
     ext2_jbd2_tx_seq_next = ext2_jbd2_tx_seq_next + 1;
     if (ext2_jbd2_rewrite_sb_clean(ext2_jbd2_tx_seq_next) != 0) {
-        kprintln("jbd2: commit_tx: SB-clean rewrite FAIL (journal may look dirty next mount)", 72);
+        kprintln("jbd2: commit_tx: SB-clean rewrite FAIL (journal may look dirty next mount)", 74);
         ext2_jbd2_tx_active = 0;
         ext2_jbd2_tx_count  = 0;
         return 0 - 1;
@@ -5307,7 +5307,7 @@ fn ext2_jbd2_integration_selftest() {
 
     # Integration check: tx_count > 0 iff put_inode routed through journal.
     if (ext2_jbd2_tx_count == 0) {
-        kprintln("jbd2-int: put_inode did NOT route through journal (integration broken)", 71);
+        kprintln("jbd2-int: put_inode did NOT route through journal (integration broken)", 70);
         ext2_jbd2_abort_tx();
         return 0 - 1;
     }

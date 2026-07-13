@@ -177,7 +177,7 @@ fn hid_kbd_configure(slot_id) {
     # Step 1a: read 9-byte config descriptor header to learn wTotalLength.
     xhci_zero_page(xhci_desc_buf_phys);
     if (xhci_get_config_descriptor(slot_id, 0, 9) == 0) {
-        kprintln("hid: get config descriptor (9) failed", 38);
+        kprintln("hid: get config descriptor (9) failed", 37);
         return 0;
     }
     var total_len = load16(xhci_desc_buf_phys + 2);

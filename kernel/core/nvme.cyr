@@ -1091,7 +1091,7 @@ fn nvme_blk_write_sectors(start, count, buf) {
 fn nvme_register_block_dev() {
     if (nvme_io_ready == 0) { return 0; }
     blk_register_nvme(nvme_ns1_nsze, nvme_ns1_lba_bytes);
-    kprint("nvme: registered as block_dev (", 32);
+    kprint("nvme: registered as block_dev (", 31);
     kprint_num(nvme_ns1_nsze);
     kprint(" LBAs x ", 8);
     kprint_num(nvme_ns1_lba_bytes);

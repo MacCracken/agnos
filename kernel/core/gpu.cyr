@@ -35,6 +35,8 @@ var gpu_arena_mc   = 0;      # MEC/FB-aperture MC address (pq_base = mc>>8)
 var gpu_arena_phys = 0;      # CPU physical address (UC-mapped)
 var gpu_queue_active = 0;    # C2c: 1 = MEC1/pipe0/queue0 mapped (HQD active, empty)
 var gpu_ring_fetched = 0;    # C2d: 1 = the MEC fetched+consumed a PM4 packet (VM-fetch gate open)
+var gpu_ring_wptr    = 0;    # CPU-canonical ring write cursor in DWORDS (C2d sets =8; C2e appends)
+var gpu_fence_ok     = 0;    # C2e: 1 = MEC executed WRITE_DATA AND the write is CPU-visible
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -1110,9 +1112,117 @@ fn gpu_ring_kick() {
     }
     if (fetched != 0 && gui == 0) {
         gpu_ring_fetched = 1;
+        gpu_ring_wptr = 8;   # canonical ring cursor after the 8-dword NOP kick; C2e appends here
         kprintln("gpu: C2d = PM4 FETCHED (rptr 0->8; the MEC ran the ring)", 56);
         return 1;
     }
     kprintln("gpu: C2d = NO FETCH (doorbell not honored / rptr stuck)", 55);
+    return 0;
+}
+# ── C2e — WRITE_DATA fence: the MEC executes + a CPU-visible write ─────────────
+# C2d proved the MEC FETCHES (rptr 0->8) but left two ambiguities: did it EXECUTE
+# (vs skip a NOP), and is a MEC memory write CPU-VISIBLE (C2d's memory rptr-report
+# read 0 from the CPU even as the register rptr read 8). C2e resolves both with ONE
+# UNCONDITIONAL PACKET3_WRITE_DATA that writes a known sentinel to a carveout slot the
+# CPU reads back. DST_SEL=5 (memory async-direct) targets DRAM, bypassing the GL2 path
+# that would strand the write — so "rptr advanced but sentinel stale" can ONLY mean a
+# coherence gap (retro-explaining C2d's rmem=0). NO ACQUIRE_MEM flush on this burn: it
+# would collapse the executed-vs-coherent disambiguation (the row-2 follow-up).
+# WEDGE-SAFE (same envelope as C2d): bounded watchdog only; every CPU access hits
+# decoded carveout DRAM / BAR5 regs; the MEC write targets OUR carveout (bus-master off
+# => it cannot reach system RAM); faults bounded by the 0x1FFC dummy-page net.
+# Derived + 2-lens adversarially verified vs PM4/soc15d.h — all refuted=False.
+fn gpu_fence() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_ring_fetched == 0) {
+        kprintln("gpu: C2e ABORT - queue not fetched (run C2d first)", 50);
+        return 0;
+    }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+
+    var sent_mc   = gpu_arena_mc   + GPU_VM_SENT_SUBOFF;   # MEC-side MC addr (FB aperture)
+    var sent_phys = gpu_arena_phys + GPU_VM_SENT_SUBOFF;   # CPU-side UC phys (same DRAM)
+
+    # Pre-seed a NOT-YET marker (!= sentinel AND != 0) so a stale/zero read can't false-pass.
+    store32(sent_phys, GPU_C2E_NOTYET);
+    gpu_mfence();
+
+    # Clear sticky VM fault-status (pulse CLEAR bit0, re-arm to the prior 0x1FFC net) so a
+    # post-kick fault!=0 unambiguously blames THIS WRITE_DATA.
+    var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
+
+    # Append the 5-dword WRITE_DATA packet at the tracked cursor (cursor is DWORDS -> *4).
+    var base = gpu_arena_phys + (gpu_ring_wptr << 2);
+    store32(base + 0x00, GPU_PM4_WRITE_DATA_HDR);        # PACKET3(WRITE_DATA, count=3)
+    store32(base + 0x04, GPU_PM4_WRITE_DATA_CTL);        # DST_SEL=5 (memory) | WR_CONFIRM
+    store32(base + 0x08, sent_mc & 0xFFFFFFFF);          # DST_ADDR_LO (MC/aperture, no PTs)
+    store32(base + 0x0C, (sent_mc >> 32) & 0xFFFFFFFF);  # DST_ADDR_HI
+    store32(base + 0x10, GPU_C2E_SENTINEL);              # DATA = sentinel to write
+    gpu_mfence();                                        # ring bytes visible before the kick
+
+    var new_wptr = gpu_ring_wptr + 5;                    # header + 4 body = 5 dwords
+
+    # Submit via the PROVEN register-wptr path (C2d: doorbell did NOT advance wptr; a direct
+    # CP_HQD_PQ_WPTR_LO write DID). GRBM-select the HQD, write wptr.
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
+
+    # BOUNDED watchdog (NEVER spin): poll BOTH the register rptr AND the sentinel, 100 ms cap.
+    var i = 0;
+    var rptr_ok = 0;
+    var sent_ok = 0;
+    var rreg = 0;
+    var sval = 0;
+    while (i < 1000) {
+        rreg = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR) & 0xFFFFFFFF;
+        sval = load32(sent_phys) & 0xFFFFFFFF;
+        if (rreg == new_wptr) { rptr_ok = 1; }
+        if (sval == GPU_C2E_SENTINEL) { sent_ok = 1; }
+        if (rptr_ok != 0 && sent_ok != 0) { i = 1000; }
+        else { gpu_udelay(100); i = i + 1; }
+    }
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);   # deselect
+
+    # Force UC-CPU / MC-async-write ordering before the authoritative read.
+    gpu_mfence();
+    var dummy = load32(sent_phys);                      # throwaway ordering read
+
+    var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+    var grbm  = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
+    var gui   = grbm & GPU_GRBM_GUI_ACTIVE;
+    sval = load32(sent_phys) & 0xFFFFFFFF;              # final authoritative readback
+
+    kprint("gpu: C2e sent=0x", 16);
+    kprint_hex(sval);
+    kprint(" rreg=0x", 8);
+    kprint_hex(rreg);
+    kprint(" wptr=0x", 8);
+    kprint_hex(new_wptr);
+    kprint(" fault=0x", 9);
+    kprint_hex(fault & 0xFFFFFFFF);
+    kprint(" grbm=0x", 8);
+    kprint_hex(grbm & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    gpu_ring_wptr = new_wptr;                           # advance cursor -> a re-run appends cleanly
+
+    if (fault != 0) {
+        kprintln("gpu: C2e = VM FAULT (WRITE_DATA addr faulted; served dummy)", 59);
+        return 0;
+    }
+    if (rptr_ok != 0 && sent_ok != 0 && gui == 0) {
+        gpu_fence_ok = 1;
+        kprintln("gpu: C2e = FENCE OK (MEC executed WRITE_DATA; CPU-visible write)", 64);
+        return 1;
+    }
+    if (rptr_ok != 0 && sent_ok == 0) {
+        kprintln("gpu: C2e = EXECUTED, NOT COHERENT (rptr advanced, sentinel stale)", 65);
+        return 0;
+    }
+    kprintln("gpu: C2e = NO EXEC (rptr stuck; WRITE_DATA not consumed)", 56);
     return 0;
 }
