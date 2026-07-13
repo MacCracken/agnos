@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.24] — 2026-07-13 — GPU arc C2g-1: match mabda's HW-proven Cezanne compute preamble
+
+**C2g-1 burn 6** (1.54.23) proved FORCE_SIMD_DIST had ZERO effect (sweep pattern bit-identical to burn 5),
+and four register fixes in a row (exec-set, START/RESTART, FSD) all did nothing while our dispatch packet
+matched tinygrad's. The breakthrough was checking **mabda** — the AGNOS GPU foundation library, whose
+pure-Cyrius native AMD path (`src/backend_native_pm4.cyr` `native_pm4_build_compute_generic`) runs
+multi-thread compute (LocalSize 4/8/16, `@workgroup_size(64)`, per-lane results correct) **HW-verified on
+AMD Cezanne — the same archaemenid chip.** Its compute-dispatch preamble differs from ours in four
+launch-relevant registers.
+
+### Fixed
+
+- **C2g-1 multi-thread wave launch — match mabda's proven Cezanne preamble** (`kernel/core/gpu.cyr` +
+  `kernel/core/gpu_regs.cyr`, all three compute dispatches: C2f, C2g-1, and the sweep):
+  - **`COMPUTE_STATIC_THREAD_MGMT` SE0=0xFFFFFFFF, SE1=0, SE2=0, SE3=0** — mabda: *"SE1 absent on
+    Cezanne."* We were setting SE1=0xFFFFFFFF, **enabling CUs on a non-existent shader engine** — the
+    prime suspect for the deterministic, width-dependent wave-launch failure (waves launched at
+    NUM_THREAD_X 8/48 but not 2/16/32/63/64) that FORCE_SIMD_DIST could not fix. Added the SE2/SE3=0
+    write (offset 0x219) we previously omitted.
+  - **`COMPUTE_DISPATCH_INITIATOR` 0x5 → 0x45** — set ORDER_MODE (bit 6), mabda/radeonsi's gfx9 value.
+  - **`COMPUTE_RESOURCE_LIMITS` → 0x140** (mabda's Mesa-verified value; was 0 / 0x00800000).
+  - **`COMPUTE_PGM_RSRC1` 0x00AC0040 → 0x2C0040** (mabda `GFX9_COMPUTE_PGM_RSRC1_MIN`; dropped IEEE_MODE).
+  Skipped mabda's TMPRING_SIZE / BC_BASE / COHER_START_DELAY / USER_DATA — C2f proves they are not
+  launch-required, and they are scratch/kernarg-specific (our hand-assembled shader uses neither).
+  Iron-only; flash `--update-all`. NB: mabda submits its IB via amdgpu DRM, so it is a reference for the
+  dispatch preamble + shader ISA but NOT the raw MQD/HQD/ring setup (agnos's C2c `gpu_queue_setup`) — if
+  the sweep is still MIXED after this, the residual is in agnos's own queue setup.
+
 ## [1.54.23] — 2026-07-13 — GPU arc C2g-1 root fix: FORCE_SIMD_DIST (SIMD round-robin routing)
 
 **C2g-1 burn 5** (1.54.22) proved the START/RESTART fix does NOT launch the 64-thread wave, but the
