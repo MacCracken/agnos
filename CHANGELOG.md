@@ -5,6 +5,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.11] — 2026-07-12 — log-capture fixes: console-write cap + relative-path creation
+
+Two tooling bugs surfaced while capturing the C2c iron log to a file (both post-boot, neither
+GPU-related). Fixed so `klug` and shell redirects can capture the full boot log to the agnos-fs.
+
+### Fixed
+
+- **Console writes truncated at 4 KB** (`core/devs.cyr` `serial_dev_write`) — the function capped
+  `count` at 4096 and returned that, so a single ring-3 `write(1, buf, n)` with `n > 4096` (e.g. `klug`
+  dumping the ~16–20 KB boot log to the console) silently emitted only the first 4 KB; the caller saw a
+  full-looking short return and didn't loop. Now writes the full `count` in ≤4096-byte chunks.
+- **Bare (relative) filenames couldn't be created** (`core/syscall.cyr` open handler `num==7`) — agnos
+  has no per-process CWD, and `vfs_resolve_mount` requires an absolute path, so a bare name (`touch
+  foo`, `cmd > foo`) resolved to `FS_NONE` and fell through to the **read-only initrd** → `EPERM` /
+  "cannot open redirect target". A relative name is now normalized to rooted-at-`/` (prepended into a
+  kernel scratch buffer) → routed to the writable ext2/primary root, identical to an absolute open.
+  Absolute paths are untouched (skip the normalization). This is the "CWD = /" convention; `mkdir`/
+  `unlink`/`rename` with relative paths are a follow-up (the capture path is open).
+
+### Notes
+
+- Effect: `klug > c2c.txt` (or any bare-name redirect) now writes the **complete** boot log to the
+  agnos-fs — mount it from Linux to read it, retiring the FB-photo channel. Includes C2c
+  (iron-validated at 1.54.10) unchanged. No new firmware; flash `--update-all`. Rubric/notes: agnosticos
+  `iron-nuc-zen-log.md`. Next: C2d (first PM4 packet — the VM-fetch gate).
+
 ## [1.54.10] — 2026-07-12 — GPU arc bite C2c: map an empty compute queue + klug 64 KB log ring
 
 **C2b was iron-validated on archaemenid** (1.54.9): GMC ARMED, and the CPU can R/W the carveout DRAM

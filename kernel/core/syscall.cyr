@@ -233,6 +233,13 @@ fn is_user_range(ptr, len) {
     return 1;
 }
 
+# A RELATIVE path (no leading '/') has no CWD in agnos, so it is rooted at the "/"
+# mount — the writable ext2/primary root. This scratch buffer holds the "/"-prepended
+# form so bare names (`touch foo`, `cmd > foo`) create in the root FS instead of
+# falling through to the read-only initrd (the open handler uses it; the ext2 lookup
+# needs the leading '/'). Single-threaded per syscall ⇒ one shared buffer is safe.
+var sc_open_abs[32];   # 256 bytes: '/' + up to 254-char relative name
+
 # 1.41.6 (#22): the path-argument preamble every mount-routed FS syscall shares —
 # a non-empty length AND a valid user range. Returns 1 if (ptr,len) is an
 # acceptable path argument, 0 otherwise. Pure factoring of the duplicated
@@ -1045,7 +1052,21 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # as the bare-name fallback. AO_DIRECTORY(0x800)→dir-fd (getdents);
         # AO_CREAT(0x100) creates if absent; AO_TRUNC(0x200) zeroes existing.
         if (sc_path_ok(arg1, arg2) == 0) { return 0 - 1; }
-        var be7 = vfs_resolve_mount(arg1, arg2);
+        # Normalize a RELATIVE name (no leading '/') to rooted-at-'/' — agnos has no
+        # CWD, so `touch foo` / `cmd > foo` land in the writable root FS instead of
+        # failing against the read-only initrd. Prepend '/' into a kernel scratch buffer
+        # + route THAT (the ext2 lookup needs the leading '/'). Absolute paths pass
+        # through untouched. (1.54.11: the redirect/touch-can't-create fix.)
+        var op_path = arg1;
+        var op_len  = arg2;
+        if (load8(arg1) != 47) {
+            store8(&sc_open_abs, 47);
+            var opi = 0;
+            while (opi < arg2 && opi < 254) { store8(&sc_open_abs + 1 + opi, load8(arg1 + opi)); opi = opi + 1; }
+            op_path = &sc_open_abs;
+            op_len  = opi + 1;
+        }
+        var be7 = vfs_resolve_mount(op_path, op_len);
         if (be7 == FS_EXT2) {
             # SMP sub-bite 5 (fs_lock): the ext2 open/create arm — lookup + (optional)
             # create + truncate + open all touch ext2 scratch. Locked at the syscall
@@ -1054,13 +1075,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # and none of them is independently fs_lock'd → single acquire, no nest.
             # INNER-WRAPPER form (one return point) so the lock can't leak.
             fs_spin_lock();
-            var ofd7 = sys_open_ext2_inner(arg1, arg2, arg3);
+            var ofd7 = sys_open_ext2_inner(op_path, op_len, arg3);
             fs_spin_unlock();
             return ofd7;
         }
         if (be7 == FS_FAT || be7 == FS_EXFAT) {
-            var roff = arg1 + vfs_mnt_reloff;
-            var rlen = arg2 - vfs_mnt_reloff;
+            var roff = op_path + vfs_mnt_reloff;
+            var rlen = op_len - vfs_mnt_reloff;
             if ((arg3 & 0x100) != 0) { vfs_create_on(be7, roff, rlen); }   # AO_CREAT
             # 1.41.7: write-access (AO_WRONLY/AO_RDWR, low 2 bits) → a write-back
             # fd that buffers content + flushes the whole file via vfs_write_on at

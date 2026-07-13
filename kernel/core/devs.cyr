@@ -59,8 +59,18 @@ fn serial_dev_read(buf, count) {
 # was running. 1.40.9 already proved ring-3→fb works (boot_info_copy fix), so
 # this just re-activates that path. kprint no-ops fb when fb_console_ready == 0.
 fn serial_dev_write(buf, count) {
-    if (count > 4096) { count = 4096; }
-    kprint(buf, count);
+    # Write the FULL count in <=4096-byte chunks. The old form CAPPED count at 4096
+    # and returned that, so a single ring-3 write(1, buf, n) with n>4096 (e.g. `klug`
+    # dumping the ~16-20 KB boot log) silently truncated to the first 4 KB — the caller
+    # saw a full-looking short return and did not loop. Chunking keeps whatever per-call
+    # bound the 4096 was for while emitting everything.
+    var off = 0;
+    while (off < count) {
+        var chunk = count - off;
+        if (chunk > 4096) { chunk = 4096; }
+        kprint(buf + off, chunk);
+        off = off + chunk;
+    }
     return count;
 }
 
