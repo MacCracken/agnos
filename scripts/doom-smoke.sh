@@ -30,8 +30,15 @@ WAD="$DOOM_ROOT/wad/DOOM1.WAD"
 [ -f "$WAD" ]     || { echo "ERROR: DOOM1.WAD not found at $WAD"; exit 1; }
 
 # Build the DOOM_SELFTEST kernel (runs /bin/doom from disk at boot).
-echo "[1/4] Building DOOM_SELFTEST kernel..."
-if ! env DOOM_SELFTEST=1 sh "$ROOT/scripts/build.sh" >/tmp/doom-smoke-build.log 2>&1; then
+# DOOM_DIRECTMAP=1 (set by doom-directmap-smoke.sh) makes the selftest run
+# `/bin/doom /DOOM1.WAD E1M1` so doom skips menu_run() and renders E1M1 at spawn
+# — the in-game 3D renderer is verified with NO keyboard input.
+if [ -n "${DOOM_DIRECTMAP:-}" ]; then
+    echo "[1/4] Building DOOM_SELFTEST kernel (DIRECT-MAP: E1M1 at spawn, no keyboard)..."
+else
+    echo "[1/4] Building DOOM_SELFTEST kernel..."
+fi
+if ! env DOOM_SELFTEST=1 DOOM_DIRECTMAP="${DOOM_DIRECTMAP:-}" sh "$ROOT/scripts/build.sh" >/tmp/doom-smoke-build.log 2>&1; then
     echo "  BUILD-FAIL (see /tmp/doom-smoke-build.log)"; tail -5 /tmp/doom-smoke-build.log; exit 1
 fi
 echo "  build/agnos $(stat -c %s "$AGNOS") B"
@@ -141,6 +148,47 @@ else
     echo "  FAIL: no screendump captured"; rc=1
 fi
 
+# DIRECT-MAP gate: with DOOM_DIRECTMAP the screendump is the live E1M1 3D view,
+# so assert the floor band looks like a textured flat (distinct colors/row in
+# [8..45]) — the same robust signature doom-ingame-smoke.py uses, but reached
+# WITHOUT any keyboard input. A textured flat measures ~11-30/row; a smear 1-4;
+# TITLEPIC art ~51-59. This is the keyboard-independent in-game render check.
+if [ -n "${DOOM_DIRECTMAP:-}" ] && [ -f "$PPM" ]; then
+    FLOOR=$(python3 - "$PPM" <<'PY'
+import sys
+d=open(sys.argv[1],'rb').read()
+parts=d.split(maxsplit=4)
+w,h=int(parts[1]),int(parts[2])
+off=d.index(parts[3])+len(parts[3])+1
+px=d[off:]
+scale=max(1,min(w//320,h//200))
+ok=chk=0; counts=[]
+for ey in range(140,165,4):
+    y=ey*scale
+    if y>=h: break
+    seen=set()
+    for ex in range(0,320,2):
+        o=(y*w+ex*scale)*3
+        seen.add(px[o:o+3])
+    chk+=1; counts.append(len(seen))
+    if 8<=len(seen)<=45: ok+=1
+print("%d %d %s"%(ok,chk,counts))
+PY
+)
+    FOK=$(echo "$FLOOR" | cut -d' ' -f1); FCHK=$(echo "$FLOOR" | cut -d' ' -f2)
+    FCOUNTS=$(echo "$FLOOR" | cut -d' ' -f3-)
+    echo "  direct-map floor band: $FCOUNTS (flat window [8..45])"
+    if [ "${FCHK:-0}" -gt 0 ] && [ "${FOK:-0}" -eq "${FCHK:-1}" ]; then
+        echo "  PASS: E1M1 floor renders as a textured flat (no keyboard needed)"
+    else
+        echo "  FAIL: direct-map floor band is not a textured flat"; rc=1
+    fi
+fi
+
 echo ""
-[ "$rc" -eq 0 ] && echo "doom-smoke: PASS — DOOM renders on AGNOS" || echo "doom-smoke: FAIL"
+if [ -n "${DOOM_DIRECTMAP:-}" ]; then
+    [ "$rc" -eq 0 ] && echo "doom-smoke: PASS — DOOM renders E1M1 3D view on AGNOS (direct-map)" || echo "doom-smoke: FAIL"
+else
+    [ "$rc" -eq 0 ] && echo "doom-smoke: PASS — DOOM renders on AGNOS" || echo "doom-smoke: FAIL"
+fi
 exit $rc

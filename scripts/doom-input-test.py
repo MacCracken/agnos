@@ -96,8 +96,13 @@ try:
     ca = colors(PPM_A)
     p(f"  [A] title screendump: {ca} colors")
 
-    # (1) movement key 'w' -> title should advance to the main menu
-    hmp("sendkey w"); time.sleep(2.0)
+    # (1) movement key 'w' -> title should advance to the main menu.
+    # HELD key (2026-07-12): a bare `sendkey w` releases so fast that the make
+    # AND break land in one input_poll drain — doom's persistent key_state nets
+    # back to 0 and no edge is seen. Hold ~HOLD ms so doom polls with the key
+    # down before the release. (The kernel scancode path is correct either way;
+    # this is a sendkey-cadence requirement for a cooperatively-polled IF=0 guest.)
+    hmp("sendkey w %d" % int(os.environ.get("DOOM_KEY_HOLD", "500"))); time.sleep(2.0)
     hmp("screendump %s" % PPM_B); time.sleep(1.0)
     cb = colors(PPM_B)
     p(f"  [B] post-'w' screendump: {cb} colors")
@@ -108,8 +113,8 @@ try:
     else:
         p("  FAIL: framebuffer unchanged after 'w' — movement input did not register"); rc = 1
 
-    # (2) quit key 'q' -> menu_run returns -1 -> doom exits
-    hmp("sendkey q"); time.sleep(3.0)
+    # (2) quit key 'q' -> menu_run returns -1 -> doom exits (held, see above)
+    hmp("sendkey q %d" % int(os.environ.get("DOOM_KEY_HOLD", "500"))); time.sleep(3.0)
     log = ser()
     if "quit from menu" in log or "exec: doom returned" in log:
         p("  PASS: 'q' quit doom (input_quit reached menu_run -> doom_exit)")

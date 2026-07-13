@@ -27,11 +27,6 @@ var hid_kbd_report_buf  = 0;
 var hid_kbd_xfer_idx    = 0;   # Next TRB slot on kbd ring (0..255)
 var hid_kbd_xfer_cycle  = 1;   # Producer cycle state for kbd ring
 
-# DBG (temporary input-delivery probe) — cumulative pipeline counters.
-var hid_dbg_drained   = 0;   # total event-ring TRBs consumed by hid_poll
-var hid_dbg_processed = 0;   # total kbd transfer events matched
-var hid_dbg_pushed    = 0;   # total scancodes pushed into kb_buf
-
 # Two 8-byte buffers: current and previous reports. Allocated statically
 # (BSS) rather than from PMM since the DMA buffer is hid_kbd_report_buf
 # (xHCI controller writes into that phys); these two copies are CPU-side
@@ -59,8 +54,6 @@ fn hid_kbd_init() {
 # (kernel/arch/x86_64/keyboard.cyr:3) implements for the PS/2 ISR path —
 # producer changes (HID), consumer (scancode_to_ascii) doesn't.
 fn hid_kb_push(scancode) {
-    hid_dbg_pushed = hid_dbg_pushed + 1;   # DBG
-    kprint("push sc=", 8); kprint_num(scancode); kputc(10);   # DBG
     # input_lock (keyboard.cyr): serialize the kb_head RMW vs the kb_isr IRQ1 producer
     # (same-CPU, excluded by cli-first) and a foreign-CPU accessor (cross-CPU spinlock).
     var f = kbd_irq_save();
@@ -477,7 +470,5 @@ fn hid_poll() {
         var new_erdp = xhci_evt_ring_phys + xhci_evt_ring_idx * 16;
         xhci_rt_write64(ir0 + XHCI_IR_ERDP, new_erdp | 0x8);
     }
-    hid_dbg_drained = hid_dbg_drained + drained;       # DBG
-    hid_dbg_processed = hid_dbg_processed + processed;  # DBG
     return processed;
 }

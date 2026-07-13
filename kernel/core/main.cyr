@@ -2351,7 +2351,15 @@ pipe_rc_selftest();
 # doom-smoke.sh screendumps the live framebuffer. "exec: doom returned" only
 # prints if doom exits (it shouldn't, with no quit input).
 kprintln("exec: running /bin/doom", 23);
+#ifdef DOOM_DIRECTMAP
+# Direct-map render smoke (DOOM_DIRECTMAP=1): pass an explicit WAD + map so doom's
+# direct_map path skips menu_run() and renders E1M1 at spawn — the in-game 3D
+# renderer is verified WITHOUT any keyboard input (scripts/doom-directmap-smoke.sh).
+sh_exec("run /bin/doom /DOOM1.WAD E1M1", 29);
+#endif
+#ifndef DOOM_DIRECTMAP
 sh_exec("run /bin/doom", 13);
+#endif
 kprintln("exec: doom returned", 19);
 #endif
 

@@ -176,6 +176,7 @@ else
         [ -n "$FAULT_SELFTEST" ]     && echo '#define FAULT_SELFTEST'
         [ -n "$PIPE_RC_SELFTEST" ]   && echo '#define PIPE_RC_SELFTEST'
         [ -n "$DOOM_SELFTEST" ]      && echo '#define DOOM_SELFTEST'
+        [ -n "$DOOM_DIRECTMAP" ]     && echo '#define DOOM_DIRECTMAP'
         [ -n "$AETHERSAFHA_SELFTEST" ] && echo '#define AETHERSAFHA_SELFTEST'
         [ -n "$AETHERSAFHA_SETU_SELFTEST" ] && echo '#define AETHERSAFHA_SETU_SELFTEST'
         [ -n "$DOOM_AUDIO_SELFTEST" ] && echo '#define DOOM_AUDIO_SELFTEST'
