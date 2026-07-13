@@ -1316,8 +1316,10 @@ fn gpu_shader_dispatch() {
     # 5. Register-wptr submit (proven C2d/C2e path). new_wptr == 52.
     var new_wptr = gpu_ring_wptr;
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);   # LO FIRST — matches the
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);          # proven C2d/C2e order; the CP
+    #   latches the 64-bit wptr on the HI write, sampling the LO already set (C2f burn 2 wrote HI first
+    #   -> latched the stale LO=13 -> wptr stuck at 13, queue never advanced).
     gpu_mfence();
 
     # 6. BOUNDED watchdog on the done-marker (100 ms cap; NEVER an unbounded spin).
@@ -1344,7 +1346,9 @@ fn gpu_shader_dispatch() {
 
     kprint("gpu: C2f rptr=0x", 16);
     kprint_hex(rreg);
-    kprint(" wptr=0x", 8);
+    kprint(" wr=0x", 6);
+    kprint_hex(new_wptr);
+    kprint(" wb=0x", 6);
     kprint_hex(wptr_rb);
     kprint(" act=0x", 7);
     kprint_hex(active);

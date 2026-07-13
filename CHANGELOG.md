@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.16] — 2026-07-13 — GPU arc C2f burn 2 fix: WPTR write order (LO before HI)
+
+**C2f burn 2** (1.54.15) localized the stall to the *submit*, not the ring program: `rptr=0xd wptr=0xd act=0x1`
+— the queue never advanced past where C2e left it (13), so the `SET_SH_REG`/`DISPATCH`/`CS_PARTIAL_FLUSH` ring
+program never ran. `gpu_shader_dispatch()` wrote `CP_HQD_PQ_WPTR_HI` then `WPTR_LO`, but C2d/C2e (which work)
+write `WPTR_LO` then `WPTR_HI` — the CP latches the 64-bit wptr on the **HI** write, sampling the LO already
+set, so writing HI first latched the stale `LO=13` and the later `LO=52` was never latched.
+
+### Fixed
+
+- **C2f WPTR submit order → `WPTR_LO` then `WPTR_HI`** — `kernel/core/gpu.cyr` `gpu_shader_dispatch()`: byte-match
+  the proven C2d/C2e register-wptr submit so the queue's wptr actually advances to 52 and the MEC fetches the
+  dispatch ring. Also split the report's wptr readout into `wr` (the value written — confirms `gpu_ring_put`
+  built the 52-dword cursor) vs `wb` (the register readback — confirms the submit landed), so burn 3 is
+  unambiguous. Iron-only; flash `--update-all`. Expected burn 3: `rptr` advances (the ring program finally
+  runs) → the real C2f verdict (`SHADER RAN` / `STORE STALE` / a genuine fence-stall). Rubric + burn history:
+  agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c2f`.
+
 ## [1.54.15] — 2026-07-13 — GPU arc C2f burn 1 diagnostic: read HQD state while GRBM-selected
 
 **C2f burn 1** (1.54.14) returned `NO RETIRE` — the dispatch ring stalled before the final `WRITE_DATA`
