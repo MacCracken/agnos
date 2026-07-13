@@ -5,6 +5,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.17] — 2026-07-13 — GPU arc bite C2g-1: first multi-thread compute dispatch (64 threads)
+
+**C2f was iron-validated** (1.54.16): a single-thread gfx90c shader ran on the cores and its store was
+CPU-visible. C2g-1 is sub-bite 1 of the C2g "rosnet matmul" crown — the first PARALLEL dispatch: a workgroup
+of 64 threads, each writing its own workitem-id to `out[tid]`, verified `out[i]==i` on the CPU.
+
+### Added
+
+- **First multi-thread dispatch (bite C2g-1)** — `kernel/core/gpu.cyr` `gpu_shader_dispatch2()`: an 11-dword
+  gfx90c shader where each of 64 lanes computes `out_addr = out_base + (v0<<2)` (v0 = SPI-loaded workitem-id)
+  and stores its tid — `v_lshlrev_b32 v3,2,v0` + `v_add_co_u32`/`v_addc_co_u32` (64-bit carry chain) +
+  `global_store_dword v[1:2],v0,off glc`. **Every shader dword is `llvm-mc -mcpu=gfx90c` ground-truth.** The
+  ring program is the C2f program with exactly ONE change — `COMPUTE_NUM_THREAD_X 1→64` (`DISPATCH_DIRECT` DIM
+  stays `1×1×1` = one workgroup of 64); the CPU pre-seeds a 64-dword output array, submits, and verifies all 64
+  `out[i]==i` (reporting `ok=N/64` + `firstbad`). `kernel/core/gpu_regs.cyr`: the C2g-1 constants.
+  - Output array at arena `+0x14800` (the C2f slot) — deliberately NOT `+0x15000`, which is the L2 fault-sink
+    dummy page (would alias faulting stores in + corrupt the fault signal).
+  - Pass signal: `gpu: C2g-1 = MULTI-THREAD OK (64/64 tids written; CPU-visible)` — parallel dispatch +
+    workitem-id + per-lane 64-bit addressing proven; the foundation for C2g-2 (kernargs) → C2g-4 (matmul).
+
+### Notes
+
+- Derived by a 9-agent workflow; the ISA was confirmed bit-for-bit by two adversarial skeptics AND assembled on
+  the real `gfx90c` target, which caught two burn-critical bugs pre-iron (the `+0x15000` dummy-page collision
+  and a wrong `v_lshlrev` opcode). **CPU-wedge-SAFE**: 64 lanes write distinct addresses in our carveout array;
+  bus-master off (cores reach only the FB aperture); a bad per-lane address faults into the `0x1FFC` dummy net;
+  straight-line shader can't hang; bounded 100 ms watchdog. The one thing the burn tests is dispatch-side
+  empirical (per-lane `v0=0..63` delivery + wave64 EXEC width) — the `firstbad`/`ok` readout pinpoints any
+  shortfall. No new firmware; flash `--update-all`. Iron-only; QEMU no-op. Rubric + falsification table:
+  agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c2g1`. Next: C2g-2 (kernargs) → C2g-3 (ALU+loop) → C2g-4
+  (rosnet matmul, the crown).
+
 ## [1.54.16] — 2026-07-13 — GPU arc C2f burn 2 fix: WPTR write order (LO before HI)
 
 **C2f burn 2** (1.54.15) localized the stall to the *submit*, not the ring program: `rptr=0xd wptr=0xd act=0x1`

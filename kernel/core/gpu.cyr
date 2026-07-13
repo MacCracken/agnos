@@ -38,6 +38,7 @@ var gpu_ring_fetched = 0;    # C2d: 1 = the MEC fetched+consumed a PM4 packet (V
 var gpu_ring_wptr    = 0;    # CPU-canonical ring write cursor in DWORDS (C2d sets =8; C2e/C2f append)
 var gpu_fence_ok     = 0;    # C2e: 1 = MEC executed WRITE_DATA AND the write is CPU-visible
 var gpu_shader_ok    = 0;    # C2f: 1 = shader RAN + store CPU-visible; -1 no-retire; -2 store-stale; -3 fault
+var gpu_mt_ok        = 0;    # C2g-1: 1 = all 64 tids written CPU-visible; -1 no-retire; -2 partial; -3 fault
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -1380,5 +1381,143 @@ fn gpu_shader_dispatch() {
     }
     gpu_shader_ok = 0 - 1;
     kprintln("gpu: C2f = NO RETIRE (dispatch not consumed / no wave)", 54);
+    return 0;
+}
+# ── C2g-1 — FIRST MULTI-THREAD compute dispatch (1 workgroup, 64 threads; out[tid]=tid) ──
+# The first parallel dispatch: 64 lanes each write their workitem-id to out[tid], CPU verifies
+# out[i]==i. Minimal delta on C2f — NUM_THREAD_X flips 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 =>
+# 64 threads in ONE workgroup), and the shader computes out[tid]=tid via v0(=workitem-id-X)<<2
+# folded into a 64-bit base (v_lshlrev + v_add_co/v_addc_co carry chain). ALL 11 shader dwords are
+# llvm-mc(-mcpu=gfx90c) ground-truth. Output ARRAY is at +0x14800 (the C2f slot) — NOT +0x15000
+# which is the dummy fault-sink page (would alias faulting stores in + corrupt the fault signal).
+# WEDGE-SAFE: straight-line shader (no loops); bus-master off (cores reach only the FB aperture);
+# a bad per-lane addr faults into the 0x1FFC dummy net (fault!=0); CPU runs a BOUNDED watchdog only.
+fn gpu_shader_dispatch2() {
+    gpu_mt_ok = 0;
+    if (gpu_present == 0) { return 0; }
+    if (gpu_shader_ok != 1) {
+        kprintln("gpu: C2g-1 ABORT - shader not proven (run C2f first)", 52);
+        return 0;
+    }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+
+    var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
+    var out_phys    = gpu_arena_phys + GPU_SHADER_OUT2_SUBOFF;
+    var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
+    var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;
+    var out_mc      = gpu_arena_mc   + GPU_SHADER_OUT2_SUBOFF;
+    var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
+
+    # 1. Write the 11-dword C2g-1 shader blob (out base COMPUTED from arena_mc).
+    store32(shader_phys + 0x00, 0x7E0202FF);              # v_mov_b32 v1, lit
+    store32(shader_phys + 0x04, out_mc & 0xFFFFFFFF);     #   = out base lo
+    store32(shader_phys + 0x08, 0x7E0402FF);              # v_mov_b32 v2, lit
+    store32(shader_phys + 0x0C, (out_mc >> 32) & 0xFFFFFFFF); # = out base hi
+    store32(shader_phys + 0x10, 0x24060082);              # v_lshlrev_b32 v3, 2, v0   (v3 = tid<<2)
+    store32(shader_phys + 0x14, 0x32020701);              # v_add_co_u32  v1, vcc, v1, v3
+    store32(shader_phys + 0x18, 0x38040480);              # v_addc_co_u32 v2, vcc, 0, v2, vcc
+    store32(shader_phys + 0x1C, 0xDC718000);              # global_store_dword v[1:2],v0,off glc
+    store32(shader_phys + 0x20, 0x007F0001);              #   (VADDR=v1, VDATA=v0=tid, SADDR=off)
+    store32(shader_phys + 0x24, 0xBF8C0F70);              # s_waitcnt vmcnt(0)
+    store32(shader_phys + 0x28, 0xBF810000);              # s_endpgm
+
+    # 2. Pre-seed all 64 output dwords + done with a NOT-YET marker (!= any tid 0..63, != done).
+    var s = 0;
+    while (s < GPU_MT_N) { store32(out_phys + (s << 2), GPU_MT_NOTYET); s = s + 1; }
+    store32(done_phys, GPU_MT_NOTYET);
+    gpu_mfence();
+
+    # 3. Pulse-clear + re-arm the fault-net so a post-dispatch fault!=0 blames C2g-1.
+    var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
+
+    # 4. Append the 39-dword ring program at gpu_ring_wptr (== 52 after C2f). ONLY delta vs C2f:
+    #    NUM_THREAD_X = 64 instead of 1.
+    var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
+    var pgm_hi = (shader_mc >> 40) & 0xFF;
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(GPU_MT_NUM_THREAD_X); gpu_ring_put(1); gpu_ring_put(1);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(GPU_CU_MASK_ALL);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
+    gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
+    gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
+    gpu_mfence();
+
+    # 5. Register-wptr submit (LO before HI — the CP latches the 64-bit wptr on the HI write).
+    var new_wptr = gpu_ring_wptr;
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
+    gpu_mfence();
+
+    # 6. BOUNDED watchdog on the done-marker (100 ms cap; NEVER an unbounded spin).
+    var ok = 0;
+    var i = 0;
+    while (i < 1000) {
+        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
+        else { gpu_udelay(100); i = i + 1; }
+    }
+    # Read per-queue state WHILE STILL GRBM-SELECTED (deselected reads hit the default queue).
+    var rreg    = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR)    & 0xFFFFFFFF;
+    var wptr_rb = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO) & 0xFFFFFFFF;
+    var active  = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_ACTIVE)     & 0xFFFFFFFF;
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+    gpu_mfence();
+
+    # 7. VERIFY out[i]==i for all 64; count correct + first-bad index.
+    var okcount  = 0;
+    var firstbad = 0 - 1;
+    var j = 0;
+    while (j < GPU_MT_N) {
+        var v = load32(out_phys + (j << 2)) & 0xFFFFFFFF;
+        if (v == j) { okcount = okcount + 1; }
+        else { if (firstbad < 0) { firstbad = j; } }
+        j = j + 1;
+    }
+    var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+    gpu_ring_wptr = new_wptr;
+
+    kprint("gpu: C2g-1 rptr=0x", 18);
+    kprint_hex(rreg);
+    kprint(" wr=0x", 6);
+    kprint_hex(new_wptr);
+    kprint(" wb=0x", 6);
+    kprint_hex(wptr_rb);
+    kprint(" act=0x", 7);
+    kprint_hex(active);
+    kprintln("", 0);
+    kprint("gpu: C2g-1 ok=", 14);
+    kprint_hex(okcount);
+    kprint("/64 firstbad=0x", 15);
+    kprint_hex(firstbad & 0xFFFFFFFF);
+    kprint(" fault=0x", 9);
+    kprint_hex(fault & 0xFFFFFFFF);
+    kprintln("", 0);
+
+    if (fault != 0) {
+        gpu_mt_ok = 0 - 3;
+        kprintln("gpu: C2g-1 = VM FAULT (multi-thread store faulted; served dummy)", 64);
+        return 0;
+    }
+    if (ok != 0) {
+        if (okcount == GPU_MT_N) {
+            gpu_mt_ok = 1;
+            kprintln("gpu: C2g-1 = MULTI-THREAD OK (64/64 tids written; CPU-visible)", 62);
+            return 1;
+        }
+        gpu_mt_ok = 0 - 2;
+        kprintln("gpu: C2g-1 = PARTIAL (dispatched; some tids stale/wrong)", 56);
+        return 0;
+    }
+    gpu_mt_ok = 0 - 1;
+    kprintln("gpu: C2g-1 = NO RETIRE (dispatch not consumed / no wave)", 56);
     return 0;
 }

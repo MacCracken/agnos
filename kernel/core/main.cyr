@@ -886,6 +886,12 @@ gpu_fence();
 # proven) inside gpu_shader_dispatch(). Same wedge-safe envelope. See kernel/core/gpu.cyr.
 gpu_shader_dispatch();
 
+# GPU arc C2g-1 (1.54.x) — first MULTI-THREAD dispatch: 64 threads in one workgroup, each writes
+# its workitem-id to out[tid]; CPU verifies out[i]==i. First sub-bite of the C2g matmul crown —
+# proves grid/workgroup dispatch + workitem-id read + per-thread 64-bit addressing. Gated on C2f
+# (shader proven) inside gpu_shader_dispatch2(). Same wedge-safe envelope. See kernel/core/gpu.cyr.
+gpu_shader_dispatch2();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif
