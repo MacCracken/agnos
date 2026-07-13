@@ -879,6 +879,13 @@ gpu_ring_kick();
 # C2d success inside gpu_fence(). Same wedge-safe envelope. See kernel/core/gpu.cyr gpu_fence().
 gpu_fence();
 
+# GPU arc C2f (1.54.x) — first hand-assembled gfx90c compute shader. A minimal single-thread
+# shader writes a constant to the carveout via global_store_dword; the CPU reads it back. First
+# arbitrary ISA on the shader cores. Ring program = SET_SH_REG compute config + DISPATCH_DIRECT +
+# CS_PARTIAL_FLUSH drain + ACQUIRE_MEM L2-writeback + WRITE_DATA done-marker. Gated on C2e (fence
+# proven) inside gpu_shader_dispatch(). Same wedge-safe envelope. See kernel/core/gpu.cyr.
+gpu_shader_dispatch();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

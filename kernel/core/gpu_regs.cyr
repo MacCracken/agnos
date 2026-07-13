@@ -230,3 +230,32 @@ var GPU_C2E_NOTYET         = 0xDEADBEEF; # pre-seed marker: distinct from sentin
 # sh_mask.h before that burn (a wrong bit makes ACQUIRE_MEM a silent no-op).
 var GPU_PM4_ACQUIRE_MEM_HDR = 0xC0055800; # PACKET3(ACQUIRE_MEM=0x58, count=5) -> 7-dword packet
 var GPU_CP_COHER_CNTL_TCWB  = 0x00840000; # TC_WB_ACTION_ENA(1<<18) | TC_ACTION_ENA(1<<23)
+
+# --- C2f: first hand-assembled gfx90c compute shader (DISPATCH_DIRECT) ---
+# All raw ISA/PM4 bytes CONFIRMED by 2 independent adversarial re-derivations (incl. reconstructing
+# LLVM D40493's global_store_dwordx2=0xDC748000 to the bit). 12-agent derive, 0 encoding refuted.
+var GPU_SHADER_SUBOFF      = 0x14000;    # shader blob (256-aligned: COMPUTE_PGM_LO = mc>>8 is exact)
+var GPU_SHADER_OUT_SUBOFF  = 0x14800;    # shader output slot
+var GPU_SHADER_DONE_SUBOFF = 0x14C00;    # dispatch done-marker slot
+var GPU_C2F_CONST          = 0xC2F0C2F0; # the value the shader writes (the RAN witness)
+var GPU_C2F_DONE           = 0xC2F0D02E; # done-marker value (dispatch retired + L2 flushed)
+# PM4 headers (rule: 0xC0000000 | (count<<16) | (op<<8); SET_SH count = num_values)
+var GPU_PM4_SET_SH_REG_N1  = 0xC0017600; # SET_SH_REG op0x76, 1 value
+var GPU_PM4_SET_SH_REG_N2  = 0xC0027600; # SET_SH_REG op0x76, 2 values
+var GPU_PM4_SET_SH_REG_N3  = 0xC0037600; # SET_SH_REG op0x76, 3 values
+var GPU_PM4_DISPATCH_DIRECT_HDR = 0xC0031502; # DISPATCH_DIRECT op0x15, count3, SHADER_TYPE=compute(bit1)
+var GPU_PM4_EVENT_WRITE_HDR = 0xC0004600; # EVENT_WRITE op0x46, count0 (the CS_PARTIAL_FLUSH drain)
+var GPU_EVENT_CS_PARTIAL_FLUSH = 0x00000407; # EVENT_TYPE=0x07 | EVENT_INDEX=4<<8 (drain compute waves)
+var GPU_DISPATCH_INITIATOR = 0x00000005; # COMPUTE_SHADER_EN | FORCE_START_AT_000
+var GPU_COMPUTE_PGM_RSRC1_MIN = 0x00AC0040; # 4 VGPR / 16 SGPR (over-provisioned) / FP=0xC0 / DX10_CLAMP / IEEE
+var GPU_CU_MASK_ALL        = 0xFFFFFFFF;  # STATIC_THREAD_MGMT_SE* CU-enable (else zero CUs launch, silent no-op)
+# SET_SH packet reg offsets (absolute GC dword - 0x2C00)
+var GPU_SH_COMPUTE_NUM_THREAD_X    = 0x207;
+var GPU_SH_COMPUTE_PGM_LO          = 0x20C;
+var GPU_SH_COMPUTE_PGM_RSRC1       = 0x212;
+var GPU_SH_COMPUTE_RESOURCE_LIMITS = 0x215;
+var GPU_SH_COMPUTE_STATIC_SE0      = 0x216;
+# ACQUIRE_MEM body (whole-cache TC write-back; header + coher-cntl reuse the C2e-staged consts)
+var GPU_ACQUIRE_COHER_SIZE    = 0xFFFFFFFF;
+var GPU_ACQUIRE_COHER_SIZE_HI = 0x00FFFFFF;
+var GPU_ACQUIRE_POLL          = 0x0000000A;

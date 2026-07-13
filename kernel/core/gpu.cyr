@@ -35,8 +35,9 @@ var gpu_arena_mc   = 0;      # MEC/FB-aperture MC address (pq_base = mc>>8)
 var gpu_arena_phys = 0;      # CPU physical address (UC-mapped)
 var gpu_queue_active = 0;    # C2c: 1 = MEC1/pipe0/queue0 mapped (HQD active, empty)
 var gpu_ring_fetched = 0;    # C2d: 1 = the MEC fetched+consumed a PM4 packet (VM-fetch gate open)
-var gpu_ring_wptr    = 0;    # CPU-canonical ring write cursor in DWORDS (C2d sets =8; C2e appends)
+var gpu_ring_wptr    = 0;    # CPU-canonical ring write cursor in DWORDS (C2d sets =8; C2e/C2f append)
 var gpu_fence_ok     = 0;    # C2e: 1 = MEC executed WRITE_DATA AND the write is CPU-visible
+var gpu_shader_ok    = 0;    # C2f: 1 = shader RAN + store CPU-visible; -1 no-retire; -2 store-stale; -3 fault
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -1224,5 +1225,146 @@ fn gpu_fence() {
         return 0;
     }
     kprintln("gpu: C2e = NO EXEC (rptr stuck; WRITE_DATA not consumed)", 56);
+    return 0;
+}
+# ── C2f — first hand-assembled gfx90c compute shader (DISPATCH_DIRECT) ─────────
+# The FIRST arbitrary ISA on the shader cores. A minimal single-thread (1x1x1) shader
+# writes constant 0xC2F0C2F0 to a carveout slot via global_store_dword (GLC=1), and the
+# CPU reads it back. Every ISA/PM4 byte is adversarially confirmed (incl. reconstructing
+# LLVM D40493's global_store_dwordx2=0xDC748000 to the bit); scalar SMEM stores don't
+# exist on gfx9 so we use a VECTOR store, which reuses the C2b-proven L2/UTCL2 datapath.
+# A shader store lands in GL2 (unlike C2e's CP WRITE_DATA straight to MC), so the ring
+# program appends CS_PARTIAL_FLUSH (drain waves) + ACQUIRE_MEM (TC write-back GL2->DRAM)
+# BEFORE the C2e-proven WRITE_DATA done-marker — so a visible done-marker means
+# "waves retired AND L2 flushed". Submit via the proven register-wptr path.
+# WEDGE-SAFE: our ~6-instr straight-line shader (no loops, ends s_endpgm) on OUR carveout;
+# cores reach only the FB aperture (bus-master off => no system RAM); a bad store faults
+# into the 0x1FFC dummy-page net; the CPU only ever runs a BOUNDED watchdog on the marker.
+# gpu_ring_put appends one dword at the tracked cursor and advances it.
+fn gpu_ring_put(val) {
+    store32(gpu_arena_phys + (gpu_ring_wptr << 2), val & 0xFFFFFFFF);
+    gpu_ring_wptr = gpu_ring_wptr + 1;
+    return 0;
+}
+fn gpu_shader_dispatch() {
+    gpu_shader_ok = 0;
+    if (gpu_present == 0) { return 0; }
+    if (gpu_fence_ok == 0) {
+        kprintln("gpu: C2f ABORT - fence not proven (run C2e first)", 49);
+        return 0;
+    }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+
+    var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
+    var out_phys    = gpu_arena_phys + GPU_SHADER_OUT_SUBOFF;
+    var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
+    var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;       # COMPUTE_PGM src
+    var out_mc      = gpu_arena_mc   + GPU_SHADER_OUT_SUBOFF;   # what the shader stores to
+    var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;  # WRITE_DATA marker dst
+
+    # 1. Write the 10-dword shader blob at arena+0x14000. The store-target address (v0/v1)
+    #    is COMPUTED from arena_mc, not hardcoded, so it tracks the real FB base.
+    store32(shader_phys + 0x00, 0x7E0002FF);              # v_mov_b32 v0, lit
+    store32(shader_phys + 0x04, out_mc & 0xFFFFFFFF);     #   = out addr lo
+    store32(shader_phys + 0x08, 0x7E0202FF);              # v_mov_b32 v1, lit
+    store32(shader_phys + 0x0C, (out_mc >> 32) & 0xFFFFFFFF); # = out addr hi
+    store32(shader_phys + 0x10, 0x7E0402FF);              # v_mov_b32 v2, lit
+    store32(shader_phys + 0x14, GPU_C2F_CONST);           #   = 0xC2F0C2F0
+    store32(shader_phys + 0x18, 0xDC718000);              # global_store_dword v[0:1],v2,off glc
+    store32(shader_phys + 0x1C, 0x007F0200);              #   (VADDR=v0, VDATA=v2, SADDR=off=0x7F)
+    store32(shader_phys + 0x20, 0xBF8C0F70);              # s_waitcnt vmcnt(0)
+    store32(shader_phys + 0x24, 0xBF810000);              # s_endpgm
+
+    # 2. Pre-seed out + done with a NOT-YET marker (!= const/done AND != 0) so a stale/zero
+    #    read cannot false-pass.
+    store32(out_phys,  0xDEADBEEF);
+    store32(done_phys, 0xDEADBEEF);
+    gpu_mfence();
+
+    # 3. Pulse-clear + re-arm the fault-net so a post-dispatch fault!=0 blames C2f.
+    var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
+
+    # 4. Append the 39-dword C2f ring program at gpu_ring_wptr (== 13).
+    var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
+    var pgm_hi = (shader_mc >> 40) & 0xFF;
+    # SET_SH COMPUTE_PGM_LO/HI
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
+    # SET_SH COMPUTE_PGM_RSRC1/2
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(0);
+    # SET_SH COMPUTE_NUM_THREAD_X/Y/Z = 1,1,1
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1);
+    # SET_SH COMPUTE_STATIC_THREAD_MGMT_SE0/SE1 = all-CUs (else zero waves launch)
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(GPU_CU_MASK_ALL);
+    # SET_SH COMPUTE_RESOURCE_LIMITS = 0 (no caps)
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(0);
+    # DISPATCH_DIRECT 1x1x1
+    gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
+    # EVENT_WRITE CS_PARTIAL_FLUSH (drain the compute waves before the flush)
+    gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
+    # ACQUIRE_MEM whole-cache TC write-back (GL2 -> DRAM, so the CPU UC read sees the store)
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    # WRITE_DATA done-marker (C2e-proven DST_SEL=5 path -> CPU-visible completion signal)
+    gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
+    gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
+    gpu_mfence();
+
+    # 5. Register-wptr submit (proven C2d/C2e path). new_wptr == 52.
+    var new_wptr = gpu_ring_wptr;
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
+    gpu_mfence();
+
+    # 6. BOUNDED watchdog on the done-marker (100 ms cap; NEVER an unbounded spin).
+    var ok = 0;
+    var i = 0;
+    while (i < 1000) {
+        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
+        else { gpu_udelay(100); i = i + 1; }
+    }
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);   # deselect
+    gpu_mfence();
+    var drain = load32(done_phys);                            # ordering read
+
+    # 7. Readback + classify.
+    var outv  = load32(out_phys) & 0xFFFFFFFF;
+    var donev = load32(done_phys) & 0xFFFFFFFF;
+    var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+    var rreg  = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR) & 0xFFFFFFFF;
+
+    kprint("gpu: C2f out=0x", 15);
+    kprint_hex(outv);
+    kprint(" done=0x", 8);
+    kprint_hex(donev);
+    kprint(" fault=0x", 9);
+    kprint_hex(fault & 0xFFFFFFFF);
+    kprint(" rptr=0x", 8);
+    kprint_hex(rreg);
+    kprintln("", 0);
+
+    gpu_ring_wptr = new_wptr;   # cursor authoritative for any re-run
+
+    if (fault != 0) {
+        gpu_shader_ok = 0 - 3;
+        kprintln("gpu: C2f = VM FAULT (shader store faulted; served dummy)", 56);
+        return 0;
+    }
+    if (ok != 0) {
+        if (outv == GPU_C2F_CONST) {
+            gpu_shader_ok = 1;
+            kprintln("gpu: C2f = SHADER RAN (wrote 0xC2F0C2F0; CPU-visible)", 53);
+            return 1;
+        }
+        gpu_shader_ok = 0 - 2;
+        kprintln("gpu: C2f = STORE STALE (dispatched; write not CPU-visible)", 58);
+        return 0;
+    }
+    gpu_shader_ok = 0 - 1;
+    kprintln("gpu: C2f = NO RETIRE (dispatch not consumed / no wave)", 54);
     return 0;
 }

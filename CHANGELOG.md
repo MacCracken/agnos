@@ -5,6 +5,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.14] — 2026-07-12 — GPU arc bite C2f: first hand-assembled gfx90c compute shader (DISPATCH_DIRECT)
+
+**C2e was iron-validated** (1.54.13): the MEC executes PM4 and a CP `WRITE_DATA` reaches CPU-visible DRAM.
+C2f is the largest, highest-risk bite of the arc — the FIRST time agnos runs its own hand-assembled machine
+code on the GPU shader cores, with no amdgpu/ROCm anywhere. A minimal single-thread shader writes a known
+constant to a carveout slot; the CPU reads it back.
+
+### Added
+
+- **First gfx90c compute shader (bite C2f)** — `kernel/core/gpu.cyr` `gpu_shader_dispatch()` (+ `gpu_ring_put`
+  ring-append helper): writes a 10-dword hand-assembled gfx90c shader to the carveout at arena `+0x14000`
+  (`v_mov_b32 v0/v1/v2` + `global_store_dword v[0:1],v2,off glc` + `s_waitcnt vmcnt(0)` + `s_endpgm`; scalar
+  SMEM stores don't exist on gfx9, so a vector store reusing the C2b-proven L2/UTCL2 datapath), then appends a
+  39-dword ring program (wptr 13→52) — `SET_SH_REG` ×5 to program `COMPUTE_PGM_LO/HI`, `PGM_RSRC1`
+  (`0x00AC0040`), `NUM_THREAD_X/Y/Z=1`, `STATIC_THREAD_MGMT_SE0/SE1=0xFFFFFFFF` (CU-enable), `RESOURCE_LIMITS`;
+  then `DISPATCH_DIRECT 1×1×1`; then `CS_PARTIAL_FLUSH` (drain waves) + `ACQUIRE_MEM` TC write-back (GL2→DRAM,
+  because a shader store lands in GL2 — C2e's DST_SEL=5 coherence does not transfer); then the C2e-proven
+  `WRITE_DATA` done-marker — submitted via the register-wptr path. The shader's store address is computed from
+  `gpu_arena_mc` at runtime. `kernel/core/gpu_regs.cyr`: the C2f `SET_SH_REG`/`DISPATCH`/`ACQUIRE_MEM` constants.
+  - Pass signal: `gpu: C2f = SHADER RAN (wrote 0xC2F0C2F0; CPU-visible)` — first sovereign compute-shader
+    execution on the cores; the readback path C2g (rosnet matmul) stands on.
+
+### Notes
+
+- **Every raw ISA/PM4 byte is CONFIRMED** by a 12-agent derivation (5 dims + 6 adversarial verifiers + synth,
+  0 encoding refuted) — the `global_store_dword` encoding was reconstructed to the bit from LLVM D40493's
+  `global_store_dwordx2=0xDC748000`; the skeptics caught + fixed `SET_SH_REG count=num_values`, the 39-dword
+  total, and the missing CU-enable masks. **CPU-wedge-SAFE**: our ~6-instruction straight-line shader (no loops,
+  ends `s_endpgm`) on our carveout; cores reach only the FB aperture (bus-master off → no system RAM); a bad
+  store faults into the `0x1FFC` dummy-page net; the CPU only runs a bounded 100 ms watchdog. Residuals are
+  behavioral/empirical (EXEC auto-init, `CS_PARTIAL_FLUSH` on the non-HWS queue, shader→CPU coherence on this
+  UMA part) — **none an unverified opcode** — each with a pre-encoded pivot (`s_mov_b64 exec,1`; `RELEASE_MEM`
+  EOP fence; `SLC=1`/HDP flush). No new firmware; flash `--update-all`. Iron-only; QEMU no-op. Rubric +
+  falsification table: agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c2f`. Next: C2g (rosnet matmul on the
+  cores — the crown).
+
 ## [1.54.13] — 2026-07-12 — GPU arc bite C2e: WRITE_DATA fence (the MEC executes + a CPU-visible write) + kernel-wide kprint log hygiene
 
 **C2d was iron-validated** (1.54.12): the MEC fetches PM4 packets (rptr 0→8), and the ring GPUVA translates
