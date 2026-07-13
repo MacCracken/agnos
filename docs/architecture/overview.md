@@ -1,8 +1,8 @@
 # AGNOS Kernel Architecture
 
-> **Last Updated**: 2026-06-10 (v1.44.x preemptive-ring-3 arc)
+> **Last Updated**: 2026-07-13 (v1.54.x GPU / sovereign-compute arc)
 >
-> Multi-arch (x86_64 primary; aarch64 non-primary), **43 syscalls (0–42)**, 40+ subsystems. Built with cyrius 6.0.56 (pinned in `cyrius.cyml`). Production x86_64 multiboot2 kernel is **1,141,840 B**. Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+). **Iron-validated on archaemenid (NUC AMD Zen)**: boot-to-shell MVP cleared at Attempt 68 (1.30.9) with a typeable USB-HID keyboard; the storage stack (NVMe/AHCI/USB-MS), the r8169 NIC + DHCP networking stack, ext2/4 write, and exec-from-disk (a static ELF64 program run in ring 3 from the FS, 1.40.x) all iron-validated since. **The interactive shell is the userland `agnsh` (agnoshi), exec'd in ring 3 off the ext2 root by kybernet (PID 1, 1.41.4)** — the first userland binary promoted to a system component; the in-kernel `shell()` shrank to a recovery REPL (1.41.9). The 1.43.x graphics/input arc is **iron-complete** (burn 1439 plays cyrius-doom in-game on real Zen, keyboard-driven). The 1.42.x perf/hardening + sysinfo/klug arc and the 1.44.x preemptive-ring-3 / multi-threading arc are **QEMU-validated, iron-pending**. See [`../development/state.md`](../development/state.md) for the live subsystem rollup + open items.
+> Multi-arch (x86_64 primary; aarch64 non-primary), **syscalls 0–81** (dispatch reaches #81), 40+ subsystems. Built with cyrius 6.0.56 (pinned in `cyrius.cyml`). The x86_64 multiboot2 kernel has grown past **1.4 MB** (live size in [`../development/state.md`](../development/state.md)). Identity-maps 0–4 GB so QEMU's ACPI tables (~`0x07FE0000`) are reachable. Memory isolation under SMAP verified at boot via `stac`/`clac`-bracketed test (`Memory isolation: PASS` checkpoint, v1.27.1+). **Iron-validated on archaemenid (NUC AMD Zen)**: boot-to-shell MVP cleared at Attempt 68 (1.30.9) with a typeable USB-HID keyboard; the storage stack (NVMe/AHCI/USB-MS), the r8169 NIC + DHCP networking stack, ext2/4 write, and exec-from-disk (a static ELF64 program run in ring 3 from the FS, 1.40.x) all iron-validated since. **The interactive shell is the userland `agnsh` (agnoshi), exec'd in ring 3 off the ext2 root by kybernet (PID 1, 1.41.4)** — the first userland binary promoted to a system component; the in-kernel `shell()` shrank to a recovery REPL (1.41.9). The 1.43.x graphics/input arc is **iron-complete** (burn 1439 plays cyrius-doom in-game on real Zen, keyboard-driven). The kernel has since advanced to **1.54.19**: the **1.52.x HDA audio** arc (ring-3 `snd_*` #64–69 + two-process mixing), the **1.53.x raw-block / native-install** arc (`blk_*` #75–81, userland GPT/mkfs), and the **1.54.x GPU / sovereign-compute** arc (AMD gfx90c, iron-only) have all **iron-validated on archaemenid** since. The 1.42.x perf/hardening + sysinfo/klug and 1.44.x preemptive-ring-3 / multi-threading arcs were QEMU-validated at the time of writing. See [`../development/state.md`](../development/state.md) for the live subsystem rollup + open items.
 >
 > For live binary sizes per arch, per-cut size trajectory, source line counts, sibling pins, and test surface, see [`../development/state.md`](../development/state.md).
 
@@ -23,11 +23,13 @@ UEFI firmware
         -> ELF loader, VFS, initrd, device drivers
         -> PCI scan; storage (NVMe / AHCI / USB-MS / VirtIO-Blk / RAM-disk + 5-backend block layer + GPT)
         -> networking (VirtIO-Net / r8169 GbE + ARP/IPv4/UDP/TCP + DHCP)
+        -> GPU: PCI probe -> PSP fw-load -> engine start -> GPUVM/FB-aperture -> compute queue (iron-only, no-op if no AMD GPU)
         -> filesystems read+write (mount-routed VFS: ext2/ext4 at "/", FAT12/16/32 + exFAT at /mnt/*)
         -> Native xHCI + USB-HID-boot keyboard (Phase 1-5)
         -> SMP init (APIC, IPI, trampoline, per-CPU stacks)
-        -> 43 syscalls 0-42 (FS verbs, signals, epoll, timerfd, pipes, mmap/munmap, exec-by-path,
-             uname/sysinfo/klug, execwait, fbinfo/blit/uptime_ms/sleep_ms/kbscan)
+        -> syscalls 0-81 (FS verbs, signals, epoll, timerfd, pipes, mmap/munmap, exec-by-path,
+             uname/sysinfo/klug, execwait, fbinfo/blit/uptime_ms/sleep_ms/kbscan, snd_* audio #64-69,
+             shm #71-74, raw-block blk_* #75-81 with blk_write#78 gated)
         -> preemptive ring-3 scheduler (kthread_create + preempt gate, timer-driven time-slicing)
         -> kybernet (PID 1) -> exec /bin/agnsh (userland shell, ring 3) | in-kernel recovery shell on fallback
 ```
@@ -60,6 +62,10 @@ qemu-system-aarch64 -M virt
 0x200000 - 0x1000000 Available physical memory (2 MB - 16 MB)
 0xFEE00000           Local APIC MMIO
 0xFED90000+          IOMMU (VT-d) register window when ACPI DMAR is present
+BAR5 (PCI-assigned)  AMD GPU MMIO register aperture — 512 KB (0x80000), UC-mapped (VA==PA). Iron-only; absent w/o an AMD GPU.
+0xF70000000+         GPU UMA compute carveout (CPU-physical) via the BIOS FB aperture — 3 GB (MC base 0xF400000000);
+                     the compute arena sits at +0x80000000 = CPU-phys 0xFF0000000 / MC 0xF480000000 (2 MB UC),
+                     reached with ZERO page tables (no GART). Values from gpu_regs.cyr / gpu_vm_setup() in kernel/core/.
 ```
 
 Live binary size + per-cut trajectory lives in [`../development/state.md`](../development/state.md). Identity-map ceiling extended to 4 GB at v1.25.0 so QEMU's ACPI tables resolve; the per-process PD-copy loop at `proc_create_address_space` mirrors that ceiling into every address space (v1.25.1). The XHCI BAR for AMD FCH 1022:1639 sits below 4 GB and is remapped strict-UC (PWT=1+PCD=1+PAT=0) on top of the identity map per Repair (X) at v1.30.x (kernel/core/vmm.cyr `vmm_remap_uc_2mb`).
@@ -80,7 +86,7 @@ Live binary size + per-cut trajectory lives in [`../development/state.md`](../de
 │              kybernet (PID 1 Init)                       │
 │   loads /bin/agnsh, exec_and_wait in ring 3, proc_reap   │
 ├─────────────────────────────────────────────────────────┤
-│         Syscall Interface (43 syscalls, 0-42)            │
+│        Syscall Interface (0-81; dispatch reaches #81)   │
 │  exit(0) write(1) getpid(2) spawn(3) waitpid(4)        │
 │  read(5) close(6) open(7) dup(8) mkdir(9) rmdir(10)    │
 │  mount(11) sync(12) reboot(13) pause(14) getuid(15)    │
@@ -95,6 +101,10 @@ Live binary size + per-cut trajectory lives in [`../development/state.md`](../de
 │  kbscan(42)                       [1.43.x gfx/timing/in]│
 │  [26 write_boot_checkpoint = diagnostic]                │
 │  [waitpid(4) NON-BLOCKING poll since 1.44.9: -2=WOULDBLK]│
+│  43-63 spawn_path/getrandom/net/present/winsize/symlink │
+│  snd_* audio 64-69 (1.52.x) · readlink 70 · shm 71-74   │
+│  raw-block blk_* 75-80 + readdir 81 (1.53.10; write#78 gated) │
+│  [no GPU syscall row yet — ring-3 gpu_* band is C2h]     │
 ├──────────────────┬──────────────────────────────────────┤
 │  ELF Loader      │  VFS — mount-routed (prefix → backend)│
 │  static ELF64    │   ext2-file/dir, FAT/exFAT write-fd,  │
@@ -124,6 +134,11 @@ Live binary size + per-cut trajectory lives in [`../development/state.md`](../de
 │  Timer (APIC ~100Hz)          │  Keyboard (PS/2 + USB-HID-boot via xHCI) │
 │  PIC (8259A)  Local APIC      │  IDT (256 vectors)      │
 │  GDT (5 seg + TSS)            │  Serial (COM1 0x3F8)    │
+├─────────────────────────────────────────────────────────┤
+│  GPU / DRM (AMD gfx90c, iron only) — PCI probe + BAR5,   │
+│  PSP fw-load → MEC compute engine, FB-aperture GPUVM     │
+│  (zero page tables), PM4 ring → hand-assembled gfx90c    │
+│  shader dispatch (1.54.x). No-op without an AMD GPU.     │
 ├─────────────────────────────────────────────────────────┤
 │           Path-C sovereign boot-info ABI (v1.30.0+)      │
 │      gnoboot (UEFI) → RDI = &boot_info → ELF64 entry     │
@@ -174,3 +189,18 @@ A tag-based **block layer** (`kernel/core/block.cyr`) dispatches to five backend
 The VFS is **mount-routed** (1.40.13): a `{prefix → backend}` registry with a longest-prefix resolver (`vfs_mount_init` / `vfs_resolve_mount` / the `vfs_*_on` dispatchers) lets **ext2 own `/`, FAT live at `/mnt/fat`, and exFAT at `/mnt/exfat` all at once** — every verb resolves an absolute path to its owning backend, rather than routing by a single `ext2_active` flag. This was the load-bearing half of the 1.39.x generic-write lift: without it the shell could not reach FAT/exFAT on any box where ext2 was mounted at `/` (every real boot). The 1.39.x lift itself reached the write/dir verbs across FAT32 + exFAT via the generic per-FS `vfs_*_on` dispatch.
 
 **FAT/exFAT content-write reaches the syscall ABI** (1.41.7) via the `VFS_SEC_WFILE` write-fd: `open(7)` with write access (`AO_WRONLY`/`AO_RDWR`) on a FAT/exFAT mount returns a write-back fd that buffers content and flushes the whole file to the backend on `close` (`vfs_write_on` → `fatfs_write_file` / `exfat_write_file`). Before this, `vfs_write` was ext2-only, so a userland program could not write a FAT/exFAT volume. The fd is backed by a finite static pool freed on close (the kernel heap is alloc-only), with a 4 KB whole-file content cap per fd as a known follow-on limit.
+
+## GPU / Compute
+
+PCI enumeration discovers the AMD **Cezanne** integrated GPU (`1002:1638` — **gfx90c**, GCN5 / Vega compute ISA + DCN 2.1 display) and maps its **BAR5** MMIO register aperture (512 KB) uncacheable (`gpu_probe`, `kernel/core/gpu.cyr`). This is the **1.54.x sovereign-compute arc**: the kernel drives the GPU as a first-class compute device with **no amdgpu / ROCm / HIP** — every sequence is re-derived from open AMD sources (LLVM AMDGPU for the gfx90c ISA, the gfx9 register headers, cross-checked against tinygrad's MEC reverse-engineering) and re-emitted as sovereign register writes, PM4 packets, and hand-assembled shader bytes. The subsystem is **iron-only** — QEMU emulates no AMD GFX/DCN — and a **clean no-op on any box without an AMD GPU** (a non-AMD VGA with no BAR5 is reported and skipped). It runs from `main.cyr` after the HDA audio probe.
+
+The bring-up ladder, each bite its own cut and iron-validated on **archaemenid** (Beelink SER, Ryzen 7 5800H):
+
+- **F0 — PCI probe + register map** (1.54.0): find `1002:1638`, map BAR5 UC, dump the GC/GMC/DCN identity registers. The Renoir/gfx9 base-segment offset tables live in `kernel/core/gpu_regs.cyr` (absolute DWORD index = `base_segment[IP] + offset`; hardcoded, no IP-discovery walk).
+- **C0 / C1 — firmware load + engine start** (1.54.1–.7): the firmware-reality check found **CASE B** — the CP/MEC/RLC microcode is **not** BIOS-resident, so agnos drives the **PSP** firmware-load handshake itself. Over the PSP GPCOM ring it issues `SETUP_TMR`, loads `RLC_G` (the first sovereign-loaded firmware on the GPU — the PSP validates AMD's signature), then the full 5/5 CP + MEC ucode set, and un-halts the engines (`RLC_CNTL` up, `CP_ME_CNTL` / `CP_MEC_CNTL` halts cleared) → **CASE A: the compute engine is running**.
+- **C2 — GPUVM + compute dispatch** (1.54.8–.16): the GMC probe found **GART = ABSENT**, so the design addresses a compute arena in the **UMA carveout via the BIOS FB aperture with ZERO page tables** (`VM_CONTEXT0` stays disabled — the VM-fault-storm CPU-wedge is designed out). Then: GMC armed (L2 datapath on, `0x1FFC` fault-net) → a compute queue mapped on MEC1/pipe0/queue0 via direct HQD programming → the first PM4 packet **fetched** (`fault=0` proved the FB-aperture translation held with no GART) → a `WRITE_DATA` fence whose MEC memory write is **CPU-visible** (**GPU→CPU coherence proven**) → **C2f (1.54.16): the first hand-assembled gfx90c compute shader RAN on the shader cores and the CPU read its `global_store_dword` result back** — the first sovereign compute-shader execution on agnos.
+- **C2g — rosnet matmul on the cores (the crown, in progress)**: scaling to real parallel compute (multi-thread dispatch → kernargs → ALU/reduction loop → a rosnet matmul that is bit-correct vs the CPU reference), then **C2h** — a ring-3 `gpu_*` compute syscall band (mabda's agnos backend). No GPU syscall row exists yet.
+
+**Firmware posture**: agnos ships and accepts the AMD-signed compute microcode (`renoir_*`) exactly like CPU microcode — hardware-required, vendor-signed, PSP-validated. Sovereignty lives **above** the microcode (no vendor driver, no KFD/DRM ABI — the kernel grows for the native ML-on-GPU workload, not to mimic Linux). The claim is precise: *"sovereign except the vendor microcode"* — never "blob-free GPU compute."
+
+Driver: [`kernel/core/gpu.cyr`](../../kernel/core/gpu.cyr) + [`kernel/core/gpu_regs.cyr`](../../kernel/core/gpu_regs.cyr). Full detail: [`../development/planning/kernel-gpu-arc-154x.md`](../development/planning/kernel-gpu-arc-154x.md) (bite ladder + risks) and the agnosticos session handoff [`gpu-arc-handoff.md`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/gpu-arc-handoff.md) (code map + hard-won learnings).
