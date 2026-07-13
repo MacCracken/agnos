@@ -1300,7 +1300,7 @@ fn gpu_shader_dispatch() {
     # SET_SH COMPUTE_STATIC_THREAD_MGMT_SE0/SE1 = all-CUs (else zero waves launch)
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(GPU_CU_MASK_ALL);
     # SET_SH COMPUTE_RESOURCE_LIMITS = 0 (no caps)
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(GPU_COMPUTE_RESOURCE_LIMITS_FSD);
     # DISPATCH_DIRECT 1x1x1
     gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
     # EVENT_WRITE CS_PARTIAL_FLUSH (drain the compute waves before the flush)
@@ -1460,7 +1460,7 @@ fn gpu_shader_dispatch2() {
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(GPU_MT_NUM_THREAD_X); gpu_ring_put(1); gpu_ring_put(1);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_RESTART_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(GPU_CU_MASK_ALL);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(GPU_COMPUTE_RESOURCE_LIMITS_FSD);
     gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
     gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
     gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
@@ -1592,7 +1592,7 @@ fn gpu_sweep_one(width, slot_off) {
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(width); gpu_ring_put(1); gpu_ring_put(1);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_RESTART_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(GPU_CU_MASK_ALL);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(GPU_COMPUTE_RESOURCE_LIMITS_FSD);
     gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
     gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
     gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
@@ -1644,14 +1644,17 @@ fn gpu_shader_sweep() {
     kprint(" w64=", 5);  kprint_hex(a64);
     kprintln("", 0);
 
-    if (a2 == 0) {
-        kprintln("gpu: SWEEP verdict = DEAD@2 -> DIM-mode (try USE_THREAD_DIMENSIONS)", 67);
+    var nsum = a2 + a8 + a16 + a32 + a48 + a63 + a64;
+    if (nsum == 7) {
+        kprintln("gpu: SWEEP verdict = ALL ALIVE -> FORCE_SIMD_DIST fixed wave launch", 67);
+        return 1;
+    }
+    if (nsum == 0) {
+        kprintln("gpu: SWEEP verdict = ALL DEAD -> launch fully broken (not SIMD-routing)", 71);
         return 0;
     }
-    if (a64 == 0) {
-        kprintln("gpu: SWEEP verdict = alive<64 dead@64 -> wave64 boundary (FORCE_SIMD_DIST)", 74);
-        return 0;
-    }
-    kprintln("gpu: SWEEP verdict = ALL ALIVE -> START/RESTART launched the waves", 66);
-    return 1;
+    # non-monotonic / width-independent alive pattern = the SIMD round-robin signature; if this
+    # persists WITH FORCE_SIMD_DIST set, the fix is insufficient (revisit SIMD_DEST_CNTL / CU mask).
+    kprintln("gpu: SWEEP verdict = MIXED non-monotonic -> SIMD round-robin residual", 69);
+    return 0;
 }

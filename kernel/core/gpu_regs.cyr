@@ -255,6 +255,13 @@ var GPU_SH_COMPUTE_PGM_LO          = 0x20C;
 var GPU_SH_COMPUTE_PGM_RSRC1       = 0x212;
 var GPU_SH_COMPUTE_RESOURCE_LIMITS = 0x215;
 var GPU_SH_COMPUTE_STATIC_SE0      = 0x216;
+# C2g-1 zero-wave ROOT FIX (burn 5 → 6): FORCE_SIMD_DIST bit23. Cezanne's CU-per-SE is not a
+# multiple of 4, so the SPI's DEFAULT round-robin SIMD selector can target a non-existent/disabled
+# SIMD => the wave silently never executes. The failure is non-deterministic per dispatch (burn 5
+# sweep: w8/w48 alive, w2/w16/w32/w63/w64 dead — width-INDEPENDENT); C2f's 1-thread wave worked by
+# luck. radeonsi sets this for every waves_per_threadgroup==1 dispatch on non-mult-of-4-CU APUs;
+# amdkfd manages COMPUTE_RESOURCE_LIMITS__FORCE_SIMD_DIST_MASK for the same soft-hang class.
+var GPU_COMPUTE_RESOURCE_LIMITS_FSD = 0x00800000;  # FORCE_SIMD_DIST=1 (even SIMD distribution)
 # C2g-1 zero-wave fix: persistent dispatch-walk SH state that tinygrad/radv clear EVERY dispatch
 # and our raw MQD path uniquely left stale. START = threadgroup origin the SPI evaluates against
 # NUM_THREAD; RESTART = dispatch-resume cursor. FORCE_START_AT_000 is NOT a guaranteed substitute.

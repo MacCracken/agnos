@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.23] — 2026-07-13 — GPU arc C2g-1 root fix: FORCE_SIMD_DIST (SIMD round-robin routing)
+
+**C2g-1 burn 5** (1.54.22) proved the START/RESTART fix does NOT launch the 64-thread wave, but the
+wave-width sweep **cracked the mechanism**: `SWEEP alive w2=0 w8=1 w16=0 w32=0 w48=1 w63=0 w64=0` —
+a **non-monotonic, width-independent** alive/dead pattern. That refutes both DIM-mode (would kill all
+widths ≥2 uniformly) and a wave64 boundary (would be monotonic). A per-dispatch, non-deterministic
+launch that doesn't track width is the signature of the **SIMD round-robin selector**: on Cezanne
+(CU-per-SE not a multiple of 4) the SPI's default round-robin lands some dispatches on a
+non-existent/disabled SIMD, so that wave silently never executes. C2f's 1-thread wave worked by luck.
+
+### Fixed
+
+- **C2g-1 multi-thread wave launch (root cause)** — `kernel/core/gpu.cyr` + `kernel/core/gpu_regs.cyr`:
+  set `COMPUTE_RESOURCE_LIMITS = 0x00800000` (`FORCE_SIMD_DIST`, bit 23) on all three compute dispatches
+  (C2f, C2g-1, and the width sweep) — forces even SIMD distribution instead of the flaky round-robin.
+  Sourced fix: radeonsi `si_compute.c:769-770` sets it for every `waves_per_threadgroup==1` dispatch on
+  non-mult-of-4-CU APUs; amdkfd manages `COMPUTE_RESOURCE_LIMITS__FORCE_SIMD_DIST_MASK` for the same
+  gfx9 soft-launch class. Applied to C2f too so the whole compute chain is deterministic rather than
+  luck-dependent (C2g dispatches gate on C2f). The START/RESTART zeroing from 1.54.22 stays (correct
+  dispatch-hygiene). Iron-only; flash `--update-all`.
+
+### Changed
+
+- **`gpu_shader_sweep()` verdict** — recognizes the non-monotonic / width-independent alive pattern and
+  labels it `MIXED non-monotonic -> SIMD round-robin residual` (the old logic mislabeled it `DEAD@2 ->
+  DIM-mode` by checking width-2 first). `ALL ALIVE` now reads `FORCE_SIMD_DIST fixed wave launch`.
+
 ## [1.54.22] — 2026-07-13 — GPU arc C2g-1 zero-wave fix (COMPUTE_START/RESTART) + wave-width sweep
 
 **C2g-1 burn 4** (1.54.20) proved the exec-unmask fix does NOT work: with `s_mov_b64 exec,-1` as the
