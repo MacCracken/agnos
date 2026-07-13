@@ -263,9 +263,11 @@ var GPU_ACQUIRE_POLL          = 0x0000000A;
 # --- C2g-1: first MULTI-THREAD dispatch (1 workgroup, 64 threads; out[tid]=tid) ---
 # All 11 shader dwords are llvm-mc(-mcpu=gfx90c) ground-truth. Only ONE compute-reg differs
 # from C2f: NUM_THREAD_X 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 => 64 threads in ONE workgroup).
-var GPU_SHADER_OUT2_SUBOFF = 0x14800;    # 64-dword (256 B) per-thread output array. REUSES the C2f
-# out slot (C2f passed) — NOT 0x15000 = GPU_VM_DUMMY_SUBOFF
-# (the L2 fault-sink page); 0x400 gap to the 0x14C00 done-marker.
+var GPU_SHADER_OUT2_SUBOFF = 0x16000;    # 64-dword (256 B) per-thread output array. FRESH slot past the
+# dummy page (0x15000..0x16000) that C2f NEVER touched — so no
+# stale-L2 ghost resurrects over the CPU pre-seed (C2g-1 burn 2:
+# reusing the C2f +0x14800 slot flushed C2f's cached 0xC2F0C2F0
+# back over the pre-seed, masking whether the shader wrote).
 var GPU_MT_NUM_THREAD_X    = 64;         # workgroup size X (Y=Z=1); DIM stays 1x1x1 => 64 total threads
 var GPU_MT_N               = 64;         # verification element count (out[0..63])
 var GPU_MT_NOTYET          = 0xDEADBEEF;  # pre-seed marker: != any tid 0..63 (incl 0), != done

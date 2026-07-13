@@ -1409,18 +1409,20 @@ fn gpu_shader_dispatch2() {
     var out_mc      = gpu_arena_mc   + GPU_SHADER_OUT2_SUBOFF;
     var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
 
-    # 1. Write the 11-dword C2g-1 shader blob (out base COMPUTED from arena_mc).
+    # 1. ISOLATION-DIAGNOSTIC shader (8 dwords): each lane stores its workitem-id v0 to a FIXED
+    #    address out_base (NO per-thread offset — the v_lshlrev/v_add_co/v_addc_co arithmetic is
+    #    dropped). 64 lanes race into out[0]; the winner's v0 lands there. This splits the C2g-1
+    #    burn-2 result (stores didn't land): o0 in [0,63] => waves RUN and v0 IS the workitem-id
+    #    (=> the real bug is the address arithmetic); o0 stale (0xDEADBEEF, fresh slot) => zero
+    #    waves launched (=> the 64-thread dispatch config). Only C2f/C2g-1-proven encodings used.
     store32(shader_phys + 0x00, 0x7E0202FF);              # v_mov_b32 v1, lit
-    store32(shader_phys + 0x04, out_mc & 0xFFFFFFFF);     #   = out base lo
+    store32(shader_phys + 0x04, out_mc & 0xFFFFFFFF);     #   = out base lo (FIXED addr)
     store32(shader_phys + 0x08, 0x7E0402FF);              # v_mov_b32 v2, lit
     store32(shader_phys + 0x0C, (out_mc >> 32) & 0xFFFFFFFF); # = out base hi
-    store32(shader_phys + 0x10, 0x24060082);              # v_lshlrev_b32 v3, 2, v0   (v3 = tid<<2)
-    store32(shader_phys + 0x14, 0x32020701);              # v_add_co_u32  v1, vcc, v1, v3
-    store32(shader_phys + 0x18, 0x38040480);              # v_addc_co_u32 v2, vcc, 0, v2, vcc
-    store32(shader_phys + 0x1C, 0xDC718000);              # global_store_dword v[1:2],v0,off glc
-    store32(shader_phys + 0x20, 0x007F0001);              #   (VADDR=v1, VDATA=v0=tid, SADDR=off)
-    store32(shader_phys + 0x24, 0xBF8C0F70);              # s_waitcnt vmcnt(0)
-    store32(shader_phys + 0x28, 0xBF810000);              # s_endpgm
+    store32(shader_phys + 0x10, 0xDC718000);              # global_store_dword v[1:2],v0,off glc
+    store32(shader_phys + 0x14, 0x007F0001);              #   (VADDR=v1, VDATA=v0=workitem-id, SADDR=off)
+    store32(shader_phys + 0x18, 0xBF8C0F70);              # s_waitcnt vmcnt(0)
+    store32(shader_phys + 0x1C, 0xBF810000);              # s_endpgm
 
     # 2. Pre-seed all 64 output dwords + done with a NOT-YET marker (!= any tid 0..63, != done).
     var s = 0;

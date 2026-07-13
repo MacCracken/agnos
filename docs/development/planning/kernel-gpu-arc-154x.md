@@ -1,9 +1,14 @@
 # Kernel GPU arc — pixels AND data through the silicon (slotted 1.54.x)
 
-**Status (2026-07-10): ▷ PLANNED — research + bite ladder ready; NOT started.** Opened as a
-plan-only deliverable right after the 1.53.x console-perf arc iron-closed (1.53.14). A later
-session agent executes; **the first landed bite cuts agnos 1.54.0** (no VERSION bump before that —
-[[feedback_no_unprompted_version_bumps]]). Target: **archaemenid AMD Zen** (Beelink SER, Ryzen 7
+**Status (2026-07-13): ◐ EXECUTING — F0..C2f all iron-PASS (kernel 1.54.18; 1.54.19 cutting).**
+The **C1 firmware-load + engine-start sub-arc is COMPLETE**; the **C2 compute-dispatch sub-arc** has
+proven the full path — GMC/FB-aperture → compute queue → PM4 fetch → WRITE_DATA fence (GPU→CPU
+coherence) → **first hand-assembled gfx90c shader RAN (C2f, 1.54.16)**. Now on **C2g (rosnet matmul,
+the crown)**, decomposed g-1..g-4; C2g-1 (first 64-thread dispatch) is mid-debug (1.54.17/18; 1.54.19
+= a store-landing isolation diagnostic). Live status → `agnosticos/docs/development/state.md` +
+`gpu-arc-handoff.md`; per-burn detail → `iron-nuc-zen-log.md#tracker-154x-*`. *(History: opened
+2026-07-10 as a plan-only deliverable right after the 1.53.x console-perf arc iron-closed (1.53.14);
+the first landed bite cut agnos 1.54.0.)* Target: **archaemenid AMD Zen** (Beelink SER, Ryzen 7
 5800H — Cezanne APU). **NOT Cyrius-gated** — 6.4.x is plenty ([[project_gpu_arc_not_cyrius_gated]]).
 
 **Size is NOT a constraint (user, 2026-07-10):** this is a large, multi-phase arc spanning many
@@ -76,7 +81,7 @@ workloads — the kernel grows for them, not to mimic a Linux DRM/KFD ABI.
 - Display: `blit`#39 CPU-memcpys into live scanout (tears; no second buffer). Display audio is
   GPU-gated (1.53.5 burn 2 dispositive).
 
-## Target hardware facts (verified 2026-07-10; executing agent RE-VERIFIES on iron at D0/C0)
+## Target hardware facts (verified 2026-07-10; executing agent RE-VERIFIES on iron at F0/C0)
 
 | Fact | Value | Source |
 |------|-------|--------|
@@ -200,14 +205,36 @@ P5 needs C1/C2). Batch read-only bites per burn where safe (F0+P0+C0 are read-on
    IS COMPLETE — the compute-thrust gate is OPEN.** Payload byte-range unknown = CONFIRMED
    (`common_firmware_header` `ucode_size_bytes`@0x14 / `ucode_array_offset_bytes`@0x18).
 
-   **▷ C2 — DISPATCH COMPUTE (next, iron-only):** the engine is running+idle; C2 makes it do work.
-   Ladder opens with a **read-only GMC/GPUVM state probe (C2a)** — answer "is there a reusable
-   GART/VM already set up by BIOS/PSP, or must we build page tables?" (the make-or-break that shapes
-   the rest) — before any VM writes, since bad GPUVM ⟹ VM-fault storm ⟹ CPU wedge is the first REAL
-   hang-risk of the arc (flagged by the C1d verify). Then: build/reuse VM → compute queue (MQD/HQD,
-   MMIO poll-mode to dodge the BAR2 doorbell for a first bite) → PM4 dispatch (prove a packet executes)
-   → hand-assembled gfx90c shader → rosnet matmul bit-correct. Decompose + C2a derivation → the
-   `gpu-c2-decompose-derive` workflow.
+   **✅ C2 — DISPATCH COMPUTE (executed through C2f, iron-only):** the C2a read-only GMC/GPUVM probe
+   answered the make-or-break — **GART=ABSENT**, so the design is compute scratch in the UMA carveout
+   addressed via the BIOS FB aperture with **ZERO page tables** (`VM_CONTEXT0` disabled), which designs
+   the VM-fault-storm CPU-wedge OUT. The landed + iron-PASS ladder:
+   - **C2a** (1.54.8) GMC/VM probe — GART absent, FB carveout MC `[0xF400000000,+3GB)`.
+   - **C2b** (1.54.9) GMC ARMED — L2 datapath on, paging off, `0x1FFC` fault-net armed; CPU R/W of the
+     carveout DRAM validated.
+   - **C2c** (1.54.10) compute QUEUE MAPPED — MEC1/pipe0/queue0 via direct (non-HWS) CP_HQD programming.
+   - **C2d** (1.54.12) first PM4 packet FETCHED — `fault=0` proved the ring GPUVA translates through the
+     FB aperture with no page tables (no GART). *Residual: the posted BAR2 doorbell didn't advance the
+     wptr; the **register-wptr submit works** and is used everywhere.*
+   - **C2e** (1.54.13) WRITE_DATA FENCE OK — the MEC executes a packet AND its `DST_SEL=5` memory write
+     is **CPU-visible** = GPU→CPU coherence proven.
+   - **C2f** (1.54.16) first hand-assembled **gfx90c SHADER RAN** — a single-thread compute kernel
+     executed on the cores and its `global_store_dword` result read back on the CPU. *(Took 3 burns —
+     the bug was a WPTR **LO-before-HI** submit-order gotcha, not the ISA.)*
+
+   **▷ C2g — rosnet matmul on the cores (THE CROWN), decomposed:** **C2g-1** first multi-thread dispatch
+   (64 threads, `out[tid]=tid`) → **C2g-2** kernargs (operand pointers via `COMPUTE_USER_DATA`) →
+   **C2g-3** ALU + reduction loop → **C2g-4** rosnet matmul, bit-correct vs the CPU reference. C2g-1 is
+   IN PROGRESS (burn 1 1.54.17 PARTIAL; burn 2 1.54.18 the shader's stores don't land — the CPU read
+   only a **stale-L2 ghost** of the C2f value; 1.54.19 = a fresh-slot isolation diagnostic to split
+   zero-waves vs a wrong-address). Then **C2h** = the ring-3 `gpu_*` band (mabda's agnos backend seam).
+
+   **Key learnings baked in (see `gpu-arc-handoff.md`):** match the proven register-submit sequence
+   byte-for-byte (WPTR **LO before HI** — the CP latches on the HI write); the **stale-L2 trap**
+   (`ACQUIRE_MEM` is write-*back*, not invalidate, so a CPU UC pre-seed of a GPU-written buffer gets
+   clobbered — use a fresh slot); **byte-confirm every ISA/PM4 encoding** (`llvm-mc -mcpu=gfx90c`
+   ground-truth + 2 adversarial re-derivations); the **diagnostic-ladder** discipline (localize before
+   fixing on iron). Each bite: `gpu-c2*-derive` / `gpu-c2g*-derive` workflow + a CONFIRM/FALSIFY tracker.
 2. **GPUVM page-table format** (C1) — gfx9 multi-level PTE/PDE encoding + TLB-flush must be exact;
    a wrong PTE reads garbage. Derive from `gmc_v9_0.c`.
 3. **Shader ISA** (C3) — hand-assembled gfx90c kernels are the MVP (LLVM assembler validates); a

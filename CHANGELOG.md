@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.19] — 2026-07-13 — GPU arc C2g-1 burn 2 isolation: v0-to-fixed-slot + fresh output slot
+
+**C2g-1 burn 2** (1.54.18) showed the 64-thread shader's stores don't land: only one output dword changed
+and it was the **C2f sentinel resurrected** — a stale GPU-L2 line (from C2f's write to the shared `+0x14800`
+slot) flushed back over the CPU's UC pre-seed by `ACQUIRE_MEM` (write-back, not invalidate). So no C2g-1
+store reached the array. This cut isolates the cause.
+
+### Fixed
+
+- **C2g-1 isolation diagnostic** — `kernel/core/gpu.cyr` `gpu_shader_dispatch2()`: (a) output array moved to a
+  **fresh slot `+0x16000`** past the dummy fault-sink page — a slot C2f never wrote, so no stale-L2 ghost
+  resurrects over the pre-seed; (b) the shader is stripped to 8 dwords that store `v0` (the workitem-id) to a
+  **fixed** address (drops the `v_lshlrev`/`v_add_co`/`v_addc_co` per-thread arithmetic; only C2f/C2g-1-proven
+  encodings). 64 lanes race into `out[0]`. Reading `o0`: `o0 ∈ [0,63]` ⟹ waves launched **and** `v0` is the
+  workitem-id ⟹ the C2g-1 failure is the address arithmetic; `o0 = 0xDEADBEEF` ⟹ zero waves launched with
+  `NUM_THREAD_X=64` ⟹ the dispatch config. `kernel/core/gpu_regs.cyr`: `GPU_SHADER_OUT2_SUBOFF` → `0x16000`.
+  Diagnostic-only, no GPU-behavior change (localize before repairing). Iron-only; flash `--update-all`.
+  Decision tree + repair paths: agnosticos `iron-nuc-zen-log.md#tracker-154x-c2g1` + `gpu-arc-handoff.md`.
+
 ## [1.54.18] — 2026-07-13 — GPU arc C2g-1 burn 1 diagnostic: dump raw output values + changed-count
 
 **C2g-1 burn 1** (1.54.17) returned `PARTIAL`: the multi-thread dispatch ran end-to-end (ring fully consumed,
