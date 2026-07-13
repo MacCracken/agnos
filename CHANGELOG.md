@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.15] — 2026-07-13 — GPU arc C2f burn 1 diagnostic: read HQD state while GRBM-selected
+
+**C2f burn 1** (1.54.14) returned `NO RETIRE` — the dispatch ring stalled before the final `WRITE_DATA`
+done-marker (`out`/`done` both still the `0xDEADBEEF` pre-seed, `fault=0x0`). But `rptr=0x0` was a **diagnostic
+read bug**: `CP_HQD_PQ_RPTR` was read *after* `GRBM_GFX_CNTL=0` (deselect), so it reported the default queue's
+rptr instead of the MEC1/pipe0/queue0 compute queue's — obscuring where the ring actually stalled. Ring program
+unchanged; this cut fixes the instrumentation so the re-burn localizes the stall.
+
+### Fixed
+
+- **C2f readback reads per-queue state while GRBM-selected** — `kernel/core/gpu.cyr` `gpu_shader_dispatch()`:
+  read `CP_HQD_PQ_RPTR` (stall locator), `CP_HQD_PQ_WPTR_LO` (submit-landed check), and `CP_HQD_ACTIVE`
+  (queue-alive check) *before* the deselect, matching the C2d/C2e pattern. Report is now two lines:
+  `gpu: C2f rptr=0x.. wptr=0x.. act=0x..` + `gpu: C2f out=0x.. done=0x.. fault=0x..`. The `rptr` value maps to
+  a ring packet index (13 start → 0x34 all-consumed): `~0x26` = the `CS_PARTIAL_FLUSH` drain (the pre-flagged
+  suspect on the non-HWS direct-HQD queue), etc. — see the decision tree in agnosticos `iron-nuc-zen-log.md`
+  `#tracker-154x-c2f`. Diagnostic-only, no GPU-behavior change (localize before pivoting); the `RELEASE_MEM`
+  pivot is staged for a confirmed fence-area stall. Iron-only; flash `--update-all`.
+
 ## [1.54.14] — 2026-07-12 — GPU arc bite C2f: first hand-assembled gfx90c compute shader (DISPATCH_DIRECT)
 
 **C2e was iron-validated** (1.54.13): the MEC executes PM4 and a CP `WRITE_DATA` reaches CPU-visible DRAM.

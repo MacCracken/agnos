@@ -1327,24 +1327,34 @@ fn gpu_shader_dispatch() {
         if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
         else { gpu_udelay(100); i = i + 1; }
     }
+    # Read the per-queue state WHILE STILL GRBM-SELECTED — rptr/wptr/active read the
+    # DEFAULT queue once deselected (that was the C2f-first-burn rptr=0x0 artifact). rptr
+    # localizes WHERE the ring stalled (13=start..0x34=all consumed); wptr confirms the
+    # submit landed (0x34); active confirms the queue wasn't dequeued.
+    var rreg    = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR)    & 0xFFFFFFFF;
+    var wptr_rb = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO) & 0xFFFFFFFF;
+    var active  = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_ACTIVE)     & 0xFFFFFFFF;
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);   # deselect
     gpu_mfence();
-    var drain = load32(done_phys);                            # ordering read
 
-    # 7. Readback + classify.
+    # 7. Readback (memory + non-queue regs) + classify.
     var outv  = load32(out_phys) & 0xFFFFFFFF;
     var donev = load32(done_phys) & 0xFFFFFFFF;
     var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
-    var rreg  = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR) & 0xFFFFFFFF;
 
+    kprint("gpu: C2f rptr=0x", 16);
+    kprint_hex(rreg);
+    kprint(" wptr=0x", 8);
+    kprint_hex(wptr_rb);
+    kprint(" act=0x", 7);
+    kprint_hex(active);
+    kprintln("", 0);
     kprint("gpu: C2f out=0x", 15);
     kprint_hex(outv);
     kprint(" done=0x", 8);
     kprint_hex(donev);
     kprint(" fault=0x", 9);
     kprint_hex(fault & 0xFFFFFFFF);
-    kprint(" rptr=0x", 8);
-    kprint_hex(rreg);
     kprintln("", 0);
 
     gpu_ring_wptr = new_wptr;   # cursor authoritative for any re-run
