@@ -5,6 +5,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.18] — 2026-07-13 — GPU arc C2g-1 burn 1 diagnostic: dump raw output values + changed-count
+
+**C2g-1 burn 1** (1.54.17) returned `PARTIAL`: the multi-thread dispatch ran end-to-end (ring fully consumed,
+submit landed, done-marker fired, `fault=0`) but `ok=0/64` — every output wrong. The readout printed
+`ok`/`firstbad` but not the actual output values, so it couldn't distinguish "no store landed" from "wrote
+wrong value/address" — two different fixes. This cut adds the values.
+
+### Fixed
+
+- **C2g-1 readout dumps raw outputs + changed-count** — `kernel/core/gpu.cyr` `gpu_shader_dispatch2()`: prints
+  `o0`/`o1`/`o2` (the raw first three output dwords) and `nz` (how many of the 64 dwords changed from the
+  `0xDEADBEEF` pre-seed). `nz=0` ⟹ nothing landed in the array (waves didn't launch or all addresses missed);
+  `nz=64` with wrong values ⟹ all lanes wrote but the value/address is wrong (decode `o0/o1/o2`); partial `nz`
+  ⟹ wave-width. Shader + ring UNCHANGED (localize before pivoting). Diagnostic-only, no GPU-behavior change.
+  Iron-only; flash `--update-all`. Decision tree: agnosticos `iron-nuc-zen-log.md` `#tracker-154x-c2g1`.
+
 ## [1.54.17] — 2026-07-13 — GPU arc bite C2g-1: first multi-thread compute dispatch (64 threads)
 
 **C2f was iron-validated** (1.54.16): a single-thread gfx90c shader ran on the cores and its store was
