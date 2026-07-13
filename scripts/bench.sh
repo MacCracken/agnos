@@ -13,7 +13,7 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # 'undefined KASHI_FONT_VGA_8X16'). Resolution mirrors scripts/build.sh:
 # sibling-checkout default, auto-clone the pinned tag when absent.
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.0}"
+KASHI_REF="${KASHI_REF:-1.0.3}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for bench build..." >&2
     rm -rf "$KASHI_DIR"

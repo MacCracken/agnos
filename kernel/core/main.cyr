@@ -4201,7 +4201,7 @@ if (exec_pid >= 0) {
     var exec_entry = load64(ep + 24);
     var exec_rsp = load64(ep + 16);
     var exec_cr3 = load64(ep + 160);
-    # skipped
+    exec_and_wait(exec_entry, exec_rsp, exec_cr3);
     kprintln("Userland exec complete", 22);
 }
 # CMOS CP 0x14: post-userland-exec test (spawn done, exec_and_wait still bypassed)

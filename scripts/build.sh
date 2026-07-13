@@ -16,10 +16,11 @@ CYRB="$CYRIUS_HOME/bin/cyrius"
 # with a sibling-checkout default — works on a local devbox where both
 # repos live under ~/Repos/ AND in CI where actions/checkout only fetches
 # this repo. When the sibling is absent we clone the pinned tag (override
-# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.0 — kashi's v1 API freeze;
-# bump as kashi cuts new 1.x releases.
+# via KASHI_REF=<tag-or-branch>). Pinned at 1.0.3 — kashi's v1 API freeze;
+# bump as kashi cuts new 1.x releases (only affects the clone fallback — the
+# freestanding font_data.cyr is byte-identical across the 1.0.x toolchain bumps).
 KASHI_DIR="${KASHI_DIR:-$ROOT/../kashi}"
-KASHI_REF="${KASHI_REF:-1.0.0}"
+KASHI_REF="${KASHI_REF:-1.0.3}"
 if [ ! -f "$KASHI_DIR/src/font_data.cyr" ]; then
     echo "  kashi not at $KASHI_DIR — cloning $KASHI_REF for build..." >&2
     rm -rf "$KASHI_DIR"
@@ -85,6 +86,12 @@ else
     # — same reason `ARCH_X86_64` is prepended, not `-D`'d).
     #
     # Optional gates (env-var driven, same prepend mechanism):
+    #   TEST=1          — compile in the kernel `test` shell verb + its suite
+    #                     (user/test.cyr: PMM/heap/VFS/proc/syscall/kstdlib/
+    #                     initrd assertions, gated by `#ifdef TEST` in agnos.cyr
+    #                     + user/shell.cyr). Used by scripts/ktest.sh, which
+    #                     rewrites core/boot_finish.cyr to run sh_cmd_test() at
+    #                     boot in place of the kybernet launch.
     #   KTEST=1         — boot-time in-kernel self-tests (Syscall, Context
     #                     Switch, VFS/initrd, Userland Exec) emit their
     #                     output and CMOS checkpoints. Off by default;
@@ -156,6 +163,7 @@ else
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'
+        [ -n "$TEST" ]           && echo '#define TEST'
         [ -n "$KTEST" ]          && echo '#define KTEST'
         [ -n "$XHCI_VERBOSE" ]   && echo '#define XHCI_VERBOSE'
         [ -n "$AHCI_RW_DEMO" ]   && echo '#define AHCI_RW_DEMO'
