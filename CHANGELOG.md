@@ -5,6 +5,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.22] — 2026-07-13 — GPU arc C2g-1 zero-wave fix (COMPUTE_START/RESTART) + wave-width sweep
+
+**C2g-1 burn 4** (1.54.20) proved the exec-unmask fix does NOT work: with `s_mov_b64 exec,-1` as the
+shader's FIRST instruction the 64-thread dispatch still stored nothing (`nz=0`), so the shader never
+executed — the 64-thread wave *launch* produces ZERO executing lanes while a 1-thread wave works.
+Not a shader-EXEC bug. A register-diff against tinygrad's working raw-MEC compute sequence (the closest
+sovereign analog — non-HWS MEC HQD, raw PM4 DISPATCH_DIRECT, gfx9) found the delta: we uniquely omit
+the persistent dispatch-walk SH state tinygrad/radv clear on **every** dispatch.
+
+### Fixed
+
+- **C2g-1 multi-thread wave launch** — `kernel/core/gpu.cyr` `gpu_shader_dispatch2()` + `kernel/core/gpu_regs.cyr`:
+  zero `COMPUTE_START_X/Y/Z` (SH 0x204/5/6) and `COMPUTE_RESTART_X/Y/Z` (0x21B/C/D) before the dispatch —
+  the stale threadgroup-origin / dispatch-resume cursor the SPI evaluates against `NUM_THREAD_X`, which
+  our raw MQD path left uninitialized (`FORCE_START_AT_000` is not a guaranteed substitute). START is
+  latched in the same SET_SH burst as `NUM_THREAD` (tinygrad `ops_amd.py` `AMDComputeQueue.exec`). This is
+  the **only delta vs 1.54.20** — a pass attributes cleanly. Derived from a 3-lens register-diff
+  (tinygrad / amdkfd v9 / gfx9 ISA) + synthesis; confidence medium (no single per-dispatch COMPUTE_*
+  field airtight-explains 1-vs-64, so the sweep below disambiguates). Iron-only; flash `--update-all`.
+
+### Added
+
+- **C2g-1 wave-width sweep** — `gpu_shader_sweep()` / `gpu_sweep_one()` (`kernel/core/gpu.cyr`): one
+  fixed-address-store dispatch per `NUM_THREAD_X ∈ {2,8,16,32,48,63,64}` (each with the START/RESTART
+  fix), reporting which widths launch executing waves (`gpu: SWEEP alive w2=.. … w64=..`). Pinpoints the
+  launch threshold in one burn: `DEAD@2` ⟹ DIM-mode (next fix `USE_THREAD_DIMENSIONS`); `alive<64 dead@64`
+  ⟹ wave64 boundary (next fix `FORCE_SIMD_DIST`, `RESOURCE_LIMITS=0x00800000`); `ALL alive` ⟹ the
+  START/RESTART fix launched the waves. Each dispatch is the proven bounded-watchdog envelope
+  (wedge-safe); fresh per-width output slots at `+0x17000`. Rubric: agnosticos
+  `iron-nuc-zen-log.md#tracker-154x-c2g1`.
+
 ## [1.54.21] — 2026-07-13 — ktest.sh boot-to-shell smoke harness repaired (bench.sh pattern) + kashi 1.0.3 pin
 
 The QEMU boot-to-shell functional smoke (`scripts/ktest.sh`) had rotted three independent ways

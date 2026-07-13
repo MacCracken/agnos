@@ -255,6 +255,11 @@ var GPU_SH_COMPUTE_PGM_LO          = 0x20C;
 var GPU_SH_COMPUTE_PGM_RSRC1       = 0x212;
 var GPU_SH_COMPUTE_RESOURCE_LIMITS = 0x215;
 var GPU_SH_COMPUTE_STATIC_SE0      = 0x216;
+# C2g-1 zero-wave fix: persistent dispatch-walk SH state that tinygrad/radv clear EVERY dispatch
+# and our raw MQD path uniquely left stale. START = threadgroup origin the SPI evaluates against
+# NUM_THREAD; RESTART = dispatch-resume cursor. FORCE_START_AT_000 is NOT a guaranteed substitute.
+var GPU_SH_COMPUTE_START_X         = 0x204;   # + START_Y 0x205, START_Z 0x206 (write 0,0,0)
+var GPU_SH_COMPUTE_RESTART_X       = 0x21B;   # + RESTART_Y 0x21C, RESTART_Z 0x21D (write 0,0,0)
 # ACQUIRE_MEM body (whole-cache TC write-back; header + coher-cntl reuse the C2e-staged consts)
 var GPU_ACQUIRE_COHER_SIZE    = 0xFFFFFFFF;
 var GPU_ACQUIRE_COHER_SIZE_HI = 0x00FFFFFF;
@@ -271,3 +276,6 @@ var GPU_SHADER_OUT2_SUBOFF = 0x16000;    # 64-dword (256 B) per-thread output ar
 var GPU_MT_NUM_THREAD_X    = 64;         # workgroup size X (Y=Z=1); DIM stays 1x1x1 => 64 total threads
 var GPU_MT_N               = 64;         # verification element count (out[0..63])
 var GPU_MT_NOTYET          = 0xDEADBEEF;  # pre-seed marker: != any tid 0..63 (incl 0), != done
+# C2g-1 wave-width SWEEP: one fixed-addr-store dispatch per width to pinpoint where launch breaks.
+# 7 one-dword slots (a width is "alive" if its slot changed from NOTYET => >=1 lane executed).
+var GPU_SWEEP_OUT_SUBOFF   = 0x17000;    # 7 dwords, one per width {2,8,16,32,48,63,64}; fresh region

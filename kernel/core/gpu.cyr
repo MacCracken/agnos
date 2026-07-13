@@ -1452,7 +1452,13 @@ fn gpu_shader_dispatch2() {
     var pgm_hi = (shader_mc >> 40) & 0xFF;
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(0);
+    # C2g-1 zero-wave FIX (burn 5): clear the stale threadgroup-origin + dispatch-resume SH state
+    # tinygrad/radv zero on EVERY dispatch and our raw MQD path uniquely left stale — a full
+    # 64-thread workgroup launched ZERO executing waves at 1.54.20 (even with exec,-1 first),
+    # which is neither a shader-EXEC nor a NUM_THREAD-field bug. START latches with NUM_THREAD.
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_START_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(GPU_MT_NUM_THREAD_X); gpu_ring_put(1); gpu_ring_put(1);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_RESTART_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(GPU_CU_MASK_ALL);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(0);
     gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
@@ -1546,4 +1552,106 @@ fn gpu_shader_dispatch2() {
     gpu_mt_ok = 0 - 1;
     kprintln("gpu: C2g-1 = NO RETIRE (dispatch not consumed / no wave)", 56);
     return 0;
+}
+
+# ── C2g-1 wave-width SWEEP — pinpoint where multi-thread launch breaks ──────────
+# Burn 4 (1.54.20) proved a full 64-thread workgroup launches ZERO executing waves
+# (nz=0 even with exec,-1 FIRST) while 1 thread works. This runs ONE fixed-addr store
+# dispatch per NUM_THREAD_X in {2,8,16,32,48,63,64} (each WITH the START/RESTART fix)
+# and reports which widths produced a store => which widths launch executing waves.
+# Splits the hypothesis: DEAD@2 => DIM-mode (USE_THREAD_DIMENSIONS); alive<64 dead@64 =>
+# wave64 boundary (FORCE_SIMD_DIST); ALL alive => the START/RESTART fix launched the waves.
+# WEDGE-SAFE: each dispatch is the proven bounded-watchdog envelope; fixed-addr store; a
+# per-width slot in a fresh region; bus-master off; a bad addr faults into the 0x1FFC net.
+fn gpu_sweep_one(width, slot_off) {
+    var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
+    var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;
+    var out_phys    = gpu_arena_phys + slot_off;
+    var out_mc      = gpu_arena_mc   + slot_off;
+    var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
+    var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
+
+    # 8-dword fixed-addr store shader: each active lane stores its workitem-id v0 -> out_mc
+    # (no exec-set — SPI auto-inits EXEC; this tests PURE wave launch, not masking).
+    store32(shader_phys + 0x00, 0x7E0202FF); store32(shader_phys + 0x04, out_mc & 0xFFFFFFFF);
+    store32(shader_phys + 0x08, 0x7E0402FF); store32(shader_phys + 0x0C, (out_mc >> 32) & 0xFFFFFFFF);
+    store32(shader_phys + 0x10, 0xDC718000); store32(shader_phys + 0x14, 0x007F0001);
+    store32(shader_phys + 0x18, 0xBF8C0F70); store32(shader_phys + 0x1C, 0xBF810000);
+    store32(out_phys, GPU_MT_NOTYET); store32(done_phys, GPU_MT_NOTYET);
+    gpu_mfence();
+
+    var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
+
+    var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
+    var pgm_hi = (shader_mc >> 40) & 0xFF;
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_START_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(width); gpu_ring_put(1); gpu_ring_put(1);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_RESTART_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(GPU_CU_MASK_ALL);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
+    gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
+    gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
+    gpu_mfence();
+
+    var new_wptr = gpu_ring_wptr;
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
+    gpu_mfence();
+    var i = 0;
+    while (i < 1000) {
+        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { i = 1000; }
+        else { gpu_udelay(100); i = i + 1; }
+    }
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+    gpu_mfence();
+    gpu_ring_wptr = new_wptr;
+
+    var v = load32(out_phys) & 0xFFFFFFFF;
+    if (v != GPU_MT_NOTYET) { return 1; }
+    return 0;
+}
+
+fn gpu_shader_sweep() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_shader_ok != 1) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+
+    var a2  = gpu_sweep_one(2,  GPU_SWEEP_OUT_SUBOFF + 0x00);
+    var a8  = gpu_sweep_one(8,  GPU_SWEEP_OUT_SUBOFF + 0x04);
+    var a16 = gpu_sweep_one(16, GPU_SWEEP_OUT_SUBOFF + 0x08);
+    var a32 = gpu_sweep_one(32, GPU_SWEEP_OUT_SUBOFF + 0x0C);
+    var a48 = gpu_sweep_one(48, GPU_SWEEP_OUT_SUBOFF + 0x10);
+    var a63 = gpu_sweep_one(63, GPU_SWEEP_OUT_SUBOFF + 0x14);
+    var a64 = gpu_sweep_one(64, GPU_SWEEP_OUT_SUBOFF + 0x18);
+
+    kprint("gpu: SWEEP alive w2=", 20); kprint_hex(a2);
+    kprint(" w8=", 4);   kprint_hex(a8);
+    kprint(" w16=", 5);  kprint_hex(a16);
+    kprint(" w32=", 5);  kprint_hex(a32);
+    kprint(" w48=", 5);  kprint_hex(a48);
+    kprint(" w63=", 5);  kprint_hex(a63);
+    kprint(" w64=", 5);  kprint_hex(a64);
+    kprintln("", 0);
+
+    if (a2 == 0) {
+        kprintln("gpu: SWEEP verdict = DEAD@2 -> DIM-mode (try USE_THREAD_DIMENSIONS)", 67);
+        return 0;
+    }
+    if (a64 == 0) {
+        kprintln("gpu: SWEEP verdict = alive<64 dead@64 -> wave64 boundary (FORCE_SIMD_DIST)", 74);
+        return 0;
+    }
+    kprintln("gpu: SWEEP verdict = ALL ALIVE -> START/RESTART launched the waves", 66);
+    return 1;
 }
