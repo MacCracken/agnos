@@ -1610,18 +1610,23 @@ fn gpu_sweep_one(width, slot_off) {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
     gpu_mfence();
+    var retired = 0;
     var i = 0;
     while (i < 1000) {
-        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { i = 1000; }
+        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { retired = 1; i = 1000; }
         else { gpu_udelay(100); i = i + 1; }
     }
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
     gpu_mfence();
     gpu_ring_wptr = new_wptr;
 
+    # bit0 = a lane's store landed (wave executed); bit1 = the done-marker fired (ring retired =
+    # NOT a hang). dead+retired = launched-but-no-wave; dead+!retired = HUNG (watchdog timed out).
+    var r = 0;
     var v = load32(out_phys) & 0xFFFFFFFF;
-    if (v != GPU_MT_NOTYET) { return 1; }
-    return 0;
+    if (v != GPU_MT_NOTYET) { r = r | 1; }
+    if (retired != 0) { r = r | 2; }
+    return r;
 }
 
 fn gpu_shader_sweep() {
@@ -1630,34 +1635,43 @@ fn gpu_shader_sweep() {
     if (gpu_arena_mc == 0) { return 0; }
     if (gpu_ring_wptr == 0) { return 0; }
 
-    var a2  = gpu_sweep_one(2,  GPU_SWEEP_OUT_SUBOFF + 0x00);
-    var a8  = gpu_sweep_one(8,  GPU_SWEEP_OUT_SUBOFF + 0x04);
-    var a16 = gpu_sweep_one(16, GPU_SWEEP_OUT_SUBOFF + 0x08);
-    var a32 = gpu_sweep_one(32, GPU_SWEEP_OUT_SUBOFF + 0x0C);
-    var a48 = gpu_sweep_one(48, GPU_SWEEP_OUT_SUBOFF + 0x10);
-    var a63 = gpu_sweep_one(63, GPU_SWEEP_OUT_SUBOFF + 0x14);
-    var a64 = gpu_sweep_one(64, GPU_SWEEP_OUT_SUBOFF + 0x18);
-
-    kprint("gpu: SWEEP alive w2=", 20); kprint_hex(a2);
-    kprint(" w8=", 4);   kprint_hex(a8);
-    kprint(" w16=", 5);  kprint_hex(a16);
-    kprint(" w32=", 5);  kprint_hex(a32);
-    kprint(" w48=", 5);  kprint_hex(a48);
-    kprint(" w63=", 5);  kprint_hex(a63);
-    kprint(" w64=", 5);  kprint_hex(a64);
+    # DIAGNOSTIC: 5 IB-register configs (exec / START,RESTART / FSD / mabda-preamble) ALL gave the
+    # IDENTICAL width-dependent alive pattern => the bug is NOT in the dispatch IB, it is agnos's own
+    # queue/MQD (C2c). Separate WIDTH from dispatch-POSITION, and hang from no-launch: run a FIXED
+    # width to 8 successive slots, twice. gpu_sweep_one returns bit0=alive(store landed), bit1=retired
+    # (done fired = NOT hung). Control A: width 64 x8. Control B: width 8 x8 (8 was "alive" before).
+    var a64m = 0;  var r64m = 0;  var res = 0;  var k = 0;
+    while (k < 8) {
+        res = gpu_sweep_one(64, GPU_SWEEP_OUT_SUBOFF + (k << 2));
+        if ((res & 1) != 0) { a64m = a64m | (1 << k); }
+        if ((res & 2) != 0) { r64m = r64m | (1 << k); }
+        k = k + 1;
+    }
+    var a8m = 0;  var r8m = 0;  k = 0;
+    while (k < 8) {
+        res = gpu_sweep_one(8, GPU_SWEEP_OUT_SUBOFF + 0x100 + (k << 2));
+        if ((res & 1) != 0) { a8m = a8m | (1 << k); }
+        if ((res & 2) != 0) { r8m = r8m | (1 << k); }
+        k = k + 1;
+    }
+    kprint("gpu: SWEEP w64x8 alive=0x", 25); kprint_hex(a64m);
+    kprint(" retire=0x", 10);  kprint_hex(r64m);
+    kprintln("", 0);
+    kprint("gpu: SWEEP w8x8 alive=0x", 24); kprint_hex(a8m);
+    kprint(" retire=0x", 10);  kprint_hex(r8m);
     kprintln("", 0);
 
-    var nsum = a2 + a8 + a16 + a32 + a48 + a63 + a64;
-    if (nsum == 7) {
-        kprintln("gpu: SWEEP verdict = ALL ALIVE -> FORCE_SIMD_DIST fixed wave launch", 67);
+    # a64m==0xFF => 64-lane launch FIXED. a64m==a8m (same slots, width-independent) => POSITION-
+    # dependent (queue state advances per dispatch). a64m!=a8m => WIDTH-dependent. retire<0xFF bits
+    # => those dispatches HUNG (watchdog timeout) rather than launched-empty.
+    if (a64m == 0xFF) {
+        kprintln("gpu: SWEEP verdict = w64 ALL ALIVE -> multi-thread launch FIXED", 63);
         return 1;
     }
-    if (nsum == 0) {
-        kprintln("gpu: SWEEP verdict = ALL DEAD -> launch fully broken (not SIMD-routing)", 71);
+    if (a64m == a8m) {
+        kprintln("gpu: SWEEP verdict = w64==w8 slots -> POSITION-dependent (queue state)", 70);
         return 0;
     }
-    # non-monotonic / width-independent alive pattern = the SIMD round-robin signature; if this
-    # persists WITH FORCE_SIMD_DIST set, the fix is insufficient (revisit SIMD_DEST_CNTL / CU mask).
-    kprintln("gpu: SWEEP verdict = MIXED non-monotonic -> SIMD round-robin residual", 69);
+    kprintln("gpu: SWEEP verdict = w64 != w8 -> WIDTH-dependent (workgroup decode)", 68);
     return 0;
 }

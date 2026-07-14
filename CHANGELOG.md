@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.25] — 2026-07-13 — GPU arc C2g-1 diagnostic: width-vs-position + hang-vs-no-launch
+
+**C2g-1 burn 7** (1.54.24) proved the mabda-preamble match had ZERO effect — the sweep pattern was
+bit-identical to burns 5 and 6 for a third time (`rptr` advanced, confirming the registers landed).
+Five IB-register configurations (exec-set, START/RESTART, FORCE_SIMD_DIST, mabda's 4-register preamble)
+all yield the same width-dependent alive pattern ⟹ **the bug is not in the dispatch IB; it is agnos's
+own queue/MQD setup** (`gpu_queue_setup`, C2c) — mabda couldn't cover this because it submits its IB
+through the amdgpu DRM driver, which owns the queue. This cut stops guessing fixes and measures the
+failure mode.
+
+### Changed
+
+- **`gpu_shader_sweep` / `gpu_sweep_one` — pure diagnostic** (`kernel/core/gpu.cyr`): `gpu_sweep_one`
+  now returns a 2-bit code (bit0 = a store landed / wave executed; bit1 = the done-marker fired = the
+  ring retired, i.e. not a hang). `gpu_shader_sweep` now runs a **fixed `NUM_THREAD_X=64` to 8 slots**
+  and **`NUM_THREAD_X=8` to 8 slots**, reporting `alive` + `retire` bitmasks for each. This separates
+  **width-dependence** (`w64x8 alive=0x00` while `w8x8 alive=0xFF`) from **position-dependence**
+  (`w64x8 alive == w8x8 alive` ⟹ the queue accumulates state per dispatch → fix is HQD re-arm between
+  dispatches), and detects **hangs** (`retire` bits < 0xFF = watchdog timeout, not launched-empty).
+  No kernel-behavior change beyond the diagnostic; iron-only, flash `--update-all`.
+
 ## [1.54.24] — 2026-07-13 — GPU arc C2g-1: match mabda's HW-proven Cezanne compute preamble
 
 **C2g-1 burn 6** (1.54.23) proved FORCE_SIMD_DIST had ZERO effect (sweep pattern bit-identical to burn 5),
