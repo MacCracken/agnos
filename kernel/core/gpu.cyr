@@ -49,6 +49,14 @@ var gpu_display_pipe  = 0 - 1; # P0: the HUBP instance scanning out our console 
 var gpu_display_surf  = 0;   # P0: that pipe's FRONT surface MC address (the P1 restore target)
 var gpu_flip_ok       = 0;   # P1: 1 = scanout re-pointed to our back buffer + restored; -1 flip didn't latch; -2 restore didn't latch; -3 no frame boundary
 var gpu_vblank_ok     = 0;   # P2: 1 = frame counter advances + both scan phases observable (the pacing signal); -1 counter stuck; -2 no blank; -3 no active
+# blit#39 double-buffering (tear-free full-screen apps). Falls back to the direct FB when unarmed.
+var gpu_bb_armed      = 0;   # 1 = the two app buffers are WC-mapped + cleared
+var gpu_bb_a_phys     = 0;   # buffer A: CPU (carveout direct-DRAM window) / MC (what the HUBP fetches)
+var gpu_bb_a_mc       = 0;
+var gpu_bb_b_phys     = 0;   # buffer B
+var gpu_bb_b_mc       = 0;
+var gpu_bb_back       = 0;   # current RENDER target: 0 = A, 1 = B (the other is being scanned)
+var gpu_scanout_pid   = 0 - 1; # pid owning the scanout (-1 = the console owns it)
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -2450,4 +2458,108 @@ fn gpu_display_flip() {
     gpu_flip_ok = 1;
     kprintln("gpu: display double-buffered present online (8 paced flips)", 59);
     return 1;
+}
+
+# === 1.55.x display arc — blit#39 double-buffering (the payoff: tear-free full-screen apps) ===
+# blit#39 is the graphical-TAKEOVER path (doom/fbtest draw full-screen and never interleave with console
+# text). Wiring it here makes those apps tear-free with NO app change: the blit renders into a back buffer
+# and the present swaps it in during blank. Two consequences worth naming:
+#   * OWNERSHIP — while an app presents, the scanout is on ITS buffers, so console text (which still lands
+#     in the console's own framebuffer) is not visible. `gpu_display_restore_console` hands the screen back
+#     when the owning process exits, so a full-screen app quitting doesn't leave a blank console. A
+#     long-running compositor simply keeps the screen, which is correct.
+#   * PACING — the present blocks until the pipe takes the surface, so a blit is vsync-paced (≤ refresh).
+#     That is the point (tear-free), but it does mean a blit can block up to one frame.
+# Falls back to the direct live-FB path whenever the GPU/DCN isn't usable (e.g. QEMU) or P0 never found a
+# pipe, so existing behaviour is byte-identical off-iron.
+
+# gpu_blit_arm — lazily stand up the double-buffer: two VRAM buffers with the console FB's exact geometry
+# and pitch, WC-mapped and CLEARED. Clearing matters: an app that only paints part of the screen (a
+# letterboxed viewport) leaves black in the margins rather than stale pixels from two frames ago.
+fn gpu_blit_arm() {
+    if (gpu_bb_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_display_ok != 1) { return 0; }     # no pipe identified (P0) → direct path
+    if (gpu_display_pipe < 0) { return 0; }
+    if (gpu_display_surf == 0) { return 0; }
+    var bi = load64(&boot_info_ptr);
+    if (bi == 0) { return 0; }
+    var pitch  = load32(bi + 0x50) & 0xFFFFFFFF;
+    var height = load32(bi + 0x58) & 0xFFFFFFFF;
+    if (pitch == 0) { return 0; }
+    if (height == 0) { return 0; }
+    var fb_size = pitch * height;
+    var span = ((fb_size + 0x1FFFFF) >> 21) << 21;
+    var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
+    var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
+    gpu_bb_a_phys = (r_off  << 24) + GPU_FB_BACK_OFF;
+    gpu_bb_a_mc   = (r_base << 24) + GPU_FB_BACK_OFF;
+    gpu_bb_b_phys = gpu_bb_a_phys + span;
+    gpu_bb_b_mc   = gpu_bb_a_mc   + span;
+    var p = 0;
+    while (p < span) {
+        vmm_remap_wc_2mb(gpu_bb_a_phys + p);
+        vmm_remap_wc_2mb(gpu_bb_b_phys + p);
+        p = p + 0x200000;
+    }
+    var q = 0;
+    while (q < fb_size) { store64(gpu_bb_a_phys + q, 0); store64(gpu_bb_b_phys + q, 0); q = q + 8; }
+    gpu_mfence();
+    gpu_bb_back  = 0;
+    gpu_bb_armed = 1;
+    return 1;
+}
+
+# gpu_blit_target — where a blit should RENDER: the back buffer when double-buffering is available, else
+# the caller's direct live-FB base (unchanged legacy path).
+fn gpu_blit_target(fb_direct) {
+    if (gpu_blit_arm() != 1) { return fb_direct; }
+    if (gpu_bb_back == 0) { return gpu_bb_a_phys; }
+    return gpu_bb_b_phys;
+}
+
+# gpu_blit_present — swap the freshly-rendered back buffer in: flip (HIGH then LOW) → block until the pipe
+# takes it at the next blank (tear-free, and vsync-paces the caller) → the other buffer becomes the render
+# target. Records the owning pid so exit() can hand the screen back.
+fn gpu_blit_present(pid) {
+    if (gpu_bb_armed != 1) { return 0; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (tgt >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, tgt & 0xFFFFFFFF);
+    gpu_mfence();
+    gpu_display_wait_vblank(gpu_display_pipe);
+    if (gpu_bb_back == 0) { gpu_bb_back = 1; } else { gpu_bb_back = 0; }
+    gpu_scanout_pid = pid;
+    return 1;
+}
+
+# gpu_display_restore_console — hand the screen back to the console by re-pointing the scanout at the
+# console's own framebuffer. Called when the process owning the scanout exits: without this, a full-screen
+# app quitting would leave its last frame on the panel while console text scrolled invisibly into a buffer
+# nothing is scanning.
+fn gpu_display_restore_console() {
+    if (gpu_scanout_pid < 0) { return 0; }     # console already owns it
+    if (gpu_display_ok != 1) { return 0; }
+    if (gpu_display_pipe < 0) { return 0; }
+    if (gpu_display_surf == 0) { return 0; }
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_display_surf >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_display_surf & 0xFFFFFFFF);
+    gpu_mfence();
+    gpu_display_wait_vblank(gpu_display_pipe);
+    gpu_scanout_pid = 0 - 1;
+    gpu_bb_back = 0;
+    return 1;
+}
+
+# gpu_release_pid — the display half of the per-pid release chain (cf. flock_release_pid / snd_release_pid):
+# if this process owned the scanout, hand the screen back to the console as it exits. A process that never
+# presented is a no-op, and a long-running compositor simply never exits — so it keeps the screen.
+fn gpu_release_pid(pid) {
+    if (gpu_scanout_pid != pid) { return 0; }
+    return gpu_display_restore_console();
 }

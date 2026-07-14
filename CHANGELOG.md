@@ -5,6 +5,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.6] — 2026-07-14 — blit#39 double-buffered: tear-free full-screen apps, no app change
+
+The payoff of the display arc. `blit`#39 is the graphical-TAKEOVER path (doom/fbtest draw full-screen and
+never interleave with console text), so it is wired straight onto the present primitive proven in
+1.55.0–1.55.5: the blit renders into a back buffer and the finished frame is swapped in during blank.
+
+### Added
+
+- **`gpu_blit_arm`** (`kernel/core/gpu.cyr`): lazily stands up two VRAM buffers with the console FB's exact
+  geometry and pitch, WC-mapped and **CLEARED**. Clearing is load-bearing — an app that paints only part of
+  the screen (a letterboxed viewport) leaves black in the margins rather than stale pixels from two frames
+  ago. Buffers live at VRAM offset 1 GB (+ one 2 MB-aligned span), clear of the console FB, PSP TMR and
+  compute arena; **the console's own buffer is never touched**.
+- **`gpu_blit_target`**: where a blit renders — the back buffer when the DCN pipe is ours (P0), else the
+  caller's direct live-FB base.
+- **`gpu_blit_present`**: flips the scanout to the freshly-rendered buffer, **blocks until the pipe takes it
+  at the next blank**, then swaps the render target. Tear-free, and it vsync-paces the caller.
+- **`gpu_release_pid`** + **`gpu_display_restore_console`**: the ownership answer, following the existing
+  per-pid release idiom (`flock_release_pid` / `snd_release_pid`). When the process owning the scanout
+  exits, the screen is handed back to the console — otherwise a full-screen app quitting would leave its
+  last frame on the panel while console text scrolled invisibly into a buffer nothing is scanning. A
+  long-running compositor never exits, so it keeps the screen, which is correct.
+
+### Changed
+
+- **`blit`#39 renders to the back buffer + presents** (`kernel/core/syscall.cyr`): `bl_fb` now comes from
+  `gpu_blit_target`, and the frame is presented after the copy loops. Geometry/pitch are the console FB's,
+  so every in-bounds proof in the handler still holds. **Falls back to the direct live-FB path** whenever
+  the GPU/DCN isn't usable (e.g. QEMU) or P0 never identified a pipe — legacy behaviour is byte-identical
+  off-iron (**verified: `doom-smoke.sh` PASS, 240 colors, DOOM renders normally**).
+- **`exit`#0** releases the display alongside flock/snd (`gpu_release_pid`).
+
+### Behaviour notes (honest)
+
+- **A blit can now block up to one frame** (the vsync wait). That is the point — tear-free and paced — but
+  it is a real change: a full-screen app is capped at the refresh rate.
+- **Partial-blit apps**: both buffers are cleared at arm and today's consumers (doom/fbtest) redraw fully
+  each frame, so this is correct for them. An app doing incremental partial updates would see two-frame-old
+  content — that is when an explicit `present` API earns its place.
+
+Iron: DOOM should render tear-free with **no app change**, and quitting it should return the console rather
+than leaving its last frame up.
+
 ## [1.55.5] — 2026-07-14 — The double-buffered present loop (tear-free, paced by the display's own clock)
 
 ### Changed

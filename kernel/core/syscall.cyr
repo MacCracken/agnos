@@ -918,6 +918,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # fork-per-accept worker that dies mid-turn can't strand the shared world).
         flock_release_pid(proc_current_get());
         snd_release_pid(proc_current_get());      # release any snd#64 audio slot (Gate 2)
+        gpu_release_pid(proc_current_get());      # 1.55.x: if it owned the scanout, hand the screen back
+        # to the console (else a full-screen app quitting would
+        # leave its last frame up while console text scrolled
+        # invisibly into a buffer nothing is scanning)
         if (proc_current_get() < proc_count) {
             proc_set_state(proc_current_get(), 0);
             # 1.53.x B3b: clear this CPU's FP owner if it named the exiting proc (same
@@ -1876,8 +1880,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
         if (bl_w > 8192) { stack_canary_check(canary); return 0 - 1; }   # sanity cap (w*h*4 can't overflow)
         if (bl_h > 8192) { stack_canary_check(canary); return 0 - 1; }
         if (is_user_range(arg1, bl_w * bl_h * 4) == 0) { stack_canary_check(canary); return 0 - 1; }
-        var bl_fb = fb_fb_phys();
-        if (bl_fb == 0) { stack_canary_check(canary); return 0 - 1; }    # no framebuffer
+        var bl_fb_direct = fb_fb_phys();
+        if (bl_fb_direct == 0) { stack_canary_check(canary); return 0 - 1; }    # no framebuffer
+        # 1.55.x display arc: render into the DOUBLE-BUFFER's back buffer when the DCN pipe is ours (P0),
+        # so the finished frame can be swapped in during blank (tear-free) instead of being drawn straight
+        # into the live scanout. Falls back to the direct live-FB base — byte-identical legacy behaviour —
+        # whenever the GPU/DCN isn't usable (e.g. QEMU) or P0 never identified a pipe. Geometry/pitch are
+        # the console FB's, so every bound proven below still holds for the back buffer.
+        var bl_fb = gpu_blit_target(bl_fb_direct);
         var bl_fw = fb_width();
         var bl_fh = fb_height();
         var bl_pitch = fb_pitch();
@@ -1971,6 +1981,10 @@ fn ksyscall(num, arg1, arg2, arg3) {
                 }
             }
         }
+        # 1.55.x: the frame is complete in the back buffer — PRESENT it. Flips the pipe's scanout to it and
+        # blocks until the hardware takes it at the next blank: tear-free, and it vsync-paces the caller
+        # (a blit can therefore block up to one frame — that is the point). No-op on the direct path.
+        gpu_blit_present(proc_current_get());
         stack_canary_check(canary);
         return 0;
     }
