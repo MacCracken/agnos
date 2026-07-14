@@ -28,9 +28,9 @@ audio is silent (the 1.53.5 HDA HDMI/DP work reaches the codec but the DCN audio
 | **P1** | Double-buffer / tear-free flip — re-point HUBP `DCSURF_PRIMARY_SURFACE_ADDRESS` to a second buffer; wire kernel-mediated double-buffer into `blit`#39. Needs P0's HUBP surface register proven. | IRON FB photo — no tearing |
 | **P2** | Vblank pacing — poll OTG scan position; flip-on-vblank so P1's re-point lands in blank. | IRON — clean present cadence |
 | **P3a** | **Display-audio state probe** (read-only) — resolve every open question before writing an audio register. **DONE (iron 1.55.8/1.55.9).** Results: the link is **HDMI on DIG1 in DIG_MODE=2 (DVI)**; DMCUB is **not** in the path; the **AZ window is awake and correctly addressed** (index-writeback discriminator) so **no SMU PME mailbox is needed**; the audio DTOs are unprogrammed. | IRON — done |
-| **P3b-i** | **Pixel-clock discovery** (read-only) — the HDMI audio DTO's MODULE field **is** the pixel clock in 100 Hz units (`dce_audio.c` `get_azalia_clock_info_hdmi`) and the ACR CTS derives from it, but the DCCG register that would hold it is only populated on a **DP-driven** pipe — this link is HDMI, so it reads 0. Derive instead: **pixel clock = h_total × v_total × refresh**, with the totals read from the OTG and the **refresh measured against the free-running PIT ch0 and snapped to the standard rate**. | IRON — geometry + rate match the standard mode |
+| **P3b-i** | **Pixel-clock discovery** (read-only) — the HDMI audio DTO's MODULE field **is** the pixel clock in 100 Hz units (`dce_audio.c` `get_azalia_clock_info_hdmi`) and the ACR CTS derives from it, but the DCCG register that would hold it is only populated on a **DP-driven** pipe — this link is HDMI, so it reads 0. Derive instead: **pixel clock = h_total × v_total × refresh**, totals from the OTG, refresh **measured** against the free-running PIT ch0. **DONE (iron 1.55.11).** `gpu_pixclk_100hz` = **2415030** (241.503 MHz, 13 ppm off the 241.500 MHz standard). 1.55.10 snapped the refresh to a table and iron falsified it (176 ppm error); 1.55.11 deleted the snap. | IRON — **PASS**: `link 2560x1440 total 2720x1481 blanking 160x41` · `windows agree within 12 ppm` · `241503 kHz, 13 ppm from the 241500 kHz step` |
 | **P3b-ii** | **DVI→HDMI mode change** on the live link (`DIG_MODE` 2→3) — the risky bite: it rewrites the encoder carrying the console. | IRON — console survives, audio packets possible |
-| **P3b-iii** | **Audio programming** — DCCG audio DTO → AZ endpoint enable → AFMT/SDP → ACR. Write order is **hardware-enforced** (source/select before module/phase, MODULE before PHASE); a reordered sequence fails **silently**. Closes the 1.53.5 HDA backlog: the codec already streams samples; this programs the DCN side that embeds them. | IRON — tone from the sink |
+| **P3b-iii** | **Audio programming** — DCCG audio DTO → AZ endpoint enable → AFMT/SDP → ACR. Write order: **source/select (`DTO0_SOURCE_SEL` + `DTO_SEL`) before MODULE and PHASE** is hardware-enforced (AMD's `dce_audio.c` warning) and a violation fails **silently**; **MODULE before PHASE** merely matches AMD's observed order and is **not** documented as required — write it that way, but never debug against it as if it were a constraint. Full derivation + provenance in `gpu_regs.cyr`'s P3 header. Closes the 1.53.5 HDA backlog: the codec already streams samples; this programs the DCN side that embeds them. | IRON — tone from the sink |
 | **P4** | Scanout-residue clear (Quiet-Boot legibility) via the P1 re-point primitive — clean first paint. | IRON photo |
 | **P6+** | **The deep end** (likely a follow-on arc): 3D path (RADV-derived GFX-ring blits, needs the C1/C2 ring machinery) + full mode-set (DCN mode-set / DP link-training / DMCUB). In the ambition, not this arc's core. | IRON |
 
@@ -85,11 +85,18 @@ fb_width/fb_height is reading the wrong plane of the pipe** — that was 1.55.10
 because 2720 > 800. Use `OTG_H/V_BLANK_START_END` (active = START − END; programmed with **no −1**, so
 convention-free).
 
-**Still unproven:** the *mechanism*. Upscaling (DSCL stretching 800x600 into the 2560x1440 raster) fits, but so
-does **centring with DSCL in bypass** (an 800x600 island with black borders) — the console photo favours
-upscaling, but no scaler register has been read. To settle it: `DSCL0_SCL_MODE` 0x0CEC (DSCL_MODE[2:0], 6 =
-bypass) · `SCL_HORZ_FILTER_SCALE_RATIO` 0x0CF1 (ratio = raw / 2^24) · `RECOUT_SIZE` 0x0D03 (DPP stride 0x16B).
-**This does not block P3b** — DSCL sits upstream of OTG/DIG/PHY, so the link clock is untouched by any scaling.
+**Confirmed from hardware at 1.55.11**: the blank registers report the link active as **2560x1440**, not
+800x600 — so the surface and the raster genuinely differ and the pipe scaler is engaged. The *mechanism* is
+still unread: upscaling (DSCL stretching 800x600 into the raster) fits, but so does **centring with DSCL in
+bypass** (an 800x600 island with black borders); the console photo favours upscaling. To settle it:
+`DSCL0_SCL_MODE` 0x0CEC (DSCL_MODE[2:0], 6 = bypass) · `SCL_HORZ_FILTER_SCALE_RATIO` 0x0CF1 (ratio = raw /
+2^24) · `RECOUT_SIZE` 0x0D03 (DPP stride 0x16B). **This does not block P3b** — DSCL sits upstream of
+OTG/DIG/PHY, so the link clock is untouched by any scaling.
+
+**Geometry closure is now the totals' independent witness.** The blank registers carry **no -1**, so
+`active = START - END` is convention-free; `h_total - h_active = 2720 - 2560 = 160` lands exactly on CVT-RB's
+mandated hblank, where a wrong -1 would give 159 and match no standard. The `blanking 160x41` log line is
+therefore a self-check on the totals decode on every boot — not a decoration.
 
 ### P3b-i pixel-clock derivation — settled facts (do NOT re-litigate)
 

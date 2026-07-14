@@ -117,8 +117,20 @@ var GPU_FB_BACK_LIMIT       = 0x60000000;
 #  * Azalia endpoint indices are the **F0 window ordinals** from dce_11_0_d.h (HOT_PLUG_CONTROL=0x54 etc.).
 #    dcn_2_1_0_offset.h's ixAZALIA_F2_* are the codec-VERB space (0x3707 == HDA verb 0x707) — writing an F2
 #    index into REG_INDEX would poke an unintended codec register. Top burn risk; hard-coded below.
-#  * Write order is HARDWARE-ENFORCED (AMD's own warning in dce_audio.c): DTO source/select BEFORE
-#    module/phase, MODULE before PHASE — a reordered sequence fails SILENTLY (no audio, no fault).
+#  * Write order — one half is HARDWARE-ENFORCED, the other is only convention. Do not conflate them:
+#      - ENFORCED: DTO0_SOURCE_SEL + DTO_SEL BEFORE MODULE and PHASE. AMD's own warning in dce_audio.c
+#        (dce_aud_wall_dto_setup): "These bits must be programmed first, otherwise there will be no HDMI
+#        audio at boot up." It fails SILENTLY — no audio, no fault. Note it binds those two FIELDS, not
+#        the whole DTO_SOURCE register: AMD writes DTO2_USE_512FBR_DTO (same register, 0xAB) LAST on the
+#        DP path, after MODULE/PHASE.
+#        PROVENANCE (do not overstate this either): that warning is scoped "On TN/SI" and describes itself
+#        as a sequence change "different from old ASICs" — it is NOT a documented DCN2.1 claim. It reaches
+#        Renoir by CONVERGENCE: dcn21 wires dce_audio_create(), so this is literally the code our hardware
+#        would run. The inference is strong and the failure is silent, so program it as enforced — but if
+#        iron ever contradicts it, that is a legitimate finding, not a violation of this comment.
+#      - NOT documented as required: MODULE before PHASE. AMD happens to write it that way; no source
+#        states the relative order matters. Keep writing MODULE first (matching prior art costs nothing),
+#        but do NOT treat it as a constraint — chasing it as one would burn a debug cycle on a non-cause.
 #
 # --- DCCG (BASE_IDX 1 = GPU_BASE_DCN_1) ---
 var GPU_R_OTG_PIXEL_RATE_CNTL = 0x80;   # OTGn, stride 4: DP_DTOn_ENABLE bit4 = THE DP/HDMI discriminator
