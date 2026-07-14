@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.1] — 2026-07-14 — P0 diagnostic: localize the DCN surface no-match
+
+### Added
+
+- **P0 read-only diagnostic dump** (`kernel/core/gpu.cyr` `gpu_display_probe`): the 1.55.0 P0 burn falsified
+  cleanly (`gpu: display pipe surface not matched` — read the DCN, no hang, booted through), so this adds a
+  labeled-hex dump of the actual reads to triage base-vs-shift-vs-domain-vs-`fb_phys` before theorizing a fix
+  (per the iron-debugging discipline — get the data first). Prints `fb_phys` + `expected_mc` (what we search
+  for), each pipe's `OTG_CONTROL` + HUBP surface address (what the DCN holds), and `DCE_VERSION` (seg1 base
+  sanity). Read-only, zero-hang-risk; a temporary diagnostic removed once P0 passes (same pattern as the
+  C2g-1 sweep). Interpretation: sane `dce=` ⇒ register model alive; all-`0`/all-`ff` `otg=` ⇒ wrong DCN base;
+  `surf == fb>>8` ⇒ address shift; plausible-but-different `surf` ⇒ wrong address domain.
+
+Iron-only; flash `--update-all` then `run /bin/klug > p0diag.txt` and read the `gpu: dcn diag …` lines.
+
 ## [1.55.0] — 2026-07-14 — Kernel DISPLAY arc opens (Thrust P) + P0: read-only DCN 2.1 live-pipe probe
 
 The GPU **compute** thrust (the 1.54.x arc) is complete end-to-end — sovereign gfx90c compute proven on

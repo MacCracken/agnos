@@ -2253,6 +2253,23 @@ fn gpu_display_probe() {
         n = n + 1;
     }
 
+    # --- P0 DIAGNOSTIC (localize the no-match; labeled hex, removed once P0 passes) ---
+    # fb/mc = what we search for; per-pipe otg/surf = what the DCN actually holds; dce = seg1 base sanity.
+    kprint("gpu: dcn diag fb=", 17); kprint_hex(fb_phys);
+    kprint(" mc=", 4); kprint_hex(expected_mc); kprintln("", 0);
+    var dq = 0;
+    while (dq < GPU_DCN_PIPES) {
+        var octl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL + dq * GPU_DCN_OTG_STRIDE);
+        var dslo = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR    + dq * GPU_DCN_HUBP_STRIDE) & 0xFFFFFFFF;
+        var dshi = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + dq * GPU_DCN_HUBP_STRIDE) & 0xFFFF;
+        kprint("gpu: dcn diag pipe", 18); kprint_num(dq);
+        kprint(" otg=", 5); kprint_hex(octl);
+        kprint(" surf=", 6); kprint_hex((dshi << 32) | dslo);
+        kprintln("", 0);
+        dq = dq + 1;
+    }
+    kprint("gpu: dcn diag dce=", 18); kprint_hex(gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCE_VERSION)); kprintln("", 0);
+
     if (pipe >= 0) {
         if (lit_otg >= 0) {
             gpu_display_ok = 1;
