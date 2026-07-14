@@ -5,6 +5,77 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.10] — 2026-07-14 — P3b-i: pixel-clock discovery
+
+The HDMI audio DTO's `MODULE` field **is** the pixel clock in 100 Hz units (`dce_audio.c`
+`get_azalia_clock_info_hdmi`: `audio_dto_module = actual_pixel_clock_100Hz`), and the ACR CTS derives from it
+too — so P3b cannot program a single audio register without it. The DCCG register that would simply *hold* the
+pixel clock is only populated on a **DP-driven** pipe; this link is HDMI (`DP_DTO0_ENABLE`=0, iron 1.55.8), so
+it reads 0 and the clock has to be **derived**. Read-only; gated on P0; no-ops where there is no AMD GPU.
+
+### Added
+
+- **`gpu_pixclk_discover()`** (`kernel/core/gpu.cyr`) — derive the live pixel clock as
+  **`h_total x v_total x refresh`**: the totals read straight from the OTG, the refresh **measured against the
+  free-running PIT channel 0** and then **snapped to the standard rate**. Result lands in `gpu_pixclk_100hz` —
+  one value, computed once, used by every consumer downstream. `0` means not derived, and P3b must then refuse
+  to program the DTO rather than guess.
+- **`gpu_pixclk_ticks(pipe, frames)`** — the measurement primitive: PIT ch0 ticks spanned by exactly `frames`
+  vsync boundaries, both endpoints detected through the same poll loop so their detection latency largely
+  cancels.
+- **OTG timing registers** (`kernel/core/gpu_regs.cyr`, all `BASE_IDX 2`, stride 0x80): `OTG_H_TOTAL` 0x1b2a ·
+  `OTG_V_TOTAL` 0x1b2f · `OTG_H_TIMING_CNTL` 0x1b2e · `OTG_INTERLACE_CONTROL` 0x1b44; totals `[14:0]`.
+
+### Fixed
+
+- **`OTG_STATUS_FRAME_COUNT` mask was 16-bit; the field is `[23:0]`.** Harmless for
+  `gpu_display_wait_vblank`'s change-detect (any change ends the wait), but it would corrupt any frame
+  *counting* every 65536 frames — which is exactly what this cut's refresh measurement does. Replaced the two
+  hardcoded `0xFFFF` sites with `GPU_OTG_FRAME_COUNT_MASK` (0xFFFFFF).
+
+### Why the refresh is snapped, and not the pixel clock
+
+The refresh measurement uses **only** the frame counter and the PIT, so it cannot be corrupted by a misread
+total, and a snapped rate is *exact* where a measured one would carry its error into the DTO forever. Snapping
+the finished pixel clock instead would let a `total-1` error (~1300 ppm) **mis-snap 60 Hz to 59.94 Hz** — they
+are only ~1000 ppm apart — shipping a silently-wrong clock rather than failing loudly. This decoupling is
+load-bearing, not stylistic.
+
+### Read-and-refuse gates (assume nothing)
+
+- **Interlace** (`OTG_INTERLACE_CONTROL` bit0) and **half pixel rate** (`OTG_H_TIMING_CNTL.DIV_BY2` bit0) each
+  break the `h_total x v_total x refresh` relation ⇒ refuse. dcn21 has **no `OTG_H_TIMING_DIV_MODE` field at
+  all** (zero hits in its `_sh_mask.h`) — the dcn10 DIV_MODE branch is for later parts; bit0 is the whole story
+  here.
+- **A total that does not exceed the active size is not a total** — cross-checked against `fb_width()` /
+  `fb_height()`.
+- **Snap tolerance 500 ppm — refuse rather than mis-snap.** A silently-wrong DTO module is inaudible to test
+  but wrong forever. A correct read lands within tens of ppm; every plausible fault (misread total ~1300 ppm,
+  missed PIT wrap ~3%, non-standard mode) lands far outside. The tolerance is itself the check on the whole
+  derivation.
+
+### Derivation notes (durable — see `docs/development/planning/kernel-display-arc-155x.md`)
+
+- **Both totals hold `total - 1`.** `dcn10_optc.c` `optc1_program_timing`: `/* CRTC_H_TOTAL = vesa.h_total - 1 */`
+  and, on the line *before* the `OTG_V_TOTAL` write, `v_total = patched_crtc_timing.v_total - 1;`. The V write
+  *looks* raw — the asymmetry is only apparent, and reading the write site without the preceding line is a
+  trap. It is a counter-wrap value ⇒ a hardware convention every firmware obeys, not a driver choice. The raw
+  register values are logged alongside the corrected ones so the burn shows the convention confirming itself.
+- `apply_front_porch_workaround()` clamps `v_front_porch` **only** — it never touches a total.
+- The header's `OTG_CONTROL` 0x1b41 / `OTG_STATUS` 0x1b49 / `OTG_STATUS_FRAME_COUNT` 0x1b4c match three
+  **iron-proven** values exactly — confirmation that `dcn_2_1_0` describes this part (Cezanne reuses Renoir's
+  DCN 2.1) before trusting any new offset from it.
+- **No new timebase was needed.** `pit_ch0_read()` (`apic.cyr`) already existed and is iron-proven (it is what
+  `lapic_calibrate` uses): a non-destructive latch read of ch0, which `pic_init()` leaves free-running as a
+  **mode-2** rate generator (divisor 11932 ⇒ exactly 11932 ticks per period, decrementing by **one** — mode 3
+  would step by two and break the wrap math). `pic_mask_pit()` masks IRQ0 at the 8259 but **never touches the
+  counter**. CPUID 0x15/0x16 read zero on this exact part, so the TSC route was closed anyway.
+- **The GPU probes run with IF=0** (no `sti` before them — "Interrupts enabled" is ~2000 lines later), so no ISR
+  and no scheduler can perturb a window. **SMI is the only contaminant**; it can only ever *add* time, and only
+  an SMI landing **on a window endpoint** biases anything (one mid-window delays the polling, not the two clocks
+  being compared). Hence **5 short windows of 20 frames (~0.33 s each), keep the shortest** — measurement error
+  ~30 ppm against a 500 ppm need.
+
 ## [1.55.9] — 2026-07-14 — P3a-2: Azalia window discriminator (D3 vs wrong-offset)
 
 The 1.55.8 probe read `hpc=0` on all four Azalia endpoints. That is **two very different diagnoses wearing

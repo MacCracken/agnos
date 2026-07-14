@@ -185,7 +185,7 @@ fn fb_console_init() {
     # warning. Linux ref: drivers/video/fbdev/efifb.c rejects modes
     # outside the two 8-bit-per-channel-with-reserved formats.
     if (diag_pf > 1) {
-        serial_println("fb: WARN unsupported PixelFormat, FB paint disabled, serial-only console", 73);
+        serial_println("fb: WARN unsupported PixelFormat, FB paint disabled, serial-only console", 72);
         fb_console_ready = 0;
         return 0;
     }
@@ -302,7 +302,7 @@ fn fb_shadow_init() {
     var n = (need + 0x1FFFFF) / 0x200000;
     var base = pmm_alloc_2mb_run(n);
     if (base == 0) {
-        serial_println("fb: shadow alloc failed, direct-paint (scroll reads WC FB)", 57);
+        serial_println("fb: shadow alloc failed, direct-paint (scroll reads WC FB)", 58);
         return 0;
     }
     # One-time sync: copy the current FB image (boot log already painted) into the

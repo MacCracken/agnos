@@ -407,7 +407,7 @@ fn test_initrd() {
 
 # === Main Test Runner ===
 fn sh_cmd_test() {
-    serial_println("=== AGNOS Kernel Test Suite ===", 30);
+    serial_println("=== AGNOS Kernel Test Suite ===", 31);
     test_pass = 0;
     test_fail = 0;
 

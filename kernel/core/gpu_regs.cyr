@@ -74,7 +74,11 @@ var GPU_R_OTG_STATUS     = 0x1B49;   # OTGn OTG_STATUS: V_BLANK bit0 / V_ACTIVE_
 var GPU_DCN_OTG_STRIDE   = 0x80;     # per-OTG instance stride
 var GPU_OTG_MASTER_EN    = 0x1;      # OTG_CONTROL bit0
 # P2 vblank pacing — the frame counter increments once per vsync: the signal a present loop paces on.
-var GPU_R_OTG_FRAME_COUNT = 0x1B4C;  # OTGn OTG_STATUS_FRAME_COUNT [15:0] — +1 per vsync on a scanning pipe
+var GPU_R_OTG_FRAME_COUNT = 0x1B4C;  # OTGn OTG_STATUS_FRAME_COUNT — +1 per vsync on a scanning pipe.
+# The field is **[23:0]** (mask 0x00FFFFFF), NOT [15:0] as this comment previously claimed. Harmless for the
+# change-detect in gpu_display_wait_vblank (any change ends the wait), but a 16-bit mask would corrupt any
+# frame COUNTING (e.g. deriving a refresh rate) every 65536 frames. Use the full 24 bits.
+var GPU_OTG_FRAME_COUNT_MASK = 0xFFFFFF;
 var GPU_OTG_V_BLANK       = 0x1;     # OTG_STATUS bit0 — pipe is in vertical blank
 var GPU_OTG_V_ACTIVE      = 0x2;     # OTG_STATUS bit1 — pipe is in active display
 # HUBP/HUBPREQ — scanout surface (stride 0xDC). The surface-address match is the P0 pass gate.
@@ -148,6 +152,51 @@ var GPU_DCN_AZ_STRIDE         = 0x6;
 var GPU_AZ_IX_HOT_PLUG_CONTROL = 0x54;  # F0 ordinal: CLOCK_ON_STATE b4 (RO), AUDIO_ENABLED b31 — the D3 gate
 var GPU_AZ_IX_RESPONSE_CFG_DEF = 0x56;  # F0 ordinal: PORT_CONNECTIVITY[31:30] — a real endpoint is NOT all-zero
 var GPU_AZ_IX_CONV_STREAM_ID   = 0x03;  # F0 ordinal: STREAM_ID[7:4] — should echo agnos's HDA stream tag if bound
+
+# --- P3b prerequisite: pixel-clock discovery (OTG timing, BASE_IDX 2, stride 0x80) ---
+# The HDMI audio DTO's MODULE field IS the pixel clock in 100 Hz units (dce_audio.c
+# get_azalia_clock_info_hdmi: audio_dto_module = actual_pixel_clock_100Hz), and the ACR CTS needs it too —
+# but the DCCG's DP_DTO_PHASE register only *holds* the pixel clock while the DP DTO drives the pipe. This
+# link is HDMI (DP_DTO0_ENABLE=0), so that register reads 0 and the clock has to be derived instead:
+#     pixel clock = h_total x v_total x refresh
+# h_total/v_total are read exactly from the OTG; refresh is measured against PIT ch0 and snapped to the
+# standard rate. Snapping the REFRESH (not the pixel clock) is deliberate: the measurement comes from the
+# frame counter + PIT alone, so it cannot be corrupted by a misread total, and the snapped rate is then exact.
+#
+# BOTH totals hold **total - 1** (dcn10_optc.c optc1_program_timing: "CRTC_H_TOTAL = vesa.h_total - 1" and
+# `v_total = patched_crtc_timing.v_total - 1` on the line before the OTG_V_TOTAL write). The asymmetry is
+# only apparent — the V write looks raw because the -1 already happened. This is a counter-wrap value, so it
+# is a hardware convention every firmware obeys, not a driver choice. apply_front_porch_workaround() clamps
+# v_front_porch only and never touches a total.
+var GPU_R_OTG_H_TOTAL          = 0x1B2A; # OTGn OTG_H_TOTAL: OTG_H_TOTAL[14:0] = h_total - 1
+var GPU_R_OTG_V_TOTAL          = 0x1B2F; # OTGn OTG_V_TOTAL: OTG_V_TOTAL[14:0] = v_total - 1
+var GPU_R_OTG_H_TIMING_CNTL    = 0x1B2E; # OTGn OTG_H_TIMING_CNTL: OTG_H_TIMING_DIV_BY2 bit0
+var GPU_R_OTG_INTERLACE_CONTROL = 0x1B44; # OTGn OTG_INTERLACE_CONTROL: OTG_INTERLACE_ENABLE bit0
+var GPU_OTG_TOTAL_MASK         = 0x7FFF; # both totals are [14:0]
+# Two timing modes break the pixel clock = h_total x v_total x refresh relation. READ AND REFUSE — do not
+# assume either is clear. DIV_BY2 means two pixels per container (YCbCr420 / an ODM 2:1 pipe split), so the
+# OTG counts at half the pixel rate. dcn21 has NO OTG_H_TIMING_DIV_MODE field at all (only DIV_BY2), so bit0
+# is the whole story on this part.
+var GPU_OTG_H_TIMING_DIV_BY2   = 0x1;
+var GPU_OTG_INTERLACE_ENABLE   = 0x1;
+# PIT channel 0 — the measurement timebase. pic_init() programs ch0 as a mode-2 rate generator (out 0x43,
+# 0x34) with divisor 11932 and leaves it free-running; pic_mask_pit() masks IRQ0 at the 8259 but never
+# touches the counter, so pit_ch0_read() (apic.cyr, a non-destructive latch read) stays valid for the whole
+# boot. Mode 2 decrements by ONE per tick and reloads after exactly `divisor` ticks — mode 3 would step by
+# two and break the wrap math. The GPU probes run with IF=0 (no sti anywhere in the boot path), so nothing
+# but an SMI can perturb a measurement window.
+var GPU_PIT_HZ                 = 1193182; # the 8254 input clock (pic.cyr's divisor comment rounds to 1193180 — 1.7 ppm, immaterial)
+var GPU_PIT_CH0_DIV            = 11932;   # ch0 reload — one full period, and the wrap credit
+# Measurement shape. Only an SMI landing ON a window endpoint can bias a reading, and an SMI can only ever
+# ADD time, so take the MINIMUM tick count over several short windows: short windows are less likely to catch
+# an SMI at all, and the minimum is the least-contaminated of them. 20 frames ~ 0.33 s at 60 Hz, where the
+# PIT's 838 ns tick and the ~4 us poll granularity are each well under 30 ppm — vs the ~500 ppm needed to
+# separate the closest candidate pair (59.94 vs 60 Hz are ~1000 ppm apart).
+var GPU_PIXCLK_FRAMES          = 20;
+var GPU_PIXCLK_TRIALS          = 5;
+var GPU_PIXCLK_GUARD           = 1000000; # ~4 s of polling: a "pipe stopped scanning" backstop, not a delay
+var GPU_PIXCLK_SNAP_PPM        = 500;     # refuse rather than mis-snap: half the 59.94-vs-60 separation
+var GPU_PIXCLK_CANDS           = 17;
 
 # --- Field masks ---
 var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id (reads 0x0 on Cezanne — quirk)

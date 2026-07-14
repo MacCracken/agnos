@@ -59,6 +59,10 @@ var gpu_scanout_pid   = 0 - 1; # pid owning the scanout (-1 = the console owns i
 # P3a display-audio discovery (read-only probe results)
 var gpu_audio_dp      = 0 - 1; # 1 = the lit stream is DP (DTO1, constant module); 0 = HDMI (DTO0, pixel-clock module); -1 = unknown
 var gpu_audio_dig     = 0 - 1; # the live stream encoder (DIG) carrying the lit stream
+# P3b: the live pixel clock in 100 Hz units — THE value the HDMI audio DTO's MODULE field takes (and what the
+# ACR CTS is computed from). 0 = not derived (then P3b must not program the DTO). Derived, not read: the
+# DCCG's DP_DTO_PHASE register only holds the pixel clock on a DP-driven pipe, and this link is HDMI.
+var gpu_pixclk_100hz  = 0;
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -2303,10 +2307,10 @@ fn gpu_display_probe() {
 # Bounded (~50 ms ≥ 3 frames at 60 Hz) so a stopped pipe can never wedge the boot. 1 = boundary crossed.
 fn gpu_display_wait_vblank(pipe) {
     var fc_off = GPU_R_OTG_FRAME_COUNT + pipe * GPU_DCN_OTG_STRIDE;
-    var f0 = gpu_reg32(GPU_BASE_DCN_2, fc_off) & 0xFFFF;
+    var f0 = gpu_reg32(GPU_BASE_DCN_2, fc_off) & GPU_OTG_FRAME_COUNT_MASK;
     var i = 0;
     while (i < 5000) {
-        if ((gpu_reg32(GPU_BASE_DCN_2, fc_off) & 0xFFFF) != f0) { return 1; }
+        if ((gpu_reg32(GPU_BASE_DCN_2, fc_off) & GPU_OTG_FRAME_COUNT_MASK) != f0) { return 1; }
         gpu_udelay(10);
         i = i + 1;
     }
@@ -2577,6 +2581,178 @@ fn gpu_audio_probe() {
     gpu_audio_dp = 0;
     gpu_audio_dig = live_dig;
     kprint("gpu: display audio path is HDMI on dig ", 39); kprint_num(live_dig); kprintln("", 0);
+    return 1;
+}
+
+# === 1.55.x P3b prerequisite — pixel-clock discovery ===
+# The HDMI audio DTO needs the pixel clock in 100 Hz units, and the DCCG register that would hold it is only
+# populated on a DP-driven pipe (this link is HDMI, so it reads 0). Derive it instead:
+#     pixel clock = h_total x v_total x refresh
+# h_total/v_total come straight from the OTG; refresh is MEASURED and then snapped to the standard rate.
+# Snapping the refresh rather than the finished pixel clock is the load-bearing choice: the measurement is
+# made from the frame counter and PIT alone, so it is immune to a misread total, and a snapped rate is exact
+# where a measured one would carry the measurement's error into the DTO forever.
+
+# The standard refresh rates, as exact rationals. The /1001 entries are the NTSC-fractional pairs (59.94 =
+# 60000/1001), which sit ~1000 ppm from their integer twins — the closest pair in the table and the reason the
+# snap tolerance is 500 ppm. Kept as num/den rather than a rounded constant so the pixel clock stays exact.
+fn gpu_pixclk_cand_num(i) {
+    if (i == 0)  { return 60; }
+    if (i == 1)  { return 60000; }
+    if (i == 2)  { return 50; }
+    if (i == 3)  { return 75; }
+    if (i == 4)  { return 120; }
+    if (i == 5)  { return 120000; }
+    if (i == 6)  { return 144; }
+    if (i == 7)  { return 100; }
+    if (i == 8)  { return 30; }
+    if (i == 9)  { return 30000; }
+    if (i == 10) { return 24; }
+    if (i == 11) { return 24000; }
+    if (i == 12) { return 240; }
+    if (i == 13) { return 165; }
+    if (i == 14) { return 85; }
+    if (i == 15) { return 70; }
+    return 72;
+}
+fn gpu_pixclk_cand_den(i) {
+    if (i == 1)  { return 1001; }
+    if (i == 5)  { return 1001; }
+    if (i == 9)  { return 1001; }
+    if (i == 11) { return 1001; }
+    return 1;
+}
+
+# gpu_pixclk_ticks — the measurement primitive: PIT ch0 ticks spanned by exactly `frames` vsync boundaries.
+# Both endpoints are detected the same way through the same poll loop, so their detection latency largely
+# cancels and only the jitter survives. Interrupts mid-window are irrelevant — they delay the polling, not
+# the two clocks being compared — which is why this needs no cli/sti window. Returns 0 if the pipe stalls.
+fn gpu_pixclk_ticks(pipe, frames) {
+    var fc_off = GPU_R_OTG_FRAME_COUNT + pipe * GPU_DCN_OTG_STRIDE;
+
+    # Open the window ON a frame boundary rather than wherever we happened to arrive.
+    var f0 = gpu_reg32(GPU_BASE_DCN_2, fc_off) & GPU_OTG_FRAME_COUNT_MASK;
+    var guard = 0;
+    while ((gpu_reg32(GPU_BASE_DCN_2, fc_off) & GPU_OTG_FRAME_COUNT_MASK) == f0) {
+        guard = guard + 1;
+        if (guard >= GPU_PIXCLK_GUARD) { return 0; }
+    }
+
+    var pstart = pit_ch0_read();
+    var prev   = pstart;
+    var wraps  = 0;
+    var fprev  = gpu_reg32(GPU_BASE_DCN_2, fc_off) & GPU_OTG_FRAME_COUNT_MASK;
+    var seen   = 0;
+    guard = 0;
+    while (seen < frames) {
+        var pc = pit_ch0_read();
+        if (pc > prev) { wraps = wraps + 1; }   # ch0 counts DOWN, so a RISE is a reload
+        prev = pc;
+        var fc = gpu_reg32(GPU_BASE_DCN_2, fc_off) & GPU_OTG_FRAME_COUNT_MASK;
+        if (fc != fprev) { fprev = fc; seen = seen + 1; }
+        guard = guard + 1;
+        if (guard >= GPU_PIXCLK_GUARD) { return 0; }
+    }
+    # Elapsed = the drop within the current period + one full period per reload. The loop polls every few
+    # microseconds against a 10 ms period, so a wrap cannot be missed short of a multi-millisecond stall —
+    # and such a stall would land ~3% low, far outside the snap tolerance, so it is refused rather than taken.
+    return (pstart - prev) + wraps * GPU_PIT_CH0_DIV;
+}
+
+fn gpu_pixclk_discover() {
+    gpu_pixclk_100hz = 0;
+    if (gpu_present == 0) { return 0; }
+    if (gpu_display_ok != 1) { return 0; }
+    if (gpu_display_pipe < 0) { return 0; }
+    var pipe = gpu_display_pipe;
+
+    # Refuse the two timing modes that break pixel clock = h_total x v_total x refresh, rather than assume
+    # a desktop link clears both.
+    var il = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_INTERLACE_CONTROL + pipe * GPU_DCN_OTG_STRIDE);
+    if ((il & GPU_OTG_INTERLACE_ENABLE) != 0) {
+        kprintln("gpu: display timing is interlaced, pixel clock not derived", 58);
+        return 0;
+    }
+    var hd = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_TIMING_CNTL + pipe * GPU_DCN_OTG_STRIDE);
+    if ((hd & GPU_OTG_H_TIMING_DIV_BY2) != 0) {
+        kprintln("gpu: display timing runs at half pixel rate, clock not derived", 62);
+        return 0;
+    }
+
+    # Both totals hold total-1 (see gpu_regs.cyr). The raw values are logged as well as the corrected ones:
+    # a standard mode has a standard geometry (1920x1080p60 is exactly 2200x1125), so the burn itself shows
+    # whether the -1 correction landed on the standard total or one past it.
+    var hraw = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_TOTAL + pipe * GPU_DCN_OTG_STRIDE) & GPU_OTG_TOTAL_MASK;
+    var vraw = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL + pipe * GPU_DCN_OTG_STRIDE) & GPU_OTG_TOTAL_MASK;
+    var htotal = hraw + 1;
+    var vtotal = vraw + 1;
+    var w = fb_width();
+    var h = fb_height();
+    kprint("gpu: display timing ", 20); kprint_num(w); kprint("x", 1); kprint_num(h);
+    kprint(" total ", 7); kprint_num(htotal); kprint("x", 1); kprint_num(vtotal);
+    kprint(" raw ", 5); kprint_num(hraw); kprint("x", 1); kprint_num(vraw); kprintln("", 0);
+    # A total that does not exceed the active size is not a total — the offsets or the mode are wrong.
+    if (htotal <= w) {
+        kprintln("gpu: display horizontal total below active, clock not derived", 61);
+        return 0;
+    }
+    if (vtotal <= h) {
+        kprintln("gpu: display vertical total below active, clock not derived", 59);
+        return 0;
+    }
+
+    # Measure: several short windows, keep the shortest (an SMI can only add time).
+    var best = 0;
+    var worst = 0;
+    var t = 0;
+    while (t < GPU_PIXCLK_TRIALS) {
+        var tk = gpu_pixclk_ticks(pipe, GPU_PIXCLK_FRAMES);
+        if (tk > 0) {
+            if (best == 0) { best = tk; worst = tk; }
+            if (tk < best) { best = tk; }
+            if (tk > worst) { worst = tk; }
+        }
+        t = t + 1;
+    }
+    if (best == 0) {
+        kprintln("gpu: display refresh not measurable", 35);
+        return 0;
+    }
+    # milliHz keeps the fractional rates readable (59.94 Hz = 59940) without leaving integer arithmetic.
+    var refresh = GPU_PIXCLK_FRAMES * GPU_PIT_HZ * 1000 / best;
+    var spread  = GPU_PIXCLK_FRAMES * GPU_PIT_HZ * 1000 / worst;
+
+    # Snap to the nearest standard rate.
+    var bi   = 0 - 1;
+    var bppm = 0;
+    var i = 0;
+    while (i < GPU_PIXCLK_CANDS) {
+        var cm = gpu_pixclk_cand_num(i) * 1000 / gpu_pixclk_cand_den(i);
+        var d = refresh - cm;
+        if (d < 0) { d = 0 - d; }
+        var ppm = d * 1000000 / cm;
+        if (bi < 0) { bi = i; bppm = ppm; }
+        elif (ppm < bppm) { bi = i; bppm = ppm; }
+        i = i + 1;
+    }
+    var num = gpu_pixclk_cand_num(bi);
+    var den = gpu_pixclk_cand_den(bi);
+    var snapped = num * 1000 / den;
+    kprint("gpu: display refresh ", 21); kprint_num(refresh);
+    kprint(" mHz measured, slowest ", 23); kprint_num(spread);
+    kprint(", nearest standard ", 19); kprint_num(snapped);
+    kprint(" off by ", 8); kprint_num(bppm); kprintln(" ppm", 4);
+    if (bppm > GPU_PIXCLK_SNAP_PPM) {
+        # Refuse rather than ship a wrong clock: a silently-wrong DTO module is inaudible to test but wrong
+        # forever, and every plausible fault here (a misread total, a missed PIT wrap, a non-standard mode)
+        # lands far outside this tolerance while a correct read lands within a few tens of ppm.
+        kprintln("gpu: display refresh matches no standard rate, clock not derived", 64);
+        return 0;
+    }
+
+    # ONE value, computed once from the snapped rate, used by every consumer downstream.
+    gpu_pixclk_100hz = htotal * vtotal * num / (den * 100);
+    kprint("gpu: display pixel clock ", 25); kprint_num(gpu_pixclk_100hz / 10); kprintln(" kHz", 4);
     return 1;
 }
 

@@ -940,6 +940,13 @@ gpu_display_vblank();
 # is awake or in D3; and whether the GOP already programmed the DTO/AFMT. Gated on P0.
 gpu_audio_probe();
 
+# GPU arc 1.55.x (Thrust P) P3b prerequisite: derive the live pixel clock. The HDMI audio DTO's module field
+# IS the pixel clock (in 100 Hz units) and the ACR CTS is computed from it, but the DCCG register that holds
+# it is only populated on a DP-driven pipe — this link is HDMI, so it reads 0 and the clock must be derived:
+# h_total x v_total from the OTG, refresh measured against the free-running PIT and snapped to the standard
+# rate. Read-only; gated on P0. Takes ~2 s of boot: five ~0.33 s measurement windows.
+gpu_pixclk_discover();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif
