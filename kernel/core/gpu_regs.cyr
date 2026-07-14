@@ -300,3 +300,15 @@ var GPU_SH_COMPUTE_USER_DATA_0 = 0x240;      # + _1 0x241, _2 0x242, _3 0x243 (C
 var GPU_PM4_SET_SH_REG_N4     = 0xC0047600;  # SET_SH_REG, 4 values (in_lo, in_hi, out_lo, out_hi)
 var GPU_KERNARG_IN_SUBOFF     = 0x18000;     # input buffer, 64 dwords (in[i]=i*7+1)
 var GPU_KERNARG_OUT_SUBOFF    = 0x18400;     # output buffer, 64 dwords (out[i] must == in[i])
+
+# C2g-3 — ALU + REDUCTION LOOP (matmul's inner loop): each of 64 lanes computes an integer dot product
+# out[tid] = sum_{k=0..K-1} a[tid*K+k] * b[tid*K+k] via a real branch loop (s_cbranch) + v_mul_lo_u32 /
+# v_add_u32 accumulate. 3 kernargs (a,b,out) => USER_SGPR=6 (RSRC2=0x0C, USER_DATA_0..5). mabda-proven.
+var GPU_COMPUTE_RSRC2_KERNARG3 = 0x0000000C; # RSRC2 USER_SGPR=6 -> preload s0..s5 from USER_DATA_0..5
+var GPU_COMPUTE_PGM_RSRC1_V12  = 0x002C0042; # RSRC1 with VGPRS=2 (12 VGPRs) — the loop shader uses v0..v10
+var GPU_PM4_SET_SH_REG_N6     = 0xC0067600;  # SET_SH_REG, 6 values (a_lo,a_hi,b_lo,b_hi,out_lo,out_hi)
+var GPU_DOT_K                 = 4;           # reduction length per lane (dot-product size)
+var GPU_DOT_N                 = 256;         # input element count = 64 lanes * K
+var GPU_DOT_A_SUBOFF          = 0x19000;     # input a[256] (a[i]=i+1)
+var GPU_DOT_B_SUBOFF          = 0x19400;     # input b[256] (b[i]=i+2)
+var GPU_DOT_OUT_SUBOFF        = 0x19800;     # output[64] (out[tid] = dot product)

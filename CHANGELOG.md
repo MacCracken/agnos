@@ -5,6 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.28] — 2026-07-13 — GPU arc C2g-3: ALU + reduction loop (matmul's inner loop)
+
+### Added
+
+- **C2g-3 — ALU + reduction loop** (`kernel/core/gpu.cyr` `gpu_shader_dispatch4` + `kernel/core/gpu_regs.cyr`):
+  each of the 64 lanes runs matmul's inner loop — an integer dot product `out[tid] = Σ_{k=0..K-1}
+  a[tid*K+k] * b[tid*K+k]` (K=4) — via a **real branch loop** (`s_cbranch_scc1`, the −17-dword back-edge) with
+  `v_mul_lo_u32` / `v_add_u32` multiply-accumulate. Three kernargs (`a`, `b`, `out`) → `COMPUTE_PGM_RSRC2 =
+  0x0C` (USER_SGPR=6, SPI preloads `s0..s5`), `COMPUTE_PGM_RSRC1` bumped to 12 VGPRs, `SET_SH_REG` writes
+  `COMPUTE_USER_DATA_0..5`. All 38 shader dwords are `llvm-mc -mcpu=gfx90c` ground-truth (including the loop
+  back-branch). Pre-seeds `a[i]=i+1, b[i]=i+2` and verifies each of the 64 dot products against the CPU — the
+  first loop control-flow and first integer multiply-accumulate on the shader cores, and the last primitive
+  before rosnet matmul (C2g-4). Gated on C2g-2; same bounded wedge-safe envelope. Iron-only; flash
+  `--update-all`. PASS = `gpu: reduction-loop compute online (64 dot products)`.
+
 ## [1.54.27] — 2026-07-13 — GPU arc C2g-2 (compute kernargs) + GPU boot-log cleanup
 
 ### Added

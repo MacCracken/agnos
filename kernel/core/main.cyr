@@ -897,6 +897,11 @@ gpu_shader_dispatch2();
 # pointers — the last primitive before rosnet matmul. Gated on C2g-1 inside gpu_shader_dispatch3().
 gpu_shader_dispatch3();
 
+# GPU arc C2g-3 (1.54.x) — ALU + reduction LOOP: each of 64 lanes runs matmul's inner loop, an integer
+# dot product out[tid]=sum_k a[tid*K+k]*b[tid*K+k] via a real branch loop + multiply-accumulate. The last
+# primitive before rosnet matmul (C2g-4). Gated on C2g-2 inside gpu_shader_dispatch4().
+gpu_shader_dispatch4();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif
