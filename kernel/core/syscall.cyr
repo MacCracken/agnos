@@ -1544,6 +1544,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 80) { stack_canary_check(canary); return blk_close_sys(arg1); }                               # blk_close(h) -> 0
     # directory listing (#81) — ring-3 readdir over the ext2 root; fills 64-byte {name,type} records.
     if (num == 81) { stack_canary_check(canary); return ext2_readdir_sys(arg1, arg2, arg3); }                # readdir(path, buf, max) -> count
+    # GPU compute dispatch (#82) — C2h ring-3 seam: run the proven 8x8 integer matmul on the caller's
+    # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.
+    if (num == 82) { stack_canary_check(canary); return gpu_dispatch_sys(arg1, arg2, arg3); }                # gpu_dispatch(a, b, c)
     if (num == 34) {
         # uname(buf=arg1, len=arg2) — writes the 64-byte identity struct: four
         # 16-byte NUL-padded fields at offsets 0/16/32/48 = sysname / nodename /

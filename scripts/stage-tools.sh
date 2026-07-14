@@ -87,6 +87,14 @@ stage_one iam          src/main.cyr iam      || rc=1
 stage_one kii          src/main.cyr kii      || rc=1
 stage_one cyim         src/main.cyr cyim     || rc=1
 
+# GPU compute probe: gpumm is the first ring-3 consumer of the C2h GPU-compute
+# seam (gpu_dispatch #82). It dispatches an 8x8 integer matmul onto the GPU shader
+# cores from userspace and verifies C=A*B bit-for-bit vs a CPU reference —
+# `run /bin/gpumm` prints "gpu: userspace matmul OK (64/64 bit-correct vs CPU)".
+# The seam mabda/tentib consume for GPU inference. Runs only on real AMD iron
+# (the GPU arc is not exercised under QEMU); harmless -1 on non-GPU boots.
+stage_one gpumm        src/main.cyr gpumm    || rc=1
+
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
 # symlinks (-> kriya) in the rootfs: install-media.sh's `cp -a` preserves them

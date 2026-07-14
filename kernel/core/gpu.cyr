@@ -1650,29 +1650,11 @@ fn gpu_shader_dispatch4() {
 # branch loop. Bit-correct vs the CPU reference. Same kernarg ABI as C2g-3 (3 pointers, RSRC2=0x0C, 12 VGPRs).
 # All 41 shader dwords llvm-mc(-mcpu=gfx90c) ground-truth. THIS is the matmul that attn11/tentib ML layers
 # ride onto the GPU (C2h wires the ring-3 gpu_* band next). Gated on C2g-3 (loop+MAC proven).
-fn gpu_shader_dispatch5() {
-    gpu_matmul_ok = 0;
-    if (gpu_present == 0) { return 0; }
-    if (gpu_reduce_ok != 1) {
-        kprintln("gpu: skipping matmul (reduction loop unverified)", 48);
-        return 0;
-    }
-    if (gpu_arena_mc == 0) { return 0; }
-    if (gpu_ring_wptr == 0) { return 0; }
-
-    var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
-    var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;
-    var a_phys      = gpu_arena_phys + GPU_MM_A_SUBOFF;
-    var a_mc        = gpu_arena_mc   + GPU_MM_A_SUBOFF;
-    var b_phys      = gpu_arena_phys + GPU_MM_B_SUBOFF;
-    var b_mc        = gpu_arena_mc   + GPU_MM_B_SUBOFF;
-    var c_phys      = gpu_arena_phys + GPU_MM_C_SUBOFF;
-    var c_mc        = gpu_arena_mc   + GPU_MM_C_SUBOFF;
-    var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
-    var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
-
-    # 1. Shader (41 dwords): tid->i,j; addr_a = A + i*32 (row); addr_b = B + j*4 (col); loop K=8 with
-    #    v_mul_lo_u32 + v_add_u32 MAC (addr_a += 4, addr_b += 32 per k); store C[tid] = acc.
+# === C2h: shared integer-matmul primitives (factored from gpu_shader_dispatch5) ===
+# gpu_matmul_write_shader — emit the 41-dword gfx90c 8x8 integer-matmul kernel at
+# shader_phys. tid->(i,j); walk A row (i*32, +4/k) x B col (j*4, +32/k); loop K=8
+# with v_mul_lo_u32 + v_add_u32 MAC; store C[tid]. The C2g-4 shader, one source of truth.
+fn gpu_matmul_write_shader(shader_phys) {
     store32(shader_phys + 0x00, 0xBEFE01C1);   # s_mov_b64 exec, -1
     store32(shader_phys + 0x04, 0x20120083);   # v_lshrrev_b32 v9, 3, v0     (i = tid>>3)
     store32(shader_phys + 0x08, 0x26140087);   # v_and_b32 v10, 7, v0        (j = tid&7)
@@ -1714,25 +1696,24 @@ fn gpu_shader_dispatch5() {
     store32(shader_phys + 0x98, 0x007F0801);
     store32(shader_phys + 0x9C, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
     store32(shader_phys + 0xA0, 0xBF810000);   # s_endpgm
+    return 0;
+}
 
-    # 2. Pre-seed A[i]=i+1, B[i]=i+1 (64 each), C[64]=NOTYET, done=NOTYET.
-    var n = GPU_MM_DIM * GPU_MM_DIM;
-    var s = 0;
-    while (s < n) {
-        store32(a_phys + (s << 2), s + 1);
-        store32(b_phys + (s << 2), s + 1);
-        store32(c_phys + (s << 2), GPU_MT_NOTYET);
-        s = s + 1;
-    }
+# gpu_matmul_run — with A,B already in the carveout and the shader resident, emit the
+# proven PM4 dispatch envelope (I-cache invalidate -> SET_SH_REG USER_DATA=A,B,C ->
+# DISPATCH_DIRECT -> CS flush -> TCWB -> fence WRITE_DATA), submit via register-wptr,
+# and spin the watchdog. Returns 1 = fence fired, 0 = timeout. Leaves C[tid] in the
+# carveout. Shared by the C2g-4 boot proof and the C2h dispatch syscall.
+fn gpu_matmul_run(shader_mc, a_mc, b_mc, c_mc, done_mc, done_phys) {
     store32(done_phys, GPU_MT_NOTYET);
     gpu_mfence();
 
-    # 3. Re-arm the fault-net.
+    # Re-arm the fault-net.
     var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
 
-    # 4. Ring program (same envelope as C2g-3; USER_DATA_0..5 = A, B, C).
+    # Ring program (USER_DATA_0..5 = A, B, C).
     var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
     var pgm_hi = (shader_mc >> 40) & 0xFF;
     gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
@@ -1759,14 +1740,14 @@ fn gpu_shader_dispatch5() {
     gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
     gpu_mfence();
 
-    # 5. Register-wptr submit.
+    # Register-wptr submit.
     var new_wptr = gpu_ring_wptr;
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
     gpu_mfence();
 
-    # 6. Bounded watchdog.
+    # Bounded watchdog.
     var ok = 0;
     var i = 0;
     while (i < 1000) {
@@ -1776,6 +1757,46 @@ fn gpu_shader_dispatch5() {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
     gpu_mfence();
     gpu_ring_wptr = new_wptr;
+    return ok;
+}
+
+fn gpu_shader_dispatch5() {
+    gpu_matmul_ok = 0;
+    if (gpu_present == 0) { return 0; }
+    if (gpu_reduce_ok != 1) {
+        kprintln("gpu: skipping matmul (reduction loop unverified)", 48);
+        return 0;
+    }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+
+    var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
+    var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;
+    var a_phys      = gpu_arena_phys + GPU_MM_A_SUBOFF;
+    var a_mc        = gpu_arena_mc   + GPU_MM_A_SUBOFF;
+    var b_phys      = gpu_arena_phys + GPU_MM_B_SUBOFF;
+    var b_mc        = gpu_arena_mc   + GPU_MM_B_SUBOFF;
+    var c_phys      = gpu_arena_phys + GPU_MM_C_SUBOFF;
+    var c_mc        = gpu_arena_mc   + GPU_MM_C_SUBOFF;
+    var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
+    var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
+
+    # 1. Shader — the C2g-4 8x8 integer-matmul kernel (factored to gpu_matmul_write_shader).
+    gpu_matmul_write_shader(shader_phys);
+
+    # 2. Pre-seed A[i]=i+1, B[i]=i+1 (64 each), C[64]=NOTYET.
+    var n = GPU_MM_DIM * GPU_MM_DIM;
+    var s = 0;
+    while (s < n) {
+        store32(a_phys + (s << 2), s + 1);
+        store32(b_phys + (s << 2), s + 1);
+        store32(c_phys + (s << 2), GPU_MT_NOTYET);
+        s = s + 1;
+    }
+    gpu_mfence();
+
+    # 3-6. Dispatch envelope + submit + watchdog (factored to gpu_matmul_run).
+    var ok = gpu_matmul_run(shader_mc, a_mc, b_mc, c_mc, done_mc, done_phys);
 
     # 7. VERIFY C[i*8+j] == sum_{k=0..7} A[i*8+k]*B[k*8+j] (A[x]=B[x]=x+1) — bit-correct vs the CPU matmul.
     var okcount = 0;
@@ -1814,5 +1835,61 @@ fn gpu_shader_dispatch5() {
     }
     gpu_matmul_ok = 0 - 1;
     kprintln("gpu: matmul dispatch did not complete", 37);
+    return 0;
+}
+
+# === C2h: ring-3 GPU-compute dispatch (syscall #82) ===
+# gpu_dispatch(a_uva, b_uva, c_uva): run the proven 8x8 integer matmul on the
+# userspace-supplied A,B (64 i32 each, row-major) and write C (64 i32, C=A*B) to
+# c_uva. This is the ring-3 seam the sovereign GPU compute libraries (mabda /
+# tentib) consume — the SAME PM4 envelope as the C2g-4 boot proof, driven by
+# caller data instead of a kernel-baked pattern. Returns 0 ok; -1 GPU not ready;
+# -2 dispatch did not complete; -3 VM fault.
+#
+# Runs in ring 0 under the CALLER's CR3: the carveout lives in the shared kernel
+# PDPT (proc CR3s mirror entries [1..511], so it is reachable), and a_uva/b_uva/
+# c_uva are the caller's own user pages (present under its CR3). Pointer sanity is
+# the caller's responsibility for now (matches the other simple syscall handlers);
+# a proc_copy_from_user hardening pass is tracked as follow-on.
+fn gpu_dispatch_sys(a_uva, b_uva, c_uva) {
+    if (gpu_present == 0)   { return 0 - 1; }
+    if (gpu_matmul_ok != 1) { return 0 - 1; }   # engines + shader proven at boot
+    if (gpu_arena_mc == 0)  { return 0 - 1; }
+    if (gpu_ring_wptr == 0) { return 0 - 1; }
+
+    var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
+    var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;
+    var a_phys      = gpu_arena_phys + GPU_MM_A_SUBOFF;
+    var a_mc        = gpu_arena_mc   + GPU_MM_A_SUBOFF;
+    var b_phys      = gpu_arena_phys + GPU_MM_B_SUBOFF;
+    var b_mc        = gpu_arena_mc   + GPU_MM_B_SUBOFF;
+    var c_phys      = gpu_arena_phys + GPU_MM_C_SUBOFF;
+    var c_mc        = gpu_arena_mc   + GPU_MM_C_SUBOFF;
+    var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
+    var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
+
+    # Copy caller A,B into the carveout; clear C.
+    var n = GPU_MM_DIM * GPU_MM_DIM;
+    var s = 0;
+    while (s < n) {
+        store32(a_phys + (s << 2), load32(a_uva + (s << 2)) & 0xFFFFFFFF);
+        store32(b_phys + (s << 2), load32(b_uva + (s << 2)) & 0xFFFFFFFF);
+        store32(c_phys + (s << 2), GPU_MT_NOTYET);
+        s = s + 1;
+    }
+    gpu_matmul_write_shader(shader_phys);
+    gpu_mfence();
+
+    var ok = gpu_matmul_run(shader_mc, a_mc, b_mc, c_mc, done_mc, done_phys);
+    var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+    if (fault != 0) { return 0 - 3; }
+    if (ok != 1)    { return 0 - 2; }
+
+    # Copy C back to the caller.
+    s = 0;
+    while (s < n) {
+        store32(c_uva + (s << 2), load32(c_phys + (s << 2)) & 0xFFFFFFFF);
+        s = s + 1;
+    }
     return 0;
 }

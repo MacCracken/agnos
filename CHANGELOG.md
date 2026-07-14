@@ -5,6 +5,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.30] — 2026-07-13 — GPU arc C2h: ring-3 GPU-compute dispatch (the userspace seam)
+
+### Added
+
+- **C2h — `gpu_dispatch` syscall (#82): the ring-3 GPU-compute seam** (`kernel/core/gpu.cyr` `gpu_dispatch_sys`
+  + `kernel/core/syscall.cyr`). `gpu_dispatch(a, b, c)` accepts three userspace pointers — A, B (64 i32 each,
+  row-major 8×8) and C — copies A/B into the GPU carveout, runs the proven `gfx90c` integer matmul on the
+  shader cores, and writes `C = A·B` back to the caller. This is the path the sovereign GPU-compute libraries
+  (mabda / tentib) consume to run ML inference on the GPU. Runs in ring 0 under the **caller's CR3**: the
+  carveout is reachable because proc page tables mirror the kernel PDPT/PML4 `[1..511]` (UC device map), and
+  A/B/C are the caller's own user pages. Returns `0` ok / `-1` GPU not ready / `-2` dispatch did not complete /
+  `-3` VM fault. Pointer sanity is the caller's responsibility for now (matches the other simple syscall
+  handlers); a `proc_copy_from_user` hardening pass is tracked as follow-on.
+- **`/bin/gpumm` — the first ring-3 consumer** (new sibling repo `gpumm` 0.1.0; `scripts/stage-tools.sh`).
+  A sovereign userspace GPU matmul probe: fills `A[i] = B[i] = i+1`, calls `gpu_dispatch` (#82), and verifies
+  all 64 outputs bit-for-bit against a CPU matmul reference. Static x86-64 ELF64 (35 KB), staged onto the
+  agnos-fs rootfs as `/bin/gpumm`. **QEMU-verified** (`scripts/basestack-run-smoke.sh`): loads off ext2, runs
+  in ring 3, calls #82, takes the clean GPU-absent `-1` path, prints, and exits — no fault (the GPU arc is not
+  exercised under QEMU; the real dispatch is iron-only).
+
+### Changed
+
+- **Factored the C2g-4 matmul into shared primitives** (`kernel/core/gpu.cyr`): `gpu_matmul_write_shader`
+  (the 41-dword `gfx90c` kernel) + `gpu_matmul_run` (the PM4 dispatch envelope + register-wptr submit +
+  watchdog). The C2g-4 boot proof (`gpu_shader_dispatch5`) and the C2h dispatch syscall now share **one source
+  of truth** for the shader and the dispatch envelope — no drift. The boot proof is behaviourally unchanged
+  (same `gpu: integer matmul online (8x8, bit-correct vs CPU)` line).
+
+Iron-only; flash `--update-all` then `run /bin/gpumm`. PASS = `gpu: userspace matmul OK (64/64 bit-correct
+vs CPU)` — **a userspace program dispatching a matrix multiply onto the sovereign AMD GPU** (no amdgpu /
+no ROCm), the seam mabda/tentib ride to run ML on the shader cores. Follow-on: the f64 `rosnet`-bit-correct
+variant for attn11's full-precision path.
+
 ## [1.54.29] — 2026-07-13 — GPU arc C2g-4 (THE CROWN): integer tiled matmul on the shader cores
 
 ### Added
