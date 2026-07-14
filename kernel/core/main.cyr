@@ -914,6 +914,12 @@ gpu_shader_dispatch5();
 # Gated on the integer matmul (engines proven) inside gpu_shader_dispatch_f64().
 gpu_shader_dispatch_f64();
 
+# GPU arc f64 fidelity — proves the f64 matmul is ROSNET-BIT-CORRECT: the same mul+add shader on NON-exact
+# (rounding) data, verified against an in-kernel f64_mul/f64_add reference (the same builtins + k-order
+# rosnet uses). A PASS on rounding data proves the GPU's separate mul+add == rosnet's mul+add bit-for-bit
+# (a fused FMA would diverge). Gated on the exact-int f64 proof inside gpu_shader_dispatch_f64_fidelity().
+gpu_shader_dispatch_f64_fidelity();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

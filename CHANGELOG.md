@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.32] — 2026-07-13 — GPU arc f64 fidelity: rosnet-bit-correct matmul (the FMA-vs-mul+add proof)
+
+### Added
+
+- **f64 matmul proven rosnet-bit-correct on rounding data** (`kernel/core/gpu.cyr`
+  `gpu_shader_dispatch_f64_fidelity`): the earlier f64 burn proved execution + bit-correctness for
+  exact-integer data, which cannot distinguish fused FMA from separate mul-then-add. This closes that gap.
+  Test data `A[i]=B[i]=(i+1)·0x1234567` — exact integer inputs, but the f64 **products exceed 2⁵³ and round**
+  (host-verified: fma and mul+add diverge on **29 of 64** outputs with this data). Each `C[tid]` is verified
+  bit-for-bit against an **in-kernel reference using the same `f64_mul`/`f64_add` builtins rosnet uses**, in
+  the same k-ascending order — so a PASS proves the GPU result is bit-identical to rosnet's CPU arithmetic.
+  PASS = `gpu: f64 matmul rosnet-bit-correct (8x8, rounding)`.
+
+### Changed
+
+- **f64 matmul shader: fused `v_fma_f64` → separate `v_mul_f64` + `v_add_f64`** (`kernel/core/gpu.cyr`
+  `gpu_matmul_write_shader_f64`, now 43 dwords, all `llvm-mc -mcpu=gfx90c` verified). rosnet accumulates as
+  mul-then-add — its `f64v_fmadd` lowers to `mulpd+addpd`, and the scalar path is `f64_add(y, f64_mul(x, W))`
+  (two roundings per step). A fused FMA (one rounding) would diverge from rosnet on rounding data, so the
+  sovereign matmul must match rosnet's semantics to be a drop-in. The product lands in the free pair
+  v[14:15] (still ≤16 VGPRs, `RSRC1=0x002C0043` unchanged). The exact-integer boot proof
+  (`gpu: f64 matmul online …`) still passes on the mul+add shader (exact data never rounds).
+
+Iron-only; flash `--update-all` then `run /bin/klug`. Both f64 lines print at boot: `gpu: f64 matmul online
+(8x8, bit-correct vs CPU)` then `gpu: f64 matmul rosnet-bit-correct (8x8, rounding)` — **the sovereign GPU's
+f64 matmul is now bit-identical to rosnet's CPU math, including rounding**, the fidelity guarantee attn11
+needs.
+
 ## [1.54.31] — 2026-07-13 — GPU arc f64: full-precision matmul on the shader cores (attn11's path)
 
 ### Added
