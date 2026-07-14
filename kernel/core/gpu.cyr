@@ -44,6 +44,7 @@ var gpu_reduce_ok    = 0;    # C2g-3: 1 = all 64 dot products correct (loop+MAC)
 var gpu_matmul_ok    = 0;    # C2g-4: 1 = 8x8 integer matmul bit-correct vs CPU; -1 no-retire; -2 partial; -3 fault
 var gpu_matmul_f64_ok = 0;   # f64: 1 = 8x8 f64 matmul bit-correct (exact-int data) vs CPU; -1 no-retire; -2 partial; -3 fault
 var gpu_f64_fidelity_ok = 0; # f64 fidelity: 1 = rosnet-bit-correct on NON-exact (rounding) data vs in-kernel f64_mul/f64_add; -1/-2/-3 as above
+var gpu_display_ok    = 0;   # P0 (1.55.x display arc): 1 = lit HUBP scanout matches fb_phys; -1 no match; -2 surface matched but no OTG lit
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -2197,5 +2198,74 @@ fn gpu_dispatch_f64_sys(a_uva, b_uva, c_uva) {
         store64(c_uva + (s << 3), load64(c_phys + (s << 3)));
         s = s + 1;
     }
+    return 0;
+}
+
+# === 1.55.x display arc (Thrust P) — P0: read-only DCN 2.1 live-pipe probe ===
+# gpu_display_probe — the display-arc opening bite. STRICTLY READ-ONLY (no writes). Walks the OTG/OPTC
+# instances to find the GOP-lit pipe, then scans the HUBP instances for the one whose scanout surface
+# address equals the kernel's framebuffer (fb_phys, or its MC-aperture image) — that HUBP is by definition
+# the pipe driving our console, and it is exactly the surface register P1's page-flip will re-point. Prints
+# a plain-kernel line on match. Zero-hang-risk: OTG reads are safe on a lit DCN; the 0xFFFFFFFF guard skips
+# gated pipes; a HUBP mismatch simply fails the gate. No-ops if the GPU is absent or the FB isn't GOP-lit.
+# DCN registers live at BASE_IDX 2 (GPU_BASE_DCN_2 = 0x34C0), NOT the seg1 0xC0 (DCE_VERSION only).
+fn gpu_display_probe() {
+    gpu_display_ok = 0;
+    if (gpu_present == 0) { return 0; }
+
+    # Framebuffer physical base from the gnoboot/GOP handoff (boot_info + 0x48).
+    var bi = load64(&boot_info_ptr);
+    if (bi == 0) { return 0; }
+    var fb_phys = load64(bi + 0x48);
+    if (fb_phys == 0) { return 0; }   # no GOP FB → nothing to match
+
+    # MC↔phys transform (iron-proven C2b reads): a HUBP holds an MC-domain address; convert fb_phys
+    # (CPU-physical) to the MC view so the match works in either domain.
+    var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
+    var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
+    var fb_off  = r_off << 24;
+    var fb_base = r_base << 24;
+    var expected_mc = fb_phys - fb_off + fb_base;
+
+    # OTG liveness walk (safe on all 4 pipes; corroboration + pipe id). 0xFFFFFFFF = gated → skip.
+    var lit_otg = 0 - 1;
+    var n = 0;
+    while (n < GPU_DCN_PIPES) {
+        var ctl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL + n * GPU_DCN_OTG_STRIDE);
+        if (ctl != 0xFFFFFFFF) {
+            if ((ctl & GPU_OTG_MASTER_EN) != 0) { if (lit_otg < 0) { lit_otg = n; } }
+        }
+        n = n + 1;
+    }
+
+    # HUBP surface scan — the authoritative match: the HUBP whose scanout surface == the framebuffer.
+    var pipe = 0 - 1;
+    n = 0;
+    while (n < GPU_DCN_PIPES) {
+        var lo = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR    + n * GPU_DCN_HUBP_STRIDE) & 0xFFFFFFFF;
+        var hi = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + n * GPU_DCN_HUBP_STRIDE) & 0xFFFF;
+        var surf = (hi << 32) | lo;
+        var blank = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_CNTL + n * GPU_DCN_HUBP_STRIDE) & GPU_HUBP_BLANK_EN;
+        if (blank == 0) {
+            if (surf == fb_phys) { if (pipe < 0) { pipe = n; } }
+            else { if (surf == expected_mc) { if (pipe < 0) { pipe = n; } } }
+        }
+        n = n + 1;
+    }
+
+    if (pipe >= 0) {
+        if (lit_otg >= 0) {
+            gpu_display_ok = 1;
+            kprint("gpu: display pipe ", 18);
+            kprint_num(pipe);
+            kprintln(" live (scanout matches framebuffer)", 35);
+            return 1;
+        }
+        gpu_display_ok = 0 - 2;
+        kprintln("gpu: display surface matched but no OTG lit", 43);
+        return 0;
+    }
+    gpu_display_ok = 0 - 1;
+    kprintln("gpu: display pipe surface not matched", 37);
     return 0;
 }

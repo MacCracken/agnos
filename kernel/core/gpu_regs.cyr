@@ -42,7 +42,7 @@ var GPU_BASE_GC_0     = 0x2000;   # graphics/compute core, segment 0
 var GPU_BASE_GC_1     = 0xA000;   # graphics/compute core, segment 1 (RLC + CP ucode-load iface)
 var GPU_BASE_NBIO_2   = 0xD20;    # NBIO/NBIF/RCC, segment 2 (STRAP0, MEMSIZE)
 var GPU_BASE_MMHUB_0  = 0x1A000;  # GMC / memory hub, segment 0 (C1 GPUVM)
-var GPU_BASE_DCN_1    = 0xC0;     # DCE/DCN 2.1 display, segment 1 (Thrust P)
+var GPU_BASE_DCN_1    = 0xC0;     # DMU/DCN seg1 (BASE_IDX 1) — legacy VGA-compat + mmDCE_VERSION ONLY, NOT the pipe base
 var GPU_BASE_MP0_0    = 0x16000;  # MP0 / PSP, segment 0 (C0 firmware-reality bite)
 var GPU_BASE_SDMA0_0  = 0x1260;   # SDMA engine 0, segment 0 (fallback data path)
 
@@ -55,7 +55,28 @@ var GPU_R_GRBM_STATUS    = 0x04;  # mmGRBM_STATUS: GUI_ACTIVE + per-block busy b
 var GPU_R_GB_ADDR_CONFIG = 0x63E; # mmGB_ADDR_CONFIG: pipe/bank/SE addressing config
 var GPU_R_GB_GPU_ID      = 0x640; # mmGB_GPU_ID: [3:0] GPU_ID (0 on a single-die APU)
 # DCN — meaningful only when the display block is powered (GOP-lit → usually yes).
-var GPU_R_DCE_VERSION    = 0x5E;  # mmDCE_VERSION: DCE/DCN version constant
+var GPU_R_DCE_VERSION    = 0x5E;  # mmDCE_VERSION: DCE/DCN version constant (BASE_IDX 1 → read via GPU_BASE_DCN_1)
+
+# === 1.55.x display arc (Thrust P) — DCN 2.1 pipe registers (P0 read-only probe) ===
+# The pipe registers (OTG/OPTC + HUBP/HUBPREQ + DPP/MPC/OPP) live at DCN IP base SEGMENT 2 = 0x34C0
+# (DMU/DCN_BASE INST0_SEG2, BASE_IDX==2) — NOT the seg1 0xC0 above. Derived from renoir_ip_offset.h +
+# dcn_2_1_0_offset.h, adversarially cross-verified (5-lens), anchored on GC seg0=0x2000 matching the
+# iron-proven compute base. Renoir instantiates 4 pipes. All reads are read-only + safe on the GOP-lit pipe.
+var GPU_BASE_DCN_2       = 0x34C0;   # DCN 2.1 pipe register base (OTG/HUBP/…) — BASE_IDX 2
+var GPU_DCN_PIPES        = 4;        # OTG0-3 / HUBP0-3 populated on Renoir
+# OTG/OPTC — find the GOP-lit pipe (stride 0x80).
+var GPU_R_OTG_CONTROL    = 0x1B41;   # OTGn OTG_CONTROL: OTG_MASTER_EN = bit0 (1 = pipe lit); 0xFFFFFFFF = gated → skip
+var GPU_R_OTG_STATUS     = 0x1B49;   # OTGn OTG_STATUS: V_BLANK bit0 / V_ACTIVE_DISP bit1 (corroboration only)
+var GPU_DCN_OTG_STRIDE   = 0x80;     # per-OTG instance stride
+var GPU_OTG_MASTER_EN    = 0x1;      # OTG_CONTROL bit0
+# HUBP/HUBPREQ — scanout surface (stride 0xDC). The surface-address match is the P0 pass gate.
+var GPU_R_HUBP_SURF_ADDR    = 0x60A; # HUBPREQn DCSURF_PRIMARY_SURFACE_ADDRESS [31:0] — RAW byte addr, no shift
+var GPU_R_HUBP_SURF_ADDR_HI = 0x60B; # HUBPREQn ..._ADDRESS_HIGH [15:0] = addr[47:32]
+var GPU_R_HUBP_SURF_PITCH   = 0x607; # HUBPREQn DCSURF_SURFACE_PITCH [13:0] (in PIXELS)
+var GPU_R_HUBP_SURF_CONFIG  = 0x5E5; # HUBPn DCSURF_SURFACE_CONFIG: SURFACE_PIXEL_FORMAT [6:0]
+var GPU_R_HUBP_CNTL         = 0x5F3; # HUBPn DCHUBP_CNTL: HUBP_BLANK_EN bit0 (0 = fetching)
+var GPU_DCN_HUBP_STRIDE     = 0xDC;  # per-HUBP instance stride
+var GPU_HUBP_BLANK_EN       = 0x1;   # DCHUBP_CNTL bit0
 
 # --- Field masks ---
 var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id (reads 0x0 on Cezanne — quirk)

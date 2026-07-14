@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.0] — 2026-07-14 — Kernel DISPLAY arc opens (Thrust P) + P0: read-only DCN 2.1 live-pipe probe
+
+The GPU **compute** thrust (the 1.54.x arc) is complete end-to-end — sovereign gfx90c compute proven on
+iron through firmware-load → engines → GPUVM → CP/MEC → PM4 → hand-assembled shaders → int + rosnet-bit-correct
+f64 matmul, exposed to ring 3 (#82/#83). This opens the **other half: PIXELS** — own the GOP-lit **DCN 2.1**
+display pipe. Plan: [`docs/development/planning/kernel-display-arc-155x.md`](docs/development/planning/kernel-display-arc-155x.md).
+
+### Added
+
+- **P0 — read-only DCN 2.1 live-pipe probe** (`kernel/core/gpu.cyr` `gpu_display_probe` +
+  `kernel/core/gpu_regs.cyr`): the display-arc opening bite. Strictly read-only — walks the OTG/OPTC
+  instances to find the GOP-lit pipe (`OTG_CONTROL.OTG_MASTER_EN`, `0xFFFFFFFF`-gated guard), then scans the
+  HUBP instances for the one whose scanout surface address (`DCSURF_PRIMARY_SURFACE_ADDRESS` low+high, raw
+  byte address) equals the kernel's `fb_phys` (the console buffer gnoboot handed off), matching either the
+  CPU-physical or MC-aperture domain. That HUBP is by definition the pipe driving the console — and exactly
+  the surface register P1's tear-free page-flip will re-point. PASS = `gpu: display pipe N live (scanout
+  matches framebuffer)`. Zero hang-risk (read-only; DCN reads safe on the lit pipe). No-ops when the GPU is
+  absent (QEMU) or the FB isn't GOP-lit.
+- **DCN 2.1 pipe register table** (`kernel/core/gpu_regs.cyr`): base + OTG/HUBP offsets/strides, derived from
+  `renoir_ip_offset.h` + `dcn_2_1_0_offset.h` and adversarially cross-verified (5-lens). **Correction**: the
+  pipe registers (OTG/HUBP/DPP/MPC) live at DCN **BASE_IDX 2 = `GPU_BASE_DCN_2 = 0x34C0`**, not the seg1
+  `0xC0` (which holds only legacy VGA-compat + `mmDCE_VERSION`) — the existing constant is re-commented
+  accordingly.
+
+Iron-only (QEMU emulates no DCN); flash `--update-all` then `run /bin/klug`. First bite of the display arc;
+the ladder is P0 (this) → P1 tear-free flips → P2 vblank pacing → P3 display-audio egress (DP first — closes
+the 1.53.5 HDA HDMI/DP backlog) → P4 scanout-residue clear → P6+ (3D + full mode-set, likely a follow-on arc).
+
 ## [1.54.33] — 2026-07-14 — GPU arc: #82 pointer-hardening + f64 ring-3 seam (#83)
 
 ### Added

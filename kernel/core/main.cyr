@@ -920,6 +920,12 @@ gpu_shader_dispatch_f64();
 # (a fused FMA would diverge). Gated on the exact-int f64 proof inside gpu_shader_dispatch_f64_fidelity().
 gpu_shader_dispatch_f64_fidelity();
 
+# GPU arc 1.55.x (Thrust P — DISPLAY) P0: read-only DCN 2.1 live-pipe probe. Walks the OTG instances to
+# the GOP-lit pipe + scans the HUBP instances for the one whose scanout surface address == fb_phys (the
+# console buffer gnoboot handed off) — proving the DCN register base + surface register that P1's tear-free
+# page-flip will re-point. Strictly read-only; no-ops if the GPU is absent (QEMU) or the FB isn't GOP-lit.
+gpu_display_probe();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif
