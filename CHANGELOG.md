@@ -29,6 +29,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   — failure paths keep their (also plain-language) messages. Deleted the C2g-1 wave-width **diagnostic sweep**
   (functions + call + region) now that C2g-1 is proven. The internal codes remain in source comments + the
   arc docs for traceability. Net: the kernel binary shrank ~11 KB. No functional GPU change.
+- **Kernel-wide log audit** — a wider pass over every subsystem's boot output confirmed the rest already reads
+  like a real kernel (`nvme:`, `ahci:`, `r8169:`, `dhcp:`, `GDT loaded`, `VFS initialized`, `Activating
+  scheduler...`); the cryptic-looking prefixes elsewhere (`fssys:`/`shsys:`/`lo:`/`HIRAM:` etc.) are all
+  `*_SELFTEST`-gated assertions the test harness greps for pass/fail and were correctly left untouched. The one
+  genuinely out-of-place always-on line — a heap sanity check dumping three raw `kmalloc` pointer addresses to
+  the console (`main.cyr`) — is now a silent alloc/free smoke.
 
 ## [1.54.26] — 2026-07-13 — GPU arc C2g-1 ROOT FIX: pre-dispatch shader I-cache invalidate
 

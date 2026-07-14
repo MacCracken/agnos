@@ -2860,17 +2860,13 @@ ext2_extent_write_selftest();
 # === CMOS kernel checkpoint 12 (VFS up) ===
 asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0C; 0xE6; 0x71; }
 
+# Silent allocator smoke — exercise three size classes + free them (no pointer dump to the console).
 var h1 = kmalloc(16);
 var h2 = kmalloc(100);
 var h3 = kmalloc(4096);
-kprint("Heap: ", 6);
-kprint_num(h1);
-kprint(" ", 1);
-kprint_num(h2);
-kprint(" ", 1);
-kprint_num(h3);
-kprintln("", 0);
+kfree_sized(h1, 16);
 kfree_sized(h2, 100);
+kfree_sized(h3, 4096);
 
 # Initialize SYSCALL/SYSRET
 syscall_init();
