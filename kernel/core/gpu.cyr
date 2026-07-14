@@ -45,6 +45,9 @@ var gpu_matmul_ok    = 0;    # C2g-4: 1 = 8x8 integer matmul bit-correct vs CPU;
 var gpu_matmul_f64_ok = 0;   # f64: 1 = 8x8 f64 matmul bit-correct (exact-int data) vs CPU; -1 no-retire; -2 partial; -3 fault
 var gpu_f64_fidelity_ok = 0; # f64 fidelity: 1 = rosnet-bit-correct on NON-exact (rounding) data vs in-kernel f64_mul/f64_add; -1/-2/-3 as above
 var gpu_display_ok    = 0;   # P0 (1.55.x display arc): 1 = lit HUBP scanout matches fb_phys; -1 no match; -2 surface matched but no OTG lit
+var gpu_display_pipe  = 0 - 1; # P0: the HUBP instance scanning out our console (P1 re-points this one)
+var gpu_display_surf  = 0;   # P0: that pipe's FRONT surface MC address (the P1 restore target)
+var gpu_flip_ok       = 0;   # P1: 1 = scanout re-pointed to our back buffer + restored; -1 flip didn't latch; -2 restore didn't latch
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -2262,27 +2265,11 @@ fn gpu_display_probe() {
         n = n + 1;
     }
 
-    # --- P0 DIAGNOSTIC (localize the no-match; labeled hex, removed once P0 passes) ---
-    # fb/mc = what we search for; per-pipe otg/surf = what the DCN actually holds; dce = seg1 base sanity.
-    kprint("gpu: dcn diag fb=", 17); kprint_hex(fb_phys);
-    kprint(" bar0=", 6); kprint_hex(bar0);
-    kprint(" mc=", 4); kprint_hex(expected_mc); kprintln("", 0);
-    var dq = 0;
-    while (dq < GPU_DCN_PIPES) {
-        var octl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL + dq * GPU_DCN_OTG_STRIDE);
-        var dslo = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR    + dq * GPU_DCN_HUBP_STRIDE) & 0xFFFFFFFF;
-        var dshi = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + dq * GPU_DCN_HUBP_STRIDE) & 0xFFFF;
-        kprint("gpu: dcn diag pipe", 18); kprint_num(dq);
-        kprint(" otg=", 5); kprint_hex(octl);
-        kprint(" surf=", 6); kprint_hex((dshi << 32) | dslo);
-        kprintln("", 0);
-        dq = dq + 1;
-    }
-    kprint("gpu: dcn diag dce=", 18); kprint_hex(gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCE_VERSION)); kprintln("", 0);
-
     if (pipe >= 0) {
         if (lit_otg >= 0) {
             gpu_display_ok = 1;
+            gpu_display_pipe = pipe;        # the HUBP whose scanout is our console — P1 re-points THIS one
+            gpu_display_surf = expected_mc; # its current (front) surface address, for the P1 restore
             kprint("gpu: display pipe ", 18);
             kprint_num(pipe);
             kprintln(" live (scanout matches framebuffer)", 35);
@@ -2295,4 +2282,90 @@ fn gpu_display_probe() {
     gpu_display_ok = 0 - 1;
     kprintln("gpu: display pipe surface not matched", 37);
     return 0;
+}
+
+# === 1.55.x display arc — P1: the scanout flip (the FIRST DCN WRITE) ===
+# gpu_display_flip — re-point the lit pipe's HUBP scanout to a back buffer we own, hold it so the swap is
+# visible on the panel, then restore the console. This is the primitive a tear-free double-buffered present
+# is built from: render into a back buffer, then write ONE register pair to swap it in. DCN latches the
+# surface address and swaps at the next vblank — that hardware latch is what makes the swap tear-free (P2
+# then paces the render against vblank).
+#
+# The back buffer lives at VRAM offset GPU_FB_BACK_OFF (1 GB) — clear of the console FB (offset 0), the PSP
+# TMR (1.5 GB) and the compute arena (2 GB). The CPU writes it through the carveout's direct DRAM window
+# (fb_off + off, WC-mapped — the compute arc's proven CPU→carveout path); the HUBP fetches the same pixels
+# at fb_base + off. Write order is HIGH then LOW: the LOW write is the trigger that latches the pair.
+#
+# SAFETY — this writes the register driving the panel the operator is reading: the back buffer is FILLED
+# before the flip so the pipe never scans garbage; the front address is restored afterwards so the console
+# returns; both writes are read back and reported. Gated on P0 (which proved the pipe + its front address).
+# Worst case is a wrong-looking screen until the restore lands — reboot-recoverable, no hang.
+fn gpu_display_flip() {
+    gpu_flip_ok = 0;
+    if (gpu_present == 0) { return 0; }
+    if (gpu_display_ok != 1) { return 0; }     # P0 must have identified the lit pipe
+    if (gpu_display_pipe < 0) { return 0; }
+    if (gpu_display_surf == 0) { return 0; }
+
+    var bi = load64(&boot_info_ptr);
+    if (bi == 0) { return 0; }
+    var pitch  = load32(bi + 0x50) & 0xFFFFFFFF;   # bytes per scanline
+    var height = load32(bi + 0x58) & 0xFFFFFFFF;
+    if (pitch == 0) { return 0; }
+    if (height == 0) { return 0; }
+    var fb_size = pitch * height;
+
+    var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
+    var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
+    var fb_off  = r_off << 24;      # carveout CPU-phys base — the CPU's direct DRAM window onto VRAM
+    var fb_base = r_base << 24;     # carveout MC base — the GPU's view of the same memory
+    var back_phys = fb_off  + GPU_FB_BACK_OFF;
+    var back_mc   = fb_base + GPU_FB_BACK_OFF;
+
+    # WC-map the back buffer (2 MB granular) then FILL it — the pipe must never scan garbage.
+    var p = 0;
+    while (p < fb_size) { vmm_remap_wc_2mb(back_phys + p); p = p + 0x200000; }
+    var fill = (GPU_FB_BACK_FILL << 32) | GPU_FB_BACK_FILL;   # two ARGB pixels per store64
+    var q = 0;
+    while (q < fb_size) { store64(back_phys + q, fill); q = q + 8; }
+    gpu_mfence();
+
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+
+    # FLIP — HIGH then LOW (LOW is the trigger that latches the pair).
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (back_mc >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, back_mc & 0xFFFFFFFF);
+    gpu_mfence();
+    var rlo = gpu_reg32(GPU_BASE_DCN_2, slo) & 0xFFFFFFFF;
+    var rhi = gpu_reg32(GPU_BASE_DCN_2, shi) & 0xFFFF;
+    var got = (rhi << 32) | rlo;
+
+    # Hold ~2 s so the swap is unmistakable on the panel, then put the console back.
+    var h = 0;
+    while (h < 20000) { gpu_udelay(100); h = h + 1; }
+
+    # RESTORE — the console's front buffer.
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_display_surf >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_display_surf & 0xFFFFFFFF);
+    gpu_mfence();
+    var blo = gpu_reg32(GPU_BASE_DCN_2, slo) & 0xFFFFFFFF;
+    var bhi = gpu_reg32(GPU_BASE_DCN_2, shi) & 0xFFFF;
+    var rst = (bhi << 32) | blo;
+    var h2 = 0;
+    while (h2 < 2000) { gpu_udelay(100); h2 = h2 + 1; }   # let the restore latch before we log
+
+    if (got != back_mc) {
+        gpu_flip_ok = 0 - 1;
+        kprintln("gpu: display flip did not latch", 31);
+        return 0;
+    }
+    if (rst != gpu_display_surf) {
+        gpu_flip_ok = 0 - 2;
+        kprintln("gpu: display flip restore did not latch", 39);
+        return 0;
+    }
+    gpu_flip_ok = 1;
+    kprintln("gpu: display flip online (scanout re-pointed + restored)", 56);
+    return 1;
 }

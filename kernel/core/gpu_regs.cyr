@@ -77,6 +77,12 @@ var GPU_R_HUBP_SURF_CONFIG  = 0x5E5; # HUBPn DCSURF_SURFACE_CONFIG: SURFACE_PIXE
 var GPU_R_HUBP_CNTL         = 0x5F3; # HUBPn DCHUBP_CNTL: HUBP_BLANK_EN bit0 (0 = fetching)
 var GPU_DCN_HUBP_STRIDE     = 0xDC;  # per-HUBP instance stride
 var GPU_HUBP_BLANK_EN       = 0x1;   # DCHUBP_CNTL bit0
+# P1 back buffer — VRAM offset 1 GB: clear of the console FB (offset 0, ~8 MB), the PSP TMR (1.5 GB) and
+# the compute arena (2 GB = GPU_VM_ARENA_OFF), and well inside the 3 GB carveout. CPU writes it through the
+# carveout's direct DRAM window (fb_off + this, WC-mapped — the compute arc's proven path); the HUBP fetches
+# it at fb_base + this.
+var GPU_FB_BACK_OFF         = 0x40000000;
+var GPU_FB_BACK_FILL        = 0xFF0000FF; # solid blue (ARGB8888) — an unmistakable "the flip landed" frame
 
 # --- Field masks ---
 var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id (reads 0x0 on Cezanne — quirk)

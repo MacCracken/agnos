@@ -926,6 +926,13 @@ gpu_shader_dispatch_f64_fidelity();
 # page-flip will re-point. Strictly read-only; no-ops if the GPU is absent (QEMU) or the FB isn't GOP-lit.
 gpu_display_probe();
 
+# GPU arc 1.55.x (Thrust P) P1: the scanout FLIP — the first DCN write. Re-points the lit pipe's HUBP
+# surface address to a back buffer we own (VRAM offset 1 GB, filled first so the pipe never scans garbage),
+# holds ~2 s so the swap is visible on the panel, then restores the console. This is the primitive a
+# tear-free double-buffered present is built from — DCN latches the address and swaps at the next vblank.
+# Gated on P0 inside gpu_display_flip(); no-ops if the GPU/DCN is absent or P0 didn't identify the pipe.
+gpu_display_flip();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

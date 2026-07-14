@@ -5,6 +5,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.3] — 2026-07-14 — P1: the scanout flip (agnos's first DCN write)
+
+### Added
+
+- **P1 — scanout flip** (`kernel/core/gpu.cyr` `gpu_display_flip` + `kernel/core/gpu_regs.cyr`): the display
+  arc's first **write** to the DCN. Re-points the lit pipe's HUBP `DCSURF_PRIMARY_SURFACE_ADDRESS` to a back
+  buffer agnos owns, holds ~2 s so the swap is visible on the panel, then restores the console. That single
+  register pair is the primitive a tear-free double-buffered present is built from — DCN latches the address
+  and swaps at the **next vblank**, which is what makes the swap tear-free (P2 paces rendering against it).
+  Write order is HIGH then LOW (the LOW write triggers the latch); both writes are read back and reported.
+  PASS = `gpu: display flip online (scanout re-pointed + restored)` **plus** a solid-blue panel for ~2 s.
+- **Back buffer at VRAM offset 1 GB** (`GPU_FB_BACK_OFF`): clear of the console FB (offset 0, ~8 MB), the PSP
+  TMR (1.5 GB) and the compute arena (2 GB = `GPU_VM_ARENA_OFF`), well inside the 3 GB carveout. The CPU
+  writes it through the carveout's direct DRAM window (`fb_off + off`, WC-mapped — the compute arc's proven
+  CPU→carveout path); the HUBP fetches the same pixels at `fb_base + off`.
+
+Safety (this writes the register driving the operator's panel): the back buffer is **filled before** the flip
+so the pipe never scans garbage; the front address is **restored after**; both writes are read back; gated on
+P0 (which proved the pipe + its front address). Worst case is a wrong-looking screen until the restore lands
+— reboot-recoverable, no hang.
+
+### Changed
+
+- **P0 diagnostic removed** (`gpu_display_probe`): the `gpu: dcn diag …` labeled-hex lines did their job
+  (they localized the 1.55.0 no-match to a BAR0-vs-carveout premise bug) and are dropped now that P0 is
+  green — the boot log reads clean again, per the plain-kernel-log style.
+
+Iron-only; flash `--update-all`. Watch the boot: solid blue ~2 s then the console returns = the display
+followed our re-point. `flip online` **without** blue ⇒ the register latched but the pipe didn't swap (needs
+a surface-update lock/GSL — a follow-up bite). Then `run /bin/klug` for the verdict line.
+
 ## [1.55.2] — 2026-07-14 — P0 fix: the scanout address is BAR0-relative, not carveout-relative
 
 ### Fixed
