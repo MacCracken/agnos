@@ -892,13 +892,6 @@ gpu_shader_dispatch();
 # (shader proven) inside gpu_shader_dispatch2(). Same wedge-safe envelope. See kernel/core/gpu.cyr.
 gpu_shader_dispatch2();
 
-# GPU arc C2g-1 wave-width SWEEP (1.54.x burn 5) — burn 4 (1.54.20) showed a full 64-thread
-# workgroup launches ZERO executing waves (nz=0 even with exec,-1 first) while 1 thread works.
-# gpu_shader_dispatch2() above now carries the START/RESTART zero-fix; this sweep runs one
-# fixed-addr store per NUM_THREAD_X in {2,8,16,32,48,63,64} to pinpoint where launch breaks
-# (DEAD@2 => DIM-mode; alive<64 dead@64 => wave64 boundary; ALL alive => the fix worked).
-gpu_shader_sweep();
-
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

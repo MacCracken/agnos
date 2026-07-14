@@ -138,7 +138,7 @@ fn gpu_probe() {
     # BAR5 = the 512 KB MMIO register aperture.
     var bar = pci_bar_64(idx, GPU_BAR_MMIO);
     if (bar == 0) {
-        kprintln("gpu: no MMIO BAR5", 17);
+        kprintln("gpu: no MMIO aperture (BAR5)", 28);
         return 0;
     }
 
@@ -167,16 +167,11 @@ fn gpu_probe() {
     # Cezanne (an EPF0-strap MMIO-alias quirk — amdgpu reads it the same direct
     # way; iron 2026-07-11), so device identity comes authoritatively from PCI
     # config, not this register; strap0 is printed raw as a diagnostic only.
-    var strap0 = gpu_reg32(GPU_BASE_NBIO_2, GPU_R_RCC_STRAP0);
     var memsize = gpu_reg32(GPU_BASE_NBIO_2, GPU_R_CONFIG_MEMSIZE);
 
-    kprint("gpu: strap0=0x", 14);
-    kprint_hex(strap0 & 0xFFFFFFFF);
-    kprint(" (pci devid=0x", 14);
-    kprint_hex(pci_device(idx));
-    kprint(") vram=", 7);
+    kprint("gpu: ", 5);
     kprint_num(memsize);
-    kprintln("MB", 2);
+    kprintln("MB VRAM", 7);
 
     # GC — powered pre-driver; proves the graphics-core bus responds, not just
     # NBIO. (A power-gated GC reads 0 without meaning a mapping failure — STRAP0
@@ -184,11 +179,6 @@ fn gpu_probe() {
     var gbcfg = gpu_reg32(GPU_BASE_GC_0, GPU_R_GB_ADDR_CONFIG);
     var grbm  = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
 
-    kprint("gpu: gb_addr_config=0x", 22);
-    kprint_hex(gbcfg & 0xFFFFFFFF);
-    kprint(" grbm_status=0x", 15);
-    kprint_hex(grbm & 0xFFFFFFFF);
-    kprintln("", 0);
 
     # F0 pass gate: the aperture reads REAL values (a sane VRAM size + a structured
     # GB_ADDR_CONFIG, both non-0 / non-0xFFFFFFFF). This replaced the STRAP0 anchor
@@ -196,10 +186,10 @@ fn gpu_probe() {
     var live = 0;
     if (memsize != 0 && memsize != 0xFFFFFFFF && gbcfg != 0 && gbcfg != 0xFFFFFFFF) { live = 1; }
     if (live != 0) {
-        kprintln("gpu: F0 OK - register aperture live", 35);
+        kprintln("gpu: register aperture mapped", 29);
         return 1;
     }
-    kprintln("gpu: F0 WARN - aperture reads dead (0/FFFFFFFF)", 47);
+    kprintln("gpu: warning: aperture reads dead", 33);
     return 1;
 }
 
@@ -249,23 +239,7 @@ fn gpu_fw_probe() {
     var mec_hdr    = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_ME1_HEADER);
     var cp_stat    = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_STAT);
 
-    kprint("gpu: C0 psp=0x", 14);
-    kprint_hex(psp_sol & 0xFFFFFFFF);
-    kprint(" rlc=0x", 7);
-    kprint_hex(rlc_cntl & 0xFFFFFFFF);
-    kprint(" gpm=0x", 7);
-    kprint_hex(rlc_gpm & 0xFFFFFFFF);
-    kprintln("", 0);
 
-    kprint("gpu: C0 me=0x", 13);
-    kprint_hex(cp_me_cntl & 0xFFFFFFFF);
-    kprint(" mec=0x", 7);
-    kprint_hex(mec_cntl & 0xFFFFFFFF);
-    kprint(" hdr=0x", 7);
-    kprint_hex(mec_hdr & 0xFFFFFFFF);
-    kprint(" stat=0x", 8);
-    kprint_hex(cp_stat & 0xFFFFFFFF);
-    kprintln("", 0);
 
     # Verdict — halt bits SET = engine halted; RLC_CNTL bit0 = RLC running w/ ucode;
     # MEC header nonzero = MEC1 fetched its ucode. Case A needs all four positive.
@@ -279,14 +253,14 @@ fn gpu_fw_probe() {
     # false CASE B when a genuinely-running MEC left the header at the sentinel).
     if (rlc_on != 0 && gfx_halted == 0 && mec_halted == 0) {
         if (gpu_mec_hdr_is_real(mec_hdr) != 0) {
-            kprintln("gpu: C0 = CASE A (ucode running; MEC hdr live)", 46);
+            kprintln("gpu: firmware already resident (engines running)", 48);
         }
         if (gpu_mec_hdr_is_real(mec_hdr) == 0) {
-            kprintln("gpu: C0 = CASE A (engines running; MEC hdr=sentinel)", 52);
+            kprintln("gpu: firmware already resident (engines running)", 48);
         }
         return 1;
     }
-    kprintln("gpu: C0 = CASE B (ucode NOT loaded; PSP-load)", 45);
+    kprintln("gpu: firmware not resident, loading via PSP", 43);
     return 1;
 }
 
@@ -310,7 +284,7 @@ fn gpu_psp_ring_create() {
     # PSP must be alive (C0 read psp=0x698e82); a 0 SOL means no sOS to talk to.
     var sol = gpu_reg32(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_81);
     if (sol == 0) {
-        kprintln("gpu: C1a PSP not alive (SOL=0) - skip", 37);
+        kprintln("gpu: PSP not responding, skipping firmware load", 47);
         return 0;
     }
 
@@ -339,21 +313,16 @@ fn gpu_psp_ring_create() {
     }
     var status = resp & GPU_PSP_STATUS_MASK;
 
-    kprint("gpu: C1a ring=0x", 16);
-    kprint_hex(ring_phys & 0xFFFFFFFF);
-    kprint(" resp=0x", 8);
-    kprint_hex(resp & 0xFFFFFFFF);
-    kprintln("", 0);
 
     if ((resp & GPU_PSP_FLAG_RESPONSE) != 0 && status == 0) {
-        kprintln("gpu: C1a = GPCOM ring UP (PSP accepted)", 39);
+        kprintln("gpu: PSP command ring initialized", 33);
         return 1;
     }
     if ((resp & GPU_PSP_FLAG_RESPONSE) != 0) {
-        kprintln("gpu: C1a = ring INIT error (status != 0)", 40);
+        kprintln("gpu: PSP command ring init failed", 33);
         return 1;
     }
-    kprintln("gpu: C1a = ring INIT TIMEOUT (no response)", 42);
+    kprintln("gpu: PSP command ring init timed out", 36);
     return 1;
 }
 
@@ -373,14 +342,14 @@ fn gpu_psp_setup() {
     if (gpu_present == 0) { return 0; }
     var sol = gpu_reg32(GPU_BASE_MP0_0, GPU_R_MP0_C2PMSG_81);
     if (sol == 0) {
-        kprintln("gpu: C1b PSP not alive - skip", 29);
+        kprintln("gpu: PSP not responding, skipping secure region", 47);
         return 0;
     }
 
     # 2 MB UC region for ring(32 KB)+cmd(4 KB)+fence, and a 4 MB UC TMR.
     var region = pmm_alloc_2mb();
     if (region == 0) {
-        kprintln("gpu: C1b region alloc FAIL", 26);
+        kprintln("gpu: secure region allocation failed", 36);
         return 0;
     }
     vmm_remap_uc_2mb(region);
@@ -430,9 +399,6 @@ fn gpu_psp_setup() {
         i = i + 1;
     }
     if ((rr & GPU_PSP_FLAG_RESPONSE) == 0 || (rr & GPU_PSP_STATUS_MASK) != 0) {
-        kprint("gpu: C1b ring re-init FAIL resp=0x", 34);
-        kprint_hex(rr & 0xFFFFFFFF);
-        kprintln("", 0);
         return 0;
     }
 
@@ -449,24 +415,12 @@ fn gpu_psp_setup() {
     store32(cmd + 48, (tmr_phys >> 32) & 0xFFFFFFFF);    # system_phy_addr_hi
     var status = gpu_psp_submit(ring, cmd, fence);
 
-    kprint("gpu: C1b fb_base=0x", 19);
-    kprint_hex(r_base);
-    kprint(" fb_top=0x", 10);
-    kprint_hex(r_top);
-    kprintln("", 0);
-    kprint("gpu: C1b tmr=0x", 15);
-    kprint_hex(tmr_phys & 0xFFFFFFFF);
-    kprint(" fence=0x", 9);
-    kprint_hex(load32(fence));
-    kprint(" status=0x", 10);
-    kprint_hex(status & 0xFFFFFFFF);
-    kprintln("", 0);
 
     if (load32(fence) == gpu_psp_fctr && status == 0) {
-        kprintln("gpu: C1b = SETUP_TMR OK (PSP DMA live)", 38);
+        kprintln("gpu: PSP secure memory region ready", 35);
         return 1;
     }
-    kprintln("gpu: C1b = SETUP_TMR FAIL (fence/status)", 40);
+    kprintln("gpu: PSP secure region setup failed", 35);
     return 1;
 }
 
@@ -496,22 +450,19 @@ fn gpu_fw_load() {
     var hdr[32];                   # function-local var X[N] = N BYTES → 32 B
     var rc = vfs_read_file_at("/fw/rlc.bin", 11, 0, &hdr, 32);
     if (rc <= 0) {
-        kprintln("gpu: C1b-2 RLC blob not found (/fw/rlc.bin)", 43);
+        kprintln("gpu: RLC firmware not found (/fw/rlc.bin)", 41);
         return 0;
     }
     var uc_size = load32(&hdr + 0x14) & 0xFFFFFFFF;   # ucode_size_bytes
     var uc_off  = load32(&hdr + 0x18) & 0xFFFFFFFF;   # ucode_array_offset_bytes
     if (uc_size == 0 || uc_size > 0x100000) {
-        kprint("gpu: C1b-2 bad RLC header size=0x", 33);
-        kprint_hex(uc_size);
-        kprintln("", 0);
         return 0;
     }
 
     # Read the payload [uc_off, uc_off+uc_size) straight into the UC payload buffer.
     rc = vfs_read_file_at("/fw/rlc.bin", 11, uc_off, payload, uc_size);
     if (rc <= 0) {
-        kprintln("gpu: C1b-2 RLC payload read FAIL", 32);
+        kprintln("gpu: RLC firmware read failed", 29);
         return 0;
     }
 
@@ -526,21 +477,12 @@ fn gpu_fw_load() {
     store32(cmd + 40, GPU_FW_TYPE_RLC_G);
     var status = gpu_psp_submit(ring, cmd, fence);
 
-    kprint("gpu: C1b-2 rlc off=0x", 21);
-    kprint_hex(uc_off);
-    kprint(" sz=0x", 6);
-    kprint_hex(uc_size);
-    kprint(" fence=0x", 9);
-    kprint_hex(load32(fence));
-    kprint(" status=0x", 10);
-    kprint_hex(status & 0xFFFFFFFF);
-    kprintln("", 0);
 
     if (load32(fence) == gpu_psp_fctr && status == 0) {
-        kprintln("gpu: C1b-2 = RLC_G LOADED (PSP validated sig)", 45);
+        kprintln("gpu: RLC firmware loaded (PSP-validated)", 40);
         return 1;
     }
-    kprintln("gpu: C1b-2 = LOAD_IP_FW FAIL", 28);
+    kprintln("gpu: RLC firmware load failed", 29);
     return 1;
 }
 
@@ -560,9 +502,6 @@ fn gpu_fw_load_one(path, path_len, fw_type, kind) {
     var hdr[48];                   # function-local var X[N] = N BYTES; header spans to 0x2C
     var rc = vfs_read_file_at(path, path_len, 0, &hdr, 48);
     if (rc <= 0) {
-        kprint("gpu: C1c blob missing ft=0x", 27);
-        kprint_hex(fw_type);
-        kprintln("", 0);
         return 0;
     }
     var uc_size = load32(&hdr + 0x14) & 0xFFFFFFFF;   # ucode_size_bytes
@@ -580,20 +519,12 @@ fn gpu_fw_load_one(path, path_len, fw_type, kind) {
         psize = jt_sz * 4;
     }
     if (psize == 0 || psize > 0x100000) {
-        kprint("gpu: C1c bad size ft=0x", 23);
-        kprint_hex(fw_type);
-        kprint(" sz=0x", 6);
-        kprint_hex(psize);
-        kprintln("", 0);
         return 0;
     }
 
     # DMA-read the payload slice straight into the UC buffer.
     rc = vfs_read_file_at(path, path_len, poff, payload, psize);
     if (rc <= 0) {
-        kprint("gpu: C1c read FAIL ft=0x", 24);
-        kprint_hex(fw_type);
-        kprintln("", 0);
         return 0;
     }
 
@@ -607,19 +538,9 @@ fn gpu_fw_load_one(path, path_len, fw_type, kind) {
     store32(cmd + 40, fw_type);
     var status = gpu_psp_submit(ring, cmd, fence);
 
-    kprint("gpu: C1c ft=0x", 14);
-    kprint_hex(fw_type);
-    kprint(" off=0x", 7);
-    kprint_hex(poff);
-    kprint(" sz=0x", 6);
-    kprint_hex(psize);
-    kprint(" st=0x", 6);
-    kprint_hex(status & 0xFFFFFFFF);
     if (load32(fence) == gpu_psp_fctr && status == 0) {
-        kprintln(" OK", 3);
         return 1;
     }
-    kprintln(" FAIL", 5);
     return 0;
 }
 
@@ -633,7 +554,7 @@ fn gpu_fw_load_one(path, path_len, fw_type, kind) {
 fn gpu_fw_load_set() {
     if (gpu_present == 0) { return 0; }
     if (gpu_psp_ring2 == 0) { return 0; }
-    kprintln("gpu: C1c loading CP/MEC set...", 30);
+    kprintln("gpu: loading CP/MEC firmware...", 31);
     var ok = 0;
     ok = ok + gpu_fw_load_one("/fw/ce.bin",  10, GPU_FW_TYPE_CP_CE,      0);
     ok = ok + gpu_fw_load_one("/fw/pfp.bin", 11, GPU_FW_TYPE_CP_PFP,     0);
@@ -641,12 +562,9 @@ fn gpu_fw_load_set() {
     ok = ok + gpu_fw_load_one("/fw/mec.bin", 11, GPU_FW_TYPE_CP_MEC,     1);
     ok = ok + gpu_fw_load_one("/fw/mec.bin", 11, GPU_FW_TYPE_CP_MEC_ME1, 2);
     if (ok == 5) {
-        kprintln("gpu: C1c = ALL CP+MEC ucode LOADED (5/5, PSP validated)", 55);
+        kprintln("gpu: CP/MEC firmware loaded (5/5, PSP-validated)", 48);
         return 1;
     }
-    kprint("gpu: C1c = PARTIAL CP/MEC load ok=0x", 36);
-    kprint_hex(ok);
-    kprintln("", 0);
     return 0;
 }
 
@@ -666,20 +584,15 @@ fn gpu_fw_load_set() {
 fn gpu_engine_start() {
     if (gpu_present == 0) { return 0; }
     if (gpu_psp_ring2 == 0) { return 0; }   # firmware-load path ran (ring/TMR up)
-    kprintln("gpu: C1d starting engines...", 28);
+    kprintln("gpu: starting compute engines...", 32);
 
     # 1) RLC: set RLC_ENABLE_F32 (bit0) via RMW. MUST precede the CP un-halts.
     var rlc0 = gpu_reg32(GPU_BASE_GC_1, GPU_R_RLC_CNTL);
     gpu_reg32_write(GPU_BASE_GC_1, GPU_R_RLC_CNTL, rlc0 | GPU_RLC_ENABLE_F32);
     gpu_udelay(50);
     var rlc1 = gpu_reg32(GPU_BASE_GC_1, GPU_R_RLC_CNTL);
-    kprint("gpu: C1d rlc 0x", 15);
-    kprint_hex(rlc0 & 0xFFFFFFFF);
-    kprint(" -> 0x", 6);
-    kprint_hex(rlc1 & 0xFFFFFFFF);
-    kprintln("", 0);
     if ((rlc1 & GPU_RLC_ENABLE_F32) == 0) {
-        kprintln("gpu: C1d ABORT - RLC did not enable (CG/GFXOFF gated)", 53);
+        kprintln("gpu: engine start failed: RLC power-gated", 41);
         return 0;
     }
 
@@ -688,11 +601,6 @@ fn gpu_engine_start() {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_ME_CNTL, me0 & 0xEAFFFFFF);
     gpu_udelay(50);
     var me1 = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_ME_CNTL);
-    kprint("gpu: C1d me  0x", 15);
-    kprint_hex(me0 & 0xFFFFFFFF);
-    kprint(" -> 0x", 6);
-    kprint_hex(me1 & 0xFFFFFFFF);
-    kprintln("", 0);
 
     # 3) CP-compute (MEC1 crown) un-halt: write 0 (amdgpu parity; MEC2 fused-absent
     #    on gfx9.3.0 so clearing MEC_ME2_HALT is a no-op).
@@ -700,11 +608,6 @@ fn gpu_engine_start() {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL, 0);
     gpu_udelay(50);
     var mec1 = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL);
-    kprint("gpu: C1d mec 0x", 15);
-    kprint_hex(mec0 & 0xFFFFFFFF);
-    kprint(" -> 0x", 6);
-    kprint_hex(mec1 & 0xFFFFFFFF);
-    kprintln("", 0);
 
     # 4) MEC1 header — poll ~1 ms for the ucode-fetch transition. BONUS positive only.
     var hdr = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_ME1_HEADER);
@@ -713,28 +616,17 @@ fn gpu_engine_start() {
         if (gpu_mec_hdr_is_real(hdr) != 0) { t = 20; }
         else { gpu_udelay(50); hdr = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_ME1_HEADER); t = t + 1; }
     }
-    kprint("gpu: C1d mec-hdr 0x", 19);
-    kprint_hex(hdr & 0xFFFFFFFF);
-    if (gpu_mec_hdr_is_real(hdr) != 0) {
-        kprintln(" (ucode fetch confirmed)", 24);
-    }
-    if (gpu_mec_hdr_is_real(hdr) == 0) {
-        kprintln(" (sentinel - hdr not repopulated on PSP path)", 45);
-    }
 
     # 5) Reliable verdict: RLC on + gfx/mec halts clear + GRBM idle (GUI_ACTIVE=0).
     var grbm = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
-    kprint("gpu: C1d grbm 0x", 16);
-    kprint_hex(grbm & 0xFFFFFFFF);
-    kprintln("", 0);
     var gfx_halt = me1 & GPU_CP_GFX_HALT_MASK;
     var mec_halt = mec1 & GPU_CP_MEC_ME1_HALT;
     var gui_busy = grbm & GPU_GRBM_GUI_ACTIVE;
     if (gfx_halt == 0 && mec_halt == 0 && gui_busy == 0) {
-        kprintln("gpu: C1d = ENGINES RUNNING (rlc on, gfx+mec un-halted, idle)", 60);
+        kprintln("gpu: compute engines online (idle)", 34);
     }
     if (gfx_halt != 0 || mec_halt != 0 || gui_busy != 0) {
-        kprintln("gpu: C1d = engines NOT clean (check halt/gui bits above)", 56);
+        kprintln("gpu: compute engines failed to start", 36);
     }
 
     # 6) Formal C0 re-read — expect the CASE B → CASE A flip.
@@ -766,50 +658,23 @@ fn gpu_gpuvm_probe() {
     var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
     var bar2  = pci_bar_64(gpu_pci_idx, 2);
 
-    kprintln("gpu: C2a GMC/GFXHUB VM probe (read-only)", 40);
-    kprint("gpu: C2a l1=0x", 14);
-    kprint_hex(l1 & 0xFFFFFFFF);
-    kprint(" l2=0x", 6);
-    kprint_hex(l2 & 0xFFFFFFFF);
-    kprint(" ctx0=0x", 8);
-    kprint_hex(ctx0 & 0xFFFFFFFF);
-    kprint(" ptb=0x", 7);
-    kprint_hex(ptlo & 0xFFFFFFFF);
-    kprintln("", 0);
-    kprint("gpu: C2a fb=0x", 14);
-    kprint_hex(fbb & 0xFFFFFFFF);
-    kprint("..0x", 4);
-    kprint_hex(fbt & 0xFFFFFFFF);
-    kprint(" agp=0x", 7);
-    kprint_hex(agpb & 0xFFFFFFFF);
-    kprint("..0x", 4);
-    kprint_hex(agpt & 0xFFFFFFFF);
-    kprintln("", 0);
-    kprint("gpu: C2a sysap=0x", 17);
-    kprint_hex(salo & 0xFFFFFFFF);
-    kprint("..0x", 4);
-    kprint_hex(sahi & 0xFFFFFFFF);
-    kprint(" fault=0x", 9);
-    kprint_hex(fault & 0xFFFFFFFF);
-    kprint(" bar2=0x", 8);
-    kprint_hex(bar2 & 0xFFFFFFFF);
-    kprintln("", 0);
+    kprintln("gpu: probing memory controller...", 33);
 
     var ptb = 0;
     if ((ptlo | pthi) != 0) { ptb = 1; }
     if ((ctx0 & 0x1) != 0 && ptb != 0) {
-        kprintln("gpu: C2a GART=PRESENT (ctx0 live; treat STALE, rebuild)", 55);
+        kprintln("gpu: GART present (stale)", 25);
     }
     if ((ctx0 & 0x1) == 0 || ptb == 0) {
-        kprintln("gpu: C2a GART=ABSENT (no page tables; walk path empty)", 54);
+        kprintln("gpu: no GART page tables", 24);
     }
     if ((l1 & 0x1) != 0 && (l2 & 0x1) != 0) {
-        kprintln("gpu: C2a PIPE=LIVE (FB-aperture reachable; C2b map-only)", 56);
+        kprintln("gpu: framebuffer aperture reachable", 35);
     }
     if ((l1 & 0x1) == 0 || (l2 & 0x1) == 0) {
-        kprintln("gpu: C2a PIPE=OFF (C2b enables L1+L2; still no page tables)", 59);
+        kprintln("gpu: memory pipe disabled (enabling caches)", 43);
     }
-    kprintln("gpu: C2a = C2b target: UMA carveout via FB-aperture, ZERO PTEs", 62);
+    kprintln("gpu: memory: UMA carveout via framebuffer aperture", 50);
     return 1;
 }
 # ── C2b — GFXHUB GMC setup for FB-aperture compute (first GMC write) ───────────
@@ -877,37 +742,15 @@ fn gpu_vm_setup() {
     var flt  = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
     var grbm = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
 
-    kprint("gpu: C2b arena mc=0x", 20);
-    kprint_hex(arena_mc);
-    kprint(" phys=0x", 8);
-    kprint_hex(arena_phys);
-    kprintln("", 0);
-    kprint("gpu: C2b cpuprobe=0x", 20);
-    kprint_hex(chk);
-    kprintln("", 0);
-    kprint("gpu: C2b l2=0x", 14);
-    kprint_hex(l2v & 0xFFFFFFFF);
-    kprint(" ctx0=0x", 8);
-    kprint_hex(ctxv & 0xFFFFFFFF);
-    kprint(" fcntl=0x", 9);
-    kprint_hex(fcv & 0xFFFFFFFF);
-    kprint(" ack=0x", 7);
-    kprint_hex(acked);
-    kprintln("", 0);
-    kprint("gpu: C2b fault=0x", 17);
-    kprint_hex(flt & 0xFFFFFFFF);
-    kprint(" grbm=0x", 8);
-    kprint_hex(grbm & 0xFFFFFFFF);
-    kprintln("", 0);
 
     var l2_on   = l2v & GPU_VM_L2_ENABLE_CACHE;
     var ctx_off = ctxv & 0x1;
     var gui     = grbm & GPU_GRBM_GUI_ACTIVE;
     if (l2_on != 0 && ctx_off == 0 && flt == 0 && gui == 0 && chk == 0xC2B0C2B0) {
-        kprintln("gpu: C2b = GMC ARMED (L2 on, ctx0 off, fault-net, cpu-ok, idle)", 63);
+        kprintln("gpu: memory controller ready (L2 on, idle)", 42);
         return 1;
     }
-    kprintln("gpu: C2b = GMC setup INCOMPLETE (check readbacks above)", 55);
+    kprintln("gpu: memory controller setup incomplete", 39);
     return 0;
 }
 # ── C2c — map an EMPTY compute queue (MEC1/pipe0/queue0) ──────────────────────
@@ -977,29 +820,15 @@ fn gpu_queue_setup() {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
     var grbm = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
 
-    kprint("gpu: C2c pq=0x", 14);
-    kprint_hex((ring_mc >> 8) & 0xFFFFFFFF);
-    kprint(" mqd=0x", 7);
-    kprint_hex(mqd_mc);
-    kprintln("", 0);
-    kprint("gpu: C2c active=0x", 18);
-    kprint_hex(active & 0xFFFFFFFF);
-    kprint(" rptr=0x", 8);
-    kprint_hex(rptr & 0xFFFFFFFF);
-    kprint(" db=0x", 6);
-    kprint_hex(db & 0xFFFFFFFF);
-    kprint(" grbm=0x", 8);
-    kprint_hex(grbm & 0xFFFFFFFF);
-    kprintln("", 0);
 
     var act = active & 0x1;
     var gui = grbm & GPU_GRBM_GUI_ACTIVE;
     if (act != 0 && rptr == 0 && gui == 0) {
         gpu_queue_active = 1;
-        kprintln("gpu: C2c = QUEUE MAPPED (MEC1 p0q0 active, empty, idle)", 55);
+        kprintln("gpu: compute queue ready (MEC1)", 31);
         return 1;
     }
-    kprintln("gpu: C2c = QUEUE MAP INCOMPLETE (check active/rptr/gui)", 55);
+    kprintln("gpu: compute queue setup incomplete", 35);
     return 0;
 }
 # ── C2d — first PM4 packet: the VM-fetch gate ─────────────────────────────────
@@ -1024,7 +853,7 @@ fn gpu_ring_kick() {
     var fb_base = r_base << 24;
     var fb_top  = (r_top << 24) + 0x1000000;
     if (ring_mc < fb_base || ring_mc >= fb_top) {
-        kprintln("gpu: C2d ABORT - ring MC outside FB aperture", 44);
+        kprintln("gpu: command ring address out of range", 38);
         return 0;
     }
 
@@ -1035,7 +864,7 @@ fn gpu_ring_kick() {
 
     # UC-map BAR2 + the doorbell 8-byte slot (index 0x06 -> byte 0x18).
     var bar2 = pci_bar_64(gpu_pci_idx, 2);
-    if (bar2 == 0) { kprintln("gpu: C2d ABORT - no BAR2 doorbell aperture", 42); return 0; }
+    if (bar2 == 0) { kprintln("gpu: no doorbell aperture (BAR2)", 32); return 0; }
     vmm_remap_uc_2mb(bar2);
     var db_slot = bar2 + 0x18;
 
@@ -1079,15 +908,6 @@ fn gpu_ring_kick() {
     var grbm  = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS);
     var gui   = grbm & GPU_GRBM_GUI_ACTIVE;
 
-    kprint("gpu: C2d rmem=0x", 16);
-    kprint_hex(rmem);
-    kprint(" rreg=0x", 8);
-    kprint_hex(rreg & 0xFFFFFFFF);
-    kprint(" fault=0x", 9);
-    kprint_hex(fault & 0xFFFFFFFF);
-    kprint(" grbm=0x", 8);
-    kprint_hex(grbm & 0xFFFFFFFF);
-    kprintln("", 0);
 
     # Isolation fallback (only on a clean no-fetch): a direct register wptr write bypasses
     # the doorbell route — if THAT advances rptr, the doorbell routing was the gap (not VM).
@@ -1101,24 +921,22 @@ fn gpu_ring_kick() {
             else { gpu_udelay(100); j = j + 1; }
         }
         gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
-        if ((rreg & 0xFFFFFFFF) == 8) { kprintln("gpu: C2d fallback: register-wptr kick fetched (doorbell route was the gap)", 74); }
-        if ((rreg & 0xFFFFFFFF) != 8) { kprintln("gpu: C2d fallback: still no fetch (VM/ring issue, not the doorbell)", 67); }
     }
 
     var fetched = 0;
     if (ok != 0) { fetched = 1; }
     if ((rreg & 0xFFFFFFFF) == 8) { fetched = 1; }
     if (fault != 0) {
-        kprintln("gpu: C2d = VM-FETCH FAULT (FB-aperture xlate faulted; served dummy)", 67);
+        kprintln("gpu: command ring fetch faulted", 31);
         return 0;
     }
     if (fetched != 0 && gui == 0) {
         gpu_ring_fetched = 1;
         gpu_ring_wptr = 8;   # canonical ring cursor after the 8-dword NOP kick; C2e appends here
-        kprintln("gpu: C2d = PM4 FETCHED (rptr 0->8; the MEC ran the ring)", 56);
+        kprintln("gpu: command ring active", 24);
         return 1;
     }
-    kprintln("gpu: C2d = NO FETCH (doorbell not honored / rptr stuck)", 55);
+    kprintln("gpu: command ring not responding", 32);
     return 0;
 }
 # ── C2e — WRITE_DATA fence: the MEC executes + a CPU-visible write ─────────────
@@ -1137,7 +955,7 @@ fn gpu_ring_kick() {
 fn gpu_fence() {
     if (gpu_present == 0) { return 0; }
     if (gpu_ring_fetched == 0) {
-        kprintln("gpu: C2e ABORT - queue not fetched (run C2d first)", 50);
+        kprintln("gpu: skipping coherence check (ring inactive)", 45);
         return 0;
     }
     if (gpu_arena_mc == 0) { return 0; }
@@ -1198,34 +1016,23 @@ fn gpu_fence() {
     var gui   = grbm & GPU_GRBM_GUI_ACTIVE;
     sval = load32(sent_phys) & 0xFFFFFFFF;              # final authoritative readback
 
-    kprint("gpu: C2e sent=0x", 16);
-    kprint_hex(sval);
-    kprint(" rreg=0x", 8);
-    kprint_hex(rreg);
-    kprint(" wptr=0x", 8);
-    kprint_hex(new_wptr);
-    kprint(" fault=0x", 9);
-    kprint_hex(fault & 0xFFFFFFFF);
-    kprint(" grbm=0x", 8);
-    kprint_hex(grbm & 0xFFFFFFFF);
-    kprintln("", 0);
 
     gpu_ring_wptr = new_wptr;                           # advance cursor -> a re-run appends cleanly
 
     if (fault != 0) {
-        kprintln("gpu: C2e = VM FAULT (WRITE_DATA addr faulted; served dummy)", 59);
+        kprintln("gpu: coherence check faulted", 28);
         return 0;
     }
     if (rptr_ok != 0 && sent_ok != 0 && gui == 0) {
         gpu_fence_ok = 1;
-        kprintln("gpu: C2e = FENCE OK (MEC executed WRITE_DATA; CPU-visible write)", 64);
+        kprintln("gpu: GPU-to-CPU coherence verified", 34);
         return 1;
     }
     if (rptr_ok != 0 && sent_ok == 0) {
-        kprintln("gpu: C2e = EXECUTED, NOT COHERENT (rptr advanced, sentinel stale)", 65);
+        kprintln("gpu: GPU write not CPU-visible", 30);
         return 0;
     }
-    kprintln("gpu: C2e = NO EXEC (rptr stuck; WRITE_DATA not consumed)", 56);
+    kprintln("gpu: coherence check did not run", 32);
     return 0;
 }
 # ── C2f — first hand-assembled gfx90c compute shader (DISPATCH_DIRECT) ─────────
@@ -1251,7 +1058,7 @@ fn gpu_shader_dispatch() {
     gpu_shader_ok = 0;
     if (gpu_present == 0) { return 0; }
     if (gpu_fence_ok == 0) {
-        kprintln("gpu: C2f ABORT - fence not proven (run C2e first)", 49);
+        kprintln("gpu: skipping shader test (coherence unverified)", 48);
         return 0;
     }
     if (gpu_arena_mc == 0) { return 0; }
@@ -1353,42 +1160,26 @@ fn gpu_shader_dispatch() {
     var donev = load32(done_phys) & 0xFFFFFFFF;
     var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
 
-    kprint("gpu: C2f rptr=0x", 16);
-    kprint_hex(rreg);
-    kprint(" wr=0x", 6);
-    kprint_hex(new_wptr);
-    kprint(" wb=0x", 6);
-    kprint_hex(wptr_rb);
-    kprint(" act=0x", 7);
-    kprint_hex(active);
-    kprintln("", 0);
-    kprint("gpu: C2f out=0x", 15);
-    kprint_hex(outv);
-    kprint(" done=0x", 8);
-    kprint_hex(donev);
-    kprint(" fault=0x", 9);
-    kprint_hex(fault & 0xFFFFFFFF);
-    kprintln("", 0);
 
     gpu_ring_wptr = new_wptr;   # cursor authoritative for any re-run
 
     if (fault != 0) {
         gpu_shader_ok = 0 - 3;
-        kprintln("gpu: C2f = VM FAULT (shader store faulted; served dummy)", 56);
+        kprintln("gpu: shader store faulted", 25);
         return 0;
     }
     if (ok != 0) {
         if (outv == GPU_C2F_CONST) {
             gpu_shader_ok = 1;
-            kprintln("gpu: C2f = SHADER RAN (wrote 0xC2F0C2F0; CPU-visible)", 53);
+            kprintln("gpu: compute shader executed", 28);
             return 1;
         }
         gpu_shader_ok = 0 - 2;
-        kprintln("gpu: C2f = STORE STALE (dispatched; write not CPU-visible)", 58);
+        kprintln("gpu: shader store not CPU-visible", 33);
         return 0;
     }
     gpu_shader_ok = 0 - 1;
-    kprintln("gpu: C2f = NO RETIRE (dispatch not consumed / no wave)", 54);
+    kprintln("gpu: shader dispatch did not complete", 37);
     return 0;
 }
 # ── C2g-1 — FIRST MULTI-THREAD compute dispatch (1 workgroup, 64 threads; out[tid]=tid) ──
@@ -1407,7 +1198,7 @@ fn gpu_shader_dispatch2() {
     gpu_mt_ok = 0;
     if (gpu_present == 0) { return 0; }
     if (gpu_shader_ok != 1) {
-        kprintln("gpu: C2g-1 ABORT - shader not proven (run C2f first)", 52);
+        kprintln("gpu: skipping parallel test (shader unverified)", 47);
         return 0;
     }
     if (gpu_arena_mc == 0) { return 0; }
@@ -1524,175 +1315,23 @@ fn gpu_shader_dispatch2() {
     var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
     gpu_ring_wptr = new_wptr;
 
-    kprint("gpu: C2g-1 rptr=0x", 18);
-    kprint_hex(rreg);
-    kprint(" wr=0x", 6);
-    kprint_hex(new_wptr);
-    kprint(" wb=0x", 6);
-    kprint_hex(wptr_rb);
-    kprint(" act=0x", 7);
-    kprint_hex(active);
-    kprintln("", 0);
-    kprint("gpu: C2g-1 ok=", 14);
-    kprint_hex(okcount);
-    kprint("/64 firstbad=0x", 15);
-    kprint_hex(firstbad & 0xFFFFFFFF);
-    kprint(" fault=0x", 9);
-    kprint_hex(fault & 0xFFFFFFFF);
-    kprintln("", 0);
-    kprint("gpu: C2g-1 o0=0x", 16);
-    kprint_hex(load32(out_phys) & 0xFFFFFFFF);
-    kprint(" o1=0x", 6);
-    kprint_hex(load32(out_phys + 4) & 0xFFFFFFFF);
-    kprint(" o2=0x", 6);
-    kprint_hex(load32(out_phys + 8) & 0xFFFFFFFF);
-    kprint(" nz=0x", 6);
-    kprint_hex(nz);
-    kprintln("", 0);
 
     if (fault != 0) {
         gpu_mt_ok = 0 - 3;
-        kprintln("gpu: C2g-1 = VM FAULT (multi-thread store faulted; served dummy)", 64);
+        kprintln("gpu: parallel compute store faulted", 35);
         return 0;
     }
     if (ok != 0) {
         if (okcount == GPU_MT_N) {
             gpu_mt_ok = 1;
-            kprintln("gpu: C2g-1 = MULTI-THREAD OK (64/64 tids written; CPU-visible)", 62);
+            kprintln("gpu: parallel compute online (64 threads)", 41);
             return 1;
         }
         gpu_mt_ok = 0 - 2;
-        kprintln("gpu: C2g-1 = PARTIAL (dispatched; some tids stale/wrong)", 56);
+        kprintln("gpu: parallel compute incomplete", 32);
         return 0;
     }
     gpu_mt_ok = 0 - 1;
-    kprintln("gpu: C2g-1 = NO RETIRE (dispatch not consumed / no wave)", 56);
-    return 0;
-}
-
-# ── C2g-1 wave-width SWEEP — pinpoint where multi-thread launch breaks ──────────
-# Burn 4 (1.54.20) proved a full 64-thread workgroup launches ZERO executing waves
-# (nz=0 even with exec,-1 FIRST) while 1 thread works. This runs ONE fixed-addr store
-# dispatch per NUM_THREAD_X in {2,8,16,32,48,63,64} (each WITH the START/RESTART fix)
-# and reports which widths produced a store => which widths launch executing waves.
-# Splits the hypothesis: DEAD@2 => DIM-mode (USE_THREAD_DIMENSIONS); alive<64 dead@64 =>
-# wave64 boundary (FORCE_SIMD_DIST); ALL alive => the START/RESTART fix launched the waves.
-# WEDGE-SAFE: each dispatch is the proven bounded-watchdog envelope; fixed-addr store; a
-# per-width slot in a fresh region; bus-master off; a bad addr faults into the 0x1FFC net.
-fn gpu_sweep_one(width, slot_off) {
-    var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
-    var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;
-    var out_phys    = gpu_arena_phys + slot_off;
-    var out_mc      = gpu_arena_mc   + slot_off;
-    var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
-    var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
-
-    # 8-dword fixed-addr store shader: each active lane stores its workitem-id v0 -> out_mc
-    # (no exec-set — SPI auto-inits EXEC; this tests PURE wave launch, not masking).
-    store32(shader_phys + 0x00, 0x7E0202FF); store32(shader_phys + 0x04, out_mc & 0xFFFFFFFF);
-    store32(shader_phys + 0x08, 0x7E0402FF); store32(shader_phys + 0x0C, (out_mc >> 32) & 0xFFFFFFFF);
-    store32(shader_phys + 0x10, 0xDC718000); store32(shader_phys + 0x14, 0x007F0001);
-    store32(shader_phys + 0x18, 0xBF8C0F70); store32(shader_phys + 0x1C, 0xBF810000);
-    store32(out_phys, GPU_MT_NOTYET); store32(done_phys, GPU_MT_NOTYET);
-    gpu_mfence();
-
-    var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
-
-    var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
-    var pgm_hi = (shader_mc >> 40) & 0xFF;
-    # PRE-dispatch I$/K$ invalidate (mabda-proven, MANDATORY on gfx9) — the shader is rewritten in place at
-    # a FIXED VA (0x14000) every dispatch, so without this the SQ runs a STALE cached shader (a prior
-    # dispatch's baked store-address) => the store lands in the wrong slot. THE fix for the C2g-1
-    # intermittent-launch bug (burns 1-8): C2f worked only by cold-cache luck; every later dispatch ran stale.
-    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
-    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
-    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(0);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_START_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(width); gpu_ring_put(1); gpu_ring_put(1);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_RESTART_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(0);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE2); gpu_ring_put(0); gpu_ring_put(0);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(GPU_COMPUTE_RESLIM);
-    gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
-    gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
-    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
-    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
-    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
-    gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
-    gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
-    gpu_mfence();
-
-    var new_wptr = gpu_ring_wptr;
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
-    gpu_mfence();
-    var retired = 0;
-    var i = 0;
-    while (i < 1000) {
-        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { retired = 1; i = 1000; }
-        else { gpu_udelay(100); i = i + 1; }
-    }
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
-    gpu_mfence();
-    gpu_ring_wptr = new_wptr;
-
-    # bit0 = a lane's store landed (wave executed); bit1 = the done-marker fired (ring retired =
-    # NOT a hang). dead+retired = launched-but-no-wave; dead+!retired = HUNG (watchdog timed out).
-    var r = 0;
-    var v = load32(out_phys) & 0xFFFFFFFF;
-    if (v != GPU_MT_NOTYET) { r = r | 1; }
-    if (retired != 0) { r = r | 2; }
-    return r;
-}
-
-fn gpu_shader_sweep() {
-    if (gpu_present == 0) { return 0; }
-    if (gpu_shader_ok != 1) { return 0; }
-    if (gpu_arena_mc == 0) { return 0; }
-    if (gpu_ring_wptr == 0) { return 0; }
-
-    # DIAGNOSTIC: 5 IB-register configs (exec / START,RESTART / FSD / mabda-preamble) ALL gave the
-    # IDENTICAL width-dependent alive pattern => the bug is NOT in the dispatch IB, it is agnos's own
-    # queue/MQD (C2c). Separate WIDTH from dispatch-POSITION, and hang from no-launch: run a FIXED
-    # width to 8 successive slots, twice. gpu_sweep_one returns bit0=alive(store landed), bit1=retired
-    # (done fired = NOT hung). Control A: width 64 x8. Control B: width 8 x8 (8 was "alive" before).
-    var a64m = 0;  var r64m = 0;  var res = 0;  var k = 0;
-    while (k < 8) {
-        res = gpu_sweep_one(64, GPU_SWEEP_OUT_SUBOFF + (k << 2));
-        if ((res & 1) != 0) { a64m = a64m | (1 << k); }
-        if ((res & 2) != 0) { r64m = r64m | (1 << k); }
-        k = k + 1;
-    }
-    var a8m = 0;  var r8m = 0;  k = 0;
-    while (k < 8) {
-        res = gpu_sweep_one(8, GPU_SWEEP_OUT_SUBOFF + 0x100 + (k << 2));
-        if ((res & 1) != 0) { a8m = a8m | (1 << k); }
-        if ((res & 2) != 0) { r8m = r8m | (1 << k); }
-        k = k + 1;
-    }
-    kprint("gpu: SWEEP w64x8 alive=0x", 25); kprint_hex(a64m);
-    kprint(" retire=0x", 10);  kprint_hex(r64m);
-    kprintln("", 0);
-    kprint("gpu: SWEEP w8x8 alive=0x", 24); kprint_hex(a8m);
-    kprint(" retire=0x", 10);  kprint_hex(r8m);
-    kprintln("", 0);
-
-    # a64m==0xFF => 64-lane launch FIXED. a64m==a8m (same slots, width-independent) => POSITION-
-    # dependent (queue state advances per dispatch). a64m!=a8m => WIDTH-dependent. retire<0xFF bits
-    # => those dispatches HUNG (watchdog timeout) rather than launched-empty.
-    if (a64m == 0xFF) {
-        kprintln("gpu: SWEEP verdict = w64 ALL ALIVE -> multi-thread launch FIXED", 63);
-        return 1;
-    }
-    if (a64m == a8m) {
-        kprintln("gpu: SWEEP verdict = w64==w8 slots -> POSITION-dependent (queue state)", 70);
-        return 0;
-    }
-    kprintln("gpu: SWEEP verdict = w64 != w8 -> WIDTH-dependent (workgroup decode)", 68);
+    kprintln("gpu: parallel dispatch did not complete", 39);
     return 0;
 }

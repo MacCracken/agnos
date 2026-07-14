@@ -290,6 +290,3 @@ var GPU_SHADER_OUT2_SUBOFF = 0x16000;    # 64-dword (256 B) per-thread output ar
 var GPU_MT_NUM_THREAD_X    = 64;         # workgroup size X (Y=Z=1); DIM stays 1x1x1 => 64 total threads
 var GPU_MT_N               = 64;         # verification element count (out[0..63])
 var GPU_MT_NOTYET          = 0xDEADBEEF;  # pre-seed marker: != any tid 0..63 (incl 0), != done
-# C2g-1 wave-width SWEEP: one fixed-addr-store dispatch per width to pinpoint where launch breaks.
-# 7 one-dword slots (a width is "alive" if its slot changed from NOTYET => >=1 lane executed).
-var GPU_SWEEP_OUT_SUBOFF   = 0x17000;    # 7 dwords, one per width {2,8,16,32,48,63,64}; fresh region
