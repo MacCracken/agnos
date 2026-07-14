@@ -59,6 +59,38 @@ path, and can proceed once P0 has the DCN base + register-access model proven. P
 The P0 register table (OTG_CONTROL + HUBP surface registers, bases + per-instance strides) is derived
 adversarially (multi-lens) and iron-validated read-only before any write bite.
 
+### The link, positively identified (iron 1.55.10)
+
+**2560x1440 CVT reduced-blanking @ 241.50 MHz, 59.9506 Hz.** Registers read `raw 2719x1480` → totals
+**2720x1481** (hblank **160** = RB's fixed value, vblank **41**). Independently re-derived clean-room from the
+CVT-RB algorithm, and a 147-mode brute-force scan found it the **unique** match on the (h_total, v_total) pair.
+
+- ⚠ **Neither total identifies a mode alone.** 2720 also fits 2560x1080 and 2560x1600 at every rate (RB's fixed
+  160 hblank pins only the active *width*); 1481 also fits 1920x1440@60 and 3440x1440@60. **Always key on the
+  pair.**
+- **59.9506 Hz is the standard's own value**, not PLL error or drift — it is what the floor() to the 0.25 MHz
+  clock step leaves behind. Nothing should "correct" it toward 60.000.
+- **SSC is on DPREFCLK but NOT on the TMDS pixel clock**: DPREFCLK measured 598.875 MHz (0.1875% downspread),
+  yet the pixel clock measured 241.502 — *above* nominal 241.500. A downspread pixel clock would read ~241.05.
+- **241.5 MHz at DIG_MODE=2 is not a contradiction.** 241.5 MHz exceeds single-link *DVI's* 165 MHz ceiling,
+  but this is DVI **signalling** on an HDMI physical link (7.245 Gbps = 71% of HDMI 1.4's 10.2 Gbps ceiling) —
+  consistent with `DP_DTO0_ENABLE`=0 and the absence of display audio. Do not gate anything at 165 MHz.
+
+### ⚠ `fb_width()` / `fb_height()` ARE NOT THE SCANOUT GEOMETRY (iron 1.55.10)
+
+The firmware left an **800x600 GOP surface on a 2560x1440 link** — **the DCN pipe scaler is live**. gnoboot
+reads fb_width from `Mode->Info->HorizontalResolution` *after* `SetMode`, so boot_info is **not stale**; the
+firmware genuinely chose 800x600. **Anything in this arc that derives timing, pixel clock or vblank period from
+fb_width/fb_height is reading the wrong plane of the pipe** — that was 1.55.10's guard bug, which passed only
+because 2720 > 800. Use `OTG_H/V_BLANK_START_END` (active = START − END; programmed with **no −1**, so
+convention-free).
+
+**Still unproven:** the *mechanism*. Upscaling (DSCL stretching 800x600 into the 2560x1440 raster) fits, but so
+does **centring with DSCL in bypass** (an 800x600 island with black borders) — the console photo favours
+upscaling, but no scaler register has been read. To settle it: `DSCL0_SCL_MODE` 0x0CEC (DSCL_MODE[2:0], 6 =
+bypass) · `SCL_HORZ_FILTER_SCALE_RATIO` 0x0CF1 (ratio = raw / 2^24) · `RECOUT_SIZE` 0x0D03 (DPP stride 0x16B).
+**This does not block P3b** — DSCL sits upstream of OTG/DIG/PHY, so the link clock is untouched by any scaling.
+
 ### P3b-i pixel-clock derivation — settled facts (do NOT re-litigate)
 
 Read out of `dcn_2_1_0_offset.h` / `_sh_mask.h` / `dcn10_optc.c` / `dce_audio.c` directly, not from memory.
@@ -77,10 +109,35 @@ confirmations that this header describes this part before trusting any new offse
   dcn10 code's DIV_MODE branch is for later parts; bit0 is the whole story here.
 - **`get_azalia_clock_info_hdmi`: `audio_dto_module = actual_pixel_clock_100Hz`, `phase = 24*10000`.** So
   P3b-i's output feeds `DTO0_MODULE` directly, and **Fs never enters** (already a settled P3a fact).
-- **Snap the REFRESH, not the finished pixel clock.** The refresh measurement uses only the frame counter and
-  the PIT, so it cannot be corrupted by a misread total; snapping it yields an *exact* rate, where snapping
-  the pixel clock would let a totals error mis-snap 60 → 59.94 (they are only ~1000 ppm apart) instead of
-  failing loudly.
+- **🔴 DO NOT SNAP AT ALL — the measured value IS the answer.** (1.55.10 snapped the refresh; **iron falsified
+  it**; corrected in 1.55.11 after a 16-agent adversarial verification. The reasoning is preserved here
+  because the instinct to snap is strong and keeps coming back.)
+  - **Refresh is not a round number on PC modes.** VESA CVT quantises the **pixel clock** to a 0.25 MHz step
+    (241.6992 → 241.50 by *floor*); the refresh (59.9506 Hz) is the **leftover**. Round-refresh is a **CEA/TV**
+    property. 1.55.10's table snapped to **59.94 — a television rate on a PC monitor** — turning a **7.5 ppm**
+    measurement into a **176 ppm** answer.
+  - **Snapping the pixel clock to the 0.25 MHz grid is WORSE, not better.** On this link the **wrong** totals
+    decode (raw 2719x1480) lands **+0.08 ppm** from a grid step while the **correct** decode lands **+7.5 ppm**
+    — the bug fits the grid **75x better than the truth**. A grid cannot tell *correct* from *plausible*; it
+    would launder a register-decode bug into a confident exact number. Also: CVT-**RBv2** uses a **0.001 MHz**
+    step (modern VRR panels are off-grid), legacy DMT 25.175/28.322 are off-grid, and a `/1.001` grid is
+    **−27.7 ppm** from this clock ⇒ ambiguous.
+  - **There is no PLL to read.** amdgpu has no PHY-PLL read-back on the HDMI path (`get_pixel_clk_frequency_100hz`
+    reads the DP DTO — the register that reads 0 here); dividers come from ATOM BIOS tables, and divider math
+    returns the un-spread **centre** while frame-counting returns the **average** — and the average is what the
+    audio DTO wants. **The measurement is more correct than the register.**
+- **Accuracy is not the constraint.** The DTO module and the ACR CTS derive from the **same** believed clock, so
+  any error is self-consistent — the sink recovers the source's actual rate, no drift, no under/overrun, only an
+  absolute pitch offset. Even 176 ppm = **0.3 cents** (JND ~5 cents) and passes IEC 60958-3 Level II (±1000 ppm)
+  5.7x over. Delete the snap because it can be **catastrophically wrong on an unlisted mode**, not because it
+  was audible.
+- **Gate the axis where a gate can fire.** The 500 ppm snap tolerance was **dead code** across [59.94, 60]
+  (candidates ~1000 ppm apart, gate at the half-spacing ⇒ something always matched). Use **cross-window
+  agreement** (>200 ppm spread ⇒ refuse; iron ~17 ppm) + a wide 5–600 MHz band. **Do NOT gate at DVI's 165 MHz**
+  — this link legitimately runs 241.5 MHz at DIG_MODE=2.
+- **Compute from the raw tick count**, never a rounded mHz refresh (±0.5 mHz print quantum ≈ 8 ppm at 60 Hz).
+- **When we reach ACR: use HW auto-CTS** (`HDMI_ACR_AUTO_SEND` / `ACR_CONT`) — the hardware measures CTS off the
+  real TMDS and real audio clock, so the derived pixel clock never enters the ACR path at all.
 - **The timebase already existed.** `pit_ch0_read()` (apic.cyr) is a non-destructive latch read of ch0, which
   `pic_init()` leaves free-running as a **mode-2** rate generator (divisor 11932); `pic_mask_pit()` masks
   IRQ0 at the 8259 but never touches the counter. Mode 2 decrements by **one** per tick and reloads after

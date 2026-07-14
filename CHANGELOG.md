@@ -5,6 +5,82 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.11] — 2026-07-14 — P3b-i corrected: the measured pixel clock IS the answer
+
+**Iron falsified 1.55.10's snap.** The archaemenid burn read `raw 2719x1480` → totals **2720x1481**, which is
+exactly **CVT reduced-blanking 2560x1440** (hblank **160** = RB's fixed value, vblank **41**, standard clock
+**241.50 MHz**). 1.55.10 measured that link's refresh at **59.951 Hz** — **7.5 ppm** from the CVT-RB truth of
+59.9506 — and then snapped it to **59.940**, producing 241457 kHz instead of 241500. **The snap turned a
+7.5 ppm measurement into a 176 ppm answer.**
+
+### Fixed
+
+- **The refresh snap is deleted.** `gpu_pixclk_discover` now computes
+  `pixel clock = h_total x v_total x refresh_measured` **straight from the PIT tick count** — no candidate
+  table, no grid, no snap, and no rounded intermediate between the measurement and the DTO. Removed
+  `gpu_pixclk_cand_num` / `gpu_pixclk_cand_den` / `GPU_PIXCLK_CANDS` / `GPU_PIXCLK_SNAP_PPM`.
+- **The active-size guard read the wrong plane of the pipe.** 1.55.10 gated on `htotal <= fb_width()`, but
+  `fb_width`/`fb_height` describe the **GOP's surface**, not the scanout raster — on archaemenid the firmware
+  left an **800x600 surface on a 2560x1440 link** (the DCN pipe scaler is live), so the guard was comparing a
+  link total against a surface width and **passed only by luck** (2720 > 800). It now reads the link's true
+  active size from `OTG_H_BLANK_START_END` / `OTG_V_BLANK_START_END`, which are **convention-free** (programmed
+  with no `-1`) and give `active = START - END`.
+- **The snap-tolerance gate was dead code.** Across [59.94, 60] the candidates sit ~1000 ppm apart with the
+  gate at the 500 ppm half-spacing, so something **always** matched and the gate could never fire. Replaced
+  with a gate on an axis that can: **cross-window agreement** (refuse if the 5 measurement windows disagree by
+  more than 200 ppm — iron spread was ~17 ppm, so ~12x headroom), plus a deliberately wide **5-600 MHz**
+  plausibility band.
+
+### Added
+
+- **`OTG_H_BLANK_START_END` 0x1B2B / `OTG_V_BLANK_START_END` 0x1B36** (`BASE_IDX 2`, stride 0x80;
+  START `[14:0]`, END `[30:16]`).
+- **A 0.25 MHz-step canary in the log** — the derived clock's distance from the nearest VESA clock step,
+  **diagnostic only, never applied**. A gross mis-derivation lands thousands of ppm out and says so; a healthy
+  read lands within tens of ppm and corroborates the totals decode, the PIT and the absence of pixel-clock
+  spread-spectrum in one line.
+
+### Why NOT snap to the 0.25 MHz clock step instead (the fix that was rejected)
+
+VESA CVT quantises the **pixel clock** to a 0.25 MHz step, so snapping the *clock* rather than the *refresh*
+looks like the obvious repair. It is **worse**, and this link proves it: the **WRONG** totals decode
+(raw 2719x1480) lands **+0.08 ppm** from a grid step, while the **CORRECT** decode lands **+7.5 ppm** — the
+bug fits the grid **75x better than the truth**. A grid cannot distinguish *correct* from *plausible*; it
+would launder a register-decode bug into a confident exact number with no signal that anything was wrong.
+Further: CVT-**RBv2** uses a **0.001 MHz** step (modern VRR/high-refresh panels are off-grid entirely), legacy
+DMT clocks (25.175, 28.322 MHz) are off-grid, and a second `/1.001` grid for CEA fractional rates sits
+**-27.7 ppm** from *this* machine's clock — ambiguous inside any useful window.
+
+Reading the PLL was rejected too: amdgpu has **no PHY-PLL read-back on the HDMI path** (its
+`get_pixel_clk_frequency_100hz` reads the DP DTO — the very register that reads 0 here), the dividers come from
+ATOM BIOS command tables, and a divider computation would return the un-spread **centre** while frame-counting
+returns the **average** — which is the number the audio DTO actually wants. **The measurement is more correct
+than the register would have been.**
+
+### Honest note on severity
+
+1.55.10's 176 ppm error would **not** have been audible. The DTO module and the ACR CTS are derived from the
+same believed pixel clock, so the error is **self-consistent**: the sink recovers the source's actual audio
+rate with no drift and no under/overrun, leaving only an absolute pitch offset of **0.3 cents** (the JND is
+~5 cents), and it passes IEC 60958-3 Level II's ±1000 ppm with 5.7x margin. The snap is deleted because it can
+be **catastrophically wrong on a mode that is not in the table**, not because its error was audible.
+
+### Iron facts recorded (archaemenid, 1.55.10)
+
+- **The link is 2560x1440 CVT-RB @ 241.50 MHz, 59.9506 Hz.** Re-derived clean-room from the CVT-RB algorithm;
+  a 147-mode brute-force scan found it the **unique** match on the (h_total, v_total) **pair**. Neither total
+  identifies a mode alone — 2720 also fits 2560x1080/1600, and 1481 also fits 1920x1440 / 3440x1440.
+- **The `total-1` decode is confirmed three independent ways** — the CVT-RB derivation, the PIT measurement
+  (the correct decode is 7.5 ppm from measured; a raw decode would be 1036 ppm out), and amdgpu's
+  `optc1_program_timing`. **Do not revisit it.**
+- **59.9506 Hz is the standard's own value, not PLL error or measurement drift** — it is what the floor() to
+  the 0.25 MHz clock step (241.6992 → 241.50) leaves behind. Nothing should "correct" it toward 60.000.
+- **Spread-spectrum is on DPREFCLK but NOT on the TMDS pixel clock**: DPREFCLK measured 598.875 MHz (a 0.1875%
+  downspread), yet the pixel clock came in at 241.502 — *above* nominal. A downspread pixel clock would have
+  measured ~241.05.
+- The PIT path **latches** the 16-bit counter (838 ns/tick) rather than counting 100 Hz IRQs, so the reported
+  precision is real rather than spurious.
+
 ## [1.55.10] — 2026-07-14 — P3b-i: pixel-clock discovery
 
 The HDMI audio DTO's `MODULE` field **is** the pixel clock in 100 Hz units (`dce_audio.c`

@@ -159,9 +159,13 @@ var GPU_AZ_IX_CONV_STREAM_ID   = 0x03;  # F0 ordinal: STREAM_ID[7:4] — should 
 # but the DCCG's DP_DTO_PHASE register only *holds* the pixel clock while the DP DTO drives the pipe. This
 # link is HDMI (DP_DTO0_ENABLE=0), so that register reads 0 and the clock has to be derived instead:
 #     pixel clock = h_total x v_total x refresh
-# h_total/v_total are read exactly from the OTG; refresh is measured against PIT ch0 and snapped to the
-# standard rate. Snapping the REFRESH (not the pixel clock) is deliberate: the measurement comes from the
-# frame counter + PIT alone, so it cannot be corrupted by a misread total, and the snapped rate is then exact.
+# h_total/v_total are read exactly from the OTG; refresh is measured against PIT ch0. The measured value IS
+# the answer — NOTHING is snapped to a "standard" value. 1.55.10 snapped the refresh to a table of standard
+# rates and iron falsified it: this link is CVT-RB, whose refresh (59.9506 Hz) is a LEFTOVER of VESA
+# quantising the PIXEL CLOCK to a 0.25 MHz step — not a round number at all — so the table's nearest entry
+# (59.94, a television rate) turned a 7.5 ppm measurement into a 176 ppm answer. Snapping the pixel clock to
+# that step instead is worse still: the WRONG totals decode fits the step grid 75x better than the right one.
+# Full reasoning in gpu.cyr's gpu_pixclk_discover header.
 #
 # BOTH totals hold **total - 1** (dcn10_optc.c optc1_program_timing: "CRTC_H_TOTAL = vesa.h_total - 1" and
 # `v_total = patched_crtc_timing.v_total - 1` on the line before the OTG_V_TOTAL write). The asymmetry is
@@ -173,6 +177,15 @@ var GPU_R_OTG_V_TOTAL          = 0x1B2F; # OTGn OTG_V_TOTAL: OTG_V_TOTAL[14:0] =
 var GPU_R_OTG_H_TIMING_CNTL    = 0x1B2E; # OTGn OTG_H_TIMING_CNTL: OTG_H_TIMING_DIV_BY2 bit0
 var GPU_R_OTG_INTERLACE_CONTROL = 0x1B44; # OTGn OTG_INTERLACE_CONTROL: OTG_INTERLACE_ENABLE bit0
 var GPU_OTG_TOTAL_MASK         = 0x7FFF; # both totals are [14:0]
+# The LINK's active size — the ONLY correct operand for a timing sanity check. fb_width()/fb_height()
+# describe the GOP's SURFACE, and the DCN pipe scaler can stretch that into an unrelated raster: archaemenid
+# boots an 800x600 surface onto a 2560x1440 link. START is [14:0], END is [30:16], and
+# active = START - END because dcn10_optc.c computes asic_blank_end = asic_blank_start - h_addressable.
+# Unlike the totals these are programmed with NO -1, so they are convention-free.
+var GPU_R_OTG_H_BLANK_START_END = 0x1B2B;
+var GPU_R_OTG_V_BLANK_START_END = 0x1B36;
+var GPU_OTG_BLANK_MASK         = 0x7FFF;
+var GPU_OTG_BLANK_END_SHIFT    = 16;
 # Two timing modes break the pixel clock = h_total x v_total x refresh relation. READ AND REFUSE — do not
 # assume either is clear. DIV_BY2 means two pixels per container (YCbCr420 / an ODM 2:1 pipe split), so the
 # OTG counts at half the pixel rate. dcn21 has NO OTG_H_TIMING_DIV_MODE field at all (only DIV_BY2), so bit0
@@ -195,8 +208,20 @@ var GPU_PIT_CH0_DIV            = 11932;   # ch0 reload — one full period, and 
 var GPU_PIXCLK_FRAMES          = 20;
 var GPU_PIXCLK_TRIALS          = 5;
 var GPU_PIXCLK_GUARD           = 1000000; # ~4 s of polling: a "pipe stopped scanning" backstop, not a delay
-var GPU_PIXCLK_SNAP_PPM        = 500;     # refuse rather than mis-snap: half the 59.94-vs-60 separation
-var GPU_PIXCLK_CANDS           = 17;
+# The windows must AGREE. This is the gate that replaced 1.55.10's snap tolerance, which could never fire
+# across [59.94, 60]: the candidates were ~1000 ppm apart and the gate sat at the 500 ppm half-spacing, so
+# something always "matched" — dead code guarding the wrong axis. Window disagreement is an axis where a gate
+# CAN fire (a missed PIT wrap is ~3%; a rate moving under us shows up immediately). Iron spread was ~17 ppm,
+# so 200 ppm is ~12x headroom over the real thing while still catching a genuine fault.
+var GPU_PIXCLK_SPREAD_PPM      = 200;
+# A deliberately WIDE plausibility band. It does NOT gate at single-link DVI's 165 MHz ceiling: archaemenid's
+# link legitimately runs 241.5 MHz while reporting DIG_MODE=2 (DVI signalling on an HDMI wire).
+var GPU_PIXCLK_MIN_HZ          = 5000000;
+var GPU_PIXCLK_MAX_HZ          = 600000000;
+# VESA's CVT pixel-clock quantum. DIAGNOSTIC ONLY — the derived clock is NEVER snapped to it. See the canary
+# note in gpu.cyr: on archaemenid's link the WRONG totals decode fits this grid 75x BETTER than the right
+# one, so a grid cannot tell correct from plausible and snapping to it would launder a bug.
+var GPU_PIXCLK_GRID_HZ         = 250000;
 
 # --- Field masks ---
 var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id (reads 0x0 on Cezanne — quirk)

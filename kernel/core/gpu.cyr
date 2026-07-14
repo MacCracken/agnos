@@ -2588,40 +2588,30 @@ fn gpu_audio_probe() {
 # The HDMI audio DTO needs the pixel clock in 100 Hz units, and the DCCG register that would hold it is only
 # populated on a DP-driven pipe (this link is HDMI, so it reads 0). Derive it instead:
 #     pixel clock = h_total x v_total x refresh
-# h_total/v_total come straight from the OTG; refresh is MEASURED and then snapped to the standard rate.
-# Snapping the refresh rather than the finished pixel clock is the load-bearing choice: the measurement is
-# made from the frame counter and PIT alone, so it is immune to a misread total, and a snapped rate is exact
-# where a measured one would carry the measurement's error into the DTO forever.
-
-# The standard refresh rates, as exact rationals. The /1001 entries are the NTSC-fractional pairs (59.94 =
-# 60000/1001), which sit ~1000 ppm from their integer twins — the closest pair in the table and the reason the
-# snap tolerance is 500 ppm. Kept as num/den rather than a rounded constant so the pixel clock stays exact.
-fn gpu_pixclk_cand_num(i) {
-    if (i == 0)  { return 60; }
-    if (i == 1)  { return 60000; }
-    if (i == 2)  { return 50; }
-    if (i == 3)  { return 75; }
-    if (i == 4)  { return 120; }
-    if (i == 5)  { return 120000; }
-    if (i == 6)  { return 144; }
-    if (i == 7)  { return 100; }
-    if (i == 8)  { return 30; }
-    if (i == 9)  { return 30000; }
-    if (i == 10) { return 24; }
-    if (i == 11) { return 24000; }
-    if (i == 12) { return 240; }
-    if (i == 13) { return 165; }
-    if (i == 14) { return 85; }
-    if (i == 15) { return 70; }
-    return 72;
-}
-fn gpu_pixclk_cand_den(i) {
-    if (i == 1)  { return 1001; }
-    if (i == 5)  { return 1001; }
-    if (i == 9)  { return 1001; }
-    if (i == 11) { return 1001; }
-    return 1;
-}
+# with the totals read exactly from the OTG and the refresh measured against PIT ch0. The measured value IS
+# the answer — nothing is snapped to a "standard" value. That corrects 1.55.10, and the reasoning matters
+# because the instinct to snap is strong and wrong:
+#
+#   * 1.55.10 snapped the REFRESH to a table of standard rates. Iron falsified it. This link is CVT-RB
+#     2560x1440, whose refresh is 59.9506 Hz — a LEFTOVER, not a round number: VESA CVT quantises the PIXEL
+#     CLOCK to a 0.25 MHz step (241.6992 -> 241.50), and the odd refresh is what falls out. The table's
+#     nearest entry was 59.94, a TELEVISION rate, which turned a 7.5 ppm measurement into a 176 ppm answer.
+#     The snap did not protect the value; it corrupted it.
+#   * Snapping the PIXEL CLOCK to the 0.25 MHz step instead is WORSE, not better. On this very link the
+#     WRONG totals decode (raw 2719x1480, no -1) lands 0.08 ppm from a step, while the CORRECT decode lands
+#     7.5 ppm from one — the wrong answer fits the grid 75x better. A grid cannot tell correct from
+#     plausible, so it would launder a register-decode bug into a confident exact number.
+#   * There is no PLL to read either: amdgpu has no PHY-PLL read-back on the HDMI path (its
+#     get_pixel_clk_frequency_100hz reads the DP DTO, which is exactly the register that reads 0 here), and
+#     a divider computation would return the un-spread CENTRE while the frame-count measurement returns the
+#     AVERAGE — and the average is what the audio DTO actually wants.
+#
+# Accuracy is not the constraint people assume. The DTO module and the ACR CTS are derived from the SAME
+# believed pixel clock, so any error is self-consistent: the sink recovers the source's actual rate with no
+# drift and no under/overrun, leaving only an absolute pitch offset. Even 1.55.10's 176 ppm was 0.3 cents
+# (inaudible; ~5 cents is the JND) and passes IEC 60958-3 Level II's +/-1000 ppm with margin. The snap was
+# deleted because it can be CATASTROPHICALLY wrong on a mode that is not in the table, not because its error
+# was audible.
 
 # gpu_pixclk_ticks — the measurement primitive: PIT ch0 ticks spanned by exactly `frames` vsync boundaries.
 # Both endpoints are detected the same way through the same poll loop, so their detection latency largely
@@ -2679,24 +2669,44 @@ fn gpu_pixclk_discover() {
         return 0;
     }
 
-    # Both totals hold total-1 (see gpu_regs.cyr). The raw values are logged as well as the corrected ones:
-    # a standard mode has a standard geometry (1920x1080p60 is exactly 2200x1125), so the burn itself shows
-    # whether the -1 correction landed on the standard total or one past it.
+    # Both totals hold total-1 (see gpu_regs.cyr). Confirmed on iron three independent ways at 1.55.10 —
+    # raw 2719x1480 -> 2720x1481, which is exactly CVT-RB 2560x1440 (hblank 160, vblank 41); the measured
+    # refresh matches that decode to 7.5 ppm while a raw decode would be 1036 ppm out; and it is what
+    # amdgpu's optc1_program_timing writes. Do NOT revisit it.
     var hraw = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_TOTAL + pipe * GPU_DCN_OTG_STRIDE) & GPU_OTG_TOTAL_MASK;
     var vraw = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL + pipe * GPU_DCN_OTG_STRIDE) & GPU_OTG_TOTAL_MASK;
     var htotal = hraw + 1;
     var vtotal = vraw + 1;
-    var w = fb_width();
-    var h = fb_height();
-    kprint("gpu: display timing ", 20); kprint_num(w); kprint("x", 1); kprint_num(h);
+
+    # The LINK's active size — NOT fb_width()/fb_height(). Those describe the GOP's surface, which the DCN
+    # pipe scaler may be stretching into a completely different raster: on archaemenid the firmware left an
+    # 800x600 surface on a 2560x1440 link, so 1.55.10's `htotal <= fb_width()` guard was comparing a link
+    # total against a surface width — the wrong plane of the pipe, and it passed only by luck. The blank
+    # registers are the right operand and are convention-free: dcn10_optc.c programs them with NO -1, and
+    # asic_blank_end = asic_blank_start - h_addressable, so the difference IS the active size.
+    var hbl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_BLANK_START_END + pipe * GPU_DCN_OTG_STRIDE);
+    var vbl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_BLANK_START_END + pipe * GPU_DCN_OTG_STRIDE);
+    var hact = (hbl & GPU_OTG_BLANK_MASK) - ((hbl >> GPU_OTG_BLANK_END_SHIFT) & GPU_OTG_BLANK_MASK);
+    var vact = (vbl & GPU_OTG_BLANK_MASK) - ((vbl >> GPU_OTG_BLANK_END_SHIFT) & GPU_OTG_BLANK_MASK);
+    kprint("gpu: display link ", 18); kprint_num(hact); kprint("x", 1); kprint_num(vact);
     kprint(" total ", 7); kprint_num(htotal); kprint("x", 1); kprint_num(vtotal);
-    kprint(" raw ", 5); kprint_num(hraw); kprint("x", 1); kprint_num(vraw); kprintln("", 0);
-    # A total that does not exceed the active size is not a total — the offsets or the mode are wrong.
-    if (htotal <= w) {
+    kprint(" blanking ", 10); kprint_num(htotal - hact); kprint("x", 1); kprint_num(vtotal - vact);
+    kprintln("", 0);
+    # Geometry must close: a total that does not exceed a positive active size is not a total, and the
+    # offsets or the mode are then wrong. This is the check fb_width() could never actually perform.
+    if (hact <= 0) {
+        kprintln("gpu: display active width not readable, clock not derived", 57);
+        return 0;
+    }
+    if (vact <= 0) {
+        kprintln("gpu: display active height not readable, clock not derived", 58);
+        return 0;
+    }
+    if (htotal <= hact) {
         kprintln("gpu: display horizontal total below active, clock not derived", 61);
         return 0;
     }
-    if (vtotal <= h) {
+    if (vtotal <= vact) {
         kprintln("gpu: display vertical total below active, clock not derived", 59);
         return 0;
     }
@@ -2718,41 +2728,50 @@ fn gpu_pixclk_discover() {
         kprintln("gpu: display refresh not measurable", 35);
         return 0;
     }
-    # milliHz keeps the fractional rates readable (59.94 Hz = 59940) without leaving integer arithmetic.
-    var refresh = GPU_PIXCLK_FRAMES * GPU_PIT_HZ * 1000 / best;
-    var spread  = GPU_PIXCLK_FRAMES * GPU_PIT_HZ * 1000 / worst;
 
-    # Snap to the nearest standard rate.
-    var bi   = 0 - 1;
-    var bppm = 0;
-    var i = 0;
-    while (i < GPU_PIXCLK_CANDS) {
-        var cm = gpu_pixclk_cand_num(i) * 1000 / gpu_pixclk_cand_den(i);
-        var d = refresh - cm;
-        if (d < 0) { d = 0 - d; }
-        var ppm = d * 1000000 / cm;
-        if (bi < 0) { bi = i; bppm = ppm; }
-        elif (ppm < bppm) { bi = i; bppm = ppm; }
-        i = i + 1;
-    }
-    var num = gpu_pixclk_cand_num(bi);
-    var den = gpu_pixclk_cand_den(bi);
-    var snapped = num * 1000 / den;
+    # The windows must AGREE. This replaces 1.55.10's snap-tolerance gate, which was unreachable across
+    # [59.94, 60] by construction (candidates ~1000 ppm apart, gate at the 500 ppm half-spacing, so something
+    # always "matched"). Disagreement between windows is an axis where a gate can actually fire: it catches a
+    # missed PIT wrap (~3%) or a pipe whose rate is moving under us. Iron spread at 1.55.10 was ~17 ppm.
+    var spread_ppm = (worst - best) * 1000000 / best;
+    # milliHz keeps a fractional rate readable (59.94 Hz = 59940) without leaving integer arithmetic. This is
+    # for the log ONLY — the pixel clock below is computed from the raw tick count, never from this rounded
+    # value, whose +/-0.5 mHz print quantum is itself ~8 ppm at 60 Hz.
+    var refresh = GPU_PIXCLK_FRAMES * GPU_PIT_HZ * 1000 / best;
     kprint("gpu: display refresh ", 21); kprint_num(refresh);
-    kprint(" mHz measured, slowest ", 23); kprint_num(spread);
-    kprint(", nearest standard ", 19); kprint_num(snapped);
-    kprint(" off by ", 8); kprint_num(bppm); kprintln(" ppm", 4);
-    if (bppm > GPU_PIXCLK_SNAP_PPM) {
-        # Refuse rather than ship a wrong clock: a silently-wrong DTO module is inaudible to test but wrong
-        # forever, and every plausible fault here (a misread total, a missed PIT wrap, a non-standard mode)
-        # lands far outside this tolerance while a correct read lands within a few tens of ppm.
-        kprintln("gpu: display refresh matches no standard rate, clock not derived", 64);
+    kprint(" mHz, windows agree within ", 27); kprint_num(spread_ppm); kprintln(" ppm", 4);
+    if (spread_ppm > GPU_PIXCLK_SPREAD_PPM) {
+        kprintln("gpu: display refresh unstable across windows, clock not derived", 63);
         return 0;
     }
 
-    # ONE value, computed once from the snapped rate, used by every consumer downstream.
-    gpu_pixclk_100hz = htotal * vtotal * num / (den * 100);
-    kprint("gpu: display pixel clock ", 25); kprint_num(gpu_pixclk_100hz / 10); kprintln(" kHz", 4);
+    # THE value: measured, not snapped, and computed straight from the tick count so no rounded intermediate
+    # gets between the measurement and the DTO.
+    var pixclk = htotal * vtotal * GPU_PIXCLK_FRAMES * GPU_PIT_HZ / best;
+    # A plausibility band, deliberately WIDE. Note it does not gate at single-link DVI's 165 MHz ceiling:
+    # this link legitimately runs 241.5 MHz while reporting DIG_MODE=2 (DVI signalling on an HDMI wire).
+    if (pixclk < GPU_PIXCLK_MIN_HZ) {
+        kprintln("gpu: display pixel clock implausibly low, not derived", 53);
+        return 0;
+    }
+    if (pixclk > GPU_PIXCLK_MAX_HZ) {
+        kprintln("gpu: display pixel clock implausibly high, not derived", 54);
+        return 0;
+    }
+    gpu_pixclk_100hz = pixclk / 100;
+
+    # Canary: how far the derived clock sits from the nearest VESA 0.25 MHz clock step. DIAGNOSTIC ONLY —
+    # NEVER apply it. A grid fit does not mean the value is right: on this very link the WRONG totals decode
+    # lands 0.08 ppm from a step while the CORRECT one lands 7.5 ppm from one, so snapping would actively
+    # prefer the bug. It is logged because a gross mis-derivation lands thousands of ppm from any step and
+    # says so, while a healthy read lands within tens of ppm and corroborates the totals, the PIT and the
+    # absence of spread-spectrum on the pixel clock in a single line.
+    var grid = (pixclk + GPU_PIXCLK_GRID_HZ / 2) / GPU_PIXCLK_GRID_HZ * GPU_PIXCLK_GRID_HZ;
+    var gd = pixclk - grid;
+    if (gd < 0) { gd = 0 - gd; }
+    kprint("gpu: display pixel clock ", 25); kprint_num(pixclk / 1000);
+    kprint(" kHz, ", 6); kprint_num(gd * 1000000 / grid);
+    kprint(" ppm from the ", 14); kprint_num(grid / 1000); kprintln(" kHz step", 9);
     return 1;
 }
 
