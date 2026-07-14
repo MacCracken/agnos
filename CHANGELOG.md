@@ -5,6 +5,82 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.12] — 2026-07-14 — P3b-ii + P3b-iii: display audio, end to end
+
+**The write bite.** The 1.53.5 HDA work streams samples into the GPU's audio function and has been silent
+ever since because the **display** side of the path was never programmed. This programs it: the live link
+goes from DVI to HDMI signalling, the audio DTO is fed the pixel clock 1.55.11 derived, the Azalia endpoint
+is enabled, the AFMT tap is opened, and the GPU's HDMI controller becomes the live audio sink.
+
+**Gated on `HDA_HDMI`** — the same flag the HDA half already uses, for the same reason: this writes the
+encoder carrying the operator's only console, and **no register on this path reports sink health** (an HDMI
+source is transmit-only; the OTG keeps scanning whatever the sink does). The operator's eyes are the only
+oracle, so the default/MVP kernel never touches `DIG_MODE` and cannot black-screen loop. Recovery from a
+blanking failure is flashing a kernel built without the flag.
+
+### Added
+
+- **`gpu_hdmi_audio_enable()`** (`kernel/core/gpu.cyr`) — the whole chain in one path: stage the HDMI block →
+  flip `DIG_MODE` → DCCG audio DTO → Azalia configure+enable → AFMT clock/ACR/source/channels/InfoFrame →
+  open the sample tap.
+- **`gpu_hdmi_preflight()`** — the three black-screen gates, run **inline** as the enable path's own gate
+  rather than as a separate burn: deep colour / scrambling armed, `AVMUTE` armed, or a non-24bpp-RGB pixel
+  format each refuse the flip. A read that only reports is a burn spent on something the writer can decide
+  itself.
+- **Sink-select** (the parked HDA bite 4) — `hda_active_ctl = 1` once the display side is up, so a ring-3
+  tone lands on the display link instead of the analog jack. This is also what makes `tonegen` play to HDMI
+  with no `--device` flag: HDMI *is* the live sink.
+- **The HDMI/AFMT/ACR register block** (`kernel/core/gpu_regs.cyr`) — offsets, field widths and the values
+  that matter, each annotated with the silent failure it prevents.
+
+### Changed
+
+- **Kernel size ceiling 1.5M → 1.6M**, in `scripts/test.sh` and `scripts/check.sh` (they bump in lockstep).
+  The display-audio bite landed at **1,560,016 B — 16 B over**, the same way 1.45.10 closed on the 1.2M
+  bound. The arc's growth is register tables (OTG timing, HDMI/AFMT/ACR) and their derivations, not bloat.
+
+### Why the flip is mandatory, and why it is smaller than it looks
+
+**Audio cannot be reached in DVI signalling** — proven three independent ways: amdgpu gates the AFMT/HDMI
+path on the signal type, its DVI attribute setter writes no audio register at all, and **DVI's TMDS link has
+no data-island period** to carry samples in. There is no route around this bite.
+
+But it is far smaller than "rewrite the encoder": **every `HDMI_*` register is INERT while `DIG_MODE == 2`**,
+so the entire HDMI configuration can be staged onto the live console link at **zero risk**, leaving one 3-bit
+field as the commit of an already-verified context. amdgpu's `dcn10_link_encoder_setup()` is literally one
+`REG_UPDATE` — no PHY, no PLL, no OTG — so the flip **cannot** move the 241.503 MHz clock or the 2720x1481
+timing. And with every `_SEND` bit clear the encoder emits no data islands, and a sink infers DVI-vs-HDMI
+from **the presence of data islands** rather than any source-side bit, so the flip alone is inert.
+
+The risk is not the mode bit; it is what the firmware left in registers DVI mode ignores — unconstrained
+*because* they are ignored, and live the instant the mode lands. Those are exactly the three gates above.
+
+### Silent-failure traps this sequence had to avoid (each verified against the headers)
+
+- **`DIG_BE_CNTL` is read-modify-write, always.** `DIG_FE_SOURCE_SELECT` is **7 bits** ([14:8]) in the same
+  register; a blind `DIG_MODE` write would zero the front-end↔back-end binding and take the console down for
+  a reason unrelated to HDMI.
+- **`AFMT_CNTL.AFMT_AUDIO_CLOCK_EN` must be FIRST.** Without it the AFMT block has no clock and the entire
+  audio sequence is inert — no sound, no fault, clean status register.
+- **`AFMT_AUDIO_CHANNEL_ENABLE` is 8 bits** ([15:8], one per channel). Zero channels is silence with every
+  other register perfect.
+- **`DTO_SEL` must be 0** — 0 is the DTO0/HDMI path, 1 is DTO1/DP. A firmware that left it at 1 gives silence
+  with everything else correct.
+- **N must be programmed even in ACR auto mode.** `HDMI_ACR_AUTO_SEND`=1 + `HDMI_ACR_SOURCE`=0 means the
+  hardware measures **CTS** off the real TMDS (which is why the derived pixel clock never enters the ACR
+  path), but **N is a per-Fs constant** and hardware cannot measure it. 6144 for 48 kHz.
+- **`AFMT_AVI_INFO0..3` DOES NOT EXIST on DCN 2.1** (zero `AVI` hits in the offset header). AVI is a generic
+  packet. The false premise traces to a **stale DCE-era comment** in AMD's own `dc_resource.c`, which still
+  says "Calculate AFMT_AVI_INFO0 ~ AFMT_AVI_INFO3" while writing generic-packet fields — a textbook case for
+  this project's *re-derive, don't validate comments* rule.
+- **`AFMT_60958_2` is at 0x20A7**, not adjacent to `_0`/`_1` (0x20A0/0x20A1).
+- **`HDMI_AUDIO_DELAY_EN` is a 2-bit field** [5:4], not a flag.
+- **DTO order**: `DTO0_SOURCE_SEL` + `DTO_SEL` **before** module/phase is hardware-enforced (AMD warns in
+  `dce_audio.c`). MODULE-before-PHASE is AMD's observed order but **not** a documented constraint — matched,
+  but never to be debugged against as if it were one.
+- **`AFMT_STATUS.AFMT_AUDIO_ENABLE` is hardware-driven** by the Azalia endpoint, not a readback of our own
+  write — so it is a real answer about whether the endpoint took the stream.
+
 ## [1.55.11] — 2026-07-14 — P3b-i corrected: the measured pixel clock IS the answer
 
 **Iron falsified 1.55.10's snap.** The archaemenid burn read `raw 2719x1480` → totals **2720x1481**, which is

@@ -156,6 +156,99 @@ var GPU_DIG_SYMCLK_FE_ON      = 0x1000000; # DIG_FE_CNTL bit24
 var GPU_DIG_ENABLE            = 0x1;    # DIG_BE_EN_CNTL bit0
 var GPU_DIG_MODE_HDMI         = 0x3;    # DIG_BE_CNTL DIG_MODE == 3 => HDMI (authoritative value)
 var GPU_AFMT_AUDIO_ENABLE     = 0x10;   # AFMT_STATUS bit4
+# --- P3b-ii pre-flight: the HDMI block on the live DIG (BASE_IDX 2, stride 0x100 like the rest of the DIG) ---
+# THE SAFETY MODEL, in one line: **every HDMI_* register below is INERT while DIG_MODE == 2 (DVI)**. That is
+# what makes this bite tractable — the whole HDMI configuration can be staged onto the live console link at
+# zero risk, leaving the DIG_MODE 2->3 write as a single-field commit of an already-verified context
+# (amdgpu's dcn10_link_encoder_setup is literally one REG_UPDATE of this field; it touches no PHY, no PLL and
+# no OTG, so it cannot move our 241.503 MHz clock or the 2720x1481 timing).
+#
+# But "inert" cuts both ways, and it is exactly why this pre-flight exists: because DVI mode IGNORES these
+# registers, nothing constrains what the GOP left in them. Three of their fields become LIVE the instant
+# DIG_MODE lands, and each is an independent BLACK-SCREEN path on the operator's only console:
+#   * HDMI_CONTROL DEEP_COLOR_ENABLE/DEPTH + DATA_SCRAMBLE_EN + CLOCK_CHANNEL_RATE — these multiply/divide the
+#     TMDS character rate. At reset all 0 = correct for 24bpp at 241.503 MHz (the scrambler threshold is
+#     340000 kHz, dcn10_stream_encoder.c; we are well under). Any one set => the char rate diverges from the
+#     PLL the moment HDMI mode engages => the sink desyncs.
+#   * HDMI_GC AVMUTE — mutes the stream.
+#   * DIG_FE_CNTL TMDS_PIXEL_ENCODING / TMDS_COLOR_FORMAT — wrong pixel format.
+# All three are READ-ONLY checkable BEFORE writing anything, which is what this bite does.
+var GPU_R_HDMI_CONTROL         = 0x2071;
+var GPU_R_HDMI_AUDIO_PACKET_CONTROL = 0x2073;
+var GPU_R_HDMI_ACR_PACKET_CONTROL   = 0x2074;
+var GPU_R_HDMI_VBI_PACKET_CONTROL   = 0x2075;
+var GPU_R_HDMI_INFOFRAME_CONTROL0   = 0x2076;
+var GPU_R_HDMI_GENERIC_PACKET_CONTROL0 = 0x2078;
+var GPU_R_HDMI_GC              = 0x207B;
+var GPU_R_AFMT_CNTL            = 0x20E6; # AFMT_AUDIO_CLOCK_EN bit0 (WRITE), AFMT_AUDIO_CLOCK_ON bit8 (STATUS)
+var GPU_R_AFMT_AUDIO_PACKET_CONTROL = 0x20AA;
+# The TMDS character-rate hazard: DATA_SCRAMBLE_EN b1 | CLOCK_CHANNEL_RATE b2 | DEEP_COLOR_ENABLE b24 |
+# DEEP_COLOR_DEPTH [29:28]. ALL must read 0 before the flip is safe.
+var GPU_HDMI_CONTROL_RATE_HAZARD = 0x31000006;
+var GPU_HDMI_GC_AVMUTE         = 0x1;
+# The pixel-format hazard: TMDS_PIXEL_ENCODING is **b28 ALONE** (mask 0x10000000) — NOT [29:28]; bit 29
+# belongs to no field in this register. TMDS_COLOR_FORMAT is [31:30] (0xC0000000). Getting this width wrong
+# would build an abort gate that reads a reserved bit.
+var GPU_DIG_FE_FORMAT_HAZARD   = 0xD0000000;
+var GPU_AFMT_AUDIO_CLOCK_EN    = 0x1;
+var GPU_AFMT_AUDIO_CLOCK_ON    = 0x100;
+# DCCG_AUDIO_DTO_SOURCE DTO_SEL [5:4]: **0 selects the DTO0/HDMI path**, 1 selects DTO1/DP. If the GOP left
+# this at 1, HDMI audio is silent with every other register perfect.
+var GPU_DCCG_AUDIO_DTO_SEL_MASK = 0x30;
+# ⚠ DIG_BE_CNTL IS A READ-MODIFY-WRITE REGISTER, ALWAYS. DIG_FE_SOURCE_SELECT is **7 bits** ([14:8], mask
+# 0x00007F00) — it binds this back-end to its front-end. A blind write of just DIG_MODE would zero that
+# binding and take the console down for a reason that has nothing to do with HDMI.
+var GPU_DIG_MODE_MASK          = 0x70000; # DIG_BE_CNTL DIG_MODE [18:16]
+var GPU_DIG_MODE_SHIFT         = 16;
+var GPU_DIG_MODE_DVI           = 0x2;
+
+# --- P3b-iii: the audio chain itself (DIG stride 0x100; DCCG regs are seg1) ---
+# Order below is AMD's (enc1_se_hdmi_audio_setup / dce_aud_wall_dto_setup / dce_aud_az_*). Everything here
+# fails SILENTLY when mis-ordered or skipped — no fault, no log, just no sound — so each entry names why.
+var GPU_R_AFMT_60958_0         = 0x20A0; # channel status word 0
+var GPU_R_AFMT_60958_1         = 0x20A1; # channel status word 1
+var GPU_R_AFMT_60958_2         = 0x20A7; # NOT adjacent to 0/1 — it sits at 0x20A7, an easy mis-derivation
+var GPU_R_AFMT_AUDIO_PACKET_CONTROL2 = 0x207C;
+var GPU_R_AFMT_AUDIO_SRC_CONTROL     = 0x20AD;
+var GPU_R_AFMT_INFOFRAME_CONTROL0    = 0x20AC;
+var GPU_R_AFMT_AUDIO_INFO0     = 0x209E;
+var GPU_R_AFMT_AUDIO_INFO1     = 0x209F;
+var GPU_R_HDMI_ACR_48_0        = 0x209A; # HDMI_ACR_CTS_48 [31:12]
+var GPU_R_HDMI_ACR_48_1        = 0x209B; # HDMI_ACR_N_48   [19:0]
+# HDMI_CONTROL target: KEEPOUT_MODE b0 | NO_EXTRA_NULL_PACKET_FILLED b3 | PACKET_GEN_VERSION b4 = 0x19,
+# with the rate hazards cleared. RMW against ~0x3100001F: bit5 is undefined and AMD never touches it, so a
+# ~0x3100003F mask would clear a reserved bit for no reason.
+var GPU_HDMI_CONTROL_KEEP      = 0x3100001F;
+var GPU_HDMI_CONTROL_SET       = 0x19;
+# HDMI_VBI_PACKET_CONTROL: NULL_SEND b0 | GC_SEND b4 | GC_CONT b5.
+var GPU_HDMI_VBI_SET           = 0x31;
+# HDMI_AUDIO_DELAY_EN is a **2-bit field [5:4]**, not a flag — AMD writes 1, i.e. 0x10.
+var GPU_HDMI_AUDIO_DELAY_MASK  = 0x30;
+var GPU_HDMI_AUDIO_DELAY_SET   = 0x10;
+# ACR: AUTO_SEND b12 = 1 and SOURCE b8 = 0 (0 = HARDWARE-measured CTS). That is why the derived pixel clock
+# never enters the ACR path — the hardware measures CTS off the real TMDS. **N still must be programmed**: N
+# is a per-Fs constant, not something hardware can measure. 6144 is the 48 kHz value (HDMI spec table).
+var GPU_HDMI_ACR_AUTO_SEND     = 0x1000;
+var GPU_HDMI_ACR_SOURCE        = 0x100;
+var GPU_HDMI_ACR_SELECT_MASK   = 0x30;
+var GPU_HDMI_ACR_N_48_MASK     = 0xFFFFF;
+var GPU_HDMI_ACR_N_48_VAL      = 6144;
+var GPU_HDMI_ACR_CTS_48_SHIFT  = 12;
+# AFMT_AUDIO_CHANNEL_ENABLE is **8 bits [15:8]**, one bit per channel. ZERO CHANNELS = SILENCE with every
+# other register perfect — a prime silent-failure. Stereo = 0x03 in the field.
+var GPU_AFMT_CHANNEL_ENABLE_MASK = 0xFF00;
+var GPU_AFMT_CHANNEL_ENABLE_STEREO = 0x300;
+var GPU_AFMT_AUDIO_SRC_SELECT_MASK = 0x7;  # must be 0..3 on Renoir — only 4 endpoints exist
+var GPU_AFMT_60958_CS_UPDATE   = 0x4000000;
+var GPU_AFMT_AUDIO_SAMPLE_SEND = 0x1;      # the LAST write — opens the tap
+var GPU_AFMT_AUDIO_INFO_UPDATE = 0x80;
+# Azalia endpoint: ix 0x25 carries SPEAKER_ALLOCATION [6:0] and CHANNEL_ALLOCATION [15:8]; ix 0x54's bit31
+# AUDIO_ENABLED is the endpoint's own gate. AMD configures (0x25 + clock-gating) BEFORE enabling (0x54).
+var GPU_AZ_IX_CHANNEL_SPEAKER  = 0x25;
+var GPU_AZ_AUDIO_ENABLED       = 0x80000000;
+var GPU_AZ_SPEAKER_FL_FR       = 0x1;      # front-left/front-right — stereo
+var GPU_AZ_CLOCK_GATING_DISABLE = 0x40;    # HOT_PLUG_CONTROL bit6
+
 # --- Azalia endpoint indirect window (BASE_IDX 2), stride 0x6 per endpoint ---
 var GPU_DCN_AZ_ENDPOINTS      = 4;      # Renoir: ONLY 0..3 exist
 var GPU_R_AZ_ENDPOINT_INDEX   = 0x386;  # AZF0ENDPOINTk_ENDPOINT_INDEX (write ix first)

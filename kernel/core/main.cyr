@@ -947,6 +947,32 @@ gpu_audio_probe();
 # rate. Read-only; gated on P0. Takes ~2 s of boot: five ~0.33 s measurement windows.
 gpu_pixclk_discover();
 
+#ifdef HDA_HDMI
+# GPU arc 1.55.x (Thrust P) P3b-ii + P3b-iii — THE WRITE BITE: close the 1.53.5 backlog. The HDA half above
+# already streams samples into the GPU's audio function; nothing embeds them because the DISPLAY half was
+# never programmed. This programs it: take the live link from DVI to HDMI signalling (mandatory — DVI has no
+# data-island period to carry samples in), feed the audio DTO the pixel clock P3b-i derived, enable the
+# Azalia endpoint, and open the AFMT tap.
+#
+# It runs HERE, not in the HDA block above, because it needs the GPU probes' results (the live encoder, the
+# lit pipe, and the pixel clock) — those are only known by this point in the boot.
+#
+# Gated on HDA_HDMI for the same reason that block is: this writes the encoder carrying the operator's only
+# console, and NO register on this path reports sink health (an HDMI source is transmit-only; the OTG keeps
+# scanning whatever the sink does). So the sole oracle is the operator looking at the screen, and the sole
+# recovery is flashing a kernel built without this flag. The default/MVP kernel therefore never touches
+# DIG_MODE and cannot black-screen loop.
+gpu_hdmi_audio_enable();
+# Sink-select (the parked HDA bite 4): make the GPU's HDMI controller the LIVE refill target so a ring-3
+# tone lands on the display link rather than the analog jack. Only worth doing if the display side actually
+# came up — otherwise instance 0 stays the sink and the analog path keeps working.
+if (gpu_hdmi_audio_on == 1) {
+    hda_active_ctl = 1;
+    kprintln("hda: HDMI is the live audio sink", 32);
+}
+#endif
+
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

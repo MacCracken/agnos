@@ -55,11 +55,14 @@ check "version in changelog" $?
 # on 1.2M and the 1.46.x lseek/flock syscalls crossed it (~1,203,984 B), so the
 # bound moved 1.2M → 1.4M. The 1.54.x GPU arc (F0 landed ~1.40M; C0+ add the
 # CP/MEC/RLC/PSP register tables) moved it 1.4M → 1.5M — still catching a
-# runaway-bloat regression. Matches scripts/test.sh (bumped in lockstep).
+# runaway-bloat regression. The 1.55.x DISPLAY arc's display-audio bite then closed
+# on 1.5M (1,560,016 B — 16 B over, the same way 1.45.10 closed on 1.2M), so the
+# bound moved 1.5M → 1.6M; that arc's growth is the OTG-timing and HDMI/AFMT/ACR
+# register tables, not bloat. Matches scripts/test.sh (bumped in lockstep).
 echo ""
 echo "--- Binary ---"
 SZ=$(wc -c < "$ROOT/build/agnos")
-test "$SZ" -gt 50000 && test "$SZ" -lt 1560000
+test "$SZ" -gt 50000 && test "$SZ" -lt 1600000
 check "binary size ($SZ bytes)" $?
 
 echo ""

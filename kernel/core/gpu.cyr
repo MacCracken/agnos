@@ -63,6 +63,12 @@ var gpu_audio_dig     = 0 - 1; # the live stream encoder (DIG) carrying the lit 
 # ACR CTS is computed from). 0 = not derived (then P3b must not program the DTO). Derived, not read: the
 # DCCG's DP_DTO_PHASE register only holds the pixel clock on a DP-driven pipe, and this link is HDMI.
 var gpu_pixclk_100hz  = 0;
+# P3b-ii pre-flight: 1 = every precondition for the DVI->HDMI DIG_MODE flip is verified clear on the live
+# encoder. 0 = do NOT flip (a hazard is armed, or the link/encoder isn't ours to touch). Read-only result.
+var gpu_hdmi_flip_ok  = 0;
+# P3b-iii: 1 = the display side of the audio path is programmed (link in HDMI signalling, DTO fed the live
+# pixel clock, endpoint enabled, AFMT tap open). This is the half the 1.53.5 HDA work was missing.
+var gpu_hdmi_audio_on = 0;
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -2772,6 +2778,204 @@ fn gpu_pixclk_discover() {
     kprint("gpu: display pixel clock ", 25); kprint_num(pixclk / 1000);
     kprint(" kHz, ", 6); kprint_num(gd * 1000000 / grid);
     kprint(" ppm from the ", 14); kprint_num(grid / 1000); kprintln(" kHz step", 9);
+    return 1;
+}
+
+# === 1.55.x P3b-ii pre-flight — is the DVI->HDMI flip safe on THIS link? (READ-ONLY) ===
+# Audio cannot be reached without DIG_MODE=3: DVI's TMDS link has no data-island period to carry samples in,
+# amdgpu gates the whole AFMT/HDMI path on the signal type, and its DVI attribute setter writes no audio
+# register at all. So the flip is not optional and this bite makes it answerable instead of a leap.
+#
+# The flip itself is one field, and it is inert on its own: with every HDMI_*_SEND bit clear the encoder emits
+# no data islands, and a sink infers DVI-vs-HDMI from the PRESENCE of data islands rather than from any
+# source-side bit — so the picture is expected to survive unchanged. What can black the console is not the
+# mode bit but what the GOP happened to leave in registers DVI mode ignores. Those defaults are unconstrained
+# precisely BECAUSE they are inert, and they go live the instant the mode lands. Every one is readable now.
+#
+# This probe reads them and returns a verdict. It writes nothing.
+fn gpu_hdmi_preflight() {
+    gpu_hdmi_flip_ok = 0;
+    if (gpu_present == 0) { return 0; }
+    if (gpu_display_ok != 1) { return 0; }
+    if (gpu_audio_dp != 0) { return 0; }        # DP link: the HDMI block is not the path
+    if (gpu_audio_dig < 0) { return 0; }        # P3a never found a live encoder
+    # Derive the DIG offset from the probed instance rather than hard-coding the iron's DIG1: the global IS
+    # the single source of truth, and a literal would encode the same fact twice.
+    var d = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+
+    var fe   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL   + d);
+    var ctl  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL  + d);
+    var gc   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC       + d);
+    var acnt = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL     + d);
+    kprint("gpu: hdmi preflight fe=", 23); kprint_hex(fe);
+    kprint(" control=", 9); kprint_hex(ctl);
+    kprint(" gc=", 4); kprint_hex(gc);
+    kprint(" afmtcntl=", 10); kprint_hex(acnt); kprintln("", 0);
+
+    # The packet-generator SEND/CONT bits. The whole "the flip is inert" argument ASSUMES these are all clear;
+    # that assumption is not iron-confirmed, and a GOP that configured HDMI before falling back to DVI could
+    # have left one armed. Read them rather than assume them — this is the gate the safety case rests on.
+    var apc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL   + d);
+    var vpc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL   + d);
+    var ifc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0   + d);
+    var gpc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d);
+    var hap  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
+    var afp  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+    kprint("gpu: hdmi preflight acr=", 24); kprint_hex(apc);
+    kprint(" vbi=", 5); kprint_hex(vpc);
+    kprint(" info=", 6); kprint_hex(ifc);
+    kprint(" generic=", 9); kprint_hex(gpc); kprintln("", 0);
+    kprint("gpu: hdmi preflight audiopkt=", 29); kprint_hex(hap);
+    kprint(" afmtaudio=", 11); kprint_hex(afp);
+    kprint(" dtosel=", 8);
+    kprint_num((gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO_SRC) & GPU_DCCG_AUDIO_DTO_SEL_MASK) >> 4);
+    kprintln("", 0);
+
+    # --- The three black-screen gates. Each is a hard refusal, not a warning. ---
+    var bad = 0;
+    if ((ctl & GPU_HDMI_CONTROL_RATE_HAZARD) != 0) {
+        # Deep colour or scrambling would rescale the TMDS character rate away from the running PLL.
+        kprintln("gpu: hdmi flip unsafe: deep colour or scrambling armed", 54);
+        bad = 1;
+    }
+    if ((gc & GPU_HDMI_GC_AVMUTE) != 0) {
+        kprintln("gpu: hdmi flip unsafe: AVMUTE armed", 35);
+        bad = 1;
+    }
+    if ((fe & GPU_DIG_FE_FORMAT_HAZARD) != 0) {
+        kprintln("gpu: hdmi flip unsafe: pixel format is not 24bpp RGB", 52);
+        bad = 1;
+    }
+    if (bad != 0) { return 0; }
+    gpu_hdmi_flip_ok = 1;
+    kprintln("gpu: hdmi flip preconditions met", 32);
+    return 1;
+}
+
+# === 1.55.x P3b-ii + P3b-iii — take the live DVI link to HDMI and open the audio path ===
+# This is the write bite: it closes the 1.53.5 backlog where the HDA codec streams samples that nothing
+# embeds. gpu_hdmi_preflight() runs INLINE as this function's gate — the hazard reads and the writes belong in
+# the same boot, because a read that only reports is a burn spent on something the writer could decide itself.
+#
+# ORDER IS LOAD-BEARING AND EVERY VIOLATION FAILS SILENTLY (no fault, no log, just no sound):
+#   1. Stage the HDMI block while DIG_MODE is still 2 — every HDMI_* register is INERT in DVI mode, so this
+#      part is free. Staging first means the flip commits an already-correct context rather than a moment of
+#      half-configured HDMI.
+#   2. Flip DIG_MODE 2->3 by READ-MODIFY-WRITE. Never a blind write: DIG_FE_SOURCE_SELECT is 7 bits in this
+#      same register and zeroing it would unbind the front end from the back end and take the console down
+#      for a reason unrelated to HDMI.
+#   3. DCCG audio DTO — SOURCE/SEL strictly BEFORE module/phase (hardware-enforced; AMD warns in dce_audio.c).
+#      MODULE-before-PHASE is AMD's observed order but NOT a documented constraint: match it, never debug
+#      against it as if it were one.
+#   4. Azalia: configure (speaker/channel allocation, clock gating) BEFORE enable, per dce110_enable_stream.
+#   5. AFMT: the audio CLOCK first (nothing downstream ticks without it), then source/channels, then the tap.
+fn gpu_hdmi_audio_enable() {
+    gpu_hdmi_audio_on = 0;
+    if (gpu_hdmi_preflight() != 1) {
+        kprintln("gpu: hdmi audio not enabled (preflight refused)", 47);
+        return 0;
+    }
+    if (gpu_pixclk_100hz == 0) {
+        # The DTO module IS the pixel clock; without it we would be guessing at the audio wall clock.
+        kprintln("gpu: hdmi audio not enabled (no pixel clock)", 44);
+        return 0;
+    }
+    var d    = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    var pipe = gpu_display_pipe;
+    # Endpoint index == stream-encoder index (amdgpu find_first_free_audio matches id to engine), so the live
+    # DIG's own index is the endpoint. Renoir has only 4, and AFMT_AUDIO_SRC_SELECT must never exceed 3.
+    var az = gpu_audio_dig;
+    if (az >= GPU_DCN_AZ_ENDPOINTS) {
+        kprintln("gpu: hdmi audio not enabled (no endpoint for encoder)", 53);
+        return 0;
+    }
+    var ir = GPU_R_AZ_ENDPOINT_INDEX + az * GPU_DCN_AZ_STRIDE;
+    var dr = GPU_R_AZ_ENDPOINT_DATA  + az * GPU_DCN_AZ_STRIDE;
+
+    # --- 1. Stage the HDMI block (inert while DIG_MODE==2, so this cannot disturb the console) ---
+    var ctl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d,
+    (ctl & (0 - 1 - GPU_HDMI_CONTROL_KEEP)) | GPU_HDMI_CONTROL_SET);
+    var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, gc & (0 - 1 - GPU_HDMI_GC_AVMUTE));
+    var vbi = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL + d, vbi | GPU_HDMI_VBI_SET);
+
+    # --- 2. THE COMMIT: DIG_MODE 2 -> 3, read-modify-write ---
+    var be = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d,
+    (be & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT));
+    var back = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & GPU_DIG_MODE_MASK) >> GPU_DIG_MODE_SHIFT;
+    if (back != GPU_DIG_MODE_HDMI) {
+        kprintln("gpu: hdmi mode did not take", 27);
+        return 0;
+    }
+    kprintln("gpu: display link switched to HDMI signalling", 45);
+
+    # --- 3. DCCG audio DTO (seg1). Source/select FIRST — hardware-enforced. ---
+    # DTO_SEL must be 0: 0 selects the DTO0/HDMI path, 1 selects DTO1/DP. A GOP that left it at 1 would give
+    # silence with every other register perfect.
+    var src = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO_SRC);
+    src = src & (0 - 1 - GPU_DCCG_AUDIO_DTO_SEL_MASK) & (0 - 1 - 0x7);
+    gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO_SRC, src | (pipe & 0x7));
+    # MODULE = the live pixel clock in 100 Hz units (this is what P3b-i derived); PHASE = a constant 24 MHz.
+    # The sample rate NEVER enters either: Fs comes from the HDA converter format, and 128*Fs is derived
+    # downstream. An Fs-scaled DTO would be a regression.
+    gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE, gpu_pixclk_100hz);
+    gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_PHASE,  GPU_DCCG_AUDIO_DTO_PHASE_VAL);
+
+    # --- 4. Azalia endpoint: configure, then enable ---
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_CHANNEL_SPEAKER);
+    var spk = gpu_reg32(GPU_BASE_DCN_2, dr);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, (spk & (0 - 1 - 0x7F)) | GPU_AZ_SPEAKER_FL_FR);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+    var hpc = gpu_reg32(GPU_BASE_DCN_2, dr);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc | GPU_AZ_CLOCK_GATING_DISABLE | GPU_AZ_AUDIO_ENABLED);
+
+    # --- 5. AFMT. The audio CLOCK first: without it the whole block is inert and reports nothing wrong. ---
+    var ac = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d, ac | GPU_AFMT_AUDIO_CLOCK_EN);
+
+    # ACR: hardware-measured CTS (SOURCE=0) + AUTO_SEND, but N is a per-Fs constant and must be written.
+    var acr = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d);
+    acr = acr & (0 - 1 - GPU_HDMI_ACR_SOURCE) & (0 - 1 - GPU_HDMI_ACR_SELECT_MASK);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d, acr | GPU_HDMI_ACR_AUTO_SEND);
+    var n48 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d,
+    (n48 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_48_VAL);
+
+    var hap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d,
+    (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK)) | GPU_HDMI_AUDIO_DELAY_SET);
+
+    # Source select binds this DIG's AFMT to the Azalia endpoint; channel-enable is 8 bits and zero of them
+    # is silence, so stereo must be spelled out.
+    var sc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d,
+    (sc & (0 - 1 - GPU_AFMT_AUDIO_SRC_SELECT_MASK)) | az);
+    var pc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d,
+    (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK)) | GPU_AFMT_CHANNEL_ENABLE_STEREO);
+
+    # The Audio InfoFrame must accompany the sample packets or the sink will not render them.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_INFO0 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_INFO1 + d, 0);
+    var ifc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ifc | GPU_AFMT_AUDIO_INFO_UPDATE);
+
+    # LAST: latch channel status and open the sample tap.
+    var apc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,
+    apc | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+
+    # AFMT_AUDIO_ENABLE is HARDWARE-driven by the Azalia endpoint — not our own write read back — so it is a
+    # real answer about whether the endpoint accepted the stream, not an echo.
+    var st = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + d);
+    gpu_hdmi_audio_on = 1;
+    kprint("gpu: hdmi audio path armed on dig ", 34); kprint_num(gpu_audio_dig);
+    kprint(" endpoint ", 10); kprint_num(az);
+    kprint(", pixel clock ", 14); kprint_num(gpu_pixclk_100hz / 10);
+    kprint(" kHz, afmt status ", 18); kprint_hex(st); kprintln("", 0);
     return 1;
 }
 
