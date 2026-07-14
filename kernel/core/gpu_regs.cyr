@@ -66,9 +66,13 @@ var GPU_BASE_DCN_2       = 0x34C0;   # DCN 2.1 pipe register base (OTG/HUBP/…)
 var GPU_DCN_PIPES        = 4;        # OTG0-3 / HUBP0-3 populated on Renoir
 # OTG/OPTC — find the GOP-lit pipe (stride 0x80).
 var GPU_R_OTG_CONTROL    = 0x1B41;   # OTGn OTG_CONTROL: OTG_MASTER_EN = bit0 (1 = pipe lit); 0xFFFFFFFF = gated → skip
-var GPU_R_OTG_STATUS     = 0x1B49;   # OTGn OTG_STATUS: V_BLANK bit0 / V_ACTIVE_DISP bit1 (corroboration only)
+var GPU_R_OTG_STATUS     = 0x1B49;   # OTGn OTG_STATUS: V_BLANK bit0 / V_ACTIVE_DISP bit1
 var GPU_DCN_OTG_STRIDE   = 0x80;     # per-OTG instance stride
 var GPU_OTG_MASTER_EN    = 0x1;      # OTG_CONTROL bit0
+# P2 vblank pacing — the frame counter increments once per vsync: the signal a present loop paces on.
+var GPU_R_OTG_FRAME_COUNT = 0x1B4C;  # OTGn OTG_STATUS_FRAME_COUNT [15:0] — +1 per vsync on a scanning pipe
+var GPU_OTG_V_BLANK       = 0x1;     # OTG_STATUS bit0 — pipe is in vertical blank
+var GPU_OTG_V_ACTIVE      = 0x2;     # OTG_STATUS bit1 — pipe is in active display
 # HUBP/HUBPREQ — scanout surface (stride 0xDC). The surface-address match is the P0 pass gate.
 var GPU_R_HUBP_SURF_ADDR    = 0x60A; # HUBPREQn DCSURF_PRIMARY_SURFACE_ADDRESS [31:0] — RAW byte addr, no shift
 var GPU_R_HUBP_SURF_ADDR_HI = 0x60B; # HUBPREQn ..._ADDRESS_HIGH [15:0] = addr[47:32]

@@ -5,6 +5,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.4] — 2026-07-14 — P2: vblank pacing (the present-loop primitive)
+
+### Added
+
+- **`gpu_display_wait_vblank(pipe)` — the pacing primitive** (`kernel/core/gpu.cyr`): blocks until the pipe
+  crosses a frame boundary, detected via `OTG_STATUS_FRAME_COUNT` (+1 per vsync). This is what a present
+  loop waits on: after a flip it returns once the hardware has **actually taken** the new surface, so the
+  previous front buffer is free to render into. Bounded ~50 ms (≥3 frames at 60 Hz) so a stopped pipe can
+  never wedge the boot.
+- **P2 — vblank pacing proof** (`gpu_display_vblank`): verifies the pacing *signal* is real and observable —
+  (1) the frame counter advances (the pipe is genuinely scanning; frame boundaries are visible to us), and
+  (2) `OTG_STATUS` shows **both** the blank and active phases (we can tell where in the scan we are).
+  Read-only, gated on P0. PASS = `gpu: display vblank pacing online (frame counter + blank)`.
+- DCN vblank registers (`kernel/core/gpu_regs.cyr`): `OTG_STATUS_FRAME_COUNT` @0x1B4C (stride 0x80),
+  `OTG_STATUS.V_BLANK` bit0 / `V_ACTIVE_DISP` bit1 — from the P0 derivation, no new RE needed.
+
+### Changed
+
+- **P1's flip is now vblank-paced** (`gpu_display_flip`): the blind delay after the flip is replaced by a
+  real `gpu_display_wait_vblank` — it no longer *hopes* the swap landed, it waits for the hardware's own
+  frame boundary to confirm the surface was taken (and paces the restore the same way). New verdict:
+  `gpu: display flip online (paced in blank + restored)`; new `-3` = latched but no frame boundary.
+
+Note on the refresh rate: deliberately **not** printed. `gpu_udelay` hardcodes 3000 TSC ticks/µs (3 GHz) but
+this part's TSC is ~3.2 GHz, so a derived Hz would read ~64 for a 60 Hz panel — a quietly-6%-wrong number is
+worse than none. P2 proves the pacing structurally, which is what the present loop needs.
+
+Iron-only; flash `--update-all` then `run /bin/klug`. Completes the present primitive — the real
+double-buffered `blit`#39 is the payoff bite.
+
 ## [1.55.3] — 2026-07-14 — P1: the scanout flip (agnos's first DCN write)
 
 ### Added

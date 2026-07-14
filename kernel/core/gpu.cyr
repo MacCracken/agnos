@@ -47,7 +47,8 @@ var gpu_f64_fidelity_ok = 0; # f64 fidelity: 1 = rosnet-bit-correct on NON-exact
 var gpu_display_ok    = 0;   # P0 (1.55.x display arc): 1 = lit HUBP scanout matches fb_phys; -1 no match; -2 surface matched but no OTG lit
 var gpu_display_pipe  = 0 - 1; # P0: the HUBP instance scanning out our console (P1 re-points this one)
 var gpu_display_surf  = 0;   # P0: that pipe's FRONT surface MC address (the P1 restore target)
-var gpu_flip_ok       = 0;   # P1: 1 = scanout re-pointed to our back buffer + restored; -1 flip didn't latch; -2 restore didn't latch
+var gpu_flip_ok       = 0;   # P1: 1 = scanout re-pointed to our back buffer + restored; -1 flip didn't latch; -2 restore didn't latch; -3 no frame boundary
+var gpu_vblank_ok     = 0;   # P2: 1 = frame counter advances + both scan phases observable (the pacing signal); -1 counter stuck; -2 no blank; -3 no active
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -2284,6 +2285,69 @@ fn gpu_display_probe() {
     return 0;
 }
 
+# === 1.55.x display arc — P2: vblank pacing ===
+# gpu_display_wait_vblank — THE pacing primitive: block until the pipe crosses a frame boundary. The OTG
+# frame counter increments once per vsync, so a change means a full frame was scanned and we are now in (or
+# just past) the blank interval. This is what a present loop waits on: after a flip, this returns once the
+# hardware has ACTUALLY taken the new surface, so the previous front buffer is free to render into.
+# Bounded (~50 ms ≥ 3 frames at 60 Hz) so a stopped pipe can never wedge the boot. 1 = boundary crossed.
+fn gpu_display_wait_vblank(pipe) {
+    var fc_off = GPU_R_OTG_FRAME_COUNT + pipe * GPU_DCN_OTG_STRIDE;
+    var f0 = gpu_reg32(GPU_BASE_DCN_2, fc_off) & 0xFFFF;
+    var i = 0;
+    while (i < 5000) {
+        if ((gpu_reg32(GPU_BASE_DCN_2, fc_off) & 0xFFFF) != f0) { return 1; }
+        gpu_udelay(10);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# gpu_display_vblank — P2 proof: the pacing SIGNAL exists and is observable. (1) the frame counter advances
+# => the pipe is really scanning and we can see frame boundaries; (2) OTG_STATUS shows BOTH the blank and
+# the active phase => we can tell where in the scan we are. Together these are what P1's flip is paced on
+# and what the double-buffered blit will pace on. Strictly read-only. Gated on P0 (we know the lit pipe).
+fn gpu_display_vblank() {
+    gpu_vblank_ok = 0;
+    if (gpu_present == 0) { return 0; }
+    if (gpu_display_ok != 1) { return 0; }
+    if (gpu_display_pipe < 0) { return 0; }
+    var pipe = gpu_display_pipe;
+
+    # 1. Frame boundaries must be observable.
+    if (gpu_display_wait_vblank(pipe) != 1) {
+        gpu_vblank_ok = 0 - 1;
+        kprintln("gpu: display frame counter not advancing", 40);
+        return 0;
+    }
+
+    # 2. Both scan phases must be observable — poll OTG_STATUS across at least one frame.
+    var st_off = GPU_R_OTG_STATUS + pipe * GPU_DCN_OTG_STRIDE;
+    var saw_blank  = 0;
+    var saw_active = 0;
+    var i = 0;
+    while (i < 200000) {
+        var st = gpu_reg32(GPU_BASE_DCN_2, st_off);
+        if ((st & GPU_OTG_V_BLANK)  != 0) { saw_blank  = 1; }
+        if ((st & GPU_OTG_V_ACTIVE) != 0) { saw_active = 1; }
+        if (saw_blank != 0) { if (saw_active != 0) { i = 200000; } }
+        i = i + 1;
+    }
+    if (saw_blank == 0) {
+        gpu_vblank_ok = 0 - 2;
+        kprintln("gpu: display blank interval not observed", 40);
+        return 0;
+    }
+    if (saw_active == 0) {
+        gpu_vblank_ok = 0 - 3;
+        kprintln("gpu: display active phase not observed", 38);
+        return 0;
+    }
+    gpu_vblank_ok = 1;
+    kprintln("gpu: display vblank pacing online (frame counter + blank)", 57);
+    return 1;
+}
+
 # === 1.55.x display arc — P1: the scanout flip (the FIRST DCN WRITE) ===
 # gpu_display_flip — re-point the lit pipe's HUBP scanout to a back buffer we own, hold it so the swap is
 # visible on the panel, then restore the console. This is the primitive a tear-free double-buffered present
@@ -2341,6 +2405,10 @@ fn gpu_display_flip() {
     var rhi = gpu_reg32(GPU_BASE_DCN_2, shi) & 0xFFFF;
     var got = (rhi << 32) | rlo;
 
+    # P2: PACE the flip — block until the pipe crosses a frame boundary, i.e. the hardware has actually
+    # taken our surface (rather than blindly sleeping and hoping). This is the present-loop primitive.
+    var paced = gpu_display_wait_vblank(gpu_display_pipe);
+
     # Hold ~2 s so the swap is unmistakable on the panel, then put the console back.
     var h = 0;
     while (h < 20000) { gpu_udelay(100); h = h + 1; }
@@ -2352,8 +2420,7 @@ fn gpu_display_flip() {
     var blo = gpu_reg32(GPU_BASE_DCN_2, slo) & 0xFFFFFFFF;
     var bhi = gpu_reg32(GPU_BASE_DCN_2, shi) & 0xFFFF;
     var rst = (bhi << 32) | blo;
-    var h2 = 0;
-    while (h2 < 2000) { gpu_udelay(100); h2 = h2 + 1; }   # let the restore latch before we log
+    gpu_display_wait_vblank(gpu_display_pipe);   # pace the restore too — console is back before we log
 
     if (got != back_mc) {
         gpu_flip_ok = 0 - 1;
@@ -2365,7 +2432,12 @@ fn gpu_display_flip() {
         kprintln("gpu: display flip restore did not latch", 39);
         return 0;
     }
+    if (paced != 1) {
+        gpu_flip_ok = 0 - 3;
+        kprintln("gpu: display flip latched but no frame boundary", 47);
+        return 0;
+    }
     gpu_flip_ok = 1;
-    kprintln("gpu: display flip online (scanout re-pointed + restored)", 56);
+    kprintln("gpu: display flip online (paced in blank + restored)", 52);
     return 1;
 }
