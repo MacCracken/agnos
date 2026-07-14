@@ -5,6 +5,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.2] — 2026-07-14 — P0 fix: the scanout address is BAR0-relative, not carveout-relative
+
+### Fixed
+
+- **P0 CPU→MC scanout transform** (`kernel/core/gpu.cyr` `gpu_display_probe`): the 1.55.1 diagnostic
+  localized the 1.55.0 no-match to a wrong premise, not a wrong register. The GOP framebuffer is addressed
+  by the CPU through the GPU's **BAR0 VRAM aperture** (`fb_phys = 0xD0000000`, ~3.25 GB), **not** the DRAM
+  carveout's CPU-phys base (`fb_off = 0xF70000000`, ~62 GB) — so subtracting `fb_off` produced a nonsense
+  MC address (`0xE560000000`). The transform is now `expected = fb_base + (fb_phys − BAR0)` (via
+  `pci_bar0_64`): the framebuffer's offset **within VRAM**, mapped into the GPU's MC view. The console sits
+  at VRAM offset 0, so this reduces to `fb_base = 0xF400000000` — exactly the surface the iron reported.
+
+### Confirmed by the 1.55.1 diagnostic (iron, archaemenid)
+
+- **The DCN base `GPU_BASE_DCN_2 = 0x34C0` is CORRECT** — `pipe0 otg=0x80011301` is a real structured
+  register with `OTG_MASTER_EN=1` (the GOP-lit pipe), and pipes 1-3 read `0x80000300` (bit0=0, off) —
+  exactly right for a single display. The 5-lens derivation held.
+- **The HUBP surface read is correct** — `pipe0 surf=0xF400000000` is precisely the FB carveout MC base the
+  compute arc established (`FB carveout MC [0xF400000000, +3GB)`), i.e. the console at VRAM offset 0.
+- The read-only/hang-safety posture held: the probe read the DCN and booted clean through to agnsh.
+
+### Added
+
+- `bar0=` in the P0 diagnostic dump (confirms the transform's input; expected `0xD0000000`). The diagnostic
+  lines are retained for this burn and removed once P0 is green.
+
+Iron-only; flash `--update-all` then `run /bin/klug > p0b.txt`. PASS = `gpu: display pipe 0 live (scanout
+matches framebuffer)` — the DCN base + surface register proven, which unblocks **P1** (tear-free flips
+re-point that same HUBP surface address).
+
 ## [1.55.1] — 2026-07-14 — P0 diagnostic: localize the DCN surface no-match
 
 ### Added

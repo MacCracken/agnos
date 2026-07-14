@@ -2219,13 +2219,22 @@ fn gpu_display_probe() {
     var fb_phys = load64(bi + 0x48);
     if (fb_phys == 0) { return 0; }   # no GOP FB → nothing to match
 
-    # MC↔phys transform (iron-proven C2b reads): a HUBP holds an MC-domain address; convert fb_phys
-    # (CPU-physical) to the MC view so the match works in either domain.
-    var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
+    # CPU→MC transform for the scanout address. The GOP framebuffer is addressed by the CPU through the
+    # GPU's **BAR0 VRAM aperture** — NOT the DRAM carveout's CPU-phys base. So the framebuffer's offset
+    # within VRAM is (fb_phys - BAR0), and the HUBP — which holds the GPU/MC-domain address of the same
+    # pixels — sees it at fb_base + that offset.
+    #
+    # IRON 1.55.1 proved this: fb_phys read 0xD0000000 (~3.25 GB = the BAR0 window) while the carveout's
+    # CPU-phys base is 0xF70000000 (~62 GB), so subtracting fb_off was the 1.55.0 no-match bug (it produced
+    # 0xE560000000). The real pipe-0 surface read 0xF400000000 == fb_base exactly, i.e. the console sits at
+    # VRAM offset 0 — which this BAR0-relative transform reproduces.
     var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
-    var fb_off  = r_off << 24;
-    var fb_base = r_base << 24;
-    var expected_mc = fb_phys - fb_off + fb_base;
+    var fb_base = r_base << 24;          # carveout MC base = where VRAM offset 0 lives in the GPU's view
+    var bar0 = pci_bar0_64(gpu_pci_idx); # VRAM aperture: the CPU's window onto the same memory
+    var expected_mc = 0;
+    if (bar0 != 0) {
+        if (fb_phys >= bar0) { expected_mc = fb_base + (fb_phys - bar0); }
+    }
 
     # OTG liveness walk (safe on all 4 pipes; corroboration + pipe id). 0xFFFFFFFF = gated → skip.
     var lit_otg = 0 - 1;
@@ -2256,6 +2265,7 @@ fn gpu_display_probe() {
     # --- P0 DIAGNOSTIC (localize the no-match; labeled hex, removed once P0 passes) ---
     # fb/mc = what we search for; per-pipe otg/surf = what the DCN actually holds; dce = seg1 base sanity.
     kprint("gpu: dcn diag fb=", 17); kprint_hex(fb_phys);
+    kprint(" bar0=", 6); kprint_hex(bar0);
     kprint(" mc=", 4); kprint_hex(expected_mc); kprintln("", 0);
     var dq = 0;
     while (dq < GPU_DCN_PIPES) {
