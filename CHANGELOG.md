@@ -5,6 +5,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.26] — 2026-07-13 — GPU arc C2g-1 ROOT FIX: pre-dispatch shader I-cache invalidate
+
+**The C2g-1 multi-thread bug (8 burns) was a missing per-dispatch shader-cache invalidate.** The burn-8
+diagnostic (`retire=0xff` on every dispatch = every wave launched and ran; the store just landed at the
+wrong address) let the root cause fall out: agnos rewrites the compute shader **in place at a fixed VA**
+(`GPU_SHADER_SUBOFF = 0x14000`) for every dispatch, but never invalidated the SQC instruction cache
+(`SH_ICACHE`) or scalar K-cache between dispatches. So successive waves executed a **stale cached shader**
+whose baked-in store address targeted a *previous* dispatch's output slot. This explains all eight burns:
+C2f always worked (first cold use of the VA = guaranteed I-cache miss = correct fetch); C2g-1 was dead
+because it ran C2f's still-cached 1-thread shader (`nz=0`); the five IB-register configurations produced
+identical patterns because the defect is upstream of the dispatch registers; even the earlier "stale-L2
+ghost" (`out[0]=0xC2F0C2F0`) was instruction staleness mis-attributed to data staleness. mabda's HW-proven
+Cezanne path (`backend_native_pm4.cyr`) emits this invalidate before every dispatch, commented *"mandatory
+before a compute dispatch on GFX9."*
+
+### Fixed
+
+- **C2g-1 multi-thread wave launch — pre-dispatch I-cache invalidate** (`kernel/core/gpu.cyr` +
+  `kernel/core/gpu_regs.cyr`, all three compute dispatches: C2f, C2g-1, and the sweep): prepend a 7-dword
+  `ACQUIRE_MEM` with `GPU_CP_COHER_CNTL_INV = 0x28C40000` (SH_ICACHE bit 29 | SH_KCACHE 27 | TC 23 | TCL1 22
+  | TC_WB 18 — mabda's RADV-captured full-invalidate mask) to the **start** of the ring program, before the
+  first `SET_SH_REG COMPUTE_PGM_LO`, so the SQ refetches the current shader bytes each dispatch. The existing
+  post-dispatch `ACQUIRE_MEM 0x00840000` (TC writeback) is kept for output visibility. Per-dispatch order now
+  matches mabda: invalidate → `SET_SH` regs → `DISPATCH_DIRECT` → `CS_PARTIAL_FLUSH` → TC-writeback →
+  `WRITE_DATA` done-marker. The register-wptr submit path is unchanged — `retire=0xff` proved it already
+  works (the doorbell is a separate robustness item, not this bug). Iron-only; flash `--update-all`.
+  Validation: `SWEEP w64x8/w8x8 alive → 0xFF`, `gpu: C2g-1 = MULTI-THREAD OK` (`nz=0 → 64`).
+
 ## [1.54.25] — 2026-07-13 — GPU arc C2g-1 diagnostic: width-vs-position + hang-vs-no-launch
 
 **C2g-1 burn 7** (1.54.24) proved the mabda-preamble match had ZERO effect — the sweep pattern was

@@ -229,7 +229,12 @@ var GPU_C2E_NOTYET         = 0xDEADBEEF; # pre-seed marker: distinct from sentin
 # collapse the executed-vs-coherent disambiguation). Verify CP_COHER_CNTL vs local gc_9_0
 # sh_mask.h before that burn (a wrong bit makes ACQUIRE_MEM a silent no-op).
 var GPU_PM4_ACQUIRE_MEM_HDR = 0xC0055800; # PACKET3(ACQUIRE_MEM=0x58, count=5) -> 7-dword packet
-var GPU_CP_COHER_CNTL_TCWB  = 0x00840000; # TC_WB_ACTION_ENA(1<<18) | TC_ACTION_ENA(1<<23)
+var GPU_CP_COHER_CNTL_TCWB  = 0x00840000; # TC_WB_ACTION_ENA(1<<18) | TC_ACTION_ENA(1<<23) — POST-dispatch output writeback
+# PRE-dispatch full invalidate (mabda/RADV-captured, HW-proven Cezanne): SH_ICACHE(1<<29) | SH_KCACHE(1<<27)
+# | TC(1<<23) | TCL1(1<<22) | TC_WB(1<<18). MANDATORY before DISPATCH on gfx9 — the shader is rewritten in
+# place at a FIXED VA (0x14000) every dispatch, so without an I-cache invalidate the SQ runs a STALE cached
+# shader (a previous dispatch's baked store-address). THE fix for the C2g-1 intermittent-launch bug (burns 1-8).
+var GPU_CP_COHER_CNTL_INV   = 0x28C40000;
 
 # --- C2f: first hand-assembled gfx90c compute shader (DISPATCH_DIRECT) ---
 # All raw ISA/PM4 bytes CONFIRMED by 2 independent adversarial re-derivations (incl. reconstructing

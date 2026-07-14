@@ -1292,6 +1292,13 @@ fn gpu_shader_dispatch() {
     var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
     var pgm_hi = (shader_mc >> 40) & 0xFF;
     # SET_SH COMPUTE_PGM_LO/HI
+    # PRE-dispatch I$/K$ invalidate (mabda-proven, MANDATORY on gfx9) — the shader is rewritten in place at
+    # a FIXED VA (0x14000) every dispatch, so without this the SQ runs a STALE cached shader (a prior
+    # dispatch's baked store-address) => the store lands in the wrong slot. THE fix for the C2g-1
+    # intermittent-launch bug (burns 1-8): C2f worked only by cold-cache luck; every later dispatch ran stale.
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
     # SET_SH COMPUTE_PGM_RSRC1/2
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(0);
@@ -1451,6 +1458,13 @@ fn gpu_shader_dispatch2() {
     #    NUM_THREAD_X = 64 instead of 1.
     var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
     var pgm_hi = (shader_mc >> 40) & 0xFF;
+    # PRE-dispatch I$/K$ invalidate (mabda-proven, MANDATORY on gfx9) — the shader is rewritten in place at
+    # a FIXED VA (0x14000) every dispatch, so without this the SQ runs a STALE cached shader (a prior
+    # dispatch's baked store-address) => the store lands in the wrong slot. THE fix for the C2g-1
+    # intermittent-launch bug (burns 1-8): C2f worked only by cold-cache luck; every later dispatch ran stale.
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(0);
     # C2g-1 zero-wave FIX (burn 5): clear the stale threadgroup-origin + dispatch-resume SH state
@@ -1588,6 +1602,13 @@ fn gpu_sweep_one(width, slot_off) {
 
     var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
     var pgm_hi = (shader_mc >> 40) & 0xFF;
+    # PRE-dispatch I$/K$ invalidate (mabda-proven, MANDATORY on gfx9) — the shader is rewritten in place at
+    # a FIXED VA (0x14000) every dispatch, so without this the SQ runs a STALE cached shader (a prior
+    # dispatch's baked store-address) => the store lands in the wrong slot. THE fix for the C2g-1
+    # intermittent-launch bug (burns 1-8): C2f worked only by cold-cache luck; every later dispatch ran stale.
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(0);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_START_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
