@@ -290,3 +290,13 @@ var GPU_SHADER_OUT2_SUBOFF = 0x16000;    # 64-dword (256 B) per-thread output ar
 var GPU_MT_NUM_THREAD_X    = 64;         # workgroup size X (Y=Z=1); DIM stays 1x1x1 => 64 total threads
 var GPU_MT_N               = 64;         # verification element count (out[0..63])
 var GPU_MT_NOTYET          = 0xDEADBEEF;  # pre-seed marker: != any tid 0..63 (incl 0), != done
+
+# C2g-2 — compute KERNARGS: operand pointers passed via COMPUTE_USER_DATA (the last primitive before
+# matmul). RSRC2 USER_SGPR=4 preloads s0..s3 from USER_DATA_0..3 before shader entry (s[0:1]=input base,
+# s[2:3]=output base); the shader reads in[tid] via s[0:1] and writes out[tid] via s[2:3]. mabda-proven
+# ABI (backend_native_shaders.cyr): RSRC2=0x08, USER_DATA_0 at SH 0x240 (mabda 0xB900).
+var GPU_COMPUTE_RSRC2_KERNARG = 0x00000008;  # RSRC2 USER_SGPR=4 -> preload s0..s3 from USER_DATA_0..3
+var GPU_SH_COMPUTE_USER_DATA_0 = 0x240;      # + _1 0x241, _2 0x242, _3 0x243 (COMPUTE_USER_DATA_0..3)
+var GPU_PM4_SET_SH_REG_N4     = 0xC0047600;  # SET_SH_REG, 4 values (in_lo, in_hi, out_lo, out_hi)
+var GPU_KERNARG_IN_SUBOFF     = 0x18000;     # input buffer, 64 dwords (in[i]=i*7+1)
+var GPU_KERNARG_OUT_SUBOFF    = 0x18400;     # output buffer, 64 dwords (out[i] must == in[i])

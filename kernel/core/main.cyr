@@ -892,6 +892,11 @@ gpu_shader_dispatch();
 # (shader proven) inside gpu_shader_dispatch2(). Same wedge-safe envelope. See kernel/core/gpu.cyr.
 gpu_shader_dispatch2();
 
+# GPU arc C2g-2 (1.54.x) — compute KERNARGS: pass input+output base pointers via COMPUTE_USER_DATA
+# (SPI preloads s0..s3), shader does out[tid]=in[tid]. Proves per-lane operand reads through kernarg
+# pointers — the last primitive before rosnet matmul. Gated on C2g-1 inside gpu_shader_dispatch3().
+gpu_shader_dispatch3();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

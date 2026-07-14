@@ -39,6 +39,7 @@ var gpu_ring_wptr    = 0;    # CPU-canonical ring write cursor in DWORDS (C2d se
 var gpu_fence_ok     = 0;    # C2e: 1 = MEC executed WRITE_DATA AND the write is CPU-visible
 var gpu_shader_ok    = 0;    # C2f: 1 = shader RAN + store CPU-visible; -1 no-retire; -2 store-stale; -3 fault
 var gpu_mt_ok        = 0;    # C2g-1: 1 = all 64 tids written CPU-visible; -1 no-retire; -2 partial; -3 fault
+var gpu_kernarg_ok   = 0;    # C2g-2: 1 = all 64 out[i]==in[i] via kernarg pointers; -1 no-retire; -2 partial; -3 fault
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -1333,5 +1334,142 @@ fn gpu_shader_dispatch2() {
     }
     gpu_mt_ok = 0 - 1;
     kprintln("gpu: parallel dispatch did not complete", 39);
+    return 0;
+}
+
+# ── C2g-2 — compute KERNARGS: read an operand through a pointer passed in COMPUTE_USER_DATA ──────
+# The last primitive before matmul. C2g-1 baked the output address into the shader as a literal; C2g-2
+# passes BOTH an input and an output base pointer via COMPUTE_USER_DATA_0..3 (RSRC2 USER_SGPR=4 makes the
+# SPI preload s[0:1]=input, s[2:3]=output before shader entry), and the shader does out[tid] = in[tid] —
+# proving per-lane operand reads through kernarg pointers. mabda-proven ABI; all 17 shader dwords are
+# llvm-mc(-mcpu=gfx90c) ground-truth. Gated on C2g-1 (multi-thread proven). WEDGE-SAFE: same bounded
+# envelope as C2g-1; a bad per-lane load/store addr faults into the 0x1FFC dummy net (fault!=0, bounded).
+fn gpu_shader_dispatch3() {
+    gpu_kernarg_ok = 0;
+    if (gpu_present == 0) { return 0; }
+    if (gpu_mt_ok != 1) {
+        kprintln("gpu: skipping kernarg test (parallel compute unverified)", 56);
+        return 0;
+    }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+
+    var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
+    var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;
+    var in_phys     = gpu_arena_phys + GPU_KERNARG_IN_SUBOFF;
+    var in_mc       = gpu_arena_mc   + GPU_KERNARG_IN_SUBOFF;
+    var out_phys    = gpu_arena_phys + GPU_KERNARG_OUT_SUBOFF;
+    var out_mc      = gpu_arena_mc   + GPU_KERNARG_OUT_SUBOFF;
+    var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
+    var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
+
+    # 1. Shader (17 dwords): s[0:1]=input base, s[2:3]=output base (SPI-preloaded from USER_DATA).
+    #    off = tid*4; v3 = in[off] (load via s[0:1]); out[off] = v3 (store via s[2:3]).
+    store32(shader_phys + 0x00, 0xBEFE01C1);   # s_mov_b64 exec, -1   (unmask all 64 lanes; exact-64)
+    store32(shader_phys + 0x04, 0x24000082);   # v_lshlrev_b32 v0, 2, v0        (v0 = tid*4)
+    store32(shader_phys + 0x08, 0x7E020200);   # v_mov_b32 v1, s0               (in base lo)
+    store32(shader_phys + 0x0C, 0x7E040201);   # v_mov_b32 v2, s1               (in base hi)
+    store32(shader_phys + 0x10, 0x32020101);   # v_add_co_u32 v1, vcc, v1, v0
+    store32(shader_phys + 0x14, 0x38040480);   # v_addc_co_u32 v2, vcc, 0, v2, vcc
+    store32(shader_phys + 0x18, 0xDC508000);   # global_load_dword v3, v[1:2], off
+    store32(shader_phys + 0x1C, 0x037F0001);   #   (VDATA=v3, VADDR=v1, SADDR=off)
+    store32(shader_phys + 0x20, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
+    store32(shader_phys + 0x24, 0x7E020202);   # v_mov_b32 v1, s2               (out base lo)
+    store32(shader_phys + 0x28, 0x7E040203);   # v_mov_b32 v2, s3               (out base hi)
+    store32(shader_phys + 0x2C, 0x32020101);   # v_add_co_u32 v1, vcc, v1, v0
+    store32(shader_phys + 0x30, 0x38040480);   # v_addc_co_u32 v2, vcc, 0, v2, vcc
+    store32(shader_phys + 0x34, 0xDC718000);   # global_store_dword v[1:2], v3, off glc
+    store32(shader_phys + 0x38, 0x007F0301);   #   (VADDR=v1, VDATA=v3, SADDR=off)
+    store32(shader_phys + 0x3C, 0xBF8C0F70);   # s_waitcnt vmcnt(0)
+    store32(shader_phys + 0x40, 0xBF810000);   # s_endpgm
+
+    # 2. Pre-seed the INPUT buffer (in[i] = i*7+1, a distinct != NOTYET pattern) + the OUTPUT + done.
+    var s = 0;
+    while (s < GPU_MT_N) {
+        store32(in_phys  + (s << 2), s * 7 + 1);
+        store32(out_phys + (s << 2), GPU_MT_NOTYET);
+        s = s + 1;
+    }
+    store32(done_phys, GPU_MT_NOTYET);
+    gpu_mfence();
+
+    # 3. Re-arm the fault-net.
+    var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
+
+    # 4. Ring program. Deltas vs C2g-1: RSRC2 = USER_SGPR=4 (0x08) so the SPI preloads s0..s3, and a
+    #    COMPUTE_USER_DATA_0..3 = (in_lo, in_hi, out_lo, out_hi) write. Everything else is the proven path
+    #    (pre-dispatch I$ invalidate, START/RESTART, STATIC, RESLIM, post-dispatch TC-writeback, done).
+    var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
+    var pgm_hi = (shader_mc >> 40) & 0xFF;
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(GPU_COMPUTE_RSRC2_KERNARG);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N4); gpu_ring_put(GPU_SH_COMPUTE_USER_DATA_0);
+    gpu_ring_put(in_mc & 0xFFFFFFFF); gpu_ring_put((in_mc >> 32) & 0xFFFFFFFF);
+    gpu_ring_put(out_mc & 0xFFFFFFFF); gpu_ring_put((out_mc >> 32) & 0xFFFFFFFF);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_START_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(GPU_MT_NUM_THREAD_X); gpu_ring_put(1); gpu_ring_put(1);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_RESTART_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE2); gpu_ring_put(0); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(GPU_COMPUTE_RESLIM);
+    gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
+    gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
+    gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
+    gpu_mfence();
+
+    # 5. Register-wptr submit (LO before HI).
+    var new_wptr = gpu_ring_wptr;
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
+    gpu_mfence();
+
+    # 6. Bounded watchdog on the done-marker.
+    var ok = 0;
+    var i = 0;
+    while (i < 1000) {
+        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
+        else { gpu_udelay(100); i = i + 1; }
+    }
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+    gpu_mfence();
+    gpu_ring_wptr = new_wptr;
+
+    # 7. VERIFY out[i] == in[i] (== i*7+1) for all 64 — proves each lane read its operand + wrote it back.
+    var okcount = 0;
+    var j = 0;
+    while (j < GPU_MT_N) {
+        var v = load32(out_phys + (j << 2)) & 0xFFFFFFFF;
+        if (v == (j * 7 + 1)) { okcount = okcount + 1; }
+        j = j + 1;
+    }
+    var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+
+    if (fault != 0) {
+        gpu_kernarg_ok = 0 - 3;
+        kprintln("gpu: kernarg compute faulted", 28);
+        return 0;
+    }
+    if (ok != 0) {
+        if (okcount == GPU_MT_N) {
+            gpu_kernarg_ok = 1;
+            kprintln("gpu: kernarg compute online (64 operand reads)", 46);
+            return 1;
+        }
+        gpu_kernarg_ok = 0 - 2;
+        kprintln("gpu: kernarg compute incomplete", 31);
+        return 0;
+    }
+    gpu_kernarg_ok = 0 - 1;
+    kprintln("gpu: kernarg dispatch did not complete", 38);
     return 0;
 }

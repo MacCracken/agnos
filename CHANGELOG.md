@@ -5,6 +5,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.27] — 2026-07-13 — GPU arc C2g-2 (compute kernargs) + GPU boot-log cleanup
+
+### Added
+
+- **C2g-2 — compute kernargs** (`kernel/core/gpu.cyr` `gpu_shader_dispatch3` + `kernel/core/gpu_regs.cyr`):
+  the compute shader now reads an operand through a pointer passed in `COMPUTE_USER_DATA` rather than a
+  baked-in literal address — the last primitive before matmul. `COMPUTE_PGM_RSRC2 = 0x08` (USER_SGPR=4)
+  makes the SPI preload `s0..s3` from `COMPUTE_USER_DATA_0..3` before shader entry (`s[0:1]` = input base,
+  `s[2:3]` = output base); a `SET_SH_REG` writes those four registers to the input/output buffer VAs. The
+  17-dword shader (all `llvm-mc -mcpu=gfx90c` ground-truth) does `out[tid] = in[tid]` via `global_load` /
+  `global_store` through the kernarg pointers. Pre-seeds `in[i] = i*7+1` and verifies `out[i] == in[i]` for
+  all 64 lanes, proving per-lane operand reads. mabda-proven ABI (`backend_native_shaders.cyr`). Gated on
+  C2g-1; same bounded wedge-safe envelope. Iron-only; flash `--update-all`.
+
+### Changed
+
+- **GPU boot log — rewritten to plain kernel-style statements.** The bring-up log used internal arc-ladder
+  codes as markers (`gpu: F0 OK`, `gpu: C1d = ENGINES RUNNING`, `gpu: C2g-1 = MULTI-THREAD OK`) — meaningless
+  to anyone reading the console. All 54 status lines now read like a real driver: `gpu: compute engines
+  online`, `gpu: RLC firmware loaded (PSP-validated)`, `gpu: parallel compute online (64 threads)`, etc.
+  Removed **209 lines of verbose hex-dump debug** (`rptr=0x.. wr=0x..` register spam) from the success path
+  — failure paths keep their (also plain-language) messages. Deleted the C2g-1 wave-width **diagnostic sweep**
+  (functions + call + region) now that C2g-1 is proven. The internal codes remain in source comments + the
+  arc docs for traceability. Net: the kernel binary shrank ~11 KB. No functional GPU change.
+
 ## [1.54.26] — 2026-07-13 — GPU arc C2g-1 ROOT FIX: pre-dispatch shader I-cache invalidate
 
 **The C2g-1 multi-thread bug (8 burns) was a missing per-dispatch shader-cache invalidate.** The burn-8
