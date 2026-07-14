@@ -2522,14 +2522,45 @@ fn gpu_audio_probe() {
         d = d + 1;
     }
 
-    # --- Azalia endpoints 0..3 (ONLY 0..3 exist on Renoir): is the block awake or in D3? ---
+    # --- Azalia endpoints 0..3 (ONLY 0..3 exist on Renoir). DISCRIMINATOR ---
+    # 1.55.8 read hpc=0 on all four, which is EITHER (a) the AZ block is in D3 (writes dropped, reads 0 =>
+    # needs the SMU PME wake, VBIOSSMC_MSG_UpdatePmeRestore) OR (b) our F0 index-window offsets/ordinals are
+    # wrong. Implementing an SMU mailbox to fix a typo would be an expensive mistake, so distinguish first:
+    # WRITE the index register, then READ IT BACK.
+    #   back == what we wrote  => the window is powered + reachable  => NOT D3; a zero DATA read means the
+    #                             endpoint register really is 0, or the ix ordinal is wrong.
+    #   back == 0 / all-ones   => the write was dropped => D3 (or a bad offset).
+    # Also read two more ordinals: RESPONSE_CONFIGURATION_DEFAULT (a real endpoint's PORT_CONNECTIVITY is not
+    # all-zero) and CONVERTER_CONTROL_CHANNEL_STREAM_ID (should echo agnos's HDA stream tag if bound) — if
+    # every ordinal reads 0 on a live window, the ordinals are the suspect, not the power state.
+    var az_alive = 0;
     var k = 0;
     while (k < GPU_DCN_AZ_ENDPOINTS) {
-        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AZ_ENDPOINT_INDEX + k * GPU_DCN_AZ_STRIDE, GPU_AZ_IX_HOT_PLUG_CONTROL);
-        var hpc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AZ_ENDPOINT_DATA + k * GPU_DCN_AZ_STRIDE);
+        var ir = GPU_R_AZ_ENDPOINT_INDEX + k * GPU_DCN_AZ_STRIDE;
+        var dr = GPU_R_AZ_ENDPOINT_DATA  + k * GPU_DCN_AZ_STRIDE;
+        var pre = gpu_reg32(GPU_BASE_DCN_2, ir);                       # reset state before we touch it
+        gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+        var back = gpu_reg32(GPU_BASE_DCN_2, ir);                      # THE discriminator
+        var hpc = gpu_reg32(GPU_BASE_DCN_2, dr);
+        gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_RESPONSE_CFG_DEF);
+        var rcd = gpu_reg32(GPU_BASE_DCN_2, dr);
+        gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_CONV_STREAM_ID);
+        var csi = gpu_reg32(GPU_BASE_DCN_2, dr);
         kprint("gpu: audio probe az", 19); kprint_num(k);
-        kprint(" hpc=", 5); kprint_hex(hpc); kprintln("", 0);
+        kprint(" pre=", 5); kprint_hex(pre);
+        kprint(" back=", 6); kprint_hex(back);
+        kprint(" hpc=", 5); kprint_hex(hpc);
+        kprint(" rcd=", 5); kprint_hex(rcd);
+        kprint(" csi=", 5); kprint_hex(csi);
+        kprintln("", 0);
+        if (back == GPU_AZ_IX_HOT_PLUG_CONTROL) { az_alive = az_alive + 1; }
         k = k + 1;
+    }
+    if (az_alive == 0) {
+        kprintln("gpu: audio endpoint window dead (D3 or wrong offset)", 52);
+    }
+    if (az_alive != 0) {
+        kprint("gpu: audio endpoint window alive on ", 36); kprint_num(az_alive); kprintln(" of 4", 5);
     }
 
     # --- Verdict: which signal, which DIG ---

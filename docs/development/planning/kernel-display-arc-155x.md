@@ -41,7 +41,7 @@ path, and can proceed once P0 has the DCN base + register-access model proven. P
 |-------|-------|
 | iGPU | AMD Cezanne (Ryzen 7 5800H) — DCN 2.1 display, gfx90c compute |
 | PCI | `1002:1638` function 0; register BAR5 (MMIO, UC-mapped at F0) |
-| Display | DCN 2.1, **GOP-lit linear FB**; user's display on **DP output 2** |
+| Display | DCN 2.1, **GOP-lit linear FB**; the display is on **HDMI** — physically, per the operator (the cable in the box is the ground truth). **The old "DP output 2" note in this table was WRONG** and cost a detour. Iron-confirmed at P3a (1.55.8): `DP_DTO0_ENABLE`=0, `DP_VID_STREAM_ENABLE`=0 ⇒ not DP-SST; the live encoder is **DIG1**, and it is in **DIG_MODE=2 (DVI)** — legal on an HDMI sink, but DVI signaling carries **no audio and no infoframes** |
 | FB phys | `fb_phys = load64(load64(&boot_info_ptr) + 0x48)` (pitch +0x50, height +0x58) — the P0 pass-gate |
 | DCN base | `GPU_BASE_DCN_1` in `gpu_regs.cyr` (verify at P0 — the DCN 2.1 register segment) |
 

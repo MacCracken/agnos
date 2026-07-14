@@ -5,6 +5,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.9] — 2026-07-14 — P3a-2: Azalia window discriminator (D3 vs wrong-offset)
+
+The 1.55.8 probe read `hpc=0` on all four Azalia endpoints. That is **two very different diagnoses wearing
+the same symptom**: either the AZ block is in D3 (needing an SMU PME mailbox) or our F0 index-window
+offsets/ordinals are wrong. Implementing an SMU mailbox to work around a typo would be an expensive mistake,
+so this settles it with a read before any of that gets written.
+
+### Added
+
+- **Azalia index-window discriminator** (`kernel/core/gpu.cyr` `gpu_audio_probe`): **write the endpoint index
+  register, then read it back.**
+  - `back == what we wrote` ⇒ the window is **powered and reachable** ⇒ **not D3**; a zero DATA read then
+    means the endpoint register really is 0, or the ix ordinal is wrong.
+  - `back == 0 / all-ones` ⇒ the write was **dropped** ⇒ D3 (or a bad offset).
+  Also dumps the pre-touch reset state and two more F0 ordinals — `RESPONSE_CONFIGURATION_DEFAULT` (0x56; a
+  real endpoint's `PORT_CONNECTIVITY` is not all-zero) and `CONVERTER_CONTROL_CHANNEL_STREAM_ID` (0x03;
+  should echo agnos's HDA stream tag if bound). **If every ordinal reads 0 on a live window, the ordinals are
+  the suspect, not the power state** — which is the distinction that decides the next bite.
+  Verdict: `audio endpoint window alive on N of 4` or `audio endpoint window dead (D3 or wrong offset)`.
+
+### Iron results recorded from 1.55.8 (archaemenid)
+
+- **The display is on HDMI, not DP** — the plan table's "DP output 2" was **wrong** (operator confirmed the
+  physical cable; ask, don't derive). Iron: `DP_DTO0_ENABLE`=0, `DP_VID_STREAM_ENABLE`=0.
+- **Live encoder = DIG1** — the only one with both `DIG_ENABLE` and `SYMCLK_FE_ON`.
+- **`DIG_MODE = 2` = DVI, not 3 = HDMI.** The GOP lit the link in **DVI signaling** — legal on an HDMI sink,
+  but it carries **no audio and no infoframes**. This gates audio *below* the DTO/AFMT layer: reaching audio
+  needs a DVI→HDMI mode change on the live link.
+- **DPREFCLK measured = 598,875,000 Hz** (not the nominal 600 MHz) — a real **0.1875% spread-spectrum
+  downspread**, read directly. This also **iron-validates the seg1/DCCG base correction** from 1.55.8.
+- **Audio DTOs unprogrammed** (`dto0=0/1 dto1=0/1`) — the GOP does video only, as expected.
+
+Remaining P3b prerequisites (the HDMI path is materially bigger than DP would have been): AZ wake (this bite
+decides whether that is even needed) → pixel-clock discovery (`pixclk=0`; HDMI needs it for both
+`DTO0_MODULE` and ACR CTS) → DVI→HDMI DIG mode change → DTO/AFMT/ACR.
+
+Iron-only; flash `--update-all` then `run /bin/klug > p3a2.txt`.
+
 ## [1.55.8] — 2026-07-14 — P3a: display-audio state probe (read-only) — DMCUB is NOT gating
 
 The 1.53.5 HDA work streams a tone into the GPU's audio function (04:00.1) — codec enumerated, digital pin

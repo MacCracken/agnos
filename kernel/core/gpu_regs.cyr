@@ -146,6 +146,8 @@ var GPU_R_AZ_ENDPOINT_INDEX   = 0x386;  # AZF0ENDPOINTk_ENDPOINT_INDEX (write ix
 var GPU_R_AZ_ENDPOINT_DATA    = 0x387;  # then read/write DATA
 var GPU_DCN_AZ_STRIDE         = 0x6;
 var GPU_AZ_IX_HOT_PLUG_CONTROL = 0x54;  # F0 ordinal: CLOCK_ON_STATE b4 (RO), AUDIO_ENABLED b31 — the D3 gate
+var GPU_AZ_IX_RESPONSE_CFG_DEF = 0x56;  # F0 ordinal: PORT_CONNECTIVITY[31:30] — a real endpoint is NOT all-zero
+var GPU_AZ_IX_CONV_STREAM_ID   = 0x03;  # F0 ordinal: STREAM_ID[7:4] — should echo agnos's HDA stream tag if bound
 
 # --- Field masks ---
 var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id (reads 0x0 on Cezanne — quirk)
