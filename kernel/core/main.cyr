@@ -902,6 +902,11 @@ gpu_shader_dispatch3();
 # primitive before rosnet matmul (C2g-4). Gated on C2g-2 inside gpu_shader_dispatch4().
 gpu_shader_dispatch4();
 
+# GPU arc C2g-4 (1.54.x) — THE CROWN: real integer tiled matmul C[8x8]=A*B on the shader cores, each of
+# 64 lanes computing one output element via the proven kernarg + loop + MAC primitives, bit-correct vs the
+# CPU. This is the matmul that attn11/tentib ML layers ride onto the GPU. Gated on C2g-3 in dispatch5().
+gpu_shader_dispatch5();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

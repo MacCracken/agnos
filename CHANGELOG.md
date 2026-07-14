@@ -5,6 +5,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.29] — 2026-07-13 — GPU arc C2g-4 (THE CROWN): integer tiled matmul on the shader cores
+
+### Added
+
+- **C2g-4 — real integer tiled matmul `C[8×8] = A[8×8] × B[8×8]` on the GPU shader cores** (`kernel/core/gpu.cyr`
+  `gpu_shader_dispatch5` + `kernel/core/gpu_regs.cyr`): each of the 64 lanes computes one output element
+  `C[i][j] = Σ_{k=0..7} A[i*8+k] * B[k*8+j]` — `tid → i=tid>>3, j=tid&7`; the lane walks row `i` of A (+4 per
+  step) and **column `j` of B** (+32 per step = N*4), accumulating over K in a real branch loop with
+  `v_mul_lo_u32` / `v_add_u32`. Result verified **bit-for-bit against the CPU matmul reference**. Built from
+  the primitives proven in C2g-1..C2g-3 (parallel dispatch + kernarg pointers + loop + integer MAC); the only
+  new logic is the 2D index decomposition (`v_lshrrev` / `v_and`) and the strided B access — all 41 shader
+  dwords `llvm-mc -mcpu=gfx90c` ground-truth. Same kernarg ABI (3 pointers A/B/C, `RSRC2=0x0C` USER_SGPR=6,
+  12 VGPRs). Gated on C2g-3; same bounded wedge-safe envelope. Iron-only; flash `--update-all`. PASS =
+  `gpu: integer matmul online (8x8, bit-correct vs CPU)` — **a real matrix multiply running on the sovereign
+  AMD GPU (no amdgpu / no ROCm)**, the seam attn11/tentib ML layers ride onto the GPU (C2h wires the ring-3
+  `gpu_*` band next). Follow-on: the f64 `rosnet`-bit-correct variant for attn11's full-precision path.
+
 ## [1.54.28] — 2026-07-13 — GPU arc C2g-3: ALU + reduction loop (matmul's inner loop)
 
 ### Added

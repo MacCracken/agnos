@@ -312,3 +312,12 @@ var GPU_DOT_N                 = 256;         # input element count = 64 lanes * 
 var GPU_DOT_A_SUBOFF          = 0x19000;     # input a[256] (a[i]=i+1)
 var GPU_DOT_B_SUBOFF          = 0x19400;     # input b[256] (b[i]=i+2)
 var GPU_DOT_OUT_SUBOFF        = 0x19800;     # output[64] (out[tid] = dot product)
+
+# C2g-4 — THE CROWN: real integer tiled matmul C[8x8] = A[8x8] * B[8x8]. Each of 64 lanes computes one
+# output element C[i][j] = sum_{k=0..7} A[i*8+k] * B[k*8+j] (tid -> i=tid>>3, j=tid&7; A walks a row +4/step,
+# B walks a column +32/step = N*4). Bit-correct vs the CPU reference. Same kernarg ABI as C2g-3 (RSRC2=0x0C,
+# 12 VGPRs, USER_DATA_0..5 = A,B,C). The matmul structure that attn11/tentib ML layers ride onto the GPU.
+var GPU_MM_DIM               = 8;           # 8x8 (M=N=K=8 => 64 output elements = 64 lanes)
+var GPU_MM_A_SUBOFF          = 0x1A000;     # A[64] (row-major, A[i]=i+1)
+var GPU_MM_B_SUBOFF          = 0x1A400;     # B[64] (row-major, B[i]=i+1)
+var GPU_MM_C_SUBOFF          = 0x1A800;     # C[64] output (C[tid] = matmul element)
