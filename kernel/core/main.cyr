@@ -907,6 +907,13 @@ gpu_shader_dispatch4();
 # CPU. This is the matmul that attn11/tentib ML layers ride onto the GPU. Gated on C2g-3 in dispatch5().
 gpu_shader_dispatch5();
 
+# GPU arc f64 (1.54.x) — full-precision 8x8 matmul on the shader cores (attn11's path): the integer
+# crown with f64 (8-byte) elements — global_load/store_dwordx2, v_fma_f64 MAC, 16 VGPRs. Seeds
+# A[i]=B[i]=(i+1).0 and verifies each C[tid] bit-for-bit vs the CPU reference (exact-integer data, no
+# rounding). Proves f64 matmul EXECUTES + is bit-correct here; FMA-vs-rosnet fidelity is a follow-on.
+# Gated on the integer matmul (engines proven) inside gpu_shader_dispatch_f64().
+gpu_shader_dispatch_f64();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif

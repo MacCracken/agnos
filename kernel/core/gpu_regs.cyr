@@ -321,3 +321,17 @@ var GPU_MM_DIM               = 8;           # 8x8 (M=N=K=8 => 64 output elements
 var GPU_MM_A_SUBOFF          = 0x1A000;     # A[64] (row-major, A[i]=i+1)
 var GPU_MM_B_SUBOFF          = 0x1A400;     # B[64] (row-major, B[i]=i+1)
 var GPU_MM_C_SUBOFF          = 0x1A800;     # C[64] output (C[tid] = matmul element)
+
+# f64 — full-precision 8x8 matmul C[8x8] = A[8x8] * B[8x8] on the shader cores (attn11's full-precision
+# path). Same tiled structure as the integer crown, but f64 (8-byte) elements: global_load/store_dwordx2
+# into register pairs, v_fma_f64 MAC, and doubled address strides (A row +64, A step +8, B step +64, C
+# tid*8). Test data A[x]=B[x]=(x+1).0 -> every C[i][j] is an exact integer < 2^15 (exactly representable),
+# so the burn proves f64 matmul EXECUTION + bit-correctness for exact-integer data; the FMA-vs-rosnet
+# fidelity test (non-exact data + a fused-fma CPU reference in the same k-order) is a follow-on.
+var GPU_COMPUTE_PGM_RSRC1_F64  = 0x002C0043; # RSRC1 VGPRS=3 (16 VGPRs): the f64 shader uses v0..v13 (14),
+                                             # which rounds up to 16 at granularity-4. The 2->3 bump is
+                                             # MANDATORY — field=2 (12 VGPRs) would under-allocate + corrupt
+                                             # the v[12:13] f64 accumulator. FLOAT_MODE=0xC0 (f64 denorms + RNE).
+var GPU_MMF_A_SUBOFF         = 0x1B000;     # f64 A[64] (row-major, A[i]=(i+1).0) — 512 bytes
+var GPU_MMF_B_SUBOFF         = 0x1B400;     # f64 B[64] (row-major, B[i]=(i+1).0) — 512 bytes
+var GPU_MMF_C_SUBOFF         = 0x1B800;     # f64 C[64] output (C[tid] = matmul element) — 512 bytes

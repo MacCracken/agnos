@@ -5,6 +5,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.31] — 2026-07-13 — GPU arc f64: full-precision matmul on the shader cores (attn11's path)
+
+### Added
+
+- **f64 8×8 matmul on the GPU shader cores** (`kernel/core/gpu.cyr` `gpu_shader_dispatch_f64` +
+  `gpu_matmul_write_shader_f64` + `kernel/core/gpu_regs.cyr`): the integer crown (C2g-4) in full precision —
+  each of 64 lanes computes `C[i][j] = Σ_{k=0..7} A[i*8+k]·B[k*8+j]` in **f64**. Three ISA changes vs the
+  integer shader, all `llvm-mc -mcpu=gfx90c` verified: `global_load_dwordx2` / `global_store_dwordx2` (64-bit
+  loads/stores into register pairs), `v_fma_f64` for the fused multiply-accumulate, and doubled address
+  strides (A row `i*64`, `+8`/k; B `+64`/k; C `tid*8`). `RSRC1 = 0x002C0043` (16 VGPRs — the f64 pairs need
+  the headroom; `FLOAT_MODE=0xC0` = f64 denorms + round-to-nearest-even, matching a CPU reference). Seeds
+  `A[i]=B[i]=(i+1).0`; **verified bit-for-bit** against the CPU reference with **zero kernel FPU** — the
+  expected integer result (every `C[i][j]` is an exact integer < 2¹⁵, exactly representable) is converted to
+  its IEEE-754 double bit pattern in pure i64 (`u64_to_f64_bits`) and compared to the raw 8 bytes the GPU
+  wrote. The 41 shader dwords were adversarially cross-verified (5-lens workflow: encoding, register hazards,
+  matmul indexing, dispatch config, verify strategy) and diffed byte-for-byte against llvm-mc.
+- **Scope**: this proves f64 matmul **executes on the shader cores and is bit-correct for exact-integer
+  data**. It does not yet prove FMA-vs-`rosnet` bit fidelity — exact-integer data never rounds, so it can't
+  distinguish fused FMA from separate mul-then-add. The fidelity burn (non-exact operands + a fused-`fma()`
+  CPU reference in the identical k-accumulation order) is the follow-on that earns the "rosnet-bit-correct"
+  claim.
+
+### Changed
+
+- **`gpu_matmul_run` parameterized by `rsrc1`** (`kernel/core/gpu.cyr`): the shared dispatch envelope now
+  takes the `COMPUTE_PGM_RSRC1` value as an argument so the integer paths (C2g-4 boot proof + the C2h #82
+  syscall) pass the 12-VGPR value and the f64 path passes the 16-VGPR value — one source of truth for the
+  PM4 envelope, behaviourally unchanged for the integer callers.
+
+Iron-only (no-ops under QEMU — GPU absent); flash `--update-all`. PASS = `gpu: f64 matmul online (8x8,
+bit-correct vs CPU)` printed right after the integer `gpu: integer matmul online …` line — **full-precision
+f64 matmul running on the sovereign AMD GPU shader cores** (no amdgpu / no ROCm), attn11's arithmetic.
+
 ## [1.54.30] — 2026-07-13 — GPU arc C2h: ring-3 GPU-compute dispatch (the userspace seam)
 
 ### Added
