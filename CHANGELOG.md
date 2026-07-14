@@ -5,6 +5,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.5] — 2026-07-14 — The double-buffered present loop (tear-free, paced by the display's own clock)
+
+### Changed
+
+- **P1's single flip is now a real double-buffered PRESENT LOOP** (`kernel/core/gpu.cyr` `gpu_display_flip`):
+  two buffers, alternated, **8 paced flips** held 15 vblanks each (~250 ms) — the panel alternates blue/green
+  for ~2 s, then the console is restored. The loop body is the actual present cycle:
+  `flip → wait_vblank (the hardware took it) → the other buffer is yours → repeat`. **There is no `udelay`
+  anywhere in it** — the entire loop is paced by the display's own frame clock. It is tear-free because DCN
+  latches the surface address and swaps during blank. Each flip is verified by readback; the verdict counts
+  how many of the 8 landed. PASS = `gpu: display double-buffered present online (8 paced flips)`;
+  `present incomplete (N of 8 …)` localizes a lost latch or a missed boundary.
+- **Two buffers instead of one** (`gpu_regs.cyr`): buffer A at VRAM offset 1 GB (`GPU_FB_BACK_OFF`, blue),
+  buffer B one 2 MB-aligned span later (green) — both clear of the console FB (offset 0), the PSP TMR
+  (1.5 GB) and the compute arena (2 GB). **The console's own buffer is never touched**, so the restore
+  brings back an intact console.
+
+This completes the present primitive on real silicon: P0 (read the pipe) + P1 (re-point the scanout) + P2
+(pace on vblank) + this (the loop). Iron-only; flash `--update-all`, watch for ~2 s of blue/green alternation,
+then `run /bin/klug`.
+
+### Note — blit#39 double-buffering is a deliberate open decision
+
+Wiring this into `blit`#39 raises display **ownership**, not just plumbing. blit#39 is the *graphical takeover*
+path (DOOM/fbtest full-screen, never interleaved with console text). If blit auto-flips to a back buffer, then
+**when the app exits nothing flips back and the console is invisible** — normally a compositor's job. Options:
+make double-buffering **opt-in** (a `present` syscall or a blit flag, so unmodified DOOM keeps today's
+behavior), or **flip-on-blit** plus a console-restore hook. Each has consequences for the aethersafha seam, so
+it is left as an explicit decision rather than picked by default. The primitive is proven and ready either way.
+
 ## [1.55.4] — 2026-07-14 — P2: vblank pacing (the present-loop primitive)
 
 ### Added
