@@ -5,6 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.54.33] — 2026-07-14 — GPU arc: #82 pointer-hardening + f64 ring-3 seam (#83)
+
+### Added
+
+- **f64 ring-3 GPU-compute dispatch — syscall #83 `gpu_dispatch_f64(a, b, c)`** (`kernel/core/gpu.cyr`
+  `gpu_dispatch_f64_sys`): the full-precision peer of #82. A,B are 64 f64 (512 bytes each); the kernel copies
+  them into the carveout, runs the rosnet-matching mul+add f64 shader (`RSRC1_F64` = 16 VGPRs), and writes
+  `C = A·B` (64 f64) back. This is **attn11's path to the GPU from ring 3** — a userspace program gets
+  rosnet-bit-correct f64 matmul on the shader cores. Same pointer hardening as #82.
+- **gpumm 0.2.0 — f64 test** (`../gpumm`): the userspace probe now runs both matmuls. The f64 test fills
+  `A[i]=B[i]=(i+1)·0x1234567` (rounding data) and verifies each output with the same `f64_mul`/`f64_add`
+  builtins rosnet uses, proving **rosnet-bit-correct f64 matmul from ring 3**:
+  `gpu: userspace f64 matmul OK (64/64 rosnet-bit-correct)`. QEMU-smoked (both #82 and #83 load, dispatch,
+  take the clean GPU-absent `-1`, no fault).
+
+### Changed
+
+- **#82 `gpu_dispatch` pointer hardening** (`kernel/core/gpu.cyr` `gpu_dispatch_sys`): a wild ring-3 pointer
+  can no longer steer the copy into kernel memory or #PF the kernel. `is_user_range` rejects out-of-range
+  pointers (kernel addresses, wrap, above the 1 GB user ceiling) — the readdir#81/uname#34 norm; the A/B
+  reads now go through `proc_copy_from_user`, which page-walks the caller's CR3 and refuses any not-present
+  / non-user page (returns 0) instead of a blind deref; and the C write-back is preceded by a present+user
+  page-walk verify (no `proc_copy_to_user` primitive exists, so validate-then-store). New error codes:
+  -4 pointer out of user range, -5 user page not mapped.
+
+Iron-only; flash `--update-all` then `run /bin/gpumm`. Both lines print: `gpu: userspace matmul OK (64/64
+bit-correct vs CPU)` (int, #82) and `gpu: userspace f64 matmul OK (64/64 rosnet-bit-correct)` (f64, #83) —
+**a ring-3 program running both int and rosnet-bit-correct f64 matmul on the sovereign AMD GPU.**
+
 ## [1.54.32] — 2026-07-13 — GPU arc f64 fidelity: rosnet-bit-correct matmul (the FMA-vs-mul+add proof)
 
 ### Added

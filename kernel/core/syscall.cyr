@@ -1547,6 +1547,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
     # GPU compute dispatch (#82) — C2h ring-3 seam: run the proven 8x8 integer matmul on the caller's
     # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.
     if (num == 82) { stack_canary_check(canary); return gpu_dispatch_sys(arg1, arg2, arg3); }                # gpu_dispatch(a, b, c)
+    # GPU f64 compute dispatch (#83) — full-precision peer of #82: 64 f64 A,B -> C = A·B (rosnet-bit-correct
+    # mul+add), the path attn11 rides to run f64 matmul on the GPU from ring 3. -> 0 ok / <0 err.
+    if (num == 83) { stack_canary_check(canary); return gpu_dispatch_f64_sys(arg1, arg2, arg3); }            # gpu_dispatch_f64(a, b, c)
     if (num == 34) {
         # uname(buf=arg1, len=arg2) — writes the 64-byte identity struct: four
         # 16-byte NUL-padded fields at offsets 0/16/32/48 = sysname / nodename /

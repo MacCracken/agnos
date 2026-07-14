@@ -1859,6 +1859,15 @@ fn gpu_dispatch_sys(a_uva, b_uva, c_uva) {
     if (gpu_arena_mc == 0)  { return 0 - 1; }
     if (gpu_ring_wptr == 0) { return 0 - 1; }
 
+    # Pointer hardening: A,B,C each hold 64 i32 = 256 bytes. Reject out-of-range pointers (kernel
+    # addresses, wrap, above the 1 GB user ceiling) — the readdir#81/uname#34 norm — so a wild ring-3
+    # pointer can never steer the copy into kernel memory.
+    var nbytes = GPU_MM_DIM * GPU_MM_DIM * 4;   # 256
+    if (is_user_range(a_uva, nbytes) == 0) { return 0 - 4; }
+    if (is_user_range(b_uva, nbytes) == 0) { return 0 - 4; }
+    if (is_user_range(c_uva, nbytes) == 0) { return 0 - 4; }
+    var cr3 = proc_get_cr3(proc_current_get());
+
     var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
     var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;
     var a_phys      = gpu_arena_phys + GPU_MM_A_SUBOFF;
@@ -1870,15 +1879,15 @@ fn gpu_dispatch_sys(a_uva, b_uva, c_uva) {
     var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
     var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
 
-    # Copy caller A,B into the carveout; clear C.
+    # Fault-proof copy A,B from userspace into the carveout: proc_copy_from_user page-walks the caller's
+    # CR3 and refuses any not-present / non-user page (returns 0) instead of a blind deref that could #PF
+    # the kernel on a wild-but-in-range pointer.
+    if (proc_copy_from_user(cr3, a_phys, a_uva, nbytes) == 0) { return 0 - 5; }
+    if (proc_copy_from_user(cr3, b_phys, b_uva, nbytes) == 0) { return 0 - 5; }
     var n = GPU_MM_DIM * GPU_MM_DIM;
     var s = 0;
-    while (s < n) {
-        store32(a_phys + (s << 2), load32(a_uva + (s << 2)) & 0xFFFFFFFF);
-        store32(b_phys + (s << 2), load32(b_uva + (s << 2)) & 0xFFFFFFFF);
-        store32(c_phys + (s << 2), GPU_MT_NOTYET);
-        s = s + 1;
-    }
+    while (s < n) { store32(c_phys + (s << 2), GPU_MT_NOTYET); s = s + 1; }
+
     gpu_matmul_write_shader(shader_phys);
     gpu_mfence();
 
@@ -1887,7 +1896,10 @@ fn gpu_dispatch_sys(a_uva, b_uva, c_uva) {
     if (fault != 0) { return 0 - 3; }
     if (ok != 1)    { return 0 - 2; }
 
-    # Copy C back to the caller.
+    # Fault-proof the write-back: no proc_copy_TO_user primitive exists, so confirm C's user pages are
+    # present+user first (page-walk into a_phys, now free — its A copy was already consumed by the
+    # dispatch), then the direct store32 loop cannot #PF.
+    if (proc_copy_from_user(cr3, a_phys, c_uva, nbytes) == 0) { return 0 - 5; }
     s = 0;
     while (s < n) {
         store32(c_uva + (s << 2), load32(c_phys + (s << 2)) & 0xFFFFFFFF);
@@ -2132,5 +2144,58 @@ fn gpu_shader_dispatch_f64_fidelity() {
     }
     gpu_f64_fidelity_ok = 0 - 1;
     kprintln("gpu: f64 fidelity dispatch did not complete", 43);
+    return 0;
+}
+
+# === f64 ring-3 GPU-compute dispatch (syscall #83) ===
+# gpu_dispatch_f64(a_uva, b_uva, c_uva): the FULL-PRECISION ring-3 seam. Same as #82 but f64 — A,B are 64
+# f64 (512 bytes each), runs the rosnet-matching mul+add f64 shader (RSRC1_F64 = 16 VGPRs), writes C = A·B
+# (64 f64) back. This is attn11's path to the GPU from userspace: a ring-3 program gets rosnet-bit-correct
+# f64 matmul on the shader cores. Same pointer hardening as #82. Returns 0 ok; -1 GPU/f64 not ready;
+# -2 dispatch did not complete; -3 VM fault; -4 pointer out of user range; -5 user page not mapped.
+fn gpu_dispatch_f64_sys(a_uva, b_uva, c_uva) {
+    if (gpu_present == 0)       { return 0 - 1; }
+    if (gpu_matmul_f64_ok != 1) { return 0 - 1; }   # f64 pipeline proven at boot
+    if (gpu_arena_mc == 0)      { return 0 - 1; }
+    if (gpu_ring_wptr == 0)     { return 0 - 1; }
+
+    var nbytes = GPU_MM_DIM * GPU_MM_DIM * 8;   # 512 (64 f64)
+    if (is_user_range(a_uva, nbytes) == 0) { return 0 - 4; }
+    if (is_user_range(b_uva, nbytes) == 0) { return 0 - 4; }
+    if (is_user_range(c_uva, nbytes) == 0) { return 0 - 4; }
+    var cr3 = proc_get_cr3(proc_current_get());
+
+    var shader_phys = gpu_arena_phys + GPU_SHADER_SUBOFF;
+    var shader_mc   = gpu_arena_mc   + GPU_SHADER_SUBOFF;
+    var a_phys      = gpu_arena_phys + GPU_MMF_A_SUBOFF;
+    var a_mc        = gpu_arena_mc   + GPU_MMF_A_SUBOFF;
+    var b_phys      = gpu_arena_phys + GPU_MMF_B_SUBOFF;
+    var b_mc        = gpu_arena_mc   + GPU_MMF_B_SUBOFF;
+    var c_phys      = gpu_arena_phys + GPU_MMF_C_SUBOFF;
+    var c_mc        = gpu_arena_mc   + GPU_MMF_C_SUBOFF;
+    var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
+    var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
+
+    if (proc_copy_from_user(cr3, a_phys, a_uva, nbytes) == 0) { return 0 - 5; }
+    if (proc_copy_from_user(cr3, b_phys, b_uva, nbytes) == 0) { return 0 - 5; }
+    var n = GPU_MM_DIM * GPU_MM_DIM;
+    var s = 0;
+    while (s < n) { store64(c_phys + (s << 3), 0); s = s + 1; }
+
+    gpu_matmul_write_shader_f64(shader_phys);
+    gpu_mfence();
+
+    var ok = gpu_matmul_run(shader_mc, a_mc, b_mc, c_mc, done_mc, done_phys, GPU_COMPUTE_PGM_RSRC1_F64);
+    var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+    if (fault != 0) { return 0 - 3; }
+    if (ok != 1)    { return 0 - 2; }
+
+    # Fault-proof the write-back (present+user check into a_phys, now free), then store.
+    if (proc_copy_from_user(cr3, a_phys, c_uva, nbytes) == 0) { return 0 - 5; }
+    s = 0;
+    while (s < n) {
+        store64(c_uva + (s << 3), load64(c_phys + (s << 3)));
+        s = s + 1;
+    }
     return 0;
 }
