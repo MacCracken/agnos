@@ -86,10 +86,11 @@ var GPU_HUBP_BLANK_EN       = 0x1;   # DCHUBP_CNTL bit0
 # carveout's direct DRAM window (fb_off + this, WC-mapped — the compute arc's proven path); the HUBP fetches
 # it at fb_base + this.
 var GPU_FB_BACK_OFF         = 0x40000000;
-var GPU_FB_BACK_FILL        = 0xFF0000FF; # buffer A: solid blue (ARGB8888)
-var GPU_FB_BACK_FILL2       = 0xFF00FF00; # buffer B: solid green — alternating A/B makes each present visible
-var GPU_FB_PRESENT_FRAMES   = 8;          # paced flips in the present-loop proof
-var GPU_FB_PRESENT_HOLD     = 15;         # vblanks held per frame (~250 ms at 60 Hz) — visible, still paced
+# HARD BOUND: both back buffers must END before the PSP TMR (1.5 GB into the carveout; the compute arena
+# follows at 2 GB = GPU_VM_ARENA_OFF). That leaves 512 MB from GPU_FB_BACK_OFF — ample even at 4K
+# (2 x ~33 MB) — but it is a GUARD, not an assumption: a quirky/hostile GOP geometry must fall back to the
+# direct FB rather than scribble the buffers over the TMR or the arena.
+var GPU_FB_BACK_LIMIT       = 0x60000000;
 
 # --- Field masks ---
 var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id (reads 0x0 on Cezanne — quirk)

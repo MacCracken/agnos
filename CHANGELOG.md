@@ -5,6 +5,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.7] — 2026-07-14 — Display arc cleanup + hardening pass
+
+DOOM renders through the sovereign display stack on iron (1.55.6, archaemenid) — probed, re-pointed,
+vblank-paced, double-buffered, no amdgpu. The scaffolding that proved each step comes out, and the paths it
+left behind get hardened.
+
+### Fixed
+
+- **The crash path now releases the display** (`kernel/core/syscall.cyr` `fault_kill_current`): the per-pid
+  release chain has **two** sites — `exit`#0 and `fault_kill_current` (a proc killed by a fault, which
+  mirrors exit#0) — and 1.55.6 only wired `gpu_release_pid` into the first. **A full-screen app that FAULTED
+  would have stranded its last frame on the panel forever** while console text scrolled invisibly into a
+  buffer nothing was scanning. The crash path must mirror exit#0 exactly; it now does.
+- **Hard bound on the back buffers** (`gpu_blit_arm` + `GPU_FB_BACK_LIMIT`): both buffers must END before
+  the PSP TMR (1.5 GB into the carveout; the compute arena follows at 2 GB). That leaves 512 MB from
+  `GPU_FB_BACK_OFF` — ample even at 4K (2 × ~33 MB) — but it is now a **guard, not an assumption**: a
+  quirky or hostile GOP geometry falls back to the direct FB rather than scribbling the buffers over the
+  TMR or the compute arena.
+
+### Removed
+
+- **The boot present-loop demo** (`gpu_display_flip` + `GPU_FB_BACK_FILL`/`FILL2`/`PRESENT_FRAMES`/`HOLD` +
+  `gpu_flip_ok`): the ~2 s blue/green alternation proved the flip (1.55.3) and the paced present loop
+  (1.55.5) on iron, and blit#39 (1.55.6) is now the real consumer — so the scaffolding costs every boot 2 s
+  and a flashing panel for nothing. Same disposal as the P0 diagnostic. −2,576 B. The primitives it proved
+  (`gpu_display_wait_vblank`, `gpu_blit_arm`/`_target`/`_present`, `gpu_display_restore_console`) all stay —
+  they are what blit#39 runs on.
+
+The boot display lines that remain are the health checks, not demos: `display pipe 0 live (scanout matches
+framebuffer)` (P0) and `display vblank pacing online (frame counter + blank)` (P2). Verified: build green,
+check 11/0, all touched files fmt-stable, no dangling references.
+
 ## [1.55.6] — 2026-07-14 — blit#39 double-buffered: tear-free full-screen apps, no app change
 
 The payoff of the display arc. `blit`#39 is the graphical-TAKEOVER path (doom/fbtest draw full-screen and

@@ -385,6 +385,10 @@ fn fault_kill_current(vector) {
     proc_set_exit_code(pid, code);
     flock_release_pid(pid);                       # release advisory locks (mirror exit#0)
     snd_release_pid(pid);                         # release any snd#64 audio slot (Gate 2)
+    gpu_release_pid(pid);                         # 1.55.x: hand the scanout back to the console. Without
+    # this a full-screen app that FAULTS would strand its last
+    # frame on the panel forever while the console scrolled
+    # invisibly — the crash path must mirror exit#0 exactly.
     if (pid < proc_count) {
         proc_set_state(pid, 0);                   # mark dead — sched_next won't pick it
         # 1.53.x B3b: clear this CPU's FP owner if it named the dying proc, so a recycled

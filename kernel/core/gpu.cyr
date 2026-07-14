@@ -47,7 +47,6 @@ var gpu_f64_fidelity_ok = 0; # f64 fidelity: 1 = rosnet-bit-correct on NON-exact
 var gpu_display_ok    = 0;   # P0 (1.55.x display arc): 1 = lit HUBP scanout matches fb_phys; -1 no match; -2 surface matched but no OTG lit
 var gpu_display_pipe  = 0 - 1; # P0: the HUBP instance scanning out our console (P1 re-points this one)
 var gpu_display_surf  = 0;   # P0: that pipe's FRONT surface MC address (the P1 restore target)
-var gpu_flip_ok       = 0;   # P1: 1 = scanout re-pointed to our back buffer + restored; -1 flip didn't latch; -2 restore didn't latch; -3 no frame boundary
 var gpu_vblank_ok     = 0;   # P2: 1 = frame counter advances + both scan phases observable (the pacing signal); -1 counter stuck; -2 no blank; -3 no active
 # blit#39 double-buffering (tear-free full-screen apps). Falls back to the direct FB when unarmed.
 var gpu_bb_armed      = 0;   # 1 = the two app buffers are WC-mapped + cleared
@@ -2356,109 +2355,6 @@ fn gpu_display_vblank() {
     return 1;
 }
 
-# === 1.55.x display arc — P1: the scanout flip (the FIRST DCN WRITE) ===
-# gpu_display_flip — re-point the lit pipe's HUBP scanout to a back buffer we own, hold it so the swap is
-# visible on the panel, then restore the console. This is the primitive a tear-free double-buffered present
-# is built from: render into a back buffer, then write ONE register pair to swap it in. DCN latches the
-# surface address and swaps at the next vblank — that hardware latch is what makes the swap tear-free (P2
-# then paces the render against vblank).
-#
-# The back buffer lives at VRAM offset GPU_FB_BACK_OFF (1 GB) — clear of the console FB (offset 0), the PSP
-# TMR (1.5 GB) and the compute arena (2 GB). The CPU writes it through the carveout's direct DRAM window
-# (fb_off + off, WC-mapped — the compute arc's proven CPU→carveout path); the HUBP fetches the same pixels
-# at fb_base + off. Write order is HIGH then LOW: the LOW write is the trigger that latches the pair.
-#
-# SAFETY — this writes the register driving the panel the operator is reading: the back buffer is FILLED
-# before the flip so the pipe never scans garbage; the front address is restored afterwards so the console
-# returns; both writes are read back and reported. Gated on P0 (which proved the pipe + its front address).
-# Worst case is a wrong-looking screen until the restore lands — reboot-recoverable, no hang.
-fn gpu_display_flip() {
-    gpu_flip_ok = 0;
-    if (gpu_present == 0) { return 0; }
-    if (gpu_display_ok != 1) { return 0; }     # P0 must have identified the lit pipe
-    if (gpu_display_pipe < 0) { return 0; }
-    if (gpu_display_surf == 0) { return 0; }
-
-    var bi = load64(&boot_info_ptr);
-    if (bi == 0) { return 0; }
-    var pitch  = load32(bi + 0x50) & 0xFFFFFFFF;   # bytes per scanline
-    var height = load32(bi + 0x58) & 0xFFFFFFFF;
-    if (pitch == 0) { return 0; }
-    if (height == 0) { return 0; }
-    var fb_size = pitch * height;
-
-    var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
-    var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
-    var fb_off  = r_off << 24;      # carveout CPU-phys base — the CPU's direct DRAM window onto VRAM
-    var fb_base = r_base << 24;     # carveout MC base — the GPU's view of the same memory
-    # TWO buffers, a 2 MB-aligned span apart — both clear of the console FB (offset 0), the PSP TMR
-    # (1.5 GB) and the compute arena (2 GB). The console's own buffer is never touched, so the restore
-    # brings back an intact console.
-    var span = ((fb_size + 0x1FFFFF) >> 21) << 21;
-    var a_phys = fb_off  + GPU_FB_BACK_OFF;
-    var a_mc   = fb_base + GPU_FB_BACK_OFF;
-    var b_phys = a_phys + span;
-    var b_mc   = a_mc   + span;
-
-    # WC-map + FILL both ONCE (distinct colours so every present is visible) — never scan garbage.
-    var p = 0;
-    while (p < span) { vmm_remap_wc_2mb(a_phys + p); vmm_remap_wc_2mb(b_phys + p); p = p + 0x200000; }
-    var fa  = (GPU_FB_BACK_FILL  << 32) | GPU_FB_BACK_FILL;    # two ARGB pixels per store64
-    var fbv = (GPU_FB_BACK_FILL2 << 32) | GPU_FB_BACK_FILL2;
-    var q = 0;
-    while (q < fb_size) { store64(a_phys + q, fa); store64(b_phys + q, fbv); q = q + 8; }
-    gpu_mfence();
-
-    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
-    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
-
-    # THE PRESENT LOOP — alternate the two buffers, every swap paced on the display's OWN frame clock.
-    # There is no udelay anywhere in here: flip -> wait_vblank (the hardware took it) -> the other buffer
-    # is ours to render into -> repeat. That is the double-buffered present, and it is tear-free because
-    # DCN latches the surface address and swaps during blank.
-    var landed = 0;
-    var f = 0;
-    while (f < GPU_FB_PRESENT_FRAMES) {
-        var tgt = a_mc;
-        if ((f & 1) != 0) { tgt = b_mc; }
-        gpu_reg32_write(GPU_BASE_DCN_2, shi, (tgt >> 32) & 0xFFFF);   # HIGH then LOW (LOW triggers)
-        gpu_reg32_write(GPU_BASE_DCN_2, slo, tgt & 0xFFFFFFFF);
-        gpu_mfence();
-        if (gpu_display_wait_vblank(gpu_display_pipe) == 1) {          # block until the HW took it
-            var rlo = gpu_reg32(GPU_BASE_DCN_2, slo) & 0xFFFFFFFF;
-            var rhi = gpu_reg32(GPU_BASE_DCN_2, shi) & 0xFFFF;
-            if (((rhi << 32) | rlo) == tgt) { landed = landed + 1; }
-        }
-        var v = 0;                                                     # hold — still vblank-paced
-        while (v < GPU_FB_PRESENT_HOLD) { gpu_display_wait_vblank(gpu_display_pipe); v = v + 1; }
-        f = f + 1;
-    }
-
-    # RESTORE — the console's front buffer, paced.
-    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_display_surf >> 32) & 0xFFFF);
-    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_display_surf & 0xFFFFFFFF);
-    gpu_mfence();
-    gpu_display_wait_vblank(gpu_display_pipe);
-    var blo = gpu_reg32(GPU_BASE_DCN_2, slo) & 0xFFFFFFFF;
-    var bhi = gpu_reg32(GPU_BASE_DCN_2, shi) & 0xFFFF;
-    var rst = (bhi << 32) | blo;
-
-    if (rst != gpu_display_surf) {
-        gpu_flip_ok = 0 - 2;
-        kprintln("gpu: display flip restore did not latch", 39);
-        return 0;
-    }
-    if (landed != GPU_FB_PRESENT_FRAMES) {
-        gpu_flip_ok = 0 - 1;
-        kprint("gpu: display present incomplete (", 33);
-        kprint_num(landed);
-        kprintln(" of 8 paced flips landed)", 25);
-        return 0;
-    }
-    gpu_flip_ok = 1;
-    kprintln("gpu: display double-buffered present online (8 paced flips)", 59);
-    return 1;
-}
 
 # === 1.55.x display arc — blit#39 double-buffering (the payoff: tear-free full-screen apps) ===
 # blit#39 is the graphical-TAKEOVER path (doom/fbtest draw full-screen and never interleave with console
@@ -2490,6 +2386,9 @@ fn gpu_blit_arm() {
     if (height == 0) { return 0; }
     var fb_size = pitch * height;
     var span = ((fb_size + 0x1FFFFF) >> 21) << 21;
+    # HARD BOUND: both buffers must end before the PSP TMR (GPU_FB_BACK_LIMIT). A quirky/hostile GOP
+    # geometry falls back to the direct FB rather than scribbling over the TMR or the compute arena.
+    if (GPU_FB_BACK_OFF + span + span > GPU_FB_BACK_LIMIT) { return 0; }
     var r_off  = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET)   & GPU_FB_LOC_MASK;
     var r_base = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_LOC_BASE) & GPU_FB_LOC_MASK;
     gpu_bb_a_phys = (r_off  << 24) + GPU_FB_BACK_OFF;
