@@ -42,7 +42,11 @@ var GPU_BASE_GC_0     = 0x2000;   # graphics/compute core, segment 0
 var GPU_BASE_GC_1     = 0xA000;   # graphics/compute core, segment 1 (RLC + CP ucode-load iface)
 var GPU_BASE_NBIO_2   = 0xD20;    # NBIO/NBIF/RCC, segment 2 (STRAP0, MEMSIZE)
 var GPU_BASE_MMHUB_0  = 0x1A000;  # GMC / memory hub, segment 0 (C1 GPUVM)
-var GPU_BASE_DCN_1    = 0xC0;     # DMU/DCN seg1 (BASE_IDX 1) — legacy VGA-compat + mmDCE_VERSION ONLY, NOT the pipe base
+# DMU/DCN seg1 (BASE_IDX 1). CORRECTION (P3 derivation, 2026-07-14): this is NOT "legacy VGA only" — seg1 is
+# the entire **DCCG**: the audio DTO block (0xAB-0xAF) and the per-pipe PIXEL_RATE_CNTL / DP_DTO block
+# (0x80 + 4n), plus mmDCE_VERSION (0x5E). The DISPLAY-AUDIO path straddles BOTH segments — DTO here at 0xC0,
+# AFMT/DP_SEC/Azalia at 0x34C0 (seg2). A helper hard-wired to seg2 would silently write the wrong address.
+var GPU_BASE_DCN_1    = 0xC0;
 var GPU_BASE_MP0_0    = 0x16000;  # MP0 / PSP, segment 0 (C0 firmware-reality bite)
 var GPU_BASE_SDMA0_0  = 0x1260;   # SDMA engine 0, segment 0 (fallback data path)
 
@@ -91,6 +95,57 @@ var GPU_FB_BACK_OFF         = 0x40000000;
 # (2 x ~33 MB) — but it is a GUARD, not an assumption: a quirky/hostile GOP geometry must fall back to the
 # direct FB rather than scribble the buffers over the TMR or the arena.
 var GPU_FB_BACK_LIMIT       = 0x60000000;
+
+# === 1.55.x P3 — display-audio egress (the 1.53.5 HDA backlog closes here) ===
+# The HDA side already works: the GPU's audio function (PCI 04:00.1) is probed, its codec enumerated, a
+# digital pin routed, DigEn set, converter bound, tone streaming. It is SILENT because the DISPLAY side of
+# the audio path was never programmed. P3a is a READ-ONLY probe that resolves every open question before a
+# single audio register is written. Derived + adversarially cross-verified (5-lens, all HIGH confidence).
+#
+# KEY DERIVED FACTS (durable — a future session must not re-litigate these):
+#  * DMCUB is NOT in this path (the full dmub_cmd.h surface has zero audio/azalia/afmt hits; dcn21 wires
+#    enable_audio_stream = dce110_enable_audio_stream, plain MMIO). Seg3 stays untouched.
+#  * The DTO produces a constant 24.000 MHz wall clock. **48 kHz NEVER enters PHASE/MODULE** —
+#    get_azalia_clock_info_{hdmi,dp}() take no sample-rate argument. Fs comes from the HDA converter format
+#    agnos already programs; 128·Fs is derived downstream. Fs-scaled DTO values would be a REGRESSION.
+#  * Renoir has only **4** audio endpoints (res_cap_rn.num_audio=4) though the header defines 0..7.
+#    Never sweep k=4..7; never write AFMT_AUDIO_SRC_SELECT > 3.
+#  * Azalia endpoint indices are the **F0 window ordinals** from dce_11_0_d.h (HOT_PLUG_CONTROL=0x54 etc.).
+#    dcn_2_1_0_offset.h's ixAZALIA_F2_* are the codec-VERB space (0x3707 == HDA verb 0x707) — writing an F2
+#    index into REG_INDEX would poke an unintended codec register. Top burn risk; hard-coded below.
+#  * Write order is HARDWARE-ENFORCED (AMD's own warning in dce_audio.c): DTO source/select BEFORE
+#    module/phase, MODULE before PHASE — a reordered sequence fails SILENTLY (no audio, no fault).
+#
+# --- DCCG (BASE_IDX 1 = GPU_BASE_DCN_1) ---
+var GPU_R_OTG_PIXEL_RATE_CNTL = 0x80;   # OTGn, stride 4: DP_DTOn_ENABLE bit4 = THE DP/HDMI discriminator
+var GPU_R_DP_DTO_PHASE        = 0x81;   # OTGn, stride 4: = the live PIXEL CLOCK in Hz (when MODULO==DPREFCLK)
+var GPU_R_DP_DTO_MODULO       = 0x82;   # OTGn, stride 4: = DPREFCLK in Hz as VBIOS programmed it (~600e6)
+var GPU_DCN_PIXRATE_STRIDE    = 0x4;
+var GPU_DP_DTO_ENABLE         = 0x10;   # PIXEL_RATE_CNTL bit4
+var GPU_R_DCCG_AUDIO_DTO_SRC  = 0xAB;   # DTO0_SOURCE_SEL[2:0], DTO_SEL[5:4], DTO2_USE_512FBR_DTO b20 (GLOBAL → RMW only)
+var GPU_R_DCCG_AUDIO_DTO0_PHASE  = 0xAC;  # HDMI path
+var GPU_R_DCCG_AUDIO_DTO0_MODULE = 0xAD;  # HDMI: = actual pixel clock in 100 Hz units
+var GPU_R_DCCG_AUDIO_DTO1_PHASE  = 0xAE;  # DP path
+var GPU_R_DCCG_AUDIO_DTO1_MODULE = 0xAF;  # DP: = DPREFCLK/100 (nominal 6,000,000)
+var GPU_DCCG_AUDIO_DTO_PHASE_VAL = 240000; # 24 x 10000 — the constant that yields 24.000 MHz. NOT Fs-scaled.
+# --- DIG / DP / AFMT (BASE_IDX 2 = GPU_BASE_DCN_2), stride 0x100 per instance ---
+var GPU_DCN_DIGS              = 5;      # Renoir: 5 stream encoders (but only 4 audio endpoints)
+var GPU_DCN_DIG_STRIDE        = 0x100;
+var GPU_R_DIG_FE_CNTL         = 0x2068; # DIG_SOURCE_SELECT[2:0], DIG_START b10, DIG_SYMCLK_FE_ON b24
+var GPU_R_DIG_BE_EN_CNTL      = 0x20B0; # DIG_ENABLE b0 — liveness gate
+var GPU_R_DIG_BE_CNTL         = 0x20AF; # DIG_MODE[18:16] — trust only 3 == HDMI (the getter contradicts the setter at 0/1)
+var GPU_R_DP_VID_STREAM_CNTL  = 0x210C; # DP_VID_STREAM_ENABLE b0, _STATUS b16 — DP confirm
+var GPU_R_AFMT_STATUS         = 0x20A9; # AFMT_AUDIO_ENABLE b4 (the phase gate), AFMT_AUDIO_FIFO_OVERFLOW b24
+var GPU_DIG_SYMCLK_FE_ON      = 0x1000000; # DIG_FE_CNTL bit24
+var GPU_DIG_ENABLE            = 0x1;    # DIG_BE_EN_CNTL bit0
+var GPU_DIG_MODE_HDMI         = 0x3;    # DIG_BE_CNTL DIG_MODE == 3 => HDMI (authoritative value)
+var GPU_AFMT_AUDIO_ENABLE     = 0x10;   # AFMT_STATUS bit4
+# --- Azalia endpoint indirect window (BASE_IDX 2), stride 0x6 per endpoint ---
+var GPU_DCN_AZ_ENDPOINTS      = 4;      # Renoir: ONLY 0..3 exist
+var GPU_R_AZ_ENDPOINT_INDEX   = 0x386;  # AZF0ENDPOINTk_ENDPOINT_INDEX (write ix first)
+var GPU_R_AZ_ENDPOINT_DATA    = 0x387;  # then read/write DATA
+var GPU_DCN_AZ_STRIDE         = 0x6;
+var GPU_AZ_IX_HOT_PLUG_CONTROL = 0x54;  # F0 ordinal: CLOCK_ON_STATE b4 (RO), AUDIO_ENABLED b31 — the D3 gate
 
 # --- Field masks ---
 var GPU_STRAP0_DEVID_MASK = 0xFFFF;  # STRAP0[15:0] — echoes the PCI device id (reads 0x0 on Cezanne — quirk)

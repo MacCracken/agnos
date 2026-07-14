@@ -5,6 +5,59 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.8] — 2026-07-14 — P3a: display-audio state probe (read-only) — DMCUB is NOT gating
+
+The 1.53.5 HDA work streams a tone into the GPU's audio function (04:00.1) — codec enumerated, digital pin
+routed, DigEn set, converter bound — and it has been SILENT for months because the **display** side of the
+audio path was never programmed. This opens P3 with a read-only probe that answers every question the
+derivation raised, for the cost of a klug dump, before a single audio register is written.
+
+### Added
+
+- **P3a — display-audio state probe** (`kernel/core/gpu.cyr` `gpu_audio_probe` + `gpu_regs.cyr`),
+  strictly read-only (bar the Azalia index/data window select, which is a *read* mechanism):
+  - **DP or HDMI** — the primary discriminator is DCCG `OTGn_PIXEL_RATE_CNTL.DP_DTOn_ENABLE` (bit4), **not
+    the "HDMI audio" backlog name**. It decides everything downstream: DP uses DTO1 with a *constant*
+    module (DPREFCLK/100), HDMI uses DTO0 with the *actual pixel clock*.
+  - **Pixel clock + DPREFCLK, for free** — `DP_DTO_PHASE` holds the live pixel clock in Hz and
+    `DP_DTO_MODULO` holds DPREFCLK as VBIOS programmed it. Reading MODULO also **measures** any
+    spread-spectrum downspread (the nominal 600 MHz is a driver-side constant, not a hardware read), which
+    settles that question and removes the HDMI path's pixel-clock prerequisite.
+  - **Which DIG carries the lit stream** — gated on `DIG_BE_EN_CNTL.DIG_ENABLE` && `DIG_FE_CNTL.SYMCLK_FE_ON`
+    (`DIG_SOURCE_SELECT` alone is a **trap**: its reset default is also 0), plus `DIG_BE_CNTL.DIG_MODE`.
+  - **Azalia awake or in D3** — reads `HOT_PLUG_CONTROL` (F0 ordinal 0x54) on endpoints 0..3. All-ones/zero
+    would mean the SMU PME workaround (`VBIOSSMC_MSG_UpdatePmeRestore` — an SMU mailbox, **not** DMCUB) is
+    needed; detected for free rather than implemented preemptively.
+  - **GOP state** — whether the audio DTO is already programmed and `AFMT_STATUS.AFMT_AUDIO_ENABLE` (bit4)
+    is already set.
+- **DCN 2.1 audio register table** (`gpu_regs.cyr`), 5-lens derived, all HIGH confidence.
+
+### Fixed
+
+- **`GPU_BASE_DCN_1` (seg1 = 0xC0) was mis-documented as "legacy VGA + mmDCE_VERSION only".** It is the
+  entire **DCCG** — the audio DTO block (0xAB–0xAF) *and* the per-pipe `PIXEL_RATE_CNTL`/`DP_DTO` block
+  (0x80+4n). **The display-audio path straddles BOTH segments** (DTO at seg1, AFMT/DP_SEC/Azalia at seg2);
+  a helper hard-wired to seg2 would silently write the wrong address. Comment corrected.
+
+### Derivation results worth keeping (do not re-litigate)
+
+- **DMCUB is NOT in the display-audio path** — a hard result: the full `dmub_cmd.h` surface (8140 lines) has
+  **zero** `audio|azalia|afmt` hits, and `dcn21_init.c` wires `.enable_audio_stream = dce110_enable_audio_stream`
+  (plain MMIO) with `dce_audio_create()` (direct register lists). **Risk #4 of the display-arc plan is CLOSED.**
+- **The DTO produces a constant 24.000 MHz wall clock — 48 kHz NEVER enters PHASE/MODULE.**
+  `get_azalia_clock_info_{hdmi,dp}()` take no sample-rate argument; Fs comes from the HDA converter format
+  agnos already programs. Fs-scaled DTO values would be a **regression**.
+- **Only 4 Azalia endpoints exist on Renoir** (`res_cap_rn.num_audio = 4`) though the header defines 0..7 —
+  never sweep k=4..7, never write `AFMT_AUDIO_SRC_SELECT > 3`.
+- **Endpoint indices are the F0 window ordinals** (`dce_11_0_d.h`: 0x54/0x25/…), **not** the `ixAZALIA_F2_*`
+  values in `dcn_2_1_0_offset.h` — those are the codec-VERB space (0x3707 == HDA verb 0x707). Writing an F2
+  index would poke an unintended codec register. Top burn risk; hard-coded with source comments.
+- **Write order is hardware-enforced** (AMD's own warning in `dce_audio.c`): DTO source/select BEFORE
+  module/phase, MODULE before PHASE — a reordered sequence fails **silently**.
+
+Iron-only; flash `--update-all` then `run /bin/klug > p3a.txt`. P3b (the writes: DTO → Azalia endpoint →
+AFMT/DP_SEC → unmute) and the `tonegen --device=` tool follow once the probe says which path is live.
+
 ## [1.55.7] — 2026-07-14 — Display arc cleanup + hardening pass
 
 DOOM renders through the sovereign display stack on iron (1.55.6, archaemenid) — probed, re-pointed,

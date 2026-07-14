@@ -56,6 +56,9 @@ var gpu_bb_b_phys     = 0;   # buffer B
 var gpu_bb_b_mc       = 0;
 var gpu_bb_back       = 0;   # current RENDER target: 0 = A, 1 = B (the other is being scanned)
 var gpu_scanout_pid   = 0 - 1; # pid owning the scanout (-1 = the console owns it)
+# P3a display-audio discovery (read-only probe results)
+var gpu_audio_dp      = 0 - 1; # 1 = the lit stream is DP (DTO1, constant module); 0 = HDMI (DTO0, pixel-clock module); -1 = unknown
+var gpu_audio_dig     = 0 - 1; # the live stream encoder (DIG) carrying the lit stream
 
 # Read a 32-bit GPU register given its IP base segment + DWORD offset. Absolute
 # DWORD index = base + off; MMIO byte offset = index * 4 into the BAR5 aperture.
@@ -2452,6 +2455,97 @@ fn gpu_display_restore_console() {
     gpu_display_wait_vblank(gpu_display_pipe);
     gpu_scanout_pid = 0 - 1;
     gpu_bb_back = 0;
+    return 1;
+}
+
+# === 1.55.x P3a — display-audio state probe (READ-ONLY) ===
+# The 1.53.5 HDA work reaches the codec on the GPU's audio function (04:00.1) and streams a tone, but the
+# tone is SILENT because the DISPLAY side of the audio path was never programmed. Before writing a single
+# audio register, this probe answers every open question for the cost of a klug dump:
+#   1. DP or HDMI? — the PRIMARY discriminator is DCCG OTGn_PIXEL_RATE_CNTL.DP_DTOn_ENABLE (bit4), NOT the
+#      "HDMI audio" backlog name. It decides everything: DP uses DTO1 with a CONSTANT module (DPREFCLK/100),
+#      HDMI uses DTO0 with the actual pixel clock — which we would otherwise have to reconstruct.
+#   2. The pixel clock + DPREFCLK, for free: DP_DTO_PHASE holds the live pixel clock in Hz and DP_DTO_MODULO
+#      holds DPREFCLK as VBIOS programmed it. Reading MODULO also MEASURES any spread-spectrum downspread
+#      (the nominal 600 MHz is a driver-side constant, not a hardware read), so it settles that question too.
+#   3. Which DIG carries the lit stream (DIG_ENABLE + SYMCLK_FE_ON; SOURCE_SELECT alone is a trap — its
+#      reset default is also 0), and its DIG_MODE (3 == HDMI).
+#   4. Is the Azalia endpoint awake, or in D3? If endpoint reads come back all-ones/zero we need the SMU
+#      PME workaround (VBIOSSMC_MSG_UpdatePmeRestore — an SMU mailbox, NOT DMCUB). Detected for free here
+#      rather than implemented preemptively.
+#   5. Did the GOP already program the audio DTO, and is AFMT audio already enabled (AFMT_STATUS bit4)?
+# Strictly read-only apart from the Azalia index/data window select (a read mechanism, not a config write).
+# Labeled-hex discovery dump — removed once P3b lands, same disposal as the P0 diagnostic.
+fn gpu_audio_probe() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_display_ok != 1) { return 0; }      # need the lit pipe (P0)
+    var pipe = gpu_display_pipe;
+
+    # --- DCCG (seg1!) — the DP/HDMI discriminator + the clocks, for free ---
+    var prc  = gpu_reg32(GPU_BASE_DCN_1, GPU_R_OTG_PIXEL_RATE_CNTL + pipe * GPU_DCN_PIXRATE_STRIDE);
+    var pixc = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DP_DTO_PHASE        + pipe * GPU_DCN_PIXRATE_STRIDE);
+    var dpref= gpu_reg32(GPU_BASE_DCN_1, GPU_R_DP_DTO_MODULO       + pipe * GPU_DCN_PIXRATE_STRIDE);
+    var is_dp = 0;
+    if ((prc & GPU_DP_DTO_ENABLE) != 0) { is_dp = 1; }
+    kprint("gpu: audio probe rate=", 22); kprint_hex(prc);
+    kprint(" pixclk=", 8); kprint_hex(pixc);
+    kprint(" dpref=", 7); kprint_hex(dpref); kprintln("", 0);
+
+    var dsrc = gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO_SRC);
+    kprint("gpu: audio probe dtosrc=", 24); kprint_hex(dsrc);
+    kprint(" dto0=", 6); kprint_hex(gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_PHASE));
+    kprint("/", 1);     kprint_hex(gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE));
+    kprint(" dto1=", 6); kprint_hex(gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO1_PHASE));
+    kprint("/", 1);     kprint_hex(gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO1_MODULE));
+    kprintln("", 0);
+
+    # --- DIG walk (seg2): find the LIVE stream encoder. SOURCE_SELECT alone is a trap (reset default 0),
+    #     so gate on DIG_ENABLE && SYMCLK_FE_ON.
+    var live_dig = 0 - 1;
+    var d = 0;
+    while (d < GPU_DCN_DIGS) {
+        var fe = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL    + d * GPU_DCN_DIG_STRIDE);
+        var be = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d * GPU_DCN_DIG_STRIDE);
+        var bc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL    + d * GPU_DCN_DIG_STRIDE);
+        var dv = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DP_VID_STREAM_CNTL + d * GPU_DCN_DIG_STRIDE);
+        var af = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS    + d * GPU_DCN_DIG_STRIDE);
+        kprint("gpu: audio probe dig", 20); kprint_num(d);
+        kprint(" fe=", 4); kprint_hex(fe);
+        kprint(" be=", 4); kprint_hex(be);
+        kprint(" mode=", 6); kprint_hex((bc >> 16) & 0x7);
+        kprint(" dpvid=", 7); kprint_hex(dv);
+        kprint(" afmt=", 6); kprint_hex(af);
+        kprintln("", 0);
+        if ((be & GPU_DIG_ENABLE) != 0) {
+            if ((fe & GPU_DIG_SYMCLK_FE_ON) != 0) { if (live_dig < 0) { live_dig = d; } }
+        }
+        d = d + 1;
+    }
+
+    # --- Azalia endpoints 0..3 (ONLY 0..3 exist on Renoir): is the block awake or in D3? ---
+    var k = 0;
+    while (k < GPU_DCN_AZ_ENDPOINTS) {
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AZ_ENDPOINT_INDEX + k * GPU_DCN_AZ_STRIDE, GPU_AZ_IX_HOT_PLUG_CONTROL);
+        var hpc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AZ_ENDPOINT_DATA + k * GPU_DCN_AZ_STRIDE);
+        kprint("gpu: audio probe az", 19); kprint_num(k);
+        kprint(" hpc=", 5); kprint_hex(hpc); kprintln("", 0);
+        k = k + 1;
+    }
+
+    # --- Verdict: which signal, which DIG ---
+    if (live_dig < 0) {
+        kprintln("gpu: display audio: no live stream encoder found", 48);
+        return 0;
+    }
+    if (is_dp != 0) {
+        gpu_audio_dp = 1;
+        gpu_audio_dig = live_dig;
+        kprint("gpu: display audio path is DP on dig ", 37); kprint_num(live_dig); kprintln("", 0);
+        return 1;
+    }
+    gpu_audio_dp = 0;
+    gpu_audio_dig = live_dig;
+    kprint("gpu: display audio path is HDMI on dig ", 39); kprint_num(live_dig); kprintln("", 0);
     return 1;
 }
 

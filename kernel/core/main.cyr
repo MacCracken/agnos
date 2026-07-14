@@ -932,6 +932,14 @@ gpu_display_probe();
 # below is then PACED on this signal (block until the hardware actually took the surface).
 gpu_display_vblank();
 
+# GPU arc 1.55.x (Thrust P) P3a: display-audio state probe (READ-ONLY). The 1.53.5 HDA work streams a tone
+# into the GPU's audio function but it is silent — the DISPLAY side of the audio path was never programmed.
+# Before writing any audio register this answers: DP or HDMI (the DCCG DP_DTO_ENABLE bit, not the backlog
+# name — it decides whether the module is a constant or the pixel clock); the live pixel clock + DPREFCLK
+# (free, and it measures any spread-spectrum); which DIG carries the lit stream; whether the Azalia endpoint
+# is awake or in D3; and whether the GOP already programmed the DTO/AFMT. Gated on P0.
+gpu_audio_probe();
+
 #ifdef LOOPBACK_SELFTEST
 loopback_selftest();
 #endif
