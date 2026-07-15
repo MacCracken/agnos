@@ -34,6 +34,33 @@ proves nothing about whether a single sample crosses the HDA link into the encod
   written to be honest when it learns nothing: an inert counter and an empty pipe look identical from here,
   and it says "unconfirmed" rather than inventing a verdict.
 
+### Added — `burn-verify.sh`, because check.sh silently ate a burn artifact
+
+The 1.55.15 measurement burn was **wasted**, and not by the flag being missing — by it being **undone**.
+`burn-prep.sh BURN_HDMI_DUMP=1` correctly built the measurement kernel (1,573,656 B). Then `check.sh` ran
+before the flash. **`check.sh:24` calls `build.sh` with no `BUILD_ENV`** (so does `test.sh`), rebuilding a
+bare production kernel (1,566,336 B) straight over the artifact.
+
+The boot log looked *completely normal*, which is the whole problem. Nothing errored. The tell was a
+**hole**: `gpu: display pixel clock 241502 kHz` straight to `SYSCALL/SYSRET initialized`, with no
+`hdmi audio online`, no `hda: ctl1 probing 2nd controller`, no dump, no CRC line — and `tonegen` playing
+out the analog jack (`route pin=0x1b … digi=0`) that nobody has plugged in. A normal-looking log with a
+gap in it is the signature of a missing build flag.
+
+- **`burn-prep.sh` now verifies its own artifact** before declaring success, using a marker string that
+  exists only inside the matching `#ifdef` block in `main.cyr` (`ctl1 probing 2nd controller` ⟸ HDA_HDMI ·
+  `sweep streaming` ⟸ HDA_TONE · `== agnos display-audio dump ==` ⟸ HDMI_AUDIO_DUMP), and refuses to pass
+  a build where the flags did not land.
+- **It then stamps `build/agnos.burn-tag`** (tag / size / version / sha256).
+- **`scripts/burn-verify.sh` re-checks that stamp immediately before a flash** and refuses a stale
+  artifact. Tested by reproducing the exact clobber: fresh artifact verifies OK, `check.sh` runs, verify
+  fires `STALE ARTIFACT — build/agnos has been REBUILT since burn-prep.sh ran`.
+
+**The marker choice is load-bearing, and the obvious one is wrong.** A bare production kernel greps
+**PRESENT** for `"samples reaching the encoder"` — `gpu_hdmi_audio_crc_probe`'s own text — because the
+function compiles and is merely never called. Verifying with a string from an `#ifdef`'d *function body*
+reproduces the bug it is meant to catch. Only a call-site-gated string in `main.cyr` is honest.
+
 ### Added — `BURN_HDMI_DUMP`, the measurement-burn recipe
 
 `scripts/burn-prep.sh` gains `BURN_HDMI_DUMP=1` → `HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_DUMP=1`. Use it for the

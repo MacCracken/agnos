@@ -96,10 +96,48 @@ if ! env $BUILD_ENV sh scripts/build.sh >/tmp/burn-prep-build.log 2>&1; then
     exit 1
 fi
 
+# --- PROVE THE FLAGS ACTUALLY LANDED IN THE ARTIFACT -------------------------
+# A burn was wasted on 2026-07-15 because build/agnos was silently rebuilt WITHOUT these flags between
+# burn-prep and the flash (scripts/check.sh line 24 runs build.sh with no BUILD_ENV, so ANY check.sh run
+# after this point clobbers the burn artifact with a bare production kernel). The boot log looked normal —
+# the HDMI-audio block simply was not there, and the tone went out the analog jack nobody has plugged in.
+#
+# So verify rather than trust. Each marker below is a string that exists ONLY inside the matching #ifdef
+# block in main.cyr, so its presence proves the code is COMPILED AND REACHED.
+#
+# Do NOT verify with a string from an #ifdef'd FUNCTION BODY: gpu_hdmi_audio_crc_probe's own text is
+# present in a bare production kernel too, because the function compiles and is simply never called. That
+# is the exact trap this check exists to close — "a plain build compiles the code and never calls it".
+verify_marker() {
+    if ! grep -qa "$1" build/agnos; then
+        echo ""
+        echo "burn-prep: ARTIFACT-MISMATCH -- build/agnos does NOT contain '$1'"
+        echo "  Expected it for BUILD_TAG=$BUILD_TAG. The flags did not land, or something rebuilt"
+        echo "  build/agnos after the build (check.sh and test.sh both call build.sh with no BUILD_ENV)."
+        echo "  DO NOT FLASH THIS. Re-run burn-prep and flash immediately, running nothing in between."
+        exit 1
+    fi
+}
+case "$BUILD_TAG" in *HDA_HDMI*)         verify_marker "ctl1 probing 2nd controller" ;; esac
+case "$BUILD_TAG" in *HDA_TONE*)         verify_marker "sweep streaming" ;; esac
+case "$BUILD_TAG" in *HDMI_AUDIO_DUMP*)  verify_marker "== agnos display-audio dump ==" ;; esac
+
 SZ="$(stat -c %s build/agnos 2>/dev/null)"
 MT="$(stat -c %y build/agnos 2>/dev/null | cut -d. -f1)"
 VER="$(cat VERSION 2>/dev/null)"
+SUM="$(sha256sum build/agnos 2>/dev/null | cut -c1-16)"
 echo "  build/agnos: $SZ bytes, built $MT  (AGNOS $VER, $BUILD_TAG)"
+if [ "$BUILD_TAG" != "bare" ]; then
+    echo "  markers verified: the $BUILD_TAG code is compiled AND reached (not merely present)."
+fi
+
+# Stamp the artifact so staleness is DETECTABLE rather than silent. `sh scripts/burn-verify.sh` re-checks
+# this before a flash; a mismatch means something rebuilt build/agnos since burn-prep ran.
+printf '%s\n%s\n%s\n%s\n' "$BUILD_TAG" "$SZ" "$VER" "$(sha256sum build/agnos | cut -d" " -f1)" > build/agnos.burn-tag
+echo "  stamped build/agnos.burn-tag ($SUM...) -- re-check with: sh scripts/burn-verify.sh"
+echo ""
+echo "  !! Run NOTHING between here and the flash. check.sh / test.sh rebuild build/agnos"
+echo "     WITHOUT these flags and will silently replace the burn artifact."
 echo ""
 
 # --- Flash + watch instructions ---------------------------------------------
