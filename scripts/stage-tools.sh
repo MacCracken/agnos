@@ -94,6 +94,12 @@ stage_one cyim         src/main.cyr cyim     || rc=1
 # The seam mabda/tentib consume for GPU inference. Runs only on real AMD iron
 # (the GPU arc is not exercised under QEMU); harmless -1 on non-GPU boots.
 stage_one gpumm        src/main.cyr gpumm    || rc=1
+# tonegen is IN-TREE (agnos/audio-test), not a sibling repo — hence the agnos/ prefix,
+# which stage_one resolves through $SIBLINGS. It is the ring-3 end of the display-audio
+# path: with HDA_HDMI=1 the kernel makes the GPU's HDMI controller the live sink, so
+# this streams its tone out over HDMI with no device flag. Without it staged there is
+# nothing in /bin to produce samples, and the armed audio path stays silent.
+stage_one agnos/audio-test tonegen.cyr tonegen || rc=1
 
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
