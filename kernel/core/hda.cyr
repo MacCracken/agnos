@@ -1160,9 +1160,12 @@ fn hda_refill_half(ci, h) {
     #ifdef HDA_TONE
     var amp = 12000;
     # BYTES PER FRAME IS PER-INSTANCE. 16-bit = 4 (two packed s16). 24-bit = 8: HDA carries 24-bit samples
-    # in 32-BIT CONTAINERS, left-justified, so the s16 goes in the TOP bits (<<8 puts a 16-bit sample at the
-    # top of a 24-bit field). Telling the codec 0x31 while writing 4-byte frames would make it read our
-    # 16-bit data as 24-bit and emit noise — the format and the ring have to move together.
+    # in 32-BIT CONTAINERS, left-justified WITHIN THE CONTAINER — HDA spec 1.0a: "20 and 24-bit samples must
+    # be padded out with zeros at the LSB end to make them all 32-bits long", i.e. the sample occupies
+    # [31:8] and the PAD is [7:0]. An s16 therefore lands at [31:16] => <<16, not <<8. (1.55.17 shipped <<8,
+    # which parks the sample at [23:8] and pads the MSB end instead: the hardware reads [31:8] = sample>>8,
+    # ~-57 dBFS AND sign-mangled — non-zero, so the AFMT CRC tap still reads "content", but inaudible. No
+    # instance streams 24-bit today; this branch is kept correct rather than left as a trap.)
     var bpf = load64(&hda_bpf + ci * 8);
     if (bpf == 0) { bpf = 4; }
     var nframes = load64(&hda_ring_half + ci * 8) / bpf;
@@ -1173,7 +1176,7 @@ fn hda_refill_half(ci, h) {
         if (acc < 32768) { s = (0 - amp) + (2 * amp * acc) / 32768; }
         else { s = amp - (2 * amp * (acc - 32768)) / 32768; }
         if (bpf == 8) {
-            var s24 = (s << 8) & 0xFFFFFF;
+            var s24 = (s << 16) & 0xFFFFFF00;   # s16 -> [31:16], zero pad [15:0] (spec: pad at the LSB end)
             store32(base + fi * 8, s24);
             store32(base + fi * 8 + 4, s24);
         } else {
@@ -1263,9 +1266,9 @@ fn snd_copy_frames(uptr, n) {
     if (bpf == 0) { bpf = 4; }
     # THE RING-3 ABI IS S16 STEREO AND STAYS S16 STEREO. snd_write#66 takes frames*4 and tonegen writes
     # store16 — that contract is iron-validated and is not being broken for this. On a 24-bit instance the
-    # KERNEL converts: each s16 is left-justified into a 32-bit container (<<8 = 16 bits at the top of the
-    # 24-bit field), which is exactly what the fill does. A blind block copy would hand the codec 16-bit
-    # data while it reads 24-bit, i.e. noise.
+    # KERNEL converts: each s16 is left-justified into the 32-bit CONTAINER (<<16 — the sample owns [31:16]
+    # and the zero pad owns the LSB end, per HDA 1.0a), which is exactly what hda_refill_half does. A blind
+    # block copy would hand the codec 16-bit data while it reads 24-bit, i.e. noise.
     if (bpf == 8) {
         var cbl_f = 65536 / 8;                          # 8192 frames at 8 bytes/frame
         var fi = 0;
@@ -1275,8 +1278,8 @@ fn snd_copy_frames(uptr, n) {
             var r = load16(uptr + fi * 4 + 2) & 0xFFFF;
             if (l >= 32768) { l = l | 0xFFFF0000; }     # sign-extend before the shift
             if (r >= 32768) { r = r | 0xFFFF0000; }
-            store32(pva + slot * 8,     (l << 8) & 0xFFFFFF);
-            store32(pva + slot * 8 + 4, (r << 8) & 0xFFFFFF);
+            store32(pva + slot * 8,     (l << 16) & 0xFFFFFF00);   # s16 -> [31:16], zero pad [15:0]
+            store32(pva + slot * 8 + 4, (r << 16) & 0xFFFFFF00);
             fi = fi + 1;
         }
         snd_appl = snd_appl + n;
@@ -1365,13 +1368,17 @@ fn hda_snd_selftest() {
 # SD_LPIB advances (DMA fetching). Silence for now; B4 fills a sine (first tone).
 fn hda_stream_arm() {
     if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_out_dac + hda_active_ctl * 8) == 0) { return 0; }
-    # Per-instance format/tag. Instance 0 (analog) keeps the 16-bit/tag-1 setup that is iron-validated and
-    # audible; instance 1 (HDMI) takes amdgpu's measured 24-bit/tag-3. Declarative array init does not take
-    # in this codebase (cf. snd_active_slot), so set them here at runtime.
+    # Per-instance format/tag. BOTH instances stream 16-bit: the analog path is iron-validated and audible,
+    # and the codec-side known-good capture states plainly that S16_LE / 2ch / 48000 is a format this sink
+    # plays under amdgpu (`AZ_CONVERTER_FORMAT 0x11`). 1.55.17 moved the HDMI instance to 24-bit/0x31 to
+    # match the BAR5 known-good, but the two captures disagree only because they caught DIFFERENT PLAYERS:
+    # the BAR5 dump was taken with ffmpeg negotiating 24-bit, the codec-side dump with a 16-bit stream. Both
+    # were audible ⇒ the converter format was never causal, and matching 0x31 was matching an artifact of
+    # the capture. Instance 1 keeps amdgpu's tag 3 (a real, harmless match — tags are per-link).
     if (hda_active_ctl == 1) {
         store64(&hda_tag + 8, 3);
-        store64(&hda_fmt + 8, HDA_FMT_48K_24_2);
-        store64(&hda_bpf + 8, 8);
+        store64(&hda_fmt + 8, HDA_FMT_48K_16_2);
+        store64(&hda_bpf + 8, 4);
     } else {
         store64(&hda_tag + 0, 1);
         store64(&hda_fmt + 0, HDA_FMT_48K_16_2);
@@ -1482,7 +1489,9 @@ fn hda_stream_arm() {
     kprint("hda: stream sd=0x", 17);
     kprint_hex(sd);
     kprint(" tag=", 5);
-    kprint_num(hda_stream_tag);
+    kprint_num(a_tag);              # the tag actually programmed above — NOT the legacy hda_stream_tag
+                                    # global, which this line printed until 1.55.18 and which made the
+                                    # HDMI instance report `tag=1` while it had really bound tag 3.
     kprint(" fifos=", 7);
     kprint_num(fifos);
     kprint(" lpib=", 6);
