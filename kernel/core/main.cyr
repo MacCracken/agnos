@@ -968,39 +968,28 @@ gpu_hdmi_audio_enable();
 # came up — otherwise instance 0 stays the sink and the analog path keeps working.
 if (gpu_hdmi_audio_on == 1) {
     hda_active_ctl = 1;
-    # RE-ROUTE the codec now that the display side knows which pin is live. hda_codec_route() ran during the
-    # HDA block above, LONG before any GPU probe, so it had to score blind — and on an AMD HDMI codec it has
-    # no signal to score with: all four digital pins carry an identical config default (rcd=0x185600F0),
-    # ELD-Valid never sets because agnos has no ELD reader, and presence-detect is unreliable without amdgpu
-    # driving hot-plug. It picked pin 3, which the sink's own ELD reports as monitor_present=0 — so the codec
-    # streamed into an unconnected pin while the display side pulled from endpoint 1. The two halves were
-    # crossed, and every register on both sides read back correct.
-    #
-    # gpu_audio_dig is the lit encoder (DIG1 on this iron). amdgpu's find_first_free_audio() binds the audio
-    # instance to the encoder's engine id, and the codec's pin/converter pair sits at that same ordinal —
-    # three independent measurements agree at index 1 here: the ELD puts the XB323U on codec pin 0x5 (the
-    # second digital pin), amdgpu reads AFMT_AUDIO_SRC_SELECT=1, and DIG1 is the only encoder with both
-    # DIG_ENABLE and SYMCLK_FE_ON.
-    hda_force_digi_ord = gpu_audio_dig;
-    hda_codec_route();
-    hda_force_digi_ord = 0 - 1;
-    # hda_stream_arm() ALWAYS follows hda_codec_route() — that pairing holds at both call sites in the HDA
-    # block above, and for the same reason here: the arm binds the stream to the converter the route just
-    # chose (and, under HDA_TONE, refills the PCM ring). Re-routing without re-arming would point the codec
-    # at the new pin while the DMA stayed bound to the old converter — silence, again, with every register
-    # correct. This is the same class of crossing the re-route exists to fix.
-    hda_stream_arm();
-    # Report exactly what snd_open() gates on, for THIS instance. snd_open returns -1 unless BOTH
-    # hda_present[ctl] and hda_out_dac[ctl] are non-zero — so if ctl1's codec route never found a digital
-    # DAC, every ring-3 tone fails at the first syscall and no amount of display-side correctness matters.
-    # Until now that was assumed rather than shown; the display side was being debugged on faith that the
-    # codec side had a sink to hand it to.
+    # Report BEFORE the re-route, never after. This line is the only window onto the codec half, and putting
+    # it behind the code it exists to diagnose is how a burn comes back saying nothing at all.
     kprint("hda: sink ctl=", 14); kprint_num(hda_active_ctl);
     kprint(" present=", 9); kprint_num(load64(&hda_present + hda_active_ctl * 8));
     kprint(" dac=", 5); kprint_num(load64(&hda_out_dac + hda_active_ctl * 8));
     kprint(" pin=", 5); kprint_num(load64(&hda_out_pin + hda_active_ctl * 8));
     kprint(" digital=", 9); kprint_num(load64(&hda_out_digital + hda_active_ctl * 8));
     kprintln("", 0);
+    # `pin=3` here is NOT a bug and does not need "fixing" — that was a wrong read on my part, corrected by
+    # reading hda_codec_route() instead of grepping it. hda_out_pin is only the SCORED PRIMARY, the pin whose
+    # stream descriptor hda_stream_arm() sets up. The route's digital BROADCAST (hda.cyr step 3b) already
+    # powers EVERY digital pin, sets DIGEN, stereo, 48k/16/2, binds EVERY converter to the one stream tag and
+    # asserts PINCTL_OUT_EN — precisely because this AMD codec cannot identify the connected pin without
+    # amdgpu (uniform Get Pin Sense, identical config defaults). So codec pin 0x5 / converter 0x4 — the one
+    # the sink's ELD names — is already fully enabled and already carries the tag, whatever hda_out_pin says.
+    # Forcing the scored primary onto the ELD's ordinal would change this print and nothing electrical.
+    # THE SEAM CHECK. Both halves report themselves healthy and the sink is mute, so the question that
+    # matters is whether samples are physically moving between them. hda_stream_arm() already printed this
+    # verdict — during the HDA block, hundreds of lines up, off the top of the panel. Read it again here,
+    # where it is visible. LPIB advancing => the DMA is fetching PCM and the residual is downstream in the
+    # DCN link/packet egress; LPIB frozen => nothing is being fetched and the display side is irrelevant.
+    hda_dma_report();
     if (load64(&hda_out_dac + hda_active_ctl * 8) == 0) {
         # Say it plainly rather than let it surface as "the tone is silent".
         kprintln("hda: HDMI has no output DAC -- ring-3 audio will fail to open", 61);

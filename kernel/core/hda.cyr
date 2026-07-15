@@ -706,6 +706,37 @@ fn hda_unmute_in(codec, nid, idx) {
 # sequence: Realtek COEF init (vendor-gated) -> power D0 -> PIN_CTL out+HP -> EAPD
 # (PINCAP-gated) -> unmute + ~75% gain on DAC & pin amps. QEMU exercises the
 # machinery on its trivial codec; the ALC897 amp/EAPD/COEF effects are iron-only.
+# Is the LIVE instance's output DMA actually fetching, right now?
+#
+# hda_stream_arm() already gates on this and prints the verdict — but it does so during the HDA block,
+# hundreds of console lines before the prompt, so on a real boot it has scrolled off the top of the panel
+# before the operator ever looks. Six burns of this arc printed that answer and nobody read it. Re-read it
+# HERE, at the bottom of the boot, next to the display-side verdict, where it is visible without a klug dump.
+#
+# This is THE seam diagnostic. The display half and the codec half each report themselves healthy while the
+# sink stays mute; LPIB is the one number that says whether samples are physically moving between them.
+# LPIB advancing  => the DMA is fetching PCM and the gap is downstream, in the DCN link/packet egress.
+# LPIB frozen     => nothing is being fetched and no amount of display-side correctness can matter.
+# Compare != rather than > : LPIB wraps at the cyclic buffer length.
+fn hda_dma_report() {
+    var sd = load64(&hda_sd_base + hda_active_ctl * 8);
+    if (sd == 0) {
+        kprintln("hda: dma no stream armed", 24);
+        return 0;
+    }
+    var l0 = hda_read32(sd + SD_LPIB);
+    hda_udelay(2000);
+    var l1 = hda_read32(sd + SD_LPIB);
+    var ctl = hda_read32(sd + SD_CTL);
+    kprint("hda: dma ", 9);
+    if (l1 != l0) { kprint("running", 7); } else { kprint("STALLED", 7); }
+    kprint(" lpib=", 6); kprint_num(l1);
+    kprint(" run=", 5); kprint_num((ctl & SD_RUN) >> 1);
+    kprintln("", 0);
+    if (l1 != l0) { return 1; }
+    return 0;
+}
+
 fn hda_codec_route() {
     if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_codec_mask + hda_active_ctl * 8) == 0) { return 0; }
     if (load64(&hda_afg + hda_active_ctl * 8) == 0 || load64(&hda_w_count + hda_active_ctl * 8) == 0) { return 0; }
