@@ -5,6 +5,92 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.16] — 2026-07-15 — the cut that stopped guessing and built the instruments
+
+Fifteen burns had produced no root cause because the arc was **arguing instead of measuring**. Every
+adversarial refutation died on the same sentence: *"no known-good value exists, so the read is
+uninterpretable."* This cut fixes that, and it is deliberately a **measurement cut, not a fix cut**.
+
+What it buys:
+
+- **The known-good exists.** Full BAR5 + all 34 Azalia ordinals × 8 endpoints, captured off amdgpu on this
+  silicon **while the panel was audibly playing**, committed as prior-art. The ~13-register corpus quoted
+  from a changelog is retired — along with one of its claims that turned out to be **flatly false**.
+- **The premise is settled.** The sink *is* audible under amdgpu (operator-confirmed by ear). agnos's
+  silence is agnos's bug, and none of the register work was aimed at a phantom.
+- **The diff is four registers, 26 are byte-identical**, and three of the four are explained.
+- **Instruments that answer instead of echo**: the AFMT audio CRC (both taps), `HDMI_STATUS` (read-only, and
+  never read in fifteen burns), the endpoint's `DIGITAL_OUTPUT_STATUS` and `LPIB`, and the full AZ ordinal
+  set — so one burn now closes the whole endpoint diff instead of one register per burn.
+- **A burn artifact that cannot be silently clobbered** (`burn-verify.sh`), after `check.sh` ate one.
+- **Fourteen mechanisms refuted with reasons**, and two of this session's own conclusions retracted.
+
+What it does **not** buy: sound. One fix shipped (`DIG_STEREOSYNC_GATE_EN`) and did not cure it. The
+remaining lead is blocked on an instrument whose semantics are unverified, and the experiment that settles
+it costs **zero burns**. That is the honest state.
+
+### ⚠ The tap bisection is UNRESOLVED — the instrument's semantics were inferred, again
+
+**A 74-agent adversarial audit killed every mechanism submitted, and then killed the premise.** Recorded
+before the fix list, because it invalidates the reasoning the last two cuts were built on.
+
+agnos read `tap 0 = 0x25EB75` (content) / `tap 1 = 0x000000` (zero) and concluded *"samples reach the
+encoder and are zeroed between the taps."* **That assumes the two taps are serial points on one sample
+path. Nothing establishes it.** `AFMT_AUDIO_CRC_SOURCE` is a bare 1-bit field (shift `0x8`, mask `0x100`)
+with no enum, no prose, and **no consumer anywhere in the kernel tree** — the only in-tree writes are
+legacy DCE parking it disabled (`dce_v8_0.c:1553`, `dce_v10_0.c:1601`, `dce_v11_0.c:1650`, all `0x1000`).
+
+Two readings fit all four measured CRCs, and they point in **opposite** directions:
+
+- **Serial taps.** agnos has real samples at tap 0, something zeroes them before tap 1. Then the entire
+  Azalia endpoint diff is **exonerated** — every register in it sits upstream of *both* taps.
+- **One tap reads framing.** If a tap views the IEC-60958 subframe (preamble / channel status / validity /
+  parity) rather than raw PCM, its CRC is **non-zero even over digital silence**, because
+  `AFMT_60958_0/1/2` are programmed non-zero and byte-identical on both paths. Then agnos's "content" is
+  framing bits over silence, the samples are zero **at the source**, nothing happens between the taps, and
+  the endpoint / converter / DMA path is fully back in scope.
+
+**The instrument's meaning was inferred from the answer it seemed to give.** That is precisely the error
+this arc wrote a rule against — *verify an ordinal's semantics, not its number* — for the second time in
+one day, with the instrument built to replace the one rejected for that same flaw.
+
+**`scripts/crc-tap-identity.sh` settles it for zero burns**: arm the identical probe on the *audibly
+working* amdgpu path with a **known stimulus** — digital silence, then a tone. Tap 0's CRC changing means
+it is sample-content-sensitive and the serial reading holds; tap 0 invariant means it reads framing and
+agnos's "content" was an echo. Either outcome kills half the search space. (It refuses unless the panel is
+awake — the ELD and pin presence vanish when it sleeps.)
+
+### Refuted this round — every one, with its reason. Do not re-chase.
+
+Fourteen mechanisms died. The register facts were almost always **correct**; the mechanisms were invented.
+
+- **`MULTICHANNEL_MODE` (ix `0x58`) = 0 vs amdgpu 1** — the lead this cut nearly shipped. `PAIRED=0` /
+  `SINGLE=1`; agnos's `0x777 ← 0x01` is **byte-for-byte what Linux's own paired branch emits for stereo**,
+  and `MULTICHANNEL_ENABLE` reads `0x1` identically on both. Also upstream of both taps.
+  **⚠ HAZARD, recorded: flipping it to 1 without also issuing verb `0x785` would leave the right channel
+  dark.** Not shipping it was the correct call.
+- **`AUDIO_DESCRIPTOR0` (ix `0x28`)** — a CEA-861 SAD **capability mailbox**, written from the sink's EDID
+  and read back out by the host over codec verbs. Informational; no hardware consumer. agnos advertises
+  16-bit and plays 16-bit — self-consistent, the inverse of a fault.
+- **`SINK_INFO0..8` (ix `0x3a`–`0x42`)** — the monitor's manufacturer/product ID and ASCII name. Sole
+  reader is ALSA's ELD emulation (`hda_eld.c`). Pure metadata.
+- **`CONVERTER_FORMAT` `0x11` vs `0x31`** — a 16-vs-24-bit container delta shifts or attenuates; it cannot
+  produce **exactly** `0x000000` across 2048 samples. S16_LE is explicitly advertised.
+- **ATI verb `0x770` `SET_RAMP_RATE`** — issued on the *converter*, upstream of the AFMT; and `0` means
+  *ramping disabled*, the passthrough state agnos already sits in.
+- **`AFMT_RAMP_CONTROL1` / `AFMT_AUDIO_TEST_CH_DISABLE`** — gated by `AFMT_AUDIO_TEST_EN` (bit 12), and
+  `AFMT_AUDIO_PACKET_CONTROL = 0x801` on **both** paths ⇒ bit 12 clear, generator off. Inert.
+- **`AFMT_STATUS` bit 24 `FIFO_OVERFLOW`** — **wrong sign.** Overflow means the FIFO is *full of real
+  samples*; zero-substitution would be *underflow*, and no such field exists here. amdgpu never reads or
+  acks this bit anywhere. Symptom or noise, not mechanism.
+- **The whole `dce_aud_az_configure` gap** — it writes **nothing** in the sample datapath (`grep` for
+  `MULTICHANNEL|CONVERTER_FORMAT|AFMT` in `dce_audio.c` returns **0**), and its one datapath-adjacent
+  register, `CHANNEL_SPEAKER`, is measured byte-identical at `0x10001`. Implementing it buys zero samples.
+- **`az_enable` / `az_disable` / `wall_dto_setup`** — agnos matches; every register they touch is identical.
+- **`DIG_STEREOSYNC_GATE_EN`** — the one fix this cut *did* ship. `DIG_FE_CNTL` now reads `0x01000100`,
+  matching amdgpu exactly. **It did not cure the silence.** Flagged as a hypothesis rather than a
+  diagnosis when written; that was right, and the register is now closed permanently.
+
 ### The known-good was finally captured, and the diff is FOUR registers
 
 **2026-07-15.** The artifact fourteen burns were missing now exists: the complete BAR5 state amdgpu leaves
