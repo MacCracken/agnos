@@ -2893,7 +2893,7 @@ fn gpu_hdmi_audio_enable() {
     var k = 0;
     while (k < GPU_DCN_AZ_ENDPOINTS) {
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AZ_ENDPOINT_INDEX + k * GPU_DCN_AZ_STRIDE,
-                        GPU_AZ_IX_CONV_STREAM_ID);
+        GPU_AZ_IX_CONV_STREAM_ID);
         var sid = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_AZ_ENDPOINT_DATA + k * GPU_DCN_AZ_STRIDE) >> 4) & 0xF;
         kprint("gpu: hdmi endpoint ", 19); kprint_num(k);
         kprint(" stream tag ", 12); kprint_num(sid); kprintln("", 0);
