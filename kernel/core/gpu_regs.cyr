@@ -216,12 +216,23 @@ var GPU_HDMI_GENERIC0_LINE_VAL  = 0x2;           # enc2_update_hdmi_info_packet:
 # colorimetry), Q=0 (default range), and VIC=0 because 2560x1440 CVT-RB has no CEA VIC at all. It cannot
 # describe the picture worse than the no-AVI state it replaces.
 var GPU_AVI_HDR                = 0xD0282; # 0x82 | (0x02 << 8) | (0x0D << 16) — matches amdgpu byte-for-byte
-# The AVI data bytes, MEASURED off amdgpu playing sound on this link (AFMT_GENERIC_0 = 0x80885E8F), not
-# derived. The checksum is NOT a constant here — it is computed at write time from these plus the live bar
-# values, because a baked checksum silently lies the moment the raster changes.
-var GPU_AVI_DB1                = 0x5E;    # Y=2 (YCbCr444) · A0=1 active-format valid · B=3 both bars valid · S=2
-var GPU_AVI_DB2                = 0x88;    # C=2 (BT.709 colorimetry) · M=0 · R=8 (same as picture aspect)
-var GPU_AVI_DB3                = 0x80;    # ITC=1 · EC=0 · Q=0 (default range) · SC=0
+# The AVI data bytes. Structure measured off amdgpu playing sound on this link (AFMT_GENERIC_0 = 0x80885E8F)
+# — but the COLORSPACE FIELDS ARE DELIBERATELY OURS, NOT AMDGPU'S, and that distinction is the whole lesson.
+#
+# amdgpu sends DB1=0x5E (Y=2, YCbCr 4:4:4) and DB2=0x88 (C=2, BT.709) because AMDGPU CONFIGURES ITS ENCODER
+# FOR YCbCr. agnos does not: it inherits the GOP's RGB link and never touches the pixel encoding. Copying
+# amdgpu's bytes verbatim told the sink to decode our RGB pixels as YCbCr — the panel came up GREEN with
+# pink text, iron-proven 2026-07-14. The AVI must describe WHAT WE ACTUALLY TRANSMIT, not what the reference
+# driver transmits. A known-good value is only known-good for the configuration that produced it.
+#
+# (The green screen was also the proof the packet works: the sink could not have mis-decoded anything unless
+# it were receiving, parsing and honouring our AVI — i.e. finally treating the link as HDMI.)
+var GPU_AVI_DB1                = 0x1E;    # Y=0 (RGB — OURS) · A0=1 active-format valid · B=3 both bars valid · S=2
+var GPU_AVI_DB2                = 0x08;    # C=0 (no colorimetry data — correct for RGB) · M=0 · R=8 same as picture
+var GPU_AVI_DB3                = 0x00;    # ITC=0 · EC=0 · Q=0 (default range) · SC=0
+# The checksum is NOT a constant — it is computed at write time from these plus the live bar values, so it
+# can never disagree with the body. With Y=0/C=0 it lands on 0xC5 for this raster rather than amdgpu's 0x8F;
+# both are correct for their own payload.
 var GPU_R_AFMT_CNTL            = 0x20E6; # AFMT_AUDIO_CLOCK_EN bit0 (WRITE), AFMT_AUDIO_CLOCK_ON bit8 (STATUS)
 var GPU_R_AFMT_AUDIO_PACKET_CONTROL = 0x20AA;
 # The TMDS character-rate hazard: DATA_SCRAMBLE_EN b1 | CLOCK_CHANNEL_RATE b2 | DEEP_COLOR_ENABLE b24 |
