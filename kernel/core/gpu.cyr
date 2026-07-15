@@ -2931,6 +2931,13 @@ fn gpu_hdmi_audio_enable() {
     & (0 - 1 - GPU_AZ_EXTRA_CONN_INFO_LSB);
     gpu_reg32_write(GPU_BASE_DCN_2, dr, spk | GPU_AZ_SPEAKER_FL_FR | GPU_AZ_HDMI_CONNECTION);
 
+    # The slot map. Untouched, this register reads 0x21615101 on this silicon — all four slot pairs enabled
+    # carrying channel IDs 0/5/6/2 — which contradicts the two channels CHANNEL_SPEAKER, the Audio InfoFrame
+    # and AFMT_AUDIO_CHANNEL_ENABLE all declare. amdgpu writes 0x1 to the live pin and only the live pin.
+    # A whole write is correct here: every field in the register is a slot field.
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, GPU_AZ_MULTICHANNEL_STEREO);
+
     # Now enable the endpoint, then close the clock-gating bracket (amdgpu re-writes with the bit cleared).
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
     var hpc1 = gpu_reg32(GPU_BASE_DCN_2, dr);
@@ -2944,16 +2951,45 @@ fn gpu_hdmi_audio_enable() {
     gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc2 & (0 - 1 - GPU_AZ_CLOCK_GATING_DISABLE));
 
     # --- 5. AFMT. The audio CLOCK first: without it the whole block is inert and reports nothing wrong. ---
-    # AFMT_AUDIO_CLOCK_ON (bit8) is the hardware's own ack and is read-only, so unlike the CLOCK_EN bit we
-    # write, it cannot echo us back: 1 means the clock genuinely started. amdgpu reads 0x101 here — both bits
-    # — with sound playing. Gate on it rather than assume, since a dead clock silences everything downstream
-    # while every register we wrote still reads back exactly as written.
+    # AFMT_AUDIO_CLOCK_ON (bit8) is the hardware's ack, and amdgpu reads 0x101 here — both bits — with sound
+    # playing on this iron. But NEVER GATE ON IT. amdgpu polls this bit nowhere: enc1_se_enable_audio_clock
+    # carries the REG_WAIT commented out, under "wait for clock_on does not work well ... audio seems work
+    # normally even without wait for clock_on status change", and its own expectation was 1-2 reads. We read
+    # once, immediately. Report the ack; never let an unreliable status bit abort the eight writes below.
     var ac = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d, ac | GPU_AFMT_AUDIO_CLOCK_EN);
     if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d) & GPU_AFMT_AUDIO_CLOCK_ON) == 0) {
-        kprintln("gpu: hdmi audio clock did not start", 35);
-        return 0;
+        kprintln("gpu: hdmi audio clock ack did not arrive", 40);
     }
+
+    # THE AVI INFOFRAME — generic packet slot 0. This must follow the AFMT clock write above:
+    # enc1_update_generic_info_packet opens by turning the audio clock on, under "we need turn on clock
+    # before programming AFMT block". The sequence is enc1_update_generic_info_packet followed by
+    # enc2_update_hdmi_info_packet case 0, in order. Without this the sink never sees an AVI, never treats
+    # the link as HDMI, and ignores every audio data island we send — with all our registers reading back
+    # exactly as written.
+    var vp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL + d);
+    vp = (vp & (0 - 1 - GPU_AFMT_GENERIC_INDEX_MASK)) | GPU_AFMT_GENERIC_CONFLICT_CLR;
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL + d, vp);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_HDR + d, GPU_AVI_HDR);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_0 + d, GPU_AVI_SB0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_1 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_2 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_3 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_4 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_5 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_6 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_7 + d, 0);
+    var vp1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL1 + d,
+    vp1 | GPU_AFMT_GENERIC0_IMMEDIATE_UPDATE);
+    # GENERIC0_LINE is in CONTROL1, not CONTROL0 — dcn20 split enc1's fused write because DCN2 moved it.
+    var gl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL1 + d,
+    (gl & (0 - 1 - GPU_HDMI_GENERIC0_LINE_MASK)) | GPU_HDMI_GENERIC0_LINE_VAL);
+    var gp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d,
+    gp | GPU_HDMI_GENERIC0_SEND | GPU_HDMI_GENERIC0_CONT);
 
     # ACR: hardware-measured CTS (SOURCE=0) + AUTO_SEND, but N is a per-Fs constant and must be written.
     var acr = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d);
@@ -2962,6 +2998,18 @@ fn gpu_hdmi_audio_enable() {
     var n48 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d,
     (n48 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_48_VAL);
+    # ACR_SELECT is cleared above, which is hardware rate auto-select: the hardware picks the N/CTS pair from
+    # the incoming Fs. tonegen is locked to 48 kHz so the 48 pair is the live one and it is correct — but the
+    # 32 and 44.1 pairs are silence the moment anything plays at those rates. amdgpu writes all six. All three
+    # N fields share the same [19:0] mask. The CTS registers stay unwritten deliberately: they are inert under
+    # HDMI_ACR_SOURCE=0 (hardware-measured CTS), and our PIT-derived clock would write 241502 where the
+    # known-good value is 241500 — writing them would open a divergence rather than close one.
+    var n32 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d,
+    (n32 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_32_VAL);
+    var n44 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d,
+    (n44 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_44_VAL);
 
     var hap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d,
@@ -2972,9 +3020,13 @@ fn gpu_hdmi_audio_enable() {
     var sc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d,
     (sc & (0 - 1 - GPU_AFMT_AUDIO_SRC_SELECT_MASK)) | az);
+    # Clearing AUDIO_LAYOUT_OVRD (bit0) and 60958_OSF_OVRD (bit28) alongside the channel enable matches
+    # dcn10_stream_encoder.c; known-good reads 0x300, with both overrides at 0. LAYOUT_SELECT, HBR_ENABLE_OVRD
+    # and DP_AUDIO_STREAM_ID are deliberately left alone — amdgpu never writes them.
     var pc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d,
-    (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK)) | GPU_AFMT_CHANNEL_ENABLE_STEREO);
+    (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK) & (0 - 1 - GPU_AFMT_AUDIO_LAYOUT_OVRD)
+    & (0 - 1 - GPU_AFMT_60958_OSF_OVRD)) | GPU_AFMT_CHANNEL_ENABLE_STEREO);
 
     # IEC 60958 channel status. These MUST be populated before CS_UPDATE latches them: L/R = 0/0 is invalid
     # channel status and a strict sink rejects the substream. 1.55.12 set the latch over untouched registers
@@ -3012,6 +3064,13 @@ fn gpu_hdmi_audio_enable() {
     var apc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,
     apc | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+
+    # The hardware's own Audio InfoFrame, read back. Non-zero here means the AIF generator actually ran on
+    # the CHANNEL_SPEAKER we wrote — the one end-to-end check this block gives us for free, and a real answer
+    # rather than an echo, since we never write this register and neither does amdgpu.
+    if (gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_INFO0 + d) != GPU_AFMT_AUDIO_INFO0_STEREO) {
+        kprintln("gpu: hdmi audio infoframe not generated", 39);
+    }
 
     gpu_hdmi_audio_on = 1;
     kprint("gpu: hdmi audio online (endpoint ", 33); kprint_num(az);

@@ -47,12 +47,59 @@ wiring, not a search.
   moment a second sink appears." It was biting when that sentence was written. The search was never
   repairable; it was the wrong question.
 
-### Added
+### Added — the AVI InfoFrame was never transmitted either
 
-- **`AFMT_AUDIO_CLOCK_ON` is now a gate, not a spare constant.** `AFMT_CNTL` bit 8 is the hardware's ack and
-  is read-only, so unlike the `AFMT_AUDIO_CLOCK_EN` bit we write, it cannot echo us. amdgpu reads `0x101`
-  here with sound playing. The constant has existed in `gpu_regs.cyr` since 1.55.12 and **nothing ever read
-  it** — six burns had a free, decisive gate sitting unused in the register table.
+The endpoint fix above was necessary and is not obviously sufficient. A follow-on audit diffed the whole
+sequence against the same known-good dump and found a second candidate of equal weight, plus one defect this
+cut had introduced.
+
+- **`HDMI_GENERIC_PACKET_CONTROL0.HDMI_GENERIC0_SEND` + `HDMI_GENERIC0_CONT`** (DIG 0x2078, bits 0 and 1), and
+  the AVI packet body behind them. **On DCN 2.x the AVI InfoFrame is generic packet slot 0** —
+  `dcn20_stream_encoder.c` `enc2_update_hdmi_info_packet(enc1, 0, &info_frame->avi)`. agnos defined the
+  register and read or wrote it nowhere; the preflight printed `generic=0` on all six burns, while amdgpu on
+  this iron reads `0x3`. **`DIG_MODE = 3` is only a source-side setting** — the sink decides HDMI-versus-DVI
+  from what actually arrives on the wire, and an HDMI source must transmit an AVI. This panel was lit by the
+  GOP as DVI and has never received one, so agnos flipped to HDMI signalling and began emitting audio data
+  islands into a link the sink still treated as DVI. Same shape as the bug 1.55.13 found, one level up.
+  Two register traps, both from the dcn10-to-dcn20 split, are documented at the write site: the GSP index
+  lives in `AFMT_VBI_PACKET_CONTROL` (0x20AB), **not** `HDMI_VBI_PACKET_CONTROL` (0x2075) which this path
+  already writes; and `GENERIC0_LINE` lives in `HDMI_GENERIC_PACKET_CONTROL1` (0x2095), **not** CONTROL0.
+- **`AZALIA_F0_CODEC_PIN_CONTROL_MULTICHANNEL_ENABLE`** (AZ ix 0x36) = `0x1`. The stream-channel-to-slot map.
+  Untouched it reads `0x21615101` on this silicon — **measured identically on endpoints 0, 2 and 3, none of
+  which any driver writes, which is what establishes it as the reset value** — meaning all four slot pairs
+  enabled carrying channel IDs 0/5/6/2, contradicting the two channels that `CHANNEL_SPEAKER`, the Audio
+  InfoFrame and `AFMT_AUDIO_CHANNEL_ENABLE` all declare. amdgpu writes `0x1` to the live pin and only the
+  live pin. Honest note: the low byte of the reset value already matches amdgpu, so the stereo pair is
+  arguably fine untouched; whether the encoder derives layout from this register or from
+  `AFMT_AUDIO_CHANNEL_ENABLE` is **UNVERIFIED**. It earns its place because it is correct either way — a
+  no-op if the pair was already right, and the removal of a live contradiction if it was not.
+- **`HDMI_ACR_32_1` = 4096 and `HDMI_ACR_44_1` = 6272.** amdgpu writes all six ACR registers; agnos wrote only
+  N_48. With `HDMI_ACR_SELECT` cleared the hardware auto-selects the N/CTS pair from the incoming Fs, and
+  tonegen is locked to 48 kHz, so **this cannot be the current silence** — it becomes silence the moment
+  anything plays at 32 or 44.1 kHz. The CTS registers stay deliberately unwritten: inert under
+  `HDMI_ACR_SOURCE = 0`, and our PIT-derived clock would write 241502 where known-good is 241500.
+- **`AFMT_AUDIO_LAYOUT_OVRD` (bit 0) and `AFMT_60958_OSF_OVRD` (bit 28) now cleared** alongside the channel
+  enable, matching `dcn10_stream_encoder.c`. Known-good has both at 0.
+- **`AFMT_AUDIO_INFO0` read back as a health check.** amdgpu writes this register **nowhere** across
+  dcn10/dcn20/dce_stream_encoder/dce_audio, yet it reads `0x170` on this iron: checksum `0x70` and CC=1 (two
+  channels). The arithmetic is exact — HB0 `0x84` + HB1 `0x01` + HB2 `0x0A` + DB1 `0x01` = `0x90`, and
+  `0x100 - 0x90` = `0x70` — so the hardware built a valid, correctly-checksummed stereo Audio InfoFrame from
+  the `CHANNEL_SPEAKER` we wrote and left the evidence in a register. **It is a register to read, not to
+  write** — which also retires 1.55.13's open question about whether deleting the `AFMT_AUDIO_INFO0/1` writes
+  was a regression. It was not; those writes were always the wrong lever.
+
+### Fixed — a gate this cut had added, which would have eaten the burn
+
+- **`AFMT_AUDIO_CLOCK_ON` no longer aborts the audio path.** This cut originally turned `AFMT_CNTL` bit 8 into
+  a hard `return 0`, on the reasoning that a read-only hardware ack cannot echo our own write. The reasoning
+  is sound and the value was right (`DIG1_AFMT_CNTL` reads `0x101` with sound playing). **The gate was not.**
+  amdgpu polls this bit nowhere: `enc1_se_enable_audio_clock` carries its `REG_WAIT` commented out, under
+  *"wait for clock_on does not work well… audio seems work normally even without wait for clock_on status
+  change"* — and AMD's own expectation there was 1-2 reads. agnos read it **once, immediately, with no delay
+  and no retry**, and aborted before ACR, the channel enable, the channel status, the Audio InfoFrame and
+  `AFMT_AUDIO_SAMPLE_SEND`. A lagging ack would have killed the burn on a gate agnos invented, printed a line
+  blaming the clock, and sent the next session chasing a DCCG chain the dump already proves byte-correct.
+  It now reports and continues.
 
 ### Removed
 
