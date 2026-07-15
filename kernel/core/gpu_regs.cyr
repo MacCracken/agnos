@@ -295,6 +295,8 @@ var GPU_HDMI_ACR_CTS_48_SHIFT  = 12;
 # other register perfect — a prime silent-failure. Stereo = 0x03 in the field.
 var GPU_AFMT_CHANNEL_ENABLE_MASK = 0xFF00;
 var GPU_AFMT_CHANNEL_ENABLE_STEREO = 0x300;
+var GPU_AFMT_FIFO_OVERFLOW     = 0x1000000;  # AFMT_STATUS bit24 — STICKY: latches on the first overrun
+var GPU_AFMT_FIFO_OVERFLOW_ACK = 0x800000;   # AFMT_AUDIO_PACKET_CONTROL bit23 — write to clear the above
 var GPU_AFMT_AUDIO_LAYOUT_OVRD = 0x1;        # AFMT_AUDIO_PACKET_CONTROL2 bit0 — known-good = 0
 var GPU_AFMT_60958_OSF_OVRD    = 0x10000000; # AFMT_AUDIO_PACKET_CONTROL2 bit28 — known-good = 0
 var GPU_AFMT_AUDIO_SRC_SELECT_MASK = 0x7;  # must be 0..3 on Renoir — only 4 endpoints exist
@@ -355,6 +357,8 @@ var GPU_AZ_IX_CONV_STREAM_ID   = 0x03;  # F0 ordinal: STREAM_ID[7:4] — should 
 # 0/5/6/2, contradicting the two channels both the Audio InfoFrame and AFMT_AUDIO_CHANNEL_ENABLE declare.
 var GPU_AZ_IX_MULTICHANNEL_ENABLE = 0x36;
 var GPU_AZ_MULTICHANNEL_STEREO    = 0x1;
+var GPU_AZ_IX_CONV_FORMAT         = 0x02; # F0 ordinal: the HDA stream format the converter carries
+var GPU_AZ_IX_AUDIO_ENABLE_STATUS = 0x6B; # F0 ordinal: 1 while the endpoint is actually passing audio
 # The hardware's own Audio InfoFrame, read back. amdgpu writes AFMT_AUDIO_INFO0 NOWHERE (verified across
 # dcn10/dcn20/dce_stream_encoder/dce_audio) yet it reads 0x170 on this iron: AFMT_AUDIO_INFO_CHECKSUM[7:0] =
 # 0x70 and AFMT_AUDIO_INFO_CC[10:8] = 1 (two channels). The arithmetic is exact — HB0 0x84 + HB1 0x01 +

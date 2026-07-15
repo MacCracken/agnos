@@ -263,6 +263,13 @@ else
         # -device intel-hda). Instance 0 (analog) stays the default sink. Gated so the
         # production/MVP kernel stays single-controller. Drives scripts/hda-dual-smoke.sh.
         [ -n "$HDA_HDMI" ]           && echo '#define HDA_HDMI'
+        # HDMI_AUDIO_DUMP=1 — dump the display-audio register block AFTER the enable path
+        # has run, in the exact order + naming of agnosticos/scripts/dump-dcn-audio.py, so
+        # the agnos side can be DIFFED against the known-good captured off amdgpu on the
+        # same silicon (/tmp/amdgpu-good.txt). Diagnostic-only: this is a raw hex dump and
+        # therefore gated OUT of every normal build per the kernel-log rule (plain driver
+        # statements, never hex). Capture with: run /bin/klug > dump.txt
+        [ -n "$HDMI_AUDIO_DUMP" ]    && echo '#define HDMI_AUDIO_DUMP'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include

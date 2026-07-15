@@ -990,6 +990,11 @@ if (gpu_hdmi_audio_on == 1) {
     # where it is visible. LPIB advancing => the DMA is fetching PCM and the residual is downstream in the
     # DCN link/packet egress; LPIB frozen => nothing is being fetched and the display side is irrelevant.
     hda_dma_report();
+    #ifdef HDMI_AUDIO_DUMP
+    # Diagnostic build only: read back the whole display-audio block so it can be diffed against the
+    # known-good captured off amdgpu on this same silicon. Runs LAST, after every write has landed.
+    gpu_audio_dump();
+    #endif
     if (load64(&hda_out_dac + hda_active_ctl * 8) == 0) {
         # Say it plainly rather than let it surface as "the tone is silent".
         kprintln("hda: HDMI has no output DAC -- ring-3 audio will fail to open", 61);

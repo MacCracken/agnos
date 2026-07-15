@@ -2938,17 +2938,25 @@ fn gpu_hdmi_audio_enable() {
     & (0 - 1 - GPU_AZ_EXTRA_CONN_INFO_LSB);
     gpu_reg32_write(GPU_BASE_DCN_2, dr, spk | GPU_AZ_SPEAKER_FL_FR | GPU_AZ_HDMI_CONNECTION);
 
-    # The slot map. Untouched, this register reads 0x21615101 on this silicon — all four slot pairs enabled
-    # carrying channel IDs 0/5/6/2 — which contradicts the two channels CHANNEL_SPEAKER, the Audio InfoFrame
-    # and AFMT_AUDIO_CHANNEL_ENABLE all declare. amdgpu writes 0x1 to the live pin and only the live pin.
-    # A whole write is correct here: every field in the register is a slot field.
-    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
-    gpu_reg32_write(GPU_BASE_DCN_2, dr, GPU_AZ_MULTICHANNEL_STEREO);
-
     # Now enable the endpoint, then close the clock-gating bracket (amdgpu re-writes with the bit cleared).
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
     var hpc1 = gpu_reg32(GPU_BASE_DCN_2, dr);
     gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc1 | GPU_AZ_AUDIO_ENABLED);
+
+    # THE SLOT MAP — written AFTER AUDIO_ENABLED, and read back, because writing it BEFORE did not stick.
+    # Iron, 1.55.14 dump: agnos read AZ_MULTICHANNEL_ENABLE = 0 where amdgpu reads 1, while CHANNEL_SPEAKER
+    # (written in the same window, moments earlier) landed fine at 0x10001. So the window works and the
+    # ordinal is right — the endpoint clears this register across the AUDIO_ENABLED transition. That matters
+    # because MULTICHANNEL01_ENABLE is bit 0: at 0, NO slot pair is enabled, the AFMT has nowhere to drain
+    # samples, and the FIFO backs up — which is exactly the AFMT_AUDIO_FIFO_OVERFLOW (bit 24) that the same
+    # dump caught set on agnos and clear on amdgpu. Two registers, one bug.
+    # Never assume a write stuck: read it back and say so.
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, GPU_AZ_MULTICHANNEL_STEREO);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
+    if ((gpu_reg32(GPU_BASE_DCN_2, dr) & 0x1) == 0) {
+        kprintln("gpu: hdmi endpoint slot map did not take", 40);
+    }
     # CLOCK_ON_STATE is a READ-ONLY status, so unlike AUDIO_ENABLED it cannot echo our own write: 1 means the
     # audio wall clock genuinely reached the endpoint.
     var hpc2 = gpu_reg32(GPU_BASE_DCN_2, dr);
@@ -3099,11 +3107,118 @@ fn gpu_hdmi_audio_enable() {
         kprintln("gpu: hdmi audio infoframe not generated", 39);
     }
 
+    # AFMT_AUDIO_FIFO_OVERFLOW (AFMT_STATUS bit 24) is a STICKY status: it latches on the first overrun and
+    # stays set, so a bit read long after setup cannot distinguish "overflowing right now" from "overran once
+    # while the path was being built". The 1.55.14 dump caught it SET on agnos and CLEAR on amdgpu. Clear it
+    # here, now that the drain path is fully armed, and read it back: if it re-arms after the ack, samples
+    # genuinely cannot drain and the FIFO is still backing up; if it stays clear, the earlier read was a
+    # setup artifact and the overflow is not the fault. Ack is bit 23 of AFMT_AUDIO_PACKET_CONTROL.
+    var ao = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, ao | GPU_AFMT_FIFO_OVERFLOW_ACK);
+    if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + d) & GPU_AFMT_FIFO_OVERFLOW) != 0) {
+        kprintln("gpu: hdmi audio fifo overflowing", 32);
+    }
+
     gpu_hdmi_audio_on = 1;
     kprint("gpu: hdmi audio online (endpoint ", 33); kprint_num(az);
     kprint(" on dig ", 8); kprint_num(gpu_audio_dig); kprintln(")", 1);
     return 1;
 }
+
+#ifdef HDMI_AUDIO_DUMP
+# Dump the display-audio block AFTER the enable path has run, in the exact register order and naming of
+# agnosticos/scripts/dump-dcn-audio.py, so agnos's state can be diffed mechanically against the known-good
+# captured off amdgpu playing sound on this same silicon. Every claim made about agnos's registers so far
+# has been INFERRED FROM THE SOURCE and several were wrong; this reads the hardware.
+#
+# Diagnostic-only, gated out of every normal build: it is a raw hex dump, which the kernel-log rule forbids
+# in the production path. Capture with `run /bin/klug > dump.txt`.
+fn gpu_audio_dump() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_audio_dig < 0) { return 0; }
+    var d = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    var az = gpu_audio_dig;
+    var ir = GPU_R_AZ_ENDPOINT_INDEX + az * GPU_DCN_AZ_STRIDE;
+    var dr = GPU_R_AZ_ENDPOINT_DATA  + az * GPU_DCN_AZ_STRIDE;
+
+    kprintln("== agnos display-audio dump ==", 30);
+    kprint("DCCG_AUDIO_DTO_SOURCE  ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO_SRC)); kprintln("", 0);
+    kprint("DCCG_AUDIO_DTO0_PHASE  ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_PHASE)); kprintln("", 0);
+    kprint("DCCG_AUDIO_DTO0_MODULE ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE)); kprintln("", 0);
+    kprint("DIG_FE_CNTL            ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL + d)); kprintln("", 0);
+    kprint("HDMI_CONTROL           ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d)); kprintln("", 0);
+    kprint("HDMI_AUDIO_PKT_CONTROL ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d)); kprintln("", 0);
+    kprint("HDMI_ACR_PKT_CONTROL   ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d)); kprintln("", 0);
+    kprint("HDMI_VBI_PKT_CONTROL   ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL + d)); kprintln("", 0);
+    kprint("HDMI_INFOFRAME_CNTL0   ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d)); kprintln("", 0);
+    kprint("HDMI_INFOFRAME_CNTL1   ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d)); kprintln("", 0);
+    kprint("HDMI_GENERIC_PKT_CNTL0 ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d)); kprintln("", 0);
+    kprint("HDMI_GENERIC_PKT_CNTL1 ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL1 + d)); kprintln("", 0);
+    kprint("HDMI_GC                ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d)); kprintln("", 0);
+    kprint("AFMT_GENERIC_HDR       ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_HDR + d)); kprintln("", 0);
+    kprint("AFMT_GENERIC_0         ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_0 + d)); kprintln("", 0);
+    kprint("AFMT_GENERIC_2         ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_2 + d)); kprintln("", 0);
+    kprint("AFMT_GENERIC_3         ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_3 + d)); kprintln("", 0);
+    kprint("AFMT_VBI_PKT_CONTROL   ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL + d)); kprintln("", 0);
+    kprint("AFMT_AUDIO_PKT_CONTROL ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d)); kprintln("", 0);
+    kprint("AFMT_AUDIO_PKT_CNTL2   ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d)); kprintln("", 0);
+    kprint("AFMT_AUDIO_SRC_CONTROL ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d)); kprintln("", 0);
+    kprint("AFMT_INFOFRAME_CNTL0   ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d)); kprintln("", 0);
+    kprint("AFMT_AUDIO_INFO0       ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_INFO0 + d)); kprintln("", 0);
+    kprint("AFMT_60958_0           ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_0 + d)); kprintln("", 0);
+    kprint("AFMT_60958_1           ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_1 + d)); kprintln("", 0);
+    kprint("AFMT_60958_2           ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_2 + d)); kprintln("", 0);
+    kprint("AFMT_STATUS            ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + d)); kprintln("", 0);
+    kprint("AFMT_CNTL              ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d)); kprintln("", 0);
+    kprint("HDMI_ACR_48_1          ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d)); kprintln("", 0);
+    kprint("DIG_BE_CNTL            ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d)); kprintln("", 0);
+    # The AZ endpoint the AFMT is bound to — indexed window, same ordinals as the python dump.
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_CONV_FORMAT);
+    kprint("AZ_CONVERTER_FORMAT    ", 23); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr)); kprintln("", 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_CONV_STREAM_ID);
+    kprint("AZ_CHANNEL_STREAM_ID   ", 23); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr)); kprintln("", 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_CHANNEL_SPEAKER);
+    kprint("AZ_CHANNEL_SPEAKER     ", 23); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr)); kprintln("", 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
+    kprint("AZ_MULTICHANNEL_ENABLE ", 23); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr)); kprintln("", 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+    kprint("AZ_HOT_PLUG_CONTROL    ", 23); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr)); kprintln("", 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_AUDIO_ENABLE_STATUS);
+    kprint("AZ_AUDIO_ENABLE_STATUS ", 23); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr)); kprintln("", 0);
+    kprintln("== end dump ==", 14);
+    return 1;
+}
+#endif
 
 # gpu_release_pid — the display half of the per-pid release chain (cf. flock_release_pid / snd_release_pid):
 # if this process owned the scanout, hand the screen back to the console as it exits. A process that never
