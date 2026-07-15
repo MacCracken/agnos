@@ -766,6 +766,84 @@ fn hda_dma_report() {
     return 0;
 }
 
+# hda_hdmi_bind_single — bind the ONE live digital pin/converter and UNBIND the rest.
+#
+# THE BROADCAST IS THE BUG. hda_codec_route()'s digital branch enables EVERY digital pin and binds EVERY
+# converter to the same stream tag, because at route time agnos cannot tell which pin has the display
+# (uniform Get Pin Sense 0x7fffffff, identical config defaults). Linux NEVER does this — hdmi_choose_cvt()
+# picks ONE converter for ONE pin — and patch_hdmi.c says why, in generic_hdmi_playback_pcm_prepare():
+#
+#   "Verify pin:cvt selections to avoid silent audio ... multiple pins can share a same default convertor
+#    and mute control will affect each other, which can cause a resumed audio playback become silent"
+#
+# MULTIPLE PINS SHARING A CONVERTER => SILENT AUDIO. That is agnos's design, and agnos's symptom.
+#
+# Compare agnos's OWN WORKING PATH: the analog branch binds ONE pin (0x1b) to ONE dac (0x02) and plays.
+# The digital branch binds four and is silent. The working reference was in the same function all along.
+#
+# By the time this runs the ordinal is KNOWN: gpu_hdmi_audio_enable() found the live encoder (DIG1) and the
+# AFMT is bound to AZ endpoint 1, whose codec pin is the 2nd digital pin (0x05) / converter 0x04 — the pair
+# the sink's ELD names. hda_codec_route() runs ~300 lines earlier in boot and cannot know this; that is why
+# hda_force_digi_ord exists and why it was never set. This is the fixup pass that closes that seam.
+fn hda_hdmi_bind_single(ord) {
+    if (load64(&hda_present + hda_active_ctl * 8) == 0) { return 0; }
+    var codec = load64(&hda_codec0 + hda_active_ctl * 8);
+    var seen = 0;
+    var bound_pin = 0;
+    var bound_cvt = 0;
+    var wi = 0;
+    while (wi < load64(&hda_w_count + hda_active_ctl * 8)) {
+        var nid = load64(&hda_w_start + hda_active_ctl * 8) + wi;
+        var wcap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_WCAP);
+        if (((wcap >> 20) & 0xF) == WID_PIN) {
+            var pcap = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_PINCAP);
+            var cfg  = hda_verb(codec, nid, (V_GET_CFGDEF << 8) | 0);
+            var ddev = (cfg >> 20) & 0xF;
+            var conn = (cfg >> 30) & 0x3;
+            var dig  = ((pcap & (PINCAP_HDMI | PINCAP_DP)) != 0) || (ddev == DEV_SPDIF_OUT || ddev == DEV_DIG_OTHER_OUT);
+            if ((pcap & PINCAP_OUT) != 0 && dig != 0 && conn != 1) {
+                # this pin's converter (HDMI/DP pins connect direct, 1 hop)
+                var cl = hda_verb(codec, nid, (V_GET_PARAM << 8) | P_CONNLEN) & 0x7F;
+                var cvt = 0;
+                if (cl > 0) {
+                    var sel = hda_verb(codec, nid, (V_GET_CONNSEL << 8) | 0) & 0xFF;
+                    if (sel >= cl) { sel = 0; }
+                    var lw = hda_verb(codec, nid, (V_GET_CONNLIST << 8) | (sel & 0xFC));
+                    cvt = (lw >> ((sel & 0x3) * 8)) & 0xFF;
+                }
+                if (cvt != 0) {
+                    if (seen == ord) {
+                        # THE LIVE PAIR: bind it to the stream tag and light the pin.
+                        hda_verb(codec, cvt, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
+                        hda_verb(codec, cvt, (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
+                        hda_verb(codec, cvt, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
+                        hda_verb(codec, nid, (V_SET_PINCTL << 8) | PINCTL_OUT_EN);
+                        bound_pin = nid;
+                        bound_cvt = cvt;
+                    } else {
+                        # EVERY OTHER digital pin: UNBIND its converter (stream 0 = no stream) and drop
+                        # the pin's output enable, so nothing else shares our converter or our tag.
+                        hda_verb(codec, cvt, (V_SET_STREAMID << 8) | 0);
+                        hda_verb(codec, nid, (V_SET_PINCTL << 8) | 0);
+                    }
+                    seen = seen + 1;
+                }
+            }
+        }
+        wi = wi + 1;
+    }
+    if (bound_pin == 0) {
+        kprintln("hda: hdmi single-bind found no pin at the encoder ordinal", 57);
+        return 0;
+    }
+    store64(&hda_out_pin + hda_active_ctl * 8, bound_pin);
+    store64(&hda_out_dac + hda_active_ctl * 8, bound_cvt);
+    kprint("hda: hdmi bound pin 0x", 22); kprint_byte(bound_pin);
+    kprint(" cvt 0x", 7); kprint_byte(bound_cvt);
+    kprintln(" only (others unbound)", 22);
+    return 1;
+}
+
 fn hda_codec_route() {
     if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_codec_mask + hda_active_ctl * 8) == 0) { return 0; }
     if (load64(&hda_afg + hda_active_ctl * 8) == 0 || load64(&hda_w_count + hda_active_ctl * 8) == 0) { return 0; }

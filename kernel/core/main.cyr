@@ -968,6 +968,18 @@ gpu_hdmi_audio_enable();
 # came up — otherwise instance 0 stays the sink and the analog path keeps working.
 if (gpu_hdmi_audio_on == 1) {
     hda_active_ctl = 1;
+    # THE SEAM, FINALLY CLOSED. hda_codec_route() ran ~300 lines up and could not know which digital pin has
+    # the display, so its digital branch BROADCASTS: every pin enabled, every converter bound to one tag.
+    # patch_hdmi.c names that exact design as a cause of silent audio ("multiple pins can share a same
+    # default convertor ... can cause a resumed audio playback become silent"), and Linux never does it —
+    # hdmi_choose_cvt picks ONE converter for ONE pin. agnos's own ANALOG branch binds one pin to one dac
+    # and plays; the digital branch binds four and is silent. The working reference was in the same function.
+    #
+    # By now the ordinal IS known: gpu_hdmi_audio_enable() found the live encoder and bound the AFMT to AZ
+    # endpoint `gpu_audio_dig`, whose codec pin is that ordinal among the digital pins — the pair the sink's
+    # ELD names (0x05 / 0x04 on this panel). That is what hda_force_digi_ord was declared for and never set.
+    hda_force_digi_ord = gpu_audio_dig;
+    hda_hdmi_bind_single(gpu_audio_dig);
     # Report BEFORE the re-route, never after. This line is the only window onto the codec half, and putting
     # it behind the code it exists to diagnose is how a burn comes back saying nothing at all.
     kprint("hda: sink ctl=", 14); kprint_num(hda_active_ctl);
