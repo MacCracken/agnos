@@ -179,6 +179,20 @@ var GPU_R_DIG_BE_CNTL         = 0x20AF; # DIG_MODE[18:16] — trust only 3 == HD
 var GPU_R_DP_VID_STREAM_CNTL  = 0x210C; # DP_VID_STREAM_ENABLE b0, _STATUS b16 — DP confirm
 var GPU_R_AFMT_STATUS         = 0x20A9; # AFMT_AUDIO_ENABLE b4 (the phase gate), AFMT_AUDIO_FIFO_OVERFLOW b24
 var GPU_DIG_SYMCLK_FE_ON      = 0x1000000; # DIG_FE_CNTL bit24
+# DIG_STEREOSYNC_GATE_EN (DIG_FE_CNTL bit8) — THE ONLY UNEXPLAINED CAUSAL DIFFERENCE left on this block.
+# The 2026-07-15 known-good capture diffed 30 registers between agnos (silent) and amdgpu (audibly playing)
+# on this exact silicon: 26 byte-identical, AFMT_GENERIC_0 deliberate (our link is RGB, amdgpu's YCbCr444),
+# DTO0_MODULE 8 ppm (refuted, inaudible), AFMT_STATUS the overflow itself (the SYMPTOM) — and this bit.
+#   amdgpu: DIG_FE_CNTL = 0x01000100  (bit8 SET)
+#   agnos:  DIG_FE_CNTL = 0x01000000  (bit8 CLEAR — as the GOP left it; agnos never touches this register)
+# amdgpu sets it in enc1_setup_stereo_sync: `REG_UPDATE(DIG_FE_CNTL, DIG_STEREOSYNC_GATE_EN, !enable)` —
+# so with 3D stereo OFF (always, here) the gate goes ON.
+# HONEST: the MECHANISM is unproven. "Stereosync" is the 3D frame-alternate sync, not 2-channel audio, and
+# no source explains how an ungated stereosync would stall the audio FIFO. It earns the write on two
+# grounds only: it is the sole unexplained divergence in a 30-register comparison where everything else
+# matches, and matching amdgpu's value is safe and reversible. It is a HYPOTHESIS, not a diagnosis — do not
+# let this comment harden into a claim.
+var GPU_DIG_STEREOSYNC_GATE_EN = 0x100;    # DIG_FE_CNTL bit8
 var GPU_DIG_ENABLE            = 0x1;    # DIG_BE_EN_CNTL bit0
 var GPU_DIG_MODE_HDMI         = 0x3;    # DIG_BE_CNTL DIG_MODE == 3 => HDMI (authoritative value)
 var GPU_AFMT_AUDIO_ENABLE     = 0x10;   # AFMT_STATUS bit4
@@ -356,9 +370,30 @@ var GPU_AFMT_FIFO_OVERFLOW_ACK = 0x800000;   # AFMT_AUDIO_PACKET_CONTROL bit23 �
 # unreadable. Rejected for this reason; do not re-propose it without arming 0x64 first.
 var GPU_R_AFMT_AUDIO_CRC_CONTROL = 0x20A2;  # CRC_EN b0 · CRC_CONT b4 · CRC_SOURCE b8 · CH_SEL [15:12] · COUNT [31:16]
 var GPU_R_AFMT_AUDIO_CRC_RESULT  = 0x20A8;  # CRC_DONE b0 (RO) · CRC [31:8] (RO)
+
+# HDMI_STATUS — READ-ONLY, and the only register on this whole block that is a hardware VERDICT rather than
+# an echo of our own write. Nobody has ever read it: not agnos, not the dump script, not fourteen burns.
+# HDMI_AUDIO_PACKET_ERROR is the direct answer to "is the packet engine choking on our audio?", and
+# HDMI_ACTIVE_AVMUTE is the direct answer to "is the sink being told to mute?" — both questions this arc has
+# only ever inferred. Offsets + every bit position confirmed against Linux v6.6 dcn_2_1_0_offset.h
+# (mmDIG0_HDMI_STATUS = 0x2072) and dcn_2_1_0_sh_mask.h.
+var GPU_R_HDMI_STATUS            = 0x2072;
+var GPU_HDMI_ACTIVE_AVMUTE       = 0x1;         # bit0  — sink is being commanded to mute
+var GPU_HDMI_AUDIO_PACKET_ERROR  = 0x10000;     # bit16 — the packet engine rejected an audio packet
+var GPU_HDMI_VBI_PACKET_ERROR    = 0x100000;    # bit20
+var GPU_HDMI_ERROR_INT           = 0x8000000;   # bit27
+
+# The ACR engine's own report. agnos deliberately declines to write the CTS registers (HDMI_ACR_SOURCE=0 ⇒
+# hardware-measured CTS), and that reasoning has survived two audits — but NOBODY HAS EVER READ what the
+# hardware actually measured. Free to read; rides any dump.
+var GPU_R_HDMI_ACR_STATUS_0      = 0x209C;
+var GPU_R_HDMI_ACR_STATUS_1      = 0x209D;
+var GPU_R_HDMI_DB_CONTROL        = 0x2088;
 var GPU_AFMT_AUDIO_CRC_EN        = 0x1;
 var GPU_AFMT_AUDIO_CRC_CONT      = 0x10;
 var GPU_AFMT_AUDIO_CRC_DONE      = 0x1;
+var GPU_AFMT_AUDIO_CRC_SOURCE_SHIFT = 8;   # CRC_SOURCE is ONE bit (sh_mask shift 0x8, mask 0x100) selecting
+# between two taps. WHICH tap is which is UNDOCUMENTED — probe both.
 var GPU_AFMT_AUDIO_CRC_COUNT_SHIFT = 16;
 # 2048 samples @ 48 kHz = ~43 ms of audio — long enough that a running stream completes it comfortably,
 # short enough that a dead one does not stall the boot behind the bounded wait below.
@@ -423,6 +458,37 @@ var GPU_AZ_IX_CONV_STREAM_ID   = 0x03;  # F0 ordinal: STREAM_ID[7:4] — should 
 # 0/5/6/2, contradicting the two channels both the Audio InfoFrame and AFMT_AUDIO_CHANNEL_ENABLE declare.
 var GPU_AZ_IX_MULTICHANNEL_ENABLE = 0x36;
 var GPU_AZ_MULTICHANNEL_STEREO    = 0x1;
+
+# --- The AZ ordinals agnos has never read. Every value below is MEASURED off amdgpu on this exact silicon
+#     while the panel was audibly playing (prior-art: agnosticos known-good capture, 2026-07-15), so each
+#     one now has an answer key. Ordinals confirmed against Linux v6.6 dcn_2_1_0_offset.h AND umr's
+#     green_sardine.asic — the same two sources that confirmed the six we already had.
+#
+# THE TWO THAT MATTER:
+var GPU_AZ_IX_DIGITAL_OUTPUT_STATUS = 0x63; # OUTPUT_ACTIVE bit0, READ-ONLY. amdgpu=1 while playing.
+# The direct answer to "is this pin transmitting?" — a question
+# this arc has only ever inferred. agnos=0 would collapse the
+# search onto the encoder in one reading.
+var GPU_AZ_IX_LPIB                  = 0x65; # the endpoint's OWN link position. amdgpu=0x00019128 — LIVE.
+# Rejected earlier because amdgpu reads it nowhere in the whole
+# amd tree, so nothing proved it wasn't dead silicon on DCN 2.1.
+# MEASUREMENT OVERRULED THAT: it moves. Read it twice; a static
+# value stays uninformative, never a verdict.
+var GPU_AZ_OUTPUT_ACTIVE            = 0x1;  # DIGITAL_OUTPUT_STATUS bit0
+# The rest — read for the corpus, so one burn closes the AZ diff instead of one register per burn:
+var GPU_AZ_IX_CONV_WIDGET_CAPS      = 0x01; # amdgpu=0x00000221
+var GPU_AZ_IX_CONV_DIGITAL_CONVERTER = 0x04; # amdgpu=0x00000001 (DIGEN as the ENDPOINT sees it)
+var GPU_AZ_IX_PIN_CAPS              = 0x21; # amdgpu=0x00000094
+var GPU_AZ_IX_PIN_SENSE             = 0x23; # amdgpu=0x7fffffff
+var GPU_AZ_IX_PIN_WIDGET_CONTROL    = 0x24; # amdgpu=0x00000040 (PINCTL_OUT_EN, mirrored from the codec)
+var GPU_AZ_IX_AUDIO_DESCRIPTOR0     = 0x28; # amdgpu=0x07070701 — WRITTEN by dce_aud_az_configure from the
+# sink's ELD. agnos writes NOTHING here; if it reads 0 the
+# endpoint believes the sink supports no format at all.
+var GPU_AZ_IX_RESPONSE_HBR          = 0x38; # amdgpu=0x00000001
+var GPU_AZ_IX_SINK_INFO0            = 0x3A; # amdgpu=0x07757204 — the ELD amdgpu pushes into the endpoint
+var GPU_AZ_IX_MULTICHANNEL_MODE     = 0x58; # amdgpu=0x00000001 — a CONTROL agnos never writes
+var GPU_AZ_IX_CODING_TYPE           = 0x67; # amdgpu=0x00000000
+var GPU_AZ_IX_FORMAT_CHANGED        = 0x68; # amdgpu=0x00000000
 var GPU_AZ_IX_CONV_FORMAT         = 0x02; # F0 ordinal: the HDA stream format the converter carries
 var GPU_AZ_IX_AUDIO_ENABLE_STATUS = 0x6B; # F0 ordinal: 1 while the endpoint is actually passing audio
 # The hardware's own Audio InfoFrame, read back. amdgpu writes AFMT_AUDIO_INFO0 NOWHERE (verified across

@@ -5,6 +5,165 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### The known-good was finally captured, and the diff is FOUR registers
+
+**2026-07-15.** The artifact fourteen burns were missing now exists: the complete BAR5 state amdgpu leaves
+while HDMI audio is **audibly playing** on this silicon —
+`agnosticos/docs/development/prior-art/dcn-audio-live-amdgpu-known-good-2026-07-15.md`. Every prior
+"known-good" was ~13 registers *quoted from a changelog*; every adversarial refutation on this arc ended in
+*"no known-good value exists, so the read is uninterpretable."* That corpus gap — not a shortage of ideas —
+was the blocker. It is closed.
+
+**Thirty registers compared. Twenty-six byte-identical.** The four that differ:
+
+| register | agnos (silent) | amdgpu (audible) | verdict |
+|---|---|---|---|
+| `AFMT_GENERIC_0` | `0x00081ecf` | `0x80885e8f` | **deliberate** — our link is RGB, amdgpu drives YCbCr444 |
+| `DCCG_AUDIO_DTO0_MODULE` | `0x0024d9ac` | `0x0024d998` | 8 ppm — already refuted, inaudible |
+| `AFMT_STATUS` | `0x41000010` | `0x40000010` | **the symptom** (see below) |
+| **`DIG_FE_CNTL`** | **`0x01000000`** | **`0x01000100`** | **the only unexplained causal difference** |
+
+**The FIFO overflow is confirmed abnormal.** `AFMT_STATUS` bit 24 is **clear** on the working path and
+**set** on agnos. amdgpu does not overflow while playing; agnos does. The bisection — samples in, nothing
+out — **survives**, and is now evidence rather than the over-read it was when written.
+
+**And it retires a false record.** The 1.55.14 ledger called `AFMT_STATUS` bit 30
+(`AFMT_AZ_AUDIO_ENABLE_CHG`) *"the only unexplained diff left on the block"*, reading 1 on agnos and 0 on
+amdgpu. **It reads 1 on amdgpu too** (`0x40000010`). That entry was wrong, and two cuts carried it forward.
+
+#### `DIG_FE_CNTL` bit 8 — `DIG_STEREOSYNC_GATE_EN`
+
+The sole unexplained divergence. amdgpu sets it in `enc1_setup_stereo_sync`
+(`REG_UPDATE(DIG_FE_CNTL, DIG_STEREOSYNC_GATE_EN, !enable)` — with 3D stereo off, the gate goes on); the
+GOP left it clear and agnos never touched that register. agnos now matches amdgpu.
+
+**Stated honestly: the mechanism is unproven.** "Stereosync" is the 3D frame-alternate sync, not 2-channel
+audio, and nothing explains how an ungated stereosync would stall an audio FIFO. It earns the write on two
+grounds only — it is the last unexplained difference in a 30-register comparison where everything else
+matches, and matching amdgpu is safe and reversible. **A hypothesis, not a diagnosis.**
+
+#### The AZ endpoint: agnos reads 6 ordinals, amdgpu's capture has 34
+
+Two of the missing ones are the instruments this arc has needed all along, and both now have an answer key:
+
+- **`DIGITAL_OUTPUT_STATUS` (`0x63`)** — `OUTPUT_ACTIVE`, **read-only**. amdgpu reads **1** while playing.
+  The direct answer to "is this pin transmitting?", a question fourteen burns only ever inferred.
+- **`LPIB` (`0x65`)** — amdgpu reads **`0x00019128`**: live and non-zero. This register was **rejected as an
+  instrument** earlier this session on the grounds that amdgpu reads it *nowhere* in the entire
+  `drivers/gpu/drm/amd` tree, so nothing proved it wasn't dead silicon on DCN 2.1. **Measurement overruled
+  the reasoning.** It works. Read twice, so a frozen counter is distinguishable from a moving one.
+
+Also newly on record and never written by agnos: `AUDIO_DESCRIPTOR0 = 0x07070701` (amdgpu builds it from
+the sink's ELD in `dce_aud_az_configure`), `MULTICHANNEL_MODE (0x58) = 1`, `RESPONSE_HBR = 1`, and
+`SINK_INFO0..5`. agnos has no equivalent of `dce_aud_az_configure` at all. And `CONVERTER_FORMAT` differs —
+agnos `0x11` (16-bit), amdgpu `0x31` (24-bit) — both legal; recorded, not suspected.
+
+agnos now dumps all of them: **one burn closes the entire AZ diff** instead of one register per burn.
+
+#### The CRC probe now measures BOTH taps
+
+The control run on amdgpu (`dcn-audio-crc-probe-control-2026-07-15.md`) settled what it could: on an
+audibly-working path **both** taps complete, with **different** CRCs (`0x7fe228` vs `0x525ae0`). So the
+block is real and the taps are genuinely distinct — but on a working path both input *and* output see
+samples, so that cannot say which is which. **The discriminator is on the broken path**, and agnos now runs
+both:
+
+- **both complete** → samples reach both taps; the fault is past the encoder.
+- **`0` completes, `1` does not** → the fault sits *between* the taps. The bisection is proven.
+- **neither** → nothing arrives, and the codec half is back in scope.
+
+### The CRC probe fired, and it bisected the arc: samples reach the encoder and never leave it
+
+**Iron, 1.55.15, 2026-07-15.** The first burn of `gpu_hdmi_audio_crc_probe` answered the question thirteen
+burns could not:
+
+```
+gpu: hdmi audio samples reaching the encoder (crc 62ea5b)
+AFMT_AUDIO_CRC_RESULT  62ea5b00
+AFMT_STATUS            41000010     <- was 40000010 at 1.55.14
+```
+
+**Fact 1 — samples arrive, with content.** `CRC_DONE` asserted over 2048 samples and the CRC read `0x62EA5B`
+— non-zero, so not digital silence. The HDA DMA, the HDA link, the codec converter, the stream/tag binding
+and the FIFO input are **all exonerated by measurement**. That is the entire upstream half of the chain, and
+it is the half every previous burn was aimed at.
+
+**Fact 2 — the FIFO is overflowing, continuously.** `AFMT_STATUS` bit 24 (`AFMT_AUDIO_FIFO_OVERFLOW`) is
+**set**. The only difference between the 1.55.14 dump (`0x40000010`, clear) and this one (`0x41000010`, set)
+is the ~300 ms the CRC probe spends between the overflow-ack and the dump. **Given 300 ms, it overflows
+again.**
+
+**So: samples go in and nothing comes out.** Input at 48 kHz, output at approximately zero. The fault is in
+the AFMT → HDMI data-island transmission — downstream of the FIFO input, upstream of the sink. The arc's
+search space just collapsed from "36 registers and a codec" to "why is this encoder not emitting islands".
+
+> **⚠ THAT PARAGRAPH IS AN OVER-READ. Both of its facts rest on assumptions nobody has verified,** and a
+> 53-agent adversarial audit found them within hours of it being written. Recorded rather than deleted,
+> because the over-read is the lesson:
+>
+> - **`AFMT_AUDIO_CRC_SOURCE = 0` has unknown semantics.** It is a 1-bit field (`sh_mask` shift `0x8`,
+>   mask `0x100`) and **no source says whether 0 taps the FIFO *input* or the packetized *output*.** If it
+>   taps the input, then "2048 samples traversed the AFMT" collapses to "2048 samples *arrived*" — which
+>   the overflow already told us, and which proves nothing about the drain. **agnos verified the CRC
+>   registers' offsets and bit positions and then failed to verify what the field selects** — the exact
+>   error this arc had *just* written a rule against: *verify an ordinal's semantics, not its number.*
+> - **Nobody knows whether `AFMT_AUDIO_FIFO_OVERFLOW` is abnormal.** There is no reading of `AFMT_STATUS`
+>   from amdgpu **while sound plays** anywhere in the corpus. It is a *sticky* bit. If it latches once at
+>   stream start and no driver ever acks it, amdgpu may read bit 24 set while audibly playing — in which
+>   case the drain is fine and this "finding" is a normal bit.
+>
+> The bisection may still be right. It is simply **not evidence yet**, and the arc has spent fourteen burns
+> on claims that felt this solid. Both questions are settled by reading amdgpu, which costs zero burns.
+
+**This also retracts 1.55.15's own ledger entry**, which recorded the overflow as a setup artifact on the
+grounds that it "stays clear" after the ack. It stayed clear because it was re-read microseconds later —
+far too soon for a 48 kHz stream to refill it. That read measured the ack, not the drain. The correction is
+annotated in place below.
+
+Corroboration that this is agnos's bug and not the hardware's: the same panel plays HDMI audio under amdgpu
+on this machine, operator-confirmed by ear the same day.
+
+### Added — `HDMI_STATUS`, the read-only verdict nobody had ever read
+
+Fourteen burns, and **not one of them read `HDMI_STATUS` (`mmDIG0_HDMI_STATUS = 0x2072`, BASE_IDX 2)** —
+which is read-only and therefore *cannot echo our own writes*, the property every other register on this
+block lacks. Neither agnos nor `dump-dcn-audio.py` had a constant for it.
+
+- **`HDMI_AUDIO_PACKET_ERROR` (bit 16)** — the direct answer to "is the packet engine rejecting our audio?",
+  a question this arc has only ever inferred.
+- **`HDMI_ACTIVE_AVMUTE` (bit 0)** — the direct answer to "is the sink being told to mute?"
+- Plus `HDMI_VBI_PACKET_ERROR` (20) and `HDMI_ERROR_INT` (27).
+
+agnos now reports both as plain driver lines, and `HDMI_STATUS` / `HDMI_DB_CONTROL` (`0x2088`) /
+`HDMI_ACR_STATUS_0`/`_1` (`0x209C`/`0x209D`) join both dumps. The ACR status matters specifically because
+agnos *deliberately declines* to write the CTS registers (`HDMI_ACR_SOURCE = 0` ⇒ hardware-measured CTS) —
+reasoning that has survived two audits — and **nobody has ever read what the hardware actually measured.**
+
+Offsets and bit positions confirmed against Linux v6.6 `dcn_2_1_0_offset.h` + `dcn_2_1_0_sh_mask.h`.
+
+### Verified against real source, and cleared — recorded so they are not re-chased
+
+A register-by-register decode of the 1.55.15 dump against fetched `dcn_2_1_0_sh_mask.h`, compared to
+`enc1_stream_encoder_hdmi_set_stream_attribute`:
+
+- **`DIG_MODE` is 3 (TMDS-HDMI), not 2 (TMDS-DVI).** The field is at shift `0x10`, not bits 10:8. A
+  hand-decode using the wrong shift read `DIG_BE_CNTL = 0x10030200` as DVI and briefly looked like it
+  explained everything. It does not. **The link is genuinely in HDMI mode.**
+- **`HDMI_CONTROL = 0x10019` matches all six fields amdgpu sets**, exactly: `PACKET_GEN_VERSION=1`,
+  `KEEPOUT_MODE=1`, `DEEP_COLOR_ENABLE=0`, `DATA_SCRAMBLE_EN=0`, `NO_EXTRA_NULL_PACKET_FILLED=1`,
+  `CLOCK_CHANNEL_RATE=0`, and `DEEP_COLOR_DEPTH=0` for `COLOR_DEPTH_888`.
+- **`HDMI_VBI_PACKET_CONTROL = 0x31`** = `GC_CONT` + `GC_SEND` + `NULL_SEND`, and
+  **`HDMI_INFOFRAME_CONTROL0 = 0x10`** (`AUDIO_INFO_SEND=1`), **`CONTROL1 = 0x200`** (`AUDIO_INFO_LINE=2`),
+  **`HDMI_GC.AVMUTE = 0`** — all exactly what amdgpu writes.
+- **`DIG_START = 0` is correct.** It looked alarming; both amdgpu call sites are in the **DP** path, and
+  dcn20 states it outright: *"write 0 to take the FIFO out of reset"*. 0 is the running state.
+- **`AFMT_60958_CS_UPDATE` is bit 26, not bit 11** — agnos's constant (`0x4000000`) was already right. Bit
+  11 of `AFMT_AUDIO_PACKET_CONTROL` is `AFMT_RESET_FIFO_WHEN_AUDIO_DIS`, a reset-value bit.
+- **`AFMT_AZ_AUDIO_ENABLE_CHG_ACK` is not required** — amdgpu writes it **nowhere** across four
+  generations and plays sound. A bit the working driver never touches cannot gate the drain.
+
+**The uncomfortable summary: every register agnos writes that has a known-good value on record matches it.**
+
 ### Added — the audio CRC: the first instrument on this block that answers instead of echoes
 
 Not cut. Staged for the next measurement burn.
@@ -189,6 +348,11 @@ The SMU accepted the message on iron. It did not produce sound.
   now acked (`AFMT_AUDIO_PACKET_CONTROL` bit 23) once the drain path is fully armed, then re-read: re-arms
   means samples genuinely cannot drain; stays clear means the earlier read was a setup artifact. On iron it
   **stays clear** — so the overflow 1.55.14 recorded was an artifact, and is not the fault.
+  > **⚠ THIS CONCLUSION IS WRONG, and the next burn proved it.** The re-read was taken *microseconds* after
+  > the ack, which is not long enough for a 48 kHz stream to refill the FIFO. With the ~300 ms CRC probe
+  > inserted between the ack and the dump, `AFMT_STATUS` reads `0x41000010` — **bit 24 set again**. The FIFO
+  > is overflowing **continuously**. "Acked and immediately clear" measured the ack, not the drain. See
+  > `[Unreleased]`.
 - **`gpu_audio_dump()`**, behind a new `HDMI_AUDIO_DUMP` build flag: reads the whole display-audio block
   back **after** every write has landed, in the exact register order and naming of
   `agnosticos/scripts/dump-dcn-audio.py`, so agnos can be diffed against the known-good capture

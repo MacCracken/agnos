@@ -3173,9 +3173,27 @@ fn gpu_hdmi_audio_enable() {
     kprint("gpu: hdmi audio online (endpoint ", 33); kprint_num(az);
     kprint(" on dig ", 8); kprint_num(gpu_audio_dig); kprintln(")", 1);
 
+    # The only unexplained causal difference the known-good capture found. 30 registers compared against
+    # amdgpu audibly playing on this silicon: 26 identical, two deliberate/benign, one the overflow symptom
+    # — and this bit. amdgpu sets it (enc1_setup_stereo_sync writes !stereo_enable, and stereo is always off
+    # here); the GOP left it clear and agnos never touched this register. Matching amdgpu is safe and
+    # reversible; the MECHANISM is unproven and this is a hypothesis, not a diagnosis.
+    var fec = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL + d, fec | GPU_DIG_STEREOSYNC_GATE_EN);
+
     # THE ONE QUESTION EVERY LINE ABOVE BEGS. Everything printed so far is an echo of a write: the endpoint
     # says it is enabled because we enabled it. This asks the hardware something it has to answer for itself.
     gpu_hdmi_audio_crc_probe(d);
+
+    # HDMI_STATUS is READ-ONLY and cannot echo anything we wrote. Two bits, two answers this arc has only
+    # ever inferred: is the packet engine rejecting our audio, and is the sink being told to mute.
+    var hs = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_STATUS + d);
+    if ((hs & GPU_HDMI_AUDIO_PACKET_ERROR) != 0) {
+        kprintln("gpu: hdmi encoder reports an audio packet error", 47);
+    }
+    if ((hs & GPU_HDMI_ACTIVE_AVMUTE) != 0) {
+        kprintln("gpu: hdmi link is muted (AVMUTE active on the wire)", 51);
+    }
     return 1;
 }
 
@@ -3198,10 +3216,27 @@ fn gpu_hdmi_audio_enable() {
 #       back and so nothing validates the DONE semantics on DCN 2.1. Do not turn a non-answer into a
 #       verdict; that is how the last twelve burns were spent.
 fn gpu_hdmi_audio_crc_probe(d) {
+    # BOTH TAPS. AFMT_AUDIO_CRC_SOURCE is a 1-bit field and no source says whether 0 is the FIFO input or
+    # the packetized output — so a single reading cannot tell "samples arrive" from "samples egress", and
+    # 1.55.15 over-read exactly that. The control run on amdgpu settled what it could: on an AUDIBLY WORKING
+    # path BOTH taps complete, with different CRCs (source 0 = 0x7fe228, source 1 = 0x525ae0), so both are
+    # real and distinct. That means the discriminator is HERE, on the broken path:
+    #   both complete  ⟹ samples reach both taps; the fault is past the encoder (link/sink).
+    #   0 completes, 1 does not ⟹ the fault sits BETWEEN the taps — the bisection is proven, and whichever
+    #                             tap 1 is, agnos does not reach it.
+    #   neither ⟹ nothing arrives at all and the codec half is back in scope.
+    gpu_hdmi_audio_crc_one(d, 0);
+    gpu_hdmi_audio_crc_one(d, 1);
+    return 1;
+}
+
+# One CRC measurement at one tap. Returns 1 if it completed.
+fn gpu_hdmi_audio_crc_one(d, source) {
     # Disarm first: the counter is free-running once enabled, and re-arming a live one races its own DONE.
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d, 0);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d,
-    (GPU_AFMT_AUDIO_CRC_SAMPLES << GPU_AFMT_AUDIO_CRC_COUNT_SHIFT) | GPU_AFMT_AUDIO_CRC_EN);
+    (GPU_AFMT_AUDIO_CRC_SAMPLES << GPU_AFMT_AUDIO_CRC_COUNT_SHIFT)
+    | ((source & 0x1) << GPU_AFMT_AUDIO_CRC_SOURCE_SHIFT) | GPU_AFMT_AUDIO_CRC_EN);
 
     # 2048 samples at 48 kHz is ~43 ms. Wait up to ~300 ms: generous enough that a running stream always
     # finishes, bounded so a dead one costs a third of a second of boot rather than hanging the box on a
@@ -3221,17 +3256,18 @@ fn gpu_hdmi_audio_crc_probe(d) {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d, 0);
 
     if (done == 0) {
-        kprintln("gpu: hdmi audio sample flow unconfirmed (crc did not complete)", 62);
+        kprint("gpu: hdmi audio tap ", 20); kprint_num(source);
+        kprintln(" saw no samples (crc did not complete)", 38);
         return 0;
     }
     var crc = (res >> 8) & 0xFFFFFF;
     if (crc == 0) {
-        kprintln("gpu: hdmi audio samples reaching the encoder, but they are silence", 66);
+        kprint("gpu: hdmi audio tap ", 20); kprint_num(source);
+        kprintln(" saw samples, but they are silence", 34);
         return 1;
     }
-    kprint("gpu: hdmi audio samples reaching the encoder (crc ", 50);
-    kprint_hex(crc);
-    kprintln(")", 1);
+    kprint("gpu: hdmi audio tap ", 20); kprint_num(source);
+    kprint(" saw samples (crc ", 18); kprint_hex(crc); kprintln(")", 1);
     return 1;
 }
 
@@ -3262,6 +3298,14 @@ fn gpu_audio_dump() {
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL + d)); kprintln("", 0);
     kprint("HDMI_CONTROL           ", 23);
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d)); kprintln("", 0);
+    kprint("HDMI_STATUS            ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_STATUS + d)); kprintln("", 0);
+    kprint("HDMI_DB_CONTROL        ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_DB_CONTROL + d)); kprintln("", 0);
+    kprint("HDMI_ACR_STATUS_0      ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_STATUS_0 + d)); kprintln("", 0);
+    kprint("HDMI_ACR_STATUS_1      ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_STATUS_1 + d)); kprintln("", 0);
     kprint("HDMI_AUDIO_PKT_CONTROL ", 23);
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d)); kprintln("", 0);
     kprint("HDMI_ACR_PKT_CONTROL   ", 23);
@@ -3331,8 +3375,55 @@ fn gpu_audio_dump() {
     kprint("AZ_HOT_PLUG_CONTROL    ", 23); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr)); kprintln("", 0);
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_AUDIO_ENABLE_STATUS);
     kprint("AZ_AUDIO_ENABLE_STATUS ", 23); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr)); kprintln("", 0);
+
+    # --- The ordinals agnos has never read, now that a known-good exists for every one of them ---
+    #
+    # The six above were the whole AZ picture for fourteen burns. The amdgpu capture has THIRTY-FOUR, and
+    # the two that matter most were never among ours:
+    #
+    #   DIGITAL_OUTPUT_STATUS (0x63) — OUTPUT_ACTIVE bit0, READ-ONLY. The direct answer to "is this pin
+    #     transmitting?". amdgpu reads 1 while audibly playing. If agnos reads 0, the drain is dead AT THE
+    #     PIN and the whole search collapses onto the encoder.
+    #   LPIB (0x65) — the endpoint's own link position. Previously rejected as an instrument because amdgpu
+    #     reads it NOWHERE in the entire amd tree, so nothing proved it was implemented rather than dead
+    #     silicon. MEASUREMENT OVERRULED THAT: amdgpu's reads 0x00019128 — live and non-zero. It is real,
+    #     and it now has a known-good. Sampled twice so a frozen counter is distinguishable from a moving
+    #     one; a static value is still uninformative, never a verdict.
+    #
+    # The rest are read for the corpus: one burn closes the entire AZ diff instead of one register per burn.
+    # All read-only or already-owned; nothing here changes hardware behaviour.
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_DIGITAL_OUTPUT_STATUS, "AZ_DIGITAL_OUT_STATUS  ");
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_LPIB);
+    var lp0 = gpu_reg32(GPU_BASE_DCN_2, dr);
+    gpu_udelay(50000);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_LPIB);
+    var lp1 = gpu_reg32(GPU_BASE_DCN_2, dr);
+    kprint("AZ_LPIB                ", 23); kprint_hex(lp0);
+    kprint(" then ", 6); kprint_hex(lp1); kprintln("", 0);
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_CONV_DIGITAL_CONVERTER, "AZ_DIGITAL_CONVERTER   ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_CONV_WIDGET_CAPS,       "AZ_CONV_WIDGET_CAPS    ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_PIN_WIDGET_CONTROL,     "AZ_PIN_WIDGET_CONTROL  ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_PIN_CAPS,               "AZ_PIN_CAPS            ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_PIN_SENSE,              "AZ_PIN_SENSE           ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_AUDIO_DESCRIPTOR0,      "AZ_AUDIO_DESCRIPTOR0   ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_MULTICHANNEL_MODE,      "AZ_MULTICHANNEL_MODE   ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_RESPONSE_HBR,           "AZ_RESPONSE_HBR        ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_SINK_INFO0,             "AZ_SINK_INFO0          ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_CODING_TYPE,            "AZ_CODING_TYPE         ");
+    gpu_az_dump_ord(ir, dr, GPU_AZ_IX_FORMAT_CHANGED,         "AZ_FORMAT_CHANGED      ");
     kprintln("== end dump ==", 14);
     return 1;
+}
+
+# One AZ indexed ordinal, named and printed. The index window has NO MEMORY — it returns whatever `ir` last
+# selected — so every read re-selects. That is the bug 1.55.15 fixed by hand at four sites; this makes it
+# structurally impossible to repeat.
+fn gpu_az_dump_ord(ir, dr, ordinal, label) {
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, ordinal);
+    kprint(label, 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr));
+    kprintln("", 0);
+    return 0;
 }
 #endif
 
