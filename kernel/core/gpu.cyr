@@ -2800,6 +2800,35 @@ fn gpu_pixclk_discover() {
 # precisely BECAUSE they are inert, and they go live the instant the mode lands. Every one is readable now.
 #
 # This probe reads them and returns a verdict. It writes nothing.
+# Send one VBIOSSMC message to the SMU and wait for its response. Transcribed from
+# rn_vbios_smu_send_msg_with_param() (rn_clk_mgr_vbios_smu.c) — the order is the protocol:
+#   1. wait until the response register is not BUSY (a prior message may still be in flight)
+#   2. clear the response register to BUSY, so we can tell OUR completion from a stale one
+#   3. write the parameter
+#   4. write the message id LAST — that write is what triggers the transaction
+#   5. wait for the response, and read the result back out of the parameter register
+# amdgpu polls at 10 us x 200000 (2 s worst case); a shorter bound is fine here because a wedged SMU must
+# not be able to hang the boot — this is an audio nicety, not a boot-critical path.
+fn gpu_smu_msg(msg, param) {
+    var i = 0;
+    while (i < GPU_SMU_POLL_MAX) {
+        if (gpu_reg32(GPU_BASE_MP1_0, GPU_R_SMU_RESP) != GPU_SMU_BUSY) { break; }
+        gpu_udelay(10);
+        i = i + 1;
+    }
+    gpu_reg32_write(GPU_BASE_MP1_0, GPU_R_SMU_RESP, GPU_SMU_BUSY);
+    gpu_reg32_write(GPU_BASE_MP1_0, GPU_R_SMU_PARAM, param);
+    gpu_reg32_write(GPU_BASE_MP1_0, GPU_R_SMU_MSG, msg);
+    i = 0;
+    while (i < GPU_SMU_POLL_MAX) {
+        var r = gpu_reg32(GPU_BASE_MP1_0, GPU_R_SMU_RESP);
+        if (r != GPU_SMU_BUSY) { return r; }
+        gpu_udelay(10);
+        i = i + 1;
+    }
+    return GPU_SMU_BUSY;
+}
+
 fn gpu_hdmi_preflight() {
     gpu_hdmi_flip_ok = 0;
     if (gpu_present == 0) { return 0; }
@@ -2972,6 +3001,19 @@ fn gpu_hdmi_audio_enable() {
     if ((hpc2 & GPU_AZ_CLOCK_ON_STATE) != 0) { kprint("on", 2); } else { kprint("OFF", 3); }
     kprint(" (hotplug ", 10); kprint_hex(hpc2); kprintln(")", 1);
     gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc2 & (0 - 1 - GPU_AZ_CLOCK_GATING_DISABLE));
+
+    # THE PME WORKAROUND — wake the Azalia block out of D3. This goes exactly where amdgpu puts it:
+    # dce110_enable_audio_stream() calls az_enable() and then, unconditionally (num_audio starts at 1),
+    # clk_mgr->funcs->enable_pme_wa() — before enable_audio_packet() opens the tap.
+    # It is the ONE function in amdgpu's audio-enable chain agnos never had. 1.55.9 ruled it out because the
+    # AZ index window answered reads and writes, but a reachable window is not a woken block: everything
+    # configures, the endpoint reports itself enabled and passing, the DMA runs — and nothing drains.
+    var smu = gpu_smu_msg(GPU_SMU_MSG_PME_RESTORE, 0);
+    if (smu != GPU_SMU_OK) {
+        # Not fatal: report and continue. If the block was already awake the message is redundant, and a
+        # sulking SMU must not take the audio path down with it.
+        kprint("gpu: hdmi azalia wake declined (smu ", 36); kprint_hex(smu); kprintln(")", 1);
+    }
 
     # --- 5. AFMT. The audio CLOCK first: without it the whole block is inert and reports nothing wrong. ---
     # AFMT_AUDIO_CLOCK_ON (bit8) is the hardware's ack, and amdgpu reads 0x101 here — both bits — with sound

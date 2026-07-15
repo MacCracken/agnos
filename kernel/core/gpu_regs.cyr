@@ -48,6 +48,32 @@ var GPU_BASE_MMHUB_0  = 0x1A000;  # GMC / memory hub, segment 0 (C1 GPUVM)
 # AFMT/DP_SEC/Azalia at 0x34C0 (seg2). A helper hard-wired to seg2 would silently write the wrong address.
 var GPU_BASE_DCN_1    = 0xC0;
 var GPU_BASE_MP0_0    = 0x16000;  # MP0 / PSP, segment 0 (C0 firmware-reality bite)
+# MP1 / SMU mailbox, segment 0. MP0_BASE and MP1_BASE share INST0 seg0 = 0x00016000 on Renoir
+# (renoir_ip_offset.h), so this rides the same aperture the PSP firmware-load path already proved.
+#
+# THE PME WORKAROUND — the one FUNCTION in amdgpu's audio-enable chain that agnos has no equivalent of.
+# dce110_enable_audio_stream():
+#     if (num_audio >= 1 && clk_mgr->funcs->enable_pme_wa)
+#         /*this is the first audio. apply the PME w/a in order to wake AZ from D3*/
+#         clk_mgr->funcs->enable_pme_wa(clk_mgr);
+# num_audio starts at 1, so this ALWAYS fires. On Renoir it lands in rn_enable_pme_wa ->
+# rn_vbios_smu_enable_pme_wa -> rn_vbios_smu_send_msg_with_param(VBIOSSMC_MSG_UpdatePmeRestore, 0).
+# 1.55.9 dismissed the PME workaround because the AZ index window was readable/writable — but a reachable
+# register window is NOT the same as the audio block being awake enough to DRAIN. That distinction is
+# exactly the observed symptom: every register configures and reads back correct, the endpoint reports
+# AUDIO_ENABLE_STATUS=1, the DMA runs, and AFMT_STATUS bit24 (AUDIO_FIFO_OVERFLOW) re-arms within ~2 ms of
+# being acked because nothing consumes the samples.
+# A register diff could never surface this: it is not a register we set wrong, it is a MESSAGE we never send.
+var GPU_BASE_MP1_0    = 0x16000;  # MP1 / SMU, segment 0 (BASE_IDX 0 for the C2PMSG mailbox)
+var GPU_R_SMU_MSG     = 0x283;    # mmMP1_SMN_C2PMSG_67 — message id (write LAST; it triggers)
+var GPU_R_SMU_PARAM   = 0x293;    # mmMP1_SMN_C2PMSG_83 — parameter in, result out
+var GPU_R_SMU_RESP    = 0x29B;    # mmMP1_SMN_C2PMSG_91 — response
+var GPU_SMU_BUSY      = 0x0;      # VBIOSSMC_Status_BUSY
+var GPU_SMU_OK        = 0x1;      # VBIOSSMC_Result_OK
+var GPU_SMU_MSG_PME_RESTORE = 0xE; # VBIOSSMC_MSG_UpdatePmeRestore
+# amdgpu polls 10us x 200000 (2 s). We bound it far shorter: a wedged SMU must not be able to stall the boot
+# for two seconds over an audio nicety. 2000 x 10us = 20 ms, ample for a mailbox that answers in microseconds.
+var GPU_SMU_POLL_MAX  = 2000;
 var GPU_BASE_SDMA0_0  = 0x1260;   # SDMA engine 0, segment 0 (fallback data path)
 
 # --- Register offsets within their IP (DWORD) ---
