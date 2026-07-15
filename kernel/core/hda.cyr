@@ -151,6 +151,15 @@ var hda_pci_idx[2];           # [per-instance] PCI enumeration index (set by hda
 # snd_* ring counters stay single — only one HW stream ever plays.
 var HDA_NCTL       = 2;       # controller-instance capacity (analog + HDMI)
 var hda_active_ctl = 0;       # live instance selector; bite 1 never moves it
+# Force the codec route onto the Nth DIGITAL output pin (0-based, in ascending-NID order); -1 = score
+# normally. This is how the DISPLAY side hands the codec side the answer it cannot work out alone: on AMD
+# HDMI codecs every digital pin carries an IDENTICAL config default (all four read rcd=0x185600F0 on this
+# silicon), presence-detect is unreliable without amdgpu driving hot-plug, and ELD-Valid never sets because
+# agnos has no ELD reader — so the scorer below has no signal that discriminates them and picks whichever
+# pin spuriously reports presence. The GPU probe DOES know: it finds the lit encoder (DIG1 here), and
+# amdgpu's find_first_free_audio() binds the audio instance to the encoder's engine id, so the endpoint —
+# and the codec pin/converter pair at the same ordinal — follow from it.
+var hda_force_digi_ord = 0 - 1;
 var hda_mmio_base[2];         # [per-instance] controller MMIO base — steers every hda_read*/write*
 var hda_codec_mask[2];        # [per-instance] STATESTS codec-present bitmask (set by hda_reset, B1)
 
@@ -707,6 +716,7 @@ fn hda_codec_route() {
     var best_dev = 0;
     var best_is_digi = 0;
     var best_score = 0 - 1;
+    var digi_seen = 0;   # digital output pins met so far, ascending NID — the endpoint ordinal
     var wi = 0;
     while (wi < load64(&hda_w_count + hda_active_ctl * 8)) {
         var nid = load64(&hda_w_start + hda_active_ctl * 8) + wi;
@@ -722,6 +732,11 @@ fn hda_codec_route() {
                 # (hardware ground truth) OR the CONFIG default_device is digital
                 # (SPDIF/Digital-Other-Out — the BIOS label; can be stale, so OR them).
                 var is_digi = ((pincap & (PINCAP_HDMI | PINCAP_DP)) != 0) || (ddev == DEV_SPDIF_OUT || ddev == DEV_DIG_OTHER_OUT);
+                # This pin's ordinal among the digital pins. Counted BEFORE the candidate filter and
+                # incremented unconditionally for digital pins, so the ordinal tracks the hardware's own
+                # enumeration and cannot shift if a pin is later filtered out.
+                var this_ord = digi_seen;
+                if (is_digi) { digi_seen = digi_seen + 1; }
                 # candidate: analog HP-Out/Line-Out OR a digital pin, connector present.
                 if ((ddev == DEV_HPOUT || ddev == DEV_LINEOUT || is_digi) && pconn != 1) {
                     var score = 10;
@@ -743,6 +758,14 @@ fn hda_codec_route() {
                     # config-identical AMD digital pins it's the only reliable signal
                     # (outweighs presence, which AMD often leaves unset without amdgpu).
                     if ((sense & 0x40000000) != 0) { score = score + 2000; }
+                    # The display side's answer, when it has one. It outranks every heuristic above because
+                    # it is measured rather than inferred: the GPU probe found the lit encoder, and the
+                    # endpoint/pin ordinal follows from it. Only ever set for the HDMI controller.
+                    if (is_digi) {
+                        if (hda_force_digi_ord >= 0) {
+                            if (this_ord == hda_force_digi_ord) { score = score + 100000; }
+                        }
+                    }
                     if (score > best_score) {
                         best_score = score;
                         best_pin = nid;

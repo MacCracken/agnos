@@ -968,6 +968,28 @@ gpu_hdmi_audio_enable();
 # came up — otherwise instance 0 stays the sink and the analog path keeps working.
 if (gpu_hdmi_audio_on == 1) {
     hda_active_ctl = 1;
+    # RE-ROUTE the codec now that the display side knows which pin is live. hda_codec_route() ran during the
+    # HDA block above, LONG before any GPU probe, so it had to score blind — and on an AMD HDMI codec it has
+    # no signal to score with: all four digital pins carry an identical config default (rcd=0x185600F0),
+    # ELD-Valid never sets because agnos has no ELD reader, and presence-detect is unreliable without amdgpu
+    # driving hot-plug. It picked pin 3, which the sink's own ELD reports as monitor_present=0 — so the codec
+    # streamed into an unconnected pin while the display side pulled from endpoint 1. The two halves were
+    # crossed, and every register on both sides read back correct.
+    #
+    # gpu_audio_dig is the lit encoder (DIG1 on this iron). amdgpu's find_first_free_audio() binds the audio
+    # instance to the encoder's engine id, and the codec's pin/converter pair sits at that same ordinal —
+    # three independent measurements agree at index 1 here: the ELD puts the XB323U on codec pin 0x5 (the
+    # second digital pin), amdgpu reads AFMT_AUDIO_SRC_SELECT=1, and DIG1 is the only encoder with both
+    # DIG_ENABLE and SYMCLK_FE_ON.
+    hda_force_digi_ord = gpu_audio_dig;
+    hda_codec_route();
+    hda_force_digi_ord = 0 - 1;
+    # hda_stream_arm() ALWAYS follows hda_codec_route() — that pairing holds at both call sites in the HDA
+    # block above, and for the same reason here: the arm binds the stream to the converter the route just
+    # chose (and, under HDA_TONE, refills the PCM ring). Re-routing without re-arming would point the codec
+    # at the new pin while the DMA stayed bound to the old converter — silence, again, with every register
+    # correct. This is the same class of crossing the re-route exists to fix.
+    hda_stream_arm();
     # Report exactly what snd_open() gates on, for THIS instance. snd_open returns -1 unless BOTH
     # hda_present[ctl] and hda_out_dac[ctl] are non-zero — so if ctl1's codec route never found a digital
     # DAC, every ring-3 tone fails at the first syscall and no amount of display-side correctness matters.
