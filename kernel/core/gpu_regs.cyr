@@ -215,8 +215,13 @@ var GPU_HDMI_GENERIC0_LINE_VAL  = 0x2;           # enc2_update_hdmi_info_packet:
 # all-zero payload. All-zero is the legal MINIMUM and it is right for this link: Y=0 (RGB), C=0 (no
 # colorimetry), Q=0 (default range), and VIC=0 because 2560x1440 CVT-RB has no CEA VIC at all. It cannot
 # describe the picture worse than the no-AVI state it replaces.
-var GPU_AVI_HDR                = 0xD0282; # 0x82 | (0x02 << 8) | (0x0D << 16)
-var GPU_AVI_SB0                = 0x6F;    # sb[0] = checksum; sb[1..3] = 0
+var GPU_AVI_HDR                = 0xD0282; # 0x82 | (0x02 << 8) | (0x0D << 16) — matches amdgpu byte-for-byte
+# The AVI data bytes, MEASURED off amdgpu playing sound on this link (AFMT_GENERIC_0 = 0x80885E8F), not
+# derived. The checksum is NOT a constant here — it is computed at write time from these plus the live bar
+# values, because a baked checksum silently lies the moment the raster changes.
+var GPU_AVI_DB1                = 0x5E;    # Y=2 (YCbCr444) · A0=1 active-format valid · B=3 both bars valid · S=2
+var GPU_AVI_DB2                = 0x88;    # C=2 (BT.709 colorimetry) · M=0 · R=8 (same as picture aspect)
+var GPU_AVI_DB3                = 0x80;    # ITC=1 · EC=0 · Q=0 (default range) · SC=0
 var GPU_R_AFMT_CNTL            = 0x20E6; # AFMT_AUDIO_CLOCK_EN bit0 (WRITE), AFMT_AUDIO_CLOCK_ON bit8 (STATUS)
 var GPU_R_AFMT_AUDIO_PACKET_CONTROL = 0x20AA;
 # The TMDS character-rate hazard: DATA_SCRAMBLE_EN b1 | CLOCK_CHANNEL_RATE b2 | DEEP_COLOR_ENABLE b24 |

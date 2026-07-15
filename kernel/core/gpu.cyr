@@ -63,6 +63,11 @@ var gpu_audio_dig     = 0 - 1; # the live stream encoder (DIG) carrying the lit 
 # ACR CTS is computed from). 0 = not derived (then P3b must not program the DTO). Derived, not read: the
 # DCCG's DP_DTO_PHASE register only holds the pixel clock on a DP-driven pipe, and this link is HDMI.
 var gpu_pixclk_100hz  = 0;
+# The live raster totals, kept from gpu_pixclk_discover so the AVI InfoFrame can describe the actual link
+# rather than hardcoding one panel's numbers. amdgpu's AVI on this iron carries bottom-bar = v_total+1 and
+# right-bar = h_total+1 (1482 / 2721 against a 2720x1481 link) — measured, not derived from a spec.
+var gpu_h_total       = 0;
+var gpu_v_total       = 0;
 # P3b-ii pre-flight: 1 = every precondition for the DVI->HDMI DIG_MODE flip is verified clear on the live
 # encoder. 0 = do NOT flip (a hazard is armed, or the link/encoder isn't ours to touch). Read-only result.
 var gpu_hdmi_flip_ok  = 0;
@@ -2683,6 +2688,8 @@ fn gpu_pixclk_discover() {
     var vraw = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL + pipe * GPU_DCN_OTG_STRIDE) & GPU_OTG_TOTAL_MASK;
     var htotal = hraw + 1;
     var vtotal = vraw + 1;
+    gpu_h_total = htotal;
+    gpu_v_total = vtotal;
 
     # The LINK's active size — NOT fb_width()/fb_height(). Those describe the GOP's surface, which the DCN
     # pipe scaler may be stretching into a completely different raster: on archaemenid the firmware left an
@@ -2971,11 +2978,31 @@ fn gpu_hdmi_audio_enable() {
     var vp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL + d);
     vp = (vp & (0 - 1 - GPU_AFMT_GENERIC_INDEX_MASK)) | GPU_AFMT_GENERIC_CONFLICT_CLR;
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL + d, vp);
+    # The PAYLOAD. 1.55.14 originally sent an all-zero body with checksum 0x6F, arguing an empty AVI was "a
+    # legal minimum". The header was derived correctly (0xD0282 == amdgpu byte-for-byte) and then the body
+    # was INVENTED — a self-consistent packet describing nothing. Measured against amdgpu playing sound on
+    # this link: GENERIC_0 = 0x80885E8F, GENERIC_2 = 0x05CA, GENERIC_3 = 0x0AA1. It describes the raster.
+    #   sb[0] = 0x8F checksum · DB1 = 0x5E · DB2 = 0x88 · DB3 = 0x80
+    #   DB1 0x5E: A0=1 (active-format valid), B=3 (BOTH bars valid), S=2 — agnos sent 0x00, declaring no
+    #             bar info and no active format, then pointed at bars it never sent.
+    #   bottom bar = v_total + 1, right bar = h_total + 1 (1482 / 2721 on this 2720x1481 link) — derived
+    #             from the totals gpu_pixclk_discover already reads, NOT hardcoded to one panel.
+    # The checksum is computed here for the same reason: a copied constant would silently lie the moment the
+    # raster changes. 0x100 - (HB0 + HB1 + HB2 + sum(DB1..DB13)), which reproduces amdgpu's 0x8F exactly on
+    # this link (verified arithmetically before this was written).
+    var bar_b = gpu_v_total + 1;
+    var bar_r = gpu_h_total + 1;
+    var g2 = bar_b & 0xFFFF;
+    var g3 = bar_r & 0xFFFF;
+    var sum = 0x82 + 0x02 + 0x0D + GPU_AVI_DB1 + GPU_AVI_DB2 + GPU_AVI_DB3;
+    sum = sum + (g2 & 0xFF) + ((g2 >> 8) & 0xFF) + (g3 & 0xFF) + ((g3 >> 8) & 0xFF);
+    var cks = (0x100 - (sum & 0xFF)) & 0xFF;
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_HDR + d, GPU_AVI_HDR);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_0 + d, GPU_AVI_SB0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_0 + d,
+    cks | (GPU_AVI_DB1 << 8) | (GPU_AVI_DB2 << 16) | (GPU_AVI_DB3 << 24));
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_1 + d, 0);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_2 + d, 0);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_3 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_2 + d, g2);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_3 + d, g3);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_4 + d, 0);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_5 + d, 0);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_6 + d, 0);
