@@ -2881,6 +2881,15 @@ fn gpu_hdmi_preflight() {
 #      against it as if it were one.
 #   4. Azalia: configure (speaker/channel allocation, clock gating) BEFORE enable, per dce110_enable_stream.
 #   5. AFMT: the audio CLOCK first (nothing downstream ticks without it), then source/channels, then the tap.
+# One AZ indexed ordinal, written and read back. The index window has NO MEMORY: `dr` returns whatever `ir`
+# last named, so every access re-selects. 1.55.15 fixed that by hand at four sites after it destroyed its
+# own slot-map write; this makes it impossible to get wrong again.
+fn gpu_az_write_ord(ir, dr, ordinal, val) {
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, ordinal);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, val);
+    return 0;
+}
+
 fn gpu_hdmi_audio_enable() {
     gpu_hdmi_audio_on = 0;
     if (gpu_hdmi_preflight() != 1) {
@@ -3269,12 +3278,13 @@ fn gpu_hdmi_audio_crc_one(d, source) {
     (GPU_AFMT_AUDIO_CRC_SAMPLES << GPU_AFMT_AUDIO_CRC_COUNT_SHIFT)
     | ((source & 0x1) << GPU_AFMT_AUDIO_CRC_SOURCE_SHIFT) | GPU_AFMT_AUDIO_CRC_EN);
 
-    # 2048 samples at 48 kHz is ~43 ms. Wait up to ~300 ms: generous enough that a running stream always
-    # finishes, bounded so a dead one costs a third of a second of boot rather than hanging the box on a
-    # register whose behaviour is unverified.
+    # 2048 samples at 48 kHz is 42.7 ms, so 60 ms is the honest bound — the old 300 ms was 7x that, and with
+    # TWO taps it put up to 600 ms of busy-wait into every burn kernel's boot BEFORE interrupts are enabled.
+    # DHCP started failing on exactly the burns that added it (5/5 ACK at 1.55.14 -> 0/3 by 1.55.16); the
+    # correlation is not proof, but a diagnostic has no business costing half a second of boot to find out.
     var waited = 0;
     var done = 0;
-    while (waited < 300) {
+    while (waited < 60) {
         gpu_udelay(1000);
         waited = waited + 1;
         if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_RESULT + d) & GPU_AFMT_AUDIO_CRC_DONE) != 0) {
@@ -3436,7 +3446,7 @@ fn gpu_audio_dump() {
     gpu_az_dump_ord(ir, dr, GPU_AZ_IX_DIGITAL_OUTPUT_STATUS, "AZ_DIGITAL_OUT_STATUS  ");
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_LPIB);
     var lp0 = gpu_reg32(GPU_BASE_DCN_2, dr);
-    gpu_udelay(50000);
+    gpu_udelay(5000);   # 5 ms is enough to see LPIB move; 50 ms was gratuitous boot cost
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_LPIB);
     var lp1 = gpu_reg32(GPU_BASE_DCN_2, dr);
     kprint("AZ_LPIB                ", 23); kprint_hex(lp0);
@@ -3459,14 +3469,6 @@ fn gpu_audio_dump() {
 # One AZ indexed ordinal, named and printed. The index window has NO MEMORY — it returns whatever `ir` last
 # selected — so every read re-selects. That is the bug 1.55.15 fixed by hand at four sites; this makes it
 # structurally impossible to repeat.
-# One AZ indexed ordinal, written and read back. The index window has NO MEMORY: `dr` returns whatever `ir`
-# last named, so every access re-selects. 1.55.15 fixed that by hand at four sites after it destroyed its
-# own slot-map write; this makes it impossible to get wrong again.
-fn gpu_az_write_ord(ir, dr, ordinal, val) {
-    gpu_reg32_write(GPU_BASE_DCN_2, ir, ordinal);
-    gpu_reg32_write(GPU_BASE_DCN_2, dr, val);
-    return 0;
-}
 
 fn gpu_az_dump_ord(ir, dr, ordinal, label) {
     gpu_reg32_write(GPU_BASE_DCN_2, ir, ordinal);
