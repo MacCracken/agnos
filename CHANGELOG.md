@@ -5,6 +5,80 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### The tap experiment ran — and a 47-agent audit found the calibration gap in it
+
+**The known-stimulus experiment worked** (`agnosticos/scripts/crc-tap-identity.sh`, zero burns, on the
+audibly-working amdgpu path):
+
+```
+SILENCE playing:  tap0 = 0x000000    tap1 = 0x000000
+TONE playing:     tap0 = 0x80fd38    tap1 = 0x15f002
+```
+
+**Both taps are PCM-content-sensitive**, and the IEC-60958-framing hypothesis is **dead** — framing would
+have read non-zero over the all-zero stream; both read exactly zero. `CRC_SOURCE` selects a **stage**, not
+a channel (`CRC_CH_SEL` was 0 throughout, and a channel selector already exists at [15:12]).
+
+**But the conclusion drawn from it — "the bisection is PROVEN, real samples are zeroed inside the AFMT" —
+is RETRACTED.** Both stimuli **flowed**. The CRC was never armed with *nothing playing*, so
+`CRC_DONE=1, CRC=0x000000` still carries two meanings and only one is measured:
+
+1. **2048 zero samples traversed** — what agnos's tap-1 reading was taken to mean.
+2. **The counter completed and nothing traversed** — **untested**.
+
+And `dump-dcn-audio.py`'s own comment — *"CRC_DONE asserts only when CRC_COUNT samples have physically
+traversed the AFMT"* — **is a comment agnos wrote from inference, then reasoned from as if it were
+measured.** `AFMT_AUDIO_CRC_COUNT` is a bare 16-bit field with no in-tree consumer; nothing in
+`dcn_2_1_0_sh_mask.h` says it counts *valid samples* rather than *sample clocks*.
+
+**If reading (2) holds, the whole picture inverts**: tap 1's zero means *"the AFMT read side never
+drains"*, not *"something zeroes real samples"*. The paradox that motivated this hunt — every AFMT control
+register byte-identical to amdgpu, yet audio zeroed — **dissolves**, because then no register zeroes
+anything, which is exactly why every register hypothesis failed. `AFMT_STATUS` bit 24
+(`AFMT_AUDIO_FIFO_OVERFLOW`, agnos set / amdgpu clear — the single measured control-domain divergence)
+becomes the coherent centerpiece rather than an anomaly, and its "wrong sign" refutation is **void**,
+resting on the same unverified premise.
+
+The Azalia endpoint exoneration is therefore **provisional**, not final.
+
+**Case C — the null — now exists in the harness** and settles it for zero burns: arm the CRC with nothing
+playing, read `AFMT_CNTL` alongside. `DONE=1 / CRC=0` ⇒ a zero CRC means *nothing traversed*, the bisection
+is invalid, and the hunt becomes the drain. `DONE=0` ⇒ the counter needs traversal, the bisection stands,
+and the cause is not register-visible — leaving the ATOM `DIGxEncoderControl` setup as the last lane.
+`AFMT_CNTL` dropping to 0 means amdgpu tore the clock down on close and the run is inconclusive by that
+route.
+
+**The lesson, third instance in one day: an instrument calibrated only against stimuli that all flow has
+not been calibrated. The null response is part of the instrument.**
+
+### The AFMT register file, closed exhaustively
+
+The set-subtraction has now been done twice with different answers, so it is settled and recorded:
+**40 `mmDIG0_AFMT_*` definitions in `dcn_2_1_0_offset.h`; agnos knows 24; 16 unknown; 5 residual** after
+excluding the 11 ISRC1/ISRC2/MPEG_INFO packet-payload carriers (no enable/mask/gain/select field between
+them). The five — `AFMT_RAMP_CONTROL0..3` (`0x20A3`–`0x20A6`) and `AFMT_INTERRUPT_STATUS` (`0x2079`) —
+join `dump-dcn-audio.py` as free riders. Verified independently against the fetched header.
+
+**None is a candidate.** `RAMP_CONTROL*` is a test-tone generator gated by `AFMT_AUDIO_TEST_EN`, which
+reads **0 byte-identically on both paths**, and amdgpu never writes them either.
+`AFMT_INTERRUPT_STATUS` has zero decoded bitfields in `sh_mask`. Captured so nobody repeats the subtraction.
+
+### Also refuted this round — by measurement, not argument
+
+- **The missing `SAMPLE_SEND` 0→1 latch** — a genuinely promising theory (identical readback + divergent
+  behaviour is exactly this bug's shape), **killed by the capture**: the four untouched DIGs in the
+  known-good all read `AFMT_AUDIO_PACKET_CONTROL = 0x04000800`, so bit 0 defaults to **0** and agnos's
+  OR-write **is** a real 0→1 edge.
+- **The Azalia `AUDIO_ENABLED` / AFMT-clock order inversion** — a real ordering divergence, but
+  `AFMT_STATUS` bits 4 and 30 both read **set** on agnos, proving the AFMT latched the enable the theory
+  says it missed. Hygiene, not the bug.
+- **ATOM payload carries audio state** — `dig_encoder_stream_setup_parameters_v1_5` has **no audio member
+  at all**; `enable_dp_audio` is discarded before the payload is built, and `SIGNAL_TYPE_HDMI_TYPE_A`
+  returns `ATOM_ENCODER_MODE_HDMI` unconditionally, so the message is bit-identical either way.
+- **ATOM is required to enable audio** — amdgpu toggles audio at runtime over MMIO with no
+  `encoder_control` re-issue. This does *not* exonerate the one-time ATOM **setup**, which remains the last
+  standing lane if the null test returns `DONE=0`.
+
 ## [1.55.16] — 2026-07-15 — the cut that stopped guessing and built the instruments
 
 Fifteen burns had produced no root cause because the arc was **arguing instead of measuring**. Every
