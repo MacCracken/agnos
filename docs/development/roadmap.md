@@ -15,7 +15,7 @@
   some point and that sed did nothing for months; restored 2026-07-14.)
 -->
 
-> **Current**: v1.55.14 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
+> **Current**: v1.55.15 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
 
 > **This file is forward-facing.** Completed arcs are not re-narrated here — each gets one line in the
 > [Completed arcs ledger](#completed-arcs-ledger), and the history is the CHANGELOG's job. Per-arc reasoning
@@ -39,22 +39,64 @@ vblank pacing (P2), the double-buffered present loop, and `blit`#39 double-buffe
 tear-free through the sovereign display stack on real hardware with no application change. Cleanup and
 hardening followed at 1.55.7. See the CHANGELOG entries for 1.55.0 through 1.55.7 for the detail.
 
-**Current bite — P3, display audio.** Six burns from 1.55.8 through 1.55.13 stayed silent. 1.55.14 (cut,
-**pre-burn**) fixes the real cause: the audio was armed on Azalia endpoint 0 while the live encoder is
-DIG1, whose endpoint is 1. Endpoint 0 is a codec pin with nothing plugged into it. The cause was found by
-dumping amdgpu's known-good registers off this same machine rather than by deriving them. This bite closes
-the HDMI-audio backlog opened at 1.53.5, which left the digital arm QEMU-complete but iron-gated.
+**Current bite — P3, display audio. Twelve burns, still mute.** 1.55.8 through 1.55.13 stayed silent;
+1.55.14 found and fixed the real endpoint bug (audio armed on Azalia endpoint 0 while the live encoder is
+DIG1, whose endpoint is 1 — endpoint 0 is a codec pin with nothing plugged into it), found by dumping
+amdgpu's known-good registers off this same machine rather than by deriving them. Six more burns landed
+that fix plus four further real defects, cut as **1.55.15**. The sink is still silent.
 
-Two residuals from 1.55.14's own ledger, both conditional on how that burn lands:
+**Every gate passes and the sink is mute** — DMA fetching (`lpib` advancing), endpoint enabled, slot map
+taking, AVI transmitting, no FIFO overflow after ack, the hardware building a correctly-checksummed Audio
+InfoFrame from our own `CHANNEL_SPEAKER`, audio clock acked, SMU accepting the PME wake. A 31-agent
+adversarial audit re-derived the path from fetched v6.6 amdgpu source and **found no surviving candidate
+defect**. No known wrong bit, and no confident root cause.
 
-- **`AFMT_AUDIO_INFO0` disposition — open.** The register exists on DCN 2.1 at `0x209E` and reads
-  `0x00000170` on the working path. 1.55.13 removed agnos's writes to it, arguing the field is
-  hardware-generated. A register dump cannot distinguish "amdgpu wrote it" from "hardware generated it", so
-  the question stays open — and becomes moot if the endpoint fix lands, since the InfoFrame is then built
-  from the correct endpoint.
-- **`AFMT_AZ_AUDIO_ENABLE_CHG_ACK` — noted for the next hardening pass.** `AFMT_STATUS` bit 30 reads 1 on
-  agnos and 0 on amdgpu, and agnos never writes the corresponding acknowledgement. Likely benign once the
-  endpoint is right.
+**The register diff was never exhausted** — the tempting conclusion, and it is not supported. The
+known-good corpus covers only ~13 of the 36 registers `gpu_audio_dump()` prints; **~23 have never been
+compared to anything.** The capture was taken to settle specific arguments, not as a survey.
+
+**Nothing on record proves a single sample crosses the HDA link into the AFMT.** `lpib` is measured on the
+*controller* side of 04:00.1; `AFMT_AUDIO_ENABLE = 1` only means the endpoint was told audio is on. "No
+overflow with `SAMPLE_SEND = 1`" is equally consistent with draining fine and with nothing arriving to
+drain. **04:00.1 has never produced sound on this machine** — the iron-validated 1.52.x arc drove a
+*different* controller (04:00.6 / ALC897). That hop is the least-evidenced in the chain.
+
+**▶ Next burn is a MEASUREMENT burn, not a fix burn.** The discriminator is one register:
+**AZ endpoint ordinal `0x65` `PIN_CONTROL_LPIB`** — the endpoint's *own* link position, which
+`gpu_audio_dump()` does not read. Sample it twice ~50 ms apart: not advancing while the controller's `lpib`
+does ⇒ samples never cross the link, the whole DCN lane is exonerated, the search collapses onto 04:00.1.
+Advancing ⇒ the DCN egress is guilty. Either way one burn halves the problem. Add alongside it `0x63`
+DIGITAL_OUTPUT_STATUS, `0x04` DIGITAL_CONVERTER (DIGEN readback on converter 0x04), `0x67` CODING_TYPE,
+`0x68` FORMAT_CHANGED, plus `HDMI_ACR_48_0` and `DIG_BE_EN_CNTL`. **Do not write `HDMI_ACR_CTS_48`** — the
+decline is well-reasoned and the register has never been read; read it first.
+
+**✅ The premise is SETTLED (2026-07-15): the sink is audible.** Twelve burns assumed this panel emits
+sound over HDMI and nobody had checked. It does — operator-confirmed by ear, via a pattern they could not
+guess (three 880 Hz beeps, pause, 300→3000 Hz sweep, twice) played to `hw:0,7` and described only
+afterwards. **So agnos's silence is agnos's bug** and the arc is legitimate. Do not re-open.
+
+**The codec half of the known-good is captured** and needed no root (`/proc/asound` is world-readable,
+`/dev/snd/pcmC0D7p` carries a session ACL):
+[`dcn-audio-codec-side-known-good-2026-07-15.md`](../../../agnosticos/docs/development/prior-art/dcn-audio-codec-side-known-good-2026-07-15.md).
+With a tone playing, converter `0x04` = `Digital: Enabled`, pin `0x05` = `Pin-ctls: 0x40: OUT` — the same
+sequence agnos performs, and agnos's HDA constants verify against it. Delta on record: **Linux binds stream
+tag 3, agnos uses tag 1** (legal — tags are per-link). **The DCN/BAR5 half still needs root**:
+`sudo agnosticos/scripts/capture-hdmi-audio-known-good.sh` (device resolution is derived, not hardcoded —
+`pcmNp/info`'s `id: HDMI <k>` matches `eld#0.<k>`; `-ac 2` is mandatory or ALSA refuses the open).
+
+Surviving diff **among the ~13 registers that have a known-good value at all** (three differ, two deliberate):
+
+- **`AFMT_GENERIC_0`** `0x00081ECF` vs `0x80885E8F` — **intended**: amdgpu drives this panel as YCbCr 4:4:4,
+  agnos's link is RGB, and the AVI must describe our link.
+- **`DCCG_AUDIO_DTO0_MODULE`** 8 ppm high — **intended, and cannot cause silence** (inaudible against IEC
+  60958-3 Level II's ±1000 ppm; it could only ever cause a pitch error too small to hear).
+- **`AFMT_STATUS` bit 30** (`AFMT_AZ_AUDIO_ENABLE_CHG`) reads 1 on agnos, 0 on amdgpu; agnos never writes
+  the `..._CHG_ACK`. **The only unexplained diff left on the block.** A change-notification bit, so most
+  likely a symptom rather than a cause — but it is the last measurable difference from the working driver.
+
+Closed residual: **`AFMT_AUDIO_INFO0` is settled** — it reads `0x00000170` on both agnos and amdgpu, and
+the arithmetic is exact (HB0 `0x84` + HB1 `0x01` + HB2 `0x0A` + DB1 `0x01` = `0x90`; `0x100 − 0x90` =
+`0x70`). The hardware builds it. It is a register to read, not to write; 1.55.13's removal was correct.
 
 ### Remaining ladder
 

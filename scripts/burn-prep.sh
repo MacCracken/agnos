@@ -49,8 +49,33 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_HDMI:-}" ]; then
-    echo "[2/2] Building the HDMI-audio kernel (HDA_HDMI: probe/route/stream instance 1 = 04:00.1 HDMI/DP digital sink; HDA_TONE: audible sweep). Analog instance 0 plays out the front jack; HDMI plays out a firmware-LIT display port (agnos has no amdgpu -> a dark port won't egress). Bite 3 iron gate."
+if [ -n "${BURN_HDMI_DUMP:-}" ]; then
+    # THE MEASUREMENT BURN. Use this one for the display-audio arc until the silence is explained.
+    #
+    # Adds HDMI_AUDIO_DUMP on top of BURN_HDMI: reads the whole display-audio block back AFTER every write
+    # has landed, in the same register order and naming as agnosticos/scripts/dump-dcn-audio.py, so agnos
+    # can be diffed against the known-good MECHANICALLY instead of by argument.
+    #
+    # Capture the result with `run /bin/klug > /f/dump.txt` at the agnsh prompt, then mount agnos-fs from
+    # Linux to copy it out. The line that matters most is NOT in the dump: gpu_hdmi_audio_crc_probe prints
+    # whether samples PHYSICALLY traverse the encoder, which is the one question the register block cannot
+    # answer about itself.
+    #
+    # PASS IS STILL THE OPERATOR'S EARS. Twelve burns read green while mute; the log line is not the oracle.
+    echo "[2/2] Building the HDMI-audio MEASUREMENT kernel (HDA_HDMI + HDA_TONE + HDMI_AUDIO_DUMP: sovereign DCN audio path + audible sweep + the full register read-back for diffing against amdgpu's known-good)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI:-}" ]; then
+    # HDA_HDMI: probe/route/stream instance 1 (04:00.1, the HDMI/DP digital sink) + the sovereign DCN
+    # display-audio path (DIG mode, Azalia endpoint, AVI InfoFrame, audio DTO, PME wake). HDA_TONE: audible
+    # sweep. Analog instance 0 keeps playing out the front jack.
+    #
+    # Gated because this path writes the encoder carrying the operator's only console and NO register on it
+    # reports sink health — an HDMI source is transmit-only. The default/MVP kernel therefore never touches
+    # DIG_MODE and cannot black-screen loop.
+    #
+    # For the display-audio arc prefer BURN_HDMI_DUMP above — it adds the register read-back.
+    echo "[2/2] Building the HDMI-audio kernel (HDA_HDMI: sovereign DCN display-audio path on 04:00.1; HDA_TONE: audible sweep). Analog instance 0 still plays out the front jack."
     BUILD_ENV="HDA_HDMI=1 HDA_TONE=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE"
 elif [ -n "${BURN_HDA_TONE:-}" ]; then

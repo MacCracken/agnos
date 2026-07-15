@@ -323,6 +323,46 @@ var GPU_AFMT_CHANNEL_ENABLE_MASK = 0xFF00;
 var GPU_AFMT_CHANNEL_ENABLE_STEREO = 0x300;
 var GPU_AFMT_FIFO_OVERFLOW     = 0x1000000;  # AFMT_STATUS bit24 — STICKY: latches on the first overrun
 var GPU_AFMT_FIFO_OVERFLOW_ACK = 0x800000;   # AFMT_AUDIO_PACKET_CONTROL bit23 — write to clear the above
+
+# --- THE AUDIO CRC: the one instrument on this block that answers a question instead of echoing a write ---
+#
+# Twelve burns have read this path green while the panel stayed mute. Every register above reports what we
+# TOLD the hardware, not what the hardware DID. AFMT_AUDIO_ENABLE = 1 means the endpoint was told audio is
+# on. The absence of AFMT_AUDIO_FIFO_OVERFLOW is equally consistent with "draining fine" and with "nothing
+# arriving to drain". And `lpib` — the one thing measured that genuinely moves — is on the CONTROLLER side
+# of 04:00.1, which proves the DMA fetches PCM out of RAM and proves nothing about whether a single sample
+# ever crosses the HDA link into this encoder.
+#
+# The CRC block closes that gap. It computes a checksum over the samples that ACTUALLY traverse the AFMT:
+#   - arm CRC_COUNT samples + CRC_EN
+#   - CRC_DONE asserts ONLY when that many samples have physically gone through
+#   - the CRC VALUE is content-derived, so a tone and digital silence produce different results
+# So it is a hard yes/no on sample flow plus a fingerprint of what flowed, and it bisects the whole chain:
+# DONE with a content-bearing CRC ⟹ samples reach the encoder and the fault is DOWNSTREAM (link/sink).
+# never DONE ⟹ nothing arrives and the fault is UPSTREAM (HDA link / codec / stream binding).
+#
+# PROVENANCE — offsets and every bit position confirmed against TWO independent primary sources:
+# Linux v6.6 `dcn_2_1_0_offset.h` and umr's `green_sardine.asic` → `ip/dcn_2_1_0.reg`. BASE_IDX 2, same
+# block as the rest of the DIG registers, plain MMIO — NOT the Azalia index/data window, so it carries none
+# of that window's re-select hazard (the bug 1.55.15 fixed).
+#
+# Honest note on amdgpu: the legacy DCE paths (`dce_v8_0.c` / `dce_v10_0.c` / `dce_v11_0.c`) WRITE this
+# block, so the hardware is real and not a documentation ghost — but amdgpu never reads the result back, so
+# nothing in the reference driver validates the DONE semantics. This is a probe, and it is written to be
+# honest when it learns nothing: a CRC that never completes is reported as "did not complete", NOT as
+# "no samples", because an inert counter and an empty pipe look identical from here. That distinction is
+# exactly what the LPIB ordinal (0x65) could not offer — amdgpu reads it NOWHERE in the entire amd tree,
+# it sits mid-snapshot-triplet (0x64 lock / 0x65 value / 0x66 timer), and a static read would have been
+# unreadable. Rejected for this reason; do not re-propose it without arming 0x64 first.
+var GPU_R_AFMT_AUDIO_CRC_CONTROL = 0x20A2;  # CRC_EN b0 · CRC_CONT b4 · CRC_SOURCE b8 · CH_SEL [15:12] · COUNT [31:16]
+var GPU_R_AFMT_AUDIO_CRC_RESULT  = 0x20A8;  # CRC_DONE b0 (RO) · CRC [31:8] (RO)
+var GPU_AFMT_AUDIO_CRC_EN        = 0x1;
+var GPU_AFMT_AUDIO_CRC_CONT      = 0x10;
+var GPU_AFMT_AUDIO_CRC_DONE      = 0x1;
+var GPU_AFMT_AUDIO_CRC_COUNT_SHIFT = 16;
+# 2048 samples @ 48 kHz = ~43 ms of audio — long enough that a running stream completes it comfortably,
+# short enough that a dead one does not stall the boot behind the bounded wait below.
+var GPU_AFMT_AUDIO_CRC_SAMPLES   = 2048;
 var GPU_AFMT_AUDIO_LAYOUT_OVRD = 0x1;        # AFMT_AUDIO_PACKET_CONTROL2 bit0 — known-good = 0
 var GPU_AFMT_60958_OSF_OVRD    = 0x10000000; # AFMT_AUDIO_PACKET_CONTROL2 bit28 — known-good = 0
 var GPU_AFMT_AUDIO_SRC_SELECT_MASK = 0x7;  # must be 0..3 on Renoir — only 4 endpoints exist

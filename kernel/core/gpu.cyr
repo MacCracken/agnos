@@ -3172,6 +3172,66 @@ fn gpu_hdmi_audio_enable() {
     gpu_hdmi_audio_on = 1;
     kprint("gpu: hdmi audio online (endpoint ", 33); kprint_num(az);
     kprint(" on dig ", 8); kprint_num(gpu_audio_dig); kprintln(")", 1);
+
+    # THE ONE QUESTION EVERY LINE ABOVE BEGS. Everything printed so far is an echo of a write: the endpoint
+    # says it is enabled because we enabled it. This asks the hardware something it has to answer for itself.
+    gpu_hdmi_audio_crc_probe(d);
+    return 1;
+}
+
+# Measure whether audio samples PHYSICALLY traverse this encoder, by checksumming them in hardware.
+#
+# This exists because twelve burns could not distinguish "the encoder is transmitting our tone and the sink
+# ignores it" from "nothing ever reaches the encoder and it is faithfully transmitting silence". Both look
+# exactly like the register state agnos already has. The CRC block tells them apart: it counts and
+# checksums the samples that actually go through, so DONE is a fact about the hardware rather than about
+# our configuration.
+#
+# HOW TO READ THE RESULT — this is the whole point, so it is spelled out:
+#   "samples reaching the encoder (crc N)"  ⟹ the HDA link, the codec, the stream binding and the FIFO all
+#       work. Samples arrive. The fault is DOWNSTREAM: the link, the sink, or the panel itself. Next look
+#       at what the monitor is told, not at this block.
+#   crc N == 0 with DONE set ⟹ samples arrive but they are DIGITAL SILENCE. The pipe is correct and the
+#       PCM is empty — a ring/refill/sink-select bug on the codec side, not a display bug at all.
+#   "crc did not complete" ⟹ either nothing is arriving, OR this counter is inert on this silicon. It is
+#       reported as UNCONFIRMED and not as proof of no samples, because amdgpu never reads this register
+#       back and so nothing validates the DONE semantics on DCN 2.1. Do not turn a non-answer into a
+#       verdict; that is how the last twelve burns were spent.
+fn gpu_hdmi_audio_crc_probe(d) {
+    # Disarm first: the counter is free-running once enabled, and re-arming a live one races its own DONE.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d,
+    (GPU_AFMT_AUDIO_CRC_SAMPLES << GPU_AFMT_AUDIO_CRC_COUNT_SHIFT) | GPU_AFMT_AUDIO_CRC_EN);
+
+    # 2048 samples at 48 kHz is ~43 ms. Wait up to ~300 ms: generous enough that a running stream always
+    # finishes, bounded so a dead one costs a third of a second of boot rather than hanging the box on a
+    # register whose behaviour is unverified.
+    var waited = 0;
+    var done = 0;
+    while (waited < 300) {
+        gpu_udelay(1000);
+        waited = waited + 1;
+        if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_RESULT + d) & GPU_AFMT_AUDIO_CRC_DONE) != 0) {
+            done = 1;
+            break;
+        }
+    }
+    var res = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_RESULT + d);
+    # Leave the block as we found it — a free-running CRC serves no purpose past this measurement.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d, 0);
+
+    if (done == 0) {
+        kprintln("gpu: hdmi audio sample flow unconfirmed (crc did not complete)", 62);
+        return 0;
+    }
+    var crc = (res >> 8) & 0xFFFFFF;
+    if (crc == 0) {
+        kprintln("gpu: hdmi audio samples reaching the encoder, but they are silence", 66);
+        return 1;
+    }
+    kprint("gpu: hdmi audio samples reaching the encoder (crc ", 50);
+    kprint_hex(crc);
+    kprintln(")", 1);
     return 1;
 }
 
@@ -3248,6 +3308,12 @@ fn gpu_audio_dump() {
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + d)); kprintln("", 0);
     kprint("AFMT_CNTL              ", 23);
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d)); kprintln("", 0);
+    # The CRC pair. gpu_hdmi_audio_crc_probe disarms CONTROL when it finishes, so CONTROL reads 0 here by
+    # design and RESULT still holds the last measurement — the value the probe's line above reported.
+    kprint("AFMT_AUDIO_CRC_CONTROL ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d)); kprintln("", 0);
+    kprint("AFMT_AUDIO_CRC_RESULT  ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_RESULT + d)); kprintln("", 0);
     kprint("HDMI_ACR_48_1          ", 23);
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d)); kprintln("", 0);
     kprint("DIG_BE_CNTL            ", 23);

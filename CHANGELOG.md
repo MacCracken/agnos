@@ -5,6 +5,291 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — the audio CRC: the first instrument on this block that answers instead of echoes
+
+Not cut. Staged for the next measurement burn.
+
+Twelve burns read this path green while the panel stayed mute, because **every register on it echoes a
+write**. `AFMT_AUDIO_ENABLE = 1` means the endpoint was told audio is on. No FIFO overflow is equally
+consistent with "draining fine" and "nothing arriving to drain". And `lpib`, the one measured thing that
+genuinely moves, sits on the **controller** side of 04:00.1 — it proves the DMA fetches PCM out of RAM and
+proves nothing about whether a single sample crosses the HDA link into the encoder.
+
+- **`gpu_hdmi_audio_crc_probe()`** (`kernel/core/gpu.cyr`) arms `AFMT_AUDIO_CRC_CONTROL` (`0x20A2`) over
+  2048 samples (~43 ms at 48 kHz) and reads `AFMT_AUDIO_CRC_RESULT` (`0x20A8`). `CRC_DONE` asserts **only
+  when that many samples have physically traversed the AFMT**, and the CRC is content-derived. It bisects
+  the entire chain in one reading:
+  - **samples reaching the encoder, CRC non-zero** ⇒ HDA link, codec, stream binding and FIFO all work; the
+    fault is **downstream** (link/sink/panel).
+  - **samples reaching the encoder, CRC zero** ⇒ the pipe is right and the PCM is **digital silence** — a
+    ring/refill/sink-select bug on the codec side, not a display bug at all.
+  - **did not complete** ⇒ reported as **unconfirmed, not as proof of no samples** (see below).
+  Bounded to ~300 ms, disarms the block when done, and both registers are added to `gpu_audio_dump()` and
+  to `agnosticos/scripts/dump-dcn-audio.py` so the two sides keep printing the same list.
+- **Offsets and every bit position confirmed against two independent primary sources** — Linux v6.6
+  `dcn_2_1_0_offset.h` and umr's `green_sardine.asic` / `ip/dcn_2_1_0.reg`. BASE_IDX 2, plain MMIO, so it
+  carries none of the Azalia index-window re-select hazard 1.55.15 just fixed. amdgpu's legacy DCE paths
+  (`dce_v8_0.c` / `dce_v10_0.c` / `dce_v11_0.c`) write this block, so the hardware is real — but amdgpu
+  never reads the result, so **nothing validates the DONE semantics on DCN 2.1**. The probe is therefore
+  written to be honest when it learns nothing: an inert counter and an empty pipe look identical from here,
+  and it says "unconfirmed" rather than inventing a verdict.
+
+### Added — `BURN_HDMI_DUMP`, the measurement-burn recipe
+
+`scripts/burn-prep.sh` gains `BURN_HDMI_DUMP=1` → `HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_DUMP=1`. Use it for the
+display-audio arc until the silence is explained; it is `BURN_HDMI` plus the full register read-back, so
+agnos can be diffed against the known-good mechanically rather than by argument. Named as a `BURN_*` recipe
+rather than hand-rolled build flags, because a plain build compiles this code and never calls it.
+
+Also corrects `BURN_HDMI`'s description, which was stale by two arcs: it still claimed *"agnos has no
+amdgpu → a dark port won't egress"*. agnos has driven its own DCN pipe since 1.55.0 — the port is lit by
+agnos's own driver now, and that sentence was describing a 1.53.5 world.
+
+### Rejected — `PIN_CONTROL_LPIB`, and why it is not the discriminator it looks like
+
+Recorded so it does not get re-proposed. The obvious next instrument is the Azalia endpoint's own
+`PIN_CONTROL_LPIB`. The ordinal (`0x65`) is **confirmed correct** by both sources. It is still the wrong
+instrument:
+
+- **amdgpu reads it nowhere** — zero references in any `.c` file across the entire `drivers/gpu/drm/amd`
+  tree, against 268 defines in headers. Nothing in the reference driver exercises it.
+- It sits mid-**snapshot triplet** (`0x64` `LPIB_SNAPSHOT_CONTROL` / `0x65` `LPIB` / `0x66`
+  `LPIB_TIMER_SNAPSHOT`), so a naked read without arming the lock may return torn, stale or zero data.
+- No primary source documents its behaviour; AMD publishes no DCN 2.1 register reference with prose.
+- Therefore a zero or frozen read would be **uninterpretable** — indistinguishable from "no audio" — which
+  is precisely the ambiguity a burn is spent to resolve.
+- Name collision worth knowing: the LPIB Linux actually uses for stream position is a **different register
+  in a different device**, the HDA controller's stream-descriptor `SD_LPIB` (`azx_get_pos_lpib`), and ALSA
+  trusts even that one so little it ships `POS_FIX_LPIB` quirk machinery.
+
+If it is ever read, read the whole triplet and treat a static value as uninformative.
+
+## [1.55.15] — 2026-07-15 — everything amdgpu does, and the panel is still mute
+
+The endpoint fix landed. So did four more real defects behind it, one of which was actively destroying its
+own write. Every gate on this path now passes: the DMA fetches PCM, the endpoint reports itself enabled,
+the slot map takes and reads back, the AVI transmits, the FIFO does not overflow after its ack, the
+hardware builds a correctly-checksummed Audio InfoFrame out of the `CHANNEL_SPEAKER` we wrote, the audio
+clock acks, and the SMU accepts the wake. The sink is silent.
+
+This cut is that work, recorded honestly. It fixes real bugs. **It does not fix the silence.**
+
+**And it does not entitle us to the conclusion the last two cuts have been drifting toward.** An
+independent re-derivation of amdgpu's DCN audio path from real v6.6 source confirms every DIG1 register
+agnos writes matches what `enc1_se_setup_hdmi_audio` / `enc1_se_audio_setup` / `enc1_se_enable_audio_clock`
+write — but **the known-good corpus is only about 13 of the 36 registers agnos dumps.** The rest have never
+been compared to anything. "The block is byte-identical to amdgpu except for three registers" is a
+statement about *the registers that happen to have a recorded value*, not about the block. The capture was
+taken to settle specific arguments, and it settled them; it was never a survey. Twenty-three values are
+still unmeasured, and treating that as "exhausted" is how a thirteenth burn gets spent.
+
+**None of this is a pass.** Per the rule this arc learned the hard way at 1.55.14: the log line is not the
+oracle, the operator's ears are. Twelve burns have now read green while mute.
+
+### Fixed — the Azalia index window has no memory
+
+The endpoint registers are reached through an index/data window: write the ordinal to
+`AZF0ENDPOINT_ENDPOINT_INDEX` (`0x386`), then read or write `..._ENDPOINT_DATA` (`0x387`), which returns
+whatever the index last named. 1.55.14 inserted the slot-map write (index `0x36`) into the middle of a
+HOT_PLUG_CONTROL (index `0x54`) select-then-use pair, and never re-selected.
+
+Everything downstream then aimed at the wrong register through a window that reports no error:
+
+- the `hotplug` read reported the **slot map** and printed a fake `hotplug 0` / `clock OFF`;
+- the clock-gating read-modify-write then stored `0` straight back into the slot map — **destroying the
+  very write it had just been added to make**.
+
+The iron caught it as a contradiction that could not both be true: the sequence printed `hotplug 0` while
+the end-of-boot dump read the same register as `0x80000011`. Two reads of one register, two answers, one
+of them through a stale window. Fixed by re-selecting the index before the reads below it. **Any write
+between an index select and its data use must re-select** — recorded at the site, because this window will
+do it again.
+
+### Fixed — the slot map is cleared by the AUDIO_ENABLED transition
+
+`MULTICHANNEL_ENABLE` (index `0x36`) read **0** on agnos where amdgpu reads **1**, while `CHANNEL_SPEAKER`
+— written through the same window moments earlier — landed correctly at `0x10001`. So the window worked
+and the ordinal was right; the endpoint clears this register across the `AUDIO_ENABLED` transition.
+
+That matters because `MULTICHANNEL01_ENABLE` is bit 0: at 0 no slot pair is enabled, the AFMT has nowhere
+to drain, and the FIFO backs up — which is exactly the `AFMT_AUDIO_FIFO_OVERFLOW` the same dump caught set
+on agnos and clear on amdgpu. Two registers, one bug. The write now goes **after** `AUDIO_ENABLED`, and is
+read back rather than assumed.
+
+### Fixed — the AVI InfoFrame body was invented
+
+1.55.14 derived the header correctly (`0xD0282`, byte-for-byte amdgpu) and then **made up the body**: an
+all-zero payload with checksum `0x6F`, argued as "a legal minimum". It was a self-consistent packet that
+described nothing, and it declared `B=0` (no bar info) while pointing at bars it never sent.
+
+Measured against amdgpu playing sound on this link: `GENERIC_0 = 0x80885E8F`, `GENERIC_2 = 0x05CA`,
+`GENERIC_3 = 0x0AA1`. It describes the raster. agnos now sends a real body:
+
+- bottom bar = `v_total + 1`, right bar = `h_total + 1` — **derived from the totals `gpu_pixclk_discover`
+  already reads, not hardcoded to one panel**;
+- the checksum is **computed**, not copied, for the same reason: a constant would silently lie the moment
+  the raster changed.
+
+**Deliberate deviation, stated plainly:** `DB1 = 0x1E` where amdgpu has `0x5E`. The difference is the `Y`
+field — amdgpu drives this panel as YCbCr 4:4:4, agnos's link is RGB, and the AVI must describe *our*
+link, not amdgpu's. `DB2 = 0x08` (C=0, no colorimetry data — correct for RGB) against amdgpu's `0x88`
+(C=2, BT.709) follows from the same choice. This is the one place the diff against known-good is expected
+to be non-zero.
+
+### Added — the PME workaround (a new SMU mailbox)
+
+`enable_pme_wa()` is the one function in amdgpu's audio-enable chain agnos had no equivalent of. In
+`dce110_enable_audio_stream()` it fires unconditionally — `num_audio` starts at 1 — between `az_enable()`
+and `enable_audio_packet()`, to wake the Azalia block out of D3. On Renoir it lands in
+`rn_vbios_smu_enable_pme_wa` → `VBIOSSMC_MSG_UpdatePmeRestore`.
+
+1.55.9 ruled it out on the grounds that the AZ index window answered reads and writes. **A reachable
+window is not a woken block** — everything configures, the endpoint reports itself enabled, the DMA runs,
+and nothing drains. That reasoning was the wrong test.
+
+Implementing it needed a facility agnos didn't have: `gpu_smu_msg()`, a VBIOSSMC mailbox transcribed from
+`rn_vbios_smu_send_msg_with_param()` (MP1 segment 0, `C2PMSG_67`). The order *is* the protocol: drain,
+clear the response, write the parameter, write the message id last because that is what triggers it. It is
+bounded rather than amdgpu's 2-second worst case, and a declined wake **reports and continues** — a
+sulking SMU must not take the audio path down with it.
+
+The SMU accepted the message on iron. It did not produce sound.
+
+### Added — the FIFO overflow ack, and the diagnostics that make the next diff mechanical
+
+- **`AFMT_AUDIO_FIFO_OVERFLOW` is sticky.** It latches on the first overrun and stays set, so a read taken
+  long after setup cannot tell "overflowing now" from "overran once while the path was being built". It is
+  now acked (`AFMT_AUDIO_PACKET_CONTROL` bit 23) once the drain path is fully armed, then re-read: re-arms
+  means samples genuinely cannot drain; stays clear means the earlier read was a setup artifact. On iron it
+  **stays clear** — so the overflow 1.55.14 recorded was an artifact, and is not the fault.
+- **`gpu_audio_dump()`**, behind a new `HDMI_AUDIO_DUMP` build flag: reads the whole display-audio block
+  back **after** every write has landed, in the exact register order and naming of
+  `agnosticos/scripts/dump-dcn-audio.py`, so agnos can be diffed against the known-good capture
+  mechanically instead of by argument. Diagnostic-only and gated out of every normal build — it is a raw
+  hex dump, which the kernel-log rule forbids in the production path.
+- **`hda_dma_report()` at the seam.** Both halves of this path report themselves healthy while the sink is
+  mute, so the question that matters is whether samples are physically moving between them.
+  `hda_stream_arm()` already printed that verdict — hundreds of lines up, off the top of the panel. It is
+  now read again where it is visible, next to the sink report.
+
+### Fixed — the codec side: verb order, and the slot map lives behind vendor verbs
+
+- **Setting the stream format RESETS the converter's channel count.** agnos issued `CVT_CHAN_COUNT` first,
+  so the format write immediately wiped it. Linux does not have this bug because it does not have this
+  order: `patch_hdmi.c` `hdmi_pcm_prepare` sets tag+format via `snd_hda_codec_setup_stream` **first**, then
+  `hdmi_setup_audio_infoframe` issues `AC_VERB_SET_CVT_CHAN_COUNT`. agnos now matches: format, then stream
+  id, then channel count last.
+- **The standard `SET_CVT_CHAN_COUNT` is a no-op on this codec.** Iron-proven: it never moved
+  `MULTICHANNEL_ENABLE` off 0 in *either* verb order, while the same endpoint faithfully mirrored our
+  `CONVERTER_FORMAT` (`0x11`) and `CHANNEL_STREAM_ID` (`0x10`) — so the verbs reach it. On ATI/AMD the slot
+  map lives behind **vendor verbs on the pin**: `0x772` downmix, `0x771` channel allocation, `0x777` slot
+  pair 0/1. Vendor-gated on `0x1002` so the ALC897 analog path is untouched.
+
+### Added — sink-select (the parked HDA bite 4)
+
+Make the GPU's HDMI controller the live refill target when — and only when — the display side actually came
+up, so a ring-3 tone lands on the display link rather than the analog jack. Otherwise instance 0 stays the
+sink and the analog path, which works and is iron-validated, keeps working. The sink report prints
+**before** the re-route, not after: it is the only window onto the codec half, and putting it behind the
+code it exists to diagnose is how a burn comes back saying nothing at all.
+
+### What the last burn actually proved
+
+The sixth burn carried the endpoint fix, the window re-select, the slot-map reorder and the real AVI body —
+each confirmed from the log or by arithmetic, not assumed:
+
+- `gpu: hdmi endpoint clock on (hotplug 80000011)` — the re-select landed; the pre-fix build printed
+  `hotplug 0` / `clock OFF` for this same register.
+- `AZ_MULTICHANNEL_ENABLE 1` in the dump, with no "slot map did not take" — the reorder landed.
+- `AFMT_GENERIC_0 = 0x00081ECF` — checksum `0xCF` reproduces
+  `0x100 − ((0x82+0x02+0x0D+0x1E+0x08+0x00+0xCA+0x05+0xA1+0x0A) & 0xFF)` exactly, so the computed body
+  landed on the real 2720x1481 raster.
+- `hda: dma running lpib=24460 run=1` — PCM is physically moving.
+
+And `gpu: hdmi audio online (endpoint 1 on dig 1)`, and silence.
+
+### Ledger — the surviving diff, **among the registers that have a known-good value at all**
+
+Scope, stated first because the last two cuts elided it: this compares the ~13 registers with a recorded
+amdgpu value against agnos. The other ~23 in `gpu_audio_dump()`'s output are **unmeasured**, not matching.
+
+Of the compared set, three differ, and two of those are deliberate:
+
+- **`AFMT_GENERIC_0`** `0x00081ECF` vs `0x80885E8F` — the RGB-versus-YCbCr AVI body above. **Intended.**
+- **`DCCG_AUDIO_DTO0_MODULE`** `0x24D9AC` (2415020) vs `0x24D998` (2415000) — agnos's measured pixel clock,
+  8 ppm high. Against IEC 60958-3 Level II's ±1000 ppm this is inaudible and self-consistent; 1.55.11
+  deleted the snap deliberately and that reasoning stands. **Intended, and cannot cause silence** — it
+  could only ever cause a pitch error too small to hear.
+- **`AFMT_STATUS` bit 30** (`AFMT_AZ_AUDIO_ENABLE_CHG`) reads **1** on agnos, **0** on amdgpu. agnos still
+  never writes the corresponding `..._CHG_ACK`. This is the **only unexplained diff left on the block**,
+  and it was already noted for hardening at 1.55.14 and not acted on. It is a change-notification bit, so
+  the honest reading is that it is a symptom rather than a cause — but it is the last thing on this block
+  that is measurably not what the working driver looks like.
+
+### Honest note on where this leaves the arc
+
+A 31-agent adversarial audit re-derived the whole path from fetched v6.6 amdgpu source and **produced no
+surviving candidate defect**. Every hypothesis it raised was refuted, several by the audit's own verifiers.
+That is a real result and it is recorded as one: there is no known wrong bit in this block, and there is
+also no confident root cause. Manufacturing one is how the last six burns got spent.
+
+Two things it did establish, both worth more than another guess:
+
+- **The register diff was never exhausted.** ~23 of the 36 values agnos dumps have no known-good
+  counterpart. The premise that six burns closed out the display side is not supported.
+- **Nothing on record proves a single sample crosses the HDA link into the AFMT.** `lpib` advancing is
+  measured on the *controller* side of 04:00.1. `AFMT_AUDIO_ENABLE = 1` only means the endpoint was told
+  audio is on. "No FIFO overflow with `SAMPLE_SEND = 1`" is **equally consistent with draining fine and
+  with nothing arriving to drain** — and the DCN side re-deriving as correct shifts weight toward the
+  second. The HDA controller at **04:00.1 has never produced sound on this machine**: the iron-validated
+  1.52.x audio arc drove a *different* controller (04:00.6, the ALC897 analog codec). That link is the
+  least-evidenced hop in the chain and the one with zero known-good data.
+
+**The next burn should be a measurement burn, not a fix burn**, and the discriminator is one register:
+**AZ endpoint ordinal `0x65`, `PIN_CONTROL_LPIB`** — the endpoint's *own* link position, which
+`gpu_audio_dump()` does not currently read. Sampled twice ~50 ms apart: if it does not advance while the
+controller's `lpib` does, samples are not crossing the link, the entire DCN lane is exonerated in one
+reading, and the search collapses onto 04:00.1. If it advances, the DCN egress is guilty and the search
+collapses the other way. Either way one burn halves the problem, which is more than any of the last six
+achieved.
+
+**Do not write `HDMI_ACR_CTS_48` next burn.** It is the field agnos consciously declined with a rationale
+that survived the audit (`HDMI_ACR_SOURCE = 0` ⇒ hardware-measured CTS). Nobody has ever *read* it. Read it
+first; writing agnos's 241502-derived value where amdgpu computes from 241500 opens a divergence rather
+than closing one.
+
+And the capture itself: it should be taken whole and **stored**, alongside
+`agnosticos/docs/development/prior-art/r8169-live-linux-register-dump-2026-05-25.md`, so that no future
+session re-derives what this silicon will simply answer. `agnosticos/scripts/capture-hdmi-audio-known-good.sh`
+now does that in one command — both halves, while a tone plays.
+
+### The premise nobody had checked — checked, and it holds
+
+Twelve burns assumed this panel emits sound over HDMI, and **no record showed anyone confirming they could
+hear it**. The 1.55.14 capture was taken "while Firefox was playing", which proves ALSA had a stream open
+on the HDMI codec — not that the monitor made a noise. Had the XB323U no usable audio out, every register
+on this path could be perfect and the result would be exactly what twelve burns observed.
+
+**Checked on 2026-07-15: the sink is audible.** A tone played to `hw:0,7` under amdgpu is plainly heard out
+the panel. **Therefore agnos's silence is agnos's bug**, the arc is legitimate, and none of the register
+work above was aimed at a phantom.
+
+The method is worth keeping, because the first answer offered was *"I believe I heard the tones"* — which
+is not evidence, and accepting that grade of maybe is how twelve burns read green while mute. Instead: play
+a pattern the operator cannot guess, **then** describe it and ask for a match — three short 880 Hz beeps, a
+pause, one 300→3000 Hz rising sweep, twice. Someone hearing nothing cannot reproduce that description. The
+capture harness (`agnosticos/scripts/capture-hdmi-audio-known-good.sh`) asks outright and refuses to record
+a known-good it cannot stand behind.
+
+The **codec half of the known-good is now captured and committed** —
+`agnosticos/docs/development/prior-art/dcn-audio-codec-side-known-good-2026-07-15.md` — and it needed no
+root: `/proc/asound` is world-readable and `/dev/snd/pcmC0D7p` carries a session ACL. With a tone playing,
+converter `0x04` reads `Digital: Enabled` and pin `0x05` reads `Pin-ctls: 0x40: OUT` — **the same sequence
+agnos performs**, and agnos's HDA constants check out against it (`WCAP_DIGITAL 0x200` vs `wcaps 0x221`;
+`PINCAP_HDMI 0x80` vs `Pincap 0x94`; `PINCTL_OUT_EN 0x40` vs `Pin-ctls 0x40`; `HDA_FMT_48K_16_2 0x0011` vs
+the DCN's mirrored `AZ_CONVERTER_FORMAT 0x11`). One delta recorded, not suspected: **Linux binds stream tag
+3, agnos uses tag 1** — legal, since tags are per-link and driver-chosen.
+
 ## [1.55.14] — 2026-07-14 — the audio was aimed at a pin with nothing plugged into it
 
 **Every register the 1.55.12/1.55.13 sequence programs was already byte-correct. It was programming the
