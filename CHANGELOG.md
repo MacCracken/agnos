@@ -5,6 +5,97 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.14] — 2026-07-14 — the audio was aimed at a pin with nothing plugged into it
+
+**Every register the 1.55.12/1.55.13 sequence programs was already byte-correct. It was programming the
+wrong Azalia endpoint.** The live encoder is DIG1; agnos armed endpoint **0**; amdgpu uses endpoint **1**.
+Endpoint 0 is codec pin `0x3`, which reports `monitor_present 0`. Six burns of audio went out an unconnected
+port.
+
+### The method that found it, after six burns that didn't
+
+This machine runs Arch + amdgpu and plays HDMI audio through this exact panel and cable. So the correct
+value of every disputed register was sitting in the silicon the whole time. A read-only BAR5 dump
+(`agnosticos/scripts/dump-dcn-audio.py`, mmap of `resource5`, `PROT_READ`) taken **while Firefox was
+playing** gave amdgpu's known-good state in one pass, with no burn. The diff was then arithmetic rather
+than argument.
+
+Three independent confirmations of the same pairing, all measured:
+
+- `DIG1_AFMT_AUDIO_SRC_CONTROL` = `0x00000001` → `AFMT_AUDIO_SRC_SELECT` = **1**.
+- `AZ1_..._HOT_PLUG_CONTROL` = `0x80000000` — endpoint 1 is the **only** one with `AUDIO_ENABLED` (bit 31);
+  endpoints 0/2/3 read `0x0`. Likewise `AZ1_..._CHANNEL_SPEAKER` = `0x00010001` (`HDMI_CONNECTION` bit 16 +
+  FL/FR) while 0/2/3 read `0x00001300`.
+- `/proc/asound/card*/eld#*`: the Acer XB323U is on `codec_pin_nid 0x5` / `codec_cvt_nid 0x4` — the second
+  pin/converter pair, index 1. The other three pins read `monitor_present 0`.
+
+And amdgpu says *why* in `dc_resource.c` `find_first_free_audio()`: `if (id != i) continue;` — the audio
+instance index **is** the stream encoder's engine id. DIG1 / `ENGINE_ID_DIGB` → endpoint 1. It is a fixed
+wiring, not a search.
+
+### Fixed
+
+- **The Azalia endpoint is now the encoder's index** (`kernel/core/gpu.cyr` `gpu_hdmi_audio_enable`):
+  `az = gpu_audio_dig`. This single value feeds both the endpoint register window (`HOT_PLUG_CONTROL`,
+  `CHANNEL_SPEAKER`) and `AFMT_AUDIO_SRC_SELECT`, so both move together. Guarded: Renoir has five DIGs but
+  only four audio endpoints (`res_cap_rn.num_audio = 4`), so an out-of-range encoder refuses rather than
+  wrapping onto someone else's endpoint.
+- **The stream-tag search is deleted.** It asked which endpoint had a non-zero
+  `CONVERTER_CONTROL_CHANNEL_STREAM_ID`, but `hda_codec_route()` binds **every** converter to the same tag,
+  so it could only ever return endpoint 0. **1.55.13 diagnosed this exactly** — its changelog calls the scan
+  "degenerate… it can only ever return the first endpoint" and files it as "known debt: it will bite the
+  moment a second sink appears." It was biting when that sentence was written. The search was never
+  repairable; it was the wrong question.
+
+### Added
+
+- **`AFMT_AUDIO_CLOCK_ON` is now a gate, not a spare constant.** `AFMT_CNTL` bit 8 is the hardware's ack and
+  is read-only, so unlike the `AFMT_AUDIO_CLOCK_EN` bit we write, it cannot echo us. amdgpu reads `0x101`
+  here with sound playing. The constant has existed in `gpu_regs.cyr` since 1.55.12 and **nothing ever read
+  it** — six burns had a free, decisive gate sitting unused in the register table.
+
+### Removed
+
+- **The preflight and post-arm register hex-dumps.** `preflight fe=/control=/gc=/afmtcntl=`,
+  `preflight acr=/vbi=/info=/generic=`, `preflight audiopkt=/afmtaudio=/dtosel=`, the per-endpoint
+  `stream tag` lines, `afmt status`, and `infoframe info=/line=/speaker=` are gone. They were the arc's
+  diagnostic crutch and they violated this project's kernel-log rule (plain driver statements, never debug
+  hex-dumps). Every value they printed is now known-good from the amdgpu dump, so they have nothing left to
+  tell us. Same disposal as the P0 diagnostic at 1.55.3 and the present-loop demo at 1.55.7. **All the
+  safety gates they fed remain** — deep colour/scrambling, AVMUTE, and non-24bpp-RGB still hard-refuse the
+  flip. One plain line replaces them: `gpu: hdmi audio online (endpoint N on dig N)`.
+
+### Hypotheses the measurement refuted (recorded so nobody re-chases them)
+
+- **ACR is not the bug.** `HDMI_ACR_SEND` [0] and `HDMI_ACR_CONT` [1] are **not defined anywhere in agnos
+  and never written** — which looked exactly like the InfoFrame bug 1.55.13 had just fixed one register
+  over. The dump kills it: amdgpu's working `DIG1_HDMI_ACR_PACKET_CONTROL` = `0x00011000` — `ACR_SEND` = 0,
+  `ACR_CONT` = 0, `AUTO_SEND` = 1 — which is **byte-identical to what agnos writes**. A burn would have cost
+  a day to learn this; the dump cost eleven minutes.
+- **`dtosel=3` was a red herring.** The pre-write read was the GOP's leftover; agnos forces the field to 0
+  and amdgpu's working `DCCG_AUDIO_DTO_SOURCE` reads `0x00000000`. agnos's mask (`0x30`, `[5:4]`) is correct.
+- **The strides were correct.** `GPU_DCN_AZ_STRIDE = 0x6` and `GPU_DCN_DIG_STRIDE = 0x100` both match the
+  headers. A wrong stride would have produced this exact symptom (correct values, wrong address, perfect
+  readback) — it just wasn't this.
+- **`HDMI_AUDIO_PACKETS_PER_LINE` is not required.** It reads **0** on amdgpu's working path.
+- **`HDMI_AUDIO_INFO_CONT` is not required.** amdgpu's `HDMI_INFOFRAME_CONTROL0` = `0x10`: `SEND` set,
+  `CONT` clear — exactly what 1.55.13 already produces.
+
+### Ledger — real, but not this bug
+
+- **`DCCG_AUDIO_DTO0_MODULE`**: agnos writes the measured `2415030`; amdgpu writes the exact standard
+  `2415000` (`0x0024d998`). A 12 ppm difference, ~0.02 cents, against IEC 60958-3 Level II's ±1000 ppm.
+  Inaudible, self-consistent, and left alone — 1.55.11 deleted the snap deliberately and its reasoning
+  stands. Recorded only because the golden value is now known.
+- **`AFMT_AUDIO_INFO0` = `0x00000170` on the working path** (and the register **does** exist on DCN 2.1, at
+  `0x209E`). 1.55.13 removed agnos's writes here arguing the field is hardware-generated from
+  `CHANNEL_SPEAKER`. A register dump cannot distinguish "amdgpu wrote it" from "hardware generated it", so
+  this stays **open** — and moot if the endpoint fix lands, since the AIF is then built from the correct
+  endpoint.
+- **`AFMT_AZ_AUDIO_ENABLE_CHG`** (`AFMT_STATUS` bit 30) read **1** on agnos at 1.55.13 and **0** on amdgpu.
+  agnos never writes the corresponding `AFMT_AZ_AUDIO_ENABLE_CHG_ACK`. Likely benign once the endpoint is
+  right; noted for the next hardening pass.
+
 ## [1.55.13] — 2026-07-14 — the Audio InfoFrame was never transmitted
 
 **1.55.12 armed a perfect-looking display side and the sink stayed silent.** The cause was one bit, and it was

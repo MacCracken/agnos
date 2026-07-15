@@ -968,7 +968,21 @@ gpu_hdmi_audio_enable();
 # came up — otherwise instance 0 stays the sink and the analog path keeps working.
 if (gpu_hdmi_audio_on == 1) {
     hda_active_ctl = 1;
-    kprintln("hda: HDMI is the live audio sink", 32);
+    # Report exactly what snd_open() gates on, for THIS instance. snd_open returns -1 unless BOTH
+    # hda_present[ctl] and hda_out_dac[ctl] are non-zero — so if ctl1's codec route never found a digital
+    # DAC, every ring-3 tone fails at the first syscall and no amount of display-side correctness matters.
+    # Until now that was assumed rather than shown; the display side was being debugged on faith that the
+    # codec side had a sink to hand it to.
+    kprint("hda: sink ctl=", 14); kprint_num(hda_active_ctl);
+    kprint(" present=", 9); kprint_num(load64(&hda_present + hda_active_ctl * 8));
+    kprint(" dac=", 5); kprint_num(load64(&hda_out_dac + hda_active_ctl * 8));
+    kprint(" pin=", 5); kprint_num(load64(&hda_out_pin + hda_active_ctl * 8));
+    kprint(" digital=", 9); kprint_num(load64(&hda_out_digital + hda_active_ctl * 8));
+    kprintln("", 0);
+    if (load64(&hda_out_dac + hda_active_ctl * 8) == 0) {
+        # Say it plainly rather than let it surface as "the tone is silent".
+        kprintln("hda: HDMI has no output DAC -- ring-3 audio will fail to open", 61);
+    }
 }
 #endif
 

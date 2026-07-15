@@ -2806,30 +2806,6 @@ fn gpu_hdmi_preflight() {
     var fe   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL   + d);
     var ctl  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL  + d);
     var gc   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC       + d);
-    var acnt = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL     + d);
-    kprint("gpu: hdmi preflight fe=", 23); kprint_hex(fe);
-    kprint(" control=", 9); kprint_hex(ctl);
-    kprint(" gc=", 4); kprint_hex(gc);
-    kprint(" afmtcntl=", 10); kprint_hex(acnt); kprintln("", 0);
-
-    # The packet-generator SEND/CONT bits. The whole "the flip is inert" argument ASSUMES these are all clear;
-    # that assumption is not iron-confirmed, and a GOP that configured HDMI before falling back to DVI could
-    # have left one armed. Read them rather than assume them — this is the gate the safety case rests on.
-    var apc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL   + d);
-    var vpc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL   + d);
-    var ifc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0   + d);
-    var gpc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d);
-    var hap  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
-    var afp  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
-    kprint("gpu: hdmi preflight acr=", 24); kprint_hex(apc);
-    kprint(" vbi=", 5); kprint_hex(vpc);
-    kprint(" info=", 6); kprint_hex(ifc);
-    kprint(" generic=", 9); kprint_hex(gpc); kprintln("", 0);
-    kprint("gpu: hdmi preflight audiopkt=", 29); kprint_hex(hap);
-    kprint(" afmtaudio=", 11); kprint_hex(afp);
-    kprint(" dtosel=", 8);
-    kprint_num((gpu_reg32(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO_SRC) & GPU_DCCG_AUDIO_DTO_SEL_MASK) >> 4);
-    kprintln("", 0);
 
     # --- The three black-screen gates. Each is a hard refusal, not a warning. ---
     var bad = 0;
@@ -2882,28 +2858,24 @@ fn gpu_hdmi_audio_enable() {
     }
     var d    = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
     var pipe = gpu_display_pipe;
-    # WHICH Azalia endpoint? MEASURE IT — never assume it is the DIG index. The endpoint is whichever one the
-    # HDA codec's converter actually feeds, and that is decided by the codec's pin/converter routing, not by
-    # the encoder's number. hda_codec_route() binds the converter with Set Converter Stream/Channel (verb
-    # 0x706, tag in bits [7:4]), so the OWNING endpoint is the one whose CONVERTER_CONTROL_CHANNEL_STREAM_ID
-    # echoes a non-zero tag. P3a read all four as 0 only because nothing was streaming AT PROBE TIME — that
-    # was never evidence that the endpoints are unbound, and taking it as such is exactly how the first
-    # attempt pointed AFMT at the wrong endpoint and produced silence that looked like success.
-    var az = 0 - 1;
-    var k = 0;
-    while (k < GPU_DCN_AZ_ENDPOINTS) {
-        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AZ_ENDPOINT_INDEX + k * GPU_DCN_AZ_STRIDE,
-        GPU_AZ_IX_CONV_STREAM_ID);
-        var sid = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_AZ_ENDPOINT_DATA + k * GPU_DCN_AZ_STRIDE) >> 4) & 0xF;
-        kprint("gpu: hdmi endpoint ", 19); kprint_num(k);
-        kprint(" stream tag ", 12); kprint_num(sid); kprintln("", 0);
-        if (sid != 0) { if (az < 0) { az = k; } }
-        k = k + 1;
-    }
-    if (az < 0) {
-        # Nothing bound: the codec side never routed a converter on this controller, so there is no endpoint
-        # for AFMT to pull from. Say so plainly rather than pick one and emit silence that reads as success.
-        kprintln("gpu: hdmi audio not enabled (no endpoint has a bound stream)", 60);
+    # WHICH Azalia endpoint? THE ONE WHOSE INDEX MATCHES THE ENCODER'S. amdgpu's find_first_free_audio()
+    # (dc_resource.c) walks the audio pool and skips every instance whose index is not the stream encoder's
+    # engine id ("if (id != i) continue;"), so DIG1 / ENGINE_ID_DIGB takes audio endpoint 1. The pairing is
+    # fixed by the hardware's wiring, not discovered by a search.
+    #
+    # 1.55.8-1.55.13 searched instead — for the endpoint whose CONVERTER_CONTROL_CHANNEL_STREAM_ID echoed a
+    # non-zero tag. hda_codec_route() binds EVERY converter to the same tag, so that search could only ever
+    # return endpoint 0, and six burns aimed the audio at a pin with nothing plugged into it. Every other
+    # register those burns programmed was already byte-correct.
+    #
+    # Confirmed three independent ways against this iron running amdgpu with sound playing: the live DIG1
+    # reads AFMT_AUDIO_SRC_SELECT=1; endpoint 1 is the only one with AUDIO_ENABLED set in HOT_PLUG_CONTROL;
+    # and the sink's ELD reports the monitor on codec pin 0x5, the second pin, with the other three pins
+    # reading monitor_present=0.
+    var az = gpu_audio_dig;
+    if (az >= GPU_DCN_AZ_ENDPOINTS) {
+        # Renoir carries five DIGs but only four audio endpoints, so a high-numbered encoder has none.
+        kprintln("gpu: hdmi audio not enabled (encoder has no audio endpoint)", 59);
         return 0;
     }
     var ir = GPU_R_AZ_ENDPOINT_INDEX + az * GPU_DCN_AZ_STRIDE;
@@ -2972,8 +2944,16 @@ fn gpu_hdmi_audio_enable() {
     gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc2 & (0 - 1 - GPU_AZ_CLOCK_GATING_DISABLE));
 
     # --- 5. AFMT. The audio CLOCK first: without it the whole block is inert and reports nothing wrong. ---
+    # AFMT_AUDIO_CLOCK_ON (bit8) is the hardware's own ack and is read-only, so unlike the CLOCK_EN bit we
+    # write, it cannot echo us back: 1 means the clock genuinely started. amdgpu reads 0x101 here — both bits
+    # — with sound playing. Gate on it rather than assume, since a dead clock silences everything downstream
+    # while every register we wrote still reads back exactly as written.
     var ac = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d, ac | GPU_AFMT_AUDIO_CLOCK_EN);
+    if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d) & GPU_AFMT_AUDIO_CLOCK_ON) == 0) {
+        kprintln("gpu: hdmi audio clock did not start", 35);
+        return 0;
+    }
 
     # ACR: hardware-measured CTS (SOURCE=0) + AUTO_SEND, but N is a per-Fs constant and must be written.
     var acr = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d);
@@ -3033,23 +3013,9 @@ fn gpu_hdmi_audio_enable() {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,
     apc | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
 
-    # AFMT_AUDIO_ENABLE is HARDWARE-driven by the Azalia endpoint — not our own write read back — so it is a
-    # real answer about whether the endpoint accepted the stream, not an echo.
-    var st = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + d);
     gpu_hdmi_audio_on = 1;
-    kprint("gpu: hdmi audio path armed on dig ", 34); kprint_num(gpu_audio_dig);
-    kprint(" endpoint ", 10); kprint_num(az);
-    kprint(", pixel clock ", 14); kprint_num(gpu_pixclk_100hz / 10);
-    kprint(" kHz, afmt status ", 18); kprint_hex(st); kprintln("", 0);
-    # Read the infoframe path back. `info` MUST now have bit4 set — it read 0 on every burn up to 1.55.12,
-    # which was the bug in plain sight. `speaker` must have bit16 (HDMI_CONNECTION) set, or the hardware has
-    # no HDMI Audio InfoFrame to build.
-    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_CHANNEL_SPEAKER);
-    kprint("gpu: hdmi infoframe info=", 25);
-    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d));
-    kprint(" line=", 6); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d));
-    kprint(" speaker=", 9); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr));
-    kprintln("", 0);
+    kprint("gpu: hdmi audio online (endpoint ", 33); kprint_num(az);
+    kprint(" on dig ", 8); kprint_num(gpu_audio_dig); kprintln(")", 1);
     return 1;
 }
 
