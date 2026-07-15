@@ -126,6 +126,25 @@ var V_SET_DIGI_CVT1   = 0x70D;      # Set Digital Converter Control 1 (8-bit pay
 var DIGEN             = 0x01;       # DIGI_CVT1 bit0: Digital Enable
 var V_SET_CVT_CHANS   = 0x72D;      # Set Converter Channel Count (payload = channels-1)
 var CVT_CHANS_STEREO  = 0x01;       # channels-1 for 2ch (stereo)
+# --- ATI/AMD vendor-specific HDMI codec verbs (AMD HDA Verbs spec; Linux patch_hdmi.c "ATI/AMD-specific
+# implementations", which gates on vendor_id == 0x1002aa01 — THIS codec, exactly).
+#
+# On an ATI HDMI codec the HDMI slot map is NOT driven by the standard SET_CVT_CHAN_COUNT (0x72D) verb on
+# the CONVERTER. It is driven by a vendor verb on the PIN. That is why agnos's 0x72D never moved
+# AZALIA_F0_..._MULTICHANNEL_ENABLE in either verb order: wrong verb, wrong widget.
+#
+# atihdmi_pin_set_slot_channel():
+#     verb = ATI_VERB_SET_MULTICHANNEL_01 + hdmi_slot/2 + (hdmi_slot % 2) * 0x00e;
+#     ati_channel_setup = (stream_channel << 4) | ATI_OUT_ENABLE;   // [7:4]=chan id, [1]=mute, [0]=enable
+#     snd_hda_codec_write(codec, pin_nid, 0, verb, ati_channel_setup);
+# For stereo, slot 0 carrying stream channel 0: verb 0x777, payload (0 << 4) | 1 = 0x01 — which is EXACTLY
+# what amdgpu leaves in AZ endpoint 1's MULTICHANNEL_ENABLE (measured 0x00000001) on this iron. The slot-0
+# arithmetic is identical with or without full-remap support, so no revision gate is needed for 2 channels.
+var V_ATI_SET_CHAN_ALLOC   = 0x771; # payload = CEA channel allocation (0 = FL/FR stereo)
+var V_ATI_SET_DOWNMIX      = 0x772; # atihdmi_init zeroes this so the infoframe carries no downmix info
+var V_ATI_SET_MULTICHAN_01 = 0x777; # slot pair 0/1 map — the register the whole arc has been stuck on
+var ATI_OUT_ENABLE         = 0x01;  # payload bit0 = slot enable
+var HDA_VENDOR_ATI         = 0x1002;
 var WCAP_DIGITAL      = 0x200;      # WCAP bit9: node is a digital widget (converter assert-gate)
 
 # --- Known controller PCI identities (B0 probe order) ---
@@ -900,11 +919,36 @@ fn hda_codec_route() {
                     if (dgcv != 0 && ((dgcw >> 20) & 0xF) == WID_DAC) {
                         hda_verb(codec, dgcv, (V_SET_POWER << 8) | 0x00);
                         if ((dgcw & WCAP_DIGITAL) != 0) { hda_verb(codec, dgcv, (V_SET_DIGI_CVT1 << 8) | DIGEN); }
-                        hda_verb(codec, dgcv, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
+                        # ORDER IS LOAD-BEARING: channel count goes LAST, after format and stream id.
+                        # Linux does it that way (patch_hdmi.c hdmi_pcm_prepare: snd_hda_codec_setup_stream
+                        # sets tag+format FIRST, then hdmi_setup_audio_infoframe issues
+                        # AC_VERB_SET_CVT_CHAN_COUNT) and the reason is now iron-proven here: setting the
+                        # stream format RESETS the converter's channel count. We had CVT_CHANS first, so the
+                        # format write immediately wiped it.
+                        # Iron, 1.55.14 dump: AZ endpoint 1 mirrored our CONVERTER_FORMAT (0x11) and our
+                        # CHANNEL_STREAM_ID (0x10) — so the verbs reach it — while MULTICHANNEL_ENABLE read
+                        # 0 against amdgpu's 1, and its reset value is 0x21615101, i.e. something actively
+                        # zeroed it. That something was the format write, ordered after the channel count.
+                        # With no slot pair enabled the AFMT cannot drain samples: AFMT_STATUS bit24
+                        # (AUDIO_FIFO_OVERFLOW) re-armed within moments of being acked. Silence, with the DMA
+                        # running and every other register byte-identical to amdgpu.
                         hda_verb(codec, dgcv, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
                         hda_verb(codec, dgcv, (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
+                        hda_verb(codec, dgcv, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
                         hda_verb(codec, dgn, (V_SET_POWER << 8) | 0x00);
                         hda_verb(codec, dgn, (V_SET_PINCTL << 8) | PINCTL_OUT_EN);
+                        # ATI/AMD: the slot map lives behind VENDOR verbs on the PIN. The standard
+                        # SET_CVT_CHAN_COUNT above is a no-op on this codec — iron-proven: it never moved
+                        # MULTICHANNEL_ENABLE off 0 in either verb order, while the same endpoint faithfully
+                        # mirrored our CONVERTER_FORMAT and CHANNEL_STREAM_ID. With no slot pair enabled the
+                        # AFMT cannot drain and AFMT_STATUS bit24 (AUDIO_FIFO_OVERFLOW) re-arms within
+                        # moments of being acked — silence, with the DMA running and 32/34 registers
+                        # byte-identical to amdgpu.
+                        if (((load64(&hda_vendor + hda_active_ctl * 8) >> 16) & 0xFFFF) == HDA_VENDOR_ATI) {
+                            hda_verb(codec, dgn, (V_ATI_SET_DOWNMIX << 8) | 0x00);
+                            hda_verb(codec, dgn, (V_ATI_SET_CHAN_ALLOC << 8) | 0x00);
+                            hda_verb(codec, dgn, (V_ATI_SET_MULTICHAN_01 << 8) | ATI_OUT_ENABLE);
+                        }
                         #ifdef HDA_TONE
                         kprint("hda: hdmi enable pin=0x", 23);
                         kprint_byte(dgn);

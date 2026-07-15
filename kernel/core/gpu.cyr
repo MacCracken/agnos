@@ -2957,6 +2957,14 @@ fn gpu_hdmi_audio_enable() {
     if ((gpu_reg32(GPU_BASE_DCN_2, dr) & 0x1) == 0) {
         kprintln("gpu: hdmi endpoint slot map did not take", 40);
     }
+    # RE-SELECT THE INDEX. Everything below reads and writes HOT_PLUG_CONTROL, and `dr` is a WINDOW: it
+    # returns whatever ordinal `ir` last named. Inserting the slot-map write above without re-selecting left
+    # the window on 0x36, so the reads below reported the slot map as "hotplug" (printing a fake
+    # `hotplug 0` / `clock OFF`) and the clock-gating write below then stored 0 straight back into the slot
+    # map — destroying the very write it was meant to protect. Iron, 1.55.14: `hotplug 0` in the sequence
+    # while the end-of-boot dump read the same register as 0x80000011.
+    # Any write between an `ir` select and its `dr` use must re-select. This window has no memory.
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
     # CLOCK_ON_STATE is a READ-ONLY status, so unlike AUDIO_ENABLED it cannot echo our own write: 1 means the
     # audio wall clock genuinely reached the endpoint.
     var hpc2 = gpu_reg32(GPU_BASE_DCN_2, dr);
