@@ -242,12 +242,43 @@ var GPU_AFMT_AUDIO_SRC_SELECT_MASK = 0x7;  # must be 0..3 on Renoir — only 4 e
 var GPU_AFMT_60958_CS_UPDATE   = 0x4000000;
 var GPU_AFMT_AUDIO_SAMPLE_SEND = 0x1;      # the LAST write — opens the tap
 var GPU_AFMT_AUDIO_INFO_UPDATE = 0x80;
+# THE AUDIO INFOFRAME — and the distinction that cost a burn. AFMT_INFOFRAME_CONTROL0.AFMT_AUDIO_INFO_UPDATE
+# (0x80, above) is an UPDATE LATCH. HDMI_INFOFRAME_CONTROL0.HDMI_AUDIO_INFO_SEND is the TRANSMIT ENABLE, one
+# register over. 1.55.12 set the latch and left the enable clear, so the encoder sent audio sample packets and
+# ACR packets but NO Audio InfoFrame — and a conformant sink mutes without one. The preflight even printed
+# `info=0` and it was read straight past. amdgpu sets SEND in enc1_stream_encoder_hdmi_set_stream_attribute,
+# under its own comment "following belongs to audio".
+var GPU_R_HDMI_INFOFRAME_CONTROL1 = 0x2077;
+var GPU_HDMI_AUDIO_INFO_SEND   = 0x10;      # INFOFRAME_CONTROL0 bit4 — the transmit enable
+var GPU_HDMI_AUDIO_INFO_LINE_MASK = 0x3F00; # INFOFRAME_CONTROL1 [13:8] — the scanline it goes out on
+var GPU_HDMI_AUDIO_INFO_LINE_VAL  = 0x200;  # line 2 (VBI_LINE_0 + 2). SEND with LINE=0 has no slot to use.
+# The Audio InfoFrame's CONTENT is HARDWARE-GENERATED from the Azalia endpoint's CHANNEL_SPEAKER register —
+# which is why amdgpu never writes AFMT_AUDIO_INFO0/1 anywhere in the DCN path, and why HDMI_CONNECTION must
+# be set: it tells the endpoint this pin is HDMI so the hardware builds an HDMI AIF. 1.55.12 masked only
+# SPEAKER_ALLOCATION [6:0], so HDMI_CONNECTION kept the GOP's DVI-era 0 and the HW had nothing to build from.
+var GPU_AZ_HDMI_CONNECTION     = 0x10000;   # CHANNEL_SPEAKER bit16
+var GPU_AZ_DP_CONNECTION       = 0x20000;   # bit17 — must be 0 on an HDMI pin
+var GPU_AZ_EXTRA_CONN_INFO_LSB = 0x40000;   # EXTRA_CONNECTION_INFO [23:18] bit0 — cleared for HDMI
+var GPU_AZ_SPEAKER_ALLOC_MASK  = 0x7F;
+# IEC 60958 channel status. 1.55.12 latched CS_UPDATE over registers it never populated, i.e. it latched
+# ZEROS — and channel numbers L/R = 0/0 is invalid channel status that a strict sink rejects.
+var GPU_AFMT_CS_CHANNEL_MASK   = 0xF00000;  # CHANNEL_NUMBER_L / _R, shift 20
+var GPU_AFMT_CS_CHANNEL_L      = 0x100000;  # L = 1
+var GPU_AFMT_CS_CHANNEL_R      = 0x200000;  # R = 2
+var GPU_AFMT_CS_CLOCK_ACCURACY_MASK = 0x30000000;
+var GPU_AFMT_60958_2_CHANNELS  = 0x876543;  # CHANNEL_NUMBER_2..7 = 3,4,5,6,7,8 (one nibble each, [23:0])
 # Azalia endpoint: ix 0x25 carries SPEAKER_ALLOCATION [6:0] and CHANNEL_ALLOCATION [15:8]; ix 0x54's bit31
 # AUDIO_ENABLED is the endpoint's own gate. AMD configures (0x25 + clock-gating) BEFORE enabling (0x54).
 var GPU_AZ_IX_CHANNEL_SPEAKER  = 0x25;
-var GPU_AZ_AUDIO_ENABLED       = 0x80000000;
+var GPU_AZ_AUDIO_ENABLED       = 0x80000000; # HOT_PLUG_CONTROL bit31 (AUDIO_ENABLED__SHIFT 0x1f)
 var GPU_AZ_SPEAKER_FL_FR       = 0x1;      # front-left/front-right — stereo
-var GPU_AZ_CLOCK_GATING_DISABLE = 0x40;    # HOT_PLUG_CONTROL bit6
+# HOT_PLUG_CONTROL.CLOCK_GATING_DISABLE is **bit 0** (CLOCK_GATING_DISABLE__SHIFT = 0x0), NOT bit 6. 1.55.12
+# shipped 0x40 here, which set a reserved bit and left the endpoint's clock GATED — enabled but unclocked,
+# i.e. AFMT_AUDIO_ENABLE reads 1 and no samples ever move. dce_aud_az_configure sets this before az_enable.
+var GPU_AZ_CLOCK_GATING_DISABLE = 0x1;
+# CLOCK_ON_STATE is a READ-ONLY status at bit 4: 1 = the endpoint actually has its clock. This is the
+# decisive readback — enabling without it going 1 means the audio wall clock never reached the endpoint.
+var GPU_AZ_CLOCK_ON_STATE      = 0x10;
 
 # --- Azalia endpoint indirect window (BASE_IDX 2), stride 0x6 per endpoint ---
 var GPU_DCN_AZ_ENDPOINTS      = 4;      # Renoir: ONLY 0..3 exist

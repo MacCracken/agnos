@@ -2942,12 +2942,34 @@ fn gpu_hdmi_audio_enable() {
     gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_PHASE,  GPU_DCCG_AUDIO_DTO_PHASE_VAL);
 
     # --- 4. Azalia endpoint: configure, then enable ---
-    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_CHANNEL_SPEAKER);
-    var spk = gpu_reg32(GPU_BASE_DCN_2, dr);
-    gpu_reg32_write(GPU_BASE_DCN_2, dr, (spk & (0 - 1 - 0x7F)) | GPU_AZ_SPEAKER_FL_FR);
+    # Un-gate the endpoint clock FIRST — before any other endpoint write. dce_aud_az_configure brackets its
+    # whole sequence this way (open at dce_audio.c:685, close at :1013), and the order matters: a register
+    # write into a gated clock is dropped SILENTLY. 1.55.12 set this bit after the CHANNEL_SPEAKER write, so
+    # that write may never have landed at all.
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
     var hpc = gpu_reg32(GPU_BASE_DCN_2, dr);
-    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc | GPU_AZ_CLOCK_GATING_DISABLE | GPU_AZ_AUDIO_ENABLED);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc | GPU_AZ_CLOCK_GATING_DISABLE);
+
+    # CHANNEL_SPEAKER is not just speaker allocation — it is the SOURCE the hardware builds the Audio
+    # InfoFrame from, so HDMI_CONNECTION must say "this pin is HDMI" or the HW has nothing to build. 1.55.12
+    # masked only [6:0] and left bit16 at the GOP's DVI-era 0.
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_CHANNEL_SPEAKER);
+    var spk = gpu_reg32(GPU_BASE_DCN_2, dr);
+    spk = spk & (0 - 1 - GPU_AZ_SPEAKER_ALLOC_MASK) & (0 - 1 - GPU_AZ_DP_CONNECTION)
+    & (0 - 1 - GPU_AZ_EXTRA_CONN_INFO_LSB);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, spk | GPU_AZ_SPEAKER_FL_FR | GPU_AZ_HDMI_CONNECTION);
+
+    # Now enable the endpoint, then close the clock-gating bracket (amdgpu re-writes with the bit cleared).
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+    var hpc1 = gpu_reg32(GPU_BASE_DCN_2, dr);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc1 | GPU_AZ_AUDIO_ENABLED);
+    # CLOCK_ON_STATE is a READ-ONLY status, so unlike AUDIO_ENABLED it cannot echo our own write: 1 means the
+    # audio wall clock genuinely reached the endpoint.
+    var hpc2 = gpu_reg32(GPU_BASE_DCN_2, dr);
+    kprint("gpu: hdmi endpoint clock ", 25);
+    if ((hpc2 & GPU_AZ_CLOCK_ON_STATE) != 0) { kprint("on", 2); } else { kprint("OFF", 3); }
+    kprint(" (hotplug ", 10); kprint_hex(hpc2); kprintln(")", 1);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc2 & (0 - 1 - GPU_AZ_CLOCK_GATING_DISABLE));
 
     # --- 5. AFMT. The audio CLOCK first: without it the whole block is inert and reports nothing wrong. ---
     var ac = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
@@ -2974,9 +2996,35 @@ fn gpu_hdmi_audio_enable() {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d,
     (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK)) | GPU_AFMT_CHANNEL_ENABLE_STEREO);
 
-    # The Audio InfoFrame must accompany the sample packets or the sink will not render them.
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_INFO0 + d, 0);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_INFO1 + d, 0);
+    # IEC 60958 channel status. These MUST be populated before CS_UPDATE latches them: L/R = 0/0 is invalid
+    # channel status and a strict sink rejects the substream. 1.55.12 set the latch over untouched registers
+    # and therefore latched zeros. (AFMT_60958_2 is at 0x20A7, NOT adjacent to _0/_1 — see gpu_regs.cyr.)
+    var cs0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_0 + d,
+    (cs0 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK) & (0 - 1 - GPU_AFMT_CS_CLOCK_ACCURACY_MASK))
+    | GPU_AFMT_CS_CHANNEL_L);
+    var cs1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_1 + d,
+    (cs1 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK)) | GPU_AFMT_CS_CHANNEL_R);
+    var cs2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_2 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_2 + d,
+    (cs2 & (0 - 1 - 0xFFFFFF)) | GPU_AFMT_60958_2_CHANNELS);
+
+    # THE AUDIO INFOFRAME. This is what 1.55.12 missed and it is why the sink stayed silent through a
+    # perfect-looking display side: the encoder was sending sample packets and ACR packets with NO Audio
+    # InfoFrame, and a conformant sink mutes without one.
+    #   * HDMI_AUDIO_INFO_SEND (INFOFRAME_CONTROL0 bit4) is the TRANSMIT ENABLE — the missing write.
+    #   * HDMI_AUDIO_INFO_LINE (INFOFRAME_CONTROL1 [13:8]) is the scanline it goes out on; SEND with LINE=0
+    #     has no slot to use, so they are a pair.
+    #   * AFMT_AUDIO_INFO_UPDATE (AFMT_INFOFRAME_CONTROL0 bit7) is only the UPDATE LATCH. 1.55.12 set the
+    #     latch and left the enable clear — one register apart. The content itself is HW-generated from the
+    #     endpoint's CHANNEL_SPEAKER (set above), which is why amdgpu never writes AFMT_AUDIO_INFO0/1 at all;
+    #     1.55.12's writes there were the wrong lever entirely and are gone.
+    var il = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d,
+    (il & (0 - 1 - GPU_HDMI_AUDIO_INFO_LINE_MASK)) | GPU_HDMI_AUDIO_INFO_LINE_VAL);
+    var hif = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d, hif | GPU_HDMI_AUDIO_INFO_SEND);
     var ifc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ifc | GPU_AFMT_AUDIO_INFO_UPDATE);
 
@@ -2993,6 +3041,15 @@ fn gpu_hdmi_audio_enable() {
     kprint(" endpoint ", 10); kprint_num(az);
     kprint(", pixel clock ", 14); kprint_num(gpu_pixclk_100hz / 10);
     kprint(" kHz, afmt status ", 18); kprint_hex(st); kprintln("", 0);
+    # Read the infoframe path back. `info` MUST now have bit4 set — it read 0 on every burn up to 1.55.12,
+    # which was the bug in plain sight. `speaker` must have bit16 (HDMI_CONNECTION) set, or the hardware has
+    # no HDMI Audio InfoFrame to build.
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_CHANNEL_SPEAKER);
+    kprint("gpu: hdmi infoframe info=", 25);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d));
+    kprint(" line=", 6); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d));
+    kprint(" speaker=", 9); kprint_hex(gpu_reg32(GPU_BASE_DCN_2, dr));
+    kprintln("", 0);
     return 1;
 }
 

@@ -5,6 +5,74 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.13] — 2026-07-14 — the Audio InfoFrame was never transmitted
+
+**1.55.12 armed a perfect-looking display side and the sink stayed silent.** The cause was one bit, and it was
+printed on every burn since 1.55.8:
+
+```
+gpu: hdmi preflight acr=10000 vbi=0 info=0 generic=0
+                                     ^^^^^^
+```
+
+`info` is `HDMI_INFOFRAME_CONTROL0`, and **bit 4 is `HDMI_AUDIO_INFO_SEND` — the transmit enable for the Audio
+InfoFrame**. It was never written. So the encoder sent audio sample packets and ACR packets with **no Audio
+InfoFrame**, and a conformant HDMI sink mutes without one. 1.55.12 set `AFMT_AUDIO_INFO_UPDATE` — the update
+**latch** — and left the transmit **enable** clear, one register over. The code comment stated the requirement
+("The Audio InfoFrame must accompany the sample packets or the sink will not render them") and then wrote the
+wrong bit.
+
+Found by diffing the AGNOS sequence against amdgpu's `enc1_stream_encoder_hdmi_set_stream_attribute` — the one
+function AGNOS had no equivalent of at all.
+
+### Fixed
+
+- **`HDMI_INFOFRAME_CONTROL0.HDMI_AUDIO_INFO_SEND`** (DIG 0x2076, bit 4) = 1. **The root cause.** Source:
+  `enc1_stream_encoder_hdmi_set_stream_attribute`, under its own comment *"following belongs to audio"*.
+- **`HDMI_INFOFRAME_CONTROL1.HDMI_AUDIO_INFO_LINE`** (DIG 0x2077, [13:8]) = 2. The required pair: `SEND` with
+  `LINE`=0 has no scanline slot to go out on. **The register was absent from `gpu_regs.cyr` entirely.**
+- **`CHANNEL_SPEAKER.HDMI_CONNECTION`** (AZ ix 0x25, bit 16) = 1, `DP_CONNECTION` = 0. The Audio InfoFrame's
+  **content is hardware-generated from this endpoint register** — which is why amdgpu never writes
+  `AFMT_AUDIO_INFO0/1` anywhere in the DCN path. 1.55.12 masked only `SPEAKER_ALLOCATION` [6:0], so bit 16 kept
+  the GOP's DVI-era 0 and the hardware had nothing to build an AIF from. `SEND` alone would still have been
+  silent.
+- **`AFMT_60958_0/1/2` channel status now populated before `CS_UPDATE` latches it.** 1.55.12 set the latch over
+  registers it never wrote, i.e. it latched **zeros** — and channel numbers L/R = 0/0 is invalid IEC 60958
+  channel status that a strict sink rejects. (`AFMT_60958_2` is at 0x20A7, not adjacent to `_0`/`_1`.)
+- **Azalia clock-gating bracket reordered.** `CLOCK_GATING_DISABLE` (`HOT_PLUG_CONTROL` **bit 0**, not bit 6 as
+  1.55.12 had it) is now set **before** any endpoint write and cleared after the last one, matching
+  `dce_aud_az_configure`. The old order wrote `CHANNEL_SPEAKER` into a possibly-gated clock, where writes are
+  dropped **silently**.
+
+### Removed
+
+- **`AFMT_AUDIO_INFO0/1 = 0`** — the wrong lever. amdgpu never writes these registers anywhere in the DCN path;
+  the AIF body is hardware-generated from the Azalia endpoint's `CHANNEL_SPEAKER`. 1.55.12 was hand-writing an
+  infoframe the hardware does not source from, while leaving the hardware's real source unset and the transmit
+  enable clear.
+
+### Added
+
+- **Readbacks that can falsify, not echo.** `CLOCK_ON_STATE` (`HOT_PLUG_CONTROL` bit 4) is **read-only**, so
+  unlike `AUDIO_ENABLED` it cannot reflect our own write: 1 means the audio wall clock genuinely reached the
+  endpoint. And `gpu: hdmi infoframe info=... line=... speaker=...` reads back the two registers that were
+  actually wrong — `info` bit 4 and `speaker` bit 16 — both of which read 0 on every burn through 1.55.12.
+
+### Iron results from 1.55.12 (archaemenid)
+
+- **The DVI→HDMI flip WORKS.** `display link switched to HDMI signalling`; the screen blacked momentarily (the
+  sink re-locking on the transition) and **came back**. `DIG_MODE` readback confirms 3. The pre-stage/inert
+  argument held: `vbi=0 info=0 generic=0` — every `_SEND` bit was clear, exactly as predicted.
+- **`AFMT_AUDIO_ENABLE` = 1** (`afmt status 40000010`, bit 4) — hardware-driven by the Azalia endpoint, so the
+  endpoint really did accept the stream. It was never the blocker.
+- **`DTO_SEL` read 3 pre-write** — neither HDMI (0) nor DP (1). Forcing it to 0 was load-bearing; assuming it
+  was already 0 would have been silence with every other register perfect.
+- **All four AZ endpoints read IDENTICAL** (`csi=0x10`, stream tag 1 on every one) because `hda_codec_route()`
+  binds **every** converter to the one tag. So an endpoint-selection scan keyed on the stream tag is
+  **degenerate** — it can only ever return the first endpoint. Endpoint choice was never the bug; amdgpu binds
+  the audio instance by resource, not by inferring it from a broadcast tag. Left as known debt: it will bite
+  the moment a second sink appears.
+
 ## [1.55.12] — 2026-07-14 — P3b-ii + P3b-iii: display audio, end to end
 
 **The write bite.** The 1.53.5 HDA work streams samples into the GPU's audio function and has been silent
