@@ -5,6 +5,76 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.17] — 2026-07-15 — bind one pin, and match amdgpu's format
+
+Two fixes, both found by the operator asking the questions I should have asked twelve hours earlier:
+*"have you even looked at tonegen to see what format the audio jack needed?"* and *"look at what works."*
+
+### Fixed — the digital BROADCAST was the bug
+
+`hda_codec_route()`'s digital branch enabled **every** digital pin and bound **every** converter to one
+stream tag, because at route time agnos cannot tell which pin has the display (uniform Get Pin Sense
+`0x7fffffff`, identical config defaults). `patch_hdmi.c` names that exact design as a cause of silence, in
+`generic_hdmi_playback_pcm_prepare()`:
+
+> *"Verify pin:cvt selections to avoid silent audio ... **multiple pins can share a same default convertor**
+> and mute control will affect each other, **which can cause a resumed audio playback become silent**"*
+
+Linux never broadcasts — `hdmi_choose_cvt()` picks one converter for one pin. **And agnos's own analog
+branch binds one pin (`0x1b`) to one dac (`0x02`) and plays.** The working reference was in the same
+function the whole time; sixteen burns were spent comparing to amdgpu instead of to the path that works.
+
+`hda_hdmi_bind_single()` binds the live pair and **unbinds the rest** (stream 0, pin control off). The
+ordinal comes from the GPU probe: live encoder → AZ endpoint 1 → digital pin ordinal 1 → pin `0x05` /
+converter `0x04`, exactly what the sink's ELD names. **That is what `hda_force_digi_ord` was declared for
+at hda.cyr:181 and never assigned** — a dead hook, read on day one of this session and walked past because
+a code comment asserted the broadcast was harmless.
+
+**IRON RESULT (1.55.16 + this fix): `gpu: hdmi audio tap 1 saw samples (crc 71539c)`.** Tap 1 had read
+`0x000000` on every burn of this arc. It now carries content, matching the working amdgpu signature — real
+audio is leaving agnos's encoder for the first time. `hda: sink ctl=1 present=1 dac=4 pin=5` (was dac 2 /
+pin 3). Still inaudible, so something remains downstream — but the arc moved.
+
+### Fixed — the last two measured differences from amdgpu
+
+Both were the only remaining diffs against the known-good capture. Made **per-instance** so the
+iron-validated analog path is untouched:
+
+- **Stream tag → 3 on the HDMI controller** (`hda_tag[]`). Tags are per-link, so tag 1 on both controllers
+  was never a collision — but amdgpu drives this codec at 3, and it was a measured difference.
+- **Converter format → `0x31` (24-bit)** on the HDMI instance (`hda_fmt[]`), matching amdgpu's `0x31`
+  against agnos's `0x11`.
+
+**The format is not a one-constant change, and pretending otherwise would have produced noise.** HDA carries
+24-bit in **32-bit containers**, so the ring had to widen with it (`hda_bpf[]`: 4 bytes/frame for 16-bit, 8
+for 24-in-32). Telling the codec `0x31` while writing 4-byte frames makes it read 16-bit data as 24-bit.
+Widened: `hda_refill_half()` (the boot sweep), the LPIB→frames arithmetic, and `snd_copy_frames()`.
+
+**The ring-3 ABI is unchanged and stays S16 stereo** — `snd_write`#66 takes `frames*4`, tonegen writes
+`store16`, and that contract is iron-validated. On the 24-bit instance the **kernel** converts: each s16 is
+sign-extended and left-justified into a 32-bit container (`<<8` puts 16 bits at the top of the 24-bit
+field), which is exactly what the fill does.
+
+**Honest note:** 16-bit HDMI audio is legal and Linux plays it; amdgpu's `0x31` is ALSA's choice, not a
+hardware requirement. This is matched because it was the last measured difference, not because there is
+evidence it is the cause.
+
+### The method correction that produced both
+
+The 1.54.x GPU arc landed C1 through C2h mostly first-try by **porting prior art and burning it**. This arc
+spent sixteen burns and four adversarial audits trying to *derive* the answer first, hunting a wrong bit in
+a path agnos never actually ported. Recorded because the record matters:
+
+- **agnos never ported `dce_aud_az_configure`** — no ELD read, no audio descriptors, no sink info, no
+  `MULTICHANNEL_MODE`, half the ATI verbs. Ported at 1.55.16 from amdgpu's measured values; **the FIFO
+  overflow stopped** (`AFMT_STATUS` `0x41000010` → `0x40000010`), proving those writes mattered.
+- **The perturbation test that "exonerated" them was asymmetric.** Forcing agnos's value onto a path amdgpu
+  had already configured correctly cannot exonerate a write that never happens. A one-directional test was
+  read as symmetric.
+- **The working reference was ignored.** agnos's analog path plays. It was never diffed against the HDMI
+  path until the operator demanded it — and that diff is where both of these fixes came from.
+
+
 ### ✅ MODEL A CONFIRMED — the mute experiment ran, and the bisection survives falsification
 
 **Zero burns.** `agnosticos/scripts/crc-model-discriminator.sh`, prediction pre-registered before the run:

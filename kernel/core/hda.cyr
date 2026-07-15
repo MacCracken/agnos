@@ -109,6 +109,12 @@ var SD_SRST       = 0x1;      # SDnCTL bit0: stream reset
 var SD_RUN        = 0x2;      # SDnCTL bit1: stream run
 var SD_TAG_SHIFT  = 20;       # SDnCTL stream tag position (bits 23:20)
 var HDA_FMT_48K_16_2 = 0x0011; # 48k base (bit14=0) | 16-bit (001<<4) | 2ch (chan-1=1)
+# 24-bit: BITS=011<<4. HDA carries 24-bit samples in 32-BIT CONTAINERS, so the ring widens to 8 bytes per
+# stereo frame — the format is NOT a lone constant. amdgpu drives this panel at 0x31 (ALSA's choice, not a
+# hardware requirement: 16-bit HDMI audio is legal and Linux plays it). It is the LAST measured difference
+# between agnos's endpoint and an audibly-working amdgpu, so it gets tested rather than argued about.
+# PER-INSTANCE, deliberately: the analog path plays 16-bit today and must not be disturbed by this.
+var HDA_FMT_48K_24_2 = 0x0031;
 var BDL_IOC       = 0x1;      # BDL entry flags bit0: interrupt-on-completion
 var V_SET_STREAM_FMT = 0x2;   # 4-bit verb: Set Converter Format
 var V_SET_STREAMID   = 0x706; # 12-bit verb: Set Converter Stream/Channel
@@ -217,7 +223,12 @@ var hda_iss[2];               # [per-instance] GCAP input stream count (output S
 var hda_bdl_phys  = 0;        # BDL ring phys
 var hda_pcm_phys  = 0;        # WC PCM ring phys
 var hda_sd_base[2];           # [per-instance] output stream descriptor register base offset
-var hda_stream_tag = 1;       # stream tag binding DAC <-> stream
+# Per-instance stream tag. Tags are per-LINK, so tag 1 on both controllers was never a collision — but
+# amdgpu drives the HDMI codec at tag 3 and this is one of the two last measured differences, so match it.
+var hda_stream_tag = 1;       # stream tag binding DAC <-> stream (instance 0 / analog)
+var hda_tag[2];               # [per-instance] 1 = analog, 3 = HDMI (amdgpu's value)
+var hda_fmt[2];               # [per-instance] HDA_FMT_48K_16_2 / _24_2
+var hda_bpf[2];               # [per-instance] BYTES PER STEREO FRAME: 4 for 16-bit, 8 for 24-in-32
 var hda_path_n[2];            # [per-instance] node count in the pin->DAC signal path (excl DAC)
 var hda_path[16];             # [per-instance] path node ids (2 instances x 8 nodes); node k of instance ci at &hda_path + (ci*8 + k)*8
 # --- B5: streamed PCM double-buffer refill (roadmap 1.52.6) ---
@@ -814,8 +825,8 @@ fn hda_hdmi_bind_single(ord) {
                 if (cvt != 0) {
                     if (seen == ord) {
                         # THE LIVE PAIR: bind it to the stream tag and light the pin.
-                        hda_verb(codec, cvt, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
-                        hda_verb(codec, cvt, (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
+                        hda_verb(codec, cvt, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_24_2);
+                        hda_verb(codec, cvt, (V_SET_STREAMID << 8) | (3 << 4));
                         hda_verb(codec, cvt, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
                         hda_verb(codec, nid, (V_SET_PINCTL << 8) | PINCTL_OUT_EN);
                         bound_pin = nid;
@@ -1020,8 +1031,8 @@ fn hda_codec_route() {
                         # With no slot pair enabled the AFMT cannot drain samples: AFMT_STATUS bit24
                         # (AUDIO_FIFO_OVERFLOW) re-armed within moments of being acked. Silence, with the DMA
                         # running and every other register byte-identical to amdgpu.
-                        hda_verb(codec, dgcv, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
-                        hda_verb(codec, dgcv, (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
+                        hda_verb(codec, dgcv, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_24_2);
+                        hda_verb(codec, dgcv, (V_SET_STREAMID << 8) | (3 << 4));
                         hda_verb(codec, dgcv, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
                         hda_verb(codec, dgn, (V_SET_POWER << 8) | 0x00);
                         hda_verb(codec, dgn, (V_SET_PINCTL << 8) | PINCTL_OUT_EN);
@@ -1148,14 +1159,27 @@ fn hda_refill_half(ci, h) {
     var base = load64(&hda_pcm_va + ci * 8) + h * load64(&hda_ring_half + ci * 8);
     #ifdef HDA_TONE
     var amp = 12000;
+    # BYTES PER FRAME IS PER-INSTANCE. 16-bit = 4 (two packed s16). 24-bit = 8: HDA carries 24-bit samples
+    # in 32-BIT CONTAINERS, left-justified, so the s16 goes in the TOP bits (<<8 puts a 16-bit sample at the
+    # top of a 24-bit field). Telling the codec 0x31 while writing 4-byte frames would make it read our
+    # 16-bit data as 24-bit and emit noise — the format and the ring have to move together.
+    var bpf = load64(&hda_bpf + ci * 8);
+    if (bpf == 0) { bpf = 4; }
+    var nframes = load64(&hda_ring_half + ci * 8) / bpf;
     var fi = 0;
-    while (fi < 8192) {                     # 32 KB / 4 bytes-per-frame
+    while (fi < nframes) {
         var acc = hda_gen_acc & 0xFFFF;
         var s = 0;
         if (acc < 32768) { s = (0 - amp) + (2 * amp * acc) / 32768; }
         else { s = amp - (2 * amp * (acc - 32768)) / 32768; }
-        store16(base + fi * 4, s & 0xFFFF);
-        store16(base + fi * 4 + 2, s & 0xFFFF);
+        if (bpf == 8) {
+            var s24 = (s << 8) & 0xFFFFFF;
+            store32(base + fi * 8, s24);
+            store32(base + fi * 8 + 4, s24);
+        } else {
+            store16(base + fi * 4, s & 0xFFFF);
+            store16(base + fi * 4 + 2, s & 0xFFFF);
+        }
         hda_gen_acc = (hda_gen_acc + hda_gen_inc) & 0xFFFF;
         # Ramp the frequency every 64 frames for a slow (~1.5 s) rising sweep,
         # wrapping for a repeating whoop. Phase (`acc`) stays continuous across the
@@ -1204,7 +1228,9 @@ fn hda_stream_service() {
         var raw = hda_read32(load64(&hda_sd_base + ci * 8) + SD_LPIB) & 0xFFFF;   # LPIB byte offset 0..CBL-1
         if (raw < snd_last_raw) { snd_wrap_epochs = snd_wrap_epochs + 1; }
         snd_last_raw = raw;
-        snd_hw_frames = (snd_wrap_epochs * 65536 + raw) / 4;
+        var lp_bpf = load64(&hda_bpf + ci * 8);
+        if (lp_bpf == 0) { lp_bpf = 4; }
+        snd_hw_frames = (snd_wrap_epochs * 65536 + raw) / lp_bpf;
     }
     if (load64(&hda_stream_on + ci * 8) == 0) { return 0; }
     var lpib = hda_read32(load64(&hda_sd_base + ci * 8) + SD_LPIB);
@@ -1233,6 +1259,29 @@ fn snd_blk_copy(dst, src, nbytes) {
 # space, never mid-copy). Caller guarantees n <= free (won't overrun the DMA head).
 fn snd_copy_frames(uptr, n) {
     var pva = load64(&hda_pcm_va + hda_active_ctl * 8);   # live instance's ring VA (IF=0 caller → stable)
+    var bpf = load64(&hda_bpf + hda_active_ctl * 8);
+    if (bpf == 0) { bpf = 4; }
+    # THE RING-3 ABI IS S16 STEREO AND STAYS S16 STEREO. snd_write#66 takes frames*4 and tonegen writes
+    # store16 — that contract is iron-validated and is not being broken for this. On a 24-bit instance the
+    # KERNEL converts: each s16 is left-justified into a 32-bit container (<<8 = 16 bits at the top of the
+    # 24-bit field), which is exactly what the fill does. A blind block copy would hand the codec 16-bit
+    # data while it reads 24-bit, i.e. noise.
+    if (bpf == 8) {
+        var cbl_f = 65536 / 8;                          # 8192 frames at 8 bytes/frame
+        var fi = 0;
+        while (fi < n) {
+            var slot = (snd_appl + fi) & (cbl_f - 1);
+            var l = load16(uptr + fi * 4) & 0xFFFF;
+            var r = load16(uptr + fi * 4 + 2) & 0xFFFF;
+            if (l >= 32768) { l = l | 0xFFFF0000; }     # sign-extend before the shift
+            if (r >= 32768) { r = r | 0xFFFF0000; }
+            store32(pva + slot * 8,     (l << 8) & 0xFFFFFF);
+            store32(pva + slot * 8 + 4, (r << 8) & 0xFFFFFF);
+            fi = fi + 1;
+        }
+        snd_appl = snd_appl + n;
+        return 0;
+    }
     var start_byte = (snd_appl & 16383) * 4;          # (snd_appl mod CBL_FRAMES) * bpf
     var nbytes = n * 4;
     var tail = 65536 - start_byte;                     # bytes from here to the ring end (CBL=64K)
@@ -1316,6 +1365,20 @@ fn hda_snd_selftest() {
 # SD_LPIB advances (DMA fetching). Silence for now; B4 fills a sine (first tone).
 fn hda_stream_arm() {
     if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_out_dac + hda_active_ctl * 8) == 0) { return 0; }
+    # Per-instance format/tag. Instance 0 (analog) keeps the 16-bit/tag-1 setup that is iron-validated and
+    # audible; instance 1 (HDMI) takes amdgpu's measured 24-bit/tag-3. Declarative array init does not take
+    # in this codebase (cf. snd_active_slot), so set them here at runtime.
+    if (hda_active_ctl == 1) {
+        store64(&hda_tag + 8, 3);
+        store64(&hda_fmt + 8, HDA_FMT_48K_24_2);
+        store64(&hda_bpf + 8, 8);
+    } else {
+        store64(&hda_tag + 0, 1);
+        store64(&hda_fmt + 0, HDA_FMT_48K_16_2);
+        store64(&hda_bpf + 0, 4);
+    }
+    var a_tag = load64(&hda_tag + hda_active_ctl * 8);
+    var a_fmt = load64(&hda_fmt + hda_active_ctl * 8);
     if (load64(&hda_oss + hda_active_ctl * 8) == 0) { kprintln("hda: OSS=0, no output stream", 28); return 0; }
     snd_active_slot = 0 - 1;   # Gate-2: -1 sentinel (declarative module-init doesn't take; init at runtime)
     var sd = HDA_SD_BASE + load64(&hda_iss + hda_active_ctl * 8) * HDA_SD_STRIDE;   # output SDs follow ISS inputs
@@ -1396,20 +1459,20 @@ fn hda_stream_arm() {
     while (i < 1000) { if ((hda_read32(sd + SD_CTL) & SD_SRST) == 0) { break; } hda_udelay(1); i = i + 1; }
 
     # Program: stream tag (RUN off) -> CBL -> FMT -> LVI -> BDL base.
-    hda_write32(sd + SD_CTL, hda_stream_tag << SD_TAG_SHIFT);
+    hda_write32(sd + SD_CTL, a_tag << SD_TAG_SHIFT);
     hda_write32(sd + SD_CBL, half * 2);
-    hda_write16(sd + SD_FMT, HDA_FMT_48K_16_2);
+    hda_write16(sd + SD_FMT, a_fmt);
     hda_write16(sd + SD_LVI, 1);
     hda_write32(sd + SD_BDPL, bdl & 0xFFFFFFFF);
     hda_write32(sd + SD_BDPU, (bdl >> 32) & 0xFFFFFFFF);
     var fifos = hda_read16(sd + SD_FIFOS);
 
     # Codec side: identical format + stream/channel on the DAC (must match SDnFMT).
-    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), load64(&hda_out_dac + hda_active_ctl * 8), (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_16_2);
-    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), load64(&hda_out_dac + hda_active_ctl * 8), (V_SET_STREAMID << 8) | (hda_stream_tag << 4));
+    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), load64(&hda_out_dac + hda_active_ctl * 8), (V_SET_STREAM_FMT << 16) | a_fmt);
+    hda_verb(load64(&hda_codec0 + hda_active_ctl * 8), load64(&hda_out_dac + hda_active_ctl * 8), (V_SET_STREAMID << 8) | (a_tag << 4));
 
     # RUN.
-    hda_write32(sd + SD_CTL, (hda_stream_tag << SD_TAG_SHIFT) | SD_RUN);
+    hda_write32(sd + SD_CTL, (a_tag << SD_TAG_SHIFT) | SD_RUN);
 
     # Gate: LPIB advances = DMA fetching.
     var lpib0 = hda_read32(sd + SD_LPIB);
