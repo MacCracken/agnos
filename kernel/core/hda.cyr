@@ -1489,9 +1489,11 @@ fn hda_stream_arm() {
     kprint("hda: stream sd=0x", 17);
     kprint_hex(sd);
     kprint(" tag=", 5);
-    kprint_num(a_tag);              # the tag actually programmed above — NOT the legacy hda_stream_tag
-                                    # global, which this line printed until 1.55.18 and which made the
-                                    # HDMI instance report `tag=1` while it had really bound tag 3.
+    # `a_tag` — the tag actually programmed above. This printed the legacy `hda_stream_tag` global until
+    # the 24-bit revert, so the HDMI instance reported `tag=1` while it had really bound tag 3 (the DCN
+    # mirror `AZ_CHANNEL_STREAM_ID` read 0x30 the whole time). A log that disagrees with the hardware
+    # costs a reader an hour; per-instance state has to be printed from the per-instance variable.
+    kprint_num(a_tag);
     kprint(" fifos=", 7);
     kprint_num(fifos);
     kprint(" lpib=", 6);

@@ -499,6 +499,9 @@ fn r8169_init_rx() {
         kprintln("r8169: rx ring pmm_alloc failed", 31);
         return 0 - 1;
     }
+    # S10 contract — every DMA region is declared before any device
+    # read/write touches it. The NIC reads descriptors out of this ring.
+    iommu_register_dma(r8169_rx_ring_phys);
     for (var i = 0; i < 4096; i = i + 1) {
         store8(r8169_rx_ring_phys + i, 0);
     }
@@ -509,6 +512,7 @@ fn r8169_init_rx() {
             kprintln("r8169: rx buf pmm_alloc failed", 30);
             return 0 - 1;
         }
+        iommu_register_dma(buf);
         store64(&r8169_rx_bufs + i * 8, buf);
 
         var desc = r8169_rx_ring_phys + i * 16;
@@ -556,6 +560,9 @@ fn r8169_init_tx() {
         kprintln("r8169: tx ring pmm_alloc failed", 31);
         return 0 - 1;
     }
+    # S10 contract — declared before the chip's first descriptor fetch,
+    # which the TX list addr write below (step 4) arms.
+    iommu_register_dma(r8169_tx_ring_phys);
     for (var i = 0; i < 4096; i = i + 1) {
         store8(r8169_tx_ring_phys + i, 0);
     }
@@ -566,6 +573,7 @@ fn r8169_init_tx() {
             kprintln("r8169: tx buf pmm_alloc failed", 30);
             return 0 - 1;
         }
+        iommu_register_dma(buf);
         store64(&r8169_tx_bufs + i * 8, buf);
 
         var desc = r8169_tx_ring_phys + i * 16;
