@@ -5,6 +5,145 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### ✅ MODEL A CONFIRMED — the mute experiment ran, and the bisection survives falsification
+
+**Zero burns.** `agnosticos/scripts/crc-model-discriminator.sh`, prediction pre-registered before the run:
+
+```
+BASELINE (playing):  tap0 DONE=1 CRC=0x0d0827   tap1 DONE=1 CRC=0x81b8cf   AFMT_STATUS=0x40000010
+MUTED D1/D2:         tap0 DONE=0               tap1 DONE=0                AFMT_STATUS=0x41000010
+RESTORED:            tap0 DONE=1 CRC=0x57bc7a   tap1 DONE=1 CRC=0xba4251
+```
+
+**Model B predicted `DONE=1, CRC=0` under mute** — its counter is driven by the shared input strobe, and the
+input never stopped (HDA DMA running, LPIB advancing, codec still feeding). **Both counters stopped dead
+instead. Model B is refuted by demonstration.** The bit-11 FIFO-reset confound was controlled: D1 and D2
+agree exactly.
+
+**So agnos's tap-1 `DONE=1 / CRC=0x000000` means what it appeared to mean: 2048 samples traversed that tap
+and they were zero.** The bisection stands, the Azalia/codec/link/DMA exoneration stands, and the
+register-poke class stays closed.
+
+**agnos matches neither amdgpu state** — not muted (its counters complete), not playing (its tap-1 data is
+zero). It is a third state: **counters running, tap-1 data zero.**
+
+**⚠ One tension, recorded rather than explained: muting SETS `FIFO_OVERFLOW` on the working path**
+(`0x40000010` → `0x41000010`, sticky — still set after restore because nothing acks it). So overflow
+accompanies *"output stopped"* here. But agnos's counters complete, which under Model A means the drain
+runs. **Fill outpacing a demonstrably-running drain is not reconciled.** Candidates, none established:
+agnos's drain runs slower than 48 kHz; overflow has a second cause; or agnos's ack/re-read window measures
+something subtler than steady-state overflow. **This is the next question, not the next answer.**
+
+Full record: `agnosticos/docs/development/prior-art/dcn-audio-crc-model-discriminator-2026-07-15.md`.
+
+### ⚠ STILL NO 1.55.17 REPAIR. There is no register left to write.
+
+**A 65-agent audit refused the cut, and it is right.** Recorded first because it overrides everything below.
+
+**The three-stimulus calibration does not discriminate.** `AFMT_AUDIO_CRC_CONTROL` is ONE engine — one
+enable, one counter, one CRC shift register — and `CRC_SOURCE` is a **single bit** muxing two inputs. DC
+never reads, writes or references the block: **zero source ground truth.** Two models fit:
+
+- **Model A** (assumed): the counter is gated by sample-valid **at the selected tap** ⇒ agnos's tap-1 zeros
+  mean a *running* output stage emits silence ⇒ something zeroes the data.
+- **Model B**: ONE counter gated by the **shared input strobe**; `SOURCE` only muxes which bus feeds the
+  CRC ⇒ agnos's tap-1 zeros mean *"2048 samples entered and the tap-1 bus read zero throughout"* ⇒ **the
+  output stage never fires. Samples never leave. Nothing zeroes anything.**
+
+| stimulus | Model A | Model B |
+|---|---|---|
+| nothing playing | `DONE=0` / `DONE=0` | `DONE=0` / `DONE=0` |
+| tone | two non-zero CRCs | two non-zero CRCs |
+| digital silence | `0` / `0` | `0` / `0` |
+
+**Three points, zero discrimination.** The state that separates them — **input flowing, output stopped** —
+never occurs naturally on a working path and was never measured.
+
+**And the arc dismissed the discriminating datum circularly.** `AFMT_STATUS` bit 24 (`FIFO_OVERFLOW`) is
+agnos=1 / audibly-working-amdgpu=0 — **the only audio-side difference in the entire capture**. A FIFO
+overflows when fill outpaces drain; **under Model A the drain runs at 48 kHz and has no reason to
+overflow.** It was reclassified as "symptom, the FIFO is full of real zero-samples" — using the *contested
+Model A reading* to discard the one measurement that discriminates *against* Model A. **The overflow is
+evidence for Model B.**
+
+### The discriminator — `scripts/crc-model-discriminator.sh`, zero burns
+
+Manufacture "input flowing, output stopped" on the working amdgpu path using **the encoder's own mute**:
+`link_hwss_dio.c` `enable_dio_audio_packet()` → for HDMI the whole drain-side enable is one call,
+`audio_mute_control(enc, false)`, and `enc1_se_audio_mute_control()` is literally
+`REG_UPDATE(AFMT_AUDIO_PACKET_CONTROL, AFMT_AUDIO_SAMPLE_SEND, !mute)`. `dcn20_stream_encoder.c` binds that
+same function — **Cezanne's live path**. Bit 0 of DIG1 `0x21AA` (byte `0x159A8`, arithmetic independently
+verified) is the hardware's own output-stage switch.
+
+- `source=1 → DONE=0` while muted ⇒ **Model A**. The instrument is vindicated, the bisection stands.
+- `source=1 → DONE=1, CRC=0` while muted ⇒ **Model B**. **agnos's exact signature reproduced on hardware
+  that is merely muted and is definitely not passing 2048 zero samples.** "CRC=0 means zeros flowed" is
+  falsified by demonstration, and the target becomes *why the audio-sample-packet inserter never fires*.
+- **Bonus**: if bit 24 also sets under mute, the good-path mute reproduces agnos's **entire** signature and
+  the overflow becomes the diagnosis, not a symptom.
+
+Confound controlled: `0x801` is bit 0 **plus** bit 11 (`AFMT_RESET_FIFO_WHEN_AUDIO_DIS`), so muting alone
+may hold the FIFO in reset — which is *not* agnos's state (agnos's FIFO **overflows**, i.e. is not reset).
+The script runs the 2×2 and restores unconditionally, including on Ctrl-C.
+
+### Repairs refused, with reasons
+
+- **`HDMI_DB_DISABLE`** — the strongest-looking candidate (amdgpu sets it unconditionally, agnos never
+  does). Dies twice: the latch trigger is VUPDATE and agnos's scanout is live and tear-free at ~60 Hz, so
+  any shadow write promotes within 16 ms — **and it is self-refuting**, because agnos's CRC probe *lives in
+  the allegedly-shadowed bank* and flipping `CRC_SOURCE` demonstrably re-points a live hardware tap. Those
+  writes land.
+- **`DCCG_AUDIO_DTO0_MODULE` → hardcode `0x24D998`** — no. agnos's value is **correct by derivation** (it
+  *is* `actual_pixel_clock_100Hz`, exactly what `dce_audio.c` writes) and 13 ppm *more* accurate than
+  amdgpu's nominal constant. Hardcoding would trade a derived value for a one-panel constant and regress
+  the moment the raster changes.
+- **`DIG_SOFT_RESET` on DIG1 FE** — high risk, no derivation, and **contradicted by the measurement**: a
+  parked FE gives `DONE=0`, not `DONE=1`-with-zeros. It would black-screen the console with no ATOM
+  interpreter to restore FE state, costing **both** the FB-photo fallback and the klug-to-text readout.
+- **The cold-path bring-up** (blank → drop `DIG_ENABLE` → set `DIG_MODE` → re-assert) — **an invention.**
+  `dcn10_link_encoder_setup` writes `DIG_MODE` with a **bare RMW**, exactly as agnos does, and
+  `DIG_BE_EN_CNTL.DIG_ENABLE` is **only read** by DC (`dcn10_is_dig_enabled`), never written — ATOM owns
+  it. Killed before a line was written.
+
+**Writing anything to this encoder now would be burn 16 of a class already closed by measurement**, on a
+path that drives the operator's only console, with an expected information yield of zero.
+
+### ✅ THE NULL CASE RAN. The instrument is calibrated, the bisection holds, and the cause is NOT a register.
+
+```
+CASE C — nothing playing:
+  null  source=0 :  CRC_DONE=0 (did not complete)
+  null  source=1 :  CRC_DONE=0 (did not complete)
+  DIG1_AFMT_CNTL = 0x00000101      <- audio clock STILL ON => conclusive, not inconclusive
+```
+
+`AFMT_CNTL` stayed at `0x101`, so amdgpu did not tear the clock down and the escape hatch does not apply.
+**With the clock on and no samples arriving, `CRC_DONE` never asserts** ⇒ the counter genuinely requires
+traversal ⇒ **a zero CRC really does mean 2048 zero samples.** The instrument is now calibrated across all
+three stimuli: content → non-zero, zero-PCM → `DONE=1`/CRC 0, no-flow → `DONE=0`.
+
+**So the retraction above is itself retracted, on evidence:**
+
+- **agnos's bisection STANDS** — real samples reach agnos's AFMT and leave as digital silence.
+- **The Azalia endpoint exoneration is FINAL** — the codec, converter, HDA link, DMA, stream binding,
+  `MULTICHANNEL_MODE`, verb `0x789`, the whole `dce_aud_az_configure` gap. All upstream of both taps. Dead.
+- **`AFMT_STATUS` bit 24's "wrong sign" refutation is reinstated** — zeros are provably traversing, so the
+  FIFO is full of real (zero) samples. Symptom, not mechanism.
+
+**And the conclusion that matters: THE CAUSE IS NOT REGISTER-VISIBLE.** Every AFMT control register is
+byte-identical to amdgpu and the AFMT still zeroes the audio. That eliminates the entire register-poke
+class of fix — and retroactively explains why fifteen burns of register hypotheses all failed. They were
+looking for a wrong value in a block that has none.
+
+What remains is the one thing agnos structurally does not do: **a real HDMI bring-up.** agnos flips
+`DIG_BE_CNTL.DIG_MODE` 2→3 on a **live, scanning link** that the UEFI GOP brought up as **DVI**. amdgpu
+brings the link up *as HDMI* via ATOM `DIGxEncoderControl` (`ENCODER_CONTROL_SETUP`,
+`SIGNAL_TYPE_HDMI_TYPE_A`) and returns early if it fails. The ATOM *payload* carries no audio state (that
+was refuted), so this is not "implement ATOM" — it is that a live mode flip appears to leave the encoder's
+audio path in a state no register exposes.
+
+**This is now an operator decision, not a code decision** — see the honest risk note below.
+
 ### The tap experiment ran — and a 47-agent audit found the calibration gap in it
 
 **The known-stimulus experiment worked** (`agnosticos/scripts/crc-tap-identity.sh`, zero burns, on the

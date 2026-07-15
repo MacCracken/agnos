@@ -368,6 +368,20 @@ var GPU_AFMT_FIFO_OVERFLOW_ACK = 0x800000;   # AFMT_AUDIO_PACKET_CONTROL bit23 �
 # exactly what the LPIB ordinal (0x65) could not offer — amdgpu reads it NOWHERE in the entire amd tree,
 # it sits mid-snapshot-triplet (0x64 lock / 0x65 value / 0x66 timer), and a static read would have been
 # unreadable. Rejected for this reason; do not re-propose it without arming 0x64 first.
+# THE RAMP BLOCK — the last DIG registers agnos has never read, and the only ones that are an ATTENUATOR.
+# The perturbation test (2026-07-15) forced all six MEASURED agnos-vs-amdgpu differences onto the audibly
+# working amdgpu path and NONE killed the tone — so "agnos has a wrong register value" is closed for every
+# value we had measured. But these five were in no diff at all, because neither side ever read them.
+# A ramp parked at zero attenuates real content to EXACTLY zero — agnos's signature (content at CRC tap 0,
+# zero at tap 1) — and would appear in no comparison. An audit refuted this block BY ARGUMENT ("gated by
+# AFMT_AUDIO_TEST_EN, which reads 0 on both paths"); that is an inference from a field name, and inference
+# is exactly what the perturbation test just discredited. Read it.
+# Offsets confirmed against Linux v6.6 dcn_2_1_0_offset.h (mmDIG0_AFMT_RAMP_CONTROL0 = 0x20a3).
+var GPU_R_AFMT_RAMP_CONTROL0 = 0x20A3;  # RAMP_MAX_COUNT[23:0] · RAMP_DATA_SIGN[31]
+var GPU_R_AFMT_RAMP_CONTROL1 = 0x20A4;  # RAMP_MIN_COUNT[23:0] · AFMT_AUDIO_TEST_CH_DISABLE[31:24]
+var GPU_R_AFMT_RAMP_CONTROL2 = 0x20A5;  # RAMP_INC_COUNT[23:0]
+var GPU_R_AFMT_RAMP_CONTROL3 = 0x20A6;  # RAMP_DEC_COUNT[23:0]
+var GPU_R_AFMT_INTERRUPT_STATUS = 0x2079;
 var GPU_R_AFMT_AUDIO_CRC_CONTROL = 0x20A2;  # CRC_EN b0 · CRC_CONT b4 · CRC_SOURCE b8 · CH_SEL [15:12] · COUNT [31:16]
 var GPU_R_AFMT_AUDIO_CRC_RESULT  = 0x20A8;  # CRC_DONE b0 (RO) · CRC [31:8] (RO)
 
@@ -465,6 +479,41 @@ var GPU_AZ_MULTICHANNEL_STEREO    = 0x1;
 #     green_sardine.asic — the same two sources that confirmed the six we already had.
 #
 # THE TWO THAT MATTER:
+# --- dce_aud_az_configure: THE FUNCTION AGNOS NEVER PORTED -------------------------------------------
+# agnos's audio path is a hand-derived minimal approximation. amdgpu programs the endpoint from the sink's
+# ELD in dce_aud_az_configure(): audio descriptors (what formats the sink accepts), sink info (who the sink
+# IS), ACP, lipsync, and the multichannel mode. agnos reads NO ELD and writes NONE of it — it writes
+# HOT_PLUG_CONTROL, a hardcoded CHANNEL_SPEAKER, and MULTICHANNEL_ENABLE, and stops.
+#
+# WHY THESE ARE NOT EXONERATED, despite a perturbation test that "cleared" them:
+# that test forced agnos's values onto a path where amdgpu had ALREADY configured everything correctly.
+# The hardware had already latched good state, so a late bad write changed nothing. THAT IS ASYMMETRIC:
+# "you cannot break a working path with a bad value" does NOT imply "that value is harmless when it is the
+# ONLY value ever written". A one-directional test cannot exonerate a write that never happens. Port them.
+#
+# Values are amdgpu's MEASURED known-good for this panel (prior-art capture 2026-07-15, panel audibly
+# playing). Hardcoding the sink-derived ones is a deliberate, honest interim: the general form is an ELD
+# read, which agnos does not have yet. Panel-specific by construction — see the ELD note at the write site.
+var GPU_AZ_IX_AUDIO_DESCRIPTOR0 = 0x28;  # amdgpu 0x07070701: LPCM, 2ch, 32/44.1/48k, 16/20/24-bit
+var GPU_AZ_IX_AUDIO_DESCRIPTOR1 = 0x29;  # amdgpu 0x00000000
+var GPU_AZ_IX_AUDIO_DESCRIPTOR2 = 0x2A;  # amdgpu 0x00000000
+var GPU_AZ_IX_RESPONSE_LIPSYNC  = 0x37;  # amdgpu 0x00000000
+var GPU_AZ_IX_SINK_INFO1        = 0x3B;
+var GPU_AZ_IX_SINK_INFO2        = 0x3C;
+var GPU_AZ_IX_SINK_INFO3        = 0x3D;
+var GPU_AZ_IX_SINK_INFO4        = 0x3E;
+var GPU_AZ_IX_SINK_INFO5        = 0x3F;
+var GPU_AZ_IX_SINK_INFO6        = 0x40;
+var GPU_AZ_IX_SINK_INFO7        = 0x41;
+var GPU_AZ_IX_SINK_INFO8        = 0x42;
+var GPU_AZ_AUDIO_DESCRIPTOR0_VAL = 0x07070701;
+var GPU_AZ_SINK_INFO0_VAL        = 0x07757204;   # manufacturer + product id
+var GPU_AZ_SINK_INFO1_VAL        = 0x00000007;   # name length
+var GPU_AZ_SINK_INFO2_VAL        = 0x5558859e;
+var GPU_AZ_SINK_INFO3_VAL        = 0x0d989449;
+var GPU_AZ_SINK_INFO4_VAL        = 0x32334258;   # "XB32" — the display name, ASCII
+var GPU_AZ_SINK_INFO5_VAL        = 0x00005533;   # "3U"
+var GPU_AZ_MULTICHANNEL_MODE_SINGLE = 0x1;       # amdgpu 0x1 (ATI verb 0x789 = MULTICHANNEL_MODE_SINGLE)
 var GPU_AZ_IX_DIGITAL_OUTPUT_STATUS = 0x63; # OUTPUT_ACTIVE bit0, READ-ONLY. amdgpu=1 while playing.
 # The direct answer to "is this pin transmitting?" — a question
 # this arc has only ever inferred. agnos=0 would collapse the

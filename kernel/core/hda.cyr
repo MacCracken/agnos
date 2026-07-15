@@ -143,6 +143,16 @@ var CVT_CHANS_STEREO  = 0x01;       # channels-1 for 2ch (stereo)
 var V_ATI_SET_CHAN_ALLOC   = 0x771; # payload = CEA channel allocation (0 = FL/FR stereo)
 var V_ATI_SET_DOWNMIX      = 0x772; # atihdmi_init zeroes this so the infoframe carries no downmix info
 var V_ATI_SET_MULTICHAN_01 = 0x777; # slot pair 0/1 map — the register the whole arc has been stuck on
+# The two ATI verbs agnos has never issued. patch_hdmi.c atihdmi_init() writes MULTICHANNEL_MODE=SINGLE on
+# every rev3+ AMD HDMI codec ("enable channel-wise remap mode if supported"), and this codec qualifies:
+# has_amd_full_remap_support = vendor 0x1002aa01 && (revision & 0xff00) >= 0x0300, and amdgpu's endpoint
+# reads MULTICHANNEL_MODE = 1 on the working path — proof it passed that test on THIS silicon.
+# In SINGLE mode the slot map is PER-SLOT, not per-pair: atihdmi_pin_set_slot_channel computes
+#   verb = ATI_VERB_SET_MULTICHANNEL_01 + hdmi_slot/2 + (hdmi_slot % 2) * 0x00e
+# so slot 0 -> 0x777 and slot 1 -> 0x785. agnos writes ONLY 0x777 and leaves slot 1 unmapped.
+var V_ATI_SET_MULTICHAN_1  = 0x785; # slot 1 in SINGLE (channel-wise remap) mode
+var V_ATI_SET_MULTICHAN_MODE = 0x789;
+var ATI_MULTICHANNEL_MODE_SINGLE = 0x1;
 var ATI_OUT_ENABLE         = 0x01;  # payload bit0 = slot enable
 var HDA_VENDOR_ATI         = 0x1002;
 var WCAP_DIGITAL      = 0x200;      # WCAP bit9: node is a digital widget (converter assert-gate)
@@ -947,7 +957,15 @@ fn hda_codec_route() {
                         if (((load64(&hda_vendor + hda_active_ctl * 8) >> 16) & 0xFFFF) == HDA_VENDOR_ATI) {
                             hda_verb(codec, dgn, (V_ATI_SET_DOWNMIX << 8) | 0x00);
                             hda_verb(codec, dgn, (V_ATI_SET_CHAN_ALLOC << 8) | 0x00);
+                            # SINGLE (channel-wise remap) mode FIRST — it decides which slot-map verbs are
+                            # authoritative, so it must precede the map. Then map BOTH slots:
+                            #   slot 0 <- stream channel 0 : verb 0x777, payload (0 << 4) | enable = 0x01
+                            #   slot 1 <- stream channel 1 : verb 0x785, payload (1 << 4) | enable = 0x11
+                            # agnos previously wrote only slot 0 and never set the mode, leaving the right
+                            # channel unmapped in a mode the codec was never put into.
+                            hda_verb(codec, dgn, (V_ATI_SET_MULTICHAN_MODE << 8) | ATI_MULTICHANNEL_MODE_SINGLE);
                             hda_verb(codec, dgn, (V_ATI_SET_MULTICHAN_01 << 8) | ATI_OUT_ENABLE);
+                            hda_verb(codec, dgn, (V_ATI_SET_MULTICHAN_1 << 8) | ((1 << 4) | ATI_OUT_ENABLE));
                         }
                         #ifdef HDA_TONE
                         kprint("hda: hdmi enable pin=0x", 23);

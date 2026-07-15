@@ -2986,6 +2986,37 @@ fn gpu_hdmi_audio_enable() {
     if ((gpu_reg32(GPU_BASE_DCN_2, dr) & 0x1) == 0) {
         kprintln("gpu: hdmi endpoint slot map did not take", 40);
     }
+    # --- dce_aud_az_configure: THE BLOCK AGNOS NEVER PORTED ------------------------------------------
+    # agnos's audio path was hand-derived down to a minimum: HOT_PLUG_CONTROL, a hardcoded CHANNEL_SPEAKER,
+    # MULTICHANNEL_ENABLE, stop. amdgpu programs the endpoint from the sink's ELD — descriptors (what the
+    # sink accepts), sink info (who it is), lipsync, and the multichannel MODE. Sixteen burns hunted a wrong
+    # VALUE in the registers agnos does write, and every one of them is byte-identical to amdgpu. The
+    # registers agnos does NOT write were never in the diff at all.
+    #
+    # The perturbation test that appeared to clear these was ASYMMETRIC: it forced agnos's values onto a
+    # path amdgpu had ALREADY configured correctly, where the hardware had latched good state, so a late bad
+    # write did nothing. That cannot exonerate a write that never happens. Port them and let the burn judge
+    # — the method that carried the whole 1.54.x GPU arc.
+    #
+    # PANEL-SPECIFIC, DELIBERATELY AND TEMPORARILY: these are amdgpu's measured values for the XB323U
+    # (prior-art capture 2026-07-15). The general form is an ELD read, which agnos does not have. If this
+    # burn makes sound, the ELD parse is the follow-up and these constants die. If it does not, they cost
+    # nothing. Do not ship them past that decision.
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_AUDIO_DESCRIPTOR0, GPU_AZ_AUDIO_DESCRIPTOR0_VAL);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_AUDIO_DESCRIPTOR1, 0);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_AUDIO_DESCRIPTOR2, 0);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_RESPONSE_LIPSYNC,  0);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_SINK_INFO0, GPU_AZ_SINK_INFO0_VAL);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_SINK_INFO1, GPU_AZ_SINK_INFO1_VAL);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_SINK_INFO2, GPU_AZ_SINK_INFO2_VAL);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_SINK_INFO3, GPU_AZ_SINK_INFO3_VAL);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_SINK_INFO4, GPU_AZ_SINK_INFO4_VAL);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_SINK_INFO5, GPU_AZ_SINK_INFO5_VAL);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_SINK_INFO6, 0);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_SINK_INFO7, 0);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_SINK_INFO8, 0);
+    gpu_az_write_ord(ir, dr, GPU_AZ_IX_MULTICHANNEL_MODE, GPU_AZ_MULTICHANNEL_MODE_SINGLE);
+
     # RE-SELECT THE INDEX. Everything below reads and writes HOT_PLUG_CONTROL, and `dr` is a WINDOW: it
     # returns whatever ordinal `ir` last named. Inserting the slot-map write above without re-selecting left
     # the window on 0x36, so the reads below reported the slot map as "hotplug" (printing a fake
@@ -3354,6 +3385,16 @@ fn gpu_audio_dump() {
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d)); kprintln("", 0);
     # The CRC pair. gpu_hdmi_audio_crc_probe disarms CONTROL when it finishes, so CONTROL reads 0 here by
     # design and RESULT still holds the last measurement — the value the probe's line above reported.
+    kprint("AFMT_RAMP_CONTROL0     ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL0 + d)); kprintln("", 0);
+    kprint("AFMT_RAMP_CONTROL1     ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL1 + d)); kprintln("", 0);
+    kprint("AFMT_RAMP_CONTROL2     ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL2 + d)); kprintln("", 0);
+    kprint("AFMT_RAMP_CONTROL3     ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL3 + d)); kprintln("", 0);
+    kprint("AFMT_INTERRUPT_STATUS  ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INTERRUPT_STATUS + d)); kprintln("", 0);
     kprint("AFMT_AUDIO_CRC_CONTROL ", 23);
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_CRC_CONTROL + d)); kprintln("", 0);
     kprint("AFMT_AUDIO_CRC_RESULT  ", 23);
@@ -3418,6 +3459,15 @@ fn gpu_audio_dump() {
 # One AZ indexed ordinal, named and printed. The index window has NO MEMORY — it returns whatever `ir` last
 # selected — so every read re-selects. That is the bug 1.55.15 fixed by hand at four sites; this makes it
 # structurally impossible to repeat.
+# One AZ indexed ordinal, written and read back. The index window has NO MEMORY: `dr` returns whatever `ir`
+# last named, so every access re-selects. 1.55.15 fixed that by hand at four sites after it destroyed its
+# own slot-map write; this makes it impossible to get wrong again.
+fn gpu_az_write_ord(ir, dr, ordinal, val) {
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, ordinal);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, val);
+    return 0;
+}
+
 fn gpu_az_dump_ord(ir, dr, ordinal, label) {
     gpu_reg32_write(GPU_BASE_DCN_2, ir, ordinal);
     kprint(label, 23);
