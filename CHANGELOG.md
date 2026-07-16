@@ -5,6 +5,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.19] — 2026-07-16 — HDMI audio: the FIFO was fed before the drain was armed
+
+The HDMI-audio silence is a **feed-before-drain ordering bug** — a driver-class defect, exactly as the
+operator kept insisting, not the DMUB/PHY wall 1.55.18 feared. This cut ships the root-cause fix, the
+Stage-1 link-event edges it supersedes, the in-boot fix-profile sweep harness, and the register-diff
+closeout, plus a first-principles cross-system plan (`docs/development/planning/hdmi-audio-plan.md`).
+
+### Fixed — the codec fed the AFMT audio FIFO for seconds before the drain was armed (THE root cause)
+
+Two iron observations settled it: the **exact same tone plays perfectly out the analog jack** (PCM / HDA
+ring / DMA all good — content ruled out), and the **screen visibly blanked** during the Stage-1 `DIG_ENABLE`
+drop (the sink DID get a real link event and still played nothing). That isolated the fault to one thing —
+the AFMT audio FIFO fills but never drains audio sample packets — and a focused deep-dive found the mechanism:
+
+**`hda_stream_arm` sets `SD_RUN` on the HDMI stream (tag 3) during the HDA block — seconds before
+`gpu_hdmi_audio_enable` opens the AFMT drain (`AFMT_AUDIO_SAMPLE_SEND`).** So the GPU's HDMI codec free-runs
+PCM into the AFMT FIFO with the read side closed: the write pointer laps a never-drained FIFO
+(`AFMT_STATUS` bit24 `AUDIO_FIFO_OVERFLOW` latches early), and when `SAMPLE_SEND` finally opens the read
+pointer is **permanently out of phase** — the IEC-60958 formatter clocks out **null cells**. That is the
+exact iron signature every burn showed and no one read correctly: `AFMT_AUDIO_CRC` tap0 (FIFO input) full of
+real PCM, **tap1 (formatter output) = "silence"**, `AFMT_STATUS` bit24 chronically set. amdgpu never hits it
+because ALSA `prepare()` configures the encoder drain and `trigger(START)` starts the codec feed **last**,
+into an empty FIFO with pointers coherent. (This also explains why Stage-1's clean edge failed: it cycled
+only the *reader*, never the feed.)
+
+**Fix — drain-before-feed ordering (amdgpu's prepare→trigger):** new `hda_hdmi_feed_stop()` /
+`hda_hdmi_feed_start()` (hda.cyr) clear/set `SD_RUN` on instance 1. `gpu_hdmi_audio_enable` calls `_stop` at
+the top so all encoder-audio setup runs against a **quiesced** FIFO, then arms the drain on the empty FIFO
+(overflow-ACK → AVMUTE-clear → `SAMPLE_SEND` 0→1); `main.cyr` calls `_start` as the **true terminal op, after
+`hda_hdmi_bind_single`** (which re-issues `SET_STREAM_FMT` and would re-glitch the pointer phase if the feed
+were already running). **Derived from a focused deep-dive; not yet iron-confirmed audible** — the confirming
+burn checks a real instrument, not just the ear: **`AFMT_AUDIO_CRC` tap1 goes non-zero** (was "silence") and
+**`AFMT_STATUS` → `0x40000010`** (bit24 clear, byte-identical to amdgpu-playing).
+
+### Added — the `DIG_ENABLE` + AVMUTE link-event edges (cold output-enable on the shipped path)
+
+`gpu_hdmi_audio_enable` now, at the tail, SETs AVMUTE + drops `DIG_ENABLE` (~120 ms, a real TMDS-loss the
+sink re-locks on — operator-confirmed the screen blanks), re-raises it polling `DIG_SYMCLK_BE_ON`, and CLEARs
+AVMUTE last (the SET→CLEAR unmute edge many sinks require, per the vc4_hdmi fix). This reconstructs the two
+dynamic events a cold modeset produces that a live `DIG_MODE` flip skips — grounded in the discrete-TX-chip /
+vc4 / i915 / pre-DMUB-DCE cross-system review that also **proved MMIO alone is sufficient (no DMUB/ATOM
+needed)**. It was not itself the fix (the sink got the event and stayed silent), but it is correct behaviour
+and is kept as the link event ahead of the drain-before-feed start.
+
 ### Added — `HDMI_AUDIO_SWEEP`: an in-boot fix-profile matrix (stop debugging one hypothesis per reflash)
 
 With the register-value class exhausted, the bottleneck is that each idea costs a full reflash. This flag
@@ -39,9 +83,9 @@ sink, and no register in this block that agnos can set changes that. The remaini
 below the DCN register file: agnos flips `DIG_MODE` live on the link the UEFI GOP brought up as **DVI**, while
 amdgpu brings the HDMI link/PHY up **cold** (ATOM `DIGxEncoderControl`, `SIGNAL_TYPE_HDMI`). The `HDMI_DB_CONTROL`
 write is kept — it makes agnos match the known-good on that register — but it is a correctness match, not the
-fix. Next frontier is the PHY/link bring-up (or the codec-feed↔AFMT-drain audio-clock coherence behind the
-persistent overflow), both larger and higher-risk than a register poke, and the encoder carries the only
-console — an operator-gated decision.
+fix. This entry named the next frontier as "the PHY/link bring-up **or the codec-feed↔AFMT-drain coherence
+behind the persistent overflow**" — and the latter was right: the root cause (above) is precisely a
+feed-before-drain ordering bug, not a PHY/firmware problem. MMIO was sufficient all along.
 
 ## [1.55.18] — 2026-07-15 — audit the audio arc: the packing bug lived on the 24-bit path we reverted
 
