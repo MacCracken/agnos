@@ -15,7 +15,7 @@
   some point and that sed did nothing for months; restored 2026-07-14.)
 -->
 
-> **Current**: v1.55.19 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
+> **Current**: v1.55.20 — live state (kernel head, cyrius pin, active burn, sweeps, sizes) lives in [`state.md`](state.md).
 
 > **This file is forward-facing.** Completed arcs are not re-narrated here — each gets one line in the
 > [Completed arcs ledger](#completed-arcs-ledger), and the history is the CHANGELOG's job. Per-arc reasoning

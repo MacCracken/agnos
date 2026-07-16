@@ -5,6 +5,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.20] — 2026-07-16 — HDMI audio: unmute AFTER the feed is live (amdgpu's trigger→unmute order)
+
+1.55.19 fixed the FIFO drain (the formatter now clocks real audio — `AFMT_AUDIO_CRC` tap1 non-zero,
+`AFMT_STATUS 0x40000010`, bit24 clear, byte-identical to amdgpu-playing) and confirmed
+`HDMI_AUDIO_PACKETS_PER_LINE` landed (`HDMI_AUDIO_PKT_CONTROL 30010`, ppl=3). The AFMT now *generates*
+correct, audible-level audio and every DCN register matches the audibly-working amdgpu path — **and the sink
+is still silent.** That rules out the AFMT/register class entirely and points at the one thing register
+matching cannot: the **ordering of the unmute relative to the audio stream**.
+
+### Fixed — the AVMUTE unmute edge fired over an EMPTY FIFO, before the codec feed started
+
+1.55.19's link-event block clears AVMUTE (the SET→CLEAR unmute edge many sinks latch their audio receiver on)
+at the **tail of `gpu_hdmi_audio_enable`** — which runs **before** `hda_hdmi_bind_single` and before
+`hda_hdmi_feed_start`. So the sink is told "unmute" while the AFMT FIFO is still empty and no PCM is moving,
+then the DMA feed starts a beat later. amdgpu does the reverse: ALSA `trigger(START)` brings the stream up
+**first**, then the AV path unmutes — the unmute transition coincides with audio actually present. A sink that
+samples stream-state on that edge (the vc4_hdmi unmute-edge rule; the ADV7511 / IT66121 reset-then-release
+pattern) can leave its receiver disarmed when the edge lands over a dead FIFO, even with every register
+correct and samples flowing microseconds later. This is precisely the operator's own framing — *the same tone
+plays fine out the analog jack*, which never had a mute-before-audio gap to trip over.
+
+**Fix — re-issue the unmute edge as the terminal op, with the feed live.** New `gpu_hdmi_avmute_pulse()`
+(gpu.cyr): after `hda_hdmi_feed_start()` primes the FIFO with real samples, `main.cyr` calls it as the last
+step of HDMI-audio bring-up — a fresh GCP AVMUTE **SET (~3 frames) → CLEAR** pulse, so the sink sees the
+transition with the stream genuinely running. Gated on `gpu_hdmi_audio_on` (inert unless the HDMI audio path
+came up) and `gpu_audio_quiet` (a sweep re-apply does not blink the console). The 1.55.19 pre-feed edge is
+kept as the link event; this adds the amdgpu-ordered post-feed edge it was missing. Costs one extra brief
+black flash on the HDMI console (the SET half), visually identical to the `DIG_ENABLE` flash already there.
+**Derived from the ordering analysis; not yet iron-confirmed audible** — the confirming instrument is the
+operator's ears, listening immediately after that second flash.
+
+### Confirmed — `HDMI_AUDIO_PACKETS_PER_LINE` explicitly programmed (was implicit 0 after the live flip)
+
+The live `DIG_MODE` flip can leave `HDMI_AUDIO_PACKETS_PER_LINE` at 0 (schedule zero audio-sample packets per
+line) where a cold modeset auto-derives a non-zero budget. `gpu_hdmi_audio_enable` now computes it from the
+blanking (DCE's `(h_blank − 58) / 32`, clamped [1,31] → 3 on this 2560×1440 link) and writes it into
+`HDMI_AUDIO_PACKET_CONTROL [20:16]`. Iron-confirmed landed in the 1.55.19 measurement burn
+(`HDMI_AUDIO_PKT_CONTROL 30010`); it is the one register between the working formatter and the wire, so it is
+kept regardless of the unmute-ordering outcome.
+
 ## [1.55.19] — 2026-07-16 — HDMI audio: the FIFO was fed before the drain was armed
 
 The HDMI-audio silence is a **feed-before-drain ordering bug** — a driver-class defect, exactly as the
