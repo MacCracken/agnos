@@ -71,6 +71,7 @@ var gpu_pixclk_100hz  = 0;
 # right-bar = h_total+1 (1482 / 2721 against a 2720x1481 link) — measured, not derived from a spec.
 var gpu_h_total       = 0;
 var gpu_v_total       = 0;
+var gpu_h_active      = 0;    # link active width — for HDMI_AUDIO_PACKETS_PER_LINE (data-island budget)
 # P3b-ii pre-flight: 1 = every precondition for the DVI->HDMI DIG_MODE flip is verified clear on the live
 # encoder. 0 = do NOT flip (a hazard is armed, or the link/encoder isn't ours to touch). Read-only result.
 var gpu_hdmi_flip_ok  = 0;
@@ -2704,6 +2705,8 @@ fn gpu_pixclk_discover() {
     var vbl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_BLANK_START_END + pipe * GPU_DCN_OTG_STRIDE);
     var hact = (hbl & GPU_OTG_BLANK_MASK) - ((hbl >> GPU_OTG_BLANK_END_SHIFT) & GPU_OTG_BLANK_MASK);
     var vact = (vbl & GPU_OTG_BLANK_MASK) - ((vbl >> GPU_OTG_BLANK_END_SHIFT) & GPU_OTG_BLANK_MASK);
+    gpu_h_active = hact;
+
     kprint("gpu: display link ", 18); kprint_num(hact); kprint("x", 1); kprint_num(vact);
     kprint(" total ", 7); kprint_num(htotal); kprint("x", 1); kprint_num(vtotal);
     kprint(" blanking ", 10); kprint_num(htotal - hact); kprint("x", 1); kprint_num(vtotal - vact);
@@ -3162,9 +3165,19 @@ fn gpu_hdmi_audio_enable() {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d,
     (n44 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_44_VAL);
 
+    # HDMI_AUDIO_PACKETS_PER_LINE ([20:16]) — the per-line audio-sample-packet budget, and THE gate downstream
+    # of the AFMT_AUDIO_CRC taps (which sit inside the AFMT). With the drain-before-feed fix the formatter now
+    # produces real audio (tap1 non-zero), but a live DIG_MODE flip may leave this at 0 = "schedule ZERO
+    # packets per line" (whereas amdgpu's cold modeset auto-derives a non-zero count). Program it explicitly
+    # from the blanking — DCE's calc_max_audio_packets_per_line: (h_blank - 58) / 32, clamped [1,31] (this link
+    # h_blank = 2720-2560 = 160 -> 3). This is the one register between the working formatter and the wire.
+    var h_blank = gpu_h_total - gpu_h_active;
+    var ppl = (h_blank - 58) / 32;
+    if (ppl < 1) { ppl = 1; }
+    if (ppl > 31) { ppl = 31; }
     var hap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d,
-    (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK)) | GPU_HDMI_AUDIO_DELAY_SET);
+    (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK) & (0 - 1 - 0x1F0000)) | GPU_HDMI_AUDIO_DELAY_SET | (ppl << 16));
 
     # Source select binds this DIG's AFMT to the Azalia endpoint; channel-enable is 8 bits and zero of them
     # is silence, so stereo must be spelled out.
