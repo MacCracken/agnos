@@ -3243,6 +3243,49 @@ fn gpu_hdmi_audio_enable() {
     var fec = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL + d, fec | GPU_DIG_STEREOSYNC_GATE_EN);
 
+    # === STAGE 1 — the two DYNAMIC EDGES a live DIG_MODE flip skips (2026-07-16 first-principles plan) ===
+    # Every audio register above is BYTE-IDENTICAL to amdgpu audibly playing on this exact panel, and it is
+    # still silent — so the fault is NOT a register value. HDMI audio is data-island packets the sink accepts
+    # only after two DYNAMIC events that a COLD modeset produces and agnos's LIVE DIG_MODE flip never has:
+    #   (1) a DIG_ENABLE output-enable EDGE — the MMIO equivalent of ATOM TransmitterControl(ENABLE,HDMI); a
+    #       real TMDS-loss/re-lock the sink treats as a link event and re-arms its audio receiver on.
+    #   (2) an AVMUTE SET->CLEAR EDGE in the GCP data island — many sinks unmute only on the transition, not on
+    #       a steady-cleared AVMUTE (the vc4_hdmi upstream fix; corroborated by i915's "audio only after the
+    #       port is enabled and link-trained" rule and the ADV7511/IT66121 reset-then-release pattern).
+    # Sweep profiles 14/15 toggled DIG_ENABLE but the window was MICROSECONDS (no sink link event) and never
+    # produced the AVMUTE edge, so islands moved and the sink still ignored them. This does it PROPERLY. All
+    # MMIO, no DMUB/ATOM (pre-DMUB DCE did HDMI audio 100% via MMIO — this is the same enc1_se_* class + the
+    # output-enable edge). The DIG_ENABLE toggle is iron-proven recoverable (14/15 booted through it). Skipped
+    # on a quiet sweep re-apply so the harness does not blink the console 28 times.
+    if (gpu_audio_quiet == 0) {
+        # SET AVMUTE (the SET half of the edge) and close the sample tap, then take the link DOWN.
+        var e_gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, e_gc | GPU_HDMI_GC_AVMUTE);
+        var e_ap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, e_ap & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+        var e_en = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d, e_en & (0 - 1 - GPU_DIG_ENABLE));
+        # Hold the link DOWN ~120 ms so the sink registers a real TMDS-loss event (14/15 held only microseconds).
+        gpu_udelay(120000);
+        # Bring it back UP with HDMI framing latched; poll the back-end symbol clock re-assert.
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d, e_en | GPU_DIG_ENABLE);
+        var e_pi = 0;
+        while (e_pi < 20000) {
+            if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d) & GPU_DIG_SYMCLK_BE_ON) != 0) { break; }
+            e_pi = e_pi + 1;
+        }
+        # Let the re-locked link settle, then re-arm the audio path against the FRESH link (latch channel
+        # status + re-open the sample tap — the link drop may have reset the AFMT drain).
+        gpu_udelay(20000);
+        var e_re = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, e_re | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+        # Hold AVMUTE a few GCP periods so the sink sees it SET, then CLEAR it LAST — the SET->CLEAR unmute edge.
+        gpu_udelay(50000);
+        var e_gc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, e_gc2 & (0 - 1 - GPU_HDMI_GC_AVMUTE));
+        kprintln("gpu: hdmi audio link-event bring-up done (DIG_ENABLE + AVMUTE edges)", 68);
+    }
+
     # THE ONE QUESTION EVERY LINE ABOVE BEGS. Everything printed so far is an echo of a write: the endpoint
     # says it is enabled because we enabled it. This asks the hardware something it has to answer for itself.
     # Skipped on a quiet sweep re-apply — the ~120 ms two-tap probe would dominate the harness's cadence.
