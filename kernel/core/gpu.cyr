@@ -2929,6 +2929,14 @@ fn gpu_hdmi_audio_enable() {
     var ir = GPU_R_AZ_ENDPOINT_INDEX + az * GPU_DCN_AZ_STRIDE;
     var dr = GPU_R_AZ_ENDPOINT_DATA  + az * GPU_DCN_AZ_STRIDE;
 
+    # DRAIN-BEFORE-FEED (2026-07-16, THE root cause): stop the HDMI codec DMA NOW so all the encoder-audio
+    # setup below runs against a QUIESCED AFMT FIFO. hda_stream_arm set SD_RUN on this stream during the HDA
+    # block, so the codec has been free-running PCM into the FIFO for seconds with the read side closed —
+    # which is why AFMT_STATUS bit24 is chronically set and the AFMT formatter (CRC tap1) drains NULL cells
+    # while tap0 is full. The feed is restarted as the TERMINAL op of this function (hda_hdmi_feed_start),
+    # into a freshly-drained FIFO with the read pointer armed — amdgpu's prepare(drain)->trigger(feed) order.
+    if (gpu_audio_quiet == 0) { hda_hdmi_feed_stop(); }
+
     # --- 1. Stage the HDMI block (inert while DIG_MODE==2, so this cannot disturb the console) ---
     var ctl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d,
@@ -3274,16 +3282,24 @@ fn gpu_hdmi_audio_enable() {
             if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d) & GPU_DIG_SYMCLK_BE_ON) != 0) { break; }
             e_pi = e_pi + 1;
         }
-        # Let the re-locked link settle, then re-arm the audio path against the FRESH link (latch channel
-        # status + re-open the sample tap — the link drop may have reset the AFMT drain).
+        # Link re-locked, clocks stable, DIG up, SAMPLE_SEND still 0 (FIFO held in reset via
+        # AFMT_RESET_FIFO_WHEN_AUDIO_DIS), and the codec FEED is STILL STOPPED (hda_hdmi_feed_stop, top).
         gpu_udelay(20000);
-        var e_re = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
-        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, e_re | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
-        # Hold AVMUTE a few GCP periods so the sink sees it SET, then CLEAR it LAST — the SET->CLEAR unmute edge.
-        gpu_udelay(50000);
+        # Clear the sticky overflow accumulated during setup — the FIFO is empty and the feed is stopped, so
+        # this ack finally sticks (bit24 has nothing to re-arm it).
+        var e_ov = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, e_ov | GPU_AFMT_FIFO_OVERFLOW_ACK);
+        # AVMUTE SET->CLEAR unmute edge.
         var e_gc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, e_gc2 & (0 - 1 - GPU_HDMI_GC_AVMUTE));
-        kprintln("gpu: hdmi audio link-event bring-up done (DIG_ENABLE + AVMUTE edges)", 68);
+        # ARM THE DRAIN: latch channel status + open the sample tap (SAMPLE_SEND 0->1) on the EMPTY FIFO.
+        # The codec FEED stays STOPPED here — it is started LAST, in main.cyr AFTER hda_hdmi_bind_single()
+        # runs (bind-single re-issues SET_STREAM_FMT on the converter, which would re-glitch the pointer phase
+        # if the feed were already running). So feed-start is the true terminal op of the whole HDMI-audio
+        # bring-up: hda_hdmi_feed_start() at main.cyr, after the sink is fully bound.
+        var e_re = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, e_re | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+        kprintln("gpu: hdmi audio drain armed on empty FIFO (feed starts after bind)", 66);
     }
 
     # THE ONE QUESTION EVERY LINE ABOVE BEGS. Everything printed so far is an echo of a write: the endpoint

@@ -990,6 +990,12 @@ if (gpu_hdmi_audio_on == 1) {
         hda_active_ctl = 0;
         kprintln("hda: hdmi bind found no pin -- sink reverted to analog", 54);
     }
+    # DRAIN-BEFORE-FEED, terminal step: gpu_hdmi_audio_enable() stopped the HDMI codec DMA and armed the AFMT
+    # drain on an EMPTY FIFO; bind-single has now done the final converter programming. Start the codec feed
+    # LAST so its write pointer begins together with the armed AFMT read pointer — the coherent-pointer start
+    # amdgpu gets from trigger(START)-after-prepare, and the fix for the chronic FIFO overflow / null egress.
+    # Only when HDMI actually bound (hda_active_ctl still 1); on the analog-revert path the HDMI feed stays off.
+    if (hda_active_ctl == 1) { hda_hdmi_feed_start(); }
     # Report BEFORE the re-route, never after. This line is the only window onto the codec half, and putting
     # it behind the code it exists to diagnose is how a burn comes back saying nothing at all.
     kprint("hda: sink ctl=", 14); kprint_num(hda_active_ctl);

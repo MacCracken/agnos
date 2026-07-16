@@ -1538,3 +1538,44 @@ fn hda_stream_arm() {
     kprintln("hda: stream armed, LPIB not advancing", 37);
     return 0;
 }
+
+# hda_hdmi_feed_stop / hda_hdmi_feed_start — THE DRAIN-BEFORE-FEED FIX for the HDMI-audio silence.
+#
+# hda_stream_arm sets SD_RUN on the HDMI stream (instance 1, tag 3) during the HDA block — SECONDS before
+# gpu_hdmi_audio_enable opens the AFMT drain (AFMT_AUDIO_SAMPLE_SEND). So the GPU's HDMI codec free-runs PCM
+# into the DCN AFMT audio FIFO with the read side still closed: the write pointer laps a never-drained FIFO
+# (AFMT_STATUS bit24 AUDIO_FIFO_OVERFLOW latches early), and when SAMPLE_SEND finally opens the read pointer
+# is PERMANENTLY OUT OF PHASE with the free-running writer, so the IEC-60958 formatter clocks out NULL cells
+# — which is exactly the iron signature: AFMT_AUDIO_CRC tap0 (FIFO input) full of real PCM, tap1 (formatter
+# output) reads SILENCE, and bit24 chronically set. amdgpu never hits this: ALSA configures the encoder drain
+# in prepare() and only trigger(START) starts the codec feed LAST, into an empty FIFO with pointers coherent.
+# So: gpu_hdmi_audio_enable calls _stop at the TOP (all encoder-audio setup then runs against a quiesced FIFO)
+# and _start as its TERMINAL op (feed resumes into a freshly-drained FIFO with the read pointer already armed).
+# The MMIO accessors index by hda_active_ctl; at enable time that is still 0 (analog), so save/select/restore.
+fn hda_hdmi_feed_stop() {
+    var ci = 1;                                        # instance 1 = the HDMI/DP controller
+    if (load64(&hda_present + ci * 8) == 0) { return 0; }
+    var sd = load64(&hda_sd_base + ci * 8);
+    if (sd == 0) { return 0; }
+    store64(&hda_stream_on + ci * 8, 0);               # pause the 100 Hz refill servicer first
+    var ci_save = hda_active_ctl;
+    hda_active_ctl = ci;
+    var ctl = hda_read32(sd + SD_CTL);
+    hda_write32(sd + SD_CTL, ctl & (0 - 1 - SD_RUN));  # clear RUN -> DMA stops feeding the codec
+    hda_active_ctl = ci_save;
+    hda_udelay(2000);                                  # let the codec link + AFMT FIFO write side go quiet
+    return 1;
+}
+fn hda_hdmi_feed_start() {
+    var ci = 1;
+    if (load64(&hda_present + ci * 8) == 0) { return 0; }
+    var sd = load64(&hda_sd_base + ci * 8);
+    if (sd == 0) { return 0; }
+    var ci_save = hda_active_ctl;
+    hda_active_ctl = ci;
+    var a_tag = load64(&hda_tag + ci * 8);
+    hda_write32(sd + SD_CTL, (a_tag << SD_TAG_SHIFT) | SD_RUN);   # RUN -> feed resumes into a drained FIFO
+    hda_active_ctl = ci_save;
+    store64(&hda_stream_on + ci * 8, 1);               # resume the refill servicer
+    return 1;
+}

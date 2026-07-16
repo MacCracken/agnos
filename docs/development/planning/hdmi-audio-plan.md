@@ -94,7 +94,31 @@ Every burn has been un-adjudicable (tap1 frozen + amplitude-blind, no on-die wir
    panel — if it visibly blanks, the GCP island reaches the sink and its mute logic is live (which makes the
    Stage-1 clear-edge meaningful).
 
-### Stage 1 — the cold output-enable + AVMUTE edge (SHIPPED 2026-07-16, first burn) ✅ IMPLEMENTED
+### ROOT CAUSE FOUND (2026-07-16, iron-confirmed signature) — feed-before-drain
+
+Stage-1 (the edges) burned and stayed silent, but the operator's two observations settled it: the **analog
+jack plays the same tone perfectly** (PCM/HDA/DMA all good — content ruled out) and the **screen visibly
+blanked** during the `DIG_ENABLE` drop (the sink *did* get a real link event and still played nothing). That
+isolated the fault to one thing — **the AFMT audio FIFO fills but never drains audio sample packets** — and a
+focused deep-dive nailed the mechanism:
+
+**`hda_stream_arm` sets `SD_RUN` on the HDMI stream (tag 3) during the HDA block — seconds before
+`gpu_hdmi_audio_enable` opens the AFMT drain (`AFMT_AUDIO_SAMPLE_SEND`).** So the GPU HDMI codec free-runs PCM
+into the AFMT FIFO with the read side closed: the write pointer laps a never-drained FIFO (`AFMT_STATUS` bit24
+`AUDIO_FIFO_OVERFLOW` latches early), and when `SAMPLE_SEND` finally opens the read pointer is **permanently
+out of phase** — the IEC-60958 formatter clocks out **null cells**. That is the exact iron signature:
+`AFMT_AUDIO_CRC` tap0 (FIFO input) full of real PCM, **tap1 (formatter output) = silence**, bit24 chronic.
+amdgpu never hits it: ALSA `prepare()` configures the drain and `trigger(START)` starts the feed **last**,
+into an empty FIFO with pointers coherent. Stage-1 failed because it cycled only the *reader*, never the feed.
+
+**THE FIX (shipped): drain-before-feed ordering.** `hda_hdmi_feed_stop()` / `hda_hdmi_feed_start()` (hda.cyr)
+clear/set `SD_RUN` on instance 1. `gpu_hdmi_audio_enable` calls `_stop` at the top (all encoder-audio setup
+runs against a quiesced FIFO), arms the drain on the empty FIFO (overflow-ack → AVMUTE-clear → `SAMPLE_SEND`
+0→1), and `main.cyr` calls `_start` as the **true terminal op, after `hda_hdmi_bind_single`** (which re-issues
+`SET_STREAM_FMT` and would re-glitch the phase if the feed were already running). Verify: **tap1 goes
+non-zero** (was "silence") and **`AFMT_STATUS` → `0x40000010`** (bit24 clear, matching amdgpu) — plus the ear.
+
+### Stage 1 (superseded) — the cold output-enable + AVMUTE edge (kept as the link event) ✅ IMPLEMENTED
 Rewrote the tail of `gpu_hdmi_audio_enable` (gpu.cyr) to, after all staging: SET AVMUTE + close the tap →
 drop `DIG_ENABLE` → **hold ~120 ms** (14/15 held microseconds) → raise `DIG_ENABLE` + poll `DIG_SYMCLK_BE_ON`
 → settle → re-latch CS + re-open SAMPLE_SEND → hold ~50 ms → **CLEAR AVMUTE last** (the SET→CLEAR edge). All
