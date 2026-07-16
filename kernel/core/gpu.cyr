@@ -3269,7 +3269,7 @@ fn gpu_hdmi_audio_enable() {
 # overflow and reads AFMT_STATUS bit24 back — the built-in oracle: bit24 re-arming = still not draining.
 # The operator watches this log and LISTENS; the profile whose name is on screen when sound appears is it.
 # gpu_hdmi_audio_profile(-1) returns the profile count. All profiles are safe or console-recoverable.
-var GPU_HDMI_SWEEP_COUNT = 14;
+var GPU_HDMI_SWEEP_COUNT = 16;
 fn gpu_hdmi_audio_profile(n) {
     if (n < 0) { return GPU_HDMI_SWEEP_COUNT; }
     # 1. Reset to the shipped 1.55.18 baseline, quietly, so each profile is an independent single-variable test.
@@ -3283,6 +3283,7 @@ fn gpu_hdmi_audio_profile(n) {
     # Cyrius `var` is function-scoped, so scratch registers reused across the mutually-exclusive branches
     # below are declared once here and assigned (not re-declared) per profile.
     var v = 0; var c = 0; var c2 = 0; var r = 0; var h0 = 0; var ic = 0; var ap = 0; var hap = 0;
+    var been = 0; var bc = 0; var pi = 0;   # cold-bringup scratch (profiles 14/15)
 
     kprint("hdmi-sweep: profile ", 20); kprint_num(n); kprint(" = ", 3);
 
@@ -3397,7 +3398,7 @@ fn gpu_hdmi_audio_profile(n) {
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d, h0 | GPU_HDMI_AUDIO_INFO_SEND | GPU_HDMI_AUDIO_INFO_CONT);
         ic = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ic | GPU_AFMT_AUDIO_INFO_UPDATE);
-    } else {
+    } elif (n == 13) {
         # A — re-ENTER HDMI mode (3->2->3) to re-run the back-end HDMI packet latch. Brief screen flicker at
         #     the DVI dip is expected (mode 2 is a lit state; the RMW preserves FE_SOURCE_SELECT so it recovers).
         kprintln("A dig-mode bounce 3-2-3", 23);
@@ -3407,6 +3408,56 @@ fn gpu_hdmi_audio_profile(n) {
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, (be & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT));
         v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, v | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+    } elif (n == 14) {
+        # RISK — the register-reachable proxy for ATOM TransmitterControl(ENABLE,HDMI): a DIG_ENABLE edge
+        #        (1->0->1) with DIG_MODE already 3 — the HDMI-enable edge agnos's live DIG_MODE flip never
+        #        produced. DIG_BE_EN_CNTL is the one liveness register agnos has only ever READ, never written.
+        #        The picture blanks for the toggle window then restores (DIG_ENABLE re-asserted). The CRC probe
+        #        after shows whether audio ISLANDS finally leave the encoder (tap1 non-zero).
+        kprintln("RISK cold DIG-enable re-latch", 29);
+        v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, v & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+        been = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d, been & (0 - 1 - GPU_DIG_ENABLE));
+        bc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, (bc & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT));
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d, been | GPU_DIG_ENABLE);
+        pi = 0;
+        while (pi < 10000) {
+            if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d) & GPU_DIG_SYMCLK_BE_ON) != 0) { break; }
+            pi = pi + 1;
+        }
+        r = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, r | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+        gpu_hdmi_audio_crc_probe(d);
+    } else {
+        # RISK — the ordered cold replica: DIG_ENABLE DOWN, re-stage the FE/HDMI datapath while output is off
+        #        (the ATOM EncoderControl SETUP equivalent), THEN raise DIG_ENABLE so the encoder latches HDMI
+        #        framing on the rising edge with the FE fully staged — as close to amdgpu's cold bring-up order
+        #        as agnos gets without ATOM. Blanks then restores; CRC probe after.
+        kprintln("RISK cold FE+BE re-stage", 24);
+        v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, v & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+        been = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d, been & (0 - 1 - GPU_DIG_ENABLE));
+        bc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, (bc & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT));
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d, GPU_HDMI_CONTROL_SET);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL + d, GPU_HDMI_VBI_SET);
+        c = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, c & (0 - 1 - GPU_HDMI_GC_AVMUTE));
+        c2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_FE_CNTL + d, c2 | GPU_DIG_STEREOSYNC_GATE_EN);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_DB_CONTROL + d, GPU_HDMI_DB_CONTROL_VAL);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d, been | GPU_DIG_ENABLE);
+        pi = 0;
+        while (pi < 10000) {
+            if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d) & GPU_DIG_SYMCLK_BE_ON) != 0) { break; }
+            pi = pi + 1;
+        }
+        r = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, r | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+        gpu_hdmi_audio_crc_probe(d);
     }
 
     # 3. The built-in oracle: clear the sticky overflow, let it re-arm (or not), read AFMT_STATUS bit24.
