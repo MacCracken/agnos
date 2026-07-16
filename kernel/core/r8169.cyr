@@ -841,6 +841,84 @@ fn r8169_rx_rearm(desc) {
     return 0;
 }
 
+# === RX engine restart — run once when interrupts come up =======================
+#
+# The receiver goes live in r8169_init_tx step 11 (CR.TE|RE) during early boot, but
+# `sti` does not execute until ~2,500 lines later in main.cyr. For that whole window
+# the NIC DMAs LAN broadcast chatter into 64 descriptors with NOTHING draining them:
+# the overflow recovery this driver is designed around — "the proven 100 Hz timer-tick
+# whole-ring drain", per the IMR note above — is a TIMER tick, and no timer runs with
+# interrupts off. The ring fills, RDU/FOVW latch on a condition nothing relieves, and
+# the receiver can dead-stall. That note anticipated exactly this case and prescribed
+# the remedy: "if iron shows overflow dead-stall, the fix is a CR.RE off/on bounce in
+# an FOVW branch". This is that bounce, at the moment the drain can finally run.
+#
+# Why it appeared now: RX is UNCHANGED since it was iron-proven at 1.51.7 (a real DHCP
+# lease, 192.168.1.195). What changed is the length of the pre-`sti` window, which grew
+# across the GPU/display/audio arcs — PSP firmware load, DCN probes, the display-audio
+# CRC taps' busy-wait — and DHCP degraded in step with it (5/5 ACK at 1.55.14 -> 0/3 by
+# 1.55.16, recorded in gpu.cyr's CRC-probe timeout comment). This is a boot-ordering
+# regression that landed on the NIC, not a defect in the NIC.
+#
+# Discarding the pre-`sti` frames costs nothing: they are chatter that arrived before
+# the stack was listening, addressed to a host with no lease.
+fn r8169_rx_restart() {
+    if (r8169_present == 0) { return 0; }
+    if (r8169_rx_ring_phys == 0) { return 0; }
+
+    # Read the chip's latched condition BEFORE the W1C below clears it. This is the
+    # measurement: ISR is the silicon's own answer to "did the ring overrun?", not our
+    # bookkeeping echoed back. The dead-stall mechanism above is derived, not yet seen
+    # on iron, so the restart carries the instrument that confirms or refutes it. The
+    # read is trustworthy despite running after sti: FOVW/RDU are condition-latched
+    # (see the IMR note above) and do NOT self-clear on the pre-sti ROK MSI's W1C in
+    # r8169_irq_ack — only relieving the ring here clears them — so they still read set.
+    var isr = r8169_read16(R8169_REG_ISR);
+    var overran = isr & (R8169_INTR_FOVW | R8169_INTR_RDU);
+
+    # ONLY the genuine dead-stall gets the whole-ring re-arm + index reset. In the
+    # healthy / partial-fill case (no FOVW/RDU) the receiver is fine: the normal 100 Hz
+    # timer-tick + MSI drain empties the pre-sti frames from rx_idx exactly as it did
+    # before this pre-sti window grew (iron-proven at 1.51.7), so touching nothing is
+    # correct. Re-arming there would force r8169_rx_idx = 0 while the chip's descriptor
+    # pointer sits mid-ring — and whether an RE off/on bounce reloads that pointer to
+    # slot 0 is UNSOURCED (see below). Guessing wrong DESYNCS software from hardware and
+    # reintroduces the exact stall this fixes, on a boot that was healthy. So gate on the
+    # measured overrun: only when the ring actually filled — where the chip's write
+    # pointer HAS wrapped back to slot 0 (ring full) so idx = 0 is correct under either
+    # pointer model — do the aggressive restart.
+    if (overran == 0) {
+        kprintln("r8169: receiver ring healthy at sti, no restart needed", 54);
+        return 0;
+    }
+
+    # RE down: stop the receiver so descriptors can be re-armed without racing DMA.
+    var cr = r8169_read8(R8169_REG_CR);
+    r8169_write8(R8169_REG_CR, cr & (0xFF - R8169_CR_RE));
+
+    # Re-arm the whole ring (OWN back to the NIC, EOR preserved on the last slot) and
+    # resync our index — the chip resumes at slot 0 when RE is raised again.
+    var i = 0;
+    while (i < R8169_RX_RING_SIZE) {
+        r8169_rx_rearm(r8169_rx_ring_phys + i * 16);
+        i = i + 1;
+    }
+    r8169_rx_idx = 0;
+
+    # W1C the latched bits now that the ring-full condition is actually relieved. RDU
+    # and FOVW do not self-clear until it is — which is precisely why they are kept out
+    # of the MSI mask instead of being acked inside the handler.
+    r8169_write16(R8169_REG_ISR, 0xFFFF);
+
+    # RE back up.
+    cr = r8169_read8(R8169_REG_CR);
+    r8169_write8(R8169_REG_CR, cr | R8169_CR_RE);
+
+    # Reached only on a measured overrun (the healthy case returned above).
+    kprintln("r8169: RX ring overran before interrupts were enabled, receiver restarted", 73);
+    return 0;
+}
+
 fn r8169_poll(buf, maxlen) {
     if (r8169_present == 0) { return 0; }
     if (r8169_rx_ring_phys == 0) { return 0; }

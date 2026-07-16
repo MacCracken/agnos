@@ -2584,6 +2584,9 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var sw_nb = ksyscall_a4_get() & 1;
         if (sw_nb == 1) {
             if (snd_hw_frames > snd_appl) { snd_appl = snd_hw_frames; }                # underrun resync
+            # 16384 = the ring's frame capacity at bpf=4 (65536/4). This and the two twin sites below assume
+            # a 16-bit sink; a 24-bit (bpf=8) instance holds only 8192 frames, so reactivating hda.cyr's
+            # bpf==8 path requires deriving this from 65536/hda_bpf[hda_active_ctl] first (see hda.cyr note).
             var sw_f0 = 16384 - (snd_appl - snd_hw_frames) - 1;
             var sw_n0 = arg3; if (sw_n0 > sw_f0) { sw_n0 = sw_f0; }
             if (sw_n0 > 0) { snd_copy_frames(arg2, sw_n0); }

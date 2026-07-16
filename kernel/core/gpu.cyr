@@ -3245,12 +3245,20 @@ fn gpu_hdmi_audio_enable() {
 # checksums the samples that actually go through, so DONE is a fact about the hardware rather than about
 # our configuration.
 #
-# HOW TO READ THE RESULT — this is the whole point, so it is spelled out:
-#   "samples reaching the encoder (crc N)"  ⟹ the HDA link, the codec, the stream binding and the FIFO all
-#       work. Samples arrive. The fault is DOWNSTREAM: the link, the sink, or the panel itself. Next look
-#       at what the monitor is told, not at this block.
-#   crc N == 0 with DONE set ⟹ samples arrive but they are DIGITAL SILENCE. The pipe is correct and the
-#       PCM is empty — a ring/refill/sink-select bug on the codec side, not a display bug at all.
+# HOW TO READ THE RESULT — this is the whole point, so it is spelled out. The one rule that governs all of
+# it: this CRC is CONTENT-SENSITIVE but AMPLITUDE-BLIND. It checksums the sample words; any stream that is
+# not all-zeros produces a non-zero CRC, at ANY level. So a non-zero CRC proves samples TRAVERSED — it does
+# NOT prove the samples are CORRECT, or even audible.
+#   "samples reaching the encoder (crc N)"  ⟹ non-zero samples are traversing this tap. That is ALL it
+#       proves. It does NOT clear the codec-side data path: a wrong-amplitude or sign-mangled PCM stream
+#       reads exactly like a correct one here. This is not hypothetical — 1.55.17's s16->24-bit packing bug
+#       (sample parked at container [23:8] instead of [31:8]) made a ~-48 dB, sign-folded, all-positive DC
+#       remnant that was DEAD SILENT on the sink yet lit this tap at crc 0x71539c. So on a non-zero CRC,
+#       look BOTH ways: UPSTREAM at the PCM the ring actually contains (hda.cyr hda_refill_half /
+#       snd_copy_frames — is it the right level and sign?) AND downstream at the link/sink. Do not read
+#       "crc N" as "the codec half works".
+#   crc N == 0 with DONE set ⟹ samples arrive but they are DIGITAL SILENCE (genuinely all-zero words). The
+#       pipe is correct and the PCM is empty — a ring/refill/sink-select bug on the codec side.
 #   "crc did not complete" ⟹ either nothing is arriving, OR this counter is inert on this silicon. It is
 #       reported as UNCONFIRMED and not as proof of no samples, because amdgpu never reads this register
 #       back and so nothing validates the DONE semantics on DCN 2.1. Do not turn a non-answer into a
@@ -3261,7 +3269,11 @@ fn gpu_hdmi_audio_crc_probe(d) {
     # 1.55.15 over-read exactly that. The control run on amdgpu settled what it could: on an AUDIBLY WORKING
     # path BOTH taps complete, with different CRCs (source 0 = 0x7fe228, source 1 = 0x525ae0), so both are
     # real and distinct. That means the discriminator is HERE, on the broken path:
-    #   both complete  ⟹ samples reach both taps; the fault is past the encoder (link/sink).
+    #   both complete  ⟹ non-zero samples reach both taps. Because this CRC is amplitude-blind (see the
+    #                    HOW-TO-READ block above), this does NOT localize the fault past the encoder — it is
+    #                    equally consistent with correct samples that the sink drops AND with garbage-level
+    #                    samples that traverse fine (the 1.55.17 packing bug read exactly this way). Rule the
+    #                    PCM level/sign UPSTREAM (hda.cyr) in or out before concluding the fault is link/sink.
     #   0 completes, 1 does not ⟹ the fault sits BETWEEN the taps — the bisection is proven, and whichever
     #                             tap 1 is, agnos does not reach it.
     #   neither ⟹ nothing arrives at all and the codec half is back in scope.

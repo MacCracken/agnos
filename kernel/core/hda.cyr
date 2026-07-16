@@ -777,6 +777,31 @@ fn hda_dma_report() {
     return 0;
 }
 
+# Per-instance stream format / tag / bytes-per-frame. Declarative array init does not take in this
+# codebase (cf. snd_active_slot), so these are set at RUNTIME — and IDEMPOTENTLY, so every consumer calls
+# this before reading rather than depending on some other function having run first. That dependency is
+# not hypothetical: hda_codec_route() and hda_hdmi_bind_single() both write the codec's converter format,
+# and BOTH run outside hda_stream_arm() (route ~300 lines of boot earlier, bind_single after it from
+# main.cyr). The controller's SDnFMT and every codec SET_STREAM_FMT must agree or the stream faults, so
+# there is exactly one place these values are chosen.
+#
+# BOTH instances stream 16-bit. The analog path is iron-validated and audible. For HDMI, the codec-side
+# known-good capture — taken while the panel was audibly playing — records `format: S16_LE` and states
+# plainly that "the format agnos streams is the format that works — S16_LE / 2ch / 48000". 1.55.17 moved
+# the HDMI instance to 24-bit/0x31 to match the BAR5 dump's AZ mirror instead, which is a DIFFERENT
+# capture and disagrees with the audible one. Nothing on record establishes which capture reflects the
+# audible run, so the change had no evidential basis and is reverted. Instance 1 keeps amdgpu's tag 3 — a
+# real measured match, and harmless (tags are per-link, driver-chosen).
+fn hda_fmt_init() {
+    store64(&hda_tag + 8, 3);
+    store64(&hda_fmt + 8, HDA_FMT_48K_16_2);
+    store64(&hda_bpf + 8, 4);
+    store64(&hda_tag + 0, 1);
+    store64(&hda_fmt + 0, HDA_FMT_48K_16_2);
+    store64(&hda_bpf + 0, 4);
+    return 0;
+}
+
 # hda_hdmi_bind_single — bind the ONE live digital pin/converter and UNBIND the rest.
 #
 # THE BROADCAST IS THE BUG. hda_codec_route()'s digital branch enables EVERY digital pin and binds EVERY
@@ -798,6 +823,7 @@ fn hda_dma_report() {
 # hda_force_digi_ord exists and why it was never set. This is the fixup pass that closes that seam.
 fn hda_hdmi_bind_single(ord) {
     if (load64(&hda_present + hda_active_ctl * 8) == 0) { return 0; }
+    hda_fmt_init();
     var codec = load64(&hda_codec0 + hda_active_ctl * 8);
     var seen = 0;
     var bound_pin = 0;
@@ -825,17 +851,30 @@ fn hda_hdmi_bind_single(ord) {
                 if (cvt != 0) {
                     if (seen == ord) {
                         # THE LIVE PAIR: bind it to the stream tag and light the pin.
-                        hda_verb(codec, cvt, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_24_2);
-                        hda_verb(codec, cvt, (V_SET_STREAMID << 8) | (3 << 4));
+                        # Format + tag come from the PER-INSTANCE state hda_stream_arm programmed into the
+                        # controller. They were hardcoded (0x31 / tag 3) until the 24-bit revert, which made
+                        # this — the LAST format write on the live converter, called from main.cyr after
+                        # hda_stream_arm — silently disagree with SDnFMT. Per this file's own rule at
+                        # hda_stream_arm: controller SDnFMT and codec SET_STREAM_FMT must MATCH or the
+                        # stream faults. One source of truth is the only way that rule can hold.
+                        hda_verb(codec, cvt, (V_SET_STREAM_FMT << 16) | load64(&hda_fmt + hda_active_ctl * 8));
+                        hda_verb(codec, cvt, (V_SET_STREAMID << 8) | (load64(&hda_tag + hda_active_ctl * 8) << 4));
                         hda_verb(codec, cvt, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
                         hda_verb(codec, nid, (V_SET_PINCTL << 8) | PINCTL_OUT_EN);
                         bound_pin = nid;
                         bound_cvt = cvt;
                     } else {
-                        # EVERY OTHER digital pin: UNBIND its converter (stream 0 = no stream) and drop
-                        # the pin's output enable, so nothing else shares our converter or our tag.
-                        hda_verb(codec, cvt, (V_SET_STREAMID << 8) | 0);
+                        # EVERY OTHER digital pin: drop its output enable, and unbind its converter (stream 0)
+                        # UNLESS that converter is the one we just bound. On an AMD codec whose digital pins
+                        # share a default converter — the exact patch_hdmi.c silent-audio case this fixup
+                        # targets — a later higher-nid pin resolving to bound_cvt would zero the LIVE stream id
+                        # AFTER the bind and re-mute it. bound_cvt is already set for every post-live pin (the
+                        # bind fires at seen==ord, before any seen>ord iteration); for pre-ord pins bound_cvt is
+                        # still 0 so the guard is always true and they unbind as before (self-healing — the
+                        # bind re-writes the tag). On this panel the pins use distinct converters, so the guard
+                        # never changes anything; it only makes the shared-converter codec safe.
                         hda_verb(codec, nid, (V_SET_PINCTL << 8) | 0);
+                        if (cvt != bound_cvt) { hda_verb(codec, cvt, (V_SET_STREAMID << 8) | 0); }
                     }
                     seen = seen + 1;
                 }
@@ -858,6 +897,7 @@ fn hda_hdmi_bind_single(ord) {
 fn hda_codec_route() {
     if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_codec_mask + hda_active_ctl * 8) == 0) { return 0; }
     if (load64(&hda_afg + hda_active_ctl * 8) == 0 || load64(&hda_w_count + hda_active_ctl * 8) == 0) { return 0; }
+    hda_fmt_init();   # this routes the digital converter's format — must agree with the SDnFMT arm later
     var codec = load64(&hda_codec0 + hda_active_ctl * 8);
 
     # --- select output pin (scored; no hardcoded nid) ---
@@ -1031,8 +1071,10 @@ fn hda_codec_route() {
                         # With no slot pair enabled the AFMT cannot drain samples: AFMT_STATUS bit24
                         # (AUDIO_FIFO_OVERFLOW) re-armed within moments of being acked. Silence, with the DMA
                         # running and every other register byte-identical to amdgpu.
-                        hda_verb(codec, dgcv, (V_SET_STREAM_FMT << 16) | HDA_FMT_48K_24_2);
-                        hda_verb(codec, dgcv, (V_SET_STREAMID << 8) | (3 << 4));
+                        # Per-instance format/tag (see hda_stream_arm) — never hardcode either here: this
+                        # runs on the same converter the controller's SDnFMT describes, and the two must agree.
+                        hda_verb(codec, dgcv, (V_SET_STREAM_FMT << 16) | load64(&hda_fmt + hda_active_ctl * 8));
+                        hda_verb(codec, dgcv, (V_SET_STREAMID << 8) | (load64(&hda_tag + hda_active_ctl * 8) << 4));
                         hda_verb(codec, dgcv, (V_SET_CVT_CHANS << 8) | CVT_CHANS_STEREO);
                         hda_verb(codec, dgn, (V_SET_POWER << 8) | 0x00);
                         hda_verb(codec, dgn, (V_SET_PINCTL << 8) | PINCTL_OUT_EN);
@@ -1163,9 +1205,14 @@ fn hda_refill_half(ci, h) {
     # in 32-BIT CONTAINERS, left-justified WITHIN THE CONTAINER — HDA spec 1.0a: "20 and 24-bit samples must
     # be padded out with zeros at the LSB end to make them all 32-bits long", i.e. the sample occupies
     # [31:8] and the PAD is [7:0]. An s16 therefore lands at [31:16] => <<16, not <<8. (1.55.17 shipped <<8,
-    # which parks the sample at [23:8] and pads the MSB end instead: the hardware reads [31:8] = sample>>8,
-    # ~-57 dBFS AND sign-mangled — non-zero, so the AFMT CRC tap still reads "content", but inaudible. No
-    # instance streams 24-bit today; this branch is kept correct rather than left as a trap.)
+    # which parks the sample at [23:8] and pads the MSB end instead: the hardware then reads [31:8] as the
+    # s16 VALUE interpreted at 24-bit scale — a +12000 peak becomes 12000/2^23 ~= -57 dBFS, far too quiet —
+    # and every NEGATIVE sample folds positive (bit23=0), so the whole tone collapses to an all-positive DC
+    # remnant. Non-zero, so the amplitude-blind AFMT CRC tap still reads "content", but inaudible.
+    # NOTE ON REACTIVATION: the PACKING below is correct, but this bpf==8 branch is NOT drop-in reactivatable.
+    # No instance streams 24-bit today (hda_fmt_init pins bpf=4 for both), and the ring-3 producer flow-control
+    # still hardwires the 16384-frame (bpf=4) capacity at syscall.cyr snd_write/snd_avail (16384 = 65536/4).
+    # A future 24-bit re-attempt must widen those to 65536/bpf FIRST or the producer will overrun the ring.)
     var bpf = load64(&hda_bpf + ci * 8);
     if (bpf == 0) { bpf = 4; }
     var nframes = load64(&hda_ring_half + ci * 8) / bpf;
@@ -1368,22 +1415,7 @@ fn hda_snd_selftest() {
 # SD_LPIB advances (DMA fetching). Silence for now; B4 fills a sine (first tone).
 fn hda_stream_arm() {
     if (load64(&hda_present + hda_active_ctl * 8) == 0 || load64(&hda_out_dac + hda_active_ctl * 8) == 0) { return 0; }
-    # Per-instance format/tag. BOTH instances stream 16-bit: the analog path is iron-validated and audible,
-    # and the codec-side known-good capture states plainly that S16_LE / 2ch / 48000 is a format this sink
-    # plays under amdgpu (`AZ_CONVERTER_FORMAT 0x11`). 1.55.17 moved the HDMI instance to 24-bit/0x31 to
-    # match the BAR5 known-good, but the two captures disagree only because they caught DIFFERENT PLAYERS:
-    # the BAR5 dump was taken with ffmpeg negotiating 24-bit, the codec-side dump with a 16-bit stream. Both
-    # were audible ⇒ the converter format was never causal, and matching 0x31 was matching an artifact of
-    # the capture. Instance 1 keeps amdgpu's tag 3 (a real, harmless match — tags are per-link).
-    if (hda_active_ctl == 1) {
-        store64(&hda_tag + 8, 3);
-        store64(&hda_fmt + 8, HDA_FMT_48K_16_2);
-        store64(&hda_bpf + 8, 4);
-    } else {
-        store64(&hda_tag + 0, 1);
-        store64(&hda_fmt + 0, HDA_FMT_48K_16_2);
-        store64(&hda_bpf + 0, 4);
-    }
+    hda_fmt_init();   # per-instance format/tag/bpf — the single source of truth (see hda_fmt_init)
     var a_tag = load64(&hda_tag + hda_active_ctl * 8);
     var a_fmt = load64(&hda_fmt + hda_active_ctl * 8);
     if (load64(&hda_oss + hda_active_ctl * 8) == 0) { kprintln("hda: OSS=0, no output stream", 28); return 0; }

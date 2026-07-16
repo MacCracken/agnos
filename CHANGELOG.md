@@ -5,6 +5,176 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.18] — 2026-07-15 — audit the audio arc: the packing bug lived on the 24-bit path we reverted
+
+A seven-dimension adversarial review of the whole HDMI/HDA audio arc (28 agents, find → verify) drove this
+cut. It confirmed the arc's real fixes, corrected three overstated conclusions in the record, and closed
+four latent defects the arc had left behind. The through-line: **whatever makes the shipped build audible —
+if anything does — is the 16-bit revert plus 1.55.17's bind-single, both still derived, not yet measured.
+The "PCM packing bug" is real but lived on a code path this same cut reverts out of the build.**
+
+### Fixed — the s16→24-bit packing was wrong, but on a path that no longer runs
+
+The register-diff class is closed: the audio registers agnos programs match the audibly-working amdgpu path,
+so sixteen burns of register-diffing could not find the fault — **it was in the PCM data, which no register
+describes.** `hda_refill_half` and `snd_copy_frames` converted s16 to the 24-bit container with
+`(s << 8) & 0xFFFFFF`, parking the sample in bits **[23:8]** and padding the **MSB** end. HDA spec 1.0a
+requires the opposite — sample in **[31:8]**, pad in **[7:0]** — so the hardware read the positive half at
+its s16 *value* interpreted at 24-bit scale (a +12000 peak = 12000/2^23 ≈ **−57 dBFS**, far too quiet)
+while every **negative** sample folded positive (bit 23 = 0):
+
+| s | container written | what the codec read |
+|---|---|---|
+| +12000 | `0x002EE000` | `0x002EE0` = **+12000** (≈ −57 dBFS at 24-bit scale) |
+| −12000 | `0x00D12000` | `0x00D120` = **+53536** (sign lost) |
+
+The tone collapsed to an all-positive DC remnant — inaudible on monitor speakers, **while LPIB advanced and
+both CRC taps returned healthy non-zero CRCs.** That is the whole trap: **a CRC is content-sensitive but
+amplitude-blind** — it checksums the sample words, so any not-all-zero stream lights it at *any* level.
+`tap1` going non-zero at 1.55.17 was read as "real audio is leaving the encoder"; it only ever proved "not
+all zeros". The packing is now `(s << 16) & 0xFFFFFF00` at both sites.
+
+**Truth-in-labeling:** this fix lands on the **24-bit (bpf=8) branch**, and after the revert below both
+instances stream 16-bit (bpf=4), where the live path is a plain `store16` that was never sign-buggy. So the
+packing fix is **latent-correctness hardening of a dormant branch**, not what makes the shipped build
+audible. It is kept correct rather than left a trap — with the caveat now recorded in-code that reactivating
+bpf=8 also requires widening the ring-3 producer's frame capacity (still hardwired to the 16384-frame/bpf=4
+ring in `snd_write`/`snd_avail`) to `65536/bpf`, or the producer overruns the ring.
+
+### Reverted — the HDMI converter format to 16-bit, because 24-bit never had a basis
+
+1.55.17 moved the HDMI instance to `0x31`/24-bit to close "the last measured difference" against the BAR5
+known-good, while its own changelog admitted *"there is no evidence it is the cause."* **The two known-good
+captures disagree with each other**: the BAR5 dump mirrors `AZ_CONVERTER_FORMAT = 0x31`, but the codec-side
+dump — taken while the panel was **audibly playing** — records `format: S16_LE` and states plainly that
+*"the format agnos streams is the format that works — S16_LE / 2ch / 48000."*
+
+**Nothing on record establishes which capture reflects the audible run.** The change matched the mirror
+rather than the measured-audible stream, and brought the packing bug with it. Both instances stream 16-bit
+again. Instance 1 keeps amdgpu's tag 3 — a real measured match, and harmless (tags are per-link).
+
+This leaves a clean single-variable experiment: **16-bit + 1.55.17's bind-single fix.** Bind-single is the
+change with actual iron evidence behind it — it drove `tap1` from `0x000000` to `0x71539c` and the sink from
+dac 2/pin 3 to dac 4/pin 5 (the pair the sink's ELD names).
+
+### Fixed — three sites chose the stream format independently, and could disagree
+
+`hda_hdmi_bind_single` (which runs **last**, from `main.cyr` after `hda_stream_arm`) and `hda_codec_route`
+(which runs ~300 lines of boot **earlier**) both hardcoded `0x31`/tag 3, while `hda_stream_arm` programmed
+the controller's SDnFMT from per-instance state. `hda.cyr`'s own rule says *"controller SDnFMT + codec
+SET_STREAM_FMT must MATCH or the stream faults"* — but nothing enforced it, so a partial revert produced a
+real controller/codec mismatch. All three now read one idempotent source of truth (`hda_fmt_init`), called
+before use rather than depending on call order.
+
+### Fixed — the stream log reported a tag the hardware never had
+
+`hda: stream sd=0x80 tag=1` printed the legacy `hda_stream_tag` global instead of the per-instance tag it
+had just programmed. The HDMI instance really had bound tag **3** (`AZ_CHANNEL_STREAM_ID = 0x30` said so
+the whole time). A log that disagrees with the silicon costs a reader an hour.
+
+### Fixed — bind-single could re-mute the live converter on a shared-converter codec
+
+The review found `hda_hdmi_bind_single` reintroduced the exact `patch_hdmi.c` bug it was written to cure. It
+binds the live pin/converter at the encoder ordinal, then **unbinds every other digital pin by zeroing its
+converter's stream id** — and on a codec whose digital pins share a default converter, a higher-nid pin
+iterating *after* the bind would zero the **live** converter and re-mute it. It does not fire on this panel
+(distinct per-pin converters — which is why `tap1` saw samples), so it was latent, but unsound for precisely
+the shared-converter case the fix cites. The unbind is now guarded (`cvt != bound_cvt`); on this panel the
+guard changes nothing.
+
+### Fixed — a failed bind stranded the box on a dead digital sink
+
+If the encoder ordinal exceeds the codec's connected-digital-pin count, bind-single unbinds every pin, binds
+none, and returned to a caller that had already switched the live sink to the (now torn-down) HDMI instance
+— total silence, no diagnostic, no path back to the working analog jack. The sink-select now checks
+bind-single's result and **reverts to the analog instance on failure**. (4 endpoints / 4 pins on this iron,
+so this is a guard, not a live path.)
+
+### Fixed — a dead route hook that only looked like it steered the codec
+
+`hda_force_digi_ord = gpu_audio_dig` was assigned in `main.cyr` **after** both `hda_codec_route()` calls had
+already run ~300 lines earlier — a dead write; the route scorer never saw it. The ordinal is enforced solely
+by bind-single's own pin scan, so the assignment is removed and the comment corrected. Recorded alongside it:
+**endpoint-index == digital-pin-ordinal is an AMD single-display convention** (it holds on this panel), not a
+general HDA invariant — a multi-display or non-contiguous-digital-pin codec would need the pin chosen by
+per-pin ELD / monitor-present, not by positional ordinal.
+
+### Fixed — the CRC-probe comment still sent the reader downstream
+
+The display-audio CRC probe's interpretation comment routed a non-zero CRC to "codec/link/binding/FIFO all
+work, the fault is DOWNSTREAM (link/sink/panel)" — the exact wrong turn that cost the arc sixteen burns, now
+falsified by the amplitude-blind packing bug that lit the tap while the sink was mute. The comment now states
+the one rule — a non-zero CRC proves *traversal*, not correct amplitude — and sends the reader **upstream**
+to the PCM the ring actually contains, not only downstream to the link and sink.
+
+### Fixed — the receiver ran unserviced for the entire pre-`sti` boot window (the DHCP regression)
+
+**RX is unchanged since it was iron-proven at 1.51.7** (a real lease, `192.168.1.195`). What changed is the
+*boot*: `r8169_init_tx` raises `CR.TE|RE` near the top of `kernel_main`, but `sti` does not execute until
+~2,500 lines later. For that entire window the NIC DMAs LAN broadcast chatter into 64 descriptors with
+**nothing draining them** — because this driver's overflow recovery *is* the 100 Hz timer-tick whole-ring
+drain, and no timer runs with interrupts off. The ring fills, RDU/FOVW latch on a condition nothing
+relieves, and the receiver can dead-stall: one latched ROK posts a single MSI at `sti` (hence
+`RX MSI LIVE`), the drain pulls the stale frames, and **no new frame ever lands again**.
+
+The window grew across the GPU/display/audio arcs and DHCP degraded in step — **5/5 ACK at 1.55.14 → 0/3 by
+1.55.16**, a correlation already recorded in `gpu.cyr`'s CRC-probe timeout comment but never connected to
+the NIC. This is a boot-ordering regression that landed on the r8169, not a defect in it.
+
+`r8169_rx_restart()` is the remedy this driver's own 2026-07-01 adversarial review prescribed for exactly
+this case — *"if iron shows overflow dead-stall, the fix is a CR.RE off/on bounce in an FOVW branch"* —
+run once at `sti`: bounce `CR.RE`, re-arm the ring, resync the index, W1C the latched condition now that it
+is actually relieved. Discarding the pre-`sti` frames costs nothing; they arrived before the stack was
+listening.
+
+**The dead-stall mechanism is derived, not yet measured**, so the restart carries its own instrument: it
+reads `ISR` *before* the W1C and reports whether the ring overran. One burn confirms or refutes it.
+
+The review then caught that the restart as first written could **reintroduce the very stall it targets**: it
+reset `r8169_rx_idx = 0` and re-armed the whole ring **unconditionally**, on the unsourced assumption that an
+RE off/on bounce reloads the chip's descriptor pointer to slot 0. In the healthy/partial-fill case that
+assumption is untested, and a wrong `idx = 0` desyncs software from the hardware pointer. The restart is now
+**gated on the measured overrun** — `FOVW|RDU`, which are condition-latched and do *not* self-clear on the
+pre-`sti` ROK-MSI's W1C, so the read is trustworthy. Only the genuine dead-stall (ring full, chip write
+pointer already wrapped to slot 0, so `idx = 0` is correct) gets the whole-ring re-arm; a healthy ring is
+left to the normal drain, exactly as at 1.51.7.
+
+### Added — the chip's own counters on the ARP failure path
+
+`r8169_print_stats()` (RxMissed / rx_uc / rx_bc / rx_mc) was wired **only to the success branch**, behind
+`NET_VERBOSE`. It now always prints on the failure path, where it is exactly what a reader needs: `missed`
+separates *"the NIC never accepted a frame"* (filter/PHY/link) from *"the NIC accepted frames and the ring
+lost them"* (overflow).
+
+⚠ **`net: L2 RX SILENT -- 0 frames in ~5s` is a lying instrument** and is now commented as such: `rx_frames`
+counts only what `net_poll()` itself returned, while the timer ISR and the MSI handler drain the ring
+independently and demux correctly without ever touching that counter. The line means *"net_poll never won
+the race"*, not *"zero frames arrived"*. Read the silicon counters, not this line.
+
+### Method note
+
+Every fix here came from **comparing against the path that works** — the audible codec-side capture, the
+analog instance, the 1.51.7 network burn — not from deriving against amdgpu. The register-diff class was
+closed by measurement two cuts ago; the arc kept mining it anyway because the remaining diffs were the only
+thing left that looked like an answer.
+
+### Review — the seven-dimension adversarial audit
+
+This cut is the output of a 28-agent, find→verify review of the arc (packing root-cause · 16-bit revert
+consistency · bind-single · the r8169 regression · GPU-side AFMT/CRC semantics · analog-path regression
+safety · a claims-vs-code narrative audit). It **confirmed** the packing arithmetic (both the old-bug sign
+mangle and the `<<16` fix), the 16-bit revert's single-source-of-truth (`hda_fmt_init`), the bind-single
+format agreement with the controller SDnFMT, and — across a dedicated dimension — that **the iron-validated
+analog path (instance 0) cannot regress** from any change in this arc (`hda_fmt_init` is the sole writer of
+its format state; every `bpf==8` branch is dead; every `hda_active_ctl` mutation is pre-`sti`; bind-single is
+digital-only/instance-1-only). It **corrected** three overstated records: the "packing bug = root cause"
+headline (the fix is on a dead branch); the "51/57 registers + all-34-ordinals match" claim (that evidence is
+from the 24-bit burn — the reverted tree reads `CONVERTER_FORMAT = 0x11` by design); and the CRC-tap
+bisection framing (amplitude-blind, so `tap1` non-zero never proved real audio). It **closed** the four
+defects above. **No dimension found a fault in the live 16-bit path.** Every audible-outcome claim in this
+cut is derived, not measured — one iron burn (16-bit + bind-single, with the r8169 restart riding along)
+confirms or refutes it.
+
 ## [1.55.17] — 2026-07-15 — bind one pin, and match amdgpu's format
 
 Two fixes, both found by the operator asking the questions I should have asked twelve hours earlier:

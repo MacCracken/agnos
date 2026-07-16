@@ -977,9 +977,19 @@ if (gpu_hdmi_audio_on == 1) {
     #
     # By now the ordinal IS known: gpu_hdmi_audio_enable() found the live encoder and bound the AFMT to AZ
     # endpoint `gpu_audio_dig`, whose codec pin is that ordinal among the digital pins — the pair the sink's
-    # ELD names (0x05 / 0x04 on this panel). That is what hda_force_digi_ord was declared for and never set.
-    hda_force_digi_ord = gpu_audio_dig;
-    hda_hdmi_bind_single(gpu_audio_dig);
+    # ELD names (0x05 / 0x04 on this panel). bind-single enforces the ordinal via its own digital-pin scan;
+    # the old hda_force_digi_ord route-scorer hook is NOT the mechanism — it was assigned here, AFTER both
+    # hda_codec_route() calls had already run ~300 lines up, so the scorer never saw it. That dead write is
+    # removed. NOTE: endpoint-index == digital-pin-ordinal is an AMD single-display convention (holds on this
+    # panel: dac=4/pin=5), not a general HDA invariant — a multi-display or non-contiguous-digital-pin codec
+    # would need the pin chosen by per-pin ELD / monitor-present, not by positional ordinal.
+    if (hda_hdmi_bind_single(gpu_audio_dig) == 0) {
+        # No codec digital pin at the encoder's ordinal (fewer connected digital pins than DCN endpoints, or
+        # an ordinal shifted by an unconnected conn=1 pin). bind-single has already unbound the digital codec;
+        # revert the sink to the audible ANALOG instance rather than strand the box on a dead digital sink.
+        hda_active_ctl = 0;
+        kprintln("hda: hdmi bind found no pin -- sink reverted to analog", 54);
+    }
     # Report BEFORE the re-route, never after. This line is the only window onto the codec half, and putting
     # it behind the code it exists to diagnose is how a burn comes back saying nothing at all.
     kprint("hda: sink ctl=", 14); kprint_num(hda_active_ctl);
@@ -3072,6 +3082,12 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x0E; 0xE6; 0x71; }
 asm { sti; }
 kprintln("Interrupts enabled", 18);
 
+# The r8169's receiver has been live since r8169_init_tx ran near the top of this
+# function, with nothing draining it: its overflow recovery is the 100 Hz timer-tick
+# whole-ring drain, and the timer only starts here. Restart the engine now that the
+# drain it depends on can actually run. No-op when the r8169 is absent (QEMU: virtio).
+r8169_rx_restart();
+
 # === CMOS kernel checkpoint 15 (interrupts enabled — sti executed) ===
 # CP 15 reached but CP 16 not = scheduler activation faulted, or a flood
 # of interrupts post-sti is preventing forward progress.
@@ -4454,7 +4470,22 @@ if (vnet_active != 0 || nic_ready() != 0) {
             kprint_num(net_arp_replies_sent);
             kprintln(" -- gateway unicast reply pending", 33);
         } else {
+            # NOTE: rx_frames counts only what net_poll() itself returned here. The
+            # timer ISR and the MSI handler both run net_rx_drain() independently, and
+            # anything they drain is demuxed correctly but never counted by this loop.
+            # So this line means "net_poll never won the race", NOT "zero frames
+            # arrived". Read the silicon counters below, not this line.
             kprintln("net: L2 RX SILENT -- 0 frames in ~5s", 36);
+        }
+
+        # The chip's own tally counters — the only instrument on this path that is not
+        # our own bookkeeping read back to us. `missed` (RxMissed) counts FIFO-overflow
+        # drops, so it separates "the NIC never accepted a frame" (filter/PHY/link)
+        # from "the NIC accepted frames and the ring lost them" (overflow). The success
+        # branch above gates this behind NET_VERBOSE; on the failure path it is exactly
+        # what a reader needs, so it always prints.
+        if (r8169_present == 1) {
+            r8169_print_stats();
         }
     }
 }
