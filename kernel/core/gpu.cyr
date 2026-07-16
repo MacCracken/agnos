@@ -3589,6 +3589,32 @@ fn gpu_hdmi_audio_crc_probe(d) {
     return 1;
 }
 
+# gpu_hdmi_avmute_pulse — a fresh GCP AVMUTE SET->CLEAR edge issued WITH the codec feed already running.
+#
+# WHY THIS EXISTS. gpu_hdmi_audio_enable() clears AVMUTE (its unmute edge) at the END of the enable — but that
+# is BEFORE hda_hdmi_bind_single() and BEFORE hda_hdmi_feed_start(), i.e. while the AFMT FIFO is still EMPTY
+# and no PCM is moving. amdgpu unmutes in the opposite order: the audio stream is already live (trigger START
+# after prepare), THEN the AV path unmutes. Many sinks latch their audio receiver ON the AVMUTE SET->CLEAR
+# transition (the vc4_hdmi unmute-edge rule; the ADV7511/IT66121 reset-then-release pattern), and sample the
+# stream state at that instant — an unmute edge over an empty FIFO can leave the receiver disarmed even though
+# every register reads correct and samples start flowing a beat later. This re-issues the edge as the terminal
+# op, from main.cyr AFTER the feed is primed, so the sink sees the transition with real audio in the pipe.
+#
+# A brief (~one-frame) SET before the CLEAR is a momentary AV-mute — a quick black flash on the HDMI console,
+# already visually indistinguishable from the DIG down/up the enable does. Gated on gpu_hdmi_audio_on so it is
+# inert unless the HDMI audio path actually came up, and on gpu_audio_quiet so a sweep re-apply does not blink.
+fn gpu_hdmi_avmute_pulse() {
+    if (gpu_hdmi_audio_on == 0) { return 0; }
+    if (gpu_audio_quiet != 0) { return 0; }
+    var d = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, gc | GPU_HDMI_GC_AVMUTE);             # SET (mute)
+    gpu_udelay(48000);                                                                       # ~3 frames of samples flow into the muted sink
+    var gc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, gc2 & (0 - 1 - GPU_HDMI_GC_AVMUTE));  # CLEAR (unmute edge, audio present)
+    return 0;
+}
+
 # One CRC measurement at one tap. Returns 1 if it completed.
 fn gpu_hdmi_audio_crc_one(d, source) {
     # Disarm first: the counter is free-running once enabled, and re-arming a live one races its own DONE.

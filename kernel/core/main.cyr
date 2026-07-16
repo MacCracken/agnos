@@ -997,6 +997,12 @@ if (gpu_hdmi_audio_on == 1) {
     # Only when HDMI actually bound (hda_active_ctl still 1); on the analog-revert path the HDMI feed stays off.
     if (hda_active_ctl == 1) {
         hda_hdmi_feed_start();
+        # UNMUTE-WITH-AUDIO edge (2026-07-16). The enable cleared AVMUTE on an EMPTY FIFO, before this feed
+        # started; a sink that latches its audio receiver on the AVMUTE SET->CLEAR transition can miss it when
+        # no PCM is moving at that instant. Prime the pipe, then re-issue the edge with the stream actually
+        # live — amdgpu's trigger(START)-then-unmute ordering. See gpu_hdmi_avmute_pulse().
+        gpu_udelay(40000);            # let the feed prime the FIFO with real samples before the unmute edge
+        gpu_hdmi_avmute_pulse();
         #ifdef HDMI_AUDIO_DUMP
         # Re-measure with the feed ACTUALLY RUNNING. The crc probe inside gpu_hdmi_audio_enable ran while the
         # feed was stopped (drain-before-feed), so it correctly saw no samples. Now the codec is streaming into
