@@ -49,7 +49,17 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_HDMI_DUMP:-}" ]; then
+if [ -n "${BURN_HDMI_SWEEP:-}" ]; then
+    # THE MATRIX BURN. The register-value class is exhausted (every DCN reg matches amdgpu, still silent),
+    # so stop testing one hypothesis per reflash. This kernel, post-sti with the HDA tone already streaming
+    # to the HDMI sink, cycles gpu_hdmi_audio_profile(0..N): each applies a candidate structural/sequencing/
+    # clock fix to the LIVE encoder, prints "hdmi-sweep: profile N = <name>", and holds ~3s. The operator
+    # WATCHES serial + LISTENS — one boot tests the whole matrix. Adds HDMI_AUDIO_DUMP so the register state
+    # of the LAST-applied profile is on record. PASS IS STILL THE OPERATOR'S EARS.
+    echo "[2/2] Building the HDMI-audio MATRIX kernel (HDA_HDMI + HDA_TONE + HDMI_AUDIO_SWEEP + HDMI_AUDIO_DUMP: cycle every candidate fix in one boot; watch serial + listen for which profile makes sound)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_AUDIO_SWEEP=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_AUDIO_SWEEP+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_DUMP:-}" ]; then
     # THE MEASUREMENT BURN. Use this one for the display-audio arc until the silence is explained.
     #
     # Adds HDMI_AUDIO_DUMP on top of BURN_HDMI: reads the whole display-audio block back AFTER every write
@@ -121,6 +131,7 @@ verify_marker() {
 case "$BUILD_TAG" in *HDA_HDMI*)         verify_marker "ctl1 probing 2nd controller" ;; esac
 case "$BUILD_TAG" in *HDA_TONE*)         verify_marker "sweep streaming" ;; esac
 case "$BUILD_TAG" in *HDMI_AUDIO_DUMP*)  verify_marker "== agnos display-audio dump ==" ;; esac
+case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; esac
 
 SZ="$(stat -c %s build/agnos 2>/dev/null)"
 MT="$(stat -c %y build/agnos 2>/dev/null | cut -d. -f1)"

@@ -3088,6 +3088,34 @@ kprintln("Interrupts enabled", 18);
 # drain it depends on can actually run. No-op when the r8169 is absent (QEMU: virtio).
 r8169_rx_restart();
 
+#ifdef HDMI_AUDIO_SWEEP
+# In-boot HDMI-audio FIX-PROFILE sweep. The register-value class is exhausted (every DCN register matches
+# amdgpu, still silent, FIFO overflowing), so cycle a matrix of candidate structural/sequencing/clock fixes
+# in ONE boot instead of one-per-reflash. Runs here, post-sti, so the 100 Hz timer keeps refilling the HDA
+# tone that streams to the HDMI sink while each profile re-applies the baseline + one delta on the live
+# encoder. The operator WATCHES this log and LISTENS: the profile named when sound appears is the fix.
+if (gpu_hdmi_audio_on == 1) {
+    kprintln("hdmi-sweep: cycling HDMI-audio fix profiles -- watch + LISTEN", 61);
+    var hs_cnt = gpu_hdmi_audio_profile(0 - 1);
+    var hs_pass = 0;
+    while (hs_pass < 2) {
+        kprint("hdmi-sweep: pass ", 17); kprint_num(hs_pass + 1); kprintln(" of 2", 5);
+        var hs_n = 0;
+        while (hs_n < hs_cnt) {
+            gpu_hdmi_audio_profile(hs_n);
+            var hs_t0 = timer_ticks;
+            while ((timer_ticks - hs_t0) < 300) { arch_wait(); }   # hold ~3s to listen (100 Hz tick)
+            hs_n = hs_n + 1;
+        }
+        hs_pass = hs_pass + 1;
+    }
+    gpu_hdmi_audio_profile(0);   # leave the console on the clean baseline
+    kprintln("hdmi-sweep: done -- note the profile number that made sound", 59);
+} else {
+    kprintln("hdmi-sweep: no HDMI audio path -- skipping sweep", 48);
+}
+#endif
+
 # === CMOS kernel checkpoint 15 (interrupts enabled — sti executed) ===
 # CP 15 reached but CP 16 not = scheduler activation faulted, or a flood
 # of interrupts post-sti is preventing forward progress.

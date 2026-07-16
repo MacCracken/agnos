@@ -5,6 +5,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — `HDMI_AUDIO_SWEEP`: an in-boot fix-profile matrix (stop debugging one hypothesis per reflash)
+
+With the register-value class exhausted, the bottleneck is that each idea costs a full reflash. This flag
+(`burn-prep.sh BURN_HDMI_SWEEP`, on top of `HDA_HDMI + HDA_TONE + HDMI_AUDIO_DUMP`) turns one boot into a
+whole matrix: post-`sti`, with the HDA tone already streaming to the HDMI sink, `gpu_hdmi_audio_profile(n)`
+re-establishes the 1.55.18 baseline (a quiet `gpu_hdmi_audio_enable`) then applies ONE candidate fix to the
+live encoder, prints `hdmi-sweep: profile N = <name>`, and reports the built-in oracle (ACK the FIFO
+overflow, re-read `AFMT_STATUS` bit24 — re-arming = still not draining). 14 profiles across the classes a
+28-agent design pass surfaced — FIFO-reset edges (`AZ` audio-enable off/on, the `RESET_FIFO_WHEN_AUDIO_DIS`
+edge amdgpu produces and agnos never did), software-CTS ACR (the live DVI→HDMI flip may leave HW-measured
+CTS stale), packet scheduling (`PACKETS_PER_LINE`/`SEND_MAX`), audio-clock/DTO re-lock, packet-generator
+re-arm, InfoFrame CONT, and a `DIG_MODE` 3→2→3 bounce — cycled twice so the operator can catch it by ear.
+All profiles are safe or console-recoverable. The operator watches the log and listens; the profile named
+when sound appears is the fix.
+
+### Fixed — `HDMI_DB_CONTROL` now matches amdgpu; and the register-value hypothesis class is EXHAUSTED
+
+The 1.55.18 (HDA_HDMI) burn ran the full 16-bit + bind-single path on iron: `AZ_CONVERTER_FORMAT 11`,
+**both CRC taps carry content** (`tap0`/`tap1` non-zero — no longer silence), endpoint fully enabled,
+`AZ_LPIB` advancing — and still no audible sound. A register-by-register diff of the live-`DIG1` dump against
+`dcn-audio-live-amdgpu-known-good` (captured while amdgpu was **audibly** playing this link) left exactly one
+unexplained **control** difference: `HDMI_DB_CONTROL` — agnos `0x00010010` (the GOP's DVI value, never written
+by agnos) vs amdgpu `0x00001000`. agnos now writes amdgpu's exact `0x1000`.
+
+**The follow-up burn confirmed the write took (`HDMI_DB_CONTROL 1000`) and did NOT restore sound: the FIFO
+still overflows (`AFMT_STATUS 41000010`).** That is the important result. **Every DCN register agnos programs
+now equals the audibly-working amdgpu path byte-for-byte** (the only remaining diffs are the deliberate
+RGB-vs-YCbCr AVI `GENERIC_0` and the `AFMT_STATUS` bit24 overflow *symptom* itself) — **and it is still silent.
+This exhausts the entire "wrong register value" hypothesis class the arc spent ~18 burns on.** The samples
+reach and traverse the AFMT (both CRC taps), but the HDMI data-island packetizer does not drain them to the
+sink, and no register in this block that agnos can set changes that. The remaining difference is *structural*,
+below the DCN register file: agnos flips `DIG_MODE` live on the link the UEFI GOP brought up as **DVI**, while
+amdgpu brings the HDMI link/PHY up **cold** (ATOM `DIGxEncoderControl`, `SIGNAL_TYPE_HDMI`). The `HDMI_DB_CONTROL`
+write is kept — it makes agnos match the known-good on that register — but it is a correctness match, not the
+fix. Next frontier is the PHY/link bring-up (or the codec-feed↔AFMT-drain audio-clock coherence behind the
+persistent overflow), both larger and higher-risk than a register poke, and the encoder carries the only
+console — an operator-gated decision.
+
 ## [1.55.18] — 2026-07-15 — audit the audio arc: the packing bug lived on the 24-bit path we reverted
 
 A seven-dimension adversarial review of the whole HDMI/HDA audio arc (28 agents, find → verify) drove this

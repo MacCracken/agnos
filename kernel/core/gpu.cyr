@@ -59,6 +59,9 @@ var gpu_scanout_pid   = 0 - 1; # pid owning the scanout (-1 = the console owns i
 # P3a display-audio discovery (read-only probe results)
 var gpu_audio_dp      = 0 - 1; # 1 = the lit stream is DP (DTO1, constant module); 0 = HDMI (DTO0, pixel-clock module); -1 = unknown
 var gpu_audio_dig     = 0 - 1; # the live stream encoder (DIG) carrying the lit stream
+# HDMI_AUDIO_SWEEP: when 1, gpu_hdmi_audio_enable() suppresses its status prints + the CRC probe so the
+# sweep harness can re-run it as a quiet baseline reset between fix-profiles. 0 = normal verbose boot enable.
+var gpu_audio_quiet   = 0;
 # P3b: the live pixel clock in 100 Hz units — THE value the HDMI audio DTO's MODULE field takes (and what the
 # ACR CTS is computed from). 0 = not derived (then P3b must not program the DTO). Derived, not read: the
 # DCCG's DP_DTO_PHASE register only holds the pixel clock on a DP-driven pipe, and this link is HDMI.
@@ -3037,9 +3040,11 @@ fn gpu_hdmi_audio_enable() {
     # CLOCK_ON_STATE is a READ-ONLY status, so unlike AUDIO_ENABLED it cannot echo our own write: 1 means the
     # audio wall clock genuinely reached the endpoint.
     var hpc2 = gpu_reg32(GPU_BASE_DCN_2, dr);
-    kprint("gpu: hdmi endpoint clock ", 25);
-    if ((hpc2 & GPU_AZ_CLOCK_ON_STATE) != 0) { kprint("on", 2); } else { kprint("OFF", 3); }
-    kprint(" (hotplug ", 10); kprint_hex(hpc2); kprintln(")", 1);
+    if (gpu_audio_quiet == 0) {
+        kprint("gpu: hdmi endpoint clock ", 25);
+        if ((hpc2 & GPU_AZ_CLOCK_ON_STATE) != 0) { kprint("on", 2); } else { kprint("OFF", 3); }
+        kprint(" (hotplug ", 10); kprint_hex(hpc2); kprintln(")", 1);
+    }
     gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc2 & (0 - 1 - GPU_AZ_CLOCK_GATING_DISABLE));
 
     # THE PME WORKAROUND — wake the Azalia block out of D3. This goes exactly where amdgpu puts it:
@@ -3066,6 +3071,19 @@ fn gpu_hdmi_audio_enable() {
     if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d) & GPU_AFMT_AUDIO_CLOCK_ON) == 0) {
         kprintln("gpu: hdmi audio clock ack did not arrive", 40);
     }
+
+    # HDMI_DB_CONTROL — the LAST unexplained CONTROL-register difference on the 16-bit path. Measured against
+    # amdgpu audibly playing on this exact link (dcn-audio-live-amdgpu-known-good, DIG1): amdgpu = 0x00001000,
+    # agnos = 0x00010010 — the GOP's DVI-bring-up value, because agnos never wrote this register at all.
+    # It governs the HDMI DATA-ISLAND packet buffer, and agnos's AFMT audio FIFO is OVERFLOWING (AFMT_STATUS
+    # bit24 SET on agnos, CLEAR on amdgpu even after the ack below): the signature of audio samples that enter
+    # the FIFO but never drain into HDMI audio sample packets. A live DIG_MODE flip (what agnos does) never
+    # triggers the buffer swap a full modeset would, so a stale GOP data-island buffer config is a coherent
+    # cause for "every register reads back correct yet the sink is silent". Write amdgpu's exact value —
+    # absolute, not RMW, to also clear the GOP's bit4/bit16 that the working path does not set.
+    # HYPOTHESIS, not diagnosis: the mechanism is unproven, but it is safe (a packet-buffer control, not the
+    # scanout) and reversible, and it is the one register on the working path agnos has never touched.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_DB_CONTROL + d, GPU_HDMI_DB_CONTROL_VAL);
 
     # THE AVI INFOFRAME — generic packet slot 0. This must follow the AFMT clock write above:
     # enc1_update_generic_info_packet opens by turning the audio clock on, under "we need turn on clock
@@ -3205,13 +3223,17 @@ fn gpu_hdmi_audio_enable() {
     # setup artifact and the overflow is not the fault. Ack is bit 23 of AFMT_AUDIO_PACKET_CONTROL.
     var ao = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, ao | GPU_AFMT_FIFO_OVERFLOW_ACK);
-    if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + d) & GPU_AFMT_FIFO_OVERFLOW) != 0) {
-        kprintln("gpu: hdmi audio fifo overflowing", 32);
+    if (gpu_audio_quiet == 0) {
+        if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + d) & GPU_AFMT_FIFO_OVERFLOW) != 0) {
+            kprintln("gpu: hdmi audio fifo overflowing", 32);
+        }
     }
 
     gpu_hdmi_audio_on = 1;
-    kprint("gpu: hdmi audio online (endpoint ", 33); kprint_num(az);
-    kprint(" on dig ", 8); kprint_num(gpu_audio_dig); kprintln(")", 1);
+    if (gpu_audio_quiet == 0) {
+        kprint("gpu: hdmi audio online (endpoint ", 33); kprint_num(az);
+        kprint(" on dig ", 8); kprint_num(gpu_audio_dig); kprintln(")", 1);
+    }
 
     # The only unexplained causal difference the known-good capture found. 30 registers compared against
     # amdgpu audibly playing on this silicon: 26 identical, two deliberate/benign, one the overflow symptom
@@ -3223,18 +3245,180 @@ fn gpu_hdmi_audio_enable() {
 
     # THE ONE QUESTION EVERY LINE ABOVE BEGS. Everything printed so far is an echo of a write: the endpoint
     # says it is enabled because we enabled it. This asks the hardware something it has to answer for itself.
-    gpu_hdmi_audio_crc_probe(d);
-
-    # HDMI_STATUS is READ-ONLY and cannot echo anything we wrote. Two bits, two answers this arc has only
-    # ever inferred: is the packet engine rejecting our audio, and is the sink being told to mute.
-    var hs = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_STATUS + d);
-    if ((hs & GPU_HDMI_AUDIO_PACKET_ERROR) != 0) {
-        kprintln("gpu: hdmi encoder reports an audio packet error", 47);
-    }
-    if ((hs & GPU_HDMI_ACTIVE_AVMUTE) != 0) {
-        kprintln("gpu: hdmi link is muted (AVMUTE active on the wire)", 51);
+    # Skipped on a quiet sweep re-apply — the ~120 ms two-tap probe would dominate the harness's cadence.
+    if (gpu_audio_quiet == 0) {
+        gpu_hdmi_audio_crc_probe(d);
+        # HDMI_STATUS is READ-ONLY and cannot echo anything we wrote. Two bits, two answers this arc has only
+        # ever inferred: is the packet engine rejecting our audio, and is the sink being told to mute.
+        var hs = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_STATUS + d);
+        if ((hs & GPU_HDMI_AUDIO_PACKET_ERROR) != 0) {
+            kprintln("gpu: hdmi encoder reports an audio packet error", 47);
+        }
+        if ((hs & GPU_HDMI_ACTIVE_AVMUTE) != 0) {
+            kprintln("gpu: hdmi link is muted (AVMUTE active on the wire)", 51);
+        }
     }
     return 1;
+}
+
+# === HDMI_AUDIO_SWEEP — in-boot fix-profile matrix ==========================================
+# The register-value class is exhausted (every DCN register matches amdgpu, still silent, FIFO overflowing),
+# so instead of one hypothesis per reflash this cycles a matrix of candidate STRUCTURAL/SEQUENCING/CLOCK
+# fixes in a single boot. Each profile re-establishes the 1.55.18 baseline (a quiet gpu_hdmi_audio_enable),
+# then applies ONE delta to the live encoder while the HDA tone streams to the HDMI sink, then ACKs the FIFO
+# overflow and reads AFMT_STATUS bit24 back — the built-in oracle: bit24 re-arming = still not draining.
+# The operator watches this log and LISTENS; the profile whose name is on screen when sound appears is it.
+# gpu_hdmi_audio_profile(-1) returns the profile count. All profiles are safe or console-recoverable.
+var GPU_HDMI_SWEEP_COUNT = 14;
+fn gpu_hdmi_audio_profile(n) {
+    if (n < 0) { return GPU_HDMI_SWEEP_COUNT; }
+    # 1. Reset to the shipped 1.55.18 baseline, quietly, so each profile is an independent single-variable test.
+    gpu_audio_quiet = 1;
+    gpu_hdmi_audio_enable();
+    gpu_audio_quiet = 0;
+    var d  = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    var az = gpu_audio_dig;
+    var ir = GPU_R_AZ_ENDPOINT_INDEX + az * GPU_DCN_AZ_STRIDE;
+    var dr = GPU_R_AZ_ENDPOINT_DATA  + az * GPU_DCN_AZ_STRIDE;
+    # Cyrius `var` is function-scoped, so scratch registers reused across the mutually-exclusive branches
+    # below are declared once here and assigned (not re-declared) per profile.
+    var v = 0; var c = 0; var c2 = 0; var r = 0; var h0 = 0; var ic = 0; var ap = 0; var hap = 0;
+
+    kprint("hdmi-sweep: profile ", 20); kprint_num(n); kprint(" = ", 3);
+
+    # 2. Apply the delta for profile n.
+    if (n == 0) {
+        kprintln("baseline (no delta)", 19);
+    } elif (n == 1) {
+        # E1 — fire the RESET_FIFO_WHEN_AUDIO_DIS edge amdgpu gets from az_disable->az_enable and agnos never does.
+        kprintln("E1 AZ audio-enable off-on", 25);
+        v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, v & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+        gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+        var hpc = gpu_reg32(GPU_BASE_DCN_2, dr);
+        gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc & (0 - 1 - GPU_AZ_AUDIO_ENABLED));
+        gpu_udelay(2000);
+        gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+        var hpc2 = gpu_reg32(GPU_BASE_DCN_2, dr);
+        gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc2 | GPU_AZ_AUDIO_ENABLED);
+        gpu_udelay(2000);
+        c = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, c | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+    } elif (n == 2) {
+        # E3 — re-latch the AFMT audio clock (agnos raised it DURING the live DIG flip; re-latch a clean one).
+        kprintln("E3 AFMT audio-clock off-on", 26);
+        v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, v & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+        c = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d, c & (0 - 1 - GPU_AFMT_AUDIO_CLOCK_EN));
+        gpu_udelay(1000);
+        c2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d, c2 | GPU_AFMT_AUDIO_CLOCK_EN);
+        r = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, r | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+    } elif (n == 3) {
+        # E4 — open SAMPLE_SEND strictly LAST, after CS latches and the packet stream settles (agnos fuses them).
+        kprintln("E4 sample-send opened last", 26);
+        v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, v & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+        c = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, c | GPU_AFMT_60958_CS_UPDATE);
+        gpu_udelay(2000);
+        var s = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, s | GPU_AFMT_AUDIO_SAMPLE_SEND);
+    } elif (n == 4) {
+        # A — close, reset, re-open the sample tap so the packetizer re-syncs from an empty FIFO.
+        kprintln("A relatch AFMT sample tap", 25);
+        v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, v & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+        gpu_udelay(1000);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, v | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+    } elif (n == 5) {
+        # A — pulse the AVI + Audio-InfoFrame SEND enables off then on (stale DVI-context latch hypothesis).
+        kprintln("A rearm data-island packets", 27);
+        var g0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d, g0 & (0 - 1 - GPU_HDMI_GENERIC0_SEND) & (0 - 1 - GPU_HDMI_GENERIC0_CONT));
+        h0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d, h0 & (0 - 1 - GPU_HDMI_AUDIO_INFO_SEND));
+        gpu_udelay(1000);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d, g0 | GPU_HDMI_GENERIC0_SEND | GPU_HDMI_GENERIC0_CONT);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d, h0 | GPU_HDMI_AUDIO_INFO_SEND);
+        ic = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ic | GPU_AFMT_AUDIO_INFO_UPDATE);
+    } elif (n == 6) {
+        # F1 — HW-measured CTS may be stale after the live DVI->HDMI flip; force software CTS = amdgpu's 241500.
+        kprintln("F1 software CTS 241500", 22);
+        ap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d, (ap & (0 - 1 - GPU_HDMI_ACR_SELECT_MASK)) | GPU_HDMI_ACR_SOURCE | GPU_HDMI_ACR_AUTO_SEND);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d, GPU_HDMI_ACR_CTS_48_VAL);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d, GPU_HDMI_ACR_CTS_48_VAL);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d, GPU_HDMI_ACR_CTS_48_VAL);
+    } elif (n == 7) {
+        # F3 — software CTS AND explicit continuous ACR send (bypass AUTO_SEND's modeset-timing dependence).
+        kprintln("F3 software CTS + manual send", 29);
+        ap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d, (ap & (0 - 1 - GPU_HDMI_ACR_AUTO_SEND) & (0 - 1 - GPU_HDMI_ACR_SELECT_MASK)) | GPU_HDMI_ACR_SOURCE | GPU_HDMI_ACR_SEND | GPU_HDMI_ACR_CONT);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d, GPU_HDMI_ACR_CTS_48_VAL);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d, GPU_HDMI_ACR_CTS_48_VAL);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d, GPU_HDMI_ACR_CTS_48_VAL);
+    } elif (n == 8) {
+        # D1 — PACKETS_PER_LINE=0 may mean "schedule zero" not "auto"; force the DCE-computed count (3 here).
+        kprintln("D1 packets-per-line explicit", 28);
+        hap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d, (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK) & (0 - 1 - 0x1F0000)) | GPU_HDMI_AUDIO_DELAY_SET | 0x30000);
+    } elif (n == 9) {
+        # D2 — force SEND_MAX_PACKETS so the packetizer packs the line instead of throttling to zero.
+        kprintln("D2 send-max-packets", 19);
+        hap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d, (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK)) | GPU_HDMI_AUDIO_DELAY_SET | 0x100);
+    } elif (n == 10) {
+        # D4 — pin stereo layout-0; the packetizer may be auto-deriving 8ch and stalling on channels 3-8.
+        kprintln("D4 audio-layout-0 override", 26);
+        var pc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d, (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK) & (0 - 1 - 0x2) & (0 - 1 - GPU_AFMT_60958_OSF_OVRD)) | GPU_AFMT_CHANNEL_ENABLE_STEREO | GPU_AFMT_AUDIO_LAYOUT_OVRD);
+    } elif (n == 11) {
+        # C — re-latch the audio DTO to source 0 with amdgpu's exact MODULE, then re-cycle the AFMT clock so
+        #     the codec feed and the AFMT drain lock to ONE wall clock (the live flip may have stale-locked it).
+        kprintln("C DTO source0 + clock relatch", 29);
+        gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO_SRC, 0);
+        gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE, 0x24d998);
+        gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_PHASE, 0x3a980);
+        c = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d, c & (0 - 1 - GPU_AFMT_AUDIO_CLOCK_EN));
+        gpu_udelay(1000);
+        c2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d, c2 | GPU_AFMT_AUDIO_CLOCK_EN);
+        r = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, r | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+    } elif (n == 12) {
+        # A — a live-flipped link may drop the one-shot Audio InfoFrame before the sink locks; force CONT.
+        kprintln("A audio-infoframe CONT", 22);
+        h0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d, h0 | GPU_HDMI_AUDIO_INFO_SEND | GPU_HDMI_AUDIO_INFO_CONT);
+        ic = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ic | GPU_AFMT_AUDIO_INFO_UPDATE);
+    } else {
+        # A — re-ENTER HDMI mode (3->2->3) to re-run the back-end HDMI packet latch. Brief screen flicker at
+        #     the DVI dip is expected (mode 2 is a lit state; the RMW preserves FE_SOURCE_SELECT so it recovers).
+        kprintln("A dig-mode bounce 3-2-3", 23);
+        var be = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, (be & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_DVI << GPU_DIG_MODE_SHIFT));
+        gpu_udelay(2000);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, (be & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT));
+        v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, v | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+    }
+
+    # 3. The built-in oracle: clear the sticky overflow, let it re-arm (or not), read AFMT_STATUS bit24.
+    var oa = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, oa | GPU_AFMT_FIFO_OVERFLOW_ACK);
+    gpu_udelay(150000);
+    if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_STATUS + d) & GPU_AFMT_FIFO_OVERFLOW) != 0) {
+        kprintln("  drain: STILL OVERFLOWING (bit24 set)", 38);
+    } else {
+        kprintln("  drain: OK -- bit24 CLEAR (listen now)", 39);
+    }
+    return 0;
 }
 
 # Measure whether audio samples PHYSICALLY traverse this encoder, by checksumming them in hardware.

@@ -403,6 +403,10 @@ var GPU_HDMI_ERROR_INT           = 0x8000000;   # bit27
 var GPU_R_HDMI_ACR_STATUS_0      = 0x209C;
 var GPU_R_HDMI_ACR_STATUS_1      = 0x209D;
 var GPU_R_HDMI_DB_CONTROL        = 0x2088;
+# amdgpu programs DIG1_HDMI_DB_CONTROL = 0x00001000 on the audibly-working link (known-good capture);
+# agnos never wrote this register, leaving the GOP's DVI value 0x00010010. The HDMI data-island packet
+# buffer control — the last unexplained CONTROL-register diff on the 16-bit audio path.
+var GPU_HDMI_DB_CONTROL_VAL      = 0x1000;
 var GPU_AFMT_AUDIO_CRC_EN        = 0x1;
 var GPU_AFMT_AUDIO_CRC_CONT      = 0x10;
 var GPU_AFMT_AUDIO_CRC_DONE      = 0x1;
@@ -414,6 +418,17 @@ var GPU_AFMT_AUDIO_CRC_COUNT_SHIFT = 16;
 var GPU_AFMT_AUDIO_CRC_SAMPLES   = 2048;
 var GPU_AFMT_AUDIO_LAYOUT_OVRD = 0x1;        # AFMT_AUDIO_PACKET_CONTROL2 bit0 — known-good = 0
 var GPU_AFMT_60958_OSF_OVRD    = 0x10000000; # AFMT_AUDIO_PACKET_CONTROL2 bit28 — known-good = 0
+
+# --- HDMI_AUDIO_SWEEP harness: extra field constants the fix-profile matrix perturbs ---
+var GPU_HDMI_AUDIO_INFO_CONT   = 0x20;    # HDMI_INFOFRAME_CONTROL0 bit5 — AIF continuous re-send
+var GPU_HDMI_ACR_SEND          = 0x1;     # HDMI_ACR_PACKET_CONTROL bit0 — manual ACR send
+var GPU_HDMI_ACR_CONT          = 0x2;     # HDMI_ACR_PACKET_CONTROL bit1 — manual ACR continuous
+var GPU_R_HDMI_ACR_44_0        = 0x2098;  # HDMI_ACR_CTS_44 [31:12] (48_0=0x209A, -2 dwords)
+var GPU_R_HDMI_ACR_32_0        = 0x2096;  # HDMI_ACR_CTS_32 [31:12]
+var GPU_HDMI_ACR_CTS_48_VAL    = 0x3AF5C000;  # amdgpu's measured CTS 241500 << 12 (48/44/32 identical on this link)
+var GPU_AFMT_RESET_FIFO_WHEN_AUDIO_DIS = 0x800;  # AFMT_AUDIO_PACKET_CONTROL bit11 — FIFO resets on audio-disable edge
+var GPU_DIG_START              = 0x400;   # DIG_FE_CNTL bit10 — FE start edge (known-good = 0)
+var GPU_DIG_SYMCLK_BE_ON       = 0x100;   # DIG_BE_EN_CNTL bit8 — back-end symbol clock on (RO ack)
 var GPU_AFMT_AUDIO_SRC_SELECT_MASK = 0x7;  # must be 0..3 on Renoir — only 4 endpoints exist
 var GPU_AFMT_60958_CS_UPDATE   = 0x4000000;
 var GPU_AFMT_AUDIO_SAMPLE_SEND = 0x1;      # the LAST write — opens the tap

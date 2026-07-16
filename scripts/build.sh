@@ -270,6 +270,12 @@ else
         # therefore gated OUT of every normal build per the kernel-log rule (plain driver
         # statements, never hex). Capture with: run /bin/klug > dump.txt
         [ -n "$HDMI_AUDIO_DUMP" ]    && echo '#define HDMI_AUDIO_DUMP'
+        # HDMI_AUDIO_SWEEP=1 — in-boot HDMI-audio FIX-PROFILE sweep. Post-sti, with the HDA tone
+        # already streaming to the HDMI sink, cycle gpu_hdmi_audio_profile(0..N) — each applies a
+        # candidate structural/sequencing/clock fix to the live encoder, prints its name, and holds
+        # ~3s. The operator watches serial + LISTENS: one boot tests the whole hypothesis matrix
+        # instead of one-per-reflash. Requires HDA_HDMI + HDA_TONE (the streaming tone + HDMI sink).
+        [ -n "$HDMI_AUDIO_SWEEP" ]   && echo '#define HDMI_AUDIO_SWEEP'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include
