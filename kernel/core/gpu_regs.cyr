@@ -368,19 +368,29 @@ var GPU_AFMT_FIFO_OVERFLOW_ACK = 0x800000;   # AFMT_AUDIO_PACKET_CONTROL bit23 �
 # exactly what the LPIB ordinal (0x65) could not offer — amdgpu reads it NOWHERE in the entire amd tree,
 # it sits mid-snapshot-triplet (0x64 lock / 0x65 value / 0x66 timer), and a static read would have been
 # unreadable. Rejected for this reason; do not re-propose it without arming 0x64 first.
-# THE RAMP BLOCK — the last DIG registers agnos has never read, and the only ones that are an ATTENUATOR.
+# THE RAMP BLOCK — the only registers in the DIG audio path that are an ATTENUATOR.
 # The perturbation test (2026-07-15) forced all six MEASURED agnos-vs-amdgpu differences onto the audibly
 # working amdgpu path and NONE killed the tone — so "agnos has a wrong register value" is closed for every
-# value we had measured. But these five were in no diff at all, because neither side ever read them.
-# A ramp parked at zero attenuates real content to EXACTLY zero — agnos's signature (content at CRC tap 0,
-# zero at tap 1) — and would appear in no comparison. An audit refuted this block BY ARGUMENT ("gated by
-# AFMT_AUDIO_TEST_EN, which reads 0 on both paths"); that is an inference from a field name, and inference
-# is exactly what the perturbation test just discredited. Read it.
+# value we had measured. But these were in no diff at all, because neither side ever read them.
+# A ramp parked at zero attenuates real content to EXACTLY zero. An audit refuted this block BY ARGUMENT
+# ("gated by AFMT_AUDIO_TEST_EN, which reads 0 on both paths"); that is an inference from a field name, and
+# inference is exactly what the perturbation test discredited. So the 1.55.19 dump READ them:
+# **agnos = 0/0/0/0 on all four** (audio_re_4/audio_re_5, 2026-07-16) — never programmed, GOP never touched
+# them. No amdgpu-side capture of these registers exists (the known-good corpus predates the dump rows), so
+# the known-good values come from PRIOR ART instead: radeon's MMIO HDMI-audio lineage — r600_hdmi.c
+# r600_hdmi_update_audio_settings() and evergreen_hdmi.c/dce6_afmt evergreen_hdmi_update_audio_settings() —
+# programs this exact block on EVERY audio enable: 0x00FFFFFF / 0x007FFFFF / 1 / 1 (max/min/inc/dec).
+# The corroborating iron fact (audio_re_5 burn): the SINK'S AMP IS ARMED — the operator hears the monitor
+# speakers "release" (a soft pop) at machine shutdown — so the stream is accepted and DRIVEN end-to-end,
+# and what it carries decodes as silence. That is the exact signature of a zeroed output attenuator.
 # Offsets confirmed against Linux v6.6 dcn_2_1_0_offset.h (mmDIG0_AFMT_RAMP_CONTROL0 = 0x20a3).
 var GPU_R_AFMT_RAMP_CONTROL0 = 0x20A3;  # RAMP_MAX_COUNT[23:0] · RAMP_DATA_SIGN[31]
 var GPU_R_AFMT_RAMP_CONTROL1 = 0x20A4;  # RAMP_MIN_COUNT[23:0] · AFMT_AUDIO_TEST_CH_DISABLE[31:24]
 var GPU_R_AFMT_RAMP_CONTROL2 = 0x20A5;  # RAMP_INC_COUNT[23:0]
 var GPU_R_AFMT_RAMP_CONTROL3 = 0x20A6;  # RAMP_DEC_COUNT[23:0]
+var GPU_AFMT_RAMP_MAX_VAL = 0xFFFFFF;   # radeon r600/evergreen: full-scale ramp ceiling
+var GPU_AFMT_RAMP_MIN_VAL = 0x7FFFFF;   # radeon r600/evergreen: ramp floor ([31:24]=0 -> no TEST_CH_DISABLE)
+var GPU_AFMT_RAMP_STEP_VAL = 0x1;       # radeon r600/evergreen: inc/dec step
 var GPU_R_AFMT_INTERRUPT_STATUS = 0x2079;
 var GPU_R_AFMT_AUDIO_CRC_CONTROL = 0x20A2;  # CRC_EN b0 · CRC_CONT b4 · CRC_SOURCE b8 · CH_SEL [15:12] · COUNT [31:16]
 var GPU_R_AFMT_AUDIO_CRC_RESULT  = 0x20A8;  # CRC_DONE b0 (RO) · CRC [31:8] (RO)

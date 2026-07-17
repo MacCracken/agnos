@@ -3224,6 +3224,20 @@ fn gpu_hdmi_audio_enable() {
     var ifc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ifc | GPU_AFMT_AUDIO_INFO_UPDATE);
 
+    # THE RAMP ENVELOPE — the output-stage sample attenuator, and the one block in this path agnos had never
+    # programmed. All four read 0 on agnos (audio_re_4/5 dumps): a ramp ceiling of ZERO scales every sample
+    # to exactly zero, so the wire carries a fully valid audio stream OF SILENCE — the sink accepts it, arms
+    # its amp (iron-corroborated: the operator hears the monitor speakers release at shutdown), and plays
+    # nothing, while the CRC taps upstream of the output stage read real content. Never caught by register
+    # diffing because NO capture (either side) ever included these rows. Values are radeon's MMIO HDMI-audio
+    # lineage — r600_hdmi.c / evergreen_hdmi.c program exactly this block on every audio enable — the same
+    # pre-DCN AFMT hardware family this enable is already built on. Programmed BEFORE the sample tap opens
+    # so the envelope is at full scale from the first sample out.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL0 + d, GPU_AFMT_RAMP_MAX_VAL);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL1 + d, GPU_AFMT_RAMP_MIN_VAL);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL2 + d, GPU_AFMT_RAMP_STEP_VAL);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL3 + d, GPU_AFMT_RAMP_STEP_VAL);
+
     # LAST: latch channel status and open the sample tap.
     var apc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,

@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — AFMT sample-RAMP envelope programmed (was 0/0/0/0 = output attenuated to exact silence)
+
+The 1.55.20 burn (audio_re_5) was still silent — but produced the arc's most important observation, from the
+operator: **the monitor speakers "release" (a soft pop) at machine shutdown.** A muted or rejected input
+cannot do that — the sink's amplifier was ARMED and DRIVEN by agnos's stream the whole time. That single fact
+proves the audio data islands egress, the ACR/InfoFrame/sample packets are accepted, and the sink opened its
+audio path — **what agnos delivers it decodes as silence.** The fault therefore sits in the one output-stage
+attenuator in the whole path: the **AFMT sample-RAMP envelope** (`AFMT_RAMP_CONTROL0–3`). The 1.55.19 dump
+rows read **all four = 0 on agnos** (never programmed; the GOP doesn't touch them); a ramp ceiling of 0
+scales every sample to exactly zero while every upstream instrument (CRC taps, LPIB, bit24) reads healthy —
+and the registers appear in NO known-good comparison (neither side ever captured them; the audit that
+dismissed them argued from a field name, the exact inference the 2026-07-15 perturbation test discredited).
+`gpu_hdmi_audio_enable` now programs radeon's MMIO HDMI-audio lineage values (r600_hdmi.c /
+evergreen_hdmi.c, the same AFMT hardware family, on every audio enable): `RAMP_CONTROL0=0x00FFFFFF` (max),
+`1=0x007FFFFF` (min), `2=1` (inc), `3=1` (dec) — written **before** the sample tap opens so the envelope is
+at full scale from the first sample. amdgpu-DCN writes these via no traced MMIO (consistent with DMUB/vBIOS
+init — invisible to the register-diff corpus). The decisive Linux-side check stays available:
+`scripts/dump-dcn-audio.py` under amdgpu while audibly playing — non-zero RAMP rows confirm the mechanism.
+
 ## [1.55.20] — 2026-07-16 — HDMI audio: unmute AFTER the feed is live (amdgpu's trigger→unmute order)
 
 1.55.19 fixed the FIFO drain (the formatter now clocks real audio — `AFMT_AUDIO_CRC` tap1 non-zero,
