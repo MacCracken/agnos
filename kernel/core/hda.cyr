@@ -1201,6 +1201,16 @@ fn hda_refill_half(ci, h) {
     var base = load64(&hda_pcm_va + ci * 8) + h * load64(&hda_ring_half + ci * 8);
     #ifdef HDA_TONE
     var amp = 12000;
+    # MAGNITUDE DISCRIMINATOR (2026-07-16). The full known-good capture proved agnos matches amdgpu-playing
+    # byte-for-byte on EVERY audio register AND the 16-bit converter format (AZ1 CONVERTER_FORMAT=0x11 on
+    # both) — yet agnos is silent and amdgpu is loud. The one quantity no register and no AFMT_AUDIO_CRC can
+    # measure (the CRC is amplitude-blind — the 1.55.17 −57 dBFS bug read as "content") is the sample
+    # MAGNITUDE actually reaching the sink. So drive instance 1 (HDMI) at near-full-scale (−0.8 dBFS) while
+    # instance 0 (analog, iron-validated audible at 12000) is left ALONE. One burn splits the last fork:
+    #   HDMI now audible  => the path was attenuating a healthy −8.7 dBFS signal to inaudibility (hunt where);
+    #   HDMI still silent => magnitude is exonerated, samples are structurally zeroed between AFMT and sink
+    #                        (below-register — needs a wire analyzer, not another register).
+    if (ci == 1) { amp = 30000; }
     # BYTES PER FRAME IS PER-INSTANCE. 16-bit = 4 (two packed s16). 24-bit = 8: HDA carries 24-bit samples
     # in 32-BIT CONTAINERS, left-justified WITHIN THE CONTAINER — HDA spec 1.0a: "20 and 24-bit samples must
     # be padded out with zeros at the LSB end to make them all 32-bits long", i.e. the sample occupies

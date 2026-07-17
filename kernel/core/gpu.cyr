@@ -3165,19 +3165,14 @@ fn gpu_hdmi_audio_enable() {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d,
     (n44 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_44_VAL);
 
-    # HDMI_AUDIO_PACKETS_PER_LINE ([20:16]) — the per-line audio-sample-packet budget, and THE gate downstream
-    # of the AFMT_AUDIO_CRC taps (which sit inside the AFMT). With the drain-before-feed fix the formatter now
-    # produces real audio (tap1 non-zero), but a live DIG_MODE flip may leave this at 0 = "schedule ZERO
-    # packets per line" (whereas amdgpu's cold modeset auto-derives a non-zero count). Program it explicitly
-    # from the blanking — DCE's calc_max_audio_packets_per_line: (h_blank - 58) / 32, clamped [1,31] (this link
-    # h_blank = 2720-2560 = 160 -> 3). This is the one register between the working formatter and the wire.
-    var h_blank = gpu_h_total - gpu_h_active;
-    var ppl = (h_blank - 58) / 32;
-    if (ppl < 1) { ppl = 1; }
-    if (ppl > 31) { ppl = 31; }
+    # HDMI_AUDIO_PACKETS_PER_LINE ([20:16]) — tested and FALSIFIED as a cause (2026-07-16). The DCE-formula
+    # ppl=3 was burned on iron (HDMI_AUDIO_PKT_CONTROL 0x30010): still silent. The full amdgpu-while-playing
+    # capture then showed the working path runs **ppl = 0** (0x00000010 — the hardware schedules packets
+    # itself when the field is 0; the DCE-era explicit budget does not apply to DCN 2.1). Field cleared to
+    # match the known-good byte-for-byte; DELAY_EN (bit4) is the only bit the working path sets here.
     var hap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d,
-    (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK) & (0 - 1 - 0x1F0000)) | GPU_HDMI_AUDIO_DELAY_SET | (ppl << 16));
+    (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK) & (0 - 1 - 0x1F0000)) | GPU_HDMI_AUDIO_DELAY_SET);
 
     # Source select binds this DIG's AFMT to the Azalia endpoint; channel-enable is 8 bits and zero of them
     # is silence, so stereo must be spelled out.
@@ -3224,19 +3219,14 @@ fn gpu_hdmi_audio_enable() {
     var ifc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ifc | GPU_AFMT_AUDIO_INFO_UPDATE);
 
-    # THE RAMP ENVELOPE — the output-stage sample attenuator, and the one block in this path agnos had never
-    # programmed. All four read 0 on agnos (audio_re_4/5 dumps): a ramp ceiling of ZERO scales every sample
-    # to exactly zero, so the wire carries a fully valid audio stream OF SILENCE — the sink accepts it, arms
-    # its amp (iron-corroborated: the operator hears the monitor speakers release at shutdown), and plays
-    # nothing, while the CRC taps upstream of the output stage read real content. Never caught by register
-    # diffing because NO capture (either side) ever included these rows. Values are radeon's MMIO HDMI-audio
-    # lineage — r600_hdmi.c / evergreen_hdmi.c program exactly this block on every audio enable — the same
-    # pre-DCN AFMT hardware family this enable is already built on. Programmed BEFORE the sample tap opens
-    # so the envelope is at full scale from the first sample out.
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL0 + d, GPU_AFMT_RAMP_MAX_VAL);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL1 + d, GPU_AFMT_RAMP_MIN_VAL);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL2 + d, GPU_AFMT_RAMP_STEP_VAL);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_RAMP_CONTROL3 + d, GPU_AFMT_RAMP_STEP_VAL);
+    # THE RAMP ENVELOPE — tested and FALSIFIED (2026-07-16, full known-good capture). The hypothesis: all four
+    # AFMT_RAMP_CONTROL regs read 0 on agnos, and a zero output-attenuator would deliver a valid stream of
+    # exact silence. The radeon-lineage values (0xFFFFFF/0x7FFFFF/1/1, r600/evergreen) were burned on iron:
+    # still silent, AND the shutdown-release pop the previous burn produced DISAPPEARED — the non-zero values
+    # made the output measurably worse. The full amdgpu-while-audibly-playing capture then settled it:
+    # **amdgpu plays with all four at 0** (dcn-audio-known-good-full-0716.txt, DIG1). Zero IS the working
+    # value on DCN 2.1; the radeon-era programming does not transfer. DO NOT write these registers — the
+    # dump rows keep reading them for the record.
 
     # LAST: latch channel status and open the sample tap.
     var apc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);

@@ -5,24 +5,75 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed — AFMT sample-RAMP envelope programmed (was 0/0/0/0 = output attenuated to exact silence)
+## [1.55.21] — 2026-07-17 — HDMI audio: the register + format class is CLOSED; the fault is sample magnitude
 
-The 1.55.20 burn (audio_re_5) was still silent — but produced the arc's most important observation, from the
-operator: **the monitor speakers "release" (a soft pop) at machine shutdown.** A muted or rejected input
-cannot do that — the sink's amplifier was ARMED and DRIVEN by agnos's stream the whole time. That single fact
-proves the audio data islands egress, the ACR/InfoFrame/sample packets are accepted, and the sink opened its
-audio path — **what agnos delivers it decodes as silence.** The fault therefore sits in the one output-stage
-attenuator in the whole path: the **AFMT sample-RAMP envelope** (`AFMT_RAMP_CONTROL0–3`). The 1.55.19 dump
-rows read **all four = 0 on agnos** (never programmed; the GOP doesn't touch them); a ramp ceiling of 0
-scales every sample to exactly zero while every upstream instrument (CRC taps, LPIB, bit24) reads healthy —
-and the registers appear in NO known-good comparison (neither side ever captured them; the audit that
-dismissed them argued from a field name, the exact inference the 2026-07-15 perturbation test discredited).
-`gpu_hdmi_audio_enable` now programs radeon's MMIO HDMI-audio lineage values (r600_hdmi.c /
-evergreen_hdmi.c, the same AFMT hardware family, on every audio enable): `RAMP_CONTROL0=0x00FFFFFF` (max),
-`1=0x007FFFFF` (min), `2=1` (inc), `3=1` (dec) — written **before** the sample tap opens so the envelope is
-at full scale from the first sample. amdgpu-DCN writes these via no traced MMIO (consistent with DMUB/vBIOS
-init — invisible to the register-diff corpus). The decisive Linux-side check stays available:
-`scripts/dump-dcn-audio.py` under amdgpu while audibly playing — non-zero RAMP rows confirm the mechanism.
+The 1.55.20 burns and the operator's decision to use Linux as a test bench turned the HDMI-audio arc from
+guesswork into elimination. The shutdown-release pop proved the sink's amp is armed and DRIVEN (stream
+accepted, decoding silence); three full known-good captures under amdgpu-audibly-playing (DIG, Azalia
+endpoint, HDA codec + ELD) let a 7-agent diff prove agnos matches the working path **byte-for-byte across
+every register AND the 16-bit converter format**; and four successive hypotheses (RAMP envelope,
+packets-per-line, AVI colorimetry, 24-bit format) were each falsified against that capture. What survives is
+the one quantity no register and no (amplitude-blind) CRC ever measured: the sample MAGNITUDE reaching the
+sink. This cut ships the reverts, the new Linux poke bench, and the magnitude discriminator.
+
+### The full known-good capture — the DIG register file is now compared EXHAUSTIVELY (and two fixes reverted)
+
+Two iron observations from the 1.55.20 burns reframed the arc. First (audio_re_5, operator's trained ear):
+**the monitor speakers "release" (a soft pop) at machine shutdown** — the sink's amplifier was ARMED and
+DRIVEN by agnos's stream; data islands egress, ACR/InfoFrame/sample packets accepted, sink audio path open,
+**payload decoding as silence**. That retired the entire "packets don't egress / sink rejects" class. Second
+(audio_re_6): the RAMP-envelope fix (radeon-lineage `0xFFFFFF/0x7FFFFF/1/1` into `AFMT_RAMP_CONTROL0–3`,
+staged on the zero-attenuator hypothesis) burned **still-silent, and the release pop DISAPPEARED** — the
+non-zero envelope made the output worse.
+
+The operator then proposed using Linux as the test bench, and the first capture settled everything the
+register class had left: `scripts/dump-dcn-audio.py` run under amdgpu **while audibly playing**
+(`agnosticos docs/development/prior-art/dcn-audio-known-good-full-0716.txt`) — the FIRST complete corpus
+(all 5 DIGs, all AFMT rows including the never-compared ones). Verdicts:
+
+- **RAMP hypothesis FALSIFIED: amdgpu plays with `AFMT_RAMP_CONTROL0–3` = 0/0/0/0.** Zero is the working
+  value on DCN 2.1; the radeon-era programming does not transfer. **Reverted** (nothing writes the block;
+  the dump rows keep reading it).
+- **`HDMI_AUDIO_PACKETS_PER_LINE` FALSIFIED: amdgpu plays with ppl = 0** (`0x00000010` — the hardware
+  schedules packets itself; the DCE explicit-budget formula does not apply to DCN 2.1). **Reverted** to
+  match the known-good byte-for-byte (DELAY_EN stays, the only bit the working path sets).
+- **After the reverts, the ENTIRE remaining difference between agnos-silent and amdgpu-playing across the
+  DIG register file is the AVI InfoFrame content** (`AFMT_GENERIC_0`: agnos RGB `0x81ECF` matching its RGB
+  scanout, amdgpu YCbCr444 `0x80885E8F`) plus a benign 13 ppm DTO-module delta (measured-vs-nominal pixel
+  clock) and its read-only CTS echo. 32 of 32 other compared rows are byte-identical, on the same encoder
+  (DIG1, `DIG_MODE=3`, identical `DIG_FE_CNTL`).
+
+New tool: `agnosticos scripts/poke-dcn-audio.py` (operator's idea) — writes agnos's iron-dump values onto
+the LIVE amdgpu path block-by-block while audio plays, restoring originals after each ear verdict, so each
+block is an independent A/B with seconds of feedback and zero reflashes.
+
+### The codec + AZ + ELD captures land — TWO more fixes falsified, the search collapses to sample MAGNITUDE
+
+The operator captured the remaining two known-good surfaces under amdgpu audibly playing: the Azalia endpoint
+indexed registers (`dcn-audio-known-good-az-0716.txt`) and the HDA codec side + ELD
+(`hda-codec-known-good-716.txt`). A 7-agent parallel diff+adversarial workflow compared every one against
+agnos and settled the arc's hypothesis space:
+
+- **HDA codec (converter 0x04 / pin 0x05): byte-identical.** Every muting-capable verb amdgpu issues
+  (DIGEN, stream/format 0x30/0x11, pin-ctl 0x40, the ATI slot-map verbs 0x777/0x785 + mode 0x789=SINGLE)
+  agnos also issues, confirmed in its own AZ mirror. The historical `MULTICHANNEL_ENABLE=0` mute is fixed.
+- **Azalia endpoint (AZ1, the live one): byte-identical** — format/stream/speaker/descriptor/multichannel/
+  coding all match the playing endpoint (not the reset-default idle ones).
+- **ELD**: the XB323U advertises exactly `FL/FR` `LPCM` stereo — precisely what agnos sends.
+- **AVI colorimetry (Fork A) FALSIFIED (~3%)**: RGB-vs-YCbCr444 is video-only per CEA-861 and cannot both
+  arm the sink's amp and mute it; matching it would require a whole output-CSC subsystem (agnos has none)
+  and would corrupt the RGB picture. Not pursued.
+- **24-bit converter format (Fork B-format) FALSIFIED**: the synthesis proposed re-enabling 24-bit/0x31, but
+  the live capture shows **amdgpu plays at `CONVERTER_FORMAT = 0x11` (16-bit)** — agnos already matches.
+  Re-enabling 24-bit would diverge from the audible path; **not done.**
+
+What survives: every register **and** the 16-bit format match amdgpu byte-for-byte, the sink's amp is armed
+(accepts the stream), and the AFMT CRC taps are **amplitude-blind** — so the one quantity never measured is
+the sample MAGNITUDE actually reaching the sink (the same blind spot the 1.55.17 −57 dBFS bug hid behind).
+The magnitude discriminator: `hda_refill_half` now drives **instance 1 (HDMI) at −0.8 dBFS** (amp 30000)
+while instance 0 (analog, iron-validated audible) is untouched. One burn splits it — HDMI audible ⇒ the path
+was attenuating a healthy −8.7 dBFS signal (hunt where); HDMI still silent ⇒ magnitude is exonerated and the
+samples are structurally zeroed between AFMT and wire (below-register — needs a wire analyzer, not a register).
 
 ## [1.55.20] — 2026-07-16 — HDMI audio: unmute AFTER the feed is live (amdgpu's trigger→unmute order)
 
