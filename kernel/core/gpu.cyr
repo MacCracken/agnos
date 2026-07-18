@@ -3811,7 +3811,40 @@ fn gpu_audio_dump() {
     gpu_az_dump_ord(ir, dr, GPU_AZ_IX_SINK_INFO0,             "AZ_SINK_INFO0          ");
     gpu_az_dump_ord(ir, dr, GPU_AZ_IX_CODING_TYPE,            "AZ_CODING_TYPE         ");
     gpu_az_dump_ord(ir, dr, GPU_AZ_IX_FORMAT_CHANGED,         "AZ_FORMAT_CHANGED      ");
+    gpu_dmcub_probe();
     kprintln("== end dump ==", 14);
+    return 1;
+}
+
+# T2 (hdmi-modeset-arc-155x.md) — READ-ONLY DMCUB attach probe. Reads only the always-on DMU-domain
+# CNTL/SCRATCH/CC_DC_PIPE_DIS + inbox pointers (SAFE on a live GOP-lit DMCUB: amdgpu's cold
+# dmub_dcn20_is_hw_init/get_fw_boot_status read exactly these with no power sequencing, unlike the gate-able
+# pipe blocks that hung the blind scan). Decides Path A (attach the GOP's live inbox ring, effort M) vs
+# Path B (PSP-load renoir_dmcub.bin ourselves, L/XL). WRITES NOTHING.
+fn gpu_dmcub_probe() {
+    if (gpu_present == 0) { return 0; }
+    var pipe_dis = gpu_reg32(GPU_BASE_DCN_2, GPU_R_CC_DC_PIPE_DIS);
+    var cntl     = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DMCUB_CNTL);
+    var scr0     = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DMCUB_SCRATCH0);
+    var ibase    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DMCUB_INBOX1_BASE);
+    var isize    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DMCUB_INBOX1_SIZE);
+    var iwptr    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DMCUB_INBOX1_WPTR);
+    var irptr    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DMCUB_INBOX1_RPTR);
+    kprint("dmcub: CC_DC_PIPE_DIS ", 22); kprint_hex(pipe_dis); kprintln("", 0);
+    kprint("dmcub: CNTL ", 12); kprint_hex(cntl); kprintln("", 0);
+    kprint("dmcub: SCRATCH0 ", 16); kprint_hex(scr0); kprintln("", 0);
+    kprint("dmcub: INBOX1 base ", 19); kprint_hex(ibase);
+    kprint(" size ", 6); kprint_hex(isize);
+    kprint(" wptr ", 6); kprint_hex(iwptr);
+    kprint(" rptr ", 6); kprint_hex(irptr); kprintln("", 0);
+    var enabled = (cntl & GPU_DMCUB_ENABLE);
+    var mbrdy   = (scr0 & GPU_DMCUB_FW_MAILBOX_RDY);
+    var dalfw   = (scr0 & GPU_DMCUB_FW_DAL);
+    if (enabled != 0 && mbrdy != 0 && dalfw != 0) {
+        kprintln("dmcub: ATTACHABLE -> Path A (attach live ring)", 46);
+    } else {
+        kprintln("dmcub: NOT attach-ready -> Path B (PSP-load fw)", 47);
+    }
     return 1;
 }
 

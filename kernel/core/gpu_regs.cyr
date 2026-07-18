@@ -133,8 +133,13 @@ var GPU_FB_BACK_LIMIT       = 0x60000000;
 # single audio register is written. Derived + adversarially cross-verified (5-lens, all HIGH confidence).
 #
 # KEY DERIVED FACTS (durable — a future session must not re-litigate these):
-#  * DMCUB is NOT in this path (the full dmub_cmd.h surface has zero audio/azalia/afmt hits; dcn21 wires
-#    enable_audio_stream = dce110_enable_audio_stream, plain MMIO). Seg3 stays untouched.
+#  * DMCUB is NOT in the AUDIO path (dcn21 wires enable_audio_stream = dce110_enable_audio_stream, plain MMIO).
+#    **BUT DMCUB IS in the TRANSMITTER/PHY-enable path** — corrected 2026-07-18. amdgpu's HDMI transmitter
+#    enable (link_transmitter_control) routes through the DMCUB on this gen: command_table2.c
+#    transmitter_control_v1_6/7 branches to transmitter_control_dmcub when dmub_command_table=true (dcn21
+#    default). Iron-confirmed by the modeset capture: DMCUB_INBOX1_WPTR advanced 106×64B, zero host PHY writes.
+#    The T-series (hdmi-modeset-arc-155x.md) builds DMCUB inbox submission to send DIGX_ENCODER_CONTROL(HDMI)
+#    + DIG1_TRANSMITTER_CONTROL(ENABLE) — the true-HDMI-mode commit the live DIG_MODE flip skips.
 #  * The DTO produces a constant 24.000 MHz wall clock. **48 kHz NEVER enters PHASE/MODULE** —
 #    get_azalia_clock_info_{hdmi,dp}() take no sample-rate argument. Fs comes from the HDA converter format
 #    agnos already programs; 128·Fs is derived downstream. Fs-scaled DTO values would be a REGRESSION.
@@ -383,6 +388,27 @@ var GPU_R_AFMT_RAMP_CONTROL3 = 0x20A6;  # RAMP_DEC_COUNT[23:0]
 var GPU_R_AFMT_INTERRUPT_STATUS = 0x2079;
 var GPU_R_AFMT_AUDIO_CRC_CONTROL = 0x20A2;  # CRC_EN b0 · CRC_CONT b4 · CRC_SOURCE b8 · CH_SEL [15:12] · COUNT [31:16]
 var GPU_R_AFMT_AUDIO_CRC_RESULT  = 0x20A8;  # CRC_DONE b0 (RO) · CRC [31:8] (RO)
+
+# === DMCUB (DMU microcontroller) — the TRANSMITTER-enable path (T-series, hdmi-modeset-arc-155x.md) ==========
+# All BASE_IDX 2 (GPU_BASE_DCN_2). Offsets VERIFIED against dcn_2_1_0_offset.h (identical in dcn_2_0_0);
+# WPTR cross-checks the iron capture (abs dword 0x34C0+0x3280 = 0x6740). ⚠ ORDER GOTCHA: WPTR is 0x3280,
+# RPTR is 0x3281 — WPTR comes BEFORE RPTR. The CNTL/SCRATCH/CC_DC_PIPE_DIS reads are in the ALWAYS-ON DMU
+# domain (amdgpu's cold dmub_dcn20_is_hw_init probes them with no power sequencing) → SAFE to read on a live
+# GOP-lit DMCUB, unlike the gate-able pipe blocks that hung the blind scan. WRITES (WPTR/CNTL/SEC/REGION3)
+# are NOT safe until we commit to attaching.
+var GPU_R_CC_DC_PIPE_DIS      = 0x00CA;   # DC_DMCUB_ENABLE bit16 = DMCUB block present on this ASIC
+var GPU_R_DMCUB_CNTL          = 0x32A0;   # DMCUB_ENABLE bit16 · SOFT_RESET bit17 · TRACEPORT_EN bit19
+var GPU_R_DMCUB_SCRATCH0      = 0x328D;   # fw boot status: dal_fw bit0 · mailbox_rdy bit1
+var GPU_R_DMCUB_SCRATCH14     = 0x329B;   # host→fw boot options
+var GPU_R_DMCUB_INBOX1_BASE   = 0x327E;   # inbox1 ring base address
+var GPU_R_DMCUB_INBOX1_SIZE   = 0x327F;   # inbox1 ring size
+var GPU_R_DMCUB_INBOX1_WPTR   = 0x3280;   # host DOORBELL (write pointer)  [abs 0x6740]
+var GPU_R_DMCUB_INBOX1_RPTR   = 0x3281;   # DMCUB consume pointer (read pointer)
+var GPU_DMCUB_ENABLE          = 0x10000;  # DMCUB_CNTL bit16
+var GPU_DMCUB_SOFT_RESET      = 0x20000;  # DMCUB_CNTL bit17
+var GPU_CC_DMCUB_ENABLE       = 0x10000;  # CC_DC_PIPE_DIS bit16
+var GPU_DMCUB_FW_DAL          = 0x1;      # SCRATCH0 bit0 = real DAL firmware
+var GPU_DMCUB_FW_MAILBOX_RDY  = 0x2;      # SCRATCH0 bit1 = inbox1 set up + serviced
 
 # HDMI_STATUS — READ-ONLY, and the only register on this whole block that is a hardware VERDICT rather than
 # an echo of our own write. Nobody has ever read it: not agnos, not the dump script, not fourteen burns.

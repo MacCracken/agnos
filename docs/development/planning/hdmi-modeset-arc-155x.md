@@ -59,8 +59,41 @@ paths — all P6-class sub-projects, none a burn:
 
 The audio path (P3) remains 100% proven-ready and lights up the instant the HDMI transmitter state exists.
 **P5c/P5d as written below (implement a captured PHY sequence) are moot** and superseded by this correction.
-The bite ladder is retained below for provenance; the live plan is: pick one of the three subsystem paths above
-as a scoped P6-class effort.
+
+## ✅ MECHANISM RESOLVED (2026-07-18) — it's DMCUB command submission, and Bite #1 confirmed it
+
+A 4-probe source-verified scoping pass + a free capture re-analysis settled the mechanism:
+
+- **The transmitter enable is a DMCUB command**, not host-ATOM and not SMU. Source: `command_table2.c`
+  `transmitter_control_v1_6/v1_7` both branch `if (dmub_srv && debug.dmub_command_table) transmitter_control_dmcub(...)`;
+  `dcn21_resource.c debug_defaults_drv` ships `.dmub_command_table = true`; modern `green_sardine_dmcub.bin` ⇒
+  `disable_dmcu = true` ⇒ transmitter control routes to the DMCUB, which does the PHY writes **internally, off
+  the host bus**. That is why the capture saw zero PHY MMIO.
+- **Bite #1 (free, from the existing capture) PROVED it:** `DMCUB_INBOX1_WPTR` (abs 0x6740) advances
+  monotonically in **+0x40 (64-byte) steps, 106 commands** during the modeset — the inbox ring in active use.
+  No RDPCS/UNIPHY/TMDS host-PHY writes anywhere (only DPP/MPC pixel-pipe). A host-ATOM path would show the PHY
+  writes on the bus; it doesn't. **Mechanism = DMCUB, confirmed.**
+- **SMU ruled out** (airtight): the Renoir VBIOSSMC enum has no transmitter/DIG/PHY message; agnos already sends
+  the only relevant one (`UpdatePmeRestore`). **ATOM interpreter held as insurance** (~2200 Cyrius LOC + VBIOS
+  image acquisition) only if the DMCUB proves un-attachable.
+
+**THE LOAD-BEARING COMMAND:** `DIGX_ENCODER_CONTROL(sub_type 0, SIGNAL_TYPE_HDMI)` — it puts the DIG into
+*true* HDMI mode with data-island packets, the exact thing agnos's live `DIG_MODE 2→3` bit-flip skips (hence
+the chronic AFMT FIFO overflow + stale `HDMI_DB_CONTROL`). Then `DIG1_TRANSMITTER_CONTROL(sub_type 1, ENABLE)`.
+
+### The new bite ladder (T-series — DMCUB inbox submission)
+
+| Bite | What | Gate |
+|------|------|------|
+| **T1** ✅ | Confirm mechanism = DMCUB (free, from capture). `DMCUB_INBOX1_WPTR` advancing 106×64B; no host PHY writes. | DONE |
+| **T2** | **Read-only**: is the GOP's DMCUB attachable? Dump `DMCUB_CNTL.ENABLE`, `DMCUB_SCRATCH*` mailbox-ready/dal_fw bits, the four `DMCUB_INBOX1_*` pointers (VERIFIED offsets only — the DMU region hangs on a blind read). `ENABLE==1 && mailbox_rdy==1` ⇒ **Path A (attach, effort M)**; else ⇒ **Path B (PSP-load fw, L/XL, console-risky)**. | IRON read-only |
+| **T3** | Build the inbox submission: 64-byte `dmub_rb_cmd` push at WPTR + doorbell + poll RPTR. First command `DIGX_ENCODER_CONTROL(HDMI)`, then `DIG1_TRANSMITTER_CONTROL(ENABLE)` — payload per the green_sardine `DIG1TransmitterControl` crev (v1_6 vs v1_7; read `BIOS_CMD_TABLE_REVISION` from the dumped VBIOS first). | IRON — console survives |
+| **T4** | Audio egresses — the proven-ready payoff. | IRON — **tone from XB323U** |
+
+**Effort: M** if T2 shows a mailbox-ready GOP DMCUB (Path A: reuse the live ring); **L/XL** if agnos must
+PSP-load `renoir_dmcub.bin` itself (Path B: INST_CONST/BSS FB windows, `DMCUB_REGION3_CW*`, reset-release, own
+ring — a multi-cycle subsystem, and the reset tears down the GOP's DMCUB on a single-console box). Biggest
+risk = the firmware-load blocker; T2's read-only probe decides it before any commit.
 
 ## Thesis (SUPERSEDED — see P5b correction above) — own the transmitter, without ATOM, by capture-and-replay
 

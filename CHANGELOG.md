@@ -5,6 +5,47 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.22] — 2026-07-18 — HDMI transmitter: mechanism RESOLVED (DMCUB), + the T2 attach probe
+
+The HDMI-audio blocker is now a fully-scoped subsystem with a proven mechanism. The prior "full HDMI modeset"
+conclusion (below) was refined by a source-verified scoping pass: the missing piece is not a register sequence
+agnos can write — it is a **DMCUB (DMU microcontroller) command**.
+
+### ★★ The transmitter enable is a DMCUB command — mechanism proven, and T1 confirmed it for free
+
+A 4-probe scoping pass (source-verified against the real amdgpu tree) + a re-analysis of the existing modeset
+capture settled how amdgpu lights the HDMI transmitter on this Cezanne:
+
+- **It's DMCUB, not host-ATOM and not SMU.** `command_table2.c transmitter_control_v1_6/v1_7` both branch
+  `if (dmub_srv && debug.dmub_command_table) transmitter_control_dmcub(...)`; `dcn21_resource.c` ships
+  `.dmub_command_table = true`; modern `green_sardine_dmcub.bin` ⇒ `disable_dmcu = true` ⇒ transmitter control
+  routes to the DMCUB, which does the RDPCS/DPCS PHY writes **internally, off the host bus**. That is exactly
+  why every register capture saw zero PHY writes — the transmitter enable was never a host-MMIO event.
+- **T1 proved it from the capture, no burn:** `DMCUB_INBOX1_WPTR` advances monotonically in +0x40 (64-byte)
+  steps — **106 commands pushed to the inbox ring during the modeset** — with zero RDPCS/UNIPHY/TMDS host-PHY
+  writes anywhere (a host-ATOM path would show them). Mechanism confirmed.
+- **The load-bearing command is `DIGX_ENCODER_CONTROL(SIGNAL_TYPE_HDMI)`** — it puts the DIG into *true* HDMI
+  mode with data-island packets, precisely the state agnos's live `DIG_MODE 2→3` bit-flip skips (hence the
+  chronic `AFMT_STATUS` bit24 FIFO overflow). Then `DIG1_TRANSMITTER_CONTROL(ENABLE)`.
+- **SMU ruled out** (the Renoir VBIOSSMC enum has no transmitter/DIG/PHY message; agnos already sends the only
+  relevant one, `UpdatePmeRestore`). **An ATOM interpreter is held as insurance** only if the DMCUB proves
+  un-attachable.
+
+This corrects a stale `gpu_regs.cyr` comment ("DMCUB is NOT in this path") — true for the *audio* path, false
+for the *transmitter* path.
+
+### Added — T2: read-only DMCUB attach probe (`gpu_dmcub_probe`)
+
+The one remaining unknown is whether the GOP hands agnos a running, mailbox-ready DMCUB it can attach to
+(Path A, effort M) or whether agnos must PSP-load `renoir_dmcub.bin` itself (Path B, L/XL, console-risky).
+`gpu_dmcub_probe()` (gpu.cyr, in the `HDMI_AUDIO_DUMP` block) answers it with three **read-only** reads of the
+always-on DMU-domain registers — `CC_DC_PIPE_DIS`, `DMCUB_CNTL` (ENABLE bit16), `DMCUB_SCRATCH0` (dal_fw bit0
++ mailbox_rdy bit1) — plus the four `INBOX1` pointers, and prints the `ATTACHABLE → Path A` / `NOT
+attach-ready → Path B` verdict. Every offset is verified against `dcn_2_1_0_offset.h` (identical in
+`dcn_2_0_0`); the reads are safe on a live GOP-lit DMCUB (amdgpu's own cold `dmub_dcn20_is_hw_init` probes
+exactly these with no power sequencing, unlike the gate-able pipe blocks that hung the earlier blind scan).
+Roadmap: `docs/development/planning/hdmi-modeset-arc-155x.md` § MECHANISM RESOLVED (T-series ladder).
+
 ### ★ The feed is PROVEN correct — a Linux userspace reproduction of agnos's feed plays sound
 
 The operator's method — "write the driver on Linux to confirm the process works without agnos" — paid off
