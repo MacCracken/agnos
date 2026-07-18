@@ -962,6 +962,16 @@ gpu_pixclk_discover();
 # scanning whatever the sink does). So the sole oracle is the operator looking at the screen, and the sole
 # recovery is flashing a kernel built without this flag. The default/MVP kernel therefore never touches
 # DIG_MODE and cannot black-screen loop.
+#ifdef HDMI_ATOM
+# A4 (hdmi-modeset-arc-155x.md) — sovereign firmware HDMI transmitter bring-up, BEFORE the audio programming.
+# The DCN 2.1 transmitter enable is an ATOM command (#76, v1_6): the GOP ran it as DVI at boot, so agnos
+# re-runs DIGxEncoderControl(HDMI) [true HDMI mode + data islands — what the raw DIG_MODE 2->3 flip only
+# approximates] then DIG1TransmitterControl(ENABLE) [the firmware PHY output edge the flip cannot produce].
+# This is the missing subsystem the whole 1.55.x arc converged on: HDMI audio is blocked on the firmware-
+# driven transmitter setup, not any register tweak. Console-risky (drives the PHY) — separately gated from
+# HDA_HDMI so a burn can isolate it; recovery is flashing a kernel without HDMI_ATOM.
+atom_hdmi_transmitter_bringup();
+#endif
 gpu_hdmi_audio_enable();
 # Sink-select (the parked HDA bite 4): make the GPU's HDMI controller the LIVE refill target so a ring-3
 # tone lands on the display link rather than the analog jack. Only worth doing if the display side actually

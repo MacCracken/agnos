@@ -3812,10 +3812,57 @@ fn gpu_audio_dump() {
     gpu_az_dump_ord(ir, dr, GPU_AZ_IX_CODING_TYPE,            "AZ_CODING_TYPE         ");
     gpu_az_dump_ord(ir, dr, GPU_AZ_IX_FORMAT_CHANGED,         "AZ_FORMAT_CHANGED      ");
     gpu_dmcub_probe();
+    gpu_vbios_acquire();
     kprintln("== end dump ==", 14);
     return 1;
 }
+#endif
+# --- VBIOS acquisition (A2) is ALWAYS compiled: the ATOM interpreter (core/atom.cyr,
+# always included) consumes gpu_vbios_va. The dump-block gate above only controls the
+# read-only probes; acquisition itself is a safe ACPI walk + one alloc + a word copy. ---
 
+var gpu_vbios_va = 0;    # A2: CPU VA of the copied VBIOS ATOM image (0 = not acquired)
+var gpu_vbios_len = 0;   # A2: length of the VBIOS ATOM image in bytes
+
+# A2 (hdmi-modeset-arc-155x.md) — acquire the VBIOS ATOM image from the ACPI VFCT table. Renoir/Cezanne is an
+# APU with NO discrete flash ROM; the integrated IGP VBIOS ships inside the system UEFI, published as the ACPI
+# VFCT table. Layout (amdgpu_bios.c amdgpu_acpi_vfct_bios): ACPI header(36) + TableUUID[16] +
+# VBIOSImageOffset:u32 @52. At (vfct + VBIOSImageOffset) sits VFCT_IMAGE_HEADER { PCIBus/Dev/Fn u32 (12) ·
+# VendorID u16 @12 · DeviceID u16 @14 · SSVID/SSID (4) · Revision u32 @20 · ImageLength u32 @24 } then the raw
+# VbiosContent[] @28. Read-only ACPI walk + one 2 MB alloc + a word copy. Safe. Sets gpu_vbios_va/len for A3.
+fn gpu_vbios_acquire() {
+    var vfct = 0;
+    if (acpi_xsdt_addr != 0) { vfct = acpi_xsdt_find(acpi_xsdt_addr, 0x56, 0x46, 0x43, 0x54); }
+    if (vfct == 0 && acpi_rsdt_addr != 0) { vfct = acpi_rsdt_find(acpi_rsdt_addr, 0x56, 0x46, 0x43, 0x54); }
+    if (vfct == 0) { kprintln("gpu: vbios VFCT not found", 25); return 0; }
+    var vbase = vfct + acpi_load32(vfct + 52);
+    var vendor = acpi_load16(vbase + 12);
+    var device = acpi_load16(vbase + 14);
+    var len    = acpi_load32(vbase + 24);
+    kprint("gpu: vbios VFCT vid=", 20); kprint_hex(vendor);
+    kprint(" did=", 5); kprint_hex(device);
+    kprint(" len=", 5); kprint_num(len); kprintln("", 0);
+    if (vendor != 0x1002) { kprintln("gpu: vbios vendor mismatch", 26); return 0; }
+    if (len < 512 || len > 0x100000) { kprintln("gpu: vbios length insane", 24); return 0; }
+    var buf = pmm_alloc_2mb();
+    if (buf == 0) { kprintln("gpu: vbios buf alloc failed", 27); return 0; }
+    var bva = DIRECTMAP_BASE + buf;
+    var content = vbase + 28;
+    var words = (len + 3) / 4;
+    var i = 0;
+    while (i < words) { store32(bva + i * 4, acpi_load32(content + i * 4)); i = i + 1; }
+    var sig = load8(bva) | (load8(bva + 1) << 8);
+    var atomhdr = load8(bva + 0x48) | (load8(bva + 0x49) << 8);
+    kprint("gpu: vbios copied, sig=", 23); kprint_hex(sig);
+    kprint(" atomhdr=", 9); kprint_hex(atomhdr); kprintln("", 0);
+    if (sig != 0xAA55) { kprintln("gpu: vbios sig NOT 55aa", 23); return 0; }
+    gpu_vbios_va = bva;
+    gpu_vbios_len = len;
+    kprintln("gpu: vbios ATOM image acquired OK", 33);
+    return 1;
+}
+
+#ifdef HDMI_AUDIO_DUMP
 # T2 (hdmi-modeset-arc-155x.md) — READ-ONLY DMCUB attach probe. Reads only the always-on DMU-domain
 # CNTL/SCRATCH/CC_DC_PIPE_DIS + inbox pointers (SAFE on a live GOP-lit DMCUB: amdgpu's cold
 # dmub_dcn20_is_hw_init/get_fw_boot_status read exactly these with no power sequencing, unlike the gate-able

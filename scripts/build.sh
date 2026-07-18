@@ -276,6 +276,15 @@ else
         # ~3s. The operator watches serial + LISTENS: one boot tests the whole hypothesis matrix
         # instead of one-per-reflash. Requires HDA_HDMI + HDA_TONE (the streaming tone + HDMI sink).
         [ -n "$HDMI_AUDIO_SWEEP" ]   && echo '#define HDMI_AUDIO_SWEEP'
+        # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
+        # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
+        # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot
+        # reproduce — the missing subsystem the 1.55.x arc converged on. Console-risky (drives the PHY);
+        # requires HDA_HDMI. Recovery: flash without it.
+        [ -n "$HDMI_ATOM" ]          && echo '#define HDMI_ATOM'
+        # ATOM_TRACE=1 — print every MMIO write the ATOM interpreter makes (idx + value) for diffing the
+        # live write sequence against the atom-interp.py oracle. Bring-up debug aid; pairs with HDMI_ATOM.
+        [ -n "$ATOM_TRACE" ]         && echo '#define ATOM_TRACE'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include

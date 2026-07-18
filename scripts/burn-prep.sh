@@ -49,7 +49,30 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_HDMI_SWEEP:-}" ]; then
+if [ -n "${BURN_HDMI_ATOM_DRY:-}" ]; then
+    # THE A4 DRY-VALIDATION BURN (safe fallback). Same as BURN_HDMI_ATOM but ATOM_DRY suppresses every MMIO
+    # write and forces reads to 0 — the interpreter runs its full control flow WITHOUT touching the PHY, so
+    # the console is guaranteed to survive and `run /bin/klug > /f/dump.txt` always works. The ATOM_TRACE
+    # output is the deliverable: the exact write sequence agnos's interpreter produces, to diff against the
+    # atom-interp.py oracle (transmitter: 21 reads / 17 writes / 5 delays, writes to UNIPHYA 0x55xx + RDPCS
+    # 0x5Dxx-0x5Exx). Use this if a live BURN_HDMI_ATOM blacks/hangs the console before the shell.
+    echo "[2/2] Building the A4 DRY-VALIDATION kernel (HDA_HDMI + HDMI_ATOM + ATOM_DRY + ATOM_TRACE: run the ATOM interpreter with writes SUPPRESSED; capture the trace and diff vs the oracle. No PHY drive, console safe, no audio)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_DRY=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_DRY+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_ATOM:-}" ]; then
+    # THE A4 BURN — the whole 1.55.x arc's convergence. The register-value class is exhausted (every DCN
+    # audio register matches amdgpu byte-for-byte, still silent); the arc proved HDMI audio is blocked on the
+    # FIRMWARE-driven HDMI transmitter/encoder bring-up the GOP did as DVI and the raw DIG_MODE flip cannot
+    # reproduce. This kernel runs the sovereign ATOM interpreter (core/atom.cyr) to re-issue
+    # DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE) on the live pipe, BEFORE the proven-ready
+    # audio path (gpu_hdmi_audio_enable). ATOM_TRACE prints every MMIO write for diffing against the
+    # atom-interp.py oracle (transmitter dry-run: 21 reads / 17 writes / 5 delays). HDMI_AUDIO_DUMP keeps the
+    # register read-back. Console-risky (drives the PHY) — recovery is flashing without HDMI_ATOM.
+    # PASS IS THE OPERATOR'S EARS: a tone from the XB323U over HDMI.
+    echo "[2/2] Building the A4 ATOM-transmitter kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_TRACE + HDMI_AUDIO_DUMP: sovereign firmware HDMI transmitter bring-up, then the proven audio path; watch serial for the atom write trace + LISTEN)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_SWEEP:-}" ]; then
     # THE MATRIX BURN. The register-value class is exhausted (every DCN reg matches amdgpu, still silent),
     # so stop testing one hypothesis per reflash. This kernel, post-sti with the HDA tone already streaming
     # to the HDMI sink, cycles gpu_hdmi_audio_profile(0..N): each applies a candidate structural/sequencing/

@@ -1,0 +1,844 @@
+# ============================================================================
+#  core/atom.cyr — sovereign ATOM BIOS bytecode interpreter (1.55.x DISPLAY arc)
+# ============================================================================
+# A faithful Cyrius port of amdgpu's atom.c (via the validated reference oracle
+# agnosticos/scripts/atom-interp.py). The DCN 2.1 HDMI transmitter enable is a
+# FIRMWARE operation: link_transmitter_control -> ATOM command-table #76 (v1_6),
+# a parameterized bytecode VM (SWITCH/SETPORT dispatch) with no replay shortcut.
+# The GOP ran it as DVI/audio-off; agnos must re-run it as HDMI to open the
+# data-island path the audio subsystem (P3, proven-ready) needs.
+#
+# This engine consumes the VBIOS ATOM image acquired by gpu_vbios_acquire()
+# (A2, in gpu.cyr; gpu_vbios_va / gpu_vbios_len). All register access rides the
+# BAR5 direct window via gpu_mmio (idx*4), bounded to GPU_RMMIO_SIZE.
+#
+# Address spaces: REG (MMIO), PS (params), WS (per-table workspace + specials),
+# FB (scratch), ID (data-table), IMM. PLL/MC are not wired on DCN (return 0 /
+# no-op — the transmitter path never touches them). IIO is empty on this VBIOS
+# (io_mode is always ATOM_IO_MM), so the indirect-I/O engine is not ported.
+#
+# Cyrius dialect notes: no chained `else if` (mutually-exclusive branches on a
+# fixed selector are written as sequential `if`s); sibling-block `var` names are
+# hoisted to one declaration per function.
+#
+# The ENTIRE interpreter is gated behind HDMI_ATOM: it's a ~600-line OPT-IN,
+# console-risky subsystem that the default/MVP kernel never needs, so it must
+# not count against the MVP binary-size budget. gpu_vbios_acquire() (its VBIOS
+# source, gpu.cyr) stays always-compiled — it's ~40 lines and also feeds the
+# read-only HDMI_AUDIO_DUMP probe.
+# ============================================================================
+#ifdef HDMI_ATOM
+
+# ---- parsed ROM layout (offsets into the VBIOS image) ----
+var atom_rom        = 0;
+var atom_cmd_table  = 0;
+var atom_data_table = 0;
+
+# ---- struct atom_context state (SHARED across calltable recursion) ----
+var atom_io_mode    = 0;      # ATOM_IO_MM=0
+var atom_reg_block  = 0;
+var atom_data_block = 0;
+var atom_fb_base    = 0;
+var atom_divmul0    = 0;      # quotient / mul-low
+var atom_divmul1    = 0;      # remainder / mul-high
+var atom_shift      = 0;
+var atom_io_attr    = 0;
+var atom_cs_equal   = 0;
+var atom_cs_above   = 0;
+
+# ---- current execution context (per-table; saved/restored around recursion) ----
+var atom_cur_ps_off   = 0;    # byte window into atom_ps_buf
+var atom_cur_ps_size  = 0;    # dwords visible
+var atom_cur_ps_shift = 0;    # header ps_count/4 (child window shift)
+var atom_cur_ws_ptr   = 0;    # VA of this level's workspace
+var atom_cur_ws_size  = 0;    # dwords
+var atom_cur_start    = 0;    # table code base (jump/switch targets are start-relative)
+var atom_cur_abort    = 0;
+
+# ---- shared cursors ----
+var atom_ip    = 0;           # instruction pointer (all operand readers advance it)
+var atom_saved = 0;           # saved-out (full 32-bit dst value before mask/shift)
+
+# ---- instrumentation (per-table; compare to the atom-interp.py oracle: the
+#      transmitter dry-run was 21 reads / 17 writes / 5 delays) ----
+var atom_n_reg_r = 0;
+var atom_n_reg_w = 0;
+var atom_n_delay = 0;
+
+# ---- working memory ----
+var atom_ps_buf[8];           # 64 bytes = param block (max 32 B used); dword-addressed
+var atom_work_va      = 0;    # 2 MB scratch page VA (ws pool + FB scratch)
+var atom_ws_pool_base = 0;    # 8 levels x 512 bytes
+var atom_scratch_base = 0;    # 256 dwords FB scratch
+var atom_scratch_size = 0;    # bytes
+
+# ============================================================================
+#  VBIOS byte readers (atom-bits.h: U8/U16/U32, little-endian, absolute offset)
+# ============================================================================
+fn atom_u8(off) {
+    return load8(gpu_vbios_va + off);
+}
+fn atom_u16(off) {
+    return load8(gpu_vbios_va + off) | (load8(gpu_vbios_va + off + 1) << 8);
+}
+fn atom_u32(off) {
+    return load8(gpu_vbios_va + off)
+         | (load8(gpu_vbios_va + off + 1) << 8)
+         | (load8(gpu_vbios_va + off + 2) << 16)
+         | (load8(gpu_vbios_va + off + 3) << 24);
+}
+
+# ============================================================================
+#  32-bit shift helpers (a shift count >= 32 clears a 32-bit value to 0).
+# ============================================================================
+fn atom_shl32(v, n) {
+    if (n >= 32) { return 0; }
+    return (v << n) & 0xFFFFFFFF;
+}
+fn atom_shr32(v, n) {
+    if (n >= 32) { return 0; }
+    return (v & 0xFFFFFFFF) >> n;
+}
+
+# ============================================================================
+#  Operand-decode lookup tables (atom.c:80, verbatim)
+# ============================================================================
+fn atom_arg_mask(i) {
+    if (i == 0) { return 0xFFFFFFFF; }
+    if (i == 1) { return 0xFFFF; }
+    if (i == 2) { return 0xFFFF00; }
+    if (i == 3) { return 0xFFFF0000; }
+    if (i == 4) { return 0xFF; }
+    if (i == 5) { return 0xFF00; }
+    if (i == 6) { return 0xFF0000; }
+    return 0xFF000000;
+}
+fn atom_arg_shift(i) {
+    if (i == 2) { return 8; }
+    if (i == 3) { return 16; }
+    if (i == 5) { return 8; }
+    if (i == 6) { return 16; }
+    if (i == 7) { return 24; }
+    return 0;
+}
+# atom_dst_to_src[align3][sel2]: row0=[0,0,0,0], rows1-3=[1,2,3,0], rows4-7=[4,5,6,7]
+fn atom_dst_to_src(a, s) {
+    if (a == 0) { return 0; }
+    if (a <= 3) {
+        if (s == 0) { return 1; }
+        if (s == 1) { return 2; }
+        if (s == 2) { return 3; }
+        return 0;
+    }
+    if (s == 0) { return 4; }
+    if (s == 1) { return 5; }
+    if (s == 2) { return 6; }
+    return 7;
+}
+# atom_def_dst[] = [0,0,1,2,0,1,2,3]
+fn atom_def_dst(i) {
+    if (i == 2) { return 1; }
+    if (i == 3) { return 2; }
+    if (i == 5) { return 1; }
+    if (i == 6) { return 2; }
+    if (i == 7) { return 3; }
+    return 0;
+}
+# opcode-group arg map: [REG=0, PS=1, WS=2, FB=3, PLL=6, MC=7]
+fn atom_argmap6(i) {
+    if (i == 4) { return 6; }
+    if (i == 5) { return 7; }
+    return i;
+}
+# jump-cond map (spec order ALWAYS,EQUAL,BELOW,ABOVE,BELOWOREQUAL,ABOVEOREQUAL,NOTEQUAL)
+fn atom_jumpmap(i) {
+    if (i == 0) { return 2; }
+    if (i == 1) { return 5; }
+    if (i == 2) { return 3; }
+    if (i == 3) { return 0; }
+    if (i == 4) { return 4; }
+    if (i == 5) { return 1; }
+    return 6;
+}
+
+# ============================================================================
+#  Backend accessors — REG (BAR5 MMIO), PS, WS, FB scratch
+# ============================================================================
+# ATOM_DRY (compile flag): dry-run validation mode — reads return 0 and writes
+# are traced but NOT applied. Guarantees the console survives (no PHY drive) and
+# captures the exact write sequence to diff against the atom-interp.py oracle
+# (17 writes for the transmitter dry-run). Live PHY drive is the default (no flag).
+fn atom_reg_read(idx) {
+    if (idx >= 0x20000) { return 0; }          # beyond direct BAR5 window — never touch
+    atom_n_reg_r = atom_n_reg_r + 1;
+    #ifdef ATOM_DRY
+    return 0;
+    #else
+    return load32(gpu_mmio + idx * 4);
+    #endif
+}
+fn atom_reg_write(idx, val) {
+    if (idx >= 0x20000) { return 0; }
+    atom_n_reg_w = atom_n_reg_w + 1;
+    #ifdef ATOM_TRACE
+    kprint("atom w=", 7); kprint_hex(idx); kprint(" v=", 3); kprint_hex(val & 0xFFFFFFFF); kprintln("", 0);
+    #endif
+    #ifndef ATOM_DRY
+    var a = gpu_mmio + idx * 4;
+    store32(a, val & 0xFFFFFFFF);
+    var flush = load32(a);                      # push past posted-write reordering
+    #endif
+    return 0;
+}
+fn atom_ps_dword(idx) {
+    return load32(&atom_ps_buf + atom_cur_ps_off + idx * 4);
+}
+fn atom_ps_write(idx, val) {
+    store32(&atom_ps_buf + atom_cur_ps_off + idx * 4, val & 0xFFFFFFFF);
+    return 0;
+}
+fn atom_ws_read(idx) {
+    if (idx == 0x40) { return atom_divmul0; }                       # QUOTIENT
+    if (idx == 0x41) { return atom_divmul1; }                       # REMAINDER
+    if (idx == 0x42) { return atom_data_block; }                    # DATAPTR
+    if (idx == 0x43) { return atom_shift; }                         # SHIFT
+    if (idx == 0x44) { return atom_shl32(1, atom_shift); }          # OR_MASK = 1<<shift
+    if (idx == 0x45) { return (atom_shl32(1, atom_shift)) ^ 0xFFFFFFFF; }  # AND_MASK
+    if (idx == 0x46) { return atom_fb_base; }                       # FB_WINDOW
+    if (idx == 0x47) { return atom_io_attr; }                       # ATTRIBUTES
+    if (idx == 0x48) { return atom_reg_block; }                     # REGPTR
+    if (idx < atom_cur_ws_size) { return load32(atom_cur_ws_ptr + idx * 4); }
+    return 0xCDCDCDCD;                                              # out of range
+}
+fn atom_ws_write(idx, val) {
+    if (idx == 0x40) { atom_divmul0 = val; return 0; }
+    if (idx == 0x41) { atom_divmul1 = val; return 0; }
+    if (idx == 0x42) { atom_data_block = val; return 0; }
+    if (idx == 0x43) { atom_shift = val; return 0; }
+    if (idx == 0x44) { return 0; }                                  # OR_MASK: read-only
+    if (idx == 0x45) { return 0; }                                  # AND_MASK: read-only
+    if (idx == 0x46) { atom_fb_base = val; return 0; }
+    if (idx == 0x47) { atom_io_attr = val; return 0; }
+    if (idx == 0x48) { atom_reg_block = val; return 0; }
+    if (idx < atom_cur_ws_size) { store32(atom_cur_ws_ptr + idx * 4, val & 0xFFFFFFFF); }
+    return 0;
+}
+fn atom_fb_read(idx) {
+    if ((atom_fb_base + idx * 4) > atom_scratch_size) { return 0; }
+    return load32(atom_scratch_base + (atom_fb_base / 4 + idx) * 4);
+}
+fn atom_fb_write(idx, val) {
+    if ((atom_fb_base + idx * 4) > atom_scratch_size) { return 0; }
+    store32(atom_scratch_base + (atom_fb_base / 4 + idx) * 4, val & 0xFFFFFFFF);
+    return 0;
+}
+
+# ============================================================================
+#  atom.c:185 atom_get_src_int — read an operand, advance atom_ip.
+#  want_saved != 0 stores the pre-mask/shift 32-bit value into atom_saved.
+#  arg is a fixed selector (attr & 7) so exactly one branch fires.
+# ============================================================================
+fn atom_get_src_int(attr, want_saved) {
+    var val = 0xCDCDCDCD;
+    var arg = attr & 7;
+    var align = (attr >> 3) & 7;
+    var idx = 0;
+    if (arg == 0) {                                                 # REG
+        idx = atom_u16(atom_ip); atom_ip = atom_ip + 2;
+        idx = (idx + atom_reg_block) & 0xFFFFFFFF;
+        if (atom_io_mode == 0) { val = atom_reg_read(idx); } else { val = 0; }
+    }
+    if (arg == 1) {                                                 # PS
+        idx = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+        if (idx < atom_cur_ps_size) { val = atom_ps_dword(idx); }
+    }
+    if (arg == 2) {                                                 # WS
+        idx = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+        val = atom_ws_read(idx);
+    }
+    if (arg == 4) {                                                 # ID
+        idx = atom_u16(atom_ip); atom_ip = atom_ip + 2;
+        val = atom_u32(idx + atom_data_block);
+    }
+    if (arg == 3) {                                                 # FB
+        idx = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+        val = atom_fb_read(idx);
+    }
+    if (arg == 5) {                                                 # IMM (early return, no mask)
+        if (align == 0) { val = atom_u32(atom_ip); atom_ip = atom_ip + 4; return val & 0xFFFFFFFF; }
+        if (align <= 3) { val = atom_u16(atom_ip); atom_ip = atom_ip + 2; return val & 0xFFFFFFFF; }
+        val = atom_u8(atom_ip); atom_ip = atom_ip + 1; return val & 0xFFFFFFFF;
+    }
+    if (arg == 6) { atom_ip = atom_ip + 1; val = 0; }               # PLL (not wired)
+    if (arg == 7) { atom_ip = atom_ip + 1; val = 0; }               # MC (not wired)
+    val = val & 0xFFFFFFFF;
+    if (want_saved != 0) { atom_saved = val; }
+    val = val & atom_arg_mask(align);
+    val = val >> atom_arg_shift(align);
+    return val & 0xFFFFFFFF;
+}
+fn atom_get_src(attr) {
+    return atom_get_src_int(attr, 0);
+}
+# atom.c:416 atom_get_src_direct — inline immediate by align width
+fn atom_get_src_direct(align) {
+    var v = 0;
+    if (align == 0) { v = atom_u32(atom_ip); atom_ip = atom_ip + 4; return v & 0xFFFFFFFF; }
+    if (align <= 3) { v = atom_u16(atom_ip); atom_ip = atom_ip + 2; return v & 0xFFFFFFFF; }
+    v = atom_u8(atom_ip); atom_ip = atom_ip + 1; return v & 0xFFFFFFFF;
+}
+# atom.c:442 atom_get_dst — remap dst attr to a src attr, then read
+fn atom_get_dst(arg, attr, want_saved) {
+    var new_attr = arg | (atom_dst_to_src((attr >> 3) & 7, (attr >> 6) & 3) << 3);
+    return atom_get_src_int(new_attr, want_saved);
+}
+# atom.c:376 atom_skip_src_int — advance atom_ip past an operand w/o reading
+fn atom_skip_src_int(attr) {
+    var align = (attr >> 3) & 7;
+    var arg = attr & 7;
+    if (arg == 0) { atom_ip = atom_ip + 2; return 0; }             # REG
+    if (arg == 4) { atom_ip = atom_ip + 2; return 0; }             # ID
+    if (arg == 5) {                                                # IMM
+        if (align == 0) { atom_ip = atom_ip + 4; return 0; }
+        if (align <= 3) { atom_ip = atom_ip + 2; return 0; }
+        atom_ip = atom_ip + 1; return 0;
+    }
+    atom_ip = atom_ip + 1;                                         # PS/WS/FB/PLL/MC
+    return 0;
+}
+fn atom_skip_dst(arg, attr) {
+    var new_attr = arg | (atom_dst_to_src((attr >> 3) & 7, (attr >> 6) & 3) << 3);
+    atom_skip_src_int(new_attr);
+    return 0;
+}
+# atom.c:458 atom_put_dst — dptr is the SAVED dst-operand start (read locally,
+# never advances the shared cursor). arg is a fixed selector.
+fn atom_put_dst(arg, attr, dptr, val, saved) {
+    var align = atom_dst_to_src((attr >> 3) & 7, (attr >> 6) & 3);
+    var idx = 0;
+    val = val & 0xFFFFFFFF;
+    val = atom_shl32(val, atom_arg_shift(align));
+    val = val & atom_arg_mask(align);
+    saved = saved & ((atom_arg_mask(align)) ^ 0xFFFFFFFF);
+    val = (val | saved) & 0xFFFFFFFF;
+    if (arg == 0) {                                                # REG
+        idx = atom_u16(dptr);
+        idx = (idx + atom_reg_block) & 0xFFFFFFFF;
+        if (atom_io_mode == 0) {
+            if (idx == 0) { atom_reg_write(0, atom_shl32(val, 2)); } else { atom_reg_write(idx, val); }
+        }
+    }
+    if (arg == 1) {                                                # PS
+        idx = atom_u8(dptr);
+        if (idx < atom_cur_ps_size) { atom_ps_write(idx, val); }
+    }
+    if (arg == 2) {                                                # WS
+        idx = atom_u8(dptr);
+        atom_ws_write(idx, val);
+    }
+    if (arg == 3) {                                                # FB
+        idx = atom_u8(dptr);
+        atom_fb_write(idx, val);
+    }
+    # PLL(6)/MC(7): not wired — no-op
+    return 0;
+}
+
+# ============================================================================
+#  Opcode handlers — line-for-line with atom.c. atom_ip is the shared cursor.
+# ============================================================================
+# ADD/AND/OR/SUB/XOR share the read-dst / read-src / combine / write-dst shape.
+# opkind: 0=ADD 1=AND 2=OR 3=SUB 4=XOR
+fn atom_binop(arg, opkind) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dptr = atom_ip;
+    var dst = atom_get_dst(arg, attr, 1);
+    var saved = atom_saved;
+    var src = atom_get_src(attr);
+    var r = 0;
+    if (opkind == 0) { r = (dst + src) & 0xFFFFFFFF; }
+    if (opkind == 1) { r = (dst & src) & 0xFFFFFFFF; }
+    if (opkind == 2) { r = (dst | src) & 0xFFFFFFFF; }
+    if (opkind == 3) { r = (dst - src) & 0xFFFFFFFF; }
+    if (opkind == 4) { r = (dst ^ src) & 0xFFFFFFFF; }
+    atom_put_dst(arg, attr, dptr, r, saved);
+    return 0;
+}
+fn atom_op_move(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dptr = atom_ip;
+    var saved_v = 0;
+    if (((attr >> 3) & 7) != 0) {                                  # not SRC_DWORD
+        atom_get_dst(arg, attr, 1);
+        saved_v = atom_saved;
+    } else {
+        atom_skip_dst(arg, attr);
+        saved_v = 0xCDCDCDCD;
+    }
+    var src = atom_get_src(attr);
+    atom_put_dst(arg, attr, dptr, src, saved_v);
+    return 0;
+}
+fn atom_op_clear(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dptr = atom_ip;
+    attr = attr & 0x38;
+    attr = attr | (atom_def_dst(attr >> 3) << 6);
+    atom_get_dst(arg, attr, 1);
+    var saved_v = atom_saved;
+    atom_put_dst(arg, attr, dptr, 0, saved_v);
+    return 0;
+}
+fn atom_op_mask(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dptr = atom_ip;
+    var dst = atom_get_dst(arg, attr, 1);
+    var saved_v = atom_saved;
+    var mask = atom_get_src_direct((attr >> 3) & 7);
+    var src = atom_get_src(attr);
+    dst = ((dst & mask) | src) & 0xFFFFFFFF;
+    atom_put_dst(arg, attr, dptr, dst, saved_v);
+    return 0;
+}
+fn atom_op_compare(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dst = atom_get_dst(arg, attr, 0);
+    var src = atom_get_src(attr);
+    if (dst == src) { atom_cs_equal = 1; } else { atom_cs_equal = 0; }
+    if (dst > src) { atom_cs_above = 1; } else { atom_cs_above = 0; }
+    return 0;
+}
+fn atom_op_test(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dst = atom_get_dst(arg, attr, 0);
+    var src = atom_get_src(attr);
+    if ((dst & src) == 0) { atom_cs_equal = 1; } else { atom_cs_equal = 0; }
+    return 0;
+}
+# cond is a fixed selector (0=ABOVE..6=NOTEQUAL).
+fn atom_op_jump(cond) {
+    var target = atom_u16(atom_ip); atom_ip = atom_ip + 2;
+    var execute = 0;
+    if (cond == 0) { execute = atom_cs_above; }                                    # ABOVE
+    if (cond == 1) { if (atom_cs_above != 0 || atom_cs_equal != 0) { execute = 1; } }  # ABOVEOREQUAL
+    if (cond == 2) { execute = 1; }                                                # ALWAYS
+    if (cond == 3) { if (atom_cs_above == 0 && atom_cs_equal == 0) { execute = 1; } }  # BELOW
+    if (cond == 4) { if (atom_cs_above == 0) { execute = 1; } }                    # BELOWOREQUAL
+    if (cond == 5) { execute = atom_cs_equal; }                                    # EQUAL
+    if (cond == 6) { if (atom_cs_equal == 0) { execute = 1; } }                    # NOTEQUAL
+    if (execute != 0) { atom_ip = atom_cur_start + target; }
+    return 0;
+}
+fn atom_op_switch(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var src = atom_get_src(attr);
+    var val = 0;
+    var target = 0;
+    while (atom_u16(atom_ip) != 0x5A5A) {                          # ATOM_CASE_END
+        if (atom_u8(atom_ip) == 0x63) {                           # ATOM_CASE_MAGIC
+            atom_ip = atom_ip + 1;
+            val = atom_get_src((attr & 0x38) | 5);                # IMM
+            target = atom_u16(atom_ip);
+            if (val == src) { atom_ip = atom_cur_start + target; return 0; }
+            atom_ip = atom_ip + 2;
+        } else {
+            return 0;                                             # bad case
+        }
+    }
+    atom_ip = atom_ip + 2;                                        # skip CASE_END (fall through)
+    return 0;
+}
+fn atom_op_shift_left(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dptr = atom_ip;
+    attr = attr & 0x38;
+    attr = attr | (atom_def_dst(attr >> 3) << 6);
+    var dst = atom_get_dst(arg, attr, 1);
+    var saved_v = atom_saved;
+    var shift = atom_get_src_direct(4);                           # SRC_BYTE0
+    dst = atom_shl32(dst, shift);
+    atom_put_dst(arg, attr, dptr, dst, saved_v);
+    return 0;
+}
+fn atom_op_shift_right(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dptr = atom_ip;
+    attr = attr & 0x38;
+    attr = attr | (atom_def_dst(attr >> 3) << 6);
+    var dst = atom_get_dst(arg, attr, 1);
+    var saved_v = atom_saved;
+    var shift = atom_get_src_direct(4);                           # SRC_BYTE0
+    dst = atom_shr32(dst, shift);
+    atom_put_dst(arg, attr, dptr, dst, saved_v);
+    return 0;
+}
+fn atom_op_shl(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dptr = atom_ip;
+    var dst_align = atom_dst_to_src((attr >> 3) & 7, (attr >> 6) & 3);
+    atom_get_dst(arg, attr, 1);
+    var saved_v = atom_saved;
+    var dst = saved_v;                                            # op needs full dst value
+    var shift = atom_get_src(attr);
+    dst = atom_shl32(dst, shift);
+    dst = dst & atom_arg_mask(dst_align);
+    dst = dst >> atom_arg_shift(dst_align);
+    atom_put_dst(arg, attr, dptr, dst, saved_v);
+    return 0;
+}
+fn atom_op_shr(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dptr = atom_ip;
+    var dst_align = atom_dst_to_src((attr >> 3) & 7, (attr >> 6) & 3);
+    atom_get_dst(arg, attr, 1);
+    var saved_v = atom_saved;
+    var dst = saved_v;
+    var shift = atom_get_src(attr);
+    dst = atom_shr32(dst, shift);
+    dst = dst & atom_arg_mask(dst_align);
+    dst = dst >> atom_arg_shift(dst_align);
+    atom_put_dst(arg, attr, dptr, dst, saved_v);
+    return 0;
+}
+fn atom_op_mul(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dst = atom_get_dst(arg, attr, 0);
+    var src = atom_get_src(attr);
+    atom_divmul0 = (dst * src) & 0xFFFFFFFF;
+    return 0;
+}
+fn atom_op_div(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dst = atom_get_dst(arg, attr, 0);
+    var src = atom_get_src(attr);
+    if (src != 0) {
+        atom_divmul0 = (dst / src) & 0xFFFFFFFF;
+        atom_divmul1 = (dst % src) & 0xFFFFFFFF;
+    } else {
+        atom_divmul0 = 0; atom_divmul1 = 0;
+    }
+    return 0;
+}
+fn atom_op_mul32(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dst = atom_get_dst(arg, attr, 0);
+    var src = atom_get_src(attr);
+    var prod = dst * src;                                          # low 64 bits
+    atom_divmul0 = prod & 0xFFFFFFFF;
+    atom_divmul1 = (prod >> 32) & 0xFFFFFFFF;                      # mask discards sign-fill
+    return 0;
+}
+fn atom_op_div32(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dst = atom_get_dst(arg, attr, 0);
+    var src = atom_get_src(attr);
+    if (src == 0) { atom_divmul0 = 0; atom_divmul1 = 0; return 0; }
+    # UNSIGNED 64-bit / 32-bit divide of (divmul1 : dst) by src. Cyrius `/` is
+    # SIGNED (x86 cqo;idiv, aarch64 sdiv), so the oracle's `val64 // src` cannot
+    # be expressed as `((divmul1<<32)|dst) / src` — with divmul1's MSB set that
+    # dividend is a negative i64 and the signed quotient diverges. Do it bit-by-
+    # bit instead: the running remainder stays < src (< 2^32), so rem<<1|bit is
+    # always a positive i64 and every compare/shift is unsigned-safe. (DIV32 is
+    # unused by the HDMI transmitter/encoder tables, but the interpreter is the
+    # P6 modeset foundation — keep it a faithful port.)
+    var hi = atom_divmul1 & 0xFFFFFFFF;
+    var lo = dst & 0xFFFFFFFF;
+    var qhi = 0;
+    var qlo = 0;
+    var rem = 0;
+    var i = 63;
+    while (i >= 0) {
+        var bit = 0;
+        if (i >= 32) { bit = (hi >> (i - 32)) & 1; } else { bit = (lo >> i) & 1; }
+        rem = (rem << 1) | bit;                       # rem < src <= 2^32-1 -> stays positive
+        if (rem >= src) {
+            rem = rem - src;
+            if (i >= 32) { qhi = qhi | (1 << (i - 32)); } else { qlo = qlo | (1 << i); }
+        }
+        i = i - 1;
+    }
+    atom_divmul0 = qlo & 0xFFFFFFFF;
+    atom_divmul1 = qhi & 0xFFFFFFFF;
+    return 0;
+}
+# arg is a fixed selector (0=ATI, 1=PCI, 2=SYSIO).
+fn atom_op_setport(arg) {
+    var port = 0;
+    if (arg == 0) {                                               # ATI
+        port = atom_u16(atom_ip); atom_ip = atom_ip + 2;
+        if (port == 0) { atom_io_mode = 0; } else { atom_io_mode = 0x80 | port; }
+    }
+    if (arg == 1) { atom_io_mode = 1; atom_ip = atom_ip + 1; }    # PCI
+    if (arg == 2) { atom_io_mode = 2; atom_ip = atom_ip + 1; }    # SYSIO
+    return 0;
+}
+fn atom_op_setregblock() {
+    atom_reg_block = atom_u16(atom_ip); atom_ip = atom_ip + 2;
+    return 0;
+}
+fn atom_op_setfbbase() {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    atom_fb_base = atom_get_src(attr);
+    return 0;
+}
+fn atom_op_setdatablock() {
+    var idx = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    if (idx == 0) { atom_data_block = 0; }
+    if (idx == 255) { atom_data_block = atom_cur_start; }
+    if (idx != 0 && idx != 255) { atom_data_block = atom_u16(atom_data_table + 4 + 2 * idx); }
+    return 0;
+}
+fn atom_op_delay(unit) {
+    var count = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    atom_n_delay = atom_n_delay + 1;
+    if (unit == 0) { gpu_udelay(count); } else { gpu_udelay(count * 1000); }
+    return 0;
+}
+fn atom_op_processds() {
+    var val = atom_u16(atom_ip);
+    atom_ip = atom_ip + val + 2;
+    return 0;
+}
+fn atom_op_skip1() {                                              # POSTCARD / DEBUG: consume 1 byte
+    atom_ip = atom_ip + 1;
+    return 0;
+}
+# REPEAT / SAVEREG / RESTOREREG: unimplemented in amdgpu too. Rather than desync
+# the cursor (they carry operands we don't decode) and risk poking stray PHY
+# registers, abort the table cleanly.
+fn atom_op_unimpl() {
+    atom_cur_abort = 1;
+    return 0;
+}
+
+# ============================================================================
+#  Dispatch (atom.c:1090 opcode_table, encoded structurally). depth threads to
+#  CALLTABLE so a sub-table recurses one level deeper.
+# ============================================================================
+fn atom_op_calltable(depth) {
+    var idx = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    if (atom_u16(atom_cmd_table + 4 + 2 * idx) != 0) {
+        var sub_off = atom_cur_ps_off + atom_cur_ps_shift * 4;
+        var sub_size = atom_cur_ps_size - atom_cur_ps_shift;
+        var r = atom_execute_table_locked(idx, sub_off, sub_size, depth + 1);
+        if (r != 0) { atom_cur_abort = 1; }
+    }
+    return 0;
+}
+fn atom_dispatch(op, depth) {
+    if (op >= 1 && op <= 54) {
+        var g = (op - 1) / 6;
+        var a = atom_argmap6((op - 1) % 6);
+        if (g == 0) { atom_op_move(a); }
+        if (g == 1) { atom_binop(a, 1); }                         # AND
+        if (g == 2) { atom_binop(a, 2); }                         # OR
+        if (g == 3) { atom_op_shift_left(a); }
+        if (g == 4) { atom_op_shift_right(a); }
+        if (g == 5) { atom_op_mul(a); }
+        if (g == 6) { atom_op_div(a); }
+        if (g == 7) { atom_binop(a, 0); }                         # ADD
+        if (g == 8) { atom_binop(a, 3); }                         # SUB
+        return 0;
+    }
+    if (op == 55) { atom_op_setport(0); return 0; }
+    if (op == 56) { atom_op_setport(1); return 0; }
+    if (op == 57) { atom_op_setport(2); return 0; }
+    if (op == 58) { atom_op_setregblock(); return 0; }
+    if (op == 59) { atom_op_setfbbase(); return 0; }
+    if (op >= 60 && op <= 65) { atom_op_compare(atom_argmap6(op - 60)); return 0; }
+    if (op == 66) { atom_op_switch(0); return 0; }
+    if (op >= 67 && op <= 73) { atom_op_jump(atom_jumpmap(op - 67)); return 0; }
+    if (op >= 74 && op <= 79) { atom_op_test(atom_argmap6(op - 74)); return 0; }
+    if (op == 80) { atom_op_delay(1); return 0; }                 # MILLISEC
+    if (op == 81) { atom_op_delay(0); return 0; }                 # MICROSEC
+    if (op == 82) { atom_op_calltable(depth); return 0; }
+    if (op == 83) { atom_op_unimpl(); return 0; }                 # REPEAT
+    if (op >= 84 && op <= 89) { atom_op_clear(atom_argmap6(op - 84)); return 0; }
+    if (op == 90) { return 0; }                                   # NOP
+    if (op == 91) { return 0; }                                   # EOT (loop breaks)
+    if (op >= 92 && op <= 97) { atom_op_mask(atom_argmap6(op - 92)); return 0; }
+    if (op == 98) { atom_op_skip1(); return 0; }                  # POSTCARD
+    if (op == 99) { return 0; }                                   # BEEP
+    if (op == 100) { atom_op_unimpl(); return 0; }                # SAVEREG
+    if (op == 101) { atom_op_unimpl(); return 0; }                # RESTOREREG
+    if (op == 102) { atom_op_setdatablock(); return 0; }
+    if (op >= 103 && op <= 108) { atom_binop(atom_argmap6(op - 103), 4); return 0; }  # XOR
+    if (op >= 109 && op <= 114) { atom_op_shl(atom_argmap6(op - 109)); return 0; }
+    if (op >= 115 && op <= 120) { atom_op_shr(atom_argmap6(op - 115)); return 0; }
+    if (op == 121) { atom_op_skip1(); return 0; }                 # DEBUG
+    if (op == 122) { atom_op_processds(); return 0; }
+    if (op == 123) { atom_op_mul32(1); return 0; }                # MUL32_PS
+    if (op == 124) { atom_op_mul32(2); return 0; }                # MUL32_WS
+    if (op == 125) { atom_op_div32(1); return 0; }                # DIV32_PS
+    if (op == 126) { atom_op_div32(2); return 0; }                # DIV32_WS
+    return 0;
+}
+
+# ============================================================================
+#  atom.c:1224 amdgpu_atom_execute_table_locked — run one command table.
+#  Recurses via CALLTABLE. Saves/restores the enclosing ectx + atom_ip.
+# ============================================================================
+fn atom_execute_table_locked(index, ps_off, ps_size, depth) {
+    var base = atom_u16(atom_cmd_table + 4 + 2 * index);
+    if (base == 0) { return -22; }
+    if (depth >= 8) { kprintln("atom: nesting limit", 19); return -40; }
+
+    var ws_count = atom_u8(base + 4);
+    var ps_count = atom_u8(base + 5) & 0x7F;
+
+    var save_ip       = atom_ip;
+    var save_ps_off   = atom_cur_ps_off;
+    var save_ps_size  = atom_cur_ps_size;
+    var save_ps_shift = atom_cur_ps_shift;
+    var save_ws_ptr   = atom_cur_ws_ptr;
+    var save_ws_size  = atom_cur_ws_size;
+    var save_start    = atom_cur_start;
+    var save_abort    = atom_cur_abort;
+
+    atom_cur_ps_off   = ps_off;
+    atom_cur_ps_size  = ps_size;
+    atom_cur_ps_shift = ps_count / 4;
+    atom_cur_start    = base;
+    atom_cur_abort    = 0;
+    atom_cur_ws_size  = ws_count;
+    atom_cur_ws_ptr   = atom_ws_pool_base + depth * 512;
+    var wi = 0;
+    while (wi < ws_count) { store32(atom_cur_ws_ptr + wi * 4, 0); wi = wi + 1; }
+
+    atom_ip = base + 6;                                            # ATOM_CT_CODE_PTR
+
+    var ret = 0;
+    var steps = 0;
+    var running = 1;
+    while (running != 0) {
+        var op = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+        steps = steps + 1;
+        var stop = 0;
+        if (steps > 1000000) { kprintln("atom: step cap hit", 18); ret = -22; running = 0; stop = 1; }
+        if (stop == 0 && atom_cur_abort != 0) { ret = -22; running = 0; stop = 1; }
+        if (stop == 0 && op == 0) { running = 0; stop = 1; }        # reserved
+        if (stop == 0 && op >= 127) { running = 0; stop = 1; }      # out of range
+        if (stop == 0) {
+            atom_dispatch(op, depth);
+            if (op == 91) { running = 0; }                         # EOT
+        }
+    }
+
+    atom_ip           = save_ip;
+    atom_cur_ps_off   = save_ps_off;
+    atom_cur_ps_size  = save_ps_size;
+    atom_cur_ps_shift = save_ps_shift;
+    atom_cur_ws_ptr   = save_ws_ptr;
+    atom_cur_ws_size  = save_ws_size;
+    atom_cur_start    = save_start;
+    atom_cur_abort    = save_abort;
+    return ret;
+}
+# atom.c:1302 amdgpu_atom_execute_table — reset ctx, then run. Params must
+# already be in atom_ps_buf (ps_size = dword count).
+fn atom_execute_table(index, ps_size) {
+    atom_data_block = 0;
+    atom_reg_block  = 0;
+    atom_fb_base    = 0;
+    atom_io_mode    = 0;
+    atom_divmul0    = 0;
+    atom_divmul1    = 0;
+    atom_n_reg_r    = 0;
+    atom_n_reg_w    = 0;
+    atom_n_delay    = 0;
+    return atom_execute_table_locked(index, 0, ps_size, 0);
+}
+# Print the per-table access counts (compare to the atom-interp.py oracle).
+fn atom_print_counts() {
+    kprint("atom: reads=", 12); kprint_num(atom_n_reg_r);
+    kprint(" writes=", 8); kprint_num(atom_n_reg_w);
+    kprint(" delays=", 8); kprint_num(atom_n_delay); kprintln("", 0);
+    return 0;
+}
+
+# ============================================================================
+#  amdgpu_atom_parse — read the ROM header + master tables.
+# ============================================================================
+fn atom_parse() {
+    if (gpu_vbios_va == 0) { kprintln("atom: no vbios image", 20); return 0; }
+    atom_rom = atom_u16(0x48);                                    # ATOM_ROM_TABLE_PTR
+    var m0 = atom_u8(atom_rom + 4);
+    var m1 = atom_u8(atom_rom + 5);
+    var m2 = atom_u8(atom_rom + 6);
+    var m3 = atom_u8(atom_rom + 7);
+    if (m0 != 65 || m1 != 84 || m2 != 79 || m3 != 77) {           # "ATOM"
+        kprintln("atom: not an ATOM rom", 21); return 0;
+    }
+    atom_cmd_table  = atom_u16(atom_rom + 0x1E);                  # MasterCommandTable off
+    atom_data_table = atom_u16(atom_rom + 0x20);                  # MasterDataTable off
+    kprint("atom: rom=", 10); kprint_hex(atom_rom);
+    kprint(" cmd=", 5); kprint_hex(atom_cmd_table);
+    kprint(" data=", 6); kprint_hex(atom_data_table); kprintln("", 0);
+    return 1;
+}
+
+# Allocate the interpreter working memory (ws pool + FB scratch) from one 2 MB
+# page. Idempotent.
+fn atom_init_mem() {
+    if (atom_work_va != 0) { return 1; }
+    var p = pmm_alloc_2mb();
+    if (p == 0) { kprintln("atom: work alloc failed", 23); return 0; }
+    atom_work_va      = DIRECTMAP_BASE + p;
+    atom_ws_pool_base = atom_work_va;                             # 8 x 512 = 4096 B
+    atom_scratch_base = atom_work_va + 4096;                      # 256 dwords
+    atom_scratch_size = 1024;
+    var i = 0;
+    while (i < 256) { store32(atom_scratch_base + i * 4, 0); i = i + 1; }
+    return 1;
+}
+
+# ============================================================================
+#  A4 command builders — the two load-bearing HDMI bring-up commands.
+#  Routing (iron-confirmed via object-info, A1): phyid=0 (UNIPHYA),
+#  digfe_sel=0x02 (DIG1), connobj_id=0x13 (HDMI_TYPE_A), symclk=24150 (241.50
+#  MHz), lanenum=4, HDMI mode=3.
+# ============================================================================
+# DIGxEncoderControl (#4, v1_5) STREAM_SETUP(0x0F) — puts DIG1 in true HDMI mode
+# with data islands (the step the raw DIG_MODE 2->3 bit-flip skips).
+fn atom_run_encoder_hdmi() {
+    store32(&atom_ps_buf + 0,  0x01 | (0x0F << 8) | (3 << 16) | (4 << 24));  # digid,action,digmode,lanenum
+    store32(&atom_ps_buf + 4,  24150);                                       # pclk_10khz
+    store32(&atom_ps_buf + 8,  0);
+    store32(&atom_ps_buf + 12, 0);
+    return atom_execute_table(4, 4);
+}
+# DIG1TransmitterControl (#76, v1_6) ENABLE(1) HDMI — the firmware PHY output edge.
+fn atom_run_transmitter_enable_hdmi() {
+    store32(&atom_ps_buf + 0,  0x00 | (1 << 8) | (3 << 16) | (4 << 24));     # phyid,action,digmode,lanenum
+    store32(&atom_ps_buf + 4,  24150);                                       # symclk_10khz
+    store32(&atom_ps_buf + 8,  0x00 | (0x02 << 8) | (0x13 << 16));           # hpdsel,digfe_sel,connobj_id
+    store32(&atom_ps_buf + 12, 0);
+    store32(&atom_ps_buf + 16, 0);
+    store32(&atom_ps_buf + 20, 0);
+    store32(&atom_ps_buf + 24, 0);
+    store32(&atom_ps_buf + 28, 0);
+    return atom_execute_table(76, 8);
+}
+
+# A4 top-level: acquire VBIOS -> parse -> run encoder(HDMI) + transmitter(ENABLE).
+# Returns 1 on clean bring-up. Console-risky (drives the PHY) — call only behind
+# the HDMI audio gate.
+fn atom_hdmi_transmitter_bringup() {
+    if (gpu_vbios_acquire() == 0) { kprintln("atom: vbios acquire failed", 26); return 0; }
+    if (atom_parse() == 0) { return 0; }
+    if (atom_init_mem() == 0) { return 0; }
+    kprintln("atom: running DIGxEncoderControl HDMI setup", 43);
+    var r1 = atom_run_encoder_hdmi();
+    kprint("atom: encoder rc=", 17); kprint_num(r1); kprintln("", 0);
+    atom_print_counts();
+    kprintln("atom: running DIG1TransmitterControl ENABLE HDMI", 48);
+    var r2 = atom_run_transmitter_enable_hdmi();
+    kprint("atom: transmitter rc=", 21); kprint_num(r2); kprintln("", 0);
+    atom_print_counts();
+    if (r1 == 0 && r2 == 0) { kprintln("atom: HDMI transmitter bringup OK", 33); return 1; }
+    kprintln("atom: HDMI transmitter bringup had errors", 41);
+    return 0;
+}
+
+#endif
+# ^ HDMI_ATOM — the whole ATOM interpreter is opt-in (see the file header).

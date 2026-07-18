@@ -119,14 +119,27 @@ bytecode** (@0xb162). Also present: `DIGxEncoderControl` #4 v1_5 (@0xae4e, 782B)
 |------|------|------|
 | **A0** ✅ | VBIOS acquired + transmitter table located (#76 v1_6) + disassembled → interpreter required. | DONE |
 | **A1** ✅ | **Python ATOM interpreter built + dry-run validated** (`scripts/atom-interp.py`, 1461 lines, verbatim line-for-line port of amdgpu `atom.c` — all 41 `atom_op_*`, 127-entry `opcode_table[]`, all 8 address spaces + `ATOM_WS_*` specials + IIO). Dry-run of `DIG1TransmitterControl(ENABLE, HDMI, phyid=0)` **steps to EOT clean, no desync, 239 opcodes, 21 reads / 17 writes / 5 delays** — and the writes land in **UNIPHYA (0x55xx) + RDPCS/DPCS (0x5Dxx–0x5Exx)** with 5/200/200/5/10µs PHY power sequencing = EXACTLY the RDPCS/DPCS block P5b named as the real transmitter PHY (abs ~0x5DE8). Cross-validates the whole arc. Default dry-run (no HW); `--live` mmaps BAR5. **Residual uncertainty is PARAMS not engine:** phyid (default 0=UNIPHYA, from object-info path0 HDMI→enum_id 1; phyid-sensitive, +0x400/inst), digfe_sel (0x02?), hpdsel (0) — confirm on iron; symclk=24150/lanenum=4/digmode=HDMI/action=ENABLE exact. | DONE (dry-run) |
-| **A2** | **VBIOS acquisition in agnos** — find + read the ATOM image at boot (ACPI VFCT / PCI ROM / VRAM shadow) so agnos has its own copy (no Linux dep). | IRON read-only |
-| **A3** | **Port the interpreter to Cyrius** — mechanical once A1 proves the logic; run the two command tables in `gpu_hdmi_audio_enable`. | IRON — console survives |
-| **A4** | Audio egresses. | IRON — **tone from XB323U** |
+| **A2** ✅ | **VBIOS acquisition in agnos** — `gpu_vbios_acquire()` (gpu.cyr) parses the ACPI VFCT table, verifies VendorID=0x1002, copies the ATOM image to a 2 MB page, checks the 55aa sig, sets `gpu_vbios_va/len`. Moved OUT of the `#ifdef HDMI_AUDIO_DUMP` guard so it's always compiled (the interpreter needs it). | DONE (compiles; iron-validated together with A4's burn) |
+| **A3** ✅ | **Port the interpreter to Cyrius** — `kernel/core/atom.cyr` (~600 lines), faithful port of `atom-interp.py`: VBIOS readers, all operand-decode tables, address spaces (REG via `gpu_mmio+idx*4` bounded <0x20000, PS/WS/FB/ID/IMM), get_src_int / put_dst / get_dst on a single global cursor `atom_ip`, structural 127-entry dispatch, recursive `execute_table_locked` (depth ≤8). Cyrius dialect: **no chained `else if`** (sequential `if`s on a fixed selector), sibling `var` hoisted, `^0xFFFFFFFF` for NOT, 1M-step cap replaces the Python wall-clock loop-guard, REPEAT/SAVEREG/RESTOREREG→clean abort. Runs the two tables in `atom_hdmi_transmitter_bringup()`, wired in `main.cyr` before `gpu_hdmi_audio_enable()`, gated `#ifdef HDMI_ATOM`. Instrumented: r/w/delay counters (vs the 21/17/5 oracle) + `#ifdef ATOM_TRACE` per-write trace + `#ifdef ATOM_DRY` safe mode (reads→0, writes traced-not-applied). | DONE (compiles clean); **NEXT: iron burn `BURN_HDMI_ATOM`** |
+| **A4** | Audio egresses. Burn `BURN_HDMI_ATOM` (live PHY drive) — operator's ears are the oracle. If it blacks/hangs pre-shell, fall back to `BURN_HDMI_ATOM_DRY` (safe, captures the write trace to diff vs the atom-interp.py oracle). | IRON — **tone from XB323U** |
 
 **Strategic upside:** the ATOM interpreter unlocks the ENTIRE VBIOS command surface (SetPixelClock, power
 gating, DP, full modeset) — it IS the P6 cold-modeset foundation, not just the HDMI-audio unblock. Effort
 **L/XL**, but bounded (ATOM is a ~50-opcode defined VM) and de-risked Python-first. The DMCUB Path B is
 retained only as a fallback if the interpreter proves intractable (it won't — it's the vendor's own logic).
+
+**A3 adversarial audit (2026-07-18, 6-dimension + per-finding-verify workflow):** 10 findings raised, **1
+confirmed** (severity low, latent): `atom_op_div32` used Cyrius's SIGNED `/` on a 64-bit dividend that goes
+negative when `divmul1`'s MSB is set → diverges from the oracle's unsigned divide. **FIXED** with bit-by-bit
+unsigned division (running remainder stays < src < 2^32, so every compare/shift is positive-safe). DIV32 is
+**not used by the transmitter #76 / encoder #4 tables**, so the A4 audio path was unaffected either way — but
+the interpreter is the P6 foundation, so it's kept a faithful port. The 9 false alarms were deliberate
+documented divergences (unimpl→abort, dropped wall-clock loop-guard, PLL/MC-not-wired) or A4-safe latents.
+**Two A4-safe latents to revisit when extending the interpreter for P6** (both cleared for the transmitter
+path, which nests ≤4 deep with ws ≤8 dwords): (1) the recursion **depth cap is 8** vs the oracle's 32 — bump
+the cap AND the ws-pool level count together if a P6 table nests deeper; (2) each ws slot is a fixed **512 B
+(128 dwords)** but `ws_count` is a u8 (max 255) — a table with `ws_count > 128` would overflow its slot into
+the next depth's; size slots to 1024 B (256 dwords) before running any table with a large workspace.
 
 ## Thesis (SUPERSEDED — see P5b correction above) — own the transmitter, without ATOM, by capture-and-replay
 

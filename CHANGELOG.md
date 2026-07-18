@@ -5,6 +5,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.23] — 2026-07-18 — Sovereign ATOM BIOS interpreter: the HDMI transmitter bring-up (A2/A3/A4)
+
+The 1.55.x display-audio arc reaches its convergence. 1.55.22's T2 probe found the GOP's DMCUB **dormant at
+boot** (held in soft-reset, no firmware) — so the display's HDMI transmitter was lit by **host-ATOM**, not the
+DMCUB. The register class was exhausted long ago (every DCN audio register matches amdgpu byte-for-byte, still
+silent); the missing piece was always the **firmware-driven HDMI transmitter/encoder bring-up** the GOP runs
+as DVI at boot and the raw `DIG_MODE 2→3` bit-flip cannot reproduce. This release makes agnos do it itself, by
+running the vendor's own ATOM command tables through a sovereign interpreter.
+
+### Added
+
+- **`kernel/core/atom.cyr` — a sovereign ATOM BIOS bytecode interpreter** (~600 lines, `#ifdef HDMI_ATOM`).
+  A faithful Cyrius port of amdgpu's `atom.c`, validated line-for-line against the reference oracle
+  `agnosticos/scripts/atom-interp.py`: VBIOS `U8/U16/U32` readers; the operand-decode tables
+  (`arg_mask`/`arg_shift`/`dst_to_src`/`def_dst`); all address spaces (REG via the BAR5 direct window bounded
+  to `<0x20000`, PS, WS + the `ATOM_WS_*` specials, FB scratch, ID, IMM; PLL/MC return 0 — unwired on DCN);
+  `get_src_int`/`put_dst`/`get_dst` on a single global instruction cursor; a structural 127-entry opcode
+  dispatch; and a recursive `execute_table_locked` (CALLTABLE tree, depth-bounded). Runs the two load-bearing
+  commands — `DIGxEncoderControl(#4, STREAM_SETUP, HDMI)` then `DIG1TransmitterControl(#76, ENABLE, HDMI)` —
+  with the iron-derived routing (phyid=0/UNIPHYA, digfe_sel=0x02/DIG1, connobj=0x13/HDMI_TYPE_A, symclk=24150,
+  lanenum=4). **Strategically this is the P6 cold-modeset foundation: it unlocks the entire VBIOS command
+  surface (SetPixelClock, power-gating, DP, full modeset), not just the HDMI-audio unblock.**
+- **`gpu_vbios_acquire()` (`kernel/core/gpu.cyr`, A2)** — acquires the VBIOS ATOM image from the ACPI VFCT
+  table at boot (Renoir/Cezanne is an APU with no discrete flash ROM): verifies VendorID=0x1002, copies the
+  image to a 2 MB page, checks the `55aa` signature, publishes `gpu_vbios_va`/`gpu_vbios_len`. Always compiled
+  (also feeds the read-only `HDMI_AUDIO_DUMP` probe).
+- **Build flags + burn profiles:** `HDMI_ATOM` (run the transmitter bring-up before `gpu_hdmi_audio_enable`),
+  `ATOM_TRACE` (log every MMIO write — `idx`+`val` — for diffing the live sequence against the oracle's
+  5 encoder + 17 transmitter writes), `ATOM_DRY` (reads→0, writes traced-not-applied: runs the full control
+  flow without touching the PHY, so the console is guaranteed to survive). Burn profiles `BURN_HDMI_ATOM`
+  (live) and `BURN_HDMI_ATOM_DRY` (safe validation) in `scripts/burn-prep.sh`. Per-table read/write/delay
+  counters compare against the oracle's 21/17/5.
+
+### Changed
+
+- The HDMI-audio boot path now runs `atom_hdmi_transmitter_bringup()` **before** `gpu_hdmi_audio_enable()`
+  when built with `HDMI_ATOM`. Console-risky (drives the PHY), so it's separately gated from `HDA_HDMI`;
+  recovery is flashing a kernel without the flag. The default/MVP kernel is untouched — the interpreter is an
+  opt-in subsystem and does not count against the MVP binary-size budget.
+
+### Fixed
+
+- **`atom_op_div32` unsigned-division correctness** (found by a 6-dimension adversarial audit of the port
+  against the oracle; 1 confirmed of 10 findings). Cyrius `/` is *signed* (x86 `cqo;idiv`, aarch64 `sdiv`), so
+  a 64-bit dividend whose high dword has bit 31 set went negative and the quotient diverged from the oracle's
+  unsigned divide. Replaced with a bit-by-bit unsigned long division (the running remainder stays `< src <
+  2^32`, keeping every compare/shift positive-safe). Latent on the HDMI path (the transmitter/encoder tables
+  use no 64-bit divide) but fixed for the interpreter's P6 future.
+
 ## [1.55.22] — 2026-07-18 — HDMI transmitter: mechanism RESOLVED (DMCUB), + the T2 attach probe
 
 The HDMI-audio blocker is now a fully-scoped subsystem with a proven mechanism. The prior "full HDMI modeset"
