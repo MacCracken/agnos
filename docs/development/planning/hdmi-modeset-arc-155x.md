@@ -95,6 +95,39 @@ PSP-load `renoir_dmcub.bin` itself (Path B: INST_CONST/BSS FB windows, `DMCUB_RE
 ring — a multi-cycle subsystem, and the reset tears down the GOP's DMCUB on a single-console box). Biggest
 risk = the firmware-load blocker; T2's read-only probe decides it before any commit.
 
+## ✅ T2 RESULT + PIVOT (2026-07-18) — DMCUB is DORMANT; the boot-native path is host-ATOM → build an interpreter
+
+**T2 burn (audio_re_8, read-only):** `CC_DC_PIPE_DIS=0x10000` (block present), **`DMCUB_CNTL=0x20000`
+(SOFT_RESET set, ENABLE clear → held in reset, NOT running)**, `SCRATCH0=0` (no fw), `INBOX1 base/size/wptr/
+rptr all 0` (no ring). Verdict: **NOT attach-ready.** The display is up yet the DMCUB never ran ⇒ **the GOP
+brought the transmitter up via HOST-ATOM** (the DMCUB is an OS-driver-loaded thing; at boot it is always
+dormant, firmware modesets go through host-ATOM). So agnos's boot-inherited world is host-ATOM.
+
+**PIVOT: don't build Path B (load the DMCUB — needs the fw blob + a console-risky soft-reset). Do what the
+box does at boot — host-ATOM.** It produces host-MMIO writes (visible/debuggable), needs no firmware load and
+no reset (zero console risk), and is the sovereign-AND-interoperable path (run the vendor's own bytecode).
+
+**VBIOS acquired + parsed** (`sudo cat /sys/kernel/debug/dri/1/amdgpu_vbios`, 54KB, saved `vbios.rom`):
+atomfirmware layout; MasterCommandTable @0x93fa. **Transmitter = command-table index 76, `v1_6`, 262B
+bytecode** (@0xb162). Also present: `DIGxEncoderControl` #4 v1_5 (@0xae4e, 782B), `SetPixelClock` #12 v1_7,
+`EnableDispPowerGating` #13. **Disassembly: the tables branch on `SWITCH` (parameter dispatch) + use `SETPORT`
+(indirect I/O) within ~9 bytes ⇒ parameterized control-flow bytecode, NOT a linear replayable sequence.**
+
+### The A-series bite ladder (sovereign ATOM interpreter)
+
+| Bite | What | Gate |
+|------|------|------|
+| **A0** ✅ | VBIOS acquired + transmitter table located (#76 v1_6) + disassembled → interpreter required. | DONE |
+| **A1** ✅ | **Python ATOM interpreter built + dry-run validated** (`scripts/atom-interp.py`, 1461 lines, verbatim line-for-line port of amdgpu `atom.c` — all 41 `atom_op_*`, 127-entry `opcode_table[]`, all 8 address spaces + `ATOM_WS_*` specials + IIO). Dry-run of `DIG1TransmitterControl(ENABLE, HDMI, phyid=0)` **steps to EOT clean, no desync, 239 opcodes, 21 reads / 17 writes / 5 delays** — and the writes land in **UNIPHYA (0x55xx) + RDPCS/DPCS (0x5Dxx–0x5Exx)** with 5/200/200/5/10µs PHY power sequencing = EXACTLY the RDPCS/DPCS block P5b named as the real transmitter PHY (abs ~0x5DE8). Cross-validates the whole arc. Default dry-run (no HW); `--live` mmaps BAR5. **Residual uncertainty is PARAMS not engine:** phyid (default 0=UNIPHYA, from object-info path0 HDMI→enum_id 1; phyid-sensitive, +0x400/inst), digfe_sel (0x02?), hpdsel (0) — confirm on iron; symclk=24150/lanenum=4/digmode=HDMI/action=ENABLE exact. | DONE (dry-run) |
+| **A2** | **VBIOS acquisition in agnos** — find + read the ATOM image at boot (ACPI VFCT / PCI ROM / VRAM shadow) so agnos has its own copy (no Linux dep). | IRON read-only |
+| **A3** | **Port the interpreter to Cyrius** — mechanical once A1 proves the logic; run the two command tables in `gpu_hdmi_audio_enable`. | IRON — console survives |
+| **A4** | Audio egresses. | IRON — **tone from XB323U** |
+
+**Strategic upside:** the ATOM interpreter unlocks the ENTIRE VBIOS command surface (SetPixelClock, power
+gating, DP, full modeset) — it IS the P6 cold-modeset foundation, not just the HDMI-audio unblock. Effort
+**L/XL**, but bounded (ATOM is a ~50-opcode defined VM) and de-risked Python-first. The DMCUB Path B is
+retained only as a fallback if the interpreter proves intractable (it won't — it's the vendor's own logic).
+
 ## Thesis (SUPERSEDED — see P5b correction above) — own the transmitter, without ATOM, by capture-and-replay
 
 The GOP already runs the **pixel PLL** (241.503 MHz, measured at P3b-i) and the **OTG** (timing, scanning) —
