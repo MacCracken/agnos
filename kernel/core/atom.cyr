@@ -83,9 +83,9 @@ fn atom_u16(off) {
 }
 fn atom_u32(off) {
     return load8(gpu_vbios_va + off)
-         | (load8(gpu_vbios_va + off + 1) << 8)
-         | (load8(gpu_vbios_va + off + 2) << 16)
-         | (load8(gpu_vbios_va + off + 3) << 24);
+    | (load8(gpu_vbios_va + off + 1) << 8)
+    | (load8(gpu_vbios_va + off + 2) << 16)
+    | (load8(gpu_vbios_va + off + 3) << 24);
 }
 
 # ============================================================================
