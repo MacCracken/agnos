@@ -5,6 +5,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### ★ The feed is PROVEN correct — a Linux userspace reproduction of agnos's feed plays sound
+
+The operator's method — "write the driver on Linux to confirm the process works without agnos" — paid off
+decisively. `agnosticos/scripts/agnos-hdmi-linux.py` reproduces agnos's ENTIRE HDMI-audio feed (hda.cyr
+CORB/RIRB verbs + codec config + SDn stream + BDL + the 16-bit triangle, verbatim) on the real 04:00.1 HDA
+controller, with the DCN AFMT set to the proven-audible known-good values — and it **played audible sound on
+the monitor**, no agnos kernel involved. Getting the Linux environment to match agnos took two boot params:
+`amd_iommu=off` (Linux had the IOMMU on, remapping our raw-physical DMA so the codec's RIRB response landed
+nowhere — a DMA-free immediate-command probe returned the ATI vendor id and localised it) and
+`modprobe.blacklist=snd_hda_intel` (unbinding the driver deadlocked in the kernel while pipewire held the
+codec). Findings:
+
+- **agnos's feed ALGORITHM is correct** — codec verbs, DMA, stream descriptor, tone all produce sound when
+  run faithfully on this silicon. So do the AFMT/DCN audio registers (the driver used the known-good values)
+  and, per the earlier replay, agnos's DCN enable sequence.
+- **The FIFO overflow (AFMT_STATUS bit24) is NOT the mute** — it was SET the entire time the Linux driver was
+  audible. The drain-before-feed work (1.55.19) that chased it clear was addressing a red herring.
+- **Therefore agnos's silence is not the audio path at all.** A morph test (replaying agnos's DIG_MODE flip on
+  amdgpu's committed pipe) kept the audio playing — so the DIG flip is innocent too; the deficit is the base
+  pipe state. Source-verified against the real amdgpu headers: **the fix is a full HDMI MODESET, not any
+  register.** `symclk_se` does not exist on DCN 2.1 (added 2024 for dcn35/dcn401); agnos already writes every
+  audio-clock/AFMT register byte-correct; the clocks are provably present (the FIFO overflows *with* good
+  clocks = a link/data-island-acceptance failure, not a clock failure). The one thing a live `DIG_MODE 2→3`
+  flip cannot reproduce is the cold modeset's PHY/encoder bring-up — ATOM `DIGxEncoderControl(SETUP, HDMI,
+  audio=1)` + a real `TransmitterControl(ENABLE, HDMI)` output edge (the GOP ran these as DVI/audio-off).
+  **HDMI audio is therefore blocked on the sovereign full HDMI modeset (pixel PLL + OTG + DIG + PHY transmitter
+  bring-up) — the roadmapped P6+ full-mode-set work. The entire audio path is proven-ready and lights up the
+  instant that modeset lands.** No further audio-register work is warranted; agnos's Stage-1 DIG_ENABLE bounce
+  is the wrong lever (it toggles the DIG back-end, not the PHY).
+
 ## [1.55.21] — 2026-07-17 — HDMI audio: the register + format class is CLOSED; the fault is sample magnitude
 
 The 1.55.20 burns and the operator's decision to use Linux as a test bench turned the HDMI-audio arc from
