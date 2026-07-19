@@ -285,6 +285,16 @@ else
         # ATOM_TRACE=1 — print every MMIO write the ATOM interpreter makes (idx + value) for diffing the
         # live write sequence against the atom-interp.py oracle. Bring-up debug aid; pairs with HDMI_ATOM.
         [ -n "$ATOM_TRACE" ]         && echo '#define ATOM_TRACE'
+        # ATOM_DRY=1 — dry-run validation: the interpreter's atom_reg_read() returns 0 and atom_reg_write()
+        # SUPPRESSES the store (traced, never applied). Runs the full control flow without touching the PHY, so
+        # the console survives. WITHOUT this, HMDI_ATOM drives the PHY live. (Was missing 2026-07-18 — the
+        # "DRY" burn built byte-identical to LIVE and drove the PHY, blacking the iron display. The
+        # atom_hdmi_transmitter_bringup() banner now prints DRY vs LIVE so the boot log is dispositive.)
+        [ -n "$ATOM_DRY" ]           && echo '#define ATOM_DRY'
+        # ATOM_HALT=1 — ISOLATION diagnostic: after the ATOM path, halt (freeze the FB for a photo) BEFORE
+        # gpu_hdmi_audio_enable()'s DIG_MODE flip. Pairs with ATOM_DRY to isolate ATOM-path vs DIG-flip as the
+        # cause of the iron black-screen. Never in a shipping build.
+        [ -n "$ATOM_HALT" ]          && echo '#define ATOM_HALT'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include

@@ -971,6 +971,16 @@ gpu_pixclk_discover();
 # driven transmitter setup, not any register tweak. Console-risky (drives the PHY) — separately gated from
 # HDA_HDMI so a burn can isolate it; recovery is flashing a kernel without HDMI_ATOM.
 atom_hdmi_transmitter_bringup();
+#ifdef ATOM_HALT
+# ISOLATION DIAGNOSTIC: freeze here, BEFORE gpu_hdmi_audio_enable()'s DIG_MODE flip, so the framebuffer holds
+# the ATOM path's step markers for a photo. Pairs with ATOM_DRY (interpreter touches no PHY). If the FB shows
+# the clean 'atom: ... acquired OK / bringup OK' summary, the ATOM path is display-safe and the black screen is
+# gpu_hdmi_audio_enable's; if the FB is black/garbled here, the ATOM path (gpu_vbios_acquire's pmm alloc + copy,
+# or the interpreter walk) is the culprit. Never in a shipping build.
+kprintln("atom: HALT for photo (skipped audio enable)", 43);
+var atom_halt_spin = 0;
+while (atom_halt_spin == 0) { }
+#endif
 #endif
 gpu_hdmi_audio_enable();
 # Sink-select (the parked HDA bite 4): make the GPU's HDMI controller the LIVE refill target so a ring-3

@@ -49,7 +49,23 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_HDMI_ATOM_DRY:-}" ]; then
+if [ -n "${BURN_HDMI_ATOM_HALT:-}" ]; then
+    # THE A4 ISOLATION BURN. Both the live and dry ATOM kernels blacked the iron display before the shell,
+    # with no log — and DRY writes NOTHING to the PHY, so the interpreter's HW writes are not the cause. This
+    # kernel runs the full ATOM DRY path (gpu_vbios_acquire + the interpreter, zero PHY writes), prints its
+    # step markers, then HALTS — freezing the framebuffer BEFORE gpu_hdmi_audio_enable()'s DIG_MODE flip. The
+    # operator photographs the FB (13NN_*.jpg). READ:
+    #   * clean 'gpu: vbios ... acquired OK' + 'atom: ... bringup OK' summary, screen intact
+    #       => the ATOM path is display-safe; the black screen is gpu_hdmi_audio_enable's DIG flip (investigate
+    #          there — prior HDA_HDMI burns kept video, so something in the new path changed its behaviour).
+    #   * black or garbled FB at the halt, or the markers stop partway
+    #       => the ATOM path itself broke the display (gpu_vbios_acquire's pmm_alloc_2mb landing in the APU UMA
+    #          carveout + the 1 MB VBIOS copy is the prime suspect); the last visible marker localizes it.
+    # No ATOM_TRACE (keep the summary on one screen). No PHY drive. No audio.
+    echo "[2/2] Building the A4 ISOLATION kernel (HDA_HDMI + HDMI_ATOM + ATOM_DRY + ATOM_HALT: run the ATOM path with zero PHY writes, then FREEZE the framebuffer before the DIG flip; photograph the FB to isolate ATOM-path vs DIG-flip)."
+    BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 ATOM_DRY=1 ATOM_HALT=1"
+    BUILD_TAG="HDA_HDMI+HDMI_ATOM+ATOM_DRY+ATOM_HALT"
+elif [ -n "${BURN_HDMI_ATOM_DRY:-}" ]; then
     # THE A4 DRY-VALIDATION BURN (safe fallback). Same as BURN_HDMI_ATOM but ATOM_DRY suppresses every MMIO
     # write and forces reads to 0 — the interpreter runs its full control flow WITHOUT touching the PHY, so
     # the console is guaranteed to survive and `run /bin/klug > /f/dump.txt` always works. The ATOM_TRACE

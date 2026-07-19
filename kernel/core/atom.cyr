@@ -75,13 +75,21 @@ var atom_scratch_size = 0;    # bytes
 # ============================================================================
 #  VBIOS byte readers (atom-bits.h: U8/U16/U32, little-endian, absolute offset)
 # ============================================================================
+# Bounded to the acquired image [0, gpu_vbios_len): a well-formed VBIOS never
+# reads past its own length, so an out-of-range offset means a bug or a divergent
+# iron image — return 0 rather than page-fault the box (a fault pre-shell = a
+# black screen + reset with no log). This is the only unbounded fault surface in
+# a DRY run (the interpreter's MMIO is suppressed but these reads are not).
 fn atom_u8(off) {
+    if (off < 0 || off >= gpu_vbios_len) { return 0; }
     return load8(gpu_vbios_va + off);
 }
 fn atom_u16(off) {
+    if (off < 0 || off + 1 >= gpu_vbios_len) { return 0; }
     return load8(gpu_vbios_va + off) | (load8(gpu_vbios_va + off + 1) << 8);
 }
 fn atom_u32(off) {
+    if (off < 0 || off + 3 >= gpu_vbios_len) { return 0; }
     return load8(gpu_vbios_va + off)
     | (load8(gpu_vbios_va + off + 1) << 8)
     | (load8(gpu_vbios_va + off + 2) << 16)
@@ -824,6 +832,11 @@ fn atom_run_transmitter_enable_hdmi() {
 # Returns 1 on clean bring-up. Console-risky (drives the PHY) — call only behind
 # the HDMI audio gate.
 fn atom_hdmi_transmitter_bringup() {
+    #ifdef ATOM_DRY
+    kprintln("atom: DRY build (no MMIO)", 25);
+    #else
+    kprintln("atom: LIVE build (drives PHY)", 29);
+    #endif
     if (gpu_vbios_acquire() == 0) { kprintln("atom: vbios acquire failed", 26); return 0; }
     if (atom_parse() == 0) { return 0; }
     if (atom_init_mem() == 0) { return 0; }
