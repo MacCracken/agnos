@@ -295,6 +295,11 @@ else
         # gpu_hdmi_audio_enable()'s DIG_MODE flip. Pairs with ATOM_DRY to isolate ATOM-path vs DIG-flip as the
         # cause of the iron black-screen. Never in a shipping build.
         [ -n "$ATOM_HALT" ]          && echo '#define ATOM_HALT'
+        # ATOM_RUN_TRANSMITTER=1 — also run DIG1TransmitterControl(ENABLE) after the encoder setup. OFF by
+        # default: on iron (1.55.23) the transmitter's PHY power-cycle blanks the live console pipe non-
+        # recoverably. The default HDMI_ATOM build runs the encoder setup ONLY (DIG front-end, PHY-safe).
+        # Enable this only with a full modeset (SetPixelClock + OTG recommit) in place.
+        [ -n "$ATOM_RUN_TRANSMITTER" ] && echo '#define ATOM_RUN_TRANSMITTER'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include

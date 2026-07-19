@@ -75,17 +75,25 @@ elif [ -n "${BURN_HDMI_ATOM_DRY:-}" ]; then
     echo "[2/2] Building the A4 DRY-VALIDATION kernel (HDA_HDMI + HDMI_ATOM + ATOM_DRY + ATOM_TRACE: run the ATOM interpreter with writes SUPPRESSED; capture the trace and diff vs the oracle. No PHY drive, console safe, no audio)."
     BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_DRY=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_DRY+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_ATOM_FULL:-}" ]; then
+    # THE ENCODER+TRANSMITTER burn (ATOM_RUN_TRANSMITTER=1). ⚠ The transmitter ENABLE power-cycles the PHY and
+    # BLANKS THE LIVE CONSOLE PIPE NON-RECOVERABLY on iron (proven 1.55.23) unless a full modeset (SetPixelClock
+    # + OTG recommit) is also in place. DO NOT flash this until that modeset exists. Kept for that future work.
+    echo "[2/2] Building the A4 FULL kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE + HDMI_AUDIO_DUMP: encoder + transmitter. ⚠ BLANKS THE CONSOLE without a full modeset — do not flash yet)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_HDMI_ATOM:-}" ]; then
-    # THE A4 BURN — the whole 1.55.x arc's convergence. The register-value class is exhausted (every DCN
-    # audio register matches amdgpu byte-for-byte, still silent); the arc proved HDMI audio is blocked on the
-    # FIRMWARE-driven HDMI transmitter/encoder bring-up the GOP did as DVI and the raw DIG_MODE flip cannot
-    # reproduce. This kernel runs the sovereign ATOM interpreter (core/atom.cyr) to re-issue
-    # DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE) on the live pipe, BEFORE the proven-ready
-    # audio path (gpu_hdmi_audio_enable). ATOM_TRACE prints every MMIO write for diffing against the
-    # atom-interp.py oracle (transmitter dry-run: 21 reads / 17 writes / 5 delays). HDMI_AUDIO_DUMP keeps the
-    # register read-back. Console-risky (drives the PHY) — recovery is flashing without HDMI_ATOM.
-    # PASS IS THE OPERATOR'S EARS: a tone from the XB323U over HDMI.
-    echo "[2/2] Building the A4 ATOM-transmitter kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_TRACE + HDMI_AUDIO_DUMP: sovereign firmware HDMI transmitter bring-up, then the proven audio path; watch serial for the atom write trace + LISTEN)."
+    # THE A4 ENCODER-ONLY BURN (the audio attempt). Iron 1.55.23 proved: the interpreter is bit-correct, but
+    # DIG1TransmitterControl(ENABLE) power-cycles the PHY and blanks the live pipe. So this runs
+    # DIGxEncoderControl(#4, STREAM_SETUP, HDMI) ONLY — 5 writes in the DIG1 digital front-end (0x56xx),
+    # DISJOINT from the PHY (0x5Dxx) — putting DIG1 in true HDMI mode with proper data-island setup, which the
+    # raw DIG_MODE bit-flip only half-does. The transmitter (#76) is gated OFF (ATOM_RUN_TRANSMITTER unset).
+    # Display risk: at worst a transient, self-recovering front-end flicker (the DIG_START strobe) — the same
+    # survivable class as the DIG_MODE flip, NOT the transmitter's non-recoverable blank. Then the proven audio
+    # path (gpu_hdmi_audio_enable) runs. LIVE (no ATOM_DRY): the encoder writes are actually applied, RMW'd
+    # against the real running registers. ATOM_TRACE logs the 5 writes; HDMI_AUDIO_DUMP keeps the read-back.
+    # Recovery if it misbehaves: flash without HDMI_ATOM. PASS IS THE OPERATOR'S EARS: a tone from the XB323U.
+    echo "[2/2] Building the A4 ENCODER-ONLY kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_TRACE + HDMI_AUDIO_DUMP: run DIGxEncoderControl(HDMI) LIVE — PHY-safe front-end setup, transmitter SKIPPED — then the audio path. Recoverable flicker at worst; LISTEN for the tone)."
     BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_TRACE+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_HDMI_SWEEP:-}" ]; then

@@ -844,12 +844,25 @@ fn atom_hdmi_transmitter_bringup() {
     var r1 = atom_run_encoder_hdmi();
     kprint("atom: encoder rc=", 17); kprint_num(r1); kprintln("", 0);
     atom_print_counts();
+    var ok = 0;
+    if (r1 == 0) { ok = 1; }
+    # DIG1TransmitterControl(#76, ENABLE) power-cycles the PHY (556F power + 5E03 lane reset + 5DF0/5DE9 RDPCS)
+    # and blanks the LIVE GOP-DVI console pipe NON-recoverably — amdgpu only runs it inside a full modeset
+    # (SetPixelClock + OTG re-commit), which agnos skips. OFF by default (iron-confirmed 1.55.23). The
+    # encoder-setup-only path above puts DIG1 in true HDMI mode via the digital front-end (regs 0x56xx —
+    # disjoint from the PHY at 0x5Dxx), worst case a transient self-recovering flicker. Re-enable
+    # ATOM_RUN_TRANSMITTER only once the full modeset (pixel-clock + OTG recommit) is in place.
+    #ifdef ATOM_RUN_TRANSMITTER
     kprintln("atom: running DIG1TransmitterControl ENABLE HDMI", 48);
     var r2 = atom_run_transmitter_enable_hdmi();
     kprint("atom: transmitter rc=", 21); kprint_num(r2); kprintln("", 0);
     atom_print_counts();
-    if (r1 == 0 && r2 == 0) { kprintln("atom: HDMI transmitter bringup OK", 33); return 1; }
-    kprintln("atom: HDMI transmitter bringup had errors", 41);
+    if (r2 != 0) { ok = 0; }
+    #else
+    kprintln("atom: transmitter SKIPPED (encoder-only, PHY untouched)", 55);
+    #endif
+    if (ok == 1) { kprintln("atom: HDMI bringup OK", 21); return 1; }
+    kprintln("atom: HDMI bringup had errors", 29);
     return 0;
 }
 
