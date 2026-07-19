@@ -5,6 +5,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.24] — 2026-07-19 — ATOM interpreter PROVEN ON IRON; A4 narrows to the DCCG symbol clock (work demark)
+
+A work-demark cut. The 1.55.23 sovereign ATOM interpreter is now **validated bit-correct on real hardware**,
+and the A4 (HDMI-audio egress) search has narrowed — from both sides — to a single host-visible register the
+GOP left unset. A4 is still open; this cut marks the boundary.
+
+### Added
+
+- **The ATOM interpreter is PROVEN BIT-CORRECT ON IRON.** The 1.55.23 DRY boot trace (interpreter runs, MMIO
+  suppressed) matches the `atom-interp.py` oracle **exactly** — `DIGxEncoderControl(#4)` = 5 writes,
+  `DIG1TransmitterControl(#76)` = 21 reads / 17 writes / 5 delays, byte-for-byte, with **no amdgpu in the
+  loop**. `gpu_vbios_acquire` (A2) also confirmed on iron (`vbios ATOM image acquired OK`, len=55296). Kept as
+  `agnosticos/docs/development/prior-art/atom-iron-dry-trace-0718.txt`.
+- **DCCG symbol-clock re-prime** (`HDMI_DCCG`, `gpu_hdmi_audio_enable`): agnos was omitting the **SYMCLKA**
+  write (abs dword `0x159 = 0x000d000d`) amdgpu makes for HDMI. Confirmed as DIG1's clock — DIG1 routes to
+  UNIPHYA (phyid=0), and amdgpu's own HDMI-on-DIG1 set `0x159` active (its AVI infoframe landed at abs `0x564d`
+  = agnos's DIG1 `AFMT_GENERIC_0`). Host-visible, no PHY power-cycle — the current, display-safe A4 lead.
+- Ground-truth from `scripts/capture-amdgpu-modeset-clock.sh` (new) + a mining of the existing amdgpu modeset
+  capture: the pixel-clock/DCCG programming is host-visible; the transmitter/PHY is DMCUB (~50 opaque inbox
+  commands) for amdgpu but host-ATOM `#76` for agnos.
+- Build flags: `ATOM_DRY` (interpreter dry-run — no MMIO), `ATOM_TRACE` (per-write trace), `ATOM_HALT`
+  (isolation freeze), `ATOM_RUN_TRANSMITTER` (opt-in the pipe-blanking transmitter), `HDMI_DCCG`. Burn
+  profiles `BURN_HDMI_ATOM_DRY`, `BURN_HDMI_DCCG`, `BURN_HDMI_ATOM_FULL`, `BURN_HDMI_ATOM_HALT`.
+
+### Changed
+
+- **The ATOM HDMI path runs the encoder setup ONLY by default.** `DIG1TransmitterControl(ENABLE)` is now
+  gated behind `ATOM_RUN_TRANSMITTER` (off) because on iron its PHY power-cycle (556F/5E03/5DF0) **blanks the
+  live console pipe non-recoverably** — amdgpu only runs it inside a full modeset agnos doesn't yet do. The
+  encoder-setup-only path is display-safe (front-end only, disjoint from the PHY).
+- Bounded the interpreter's VBIOS readers `atom_u8/u16/u32` to `[0, gpu_vbios_len)` (return 0, never
+  page-fault) — the only unbounded fault surface in a dry run.
+- Doc cleanup for handoff: `state.md` header refreshed to 1.55.24 (was a stale 1.53.x narrative); the display
+  planning docs got a clear current-status block + entry-point pointers + superseded-section notes; a
+  `prior-art/README.md` capture index.
+
+### Fixed
+
+- **`ATOM_DRY` was a no-op — a new `#ifdef` flag never wired into `build.sh`.** The "DRY" and "live" kernels
+  built byte-identical (`cmp`-proven), so the "safe" burn drove the PHY and blacked the iron display twice.
+  Added the `build.sh` define, plus a dispositive `atom: DRY build (no MMIO)` / `atom: LIVE build (drives PHY)`
+  boot banner. **Lesson: verify a mode flag by `cmp`-ing the two binaries, not by the burn tag.**
+
 ## [1.55.23] — 2026-07-18 — Sovereign ATOM BIOS interpreter: the HDMI transmitter bring-up (A2/A3/A4)
 
 The 1.55.x display-audio arc reaches its convergence. 1.55.22's T2 probe found the GOP's DMCUB **dormant at
