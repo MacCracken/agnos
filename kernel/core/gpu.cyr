@@ -2981,13 +2981,17 @@ fn gpu_hdmi_audio_enable() {
     # safer than the transmitter (which blanks the pipe). This may be the missing symbol clock that carries
     # audio to the sink without the transmitter enable. base_seg 0 => absolute dword index. Single-display box,
     # so SYMCLKB/C/D are already idle (the idle writes are faithful no-ops).
+    # ⚠ ATTRIBUTION STATUS (2026-07-19): this block is a CANDIDATE WITH NO SURVIVING EVIDENCE, not a fix.
+    # It is now INSTRUMENTED rather than blind — read the five registers BEFORE and AFTER. If the "before"
+    # line already shows 000d000d / 000d000a / 00001111, the block never changed anything and the 1.55.24
+    # "breakthrough" is closed as a no-op. Reading first also costs nothing: gpu_reg32 is a pure load.
     #ifdef HDMI_DCCG
-    gpu_reg32_write(0, 0x159, 0x000D000D);   # SYMCLKA (DIG1 / UNIPHYA) — ENABLE
-    gpu_reg32_write(0, 0x15A, 0x000D000A);   # SYMCLKB idle
-    gpu_reg32_write(0, 0x15B, 0x000D000A);   # SYMCLKC idle
-    gpu_reg32_write(0, 0x15C, 0x000D000A);   # SYMCLKD idle
-    gpu_reg32_write(0, 0x176, 0x00001111);   # DCCG companion amdgpu writes alongside the symclk
+    gpu_symclk_capture();
+    kprintln("gpu: hdmi DCCG symclk BEFORE", 28);
+    gpu_symclk_report();
+    gpu_symclk_apply();
     kprintln("gpu: hdmi DCCG symclk re-prime (SYMCLKA on)", 43);
+    gpu_symclk_report();
     #endif
 
     # --- 4. Azalia endpoint: configure, then enable ---
@@ -3679,6 +3683,111 @@ fn gpu_hdmi_audio_crc_one(d, source) {
     return 1;
 }
 
+# NOTE ON PLACEMENT: these live OUTSIDE #ifdef HDMI_AUDIO_DUMP on purpose. Their consumers are the
+# HDMI_DCCG boot path and the HDMI_SYMCLK_AB in-boot A/B, both of which can be built without the dump.
+# They were briefly declared inside the dump guard — a narrower #ifdef than the consumer — which built
+# clean only because both burn profiles happen to set HDMI_AUDIO_DUMP too, and emitted
+# 'undefined function gpu_symclk_capture' with a REACHABLE call site the moment HDMI_DCCG was built
+# alone. See [[reference_cyrius_control_flow_idioms]]: a shared decl must never sit behind a narrower
+# guard than the code that calls it.
+# === A4 SYMCLK attribution instrument =======================================================
+# WHY THIS EXISTS: 1.55.24 wrote five blind absolute stores (0x159/15A/15B/15C/176) and the burn was written
+# up as "the DCCG symclk re-prime ARMED THE SINK". The re-audit killed that: the symbol clock reads ALREADY ON
+# in every silent burn (`audio probe dig1 fe=1000000 be=101` — both DIG_SYMCLK_*_ON acks SET, byte-identical
+# across all eight logs); the shutdown pop predates the write by five burns (first heard at audio_re_5 /
+# 1.55.20); the operator reports the noise floor recurred on several burns in the cycle; and NOT ONE dumped
+# register differs between the silent burn 8 and the "armed" burn 10. The write had no pre-read, no readback
+# and no dump row, so there is no evidence any bit ever changed. These helpers close that hole: capture the
+# pre-write values, apply, restore, and report — so the block can be PROVEN a no-op rather than argued about.
+var gpu_symclk_s159 = 0;
+var gpu_symclk_s15a = 0;
+var gpu_symclk_s15b = 0;
+var gpu_symclk_s15c = 0;
+var gpu_symclk_s176 = 0;
+var gpu_symclk_have = 0;
+
+# Snapshot the pre-write state ONCE. Idempotent: a second call is a no-op, so the A/B loop can never
+# overwrite the pristine values with its own applied ones.
+fn gpu_symclk_capture() {
+    if (gpu_symclk_have == 1) { return 0; }
+    gpu_symclk_s159 = gpu_reg32(0, 0x159);
+    gpu_symclk_s15a = gpu_reg32(0, 0x15A);
+    gpu_symclk_s15b = gpu_reg32(0, 0x15B);
+    gpu_symclk_s15c = gpu_reg32(0, 0x15C);
+    gpu_symclk_s176 = gpu_reg32(0, 0x176);
+    gpu_symclk_have = 1;
+    return 0;
+}
+
+# One line, five live reads. THE decisive readout: if these already equal amdgpu's values BEFORE the write,
+# the whole block is a no-op and the attribution collapses with no further burn.
+fn gpu_symclk_report() {
+    kprint("gpu: symclk 159=", 16); kprint_hex(gpu_reg32(0, 0x159));
+    kprint(" 15a=", 5);             kprint_hex(gpu_reg32(0, 0x15A));
+    kprint(" 15b=", 5);             kprint_hex(gpu_reg32(0, 0x15B));
+    kprint(" 15c=", 5);             kprint_hex(gpu_reg32(0, 0x15C));
+    kprint(" 176=", 5);             kprint_hex(gpu_reg32(0, 0x176));
+    kprintln("", 0);
+    return 0;
+}
+
+# The five amdgpu values. Host DCCG only — no PHY power-cycle, so display-safe (burn 10 ran them and finished
+# to a shell with a live 2560x1440 scanout).
+fn gpu_symclk_apply() {
+    gpu_symclk_capture();
+    gpu_reg32_write(0, 0x159, 0x000D000D);
+    gpu_reg32_write(0, 0x15A, 0x000D000A);
+    gpu_reg32_write(0, 0x15B, 0x000D000A);
+    gpu_reg32_write(0, 0x15C, 0x000D000A);
+    gpu_reg32_write(0, 0x176, 0x00001111);
+    return 0;
+}
+
+# Put back exactly what the GOP left. Without this the A/B has no "off" window.
+fn gpu_symclk_restore() {
+    if (gpu_symclk_have == 0) { return 0; }
+    gpu_reg32_write(0, 0x159, gpu_symclk_s159);
+    gpu_reg32_write(0, 0x15A, gpu_symclk_s15a);
+    gpu_reg32_write(0, 0x15B, gpu_symclk_s15b);
+    gpu_reg32_write(0, 0x15C, gpu_symclk_s15c);
+    gpu_reg32_write(0, 0x176, gpu_symclk_s176);
+    return 0;
+}
+
+# === ACR N-scale discriminator ==============================================================
+# HDMI_ACR_STATUS_0 is the one register in this block that demonstrably MOVES: CTS reads 241502/241503/241504
+# across burns (dead DIGs read 0), agnos never writes those values, and ACR_SOURCE=0 means HW-measured. But at
+# N=6144 / Fs=48kHz, CTS = f_TMDS*N/(128*Fs) reduces to exactly f_pixel in kHz — so "measured against the
+# audio clock" and "just counting pixels" predict the SAME number. Doubling N separates them: if the audio
+# clock is genuinely in the measurement loop, CTS doubles. Display-safe — ACR affects only the audio
+# clock-regeneration packet, never TMDS timing. N is restored before returning.
+fn gpu_hdmi_acr_nscale() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_audio_dig < 0) { return 0; }
+    var d = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    var n0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d);
+    var c0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_STATUS_0 + d) >> GPU_HDMI_ACR_CTS_48_SHIFT;
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d,
+    (n0 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | (GPU_HDMI_ACR_N_48_VAL * 2));
+    gpu_udelay(200000);
+    var c1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_STATUS_0 + d) >> GPU_HDMI_ACR_CTS_48_SHIFT;
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d, n0);
+    gpu_udelay(200000);
+    var c2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_STATUS_0 + d) >> GPU_HDMI_ACR_CTS_48_SHIFT;
+    kprint("gpu: acr cts ", 13);   kprint_num(c0);
+    kprint(" -> ", 4);             kprint_num(c1);
+    kprint(" -> ", 4);             kprint_num(c2);
+    kprintln(" (n doubled then restored)", 26);
+    # The verdict, stated so the log reads it out instead of the operator deriving it.
+    if (c1 > (c0 + (c0 >> 1))) {
+        kprintln("gpu: acr cts scaled with n -- audio clock is in the measurement loop", 68);
+    } else {
+        kprintln("gpu: acr cts did not scale with n -- pixel-only counter, says nothing about audio", 81);
+    }
+    return 0;
+}
+
+
 #ifdef HDMI_AUDIO_DUMP
 # Dump the display-audio block AFTER the enable path has run, in the exact register order and naming of
 # agnosticos/scripts/dump-dcn-audio.py, so agnos's state can be diffed mechanically against the known-good
@@ -3714,6 +3823,27 @@ fn gpu_audio_dump() {
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_STATUS_0 + d)); kprintln("", 0);
     kprint("HDMI_ACR_STATUS_1      ", 23);
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_STATUS_1 + d)); kprintln("", 0);
+    # The three programmed CTS registers, never dumped before. FREE ECHO TEST: agnos declines to write CTS
+    # (ACR_SOURCE=0 = HW-measured) and its only CTS constant is 0x3AF5C000 (241500). If these read anything
+    # other than ~241502, ACR_STATUS_0 is not echoing a programmed value and it is a real instrument.
+    kprint("HDMI_ACR_48_0          ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d)); kprintln("", 0);
+    kprint("HDMI_ACR_44_0          ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d)); kprintln("", 0);
+    kprint("HDMI_ACR_32_0          ", 23);
+    kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d)); kprintln("", 0);
+    # The five DCCG symbol-clock registers the 1.55.24 write touched blind. Permanent rows now, so no future
+    # session has to argue about whether that block changed anything.
+    kprint("DCCG_SYMCLKA (0x159)   ", 23);
+    kprint_hex(gpu_reg32(0, 0x159)); kprintln("", 0);
+    kprint("DCCG_SYMCLKB (0x15a)   ", 23);
+    kprint_hex(gpu_reg32(0, 0x15A)); kprintln("", 0);
+    kprint("DCCG_SYMCLKC (0x15b)   ", 23);
+    kprint_hex(gpu_reg32(0, 0x15B)); kprintln("", 0);
+    kprint("DCCG_SYMCLKD (0x15c)   ", 23);
+    kprint_hex(gpu_reg32(0, 0x15C)); kprintln("", 0);
+    kprint("DCCG_COMPANION (0x176) ", 23);
+    kprint_hex(gpu_reg32(0, 0x176)); kprintln("", 0);
     kprint("HDMI_AUDIO_PKT_CONTROL ", 23);
     kprint_hex(gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d)); kprintln("", 0);
     kprint("HDMI_ACR_PKT_CONTROL   ", 23);

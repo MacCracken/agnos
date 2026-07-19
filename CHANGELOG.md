@@ -5,6 +5,63 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **A4 attribution control — the in-boot SYMCLK A/B (`HDMI_SYMCLK_AB`, burn profile `BURN_HDMI_SYMCLK_AB`).**
+  `gpu_symclk_capture/_report/_apply/_restore` (`gpu.cyr`) snapshot, apply and restore the five DCCG stores at
+  abs `0x159`/`0x15A`/`0x15B`/`0x15C`/`0x176`; `main.cyr` runs two passes of (symclk-OFF window → symclk-ON
+  window), ~6 s each, post-`sti` while the HDA tone streams, each bracketed by a five-register readout. A
+  cross-boot comparison cannot settle this — sink amp/mute/mode state is **sink-latched** and every agnos
+  instrument is source-side — so the A/B has to happen inside one boot against one sink state.
+- **`gpu_hdmi_acr_nscale()`** — doubles `HDMI_ACR_N_48` (6144 → 12288), re-reads `HDMI_ACR_STATUS_0`, restores
+  N, and states the verdict. `HDMI_ACR_STATUS_0` is the one register in this block that demonstrably moves
+  (CTS 241502/3/4 across burns; dead DIGs read 0) but at N=6144/48 kHz `CTS = f_TMDS·N/(128·Fs)` reduces to
+  exactly `f_pixel` in kHz, so a pixel counter and a real audio-clock measurement predict the same number.
+  Scaling N separates them.
+- **`HDMI_AUDIO_DUMP` rows** for `HDMI_ACR_48_0`/`44_0`/`32_0` and all five DCCG symbol-clock registers.
+- **`scripts/kprint-len-check.sh`, wired into `check.sh`** (now 12 checks). `kprint`/`kprintln` take
+  (string, length) and the compiler does not verify they agree; the build stays green either way. Caught four
+  off-by-ones in this cut's own new code — every one of the other 913 literals in `gpu.cyr` + `main.cyr` was
+  correct, so the defect is introduced-by-hand, not systemic. Failures print the mismatching literal.
+
+### Changed
+
+- **The `HDMI_DCCG` block is instrumented instead of blind** — it now reads the five registers *before* the
+  write and reports both sides. If the "before" values already hold amdgpu's, the block is a proven no-op.
+- **⚠ RETRACTED: "the DCCG symclk re-prime ARMED THE SINK" (1.55.24).** Downgraded to **low confidence** by an
+  adversarial re-audit. (1) The symbol clock reads **already ON in every silent burn** — `audio probe dig1
+  fe=1000000 be=101`, both `DIG_SYMCLK_FE_ON`/`BE_ON` read-only acks SET, byte-identical across all eight burn
+  logs. (2) The shutdown release-pop was first heard at `audio_re_5` / **1.55.20**, five burns earlier, and the
+  operator confirms the noise floor recurred on several burns in the cycle — **nothing observed on burn 10 was
+  new.** (3) **Zero instruments moved**: every dumped register is byte-identical between the silent burn 8 and
+  the "armed" burn 10. Separately, the "two-variable burn" worry is resolved and was *not* the confound —
+  burns `audio_re_3`–`_8` ran neither ATOM nor SYMCLKA and were all silent, so burn 10 is "burn 8 + SYMCLKA",
+  a one-variable experiment. The uncontrolled variable was the **oracle**, not the register.
+- **⛔ CANCELLED: the planned DCCG audio-DTO read-clock discriminator — it is an echo register.**
+  `DCCG_AUDIO_DTO0_PHASE`/`_MODULE` are each a single 32-bit field bearing the register's own name
+  (`dcn_2_1_0_sh_mask.h`) — divider config, no accumulator; DCN 2.1 exposes no moving audio-DTO register
+  (contrast `DCCG_GTC_CURRENT`, which AMD does expose for the GTC DTO). A frozen read would prove nothing and
+  a moving read is impossible. The question it posed is also already answered: `AFMT_AUDIO_CRC_DONE` asserts
+  only after 2048 samples traverse the AFMT and both taps complete with content ⇒ **the read side drains.**
+  Also do **not** set `DTO2_USE_512FBR_DTO` (bit20) — amdgpu sets it only on the DP branch, and the audibly
+  playing HDMI link reads `DCCG_AUDIO_DTO_SOURCE = 0`.
+
+### Fixed
+
+- **`burn-prep.sh` marker-coverage gap** — `verify_marker` had arms only for `HDA_HDMI`, `HDA_TONE`,
+  `HDMI_AUDIO_DUMP` and `HDMI_AUDIO_SWEEP`, yet the run printed "markers verified: the $BUILD_TAG code is
+  compiled AND reached" for the **whole tag**. Every `HDMI_DCCG` and `ATOM_*` burn therefore shipped
+  unverified for the very flag under test, the 1.55.24 DCCG burn included. Arms added for `HDMI_DCCG`,
+  `HDMI_SYMCLK_AB` and `ATOM_DRY`/`HDMI_ATOM`. Same family as the `ATOM_DRY` no-op.
+- **`burn-prep.sh` ambient-environment leak** — `env $BUILD_ENV sh scripts/build.sh` *adds* to the inherited
+  environment rather than replacing it, so an exported `HDMI_ATOM=1` (or any other flag) lingering in the
+  operator's shell reached `build.sh` and was `#define`d **regardless of the selected profile**, silently
+  producing an artifact the burn tag does not describe. All known build flags are now explicitly cleared.
+- **A reachable-undef trap, caught pre-burn.** The new `gpu_symclk_*` helpers were briefly declared inside
+  `#ifdef HDMI_AUDIO_DUMP` — a narrower guard than their `HDMI_DCCG` consumer. It built clean only because
+  both burn profiles happen to set the dump flag, and emitted `undefined function gpu_symclk_capture` with a
+  **reachable** call site the moment `HDMI_DCCG` was built alone. Moved above the guard.
+
 ## [1.55.24] — 2026-07-19 — ATOM interpreter PROVEN ON IRON; A4 narrows to the DCCG symbol clock (work demark)
 
 A work-demark cut. The 1.55.23 sovereign ATOM interpreter is now **validated bit-correct on real hardware**,

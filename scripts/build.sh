@@ -280,6 +280,15 @@ else
         # host-visible DCCG writes amdgpu makes for HDMI (abs 0x159-0x15c, 0x176) that agnos omitted, replicated
         # from the amdgpu modeset capture (ground truth). No PHY power-cycle ⇒ display-safe. Requires HDA_HDMI.
         [ -n "$HDMI_DCCG" ]          && echo '#define HDMI_DCCG'
+        # HDMI_SYMCLK_AB=1 — the IN-BOOT A/B for the DCCG symbol-clock block (A4 attribution control). Post-sti,
+        # while the HDA tone streams, alternate two labelled ~6 s listening windows: symclk RESTORED to the GOP's
+        # values (window A) then amdgpu's values APPLIED (window B), twice, each bracketed by a five-register
+        # readout — then run the ACR N-scale discriminator. One flash, one sink state, one cable, one volume:
+        # the only thing that changes between windows is the five stores. This is the control the 1.55.24 burn
+        # lacked, and without which "the symclk armed the sink" could not be told from sink drift. Requires
+        # HDA_HDMI + HDA_TONE. Use INSTEAD OF HDMI_DCCG, not with it — HDMI_DCCG applies the write at boot,
+        # which would leave window A already-on and destroy the experiment. Display-safe (host DCCG only).
+        [ -n "$HDMI_SYMCLK_AB" ]     && echo '#define HDMI_SYMCLK_AB'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

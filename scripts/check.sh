@@ -24,6 +24,19 @@ echo "--- Build ---"
 sh "$ROOT/scripts/build.sh" > /dev/null 2>&1
 check "x86_64 build" $?
 
+# Source hygiene
+# kprint/kprintln take (string, length) and the compiler does NOT verify the two agree — short truncates the
+# line, long runs past the literal. The build stays green either way, so this only ever surfaced by eye, and
+# an off-by-one in a burn's PASS line is indistinguishable from a failed burn when you are reading a console
+# photo. Wired in 2026-07-19 after a single A4 instrumentation bite introduced four of them (every one of the
+# other 913 literals in gpu.cyr + main.cyr was correct). Failures print in full — a bare FAIL line would not
+# be actionable.
+echo ""
+echo "--- Source Hygiene ---"
+sh "$ROOT/scripts/kprint-len-check.sh" > /tmp/kprint-len-check.log 2>&1 && rc=0 || rc=$?
+check "kprint literal lengths" $rc
+[ "$rc" = "0" ] || cat /tmp/kprint-len-check.log
+
 # Tests
 echo ""
 echo "--- Tests ---"

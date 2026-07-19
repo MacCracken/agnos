@@ -49,7 +49,21 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_HDMI_DCCG:-}" ]; then
+if [ -n "${BURN_HDMI_SYMCLK_AB:-}" ]; then
+    # THE ATTRIBUTION CONTROL BURN. 1.55.24 wrote the five DCCG symbol-clock stores blind and the burn was
+    # written up as "SYMCLKA ARMED THE SINK". The re-audit killed that read: the symbol clock is ALREADY ON in
+    # every silent burn (DIG_SYMCLK_FE_ON/BE_ON both ack SET, identical across all eight logs), the shutdown
+    # pop predates the write by five burns, the operator reports the noise floor recurred on several burns in
+    # the cycle, and not one dumped register differs between the silent burn 8 and the "armed" burn 10.
+    # Cross-boot comparison cannot settle it — sink amp/mute/mode state is SINK-latched and every agnos
+    # instrument is source-side. So do the A/B INSIDE one boot: two labelled ~6 s listening windows, symclk
+    # off then on, twice, each bracketed by a five-register readout, then the ACR N-scale discriminator.
+    # NOTE: deliberately does NOT set HDMI_DCCG — that would apply the write at boot and leave window A
+    # already-on. PASS IS THE OPERATOR'S EARS, and the question is whether A and B DIFFER.
+    echo "[2/2] Building the SYMCLK A/B kernel (HDA_HDMI + HDA_TONE + HDMI_SYMCLK_AB + HDMI_AUDIO_DUMP: two labelled listening windows in ONE boot, symclk OFF then ON; LISTEN for a difference)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_SYMCLK_AB=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_SYMCLK_AB+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_DCCG:-}" ]; then
     # THE DCCG SYMCLK BURN — the de-risked candidate. The amdgpu modeset capture proved agnos omits the DCCG
     # symbol-clock writes amdgpu makes for HDMI (abs 0x159 SYMCLKA-on for DIG1/UNIPHYA, confirmed by DIG1's AVI
     # landing at 0x564d + phyid=0). This applies exactly those writes in gpu_hdmi_audio_enable. NO ATOM
@@ -158,7 +172,15 @@ else
     BUILD_ENV=""
     BUILD_TAG="bare"
 fi
-if ! env $BUILD_ENV sh scripts/build.sh >/tmp/burn-prep-build.log 2>&1; then
+# AMBIENT-ENV LEAK, closed 2026-07-19. `env $BUILD_ENV` ADDS to the inherited environment — it does not
+# replace it. So an exported HDMI_ATOM=1 (or any other flag) lingering in the operator's shell from an earlier
+# experiment reaches build.sh and gets #define'd REGARDLESS of the profile selected above, silently producing
+# an artifact that is not the one the burn tag names. Same family as the ATOM_DRY no-op: the tag stops
+# describing the binary. Clear every known build flag first, then apply only the profile's own.
+if ! env -u HDA_HDMI -u HDA_TONE -u HDMI_DCCG -u HDMI_ATOM -u HDMI_AUDIO_DUMP -u HDMI_AUDIO_SWEEP \
+        -u ATOM_DRY -u ATOM_TRACE -u ATOM_HALT -u ATOM_RUN_TRANSMITTER \
+        -u EXT2_WRITE_SELFTEST -u EXEC_SELFTEST -u THREAD_SELFTEST \
+        $BUILD_ENV sh scripts/build.sh >/tmp/burn-prep-build.log 2>&1; then
     echo "burn-prep: BUILD-FAIL (see /tmp/burn-prep-build.log)"
     exit 1
 fi
@@ -189,6 +211,16 @@ case "$BUILD_TAG" in *HDA_HDMI*)         verify_marker "ctl1 probing 2nd control
 case "$BUILD_TAG" in *HDA_TONE*)         verify_marker "sweep streaming" ;; esac
 case "$BUILD_TAG" in *HDMI_AUDIO_DUMP*)  verify_marker "== agnos display-audio dump ==" ;; esac
 case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; esac
+# MARKER-COVERAGE GAP, closed 2026-07-19. The four arms above covered only the HDA_* / HDMI_AUDIO_* flags,
+# yet the "markers verified" line below claims the WHOLE $BUILD_TAG is compiled AND reached. So every
+# HDMI_DCCG and ATOM_* burn shipped unverified for the very flag under test — the 1.55.24 DCCG burn included
+# (it happened to carry its kprintln, but that was luck, not process). This is the ATOM_DRY defect's family:
+# a flag whose presence in the tag was never proven in the artifact. Each marker below is a kprintln inside
+# the flag's own #ifdef, in a function called unconditionally, so it satisfies verify_marker's own rule.
+case "$BUILD_TAG" in *HDMI_DCCG*)        verify_marker "hdmi DCCG symclk re-prime" ;; esac
+case "$BUILD_TAG" in *HDMI_SYMCLK_AB*)   verify_marker "symclk-ab: in-boot A/B" ;; esac
+case "$BUILD_TAG" in *ATOM_DRY*)         verify_marker "atom: DRY build (no MMIO)" ;; esac
+case "$BUILD_TAG" in *HDMI_ATOM*)        verify_marker "atom: running DIGxEncoderControl" ;; esac
 
 SZ="$(stat -c %s build/agnos 2>/dev/null)"
 MT="$(stat -c %y build/agnos 2>/dev/null | cut -d. -f1)"

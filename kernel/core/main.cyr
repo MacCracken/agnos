@@ -3165,6 +3165,48 @@ if (gpu_hdmi_audio_on == 1) {
 }
 #endif
 
+#ifdef HDMI_SYMCLK_AB
+# In-boot A/B for the DCCG symbol-clock block — the control the 1.55.24 burn lacked.
+#
+# WHY IN-BOOT AND NOT TWO FLASHES: burn 8 (silent) and burn 10 ("armed") are separated by a version boundary,
+# two uncaptured PHY-blanking burns that tore down and re-established the HDMI link, an unrecorded monitor
+# volume, and no ear record at all for burns 7/8/9. Sink amp/mute/mode state is SINK-latched and every agnos
+# instrument is source-side, so a cross-boot comparison cannot control for any of it. Two labelled listening
+# windows inside ONE boot share one sink state, one cable, one volume, one power cycle — the only thing that
+# changes between them is the five stores. That is the whole point.
+#
+# Runs post-sti so the 100 Hz timer keeps refilling the HDA tone streaming to the HDMI sink through both
+# windows. Display-safe: host DCCG only, no PHY power-cycle.
+if (gpu_hdmi_audio_on == 1) {
+    kprintln("symclk-ab: in-boot A/B -- one sink state, one variable. LISTEN to each window.", 78);
+    gpu_symclk_capture();
+    kprintln("symclk-ab: pre-write state (if this already matches amdgpu, the block is a no-op)", 81);
+    gpu_symclk_report();
+    var ab_pass = 0;
+    var ab_t0 = 0;
+    while (ab_pass < 2) {
+        gpu_symclk_restore();
+        kprint("symclk-ab: pass ", 16); kprint_num(ab_pass + 1);
+        kprintln(" window A -- symclk OFF, LISTEN", 31);
+        gpu_symclk_report();
+        ab_t0 = timer_ticks;
+        while ((timer_ticks - ab_t0) < 600) { arch_wait(); }   # hold ~6s to listen (100 Hz tick)
+        gpu_symclk_apply();
+        kprint("symclk-ab: pass ", 16); kprint_num(ab_pass + 1);
+        kprintln(" window B -- symclk ON, LISTEN", 30);
+        gpu_symclk_report();
+        ab_t0 = timer_ticks;
+        while ((timer_ticks - ab_t0) < 600) { arch_wait(); }
+        ab_pass = ab_pass + 1;
+    }
+    # Ride the same burn: prove whether ACR CTS is a real audio-clock measurement or a pixel counter.
+    gpu_hdmi_acr_nscale();
+    kprintln("symclk-ab: done -- did the sound differ between window A and window B?", 70);
+} else {
+    kprintln("symclk-ab: no HDMI audio path -- skipping", 41);
+}
+#endif
+
 # === CMOS kernel checkpoint 15 (interrupts enabled — sti executed) ===
 # CP 15 reached but CP 16 not = scheduler activation faulted, or a flood
 # of interrupts post-sti is preventing forward progress.

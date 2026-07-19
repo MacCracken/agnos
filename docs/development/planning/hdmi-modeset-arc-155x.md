@@ -1,34 +1,161 @@
 # Sovereign HDMI modeset arc — own the transmitter, unblock the audio (slotted 1.55.x)
 
-## CURRENT STATUS (2026-07-18) — read this first
+## CURRENT STATUS (2026-07-19, HEAD 1.55.24) — read this first
 
-Kernel HEAD **1.55.23**. This is the audio slice of Thrust P (display). **A0–A3 ✅ DONE + PROVEN ON IRON;
-A4 OPEN.** The path is now the sovereign **host-ATOM interpreter** (NOT capture-replay, NOT DMCUB — both
-superseded below).
+Audio slice of Thrust P (display). **A0–A3 ✅ DONE + PROVEN ON IRON. A4 (audio egress) is OPEN.**
 
-- **A2 (`gpu_vbios_acquire`, gpu.cyr) + A3 (the ~700-line Cyrius ATOM interpreter, `kernel/core/atom.cyr`)
-  are DONE and BIT-CORRECT ON IRON.** The 1.55.23 DRY trace matches the `atom-interp.py` oracle **exactly** —
-  encoder #4 = 5 writes, transmitter #76 = 21 reads / 17 writes / 5 delays, no amdgpu in the loop. The
-  interpreter runs the vendor's own VBIOS bytecode and **IS the P6 cold-modeset foundation** — the strategic
-  prize of the arc, already in hand.
-- **A4 (audio egress) is the open item.** Iron-confirmed findings:
-  - **The ATOM transmitter enable #76 POWER-CYCLES the PHY** (writes 556F / 5E03 / 5DF0) and **blanks the live
-    GOP console pipe NON-recoverably** — too destructive to fire against the inherited display as-is.
-  - **The encoder-setup-only #4 is display-SAFE but SILENT** (exonerated — it doesn't arm the sink).
-  - **CURRENT LEAD → the DCCG symbol-clock re-prime (`BURN_HDMI_DCCG`).** agnos omits the **SYMCLKA** write
-    (abs `0x159 = 0x000d000d`) that amdgpu makes for HDMI. Confirmed as DIG1's symbol clock: DIG1 routes to
-    UNIPHYA (phyid=0), and amdgpu's own HDMI-on-DIG1 set `0x159` active (its AVI landed at `0x564d` =
-    DIG1 `AFMT_GENERIC_0`). Host-visible, display-safe, under test.
-  - **FALLBACK if DCCG is silent:** the full HDMI modeset (`SetPixelClock` #12 + transmitter #76 + OTG
-    re-commit) wrapped in a **self-recovering OTG-frame-count watchdog**. Transmitter = DMCUB for amdgpu
-    (opaque) but **host-ATOM #76 for agnos**.
+**⚠⚠ RETRACTED 2026-07-19 (same day it was written): "THE DCCG SYMCLK RE-PRIME ARMED THE SINK" IS DOWNGRADED
+TO *LOW CONFIDENCE*. Do not build on it.** An adversarial re-audit found three independent falsifiers:
+
+1. **The symbol clock was ALREADY ON — measured, in every silent burn.** agnos's own read-only probe prints
+   `gpu: audio probe dig1 fe=1000000 be=101 …` **byte-identically at line 160 of all eight burn logs**. `fe`
+   bit24 = `DIG_SYMCLK_FE_ON`, `be` bit8 = `DIG_SYMCLK_BE_ON` (`gpu_regs.cyr:186`, `:456`) — read-only hardware
+   **acks**. Both read ON *before* the write, in burns that were silent. A clock cannot be the missing lever
+   when the silicon says it was already running. This also refutes the burn profile's own stated premise.
+2. **Half the oracle predates the write by five burns and four cuts.** The shutdown release-pop was first heard
+   at `audio_re_5` / **1.55.20**, and the identical "amp ARMED and DRIVEN, payload decodes as silence"
+   inference was banked at 1.55.21. Its known precondition (`AFMT_RAMP` = 0/0/0/0) was restored at 1.55.21 and
+   held through burns 7–10 — so burn 10's pop is the *predicted* consequence of a state that existed three
+   burns earlier. **"First time in the arc" was simply wrong.** The other half — "noise floor" — is a new
+   *report*, not a new *observation*: **no record anywhere says a noise floor was listened for and not heard on
+   burns 7, 8 or 9.** And a noise floor discriminates *amp powered* from *amp muted*, not *sink locked to us*.
+3. **Zero instruments moved.** Every dumped register is byte-identical between burn 8 (silent) and burn 10
+   ("armed"): `DIG_FE_CNTL 1000100`, `DIG_BE_CNTL 10030200`, `AFMT_CNTL 101`, `AFMT_STATUS 40000010`,
+   `HDMI_CONTROL 10019`, `HDMI_DB_CONTROL 1000`, `HDMI_ACR_STATUS_1 1800`. The write is **five blind absolute
+   stores** — no pre-read, no readback, no dump row (`gpu.cyr:2985-2989`) — so **there is no evidence any bit
+   in any of the five registers changed value at all.**
+
+**★ OPERATOR TESTIMONY, 2026-07-19 — THE LAST SUPPORT IS GONE.** Asked directly whether burns 7/8/9 had an
+audible noise floor, the operator answered: ***"there were a few burns in cycle that exposed the noise floor;
+but can't recall at which ones."*** ⟹ **the noise floor is NOT unique to burn 10** — it recurs across the
+cycle independent of the SYMCLKA write. Combined with falsifier (2) — the pop first heard at `audio_re_5` /
+1.55.20 — **BOTH halves of the burn-10 oracle are now known to predate or recur independently of the write.
+Nothing observed on burn 10 was new.** On sink-side state between 07-18 and 07-19 the operator reported
+*nothing changed* but also *can't recall*, so sink drift stays formally open rather than excluded.
+
+**⟹ POSTURE: `SYMCLKA` is an UNSUPPORTED candidate with no surviving evidence for it. Treat the block as a
+NO-OP until a before/after read proves otherwise. Do NOT cite burn 10 as a breakthrough anywhere.** Further demotions worth carrying: the SYMCLKA↔DIG1 mapping is
+**self-referential** (the code comment cites the same trace the values were copied from) and names a **DCE-era
+PHY, "UNIPHYA", on a DCN 2.1 / RDPCS-DPCS part** — no vendor header was consulted; the block cannot
+self-attribute anyway (five writes went out, one was named in the log line, and abs `0x176` — unknown function,
+36/36 write-adjacency in the vendor trace — is at least as plausible as `0x159`); and abs `0x15C` is written
+**idle** where amdgpu ends it **active**, so if anything in the block had a live effect, the likeliest one was
+negative. Code stays in `gpu_hdmi_audio_enable` behind `#ifdef HDMI_DCCG`; `BURN_HDMI_DCCG`.
+
+**✅ THE "TWO-VARIABLE BURN" WORRY IS RESOLVED — AND IT WAS NOT THE CONFOUND.** Burn 10 both added SYMCLKA and
+dropped the live ATOM encoder path, which looked uninterpretable. It isn't: **burns `audio_re_3` through `_8`
+ran NEITHER ATOM nor SYMCLKA and were ALL silent**, so removing ATOM merely returns the system to a
+documented-silent baseline and cannot manufacture a signal that baseline never had. **Burn 10 is "burn 8 +
+SYMCLKA" — a one-variable experiment.** The live ATOM run left zero residue (burns 7/8/9/10 report identical
+DIG/AFMT/Azalia values, including the one register ATOM transiently cleared). **The real uncontrolled variable
+is the ORACLE, not the register:** no ear record at all for burns 7/8/9; unrecorded monitor volume; and **two
+uncaptured PHY-blanking burns in the 1.55.23 window tore down and re-established the HDMI link between the
+silent baseline and the arming burn** — sink amp/mute/mode state is **sink-latched**, and every agnos
+instrument is source-side and cannot see it.
+
+**THE REMAINING GAP — the PAYLOAD is DIGITAL SILENCE (noise floor), not the tone.** The amp is on and receiving
+a valid, all-zeros stream. Samples are non-zero at the AFMT formatter (crc 9e490d/7d9f3), HDA DMA runs
+(lpib=16984), AZ_LPIB advances — so the sample content is being dropped/zeroed between the formatter and the
+wire, OR the feed never fills instance-1's ring audibly. **We crossed from "sink ignores us" to "sink receives
+us"; the last mile is the sample content.**
+
+**NEXT STEP (a fresh session starts HERE).**
+
+**⛔⛔ THE PREVIOUSLY-PLANNED "DCCG AUDIO-DTO READ-CLOCK DISCRIMINATOR" IS CANCELLED — IT IS AN ECHO REGISTER.
+DO NOT WRITE IT, DO NOT BURN IT.** (Verified 2026-07-19 against `dcn_2_1_0_sh_mask.h` + `dce_audio.c`.) The
+plan was "read the DTO0 accumulator/PHASE twice, see whether it advances." **There is no accumulator.**
+`DCCG_AUDIO_DTO0_PHASE` and `_MODULE` are each **one 32-bit field bearing the register's own name**
+(`…_PHASE__DCCG_AUDIO_DTO0_PHASE_MASK 0xFFFFFFFF`) — numerator/denominator of a fractional divider, pure
+config. `dce_aud_wall_dto_setup()` only ever `REG_UPDATE`s them; nothing in amdgpu reads them back. Iron
+agrees: `DTO0_PHASE` reads `0x3a980` (240000 = "generate 24.000 MHz") in **every** agnos burn AND on amdgpu's
+audibly-playing link. A frozen read proves nothing; a moving read is impossible. **Zero information in either
+branch** — exactly the failure mode the echo-vs-answer rule exists to prevent. Structural confirmation: where
+AMD *does* have a running DTO accumulator they expose it (`DCCG_GTC_CURRENT`, 0x0063 BASE_IDX 1 — a live
+32-bit readback of the GTC DTO count). **The audio DTO has no analogue**; the DCCG audio block is exactly five
+registers, all config.
+
+**AND THE QUESTION IT MEANT TO ANSWER IS ALREADY SETTLED — THE READ SIDE DRAINS.** `AFMT_AUDIO_CRC_DONE`
+asserts only after `CRC_COUNT` (2048) samples physically traverse the AFMT. Pre-feed both taps read "did not
+complete"; post-feed both complete with distinct, non-zero, content-bearing values. The underrun hypothesis is
+dead on data already in hand.
+
+**⛔ Do NOT set `DTO2_USE_512FBR_DTO` (bit20) either.** In `dce_aud_wall_dto_setup()` the HDMI branch writes
+only `REG_UPDATE_2(DTO0_SOURCE_SEL, src_sel, DTO_SEL, 0)` then MODULE then PHASE — it never touches 512FBR;
+only the DP/`else` branch sets it. Iron confirms: the audibly-playing HDMI link reads
+`DCCG_AUDIO_DTO_SOURCE = 0x00000000`, all three 512FBR bits clear. Source and silicon agree.
+
+**▶ THE REPLACEMENT BURN — cheaper, display-safe, and decisive about what is actually open. ✅ IMPLEMENTED
+2026-07-19, PRE-BURN.** Build **only** via `BURN_HDMI_SYMCLK_AB=1 sh scripts/burn-prep.sh` (banner must read
+`AGNOS 1.55.24 (HDA_HDMI+HDA_TONE+HDMI_SYMCLK_AB+HDMI_AUDIO_DUMP)`). New surface in `gpu.cyr`:
+`gpu_symclk_capture/_report/_apply/_restore` + `gpu_hdmi_acr_nscale()`; `main.cyr` runs the A/B post-`sti`
+while the HDA tone streams. Green pre-burn: check 11/0, `cyrius fmt`-stable, kprint lengths verified by the
+new `scripts/kprint-len-check.sh` (it caught four off-by-ones in this very bite), and **`cmp`-proven that each
+flag changes the artifact** — the ATOM_DRY lesson applied rather than assumed. Rubric + risk in the iron log:
+[`#tracker-155x-a4-dccg`](https://github.com/MacCracken/agnosticos/blob/main/docs/development/iron-nuc-zen-log.md#tracker-155x-a4-dccg).
+
+**(A) INSTRUMENT THE SYMCLK BLOCK (free — rides any burn).** Read abs `0x159`/`0x15A`/`0x15B`/`0x15C`/`0x176`
+**before and after** the write, print both, and add them as permanent `HDMI_AUDIO_DUMP` rows (the read
+primitive `gpu.cyr:87-89` is a pure load). **If the before-values already read `0x000d000d` / `0x000d000a` /
+`0x00001111`, the block is a proven no-op and the whole attribution collapses with no further burn.**
+
+**(B) MAKE THE WRITE RUNTIME-TRIGGERED RATHER THAN A BOOT-TIME `#ifdef` — this is the in-burn A/B.** Move the
+five stores out of the boot path into a shell/klug subcommand. Boot with the tone running and the write NOT
+applied; the operator listens. Then issue it from the shell **in the same boot**; listen again. One flash, one
+sink state, one cable, one volume setting, one monitor power cycle — the only thing changing between the two
+listening windows is the five stores. That eliminates every confound the 8→10 comparison cannot: sink drift,
+unversioned build variation, ATOM, the version boundary. Display-safe (host DCCG only; burn 10 completed to a
+shell with a live 2560×1440 scanout).
+
+**(C) THE ONE GENUINELY MOVING INSTRUMENT — `HDMI_ACR_STATUS_0` (0x209C+d).** agnos already reads it, and it
+has been quietly reporting a **live hardware measurement** across eight burns: `0x3af5e000` / `0x3af5f000` /
+`0x3af60000` = CTS **241502 / 241503 / 241504**, drifting ±1–2 LSB boot to boot, while dead DIGs read
+`0x00000000`. agnos never writes those values — its only CTS constant is `0x3AF5C000` (241500), written only in
+the F2/F3 sweep profiles, and the default path sets `ACR_SOURCE=0` = HW-measured. **Honest caveat that must not
+be skipped:** at N=6144 / Fs=48 kHz, `CTS = f_TMDS·N/(128·Fs)` reduces to *exactly* `f_pixel` in kHz, so
+"measured against the audio clock" and "just counting the pixel clock" predict the **same number** — the
+current data cannot separate them. Two steps close it: **free, no burn** — add `HDMI_ACR_48_0`/`44_0`/`32_0`
+(0x209A / 0x2098 / 0x2096, +d) to the dump; if they read anything other than ~241502 the echo hypothesis dies
+outright. **The real discriminator, one register write, display-safe** (ACR affects only the audio
+clock-regeneration packet, never TMDS timing): temporarily program `HDMI_ACR_N_48` to **12288** instead of 6144
+and re-read CTS. **Doubles to ~483005 ⟹ the audio clock is genuinely in the measurement loop and the read
+clock is proven alive at exactly 48 kHz. Stays ~241502 ⟹ pixel-only counter, tells you nothing about audio.**
+
+**⚠ CORRECTION — `DCCG_AUDIO_DTO0_MODULE` DOES NOT MATCH amdgpu**, contrary to what this doc previously said.
+Iron reads `0x24d9b2`; amdgpu's constant is `0x24d998` — 26 counts / ~10.8 ppm, because agnos derives MODULE
+from the live pixel clock instead of copying the literal. PHASE (`0x3a980`) and SOURCE (`0`) *do* match
+exactly. Treat MODULE as an open variable, not an already-matched one.
+
+**⚠ TWO QUESTIONS FOR THE OPERATOR — they cost nothing and may close the case outright:** *did burns 7/8/9
+have a noise floor?* and *did the monitor volume change between 07-18 and 07-19?*
+
+**Better-evidenced omissions than SYMCLKA ever was** (open items, from the ground-truth trace): abs `0x052`
+bracket (`0x110` open / `0x010` close) encloses amdgpu's **entire** audio-enable block and agnos does not write
+it at all — ⚠ but see the DO-NOT below, bit8 is a pipe hold; and abs `0x101` is likewise never written by
+agnos. Also on record: agnos emits `0x176` once vs amdgpu's 36/36 per-write cadence.
+
+**⛔ DO NOT WRITE abs `0x52`** — the analysis (high conf) found bit8 is a pipe hold/soft-reset bracket around
+the WHOLE pipe; latching it risks blanking the working scanout. It is NOT an audio lever. `IEC-60958 non-audio`
+was RULED OUT (channel status normal: L=1/R=2). The FEED is EXONERATED (instance-1's ring genuinely carries
+the −0.8 dBFS triangle). Retrieve the full synthesis from `wf_253879c6-6eb/journal.jsonl` (`synthesize` result)
+if more detail is needed.
+
+**FALLBACK (only if the payload path dead-ends):** the full HDMI modeset (`SetPixelClock` #12 + transmitter #76
++ OTG re-commit) wrapped in a **self-recovering OTG-frame-count watchdog** — but the transmitter #76
+POWER-CYCLES the PHY and blanks the pipe (it's DMCUB/opaque for amdgpu, host-ATOM #76 for agnos), so this is
+the risky last resort, not the current lead.
 
 **Process lesson (cost two burns):** a new `#ifdef` mode-flag needs its `build.sh` define line, and you verify
-it landed by **`cmp`-ing the two binaries**, not by trusting the burn tag — the `ATOM_DRY` flag was a silent
-no-op for two burns.
+it landed by **`cmp`-ing the two binaries**, not by trusting the burn tag — `ATOM_DRY` was a silent no-op for
+two burns (both "live" and "dry" built byte-identical and drove the PHY, blacking the display twice).
 
-**NEXT STEP: burn `BURN_HDMI_DCCG`** — add the SYMCLKA `0x159` write (display-safe, host-visible). Operator's
-ears are the egress oracle.
+**Interpreter (A2/A3), the strategic prize — already in hand:** `gpu_vbios_acquire` (gpu.cyr) + the ~700-line
+Cyrius ATOM interpreter (`kernel/core/atom.cyr`) run the vendor's own VBIOS bytecode BIT-CORRECT on iron (the
+1.55.23 DRY trace matches the `atom-interp.py` oracle exactly). It IS the P6 cold-modeset foundation.
+
+**Build flags / burns (all in `build.sh` + `burn-prep.sh`):** `HDMI_DCCG` (the current lead) · `HDMI_ATOM`
+(runs the interpreter, encoder-only by default) · `ATOM_RUN_TRANSMITTER` (opt-in the pipe-blanking #76, OFF) ·
+`ATOM_DRY` (interpreter dry-run, no MMIO) · `ATOM_TRACE` · `ATOM_HALT`. Capture tool:
+`agnosticos/scripts/capture-amdgpu-modeset-clock.sh`. Iron keepers indexed in `prior-art/README.md`.
 
 ---
 
