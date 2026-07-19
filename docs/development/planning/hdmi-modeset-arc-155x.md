@@ -1,5 +1,37 @@
 # Sovereign HDMI modeset arc — own the transmitter, unblock the audio (slotted 1.55.x)
 
+## CURRENT STATUS (2026-07-18) — read this first
+
+Kernel HEAD **1.55.23**. This is the audio slice of Thrust P (display). **A0–A3 ✅ DONE + PROVEN ON IRON;
+A4 OPEN.** The path is now the sovereign **host-ATOM interpreter** (NOT capture-replay, NOT DMCUB — both
+superseded below).
+
+- **A2 (`gpu_vbios_acquire`, gpu.cyr) + A3 (the ~700-line Cyrius ATOM interpreter, `kernel/core/atom.cyr`)
+  are DONE and BIT-CORRECT ON IRON.** The 1.55.23 DRY trace matches the `atom-interp.py` oracle **exactly** —
+  encoder #4 = 5 writes, transmitter #76 = 21 reads / 17 writes / 5 delays, no amdgpu in the loop. The
+  interpreter runs the vendor's own VBIOS bytecode and **IS the P6 cold-modeset foundation** — the strategic
+  prize of the arc, already in hand.
+- **A4 (audio egress) is the open item.** Iron-confirmed findings:
+  - **The ATOM transmitter enable #76 POWER-CYCLES the PHY** (writes 556F / 5E03 / 5DF0) and **blanks the live
+    GOP console pipe NON-recoverably** — too destructive to fire against the inherited display as-is.
+  - **The encoder-setup-only #4 is display-SAFE but SILENT** (exonerated — it doesn't arm the sink).
+  - **CURRENT LEAD → the DCCG symbol-clock re-prime (`BURN_HDMI_DCCG`).** agnos omits the **SYMCLKA** write
+    (abs `0x159 = 0x000d000d`) that amdgpu makes for HDMI. Confirmed as DIG1's symbol clock: DIG1 routes to
+    UNIPHYA (phyid=0), and amdgpu's own HDMI-on-DIG1 set `0x159` active (its AVI landed at `0x564d` =
+    DIG1 `AFMT_GENERIC_0`). Host-visible, display-safe, under test.
+  - **FALLBACK if DCCG is silent:** the full HDMI modeset (`SetPixelClock` #12 + transmitter #76 + OTG
+    re-commit) wrapped in a **self-recovering OTG-frame-count watchdog**. Transmitter = DMCUB for amdgpu
+    (opaque) but **host-ATOM #76 for agnos**.
+
+**Process lesson (cost two burns):** a new `#ifdef` mode-flag needs its `build.sh` define line, and you verify
+it landed by **`cmp`-ing the two binaries**, not by trusting the burn tag — the `ATOM_DRY` flag was a silent
+no-op for two burns.
+
+**NEXT STEP: burn `BURN_HDMI_DCCG`** — add the SYMCLKA `0x159` write (display-safe, host-visible). Operator's
+ears are the egress oracle.
+
+---
+
 **Thrust P, continued.** The display arc ([`kernel-display-arc-155x.md`](kernel-display-arc-155x.md)) owned the
 GOP-lit pipe for scanout (P0–P2, blit#39) and drove the display-audio program to completion (P3). P3's audio
 path is now **proven correct end-to-end** — but it is **blocked on one dependency this arc originally deferred
@@ -60,7 +92,13 @@ paths — all P6-class sub-projects, none a burn:
 The audio path (P3) remains 100% proven-ready and lights up the instant the HDMI transmitter state exists.
 **P5c/P5d as written below (implement a captured PHY sequence) are moot** and superseded by this correction.
 
-## ✅ MECHANISM RESOLVED (2026-07-18) — it's DMCUB command submission, and Bite #1 confirmed it
+## ⛔ SUPERSEDED (2026-07-18) — "MECHANISM = DMCUB command submission" (the T-series, Path A/B)
+
+> **Superseded by the T2 host-ATOM pivot in the next section.** T2's read-only burn found the GOP's DMCUB
+> **held in reset, no ring, no fw** (dormant at boot). DMCUB is an OS-driver-loaded thing; the boot-native
+> transmitter path is **host-ATOM**, not DMCUB. The whole T-series (T1–T4, Path A "attach the live ring" /
+> Path B "PSP-load the fw blob") is retired — replaced by the A-series ATOM interpreter. Kept for the
+> mechanism analysis (DMCUB inbox anatomy) only; **do not implement the T-ladder.**
 
 A 4-probe source-verified scoping pass + a free capture re-analysis settled the mechanism:
 
@@ -119,9 +157,9 @@ bytecode** (@0xb162). Also present: `DIGxEncoderControl` #4 v1_5 (@0xae4e, 782B)
 |------|------|------|
 | **A0** ✅ | VBIOS acquired + transmitter table located (#76 v1_6) + disassembled → interpreter required. | DONE |
 | **A1** ✅ | **Python ATOM interpreter built + dry-run validated** (`scripts/atom-interp.py`, 1461 lines, verbatim line-for-line port of amdgpu `atom.c` — all 41 `atom_op_*`, 127-entry `opcode_table[]`, all 8 address spaces + `ATOM_WS_*` specials + IIO). Dry-run of `DIG1TransmitterControl(ENABLE, HDMI, phyid=0)` **steps to EOT clean, no desync, 239 opcodes, 21 reads / 17 writes / 5 delays** — and the writes land in **UNIPHYA (0x55xx) + RDPCS/DPCS (0x5Dxx–0x5Exx)** with 5/200/200/5/10µs PHY power sequencing = EXACTLY the RDPCS/DPCS block P5b named as the real transmitter PHY (abs ~0x5DE8). Cross-validates the whole arc. Default dry-run (no HW); `--live` mmaps BAR5. **Residual uncertainty is PARAMS not engine:** phyid (default 0=UNIPHYA, from object-info path0 HDMI→enum_id 1; phyid-sensitive, +0x400/inst), digfe_sel (0x02?), hpdsel (0) — confirm on iron; symclk=24150/lanenum=4/digmode=HDMI/action=ENABLE exact. | DONE (dry-run) |
-| **A2** ✅ | **VBIOS acquisition in agnos** — `gpu_vbios_acquire()` (gpu.cyr) parses the ACPI VFCT table, verifies VendorID=0x1002, copies the ATOM image to a 2 MB page, checks the 55aa sig, sets `gpu_vbios_va/len`. Moved OUT of the `#ifdef HDMI_AUDIO_DUMP` guard so it's always compiled (the interpreter needs it). | DONE (compiles; iron-validated together with A4's burn) |
-| **A3** ✅ | **Port the interpreter to Cyrius** — `kernel/core/atom.cyr` (~600 lines), faithful port of `atom-interp.py`: VBIOS readers, all operand-decode tables, address spaces (REG via `gpu_mmio+idx*4` bounded <0x20000, PS/WS/FB/ID/IMM), get_src_int / put_dst / get_dst on a single global cursor `atom_ip`, structural 127-entry dispatch, recursive `execute_table_locked` (depth ≤8). Cyrius dialect: **no chained `else if`** (sequential `if`s on a fixed selector), sibling `var` hoisted, `^0xFFFFFFFF` for NOT, 1M-step cap replaces the Python wall-clock loop-guard, REPEAT/SAVEREG/RESTOREREG→clean abort. Runs the two tables in `atom_hdmi_transmitter_bringup()`, wired in `main.cyr` before `gpu_hdmi_audio_enable()`, gated `#ifdef HDMI_ATOM`. Instrumented: r/w/delay counters (vs the 21/17/5 oracle) + `#ifdef ATOM_TRACE` per-write trace + `#ifdef ATOM_DRY` safe mode (reads→0, writes traced-not-applied). | DONE (compiles clean); **NEXT: iron burn `BURN_HDMI_ATOM`** |
-| **A4** | Audio egresses. Burn `BURN_HDMI_ATOM` (live PHY drive) — operator's ears are the oracle. If it blacks/hangs pre-shell, fall back to `BURN_HDMI_ATOM_DRY` (safe, captures the write trace to diff vs the atom-interp.py oracle). | IRON — **tone from XB323U** |
+| **A2** ✅ | **VBIOS acquisition in agnos** — `gpu_vbios_acquire()` (gpu.cyr) parses the ACPI VFCT table, verifies VendorID=0x1002, copies the ATOM image to a 2 MB page, checks the 55aa sig, sets `gpu_vbios_va/len`. Moved OUT of the `#ifdef HDMI_AUDIO_DUMP` guard so it's always compiled (the interpreter needs it). | **DONE — iron-proven (1.55.23)** |
+| **A3** ✅ | **Port the interpreter to Cyrius** — `kernel/core/atom.cyr` (~600 lines), faithful port of `atom-interp.py`: VBIOS readers, all operand-decode tables, address spaces (REG via `gpu_mmio+idx*4` bounded <0x20000, PS/WS/FB/ID/IMM), get_src_int / put_dst / get_dst on a single global cursor `atom_ip`, structural 127-entry dispatch, recursive `execute_table_locked` (depth ≤8). Cyrius dialect: **no chained `else if`** (sequential `if`s on a fixed selector), sibling `var` hoisted, `^0xFFFFFFFF` for NOT, 1M-step cap replaces the Python wall-clock loop-guard, REPEAT/SAVEREG/RESTOREREG→clean abort. Runs the two tables in `atom_hdmi_transmitter_bringup()`, wired in `main.cyr` before `gpu_hdmi_audio_enable()`, gated `#ifdef HDMI_ATOM`. Instrumented: r/w/delay counters (vs the 21/17/5 oracle) + `#ifdef ATOM_TRACE` per-write trace + `#ifdef ATOM_DRY` safe mode (reads→0, writes traced-not-applied). | **DONE — iron-proven bit-correct (1.55.23)**: the DRY trace = encoder #4 5 writes + transmitter #76 21 reads / 17 writes / 5 delays, matching the atom-interp.py oracle exactly, no amdgpu |
+| **A4** | **OPEN — audio egress.** Iron findings: live transmitter #76 **blanks the GOP pipe non-recoverably** (power-cycles the PHY: writes 556F/5E03/5DF0); encoder-only #4 is **display-safe but silent** (exonerated). **LEAD → the DCCG SYMCLKA re-prime: burn `BURN_HDMI_DCCG`** — write abs `0x159 = 0x000d000d`, the HDMI symbol clock agnos omits (DIG1→UNIPHYA phyid=0; amdgpu's HDMI-on-DIG1 sets it, AVI at `0x564d`); display-safe, host-visible. **Fallback if silent:** full HDMI modeset (`SetPixelClock` #12 + transmitter #76 + OTG re-commit) under a self-recovering OTG-frame-count watchdog. | IRON — **tone from XB323U** |
 
 **Strategic upside:** the ATOM interpreter unlocks the ENTIRE VBIOS command surface (SetPixelClock, power
 gating, DP, full modeset) — it IS the P6 cold-modeset foundation, not just the HDMI-audio unblock. Effort
@@ -159,7 +197,14 @@ constraints shape the whole approach:
 The payoff is proven-ready: the moment the transmitter comes up as HDMI, the already-correct audio path
 egresses. And the transmitter bring-up is the foundation the P6 full modeset needs anyway.
 
-## Bite ladder — each its own cut; user burns; iron-only (QEMU emulates no DCN/PHY)
+## ⛔ SUPERSEDED — capture-and-replay bite ladder (P5a–P6)
+
+> **Superseded by the P5b correction + the A-series ATOM interpreter.** P5a's captured "PHY sequence" was a
+> mis-identified page-flip/cursor block; the real transmitter enable is firmware bytecode, not a replayable
+> MMIO trace. P5c/P5d (implement a captured sequence) are moot. Kept for the P5a capture provenance and the
+> risk/constraint carry-forwards only. **The live plan is the A-ladder above.**
+
+### Bite ladder — each its own cut; user burns; iron-only (QEMU emulates no DCN/PHY)
 
 | Bite | What | Validate |
 |------|------|----------|
@@ -208,7 +253,8 @@ audio with the minimum transmitter bring-up, and hands P6 a verified PHY sequenc
 
 ## Definition of done
 
-**HDMI audio plays out the XB323U speakers on iron**, driven by agnos's sovereign HDMI transmitter bring-up
-(no ATOM, no GOP-DVI inheritance for the encoder/PHY), with the console surviving the PHY edge — closing the
-display-audio backlog opened at 1.53.5 and delivering the first sovereign HDMI-with-audio output. The verified
-PHY sequence is then the seed for the P6 full modeset.
+**HDMI audio plays out the XB323U speakers on iron**, driven by agnos's sovereign HDMI transmitter bring-up —
+now the sovereign **ATOM interpreter** (`kernel/core/atom.cyr`) running the vendor's own VBIOS bytecode
+(supersedes the original "no ATOM" constraint; an interpreter of a defined VM is bounded + interoperable, the
+anukūlana/Type-3 posture), with the console surviving — closing the display-audio backlog opened at 1.53.5 and
+delivering the first sovereign HDMI-with-audio output. The interpreter is then the seed for the P6 full modeset.

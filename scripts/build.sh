@@ -276,6 +276,10 @@ else
         # ~3s. The operator watches serial + LISTENS: one boot tests the whole hypothesis matrix
         # instead of one-per-reflash. Requires HDA_HDMI + HDA_TONE (the streaming tone + HDMI sink).
         [ -n "$HDMI_AUDIO_SWEEP" ]   && echo '#define HDMI_AUDIO_SWEEP'
+        # HDMI_DCCG=1 — apply the DCCG symbol-clock re-prime (SYMCLKA on) in gpu_hdmi_audio_enable: the
+        # host-visible DCCG writes amdgpu makes for HDMI (abs 0x159-0x15c, 0x176) that agnos omitted, replicated
+        # from the amdgpu modeset capture (ground truth). No PHY power-cycle ⇒ display-safe. Requires HDA_HDMI.
+        [ -n "$HDMI_DCCG" ]          && echo '#define HDMI_DCCG'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

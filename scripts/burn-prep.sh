@@ -49,7 +49,17 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_HDMI_ATOM_HALT:-}" ]; then
+if [ -n "${BURN_HDMI_DCCG:-}" ]; then
+    # THE DCCG SYMCLK BURN — the de-risked candidate. The amdgpu modeset capture proved agnos omits the DCCG
+    # symbol-clock writes amdgpu makes for HDMI (abs 0x159 SYMCLKA-on for DIG1/UNIPHYA, confirmed by DIG1's AVI
+    # landing at 0x564d + phyid=0). This applies exactly those writes in gpu_hdmi_audio_enable. NO ATOM
+    # interpreter, NO transmitter, NO PHY power-cycle — host-visible DCCG only, so display-safe (worst case a
+    # clock glitch, recoverable; not the transmitter's non-recoverable blank). If audio plays, the missing
+    # symbol clock was the whole thing and we never touch the transmitter. PASS IS THE OPERATOR'S EARS.
+    echo "[2/2] Building the DCCG-symclk kernel (HDA_HDMI + HDA_TONE + HDMI_DCCG + HDMI_AUDIO_DUMP: apply the DCCG symbol-clock re-prime amdgpu does for HDMI; host-visible, display-safe; LISTEN for the tone)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_DCCG=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_DCCG+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_ATOM_HALT:-}" ]; then
     # THE A4 ISOLATION BURN. Both the live and dry ATOM kernels blacked the iron display before the shell,
     # with no log — and DRY writes NOTHING to the PHY, so the interpreter's HW writes are not the cause. This
     # kernel runs the full ATOM DRY path (gpu_vbios_acquire + the interpreter, zero PHY writes), prints its

@@ -2972,6 +2972,24 @@ fn gpu_hdmi_audio_enable() {
     gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE, gpu_pixclk_100hz);
     gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_PHASE,  GPU_DCCG_AUDIO_DTO_PHASE_VAL);
 
+    # --- 3b. DCCG symbol-clock re-prime (HDMI_DCCG) — the host-visible DCCG writes amdgpu makes for HDMI that
+    # agnos omitted. GROUND TRUTH: agnosticos/docs/development/prior-art/amdgpu-hdmi-modeset-writes-0717.txt,
+    # replug window t=33338.x. SYMCLKA (abs dword 0x159) is DIG1's PHY symbol clock: DIG1 routes to UNIPHYA
+    # (phyid=0, A1-confirmed), and amdgpu set 0x159 ACTIVE with its own HDMI on the SAME DIG1 (its AVI infoframe
+    # 0x80885e8f landed at abs 0x564d = agnos's DIG1 AFMT_GENERIC_0; its DIG_FE writes hit 0x5628 = DIG1). So
+    # the mapping is confirmed, not guessed. These are DCCG writes — host-visible, NO PHY power-cycle — so far
+    # safer than the transmitter (which blanks the pipe). This may be the missing symbol clock that carries
+    # audio to the sink without the transmitter enable. base_seg 0 => absolute dword index. Single-display box,
+    # so SYMCLKB/C/D are already idle (the idle writes are faithful no-ops).
+    #ifdef HDMI_DCCG
+    gpu_reg32_write(0, 0x159, 0x000D000D);   # SYMCLKA (DIG1 / UNIPHYA) — ENABLE
+    gpu_reg32_write(0, 0x15A, 0x000D000A);   # SYMCLKB idle
+    gpu_reg32_write(0, 0x15B, 0x000D000A);   # SYMCLKC idle
+    gpu_reg32_write(0, 0x15C, 0x000D000A);   # SYMCLKD idle
+    gpu_reg32_write(0, 0x176, 0x00001111);   # DCCG companion amdgpu writes alongside the symclk
+    kprintln("gpu: hdmi DCCG symclk re-prime (SYMCLKA on)", 43);
+    #endif
+
     # --- 4. Azalia endpoint: configure, then enable ---
     # Un-gate the endpoint clock FIRST — before any other endpoint write. dce_aud_az_configure brackets its
     # whole sequence this way (open at dce_audio.c:685, close at :1013), and the order matters: a register

@@ -6,11 +6,23 @@ type: planning
 
 # HDMI Audio on AGNOS — the model and the plan
 
+> **▶ CURRENT ENTRY POINT: [`hdmi-modeset-arc-155x.md`](hdmi-modeset-arc-155x.md) + [`../state.md`](../state.md).**
+> This doc is the audio-register / first-principles analysis (valuable history — Part 1's HDMI model still
+> holds). Its **plan-of-attack conclusion is SUPERSEDED**: the DCN audio register class is now EXHAUSTED
+> (byte-for-byte amdgpu, still silent) and the "MMIO-is-sufficient, no ATOM needed" verdict was wrong — the
+> blocker resolved to the **firmware-driven HDMI transmitter/encoder bring-up** the GOP does as DVI, now driven
+> by a **sovereign ATOM BIOS interpreter** (`kernel/core/atom.cyr`, A2/A3 bit-correct on iron 1.55.23). A4
+> (audio) is OPEN; current lead is the DCCG SYMCLKA re-prime. Do not act on the register/edge fixes below
+> without checking the modeset arc doc first.
+
 > Built from a 7-angle first-principles review (HDMI spec · discrete TX chips ADV7511/IT66121/SiI9022 ·
 > vc4/i915 · AMD DCN/DCE encoder · sink conformance · agnos gap · the DMUB-vs-MMIO question), 2026-07-16.
 > **This is a driver-class task, not a research problem.** The register-value class is EXHAUSTED (agnos is
 > byte-identical to amdgpu audibly playing on the XB323U). What is left is a small set of *dynamic edges*,
 > all reachable by pure MMIO.
+> **⚠ SUPERSEDED (1.55.23): "all reachable by pure MMIO / small set of dynamic edges" proved wrong — the edges
+> below were burned and stayed silent. The residual is the firmware transmitter bring-up, now driven by the
+> sovereign ATOM interpreter (`kernel/core/atom.cyr`). See `hdmi-modeset-arc-155x.md`.**
 
 ## Part 1 — how HDMI audio actually works
 
@@ -74,6 +86,11 @@ packets leave the encoder.
 
 ## The DMUB question — resolved: MMIO is sufficient
 
+> **⚠ SUPERSEDED (1.55.23): "no firmware seam needed — no DMUB, no ATOM" was wrong.** The audio-block *is* pure
+> MMIO, but audio egress is gated on the **HDMI transmitter/encoder bring-up the GOP ran as DVI**, which is
+> firmware (ATOM/VBIOS) work. agnos now runs the vendor's own VBIOS transmitter bytecode via a sovereign ATOM
+> BIOS interpreter (`kernel/core/atom.cyr`, A2/A3 bit-correct on iron). ATOM turned out to be exactly the seam.
+
 - **Pre-DMUB AMD proves it.** DCE8/10/11 (GCN, no display microcontroller) does HDMI audio 100% via REG_UPDATE.
 - **DCN2.1's audio block is still pure MMIO** (`enc1_se_*`, no `dc_dmub_srv`). DMUB owns PSR/ABM/idle, not AFMT.
   The ftrace "zero DIG/AFMT writes during playback/modeset" = the block is configured ONCE at modeset then
@@ -96,6 +113,11 @@ Every burn has been un-adjudicable (tap1 frozen + amplitude-blind, no on-die wir
 
 ### ROOT CAUSE FOUND (2026-07-16, iron-confirmed signature) — feed-before-drain
 
+> **⚠ SUPERSEDED (1.55.23): this was NOT the root cause.** The drain-before-feed reorder shipped and iron
+> stayed silent; the DCN audio register class was subsequently exhausted (byte-for-byte amdgpu, still silent).
+> Feed/codec/magnitude/FIFO-ordering all EXONERATED. The real blocker is the firmware HDMI transmitter
+> bring-up (ATOM interpreter). Keep the FIFO-phase analysis as reference; do not treat the fix as the answer.
+
 Stage-1 (the edges) burned and stayed silent, but the operator's two observations settled it: the **analog
 jack plays the same tone perfectly** (PCM/HDA/DMA all good — content ruled out) and the **screen visibly
 blanked** during the `DIG_ENABLE` drop (the sink *did* get a real link event and still played nothing). That
@@ -117,6 +139,11 @@ runs against a quiesced FIFO), arms the drain on the empty FIFO (overflow-ack �
 0→1), and `main.cyr` calls `_start` as the **true terminal op, after `hda_hdmi_bind_single`** (which re-issues
 `SET_STREAM_FMT` and would re-glitch the phase if the feed were already running). Verify: **tap1 goes
 non-zero** (was "silence") and **`AFMT_STATUS` → `0x40000010`** (bit24 clear, matching amdgpu) — plus the ear.
+
+> **⚠ SUPERSEDED (1.55.23): Stages 1–3 below (DIG_ENABLE edge, AVMUTE SET→CLEAR edge, PCM-content re-check, HPD
+> bounce) were all pursued and did NOT produce sound; the audio register/edge class is exhausted. Stage 4
+> (ATOM interpreter), dismissed here as "likely unnecessary", became the actual path — A2/A3 are done and
+> iron-proven. Read the stages as history; the live plan is `hdmi-modeset-arc-155x.md` A4.**
 
 ### Stage 1 (superseded) — the cold output-enable + AVMUTE edge (kept as the link event) ✅ IMPLEMENTED
 Rewrote the tail of `gpu_hdmi_audio_enable` (gpu.cyr) to, after all staging: SET AVMUTE + close the tap →
@@ -141,9 +168,19 @@ needed cycle the UNIPHY/DCIO PHY transmitter power with DIG_MODE=3 latched (mabd
 
 ### Stage 4 — minimal ATOM interpreter (durable fallback; likely unnecessary)
 Only if the MMIO edge provably cannot latch DIP scheduling. Report-7 argues strongly it is not needed.
+> **⚠ SUPERSEDED (1.55.23): this became the ACTUAL path, not a fallback.** The MMIO edges could not egress
+> audio and the register class was exhausted, so agnos built a sovereign ~700-line Cyrius ATOM BIOS interpreter
+> (`kernel/core/atom.cyr`) that runs the vendor's VBIOS transmitter/encoder bytecode — A2/A3 done and
+> bit-correct on iron. "Report-7 argues it is not needed" was wrong.
 
 ## Bottom line
 Stop reflashing register-value hypotheses (that class is empty). **MMIO is sufficient; the fix is the
 `DIG_ENABLE` output-enable edge + the AVMUTE SET→CLEAR edge** — the two dynamic events amdgpu's cold modeset
 produces and agnos's live flip skips. Stage 1 is implemented and shipped on the enable path; the next burn
 tests it (ideally with the Stage-0 dongle as adjudicator).
+
+> **⚠ SUPERSEDED (1.55.23): the bottom line is inverted.** MMIO was NOT sufficient — the `DIG_ENABLE` +
+> AVMUTE edges shipped and stayed silent, and the DCN audio register class is now exhausted. The blocker
+> resolved to the firmware HDMI transmitter bring-up, now driven by the sovereign ATOM interpreter
+> (`kernel/core/atom.cyr`, A2/A3 iron-proven). Current audio lead (A4) = the DCCG SYMCLKA re-prime. Live
+> plan: [`hdmi-modeset-arc-155x.md`](hdmi-modeset-arc-155x.md).

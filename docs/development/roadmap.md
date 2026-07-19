@@ -39,33 +39,48 @@ vblank pacing (P2), the double-buffered present loop, and `blit`#39 double-buffe
 tear-free through the sovereign display stack on real hardware with no application change. Cleanup and
 hardening followed at 1.55.7. See the CHANGELOG entries for 1.55.0 through 1.55.7 for the detail.
 
-**Current bite — P3, display audio. Fifteen burns, still mute.** The sink is **confirmed audible** under
-amdgpu on this panel (operator-confirmed by ear, 2026-07-15) — **so agnos's silence is agnos's bug**, the
-arc is legitimate, and that premise is settled. Do not re-open it.
+**Current bite — A4, HDMI display audio. The DCN audio register class is EXHAUSTED.** Every audio register
+agnos writes now matches the live amdgpu known-good
+([`dcn-audio-live-amdgpu-known-good-2026-07-15.md`](../../../agnosticos/docs/development/prior-art/dcn-audio-live-amdgpu-known-good-2026-07-15.md),
+full BAR5 + all 34 Azalia ordinals × 8 endpoints, captured while the panel was audibly playing)
+**byte-for-byte**, and the panel is still silent. Feed, codec, magnitude, and DCN sequence are all
+**exonerated**: a Linux userspace driver replaying agnos's *exact* feed on amdgpu's pipe **played sound**.
+The sink is confirmed audible under amdgpu on this panel (operator-confirmed by ear, 2026-07-15) — agnos's
+silence is agnos's bug, that premise is settled, do not re-open it. The remaining gap is **not** a
+display-audio register: it is the **firmware-driven HDMI transmitter/encoder bring-up the GOP does as DVI**.
 
-**The known-good is captured at last**, and it is the artifact fifteen burns lacked:
-[`dcn-audio-live-amdgpu-known-good-2026-07-15.md`](../../../agnosticos/docs/development/prior-art/dcn-audio-live-amdgpu-known-good-2026-07-15.md)
-(full BAR5 + all 34 Azalia ordinals × 8 endpoints, taken while the panel was audibly playing) and
-[`dcn-audio-codec-side-known-good-2026-07-15.md`](../../../agnosticos/docs/development/prior-art/dcn-audio-codec-side-known-good-2026-07-15.md)
-(the codec half BAR5 cannot see). Every prior "known-good" was ~13 registers **quoted from a changelog**,
-and **every adversarial refutation on this arc had been dying on "no known-good value exists, so the read
-is uninterpretable."** That corpus gap was the blocker — not a shortage of ideas.
+**A2 / A3 — DONE and PROVEN BIT-CORRECT ON IRON (the strategic prize of the arc).** A2
+(`gpu_vbios_acquire` in `gpu.cyr`) acquires the vendor VBIOS; A3 is a sovereign ~700-line Cyrius **ATOM BIOS
+interpreter** (`kernel/core/atom.cyr`) that runs the vendor's own VBIOS bytecode. The 1.55.23 DRY trace
+matches the `atom-interp.py` oracle **exactly** — encoder 5 writes; transmitter 21 reads / 17 writes / 5
+delays; no amdgpu. Iron proof:
+[`atom-iron-dry-trace-0718.txt`](../../../agnosticos/docs/development/prior-art/atom-iron-dry-trace-0718.txt)
+against the oracle
+[`atom-oracle-writes-0718.txt`](../../../agnosticos/docs/development/prior-art/atom-oracle-writes-0718.txt).
+This interpreter is the **P6 cold-modeset foundation** — already in hand.
 
-**The result: 30 registers compared, 26 byte-identical.** agnos's register writes are, very nearly, right.
-Detail and the full refutation ledger live in the CHANGELOG; live state in [`state.md`](state.md).
+**▶ A4 is OPEN. Current lead — the DCCG symbol-clock re-prime.** agnos omitted the SYMCLKA write
+(abs `0x159` = `0x000d000d`) that amdgpu makes for HDMI. Confirmed as DIG1's clock: DIG1 routes to UNIPHYA
+(phyid 0), and amdgpu's own HDMI-on-DIG1 set `0x159` active (its AVI landed at `0x564d` = DIG1
+`AFMT_GENERIC_0`). Host-visible, display-safe, under test (`BURN_HDMI_DCCG`). Lead was read off
+[`amdgpu-hdmi-modeset-writes-0717.txt`](../../../agnosticos/docs/development/prior-art/amdgpu-hdmi-modeset-writes-0717.txt).
 
-**▶ The next step is a MEASUREMENT and it costs ZERO burns.** agnos's own CRC probe reads
-`tap 0 = content / tap 1 = zero`, which *looks* like "samples are zeroed inside the encoder" — but
-`AFMT_AUDIO_CRC_SOURCE` is a bare 1-bit field with **no consumer anywhere in the kernel tree**, and two
-readings fit the data in opposite directions (serial taps vs one tap reading IEC-60958 framing, whose CRC
-is non-zero even over digital silence). **The instrument's semantics were inferred from the answer it
-seemed to give** — the same error that rejected LPIB earlier the same day.
-Run `sudo agnosticos/scripts/crc-tap-identity.sh` (panel awake): it arms the identical probe on the
-*working* amdgpu path against a **known stimulus** (silence, then tone). Tap 0 content-sensitive ⇒ the
-serial reading holds and the Azalia endpoint is exonerated; tap 0 invariant ⇒ agnos's "content" is framing
-over silence and the endpoint is back in scope. Either outcome kills half the search space.
+**Iron-confirmed A4 findings:**
+- The ATOM transmitter-enable #76 **power-cycles the PHY** (`556F` / `5E03` / `5DF0`) and blanks the live
+  console pipe **non-recoverably** — not usable as-is on the running pipe.
+- The encoder-setup-only #4 is **display-safe but SILENT** (exonerated).
+- **Fallback if DCCG fails:** the full HDMI modeset (SetPixelClock #12 + transmitter + OTG re-commit)
+  wrapped in a self-recovering OTG-frame-count watchdog; the transmitter is DMCUB for amdgpu (opaque) but
+  host-ATOM #76 for agnos.
 
-**Do not spend a burn on a register write while the instrument reading the result is unverified.**
+**Process lesson from this cycle:** a new `#ifdef` mode-flag needs its `build.sh` define line, and you verify
+it by `cmp`-ing the two binaries, not by the burn tag — the `ATOM_DRY` flag was a no-op for two burns.
+
+*Superseded:* the fifteen-burn "still mute" register-diff hunt (the DCN audio register class is now
+byte-exhausted), and the AFMT_AUDIO_CRC tap-identity zero-burn measurement — the taps were proven
+PCM-content-sensitive on the working amdgpu path, closing that branch
+([`dcn-audio-crc-tap-identity-2026-07-15.md`](../../../agnosticos/docs/development/prior-art/dcn-audio-crc-tap-identity-2026-07-15.md)).
+The search has moved off the display-audio registers and onto the transmitter/encoder bring-up.
 
 ### Remaining ladder
 
@@ -73,7 +88,7 @@ over silence and the endpoint is back in scope. Either outcome kills half the se
 |------|-------|
 | **P4 — scanout-residue clear** | Clear the AMD Zen Quiet-Boot scanout residue using the P1 re-point primitive, for a clean first paint. This subsumes the long-parked standalone "AMD Zen scanout residue" item — the two are one bite now that P1 shipped the primitive. It does not block MVP: the VGA path is legible at 1080p and 1440p. The two resumption options remain a HUBP `clear_tiling` port (the Linux `drivers/gpu/drm/amd/display/` analog) or a shadow-buffer FB-console architectural evaluation (simpledrm-style); both forms of another GOP `SetMode` lever were falsified at Attempt 78. Pin: `project_amd_zen_scanout_residue`. |
 | **GFX-ring 2D acceleration** | Accelerated `blit`#39 and a GPU-composited aethersafha. |
-| **P6+ — 3D and full modeset** | RADV-derived GFX-ring blits over the C1/C2 ring machinery, plus DCN mode-set, DP link-training, and DMCUB. Likely a follow-on arc. It is in the ambition and is not written off. |
+| **P6+ — 3D and full modeset** | RADV-derived GFX-ring blits over the C1/C2 ring machinery, plus DCN mode-set, DP link-training, and DMCUB. Likely a follow-on arc — but the **cold-modeset foundation is already in hand**: the sovereign Cyrius ATOM BIOS interpreter (`kernel/core/atom.cyr`, the arc's A3) runs the vendor VBIOS bytecode bit-correctly on iron (proven at 1.55.23), so a sovereign modeset does not need DMCUB. It is in the ambition and is not written off. |
 
 Numbering note: this file previously called 2D acceleration "P5". The display-arc plan doc's ladder has no
 P5 — it goes from P4 straight to P6+. Reconcile before anyone codes against either. See
@@ -233,7 +248,7 @@ they stayed deferred deliberately.
 
 | Item | Notes |
 |------|-------|
-| **HDMI/DP audio residue** | The active P3 bite covers getting sound out the video cable. What it does not cover, and what stays deferred: **ELD and hotplug** — which display is attached and what formats it supports — **per-sink stream routing**, and the **`core/audio/` multi-file driver form** the 1.52.x arc-open note flagged as this item's likely trigger. Two corrections to the old framing: this is no longer "its own later arc, no consumer demand yet" (it is the active bite), and the planned approach of a second-function probe at `04:00.1` with HDMI-codec enumeration is partly superseded by the DCN-side route actually taken (DIG1 and Azalia endpoint 1). |
+| **HDMI/DP audio residue** | The active A4 bite covers getting sound out the video cable. What it does not cover, and what stays deferred: **ELD and hotplug** — which display is attached and what formats it supports — **per-sink stream routing**, and the **`core/audio/` multi-file driver form** the 1.52.x arc-open note flagged as this item's likely trigger. Two corrections to the old framing: this is no longer "its own later arc, no consumer demand yet" (it is the active bite), and the planned approach of a second-function probe at `04:00.1` with HDMI-codec enumeration is partly superseded by the DCN-side route actually taken (DIG1 and Azalia endpoint 1). |
 | **NTFS read + squashfs read** | Split out of the FAT-family decision on 2026-05-26 and deferred at 1.34.0. **NTFS** read gives Windows-volume interop; it is a complex on-disk format ($MFT, attribute runs, B-trees) and multi-source-audit-heavy. **squashfs** read is a compressed read-only FS and leverages `sankoch` (LZ4, DEFLATE, zlib, gzip) decompression in-kernel. Both read-only; each its own minor when slotted. Neither exists in the tree. |
 | **HTREE indexed directory support (ext4)** | A linear dirent scan suffices for read, and `ext2.cyr` never creates htree-indexed dirs. HTREE is a performance optimization for huge directories of 10k+ entries. Queue when a real consumer needs it. |
 | **Perf tail — syscall entry/exit and context-switch** | Deferred with reason at the 1.47.x perf-series close; the reasoning is the value. **Syscall entry/exit:** the `ksyscall` dispatch is already well-ordered — the hot syscalls (`exit`, `write`, `getpid`, `read`, `close`) sit at depths 1 through 7 of the linear `if (num == N)` chain — so a reorder or fast path is a near-zero real win, and the entry trampoline is hand-asm; not worth a hollow patch. **Context-switch:** the per-tick register save and restore is hand-asm, and the 1.44.22 audit flagged it low-headroom and higher-risk. Both queue behind a profile showing either is actually hot. Note this row supersedes the older, broader "more perf tuning" list — ext2 I/O and the scheduler single-pass both landed in the 1.47.x series, so only these two survive from it. |
@@ -335,7 +350,7 @@ now. Arcs before 1.40.x are recorded in the CHANGELOG and in `state.md`'s own cl
 | **1.50.x** | RAM full-usage continuation, boot-CR3 to own PML4, the mmap-arena lift, and process-isolation hardening. | 1.50.10, 2026-06-29 | Validated |
 | **1.51.x** | Sovereign package-manager kernel surface — the ark v2 and agnova prerequisites, including `symlink`#63 — plus the NIC RX-interrupt latency fix. ark M3 proven end-to-end on agnos. | 1.51.9, 2026-07-03 | Validated |
 | **1.52.x** | Audio output — the HDA/Azalia driver and the ring-3 `snd_*` band, syscalls #64 through #69. First sound from sovereign AGNOS. | 1.52.8, 2026-07-04 | Validated *(no explicit close sentence — see open question 5)* |
-| **1.53.x** | Multi-thrust: FP/SIMD in ring 3, console perf, shm and setu, the raw-block install primitives (#75–80), `readlink`#70, `readdir`#81, and native xHCI USB-HID. The 1.53.5 HDMI-audio bites left the backlog that 1.55.x P3 is closing. | 1.53.14, 2026-07-10 | Validated (explicit) |
+| **1.53.x** | Multi-thrust: FP/SIMD in ring 3, console perf, shm and setu, the raw-block install primitives (#75–80), `readlink`#70, `readdir`#81, and native xHCI USB-HID. The 1.53.5 HDMI-audio bites left the backlog the 1.55.x display arc (A4) is working. | 1.53.14, 2026-07-10 | Validated (explicit) |
 | **1.54.x** | **GPU compute — the crown.** Sovereign gfx90c compute proven on iron with no amdgpu and no ROCm: firmware load, engines, GPUVM, CP/MEC, PM4, hand-assembled shaders, integer and rosnet-bit-correct f64 matmul, exposed to ring 3 via syscalls #82 and #83. Plan: [`planning/kernel-gpu-arc-154x.md`](planning/kernel-gpu-arc-154x.md). | 1.54.33, 2026-07-14 | Complete end-to-end, iron-proven |
 
 ---
