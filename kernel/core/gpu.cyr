@@ -3690,6 +3690,103 @@ fn gpu_hdmi_audio_crc_one(d, source) {
 # 'undefined function gpu_symclk_capture' with a REACHABLE call site the moment HDMI_DCCG was built
 # alone. See [[reference_cyrius_control_flow_idioms]]: a shared decl must never sit behind a narrower
 # guard than the code that calls it.
+# === Shutdown arc bite 11 — HDMI audio teardown, as a METERED LADDER ========================
+#
+# TWO JOBS, and the second is why this is gated OFF by default.
+#
+# (1) It is the anti-pop step. The monitor's amp releases with an audible pop when
+#     agnos cuts power with the audio path still live — Linux does not pop because
+#     it tears the path down first. Muting and unwinding in order fixes that.
+#
+# (2) ⚠ IT IS ALSO AN A4 DIAGNOSTIC, and that is worth more than the fix right now.
+#     The shutdown pop is currently the arc's ONLY sink-side instrument — the single
+#     piece of evidence that the monitor's amp is armed and driven by agnos's stream
+#     at all. Every other instrument in this arc is source-side. Shipping a silent
+#     unconditional teardown would DESTROY that instrument before A4 closes.
+#
+# So each rung prints a label and holds ~1 s. THE OPERATOR NOTES WHICH RUNG PRODUCES
+# THE POP, and that answers a question 20+ burns could not:
+#   - pop at the SD_RUN clear (rung 3)  ⟹ the amp follows sample CONTENT, which
+#     FALSIFIES "the payload is digital silence" and moves A4 to level/scale in hda.cyr;
+#   - pop only at SAMPLE_SEND (rung 2)  ⟹ the amp follows data-island presence;
+#   - pop only at the very end          ⟹ "amp armed by our stream" is overstated.
+#
+# Answer-registers to read alongside, both content-sensitive rather than echoes:
+# AZ_LPIB must FREEZE once SD_RUN clears, and AZ_AUDIO_ENABLE_STATUS must go 1 -> 0.
+# ⚠ Do NOT score AFMT_STATUS bit4 — the tree already documents it as "what the
+# hardware was TOLD", not what it did.
+#
+# ⚠ DOES NOT reuse gpu_hdmi_avmute_pulse(): that is an UNMUTE-edge generator which
+# clears AVMUTE ~48 ms later, so the amp would be live again exactly when power drops
+# and the pop would return. Here AVMUTE is asserted and HELD.
+# ⚠ NEVER touches DIG_BE_CNTL / DIG_MODE — the console rides this DIG.
+#ifdef BURN_AUDIO_TEARDOWN
+fn gpu_hdmi_audio_disable() {
+    var d = 0;
+    var az = 0;
+    var ir = 0;
+    var dr = 0;
+    var v = 0;
+    var hpc = 0;
+
+    if (gpu_present == 0) { return 0; }
+    if (gpu_audio_dig < 0) { return 0; }
+    d  = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    az = gpu_audio_dig;
+    ir = GPU_R_AZ_ENDPOINT_INDEX + az * GPU_DCN_AZ_STRIDE;
+    dr = GPU_R_AZ_ENDPOINT_DATA  + az * GPU_DCN_AZ_STRIDE;
+
+    kprintln("audio teardown: rung 1 assert avmute", 36);
+    v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, v | GPU_HDMI_GC_AVMUTE);
+    v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_STATUS + d);
+    if ((v & GPU_HDMI_ACTIVE_AVMUTE) != 0) {
+        kprintln("audio teardown: sink is being told to mute", 42);
+    }
+    gpu_udelay(1000000);
+
+    kprintln("audio teardown: rung 2 stop sample send", 39);
+    v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,
+    v & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+    gpu_udelay(1000000);
+
+    kprintln("audio teardown: rung 3 stop the codec feed", 42);
+    hda_hdmi_feed_stop();
+    gpu_udelay(1000000);
+
+    # The endpoint disable MUST be bracketed by clock-gating-disable. A write into a
+    # gated clock is dropped SILENTLY — the sweep code elsewhere clears AUDIO_ENABLED
+    # without the bracket, so that write may never have landed at all.
+    kprintln("audio teardown: rung 4 disable the endpoint", 43);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+    hpc = gpu_reg32(GPU_BASE_DCN_2, dr);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc | GPU_AZ_CLOCK_GATING_DISABLE);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+    hpc = gpu_reg32(GPU_BASE_DCN_2, dr);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc & (0 - 1 - GPU_AZ_AUDIO_ENABLED));
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+    hpc = gpu_reg32(GPU_BASE_DCN_2, dr);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc & (0 - 1 - GPU_AZ_CLOCK_GATING_DISABLE));
+    gpu_udelay(1000000);
+
+    kprintln("audio teardown: rung 5 stop the packet generators", 49);
+    v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d,
+    v & (0 - 1 - GPU_HDMI_AUDIO_INFO_SEND));
+    gpu_udelay(1000000);
+
+    # LAST. Dropping the audio clock first would gate every preceding write into a
+    # dead clock, so this rung has to come after all of them.
+    kprintln("audio teardown: rung 6 drop the audio clock", 43);
+    v = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d, v & (0 - 1 - GPU_AFMT_AUDIO_CLOCK_EN));
+
+    kprintln("audio teardown: done -- which rung made the pop?", 48);
+    return 1;
+}
+#endif
+
 # === Shutdown arc bite 6 — quiesce the GPU compute engines ==================================
 #
 # THE CONCRETE HAZARD THIS CLOSES: CP_HQD_ACTIVE is written to 1 exactly once, when

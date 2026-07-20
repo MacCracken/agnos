@@ -5,6 +5,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Shutdown arc bite 11 — the HDMI audio teardown, as a METERED LADDER**
+  (`gpu_hdmi_audio_disable()` in `gpu.cyr`, `#ifdef BURN_AUDIO_TEARDOWN`, **DEFAULT OFF**). Closes the ladder.
+  It has two jobs, and the second is why it is opt-in:
+  1. **The anti-pop step.** The monitor's amp releases with an audible pop because agnos cut power with the
+     audio path still live; Linux does not pop because it tears down first.
+  2. **⚠ It is also an A4 DIAGNOSTIC, and right now that is worth more than the fix.** The shutdown pop is the
+     A4 sub-arc's **only sink-side instrument** — the sole evidence the amp is armed and driven by agnos's
+     stream at all; every other instrument in the arc is source-side. A silent unconditional teardown would
+     **destroy that instrument before A4 closes.**
+  So each of six rungs prints a label and holds ~1 s, and the operator notes **which rung produces the pop** —
+  answering something 20+ burns could not: a pop at the **`SD_RUN` clear** means the amp follows sample
+  **content**, which **falsifies "the payload is digital silence"** and moves A4 to level/scale in `hda.cyr`;
+  a pop only at `SAMPLE_SEND` means it follows data-island presence; a pop only at the end means "amp armed by
+  our stream" is overstated. Read `AZ_LPIB` (must **freeze** once `SD_RUN` clears) and `AZ_AUDIO_ENABLE_STATUS`
+  (must go 1→0) alongside — both content-sensitive rather than echoes. ⚠ Do **not** score `AFMT_STATUS` bit 4;
+  the tree already documents it as "what the hardware was **told**".
+  Order: assert **and HOLD** AVMUTE → stop `SAMPLE_SEND` → stop the codec feed → disable the AZ endpoint
+  **inside the clock-gating bracket** (a write into a gated clock is dropped silently — the sweep code
+  elsewhere clears `AUDIO_ENABLED` without the bracket, so that write may never have landed) → stop the packet
+  generators → drop the audio clock **last** (dropping it first would gate every preceding write into a dead
+  clock). ⚠ Deliberately does **not** reuse `gpu_hdmi_avmute_pulse()` — that is an *unmute*-edge generator
+  which clears AVMUTE ~48 ms later, so the amp would be live again exactly when power drops and the pop would
+  return. ⚠ Never touches `DIG_BE_CNTL`/`DIG_MODE`: the console rides that DIG.
+  `cmp`-verified that the flag changes the artifact (1,604,232 B off / 1,607,424 B on).
+
+### Notes
+
+- **Filed `2026-07-19-sys-reboot-nullary-vs-agnos-4arg-abi.md`** in **both** `agnos/docs/development/issues/`
+  and `cyrius/docs/development/issues/` (per the cross-repo issue convention). cyrius's
+  `sys_reboot()` is still the **nullary** wrapper that matched the old stub #13; agnos #13 now takes
+  `(magic1, magic2, cmd, arg)`. Because the cyrius `syscall()` builtin pops exactly the registers its call site
+  names, a stale nullary caller delivers **garbage** into a syscall that can power the machine off — which is
+  precisely what agnos's magic pair makes fail closed, so this is a foot-gun to remove rather than an
+  emergency. The issue requests the widened wrapper plus exported `PWR_*` constants, so consumers stop
+  hand-rolling the magic values. Explicitly noted as **not a cyrius bug** — `syscall()` is working as designed;
+  agnos changed an ABI underneath a stdlib wrapper.
+
 ## [1.55.26] — 2026-07-19 — ★ AGNOS POWERS ITSELF OFF (ACPI S5, iron-validated)
 
 **★★ IRON-PASS on archaemenid: `poweroff` at the agnsh prompt runs the full teardown and the machine goes

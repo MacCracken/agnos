@@ -289,6 +289,14 @@ else
         # HDA_HDMI + HDA_TONE. Use INSTEAD OF HDMI_DCCG, not with it — HDMI_DCCG applies the write at boot,
         # which would leave window A already-on and destroy the experiment. Display-safe (host DCCG only).
         [ -n "$HDMI_SYMCLK_AB" ]     && echo '#define HDMI_SYMCLK_AB'
+        # BURN_AUDIO_TEARDOWN=1 — the metered HDMI-audio teardown ladder (shutdown arc
+        # bite 11). Six labelled rungs ~1 s apart on the shutdown path: assert+HOLD
+        # AVMUTE, stop SAMPLE_SEND, stop the codec feed, disable the AZ endpoint,
+        # stop the packet generators, drop the audio clock. DEFAULT OFF and it must
+        # stay that way until A4 closes: the shutdown release-pop is the arc's only
+        # sink-side instrument, and this ladder exists to ask WHICH RUNG produces it.
+        # A pop at the SD_RUN rung would falsify "the payload is digital silence".
+        [ -n "$BURN_AUDIO_TEARDOWN" ] && echo '#define BURN_AUDIO_TEARDOWN'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

@@ -126,6 +126,13 @@ fn power_storage_quiesce() {
 #                         has no way to interact with the machine.
 fn power_quiesce_devices() {
     power_flush();
+    # Bite 11 — the HDMI audio teardown, gated OFF by default. It runs FIRST among
+    # the device steps: the mute has to reach the sink before the data island stops.
+    # It is opt-in because the shutdown pop is still the A4 sub-arc's only sink-side
+    # instrument, and a silent unconditional teardown would remove it before A4 closes.
+    #ifdef BURN_AUDIO_TEARDOWN
+    gpu_hdmi_audio_disable();
+    #endif
     hda_quiesce_all();
     gpu_quiesce();
     r8169_quiesce();
