@@ -158,6 +158,150 @@ fn acpi_parse_dmar(dmar) {
     return 0;
 }
 
+# === FADT (FACP) — the power-management table ================================
+# Shutdown arc bite 2. STRICTLY READ-ONLY: locate the FADT and decode the fields
+# a later bite needs to reset or power off. Nothing here writes a register, so it
+# is safe to run on every boot and safe to fold into any burn.
+#
+# EVERY read is bounds-checked against the table's own length, because FADT
+# revisions differ wildly in size and the X_ (64-bit GAS) forms live PAST the end
+# of an old table: QEMU's i440fx machine emits a rev-1, 116-byte FADT with no
+# X-fields at all, so a blind read of X_PM1a_CNT at offset 172 returns adjacent
+# firmware blob bytes — which would look like a perfectly plausible I/O port.
+# Prefer an X-form only when it is in range AND non-zero; else use the legacy u32.
+var acpi_fadt_addr   = 0;
+var acpi_fadt_len    = 0;
+var acpi_fadt_rev    = 0;
+var acpi_fadt_flags  = 0;
+var acpi_hw_reduced  = 0;   # FADT flags bit20 — no fixed PM hardware; S5 via PM1 would be wrong
+var acpi_dsdt_addr   = 0;   # where the \_S5_ package lives (bite 3)
+var acpi_smi_cmd     = 0;
+var acpi_enable_val  = 0;
+var acpi_pm1a_cnt    = 0;
+var acpi_pm1b_cnt    = 0;
+var acpi_pm1a_evt    = 0;
+var acpi_pm1_cnt_len = 0;
+var acpi_reset_space = 0;   # GAS address-space id: 0 = system memory, 1 = system I/O
+var acpi_reset_addr  = 0;
+var acpi_reset_value = 0;
+var acpi_reset_ok    = 0;   # 1 = FADT advertises RESET_REG (flags bit10) and revision >= 2
+
+# Is [off, off+size) inside the table the firmware actually gave us?
+fn acpi_fadt_has(off, size) {
+    if (acpi_fadt_len == 0) { return 0; }
+    if ((off + size) > acpi_fadt_len) { return 0; }
+    return 1;
+}
+
+# A Generic Address Structure is 12 bytes: space_id, bit_width, bit_offset,
+# access_size, then a 64-bit address. Only the space id and address matter here.
+fn acpi_gas_space(off) {
+    if (acpi_fadt_has(off, 12) == 0) { return 0 - 1; }
+    return acpi_load8(acpi_fadt_addr + off);
+}
+fn acpi_gas_addr(off) {
+    if (acpi_fadt_has(off, 12) == 0) { return 0; }
+    return acpi_load64(acpi_fadt_addr + off + 4);
+}
+
+fn acpi_find_fadt() {
+    var f = 0;
+    var xa = 0;
+    # 'FACP' — the FADT's signature is NOT "FADT".
+    if (acpi_xsdt_addr != 0) { f = acpi_xsdt_find(acpi_xsdt_addr, 0x46, 0x41, 0x43, 0x50); }
+    if (f == 0) {
+        if (acpi_rsdt_addr != 0) { f = acpi_rsdt_find(acpi_rsdt_addr, 0x46, 0x41, 0x43, 0x50); }
+    }
+    if (f == 0) { return 0; }
+
+    acpi_fadt_len = acpi_load32(f + 4);
+    # A FADT shorter than its own fixed header + PM block fields is corrupt; refuse
+    # it outright rather than decode garbage.
+    if (acpi_fadt_len < 92) { acpi_fadt_len = 0; return 0; }
+    if (acpi_fadt_len > 0x10000) { acpi_fadt_len = 0; return 0; }
+    acpi_fadt_addr = f;
+    acpi_fadt_rev  = acpi_load8(f + 8);
+
+    if (acpi_fadt_has(112, 4) == 1) { acpi_fadt_flags = acpi_load32(f + 112); }
+    acpi_hw_reduced = (acpi_fadt_flags >> 20) & 1;
+
+    if (acpi_fadt_has(40, 4)  == 1) { acpi_dsdt_addr   = acpi_load32(f + 40); }
+    if (acpi_fadt_has(48, 4)  == 1) { acpi_smi_cmd     = acpi_load32(f + 48); }
+    if (acpi_fadt_has(52, 1)  == 1) { acpi_enable_val  = acpi_load8(f + 52); }
+    if (acpi_fadt_has(56, 4)  == 1) { acpi_pm1a_evt    = acpi_load32(f + 56); }
+    if (acpi_fadt_has(64, 4)  == 1) { acpi_pm1a_cnt    = acpi_load32(f + 64); }
+    if (acpi_fadt_has(68, 4)  == 1) { acpi_pm1b_cnt    = acpi_load32(f + 68); }
+    if (acpi_fadt_has(89, 1)  == 1) { acpi_pm1_cnt_len = acpi_load8(f + 89); }
+
+    # X_DSDT (offset 140) supersedes the 32-bit DSDT when present and non-zero —
+    # required once the table lives above 4 GB.
+    if (acpi_fadt_has(140, 8) == 1) {
+        xa = acpi_load64(f + 140);
+        if (xa != 0) { acpi_dsdt_addr = xa; }
+    }
+    # X_PM1a_CNT_BLK (172) / X_PM1b_CNT_BLK (184).
+    if (acpi_fadt_has(172, 12) == 1) {
+        xa = acpi_gas_addr(172);
+        if (xa != 0) { acpi_pm1a_cnt = xa; }
+    }
+    if (acpi_fadt_has(184, 12) == 1) {
+        xa = acpi_gas_addr(184);
+        if (xa != 0) { acpi_pm1b_cnt = xa; }
+    }
+
+    # RESET_REG (116) + RESET_VALUE (128). Flags bit10 = RESET_REG_SUP; the register
+    # is only meaningful from revision 2 onward.
+    if (acpi_fadt_has(128, 1) == 1) {
+        acpi_reset_space = acpi_gas_space(116);
+        acpi_reset_addr  = acpi_gas_addr(116);
+        acpi_reset_value = acpi_load8(f + 128);
+        if (acpi_fadt_rev >= 2) {
+            if (((acpi_fadt_flags >> 10) & 1) == 1) {
+                if (acpi_reset_addr != 0) { acpi_reset_ok = 1; }
+            }
+        }
+    }
+    return f;
+}
+
+# One plain line per group. Read-only report; a later bite acts on these.
+fn acpi_fadt_report() {
+    if (acpi_fadt_addr == 0) {
+        kprintln("acpi: no FADT found -- no power management available", 52);
+        return 0;
+    }
+    kprint("acpi: fadt revision ", 20); kprint_num(acpi_fadt_rev);
+    kprint(", length ", 9);             kprint_num(acpi_fadt_len);
+    kprintln("", 0);
+
+    kprint("acpi: power control pm1a ", 25); kprint_hex(acpi_pm1a_cnt);
+    kprint(" pm1b ", 6);                     kprint_hex(acpi_pm1b_cnt);
+    kprint(" width ", 7);                    kprint_num(acpi_pm1_cnt_len);
+    kprintln("", 0);
+
+    if (acpi_reset_ok == 1) {
+        kprint("acpi: reset register space ", 27); kprint_num(acpi_reset_space);
+        kprint(" address ", 9);                    kprint_hex(acpi_reset_addr);
+        kprint(" value ", 7);                      kprint_hex(acpi_reset_value);
+        kprintln("", 0);
+    } else {
+        kprintln("acpi: no reset register advertised", 34);
+    }
+
+    kprint("acpi: dsdt at ", 14); kprint_hex(acpi_dsdt_addr);
+    kprintln("", 0);
+
+    if (acpi_hw_reduced == 1) {
+        kprintln("acpi: hardware-reduced platform (no fixed power management)", 59);
+    }
+    if (acpi_smi_cmd != 0) {
+        kprint("acpi: firmware handoff port ", 28); kprint_hex(acpi_smi_cmd);
+        kprint(" enable ", 8);                      kprint_hex(acpi_enable_val);
+        kprintln("", 0);
+    }
+    return 0;
+}
+
 fn acpi_init() {
     acpi_rsdp_addr = 0;
     acpi_rsdt_addr = 0;
@@ -218,6 +362,10 @@ fn acpi_init() {
         # Parse DMAR to find IOMMU register base
         acpi_iommu_base = acpi_parse_dmar(dmar);
     }
+
+    # Shutdown arc bite 2: locate + decode the FADT. Read-only, so it costs a boot
+    # nothing and gives every later burn the power-management facts for free.
+    acpi_find_fadt();
 
     return 0;
 }

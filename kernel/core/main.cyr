@@ -443,6 +443,9 @@ if (acpi_rsdp_addr != 0) {
         kprint_num(acpi_iommu_base);
         kprintln("", 0);
     }
+    # Shutdown arc bite 2 — read-only power-management facts (reset register, PM1
+    # control blocks, DSDT for the later \_S5_ decode).
+    acpi_fadt_report();
 } else {
     kprintln("ACPI: no RSDP found", 19);
 }

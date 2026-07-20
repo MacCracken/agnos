@@ -20,6 +20,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with `do_flush=1`, which left three holes that each lose `write()`-acknowledged data: **proc 0 uses the
   global `vfs_table` and is never reaped**, a reap with `do_flush=0` drops up to 4×4 KB, and nothing at all
   ran when the box simply stopped.
+- **Shutdown arc bite 2 — FADT discovery, strictly read-only** (`acpi.cyr`). `acpi_find_fadt()` locates the
+  FADT (signature **`FACP`**, not "FADT") via the existing XSDT walk with an RSDT fallback, and decodes what a
+  reset or power-off will need: revision, length, flags, `PM1a`/`PM1b_CNT_BLK` (+ their 64-bit X-forms),
+  `PM1_CNT_LEN`, `SMI_CMD`/`ACPI_ENABLE`, `RESET_REG` GAS + `RESET_VALUE`, and DSDT/X_DSDT (bite 3's target).
+  `acpi_fadt_report()` prints it as plain statements. **Writes nothing**, so it rides every boot and can fold
+  into any burn for free.
+  **Every field read is bounds-checked against the table's own length**, because the X_ forms live *past the
+  end* of an old FADT — QEMU's i440fx emits a **rev-1, 116-byte** table with no X-fields at all, so a blind
+  read of `X_PM1a_CNT` at offset 172 returns adjacent firmware-blob bytes that would look like a perfectly
+  plausible I/O port. An X-form is preferred only when in-range **and** non-zero; otherwise the legacy u32 wins.
+  Verified on QEMU q35: `fadt revision 3, length 244` · `pm1a 604 pm1b 0 width 2` · `reset register space 1
+  address cf9 value f` · `dsdt at 1fb7a000` · hardware-reduced clear — all matching that machine's known values.
+  ⚠ **Carry-forward for the reset bite:** QEMU advertises `RESET_VALUE = 0xf` on port `0xcf9`. On the AMD FCH a
+  CF9 write of `0x0E` is a genuine **S5 power-cycle**, not a warm reset — so *following the FADT's own
+  advertised value* could power archaemenid off rather than reboot it. Capture the iron FADT (read-only, rides
+  any burn) before writing anything.
 - **`scripts/shutdown-smoke.sh`** — QEMU gate for the above: builds a GPT+ESP+ext2 image, drives the shell to
   exit via HMP `sendkey`, then requires both the `power: filesystems flushed` line **and** `e2fsck -fn` clean.
   It checks the image is clean *before* boot too, since a "clean" verdict on a never-dirtied FS proves nothing.
