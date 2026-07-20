@@ -36,6 +36,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   CF9 write of `0x0E` is a genuine **S5 power-cycle**, not a warm reset — so *following the FADT's own
   advertised value* could power archaemenid off rather than reboot it. Capture the iron FADT (read-only, rides
   any burn) before writing anything.
+- **Shutdown arc bite 3 — the `\_S5_` decode, strictly read-only** (`acpi.cyr`). ACPI defines soft-off by an
+  object in the DSDT's **AML bytecode**, not by a table field, so there is no way to power a machine down
+  without decoding it. `acpi_find_s5()` does the bounded byte-scan every small kernel uses —
+  `NameOp(0x08) "_S5_" PackageOp(0x12) PkgLength NumElements <elements>` — with full PkgLength decoding
+  (bits[7:6] = count of additional bytes), the Zero/One/Byte/Word/DWord element prefixes, and an explicit
+  **MethodOp(0x14) detection that REFUSES rather than mis-decodes** a method body as a package.
+  **✅ VALIDATED AGAINST REAL FIRMWARE — the one thing QEMU structurally cannot test.** QEMU's DSDT declares
+  `_S5` as a package of all zeroes, so a completely broken scanner passes there by construction (agnos duly
+  prints `sleep type a 0 b 0` under QEMU, which is a non-answer). Ground truth was taken from archaemenid's own
+  Linux (`acpica` package) and the decode reached **two independent ways**: `iasl -d` gives
+  `Name (_S5, Package (0x04) { 0x05, Zero, Zero, Zero })`, and agnos's own algorithm re-run byte-for-byte over
+  the raw 36,097-byte AMI DSDT finds `_S5_` at offset 12422, confirms the preceding `0x08` NameOp, decodes
+  PkgLength lead `0x07` → 0 extra bytes → skip 2, and reads `0x0A 0x05` then `ZeroOp`. **Both give
+  SLP_TYPa = 5, SLP_TYPb = 0.** Kept as
+  `agnosticos/docs/development/prior-art/acpi-s5-known-good-archaemenid-0719.txt`.
+  ⟹ **Iron PASS criterion for the read-only capture: `acpi: sleep type a 5 b 0`.** A different value means the
+  scanner desynced on this firmware and the poweroff bite must not be written.
+  ⚠ A wrong SLP_TYP is not cosmetic — it selects WHICH sleep state, and a value the platform reads as S1/S3
+  suspends the box with interrupts off, no wake vector and no resume path (indistinguishable from a hard hang,
+  exit is a power-button hold). The field is therefore range-checked to 3 bits and a decode that does not look
+  like a real package is refused rather than guessed at.
 - **`scripts/shutdown-smoke.sh`** — QEMU gate for the above: builds a GPT+ESP+ext2 image, drives the shell to
   exit via HMP `sendkey`, then requires both the `power: filesystems flushed` line **and** `e2fsck -fn` clean.
   It checks the image is clean *before* boot too, since a "clean" verdict on a never-dirtied FS proves nothing.
