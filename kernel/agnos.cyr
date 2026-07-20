@@ -109,6 +109,7 @@ include "core/net_tcp.cyr"       # TCP stack — split out at 1.36.0; must stay 
 include "core/fatfs.cyr"
 include "core/exfat.cyr"
 include "core/ext2.cyr"
+include "core/power.cyr"         # orderly shutdown — after the FS/block layers it flushes, before syscall.cyr
 include "core/syscall.cyr"
 include "core/bench.cyr"         # 3-tier rdtsc benchmarks (build-time entry; inert unless scripts/bench.sh rewrites boot_finish.cyr to call bench_run_all)
 include "user/test_procs.cyr"

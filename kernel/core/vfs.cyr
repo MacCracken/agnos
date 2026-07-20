@@ -178,6 +178,57 @@ fn vfs_fd_inherit(child_pid, parent_pid) {
 # before freeing, so a program that exits with an open write-fd still persists its data.
 # do_flush=0 (proc_reap_child) matches that path's prior no-sweep behavior. Never frees the
 # static global (proc 0) — just detaches it.
+# Flush EVERY dirty secondary-write buffer in the system, whoever owns it.
+#
+# proc_destroy_fd_table(pid, 1) below already does this per-process, but only on
+# two paths: close() and a reap with do_flush=1. Three gaps follow from that, and
+# all three lose data that write() already acknowledged:
+#   - proc 0 uses the GLOBAL vfs_table (proc_fd_base[0] == 0) and is never reaped,
+#     so its write-back buffers have never been flushed by anything;
+#   - a proc reaped with do_flush=0 drops up to 4x4KB of acked content;
+#   - nothing at all runs when the box simply stops.
+# Shutdown needs the whole-system view, so the per-fd walk is hoisted here and run
+# over the global table plus every live per-process table. Caller holds fs_lock.
+fn vfs_wfile_sweep_all() {
+    var pid = 0;
+    var t = 0;
+    var fd = 0;
+    var base = 0;
+
+    # The global table first — proc 0, kthreads and anything pre-init live here.
+    fd = 3;
+    while (fd < 32) {
+        base = &vfs_table + fd * 32;
+        if (kis_tag(base, VFS_FREE) == 0) {
+            if (ktag(base) == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
+        }
+        fd = fd + 1;
+    }
+
+    # Then each per-process table. Skip 0 (uses the global, already done above) and
+    # skip any pid whose base IS the global, so a buffer is never flushed twice —
+    # vfs_sec_wfile_flush releases the pool slot, so a second pass would write from
+    # a block that has already been handed back.
+    pid = 0;
+    while (pid < 16) {
+        t = proc_fd_base_get(pid);
+        if (t != 0) {
+            if (t != &vfs_table) {
+                fd = 3;
+                while (fd < 32) {
+                    base = t + fd * 32;
+                    if (kis_tag(base, VFS_FREE) == 0) {
+                        if (ktag(base) == VFS_SEC_WFILE) { vfs_sec_wfile_flush(base); }
+                    }
+                    fd = fd + 1;
+                }
+            }
+        }
+        pid = pid + 1;
+    }
+    return 0;
+}
+
 fn proc_destroy_fd_table(pid, do_flush) {
     var t = proc_fd_base_get(pid);
     if (t == 0) { return 0; }                               # used the global — nothing to free

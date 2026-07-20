@@ -20,7 +20,11 @@ asm { 0xB0; 0x50; 0xE6; 0x70; 0xB0; 0x15; 0xE6; 0x71; }
 #ifdef KLUG_SELFTEST
 klug_dump();
 #endif
-kybernet(); arch_halt();
+# kybernet returns when the shell exits. Until 1.55.x that fell straight into an
+# unrecoverable spin with the ext2 superblock still marked dirty — exiting the
+# shell corrupted the mount. Flush before stopping, on BOTH stop paths.
+kybernet(); power_flush(); arch_halt();
 
 kprintln("Halted.", 7);
+power_flush();
 arch_halt();

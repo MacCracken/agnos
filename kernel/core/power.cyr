@@ -1,0 +1,62 @@
+# === Orderly shutdown ========================================================
+#
+# agnos has never had one. `arch_halt()` is `cli; hlt; jmp $` — an unrecoverable
+# spin, not a power state — and syscall #13 ("reboot") prints a line and calls it,
+# so a userland reboot() today freezes the box with a DIRTY ext2 superblock. When
+# the shell exits, kybernet returns and boot_finish spins in the same halt. Every
+# one of those paths loses un-synced filesystem state.
+#
+# This file is the shutdown sequence, built as a ladder. Bite 1 is ONLY the
+# durability barrier: make stopping safe before making it stop. Device quiesce
+# (storage / net / USB / audio / GPU), the ACPI FADT + \_S5 decode, reset and
+# S5 poweroff all land in later bites on top of power_flush().
+#
+# Deliberately NOT here, both decided against on evidence:
+#   - a jbd2 commit. The journal is inert on this tree (ext2_write_at_journaled
+#     has no callers, ext2_jbd2_tx_active is 0 on real writes), so commit_tx would
+#     log an error that means nothing, and "fixing" that would rewrite the journal
+#     superblock of the dev box's root on every shutdown.
+#   - IOMMU teardown. VT-d never runs on this box (AMD publishes IVRS, not DMAR,
+#     so acpi_iommu_base stays 0) and amd_iommu_disable() already ran at boot.
+
+# The durability barrier: everything write() has acknowledged reaches stable media.
+#
+# Order is load-bearing. The write-back sweep runs FIRST because it calls
+# vfs_write_on — it produces new dirty filesystem state, so flushing before it
+# would flush a snapshot that is immediately made stale. ext2_sync() then marks
+# EXT2_VALID_FS and writes the superblock, and its own trailing blk_flush_on()
+# pushes the controller-acked data through the drive's volatile cache. The
+# remaining backends are flushed after, because a box can have ext2 + FAT/exFAT
+# mounted on different devices and only ext2's own flush is implicit.
+#
+# fs_lock is taken ONCE around the sweep and the sync together: the syscall paths
+# hold it across exactly these calls, neither routine takes it internally, and it
+# is not reentrant. Device flushes go outside it — block/nvme/ahci take their own
+# locks, and fs < ahci is the established forward order.
+fn power_flush() {
+    var b0 = 0 - 1;
+    var b1 = 0 - 1;
+    var b2 = 0 - 1;
+    var b3 = 0 - 1;
+
+    fs_spin_lock();
+    vfs_wfile_sweep_all();
+    if (ext2_active != 0) { ext2_sync(); }
+    fs_spin_unlock();
+
+    # Flush each DISTINCT active backend. vfs_sync_secondary() is not used: it
+    # early-returns after its FAT branch, so a box with FAT and exFAT mounted at
+    # once would silently flush only FAT.
+    b0 = blk_active;
+    if (ext2_active  != 0) { b1 = ext2_backend; }
+    if (fatfs_active != 0) { b2 = fat_backend; }
+    if (exfat_active != 0) { b3 = exfat_backend; }
+
+    if (b0 >= 0) { blk_flush_on(b0); }
+    if (b1 >= 0) { if (b1 != b0) { blk_flush_on(b1); } }
+    if (b2 >= 0) { if (b2 != b0) { if (b2 != b1) { blk_flush_on(b2); } } }
+    if (b3 >= 0) { if (b3 != b0) { if (b3 != b1) { if (b3 != b2) { blk_flush_on(b3); } } } }
+
+    kprintln("power: filesystems flushed", 26);
+    return 0;
+}

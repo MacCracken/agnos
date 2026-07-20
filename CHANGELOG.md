@@ -7,6 +7,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Shutdown arc bite 1 — `power_flush()`, the durability barrier** (`kernel/core/power.cyr`, new). agnos has
+  never had an orderly shutdown: `arch_halt()` is `cli; hlt; jmp $`, and when the shell exits kybernet returns
+  straight into it with **ext2's superblock still marked dirty** — so a normal shutdown corrupted the mount.
+  `power_flush()` sweeps every write-back buffer, marks the FS clean and pushes the drive cache, and is now
+  called on both stop paths in `boot_finish.cyr`. Order is load-bearing: the write-back sweep runs *first*
+  (it calls `vfs_write_on`, producing new dirty state), then `ext2_sync()` under `fs_lock`, then a flush of
+  each **distinct** active backend — `vfs_sync_secondary()` is deliberately not used because it early-returns
+  after its FAT branch and would silently skip exFAT on a box with both mounted.
+- **`vfs_wfile_sweep_all()`** (`vfs.cyr`) — hoists the per-fd write-back flush out of
+  `proc_destroy_fd_table()` so it covers the whole system. That routine only ran on `close()` and on a reap
+  with `do_flush=1`, which left three holes that each lose `write()`-acknowledged data: **proc 0 uses the
+  global `vfs_table` and is never reaped**, a reap with `do_flush=0` drops up to 4×4 KB, and nothing at all
+  ran when the box simply stopped.
+- **`scripts/shutdown-smoke.sh`** — QEMU gate for the above: builds a GPT+ESP+ext2 image, drives the shell to
+  exit via HMP `sendkey`, then requires both the `power: filesystems flushed` line **and** `e2fsck -fn` clean.
+  It checks the image is clean *before* boot too, since a "clean" verdict on a never-dirtied FS proves nothing.
+  ⚠ **Not yet passing end-to-end**: under this invocation xHCI comes up but never enumerates the USB keyboard
+  (`ver=0`, no `port N connected`, no `hid: keyboard` — iron reads `ver=272`), so the keystrokes that drive
+  the shell to exit never arrive. The barrier itself builds green and is wired; the harness's input path needs
+  a separate look. Also observed: the staged `agnsh` (1.8.2) fails `alloc_init: mmap failed` under QEMU and
+  kybernet falls through to the in-kernel recovery shell — pre-existing, unrelated to this bite.
 - **A4 attribution control — the in-boot SYMCLK A/B (`HDMI_SYMCLK_AB`, burn profile `BURN_HDMI_SYMCLK_AB`).**
   `gpu_symclk_capture/_report/_apply/_restore` (`gpu.cyr`) snapshot, apply and restore the five DCCG stores at
   abs `0x159`/`0x15A`/`0x15B`/`0x15C`/`0x176`; `main.cyr` runs two passes of (symclk-OFF window → symclk-ON

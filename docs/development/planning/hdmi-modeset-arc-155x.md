@@ -4,6 +4,34 @@
 
 Audio slice of Thrust P (display). **A0–A3 ✅ DONE + PROVEN ON IRON. A4 (audio egress) is OPEN.**
 
+**▶▶▶ BURN 11 RESULT (1.55.24, 2026-07-19, `audio_re_11.txt`) — EVERY MEASURABLE CLASS IS NOW EXHAUSTED. THE
+NEXT REAL WORK IS THE FULL HDMI MODESET.**
+
+- **⛔ SYMCLKA falsified by measurement.** The in-boot A/B ran clean over two passes: pre-write all zeros →
+  applied `159=d000d …176=1111` → restored → applied again. **The writes land and the sound does not change**,
+  same boot, one sink state. Delete the block. (Also: abs `0x159` reads **0 on a lit, working display** — if
+  it were DIG1's symbol-clock enable there would be no picture. The name was inference-grade and is wrong.)
+- **★★★ The audio clock is ALIVE — the arc's first counted instrument.** `acr cts 241502 → 483006 → 241502`,
+  exactly 2× with N. The CTS engine counts TMDS clocks *gated by the audio clock*, so a stalled read clock
+  cannot yield a stable 241502 that tracks the pixel clock to 11 ppm and doubles precisely. **The whole clock
+  hypothesis class is dead.** Echo-test passed alongside: `HDMI_ACR_48_0/44_0/32_0` all read 0, so
+  `HDMI_ACR_STATUS_0` is a real measurement, not an echo.
+- **⛔ AVMUTE ruled out free:** `HDMI_GC = 4` vs amdgpu-playing `0x00000004`, `HDMI_ACTIVE_AVMUTE = 0` on both.
+- **★ The shutdown pop is REAL evidence and the premise stands.** HDMI audio has been armed on this rig under
+  Linux many times with **no** release pop on reboot — because Linux tears the audio path down before
+  power-off. agnos pops because it cuts power with the amp still energised. ⟹ the sink's amp **is armed and
+  driven by agnos's stream**. (Separate small bite this exposes: **agnos has no orderly audio teardown**.)
+
+**⟹ Clock ✅ · FIFO drains ✅ · real PCM at both taps ✅ · ACR ✅ · AVMUTE ✅ · channel status ✅ · register file
+byte-matched ✅ · amp armed ✅ — and the sink decodes silence.** The only remaining structural difference is
+not a register: **agnos rides the GOP's DVI modeset and has never performed a real HDMI modeset.** The
+off-agnos experiment already showed this from the other side — a from-scratch Linux driver replaying agnos's
+EXACT feed **played audible sound** riding amdgpu's cold modeset. **The full modeset (`SetPixelClock #12` +
+encoder `#4` + transmitter `#76` + OTG re-commit) is no longer the fallback — it is the LEAD**, and the
+sovereign ATOM interpreter makes it buildable. The transmitter blanks the pipe only because agnos runs it
+naked; it needs the surrounding sequence plus a **self-recovering OTG-frame-count watchdog** so a failed
+modeset restores the console instead of stranding a black panel.
+
 **⚠⚠ RETRACTED 2026-07-19 (same day it was written): "THE DCCG SYMCLK RE-PRIME ARMED THE SINK" IS DOWNGRADED
 TO *LOW CONFIDENCE*. Do not build on it.** An adversarial re-audit found three independent falsifiers:
 
