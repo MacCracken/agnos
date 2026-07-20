@@ -338,44 +338,44 @@ fn acpi_find_s5() {
     while (i < (len - 8)) {
         named = 0;
         if (acpi_load8(base + i)     == 0x5F) {           # '_'
-        if (acpi_load8(base + i + 1) == 0x53) {           # 'S'
-        if (acpi_load8(base + i + 2) == 0x35) {           # '5'
-        if (acpi_load8(base + i + 3) == 0x5F) {           # '_'
-            p1 = acpi_load8(base + i - 1);
-            p2 = acpi_load8(base + i - 2);
-            # NameOp directly before, or NameOp then a RootChar '\' prefix.
-            if (p1 == 0x08) { named = 1; }
-            if (p1 == 0x5C) { if (p2 == 0x08) { named = 1; } }
-            # A Method-defined _S5_ needs a real interpreter to evaluate; refuse it
-            # loudly instead of decoding the method body as if it were a package.
-            if (p1 == 0x14) { acpi_s5_method = 1; }
-            if (p2 == 0x14) { acpi_s5_method = 1; }
+            if (acpi_load8(base + i + 1) == 0x53) {           # 'S'
+                if (acpi_load8(base + i + 2) == 0x35) {           # '5'
+                    if (acpi_load8(base + i + 3) == 0x5F) {           # '_'
+                        p1 = acpi_load8(base + i - 1);
+                        p2 = acpi_load8(base + i - 2);
+                        # NameOp directly before, or NameOp then a RootChar '\' prefix.
+                        if (p1 == 0x08) { named = 1; }
+                        if (p1 == 0x5C) { if (p2 == 0x08) { named = 1; } }
+                        # A Method-defined _S5_ needs a real interpreter to evaluate; refuse it
+                        # loudly instead of decoding the method body as if it were a package.
+                        if (p1 == 0x14) { acpi_s5_method = 1; }
+                        if (p2 == 0x14) { acpi_s5_method = 1; }
 
-            if (named == 1) {
-                acpi_aml_cursor = i + 4;
-                if (acpi_load8(base + acpi_aml_cursor) == 0x12) {   # PackageOp
-                    acpi_aml_cursor = acpi_aml_cursor + 1;
-                    b = acpi_load8(base + acpi_aml_cursor);
-                    # PkgLength: bits[7:6] = count of ADDITIONAL bytes. Skip the
-                    # whole encoding, then the one-byte NumElements.
-                    acpi_aml_cursor = acpi_aml_cursor + ((b & 0xC0) >> 6) + 1 + 1;
-                    if (acpi_aml_cursor < len) {
-                        a  = acpi_aml_read_int(base);
-                        bb = acpi_aml_read_int(base);
-                        # SLP_TYP is a 3-bit field. Anything wider means the decode
-                        # desynced — refuse rather than mask it down and sleep the
-                        # machine into a state it cannot come back from.
-                        if (a >= 0) { if (a <= 7) { if (bb <= 7) {
-                            acpi_slp_typa = a;
-                            acpi_slp_typb = bb;
-                            if (bb < 0) { acpi_slp_typb = 0; }
-                            acpi_s5_valid = 1;
-                            return 1;
-                        } } }
-                    }
-                }
-            }
-        } } } }
+                        if (named == 1) {
+                            acpi_aml_cursor = i + 4;
+                            if (acpi_load8(base + acpi_aml_cursor) == 0x12) {   # PackageOp
+                                acpi_aml_cursor = acpi_aml_cursor + 1;
+                                b = acpi_load8(base + acpi_aml_cursor);
+                                # PkgLength: bits[7:6] = count of ADDITIONAL bytes. Skip the
+                                # whole encoding, then the one-byte NumElements.
+                                acpi_aml_cursor = acpi_aml_cursor + ((b & 0xC0) >> 6) + 1 + 1;
+                                if (acpi_aml_cursor < len) {
+                                    a  = acpi_aml_read_int(base);
+                                    bb = acpi_aml_read_int(base);
+                                    # SLP_TYP is a 3-bit field. Anything wider means the decode
+                                    # desynced — refuse rather than mask it down and sleep the
+                                    # machine into a state it cannot come back from.
+                                    if (a >= 0) { if (a <= 7) { if (bb <= 7) {
+                                                acpi_slp_typa = a;
+                                                acpi_slp_typb = bb;
+                                                if (bb < 0) { acpi_slp_typb = 0; }
+                                                acpi_s5_valid = 1;
+                                                return 1;
+                                            } } }
+                                }
+                            }
+                        }
+                    } } } }
         i = i + 1;
     }
     return 0;
