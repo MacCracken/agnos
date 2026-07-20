@@ -2450,22 +2450,49 @@ fn gpu_blit_arm() {
 # Display-safe: cannot hang (same HUBP block agnos already writes for flips); worst case is a mis-drawn screen
 # that a reboot clears. Gated for the first iron test — promote to default-on once the residue is confirmed
 # gone. Uses the lit pipe found by P0; no-op if the surface is already linear or the pipe was never matched.
+# ⚠ REWRITTEN after the first iron attempt FAILED (bands persisted). Two mistakes, both now fixed (registers
+# derived + cross-checked vs dcn_2_1_0_offset.h / amdgpu hubp2.c, 2026-07-20):
+#   (1) it cleared SW_MODE but NEVER cleared DCC — the GOP left DCSURF_SURFACE_CONTROL.PRIMARY_SURFACE_DCC_EN
+#       set, so the HUBP still decompressed fb_console's linear bytes into garbage. agnos had never touched 0x61A.
+#   (2) it relied on an ADDRESS FLIP to latch tiling/DCC — but the flip only auto-latches the ADDRESS group;
+#       tiling + DCC are VUPDATE double-buffered and latch ONLY under the OTG master update lock (amdgpu
+#       programs them inside optc1_lock/unlock, never on a bare flip).
+# The fix: lock the OTG, clear DCC + set linear tiling, re-arm the address, unlock, settle. All registers are in
+# the always-clocked HUBP/OTG block agnos already touches for flips — no gated-clock hang, no OTG_MASTER_EN /
+# HUBP_BLANK write, so the worst case is a torn frame that self-clears or reboots away, never a dead pipe.
+# ⚠ The lock MUST be cleared on every exit path or the pipe freezes on its last frame; the status poll is bounded.
 fn gpu_scanout_clear_tiling() {
     if (gpu_display_ok != 1) { return 0; }
     if (gpu_display_swmode == 0) { return 0; }          # already linear — nothing to do
 
-    var tc_off = GPU_R_HUBP_TILING_CONFIG + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
-    var tc = gpu_reg32(GPU_BASE_DCN_2, tc_off);
-    gpu_reg32_write(GPU_BASE_DCN_2, tc_off, tc & (0 - 1 - GPU_HUBP_SW_MODE_MASK));   # SW_MODE -> 0 (linear)
+    var h = gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var o = gpu_display_pipe * GPU_DCN_OTG_STRIDE;
+    var lock_off = GPU_R_OTG_MASTER_UPDATE_LOCK + o;
 
-    # Re-latch: re-write the current front surface address so the HUBP re-samples its config at the next blank.
-    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
-    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
-    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_display_surf >> 32) & 0xFFFF);
-    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_display_surf & 0xFFFFFFFF);
+    # 1. Point the master update lock at this pipe, then take it. Bounded poll on the ack — proceed on timeout
+    #    exactly as amdgpu's REG_WAIT does (a stuck poll must never wedge boot).
+    var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o,
+    (gc & (0 - 1 - GPU_OTG_LOCK_SEL_MASK)) | ((gpu_display_pipe << 25) & GPU_OTG_LOCK_SEL_MASK));
+    gpu_reg32_write(GPU_BASE_DCN_2, lock_off, 0x1);
+    var spins = 0;
+    while (spins < 100000) {
+        if ((gpu_reg32(GPU_BASE_DCN_2, lock_off) & GPU_OTG_UPDATE_LOCK_STATUS) != 0) { spins = 100000; }
+        else { spins = spins + 1; }
+    }
+
+    # 2. Clear DCC (full-write 0 = DCC off + TMZ off) and set a plain linear tiling config (SW_MODE=0, META_LINEAR).
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURFACE_CONTROL + h, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_TILING_CONFIG + h, GPU_HUBP_META_LINEAR);
+
+    # 3. Re-arm the surface address (HIGH then LOW; LOW is the flip trigger) so the new config commits with a
+    #    fresh scanout base, then release the lock — the whole change latches atomically at the next VUPDATE.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + h, (gpu_display_surf >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR + h, gpu_display_surf & 0xFFFFFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, lock_off, 0);       # UNLOCK — must always run
     gpu_mfence();
     gpu_display_wait_vblank(gpu_display_pipe);
-    kprintln("gpu: scanout tiling cleared to linear (residue fix)", 51);
+    kprintln("gpu: scanout tiling+dcc cleared to linear (residue fix)", 55);
     return 1;
 }
 

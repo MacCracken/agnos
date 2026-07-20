@@ -119,6 +119,16 @@ var GPU_R_HUBP_CNTL         = 0x5F3; # HUBPn DCHUBP_CNTL: HUBP_BLANK_EN bit0 (0 
 # while fb_console writes it linear, the HUBP de-swizzles linear bytes → banded glyphs (the AMD-Zen residue).
 var GPU_R_HUBP_TILING_CONFIG = 0x5E7;
 var GPU_HUBP_SW_MODE_MASK    = 0x1F;  # SW_MODE field [4:0]
+var GPU_HUBP_META_LINEAR     = 0x200; # DCSURF_TILING_CONFIG META_LINEAR bit9 (set for a linear surface)
+# HUBPREQn DCSURF_SURFACE_CONTROL (stride 0xDC): PRIMARY_SURFACE_DCC_EN bit1, SECONDARY bit9, TMZ bit0. The
+# GOP left DCC ENABLED and agnos never touched this — the residual band after the SW_MODE-only fix. Clear to 0.
+var GPU_R_HUBP_SURFACE_CONTROL = 0x61A;
+# OTG master update lock — tiling + DCC are VUPDATE double-buffered and do NOT latch on a bare address flip;
+# they latch under this lock (amdgpu optc1_lock/unlock). Bounded poll on UPDATE_LOCK_STATUS (bit8).
+var GPU_R_OTG_MASTER_UPDATE_LOCK = 0x1B8B; # OTGn (stride 0x80): LOCK bit0, UPDATE_LOCK_STATUS bit8
+var GPU_R_OTG_GLOBAL_CONTROL0    = 0x1B90; # OTGn (stride 0x80): OTG_MASTER_UPDATE_LOCK_SEL [27:25]
+var GPU_OTG_UPDATE_LOCK_STATUS   = 0x100;  # OTG_MASTER_UPDATE_LOCK bit8 (locked ack)
+var GPU_OTG_LOCK_SEL_MASK        = 0xE000000; # OTG_GLOBAL_CONTROL0 [27:25]
 var GPU_DCN_HUBP_STRIDE     = 0xDC;  # per-HUBP instance stride
 var GPU_HUBP_BLANK_EN       = 0x1;   # DCHUBP_CNTL bit0
 # P1 back buffer — VRAM offset 1 GB: clear of the console FB (offset 0, ~8 MB), the PSP TMR (1.5 GB) and
