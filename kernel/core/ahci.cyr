@@ -394,6 +394,69 @@ fn ahci_hba_reset() {
 
 # --- Per-port command-list + FIS init --------------------------------
 
+# Shutdown arc bite 4 — stop a port's DMA engines, AND SAY WHETHER IT WORKED.
+#
+# This is steps a-d of ahci_port_init below, lifted out. The reason it is a separate
+# function rather than a call into that one is the RETURN STATUS: the inline version
+# leaves its wait loops by assigning `spins = AHCI_TIMEOUT_SPINS`, which is
+# byte-identical to having timed out, so no caller can tell whether the engine
+# actually stopped.
+#
+# At init that ambiguity is harmless — the port is about to be reprogrammed anyway.
+# At SHUTDOWN it is not: the command-list and FIS-receive buffers are physical pages
+# the HBA writes into by DMA, and freeing or reusing them while CR/FR are still set
+# hands live DMA targets back to the allocator. Silent 8-byte scribbles into
+# whatever lands there next is exactly the class of corruption that is impossible to
+# diagnose afterwards. Returns 1 = stopped, 0 = still running (caller must NOT
+# reclaim the buffers).
+fn ahci_port_stop(port) {
+    var port_off = 0;
+    var cmd = 0;
+    var spins = 0;
+    var stopped = 0;
+    var c = 0;
+
+    if (ahci_present == 0) { return 0; }
+    if (port < 0) { return 0; }
+    if (port >= AHCI_MAX_PORTS) { return 0; }
+    port_off = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
+
+    # ST=0, then wait for CR (command-list running) to clear.
+    cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    ahci_mmio_write32(port_off + AHCI_P_CMD, cmd & 0xFFFFFFFE);
+    spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        c = ahci_mmio_read32(port_off + AHCI_P_CMD);
+        if (((c >> 15) & 0x01) == 0) { stopped = 1; spins = AHCI_TIMEOUT_SPINS; }
+        else { spins = spins + 1; }
+    }
+    if (stopped == 0) {
+        kprint("ahci: port ", 11); kprint_num(port);
+        kprintln(" command engine still running", 29);
+        return 0;
+    }
+
+    # FRE=0, then wait for FR (FIS receive running) to clear.
+    stopped = 0;
+    cmd = ahci_mmio_read32(port_off + AHCI_P_CMD);
+    ahci_mmio_write32(port_off + AHCI_P_CMD, cmd & 0xFFFFFFEF);
+    spins = 0;
+    while (spins < AHCI_TIMEOUT_SPINS) {
+        c = ahci_mmio_read32(port_off + AHCI_P_CMD);
+        if (((c >> 14) & 0x01) == 0) { stopped = 1; spins = AHCI_TIMEOUT_SPINS; }
+        else { spins = spins + 1; }
+    }
+    if (stopped == 0) {
+        kprint("ahci: port ", 11); kprint_num(port);
+        kprintln(" fis receive still running", 26);
+        return 0;
+    }
+
+    kprint("ahci: port ", 11); kprint_num(port);
+    kprintln(" stopped", 8);
+    return 1;
+}
+
 fn ahci_port_init(port) {
     if (ahci_present == 0) { return 0; }
     if (port < 0) { return 0; }

@@ -60,3 +60,47 @@ fn power_flush() {
     kprintln("power: filesystems flushed", 26);
     return 0;
 }
+
+# Bite 4 — stop the storage DMA engines. Runs AFTER power_flush(), never before:
+# every one of these calls ends the controller's ability to service I/O, so a flush
+# issued afterwards would have nothing to run on. The ordering is the whole point of
+# splitting the two.
+#
+# Best-effort by design. A controller that refuses to stop must not wedge the
+# shutdown — it reports and the sequence continues, because a box that will not
+# power off is worse than one that powers off with a port still running. What it
+# must NOT do is pretend: ahci_port_stop() returns a real status precisely so a
+# failure is visible rather than silently assumed.
+fn power_storage_quiesce() {
+    var port = 0;
+    var stopped = 0;
+    var failed = 0;
+
+    # NVMe first: it is the primary block device on this box, and its shutdown
+    # notification is the one that makes the drive commit its own write cache.
+    nvme_shutdown();
+
+    # Then every AHCI port that was actually brought up. A zero command-list
+    # address means the port was never initialised, so there is nothing running.
+    if (ahci_present != 0) {
+        port = 0;
+        while (port < AHCI_MAX_PORTS) {
+            if (load64(&ahci_port_cl_phys + port * 8) != 0) {
+                if (ahci_port_stop(port) == 1) { stopped = stopped + 1; }
+                else { failed = failed + 1; }
+            }
+            port = port + 1;
+        }
+    }
+
+    if (failed != 0) {
+        kprint("power: ", 7); kprint_num(failed);
+        kprintln(" storage ports would not stop", 29);
+    }
+    # Terminal marker for the sequence so far. A test can gate on this instead of
+    # racing the poll budgets above — without it, a harness that kills the machine a
+    # couple of seconds after the flush line simply truncates the log before any of
+    # this appears, and the absence looks like the code never ran.
+    kprintln("power: storage quiesced", 23);
+    return 0;
+}

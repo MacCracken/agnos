@@ -57,6 +57,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   suspends the box with interrupts off, no wake vector and no resume path (indistinguishable from a hard hang,
   exit is a power-button hold). The field is therefore range-checked to 3 bits and a decode that does not look
   like a real package is refused rather than guessed at.
+- **Shutdown arc bite 4 — storage quiesce** (`nvme.cyr`, `ahci.cyr`, `power.cyr`). `power_storage_quiesce()`
+  runs after `power_flush()` (never before — each call ends the controller's ability to serve I/O, so a flush
+  issued afterwards would have nothing to run on) and is best-effort: a controller that will not stop reports
+  and the sequence continues, because a box that refuses to power off is worse than one that powers off with a
+  port still running.
+  - **`nvme_shutdown()`** — the spec-clean shutdown `nvme_disable()` never was. Per NVMe 1.4 §7.6.2 it sets
+    `CC.SHN=01b` with **EN still set**, polls `CSTS.SHST` for `10b`, and only then drops EN. `nvme_disable()`
+    clears EN with SHN left 0, which quiesces the controller but never sends the shutdown **notification**, so
+    the drive is never told to commit its internal state. The poll budget is ~5 s paced on the 100 Hz timer
+    (with a spin backstop): reusing `nvme_disable()`'s 1,000,000-iteration ceiling — about **250 ms** — would
+    false-time-out exactly the drives committing a large write cache, and proceeding to power off after a false
+    timeout is the same outcome as never having notified at all.
+  - **`ahci_port_stop(port)`** — steps a–d of `ahci_port_init` lifted out **with a return status**. The inline
+    version leaves its wait loops by assigning `spins = AHCI_TIMEOUT_SPINS`, byte-identical to having timed
+    out, so no caller can tell whether the engine stopped. Harmless at init (the port is about to be
+    reprogrammed); at shutdown it is not — the command-list and FIS-receive buffers are physical pages the HBA
+    DMAs into, and reclaiming them while CR/FR are still set hands live DMA targets back to the allocator.
+  - **⚠ Fixed in passing: `nvme_disabled` does not mean what its name says.** It means "`nvme_disable()` once
+    observed RDY=0" — the boot path calls `nvme_disable()` before init, the admin-queue setup *requires* the
+    flag to be 1 to proceed, and **nothing ever clears it**, so it reads 1 for the rest of the boot with the
+    controller fully enabled and serving I/O. Gating `nvme_shutdown()` on it made the function a silent no-op
+    on every shutdown; the live `CC.EN` bit is the only honest test. Caught because the QEMU run produced
+    `power: storage quiesced` with no `nvme:` line.
+  - `power_storage_quiesced` prints a terminal marker so a harness can **gate** on the sequence instead of
+    racing it — without it, a test that kills the machine seconds after the flush line truncates the log before
+    any of this appears, and the absence reads as dead code.
+  - QEMU-verified: `power: filesystems flushed` → `nvme: shutdown complete` → `power: storage quiesced`, with
+    the filesystem still `clean`. ⚠ **`ahci_port_stop()` is NOT yet exercised** — QEMU q35's only SATA device is
+    an ATAPI CD on port 2 that agnos never initialises, so no port has a command list to stop. Iron has a real
+    WD Blue on port 0 and will be its first run.
 - **`scripts/shutdown-smoke.sh`** — QEMU gate for the above: builds a GPT+ESP+ext2 image, drives the shell to
   exit via HMP `sendkey`, then requires both the `power: filesystems flushed` line **and** `e2fsck -fn` clean.
   It checks the image is clean *before* boot too, since a "clean" verdict on a never-dirtied FS proves nothing.

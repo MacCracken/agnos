@@ -232,6 +232,64 @@ fn nvme_disable() {
     return 1;
 }
 
+# Shutdown arc bite 4 — the SPEC-CLEAN controller shutdown.
+#
+# nvme_disable() above clears CC.EN with CC.SHN left at 0, which is fine as a boot
+# defensive reset but is NOT a shutdown: the drive never receives the shutdown
+# NOTIFICATION, so it is never told to commit its internal state before power goes.
+# NVMe 1.4 section 7.6.2 is explicit — set CC.SHN=01b (normal shutdown) with EN
+# STILL SET, poll CSTS.SHST until 10b (shutdown complete), and only then drop EN.
+#
+# The budget is the load-bearing detail. A drive committing a large write cache can
+# take SECONDS. nvme_disable()'s 1,000,000-iteration ceiling is roughly 250 ms, and
+# reusing it here would false-time-out exactly the drives that most need the wait —
+# and continuing to power off after a false timeout is the same outcome as never
+# having sent the notification at all. So pace on the 100 Hz timer (this runs
+# post-sti, before the shutdown path disables interrupts), with a spin backstop for
+# any context where the timer is not advancing.
+fn nvme_shutdown() {
+    var cc = 0;
+    var t0 = 0;
+    var spins = 0;
+    var done = 0;
+    var shst = 0;
+
+    if (nvme_present == 0) { return 0; }
+    # ⚠ Do NOT gate on nvme_disabled here. Despite the name it does not mean "the
+    # controller is currently disabled" — it means "nvme_disable() once observed
+    # RDY=0". The boot path calls nvme_disable() before init (main.cyr), the admin
+    # queue setup REQUIRES the flag to be 1 to proceed, and nothing ever clears it,
+    # so it reads 1 for the rest of the boot with the controller fully enabled and
+    # serving I/O. Gating on it made this function a silent no-op on every shutdown.
+    # The live CC.EN bit below is the real question and the only honest test.
+    cc = nvme_mmio_read32(NVME_REG_CC);
+    if ((cc & 0x01) == 0) { return 0; }          # genuinely disabled — nothing to notify
+
+    # SHN is CC[15:14]. Set 01b and leave every other field, EN included, alone.
+    cc = (cc & 0xFFFF3FFF) | 0x4000;
+    nvme_mmio_write32(NVME_REG_CC, cc);
+
+    t0 = timer_ticks;
+    while (done == 0) {
+        shst = (nvme_mmio_read32(NVME_REG_CSTS) >> 2) & 0x03;
+        if (shst == 2) {
+            done = 1;
+        } else {
+            spins = spins + 1;
+            if ((timer_ticks - t0) > 500) { done = 2; }        # ~5 s at 100 Hz
+            if (spins > 200000000) { done = 2; }               # timer-not-running backstop
+        }
+    }
+    if (done == 2) {
+        kprintln("nvme: shutdown did not complete in time", 39);
+        return 0;
+    }
+
+    kprintln("nvme: shutdown complete", 23);
+    nvme_disable();
+    return 1;
+}
+
 # --- Phase 2: admin queue + IDENTIFY ---
 #
 # Allocate Admin SQ + Admin CQ + a 4 KB IDENTIFY scratch buffer, program

@@ -257,12 +257,19 @@ if not type_verified(verb, 2.0, repr(verb)):
 # The barrier's own line. This is the load-bearing assertion: without it the
 # e2fsck result below would only be telling us the FS was never dirtied.
 ok = wait_for('power: filesystems flushed', 60, 'power_flush ran on the exit path')
-sys.exit(0 if ok else 3)
+if not ok:
+    sys.exit(3)
+# Gate on the storage quiesce too, rather than racing it: nvme_shutdown() budgets
+# up to ~5 s for CSTS.SHST, so killing the machine a couple of seconds after the
+# flush line truncates the log before any of it lands and the absence looks like
+# dead code. Not fatal on its own — a box with no NVMe/AHCI still shuts down.
+wait_for('power: storage quiesced', 30, 'storage quiesce completed')
+sys.exit(0)
 PY
 PYRC=$?
 set -e
 
-sleep 2
+sleep 12
 kill $QPID 2>/dev/null || true
 wait $QPID 2>/dev/null || true
 
