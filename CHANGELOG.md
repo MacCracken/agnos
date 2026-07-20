@@ -5,6 +5,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Shutdown arc bite 9 — ACPI S5 soft-off** (`power_off()` in `power.cyr`), wired to `PWR_OFF`. QEMU-verified:
+  `poweroff` at the agnsh prompt runs the full teardown and the machine goes away (QEMU exits). All three smoke
+  arms — `exit`, `reboot`, `poweroff` — pass with the filesystem `clean`.
+  **⚠ WHAT QEMU PROVES HERE IS THE PLUMBING, NOT THE DECODE.** QEMU's `_S5_` package is all zeroes, so
+  `SLP_TYP=0` is exactly what it wants and a **completely broken decode would pass by construction** (agnos
+  duly prints `sleep type a 0 b 0` there). The decode itself is validated separately against archaemenid's real
+  AMI firmware — `SLP_TYPa=5, SLP_TYPb=0`, reached two independent ways and kept in
+  `prior-art/acpi-s5-known-good-archaemenid-0719.txt`.
+  **⚠ THIS IS THE MOST DANGEROUS FUNCTION IN THE ARC.** `SLP_TYP` selects *which* sleep state, so a value the
+  platform reads as S1/S3 **suspends** the box with interrupts off, no wake vector and no resume path —
+  indistinguishable from a hard hang, exit is a power-button hold. Four gates run before the write (FADT
+  present, `_S5_` valid, PM1a present, not hardware-reduced) plus a final 3-bit range check.
+  Three specific hazards handled, each of which is a silent bug in the naive version:
+  - **Read-modify-write, never a blind store.** `outw(port, typ<<10|EN)` would zero `SCI_EN` (bit0) and
+    `BM_RLD` (bit1) in the same instruction, dropping the machine out of ACPI mode mid-shutdown — after which
+    the firmware ignores the very write that disabled it. Only `SLP_TYP`+`SLP_EN` are cleared.
+  - **PM1b written only when it exists**, and carrying **`SLP_TYPb`** — not a copy of `SLP_TYPa`. An
+    unconditional write targets **I/O port 0** on every box without a PM1b (QEMU and the AMD FCH both), and
+    port 0 is the 8237 DMA channel-0 address latch, not a void.
+  - **Every poll is bounded.** ACPICA's `WAK_STS` wait is unbounded; here that would be an infinite spin with
+    interrupts already off and the filesystem already quiesced — a silently dead session with no console
+    output. Includes ACPICA's documented bare-`SLP_EN` retry between the two bounded waits.
+  - `SCI_EN` is verified first, with the `SMI_CMD`/`ACPI_ENABLE` handshake if the firmware is still in legacy
+    mode — otherwise the `SLP_TYP` write is simply ignored and the machine just sits there.
+
 ## [1.55.25] — 2026-07-19 — agnos gets an orderly shutdown (+ the A4 attribution control)
 
 **agnos can now stop properly.** Until this release it could not: `arch_halt()` is `cli; hlt; jmp $` — an

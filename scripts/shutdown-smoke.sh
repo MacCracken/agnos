@@ -298,16 +298,20 @@ def qemu_gone(pid):
     except OSError:
         return True
 
-if verb == 'reboot':
-    # QEMU runs with -no-reboot, so a real platform reset makes it EXIT. Watching the
+if verb == 'reboot' or verb == 'poweroff':
+    # QEMU runs with -no-reboot, so a real platform reset makes it EXIT. An ACPI S5
+    # soft-off exits it too. ⚠ For poweroff this proves the PLUMBING ONLY: QEMU's
+    # _S5_ package is all zeroes, so SLP_TYP=0 is exactly what it wants and a
+    # completely broken decode would pass here. The decode itself is validated
+    # against real firmware in prior-art/acpi-s5-known-good-archaemenid-0719.txt. Watching the
     # process die is direct evidence; a log line would only be a claim.
     t0 = time.time()
     while time.time() - t0 < 40:
         if qemu_gone(qpid):
-            print('  ok: guest reset -- qemu exited (-no-reboot)')
+            print(f'  ok: guest {verb} took effect -- qemu exited')
             sys.exit(0)
         time.sleep(0.5)
-    print('  FAIL: platform never reset (qemu still running after 40s)')
+    print(f'  FAIL: platform never {verb}ed (qemu still running after 40s)')
     if 'power: platform did not reset' in logtext():
         print('         every rung of the reset ladder was tried and declined')
     sys.exit(4)

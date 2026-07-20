@@ -211,6 +211,113 @@ fn power_reset() {
     return 0;
 }
 
+# === Bite 9 — ACPI S5 soft-off ==============================================
+#
+# ⚠ THE SINGLE MOST DANGEROUS FUNCTION IN THIS ARC. SLP_TYP does not mean "power
+# off" — it selects WHICH sleep state. A value the platform reads as S1/S3 SUSPENDS
+# the machine with interrupts already disabled, no wake vector armed and no resume
+# path: indistinguishable from a hard hang, recoverable only by holding the power
+# button. That is why the values are not guessed. They come from the DSDT's own
+# \_S5_ package (bite 3), were cross-checked against `iasl -d` on archaemenid's real
+# firmware (SLP_TYPa=5, SLP_TYPb=0), and are refused outright if the decode looks
+# wrong. QEMU CANNOT validate any of this — its _S5_ is all zeroes, so a broken
+# decode "works" there by construction.
+#
+# The device teardown runs BEFORE this (power_sys calls power_quiesce_devices), so
+# even a wrong S-state costs a power-button hold rather than the filesystem.
+fn power_off() {
+    var cnt = 0;
+    var spins = 0;
+    var done = 0;
+    var base = 0;
+
+    if (acpi_fadt_addr == 0) {
+        kprintln("acpi: no FADT -- cannot power off", 33);
+        return 0;
+    }
+    if (acpi_s5_valid == 0) {
+        kprintln("acpi: no _S5_ values -- cannot power off", 40);
+        return 0;
+    }
+    if (acpi_pm1a_cnt == 0) {
+        kprintln("acpi: no power control block -- cannot power off", 48);
+        return 0;
+    }
+    # A hardware-reduced platform has no fixed PM hardware at all; driving PM1 there
+    # would be writing to something that is not the power controller.
+    if (acpi_hw_reduced == 1) {
+        kprintln("acpi: hardware-reduced platform -- PM1 soft-off does not apply", 62);
+        return 0;
+    }
+    # SLP_TYP is a 3-bit field. bite 3 already range-checks, but this is the last
+    # gate before the write actually happens, so it checks again rather than trusting.
+    if (acpi_slp_typa > 7) {
+        kprintln("acpi: sleep type out of range -- refusing to write", 50);
+        return 0;
+    }
+
+    # 1. Clear WAK_STS (PM1a_STS bit15, write-1-clear) so the post-write poll below
+    #    means something. Without this a stale bit reads as "already woken".
+    if (acpi_pm1a_evt != 0) { outw(acpi_pm1a_evt, 0x8000); }
+
+    # 2. Make sure we are actually in ACPI mode. If SCI_EN is clear the firmware is
+    #    still in legacy/SMI mode and will IGNORE the SLP_TYP write entirely — the
+    #    machine would just sit there. The handshake is the SMI_CMD port + the FADT's
+    #    ACPI_ENABLE value, then poll for SCI_EN to come up.
+    cnt = inw(acpi_pm1a_cnt);
+    if ((cnt & 0x1) == 0) {
+        if (acpi_smi_cmd != 0) {
+            outb(acpi_smi_cmd, acpi_enable_val);
+            spins = 0;
+            while (spins < 300000) {
+                cnt = inw(acpi_pm1a_cnt);
+                if ((cnt & 0x1) != 0) { spins = 300000; }
+                else { spins = spins + 1; }
+            }
+        }
+    }
+
+    # 3. THE WRITE, as a two-step split — SLP_TYP first, then SLP_TYP|SLP_EN. Some
+    #    firmware latches the type on the first write and acts on the enable edge;
+    #    a single combined store is accepted by most and ignored by some.
+    #
+    #    ⚠ READ-MODIFY-WRITE, never a blind store. A bare `outw(port, typ<<10|EN)`
+    #    would zero SCI_EN (bit0) and BM_RLD (bit1) in the same instruction, dropping
+    #    the machine out of ACPI mode mid-shutdown — after which the firmware ignores
+    #    the very write that just disabled it. Clear ONLY SLP_TYP + SLP_EN.
+    base = inw(acpi_pm1a_cnt) & (0 - 1 - 0x1C00) & (0 - 1 - 0x2000);
+    outw(acpi_pm1a_cnt, base | (acpi_slp_typa << 10));
+    outw(acpi_pm1a_cnt, base | (acpi_slp_typa << 10) | 0x2000);
+
+    # 4. PM1b, ONLY if the platform actually has one.
+    #    ⚠ An unconditional write here targets I/O port 0 on every box whose PM1b is
+    #    absent (QEMU and the AMD FCH both) — and port 0 is the 8237 DMA channel-0
+    #    address latch, not a void. It also carries SLP_TYPb, which is a DIFFERENT
+    #    value from SLP_TYPa; copying A into B is a common and silent bug.
+    if (acpi_pm1b_cnt != 0) {
+        base = inw(acpi_pm1b_cnt) & (0 - 1 - 0x1C00) & (0 - 1 - 0x2000);
+        outw(acpi_pm1b_cnt, base | (acpi_slp_typb << 10));
+        outw(acpi_pm1b_cnt, base | (acpi_slp_typb << 10) | 0x2000);
+    }
+
+    # 5. Wait for the platform to go. ⚠ ACPICA's equivalent poll is UNBOUNDED; ours
+    #    must not be — interrupts are off and the filesystem is already quiesced, so
+    #    an infinite spin here is a silently bricked session with no console output.
+    #    A machine that is going to power off does so in microseconds; this budget is
+    #    generous by orders of magnitude.
+    spins = 0;
+    while (spins < 2000000) { spins = spins + 1; }
+
+    # 6. ACPICA's documented retry: re-issue a bare SLP_EN edge. Some firmware wants
+    #    the enable pulse a second time after the type has settled.
+    outw(acpi_pm1a_cnt, base | (acpi_slp_typa << 10) | 0x2000);
+    spins = 0;
+    while (spins < 2000000) { spins = spins + 1; }
+
+    kprintln("acpi: platform did not power off", 32);
+    return 0;
+}
+
 # === The syscall body ========================================================
 #
 # WHY MAGIC NUMBERS, and it is not cargo-culting Linux. Syscall #13 already exists
@@ -248,10 +355,10 @@ fn power_sys(magic1, magic2, cmd, arg) {
         return 0;
     }
     if (cmd == PWR_OFF) {
-        # Bite 9 wires ACPI S5 here. Until then, halting is the honest outcome —
-        # a poweroff that silently halts instead is a lie the operator would have to
-        # discover by watching the power LED.
-        kprintln("power: soft-off not yet implemented -- halted", 45);
+        power_off();
+        # power_off() only returns when the platform declined or refused a gate; it
+        # has already said which on the console. Halting is then the honest outcome.
+        kprintln("power: halted (soft-off unavailable)", 36);
         arch_halt();
         return 0;
     }
