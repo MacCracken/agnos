@@ -112,6 +112,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `xhci: controller halted` → `devices quiesced`, filesystem still `clean`. ⚠ `hda_quiesce_all()` and
     `r8169_quiesce()` are **silent and unexercised here** — the smoke's QEMU has neither device. Together with
     `ahci_port_stop()` they get their first run on iron.
+- **Shutdown arc bite 6 — GPU quiesce** (`gpu_quiesce()` in `gpu.cyr`), slotted between audio and network in
+  `power_quiesce_devices()`. **The concrete hazard it closes:** `CP_HQD_ACTIVE` is written to 1 exactly once,
+  when the compute queue is mapped (gpu.cyr:853), and is cleared **nowhere else in the tree**. A warm reset
+  does not power-cycle the iGPU, so a MEC queue with a live doorbell and a PQ base pointing into DRAM survives
+  into a next boot that has since reallocated that memory — the GPU keeps fetching packets from pages the new
+  kernel is using for something else. Invisible until it isn't.
+  Order mirrors bring-up (RLC → CP-gfx → CP-MEC) in reverse: deactivate the **queue** first, then halt MEC1
+  (`CP_MEC_CNTL |= ME1_HALT`), then the gfx pipe (`CP_ME_CNTL |= ME|PFP|CE`). Halting MEC while its queue is
+  still marked active leaves the engine holding a mapped queue it can no longer drain. The HQD registers sit
+  behind the GRBM queue mux, so the select/deselect brackets the write exactly as the mapping path does —
+  leaving the mux selected would misdirect every later GC register access.
+  **Deliberately untouched:** PSP/TMR (no un-load path exists — firmware is resident by design), the VM L2
+  cache-enable, and the **display/scanout**, because blacking the console before the operator can read the
+  final lines would trade one problem for a worse one. Display teardown is its own bite.
+  ⚠ **Iron-only — QEMU has no GPU**, so this is silent there and unexercised, alongside `hda_quiesce_all()`,
+  `r8169_quiesce()` and `ahci_port_stop()`.
 - **Binary size ceiling 1.6M → 1.7M** (`check.sh` + `test.sh`, in lockstep). The arc closed on 1.6M at
   1,600,712 B — 712 B over, the same way 1.45.10 closed on 1.2M and the display-audio bite closed on 1.5M. The
   growth is the ACPI FADT/`_S5` decode plus the per-subsystem quiesce paths, not bloat.

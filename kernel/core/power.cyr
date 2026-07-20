@@ -114,14 +114,20 @@ fn power_storage_quiesce() {
 #                         device-WRITE target; stopping them before memory is
 #                         reclaimed is what prevents async scribbles into reused
 #                         pages. (This is also what stops the amp popping.)
-#   3. network          — mask, ack, detach MSI, reset.
-#   4. storage          — the NVMe shutdown notification lets the drive commit.
-#   5. USB              — LAST, because on this box it is also the KEYBOARD. Taking
+#   3. GPU              — a mapped MEC queue with a live doorbell and a PQ base in
+#                         DRAM outlives a warm reset, so it must be deactivated
+#                         before any reset hands that memory to the next boot.
+#                         Display/scanout deliberately untouched — the console has
+#                         to stay readable through the rest of the sequence.
+#   4. network          — mask, ack, detach MSI, reset.
+#   5. storage          — the NVMe shutdown notification lets the drive commit.
+#   6. USB              — LAST, because on this box it is also the KEYBOARD. Taking
 #                         it down earlier means an operator watching a stalled step
 #                         has no way to interact with the machine.
 fn power_quiesce_devices() {
     power_flush();
     hda_quiesce_all();
+    gpu_quiesce();
     r8169_quiesce();
     power_storage_quiesce();
     xhci_stop();

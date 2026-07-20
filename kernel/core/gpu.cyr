@@ -3690,6 +3690,53 @@ fn gpu_hdmi_audio_crc_one(d, source) {
 # 'undefined function gpu_symclk_capture' with a REACHABLE call site the moment HDMI_DCCG was built
 # alone. See [[reference_cyrius_control_flow_idioms]]: a shared decl must never sit behind a narrower
 # guard than the code that calls it.
+# === Shutdown arc bite 6 — quiesce the GPU compute engines ==================================
+#
+# THE CONCRETE HAZARD THIS CLOSES: CP_HQD_ACTIVE is written to 1 exactly once, when
+# the compute queue is mapped (see the 20-write HQD block above), and is cleared
+# NOWHERE else in this tree. A warm reset does not power-cycle the iGPU. So a MEC
+# queue with a live doorbell and a PQ base pointing into DRAM survives the reset into
+# a next boot that has since reallocated that memory — the GPU keeps fetching packets
+# from pages the new kernel is using for something else. That is the worst class of
+# corruption available here, because it is invisible until it isn't.
+#
+# ORDER IS LOAD-BEARING, and it is the mirror of bring-up (RLC -> CP-gfx -> CP-MEC):
+# deactivate the QUEUE first, then halt the MEC that would service it, then halt the
+# gfx pipe. Halting MEC while its queue is still marked active leaves the engine
+# holding a mapped queue it can no longer drain.
+#
+# DELIBERATELY NOT TOUCHED: the PSP/TMR (there is no un-load path — the firmware
+# stays resident by design), the VM L2 cache-enable, the DIG/display block, and the
+# scanout. Powering down the display here would black the console before the
+# operator can read the final lines, and the display half is a separate bite.
+fn gpu_quiesce() {
+    var active = 0;
+    var mec = 0;
+    var me = 0;
+
+    if (gpu_present == 0) { return 0; }
+
+    # 1. Deactivate the compute queue. The HQD registers are behind the GRBM queue
+    #    mux, so select MEC1/pipe0/queue0 exactly as the mapping path does, and put
+    #    the mux back to 0 afterwards — leaving it selected would misdirect every
+    #    later GC register access.
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    active = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_ACTIVE);
+    if ((active & 0x1) != 0) {
+        gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_ACTIVE, 0);
+    }
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+
+    # 2. Halt MEC1, then the gfx pipe (ME|PFP|CE).
+    mec = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL, mec | GPU_CP_MEC_ME1_HALT);
+    me = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_ME_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_ME_CNTL, me | GPU_CP_GFX_HALT_MASK);
+
+    kprintln("gpu: compute engines halted", 27);
+    return 1;
+}
+
 # === A4 SYMCLK attribution instrument =======================================================
 # WHY THIS EXISTS: 1.55.24 wrote five blind absolute stores (0x159/15A/15B/15C/176) and the burn was written
 # up as "the DCCG symclk re-prime ARMED THE SINK". The re-audit killed that: the symbol clock reads ALREADY ON
