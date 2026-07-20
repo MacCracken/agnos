@@ -128,6 +128,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   final lines would trade one problem for a worse one. Display teardown is its own bite.
   ⚠ **Iron-only — QEMU has no GPU**, so this is silent there and unexercised, alongside `hda_quiesce_all()`,
   `r8169_quiesce()` and `ahci_port_stop()`.
+- **Shutdown arc bite 7 — the reset ladder, and syscall #13 stops lying** (`power.cyr`, `syscall.cyr`).
+  **✅ QEMU-VERIFIED END TO END:** typing `reboot` in agnsh runs the full teardown and resets the platform —
+  QEMU exits under `-no-reboot`, which is direct evidence rather than a log line claiming success. The plain
+  `exit` arm still passes with the filesystem clean.
+  - **`power_reset()`** — four rungs, each falling through to the next: ACPI `RESET_REG` (gated on FADT
+    revision ≥ 2, the `RESET_REG_SUP` flag and a writable address space, + 15 ms settle) → 8042 pulse ×10 with
+    an input-buffer wait → CF9 two-step → triple fault via a zero-limit IDT. Code after a rung only runs
+    because that rung did nothing.
+    ⚠ **The CF9 fallback writes `0x02` then `0x06` and NEVER `0x0E`** — on the AMD FCH `0x0E` is a genuine S5
+    **power-cycle**, not a warm reset. It is also gated on `pci_count > 0`, since CF9 sits inside the 0xCF8
+    CONFIG_ADDRESS window and Linux only writes it once PCI mechanism 1 is positively identified.
+    ⚠ **The FADT's own `RESET_VALUE` is a separate matter** and is tried first because following the
+    firmware's advertised method is the spec-sanctioned path. QEMU advertises `0xf`. **If archaemenid's
+    firmware advertises an `0x0E`-shaped value, that first rung will power the box off rather than reboot it**
+    — bite 2's read-only report prints the exact value, so read it in the burn log before flashing a kernel
+    that can reach this function.
+  - **Syscall #13 was a LIVE WEDGE, not a stub.** It printed a line and called `arch_halt()` while being
+    reachable from ring 3 (cyrius exposes `sys_reboot()`), so any caller froze the box with a dirty superblock
+    and no device quiesce. It now takes `(magic1, magic2, cmd, arg)` and runs the real sequence.
+    **The magic pair is load-bearing, not ceremony:** cyrius's wrapper is **nullary**, and the cyrius
+    `syscall()` builtin pops exactly the registers its call site names — so every already-compiled caller of
+    the old form delivers **garbage** in `rdi`/`rsi`/`rdx`. Without a token the first such caller to run would
+    reset the machine at random. `"PWR1"`/`"PWR2"` makes that garbage fail closed. It is also the privilege
+    gate by design: `getuid` is hardcoded 0 with no uid model, so a uid check would be a gate that is always
+    open, and a pid-0 check would make the shell builtin a silent no-op. Magic-token arming matches the
+    established `blk_rw_armed` idiom.
+  - `PWR_OFF` currently halts and **says so on the console** — a poweroff that silently halts is a lie the
+    operator would only discover by watching the power LED. ACPI S5 is bite 9.
+  - Pairs with **agnoshi 1.8.5**, which adds the `reboot`/`poweroff`/`halt` builtins that reach this.
 - **Binary size ceiling 1.6M → 1.7M** (`check.sh` + `test.sh`, in lockstep). The arc closed on 1.6M at
   1,600,712 B — 712 B over, the same way 1.45.10 closed on 1.2M and the display-audio bite closed on 1.5M. The
   growth is the ACPI FADT/`_S5` decode plus the per-subsystem quiesce paths, not bloat.

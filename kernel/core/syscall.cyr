@@ -1149,10 +1149,13 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 24) { return 0; }             # umount
     # Tier 2: simple
     if (num == 11) { return 0; }             # mount (noop for now)
-    if (num == 13) {                          # reboot
-        serial_println("AGNOS: reboot", 13);
-        arch_halt();
-        return 0;
+    if (num == 13) {                          # reboot(magic1, magic2, cmd, arg)
+        # Until 1.55.x this printed a line and called arch_halt() — a LIVE WEDGE, not
+        # a stub: it is reachable from ring 3 (cyrius exposes sys_reboot()), so any
+        # caller froze the box with a dirty ext2 superblock and no device quiesce.
+        # It now runs the real shutdown sequence, gated on the magic pair so the
+        # garbage-argument callers the old nullary ABI left behind fail closed.
+        return power_sys(arg1, arg2, arg3, ksyscall_a4_get());
     }
     if (num == 14) {                          # pause — no-ready-proc FALLBACK (safe hlt)
         # Ring-3 pause is normally handled in syscall_handler (#14): it yields to a ready

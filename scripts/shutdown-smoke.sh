@@ -143,9 +143,18 @@ trap "kill $QPID 2>/dev/null || true" EXIT INT TERM
 # set -e must not abort here: a FAILING driver is the whole point of the control
 # run, and the e2fsck verdict below is the evidence we most need when it fails.
 set +e
-python3 - "$MON" "$LOG" <<'PY'
+# SHUTDOWN_SMOKE_VERB=reboot exercises the bite-7 reset ladder instead of the plain
+# exit path. The oracle is QEMU itself: with -no-reboot it EXITS when the guest
+# resets, so "the qemu process is gone" is direct evidence the platform actually
+# reset rather than a log line claiming it did.
+VERB="${SHUTDOWN_SMOKE_VERB:-exit}"
+# -u: python block-buffers stdout when redirected to a file, so every diagnostic
+# print is lost if the driver is killed — which is exactly when you need them.
+python3 -u - "$MON" "$LOG" "$VERB" "$QPID" <<'PY'
 import socket, sys, time, os
 mon, log = sys.argv[1], sys.argv[2]
+want_verb = sys.argv[3] if len(sys.argv) > 3 else 'exit'
+qpid = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 
 def logtext():
     try:
@@ -174,7 +183,7 @@ t0 = time.time()
 while time.time() - t0 < 120:
     txt = logtext()
     if '[ASSIST]' in txt:
-        verb = 'exit'; print('  ok: agnsh reached its prompt'); break
+        verb = want_verb; print('  ok: agnsh reached its prompt'); break
     if 'agnos>' in txt:
         verb = 'halt'; print('  ok: recovery shell reached its prompt (agnsh did not start)'); break
     time.sleep(0.5)
@@ -198,7 +207,11 @@ def drain():
     # is ignoring the keyboard".
     try:
         while True:
-            s.recv(65536)
+            # recv() returning EMPTY means the peer CLOSED — it does not raise. On a
+            # successful reboot QEMU exits and this loop would otherwise spin forever
+            # on b'', hanging the driver at exactly the moment it succeeded.
+            if s.recv(65536) == b'':
+                return
     except OSError:
         pass
 
@@ -207,15 +220,27 @@ def drain():
 KM = {' ': 'spc', '\n': 'ret', '-': 'minus', '.': 'dot', '/': 'slash',
       '_': 'shift-minus', ':': 'shift-semicolon'}
 
+def key(name):
+    # A SUCCESSFUL reboot kills the monitor socket underneath us — QEMU exits the
+    # moment the guest resets. That is the PASS condition, not an error, so a dead
+    # socket must not raise out of the driver. Swallow it and let the caller's own
+    # oracle decide.
+    try:
+        s.sendall(('sendkey ' + name + '\n').encode())
+    except OSError:
+        return False
+    time.sleep(0.10); drain()
+    return True
+
 def typ(word):
     # Prime with a throwaway `ret`: the first sendkey after an idle gap is dropped
     # by the xHCI HID warmup, so the real first character would be eaten. Harmless
     # on an empty prompt. Cadence and drain per scripts/whirl-smoke.sh, which
     # documents both quirks.
-    s.sendall(b'sendkey ret\n'); time.sleep(0.10); drain()
+    key('ret')
     for ch in word:
-        s.sendall(('sendkey ' + KM.get(ch, ch) + '\n').encode()); time.sleep(0.10); drain()
-    s.sendall(b'sendkey ret\n'); time.sleep(0.10); drain()
+        key(KM.get(ch, ch))
+    key('ret')
 
 # sendkey drops random characters on bursts, so confirm the verb actually echoed
 # before judging the result — a dropped key would otherwise read as "the barrier
@@ -259,6 +284,33 @@ if not type_verified(verb, 2.0, repr(verb)):
 ok = wait_for('power: filesystems flushed', 60, 'power_flush ran on the exit path')
 if not ok:
     sys.exit(3)
+
+def qemu_gone(pid):
+    # ⚠ os.kill(pid, 0) is NOT a liveness test here. QEMU is a SIBLING of this
+    # process — a child of the shell running the smoke — so when it exits it becomes
+    # a ZOMBIE until the shell reaps it, and signal 0 to a zombie SUCCEEDS. The
+    # obvious check therefore never fires and the arm times out even on a perfect
+    # reset. Read the process state instead: 'Z' (or a vanished entry) means gone.
+    try:
+        with open(f'/proc/{pid}/stat', 'rb') as f:
+            fields = f.read().decode('latin1').rsplit(')', 1)[1].split()
+        return fields[0] == 'Z'
+    except OSError:
+        return True
+
+if verb == 'reboot':
+    # QEMU runs with -no-reboot, so a real platform reset makes it EXIT. Watching the
+    # process die is direct evidence; a log line would only be a claim.
+    t0 = time.time()
+    while time.time() - t0 < 40:
+        if qemu_gone(qpid):
+            print('  ok: guest reset -- qemu exited (-no-reboot)')
+            sys.exit(0)
+        time.sleep(0.5)
+    print('  FAIL: platform never reset (qemu still running after 40s)')
+    if 'power: platform did not reset' in logtext():
+        print('         every rung of the reset ladder was tried and declined')
+    sys.exit(4)
 # Gate on the storage quiesce too, rather than racing it: nvme_shutdown() budgets
 # up to ~5 s for CSTS.SHST, so killing the machine a couple of seconds after the
 # flush line truncates the log before any of it lands and the absence looks like

@@ -134,3 +134,129 @@ fn power_quiesce_devices() {
     kprintln("power: devices quiesced", 23);
     return 0;
 }
+
+# === Bite 7 — the reset ladder ==============================================
+#
+# Four methods, tried in the order Linux tries them, each falling through to the
+# next. None of them returns if it works, so the code after a step only runs
+# because that step did nothing.
+#
+# ⚠ CF9 HAZARD, and it is the reason the ladder is ordered this way: on the AMD FCH
+# a CF9 write of 0x0E is a genuine S5 POWER-CYCLE, not a warm reset — the box goes
+# off and stays off. So the manual CF9 fallback here writes 0x02 then 0x06 and NEVER
+# 0x0E. (The FADT's own RESET_VALUE is a separate matter: that is the firmware's
+# advertised value and following it is the spec-sanctioned path, which is why it is
+# tried first. QEMU advertises 0xf there. If archaemenid's firmware advertises an
+# 0x0E-shaped value, the first rung will power the box off rather than reboot it —
+# the read-only FADT report from bite 2 prints the exact value, so check it in the
+# burn log BEFORE flashing a kernel that can reach this function.)
+#
+# ⚠ CF9 also sits inside the 0xCF8 CONFIG_ADDRESS dword window. Linux gates that
+# write behind positive identification of PCI mechanism 1. agnos's whole PCI layer
+# is mechanism-1 config cycles (pci_read32/pci_write32 use 0xCF8/0xCFC and the bus
+# enumerated), so mechanism 1 is proven by the fact that we found any device at all
+# — gate on that rather than assuming it.
+fn power_reset() {
+    var i = 0;
+    var st = 0;
+
+    kprintln("power: resetting", 16);
+
+    # 1. ACPI RESET_REG — the firmware's own advertised method. Only meaningful from
+    #    FADT revision 2, only when the RESET_REG_SUP flag is set, and only for an
+    #    address space we can actually write.
+    if (acpi_reset_ok == 1) {
+        if (acpi_reset_space == 1) {                  # SystemIO
+            outb(acpi_reset_addr, acpi_reset_value);
+            gpu_udelay(15000);                        # spec allows 15 ms to take effect
+        }
+        if (acpi_reset_space == 0) {                  # SystemMemory
+            store8(acpi_reset_addr, acpi_reset_value);
+            gpu_udelay(15000);
+        }
+    }
+
+    # 2. The 8042 keyboard controller pulse. Very likely dead on this box (USB-only,
+    #    no PS/2 chip), which is exactly why it must never be the only method — but
+    #    it is harmless where absent. Wait for the input buffer to drain first; the
+    #    pulse is ignored if the controller is busy.
+    i = 0;
+    while (i < 10) {
+        st = inb(0x64);
+        if ((st & 0x02) == 0) { outb(0x64, 0xFE); }
+        gpu_udelay(1000);
+        i = i + 1;
+    }
+
+    # 3. CF9 two-step, warm only. Gated on PCI mechanism 1 being proven.
+    if (pci_count > 0) {
+        outb(0xCF9, 0x02);                            # RST_CPU armed
+        gpu_udelay(1000);
+        outb(0xCF9, 0x06);                            # SYS_RST | RST_CPU  (NEVER 0x0E)
+        gpu_udelay(15000);
+    }
+
+    # 4. Triple fault. A zero-limit IDT means the next interrupt cannot be dispatched,
+    #    cannot be escalated to a double fault handler either, and the CPU shuts down
+    #    and resets. Crude, universally effective, and the reason there is no fifth rung.
+    asm {
+        0x48; 0x31; 0xC0;                             # xor rax, rax
+        0x50;                                         # push rax  (base 0)
+        0x66; 0x50;                                   # push ax   (limit 0)
+        0x0F; 0x01; 0x1C; 0x24;                       # lidt [rsp]
+        0xCC;                                         # int3 -> no IDT -> triple fault
+    }
+
+    kprintln("power: platform did not reset", 29);
+    return 0;
+}
+
+# === The syscall body ========================================================
+#
+# WHY MAGIC NUMBERS, and it is not cargo-culting Linux. Syscall #13 already exists
+# and cyrius already exposes it as a NULLARY `sys_reboot()`. The cyrius `syscall()`
+# builtin pops exactly the N argument registers its call site names, so every
+# already-compiled caller of the old nullary form delivers GARBAGE in rdi/rsi/rdx.
+# Without a token the first such caller to run would halt or reset the box at
+# random. The magic pair makes that garbage fail closed. That is the same reason
+# Linux's reboot(2) carries them, and it applies here verbatim.
+#
+# It is also the privilege gate, deliberately: `getuid` is hardcoded 0 and there is
+# no uid model, so a uid check would be a gate that is always open. An init-only
+# (pid == 0) check would make a shell builtin a silent no-op, since agnsh runs as
+# its own pid. Magic-token arming is the established idiom in this tree — the same
+# shape as blk_rw_armed.
+var PWR_MAGIC1 = 0x50575231;   # "PWR1"
+var PWR_MAGIC2 = 0x50575232;   # "PWR2"
+var PWR_HALT   = 1;
+var PWR_OFF    = 2;
+var PWR_REBOOT = 3;
+
+fn power_sys(magic1, magic2, cmd, arg) {
+    if (magic1 != PWR_MAGIC1) { return 0 - 1; }
+    if (magic2 != PWR_MAGIC2) { return 0 - 1; }
+
+    # Every command shares the teardown. Getting the machine into a safe state is
+    # not conditional on which way it is being stopped.
+    power_quiesce_devices();
+
+    if (cmd == PWR_REBOOT) {
+        power_reset();
+        # power_reset() only returns when every rung failed.
+        kprintln("power: halted (reset unavailable)", 33);
+        arch_halt();
+        return 0;
+    }
+    if (cmd == PWR_OFF) {
+        # Bite 9 wires ACPI S5 here. Until then, halting is the honest outcome —
+        # a poweroff that silently halts instead is a lie the operator would have to
+        # discover by watching the power LED.
+        kprintln("power: soft-off not yet implemented -- halted", 45);
+        arch_halt();
+        return 0;
+    }
+
+    kprintln("power: halted", 13);
+    arch_halt();
+    return 0;
+}
