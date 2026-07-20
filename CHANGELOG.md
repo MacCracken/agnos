@@ -87,6 +87,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     the filesystem still `clean`. ⚠ **`ahci_port_stop()` is NOT yet exercised** — QEMU q35's only SATA device is
     an ATAPI CD on port 2 that agnos never initialises, so no port has a command list to stop. Iron has a real
     WD Blue on port 0 and will be its first run.
+- **Shutdown arc bite 5 — bus quiesce (audio / network / USB)**, and `power_quiesce_devices()` in `power.cyr`
+  now owns the whole teardown in one ordered sequence. **The order is the design, not style:** filesystems
+  first (everything after ends some controller's ability to serve the I/O a flush needs) → audio → network →
+  storage → **USB last, because on this box it is also the KEYBOARD**; taking it down earlier leaves an
+  operator watching a stalled step with no way to interact with the machine.
+  - **`hda_quiesce(ci)` / `hda_quiesce_all()`** — generalises `hda_hdmi_feed_stop()` off its hardcoded
+    `ci = 1`, so both controllers are covered (instance 0 = analog ALC897, 1 = AMD HDMI), and goes past the
+    stream to the **CORB/RIRB engines**. The RIRB is a device-**write** target: unsolicited codec responses
+    (HDMI hot-plug is exactly that class) land in a pmm page asynchronously, so leaving `RIRBCTL` armed while
+    memory is reclaimed means silent 8-byte writes into whatever occupies that page next. The refill servicer
+    is stopped **first**, or the 100 Hz tick re-arms the stream underneath the teardown.
+  - **`r8169_quiesce()`** — mask (`IMR=0`) → acknowledge (`ISR` write-1-clear) → **detach MSI** → reset.
+    `r8169_reset()` alone is not enough: **`CR.RST` does not touch PCI config space**, so the card keeps a live
+    MSI vector aimed at an IDT entry that is about to stop meaning anything. New `pci_disable_msi(idx)` in
+    `pci.cyr` is the exact inverse of `pci_enable_msi_vector`. Mask-before-ack is deliberate — reversing them
+    leaves a race where an interrupt latches between the two.
+  - **`xhci_stop()`** — clears R/S together with INTE/HSEE/EWE in **one** write (Linux's `xhci_quiesce`;
+    dropping R/S alone leaves the interrupter armed while the controller winds down), then waits for HCH on a
+    **~16 ms bound rather than a spin count**. Each `xhci_op_read32` is a non-posted MMIO read round-tripping
+    the PCIe link at roughly a microsecond, so the 1,000,000-iteration idiom used elsewhere in this tree would
+    be *seconds* of apparent wedge on a controller that is never going to halt.
+  - QEMU-verified in sequence: `filesystems flushed` → `nvme: shutdown complete` → `storage quiesced` →
+    `xhci: controller halted` → `devices quiesced`, filesystem still `clean`. ⚠ `hda_quiesce_all()` and
+    `r8169_quiesce()` are **silent and unexercised here** — the smoke's QEMU has neither device. Together with
+    `ahci_port_stop()` they get their first run on iron.
+- **Binary size ceiling 1.6M → 1.7M** (`check.sh` + `test.sh`, in lockstep). The arc closed on 1.6M at
+  1,600,712 B — 712 B over, the same way 1.45.10 closed on 1.2M and the display-audio bite closed on 1.5M. The
+  growth is the ACPI FADT/`_S5` decode plus the per-subsystem quiesce paths, not bloat.
 - **`scripts/shutdown-smoke.sh`** — QEMU gate for the above: builds a GPT+ESP+ext2 image, drives the shell to
   exit via HMP `sendkey`, then requires both the `power: filesystems flushed` line **and** `e2fsck -fn` clean.
   It checks the image is clean *before* boot too, since a "clean" verdict on a never-dirtied FS proves nothing.

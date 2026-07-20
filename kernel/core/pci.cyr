@@ -351,6 +351,25 @@ fn pci_enable_msi_vector(idx, vector) {
     return 1;
 }
 
+# Shutdown arc bite 5 — the inverse of pci_enable_msi_vector.
+#
+# A device-level reset does NOT clear PCI config space: the R8169's CR.RST, for
+# instance, resets the MAC but leaves MSI Enable set in the capability. So a
+# controller that has been "reset" can still raise an interrupt through a vector
+# whose handler is about to stop existing. Clearing bit 16 of the MSI control dword
+# is the only thing that actually detaches it.
+fn pci_disable_msi(idx) {
+    var slot = PciDev_slot(&pci_devs + idx * 32);
+    var bf = load64(&pci_busfunc + idx * 8);
+    var bus  = (bf >> 8) & 0xFF;
+    var func = bf & 0x07;
+    var off = pci_find_cap(idx, 0x05);
+    if (off == 0) { return 0; }
+    var hdr = pci_read32(bus, slot, func, off);
+    pci_write32(bus, slot, func, off, hdr & 0xFFFEFFFF);   # clear MSI Enable (bit 16)
+    return 1;
+}
+
 # Capture one (bus, slot, func) device into pci_devs[pci_count].
 # Returns 1 if a real device was recorded, 0 if absent or table full.
 # Factored out of pci_scan() so the multi-bus / multifunction loop reads

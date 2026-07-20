@@ -1562,6 +1562,59 @@ fn hda_stream_arm() {
 # So: gpu_hdmi_audio_enable calls _stop at the TOP (all encoder-audio setup then runs against a quiesced FIFO)
 # and _start as its TERMINAL op (feed resumes into a freshly-drained FIFO with the read pointer already armed).
 # The MMIO accessors index by hda_active_ctl; at enable time that is still 0 (analog), so save/select/restore.
+# Shutdown arc bite 5 — quiesce one HDA controller completely.
+#
+# hda_hdmi_feed_stop() below does the stream half but is hardcoded to instance 1
+# (the HDMI controller), because that is all the audio arc needed. A shutdown has to
+# cover BOTH controllers on this box — instance 0 is the analog ALC897, instance 1
+# the AMD HDMI codec — and has to go further than the stream: CORB and RIRB are DMA
+# engines in their own right, and the RIRB is a device-WRITE target. Unsolicited
+# codec responses (HDMI hot-plug is exactly that class) land in a pmm page
+# asynchronously, so leaving RIRBCTL armed while memory is reclaimed means silent
+# 8-byte writes into whatever occupies that page next.
+#
+# Order: stop the refill servicer first (otherwise the 100 Hz tick re-arms the
+# stream underneath us), then SD_RUN, then the CORB/RIRB engines.
+fn hda_quiesce(ci) {
+    var sd = 0;
+    var ci_save = 0;
+    var ctl = 0;
+
+    if (load64(&hda_present + ci * 8) == 0) { return 0; }
+    store64(&hda_stream_on + ci * 8, 0);               # pause the timer-tick refill FIRST
+
+    ci_save = hda_active_ctl;
+    hda_active_ctl = ci;
+
+    sd = load64(&hda_sd_base + ci * 8);
+    if (sd != 0) {
+        ctl = hda_read32(sd + SD_CTL);
+        hda_write32(sd + SD_CTL, ctl & (0 - 1 - SD_RUN));   # stop the stream DMA
+        hda_udelay(2000);                                   # let the link go quiet
+    }
+    hda_write8(HDA_CORBCTL, 0);                        # stop command-ring DMA
+    hda_write8(HDA_RIRBCTL, 0);                        # stop response-ring DMA (a WRITE target)
+
+    hda_active_ctl = ci_save;
+    return 1;
+}
+
+# Quiesce every bound controller. Instance order does not matter here — they are
+# independent devices sharing only the selector.
+fn hda_quiesce_all() {
+    var ci = 0;
+    var n = 0;
+    while (ci < 2) {
+        if (hda_quiesce(ci) == 1) { n = n + 1; }
+        ci = ci + 1;
+    }
+    if (n != 0) {
+        kprint("hda: ", 5); kprint_num(n);
+        kprintln(" controllers quiesced", 21);
+    }
+    return 0;
+}
+
 fn hda_hdmi_feed_stop() {
     var ci = 1;                                        # instance 1 = the HDMI/DP controller
     if (load64(&hda_present + ci * 8) == 0) { return 0; }

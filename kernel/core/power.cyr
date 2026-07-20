@@ -104,3 +104,27 @@ fn power_storage_quiesce() {
     kprintln("power: storage quiesced", 23);
     return 0;
 }
+
+# Bite 5 — the full device teardown, in the order that matters.
+#
+# THE ORDER IS THE DESIGN, not a style choice:
+#   1. filesystems      — must precede everything; every step below ends some
+#                         controller's ability to serve the I/O a flush would need.
+#   2. audio            — the HDA controllers are DMA engines AND the RIRB is a
+#                         device-WRITE target; stopping them before memory is
+#                         reclaimed is what prevents async scribbles into reused
+#                         pages. (This is also what stops the amp popping.)
+#   3. network          — mask, ack, detach MSI, reset.
+#   4. storage          — the NVMe shutdown notification lets the drive commit.
+#   5. USB              — LAST, because on this box it is also the KEYBOARD. Taking
+#                         it down earlier means an operator watching a stalled step
+#                         has no way to interact with the machine.
+fn power_quiesce_devices() {
+    power_flush();
+    hda_quiesce_all();
+    r8169_quiesce();
+    power_storage_quiesce();
+    xhci_stop();
+    kprintln("power: devices quiesced", 23);
+    return 0;
+}

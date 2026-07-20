@@ -357,6 +357,27 @@ fn r8169_cfg_lock() {
 # U-Boot rtl8169 (its comment cites this exact "DHCP failures after kernel
 # reboots" signature, same as the post-reset RXDV-gate clear in r8169_init_rx).
 
+# Shutdown arc bite 5 — take the NIC fully off the bus before the machine stops.
+#
+# r8169_reset() below halts DMA and resets the MAC, which is most of the job, but a
+# shutdown needs two more things in front of it:
+#   - IMR = 0 and ISR write-1-clear, so no interrupt is pending or armed while the
+#     handlers are being torn down;
+#   - MSI Enable cleared in PCI CONFIG SPACE. CR.RST does not touch config space, so
+#     without this the card keeps a live MSI vector pointing at an IDT entry that is
+#     about to stop meaning anything.
+# Order matters: mask first, then acknowledge, then detach, then reset. Reversing
+# mask/ack leaves a race where an interrupt latches between the two.
+fn r8169_quiesce() {
+    if (r8169_present == 0) { return 0; }
+    r8169_write16(R8169_REG_IMR, 0);          # mask every source
+    r8169_write16(R8169_REG_ISR, 0xFFFF);     # write-1-clear whatever latched
+    pci_disable_msi(r8169_pci_idx);           # detach the vector (CR.RST won't)
+    r8169_reset();                            # halt DMA + reset the MAC
+    kprintln("r8169: receiver stopped", 23);
+    return 1;
+}
+
 fn r8169_reset() {
     # 1. Halt the RX/TX DMA engines first (clear RE|TE, keep the other CR bits).
     #    `0xFF - RE - TE` = the bit-clear mask (the r8169_aspm_disable idiom).

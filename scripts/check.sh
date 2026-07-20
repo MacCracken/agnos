@@ -72,10 +72,14 @@ check "version in changelog" $?
 # on 1.5M (1,560,016 B — 16 B over, the same way 1.45.10 closed on 1.2M), so the
 # bound moved 1.5M → 1.6M; that arc's growth is the OTG-timing and HDMI/AFMT/ACR
 # register tables, not bloat. Matches scripts/test.sh (bumped in lockstep).
+# The 1.55.x SHUTDOWN arc then closed on 1.6M (1,600,712 B — 712 B over, the
+# same way 1.45.10 closed on 1.2M and the display-audio bite closed on 1.5M),
+# so the bound moved 1.6M -> 1.7M. That arc's growth is the ACPI FADT/_S5
+# decode plus the per-subsystem quiesce paths, not bloat.
 echo ""
 echo "--- Binary ---"
 SZ=$(wc -c < "$ROOT/build/agnos")
-test "$SZ" -gt 50000 && test "$SZ" -lt 1600000
+test "$SZ" -gt 50000 && test "$SZ" -lt 1700000
 check "binary size ($SZ bytes)" $?
 
 echo ""

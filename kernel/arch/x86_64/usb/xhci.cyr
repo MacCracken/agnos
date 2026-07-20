@@ -425,6 +425,47 @@ fn xhci_rt_write64(addr, val) {
 #   `xhci: halted, reset clean`
 # CMOS checkpoint kcp = 0x31 stamped only on success.
 
+# Shutdown arc bite 5 — halt the host controller.
+#
+# ⚠ THIS IS ALSO THE KEYBOARD. On a USB-only box (archaemenid has no PS/2) stopping
+# xHCI takes the operator's input away, so it runs LAST in the shutdown sequence,
+# after every other device is already quiesced. A partial stop here leaves a box
+# that is neither shut down nor typeable.
+#
+# Clear R/S together with the interrupt enables (INTE, HSEE, EWE) in ONE write, per
+# Linux's xhci_quiesce — dropping R/S alone leaves the interrupter armed while the
+# controller winds down. Then wait for HCH.
+#
+# The bound is ~16 ms, not a spin count. Each xhci_op_read32 is a non-posted MMIO
+# read that round-trips the PCIe link at roughly a microsecond, so the 1,000,000
+# iterations used elsewhere in this tree would be SECONDS of apparent wedge on a
+# controller that is simply never going to halt. The spec allows 16 ms.
+fn xhci_stop() {
+    var cmd = 0;
+    var spins = 0;
+    var halted = 0;
+    var sts = 0;
+
+    if (xhci_present == 0) { return 0; }
+    if (xhci_op_base == 0) { return 0; }
+
+    cmd = xhci_op_read32(XHCI_OP_USBCMD);
+    # bit0 R/S, bit2 INTE, bit3 HSEE, bit10 EWE — cleared as one write.
+    xhci_op_write32(XHCI_OP_USBCMD, cmd & 0xFFFFFBF2);
+
+    while (spins < 16000) {
+        sts = xhci_op_read32(XHCI_OP_USBSTS);
+        if ((sts & 0x01) != 0) { halted = 1; spins = 16000; }
+        else { spins = spins + 1; }
+    }
+    if (halted == 0) {
+        kprintln("xhci: controller did not halt", 29);
+        return 0;
+    }
+    kprintln("xhci: controller halted", 23);
+    return 1;
+}
+
 fn xhci_init() {
     if (xhci_present == 0) { return 0; }
 

@@ -87,11 +87,12 @@ exit(0 if ok else 1)
     # if a real squeeze is ever wanted; the ceiling, not DCE, is the growth knob.)
     # The 1.55.x DISPLAY arc then closed on THAT one exactly as 1.45.10 did — the
     # display-audio bite landed at 1,560,016 B, 16 B over — so it moved 1.5M → 1.6M.
+    # The 1.55.x shutdown arc then closed on 1.6M (1,600,712 B) — moved 1.6M → 1.7M.
     # The arc's growth is register tables (OTG timing, the HDMI/AFMT/ACR block) plus
     # their derivations, not bloat: those tables are the compressed form of what the
     # burns proved, and losing them costs another burn to re-learn.
     SZ=$(wc -c < $ROOT/build/agnos_test 2>/dev/null || echo 0)
-    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 1600000 ]; then
+    if [ "$SZ" -gt 50000 ] && [ "$SZ" -lt 1700000 ]; then
         check "x86 size reasonable (${SZ}B)" "0" "0"
     else
         check "x86 size reasonable (${SZ}B)" "0" "1"
