@@ -23,11 +23,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`scripts/shutdown-smoke.sh`** — QEMU gate for the above: builds a GPT+ESP+ext2 image, drives the shell to
   exit via HMP `sendkey`, then requires both the `power: filesystems flushed` line **and** `e2fsck -fn` clean.
   It checks the image is clean *before* boot too, since a "clean" verdict on a never-dirtied FS proves nothing.
-  ⚠ **Not yet passing end-to-end**: under this invocation xHCI comes up but never enumerates the USB keyboard
-  (`ver=0`, no `port N connected`, no `hid: keyboard` — iron reads `ver=272`), so the keystrokes that drive
-  the shell to exit never arrive. The barrier itself builds green and is wired; the harness's input path needs
-  a separate look. Also observed: the staged `agnsh` (1.8.2) fails `alloc_init: mmap failed` under QEMU and
-  kybernet falls through to the in-kernel recovery shell — pre-existing, unrelated to this bite.
+  **✅ VALIDATED BOTH WAYS.** With the barrier: `power: filesystems flushed` present, `Filesystem state:
+  clean`, no structural damage. With `power_flush()` removed from `boot_finish.cyr` and everything else
+  identical: flush line absent, **`Filesystem state: not clean`**. The delta is the evidence, and it confirms
+  the premise — exiting the shell really did leave the superblock dirty.
+  **⚠ THE ORACLE WAS THE HARD PART, AND IT LIED FIRST.** `e2fsck -fn` **exits 0** on an
+  unclean-but-structurally-consistent filesystem; the "not cleanly unmounted" notice goes to stdout while the
+  status stays 0. Gating on the exit code made the smoke report **PASS for a control kernel that had left
+  `s_state = 0x0000`** — a gate returning success for the exact case it exists to catch. It briefly produced a
+  false retraction of this whole bite ("the barrier is not observably necessary"). Only instrumenting
+  `ext2_mark_dirty()` (which proved it fired once, cleared VALID_FS, and its superblock write returned 0) and
+  then reading `dumpe2fs -h` + the raw byte at SB+0x3A exposed it. **The gate is now `dumpe2fs`'s "Filesystem
+  state"**, with structural consistency reported separately as the different question it is.
+  Beyond the state bit, `vfs_wfile_sweep_all()` independently closes a real hole: proc 0 uses the global
+  `vfs_table`, is never reaped, so its write-back buffers were never flushed by anything — `write()`-acked data
+  that no userland sync covers. The drive-cache flush stays unfalsifiable under QEMU, which does not model a
+  volatile write cache; that one needs iron.
+  Three harness lessons worth keeping, each of which cost a run: seed `/bin/agnsh` from
+  `build/rootfs` via `stage-agnsh.sh --build`, never from `../agnoshi/build/agnsh` (that is the **host
+  Linux-ABI** build, and it dies on its first ring-3 syscall with `alloc_init: mmap failed`, after which
+  kybernet falls through to the in-kernel recovery REPL — which reads PS/2 via `kb_has_key()` while
+  `hid_poll()` drains the xHCI ring, so on a USB-only QEMU keyboard that REPL is deaf and cannot be driven);
+  HMP `sendkey` needs the key-NAME map (`spc`, `slash`) and the `whirl-smoke.sh` cadence — prime with a
+  throwaway `ret`, `drain()` the monitor socket after every key, verify the echo; and `set -e` must be lifted
+  around the driver or the control run aborts before reaching its own evidence.
 - **A4 attribution control — the in-boot SYMCLK A/B (`HDMI_SYMCLK_AB`, burn profile `BURN_HDMI_SYMCLK_AB`).**
   `gpu_symclk_capture/_report/_apply/_restore` (`gpu.cyr`) snapshot, apply and restore the five DCCG stores at
   abs `0x159`/`0x15A`/`0x15B`/`0x15C`/`0x176`; `main.cyr` runs two passes of (symclk-OFF window → symclk-ON
