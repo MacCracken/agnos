@@ -1,5 +1,38 @@
 # Kernel display arc — push PIXELS through the silicon (slotted 1.55.x)
 
+## ▶▶▶ GRAPHICS-CLOSURE ROADMAP (2026-07-20) — finish the pixel arc within 1.55.x
+
+The pixel arc's spine is DONE and iron-validated: **P0** (read the pipe) → **P1** (tear-free flip) → **P2**
+(vblank pacing) → **blit#39** (double-buffered present; DOOM renders through the sovereign stack). What remains
+to CLOSE the 1.55.x display arc as a **desktop-ready** graphics deliverable is three pipe-ownership bites. The
+audio egress (P3b-iii / P5 / **A4**) is a **parked open thread**, not part of this closure — set down at
+1.55.27 with the ACR/CTS-at-241503 lead recorded; resume when wanted.
+
+| Bite | What | Touches | Validate | Effort · Risk |
+|------|------|---------|----------|---------------|
+| **P4 — scanout-residue clear** (clean first paint) | Kill the AMD-Zen quiet-boot banded-glyphs bug. Root cause (`fb_console.cyr:88-91`): GOP leaves the scanout **tiled/DCC** with quiet-boot ON, `fb_console` writes it **linear** → the swizzle bands the glyphs. Now diagnosable — P0's HUBP read exposes `DCSURF_*_TILING`/swizzle, and **P1 already re-points the scanout to a LINEAR buffer agnos owns**, so the fix is largely: at boot, run the console on agnos's own linear surface via the P1 primitive instead of the GOP's tiled one. | `gpu.cyr` (P1 re-point at boot), `fb_console.cyr` | IRON photo — clean first paint, no bands, quiet-boot ON | MED (survived 2 pre-P1 attempts; the pipe-ownership primitives are new leverage) · LOW (display-safe, proven P1 write) |
+| **P7 — explicit present API** (the compositor seam) | blit#39's honest gap: it assumes **full-redraw-every-frame**, so a partial-update compositor (aethersafha) would see 2-frame-old content. Add `gpu_present(surface[, dirty])` + a ring-3 syscall that decouples **render** from **flip** — composite into your own buffer, present when ready. This is what makes "own the pipe" actually serve the desktop. | `gpu.cyr` (blit/present split), `syscall.cyr` (+1 syscall), the aethersafha/setu seam | QEMU fallback path + IRON — a partial-update present lands correctly, no stale frame | MED · LOW |
+| **P8 — hardware cursor plane** (optional, desktop-quality) | DCN cursor overlay (HUBP cursor registers) — a hardware pointer so mouse motion does **not** recompose the frame. Pure "own the lit pipe" scope; the compositor can do software cursor without it, so this is polish, not a gate. | `gpu.cyr` (cursor regs), `syscall.cyr` | IRON — cursor moves smoothly over a static frame | MED · LOW-MED (new register block, display-safe overlay) |
+
+| **P9 — 2D acceleration** (the hardware blit) | Move fills/copies/blits off the CPU. **SDMA is the right primitive**, not the GFX ring: the DCN-adjacent System DMA engine does linear copy, constant fill, AND tiled↔linear conversion with a simple packet format, independent of the GFX/compute rings — and its tiled↔linear path is the same machinery P4 leans on, so the two share groundwork. Ring the SDMA up (queue + doorbell, mirroring the proven MEC ring bring-up from Thrust C), then expose fill/copy through the blit path + a ring-3 syscall. | `gpu.cyr` (SDMA ring + packets), `gpu_regs.cyr` (SDMA regs), `syscall.cyr` | IRON — a hardware fill/copy lands correct + faster than CPU memcpy | LARGE · MED (new engine ring; SDMA is the simplest AMD ring, and the MEC bring-up is proven prior art) |
+
+**Ordering:** **P4 first** — standing debt, independent, gives a clean boot, and its tiled↔linear diagnosis is
+groundwork P9 reuses. Then **P7** (compositor-critical). **P9** (2D accel — the biggest lift; SDMA ring shares
+P4's tiling work). **P8** (cursor) last and optional. Each is its own cut + iron burn; iron-only (QEMU emulates
+no DCN, so all fall back to the direct-FB path off-iron and are QEMU-smoke-safe).
+
+**⛔ STILL OUT OF 1.55.x — a deliberate follow-on arc:** the **3D path** (RADV-derived, GFX-ring shader
+pipeline); the **full cold modeset** (the sovereign ATOM interpreter `atom.cyr` is its proven foundation, but
+the full pixel-PLL+OTG+DIG+PHY-from-scratch sequence is the deep end); **DP link-training / DMCUB**. These open
+the next arc.
+
+**1.55.x DISPLAY closes when P4 + P7 + P9 land** (P8 optional): own the lit pipe, clean first paint, present
+tear-free from a compositor, and blit in hardware. A4 audio stays parked with the ACR/CTS-241503 lead; 3D +
+cold modeset are the next arc.
+
+---
+
+
 > **▶ CURRENT ENTRY POINT: [`docs/development/planning/hdmi-modeset-arc-155x.md`](hdmi-modeset-arc-155x.md) + [`docs/development/state.md`](../state.md).**
 > This doc covers earlier P0-P3b work / the audio-register analysis; the HDMI-audio blocker resolved to the
 > sovereign ATOM interpreter (A2/A3 proven on iron 1.55.23) — see the modeset arc doc. Kernel HEAD is **1.55.23**.

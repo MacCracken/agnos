@@ -47,6 +47,7 @@ var gpu_f64_fidelity_ok = 0; # f64 fidelity: 1 = rosnet-bit-correct on NON-exact
 var gpu_display_ok    = 0;   # P0 (1.55.x display arc): 1 = lit HUBP scanout matches fb_phys; -1 no match; -2 surface matched but no OTG lit
 var gpu_display_pipe  = 0 - 1; # P0: the HUBP instance scanning out our console (P1 re-points this one)
 var gpu_display_surf  = 0;   # P0: that pipe's FRONT surface MC address (the P1 restore target)
+var gpu_display_swmode = 0;  # P4: the lit pipe's HUBP SW_MODE (0 = linear; non-zero = tiled → console bands)
 var gpu_vblank_ok     = 0;   # P2: 1 = frame counter advances + both scan phases observable (the pacing signal); -1 counter stuck; -2 no blank; -3 no active
 # blit#39 double-buffering (tear-free full-screen apps). Falls back to the direct FB when unarmed.
 var gpu_bb_armed      = 0;   # 1 = the two app buffers are WC-mapped + cleared
@@ -2303,6 +2304,17 @@ fn gpu_display_probe() {
             kprint("gpu: display pipe ", 18);
             kprint_num(pipe);
             kprintln(" live (scanout matches framebuffer)", 35);
+            # P4 diagnostic — is the GOP scanout surface tiled? fb_console writes LINEAR, so a non-zero SW_MODE
+            # means the HUBP de-swizzles our linear bytes → the banded-glyph residue. Read-only, safe (same
+            # HUBP block as the surface regs above). Names the root cause before P4's fix touches anything.
+            var swmode = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_TILING_CONFIG + pipe * GPU_DCN_HUBP_STRIDE) & GPU_HUBP_SW_MODE_MASK;
+            gpu_display_swmode = swmode;
+            if (swmode == 0) {
+                kprintln("gpu: scanout surface is linear (no residue expected)", 52);
+            } else {
+                kprint("gpu: scanout surface is tiled, sw_mode ", 39); kprint_num(swmode);
+                kprintln(" -- linear console writes will band", 35);
+            }
             return 1;
         }
         gpu_display_ok = 0 - 2;
@@ -2428,6 +2440,32 @@ fn gpu_blit_arm() {
     gpu_mfence();
     gpu_bb_back  = 0;
     gpu_bb_armed = 1;
+    return 1;
+}
+
+# P4 — scanout-residue clear. If the GOP left the console surface TILED (SW_MODE != 0), fb_console's LINEAR
+# byte writes get de-swizzled by the HUBP → banded glyphs. The data on the surface IS linear (fb_console wrote
+# it); only the HUBP's interpretation is wrong. So clear SW_MODE to 0 (linear) and re-latch by re-pointing the
+# surface address (HIGH-then-LOW, the P1 latch idiom) so the HUBP re-reads its tiling config at the next blank.
+# Display-safe: cannot hang (same HUBP block agnos already writes for flips); worst case is a mis-drawn screen
+# that a reboot clears. Gated for the first iron test — promote to default-on once the residue is confirmed
+# gone. Uses the lit pipe found by P0; no-op if the surface is already linear or the pipe was never matched.
+fn gpu_scanout_clear_tiling() {
+    if (gpu_display_ok != 1) { return 0; }
+    if (gpu_display_swmode == 0) { return 0; }          # already linear — nothing to do
+
+    var tc_off = GPU_R_HUBP_TILING_CONFIG + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var tc = gpu_reg32(GPU_BASE_DCN_2, tc_off);
+    gpu_reg32_write(GPU_BASE_DCN_2, tc_off, tc & (0 - 1 - GPU_HUBP_SW_MODE_MASK));   # SW_MODE -> 0 (linear)
+
+    # Re-latch: re-write the current front surface address so the HUBP re-samples its config at the next blank.
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_display_surf >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_display_surf & 0xFFFFFFFF);
+    gpu_mfence();
+    gpu_display_wait_vblank(gpu_display_pipe);
+    kprintln("gpu: scanout tiling cleared to linear (residue fix)", 51);
     return 1;
 }
 

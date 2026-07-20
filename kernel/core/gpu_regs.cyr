@@ -113,6 +113,12 @@ var GPU_R_HUBP_SURF_ADDR_HI = 0x60B; # HUBPREQn ..._ADDRESS_HIGH [15:0] = addr[4
 var GPU_R_HUBP_SURF_PITCH   = 0x607; # HUBPREQn DCSURF_SURFACE_PITCH [13:0] (in PIXELS)
 var GPU_R_HUBP_SURF_CONFIG  = 0x5E5; # HUBPn DCSURF_SURFACE_CONFIG: SURFACE_PIXEL_FORMAT [6:0]
 var GPU_R_HUBP_CNTL         = 0x5F3; # HUBPn DCHUBP_CNTL: HUBP_BLANK_EN bit0 (0 = fetching)
+# HUBPn DCSURF_TILING_CONFIG (P4 — scanout-residue diagnosis). SW_MODE[4:0]=0 → SW_LINEAR; any non-zero =
+# tiled/swizzled. Sits between 0x5E5/0x5F3 in the same dispdec HUBP block → safe to read during scanout
+# (offset derived + cross-checked against dcn_2_1_0_offset.h, 2026-07-20). If the GOP left the surface tiled
+# while fb_console writes it linear, the HUBP de-swizzles linear bytes → banded glyphs (the AMD-Zen residue).
+var GPU_R_HUBP_TILING_CONFIG = 0x5E7;
+var GPU_HUBP_SW_MODE_MASK    = 0x1F;  # SW_MODE field [4:0]
 var GPU_DCN_HUBP_STRIDE     = 0xDC;  # per-HUBP instance stride
 var GPU_HUBP_BLANK_EN       = 0x1;   # DCHUBP_CNTL bit0
 # P1 back buffer — VRAM offset 1 GB: clear of the console FB (offset 0, ~8 MB), the PSP TMR (1.5 GB) and

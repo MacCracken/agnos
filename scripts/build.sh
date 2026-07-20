@@ -302,6 +302,11 @@ else
         # In the audio-clock-regeneration path — the exact mechanism for a sink that receives a stream but
         # decodes clean silence. Display-safe (audio only). Requires HDA_HDMI.
         [ -n "$HDMI_ACR_CTS" ]       && echo '#define HDMI_ACR_CTS'
+        # SCANOUT_LINEAR=1 — P4 scanout-residue clear: if the GOP left the console surface tiled (SW_MODE!=0),
+        # clear it to linear + re-latch so fb_console's linear writes stop banding. Display-safe (cannot hang;
+        # worst case a mis-drawn screen a reboot clears). The read-only diagnostic runs unconditionally; this
+        # flag enables the WRITE. Promote to default-on once iron confirms the residue is gone.
+        [ -n "$SCANOUT_LINEAR" ]     && echo '#define SCANOUT_LINEAR'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

@@ -49,7 +49,16 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_HDMI_ACR_CTS:-}" ]; then
+if [ -n "${BURN_SCANOUT_LINEAR:-}" ]; then
+    # P4 — SCANOUT-RESIDUE CLEAR. The read-only diagnostic (does the GOP leave the console surface tiled?)
+    # runs unconditionally; this build ALSO enables the fix: clear HUBP SW_MODE to linear + re-latch so
+    # fb_console's linear writes stop banding. Display-safe (cannot hang; worst case a mis-drawn screen a
+    # reboot clears). ⚠ THE RESIDUE ONLY REPRODUCES WITH BIOS QUIET-BOOT ON — if quiet-boot is off (the old
+    # workaround), the diagnostic will log "scanout surface is linear" and there is nothing to fix.
+    echo "[2/2] Building the P4 scanout-linear kernel (SCANOUT_LINEAR: clear tiling + re-latch; needs BIOS quiet-boot ON to reproduce the residue; LOOK at first-paint legibility)."
+    BUILD_ENV="SCANOUT_LINEAR=1"
+    BUILD_TAG="SCANOUT_LINEAR"
+elif [ -n "${BURN_HDMI_ACR_CTS:-}" ]; then
     # THE ACR CTS BURN — the one real register-value delta left after the whole register class was exhausted
     # (PHY included, 2026-07-20). agnos left HDMI_ACR_CTS_48/44/32_0 at 0; the amdgpu-playing capture writes
     # 0x3AF5C000 (241500) to all three. The CTS/N ratio is what the sink uses to regenerate its audio clock —
@@ -230,6 +239,7 @@ case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; 
 case "$BUILD_TAG" in *HDMI_DCCG*)        verify_marker "hdmi DCCG symclk re-prime" ;; esac
 case "$BUILD_TAG" in *HDMI_SYMCLK_AB*)   verify_marker "symclk-ab: in-boot A/B" ;; esac
 case "$BUILD_TAG" in *HDMI_ACR_CTS*)     verify_marker "hdmi acr cts programmed" ;; esac
+case "$BUILD_TAG" in *SCANOUT_LINEAR*)   verify_marker "scanout-linear fix armed" ;; esac
 case "$BUILD_TAG" in *ATOM_DRY*)         verify_marker "atom: DRY build (no MMIO)" ;; esac
 case "$BUILD_TAG" in *HDMI_ATOM*)        verify_marker "atom: running DIGxEncoderControl" ;; esac
 

@@ -1991,9 +1991,26 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # 1.55.x: the frame is complete in the back buffer — PRESENT it. Flips the pipe's scanout to it and
         # blocks until the hardware takes it at the next blank: tear-free, and it vsync-paces the caller
         # (a blit can therefore block up to one frame — that is the point). No-op on the direct path.
-        gpu_blit_present(proc_current_get());
+        #
+        # P7 (2026-07-20): a4 bit40 = DEFER_PRESENT. A full-screen app (doom/fbtest) leaves it clear and each
+        # blit auto-presents, exactly as before — structural back-compat, every existing caller is bit-identical.
+        # A COMPOSITOR sets it: blit each window into the SAME back buffer with the bit set (no flip), then call
+        # present#84 ONCE when the whole frame is composited. Without this, N windows = N flips = the compositor
+        # sees partial composites. The back buffer is NOT swapped until the present, so deferred blits accumulate.
+        if ((bl_dstxy & 0x10000000000) == 0) {
+            gpu_blit_present(proc_current_get());
+        }
         stack_canary_check(canary);
         return 0;
+    }
+    if (num == 84) {
+        # gpu_present() — P7: flip the accumulated back buffer to the scanout, tear-free, vsync-paced. The
+        # explicit half of the blit/present split: a compositor blits its windows with #39's DEFER_PRESENT bit
+        # set (no flip), then calls this ONCE to show the finished frame. Returns 1 = presented, 0 = nothing to
+        # present (double-buffer not armed / direct-FB path — the compositor's blits already hit the live FB).
+        var pr = gpu_blit_present(proc_current_get());
+        stack_canary_check(canary);
+        return pr;
     }
     if (num == 40) {
         # uptime_ms() — monotonic milliseconds since boot, returned in rax (no
