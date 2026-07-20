@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.26] — 2026-07-19 — ★ AGNOS POWERS ITSELF OFF (ACPI S5, iron-validated)
+
+**★★ IRON-PASS on archaemenid: `poweroff` at the agnsh prompt runs the full teardown and the machine goes
+dark — power LED out.** With the reboot burn at 1.55.25, agnos can now **stop itself both ways** on real
+hardware. Ten of the shutdown arc's eleven bites are closed; only the metered audio anti-pop ladder remains.
+
+That is the whole distance travelled in one arc: from `arch_halt()` = `cli; hlt; jmp $` with a dirty ext2
+superblock, to a kernel that flushes its filesystems, notifies the drive to commit, quiesces every DMA engine
+in a deliberate order, and then either resets the platform or drives it to ACPI S5.
+
+**Why the S5 burn was the riskiest of the arc, and why it was safe to attempt:** `SLP_TYP` selects *which*
+sleep state, so a wrong value **suspends** the box with interrupts off, no wake vector and no resume path —
+indistinguishable from a hard hang. It was safe only because the value was never guessed: bite 3 decodes
+`\_S5_` from the DSDT's own AML, that decode was cross-checked against `iasl -d` on this machine's real AMI
+firmware (`SLP_TYPa=5, SLP_TYPb=0`, kept in `prior-art/acpi-s5-known-good-archaemenid-0719.txt`), and the
+read-only `acpi: sleep type a 5 b 0` line printed on every boot let it be confirmed **before** the write was
+ever attempted. QEMU could not have caught a bad decode — its `_S5_` is all zeroes, so `SLP_TYP=0` is exactly
+what it wants and a broken scanner passes there by construction.
+
 ### Added
 
 - **Shutdown arc bite 9 — ACPI S5 soft-off** (`power_off()` in `power.cyr`), wired to `PWR_OFF`. QEMU-verified:
