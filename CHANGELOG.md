@@ -5,6 +5,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.25] — 2026-07-19 — agnos gets an orderly shutdown (+ the A4 attribution control)
+
+**agnos can now stop properly.** Until this release it could not: `arch_halt()` is `cli; hlt; jmp $` — an
+unrecoverable spin, not a power state — syscall #13 printed a line and called it while being reachable from
+ring 3, and exiting the shell dropped straight into the same spin with the **ext2 superblock still marked
+dirty**. Seven bites build the sequence bottom-up: durability barrier → ACPI facts → `\_S5_` decode → storage
+quiesce → bus quiesce → GPU quiesce → reset ladder. Each is independently verified, and the riskiest step
+(actually cutting power) is deliberately last and still unwritten.
+
+**★ IRON-VALIDATED 2026-07-19: `reboot` at the agnsh prompt resets archaemenid.** The full teardown runs in
+order and the platform comes back. That burn was also the **first execution anywhere** of four functions QEMU
+structurally cannot reach — `ahci_port_stop()`, `hda_quiesce_all()`, `r8169_quiesce()`, `gpu_quiesce()`.
+
+Pairs with **agnoshi 1.8.5**, which adds the `reboot` / `poweroff` / `halt` builtins that reach the syscall.
+
+Still open, in ladder order: ACPI S5 poweroff (bite 9), its iron burn (10), and the metered audio anti-pop
+ladder (11) — the last of which doubles as an A4 diagnostic and is therefore gated OFF by default.
+
 ### Added
 
 - **Shutdown arc bite 1 — `power_flush()`, the durability barrier** (`kernel/core/power.cyr`, new). agnos has
