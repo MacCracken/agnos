@@ -1,5 +1,103 @@
 # Sovereign HDMI modeset arc — own the transmitter, unblock the audio (slotted 1.55.x)
 
+## ▶▶▶▶▶ ACR CTS BURNED (1.55.26 iron, `audio_wk2_1` → `prior-art/hdmi-acr-cts-burn-tap1-zeroed-iron-0720.txt`): STILL SILENT, BUT IT *MOVED THE OUTPUT* — the first change in the arc to do so, and it points at the ACR/CTS clock alignment.
+
+The last register-value delta (`HDMI_ACR_CTS_48/44/32_0`) was programmed to amdgpu's literal `0x3AF5C000`
+(241500). **Sink still silent — so the register-value class is now COMPLETELY exhausted, no exceptions.** But
+the burn was NOT a null result:
+
+- **⚠ IT ZEROED tap1.** Burn 11 (no CTS): `tap0=249f2f tap1=b9b93c`, both content. This burn (CTS forced):
+  `tap0=965cfd`, **`tap1 saw samples, but they are silence`** — tap1 went to ZERO. And `HDMI_ACR_STATUS_0`
+  changed `3af5e000 → 3af5c000`. **⟹ THE ACR/CTS PATH IS NOT INERT** — the months-old "inert under
+  `ACR_SOURCE=0`" assumption is FALSIFIED. The CTS value reaches the formatter and changes its output.
+- **⟹ THE LIKELY MECHANISM — a CTS/TMDS mismatch, and it is DIRECTIONAL.** agnos's real pixel clock is
+  **241503 kHz** (`display pixel clock 241503`); I forced CTS = **241500**. A CTS that does not match the
+  actual TMDS clock breaks the sink's audio-clock regeneration / sample alignment → null cells. The
+  "write amdgpu's literal to avoid divergence" reasoning was **backwards**: amdgpu wrote 241500 because
+  amdgpu's *own* clock was 241500 at capture; agnos's is 241503, so agnos must program CTS to match its OWN
+  measured clock (or drive `ACR_SOURCE`/N to lock the ratio), NOT copy amdgpu's number.
+
+**▶ THE NEXT AGNOS BURN (leave HDMI_ACR_CTS gated OFF — 241500 made tap1 worse):** program CTS to agnos's
+OWN measured clock (241503 → `0x3af5cbc0`-ish, or read `HDMI_ACR_STATUS_0`'s pre-programming HW measurement and
+write THAT), OR set `ACR_SOURCE`/N so the CTS/N ratio locks to the real 241503 TMDS. This is the first lever
+that demonstrably reaches the wire — worth one more agnos burn before falling back to the Linux sequencing
+experiment. Test at agnos's clock, not amdgpu's.
+
+## ▶▶▶▶ THE REGISTER-*VALUE* CLASS IS EXHAUSTED — DEFINITIVELY, PHY INCLUDED (2026-07-20)
+
+Two matched-1440p read-only captures (GOP-DVI-inherited + amdgpu-HDMI-playing, `gop-dvi-dump.py`) plus a
+**comprehensive 40-register agnos-vs-amdgpu diff** (agnos = `audio_re_11`, amdgpu = `dcn-audio-known-good-full-0716`)
+close the register hypothesis for good:
+
+- **The PHY / RDPCS block is BYTE-IDENTICAL between agnos-inherited-DVI and amdgpu-HDMI-playing.** Every
+  `RDPCSTX0/1`, `UNIPHYA/B`, `CHANNEL_XBAR` register matches. As predicted for a 241.5 MHz link (below the
+  340 MHz HDMI scrambling threshold), DVI and HDMI use the SAME PHY. **The sovereign cold-modeset / transmitter
+  thesis is FALSIFIED. `#76` was never the answer; it stays gated for console safety, not because it is a lead.**
+- **DIG_BE_CNTL and DIG_FE_CNTL match** — agnos already writes `0x10030200` (DIG_MODE=3=HDMI) and `0x01000100`
+  (STEREOSYNC_GATE, bit8). The GOP-DVI→HDMI deltas there are just the inherited pipe catching up to what agnos
+  already does.
+- **HDMI_CONTROL matches the known-good** (`0x10019`). ⚠ Note bit3 (`HDMI_NO_EXTRA_NULL_PACKET_FILLED`) reads
+  `1` in the 0716 capture and `0` in a fresh 0720 capture — it **varies between two audibly-playing amdgpu
+  captures**, so it cannot gate audio, and it is a standing caution against over-reading any single snapshot.
+- **The full 40-register diff: 35 exact matches, 5 differences, ALL accounted for** — `HDMI_ACR_STATUS_0`
+  (read-only HW-measured CTS, 241502 vs 241500, a measurement not a write); `HDMI_ACR_48_0/44_0/32_0` (agnos 0
+  vs amdgpu `0x3af5c000`, but **both have `ACR_SOURCE=0` ⟹ the programmed CTS is unused, HW-measured wins** —
+  inert, though a free belt-and-suspenders alignment); `AFMT_GENERIC_0` (the deliberate RGB-vs-YCbCr AVI).
+
+**⟹ THERE IS NO REGISTER VALUE THAT GATES THE AUDIO.** Every readable register — PHY included — matches
+amdgpu-playing or differs only by measurement / intent. This is the SAME conclusion the earlier "register
+class exhausted" audits reached, now made unfalsifiable: the last unread block (PHY) is confirmed identical.
+
+**⟹ THE ANSWER IS NOT A REGISTER — it is one of: (a) SEQUENCING** (agnos live-flips DIG_MODE 2→3 where amdgpu
+does a cold-modeset EDGE; a data-island scheduler or FIFO that transitions on an edge, not a level, would look
+register-identical afterward and still be dead); **(b) a WRITE THAT DOESN'T LATCH** (a value programmed into a
+gated clock reads back correct but never took); **(c) the bare-metal ENVIRONMENT** (DMA coherence / caching /
+MMIO ordering — the one axis the off-agnos Linux driver could not test, because it ran under Linux). The
+off-agnos experiment already proved agnos's FEED is correct on amdgpu's committed pipe, so the fault is in how
+agnos's *program* brings a GOP-DVI-parked pipe to HDMI-audio, not in the feed and not in the end-state values.
+
+**▶ THE DECISIVE NEXT EXPERIMENT (Linux, no agnos burn):** extend `agnosticos/scripts/agnos-hdmi-linux.py` to
+run agnos's FULL DCN program — including the live `DIG_MODE 2→3` flip — on a **GOP-DVI pipe** (amdgpu
+blacklisted), not riding amdgpu's committed pipe. **Sound ⟹ agnos's program is correct and the iron silence is
+a bare-metal-environment bug (b/c above) — bisect in Python, no modeset, no burn. Silence ⟹ a live flip cannot
+bring a DVI-parked pipe to audio; the cold-modeset EDGE (not the PHY) is structurally required, and it can be
+developed entirely in Python where a blank costs a power cycle.** Either outcome ends the guessing.
+
+## ▶▶▶ GOP-DVI READ-ONLY DUMP (2026-07-20) — FOUR THINGS SETTLED, ZERO BURNS, ZERO RISK
+
+Read `agnosticos/scripts/gop-dvi-dump.py` output at
+`agnosticos/docs/development/prior-art/dcn-gop-dvi-readonly-0720.txt`. Run under Linux with
+`modprobe.blacklist=amdgpu`, so the console is the raw GOP/simple-framebuffer pipe — the same base state agnos
+inherits. **SETTLED (categorical, resolution-independent):**
+
+1. **✅ THE `0x5Dxx`/`0x5Exx` PHY/RDPCS DOMAIN IS READ-SAFE.** Group C completed without hanging — the first
+   time this domain has ever been read by arc tooling. **This unblocks agnos reading its own PHY block from
+   the kernel**, which every prior plan treated as a hang risk that had to be dodged. It is not.
+2. **✅ THE LIVE LINK IS DIG1 IN DVI MODE.** `DIG1_DIG_BE_CNTL = 0x10020200` (DIG_MODE=2=DVI, DIG_ENABLE=1);
+   DIG0 is off (mode 1, disabled). Confirms agnos inherits DIG1-DVI, and agnos's ATOM `#4 digid=1` is correct.
+3. **✅ THE DIG_BE DELTA IS *ONLY* DIG_MODE.** GOP-DVI `DIG1_DIG_BE_CNTL = 0x10020200` vs amdgpu-HDMI-playing
+   `0x10030200` — identical but for bit16 (DIG_MODE 2→3, `FE_SOURCE_SELECT=0x2` in both). **agnos already
+   flips exactly that bit and gets no audio ⟹ the missing HDMI state is NOT in DIG_BE_CNTL.** It is in the PHY
+   or the DIG data-island path.
+4. **⚠ BOTH PHYs ARE POWERED — THERE IS NO "SAFE" phyid FOR `#76`.** `RDPCSTX1_RDPCSTX_CNTL = 0x00d1f000`
+   (data-lane bits set ⟹ the live path is PHY B / phyid=1, confirming agnos's `#76 phyid=0` was **wrong**), but
+   `RDPCSTX0` is also fully powered (`PHY_CNTL0=0x30300204`, `PHY_CNTL6=0x001d3333`, `UNIPHYA_LINK_CNTL=0x01000100`).
+   That is why agnos's phyid=0 `#76` blanked the console even though PHY A wasn't carrying the picture — it
+   power-cycled live silicon. **`#76` on EITHER phy is destructive; it stays gated and Linux-first.**
+
+**⚠ RESOLUTION CONFOUND:** the GOP handed Linux **800×600**, agnos gets 1440p from gnoboot — so the timing,
+pixel-DTO and PHY-lane-**rate** reads are NOT comparable (a delta there is resolution, not DVI-vs-HDMI). The
+four findings above are all categorical and survive the mismatch.
+
+**▶ THE CLEAN NEXT EXPERIMENT (now unblocked by finding 1):** get the PHY block at *matched* resolution, both
+1440p: (a) extend agnos's own `HDMI_AUDIO_DUMP` to read the `0x5Dxx` block on its inherited 1440p-DVI pipe
+(safe now); (b) run `gop-dvi-dump.py` under a *normal amdgpu boot with a tone playing* for the 1440p-HDMI PHY
+values (the existing capture does not reach this block). Diff = what a cold HDMI modeset does to the PHY, one
+variable. **Predicted-but-unverified:** at 241.5 MHz TMDS (< the 340 MHz HDMI scrambling threshold) DVI and
+HDMI should use an *identical* PHY, so if the two PHY blocks match, the modeset thesis is **falsified** and the
+deficit is purely the DIG data-island path — a software bug, not a modeset. If they differ, the diff is the
+sovereign modeset's exact target list. Either outcome is decisive and costs no agnos burn.
+
 ## CURRENT STATUS (2026-07-19, HEAD 1.55.24) — read this first
 
 Audio slice of Thrust P (display). **A0–A3 ✅ DONE + PROVEN ON IRON. A4 (audio egress) is OPEN.**
@@ -81,7 +179,14 @@ uncaptured PHY-blanking burns in the 1.55.23 window tore down and re-established
 silent baseline and the arming burn** — sink amp/mute/mode state is **sink-latched**, and every agnos
 instrument is source-side and cannot see it.
 
-**THE REMAINING GAP — the PAYLOAD is DIGITAL SILENCE (noise floor), not the tone.** The amp is on and receiving
+**⚠⚠ RETRACTED 2026-07-19 — "THE PAYLOAD IS DIGITAL SILENCE" IS FALSE AND CONTRADICTS OUR OWN CALIBRATED
+INSTRUMENT.** The tap-identity experiment established that digital silence reads **exactly `0x000000` at BOTH
+taps**. Burn 11 reads `249f2f` / `b9b93c`. ⟹ **CONTENT SURVIVES TO THE LAST OBSERVABLE STAGE.** There is no
+zeroing bug between formatter and wire to hunt — do not go looking for one. The surviving caveat is narrower
+and different: the CRC taps are **amplitude-blind below about −48 dB**, so non-zero does not prove *audible
+level*. Level/scale is a live hypothesis; "the samples are zeros" is not. — *superseded text follows:*
+
+**~~THE REMAINING GAP — the PAYLOAD is DIGITAL SILENCE (noise floor), not the tone.~~** The amp is on and receiving
 a valid, all-zeros stream. Samples are non-zero at the AFMT formatter (crc 9e490d/7d9f3), HDA DMA runs
 (lpib=16984), AZ_LPIB advances — so the sample content is being dropped/zeroed between the formatter and the
 wire, OR the feed never fills instance-1's ring audibly. **We crossed from "sink ignores us" to "sink receives

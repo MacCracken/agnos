@@ -5,7 +5,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.27] — 2026-07-20 — A4: the register-*value* class is fully exhausted; the ACR/CTS path is the first lever to reach the wire
+
+A consolidation cut for the A4 (HDMI-audio) sub-arc. No sound yet, but two genuine advances that reshape the
+search, both from **read-only** work that cost zero risk to the dev box.
+
+**★ THE MODESET / PHY THESIS IS FALSIFIED.** Two matched-1440p read-only DCN dumps (`gop-dvi-dump.py`, run
+under Linux) plus a comprehensive 40-register agnos-vs-amdgpu diff proved the **PHY / RDPCS block is
+byte-identical** between agnos's inherited DVI pipe and amdgpu's HDMI-playing pipe — as expected for a
+241.5 MHz link (below the 340 MHz HDMI scrambling threshold, DVI and HDMI use the same PHY). **The sovereign
+cold-modeset and the console-blanking ATOM transmitter `#76` were never the answer.** Also settled read-only:
+the `0x5Dxx` PHY domain is read-safe for agnos; the live link is DIG1; the correct transmitter phyid is 1, not
+the 0 agnos was passing.
+
+**★ THE ACR/CTS PATH IS THE FIRST CHANGE TO MOVE THE OUTPUT.** The last register-value delta —
+`HDMI_ACR_CTS_48/44/32_0`, which agnos left 0 and amdgpu programs — was burned (`#ifdef HDMI_ACR_CTS`,
+`BURN_HDMI_ACR_CTS`). Still silent, so the register-*value* class is now **completely** exhausted. But it was
+not inert: forcing amdgpu's literal `0x3AF5C000` (241500) **zeroed the tap-1 formatter output** (both taps
+carried content before) and shifted `HDMI_ACR_STATUS_0`. The months-old "inert under `ACR_SOURCE=0`"
+assumption is **false** — the CTS reaches the formatter. Likely mechanism, and it is directional: agnos's real
+pixel clock is **241503**, so forcing a 241500 CTS created a CTS/TMDS mismatch that broke sample alignment.
+**Next agnos burn: program CTS to agnos's OWN measured clock, not amdgpu's number** — the first lever that
+demonstrably reaches the wire. `HDMI_ACR_CTS` stays gated **off** (241500 made an instrument worse).
+
 ### Added
+
+- Shutdown arc **bite 11** — the metered HDMI-audio teardown ladder (`gpu_hdmi_audio_disable()`,
+  `#ifdef BURN_AUDIO_TEARDOWN`, default off): six labelled rungs that double as an A4 diagnostic (which rung
+  pops the amp). Completes the 1.55.x shutdown ladder (bites 1–10 iron-validated at 1.55.25/1.55.26).
+- `HDMI_ACR_CTS` build flag + `BURN_HDMI_ACR_CTS` profile (see above).
+- `agnosticos/scripts/gop-dvi-dump.py` — read-only DCN register dump, GOP-DVI and (`--under-amdgpu`)
+  HDMI-playing modes; the tool behind the PHY-thesis falsification.
+
+### Changed
+
+- **`DCCG_AUDIO_DTO0_MODULE`** now writes amdgpu's literal `0x24D998` (agnos derived `0x24d9b2`, ~10.8 ppm off)
+  — closing the one benign audio-DTO delta.
+- **Retracted three misidentified prior-art attributions** (docs + `gpu.cyr` comments): the "SYMCLKA `0x159`"
+  registers are `DPPCLK*_DTO_PARAM`, not symbol clocks (amdgpu writes zero SYMCLK regs in the whole capture);
+  the "transmitter-PHY sequence" capture is HUBP page-flip traffic (never replay it); and "the payload is
+  digital silence" contradicts the calibrated CRC taps — content survives to the last observable stage.
 
 - **Shutdown arc bite 11 — the HDMI audio teardown, as a METERED LADDER**
   (`gpu_hdmi_audio_disable()` in `gpu.cyr`, `#ifdef BURN_AUDIO_TEARDOWN`, **DEFAULT OFF**). Closes the ladder.

@@ -1,11 +1,19 @@
-# `sys_reboot()` is nullary but agnos syscall #13 now takes four arguments
+# `sys_reboot()` is nullary but agnos syscall #13 now takes four arguments — OPEN
 
-**Filed**: 2026-07-19 · **Reporter**: agnos (kernel 1.55.25+) · **Severity**: medium — no crash today, but the
-stale wrapper is a live foot-gun aimed at a power-control syscall.
+**Discovered:** 2026-07-19 while building the **agnos** 1.55.x shutdown arc (orderly
+filesystem flush + device quiesce + platform reset / ACPI S5 soft-off, both iron-validated
+on the AMD Zen dev box).
+**Severity:** Medium — hard mismatch with a known workaround already shipping. No crash
+today, because agnos's magic-token gate makes stale callers fail closed by design, but the
+stdlib wrapper can no longer reach the syscall it names, and the consumer workaround is to
+bypass the stdlib entirely.
+**Affects:** `lib/syscalls_x86_64_agnos.cyr` (all versions to date; observed on cycc
+**6.4.67**). agnos kernel **1.55.25+**.
 
-Cross-filed in both repos per the agnos↔cyrius issue convention:
-- `cyrius/docs/development/issues/2026-07-19-sys-reboot-nullary-vs-agnos-4arg-abi.md` (this file)
-- `agnos/docs/development/issues/2026-07-19-sys-reboot-nullary-vs-agnos-4arg-abi.md`
+**⚠ NOT A CYRIUS BUG.** `syscall()`'s pop-exactly-what-the-call-site-names behavior is
+working as designed, and the wrapper was accurate when written. This is **agnos changing an
+ABI underneath a stdlib wrapper**; it is filed here only because the wrapper lives here.
+Cross-filed at `agnos/docs/development/issues/` per the agnos↔cyrius convention.
 
 ## Summary
 
@@ -16,11 +24,31 @@ var SYS_REBOOT = 13;                            # reboot() -> halts
 fn sys_reboot(): i64 { return syscall(SYS_REBOOT); }
 ```
 
-That matched the old kernel, where #13 was effectively a stub — it printed a line and called `arch_halt()`.
+That matched the old kernel, where #13 was effectively a stub — it printed a line and
+called `arch_halt()`. agnos 1.55.25 replaced it with a real implementation whose signature
+is `reboot(magic1, magic2, cmd, arg)`. The nullary wrapper can no longer express a valid
+call, so the only correct way to reach agnos power control from Cyrius userland today is to
+bypass the stdlib and call by raw number.
 
-**agnos 1.55.25 replaced it with a real implementation** that runs an orderly shutdown (filesystem flush,
-device quiesce across storage/net/USB/audio/GPU, then platform reset or ACPI S5 soft-off). The new signature
-is:
+## Reproduction
+
+Any `--agnos` build calling the stdlib wrapper, against agnos ≥ 1.55.25:
+
+```cyrius
+sys_reboot();       # compiles; kernel returns -1 and does nothing
+```
+
+The cyrius `syscall()` builtin pops exactly the argument registers the **call site** names,
+so a nullary `syscall(13)` leaves `rdi`/`rsi`/`rdx` holding whatever the caller happened to
+have there. The kernel sees garbage in the magic/cmd slots, rejects it, and returns `-1`.
+
+Expected: a reboot, or a compile-time signature mismatch.
+Actual: silent no-op return.
+
+## Root cause
+
+Not a defect — a stale wrapper signature. agnos's `#13` handler now reads four arguments
+(`kernel/core/power.cyr`, `power_sys()`; dispatch row in `kernel/core/syscall.cyr`):
 
 ```
 reboot(magic1, magic2, cmd, arg)
@@ -29,62 +57,49 @@ reboot(magic1, magic2, cmd, arg)
     cmd    = 1 halt | 2 power off | 3 reboot
 ```
 
-## Why this is worth fixing rather than ignoring
+The magic pair exists **specifically** to make stale nullary callers fail closed rather
+than reset the machine on register garbage — the same rationale as Linux's `reboot(2)`
+magics. So the current mismatch is inert, not dangerous.
 
-The cyrius `syscall()` builtin pops exactly the argument registers the **call site** names. A nullary
-`syscall(13)` therefore leaves `rdi`/`rsi`/`rdx` holding **whatever the caller happened to have there** — so
-every already-compiled consumer of `sys_reboot()` now delivers garbage into a syscall that can power off the
-machine.
+## Proposed fix
 
-agnos deliberately guards against this rather than trusting callers: the magic pair exists precisely so that
-garbage **fails closed** (returns `-1`, does nothing). This is the same reason Linux's `reboot(2)` carries
-magic numbers, and it means **there is no correctness emergency** — a stale caller is inert, not dangerous.
-
-But the wrapper is still wrong, and the current situation is that the only correct way to reach agnos's
-power control from Cyrius userland is to bypass the stdlib and call by raw number. agnoshi 1.8.5 does exactly
-that today:
+Widen the agnos wrapper and export the constants, so consumers stop hand-rolling them:
 
 ```cyrius
-syscall(13, 0x50575231, 0x50575232, 3, 0);   # reboot
-```
-
-That works, but every consumer re-deriving the magic constants is how they end up mistyped somewhere.
-
-## Requested change
-
-Widen the agnos wrapper to the four-argument form, and expose the constants so callers do not hand-roll them:
-
-```cyrius
-var SYS_REBOOT   = 13;
-var PWR_MAGIC1   = 0x50575231;   # "PWR1"
-var PWR_MAGIC2   = 0x50575232;   # "PWR2"
-var PWR_HALT     = 1;
-var PWR_OFF      = 2;
-var PWR_REBOOT   = 3;
+var SYS_REBOOT = 13;
+var PWR_MAGIC1 = 0x50575231;   # "PWR1"
+var PWR_MAGIC2 = 0x50575232;   # "PWR2"
+var PWR_HALT   = 1;
+var PWR_OFF    = 2;
+var PWR_REBOOT = 3;
 
 fn sys_reboot(magic1, magic2, cmd, arg): i64 {
     return syscall(SYS_REBOOT, magic1, magic2, cmd, arg);
 }
 ```
 
-Convenience wrappers (`sys_power_off()`, `sys_power_reboot()`) would be welcome but are not required — the
-constants are the part that matters, since those are what get miscopied.
+The **constants are the part that matters** — those are what get miscopied. Convenience
+wrappers (`sys_power_off()`, `sys_power_reboot()`) would be welcome but are not required.
 
-## Compatibility note
+⚠ This is a **breaking signature change** to an existing wrapper. Blast radius looks empty
+in practice — the old wrapper only ever halted, so there is little reason for existing code
+to call it — but worth a `grep` across the ecosystem before landing.
 
-This is a **signature change to an existing wrapper**, so it is a breaking change for anything calling
-`sys_reboot()` today. In practice the blast radius looks empty: the old wrapper only ever halted, so there is
-little reason for existing code to call it. Worth a `grep` across the ecosystem before landing.
+## Consumer-side workaround (shipping now)
 
-## Not a cyrius bug
+agnoshi **1.8.5** calls by raw number from its `reboot` / `poweroff` / `halt` builtins:
 
-To be explicit: nothing here is cyrius behaving incorrectly. `syscall()`'s pop-what-you-name behavior is
-working as designed, and the wrapper was accurate when written. This is **agnos changing an ABI underneath a
-stdlib wrapper**, and the follow-up belongs on the cyrius side only because that is where the wrapper lives.
+```cyrius
+syscall(13, 0x50575231, 0x50575232, 3, 0);   # 3 = reboot, 2 = power off, 1 = halt
+```
+
+This works and is the correct call shape until the wrapper is widened. The cost of leaving
+it is that every consumer re-derives the magic constants by hand, which is how they end up
+mistyped somewhere.
 
 ## References
 
 - agnos `kernel/core/power.cyr` — `power_sys()`, the magic gate and command codes
 - agnos `kernel/core/syscall.cyr` — the `#13` dispatch row
-- agnos `CHANGELOG.md` 1.55.25 (reset ladder + the #13 rebuild) and 1.55.26 (ACPI S5 soft-off)
-- agnoshi 1.8.5 — `reboot` / `poweroff` / `halt` builtins, the current raw-number caller
+- agnos `CHANGELOG.md` **1.55.25** (reset ladder + the `#13` rebuild), **1.55.26** (ACPI S5 soft-off)
+- agnoshi **1.8.5** — the current raw-number caller

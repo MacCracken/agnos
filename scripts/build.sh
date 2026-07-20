@@ -297,6 +297,11 @@ else
         # sink-side instrument, and this ladder exists to ask WHICH RUNG produces it.
         # A pop at the SD_RUN rung would falsify "the payload is digital silence".
         [ -n "$BURN_AUDIO_TEARDOWN" ] && echo '#define BURN_AUDIO_TEARDOWN'
+        # HDMI_ACR_CTS=1 — program the HDMI ACR CTS registers (48/44/32_0) to amdgpu's literal 0x3AF5C000
+        # (241500). The one real register-value delta in the full agnos-vs-amdgpu diff: agnos left them 0.
+        # In the audio-clock-regeneration path — the exact mechanism for a sink that receives a stream but
+        # decodes clean silence. Display-safe (audio only). Requires HDA_HDMI.
+        [ -n "$HDMI_ACR_CTS" ]       && echo '#define HDMI_ACR_CTS'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

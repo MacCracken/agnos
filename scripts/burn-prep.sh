@@ -49,7 +49,17 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_HDMI_SYMCLK_AB:-}" ]; then
+if [ -n "${BURN_HDMI_ACR_CTS:-}" ]; then
+    # THE ACR CTS BURN — the one real register-value delta left after the whole register class was exhausted
+    # (PHY included, 2026-07-20). agnos left HDMI_ACR_CTS_48/44/32_0 at 0; the amdgpu-playing capture writes
+    # 0x3AF5C000 (241500) to all three. The CTS/N ratio is what the sink uses to regenerate its audio clock —
+    # the exact mechanism between "amp armed + receiving our stream" and "decodes as CLEAN silence". agnos was
+    # deliberately NOT writing them ("inert under SOURCE=0"); but amdgpu writes them WITH SOURCE=0, and this
+    # register was never tested on this silicon. Display-safe (audio only, no PHY/PLL/OTG). Single variable.
+    echo "[2/2] Building the ACR-CTS kernel (HDA_HDMI + HDA_TONE + HDMI_ACR_CTS + HDMI_AUDIO_DUMP: program the ACR CTS registers to amdgpu's 241500; LISTEN for the tone)."
+    BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ACR_CTS=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ACR_CTS+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_HDMI_SYMCLK_AB:-}" ]; then
     # THE ATTRIBUTION CONTROL BURN. 1.55.24 wrote the five DCCG symbol-clock stores blind and the burn was
     # written up as "SYMCLKA ARMED THE SINK". The re-audit killed that read: the symbol clock is ALREADY ON in
     # every silent burn (DIG_SYMCLK_FE_ON/BE_ON both ack SET, identical across all eight logs), the shutdown
@@ -219,6 +229,7 @@ case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; 
 # the flag's own #ifdef, in a function called unconditionally, so it satisfies verify_marker's own rule.
 case "$BUILD_TAG" in *HDMI_DCCG*)        verify_marker "hdmi DCCG symclk re-prime" ;; esac
 case "$BUILD_TAG" in *HDMI_SYMCLK_AB*)   verify_marker "symclk-ab: in-boot A/B" ;; esac
+case "$BUILD_TAG" in *HDMI_ACR_CTS*)     verify_marker "hdmi acr cts programmed" ;; esac
 case "$BUILD_TAG" in *ATOM_DRY*)         verify_marker "atom: DRY build (no MMIO)" ;; esac
 case "$BUILD_TAG" in *HDMI_ATOM*)        verify_marker "atom: running DIGxEncoderControl" ;; esac
 

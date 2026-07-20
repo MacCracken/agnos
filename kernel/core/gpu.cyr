@@ -2969,10 +2969,25 @@ fn gpu_hdmi_audio_enable() {
     # MODULE = the live pixel clock in 100 Hz units (this is what P3b-i derived); PHASE = a constant 24 MHz.
     # The sample rate NEVER enters either: Fs comes from the HDA converter format, and 128*Fs is derived
     # downstream. An Fs-scaled DTO would be a regression.
-    gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE, gpu_pixclk_100hz);
+    # MODULE: use amdgpu's LITERAL, not our live-derived pixel clock. agnos derives
+    # gpu_pixclk_100hz from the OTG and lands 0x24d9b2 where the audibly-playing
+    # amdgpu link reads 0x24d998 — about 10.8 ppm off. Almost certainly inaudible on
+    # its own, but it is the one remaining unexplained delta in the whole DCN audio
+    # register file, and "byte-matched to the working path" is worth more than a
+    # derivation we like better. Display-safe: audio DTO only.
+    gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_MODULE, 0x24D998);
     gpu_reg32_write(GPU_BASE_DCN_1, GPU_R_DCCG_AUDIO_DTO0_PHASE,  GPU_DCCG_AUDIO_DTO_PHASE_VAL);
 
-    # --- 3b. DCCG symbol-clock re-prime (HDMI_DCCG) — the host-visible DCCG writes amdgpu makes for HDMI that
+    # --- 3b. ⚠⚠ MISIDENTIFIED REGISTERS — RETRACTED 2026-07-19. THIS BLOCK IS NOT "SYMCLK".
+    # abs 0x159-0x15C are DPPCLK0..3_DTO_PARAM and abs 0x176 is DPPCLK_DTO_CTRL — display-pipe clock DTO
+    # parameters, NOT symbol-clock enables. The real SYMCLKA_CLOCK_ENABLE is abs 0x160, and amdgpu writes
+    # ZERO SYMCLK registers anywhere in the modeset capture this block claimed to be derived from. So the
+    # comment below was wrong twice over: wrong register identity, and wrong about amdgpu doing it at all.
+    # The in-boot A/B at 1.55.24 had already falsified the block BEHAVIOURALLY (writes land, sound unchanged);
+    # this is the register-identity half of the same retraction. The block is retained only because it is
+    # harmless and #ifdef'd off by default — it is NOT a lead and must not be revived.
+    # --- superseded comment follows ---
+    # DCCG symbol-clock re-prime (HDMI_DCCG) — the host-visible DCCG writes amdgpu makes for HDMI that
     # agnos omitted. GROUND TRUTH: agnosticos/docs/development/prior-art/amdgpu-hdmi-modeset-writes-0717.txt,
     # replug window t=33338.x. SYMCLKA (abs dword 0x159) is DIG1's PHY symbol clock: DIG1 routes to UNIPHYA
     # (phyid=0, A1-confirmed), and amdgpu set 0x159 ACTIVE with its own HDMI on the SAME DIG1 (its AVI infoframe
@@ -3177,9 +3192,29 @@ fn gpu_hdmi_audio_enable() {
     # ACR_SELECT is cleared above, which is hardware rate auto-select: the hardware picks the N/CTS pair from
     # the incoming Fs. tonegen is locked to 48 kHz so the 48 pair is the live one and it is correct — but the
     # 32 and 44.1 pairs are silence the moment anything plays at those rates. amdgpu writes all six. All three
-    # N fields share the same [19:0] mask. The CTS registers stay unwritten deliberately: they are inert under
-    # HDMI_ACR_SOURCE=0 (hardware-measured CTS), and our PIT-derived clock would write 241502 where the
-    # known-good value is 241500 — writing them would open a divergence rather than close one.
+    # N fields share the same [19:0] mask.
+    #
+    # THE CTS REGISTERS (HDMI_ACR_CTS_48/44/32_0): the ONE real register-value delta in the whole 40-register
+    # agnos-vs-amdgpu diff (2026-07-20). agnos left them 0; the amdgpu-playing capture writes 0x3AF5C000 to all
+    # three. The old reasoning for leaving them 0 was "inert under HDMI_ACR_SOURCE=0, and our measured 241502
+    # would diverge from the known-good 241500" — but that has a hole: amdgpu programs 0x3AF5C000 (241500) WITH
+    # SOURCE=0, so (a) the divergence argument dies if we write amdgpu's LITERAL rather than our measurement,
+    # and (b) "inert per spec" was never tested on THIS silicon. The CTS/N ratio is exactly what a sink uses to
+    # regenerate its audio clock — the precise mechanism between "amp armed + receiving stream" and "decodes as
+    # clean silence" (a sink that cannot lock its audio clock outputs silence, not hash). This is the untested
+    # register in the exact failure path. Gated so it is a clean single-variable burn.
+    #ifdef HDMI_ACR_CTS
+    var cts48 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d,
+    (cts48 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
+    var cts44 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d,
+    (cts44 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
+    var cts32 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d,
+    (cts32 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
+    kprintln("gpu: hdmi acr cts programmed (241500, amdgpu-match)", 51);
+    #endif
     var n32 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d,
     (n32 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_32_VAL);
