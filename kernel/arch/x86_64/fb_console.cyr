@@ -62,6 +62,12 @@ var fb_console_ready = 0;
 var fb_shadow = 0;
 var fb_shadow_size = 0;  # bytes reserved (n * 2 MB); 0 until fb_shadow_init succeeds
 
+# P4 console-redirect (2026-07-20): 0 = paint the GOP framebuffer (default, unchanged). Nonzero = paint THIS
+# agnos-owned linear buffer instead, which the GPU scanout has been re-pointed at. The GOP's own console
+# surface bands on this box (register-truth proved it's surface-specific, not scan-geometry — an agnos buffer
+# scans band-free); redirecting fb_console's paint base to that buffer is the fix. Set via fb_set_scanout_base.
+var fb_scanout_base = 0;
+
 # Write one byte to the CMOS extended bank (slots 0x80..0xFF, addressed
 # via port pair 0x72=index / 0x73=data). The hardware index is the
 # logical slot minus 0x80 per the CC fix 2026-05-17 documented in
@@ -332,6 +338,18 @@ fn fb_fb_phys() {
     if (bi == 0) { return 0; }
     return load64(bi + 0x48);
 }
+# fb_draw_base — where fb_console PAINTS. Same as fb_fb_phys (the GOP FB) until the P4 console-redirect points
+# it at an agnos-owned buffer. Only the paint sites use this; WC-remap / fault-bar / P0 diag keep fb_fb_phys.
+# The shadow stays consistent automatically: sh_delta = fb_shadow - fb is recomputed from this same base.
+fn fb_draw_base() {
+    if (fb_scanout_base != 0) { return fb_scanout_base; }
+    return fb_fb_phys();
+}
+# fb_set_scanout_base — the redirect switch (called from gpu_scanout_redirect once scanout is re-pointed).
+fn fb_set_scanout_base(b) {
+    fb_scanout_base = b;
+    return 0;
+}
 fn fb_pitch() {
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
@@ -374,7 +392,7 @@ fn fb_pf() {
 # repainted on every low-frequency net syscall, so a scroll flush that transiently
 # clears it is immediately corrected by the next paint. Deliberately not mirrored.
 fn fb_dbg_beacon(code) {
-    var fb = fb_fb_phys();
+    var fb = fb_draw_base();
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var w = fb_width();
@@ -560,7 +578,7 @@ fn fb_winsize() {
 # Used by scroll bottom-row clear and backspace; not by glyph render
 # (which interleaves FG/BG per font bit).
 fn fb_fill_cell(cell_x, abs_y, color) {
-    var fb = fb_fb_phys();
+    var fb = fb_draw_base();
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var width = fb_width();
@@ -595,7 +613,7 @@ fn fb_fill_cell(cell_x, abs_y, color) {
 # was previously leaving untouched. Copy is byte-stable either way; the
 # bottom-row clear specifically needs the pitch extent.
 fn fb_scroll_up() {
-    var fb = fb_fb_phys();
+    var fb = fb_draw_base();
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var height = fb_height();
@@ -677,7 +695,7 @@ fn fb_ansi_p(i) {
 # cursor. Backs `ESC[2J`. Mirrors fb_console_init's clear loop but packs the
 # current bg into the u64 block-store (black today → 0, identical to before).
 fn fb_console_clear() {
-    var fb = fb_fb_phys();
+    var fb = fb_draw_base();
     if (fb == 0) { fb_cur_x = 0; fb_cur_y = 0; return 0; }
     var pitch = fb_pitch();
     var height = fb_height();
@@ -838,7 +856,7 @@ fn fb_putc(ch) {
     # ANSI/CSI interception (1.43.1): consume ESC + CSI bytes (colour, clear,
     # cursor). Returns 1 when the byte was part of a sequence → nothing to draw.
     if (fb_ansi_feed(ch) == 1) { return 0; }
-    var fb = fb_fb_phys();
+    var fb = fb_draw_base();
     if (fb == 0) { return 0; }
     var pitch = fb_pitch();
     var width = fb_width();

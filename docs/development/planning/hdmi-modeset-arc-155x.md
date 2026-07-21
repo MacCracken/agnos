@@ -63,6 +63,30 @@ a bare-metal-environment bug (b/c above) — bisect in Python, no modeset, no bu
 bring a DVI-parked pipe to audio; the cold-modeset EDGE (not the PHY) is structurally required, and it can be
 developed entirely in Python where a blank costs a power cycle.** Either outcome ends the guessing.
 
+## ▶▶▶▶ THE REGISTER-*OFFSET* CLASS IS ALSO CLEAN — the audio block has no `0x607`-style mislabel (2026-07-20)
+
+Companion to the value-class exhaustion above, closing the one blind spot it had. The P4 display bug was
+a **wrong offset** (`0x607` labeled `SURFACE_PITCH` but really `EARLIEST_INUSE_C`; real pitch `0x603`),
+and the A4 "byte-identical to amdgpu-playing" diff **could never have caught the same class in the audio
+block**: `agnosticos/scripts/dump-dcn-audio.py` hardcodes the *same* offsets as `gpu_regs.cyr` and reads
+them on both sides, so a mislabel reads the same wrong register twice → byte-match → invisible. The
+value-diff inherited agnos's labels; it never validated them.
+
+An **independent** diff of every audio-block offset in `gpu_regs.cyr` against the canonical headers
+(`dcn_2_1_0_offset.h` + `dce_11_0_d.h`, Linux v6.6, `curl`'d raw — the two sources agnos's provenance
+comments already cite) came back **105/105 correct, 0 mismatch**, BASE_IDX correct throughout (DIG/AFMT/
+HDMI/AZ/DMCUB = 2, DCCG audio-DTO/pixel-rate = 1). That includes **every transmission-gating register the
+hypothesis named** (`DIG_FE_CNTL 0x2068`, `DIG_BE_CNTL 0x20af`, `DIG_BE_EN_CNTL 0x20b0`, `AFMT_STATUS
+0x20a9`, `HDMI_AUDIO_PACKET_CONTROL 0x2073`, `HDMI_ACR_PACKET_CONTROL 0x2074`, `HDMI_ACR_48/44/32_*`) **and
+the current #1 payload suspect** — the DCCG audio-DTO read-clock block (`0xab–0xaf`). Corroborated by iron
+reads that only parse if the offset is right (`DP_DTO_MODULO 0x82` = DPREFCLK 598.875 MHz; `DIG_FE_CNTL` /
+`AFMT_STATUS` byte-match amdgpu; the `HDMI_ACR_STATUS_0` CTS counter tracks the pixel clock).
+
+**⟹ The audio silence is not a mislabeled register any more than it is a wrong register value.** No
+`gpu_regs.cyr` change is warranted; the offset axis is retired. This *reinforces* the arc conclusion (the
+gap is the real HDMI modeset / sequencing, not a register). Full method + 105-row table + header hashes:
+`agnosticos/docs/development/prior-art/dcn-audio-register-offset-audit-0720.md`.
+
 ## ▶▶▶ GOP-DVI READ-ONLY DUMP (2026-07-20) — FOUR THINGS SETTLED, ZERO BURNS, ZERO RISK
 
 Read `agnosticos/scripts/gop-dvi-dump.py` output at

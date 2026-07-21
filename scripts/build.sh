@@ -302,11 +302,20 @@ else
         # In the audio-clock-regeneration path — the exact mechanism for a sink that receives a stream but
         # decodes clean silence. Display-safe (audio only). Requires HDA_HDMI.
         [ -n "$HDMI_ACR_CTS" ]       && echo '#define HDMI_ACR_CTS'
-        # SCANOUT_LINEAR=1 — P4 scanout-residue clear: if the GOP left the console surface tiled (SW_MODE!=0),
-        # clear it to linear + re-latch so fb_console's linear writes stop banding. Display-safe (cannot hang;
-        # worst case a mis-drawn screen a reboot clears). The read-only diagnostic runs unconditionally; this
-        # flag enables the WRITE. Promote to default-on once iron confirms the residue is gone.
+        # SCANOUT_LINEAR=1 — ⚠ RETIRED (v3): wrote the WRONG register (0x607) under the OTG lock and BLACKED the
+        # box on iron. gpu_scanout_clear_tiling is now a no-op. Do NOT use this flag; kept for the source gate only.
         [ -n "$SCANOUT_LINEAR" ]     && echo '#define SCANOUT_LINEAR'
+        # SCANOUT_PATTERN=1 — P4 bisector (register-truth 2026-07-20): flip scanout to an agnos-owned buffer
+        # painted with bars/stripes/checker via the P0-verified address flip ONLY (zero hang risk — byte-identical
+        # to gpu_blit_present). A photo splits the banding into scan-geometry (sheared) vs surface-content (crisp).
+        # The corrected read-only 0x603/0x609 diagnostic rides in EVERY build regardless of this flag.
+        [ -n "$SCANOUT_PATTERN" ]    && echo '#define SCANOUT_PATTERN'
+        # SCANOUT_REDIRECT=1 — THE P4 FIX: redirect fb_console onto the agnos buffer the pattern proved scans
+        # band-free, via the P0-verified address flip (zero hang risk). The console text is the oracle: legible.
+        [ -n "$SCANOUT_REDIRECT" ]   && echo '#define SCANOUT_REDIRECT'
+        # SCANOUT_REGDUMP=1 — read-only dump of the live-pipe HUBP register block to klug, to re-anchor the real
+        # pitch/viewport offsets against known geometry (the surface is scaled ~800x600→2560x1440). Pure reads.
+        [ -n "$SCANOUT_REGDUMP" ]    && echo '#define SCANOUT_REGDUMP'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

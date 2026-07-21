@@ -49,15 +49,32 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_SCANOUT_LINEAR:-}" ]; then
-    # P4 — SCANOUT-RESIDUE CLEAR. The read-only diagnostic (does the GOP leave the console surface tiled?)
-    # runs unconditionally; this build ALSO enables the fix: clear HUBP SW_MODE to linear + re-latch so
-    # fb_console's linear writes stop banding. Display-safe (cannot hang; worst case a mis-drawn screen a
-    # reboot clears). ⚠ THE RESIDUE ONLY REPRODUCES WITH BIOS QUIET-BOOT ON — if quiet-boot is off (the old
-    # workaround), the diagnostic will log "scanout surface is linear" and there is nothing to fix.
-    echo "[2/2] Building the P4 scanout-linear kernel (SCANOUT_LINEAR: clear tiling + re-latch; needs BIOS quiet-boot ON to reproduce the residue; LOOK at first-paint legibility)."
-    BUILD_ENV="SCANOUT_LINEAR=1"
-    BUILD_TAG="SCANOUT_LINEAR"
+if [ -n "${BURN_SCANOUT_REGDUMP:-}" ]; then
+    # P4 — READ-ONLY HUBP register dump. The surface is scaled (~800x600 → 2560x1440); the derived HUBP offsets
+    # are unreliable, so dump the live-pipe HUBP block to klug to re-anchor the real pitch/viewport offsets.
+    # Pure reads — cannot hang, cannot black. ⚠ CAPTURE: klug > regdump.txt from the shell, send the file.
+    echo "[2/2] Building the P4 HUBP REGDUMP kernel (SCANOUT_REGDUMP: read-only register dump to klug; capture klug > regdump.txt)."
+    BUILD_ENV="SCANOUT_REGDUMP=1"
+    BUILD_TAG="SCANOUT_REGDUMP"
+elif [ -n "${BURN_SCANOUT_REDIRECT:-}" ]; then
+    # P4 — THE FIX. The pattern burn proved an agnos-owned buffer scans BAND-FREE while the GOP console surface
+    # bands (surface-specific, not scan-geometry). This redirects fb_console onto that buffer via the P0-verified
+    # address flip ONLY (zero hang risk). ⚠ ORACLE = the CONSOLE ITSELF: is the boot log + shell prompt LEGIBLE
+    # (bands gone)? Yes ⟹ P4 closed. Needs BIOS quiet-boot ON (the banded condition).
+    echo "[2/2] Building the P4 console-REDIRECT kernel (SCANOUT_REDIRECT: fb_console onto the clean agnos buffer; LOOK at first-paint legibility; quiet-boot ON)."
+    BUILD_ENV="SCANOUT_REDIRECT=1"
+    BUILD_TAG="SCANOUT_REDIRECT"
+elif [ -n "${BURN_SCANOUT_PATTERN:-}" ]; then
+    # P4 — SCANOUT BISECTOR (register-truth 2026-07-20). Flips scanout to an agnos-owned buffer painted with
+    # a bars/stripes/checker pattern via the P0-verified address flip ONLY (byte-identical to gpu_blit_present
+    # → ZERO hang risk; the retired SCANOUT_LINEAR path blacked the box by writing the WRONG register 0x607).
+    # ⚠ ORACLE = A PHOTO of the panel: crisp full-width bars + clean fine stripes + clean checker ⟹ the HUBP
+    # scans an agnos linear buffer perfectly ⟹ banding is surface-content (redirect is the fix). Sheared /
+    # garbled fine detail ⟹ a real scan-geometry fault (fix the VERIFIED 0x603). Also reads the corrected
+    # 0x603 pitch to klug during boot (before the flip). Needs BIOS quiet-boot ON to match the banded case.
+    echo "[2/2] Building the P4 scanout-PATTERN kernel (SCANOUT_PATTERN: address-flip bisector; PHOTO the bars/stripes/checker; quiet-boot ON)."
+    BUILD_ENV="SCANOUT_PATTERN=1"
+    BUILD_TAG="SCANOUT_PATTERN"
 elif [ -n "${BURN_HDMI_ACR_CTS:-}" ]; then
     # THE ACR CTS BURN — the one real register-value delta left after the whole register class was exhausted
     # (PHY included, 2026-07-20). agnos left HDMI_ACR_CTS_48/44/32_0 at 0; the amdgpu-playing capture writes
@@ -239,7 +256,9 @@ case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; 
 case "$BUILD_TAG" in *HDMI_DCCG*)        verify_marker "hdmi DCCG symclk re-prime" ;; esac
 case "$BUILD_TAG" in *HDMI_SYMCLK_AB*)   verify_marker "symclk-ab: in-boot A/B" ;; esac
 case "$BUILD_TAG" in *HDMI_ACR_CTS*)     verify_marker "hdmi acr cts programmed" ;; esac
-case "$BUILD_TAG" in *SCANOUT_LINEAR*)   verify_marker "scanout-linear fix armed" ;; esac
+case "$BUILD_TAG" in *SCANOUT_PATTERN*)  verify_marker "scanout pattern probe armed" ;; esac
+case "$BUILD_TAG" in *SCANOUT_REDIRECT*) verify_marker "console redirected to agnos scanout buffer" ;; esac
+case "$BUILD_TAG" in *SCANOUT_REGDUMP*)  verify_marker "HUBP regdump begin" ;; esac
 case "$BUILD_TAG" in *ATOM_DRY*)         verify_marker "atom: DRY build (no MMIO)" ;; esac
 case "$BUILD_TAG" in *HDMI_ATOM*)        verify_marker "atom: running DIGxEncoderControl" ;; esac
 

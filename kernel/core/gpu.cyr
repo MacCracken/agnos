@@ -2304,16 +2304,42 @@ fn gpu_display_probe() {
             kprint("gpu: display pipe ", 18);
             kprint_num(pipe);
             kprintln(" live (scanout matches framebuffer)", 35);
-            # P4 diagnostic — is the GOP scanout surface tiled? fb_console writes LINEAR, so a non-zero SW_MODE
-            # means the HUBP de-swizzles our linear bytes → the banded-glyph residue. Read-only, safe (same
-            # HUBP block as the surface regs above). Names the root cause before P4's fix touches anything.
-            var swmode = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_TILING_CONFIG + pipe * GPU_DCN_HUBP_STRIDE) & GPU_HUBP_SW_MODE_MASK;
+            # P4 diagnostic (2026-07-20, v3) — the FULL scanout-surface state, ALL to klug (this box is
+            # serial-less, so the old serial-only fb geometry never reached a capture). Read-only, safe (same
+            # HUBP block as the surface regs above). Iron burn 2 proved SW_MODE=0 (surface LINEAR) yet the
+            # console still bands — so the residue is NOT swizzle. "Broken scanlines on a linear surface" =
+            # a PITCH/STRIDE mismatch (HUBP scans at a different stride than fb_console writes) and/or DCC
+            # (compression the GOP left on). This prints all four so the next capture NAMES the cause.
+            var d = pipe * GPU_DCN_HUBP_STRIDE;
+            var swmode = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_TILING_CONFIG + d) & GPU_HUBP_SW_MODE_MASK;
+            var hubp_pitch = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH + d) & 0x3FFF;  # PIXELS
+            var dcc = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURFACE_CONTROL + d) >> 1) & 1;   # PRIMARY_SURFACE_DCC_EN
+            var pixfmt = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_CONFIG + d) & 0x7F;
             gpu_display_swmode = swmode;
-            if (swmode == 0) {
-                kprintln("gpu: scanout surface is linear (no residue expected)", 52);
+            kprint("gpu: scanout sw_mode ", 21);      kprint_num(swmode);
+            kprint(" dcc ", 5);                        kprint_num(dcc);
+            kprint(" hubp_pitch_px ", 15);            kprint_num(hubp_pitch);
+            kprint(" fb_pitch_by ", 13);              kprint_num(fb_pitch());
+            kprint(" pixfmt ", 8);                     kprint_num(pixfmt);
+            kprintln("", 0);
+            # ⚠ hubp_pitch above (0x607) is the WRONG register (EARLIEST_INUSE_C) — the 832/"MISMATCH" it
+            # produced was a phantom. The CORRECTED offsets (register-truth 2026-07-20, anchored on the
+            # HW-verified 0x60A): real DCSURF_SURFACE_PITCH = 0x603, real PRIMARY_ADDR_HIGH = 0x609. Read all
+            # three (0x603 pitch, 0x609 primary-high, 0x60B secondary-high) so THIS burn confirms the mapping
+            # on iron before any write is ever contemplated. Still read-only, same always-clocked HUBP block.
+            var true_pitch = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH_REAL + d) & 0x3FFF;
+            var prim_hi    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_PRIM_ADDR_HI + d) & 0xFFFF;
+            var sec_hi     = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + d) & 0xFFFF;
+            kprint("gpu: reg603 pitch_px ", 21);       kprint_num(true_pitch);
+            kprint(" reg609 prim_hi ", 16);            kprint_num(prim_hi);
+            kprint(" reg60b sec_hi ", 15);             kprint_num(sec_hi);
+            kprintln("", 0);
+            # Honest verdict off the REAL pitch: 0x603*4 == fb stride ⟹ geometry ok (banding is surface-content,
+            # not pitch). Differs (e.g. ~800) ⟹ the 800x600-scaled-surface hypothesis is real; fix targets 0x603.
+            if ((true_pitch * 4) == fb_pitch()) {
+                kprintln("gpu: real pitch 0x603 matches fb stride -- geometry ok, banding is not pitch", 76);
             } else {
-                kprint("gpu: scanout surface is tiled, sw_mode ", 39); kprint_num(swmode);
-                kprintln(" -- linear console writes will band", 35);
+                kprintln("gpu: real pitch 0x603 differs from fb stride -- narrow/scaled surface, fix 0x603", 80);
             }
             return 1;
         }
@@ -2462,8 +2488,19 @@ fn gpu_blit_arm() {
 # HUBP_BLANK write, so the worst case is a torn frame that self-clears or reboots away, never a dead pipe.
 # ⚠ The lock MUST be cleared on every exit path or the pipe freezes on its last frame; the status poll is bounded.
 fn gpu_scanout_clear_tiling() {
+    # ⚠⚠ RETIRED 2026-07-20 — DO NOT RE-ARM. Register-truth (HIGH confidence) proved this whole path is
+    # mis-targeted: 0x607 is EARLIEST_INUSE_C (read-only in-use STATUS), NOT DCSURF_SURFACE_PITCH (real =
+    # 0x603), and 0x60B is SECONDARY_ADDR_HIGH not primary. Writing 2560→0x607 + the address split, committed
+    # atomically under the OTG master update lock, poisoned the surface descriptor → HUBP underflow → BLACK
+    # BOX + wedge on iron (burn #3). The banding was never a pitch fault; the replacement path is the
+    # address-flip pattern probe (gpu_scanout_pattern_probe) which touches ONLY the P0-verified 0x60A/0x60B.
+    # Left as a hard no-op so a stale #ifdef SCANOUT_LINEAR build can never black the box again.
+    kprintln("gpu: scanout_clear_tiling RETIRED (0x607 was wrong reg) -- no-op", 64);
+    return 0;
+}
+
+fn gpu_scanout_clear_tiling_dead() {
     if (gpu_display_ok != 1) { return 0; }
-    if (gpu_display_swmode == 0) { return 0; }          # already linear — nothing to do
 
     var h = gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
     var o = gpu_display_pipe * GPU_DCN_OTG_STRIDE;
@@ -2485,6 +2522,15 @@ fn gpu_scanout_clear_tiling() {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURFACE_CONTROL + h, 0);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_TILING_CONFIG + h, GPU_HUBP_META_LINEAR);
 
+    # 2b. PITCH — the burn-2 lead. The surface is already LINEAR, yet the console still shears, which on a linear
+    #     surface means the HUBP scans a DIFFERENT stride than fb_console writes. fb_console lays glyphs out at
+    #     fb_pitch() BYTES/row; the HUBP must scan exactly fb_pitch()/4 PIXELS/row over that same memory. Force
+    #     the HUBP's DCSURF_SURFACE_PITCH to match the console's actual layout so every row lands where the next
+    #     one begins. (No-op if they already agree; if they don't, this is the fix.)
+    var want_pitch = fb_pitch() / 4;
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH + h, want_pitch & 0x3FFF);
+    kprint("gpu: scanout pitch -> ", 22); kprint_num(want_pitch); kprintln(" px (= fb stride)", 17);
+
     # 3. Re-arm the surface address (HIGH then LOW; LOW is the flip trigger) so the new config commits with a
     #    fresh scanout base, then release the lock — the whole change latches atomically at the next VUPDATE.
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + h, (gpu_display_surf >> 32) & 0xFFFF);
@@ -2493,6 +2539,119 @@ fn gpu_scanout_clear_tiling() {
     gpu_mfence();
     gpu_display_wait_vblank(gpu_display_pipe);
     kprintln("gpu: scanout tiling+dcc cleared to linear (residue fix)", 55);
+    return 1;
+}
+
+# gpu_scanout_pattern_probe — the SAFE, DECISIVE P4 bisector (replaces the retired pitch-write path). Paints a
+# test pattern into an agnos-OWNED linear buffer (gpu_bb_a, full console geometry, cleared) and flips scanout
+# to it using ONLY the two P0-verified address registers (0x60A/0x60B) — byte-identical to gpu_blit_present,
+# the proven DOOM/blit flip. NO pitch/tiling/DCC write, NO OTG lock, NO VUPDATE latch → it cannot black the
+# pipe (worst case a torn frame a reboot clears). Three zones so ONE photo names the fault family:
+#   top    1/3 : 64px horizontal R/G/B bars       — gross vertical stride: wrong pitch ⟹ diagonal shear/repeat.
+#   middle 1/3 : 2px vertical white/black stripes  — high HORIZONTAL freq (glyph-stroke proxy): a tiling/format
+#                fault garbles the fine stripes even when solid bars look clean.
+#   bottom 1/3 : 4px checkerboard                  — 2D high freq.
+# Crisp everywhere ⟹ HUBP scans an agnos linear buffer perfectly ⟹ banding is surface-content (the redirect is
+# the fix, and DOOM/blit#39 ARE band-free on this iron). Sheared/garbled ⟹ a real per-pipe scan-geometry fault
+# an address flip can never fix (then fix the VERIFIED 0x603, never 0x607).
+fn gpu_scanout_pattern_probe() {
+    if (gpu_display_ok != 1) { return 0; }
+    if (gpu_display_pipe < 0) { return 0; }
+    if (gpu_blit_arm() != 1) { return 0; }
+    var pitch = fb_pitch();
+    var height = fb_height();
+    var stride_u64 = pitch / 8;
+    var third = height / 3;
+    var two_third = third + third;
+    var y = 0;
+    while (y < height) {
+        var band = 0;
+        if (y >= third) { band = 1; }
+        if (y >= two_third) { band = 2; }
+        var row = gpu_bb_a_phys + y * pitch;
+        var xi = 0;
+        while (xi < stride_u64) {
+            var c = 0;
+            if (band == 0) {
+                c = 0x00FF0000;                                   # red
+                if ((y / 64) % 3 == 1) { c = 0x0000FF00; }        # green
+                if ((y / 64) % 3 == 2) { c = 0x000000FF; }        # blue
+            }
+            if (band == 1) {
+                if (xi % 2 == 0) { c = 0x00FFFFFF; }              # 2px white / 2px black vertical stripes
+            }
+            if (band == 2) {
+                if (((xi / 2) + (y / 4)) % 2 == 0) { c = 0x00FFFFFF; }  # 4x4 checker
+            }
+            store64(row + xi * 8, (c << 32) | c);
+            xi = xi + 1;
+        }
+        y = y + 1;
+    }
+    gpu_mfence();
+    # Flip scanout to the pattern buffer — ONLY the P0-verified address group (identical to gpu_blit_present).
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_bb_a_mc >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_bb_a_mc & 0xFFFFFFFF);
+    gpu_mfence();
+    gpu_display_wait_vblank(gpu_display_pipe);
+    kprintln("gpu: scanout pattern armed -- read the bars/stripes/checker", 59);
+    return 1;
+}
+
+# gpu_scanout_regdump — READ-ONLY ground-truth dump (2026-07-20). The derived HUBP offsets kept lying (0x607
+# and the register-truth "corrections" 0x603/0x609 all read garbage/0; only 0x60A/0x60B are trustworthy). The
+# pattern-probe thirds proved the real surface is SCALED (~800x600 → 2560x1440), so the pitch/viewport live in
+# HUBP regs at offsets we don't reliably know. Dump the whole HUBP/HUBPREQ block for the live pipe as
+# "rd <offset_dec> <value_dec>" so the values can be matched to the known geometry (2560=0xA00, 1440=0x5A0,
+# 800=0x320, 600=0x258, pitch 10240=0x2800 / 3200=0xC80) and the block RE-ANCHORED for real. Pure reads, safe.
+fn gpu_scanout_regdump() {
+    if (gpu_display_ok != 1) { return 0; }
+    if (gpu_display_pipe < 0) { return 0; }
+    var p = gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    kprintln("gpu: --- HUBP regdump begin (rd offset value, both decimal) ---", 63);
+    var off = 0x5A0;
+    while (off <= 0x640) {
+        var v = gpu_reg32(GPU_BASE_DCN_2, off + p);
+        if (v != 0) {                       # skip zeros to keep the klug ring small; nonzero regs carry the geometry
+            kprint("rd ", 3); kprint_num(off); kprint(" ", 1); kprint_num(v); kprintln("", 0);
+        }
+        off = off + 1;
+    }
+    kprintln("gpu: --- HUBP regdump end ---", 29);
+    return 0;
+}
+
+# gpu_scanout_redirect — THE P4 FIX (2026-07-20). The pattern probe proved an agnos-owned linear buffer scans
+# BAND-FREE while the GOP's own console surface bands (surface-specific, not scan-geometry). So: copy the boot
+# log painted so far into gpu_bb_a, flip scanout to it (address group ONLY — the P0/blit#39-proven flip, zero
+# hang risk), then point fb_console's paint base at gpu_bb_a so ALL further console output lands on the clean,
+# agnos-owned, scanned buffer. No pitch/tiling/DCC write, no OTG lock. The console text itself is the oracle:
+# legible ⟹ P4 closed. ⚠ FIRST-CUT shares gpu_bb_a (fine at boot, before any app); shipping needs a dedicated
+# console slot (gpu_blit_target hands gpu_bb_a/b to full-screen apps) + gpu_display_restore_console re-pointed.
+fn gpu_scanout_redirect() {
+    if (gpu_display_ok != 1) { return 0; }
+    if (gpu_display_pipe < 0) { return 0; }
+    if (gpu_display_surf == 0) { return 0; }
+    if (gpu_blit_arm() != 1) { return 0; }
+    # 1. Seed gpu_bb_a with the console content painted so far (so the redirect doesn't blank the boot log).
+    var src = fb_fb_phys();
+    var bytes = fb_pitch() * fb_height();
+    var q = 0;
+    while (q < bytes) { store64(gpu_bb_a_phys + q, load64(src + q)); q = q + 8; }
+    gpu_mfence();
+    # 2. Flip scanout to the agnos buffer — identical to gpu_blit_present (address group only, cannot hang).
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_bb_a_mc >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_bb_a_mc & 0xFFFFFFFF);
+    gpu_mfence();
+    gpu_display_wait_vblank(gpu_display_pipe);
+    # 3. Redirect fb_console's paint base — every subsequent glyph lands on the clean scanned buffer.
+    fb_set_scanout_base(gpu_bb_a_phys);
+    gpu_scanout_pid = 0 - 1;                 # console owns the scanout
+    kprintln("gpu: console redirected to agnos scanout buffer (pitch-free P4 fix)", 67);
     return 1;
 }
 

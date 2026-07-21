@@ -930,12 +930,38 @@ gpu_shader_dispatch_f64_fidelity();
 # page-flip will re-point. Strictly read-only; no-ops if the GPU is absent (QEMU) or the FB isn't GOP-lit.
 gpu_display_probe();
 
-# GPU arc 1.55.x (Thrust P) P4: scanout-residue clear. gpu_display_probe logs whether the GOP left the console
-# surface tiled; if so, fb_console's linear writes band. Clearing SW_MODE to linear + re-latching fixes the
-# banded-glyph residue. Gated for the first iron test — promote to default-on once confirmed.
+# GPU arc 1.55.x (Thrust P) P4: scanout-residue clear.
+# ⚠ SCANOUT_LINEAR (v3) is RETIRED — it wrote the WRONG register (0x607) under the OTG lock and BLACKED the
+# box on iron. gpu_scanout_clear_tiling is now a hard no-op; do not build this flag. Kept only so a stale
+# build can't crash. The real path is SCANOUT_PATTERN below.
 #ifdef SCANOUT_LINEAR
 kprintln("gpu: scanout-linear fix armed", 29);
 gpu_scanout_clear_tiling();
+#endif
+
+# P4 bisector (2026-07-20, register-truth): flip scanout to an agnos-owned buffer painted with a bars/stripes/
+# checker pattern, using ONLY the P0-verified address flip (zero hang risk). The photo splits the banding into
+# scan-geometry (sheared ⟹ fix verified 0x603) vs surface-content (crisp ⟹ console-redirect is the fix). The
+# corrected read-only 0x603/0x609 diagnostic in gpu_display_probe rides in EVERY build to confirm the mapping.
+#ifdef SCANOUT_PATTERN
+kprintln("gpu: scanout pattern probe armed", 32);
+gpu_scanout_pattern_probe();
+#endif
+
+# P4 FIX (2026-07-20): the pattern proved an agnos buffer scans band-free ⟹ redirect fb_console onto one.
+# Flips scanout to gpu_bb_a (address-flip only, zero hang risk) + re-points the console paint base at it, so
+# every subsequent glyph lands on the clean scanned buffer. The console text itself is the oracle: legible ⟹
+# P4 closed. Promote to default-on once iron confirms the glyphs are clean.
+#ifdef SCANOUT_REDIRECT
+gpu_scanout_redirect();
+#endif
+
+# P4 ground-truth (2026-07-20): the surface is SCALED (~800x600 → 2560x1440), so agnos writing 2560-wide bands.
+# The derived HUBP offsets are unreliable; dump the whole live-pipe HUBP block read-only so the real pitch/
+# viewport offsets can be anchored against the known geometry values. Pure reads — cannot hang, cannot black.
+#ifdef SCANOUT_REGDUMP
+kprintln("gpu: hubp regdump build armed", 29);
+gpu_scanout_regdump();
 #endif
 
 # GPU arc 1.55.x (Thrust P) P2: vblank pacing — prove the signal a present loop paces on: the OTG frame
