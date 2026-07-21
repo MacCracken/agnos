@@ -108,19 +108,16 @@ var GPU_OTG_FRAME_COUNT_MASK = 0xFFFFFF;
 var GPU_OTG_V_BLANK       = 0x1;     # OTG_STATUS bit0 — pipe is in vertical blank
 var GPU_OTG_V_ACTIVE      = 0x2;     # OTG_STATUS bit1 — pipe is in active display
 # HUBP/HUBPREQ — scanout surface (stride 0xDC). The surface-address match is the P0 pass gate.
-# ⚠ 2026-07-20 REGISTER-TRUTH (adversarial vetting, HIGH confidence): the DCN2.1 HUBPREQ DCSURF block is a
-# DENSE contiguous run. Anchoring on the ONLY hardware-verified offset — 0x60A = PRIMARY_SURFACE_ADDRESS
-# (the P0 low-dword match) — the real order is: PITCH(anchor-7=0x603), PITCH_C(0x604), EARLIEST_INUSE ×4
-# (0x605..0x608), PRIMARY_SURFACE_ADDRESS_HIGH(anchor-1=0x609), PRIMARY_SURFACE_ADDRESS(0x60A),
-# SECONDARY_SURFACE_ADDRESS_HIGH(anchor+1=0x60B). So agnos's 0x607 was NOT the pitch — it is
-# EARLIEST_INUSE_C (a read-only in-use *address* status reg), and 0x60B is SECONDARY_ADDR_HIGH, not primary.
-# The 832 "hubp_pitch" and the "PITCH MISMATCH" banner were a PHANTOM off the wrong register, and the v3 fix
-# writing 2560→0x607 under the OTG lock poisoned the surface descriptor → HUBP underflow → black box.
-var GPU_R_HUBP_SURF_ADDR    = 0x60A; # HUBPREQn DCSURF_PRIMARY_SURFACE_ADDRESS [31:0] — RAW byte addr (VERIFIED anchor)
-var GPU_R_HUBP_SURF_ADDR_HI = 0x60B; # HUBPREQn SECONDARY_SURFACE_ADDRESS_HIGH — benign for the flip (sub-4GB → 0), same reg blit#39 writes
-var GPU_R_HUBP_SURF_PITCH_REAL = 0x603; # HUBPREQn DCSURF_SURFACE_PITCH [13:0] PIXELS — CORRECTED (anchor-7)
-var GPU_R_HUBP_PRIM_ADDR_HI    = 0x609; # HUBPREQn PRIMARY_SURFACE_ADDRESS_HIGH [15:0] — CORRECTED (anchor-1)
-var GPU_R_HUBP_SURF_PITCH   = 0x607; # ⚠ WRONG (EARLIEST_INUSE_C, read-only). Kept only for the phantom-vs-real diag; DO NOT WRITE.
+# ✅ SETTLED BY IRON REGDUMP (regdump.txt, 2026-07-20) — agnos's ORIGINAL labels here are CORRECT. (The
+# 2026-07-20 "register-truth" workflow reconstructed the DCN block layout from memory and got it WRONG — its
+# claimed 0x603 pitch + 0x609 primary-high both read 0 on iron, and it wrongly called 0x60B "secondary". Its
+# only real contribution was ruling out a naive live-pitch write; do NOT trust its offsets.) Confirmed values:
+# 0x60A = PRIMARY_SURFACE_ADDRESS (reads the FB low addr), 0x60B = PRIMARY_SURFACE_ADDRESS_HIGH (reads 0xF4 =
+# the FB MC-address high), 0x607 = DCSURF_SURFACE_PITCH (reads 832 px = viewport width 800 aligned to 64),
+# 0x5EA = DCSURF_PRI_VIEWPORT_DIMENSION (reads 0x02580320 = 800x600 — the AUTHORITATIVE scanout geometry).
+var GPU_R_HUBP_SURF_ADDR    = 0x60A; # HUBPREQn DCSURF_PRIMARY_SURFACE_ADDRESS [31:0] — RAW byte addr (regdump-confirmed)
+var GPU_R_HUBP_SURF_ADDR_HI = 0x60B; # HUBPREQn DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH [15:0] — regdump: reads 0xF4 = FB high
+var GPU_R_HUBP_SURF_PITCH   = 0x607; # HUBPREQn DCSURF_SURFACE_PITCH [13:0] PIXELS — regdump: 832 (= viewport 800 aligned to 64)
 var GPU_R_HUBP_SURF_CONFIG  = 0x5E5; # HUBPn DCSURF_SURFACE_CONFIG: SURFACE_PIXEL_FORMAT [6:0]
 # DCSURF_PRI_VIEWPORT_DIMENSION — WIDTH [15:0], HEIGHT [31:16]. HARDWARE-CONFIRMED offset (regdump 2026-07-20:
 # 0x5EA read 0x02580320 = 800x600, the real scaled surface). This is the AUTHORITATIVE scanout geometry — NOT
