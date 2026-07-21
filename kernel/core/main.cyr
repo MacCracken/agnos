@@ -862,6 +862,23 @@ gpu_gpuvm_probe();
 # See kernel/core/gpu.cyr gpu_vm_setup().
 gpu_vm_setup();
 
+# GPU arc 1.55.x (Thrust P) P9.1 — SDMA0 GFX-ring bring-up (hardware 2D fill/copy engine). PSP-loads the SDMA
+# ucode (F32 is halted at boot; agnos loads only CP/MEC), un-halts the F32, and programs the ring registers
+# (regdump-anchored). NO packet/kick — verifies the engine un-halts + goes idle. Runs after gpu_vm_setup armed
+# the arena; the ring lives in the same 2 MB-UC-mapped arena. Gated #ifdef SDMA_RING; needs /fw/sdma.bin on the
+# agnos-fs (flash with --update-all). First iron burn: BURN_SDMA_RING.
+#ifdef SDMA_RING
+kprintln("gpu: sdma ring bringup armed", 28);
+gpu_sdma_bringup();
+#endif
+
+# P9.2 — first SDMA packet: one COPY_LINEAR (4 KB carveout→carveout) + FENCE, kicked via RB_WPTR, gated on the
+# fence sentinel. Proves the ring FETCHES + EXECUTES + the copy is CPU-visible (first hardware 2D). Needs the
+# ring up (SDMA_RING). First iron burn: BURN_SDMA_COPY (which builds SDMA_RING + SDMA_COPY together).
+#ifdef SDMA_COPY
+gpu_sdma_copy_test();
+#endif
+
 # GPU arc C2c (1.54.x) — map an EMPTY compute queue (MEC1/pipe0/queue0) via direct HQD
 # register programming (GRBM-select → 20 CP_HQD_* writes, ACTIVE last → deselect). The ring
 # stays empty (wptr==rptr==0) so the MEC makes zero memory accesses — isolates the HQD recipe
@@ -923,6 +940,15 @@ gpu_shader_dispatch_f64();
 # rosnet uses). A PASS on rounding data proves the GPU's separate mul+add == rosnet's mul+add bit-for-bit
 # (a fused FMA would diverge). Gated on the exact-int f64 proof inside gpu_shader_dispatch_f64_fidelity().
 gpu_shader_dispatch_f64_fidelity();
+
+# GPU arc 1.55.x (Thrust P) P9.0 — READ-ONLY SDMA0 discovery. SDMA (System DMA) is the engine P9 rings up for
+# hardware 2D (fill/copy/blit off the CPU). It's a genuine new engine — only the IP base (0x1260) is known. Per
+# the P4 lesson, anchor the real register offsets read-only BEFORE writing any. Also reports if SDMA ucode is
+# resident (the compute fw-load doesn't load it). Gated off by default; the first burn is `BURN_SDMA_PROBE`.
+#ifdef SDMA_PROBE
+kprintln("gpu: sdma probe armed", 21);
+gpu_sdma_probe();
+#endif
 
 # GPU arc 1.55.x (Thrust P — DISPLAY) P0: read-only DCN 2.1 live-pipe probe. Walks the OTG instances to
 # the GOP-lit pipe + scans the HUBP instances for the one whose scanout surface address == fb_phys (the

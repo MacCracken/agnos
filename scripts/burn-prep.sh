@@ -49,7 +49,33 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_SCANOUT_MATCHGEOM:-}" ]; then
+if [ -n "${BURN_SDMA_COPY:-}" ]; then
+    # P9.2 — FIRST SDMA PACKET (first hardware 2D on agnos). Rings up SDMA (P9.1) then submits ONE COPY_LINEAR
+    # (4KB carveout→carveout) + a FENCE, kicks via RB_WPTR (register, wptr in BYTES), gates completion on the
+    # FENCE SENTINEL (coherence-honest — rptr alone could false-GREEN on the GL2 strand), and verifies dst==src.
+    # Builds SDMA_RING + SDMA_COPY together. ⚠ NEEDS /fw/sdma.bin on the agnos-fs → flash --update-all. Oracle:
+    # 'gpu: sdma HARDWARE COPY verified'. CAPTURE: klug > sdma_copy.txt.
+    echo "[2/2] Building the P9.2 SDMA-COPY kernel (first hardware copy; FLASH WITH --update-all; capture klug > sdma_copy.txt)."
+    BUILD_ENV="SDMA_RING=1 SDMA_COPY=1"
+    BUILD_TAG="SDMA_COPY"
+elif [ -n "${BURN_SDMA_RING:-}" ]; then
+    # P9.1 — SDMA0 GFX-ring bring-up. PSP-loads the SDMA ucode (F32 halted at boot; agnos loads only CP/MEC),
+    # un-halts the F32, and programs the ring registers (regdump-anchored). NO packet/kick — verifies the engine
+    # un-halts + goes idle (the analogue of the MEC 'queue ready'). ⚠ NEEDS /fw/sdma.bin ON THE agnos-fs → flash
+    # with --update-all (not --update). Oracle: 'gpu: sdma ring ready' in klug. CAPTURE: klug > sdma_ring.txt.
+    echo "[2/2] Building the P9.1 SDMA-ring kernel (SDMA_RING: PSP-load + un-halt + ring config; FLASH WITH --update-all; capture klug > sdma_ring.txt)."
+    BUILD_ENV="SDMA_RING=1"
+    BUILD_TAG="SDMA_RING"
+elif [ -n "${BURN_SDMA_PROBE:-}" ]; then
+    # P9.0 — READ-ONLY SDMA0 register-discovery dump. SDMA is the engine P9 rings up for hardware 2D. Only its
+    # IP base (0x1260) is known; this dumps the SDMA0 block to klug so the real ring/status/ucode offsets can be
+    # anchored against known values (ucode version, idle bit) BEFORE any SDMA write — and reports whether SDMA
+    # ucode is resident. Read-only. ⚠ small hang risk if SDMA's clock is gated (reboot recovers; that's the
+    # finding). CAPTURE: klug > sdma.txt from the shell, send the file.
+    echo "[2/2] Building the P9.0 SDMA-probe kernel (SDMA_PROBE: read-only SDMA0 register dump; capture klug > sdma.txt)."
+    BUILD_ENV="SDMA_PROBE=1"
+    BUILD_TAG="SDMA_PROBE"
+elif [ -n "${BURN_SCANOUT_MATCHGEOM:-}" ]; then
     # P4 — THE FIX (regdump-confirmed). The firmware scans an 800x600 surface upscaled to 2560x1440; boot_info
     # reports the 2560x1440 output, so fb_console writes 2560-wide and bands. This reads the REAL viewport+pitch
     # (0x5EA/0x607) and overrides fb_console to render 800x600, then redraws. NO register writes — pure reads +
@@ -269,6 +295,9 @@ case "$BUILD_TAG" in *SCANOUT_PATTERN*)  verify_marker "scanout pattern probe ar
 case "$BUILD_TAG" in *SCANOUT_REDIRECT*) verify_marker "console redirected to agnos scanout buffer" ;; esac
 case "$BUILD_TAG" in *SCANOUT_REGDUMP*)  verify_marker "HUBP regdump begin" ;; esac
 case "$BUILD_TAG" in *SCANOUT_MATCHGEOM*) verify_marker "scanout matchgeom armed" ;; esac
+case "$BUILD_TAG" in *SDMA_PROBE*)       verify_marker "sdma probe armed" ;; esac
+case "$BUILD_TAG" in *SDMA_RING*)        verify_marker "sdma ring bringup armed" ;; esac
+case "$BUILD_TAG" in *SDMA_COPY*)        verify_marker "sdma ring bringup armed" ;; esac
 case "$BUILD_TAG" in *ATOM_DRY*)         verify_marker "atom: DRY build (no MMIO)" ;; esac
 case "$BUILD_TAG" in *HDMI_ATOM*)        verify_marker "atom: running DIGxEncoderControl" ;; esac
 

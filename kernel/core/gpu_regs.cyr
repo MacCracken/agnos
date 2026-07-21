@@ -74,7 +74,36 @@ var GPU_SMU_MSG_PME_RESTORE = 0xE; # VBIOSSMC_MSG_UpdatePmeRestore
 # amdgpu polls 10us x 200000 (2 s). We bound it far shorter: a wedged SMU must not be able to stall the boot
 # for two seconds over an audio nicety. 2000 x 10us = 20 ms, ample for a mailbox that answers in microseconds.
 var GPU_SMU_POLL_MAX  = 2000;
-var GPU_BASE_SDMA0_0  = 0x1260;   # SDMA engine 0, segment 0 (fallback data path)
+var GPU_BASE_SDMA0_0  = 0x1260;   # SDMA engine 0, segment 0 (P9 2D-accel ring)
+# --- SDMA0 (System DMA engine 0) — P9 hardware-2D ring. IP-relative dword offsets (add to GPU_BASE_SDMA0_0).
+# ANCHORED: iron regdump (1.55.28) + torvalds sdma0_4_0_offset.h cross-checked — the dump's idle STATUS@0x25,
+# HALT@0x2A, RB_CNTL reset-default@0x80, and every ring pointer reading 0 at 0x81-0x8A pinned base 0x1260 to a
+# 1:1 mapping. ⚠ RPTR_ADDR + WPTR_POLL_ADDR put HI at the LOWER offset (HI before LO) — do NOT swap them.
+var GPU_R_SDMA0_STATUS_REG     = 0x25;  # IDLE bit0 (answer reg; dump 0x46E5C617 = idle)
+var GPU_R_SDMA0_F32_CNTL       = 0x2A;  # HALT bit0 (answer reg; dump 0x1 = halted at boot)
+var GPU_R_SDMA0_RB_CNTL        = 0x80;  # RB_ENABLE b0 · RB_SIZE [6:1] · RPTR_WB_ENABLE b12 (reset default 0x40000)
+var GPU_R_SDMA0_RB_BASE        = 0x81;  # ring_mc >> 8
+var GPU_R_SDMA0_RB_BASE_HI     = 0x82;  # ring_mc >> 40
+var GPU_R_SDMA0_RB_RPTR        = 0x83;
+var GPU_R_SDMA0_RB_RPTR_HI     = 0x84;
+var GPU_R_SDMA0_RB_WPTR        = 0x85;
+var GPU_R_SDMA0_RB_WPTR_HI     = 0x86;
+var GPU_R_SDMA0_RB_RPTR_ADDR_HI = 0x88; # ⚠ HI at the LOWER offset
+var GPU_R_SDMA0_RB_RPTR_ADDR_LO = 0x89; # ⚠ LO at the HIGHER offset
+var GPU_R_SDMA0_IB_CNTL        = 0x8A;  # IB_ENABLE b0
+var GPU_R_SDMA0_WPTR_POLL_ADDR_HI = 0xB2; # ⚠ HI at the LOWER offset
+var GPU_R_SDMA0_WPTR_POLL_ADDR_LO = 0xB3; # ⚠ LO at the HIGHER offset
+var GPU_SDMA0_HALT       = 0x1;         # F32_CNTL HALT bit0
+var GPU_SDMA0_IDLE       = 0x1;         # STATUS_REG IDLE bit0
+var GPU_SDMA0_RB_ENABLE  = 0x1;         # RB_CNTL RB_ENABLE bit0
+var GPU_SDMA0_RB_SIZE_64K = 0x1C;       # RB_SIZE [6:1] = log2(16384 dw)=14 → 14<<1 (64 KB ring)
+var GPU_SDMA0_RPTR_WB_EN = 0x1000;      # RB_CNTL RPTR_WRITEBACK_ENABLE bit12
+var GPU_SDMA0_IB_ENABLE  = 0x1;         # IB_CNTL IB_ENABLE bit0
+var GPU_SDMA_RING_SUBOFF  = 0x20000;    # 64 KB SDMA GFX ring in the arena (past all compute buffers ~0x1A000)
+var GPU_SDMA_RPTR_SUBOFF  = 0x30000;    # rptr-report writeback page
+var GPU_SDMA_SRC_SUBOFF   = 0x38000;    # P9.2 copy-test SOURCE slot (4 KB, clear of ring/rptr)
+var GPU_SDMA_DST_SUBOFF   = 0x39000;    # P9.2 copy-test DEST slot (4 KB)
+var GPU_SDMA_FENCE_SUBOFF = 0x3A000;    # P9.2 FENCE sentinel slot (completion gate — coherence-honest)
 
 # --- Register offsets within their IP (DWORD) ---
 # NBIO/RCC — always-on bus interface; the safest reads on the GPU.
@@ -748,6 +777,7 @@ var GPU_FW_TYPE_CP_PFP      = 2;           # CP PFP (prefetch parser, GFX ring) 
 var GPU_FW_TYPE_CP_CE       = 3;           # CP CE  (constant engine, GFX ring) — whole body
 var GPU_FW_TYPE_CP_MEC      = 4;           # CP MEC1 body (compute — the crown) — body-minus-JT
 var GPU_FW_TYPE_CP_MEC_ME1  = 5;           # CP MEC1 jump-table — JT slice
+var GPU_FW_TYPE_SDMA0       = 9;           # psp_gfx_fw_type SDMA0 (RLC_G=8, SDMA0=9) — P9 2D-accel ring
 
 # C1b fix (iron 1.54.3: SETUP_TMR returned TEE_ERROR_BAD_PARAMETERS for a plain-RAM
 # TMR): the TMR must live in the GPU's VRAM/UMA carveout. Read the carveout from the

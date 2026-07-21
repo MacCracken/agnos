@@ -321,6 +321,15 @@ else
         # reads + software geometry switch + console redraw — NO register writes, cannot hang/black. Oracle: the
         # console is LEGIBLE (blocky but clean, bands gone).
         [ -n "$SCANOUT_MATCHGEOM" ]  && echo '#define SCANOUT_MATCHGEOM'
+        # SDMA_PROBE=1 — P9.0 read-only SDMA0 register-discovery dump (anchor the ring/status/ucode offsets +
+        # report ucode residency before any SDMA write). Read-only; small hang risk if SDMA's clock is gated.
+        [ -n "$SDMA_PROBE" ]         && echo '#define SDMA_PROBE'
+        # SDMA_RING=1 — P9.1 SDMA0 GFX-ring bring-up: PSP-load SDMA ucode, un-halt the F32, program the ring
+        # (regdump-anchored offsets), verify un-halt+idle. NO packet/kick. Needs /fw/sdma.bin on the agnos-fs.
+        [ -n "$SDMA_RING" ]          && echo '#define SDMA_RING'
+        # SDMA_COPY=1 — P9.2 first SDMA packet: one COPY_LINEAR (4KB carveout→carveout) + FENCE, kick via RB_WPTR,
+        # gate on the fence sentinel, verify dst==src. Needs SDMA_RING too (the ring must be up).
+        [ -n "$SDMA_COPY" ]          && echo '#define SDMA_COPY'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot
