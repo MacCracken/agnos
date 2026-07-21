@@ -41,6 +41,16 @@ var GPU_RMMIO_SIZE    = 0x80000;  # 512 KB — regs with (index*4) < this are di
 var GPU_BASE_GC_0     = 0x2000;   # graphics/compute core, segment 0
 var GPU_BASE_GC_1     = 0xA000;   # graphics/compute core, segment 1 (RLC + CP ucode-load iface)
 var GPU_BASE_NBIO_2   = 0xD20;    # NBIO/NBIF/RCC, segment 2 (STRAP0, MEMSIZE)
+# NBIO segments 1 + 3 (renoir_ip_offset.h NBIF0_BASE INST0 = {0x0, 0x14, 0xD20, 0x10400, ...}; SEG2=0xD20
+# above is agnos's proven anchor → whole array trusted). P9: route SDMA0's doorbell via the RSMU indirect port.
+var GPU_BASE_NBIO_1   = 0x14;     # NBIO segment 1 — BIF_BX_PF0_RSMU_INDEX/DATA (PCIE-PORT indirect)
+var GPU_R_NBIO_RSMU_INDEX = 0x0;  # BIF_BX_PF0_RSMU_INDEX (seg1) — target register byte-address
+var GPU_R_NBIO_RSMU_DATA  = 0x1;  # BIF_BX_PF0_RSMU_DATA  (seg1) — read/write the indexed register
+# The RSMU INDEX value to reach GDC0_BIF_SDMA0_DOORBELL_RANGE = (NBIO_seg3 0x10400 + reg 0x4f0af0) * 4 (bytes).
+var GPU_NBIO_SDMA0_DBR_IDX = 0x1403BC0;
+# Route value: OFFSET[11:2]=(0x1E0<<2)=0x780, SIZE[20:16]=(4<<16)=0x40000 → routes doorbell byte 0x780 to SDMA0.
+var GPU_NBIO_SDMA0_DBR_VAL = 0x40780;
+var GPU_NBIO_DBR_FOREIGN   = 0xFFE0F003;  # ~(OFFSET_MASK 0xFFC | SIZE_MASK 0x1F0000) — foreign-bit / RMW-preserve mask
 var GPU_BASE_MMHUB_0  = 0x1A000;  # GMC / memory hub, segment 0 (C1 GPUVM)
 # DMU/DCN seg1 (BASE_IDX 1). CORRECTION (P3 derivation, 2026-07-14): this is NOT "legacy VGA only" — seg1 is
 # the entire **DCCG**: the audio DTO block (0xAB-0xAF) and the per-pipe PIXEL_RATE_CNTL / DP_DTO block
@@ -91,6 +101,13 @@ var GPU_R_SDMA0_RB_WPTR_HI     = 0x86;
 var GPU_R_SDMA0_RB_RPTR_ADDR_HI = 0x88; # ⚠ HI at the LOWER offset
 var GPU_R_SDMA0_RB_RPTR_ADDR_LO = 0x89; # ⚠ LO at the HIGHER offset
 var GPU_R_SDMA0_IB_CNTL        = 0x8A;  # IB_ENABLE b0
+var GPU_R_SDMA0_WPTR_POLL_CNTL = 0x87;  # ENABLE b0, F32_POLL_ENABLE b2 (dump default 0x401000 = poll OFF)
+var GPU_R_SDMA0_GFX_DOORBELL        = 0x92;  # ENABLE bit28 (0x10000000) — NO offset field in this reg
+var GPU_R_SDMA0_GFX_DOORBELL_OFFSET = 0xAB;  # OFFSET[27:2] = doorbell_index << 2
+var GPU_SDMA0_DOORBELL_EN  = 0x10000000;     # GFX_DOORBELL ENABLE bit28
+# DWORD doorbell index NBIO routes to SDMA0 = AMDGPU_DOORBELL64_sDMA_ENGINE0(0xF0) << 1 (sdma_v4_0_sw_init).
+# BAR2 byte offset for the kick = index << 2 = 0x780. ⚠ NOT 0x08 — that qword slot is MEC_RING5, in the CP block.
+var GPU_SDMA_DOORBELL_INDEX = 0x1E0;
 var GPU_R_SDMA0_WPTR_POLL_ADDR_HI = 0xB2; # ⚠ HI at the LOWER offset
 var GPU_R_SDMA0_WPTR_POLL_ADDR_LO = 0xB3; # ⚠ LO at the HIGHER offset
 var GPU_SDMA0_HALT       = 0x1;         # F32_CNTL HALT bit0
