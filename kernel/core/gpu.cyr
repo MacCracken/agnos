@@ -227,6 +227,11 @@ fn gpu_probe() {
     if (memsize != 0 && memsize != 0xFFFFFFFF && gbcfg != 0 && gbcfg != 0xFFFFFFFF) { live = 1; }
     if (live != 0) {
         kprintln("gpu: register aperture mapped", 29);
+        # P4 FIX (1.55.28, DEFAULT-ON): match the console to the real (scaled) surface AS EARLY AS POSSIBLE — the
+        # aperture is up, so the HW viewport is readable now, long before the display probe. This renders the
+        # rest of the boot log at the correct geometry instead of banding it. Idempotent + guarded → safe; the
+        # late fallback in main.cyr catches it if the viewport isn't valid yet.
+        gpu_scanout_matchgeom();
         return 1;
     }
     kprintln("gpu: warning: aperture reads dead", 33);
@@ -2304,43 +2309,21 @@ fn gpu_display_probe() {
             kprint("gpu: display pipe ", 18);
             kprint_num(pipe);
             kprintln(" live (scanout matches framebuffer)", 35);
-            # P4 diagnostic (2026-07-20, v3) — the FULL scanout-surface state, ALL to klug (this box is
-            # serial-less, so the old serial-only fb geometry never reached a capture). Read-only, safe (same
-            # HUBP block as the surface regs above). Iron burn 2 proved SW_MODE=0 (surface LINEAR) yet the
-            # console still bands — so the residue is NOT swizzle. "Broken scanlines on a linear surface" =
-            # a PITCH/STRIDE mismatch (HUBP scans at a different stride than fb_console writes) and/or DCC
-            # (compression the GOP left on). This prints all four so the next capture NAMES the cause.
+            # P4 (2026-07-20, regdump-confirmed): report the REAL scanout surface geometry. The firmware scans a
+            # small surface (this box: 800x600, pitch 832px) that DCN upscales to the 2560x1440 link; boot_info
+            # reports the OUTPUT, so gpu_scanout_matchgeom overrides fb_console to render at THIS. HW-confirmed
+            # offsets: viewport 0x5EA (w[15:0], h[31:16]), pitch 0x607 (px), pixfmt 0x5E5. Read-only.
             var d = pipe * GPU_DCN_HUBP_STRIDE;
-            var swmode = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_TILING_CONFIG + d) & GPU_HUBP_SW_MODE_MASK;
-            var hubp_pitch = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH + d) & 0x3FFF;  # PIXELS
-            var dcc = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURFACE_CONTROL + d) >> 1) & 1;   # PRIMARY_SURFACE_DCC_EN
+            var vp  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_VIEWPORT_DIM + d);
+            var vw  = vp & 0xFFFF;
+            var vh  = (vp >> 16) & 0xFFFF;
+            var ppx = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH + d) & 0x3FFF;
             var pixfmt = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_CONFIG + d) & 0x7F;
-            gpu_display_swmode = swmode;
-            kprint("gpu: scanout sw_mode ", 21);      kprint_num(swmode);
-            kprint(" dcc ", 5);                        kprint_num(dcc);
-            kprint(" hubp_pitch_px ", 15);            kprint_num(hubp_pitch);
-            kprint(" fb_pitch_by ", 13);              kprint_num(fb_pitch());
-            kprint(" pixfmt ", 8);                     kprint_num(pixfmt);
+            kprint("gpu: scanout surface ", 21);   kprint_num(vw);
+            kprint("x", 1);                          kprint_num(vh);
+            kprint(" pitch ", 7);                    kprint_num(ppx);
+            kprint("px pixfmt ", 10);                kprint_num(pixfmt);
             kprintln("", 0);
-            # ⚠ hubp_pitch above (0x607) is the WRONG register (EARLIEST_INUSE_C) — the 832/"MISMATCH" it
-            # produced was a phantom. The CORRECTED offsets (register-truth 2026-07-20, anchored on the
-            # HW-verified 0x60A): real DCSURF_SURFACE_PITCH = 0x603, real PRIMARY_ADDR_HIGH = 0x609. Read all
-            # three (0x603 pitch, 0x609 primary-high, 0x60B secondary-high) so THIS burn confirms the mapping
-            # on iron before any write is ever contemplated. Still read-only, same always-clocked HUBP block.
-            var true_pitch = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH_REAL + d) & 0x3FFF;
-            var prim_hi    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_PRIM_ADDR_HI + d) & 0xFFFF;
-            var sec_hi     = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + d) & 0xFFFF;
-            kprint("gpu: reg603 pitch_px ", 21);       kprint_num(true_pitch);
-            kprint(" reg609 prim_hi ", 16);            kprint_num(prim_hi);
-            kprint(" reg60b sec_hi ", 15);             kprint_num(sec_hi);
-            kprintln("", 0);
-            # Honest verdict off the REAL pitch: 0x603*4 == fb stride ⟹ geometry ok (banding is surface-content,
-            # not pitch). Differs (e.g. ~800) ⟹ the 800x600-scaled-surface hypothesis is real; fix targets 0x603.
-            if ((true_pitch * 4) == fb_pitch()) {
-                kprintln("gpu: real pitch 0x603 matches fb stride -- geometry ok, banding is not pitch", 76);
-            } else {
-                kprintln("gpu: real pitch 0x603 differs from fb stride -- narrow/scaled surface, fix 0x603", 80);
-            }
             return 1;
         }
         gpu_display_ok = 0 - 2;
@@ -2597,6 +2580,43 @@ fn gpu_scanout_pattern_probe() {
     gpu_mfence();
     gpu_display_wait_vblank(gpu_display_pipe);
     kprintln("gpu: scanout pattern armed -- read the bars/stripes/checker", 59);
+    return 1;
+}
+
+# gpu_scanout_matchgeom — THE P4 FIX (2026-07-20, regdump-confirmed). The banding is a SCALE mismatch: the
+# firmware scans a small surface (iron: 800x600, pitch 832px) that DCN upscales to the 2560x1440 link, while
+# boot_info reports 2560x1440/10240 — so fb_console writes 2560-wide into an 800-wide surface and every row
+# smears. Fix: READ the real geometry from the HW viewport (0x5EA) + pitch (0x607) — both offsets confirmed by
+# the regdump — override fb_console's geometry to match, and redraw. NO hardware writes (pure reads + a software
+# geometry switch + a console clear) → cannot hang, cannot black. fb_console then renders at the surface's true
+# 800x600 and the scaler upsizes it → clean (blocky but legible). No-op safe: if the viewport already matches
+# boot_info (quiet-boot OFF / native), the override is the same value.
+fn gpu_scanout_matchgeom() {
+    if (fb_geom_active() == 1) { return 0; }    # already matched (idempotent — the earlier call site won)
+    # Runs from TWO sites: an EARLY one in gpu_probe (right after the aperture maps, so the boot log renders at
+    # the right geometry from there on) and a LATE fallback after gpu_display_probe. Early call precedes the
+    # display probe, so gpu_display_pipe is still -1 → assume pipe 0 (the only lit pipe on this SoC). The
+    # plausibility guards below reject a not-yet-valid viewport, so the early call simply no-ops and the late
+    # fallback fixes it — never a regression.
+    var pipe = gpu_display_pipe;
+    if (pipe < 0) { pipe = 0; }
+    var p = pipe * GPU_DCN_HUBP_STRIDE;
+    var vp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_VIEWPORT_DIM + p);
+    var vw = vp & 0xFFFF;
+    var vh = (vp >> 16) & 0xFFFF;
+    var ppx = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_PITCH + p) & 0x3FFF;
+    # Guards: only act on a plausible viewport + pitch (never override to garbage).
+    if (vw == 0) { return 0; }
+    if (vh == 0) { return 0; }
+    if (vw > 4096) { return 0; }
+    if (vh > 4096) { return 0; }
+    if (ppx < vw) { return 0; }             # pitch must be >= width
+    fb_set_geom(vw, vh, ppx * 4);           # bytes/row = pitch-px * 4 (ARGB8888)
+    fb_console_clear();                      # redraw at the new geometry (also resets cursor + shadow)
+    kprint("gpu: console geometry matched to surface ", 41); kprint_num(vw);
+    kprint("x", 1); kprint_num(vh);
+    kprint(" pitch ", 7); kprint_num(ppx * 4);
+    kprintln(" bytes", 6);
     return 1;
 }
 

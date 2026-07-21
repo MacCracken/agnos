@@ -5,6 +5,63 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.28] — 2026-07-20 — P4: the months-parked AMD-Zen quiet-boot scanout banding is FIXED (iron-validated)
+
+The long-standing banded-glyph "scanout residue" on quiet-boot — parked for months, worked around by booting
+with BIOS quiet-boot OFF — is **fixed**, and the interactive console is clean and legible on iron (archaemenid,
+AMD Cezanne / DCN 2.1).
+
+**★ ROOT CAUSE: a scaled surface, not a scan defect.** In quiet-boot the firmware hands out a small framebuffer
+— on this box **800×600, pitch 832 px** — that DCN's scaler upsizes to the 2560×1440 link. But `boot_info`
+reports the 2560×1440 **output** geometry, so `fb_console` wrote glyphs at a 2560-wide (10240-byte) stride into
+a surface the hardware actually scans ~800-wide (3328-byte) — every text row smeared across ~3 scan rows. The
+arithmetic closes exactly: `3 × 64 × 10240 / 3328 ≈ 600` rows.
+
+**★ THE FIX IS READ-ONLY.** `gpu_scanout_matchgeom` reads the real geometry from the **hardware-confirmed**
+HUBP registers — viewport `DCSURF_PRI_VIEWPORT_DIMENSION` (`0x5EA`, 800×600) and pitch `DCSURF_SURFACE_PITCH`
+(`0x607`, 832 px) — and overrides `fb_console`'s geometry to render at the true surface size, then redraws. It
+writes **no** GPU registers — pure reads plus a software geometry switch — so it cannot hang or blank the pipe.
+`fb_console` then renders 800×600 and the scaler upsizes it: blocky but crisp, bands gone. It runs twice
+(idempotently): once early in `gpu_probe` the instant the register aperture maps, so the boot log itself renders
+correctly, and once as a guarded late fallback after the display probe. Default-on; no-op on a native
+(quiet-boot-OFF) surface where the viewport already equals the output.
+
+**★ THE PATH THERE (recorded so it isn't repeated).** Several confident theories were falsified on iron first:
+tiling/DCC (falsified — `sw_mode` read 0); a "pitch mismatch" read from `0x607` (a **phantom** — a mislabeled
+register; a write to it under the OTG lock **blacked the box**); and a console-redirect onto an agnos-owned
+buffer (inert — an address flip is orthogonal to a scale mismatch). The breakthrough came from a **read-only
+register dump** that anchored the real viewport/pitch offsets against known geometry values (2560, 1440, 800,
+600) instead of *deriving* them — the derived-offset habit was the through-line of every wrong turn.
+
+### Added
+
+- `gpu_scanout_matchgeom()` — the P4 fix (read HW viewport+pitch, override `fb_console` geometry, redraw). Runs
+  early (in `gpu_probe`, right after the aperture maps) + a guarded late fallback; **default-on**.
+- `fb_geom_w/h/pitch` overrides + `fb_set_geom()` / `fb_geom_active()` in `fb_console.cyr` — let the accessors
+  return the real surface geometry instead of `boot_info`'s (scaled) output values.
+- `GPU_R_HUBP_VIEWPORT_DIM = 0x5EA` — hardware-confirmed `DCSURF_PRI_VIEWPORT_DIMENSION` offset.
+- Read-only investigation scaffolding, all behind build flags (off by default): `SCANOUT_REGDUMP` (HUBP block
+  dump that cracked the geometry), `SCANOUT_PATTERN` (the R/G/B bisector), `SCANOUT_REDIRECT` (the inert
+  console-redirect attempt, kept for the record).
+
+### Changed
+
+- `gpu_display_probe`'s P4 diagnostic now reports the **accurate** scanout surface geometry (viewport + pitch +
+  pixfmt from the confirmed offsets), replacing the earlier misleading "pitch mismatch" line that read a
+  mislabeled register.
+
+### Fixed
+
+- **P4 — quiet-boot scanout banding.** The console is legible on iron with BIOS quiet-boot ON; the OFF-mode
+  workaround is no longer required. (Residual: the handful of pre-GPU-init boot lines before the aperture maps
+  still render at `boot_info` geometry; a full line-1 fix would have gnoboot record the real surface geometry —
+  deferred.)
+
+### Removed
+
+- `gpu_scanout_clear_tiling` is retired to a no-op (the v3 pitch-write path that blacked the box); the
+  `SCANOUT_LINEAR` flag no longer does anything.
+
 ## [1.55.27] — 2026-07-20 — A4: the register-*value* class is fully exhausted; the ACR/CTS path is the first lever to reach the wire
 
 A consolidation cut for the A4 (HDMI-audio) sub-arc. No sound yet, but two genuine advances that reshape the

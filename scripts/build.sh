@@ -316,6 +316,11 @@ else
         # SCANOUT_REGDUMP=1 — read-only dump of the live-pipe HUBP register block to klug, to re-anchor the real
         # pitch/viewport offsets against known geometry (the surface is scaled ~800x600→2560x1440). Pure reads.
         [ -n "$SCANOUT_REGDUMP" ]    && echo '#define SCANOUT_REGDUMP'
+        # SCANOUT_MATCHGEOM=1 — THE P4 FIX: read the real surface geometry (viewport 0x5EA + pitch 0x607) and
+        # override fb_console to render at it (800x600 scaled), instead of boot_info's 2560x1440 output. Pure
+        # reads + software geometry switch + console redraw — NO register writes, cannot hang/black. Oracle: the
+        # console is LEGIBLE (blocky but clean, bands gone).
+        [ -n "$SCANOUT_MATCHGEOM" ]  && echo '#define SCANOUT_MATCHGEOM'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

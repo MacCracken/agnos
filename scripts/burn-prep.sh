@@ -49,7 +49,16 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_SCANOUT_REGDUMP:-}" ]; then
+if [ -n "${BURN_SCANOUT_MATCHGEOM:-}" ]; then
+    # P4 — THE FIX (regdump-confirmed). The firmware scans an 800x600 surface upscaled to 2560x1440; boot_info
+    # reports the 2560x1440 output, so fb_console writes 2560-wide and bands. This reads the REAL viewport+pitch
+    # (0x5EA/0x607) and overrides fb_console to render 800x600, then redraws. NO register writes — pure reads +
+    # a software geometry switch — cannot hang/black. ⚠ ORACLE = the CONSOLE: legible (blocky but CLEAN, no
+    # bands)? Yes ⟹ P4 closed. Needs BIOS quiet-boot ON (the banded/scaled condition).
+    echo "[2/2] Building the P4 MATCHGEOM kernel (SCANOUT_MATCHGEOM: render at the real 800x600 surface; LOOK at legibility; quiet-boot ON)."
+    BUILD_ENV="SCANOUT_MATCHGEOM=1"
+    BUILD_TAG="SCANOUT_MATCHGEOM"
+elif [ -n "${BURN_SCANOUT_REGDUMP:-}" ]; then
     # P4 — READ-ONLY HUBP register dump. The surface is scaled (~800x600 → 2560x1440); the derived HUBP offsets
     # are unreliable, so dump the live-pipe HUBP block to klug to re-anchor the real pitch/viewport offsets.
     # Pure reads — cannot hang, cannot black. ⚠ CAPTURE: klug > regdump.txt from the shell, send the file.
@@ -259,6 +268,7 @@ case "$BUILD_TAG" in *HDMI_ACR_CTS*)     verify_marker "hdmi acr cts programmed"
 case "$BUILD_TAG" in *SCANOUT_PATTERN*)  verify_marker "scanout pattern probe armed" ;; esac
 case "$BUILD_TAG" in *SCANOUT_REDIRECT*) verify_marker "console redirected to agnos scanout buffer" ;; esac
 case "$BUILD_TAG" in *SCANOUT_REGDUMP*)  verify_marker "HUBP regdump begin" ;; esac
+case "$BUILD_TAG" in *SCANOUT_MATCHGEOM*) verify_marker "scanout matchgeom armed" ;; esac
 case "$BUILD_TAG" in *ATOM_DRY*)         verify_marker "atom: DRY build (no MMIO)" ;; esac
 case "$BUILD_TAG" in *HDMI_ATOM*)        verify_marker "atom: running DIGxEncoderControl" ;; esac
 

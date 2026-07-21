@@ -350,17 +350,40 @@ fn fb_set_scanout_base(b) {
     fb_scanout_base = b;
     return 0;
 }
+# P4 geometry-match (2026-07-20): in BIOS quiet-boot the firmware scans a SMALL surface (iron: 800x600, pitch
+# 832px) upscaled by DCN to the 2560x1440 link, but boot_info reports the 2560x1440 OUTPUT. So fb_console must
+# render at the REAL surface geometry, not boot_info's. When these overrides are nonzero (set by
+# gpu_scanout_matchgeom after reading the HW viewport/pitch), the accessors return them instead of boot_info.
+# 0 = use boot_info (default / quiet-boot-OFF native path, unchanged).
+var fb_geom_w     = 0;
+var fb_geom_h     = 0;
+var fb_geom_pitch = 0;   # BYTES per scanline (= surface pitch-px * bytes-per-pixel)
+fn fb_set_geom(w, h, pitch_bytes) {
+    fb_geom_w = w;
+    fb_geom_h = h;
+    fb_geom_pitch = pitch_bytes;
+    return 0;
+}
+# fb_geom_active — 1 once the geometry has been matched to the real surface (lets the matcher run idempotently
+# from an early AND a late call site without double-clearing).
+fn fb_geom_active() {
+    if (fb_geom_pitch != 0) { return 1; }
+    return 0;
+}
 fn fb_pitch() {
+    if (fb_geom_pitch != 0) { return fb_geom_pitch; }
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
     return load32(bi + 0x50);
 }
 fn fb_width() {
+    if (fb_geom_w != 0) { return fb_geom_w; }
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
     return load32(bi + 0x54);
 }
 fn fb_height() {
+    if (fb_geom_h != 0) { return fb_geom_h; }
     var bi = load64(&boot_info_ptr);
     if (bi == 0) { return 0; }
     return load32(bi + 0x58);

@@ -122,6 +122,10 @@ var GPU_R_HUBP_SURF_PITCH_REAL = 0x603; # HUBPREQn DCSURF_SURFACE_PITCH [13:0] P
 var GPU_R_HUBP_PRIM_ADDR_HI    = 0x609; # HUBPREQn PRIMARY_SURFACE_ADDRESS_HIGH [15:0] — CORRECTED (anchor-1)
 var GPU_R_HUBP_SURF_PITCH   = 0x607; # ⚠ WRONG (EARLIEST_INUSE_C, read-only). Kept only for the phantom-vs-real diag; DO NOT WRITE.
 var GPU_R_HUBP_SURF_CONFIG  = 0x5E5; # HUBPn DCSURF_SURFACE_CONFIG: SURFACE_PIXEL_FORMAT [6:0]
+# DCSURF_PRI_VIEWPORT_DIMENSION — WIDTH [15:0], HEIGHT [31:16]. HARDWARE-CONFIRMED offset (regdump 2026-07-20:
+# 0x5EA read 0x02580320 = 800x600, the real scaled surface). This is the AUTHORITATIVE scanout geometry — NOT
+# boot_info (which reports the 2560x1440 upscaled OUTPUT). 0x607 (=832) is confirmed the real PITCH-px alongside.
+var GPU_R_HUBP_VIEWPORT_DIM = 0x5EA;
 var GPU_R_HUBP_CNTL         = 0x5F3; # HUBPn DCHUBP_CNTL: HUBP_BLANK_EN bit0 (0 = fetching)
 # HUBPn DCSURF_TILING_CONFIG (P4 — scanout-residue diagnosis). SW_MODE[4:0]=0 → SW_LINEAR; any non-zero =
 # tiled/swizzled. Sits between 0x5E5/0x5F3 in the same dispdec HUBP block → safe to read during scanout
