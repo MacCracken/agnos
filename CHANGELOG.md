@@ -5,6 +5,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.29] — 2026-07-21 — P9 checkpoint: the SDMA 2D-accel engine RINGS UP on iron (first-packet fetch WIP)
+
+A demark cut for the P9 (2D acceleration via SDMA) arc. The **System DMA engine is brought up end-to-end on
+iron** — the first non-CP/compute AMD engine agnos rings up — mirroring the proven MEC compute-ring bring-up
+from Thrust C. What's iron-validated (all behind opt-in build flags; the default build is unchanged from
+1.55.28):
+
+- **P9.0 — read-only SDMA0 discovery** (`SDMA_PROBE`): the SDMA0 register block dumps without hanging (engine
+  clocked + readable). An adversarially-verified anchoring pass (reconstructed offsets **cross-checked against
+  the iron dump**, the discipline P4 lacked) pinned the ring/status/ucode map 1:1 to base `0x1260`.
+- **P9.1 — GFX-ring bring-up** (`SDMA_RING`): PSP-loads the SDMA ucode (`fw_type SDMA0=9`, `renoir_sdma.bin` →
+  `/fw/sdma.bin`), un-halts the F32 (`HALT→0`), programs the ring (regdump-anchored offsets), and reads back the
+  answer registers — **`sdma ring ready (F32 running, idle)` first-try on iron.**
+- **P9.2 — first-packet submit path** (`SDMA_COPY`): builds a COPY_LINEAR + FENCE packet, enables the SDMA
+  doorbell, and **programs the NBIO doorbell-range route** — `GDC0_BIF_SDMA0_DOORBELL_RANGE` via the BIF RSMU
+  indirect port, read-only-probed first then written+verified (`0x40780`), with header-verified NBIO segment
+  bases anchored by agnos's proven `NBIO_2=0xD20`. Doorbell index `0x1E0` (the NBIO-routed slot), wptr in bytes.
+
+**Known gap (WIP, why this is a checkpoint not a close):** despite the full submit path being configured on
+iron — ucode loaded, F32 running, ring + doorbell + NBIO route all verified — the engine does **not yet fetch
+the first packet** (`rptr` stays 0). Next: read the doorbell `CAPTURED` bit to localize routing-reached-engine
+vs an engine-side start gate (context-switch enable), then P9.3 wires fill/copy into the blit path + a syscall.
+
+### Added
+
+- SDMA0 register block + `gpu_sdma_probe` / `gpu_sdma_bringup` / `gpu_sdma_copy_test` / `gpu_sdma_route_doorbell`
+  in `gpu.cyr`; `GPU_FW_TYPE_SDMA0=9`, the SDMA0 ring/doorbell offsets, NBIO segments 1 (`0x14`) + 3 (`0x10400`)
+  and the RSMU indirect-port constants in `gpu_regs.cyr`. All behind `SDMA_PROBE` / `SDMA_RING` / `SDMA_COPY`.
+- `renoir_sdma.bin` staged to `build/rootfs/fw/sdma.bin` (Cezanne SDMA ucode, from linux-firmware).
+
+### Changed
+
+- `gpu_regs.cyr` HUBP register comments corrected to the iron-regdump truth (`0x607` **is** the pitch; the
+  earlier "register-truth" offset guesses are debunked in-comment) — carry-over cleanup from the P4 arc.
+
 ## [1.55.28] — 2026-07-20 — P4: the months-parked AMD-Zen quiet-boot scanout banding is FIXED (iron-validated)
 
 The long-standing banded-glyph "scanout residue" on quiet-boot — parked for months, worked around by booting

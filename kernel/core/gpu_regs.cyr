@@ -104,6 +104,12 @@ var GPU_R_SDMA0_IB_CNTL        = 0x8A;  # IB_ENABLE b0
 var GPU_R_SDMA0_WPTR_POLL_CNTL = 0x87;  # ENABLE b0, F32_POLL_ENABLE b2 (dump default 0x401000 = poll OFF)
 var GPU_R_SDMA0_GFX_DOORBELL        = 0x92;  # ENABLE bit28 (0x10000000) — NO offset field in this reg
 var GPU_R_SDMA0_GFX_DOORBELL_OFFSET = 0xAB;  # OFFSET[27:2] = doorbell_index << 2
+# Start-sequence regs the P9.1 bring-up OMITTED (sdma_v4_0_start / ctx_switch_enable / gfx_resume). ANCHORED vs
+# torvalds sdma0_4_0_offset.h + sh_mask.h (1.55.29). Without AUTO_CTXSW the microcode never schedules the queue
+# (HALT=0 + RB_ENABLE is NOT sufficient); MINOR_PTR_UPDATE latched at 1 holds every wptr update → rptr stuck at 0.
+var GPU_R_SDMA0_CNTL             = 0x1C;  # AUTO_CTXSW_ENABLE bit18 (0x40000) · UTC_L1_ENABLE bit1 (0x2)
+var GPU_R_SDMA0_SEM_FAIL_TIMER   = 0x21;  # SEM_WAIT_FAIL_TIMER_CNTL — zeroed by start()
+var GPU_R_SDMA0_MINOR_PTR_UPDATE = 0xB5;  # atomic wptr-commit gate; must read/write 0 or wptr updates are held
 var GPU_SDMA0_DOORBELL_EN  = 0x10000000;     # GFX_DOORBELL ENABLE bit28
 # DWORD doorbell index NBIO routes to SDMA0 = AMDGPU_DOORBELL64_sDMA_ENGINE0(0xF0) << 1 (sdma_v4_0_sw_init).
 # BAR2 byte offset for the kick = index << 2 = 0x780. ⚠ NOT 0x08 — that qword slot is MEC_RING5, in the CP block.
@@ -116,6 +122,9 @@ var GPU_SDMA0_RB_ENABLE  = 0x1;         # RB_CNTL RB_ENABLE bit0
 var GPU_SDMA0_RB_SIZE_64K = 0x1C;       # RB_SIZE [6:1] = log2(16384 dw)=14 → 14<<1 (64 KB ring)
 var GPU_SDMA0_RPTR_WB_EN = 0x1000;      # RB_CNTL RPTR_WRITEBACK_ENABLE bit12
 var GPU_SDMA0_IB_ENABLE  = 0x1;         # IB_CNTL IB_ENABLE bit0
+var GPU_SDMA0_AUTO_CTXSW = 0x40000;     # SDMA0_CNTL AUTO_CTXSW_ENABLE bit18 — microcode schedules the GFX queue
+var GPU_SDMA0_UTC_L1_EN  = 0x2;         # SDMA0_CNTL UTC_L1_ENABLE bit1 — ring-VA xlate (UNUSED: agnos flat/no-pt)
+var GPU_SDMA0_CAPTURED   = 0x40000000;  # GFX_DOORBELL CAPTURED bit30 (RO) — set when a doorbell latches at engine
 var GPU_SDMA_RING_SUBOFF  = 0x20000;    # 64 KB SDMA GFX ring in the arena (past all compute buffers ~0x1A000)
 var GPU_SDMA_RPTR_SUBOFF  = 0x30000;    # rptr-report writeback page
 var GPU_SDMA_SRC_SUBOFF   = 0x38000;    # P9.2 copy-test SOURCE slot (4 KB, clear of ring/rptr)
