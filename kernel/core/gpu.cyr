@@ -2760,14 +2760,13 @@ fn gpu_sdma_bringup() {
     # Release the atomic wptr-commit gate: gfx_resume leaves MINOR_PTR_UPDATE=0 after programming wptr. If PSP/HW
     # left it latched at 1, every wptr update (register OR doorbell) is HELD → rptr stuck at 0 (our exact symptom).
     gpu_reg32_write(GPU_BASE_SDMA0_0, GPU_R_SDMA0_MINOR_PTR_UPDATE, 0);
-    # Enable the DOORBELL (the fetch trigger — P9.2 proved a bare wptr write doesn't fetch). OFFSET = index<<2;
-    # DOORBELL reg = ENABLE bit28 ONLY (no offset field). Index 0x1E0 is NBIO-routed to SDMA0. gfx_resume order:
-    # doorbell before RB_ENABLE.
-    gpu_reg32_write(GPU_BASE_SDMA0_0, GPU_R_SDMA0_GFX_DOORBELL_OFFSET, GPU_SDMA_DOORBELL_INDEX << 2);
-    gpu_reg32_write(GPU_BASE_SDMA0_0, GPU_R_SDMA0_GFX_DOORBELL, GPU_SDMA0_DOORBELL_EN);
+    # DISABLE the doorbell. archaemenid's doorbell aperture does NOT deliver (P9.2f: SDMA GFX_DOORBELL.CAPTURED
+    # read 0 after a routed kick; AND the MEC compute doorbell fails identically — agnos submits compute via a
+    # direct CP_HQD_PQ_WPTR_LO register write, its own code says "doorbell did NOT advance wptr; a direct
+    # CP_HQD_PQ_WPTR_LO write DID"). So submit via the RB_WPTR register (direct MMIO — the one wptr channel proven
+    # to work on this box), mirroring the MEC fallback. Doorbell OFF ⟹ the F32 takes its wptr from the RB_WPTR reg.
+    gpu_reg32_write(GPU_BASE_SDMA0_0, GPU_R_SDMA0_GFX_DOORBELL, 0);
     gpu_mfence();
-    # NBIO-route SDMA0's doorbell so the BAR2 doorbell write actually reaches the engine (the GOP never did this).
-    gpu_sdma_route_doorbell();
     # Enable the ring (RB last), then the IB path.
     var cnt2 = gpu_reg32(GPU_BASE_SDMA0_0, GPU_R_SDMA0_RB_CNTL);
     gpu_reg32_write(GPU_BASE_SDMA0_0, GPU_R_SDMA0_RB_CNTL, cnt2 | GPU_SDMA0_RB_ENABLE);
@@ -2844,18 +2843,12 @@ fn gpu_sdma_copy_test() {
     store32(ring_phys + 40, seq);                           # dw10 sentinel value
     gpu_mfence();
 
-    # S3 — KICK via the DOORBELL (the real fetch trigger — P9.2 #1/#2 proved a bare wptr/poll write leaves
-    #      rptr=0). Map BAR2 (the doorbell aperture; the MEC's own kick maps it LATER in boot, so map it here),
-    #      set RB_WPTR too (harmless), then post ONE 64-bit write of the wptr in BYTES (44) to SDMA0's routed
-    #      slot: byte 0x780 = index 0x1E0 << 2. If the VBIOS already routed SDMA's doorbell, this fetches; if
-    #      rptr stays 0, the NBIO GDC0 doorbell-range route is the next (separate) bite.
-    var bar2 = pci_bar_64(gpu_pci_idx, 2);
-    if (bar2 == 0) { kprintln("gpu: sdma copy no doorbell aperture (BAR2)", 42); return 0; }
-    vmm_remap_uc_2mb(bar2);
+    # S3 — KICK via the RB_WPTR register (direct MMIO; the doorbell is disabled in bring-up because it doesn't
+    #      deliver on this box). wptr in BYTES: 11 dw = 44. This is the exact channel agnos's MEC compute ring uses
+    #      (CP_HQD_PQ_WPTR_LO) after its own doorbell failed; AUTO_CTXSW (set in bring-up) lets the F32 schedule
+    #      the queue and act on the register wptr.
     gpu_reg32_write(GPU_BASE_SDMA0_0, GPU_R_SDMA0_RB_WPTR, 44);
     gpu_reg32_write(GPU_BASE_SDMA0_0, GPU_R_SDMA0_RB_WPTR_HI, 0);
-    gpu_mfence();
-    store64(bar2 + (GPU_SDMA_DOORBELL_INDEX << 2), 44);   # posted 64-bit doorbell = wptr in BYTES (index<<2 = 0x780)
     gpu_mfence();
 
     # S4 — bounded poll on the FENCE SENTINEL (coherence-honest completion; never spins unbounded).
