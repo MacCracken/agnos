@@ -4,14 +4,16 @@ version = "0.1.0"
 description = "agnos ring-3 CP-DMA fill proof (P9 / #13) — gpu_fill#85 + present#84 from userland: GPU-clears the blit back buffer red/green/blue with a PM4 DMA_DATA constant-fill on the compute ring and flips each to the scanout. Exits 95 iff every fill+present succeeded; the screen changing colour is the visual oracle."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.4.39"
+cyrius = "6.4.70"
 
 [build]
 src = "gpufill.cyr"
 output = "build/gpufill"
 
-# syscalls -> SYS_EXIT + sys_uptime_ms (#40). The GPU pair #84/#85 is called via the raw `syscall`
-# intrinsic: their canonical ring-3 wrappers belong in the cyrius stdlib (hands-off), and the ABI is
-# identical either way. The result IS the exit code, read via the exec path's "run: exit N".
+# syscalls -> SYS_EXIT, sys_uptime_ms (#40), sys_sched_yield (#44) and the GPU pair sys_gpu_fill (#85) /
+# sys_gpu_present (#84), which landed in cyrius [6.4.70] (hence the pin) from this repo's ask
+# docs/development/issues/2026-07-21-gpu-present-fill-syscall-cyrius-wrappers.md. Those two are behind a
+# file-level `#ifdef CYRIUS_TARGET_AGNOS` gate, so an off-agnos build fails to COMPILE rather than emitting
+# Linux rmdir/creat. The result IS the exit code, read via the exec path's "run: exit N".
 [deps]
 stdlib = ["syscalls"]

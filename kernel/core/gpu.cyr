@@ -58,6 +58,7 @@ var gpu_bb_b_phys     = 0;   # buffer B
 var gpu_bb_b_mc       = 0;
 var gpu_bb_back       = 0;   # current RENDER target: 0 = A, 1 = B (the other is being scanned)
 var gpu_bb_fbsize     = 0;   # framebuffer byte size (pitch*height) — the CP-DMA fill span for gpu_fill_sys
+var gpu_bb_pitch      = 0;   # framebuffer row pitch in BYTES — the dst stride for gpu_blit_shm_sys
 var gpu_scanout_pid   = 0 - 1; # pid owning the scanout (-1 = the console owns it)
 # P3a display-audio discovery (read-only probe results)
 var gpu_audio_dp      = 0 - 1; # 1 = the lit stream is DP (DTO1, constant module); 0 = HDMI (DTO0, pixel-clock module); -1 = unknown
@@ -2675,6 +2676,7 @@ fn gpu_blit_arm() {
     gpu_mfence();
     gpu_bb_back   = 0;
     gpu_bb_fbsize = fb_size;                 # remember the fill span for gpu_fill_sys (CP-DMA clear)
+    gpu_bb_pitch  = pitch;                   # and the row stride for gpu_blit_shm_sys (CP-DMA rect blit)
     gpu_bb_armed  = 1;
     return 1;
 }

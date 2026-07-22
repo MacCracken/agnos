@@ -33,7 +33,7 @@ enum SysNrAgnos {
     SYS_RMDIR = 10;                # rmdir(path, pathlen) → 0
     SYS_MOUNT = 11;                # mount() → 0 (stub)
     SYS_SYNC = 12;                 # sync() → 0
-    SYS_REBOOT = 13;               # reboot() → halts
+    SYS_REBOOT = 13;               # reboot(magic1,magic2,cmd,arg) → power_sys (1.55.25+)
     SYS_PAUSE = 14;                # pause() → 0 (one hlt)
     SYS_GETUID = 15;               # getuid() → 0 (stub, always root)
     SYS_KILL = 16;                 # kill(pid, sig) → 0 / -1
@@ -92,6 +92,11 @@ enum SysNrAgnos {
     SYS_BLK_WRITE  = 78;          # blk_write(h, lba, buf, nsec) → nsec / -1 — GATED (arm via blk_open magic)
     SYS_BLK_INFO   = 79;          # blk_info(h, out) → 0 / -1
     SYS_BLK_CLOSE  = 80;          # blk_close(h) → 0 / -1
+    SYS_READDIR    = 81;          # readdir(path, buf, max) → count / <0 (agnos #81; fchdir on Linux)
+    SYS_GPU_DISPATCH     = 82;    # gpu_dispatch(a,b,c) → 0/<0; 64xi32 8x8 A*B→C on GPU (RENAME on Linux)
+    SYS_GPU_DISPATCH_F64 = 83;    # gpu_dispatch_f64(a,b,c) → 0/<0; 64xf64, unfused (MKDIR on Linux)
+    SYS_GPU_PRESENT      = 84;    # present() → 1/0; flip back buffer (RMDIR on Linux — DESTRUCTIVE)
+    SYS_GPU_FILL         = 85;    # gpu_fill(color) → 0/-1; CP-DMA constant-fill of the back buffer (CREAT on Linux)
 }
 
 # ================================================================
@@ -418,8 +423,22 @@ fn sys_getuid(): i64 { return syscall(SYS_GETUID); }
 # the Linux/macOS peers) a uniform agnos definition. See lib/sys.cyr is_root.
 fn sys_geteuid(): i64 { return syscall(SYS_GETUID); }
 
-# Halt the machine (does not return).
-fn sys_reboot(): i64 { return syscall(SYS_REBOOT); }
+# agnos power-control constants — the kernel's power_sys magic gate
+# ("PWR1"/"PWR2") + command codes. Exported so consumers stop hand-rolling them.
+var PWR_MAGIC1 = 0x50575231;   # "PWR1"
+var PWR_MAGIC2 = 0x50575232;   # "PWR2"
+var PWR_HALT   = 1;
+var PWR_OFF    = 2;
+var PWR_REBOOT = 3;
+
+# agnos power control — syscall #13 power_sys(magic1, magic2, cmd, arg). agnos
+# 1.55.25 replaced the old halt-only stub with this 4-arg form; the magic pair
+# gates stale / garbage callers closed (agnos kernel/core/power.cyr). Widened
+# here from the old nullary `sys_reboot()` to match. cmd: PWR_HALT / PWR_OFF /
+# PWR_REBOOT. CHANGELOG [6.4.68].
+fn sys_reboot(magic1, magic2, cmd, arg): i64 {
+    return syscall(SYS_REBOOT, magic1, magic2, cmd, arg);
+}
 
 # Create directory `path` (length `pathlen`). Returns 0.
 fn sys_mkdir(path, pathlen): i64 { return syscall(SYS_MKDIR, path, pathlen); }
@@ -528,6 +547,79 @@ fn sys_blk_write(h, lba, buf, nsec): i64 { return syscall(SYS_BLK_WRITE, h, lba,
 fn sys_blk_info(h, out): i64             { return syscall(SYS_BLK_INFO, h, out); }
 # blk_close(h) — release the handle → 0 / -1.
 fn sys_blk_close(h): i64                 { return syscall(SYS_BLK_CLOSE, h); }
+
+# ---- agnos ring-3 directory listing (#81, agnos 1.53.13; kernel `ext2_readdir_sys`). Gives
+# crab / a future `ls` / agnsh a named entry point instead of the raw number. agnos-kernel-only —
+# on Linux x86_64 #81 is `fchdir`, so this band lives only in the agnos syscall stdlib (included
+# under #ifdef CYRIUS_TARGET_AGNOS). (issue 2026-07-10-agnos-sys-readdir-wrapper.)
+# readdir(path, buf, max) — list `path` into `buf` as `max` fixed 64-byte records (name NUL-term
+# at +0, type at +63: 1=dir/0=file; `.`/`..` omitted) → entry count (>=0), or <0 (-1 bad ptr/not
+# ext2, -2 not found, -4 not a dir).
+fn sys_readdir(path, buf, max): i64      { return syscall(SYS_READDIR, path, buf, max); }
+
+# ---- agnos GPU-compute band (#82-83; kernel leg agnos 1.54.30 cut / 1.54.33 hardened). The ring-3
+# seam onto the 1.54.x GPU arc: agnos drives the AMD Cezanne iGPU (gfx90c) directly from the kernel
+# — no amdgpu, no ROCm — PSP firmware load → CP/MEC → GPUVM → PM4 → hand-assembled gfx90c shaders.
+# Consumers: gpumm, and mabda / tentib / attn11 for ML inference on agnos.
+#
+# SAFETY — why this band lives ONLY in the agnos peer: on Linux x86_64 #82 is `rename(old, new)` and
+# #83 is `mkdir(path, mode)`. An ungated wrapper would hand the caller's matmul buffer POINTERS to the
+# kernel as filesystem PATHS. That is materially worse than the #81/`fchdir` precedent above. The gate
+# is the selector in lib/syscalls.cyr (`#ifdef CYRIUS_TARGET_AGNOS` around the include of this file),
+# which is STRONGER than a runtime error: off-agnos these fns do not exist at all, so a non-agnos
+# build fails at COMPILE time (undefined fn) and can never emit the syscall instruction. Do not add an
+# in-function #ifdef — this peer is standalone and wrong in its entirety off-agnos (SYS_OPEN=7 would
+# be Linux `lseek`, SYS_EXIT=0 would be `read`, …), so guarding 2 of ~80 wrappers would only give
+# false comfort. Never include this file directly; go through lib/syscalls.cyr.
+# (issue 2026-07-14-agnos-sys-gpu-dispatch-wrappers.)
+#
+# a, b, c — ring-3 pointers to 64-element row-major 8x8 matrices; `c` receives C = A * B.
+#   #82: i32 lanes (256 B each). #83: f64 lanes (512 B each).
+# Return: 0 OK · -1 GPU not ready · -2 dispatch didn't complete · -3 VM fault · -4 pointer outside
+#   user range · -5 user page not mapped.
+# -1 is the NORMAL answer where there is no AMD GPU (e.g. QEMU) — treat it as "no GPU here", not a
+#   failure. BLOCKING: the kernel busy-waits on a bounded watchdog (~100 ms cap) for the dispatch fence.
+# Kernel-side (1.54.33) bounds-checks all three pointers before the C write-back.
+# #83 is deliberately NOT fused-FMA: the shader accumulates with separate v_mul_f64 + v_add_f64 (two
+#   roundings, k-ascending) so the GPU result is BIT-IDENTICAL to rosnet's CPU arithmetic.
+# Fixed 8x8 today; a generalized (M,N,K) form would be new numbers, not a change to these.
+# gpu_dispatch(a, b, c) — 8x8 i32 matmul on the GPU shader cores; C = A * B → 0 / <0 (-1 = no GPU).
+fn sys_gpu_dispatch(a, b, c): i64     { return syscall(SYS_GPU_DISPATCH, a, b, c); }
+# gpu_dispatch_f64(a, b, c) — 8x8 f64 matmul, rosnet-bit-correct (unfused); C = A * B → 0 / <0.
+fn sys_gpu_dispatch_f64(a, b, c): i64 { return syscall(SYS_GPU_DISPATCH_F64, a, b, c); }
+
+# present() — flip the accumulated blit back buffer to the scanout. NULLARY.
+# Tear-free + vsync-paced: BLOCKS until the pipe takes the surface at the next
+# vblank (<= one frame) — it IS the vsync pacer. The explicit half of the P7
+# blit/present split: a compositor blits with blit #39's DEFER_PRESENT bit (no
+# flip), then calls this ONCE per frame. Returns 1 = presented, 0 = nothing to
+# present (double-buffer not armed / direct-FB path). IRON-ONLY: under QEMU this
+# returns 0 CLEANLY — read that as "no GPU here", not a failure (the #82/#83
+# precedent). agnos 1.55.x.
+# SAFETY: syscall 84 is rmdir(pathname) on Linux x86_64 — a DESTRUCTIVE call that
+# would delete a directory at whatever stale pointer sits in rdi. This wrapper is
+# reachable ONLY on agnos: the entire peer is included behind
+# `#ifdef CYRIUS_TARGET_AGNOS` in lib/syscalls.cyr, so off-agnos the fn does not
+# exist and any build referencing it fails at COMPILE time with no binary emitted
+# — stronger than an in-function guard (guarding 2 of ~80 rows would be false
+# comfort when SYS_OPEN=7 is Linux lseek). Both legs gated by
+# scripts/agnos-crossbuild-gate.sh. CHANGELOG [6.4.70].
+fn sys_gpu_present(): i64 { return syscall(SYS_GPU_PRESENT); }
+
+# gpu_fill(color) — GPU-clear the current blit back buffer to `color` (32-bit
+# xRGB8888) via a PM4 CP-DMA DMA_DATA constant fill (SRC_SEL=2 DATA) on the MEC
+# compute ring, replacing a full-screen CPU store loop. Arms the double-buffer
+# lazily; pair with sys_gpu_present() to show it. Only the colour crosses the
+# ring-3 boundary — fb_phys stays unexposed (same discipline as blit #39).
+# BLOCKS on a bounded CP-DMA completion fence (~100 ms cap). Needs NO cache flush
+# to be scanout-visible (CP-DMA writes MC-direct, bypassing GL2). Returns
+# 0 = filled, -1 = no usable display (no GPU/pipe — e.g. QEMU) or the fill failed;
+# treat -1 under QEMU as "no GPU here". agnos 1.55.30 (iron-proven: CP-DMA
+# hardware fill verified 4KB all=pattern).
+# SAFETY: syscall 85 is creat(pathname, mode) on Linux x86_64 — a 32-bit colour
+# reinterpreted as a path pointer would create/truncate a file. Same file-level
+# agnos gate as sys_gpu_present above. CHANGELOG [6.4.70].
+fn sys_gpu_fill(color): i64 { return syscall(SYS_GPU_FILL, color); }
 
 # ---- agnos HDA audio band (#64-69) — the ring-3 half of the agnos 1.52.x Gate-2
 # freeze (kernel handlers land in parallel). Single frozen format: 48000 Hz / S16 /

@@ -1,0 +1,70 @@
+# gpublit — agnos ring-3 GPU COMPOSITE proof (desktop arc).
+#
+# Proves the new pair end to end FROM RING 3:
+#   #86 shm_create_gpu(size) — allocate a client surface in the GPU CARVEOUT (so it has an MC address the
+#       CP-DMA engine can read; a #71 shm page is pmm/system RAM the GPU cannot reach AT ALL — bus-master
+#       is off by design, which is exactly why the compositor could not GPU-composite before).
+#   #87 gpu_blit_shm(id, wh, dstxy) — the GPU blits that surface straight into the blit back buffer.
+#       This replaces BOTH the shm->userland read AND the per-pixel composite loop: the pixels never
+#       leave kernel GPU-visible memory.
+# Then #85 gpu_fill for the background and #84 present to show the frame — the full compositor frame
+# shape (clear -> composite windows -> flip) with zero per-pixel CPU work in the loop.
+#
+# VISUAL oracle: a blue field with three yellow 64x64 squares composited into it.
+# EXIT oracle:  95 = all pass · 90 fill · 91 present · 92 shm_create_gpu (-1 ⇒ no carveout, e.g. QEMU)
+#               93 shm_write · 94 gpu_blit_shm
+#
+# ⚠ POSITIONING CAVEAT (watch the screen): the kernel derives the back-buffer pitch from boot_info, which on
+# this box reports the OUTPUT geometry (2560x1440), while the pipe actually scans a smaller 800x600 surface
+# — the exact mismatch P4 fixed for fb_console. So the squares proving the BLIT may not land where the
+# coordinates say. Squares appearing at all = the GPU composite works; squares in the wrong place = the
+# pitch source needs the same scanout-derived fix P4 applied (gpu_bb_pitch from the surface, not boot_info).
+
+var gb_pix[2048];                  # module-global ⇒ N x u64 = 16384 B = 64*64*4 (one BGRA surface)
+
+fn gpublit_hold(ms): i64 {
+    var t0 = sys_uptime_ms();
+    var t = t0;
+    var spins = 0;
+    while (t - t0 < ms) {
+        if (spins >= 4000000) { return 0; }
+        sys_sched_yield();
+        t = sys_uptime_ms();
+        spins = spins + 1;
+    }
+    return 0;
+}
+
+fn gpublit_main(): i64 {
+    var w = 64;
+    var h = 64;
+    var bytes = w * h * 4;                         # 16384
+
+    # Background: GPU-clear the back buffer to a deep blue so the composited squares are unmistakable.
+    if (sys_gpu_fill(0x00000080) != 0) { return 90; }
+
+    # A GPU-VISIBLE client surface (the whole point — #71 would be unreachable by the engine).
+    var id = syscall(86, bytes);
+    if (id < 1) { return 92; }                     # -1 ⇒ no GPU carveout (QEMU): CPU path still applies
+
+    # Paint it yellow CPU-side, then hand it to the kernel once.
+    var i = 0;
+    while (i < w * h) { store32(&gb_pix + i * 4, 0x00FFFF00); i = i + 1; }
+    if (syscall(72, id, &gb_pix, bytes) != 0) { return 93; }   # shm_write#72 (unchanged, works on both kinds)
+
+    # Composite it three times at different spots — repeated GPU blits into the same frame.
+    var wh = (h * 65536) + w;
+    if (syscall(87, id, wh, 0) != 0) { return 94; }                          # (0,0)
+    if (syscall(87, id, wh, (64 * 65536) + 64) != 0) { return 94; }          # (64,64)
+    if (syscall(87, id, wh, (128 * 65536) + 128) != 0) { return 94; }        # (128,128)
+
+    # One vsync-paced flip for the whole frame.
+    if (sys_gpu_present() != 1) { return 91; }
+    gpublit_hold(3000);
+
+    syscall(74, id);                               # shm_free#74 — carveout slot returns to the table
+    return 95;
+}
+
+fn _entry(): i64 { var r = gpublit_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

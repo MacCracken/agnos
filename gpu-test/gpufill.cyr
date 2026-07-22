@@ -18,9 +18,11 @@
 # and the screen stays stuck on the presented frame. gpufill_hold is now bounded TWICE (deadline AND a hard
 # spin cap) and yields each pass so it cannot starve the timer/scheduler.
 #
-# Raw syscall numbers for #84/#85: their canonical ring-3 wrappers live in the CYRIUS stdlib, which is
-# hands-off here (filed as an ask: 2026-07-21-gpu-present-fill-syscall-cyrius-wrappers.md), so this calls the
-# syscall intrinsic directly — identical ABI (rax=num, rdi=a1). sys_uptime_ms (#40) comes from the stdlib.
+# Uses the NAMED cyrius wrappers throughout (sys_gpu_fill / sys_gpu_present, cyrius >= 6.4.70 — the ask filed
+# as 2026-07-21-gpu-present-fill-syscall-cyrius-wrappers.md, landed in cyrius [6.4.70]). Those two live behind
+# a FILE-LEVEL `#ifdef CYRIUS_TARGET_AGNOS` gate, so off-agnos they don't exist and a build referencing them
+# fails at COMPILE time with no binary emitted — which matters here because on Linux x86_64 #84 is rmdir
+# (destructive) and #85 is creat.
 
 # Hold the presented frame on screen. BOUNDED TWICE OVER — a millisecond deadline AND a hard spin cap — so a
 # stalled or coarse clock can never wedge the program. Yields each pass instead of hot-spinning.
@@ -30,7 +32,7 @@ fn gpufill_hold(ms): i64 {
     var spins = 0;
     while (t - t0 < ms) {
         if (spins >= 4000000) { return 0; }        # hard cap — guarantees termination
-        syscall(44);                                # sched_yield — don't starve the timer/scheduler
+        sys_sched_yield();                          # yield — do not starve the timer/scheduler
         t = sys_uptime_ms();
         spins = spins + 1;
     }
@@ -39,8 +41,8 @@ fn gpufill_hold(ms): i64 {
 
 # One cycle: GPU-clear the back buffer to `color` via CP-DMA, flip it to the scanout, hold it.
 fn gpufill_show(color, ms): i64 {
-    if (syscall(85, color) != 0) { return 90; }    # gpu_fill(color) -> 0 ok / -1
-    if (syscall(84) != 1) { return 91; }           # present() -> 1 presented / 0 nothing
+    if (sys_gpu_fill(color) != 0) { return 90; }   # gpu_fill(color) -> 0 ok / -1
+    if (sys_gpu_present() != 1) { return 91; }     # present() -> 1 presented / 0 nothing
     gpufill_hold(ms);
     return 0;
 }

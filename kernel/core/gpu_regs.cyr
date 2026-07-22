@@ -207,6 +207,15 @@ var GPU_FB_BACK_OFF         = 0x40000000;
 # (2 x ~33 MB) — but it is a GUARD, not an assumption: a quirky/hostile GOP geometry must fall back to the
 # direct FB rather than scribble the buffers over the TMR or the arena.
 var GPU_FB_BACK_LIMIT       = 0x60000000;
+# GPU-VISIBLE client surface buffers (desktop arc). The shm present-buffer slots (#71-74) are backed by
+# `pmm_alloc_2mb` — SYSTEM RAM, which the GPU physically cannot read: bus-master is off by design, so the
+# engines reach only the FB aperture. A GPU composite therefore REQUIRES the client's pixels to live in the
+# CARVEOUT, which is what `shm_create_gpu`#86 allocates from here. 2.5 GB into the 3 GB carveout — clear of
+# the console FB (offset 0), the back buffers (1 GB), the PSP TMR (1.5 GB) and the compute arena (2 GB).
+# 16 slots x 2 MB = 32 MB, ending at 0xA2000000, well inside the carveout. Slot i is a FIXED window at
+# REGION_OFF + i*SLOT_SIZE — no allocator needed, and a slot's MC address is pure arithmetic.
+var GPU_SHM_REGION_OFF      = 0xA0000000;
+var GPU_SHM_SLOT_SIZE       = 0x200000;   # 2 MB per slot — matches SHM_MAX_SIZE
 
 # === 1.55.x P3 — display-audio egress (the 1.53.5 HDA backlog closes here) ===
 # The HDA side already works: the GPU's audio function (PCI 04:00.1) is probed, its codec enumerated, a

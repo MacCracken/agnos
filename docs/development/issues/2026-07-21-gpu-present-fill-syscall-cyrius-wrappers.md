@@ -1,9 +1,18 @@
 # 2026-07-21 — Display/2D syscalls `present` (#84) / `gpu_fill` (#85) + their cyrius wrappers
 
-**Status:** 🟡 **OPEN** (cyrius leg). **Kernel:** done + **iron-proven** on archaemenid — `#84` cut with the
-P7 blit/present split (**1.55.x**), `#85` cut **1.55.30** (CP-DMA fill). **cyrius:** `SYS_GPU_PRESENT = 84` /
-`SYS_GPU_FILL = 85` + agnos-gated wrappers — **this ask**. **Consumer:** `/bin/gpufill` (agnos `gpu-test/`)
-currently calls the raw `syscall(84)` / `syscall(85, color)` and would migrate to the named wrappers.
+**Status:** ✅ **RESOLVED — both legs (2026-07-22).** **Kernel:** done + **iron-proven** on archaemenid —
+`#84` cut with the P7 blit/present split (**1.55.x**), `#85` cut **1.55.30** (CP-DMA fill). **cyrius:** landed
+in **[6.4.70]** — `SYS_GPU_PRESENT = 84` / `SYS_GPU_FILL = 85` + `sys_gpu_present()` (nullary) /
+`sys_gpu_fill(color)`. **Consumer:** `/bin/gpufill` (agnos `gpu-test/`) **migrated off the raw numbers** onto
+the named wrappers and re-pinned to `cyrius = "6.4.70"`.
+
+**How cyrius gated it — stronger than this ask requested.** Rather than per-function guards, the *entire*
+agnos peer sits behind a file-level `#ifdef CYRIUS_TARGET_AGNOS` in `lib/syscalls.cyr`, so off-agnos the
+functions **do not exist** and any referencing build fails at **compile** time with no binary emitted. Their
+stated reasoning is better than the per-function ask: guarding 2 of ~80 rows would be false comfort when
+`SYS_OPEN = 7` is Linux `lseek`. Both legs are covered by `scripts/agnos-crossbuild-gate.sh`. They also
+report catching a test that passed against a *wrong* syscall number (mutation `#84 → 99` still passed) and
+replacing it with a precise one.
 
 Mirror: `cyrius/docs/development/issues/2026-07-21-agnos-sys-gpu-present-fill-wrappers.md`.
 

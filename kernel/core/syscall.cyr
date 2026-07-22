@@ -684,6 +684,7 @@ var SHM_MAX_SIZE = 2097152;         # 2 MB — one pmm page per buffer (bite-2 c
 var shm_phys[16];                   # 2 MB physical base per slot (0 = free)
 var shm_kva[16];                    # kernel access VA for the page (kernel-mirror; every-CR3 reachable)
 var shm_size[16];                   # byte size per slot
+var shm_mc[16];                     # GPU MC address per slot (0 = PMM-backed ⇒ NOT GPU-reachable)
 
 # ids are 1-BASED: 0 is the setu "inline pixels" sentinel (setu_attach arg5), so a real
 # shm buffer must never be 0. slot = id - 1.
@@ -728,6 +729,76 @@ fn shm_create(size) {
     return 0 - 1;
 }
 
+# shm_create_gpu(size) -> slot id (1-based) / -1. The GPU-VISIBLE peer of shm_create#71: same table, same
+# shm_write#72 / shm_read#73 / shm_free#74, but the page is carved out of the GPU CARVEOUT instead of PMM so
+# it has an MC address the CP-DMA engine can actually read. That is not an optimisation — `pmm_alloc_2mb`
+# returns SYSTEM RAM and the GPU cannot reach it at all (bus-master off by design), so a GPU composite is
+# impossible from a #71 buffer. Slot i is a FIXED 2 MB window at GPU_SHM_REGION_OFF + i*GPU_SHM_SLOT_SIZE —
+# no allocator, and the MC address is pure arithmetic off the carveout base. Returns -1 when there is no GPU
+# carveout (QEMU): the caller then falls back to shm_create#71 and the CPU path, unchanged.
+fn shm_create_gpu(size) {
+    if (size <= 0) { return 0 - 1; }
+    if (size > SHM_MAX_SIZE) { return 0 - 1; }
+    if (gpu_present == 0) { return 0 - 1; }
+    if (gpu_arena_mc == 0) { return 0 - 1; }
+    if (gpu_arena_phys == 0) { return 0 - 1; }
+    # Carveout bases, derived from the arena globals (arena = base + GPU_VM_ARENA_OFF on both sides).
+    var cpu_carve = gpu_arena_phys - GPU_VM_ARENA_OFF;
+    var mc_carve  = gpu_arena_mc   - GPU_VM_ARENA_OFF;
+    var i = 0;
+    while (i < SHM_MAX) {
+        if (load64(&shm_phys + i * 8) == 0) {
+            var off = GPU_SHM_REGION_OFF + i * GPU_SHM_SLOT_SIZE;
+            var cpu = cpu_carve + off;                  # CPU-side direct-DRAM window
+            var mc  = mc_carve  + off;                  # what the CP-DMA engine addresses
+            vmm_remap_wc_2mb(cpu);                      # WC: shm_write is a big sequential CPU store run
+            store64(&shm_phys + i * 8, cpu);            # non-zero ⇒ slot in use (shm_slot_valid)
+            store64(&shm_kva  + i * 8, cpu);            # the direct window IS the access VA
+            store64(&shm_size + i * 8, size);
+            store64(&shm_mc   + i * 8, mc);             # the GPU-visibility marker
+            return i + 1;                               # 1-based id (0 = setu "inline pixels" sentinel)
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+# gpu_blit_shm_sys(id, wh, dstxy) -> 0 / -1. THE compositor composite primitive: GPU-blit a client's
+# surface straight from its carveout shm slot into the current blit back buffer at (dx,dy), via
+# gpu_cp_dma_blit (one CP-DMA per row, src stride = w*4, dst stride = the framebuffer pitch). Replaces the
+# per-pixel userland composite AND the shm->userland read that precedes it: the pixels never leave the
+# kernel's GPU-visible memory. Pack: wh = (h<<16)|w, dstxy = (dy<<16)|dx — same convention as blit#39.
+# Ring-3 passes an id + geometry only; no MC address crosses the boundary. Pair with gpu_fill#85 for the
+# background and gpu_present#84 to flip. Returns -1 if the slot is PMM-backed (use #86 to allocate),
+# out of bounds, or the GPU/display isn't usable.
+fn gpu_blit_shm_sys(id, wh, dstxy) {
+    if (gpu_present == 0) { return 0 - 1; }
+    if (shm_slot_valid(id) == 0) { return 0 - 1; }
+    var slot = id - 1;
+    var src_mc = load64(&shm_mc + slot * 8);
+    if (src_mc == 0) { return 0 - 1; }                  # PMM-backed ⇒ the GPU cannot read it
+    if (gpu_blit_arm() != 1) { return 0 - 1; }
+    if (gpu_bb_pitch == 0) { return 0 - 1; }
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    var dx = dstxy & 0xFFFF;
+    var dy = (dstxy >> 16) & 0xFFFF;
+    if (w < 1) { return 0 - 1; }
+    if (h < 1) { return 0 - 1; }
+    var row = w * 4;                                    # 32bpp packed source rows
+    if (row * h > load64(&shm_size + slot * 8)) { return 0 - 1; }   # source must fit its slot
+    # Reject (don't silently clip) anything off-screen — the compositor owns clipping.
+    var fbw = gpu_bb_pitch / 4;
+    var fbh = gpu_bb_fbsize / gpu_bb_pitch;
+    if (dx + w > fbw) { return 0 - 1; }
+    if (dy + h > fbh) { return 0 - 1; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+    if (gpu_cp_dma_blit(dst_mc, gpu_bb_pitch, src_mc, row, row, h) != 1) { return 0 - 1; }
+    return 0;
+}
+
 # shm_write(id, user_src, size) -> 0 / -1. Copies user src INTO the shm page.
 fn shm_write(id, src, size) {
     if (shm_slot_valid(id) == 0) { return 0 - 1; }
@@ -754,10 +825,15 @@ fn shm_read(id, dst, size) {
 fn shm_free(id) {
     if (shm_slot_valid(id) == 0) { return 0 - 1; }
     var slot = id - 1;
-    pmm_free_2mb(load64(&shm_phys + slot * 8));
+    # ⚠ Release to the RIGHT allocator. A #86 (GPU-visible) slot is a FIXED window in the GPU carveout, never
+    # a pmm page — handing its address to pmm_free_2mb would corrupt the page allocator's bitmap with an
+    # address it never owned. Carveout slots are reclaimed by simply clearing the table entry; the window is
+    # statically owned by GPU_SHM_REGION_OFF + slot*GPU_SHM_SLOT_SIZE and is reused on the next create.
+    if (load64(&shm_mc + slot * 8) == 0) { pmm_free_2mb(load64(&shm_phys + slot * 8)); }
     store64(&shm_phys + slot * 8, 0);
     store64(&shm_kva + slot * 8, 0);
     store64(&shm_size + slot * 8, 0);
+    store64(&shm_mc + slot * 8, 0);
     return 0;
 }
 
@@ -2019,6 +2095,24 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var fr = gpu_fill_sys(arg1);
         stack_canary_check(canary);
         return fr;
+    }
+    if (num == 86) {
+        # shm_create_gpu(size) — GPU-VISIBLE peer of shm_create#71: the page comes from the GPU carveout, so
+        # it has an MC address the CP-DMA engine can read (a #71 pmm page is system RAM the GPU cannot reach
+        # at all). Same shm_write#72 / shm_read#73 / shm_free#74 afterwards. -1 when there's no carveout
+        # (QEMU) — the caller falls back to #71 + the CPU path.
+        var sg = shm_create_gpu(arg1);
+        stack_canary_check(canary);
+        return sg;
+    }
+    if (num == 87) {
+        # gpu_blit_shm(id, wh, dstxy) — GPU-composite a client surface from its carveout shm slot straight
+        # into the blit back buffer at (dx,dy). wh=(h<<16)|w, dstxy=(dy<<16)|dx (blit#39's packing).
+        # Replaces BOTH the shm→userland read and the per-pixel composite: the pixels never leave the
+        # kernel's GPU-visible memory. Pair with gpu_fill#85 + gpu_present#84.
+        var bs = gpu_blit_shm_sys(arg1, arg2, arg3);
+        stack_canary_check(canary);
+        return bs;
     }
     if (num == 40) {
         # uptime_ms() — monotonic milliseconds since boot, returned in rax (no
