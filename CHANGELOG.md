@@ -3,12 +3,50 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — realignment of the 1.56.x shader arc to its own plan
+## [Unreleased]
+
+## [1.56.4] — 2026-07-22 — the shader arc realigned to its own plan; #92 iron-proven end to end
 
 The arc's plan doc (`docs/development/planning/kernel-shader-arc-156x.md`) settled the syscall shape as
 decision **D-3** before any code was written. 1.56.2/1.56.3 shipped the option D-3 explicitly **rejected**,
 and renumbered the bite IDs so the plan no longer read against the CHANGELOG. This entry restores both, and
 fixes two live defects the re-audit surfaced along the way.
+
+### ✅ IRON-PROVEN (archaemenid, 2026-07-22) — the descriptor ABI works from ring 3
+
+Two burns. The first passed glyph and gradient but skipped coverage on a build-flag error (below); the
+second, with the flag dependency enforced, closed every arm.
+
+| Arm | Result |
+|---|---|
+| **`#92` op `0x01` (alpha blend)** | `run /bin/gpublend` → **`exit 95`**. Photo: three 50%-alpha squares straddling the opaque band, overlapping by 32 px — visible as **five** distinct colour regions (red · red+green · green · green+blue · blue), each rendering one colour above the band and another below it. Compounding overlaps are the evidence the blend is per-pixel src-over and not a copy |
+| **`#92` op `0x02` (coverage)** | `run /bin/gpucov` → **`exit 95`**. Photo: four overlapping translucent discs on the desktop fill, curved edges with no staircase — the non-rectangular edge neither `#87` nor CP-DMA can draw |
+| **coverage self-test (plan-S10 re-proof)** | Ran and rendered after the arity fix: a smooth-edged cyan disc straddling the dark/light underlay split |
+| **glyph (plan-S9), gradient (plan-S11)** | First iron, burn 1: `shader glyph expand online (1bpp text, bit-exact, 558 px set)` — panel shows "AGNOS SHADER GPU" **unmirrored**, confirming MSB-first bit order — and `shader gradient online (row 0 exact, max dev 1)` |
+
+`exit 95` is each program's own self-validation: every `#92` call returned 0 through the full ring-3 path —
+`#89` probe → `#85` clear → `#86`/`#72` seed → **`#92`** → `#84` present. So the descriptor copy-in, the
+two-phase validation, the op dispatch and the packed return all work on real silicon.
+
+Also confirmed incidentally: a clean boot with the shader slots relocated off the VM fault-sink page
+(`0x15000` → `0x50000`) — no fault, no canary bar, all six 1.54.x compute proofs still green.
+
+⚠ The **discs render as ellipses ~1.33× wide**. Known display scaling, not the rasteriser: the surface is
+800×600 (4:3) scaled to a 2560×1440 (16:9) output, and `(2560/800)/(1440/600) = 1.333` exactly. Same cause as
+the stretched proportions noted at 1.56.3.
+
+### Fixed — SHADER_COV / SHADER_RECT without SHADER_BLEND was a silent no-op that cost a burn
+
+`gpu_shader_cov_test` and `gpu_shader_rect_test` both open with
+`if (gpu_blend_ok != 1) { "gpu: skipping ... (blend math unproven)"; return 0; }`, and `gpu_blend_ok` is set
+**only** by `gpu_shader_blend_test` under `#ifdef SHADER_BLEND`. So `SHADER_COV=1` alone builds a kernel that
+prints `gpu: skipping coverage` and proves nothing — indistinguishable from a pass unless you read for an
+**absent** line. That is exactly what the first 1.56.4 burn did.
+
+`scripts/build.sh` now **hard-fails** on the combination, with the reason and the corrected command line.
+Checked in `build.sh` rather than `burn-prep.sh` because burns have historically been driven by
+hand-exported defines that bypass burn-prep entirely. Negative-tested against the exact flag set that
+produced the wasted burn.
 
 ### Fixed — coverage dispatched with a garbage RSRC1 and a wild kernel store (P0)
 
