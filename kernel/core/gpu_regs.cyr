@@ -911,6 +911,9 @@ var GPU_C2E_SENTINEL       = 0xC2E0C2E0; # value the MEC must write (the fence w
 var GPU_C2E_NOTYET         = 0xDEADBEEF; # pre-seed marker: distinct from sentinel AND 0 (no stale/zero false-pass)
 var GPU_PM4_DMA_DATA_HDR   = 0xC0055000; # PACKET3(DMA_DATA=0x50, count=5) -> 7-dword CP-DMA memory-copy packet
 var GPU_CPDMA_DONE         = 0x0CDD0A7E; # CP-DMA done sentinel (distinct from C2E_SENTINEL/NOTYET, bit31-clear)
+var GPU_CPDMA_CTL_COPY     = 0x80000000; # DMA_DATA CONTROL (copy): CP_SYNC=1 | SRC_SEL=0(MC) | DST_SEL=0(MC) | ENGINE=ME
+var GPU_CPDMA_CTL_FILL     = 0xC0000000; # DMA_DATA CONTROL (fill): CP_SYNC=1 | SRC_SEL=2(DATA, bits30:29) | DST_SEL=0(MC) | ENGINE=ME
+var GPU_CPDMA_MAX          = 0x03FFFFFF; # DMA_DATA BYTE_COUNT field = 26 bits (~64 MiB max per packet)
 # STAGED (row-2 coherence follow-up ONLY; do NOT wire into the first C2e burn — it would
 # collapse the executed-vs-coherent disambiguation). Verify CP_COHER_CNTL vs local gc_9_0
 # sh_mask.h before that burn (a wrong bit makes ACQUIRE_MEM a silent no-op).

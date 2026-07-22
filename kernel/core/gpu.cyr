@@ -57,6 +57,7 @@ var gpu_bb_a_mc       = 0;
 var gpu_bb_b_phys     = 0;   # buffer B
 var gpu_bb_b_mc       = 0;
 var gpu_bb_back       = 0;   # current RENDER target: 0 = A, 1 = B (the other is being scanned)
+var gpu_bb_fbsize     = 0;   # framebuffer byte size (pitch*height) — the CP-DMA fill span for gpu_fill_sys
 var gpu_scanout_pid   = 0 - 1; # pid owning the scanout (-1 = the console owns it)
 # P3a display-audio discovery (read-only probe results)
 var gpu_audio_dp      = 0 - 1; # 1 = the lit stream is DP (DTO1, constant module); 0 = HDMI (DTO0, pixel-clock module); -1 = unknown
@@ -1241,27 +1242,15 @@ fn gpu_shader_dispatch() {
 # SDMA copy-test is parked). Gated #ifdef CP_DMA_COPY; needs the ring coherence-proven (gpu_fence_ok).
 # WEDGE-SAFE: bounded watchdog only; MC addrs in OUR carveout (bus-master off ⇒ no system RAM); a bad
 # addr faults into the 0x1FFC dummy-page net (fault!=0).
-fn gpu_cp_dma_copy() {
+fn gpu_cpdma_submit(ctl, slo, shi, dst_mc, bytes) {
     if (gpu_present == 0) { return 0; }
-    if (gpu_fence_ok == 0) { kprintln("gpu: cp-dma copy skipped (ring unverified)", 42); return 0; }
+    if (gpu_fence_ok == 0) { return 0; }
     if (gpu_arena_mc == 0) { return 0; }
 
-    var src_phys   = gpu_arena_phys + GPU_SDMA_SRC_SUBOFF;
-    var dst_phys   = gpu_arena_phys + GPU_SDMA_DST_SUBOFF;
-    var fence_phys = gpu_arena_phys + GPU_SDMA_FENCE_SUBOFF;
-    var src_mc     = gpu_arena_mc + GPU_SDMA_SRC_SUBOFF;
-    var dst_mc     = gpu_arena_mc + GPU_SDMA_DST_SUBOFF;
     var fence_mc   = gpu_arena_mc + GPU_SDMA_FENCE_SUBOFF;
-    var ndw        = 1024;                               # 4096 bytes / 4
+    var fence_phys = gpu_arena_phys + GPU_SDMA_FENCE_SUBOFF;
 
-    # S0 — seed src (j+1, nonzero + bit31-clear), dst = NOT-YET, clear the fence sentinel.
-    var i = 0;
-    while (i < ndw) {
-        store32(src_phys + i * 4, i + 1);
-        store32(dst_phys + i * 4, GPU_C2E_NOTYET);
-        i = i + 1;
-    }
-    store32(fence_phys, GPU_C2E_NOTYET);
+    store32(fence_phys, GPU_C2E_NOTYET);                 # arm the done marker
     gpu_mfence();
 
     # Clear sticky VM fault-status (pulse CLEAR bit0, re-arm) so a post-kick fault!=0 blames THIS packet.
@@ -1269,15 +1258,16 @@ fn gpu_cp_dma_copy() {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
 
-    # S1 — append DMA_DATA (7 dw) + WRITE_DATA done-marker (5 dw) at the tracked cursor (gpu_ring_put
-    #      advances gpu_ring_wptr). MC addresses (gpu_arena_mc), NOT phys — the classic slip.
+    # DMA_DATA (7 dw) + WRITE_DATA done-marker (5 dw) at the tracked cursor. ctl/slo/shi select the variant:
+    #   COPY: ctl=CTL_COPY, slo/shi = src_mc lo/hi (SRC_SEL=0, read from MC).
+    #   FILL: ctl=CTL_FILL, slo = the 32-bit value, shi = 0 (SRC_SEL=2 DATA, dw2 IS the literal). dst_mc = MC, NOT phys.
     gpu_ring_put(GPU_PM4_DMA_DATA_HDR);                  # PACKET3(DMA_DATA=0x50, count=5)
-    gpu_ring_put(0x80000000);                            # CP_SYNC=1 | SRC_SEL=0(MC) | DST_SEL=0(MC) | ENGINE=ME
-    gpu_ring_put(src_mc & 0xFFFFFFFF);                   # SRC_ADDR_LO
-    gpu_ring_put((src_mc >> 32) & 0xFFFFFFFF);           # SRC_ADDR_HI (full 32b on DMA_DATA 0x50)
+    gpu_ring_put(ctl);                                   # CONTROL: CP_SYNC | SRC_SEL(copy=0/fill=2) | DST_SEL=0(MC) | ME
+    gpu_ring_put(slo & 0xFFFFFFFF);                      # SRC_ADDR_LO  (or the fill DATA constant)
+    gpu_ring_put(shi & 0xFFFFFFFF);                      # SRC_ADDR_HI  (0 for a 32-bit fill constant)
     gpu_ring_put(dst_mc & 0xFFFFFFFF);                   # DST_ADDR_LO
     gpu_ring_put((dst_mc >> 32) & 0xFFFFFFFF);           # DST_ADDR_HI
-    gpu_ring_put(0x00001000);                            # COMMAND: BYTE_COUNT=4096 (raw), WR_CONFIRM on
+    gpu_ring_put(bytes & GPU_CPDMA_MAX);                 # COMMAND: BYTE_COUNT (26-bit raw), WR_CONFIRM on (b31=0)
     gpu_ring_put(GPU_PM4_WRITE_DATA_HDR);                # PACKET3(WRITE_DATA=0x37, count=3)
     gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);                # DST_SEL=5 memory-async | WR_CONFIRM | ME
     gpu_ring_put(fence_mc & 0xFFFFFFFF);                 # marker DST_ADDR_LO
@@ -1287,32 +1277,70 @@ fn gpu_cp_dma_copy() {
 
     var new_wptr = gpu_ring_wptr;
 
-    # S2 — KICK via the proven register-wptr path: GRBM-select the HQD, wptr LO then HI (CP latches on HI).
+    # KICK via the proven register-wptr path: GRBM-select the HQD, wptr LO then HI (CP latches on HI).
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
 
-    # S3 — bounded watchdog on the done sentinel (CP_SYNC orders it after the copy), 100 ms cap.
+    # Bounded watchdog on the done sentinel (CP_SYNC orders it after the op), 100 ms cap.
     var s = 0;
     var done = 0;
     while (s < 1000) {
         if ((load32(fence_phys) & 0xFFFFFFFF) == GPU_CPDMA_DONE) { done = 1; s = 1000; }
         else { gpu_udelay(100); s = s + 1; }
     }
-    var rptr = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR) & 0xFFFFFFFF;
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);   # deselect
     gpu_mfence();
 
     var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
-    if (fault != 0) { kprintln("gpu: cp-dma copy faulted", 24); return 0; }
-    if (done != 1) {
-        kprint("gpu: cp-dma copy TIMEOUT rptr ", 30); kprint_num(rptr);
-        kprint(" wptr ", 6);                            kprint_num(new_wptr);
-        kprintln("", 0);
-        return 0;
+    if (fault != 0) { return 0; }
+    if (done != 1) { return 0; }
+    return 1;
+}
+# gpu_cp_dma — hardware COPY `bytes` from src_mc to dst_mc (both GPU MC addresses, dword-aligned). 1 ok / 0 fail.
+fn gpu_cp_dma(dst_mc, src_mc, bytes) {
+    return gpu_cpdma_submit(GPU_CPDMA_CTL_COPY, src_mc & 0xFFFFFFFF, (src_mc >> 32) & 0xFFFFFFFF, dst_mc, bytes);
+}
+# gpu_cp_dma_fill — hardware FILL: write the 32-bit `val` across `bytes` at dst_mc (SRC_SEL=2 DATA; dw2=val,
+# dw3=0). No source read; ideal for framebuffer clears. MC-direct ⇒ scanout/CPU-visible. 1 ok / 0 fail.
+fn gpu_cp_dma_fill(dst_mc, val, bytes) {
+    return gpu_cpdma_submit(GPU_CPDMA_CTL_FILL, val & 0xFFFFFFFF, 0, dst_mc, bytes);
+}
+# gpu_cp_dma_blit — hardware 2D rect BLIT: copy `rows` rows of `row_bytes` from src_mc to dst_mc with
+# independent source/dest row strides (one CP-DMA per row). The compositor substrate for moving a window or
+# region FB->FB and for scrolling. Returns 1 on full success, 0 if any row fails. All MC addresses.
+fn gpu_cp_dma_blit(dst_mc, dst_stride, src_mc, src_stride, row_bytes, rows) {
+    var y = 0;
+    while (y < rows) {
+        if (gpu_cp_dma(dst_mc + y * dst_stride, src_mc + y * src_stride, row_bytes) != 1) { return 0; }
+        y = y + 1;
     }
+    return 1;
+}
+# gpu_cp_dma_copy — P9 boot SELF-TEST (the iron proof): seed a 4 KB src, copy it via gpu_cp_dma, verify
+# dst==src byte-for-byte. Gated #ifdef CP_DMA_COPY; needs the ring coherence-proven (gpu_fence_ok).
+fn gpu_cp_dma_copy() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_fence_ok == 0) { kprintln("gpu: cp-dma copy skipped (ring unverified)", 42); return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
 
-    # S4 — verify dst == src byte-for-byte (self-validating oracle).
+    var src_phys = gpu_arena_phys + GPU_SDMA_SRC_SUBOFF;
+    var dst_phys = gpu_arena_phys + GPU_SDMA_DST_SUBOFF;
+    var src_mc   = gpu_arena_mc + GPU_SDMA_SRC_SUBOFF;
+    var dst_mc   = gpu_arena_mc + GPU_SDMA_DST_SUBOFF;
+    var ndw = 1024;                                      # 4096 bytes / 4
+
+    var i = 0;
+    while (i < ndw) {
+        store32(src_phys + i * 4, i + 1);                # src = j+1 (nonzero, bit31-clear)
+        store32(dst_phys + i * 4, GPU_C2E_NOTYET);       # dst = NOT-YET marker
+        i = i + 1;
+    }
+    gpu_mfence();
+
+    var r = gpu_cp_dma(dst_mc, src_mc, 4096);
+    if (r != 1) { kprintln("gpu: cp-dma copy TIMEOUT or fault", 33); return 0; }
+
     var ok = 1;
     var j = 0;
     while (j < ndw) {
@@ -1324,6 +1352,39 @@ fn gpu_cp_dma_copy() {
         return 1;
     }
     kprintln("gpu: cp-dma copy MISMATCH (marker fired, bytes wrong)", 53);
+    return 0;
+}
+# gpu_cp_dma_fill_test — P9 fill SELF-TEST: hardware-fill a 4 KB slot with a constant via gpu_cp_dma_fill,
+# verify every dword == the constant. Proves the DMA_DATA constant-fill (SRC_SEL=2) packet on iron. Gated
+# #ifdef CP_DMA_COPY (runs alongside the copy test). Reuses the DST arena scratch slot.
+fn gpu_cp_dma_fill_test() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_fence_ok == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+
+    var dst_phys = gpu_arena_phys + GPU_SDMA_DST_SUBOFF;
+    var dst_mc   = gpu_arena_mc + GPU_SDMA_DST_SUBOFF;
+    var val      = 0x5A5A5A5A;                           # bit31-clear fill pattern (sign-safe compare)
+    var ndw      = 1024;                                 # 4096 bytes / 4
+
+    var i = 0;
+    while (i < ndw) { store32(dst_phys + i * 4, GPU_C2E_NOTYET); i = i + 1; }   # pre-seed NOT-YET
+    gpu_mfence();
+
+    var r = gpu_cp_dma_fill(dst_mc, val, 4096);
+    if (r != 1) { kprintln("gpu: cp-dma fill TIMEOUT or fault", 33); return 0; }
+
+    var ok = 1;
+    var j = 0;
+    while (j < ndw) {
+        if ((load32(dst_phys + j * 4) & 0xFFFFFFFF) != val) { ok = 0; j = ndw; }
+        else { j = j + 1; }
+    }
+    if (ok == 1) {
+        kprintln("gpu: CP-DMA hardware fill verified (4KB, all=pattern)", 53);
+        return 1;
+    }
+    kprintln("gpu: cp-dma fill MISMATCH (marker fired, bytes wrong)", 53);
     return 0;
 }
 # ── C2g-1 — FIRST MULTI-THREAD compute dispatch (1 workgroup, 64 threads; out[tid]=tid) ──
@@ -2546,8 +2607,9 @@ fn gpu_blit_arm() {
     var q = 0;
     while (q < fb_size) { store64(gpu_bb_a_phys + q, 0); store64(gpu_bb_b_phys + q, 0); q = q + 8; }
     gpu_mfence();
-    gpu_bb_back  = 0;
-    gpu_bb_armed = 1;
+    gpu_bb_back   = 0;
+    gpu_bb_fbsize = fb_size;                 # remember the fill span for gpu_fill_sys (CP-DMA clear)
+    gpu_bb_armed  = 1;
     return 1;
 }
 
@@ -3050,6 +3112,21 @@ fn gpu_blit_present(pid) {
     if (gpu_bb_back == 0) { gpu_bb_back = 1; } else { gpu_bb_back = 0; }
     gpu_scanout_pid = pid;
     return 1;
+}
+
+# gpu_fill_sys — SYSCALL #85 handler: GPU-clear the current blit back-buffer to `color` (xRGB8888) with a
+# CP-DMA fill (replacing the CPU store-loop), then userland presents (#84) to show it. Arms the double-buffer
+# lazily. Ring-3 names only the color — the kernel targets the back buffer, so no MC address crosses the
+# boundary (same discipline as blit #39). The fill is scanout-visible (MC-direct, no ACQUIRE_MEM). Returns 0
+# on success, -1 if the GPU/display isn't usable (QEMU, no pipe) or the fill failed.
+fn gpu_fill_sys(color) {
+    if (gpu_present == 0) { return 0 - 1; }
+    if (gpu_blit_arm() != 1) { return 0 - 1; }           # stand up the back buffers (idempotent)
+    if (gpu_bb_fbsize == 0) { return 0 - 1; }
+    var tgt_mc = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt_mc = gpu_bb_b_mc; }
+    if (gpu_cp_dma_fill(tgt_mc, color, gpu_bb_fbsize) != 1) { return 0 - 1; }
+    return 0;
 }
 
 # gpu_display_restore_console — hand the screen back to the console by re-pointing the scanout at the

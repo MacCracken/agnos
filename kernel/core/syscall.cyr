@@ -2012,6 +2012,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
         stack_canary_check(canary);
         return pr;
     }
+    if (num == 85) {
+        # gpu_fill(color) — P9: GPU-clear the current blit back-buffer to a 32-bit xRGB8888 color via a CP-DMA
+        # fill (offloads a full-screen clear off the CPU), then the compositor presents (#84). arg1 = color.
+        # Ring-3 names only the color; the kernel targets the back buffer. Returns 0 ok, -1 if no display.
+        var fr = gpu_fill_sys(arg1);
+        stack_canary_check(canary);
+        return fr;
+    }
     if (num == 40) {
         # uptime_ms() — monotonic milliseconds since boot, returned in rax (no
         # buffer, like getpid#2). timer_ticks is the 100 Hz tick counter (10 ms/
