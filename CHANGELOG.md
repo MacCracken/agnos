@@ -5,6 +5,81 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.56.1] — 2026-07-22 — the first alpha blend on the shader cores (+ shaders stop being hand-typed)
+
+**AGNOS now composites alpha on the GPU.** Per-pixel premultiplied src-over runs on the compute units,
+bit-exact against the CPU reference on all 64 test pixels — the arc's headline capability, and the thing
+CP-DMA structurally cannot do (it is a byte mover with no ALU).
+
+**✅ IRON-PROVEN (archaemenid, 2026-07-22):** `gpu: shader blend lanes stored 64 of 64` followed by
+`gpu: shader alpha blend online (64 px, bit-correct vs CPU)`. The lane count is reported separately and on
+purpose: a dispatch can retire having written *nothing* if every lane is EXEC-masked, which is exactly what
+happened at 1.54.17-19, so "it completed" is not evidence. Lane 0 (`alpha=0`, out must equal dst) and lane 63
+(`alpha=255`, out must equal src) are both in the sweep — the two cases a broken blend most easily passes by
+accident.
+
+### Added — shaders are now MACHINE-ASSEMBLED, not hand-typed
+
+- **`scripts/gfx9-asm.sh`** — `.s` → `llvm-mc` → Cyrius dword table. Every shader in `gpu.cyr` through 1.55.x
+  was transcribed by hand and verified against llvm-mc *afterwards*; this inverts the tool, making the
+  verifier the assembler. No new dependency and no new trust boundary. **This is what AMD itself does** —
+  `cwsr_trap_handler_gfx9.asm` is hand-written GFX9 assembly, assembled offline and checked into Linux as a
+  hex array in a driver with no runtime. Structurally the same situation.
+- **RSRC1/RSRC2 are HARVESTED, never hand-counted.** The script reads them out of the `.amdhsa_kernel`
+  descriptor llvm-mc computes (offsets 48/52). `gpu_regs.cyr` already warned that a miscounted RSRC word is
+  "wrong, not slow"; deriving it from the same source that assembled the code removes that class of bug.
+  First harvest matched agnos's existing hand-derived `GPU_COMPUTE_PGM_RSRC1_V12` exactly — a free
+  cross-check of the old method at the moment it was retired.
+- Two guards, both learned the hard way: the script **hard-fails on relocations in `.text`** (OpenCL builtins
+  emit `s_swappc_b64` to unresolved symbols — code agnos cannot link), and every kernel `.s` pins
+  `.amdhsa_ieee_mode 0` / `.amdhsa_float_denorm_mode_32 0`, because **LLVM defaults to 1/3** and a silent
+  float-semantics mismatch is the worst available failure mode.
+
+### Added — the blend itself
+
+- **`kernel/shaders/blend_premul.s`** — premultiplied f32 src-over. Chosen over the integer and f16 forms by
+  measurement, not preference: **20-22 VALU/px vs 31-33 integer and 43-45 f16**. GFX9 has single-instruction
+  byte↔float conversion in both directions (`v_cvt_f32_ubyte0..3`, `v_cvt_pk_u8_f32`), which is what makes
+  the float path *cheaper* than the integer one rather than merely more accurate. `v_dot4_i32_i8` does not
+  exist on gfx90c. `ia = 1 - src_a/255` folds into a single `v_fma_f32`.
+
+### Fixed — rounding, settled on iron
+
+- **`v_cvt_pk_u8_f32` ROUNDS TO NEAREST; it does not truncate.** The first version added `+0.5` before the
+  convert on the assumption that it truncated, which double-rounded and came out **+1 on every colour
+  channel** (lane 1 returned `0xFFFAFAFA` for an expected `0xFFF9F9F9`). Removing it is both correct and
+  **4 VALU/px cheaper**. Exact `.5` inputs provably cannot occur here — `t/255 = k+0.5` requires
+  `t = 255k + 127.5`, never an integer — so round-to-nearest and the reference's round-half-up agree on every
+  reachable value and the tie rule is unreachable.
+
+### Added — S1 / D0 probes (both now honest reports rather than false gates)
+
+- **`gpu_shader_state_probe`** — reports COMPUTE_PGM_RSRC1/2, thread state and L2 control. Two burns
+  established that the SH compute registers are **simply not readable** through the GRBM path on this part,
+  so it was converted from a gate into a labelled report (`SH regs not readable; L2 on`). Scratch-safety
+  moved to build time, where the descriptor states it.
+- **`gpu_mpc_probe`** — DCN MPC block, **5 of 5 constraints agree, base anchored**. The first attempt failed
+  its own gate, and the post-mortem is the useful part: one real offset error (`0x1275` is `MPCC_SM_CONTROL`,
+  not `STATUS` → `0x127F`) but *mostly the gate itself was wrong* — `bot_sel == self` means nothing when
+  there is no layer below, `0xF` is a Linux init sentinel rather than a fault, and Renoir has 4 OPPs.
+
+### Added — S3: grid blend into the scanout back buffer (BUILT, NOT YET IRON-PROVEN)
+
+- **`kernel/shaders/blend_rect.s` + `gpu_blend_rect_run`** — the same blend arithmetic byte-for-byte, over a
+  **2-D grid of 256 workgroups / 16,384 threads**, written in place on the back buffer and presented. Every
+  agnos dispatch before this was `DISPATCH_DIRECT 1,1,1`. The grid is 2-D rather than a flat pixel index
+  because **GFX9 has no integer divide** — `y = gid / width` would cost `v_rcp_f32` + Newton + fixup, while
+  `(width/64, height, 1)` gets the same decomposition free from `tgid_x`/`tgid_y`.
+- ⚠ **SGPR collision, caught before the burn:** `blend_premul.s` stages its `-1/255f` constant in **`s6`** —
+  and with `TGID_X_EN` set, **`s6` IS `tgid_x`**. A copy-paste would have overwritten the column index with a
+  float constant and corrupted every address. The grid kernel uses `s15`.
+- ⚠ **The present is bracketed.** `gpu_blit_present` leaves scanout on the back buffer permanently; at boot
+  that would replace the console for the remainder of the run — no shell prompt, and no way to run `klug` to
+  capture the log proving it worked. The test now flips, holds ~3 s, restores the console surface with the
+  same address-group-only write, and undoes the buffer swap.
+- S2 is retained in the same build as a **regression net**: if S3 fails while S2 passes, the fault is
+  isolated to grid / addressing / scanout and cannot be the blend math.
+
 ## [1.56.0] — 2026-07-22 — ✳ CYCLE OPEN: the SHADER arc (alpha, translucency, text)
 
 **1.55.x (Thrust P — DISPLAY) is CLOSED.** It ends with agnos owning a complete hardware-2D path on the

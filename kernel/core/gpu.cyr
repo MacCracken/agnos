@@ -1586,7 +1586,7 @@ fn gpu_shader_blend_test() {
     while (j < 64) {
         var got = load32(out_phys + (j << 2)) & 0xFFFFFFFF;
         var ref = blend_ref_px(load32(src_phys + (j << 2)) & 0xFFFFFFFF,
-                               load32(dst_phys + (j << 2)) & 0xFFFFFFFF) & 0xFFFFFFFF;
+        load32(dst_phys + (j << 2)) & 0xFFFFFFFF) & 0xFFFFFFFF;
         if (got != GPU_MT_NOTYET) { stored = stored + 1; }
         if (got != ref) { if (ok == 1) { bad = j; } ok = 0; }
         j = j + 1;
