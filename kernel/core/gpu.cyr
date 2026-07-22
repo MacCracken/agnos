@@ -1764,9 +1764,9 @@ fn gpu_blend_surface(src_mc, w, h, dx, dy) {
     var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
     var gx = (w + 63) / 64;                    # CEILING — the shader's EXEC guard trims the last group
     return gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, dst_mc,
-                              w * 4, gpu_bb_pitch, w, gx, h,
-                              gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
-                              gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+    w * 4, gpu_bb_pitch, w, gx, h,
+    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
 }
 
 # gpu_shader_rect_test — S3: alpha-blend a real rect INTO THE SCANOUT BACK BUFFER over a 2-D grid, verify
