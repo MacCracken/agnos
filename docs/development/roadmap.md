@@ -29,10 +29,50 @@
 
 ---
 
-## Active — 1.55.x display (Thrust P)
+## Active — 1.56.x shader (Thrust S)
+
+Everything that needs **arithmetic per pixel**. CP-DMA is a byte mover with no ALU — it cannot blend, convert
+formats, or replicate pixels within a row — so alpha/translucency, anti-aliased coverage, gradients, bitmap
+glyph expand, and intra-pixel channel permutation all belong to a compositing **shader**, riding the dispatch
+seam 1.54.x already proved. **Plan doc (the working document — read it before coding):**
+[`planning/kernel-shader-arc-156x.md`](planning/kernel-shader-arc-156x.md). Scope is exactly the "NOT CP-DMA"
+list in [`issues/2026-07-22-gpu-display-syscall-band-cyrius-wrappers.md`](issues/2026-07-22-gpu-display-syscall-band-cyrius-wrappers.md).
+
+**Ladder (17 bites, two lanes).** S-lane: **S0** host toolchain + CPU reference oracle (no burn) → **S1**
+read-only compute-state probe → **S2** first blend, 64 px into fresh scratch → **S3** GL2↔scanout↔CP-DMA
+coherence in one boot → **S4** `v_perm`/VOP3P/channel swap → **S5** grid > 1 workgroup → **S6** EXEC bounds
+guard → **S7** full per-pixel alpha → **S8** ring-3 seam (**new syscall #92**) → **S9** glyph expand → **S10**
+coverage blit → **S11** gradients → **S12** batched one-submission frame. D-lane (DCN, independent): **D0**
+read-only MPC probe → **D1** hardware RGBX↔BGRX crossbar → **D2** MPCC global-alpha.
+
+**Four gaps the ladder is shaped around** (none is a blocker; all are unproven):
+1. **No shader has ever written to the scanout back buffer.** Shader stores land in **GL2**; the DCN HUBP
+   fetches through the data fabric and never traverses GL2 — and `buffer_wbl2` is unsupported on gfx90c, so
+   the CP write-back packet is the *only* mechanism. **S3 settles it; nothing writes to the back buffer first.**
+2. **agnos has never dispatched a grid other than 1×1×1** — `COMPUTE_PGM_RSRC2` sets no TGID bits (S5).
+3. **`s_mov_b64 exec,-1` is correct only for an exact 64-lane wave** — with paging disabled, a surplus lane's
+   store lands somewhere real in the carveout (S6).
+4. **One shader slot**, rewritten in place every dispatch (S12).
+
+**Deferred with reason:** the DCN **second plane**. Renoir/Cezanne exposes only 4 blendable planes total, so it
+can never serve a compositor with N translucent windows — it is a 4-6 bite front-end bring-up for a fixed-N
+win. Its own arc, not a 1.56.x bite. D1/D2 still ride along because they are genuine one-register wins on the
+pipe agnos already owns.
+
+---
+
+## Closed — 1.55.x display (Thrust P)
 
 Own the GOP-lit DCN 2.1 pipe on the archaemenid Cezanne iGPU. Plan doc:
 [`planning/kernel-display-arc-155x.md`](planning/kernel-display-arc-155x.md).
+
+**CLOSED 2026-07-22 at 1.55.32.** Ended with agnos owning a complete hardware-2D path with no amdgpu anywhere:
+the pipe read (P0) → scanout flip (P1) → vblank pacing (P2) → double-buffered blit (DOOM renders through it) →
+quiet-boot banding fixed (P4) → **CP-DMA copy / fill / strided blit** → and a ring-3 band (**#84 present · #85
+fill · #86 shm_create_gpu · #87 gpu_blit_shm · #88 gpu_fill_rect · #89 gpu_caps**) that draws a whole
+compositor frame with **zero per-pixel CPU work**, every step iron-proven. Note the 2D acceleration landed on
+the **compute ring via CP-DMA**, not the GFX ring this roadmap originally predicted — and SDMA was abandoned
+after six burns (it rings up but never fetches; an agnos doorbell-setup gap, **not** a hardware limit).
 
 Landed and iron-passed: reading the pipe (P0), the scanout flip that was agnos's first DCN write (P1),
 vblank pacing (P2), the double-buffered present loop, and `blit`#39 double-buffering — DOOM now renders
@@ -82,17 +122,31 @@ PCM-content-sensitive on the working amdgpu path, closing that branch
 ([`dcn-audio-crc-tap-identity-2026-07-15.md`](../../../agnosticos/docs/development/prior-art/dcn-audio-crc-tap-identity-2026-07-15.md)).
 The search has moved off the display-audio registers and onto the transmitter/encoder bring-up.
 
-### Remaining ladder
+### Outcome of the ladder
 
-| Bite | Scope |
-|------|-------|
-| **P4 — scanout-residue clear** | Clear the AMD Zen Quiet-Boot scanout residue using the P1 re-point primitive, for a clean first paint. This subsumes the long-parked standalone "AMD Zen scanout residue" item — the two are one bite now that P1 shipped the primitive. It does not block MVP: the VGA path is legible at 1080p and 1440p. The two resumption options remain a HUBP `clear_tiling` port (the Linux `drivers/gpu/drm/amd/display/` analog) or a shadow-buffer FB-console architectural evaluation (simpledrm-style); both forms of another GOP `SetMode` lever were falsified at Attempt 78. Pin: `project_amd_zen_scanout_residue`. |
-| **GFX-ring 2D acceleration** | Accelerated `blit`#39 and a GPU-composited aethersafha. |
-| **P6+ — 3D and full modeset** | RADV-derived GFX-ring blits over the C1/C2 ring machinery, plus DCN mode-set, DP link-training, and DMCUB. Likely a follow-on arc — but the **cold-modeset foundation is already in hand**: the sovereign Cyrius ATOM BIOS interpreter (`kernel/core/atom.cyr`, the arc's A3) runs the vendor VBIOS bytecode bit-correctly on iron (proven at 1.55.23), so a sovereign modeset does not need DMCUB. It is in the ambition and is not written off. |
+| Bite | Outcome |
+|------|---------|
+| **P4 — scanout-residue clear** | ✅ **DONE, 1.55.28.** Root cause was neither tiling nor DCC nor a pitch register (all falsified on iron across ~8 burns): the firmware scans a small **800×600** surface that DCN upscales, while `boot_info` reports the 2560×1440 **output** — so `fb_console` wrote 2560-wide rows into an 800-wide surface. Fix = read the real viewport + pitch and match `fb_console`'s geometry to them. **Read-only; no register writes.** The through-line of every wrong turn was *derived* register offsets — a read-only regdump anchored to known geometry is what cracked it. |
+| **2D acceleration** | ✅ **DONE, 1.55.30-1.55.32 — but not as predicted.** This entry said "GFX-ring". It landed on the **compute ring via CP-DMA** (`DMA_DATA`), because SDMA was abandoned after six burns (rings up, never fetches) and the CP ring was already proven. Copy · fill · strided blit, plus the ring-3 band #85-#89. A GPU-composited aethersafha is now unblocked and is a **desktop-repo** item, not a kernel one. |
+| **P6+ — 3D and full modeset** | **Still open — carried forward.** RADV-derived GFX-ring work, DCN mode-set, DP link-training. The cold-modeset foundation is in hand: the sovereign Cyrius ATOM interpreter (`kernel/core/atom.cyr`) runs vendor VBIOS bytecode bit-correctly on iron (1.55.23), so a sovereign modeset does not need DMCUB. Likely its own arc. |
 
-Numbering note: this file previously called 2D acceleration "P5". The display-arc plan doc's ladder has no
-P5 — it goes from P4 straight to P6+. Reconcile before anyone codes against either. See
-[Open questions](#open-questions-for-the-human).
+The old "P5 vs 2D-acceleration" numbering note is **resolved**: 2D acceleration shipped and is no longer a
+pending ladder item, so there is nothing left to reconcile.
+
+### Carried out of the closed 1.55.x display arc
+
+**A4 — HDMI audio out of agnos** is **still open**, and it is the arc's one unfinished thread. The state is
+well-characterised and every cheap hypothesis is dead: the register class is exonerated (every DCN audio
+register byte-matches amdgpu-playing), the feed/codec/DMA/sample-magnitude are exonerated (a from-scratch
+Linux userspace driver replaying agnos's *exact* feed on amdgpu's pipe **played audible sound**), the sink is
+exonerated (the XB323U is audible over HDMI under amdgpu), the audio clock is alive (a counted `ACR CTS`
+instrument, not an echo register), and the SYMCLKA "breakthrough" was **falsified by in-boot A/B**. What is
+left is structural, not a register: **agnos rides the GOP's DVI modeset and has never performed a real HDMI
+modeset.** ⇒ A4 is blocked on the same full-modeset work as P6+, and the ATOM interpreter is the lever.
+Arc doc: [`planning/hdmi-modeset-arc-155x.md`](planning/hdmi-modeset-arc-155x.md).
+
+**P7 consumer wiring** — the compositor adopting #85-#89 (`bhumi/src/scanout.cyr` is the only target-specific
+file) — is a **desktop-repo** item now that the kernel seam is proven, not a kernel roadmap entry.
 
 ### Carried out of the closed 1.54.x GPU arc
 
@@ -352,6 +406,7 @@ now. Arcs before 1.40.x are recorded in the CHANGELOG and in `state.md`'s own cl
 | **1.52.x** | Audio output — the HDA/Azalia driver and the ring-3 `snd_*` band, syscalls #64 through #69. First sound from sovereign AGNOS. | 1.52.8, 2026-07-04 | Validated *(no explicit close sentence — see open question 5)* |
 | **1.53.x** | Multi-thrust: FP/SIMD in ring 3, console perf, shm and setu, the raw-block install primitives (#75–80), `readlink`#70, `readdir`#81, and native xHCI USB-HID. The 1.53.5 HDMI-audio bites left the backlog the 1.55.x display arc (A4) is working. | 1.53.14, 2026-07-10 | Validated (explicit) |
 | **1.54.x** | **GPU compute — the crown.** Sovereign gfx90c compute proven on iron with no amdgpu and no ROCm: firmware load, engines, GPUVM, CP/MEC, PM4, hand-assembled shaders, integer and rosnet-bit-correct f64 matmul, exposed to ring 3 via syscalls #82 and #83. Plan: [`planning/kernel-gpu-arc-154x.md`](planning/kernel-gpu-arc-154x.md). | 1.54.33, 2026-07-14 | Complete end-to-end, iron-proven |
+| **1.55.x** | **DISPLAY (Thrust P) — the GOP-lit DCN 2.1 pipe, owned.** Read the pipe (P0) → scanout flip, agnos's first DCN write (P1) → vblank pacing (P2) → double-buffered `blit`#39 (DOOM renders tear-free, no app change) → quiet-boot scanout banding fixed (P4, a months-parked bug) → **hardware 2D via CP-DMA** on the compute ring (copy · fill · strided blit) → ring-3 band **#84 present · #85 gpu_fill · #86 shm_create_gpu · #87 gpu_blit_shm · #88 gpu_fill_rect · #89 gpu_caps**, drawing a whole compositor frame with **zero per-pixel CPU work**. Also: the sovereign Cyrius **ATOM BIOS interpreter** running vendor VBIOS bytecode bit-correctly on iron. Carried out open: **A4 HDMI audio** and **P6+ modeset** (both blocked on the same full HDMI modeset). Plan: [`planning/kernel-display-arc-155x.md`](planning/kernel-display-arc-155x.md). | 1.55.32, 2026-07-22 | Complete end-to-end, iron-proven (A4 carried) |
 
 ---
 
