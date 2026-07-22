@@ -5,12 +5,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.30] — 2026-07-21 — P9: first hardware 2D on agnos — CP-DMA copy VERIFIED on iron
+
+**P9 (2D acceleration) is DONE.** `gpu: CP-DMA hardware copy verified (4KB, dst==src)` — first-try green on
+iron (Cezanne, out.txt line 130). A PM4 **`DMA_DATA`** (CP-DMA) packet on the **already-proven MEC compute
+ring** copies 4 KB carveout→carveout and the CPU reads it back byte-identical — **the first
+hardware-accelerated 2D on sovereign agnos, with no SDMA, no doorbell, and no new firmware.** Built on the
+SDMA ring-up groundwork from 1.55.29 — but when SDMA wouldn't fetch, the copy pivoted onto the CP ring that
+the compute thrust already proved.
+
+### Added
+
+- `gpu_cp_dma_copy()` (`gpu.cyr`, gated `CP_DMA_COPY`): appends a 7-dword `DMA_DATA` (op 0x50; `CP_SYNC=1`,
+  `SRC/DST_SEL=0` MC-direct so the copy bypasses GL2 and is CPU-visible with **no `ACQUIRE_MEM`**, `ENGINE=ME`,
+  raw `byte_count=4096`) + the C2e-proven WRITE_DATA done-marker to the compute ring, submits via the proven
+  register-wptr kick, and verifies `dst==src`. Packet values anchored across mesa/kernel PM4 defs, mabda's
+  HW-verified-on-Cezanne encoding, and agnos's own conventions. `GPU_PM4_DMA_DATA_HDR` + `GPU_CPDMA_DONE` in
+  `gpu_regs.cyr`.
+
+**Why not SDMA:** the SDMA engine rings up (1.55.29) but never *fetched* its first packet on this box — the
+doorbell (`CAPTURED=0`) and bare register-wptr both failed. That's an agnos doorbell-setup gap (Linux drives
+SDMA here fine), **not** a hardware limit — but 2D doesn't need SDMA at all, so the copy rides the CP ring
+that already works. SDMA ring-up stays banked for future async/parallel-DMA; its fetch gap is a documented
+known-issue, not a blocker.
+
 ## [1.55.29] — 2026-07-21 — P9 checkpoint: the SDMA 2D-accel engine RINGS UP on iron (first-packet fetch WIP)
 
-A demark cut for the P9 (2D acceleration via SDMA) arc. The **System DMA engine is brought up end-to-end on
-iron** — the first non-CP/compute AMD engine agnos rings up — mirroring the proven MEC compute-ring bring-up
-from Thrust C. What's iron-validated (all behind opt-in build flags; the default build is unchanged from
-1.55.28):
+The **System DMA engine is brought up end-to-end on iron** — the first non-CP/compute AMD engine agnos rings
+up — mirroring the proven MEC compute-ring bring-up from Thrust C. What's iron-validated (all behind opt-in
+build flags; the default build is unchanged from 1.55.28):
 
 - **P9.0 — read-only SDMA0 discovery** (`SDMA_PROBE`): the SDMA0 register block dumps without hanging (engine
   clocked + readable). An adversarially-verified anchoring pass (reconstructed offsets **cross-checked against
