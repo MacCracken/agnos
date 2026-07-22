@@ -5,6 +5,40 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.56.0] — 2026-07-22 — ✳ CYCLE OPEN: the SHADER arc (alpha, translucency, text)
+
+**1.55.x (Thrust P — DISPLAY) is CLOSED.** It ends with agnos owning a complete hardware-2D path on the
+GOP-lit DCN 2.1 pipe, no amdgpu anywhere: read the pipe → scanout flip → vblank pacing → double-buffered blit
+(DOOM renders through it) → quiet-boot banding fixed (P4) → **CP-DMA copy / fill / strided blit** → and a
+ring-3 syscall band (**#84 present · #85 fill · #86 shm_create_gpu · #87 gpu_blit_shm · #88 gpu_fill_rect ·
+#89 gpu_caps**) that draws a whole compositor frame with **zero per-pixel CPU work**, every step iron-proven
+on archaemenid. Two engines are proven: the **CP-DMA** DMA engine (this arc) and the **shader cores** (the
+1.54.x compute thrust — hand-assembled gfx90c ISA, bit-correct matmul, ring-3 seam #82/#83).
+
+**1.56.x is the SHADER arc**, and its scope is already written down: it is precisely the "NOT CP-DMA" list
+from `docs/development/issues/2026-07-22-gpu-display-syscall-band-cyrius-wrappers.md`. CP-DMA is a byte mover
+with no ALU — it cannot blend, convert formats, or replicate pixels within a row. Everything that needs
+arithmetic per pixel belongs to a compositing **shader**, on the dispatch seam that already exists:
+
+- **Alpha blend / translucency** — `rend_blend`'s per-pixel `(sr*a + dr*ia)/255`. The headline: real
+  translucent windows and panels, and the fidelity the MUDRA/SHANTA designs want.
+- **Anti-aliased coverage blit** — src-over modulated by an 8-bit coverage mask: *the* vector-text and shape
+  path (rekha glyph → sadish path → coverage → blit).
+- **Gradients** — per-pixel lerp + src-over.
+- **Bitmap glyph draw** — 1bpp → 32bpp with a transparent background: a *conditional* per-pixel store, so
+  neither a fill nor a copy. The **highest call-count site in the whole desktop tree**.
+- **Channel swap (RGBX ↔ BGRX)** — a permutation *within* each pixel; note no CPU path exists for this today
+  either, so it is an unhandled case, not just a slow one.
+
+**Design fork to settle early:** whole-surface translucency could ride **DCN hardware plane blending** (a
+second HUBP/DPP pipe composites at scanout, essentially free) while per-pixel effects need the shader. They
+are complementary, and the answer depends on what the designs actually call for.
+
+**Possible accelerant:** shaders are hand-assembled ISA today (llvm-mc-verified). **mabda already has a
+SPIR-V → GFX9 compiler HW-verified on Cezanne** (`gfx9_isel` / `gfx9_regalloc` / `gfx9_waitcnt` /
+`gfx9_encode`) — only its *compiler* half would be reusable (its runtime goes through amdgpu), but that could
+remove hand-assembly from the critical path. Verify before banking on it.
+
 ## [1.55.32] — 2026-07-22 — the GPU compositor seam: #86-#89, a whole frame with zero per-pixel CPU work
 
 **The full compositor frame shape now runs from ring 3 with no per-pixel CPU work anywhere in it.**
@@ -12,6 +46,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 64×64 squares on the exact coded diagonal: `gpu_fill`#85 → `shm_create_gpu`#86 → `shm_write`#72 →
 `gpu_blit_shm`#87 ×3 → `present`#84. This cut adds the two syscalls that make a *real* compositor able to
 use that path: a **rect** fill for window chrome, and the capability/geometry probe it needs to clip.
+
+**✅ IRON-PROVEN (archaemenid, 2026-07-22): `run /bin/gpublit` → `run: exit 95`** — a whole mock compositor
+frame with zero per-pixel CPU work: `gpu_caps`#89 → `gpu_fill`#85 → `gpu_fill_rect`#88 ×3 → `shm_create_gpu`#86
++ `shm_write`#72 → `gpu_blit_shm`#87 ×2 → `present`#84. The window was positioned **from the geometry #89
+itself reported**, so the caps values are proven usable rather than merely non-zero.
+
+### Fixed — before it could reach a compositor
+
+- **`gpu_caps`#89 reported width=0/height=0 on a cold probe.** It derived geometry from `gpu_bb_pitch` /
+  `gpu_bb_fbsize`, which only `gpu_blit_arm()` populates — but #89 is exactly the syscall a compositor calls
+  *first*. The natural probe-then-clip order therefore always saw zeros, and since #87/#88 **reject** rather
+  than clip, **every subsequent blit would have failed**; aethersafha would have hit it on frame one. #89 now
+  arms lazily (idempotent) so the geometry it reports is the real back buffer. Caught by `/bin/gpublit`'s
+  self-validation on the first iron run (`exit 97`), before any compositor consumed the ABI.
 
 ### Added — the compositor-enabling pair
 

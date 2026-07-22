@@ -10,10 +10,15 @@ Mirror: `cyrius/docs/development/issues/2026-07-22-agnos-gpu-display-syscall-ban
 
 **Two tiers — please treat differently:**
 - **Tier 1 — EXISTS + IRON-PROVEN, needs wrappers now:** `#86 shm_create_gpu`, `#87 gpu_blit_shm` (agnos 1.55.31). **Validated on archaemenid 2026-07-22:** `/bin/gpublit` composited three GPU-blitted squares onto a GPU-filled background and presented them — the full compositor frame shape (clear → composite → flip) with zero per-pixel CPU work. Back-buffer stride and scanout confirmed in agreement (squares landed at the exact coded coordinates).
-- **Tier 2 — SHAPE DECLARED, agnos implements first:** `#88 gpu_fill_rect`, `#89 gpu_caps`,
-  `#90 gpu_readback_shm`, `#91 gpu_blit_bb`. Listed so the numbers stay contiguous and reserved, and so the
-  wrapper work can be planned once. **Do not wrap these until agnos ships each** — they are documented here
-  to prevent number drift, not to be implemented ahead of the kernel.
+- **Tier 1b — `#88 gpu_fill_rect` + `#89 gpu_caps` NOW SHIPPED + IRON-PROVEN (agnos 1.55.32, 2026-07-22).**
+  Promoted out of Tier 2 — **wrappers wanted now, alongside #86/#87.** `/bin/gpublit` → `run: exit 95` drew a
+  whole compositor frame (probe → clear → 3 chrome rects → 2 GPU composites → flip) with zero per-pixel CPU
+  work, positioning the window from the geometry #89 itself reported. ⚠ Note for the docstring: **#89 arms the
+  double-buffer lazily** — it must, because a cold probe otherwise reports width=0/height=0 and, since #87/#88
+  reject rather than clip, every later blit fails (caught on iron before any compositor consumed it).
+- **Tier 2 — SHAPE DECLARED, agnos implements first:** `#90 gpu_readback_shm`, `#91 gpu_blit_bb`. Listed so
+  the numbers stay contiguous and reserved, and so the wrapper work can be planned once. **Do not wrap these
+  until agnos ships each** — documented to prevent number drift, not to be implemented ahead of the kernel.
 
 ---
 
@@ -149,3 +154,12 @@ belong to the **alpha/translucency arc** and will ride a compositing shader, not
 - **bhumi** — `src/scanout.cyr` is the only target-specific file; the present path lands here.
 - **setu** — client surfaces migrate from #71 to #86 so they are GPU-blittable.
 - **`/bin/gpufill`, `/bin/gpublit`** (agnos `gpu-test/`) — the ring-3 proof programs.
+
+```cyrius
+SYS_GPU_FILL_RECT = 88;   # gpu_fill_rect(color,wh,dstxy) → 0/-1; rect fill (SYMLINK on Linux)
+SYS_GPU_CAPS      = 89;   # gpu_caps(buf,len) → 0/-1; 8x u32 caps + back-buffer geometry (READLINK on Linux)
+```
+```cyrius
+fn sys_gpu_fill_rect(color, wh, dstxy): i64 { return syscall(SYS_GPU_FILL_RECT, color, wh, dstxy); }
+fn sys_gpu_caps(buf, len): i64              { return syscall(SYS_GPU_CAPS, buf, len); }
+```

@@ -25,18 +25,18 @@
 
 #ifdef ARCH_X86_64
 fn print_agnos_kernel_banner() {
-    kprintln("AGNOS kernel v1.55.32", 21);
+    kprintln("AGNOS kernel v1.56.0", 20);
 }
 #endif
 
 #ifdef ARCH_AARCH64
 fn print_agnos_kernel_banner() {
-    serial_println("AGNOS kernel v1.55.32 [aarch64]", 31);
+    serial_println("AGNOS kernel v1.56.0 [aarch64]", 30);
 }
 #endif
 
 fn print_agnos_shell_banner() {
-    kprintln("AGNOS shell v1.55.32 (type 'help')", 34);
+    kprintln("AGNOS shell v1.56.0 (type 'help')", 33);
 }
 
 # Program-body-safe version accessor. Returns a pointer to the NUL-terminated
@@ -45,10 +45,10 @@ fn print_agnos_shell_banner() {
 # from the kernel program body — unlike the _AGNOS_VERSION gvar below. Callers
 # strlen() the result. Used by e.g. the TCP_LISTEN_SMOKE HTTP banner.
 fn agnos_version_str() {
-    return "1.55.32";
+    return "1.56.0";
 }
 
 # Bare version string — safe to use from any consumer that runs AFTER
 # gvar init has completed (kybernet, userspace, etc.). NOT safe to use
 # from the kernel program body (same kmode init-order constraint above).
-var _AGNOS_VERSION = "1.55.32";
+var _AGNOS_VERSION = "1.56.0";

@@ -839,6 +839,14 @@ fn gpu_fill_rect_sys(color, wh, dstxy) {
 fn gpu_caps_sys(buf, len) {
     if (is_user_range(buf, 32) == 0) { return 0 - 1; }
     if (len < 32) { return 0 - 1; }
+    # ARM LAZILY FIRST. #89 is the syscall a compositor calls BEFORE anything else, but gpu_bb_pitch /
+    # gpu_bb_fbsize are only populated by gpu_blit_arm — so probing first would report width=0/height=0, and
+    # since #87/#88 REJECT rather than clip, a probe-then-clip compositor would then fail every blit. Arming
+    # here (idempotent — returns immediately once armed) makes the reported geometry the REAL back buffer
+    # rather than a prediction. Side effect is the one the caller is about to trigger anyway on its first
+    # fill/blit; on a box where the double-buffer cannot arm, flags bit1 stays clear and the geometry reads 0,
+    # which is the honest answer. (Caught by /bin/gpublit's self-validation: exit 97, iron 1.55.32.)
+    gpu_blit_arm();
     var flags = 0;
     if (gpu_present != 0) { flags = flags | 1; }
     if (gpu_bb_armed == 1) { flags = flags | 2; }

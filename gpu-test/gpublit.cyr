@@ -14,7 +14,8 @@
 #
 # VISUAL oracle: a blue desktop with a grey window (red titlebar) and a yellow content block inside it.
 # EXIT oracle:   95 = all pass
-#                96 = gpu_caps failed · 97 = caps returned implausible geometry · 98 = gpu_fill_rect failed
+#                96 = gpu_caps call failed · 98 = gpu_fill_rect failed
+#                100 no-GPU · 101 no-carveout · 102 bad-width · 103 bad-height · 104 no-free-slot · 105 not-armed
 #                90 = fill · 91 = present · 92 = shm_create_gpu (-1 ⇒ no carveout, e.g. QEMU)
 #                93 = shm_write · 94 = gpu_blit_shm
 
@@ -40,12 +41,15 @@ fn gpublit_main(): i64 {
     var bbw   = load32(&caps + 8)  & 0xFFFFFFFF;
     var bbh   = load32(&caps + 12) & 0xFFFFFFFF;
     var freeslots = load32(&caps + 20) & 0xFFFFFFFF;
-    # Self-validate the probe: GPU present (bit0), a carveout for #86 (bit2), real geometry, a free slot.
-    if ((flags & 1) == 0) { return 97; }
-    if ((flags & 4) == 0) { return 97; }
-    if (bbw < 64)  { return 97; }
-    if (bbh < 64)  { return 97; }
-    if (freeslots < 1) { return 97; }
+    # Self-validate the probe. SPLIT CODES so a failure names itself instead of costing a guess — the first
+    # run returned a blanket 97 and the cause (geometry 0 because #89 had not armed the double-buffer) had to
+    # be reasoned out. Each check now has its own exit code.
+    if ((flags & 1) == 0) { return 100; }              # no GPU present
+    if ((flags & 4) == 0) { return 101; }              # no carveout ⇒ #86 cannot serve
+    if (bbw < 64)  { return 102; }                     # back-buffer width implausible (was the 97)
+    if (bbh < 64)  { return 103; }                     # back-buffer height implausible
+    if (freeslots < 1) { return 104; }                 # no free shm slot
+    if ((flags & 2) == 0) { return 105; }              # double-buffer not armed ⇒ #87/#88 will reject
 
     # Desktop background.
     if (sys_gpu_fill(0x00000080) != 0) { return 90; }
