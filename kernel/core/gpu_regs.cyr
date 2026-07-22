@@ -883,6 +883,9 @@ var GPU_R_CP_HQD_PQ_WPTR_HI          = 0x127C;
 # C2c values
 var GPU_GRBM_SEL_MEC1_P0_Q0    = 0x4;         # MEID=1<<2 (MEC1, pipe0, queue0, vmid0); 1-based MEID
 var GPU_CP_HQD_PQ_CONTROL_VAL  = 0xC000050D;  # QUEUE_SIZE 0xD (64 KB ring) | PRIV_STATE | KMD_QUEUE
+# Ring-buffer index wrap for the 64 KB PQ above: 65536 B / 4 = 16384 dwords, mask = 16384-1. gpu_ring_wptr
+# stays MONOTONIC (what the CP wptr register expects); only the BUFFER index is masked — see gpu_ring_put.
+var GPU_RING_DW_MASK           = 0x3FFF;      # (64 KB ring)/4 - 1 — peer of GPU_PSP_RING_DW_MASK
 var GPU_CP_HQD_DOORBELL_VAL    = 0x40000018;  # DOORBELL_OFFSET(0x06<<2=0x18) | DOORBELL_EN(1<<30)
 var GPU_CP_HQD_EOP_CONTROL_VAL = 0x9;         # EOP_SIZE 9 => 2^10 dwords = 4 KB
 var GPU_CP_HQD_PERSISTENT_VAL  = 0x5301;      # PRELOAD_REQ | PRELOAD_SIZE (inert on empty ring)

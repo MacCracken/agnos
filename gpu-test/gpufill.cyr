@@ -7,18 +7,33 @@
 #   * EXIT CODE — klug-capturable (`run: exit 95`), the same idiom blkprobe uses.
 #
 # Exit codes: 95 = ALL PASS (three fills filled + presented)
-#             90 = fill REJECTED (#85 returned -1: no usable display — e.g. QEMU, or no pipe)
-#             91 = fill OK but present returned 0 (double-buffer not armed / direct-FB path)
+#             90 / 91  = RED   cycle: fill REJECTED (#85 -> -1) / present returned 0
+#             100 / 101 = GREEN cycle: same two failures
+#             110 / 111 = BLUE  cycle: same two failures
+# (so the code says WHICH cycle broke, not just that one did)
+#
+# ⚠ v2 (iron run #1 stuck on RED): v1's hold was a bare `while (t - t0 < ms) { t = sys_uptime_ms(); }` —
+# an UNBOUNDED spin, and the only unbounded loop anywhere in this path (every kernel-side wait is
+# watchdog-bounded). If the ms clock ever fails to advance under a tight syscall loop, that spins forever
+# and the screen stays stuck on the presented frame. gpufill_hold is now bounded TWICE (deadline AND a hard
+# spin cap) and yields each pass so it cannot starve the timer/scheduler.
 #
 # Raw syscall numbers for #84/#85: their canonical ring-3 wrappers live in the CYRIUS stdlib, which is
-# hands-off here, so this calls the syscall intrinsic directly — identical ABI (rax=num, rdi=a1); the
-# sys_* wrappers are only sugar. sys_uptime_ms (#40) comes from the stdlib syscalls dep as usual.
+# hands-off here (filed as an ask: 2026-07-21-gpu-present-fill-syscall-cyrius-wrappers.md), so this calls the
+# syscall intrinsic directly — identical ABI (rax=num, rdi=a1). sys_uptime_ms (#40) comes from the stdlib.
 
-# Busy-hold on the monotonic ms clock so each colour stays on screen long enough to see.
+# Hold the presented frame on screen. BOUNDED TWICE OVER — a millisecond deadline AND a hard spin cap — so a
+# stalled or coarse clock can never wedge the program. Yields each pass instead of hot-spinning.
 fn gpufill_hold(ms): i64 {
     var t0 = sys_uptime_ms();
     var t = t0;
-    while (t - t0 < ms) { t = sys_uptime_ms(); }
+    var spins = 0;
+    while (t - t0 < ms) {
+        if (spins >= 4000000) { return 0; }        # hard cap — guarantees termination
+        syscall(44);                                # sched_yield — don't starve the timer/scheduler
+        t = sys_uptime_ms();
+        spins = spins + 1;
+    }
     return 0;
 }
 
@@ -31,12 +46,12 @@ fn gpufill_show(color, ms): i64 {
 }
 
 fn gpufill_main(): i64 {
-    var e = gpufill_show(0x00FF0000, 1200);        # red   (xRGB8888)
-    if (e != 0) { return e; }
-    e = gpufill_show(0x0000FF00, 1200);            # green
-    if (e != 0) { return e; }
-    e = gpufill_show(0x000000FF, 1200);            # blue
-    if (e != 0) { return e; }
+    var e = gpufill_show(0x00FF0000, 1000);        # red   (xRGB8888)
+    if (e != 0) { return e; }                      # 90 / 91
+    e = gpufill_show(0x0000FF00, 1000);            # green
+    if (e != 0) { return e + 10; }                 # 100 / 101
+    e = gpufill_show(0x000000FF, 1000);            # blue
+    if (e != 0) { return e + 20; }                 # 110 / 111
     return 95;                                     # ALL PASS — ring-3 CP-DMA fill works end to end
 }
 

@@ -1097,7 +1097,14 @@ fn gpu_fence() {
 # into the 0x1FFC dummy-page net; the CPU only ever runs a BOUNDED watchdog on the marker.
 # gpu_ring_put appends one dword at the tracked cursor and advances it.
 fn gpu_ring_put(val) {
-    store32(gpu_arena_phys + (gpu_ring_wptr << 2), val & 0xFFFFFFFF);
+    # WRAP the RING-BUFFER index to the 64 KB PQ (QUEUE_SIZE 0xD = 16384 dwords). `gpu_ring_wptr` itself stays
+    # MONOTONIC — that is what the CP's wptr register expects (amdgpu's model: monotonic wptr, masked buffer
+    # index), and it is what every proven boot path already writes, so this mask is a NO-OP below 16384 dwords
+    # (byte-identical behaviour for C2d/C2e/C2f and the dispatches). Without it, a repeatedly-called ring
+    # producer — e.g. the #85 fill syscall a compositor runs EVERY FRAME (12 dw each ⇒ ~23 s at 60 fps) — walks
+    # the write cursor past the end of the ring and scribbles the rptr-report/EOP slots that follow it in the
+    # arena. Peer of the PSP ring's `& GPU_PSP_RING_DW_MASK`.
+    store32(gpu_arena_phys + ((gpu_ring_wptr & GPU_RING_DW_MASK) << 2), val & 0xFFFFFFFF);
     gpu_ring_wptr = gpu_ring_wptr + 1;
     return 0;
 }
@@ -1385,6 +1392,65 @@ fn gpu_cp_dma_fill_test() {
         return 1;
     }
     kprintln("gpu: cp-dma fill MISMATCH (marker fired, bytes wrong)", 53);
+    return 0;
+}
+# gpu_cp_dma_blit_test — P9 blit SELF-TEST: a strided 2D rect copy. Copies an 8-row x 128-byte rect from a
+# source whose rows are 256 B apart into a destination whose rows are 320 B apart (DIFFERENT strides, on
+# purpose), then verifies BOTH that every copied row landed AND that the destination's inter-row padding was
+# left UNTOUCHED. That second check is the one that matters: it proves real per-row stride addressing rather
+# than one long linear copy (which would smear straight through the padding). Gated #ifdef CP_DMA_COPY.
+fn gpu_cp_dma_blit_test() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_fence_ok == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+
+    var src_phys  = gpu_arena_phys + GPU_SDMA_SRC_SUBOFF;
+    var dst_phys  = gpu_arena_phys + GPU_SDMA_DST_SUBOFF;
+    var src_mc    = gpu_arena_mc + GPU_SDMA_SRC_SUBOFF;
+    var dst_mc    = gpu_arena_mc + GPU_SDMA_DST_SUBOFF;
+    var rows      = 8;
+    var row_bytes = 128;                 # 32 dwords of payload per row
+    var src_str   = 256;                 # source row pitch (64 dw)
+    var dst_str   = 320;                 # dest row pitch (80 dw) — deliberately NOT the source's
+    var r = 0;
+    var c = 0;
+    var ok = 1;
+
+    # Seed the source payload per (row, col); paint the WHOLE dest NOT-YET so untouched padding is detectable.
+    while (r < rows) {
+        c = 0;
+        while (c < 32) { store32(src_phys + r * src_str + c * 4, r * 1000 + c + 1); c = c + 1; }
+        r = r + 1;
+    }
+    r = 0;
+    while (r < 640) { store32(dst_phys + r * 4, GPU_C2E_NOTYET); r = r + 1; }   # 640 dw = 2560 B = 8 x 320
+    gpu_mfence();
+
+    if (gpu_cp_dma_blit(dst_mc, dst_str, src_mc, src_str, row_bytes, rows) != 1) {
+        kprintln("gpu: cp-dma blit TIMEOUT or fault", 33);
+        return 0;
+    }
+
+    # (a) every copied row matches its source; (b) each row's trailing padding is STILL not-yet.
+    r = 0;
+    while (r < rows) {
+        c = 0;
+        while (c < 32) {
+            if ((load32(dst_phys + r * dst_str + c * 4) & 0xFFFFFFFF) != (r * 1000 + c + 1)) { ok = 0; c = 32; }
+            else { c = c + 1; }
+        }
+        c = 32;
+        while (c < 80) {
+            if ((load32(dst_phys + r * dst_str + c * 4) & 0xFFFFFFFF) != GPU_C2E_NOTYET) { ok = 0; c = 80; }
+            else { c = c + 1; }
+        }
+        r = r + 1;
+    }
+    if (ok == 1) {
+        kprintln("gpu: CP-DMA hardware blit verified (8 rows, strides differ)", 59);
+        return 1;
+    }
+    kprintln("gpu: cp-dma blit MISMATCH (rows or padding wrong)", 49);
     return 0;
 }
 # ── C2g-1 — FIRST MULTI-THREAD compute dispatch (1 workgroup, 64 threads; out[tid]=tid) ──

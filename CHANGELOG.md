@@ -11,6 +11,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 had yet *called* #85 from ring 3. This cut adds the consumer that closes that loop, plus the cross-repo ask for
 its named wrappers.
 
+**✅ PROVEN ON IRON:** `run /bin/gpufill` → **`run: exit 95`** with all three colours displayed (archaemenid,
+2026-07-21). One run establishes the whole seam: the ring-3 syscall path works; the CP-DMA fill lands
+**scanout-visible** pixels with no cache flush (MC-direct bypasses GL2); **double-buffering works with the GPU
+fill** (three presents alternate `gpu_bb_a_mc`/`gpu_bb_b_mc`, so both buffers were filled *and* scanned); the
+repeat path is sound with the ring-wrap fix; and the per-pid scanout release hands the console back on exit.
+**agnos now has hardware 2D — copy, fill, and a strided blit substrate — reachable from userland.**
+
+**✅ THE FULL ARC IS IRON-PROVEN** (blit.txt, 2026-07-21) — one boot prints all three:
+`CP-DMA hardware copy verified (4KB, dst==src)` · `… fill verified (4KB, all=pattern)` ·
+`… blit verified (8 rows, strides differ)`. The blit test copies an 8×128 B rect from a 256 B-pitch source to
+a **320 B-pitch** dest and asserts the dest's inter-row padding is **untouched** — so it proves real per-row
+stride addressing (a linear copy would smear through the padding), which is what a compositor needs to move a
+window or scroll a region.
+
 ### Added
 
 - **`gpu-test/` — a new in-tree userland project** building **`/bin/gpufill`** (static ELF64, staged to
@@ -27,6 +41,23 @@ its named wrappers.
   Linux x86_64 **84 = `rmdir`**, so an ungated wrapper would emit a *destructive* `rmdir()` against a stale
   `rdi`; **85 = `creat`** reinterprets a pixel colour as a path pointer. Both wrappers must be
   `#ifdef CYRIUS_TARGET_AGNOS`-gated and must not emit the syscall off-agnos.
+
+### Fixed
+
+- **`gpu_ring_put` now WRAPS the ring-buffer index** (`& GPU_RING_DW_MASK`, 16384 dwords = the 64 KB PQ set by
+  `CP_HQD_PQ_CONTROL` QUEUE_SIZE 0xD). `gpu_ring_wptr` stays monotonic — that is what the CP's wptr register
+  expects — so the mask is a **no-op below 16384 dwords** and every proven boot path (C2d/C2e/C2f, the
+  dispatches) is byte-identical. Without it a *repeatedly-called* ring producer walked the write cursor off the
+  end of the ring and scribbled the rptr-report/EOP slots that follow it in the arena: the #85 fill syscall at
+  12 dwords/frame would have corrupted the ring after **~23 s at 60 fps**, i.e. the first thing aethersafha
+  would have hit. Latent since the ring was introduced (harmless while it only ever served boot-time
+  one-shots); peer of the PSP ring's existing `& GPU_PSP_RING_DW_MASK`.
+- **`gpufill` v2 — the hold loop is now bounded.** The first iron run stuck on RED: v1's inter-frame hold was a
+  bare `while (t - t0 < ms) { t = sys_uptime_ms(); }`, the only **unbounded** loop anywhere in the path (every
+  kernel-side wait is watchdog-bounded), so a clock that fails to advance under a tight syscall loop spins
+  forever with the presented frame stuck on screen. Now bounded twice over (ms deadline **and** a hard spin
+  cap) and it `sched_yield`s each pass instead of hot-spinning. Exit codes also now identify *which* colour
+  cycle failed (90/91 red · 100/101 green · 110/111 blue) rather than just that one did.
 
 ### Changed
 

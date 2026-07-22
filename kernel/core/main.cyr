@@ -950,6 +950,7 @@ gpu_shader_dispatch_f64_fidelity();
 #ifdef CP_DMA_COPY
 gpu_cp_dma_copy();
 gpu_cp_dma_fill_test();
+gpu_cp_dma_blit_test();
 #endif
 
 # GPU arc 1.55.x (Thrust P) P9.0 — READ-ONLY SDMA0 discovery. SDMA (System DMA) is the engine P9 rings up for
