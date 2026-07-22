@@ -968,6 +968,33 @@ gpu_sdma_probe();
 # page-flip will re-point. Strictly read-only; no-ops if the GPU is absent (QEMU) or the FB isn't GOP-lit.
 gpu_display_probe();
 
+# GPU arc 1.56.x (Thrust S) S1 + D0 — the SHADER arc's read-only opening, the P0 analog. S1 decodes the live
+# compute state (RSRC1/RSRC2 fields, thread count, VM_L2_CNTL, and critically COMPUTE_TMPRING_SIZE — agnos has
+# never written it, so non-zero means a stale scratch ring that would corrupt any spilling kernel). D0 anchors
+# the DCN MPC blender's register base behind a six-constraint gate BEFORE the D lane writes anything. Both are
+# pure reads with no ring traffic. ⚠ PLACED AFTER gpu_display_probe(): burn 1 ran them before it and D0
+# skipped with 'no pipe' because gpu_display_ok was still 0 — the same ordering class as the #89 cold-probe bug. Gated #ifdef SHADER_PROBE; first iron burn: BURN_SHADER_PROBE.
+#ifdef SHADER_PROBE
+gpu_shader_state_probe();
+gpu_mpc_probe();
+#endif
+
+# GPU arc 1.56.x S2 — THE FIRST BLEND: per-pixel src-over alpha running on the shader cores. Premultiplied
+# f32 (the measured-fastest form on this ISA), kernel authored in assembly and machine-assembled. Gated
+# #ifdef SHADER_BLEND; first iron burn: BURN_SHADER_BLEND.
+#ifdef SHADER_BLEND
+gpu_shader_blend_test();
+#endif
+
+# GPU arc 1.56.x S3 — the same blend over a 2-D GRID, in place on the SCANOUT BACK BUFFER, then presented.
+# Deliberately kept as a SEPARATE flag from S2 so both run in one burn: S2 stays the regression net for the
+# blend arithmetic, and if S3 fails while S2 passes the fault is isolated to grid/addressing/scanout — none
+# of which S2 exercises. Gated #ifdef SHADER_RECT; first iron burn: BURN_SHADER_RECT.
+#ifdef SHADER_RECT
+gpu_shader_rect_test();
+#endif
+
+
 # GPU arc 1.55.x (Thrust P) P4: scanout-residue clear.
 # ⚠ SCANOUT_LINEAR (v3) is RETIRED — it wrote the WRONG register (0x607) under the OTG lock and BLACKED the
 # box on iron. gpu_scanout_clear_tiling is now a hard no-op; do not build this flag. Kept only so a stale

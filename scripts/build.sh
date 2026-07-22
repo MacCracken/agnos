@@ -334,6 +334,13 @@ else
         # MEC compute ring (no SDMA/doorbell/firmware). 4KB carveout→carveout + WRITE_DATA done-marker,
         # register-wptr kick, verify dst==src. Gated on gpu_fence_ok (the compute ring's C2e coherence proof).
         [ -n "$CP_DMA_COPY" ]        && echo '#define CP_DMA_COPY'
+        # SHADER_PROBE=1 — 1.56.x S1+D0: read-only compute-state + DCN MPC probes. No writes, no ring traffic;
+        # S1's key check is COMPUTE_TMPRING_SIZE (stale scratch ring), D0's is a six-constraint base anchor.
+        [ -n "$SHADER_PROBE" ]       && echo '#define SHADER_PROBE'
+        # SHADER_BLEND=1 — 1.56.x S2: the first per-pixel alpha blend on the CUs (premultiplied f32).
+        [ -n "$SHADER_BLEND" ]       && echo '#define SHADER_BLEND'
+        # SHADER_RECT=1 — 1.56.x S3: that blend over a 2-D grid, into the scanout back buffer, presented.
+        [ -n "$SHADER_RECT" ]        && echo '#define SHADER_RECT'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

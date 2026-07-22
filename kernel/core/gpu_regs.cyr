@@ -196,6 +196,27 @@ var GPU_R_OTG_GLOBAL_CONTROL0    = 0x1B90; # OTGn (stride 0x80): OTG_MASTER_UPDA
 var GPU_OTG_UPDATE_LOCK_STATUS   = 0x100;  # OTG_MASTER_UPDATE_LOCK bit8 (locked ack)
 var GPU_OTG_LOCK_SEL_MASK        = 0xE000000; # OTG_GLOBAL_CONTROL0 [27:25]
 var GPU_DCN_HUBP_STRIDE     = 0xDC;  # per-HUBP instance stride
+# --- 1.56.x D0 — DCN MPC (Multiple Pipe/Plane Combine): the SCANOUT BLENDER. READ-ONLY this bite.
+# All BASE_IDX 2 (GPU_BASE_DCN_2), from the generated dcn_2_1_0_offset.h. ⚠ Per
+# [[reference_agnos_dcn_hubp_reg_offsets_derived]] these are NOT trusted until D0's constraint gate agrees —
+# a derived-offset write is what blacked the box during P4. Nothing WRITES here until the gate passes.
+# ⚠⚠ NEVER range-scan this block: a blind DCN/OTG sweep once locked the whole machine (some registers sit
+# behind gated clock domains and hang the bus on read). Only named offsets, and print progressively so a
+# hang localises to the last console line.
+var GPU_R_MPCC0_TOP_SEL     = 0x1271; # MPCC0 MPCC_TOP_SEL  — which DPP feeds this blender stage (0 = DPP0)
+var GPU_R_MPCC0_BOT_SEL     = 0x1272; # MPCC_BOT_SEL        — 0xF = nothing below it (bottom of the stack)
+var GPU_R_MPCC0_OPP_ID      = 0x1273; # MPCC_OPP_ID         — which OPP this MPCC drives
+var GPU_R_MPCC0_CONTROL     = 0x1274; # MPCC_CONTROL        — ALPHA_BLND_MODE [5:4], GLOBAL_ALPHA [23:16] (D2)
+var GPU_R_MPCC0_STATUS      = 0x127F; # MPCC_STATUS — IDLE[0] / BUSY[1] / DISABLED[2] (dcn_2_1_0_offset.h:5626)
+# ⚠ WAS 0x1275, which is MPCC_SM_CONTROL (stereo-mixer, reset value 0) — a REAL register at a valid address,
+# which is why the D0 burn read a plausible 0 instead of all-ones. MPCC0 block: SM_CONTROL 0x1275,
+# UPDATE_LOCK_SEL 0x1276, TOP_GAIN 0x1277, BOT_GAIN_INSIDE 0x1278, BOT_GAIN_OUTSIDE 0x1279, BG_R_CR 0x127a,
+# BG_G_Y 0x127b, BG_B_CB 0x127c, MEM_PWR_CTRL 0x127d, STALL_STATUS 0x127e, STATUS 0x127f.
+var GPU_DCN_MPCC_STRIDE     = 0x1B;   # per-MPCC instance stride
+var GPU_R_MPC_OUT0_MUX      = 0x1385; # MPC_OUT0_MUX — which MPCC drives output 0 (per-OUT stride is 0x4, NOT 0x1B)
+var GPU_R_HUBPRET0_CONTROL  = 0x066C; # HUBPRET0_HUBPRET_CONTROL — the channel CROSSBAR (D1's one-register lever)
+var GPU_R_OPTC0_UNDERFLOW   = 0x1ACA; # OPTC0 — OPTC_UNDERFLOW_OCCURRED_STATUS bit10 (must stay 0)
+var GPU_MPCC_SEL_NONE       = 0xF;    # TOP_SEL/BOT_SEL "nothing connected"
 var GPU_HUBP_BLANK_EN       = 0x1;   # DCHUBP_CNTL bit0
 # P1 back buffer — VRAM offset 1 GB: clear of the console FB (offset 0, ~8 MB), the PSP TMR (1.5 GB) and
 # the compute arena (2 GB = GPU_VM_ARENA_OFF), and well inside the 3 GB carveout. CPU writes it through the
@@ -955,6 +976,12 @@ var GPU_EVENT_CS_PARTIAL_FLUSH = 0x00000407; # EVENT_TYPE=0x07 | EVENT_INDEX=4<<
 var GPU_DISPATCH_INITIATOR = 0x00000045; # COMPUTE_SHADER_EN | FORCE_START_AT_000 | ORDER_MODE(bit6) — mabda/radeonsi HW-proven value on Cezanne (was 0x5)
 var GPU_COMPUTE_PGM_RSRC1_MIN = 0x002C0040; # mabda GFX9_COMPUTE_PGM_RSRC1_MIN (HW-proven Cezanne; was 0x00AC0040 — dropped the IEEE_MODE bit23)
 var GPU_CU_MASK_ALL        = 0xFFFFFFFF;  # STATIC_THREAD_MGMT_SE* CU-enable (else zero CUs launch, silent no-op)
+# --- 1.56.x S1 — READ-BACK of the compute state. The GPU_SH_COMPUTE_* values below are SET_SH_REG PACKET
+# offsets (absolute GC dword - 0x2C00), i.e. what a PM4 packet carries. To READ the same registers over MMIO
+# the base must be added back: mmCOMPUTE_PGM_RSRC1 = 0x2C00 + 0x212 = 0x2E12.
+var GPU_SH_REG_MMIO_BASE           = 0x2C00; # SH packet offset + this = the GC MMIO dword offset
+var GPU_SH_COMPUTE_PGM_RSRC2       = 0x213;  # peer of RSRC1 0x212 — USER_SGPR / TGID enables / LDS_SIZE
+var GPU_SH_COMPUTE_TMPRING_SIZE    = 0x218;  # scratch ring — agnos has NEVER written it (S1's key check)
 # SET_SH packet reg offsets (absolute GC dword - 0x2C00)
 var GPU_SH_COMPUTE_NUM_THREAD_X    = 0x207;
 var GPU_SH_COMPUTE_PGM_LO          = 0x20C;
@@ -1007,7 +1034,26 @@ var GPU_KERNARG_OUT_SUBOFF    = 0x18400;     # output buffer, 64 dwords (out[i] 
 # v_add_u32 accumulate. 3 kernargs (a,b,out) => USER_SGPR=6 (RSRC2=0x0C, USER_DATA_0..5). mabda-proven.
 var GPU_COMPUTE_RSRC2_KERNARG3 = 0x0000000C; # RSRC2 USER_SGPR=6 -> preload s0..s5 from USER_DATA_0..5
 var GPU_COMPUTE_PGM_RSRC1_V12  = 0x002C0042; # RSRC1 with VGPRS=2 (12 VGPRs) — the loop shader uses v0..v10
-var GPU_PM4_SET_SH_REG_N6     = 0xC0067600;  # SET_SH_REG, 6 values (a_lo,a_hi,b_lo,b_hi,out_lo,out_hi)
+var GPU_PM4_SET_SH_REG_N6     = 0xC0067600;
+
+# --- S3 (1.56.x): grid-dispatched alpha blend into the scanout back buffer -----------------------------
+# BOTH RSRC words are HARVESTED from llvm-mc via blend_rect.s's .amdhsa_kernel descriptor — never
+# hand-counted. RSRC1 differs from the V12 value only in the SGPR field (blend_rect uses s0..s15 where
+# blend_premul used s0..s7); RSRC2 adds TGID_X_EN(1<<7)|TGID_Y_EN(1<<8) to the 3-kernarg 0x0C, which is
+# what makes the workgroup id reach the shader at all. A wrong TGID bit here does not fault — every
+# workgroup would silently read tgid 0 and blend the same 64 pixels 256 times over.
+var GPU_COMPUTE_PGM_RSRC1_GRID = 0x002C0082; # blend_rect: 12 VGPRs, 24 SGPRs (llvm-mc computed)
+var GPU_COMPUTE_RSRC2_GRID2D   = 0x0000018C; # USER_SGPR=6 | TGID_X_EN | TGID_Y_EN (llvm-mc computed)
+var GPU_BR_SRC_SUBOFF          = 0x20000;    # src rect in the arena: 256x64x4 = 64 KB, clear of 0x14000/0x1A000/0x1B800
+# Rect geometry. WIDTH MUST BE A MULTIPLE OF 64 — blend_rect has no bounds guard, so a partial trailing
+# workgroup would blend past the right edge into the neighbouring pixels.
+var GPU_BR_W  = 256;
+var GPU_BR_H  = 64;
+var GPU_BR_X  = 128;                         # rect origin in the back buffer
+var GPU_BR_Y  = 128;
+var GPU_BR_BG     = 0xFF202040;              # background outside the rect (dark blue)
+var GPU_BR_DST_L  = 0xFF00A000;              # underlay, left half  (green)  — dst varies by COLUMN so a
+var GPU_BR_DST_R  = 0xFFA00000;              # underlay, right half (red)      wrong dst_pitch is visible  # SET_SH_REG, 6 values (a_lo,a_hi,b_lo,b_hi,out_lo,out_hi)
 var GPU_DOT_K                 = 4;           # reduction length per lane (dot-product size)
 var GPU_DOT_N                 = 256;         # input element count = 64 lanes * K
 var GPU_DOT_A_SUBOFF          = 0x19000;     # input a[256] (a[i]=i+1)
