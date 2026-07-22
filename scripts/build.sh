@@ -160,6 +160,26 @@ else
     #   HARDENING_SELFTEST=1 — arc-close hardening self-test (1.35.7): hermetic
     #                     ip_safe_payload_len ingress-clamp table. Gated by
     #                     scripts/hardening-smoke.sh.
+    # --- Selftest flag DEPENDENCIES (fail loud; a silent no-op costs an iron burn) -------------------
+    # Some selftests refuse to run unless an EARLIER selftest set its proof flag. gpu_shader_cov_test and
+    # gpu_shader_rect_test both open with
+    #     if (gpu_blend_ok != 1) { "gpu: skipping ... (blend math unproven)"; return 0; }
+    # and gpu_blend_ok is set ONLY by gpu_shader_blend_test, which compiles only under SHADER_BLEND. So
+    # SHADER_COV=1 or SHADER_RECT=1 WITHOUT SHADER_BLEND=1 builds a kernel that prints "skipping" and
+    # proves nothing — indistinguishable from a pass unless you read for an absent line.
+    #
+    # This cost the first 1.56.4 burn (2026-07-22): glyph and gradient passed, coverage never ran, and the
+    # coverage re-proof was the one arm that burn actually owed. Checked HERE rather than in burn-prep.sh
+    # because burns have historically been driven by hand-exported defines straight to this script, which
+    # bypasses burn-prep entirely.
+    if [ -n "${SHADER_COV:-}${SHADER_RECT:-}" ] && [ -z "${SHADER_BLEND:-}" ]; then
+        echo "ERROR: SHADER_COV / SHADER_RECT require SHADER_BLEND=1." >&2
+        echo "       Their selftests early-return on gpu_blend_ok, which only SHADER_BLEND sets," >&2
+        echo "       so this build would print 'gpu: skipping ...' and prove nothing." >&2
+        echo "       Re-run with: SHADER_BLEND=1 ${SHADER_RECT:+SHADER_RECT=1 }${SHADER_COV:+SHADER_COV=1 }..." >&2
+        exit 1
+    fi
+
     {
         echo '#define ARCH_X86_64'
         echo '#define ELF64_KERNEL'

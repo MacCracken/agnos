@@ -78,8 +78,14 @@ if [ -n "${BURN_SHADER_OPS:-}" ]; then
     # Oracle: `run /bin/gpublend` and `run /bin/gpucov` -> `run: exit 95`. A #92 failure decodes as
     # 110 + reason (111 no-GPU · 113 bad-slot · 115 off-screen · 117 not-resident · 118 dispatch-timeout ·
     # 121 bad-descriptor · 122 reserved-field · 123 envelope-unproven). CAPTURE: klug > shader_ops.txt.
+    # ⚠ SHADER_BLEND=1 IS LOAD-BEARING HERE, NOT DECORATION. gpu_shader_cov_test and gpu_shader_rect_test
+    # both open with `if (gpu_blend_ok != 1) { "skipping ... (blend math unproven)"; return 0; }`, and
+    # gpu_blend_ok is set ONLY by gpu_shader_blend_test under #ifdef SHADER_BLEND. So SHADER_COV=1 without
+    # SHADER_BLEND=1 is a SILENT NO-OP — it prints "gpu: skipping coverage" and burns a boot. That is
+    # exactly what happened on the first 1.56.4 burn (2026-07-22): glyph and gradient passed, coverage
+    # never ran. The flag pair is a dependency; do not split it.
     echo "[2/2] Building the 1.56.4 SHADER-OPS kernel (#92 descriptor seam + cov re-proof + glyph/grad first iron; run /bin/gpublend + /bin/gpucov; capture klug > shader_ops.txt)."
-    BUILD_ENV="SHADER_COV=1 SHADER_GLYPH=1 SHADER_GRAD=1"
+    BUILD_ENV="SHADER_BLEND=1 SHADER_COV=1 SHADER_GLYPH=1 SHADER_GRAD=1"
     BUILD_TAG="SHADER_OPS"
 elif [ -n "${BURN_SHADER_GRAD:-}" ]; then
     # plan-S11 — vertical linear gradient, no source buffer. Oracle: 'gpu: shader gradient online'.
