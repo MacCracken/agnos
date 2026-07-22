@@ -1228,6 +1228,104 @@ fn gpu_shader_dispatch() {
     kprintln("gpu: shader dispatch did not complete", 37);
     return 0;
 }
+# ── CP-DMA — hardware 2D memory copy on the PROVEN compute ring (P9, pivoted off SDMA) ────────
+# The FIRST hardware 2D on sovereign agnos. A PM4 DMA_DATA (CP-DMA, op 0x50) packet on the MEC
+# compute ring that C2d/C2e already proved FETCHES + EXECUTES + lands CPU-visible writes — NO SDMA,
+# NO doorbell, NO new firmware. CP_SYNC=1 holds the ME until the copy's writes ACK to DRAM;
+# SRC_SEL/DST_SEL=0 = MC-direct (bypass GL2 — the same domain the C2e WRITE_DATA is already
+# CPU-visible through), so NO ACQUIRE_MEM is needed. A C2e-proven WRITE_DATA done-marker (DST_SEL=5)
+# follows as the CPU-pollable completion gate: CP_SYNC orders it AFTER the copy, so marker-visible
+# ⟹ the 4 KB committed to DRAM. byte_count is RAW bytes (4096), NOT byte_count-1 (that's the SDMA
+# convention). ENGINE=ME (bit0=0) — the MEC has no PFP. Submit via the proven register-wptr kick
+# (LO then HI; the CP latches the 64-bit wptr on the HI write). Reuses the arena scratch slots (the
+# SDMA copy-test is parked). Gated #ifdef CP_DMA_COPY; needs the ring coherence-proven (gpu_fence_ok).
+# WEDGE-SAFE: bounded watchdog only; MC addrs in OUR carveout (bus-master off ⇒ no system RAM); a bad
+# addr faults into the 0x1FFC dummy-page net (fault!=0).
+fn gpu_cp_dma_copy() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_fence_ok == 0) { kprintln("gpu: cp-dma copy skipped (ring unverified)", 42); return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+
+    var src_phys   = gpu_arena_phys + GPU_SDMA_SRC_SUBOFF;
+    var dst_phys   = gpu_arena_phys + GPU_SDMA_DST_SUBOFF;
+    var fence_phys = gpu_arena_phys + GPU_SDMA_FENCE_SUBOFF;
+    var src_mc     = gpu_arena_mc + GPU_SDMA_SRC_SUBOFF;
+    var dst_mc     = gpu_arena_mc + GPU_SDMA_DST_SUBOFF;
+    var fence_mc   = gpu_arena_mc + GPU_SDMA_FENCE_SUBOFF;
+    var ndw        = 1024;                               # 4096 bytes / 4
+
+    # S0 — seed src (j+1, nonzero + bit31-clear), dst = NOT-YET, clear the fence sentinel.
+    var i = 0;
+    while (i < ndw) {
+        store32(src_phys + i * 4, i + 1);
+        store32(dst_phys + i * 4, GPU_C2E_NOTYET);
+        i = i + 1;
+    }
+    store32(fence_phys, GPU_C2E_NOTYET);
+    gpu_mfence();
+
+    # Clear sticky VM fault-status (pulse CLEAR bit0, re-arm) so a post-kick fault!=0 blames THIS packet.
+    var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
+
+    # S1 — append DMA_DATA (7 dw) + WRITE_DATA done-marker (5 dw) at the tracked cursor (gpu_ring_put
+    #      advances gpu_ring_wptr). MC addresses (gpu_arena_mc), NOT phys — the classic slip.
+    gpu_ring_put(GPU_PM4_DMA_DATA_HDR);                  # PACKET3(DMA_DATA=0x50, count=5)
+    gpu_ring_put(0x80000000);                            # CP_SYNC=1 | SRC_SEL=0(MC) | DST_SEL=0(MC) | ENGINE=ME
+    gpu_ring_put(src_mc & 0xFFFFFFFF);                   # SRC_ADDR_LO
+    gpu_ring_put((src_mc >> 32) & 0xFFFFFFFF);           # SRC_ADDR_HI (full 32b on DMA_DATA 0x50)
+    gpu_ring_put(dst_mc & 0xFFFFFFFF);                   # DST_ADDR_LO
+    gpu_ring_put((dst_mc >> 32) & 0xFFFFFFFF);           # DST_ADDR_HI
+    gpu_ring_put(0x00001000);                            # COMMAND: BYTE_COUNT=4096 (raw), WR_CONFIRM on
+    gpu_ring_put(GPU_PM4_WRITE_DATA_HDR);                # PACKET3(WRITE_DATA=0x37, count=3)
+    gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);                # DST_SEL=5 memory-async | WR_CONFIRM | ME
+    gpu_ring_put(fence_mc & 0xFFFFFFFF);                 # marker DST_ADDR_LO
+    gpu_ring_put((fence_mc >> 32) & 0xFFFFFFFF);         # marker DST_ADDR_HI
+    gpu_ring_put(GPU_CPDMA_DONE);                        # done sentinel the MEC writes
+    gpu_mfence();
+
+    var new_wptr = gpu_ring_wptr;
+
+    # S2 — KICK via the proven register-wptr path: GRBM-select the HQD, wptr LO then HI (CP latches on HI).
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
+
+    # S3 — bounded watchdog on the done sentinel (CP_SYNC orders it after the copy), 100 ms cap.
+    var s = 0;
+    var done = 0;
+    while (s < 1000) {
+        if ((load32(fence_phys) & 0xFFFFFFFF) == GPU_CPDMA_DONE) { done = 1; s = 1000; }
+        else { gpu_udelay(100); s = s + 1; }
+    }
+    var rptr = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR) & 0xFFFFFFFF;
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);   # deselect
+    gpu_mfence();
+
+    var fault = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_STATUS);
+    if (fault != 0) { kprintln("gpu: cp-dma copy faulted", 24); return 0; }
+    if (done != 1) {
+        kprint("gpu: cp-dma copy TIMEOUT rptr ", 30); kprint_num(rptr);
+        kprint(" wptr ", 6);                            kprint_num(new_wptr);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # S4 — verify dst == src byte-for-byte (self-validating oracle).
+    var ok = 1;
+    var j = 0;
+    while (j < ndw) {
+        if ((load32(dst_phys + j * 4) & 0xFFFFFFFF) != (j + 1)) { ok = 0; j = ndw; }
+        else { j = j + 1; }
+    }
+    if (ok == 1) {
+        kprintln("gpu: CP-DMA hardware copy verified (4KB, dst==src)", 50);
+        return 1;
+    }
+    kprintln("gpu: cp-dma copy MISMATCH (marker fired, bytes wrong)", 53);
+    return 0;
+}
 # ── C2g-1 — FIRST MULTI-THREAD compute dispatch (1 workgroup, 64 threads; out[tid]=tid) ──
 # The first parallel dispatch: 64 lanes each write their workitem-id to out[tid], CPU verifies
 # out[i]==i. Delta on C2f — NUM_THREAD_X flips 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 => 64 threads

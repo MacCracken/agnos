@@ -941,6 +941,16 @@ gpu_shader_dispatch_f64();
 # (a fused FMA would diverge). Gated on the exact-int f64 proof inside gpu_shader_dispatch_f64_fidelity().
 gpu_shader_dispatch_f64_fidelity();
 
+# GPU arc 1.55.x (Thrust P) P9 — 2D via CP-DMA (PIVOTED off SDMA). The SDMA engine never fetched on this
+# box (doorbell + register-wptr both failed); but 2D copy doesn't need SDMA — the PROVEN compute ring can
+# carry a PM4 DMA_DATA (CP-DMA) packet. gpu_cp_dma_copy() appends one 4 KB carveout->carveout copy + a
+# WRITE_DATA done-marker to the ring C2d/C2e already proved, kicks via the register-wptr path, and verifies
+# dst==src — the first hardware 2D on agnos, no new engine/doorbell/firmware. Gated on gpu_fence_ok.
+# First iron burn: BURN_CP_DMA_COPY.
+#ifdef CP_DMA_COPY
+gpu_cp_dma_copy();
+#endif
+
 # GPU arc 1.55.x (Thrust P) P9.0 — READ-ONLY SDMA0 discovery. SDMA (System DMA) is the engine P9 rings up for
 # hardware 2D (fill/copy/blit off the CPU). It's a genuine new engine — only the IP base (0x1260) is known. Per
 # the P4 lesson, anchor the real register offsets read-only BEFORE writing any. Also reports if SDMA ucode is

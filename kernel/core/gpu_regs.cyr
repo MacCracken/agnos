@@ -909,6 +909,8 @@ var GPU_PM4_WRITE_DATA_HDR = 0xC0033700; # PACKET3(WRITE_DATA=0x37, count=3) -> 
 var GPU_PM4_WRITE_DATA_CTL = 0x00100500; # DST_SEL=5 (memory async-direct -> DRAM, bypasses GL2) | WR_CONFIRM(1<<20); ENGINE_SEL=ME(0)
 var GPU_C2E_SENTINEL       = 0xC2E0C2E0; # value the MEC must write (the fence witness)
 var GPU_C2E_NOTYET         = 0xDEADBEEF; # pre-seed marker: distinct from sentinel AND 0 (no stale/zero false-pass)
+var GPU_PM4_DMA_DATA_HDR   = 0xC0055000; # PACKET3(DMA_DATA=0x50, count=5) -> 7-dword CP-DMA memory-copy packet
+var GPU_CPDMA_DONE         = 0x0CDD0A7E; # CP-DMA done sentinel (distinct from C2E_SENTINEL/NOTYET, bit31-clear)
 # STAGED (row-2 coherence follow-up ONLY; do NOT wire into the first C2e burn — it would
 # collapse the executed-vs-coherent disambiguation). Verify CP_COHER_CNTL vs local gc_9_0
 # sh_mask.h before that burn (a wrong bit makes ACQUIRE_MEM a silent no-op).

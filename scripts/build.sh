@@ -330,6 +330,10 @@ else
         # SDMA_COPY=1 — P9.2 first SDMA packet: one COPY_LINEAR (4KB carveout→carveout) + FENCE, kick via RB_WPTR,
         # gate on the fence sentinel, verify dst==src. Needs SDMA_RING too (the ring must be up).
         [ -n "$SDMA_COPY" ]          && echo '#define SDMA_COPY'
+        # CP_DMA_COPY=1 — P9 (PIVOTED off SDMA): 2D copy via a PM4 DMA_DATA (CP-DMA) packet on the PROVEN
+        # MEC compute ring (no SDMA/doorbell/firmware). 4KB carveout→carveout + WRITE_DATA done-marker,
+        # register-wptr kick, verify dst==src. Gated on gpu_fence_ok (the compute ring's C2e coherence proof).
+        [ -n "$CP_DMA_COPY" ]        && echo '#define CP_DMA_COPY'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot
