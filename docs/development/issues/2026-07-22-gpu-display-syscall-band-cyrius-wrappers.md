@@ -16,15 +16,36 @@ Mirror: `cyrius/docs/development/issues/2026-07-22-agnos-gpu-display-syscall-ban
   work, positioning the window from the geometry #89 itself reported. ⚠ Note for the docstring: **#89 arms the
   double-buffer lazily** — it must, because a cold probe otherwise reports width=0/height=0 and, since #87/#88
   reject rather than clip, every later blit fails (caught on iron before any compositor consumed it).
-- **Tier 1c — `#92 gpu_blend_shm` NOW SHIPPED + IRON-PROVEN (agnos 1.56.2, 2026-07-22).** **Wrapper wanted
-  now, with #86/#87/#88/#89.** The ALPHA peer of #87: same packing, same reject-don't-clip discipline, but
-  composited through the SHADER CORES with per-pixel src-over instead of CP-DMA, which has no ALU and can
-  therefore only ever do opaque. `/bin/gpublend` → `run: exit 95` on archaemenid: three 50%-alpha squares
-  straddling an opaque band, each rendering two different colours from the same source pixels.
-  ⚠ **Docstring MUST state that the source is PREMULTIPLIED** (`c <= a`). The shader computes
+- **Tier 1c — ⚠ RETRACTED AND RESHAPED (agnos 1.56.4, 2026-07-22). Read this before wrapping anything ≥ #92.**
+
+  **`#92` shipped at 1.56.2 as `gpu_blend_shm(id, wh, dstxy)`. DO NOT WRAP THAT SHAPE.** It has been
+  reshaped in place to **`gpu_shader_op(desc_uva, len)`**. `#93 gpu_blend_cov_shm` and `#94 gpu_glyph_shm`
+  were implemented at 1.56.2/1.56.3 and are **WITHDRAWN — both numbers are free again and NO wrapper is
+  wanted for either.** A gradient `#95` was planned and **never minted**.
+
+  **Why:** the arc's own decision row D-3 (`planning/kernel-shader-arc-156x.md`) chose ONE descriptor
+  syscall taking an **array of ops** and explicitly rejected one-number-per-op. 1.56.2/1.56.3 shipped the
+  rejected shape; 1.56.4 restores the decision. Nothing was wrapped in the interim — `lib/syscalls*.cyr`
+  stops at `#89` — so **this retraction costs the cyrius side nothing**, which is exactly why it is being
+  sent now rather than after 6.4.72.
+
+  **The ask is ONE wrapper for ONE number**, for the entire shader-compositing surface:
+  ```cyrius
+  SYS_GPU_SHADER_OP = 92;   # gpu_shader_op(desc, len) -> 0 / -((idx<<8)|reason)
+  ```
+  `desc` points at `len / 64` **64-byte op records**; the operation is an op code in dword 0 of each
+  record, so alpha blend (1), coverage (2), glyph expand (3) and gradient (4) — and every later primitive —
+  need **no new syscall numbers**. Full record layout: `agnos docs/development/agnos-userland-abi.md`.
+
+  ⚠ **Docstring MUST state that sources are PREMULTIPLIED** (`c <= a`). The shaders compute
   `src + dst*(1 - src_a/255)` with no per-pixel divide, which is only correct for premultiplied input;
-  straight-alpha input produces washed-out edges **silently**, never an error. This is the single most
-  likely way a caller misuses the syscall.
+  straight-alpha input produces washed-out edges **silently**, never an error. Single most likely misuse.
+
+  ⚠ **Do NOT normalise the packed return to `-1`.** `e = 0 - rc; idx = e >> 8; reason = e & 0xFF`. The
+  index names which op in the array failed — that is the point of the encoding. `reason` is always ≥ 1, and
+  `E_NOGPU` at index 0 encodes as exactly `-1`, so existing `rc != 0` / `rc == -1` checks keep working.
+
+  ⚠ **`#92`'s Linux-collision severity is RAISED by this reshape** — see the table below.
 - **Tier 2 — SHAPE DECLARED, agnos implements first:** `#90 gpu_readback_shm`, `#91 gpu_blit_bb`. Listed so
   the numbers stay contiguous and reserved, and so the wrapper work can be planned once. **Do not wrap these
   until agnos ships each** — documented to prevent number drift, not to be implemented ahead of the kernel.
@@ -44,8 +65,13 @@ garbage the arguments decode to.
 | 88 | `gpu_fill_rect` | `symlink(target,link)` | no | ⚠ arg1 is a 32-bit **colour** (e.g. `0x00FF0000` = 16 MB) which **can decode to a mapped address** — the string read is not guaranteed to fault |
 | 89 | `gpu_caps` | `readlink(path,buf,sz)` | no (to FS) | ⚠ the kernel **WRITES** into arg2 for arg3 bytes — a wild process-memory write if rsi ever holds a mapped address |
 | 90 | `gpu_readback_shm` | **`chmod(path,mode)`** | **YES** | **Materially the worst number in the band**: a packed geometry word reinterpreted as a mode can set **setuid**. Mitigating: arg1 is a 1..16 id ⇒ near-null path ⇒ EFAULT overwhelmingly likely |
-| 92 | `gpu_blend_shm` | **`chown(path,uid,gid)`** | **YES** | arg1 is a 1..16 slot id ⇒ near-null path ⇒ EFAULT overwhelmingly likely, but the call itself changes file OWNERSHIP if it ever resolves |
-| 91 | `gpu_blit_bb` | **`fchmod(fd,mode)`** | **YES** | **The one row where the Linux call would plausibly SUCCEED**: arg1 is a packed `srcxy`, and `(0,0)` packs to `0` = **stdin** — small coordinates are all valid fd numbers |
+| 91 | `gpu_blit_bb` | **`fchmod(fd,mode)`** | **YES** | **One of two rows where the Linux call would plausibly SUCCEED**: arg1 is a packed `srcxy`, and `(0,0)` packs to `0` = **stdin** — small coordinates are all valid fd numbers |
+| 92 | `gpu_shader_op` | **`chown(path,uid,gid)`** | **YES** | ⚠ **SEVERITY RAISED at 1.56.4.** arg1 **was** a 1..16 slot id (near-null ⇒ EFAULT overwhelmingly likely). It is now a **real user VA ≥ 0x200000** that the kernel proves present/user-mapped before use — so off-agnos, `chown()` receives a **READABLE path pointer** and would **plausibly SUCCEED**, changing file ownership. Same hazard class as #91. The file-level `#ifdef CYRIUS_TARGET_AGNOS` gate is now the **only** barrier |
+
+**Net effect of the 1.56.4 collapse on this table: the band's destructive-collision surface drops from four
+rows to one.** `#93` (`fchown` — previously called out here as a plausible-success row) and `#94` (`lchown`,
+which never had a row at all) are withdrawn, and `#95` (`umask` — a call that *never fails* and silently
+mutates process-global state) is never minted. One number is documented and gated instead of four.
 
 ### This hazard is not hypothetical — it is live in the tree
 
@@ -114,12 +140,22 @@ GPU-visible memory. Packing matches `blit`#39: `wh = (h<<16)|w`, `dstxy = (dy<<1
 ```cyrius
 SYS_SHM_CREATE_GPU = 86;   # shm_create_gpu(size) → id/-1; GPU-visible shm page (LINK on Linux)
 SYS_GPU_BLIT_SHM   = 87;   # gpu_blit_shm(id,wh,dstxy) → 0/-1; GPU composite (UNLINK on Linux — DELETES)
-SYS_GPU_BLEND_SHM  = 92;   # gpu_blend_shm(id,wh,dstxy) → 0/-1; ALPHA composite, src PREMULTIPLIED (CHOWN on Linux)
+SYS_GPU_SHADER_OP  = 92;   # gpu_shader_op(desc,len) → 0 / -((idx<<8)|reason); ALL shader compositing.
+                           # CHOWN on Linux — a metadata WRITE, and arg1 is a REAL POINTER, so the Linux
+                           # call would PLAUSIBLY SUCCEED. The gate is load-bearing, not stylistic.
 ```
 ```cyrius
 fn sys_shm_create_gpu(size): i64          { return syscall(SYS_SHM_CREATE_GPU, size); }
 fn sys_gpu_blit_shm(id, wh, dstxy): i64   { return syscall(SYS_GPU_BLIT_SHM, id, wh, dstxy); }
-fn sys_gpu_blend_shm(id, wh, dstxy): i64  { return syscall(SYS_GPU_BLEND_SHM, id, wh, dstxy); }
+# ONE row for the ENTIRE shader-compositing surface. `desc` points at `len / 64` 64-byte op records; the
+# operation is an op code in dword 0 of each record, so alpha blend (1), coverage (2), glyph expand (3),
+# gradient (4) — and every later primitive — need NO new syscall numbers. Record layout is normative in
+# agnos `docs/development/agnos-userland-abi.md`.
+#
+# Sources must be PREMULTIPLIED (c <= a); straight alpha is silently washed out, never an error.
+# Returns 0, or a PACKED negative: e = 0 - rc; idx = e >> 8; reason = e & 0xFF.
+# DO NOT normalise the packed value to -1 — the index names which op failed, and that is the point.
+fn sys_gpu_shader_op(desc, len): i64 { return syscall(SYS_GPU_SHADER_OP, desc, len); }
 ```
 
 ---

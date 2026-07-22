@@ -1044,8 +1044,48 @@ var GPU_PM4_SET_SH_REG_N6     = 0xC0067600;
 # workgroup would silently read tgid 0 and blend the same 64 pixels 256 times over.
 var GPU_COMPUTE_PGM_RSRC1_GRID = 0x002C00C3; # blend_rect: 16 VGPRs, 32 SGPRs (llvm-mc computed)
 var GPU_COMPUTE_RSRC2_GRID2D   = 0x0000018E; # USER_SGPR=7 | TGID_X_EN | TGID_Y_EN (llvm-mc computed)
-var GPU_PM4_SET_SH_REG_N7      = 0xC0077600;  # SET_SH_REG, 7 values (src_lo/hi, dst_lo/hi, src_pitch, dst_pitch, width)
-var GPU_BR_SRC_SUBOFF          = 0x20000;    # src rect in the arena: 256x64x4 = 64 KB, clear of 0x14000/0x1A000/0x1B800
+var GPU_PM4_SET_SH_REG_N7      = 0xC0077600;
+var GPU_PM4_SET_SH_REG_N8      = 0xC0087600;  # SET_SH_REG, 8 values (blend_cov adds the uniform COLOUR)
+# --- coverage blend (blend_cov.s): AA text / shape primitive ---
+var GPU_COMPUTE_PGM_RSRC1_COV  = 0x002C00C3; # 16 VGPRs, 32 SGPRs (llvm-mc computed)
+var GPU_COMPUTE_RSRC2_COV      = 0x00000190; # USER_SGPR=8 | TGID_X_EN | TGID_Y_EN (llvm-mc computed)
+var GPU_COV_SHADER_SUBOFF      = 0x51000;    # slot 1 — blend_cov blob (67 dwords). Was 0x16000 == SHADER_OUT2.
+var GPU_COV_MASK_SUBOFF        = 0x40000;    # 256x256 8bpp coverage mask = 64 KB, clear of 0x30000's rect-2 src
+var GPU_COV_N     = 256;                     # mask is NxN; N is a multiple of 64 here, the guard is proven elsewhere
+var GPU_COV_X     = 420;                     # where the shape lands in the back buffer
+var GPU_COV_Y     = 300;
+var GPU_COV_R     = 110;                     # circle radius in px
+var GPU_COV_COLOR = 0xFF00C8FF;              # premultiplied cyan at alpha 255 (c <= a holds trivially)
+var GPU_COV_DST_L = 0xFF202020;              # underlay left half  (near-black) — the shape crosses BOTH, so
+var GPU_COV_DST_R = 0xFFE8E8E8;
+# --- 1bpp glyph expansion (glyph_1bpp.s): the bitmap-text primitive ---
+# Shares RSRC2 with blend_cov (USER_SGPR=8 | TGID_X | TGID_Y) — only the VGPR count differs, which is why
+# the 8-kernarg dispatcher takes rsrc1 as a parameter instead of being duplicated.
+var GPU_COMPUTE_PGM_RSRC1_GLYPH = 0x002C00C2; # 12 VGPRs, 32 SGPRs (llvm-mc computed)
+var GPU_GLYPH_SHADER_SUBOFF     = 0x52000;    # slot 2 — glyph_1bpp blob (36 dwords)
+var GPU_GLYPH_BMP_SUBOFF        = 0x17800;    # composed 1bpp text bitmap (16 rows x 16 B = 256 B)
+var GPU_GLY_CHARS  = 16;                      # "AGNOS SHADER GPU" — exactly 16, so 4 store32s per row
+var GPU_GLY_STRIDE = 16;                      # 1 byte per 8x16 char per scanline
+var GPU_GLY_W      = 128;                     # 16 chars x 8 px
+var GPU_GLY_H      = 16;
+var GPU_GLY_X      = 200;
+var GPU_GLY_Y      = 200;
+var GPU_GLY_BG     = 0xFF101828;              # underlay: must SURVIVE where bits are clear
+var GPU_GLY_FG     = 0xFFFFE060;
+# --- linear gradient (grad_linear.s): the last drawing primitive on the 1.56.x list ---
+# Shares RSRC2 with blend_rect (USER_SGPR=7 | TGID_X | TGID_Y) but with a completely different kernarg
+# MEANING — one pointer plus five scalars, no source buffer at all.
+var GPU_COMPUTE_PGM_RSRC1_GRAD = 0x002C00C3; # 16 VGPRs, 32 SGPRs (llvm-mc computed)
+var GPU_GRAD_SHADER_SUBOFF     = 0x53000;    # slot 3 — grad_linear blob (70 dwords). Was 0x18000 == KERNARG_IN.
+var GPU_GRD_W  = 320;
+var GPU_GRD_H  = 200;
+var GPU_GRD_X  = 200;
+var GPU_GRD_Y  = 340;
+var GPU_GRD_C0 = 0xFFC000C0;                 # row 0: OPAQUE magenta (alpha 255 ⇒ row 0 is exactly this)
+var GPU_GRD_C1 = 0x00000000;                 # last row: fully transparent ⇒ the underlay ramps back in
+var GPU_GRD_L  = 0xFF202020;                 # underlay left  (dark)  — the fade-out must be visible
+var GPU_GRD_R  = 0xFFE0E0E0;                 # underlay right (light)   against BOTH              # glyph colour, stored verbatim (no blending in this kernel)              # underlay right half (near-white)   one edge is dark-on-light  # SET_SH_REG, 7 values (src_lo/hi, dst_lo/hi, src_pitch, dst_pitch, width)
+var GPU_BR_SRC_SUBOFF          = 0x60000;    # src rect: 256x64x4 = 64 KB -> ends 0x70000. Was 0x20000 == SDMA_RING.
 # Rect geometry. WIDTH MUST BE A MULTIPLE OF 64 — blend_rect has no bounds guard, so a partial trailing
 # workgroup would blend past the right edge into the neighbouring pixels.
 var GPU_BR_W  = 256;
@@ -1058,12 +1098,27 @@ var GPU_BR_DST_R  = 0xFFA00000;              # underlay, right half (red)      w
 # Second rect — the BOUNDS-GUARD case. 200 is deliberately NOT a multiple of 64: the last of its 4
 # workgroups is 56/64 masked off. The test checks both that the 200 px blend is bit-exact AND that the
 # pixels at x = 200..255 still hold the background, which is the only direct evidence the mask worked.
-# The BLEND SYSCALL gets its OWN shader + done slots rather than sharing GPU_SHADER_SUBOFF with the boot
-# self-tests. Sharing would work today (the tests finish before ring 3 exists) but it makes a runtime path
-# depend on boot-time ordering, and the arena has room to spare.
-var GPU_BLEND_SHADER_SUBOFF = 0x15000;       # blend_rect resident for #92 (60 dwords)
-var GPU_BLEND_DONE_SUBOFF   = 0x15C00;       # its dispatch done-marker
-var GPU_BR2_SRC_SUBOFF = 0x30000;            # src for the guard rect (200x48x4 = 37.5 KB), after rect 1's 64 KB
+# --- SHADER RESIDENCY TABLE (1.56.4 / plan-S12 residency half) ----------------------------------------
+# One 4 KB slot per kernel, strided, in a region NOTHING else in the arena claims. Every slot base is
+# 4 KB-aligned, so COMPUTE_PGM_LO = mc>>8 stays exact.
+#
+# ⚠ WHY THIS MOVED. Every one of these lived at an address another constant already owned:
+#   0x15000 blend_rect  ==  GPU_VM_DUMMY_SUBOFF, the VM protection-fault SINK page (gpu_regs.cyr:884).
+#           That is not a passive overlap: gpu_vm_setup() ZEROES 4 KB there at boot (gpu.cyr:768), and
+#           VM_L2_PROT_FAULT_DEF_LO/HI point the hardware's fault writes at it for the whole run. The
+#           done-marker at +0xC00 sat in the same page, so a fault-sink write carrying the sentinel
+#           bytes could FALSE-SIGNAL completion on a dispatch that never ran.
+#   0x16000 blend_cov   ==  GPU_SHADER_OUT2_SUBOFF (:1013)
+#   0x18000 grad_linear ==  GPU_KERNARG_IN_SUBOFF  (:1029)
+# Only build-flag disjointness kept these apart, and nothing enforced that. scripts/check.sh now fails
+# the build on any duplicate _SUBOFF value so this class cannot come back.
+var GPU_SHADER_SLOT_BASE   = 0x50000;        # 8 slots x 4 KB = 0x50000..0x57FFF (past COV_MASK's 64 KB)
+var GPU_SHADER_SLOT_STRIDE = 0x1000;
+var GPU_BLEND_SHADER_SUBOFF = 0x50000;       # slot 0 — blend_rect resident for #92 (60 dwords)
+var GPU_OP_DONE_BASE        = 0x58000;       # done-marker table, 64 slots x 0x40 (one cache line each)
+var GPU_OP_DONE_STRIDE      = 0x40;
+var GPU_BLEND_DONE_SUBOFF   = 0x58000;       # done slot 0 — shared by the five kernels while unbatched
+var GPU_BR2_SRC_SUBOFF = 0x70000;            # src for the guard rect (200x48x4 = 37.5 KB) -> ends 0x79600
 var GPU_BR2_W = 200;
 var GPU_BR2_H = 48;
 var GPU_BR2_X = 128;

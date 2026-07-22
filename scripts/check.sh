@@ -37,6 +37,32 @@ sh "$ROOT/scripts/kprint-len-check.sh" > /tmp/kprint-len-check.log 2>&1 && rc=0 
 check "kprint literal lengths" $rc
 [ "$rc" = "0" ] || cat /tmp/kprint-len-check.log
 
+# GPU arena slot aliasing. Every *_SUBOFF is a byte offset into the ONE compute arena; two constants
+# holding the same value means two subsystems own the same memory, and nothing but build-flag
+# disjointness keeps them apart. Wired in 2026-07-22 after the 1.56.x audit found SIX live aliases,
+# the worst of which put #92's blend shader and the done-marker all five shader kernels poll on top of
+# GPU_VM_DUMMY_SUBOFF — the VM protection-fault SINK page, which gpu_vm_setup() zeroes at boot and the
+# hardware writes to on every fault. A fault-sink write carrying the sentinel bytes false-signals a
+# completed dispatch, which is a FALSE PASS, not a crash. Value-only check by design: it needs no
+# knowledge of each slot's extent, so it cannot rot.
+DUPS=$(grep -oE "_SUBOFF *= *0x[0-9A-Fa-f]+" "$ROOT/kernel/core/gpu_regs.cyr" \
+       | awk -F'0x' '{print toupper($2)}' | sort | uniq -d)
+test -z "$DUPS"
+check "gpu arena slots unaliased" $?
+[ -z "$DUPS" ] || { echo "  duplicated arena offsets:"; for d in $DUPS; do
+    echo "    0x$d:"; grep -nE "_SUBOFF *= *0[xX]0*$d\b" "$ROOT/kernel/core/gpu_regs.cyr" | sed 's/^/      /'; done; }
+
+# Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.
+# Wired in 2026-07-22 after the 1.56.x audit found gpu_blend_cov_run declared with 12 parameters and
+# called with 11 at BOTH coverage sites — including gpu_cov_surface, the live worker behind syscall #93.
+# Every argument after the missing one shifted by one position, which made done_phys undefined and turned
+# the function's first statement into a wild kernel store32. It had been warning in every build since the
+# glyph refactor. This promotes that warning to a build failure.
+ARITY=$(sh "$ROOT/scripts/build.sh" 2>&1 | grep -E "expects [0-9]+ arguments, got [0-9]+" || true)
+test -z "$ARITY"
+check "call arity (no cycc argument-count warnings)" $?
+[ -z "$ARITY" ] || echo "$ARITY" | sed 's/^/    /'
+
 # Tests
 echo ""
 echo "--- Tests ---"

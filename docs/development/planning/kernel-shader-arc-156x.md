@@ -138,6 +138,34 @@ resolves**. The file-level `#ifdef CYRIUS_TARGET_AGNOS` gate in `lib/syscalls.cy
 | **D-5** | Does the arc end at the kernel seam or at the desktop? | scope | **Kernel arc closes at S12 + `/bin/gpublend`;** consumer wiring (aethersafha `rend_blend`, sadish raster, dhancha surface, bhumi scanout) is follow-on in those repos with named owners. Precedent: 1.54.x's stated crown **C6 is still open** because it was a consumer item scoped inside a kernel arc. Do not repeat that |
 | **D-6** | Prove slot residency by **removing** the pre-dispatch `ACQUIRE_MEM(INV)`? | **S12** | **No.** That invalidate is load-bearing twice — stale I$ on a rewritten shader VA *and* stale GL2 lines when a shader reads bytes CP-DMA just wrote MC-direct. Removing it breaks the mixed-engine case S12 depends on. Add the slot table for batching; keep the invalidate unconditionally |
 
+### ⚠ EXECUTION DIVERGENCE — recorded 2026-07-22, at 1.56.3
+
+**The ladder above is correct as written and is NOT being rewritten.** What follows is the record of how
+execution departed from it, so the two can be read against each other. Restored at 1.56.4 (see CHANGELOG).
+
+| Plan bite / row | Status | What actually happened |
+|---|---|---|
+| **S0** | PARTIAL | `scripts/gfx9-asm.sh` assembles from `.s` via `llvm-mc` and harvests RSRC1/RSRC2 — good, and better than hand-typing. But **the `sweep.sh` check gate never landed**, and the six 1.54.x tables were never byte-verified. The net this bite existed to build does not exist |
+| **S1 · D0** | DONE-IRON | Both shipped as reports rather than gates. S1 banked a durable hardware fact: **the SH compute registers are not GRBM-readable on this part** |
+| **S2** | DONE-IRON | Shipped, but as **f32 premultiplied**, which is a *third* option D-2 never listed — see D-2 below |
+| **S3** | ❌ **NEVER RAN** | Its label was consumed by the grid bite (plan S5). The four-arm coherence table does not exist; the post-dispatch write-back is emitted unconditionally and **no build has ever run without it**. So "the TC write-back is load-bearing for display visibility" remains an *assumption*. ⚠ Arms (c)/(d) are **S12's precondition** — the arc's own standing rule forbids batching a dispatch and a CP-DMA into one submission until S3 says otherwise |
+| **S4** | ❌ **NEVER STARTED** | Zero `v_perm_b32` and zero `v_pk_*` in the tree. The RGBX↔BGRX channel swap — which this arc opened by calling **"an unhandled case, not just a slow one"** — is still exactly that |
+| **S5** | DONE-IRON | Shipped under the label "S3". Carries the blend rather than a pure copy, and was verified against `blend_ref_px` rather than `gpu_cp_dma_blit`; no per-workgroup sentinel witness (the workgroup evidence is a photo) |
+| **S6** | DONE-IRON | Shipped correctly labelled, but at w=**200** with no deliberate **unguarded** control arm. "The guard stopped the overrun" is therefore inferred, not measured |
+| **S7** | DONE-IRON | Delivered across two cuts. `gpu_blend_ok` exists but **gates nothing on the runtime path** — and it must not, being self-test-only (see the 1.56.4 note) |
+| **S8 / D-3** | ❌ **BUILT THE REJECTED OPTION** | Shipped `#92` blend + `#93` coverage + `#94` glyph — one number per op, verbatim the column D-3 rejected. Restored to the descriptor array at 1.56.4 |
+| **S9 · S10 · S11** | BUILT | Shipped as `#94` / `#93` / no-syscall-at-all, and under the labels "S8" / "S7" / "S9". The gradient shipped a working shader with **no kernel-side worker and no ring-3 path** for a full cut |
+| **S12 · D1 · D2** | NOT STARTED | S12's residency half landed early at 1.56.4 as a side effect of fixing the arena aliasing |
+
+**Two live defects found by the same re-audit** (detail in the CHANGELOG): both coverage call sites passed
+11 arguments to a 12-parameter dispatcher — warning in every build since 1.56.3 — and `#92`'s resident
+shader plus the done-marker all five kernels poll sat inside the **VM protection-fault sink page**.
+
+**The process lesson, and it is the expensive one:** the deviation was not a judgement call made and
+recorded — it was made silently, and the bite renumbering then removed the means of noticing. Per
+[[feedback_execute_the_plan_you_wrote]]: **name the bite ID and its governing D-rows before writing code,
+and re-open this document before each bite.** A decision row that is not re-read is not a decision.
+
 ### Ready to build now (no decision pending)
 
 **S1 · D0 · S3 · S4 · S5 · S6 · D1.** S0, S2, S8 and D2 are blocked on D-1, D-2, D-3 and D-4 respectively.

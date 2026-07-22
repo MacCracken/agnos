@@ -101,6 +101,25 @@ stage_one gpumm        src/main.cyr gpumm    || rc=1
 # nothing in /bin to produce samples, and the armed audio path stays silent.
 stage_one agnos/audio-test tonegen.cyr tonegen || rc=1
 
+# GPU display/compositing proofs — the ring-3 ends of the 1.55.x/1.56.x band. IN-TREE
+# (agnos/gpu-test), same agnos/ prefix as tonegen. These were staged BY HAND for every burn
+# through 1.56.3, which is why nothing in scripts/ referenced them; wired in at 1.56.4 so a
+# burn cannot silently run yesterday's binary against today's kernel.
+#
+#   gpufill  — #85 whole-buffer CP-DMA fill + #84 present
+#   gpublit  — #86/#87/#88/#89: a whole compositor frame, zero per-pixel CPU work
+#   gpublend — #92 op 0x01, per-pixel alpha src-over through the SHADER cores
+#   gpucov   — #92 op 0x02, 8bpp coverage mask (the anti-aliased edge CP-DMA cannot draw)
+#
+# Each is SELF-VALIDATING and the result IS the exit code, read as `run: exit N` — 95 = all
+# pass. gpublend/gpucov decode #92's packed failure as 110 + reason (111 no-GPU .. 123
+# envelope-unproven), so a failed burn names WHY without needing a photo. Real AMD iron only;
+# on a non-GPU boot they exit early rather than faulting.
+stage_one agnos/gpu-test gpufill.cyr  gpufill  || rc=1
+stage_one agnos/gpu-test gpublit.cyr  gpublit  || rc=1
+stage_one agnos/gpu-test gpublend.cyr gpublend || rc=1
+stage_one agnos/gpu-test gpucov.cyr   gpucov   || rc=1
+
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
 # symlinks (-> kriya) in the rootfs: install-media.sh's `cp -a` preserves them

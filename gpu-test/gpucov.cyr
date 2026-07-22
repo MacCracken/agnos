@@ -1,0 +1,143 @@
+# gpucov — agnos ring-3 ANTI-ALIASED SHAPE proof (shader arc 1.56.x, syscall #93).
+#
+# The third and last member of the compositing family:
+#   #87 gpu_blit_shm       — opaque rectangle (CP-DMA, no ALU)
+#   #92 gpu_blend_shm      — translucent rectangle (shader, 32bpp premultiplied source)
+#   #93 gpu_blend_cov_shm  — ARBITRARY SHAPE with a smooth edge (shader, 8bpp coverage + one colour)
+#
+# #93 is the only one that can draw a non-rectangular edge. #87 and #92 both composite rectangles and
+# CP-DMA fills them; none of the three can express "this pixel is 40% covered". That is what a rasteriser
+# emits for a glyph or a curve, so this is the primitive vector text and shapes have to go through.
+#
+# It is also the cheapest source in the band: one byte per pixel instead of four, because the colour is
+# uniform for the whole shape and only coverage varies.
+#
+# VISUAL oracle: four overlapping discs in different colours and alphas. Two things are visible that no
+# other call in the band can produce — CURVED EDGES with no staircase, and the overlaps compounding where
+# discs cross. A jagged edge would mean coverage was thresholded rather than blended; a hard rectangle
+# would mean the mask was ignored entirely.
+#
+# EXIT oracle: 95 = all pass
+#              96 = gpu_caps failed
+#              100 no-GPU · 101 no-carveout · 102 bad-width · 103 bad-height · 104 no-free-slot · 105 not-armed
+#              90 = fill · 92 = shm_create_gpu · 93 = shm_write · 91 = present
+#              110+reason = gpu_shader_op#92 (op 2 = coverage) FAILED. reason = (-rc) & 0xFF:
+#                111 no-GPU · 112 bad-op · 113 bad-slot · 114 slot-too-small · 115 off-screen · 116 bad-dim
+#                117 shader-not-resident · 118 dispatch-timeout · 121 bad-descriptor · 122 reserved-field
+#                123 dispatch-envelope-unproven-this-boot
+
+var gc_mask[2048];                 # module-global ⇒ N x u64 = 16384 B = 128*128 coverage bytes
+
+fn gpucov_hold(ms): i64 {
+    var t0 = sys_uptime_ms();
+    var t = t0;
+    var spins = 0;
+    while (t - t0 < ms) {
+        if (spins >= 4000000) { return 0; }
+        sys_sched_yield();
+        t = sys_uptime_ms();
+        spins = spins + 1;
+    }
+    return 0;
+}
+
+# Rasterise a filled disc's COVERAGE into the mask, 8bpp. Analytic and sqrt-free: compare the squared
+# distance against an inner and an outer radius and interpolate between them, which gives a ~2 px soft
+# boundary. This is a stand-in for what sadish/rekha will emit for a real glyph outline.
+# Packed 4 coverage bytes per store32 — 128 is a multiple of 4, so no partial word.
+fn gc_disc(radius): i64 {
+    var half = 64;
+    var ri = radius - 1;
+    var ro = radius + 1;
+    var ri2 = ri * ri;
+    var ro2 = ro * ro;
+    var span = ro2 - ri2;
+    var y = 0;
+    while (y < 128) {
+        var dy = y - half;
+        var dy2 = dy * dy;
+        var x = 0;
+        while (x < 128) {
+            var word = 0;
+            var k = 0;
+            while (k < 4) {
+                var dx = (x + k) - half;
+                var d2 = dx * dx + dy2;
+                var cov = 0;
+                if (d2 <= ri2) { cov = 255; }
+                if (d2 > ri2) {
+                    if (d2 < ro2) { cov = (255 * (ro2 - d2)) / span; }
+                }
+                word = word | (cov << (k * 8));
+                k = k + 1;
+            }
+            store32(&gc_mask + y * 128 + x, word);
+            x = x + 4;
+        }
+        y = y + 1;
+    }
+    return 0;
+}
+
+# Composite the current mask as a disc of the given colour at (x,y). The colour is PREMULTIPLIED — the
+# shader scales it by coverage and blends with no per-pixel divide, which is only correct for premultiplied
+# input, exactly as for #92.
+fn gc_draw(id, r, g, b, a, x, y): i64 {
+    var pr = (r * a) / 255;
+    var pg = (g * a) / 255;
+    var pb = (b * a) / 255;
+    var col = (a * 16777216) + (pr * 65536) + (pg * 256) + pb;
+    if (syscall(72, id, &gc_mask, 128 * 128) != 0) { return 93; }
+    # Coverage is op code 2 inside #92 rather than its own syscall number. Note what this removes: the
+    # colour used to ride in arg4 (r10) via ksyscall_a4 purely because the dispatcher had only four
+    # argument slots and coverage needs five operands. In a record it is just dword 9.
+    var d[64];                                     # function-local ⇒ 64 BYTES = exactly one record
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 2);                           # op = GPU_OP_BLEND_COV
+    store32(&d + 12, id);                          # mask_id (8bpp coverage, 1 byte per pixel)
+    store32(&d + 16, (128 * 65536) + 128);         # wh    = (h<<16)|w
+    store32(&d + 20, (y * 65536) + x);             # dstxy = (dy<<16)|dx
+    store32(&d + 36, col);                         # color0, premultiplied
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) { return 110 + ((0 - rc) & 0xFF); }
+    return 0;
+}
+
+fn gpucov_main(): i64 {
+    var caps[32];
+    if (syscall(89, &caps, 32) != 0) { return 96; }
+    var flags = load32(&caps + 0)  & 0xFFFFFFFF;
+    var bbw   = load32(&caps + 8)  & 0xFFFFFFFF;
+    var bbh   = load32(&caps + 12) & 0xFFFFFFFF;
+    var freeslots = load32(&caps + 20) & 0xFFFFFFFF;
+    if ((flags & 1) == 0) { return 100; }
+    if ((flags & 4) == 0) { return 101; }
+    if (bbw < 480) { return 102; }
+    if (bbh < 320) { return 103; }
+    if (freeslots < 1) { return 104; }
+    if ((flags & 2) == 0) { return 105; }
+
+    if (sys_gpu_fill(0x00182038) != 0) { return 90; }
+
+    # ONE byte per pixel — a quarter of what #92's 32bpp source would need for the same shape.
+    var id = syscall(86, 128 * 128);
+    if (id < 1) { return 92; }
+
+    gc_disc(56);
+    var cy = bbh / 3;
+    var cx = bbw / 5;
+    var r1 = gc_draw(id, 255,  80,  80, 255, cx,       cy);        if (r1 != 0) { return r1; }
+    var r2 = gc_draw(id,  80, 255, 120, 200, cx +  90, cy);        if (r2 != 0) { return r2; }
+    var r3 = gc_draw(id,  90, 170, 255, 200, cx +  45, cy +  80);  if (r3 != 0) { return r3; }
+    gc_disc(30);                                                    # a smaller disc: edge quality at a
+    var r4 = gc_draw(id, 255, 220,  60, 255, cx + 180, cy +  40);   # tighter curvature is the harder case
+    if (r4 != 0) { return r4; }
+
+    if (sys_gpu_present() != 1) { return 91; }   # #84 returns 1 = presented (see gpublend.cyr)
+    gpucov_hold(4000);
+    return 95;
+}
+
+fn _entry(): i64 { var r = gpucov_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

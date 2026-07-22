@@ -58,9 +58,16 @@ var gpu_bb_b_phys     = 0;   # buffer B
 var gpu_bb_b_mc       = 0;
 var gpu_bb_back       = 0;   # current RENDER target: 0 = A, 1 = B (the other is being scanned)
 var gpu_bb_fbsize     = 0;   # framebuffer byte size (pitch*height) — the CP-DMA fill span for gpu_fill_sys
-var gpu_blend_ok      = 0;   # S2: 1 = per-pixel alpha blend proven on the CUs
-var gpu_rect_ok       = 0;   # S3: 1 = grid blend into the scanout back buffer proven (and presented)
-var gpu_blend_armed   = 0;   # 1 = blend_rect resident in its own arena slot for the #92 syscall path
+var gpu_blend_ok      = 0;   # plan-S2: 1 = per-pixel alpha blend proven on the CUs (SELFTEST-ONLY flag:
+                             # set only under #ifdef SHADER_BLEND, so it must NEVER gate a runtime path)
+var gpu_rect_ok       = 0;   # plan-S5: 1 = grid blend into the scanout back buffer proven (and presented)
+var gpu_blend_armed   = 0;   # 1 = blend_rect resident in its own arena slot for #92 op GPU_OP_BLEND_RECT
+var gpu_cov_ok        = 0;   # plan-S10: 1 = coverage (anti-aliased) blend proven on iron
+var gpu_cov_armed     = 0;   # 1 = blend_cov resident in its own arena slot for #92 op GPU_OP_BLEND_COV
+var gpu_glyph_ok      = 0;   # plan-S9: 1 = 1bpp glyph expansion proven on iron
+var gpu_glyph_armed   = 0;   # 1 = glyph_1bpp resident for #92 op GPU_OP_GLYPH_1BPP
+var gpu_grad_ok       = 0;   # plan-S11: 1 = linear gradient proven on iron
+var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot for the #92 op path
 var gpu_bb_pitch      = 0;   # framebuffer row pitch in BYTES — the dst stride for gpu_blit_shm_sys
 var gpu_scanout_pid   = 0 - 1; # pid owning the scanout (-1 = the console owns it)
 # P3a display-audio discovery (read-only probe results)
@@ -1682,7 +1689,13 @@ fn blend_rect_write(dst_phys) {
 # `width` is what the shader's EXEC guard compares against — `gx` must be the CEILING of width/64, and the
 # surplus lanes of the final workgroup mask themselves off. Passing floor() instead would silently drop the
 # rect's right edge rather than fault, so the caller computes it once, here.
-fn gpu_blend_rect_run(shader_mc, src_mc, dst_mc, src_pitch, dst_pitch, width, gx, gy, done_mc, done_phys) {
+# gpu_grid7_run — the shared 7-KERNARG 2-D grid dispatcher, taking RAW kernarg dwords.
+#
+# Factored out when grad_linear arrived: blend_rect and grad_linear share RSRC2 (USER_SGPR=7 | TGID_X |
+# TGID_Y) but have completely different kernarg MEANINGS (two pointers + three scalars vs one pointer +
+# five). Rather than a third near-identical copy of the ring program — the one place a typo is silent and
+# expensive — the emitter takes seven opaque dwords and the callers name them.
+fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, done_phys) {
     store32(done_phys, GPU_MT_NOTYET);
     gpu_mfence();
 
@@ -1696,11 +1709,10 @@ fn gpu_blend_rect_run(shader_mc, src_mc, dst_mc, src_pitch, dst_pitch, width, gx
     gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
     gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
-    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_GRID); gpu_ring_put(GPU_COMPUTE_RSRC2_GRID2D);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(rsrc1); gpu_ring_put(GPU_COMPUTE_RSRC2_GRID2D);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N7); gpu_ring_put(GPU_SH_COMPUTE_USER_DATA_0);
-    gpu_ring_put(src_mc & 0xFFFFFFFF); gpu_ring_put((src_mc >> 32) & 0xFFFFFFFF);
-    gpu_ring_put(dst_mc & 0xFFFFFFFF); gpu_ring_put((dst_mc >> 32) & 0xFFFFFFFF);
-    gpu_ring_put(src_pitch); gpu_ring_put(dst_pitch); gpu_ring_put(width);
+    gpu_ring_put(k0); gpu_ring_put(k1); gpu_ring_put(k2); gpu_ring_put(k3);
+    gpu_ring_put(k4); gpu_ring_put(k5); gpu_ring_put(k6);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_START_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(GPU_MT_NUM_THREAD_X); gpu_ring_put(1); gpu_ring_put(1);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_RESTART_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
@@ -1733,6 +1745,780 @@ fn gpu_blend_rect_run(shader_mc, src_mc, dst_mc, src_pitch, dst_pitch, width, gx
     gpu_mfence();
     gpu_ring_wptr = new_wptr;
     return ok;
+}
+
+# gpu_blend_rect_run — blend_rect's kernarg layout over gpu_grid7_run. Kept as a named wrapper so the two
+# existing call sites read as (src, dst, pitches, width) rather than as seven anonymous dwords.
+fn gpu_blend_rect_run(shader_mc, src_mc, dst_mc, src_pitch, dst_pitch, width, gx, gy, done_mc, done_phys) {
+    return gpu_grid7_run(shader_mc,
+        src_mc & 0xFFFFFFFF, (src_mc >> 32) & 0xFFFFFFFF,
+        dst_mc & 0xFFFFFFFF, (dst_mc >> 32) & 0xFFFFFFFF,
+        src_pitch, dst_pitch, width,
+        GPU_COMPUTE_PGM_RSRC1_GRID, gx, gy, done_mc, done_phys);
+}
+
+# blend_cov — GENERATED by scripts/gfx9-asm.sh from kernel/shaders/blend_cov.s. DO NOT HAND-EDIT.
+# Regenerate: sh scripts/gfx9-asm.sh kernel/shaders/blend_cov.s blend_cov
+fn blend_cov_write(dst_phys) {
+    store32(dst_phys + 0,   0x8e0a8608);
+    store32(dst_phys + 4,   0x6818000a);
+    store32(dst_phys + 8,   0x7d981806);
+    store32(dst_phys + 12,  0xbe94206a);
+    store32(dst_phys + 16,  0x920b0409);
+    store32(dst_phys + 20,  0x800b0a0b);
+    store32(dst_phys + 24,  0x800c0b00);
+    store32(dst_phys + 28,  0x820d8001);
+    store32(dst_phys + 32,  0x8e0e8808);
+    store32(dst_phys + 36,  0x920f0509);
+    store32(dst_phys + 40,  0x800f0e0f);
+    store32(dst_phys + 44,  0x80100f02);
+    store32(dst_phys + 48,  0x82118003);
+    store32(dst_phys + 52,  0x7e08020c);
+    store32(dst_phys + 56,  0x7e0a020d);
+    store32(dst_phys + 60,  0x32080104);
+    store32(dst_phys + 64,  0x380a0a80);
+    store32(dst_phys + 68,  0xdc408000);
+    store32(dst_phys + 72,  0x027f0004);
+    store32(dst_phys + 76,  0x24020082);
+    store32(dst_phys + 80,  0x7e0c0210);
+    store32(dst_phys + 84,  0x7e0e0211);
+    store32(dst_phys + 88,  0x320c0306);
+    store32(dst_phys + 92,  0x380e0e80);
+    store32(dst_phys + 96,  0xdc508000);
+    store32(dst_phys + 100, 0x037f0006);
+    store32(dst_phys + 104, 0xbf8c0f70);
+    store32(dst_phys + 108, 0xbe9800ff);
+    store32(dst_phys + 112, 0x3b808081);
+    store32(dst_phys + 116, 0x7e102302);
+    store32(dst_phys + 120, 0x0a101018);
+    store32(dst_phys + 124, 0xbe9900ff);
+    store32(dst_phys + 128, 0xbb808081);
+    store32(dst_phys + 132, 0x7e122807);
+    store32(dst_phys + 136, 0x0a121109);
+    store32(dst_phys + 140, 0xd1cb000a);
+    store32(dst_phys + 144, 0x03c83309);
+    store32(dst_phys + 148, 0x7e1a2207);
+    store32(dst_phys + 152, 0x0a1a110d);
+    store32(dst_phys + 156, 0x7e1c2303);
+    store32(dst_phys + 160, 0xd1cb000d);
+    store32(dst_phys + 164, 0x0436150e);
+    store32(dst_phys + 168, 0xd1dd000b);
+    store32(dst_phys + 172, 0x042d010d);
+    store32(dst_phys + 176, 0x7e1a2407);
+    store32(dst_phys + 180, 0x0a1a110d);
+    store32(dst_phys + 184, 0x7e1c2503);
+    store32(dst_phys + 188, 0xd1cb000d);
+    store32(dst_phys + 192, 0x0436150e);
+    store32(dst_phys + 196, 0xd1dd000b);
+    store32(dst_phys + 200, 0x042d030d);
+    store32(dst_phys + 204, 0x7e1a2607);
+    store32(dst_phys + 208, 0x0a1a110d);
+    store32(dst_phys + 212, 0x7e1c2703);
+    store32(dst_phys + 216, 0xd1cb000d);
+    store32(dst_phys + 220, 0x0436150e);
+    store32(dst_phys + 224, 0xd1dd000b);
+    store32(dst_phys + 228, 0x042d050d);
+    store32(dst_phys + 232, 0x7e1c2903);
+    store32(dst_phys + 236, 0xd1cb000d);
+    store32(dst_phys + 240, 0x0426150e);
+    store32(dst_phys + 244, 0xd1dd000b);
+    store32(dst_phys + 248, 0x042d070d);
+    store32(dst_phys + 252, 0xdc718000);
+    store32(dst_phys + 256, 0x007f0b06);
+    store32(dst_phys + 260, 0xbf8c0f70);
+    store32(dst_phys + 264, 0xbf810000);
+    return 67;
+}
+
+# gpu_blend_cov_run — the shared 8-KERNARG 2-D grid dispatcher. Peer of gpu_blend_rect_run.
+#
+# Used by BOTH blend_cov and glyph_1bpp: their kernarg layouts are identical in shape (two pointers, two
+# pitches, a width and a uniform colour) and they share RSRC2 (USER_SGPR=8 | TGID_X | TGID_Y), so only
+# RSRC1 differs — hence it is a parameter. One dispatcher rather than two near-identical copies means the
+# ring program has a single place to be wrong.
+fn gpu_blend_cov_run(shader_mc, mask_mc, dst_mc, mask_pitch, dst_pitch, width, color, rsrc1, gx, gy, done_mc, done_phys) {
+    store32(done_phys, GPU_MT_NOTYET);
+    gpu_mfence();
+
+    var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
+
+    var pgm_lo = (shader_mc >> 8) & 0xFFFFFFFF;
+    var pgm_hi = (shader_mc >> 40) & 0xFF;
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(rsrc1); gpu_ring_put(GPU_COMPUTE_RSRC2_COV);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N8); gpu_ring_put(GPU_SH_COMPUTE_USER_DATA_0);
+    gpu_ring_put(mask_mc & 0xFFFFFFFF); gpu_ring_put((mask_mc >> 32) & 0xFFFFFFFF);
+    gpu_ring_put(dst_mc & 0xFFFFFFFF); gpu_ring_put((dst_mc >> 32) & 0xFFFFFFFF);
+    gpu_ring_put(mask_pitch); gpu_ring_put(dst_pitch); gpu_ring_put(width); gpu_ring_put(color);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_START_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_NUM_THREAD_X); gpu_ring_put(GPU_MT_NUM_THREAD_X); gpu_ring_put(1); gpu_ring_put(1);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N3); gpu_ring_put(GPU_SH_COMPUTE_RESTART_X); gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE0); gpu_ring_put(GPU_CU_MASK_ALL); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_STATIC_SE2); gpu_ring_put(0); gpu_ring_put(0);
+    gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(GPU_COMPUTE_RESLIM);
+    gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(gx); gpu_ring_put(gy); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
+    gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
+    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
+    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
+    gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
+    gpu_mfence();
+
+    var new_wptr = gpu_ring_wptr;
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
+    gpu_mfence();
+
+    var ok = 0;
+    var i = 0;
+    while (i < 1000) {
+        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
+        else { gpu_udelay(100); i = i + 1; }
+    }
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+    gpu_mfence();
+    gpu_ring_wptr = new_wptr;
+    return ok;
+}
+
+# cov_ref_px — EXACT rational reference for the coverage blend, rounded once at the end:
+#   out_c = round( (colour_c*cov*255 + dst_c*(65025 - colour_a*cov)) / 65025 )
+# Deriving it as one integer quotient (rather than mirroring the shader's float steps) is deliberate: it
+# measures the shader against the RIGHT ANSWER, not against a re-implementation of the shader's own
+# rounding. That is what makes the reported deviation meaningful.
+# Widest intermediate is 255*255*255 + 255*65025 ~ 33.2M, doubled for the round-half-up ~ 66.4M — far inside i64.
+fn cov_ref_px(color, cv, dst) {
+    var ca = (color >> 24) & 0xFF;
+    var out = 0;
+    var ch = 0;
+    while (ch < 4) {
+        var sh = ch * 8;
+        var cc = (color >> sh) & 0xFF;
+        var dc = (dst >> sh) & 0xFF;
+        var num = cc * cv * 255 + dc * (65025 - ca * cv);
+        var q = (num * 2 + 65025) / 130050;
+        if (q > 255) { q = 255; }
+        out = out | (q << sh);
+        ch = ch + 1;
+    }
+    return out;
+}
+
+# gpu_shader_cov_test — S7: COVERAGE blending, the anti-aliased text/shape path.
+#
+# Renders a circle with a soft edge. That choice is the point: CP-DMA fills rectangles, blend_rect
+# composites rectangular images, and NEITHER can make a round shape with a smooth boundary, because both
+# are blind to partial pixel coverage. A clean circle edge is therefore self-evidently a coverage blend.
+#
+# The circle straddles a dark/light underlay split, so one arc is light-on-dark and the other dark-on-light
+# — the two cases where a wrong blend direction or an inverted mask looks obviously wrong to the eye.
+#
+# ⚠ PRECISION, STATED HONESTLY. This test does NOT claim bit-exactness, because the kernel has two rounding
+# sites (the coverage multiply and the final pack) and 1/255 is not representable in binary floating point.
+# It asserts what is genuinely exact and MEASURES the rest:
+#   - cov = 0   MUST be bit-exact (the pixel must be untouched — any deviation is a real bug, not rounding)
+#   - cov = 255 MUST be bit-exact (it reduces to the blend already proven bit-correct at S2/S3)
+#   - everywhere else: deviation bounded at <= 1, and the OBSERVED MAXIMUM is printed.
+# Reporting the number rather than just passing means drift shows up as a changed digit instead of hiding
+# inside a tolerance.
+fn gpu_shader_cov_test() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_blend_ok != 1) { kprintln("gpu: skipping coverage (blend math unproven)", 44); return 0; }
+    if (gpu_blit_arm() != 1) { kprintln("gpu: skipping coverage (no back buffer)", 39); return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    var pitch = gpu_bb_pitch;
+    if (pitch < (GPU_COV_X + GPU_COV_N) * 4) { kprintln("gpu: skipping coverage (surface too narrow)", 43); return 0; }
+
+    var bb_phys = gpu_bb_a_phys;
+    var bb_mc   = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { bb_phys = gpu_bb_b_phys; bb_mc = gpu_bb_b_mc; }
+
+    var sh_phys = gpu_arena_phys + GPU_COV_SHADER_SUBOFF;
+    var sh_mc   = gpu_arena_mc   + GPU_COV_SHADER_SUBOFF;
+    var mk_phys = gpu_arena_phys + GPU_COV_MASK_SUBOFF;
+    var mk_mc   = gpu_arena_mc   + GPU_COV_MASK_SUBOFF;
+    var dn_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
+    var dn_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
+    blend_cov_write(sh_phys);
+
+    # --- rasterise the circle's coverage. Analytic, no sqrt: compare the squared distance against an inner
+    # and an outer radius and interpolate between them, giving a ~2 px soft edge. Packed 4 bytes per store32
+    # (the mask is 8bpp and N is a multiple of 4).
+    var half = GPU_COV_N / 2;
+    var ri = GPU_COV_R - 1;
+    var ro = GPU_COV_R + 1;
+    var ri2 = ri * ri;
+    var ro2 = ro * ro;
+    var span = ro2 - ri2;
+    var y = 0;
+    while (y < GPU_COV_N) {
+        var dy = y - half;
+        var dy2 = dy * dy;
+        var x = 0;
+        while (x < GPU_COV_N) {
+            var word = 0;
+            var k = 0;
+            while (k < 4) {
+                var dx = (x + k) - half;
+                var d2 = dx * dx + dy2;
+                var cov = 0;
+                if (d2 <= ri2) { cov = 255; }
+                if (d2 > ri2) {
+                    if (d2 < ro2) { cov = (255 * (ro2 - d2)) / span; }
+                }
+                word = word | (cov << (k * 8));
+                k = k + 1;
+            }
+            store32(mk_phys + y * GPU_COV_N + x, word);
+            x = x + 4;
+        }
+        y = y + 1;
+    }
+    gpu_mfence();
+
+    # --- underlay: dark left half, light right half, so the circle crosses both ---
+    var r_mc   = bb_mc   + GPU_COV_Y * pitch + GPU_COV_X * 4;
+    var r_phys = bb_phys + GPU_COV_Y * pitch + GPU_COV_X * 4;
+    if (gpu_cp_dma_fill_rect(r_mc, pitch, GPU_COV_DST_L, half * 4, GPU_COV_N) != 1) {
+        kprintln("gpu: coverage underlay fill failed", 34); return 0;
+    }
+    if (gpu_cp_dma_fill_rect(r_mc + half * 4, pitch, GPU_COV_DST_R, half * 4, GPU_COV_N) != 1) {
+        kprintln("gpu: coverage underlay fill failed", 34); return 0;
+    }
+
+    var gx = (GPU_COV_N + 63) / 64;
+    if (gpu_blend_cov_run(sh_mc, mk_mc, r_mc, GPU_COV_N, pitch, GPU_COV_N, GPU_COV_COLOR,
+                          GPU_COMPUTE_PGM_RSRC1_COV, gx, GPU_COV_N, dn_mc, dn_phys) != 1) {
+        kprintln("gpu: coverage dispatch did not complete", 39);
+        return 0;
+    }
+
+    # --- verify: exact at both coverage endpoints, bounded and MEASURED in between ---
+    var edge_bad = 0; var maxdev = 0; var bx = 0; var by = 0; var gotb = 0;
+    var vy = 0;
+    while (vy < GPU_COV_N) {
+        var vx = 0;
+        while (vx < GPU_COV_N) {
+            var mw = load32(mk_phys + vy * GPU_COV_N + ((vx >> 2) << 2)) & 0xFFFFFFFF;
+            var cv = (mw >> ((vx & 3) * 8)) & 0xFF;
+            var od = GPU_COV_DST_L;
+            if (vx >= half) { od = GPU_COV_DST_R; }
+            var got = load32(r_phys + vy * pitch + (vx << 2)) & 0xFFFFFFFF;
+            var ref = cov_ref_px(GPU_COV_COLOR, cv, od) & 0xFFFFFFFF;
+            if (got != ref) {
+                # The two exact cases are HARD failures; anything else is measured, not tolerated silently.
+                if (cv == 0)   { if (edge_bad == 0) { bx = vx; by = vy; gotb = got; } edge_bad = edge_bad + 1; }
+                if (cv == 255) { if (edge_bad == 0) { bx = vx; by = vy; gotb = got; } edge_bad = edge_bad + 1; }
+                var ch = 0;
+                while (ch < 4) {
+                    var sh8 = ch * 8;
+                    var a = (got >> sh8) & 0xFF;
+                    var b = (ref >> sh8) & 0xFF;
+                    var d = a - b;
+                    if (d < 0) { d = 0 - d; }
+                    if (d > maxdev) { maxdev = d; }
+                    ch = ch + 1;
+                }
+            }
+            vx = vx + 1;
+        }
+        vy = vy + 1;
+    }
+    if (edge_bad != 0) {
+        kprint("gpu: coverage ENDPOINT MISMATCH ", 32); kprint_num(edge_bad);
+        kprint(" px, first at x=", 16); kprint_num(bx);
+        kprint(" y=", 3); kprint_num(by);
+        kprint(" got ", 5); kprint_num(gotb);
+        kprintln("", 0);
+        return 0;
+    }
+    if (maxdev > 1) {
+        kprint("gpu: coverage DEVIATION too large, max ", 39); kprint_num(maxdev);
+        kprintln("", 0);
+        return 0;
+    }
+
+    # --- show it, then hand the console back (same bracket as the rect test) ---
+    var prev_back = gpu_bb_back;
+    gpu_blit_present(0);
+    var d2h = 0;
+    while (d2h < 30000) { gpu_udelay(100); d2h = d2h + 1; }
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_display_surf >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_display_surf & 0xFFFFFFFF);
+    gpu_mfence();
+    gpu_display_wait_vblank(gpu_display_pipe);
+    gpu_bb_back = prev_back;
+
+    gpu_cov_ok = 1;
+    kprint("gpu: shader coverage blend online (AA circle, endpoints exact, max dev ", 71);
+    kprint_num(maxdev);
+    kprintln(")", 1);
+    return 1;
+}
+
+# glyph_1bpp — GENERATED by scripts/gfx9-asm.sh from kernel/shaders/glyph_1bpp.s. DO NOT HAND-EDIT.
+# Regenerate: sh scripts/gfx9-asm.sh kernel/shaders/glyph_1bpp.s glyph_1bpp
+fn glyph_1bpp_write(dst_phys) {
+    store32(dst_phys + 0,   0x8e0a8608);
+    store32(dst_phys + 4,   0x6804000a);
+    store32(dst_phys + 8,   0x7d980406);
+    store32(dst_phys + 12,  0xbe94206a);
+    store32(dst_phys + 16,  0x20060483);
+    store32(dst_phys + 20,  0x920b0409);
+    store32(dst_phys + 24,  0x800c0b00);
+    store32(dst_phys + 28,  0x820d8001);
+    store32(dst_phys + 32,  0x7e08020c);
+    store32(dst_phys + 36,  0x7e0a020d);
+    store32(dst_phys + 40,  0x32080704);
+    store32(dst_phys + 44,  0x380a0a80);
+    store32(dst_phys + 48,  0xdc408000);
+    store32(dst_phys + 52,  0x067f0004);
+    store32(dst_phys + 56,  0x8e0e8808);
+    store32(dst_phys + 60,  0x920f0509);
+    store32(dst_phys + 64,  0x800f0e0f);
+    store32(dst_phys + 68,  0x80100f02);
+    store32(dst_phys + 72,  0x82118003);
+    store32(dst_phys + 76,  0x24020082);
+    store32(dst_phys + 80,  0x7e0e0210);
+    store32(dst_phys + 84,  0x7e100211);
+    store32(dst_phys + 88,  0x320e0307);
+    store32(dst_phys + 92,  0x38101080);
+    store32(dst_phys + 96,  0xbf8c0f70);
+    store32(dst_phys + 100, 0x26120487);
+    store32(dst_phys + 104, 0x6a121287);
+    store32(dst_phys + 108, 0x20140d09);
+    store32(dst_phys + 112, 0x26141481);
+    store32(dst_phys + 116, 0x7d9a1480);
+    store32(dst_phys + 120, 0x86fe6a7e);
+    store32(dst_phys + 124, 0x7e160207);
+    store32(dst_phys + 128, 0xdc718000);
+    store32(dst_phys + 132, 0x007f0b07);
+    store32(dst_phys + 136, 0xbf8c0f70);
+    store32(dst_phys + 140, 0xbf810000);
+    return 36;
+}
+
+# grad_linear — GENERATED by scripts/gfx9-asm.sh from kernel/shaders/grad_linear.s. DO NOT HAND-EDIT.
+# Regenerate: sh scripts/gfx9-asm.sh kernel/shaders/grad_linear.s grad_linear
+fn grad_linear_write(dst_phys) {
+    store32(dst_phys + 0,   0x8e098607);
+    store32(dst_phys + 4,   0x68180009);
+    store32(dst_phys + 8,   0x7d981803);
+    store32(dst_phys + 12,  0xbe90206a);
+    store32(dst_phys + 16,  0x8e0a8807);
+    store32(dst_phys + 20,  0x920b0208);
+    store32(dst_phys + 24,  0x800b0a0b);
+    store32(dst_phys + 28,  0x800c0b00);
+    store32(dst_phys + 32,  0x820d8001);
+    store32(dst_phys + 36,  0x24020082);
+    store32(dst_phys + 40,  0x7e0c020c);
+    store32(dst_phys + 44,  0x7e0e020d);
+    store32(dst_phys + 48,  0x320c0306);
+    store32(dst_phys + 52,  0x380e0e80);
+    store32(dst_phys + 56,  0xdc508000);
+    store32(dst_phys + 60,  0x037f0006);
+    store32(dst_phys + 64,  0x810ec104);
+    store32(dst_phys + 68,  0x7e120c0e);
+    store32(dst_phys + 72,  0x7e124509);
+    store32(dst_phys + 76,  0x7e040c08);
+    store32(dst_phys + 80,  0x0a041302);
+    store32(dst_phys + 84,  0xbf8c0f70);
+    store32(dst_phys + 88,  0xbe9400ff);
+    store32(dst_phys + 92,  0xbb808081);
+    store32(dst_phys + 96,  0x7e122805);
+    store32(dst_phys + 100, 0x7e142806);
+    store32(dst_phys + 104, 0x0414130a);
+    store32(dst_phys + 108, 0xd1cb000b);
+    store32(dst_phys + 112, 0x0426050a);
+    store32(dst_phys + 116, 0xd1cb0008);
+    store32(dst_phys + 120, 0x03c8290b);
+    store32(dst_phys + 124, 0x7e122205);
+    store32(dst_phys + 128, 0x7e142206);
+    store32(dst_phys + 132, 0x0414130a);
+    store32(dst_phys + 136, 0xd1cb0009);
+    store32(dst_phys + 140, 0x0426050a);
+    store32(dst_phys + 144, 0x7e142303);
+    store32(dst_phys + 148, 0xd1cb0009);
+    store32(dst_phys + 152, 0x0426110a);
+    store32(dst_phys + 156, 0xd1dd000d);
+    store32(dst_phys + 160, 0x04350109);
+    store32(dst_phys + 164, 0x7e122405);
+    store32(dst_phys + 168, 0x7e142406);
+    store32(dst_phys + 172, 0x0414130a);
+    store32(dst_phys + 176, 0xd1cb0009);
+    store32(dst_phys + 180, 0x0426050a);
+    store32(dst_phys + 184, 0x7e142503);
+    store32(dst_phys + 188, 0xd1cb0009);
+    store32(dst_phys + 192, 0x0426110a);
+    store32(dst_phys + 196, 0xd1dd000d);
+    store32(dst_phys + 200, 0x04350309);
+    store32(dst_phys + 204, 0x7e122605);
+    store32(dst_phys + 208, 0x7e142606);
+    store32(dst_phys + 212, 0x0414130a);
+    store32(dst_phys + 216, 0xd1cb0009);
+    store32(dst_phys + 220, 0x0426050a);
+    store32(dst_phys + 224, 0x7e142703);
+    store32(dst_phys + 228, 0xd1cb0009);
+    store32(dst_phys + 232, 0x0426110a);
+    store32(dst_phys + 236, 0xd1dd000d);
+    store32(dst_phys + 240, 0x04350509);
+    store32(dst_phys + 244, 0x7e142903);
+    store32(dst_phys + 248, 0xd1cb0009);
+    store32(dst_phys + 252, 0x042e110a);
+    store32(dst_phys + 256, 0xd1dd000d);
+    store32(dst_phys + 260, 0x04350709);
+    store32(dst_phys + 264, 0xdc718000);
+    store32(dst_phys + 268, 0x007f0d06);
+    store32(dst_phys + 272, 0xbf8c0f70);
+    store32(dst_phys + 276, 0xbf810000);
+    return 70;
+}
+
+# grad_ref_px — integer reference for the gradient, in the standard lerp form
+#   sc = (c0*(den-y) + c1*y + den/2) / den
+# which keeps every intermediate NON-NEGATIVE. The obvious `c0 + (c1-c0)*y/den` form has a negative
+# numerator whenever the gradient descends, and Cyrius integer division truncates toward zero — so it would
+# round the descending half in the opposite direction from the ascending half. That asymmetry is exactly
+# the kind of bug a tolerance-based test hides.
+fn grad_ref_px(c0, c1, y, den, dst) {
+    var a0 = (c0 >> 24) & 0xFF;
+    var a1 = (c1 >> 24) & 0xFF;
+    var sa = (a0 * (den - y) + a1 * y + den / 2) / den;
+    var ia = 255 - sa;
+    var out = 0;
+    var ch = 0;
+    while (ch < 4) {
+        var sh = ch * 8;
+        var e0 = (c0 >> sh) & 0xFF;
+        var e1 = (c1 >> sh) & 0xFF;
+        var sc = (e0 * (den - y) + e1 * y + den / 2) / den;
+        var dc = (dst >> sh) & 0xFF;
+        var q = (sc * 255 + dc * ia + 127) / 255;
+        if (q > 255) { q = 255; }
+        out = out | (q << sh);
+        ch = ch + 1;
+    }
+    return out;
+}
+
+# gpu_shader_grad_test — S9: vertical linear gradient, generated with NO source buffer, composited src-over.
+#
+# Both endpoint colours are SGPRs and the varying quantity is the row index the SPI already provides, so a
+# full-screen gradient reads ZERO source bytes. On the CPU this is the worst primitive of the set: per-pixel
+# interpolate AND per-pixel blend, with no memcpy-shaped loop to lean on.
+#
+# The ramp runs opaque magenta -> fully transparent over a dark/light split underlay, so BOTH ramps are
+# visible at once: the colour fading and the underlay returning. A gradient that lerped straight-alpha
+# instead of premultiplied colour would darken through the middle — visible against the light half.
+#
+# ⚠ Row 0 is asserted BIT-EXACT (t is exactly 0.0 and alpha0 is 255, so the row must be exactly C0).
+# Elsewhere the bound is 2, not blend_cov's 1, because t comes from v_rcp_f32 — a hardware reciprocal
+# APPROXIMATION, since GFX9 has neither an integer divide nor an exact f32 divide. The observed maximum is
+# reported so the looser bound stays a measured fact rather than a convenient one.
+fn gpu_shader_grad_test() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { kprintln("gpu: skipping gradient (dispatch envelope unproven)", 51); return 0; }
+    if (gpu_blit_arm() != 1) { kprintln("gpu: skipping gradient (no back buffer)", 39); return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    var pitch = gpu_bb_pitch;
+    if (pitch < (GPU_GRD_X + GPU_GRD_W) * 4) { kprintln("gpu: skipping gradient (surface too narrow)", 43); return 0; }
+
+    var bb_phys = gpu_bb_a_phys;
+    var bb_mc   = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { bb_phys = gpu_bb_b_phys; bb_mc = gpu_bb_b_mc; }
+
+    var sh_phys = gpu_arena_phys + GPU_GRAD_SHADER_SUBOFF;
+    var sh_mc   = gpu_arena_mc   + GPU_GRAD_SHADER_SUBOFF;
+    var dn_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
+    var dn_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
+    grad_linear_write(sh_phys);
+
+    var half = GPU_GRD_W / 2;
+    var g_mc   = bb_mc   + GPU_GRD_Y * pitch + GPU_GRD_X * 4;
+    var g_phys = bb_phys + GPU_GRD_Y * pitch + GPU_GRD_X * 4;
+    if (gpu_cp_dma_fill_rect(g_mc, pitch, GPU_GRD_L, half * 4, GPU_GRD_H) != 1) {
+        kprintln("gpu: gradient underlay fill failed", 34); return 0;
+    }
+    if (gpu_cp_dma_fill_rect(g_mc + half * 4, pitch, GPU_GRD_R, half * 4, GPU_GRD_H) != 1) {
+        kprintln("gpu: gradient underlay fill failed", 34); return 0;
+    }
+
+    var gx = (GPU_GRD_W + 63) / 64;
+    if (gpu_grid7_run(sh_mc,
+            g_mc & 0xFFFFFFFF, (g_mc >> 32) & 0xFFFFFFFF,
+            pitch, GPU_GRD_W, GPU_GRD_H, GPU_GRD_C0, GPU_GRD_C1,
+            GPU_COMPUTE_PGM_RSRC1_GRAD, gx, GPU_GRD_H, dn_mc, dn_phys) != 1) {
+        kprintln("gpu: gradient dispatch did not complete", 39);
+        return 0;
+    }
+
+    var den = GPU_GRD_H - 1;
+    var row0_bad = 0; var maxdev = 0; var bx = 0; var by = 0;
+    var vy = 0;
+    while (vy < GPU_GRD_H) {
+        var vx = 0;
+        while (vx < GPU_GRD_W) {
+            var od = GPU_GRD_L;
+            if (vx >= half) { od = GPU_GRD_R; }
+            var got = load32(g_phys + vy * pitch + (vx << 2)) & 0xFFFFFFFF;
+            var ref = grad_ref_px(GPU_GRD_C0, GPU_GRD_C1, vy, den, od) & 0xFFFFFFFF;
+            if (got != ref) {
+                if (vy == 0) { if (row0_bad == 0) { bx = vx; by = vy; } row0_bad = row0_bad + 1; }
+                var ch = 0;
+                while (ch < 4) {
+                    var sh8 = ch * 8;
+                    var d = ((got >> sh8) & 0xFF) - ((ref >> sh8) & 0xFF);
+                    if (d < 0) { d = 0 - d; }
+                    if (d > maxdev) { maxdev = d; }
+                    ch = ch + 1;
+                }
+            }
+            vx = vx + 1;
+        }
+        vy = vy + 1;
+    }
+    if (row0_bad != 0) {
+        kprint("gpu: gradient ROW 0 NOT EXACT ", 30); kprint_num(row0_bad);
+        kprint(" px, first at x=", 16); kprint_num(bx);
+        kprintln("", 0);
+        return 0;
+    }
+    if (maxdev > 2) {
+        kprint("gpu: gradient DEVIATION too large, max ", 39); kprint_num(maxdev);
+        kprintln("", 0);
+        return 0;
+    }
+
+    var prev_back = gpu_bb_back;
+    gpu_blit_present(0);
+    var dh = 0;
+    while (dh < 30000) { gpu_udelay(100); dh = dh + 1; }
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_display_surf >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_display_surf & 0xFFFFFFFF);
+    gpu_mfence();
+    gpu_display_wait_vblank(gpu_display_pipe);
+    gpu_bb_back = prev_back;
+
+    gpu_grad_ok = 1;
+    kprint("gpu: shader gradient online (row 0 exact, max dev ", 50); kprint_num(maxdev);
+    kprintln(")", 1);
+    return 1;
+}
+
+# gpu_glyph_arm / gpu_glyph_surface — the #94 runtime path. Same lazy-upload, own-slot discipline as
+# gpu_blend_arm / gpu_cov_arm.
+fn gpu_glyph_arm() {
+    if (gpu_glyph_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { return 0; }
+    glyph_1bpp_write(gpu_arena_phys + GPU_GLYPH_SHADER_SUBOFF);
+    gpu_mfence();
+    gpu_glyph_armed = 1;
+    return 1;
+}
+
+fn gpu_glyph_surface(bmp_mc, w, h, dx, dy, color) {
+    if (gpu_glyph_arm() != 1) { return 0; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+    var gx = (w + 63) / 64;
+    var stride = (w + 7) / 8;                      # 1bpp: 8 px per byte, rows byte-aligned
+    return gpu_blend_cov_run(gpu_arena_mc + GPU_GLYPH_SHADER_SUBOFF, bmp_mc, dst_mc,
+        stride, gpu_bb_pitch, w, color, GPU_COMPUTE_PGM_RSRC1_GLYPH, gx, h,
+        gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+        gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+}
+
+# gpu_shader_glyph_test — S8: expand a 1bpp bitmap to 32bpp with a transparent background.
+#
+# The bitmap is composed from kashi's real CP437 8x16 font, so the on-screen result is READABLE TEXT. That
+# is deliberate and not decoration: the failure mode this kernel is most prone to — reading the bit order
+# LSB-first instead of MSB-first — mirrors every glyph horizontally. A numeric test would still pass if the
+# reference made the same mistake; mirrored words do not survive a glance.
+#
+# ⚠ This test asserts BIT-EXACTNESS with no tolerance, unlike the coverage test. There is no arithmetic on
+# colour here: a pixel either becomes the colour or is untouched. Any deviation at all is a real bug.
+fn gpu_shader_glyph_test() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { kprintln("gpu: skipping glyph (dispatch envelope unproven)", 48); return 0; }
+    if (gpu_blit_arm() != 1) { kprintln("gpu: skipping glyph (no back buffer)", 36); return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    var pitch = gpu_bb_pitch;
+    if (pitch < (GPU_GLY_X + GPU_GLY_W) * 4) { kprintln("gpu: skipping glyph (surface too narrow)", 40); return 0; }
+
+    var bb_phys = gpu_bb_a_phys;
+    var bb_mc   = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { bb_phys = gpu_bb_b_phys; bb_mc = gpu_bb_b_mc; }
+
+    var sh_phys = gpu_arena_phys + GPU_GLYPH_SHADER_SUBOFF;
+    var sh_mc   = gpu_arena_mc   + GPU_GLYPH_SHADER_SUBOFF;
+    var bm_phys = gpu_arena_phys + GPU_GLYPH_BMP_SUBOFF;
+    var bm_mc   = gpu_arena_mc   + GPU_GLYPH_BMP_SUBOFF;
+    var dn_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
+    var dn_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
+    glyph_1bpp_write(sh_phys);
+
+    # Compose the 1bpp bitmap straight out of kashi's font: one row byte per character per scanline, so a
+    # 16-character line is exactly 16 bytes per row — 4 store32s, no bit shuffling at all. The font's
+    # native layout IS the kernel's input format, which is the whole point of a 1bpp path.
+    var msg = "AGNOS SHADER GPU";
+    var r = 0;
+    while (r < GPU_GLY_H) {
+        var d = 0;
+        while (d < 4) {
+            var word = 0;
+            var k = 0;
+            while (k < 4) {
+                var ch = load8(msg + d * 4 + k);
+                word = word | ((kashi_glyph_row(KASHI_FONT_VGA_8X16, ch, r) & 0xFF) << (k * 8));
+                k = k + 1;
+            }
+            store32(bm_phys + r * GPU_GLY_STRIDE + d * 4, word);
+            d = d + 1;
+        }
+        r = r + 1;
+    }
+    gpu_mfence();
+
+    var t_mc   = bb_mc   + GPU_GLY_Y * pitch + GPU_GLY_X * 4;
+    var t_phys = bb_phys + GPU_GLY_Y * pitch + GPU_GLY_X * 4;
+    if (gpu_cp_dma_fill_rect(t_mc, pitch, GPU_GLY_BG, GPU_GLY_W * 4, GPU_GLY_H) != 1) {
+        kprintln("gpu: glyph underlay fill failed", 31); return 0;
+    }
+    var gx = (GPU_GLY_W + 63) / 64;
+    if (gpu_blend_cov_run(sh_mc, bm_mc, t_mc, GPU_GLY_STRIDE, pitch, GPU_GLY_W, GPU_GLY_FG,
+        GPU_COMPUTE_PGM_RSRC1_GLYPH, gx, GPU_GLY_H, dn_mc, dn_phys) != 1) {
+        kprintln("gpu: glyph dispatch did not complete", 36);
+        return 0;
+    }
+
+    # Verify exactly. `lit` counts pixels that were actually SET — a kernel whose EXEC mask killed every
+    # lane would leave the underlay everywhere and still match on the background pixels, so "no mismatches"
+    # alone is not evidence the glyphs drew (the 1.54.17-19 lesson, in its bitmap form).
+    var bad = 0; var lit = 0; var bx = 0; var by = 0;
+    var vy = 0;
+    while (vy < GPU_GLY_H) {
+        var vx = 0;
+        while (vx < GPU_GLY_W) {
+            var byt = load8(bm_phys + vy * GPU_GLY_STRIDE + (vx >> 3)) & 0xFF;
+            var bit = (byt >> (7 - (vx & 7))) & 1;
+            var want = GPU_GLY_BG;
+            if (bit == 1) { want = GPU_GLY_FG; lit = lit + 1; }
+            var got = load32(t_phys + vy * pitch + (vx << 2)) & 0xFFFFFFFF;
+            if (got != (want & 0xFFFFFFFF)) {
+                if (bad == 0) { bx = vx; by = vy; }
+                bad = bad + 1;
+            }
+            vx = vx + 1;
+        }
+        vy = vy + 1;
+    }
+    if (bad != 0) {
+        kprint("gpu: glyph MISMATCH ", 20); kprint_num(bad);
+        kprint(" px, first at x=", 16); kprint_num(bx);
+        kprint(" y=", 3); kprint_num(by);
+        kprintln("", 0);
+        return 0;
+    }
+    if (lit < 1) { kprintln("gpu: glyph NO PIXELS SET (empty font or exec mask?)", 51); return 0; }
+
+    var prev_back = gpu_bb_back;
+    gpu_blit_present(0);
+    var dh = 0;
+    while (dh < 30000) { gpu_udelay(100); dh = dh + 1; }
+    var slo = GPU_R_HUBP_SURF_ADDR    + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    var shi = GPU_R_HUBP_SURF_ADDR_HI + gpu_display_pipe * GPU_DCN_HUBP_STRIDE;
+    gpu_reg32_write(GPU_BASE_DCN_2, shi, (gpu_display_surf >> 32) & 0xFFFF);
+    gpu_reg32_write(GPU_BASE_DCN_2, slo, gpu_display_surf & 0xFFFFFFFF);
+    gpu_mfence();
+    gpu_display_wait_vblank(gpu_display_pipe);
+    gpu_bb_back = prev_back;
+
+    gpu_glyph_ok = 1;
+    kprint("gpu: shader glyph expand online (1bpp text, bit-exact, ", 55); kprint_num(lit);
+    kprintln(" px set)", 8);
+    return 1;
+}
+
+# gpu_cov_arm — make blend_cov resident for the RUNTIME (#93) path. Idempotent; own arena slot, so #93
+# works in a kernel built without SHADER_COV and depends on no boot-time ordering. Peer of gpu_blend_arm.
+fn gpu_cov_arm() {
+    if (gpu_cov_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { return 0; }
+    blend_cov_write(gpu_arena_phys + GPU_COV_SHADER_SUBOFF);
+    gpu_mfence();
+    gpu_cov_armed = 1;
+    return 1;
+}
+
+# gpu_cov_surface — composite a uniform colour through an 8bpp coverage mask onto the back buffer.
+# Kernel-side worker behind gpu_blend_cov_shm#93. Returns 1 / 0. Caller owns all bounds checking.
+fn gpu_cov_surface(mask_mc, w, h, dx, dy, color) {
+    if (gpu_cov_arm() != 1) { return 0; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+    var gx = (w + 63) / 64;
+    return gpu_blend_cov_run(gpu_arena_mc + GPU_COV_SHADER_SUBOFF, mask_mc, dst_mc,
+                             w, gpu_bb_pitch, w, color, GPU_COMPUTE_PGM_RSRC1_COV, gx, h,
+                             gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+                             gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+}
+
+# gpu_grad_arm — make grad_linear resident for the RUNTIME path. Idempotent; own arena slot, so the
+# gradient op works in a kernel built without SHADER_GRAD and depends on no boot-time ordering.
+# Peer of gpu_blend_arm / gpu_cov_arm / gpu_glyph_arm.
+fn gpu_grad_arm() {
+    if (gpu_grad_armed == 1) { return 1; }
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { return 0; }
+    grad_linear_write(gpu_arena_phys + GPU_GRAD_SHADER_SUBOFF);
+    gpu_mfence();
+    gpu_grad_armed = 1;
+    return 1;
+}
+
+# gpu_grad_surface — paint a two-stop vertical linear gradient src-over onto the back buffer.
+# Kernel-side worker behind op GPU_OP_GRAD_LINEAR of gpu_shader_op#92. Returns 1 / 0.
+# Caller owns all bounds checking.
+#
+# NO SOURCE BUFFER — both endpoints ride in as kernargs and the varying quantity is the row index the SPI
+# already supplies in tgid_y, so a full-screen gradient reads ZERO source bytes. That is why this op takes
+# no slot id: there is nothing to validate a slot against.
+fn gpu_grad_surface(w, h, dx, dy, c0, c1) {
+    if (gpu_grad_arm() != 1) { return 0; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+    var gx = (w + 63) / 64;                    # CEILING — the shader's EXEC guard trims the last group
+    return gpu_grid7_run(gpu_arena_mc + GPU_GRAD_SHADER_SUBOFF,
+        dst_mc & 0xFFFFFFFF, (dst_mc >> 32) & 0xFFFFFFFF,
+        gpu_bb_pitch, w, h, c0, c1,
+        GPU_COMPUTE_PGM_RSRC1_GRAD, gx, h,
+        gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+        gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
 }
 
 # gpu_blend_arm — make blend_rect resident for the RUNTIME (#92) path. Idempotent.

@@ -3,7 +3,234 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [Unreleased] — realignment of the 1.56.x shader arc to its own plan
+
+The arc's plan doc (`docs/development/planning/kernel-shader-arc-156x.md`) settled the syscall shape as
+decision **D-3** before any code was written. 1.56.2/1.56.3 shipped the option D-3 explicitly **rejected**,
+and renumbered the bite IDs so the plan no longer read against the CHANGELOG. This entry restores both, and
+fixes two live defects the re-audit surfaced along the way.
+
+### Fixed — coverage dispatched with a garbage RSRC1 and a wild kernel store (P0)
+
+`gpu_blend_cov_run` gained an `rsrc1` parameter at 1.56.3 when `glyph_1bpp` began sharing the dispatcher.
+**Both coverage call sites were left passing 11 arguments to the now-12-parameter function** — the S10
+self-test (`gpu.cyr:1996`) and `gpu_cov_surface` (`gpu.cyr:2480`), the live worker behind the coverage
+syscall. Every argument after the missing one shifted one position:
+
+| declared | actually received |
+|---|---|
+| `rsrc1` | `gx` (a small integer ⇒ ~20 VGPRs / 8 SGPRs, where the kernel needs 32 SGPRs) |
+| `gy` | `done_mc` (a full MC address ⇒ a ~2³¹ dispatch Y) |
+| `done_phys` | **undefined** |
+
+`gpu_blend_cov_run`'s first statement is `store32(done_phys, GPU_MT_NOTYET)` — so every coverage dispatch
+began with a **wild kernel store to an undefined address**. `cycc` had been printing
+`'gpu_blend_cov_run' expects 12 arguments, got 11` **twice in every single build** since 1.56.3; it warns
+and emits anyway, so it shipped green. The glyph call sites were written after the refactor and were correct,
+which is why glyph was unaffected. **Coverage must be re-proven on iron** — its 1.56.3 proof describes code
+that no longer existed by the end of that cut.
+
+### Fixed — #92's shader and the done-marker lived in the VM fault-sink page (P0)
+
+`GPU_BLEND_SHADER_SUBOFF` was `0x15000`. So is `GPU_VM_DUMMY_SUBOFF` — the **VM protection-fault sink page**.
+That is not a passive overlap:
+
+- `gpu_vm_setup()` **zeroes 4 KB there at boot** (`gpu.cyr:768`), on top of the resident `#92` shader;
+- `VM_L2_PROT_FAULT_DEF_LO/HI` point the hardware's fault writes at that page for the entire run;
+- `GPU_BLEND_DONE_SUBOFF = 0x15C00` is **inside the same 4 KB page** — and that marker is what all five
+  shader kernels poll for completion. A fault-sink write landing on it **false-signals a completed
+  dispatch**: a false PASS, not a crash.
+
+Five more aliases were live for the same reason (`0x16000` cov==`SHADER_OUT2`, `0x18000` grad==`KERNARG_IN`,
+`0x20000` rect-src==`SDMA_RING`, `0x30000` guard-src==`SDMA_RPTR`). Only build-flag disjointness kept any of
+them apart, and nothing enforced that. Shader slots now live in a strided residency table at `0x50000`
+(8 × 4 KB, 4 KB-aligned so `COMPUTE_PGM_LO = mc>>8` stays exact) with the done table at `0x58000` — which is
+also plan **S12**'s residency half, landed early.
+
+### Changed — #92/#93/#94 collapse into ONE descriptor syscall (plan S8, decision D-3)
+
+```
+#92 gpu_shader_op(desc_uva, len) -> 0 / -((idx << 8) | reason)
+```
+
+`desc_uva` points at `len / 64` **64-byte op records**; the operation is an op code in dword 0. Alpha blend
+(`0x01`), coverage (`0x02`), glyph expand (`0x03`) and gradient (`0x04`) are **op codes, not syscall numbers**.
+
+- **`#93 gpu_blend_cov_shm` and `#94 gpu_glyph_shm` are WITHDRAWN**; both numbers return to the reserved
+  pool. A gradient `#95` was planned and never minted. `#90`/`#91` keep their reserved shapes.
+- **`ksyscall_a4` leaves the compositor's hot path.** `#93`/`#94` smuggled their colour through r10 purely
+  because the dispatcher offers four argument slots and coverage needs five operands. The gradient needed
+  six and had nowhere to go at all, which is why it never got a ring-3 path despite shipping a working
+  shader. In a record the colour is just dword 9.
+- **Destructive Linux-collision surface: four rows → one.** The band lands on occupied x86_64 numbers, and
+  92/93/94/95 are `chown`/`fchown`/`lchown`/`umask`. ⚠ **`#92`'s own severity RISES**: arg1 used to be a
+  1..16 slot id (near-null ⇒ EFAULT overwhelmingly likely) and is now a real user VA the kernel proves
+  mapped, so an ungated off-agnos build would hand `chown()` a **readable path pointer**. The file-level
+  `#ifdef CYRIUS_TARGET_AGNOS` gate is now the only barrier.
+- **Plan S12 (N ops in one submission) is now an implementation change rather than an ABI break** — the
+  reason D-3 chose this shape while there was exactly one shipped consumer.
+
+**Validation is two-phase, and the split is part of the ABI.** Every op is validated before any op is
+dispatched, so a rejected batch draws **nothing** — "reject rather than clip" generalised from one rect to an
+array. Only a dispatch failure can leave a composited prefix, and the returned index names where it stopped.
+Undefined record dwords **must be zero** (rejected, never ignored), which is what keeps the reserved
+`srcxy`/`src_pitch`/`mask_pitch` fields safe to define later without a stride change. `len` is a byte length,
+not an op count, so a future wider record rejects a stale caller instead of misparsing it.
+
+`E_NOGPU` at index 0 encodes as exactly `-1`, so existing `rc != 0` / `rc == -1` callers keep working.
+
+### Added — gradient reaches ring 3 for the first time; #89 gains discovery
+
+- **`gpu_grad_arm` / `gpu_grad_surface`** — `grad_linear.s` has shipped since 1.56.3 with **no kernel-side
+  worker and no ring-3 path**. It was reachable only from a boot self-test. It is now op `0x04`.
+- **`gpu_caps#89`** gains **flags bit3** (shader compositing available — mirrors `#92`'s own gate exactly, so
+  a caller that sees the bit will not then get `E_UNPROVEN`) and an **op-support mask at `+28`** (previously
+  reserved-zero), where **bit N set ⇔ op code N is implemented**. That binding is why op codes are capped at
+  `0x1F`. Discovery by one read instead of probing each op for `E_BADOP`.
+
+⚠ **`gpu_blend_ok` is deliberately NOT in `#92`'s gate.** It is set only inside the `#ifdef SHADER_BLEND`
+boot self-test, so requiring it would make `#92` return `E_UNPROVEN` in **every production kernel** — a gate
+that disables the feature it protects. The gate is `gpu_matmul_ok`, which `gpu_shader_dispatch5()` sets
+**ungated at every boot**, making it real per-boot evidence rather than a tautology.
+
+### Added — two build gates, each verified to fail on the defect that shipped
+
+- **`gpu arena slots unaliased`** — fails the build on any duplicate `*_SUBOFF` value. Value-only by design,
+  so it needs no knowledge of each slot's extent and cannot rot.
+- **`call arity`** — promotes cycc's argument-count **warning** to a build **failure**. The coverage bug
+  above warned in every build for two cuts and shipped anyway; warning noise is what hid it.
+
+Both were negative-tested against the exact defects that shipped, not just observed to pass.
+
+### Added — the 1.56.x arc's missing `BURN_*` arms
+
+`scripts/burn-prep.sh` contained **zero** shader arms. Every 1.56.x burn was reproduced by hand-exporting a
+define straight to `build.sh`, bypassing burn-prep's banner and `BUILD_TAG` stamp, so no burn artifact
+recorded which arm produced it. Seven arms added (`BURN_SHADER_PROBE` / `_BLEND` / `_RECT` / `_COV` /
+`_GLYPH` / `_GRAD` / `_OPS`), each **`cmp`-verified to produce a different binary** — the standing rule's own
+method, and the one the `ATOM_DRY` flag failed for two burns.
+
+### Errata — bite labels realigned to the plan (no behaviour change)
+
+The released 1.56.1–1.56.3 entries carry bite IDs that do not match the plan. **Corrected forward, not
+rewritten in place**: those entries are the only identifier five iron burns have, since
+`iron-nuc-zen-log.md` has no 1.56 entries yet.
+
+| CHANGELOG label | plan bite |
+|---|---|
+| "S3" (1.56.1, grid blend) | **S5** + the first half of **S7** |
+| "S6" (1.56.2, arbitrary width) | **S6** — correct — + the rest of **S7** |
+| "#92 gpu_blend_shm" (1.56.2) | **S8**, in the shape D-3 rejected; superseded here |
+| "S7" (1.56.3, coverage) | **S10** |
+| "S8" (1.56.3, glyph) | **S9** |
+| "S9" (1.56.3, gradient) | **S11** |
+
+**Never executed, and now scheduled rather than dropped:** plan **S3** (the four-arm GL2 ↔ scanout ↔ CP-DMA
+coherence characterisation — its label was consumed by the grid bite, so the write-back and invalidate are
+still *assumed* load-bearing rather than measured, and S12 depends on those arms) and plan **S4**
+(`v_perm_b32` / VOP3P / the RGBX↔BGRX channel swap — the item the arc opened by calling "an unhandled case,
+not just a slow one"; there is still zero `v_perm_b32` and zero `v_pk_*` in the tree). Plan **S0** is
+partial: `gfx9-asm.sh` assembles, but the `sweep.sh` check gate never landed. **S12, D1 and D2** are not
+started.
+
+
+
+## [1.56.3] — 2026-07-22 — the drawing-primitive list is complete: glyphs (#94) + gradients
+
+### Added — S8: 1bpp glyph expansion (`#94 gpu_glyph_shm`) — BUILT, NOT YET IRON-PROVEN
+
+The arc's own scope list called this **the highest call-count drawing site in the desktop tree**: every
+character cell in every terminal, menu, label and list row. It is its own kernel rather than a case of
+`#93` because it is not a fill (the background must survive), not a copy (the source has no colour) and
+not a blend (a bit is on or off — there is no partial coverage). It is a **conditional store**, which on a
+SIMD machine means deriving an EXEC mask from the source data itself. At **36 dwords it is the cheapest
+kernel in the arc** — no float math at all.
+
+It also consumes the font's native format. kashi ships CP437 as 1bpp row bytes; expanding those to 8bpp
+coverage in userland just to call `#93` would reintroduce exactly the per-pixel CPU loop this band exists
+to delete. 1bpp is **8× smaller than a coverage mask and 32× smaller than an RGBA source**.
+
+- **Bit-exact with zero tolerance**, unlike the coverage test — there is no arithmetic on colour, so any
+  deviation is a real bug. The test also counts pixels actually **set**: a kernel whose EXEC mask killed
+  every lane would leave the underlay everywhere and match on all background pixels, so "no mismatches"
+  alone would not prove the glyphs drew (the 1.54.17-19 lesson in bitmap form).
+- The self-test renders **readable words from kashi's real font**, deliberately. The failure this kernel is
+  most prone to — reading bits LSB-first — mirrors every glyph horizontally, and a numeric test would pass
+  if the reference made the same mistake.
+- ⚠ `#94`'s slot check is `((w+7)/8)*h`: 1bpp rows are **byte-aligned**, so a 12 px run costs 2 bytes per
+  row, not 1.5. Copying `#93`'s `w*h` rule would reject valid callers.
+
+### Added — S9: linear gradient — BUILT, NOT YET IRON-PROVEN
+
+The last drawing primitive on the 1.56.x list. **No source buffer at all**: both endpoint colours are
+SGPRs and the varying quantity is the row index the SPI already supplies, so a full-screen gradient reads
+**zero source bytes**. On the CPU this is the worst primitive of the set — per-pixel interpolate *and*
+per-pixel blend, with no memcpy-shaped inner loop.
+
+- **Premultiplied is what makes the lerp legal.** Interpolating two premultiplied colours stays
+  premultiplied (`c0 <= a0` and `c1 <= a1` implies `c0+(c1-c0)t <= a0+(a1-a0)t`). Lerping *straight*-alpha
+  colours is the classic gradient bug: it darkens through the middle because the colour crosses the alpha
+  ramp instead of riding it. The test's light-half underlay is where that would show.
+- **Row 0 is asserted bit-exact**; elsewhere the bound is **2, not `blend_cov`'s 1**, because `t` comes
+  from `v_rcp_f32` — a hardware reciprocal *approximation*, since GFX9 has neither an integer divide nor an
+  exact f32 divide. Stated up front so the looser gate reads as a derived consequence, not a gate widened
+  to make a test pass. The observed maximum is reported either way.
+- The CPU reference uses the `(c0*(den-y) + c1*y + den/2)/den` lerp form, which keeps every intermediate
+  **non-negative**. The obvious `c0 + (c1-c0)*y/den` has a negative numerator on a descending gradient, and
+  Cyrius integer division truncates toward zero — so it would round the descending half in the opposite
+  direction from the ascending half. That asymmetry is exactly what a tolerance-based test hides.
+
+### Changed — one ring program per kernarg shape, not one per kernel
+
+`gpu_grid7_run` factored out of `gpu_blend_rect_run` as a **raw 7-kernarg emitter**; `gpu_blend_rect_run`
+is now a thin naming wrapper over it, and `grad_linear` uses the emitter directly. `blend_rect` and
+`grad_linear` share `RSRC2` but have completely different kernarg *meanings* (two pointers + three scalars
+vs one pointer + five), which would otherwise have justified a third copy of the ring program — the one
+place a typo is silent and expensive. Same reason `gpu_blend_cov_run` took `rsrc1` as a parameter when
+`glyph_1bpp` arrived: it and `blend_cov` differ only in VGPR count.
+
+### Added — S7: coverage blending (`#93 gpu_blend_cov_shm`) — anti-aliased shapes and the text path
+
+**✅ IRON-PROVEN (archaemenid, 2026-07-22):** `gpu: shader coverage blend online (AA circle, endpoints
+exact, max dev N)`, with a smooth-edged disc on screen straddling a dark/light underlay split.
+
+A uniform premultiplied colour modulated by an **8-bit per-pixel coverage mask**. This is the shape a
+rasteriser actually emits — a glyph or a path is one colour, and only coverage varies — so the source is an
+SGPR rather than a buffer and the varying input drops to 8bpp, **a quarter of `blend_rect`'s source
+bandwidth** for the same output.
+
+It is also the only primitive in the band that can draw a **non-rectangular edge**. `#87` and `#92` both
+composite rectangles and CP-DMA fills them; none of them can express "this pixel is 40% covered". Vector
+text and shapes have no other path.
+
+- **`#93 gpu_blend_cov_shm(id, wh, dstxy, color)`** — mask in a GPU-visible shm slot (`#86`), one byte per
+  pixel; colour rides in arg4 via `ksyscall_a4`, the same 4th-argument path `blit`#39 uses. Same
+  reject-don't-clip discipline as `#87`/`#92`. Note the slot-size check is `w*h`, not `w*h*4`.
+- `/bin/gpucov` — four overlapping discs. Curved edges with no staircase and compounding overlaps are both
+  things no other call in the band can produce; a jagged edge would mean coverage was thresholded rather
+  than blended, and a hard rectangle would mean the mask was ignored.
+
+### Precision — measured, not assumed
+
+This kernel is **not** claimed bit-exact, and the test says so rather than widening a gate quietly.
+`blend_rect` had one rounding site; the coverage multiply adds a second, and `1/255` is not representable
+in binary floating point. The claim is split three ways:
+
+- **`cov = 0` must be bit-exact** — the pixel must be untouched; deviation there is a real bug, not rounding.
+- **`cov = 255` must be bit-exact** — it reduces to the blend already proven at S2/S3.
+- Everything between: bounded at ≤ 1, **with the observed maximum printed**, so drift shows up as a changed
+  digit instead of hiding inside a tolerance.
+
+The CPU reference computes the exact rational answer as a single integer quotient
+(`round((c*cov*255 + d*(65025 - a*cov)) / 65025)`) rather than mirroring the shader's float sequence —
+deliberately, so it measures the shader against the right answer, not against a re-implementation of the
+shader's own rounding.
+
+### Noted — not a defect
+
+The rendered disc is an **ellipse ~1.33× wide**. That is the known display scaling, not the rasteriser: the
+surface is 800×600 (4:3) scaled to a 2560×1440 (16:9) output, and `(2560/800)/(1440/600) = 1.333` exactly.
+The mask is geometrically circular. Same cause as the stretched proportions in the S3/S6 bars.
 
 ## [1.56.2] — 2026-07-22 — translucency reaches ring 3 (#92) + arbitrary rect width
 

@@ -986,12 +986,35 @@ gpu_mpc_probe();
 gpu_shader_blend_test();
 #endif
 
-# GPU arc 1.56.x S3 — the same blend over a 2-D GRID, in place on the SCANOUT BACK BUFFER, then presented.
+# GPU arc 1.56.x plan-S5 — the same blend over a 2-D GRID, in place on the SCANOUT BACK BUFFER, then presented.
 # Deliberately kept as a SEPARATE flag from S2 so both run in one burn: S2 stays the regression net for the
 # blend arithmetic, and if S3 fails while S2 passes the fault is isolated to grid/addressing/scanout — none
 # of which S2 exercises. Gated #ifdef SHADER_RECT; first iron burn: BURN_SHADER_RECT.
 #ifdef SHADER_RECT
 gpu_shader_rect_test();
+#endif
+
+# GPU arc 1.56.x plan-S10 — COVERAGE blending: a uniform colour modulated by an 8-bit per-pixel mask. The
+# anti-aliased text and shape path (rasteriser emits coverage, not colour). Renders a soft-edged circle,
+# which is self-evidently not something CP-DMA or a rectangular image blit can produce.
+# Gated #ifdef SHADER_COV; first iron burn: BURN_SHADER_COV.
+#ifdef SHADER_COV
+gpu_shader_cov_test();
+#endif
+
+# GPU arc 1.56.x S8 — 1bpp -> 32bpp glyph expansion with a transparent background. The highest call-count
+# drawing op in the desktop tree, and a CONDITIONAL STORE rather than a fill/copy/blend. Renders real
+# kashi CP437 text, so an inverted bit order is visible rather than merely numeric.
+# Gated #ifdef SHADER_GLYPH; first iron burn: BURN_SHADER_GLYPH.
+#ifdef SHADER_GLYPH
+gpu_shader_glyph_test();
+#endif
+
+# GPU arc 1.56.x S9 — vertical linear gradient, generated with NO source buffer (both endpoints are SGPRs,
+# the varying quantity is tgid_y). Completes the arc's drawing-primitive list.
+# Gated #ifdef SHADER_GRAD; first iron burn: BURN_SHADER_GRAD.
+#ifdef SHADER_GRAD
+gpu_shader_grad_test();
 #endif
 
 
@@ -1275,7 +1298,7 @@ fn sc_mkdir(path) {
     if (su == 0) { return 0 - 1; }
     var plen = strlen(path);
     memcpy(su, path, plen);
-    var rc = ksyscall(9, su, plen);                     # mkdir
+    var rc = ksyscall(9, su, plen, 0);                  # mkdir (arg3 unused by the handler)
     pmm_free_2mb(su);
     return rc;
 }
@@ -1284,7 +1307,7 @@ fn sc_rmdir(path) {
     if (su == 0) { return 0 - 1; }
     var plen = strlen(path);
     memcpy(su, path, plen);
-    var rc = ksyscall(10, su, plen);                    # rmdir
+    var rc = ksyscall(10, su, plen, 0);                 # rmdir (arg3 unused by the handler)
     pmm_free_2mb(su);
     return rc;
 }

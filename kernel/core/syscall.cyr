@@ -826,42 +826,248 @@ fn gpu_fill_rect_sys(color, wh, dstxy) {
     return 0;
 }
 
-# gpu_blend_shm_sys(id, wh, dstxy) -> 0 / -1. The ALPHA peer of gpu_blit_shm#87.
+# ── #92 gpu_shader_op — THE shader-compositing seam (plan bite S8, decision D-3) ───────────────────────
 #
-# #87 copies a client surface with CP-DMA — fast, but CP-DMA is a byte mover with no ALU, so it can only
-# ever do OPAQUE. This runs the same composite through the shader cores with per-pixel src-over, which is
-# what translucent windows, drop shadows, fades and anti-aliased edges all require. Identical packing and
-# identical bounds discipline to #87, so a compositor swaps one call for the other.
+# ONE syscall number. An ARRAY of fixed-size op records. The operation is an op code INSIDE each record,
+# so alpha blend, coverage, glyph expand and gradient are op codes rather than syscall numbers, and every
+# later primitive (channel swap, CP-DMA fill/blit as ops, batched frames) rides this same number.
 #
-# ⚠ THE SOURCE MUST BE PREMULTIPLIED (each colour channel already scaled by its own alpha, so c <= a).
-# This is not a preference — the shader computes `out = src + dst*(1 - src_a/255)` with no per-pixel divide,
-# which is only correct for premultiplied input. Straight-alpha input silently produces washed-out edges
-# rather than an error, so it is stated here and in the cyrius wrapper docstring.
+# WHY A DESCRIPTOR AND NOT ONE NUMBER PER OP. The arc plan settled this as decision D-3 *before* any of it
+# was built; 1.56.2/1.56.3 then shipped the rejected shape anyway (#92 blend, #93 coverage, #94 glyph).
+# All four of D-3's reasons still hold:
+#   - The dispatcher offers four args and a coverage blit needs five operands. That is exactly why #93/#94
+#     had to smuggle their colour through ksyscall_a4 (r10), and why a gradient — which needs two stops
+#     plus geometry — had NO room left at all and never got a ring-3 path. A record has no such ceiling.
+#   - Syscall numbers are not free. #90/#91 are reserved with declared shapes, and this band lands on
+#     OCCUPIED, partly DESTRUCTIVE Linux numbers: 92=chown, 93=fchown, 94=lchown, 95=umask. One number
+#     costs one collision to document and gate; four cost four.
+#   - The consolidated cyrius wrapper ticket exists specifically to end the one-ask-per-syscall pattern.
+#   - It makes plan bite S12 (N ops in ONE submission — one flush, one write-back, one fence) an
+#     IMPLEMENTATION change rather than an ABI break. That is the point of specifying the array now,
+#     while there is exactly one shipped consumer, instead of after a compositor depends on it.
 #
-# Rejects rather than clips off-screen rects, exactly like #87 — the compositor owns clipping and learns
-# the bounds from gpu_caps#89. Returns -1 (never a partial composite) if the GPU path is unavailable, so a
-# caller can fall back to #87 or the CPU path unchanged.
-fn gpu_blend_shm_sys(id, wh, dstxy) {
-    if (gpu_present == 0) { return 0 - 1; }
-    if (shm_slot_valid(id) == 0) { return 0 - 1; }
-    var slot = id - 1;
-    var src_mc = load64(&shm_mc + slot * 8);
-    if (src_mc == 0) { return 0 - 1; }                  # PMM-backed ⇒ the GPU cannot read it (see #86)
-    if (gpu_blit_arm() != 1) { return 0 - 1; }
-    if (gpu_bb_pitch == 0) { return 0 - 1; }
+# NO ADDRESS APPEARS IN A RECORD. Sources are named by shm slot id and resolved to an MC address inside
+# the kernel, so "no MC address crosses the ring-3 boundary" is a property of the LAYOUT rather than a
+# rule this handler has to remember to enforce.
+#
+# ⚠ SOURCES MUST BE PREMULTIPLIED (every colour channel already scaled by its own alpha, so c <= a). The
+# shaders compute `out = src + dst*(1 - src_a/255)` with no per-pixel divide, which is only correct for
+# premultiplied input. Straight-alpha input produces washed-out edges SILENTLY — never an error. This is
+# the single most likely way a caller misuses this syscall, so it is stated here, in the ABI doc, and in
+# the cyrius wrapper docstring.
+
+# --- Descriptor staging -------------------------------------------------------------------------------
+# syscall.cyr is an INCLUDED module, so a module-global `var X[N]` allocates N x u64 = 8N BYTES (in a
+# TOP-LEVEL program the same syntax allocates N bytes — the unit differs by scope, and getting it wrong
+# silently under-allocates by 8x). 2048 x 8 = 16384 B = 4 CPUs x 4096 B.
+#
+# PER-CPU, not one shared buffer. A single global staging cell is precisely what corrupted an FS operation
+# under SMP at 1.46.x, where `rename` ran with another CPU's length. Same shape as pcpu_ksyscall_a4[4].
+var pcpu_sc_gpuop[2048];             # 16384 B total = GPU_OP_CPUS x GPU_OP_BUF_BYTES
+var GPU_OP_CPUS      = 4;            # matches pcpu_cpu()'s `if (c >= 4) { c = 0; }` clamp
+var GPU_OP_BUF_BYTES = 4096;         # per-CPU share
+var GPU_OP_STRIDE    = 64;           # bytes per op record — a power of two, so indexing is a shift
+var GPU_OP_MAX       = 64;           # GPU_OP_BUF_BYTES / GPU_OP_STRIDE
+fn sc_gpuop_buf() { return &pcpu_sc_gpuop + pcpu_cpu() * GPU_OP_BUF_BYTES; }
+
+# --- Op codes. Codes 0x00-0x1F are the bitmask tier: an op code IS its bit index in gpu_caps#89's
+# support word at +28, so ring 3 can discover exactly which ops this kernel implements instead of
+# probing by trial. Minting a code >= 0x20 requires growing gpu_caps first; that is the only sanctioned
+# growth path, and it is deliberately awkward so the mask stays authoritative.
+var GPU_OP_NOP         = 0x00;       # validated, dispatches nothing — batch padding / ABI probe
+var GPU_OP_BLEND_RECT  = 0x01;       # 32bpp premultiplied source, per-pixel src-over   (was #92)
+var GPU_OP_BLEND_COV   = 0x02;       # 8bpp coverage mask x one uniform colour           (was #93)
+var GPU_OP_GLYPH_1BPP  = 0x03;       # 1bpp bitmap, colour where set, dst untouched      (was #94)
+var GPU_OP_GRAD_LINEAR = 0x04;       # two-stop vertical gradient, NO source buffer      (never had one)
+# 0x05 channel swap (plan S4) · 0x06 cov-modulated source · 0x07 packed VOP3P blend ·
+# 0x10-0x17 CP-DMA-domain ops (fill/blit/readback, plan S12) · 0x18-0x1F control (barrier/present).
+var GPU_OP_SUPPORTED   = 0x1F;       # bits 0..4 — MUST equal the set gpo_validate accepts
+
+# Flags word (+4). NOTHING is accepted here yet, on purpose: a flag that is accepted and ignored is how
+# a caller silently gets behaviour it did not ask for. bit0 SERIALIZE and bit1 CHECK_PREMUL are reserved
+# for S12, where they will mean something; until then a non-zero flags word is rejected.
+var GPU_OP_FLAGS_KNOWN = 0x00;
+
+# --- Failure reasons. The syscall returns 0, or a PACKED negative naming WHICH op failed and why:
+#       e = 0 - rc ;  idx = e >> 8 ;  reason = e & 0xFF
+# reason is always >= 1, so a valid failure never encodes as 0. GPO_E_NOGPU at idx 0 encodes as exactly
+# -1, which keeps every existing `if (rc != 0)` / `if (rc == -1)` caller working unchanged.
+var GPO_E_NOGPU    = 1;              # call  — GPU/display unavailable
+var GPO_E_BADOP    = 2;              # op    — unknown, reserved, or not implemented in this kernel
+var GPO_E_BADSLOT  = 3;              # op    — slot invalid/free, or PMM-backed (the GPU cannot read it)
+var GPO_E_SLOTSIZE = 4;              # op    — source does not fit its slot under this op's stride rule
+var GPO_E_BOUNDS   = 5;              # op    — rect off-screen (REJECT, never clip)
+var GPO_E_DIM      = 6;              # op    — w < 1 or h < 1
+var GPO_E_ARM      = 7;              # op    — the shader could not be made resident
+var GPO_E_DISPATCH = 8;              # op    — the dispatch watchdog expired (pass 2 only)
+var GPO_E_DESC     = 11;             # call  — bad desc_uva / len, or the copy-in failed
+var GPO_E_RESERVED = 12;             # op    — a reserved field or an undefined flag bit was non-zero
+var GPO_E_UNPROVEN = 13;             # call  — the dispatch envelope is unproven on this boot
+
+# gpo_field_mask(op) — bit i set <=> this op DEFINES record dword i (byte offset i*4).
+# Every dword an op does not define MUST be zero. That rule is what makes the reserved dwords safe to
+# fill in later: a v1 caller physically cannot ship garbage in a field a future kernel will read, so
+# `srcxy` / `src_pitch` / `mask_pitch` (dwords 6/7/8) can gain "0 = derive" meaning without an ABI break.
+# They are laid out NOW so adding them is never a stride change.
+fn gpo_field_mask(op) {
+    if (op == GPU_OP_NOP)         { return 0x0003; }   # op flags
+    if (op == GPU_OP_BLEND_RECT)  { return 0x0037; }   # op flags src_id wh dstxy
+    if (op == GPU_OP_BLEND_COV)   { return 0x023B; }   # op flags mask_id wh dstxy color0
+    if (op == GPU_OP_GLYPH_1BPP)  { return 0x023B; }   # op flags mask_id wh dstxy color0
+    if (op == GPU_OP_GRAD_LINEAR) { return 0x0633; }   # op flags wh dstxy color0 color1
+    return 0;
+}
+
+# gpo_slot_bytes(op, w, h) — how many source bytes this op reads from its slot. The three rules differ,
+# and using the wrong one is a live bug class: 1bpp rows are BYTE-ALIGNED, so a 12 px glyph run costs 2
+# bytes per row and not 1.5 — copying blend_cov's w*h rule here would reject valid callers.
+fn gpo_slot_bytes(op, w, h) {
+    if (op == GPU_OP_BLEND_RECT) { return w * 4 * h; }
+    if (op == GPU_OP_BLEND_COV)  { return w * h; }
+    if (op == GPU_OP_GLYPH_1BPP) { return ((w + 7) / 8) * h; }
+    return 0;
+}
+
+# gpo_slot_field(op) — record byte offset of the slot id this op sources from, or 0 for none.
+fn gpo_slot_field(op) {
+    if (op == GPU_OP_BLEND_RECT) { return 8; }         # src_id
+    if (op == GPU_OP_BLEND_COV)  { return 12; }        # mask_id
+    if (op == GPU_OP_GLYPH_1BPP) { return 12; }        # mask_id
+    return 0;
+}
+
+# gpo_validate(rec, fbw, fbh) -> 0 or a GPO_E_* reason. PURE READS on the KERNEL-RESIDENT copy: no ring
+# traffic, nothing drawn. Validating the copy rather than user memory is a security property, not a
+# convenience — ring 3 cannot change the descriptor between the check and the use.
+fn gpo_validate(rec, fbw, fbh) {
+    var op = load32(rec + 0) & 0xFFFFFFFF;
+    if (op > 0x1F) { return GPO_E_BADOP; }
+    if (((GPU_OP_SUPPORTED >> op) & 1) == 0) { return GPO_E_BADOP; }
+
+    # Every dword this op does not define must be zero.
+    var mask = gpo_field_mask(op);
+    var i = 0;
+    while (i < 16) {
+        if (((mask >> i) & 1) == 0) {
+            if ((load32(rec + i * 4) & 0xFFFFFFFF) != 0) { return GPO_E_RESERVED; }
+        }
+        i = i + 1;
+    }
+    if (((load32(rec + 4) & 0xFFFFFFFF) & ~GPU_OP_FLAGS_KNOWN) != 0) { return GPO_E_RESERVED; }
+    if (op == GPU_OP_NOP) { return 0; }                # no geometry, no slot, no arm
+
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
     var w  = wh & 0xFFFF;
     var h  = (wh >> 16) & 0xFFFF;
-    var dx = dstxy & 0xFFFF;
-    var dy = (dstxy >> 16) & 0xFFFF;
-    if (w < 1) { return 0 - 1; }
-    if (h < 1) { return 0 - 1; }
-    var row = w * 4;
-    if (row * h > load64(&shm_size + slot * 8)) { return 0 - 1; }   # source must fit its slot
+    if (w < 1) { return GPO_E_DIM; }
+    if (h < 1) { return GPO_E_DIM; }
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    if (dx + w > fbw) { return GPO_E_BOUNDS; }         # REJECT off-screen; the compositor owns clipping
+    if (dy + h > fbh) { return GPO_E_BOUNDS; }
+
+    var sf = gpo_slot_field(op);
+    if (sf != 0) {
+        var id = load32(rec + sf) & 0xFFFFFFFF;
+        if (shm_slot_valid(id) == 0) { return GPO_E_BADSLOT; }
+        var slot = id - 1;
+        if (load64(&shm_mc + slot * 8) == 0) { return GPO_E_BADSLOT; }   # PMM-backed => GPU can't read it
+        if (gpo_slot_bytes(op, w, h) > load64(&shm_size + slot * 8)) { return GPO_E_SLOTSIZE; }
+    }
+
+    # Residency last: it is the only check with a side effect (a shader upload), so everything cheap and
+    # pure runs first and a malformed batch never uploads anything.
+    if (op == GPU_OP_BLEND_RECT)  { if (gpu_blend_arm() != 1) { return GPO_E_ARM; } }
+    if (op == GPU_OP_BLEND_COV)   { if (gpu_cov_arm()   != 1) { return GPO_E_ARM; } }
+    if (op == GPU_OP_GLYPH_1BPP)  { if (gpu_glyph_arm() != 1) { return GPO_E_ARM; } }
+    if (op == GPU_OP_GRAD_LINEAR) { if (gpu_grad_arm()  != 1) { return GPO_E_ARM; } }
+    return 0;
+}
+
+# gpo_execute(rec) -> 0 or GPO_E_DISPATCH. Runs one already-validated record.
+fn gpo_execute(rec) {
+    var op  = load32(rec + 0)  & 0xFFFFFFFF;
+    if (op == GPU_OP_NOP) { return 0; }
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var dxy = load32(rec + 20) & 0xFFFFFFFF;
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    var dx = dxy & 0xFFFF;
+    var dy = (dxy >> 16) & 0xFFFF;
+    var c0 = load32(rec + 36) & 0xFFFFFFFF;
+    var c1 = load32(rec + 40) & 0xFFFFFFFF;
+
+    if (op == GPU_OP_BLEND_RECT) {
+        var s1 = load64(&shm_mc + ((load32(rec + 8) & 0xFFFFFFFF) - 1) * 8);
+        if (gpu_blend_surface(s1, w, h, dx, dy) != 1) { return GPO_E_DISPATCH; }
+        return 0;
+    }
+    if (op == GPU_OP_BLEND_COV) {
+        var s2 = load64(&shm_mc + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
+        if (gpu_cov_surface(s2, w, h, dx, dy, c0) != 1) { return GPO_E_DISPATCH; }
+        return 0;
+    }
+    if (op == GPU_OP_GLYPH_1BPP) {
+        var s3 = load64(&shm_mc + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
+        if (gpu_glyph_surface(s3, w, h, dx, dy, c0) != 1) { return GPO_E_DISPATCH; }
+        return 0;
+    }
+    if (op == GPU_OP_GRAD_LINEAR) {
+        if (gpu_grad_surface(w, h, dx, dy, c0, c1) != 1) { return GPO_E_DISPATCH; }
+        return 0;
+    }
+    return GPO_E_BADOP;
+}
+
+# gpu_shader_op_sys(desc_uva, len) -> 0 / packed negative.
+#
+# TWO PHASES, and the split is part of the ABI. Every op is validated before ANY op is dispatched, so a
+# call that fails validation draws NOTHING — "reject rather than clip" generalised from one rect to an
+# array. Only a pass-2 failure (GPO_E_DISPATCH) can leave a composited prefix, and the returned index
+# names exactly where it stopped.
+#
+# `len` is a BYTE length, not an op count. A future kernel with a wider record rejects a v1 caller on
+# `len % stride`; an op count would have passed and misparsed silently.
+fn gpu_shader_op_sys(desc_uva, len) {
+    if (gpu_present == 0) { return 0 - GPO_E_NOGPU; }
+    if (len < GPU_OP_STRIDE) { return 0 - GPO_E_DESC; }
+    if (len > GPU_OP_BUF_BYTES) { return 0 - GPO_E_DESC; }
+    if (len % GPU_OP_STRIDE != 0) { return 0 - GPO_E_DESC; }
+    if (is_user_range(desc_uva, len) == 0) { return 0 - GPO_E_DESC; }
+
+    # gpu_matmul_ok is the honest per-boot evidence that the dispatch envelope works: gpu_shader_dispatch5
+    # runs UNGATED at every boot (main.cyr), so this is a real gate rather than a tautology.
+    # ⚠ gpu_blend_ok is deliberately NOT part of this gate. It is set only inside the #ifdef SHADER_BLEND
+    # boot self-test, so requiring it would make #92 return E_UNPROVEN in every production kernel — the
+    # gate would disable the feature it is supposed to protect.
+    if (gpu_matmul_ok != 1) { return 0 - GPO_E_UNPROVEN; }
+    if (gpu_blit_arm() != 1) { return 0 - GPO_E_NOGPU; }
+    if (gpu_bb_pitch == 0) { return 0 - GPO_E_NOGPU; }
+
+    # Fault-proof copy-in: proc_copy_from_user page-walks the caller's CR3 and refuses a not-present or
+    # non-user page instead of a blind deref that could #PF the kernel on a wild-but-in-range pointer.
+    var buf = sc_gpuop_buf();
+    if (proc_copy_from_user(proc_get_cr3(proc_current_get()), buf, desc_uva, len) == 0) {
+        return 0 - GPO_E_DESC;
+    }
+
+    var n   = len / GPU_OP_STRIDE;
     var fbw = gpu_bb_pitch / 4;
     var fbh = gpu_bb_fbsize / gpu_bb_pitch;
-    if (dx + w > fbw) { return 0 - 1; }
-    if (dy + h > fbh) { return 0 - 1; }
-    if (gpu_blend_surface(src_mc, w, h, dx, dy) != 1) { return 0 - 1; }
+
+    var i = 0;
+    while (i < n) {
+        var e = gpo_validate(buf + i * GPU_OP_STRIDE, fbw, fbh);
+        if (e != 0) { return 0 - ((i << 8) | e); }
+        i = i + 1;
+    }
+    var j = 0;
+    while (j < n) {
+        var e2 = gpo_execute(buf + j * GPU_OP_STRIDE);
+        if (e2 != 0) { return 0 - ((j << 8) | e2); }
+        j = j + 1;
+    }
     return 0;
 }
 
@@ -871,9 +1077,11 @@ fn gpu_blend_shm_sys(id, wh, dstxy) {
 # which is NOT what fbinfo#38 reports (that is the console framebuffer). 8x u32 LE, mirroring fbinfo's
 # struct-write pattern:
 #   +0  flags   bit0 = GPU present · bit1 = double-buffer armed · bit2 = carveout (GPU-visible) shm available
+#               bit3 = SHADER COMPOSITING available (gpu_shader_op#92 will run)
+#               bit4 = RESERVED for S12: one #92 call == one GPU submission (batched)
 #   +4  bb_pitch  (bytes/row)      +16 shm_slots_total
 #   +8  bb_width  (px)             +20 shm_slots_free
-#   +12 bb_height (px)             +24 shm_max_size (bytes)   +28 reserved (0)
+#   +12 bb_height (px)             +24 shm_max_size (bytes)   +28 #92 op-support mask (bit N = op code N)
 # No MC address is exposed — geometry and counts only. An info query, so the CP-DMA constraints don't apply.
 fn gpu_caps_sys(buf, len) {
     if (is_user_range(buf, 32) == 0) { return 0 - 1; }
@@ -890,6 +1098,19 @@ fn gpu_caps_sys(buf, len) {
     if (gpu_present != 0) { flags = flags | 1; }
     if (gpu_bb_armed == 1) { flags = flags | 2; }
     if (gpu_arena_mc != 0) { flags = flags | 4; }        # a carveout exists ⇒ #86 can serve
+    # bit3 — SHADER COMPOSITING available, i.e. gpu_shader_op#92 can actually run. Mirrors #92's own
+    # call-level gate exactly, so a caller that sees this bit set will not then get E_UNPROVEN/E_NOGPU.
+    # Without it the only way to discover #92 is to call it and read the error, which is what #86's
+    # "call it and look for -1" already proved to be the wrong shape.
+    var shader_ok = 0;
+    if (gpu_present != 0) {
+        if (gpu_arena_mc != 0) {
+            if (gpu_ring_wptr != 0) {
+                if (gpu_matmul_ok == 1) { shader_ok = 1; }
+            }
+        }
+    }
+    if (shader_ok == 1) { flags = flags | 8; }
     var bw = 0;
     var bh = 0;
     if (gpu_bb_pitch != 0) {
@@ -909,7 +1130,13 @@ fn gpu_caps_sys(buf, len) {
     store32(buf + 16, SHM_MAX);
     store32(buf + 20, freeslots);
     store32(buf + 24, SHM_MAX_SIZE);
-    store32(buf + 28, 0);
+    # +28 — the gpu_shader_op#92 OP-SUPPORT MASK: bit N set <=> op code N is implemented by this kernel.
+    # This is why op codes are capped at 0x1F (see GPU_OP_SUPPORTED): the code IS its bit index here, so
+    # ring 3 discovers the exact op set instead of probing each one and reading E_BADOP. Reported as 0
+    # when the shader path is unavailable, so one read answers "can I" and "which ops" together.
+    var opmask = 0;
+    if (shader_ok == 1) { opmask = GPU_OP_SUPPORTED; }
+    store32(buf + 28, opmask);
     return 0;
 }
 
@@ -2245,12 +2472,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return cq;
     }
     if (num == 92) {
-        # gpu_blend_shm(id, wh, dstxy) — the ALPHA peer of gpu_blit_shm#87. Same packing, same reject-don't-
-        # clip discipline; the difference is that this composites through the SHADER CORES with per-pixel
-        # src-over instead of CP-DMA, which has no ALU and can only do opaque. Source must be PREMULTIPLIED.
-        var bl = gpu_blend_shm_sys(arg1, arg2, arg3);
+        # gpu_shader_op(desc_uva, len) — THE shader-compositing seam. ONE number, an ARRAY of 64-byte op
+        # records, the operation selected by an op code INSIDE the payload: alpha blend / coverage / glyph
+        # expand / gradient today; channel swap, CP-DMA ops and batched frames later with NO new number
+        # (arc decision D-3). No pointer and no MC address appears in a record — sources are named by shm
+        # slot id and resolved in-kernel. Validates EVERY op before dispatching ANY, so a rejected batch
+        # draws nothing; rejects rather than clips. Sources must be PREMULTIPLIED (c <= a).
+        # Returns 0, or -((idx<<8)|reason) naming the failing op; -1 still means "no GPU here".
+        # ⚠ LINUX COLLISION: #92 = chown(path,uid,gid), a metadata WRITE. Severity is HIGHER than it was
+        # for the old 1..16-slot-id shape: arg1 is now a real user VA >= 0x200000, so off-agnos the call
+        # would get a READABLE path pointer and could plausibly SUCCEED. The file-level
+        # #ifdef CYRIUS_TARGET_AGNOS gate in cyrius/lib/syscalls.cyr is the only remaining barrier.
+        # (This collapse also RETIRES #93=fchown and #94=lchown and never mints #95=umask, so the band's
+        # destructive-collision surface goes from four rows to one.)
+        var so = gpu_shader_op_sys(arg1, arg2);
         stack_canary_check(canary);
-        return bl;
+        return so;
     }
     if (num == 40) {
         # uptime_ms() — monotonic milliseconds since boot, returned in rax (no

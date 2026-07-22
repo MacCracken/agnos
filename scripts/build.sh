@@ -339,8 +339,19 @@ else
         [ -n "$SHADER_PROBE" ]       && echo '#define SHADER_PROBE'
         # SHADER_BLEND=1 — 1.56.x S2: the first per-pixel alpha blend on the CUs (premultiplied f32).
         [ -n "$SHADER_BLEND" ]       && echo '#define SHADER_BLEND'
-        # SHADER_RECT=1 — 1.56.x S3: that blend over a 2-D grid, into the scanout back buffer, presented.
+        # SHADER_RECT=1 — 1.56.x plan-S5 (grid > 1 workgroup) + the first half of plan-S7: that blend over a
+        # 2-D grid, into the scanout back buffer, presented. (Released under the label "S3" at 1.56.1; the
+        # plan's S3 is the four-arm coherence characterisation, which has NOT run. See the CHANGELOG erratum.)
         [ -n "$SHADER_RECT" ]        && echo '#define SHADER_RECT'
+        # SHADER_COV=1 — 1.56.x plan-S10: coverage (anti-aliased) blend — uniform colour x 8bpp mask.
+        # (Released under the label "S7" at 1.56.3.)
+        [ -n "$SHADER_COV" ]         && echo '#define SHADER_COV'
+        # SHADER_GLYPH=1 — 1.56.x plan-S9: 1bpp -> 32bpp glyph expansion (transparent background).
+        # (Released under the label "S8" at 1.56.3.)
+        [ -n "$SHADER_GLYPH" ]       && echo '#define SHADER_GLYPH'
+        # SHADER_GRAD=1 — 1.56.x plan-S11: vertical linear gradient (no source buffer).
+        # (Released under the label "S9" at 1.56.3.)
+        [ -n "$SHADER_GRAD" ]        && echo '#define SHADER_GRAD'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

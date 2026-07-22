@@ -26,7 +26,11 @@
 #              96 = gpu_caps failed
 #              100 no-GPU · 101 no-carveout · 102 bad-width · 103 bad-height · 104 no-free-slot · 105 not-armed
 #              90 = fill · 98 = fill_rect · 92 = shm_create_gpu (-1 ⇒ no carveout, e.g. QEMU)
-#              93 = shm_write · 94 = gpu_blend_shm FAILED  ← the one that matters · 91 = present
+#              93 = shm_write · 91 = present
+#              110+reason = gpu_shader_op#92 FAILED  ← the one that matters. reason = (-rc) & 0xFF:
+#                111 no-GPU · 112 bad-op · 113 bad-slot · 114 slot-too-small · 115 off-screen · 116 bad-dim
+#                117 shader-not-resident · 118 dispatch-timeout · 121 bad-descriptor · 122 reserved-field
+#                123 dispatch-envelope-unproven-this-boot
 
 var gp_pix[4608];                  # module-global ⇒ N x u64 = 36864 B = 96*96*4
 
@@ -55,7 +59,22 @@ fn gp_square(id, r, g, b, a, x, y): i64 {
     var i = 0;
     while (i < 96 * 96) { store32(&gp_pix + i * 4, px); i = i + 1; }
     if (syscall(72, id, &gp_pix, 96 * 96 * 4) != 0) { return 93; }
-    if (syscall(92, id, (96 * 65536) + 96, (y * 65536) + x) != 0) { return 94; }
+    # ONE 64-byte op record. #92 takes an ARRAY of these and selects the operation from the op code in
+    # dword 0, so blend / coverage / glyph / gradient all ride this one syscall number (arc decision D-3).
+    # Every dword the op does not define MUST be zero: the kernel REJECTS a non-zero reserved field rather
+    # than ignoring it, which is exactly what keeps the currently-unused srcxy/pitch dwords safe to define
+    # in a later kernel without an ABI break.
+    var d[64];                                     # function-local ⇒ 64 BYTES = exactly one record
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 1);                           # op = GPU_OP_BLEND_RECT
+    store32(&d +  8, id);                          # src_id
+    store32(&d + 16, (96 * 65536) + 96);           # wh    = (h<<16)|w
+    store32(&d + 20, (y * 65536) + x);             # dstxy = (dy<<16)|dx
+    var rc = syscall(92, &d, 64);
+    # Decode the packed failure instead of collapsing it to one code: e = -rc, idx = e>>8, reason = e&0xFF.
+    # With a single op idx is always 0, so the REASON is the informative half and it rides the exit code.
+    if (rc != 0) { return 110 + ((0 - rc) & 0xFF); }
     return 0;
 }
 

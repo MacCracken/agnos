@@ -49,7 +49,77 @@ fi
 # selftest code stays in-tree (still #ifdef-gated in build.sh); it's just not
 # ENABLED for the burn artifact now that the exec/EXT2 arc is iron-validated.
 # Opt back in for a validation burn with BURN_SELFTESTS=1 (EXEC + EXT2 write).
-if [ -n "${BURN_SDMA_COPY:-}" ]; then
+# --- 1.56.x SHADER arc arms ---------------------------------------------------
+# ⚠ These were MISSING until 1.56.4. Every 1.56.x shader burn (S1/D0, S2, grid, guard, coverage, glyph,
+# gradient) was reproduced by hand-exporting a define straight to build.sh, which bypasses this script's
+# banner + BUILD_TAG stamp — so the burn artifact carried no record of which arm produced it. That is
+# exactly the failure the standing rule ("every #ifdef bite names its BURN_* flag in burn-prep.sh, and you
+# verify by `cmp`-ing the two binaries, not by the burn tag") exists to prevent. Arms added retroactively.
+if [ -n "${BURN_SHADER_OPS:-}" ]; then
+    # 1.56.4 — FOUR proofs in ONE boot. Burns block the operator's machine, so this arm deliberately
+    # bundles everything the realignment owes rather than spending four boots:
+    #   A1  #92 gpu_shader_op descriptor seam (plan S8 / D-3)  -> run /bin/gpublend, /bin/gpucov
+    #   A2  coverage RE-PROOF — mandatory: both cov call sites passed 11 args to a 12-parameter
+    #       dispatcher until 1.56.4, so the RSRC1 the kernel ran with was whatever `gx` happened to be,
+    #       and done_phys was undefined (a wild kernel store). The 1.56.3 proof is void.
+    #   A3  glyph first iron        A4  gradient first iron  (both built at 1.56.3, never burned)
+    # Boot selftests print and continue on failure, and every dispatch is watchdog-bounded, so one bad
+    # arm should not cost the others.
+    #
+    # ⚠ WHAT THIS BOOT DOES *NOT* PROVE: the lazy-arm path for cov/glyph/grad. Their selftests write the
+    # SAME arena slot their gpu_*_arm() uses, so a slot is already populated by the time #92 runs. It is
+    # NOT a false pass — gpu_*_armed is never set by a selftest, so the arm still executes its own upload
+    # and its own gates — but the bare-kernel case is untested here. blend_rect IS clean: its selftest
+    # uses 0x14000 while #92 uses 0x50000, so /bin/gpublend exercises the real lazy arm.
+    # Follow-up (cheap, no new code): one production-shape boot — BUILD_ENV="" — running the same two
+    # binaries. Do it only after this burn is green.
+    #
+    # ⚠ NEEDS the gpu-test binaries on the agnos-fs: scripts/stage-tools.sh --build (wired 1.56.4).
+    # Oracle: `run /bin/gpublend` and `run /bin/gpucov` -> `run: exit 95`. A #92 failure decodes as
+    # 110 + reason (111 no-GPU · 113 bad-slot · 115 off-screen · 117 not-resident · 118 dispatch-timeout ·
+    # 121 bad-descriptor · 122 reserved-field · 123 envelope-unproven). CAPTURE: klug > shader_ops.txt.
+    echo "[2/2] Building the 1.56.4 SHADER-OPS kernel (#92 descriptor seam + cov re-proof + glyph/grad first iron; run /bin/gpublend + /bin/gpucov; capture klug > shader_ops.txt)."
+    BUILD_ENV="SHADER_COV=1 SHADER_GLYPH=1 SHADER_GRAD=1"
+    BUILD_TAG="SHADER_OPS"
+elif [ -n "${BURN_SHADER_GRAD:-}" ]; then
+    # plan-S11 — vertical linear gradient, no source buffer. Oracle: 'gpu: shader gradient online'.
+    echo "[2/2] Building the plan-S11 SHADER-GRAD kernel (linear gradient; capture klug > shader_grad.txt)."
+    BUILD_ENV="SHADER_GRAD=1"
+    BUILD_TAG="SHADER_GRAD"
+elif [ -n "${BURN_SHADER_GLYPH:-}" ]; then
+    # plan-S9 — 1bpp -> 32bpp glyph expansion, transparent background. Highest call-count site in the
+    # desktop tree. Oracle: 'gpu: shader glyph expand online'. CAPTURE: klug > shader_glyph.txt.
+    echo "[2/2] Building the plan-S9 SHADER-GLYPH kernel (1bpp glyph expand; capture klug > shader_glyph.txt)."
+    BUILD_ENV="SHADER_GLYPH=1"
+    BUILD_TAG="SHADER_GLYPH"
+elif [ -n "${BURN_SHADER_COV:-}" ]; then
+    # plan-S10 — coverage (anti-aliased) blend: uniform colour x 8bpp mask. ⚠ Re-proof required at 1.56.4:
+    # both coverage call sites passed 11 args to a 12-parameter dispatcher until this cut, so the RSRC1 the
+    # kernel ran with was whatever `gx` happened to be. Oracle: 'gpu: shader coverage blend online'.
+    echo "[2/2] Building the plan-S10 SHADER-COV kernel (coverage blend, RSRC1 arity FIXED; capture klug > shader_cov.txt)."
+    BUILD_ENV="SHADER_COV=1"
+    BUILD_TAG="SHADER_COV"
+elif [ -n "${BURN_SHADER_RECT:-}" ]; then
+    # plan-S5 + first half of plan-S7 — the blend over a 2-D grid, into the scanout back buffer, presented.
+    # Builds SHADER_BLEND alongside on purpose: S2 stays the regression net, so if the grid arm fails while
+    # the 64-px arm passes, the fault is isolated to grid/addressing/scanout and cannot be the blend math.
+    echo "[2/2] Building the plan-S5 SHADER-RECT kernel (grid blend to back buffer + S2 net; capture klug > shader_rect.txt)."
+    BUILD_ENV="SHADER_BLEND=1 SHADER_RECT=1"
+    BUILD_TAG="SHADER_RECT"
+elif [ -n "${BURN_SHADER_BLEND:-}" ]; then
+    # plan-S2 — the FIRST per-pixel alpha blend on the CUs (premultiplied f32), 64 px into a fresh arena
+    # slot. Oracle: 'gpu: shader blend lanes stored 64 of 64' THEN 'gpu: shader alpha blend online'. The
+    # lane count is separate on purpose — a dispatch can retire having written nothing if every lane is
+    # EXEC-masked, which is exactly what happened at 1.54.17-19.
+    echo "[2/2] Building the plan-S2 SHADER-BLEND kernel (first alpha blend on the CUs; capture klug > shader_blend.txt)."
+    BUILD_ENV="SHADER_BLEND=1"
+    BUILD_TAG="SHADER_BLEND"
+elif [ -n "${BURN_SHADER_PROBE:-}" ]; then
+    # plan-S1 + D0 — read-only compute-state + DCN MPC probes. No writes, no ring traffic.
+    echo "[2/2] Building the plan-S1+D0 SHADER-PROBE kernel (read-only probes; capture klug > shader_probe.txt)."
+    BUILD_ENV="SHADER_PROBE=1"
+    BUILD_TAG="SHADER_PROBE"
+elif [ -n "${BURN_SDMA_COPY:-}" ]; then
     # P9.2 — FIRST SDMA PACKET (first hardware 2D on agnos). Rings up SDMA (P9.1) then submits ONE COPY_LINEAR
     # (4KB carveout→carveout) + a FENCE, kicks via RB_WPTR (register, wptr in BYTES), gates completion on the
     # FENCE SENTINEL (coherence-honest — rptr alone could false-GREEN on the GL2 strand), and verifies dst==src.
