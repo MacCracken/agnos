@@ -1314,6 +1314,18 @@ fn gpu_cp_dma(dst_mc, src_mc, bytes) {
 fn gpu_cp_dma_fill(dst_mc, val, bytes) {
     return gpu_cpdma_submit(GPU_CPDMA_CTL_FILL, val & 0xFFFFFFFF, 0, dst_mc, bytes);
 }
+# gpu_cp_dma_fill_rect — hardware RECT FILL: write the 32-bit `val` across `row_bytes` on each of `rows`
+# rows, `dst_stride` apart (one CP-DMA constant-fill per row). The rect peer of gpu_cp_dma_fill, which only
+# does one contiguous run. This is the primitive behind gpu_fill_rect#88 — window chrome is ~10 of these per
+# window per frame (body, titlebar, focus accent, buttons), today a per-pixel CPU loop. Returns 1 / 0.
+fn gpu_cp_dma_fill_rect(dst_mc, dst_stride, val, row_bytes, rows) {
+    var y = 0;
+    while (y < rows) {
+        if (gpu_cp_dma_fill(dst_mc + y * dst_stride, val, row_bytes) != 1) { return 0; }
+        y = y + 1;
+    }
+    return 1;
+}
 # gpu_cp_dma_blit — hardware 2D rect BLIT: copy `rows` rows of `row_bytes` from src_mc to dst_mc with
 # independent source/dest row strides (one CP-DMA per row). The compositor substrate for moving a window or
 # region FB->FB and for scrolling. Returns 1 on full success, 0 if any row fails. All MC addresses.

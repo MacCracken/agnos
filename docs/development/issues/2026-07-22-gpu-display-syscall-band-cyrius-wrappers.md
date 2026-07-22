@@ -9,7 +9,7 @@ consistent gating and docstrings, rather than a new ask every time agnos ships a
 Mirror: `cyrius/docs/development/issues/2026-07-22-agnos-gpu-display-syscall-band.md`.
 
 **Two tiers — please treat differently:**
-- **Tier 1 — EXISTS TODAY, needs wrappers now:** `#86 shm_create_gpu`, `#87 gpu_blit_shm` (agnos 1.55.31).
+- **Tier 1 — EXISTS + IRON-PROVEN, needs wrappers now:** `#86 shm_create_gpu`, `#87 gpu_blit_shm` (agnos 1.55.31). **Validated on archaemenid 2026-07-22:** `/bin/gpublit` composited three GPU-blitted squares onto a GPU-filled background and presented them — the full compositor frame shape (clear → composite → flip) with zero per-pixel CPU work. Back-buffer stride and scanout confirmed in agreement (squares landed at the exact coded coordinates).
 - **Tier 2 — SHAPE DECLARED, agnos implements first:** `#88 gpu_fill_rect`, `#89 gpu_caps`,
   `#90 gpu_readback_shm`, `#91 gpu_blit_bb`. Listed so the numbers stay contiguous and reserved, and so the
   wrapper work can be planned once. **Do not wrap these until agnos ships each** — they are documented here

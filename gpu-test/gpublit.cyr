@@ -1,26 +1,24 @@
-# gpublit — agnos ring-3 GPU COMPOSITE proof (desktop arc).
+# gpublit — agnos ring-3 GPU COMPOSITOR-FRAME proof (desktop arc).
 #
-# Proves the new pair end to end FROM RING 3:
-#   #86 shm_create_gpu(size) — allocate a client surface in the GPU CARVEOUT (so it has an MC address the
-#       CP-DMA engine can read; a #71 shm page is pmm/system RAM the GPU cannot reach AT ALL — bus-master
-#       is off by design, which is exactly why the compositor could not GPU-composite before).
-#   #87 gpu_blit_shm(id, wh, dstxy) — the GPU blits that surface straight into the blit back buffer.
-#       This replaces BOTH the shm->userland read AND the per-pixel composite loop: the pixels never
-#       leave kernel GPU-visible memory.
-# Then #85 gpu_fill for the background and #84 present to show the frame — the full compositor frame
-# shape (clear -> composite windows -> flip) with zero per-pixel CPU work in the loop.
+# Draws a whole mock compositor frame with ZERO per-pixel CPU work, exercising the full band:
+#   #89 gpu_caps        — probe capability + the true BACK-BUFFER geometry (fbinfo#38 reports the CONSOLE
+#                         framebuffer, which is NOT the same thing). Required because #87/#88 REJECT
+#                         off-screen rects rather than clipping — the compositor owns clipping.
+#   #85 gpu_fill        — clear the frame (desktop background)
+#   #88 gpu_fill_rect   — window chrome: body + titlebar + accent (today a per-pixel CPU loop, ~10 rects
+#                         per window per frame)
+#   #86 shm_create_gpu  — a client surface in the GPU CARVEOUT (a #71 pmm page is system RAM the GPU cannot
+#                         reach at all — bus-master is off by design)
+#   #87 gpu_blit_shm    — GPU-composite that surface as the window's content
+#   #84 present         — one vsync-paced flip for the whole frame
 #
-# VISUAL oracle: a blue field with three yellow 64x64 squares composited into it.
-# EXIT oracle:  95 = all pass · 90 fill · 91 present · 92 shm_create_gpu (-1 ⇒ no carveout, e.g. QEMU)
-#               93 shm_write · 94 gpu_blit_shm
-#
-# ⚠ POSITIONING CAVEAT (watch the screen): the kernel derives the back-buffer pitch from boot_info, which on
-# this box reports the OUTPUT geometry (2560x1440), while the pipe actually scans a smaller 800x600 surface
-# — the exact mismatch P4 fixed for fb_console. So the squares proving the BLIT may not land where the
-# coordinates say. Squares appearing at all = the GPU composite works; squares in the wrong place = the
-# pitch source needs the same scanout-derived fix P4 applied (gpu_bb_pitch from the surface, not boot_info).
+# VISUAL oracle: a blue desktop with a grey window (red titlebar) and a yellow content block inside it.
+# EXIT oracle:   95 = all pass
+#                96 = gpu_caps failed · 97 = caps returned implausible geometry · 98 = gpu_fill_rect failed
+#                90 = fill · 91 = present · 92 = shm_create_gpu (-1 ⇒ no carveout, e.g. QEMU)
+#                93 = shm_write · 94 = gpu_blit_shm
 
-var gb_pix[2048];                  # module-global ⇒ N x u64 = 16384 B = 64*64*4 (one BGRA surface)
+var gb_pix[2048];                  # module-global ⇒ N x u64 = 16384 B = 64*64*4
 
 fn gpublit_hold(ms): i64 {
     var t0 = sys_uptime_ms();
@@ -36,33 +34,45 @@ fn gpublit_hold(ms): i64 {
 }
 
 fn gpublit_main(): i64 {
-    var w = 64;
-    var h = 64;
-    var bytes = w * h * 4;                         # 16384
+    var caps[32];                                  # function-local ⇒ N BYTES = the 8x u32 caps struct
+    if (syscall(89, &caps, 32) != 0) { return 96; }
+    var flags = load32(&caps + 0)  & 0xFFFFFFFF;
+    var bbw   = load32(&caps + 8)  & 0xFFFFFFFF;
+    var bbh   = load32(&caps + 12) & 0xFFFFFFFF;
+    var freeslots = load32(&caps + 20) & 0xFFFFFFFF;
+    # Self-validate the probe: GPU present (bit0), a carveout for #86 (bit2), real geometry, a free slot.
+    if ((flags & 1) == 0) { return 97; }
+    if ((flags & 4) == 0) { return 97; }
+    if (bbw < 64)  { return 97; }
+    if (bbh < 64)  { return 97; }
+    if (freeslots < 1) { return 97; }
 
-    # Background: GPU-clear the back buffer to a deep blue so the composited squares are unmistakable.
+    # Desktop background.
     if (sys_gpu_fill(0x00000080) != 0) { return 90; }
 
-    # A GPU-VISIBLE client surface (the whole point — #71 would be unreachable by the engine).
+    # Window chrome, placed using the geometry #89 just reported (proves the values are usable).
+    var wx = bbw / 8;
+    var wy = bbh / 8;
+    var ww = 320;
+    var wh_px = 200;
+    if (syscall(88, 0x00303038, (wh_px * 65536) + ww, (wy * 65536) + wx) != 0) { return 98; }        # grey body
+    if (syscall(88, 0x00B03020, (24 * 65536) + ww, (wy * 65536) + wx) != 0) { return 98; }           # red titlebar
+    if (syscall(88, 0x00F0C040, (4 * 65536) + ww, ((wy + 24) * 65536) + wx) != 0) { return 98; }     # accent line
+
+    # A client surface, GPU-composited as the window's content.
+    var bytes = 64 * 64 * 4;
     var id = syscall(86, bytes);
-    if (id < 1) { return 92; }                     # -1 ⇒ no GPU carveout (QEMU): CPU path still applies
-
-    # Paint it yellow CPU-side, then hand it to the kernel once.
+    if (id < 1) { return 92; }
     var i = 0;
-    while (i < w * h) { store32(&gb_pix + i * 4, 0x00FFFF00); i = i + 1; }
-    if (syscall(72, id, &gb_pix, bytes) != 0) { return 93; }   # shm_write#72 (unchanged, works on both kinds)
+    while (i < 64 * 64) { store32(&gb_pix + i * 4, 0x00FFFF00); i = i + 1; }
+    if (syscall(72, id, &gb_pix, bytes) != 0) { return 93; }
+    var cwh = (64 * 65536) + 64;
+    if (syscall(87, id, cwh, ((wy + 40) * 65536) + (wx + 16)) != 0) { return 94; }
+    if (syscall(87, id, cwh, ((wy + 40) * 65536) + (wx + 96)) != 0) { return 94; }
 
-    # Composite it three times at different spots — repeated GPU blits into the same frame.
-    var wh = (h * 65536) + w;
-    if (syscall(87, id, wh, 0) != 0) { return 94; }                          # (0,0)
-    if (syscall(87, id, wh, (64 * 65536) + 64) != 0) { return 94; }          # (64,64)
-    if (syscall(87, id, wh, (128 * 65536) + 128) != 0) { return 94; }        # (128,128)
-
-    # One vsync-paced flip for the whole frame.
     if (sys_gpu_present() != 1) { return 91; }
-    gpublit_hold(3000);
-
-    syscall(74, id);                               # shm_free#74 — carveout slot returns to the table
+    gpublit_hold(4000);
+    syscall(74, id);
     return 95;
 }
 

@@ -799,6 +799,73 @@ fn gpu_blit_shm_sys(id, wh, dstxy) {
     return 0;
 }
 
+# gpu_fill_rect_sys(color, wh, dstxy) -> 0 / -1. The RECT peer of gpu_fill#85 (which only clears the WHOLE
+# back buffer). GPU-fills a sub-rectangle with a 32-bit xRGB8888 colour via gpu_cp_dma_fill_rect. This is the
+# window-chrome primitive: a compositor draws body/titlebar/focus-accent/buttons as ~10 of these per window
+# per frame, today a per-pixel CPU loop with 4 compares + 2 loads + 2 multiplies BEFORE each store32.
+# Pack: wh = (h<<16)|w, dstxy = (dy<<16)|dx — blit#39's convention. Rejects (does not clip) off-screen
+# rects; the compositor owns clipping and learns the bounds from gpu_caps#89.
+fn gpu_fill_rect_sys(color, wh, dstxy) {
+    if (gpu_present == 0) { return 0 - 1; }
+    if (gpu_blit_arm() != 1) { return 0 - 1; }
+    if (gpu_bb_pitch == 0) { return 0 - 1; }
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    var dx = dstxy & 0xFFFF;
+    var dy = (dstxy >> 16) & 0xFFFF;
+    if (w < 1) { return 0 - 1; }
+    if (h < 1) { return 0 - 1; }
+    var fbw = gpu_bb_pitch / 4;
+    var fbh = gpu_bb_fbsize / gpu_bb_pitch;
+    if (dx + w > fbw) { return 0 - 1; }
+    if (dy + h > fbh) { return 0 - 1; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+    if (gpu_cp_dma_fill_rect(dst_mc, gpu_bb_pitch, color, w * 4, h) != 1) { return 0 - 1; }
+    return 0;
+}
+
+# gpu_caps_sys(buf, len) -> 0 / -1. The capability + geometry probe ring 3 has been missing. Two problems it
+# solves: (1) the ONLY way to discover GPU compositing today is to call #86 and look for -1; (2) #87/#88
+# REJECT off-screen rects rather than clipping, so a compositor MUST know the true BACK-BUFFER geometry —
+# which is NOT what fbinfo#38 reports (that is the console framebuffer). 8x u32 LE, mirroring fbinfo's
+# struct-write pattern:
+#   +0  flags   bit0 = GPU present · bit1 = double-buffer armed · bit2 = carveout (GPU-visible) shm available
+#   +4  bb_pitch  (bytes/row)      +16 shm_slots_total
+#   +8  bb_width  (px)             +20 shm_slots_free
+#   +12 bb_height (px)             +24 shm_max_size (bytes)   +28 reserved (0)
+# No MC address is exposed — geometry and counts only. An info query, so the CP-DMA constraints don't apply.
+fn gpu_caps_sys(buf, len) {
+    if (is_user_range(buf, 32) == 0) { return 0 - 1; }
+    if (len < 32) { return 0 - 1; }
+    var flags = 0;
+    if (gpu_present != 0) { flags = flags | 1; }
+    if (gpu_bb_armed == 1) { flags = flags | 2; }
+    if (gpu_arena_mc != 0) { flags = flags | 4; }        # a carveout exists ⇒ #86 can serve
+    var bw = 0;
+    var bh = 0;
+    if (gpu_bb_pitch != 0) {
+        bw = gpu_bb_pitch / 4;
+        bh = gpu_bb_fbsize / gpu_bb_pitch;
+    }
+    var freeslots = 0;
+    var i = 0;
+    while (i < SHM_MAX) {
+        if (load64(&shm_phys + i * 8) == 0) { freeslots = freeslots + 1; }
+        i = i + 1;
+    }
+    store32(buf +  0, flags);
+    store32(buf +  4, gpu_bb_pitch);
+    store32(buf +  8, bw);
+    store32(buf + 12, bh);
+    store32(buf + 16, SHM_MAX);
+    store32(buf + 20, freeslots);
+    store32(buf + 24, SHM_MAX_SIZE);
+    store32(buf + 28, 0);
+    return 0;
+}
+
 # shm_write(id, user_src, size) -> 0 / -1. Copies user src INTO the shm page.
 fn shm_write(id, src, size) {
     if (shm_slot_valid(id) == 0) { return 0 - 1; }
@@ -2113,6 +2180,22 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var bs = gpu_blit_shm_sys(arg1, arg2, arg3);
         stack_canary_check(canary);
         return bs;
+    }
+    if (num == 88) {
+        # gpu_fill_rect(color, wh, dstxy) — the RECT peer of gpu_fill#85 (whole-buffer only). GPU-fills a
+        # sub-rectangle of the back buffer: the window-chrome primitive (~10 per window per frame today done
+        # per-pixel on the CPU). wh=(h<<16)|w, dstxy=(dy<<16)|dx. Rejects off-screen rects — see gpu_caps#89.
+        var fq = gpu_fill_rect_sys(arg1, arg2, arg3);
+        stack_canary_check(canary);
+        return fq;
+    }
+    if (num == 89) {
+        # gpu_caps(buf, len) — capability + BACK-BUFFER geometry probe (8x u32, 32 B). The bounds a
+        # compositor needs to clip before calling #87/#88, which reject rather than clip; fbinfo#38 reports
+        # the CONSOLE framebuffer, not this. Also reports armed-ness and the carveout shm slot budget.
+        var cq = gpu_caps_sys(arg1, arg2);
+        stack_canary_check(canary);
+        return cq;
     }
     if (num == 40) {
         # uptime_ms() — monotonic milliseconds since boot, returned in rax (no

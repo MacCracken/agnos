@@ -5,6 +5,59 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.32] — 2026-07-22 — the GPU compositor seam: #86-#89, a whole frame with zero per-pixel CPU work
+
+**The full compositor frame shape now runs from ring 3 with no per-pixel CPU work anywhere in it.**
+`/bin/gpublit` (archaemenid, 2026-07-22) already proved the #86/#87 half — blue field with three yellow
+64×64 squares on the exact coded diagonal: `gpu_fill`#85 → `shm_create_gpu`#86 → `shm_write`#72 →
+`gpu_blit_shm`#87 ×3 → `present`#84. This cut adds the two syscalls that make a *real* compositor able to
+use that path: a **rect** fill for window chrome, and the capability/geometry probe it needs to clip.
+
+### Added — the compositor-enabling pair
+
+- **`#88 gpu_fill_rect(color, wh, dstxy)`** — the **rect** peer of `gpu_fill`#85, which only ever cleared the
+  *whole* back buffer. GPU-fills a sub-rectangle via a new `gpu_cp_dma_fill_rect` primitive (one CP-DMA
+  constant-fill per row). This is the window-chrome primitive: a compositor draws body / titlebar / focus
+  accent / buttons as ~10 of these per window per frame — today a per-pixel CPU loop that costs 4 compares +
+  2 loads + 2 multiplies *before* each `store32`. `blit`#39 packing (`wh=(h<<16)|w`, `dstxy=(dy<<16)|dx`).
+- **`#89 gpu_caps(buf, len)`** — the capability + **back-buffer geometry** probe ring 3 was missing, and a
+  hard prerequisite rather than a convenience: **#87/#88 reject off-screen rects instead of clipping**, so a
+  compositor must know the true bounds, and `fbinfo`#38 reports the *console* framebuffer, which is not the
+  same surface. Also closes the discovery gap — until now the only way to detect GPU compositing was to call
+  #86 and look for −1. 8× u32 (32 B), `fbinfo`-style: flags (GPU present / double-buffer armed / carveout
+  available), `bb_pitch`, `bb_width`, `bb_height`, shm slots total + free, `shm_max_size`. Exposes geometry
+  and counts only — no MC address crosses the boundary.
+
+### Added — the GPU-visible buffer seam
+
+- **`#86 shm_create_gpu(size)`** — the GPU-VISIBLE peer of `shm_create`#71. Same table, same
+  `shm_write`/`shm_read`/`shm_free`; only the backing differs — the page is carved from the **GPU carveout**
+  (2.5 GB in, clear of console FB / back buffers / PSP TMR / compute arena) so it has an MC address the
+  CP-DMA engine can read. **Not an optimisation:** #71 uses `pmm_alloc_2mb()` → system RAM, which the GPU
+  cannot reach *at all* (bus-master off by design), so GPU compositing from a #71 buffer is impossible.
+  Returns −1 with no carveout (QEMU) → caller falls back to #71 + the CPU path, unchanged.
+- **`#87 gpu_blit_shm(id, wh, dstxy)`** — GPU-composites that surface straight into the blit back buffer via
+  the iron-proven `gpu_cp_dma_blit`. Replaces **both** the shm→userland read and the per-pixel composite
+  loop; pixels never leave kernel GPU-visible memory. `blit`#39 packing. Rejects (does not clip) off-screen
+  rects — the compositor owns clipping.
+- `gpu_bb_pitch` (back-buffer row stride) recorded at blit-arm, alongside `gpu_bb_fbsize`.
+- `/bin/gpublit` (`gpu-test/`) — the ring-3 proof program.
+
+### Fixed
+
+- **`shm_free` would have handed a carveout address to `pmm_free_2mb`**, corrupting the page allocator's
+  bitmap with memory it never owned. Carveout-backed slots now reclaim by clearing the table entry; only
+  pmm-backed slots go back to the pmm. Caught pre-burn.
+
+### Notes
+
+- **The back-buffer pitch caveat resolved clean.** The risk was `gpu_bb_pitch` deriving from `boot_info`
+  (2560-wide) while the pipe scans an 800-wide surface — a mismatch would have shredded each blitted square
+  into ~3-row stripes. Clean squares at the coded coordinates ⟹ back-buffer stride and scanout agree; no
+  P4-style geometry fix is needed on this path.
+- Consolidated cyrius wrapper ask for the whole band (#86-#91) filed in both repos:
+  `docs/development/issues/2026-07-22-gpu-display-syscall-band-cyrius-wrappers.md`.
+
 ## [1.55.31] — 2026-07-21 — `/bin/gpufill`: the ring-3 consumer that proves the CP-DMA fill syscall end to end
 
 1.55.30 landed the CP-DMA fill/blit primitives (both iron-verified) and syscall **#85 `gpu_fill`**, but nothing
