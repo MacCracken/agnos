@@ -5,6 +5,36 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.55.31] — 2026-07-21 — `/bin/gpufill`: the ring-3 consumer that proves the CP-DMA fill syscall end to end
+
+1.55.30 landed the CP-DMA fill/blit primitives (both iron-verified) and syscall **#85 `gpu_fill`**, but nothing
+had yet *called* #85 from ring 3. This cut adds the consumer that closes that loop, plus the cross-repo ask for
+its named wrappers.
+
+### Added
+
+- **`gpu-test/` — a new in-tree userland project** building **`/bin/gpufill`** (static ELF64, staged to
+  `build/rootfs/bin/`). Calls **#85 `gpu_fill(color)`** then **#84 `present()`** from ring 3, cycling
+  red → green → blue (~1.2 s each on the monotonic ms clock), exercising **both** back buffers. Two independent
+  oracles: the **screen actually changing colour** (the scanout is displaying GPU-filled pixels) and the
+  **exit code** — `95` = all pass, `90` = fill rejected (#85 returned -1, no usable display), `91` = fill OK
+  but present returned 0. Follows the `blkprobe` exit-code idiom (no printing); disassembly-verified that the
+  `$0x55`/`$0x54` syscall immediates and the three colour constants actually landed.
+- **Cross-repo issue: cyrius wrappers for #84/#85** —
+  `docs/development/issues/2026-07-21-gpu-present-fill-syscall-cyrius-wrappers.md` (mirrored in the cyrius
+  repo). The cyrius agnos enum already carries `SYS_READDIR=81` / `SYS_GPU_DISPATCH=82` / `_F64=83`, so #84/#85
+  are the gap. **⚠ Safety:** this is the sharpest Linux collision in the band — `present`#84 is **nullary** and
+  Linux x86_64 **84 = `rmdir`**, so an ungated wrapper would emit a *destructive* `rmdir()` against a stale
+  `rdi`; **85 = `creat`** reinterprets a pixel colour as a path pointer. Both wrappers must be
+  `#ifdef CYRIUS_TARGET_AGNOS`-gated and must not emit the syscall off-agnos.
+
+### Changed
+
+- CHANGELOG 1.55.30 corrected: the named ring-3 wrappers (`sys_gpu_fill` / `sys_gpu_present`) did **not** land
+  in agnos. Their canonical home is the cyrius stdlib; a consumer `lib/` copy is **materialized** and
+  regenerated (the edit was auto-wiped, confirming the never-fix-in-materialized-libs rule). agnos owns the
+  canonical **ABI doc** row; callers use the raw `syscall` intrinsic until the cyrius ask lands.
+
 ## [1.55.30] — 2026-07-21 — P9: first hardware 2D on agnos — CP-DMA copy VERIFIED on iron
 
 **P9 (2D acceleration) is DONE.** `gpu: CP-DMA hardware copy verified (4KB, dst==src)` — first-try green on
@@ -30,9 +60,12 @@ the compute thrust already proved.
 - **Syscall #85 `gpu_fill(color)`** → `gpu_fill_sys`: GPU-clears the current blit back-buffer to an xRGB8888
   color via CP-DMA (replacing a CPU store-loop), pairing with `present`#84. Arms the double-buffer lazily and
   targets `gpu_bb_{a,b}_mc` over `gpu_bb_fbsize`. **Ring-3 names only the color** — the framebuffer stays
-  unmapped and no MC address crosses the boundary (same discipline as `blit`#39). Userland wrappers
-  `sys_gpu_fill` / `sys_gpu_present` + enum constants + the canonical ABI-doc row. Build-verified; the
-  end-to-end ring-3 path awaits a userland consumer.
+  unmapped and no MC address crosses the boundary (same discipline as `blit`#39). Documented in the canonical
+  `agnos-userland-abi.md` (row #85). Build-verified; the end-to-end ring-3 path awaits a userland consumer.
+  **Note:** the named ring-3 wrappers (`sys_gpu_fill` / `sys_gpu_present`) did **not** land here — their
+  canonical home is the cyrius stdlib (`lib/syscalls_x86_64_agnos.cyr`); consumer `lib/` copies are
+  materialized and regenerate. Filed as a cyrius ask at 1.55.31; callers use the raw `syscall` intrinsic
+  meanwhile.
 
 ### Added — the original copy self-test
 
