@@ -10,21 +10,28 @@
 // tgid_y, both delivered in SGPRs by the SPI. This is also how real compositors dispatch.
 //
 // ⚠ SGPR COLLISION — the reason this is not a copy-paste of blend_premul.s: that kernel stages the
-// -1/255f constant in **s6**. With TGID_X_EN set, **s6 IS tgid_x**. Reusing it here would overwrite the
-// column index with a float constant and every address would be wrong. The constant lives in s15 below.
+// -1/255f constant in **s6**, which here is a KERNARG (width), and with TGID_X_EN set s6 was tgid_x in the
+// previous revision. Either way, reusing it corrupts an index or an argument. The constant lives in s20.
 //
-// KERNARGS (USER_SGPR=6):
+// KERNARGS (USER_SGPR=7):
 //   s[0:1] = src base (premultiplied BGRA8888, tightly packed rows of src_pitch bytes)
 //   s[2:3] = dst base — READ AND WRITTEN IN PLACE (this is the back buffer)
-//   s4     = src pitch in BYTES     s5 = dst pitch in BYTES
-// SYSTEM SGPRs (after the 6 user SGPRs):  s6 = tgid_x (64-px column group)   s7 = tgid_y (row)
+//   s4     = src pitch in BYTES     s5 = dst pitch in BYTES     s6 = rect width in PIXELS
+// SYSTEM SGPRs (after the 7 user SGPRs):  s7 = tgid_x (64-px column group)   s8 = tgid_y (row)
+// ⚠ Adding `width` shifted the TGID registers by one (s6/s7 -> s7/s8). RSRC2 is re-harvested, so the
+// hardware agrees automatically; the hazard is only in this file's own register naming.
 //
 // In-place is safe: exactly one lane owns each pixel, and each lane reads only the pixel it writes.
 // There is no cross-lane dependency, so no barrier and no ordering hazard.
 //
-// ⚠ WIDTH MUST BE A MULTIPLE OF 64. There is no bounds guard — a partial trailing group would blend
-// pixels past the rect's right edge. The caller enforces this; gpu.cyr rejects a non-multiple width
-// rather than silently corrupting the row to its right.
+// WIDTH IS ARBITRARY. The trailing workgroup of each row is partial whenever width % 64 != 0, and those
+// surplus lanes are masked off with s_and_saveexec_b64 before ANY address is formed — so they issue no
+// load and no store and cannot touch the pixel to the right of the rect. This is what makes the kernel
+// usable by a compositor at all: real windows are not multiples of 64 px wide.
+//
+// The guard is placed before the loads rather than around the store on purpose. A masked-off lane must not
+// LOAD either — a load past the rect edge on the last row of the surface could read past the end of the
+// mapped back buffer, which is a fault, not merely a wasted fetch.
 //
 // ROUNDING: v_cvt_pk_u8_f32 ROUNDS TO NEAREST (settled on iron, 1.56.0 burn 1 — an added +0.5 came out
 // +1 on every channel). No rounding bias is applied here, matching the corrected blend_premul.s.
@@ -33,39 +40,46 @@
 .p2align 8
 .globl blend_rect
 blend_rect:
-    // ---- scalar address setup: the whole 64-lane group shares one row and one column base ----
-    s_lshl_b32      s8, s6, 8              // column byte base = tgid_x * 64 px * 4 B
-    s_mul_i32       s9, s7, s4             // src row byte base = tgid_y * src_pitch
-    s_add_u32       s9, s9, s8
-    s_add_u32       s10, s0, s9            // sets SCC = carry
-    s_addc_u32      s11, s1, 0             // consumes that carry — 64-bit src address
-    s_mul_i32       s12, s7, s5            // dst row byte base = tgid_y * dst_pitch
-    s_add_u32       s12, s12, s8
-    s_add_u32       s13, s2, s12
-    s_addc_u32      s14, s3, 0             // 64-bit dst address
+    // ---- BOUNDS GUARD: mask off lanes past the right edge BEFORE forming any address ----
+    s_lshl_b32      s9,  s7, 6             // first pixel x of this workgroup = tgid_x * 64
+    v_add_u32       v12, s9, v0            // this lane's x
+    v_cmp_gt_u32    vcc, s6, v12           // width > x ?  (VOP2 form: SGPR is legal in src0)
+    s_and_saveexec_b64 s[16:17], vcc       // surplus lanes go dark for the rest of the kernel
+
+    // ---- scalar address setup: the whole group shares one row and one column base ----
+    // Scalar ops run regardless of EXEC, so it is safe (and cheaper) to do this after the mask.
+    s_lshl_b32      s10, s7, 8             // column byte base = tgid_x * 64 px * 4 B
+    s_mul_i32       s11, s8, s4            // src row byte base = tgid_y * src_pitch
+    s_add_u32       s11, s11, s10
+    s_add_u32       s12, s0, s11           // sets SCC = carry
+    s_addc_u32      s13, s1, 0             // consumes that carry — 64-bit src address
+    s_mul_i32       s14, s8, s5            // dst row byte base = tgid_y * dst_pitch
+    s_add_u32       s14, s14, s10
+    s_add_u32       s18, s2, s14
+    s_addc_u32      s19, s3, 0             // 64-bit dst address
 
     v_lshlrev_b32   v1, 2, v0              // per-lane byte offset within the 64-px group
 
     // src pixel -> v2
-    v_mov_b32       v4, s10
-    v_mov_b32       v5, s11
+    v_mov_b32       v4, s12
+    v_mov_b32       v5, s13
     v_add_co_u32    v4, vcc, v4, v1
     v_addc_co_u32   v5, vcc, 0, v5, vcc
     global_load_dword v2, v[4:5], off
 
     // dst pixel -> v3 ; v[6:7] is ALSO the store address (in place)
-    v_mov_b32       v6, s13
-    v_mov_b32       v7, s14
+    v_mov_b32       v6, s18
+    v_mov_b32       v7, s19
     v_add_co_u32    v6, vcc, v6, v1
     v_addc_co_u32   v7, vcc, 0, v7, vcc
     global_load_dword v3, v[6:7], off
     s_waitcnt       vmcnt(0)
 
-    // ---- blend body: IDENTICAL to blend_premul.s except the constant lives in s15, not s6 ----
+    // ---- blend body: IDENTICAL to blend_premul.s except the constant lives in s20, not s6 ----
     // ia = 1 - src_a/255, as one FMA: v8 = src_a * (-1/255) + 1.0
     v_cvt_f32_ubyte3 v8, v2
-    s_mov_b32       s15, 0xBB808081        // -1/255f (VOP3 takes no 32-bit literal on gfx9)
-    v_fma_f32       v8, v8, s15, 1.0
+    s_mov_b32       s20, 0xBB808081        // -1/255f (VOP3 takes no 32-bit literal on gfx9)
+    v_fma_f32       v8, v8, s20, 1.0
 
     v_cvt_f32_ubyte0 v9,  v2
     v_cvt_f32_ubyte0 v10, v3
@@ -98,13 +112,13 @@ blend_rect:
     .amdhsa_group_segment_fixed_size 0
     .amdhsa_private_segment_fixed_size 0
     .amdhsa_kernarg_size 48
-    .amdhsa_user_sgpr_count 6
+    .amdhsa_user_sgpr_count 7
     .amdhsa_user_sgpr_kernarg_segment_ptr 0
     .amdhsa_system_sgpr_workgroup_id_x 1
     .amdhsa_system_sgpr_workgroup_id_y 1
     .amdhsa_system_vgpr_workitem_id 0
-    .amdhsa_next_free_vgpr 12
-    .amdhsa_next_free_sgpr 16
+    .amdhsa_next_free_vgpr 13
+    .amdhsa_next_free_sgpr 21
     .amdhsa_reserve_vcc 1
     .amdhsa_float_round_mode_32 0
     .amdhsa_float_round_mode_16_64 0

@@ -1042,8 +1042,9 @@ var GPU_PM4_SET_SH_REG_N6     = 0xC0067600;
 # blend_premul used s0..s7); RSRC2 adds TGID_X_EN(1<<7)|TGID_Y_EN(1<<8) to the 3-kernarg 0x0C, which is
 # what makes the workgroup id reach the shader at all. A wrong TGID bit here does not fault — every
 # workgroup would silently read tgid 0 and blend the same 64 pixels 256 times over.
-var GPU_COMPUTE_PGM_RSRC1_GRID = 0x002C0082; # blend_rect: 12 VGPRs, 24 SGPRs (llvm-mc computed)
-var GPU_COMPUTE_RSRC2_GRID2D   = 0x0000018C; # USER_SGPR=6 | TGID_X_EN | TGID_Y_EN (llvm-mc computed)
+var GPU_COMPUTE_PGM_RSRC1_GRID = 0x002C00C3; # blend_rect: 16 VGPRs, 32 SGPRs (llvm-mc computed)
+var GPU_COMPUTE_RSRC2_GRID2D   = 0x0000018E; # USER_SGPR=7 | TGID_X_EN | TGID_Y_EN (llvm-mc computed)
+var GPU_PM4_SET_SH_REG_N7      = 0xC0077600;  # SET_SH_REG, 7 values (src_lo/hi, dst_lo/hi, src_pitch, dst_pitch, width)
 var GPU_BR_SRC_SUBOFF          = 0x20000;    # src rect in the arena: 256x64x4 = 64 KB, clear of 0x14000/0x1A000/0x1B800
 # Rect geometry. WIDTH MUST BE A MULTIPLE OF 64 — blend_rect has no bounds guard, so a partial trailing
 # workgroup would blend past the right edge into the neighbouring pixels.
@@ -1053,7 +1054,20 @@ var GPU_BR_X  = 128;                         # rect origin in the back buffer
 var GPU_BR_Y  = 128;
 var GPU_BR_BG     = 0xFF202040;              # background outside the rect (dark blue)
 var GPU_BR_DST_L  = 0xFF00A000;              # underlay, left half  (green)  — dst varies by COLUMN so a
-var GPU_BR_DST_R  = 0xFFA00000;              # underlay, right half (red)      wrong dst_pitch is visible  # SET_SH_REG, 6 values (a_lo,a_hi,b_lo,b_hi,out_lo,out_hi)
+var GPU_BR_DST_R  = 0xFFA00000;              # underlay, right half (red)      wrong dst_pitch is visible
+# Second rect — the BOUNDS-GUARD case. 200 is deliberately NOT a multiple of 64: the last of its 4
+# workgroups is 56/64 masked off. The test checks both that the 200 px blend is bit-exact AND that the
+# pixels at x = 200..255 still hold the background, which is the only direct evidence the mask worked.
+# The BLEND SYSCALL gets its OWN shader + done slots rather than sharing GPU_SHADER_SUBOFF with the boot
+# self-tests. Sharing would work today (the tests finish before ring 3 exists) but it makes a runtime path
+# depend on boot-time ordering, and the arena has room to spare.
+var GPU_BLEND_SHADER_SUBOFF = 0x15000;       # blend_rect resident for #92 (60 dwords)
+var GPU_BLEND_DONE_SUBOFF   = 0x15C00;       # its dispatch done-marker
+var GPU_BR2_SRC_SUBOFF = 0x30000;            # src for the guard rect (200x48x4 = 37.5 KB), after rect 1's 64 KB
+var GPU_BR2_W = 200;
+var GPU_BR2_H = 48;
+var GPU_BR2_X = 128;
+var GPU_BR2_Y = 220;  # SET_SH_REG, 6 values (a_lo,a_hi,b_lo,b_hi,out_lo,out_hi)
 var GPU_DOT_K                 = 4;           # reduction length per lane (dot-product size)
 var GPU_DOT_N                 = 256;         # input element count = 64 lanes * K
 var GPU_DOT_A_SUBOFF          = 0x19000;     # input a[256] (a[i]=i+1)

@@ -826,6 +826,45 @@ fn gpu_fill_rect_sys(color, wh, dstxy) {
     return 0;
 }
 
+# gpu_blend_shm_sys(id, wh, dstxy) -> 0 / -1. The ALPHA peer of gpu_blit_shm#87.
+#
+# #87 copies a client surface with CP-DMA — fast, but CP-DMA is a byte mover with no ALU, so it can only
+# ever do OPAQUE. This runs the same composite through the shader cores with per-pixel src-over, which is
+# what translucent windows, drop shadows, fades and anti-aliased edges all require. Identical packing and
+# identical bounds discipline to #87, so a compositor swaps one call for the other.
+#
+# ⚠ THE SOURCE MUST BE PREMULTIPLIED (each colour channel already scaled by its own alpha, so c <= a).
+# This is not a preference — the shader computes `out = src + dst*(1 - src_a/255)` with no per-pixel divide,
+# which is only correct for premultiplied input. Straight-alpha input silently produces washed-out edges
+# rather than an error, so it is stated here and in the cyrius wrapper docstring.
+#
+# Rejects rather than clips off-screen rects, exactly like #87 — the compositor owns clipping and learns
+# the bounds from gpu_caps#89. Returns -1 (never a partial composite) if the GPU path is unavailable, so a
+# caller can fall back to #87 or the CPU path unchanged.
+fn gpu_blend_shm_sys(id, wh, dstxy) {
+    if (gpu_present == 0) { return 0 - 1; }
+    if (shm_slot_valid(id) == 0) { return 0 - 1; }
+    var slot = id - 1;
+    var src_mc = load64(&shm_mc + slot * 8);
+    if (src_mc == 0) { return 0 - 1; }                  # PMM-backed ⇒ the GPU cannot read it (see #86)
+    if (gpu_blit_arm() != 1) { return 0 - 1; }
+    if (gpu_bb_pitch == 0) { return 0 - 1; }
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    var dx = dstxy & 0xFFFF;
+    var dy = (dstxy >> 16) & 0xFFFF;
+    if (w < 1) { return 0 - 1; }
+    if (h < 1) { return 0 - 1; }
+    var row = w * 4;
+    if (row * h > load64(&shm_size + slot * 8)) { return 0 - 1; }   # source must fit its slot
+    var fbw = gpu_bb_pitch / 4;
+    var fbh = gpu_bb_fbsize / gpu_bb_pitch;
+    if (dx + w > fbw) { return 0 - 1; }
+    if (dy + h > fbh) { return 0 - 1; }
+    if (gpu_blend_surface(src_mc, w, h, dx, dy) != 1) { return 0 - 1; }
+    return 0;
+}
+
 # gpu_caps_sys(buf, len) -> 0 / -1. The capability + geometry probe ring 3 has been missing. Two problems it
 # solves: (1) the ONLY way to discover GPU compositing today is to call #86 and look for -1; (2) #87/#88
 # REJECT off-screen rects rather than clipping, so a compositor MUST know the true BACK-BUFFER geometry —
@@ -2204,6 +2243,14 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var cq = gpu_caps_sys(arg1, arg2);
         stack_canary_check(canary);
         return cq;
+    }
+    if (num == 92) {
+        # gpu_blend_shm(id, wh, dstxy) — the ALPHA peer of gpu_blit_shm#87. Same packing, same reject-don't-
+        # clip discipline; the difference is that this composites through the SHADER CORES with per-pixel
+        # src-over instead of CP-DMA, which has no ALU and can only do opaque. Source must be PREMULTIPLIED.
+        var bl = gpu_blend_shm_sys(arg1, arg2, arg3);
+        stack_canary_check(canary);
+        return bl;
     }
     if (num == 40) {
         # uptime_ms() — monotonic milliseconds since boot, returned in rax (no

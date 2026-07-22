@@ -97,6 +97,13 @@ enum SysNrAgnos {
     SYS_GPU_DISPATCH_F64 = 83;    # gpu_dispatch_f64(a,b,c) → 0/<0; 64xf64, unfused (MKDIR on Linux)
     SYS_GPU_PRESENT      = 84;    # present() → 1/0; flip back buffer (RMDIR on Linux — DESTRUCTIVE)
     SYS_GPU_FILL         = 85;    # gpu_fill(color) → 0/-1; CP-DMA constant-fill of the back buffer (CREAT on Linux)
+    SYS_SHM_CREATE_GPU   = 86;    # shm_create_gpu(size) → id/-1; GPU-visible shm page (LINK on Linux)
+    SYS_GPU_BLIT_SHM     = 87;    # gpu_blit_shm(id,wh,dstxy) → 0/-1 (UNLINK on Linux — DELETES A FILE)
+    SYS_GPU_FILL_RECT    = 88;    # gpu_fill_rect(color,wh,dstxy) → 0/-1 (SYMLINK on Linux)
+    SYS_GPU_CAPS         = 89;    # gpu_caps(buf,len) → 0/-1; bb geometry (READLINK on Linux — WRITES arg2)
+    # RESERVED, not wrapped until agnos ships them (numbers held so they can't drift):
+    #   90 gpu_readback_shm(id,wh,srcxy)  — CHMOD on Linux (setuid risk)
+    #   91 gpu_blit_bb(srcxy,wh,dstxy)    — FCHMOD on Linux; (0,0) packs to fd 0 = stdin, would SUCCEED
 }
 
 # ================================================================
@@ -620,6 +627,52 @@ fn sys_gpu_present(): i64 { return syscall(SYS_GPU_PRESENT); }
 # reinterpreted as a path pointer would create/truncate a file. Same file-level
 # agnos gate as sys_gpu_present above. CHANGELOG [6.4.70].
 fn sys_gpu_fill(color): i64 { return syscall(SYS_GPU_FILL, color); }
+
+# shm_create_gpu(size) — the GPU-VISIBLE peer of shm_create #71. Same table and the same
+# shm_write #72 / shm_read #73 / shm_free #74 afterwards; only the backing differs: the
+# page is carved from the GPU carveout, so it has an MC address the CP-DMA engine can
+# read. This is NOT an optimisation — #71 uses pmm_alloc_2mb() (system RAM), which the GPU
+# cannot reach at all (bus-master is off by design; the engines see only the FB aperture),
+# so a GPU composite from a #71 buffer is impossible. Returns id (>=1), or -1 when there is
+# no carveout (QEMU) — the caller then falls back to #71 and the CPU path, unchanged.
+# agnos 1.55.31. SAFETY: 86 is link(old,new) on Linux — two garbage pointers, FS litter.
+# Reachable ONLY on agnos (file-level #ifdef CYRIUS_TARGET_AGNOS on the whole peer; off-agnos
+# the fn does not exist and a referencing build fails at COMPILE time). CHANGELOG [6.4.71].
+fn sys_shm_create_gpu(size): i64 { return syscall(SYS_SHM_CREATE_GPU, size); }
+
+# gpu_blit_shm(id, wh, dstxy) — GPU-composite a client surface from its carveout slot
+# straight into the blit back buffer at (dx,dy) via gpu_cp_dma_blit (one CP-DMA per row;
+# src stride w*4, dst stride = framebuffer pitch). Replaces BOTH the shm→userland read and
+# the per-pixel composite loop — pixels never leave kernel GPU-visible memory. Packing
+# matches blit #39: wh = (h<<16)|w, dstxy = (dy<<16)|dx. ⚠ REJECTS rather than clips
+# anything off-screen — the compositor owns clipping, which is why sys_gpu_caps() is a
+# prerequisite for using this correctly. Returns 0 / -1 (-1 under QEMU = "no GPU here").
+# agnos 1.55.31. SAFETY: 87 is unlink(path) on Linux — it DELETES A FILE. Reachable ONLY on
+# agnos via the file-level peer gate. CHANGELOG [6.4.71].
+fn sys_gpu_blit_shm(id, wh, dstxy): i64 { return syscall(SYS_GPU_BLIT_SHM, id, wh, dstxy); }
+
+# gpu_fill_rect(color, wh, dstxy) — GPU-clear a RECTANGLE of the blit back buffer to a
+# 32-bit xRGB8888 colour (h × gpu_cp_dma_fill of w*4 bytes per row). The rect form of
+# #85, which only fills the whole buffer; this is the primitive compositor chrome needs
+# (window body, titlebar, focus accent, buttons — ~10x per window per frame). Packing
+# matches #87: wh = (h<<16)|w, dstxy = (dy<<16)|dx. Rejects rather than clips.
+# Returns 0 / -1 (-1 under QEMU = "no GPU here"). agnos 1.55.32.
+# SAFETY: 88 is symlink(target,link) on Linux — and arg1 is a 32-bit COLOUR that can decode
+# to a mapped address (0x00FF0000 = 16 MB), so the string read is not guaranteed to fault.
+# Reachable ONLY on agnos via the file-level peer gate. CHANGELOG [6.4.71].
+fn sys_gpu_fill_rect(color, wh, dstxy): i64 { return syscall(SYS_GPU_FILL_RECT, color, wh, dstxy); }
+
+# gpu_caps(buf, len) — report back-buffer geometry/capabilities into the caller's buffer.
+# Ring 3 otherwise cannot learn the true back-buffer width/height, and #87/#88 REJECT
+# off-screen rects, so a compositor must call this to clip correctly (the only prior probe
+# was "call #86 and look for -1"). ⚠ It ARMS THE DOUBLE-BUFFER LAZILY — it must: a cold
+# probe would otherwise report width=0/height=0 and, since #87/#88 reject rather than clip,
+# every later blit would fail (caught on iron before any compositor consumed it).
+# Returns 0 / -1 (-1 under QEMU = "no GPU here"). agnos 1.55.32.
+# SAFETY: 89 is readlink(path,buf,sz) on Linux — the kernel WRITES into arg2 for arg3 bytes,
+# a wild process-memory write if rsi ever holds a mapped address. Reachable ONLY on agnos via
+# the file-level peer gate. CHANGELOG [6.4.71].
+fn sys_gpu_caps(buf, len): i64 { return syscall(SYS_GPU_CAPS, buf, len); }
 
 # ---- agnos HDA audio band (#64-69) — the ring-3 half of the agnos 1.52.x Gate-2
 # freeze (kernel handlers land in parallel). Single frozen format: 48000 Hz / S16 /

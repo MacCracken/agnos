@@ -16,6 +16,15 @@ Mirror: `cyrius/docs/development/issues/2026-07-22-agnos-gpu-display-syscall-ban
   work, positioning the window from the geometry #89 itself reported. ⚠ Note for the docstring: **#89 arms the
   double-buffer lazily** — it must, because a cold probe otherwise reports width=0/height=0 and, since #87/#88
   reject rather than clip, every later blit fails (caught on iron before any compositor consumed it).
+- **Tier 1c — `#92 gpu_blend_shm` NOW SHIPPED + IRON-PROVEN (agnos 1.56.2, 2026-07-22).** **Wrapper wanted
+  now, with #86/#87/#88/#89.** The ALPHA peer of #87: same packing, same reject-don't-clip discipline, but
+  composited through the SHADER CORES with per-pixel src-over instead of CP-DMA, which has no ALU and can
+  therefore only ever do opaque. `/bin/gpublend` → `run: exit 95` on archaemenid: three 50%-alpha squares
+  straddling an opaque band, each rendering two different colours from the same source pixels.
+  ⚠ **Docstring MUST state that the source is PREMULTIPLIED** (`c <= a`). The shader computes
+  `src + dst*(1 - src_a/255)` with no per-pixel divide, which is only correct for premultiplied input;
+  straight-alpha input produces washed-out edges **silently**, never an error. This is the single most
+  likely way a caller misuses the syscall.
 - **Tier 2 — SHAPE DECLARED, agnos implements first:** `#90 gpu_readback_shm`, `#91 gpu_blit_bb`. Listed so
   the numbers stay contiguous and reserved, and so the wrapper work can be planned once. **Do not wrap these
   until agnos ships each** — documented to prevent number drift, not to be implemented ahead of the kernel.
@@ -35,6 +44,7 @@ garbage the arguments decode to.
 | 88 | `gpu_fill_rect` | `symlink(target,link)` | no | ⚠ arg1 is a 32-bit **colour** (e.g. `0x00FF0000` = 16 MB) which **can decode to a mapped address** — the string read is not guaranteed to fault |
 | 89 | `gpu_caps` | `readlink(path,buf,sz)` | no (to FS) | ⚠ the kernel **WRITES** into arg2 for arg3 bytes — a wild process-memory write if rsi ever holds a mapped address |
 | 90 | `gpu_readback_shm` | **`chmod(path,mode)`** | **YES** | **Materially the worst number in the band**: a packed geometry word reinterpreted as a mode can set **setuid**. Mitigating: arg1 is a 1..16 id ⇒ near-null path ⇒ EFAULT overwhelmingly likely |
+| 92 | `gpu_blend_shm` | **`chown(path,uid,gid)`** | **YES** | arg1 is a 1..16 slot id ⇒ near-null path ⇒ EFAULT overwhelmingly likely, but the call itself changes file OWNERSHIP if it ever resolves |
 | 91 | `gpu_blit_bb` | **`fchmod(fd,mode)`** | **YES** | **The one row where the Linux call would plausibly SUCCEED**: arg1 is a packed `srcxy`, and `(0,0)` packs to `0` = **stdin** — small coordinates are all valid fd numbers |
 
 ### This hazard is not hypothetical — it is live in the tree
@@ -65,6 +75,20 @@ comfort when `SYS_OPEN=7` is Linux `lseek` — applies with more force here, giv
 
 ---
 
+## ⚠ Return-convention wart in this band — please encode it, do not paper over it
+
+**`#84 gpu_present` returns `1 = presented / 0 = nothing to present`. Every other GPU syscall in the band
+(`#85`-`#89`, `#92`) returns `0 = ok / -1 = fail`.** This cost a burn on 2026-07-22: `/bin/gpublend`
+checked the present as `!= 0` and exited 91 having already composited all three blends and flipped the
+frame — a false failure on a fully working path.
+
+The agnos side is **not** changing: `gpublit` and `gpufill` already depend on the existing convention, and
+redefining a shipped ABI to match one caller's mistake is worse than documenting it. The ask is that
+`sys_gpu_present`'s docstring say so explicitly. A wrapper that silently normalises it to 0-ok would be the
+worst of both worlds — it would diverge from the kernel's own documented contract while looking consistent.
+
+---
+
 ## Tier 1 — exists in agnos 1.55.31, wrappers wanted now
 
 ### `#86 shm_create_gpu(size) -> id (>=1) / -1`
@@ -90,10 +114,12 @@ GPU-visible memory. Packing matches `blit`#39: `wh = (h<<16)|w`, `dstxy = (dy<<1
 ```cyrius
 SYS_SHM_CREATE_GPU = 86;   # shm_create_gpu(size) → id/-1; GPU-visible shm page (LINK on Linux)
 SYS_GPU_BLIT_SHM   = 87;   # gpu_blit_shm(id,wh,dstxy) → 0/-1; GPU composite (UNLINK on Linux — DELETES)
+SYS_GPU_BLEND_SHM  = 92;   # gpu_blend_shm(id,wh,dstxy) → 0/-1; ALPHA composite, src PREMULTIPLIED (CHOWN on Linux)
 ```
 ```cyrius
 fn sys_shm_create_gpu(size): i64          { return syscall(SYS_SHM_CREATE_GPU, size); }
 fn sys_gpu_blit_shm(id, wh, dstxy): i64   { return syscall(SYS_GPU_BLIT_SHM, id, wh, dstxy); }
+fn sys_gpu_blend_shm(id, wh, dstxy): i64  { return syscall(SYS_GPU_BLEND_SHM, id, wh, dstxy); }
 ```
 
 ---

@@ -1,0 +1,102 @@
+# gpublend — agnos ring-3 ALPHA COMPOSITING proof (shader arc 1.56.x).
+#
+# The alpha peer of gpublit. Where that program proved the OPAQUE compositor frame over CP-DMA, this proves
+# the one thing CP-DMA structurally cannot do: per-pixel blending. CP-DMA is a byte mover with no ALU, so
+# translucency has to run on the shader cores — syscall #92 gpu_blend_shm.
+#
+#   #89 gpu_caps        — probe the true back-buffer geometry (#92 REJECTS off-screen rects, like #87)
+#   #85 gpu_fill        — desktop background
+#   #88 gpu_fill_rect   — an OPAQUE band across the middle: the thing you must be able to SEE THROUGH
+#   #86 shm_create_gpu  — a client surface in the GPU carveout
+#   #72 shm_write       — fill it with a PREMULTIPLIED translucent colour
+#   #92 gpu_blend_shm   — composite it with real per-pixel alpha  ← the new call
+#   #84 present         — one flip for the whole frame
+#
+# VISUAL oracle, and it is not fakeable by an opaque path: three 50%-alpha squares STRADDLE the edge of the
+# opaque band, so each square shows the band through its top half and the dark background through its
+# bottom half — one square, two different results, decided per pixel. They also OVERLAP each other, and
+# where two overlap the colour compounds a second time. An opaque blit (#87) would paint three flat squares
+# with hard edges and no band showing through; there is no way to mistake one for the other.
+#
+# The surface is 96 px wide ON PURPOSE. 96 is not a multiple of 64, so the second column group of every row
+# is half masked — this exercises the shader's EXEC bounds guard through the SYSCALL path, not just the
+# in-kernel self-test.
+#
+# EXIT oracle: 95 = all pass
+#              96 = gpu_caps failed
+#              100 no-GPU · 101 no-carveout · 102 bad-width · 103 bad-height · 104 no-free-slot · 105 not-armed
+#              90 = fill · 98 = fill_rect · 92 = shm_create_gpu (-1 ⇒ no carveout, e.g. QEMU)
+#              93 = shm_write · 94 = gpu_blend_shm FAILED  ← the one that matters · 91 = present
+
+var gp_pix[4608];                  # module-global ⇒ N x u64 = 36864 B = 96*96*4
+
+fn gpublend_hold(ms): i64 {
+    var t0 = sys_uptime_ms();
+    var t = t0;
+    var spins = 0;
+    while (t - t0 < ms) {
+        if (spins >= 4000000) { return 0; }
+        sys_sched_yield();
+        t = sys_uptime_ms();
+        spins = spins + 1;
+    }
+    return 0;
+}
+
+# Fill the shared surface with a PREMULTIPLIED translucent colour and composite it at (x,y).
+# Premultiplied means each channel is already scaled by alpha (c <= a) — #92 requires it, because the
+# shader computes src + dst*(1 - a/255) with no per-pixel divide. Passing straight alpha would not error;
+# it would just look washed out, which is why the multiply happens here explicitly.
+fn gp_square(id, r, g, b, a, x, y): i64 {
+    var pr = (r * a) / 255;
+    var pg = (g * a) / 255;
+    var pb = (b * a) / 255;
+    var px = (a * 16777216) + (pr * 65536) + (pg * 256) + pb;
+    var i = 0;
+    while (i < 96 * 96) { store32(&gp_pix + i * 4, px); i = i + 1; }
+    if (syscall(72, id, &gp_pix, 96 * 96 * 4) != 0) { return 93; }
+    if (syscall(92, id, (96 * 65536) + 96, (y * 65536) + x) != 0) { return 94; }
+    return 0;
+}
+
+fn gpublend_main(): i64 {
+    var caps[32];                                  # function-local ⇒ N BYTES
+    if (syscall(89, &caps, 32) != 0) { return 96; }
+    var flags = load32(&caps + 0)  & 0xFFFFFFFF;
+    var bbw   = load32(&caps + 8)  & 0xFFFFFFFF;
+    var bbh   = load32(&caps + 12) & 0xFFFFFFFF;
+    var freeslots = load32(&caps + 20) & 0xFFFFFFFF;
+    if ((flags & 1) == 0) { return 100; }
+    if ((flags & 4) == 0) { return 101; }
+    if (bbw < 320) { return 102; }
+    if (bbh < 320) { return 103; }
+    if (freeslots < 1) { return 104; }
+    if ((flags & 2) == 0) { return 105; }
+
+    # Dark desktop, then an OPAQUE bright band. The band is the control: anything that shows through it
+    # was blended, and anything that hides it was not.
+    if (sys_gpu_fill(0x00101830) != 0) { return 90; }
+    var band_y = bbh / 4;
+    if (syscall(88, 0x00E0E0E0, (120 * 65536) + (bbw - 80), (band_y * 65536) + 40) != 0) { return 98; }
+
+    var id = syscall(86, 96 * 96 * 4);
+    if (id < 1) { return 92; }
+
+    # Three 50%-alpha squares, each straddling the band's TOP edge (so every square shows band above and
+    # background below), and each overlapping its neighbour by 32 px (so the overlaps compound).
+    var sy = band_y - 48;
+    var sx = 80;
+    var rc = gp_square(id, 255, 0, 0, 128, sx, sy);              if (rc != 0) { return rc; }
+    var gc = gp_square(id, 0, 255, 0, 128, sx + 64, sy);         if (gc != 0) { return gc; }
+    var bc = gp_square(id, 0, 0, 255, 128, sx + 128, sy);        if (bc != 0) { return bc; }
+
+    # ⚠ #84 returns 1 = presented / 0 = nothing to present — the ONE syscall in this band that does not use
+    # 0-ok/-1-fail. Checking `!= 0` here treated success as failure and cost a burn (exit 91 with all three
+    # blends already landed). Matches gpufill.cyr:45 and gpublit.cyr:77.
+    if (sys_gpu_present() != 1) { return 91; }
+    gpublend_hold(4000);
+    return 95;
+}
+
+fn _entry(): i64 { var r = gpublend_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

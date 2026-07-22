@@ -5,6 +5,64 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.56.2] — 2026-07-22 — translucency reaches ring 3 (#92) + arbitrary rect width
+
+### Added — S6: arbitrary rect width (the EXEC bounds guard)
+
+**✅ IRON-PROVEN (archaemenid, 2026-07-22):** `gpu: shader blend width guard ok (200 px, 56 px tail
+untouched)`, visually confirmed as a hard vertical edge with saturated green surviving to its right.
+
+`blend_rect` previously required width to be a multiple of 64 and had no bounds check — unusable by a real
+compositor, where windows are arbitrary widths. Surplus lanes in the trailing workgroup now mask off with
+`s_and_saveexec_b64`. The mask is placed **before the loads, not around the store**: a masked-off lane must
+not load either, since a read past the rect edge on the last row of the surface could run past the end of
+the mapped back buffer, which faults rather than merely wasting a fetch.
+
+The test makes two separate claims and only one can catch a broken mask — that the 200 blended px are
+bit-exact (the guard did not corrupt the lanes it kept), and that x = 200..255 still hold untouched
+underlay (it stopped the ones it dropped). The underlay is painted 256 px wide but only 200 blended, so
+that tail is a deliberate control strip; a guard that never masked anything passes the first check and
+fails the second.
+
+- `gx` is now `ceil(width/64)`, computed once in the runner — `floor` would silently drop the rect's right
+  edge rather than fail.
+- Adding `width` as a kernarg pushed `USER_SGPR` to 7, **shifting `tgid_x`/`tgid_y` from `s6`/`s7` to
+  `s7`/`s8`** — the same class of bug that bit the first grid revision. Safe because `RSRC2` is re-harvested
+  from llvm-mc (`0x18E`), so the hardware's view updates automatically.
+
+### Added — `#92 gpu_blend_shm`: translucency reaches ring 3
+
+**✅ IRON-PROVEN (archaemenid, 2026-07-22): `run /bin/gpublend` → `run: exit 95`.** Three 50%-alpha squares
+straddling an opaque white band, each rendering **two different colours from the same source pixels** —
+saturated where it overlies the dark background, pale where it overlies the band — with the overlap columns
+compounding a second time. That is the observation an opaque path cannot produce: the result is decided
+per pixel by what is underneath. Full chain: `#89` → `#85` → `#88` → `#86` → `#72` → **`#92` ×3** → `#84`,
+with zero per-pixel CPU work anywhere in the frame.
+
+The **alpha peer of `gpu_blit_shm`#87**, and the syscall the desktop arc has been waiting on. #87 composites
+with CP-DMA, which has no ALU and can therefore only ever do opaque; #92 runs the same composite through the
+shader cores with per-pixel src-over. Identical packing and identical reject-don't-clip bounds discipline,
+so a compositor swaps one call for the other.
+
+- ⚠ **The source must be PREMULTIPLIED** (`c <= a`). Not a preference: the shader computes
+  `out = src + dst*(1 - src_a/255)` with no per-pixel divide, which is only correct for premultiplied input.
+  Straight-alpha input produces washed-out edges **silently** rather than an error — stated in the handler
+  and required in the cyrius wrapper docstring.
+- `gpu_blend_arm()` uploads the kernel lazily into **its own arena slot**, separate from the boot
+  self-tests', so #92 works in a kernel built without `SHADER_RECT` and no runtime path depends on
+  boot-time ordering.
+- ⚠ **`#84 gpu_present` is the odd one out in this band**: it returns `1 = presented / 0 = nothing to
+  present`, where `#85`-`#89` and `#92` all use `0 = ok / -1 = fail`. Checking it as `!= 0` cost a burn
+  (`exit 91` with all three blends already composited and the flip already done). The convention is NOT
+  being changed — `gpublit` and `gpufill` already depend on it, and silently redefining a shipped ABI to
+  match a caller's mistake is the worse fix — but it must be stated in the cyrius wrapper docstring.
+- `/bin/gpublend` — the ring-3 proof. Three 50%-alpha squares straddle the edge of an **opaque** band, so
+  each shows the band through its top half and the background through its bottom half (one square, two
+  results, decided per pixel) and the squares overlap each other so the overlaps compound. An opaque blit
+  would paint three flat squares with hard edges and no band showing through — the two outcomes cannot be
+  confused. Its surface is **96 px wide on purpose**: not a multiple of 64, so it exercises the EXEC guard
+  through the syscall path rather than only the in-kernel self-test.
+
 ## [1.56.1] — 2026-07-22 — the first alpha blend on the shader cores (+ shaders stop being hand-typed)
 
 **AGNOS now composites alpha on the GPU.** Per-pixel premultiplied src-over runs on the compute units,
@@ -63,7 +121,14 @@ accident.
   not `STATUS` → `0x127F`) but *mostly the gate itself was wrong* — `bot_sel == self` means nothing when
   there is no layer below, `0xF` is a Linux init sentinel rather than a fault, and Renoir has 4 OPPs.
 
-### Added — S3: grid blend into the scanout back buffer (BUILT, NOT YET IRON-PROVEN)
+### Added — S3: grid blend into the scanout back buffer
+
+**✅ IRON-PROVEN (archaemenid, 2026-07-22):** `gpu: shader rect blend online (256x64 grid, bit-correct,
+presented)` — all 16,384 pixels bit-exact, **and visually confirmed on the panel**: green left / red right,
+saturated at the top where alpha is 0, washing pale at the bottom where alpha reaches 252. The photo is an
+independent check on both pitches and on the grid itself — a wrong `src_pitch` would repeat or skew rows, a
+wrong `dst_pitch` would break the vertical seam, and a `tgid` that never arrived would have blended row 0
+sixty-four times over, showing flat colour instead of a gradient.
 
 - **`kernel/shaders/blend_rect.s` + `gpu_blend_rect_run`** — the same blend arithmetic byte-for-byte, over a
   **2-D grid of 256 workgroups / 16,384 threads**, written in place on the back buffer and presented. Every
