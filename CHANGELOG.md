@@ -14,7 +14,27 @@ hardware-accelerated 2D on sovereign agnos, with no SDMA, no doorbell, and no ne
 SDMA ring-up groundwork from 1.55.29 — but when SDMA wouldn't fetch, the copy pivoted onto the CP ring that
 the compute thrust already proved.
 
-### Added
+### Added — the 2D primitives (both iron-verified)
+
+- **`gpu_cp_dma(dst_mc, src_mc, bytes)` — hardware COPY.** `gpu: CP-DMA hardware copy verified (4KB, dst==src)`.
+- **`gpu_cp_dma_fill(dst_mc, val, bytes)` — hardware FILL** (`DMA_DATA` constant-fill: `SRC_SEL=2 DATA`, CONTROL
+  `0xC0000000`, the 32-bit value in dw2, dw3=0 — anchored against kernel `soc15d.h` + mesa `sid.h`/`si_cp_dma.c`).
+  `gpu: CP-DMA hardware fill verified (4KB, all=pattern)`, green first try. No source read; the natural
+  framebuffer-clear primitive.
+- Both are thin wrappers over a shared `gpu_cpdma_submit(ctl, slo, shi, dst_mc, bytes)`.
+- **`gpu_cp_dma_blit(dst_mc, dst_stride, src_mc, src_stride, row_bytes, rows)`** — strided per-row rect blit
+  (one CP-DMA per row); the compositor substrate for window moves and scrolling.
+
+### Added — userland seam
+
+- **Syscall #85 `gpu_fill(color)`** → `gpu_fill_sys`: GPU-clears the current blit back-buffer to an xRGB8888
+  color via CP-DMA (replacing a CPU store-loop), pairing with `present`#84. Arms the double-buffer lazily and
+  targets `gpu_bb_{a,b}_mc` over `gpu_bb_fbsize`. **Ring-3 names only the color** — the framebuffer stays
+  unmapped and no MC address crosses the boundary (same discipline as `blit`#39). Userland wrappers
+  `sys_gpu_fill` / `sys_gpu_present` + enum constants + the canonical ABI-doc row. Build-verified; the
+  end-to-end ring-3 path awaits a userland consumer.
+
+### Added — the original copy self-test
 
 - `gpu_cp_dma_copy()` (`gpu.cyr`, gated `CP_DMA_COPY`): appends a 7-dword `DMA_DATA` (op 0x50; `CP_SYNC=1`,
   `SRC/DST_SEL=0` MC-direct so the copy bypasses GL2 and is CPU-visible with **no `ACQUIRE_MEM`**, `ENGINE=ME`,

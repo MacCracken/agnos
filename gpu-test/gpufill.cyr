@@ -1,0 +1,44 @@
+# gpufill — agnos ring-3 CP-DMA FILL proof (P9 / #13).
+#
+# Proves syscall #85 gpu_fill(color) end to end FROM RING 3: the kernel GPU-clears the blit back
+# buffer with a PM4 DMA_DATA constant-fill on the compute ring (no CPU store-loop), then present#84
+# flips it to the scanout. Cycles red -> green -> blue, giving TWO independent oracles:
+#   * VISUAL  — the screen really changes colour, so the scanout is showing GPU-filled pixels.
+#   * EXIT CODE — klug-capturable (`run: exit 95`), the same idiom blkprobe uses.
+#
+# Exit codes: 95 = ALL PASS (three fills filled + presented)
+#             90 = fill REJECTED (#85 returned -1: no usable display — e.g. QEMU, or no pipe)
+#             91 = fill OK but present returned 0 (double-buffer not armed / direct-FB path)
+#
+# Raw syscall numbers for #84/#85: their canonical ring-3 wrappers live in the CYRIUS stdlib, which is
+# hands-off here, so this calls the syscall intrinsic directly — identical ABI (rax=num, rdi=a1); the
+# sys_* wrappers are only sugar. sys_uptime_ms (#40) comes from the stdlib syscalls dep as usual.
+
+# Busy-hold on the monotonic ms clock so each colour stays on screen long enough to see.
+fn gpufill_hold(ms): i64 {
+    var t0 = sys_uptime_ms();
+    var t = t0;
+    while (t - t0 < ms) { t = sys_uptime_ms(); }
+    return 0;
+}
+
+# One cycle: GPU-clear the back buffer to `color` via CP-DMA, flip it to the scanout, hold it.
+fn gpufill_show(color, ms): i64 {
+    if (syscall(85, color) != 0) { return 90; }    # gpu_fill(color) -> 0 ok / -1
+    if (syscall(84) != 1) { return 91; }           # present() -> 1 presented / 0 nothing
+    gpufill_hold(ms);
+    return 0;
+}
+
+fn gpufill_main(): i64 {
+    var e = gpufill_show(0x00FF0000, 1200);        # red   (xRGB8888)
+    if (e != 0) { return e; }
+    e = gpufill_show(0x0000FF00, 1200);            # green
+    if (e != 0) { return e; }
+    e = gpufill_show(0x000000FF, 1200);            # blue
+    if (e != 0) { return e; }
+    return 95;                                     # ALL PASS — ring-3 CP-DMA fill works end to end
+}
+
+fn _entry(): i64 { var r = gpufill_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
