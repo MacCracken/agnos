@@ -87,6 +87,32 @@ if [ -n "${BURN_SHADER_OPS:-}" ]; then
     echo "[2/2] Building the 1.56.4 SHADER-OPS kernel (#92 descriptor seam + cov re-proof + glyph/grad first iron; run /bin/gpublend + /bin/gpucov; capture klug > shader_ops.txt)."
     BUILD_ENV="SHADER_BLEND=1 SHADER_COV=1 SHADER_GLYPH=1 SHADER_GRAD=1"
     BUILD_TAG="SHADER_OPS"
+elif [ -n "${BURN_DCN_DLANE:-}" ]; then
+    # 1.56.x D LANE — D1 (HUBPRET channel crossbar) + D2 (MPCC0 global alpha). Independent of the S lane.
+    #
+    # ⚠⚠ THE ONLY ARM IN THIS ARC THAT WRITES THE LIVE CONSOLE PIPE. The arc has paid for a careless DCN
+    # write once: SCANOUT_LINEAR wrote the wrong register under the OTG lock and BLACKED the box on iron.
+    # Both bites here save the GOP's value first, hold the applied state for ~3 s paced by the OTG frame
+    # counter, then restore UNCONDITIONALLY — the restore is not gated on the apply, on a readback, or on an
+    # ack, because a boot selftest has no operator input and anything conditional could leave the console
+    # wedged with no keyboard to recover it. Each then checks the readback matches AND that OPTC underflow
+    # did not change (an underflow means the pipe missed a fetch deadline — that is how a "successful" poke
+    # corrupts scanout without blanking it).
+    #
+    # WATCH, in order:
+    #   'gpu: d1 crossbar applied ... (reds and blues swap NOW)'  -> ~3 s of the console with R and B
+    #      exchanged. ⚠ GREEN AND ALPHA MUST NOT MOVE — if green also shifts, the field placement is wrong.
+    #   'gpu: d1 hubp crossbar online (whole-scanout R/B swap, restored)'
+    #   ~5 alpha steps of the whole screen fading toward the MPCC background, then snapping back
+    #   'gpu: d2 mpcc global alpha online (agnos owns the blender, restored)'
+    #
+    # A 'RESTORE FAILED' or 'UNDERFLOW changed' line means STOP and power-cycle rather than continuing.
+    # D2 uses ALPHA_BLND_MODE 2 (GLOBAL_ALPHA) ONLY: mode 0 (PER_PIXEL) on the GOP's XRGB surface, where the
+    # X byte is 0x00, reads every pixel as transparent and turns the screen BLACK.
+    # PHOTO IS THE ORACLE for both. CAPTURE: klug > dcn_dlane.txt + two photos (D1 swapped, D2 mid-fade).
+    echo "[2/2] Building the 1.56.x D-LANE kernel (D1 crossbar + D2 global alpha, LIVE PIPE WRITES with dead-man restore; capture klug > dcn_dlane.txt + 2 photos)."
+    BUILD_ENV="DCN_DLANE=1"
+    BUILD_TAG="DCN_DLANE"
 elif [ -n "${BURN_SHADER_BATCH:-}" ]; then
     # plan-S12 — the ONE-SUBMISSION batched frame. The arc's stated CLOSING CONDITION, and the payoff
     # decision D-3 was made for: because #92 was specified as an ARRAY of ops from day one, batching is an

@@ -389,6 +389,10 @@ else
         # against the same frame composited op-by-op. Needs no other shader flag: it drives the RUNTIME
         # arms (gpu_*_arm), not the boot selftests.
         [ -n "$SHADER_BATCH" ]       && echo '#define SHADER_BATCH'
+        # DCN_DLANE=1 — 1.56.x D1+D2: the two DCN one-register levers (HUBPRET channel crossbar, MPCC
+        # global alpha). ⚠ BOTH WRITE THE LIVE CONSOLE PIPE, each with an unconditional dead-man restore
+        # and an underflow check. Independent of every SHADER_* flag — these are display-side, not compute.
+        [ -n "$DCN_DLANE" ]          && echo '#define DCN_DLANE'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

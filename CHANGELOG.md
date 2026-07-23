@@ -5,9 +5,151 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — the D lane wrote SHADOW registers and never committed (burn 1, 2026-07-22)
+
+Both bites read back exactly what they wrote and **nothing appeared on the panel**:
+
+```
+gpu: d1 hubpret0 saved 14942208 underflow 1        (0x00E40000 — crossbar identity 0,1,2,3)
+gpu: d1 crossbar applied 11796480                  (0x00B40000 — B and R selectors exchanged: correct)
+gpu: d2 mpcc0 control saved 4294902881 blnd mode 2 (0xFFFF0A61 — already mode 2, global alpha 255)
+gpu: d2 swept 5 alpha steps, applied 4282319969    (0xFF3F0A61 — alpha down to 63: correct)
+```
+
+The register values are right. The writes went to the **shadow** copy and never reached the active set.
+
+**DCN registers are VUPDATE double-buffered.** A bare write lands in shadow; the pipe keeps scanning with
+the previously-latched active values until a VUPDATE event swaps them — and the readback returns the
+*shadow*, so a write looks perfectly applied while changing nothing on screen. That is the whole failure.
+
+⚠ **This was already written down in two places.** `gpu_regs.cyr:192` says these registers "do NOT latch on
+a bare address flip; they latch under this lock", and the plan's D2 row specifies the write happen "under
+the OTG master update lock **agnos already drives**". The full sequence even existed in the tree, inside the
+retired `gpu_scanout_clear_tiling_dead`. The first version of these bites simply did not use it — the same
+class of miss as the 1.56.2/1.56.3 D-3 deviation, on a smaller scale.
+
+The commit sequence, now extracted into `gpu_otg_lock` / `gpu_otg_commit_unlock` /
+`gpu_dcn_write_committed` (from amdgpu `optc1_lock`/`unlock`):
+
+1. point `OTG_GLOBAL_CONTROL0`'s lock-select at the pipe, take `OTG_MASTER_UPDATE_LOCK`, poll the ack
+2. write the target register (lands in shadow)
+3. **re-arm the surface address, HIGH then LOW — the LOW write is the flip trigger.** Without it there is no
+   VUPDATE and nothing commits. *This is the step burn 1 was missing.*
+4. release the lock; the change latches atomically at the next VUPDATE
+
+⚠ The re-arm reads the **currently programmed** address rather than a remembered one: during a boot
+self-test the console owns scanout, but a present may have swapped to a back buffer, and re-arming a stale
+base would flip the display to the wrong buffer as a side effect of a register poke that has nothing to do
+with scanout addressing. Both polls stay bounded, and the unlock runs on every exit path — a held lock
+freezes the pipe on its last frame.
+
+### Fixed — the D-lane underflow check could never fire
+
+`OPTC_UNDERFLOW_OCCURRED_STATUS` is a **sticky** bit, and burn 1 read it as **1 before either bite ran**. The
+gate compared before-vs-after, so it was structurally incapable of detecting a new underflow — it passed by
+construction. It now reports both values, fails only on a genuine `0 → 1` transition, and prints
+"check degraded" when the bit was already latched rather than claiming a pass it did not earn.
+
+⚠ Worth noting on its own: **a latched underflow at boot** is a real observation about this pipe, and the
+1.55.x quiet-boot scanout banding lived on exactly this pipe. Recorded rather than dismissed.
+
+### Added — the D lane: D1 (HUBP channel crossbar) + D2 (MPCC global alpha) — BUILT, burn-ready
+
+The last two bites in the 1.56.x ladder, and **the only ones in the whole arc that write the live console
+pipe**. The arc has already paid for a careless DCN write once — `SCANOUT_LINEAR` (v3) wrote the wrong
+register under the OTG lock and **blacked the box on iron**; it is a hard no-op now and its flag must never
+be built again.
+
+Both bites obey the same three rules, and they are structural rather than stylistic:
+
+1. **Read and save first.** The value restored is the one the GOP actually left, never a reconstructed
+   "default" — this pipe was initialised by firmware agnos did not write and cannot re-derive.
+2. **Dead-man restore.** The restore is **unconditional** — not gated on the apply having worked, not on a
+   readback, not on an ack. A boot self-test has no operator input, so anything conditional is a way to
+   leave the console wedged with no keyboard to recover it.
+3. **Verify after.** Readback must equal the saved value, **and** OPTC underflow must not have changed. An
+   underflow means the pipe missed its fetch deadline — that is how a "successful" register poke corrupts
+   scanout without blanking it, and it would otherwise pass unnoticed.
+
+Both are anchored on **D0**, which read every one of these offsets and got 5-of-5 constraints agreeing
+([[reference_agnos_dcn_hubp_reg_offsets_derived]] — anchor reads, never trust a derived write).
+
+**D1 — the crossbar.** amdgpu implements ABGR8888 as exactly ARGB8888 with the red and blue crossbar bars
+swapped; the pixel-format value never changes. So a whole-scanout RGBX↔BGRX swap is two fields in one
+register — no second plane, no DLG/TTU deadline work, no bandwidth change. `CROSSBAR_SRC_CB_B` [21:20] and
+`CROSSBAR_SRC_CR_R` [23:22] are exchanged; **alpha [17:16] and Y_G [19:18] are left exactly as found**, and
+a photo where green also shifts means the field placement is wrong.
+
+⚠ **This is not the same capability as plan-S4's `v_perm_b32` swap, and that is why both exist.** The
+crossbar is a property of the **whole scanout** — it cannot swap one composited client surface and leave its
+neighbours alone. S4's shader swap is per-surface at one VALU op. A compositor needs S4; a wrong-endian
+framebuffer format needs this. Neither substitutes for the other.
+
+**D2 — global alpha, and it is an ORACLE rather than a desktop feature.** One reversible write proves the
+MPC base, the offsets, the field placement, the latching and the OTG lock semantics *simultaneously*, with
+zero new pipes, zero new clocks, zero extra bandwidth and one-register reversibility. That is a lot of
+independent facts for a burn that risks almost nothing.
+
+⚠ **`ALPHA_BLND_MODE` = 2 (GLOBAL_ALPHA) only, and this is a hard constraint.** Mode 0 (PER_PIXEL) on the
+GOP's XRGB surface — where the X byte is `0x00` — reads every pixel as fully transparent and makes the
+screen **black**. Mode 2 ignores pixel alpha by definition, which is exactly why it is the only mode this
+bite may use.
+
+⚠ Per decision **D-4** this stays a pure oracle unless the MUDRA/SHANTA designs call for one or two large
+always-on translucent panels. They almost certainly do not: aethersafha is a multi-window compositor and
+Renoir/Cezanne exposes only **four** blendable planes total, so per-window translucency cannot ride this
+path at all — it rides the S4/S7 shader. Operator ratification of D-4 changes the framing, not the code.
+
+`BURN_DCN_DLANE`, `cmp`-verified live. The photo is the oracle for both.
+
+### Changed — the cyrius syscall-band ticket, updated for 1.56.5 (shape unchanged)
+
+`docs/development/issues/2026-07-22-gpu-display-syscall-band-cyrius-wrappers.md`. **No wrapper rework** —
+`sys_gpu_shader_op(desc, len)` is still exactly right — but two semantics were added that a caller cannot
+recover correctly without:
+
+- **`#92` is now one GPU submission for the whole array** (plan-S12, iron-proven).
+- **New reason code `15 = E_BATCH`**, call-level: one submission has one marker, so a timed-out batch
+  **cannot say which op hung**. `idx` is 0 and carries no meaning — deliberately distinct from
+  `8 = E_DISPATCH` rather than reporting a fabricated index.
+- **`gpu_caps#89` bit3/bit4 and the `+28` op-support mask** documented, with bit4 spelled out as a
+  **semantic** bit: clear ⇒ `E_DISPATCH` means ops `[0,idx)` composited; set ⇒ `E_BATCH` means an
+  indeterminate prefix landed and ring 3 recovers by re-clearing with `#85` and not calling `#84`.
+- The full reason-code table now ships in the wrapper docstring, including which codes carry a valid `idx`.
+
 ## [1.56.5] — 2026-07-22 — plan-S12: the arc's closing condition — one submission per frame
 
-### Added — plan-S12: multi-slot residency + the ONE-SUBMISSION batched frame (BUILT, burn-ready)
+### ✅ Added — plan-S12: multi-slot residency + the ONE-SUBMISSION batched frame — IRON-PROVEN
+
+**✅ IRON-PROVEN (archaemenid, 2026-07-22), first burn:**
+
+```
+gpu: batch frame seq 107 us  batched 60 us
+gpu: batched frame pixel-identical to op-by-op (6 ops, 1 submission)
+```
+
+**The gate holds: pixel-identical.** The batched frame is the same frame.
+
+**Measured 1.78x** (107 -> 60 us). The 47 us saved across five eliminated round-trips works out to
+**~9.4 us per round-trip** — the register submit plus completion spin that batching removes. Sequential
+lands at ~17.8 us/op, which independently confirms S12a's prediction of ~21 us after the poll tightening;
+before it, this same frame would have measured ~680 us sequential and the batch would have appeared ~10x
+better for nothing.
+
+**⚠ The residual is the finding, and it is bigger than the speedup.** These six ops move ~240 KB — roughly
+**8 us** of real memory traffic at ~30 GB/s. The batched frame still costs 60 us, so even batched this frame
+is **~87% fixed cost**. The fence was *a* wall and removing it helped, but it was not *the* wall. What
+remains is six whole-L2 invalidates and six `CS_PARTIAL_FLUSH`es, each stalling the CP on a coherency ack.
+
+That is exactly the lever this cut deliberately declined to pull: hoisting one invalidate to the head of an
+all-shader batch. The measurement now says it is worth pulling — and it is worth doing as its own bite with
+its own oracle, because D-6's invalidate is *evidenced* (plan-S3: 4096-of-4096 stale without it) and the
+C2g-1 precedent for removing an "obviously safe" cache op is eight burns. Note the argument differs by
+cache: the **GL2** half only bites when CP-DMA wrote a source, which cannot happen inside an all-shader
+batch, while the **I-cache** half is weakened by each kernel now having its own resident slot written once
+behind an arm latch. Neither is a licence to remove it without measuring.
+
+### Added — plan-S12: how it is built
 
 **The arc's stated closing condition.** The residency half already landed at 1.56.4 (the strided slot
 table that fixed the arena aliasing); this is the batching half.

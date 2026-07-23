@@ -1055,6 +1055,22 @@ gpu_shader_blend_pk_test();
 gpu_shader_batch_test();
 #endif
 
+# GPU arc 1.56.x D LANE — the two DCN one-register levers, independent of the S lane.
+# ⚠ BOTH WRITE THE LIVE CONSOLE PIPE. Each saves the GOP's value first, holds the applied state for a
+# photographable window paced by the OTG frame counter, then restores UNCONDITIONALLY — the restore is not
+# gated on the apply, on a readback, or on an ack, because there is no operator input during a boot selftest
+# and anything conditional is a way to leave the console wedged with no keyboard to recover it. Each then
+# verifies the readback matches the saved value AND that OPTC underflow did not change.
+# The arc has paid for a careless DCN write once already: SCANOUT_LINEAR wrote the wrong register under the
+# OTG lock and blacked the box on iron.
+# D1 = whole-scanout R/B crossbar (NOT plan-S4's per-surface swap — different capability, both needed).
+# D2 = MPCC global alpha, an ORACLE for base+offsets+field placement+latching, not a desktop feature.
+# Gated #ifdef DCN_DLANE; first iron burn: BURN_DCN_DLANE.
+#ifdef DCN_DLANE
+gpu_hubp_crossbar_test();
+gpu_mpc_galpha_test();
+#endif
+
 
 # GPU arc 1.55.x (Thrust P) P4: scanout-residue clear.
 # ⚠ SCANOUT_LINEAR (v3) is RETIRED — it wrote the WRONG register (0x607) under the OTG lock and BLACKED the

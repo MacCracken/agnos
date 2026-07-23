@@ -46,6 +46,28 @@ Mirror: `cyrius/docs/development/issues/2026-07-22-agnos-gpu-display-syscall-ban
   `E_NOGPU` at index 0 encodes as exactly `-1`, so existing `rc != 0` / `rc == -1` checks keep working.
 
   ⚠ **`#92`'s Linux-collision severity is RAISED by this reshape** — see the table below.
+
+  **UPDATE (agnos 1.56.5, 2026-07-22) — the shape is UNCHANGED; two semantics were added.** No wrapper
+  rework: `sys_gpu_shader_op(desc, len)` below is still exactly right. But the docstring should carry both
+  of these, because a caller that does not know them cannot recover correctly from a failure.
+
+  - **`#92` is now ONE GPU submission for the whole array** (plan-S12, iron-proven: a six-op frame went
+    107 µs → 60 µs and was pixel-identical to the same frame composited op-by-op). This is why the ABI was
+    specified as an array in the first place — batching landed as an implementation change, with no second
+    migration on the cyrius side.
+  - **New reason code `15 = E_BATCH`** — *call-level*. One submission means one completion marker, so a
+    batch that times out **cannot say which op hung**. `idx` is 0 and **carries no meaning** for this code;
+    it is deliberately distinct from `8 = E_DISPATCH` rather than reporting a fabricated index.
+  - **`gpu_caps#89` flags gained bit3 and bit4.** bit3 = shader compositing available. **bit4 = batched**,
+    and it is a **semantic** bit, not a performance hint:
+    - bit4 **clear** → `E_DISPATCH` means ops `[0,idx)` composited and `idx` failed.
+    - bit4 **set** → `E_BATCH` means an **indeterminate prefix** landed and no op is identifiable. Ring 3
+      recovers by re-clearing with `#85` and **not** calling `#84`.
+
+    A caller that ignores bit4 cannot know which recovery it owes.
+  - **`gpu_caps#89` `+28` is no longer reserved** — it is the **op-support mask**, where bit N set means op
+    code N is implemented by this kernel. That binding is why op codes are capped at `0x1F`. One read now
+    answers both "can I" and "which ops", instead of probing each op for `E_BADOP`.
 - **Tier 2 — SHAPE DECLARED, agnos implements first:** `#90 gpu_readback_shm`, `#91 gpu_blit_bb`. Listed so
   the numbers stay contiguous and reserved, and so the wrapper work can be planned once. **Do not wrap these
   until agnos ships each** — documented to prevent number drift, not to be implemented ahead of the kernel.
@@ -155,6 +177,12 @@ fn sys_gpu_blit_shm(id, wh, dstxy): i64   { return syscall(SYS_GPU_BLIT_SHM, id,
 # Sources must be PREMULTIPLIED (c <= a); straight alpha is silently washed out, never an error.
 # Returns 0, or a PACKED negative: e = 0 - rc; idx = e >> 8; reason = e & 0xFF.
 # DO NOT normalise the packed value to -1 — the index names which op failed, and that is the point.
+#
+# reason codes:  1 no-GPU (encodes as exactly -1, so old rc==-1 checks still work) · 2 bad-op ·
+#   3 bad-slot · 4 slot-too-small · 5 off-screen (rejects, never clips) · 6 bad-dim · 7 shader-not-resident ·
+#   8 dispatch-timeout (idx VALID) · 11 bad-descriptor · 12 reserved-field-nonzero · 13 envelope-unproven ·
+#   15 BATCH-timeout (idx is 0 and MEANINGLESS — one submission has one marker, so the failing op is not
+#      identifiable; see gpu_caps#89 bit4 for which recovery ring 3 owes).
 fn sys_gpu_shader_op(desc, len): i64 { return syscall(SYS_GPU_SHADER_OP, desc, len); }
 ```
 

@@ -75,6 +75,8 @@ var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot fo
 var gpu_perm_ok       = 0;   # plan-S4: 1 = v_perm_b32 byte crossbar + channel swap proven on iron
 var gpu_blend_pk_ok   = 0;   # plan-S4: 1 = VOP3P packed blend proven bit-identical to the f32 blend
 var gpu_batch_ok      = 0;   # plan-S12: 1 = a batched frame proven pixel-identical to op-by-op
+var gpu_d1_ok         = 0;   # D1: 1 = HUBPRET channel crossbar written + restored on the live pipe
+var gpu_d2_ok         = 0;   # D2: 1 = MPCC0 global alpha written + restored on the live pipe
 # plan-S3 coherence toggles. BOTH default to 1 and PRODUCTION NEVER CHANGES THEM — decision D-6 keeps the
 # pre-dispatch invalidate unconditional (it is load-bearing twice: stale I$ on a rewritten shader VA, and
 # stale GL2 lines when a shader reads bytes CP-DMA just wrote MC-direct). They exist so gpu_shader_cohere_test
@@ -4831,6 +4833,214 @@ fn gpu_display_probe() {
     gpu_display_ok = 0 - 1;
     kprintln("gpu: display pipe surface not matched", 37);
     return 0;
+}
+
+# ══ 1.56.x D lane — the two DCN one-register levers ═══════════════════════════════════════════════════
+#
+# ⚠ THESE ARE WRITES TO THE LIVE CONSOLE PIPE. That is the highest-risk thing in this arc, and the arc has
+# already paid for it once: SCANOUT_LINEAR (v3) wrote the WRONG register under the OTG lock and BLACKED the
+# box on iron. It is retired to a hard no-op and its flag must never be built again.
+#
+# Every bite here therefore obeys the same three rules:
+#   1. READ AND SAVE FIRST. The value restored is the one the GOP actually left, never a reconstructed
+#      "default" — this pipe was initialised by firmware agnos did not write and cannot re-derive.
+#   2. DEAD-MAN RESTORE. The restore is UNCONDITIONAL and not gated on the apply having worked, on a
+#      readback, or on an ack. There is no operator input during a boot selftest, so anything conditional
+#      is a way to leave the console wedged with no keyboard to recover it.
+#   3. VERIFY AFTER. Read the register back and compare against the saved value, and confirm OPTC underflow
+#      is still 0 — an underflow means the pipe missed its fetch deadline, which is how a "successful"
+#      register poke corrupts scanout without blanking it.
+#
+# Both are anchored on D0, which read every one of these offsets and got 5-of-5 constraints agreeing
+# ([[reference_agnos_dcn_hubp_reg_offsets_derived]]: anchor reads, never trust a derived write).
+
+# ⚠⚠ DCN REGISTERS ARE VUPDATE DOUBLE-BUFFERED. A bare write lands in the SHADOW copy; the pipe keeps
+# scanning with the previously-latched ACTIVE values until a VUPDATE event swaps them. The readback returns
+# the shadow, so a write can look perfectly applied and change nothing on screen — which is exactly what the
+# first D-lane burn produced (2026-07-22): D1 read back 0x00E40000 -> 0x00B40000 and D2 swept global alpha
+# 255 -> 63, both latched in shadow, and the panel never changed. gpu_regs.cyr:192 already said this; the
+# first version of these bites simply did not use the lock the plan's D2 row named explicitly.
+#
+# The commit sequence, lifted from the (retired) gpu_scanout_clear_tiling_dead and from amdgpu
+# optc1_lock/unlock:
+#   1. point OTG_GLOBAL_CONTROL0's lock-select at this pipe, take OTG_MASTER_UPDATE_LOCK, poll the ack
+#   2. write the target registers (they go to shadow)
+#   3. RE-ARM THE SURFACE ADDRESS, HIGH then LOW — the LOW write is the flip trigger, and without it there
+#      is no VUPDATE and nothing commits. This is the step the first burn was missing.
+#   4. release the lock; the whole change latches atomically at the next VUPDATE
+# ⚠ The unlock MUST run on every exit path or the pipe freezes on its last frame. Both polls are bounded.
+
+# gpu_otg_lock — take the master update lock for `pipe`. Bounded; proceeds on timeout exactly as amdgpu's
+# REG_WAIT does, because a stuck poll must never wedge boot.
+fn gpu_otg_lock(pipe) {
+    var o = pipe * GPU_DCN_OTG_STRIDE;
+    var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o,
+    (gc & (0 - 1 - GPU_OTG_LOCK_SEL_MASK)) | ((pipe << 25) & GPU_OTG_LOCK_SEL_MASK));
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_MASTER_UPDATE_LOCK + o, 0x1);
+    var spins = 0;
+    while (spins < 100000) {
+        if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_MASTER_UPDATE_LOCK + o) & GPU_OTG_UPDATE_LOCK_STATUS) != 0) {
+            spins = 100000;
+        }
+        else { spins = spins + 1; }
+    }
+    return 1;
+}
+
+# gpu_otg_commit_unlock — re-arm the LIVE surface address to trigger VUPDATE, release the lock, wait a frame.
+# ⚠ Re-arms whatever address is CURRENTLY programmed rather than a remembered one: during a boot self-test
+# the console owns scanout, but a present may have swapped to a back buffer, and re-arming a stale base
+# would flip the display to the wrong buffer as a side effect of a register poke that has nothing to do with
+# scanout addressing.
+fn gpu_otg_commit_unlock(pipe) {
+    var o = pipe * GPU_DCN_OTG_STRIDE;
+    var h = pipe * GPU_DCN_HUBP_STRIDE;
+    var lo = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR + h)    & 0xFFFFFFFF;
+    var hi = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + h) & 0xFFFF;
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR_HI + h, hi);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HUBP_SURF_ADDR + h, lo);   # LOW is the flip trigger
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_MASTER_UPDATE_LOCK + o, 0);   # UNLOCK — must always run
+    gpu_mfence();
+    gpu_display_wait_vblank(pipe);
+    return 1;
+}
+
+# gpu_dcn_write_committed — the whole lock -> write -> trigger -> unlock cycle for ONE register.
+fn gpu_dcn_write_committed(pipe, off, val) {
+    gpu_otg_lock(pipe);
+    gpu_reg32_write(GPU_BASE_DCN_2, off, val);
+    gpu_otg_commit_unlock(pipe);
+    return gpu_reg32(GPU_BASE_DCN_2, off) & 0xFFFFFFFF;
+}
+
+# gpu_dcn_hold — hold a state for n frames so it is photographable, paced by the display's own clock rather
+# than a spin. Bounded per frame, so a stopped pipe cannot wedge the hold.
+fn gpu_dcn_hold(frames) {
+    var i = 0;
+    while (i < frames) {
+        if (gpu_display_wait_vblank(gpu_display_pipe) != 1) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+# gpu_hubp_crossbar_test — bite D1: the HUBPRET channel CROSSBAR.
+#
+# amdgpu implements ABGR8888 as exactly ARGB8888 with the red and blue crossbar bars swapped — the
+# pixel-format value never changes. So a whole-scanout RGBX<->BGRX swap is two fields in one register: no
+# second plane, no DLG/TTU deadline work, no bandwidth change.
+#
+# ⚠ THIS IS NOT THE SAME CAPABILITY AS plan-S4's v_perm_b32 SWAP, and the distinction is the whole reason
+# both exist. This crossbar is a property of the WHOLE SCANOUT — it cannot swap one composited client
+# surface and leave its neighbours alone. S4's shader swap is per-surface and costs one VALU op. A
+# compositor needs S4; a wrong-endian framebuffer format needs this. Neither substitutes for the other.
+fn gpu_hubp_crossbar_test() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_display_ok != 1) { kprintln("gpu: d1 skipped (no pipe)", 25); return 0; }
+
+    var saved = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBPRET0_CONTROL) & 0xFFFFFFFF;
+    var unf0  = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 0x1;
+    kprint("gpu: d1 hubpret0 saved ", 23); kprint_num(saved);
+    kprint(" underflow ", 11);             kprint_num(unf0); kprintln("", 0);
+
+    # CROSSBAR_SRC_CB_B [21:20] and CROSSBAR_SRC_CR_R [23:22]: exchange the two selectors so blue reads the
+    # red bar and red reads the blue one. ALPHA [17:16] and Y_G [19:18] are left exactly as found — green
+    # and alpha must NOT move, and a photo where green also shifts means the field placement is wrong.
+    var b_sel = (saved >> 20) & 0x3;
+    var r_sel = (saved >> 22) & 0x3;
+    var swapped = saved & 0xFF0FFFFF;
+    swapped = swapped | (r_sel << 20) | (b_sel << 22);
+
+    # COMMITTED write — shadow + VUPDATE trigger + unlock. A bare gpu_reg32_write here reads back changed
+    # and does nothing on screen; that is precisely what burn 1 produced.
+    var applied = gpu_dcn_write_committed(gpu_display_pipe, GPU_R_HUBPRET0_CONTROL, swapped);
+    kprint("gpu: d1 crossbar applied ", 25); kprint_num(applied); kprintln(" (reds and blues swap NOW)", 26);
+
+    gpu_dcn_hold(180);                                  # ~3 s at 60 Hz — the photo window
+
+    gpu_dcn_write_committed(gpu_display_pipe, GPU_R_HUBPRET0_CONTROL, saved);   # DEAD-MAN: unconditional
+    gpu_dcn_hold(2);
+    var back = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBPRET0_CONTROL) & 0xFFFFFFFF;
+    var unf1 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 0x1;
+
+    if (back != saved) {
+        kprint("gpu: d1 RESTORE FAILED, reads ", 30); kprint_num(back); kprintln("", 0);
+        return 0;
+    }
+    # ⚠ OPTC_UNDERFLOW_OCCURRED_STATUS is STICKY. Burn 1 read it as 1 BEFORE the test ran, so comparing
+    # before-vs-after could never fire. Report both, and fail only on a genuine 0 -> 1 transition; when it
+    # was already latched, say the check is DEGRADED rather than printing a pass it did not earn.
+    # (A latched underflow at boot is itself worth noting — the 1.55.x quiet-boot banding lived on this pipe.)
+    if (unf0 != 0) { kprintln("gpu: d1 underflow was ALREADY latched at entry - check degraded", 63); }
+    if (unf0 == 0) {
+        if (unf1 != 0) { kprintln("gpu: d1 UNDERFLOW went 0->1 - the pipe missed a fetch deadline", 62); return 0; }
+    }
+    if (applied == saved) { kprintln("gpu: d1 crossbar write did not latch (read back unchanged)", 58); return 0; }
+    gpu_d1_ok = 1;
+    kprintln("gpu: d1 hubp crossbar online (whole-scanout R/B swap, restored)", 63);
+    return 1;
+}
+
+# gpu_mpc_galpha_test — bite D2: MPCC0 GLOBAL ALPHA. **An ORACLE, not a desktop feature.**
+#
+# What it proves in one reversible write: the MPC base is right, the offsets are right, the field placement
+# is right, the value latches, and the OTG update lock behaves — all at once, with zero new pipes, zero new
+# clocks, zero extra bandwidth, and one-register reversibility. That is a lot of independent facts for a
+# burn that risks almost nothing.
+#
+# ⚠ MODE 2 (GLOBAL_ALPHA) ONLY, and this is a hard constraint rather than a preference. Mode 0 (PER_PIXEL)
+# on the GOP's XRGB surface — where the X byte is 0x00 — reads every pixel as fully transparent and makes
+# the screen BLACK. Mode 2 ignores pixel alpha by definition, which is exactly why it is the only mode this
+# bite may use.
+#
+# ⚠ Per decision D-4 this is a PURE ORACLE unless the MUDRA/SHANTA designs call for one or two large
+# always-on translucent panels. They almost certainly do not: aethersafha is a multi-window compositor and
+# Renoir/Cezanne exposes only FOUR blendable planes total, so per-window translucency cannot ride this path
+# at all — it rides plan-S4/S7's shader. Operator ratification of D-4 changes the FRAMING, not this code.
+fn gpu_mpc_galpha_test() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_display_ok != 1) { kprintln("gpu: d2 skipped (no pipe)", 25); return 0; }
+
+    var saved = gpu_reg32(GPU_BASE_DCN_2, GPU_R_MPCC0_CONTROL) & 0xFFFFFFFF;
+    var unf0  = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 0x1;
+    var mode0 = (saved >> 4) & 0x3;
+    kprint("gpu: d2 mpcc0 control saved ", 28); kprint_num(saved);
+    kprint(" blnd mode ", 11);                  kprint_num(mode0); kprintln("", 0);
+
+    # Sweep GLOBAL_ALPHA [23:16] down in mode 2. Each step holds long enough to be seen; the screen should
+    # fade toward the MPCC background colour and come back on restore.
+    var steps = 0;
+    var a = 255;
+    while (a > 15) {
+        var v = saved & 0xFF00FFCF;             # clear GLOBAL_ALPHA [23:16] and ALPHA_BLND_MODE [5:4]
+        v = v | (2 << 4) | (a << 16);           # mode 2 = GLOBAL_ALPHA — never mode 0, see above
+        gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_CONTROL, v);
+        gpu_dcn_hold(20);
+        steps = steps + 1;
+        a = a - 48;
+    }
+    var applied = gpu_reg32(GPU_BASE_DCN_2, GPU_R_MPCC0_CONTROL) & 0xFFFFFFFF;
+
+    gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_CONTROL, saved);   # DEAD-MAN: unconditional
+    gpu_dcn_hold(2);
+    var back = gpu_reg32(GPU_BASE_DCN_2, GPU_R_MPCC0_CONTROL) & 0xFFFFFFFF;
+    var unf1 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 0x1;
+
+    kprint("gpu: d2 swept ", 14); kprint_num(steps);
+    kprint(" alpha steps, applied ", 22); kprint_num(applied); kprintln("", 0);
+    if (back != saved) {
+        kprint("gpu: d2 RESTORE FAILED, reads ", 30); kprint_num(back); kprintln("", 0);
+        return 0;
+    }
+    if (unf0 != 0) { kprintln("gpu: d2 underflow was ALREADY latched at entry - check degraded", 63); }
+    if (unf0 == 0) {
+        if (unf1 != 0) { kprintln("gpu: d2 UNDERFLOW went 0->1 - the pipe missed a fetch deadline", 62); return 0; }
+    }
+    if (applied == saved) { kprintln("gpu: d2 global-alpha write did not latch (read back unchanged)", 62); return 0; }
+    gpu_d2_ok = 1;
+    kprintln("gpu: d2 mpcc global alpha online (agnos owns the blender, restored)", 67);
+    return 1;
 }
 
 # === 1.55.x display arc — P2: vblank pacing ===
