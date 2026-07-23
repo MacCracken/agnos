@@ -934,7 +934,7 @@ fn atom_math_selftest() {
     atom_h6_pass = 0;
     atom_h6_fail = 0;
 
-# --- DIV32: unsigned (hi:lo) / src, quotient split across divmul0/divmul1 ---
+    # --- DIV32: unsigned (hi:lo) / src, quotient split across divmul0/divmul1 ---
     atom_div64_32(0x0, 0x0, 0x1);  atom_h6_case(1, 0x0, 0x0);   # identity zero
     atom_div64_32(0x0, 0x64, 0x7);  atom_h6_case(2, 0xE, 0x0);   # small / small, non-zero remainder
     atom_div64_32(0x0, 0xFFFFFFFF, 0x1);  atom_h6_case(3, 0xFFFFFFFF, 0x0);   # max u32 / 1
@@ -953,7 +953,7 @@ fn atom_math_selftest() {
     atom_div64_32(0x0, 0x64, 0x0);  atom_h6_case(16, 0x0, 0x0);   # ZERO DIVISOR -> both halves 0
     atom_div64_32(0x80000000, 0x1, 0x0);  atom_h6_case(17, 0x0, 0x0);   # ZERO DIVISOR with MSB-set dividend
 
-# --- MUL32: 64-bit product split across divmul0 (low) / divmul1 (high) ---
+    # --- MUL32: 64-bit product split across divmul0 (low) / divmul1 (high) ---
     atom_mul32_split(0x0, 0x0);  atom_h6_case(18, 0x0, 0x0);   # zero
     atom_mul32_split(0x1, 0x1);  atom_h6_case(19, 0x1, 0x0);   # identity
     atom_mul32_split(0x2, 0x3);  atom_h6_case(20, 0x6, 0x0);   # small
