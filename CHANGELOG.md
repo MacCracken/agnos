@@ -5,16 +5,63 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Result — plan-S3 burn 1 (iron, 2026-07-22): A/B/C conclusive, D void, and a doc error found
+### ✅ plan-S3 COMPLETE — iron-proven (archaemenid, 2026-07-22). All four arms conclusive.
+
+Two burns. The first returned A/B/C conclusive and arm D void (confounded by the harness, below); the
+second, with the prime corrected, closed every arm. **Final table:**
 
 ```
 S3-A shader->fb     WB=on   cpu-read 4096 of 4096  COHERENT
 S3-B shader->fb     WB=off  cpu-read    0 of 4096  STALE
 S3-C shader->cpdma  WB=on   read     4096 of 4096  COHERENT
 S3-C shader->cpdma  WB=off  read        0 of 4096  STALE
+S3-D primes executed 3 of 3
 S3-D cpdma->shader  INV=on  new      4096 of 4096  COHERENT   stale 0
-S3-D cpdma->shader  INV=off new      4096 of 4096  COHERENT   stale 0
+S3-D cpdma->shader  INV=off new         0 of 4096  STALE      stale 4096
+S3-D CONTROL cpu-wr INV=off new         0 of 4096  STALE      stale 4096
 ```
+
+Every arm matches the plan's original prediction — **a pass · b FAIL · c needs the write-back · d needs the
+invalidate** — and every row is binary (4096 or 0), with no cache-line-granular partial drainage anywhere.
+
+**Photo deliverable obtained** (the first burn could not produce it): a white tile at (96,380) beside a
+`0xFF101010` grey tile at (240,380). The grey is the underlay showing through because arm B's pixels never
+left GL2 — panel and CPU readback in agreement.
+
+**Four hardware facts, now measured rather than assumed:**
+
+1. **The post-dispatch write-back is load-bearing** for every non-GL2 consumer — the CPU through the WC
+   mapping (A/B) and CP-DMA through the MC (C). Shader stores otherwise sit in GL2 indefinitely.
+2. **CP-DMA does not snoop GL2** on reads (arm C, `WB=off` → 0 of 4096).
+3. **CP-DMA does not probe or invalidate GL2 on writes either.** Arm D's CP-DMA sub-arm and the CPU-UC
+   control behave *identically* (both 4096 stale), so the invalidate cannot be skipped on the grounds that
+   CP-DMA might self-coherently push its writes into L2. It does not.
+4. **The compute arena is GPU write-back cached** — arm C's `0 of 4096` row is impossible on an uncached
+   memory type, which retires the "nothing was ever cacheable" objection on the same carveout arm D uses.
+
+**Decision D-6's second justification is no longer unevidenced.** Keeping the pre-dispatch invalidate had
+only ever been *proven* for the shader I-cache (bits 29/27, across the C2g-1 burns 1-8, with the shader
+rewritten in place at a fixed VA). The GL2-data half was assumption. Arm D measures it: **4096 of 4096
+stale without it.** Different caches, two now-separate proofs.
+
+**For plan-S12 — the rule is per-*transition*, not per-batch and not per-buffer.** Both packets are
+whole-cache and full-range, so one covers every prior operation regardless of buffer; the constraint is
+purely ordering:
+
+- `dispatch × N → ACQUIRE_MEM(WB) → CP-DMA × M` — legal, **7 dwords once per batch**. The shape S12 wants.
+- Any CP-DMA write whose bytes a later dispatch **reads** needs an `ACQUIRE_MEM(INV)` between them, or that
+  dispatch reads 100% stale data.
+- So a batch's engine-domain state machine must emit **both** packets at **every** domain transition, in
+  either direction. That is now evidence-backed rather than a precaution.
+- The arc's no-batching-without-`ACQUIRE_MEM` standing rule is **confirmed, not relaxed**.
+
+⚠ Cost note carried into S12: today's envelope performs **two** whole-L2 invalidates per dispatch
+(pre `0x28C40000` + post `0x00840000`), discarding all GL2 residency on exit — a real tax on a path the plan
+itself calls memory-bound. Reclaiming it needs a write-back-*only* encoding, which needs the header first
+(see below). Separately, now that each kernel is resident in its **own** slot behind an arm latch (the
+residency table landed at 1.56.4), the shader bytes at a given VA never change — so the *I-cache* half of
+the pre-dispatch invalidate may be droppable **between shader-only dispatches inside one batch**. That is an
+S12 experiment, not an assumption to build on.
 
 **PROVEN — the post-dispatch write-back is load-bearing, on two independent consumers, 4096-vs-0 and not a
 partial count.** Shader stores land in GL2 and stay there; nothing drains them inside the measurement
@@ -93,7 +140,7 @@ bite closed on 1.5M). Growth is the five shader ISA tables, the `#92` descriptor
 S3 harness. Note DCE is **off** by default in this tree, so every `*_test` fn ships whether or not its
 `#ifdef` is set. `check.sh` and `test.sh` bumped in lockstep.
 
-### Added — plan-S3: the four-arm coherence characterisation (BUILT, burn-ready, not yet run)
+### Added — plan-S3: how the four-arm harness is built
 
 The bite the arc plan made a **gate** — *"nothing writes to the back buffer ahead of S3"* — and which
 execution never ran, because its label was taken by the grid bite. Shader stores have reached the panel
@@ -134,6 +181,9 @@ earns its burn twice:
 Production behaviour is unchanged: both toggles default to 1, so `gpu_grid7_run` emits the identical ring
 program it always has, plus two compares. `BURN_SHADER_COHERE`, and it needs no other shader flag — it
 drives the runtime arm (`gpu_blend_arm`), not a boot selftest.
+
+**Nothing in the production path changed on this evidence.** The write-back and the invalidate both stay
+unconditional; the result is that they are now *justified* rather than inherited.
 
 ## [1.56.4] — 2026-07-22 — the shader arc realigned to its own plan; #92 iron-proven end to end
 
