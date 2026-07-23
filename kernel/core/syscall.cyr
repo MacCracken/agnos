@@ -903,6 +903,10 @@ var GPO_E_DISPATCH = 8;              # op    — the dispatch watchdog expired (
 var GPO_E_DESC     = 11;             # call  — bad desc_uva / len, or the copy-in failed
 var GPO_E_RESERVED = 12;             # op    — a reserved field or an undefined flag bit was non-zero
 var GPO_E_UNPROVEN = 13;             # call  — the dispatch envelope is unproven on this boot
+# call — the BATCH's single completion fence never retired. Distinct from GPO_E_DISPATCH on purpose: with
+# one submission there is one marker, so the failing op is NOT identifiable and reporting an index would be
+# a fabrication. idx is 0 and carries no meaning for this reason.
+var GPO_E_BATCH    = 15;
 
 # gpo_field_mask(op) — bit i set <=> this op DEFINES record dword i (byte offset i*4).
 # Every dword an op does not define MUST be zero. That rule is what makes the reserved dwords safe to
@@ -1062,12 +1066,49 @@ fn gpu_shader_op_sys(desc_uva, len) {
         if (e != 0) { return 0 - ((i << 8) | e); }
         i = i + 1;
     }
+    return gpo_execute_all(buf, n);
+}
+
+# gpo_execute_all — plan-S12: the WHOLE op array in ONE GPU submission.
+#
+# This is the payoff decision D-3 was made for. Because the ABI was specified as an ARRAY of ops from day
+# one, batching is an IMPLEMENTATION change here and not an ABI break — the same #92, the same records, the
+# same return convention. Had the band shipped one syscall number per op (as 1.56.2/1.56.3 did before the
+# 1.56.4 realignment), this function could not exist without a second ABI migration.
+#
+# WHAT IT SAVES, per op after the first: the 7-dword TC write-back, the 5-dword completion fence, and a
+# whole CPU round-trip (register submit + spin). What it does NOT save, deliberately: the per-dispatch
+# pre-dispatch invalidate and CS_PARTIAL_FLUSH. See the batch-seam note in gpu.cyr.
+#
+# ⚠ HONEST LIMIT ON THE ERROR REPORT. One submission means ONE completion marker, so a batch that times out
+# cannot say WHICH op hung — hence GPO_E_BATCH rather than a per-op GPO_E_DISPATCH with a fabricated index.
+# Naming the op would need a per-op fence slot, which costs back a chunk of what batching just saved; that
+# is a measurable follow-up, not a silent omission. Ring 3 recovers exactly as it would from any failed
+# frame: re-clear with #85 and do not call #84.
+#
+# Emitting cannot fail partway. Pass 1 has already validated every op — bounds, slots, sizes, residency —
+# so pass 2's emitters only put dwords in the ring. That is what makes it safe to leave gpu_batch_active
+# set across the loop: there is no path that aborts mid-array and strands a fenceless partial program.
+fn gpo_execute_all(buf, n) {
+    var done_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
+    var done_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
+    store32(done_phys, GPU_MT_NOTYET);
+    gpu_mfence();
+
+    gpu_batch_active = 1;
+    var err = 0;
     var j = 0;
     while (j < n) {
         var e2 = gpo_execute(buf + j * GPU_OP_STRIDE);
-        if (e2 != 0) { return 0 - ((j << 8) | e2); }
+        if (e2 != 0) { err = (j << 8) | e2; j = n; }
         j = j + 1;
     }
+    gpu_batch_active = 0;                      # restored on EVERY exit path below
+
+    if (err != 0) { return 0 - err; }
+    gpu_batch_tail(done_mc);
+    gpu_mfence();
+    if (gpu_ring_kick_wait(done_phys, 100000) != 1) { return 0 - GPO_E_BATCH; }
     return 0;
 }
 
@@ -1078,7 +1119,7 @@ fn gpu_shader_op_sys(desc_uva, len) {
 # struct-write pattern:
 #   +0  flags   bit0 = GPU present · bit1 = double-buffer armed · bit2 = carveout (GPU-visible) shm available
 #               bit3 = SHADER COMPOSITING available (gpu_shader_op#92 will run)
-#               bit4 = RESERVED for S12: one #92 call == one GPU submission (batched)
+#               bit4 = BATCHED: one #92 call is one GPU submission (plan-S12) — see GPO_E_BATCH
 #   +4  bb_pitch  (bytes/row)      +16 shm_slots_total
 #   +8  bb_width  (px)             +20 shm_slots_free
 #   +12 bb_height (px)             +24 shm_max_size (bytes)   +28 #92 op-support mask (bit N = op code N)
@@ -1111,6 +1152,12 @@ fn gpu_caps_sys(buf, len) {
         }
     }
     if (shader_ok == 1) { flags = flags | 8; }
+    # bit4 — BATCHED SUBMISSION: one #92 call is ONE GPU submission (plan-S12). This is a SEMANTIC bit, not
+    # a performance hint. With it CLEAR, a GPO_E_DISPATCH means ops [0,idx) composited and idx failed. With
+    # it SET, a GPO_E_BATCH means an INDETERMINATE prefix landed and no op is identifiable — ring 3 recovers
+    # by re-clearing with #85 and not calling #84. A caller that does not read this bit cannot know which
+    # recovery it owes, which is why it ships in the same cut as the batching itself.
+    if (shader_ok == 1) { flags = flags | 16; }
     var bw = 0;
     var bh = 0;
     if (gpu_bb_pitch != 0) {

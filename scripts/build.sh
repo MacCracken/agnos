@@ -385,6 +385,10 @@ else
         # gpu_blend_ok because the f32 kernel is its oracle; without it the packed half silently skips.
         # Enforced in the dependency guard above, the same way SHADER_COV/SHADER_RECT are.
         [ -n "$SHADER_PERM" ]        && echo '#define SHADER_PERM'
+        # SHADER_BATCH=1 — 1.56.x plan-S12: the one-submission batched frame, compared pixel-for-pixel
+        # against the same frame composited op-by-op. Needs no other shader flag: it drives the RUNTIME
+        # arms (gpu_*_arm), not the boot selftests.
+        [ -n "$SHADER_BATCH" ]       && echo '#define SHADER_BATCH'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

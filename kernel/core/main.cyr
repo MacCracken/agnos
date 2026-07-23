@@ -1043,6 +1043,18 @@ gpu_shader_perm_test();
 gpu_shader_blend_pk_test();
 #endif
 
+# GPU arc 1.56.x plan-S12 — MULTI-SLOT RESIDENCY + the ONE-SUBMISSION batched frame. The arc's stated
+# CLOSING CONDITION. The residency half landed early at 1.56.4 (the strided slot table that fixed the arena
+# aliasing); this is the batching half, and it exists only because decision D-3 specified #92 as an ARRAY of
+# ops from day one — batching is an implementation change here, not an ABI break.
+# ⚠ The plan's honest clause governs the result: "a batched frame that is NOT faster means the fence was
+# never the wall, and that finding is the deliverable." The path is memory-bound by the arc's own
+# calibration, so PIXEL-IDENTITY is the gate; the timing is a measurement, not a target.
+# Gated #ifdef SHADER_BATCH; first iron burn: BURN_SHADER_BATCH.
+#ifdef SHADER_BATCH
+gpu_shader_batch_test();
+#endif
+
 
 # GPU arc 1.55.x (Thrust P) P4: scanout-residue clear.
 # ⚠ SCANOUT_LINEAR (v3) is RETIRED — it wrote the WRONG register (0x607) under the OTG lock and BLACKED the

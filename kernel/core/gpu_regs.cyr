@@ -1106,6 +1106,17 @@ var GPU_PERM_SRC_SUBOFF        = 0x1C000;    # 64 source pixels (256 B)
 # would not look like a shader bug. The 1 KB gap before PK_OUT is deliberate slack, not rounding.
 var GPU_PERM_OUT_SUBOFF        = 0x1C400;    # 64 x 4 dwords (1024 B) -> ends 0x1C800
 var GPU_PK_OUT_SUBOFF          = 0x1CC00;    # packed-blend output (256 B), 1 KB clear of PERM_OUT
+
+# --- plan-S12: the batched mock-frame oracle ----------------------------------------------------------
+# The op-by-op frame is snapshotted here so the batched frame can be compared against it pixel-for-pixel.
+# 256x128x4 = 128 KB at 0xC0000, well clear of every other slot (highest is BR2_SRC ending 0x79600) and of
+# the shader residency table at 0x50000-0x58FFF.
+var GPU_S12_SNAP_SUBOFF = 0xC0000;
+var GPU_S12_W  = 256;                        # frame region, deliberately a multiple of 64 (the EXEC guard
+var GPU_S12_H  = 128;                        # is proven at S6; this bite is about the SUBMISSION, not lanes)
+var GPU_S12_X  = 320;                        # where the mock frame lands in the back buffer
+var GPU_S12_Y  = 96;
+var GPU_S12_BG = 0xFF202830;                 # underlay both passes start from — identical, or the compare lies
 var GPU_GRD_W  = 320;
 var GPU_GRD_H  = 200;
 var GPU_GRD_X  = 200;

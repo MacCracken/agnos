@@ -74,6 +74,7 @@ var gpu_grad_ok       = 0;   # plan-S11: 1 = linear gradient proven on iron
 var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot for the #92 op path
 var gpu_perm_ok       = 0;   # plan-S4: 1 = v_perm_b32 byte crossbar + channel swap proven on iron
 var gpu_blend_pk_ok   = 0;   # plan-S4: 1 = VOP3P packed blend proven bit-identical to the f32 blend
+var gpu_batch_ok      = 0;   # plan-S12: 1 = a batched frame proven pixel-identical to op-by-op
 # plan-S3 coherence toggles. BOTH default to 1 and PRODUCTION NEVER CHANGES THEM — decision D-6 keeps the
 # pre-dispatch invalidate unconditional (it is load-bearing twice: stale I$ on a rewritten shader VA, and
 # stale GL2 lines when a shader reads bytes CP-DMA just wrote MC-direct). They exist so gpu_shader_cohere_test
@@ -81,6 +82,12 @@ var gpu_blend_pk_ok   = 0;   # plan-S4: 1 = VOP3P packed blend proven bit-identi
 # unconditionally, so "the write-back is load-bearing for display visibility" is an assumption.
 # ⚠ Only ever set via gpu_cohere_run(), which restores both on EVERY exit path. A leaked 0 here re-creates
 # the C2g-1 stale-shader class that cost eight burns.
+# plan-S12: when non-zero, the *_run emitters put their dispatch in the ring and RETURN WITHOUT the tail —
+# the batch driver (gpo_execute_all) owns the single TC write-back, the single fence and the single kick.
+# ⚠ Written in exactly one place, gpo_execute_all, which clears it on every exit path. It is safe as an
+# ambient flag only because pass 1 has already validated every op, so pass 2 cannot fail mid-emit and leave
+# a partial program in the ring with no fence behind it.
+var gpu_batch_active  = 0;
 var gpu_cohere_wb     = 1;   # 1 = emit the post-dispatch TC write-back (7 dwords)
 var gpu_cohere_inv    = 1;   # 1 = emit the pre-dispatch ACQUIRE_MEM invalidate (7 dwords)
 var gpu_bb_pitch      = 0;   # framebuffer row pitch in BYTES — the dst stride for gpu_blit_shm_sys
@@ -130,6 +137,43 @@ fn gpu_reg32_write(base_seg, off, val) {
 # Busy-spin >= us microseconds via rdtsc (the hda_udelay idiom; agnos has no
 # udelay). The PSP handshake needs ~20 ms settles between ring ops. HDA_TSC_MHZ=3000
 # (~3 GHz archaemenid TSC); invariant-TSC, ~constant per box.
+# GPU_TSC_PER_US — cycles per microsecond, assumed 3.0 GHz. ⚠ APPROXIMATE, deliberately: Cezanne boosts, so
+# every time this file reports is +/- the real clock. It cannot be calibrated here — GPU init runs BEFORE
+# `sti`, so timer_ticks does not advance yet and there is no second time source to calibrate against. The
+# consequence to remember: the "100 ms" dispatch watchdog is really 79-150 ms depending on the live clock.
+var GPU_TSC_PER_US = 3000;
+var gpu_last_wait_us = 0;    # wall time the most recent gpu_wait_done actually spent, for the S12 measurement
+
+# gpu_wait_done — spin until `done_phys` reads `expect`, bounded by timeout_us of wall time. Returns 1/0.
+#
+# ⚠ THIS REPLACES a `while (i < 1000) { ...; gpu_udelay(100) }` idiom that quantised EVERY dispatch to a
+# multiple of 100 us. The first load32 in that loop always misses — the CP has not retired the fence yet at
+# the instant the CPU arrives — so the loop then slept a full 100 us quantum unconditionally. Measured at
+# ~113 us per op, of which ~88% was that sleep rather than the GPU.
+#
+# ⚠ WHY IT HAD TO BE FIXED BEFORE plan-S12, NOT AFTER: a batch pays ONE quantum instead of N. Measuring
+# batching against the untightened baseline would have credited the batch with ~5x that it did not earn, and
+# S12's stated deliverable — "a batched frame that is NOT faster means the fence was never the wall, and
+# that finding is the deliverable" — would have been unfalsifiable.
+#
+# Records the elapsed wall time in gpu_last_wait_us so the caller can print a real number rather than a
+# comment. The final re-check after the bound closes the race where the marker lands in the last few cycles.
+fn gpu_wait_done(done_phys, expect, timeout_us) {
+    var t0 = rdtsc();
+    var limit = timeout_us * GPU_TSC_PER_US;
+    var el = 0;
+    while (el < limit) {
+        if ((load32(done_phys) & 0xFFFFFFFF) == expect) {
+            gpu_last_wait_us = el / GPU_TSC_PER_US;
+            return 1;
+        }
+        el = rdtsc() - t0;
+    }
+    gpu_last_wait_us = el / GPU_TSC_PER_US;
+    if ((load32(done_phys) & 0xFFFFFFFF) == expect) { return 1; }
+    return 0;
+}
+
 fn gpu_udelay(us) {
     var t0 = rdtsc();
     var target = us * 3000;
@@ -1219,12 +1263,8 @@ fn gpu_shader_dispatch() {
     gpu_mfence();
 
     # 6. BOUNDED watchdog on the done-marker (100 ms cap; NEVER an unbounded spin).
-    var ok = 0;
-    var i = 0;
-    while (i < 1000) {
-        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
-        else { gpu_udelay(100); i = i + 1; }
-    }
+    # plan-S12a: tight spin, not a 100 us sleep quantum. See gpu_wait_done.
+    var ok = gpu_wait_done(done_phys, GPU_C2F_DONE, 100000);
     # Read the per-queue state WHILE STILL GRBM-SELECTED — rptr/wptr/active read the
     # DEFAULT queue once deselected (that was the C2f-first-burn rptr=0x0 artifact). rptr
     # localizes WHERE the ring stalled (13=start..0x34=all consumed); wptr confirms the
@@ -1740,10 +1780,39 @@ fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, 
     gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(GPU_COMPUTE_RESLIM);
     gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(gx); gpu_ring_put(gy); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
     gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
-    # POST-dispatch TC write-back. Shader stores land in GL2; the DCN HUBP fetches through the data fabric
-    # and never traverses GL2, and gfx90c has NO shader-side buffer_wbl2 — so this CP packet is the only
-    # mechanism that can make a shader store visible to the DISPLAY. That has always been believed and
-    # never measured: plan-S3 arm B is the first build that can omit it.
+    if (gpu_batch_active != 0) { return 1; }   # batched: the driver emits ONE tail for the whole array
+    gpu_batch_tail(done_mc);
+    gpu_mfence();
+    return gpu_ring_kick_wait(done_phys, 100000);
+}
+
+# ── plan-S12: the batch seam ───────────────────────────────────────────────────────────────────────────
+#
+# gpu_grid7_run above is now emit + tail + kick, and the tail and kick are separable so that N dispatches
+# can share ONE of each. That is the whole of S12's throughput claim, and it is deliberately NOT a rewrite
+# of the proven dispatch program: every existing caller goes through the same three steps in the same order
+# and puts the same dwords in the ring.
+#
+# WHAT A BATCH ACTUALLY SAVES, per op after the first: the 7-dword TC write-back, the 5-dword WRITE_DATA
+# fence, and — the one that matters — a whole CPU round-trip (register submit + spin until the marker
+# retires). It does NOT save the pre-dispatch invalidate or the CS_PARTIAL_FLUSH; both stay per-dispatch.
+#
+# WHY THE INVALIDATE STAYS PER-DISPATCH. Decision D-6, now EVIDENCED rather than assumed: plan-S3 measured
+# 4096-of-4096 stale reads without it. Hoisting one invalidate to the head of a batch is a plausible
+# optimisation — inside an all-shader batch the sources are GL2-coherent with each other, and each kernel
+# now has its own resident slot so the I-cache argument is weaker than it was at C2g-1 — but it is exactly
+# the kind of "obviously safe" removal that cost eight burns once already. It is a MEASURABLE follow-up,
+# not something to fold into the bite that first makes batching work.
+#
+# ⚠ NO ENGINE-DOMAIN TRANSITIONS ARISE YET. Every #92 op code implemented today (0x01 blend, 0x02 coverage,
+# 0x03 glyph, 0x04 gradient) is a SHADER dispatch; the CP-DMA-domain codes 0x10/0x11 are reserved and still
+# return E_BADOP. So a batch is uniformly `dispatch x N -> ACQUIRE_MEM -> fence`, which is precisely the
+# shape plan-S3 blessed. The moment 0x10/0x11 are minted, this function needs the domain state machine that
+# emits BOTH packets at every transition in either direction — S3 measured that CP-DMA neither snoops GL2 on
+# read nor invalidates it on write, so neither direction is free.
+
+# gpu_batch_tail — the once-per-submission tail: TC write-back, then the completion fence.
+fn gpu_batch_tail(done_mc) {
     if (gpu_cohere_wb != 0) {
         gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
         gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
@@ -1751,21 +1820,18 @@ fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, 
     }
     gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
     gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
-    gpu_mfence();
+    return 0;
+}
 
+# gpu_ring_kick_wait — register-wptr submit (LO before HI; the CP latches on the HI write), then spin for
+# the marker, then deselect. Bounded; NEVER unbounded. Leaves gpu_last_wait_us set for the caller to print.
+fn gpu_ring_kick_wait(done_phys, timeout_us) {
     var new_wptr = gpu_ring_wptr;
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
     gpu_mfence();
-
-    # Bounded watchdog — 16384 threads, so allow the same 100 ms envelope the matmul gets. NEVER unbounded.
-    var ok = 0;
-    var i = 0;
-    while (i < 1000) {
-        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
-        else { gpu_udelay(100); i = i + 1; }
-    }
+    var ok = gpu_wait_done(done_phys, GPU_C2F_DONE, timeout_us);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
     gpu_mfence();
     gpu_ring_wptr = new_wptr;
@@ -1891,26 +1957,10 @@ fn gpu_blend_cov_run(shader_mc, mask_mc, dst_mc, mask_pitch, dst_pitch, width, c
     gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
     gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
     gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
-    gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
-    gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
+    if (gpu_batch_active != 0) { return 1; }   # batched: the driver emits ONE tail for the whole array
+    gpu_batch_tail(done_mc);
     gpu_mfence();
-
-    var new_wptr = gpu_ring_wptr;
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);
-    gpu_mfence();
-
-    var ok = 0;
-    var i = 0;
-    while (i < 1000) {
-        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
-        else { gpu_udelay(100); i = i + 1; }
-    }
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
-    gpu_mfence();
-    gpu_ring_wptr = new_wptr;
-    return ok;
+    return gpu_ring_kick_wait(done_phys, 100000);
 }
 
 # cov_ref_px — EXACT rational reference for the coverage blend, rounded once at the end:
@@ -2865,6 +2915,144 @@ fn gpu_shader_blend_pk_test() {
     return 1;
 }
 
+# ── plan-S12: the batched mock-frame oracle ───────────────────────────────────────────────────────────
+#
+# The arc's stated CLOSING CONDITION: a full mock frame composited in ONE submission and pixel-identical to
+# the same frame composited op-by-op, with a real frame time.
+#
+# ⚠ THE PLAN'S HONEST CLAUSE APPLIES AND IS NOT A HEDGE: "a batched frame that is NOT faster means the
+# fence was never the wall, and that finding is the deliverable." This path is MEMORY-bound by the arc's own
+# calibration (12 B/pixel; a full-screen 1080p blend moves ~25 MB), so a large speedup is not the expected
+# result and would itself be suspicious. What must hold unconditionally is PIXEL-IDENTITY — the batched
+# frame is not allowed to be a different frame.
+#
+# ⚠ The timing is only meaningful because plan-S12a landed FIRST. Before it, every dispatch was quantised
+# to a 100 us sleep, so a batch would have appeared ~5x better than it is purely by collapsing N sleeps
+# into one. Measuring against that baseline would have made this number unfalsifiable.
+
+# gpu_s12_frame — composite the mock frame once. batched=1 puts all six ops in ONE submission.
+# The op mix is the plan's: translucent window chrome (x3) + an AA-text run + a gradient titlebar.
+fn gpu_s12_frame(batched, src_mc, mask_mc, bmp_mc) {
+    var done_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
+    var done_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
+    if (batched == 1) {
+        store32(done_phys, GPU_MT_NOTYET);
+        gpu_mfence();
+        gpu_batch_active = 1;
+    }
+
+    var ok = 1;
+    if (gpu_blend_surface(src_mc, 64, 48, GPU_S12_X + 8,   GPU_S12_Y + 16) != 1) { ok = 0; }
+    if (gpu_blend_surface(src_mc, 64, 48, GPU_S12_X + 88,  GPU_S12_Y + 32) != 1) { ok = 0; }
+    if (gpu_blend_surface(src_mc, 64, 48, GPU_S12_X + 168, GPU_S12_Y + 48) != 1) { ok = 0; }
+    if (gpu_cov_surface(mask_mc, 64, 64, GPU_S12_X + 32, GPU_S12_Y + 56, 0xFF00C8FF) != 1) { ok = 0; }
+    if (gpu_glyph_surface(bmp_mc, 128, 16, GPU_S12_X + 16, GPU_S12_Y + 4, 0xFFFFE060) != 1) { ok = 0; }
+    if (gpu_grad_surface(192, 24, GPU_S12_X + 32, GPU_S12_Y + 100, 0xFFC000C0, 0x00000000) != 1) { ok = 0; }
+
+    if (batched != 1) { return ok; }
+    gpu_batch_active = 0;                      # restored before any early return below
+    if (ok != 1) { return 0; }
+    gpu_batch_tail(done_mc);
+    gpu_mfence();
+    return gpu_ring_kick_wait(done_phys, 100000);
+}
+
+fn gpu_shader_batch_test() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { kprintln("gpu: skipping batch (dispatch envelope unproven)", 48); return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    if (gpu_blit_arm() != 1) { kprintln("gpu: skipping batch (no back buffer)", 36); return 0; }
+
+    var pitch = gpu_bb_pitch;
+    if (pitch < (GPU_S12_X + GPU_S12_W) * 4) { kprintln("gpu: skipping batch (surface too narrow)", 40); return 0; }
+
+    var bb_phys = gpu_bb_a_phys;
+    var bb_mc   = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { bb_phys = gpu_bb_b_phys; bb_mc = gpu_bb_b_mc; }
+    var reg_mc   = bb_mc   + GPU_S12_Y * pitch + GPU_S12_X * 4;
+    var reg_phys = bb_phys + GPU_S12_Y * pitch + GPU_S12_X * 4;
+    var snap_phys = gpu_arena_phys + GPU_S12_SNAP_SUBOFF;
+    var snap_mc   = gpu_arena_mc   + GPU_S12_SNAP_SUBOFF;
+    var rowb = GPU_S12_W * 4;
+
+    # Sources: a premultiplied translucent grey window, a round coverage mask, a 1bpp text run.
+    var src_phys = gpu_arena_phys + GPU_BR_SRC_SUBOFF;
+    var src_mc   = gpu_arena_mc   + GPU_BR_SRC_SUBOFF;
+    var i = 0;
+    while (i < 64 * 48) { store32(src_phys + (i << 2), 0x80404040); i = i + 1; }
+    var mask_phys = gpu_arena_phys + GPU_COV_MASK_SUBOFF;
+    var mask_mc   = gpu_arena_mc   + GPU_COV_MASK_SUBOFF;
+    var my = 0;
+    while (my < 64) {
+        var mx = 0;
+        while (mx < 64) {
+            var dx2 = mx - 32; var dy2 = my - 32;
+            var c = 0;
+            if (dx2 * dx2 + dy2 * dy2 < 900) { c = 255; }
+            store8(mask_phys + my * 64 + mx, c);
+            mx = mx + 1;
+        }
+        my = my + 1;
+    }
+    var bmp_phys = gpu_arena_phys + GPU_GLYPH_BMP_SUBOFF;
+    var bmp_mc   = gpu_arena_mc   + GPU_GLYPH_BMP_SUBOFF;
+    var b = 0;
+    while (b < 16 * 16) { store8(bmp_phys + b, 0xA5); b = b + 1; }
+    gpu_mfence();
+
+    # ---- pass 1: OP-BY-OP, six submissions ----
+    if (gpu_cp_dma_fill_rect(reg_mc, pitch, GPU_S12_BG, rowb, GPU_S12_H) != 1) {
+        kprintln("gpu: batch underlay fill failed", 31); return 0;
+    }
+    var t0 = rdtsc();
+    if (gpu_s12_frame(0, src_mc, mask_mc, bmp_mc) != 1) {
+        kprintln("gpu: op-by-op frame failed", 26); return 0;
+    }
+    var seq_us = (rdtsc() - t0) / GPU_TSC_PER_US;
+
+    # Snapshot it. CP-DMA is MC-direct and the frame's shader stores have each been written back by their
+    # own tail, so this read is coherent — plan-S3 arm C is exactly what licenses it.
+    if (gpu_cp_dma_blit(snap_mc, rowb, reg_mc, pitch, rowb, GPU_S12_H) != 1) {
+        kprintln("gpu: batch snapshot blit failed", 31); return 0;
+    }
+
+    # ---- pass 2: BATCHED, one submission, from an identical underlay ----
+    if (gpu_cp_dma_fill_rect(reg_mc, pitch, GPU_S12_BG, rowb, GPU_S12_H) != 1) {
+        kprintln("gpu: batch underlay refill failed", 33); return 0;
+    }
+    var t1 = rdtsc();
+    if (gpu_s12_frame(1, src_mc, mask_mc, bmp_mc) != 1) {
+        kprintln("gpu: batched frame failed", 25); return 0;
+    }
+    var bat_us = (rdtsc() - t1) / GPU_TSC_PER_US;
+
+    # ---- the gate: PIXEL-IDENTICAL ----
+    var bad = 0;
+    var y = 0;
+    while (y < GPU_S12_H) {
+        var x = 0;
+        while (x < GPU_S12_W) {
+            var a = load32(reg_phys + y * pitch + (x << 2)) & 0xFFFFFFFF;
+            var c2 = load32(snap_phys + y * rowb + (x << 2)) & 0xFFFFFFFF;
+            if (a != c2) { bad = bad + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    kprint("gpu: batch frame seq ", 21); kprint_num(seq_us);
+    kprint(" us  batched ", 13); kprint_num(bat_us); kprintln(" us", 3);
+    if (bad != 0) {
+        kprint("gpu: batched frame DIFFERS at ", 30); kprint_num(bad);
+        kprintln(" pixels", 7);
+        return 0;
+    }
+    gpu_batch_ok = 1;
+    kprintln("gpu: batched frame pixel-identical to op-by-op (6 ops, 1 submission)", 68);
+    return 1;
+}
+
 # gpu_grad_arm — make grad_linear resident for the RUNTIME path. Idempotent; own arena slot, so the
 # gradient op works in a kernel built without SHADER_GRAD and depends on no boot-time ordering.
 # Peer of gpu_blend_arm / gpu_cov_arm / gpu_glyph_arm.
@@ -3656,12 +3844,8 @@ fn gpu_shader_dispatch2() {
     gpu_mfence();
 
     # 6. BOUNDED watchdog on the done-marker (100 ms cap; NEVER an unbounded spin).
-    var ok = 0;
-    var i = 0;
-    while (i < 1000) {
-        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
-        else { gpu_udelay(100); i = i + 1; }
-    }
+    # plan-S12a: tight spin, not a 100 us sleep quantum. See gpu_wait_done.
+    var ok = gpu_wait_done(done_phys, GPU_C2F_DONE, 100000);
     # Read per-queue state WHILE STILL GRBM-SELECTED (deselected reads hit the default queue).
     var rreg    = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR)    & 0xFFFFFFFF;
     var wptr_rb = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO) & 0xFFFFFFFF;
@@ -3804,12 +3988,8 @@ fn gpu_shader_dispatch3() {
     gpu_mfence();
 
     # 6. Bounded watchdog on the done-marker.
-    var ok = 0;
-    var i = 0;
-    while (i < 1000) {
-        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
-        else { gpu_udelay(100); i = i + 1; }
-    }
+    # plan-S12a: tight spin, not a 100 us sleep quantum. See gpu_wait_done.
+    var ok = gpu_wait_done(done_phys, GPU_C2F_DONE, 100000);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
     gpu_mfence();
     gpu_ring_wptr = new_wptr;
@@ -3965,12 +4145,8 @@ fn gpu_shader_dispatch4() {
     gpu_mfence();
 
     # 6. Bounded watchdog.
-    var ok = 0;
-    var i = 0;
-    while (i < 1000) {
-        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
-        else { gpu_udelay(100); i = i + 1; }
-    }
+    # plan-S12a: tight spin, not a 100 us sleep quantum. See gpu_wait_done.
+    var ok = gpu_wait_done(done_phys, GPU_C2F_DONE, 100000);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
     gpu_mfence();
     gpu_ring_wptr = new_wptr;
@@ -4116,12 +4292,8 @@ fn gpu_matmul_run(shader_mc, a_mc, b_mc, c_mc, done_mc, done_phys, rsrc1) {
     gpu_mfence();
 
     # Bounded watchdog.
-    var ok = 0;
-    var i = 0;
-    while (i < 1000) {
-        if ((load32(done_phys) & 0xFFFFFFFF) == GPU_C2F_DONE) { ok = 1; i = 1000; }
-        else { gpu_udelay(100); i = i + 1; }
-    }
+    # plan-S12a: tight spin, not a 100 us sleep quantum. See gpu_wait_done.
+    var ok = gpu_wait_done(done_phys, GPU_C2F_DONE, 100000);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
     gpu_mfence();
     gpu_ring_wptr = new_wptr;

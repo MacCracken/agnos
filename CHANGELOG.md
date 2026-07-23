@@ -5,7 +5,124 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added — plan-S4: the v_perm_b32 byte crossbar + the VOP3P packed blend (BUILT, burn-ready)
+## [1.56.5] — 2026-07-22 — plan-S12: the arc's closing condition — one submission per frame
+
+### Added — plan-S12: multi-slot residency + the ONE-SUBMISSION batched frame (BUILT, burn-ready)
+
+**The arc's stated closing condition.** The residency half already landed at 1.56.4 (the strided slot
+table that fixed the arena aliasing); this is the batching half.
+
+**This is the payoff decision D-3 was made for.** Because `#92` was specified as an **array of ops** from
+day one, batching is an *implementation* change — same syscall, same records, same return convention. Had
+the band shipped one syscall number per op, as 1.56.2/1.56.3 did before the realignment, `gpo_execute_all`
+could not exist without a second ABI migration. That was D-3's fourth stated reason, and it is now cashed.
+
+#### S12a — the completion poll, tightened FIRST (and this ordering is the point)
+
+Every dispatch polled its done marker with `while (i < 1000) { …; gpu_udelay(100) }`. The first `load32`
+**always** misses — the CP has not retired the fence at the instant the CPU arrives — so the loop then slept
+a full **100 µs quantum unconditionally**. Measured at ~113 µs per op, of which ~88% was that sleep rather
+than the GPU.
+
+`gpu_wait_done` replaces it with a bounded tight spin and records the elapsed wall time in
+`gpu_last_wait_us`, so the tests print a real number instead of trusting a comment. Seven dispatch polls
+converted.
+
+⚠ **This had to come before the batching, not after.** A batch pays one quantum instead of N, so measuring
+it against the untightened baseline would have credited the batch with ~5× it did not earn — and S12's
+stated deliverable ("a batched frame that is *not* faster means the fence was never the wall, and that
+finding is the deliverable") would have been unfalsifiable.
+
+⚠ `GPU_TSC_PER_US = 3000` is a 3.0 GHz assumption and is **approximate on purpose**: Cezanne boosts, and it
+cannot be calibrated here because GPU init runs before `sti`, so `timer_ticks` does not advance and there is
+no second time source. Consequence worth remembering: the "100 ms" watchdog is really 79–150 ms.
+
+#### S12b — the batch seam
+
+`gpu_grid7_run` and `gpu_blend_cov_run` are now emit → `gpu_batch_tail` → `gpu_ring_kick_wait`, with the
+tail and kick separable so N dispatches share one of each. Deliberately **not** a rewrite of the proven
+dispatch program: every existing caller goes through the same steps in the same order and puts the same
+dwords in the ring.
+
+**What a batch saves, per op after the first:** the 7-dword TC write-back, the 5-dword completion fence,
+and — the one that matters — a whole CPU round-trip (register submit + spin).
+
+**What it deliberately does *not* save:** the per-dispatch pre-dispatch invalidate and `CS_PARTIAL_FLUSH`.
+Decision **D-6** keeps the invalidate, and plan-S3 just *measured* why: 4096-of-4096 stale reads without it.
+Hoisting one invalidate to the head of a batch is a plausible optimisation — inside an all-shader batch the
+sources are GL2-coherent with each other, and each kernel now has its own resident slot so the I-cache
+argument is weaker than at C2g-1 — but that is exactly the "obviously safe" removal that cost eight burns
+once already. Measurable follow-up, not something folded into the bite that first makes batching work.
+
+⚠ **No engine-domain transitions arise yet.** Every implemented op code (0x01 blend, 0x02 coverage, 0x03
+glyph, 0x04 gradient) is a shader dispatch; the CP-DMA-domain codes 0x10/0x11 remain reserved and return
+`E_BADOP`. So a batch is uniformly `dispatch × N → ACQUIRE_MEM → fence`, precisely the shape S3 blessed. The
+moment 0x10/0x11 are minted, the driver needs the domain state machine emitting **both** packets at every
+transition in either direction — S3 measured that CP-DMA neither snoops GL2 on read nor invalidates it on
+write, so neither direction is free.
+
+#### The honest limit on batched error reporting
+
+One submission means **one** completion marker, so a batch that times out cannot say *which* op hung. That
+returns the new **`GPO_E_BATCH` (15)** rather than a per-op `GPO_E_DISPATCH` with a fabricated index — `idx`
+is 0 and carries no meaning. Naming the op would need a per-op fence slot, which costs back a chunk of what
+batching just saved; that is a measurable follow-up, not a silent omission.
+
+**`gpu_caps#89` gains flags bit4** to make that contract discoverable. It is a **semantic** bit, not a
+performance hint: clear ⇒ `E_DISPATCH` means ops `[0,idx)` composited and `idx` failed; set ⇒ `E_BATCH`
+means an indeterminate prefix landed and no op is identifiable, and ring 3 recovers by re-clearing with `#85`
+and not calling `#84`. A caller that does not read bit4 cannot know which recovery it owes, so it ships in
+the same cut as the batching.
+
+Emitting cannot fail partway: pass 1 has already validated every op, so pass 2's emitters only put dwords in
+the ring. That is what makes `gpu_batch_active` safe as an ambient flag — there is no path that aborts
+mid-array and strands a fenceless partial program.
+
+#### The oracle
+
+`gpu_shader_batch_test` composites the same six-op mock frame twice from an **identical** underlay —
+op-by-op (six submissions) then batched (one) — snapshots the first with CP-DMA (licensed by S3 arm C) and
+compares the second against it **pixel for pixel**, printing both wall times.
+
+**Pixel-identity is the gate; the timing is a measurement.** The path is memory-bound by the arc's own
+calibration, so a large speedup is not the expected outcome and would be worth distrusting.
+`BURN_SHADER_BATCH`, `cmp`-verified live.
+
+### ✅ Added — plan-S4: the v_perm_b32 byte crossbar + the VOP3P packed blend — IRON-PROVEN
+
+**✅ IRON-PROVEN (archaemenid, 2026-07-22), all three sub-proofs on the FIRST burn:**
+
+```
+gpu: perm control run, selector is identity      -> perm lanes stored 64 of 64
+gpu: perm swap run, selector swaps red and blue  -> perm lanes stored 64 of 64
+gpu: perm byte crossbar online (identity and channel swap, 64 px)
+gpu: packed blend lanes stored 64 of 64
+gpu: packed blend valu per pixel 27 float 31
+gpu: packed blend bit-identical to float blend (64 px)
+```
+
+**The RGBX<->BGRX channel swap is no longer an unhandled case.** It was on the arc's opening scope list as
+"an unhandled case, not just a slow one" and stayed that way through eleven bites; it is now one VALU op.
+
+**New durable hardware fact: `v_cvt_pk_u8_f32` CLAMPS a negative input to 0** rather than converting
+modularly. Corner lane 2 (opaque black over grey) hands the f32 path a strictly negative value
+(min -1.508e-05); the packed integer path cannot go negative at all, so the two kernels can only agree if
+that convert clamps. They agree. This was the single behaviour in the bite that could not be settled
+off-iron, which is why the lane existed.
+
+**Cost, measured rather than asserted: 27 VALU/px packed vs 31 f32 — a ~13% ALU reduction.** Read it
+honestly: the plan calibrated this path as **memory-bound** (12 B/pixel; a full-screen 1080p blend moves
+~25 MB), so a 13% ALU saving is unlikely to move wall-clock much. The measurement IS the deliverable, per
+the plan's own clause. What the packed path does establish is that the VOP3P route beats the *scalar
+integer* form the plan predicted at 31-33 — two channels per instruction is real — while the shipped f32
+kernel stays competitive because GFX9's single-instruction byte<->float converts are what made f32 cheaper
+than integer in the first place (the D-2 measurement).
+
+Also confirmed by omission: the `op_sel_hi:[0,1]` modifier was correct. Its failure signature
+("green or alpha wrong, check the packed shift lane select") never printed, and that failure would have
+been silent in 98.2% of pixels while still rendering a plausible image.
+
+### Added — plan-S4: how it is built
 
 The last un-started item on the ladder. Through eleven bites the tree contained **zero `v_perm_b32` and
 zero `v_pk_*`**, while the arc's own scope list called the RGBX↔BGRX channel swap *"an unhandled case, not

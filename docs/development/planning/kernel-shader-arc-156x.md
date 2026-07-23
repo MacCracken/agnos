@@ -149,13 +149,14 @@ execution departed from it, so the two can be read against each other. Restored 
 | **S1 · D0** | DONE-IRON | Both shipped as reports rather than gates. S1 banked a durable hardware fact: **the SH compute registers are not GRBM-readable on this part** |
 | **S2** | DONE-IRON | Shipped, but as **f32 premultiplied**, which is a *third* option D-2 never listed — see D-2 below |
 | **S3** | ✅ **DONE-IRON 2026-07-22** (two burns; was NEVER RAN) | Its label was consumed by the grid bite (plan S5). The four-arm coherence table does not exist; the post-dispatch write-back is emitted unconditionally and **no build has ever run without it**. So "the TC write-back is load-bearing for display visibility" remains an *assumption*. ⚠ Arms (c)/(d) are **S12's precondition** — the arc's own standing rule forbids batching a dispatch and a CP-DMA into one submission until S3 says otherwise |
-| **S4** | 🔨 **BUILT 1.56.4+, BURN-READY** (was NEVER STARTED) | Zero `v_perm_b32` and zero `v_pk_*` in the tree. The RGBX↔BGRX channel swap — which this arc opened by calling **"an unhandled case, not just a slow one"** — is still exactly that |
+| **S4** | ✅ **DONE-IRON 2026-07-22, first burn** (was NEVER STARTED) | Zero `v_perm_b32` and zero `v_pk_*` in the tree. The RGBX↔BGRX channel swap — which this arc opened by calling **"an unhandled case, not just a slow one"** — is still exactly that |
 | **S5** | DONE-IRON | Shipped under the label "S3". Carries the blend rather than a pure copy, and was verified against `blend_ref_px` rather than `gpu_cp_dma_blit`; no per-workgroup sentinel witness (the workgroup evidence is a photo) |
 | **S6** | DONE-IRON | Shipped correctly labelled, but at w=**200** with no deliberate **unguarded** control arm. "The guard stopped the overrun" is therefore inferred, not measured |
 | **S7** | DONE-IRON | Delivered across two cuts. `gpu_blend_ok` exists but **gates nothing on the runtime path** — and it must not, being self-test-only (see the 1.56.4 note) |
 | **S8 / D-3** | ❌ **BUILT THE REJECTED OPTION** | Shipped `#92` blend + `#93` coverage + `#94` glyph — one number per op, verbatim the column D-3 rejected. Restored to the descriptor array at 1.56.4 |
 | **S9 · S10 · S11** | BUILT | Shipped as `#94` / `#93` / no-syscall-at-all, and under the labels "S8" / "S7" / "S9". The gradient shipped a working shader with **no kernel-side worker and no ring-3 path** for a full cut |
-| **S12 · D1 · D2** | NOT STARTED | S12's residency half landed early at 1.56.4 as a side effect of fixing the arena aliasing |
+| **S12** | 🔨 **BUILT 1.56.5, BURN-READY** | Residency half landed 1.56.4; batching half + the pixel-identity oracle landed 1.56.5. `BURN_SHADER_BATCH`. The poll quantum was tightened FIRST (S12a) or the timing would have been unfalsifiable |
+| **D1 · D2** | NOT STARTED | HUBP crossbar, MPCC global alpha. Independent of the S lane |
 
 **Two live defects found by the same re-audit** (detail in the CHANGELOG): both coverage call sites passed
 11 arguments to a 12-parameter dispatcher — warning in every build since 1.56.3 — and `#92`'s resident
@@ -168,7 +169,7 @@ and re-open this document before each bite.** A decision row that is not re-read
 
 ### Ready to build now (no decision pending)
 
-**Remaining after the 1.56.4 realignment: S12 · D1 · D2**, plus the **S4 burn** (code landed, `BURN_SHADER_PERM`, not yet run). **S3 is CLOSED — iron-proven 2026-07-22, all four arms conclusive**, so S12's precondition is satisfied: both coherence packets are required at every engine-domain transition, in either direction, and that is now measured (CP-DMA neither snoops GL2 on read nor invalidates it on write). D-1/D-2/D-4 remain unratified — see the CHANGELOG's operator-decision list; none of them block S4.
+**Remaining: D1 · D2**, plus the **S12 burn** (code landed at 1.56.5, `BURN_SHADER_BATCH`, not yet run). Once S12 is iron-green the S lane is COMPLETE and the arc meets its stated closing condition. **S4 is CLOSED** — iron-proven first burn 2026-07-22; the RGBX↔BGRX channel swap the arc opened by calling "an unhandled case" is now one VALU op, and `v_cvt_pk_u8_f32` is confirmed to CLAMP negative inputs to 0. **S12 is the arc's stated closing condition.** **S3 is CLOSED — iron-proven 2026-07-22, all four arms conclusive**, so S12's precondition is satisfied: both coherence packets are required at every engine-domain transition, in either direction, and that is now measured (CP-DMA neither snoops GL2 on read nor invalidates it on write). D-1/D-2/D-4 remain unratified — see the CHANGELOG's operator-decision list; none of them block S4.
 
 ### Carried out of 1.55.x into this arc
 

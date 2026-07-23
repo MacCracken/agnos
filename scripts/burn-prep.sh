@@ -87,6 +87,26 @@ if [ -n "${BURN_SHADER_OPS:-}" ]; then
     echo "[2/2] Building the 1.56.4 SHADER-OPS kernel (#92 descriptor seam + cov re-proof + glyph/grad first iron; run /bin/gpublend + /bin/gpucov; capture klug > shader_ops.txt)."
     BUILD_ENV="SHADER_BLEND=1 SHADER_COV=1 SHADER_GLYPH=1 SHADER_GRAD=1"
     BUILD_TAG="SHADER_OPS"
+elif [ -n "${BURN_SHADER_BATCH:-}" ]; then
+    # plan-S12 — the ONE-SUBMISSION batched frame. The arc's stated CLOSING CONDITION, and the payoff
+    # decision D-3 was made for: because #92 was specified as an ARRAY of ops from day one, batching is an
+    # implementation change rather than an ABI break.
+    #
+    # Composites the same six-op mock frame twice from an identical underlay — op-by-op (six submissions)
+    # then batched (one) — and compares the two PIXEL FOR PIXEL:
+    #   'gpu: batch frame seq <N> us  batched <M> us'
+    #   'gpu: batched frame pixel-identical to op-by-op (6 ops, 1 submission)'
+    #
+    # ⚠ READ THE RESULT THE WAY THE PLAN WROTE IT: "a batched frame that is NOT faster means the fence was
+    # never the wall, and that finding is the deliverable." This path is MEMORY-bound by the arc's own
+    # calibration (12 B/pixel, ~25 MB for a full-screen 1080p blend), so a large speedup is NOT the expected
+    # outcome and would be worth distrusting. PIXEL-IDENTITY is the gate; the two timings are a measurement.
+    # ⚠ The timings only mean anything because plan-S12a tightened the completion poll first — before that,
+    # every dispatch was quantised to a 100 us sleep and a batch would have looked ~5x better for free.
+    # CAPTURE: klug > shader_batch.txt. No photo needed; the oracle is a pixel count.
+    echo "[2/2] Building the plan-S12 SHADER-BATCH kernel (one-submission frame vs op-by-op; capture klug > shader_batch.txt)."
+    BUILD_ENV="SHADER_BATCH=1"
+    BUILD_TAG="SHADER_BATCH"
 elif [ -n "${BURN_SHADER_PERM:-}" ]; then
     # plan-S4 — the v_perm_b32 BYTE CROSSBAR + the VOP3P PACKED blend. The last un-started ladder item: the
     # tree had zero v_perm_b32 and zero v_pk_* through eleven bites while the arc's own scope list called
