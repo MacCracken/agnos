@@ -88,10 +88,14 @@ else
     echo "gfx9-asm-check: FAIL — a shipped ISA table does not match its source. DO NOT BURN THIS."
 fi
 
-# ⚠ HONEST COVERAGE NOTE, and it is the reason this gate is not the whole of S0.
-# Only shaders WITH a .s source are checked. The six 1.54.x compute kernels (the C2f/C2g dispatch ladder and
-# the two f64 matmuls) were hand-typed as hex before scripts/gfx9-asm.sh existed and have NO .s — so they
-# are NOT covered here and remain unverified against llvm-mc. Writing .s sources for them is the remaining
-# half of S0. They are iron-proven by execution, which is a stronger check than assembly parity for those
-# specific kernels, but it does not protect them from a future hand-edit the way this gate does.
+# COVERAGE (1.56.6): all eleven .s-backed kernels are checked. The four older matmul kernels
+# (matmul_copy/dot/i32/f64, the C2g dispatch ladder + both matmuls) were hand-typed as hex before
+# scripts/gfx9-asm.sh existed; .s sources were reconstructed for them and verified BYTE-IDENTICAL to the
+# shipped tables, so the gate now protects them from a future hand-edit exactly like the rest.
+#
+# ⚠ STILL UNCOVERED, and it is deliberate: gpu_matmul_write_shader's tiny predecessors that embed a RUNTIME
+# address into the instruction stream — gpu_shader_dispatch (C2f, the out_mc literal) and gpu_shader_dispatch2
+# (C2g-1). Those are NOT static tables — a dword changes per boot — so they have no fixed .s to diff against.
+# They are the two smallest kernels (7 and 10 dwords), iron-proven by execution, and left as-is rather than
+# refactored to a load-the-address form purely to satisfy a linter.
 exit $rc

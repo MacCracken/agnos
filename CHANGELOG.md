@@ -3,6 +3,44 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.7] - 2026-07-23
+
+### Changed — the four hand-typed 1.54.x compute kernels now have `.s` sources; the ISA gate covers 11/11
+
+The 1.56.6 gate (`scripts/gfx9-asm-check.sh`) verified the seven `.s`-backed shader tables and left an honest
+hole: four older kernels — `matmul_copy` (C2g-2 kernargs), `matmul_dot` (C2g-3 reduction loop), `matmul_i32`
+(the C2g-4 integer matmul crown), `matmul_f64` (the f64 matmul) — were hand-typed as hex before the emitter
+existed and had **no source to diff against**. This reconstructs them.
+
+Each new `kernel/shaders/*.s` assembles with `llvm-mc -mcpu=gfx90c` to bytes **identical** to the table it
+replaces:
+
+| kernel | dwords | RSRC1 harvested | matches |
+|---|---|---|---|
+| matmul_copy | 17 | `0x002C0040` | `GPU_COMPUTE_PGM_RSRC1_MIN` |
+| matmul_dot  | 38 | `0x002C0042` | `GPU_COMPUTE_PGM_RSRC1_V12` |
+| matmul_i32  | 41 | `0x002C0042` | `GPU_COMPUTE_PGM_RSRC1_V12` |
+| matmul_f64  | 43 | `0x002C0043` | `GPU_COMPUTE_PGM_RSRC1_F64` |
+
+The RSRC1/RSRC2 that `llvm-mc` harvests from each `.amdhsa_kernel` descriptor equals the constant `gpu.cyr`
+already programs at dispatch — so the descriptors are now honest rather than hand-counted, which is the
+whole reason `gpu_regs.cyr:1033-1035` warns a miscounted RSRC word is *"wrong, not slow."*
+
+⚠ **The runtime ISA is byte-for-byte unchanged** — verified by extracting each in-tree table and comparing
+against a snapshot of the pre-refactor bytes: all four IDENTICAL. This is a source-form and
+gate-coverage change only; these kernels stay iron-proven, and no dword of proven ISA moved.
+
+The generated tables replace the inline hex in `gpu_shader_dispatch3`/`gpu_shader_dispatch4` and the bodies
+of `gpu_matmul_write_shader`/`gpu_matmul_write_shader_f64` (now thin wrappers over `*_write`, so no call site
+moved). Negative-tested: corrupting one dword in a new table makes the gate FAIL and names the regeneration
+command.
+
+⚠ **Deliberately still uncovered:** `gpu_shader_dispatch` (C2f) and `gpu_shader_dispatch2` (C2g-1) embed a
+**runtime address** into the instruction stream — a dword changes per boot — so they are not static tables
+and have no fixed `.s` to diff against. The two smallest kernels (7 and 10 dwords), left as-is rather than
+refactored to a load-the-address form purely to satisfy the gate. This is the true completion of the shader
+plan's opening item; nothing in it remains.
+
 ## [Unreleased]
 
 ## [1.56.6] - 2026-07-23
