@@ -99,12 +99,20 @@ elif [ -n "${BURN_DCN_DLANE:-}" ]; then
     # did not change (an underflow means the pipe missed a fetch deadline — that is how a "successful" poke
     # corrupts scanout without blanking it).
     #
+    # ⚠ EVERY PHASE IS TIMESTAMPED so a photo IDENTIFIES ITSELF — you do not have to remember what you saw.
+    # The last 'gpu: [T+NNNNms] ...' line visible in a shot states which state was live when it was taken.
+    # This exists because burn 4 produced two bar photos seconds apart that could not be assigned to a phase
+    # after the fact, which made the D1 result unreadable despite the register work being correct.
+    #
     # WATCH, in order:
-    #   'gpu: d1 crossbar applied ... (reds and blues swap NOW)'  -> ~3 s of the console with R and B
-    #      exchanged. ⚠ GREEN AND ALPHA MUST NOT MOVE — if green also shifts, the field placement is wrong.
-    #   'gpu: d1 hubp crossbar online (whole-scanout R/B swap, restored)'
-    #   ~5 alpha steps of the whole screen fading toward the MPCC background, then snapping back
-    #   'gpu: d2 mpcc global alpha online (agnos owns the blender, restored)'
+    #   [T+..] d1 PHASE A - crossbar IDENTITY   -> ~4 s, bars read R G B left to right  (the CONTROL)
+    #   [T+..] d1 PHASE B - crossbar SWAPPED    -> ~8 s, bars MUST read B G R           (the CLAIM)
+    #   [T+..] d1 PHASE C - crossbar RESTORED   -> bars back to R G B
+    #      ⚠ GREEN MUST NOT MOVE in any phase — if green also shifts, the field placement is wrong.
+    #      ONE photo in PHASE A and ONE in PHASE B settles D1. The timestamps make them unambiguous.
+    #   [T+..] d2 global alpha now 255 / 170 / 85 / 0 of 255 -> ~2 s each, screen fading toward BLUE
+    #      ✅ D2 ALREADY PROVEN on burn 4 (full blue at alpha 0, MPCC_CONTROL 0xFF000422). Re-running only
+    #      because it shares the arm; a photo is optional this time.
     #
     # A 'RESTORE FAILED' or 'UNDERFLOW changed' line means STOP and power-cycle rather than continuing.
     # D2 uses ALPHA_BLND_MODE 2 (GLOBAL_ALPHA) ONLY: mode 0 (PER_PIXEL) on the GOP's XRGB surface, where the

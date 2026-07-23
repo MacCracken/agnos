@@ -75,6 +75,23 @@ var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot fo
 var gpu_perm_ok       = 0;   # plan-S4: 1 = v_perm_b32 byte crossbar + channel swap proven on iron
 var gpu_blend_pk_ok   = 0;   # plan-S4: 1 = VOP3P packed blend proven bit-identical to the f32 blend
 var gpu_batch_ok      = 0;   # plan-S12: 1 = a batched frame proven pixel-identical to op-by-op
+# plan-D lane: a monotonic phase clock so a PHOTO IDENTIFIES ITSELF.
+# The D1 hold is a few seconds in the middle of scrolling console text, and two shots taken seconds apart
+# are indistinguishable after the fact — which is exactly why burn 4's bar photos could not be assigned to
+# a phase. Stamping each transition means the last visible line in any photo states which state is live.
+# ⚠ rdtsc, not timer_ticks: these tests run BEFORE sti, so the 100 Hz tick does not advance yet.
+var gpu_ts_base = 0;
+fn gpu_ts_reset() { gpu_ts_base = rdtsc(); return 0; }
+fn gpu_ts_mark(label, len) {
+    var us = 0;
+    if (gpu_ts_base != 0) { us = (rdtsc() - gpu_ts_base) / GPU_TSC_PER_US; }
+    kprint("gpu: [T+", 8);
+    kprint_num(us / 1000);
+    kprint("ms] ", 4);
+    kprintln(label, len);
+    return 0;
+}
+var gpu_otg_lock_acked = 0;  # last gpu_otg_lock result — 0 means the lock TIMED OUT and nothing committed
 var gpu_d1_ok         = 0;   # D1: 1 = HUBPRET channel crossbar written + restored on the live pipe
 var gpu_d2_ok         = 0;   # D2: 1 = MPCC0 global alpha written + restored on the live pipe
 # plan-S3 coherence toggles. BOTH default to 1 and PRODUCTION NEVER CHANGES THEM — decision D-6 keeps the
@@ -1500,8 +1517,12 @@ fn gpu_mpc_probe() {
 
     # THE GATE — six independent constraints for a single-plane pipe-0 scanout.
     # THE GATE, corrected. Burn 1 failed on two constraints that were MY errors, not hardware disagreement:
-    #   · `bot == 0xF` — WRONG. amdgpu's dcn10_mpc.c proves bot_sel == SELF means "nothing below", and self
-    #     is 0 for MPCC0, so bot=0 was the CORRECT single-plane reading all along.
+    #   · `bot == 0xF` — this "correction" was ITSELF WRONG, and the D-lane burns paid for it.
+    #     dcn10_mpc.c:215 writes BOT_SEL = 0xF for nothing-below; it does NOT write self. The observed
+    #     bot == 0 is an UNPROGRAMMED DON'T-CARE, because the GOP leaves MPCC_MODE = 1 (passthrough) where
+    #     the bottom mux is irrelevant. So this row asserts almost nothing: top==0 / bot==top / mux==0 are
+    #     all satisfiable by power-on values (the ascending self-index ladder mpcc0 top 0 / mpcc1 top 1 ...).
+    #     Treat "5 of 5 constraints agree" as ~1 informative constraint, not five.
     #   · `idle == 5` — WRONG. 0xF is a sentinel mpc1_mpc_init writes; it is not a POR value.
     # What remains are constraints a single-plane pipe-0 scanout genuinely must satisfy.
     var ok = 1;
@@ -4879,13 +4900,19 @@ fn gpu_otg_lock(pipe) {
     (gc & (0 - 1 - GPU_OTG_LOCK_SEL_MASK)) | ((pipe << 25) & GPU_OTG_LOCK_SEL_MASK));
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_MASTER_UPDATE_LOCK + o, 0x1);
     var spins = 0;
+    var acked = 0;
     while (spins < 100000) {
         if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_MASTER_UPDATE_LOCK + o) & GPU_OTG_UPDATE_LOCK_STATUS) != 0) {
+            acked = 1;
             spins = 100000;
         }
         else { spins = spins + 1; }
     }
-    return 1;
+    # ⚠ RETURNS THE ACK, and callers must report it. Burn 2 added this lock and printed NOTHING about it, so
+    # "the write was committed under the lock" stayed an ASSUMPTION through a whole wasted iron burn — the
+    # poll is bounded and proceeds on timeout, so an unacked lock is indistinguishable from a taken one.
+    gpu_otg_lock_acked = acked;
+    return acked;
 }
 
 # gpu_otg_commit_unlock — re-arm the LIVE surface address to trigger VUPDATE, release the lock, wait a frame.
@@ -4935,32 +4962,85 @@ fn gpu_dcn_hold(frames) {
 # both exist. This crossbar is a property of the WHOLE SCANOUT — it cannot swap one composited client
 # surface and leave its neighbours alone. S4's shader swap is per-surface and costs one VALU op. A
 # compositor needs S4; a wrong-endian framebuffer format needs this. Neither substitutes for the other.
+# gpu_d1_paint_bars — put actual COLOUR on the scanned surface so a colour crossbar has something to permute.
+# Written with the CPU straight into the framebuffer fb_console already draws to, so there is no CP-DMA
+# coherence question and no dependence on the blit double-buffer being armed.
+fn gpu_d1_paint_bars() {
+    var base  = fb_fb_phys();
+    var pitch = fb_pitch();
+    if (base == 0) { return 0; }
+    if (pitch == 0) { return 0; }
+    var w = fb_width();
+    var bw = w / 4;
+    if (bw < 16) { return 0; }
+    var y = 0;
+    while (y < 120) {
+        var x = 0;
+        while (x < bw * 3) {
+            var c = 0x00FF0000;                       # red
+            if (x >= bw) { c = 0x0000FF00; }          # green
+            if (x >= bw * 2) { c = 0x000000FF; }      # blue
+            store32(base + y * pitch + (x << 2), c);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    gpu_mfence();
+    kprintln("gpu: d1 painted R/G/B bars (the crossbar needs colour to permute)", 65);
+    return 1;
+}
+
 fn gpu_hubp_crossbar_test() {
     if (gpu_present == 0) { return 0; }
     if (gpu_display_ok != 1) { kprintln("gpu: d1 skipped (no pipe)", 25); return 0; }
 
+    gpu_ts_reset();
     var saved = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBPRET0_CONTROL) & 0xFFFFFFFF;
     var unf0  = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 0x1;
     kprint("gpu: d1 hubpret0 saved ", 23); kprint_num(saved);
     kprint(" underflow ", 11);             kprint_num(unf0); kprintln("", 0);
 
-    # CROSSBAR_SRC_CB_B [21:20] and CROSSBAR_SRC_CR_R [23:22]: exchange the two selectors so blue reads the
-    # red bar and red reads the blue one. ALPHA [17:16] and Y_G [19:18] are left exactly as found — green
-    # and alpha must NOT move, and a photo where green also shifts means the field placement is wrong.
+    # ⚠⚠ THE STIMULUS WAS THE BUG, NOT THE REGISTER. Burns 1 and 2 swapped red and blue on a console whose
+    # every pixel is FB_FG 0x00FFFFFF or FB_BG 0x00000000 — R == G == B. ANY permutation of the colour
+    # crossbar is the IDENTITY on an achromatic image. That is arithmetic, not a hypothesis, and it means
+    # those two burns could not have shown a change no matter how correct the register work was. (A third
+    # revision that forced "greyscale" would have been bit-identical on an already-greyscale screen.)
+    #
+    # The register itself is CORRECT and is confirmed three independent ways: mmHUBPRET0_HUBPRET_CONTROL is
+    # 0x066C BASE_IDX 2; the CROSSBAR_SRC_CB_B/CR_R shifts are 0x14/0x16, matching [21:20]/[23:22]; and
+    # amdgpu writes this exact dword with this exact value 0x00E40000 six times on THIS die. The crossbar is
+    # also unconditionally on the RGB path — hubp1_program_pixel_format does the crossbar RMW BEFORE and
+    # OUTSIDE the format switch, and ARGB8888/ABGR8888 both emit SURFACE_PIXEL_FORMAT 8, so the crossbar is
+    # the ONLY state distinguishing them anywhere in DC.
+    #
+    # So: PAINT COLOUR FIRST. Three saturated bars straight into the scanned framebuffer, then permute.
+    gpu_d1_paint_bars();
+    var swapped = saved & 0xFF0FFFFF;                  # clear CB_B[21:20] and CR_R[23:22] only
     var b_sel = (saved >> 20) & 0x3;
     var r_sel = (saved >> 22) & 0x3;
-    var swapped = saved & 0xFF0FFFFF;
-    swapped = swapped | (r_sel << 20) | (b_sel << 22);
+    swapped = swapped | (r_sel << 20) | (b_sel << 22);   # exchange them: the red and blue BARS trade places
 
     # COMMITTED write — shadow + VUPDATE trigger + unlock. A bare gpu_reg32_write here reads back changed
     # and does nothing on screen; that is precisely what burn 1 produced.
-    var applied = gpu_dcn_write_committed(gpu_display_pipe, GPU_R_HUBPRET0_CONTROL, swapped);
-    kprint("gpu: d1 crossbar applied ", 25); kprint_num(applied); kprintln(" (reds and blues swap NOW)", 26);
+    gpu_ts_mark("d1 PHASE A - crossbar IDENTITY, bars read R G B left to right", 63);
+    gpu_dcn_hold(240);                                  # ~4 s of the KNOWN state, so a photo can anchor on it
 
-    gpu_dcn_hold(180);                                  # ~3 s at 60 Hz — the photo window
+    var applied = gpu_dcn_write_committed(gpu_display_pipe, GPU_R_HUBPRET0_CONTROL, swapped);
+    gpu_ts_mark("d1 PHASE B - crossbar SWAPPED, bars must read B G R now", 54);
+    kprint("gpu: d1 crossbar applied ", 25); kprint_num(applied); kprintln("", 0);
+    kprint("gpu: d1 otg lock acked ", 23); kprint_num(gpu_otg_lock_acked); kprintln("", 0);
+    # PERSISTENCE: re-read after a few frames. If the value REVERTS, something else (GOP/DMCUB/a periodic
+    # reprogram) is rewriting the register and the whole approach needs a different hook. If it STICKS but
+    # the panel is unchanged, the register is simply not in this surface format's path.
+    gpu_dcn_hold(10);
+    var persist = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBPRET0_CONTROL) & 0xFFFFFFFF;
+    kprint("gpu: d1 persists after 10 frames ", 33); kprint_num(persist); kprintln("", 0);
+
+    gpu_dcn_hold(480);                                  # ~8 s at 60 Hz — PHASE B is the one to photograph
 
     gpu_dcn_write_committed(gpu_display_pipe, GPU_R_HUBPRET0_CONTROL, saved);   # DEAD-MAN: unconditional
-    gpu_dcn_hold(2);
+    gpu_ts_mark("d1 PHASE C - crossbar RESTORED, bars back to R G B", 49);
+    gpu_dcn_hold(60);
     var back = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HUBPRET0_CONTROL) & 0xFFFFFFFF;
     var unf1 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 0x1;
 
@@ -5008,19 +5088,48 @@ fn gpu_mpc_galpha_test() {
     kprint("gpu: d2 mpcc0 control saved ", 28); kprint_num(saved);
     kprint(" blnd mode ", 11);                  kprint_num(mode0); kprintln("", 0);
 
-    # Sweep GLOBAL_ALPHA [23:16] down in mode 2. Each step holds long enough to be seen; the screen should
-    # fade toward the MPCC background colour and come back on restore.
+    # ⚠⚠ THE BLENDER WAS NOT RUNNING, and I never wrote the field that starts it.
+    # The GOP leaves MPCC_CONTROL = 0xFFFF0461. Decoded: MPCC_MODE[1:0] = 1 = TOP_LAYER_PASSTHROUGH, and
+    # ALPHA_MULTIPLIED_MODE[6] = 1. Burns 1 and 2 masked with 0xFF00FFCF, which PRESERVES both of those
+    # (0xCF & 0x3 = 3, 0xCF & 0x40 = 0x40) — so every sweep wrote a global-alpha coefficient into an
+    # equation the hardware was not evaluating. Two vetoes, neither of them touched:
+    #   MODE 1 (passthrough)  -> the blend equation does not run at all
+    #   MULT 1 (premultiplied) -> out = TOP + (1-a)*BG, which with BG black is out = TOP for EVERY alpha
+    #
+    # ⚠ And "single plane means nothing to blend against" is FALSE — that claim (mine, in D0's comment) is
+    # backwards. amdgpu's mpc1_set_bg_color walks DOWN to the bottom-most MPCC to write the background, and
+    # its on-screen debug colouring works through set_bg_color alone. The bottom operand is the BACKGROUND,
+    # and agnos had never read or written it.
+    #
+    # This now matches amdgpu's KNOWN-GOOD word on this exact die (0xFFFF0422: MODE 2 = TOP_LAYER_ONLY,
+    # ALPHA_BLND_MODE 2 = GLOBAL_ALPHA, MULT 0) and differs from it only in the alpha being swept. A
+    # saturated blue background makes the fade unmistakable rather than a slow drift toward black.
+    var bg_r = gpu_reg32(GPU_BASE_DCN_2, GPU_R_MPCC0_BG_R_CR) & 0xFFFFFFFF;
+    var bg_g = gpu_reg32(GPU_BASE_DCN_2, GPU_R_MPCC0_BG_G_Y)  & 0xFFFFFFFF;
+    var bg_b = gpu_reg32(GPU_BASE_DCN_2, GPU_R_MPCC0_BG_B_CB) & 0xFFFFFFFF;
+    gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_BG_R_CR, 0);
+    gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_BG_G_Y,  0);
+    gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_BG_B_CB, 0xFFF);
+    kprintln("gpu: d2 background set BLUE (the bottom operand the sweep fades toward)", 71);
+
+    gpu_ts_reset();
     var steps = 0;
     var a = 255;
-    while (a > 15) {
-        var v = saved & 0xFF00FFCF;             # clear GLOBAL_ALPHA [23:16] and ALPHA_BLND_MODE [5:4]
-        v = v | (2 << 4) | (a << 16);           # mode 2 = GLOBAL_ALPHA — never mode 0, see above
+    while (a >= 0) {
+        var v = saved & 0xFF00FF80;             # clear MODE[1:0], BLND[5:4], MULT[6], GLOBAL_ALPHA[23:16]
+        v = v | 2 | (2 << 4) | (a << 16);       # MODE 2 + GLOBAL_ALPHA, MULT 0 — amdgpu's known-good shape
         gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_CONTROL, v);
-        gpu_dcn_hold(20);
+        kprint("gpu: [T+", 8); kprint_num(((rdtsc() - gpu_ts_base) / GPU_TSC_PER_US) / 1000);
+        kprint("ms] d2 global alpha now ", 24); kprint_num(a); kprintln(" of 255", 7);
+        gpu_dcn_hold(120);                      # ~2 s per step; the LAST step is alpha 0 = full blue
         steps = steps + 1;
-        a = a - 48;
+        a = a - 85;
     }
     var applied = gpu_reg32(GPU_BASE_DCN_2, GPU_R_MPCC0_CONTROL) & 0xFFFFFFFF;
+    kprint("gpu: d2 otg lock acked ", 23); kprint_num(gpu_otg_lock_acked); kprintln("", 0);
+    gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_BG_R_CR, bg_r);   # restore BG first
+    gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_BG_G_Y,  bg_g);
+    gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_BG_B_CB, bg_b);
 
     gpu_dcn_write_committed(gpu_display_pipe, GPU_R_MPCC0_CONTROL, saved);   # DEAD-MAN: unconditional
     gpu_dcn_hold(2);

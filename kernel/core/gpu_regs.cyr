@@ -207,6 +207,13 @@ var GPU_R_MPCC0_TOP_SEL     = 0x1271; # MPCC0 MPCC_TOP_SEL  — which DPP feeds 
 var GPU_R_MPCC0_BOT_SEL     = 0x1272; # MPCC_BOT_SEL        — 0xF = nothing below it (bottom of the stack)
 var GPU_R_MPCC0_OPP_ID      = 0x1273; # MPCC_OPP_ID         — which OPP this MPCC drives
 var GPU_R_MPCC0_CONTROL     = 0x1274; # MPCC_CONTROL        — ALPHA_BLND_MODE [5:4], GLOBAL_ALPHA [23:16] (D2)
+# MPCC0 background colour — the BOTTOM operand. ⚠ "single plane means nothing to blend against" is FALSE:
+# amdgpu's mpc1_set_bg_color walks DOWN to the bottom-most MPCC and writes these, and dcn10_hwseq's
+# on-screen debug colouring works through set_bg_color() alone. agnos had never read or written them, which
+# is half of why the D2 alpha sweep had nothing to fade toward.
+var GPU_R_MPCC0_BG_R_CR     = 0x127A;
+var GPU_R_MPCC0_BG_G_Y      = 0x127B;
+var GPU_R_MPCC0_BG_B_CB     = 0x127C;
 var GPU_R_MPCC0_STATUS      = 0x127F; # MPCC_STATUS — IDLE[0] / BUSY[1] / DISABLED[2] (dcn_2_1_0_offset.h:5626)
 # ⚠ WAS 0x1275, which is MPCC_SM_CONTROL (stereo-mixer, reset value 0) — a REAL register at a valid address,
 # which is why the D0 burn read a plausible 0 instead of all-ones. MPCC0 block: SM_CONTROL 0x1275,
