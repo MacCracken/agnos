@@ -3,6 +3,43 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.8] - 2026-07-23
+
+### Removed — llvm-mc and the ISA gate built on it. AGNOS's build no longer touches a C/C++ toolchain.
+
+1.56.6/1.56.7 added `scripts/gfx9-asm.sh` and `scripts/gfx9-asm-check.sh` to re-assemble the shader `.s`
+sources and byte-verify them against the committed hex. That gate depended on **`llvm-mc`** — part of LLVM,
+which is **C++**. A sovereign OS's build gate has no business depending on a C++ assembler, so it is deleted:
+
+- `scripts/gfx9-asm.sh` and `scripts/gfx9-asm-check.sh` — **deleted**.
+- The ISA-gate line in `scripts/check.sh` — **removed** (back to 14 gates).
+- Every `llvm-mc` / `gfx9-asm.sh` reference in `kernel/shaders/*.s`, `gpu.cyr` and `gpu_regs.cyr` reworded:
+  the committed hex tables **ARE the shader** — iron-proven on archaemenid, the authority — and the `.s`
+  files are human-readable reference for them. The sovereign gfx90c assembler in the ecosystem is
+  **mabda's Cyrius gfx9 encoder** (`mabda/src/gfx9_encode.cyr`, HW-proven on Cezanne); that is the
+  toolchain. No llvm, no C/C++, in the build or the regeneration path.
+
+This costs nothing real: the shader ISA is **iron-proven on archaemenid and committed as hex** — there is a
+pinned, tagged, working artifact. The gate only re-derived what is already known-good; losing it loses a
+convenience, not a fact. agnos builds and runs with **zero llvm involvement**.
+
+### Ratified — operator decisions D-1, D-2, D-4 (the last open items of the shader work)
+
+- **D-1 — shader authoring toolchain: llvm-mc is REJECTED.** It is C++; it is out (above). The committed hex
+  is the authority, and the sovereign gfx90c assembler is mabda's Cyrius gfx9 encoder — no C/C++ in the
+  toolchain, period.
+- **D-2 — `#92` blend semantics: PREMULTIPLIED f32, ratified.** Neither branch the arc originally listed
+  (exact-floor `/255` vs `a256`); premultiplied is the GPU-standard form, it is now consumed end-to-end
+  (sadish `sd_premul` → setu `SETU_SURF_PREMULTIPLIED` → aethersafha `#92` op 0x01 → kernel
+  `out = src + dst*(1 - a/255)`), and it is frozen. The straight-alpha `rend_blend` is dead code with no
+  callers.
+- **D-4 — whole-surface translucency is a REAL requirement.** The DCN second-plane work stays a live future
+  item (not a closed one): the MUDRA/SHANTA designs call for one or two large always-on translucent panels
+  that a dedicated hardware plane serves better than the per-window `#92` shader path. It remains a deferred
+  row of the GPU release plan, ~50-70 register writes / 4-6 iron bites, to open after the modeset.
+
+No kernel behaviour changed in this cut — the ISA bytes are byte-for-byte what 1.56.7 shipped.
+
 ## [1.56.7] - 2026-07-23
 
 ### Changed — the four hand-typed 1.54.x compute kernels now have `.s` sources; the ISA gate covers 11/11

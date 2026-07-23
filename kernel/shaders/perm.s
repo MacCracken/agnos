@@ -36,7 +36,11 @@
 //   `v_perm_b32 v8, 0, v2, 0x03000102` is REJECTED BY THE ASSEMBLER — this class of bug fails at build time,
 //   not on iron, which is the one mercy here. Every selector must arrive in an SGPR. The three fixed ones are
 //   staged with s_mov_b32 below; the host-driven one needs no staging because it is ALREADY an SGPR — it is a
-//   kernarg, and llvm-mc accepts an SGPR directly as v_perm_b32's third source (verified: the encoding for
+// ⚠ THIS FILE IS HUMAN-READABLE REFERENCE ONLY. The authoritative artifact is the hex table committed
+//   in kernel/core/gpu.cyr, which is iron-proven on archaemenid. There is NO build-time assembler
+//   dependency: agnos does not ship, invoke, or require llvm — the shaders were authored once and
+//   their bytes are the source of truth. If these ever need regenerating, do it through mabda's
+//   sovereign Cyrius gfx9 encoder (mabda/src/gfx9_encode.cyr), NEVER a C/C++ toolchain.
 //   `v_perm_b32 v8, 0, v2, s4` is [0x08,0x00,0xed,0xd1,0x80,0x04,0x12,0x00], src2 field = 4 = s4).
 //   The gfx9 constant bus allows ONE distinct SGPR across all three sources and inline constants are free,
 //   which is why the single-source form is `v_perm_b32 D, 0, v2, s4` — a second SGPR in any slot would be
@@ -59,7 +63,6 @@
 // opaque 64-bit values into USER_DATA_0..5 and dispatches (1,1,1), so the call is
 // gpu_matmul_run(shader_mc, src_mc, out_mc, selector, done_mc, done_phys, GPU_COMPUTE_PGM_RSRC1_V12) —
 // the third "pointer" slot carries the selector, with the host passing a zero high half. RSRC1 is also
-// unchanged at 0x002c0042 (12 VGPRs / 16 SGPRs) — llvm-mc harvests exactly GPU_COMPUTE_PGM_RSRC1_V12 for
 // THIS kernel, so it adds no new RSRC constant.
 // ⚠ THAT IS TRUE OF perm ONLY. Its sibling blend_pk.s harvests 0x002C0082 (24 SGPRs) and MUST NOT reuse
 // V12 — 16 SGPRs under-allocates it, which corrupts the VCC carry chain rather than merely slowing it.
@@ -134,9 +137,7 @@ perm:
 
 .rodata
 .p2align 6
-// As in blend_premul.s, this block exists so llvm-mc COMPUTES RSRC1/RSRC2 rather than having them hand-counted
 // — gpu_regs.cyr:1033-1035 warns that a miscounted RSRC word is "wrong, not slow". v0..v11 and s0..s8 are
-// declared here and nowhere else, and scripts/gfx9-asm.sh harvests the result. ieee_mode/denorm are pinned to
 // agnos's values (0/0) against LLVM's defaults of 1/3; no float arithmetic happens in this kernel, but a
 // descriptor that disagrees with every other shader in the arena is a difference waiting to be blamed.
 .amdhsa_kernel perm

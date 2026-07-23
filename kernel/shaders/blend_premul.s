@@ -24,7 +24,11 @@
 //   s[0:1] = src base (premultiplied BGRA/RGBA8888)   s[2:3] = dst base   s[4:5] = out base
 // One workitem per pixel; v0 = workitem id. Flat 1-D over the rect — no grid yet, that is a later bite.
 
-// The .amdhsa_kernel block below exists so llvm-mc COMPUTES RSRC1/RSRC2 for us. gpu_regs.cyr:1033-1035
+// ⚠ THIS FILE IS HUMAN-READABLE REFERENCE ONLY. The authoritative artifact is the hex table committed
+//   in kernel/core/gpu.cyr, which is iron-proven on archaemenid. There is NO build-time assembler
+//   dependency: agnos does not ship, invoke, or require llvm — the shaders were authored once and
+//   their bytes are the source of truth. If these ever need regenerating, do it through mabda's
+//   sovereign Cyrius gfx9 encoder (mabda/src/gfx9_encode.cyr), NEVER a C/C++ toolchain.
 // warns a hand-counted RSRC word is "wrong, not slow"; deriving it from the same source that assembled the
 // code removes that class of bug entirely. ieee_mode/denorm are pinned to agnos's values (0/0) — LLVM
 // defaults to 1/3, and a silent float-semantics mismatch is the worst possible failure mode here.

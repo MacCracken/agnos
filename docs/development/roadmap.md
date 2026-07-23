@@ -29,35 +29,24 @@
 
 ---
 
-## Active — 1.56.x shader (Thrust S)
+## Active — 1.56.x GPU (one release)
 
-Everything that needs **arithmetic per pixel**. CP-DMA is a byte mover with no ALU — it cannot blend, convert
-formats, or replicate pixels within a row — so alpha/translucency, anti-aliased coverage, gradients, bitmap
-glyph expand, and intra-pixel channel permutation all belong to a compositing **shader**, riding the dispatch
-seam 1.54.x already proved. **Plan doc (the working document — read it before coding):**
-[`docs/development/planning/gpu.md`](planning/gpu.md). Scope is exactly the "NOT CP-DMA"
-list in [`issues/2026-07-22-gpu-display-syscall-band-cyrius-wrappers.md`](issues/2026-07-22-gpu-display-syscall-band-cyrius-wrappers.md).
+**All GPU work is one open release: 1.56.x.** There is no 1.57/1.58/1.59 — the full plan, reference facts,
+falsified record and remaining ladder live in the single GPU document,
+[`docs/development/planning/gpu.md`](planning/gpu.md). Read it before touching GPU code. Summary:
 
-**Ladder (17 bites, two lanes).** S-lane: **S0** host toolchain + CPU reference oracle (no burn) → **S1**
-read-only compute-state probe → **S2** first blend, 64 px into fresh scratch → **S3** GL2↔scanout↔CP-DMA
-coherence in one boot → **S4** `v_perm`/VOP3P/channel swap → **S5** grid > 1 workgroup → **S6** EXEC bounds
-guard → **S7** full per-pixel alpha → **S8** ring-3 seam (**new syscall #92**) → **S9** glyph expand → **S10**
-coverage blit → **S11** gradients → **S12** batched one-submission frame. D-lane (DCN, independent): **D0**
-read-only MPC probe → **D1** hardware RGBX↔BGRX crossbar → **D2** MPCC global-alpha.
+**✅ DONE (shipped + verified):** the ring-3 GPU band has consumers — aethersafha composites on the GPU,
+opaque via `#87` and translucent via `#92` op 0x01 (premultiplied src-over), unblocked by setu asking
+`shm_create_gpu` #86 (root blocker was memory, not alpha); the full premultiplied chain shipped across 10
+draw-stack repos on cyrius 6.4.71. Shader ISA is sovereign — 11 `.s`-backed kernels reference-verified against
+their iron-proven committed hex, and the **llvm-mc build gate removed (1.56.8)** because a sovereign build
+takes no C/C++ toolchain. Decisions D-1/D-2/D-4 ratified (1.56.8). The S lane (S0-S12) and D lane (D1/D2) are
+closed on iron; the D-lane code was deleted after it produced its answer.
 
-**Four gaps the ladder is shaped around** (none is a blocker; all are unproven):
-1. **No shader has ever written to the scanout back buffer.** Shader stores land in **GL2**; the DCN HUBP
-   fetches through the data fabric and never traverses GL2 — and `buffer_wbl2` is unsupported on gfx90c, so
-   the CP write-back packet is the *only* mechanism. **S3 settles it; nothing writes to the back buffer first.**
-2. **agnos has never dispatched a grid other than 1×1×1** — `COMPUTE_PGM_RSRC2` sets no TGID bits (S5).
-3. **`s_mov_b64 exec,-1` is correct only for an exact 64-lane wave** — with paging disabled, a surplus lane's
-   store lands somewhere real in the carveout (S6).
-4. **One shader slot**, rewritten in place every dispatch (S12).
-
-**Deferred with reason:** the DCN **second plane**. Renoir/Cezanne exposes only 4 blendable planes total, so it
-can never serve a compositor with N translucent windows — it is a 4-6 bite front-end bring-up for a fixed-N
-win. Its own arc, not a 1.56.x bite. D1/D2 still ride along because they are genuine one-register wins on the
-pipe agnos already owns.
+**▶ REMAINING:** `#90`/`#91` reserved CP-DMA (`#90` P1) · the measured invalidate hoist · **modeset** (own the
+pipe from cold; harness half is zero-burn) · **HDMI audio** (zero-burn Linux discriminator first) · **3D** (a
+rendering primitive — the soorat/kiran consumer stack is cataloged and waits on the kernel) · **ML on the
+shader cores** (the 1.54.x crown C6). ⚠ Every GPU-pixel arm is IRON-ONLY (QEMU has no AMD GPU).
 
 ---
 
@@ -136,8 +125,8 @@ The search has moved off the display-audio registers and onto the transmitter/en
 |------|---------|
 | **P4 — scanout-residue clear** | ✅ **DONE, 1.55.28.** Root cause was neither tiling nor DCC nor a pitch register (all falsified on iron across ~8 burns): the firmware scans a small **800×600** surface that DCN upscales, while `boot_info` reports the 2560×1440 **output** — so `fb_console` wrote 2560-wide rows into an 800-wide surface. Fix = read the real viewport + pitch and match `fb_console`'s geometry to them. **Read-only; no register writes.** The through-line of every wrong turn was *derived* register offsets — a read-only regdump anchored to known geometry is what cracked it. |
 | **2D acceleration** | ✅ **DONE, 1.55.30-1.55.32 — but not as predicted.** This entry said "GFX-ring". It landed on the **compute ring via CP-DMA** (`DMA_DATA`), because SDMA was abandoned after six burns (rings up, never fetches) and the CP ring was already proven. Copy · fill · strided blit, plus the ring-3 band #85-#89. A GPU-composited aethersafha is now unblocked and is a **desktop-repo** item, not a kernel one. |
-| **P6a — full modeset** | **Open, and now PLANNED as its own arc:** [`docs/development/planning/gpu.md`](planning/gpu.md) (1.57.x, Thrust M — *own the pipe from cold*). agnos has never disabled an OTG, programmed a raster, driven a PLL or enabled a transmitter; every pixel it has shown rides the GOP's DVI setup. The foundation is in hand — the sovereign Cyrius ATOM interpreter (`kernel/core/atom.cyr`) runs vendor VBIOS bytecode bit-correctly on iron (1.55.23), and a static decode says `SetPixelClock` #12 and the CRTC family need **no new opcode**. The arc opens with a **12-bite zero-burn harness lane** and a **decisive Linux-side experiment (L1)** that can change its justification before any code is written. ⚠ Scope is **HDMI/TMDS same-mode only** — no DP (no AUX/DPCD/link-training code exists and no DP sink is attached), no mode change, no native-resolution console. |
-| **P6b — 3D** | **Split out of the modeset arc, and it has a REAL, CATALOGED CONSUMER STACK.** ⚠ An earlier draft of the 1.57.x plan claimed "3D has no consumer" — **false**, and corrected 2026-07-23: the search was bounded to the local filesystem and these repos are simply not checked out yet. **kiran** is a **shipped 1.0.0 game engine** (ECS + scene hierarchy, in the [v1.0+ libs registry](../applications/libs/README.md)); **soorat** (1.0) is a purpose-built **game render engine**, re-homed to the games lane 2026-07-05 precisely because it is *not* the desktop path; **joshua** (game manager + AI sim runtime), **salai** (editor), **impetus** (physics) and **raasta** (pathfinding) round it out; **bsp** (BSP geometry) is already Cyrius-ported. Two titles are cataloged behind them — **cyrius-mine-cart** (the deliberately-simple first 3D pilot: rail-constrained motion, "the gentlest first-3D-load") and **cyrius-block-game** (voxel survival). [`planning/shared-crates.md:103`](planning/shared-crates.md) states it plainly: *"the 3D lane waits on kiran/joshua."* **The open question is therefore ordering, not existence.** kiran and soorat are Rust→Cyrius **port targets** ([`planning/software-port-path.md:64`](planning/software-port-path.md), Tier E), so the cheapest next step — and the only one that produces evidence — is to **port them and let the port say which kernel seam it needs**, rather than assume a GFX ring. Precedent that the assumption would be wrong: the 1.54.x plan's "GFX-ring 2D acceleration" shipped as `DMA_DATA` on the existing MEC compute ring. ⚠ The modeset (P6a) is a hard prerequisite either way — a box that cannot cold-boot a display cannot ship a game. Successor doc `planning/gfx3d-arc.md`, **to open with a read of kiran + soorat, not with kernel code.** |
+| **P6a — full modeset** | **Open — REMAINING item 7 of the one 1.56.x GPU release** (NOT a new minor version): [`docs/development/planning/gpu.md`](planning/gpu.md) (*own the pipe from cold*). agnos has never disabled an OTG, programmed a raster, driven a PLL or enabled a transmitter; every pixel it has shown rides the GOP's DVI setup. The foundation is in hand — the sovereign Cyrius ATOM interpreter (`kernel/core/atom.cyr`) runs vendor VBIOS bytecode bit-correctly on iron (1.55.23), and a static decode says `SetPixelClock` #12 and the CRTC family need **no new opcode**. The arc opens with a **12-bite zero-burn harness lane** and a **decisive Linux-side experiment (L1)** that can change its justification before any code is written. ⚠ Scope is **HDMI/TMDS same-mode only** — no DP (no AUX/DPCD/link-training code exists and no DP sink is attached), no mode change, no native-resolution console. |
+| **P6b — 3D** | **Split out of the modeset arc, and it has a REAL, CATALOGED CONSUMER STACK.** ⚠ An earlier draft claimed "3D has no consumer" — **false**, corrected 2026-07-23: the search was bounded to the local filesystem and these repos are simply not checked out yet. **kiran** is a **shipped 1.0.0 game engine** (ECS + scene hierarchy, in the [v1.0+ libs registry](../applications/libs/README.md)); **soorat** (1.0) is a purpose-built **game render engine**, re-homed to the games lane 2026-07-05 precisely because it is *not* the desktop path; **joshua** (game manager + AI sim runtime), **salai** (editor), **impetus** (physics) and **raasta** (pathfinding) round it out; **bsp** (BSP geometry) is already Cyrius-ported. Two titles are cataloged behind them — **cyrius-mine-cart** (the deliberately-simple first 3D pilot: rail-constrained motion, "the gentlest first-3D-load") and **cyrius-block-game** (voxel survival). [`planning/shared-crates.md:103`](planning/shared-crates.md) states it plainly: *"the 3D lane waits on kiran/joshua."* **The open question is therefore ordering, not existence.** kiran and soorat are Rust→Cyrius **port targets** ([`planning/software-port-path.md:64`](planning/software-port-path.md), Tier E), so the cheapest next step — and the only one that produces evidence — is to **port them and let the port say which kernel seam it needs**, rather than assume a GFX ring. Precedent that the assumption would be wrong: the 1.54.x plan's "GFX-ring 2D acceleration" shipped as `DMA_DATA` on the existing MEC compute ring. ⚠ The modeset (P6a) is a hard prerequisite either way — a box that cannot cold-boot a display cannot ship a game. It is REMAINING item 9 of the one 1.56.x GPU release — **no separate arc doc**; opens with a read of kiran + soorat, not with kernel code. |
 
 The old "P5 vs 2D-acceleration" numbering note is **resolved**: 2D acceleration shipped and is no longer a
 pending ladder item, so there is nothing left to reconcile.

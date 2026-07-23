@@ -45,7 +45,11 @@
 // v_add_co_u32 / v_addc_co_u32 carry pair against vcc; the in-loop +4 bumps use the same pair.
 //
 // ⚠ BYTE-IDENTITY TRAP IN THE IN-LOOP BUMP. `v_add_co_u32_e64 v1, vcc, v1, 4` is TWO dwords (VOP3): VOP2
-//   requires src1 to be a VGPR, so an inline constant in src1 forces the VOP3 encoding — llvm-mc selects it
+// ⚠ THIS FILE IS HUMAN-READABLE REFERENCE ONLY. The authoritative artifact is the hex table committed
+//   in kernel/core/gpu.cyr, which is iron-proven on archaemenid. There is NO build-time assembler
+//   dependency: agnos does not ship, invoke, or require llvm — the shaders were authored once and
+//   their bytes are the source of truth. If these ever need regenerating, do it through mabda's
+//   sovereign Cyrius gfx9 encoder (mabda/src/gfx9_encode.cyr), NEVER a C/C++ toolchain.
 //   automatically, the _e64 suffix here is documentation, not coercion. Writing the commuted, mathematically
 //   identical `v_add_co_u32 v1, vcc, 4, v1` collapses to ONE dword of VOP2 and changes both the instruction
 //   bytes and the branch displacement. The shipped table is 38 dwords with a -17 dword branch; the commuted
@@ -71,11 +75,9 @@
 //
 // REGISTERS: v0 = workitem id (SPI-supplied) · v9 = tid*16 (a/b slice byte offset) · v10 = tid*4 (out byte
 // offset, LIVE ACROSS THE LOOP) · v1:v2 = a cursor · v3:v4 = b cursor · v5 = a[k] · v6 = b[k] · v7 = product
-// · v8 = accumulator. v11 is unused; next_free_vgpr is declared 12 so llvm-mc harvests RSRC1 = 0x002C0042,
 // which is exactly GPU_COMPUTE_PGM_RSRC1_V12 — the VGPR granule is 4 on gfx9, so 11 and 12 encode the same
 // RSRC1 and 12 is written to match the constant's name.
 //
-// The .amdhsa_kernel block below exists so llvm-mc COMPUTES RSRC1/RSRC2 rather than having them hand-counted
 // — gpu_regs.cyr:1033-1035 warns that a miscounted RSRC word is "wrong, not slow", and there is no QEMU path
 // for any of kernel/core/gpu.cyr, so a bad word fails as a burn on the operator's only dev machine.
 // ieee_mode/denorm_32 are pinned to agnos's values (0/0) against LLVM's defaults of 1/3. This kernel does no
@@ -83,8 +85,7 @@
 // waiting to be blamed for something else.
 //
 // PROVENANCE: this file is a RECONSTRUCTION. The 38 dwords were hand-typed into gpu_shader_dispatch4 in
-// kernel/core/gpu.cyr and iron-proven before scripts/gfx9-asm.sh existed; this source is written to
-// reassemble byte-identically to that shipped table so the gfx9-asm-check.sh gate can finally cover it.
+// reassemble byte-identically to that shipped table; the committed hex remains the iron-proven authority.
 // Byte-identity is the whole deliverable — nothing here may be "improved".
 .amdgcn_target "amdgcn-amd-amdhsa--gfx90c"
 .text

@@ -62,7 +62,11 @@
 //
 // Straight-line, 17 dwords, no branches and no loop — one lane, one element, one round trip.
 //
-// DESCRIPTOR / RSRC HARVEST (llvm-mc -mcpu=gfx90c, scripts/gfx9-asm.sh):
+// ⚠ THIS FILE IS HUMAN-READABLE REFERENCE ONLY. The authoritative artifact is the hex table committed
+//   in kernel/core/gpu.cyr, which is iron-proven on archaemenid. There is NO build-time assembler
+//   dependency: agnos does not ship, invoke, or require llvm — the shaders were authored once and
+//   their bytes are the source of truth. If these ever need regenerating, do it through mabda's
+//   sovereign Cyrius gfx9 encoder (mabda/src/gfx9_encode.cyr), NEVER a C/C++ toolchain.
 //   RSRC1 = 0x002C0040   == GPU_COMPUTE_PGM_RSRC1_MIN (gpu_regs.cyr:994), which is what
 //                           gpu_shader_dispatch3 actually programs (gpu.cyr:4021). VGPRS field 0 = 4 VGPRs,
 //                           and v0..v3 is exactly what this kernel allocates.
@@ -75,7 +79,6 @@
 //   (The SGPR field is pinned at 1 = 16 SGPRs for any .amdhsa_next_free_sgpr from 4 to 9 on this target, so
 //   only the VGPR count is a live choice.)
 //
-// The .amdhsa_kernel block exists so llvm-mc COMPUTES RSRC1/RSRC2 instead of anyone hand-counting them;
 // gpu_regs.cyr:1033-1035 warns that a miscounted RSRC word is "wrong, not slow". ieee_mode and
 // float_denorm_mode_32 are pinned to agnos's values (0/0) against LLVM's defaults of 1/3 — this kernel does
 // no float arithmetic at all, but a descriptor that disagrees with every other shader in the arena is a

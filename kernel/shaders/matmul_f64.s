@@ -57,14 +57,18 @@
 // issued back to back and ONE s_waitcnt vmcnt(0) covers both — they are independent, so serialising them
 // with two waits would only cost latency. The branch is written as a LABEL here; it assembles to the raw
 // -18-dword displacement (0xBF85FFEE) that the shipped table carries, and that equality is checked by
-// scripts/gfx9-asm-check.sh rather than trusted.
+// the shipped table (that displacement is part of the committed hex, which is the source of truth).
 //
 // KERNARGS (COMPUTE_USER_DATA_0..5, USER_SGPR=6 => RSRC2 0x0C = GPU_COMPUTE_RSRC2_KERNARG3):
 //   s[0:1] = A base   s[2:3] = B base   s[4:5] = C base — each 64 doubles / 512 bytes, row-major.
 // The final store is `glc`, matching the integer crown: the CPU polls C out of the carveout immediately
 // after the dispatch retires, so the write must not sit in a non-coherent cache.
 //
-// The .amdhsa_kernel block below exists so llvm-mc COMPUTES RSRC1/RSRC2 rather than having them
+// ⚠ THIS FILE IS HUMAN-READABLE REFERENCE ONLY. The authoritative artifact is the hex table committed
+//   in kernel/core/gpu.cyr, which is iron-proven on archaemenid. There is NO build-time assembler
+//   dependency: agnos does not ship, invoke, or require llvm — the shaders were authored once and
+//   their bytes are the source of truth. If these ever need regenerating, do it through mabda's
+//   sovereign Cyrius gfx9 encoder (mabda/src/gfx9_encode.cyr), NEVER a C/C++ toolchain.
 // hand-counted — gpu_regs.cyr:1033-1035 warns a miscounted RSRC word is "wrong, not slow". Harvested here:
 // RSRC1 = 0x002C0043 (== GPU_COMPUTE_PGM_RSRC1_F64) and RSRC2 = 0x0000000C (== GPU_COMPUTE_RSRC2_KERNARG3),
 // both matching the constants gpu.cyr already dispatches with. ieee_mode/denorm_32 are pinned to agnos's

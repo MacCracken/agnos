@@ -135,7 +135,11 @@
 // emitter already hardcodes.
 //
 // ⚠⚠ RSRC1 IS **NOT** GPU_COMPUTE_PGM_RSRC1_V12. THIS IS THE ONE WAY TO LOSE THE BURN. ⚠⚠
-// llvm-mc harvests 0x002C0082 for this kernel (12 VGPRs / 24 SGPRs) and NO SUCH CONSTANT EXISTS in
+// ⚠ THIS FILE IS HUMAN-READABLE REFERENCE ONLY. The authoritative artifact is the hex table committed
+//   in kernel/core/gpu.cyr, which is iron-proven on archaemenid. There is NO build-time assembler
+//   dependency: agnos does not ship, invoke, or require llvm — the shaders were authored once and
+//   their bytes are the source of truth. If these ever need regenerating, do it through mabda's
+//   sovereign Cyrius gfx9 encoder (mabda/src/gfx9_encode.cyr), NEVER a C/C++ toolchain.
 // gpu_regs.cyr today — it has MIN 0x002C0040, V12 0x002C0042, F64 0x002C0043, GLYPH 0x002C00C2,
 // GRID/COV/GRAD 0x002C00C3. blend_premul is dispatched at gpu.cyr:1595 with V12, and the sibling
 // perm.s deliverable legitimately reuses V12, so copying either call site is the obvious integrator
@@ -144,12 +148,10 @@
 // slow" class gpu_regs.cyr:1033-1035 warns about, and the first thing it corrupts here is the VCC
 // carry chain in the address arithmetic — i.e. lanes reading and writing the wrong pixels, or off the
 // end of the arena into the VM fault sink. ADD:
-//     var GPU_COMPUTE_PGM_RSRC1_PK = 0x002C0082;  # blend_pk: 12 VGPRs, 24 SGPRs (llvm-mc computed)
 // and pass it for blend_pk ONLY. (GLYPH's 0x002C00C2 would also be *safe* — same 12 VGPRs, 32 SGPRs,
 // over-allocation only costs occupancy — but reusing a constant named for another kernel is how the
 // next recount goes wrong. Over-allocating is survivable; under-allocating is not.)
 
-// The .amdhsa_kernel block below exists so llvm-mc COMPUTES RSRC1/RSRC2 for us. gpu_regs.cyr:1033-1035
 // warns a hand-counted RSRC word is "wrong, not slow"; deriving it from the same source that assembled
 // the code removes that class of bug entirely — and this kernel adds 5 SGPRs over blend_premul, which
 // is exactly the kind of recount a human forgets. ieee_mode/denorm are pinned to agnos's values (0/0);
@@ -191,7 +193,6 @@ blend_pk:
 
     // ---- op_sel / op_sel_hi are written out EXPLICITLY on every VOP3P below. ------------------
     // The mnemonic default IS op_sel:[0,0(,0)] op_sel_hi:[1,1(,1)] (verified by disassembling what
-    // llvm-mc emits for a bare mnemonic), so most of these are spelled-out defaults. They are spelled
     // out anyway because the ONE line that must differ is invisible otherwise, and getting it wrong
     // ASSEMBLES CLEAN AND COMPUTES THE WRONG ANSWER IN THE HIGH LANE ONLY. op_sel_hi[i]=1 means
     // "source i's lane-1 input is bits[31:16]"; =0 means "take bits[15:0] for both lanes".

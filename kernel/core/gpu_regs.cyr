@@ -1025,7 +1025,7 @@ var GPU_ACQUIRE_COHER_SIZE_HI = 0x00FFFFFF;
 var GPU_ACQUIRE_POLL          = 0x0000000A;
 
 # --- C2g-1: first MULTI-THREAD dispatch (1 workgroup, 64 threads; out[tid]=tid) ---
-# All 11 shader dwords are llvm-mc(-mcpu=gfx90c) ground-truth. Only ONE compute-reg differs
+# All 11 shader dwords are iron-proven gfx90c ground-truth (committed hex is authoritative). Only ONE compute-reg differs
 # from C2f: NUM_THREAD_X 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 => 64 threads in ONE workgroup).
 var GPU_SHADER_OUT2_SUBOFF = 0x16000;    # 64-dword (256 B) per-thread output array. FRESH slot past the
 # dummy page (0x15000..0x16000) that C2f NEVER touched — so no
@@ -1054,18 +1054,18 @@ var GPU_COMPUTE_PGM_RSRC1_V12  = 0x002C0042; # RSRC1 with VGPRS=2 (12 VGPRs) —
 var GPU_PM4_SET_SH_REG_N6     = 0xC0067600;
 
 # --- S3 (1.56.x): grid-dispatched alpha blend into the scanout back buffer -----------------------------
-# BOTH RSRC words are HARVESTED from llvm-mc via blend_rect.s's .amdhsa_kernel descriptor — never
+# BOTH RSRC words were derived at authoring time from blend_rect.s's .amdhsa_kernel descriptor — never
 # hand-counted. RSRC1 differs from the V12 value only in the SGPR field (blend_rect uses s0..s15 where
 # blend_premul used s0..s7); RSRC2 adds TGID_X_EN(1<<7)|TGID_Y_EN(1<<8) to the 3-kernarg 0x0C, which is
 # what makes the workgroup id reach the shader at all. A wrong TGID bit here does not fault — every
 # workgroup would silently read tgid 0 and blend the same 64 pixels 256 times over.
-var GPU_COMPUTE_PGM_RSRC1_GRID = 0x002C00C3; # blend_rect: 16 VGPRs, 32 SGPRs (llvm-mc computed)
-var GPU_COMPUTE_RSRC2_GRID2D   = 0x0000018E; # USER_SGPR=7 | TGID_X_EN | TGID_Y_EN (llvm-mc computed)
+var GPU_COMPUTE_PGM_RSRC1_GRID = 0x002C00C3; # blend_rect: 16 VGPRs, 32 SGPRs (computed at authoring; the committed value is authoritative)
+var GPU_COMPUTE_RSRC2_GRID2D   = 0x0000018E; # USER_SGPR=7 | TGID_X_EN | TGID_Y_EN (computed at authoring; the committed value is authoritative)
 var GPU_PM4_SET_SH_REG_N7      = 0xC0077600;
 var GPU_PM4_SET_SH_REG_N8      = 0xC0087600;  # SET_SH_REG, 8 values (blend_cov adds the uniform COLOUR)
 # --- coverage blend (blend_cov.s): AA text / shape primitive ---
-var GPU_COMPUTE_PGM_RSRC1_COV  = 0x002C00C3; # 16 VGPRs, 32 SGPRs (llvm-mc computed)
-var GPU_COMPUTE_RSRC2_COV      = 0x00000190; # USER_SGPR=8 | TGID_X_EN | TGID_Y_EN (llvm-mc computed)
+var GPU_COMPUTE_PGM_RSRC1_COV  = 0x002C00C3; # 16 VGPRs, 32 SGPRs (computed at authoring; the committed value is authoritative)
+var GPU_COMPUTE_RSRC2_COV      = 0x00000190; # USER_SGPR=8 | TGID_X_EN | TGID_Y_EN (computed at authoring; the committed value is authoritative)
 var GPU_COV_SHADER_SUBOFF      = 0x51000;    # slot 1 — blend_cov blob (67 dwords). Was 0x16000 == SHADER_OUT2.
 var GPU_COV_MASK_SUBOFF        = 0x40000;    # 256x256 8bpp coverage mask = 64 KB, clear of 0x30000's rect-2 src
 var GPU_COV_N     = 256;                     # mask is NxN; N is a multiple of 64 here, the guard is proven elsewhere
@@ -1078,7 +1078,7 @@ var GPU_COV_DST_R = 0xFFE8E8E8;
 # --- 1bpp glyph expansion (glyph_1bpp.s): the bitmap-text primitive ---
 # Shares RSRC2 with blend_cov (USER_SGPR=8 | TGID_X | TGID_Y) — only the VGPR count differs, which is why
 # the 8-kernarg dispatcher takes rsrc1 as a parameter instead of being duplicated.
-var GPU_COMPUTE_PGM_RSRC1_GLYPH = 0x002C00C2; # 12 VGPRs, 32 SGPRs (llvm-mc computed)
+var GPU_COMPUTE_PGM_RSRC1_GLYPH = 0x002C00C2; # 12 VGPRs, 32 SGPRs (computed at authoring; the committed value is authoritative)
 var GPU_GLYPH_SHADER_SUBOFF     = 0x52000;    # slot 2 — glyph_1bpp blob (36 dwords)
 var GPU_GLYPH_BMP_SUBOFF        = 0x17800;    # composed 1bpp text bitmap (16 rows x 16 B = 256 B)
 var GPU_GLY_CHARS  = 16;                      # "AGNOS SHADER GPU" — exactly 16, so 4 store32s per row
@@ -1092,7 +1092,7 @@ var GPU_GLY_FG     = 0xFFFFE060;
 # --- linear gradient (grad_linear.s): the last drawing primitive on the 1.56.x list ---
 # Shares RSRC2 with blend_rect (USER_SGPR=7 | TGID_X | TGID_Y) but with a completely different kernarg
 # MEANING — one pointer plus five scalars, no source buffer at all.
-var GPU_COMPUTE_PGM_RSRC1_GRAD = 0x002C00C3; # 16 VGPRs, 32 SGPRs (llvm-mc computed)
+var GPU_COMPUTE_PGM_RSRC1_GRAD = 0x002C00C3; # 16 VGPRs, 32 SGPRs (computed at authoring; the committed value is authoritative)
 var GPU_GRAD_SHADER_SUBOFF     = 0x53000;    # slot 3 — grad_linear blob (70 dwords). Was 0x18000 == KERNARG_IN.
 
 # --- plan-S4: v_perm_b32 byte crossbar + the VOP3P packed blend ----------------------------------------
@@ -1105,7 +1105,7 @@ var GPU_PK_SHADER_SUBOFF       = 0x55000;    # slot 5 — blend_pk blob (61 dwor
 # This is the highest-probability integration error in the bite, because perm.s legitimately uses _V12 and
 # the two kernels sit side by side. Harvested from blend_pk.s's own .amdhsa_kernel descriptor, never
 # hand-counted (gpu_regs.cyr's own warning: a miscounted RSRC word is *wrong*, not slow).
-var GPU_COMPUTE_PGM_RSRC1_PK   = 0x002C0082; # blend_pk: 12 VGPRs, 24 SGPRs (llvm-mc computed)
+var GPU_COMPUTE_PGM_RSRC1_PK   = 0x002C0082; # blend_pk: 12 VGPRs, 24 SGPRs (computed at authoring; the committed value is authoritative)
 var GPU_PERM_SRC_SUBOFF        = 0x1C000;    # 64 source pixels (256 B)
 # ⚠ perm writes FOUR dwords per lane (identity / involution / unpack-repack / swap), unlike every other
 # kernel in this arena, so this slot is 1 KB and not 256 B. A short buffer would run into PK_OUT below and,

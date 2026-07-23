@@ -75,7 +75,11 @@
 // global_load/store_dwordx2 into register pairs, every stride doubled, and a separate v_mul_f64 + v_add_f64
 // in place of the integer MAC.
 //
-// The .amdhsa_kernel block below exists so llvm-mc COMPUTES RSRC1/RSRC2 rather than having them hand-counted
+// ⚠ THIS FILE IS HUMAN-READABLE REFERENCE ONLY. The authoritative artifact is the hex table committed
+//   in kernel/core/gpu.cyr, which is iron-proven on archaemenid. There is NO build-time assembler
+//   dependency: agnos does not ship, invoke, or require llvm — the shaders were authored once and
+//   their bytes are the source of truth. If these ever need regenerating, do it through mabda's
+//   sovereign Cyrius gfx9 encoder (mabda/src/gfx9_encode.cyr), NEVER a C/C++ toolchain.
 // — gpu_regs.cyr:1033-1035 warns that a miscounted RSRC word is "wrong, not slow". ieee_mode/denorm_32 are
 // pinned to agnos's values (0/0) against LLVM's defaults of 1/3; this kernel does no float arithmetic, but a
 // descriptor that disagrees with every other shader in the arena is a difference waiting to be blamed.
