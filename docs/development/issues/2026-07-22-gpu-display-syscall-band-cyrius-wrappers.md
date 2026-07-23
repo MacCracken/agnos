@@ -23,7 +23,7 @@ Mirror: `cyrius/docs/development/issues/2026-07-22-agnos-gpu-display-syscall-ban
   were implemented at 1.56.2/1.56.3 and are **WITHDRAWN — both numbers are free again and NO wrapper is
   wanted for either.** A gradient `#95` was planned and **never minted**.
 
-  **Why:** the arc's own decision row D-3 (`planning/kernel-shader-arc-156x.md`) chose ONE descriptor
+  **Why:** the arc's own decision row D-3 (`docs/development/planning/gpu.md`) chose ONE descriptor
   syscall taking an **array of ops** and explicitly rejected one-number-per-op. 1.56.2/1.56.3 shipped the
   rejected shape; 1.56.4 restores the decision. Nothing was wrapped in the interim — `lib/syscalls*.cyr`
   stops at `#89` — so **this retraction costs the cyrius side nothing**, which is exactly why it is being

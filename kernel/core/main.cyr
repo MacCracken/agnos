@@ -718,7 +718,7 @@ hda_active_ctl = 0;
 # the klug log. Read-only, lowest-risk bite — no rings, no firmware, no DMA, no
 # device-state writes. No-op off archaemenid (QEMU has no gfx90c). Iron-validated
 # via `klug > /f/gpu.txt`. See kernel/core/gpu.cyr + agnosticos
-# planning/kernel-gpu-arc-154x.md (bite F0); Thrust C/P machinery is C0+.
+# planning/gpu.md (bite F0); Thrust C/P machinery is C0+.
 gpu_probe();
 # GPU arc C0 (1.54.1) — firmware-reality check: read-only dump of CP/MEC/RLC
 # state + PSP sign-of-life to decide whether the compute microcode is resident
@@ -1063,23 +1063,30 @@ gpu_shader_batch_test();
 # verifies the readback matches the saved value AND that OPTC underflow did not change.
 # The arc has paid for a careless DCN write once already: SCANOUT_LINEAR wrote the wrong register under the
 # OTG lock and blacked the box on iron.
-# D1 = whole-scanout R/B crossbar (NOT plan-S4's per-surface swap — different capability, both needed).
-# D2 = MPCC global alpha, an ORACLE for base+offsets+field placement+latching, not a desktop feature.
-# Gated #ifdef DCN_DLANE; first iron burn: BURN_DCN_DLANE.
-#ifdef DCN_DLANE
-gpu_hubp_crossbar_test();
-gpu_mpc_galpha_test();
-#endif
+# D1 (whole-scanout R/B crossbar) and D2 (MPCC global alpha) are GONE, code and flag, 2026-07-23.
+#
+# THE LANE IS FINISHED. It cost five iron burns and it produced its answer: D2 closed once the test was made
+# maximally loud (alpha to zero against a deliberately-set blue background), and D1 closed with the A/B/C/D/E
+# phase burn that put the HUBPRET crossbar and SURFACE_PIXEL_FORMAT in one boot instead of one hypothesis per
+# flash. There is nothing left to run, so there is no call site here and no DCN_DLANE flag to build.
+#
+# What the lane cost is worth keeping even though the code is not. Four of those five burns were lost to the
+# HARNESS, not the register work — a hold built on a bounded vblank poll that silently collapsed from 4 s to
+# ~50 ms; two burns whose stimulus was an achromatic console, where every pixel has R == G == B and so ANY
+# permutation of the colour crossbar is the identity by arithmetic; and a register value decoded by eye.
+# The lesson is [[feedback_dlane_five_burns_what_went_wrong]]: a test whose oracle is a human looking at the
+# screen does not belong in a boot self-test, because boot cannot ask a human anything. If a future display
+# bite needs that shape, build the trigger THEN, for that bite — the primitives it would want
+# (gpu_otg_lock / gpu_dcn_write_committed) are still in gpu.cyr and are now the only thing left of this lane.
 
 
 # GPU arc 1.55.x (Thrust P) P4: scanout-residue clear.
 # ⚠ SCANOUT_LINEAR (v3) is RETIRED — it wrote the WRONG register (0x607) under the OTG lock and BLACKED the
 # box on iron. gpu_scanout_clear_tiling is now a hard no-op; do not build this flag. Kept only so a stale
 # build can't crash. The real path is SCANOUT_PATTERN below.
-#ifdef SCANOUT_LINEAR
-kprintln("gpu: scanout-linear fix armed", 29);
-gpu_scanout_clear_tiling();
-#endif
+# Call site DELETED 1.56.x. The flag is retired and the function is a hard no-op; keeping a reachable call
+# to a routine that once blacked the box on iron is a loaded gun with the safety on. Not registered in
+# registered anywhere either — a retired lever gets no new trigger.
 
 # P4 bisector (2026-07-20, register-truth): flip scanout to an agnos-owned buffer painted with a bars/stripes/
 # checker pattern, using ONLY the P0-verified address flip (zero hang risk). The photo splits the banding into
@@ -1150,7 +1157,7 @@ gpu_pixclk_discover();
 # recovery is flashing a kernel built without this flag. The default/MVP kernel therefore never touches
 # DIG_MODE and cannot black-screen loop.
 #ifdef HDMI_ATOM
-# A4 (hdmi-modeset-arc-155x.md) — sovereign firmware HDMI transmitter bring-up, BEFORE the audio programming.
+# A4 (gpu.md) — sovereign firmware HDMI transmitter bring-up, BEFORE the audio programming.
 # The DCN 2.1 transmitter enable is an ATOM command (#76, v1_6): the GOP ran it as DVI at boot, so agnos
 # re-runs DIGxEncoderControl(HDMI) [true HDMI mode + data islands — what the raw DIG_MODE 2->3 flip only
 # approximates] then DIG1TransmitterControl(ENABLE) [the firmware PHY output edge the flip cannot produce].
@@ -2849,6 +2856,7 @@ kprintln("exec: running /bin/agnova", 25);
 sh_exec("run /bin/agnova execute --device /dev/nvme0n1 --disk-backend=native-block --scratch-base 524288 --disk-sectors 1572864 --until partition --user t --i-mean-it", 157);
 kprintln("exec: agnova returned", 21);
 #endif
+
 
 #ifdef NAAD_RING3_SELFTEST
 # 1.53.x B6 (arc-closer): naad oscillator END-PROOF. Runs /bin/naadex (naad/, built --agnos) —

@@ -12,7 +12,7 @@
 # ISA) compute + DCN 2.1 display. Convergent sources: Linux amdgpu
 # renoir_ip_offset.h / nbio_7_0_offset.h / gc_9_0_offset.h / dcn_2_1_0_offset.h
 # + amdgpu_device.c (BAR5 = rmmio; direct-vs-indirect access). Full plan +
-# bite ladder: agnos docs/development/planning/kernel-gpu-arc-154x.md.
+# bite ladder: agnos docs/development/planning/gpu.md.
 
 # --- PCI identity (function 0 = the iGPU) ---
 var GPU_VENDOR_AMD    = 0x1002;
@@ -257,7 +257,7 @@ var GPU_SHM_SLOT_SIZE       = 0x200000;   # 2 MB per slot — matches SHM_MAX_SI
 #    enable (link_transmitter_control) routes through the DMCUB on this gen: command_table2.c
 #    transmitter_control_v1_6/7 branches to transmitter_control_dmcub when dmub_command_table=true (dcn21
 #    default). Iron-confirmed by the modeset capture: DMCUB_INBOX1_WPTR advanced 106×64B, zero host PHY writes.
-#    The T-series (hdmi-modeset-arc-155x.md) builds DMCUB inbox submission to send DIGX_ENCODER_CONTROL(HDMI)
+#    The T-series (gpu.md) builds DMCUB inbox submission to send DIGX_ENCODER_CONTROL(HDMI)
 #    + DIG1_TRANSMITTER_CONTROL(ENABLE) — the true-HDMI-mode commit the live DIG_MODE flip skips.
 #  * The DTO produces a constant 24.000 MHz wall clock. **48 kHz NEVER enters PHASE/MODULE** —
 #    get_azalia_clock_info_{hdmi,dp}() take no sample-rate argument. Fs comes from the HDA converter format
@@ -508,7 +508,7 @@ var GPU_R_AFMT_INTERRUPT_STATUS = 0x2079;
 var GPU_R_AFMT_AUDIO_CRC_CONTROL = 0x20A2;  # CRC_EN b0 · CRC_CONT b4 · CRC_SOURCE b8 · CH_SEL [15:12] · COUNT [31:16]
 var GPU_R_AFMT_AUDIO_CRC_RESULT  = 0x20A8;  # CRC_DONE b0 (RO) · CRC [31:8] (RO)
 
-# === DMCUB (DMU microcontroller) — the TRANSMITTER-enable path (T-series, hdmi-modeset-arc-155x.md) ==========
+# === DMCUB (DMU microcontroller) — the TRANSMITTER-enable path (T-series, gpu.md) ==========
 # All BASE_IDX 2 (GPU_BASE_DCN_2). Offsets VERIFIED against dcn_2_1_0_offset.h (identical in dcn_2_0_0);
 # WPTR cross-checks the iron capture (abs dword 0x34C0+0x3280 = 0x6740). ⚠ ORDER GOTCHA: WPTR is 0x3280,
 # RPTR is 0x3281 — WPTR comes BEFORE RPTR. The CNTL/SCRATCH/CC_DC_PIPE_DIS reads are in the ALWAYS-ON DMU

@@ -5,6 +5,64 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed — the D lane, code and flag. It was FINISHED and I re-armed it.
+
+D1 (HUBPRET channel crossbar) and D2 (MPCC global alpha) **closed** across the five iron burns of 2026-07-22:
+D2 the moment the test was made maximally loud (alpha to zero against a deliberately-set blue background),
+D1 with the A/B/C/D/E phase burn that put the crossbar and `SURFACE_PIXEL_FORMAT` in one boot instead of one
+hypothesis per flash. The lane produced its answer. There was nothing left to run.
+
+`gpu_hubp_crossbar_test`, `gpu_mpc_galpha_test`, `gpu_d1_paint_bars`, the `DCN_DLANE` build flag and the
+`BURN_DCN_DLANE` burn arm are all deleted. Boot loses ~39 s of blind holds and the bare kernel is ~6 KB
+smaller.
+
+⚠ **The process note is the point of this entry.** The first version of this change did the opposite: it
+*rebuilt* the lane as a permanent operator-triggered harness — a new kernel file, a minted syscall, a
+ring-3 tool, a QEMU smoke, an ABI row and a burn card telling the operator to go photograph D1 again — on
+the strength of the arc plan and iron log still listing D1/D2 as "outstanding". Those docs predate the burns
+that closed them. The tell that should have stopped it much earlier: with the lane gone,
+`gpu_otg_lock` / `gpu_dcn_write_committed` have **zero callers**, so the entire apparatus existed to serve a
+test that was already done. Sharpening a harness is not the same as asking whether the test should still
+exist, and the second question is the cheaper one. See [[feedback_dlane_five_burns_what_went_wrong]].
+
+What the lane knew is preserved as commentary in `gpu.cyr` where the tests used to be: the achromatic-
+stimulus arithmetic, the unindexed-offset defect, the MPCC MODE/MULT veto analysis, and why
+`gpu_otg_lock` / `gpu_otg_commit_unlock` / `gpu_dcn_write_committed` are kept despite having no callers —
+they encode the fact that a bare DCN write lands in the shadow copy and reads back as if it applied.
+
+Also removed: the `SCANOUT_LINEAR` call site. The flag was already retired (it wrote the wrong register
+under the OTG lock and blacked the box on iron) and the function is a hard no-op; a reachable call to it was
+a loaded gun with the safety on.
+
+### Fixed — module-global initialisers that are EXPRESSIONS never ran
+
+`var gpu_scanout_pid = 0 - 1;` left the variable at **0** for the entire boot. Measured, not inferred: at
+`gpu_probe()` entry it reads 0 while a literal `0 - 8` prints `-8` on the same line. cyrius emits kmode gvar
+inits in `EMIT_GVAR_INITS`, which runs after `PARSE_PROG` — and `PARSE_PROG` here is the whole boot, ending
+in `arch_halt()`. A plain literal is folded into the data section and is fine; `0 - 1` is not folded. The two
+declarations look identical at the call site.
+
+It is not cosmetic. `gpu_release_pid` matches on `gpu_scanout_pid != pid`, and the exec path really does hand
+pid **0** to the first `run` of a boot — so that program matched a scanout owner it had never claimed and
+re-pointed the scanout on its way out. Survivable only because the restore re-programs the address already
+programmed. Every `gpu_scanout_pid < 0` "the console owns the screen" test also read false for the whole
+boot.
+
+`gpu_sentinels_init()` now assigns the five gpu.cyr sentinels explicitly at the top of `gpu_probe()`
+(`gpu_pci_idx`, `gpu_display_pipe`, `gpu_scanout_pid`, `gpu_audio_dp`, `gpu_audio_dig`); verified in QEMU —
+`display pipe -1`, `scanout owner pid -1`. Eight more across fatfs / exfat / ext2 / ahci / hda are identified
+but **not** changed: several are cache tags where 0 is a valid value, so each needs its own reasoning, and
+several are on the FS hot path where a wrong change costs more than the bug. Filed:
+`docs/development/issues/2026-07-23-kernel-expression-gvar-initialisers-never-run.md`.
+
+### Fixed — a burn-verify marker that verified nothing
+
+`burn-prep.sh`'s `verify_marker` greps the artifact, and its own rule is "a kprintln inside the flag's own
+`#ifdef`, in a function called unconditionally". `*SCANOUT_REGDUMP*` matched `"HUBP regdump begin"`, which
+lives **inside** `gpu_scanout_regdump()`, an always-compiled function — and this tree does not run DCE by
+default, so that string is in every binary and the check passed on any build. Repointed at the boot call
+site's own banner, which is inside the `#ifdef`.
+
 ### Fixed — the D lane wrote SHADOW registers and never committed (burn 1, 2026-07-22)
 
 Both bites read back exactly what they wrote and **nothing appeared on the panel**:
@@ -54,6 +112,10 @@ construction. It now reports both values, fails only on a genuine `0 → 1` tran
 1.55.x quiet-boot scanout banding lived on exactly this pipe. Recorded rather than dismissed.
 
 ### Added — the D lane: D1 (HUBP channel crossbar) + D2 (MPCC global alpha) — BUILT, burn-ready
+
+> ⚠ **SUPERSEDED LATER IN THIS SAME UNRELEASED CYCLE — see "Removed — the D lane" above.** The lane
+> closed on iron and the code is deleted. This entry and the two `Fixed` entries below are kept because
+> they record what the five burns actually established; the code they describe is gone.
 
 The last two bites in the 1.56.x ladder, and **the only ones in the whole arc that write the live console
 pipe**. The arc has already paid for a careless DCN write once — `SCANOUT_LINEAR` (v3) wrote the wrong
@@ -439,7 +501,7 @@ panel showed it lit, and a single collapsed verdict would have hidden the disagr
 
 ### Fixed — the doc error that caused the arm-D design
 
-`docs/development/planning/kernel-gpu-arc-154x.md` listed as a **key learning** that "`ACQUIRE_MEM` is
+`docs/development/planning/gpu.md` listed as a **key learning** that "`ACQUIRE_MEM` is
 write-*back*, not invalidate". That is wrong for the post-dispatch variant, and it is the root cause of arm
 D's design: the author reasoned about exactly this hazard one comment earlier and reintroduced it four lines
 later, because the plan doc said the packet could not invalidate. Corrected in place with the derivation.
@@ -511,7 +573,7 @@ unconditional; the result is that they are now *justified* rather than inherited
 
 ## [1.56.4] — 2026-07-22 — the shader arc realigned to its own plan; #92 iron-proven end to end
 
-The arc's plan doc (`docs/development/planning/kernel-shader-arc-156x.md`) settled the syscall shape as
+The arc's plan doc (`docs/development/planning/gpu.md`) settled the syscall shape as
 decision **D-3** before any code was written. 1.56.2/1.56.3 shipped the option D-3 explicitly **rejected**,
 and renumbered the bite IDs so the plan no longer read against the CHANGELOG. This entry restores both, and
 fixes two live defects the re-audit surfaced along the way.
@@ -1724,7 +1786,7 @@ always-on DMU-domain registers — `CC_DC_PIPE_DIS`, `DMCUB_CNTL` (ENABLE bit16)
 attach-ready → Path B` verdict. Every offset is verified against `dcn_2_1_0_offset.h` (identical in
 `dcn_2_0_0`); the reads are safe on a live GOP-lit DMCUB (amdgpu's own cold `dmub_dcn20_is_hw_init` probes
 exactly these with no power sequencing, unlike the gate-able pipe blocks that hung the earlier blind scan).
-Roadmap: `docs/development/planning/hdmi-modeset-arc-155x.md` § MECHANISM RESOLVED (T-series ladder).
+Roadmap: `docs/development/planning/gpu.md` § MECHANISM RESOLVED (T-series ladder).
 
 ### ★ The feed is PROVEN correct — a Linux userspace reproduction of agnos's feed plays sound
 
@@ -1871,7 +1933,7 @@ kept regardless of the unmute-ordering outcome.
 The HDMI-audio silence is a **feed-before-drain ordering bug** — a driver-class defect, exactly as the
 operator kept insisting, not the DMUB/PHY wall 1.55.18 feared. This cut ships the root-cause fix, the
 Stage-1 link-event edges it supersedes, the in-boot fix-profile sweep harness, and the register-diff
-closeout, plus a first-principles cross-system plan (`docs/development/planning/hdmi-audio-plan.md`).
+closeout, plus a first-principles cross-system plan (`docs/development/planning/gpu.md`).
 
 ### Fixed — the codec fed the AFMT audio FIFO for seconds before the drain was armed (THE root cause)
 
@@ -3370,7 +3432,7 @@ load-bearing, not stylistic.
   missed PIT wrap ~3%, non-standard mode) lands far outside. The tolerance is itself the check on the whole
   derivation.
 
-### Derivation notes (durable — see `docs/development/planning/kernel-display-arc-155x.md`)
+### Derivation notes (durable — see `docs/development/planning/gpu.md`)
 
 - **Both totals hold `total - 1`.** `dcn10_optc.c` `optc1_program_timing`: `/* CRTC_H_TOTAL = vesa.h_total - 1 */`
   and, on the line *before* the `OTG_V_TOTAL` write, `v_total = patched_crtc_timing.v_total - 1;`. The V write
@@ -3699,7 +3761,7 @@ Iron-only; flash `--update-all` then `run /bin/klug > p0diag.txt` and read the `
 The GPU **compute** thrust (the 1.54.x arc) is complete end-to-end — sovereign gfx90c compute proven on
 iron through firmware-load → engines → GPUVM → CP/MEC → PM4 → hand-assembled shaders → int + rosnet-bit-correct
 f64 matmul, exposed to ring 3 (#82/#83). This opens the **other half: PIXELS** — own the GOP-lit **DCN 2.1**
-display pipe. Plan: [`docs/development/planning/kernel-display-arc-155x.md`](docs/development/planning/kernel-display-arc-155x.md).
+display pipe. Plan: [`docs/development/planning/gpu.md`](docs/development/planning/gpu.md).
 
 ### Added
 
@@ -4123,7 +4185,7 @@ store reached the array. This cut isolates the cause.
   workitem-id ⟹ the C2g-1 failure is the address arithmetic; `o0 = 0xDEADBEEF` ⟹ zero waves launched with
   `NUM_THREAD_X=64` ⟹ the dispatch config. `kernel/core/gpu_regs.cyr`: `GPU_SHADER_OUT2_SUBOFF` → `0x16000`.
   Diagnostic-only, no GPU-behavior change (localize before repairing). Iron-only; flash `--update-all`.
-  Decision tree + repair paths: agnosticos `iron-nuc-zen-log.md#tracker-154x-c2g1` + `gpu-arc-handoff.md`.
+  Decision tree + repair paths: agnosticos `iron-nuc-zen-log.md#tracker-154x-c2g1` + `docs/development/planning/gpu.md`.
 
 ## [1.54.18] — 2026-07-13 — GPU arc C2g-1 burn 1 diagnostic: dump raw output values + changed-count
 
@@ -4765,7 +4827,7 @@ Opens the **1.54.x kernel GPU arc** — *push pixels AND data through the GPU* (
 crown). Target: the archaemenid AMD Cezanne iGPU (`04:00.0`, `1002:1638`, gfx90c/GCN5 compute +
 DCN 2.1 display). This cut is **bite F0**, the read-only foundation the whole arc stands on;
 the register dump is **iron-only** (QEMU emulates no gfx90c/DCN). Full plan + bite ladder:
-`docs/development/planning/kernel-gpu-arc-154x.md`.
+`docs/development/planning/gpu.md`.
 
 ### Added
 

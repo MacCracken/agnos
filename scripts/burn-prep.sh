@@ -87,40 +87,6 @@ if [ -n "${BURN_SHADER_OPS:-}" ]; then
     echo "[2/2] Building the 1.56.4 SHADER-OPS kernel (#92 descriptor seam + cov re-proof + glyph/grad first iron; run /bin/gpublend + /bin/gpucov; capture klug > shader_ops.txt)."
     BUILD_ENV="SHADER_BLEND=1 SHADER_COV=1 SHADER_GLYPH=1 SHADER_GRAD=1"
     BUILD_TAG="SHADER_OPS"
-elif [ -n "${BURN_DCN_DLANE:-}" ]; then
-    # 1.56.x D LANE — D1 (HUBPRET channel crossbar) + D2 (MPCC0 global alpha). Independent of the S lane.
-    #
-    # ⚠⚠ THE ONLY ARM IN THIS ARC THAT WRITES THE LIVE CONSOLE PIPE. The arc has paid for a careless DCN
-    # write once: SCANOUT_LINEAR wrote the wrong register under the OTG lock and BLACKED the box on iron.
-    # Both bites here save the GOP's value first, hold the applied state for ~3 s paced by the OTG frame
-    # counter, then restore UNCONDITIONALLY — the restore is not gated on the apply, on a readback, or on an
-    # ack, because a boot selftest has no operator input and anything conditional could leave the console
-    # wedged with no keyboard to recover it. Each then checks the readback matches AND that OPTC underflow
-    # did not change (an underflow means the pipe missed a fetch deadline — that is how a "successful" poke
-    # corrupts scanout without blanking it).
-    #
-    # ⚠ EVERY PHASE IS TIMESTAMPED so a photo IDENTIFIES ITSELF — you do not have to remember what you saw.
-    # The last 'gpu: [T+NNNNms] ...' line visible in a shot states which state was live when it was taken.
-    # This exists because burn 4 produced two bar photos seconds apart that could not be assigned to a phase
-    # after the fact, which made the D1 result unreadable despite the register work being correct.
-    #
-    # WATCH, in order:
-    #   [T+..] d1 PHASE A - crossbar IDENTITY   -> ~4 s, bars read R G B left to right  (the CONTROL)
-    #   [T+..] d1 PHASE B - crossbar SWAPPED    -> ~8 s, bars MUST read B G R           (the CLAIM)
-    #   [T+..] d1 PHASE C - crossbar RESTORED   -> bars back to R G B
-    #      ⚠ GREEN MUST NOT MOVE in any phase — if green also shifts, the field placement is wrong.
-    #      ONE photo in PHASE A and ONE in PHASE B settles D1. The timestamps make them unambiguous.
-    #   [T+..] d2 global alpha now 255 / 170 / 85 / 0 of 255 -> ~2 s each, screen fading toward BLUE
-    #      ✅ D2 ALREADY PROVEN on burn 4 (full blue at alpha 0, MPCC_CONTROL 0xFF000422). Re-running only
-    #      because it shares the arm; a photo is optional this time.
-    #
-    # A 'RESTORE FAILED' or 'UNDERFLOW changed' line means STOP and power-cycle rather than continuing.
-    # D2 uses ALPHA_BLND_MODE 2 (GLOBAL_ALPHA) ONLY: mode 0 (PER_PIXEL) on the GOP's XRGB surface, where the
-    # X byte is 0x00, reads every pixel as transparent and turns the screen BLACK.
-    # PHOTO IS THE ORACLE for both. CAPTURE: klug > dcn_dlane.txt + two photos (D1 swapped, D2 mid-fade).
-    echo "[2/2] Building the 1.56.x D-LANE kernel (D1 crossbar + D2 global alpha, LIVE PIPE WRITES with dead-man restore; capture klug > dcn_dlane.txt + 2 photos)."
-    BUILD_ENV="DCN_DLANE=1"
-    BUILD_TAG="DCN_DLANE"
 elif [ -n "${BURN_SHADER_BATCH:-}" ]; then
     # plan-S12 — the ONE-SUBMISSION batched frame. The arc's stated CLOSING CONDITION, and the payoff
     # decision D-3 was made for: because #92 was specified as an ARRAY of ops from day one, batching is an
@@ -468,7 +434,10 @@ case "$BUILD_TAG" in *HDMI_SYMCLK_AB*)   verify_marker "symclk-ab: in-boot A/B" 
 case "$BUILD_TAG" in *HDMI_ACR_CTS*)     verify_marker "hdmi acr cts programmed" ;; esac
 case "$BUILD_TAG" in *SCANOUT_PATTERN*)  verify_marker "scanout pattern probe armed" ;; esac
 case "$BUILD_TAG" in *SCANOUT_REDIRECT*) verify_marker "console redirected to agnos scanout buffer" ;; esac
-case "$BUILD_TAG" in *SCANOUT_REGDUMP*)  verify_marker "HUBP regdump begin" ;; esac
+# ⚠ NOT "HUBP regdump begin" — that string lives INSIDE gpu_scanout_regdump(), an always-compiled function,
+# and this tree does not run DCE by default, so it is present in EVERY binary and verified nothing. The
+# marker must be a kprintln inside the flag's own #ifdef; this one is the boot call site's banner.
+case "$BUILD_TAG" in *SCANOUT_REGDUMP*)  verify_marker "hubp regdump build armed" ;; esac
 case "$BUILD_TAG" in *SCANOUT_MATCHGEOM*) verify_marker "scanout matchgeom armed" ;; esac
 case "$BUILD_TAG" in *SDMA_PROBE*)       verify_marker "sdma probe armed" ;; esac
 case "$BUILD_TAG" in *SDMA_RING*)        verify_marker "sdma ring bringup armed" ;; esac
