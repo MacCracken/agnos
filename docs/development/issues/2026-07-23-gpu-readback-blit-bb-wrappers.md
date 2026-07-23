@@ -1,9 +1,11 @@
 # 2026-07-23 — #90 `gpu_readback_shm` + #91 `gpu_blit_bb` now IMPLEMENTED in agnos — promote to wrappers-wanted
 
-**Status:** 🟡 **OPEN** (cyrius leg). Promotes the two **Tier 2** rows of
+**Status:** 🟢 **IRON-PROVEN, wrappers wanted** (cyrius leg still OPEN). Promotes the two **Tier 2** rows of
 [`2026-07-22-gpu-display-syscall-band-cyrius-wrappers.md`](2026-07-22-gpu-display-syscall-band-cyrius-wrappers.md)
 — which said *"declared shape; agnos implements, then cyrius wraps … do not wrap these until agnos ships
-each."* **agnos has now shipped both**, so the trigger has fired: the numbers are no longer reserved-only.
+each."* **agnos has now shipped AND iron-proven both** on archaemenid (`/bin/gpucopy` → `run: exit 95`,
+2026-07-23) — including a fix for a readback-coherence bug (a reused `#90` slot returned a stale cache-line
+ghost; `gpu_readback_shm_sys` now `clflush`es the destination window before the CP-DMA). Both are safe to wrap.
 
 This closes the **numbering hole** in the GPU band. The kernel dispatch was contiguous through #89 and then
 jumped to #92; #90/#91 were live-but-unimplemented. They are now implemented, so ring-3 wrappers can land the

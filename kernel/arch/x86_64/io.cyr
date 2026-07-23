@@ -128,5 +128,17 @@ fn wbinvd() {
     return 0;
 }
 
+# Flush (write-back + invalidate) the cache line containing `addr` in all caches, so a later read of that
+# line misses and refetches from memory. Scoped alternative to wbinvd for DMA-buffer coherence — used by
+# gpu_readback_shm_sys to evict a stale ghost of a REUSED readback slot before the GPU DMA overwrites it,
+# without flushing the whole cache. First arg is at [rbp-8] (same marshaling as outb above).
+fn clflush(addr) {
+    asm {
+        0x48; 0x8B; 0x45; 0xF8;       # mov rax, [rbp-8]   ; addr
+        0x0F; 0xAE; 0x38;             # clflush [rax]
+    }
+    return 0;
+}
+
 fn arch_wait() { asm { hlt; } return 0; }
 fn arch_halt() { asm { cli; hlt; 0xEB; 0xFE; } return 0; }

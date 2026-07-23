@@ -124,6 +124,27 @@ stage_one agnos/gpu-test gpublend.cyr gpublend || rc=1
 stage_one agnos/gpu-test gpucov.cyr   gpucov   || rc=1
 stage_one agnos/gpu-test gpucopy.cyr  gpucopy  || rc=1
 
+# rupantara gpulayer — the ML-layer-on-GPU crown proof (1.54.x C6). A real bias-free MLP up-projection matmul
+# (rosnet linear_fwd 8x8x32) run on the gfx90c shader cores via #83, tiled 8x8 and byte-compared against
+# rupantara's CPU linear_fwd. Exit 95 = byte-identical AND all 4 tiles on the GPU (crown); 96 = identical but
+# 0 GPU tiles (QEMU/host — tiling proven, no GPU); 90 = byte mismatch. Real AMD iron only.
+stage_one rupantara programs/gpulayer.cyr gpulayer || rc=1
+
+# tentib gpumm — the SECOND ML-layer-on-GPU crown (1.54.x C6, INTEGER path). A real ternary BitLinear
+# projection `ternary_matmul_free(qx,sx,Wq,γ,0,y,8,16,32)` run on the gfx90c shader cores via #82, tiled 8x8
+# (K=16 = two k-tiles → exercises cross-tile i64 accumulation), signed (negative qx + ternary Wq), byte-
+# compared against tentib's CPU ternary_matmul_free. Exit 95 = byte-identical AND all 8 tiles on the GPU
+# (crown; bit-exact at ANY K — the integer advantage over the f64 #83 path); 96 = identical, 0 GPU tiles
+# (host/QEMU); 90 = mismatch. Real AMD iron only.
+stage_one tentib programs/gpumm.cyr gpumm || rc=1
+
+# attn11 gpuattn — the THIRD ML-layer-on-GPU crown (1.54.x C6). attn11's OWN forward-projection hook
+# `qlinear_fwd` (src/ops.cyr), wired to route a bias-free K≤8 projection to rupantara's linear_fwd_gpu (#83)
+# on agnos. The proof runs a projection three ways (CPU linear_fwd / direct linear_fwd_gpu / qlinear_fwd hook)
+# and byte-compares. Exit 95 = all identical AND all 4 tiles on the GPU (crown: attn11's hook ran on gfx90c);
+# 96 = identical, 0 GPU tiles (host/QEMU); 90/91 = mismatch (direct/hook). Real AMD iron only.
+stage_one attn11 programs/gpumm.cyr gpuattn || rc=1
+
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE
 # symlinks (-> kriya) in the rootfs: install-media.sh's `cp -a` preserves them

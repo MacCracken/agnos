@@ -41,12 +41,19 @@ opaque via `#87` and translucent via `#92` op 0x01 (premultiplied src-over), unb
 draw-stack repos on cyrius 6.4.71. Shader ISA is sovereign — 11 `.s`-backed kernels reference-verified against
 their iron-proven committed hex, and the **llvm-mc build gate removed (1.56.8)** because a sovereign build
 takes no C/C++ toolchain. Decisions D-1/D-2/D-4 ratified (1.56.8). The S lane (S0-S12) and D lane (D1/D2) are
-closed on iron; the D-lane code was deleted after it produced its answer.
+closed on iron; the D-lane code was deleted after it produced its answer. **`#90 gpu_readback_shm` + `#91
+gpu_blit_bb` closed** (iron exit 95 — screen-capture readback + overlap-safe bb→bb blit; a reused-slot
+readback-coherence bug found+fixed with a scoped `clflush`, closing the `#89→#92` band). **The ML crown (C6)
+is CLOSED — the "three jewels":** real attn11 / rupantara / tentib layer-matmuls execute on the gfx90c shader
+cores **bit-identical to CPU** (rupantara 0.4.1 f64/`#83`, tentib 1.0.1 ternary-integer/`#82` bit-exact at any
+K, attn11 1.14.1 `qlinear_fwd`/`#83`; all iron exit 95, 2026-07-23), retiring the "GPU capability with no
+caller" anti-pattern the crown was named for.
 
-**▶ REMAINING:** `#90`/`#91` reserved CP-DMA (`#90` P1) · the measured invalidate hoist · **modeset** (own the
-pipe from cold; harness half is zero-burn) · **HDMI audio** (zero-burn Linux discriminator first) · **3D** (a
-rendering primitive — the soorat/kiran consumer stack is cataloged and waits on the kernel) · **ML on the
-shader cores** (the 1.54.x crown C6). ⚠ Every GPU-pixel arm is IRON-ONLY (QEMU has no AMD GPU).
+**▶ REMAINING:** **modeset** (own the pipe from cold; harness half is zero-burn — **the recommended next
+item**) · **HDMI audio** (zero-burn Linux discriminator first) · **3D** (a rendering primitive — the
+soorat/kiran consumer stack is cataloged and waits on the kernel) · a minor invalidate-hoist perf item · plus
+the **ML full-forward wiring** follow-on (a per-repo consumer task, not a kernel blocker). ⚠ Every GPU-pixel
+arm is IRON-ONLY (QEMU has no AMD GPU). **Next-agent handoff: see gpu.md § 🤝 Handoff.**
 
 ---
 

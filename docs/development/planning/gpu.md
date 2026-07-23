@@ -26,10 +26,12 @@
 | Compute | Firmware load via PSP · engine start · queue · PM4 ring · hand-assembled gfx90c shaders · integer + f64 matmul, rosnet-bit-correct from ring 3 | 1.54.x |
 | Display | Read the live pipe · scanout flip · vblank pacing · console geometry fix · hardware 2D via CP-DMA · ring-3 band `#84`-`#89` | 1.55.x |
 | Shader compositing | Per-pixel alpha · 2-D grids · EXEC bounds guard · glyph expand · coverage · gradient · one-submission batched frame (1.78x, pixel-identical) · the `#92` descriptor ABI | 1.56.x |
+| Screen-capture + blit | `#90 gpu_readback_shm` (reuse-safe via a `clflush` on the readback window) + `#91 gpu_blit_bb` (overlap-safe bb→bb) — the `#89→#92` numbering hole closed | 1.56.x |
+| ML on the cores | real attn11 / rupantara / tentib layer matmuls execute on gfx90c, **bit-identical vs CPU** — THREE proven consumers (f64 via `#83` ×2 + ternary integer via `#82`); the 1.54.x crown, closed | 1.56.x |
 
 **What agnos still cannot do:** put a picture on a display the firmware did not already light · set a
-resolution · drive a second monitor · render anything in 3D · get audio out over HDMI. And the shader
-compositing it just proved **has no caller**.
+resolution · drive a second monitor · render anything in 3D · get audio out over HDMI. (The shader compositing
+and the ML seam now have real callers — those "capability with no caller" anti-patterns are retired.)
 
 ---
 
@@ -54,20 +56,60 @@ things with callers, not a list of things that build.
 | **2** | **Shader ISA is sovereign and byte-verified reference exists.** The four hand-typed 1.54.x matmul kernels gained `.s` sources proven byte-identical to their committed hex; the committed hex **is** the iron-proven authority. ⚠ **The llvm-mc build gate was REMOVED at 1.56.8** — llvm-mc is C++, and a sovereign build depends on no C/C++ toolchain. The sovereign gfx90c assembler is mabda's Cyrius `gfx9_encode.cyr`. | 1.56.6 → 1.56.8 |
 | **3** | **The two 1.56.3 re-audit defects** — verified already fixed at 1.56.4 (coverage-dispatcher arity green; shader slots at `0x50000`, clear of the sink page). No change needed. | verified 1.56.6 |
 | **4** | **D-1 / D-2 / D-4 ratified.** D-1: llvm-mc rejected (C++, out). D-2: `#92` blend = premultiplied f32, frozen (consumed end-to-end; straight-alpha `rend_blend` is dead code). D-4: whole-surface translucency IS a real MUDRA/SHANTA requirement → the DCN second plane stays a live deferred item. | 1.56.8 |
+| **5** | **`#90 gpu_readback_shm` + `#91 gpu_blit_bb`** — the two reserved CP-DMA jobs, now implemented, iron-proven and reuse-safe; the `#89→#92` numbering hole is closed. **`#90`** GPU-copies a rect OUT of the back buffer into a client shm slot (screen capture); **`#91`** copies a rect within the back buffer (window move / scroll — overlap-safe: downward moves copy bottom-up). ⚠ **A real readback-coherence bug was found + fixed here:** reading into a REUSED shm slot returned a stale cache-line ghost (gpu.md C2g-1 class), so `gpu_readback_shm_sys` now `clflush`es the destination window `[shm_kva, +row*h)` before the CP-DMA (a new disassembly-verified `clflush(addr)` primitive in `io.cyr`). Proven by **`/bin/gpucopy`** (banded-source + overlapping-move oracle) → `run: exit 95` on archaemenid — 5 burns, 84→76→51→95→95, each with a CONFIRM/FALSIFY rubric. Cyrius wrappers filed + iron-ready ([`issues/2026-07-23-gpu-readback-blit-bb-wrappers.md`](../issues/2026-07-23-gpu-readback-blit-bb-wrappers.md)). | 1.56.8 · iron 2026-07-23 |
+| **6** | **ML on the shader cores — the 1.54.x crown, CLOSED.** A real **rupantara** MLP up-projection matmul (`linear_fwd 8×8×32`, bias-free) executes on the gfx90c shader cores, **bit-identical** vs rosnet's production CPU `linear_fwd` on fractional f64 data. New **`rupantara/src/gpu.cyr` `linear_fwd_gpu`** tiles the matmul into 8×8×8 blocks and dispatches each via **`#83 gpu_dispatch_f64`** (iron-proven since 1.54.x), one tile per call, gathering strided sub-blocks CPU-side; bit-exact because both `#83` (unfused `v_mul_f64`+`v_add_f64`) and `linear_fwd` (cyrius `EMIT_F64V_FMADD` = SSE2 `mulpd+addpd`, no f64 hardware FMA) round identically, and K=8 is a single k-tile. Proven by **`/bin/gpulayer`** → `run: exit 95` on archaemenid (host tiling proof exit 96 → one iron burn). **Retires the "GPU capability with no caller" anti-pattern this item named** — THREE proven callers ("three jewels", all iron exit 95, 2026-07-23): **rupantara 0.4.1** (f64 up-projection via `#83`, bit-exact K≤8, `/bin/gpulayer`), **tentib 1.0.1** (ternary integer via `#82`, `/bin/gpumm`, **bit-exact at any K** since integer accumulate is associative — proven K=16 cross-tile; also the first negative-integer proof of `#82`), and **attn11 1.14.1** (the parent transformer's own `qlinear_fwd` hook routed to `#83`, `/bin/gpuattn`). ⚠ f64 K>8 (down-projection, cross-tile) is a ~1 ULP follow-on; the integer path has no such limit. Follow-on: wire the offload into the full multi-layer forward per repo. | rupantara 0.4.1 + tentib 1.0.1 + attn11 1.14.1 · iron 2026-07-23 |
 
 ### ▶ REMAINING — not started or in progress
 
 | # | What | Depends on |
 |---|---|---|
-| **5** | **`#90 gpu_readback_shm` + `#91 gpu_blit_bb`** — small CP-DMA jobs. **`#90` is P1** (without it screen capture silently returns stale pixels). **KERNEL HALF LANDED** (2026-07-23): both handlers implemented in `syscall.cyr`, dispatched at `num==90/91`, build + `check.sh` green (14/0); the `#89→#92` numbering hole is closed. `#91` overlap is handled kernel-side (downward moves copy bottom-up). **Still open:** cyrius wrappers (filed — [`issues/2026-07-23-gpu-readback-blit-bb-wrappers.md`](../issues/2026-07-23-gpu-readback-blit-bb-wrappers.md), language-agent leg) + **iron proof**. The oracle is built: **`/bin/gpucopy`** (`gpu-test/gpucopy.cyr`, staged) draws a known frame, captures it with `#90`, reads the pixels back to userland with `#73` and compares them spatially, and verifies `#91` through `#90` — a fully programmatic `run: exit 95` verdict, no photo (⚠ `#90` fails SILENTLY if wrong, which is why the oracle checks pixel *values*, not the return code; QEMU has no AMD GPU so it exits 100 there). NOT done until it passes on iron. | — |
-| **6** | **The measured invalidate hoist** — S12 showed the batched frame is ~87% fixed cost (six whole-L2 invalidates, not the fence). Needs its own oracle; precedent for removing an "obviously safe" cache op is eight burns. | iron |
-| **7** | **MODESET — own the pipe from cold.** Program a raster, drive the PLL, cycle the OTG, enable the transmitter. Closes at `OTG_MASTER_EN` 0→1 with the frame counter observed stopping and resuming. Fully laddered below; the harness half costs **no burns**. | — |
+| **7** | **MODESET — own the pipe from cold.** Program a raster, drive the PLL, cycle the OTG, enable the transmitter. Closes at `OTG_MASTER_EN` 0→1 with the frame counter observed stopping and resuming. Fully laddered below; the harness half costs **no burns**. **← recommended next (see Handoff).** | — |
 | **8** | **HDMI AUDIO.** ⚠ **Zero-burn discriminator runs FIRST** (replay agnos's full DCN program on an amdgpu-blacklisted pipe under Linux): sound ⇒ bare-metal-environment bug, the modeset won't fix it; silence ⇒ the cold-modeset edge is required. | 7 (partly) |
 | **9** | **3D — a rendering primitive** (a GFX ring, or a rasteriser on the proven compute ring). Ends with a textured triangle on the panel. Unblocks the **cataloged consumer stack**: soorat (game render engine) + kiran (game engine, 1.0.0) + joshua/salai/impetus/raasta + cyrius-mine-cart/cyrius-block-game. | **7** — kernel → engine; you cannot port a render engine to a platform with no rendering primitive. |
-| **10** | **ML on the shader cores** — an attn11/tentib layer running its matmuls on gfx90c, correct vs CPU. The 1.54.x crown, open since then because it was a consumer item scoped inside a kernel arc (the `#92` mistake). | — |
+| **10** | **The measured invalidate hoist** (minor perf, low priority) — S12 showed the batched frame is ~87% fixed cost (six whole-L2 invalidates, not the fence). Needs its own oracle; precedent for removing an "obviously safe" cache op is eight burns. | iron |
 | **deferred** | **DCN second plane** (D-4-ratified as a real requirement; opens after the modeset, ~50-70 register writes / 4-6 iron bites) · hardware cursor · SDMA ring-up · native-resolution console. Each has a written reason below. | — |
+| **follow-on** | **Wire the ML offload into the FULL forward** (item 6 proved single layer-matmuls; wiring `linear_fwd_gpu` / `ternary_matmul_free_gpu` into every projection of `ru_block_fwd` / attn11 / tentib, incl. the K>8 f64 down-projection ~1 ULP question) — a per-repo consumer task, not a kernel blocker. | — |
 
 **GPU is done when REMAINING is empty.** Not before, and not by declaring any single item finished.
+
+---
+
+## 🤝 Handoff — next agent starts here
+
+**Where the GPU arc stands (2026-07-23):** the compute (1.54.x), display (1.55.x), and shader-compositing
+(1.56.x) thrusts are shipped and iron-proven; the ring-3 band is contiguous `#82`–`#92`; **`#90`/`#91` and the
+ML crown (C6) are closed** — three ML consumers run real layer-matmuls on gfx90c bit-identical to CPU. What is
+LEFT is DONE-list-empty away: **MODESET (7), HDMI audio (8), 3D (9)**, a minor perf hoist (10), the deferred
+list, and the ML full-forward wiring (follow-on).
+
+**Recommended next: item 7 — MODESET.** Reasons: (a) its **harness half costs zero burns**, so you make real,
+verifiable progress before touching iron; (b) it is a hard prerequisite for 3D (9) and *partly* for HDMI audio
+(8); (c) the foundation is already in hand — the sovereign Cyrius ATOM interpreter (`kernel/core/atom.cyr`)
+runs vendor VBIOS bytecode bit-correctly on iron. **The full MODESET ladder, oracles, and the decisive
+zero-burn Linux experiment (L1) are already written below** — read the MODESET section + the "Iron-proven
+facts" + the "⛔ Falsified — do not re-open" section before writing any code.
+
+**How to work (the discipline that made the last arcs land clean):**
+1. **This file is THE single GPU document** — no new GPU arc docs, everything goes here (rule at the top). Live
+   state pointer: agnos `docs/development/state.md`. Per-burn CONFIRM/FALSIFY tracker: agnosticos
+   `docs/development/iron-nuc-zen-log.md` (newest `#tracker-*`).
+2. **Every bite gets a CONFIRM/FALSIFY rubric in the tracker BEFORE the operator flashes.** Burns block the
+   operator's only dev machine — engineer the negative outcome to name its own cause (the `#90`/`#91` walk was
+   84→76→51→95→95, each burn decisive). One item per burn.
+3. **Verify assumptions at the source, don't trust the map.** The two cleanest wins came from reading the
+   actual code before coding: `f64v_fmadd` = SSE2 `mulpd+addpd` (unfused, so f64 GPU == CPU bit-exact) and the
+   `#82` MAC = `v_mul_lo_u32`+`v_add_u32` (two's-complement, so signed integers work). Both would have been
+   wrong guesses.
+4. **Build/flash mechanics (all Claude's, operator only flashes):** `scripts/burn-prep.sh` (sweep + build +
+   stamp) → `scripts/burn-verify.sh` → operator runs `install-media.sh --update` (kernel) or `--update-fs`
+   (agnos-fs `/bin` only) or `--update-all`. Ring-3 proof binaries stage via `scripts/stage-tools.sh`.
+5. **The ML follow-on (wiring the offload into the full forward) is a CONSUMER task, not a kernel one** — the
+   reusable recipe: add a `*_gpu` tiling peer of the repo's matmul (`#82` int / `#83` f64) with a CPU
+   fallback + a `programs/*.cyr` exit-code proof (95 GPU-bit-identical / 96 host-plumbing / 90 mismatch),
+   host-prove the tiling (96), stage `/bin/<x>`, `--update-fs`, one burn. ⚠ Cross-repo gotcha: a consumer
+   using a NEW lib symbol needs the lib **tagged + pushed** and the dep-tag bumped, or CI resolves the old pin.
+6. **The operator (Robert) owns ALL git.** New repos = `mkdir`+`Write`. Cyrius the compiler is hands-off
+   except filing issues under `docs/development/issues/` — the language agent owns wrapper/lib work.
 
 ---
 

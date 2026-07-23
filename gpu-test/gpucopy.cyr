@@ -1,31 +1,32 @@
-# gpucopy — agnos ring-3 characterisation of #90 gpu_readback_shm. PROGRAMMATIC oracle only (no photo).
+# gpucopy — agnos ring-3 proof of #90 gpu_readback_shm + #91 gpu_blit_bb. PROGRAMMATIC oracle only (no photo).
 #
-# History:
-#   Burn 1 (2026-07-23): exit 84 — #90 Test A passed, #91 dest not-red. Ambiguous.
-#   Burn 2 (2026-07-23): exit 76 — the #91 red SOURCE at (300,100) didn't read back red, so #91 was never the
-#     problem; the source read wrong. Test A ((100,100), the slot's FIRST use) read green fine; B-src
-#     ((300,100), a slot RE-use) read not-red. #88 and #90 use the identical `tgt + y*pitch + x*4` address, so
-#     a write-then-read at the same coords is self-consistent — the one thing that changed is slot reuse.
-#     Prior art: gpu.md C2g-1 — reading a REUSED slot returns a stale ghost of its previous contents.
+# #90 fails SILENTLY (a wrong/stale read returns plausible pixels, never an error), so this reads its verdict
+# OUT to userland: draw a known frame, capture with #90, read pixels back with #73 shm_read, compare VALUES.
+# `run /bin/gpucopy` -> `run: exit 95` = all pass.
 #
-# Burn 3 (this build) DECIDES it with three reads, no #91 (that is downstream of a trustworthy readback):
-#   read1: green source (100,100) into a FRESH slot1        — the proven baseline (should be green)
-#   read2: red   source (300,100) into the SAME slot1 (REUSE)— reproduces burn-2's reused read
-#   read3: red   source (300,100) into a FRESH slot2        — the control: is the source actually red?
-# read3 (fresh) is the trustworthy source-truth; read2 vs read3 tells the reuse story:
-#   read3 blue  -> #88 never drew red at (300,100)               (source bug, NOT the slot)
-#   read3 red + read2 green -> the REUSED slot returned read1's stale data -> #90 needs a coherence fix
-#   read3 red + read2 red   -> reuse is fine; burn-2's 76 is unexplained
+# Arc (2026-07-23): burn1 exit84 (ambiguous) -> burn2 exit76 (source read wrong; #91 exonerated) -> burn3
+# exit51 (a REUSED readback slot returned a STALE ghost — gpu.md C2g-1) -> burn4 exit95 (a wbinvd in #90
+# fixed it). This build runs on the SCOPED fix (per-line clflush) and PROVES the whole surface with SPATIAL
+# discrimination (per-row colour bands, not a solid fill) so a shift / short-copy / wrong-stride / wrong
+# row-order cannot pass unseen:
+#   A  (#90 fresh):  green square @ (100,100) — green inside, blue outside.
+#   A2 (#90 REUSE):  4-band source @ (300,100) read into the SAME slot — proves the clflush coherence fix.
+#   B-flat (#91):    top-down NON-overlap move (300,100)->(420,100) [dy==sy] — bands preserved.
+#   B-down (#91):    bottom-up OVERLAPPING move (300,100)->(300,132) [dy>sy, 32-row overlap] — the memmove
+#                    row-order case the bottom-up loop EXISTS for; a top-down bug smears the lower bands.
 #
-# EXIT: 95 both fresh AND reused reads correct (all good).
-#   96 caps · 100 no-GPU (QEMU) · 101 no-carveout · 102 bb-w<512 · 103 bb-h<512 · 104 <2 free slots · 105 not-armed
-#   90 gpu_fill · 98 gpu_fill_rect · 92 shm_create(slot1) · 93 shm_create(slot2)
-#   50 read1(green,fresh) not green — #90 broke on the FIRST read (unexpected)
-#   60 read3(red,fresh) = BLUE  -> #88 did NOT draw red at (300,100)   61 read3 = neither red nor blue
-#   51 read2(red,REUSE) = GREEN -> SLOT-REUSE returns STALE (read1 data) -> #90 coherence gap on reused slots
-#   52 read2 = blue · 53 read2 = other   ·   70/71 read1 · 77/78 read2 · 80/81 read3  (#90/shm_read call failed)
+# Source @ (300,100), 64 wide, four 16-row bands (so row position is identifiable):
+#   rows 0-15 RED 0xFF0000 · 16-31 GREEN 0x00FF00 · 32-47 YELLOW 0xFFFF00 · 48-63 CYAN 0x00FFFF
+#
+# EXIT: 95 all pass.
+#   96 caps · 100 no-GPU(QEMU) · 101 no-carveout · 102 bb-w<512 · 103 bb-h<512 · 104 no-slot · 105 not-armed
+#   90 gpu_fill · 98 gpu_fill_rect · 92 shm_create_gpu
+#   A:      70 #90 nonzero · 71 shm_read nonzero · 72 green not green · 73 background not blue
+#   A2:     74 #90 nonzero · 75 shm_read nonzero · 76 REUSED read bands wrong (⇒ coherence fix regressed)
+#   B-flat: 77 #91 nonzero · 78 verify readback failed · 79 top-down dest bands wrong
+#   B-down: 80 #91 nonzero · 81 verify readback failed · 82 bottom-up dest bands wrong · 83 over-copy past dest
 
-var cap_pix[8192];                 # module-global ⇒ N x u64 = 65536 B (readback landing buffer)
+var cap_pix[8192];                 # module-global ⇒ N x u64 = 65536 B = 128*128*4 (readback landing buffer)
 
 fn cap_px(x, y, w): i64 {
     return load32(&cap_pix + (y * w + x) * 4) & 0xFFFFFFFF;
@@ -38,6 +39,16 @@ fn cap_read(id, sx, sy, w, h): i64 {
     return 0;
 }
 
+# A 64-wide capture whose rows carry the 4 bands red/green/yellow/cyan (16 rows each). Returns 0 if all four
+# sampled rows match, else the 1-based band that mismatched — so a shift/short-copy/row-swap names itself.
+fn check_bands(): i64 {
+    if (cap_px(10, 5, 64)  != 0x00FF0000) { return 1; }   # B0 red    (rows 0-15)
+    if (cap_px(10, 20, 64) != 0x0000FF00) { return 2; }   # B1 green  (rows 16-31)
+    if (cap_px(10, 40, 64) != 0x00FFFF00) { return 3; }   # B2 yellow (rows 32-47)
+    if (cap_px(10, 60, 64) != 0x0000FFFF) { return 4; }   # B3 cyan   (rows 48-63)
+    return 0;
+}
+
 fn gpucopy_main(): i64 {
     var caps[32];
     if (syscall(89, &caps, 32) != 0) { return 96; }
@@ -47,50 +58,56 @@ fn gpucopy_main(): i64 {
     var freeslots = load32(&caps + 20) & 0xFFFFFFFF;
     if ((flags & 1) == 0) { return 100; }
     if ((flags & 4) == 0) { return 101; }
-    if (bbw < 512) { return 102; }
+    if (bbw < 512) { return 102; }                     # test rects reach x=483, y=196
     if (bbh < 512) { return 103; }
-    if (freeslots < 2) { return 104; }                 # this burn holds TWO slots at once (reuse vs fresh)
+    if (freeslots < 1) { return 104; }
     if ((flags & 2) == 0) { return 105; }
 
-    # Known frame in the render back buffer (never presented; the test reads the render target directly).
-    if (sys_gpu_fill(0x00000080) != 0) { return 90; }                                            # blue background
-    if (syscall(88, 0x0000FF00, (64 * 65536) + 64, (100 * 65536) + 100) != 0) { return 98; }     # green @ (100,100)
-    if (syscall(88, 0x00FF0000, (64 * 65536) + 64, (100 * 65536) + 300) != 0) { return 98; }     # red   @ (300,100)
+    if (sys_gpu_fill(0x00000080) != 0) { return 90; }                                            # blue bg
+    if (syscall(88, 0x0000FF00, (64 * 65536) + 64, (100 * 65536) + 100) != 0) { return 98; }     # green square @ (100,100)
+    # Banded source @ (300,100): 4 x 16-row bands so row order/position is verifiable.
+    if (syscall(88, 0x00FF0000, (16 * 65536) + 64, (100 * 65536) + 300) != 0) { return 98; }     # B0 red    rows 100-115
+    if (syscall(88, 0x0000FF00, (16 * 65536) + 64, (116 * 65536) + 300) != 0) { return 98; }     # B1 green  rows 116-131
+    if (syscall(88, 0x00FFFF00, (16 * 65536) + 64, (132 * 65536) + 300) != 0) { return 98; }     # B2 yellow rows 132-147
+    if (syscall(88, 0x0000FFFF, (16 * 65536) + 64, (148 * 65536) + 300) != 0) { return 98; }     # B3 cyan   rows 148-163
 
-    var slot1 = syscall(86, 64 * 64 * 4);
-    if (slot1 < 1) { return 92; }
+    var id = syscall(86, 128 * 128 * 4);               # one slot, sized for the largest capture, reused
+    if (id < 1) { return 92; }
 
-    # read1 — GREEN source (100,100) into the FRESH slot1 (baseline).
-    var e1 = cap_read(slot1, 100, 100, 64, 64);
-    if (e1 == 0 - 1) { syscall(74, slot1); return 70; }
-    if (e1 == 0 - 2) { syscall(74, slot1); return 71; }
-    if (cap_px(10, 10, 64) != 0x0000FF00) { syscall(74, slot1); return 50; }   # first read must be green
+    # A — #90 fresh: 128x128 @ (100,100); green inside the 64x64 square, blue outside (spatial).
+    var ra = cap_read(id, 100, 100, 128, 128);
+    if (ra == 0 - 1) { syscall(74, id); return 70; }
+    if (ra == 0 - 2) { syscall(74, id); return 71; }
+    if (cap_px(10, 10, 128)   != 0x0000FF00) { syscall(74, id); return 72; }
+    if (cap_px(64, 0, 128)    != 0x00000080) { syscall(74, id); return 73; }
+    if (cap_px(100, 100, 128) != 0x00000080) { syscall(74, id); return 73; }
 
-    # read2 — RED source (300,100) into the SAME slot1 (REUSE — reproduces burn 2).
-    var e2 = cap_read(slot1, 300, 100, 64, 64);
-    if (e2 == 0 - 1) { syscall(74, slot1); return 77; }
-    if (e2 == 0 - 2) { syscall(74, slot1); return 78; }
-    var r = cap_px(10, 10, 64);
+    # A2 — #90 REUSE (same slot): read the banded source @ (300,100); proves the clflush coherence fix.
+    var r2 = cap_read(id, 300, 100, 64, 64);
+    if (r2 == 0 - 1) { syscall(74, id); return 74; }
+    if (r2 == 0 - 2) { syscall(74, id); return 75; }
+    if (check_bands() != 0) { syscall(74, id); return 76; }
 
-    # read3 — RED source (300,100) into a FRESH slot2 (control: is the source actually red?).
-    var slot2 = syscall(86, 64 * 64 * 4);
-    if (slot2 < 1) { syscall(74, slot1); return 93; }
-    var e3 = cap_read(slot2, 300, 100, 64, 64);
-    if (e3 == 0 - 1) { syscall(74, slot1); syscall(74, slot2); return 80; }
-    if (e3 == 0 - 2) { syscall(74, slot1); syscall(74, slot2); return 81; }
-    var rf = cap_px(10, 10, 64);
+    # B-flat — #91 top-down (proven gpu_cp_dma_blit), NON-overlap horizontal (300,100)->(420,100), dy==sy.
+    if (syscall(91, (100 * 65536) + 300, (64 * 65536) + 64, (100 * 65536) + 420) != 0) { syscall(74, id); return 77; }
+    var rf = cap_read(id, 420, 100, 64, 64);
+    if (rf != 0) { syscall(74, id); return 78; }
+    if (check_bands() != 0) { syscall(74, id); return 79; }
 
-    syscall(74, slot1);
-    syscall(74, slot2);
+    # B-down — #91 bottom-up (new loop), OVERLAPPING downward (300,100)->(300,132), dy>sy, 32-row overlap.
+    # Correct bottom-up preserves the bands at the dest; a top-down copy would read a source row after the
+    # dest row above it (which shares those pixels) was overwritten, smearing B2/B3. Read dst @ (300,132).
+    if (syscall(91, (100 * 65536) + 300, (64 * 65536) + 64, (132 * 65536) + 300) != 0) { syscall(74, id); return 80; }
+    var rd = cap_read(id, 300, 132, 64, 64);
+    if (rd != 0) { syscall(74, id); return 81; }
+    if (check_bands() != 0) { syscall(74, id); return 82; }
+    # Over-copy guard: the move wrote dst rows [132,196); row 196 must be untouched blue background.
+    var ro = cap_read(id, 300, 196, 64, 4);
+    if (ro == 0) { if (cap_px(10, 0, 64) != 0x00000080) { syscall(74, id); return 83; } }
 
-    # Decode. rf (fresh) is the source-truth; r (reuse) vs rf tells the reuse story.
-    if (rf == 0x00000080) { return 60; }    # fresh read of source = BLUE ⇒ #88 didn't draw red at (300,100)
-    if (rf != 0x00FF0000) { return 61; }    # fresh read = neither red nor blue ⇒ weird
-    # rf == RED: source IS red and a fresh slot reads it. So only the reused read is in question.
-    if (r == 0x00FF0000) { return 95; }     # reused read also red ⇒ reuse fine, everything works
-    if (r == 0x0000FF00) { return 51; }     # reused read = GREEN (read1's data) ⇒ SLOT-REUSE STALE
-    if (r == 0x00000080) { return 52; }     # reused read = blue ⇒ weird
-    return 53;                               # reused read = other value
+    sys_gpu_present();                                 # optional glance-check; exit code is the verdict
+    syscall(74, id);
+    return 95;
 }
 
 fn _entry(): i64 { var r = gpucopy_main(); syscall(SYS_EXIT, r); return 0; }
