@@ -3,6 +3,107 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+> ⚠ **`#90`/`#91` are documented here rather than under `[1.56.8]` deliberately.** They are implemented and
+> iron-proven in the tree, but the `[1.56.8]` entry states "No kernel behaviour changed in this cut", so the
+> syscalls landed *after* that entry was written and carry no release of their own yet. Move this section
+> into whichever version tags them.
+
+### Added — `#90 gpu_readback_shm` + `#91 gpu_blit_bb`: the `#89`→`#92` numbering hole is CLOSED
+
+The two reserved CP-DMA jobs are implemented and iron-proven on archaemenid. Both run on the **proven MEC
+compute ring** — no SDMA, no doorbell, no new firmware.
+
+- **`#90 gpu_readback_shm(id, wh, srcxy)`** — the inverse of `#87`: GPU-copies a rect **out** of the blit
+  back buffer into a client shm slot. Screen capture.
+- **`#91 gpu_blit_bb(srcxy, wh, dstxy)`** — copies a rect **within** the back buffer (window move / scroll).
+  **Overlap-safe**: downward moves copy bottom-up.
+
+**A real readback-coherence bug was found and fixed here.** Reading into a **reused** shm slot returned a
+stale cache-line ghost — the C2g-1 class. `gpu_readback_shm_sys` now `clflush`es the destination window
+`[shm_kva, +row*h)` before issuing the CP-DMA, via a new disassembly-verified `clflush(addr)` primitive in
+`io.cyr`.
+
+Proven by **`/bin/gpucopy`** (banded-source + overlapping-move oracle) → `run: exit 95` on archaemenid.
+Five burns, **84 → 76 → 51 → 95 → 95**, each with its own CONFIRM/FALSIFY rubric. Cyrius wrappers filed:
+`docs/development/issues/2026-07-23-gpu-readback-blit-bb-wrappers.md`.
+
+### Added — the H7 anchored DCN register table: 30 modeset constants, derived and gate-verified, never guessed
+
+MODESET harness bite **H7**. The derived-offset habit — not the pipe — was the through-line of every wrong
+turn in the display arc: burn 3 of P4 wrote an arithmetically *correct* pitch value to a *mislabelled* offset
+under the OTG lock and wedged the box with a HUBP underflow; offset `0x1275` read back a plausible `0` while
+being simply wrong. **Plausible is not correct.**
+
+- **`agnosticos/scripts/dcn-reg-derive.py`** — transforms the amdgpu modeset capture (454 distinct absolute
+  dword indices written at exactly 2560×1440, the mode archaemenid runs) into agnos's BASE_IDX-relative
+  space: `rel = abs - 0x34C0` for BASE_IDX 2, `abs - 0x00C0` for BASE_IDX 1. **The transform is anchored
+  twelve ways against constants agnos already trusts on iron** (OTG_H_TOTAL, OTG_V_TOTAL, OTG_CONTROL,
+  OTG_MASTER_UPDATE_LOCK, OTG_GLOBAL_CONTROL0, DCHUBP_CNTL, MPCC0_TOP_SEL, MPC_OUT0_MUX, HUBPRET0_CONTROL,
+  DIG1_DIG_FE_CNTL, OTG_PIXEL_RATE_CNTL, DCCG_AUDIO_DTO_SOURCE). **All twelve reproduce exactly**; the script
+  exits non-zero if any fails, because if the transform is wrong nothing below it ships.
+- **30 new constants in `kernel/core/gpu_regs.cyr`** under a marked `H7` block — the OTG sync/total group
+  (incl. `V_TOTAL_MIN`/`_MAX`, which M5 writes), the M6 envelope's timing-parameter group, OPTC, FMT/OPP/DPG,
+  VTG, and DCPG. Each carries its absolute index and the value a real driver wrote there.
+- The script **round-trips**: re-run against the updated kernel it reports `0 new constants, 30 already
+  present` with no divergence, making it a standing regression gate rather than a one-shot generator.
+
+**★ Three of M1's stated iron anchors are now pre-confirmed from the trace, before any burn:**
+`V_TOTAL_MIN`/`_MAX` = `0x5C8` = **1480** · `V_SYNC_A` = `0x00050000` = a **5-line pulse** ·
+`H_SYNC_A` = `0x00200000` = **32**.
+
+⛔ **Risk R5 is carried into the naming, because naming is the only defence.**
+`GPU_R_DCPG_DOMAIN0_PG_CONFIG = 0x0080` on **BASE_IDX 2** collides numerically with
+`GPU_R_OTG_PIXEL_RATE_CNTL = 0x0080` on **BASE_IDX 1**. `gpu_reg32` validates nothing, and the wrong base
+**power-gates a live pipe**. The `DCPG_` prefix and an asserted base in the comment are mandatory at every
+call site.
+
+### Added — `gpu_refresh_measure()`, the modeset arc's off-GPU oracle (I2), extracted so it can be re-run
+
+MODESET harness bite **H0**. The PIT-counted refresh measurement was buried inside `gpu_pixclk_discover`,
+which runs once at boot and derives its totals by *reading* the timing registers. The modeset ladder has to
+measure refresh against totals it has just **written**, and re-reading them would be comparing the shadow
+copy against itself.
+
+- **`gpu_refresh_ticks(pipe)`** — the extracted loop: several short windows, shortest kept (an SMI can only
+  add time), stability-gated on inter-window spread. Returns the **raw** best tick count and sets
+  `gpu_refresh_spread_ppm` / `gpu_refresh_mhz`. Raw, because `gpu_pixclk_discover` derives the pixel clock
+  from it and rounding through milliHz first would put a lossy intermediate between the measurement and the
+  DTO.
+- **`gpu_refresh_measure(pipe)`** — I2 proper: refresh in milliHz, 0 if unmeasurable. **Reads no timing
+  register**, so it is an instrument *off* the GPU and is safe to call against a raster the kernel just
+  programmed. This is what makes M5 falsifiable: 59.951 Hz → 59.152 Hz is a 13,300 ppm step against a
+  12–17 ppm noise floor.
+- `gpu_pixclk_discover` now consumes `gpu_refresh_ticks`. Behaviour-preserving — same windows, same gate,
+  same log lines.
+
+### Fixed — two latent defects in the DCN commit primitives, before the modeset arc adopts them
+
+Both were callerless and therefore invisible; operator decision **MD-7** ratified adopting these primitives,
+which makes the defects live.
+
+- **`gpu_dcn_write_committed` wrote an UNINDEXED offset.** It took `(pipe, off, val)` and wrote `off` raw,
+  while `gpu_otg_lock` and `gpu_otg_commit_unlock` both indexed by pipe two lines away — the same
+  unindexed-write defect the D-lane post-mortem named. Harmless on a pipe-0 boot; on any other pipe it
+  locked one OTG instance and wrote a different block's instance 0. Signature is now
+  **`(pipe, off, stride, val)`**, writing `off + pipe * stride`. The stride is an **explicit caller-supplied
+  parameter** rather than a hardcoded `GPU_DCN_OTG_STRIDE`, because DCN's blocks do not share one — OTG
+  `0x80`, HUBP `0xDC`, MPCC `0x1B`, PIXRATE `0x4`, DIG `0x100` — and pushing a HUBP register through an OTG
+  stride is precisely the arithmetically-plausible wrong offset that wedged the pipe at `0x607`.
+- **The return value is now documented as a SHADOW read.** On DCN a read-back reflects what was written, not
+  what the pipe is scanning. It is a plumbing check and never evidence that a change committed; the comment
+  now names the three instruments that do cross that boundary (I1 frame count, I2 PIT refresh, I3 ATOM
+  counters) and says to report `gpu_otg_lock_acked` alongside it.
+- **`gpu_vbios_acquire` is now idempotent** — `if (gpu_vbios_va != 0) { return 1; }`. The modeset ladder adds
+  several ATOM entry points (`SetPixelClock` #12, `DIGxEncoderControl` #4, `DIG1TransmitterControl` #76) and
+  each re-entry would otherwise re-walk ACPI and take another `pmm_alloc_2mb` that has no free path here. The
+  image is immutable once copied.
+
+Gates: `scripts/kprint-len-check.sh` green (2,487 literals, 0 mismatched — it caught one off-by-one in a new
+literal, which is exactly why it exists). No hardware behaviour changes in this bite; the extracted loop is
+the original loop, and its first real exercise is on iron at M1/M5.
+
 ## [1.56.8] - 2026-07-23
 
 ### Removed — llvm-mc and the ISA gate built on it. AGNOS's build no longer touches a C/C++ toolchain.
@@ -77,8 +178,6 @@ command.
 and have no fixed `.s` to diff against. The two smallest kernels (7 and 10 dwords), left as-is rather than
 refactored to a load-the-address form purely to satisfy the gate. This is the true completion of the shader
 plan's opening item; nothing in it remains.
-
-## [Unreleased]
 
 ## [1.56.6] - 2026-07-23
 

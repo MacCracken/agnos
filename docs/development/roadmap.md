@@ -149,7 +149,10 @@ Linux userspace driver replaying agnos's *exact* feed on amdgpu's pipe **played 
 exonerated (the XB323U is audible over HDMI under amdgpu), the audio clock is alive (a counted `ACR CTS`
 instrument, not an echo register), and the SYMCLKA "breakthrough" was **falsified by in-boot A/B**. What is
 left is structural, not a register: **agnos rides the GOP's DVI modeset and has never performed a real HDMI
-modeset.** ⇒ A4 is blocked on the same full-modeset work as P6+, and the ATOM interpreter is the lever.
+modeset.** ⇒ the full modeset is the **lead** — but stated precisely: it addresses exactly **one** of A4's three
+surviving candidates (sequencing), leaving (b) a write that doesn't latch and (c) the bare-metal
+environment. The **zero-burn Linux discriminator (L1) runs first** and says which to expect. The ATOM
+interpreter is the lever, and A4 is REMAINING **item 8** of the single open 1.56.x GPU release.
 Arc doc: [`docs/development/planning/gpu.md`](planning/gpu.md).
 
 **P7 consumer wiring** — the compositor adopting #85-#89 (`bhumi/src/scanout.cyr` is the only target-specific
@@ -157,11 +160,25 @@ file) — is a **desktop-repo** item now that the kernel seam is proven, not a k
 
 ### Carried out of the closed 1.54.x GPU arc
 
-**C6 — run an attn11 or tentib layer on the GPU** (the arc's stated crown) is **still open**. The kernel
-seam is proven: integer compute over syscall #82, and f64 over #83, rosnet-bit-correct from ring 3. But no
-CHANGELOG entry claims an ML layer has actually executed on the shader cores — every phrase in the record is
-about the seam that ML layers *ride onto*. This is a userland and ML-consumer item, not a kernel one. Arc
-plan: [`docs/development/planning/gpu.md`](planning/gpu.md).
+**C6 — run an attn11 or tentib layer on the GPU** (the arc's stated crown) — **✅ CLOSED ON IRON
+2026-07-23.** ~~still open … no CHANGELOG entry claims an ML layer has actually executed on the shader
+cores~~ — it has now, three times, all `run: exit 95` on archaemenid:
+
+- **rupantara 0.4.1** — a real MLP up-projection (`linear_fwd 8×8×32`) on the gfx90c shader cores via
+  `#83`, **bit-identical** vs rosnet's production CPU `linear_fwd` on fractional f64. Bit-exact because
+  both `#83` (unfused `v_mul_f64`+`v_add_f64`) and cyrius's `EMIT_F64V_FMADD` (SSE2 `mulpd+addpd`, no f64
+  hardware FMA) round identically, and K=8 is a single k-tile. `/bin/gpulayer`.
+- **tentib 1.0.1** — ternary integer matmul via `#82`, **bit-exact at ANY K** (integer accumulate is
+  associative — proven K=16 cross-tile), and the first negative-integer proof of `#82`. `/bin/gpumm`.
+- **attn11 1.14.1** — the parent transformer's own `qlinear_fwd` hook routed to `#83`. `/bin/gpuattn`.
+
+This retires the "GPU capability with no caller" anti-pattern the row was written to track.
+
+⚠ **Proven is not wired.** `attn11/src/ops.cyr` gates the GPU route on `b == 0 && K <= 8` and rupantara's
+`linear_fwd_gpu` has no callers in blocks/mlp/attn, so at production model dimensions everything except
+tentib's integer path still falls back to CPU. Wiring the offload into the **full forward** — including the
+K>8 f64 down-projection, a ~1 ULP question — is the live follow-on. It remains a userland / ML-consumer
+item, not a kernel one. Arc plan: [`docs/development/planning/gpu.md`](planning/gpu.md).
 
 ---
 

@@ -936,7 +936,9 @@ fn gpu_blit_bb_sys(srcxy, wh, dstxy) {
 #   - The dispatcher offers four args and a coverage blit needs five operands. That is exactly why #93/#94
 #     had to smuggle their colour through ksyscall_a4 (r10), and why a gradient — which needs two stops
 #     plus geometry — had NO room left at all and never got a ring-3 path. A record has no such ceiling.
-#   - Syscall numbers are not free. #90/#91 are reserved with declared shapes, and this band lands on
+#   - Syscall numbers are not free. (⚠ HISTORICAL: #90/#91 were *reserved* when this was written; they are
+#     now IMPLEMENTED and iron-proven — gpu_readback_shm_sys and gpu_blit_bb_sys, ~1700 lines below. The
+#     next free number is #93, ratified for gpu_modeset_op by operator decision MD-4.) This band lands on
 #     OCCUPIED, partly DESTRUCTIVE Linux numbers: 92=chown, 93=fchown, 94=lchown, 95=umask. One number
 #     costs one collision to document and gate; four cost four.
 #   - The consolidated cyrius wrapper ticket exists specifically to end the one-ask-per-syscall pattern.

@@ -54,7 +54,9 @@ check "gpu arena slots unaliased" $?
 
 # Call arity. cycc WARNS on an argument-count mismatch and builds anyway, so a wrong call ships green.
 # Wired in 2026-07-22 after the 1.56.x audit found gpu_blend_cov_run declared with 12 parameters and
-# called with 11 at BOTH coverage sites — including gpu_cov_surface, the live worker behind syscall #93.
+# called with 11 at BOTH coverage sites — including gpu_cov_surface. (⚠ That worker was described here as
+# "behind syscall #93"; that shape was WITHDRAWN at 1.56.4 — coverage is now op code 0x02 inside #92, and
+# #93 is unallocated, ratified for gpu_modeset_op by MD-4. The arity lesson below is unaffected.)
 # Every argument after the missing one shifted by one position, which made done_phys undefined and turned
 # the function's first statement into a wild kernel store32. It had been warning in every build since the
 # glyph refactor. This promotes that warning to a build failure.
@@ -105,7 +107,8 @@ check "version in changelog" $?
 # decode plus the per-subsystem quiesce paths, not bloat.
 # The 1.56.x SHADER arc then closed on 1.7M (1,700,472 B — 472 B over, the same
 # way 1.45.10 closed on 1.2M and the display-audio bite closed on 1.5M), so the
-# bound moved 1.7M -> 1.8M. That arc's growth is the five shader ISA tables, the
+# bound moved 1.7M -> 1.8M. That arc's growth is the seven .s-backed shader ISA
+# tables (plus the four 1.54.x matmul kernels reconstructed at 1.56.7 = 11 total), the
 # #92 descriptor validation layer, and the plan-S3 coherence harness — note DCE is
 # OFF by default here, so every *_test fn ships whether or not its #ifdef is set.
 # Matches scripts/test.sh (bumped in lockstep).

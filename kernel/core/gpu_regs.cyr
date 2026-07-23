@@ -1216,3 +1216,77 @@ var GPU_COMPUTE_PGM_RSRC1_F64  = 0x002C0043; # RSRC1 VGPRS=3 (16 VGPRs): the f64
 var GPU_MMF_A_SUBOFF         = 0x1B000;     # f64 A[64] (row-major, A[i]=(i+1).0) — 512 bytes
 var GPU_MMF_B_SUBOFF         = 0x1B400;     # f64 B[64] (row-major, B[i]=(i+1).0) — 512 bytes
 var GPU_MMF_C_SUBOFF         = 0x1B800;     # f64 C[64] output (C[tid] = matmul element) — 512 bytes
+
+# =========================================================================================================
+# === H7 — THE 3-WAY-ANCHORED DCN REGISTER TABLE (modeset arc, 1.56.x) ====================================
+# =========================================================================================================
+#
+# ⛔ NOT DERIVED BY HAND. Every constant below was produced by transforming the amdgpu modeset capture
+# (agnosticos `docs/development/prior-art/amdgpu-hdmi-modeset-writes-0717.txt`, 454 distinct absolute dword
+# indices written at exactly 2560x1440 — the mode archaemenid runs) into agnos's BASE_IDX-relative space:
+#
+#     BASE_IDX 2 (the big DCN block):  rel = abs - 0x34C0
+#     BASE_IDX 1 (DCCG / low block):   rel = abs - 0x00C0
+#
+# and that transform is ANCHORED TWELVE WAYS against constants agnos ALREADY TRUSTS ON IRON — OTG_H_TOTAL,
+# OTG_V_TOTAL, OTG_CONTROL, OTG_MASTER_UPDATE_LOCK, OTG_GLOBAL_CONTROL0, DCHUBP_CNTL, MPCC0_TOP_SEL,
+# MPC_OUT0_MUX, HUBPRET0_CONTROL, DIG1_DIG_FE_CNTL, OTG_PIXEL_RATE_CNTL, DCCG_AUDIO_DTO_SOURCE. All twelve
+# reproduce EXACTLY. Re-run the gate any time you doubt a number:
+#
+#     python3 agnosticos/scripts/dcn-reg-derive.py
+#
+# WHY THIS EXISTS: the derived-offset habit — not the pipe — was the through-line of every wrong turn in the
+# display arc. Burn 3 of P4 wrote an arithmetically-CORRECT pitch value to a MISLABELLED offset under the OTG
+# lock and wedged the box with a HUBP underflow (risk R4); offset 0x1275 read back a perfectly plausible 0
+# while being simply wrong. **Plausible is not correct.** Anchor before you write.
+#
+# The `amdgpu wrote` note on each line is a WITNESS, not a value to copy: it is what a real driver put there
+# during a cold 2560x1440 modeset. Three of them pre-confirm M1's stated iron anchors before any burn —
+# V_TOTAL_MIN/_MAX = 0x5C8 = 1480, V_SYNC_A = 0x00050000 = a 5-line pulse, H_SYNC_A = 0x00200000 = 32.
+
+# --- OTG raster: sync + totals (M5 writes V_TOTAL/_MIN/_MAX; M6 reprograms the whole group) ---
+var GPU_R_OTG_H_SYNC_A                 = 0x1B2C; # BASE_IDX 2, abs 0x4FEC. H_SYNC_A: width [15:0], start [31:16]. amdgpu last 0x00200000 = 32
+var GPU_R_OTG_H_SYNC_A_CNTL            = 0x1B2D; # BASE_IDX 2, abs 0x4FED. polarity bit0. amdgpu last 0x00000000
+var GPU_R_OTG_V_TOTAL_MIN              = 0x1B30; # BASE_IDX 2, abs 0x4FF0. amdgpu last 0x000005C8 = 1480 — an M1 anchor
+var GPU_R_OTG_V_TOTAL_MAX              = 0x1B31; # BASE_IDX 2, abs 0x4FF1. amdgpu last 0x000005C8 = 1480 — an M1 anchor
+var GPU_R_OTG_V_TOTAL_CONTROL          = 0x1B33; # BASE_IDX 2, abs 0x4FF3. min/max sel, drr. amdgpu last 0x00020003
+var GPU_R_OTG_V_SYNC_A                 = 0x1B37; # BASE_IDX 2, abs 0x4FF7. amdgpu last 0x00050000 = 5-line pulse — an M1 anchor
+var GPU_R_OTG_V_SYNC_A_CNTL            = 0x1B38; # BASE_IDX 2, abs 0x4FF8. polarity bit0. amdgpu last 0x00000001
+var GPU_R_OTG_TRIGA_CNTL               = 0x1B39; # BASE_IDX 2, abs 0x4FF9. amdgpu last 0x80010015
+var GPU_R_OTG_TRIGA_MANUAL_TRIG        = 0x1B3A; # BASE_IDX 2, abs 0x4FFA. amdgpu wrote this 207x — the per-frame trigger
+
+# --- OTG control + the M6 envelope's timing-parameter group ---
+var GPU_R_OTG_STATIC_SCREEN_CONTROL    = 0x1B82; # BASE_IDX 2, abs 0x5042. amdgpu last 0x00020000
+var GPU_R_OTG_CLOCK_CONTROL            = 0x1B86; # BASE_IDX 2, abs 0x5046. amdgpu last 0x00000003 — M6 sets this
+var GPU_R_OTG_VSTARTUP_PARAM           = 0x1B87; # BASE_IDX 2, abs 0x5047. amdgpu last 0x00000011 — M6 envelope
+var GPU_R_OTG_VUPDATE_PARAM            = 0x1B88; # BASE_IDX 2, abs 0x5048. amdgpu last 0x012F02A8 — M6 envelope
+var GPU_R_OTG_VREADY_PARAM             = 0x1B89; # BASE_IDX 2, abs 0x5049. amdgpu last 0x0000018B — M6 envelope
+
+# --- OPTC (the timing generator's input side) ---
+var GPU_R_OPTC_DATA_SOURCE_SELECT      = 0x1ACB; # BASE_IDX 2, abs 0x4F8B. amdgpu last 0x0000F000
+var GPU_R_OPTC_DATA_FORMAT_CONTROL     = 0x1ACC; # BASE_IDX 2, abs 0x4F8C. amdgpu last 0x00000000
+var GPU_R_OPTC_INPUT_CLOCK_CONTROL     = 0x1ACF; # BASE_IDX 2, abs 0x4F8F. amdgpu last 0x00000003 — M6 sets 0x3
+var GPU_R_OPTC_MEMORY_CONFIG           = 0x1AD0; # BASE_IDX 2, abs 0x4F90. amdgpu last 0x00000000
+
+# --- FMT / OPP / DPG (the output formatter) ---
+var GPU_R_FMT_DYNAMIC_EXP_CNTL         = 0x183F; # BASE_IDX 2, abs 0x4CFF
+var GPU_R_FMT_CONTROL                  = 0x1840; # BASE_IDX 2, abs 0x4D00. amdgpu last 0x01000000
+var GPU_R_FMT_BIT_DEPTH_CONTROL        = 0x1841; # BASE_IDX 2, abs 0x4D01. amdgpu last 0x00008900
+var GPU_R_FMT_CLAMP_CNTL               = 0x1845; # BASE_IDX 2, abs 0x4D05. amdgpu last 0x00000001
+var GPU_R_FMT_422_CONTROL              = 0x1849; # BASE_IDX 2, abs 0x4D09. amdgpu last 0x00000000
+var GPU_R_DPG_CONTROL                  = 0x1854; # BASE_IDX 2, abs 0x4D14. amdgpu last 0x00000000
+var GPU_R_OPPBUF_CONTROL               = 0x1884; # BASE_IDX 2, abs 0x4D44. amdgpu last 0x10000000
+var GPU_R_OPP_PIPE_CONTROL             = 0x188C; # BASE_IDX 2, abs 0x4D4C. amdgpu last 0x00000003
+
+# --- VTG + IP request ---
+var GPU_R_VTG0_CONTROL                 = 0x0528; # BASE_IDX 2, abs 0x39E8. amdgpu last 0x85C60000 — M6 envelope
+var GPU_R_DC_IP_REQUEST_CNTL           = 0x00B2; # BASE_IDX 2, abs 0x3572. amdgpu last 0x00000000
+
+# --- DCPG power gating -----------------------------------------------------------------------------------
+# ⛔⛔ RISK R5 — READ THIS BEFORE USING EITHER OF THE NEXT TWO.
+# 0x0080 on **BASE_IDX 2** is DCPG DOMAIN0_PG_CONFIG. 0x0080 on **BASE_IDX 1** is GPU_R_OTG_PIXEL_RATE_CNTL.
+# They are the SAME NUMBER on DIFFERENT BASES, gpu_reg32 validates nothing, and passing the wrong base
+# **POWER-GATES A LIVE PIPE** — instant black panel. The distinct `DCPG_` naming is the ONLY defence there
+# is; never shorten it, and always assert the base in the comment at the call site.
+var GPU_R_DCPG_DOMAIN0_PG_CONFIG       = 0x0080; # ⚠ BASE_IDX **2** (abs 0x3540) — NOT the BASE_IDX 1 0x80
+var GPU_R_DCPG_DOMAIN1_PG_CONFIG       = 0x0082; # ⚠ BASE_IDX **2** (abs 0x3542) — same collision class

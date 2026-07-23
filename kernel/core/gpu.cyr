@@ -5034,11 +5034,29 @@ fn gpu_otg_commit_unlock(pipe) {
 }
 
 # gpu_dcn_write_committed — the whole lock -> write -> trigger -> unlock cycle for ONE register.
-fn gpu_dcn_write_committed(pipe, off, val) {
+#
+# ⚠ `stride` IS THE PARAMETER THAT USED TO BE MISSING, and it is not optional. Through 1.56.8 this took
+# (pipe, off, val) and wrote `off` RAW, while gpu_otg_lock and gpu_otg_commit_unlock both indexed their own
+# offsets by pipe two lines away — the same unindexed-write defect the D-lane post-mortem found (lesson 2
+# above), latent only because nothing called it. On a pipe-0 boot it is harmless; on any other pipe it locks
+# one OTG instance and writes another block's instance 0.
+#
+# The stride is EXPLICIT rather than hardcoded to GPU_DCN_OTG_STRIDE because DCN's blocks do not share one:
+# OTG 0x80 · HUBP 0xDC · MPCC 0x1B · PIXRATE 0x4 · DIG 0x100. A caller pushing a HUBP register through an OTG
+# stride is exactly the arithmetically-plausible wrong offset that wedged the pipe at 0x607. Pass the block's
+# own GPU_DCN_*_STRIDE, or 0 for a register that genuinely is not per-instance.
+#
+# ⚠ The return is a READ-BACK, and on DCN a read-back is a SHADOW read — it reflects what was written, not
+# what the pipe is scanning. It is a plumbing check and NEVER evidence that the change committed. The three
+# instruments that cross that boundary are I1 (OTG_STATUS_FRAME_COUNT), I2 (PIT-counted refresh, via
+# gpu_refresh_measure) and I3 (the ATOM counters). Report gpu_otg_lock_acked next to it, or the caller is
+# asserting rather than measuring — which is precisely what cost burn 2.
+fn gpu_dcn_write_committed(pipe, off, stride, val) {
+    var a = off + pipe * stride;
     gpu_otg_lock(pipe);
-    gpu_reg32_write(GPU_BASE_DCN_2, off, val);
+    gpu_reg32_write(GPU_BASE_DCN_2, a, val);
     gpu_otg_commit_unlock(pipe);
-    return gpu_reg32(GPU_BASE_DCN_2, off) & 0xFFFFFFFF;
+    return gpu_reg32(GPU_BASE_DCN_2, a) & 0xFFFFFFFF;
 }
 
 # gpu_dcn_hold — hold a state for n frames so it is photographable, paced by the display's own clock rather
@@ -5937,6 +5955,71 @@ fn gpu_pixclk_ticks(pipe, frames) {
     return (pstart - prev) + wraps * GPU_PIT_CH0_DIV;
 }
 
+# === I2 — the PIT-counted refresh oracle ================================================================
+# Extracted out of gpu_pixclk_discover at 1.56.x so the arc's primary instrument can be RE-RUN after a raster
+# write, not only once at boot.
+#
+# ⚠ WHY THIS IS ITS OWN FUNCTION: the modeset ladder has to measure refresh against totals it has just
+# WRITTEN, and re-deriving them by reading the timing registers back would be measuring the shadow copy
+# against itself. This path reads NO timing register at all — it counts PIT ticks across N vsync boundaries,
+# which makes it an instrument OFF the GPU whose result can be compared against a number computed on paper
+# from the written raster. That independence is the entire point: M5 predicts 59.951 Hz -> 59.152 Hz, a
+# 13 300 ppm step against a 12-17 ppm noise floor, three orders of magnitude of headroom.
+#
+# ⚠ Compare the measurement against the WRITTEN totals, never the read-back ones.
+
+var gpu_refresh_spread_ppm = 0;   # last window spread in ppm — report it with every measurement
+var gpu_refresh_mhz = 0;          # last measured refresh in milliHz (59951 = 59.951 Hz)
+
+# gpu_refresh_ticks — the BEST (shortest) tick window; 0 if unmeasurable or unstable. Returns the RAW count
+# because gpu_pixclk_discover derives the pixel clock from it, and rounding through milliHz first would put a
+# lossy intermediate between the measurement and the DTO.
+fn gpu_refresh_ticks(pipe) {
+    gpu_refresh_spread_ppm = 0;
+    gpu_refresh_mhz = 0;
+    # Several short windows, keep the shortest — an SMI can only ADD time.
+    var best = 0;
+    var worst = 0;
+    var t = 0;
+    while (t < GPU_PIXCLK_TRIALS) {
+        var tk = gpu_pixclk_ticks(pipe, GPU_PIXCLK_FRAMES);
+        if (tk > 0) {
+            if (best == 0) { best = tk; worst = tk; }
+            if (tk < best) { best = tk; }
+            if (tk > worst) { worst = tk; }
+        }
+        t = t + 1;
+    }
+    if (best == 0) {
+        kprintln("gpu: display refresh not measurable", 35);
+        return 0;
+    }
+
+    # The windows must AGREE. This replaces 1.55.10's snap-tolerance gate, which was unreachable across
+    # [59.94, 60] by construction (candidates ~1000 ppm apart, gate at the 500 ppm half-spacing, so something
+    # always "matched"). Disagreement between windows is an axis where a gate can actually fire: it catches a
+    # missed PIT wrap (~3%) or a pipe whose rate is moving under us. Iron spread at 1.55.10 was ~17 ppm.
+    gpu_refresh_spread_ppm = (worst - best) * 1000000 / best;
+    # milliHz keeps a fractional rate readable (59.94 Hz = 59940) without leaving integer arithmetic. This is
+    # for the log and for I2 comparisons ONLY — the pixel clock below is computed from the raw tick count,
+    # never from this rounded value, whose +/-0.5 mHz print quantum is itself ~8 ppm at 60 Hz.
+    gpu_refresh_mhz = GPU_PIXCLK_FRAMES * GPU_PIT_HZ * 1000 / best;
+    kprint("gpu: display refresh ", 21); kprint_num(gpu_refresh_mhz);
+    kprint(" mHz, windows agree within ", 27); kprint_num(gpu_refresh_spread_ppm); kprintln(" ppm", 4);
+    if (gpu_refresh_spread_ppm > GPU_PIXCLK_SPREAD_PPM) {
+        kprintln("gpu: display refresh unstable across windows", 44);
+        return 0;
+    }
+    return best;
+}
+
+# gpu_refresh_measure — I2 proper: refresh in milliHz, 0 if unmeasurable. Reads no timing register, so it is
+# safe to call against a raster this kernel has just programmed.
+fn gpu_refresh_measure(pipe) {
+    if (gpu_refresh_ticks(pipe) == 0) { return 0; }
+    return gpu_refresh_mhz;
+}
+
 fn gpu_pixclk_discover() {
     gpu_pixclk_100hz = 0;
     if (gpu_present == 0) { return 0; }
@@ -6003,37 +6086,11 @@ fn gpu_pixclk_discover() {
         return 0;
     }
 
-    # Measure: several short windows, keep the shortest (an SMI can only add time).
-    var best = 0;
-    var worst = 0;
-    var t = 0;
-    while (t < GPU_PIXCLK_TRIALS) {
-        var tk = gpu_pixclk_ticks(pipe, GPU_PIXCLK_FRAMES);
-        if (tk > 0) {
-            if (best == 0) { best = tk; worst = tk; }
-            if (tk < best) { best = tk; }
-            if (tk > worst) { worst = tk; }
-        }
-        t = t + 1;
-    }
+    # Measure via I2 (gpu_refresh_ticks, above): several short windows, shortest kept, stability gated. It
+    # logs the refresh and the window spread, so this path stays exactly as loud as it was before extraction.
+    var best = gpu_refresh_ticks(pipe);
     if (best == 0) {
-        kprintln("gpu: display refresh not measurable", 35);
-        return 0;
-    }
-
-    # The windows must AGREE. This replaces 1.55.10's snap-tolerance gate, which was unreachable across
-    # [59.94, 60] by construction (candidates ~1000 ppm apart, gate at the 500 ppm half-spacing, so something
-    # always "matched"). Disagreement between windows is an axis where a gate can actually fire: it catches a
-    # missed PIT wrap (~3%) or a pipe whose rate is moving under us. Iron spread at 1.55.10 was ~17 ppm.
-    var spread_ppm = (worst - best) * 1000000 / best;
-    # milliHz keeps a fractional rate readable (59.94 Hz = 59940) without leaving integer arithmetic. This is
-    # for the log ONLY — the pixel clock below is computed from the raw tick count, never from this rounded
-    # value, whose +/-0.5 mHz print quantum is itself ~8 ppm at 60 Hz.
-    var refresh = GPU_PIXCLK_FRAMES * GPU_PIT_HZ * 1000 / best;
-    kprint("gpu: display refresh ", 21); kprint_num(refresh);
-    kprint(" mHz, windows agree within ", 27); kprint_num(spread_ppm); kprintln(" ppm", 4);
-    if (spread_ppm > GPU_PIXCLK_SPREAD_PPM) {
-        kprintln("gpu: display refresh unstable across windows, clock not derived", 63);
+        kprintln("gpu: clock not derived", 22);
         return 0;
     }
 
@@ -7431,6 +7488,11 @@ var gpu_vbios_len = 0;   # A2: length of the VBIOS ATOM image in bytes
 # VendorID u16 @12 · DeviceID u16 @14 · SSVID/SSID (4) · Revision u32 @20 · ImageLength u32 @24 } then the raw
 # VbiosContent[] @28. Read-only ACPI walk + one 2 MB alloc + a word copy. Safe. Sets gpu_vbios_va/len for A3.
 fn gpu_vbios_acquire() {
+    # Idempotent. The modeset ladder adds several entry points that need the ATOM image (SetPixelClock #12,
+    # DIGxEncoderControl #4, DIG1TransmitterControl #76), and each re-entry would otherwise walk ACPI again
+    # and take ANOTHER pmm_alloc_2mb — which has no free path here. The image is immutable once copied, so a
+    # second acquire has nothing to do but leak 2 MB.
+    if (gpu_vbios_va != 0) { return 1; }
     var vfct = 0;
     if (acpi_xsdt_addr != 0) { vfct = acpi_xsdt_find(acpi_xsdt_addr, 0x56, 0x46, 0x43, 0x54); }
     if (vfct == 0 && acpi_rsdt_addr != 0) { vfct = acpi_rsdt_find(acpi_rsdt_addr, 0x56, 0x46, 0x43, 0x54); }
