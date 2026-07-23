@@ -102,10 +102,16 @@ check "version in changelog" $?
 # same way 1.45.10 closed on 1.2M and the display-audio bite closed on 1.5M),
 # so the bound moved 1.6M -> 1.7M. That arc's growth is the ACPI FADT/_S5
 # decode plus the per-subsystem quiesce paths, not bloat.
+# The 1.56.x SHADER arc then closed on 1.7M (1,700,472 B — 472 B over, the same
+# way 1.45.10 closed on 1.2M and the display-audio bite closed on 1.5M), so the
+# bound moved 1.7M -> 1.8M. That arc's growth is the five shader ISA tables, the
+# #92 descriptor validation layer, and the plan-S3 coherence harness — note DCE is
+# OFF by default here, so every *_test fn ships whether or not its #ifdef is set.
+# Matches scripts/test.sh (bumped in lockstep).
 echo ""
 echo "--- Binary ---"
 SZ=$(wc -c < "$ROOT/build/agnos")
-test "$SZ" -gt 50000 && test "$SZ" -lt 1700000
+test "$SZ" -gt 50000 && test "$SZ" -lt 1800000
 check "binary size ($SZ bytes)" $?
 
 echo ""

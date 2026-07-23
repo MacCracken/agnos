@@ -5,6 +5,136 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Result — plan-S3 burn 1 (iron, 2026-07-22): A/B/C conclusive, D void, and a doc error found
+
+```
+S3-A shader->fb     WB=on   cpu-read 4096 of 4096  COHERENT
+S3-B shader->fb     WB=off  cpu-read    0 of 4096  STALE
+S3-C shader->cpdma  WB=on   read     4096 of 4096  COHERENT
+S3-C shader->cpdma  WB=off  read        0 of 4096  STALE
+S3-D cpdma->shader  INV=on  new      4096 of 4096  COHERENT   stale 0
+S3-D cpdma->shader  INV=off new      4096 of 4096  COHERENT   stale 0
+```
+
+**PROVEN — the post-dispatch write-back is load-bearing, on two independent consumers, 4096-vs-0 and not a
+partial count.** Shader stores land in GL2 and stay there; nothing drains them inside the measurement
+window. **CP-DMA does not snoop GL2** (arm C, `WB=off` = 0 of 4096). Arm C also establishes, as a side
+effect, that **the compute arena is GPU write-back cached** — that row is impossible on an uncached memory
+type, which retires the "nothing was ever cacheable" objection on the same carveout.
+
+**For plan-S12, the rule is per-*transition*, not per-batch and not per-buffer.** The packet is whole-cache
+and full-range, so one `ACQUIRE_MEM` covers every prior shader store regardless of buffer. Therefore
+`dispatch × N → ACQUIRE_MEM → CP-DMA × M` is legal at **7 dwords once per batch** — the shape S12 wants, now
+evidence-backed — while `dispatch → CP-DMA(reads its output) → dispatch → …` needs one per transition with
+no batching discount. The arc's no-batching-without-`ACQUIRE_MEM` rule is **confirmed, not relaxed**.
+
+### Fixed — plan-S3 arm D was confounded by construction; both rows are VOID, not a pass
+
+`GPU_CP_COHER_CNTL_TCWB = 0x00840000` is `TC_WB_ACTION_ENA(1<<18)` **plus `TC_ACTION_ENA(1<<23)`**, and bit
+23 is the L2 **invalidate**. Settled independently of agnos's own annotation — which was the thing under
+test — against a RADV IB decode captured on this same Cezanne
+(`mabda programs/diagnostics/radv_capture_triangle/radv-triangle.ib.txt`): at `:12-27` it names exactly five
+`=1` fields for `0x28C40000`, which has exactly five bits set, so the mapping is forced with no free
+parameters; at `:1649-1656` `CACHE_FLUSH_AND_INV_TS_EVENT` carries exactly `{TC_WB=1, TC=1}` — "flush" is
+bit 18, "inv" is bit 23.
+
+So arm D's priming dispatch, run with `wb=1`, emitted a whole-L2 invalidate **after** its own loads
+populated GL2 and **before** the CP-DMA overwrite — destroying the stale line the arm exists to create. The
+measured dispatch then took a compulsory miss, and `stale 0` was the only possible outcome in both sub-arms,
+**for any hardware**. Ordering is unassailable three ways: ring order, `ACQUIRE_MEM`'s coherency-ack stall,
+and a full CPU round-trip on the done marker between the two submissions.
+
+- **Prime now runs `wb=0`** at both sub-arms. `inv=1` on the prime is harmless — it fires *before* the loads
+  that populate L2.
+- **Prime witnesses added.** The returns were previously discarded, so a silently timed-out prime printed
+  the same row as a successful one — a second, independent reason those rows could not be trusted.
+- **A positive control was added**, because without one a second "coherent" is again unfalsifiable. It
+  repeats the sub-arm with a CPU UC store as the overwrite instead of CP-DMA. Both writers are MC-direct and
+  neither invalidates, so: control stale + CP-DMA fresh ⇒ **CP-DMA writes probe/invalidate L2 and D-6's GL2
+  justification is wrong** (the most valuable thing this burn could produce); control fresh ⇒ the harness
+  cannot observe load-side staleness on this part, and arm D needs redesign rather than a re-run.
+
+### Fixed — arm B's PANEL half was confounded too, in the permissive direction
+
+`gpu_blit_present` sat at the *end* of the test, so eight further dispatches — each emitting a bit-18
+write-back — had already drained arm B's dirty lines to DRAM before the panel was scanned. The photo showed
+B lit beside A and **would have done so regardless of the hardware**. The plan's headline S3 deliverable
+("one photo showing arm (a) correct beside arm (b) stale/torn") was therefore never obtained. The present
+now happens immediately after arm B's dispatch, with nothing between, which is the only placement that makes
+the panel an independent measurement rather than a restatement of the intervening flushes.
+
+Worth noting that the **"scored separately" rule caught this**: arm B read `0 of 4096` on the CPU while the
+panel showed it lit, and a single collapsed verdict would have hidden the disagreement entirely.
+
+### Fixed — the doc error that caused the arm-D design
+
+`docs/development/planning/kernel-gpu-arc-154x.md` listed as a **key learning** that "`ACQUIRE_MEM` is
+write-*back*, not invalidate". That is wrong for the post-dispatch variant, and it is the root cause of arm
+D's design: the author reasoned about exactly this hazard one comment earlier and reintroduced it four lines
+later, because the plan doc said the packet could not invalidate. Corrected in place with the derivation.
+`gpu_regs.cyr`'s own comment on the constant is corrected the same way — it described the *intent*
+("output writeback"), not the *effect*.
+
+⚠ Also recorded, **not acted on**: `mabda/src/backend_native_pm4.cyr:310-315` annotates the same
+`0x28C40000` with the five field names in **reverse bit order**, contradicting the RADV decode sitting in its
+own repo, and that annotation is vendored into ~40 repos' `lib/mabda.cyr`. agnos's ordering is the correct
+one. Cross-repo, so it is reported rather than fixed here.
+
+⚠ And **not done deliberately**: no write-back-only encoding was invented. Bit 19 is not the answer — the
+RADV decode lists `TC_NC_ACTION_ENA` below bit 18 — and a wrong bit makes `ACQUIRE_MEM` a silent no-op.
+Today's envelope therefore performs *two* whole-L2 invalidates per dispatch, discarding all GL2 residency on
+exit, which is a real tax on a path the plan itself calls memory-bound. Getting the header first is the
+prerequisite for reclaiming it.
+
+### Changed — binary size ceiling 1.7M → 1.8M
+
+The arc closed on 1.7M (1,700,472 B — 472 B over, the same way 1.45.10 closed on 1.2M and the display-audio
+bite closed on 1.5M). Growth is the five shader ISA tables, the `#92` descriptor validation layer, and the
+S3 harness. Note DCE is **off** by default in this tree, so every `*_test` fn ships whether or not its
+`#ifdef` is set. `check.sh` and `test.sh` bumped in lockstep.
+
+### Added — plan-S3: the four-arm coherence characterisation (BUILT, burn-ready, not yet run)
+
+The bite the arc plan made a **gate** — *"nothing writes to the back buffer ahead of S3"* — and which
+execution never ran, because its label was taken by the grid bite. Shader stores have reached the panel
+since 1.56.1, so it can no longer gate anything; it is now retrospective characterisation, and it still
+earns its burn twice:
+
+1. **If arm B passes, the 7-dword whole-cache write-back is not load-bearing for display visibility** and
+   S12's per-op envelope drops 7 dwords. If arm B fails, the packet is *proven* rather than assumed — every
+   build to date emitted it unconditionally, so nobody has ever measured what it buys.
+2. **Arms C and D are S12's precondition.** CP-DMA is MC-direct; shader stores go through GL2. The arc's
+   standing rule forbids batching a dispatch and a CP-DMA into one submission "until S12 says otherwise",
+   and S12 cannot say otherwise without this data.
+
+- **`gpu_cohere_wb` / `gpu_cohere_inv`** — both default to 1, and **production never changes them**;
+  decision **D-6** keeps the pre-dispatch invalidate unconditional there. They are written in exactly one
+  place, `gpu_cohere_run`, which restores both on every exit path. A leaked 0 would re-create the C2g-1
+  stale-shader class that cost eight burns, so there is one choke point rather than set/restore pairs at
+  each call site — plus a post-test assertion that both are back to 1.
+- **Six reported rows, not four booleans.** Each reports a *count* of matching pixels: "3 of 4096 stale" and
+  "4096 of 4096 stale" are different hardware facts, and a partial count means cache-line-granular drainage,
+  which no boolean could express.
+- **CPU-readback and PANEL visibility are scored separately** — different consumers on different paths (the
+  CPU reads the UC/WC mapping; DCN fetches through DCHUB → SDP → the data fabric). A result visible to one
+  and not the other is the most useful thing this test can find, and one verdict would hide it.
+- **Every arm gets a fresh, never-written 16 KB tile** pre-seeded with `0xDEADC0DE` — distinct from 0 and
+  from every expected value. Re-using a slot let a stale GL2 line false-PASS a burn at C2g-1.
+- **Arm D primes before it measures.** A stale line has to exist to be observed: the shader reads the tile
+  while it still holds `PAT1`, CP-DMA then overwrites it with `PAT2` MC-direct, and the shader reads again
+  into a fresh destination. Reading back `PAT1` means GL2 served a stale line. The no-invalidate sub-arm
+  re-primes first, because the previous dispatch's invalidate already dropped the stale lines.
+- The source is **opaque** white, so an opaque src-over yields exactly src — every arm's expected value is
+  one constant, and any deviation is a coherence fact rather than blend error.
+- ⚠ **Stated up front:** a passing arm B does **not** prove the write-back is useless. It proves GL2 drained
+  within the measurement window. Absence of a flush is not a guarantee of staleness — which is why the CPU
+  readback happens immediately after the done marker retires, and the marker rides a `WRITE_DATA` through
+  the CP rather than through GL2, so its arrival says nothing about the shader's stores.
+
+Production behaviour is unchanged: both toggles default to 1, so `gpu_grid7_run` emits the identical ring
+program it always has, plus two compares. `BURN_SHADER_COHERE`, and it needs no other shader flag — it
+drives the runtime arm (`gpu_blend_arm`), not a boot selftest.
+
 ## [1.56.4] — 2026-07-22 — the shader arc realigned to its own plan; #92 iron-proven end to end
 
 The arc's plan doc (`docs/development/planning/kernel-shader-arc-156x.md`) settled the syscall shape as

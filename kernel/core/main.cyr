@@ -1017,6 +1017,19 @@ gpu_shader_glyph_test();
 gpu_shader_grad_test();
 #endif
 
+# GPU arc 1.56.x plan-S3 — GL2 / scanout / CP-DMA COHERENCE, four arms in one boot. The bite the arc plan
+# made a GATE ("nothing writes to the back buffer ahead of S3") and execution never ran: its label was taken
+# by the grid bite, so the post-dispatch TC write-back and the pre-dispatch invalidate have been emitted
+# unconditionally by every build to date and are therefore ASSUMED load-bearing, never measured. Arms C and D
+# are plan-S12's PRECONDITION — CP-DMA is MC-direct while shader stores go through GL2, and the arc's
+# standing rule forbids batching the two into one submission until this test says otherwise.
+# ⚠ Placed LAST among the shader selftests: it is the only one that deliberately runs dispatches with a
+# coherence packet suppressed, so nothing else should be relying on the ring state while it does.
+# Gated #ifdef SHADER_COHERE; first iron burn: BURN_SHADER_COHERE.
+#ifdef SHADER_COHERE
+gpu_shader_cohere_test();
+#endif
+
 
 # GPU arc 1.55.x (Thrust P) P4: scanout-residue clear.
 # ⚠ SCANOUT_LINEAR (v3) is RETIRED — it wrote the WRONG register (0x607) under the OTG lock and BLACKED the

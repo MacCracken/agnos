@@ -231,8 +231,16 @@ P5 needs C1/C2). Batch read-only bites per burn where safe (F0+P0+C0 are read-on
 
    **Key learnings baked in (see `gpu-arc-handoff.md`):** match the proven register-submit sequence
    byte-for-byte (WPTR **LO before HI** — the CP latches on the HI write); the **stale-L2 trap**
-   (`ACQUIRE_MEM` is write-*back*, not invalidate, so a CPU UC pre-seed of a GPU-written buffer gets
-   clobbered — use a fresh slot); **byte-confirm every ISA/PM4 encoding** (`llvm-mc -mcpu=gfx90c`
+   (a CPU UC pre-seed of a GPU-written buffer gets clobbered — use a fresh slot). ⚠ **CORRECTED 2026-07-22:**
+   this line used to read "`ACQUIRE_MEM` is write-*back*, not invalidate", and that is **wrong** for the
+   post-dispatch variant. `GPU_CP_COHER_CNTL_TCWB = 0x00840000` is `TC_WB_ACTION_ENA(1<<18)` **plus**
+   `TC_ACTION_ENA(1<<23)`, and bit 23 is the L2 **INVALIDATE** — settled against a RADV IB decode captured on
+   this same Cezanne (`mabda .../radv-triangle.ib.txt:12-27` forces the field mapping; `:1649-1656` shows
+   `CACHE_FLUSH_AND_INV_TS_EVENT` carrying exactly `{TC_WB=1, TC=1}`). The stale claim is not academic: it is
+   the **root cause of plan-S3 arm D's design**, which primed L2 with a dispatch whose own trailing packet
+   then invalidated the lines it had just populated, making both sub-arms unfalsifiable on the 1.56.4 burn.
+   The author reasoned about precisely that hazard one comment earlier and reintroduced it four lines later,
+   because this doc said the packet could not invalidate; **byte-confirm every ISA/PM4 encoding** (`llvm-mc -mcpu=gfx90c`
    ground-truth + 2 adversarial re-derivations); the **diagnostic-ladder** discipline (localize before
    fixing on iron). Each bite: `gpu-c2*-derive` / `gpu-c2g*-derive` workflow + a CONFIRM/FALSIFY tracker.
 2. **GPUVM page-table format** (C1) — gfx9 multi-level PTE/PDE encoding + TLB-flush must be exact;

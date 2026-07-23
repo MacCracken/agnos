@@ -87,6 +87,26 @@ if [ -n "${BURN_SHADER_OPS:-}" ]; then
     echo "[2/2] Building the 1.56.4 SHADER-OPS kernel (#92 descriptor seam + cov re-proof + glyph/grad first iron; run /bin/gpublend + /bin/gpucov; capture klug > shader_ops.txt)."
     BUILD_ENV="SHADER_BLEND=1 SHADER_COV=1 SHADER_GLYPH=1 SHADER_GRAD=1"
     BUILD_TAG="SHADER_OPS"
+elif [ -n "${BURN_SHADER_COHERE:-}" ]; then
+    # plan-S3 — the four-arm GL2/scanout/CP-DMA coherence characterisation, in ONE boot. The bite the arc
+    # plan made a gate and execution never ran. Needs NO other shader flag: it drives the RUNTIME arm
+    # (gpu_blend_arm), not a boot selftest, so it is unaffected by the SHADER_BLEND dependency.
+    #
+    # Reads as a table in klug, six rows:
+    #   S3-A shader->fb  WB=on   S3-B shader->fb  WB=off      (CPU readback; PANEL scored from the photo)
+    #   S3-C shader->cpdma WB=on / WB=off                     (does an MC-direct read see GL2 stores?)
+    #   S3-D cpdma->shader INV=on / INV=off                   (does a GL2 read see MC-direct writes?)
+    # Plan's expectation: A pass · B FAIL · C needs the write-back · D needs the invalidate. ⚠ ANY deviation
+    # is a hardware fact worth more than the bite — do not "fix" a surprising row, record it.
+    # ⚠ A passing B does NOT prove the write-back is useless; it proves GL2 drained inside the measurement
+    # window. Absence of a flush is not a guarantee of staleness.
+    # PHOTO IS DISPOSITIVE for the panel half: two 64x64 tiles side by side at (96,380) and (240,380) over a
+    # near-black underlay — left = write-back ON, right = OFF. A dark right tile beside a white left tile is
+    # the display-visibility answer the CPU readback cannot give.
+    # CAPTURE: klug > shader_cohere.txt, and one photo of the two tiles.
+    echo "[2/2] Building the plan-S3 SHADER-COHERE kernel (four-arm GL2/scanout/CP-DMA coherence; capture klug > shader_cohere.txt + ONE photo of the two tiles)."
+    BUILD_ENV="SHADER_COHERE=1"
+    BUILD_TAG="SHADER_COHERE"
 elif [ -n "${BURN_SHADER_GRAD:-}" ]; then
     # plan-S11 — vertical linear gradient, no source buffer. Oracle: 'gpu: shader gradient online'.
     echo "[2/2] Building the plan-S11 SHADER-GRAD kernel (linear gradient; capture klug > shader_grad.txt)."

@@ -372,6 +372,12 @@ else
         # SHADER_GRAD=1 — 1.56.x plan-S11: vertical linear gradient (no source buffer).
         # (Released under the label "S9" at 1.56.3.)
         [ -n "$SHADER_GRAD" ]        && echo '#define SHADER_GRAD'
+        # SHADER_COHERE=1 — 1.56.x plan-S3: the four-arm GL2/scanout/CP-DMA coherence characterisation.
+        # The ONLY build in which gpu_cohere_wb / gpu_cohere_inv are ever cleared, and then for exactly one
+        # dispatch at a time through gpu_cohere_run, which restores both. Production is unaffected: both
+        # default to 1 and decision D-6 keeps the pre-dispatch invalidate unconditional there.
+        # Needs no other shader flag — it drives the RUNTIME arm (gpu_blend_arm), not a boot selftest.
+        [ -n "$SHADER_COHERE" ]      && echo '#define SHADER_COHERE'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

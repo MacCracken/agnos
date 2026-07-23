@@ -951,7 +951,17 @@ var GPU_CPDMA_MAX          = 0x03FFFFFF; # DMA_DATA BYTE_COUNT field = 26 bits (
 # collapse the executed-vs-coherent disambiguation). Verify CP_COHER_CNTL vs local gc_9_0
 # sh_mask.h before that burn (a wrong bit makes ACQUIRE_MEM a silent no-op).
 var GPU_PM4_ACQUIRE_MEM_HDR = 0xC0055800; # PACKET3(ACQUIRE_MEM=0x58, count=5) -> 7-dword packet
-var GPU_CP_COHER_CNTL_TCWB  = 0x00840000; # TC_WB_ACTION_ENA(1<<18) | TC_ACTION_ENA(1<<23) — POST-dispatch output writeback
+# POST-dispatch: whole-L2 write-back **AND INVALIDATE**, global range. TC_WB_ACTION_ENA(1<<18) is the
+# write-back; TC_ACTION_ENA(1<<23) is the INVALIDATE. ⚠ The name and the old comment ("output writeback")
+# describe the INTENT, not the EFFECT — this packet also discards all GL2 residency, which is why a dispatch
+# cannot be used to prime L2 for a later measurement (it voided plan-S3 arm D on the 1.56.4 burn).
+# Derivation, independent of this file: mabda programs/diagnostics/radv_capture_triangle/radv-triangle.ib.txt
+# is a RADV IB decode captured on this same Cezanne. At :12-27 it names exactly five =1 fields for
+# 0x28C40000 — which has exactly five bits set, so the mapping is forced with no free parameters — and at
+# :1649-1656 CACHE_FLUSH_AND_INV_TS_EVENT carries exactly {TC_WB=1, TC=1}: "flush" is bit 18, "inv" is 23.
+# ⚠ Do NOT hand-derive a write-back-ONLY encoding from this. Bit 19 is not the answer (the decode lists
+# TC_NC_ACTION_ENA below bit 18), and a wrong bit makes ACQUIRE_MEM a silent no-op.
+var GPU_CP_COHER_CNTL_TCWB  = 0x00840000; # TC_WB_ACTION_ENA(1<<18) | TC_ACTION_ENA(1<<23) — write-back AND INVALIDATE
 # PRE-dispatch full invalidate (mabda/RADV-captured, HW-proven Cezanne): SH_ICACHE(1<<29) | SH_KCACHE(1<<27)
 # | TC(1<<23) | TCL1(1<<22) | TC_WB(1<<18). MANDATORY before DISPATCH on gfx9 — the shader is rewritten in
 # place at a FIXED VA (0x14000) every dispatch, so without an I-cache invalidate the SQ runs a STALE cached
@@ -1119,6 +1129,24 @@ var GPU_OP_DONE_BASE        = 0x58000;       # done-marker table, 64 slots x 0x4
 var GPU_OP_DONE_STRIDE      = 0x40;
 var GPU_BLEND_DONE_SUBOFF   = 0x58000;       # done slot 0 — shared by the five kernels while unbatched
 var GPU_BR2_SRC_SUBOFF = 0x70000;            # src for the guard rect (200x48x4 = 37.5 KB) -> ends 0x79600
+
+# --- plan-S3: GL2 / scanout / CP-DMA coherence characterisation -----------------------------------------
+# Ten 16 KB tiles (64x64x4) at a 0x4000 stride, past BR2_SRC's 0x79600. Each arm gets its OWN never-
+# written tile: the standing rule is that a coherence proof uses a FRESH slot pre-seeded with a sentinel
+# distinct from both 0 and every expected value, because re-using a slot let a stale GL2 line false-PASS a
+# burn at C2g-1. Sharing tiles between arms here would defeat the entire experiment.
+# Tiles 8/9 are arm D's POSITIVE CONTROL, added after the first S3 burn returned an unfalsifiable result.
+var GPU_S3_BASE_SUBOFF = 0x80000;            # tile 0 .. tile 9 = 0x80000 .. 0xA7FFF
+var GPU_S3_STRIDE      = 0x4000;             # 64 * 64 * 4 = 16 KB per tile
+var GPU_S3_N           = 64;                 # tile is NxN pixels; 64 is exactly one wave, no EXEC guard needed
+var GPU_S3_SENTINEL    = 0xDEADC0DE;         # distinct from 0 and from every expected pixel value
+var GPU_S3_PAT1        = 0xFF404040;         # arm-D "old" pattern (premultiplied: c <= a)
+var GPU_S3_PAT2        = 0xFF808080;         # arm-D "new" pattern written MC-direct by CP-DMA
+var GPU_S3_AX          = 96;                 # arm A tile origin in the back buffer
+var GPU_S3_AY          = 380;
+var GPU_S3_BX          = 240;                # arm B tile origin — side by side with A, one photo shows both
+var GPU_S3_BY          = 380;
+var GPU_S3_UNDER       = 0xFF101010;         # underlay both tiles blend over (near-black, CP-DMA-painted)
 var GPU_BR2_W = 200;
 var GPU_BR2_H = 48;
 var GPU_BR2_X = 128;

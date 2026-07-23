@@ -72,6 +72,15 @@ var gpu_glyph_ok      = 0;   # plan-S9: 1 = 1bpp glyph expansion proven on iron
 var gpu_glyph_armed   = 0;   # 1 = glyph_1bpp resident for #92 op GPU_OP_GLYPH_1BPP
 var gpu_grad_ok       = 0;   # plan-S11: 1 = linear gradient proven on iron
 var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot for the #92 op path
+# plan-S3 coherence toggles. BOTH default to 1 and PRODUCTION NEVER CHANGES THEM — decision D-6 keeps the
+# pre-dispatch invalidate unconditional (it is load-bearing twice: stale I$ on a rewritten shader VA, and
+# stale GL2 lines when a shader reads bytes CP-DMA just wrote MC-direct). They exist so gpu_shader_cohere_test
+# can MEASURE what each packet actually buys, which has never been done — every build to date emitted both
+# unconditionally, so "the write-back is load-bearing for display visibility" is an assumption.
+# ⚠ Only ever set via gpu_cohere_run(), which restores both on EVERY exit path. A leaked 0 here re-creates
+# the C2g-1 stale-shader class that cost eight burns.
+var gpu_cohere_wb     = 1;   # 1 = emit the post-dispatch TC write-back (7 dwords)
+var gpu_cohere_inv    = 1;   # 1 = emit the pre-dispatch ACQUIRE_MEM invalidate (7 dwords)
 var gpu_bb_pitch      = 0;   # framebuffer row pitch in BYTES — the dst stride for gpu_blit_shm_sys
 var gpu_scanout_pid   = 0 - 1; # pid owning the scanout (-1 = the console owns it)
 # P3a display-audio discovery (read-only probe results)
@@ -1709,9 +1718,13 @@ fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, 
 
     var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
     var pgm_hi = (shader_mc >> 40) & 0xFF;
-    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
-    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
-    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    # PRE-dispatch invalidate. gpu_cohere_inv is 1 in production and decision D-6 keeps it that way; only
+    # gpu_shader_cohere_test (plan-S3 arm D) ever clears it, for exactly one dispatch, via gpu_cohere_run.
+    if (gpu_cohere_inv != 0) {
+        gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
+        gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+        gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    }
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(rsrc1); gpu_ring_put(GPU_COMPUTE_RSRC2_GRID2D);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N7); gpu_ring_put(GPU_SH_COMPUTE_USER_DATA_0);
@@ -1725,9 +1738,15 @@ fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, 
     gpu_ring_put(GPU_PM4_SET_SH_REG_N1); gpu_ring_put(GPU_SH_COMPUTE_RESOURCE_LIMITS); gpu_ring_put(GPU_COMPUTE_RESLIM);
     gpu_ring_put(GPU_PM4_DISPATCH_DIRECT_HDR); gpu_ring_put(gx); gpu_ring_put(gy); gpu_ring_put(1); gpu_ring_put(GPU_DISPATCH_INITIATOR);
     gpu_ring_put(GPU_PM4_EVENT_WRITE_HDR); gpu_ring_put(GPU_EVENT_CS_PARTIAL_FLUSH);
-    gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
-    gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
-    gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    # POST-dispatch TC write-back. Shader stores land in GL2; the DCN HUBP fetches through the data fabric
+    # and never traverses GL2, and gfx90c has NO shader-side buffer_wbl2 — so this CP packet is the only
+    # mechanism that can make a shader store visible to the DISPLAY. That has always been believed and
+    # never measured: plan-S3 arm B is the first build that can omit it.
+    if (gpu_cohere_wb != 0) {
+        gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
+        gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
+        gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
+    }
     gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
     gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
     gpu_mfence();
@@ -2557,6 +2576,282 @@ fn gpu_blend_surface(src_mc, w, h, dx, dy) {
     w * 4, gpu_bb_pitch, w, gx, h,
     gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
     gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+}
+
+# ── plan-S3: GL2 / scanout / CP-DMA coherence, characterised in ONE boot ──────────────────────────────
+#
+# WHY THIS EXISTS AND WHY IT IS LATE. The arc plan made S3 a GATE — "nothing writes to the back buffer ahead
+# of S3" — and then execution consumed its label for the grid bite and never ran it. Shader stores have been
+# reaching the panel since 1.56.1, so this can no longer gate anything; it is now RETROSPECTIVE
+# CHARACTERISATION, and it still earns its slot twice:
+#   1. If arm B passes, the 7-dword whole-cache write-back is NOT load-bearing for display visibility, and
+#      S12's per-op envelope drops 7 dwords. If arm B fails, the packet is proven rather than assumed.
+#   2. Arms C and D are S12's PRECONDITION. The arc's standing rule forbids batching a dispatch and a CP-DMA
+#      into one submission without an intervening ACQUIRE_MEM "until S12 says otherwise" — and S12 cannot
+#      say otherwise without this data, because CP-DMA is MC-direct while shader stores are GL2.
+#
+# The two coherence domains, stated plainly: CP-DMA bypasses GL2 entirely; shader loads/stores go through
+# GL2. Today mixing them is safe ONLY because the CPU serialises on the done marker between operations.
+#
+# ⚠ SCORED SEPARATELY: CPU-readback visibility and PANEL visibility are different consumers on different
+# paths (CPU reads the UC/WC mapping; DCN fetches through DCHUB → SDP → data fabric). A result that is
+# visible to one and not the other is the single most useful thing this test can find, and collapsing them
+# into one verdict would hide it.
+#
+# ⚠ HONEST LIMIT: a passing arm B does not prove the write-back is useless — it proves GL2 happened to have
+# drained within the measurement window. Absence of a flush is not a guarantee of staleness. That is why the
+# CPU readback happens IMMEDIATELY after the done marker retires (the marker rides a WRITE_DATA through the
+# CP, not through GL2, so its arrival says nothing about the shader's stores).
+
+fn gpu_s3_tile(i) { return GPU_S3_BASE_SUBOFF + i * GPU_S3_STRIDE; }
+
+# gpu_cohere_run — THE ONLY place gpu_cohere_wb / gpu_cohere_inv are ever written. Sets them, runs one
+# blend_rect dispatch, and restores BOTH on every exit path. A leaked 0 would re-create the C2g-1
+# stale-shader class, so there is exactly one choke point rather than set/restore pairs at each call site.
+fn gpu_cohere_run(wb, inv, src_mc, dst_mc, n) {
+    gpu_cohere_wb = wb;
+    gpu_cohere_inv = inv;
+    var r = gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, dst_mc,
+    n * 4, n * 4, n, 1, n,
+    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF,
+    gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+    gpu_cohere_wb = 1;
+    gpu_cohere_inv = 1;
+    return r;
+}
+
+# gpu_s3_seed — fill a tile with a constant via the CPU. The arena is UC-mapped, so these stores go straight
+# to DRAM with no CPU cache in the way — which is what makes it a valid starting point for a GPU-side
+# coherence measurement rather than another cache to reason about.
+fn gpu_s3_seed(phys, val, n) {
+    var i = 0;
+    var px = n * n;
+    while (i < px) { store32(phys + (i << 2), val); i = i + 1; }
+    gpu_mfence();
+}
+
+# gpu_s3_count_eq — how many of the tile's pixels equal `val`. Returning a COUNT rather than a bool is
+# deliberate: "3 of 4096 pixels stale" and "4096 of 4096 stale" are different hardware facts, and a partial
+# count would mean cache-line-granular drainage, which no boolean could express.
+fn gpu_s3_count_eq(phys, val, n) {
+    var i = 0;
+    var px = n * n;
+    var c = 0;
+    while (i < px) {
+        if ((load32(phys + (i << 2)) & 0xFFFFFFFF) == val) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+fn gpu_s3_report(label, llen, got, total) {
+    kprint(label, llen);
+    kprint_num(got);
+    kprint(" of ", 4);
+    kprint_num(total);
+    if (got == total) { kprintln("  COHERENT", 10); }
+    if (got != total) { kprintln("  STALE", 7); }
+    return 0;
+}
+
+fn gpu_shader_cohere_test() {
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    # Uses the RUNTIME arm, not a boot self-test, so this bite does not inherit SHADER_BLEND's ordering.
+    if (gpu_blend_arm() != 1) { kprintln("gpu: skipping coherence (blend shader not resident)", 51); return 0; }
+    if (gpu_blit_arm() != 1) { kprintln("gpu: skipping coherence (no back buffer)", 40); return 0; }
+
+    var n     = GPU_S3_N;
+    var tilep = n * n * 4;
+    var pitch = gpu_bb_pitch;
+    if (pitch < (GPU_S3_BX + n) * 4) { kprintln("gpu: skipping coherence (surface too narrow)", 44); return 0; }
+
+    var bb_phys = gpu_bb_a_phys;
+    var bb_mc   = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { bb_phys = gpu_bb_b_phys; bb_mc = gpu_bb_b_mc; }
+
+    var src_phys = gpu_arena_phys + gpu_s3_tile(0);
+    var src_mc   = gpu_arena_mc   + gpu_s3_tile(0);
+
+    kprintln("gpu: --- plan-S3 coherence characterisation ---", 47);
+
+    # Source: OPAQUE white (alpha 255, premultiplied). Blending opaque src over any dst yields exactly src,
+    # so every arm's expected value is one constant and any deviation is a coherence fact, not blend error.
+    gpu_s3_seed(src_phys, 0xFFFFFFFF, n);
+
+    # ---- ARMS A and B: shader -> SCANOUT BACK BUFFER, with and without the write-back ----
+    # Two tiles side by side so ONE photo scores both. The underlay is CP-DMA-painted near-black, so a tile
+    # that did not reach the display stays visibly dark against a tile that did.
+    if (gpu_cp_dma_fill_rect(bb_mc + GPU_S3_AY * pitch + GPU_S3_AX * 4, pitch, GPU_S3_UNDER, n * 4, n) != 1) {
+        kprintln("gpu: coherence underlay A failed", 32); return 0;
+    }
+    if (gpu_cp_dma_fill_rect(bb_mc + GPU_S3_BY * pitch + GPU_S3_BX * 4, pitch, GPU_S3_UNDER, n * 4, n) != 1) {
+        kprintln("gpu: coherence underlay B failed", 32); return 0;
+    }
+
+    var a_dst_mc   = bb_mc   + GPU_S3_AY * pitch + GPU_S3_AX * 4;
+    var a_dst_phys = bb_phys + GPU_S3_AY * pitch + GPU_S3_AX * 4;
+    gpu_cohere_wb = 1; gpu_cohere_inv = 1;
+    var ra = gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, a_dst_mc,
+    n * 4, pitch, n, 1, n,
+    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF, gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+    var a_cpu = 0;
+    if (ra == 1) {
+        var ay = 0;
+        while (ay < n) {
+            var ax = 0;
+            while (ax < n) {
+                if ((load32(a_dst_phys + ay * pitch + (ax << 2)) & 0xFFFFFFFF) == 0xFFFFFFFF) { a_cpu = a_cpu + 1; }
+                ax = ax + 1;
+            }
+            ay = ay + 1;
+        }
+    }
+
+    var b_dst_mc   = bb_mc   + GPU_S3_BY * pitch + GPU_S3_BX * 4;
+    var b_dst_phys = bb_phys + GPU_S3_BY * pitch + GPU_S3_BX * 4;
+    gpu_cohere_wb = 0; gpu_cohere_inv = 1;
+    var rb = gpu_blend_rect_run(gpu_arena_mc + GPU_BLEND_SHADER_SUBOFF, src_mc, b_dst_mc,
+    n * 4, pitch, n, 1, n,
+    gpu_arena_mc + GPU_BLEND_DONE_SUBOFF, gpu_arena_phys + GPU_BLEND_DONE_SUBOFF);
+    gpu_cohere_wb = 1;
+    var b_cpu = 0;
+    if (rb == 1) {
+        var by = 0;
+        while (by < n) {
+            var bx = 0;
+            while (bx < n) {
+                if ((load32(b_dst_phys + by * pitch + (bx << 2)) & 0xFFFFFFFF) == 0xFFFFFFFF) { b_cpu = b_cpu + 1; }
+                bx = bx + 1;
+            }
+            by = by + 1;
+        }
+    }
+
+    var total = n * n;
+    gpu_s3_report("gpu: S3-A shader->fb  WB=on  cpu-read ", 38, a_cpu, total);
+    gpu_s3_report("gpu: S3-B shader->fb  WB=off cpu-read ", 38, b_cpu, total);
+
+    # ⚠⚠ PRESENT HERE — BEFORE arms C and D, and NOT at the end of the test.
+    # The first S3 burn (1.56.4) presented after every arm had run, so eight further dispatches — each
+    # emitting a bit-18 write-back — had already drained arm B's dirty GL2 lines to DRAM by the time the
+    # panel was scanned. The photo showed B white beside A and would have done so no matter what the
+    # hardware did: invalid in the PERMISSIVE direction, which is the worst kind. That is precisely the
+    # failure the "CPU-readback and PANEL scored SEPARATELY" rule exists to catch, and it still caught it —
+    # B read 0 of 4096 on the CPU while the panel showed it lit.
+    # Presenting here, with nothing between arm B's dispatch and the flip, is the only placement that makes
+    # the panel an independent measurement rather than a restatement of the intervening flushes.
+    gpu_blit_present(0);
+    gpu_udelay(3000000);
+    gpu_display_restore_console();
+
+    # ---- ARM C: shader -> arena, then CP-DMA READS it. Does an MC-direct read see GL2-resident stores? ----
+    var c1_dst_phys = gpu_arena_phys + gpu_s3_tile(1);
+    var c1_dst_mc   = gpu_arena_mc   + gpu_s3_tile(1);
+    var c1_cpy_phys = gpu_arena_phys + gpu_s3_tile(2);
+    var c1_cpy_mc   = gpu_arena_mc   + gpu_s3_tile(2);
+    gpu_s3_seed(c1_dst_phys, 0, n);                       # dst zeroed => opaque blend is an exact copy
+    gpu_s3_seed(c1_cpy_phys, GPU_S3_SENTINEL, n);         # fresh, sentinel-seeded target
+    var c1_ok = gpu_cohere_run(1, 1, src_mc, c1_dst_mc, n);
+    if (c1_ok == 1) { gpu_cp_dma(c1_cpy_mc, c1_dst_mc, tilep); }
+    var c1 = gpu_s3_count_eq(c1_cpy_phys, 0xFFFFFFFF, n);
+
+    var c2_dst_phys = gpu_arena_phys + gpu_s3_tile(3);
+    var c2_dst_mc   = gpu_arena_mc   + gpu_s3_tile(3);
+    var c2_cpy_phys = gpu_arena_phys + gpu_s3_tile(4);
+    var c2_cpy_mc   = gpu_arena_mc   + gpu_s3_tile(4);
+    gpu_s3_seed(c2_dst_phys, 0, n);
+    gpu_s3_seed(c2_cpy_phys, GPU_S3_SENTINEL, n);
+    var c2_ok = gpu_cohere_run(0, 1, src_mc, c2_dst_mc, n);   # NO write-back
+    if (c2_ok == 1) { gpu_cp_dma(c2_cpy_mc, c2_dst_mc, tilep); }
+    var c2 = gpu_s3_count_eq(c2_cpy_phys, 0xFFFFFFFF, n);
+
+    gpu_s3_report("gpu: S3-C shader->cpdma WB=on  read  ", 37, c1, total);
+    gpu_s3_report("gpu: S3-C shader->cpdma WB=off read  ", 37, c2, total);
+
+    # ---- ARM D: CP-DMA -> arena, then the SHADER reads it. Does a GL2 read see MC-direct writes? ----
+    # A stale line has to EXIST before it can be measured, so each sub-arm primes GL2 first: the shader reads
+    # tile 5 while it still holds PAT1, then CP-DMA overwrites tile 5 with PAT2 MC-direct, then the shader
+    # reads tile 5 again into a FRESH destination. Reading back PAT1 means GL2 served a stale line.
+    var d_src_phys = gpu_arena_phys + gpu_s3_tile(5);
+    var d_src_mc   = gpu_arena_mc   + gpu_s3_tile(5);
+    var d_p_phys   = gpu_arena_phys + gpu_s3_tile(6);
+    var d_p_mc     = gpu_arena_mc   + gpu_s3_tile(6);
+    var d1_phys    = gpu_arena_phys + gpu_s3_tile(7);
+    var d1_mc      = gpu_arena_mc   + gpu_s3_tile(7);
+
+    # ⚠⚠ THE PRIME MUST NOT WRITE BACK — this is what voided the first S3 burn (1.56.4, 2026-07-22).
+    # GPU_CP_COHER_CNTL_TCWB = TC_WB_ACTION_ENA(1<<18) | TC_ACTION_ENA(1<<23), and bit 23 is the L2
+    # INVALIDATE. That is settled independently of agnos's own comment, against a RADV IB decode captured on
+    # this same Cezanne (mabda programs/diagnostics/radv_capture_triangle/radv-triangle.ib.txt): the decode
+    # names exactly five =1 fields for 0x28C40000 — which has exactly five bits set, so the mapping is forced
+    # — and CACHE_FLUSH_AND_INV_TS_EVENT there carries exactly {TC_WB=1, TC=1}, i.e. "flush" IS bit 18 and
+    # "inv" IS bit 23. So a prime run with wb=1 emits a whole-L2 invalidate AFTER its own loads populated
+    # GL2 and BEFORE the CP-DMA overwrite — destroying the stale line the arm exists to create. The measured
+    # dispatch then takes a compulsory miss and reports "coherent" for both sub-arms, for any hardware.
+    # Prime with wb=0. inv=1 on the prime is harmless: it fires BEFORE the loads that populate L2.
+    var dp1 = gpu_cohere_run(0, 1, d_src_mc, d_p_mc, n);       # prime GL2 with PAT1 lines for tile 5
+    gpu_cp_dma_fill(d_src_mc, GPU_S3_PAT2, tilep);             # MC-direct overwrite, bypassing GL2
+    gpu_s3_seed(d1_phys, 0, n);
+    gpu_cohere_run(1, 1, d_src_mc, d1_mc, n);                  # WITH the pre-dispatch invalidate
+    var d1_new = gpu_s3_count_eq(d1_phys, GPU_S3_PAT2, n);
+    var d1_old = gpu_s3_count_eq(d1_phys, GPU_S3_PAT1, n);
+
+    # Same experiment with the invalidate suppressed. Re-prime first — the MEASURED dispatch above ran with
+    # wb=1, so its own trailing packet invalidated L2 on the way out.
+    gpu_s3_seed(d_src_phys, GPU_S3_PAT1, n);
+    gpu_s3_seed(d_p_phys, 0, n);
+    var dp2 = gpu_cohere_run(0, 1, d_src_mc, d_p_mc, n);
+    gpu_cp_dma_fill(d_src_mc, GPU_S3_PAT2, tilep);
+    gpu_s3_seed(c1_dst_phys, 0, n);                            # tile 1 reused as a scratch destination here
+    gpu_cohere_run(1, 0, d_src_mc, c1_dst_mc, n);              # NO pre-dispatch invalidate
+    var d2_new = gpu_s3_count_eq(c1_dst_phys, GPU_S3_PAT2, n);
+    var d2_old = gpu_s3_count_eq(c1_dst_phys, GPU_S3_PAT1, n);
+
+    # POSITIVE CONTROL — can this harness observe load-side staleness AT ALL? Identical to the sub-arm above
+    # except the overwrite is a CPU store through the UC mapping instead of a CP-DMA fill. Both writers are
+    # MC-direct and neither invalidates, so:
+    #   control reads PAT1 (stale) + CP-DMA sub-arm reads PAT2  => CP-DMA writes probe/invalidate L2. A real
+    #                                                              finding, and D-6's GL2 justification is wrong.
+    #   control reads PAT2 (fresh)                              => the harness CANNOT see load-side staleness
+    #                                                              on this part. Arm D needs redesign, NOT a
+    #                                                              re-run, and the two rows above stay VOID.
+    # Without this row a second "coherent" would again be unfalsifiable, which is exactly how the first burn
+    # produced a confident-looking answer to a question it never asked.
+    var d3_src_phys = gpu_arena_phys + gpu_s3_tile(8);
+    var d3_src_mc   = gpu_arena_mc   + gpu_s3_tile(8);
+    var d3_dst_phys = gpu_arena_phys + gpu_s3_tile(9);
+    var d3_dst_mc   = gpu_arena_mc   + gpu_s3_tile(9);
+    gpu_s3_seed(d3_src_phys, GPU_S3_PAT1, n);
+    gpu_s3_seed(d_p_phys, 0, n);
+    var dp3 = gpu_cohere_run(0, 1, d3_src_mc, d_p_mc, n);      # prime GL2 with PAT1 lines for tile 8
+    gpu_s3_seed(d3_src_phys, GPU_S3_PAT2, n);                  # CPU UC overwrite, NOT CP-DMA
+    gpu_s3_seed(d3_dst_phys, 0, n);
+    gpu_cohere_run(1, 0, d3_src_mc, d3_dst_mc, n);             # NO pre-dispatch invalidate
+    var d3_new = gpu_s3_count_eq(d3_dst_phys, GPU_S3_PAT2, n);
+    var d3_old = gpu_s3_count_eq(d3_dst_phys, GPU_S3_PAT1, n);
+
+    # PRIME WITNESSES. The first burn discarded these returns, so a silently timed-out prime produced the
+    # same printed row as a successful one — a second, independent reason those rows could not be trusted.
+    kprint("gpu: S3-D primes executed ", 26);
+    kprint_num(dp1 + dp2 + dp3); kprintln(" of 3", 5);
+
+    gpu_s3_report("gpu: S3-D cpdma->shader INV=on  new  ", 37, d1_new, total);
+    kprint("gpu: S3-D cpdma->shader INV=on  stale ", 38); kprint_num(d1_old); kprintln("", 0);
+    gpu_s3_report("gpu: S3-D cpdma->shader INV=off new  ", 37, d2_new, total);
+    kprint("gpu: S3-D cpdma->shader INV=off stale ", 38); kprint_num(d2_old); kprintln("", 0);
+    gpu_s3_report("gpu: S3-D CONTROL cpu-wr INV=off new ", 37, d3_new, total);
+    kprint("gpu: S3-D CONTROL cpu-wr INV=off stale ", 39); kprint_num(d3_old); kprintln("", 0);
+
+    # Belt-and-braces: both toggles MUST be 1 before anything else runs this boot.
+    gpu_cohere_wb = 1;
+    gpu_cohere_inv = 1;
+    if (gpu_cohere_wb != 1) { kprintln("gpu: S3 FAILED TO RESTORE write-back", 36); return 0; }
+    if (gpu_cohere_inv != 1) { kprintln("gpu: S3 FAILED TO RESTORE invalidate", 36); return 0; }
+
+    kprintln("gpu: shader coherence characterised (see the S3-A..D table)", 59);
+    return 1;
 }
 
 # gpu_shader_rect_test — S3: alpha-blend a real rect INTO THE SCANOUT BACK BUFFER over a 2-D grid, verify
