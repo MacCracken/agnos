@@ -1141,6 +1141,25 @@ gpu_audio_probe();
 # rate. Read-only; gated on P0. Takes ~2 s of boot: five ~0.33 s measurement windows.
 gpu_pixclk_discover();
 
+#ifdef ATOM_MATH_SELFTEST
+# H6 (gpu.md, modeset arc) — the ATOM DIV32/MUL32 unit sweep against the atom-interp.py oracle.
+#
+# ⚠ DELIBERATELY AT TOP LEVEL, **not** inside the HDA_HDMI / HDMI_ATOM nest below. This is PURE ARITHMETIC —
+# no MMIO, no VBIOS, no bytecode, no PHY — so it must not require a console-risky flag to run. Putting it
+# inside that nest is exactly the mistake that made its first run a silent no-op: the function body compiled
+# (its string was in the binary, so a `strings` build-guard PASSED) while HDA_HDMI was unset, so no call was
+# ever emitted and the sweep never executed. **String present is not code called** — the log assertion is the
+# only real gate. Cf. [[feedback_ifdef_bites_name_their_build_flags]].
+#
+# ATOM_MATH_SELFTEST still requires HDMI_ATOM, because the helpers live inside that gate in atom.cyr; if it
+# is missing this fails to build, which is the correct loud failure.
+#
+# Why it matters: `SetPixelClock` #12 (the M7 rung) uses DIV32_WS x3 / MUL32_WS x3, and that divider had
+# never executed in ANY mode until this bite. M7 would have been its first run — live, on a pipe, with a
+# failure branch unreadable from the panel.
+atom_math_selftest();
+#endif
+
 #ifdef HDA_HDMI
 # GPU arc 1.55.x (Thrust P) P3b-ii + P3b-iii — THE WRITE BITE: close the 1.53.5 backlog. The HDA half above
 # already streams samples into the GPU's audio function; nothing embeds them because the DISPLAY half was

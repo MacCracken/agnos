@@ -527,37 +527,48 @@ fn atom_op_div(arg) {
     }
     return 0;
 }
-fn atom_op_mul32(arg) {
-    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
-    var dst = atom_get_dst(arg, attr, 0);
-    var src = atom_get_src(attr);
-    var prod = dst * src;                                          # low 64 bits
+# === H6 — the DIV32/MUL32 arithmetic, extracted so it can be UNIT-TESTED ================================
+# These two helpers hold all the arithmetic that atom_op_mul32/atom_op_div32 used to inline. They were split
+# out at 1.56.x for one reason: that code was rewritten at 1.55.23 and **had never been exercised in any
+# mode, on iron or otherwise**, while `SetPixelClock` #12 — the modeset ladder's M7 — uses DIV32_WS x3 and
+# MUL32_WS x3. Inlined inside an opcode handler the arithmetic can only be reached by running bytecode; as
+# free functions of their operands it is directly sweepable. See atom_math_selftest below.
+
+# atom_mul32_split — the 64-bit product of two u32s, low half -> divmul0, high half -> divmul1.
+#
+# ⚠ `dst * src` CAN EXCEED i64 RANGE and wrap negative: 0xFFFFFFFF^2 is ~2^64 - 2^33, well past 2^63-1.
+# That is fine and deliberate. The low 64 bits of the two's-complement pattern ARE the true product mod
+# 2^64, and `(prod >> 32) & 0xFFFFFFFF` extracts pattern bits [63:32] exactly — Cyrius's arithmetic shift
+# puts sign-fill only above bit 31, which the mask then discards. H6 proves this against the Python oracle
+# at the boundary (0xFFFFFFFF x 0xFFFFFFFF), which is precisely where a naive implementation breaks.
+fn atom_mul32_split(dst, src) {
+    var prod = dst * src;                                          # low 64 bits (may wrap negative)
     atom_divmul0 = prod & 0xFFFFFFFF;
     atom_divmul1 = (prod >> 32) & 0xFFFFFFFF;                      # mask discards sign-fill
     return 0;
 }
-fn atom_op_div32(arg) {
-    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
-    var dst = atom_get_dst(arg, attr, 0);
-    var src = atom_get_src(attr);
+
+# atom_div64_32 — UNSIGNED (hi:lo) / src. Quotient LOW half -> divmul0, HIGH half -> divmul1.
+#
+# ⚠ The remainder is DISCARDED, matching amdgpu: atom.c's op_div32 calls do_div and stores only the
+# quotient across divmul[0]/[1]. `atom_op_div` (the 32-bit DIV) is the one that stores a remainder. Do not
+# "fix" this to store one — that would diverge from the oracle.
+#
+# Cyrius `/` is SIGNED (x86 cqo;idiv, aarch64 sdiv), so the oracle's `val64 // src` cannot be written as
+# `((hi<<32)|lo) / src` — with hi's MSB set that dividend is a negative i64 and the signed quotient
+# diverges. Hence bit-by-bit restoring division: the running remainder stays < src (< 2^32), so
+# `rem<<1|bit` is always a positive i64 and every compare and shift is unsigned-safe.
+fn atom_div64_32(hi, lo, src) {
     if (src == 0) { atom_divmul0 = 0; atom_divmul1 = 0; return 0; }
-    # UNSIGNED 64-bit / 32-bit divide of (divmul1 : dst) by src. Cyrius `/` is
-    # SIGNED (x86 cqo;idiv, aarch64 sdiv), so the oracle's `val64 // src` cannot
-    # be expressed as `((divmul1<<32)|dst) / src` — with divmul1's MSB set that
-    # dividend is a negative i64 and the signed quotient diverges. Do it bit-by-
-    # bit instead: the running remainder stays < src (< 2^32), so rem<<1|bit is
-    # always a positive i64 and every compare/shift is unsigned-safe. (DIV32 is
-    # unused by the HDMI transmitter/encoder tables, but the interpreter is the
-    # P6 modeset foundation — keep it a faithful port.)
-    var hi = atom_divmul1 & 0xFFFFFFFF;
-    var lo = dst & 0xFFFFFFFF;
+    var h = hi & 0xFFFFFFFF;
+    var l = lo & 0xFFFFFFFF;
     var qhi = 0;
     var qlo = 0;
     var rem = 0;
     var i = 63;
     while (i >= 0) {
         var bit = 0;
-        if (i >= 32) { bit = (hi >> (i - 32)) & 1; } else { bit = (lo >> i) & 1; }
+        if (i >= 32) { bit = (h >> (i - 32)) & 1; } else { bit = (l >> i) & 1; }
         rem = (rem << 1) | bit;                       # rem < src <= 2^32-1 -> stays positive
         if (rem >= src) {
             rem = rem - src;
@@ -567,6 +578,22 @@ fn atom_op_div32(arg) {
     }
     atom_divmul0 = qlo & 0xFFFFFFFF;
     atom_divmul1 = qhi & 0xFFFFFFFF;
+    return 0;
+}
+
+fn atom_op_mul32(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dst = atom_get_dst(arg, attr, 0);
+    var src = atom_get_src(attr);
+    atom_mul32_split(dst, src);
+    return 0;
+}
+fn atom_op_div32(arg) {
+    var attr = atom_u8(atom_ip); atom_ip = atom_ip + 1;
+    var dst = atom_get_dst(arg, attr, 0);
+    var src = atom_get_src(attr);
+    # The 64-bit dividend is (divmul1 : dst) — the HIGH half is whatever a prior MUL32/DIV32 left behind.
+    atom_div64_32(atom_divmul1, dst, src);
     return 0;
 }
 # arg is a fixed selector (0=ATI, 1=PCI, 2=SYSIO).
@@ -868,3 +895,83 @@ fn atom_hdmi_transmitter_bringup() {
 
 #endif
 # ^ HDMI_ATOM — the whole ATOM interpreter is opt-in (see the file header).
+
+#ifdef ATOM_MATH_SELFTEST
+# === H6 — DIV32 / MUL32 unit sweep against the Python oracle ==============================================
+#
+# The cheapest bite in the modeset arc, and it gates every number `SetPixelClock` #12 computes.
+#
+# `atom_div64_32` was rewritten at 1.55.23 to a bit-by-bit UNSIGNED divide -- because Cyrius `/` is signed
+# (x86 `cqo;idiv`) and the oracle's `val64 // src` diverges the moment the dividend's high half has its MSB
+# set -- and until this bite it had **never executed in any mode, on iron or otherwise**. #12 uses
+# `DIV32_WS` x3 and `MUL32_WS` x3, so M7 would have been its first run, live, on a pipe, with a failure
+# branch that is unreadable from the panel. That is not where you discover a divider bug.
+#
+# Expected values are ORACLE-DERIVED, not hand-computed: generated by
+# `agnosticos/scripts/atom-math-vectors.py`, which reproduces the exact arithmetic of atom-interp.py's
+# `op_div32` (:763-774) and `op_mul32` (:848-854). Regenerate with:
+#     python3 agnosticos/scripts/atom-math-vectors.py
+#
+# Pure arithmetic -- no MMIO, no VBIOS, no bytecode. Runs in QEMU. Never needs iron.
+
+var atom_h6_pass = 0;
+var atom_h6_fail = 0;
+
+# Compare the divmul pair the helper just produced against the oracle's answer.
+fn atom_h6_case(tag, want0, want1) {
+    if (atom_divmul0 == want0) {
+        if (atom_divmul1 == want1) { atom_h6_pass = atom_h6_pass + 1; return 1; }
+    }
+    atom_h6_fail = atom_h6_fail + 1;
+    kprint("atom: H6 case ", 14); kprint_num(tag);
+    kprint(" got ", 5); kprint_hex(atom_divmul0); kprint("/", 1); kprint_hex(atom_divmul1);
+    kprint(" want ", 6); kprint_hex(want0); kprint("/", 1); kprint_hex(want1);
+    kprintln("", 0);
+    return 0;
+}
+
+fn atom_math_selftest() {
+    atom_h6_pass = 0;
+    atom_h6_fail = 0;
+
+# --- DIV32: unsigned (hi:lo) / src, quotient split across divmul0/divmul1 ---
+    atom_div64_32(0x0, 0x0, 0x1);  atom_h6_case(1, 0x0, 0x0);   # identity zero
+    atom_div64_32(0x0, 0x64, 0x7);  atom_h6_case(2, 0xE, 0x0);   # small / small, non-zero remainder
+    atom_div64_32(0x0, 0xFFFFFFFF, 0x1);  atom_h6_case(3, 0xFFFFFFFF, 0x0);   # max u32 / 1
+    atom_div64_32(0x0, 0xFFFFFFFF, 0xFFFFFFFF);  atom_h6_case(4, 0x1, 0x0);   # max / max = 1
+    atom_div64_32(0x1, 0x0, 0x2);  atom_h6_case(5, 0x80000000, 0x0);   # 2^32 / 2 -- crosses the halves
+    atom_div64_32(0x80000000, 0x0, 0x2);  atom_h6_case(6, 0x0, 0x40000000);   # MSB-SET dividend high half -- the signed-divide trap
+    atom_div64_32(0x80000000, 0x1, 0x3);  atom_h6_case(7, 0xAAAAAAAB, 0x2AAAAAAA);   # MSB-set dividend, odd divisor
+    atom_div64_32(0xFFFFFFFF, 0xFFFFFFFF, 0x1);  atom_h6_case(8, 0xFFFFFFFF, 0xFFFFFFFF);   # 2^64-1 / 1 -- the 64-bit boundary
+    atom_div64_32(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF);  atom_h6_case(9, 0x1, 0x1);   # 2^64-1 / 2^32-1 -- quotient exceeds 32 bits
+    atom_div64_32(0xFFFFFFFF, 0xFFFFFFFF, 0x2);  atom_h6_case(10, 0xFFFFFFFF, 0x7FFFFFFF);   # 2^64-1 / 2
+    atom_div64_32(0x0, 0x3039, 0x80000000);  atom_h6_case(11, 0x0, 0x0);   # MSB-SET divisor, quotient 0
+    atom_div64_32(0x7FFFFFFF, 0xFFFFFFFF, 0x80000000);  atom_h6_case(12, 0xFFFFFFFF, 0x0);   # MSB-set divisor at the sign boundary
+    atom_div64_32(0x12345678, 0x9ABCDEF0, 0xDEADBEEF);  atom_h6_case(13, 0x14EDB427, 0x0);   # MSB-set divisor, arbitrary dividend
+    atom_div64_32(0x0, 0x3AF5C, 0xE1F5);  atom_h6_case(14, 0x4, 0x0);   # pixel-clock-shaped: 241500 / 57845
+    atom_div64_32(0x1, 0x2A05F200, 0x3AF5C);  atom_h6_case(15, 0x50DF, 0x0);   # 5e9 / 241500 -- #12-shaped divider math
+    atom_div64_32(0x0, 0x64, 0x0);  atom_h6_case(16, 0x0, 0x0);   # ZERO DIVISOR -> both halves 0
+    atom_div64_32(0x80000000, 0x1, 0x0);  atom_h6_case(17, 0x0, 0x0);   # ZERO DIVISOR with MSB-set dividend
+
+# --- MUL32: 64-bit product split across divmul0 (low) / divmul1 (high) ---
+    atom_mul32_split(0x0, 0x0);  atom_h6_case(18, 0x0, 0x0);   # zero
+    atom_mul32_split(0x1, 0x1);  atom_h6_case(19, 0x1, 0x0);   # identity
+    atom_mul32_split(0x2, 0x3);  atom_h6_case(20, 0x6, 0x0);   # small
+    atom_mul32_split(0x10000, 0x10000);  atom_h6_case(21, 0x0, 0x1);   # 2^16 x 2^16 = exactly 2^32
+    atom_mul32_split(0x80000000, 0x2);  atom_h6_case(22, 0x0, 0x1);   # 2^31 x 2 = exactly 2^32
+    atom_mul32_split(0x80000000, 0x80000000);  atom_h6_case(23, 0x0, 0x40000000);   # 2^31 x 2^31 = 2^62
+    atom_mul32_split(0xFFFFFFFF, 0x2);  atom_h6_case(24, 0xFFFFFFFE, 0x1);   # max x 2
+    atom_mul32_split(0xFFFFFFFF, 0xFFFFFFFF);  atom_h6_case(25, 0x1, 0xFFFFFFFE);   # THE BOUNDARY: 2^64-2^33+1, wraps i64 NEGATIVE
+    atom_mul32_split(0xFFFFFFFF, 0x80000000);  atom_h6_case(26, 0x80000000, 0x7FFFFFFF);   # max x 2^31 -- also past 2^63
+    atom_mul32_split(0x3AF5C, 0x3E8);  atom_h6_case(27, 0xE64FF60, 0x0);   # 241500 x 1000 -- pixel-clock-shaped
+
+    kprint("atom: H6 selftest ", 18); kprint_num(atom_h6_pass);
+    kprint(" passed, ", 9); kprint_num(atom_h6_fail); kprintln(" failed", 7);
+    if (atom_h6_fail == 0) {
+        kprintln("atom: H6 PASS div32/mul32 match the oracle", 42);
+        return 1;
+    }
+    kprintln("atom: H6 FAIL div32/mul32 diverge from the oracle", 49);
+    return 0;
+}
+#endif

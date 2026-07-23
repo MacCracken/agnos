@@ -417,6 +417,12 @@ else
         # recoverably. The default HDMI_ATOM build runs the encoder setup ONLY (DIG front-end, PHY-safe).
         # Enable this only with a full modeset (SetPixelClock + OTG recommit) in place.
         [ -n "$ATOM_RUN_TRANSMITTER" ] && echo '#define ATOM_RUN_TRANSMITTER'
+        # ATOM_MATH_SELFTEST=1 — H6 (modeset arc): run the DIV32/MUL32 unit sweep against the
+        # atom-interp.py oracle and print pass/fail. PURE ARITHMETIC — no MMIO, no VBIOS, no bytecode, no
+        # PHY. Safe anywhere, needs no iron; QEMU is the intended venue. Requires HDMI_ATOM because the
+        # helpers live inside that gate. Vectors regenerate with
+        # `python3 agnosticos/scripts/atom-math-vectors.py`.
+        [ -n "$ATOM_MATH_SELFTEST" ] && echo '#define ATOM_MATH_SELFTEST'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include
