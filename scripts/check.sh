@@ -63,6 +63,24 @@ test -z "$ARITY"
 check "call arity (no cycc argument-count warnings)" $?
 [ -z "$ARITY" ] || echo "$ARITY" | sed 's/^/    /'
 
+# Shader ISA tables vs their assembler sources. Every table in gpu.cyr carries a "GENERATED ... DO NOT
+# HAND-EDIT" banner that NOTHING enforced until this landed (1.56.6) — it was the 1.56.x shader plan's
+# opening item and it never shipped with the arc. There is no QEMU path for kernel/core/gpu.cyr, so a
+# corrupted ISA dword cannot fail in CI; it fails as an iron burn on the operator's only dev machine.
+# Negative-tested: corrupting one dword makes this FAIL and names the regeneration command.
+# ⚠ Use the script's own EXIT CODE, not a grep of its output. The first version of this block was
+#   `grep -q FAIL && false || true` — which always exits 0, so the check could never fail. A gate that
+#   passes by construction is the exact defect this gate exists to prevent; it was caught by negative-
+#   testing, which is why every gate here gets negative-tested rather than just observed passing.
+# ⚠ `|| GFXRC=$?` is load-bearing: this script runs under `set -e` (line 3), so an unguarded non-zero exit
+#   from the gate would ABORT check.sh silently instead of reporting a FAIL. Second bug in this one block,
+#   same shape as the first: the failure path was never exercised until it was deliberately triggered.
+GFXRC=0
+sh "$ROOT/scripts/gfx9-asm-check.sh" > /tmp/gfx9-asm-check.log 2>&1 || GFXRC=$?
+check "shader ISA tables match llvm-mc -mcpu=gfx90c" $GFXRC
+[ "$GFXRC" -eq 0 ] || sed 's/^/    /' /tmp/gfx9-asm-check.log
+grep -q "^gfx9-asm-check: SKIPPED" /tmp/gfx9-asm-check.log && echo "    ⚠ llvm-mc absent — the ISA tables are UNVERIFIED on this box" || true
+
 # Tests
 echo ""
 echo "--- Tests ---"

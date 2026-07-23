@@ -5,6 +5,84 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.56.6] - 2026-07-23
+
+The burn-free rows of the GPU release plan. **No iron burn required for anything in this cut.**
+
+### Added — `scripts/gfx9-asm-check.sh`: the shader-ISA gate that shipped without its arc
+
+Every gfx90c ISA table in `kernel/core/gpu.cyr` carries a `GENERATED ... DO NOT HAND-EDIT` banner, and
+until now **nothing enforced it**. Standing up `llvm-mc` as a *sweep gate* rather than a habit was the
+opening item of the 1.56.x shader plan; `scripts/gfx9-asm.sh` (the assembler) landed, the check never did,
+and the arc closed its whole S ladder on top of an unverified foundation.
+
+The gate re-assembles each `kernel/shaders/*.s` and byte-compares against the table committed in `gpu.cyr`.
+**7/7 match** — blend_cov (67 dwords) · blend_pk (61) · blend_premul (51) · blend_rect (60) · glyph_1bpp (36)
+· grad_linear (70) · perm (34). Wired into `scripts/check.sh` (now 15 gates).
+
+⚠ **Why this is not ordinary lint:** `gpu_regs.cyr:1033-1035` states the rule — a miscounted RSRC word is
+*"wrong, not slow"* — and there is **no QEMU path for any of `kernel/core/gpu.cyr`**, because QEMU emulates
+no AMD GFX. A corrupted ISA dword therefore cannot fail in CI. It fails on the operator's only dev machine,
+as a burn. This gate is the only thing between a bad dword and a wasted flash.
+
+**Negative-tested, and it mattered — the gate had two bugs that made it pass by construction:**
+1. `grep -q FAIL && false || true` always exits 0, so the check could never fail.
+2. `check.sh` runs under `set -e`, so an unguarded non-zero exit **aborted the script silently** instead of
+   reporting a FAIL.
+
+Both were invisible while the tree was clean and were caught only by deliberately corrupting a dword. A gate
+observed passing is not a gate. It now fails on a single wrong dword, names the table, and prints the exact
+regeneration command.
+
+⚠ **Honest coverage limit, stated in the script itself:** only shaders **with** a `.s` source are checked.
+The six 1.54.x compute kernels (the C2f/C2g dispatch ladder and the two f64 matmuls) were hand-typed as hex
+before the emitter existed and have no `.s`, so they remain unverified against `llvm-mc`. Writing sources
+for them is the remaining half of that work item.
+
+### Verified closed — the two 1.56.3 re-audit defects needed no fix
+
+Checked rather than assumed, and both were already resolved at 1.56.4:
+- **Coverage-dispatcher arity**: `gpu_cov_surface` is a 6-parameter function called with 6 arguments at both
+  sites, and `check.sh`'s call-arity gate passes.
+- **Shader residency vs the VM protection-fault sink page**: slots moved to
+  `GPU_SHADER_SLOT_BASE = 0x50000` (8 × 4 KB, stride `0x1000`), clear of the `0x15000` sink page.
+
+### Changed — GPU planning consolidated from seven documents to one
+
+`docs/development/planning/gpu.md` replaces the 1.54.x compute arc, the 1.55.x display arc, the 1.56.x
+shader arc, the HDMI-modeset investigation, an earlier HDMI-audio plan, a draft modeset arc, and a stale
+session handoff in agnosticos. Extracted first: **99 iron-proven facts** (exact offsets and measured
+values), **58 falsified hypotheses with the evidence that killed each**, and **47 standing hazards**. All
+14 referencing files repointed; no dangling links.
+
+The falsified section is the load-bearing one — it was scattered across six files, and re-opening a dead
+branch costs an iron burn on the operator's only dev box.
+
+Rules written into the file so the split does not recur: **no new GPU arc documents · no cryptic bite IDs
+(`C2g-1`, `S0`-`S12`, `D0`-`D2`, `P4`, `A4` are unreadable weeks later and let the same work be re-sold as
+new) · everything maps to a release, with no "any gap" bucket · a release is finished when its consumer can
+use it, not when the kernel half compiles.** That last one is 1.54.x's C6 and 1.56.x's `#92` — the same
+mistake twice.
+
+### Fixed — the iron log had no record of the five D-lane burns
+
+`agnosticos/docs/development/iron-nuc-zen-log.md` gained the missing `#tracker-156x-dlane` section, and two
+stale *"Still outstanding in 1.56.x: D1/D2"* lists were marked closed in place.
+
+**This omission is the root cause of a wasted session.** The five burns of 2026-07-22 closed both D1 and D2
+and were never written down, so the last recorded state stayed "outstanding" — and the next session read it,
+believed it, and rebuilt the finished lane before deleting it again. **A burn that is not written into the
+log did not happen, as far as every future session is concerned.**
+
+The tracker records all five burns with the durable findings they bought: DCN registers latch only under the
+OTG lock with a VUPDATE trigger (a bare write lands in shadow and *reads back as if applied*) ·
+`OPTC0_UNDERFLOW` bit10 is sticky and already 1 at boot on this pipe · the GOP leaves
+`MPCC_CONTROL = 0xFFFF0461` (MODE=1 passthrough + ALPHA_MULTIPLIED=1, both vetoing the blend) against
+amdgpu's known-good `0xFFFF0422` · the MPCC background is the bottom blend operand and agnos had never
+touched it. Plus the arithmetic that made burns 1 and 2 unwinnable: their stimulus was a white-on-black
+console where R == G == B, so **any** colour permutation is the identity.
+
+
 ### Removed — the D lane, code and flag. It was FINISHED and I re-armed it.
 
 D1 (HUBPRET channel crossbar) and D2 (MPCC global alpha) **closed** across the five iron burns of 2026-07-22:
