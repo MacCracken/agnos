@@ -5,6 +5,71 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — plan-S4: the v_perm_b32 byte crossbar + the VOP3P packed blend (BUILT, burn-ready)
+
+The last un-started item on the ladder. Through eleven bites the tree contained **zero `v_perm_b32` and
+zero `v_pk_*`**, while the arc's own scope list called the RGBX↔BGRX channel swap *"an unhandled case, not
+just a slow one"*. Two new kernels, `kernel/shaders/perm.s` (34 dwords) and `kernel/shaders/blend_pk.s`
+(61 dwords), both assembled through `scripts/gfx9-asm.sh` with RSRC1/RSRC2 harvested from their own
+descriptors rather than hand-counted.
+
+**The channel swap is not the same capability as bite D1's HUBP crossbar.** That crossbar is a property of
+the **whole scanout**, so it cannot swap one composited client surface while leaving its neighbours alone.
+This can, in one VALU op — the shift/mask equivalent is five instructions plus a staged mask.
+
+**The packed blend is claimed BIT-IDENTICAL to the shipped f32 kernel, with zero tolerance** — not the
+"≤ 1, max printed" discipline `blend_cov` uses. That is established exhaustively off-iron: **0 mismatches,
+max deviation 0, over all 8,421,376 premultiplied `(src_c, dst_c, src_a)` triples**. So any deviation on
+hardware is a real fault, not rounding. 27 VALU/px packed vs 31 f32, and the test **prints both numbers**
+rather than trusting a comment — the tree already carries one stale instruction claim.
+
+**Three ISA facts, derived from LLVM oracles and llvm-mc round-trips rather than from memory, because a
+wrong selector produces a wrong PICTURE and never an exception:**
+
+- **`v_perm_b32`'s byte pool is inverted relative to the written operand order.** For `D, S0, S1, S2`:
+  `pool[0..3] = S1` (the *second* operand is the LOW dword), `pool[4..7] = S0`. A single-source permutation
+  must therefore be written `v_perm_b32 D, 0, pixel, sel`. Getting it backwards does not fault and does not
+  produce zeros — it permutes whatever stale value the other VGPR holds, which reads as "the shader is
+  broken" rather than "the operands are swapped", the most expensive possible misdiagnosis. Confirmed two
+  ways: constant-folding `llvm.amdgcn.perm` across all 256 selector-byte values (256/256 match), and the
+  `v_perm_b32` ISel emits for `llvm.bswap.i32`, which is a byte reversal *only* under this reading.
+- **Selector byte k drives destination byte k**, LSB to LSB, so a hex selector reads destination-MSB-first.
+  `12` is a constant `0x00`; `≥ 13` is `0xFF`; `8..11` sign-replicate.
+- **No VOP3A/VOP3B/VOP3P source takes a 32-bit literal on gfx9** — not a VOP3P-only rule. `v_perm_b32 v4,
+  v1, v2, 0x03000102` is *rejected by the assembler*, so this class fails at build time rather than on iron.
+  An SGPR **is** legal as `v_perm_b32`'s third source, so a kernarg selector needs no restaging; the
+  constant-bus limit is one distinct SGPR across all three sources.
+
+**The VOP3P trap is relocated, not absent.** The bare-mnemonic defaults (`op_sel:[0,0,0]
+op_sel_hi:[1,1,1]`) *are* what a naive reader expects for register-to-register packed math. But a scalar
+staged in the low half needs `op_sel_hi=0` on that operand, or its lane-1 input reads bits[31:16] = **zero**.
+Omitting it on the four shifts assembles clean and corrupts **8,266,513 of 8,421,376** premultiplied triples
+— 98.2%, confined to the **high** u16 lane, i.e. channels **G and A** — and renders as a plausible image
+with a colour cast. Every VOP3P in `blend_pk.s` therefore writes its modifiers out explicitly, and the test
+gives that signature (bytes 1 and 3 wrong while 0 and 2 are right) **its own console line**, because a
+generic mismatch message would send the burn hunting the wrong instruction.
+
+- ⚠ **`GPU_COMPUTE_PGM_RSRC1_PK`** exists because `blend_pk` needs **24 SGPRs** where `perm` and
+  `blend_premul` want the 16-SGPR `_V12`. Reusing `_V12` under-allocates the SGPR file; the first casualty
+  is the `vcc` carry chain in the address arithmetic, so lanes read and write the **wrong pixels** — or run
+  off the end of the arena into the VM fault sink, which faults and reads as a VM bug. Highest-probability
+  integration error in the bite, precisely because the two kernels sit side by side.
+- ⚠ **Every seeded lane satisfies `sc <= sa`.** On the full cube the two kernels genuinely diverge on
+  4,177,920 of 16,777,216 triples (max deviation 255) because f32 saturates where the packed path wraps and
+  carries into the neighbouring byte. That is the premultiplied precondition firing, and straight-alpha
+  seeds would indict the wrong instruction.
+- **Four corner lanes** are hand-placed: `sa=0` (out ≡ dst), `sa=255` (out ≡ src), opaque black over grey
+  (the f32 path hands `v_cvt_pk_u8_f32` a strictly *negative* value here, min −1.508e−05 — the two kernels
+  agree only if it clamps to 0, and that is **the one behaviour in this bite that cannot be settled
+  off-iron**), and `sa=1, sc=0, dc=1` (the truncate-vs-round discriminator).
+- The perm test runs the **identity selector first as a control**: if unpack/repack fails there, the swap
+  run cannot say anything new, so it stops rather than reporting a second derived failure. ⚠ Its involution
+  check is valid only because both driven selectors are involutions — a future *rotate* selector would need
+  a double CPU shuffle, or correct hardware would read as broken.
+
+`SHADER_PERM` joins the `SHADER_BLEND` dependency guard, since the f32 kernel is the packed blend's
+**oracle** and not merely its gate. `BURN_SHADER_PERM`, `cmp`-verified live.
+
 ### ✅ plan-S3 COMPLETE — iron-proven (archaemenid, 2026-07-22). All four arms conclusive.
 
 Two burns. The first returned A/B/C conclusive and arm D void (confounded by the harness, below); the

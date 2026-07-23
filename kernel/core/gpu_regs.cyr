@@ -1087,6 +1087,25 @@ var GPU_GLY_FG     = 0xFFFFE060;
 # MEANING — one pointer plus five scalars, no source buffer at all.
 var GPU_COMPUTE_PGM_RSRC1_GRAD = 0x002C00C3; # 16 VGPRs, 32 SGPRs (llvm-mc computed)
 var GPU_GRAD_SHADER_SUBOFF     = 0x53000;    # slot 3 — grad_linear blob (70 dwords). Was 0x18000 == KERNARG_IN.
+
+# --- plan-S4: v_perm_b32 byte crossbar + the VOP3P packed blend ----------------------------------------
+var GPU_PERM_SHADER_SUBOFF     = 0x54000;    # slot 4 — perm blob (34 dwords / 136 B)
+var GPU_PK_SHADER_SUBOFF       = 0x55000;    # slot 5 — blend_pk blob (61 dwords / 244 B)
+# ⚠ blend_pk needs its OWN RSRC1 — 12 VGPRs but 24 SGPRs, where perm and blend_premul want the 16-SGPR
+# _V12. Reusing _V12 here UNDER-ALLOCATES the SGPR file, and the first casualty is the vcc carry chain in
+# the address arithmetic: lanes then read and write the WRONG PIXELS, or run off the end of the arena into
+# the VM fault sink — which faults and reads as a VM bug rather than as a register-allocation mistake.
+# This is the highest-probability integration error in the bite, because perm.s legitimately uses _V12 and
+# the two kernels sit side by side. Harvested from blend_pk.s's own .amdhsa_kernel descriptor, never
+# hand-counted (gpu_regs.cyr's own warning: a miscounted RSRC word is *wrong*, not slow).
+var GPU_COMPUTE_PGM_RSRC1_PK   = 0x002C0082; # blend_pk: 12 VGPRs, 24 SGPRs (llvm-mc computed)
+var GPU_PERM_SRC_SUBOFF        = 0x1C000;    # 64 source pixels (256 B)
+# ⚠ perm writes FOUR dwords per lane (identity / involution / unpack-repack / swap), unlike every other
+# kernel in this arena, so this slot is 1 KB and not 256 B. A short buffer would run into PK_OUT below and,
+# in any later scale-up, into the SDMA ring at 0x20000 — a write into a live ring would be spectacular and
+# would not look like a shader bug. The 1 KB gap before PK_OUT is deliberate slack, not rounding.
+var GPU_PERM_OUT_SUBOFF        = 0x1C400;    # 64 x 4 dwords (1024 B) -> ends 0x1C800
+var GPU_PK_OUT_SUBOFF          = 0x1CC00;    # packed-blend output (256 B), 1 KB clear of PERM_OUT
 var GPU_GRD_W  = 320;
 var GPU_GRD_H  = 200;
 var GPU_GRD_X  = 200;

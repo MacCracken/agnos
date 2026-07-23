@@ -172,11 +172,13 @@ else
     # coverage re-proof was the one arm that burn actually owed. Checked HERE rather than in burn-prep.sh
     # because burns have historically been driven by hand-exported defines straight to this script, which
     # bypasses burn-prep entirely.
-    if [ -n "${SHADER_COV:-}${SHADER_RECT:-}" ] && [ -z "${SHADER_BLEND:-}" ]; then
-        echo "ERROR: SHADER_COV / SHADER_RECT require SHADER_BLEND=1." >&2
+    if [ -n "${SHADER_COV:-}${SHADER_RECT:-}${SHADER_PERM:-}" ] && [ -z "${SHADER_BLEND:-}" ]; then
+        echo "ERROR: SHADER_COV / SHADER_RECT / SHADER_PERM require SHADER_BLEND=1." >&2
         echo "       Their selftests early-return on gpu_blend_ok, which only SHADER_BLEND sets," >&2
         echo "       so this build would print 'gpu: skipping ...' and prove nothing." >&2
-        echo "       Re-run with: SHADER_BLEND=1 ${SHADER_RECT:+SHADER_RECT=1 }${SHADER_COV:+SHADER_COV=1 }..." >&2
+        echo "       (SHADER_PERM's packed-blend half uses the f32 kernel as its ORACLE, so it is not" >&2
+        echo "        merely gated on it — without SHADER_BLEND there is nothing to compare against.)" >&2
+        echo "       Re-run with: SHADER_BLEND=1 ${SHADER_RECT:+SHADER_RECT=1 }${SHADER_COV:+SHADER_COV=1 }${SHADER_PERM:+SHADER_PERM=1 }..." >&2
         exit 1
     fi
 
@@ -378,6 +380,11 @@ else
         # default to 1 and decision D-6 keeps the pre-dispatch invalidate unconditional there.
         # Needs no other shader flag — it drives the RUNTIME arm (gpu_blend_arm), not a boot selftest.
         [ -n "$SHADER_COHERE" ]      && echo '#define SHADER_COHERE'
+        # SHADER_PERM=1 — 1.56.x plan-S4: the v_perm_b32 byte crossbar (identity + RGBX<->BGRX channel
+        # swap) and the VOP3P packed blend. ⚠ REQUIRES SHADER_BLEND — gpu_shader_blend_pk_test gates on
+        # gpu_blend_ok because the f32 kernel is its oracle; without it the packed half silently skips.
+        # Enforced in the dependency guard above, the same way SHADER_COV/SHADER_RECT are.
+        [ -n "$SHADER_PERM" ]        && echo '#define SHADER_PERM'
         # HDMI_ATOM=1 — A4 (1.55.x): run the sovereign ATOM interpreter's HDMI transmitter bring-up
         # (DIGxEncoderControl(HDMI) + DIG1TransmitterControl(ENABLE)) before gpu_hdmi_audio_enable(). This
         # is the firmware-driven encoder/PHY setup the GOP did as DVI and the raw DIG_MODE flip cannot

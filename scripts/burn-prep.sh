@@ -87,6 +87,31 @@ if [ -n "${BURN_SHADER_OPS:-}" ]; then
     echo "[2/2] Building the 1.56.4 SHADER-OPS kernel (#92 descriptor seam + cov re-proof + glyph/grad first iron; run /bin/gpublend + /bin/gpucov; capture klug > shader_ops.txt)."
     BUILD_ENV="SHADER_BLEND=1 SHADER_COV=1 SHADER_GLYPH=1 SHADER_GRAD=1"
     BUILD_TAG="SHADER_OPS"
+elif [ -n "${BURN_SHADER_PERM:-}" ]; then
+    # plan-S4 — the v_perm_b32 BYTE CROSSBAR + the VOP3P PACKED blend. The last un-started ladder item: the
+    # tree had zero v_perm_b32 and zero v_pk_* through eleven bites while the arc's own scope list called
+    # the RGBX<->BGRX channel swap "an unhandled case, not just a slow one".
+    # Carries SHADER_BLEND because the f32 kernel is the packed blend's ORACLE, not merely its gate.
+    #
+    # Three sub-proofs, all bit-exact, all in one boot:
+    #   perm control run (identity selector)  -> 'gpu: perm lanes stored 64 of 64'
+    #   perm swap run    (0x03000102)         -> 'gpu: perm byte crossbar online (identity and channel swap, 64 px)'
+    #   packed blend vs f32, SAME data        -> 'gpu: packed blend bit-identical to float blend (64 px)'
+    #                                            + 'gpu: packed blend valu per pixel 27 float 31'
+    #
+    # ⚠ Two silent-wrong-VALUE failure modes to read for, neither of which faults:
+    #   'green or alpha wrong, check the packed shift lane select' = the op_sel_hi:[0,1] modifier was lost;
+    #      it corrupts 98.2% of pixels but ONLY the high u16 lane (G and A), and renders as a plausible
+    #      image with a colour cast.
+    #   'perm unpack repack wrong' on the CONTROL run = v_perm_b32's byte pool is reversed from the written
+    #      operand order (S1 is the LOW dword); a swapped pair permutes a stale VGPR and reads as "the
+    #      shader is broken" rather than "the operands are backwards".
+    # The bit-identity claim is exhaustively established off-iron (0 mismatches over all 8,421,376
+    # premultiplied triples), so ANY deviation here is a real hardware or encoding fault, not rounding.
+    # CAPTURE: klug > shader_perm.txt. No photo needed — every oracle is numeric.
+    echo "[2/2] Building the plan-S4 SHADER-PERM kernel (v_perm_b32 crossbar + VOP3P packed blend; capture klug > shader_perm.txt)."
+    BUILD_ENV="SHADER_BLEND=1 SHADER_PERM=1"
+    BUILD_TAG="SHADER_PERM"
 elif [ -n "${BURN_SHADER_COHERE:-}" ]; then
     # plan-S3 — the four-arm GL2/scanout/CP-DMA coherence characterisation, in ONE boot. The bite the arc
     # plan made a gate and execution never ran. Needs NO other shader flag: it drives the RUNTIME arm

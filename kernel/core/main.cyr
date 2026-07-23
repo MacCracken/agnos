@@ -1030,6 +1030,19 @@ gpu_shader_grad_test();
 gpu_shader_cohere_test();
 #endif
 
+# GPU arc 1.56.x plan-S4 — the v_perm_b32 BYTE CROSSBAR and the VOP3P PACKED blend. The only ladder item
+# never started: there was zero v_perm_b32 and zero v_pk_* anywhere in the tree through eleven bites, while
+# the arc's own scope list called the RGBX<->BGRX channel swap "an unhandled case, not just a slow one".
+# The swap is NOT the same capability as bite D1's HUBP crossbar — that one is a property of the whole
+# scanout and cannot swap a single composited client surface.
+# The packed blend asserts BIT-IDENTITY with the shipped f32 kernel (0 mismatches over all 8,421,376
+# premultiplied triples off-iron), so any deviation on hardware is a real fault rather than rounding.
+# Gated #ifdef SHADER_PERM; first iron burn: BURN_SHADER_PERM.
+#ifdef SHADER_PERM
+gpu_shader_perm_test();
+gpu_shader_blend_pk_test();
+#endif
+
 
 # GPU arc 1.55.x (Thrust P) P4: scanout-residue clear.
 # ⚠ SCANOUT_LINEAR (v3) is RETIRED — it wrote the WRONG register (0x607) under the OTG lock and BLACKED the
