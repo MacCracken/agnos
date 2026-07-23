@@ -859,6 +859,14 @@ fn gpu_readback_shm_sys(id, wh, srcxy) {
     var tgt = gpu_bb_a_mc;
     if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
     var src_mc = tgt + sy * gpu_bb_pitch + sx * 4;
+    # COHERENCE: the destination slot's CPU window is WC-mapped, and the CPU reads it via shm_read#73 AFTER
+    # this CP-DMA writes it. Empirically (iron 2026-07-23, gpucopy exit 51) a slot the CPU has ALREADY read
+    # returns a STALE cache-line ghost of its previous contents on the next read — the fresh GPU write never
+    # reaches the CPU. Same class as gpu.md C2g-1 ("dispatch into a fresh, never-CPU-touched slot"). Evict the
+    # stale/dirty lines BEFORE the DMA (not after: a flush after would write a dirty line back OVER the GPU's
+    # fresh data). ⚠ wbinvd is a WHOLE-cache flush — correct but far too heavy for a per-frame screen capture;
+    # the perf follow-up is a scoped per-line clflush over just [shm_kva[slot], +row*h). Correctness first.
+    wbinvd();
     if (gpu_cp_dma_blit(dst_mc, row, src_mc, gpu_bb_pitch, row, h) != 1) { return 0 - 1; }
     return 0;
 }

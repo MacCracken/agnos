@@ -1,94 +1,96 @@
-# gpucopy — agnos ring-3 proof of #90 gpu_readback_shm + #91 gpu_blit_bb. PROGRAMMATIC oracle only.
+# gpucopy — agnos ring-3 characterisation of #90 gpu_readback_shm. PROGRAMMATIC oracle only (no photo).
 #
-# #90 fails SILENTLY (a wrong address returns stale-but-plausible pixels, never an error), and graphical
-# oracles are painful — so this test reads its verdict OUT to userland instead of onto the screen. It draws a
-# known frame into the GPU back buffer, captures rectangles of it with #90, reads the captured pixels back
-# with #73 shm_read, and compares them to the exact values it drew. #91 (bb->bb copy) is then verified
-# THROUGH #90. The exit code is the whole answer: `run /bin/gpucopy` -> `run: exit 95` = all pass. No photo.
+# History:
+#   Burn 1 (2026-07-23): exit 84 — #90 Test A passed, #91 dest not-red. Ambiguous.
+#   Burn 2 (2026-07-23): exit 76 — the #91 red SOURCE at (300,100) didn't read back red, so #91 was never the
+#     problem; the source read wrong. Test A ((100,100), the slot's FIRST use) read green fine; B-src
+#     ((300,100), a slot RE-use) read not-red. #88 and #90 use the identical `tgt + y*pitch + x*4` address, so
+#     a write-then-read at the same coords is self-consistent — the one thing that changed is slot reuse.
+#     Prior art: gpu.md C2g-1 — reading a REUSED slot returns a stale ghost of its previous contents.
 #
-# Frame drawn into the render back buffer (NOT presented — the test reads the render target directly):
-#   #85 gpu_fill        blue  0x00000080  over the whole buffer
-#   #88 gpu_fill_rect   green 0x0000FF00  64x64 @ (100,100)   — the #90 content marker
-#   #88 gpu_fill_rect   red   0x00FF0000  64x64 @ (300,100)   — the #91 source marker
+# Burn 3 (this build) DECIDES it with three reads, no #91 (that is downstream of a trustworthy readback):
+#   read1: green source (100,100) into a FRESH slot1        — the proven baseline (should be green)
+#   read2: red   source (300,100) into the SAME slot1 (REUSE)— reproduces burn-2's reused read
+#   read3: red   source (300,100) into a FRESH slot2        — the control: is the source actually red?
+# read3 (fresh) is the trustworthy source-truth; read2 vs read3 tells the reuse story:
+#   read3 blue  -> #88 never drew red at (300,100)               (source bug, NOT the slot)
+#   read3 red + read2 green -> the REUSED slot returned read1's stale data -> #90 needs a coherence fix
+#   read3 red + read2 red   -> reuse is fine; burn-2's 76 is unexplained
 #
-# TEST A (#90): capture 128x128 @ (100,100). Its top-left 64x64 is the green square; the rest is blue
-#   background. Assert capture(10,10)=green, capture(64,0)=blue, capture(100,100)=blue — a uniform fill or a
-#   stale/zero buffer cannot pass this SPATIAL check, which is the point (a return-code-only check could not
-#   tell a correct readback from a silently-wrong one).
-# TEST B (#91): blit the red 64x64 from (300,100) DOWN to (300,300) (a non-overlapping downward move), then
-#   capture the destination with #90 and assert it is red — the two new syscalls verify each other.
-#
-# EXIT: 95 all pass.
-#   96 caps-call-failed · 100 no-GPU (QEMU — informational, not a failure) · 101 no-carveout ·
-#   102 bb-width < 512 · 103 bb-height < 512 · 104 no-free-slot · 105 double-buffer-not-armed ·
-#   90 gpu_fill failed · 98 gpu_fill_rect failed · 92 shm_create_gpu failed ·
-#   70 #90 returned nonzero · 71 shm_read returned nonzero · 72 green pixel not green · 73 background pixel not blue ·
-#   81 #91 returned nonzero · 82 verify-#90 returned nonzero · 83 verify-shm_read returned nonzero · 84 blit destination not red.
+# EXIT: 95 both fresh AND reused reads correct (all good).
+#   96 caps · 100 no-GPU (QEMU) · 101 no-carveout · 102 bb-w<512 · 103 bb-h<512 · 104 <2 free slots · 105 not-armed
+#   90 gpu_fill · 98 gpu_fill_rect · 92 shm_create(slot1) · 93 shm_create(slot2)
+#   50 read1(green,fresh) not green — #90 broke on the FIRST read (unexpected)
+#   60 read3(red,fresh) = BLUE  -> #88 did NOT draw red at (300,100)   61 read3 = neither red nor blue
+#   51 read2(red,REUSE) = GREEN -> SLOT-REUSE returns STALE (read1 data) -> #90 coherence gap on reused slots
+#   52 read2 = blue · 53 read2 = other   ·   70/71 read1 · 77/78 read2 · 80/81 read3  (#90/shm_read call failed)
 
-var cap_pix[8192];                 # module-global ⇒ N x u64 = 65536 B = 128*128*4 (the readback landing buffer)
+var cap_pix[8192];                 # module-global ⇒ N x u64 = 65536 B (readback landing buffer)
 
-fn gpucopy_hold(ms): i64 {
-    var t0 = sys_uptime_ms();
-    var t = t0;
-    var spins = 0;
-    while (t - t0 < ms) {
-        if (spins >= 4000000) { return 0; }
-        sys_sched_yield();
-        t = sys_uptime_ms();
-        spins = spins + 1;
-    }
-    return 0;
-}
-
-# Pixel (x,y) out of a w-wide packed capture already shm_read into cap_pix.
 fn cap_px(x, y, w): i64 {
     return load32(&cap_pix + (y * w + x) * 4) & 0xFFFFFFFF;
 }
 
+# Readback a w x h rect at (sx,sy) from slot `id` into cap_pix. 0 ok · -1 #90 rejected · -2 shm_read failed.
+fn cap_read(id, sx, sy, w, h): i64 {
+    if (syscall(90, id, (h * 65536) + w, (sy * 65536) + sx) != 0) { return 0 - 1; }
+    if (syscall(73, id, &cap_pix, w * h * 4) != 0) { return 0 - 2; }
+    return 0;
+}
+
 fn gpucopy_main(): i64 {
-    var caps[32];                                      # function-local ⇒ N BYTES = the 8x u32 caps struct
+    var caps[32];
     if (syscall(89, &caps, 32) != 0) { return 96; }
     var flags     = load32(&caps + 0)  & 0xFFFFFFFF;
     var bbw       = load32(&caps + 8)  & 0xFFFFFFFF;
     var bbh       = load32(&caps + 12) & 0xFFFFFFFF;
     var freeslots = load32(&caps + 20) & 0xFFFFFFFF;
-    if ((flags & 1) == 0) { return 100; }              # no GPU present (QEMU) — informational
-    if ((flags & 4) == 0) { return 101; }              # no carveout ⇒ #86/#90 cannot serve
-    if (bbw < 512) { return 102; }                     # need room for the test rects (max reach 364)
+    if ((flags & 1) == 0) { return 100; }
+    if ((flags & 4) == 0) { return 101; }
+    if (bbw < 512) { return 102; }
     if (bbh < 512) { return 103; }
-    if (freeslots < 1) { return 104; }                 # no free shm slot
-    if ((flags & 2) == 0) { return 105; }              # double-buffer not armed ⇒ #88/#90/#91 reject
+    if (freeslots < 2) { return 104; }                 # this burn holds TWO slots at once (reuse vs fresh)
+    if ((flags & 2) == 0) { return 105; }
 
-    # --- Draw a known frame into the render back buffer (never presented; the test reads the target directly).
+    # Known frame in the render back buffer (never presented; the test reads the render target directly).
     if (sys_gpu_fill(0x00000080) != 0) { return 90; }                                            # blue background
-    if (syscall(88, 0x0000FF00, (64 * 65536) + 64, (100 * 65536) + 100) != 0) { return 98; }     # green 64x64 @ (100,100)
-    if (syscall(88, 0x00FF0000, (64 * 65536) + 64, (100 * 65536) + 300) != 0) { return 98; }     # red   64x64 @ (300,100)
+    if (syscall(88, 0x0000FF00, (64 * 65536) + 64, (100 * 65536) + 100) != 0) { return 98; }     # green @ (100,100)
+    if (syscall(88, 0x00FF0000, (64 * 65536) + 64, (100 * 65536) + 300) != 0) { return 98; }     # red   @ (300,100)
 
-    # A GPU-visible capture slot, sized for the largest capture (128x128).
-    var cap_bytes = 128 * 128 * 4;
-    var id = syscall(86, cap_bytes);
-    if (id < 1) { return 92; }
+    var slot1 = syscall(86, 64 * 64 * 4);
+    if (slot1 < 1) { return 92; }
 
-    # --- TEST A: #90 readback. Capture 128x128 @ (100,100): top-left 64x64 = green, remainder = blue.
-    if (syscall(90, id, (128 * 65536) + 128, (100 * 65536) + 100) != 0) { syscall(74, id); return 70; }
-    if (syscall(73, id, &cap_pix, cap_bytes) != 0)                       { syscall(74, id); return 71; }
-    if (cap_px(10, 10, 128)   != 0x0000FF00) { syscall(74, id); return 72; }   # inside the green square
-    if (cap_px(64, 0, 128)    != 0x00000080) { syscall(74, id); return 73; }   # one px past green ⇒ blue (spatial)
-    if (cap_px(100, 100, 128) != 0x00000080) { syscall(74, id); return 73; }   # deep background ⇒ blue
+    # read1 — GREEN source (100,100) into the FRESH slot1 (baseline).
+    var e1 = cap_read(slot1, 100, 100, 64, 64);
+    if (e1 == 0 - 1) { syscall(74, slot1); return 70; }
+    if (e1 == 0 - 2) { syscall(74, slot1); return 71; }
+    if (cap_px(10, 10, 64) != 0x0000FF00) { syscall(74, slot1); return 50; }   # first read must be green
 
-    # --- TEST B: #91 blit_bb. Copy the red 64x64 from (300,100) down to (300,300), then VERIFY via #90.
-    if (syscall(91, (100 * 65536) + 300, (64 * 65536) + 64, (300 * 65536) + 300) != 0) { syscall(74, id); return 81; }
-    if (syscall(90, id, (64 * 65536) + 64, (300 * 65536) + 300) != 0) { syscall(74, id); return 82; }
-    if (syscall(73, id, &cap_pix, 64 * 64 * 4) != 0)                  { syscall(74, id); return 83; }
-    if (cap_px(10, 10, 64) != 0x00FF0000) { syscall(74, id); return 84; }      # blit destination is red
-    if (cap_px(50, 50, 64) != 0x00FF0000) { syscall(74, id); return 84; }
+    # read2 — RED source (300,100) into the SAME slot1 (REUSE — reproduces burn 2).
+    var e2 = cap_read(slot1, 300, 100, 64, 64);
+    if (e2 == 0 - 1) { syscall(74, slot1); return 77; }
+    if (e2 == 0 - 2) { syscall(74, slot1); return 78; }
+    var r = cap_px(10, 10, 64);
 
-    # Optional secondary visual — show the frame (blue bg, green square, red squares at two spots). The exit
-    # code above is the real verdict; this just gives a glance-check if someone is watching the panel.
-    sys_gpu_present();
-    gpucopy_hold(1500);
-    syscall(74, id);
-    return 95;
+    # read3 — RED source (300,100) into a FRESH slot2 (control: is the source actually red?).
+    var slot2 = syscall(86, 64 * 64 * 4);
+    if (slot2 < 1) { syscall(74, slot1); return 93; }
+    var e3 = cap_read(slot2, 300, 100, 64, 64);
+    if (e3 == 0 - 1) { syscall(74, slot1); syscall(74, slot2); return 80; }
+    if (e3 == 0 - 2) { syscall(74, slot1); syscall(74, slot2); return 81; }
+    var rf = cap_px(10, 10, 64);
+
+    syscall(74, slot1);
+    syscall(74, slot2);
+
+    # Decode. rf (fresh) is the source-truth; r (reuse) vs rf tells the reuse story.
+    if (rf == 0x00000080) { return 60; }    # fresh read of source = BLUE ⇒ #88 didn't draw red at (300,100)
+    if (rf != 0x00FF0000) { return 61; }    # fresh read = neither red nor blue ⇒ weird
+    # rf == RED: source IS red and a fresh slot reads it. So only the reused read is in question.
+    if (r == 0x00FF0000) { return 95; }     # reused read also red ⇒ reuse fine, everything works
+    if (r == 0x0000FF00) { return 51; }     # reused read = GREEN (read1's data) ⇒ SLOT-REUSE STALE
+    if (r == 0x00000080) { return 52; }     # reused read = blue ⇒ weird
+    return 53;                               # reused read = other value
 }
 
 fn _entry(): i64 { var r = gpucopy_main(); syscall(SYS_EXIT, r); return 0; }
