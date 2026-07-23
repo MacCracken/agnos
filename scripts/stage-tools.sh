@@ -110,15 +110,19 @@ stage_one agnos/audio-test tonegen.cyr tonegen || rc=1
 #   gpublit  — #86/#87/#88/#89: a whole compositor frame, zero per-pixel CPU work
 #   gpublend — #92 op 0x01, per-pixel alpha src-over through the SHADER cores
 #   gpucov   — #92 op 0x02, 8bpp coverage mask (the anti-aliased edge CP-DMA cannot draw)
+#   gpucopy  — #90 gpu_readback_shm + #91 gpu_blit_bb, verified by reading captured pixels BACK
+#              to userland (#73) and comparing — a fully PROGRAMMATIC oracle (#90 fails silently)
 #
 # Each is SELF-VALIDATING and the result IS the exit code, read as `run: exit N` — 95 = all
 # pass. gpublend/gpucov decode #92's packed failure as 110 + reason (111 no-GPU .. 123
-# envelope-unproven), so a failed burn names WHY without needing a photo. Real AMD iron only;
-# on a non-GPU boot they exit early rather than faulting.
+# envelope-unproven), so a failed burn names WHY without needing a photo. gpucopy names its
+# failure directly (70-73 readback, 81-84 blit_bb). Real AMD iron only; on a non-GPU boot they
+# exit early rather than faulting (gpucopy: exit 100 = no GPU, informational).
 stage_one agnos/gpu-test gpufill.cyr  gpufill  || rc=1
 stage_one agnos/gpu-test gpublit.cyr  gpublit  || rc=1
 stage_one agnos/gpu-test gpublend.cyr gpublend || rc=1
 stage_one agnos/gpu-test gpucov.cyr   gpucov   || rc=1
+stage_one agnos/gpu-test gpucopy.cyr  gpucopy  || rc=1
 
 # kriya dispatches on basename(argv[0]), so each delegated verb needs a
 # /bin/<verb> NAME resolving to the kriya binary. Create them as RELATIVE

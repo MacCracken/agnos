@@ -826,6 +826,92 @@ fn gpu_fill_rect_sys(color, wh, dstxy) {
     return 0;
 }
 
+# gpu_readback_shm_sys(id, wh, srcxy) -> 0 / -1. The INVERSE of gpu_blit_shm#87: GPU-copy a rectangle OUT of
+# the current blit back buffer at (sx,sy) INTO the client's carveout shm slot `id`, via gpu_cp_dma_blit (one
+# CP-DMA per row, src stride = the framebuffer pitch, dst stride = w*4 packed). This is the screen-capture /
+# read-pixels primitive; without it a compositor reading its own shm sees STALE content because the composited
+# result lives in the kernel's GPU back buffer, never in the client page. The captured pixels are the frame
+# the compositor just built (the render target #87/#88/#92 write), before #84 flips it. Pack: wh = (h<<16)|w,
+# srcxy = (sy<<16)|sx. Ring 3 passes an id + geometry only; no MC address crosses the boundary. Returns -1 if
+# the slot is PMM-backed (the GPU cannot WRITE it — use #86 to allocate), the capture won't fit the slot, the
+# rect is off-screen, or the GPU/display isn't usable.
+fn gpu_readback_shm_sys(id, wh, srcxy) {
+    if (gpu_present == 0) { return 0 - 1; }
+    if (shm_slot_valid(id) == 0) { return 0 - 1; }
+    var slot = id - 1;
+    var dst_mc = load64(&shm_mc + slot * 8);
+    if (dst_mc == 0) { return 0 - 1; }                  # PMM-backed ⇒ the GPU cannot write it
+    if (gpu_blit_arm() != 1) { return 0 - 1; }
+    if (gpu_bb_pitch == 0) { return 0 - 1; }
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    var sx = srcxy & 0xFFFF;
+    var sy = (srcxy >> 16) & 0xFFFF;
+    if (w < 1) { return 0 - 1; }
+    if (h < 1) { return 0 - 1; }
+    var row = w * 4;                                    # 32bpp packed destination rows
+    if (row * h > load64(&shm_size + slot * 8)) { return 0 - 1; }   # capture must fit the slot
+    # Reject (don't silently clip) anything off-screen — the compositor owns clipping.
+    var fbw = gpu_bb_pitch / 4;
+    var fbh = gpu_bb_fbsize / gpu_bb_pitch;
+    if (sx + w > fbw) { return 0 - 1; }
+    if (sy + h > fbh) { return 0 - 1; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var src_mc = tgt + sy * gpu_bb_pitch + sx * 4;
+    if (gpu_cp_dma_blit(dst_mc, row, src_mc, gpu_bb_pitch, row, h) != 1) { return 0 - 1; }
+    return 0;
+}
+
+# gpu_blit_bb_sys(srcxy, wh, dstxy) -> 0 / -1. A rect COPY within the blit back buffer, from (sx,sy) to
+# (dx,dy): the move-a-window / scroll-a-region primitive, entirely on the GPU (gpu_cp_dma_blit, framebuffer
+# pitch on both sides). Pack: wh = (h<<16)|w, srcxy = (sy<<16)|sx, dstxy = (dy<<16)|dx. Rejects (does not clip)
+# either rect off-screen; the compositor owns clipping. OVERLAP: the copy is one CP-DMA per row, so a DOWNWARD
+# move (dy > sy) into overlapping rows must run BOTTOM-UP or it would read a row after the row above it was
+# overwritten (memmove semantics) — handled below. An upward or non-overlapping move is safe top-down.
+# Intra-row horizontal overlap on the SAME source row is still undefined (one DMA reads-then-writes the whole
+# row); a caller must not self-overlap a single row.
+fn gpu_blit_bb_sys(srcxy, wh, dstxy) {
+    if (gpu_present == 0) { return 0 - 1; }
+    if (gpu_blit_arm() != 1) { return 0 - 1; }
+    if (gpu_bb_pitch == 0) { return 0 - 1; }
+    var w  = wh & 0xFFFF;
+    var h  = (wh >> 16) & 0xFFFF;
+    var sx = srcxy & 0xFFFF;
+    var sy = (srcxy >> 16) & 0xFFFF;
+    var dx = dstxy & 0xFFFF;
+    var dy = (dstxy >> 16) & 0xFFFF;
+    if (w < 1) { return 0 - 1; }
+    if (h < 1) { return 0 - 1; }
+    var fbw = gpu_bb_pitch / 4;
+    var fbh = gpu_bb_fbsize / gpu_bb_pitch;
+    if (sx + w > fbw) { return 0 - 1; }
+    if (sy + h > fbh) { return 0 - 1; }
+    if (dx + w > fbw) { return 0 - 1; }
+    if (dy + h > fbh) { return 0 - 1; }
+    var tgt = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { tgt = gpu_bb_b_mc; }
+    var row = w * 4;
+    # Downward overlapping move ⇒ copy rows bottom-up so each source row is read before the destination row
+    # one place above it (which shares its pixels) is overwritten. Upward/non-overlapping is safe top-down.
+    if (dy > sy) {
+        var i = h;
+        var s = 0;
+        var d = 0;
+        while (i > 0) {
+            i = i - 1;
+            s = tgt + (sy + i) * gpu_bb_pitch + sx * 4;
+            d = tgt + (dy + i) * gpu_bb_pitch + dx * 4;
+            if (gpu_cp_dma(d, s, row) != 1) { return 0 - 1; }
+        }
+        return 0;
+    }
+    var src_mc = tgt + sy * gpu_bb_pitch + sx * 4;
+    var dst_mc = tgt + dy * gpu_bb_pitch + dx * 4;
+    if (gpu_cp_dma_blit(dst_mc, gpu_bb_pitch, src_mc, gpu_bb_pitch, row, h) != 1) { return 0 - 1; }
+    return 0;
+}
+
 # ── #92 gpu_shader_op — THE shader-compositing seam (plan bite S8, decision D-3) ───────────────────────
 #
 # ONE syscall number. An ARRAY of fixed-size op records. The operation is an op code INSIDE each record,
@@ -2517,6 +2603,27 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var cq = gpu_caps_sys(arg1, arg2);
         stack_canary_check(canary);
         return cq;
+    }
+    if (num == 90) {
+        # gpu_readback_shm(id, wh, srcxy) — the INVERSE of #87: GPU-copy a rect OUT of the blit back buffer
+        # into the client's carveout shm slot. The screen-capture / read-pixels primitive; without it a
+        # compositor reading its own shm sees STALE pixels (the composited frame lives in the kernel's GPU
+        # back buffer, not the client page). wh=(h<<16)|w, srcxy=(sy<<16)|sx. Rejects off-screen / a
+        # too-small or PMM-backed slot. ⚠ LINUX COLLISION: #90 = chmod(path,mode) — a metadata WRITE; the
+        # file-level #ifdef CYRIUS_TARGET_AGNOS gate in cyrius/lib/syscalls.cyr is the barrier off-agnos.
+        var rb = gpu_readback_shm_sys(arg1, arg2, arg3);
+        stack_canary_check(canary);
+        return rb;
+    }
+    if (num == 91) {
+        # gpu_blit_bb(srcxy, wh, dstxy) — GPU rect COPY within the blit back buffer (move a window / scroll a
+        # region), one CP-DMA per row, overlap-safe (downward moves copy bottom-up). srcxy=(sy<<16)|sx,
+        # wh=(h<<16)|w, dstxy=(dy<<16)|dx. Rejects either rect off-screen — the compositor owns clipping.
+        # ⚠ LINUX COLLISION: #91 = fchmod(fd,mode); srcxy=(0,0) packs to fd 0 = stdin and would SUCCEED
+        # off-agnos, so the file-level #ifdef CYRIUS_TARGET_AGNOS gate in cyrius/lib/syscalls.cyr is load-bearing.
+        var bb = gpu_blit_bb_sys(arg1, arg2, arg3);
+        stack_canary_check(canary);
+        return bb;
     }
     if (num == 92) {
         # gpu_shader_op(desc_uva, len) — THE shader-compositing seam. ONE number, an ARRAY of 64-byte op

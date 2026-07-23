@@ -1,0 +1,95 @@
+# gpucopy — agnos ring-3 proof of #90 gpu_readback_shm + #91 gpu_blit_bb. PROGRAMMATIC oracle only.
+#
+# #90 fails SILENTLY (a wrong address returns stale-but-plausible pixels, never an error), and graphical
+# oracles are painful — so this test reads its verdict OUT to userland instead of onto the screen. It draws a
+# known frame into the GPU back buffer, captures rectangles of it with #90, reads the captured pixels back
+# with #73 shm_read, and compares them to the exact values it drew. #91 (bb->bb copy) is then verified
+# THROUGH #90. The exit code is the whole answer: `run /bin/gpucopy` -> `run: exit 95` = all pass. No photo.
+#
+# Frame drawn into the render back buffer (NOT presented — the test reads the render target directly):
+#   #85 gpu_fill        blue  0x00000080  over the whole buffer
+#   #88 gpu_fill_rect   green 0x0000FF00  64x64 @ (100,100)   — the #90 content marker
+#   #88 gpu_fill_rect   red   0x00FF0000  64x64 @ (300,100)   — the #91 source marker
+#
+# TEST A (#90): capture 128x128 @ (100,100). Its top-left 64x64 is the green square; the rest is blue
+#   background. Assert capture(10,10)=green, capture(64,0)=blue, capture(100,100)=blue — a uniform fill or a
+#   stale/zero buffer cannot pass this SPATIAL check, which is the point (a return-code-only check could not
+#   tell a correct readback from a silently-wrong one).
+# TEST B (#91): blit the red 64x64 from (300,100) DOWN to (300,300) (a non-overlapping downward move), then
+#   capture the destination with #90 and assert it is red — the two new syscalls verify each other.
+#
+# EXIT: 95 all pass.
+#   96 caps-call-failed · 100 no-GPU (QEMU — informational, not a failure) · 101 no-carveout ·
+#   102 bb-width < 512 · 103 bb-height < 512 · 104 no-free-slot · 105 double-buffer-not-armed ·
+#   90 gpu_fill failed · 98 gpu_fill_rect failed · 92 shm_create_gpu failed ·
+#   70 #90 returned nonzero · 71 shm_read returned nonzero · 72 green pixel not green · 73 background pixel not blue ·
+#   81 #91 returned nonzero · 82 verify-#90 returned nonzero · 83 verify-shm_read returned nonzero · 84 blit destination not red.
+
+var cap_pix[8192];                 # module-global ⇒ N x u64 = 65536 B = 128*128*4 (the readback landing buffer)
+
+fn gpucopy_hold(ms): i64 {
+    var t0 = sys_uptime_ms();
+    var t = t0;
+    var spins = 0;
+    while (t - t0 < ms) {
+        if (spins >= 4000000) { return 0; }
+        sys_sched_yield();
+        t = sys_uptime_ms();
+        spins = spins + 1;
+    }
+    return 0;
+}
+
+# Pixel (x,y) out of a w-wide packed capture already shm_read into cap_pix.
+fn cap_px(x, y, w): i64 {
+    return load32(&cap_pix + (y * w + x) * 4) & 0xFFFFFFFF;
+}
+
+fn gpucopy_main(): i64 {
+    var caps[32];                                      # function-local ⇒ N BYTES = the 8x u32 caps struct
+    if (syscall(89, &caps, 32) != 0) { return 96; }
+    var flags     = load32(&caps + 0)  & 0xFFFFFFFF;
+    var bbw       = load32(&caps + 8)  & 0xFFFFFFFF;
+    var bbh       = load32(&caps + 12) & 0xFFFFFFFF;
+    var freeslots = load32(&caps + 20) & 0xFFFFFFFF;
+    if ((flags & 1) == 0) { return 100; }              # no GPU present (QEMU) — informational
+    if ((flags & 4) == 0) { return 101; }              # no carveout ⇒ #86/#90 cannot serve
+    if (bbw < 512) { return 102; }                     # need room for the test rects (max reach 364)
+    if (bbh < 512) { return 103; }
+    if (freeslots < 1) { return 104; }                 # no free shm slot
+    if ((flags & 2) == 0) { return 105; }              # double-buffer not armed ⇒ #88/#90/#91 reject
+
+    # --- Draw a known frame into the render back buffer (never presented; the test reads the target directly).
+    if (sys_gpu_fill(0x00000080) != 0) { return 90; }                                            # blue background
+    if (syscall(88, 0x0000FF00, (64 * 65536) + 64, (100 * 65536) + 100) != 0) { return 98; }     # green 64x64 @ (100,100)
+    if (syscall(88, 0x00FF0000, (64 * 65536) + 64, (100 * 65536) + 300) != 0) { return 98; }     # red   64x64 @ (300,100)
+
+    # A GPU-visible capture slot, sized for the largest capture (128x128).
+    var cap_bytes = 128 * 128 * 4;
+    var id = syscall(86, cap_bytes);
+    if (id < 1) { return 92; }
+
+    # --- TEST A: #90 readback. Capture 128x128 @ (100,100): top-left 64x64 = green, remainder = blue.
+    if (syscall(90, id, (128 * 65536) + 128, (100 * 65536) + 100) != 0) { syscall(74, id); return 70; }
+    if (syscall(73, id, &cap_pix, cap_bytes) != 0)                       { syscall(74, id); return 71; }
+    if (cap_px(10, 10, 128)   != 0x0000FF00) { syscall(74, id); return 72; }   # inside the green square
+    if (cap_px(64, 0, 128)    != 0x00000080) { syscall(74, id); return 73; }   # one px past green ⇒ blue (spatial)
+    if (cap_px(100, 100, 128) != 0x00000080) { syscall(74, id); return 73; }   # deep background ⇒ blue
+
+    # --- TEST B: #91 blit_bb. Copy the red 64x64 from (300,100) down to (300,300), then VERIFY via #90.
+    if (syscall(91, (100 * 65536) + 300, (64 * 65536) + 64, (300 * 65536) + 300) != 0) { syscall(74, id); return 81; }
+    if (syscall(90, id, (64 * 65536) + 64, (300 * 65536) + 300) != 0) { syscall(74, id); return 82; }
+    if (syscall(73, id, &cap_pix, 64 * 64 * 4) != 0)                  { syscall(74, id); return 83; }
+    if (cap_px(10, 10, 64) != 0x00FF0000) { syscall(74, id); return 84; }      # blit destination is red
+    if (cap_px(50, 50, 64) != 0x00FF0000) { syscall(74, id); return 84; }
+
+    # Optional secondary visual — show the frame (blue bg, green square, red squares at two spots). The exit
+    # code above is the real verdict; this just gives a glance-check if someone is watching the panel.
+    sys_gpu_present();
+    gpucopy_hold(1500);
+    syscall(74, id);
+    return 95;
+}
+
+fn _entry(): i64 { var r = gpucopy_main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
