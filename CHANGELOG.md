@@ -34,6 +34,15 @@ resume check re-confirms across the 120 ms settle (kills a false NORESUME on a s
 **D3** the two clock-controls are written back from their saved values (pure same-mode) instead of forced to
 a literal `0x3`, **D4** the off-rate gate tightened to 30 mHz.
 
+**★★ BURNED 2026-07-24 (archaemenid, exit 95) — agnos disabled + re-enabled the live pipe.** `OTG_MASTER_EN`=0
+reset + stopped the frame counter (`2615 → 0, stopped 1`); `OTG_MASTER_EN`=1 resumed it (`→ 115`), refresh
+restored to `59951 = predicted 59951` to the milliHz; the panel blanked then relit (eye-confirmed). **The D3
+fix saved the burn:** the GOP pipe carries `OTG_CLOCK_CONTROL = 0x10101` and `OPTC_INPUT_CLOCK_CONTROL = 0x6`,
+NOT the card's `0x3` — forcing `0x3` (the original code) would likely have left the panel dark on re-enable;
+write-back relit it. **Plan correction:** the M6 card's "…= 0x3" is wrong for the GOP-inherited pipe (it's
+`0x10101` / `0x6`); the GOP-vs-amdgpu clock-control delta is now a known M8 consideration. The review's catch
+is vindicated on iron a third time (D1 on M4/M5, D3 here).
+
 Also **fixed** — the 1.56.12 cut bumped `VERSION` but had missed `kernel/version.cyr` (the banner + version
 gvar) and `agnos.cyr`'s header; the arc sweep's "version in kernel" gate caught it. All now read 1.56.12.
 

@@ -1257,7 +1257,7 @@ var GPU_R_OTG_TRIGA_MANUAL_TRIG        = 0x1B3A; # BASE_IDX 2, abs 0x4FFA. amdgp
 
 # --- OTG control + the M6 envelope's timing-parameter group ---
 var GPU_R_OTG_STATIC_SCREEN_CONTROL    = 0x1B82; # BASE_IDX 2, abs 0x5042. amdgpu last 0x00020000
-var GPU_R_OTG_CLOCK_CONTROL            = 0x1B86; # BASE_IDX 2, abs 0x5046. amdgpu last 0x00000003 — M6 sets this
+var GPU_R_OTG_CLOCK_CONTROL            = 0x1B86; # BASE_IDX 2, abs 0x5046. ⚠ amdgpu programs 0x3 but the GOP pipe reads 0x10101 (iron M6 2026-07-24) — M6 WRITES BACK the GOP value (same-mode), never forces 0x3; the delta is an M8 (amdgpu transmitter) consideration
 var GPU_R_OTG_VSTARTUP_PARAM           = 0x1B87; # BASE_IDX 2, abs 0x5047. amdgpu last 0x00000011 — M6 envelope
 var GPU_R_OTG_VUPDATE_PARAM            = 0x1B88; # BASE_IDX 2, abs 0x5048. amdgpu last 0x012F02A8 — M6 envelope
 var GPU_R_OTG_VREADY_PARAM             = 0x1B89; # BASE_IDX 2, abs 0x5049. amdgpu last 0x0000018B — M6 envelope
@@ -1265,7 +1265,7 @@ var GPU_R_OTG_VREADY_PARAM             = 0x1B89; # BASE_IDX 2, abs 0x5049. amdgp
 # --- OPTC (the timing generator's input side) ---
 var GPU_R_OPTC_DATA_SOURCE_SELECT      = 0x1ACB; # BASE_IDX 2, abs 0x4F8B. amdgpu last 0x0000F000
 var GPU_R_OPTC_DATA_FORMAT_CONTROL     = 0x1ACC; # BASE_IDX 2, abs 0x4F8C. amdgpu last 0x00000000
-var GPU_R_OPTC_INPUT_CLOCK_CONTROL     = 0x1ACF; # BASE_IDX 2, abs 0x4F8F. amdgpu last 0x00000003 — M6 sets 0x3
+var GPU_R_OPTC_INPUT_CLOCK_CONTROL     = 0x1ACF; # BASE_IDX 2, abs 0x4F8F. ⚠ amdgpu programs 0x3 but the GOP pipe reads 0x6 (iron M6 2026-07-24) — M6 WRITES BACK the GOP value (same-mode), never forces 0x3; GOP-vs-amdgpu delta is an M8 consideration
 var GPU_R_OPTC_MEMORY_CONFIG           = 0x1AD0; # BASE_IDX 2, abs 0x4F90. amdgpu last 0x00000000
 
 # --- FMT / OPP / DPG (the output formatter) ---
