@@ -550,21 +550,29 @@ echo ""
 # `run /bin/<tool>` therefore needs `--update-all`, or the operator flashes a new kernel against a STALE
 # tool — and a stale /bin/modeset simply falls through to its default arg and exits 96, which is
 # indistinguishable from "no GPU". That is a wasted flash on a rig whose burns block the operator's work.
-case "$BUILD_TAG" in
-    *HDMI_ATOM*|*SHADER*|*MODESET*)
-        if [ ! -x "$ROOT/build/rootfs/bin/modeset" ]; then
-            echo "  ⚠ /bin/modeset is NOT staged — run first:  sh scripts/stage-tools.sh --build"
-        fi
-        echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update-all"
-        echo "    (--update-all — this burn is driven by a RING-3 TOOL on the agnos-fs, so an"
-        echo "     ESP-only --update would ship the new kernel against a STALE /bin/modeset)"
-        ;;
-    *)
-        echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update"
-        echo "    (--update is ESP-only — the agnos-fs partition survives, per"
-        echo "     feedback_prefer_mount_modify_over_reflash)"
-        ;;
-esac
+# ⚠ THE DEFAULT IS `--update-all`, DELIBERATELY, BECAUSE THE ERROR COSTS ARE ASYMMETRIC.
+# `--update` is ESP-only (kernel + gnoboot) and never touches the agnos-fs where /bin/* lives. Most burns
+# in this tree are now driven by a RING-3 TOOL (`run /bin/modeset ...`), and flashing `--update` for one of
+# those ships a new kernel against a STALE tool — which fails SILENTLY: an old /bin/modeset just falls
+# through to its default arg and exits 96, indistinguishable from "no GPU". That is a wasted flash on a rig
+# whose burns block the operator's work.
+# Flashing `--update-all` when `--update` would have done costs nothing but a few seconds of copying.
+# A first cut of this gated on BUILD_TAG, which missed exactly the case that surfaced it: a BARE production
+# kernel whose oracle is still `run /bin/modeset --dump`. The tag cannot tell you what drives the burn, so
+# do not ask it — recommend the safe one and let the tracker say when ESP-only is enough.
+if [ -x "$ROOT/build/rootfs/bin/modeset" ] || [ -d "$ROOT/build/rootfs/bin" ]; then
+    echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update-all"
+    echo "    (--update-all refreshes the ESP *and* the agnos-fs. Use it whenever the burn's oracle is"
+    echo "     'run /bin/<tool>' — an ESP-only --update would pair a new kernel with a STALE tool, which"
+    echo "     fails silently. For a kernel-only burn, --update is enough and leaves agnos-fs untouched.)"
+    if [ ! -x "$ROOT/build/rootfs/bin/modeset" ]; then
+        echo "  ⚠ /bin/modeset is NOT staged — if this burn uses it, run:  sh scripts/stage-tools.sh --build"
+    fi
+else
+    echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update"
+    echo "    (--update is ESP-only — the agnos-fs partition survives, per"
+    echo "     feedback_prefer_mount_modify_over_reflash; no staged tools present)"
+fi
 echo ""
 echo "  The live burn rubric (hypothesis + falsification + watch-steps) lives in the"
 echo "  OPEN cycle's tracker — read it before flashing, NOT a hardcoded list here (it"

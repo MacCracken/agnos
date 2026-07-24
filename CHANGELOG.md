@@ -42,6 +42,21 @@ bias it needed to test. `m1-decode.py` reports the derivation per instance and p
 `phyid UNDETERMINED … ⛔ Do NOT run ATOM #76 on a guess` when the data is missing (verified: on the existing
 M8d capture it correctly rejects instance 0 and declines to name one).
 
+### Fixed — M8's BE↔FE bracket was inverted around the PHY block (review S5), and the verdict read a stale routing (S2)
+
+The reconnect used to sit **before** ATOM #76. Both amdgpu capture instances hold the front end **detached
+across the entire PHY block** and connect only afterwards — so agnos was reattaching the pipe through exactly
+the window the bracket exists to protect, while the transmitter was being power-cycled. The order is now
+`disconnect → #4 → stream attributes + infoframes → #76 (still detached) → connect → BE↔FE pulse → replay`,
+matching the capture; the op's own sequence docstring is corrected in lockstep so it cannot drift back.
+
+**S2, which the reordering exposes rather than hides:** the verdict gated on `be_rb`, sampled immediately
+after the connect. With the pulse and replay now following it, that readback describes a state two write
+phases old — in the `#76`-live build it could report "reconnected" about routing that had since changed. The
+gate moves to `be1` (read after everything); `be_rb` remains only as the immediate did-the-write-land probe.
+
+Neither changes M8d's behaviour (its `#76` and replay are compiled out), so the burned result stands.
+
 ## [1.56.13] - 2026-07-24
 
 **MODESET work list B — the TRANSMITTER + audio (OPEN cycle).** Bumped on cycle open; the user tags/releases

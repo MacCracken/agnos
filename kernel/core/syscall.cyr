@@ -1879,13 +1879,15 @@ fn mdo_recommit() {
 # unchanged refresh — NEVER audio. Audio is M9's test (audio-enable sequenced LAST, after a genuine
 # transmitter edge), and it only becomes meaningful once this exists.
 #
-# The sequence the amdgpu capture dictates:
-#   BE<->FE DISCONNECT (DIG_BE_CNTL FE_SOURCE_SELECT -> 0)   [the encoder must not be re-pointed while fed]
+# The sequence the amdgpu capture dictates (ordering corrected 1.56.14, review S5 — the connect used to
+# sit BEFORE #76, which left the pipe attached through exactly the window the bracket exists to protect):
+#   BE<->FE DISCONNECT (DIG_BE_CNTL FE_SOURCE_SELECT -> 0)   [nothing feeds the encoder while it is set up]
 #   -> ATOM #4  DIGxEncoderControl   (display-safe: DIG front end, regs 0x56xx, disjoint from the PHY)
 #   -> HDMI stream attributes + infoframes
-#   -> BE<->FE CONNECT (-> 0x02)
 #   -> ATOM #76 DIG1TransmitterControl(ENABLE)  [DESTRUCTIVE: power-cycles the PHY; build-gated]
-#   -> REPLAY the stream-attribute + infoframe block verbatim  [#76 resets the encoder's latched state]
+#      ⛔ still DETACHED — the capture holds the FE off across the ENTIRE PHY block
+#   -> BE<->FE CONNECT (-> 0x02)
+#   -> BE<->FE PULSE (disconnect/connect) then REPLAY the stream-attribute + infoframe block verbatim
 #   -> OTG re-commit (M6's envelope close)
 #
 # ⛔ THREE BUILD FLAGS GOVERN WHAT ACTUALLY EXECUTES, and that is the safety model:
@@ -1997,6 +1999,21 @@ fn mdo_transmit_run() {
     gpu_hdmi_program_infoframes(d, gpu_audio_dig);
     kprintln("modeset: transmit -- stream attributes + infoframes programmed", 62);
 
+    # ── ATOM #76 DIG1TransmitterControl(ENABLE) — THE PHY EDGE, run with the FE STILL DETACHED ─────────
+    # ⛔ ORDERING IS LOAD-BEARING (review S5, corrected 1.56.14). This used to reconnect BE<->FE *before*
+    # #76. Both amdgpu capture instances hold the front end DETACHED across the ENTIRE PHY block and connect
+    # only afterwards — which is the whole point of bracketing: the encoder must not be fed while its
+    # transmitter is being power-cycled. Reconnecting first left the pipe attached through exactly the
+    # window the bracket exists to protect.
+    #ifdef ATOM_RUN_TRANSMITTER
+    kprintln("modeset: transmit -- ATOM #76 DIG1TransmitterControl ENABLE (LIVE PHY EDGE)", 75);
+    var r76 = atom_run_transmitter_enable_hdmi();
+    kprint("modeset: transmit -- transmitter rc ", 36); kprint_num(r76); kprintln("", 0);
+    #else
+    var r76 = 0;
+    kprintln("modeset: transmit -- ATOM #76 SKIPPED (PHY untouched; build without ATOM_RUN_TRANSMITTER)", 89);
+    #endif
+
     # ── BE<->FE CONNECT: re-point the back end at the front end (verified value 0x0200 in [15:8]) ────
     # ⛔ DIG_MODE IS DELIBERATELY *NOT* TOUCHED HERE — read this before "fixing" it.
     #
@@ -2021,11 +2038,15 @@ fn mdo_transmit_run() {
     gpu_mfence();
     var be_rb = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
 
-    # ── ATOM #76 DIG1TransmitterControl(ENABLE) — THE PHY EDGE. Build-gated; see the flag table above. ──
+    # ── The BE<->FE PULSE, then THE REPLAY — both AFTER the connect, per the capture ────────────────
     #ifdef ATOM_RUN_TRANSMITTER
-    kprintln("modeset: transmit -- ATOM #76 DIG1TransmitterControl ENABLE (LIVE PHY EDGE)", 75);
-    var r76 = atom_run_transmitter_enable_hdmi();
-    kprint("modeset: transmit -- transmitter rc ", 36); kprint_num(r76); kprintln("", 0);
+    # The capture emits a disconnect/connect PULSE on the reconnected link before re-sending the stream
+    # attributes: the encoder is re-latched once more so the replayed packets land on a freshly-routed
+    # front end rather than on whatever state the PHY power-cycle left behind.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, be_conn & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK));
+    gpu_mfence();
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, be_conn);
+    gpu_mfence();
     # THE REPLAY (M8c). amdgpu's modeset re-emits the whole stream-attribute + infoframe block AFTER the
     # transmitter edge, and agnos has structurally never been able to — the writes were welded inside a
     # 497-line audio-enable path. ⚠ HONEST: it is NOT established that #76 clears these registers (#76's own
@@ -2034,10 +2055,7 @@ fn mdo_transmit_run() {
     # REQUIRED is what this burn measures; do not let this comment harden into a claim.
     gpu_hdmi_stage_attributes(d);
     gpu_hdmi_program_infoframes(d, gpu_audio_dig);
-    kprintln("modeset: transmit -- post-#76 replay complete", 45);
-    #else
-    var r76 = 0;
-    kprintln("modeset: transmit -- ATOM #76 SKIPPED (PHY untouched; build without ATOM_RUN_TRANSMITTER)", 89);
+    kprintln("modeset: transmit -- BE<->FE pulse + post-#76 replay complete", 61);
     #endif
 
     # ── ENVELOPE CLOSE: reprogram the timing group same-mode, then OTG_MASTER_EN = 1 ────────────────
@@ -2126,7 +2144,11 @@ fn mdo_transmit_run() {
     if (stopped == 0) { kprintln("modeset: TRANSMIT FAILED -- OTG_MASTER_EN=0 did not stop the pipe", 65); return MDO_E_NOSTOP; }
     if (r4 != 0) { kprintln("modeset: TRANSMIT FAILED -- ATOM #4 encoder returned an error", 61); return MDO_E_ATOM; }
     if (r76 != 0) { kprintln("modeset: TRANSMIT FAILED -- ATOM #76 transmitter returned an error", 66); return MDO_E_ATOM; }
-    if ((be_rb & GPU_DIG_FE_SOURCE_SEL_MASK) != GPU_DIG_FE_SOURCE_CONNECT) {
+    # ⛔ Gate on `be1` — the read taken AFTER everything (review S2). `be_rb` is sampled immediately after
+    # the connect, before the BE<->FE pulse and the replay, so in the #76-live build it can no longer
+    # describe the final routing. Checking a stale readback would report "reconnected" about a state two
+    # write-phases old. `be_rb` stays only as the immediate did-the-write-land probe.
+    if ((be1 & GPU_DIG_FE_SOURCE_SEL_MASK) != GPU_DIG_FE_SOURCE_CONNECT) {
         kprintln("modeset: TRANSMIT FAILED -- BE<->FE reconnect did not read back", 63); return MDO_E_BEFE;
     }
     # ⛔ DO NOT add a "DIG_MODE must be HDMI" gate here. Nothing in this op sets it (see the reconnect
