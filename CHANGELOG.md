@@ -57,6 +57,76 @@ gate moves to `be1` (read after everything); `be_rb` remains only as the immedia
 
 Neither changes M8d's behaviour (its `#76` and replay are compiled out), so the burned result stands.
 
+**★★ PHYID CONFIRMED ON IRON 2026-07-24 (read-only dump, exit 95) — and the seeded DRY reshapes M8e.**
+The 101-register dump answers MD-2 by measurement: `=> phyid = 1`, with **exactly one** live instance
+(`inst 1: BE=0x10020200 mode=2 FE_SOURCE=0x02 EN=0x101 enable=1`; 0/2/3/4 all dead and identical). The
+kernel rule, `m1-decode.py` and `atom-interp.py` now derive it independently from the same capture.
+
+Feeding that seed to `#76 --action enable --phyid 1` collapses it from `21r/17w/5d` to **`4r/2w/0d`**: it
+reads that `DIG_ENABLE` is already set and exits, **writing zero PHY registers**. Two consequences —
+**(a)** M8e is far safer than the arc assumed, and the historical double-blanking is explained (those runs
+used `phyid=0`, where instance 0 reads *not* enabled, so the table ran its full 17-write bring-up and
+power-cycled a PHY); **(b)** M8e as specified would prove nothing, because a no-op produces no transmitter
+edge for M9's sequencing test. **M8e is therefore re-scoped rather than built** — a genuine edge needs
+`DISABLE` then `ENABLE`, a different risk case than the one M8e was reviewed for. ⛔ Reverting to `phyid=0`
+to obtain a livelier trace would be aiming at the wrong transmitter; its liveliness *is* the bug.
+
+### Added — M8e re-scoped: the REAL transmitter edge (`#76 DISABLE → ENABLE`, flag `ATOM_TX_CYCLE`)
+
+Since `#76 ENABLE` alone is now a proven no-op, M8e is rebuilt around a genuine edge: take the link **down**
+and bring it back. New `atom_run_transmitter_disable_hdmi()` (action `0`), and `mdo_transmit` gains a third
+rung behind a new **`ATOM_TX_CYCLE`** flag that runs DISABLE then ENABLE inside M6's envelope.
+
+**Predicted from the seeded DRY against real iron state:** DISABLE = 4 writes (`DIG_BE_EN_CNTL[1] <- 0`
+clearing `DIG_ENABLE`, plus `RDPCSTX1` `0x5EDB`/`0x5EDE`); ENABLE-after-disable = **20 writes** across DIG1
+(`0x566F`/`0x5670`/`0x56A1`), UNIPHY**B** (`0x5D2F`/`0x5D30`) and **RDPCSTX1**
+(`0x5EC1`/`0x5EC8`/`0x5EDB`/`0x5EDE`/`0x5EE7-EA`) — the full bring-up. ⭐ **Every write lands on instance 1 /
+UNIPHYB / RDPCSTX1; none on instance 0, UNIPHYA or RDPCSTX0**, validating the phyid fix at the write level.
+That also retires the earlier "the vetted read-set is incomplete, #76 touches `0x55xx`" note — a phyid=0
+artifact; at the correct phyid #76 stays inside the vetted DIG/UNIPHY/RDPCS ranges.
+
+**`ATOM_RUN_TRANSMITTER` is repurposed as the NEGATIVE CONTROL** rather than retired: same code path, same
+envelope, same replay, ENABLE-only and now *proven* inert. Anything it changes did not come from the edge —
+a control this arc has never had, created by the no-op finding. `ATOM_TX_ANY` is a derived build symbol
+(never set by hand) so the post-edge replay is shared by both rungs instead of duplicated.
+
+H8 extended to three mutually-exclusive rungs (cycle / enable-only / neither), each verified in **both**
+directions and keyed on `mdo_transmit` strings — ⚠ never on `atom.cyr`'s `76 DISABLE phyid`, which compiles
+under plain `HDMI_ATOM` whether called or not and would discriminate nothing (the same false-assuring-marker
+trap fixed earlier for `HDMI_ATOM`). New burn mode `BURN_MODESET_TX_CYCLE`. Gates: all four flag
+configurations build and produce **provably distinct** artifacts; `modeset-tool-smoke` 19/0.
+
+### Fixed — M8e 5-lens review: three blockers, six should-fixes
+
+**D1/D2 (blockers, mutually entangled).** `gpu_phy_discover()` was called at the ATOM call sites, downstream
+of writes this op makes: the BE↔FE disconnect clears `FE_SOURCE_SELECT` and `#76 DISABLE` clears
+`DIG_ENABLE` — two of the three conditions the discovery requires. Both halves of the cycle therefore
+**refused**. D1 alone was a wasted burn; fixing D1 without D2 would have left DISABLE landing and ENABLE
+refusing — **the link down with no in-kernel recovery**. Fixed together: phyid is latched **once** on the
+pristine pre-state and passed to both wrappers, which now take it as a parameter and refuse only on a bad
+argument. ⚠ Same class as the original phyid bug — right source, **wrong time**.
+
+**D3 (blocker).** `power_reset()` was gated on `ATOM_RUN_TRANSMITTER`, which the re-scope turned into the
+*negative control*, so the last-resort recovery compiled into the harmless build and out of the dangerous
+one. Now `ATOM_TX_ANY`.
+
+**D4** the watchdog keys on `resumed`, which free-runs off the OTG PLL and cannot see a dead PHY — added a
+deterministic in-window check (DISABLE ok + ENABLE failed ⇒ retry ENABLE once, then `MDO_E_PHYDOWN`).
+**D5** `power_reset()` never returns, so the wrapper's `klug_spill()` was unreachable on the
+highest-evidence path — spill now precedes it. **D6** `ATOM_TRACE` + a poll storm would wrap the 64 KB klug
+ring ~34× and evict the pre-state — read-trace budget 512/table (writes always traced, since the write list
+is the falsification gate) plus an early spill after the pre-state print. **D7** three outcomes collapsed
+into one verdict line — now `PHY IS DOWN … POWER-CYCLE NOW` vs `DISABLE did not run; PHY untouched, panel
+alive` vs a generic ATOM error. **D9** `DIG_BE_CNTL`/`DIG_BE_EN_CNTL` were indexed by the **front-end**
+index; they belong to the link encoder and are now indexed by the discovered phyid (both are 1 here, so it
+worked by coincidence — the same front/back conflation this arc already paid for once).
+
+**D8 — a deliberate, recorded divergence.** The amdgpu capture runs the transmitter work with the OTG
+**live** (FE disconnect +16.3 ms after `OTG_CONTROL` enable, pixel clock running); M8e runs the cycle inside
+the OTG-disabled window because that envelope is the safety property M6 proved on iron. If the PHY needs a
+running pixel clock to lock, the ENABLE will not relight. D7 makes that outcome *distinguishable* rather than
+ambiguous, and the documented next move is to run the cycle after the envelope close.
+
 ## [1.56.13] - 2026-07-24
 
 **MODESET work list B — the TRANSMITTER + audio (OPEN cycle).** Bumped on cycle open; the user tags/releases

@@ -318,6 +318,25 @@ elif [ -n "${BURN_HDMI_ATOM_FULL:-}" ]; then
     echo "[2/2] Building the A4 FULL kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE + HDMI_AUDIO_DUMP: encoder + transmitter. ⚠ BLANKS THE CONSOLE without a full modeset — do not flash yet)."
     BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_MODESET_TX_CYCLE:-}" ]; then
+    # ⛔⛔ M8e (re-scoped 1.56.14) — THE REAL TRANSMITTER EDGE. #76 DISABLE then ENABLE, inside M6's
+    # iron-proven OTG envelope, aimed by gpu_phy_discover() at the LIVE transmitter (phyid=1, measured).
+    #
+    # WHY A CYCLE AND NOT JUST ENABLE: on an already-enabled transmitter, #76 ENABLE is a proven NO-OP
+    # (snapshot DRY: 4 reads / 2 writes / 0 delays, zero PHY registers written). The only way to produce a
+    # genuine edge is DISABLE -> ENABLE. Predicted from the seeded DRY: DISABLE = 4 writes (clears
+    # DIG_ENABLE, drives RDPCSTX1); ENABLE = 20 writes across DIG1 / UNIPHYB / RDPCSTX1 — the full bring-up.
+    #
+    # ⛔ THE PANEL GOES DARK between the two halves, BY DESIGN. That is the edge, not a failure. It must
+    # relight when the ENABLE's bring-up completes. If it does not: the in-kernel watchdog re-runs the
+    # inherited-mode program, then power_reset(); and H2's latch makes that reboot clean and self-disabling.
+    # Worst case is ONE bad boot plus `rm /.modeset-armed` — never a reflash.
+    #
+    # Burn the NEGATIVE CONTROL first if in any doubt: BURN_MODESET_TRANSMITTER_LIVE runs the same code
+    # path with ENABLE-only (no edge), so anything it changes did NOT come from the transmitter.
+    echo "[2/2] Building the M8e TRANSMITTER-CYCLE kernel (HDMI_ATOM + ATOM_TX_CYCLE + ATOM_TRACE: #76 DISABLE then ENABLE — a REAL PHY edge on the live link. ⛔ THE PANEL WILL GO DARK MID-SEQUENCE and must relight; H2 recovers in one boot. EYE-CHECK the screen)."
+    BUILD_ENV="HDMI_ATOM=1 ATOM_TX_CYCLE=1 ATOM_TRACE=1"
+    BUILD_TAG="HDMI_ATOM+ATOM_TX_CYCLE+ATOM_TRACE"
 elif [ -n "${BURN_MODESET_TRANSMITTER_LIVE:-}" ]; then
     # ⛔⛔ M8e — THE DANGEROUS RUNG. ATOM #76 DIG1TransmitterControl(ENABLE) runs LIVE, inside M6's
     # iron-proven OTG envelope, driven from ring 3 by `run /bin/modeset --transmitter`. #76 power-cycles the
@@ -486,17 +505,33 @@ case "$BUILD_TAG" in *SCANOUT_REGDUMP*)  verify_marker "hubp regdump build armed
 # HDMI_ATOM alone is the SAFE transmitter build (envelope + ATOM #4 encoder; #76 compiled OUT). It must
 # carry the SKIPPED marker and must NOT carry the live-edge string.
 case "$BUILD_TAG" in
-    *ATOM_RUN_TRANSMITTER*) ;;                                   # the live build — handled by the arm below
+    *ATOM_RUN_TRANSMITTER*) ;;                                   # enable-only rung — its own arm below
+    *ATOM_TX_CYCLE*) ;;                                          # the real-edge rung — its own arm below
     *HDMI_ATOM*)
+        # Plain HDMI_ATOM = the SAFE transmitter build: #4 runs, no form of #76 does.
         verify_marker "ATOM #76 SKIPPED"
-        verify_absent "DIG1TransmitterControl ENABLE (LIVE PHY EDGE)"
+        verify_absent "ENABLE only (negative control"
+        verify_absent "CYCLE: DISABLE then ENABLE"
         ;;
 esac
 # ATOM_RUN_TRANSMITTER is the DESTRUCTIVE build: the live-edge string must be present and the SKIPPED
 # string absent. Both halves matter — a build carrying neither would mean mdo_transmit did not compile at all.
 case "$BUILD_TAG" in *ATOM_RUN_TRANSMITTER*)
-        verify_marker "DIG1TransmitterControl ENABLE (LIVE PHY EDGE)"
+        verify_marker "ATOM #76 ENABLE only (negative control"
         verify_absent "ATOM #76 SKIPPED"
+        verify_absent "CYCLE: DISABLE then ENABLE"
+        ;;
+esac
+# ⛔ M8e — the REAL transmitter edge (DISABLE then ENABLE). The most destructive build in the arc, so the
+# marker pair is checked BOTH ways, exactly like the enable-only rung.
+# ⚠ KEY ON THE mdo_transmit STRINGS, NEVER on atom.cyr's "76 DISABLE phyid": that text lives in
+# atom_run_transmitter_disable_hdmi(), which COMPILES under plain HDMI_ATOM whether or not anything calls
+# it — so it is present in all three transmitter builds and discriminates nothing. Same false-assuring
+# trap as the old "atom: running DIGxEncoderControl" marker.
+case "$BUILD_TAG" in *ATOM_TX_CYCLE*)
+        verify_marker "CYCLE: DISABLE then ENABLE"
+        verify_absent "ATOM #76 SKIPPED"
+        verify_absent "ENABLE only (negative control"
         ;;
 esac
 case "$BUILD_TAG" in *SCANOUT_MATCHGEOM*) verify_marker "scanout matchgeom armed" ;; esac

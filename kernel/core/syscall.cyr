@@ -1349,6 +1349,7 @@ var MDO_E_NORESUME   = 17;          # op    — M6: OTG_MASTER_EN=1 did not resu
 var MDO_E_NOATOM     = 18;          # op    — M8: this kernel was not built with HDMI_ATOM, so no ATOM table can run
 var MDO_E_ATOM       = 19;          # op    — M8: an ATOM step failed (vbios acquire/parse/init, or a table returned nonzero)
 var MDO_E_BEFE       = 20;          # op    — M8: the BE<->FE routing bracket did not read back as written
+var MDO_E_PHYDOWN    = 21;          # op    — M8e: #76 DISABLE took but ENABLE failed -> THE LINK IS DOWN (power-cycle)
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -1943,11 +1944,37 @@ fn mdo_transmit_run() {
     var s_vtg   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_VTG0_CONTROL) & 0xFFFFFFFF;
     var s_occ   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_CLOCK_CONTROL) & 0xFFFFFFFF;
     var s_oicc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC_INPUT_CLOCK_CONTROL) & 0xFFFFFFFF;
-    var s_be    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
     var vt_field = s_vtot & GPU_OTG_TOTAL_MASK;
+    # ⛔⛔ DISCOVER THE PHYID *HERE*, ONCE, ON THE PRISTINE INHERITED STATE — never at the ATOM call sites.
+    # gpu_phy_discover() needs DIG_ENABLE set AND FE_SOURCE_SELECT non-zero, and THIS OP DESTROYS BOTH
+    # before the transmitter runs: the BE<->FE disconnect below clears FE_SOURCE_SELECT, and #76 DISABLE
+    # clears DIG_ENABLE. Discovering at the call sites returned -1 and made BOTH halves of the cycle refuse
+    # — the DISABLE never firing (a wasted burn) and, once that was "fixed", the ENABLE refusing after the
+    # link was already down (a dark panel). Same class as the original phyid bug: right source, wrong time.
+    var s_phy = gpu_phy_discover();
+    if (s_phy < 0) { kprintln("modeset: transmit refused -- no live link encoder (phyid undeterminable)", 72); return MDO_E_NOGPU; }
+    # ⛔ THE BACK END IS INDEXED BY THE LINK-ENCODER INSTANCE, NOT THE STREAM-ENCODER ONE. `d` is
+    # gpu_audio_dig * stride — the FRONT end (DIG_FE_CNTL/AFMT/HDMI live there and correctly use `d`).
+    # DIG_BE_CNTL / DIG_BE_EN_CNTL are the BACK end and belong to the PHY instance, which is what ATOM's
+    # phyid names. Both are 1 on archaemenid so `d` happened to work — that coincidence is the whole
+    # front-end/back-end conflation this arc already paid for once. Index them by s_phy.
+    var db      = s_phy * GPU_DCN_DIG_STRIDE;
+    var s_be    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
+    var s_been  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + db) & 0xFFFFFFFF;
 
     kprint("modeset: transmit pre-state dig ", 32); kprint_num(gpu_audio_dig);
-    kprint(" be_cntl ", 9); kprint_num(s_be); kprint(" v_total ", 9); kprint_num(vt_field + 1); kprintln("", 0);
+    kprint(" phyid ", 7); kprint_num(s_phy);
+    kprint(" be_cntl ", 9); kprint_num(s_be); kprint(" be_en ", 7); kprint_num(s_been);
+    kprint(" v_total ", 9); kprint_num(vt_field + 1); kprintln("", 0);
+    # D6: spill NOW, before anything risky. If the ATOM trace later floods the 64 KB ring or the box hangs
+    # mid-table, /klug.txt still holds the pre-state and the phyid — the two facts needed to interpret it.
+    klug_spill();
+    # Distinguish the two transmitter failure modes. They could not be more different operationally:
+    # a refused/failed DISABLE leaves the panel ALIVE (nothing was taken down); an ENABLE that fails after a
+    # successful DISABLE leaves it DARK and needs a power cycle. Collapsing both into one rc, as the first
+    # cut did, would tell the operator "ATOM error" for both.
+    var tx_phy_down   = 0;
+    var tx_dis_failed = 0;
 
     # Same refuse-gates as M5/M6: only the arc's calibrated GOP mode, DRR off. Nothing has been touched yet.
     if (vt_field != 1480) { kprintln("modeset: transmit refused -- V_TOTAL field is not the calibrated 1480", 69); return MDO_E_NOTMODE; }
@@ -1976,7 +2003,7 @@ fn mdo_transmit_run() {
     }
 
     # ── BE<->FE DISCONNECT: clear FE_SOURCE_SELECT so no front end feeds the encoder while it is set up ──
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, s_be & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK));
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, s_be & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK));
     gpu_mfence();
 
     # ── ATOM #4 DIGxEncoderControl — programs the DIG FRONT END for HDMI (data islands, clock pattern).
@@ -2005,13 +2032,48 @@ fn mdo_transmit_run() {
     # only afterwards — which is the whole point of bracketing: the encoder must not be fed while its
     # transmitter is being power-cycled. Reconnecting first left the pipe attached through exactly the
     # window the bracket exists to protect.
+    # ⛔ THREE RUNGS, and which one runs is a BUILD property (see the flag table at the top):
+    #   ATOM_TX_CYCLE          — DISABLE then ENABLE: the REAL transmitter edge. The panel goes DARK
+    #                            between them by design; the ENABLE's 20-write bring-up must relight it.
+    #   ATOM_RUN_TRANSMITTER   — ENABLE only. Now known to be a NO-OP on an already-enabled transmitter
+    #                            (4r/2w/0d, zero PHY writes), which makes it a useful NEGATIVE CONTROL:
+    #                            same code path, same envelope, no edge. If a run with this flag changes
+    #                            anything the operator can see, the change did NOT come from the edge.
+    #   (neither)              — #76 never runs at all.
+    #ifdef ATOM_TX_CYCLE
+    kprintln("modeset: transmit -- ATOM #76 CYCLE: DISABLE then ENABLE (REAL PHY EDGE)", 72);
+    var rdis = atom_run_transmitter_disable_hdmi(s_phy);
+    kprint("modeset: transmit -- transmitter DISABLE rc ", 44); kprint_num(rdis); kprintln("", 0);
+    var r76 = atom_run_transmitter_enable_hdmi(s_phy);
+    kprint("modeset: transmit -- transmitter ENABLE rc ", 43); kprint_num(r76); kprintln("", 0);
+    # ⛔ D4/D7 — THE ONE STATE THAT MUST NEVER BE REPORTED AS A GENERIC ERROR: the DISABLE succeeded and the
+    # ENABLE did not. The link is DOWN and the only code that re-asserts DIG_ENABLE and re-brings-up RDPCSTX
+    # just failed. The watchdog CANNOT see this — it keys on the OTG frame counter, which free-runs off the
+    # pixel PLL and will happily resume once the envelope closes, so `resumed` reads 1 on a dead PHY.
+    # So detect it HERE, deterministically, while still inside the disabled window, and RETRY the ENABLE
+    # once with the latched phyid before giving up. A retry costs milliseconds; a dark panel costs a boot.
+    if (rdis == 0) {
+        if (r76 != 0) {
+            kprintln("modeset: transmit -- PHY DOWN: DISABLE took but ENABLE failed -- retrying ENABLE once", 85);
+            r76 = atom_run_transmitter_enable_hdmi(s_phy);
+            kprint("modeset: transmit -- ENABLE retry rc ", 37); kprint_num(r76); kprintln("", 0);
+            if (r76 != 0) { tx_phy_down = 1; }
+        }
+    }
+    # A failed DISABLE is a different, SAFER story: the PHY was never taken down, so the panel is alive and
+    # nothing needs recovering. Keep the two distinguishable rather than collapsing both into one rc.
+    if (rdis != 0) { tx_dis_failed = 1; }
+    #endif
     #ifdef ATOM_RUN_TRANSMITTER
-    kprintln("modeset: transmit -- ATOM #76 DIG1TransmitterControl ENABLE (LIVE PHY EDGE)", 75);
-    var r76 = atom_run_transmitter_enable_hdmi();
+    kprintln("modeset: transmit -- ATOM #76 ENABLE only (negative control; no edge expected)", 78);
+    var r76 = atom_run_transmitter_enable_hdmi(s_phy);
     kprint("modeset: transmit -- transmitter rc ", 36); kprint_num(r76); kprintln("", 0);
-    #else
+    #endif
+    #ifndef ATOM_TX_CYCLE
+    #ifndef ATOM_RUN_TRANSMITTER
     var r76 = 0;
-    kprintln("modeset: transmit -- ATOM #76 SKIPPED (PHY untouched; build without ATOM_RUN_TRANSMITTER)", 89);
+    kprintln("modeset: transmit -- ATOM #76 SKIPPED (PHY untouched; no transmitter flag set)", 78);
+    #endif
     #endif
 
     # ── BE<->FE CONNECT: re-point the back end at the front end (verified value 0x0200 in [15:8]) ────
@@ -2032,20 +2094,20 @@ fn mdo_transmit_run() {
     # ⚠ The RMW re-reads rather than reusing the `s_be` captured before #4. Value-identical today, but
     # deriving a whole-register write from a snapshot taken at a different time is the
     # [[reference_agnos_dcn_hubp_reg_offsets_derived]] class — modify a FIELD of the CURRENT value.
-    var be_now  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
+    var be_now  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
     var be_conn = (be_now & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK)) | GPU_DIG_FE_SOURCE_CONNECT;
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, be_conn);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, be_conn);
     gpu_mfence();
-    var be_rb = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
+    var be_rb = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
 
     # ── The BE<->FE PULSE, then THE REPLAY — both AFTER the connect, per the capture ────────────────
-    #ifdef ATOM_RUN_TRANSMITTER
+    #ifdef ATOM_TX_ANY
     # The capture emits a disconnect/connect PULSE on the reconnected link before re-sending the stream
     # attributes: the encoder is re-latched once more so the replayed packets land on a freshly-routed
     # front end rather than on whatever state the PHY power-cycle left behind.
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, be_conn & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK));
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, be_conn & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK));
     gpu_mfence();
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, be_conn);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, be_conn);
     gpu_mfence();
     # THE REPLAY (M8c). amdgpu's modeset re-emits the whole stream-attribute + infoframe block AFTER the
     # transmitter edge, and agnos has structurally never been able to — the writes were welded inside a
@@ -2095,7 +2157,7 @@ fn mdo_transmit_run() {
     # precisely the state this code runs in. Wiring recovery to it would destroy the window it needs.
     if (resumed == 0) {
         kprintln("modeset: WATCHDOG -- pipe dark after the edge; re-running the inherited-mode program", 84);
-        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, s_be);        # restore the inherited routing
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, s_be);        # restore the inherited routing
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl & (0 - 1 - GPU_OTG_MASTER_EN));
         gpu_mfence();
         gpu_dcn_hold_ms(60);
@@ -2114,11 +2176,21 @@ fn mdo_transmit_run() {
             return MDO_E_NORESUME;
         }
         kprintln("modeset: WATCHDOG -- re-run FAILED, pipe still dark", 51);
-        #ifdef ATOM_RUN_TRANSMITTER
-        # LAST RUNG, and it is only reachable in the #76-live build. Safe ONLY because H2's latch was
-        # flushed + readback-verified to stable media BEFORE the first risky write: the next boot's
-        # modeset_latch_check finds state 'A', SKIPS the modeset and comes up normal, so this cannot loop.
+        #ifdef ATOM_TX_ANY
+        # LAST RUNG, and it must exist in EVERY build that can drive the transmitter. ⛔ This was gated on
+        # ATOM_RUN_TRANSMITTER, which after the M8e re-scope is the *negative control* — a proven no-op that
+        # cannot darken the panel — so the recovery compiled into the harmless build and OUT of the
+        # dangerous one (ATOM_TX_CYCLE). Exactly backwards. ATOM_TX_ANY covers both rungs; the guard exists
+        # to keep power_reset out of builds with no transmitter at all, not to pick between transmitter builds.
+        # Safe ONLY because H2's latch was flushed + readback-verified to stable media BEFORE the first risky
+        # write: the next boot's modeset_latch_check finds state 'A', SKIPS the modeset and comes up normal,
+        # so this cannot loop.
         kprintln("modeset: WATCHDOG -- power_reset (H2 latch makes the reboot clean and self-disabling)", 85);
+        # ⛔ SPILL BEFORE THE RESET. power_reset() never returns, so mdo_transmit's wrapper spill — the one
+        # that guarantees "the evidence outlives every exit" — is unreachable from here. This is the single
+        # highest-value failure in the arc (dark panel AND the re-run failed) and it was the one path that
+        # would have lost its log. Latent until now only because the guard above was on the wrong flag.
+        klug_spill();
         power_reset();
         #endif
         return MDO_E_NORESUME;
@@ -2126,7 +2198,7 @@ fn mdo_transmit_run() {
 
     var refr = gpu_refresh_measure(pipe);
     var unf1 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
-    var be1  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
+    var be1  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
     var pred = gpu_pixclk_100hz * 100000 / (((s_htot & GPU_OTG_TOTAL_MASK) + 1) * (vt_field + 1));
     kprint("modeset: transmit -- resumed ", 29); kprint_num(resumed);
     kprint(" refresh ", 9); kprint_num(refr); kprint(" mHz predicted ", 15); kprint_num(pred); kprintln(" mHz", 4);
@@ -2143,6 +2215,15 @@ fn mdo_transmit_run() {
     # ── VERDICT ─────────────────────────────────────────────────────────────────────────────────────
     if (stopped == 0) { kprintln("modeset: TRANSMIT FAILED -- OTG_MASTER_EN=0 did not stop the pipe", 65); return MDO_E_NOSTOP; }
     if (r4 != 0) { kprintln("modeset: TRANSMIT FAILED -- ATOM #4 encoder returned an error", 61); return MDO_E_ATOM; }
+    # ⛔ THE DARK-PANEL VERDICT, and it must come FIRST and read unmistakably. The operator is looking at a
+    # black screen and needs to know it is expected to stay black until a power cycle — not to keep waiting.
+    if (tx_phy_down != 0) {
+        kprintln("modeset: TRANSMIT -- PHY IS DOWN: DISABLE took, ENABLE failed twice. POWER-CYCLE NOW.", 85);
+        kprintln("modeset: (H2 latch is armed -- the next boot SKIPS the modeset and comes up normal)", 83);
+        return MDO_E_PHYDOWN;
+    }
+    # A failed DISABLE is the SAFE failure: the PHY was never taken down, so the panel is alive.
+    if (tx_dis_failed != 0) { kprintln("modeset: TRANSMIT FAILED -- #76 DISABLE did not run; PHY untouched, panel alive", 79); return MDO_E_ATOM; }
     if (r76 != 0) { kprintln("modeset: TRANSMIT FAILED -- ATOM #76 transmitter returned an error", 66); return MDO_E_ATOM; }
     # ⛔ Gate on `be1` — the read taken AFTER everything (review S2). `be_rb` is sampled immediately after
     # the connect, before the BE<->FE pulse and the replay, so in the #76-live build it can no longer

@@ -63,6 +63,12 @@ var atom_saved = 0;           # saved-out (full 32-bit dst value before mask/shi
 #      transmitter dry-run was 21 reads / 17 writes / 5 delays) ----
 var atom_n_reg_r = 0;
 var atom_n_reg_w = 0;
+# ATOM_TRACE read budget, reset per table execution. A wait-for-status poll can emit tens of thousands of
+# read lines (the seeded DRY of #76 at a wrong phyid produced ~87,000), which wraps the 64 KB klug ring
+# many times over and evicts the pre-state, the phyid and the write list — i.e. exactly the evidence a
+# dark-panel burn depends on. 512 is far above any real table's read count and far below the ring.
+# ⚠ Plain literal: a computed module-scope initialiser reads 0 in this kernel.
+var atom_trace_budget = 512;
 var atom_n_delay = 0;
 
 # ---- H4 instrument pack: the five failures that used to be SILENT ----
@@ -259,7 +265,11 @@ fn atom_reg_read(idx) {
     #else
     var rv = load32(gpu_mmio + idx * 4);
     #ifdef ATOM_TRACE
-    kprint("atom r=", 7); kprint_hex(idx); kprint(" v=", 3); kprint_hex(rv & 0xFFFFFFFF); kprintln("", 0);
+    if (atom_trace_budget > 0) {
+        atom_trace_budget = atom_trace_budget - 1;
+        kprint("atom r=", 7); kprint_hex(idx); kprint(" v=", 3); kprint_hex(rv & 0xFFFFFFFF); kprintln("", 0);
+        if (atom_trace_budget == 0) { kprintln("atom: TRACE TRUNCATED (budget spent -- a poll loop is running)", 62); }
+    }
     #endif
     return rv;
     #endif
@@ -268,6 +278,10 @@ fn atom_reg_write(idx, val) {
     if (idx >= 0x20000) { return atom_reg_oow(idx, 1); }
     atom_n_reg_w = atom_n_reg_w + 1;
     #ifdef ATOM_TRACE
+    # ⛔ WRITES ARE ALWAYS TRACED, budget or not. The write list IS the burn's falsification gate (it is how
+    # a wrong phyid is caught), and #76 emits only ~20 of them. It is the READ side that storms — a
+    # wait-for-status poll can emit tens of thousands and evict everything from the 64 KB klug ring, which
+    # is how a hang becomes indistinguishable from a crash and the evidence dies with the console.
     kprint("atom w=", 7); kprint_hex(idx); kprint(" v=", 3); kprint_hex(val & 0xFFFFFFFF); kprintln("", 0);
     #endif
     #ifndef ATOM_DRY
@@ -904,6 +918,7 @@ fn atom_execute_table(index, ps_size) {
     atom_divmul1    = 0;
     atom_n_reg_r    = 0;
     atom_n_reg_w    = 0;
+    atom_trace_budget = 512;        # per-table read-trace budget (see the declaration for why)
     atom_n_delay    = 0;
     return atom_execute_table_locked(index, 0, ps_size, 0);
 }
@@ -984,15 +999,49 @@ fn atom_run_encoder_hdmi() {
 # reprogram a DEAD encoder while the live link sat untouched — a wasted destructive burn, or another blank.
 # gpu_phy_discover() asks the back end which instance is actually driving, so a re-route corrects itself
 # instead of silently aiming the most destructive command in the arc at the wrong transmitter.
-fn atom_run_transmitter_enable_hdmi() {
-    var phyid = gpu_phy_discover();
-    # ⛔ REFUSE rather than fall back to 0. "0" is the wrong-and-plausible answer a dead PHY accepts in
-    # silence, which is precisely the failure this fix exists to remove.
+# DIG1TransmitterControl (#76, v1_6) DISABLE(0) — powers the PHY DOWN. The first half of a real edge.
+#
+# ⛔ THIS IS THE DESTRUCTIVE ONE, and it is destructive BY DESIGN: it clears DIG_ENABLE and drives the
+# RDPCS lanes down, so THE PANEL GOES DARK the moment it lands. That is the point — an ENABLE on an
+# already-enabled transmitter is a proven no-op (4r/2w/0d, zero PHY writes), so the only way to produce a
+# genuine transmitter EDGE is to take the link down and bring it back.
+# Snapshot-DRY at phyid=1 (M8e prep): 4 writes — DIG_BE_EN_CNTL[1] <- 0 (DIG_ENABLE cleared), then
+# RDPCSTX1 0x5EDB/0x5EDE. All on instance 1 / RDPCSTX1: the CORRECT transmitter.
+# NEVER call this without the matching ENABLE immediately after, inside the OTG envelope, under the H2
+# latch — on its own it simply turns the display off.
+# ⛔ phyid IS A PARAMETER, NOT DISCOVERED HERE — and that is load-bearing. gpu_phy_discover() reads
+# DIG_BE_CNTL/DIG_BE_EN_CNTL, and BOTH of its preconditions are destroyed by the caller's own sequence
+# before this point: the BE<->FE disconnect clears FE_SOURCE_SELECT, and a preceding DISABLE clears
+# DIG_ENABLE. Discovering here returned -1 and made both halves REFUSE. The caller must discover ONCE on
+# the pristine inherited state, before it writes anything, and pass the value down.
+fn atom_run_transmitter_disable_hdmi(phyid) {
     if (phyid < 0) {
-        kprintln("atom: REFUSING #76 -- no live link encoder found, phyid undeterminable", 70);
+        kprintln("atom: REFUSING #76 DISABLE -- caller supplied no valid phyid", 60);
         return 0 - 1;
     }
-    kprint("atom: #76 phyid ", 16); kprint_num(phyid);
+    kprint("atom: #76 DISABLE phyid ", 24); kprint_num(phyid); kprintln(" (PHY down -- panel goes dark)", 30);
+    store32(&atom_ps_buf + 0,  (phyid & 0xFF) | (0 << 8) | (3 << 16) | (4 << 24)); # phyid,action=DISABLE,digmode,lanenum
+    store32(&atom_ps_buf + 4,  24150);                                       # symclk_10khz
+    store32(&atom_ps_buf + 8,  0x00 | (0x02 << 8) | (0x13 << 16));           # hpdsel,digfe_sel,connobj_id
+    store32(&atom_ps_buf + 12, 0);
+    store32(&atom_ps_buf + 16, 0);
+    store32(&atom_ps_buf + 20, 0);
+    store32(&atom_ps_buf + 24, 0);
+    store32(&atom_ps_buf + 28, 0);
+    return atom_execute_table(76, 8);
+}
+
+# ⛔ phyid IS A PARAMETER — see atom_run_transmitter_disable_hdmi's header. Discovering it here is WRONG in
+# the cycle: a DISABLE immediately before this clears DIG_ENABLE, one of gpu_phy_discover()'s three required
+# conditions, so it would return -1 and this ENABLE would REFUSE — leaving the link down and the panel dark.
+fn atom_run_transmitter_enable_hdmi(phyid) {
+    # ⛔ REFUSE rather than fall back to 0. "0" is the wrong-and-plausible answer a dead PHY accepts in
+    # silence, which is precisely the failure this whole line of work exists to remove.
+    if (phyid < 0) {
+        kprintln("atom: REFUSING #76 ENABLE -- caller supplied no valid phyid", 59);
+        return 0 - 1;
+    }
+    kprint("atom: #76 ENABLE phyid ", 23); kprint_num(phyid);
     kprintln(" (derived from the live DIG_BE_CNTL, not hardcoded)", 51);
     store32(&atom_ps_buf + 0,  (phyid & 0xFF) | (1 << 8) | (3 << 16) | (4 << 24)); # phyid,action,digmode,lanenum
     store32(&atom_ps_buf + 4,  24150);                                       # symclk_10khz
@@ -1031,7 +1080,10 @@ fn atom_hdmi_transmitter_bringup() {
     # ATOM_RUN_TRANSMITTER only once the full modeset (pixel-clock + OTG recommit) is in place.
     #ifdef ATOM_RUN_TRANSMITTER
     kprintln("atom: running DIG1TransmitterControl ENABLE HDMI", 48);
-    var r2 = atom_run_transmitter_enable_hdmi();
+    # Safe to discover here: this boot path has not disconnected BE<->FE or disabled anything, so the
+    # inherited state still satisfies gpu_phy_discover()'s conditions. (mdo_transmit cannot do this — its
+    # own sequence invalidates them, so it discovers once up front and passes the value down.)
+    var r2 = atom_run_transmitter_enable_hdmi(gpu_phy_discover());
     kprint("atom: transmitter rc=", 21); kprint_num(r2); kprintln("", 0);
     atom_print_counts();
     if (r2 != 0) { ok = 0; }

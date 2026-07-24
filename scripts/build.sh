@@ -417,6 +417,17 @@ else
         # recoverably. The default HDMI_ATOM build runs the encoder setup ONLY (DIG front-end, PHY-safe).
         # Enable this only with a full modeset (SetPixelClock + OTG recommit) in place.
         [ -n "$ATOM_RUN_TRANSMITTER" ] && echo '#define ATOM_RUN_TRANSMITTER'
+        # ATOM_TX_CYCLE=1 — M8e: run #76 DISABLE then ENABLE, i.e. a REAL transmitter edge. OFF by default.
+        # ⛔ THE DESTRUCTIVE ONE. ENABLE alone is a proven no-op on an already-enabled transmitter (snapshot
+        # DRY: 4r/2w/0d, zero PHY writes), so the only way to produce an edge is to take the link DOWN and
+        # bring it back — the panel goes dark between the two halves by design. Only survivable inside M6's
+        # OTG envelope with the H2 latch armed. ATOM_RUN_TRANSMITTER (enable-only) is its negative control.
+        [ -n "$ATOM_TX_CYCLE" ] && echo '#define ATOM_TX_CYCLE'
+        # ATOM_TX_ANY — derived, never set by hand: "some form of #76 runs". Cyrius has no
+        # `#if defined(A) || defined(B)`, and the post-edge infoframe replay is needed by BOTH transmitter
+        # rungs, so emit one symbol rather than duplicate the block (a duplicated block is how the two
+        # copies drift apart).
+        if [ -n "$ATOM_RUN_TRANSMITTER" ] || [ -n "$ATOM_TX_CYCLE" ]; then echo '#define ATOM_TX_ANY'; fi
         # ATOM_MATH_SELFTEST=1 — H6 (modeset arc): run the DIV32/MUL32 unit sweep against the
         # atom-interp.py oracle and print pass/fail. PURE ARITHMETIC — no MMIO, no VBIOS, no bytecode, no
         # PHY. Safe anywhere, needs no iron; QEMU is the intended venue. Requires HDMI_ATOM because the
