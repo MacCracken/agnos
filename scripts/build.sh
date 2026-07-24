@@ -423,6 +423,11 @@ else
         # helpers live inside that gate. Vectors regenerate with
         # `python3 agnosticos/scripts/atom-math-vectors.py`.
         [ -n "$ATOM_MATH_SELFTEST" ] && echo '#define ATOM_MATH_SELFTEST'
+        # ATOM_INSTR_SELFTEST=1 — H4 (modeset arc): prove every abnormal interpreter exit is DISTINCT and
+        # NON-ZERO, by executing four synthetic in-RAM command tables (clean EOT / reserved opcode /
+        # out-of-range opcode / impossible header). No real VBIOS, no MMIO reachable, no PHY — safe
+        # anywhere, QEMU is the venue. Requires HDMI_ATOM (the interpreter lives inside that gate).
+        [ -n "$ATOM_INSTR_SELFTEST" ] && echo '#define ATOM_INSTR_SELFTEST'
         # Freestanding kashi font-data core (1.37.5 fold-in). Inlined here
         # rather than via cyrius dep resolution because `cyrius build` looks
         # for cyrius.cyml at cwd and we cd into kernel/ for relative include

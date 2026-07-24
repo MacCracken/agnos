@@ -1160,6 +1160,17 @@ gpu_pixclk_discover();
 atom_math_selftest();
 #endif
 
+#ifdef ATOM_INSTR_SELFTEST
+# H4 (gpu.md, modeset arc) — the ATOM instrument pack's own proof. Executes four SYNTHETIC in-RAM command
+# tables to show that a clean EOT, a reserved opcode, an out-of-range opcode and an impossible table header
+# now return four DISTINCT non-zero-vs-zero results. Before H4 all four returned rc=0, so "the table ran"
+# was unfalsifiable and every ATOM bite carried a silent false-pass channel.
+#
+# ⚠ Top level, NOT inside the HDA_HDMI / HDMI_ATOM nest — same reason as H6 above: no MMIO is reachable
+# here (the only opcodes executed are EOT / 0 / 127), so a pure test must not require a console-risky flag.
+atom_instr_selftest();
+#endif
+
 #ifdef HDA_HDMI
 # GPU arc 1.55.x (Thrust P) P3b-ii + P3b-iii — THE WRITE BITE: close the 1.53.5 backlog. The HDA half above
 # already streams samples into the GPU's audio function; nothing embeds them because the DISPLAY half was

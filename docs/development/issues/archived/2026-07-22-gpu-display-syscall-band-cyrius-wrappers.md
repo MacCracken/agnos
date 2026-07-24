@@ -1,3 +1,17 @@
+> ## ✅ CLOSED + ARCHIVED 2026-07-23
+>
+> **The cyrius wrappers this issue asked for HAVE LANDED** — verified against
+> `cyrius/lib/syscalls_x86_64_agnos.cyr` at 6.4.72, not against this document:
+> `sys_shm_create_gpu` (:640) · `sys_gpu_blit_shm` (:651) · `sys_gpu_fill_rect` (:662) ·
+> `sys_gpu_caps` (:674) · `sys_gpu_readback_shm` (:687) · `sys_gpu_blit_bb` (:699), plus
+> `sys_gpu_present` / `sys_gpu_fill` / `sys_gpu_dispatch{,_f64}`. The cyrius-side mirrors are in
+> `cyrius/docs/development/issues/archived/`.
+>
+> ⚠ **Any "cyrius leg still OPEN" wording below is STALE** — it was true when written and is not now.
+> Still-outstanding wrappers are tracked in
+> [`2026-07-23-gpu-modeset-op-93-cyrius-wrapper.md`](../2026-07-23-gpu-modeset-op-93-cyrius-wrapper.md):
+> **`#92 gpu_shader_op` and `#93 gpu_modeset_op` only.**
+
 # 2026-07-22 — The GPU/display syscall BAND (#86-#91) + their cyrius wrappers (consolidated ask)
 
 **Status:** 🟡 **OPEN** (cyrius leg). Supersedes the one-at-a-time pattern of

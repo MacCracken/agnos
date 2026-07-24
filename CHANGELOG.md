@@ -3,12 +3,23 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.56.9] - 2026-07-23
 
-> ⚠ **`#90`/`#91` are documented here rather than under `[1.56.8]` deliberately.** They are implemented and
+**The MODESET harness — work list A.** Four bites (H0, H7, H6, H4) that make the modeset ladder's iron rungs
+survivable and its instruments honest, plus the `#90`/`#91` write-up that had no release of its own.
+**Every one is zero-burn, and the default kernel is `cmp`-identical to 1.56.8** — all four selftests are
+opt-in build flags, so nothing in the shipping kernel changed. Operator decisions **MD-3/4/5/6/7/8**
+ratified (incl. syscall **`#93` = `gpu_modeset_op`** and `--update-all` for any burn carrying
+`/bin/modeset`); **MD-2 (phyid) remains the one decision still blocking a bite (M8)** and is a paper task,
+never a burn.
+
+Gates: ARC SWEEP **15/15** · `check.sh` **14/14** · `kprint-len-check` **2533/0** ·
+`atom-instr-smoke` **7/7** · `atom-math-smoke` **4/4** · `dcn-reg-derive` **12/12 anchors**.
+
+> ⚠ **`#90`/`#91` are documented under this release rather than `[1.56.8]` deliberately.** They are implemented and
 > iron-proven in the tree, but the `[1.56.8]` entry states "No kernel behaviour changed in this cut", so the
-> syscalls landed *after* that entry was written and carry no release of their own yet. Move this section
-> into whichever version tags them.
+> syscalls landed *after* that entry was written and had no release of their own until now. 1.56.9 is where
+> they get written up.
 
 ### Added — `#90 gpu_readback_shm` + `#91 gpu_blit_bb`: the `#89`→`#92` numbering hole is CLOSED
 
@@ -28,6 +39,56 @@ stale cache-line ghost — the C2g-1 class. `gpu_readback_shm_sys` now `clflush`
 Proven by **`/bin/gpucopy`** (banded-source + overlapping-move oracle) → `run: exit 95` on archaemenid.
 Five burns, **84 → 76 → 51 → 95 → 95**, each with its own CONFIRM/FALSIFY rubric. Cyrius wrappers filed:
 `docs/development/issues/2026-07-23-gpu-readback-blit-bb-wrappers.md`.
+
+### Added — H4: the ATOM instrument pack. `rc = 0` now means "a table ran", and nothing else does.
+
+MODESET harness bite **H4**. Five interpreter failures were **silent**, and the worst of them made `rc = 0`
+worthless as evidence: a table that hit a reserved opcode, ran off the end of its code, took an
+unimplemented I/O mode, or addressed a register outside the BAR5 window returned **exactly the same rc as a
+clean EOT**. Every ATOM bite therefore carried a silent false-pass channel.
+
+- **(a) Distinct rc per exit, and a reporter that names it.** `0` is now *only* a clean EOT; reserved-opcode
+  is `-61`, out-of-range `-62`, bad header `-64`, abort `-22`, nesting `-40`. On any abnormal exit the
+  interpreter prints where it stopped against where it legitimately could:
+  `atom: table 2 STOPPED rc=61 ip=a7 end=a8 in range` (`usStructureSize` at `base+0` gives the true end).
+- **(b) `atom_reg_read` traces its address** under `ATOM_TRACE`. The oracle records 21 reads for `#76`;
+  agnos could previously prove only the *count*, never *which registers*.
+- **(c) Out-of-window accesses are counted and logged** instead of vanishing. `idx >= 0x20000` is still
+  refused — but it used to `return 0` mutely, so a table addressing an unreachable register looked exactly
+  like one that never addressed it, while the read/write counters stayed misleadingly correct.
+- **(d) CALLTABLE sanity** — `size >= 6 && base + size <= gpu_vbios_len`, refused before execution. Without
+  it a bogus index walked into arbitrary image bytes and interpreted them as opcodes.
+- **(e) A non-MM `io_mode` is FATAL, not a silent 0.** The IIO engine is not ported; the old
+  `else { val = 0; }` would have read zeros, computed garbage, and kept writing PHY registers regardless.
+- **Workspace caps bumped: slot 512 → 1024 B, depth 8 → 32.** `ws_count` is a **u8** (≤ 255 dwords =
+  1020 B) and this VBIOS declares tables with **ws = 214 / 181 / 136** dwords — every one would have zeroed
+  and written past its 128-dword slot into the next recursion level's workspace. It never fired only because
+  the two A4 tables happen to fit. `SetPixelClock` #12 does not have that luck.
+
+**The gate is met.** `scripts/atom-instr-smoke.sh` (QEMU, **7/7**): executing a data table now returns
+non-zero *and reports itself*, where it returned 0 before. Proven with a **synthetic in-RAM VBIOS** — four
+tiny command tables driving each exit path. Only opcodes 91 / 0 / 127 ever execute, so no MMIO is reachable;
+safe anywhere, never needs iron. Default kernel `cmp`-identical.
+
+#### ⚠ This bite caught a Cyrius defect — one that made H4's own first run a false pass
+
+In an **included** Cyrius module, a module-scope `var` with a **computed** initializer silently initializes
+to **0**. Measured on cycc 6.4.72: `var X = 1024;` reads 1024, but `var X = 512 * 2;`, `var X = -5;` and
+`var X = 0 - 61;` **all read 0**, with no warning. It is not negative-specific — unary minus is simply an
+expression. An inline literal in a *statement* (`ret = -22;`) is unaffected, which is why this file had
+never tripped it.
+
+H4's rc codes were written as `var ATOM_RC_RESERVED = 0 - 61;`. All of them were **0**. So
+`ret = ATOM_RC_RESERVED` assigned 0, the reporter `if (ret != ATOM_RC_OK)` compared `0 != 0` and never
+fired, and the selftest asserted `got == ATOM_RC_RESERVED` — i.e. **0 == 0** — and reported **4/4 PASS**.
+A green test inside the bite whose entire purpose is eliminating silent false passes. It builds clean and
+formats clean; no existing gate sees it. It was caught **only** because the smoke also asserts on the
+reporter's printed output rather than the pass count alone.
+
+Fixed by writing the rc codes as **inline literals at every site**, with the value table and an explicit
+"do not tidy these into named `var`s" warning in the source. Issue filed in **both** repos:
+`docs/development/issues/2026-07-23-cyrius-module-scope-var-expr-initializer-zero.md`. Cyrius itself is
+hands-off — filed, not patched.
 
 ### Added — H6: the ATOM DIV32/MUL32 sweep. The pixel-clock divider math finally has a proof.
 

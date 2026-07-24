@@ -65,6 +65,49 @@ var atom_n_reg_r = 0;
 var atom_n_reg_w = 0;
 var atom_n_delay = 0;
 
+# ---- H4 instrument pack: the five failures that used to be SILENT ----
+# Before H4 a table that hit a reserved opcode, ran off the end of its code, took an unimplemented I/O mode,
+# or addressed a register outside the BAR5 window returned **rc = 0** — indistinguishable from a clean EOT.
+# `rc=0` was therefore NOT evidence a table ran, and every ATOM bite had a silent false-pass channel.
+var atom_n_oow   = 0;         # register accesses outside the direct window (idx >= 0x20000) — were dropped mutely
+var atom_last_ip = 0;         # where the last table STOPPED (compare against base + table size)
+var atom_last_end = 0;        # base + usStructureSize for that table — the legitimate end
+var atom_last_rc = 0;         # rc of the last table, for callers that only print
+
+# rc codes. 0 is ONLY a clean EOT; every abnormal exit is distinct and non-zero so a log names its own cause.
+# rc codes — ⛔ WRITTEN AS INLINE LITERALS AT EVERY SITE, DELIBERATELY. DO NOT "tidy" these into named
+# module-scope `var`s.
+#
+#   ATOM_RC_OK          0    hit EOT (opcode 91) — the ONLY success
+#   ATOM_RC_ABORT     -22    unimplemented op (REPEAT/SAVEREG/RESTOREREG), failed sub-table, or io_mode
+#   ATOM_RC_NESTING   -40    depth cap
+#   ATOM_RC_RESERVED  -61    opcode 0 — reserved; almost always "executing a DATA table as code"
+#   ATOM_RC_OUTOFRANGE -62   opcode >= 127 — ran off the end of the code, or desynced
+#   ATOM_RC_BADTABLE  -64    CALLTABLE header failed its sanity check
+#
+# ⚠⚠ WHY LITERALS: in an INCLUDED Cyrius module a module-scope `var` whose initializer is a **computed
+# expression** silently initializes to **0**. Measured on cycc 6.4.72 (agnos pin 6.4.2), 2026-07-23:
+# `var X = 1024;` reads 1024, but `var X = 512 * 2;`, `var X = -5;` and `var X = 0 - 61;` ALL read 0.
+# Negative values are affected because unary minus is itself an expression.
+#
+# This bit H4 hard and is worth remembering: the first version of this bite defined the rc codes as
+# `var ATOM_RC_RESERVED = 0 - 61;` etc. Every one was 0, so `ret = ATOM_RC_RESERVED` assigned 0, the reporter
+# `if (ret != 0)` never fired, and the H4 selftest compared 0 against 0 and **reported 4/4 PASS** —
+# a false pass, in the very bite whose purpose is to eliminate false passes. It was caught only because the
+# smoke also asserted on the reporter's own output lines, not just the pass count. Cf.
+# [[reference_cyrius_module_scope_var_expr_init_zero]]. Issue filed under docs/development/issues/.
+
+# ---- H4 cap bumps: the workspace was UNDER-SIZED for this ROM ----
+# ⚠ `ws_count` is a **u8**, so a table may legitimately ask for up to 255 dwords = 1020 bytes. The old slot
+# was 512 B = 128 dwords, and this VBIOS contains tables declaring **ws = 214 / 181 / 136** dwords — every
+# one of which would have run its zeroing loop and its writes straight past the end of its slot and into the
+# NEXT recursion level's workspace. It never fired only because the two A4 tables (#4, #76) happen to sit
+# under 128. `SetPixelClock` #12 and the modeset ladder do not have that luck.
+# 1024 B covers the u8 maximum with room to spare; depth 8 -> 32 matches the oracle's own cap.
+var ATOM_WS_SLOT  = 1024;     # bytes per recursion level (>= 255 dwords, the u8 ws_count ceiling)
+var ATOM_MAX_DEPTH = 32;      # recursion levels (was 8; atom-interp.py uses 32)
+var ATOM_WS_POOL  = 32768;    # ATOM_WS_SLOT * ATOM_MAX_DEPTH
+
 # ---- working memory ----
 var atom_ps_buf[8];           # 64 bytes = param block (max 32 B used); dword-addressed
 var atom_work_va      = 0;    # 2 MB scratch page VA (ws pool + FB scratch)
@@ -176,17 +219,53 @@ fn atom_jumpmap(i) {
 # are traced but NOT applied. Guarantees the console survives (no PHY drive) and
 # captures the exact write sequence to diff against the atom-interp.py oracle
 # (17 writes for the transmitter dry-run). Live PHY drive is the default (no flag).
+# ⚠ H4(c): an out-of-window index is still REFUSED (never touch memory past the BAR5 direct window), but it
+# is no longer silent. It used to `return 0` with no counter and no log, so a table addressing a register
+# this port cannot reach looked exactly like a table that never addressed one — and the read/write counters
+# a burn compares against the oracle stayed misleadingly correct.
+fn atom_reg_oow(idx, is_write) {
+    atom_n_oow = atom_n_oow + 1;
+    kprint("atom: OUT-OF-WINDOW ", 20);
+    if (is_write != 0) { kprint("write", 5); } else { kprint("read", 4); }
+    kprint(" idx=", 5); kprint_hex(idx); kprintln(" refused", 8);
+    return 0;
+}
+# H4(e): SETPORT selected PCI / SYSIO / an indirect ATI port. amdgpu's IIO engine is NOT ported (this VBIOS
+# ships an empty IIO table and io_mode is always ATOM_IO_MM), so there is no correct behaviour available —
+# only "stop" and "pretend". It used to pretend. Aborts the table; logged once so a desync cannot drown the
+# console in a loop.
+var atom_iomode_reported = 0;
+fn atom_io_mode_fatal(is_write) {
+    atom_cur_abort = 1;
+    if (atom_iomode_reported == 0) {
+        atom_iomode_reported = 1;
+        kprint("atom: FATAL io_mode ", 20); kprint_hex(atom_io_mode);
+        if (is_write != 0) { kprintln(" on write - IIO not ported, table aborted", 41); }
+        if (is_write == 0) { kprintln(" on read - IIO not ported, table aborted", 40); }
+    }
+    return 0;
+}
+
 fn atom_reg_read(idx) {
-    if (idx >= 0x20000) { return 0; }          # beyond direct BAR5 window — never touch
+    if (idx >= 0x20000) { return atom_reg_oow(idx, 0); }   # beyond direct BAR5 window — never touch
     atom_n_reg_r = atom_n_reg_r + 1;
     #ifdef ATOM_DRY
+    #ifdef ATOM_TRACE
+    # H4(b): a DRY read is a constant 0, but WHICH register was read is the half of the trace that was
+    # missing — the oracle records 21 reads for #76 and agnos could only prove the count, not the addresses.
+    kprint("atom r=", 7); kprint_hex(idx); kprintln(" v=0 (dry)", 10);
+    #endif
     return 0;
     #else
-    return load32(gpu_mmio + idx * 4);
+    var rv = load32(gpu_mmio + idx * 4);
+    #ifdef ATOM_TRACE
+    kprint("atom r=", 7); kprint_hex(idx); kprint(" v=", 3); kprint_hex(rv & 0xFFFFFFFF); kprintln("", 0);
+    #endif
+    return rv;
     #endif
 }
 fn atom_reg_write(idx, val) {
-    if (idx >= 0x20000) { return 0; }
+    if (idx >= 0x20000) { return atom_reg_oow(idx, 1); }
     atom_n_reg_w = atom_n_reg_w + 1;
     #ifdef ATOM_TRACE
     kprint("atom w=", 7); kprint_hex(idx); kprint(" v=", 3); kprint_hex(val & 0xFFFFFFFF); kprintln("", 0);
@@ -254,7 +333,11 @@ fn atom_get_src_int(attr, want_saved) {
     if (arg == 0) {                                                 # REG
         idx = atom_u16(atom_ip); atom_ip = atom_ip + 2;
         idx = (idx + atom_reg_block) & 0xFFFFFFFF;
-        if (atom_io_mode == 0) { val = atom_reg_read(idx); } else { val = 0; }
+        # H4(e): a non-MM io_mode is FATAL, not a silent 0. This VBIOS's IIO table is empty and io_mode is
+        # always ATOM_IO_MM, so the indirect-I/O engine was never ported — but the old `else { val = 0; }`
+        # meant that if a table ever DID take that path it would read zeros, compute garbage from them, and
+        # keep writing PHY registers as though nothing were wrong. Abort instead.
+        if (atom_io_mode == 0) { val = atom_reg_read(idx); } else { val = atom_io_mode_fatal(0); }
     }
     if (arg == 1) {                                                 # PS
         idx = atom_u8(atom_ip); atom_ip = atom_ip + 1;
@@ -332,9 +415,11 @@ fn atom_put_dst(arg, attr, dptr, val, saved) {
     if (arg == 0) {                                                # REG
         idx = atom_u16(dptr);
         idx = (idx + atom_reg_block) & 0xFFFFFFFF;
+        # H4(e): same fatal rule on the WRITE side, and it matters more here — a dropped write in a
+        # non-MM io_mode leaves the PHY half-programmed while the table reports success.
         if (atom_io_mode == 0) {
             if (idx == 0) { atom_reg_write(0, atom_shl32(val, 2)); } else { atom_reg_write(idx, val); }
-        }
+        } else { atom_io_mode_fatal(1); }
     }
     if (arg == 1) {                                                # PS
         idx = atom_u8(dptr);
@@ -716,7 +801,18 @@ fn atom_dispatch(op, depth) {
 fn atom_execute_table_locked(index, ps_off, ps_size, depth) {
     var base = atom_u16(atom_cmd_table + 4 + 2 * index);
     if (base == 0) { return -22; }
-    if (depth >= 8) { kprintln("atom: nesting limit", 19); return -40; }
+    if (depth >= ATOM_MAX_DEPTH) { kprintln("atom: nesting limit", 19); return -40; }
+
+    # H4(d): CALLTABLE SANITY. A table header is 6 bytes before any code, and the whole table must lie
+    # inside the acquired VBIOS image. Without this a bogus index walked into arbitrary image bytes and
+    # interpreted them as opcodes — which is exactly how a desync ends up poking stray PHY registers.
+    var tsize = atom_u16(base);
+    if (tsize < 6 || base + tsize > gpu_vbios_len) {
+        kprint("atom: table ", 12); kprint_num(index);
+        kprint(" BAD HEADER base=", 17); kprint_hex(base);
+        kprint(" size=", 6); kprint_num(tsize); kprintln(" - refused", 10);
+        return -64;
+    }
 
     var ws_count = atom_u8(base + 4);
     var ps_count = atom_u8(base + 5) & 0x7F;
@@ -736,7 +832,15 @@ fn atom_execute_table_locked(index, ps_off, ps_size, depth) {
     atom_cur_start    = base;
     atom_cur_abort    = 0;
     atom_cur_ws_size  = ws_count;
-    atom_cur_ws_ptr   = atom_ws_pool_base + depth * 512;
+    atom_cur_ws_ptr   = atom_ws_pool_base + depth * ATOM_WS_SLOT;
+    # Belt-and-braces after the cap bump: ws_count is a u8 (<= 255 dwords = 1020 B) and the slot is 1024 B,
+    # so this can no longer overflow — but clamp anyway and SAY SO, because a silent over-run into the next
+    # recursion level's workspace is precisely the class of bug H4 exists to stop being silent.
+    if (ws_count * 4 > ATOM_WS_SLOT) {
+        kprint("atom: ws_count ", 15); kprint_num(ws_count); kprintln(" exceeds slot - clamped", 23);
+        ws_count = ATOM_WS_SLOT / 4;
+        atom_cur_ws_size = ws_count;
+    }
     var wi = 0;
     while (wi < ws_count) { store32(atom_cur_ws_ptr + wi * 4, 0); wi = wi + 1; }
 
@@ -751,12 +855,32 @@ fn atom_execute_table_locked(index, ps_off, ps_size, depth) {
         var stop = 0;
         if (steps > 1000000) { kprintln("atom: step cap hit", 18); ret = -22; running = 0; stop = 1; }
         if (stop == 0 && atom_cur_abort != 0) { ret = -22; running = 0; stop = 1; }
-        if (stop == 0 && op == 0) { running = 0; stop = 1; }        # reserved
-        if (stop == 0 && op >= 127) { running = 0; stop = 1; }      # out of range
+        # ⚠ H4(a) — THE SILENT FALSE-PASS CHANNEL, CLOSED. Both of these used to leave `ret` at 0, so a
+        # table that hit a reserved opcode or ran off the end of its code returned the SAME rc as a clean
+        # EOT. "rc=0" was not evidence a table ran. Opcode 0 in particular is the signature of executing a
+        # DATA table as code — the exact deliberate-desync case this bite must make loud.
+        if (stop == 0 && op == 0) { ret = -61; running = 0; stop = 1; }
+        if (stop == 0 && op >= 127) { ret = -62; running = 0; stop = 1; }
         if (stop == 0) {
             atom_dispatch(op, depth);
             if (op == 91) { running = 0; }                         # EOT
         }
+    }
+
+    # H4(a): record WHERE it stopped against where it legitimately could. usStructureSize lives at base+0
+    # (ATOM_COMMON_TABLE_HEADER), so `base + size` is the first byte past this table's code. An ip at or
+    # past that end means the interpreter walked off the table — which a bare rc could never distinguish
+    # from stopping on a legitimate EOT one byte earlier.
+    atom_last_ip  = atom_ip;
+    atom_last_end = base + atom_u16(base);
+    atom_last_rc  = ret;
+    if (ret != 0) {
+        kprint("atom: table ", 12); kprint_num(index);
+        kprint(" STOPPED rc=", 12); kprint_num(0 - ret);
+        kprint(" ip=", 4); kprint_hex(atom_last_ip);
+        kprint(" end=", 5); kprint_hex(atom_last_end);
+        if (atom_last_ip > atom_last_end) { kprintln(" PAST END", 9); }
+        if (atom_last_ip <= atom_last_end) { kprintln(" in range", 9); }
     }
 
     atom_ip           = save_ip;
@@ -819,8 +943,8 @@ fn atom_init_mem() {
     var p = pmm_alloc_2mb();
     if (p == 0) { kprintln("atom: work alloc failed", 23); return 0; }
     atom_work_va      = DIRECTMAP_BASE + p;
-    atom_ws_pool_base = atom_work_va;                             # 8 x 512 = 4096 B
-    atom_scratch_base = atom_work_va + 4096;                      # 256 dwords
+    atom_ws_pool_base = atom_work_va;                             # ATOM_MAX_DEPTH x ATOM_WS_SLOT = 32 KB
+    atom_scratch_base = atom_work_va + ATOM_WS_POOL;              # 256 dwords, past the whole ws pool
     atom_scratch_size = 1024;
     var i = 0;
     while (i < 256) { store32(atom_scratch_base + i * 4, 0); i = i + 1; }
@@ -972,6 +1096,88 @@ fn atom_math_selftest() {
         return 1;
     }
     kprintln("atom: H6 FAIL div32/mul32 diverge from the oracle", 49);
+    return 0;
+}
+#endif
+
+#ifdef ATOM_INSTR_SELFTEST
+# === H4 — the instrument pack's own proof: every abnormal exit is DISTINCT and NON-ZERO ==================
+#
+# The plan's gate for this bite: "a deliberate desync (execute a data table) must return NON-ZERO where it
+# returns 0 today. Without this, rc=0 is not evidence a table ran, and every later ATOM bite has a silent
+# false-pass channel."
+#
+# Executing the real interpreter needs a VBIOS, and QEMU has no AMD GPU — so this SYNTHESISES one in RAM:
+# four tiny command tables whose first opcode is chosen to drive each exit path. No MMIO is reachable (the
+# only opcodes executed are EOT / reserved / out-of-range), so this is safe anywhere and needs no iron.
+#
+# Byte layout is composed with store32 because there is no store8; atom_u8/atom_u16 read it back with
+# load8, so little-endian placement is what matters.
+#
+#   cmd table @0x40 : u16 pointer array, index N at 0x40 + 4 + 2N
+#   table @0x80 : size 8, code[0] = 91 (EOT)        -> ATOM_RC_OK          (the control)
+#   table @0xA0 : size 8, code[0] = 0  (reserved)   -> ATOM_RC_RESERVED    (THE DESYNC CASE)
+#   table @0xC0 : size 8, code[0] = 127 (out of range) -> ATOM_RC_OUTOFRANGE
+#   table @0xE0 : size 2 (< 6, impossible header)   -> ATOM_RC_BADTABLE
+
+var atom_fake_rom[64];        # module-scope in an INCLUDED module => 64 x u64 = 512 bytes
+var atom_h4_pass = 0;
+var atom_h4_fail = 0;
+
+fn atom_h4_expect(tag, got, want) {
+    if (got == want) { atom_h4_pass = atom_h4_pass + 1; return 1; }
+    atom_h4_fail = atom_h4_fail + 1;
+    kprint("atom: H4 case ", 14); kprint_num(tag);
+    kprint(" got rc=", 8); kprint_num(0 - got);
+    kprint(" want rc=", 9); kprint_num(0 - want); kprintln("", 0);
+    return 0;
+}
+
+fn atom_instr_selftest() {
+    atom_h4_pass = 0;
+    atom_h4_fail = 0;
+    if (atom_init_mem() == 0) { kprintln("atom: H4 no work page", 21); return 0; }
+
+    var s_va  = gpu_vbios_va;
+    var s_len = gpu_vbios_len;
+    var s_cmd = atom_cmd_table;
+
+    var b = &atom_fake_rom;
+    var i = 0;
+    while (i < 128) { store32(b + i * 4, 0); i = i + 1; }
+
+    gpu_vbios_va   = b;
+    gpu_vbios_len  = 512;
+    atom_cmd_table = 0x40;
+
+    store32(b + 0x44, 0x00800000);          # ptr[1] @0x46 = 0x0080
+    store32(b + 0x48, 0x00C000A0);          # ptr[2] @0x48 = 0x00A0, ptr[3] @0x4A = 0x00C0
+    store32(b + 0x4C, 0x000000E0);          # ptr[4] @0x4C = 0x00E0
+
+    store32(b + 0x80, 0x00000008);          # table1 size = 8
+    store32(b + 0x84, 0x005B0000);          # ws=0 ps=0 code[0]=0x5B=91 EOT
+    store32(b + 0xA0, 0x00000008);          # table2 size = 8
+    store32(b + 0xA4, 0x00000000);          # ws=0 ps=0 code[0]=0  RESERVED
+    store32(b + 0xC0, 0x00000008);          # table3 size = 8
+    store32(b + 0xC4, 0x007F0000);          # ws=0 ps=0 code[0]=127 OUT OF RANGE
+    store32(b + 0xE0, 0x00000002);          # table4 size = 2 -> impossible header
+
+    atom_h4_expect(1, atom_execute_table(1, 0), 0);
+    atom_h4_expect(2, atom_execute_table(2, 0), -61);
+    atom_h4_expect(3, atom_execute_table(3, 0), -62);
+    atom_h4_expect(4, atom_execute_table(4, 0), -64);
+
+    gpu_vbios_va   = s_va;
+    gpu_vbios_len  = s_len;
+    atom_cmd_table = s_cmd;
+
+    kprint("atom: H4 selftest ", 18); kprint_num(atom_h4_pass);
+    kprint(" passed, ", 9); kprint_num(atom_h4_fail); kprintln(" failed", 7);
+    if (atom_h4_fail == 0) {
+        kprintln("atom: H4 PASS every abnormal exit is distinct", 45);
+        return 1;
+    }
+    kprintln("atom: H4 FAIL an exit path is indistinguishable", 47);
     return 0;
 }
 #endif

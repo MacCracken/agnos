@@ -112,9 +112,50 @@ read. That is worth **confirming per case**, not assuming.
    impossible to reintroduce silently. Note it must allow plain literals and reject expressions.
 2. **Per-case audit** of the eight above, each ending in either an explicit init or a comment recording why
    0 is safe here.
-3. **A cyrius ask, not a cyrius change** ([[feedback_cyrius_hands_off]]): const-foldable expressions
-   (`0 - 1`, `1 << 4`, `A * B` over literals) could be folded into the data section like plain literals, at
-   which point this whole class disappears. That would need filing in **both** repos per
-   [[feedback_cross_repo_issues_both_repos]] — it is not filed yet, because the agnos-side workaround is
-   one line per variable and the language question deserves its own framing rather than being a footnote to
-   a display bug.
+3. ✅ **FILED 2026-07-23** — **A cyrius ask, not a cyrius change** ([[feedback_cyrius_hands_off]]):
+   const-foldable expressions (`0 - 1`, `1 << 4`, `A * B` over literals) could be folded into the data
+   section like plain literals, at which point this whole class disappears. Now filed in **both** repos per
+   [[feedback_cross_repo_issues_both_repos]] as
+   [`2026-07-23-cyrius-module-scope-var-expr-initializer-zero.md`](2026-07-23-cyrius-module-scope-var-expr-initializer-zero.md)
+   (cyrius mirror: `2026-07-23-cyrius-module-scope-var-expr-initializer-zero.md`), with const-folding as the
+   preferred ask and reject-or-warn as the fallback.
+
+---
+
+## ⚠ ADDENDUM 2026-07-23 — the class is WIDER and the severity is HIGHER than "low-impact, high-confusion"
+
+Hit again the same day, in modeset harness bite **H4**, and it behaved worse than a sentinel:
+
+**(a) It is not only `0 - N`. Any non-foldable expression is affected.** Measured in one build, printed at
+runtime from a function:
+
+| Declaration | Expected | Observed |
+|---|---|---|
+| `var A = 1024;` | 1024 | **1024** ✅ |
+| `var B = 512 * 2;` | 1024 | **0** ❌ |
+| `var C = -5;` | −5 | **0** ❌ |
+| `var D = 0 - 61;` | −61 | **0** ❌ |
+
+So `512 * 2` fails too — negatives are hit only because unary minus is itself an expression. The
+discriminator is **literal vs computed**, exactly as the mechanism above predicts.
+
+**(b) IT CAN MAKE A TEST PASS.** H4 added distinct interpreter return codes so a table stopping on a reserved
+opcode could be told apart from a clean EOT — written as `var ATOM_RC_RESERVED = 0 - 61;` etc. Every one was
+**0**. Therefore `ret = ATOM_RC_RESERVED` assigned 0, the reporter `if (ret != ATOM_RC_OK)` compared
+`0 != 0` and never fired, and the selftest asserted `got == ATOM_RC_RESERVED` — i.e. **0 == 0** — and
+reported **4/4 PASS**. A green test, inside the bite whose entire stated purpose was eliminating silent
+false passes.
+
+It was caught **only** because the QEMU smoke also asserted on the reporter's *printed output*
+(`STOPPED rc=61`) rather than the pass count alone. Nothing else would have caught it: it builds clean,
+`cyrius fmt`s clean, and passes `check.sh` including the call-arity gate.
+
+⇒ **Re-rate the severity.** "Low-impact today, high-confusion" was right for sentinels where 0 is a plausible
+value. It is not right for a class that can silently invert a comparison and turn a failing test green. Any
+named constant that is negative or computed should be **printed once at runtime before it is trusted**, and
+follow-up **#1 (the source gate in `check.sh`) is now the highest-value item on this list**, not the third.
+
+**Workaround used in H4:** the rc codes are written as **inline literals at every site**, with the value
+table and an explicit "do not tidy these into named `var`s" warning in the source
+(`kernel/core/atom.cyr`). An inline literal in a *statement* (`ret = -22;`) is unaffected — it is not a gvar
+initialiser — which is precisely why that file had used them for years without ever tripping this.
