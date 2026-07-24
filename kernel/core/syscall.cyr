@@ -1958,10 +1958,16 @@ fn mdo_transmit() {
     var r4 = atom_run_encoder_hdmi();
     kprint("modeset: transmit -- encoder rc ", 32); kprint_num(r4); kprintln("", 0);
 
-    # ── HDMI stream attributes + infoframes ─────────────────────────────────────────────────────────
-    # M8c builds the replayable programmer (see CHANGELOG); until then the sequence SHAPE is here and the
-    # step is honestly announced rather than silently skipped — a missing step must never look like a done one.
-    kprintln("modeset: transmit -- infoframe/stream-attr programming NOT BUILT (M8c, see CHANGELOG)", 85);
+    # ── HDMI stream attributes + infoframes (M8c: now callable) ─────────────────────────────────────
+    # ⚠ The AFMT audio clock is gpu_hdmi_program_infoframes's documented PRECONDITION (the AFMT block is
+    # inert without it and reports nothing wrong). On a boot where gpu_hdmi_audio_enable never ran — every
+    # production kernel — it is OFF, so enable it here rather than inheriting someone else's setup. Never
+    # gate on the ACK: amdgpu leaves that REG_WAIT commented out ("audio seems work normally even without").
+    var afc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_CNTL + d, afc | GPU_AFMT_AUDIO_CLOCK_EN);
+    gpu_hdmi_stage_attributes(d);
+    gpu_hdmi_program_infoframes(d, gpu_audio_dig);
+    kprintln("modeset: transmit -- stream attributes + infoframes programmed", 62);
 
     # ── BE<->FE CONNECT: re-point the back end at the front end (verified value 0x0200 in [15:8]) ────
     var be_conn = (s_be & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK)) | GPU_DIG_FE_SOURCE_CONNECT;
@@ -1974,8 +1980,15 @@ fn mdo_transmit() {
     kprintln("modeset: transmit -- ATOM #76 DIG1TransmitterControl ENABLE (LIVE PHY EDGE)", 75);
     var r76 = atom_run_transmitter_enable_hdmi();
     kprint("modeset: transmit -- transmitter rc ", 36); kprint_num(r76); kprintln("", 0);
-    # The replay exists BECAUSE #76 resets the encoder's latched packet/stream state (M8c, see CHANGELOG).
-    kprintln("modeset: transmit -- post-#76 infoframe REPLAY NOT BUILT (M8c, see CHANGELOG)", 77);
+    # THE REPLAY (M8c). amdgpu's modeset re-emits the whole stream-attribute + infoframe block AFTER the
+    # transmitter edge, and agnos has structurally never been able to — the writes were welded inside a
+    # 497-line audio-enable path. ⚠ HONEST: it is NOT established that #76 clears these registers (#76's own
+    # write set is PHY/UNIPHY only — 0x55xx/0x5Dxx/0x5Exx — disjoint from AFMT/HDMI at 0x20xx). What IS
+    # established is that the capture emits them after the edge and agnos never has. Whether the replay is
+    # REQUIRED is what this burn measures; do not let this comment harden into a claim.
+    gpu_hdmi_stage_attributes(d);
+    gpu_hdmi_program_infoframes(d, gpu_audio_dig);
+    kprintln("modeset: transmit -- post-#76 replay complete", 45);
     #else
     var r76 = 0;
     kprintln("modeset: transmit -- ATOM #76 SKIPPED (PHY untouched; build without ATOM_RUN_TRANSMITTER)", 89);

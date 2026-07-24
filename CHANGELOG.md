@@ -57,6 +57,35 @@ oracle reproducible. ⚠ **Plan correction:** #76 also touches the `0x55xx` UNIP
 outside the vetted read set the H5 red-flag rule names (`{DCCG 0xC0-0x1FF, OTG/OPTC 0x1A00-0x1BFF, DIG
 0x2xxx, PHY 0x5Dxx-0x5Exx}`) — that set is incomplete for the transmitter.
 
+### Added — M8c: the infoframe/stream-attribute block is now REPLAYABLE
+
+The structural gap the plan named: agnos could emit the HDMI stream attributes and infoframes exactly once,
+welded inside the 497-line `gpu_hdmi_audio_enable`, and could never re-emit them — so it could not match
+amdgpu's ordering, which emits the block again *after* the transmitter edge. Two functions are now extracted
+and callable: **`gpu_hdmi_stage_attributes(d)`** (HDMI_CONTROL / GC / VBI) and
+**`gpu_hdmi_program_infoframes(d, az)`** (AVI infoframe · ACR/CTS/N · audio packet control · AFMT source
+binding · IEC 60958 channel status · Audio InfoFrame). `mdo_transmit` calls both at the plan's positions —
+after ATOM #4, and again as the post-#76 replay — enabling the AFMT audio clock first, since that is the
+documented precondition and it is off on any kernel where the audio path never ran.
+
+**The extraction is behaviour-preserving, and that was proven rather than asserted.** This function is the
+centre of the mute saga, where a reordered write would silently invalidate months of falsification work, so
+the lines were moved verbatim by script and a verifier re-inlines each call back into the post-refactor body
+and diffs it against the pre-refactor original: **227 code lines, identical**. `hda-smoke` PASS,
+`modeset-tool-smoke` **19/0**.
+
+⛔ **Two functions, not one — the plan's single extraction would have reordered writes.** Stage-1 runs
+*before* the `DIG_MODE` 2→3 flip while the AVI block must run *after* the AFMT audio-clock write
+(`enc1_update_generic_info_packet` turns the clock on before programming the AFMT block). Merging them into
+one call site would have moved the packet writes across the flip. They stay two functions at their two
+original positions.
+
+⚠ **Scope correction carried into the code:** it is **not** established that ATOM #76 clears these
+registers — #76's own write set is PHY/UNIPHY only (`0x55xx`/`0x5Dxx`/`0x5Exx`), disjoint from AFMT/HDMI at
+`0x20xx`. What *is* established is that the amdgpu capture emits the block after the edge and agnos never
+has. Whether the replay is **required** is what M8d/M8e measure; the earlier "#76 resets the encoder's
+latched packet state" phrasing was an unproven mechanism claim and is not repeated in the source.
+
 ## [1.56.12] - 2026-07-24
 
 **MODESET work list B cont. — the OTG ENVELOPE (M6, ★★ iron-proven).** The first bite to disable + re-enable

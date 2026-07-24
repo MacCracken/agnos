@@ -6238,6 +6238,189 @@ fn gpu_az_write_ord(ir, dr, ordinal, val) {
     return 0;
 }
 
+# gpu_hdmi_stage_attributes — the HDMI block's stream attributes (HDMI_CONTROL / GC / VBI).
+#
+# EXTRACTED FOR M8 (the enveloped transmitter). These writes were welded inside gpu_hdmi_audio_enable, so
+# agnos could emit them exactly once, before the DIG_MODE flip, and could never RE-emit them — which is why
+# the plan records that agnos "structurally cannot replay the stream-attribute block". amdgpu's modeset
+# emits this block again after the transmitter edge; making it callable is what lets M8 match that ordering.
+#
+# ⚠ Every register here is INERT while DIG_MODE == 2 (DVI), which is what makes calling it on a live console
+# link safe. Depends only on `d` (the DIG instance byte offset).
+fn gpu_hdmi_stage_attributes(d) {
+    # --- 1. Stage the HDMI block (inert while DIG_MODE==2, so this cannot disturb the console) ---
+    var ctl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d,
+    (ctl & (0 - 1 - GPU_HDMI_CONTROL_KEEP)) | GPU_HDMI_CONTROL_SET);
+    var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, gc & (0 - 1 - GPU_HDMI_GC_AVMUTE));
+    var vbi = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL + d, vbi | GPU_HDMI_VBI_SET);
+}
+
+# gpu_hdmi_program_infoframes — the AVI infoframe, ACR/CTS/N, audio packet control, IEC 60958 channel
+# status and the Audio InfoFrame: the packet + stream state a sink needs to accept HDMI audio.
+#
+# EXTRACTED FOR M8 (the enveloped transmitter), verbatim and in order, so the emitted write sequence is
+# unchanged for the existing caller. This is the block the plan means by "replay the stream-attribute +
+# infoframe block verbatim" — previously unreachable except by re-running the whole 497-line audio-enable
+# path (which would also re-do the feed-stop, the DIG_MODE flip and the DIG_ENABLE edge).
+#
+# ⚠ PRECONDITION: the AFMT audio clock must already be ON. gpu.cyr's original site placed this immediately
+# after the AFMT_AUDIO_CLOCK_EN write for exactly that reason (enc1_update_generic_info_packet turns the
+# clock on before programming the AFMT block). A replay caller must satisfy this itself.
+#
+# ⚠ HONEST SCOPE: it is NOT established that ATOM #76 clears these registers — #76's own write set is
+# PHY/UNIPHY only (0x55xx / 0x5Dxx / 0x5Exx), disjoint from AFMT/HDMI at 0x20xx. What IS established is that
+# the amdgpu capture emits this block after the transmitter edge and agnos never has. Whether the replay is
+# REQUIRED is what M8d/M8e measure; do not let this comment harden into a claim.
+#
+# Inputs: `d` = the DIG instance byte offset, `az` = the bound Azalia endpoint index.
+fn gpu_hdmi_program_infoframes(d, az) {
+    # THE AVI INFOFRAME — generic packet slot 0. This must follow the AFMT clock write above:
+    # enc1_update_generic_info_packet opens by turning the audio clock on, under "we need turn on clock
+    # before programming AFMT block". The sequence is enc1_update_generic_info_packet followed by
+    # enc2_update_hdmi_info_packet case 0, in order. Without this the sink never sees an AVI, never treats
+    # the link as HDMI, and ignores every audio data island we send — with all our registers reading back
+    # exactly as written.
+    var vp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL + d);
+    vp = (vp & (0 - 1 - GPU_AFMT_GENERIC_INDEX_MASK)) | GPU_AFMT_GENERIC_CONFLICT_CLR;
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL + d, vp);
+    # The PAYLOAD. 1.55.14 originally sent an all-zero body with checksum 0x6F, arguing an empty AVI was "a
+    # legal minimum". The header was derived correctly (0xD0282 == amdgpu byte-for-byte) and then the body
+    # was INVENTED — a self-consistent packet describing nothing. Measured against amdgpu playing sound on
+    # this link: GENERIC_0 = 0x80885E8F, GENERIC_2 = 0x05CA, GENERIC_3 = 0x0AA1. It describes the raster.
+    #   sb[0] = 0x8F checksum · DB1 = 0x5E · DB2 = 0x88 · DB3 = 0x80
+    #   DB1 0x5E: A0=1 (active-format valid), B=3 (BOTH bars valid), S=2 — agnos sent 0x00, declaring no
+    #             bar info and no active format, then pointed at bars it never sent.
+    #   bottom bar = v_total + 1, right bar = h_total + 1 (1482 / 2721 on this 2720x1481 link) — derived
+    #             from the totals gpu_pixclk_discover already reads, NOT hardcoded to one panel.
+    # The checksum is computed here for the same reason: a copied constant would silently lie the moment the
+    # raster changes. 0x100 - (HB0 + HB1 + HB2 + sum(DB1..DB13)), which reproduces amdgpu's 0x8F exactly on
+    # this link (verified arithmetically before this was written).
+    var bar_b = gpu_v_total + 1;
+    var bar_r = gpu_h_total + 1;
+    var g2 = bar_b & 0xFFFF;
+    var g3 = bar_r & 0xFFFF;
+    var sum = 0x82 + 0x02 + 0x0D + GPU_AVI_DB1 + GPU_AVI_DB2 + GPU_AVI_DB3;
+    sum = sum + (g2 & 0xFF) + ((g2 >> 8) & 0xFF) + (g3 & 0xFF) + ((g3 >> 8) & 0xFF);
+    var cks = (0x100 - (sum & 0xFF)) & 0xFF;
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_HDR + d, GPU_AVI_HDR);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_0 + d,
+    cks | (GPU_AVI_DB1 << 8) | (GPU_AVI_DB2 << 16) | (GPU_AVI_DB3 << 24));
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_1 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_2 + d, g2);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_3 + d, g3);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_4 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_5 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_6 + d, 0);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_7 + d, 0);
+    var vp1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL1 + d,
+    vp1 | GPU_AFMT_GENERIC0_IMMEDIATE_UPDATE);
+    # GENERIC0_LINE is in CONTROL1, not CONTROL0 — dcn20 split enc1's fused write because DCN2 moved it.
+    var gl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL1 + d,
+    (gl & (0 - 1 - GPU_HDMI_GENERIC0_LINE_MASK)) | GPU_HDMI_GENERIC0_LINE_VAL);
+    var gp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d,
+    gp | GPU_HDMI_GENERIC0_SEND | GPU_HDMI_GENERIC0_CONT);
+
+    # ACR: hardware-measured CTS (SOURCE=0) + AUTO_SEND, but N is a per-Fs constant and must be written.
+    var acr = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d);
+    acr = acr & (0 - 1 - GPU_HDMI_ACR_SOURCE) & (0 - 1 - GPU_HDMI_ACR_SELECT_MASK);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d, acr | GPU_HDMI_ACR_AUTO_SEND);
+    var n48 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d,
+    (n48 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_48_VAL);
+    # ACR_SELECT is cleared above, which is hardware rate auto-select: the hardware picks the N/CTS pair from
+    # the incoming Fs. tonegen is locked to 48 kHz so the 48 pair is the live one and it is correct — but the
+    # 32 and 44.1 pairs are silence the moment anything plays at those rates. amdgpu writes all six. All three
+    # N fields share the same [19:0] mask.
+    #
+    # THE CTS REGISTERS (HDMI_ACR_CTS_48/44/32_0): the ONE real register-value delta in the whole 40-register
+    # agnos-vs-amdgpu diff (2026-07-20). agnos left them 0; the amdgpu-playing capture writes 0x3AF5C000 to all
+    # three. The old reasoning for leaving them 0 was "inert under HDMI_ACR_SOURCE=0, and our measured 241502
+    # would diverge from the known-good 241500" — but that has a hole: amdgpu programs 0x3AF5C000 (241500) WITH
+    # SOURCE=0, so (a) the divergence argument dies if we write amdgpu's LITERAL rather than our measurement,
+    # and (b) "inert per spec" was never tested on THIS silicon. The CTS/N ratio is exactly what a sink uses to
+    # regenerate its audio clock — the precise mechanism between "amp armed + receiving stream" and "decodes as
+    # clean silence" (a sink that cannot lock its audio clock outputs silence, not hash). This is the untested
+    # register in the exact failure path. Gated so it is a clean single-variable burn.
+    #ifdef HDMI_ACR_CTS
+    var cts48 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d,
+    (cts48 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
+    var cts44 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d,
+    (cts44 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
+    var cts32 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d,
+    (cts32 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
+    kprintln("gpu: hdmi acr cts programmed (241500, amdgpu-match)", 51);
+    #endif
+    var n32 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d,
+    (n32 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_32_VAL);
+    var n44 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d,
+    (n44 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_44_VAL);
+
+    # HDMI_AUDIO_PACKETS_PER_LINE ([20:16]) — tested and FALSIFIED as a cause (2026-07-16). The DCE-formula
+    # ppl=3 was burned on iron (HDMI_AUDIO_PKT_CONTROL 0x30010): still silent. The full amdgpu-while-playing
+    # capture then showed the working path runs **ppl = 0** (0x00000010 — the hardware schedules packets
+    # itself when the field is 0; the DCE-era explicit budget does not apply to DCN 2.1). Field cleared to
+    # match the known-good byte-for-byte; DELAY_EN (bit4) is the only bit the working path sets here.
+    var hap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d,
+    (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK) & (0 - 1 - 0x1F0000)) | GPU_HDMI_AUDIO_DELAY_SET);
+
+    # Source select binds this DIG's AFMT to the Azalia endpoint; channel-enable is 8 bits and zero of them
+    # is silence, so stereo must be spelled out.
+    var sc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d,
+    (sc & (0 - 1 - GPU_AFMT_AUDIO_SRC_SELECT_MASK)) | az);
+    # Clearing AUDIO_LAYOUT_OVRD (bit0) and 60958_OSF_OVRD (bit28) alongside the channel enable matches
+    # dcn10_stream_encoder.c; known-good reads 0x300, with both overrides at 0. LAYOUT_SELECT, HBR_ENABLE_OVRD
+    # and DP_AUDIO_STREAM_ID are deliberately left alone — amdgpu never writes them.
+    var pc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d,
+    (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK) & (0 - 1 - GPU_AFMT_AUDIO_LAYOUT_OVRD)
+    & (0 - 1 - GPU_AFMT_60958_OSF_OVRD)) | GPU_AFMT_CHANNEL_ENABLE_STEREO);
+
+    # IEC 60958 channel status. These MUST be populated before CS_UPDATE latches them: L/R = 0/0 is invalid
+    # channel status and a strict sink rejects the substream. 1.55.12 set the latch over untouched registers
+    # and therefore latched zeros. (AFMT_60958_2 is at 0x20A7, NOT adjacent to _0/_1 — see gpu_regs.cyr.)
+    var cs0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_0 + d,
+    (cs0 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK) & (0 - 1 - GPU_AFMT_CS_CLOCK_ACCURACY_MASK))
+    | GPU_AFMT_CS_CHANNEL_L);
+    var cs1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_1 + d,
+    (cs1 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK)) | GPU_AFMT_CS_CHANNEL_R);
+    var cs2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_2 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_2 + d,
+    (cs2 & (0 - 1 - 0xFFFFFF)) | GPU_AFMT_60958_2_CHANNELS);
+
+    # THE AUDIO INFOFRAME. This is what 1.55.12 missed and it is why the sink stayed silent through a
+    # perfect-looking display side: the encoder was sending sample packets and ACR packets with NO Audio
+    # InfoFrame, and a conformant sink mutes without one.
+    #   * HDMI_AUDIO_INFO_SEND (INFOFRAME_CONTROL0 bit4) is the TRANSMIT ENABLE — the missing write.
+    #   * HDMI_AUDIO_INFO_LINE (INFOFRAME_CONTROL1 [13:8]) is the scanline it goes out on; SEND with LINE=0
+    #     has no slot to use, so they are a pair.
+    #   * AFMT_AUDIO_INFO_UPDATE (AFMT_INFOFRAME_CONTROL0 bit7) is only the UPDATE LATCH. 1.55.12 set the
+    #     latch and left the enable clear — one register apart. The content itself is HW-generated from the
+    #     endpoint's CHANNEL_SPEAKER (set above), which is why amdgpu never writes AFMT_AUDIO_INFO0/1 at all;
+    #     1.55.12's writes there were the wrong lever entirely and are gone.
+    var il = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d,
+    (il & (0 - 1 - GPU_HDMI_AUDIO_INFO_LINE_MASK)) | GPU_HDMI_AUDIO_INFO_LINE_VAL);
+    var hif = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d, hif | GPU_HDMI_AUDIO_INFO_SEND);
+    var ifc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ifc | GPU_AFMT_AUDIO_INFO_UPDATE);
+}
+
 fn gpu_hdmi_audio_enable() {
     gpu_hdmi_audio_on = 0;
     if (gpu_hdmi_preflight() != 1) {
@@ -6283,13 +6466,8 @@ fn gpu_hdmi_audio_enable() {
     if (gpu_audio_quiet == 0) { hda_hdmi_feed_stop(); }
 
     # --- 1. Stage the HDMI block (inert while DIG_MODE==2, so this cannot disturb the console) ---
-    var ctl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_CONTROL + d,
-    (ctl & (0 - 1 - GPU_HDMI_CONTROL_KEEP)) | GPU_HDMI_CONTROL_SET);
-    var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, gc & (0 - 1 - GPU_HDMI_GC_AVMUTE));
-    var vbi = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_VBI_PACKET_CONTROL + d, vbi | GPU_HDMI_VBI_SET);
+    # M8c: extracted so M8 can re-emit the stream attributes after the transmitter edge.
+    gpu_hdmi_stage_attributes(d);
 
     # --- 2. THE COMMIT: DIG_MODE 2 -> 3, read-modify-write ---
     var be = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d);
@@ -6475,148 +6653,9 @@ fn gpu_hdmi_audio_enable() {
     # scanout) and reversible, and it is the one register on the working path agnos has never touched.
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_DB_CONTROL + d, GPU_HDMI_DB_CONTROL_VAL);
 
-    # THE AVI INFOFRAME — generic packet slot 0. This must follow the AFMT clock write above:
-    # enc1_update_generic_info_packet opens by turning the audio clock on, under "we need turn on clock
-    # before programming AFMT block". The sequence is enc1_update_generic_info_packet followed by
-    # enc2_update_hdmi_info_packet case 0, in order. Without this the sink never sees an AVI, never treats
-    # the link as HDMI, and ignores every audio data island we send — with all our registers reading back
-    # exactly as written.
-    var vp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL + d);
-    vp = (vp & (0 - 1 - GPU_AFMT_GENERIC_INDEX_MASK)) | GPU_AFMT_GENERIC_CONFLICT_CLR;
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL + d, vp);
-    # The PAYLOAD. 1.55.14 originally sent an all-zero body with checksum 0x6F, arguing an empty AVI was "a
-    # legal minimum". The header was derived correctly (0xD0282 == amdgpu byte-for-byte) and then the body
-    # was INVENTED — a self-consistent packet describing nothing. Measured against amdgpu playing sound on
-    # this link: GENERIC_0 = 0x80885E8F, GENERIC_2 = 0x05CA, GENERIC_3 = 0x0AA1. It describes the raster.
-    #   sb[0] = 0x8F checksum · DB1 = 0x5E · DB2 = 0x88 · DB3 = 0x80
-    #   DB1 0x5E: A0=1 (active-format valid), B=3 (BOTH bars valid), S=2 — agnos sent 0x00, declaring no
-    #             bar info and no active format, then pointed at bars it never sent.
-    #   bottom bar = v_total + 1, right bar = h_total + 1 (1482 / 2721 on this 2720x1481 link) — derived
-    #             from the totals gpu_pixclk_discover already reads, NOT hardcoded to one panel.
-    # The checksum is computed here for the same reason: a copied constant would silently lie the moment the
-    # raster changes. 0x100 - (HB0 + HB1 + HB2 + sum(DB1..DB13)), which reproduces amdgpu's 0x8F exactly on
-    # this link (verified arithmetically before this was written).
-    var bar_b = gpu_v_total + 1;
-    var bar_r = gpu_h_total + 1;
-    var g2 = bar_b & 0xFFFF;
-    var g3 = bar_r & 0xFFFF;
-    var sum = 0x82 + 0x02 + 0x0D + GPU_AVI_DB1 + GPU_AVI_DB2 + GPU_AVI_DB3;
-    sum = sum + (g2 & 0xFF) + ((g2 >> 8) & 0xFF) + (g3 & 0xFF) + ((g3 >> 8) & 0xFF);
-    var cks = (0x100 - (sum & 0xFF)) & 0xFF;
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_HDR + d, GPU_AVI_HDR);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_0 + d,
-    cks | (GPU_AVI_DB1 << 8) | (GPU_AVI_DB2 << 16) | (GPU_AVI_DB3 << 24));
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_1 + d, 0);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_2 + d, g2);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_3 + d, g3);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_4 + d, 0);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_5 + d, 0);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_6 + d, 0);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_GENERIC_7 + d, 0);
-    var vp1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL1 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_VBI_PACKET_CONTROL1 + d,
-    vp1 | GPU_AFMT_GENERIC0_IMMEDIATE_UPDATE);
-    # GENERIC0_LINE is in CONTROL1, not CONTROL0 — dcn20 split enc1's fused write because DCN2 moved it.
-    var gl = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL1 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL1 + d,
-    (gl & (0 - 1 - GPU_HDMI_GENERIC0_LINE_MASK)) | GPU_HDMI_GENERIC0_LINE_VAL);
-    var gp = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GENERIC_PACKET_CONTROL0 + d,
-    gp | GPU_HDMI_GENERIC0_SEND | GPU_HDMI_GENERIC0_CONT);
-
-    # ACR: hardware-measured CTS (SOURCE=0) + AUTO_SEND, but N is a per-Fs constant and must be written.
-    var acr = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d);
-    acr = acr & (0 - 1 - GPU_HDMI_ACR_SOURCE) & (0 - 1 - GPU_HDMI_ACR_SELECT_MASK);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_PACKET_CONTROL + d, acr | GPU_HDMI_ACR_AUTO_SEND);
-    var n48 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_1 + d,
-    (n48 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_48_VAL);
-    # ACR_SELECT is cleared above, which is hardware rate auto-select: the hardware picks the N/CTS pair from
-    # the incoming Fs. tonegen is locked to 48 kHz so the 48 pair is the live one and it is correct — but the
-    # 32 and 44.1 pairs are silence the moment anything plays at those rates. amdgpu writes all six. All three
-    # N fields share the same [19:0] mask.
-    #
-    # THE CTS REGISTERS (HDMI_ACR_CTS_48/44/32_0): the ONE real register-value delta in the whole 40-register
-    # agnos-vs-amdgpu diff (2026-07-20). agnos left them 0; the amdgpu-playing capture writes 0x3AF5C000 to all
-    # three. The old reasoning for leaving them 0 was "inert under HDMI_ACR_SOURCE=0, and our measured 241502
-    # would diverge from the known-good 241500" — but that has a hole: amdgpu programs 0x3AF5C000 (241500) WITH
-    # SOURCE=0, so (a) the divergence argument dies if we write amdgpu's LITERAL rather than our measurement,
-    # and (b) "inert per spec" was never tested on THIS silicon. The CTS/N ratio is exactly what a sink uses to
-    # regenerate its audio clock — the precise mechanism between "amp armed + receiving stream" and "decodes as
-    # clean silence" (a sink that cannot lock its audio clock outputs silence, not hash). This is the untested
-    # register in the exact failure path. Gated so it is a clean single-variable burn.
-    #ifdef HDMI_ACR_CTS
-    var cts48 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_48_0 + d,
-    (cts48 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
-    var cts44 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_0 + d,
-    (cts44 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
-    var cts32 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_0 + d,
-    (cts32 & 0xFFF) | GPU_HDMI_ACR_CTS_48_VAL);
-    kprintln("gpu: hdmi acr cts programmed (241500, amdgpu-match)", 51);
-    #endif
-    var n32 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_32_1 + d,
-    (n32 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_32_VAL);
-    var n44 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_ACR_44_1 + d,
-    (n44 & (0 - 1 - GPU_HDMI_ACR_N_48_MASK)) | GPU_HDMI_ACR_N_44_VAL);
-
-    # HDMI_AUDIO_PACKETS_PER_LINE ([20:16]) — tested and FALSIFIED as a cause (2026-07-16). The DCE-formula
-    # ppl=3 was burned on iron (HDMI_AUDIO_PKT_CONTROL 0x30010): still silent. The full amdgpu-while-playing
-    # capture then showed the working path runs **ppl = 0** (0x00000010 — the hardware schedules packets
-    # itself when the field is 0; the DCE-era explicit budget does not apply to DCN 2.1). Field cleared to
-    # match the known-good byte-for-byte; DELAY_EN (bit4) is the only bit the working path sets here.
-    var hap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_AUDIO_PACKET_CONTROL + d,
-    (hap & (0 - 1 - GPU_HDMI_AUDIO_DELAY_MASK) & (0 - 1 - 0x1F0000)) | GPU_HDMI_AUDIO_DELAY_SET);
-
-    # Source select binds this DIG's AFMT to the Azalia endpoint; channel-enable is 8 bits and zero of them
-    # is silence, so stereo must be spelled out.
-    var sc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_SRC_CONTROL + d,
-    (sc & (0 - 1 - GPU_AFMT_AUDIO_SRC_SELECT_MASK)) | az);
-    # Clearing AUDIO_LAYOUT_OVRD (bit0) and 60958_OSF_OVRD (bit28) alongside the channel enable matches
-    # dcn10_stream_encoder.c; known-good reads 0x300, with both overrides at 0. LAYOUT_SELECT, HBR_ENABLE_OVRD
-    # and DP_AUDIO_STREAM_ID are deliberately left alone — amdgpu never writes them.
-    var pc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL2 + d,
-    (pc2 & (0 - 1 - GPU_AFMT_CHANNEL_ENABLE_MASK) & (0 - 1 - GPU_AFMT_AUDIO_LAYOUT_OVRD)
-    & (0 - 1 - GPU_AFMT_60958_OSF_OVRD)) | GPU_AFMT_CHANNEL_ENABLE_STEREO);
-
-    # IEC 60958 channel status. These MUST be populated before CS_UPDATE latches them: L/R = 0/0 is invalid
-    # channel status and a strict sink rejects the substream. 1.55.12 set the latch over untouched registers
-    # and therefore latched zeros. (AFMT_60958_2 is at 0x20A7, NOT adjacent to _0/_1 — see gpu_regs.cyr.)
-    var cs0 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_0 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_0 + d,
-    (cs0 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK) & (0 - 1 - GPU_AFMT_CS_CLOCK_ACCURACY_MASK))
-    | GPU_AFMT_CS_CHANNEL_L);
-    var cs1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_1 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_1 + d,
-    (cs1 & (0 - 1 - GPU_AFMT_CS_CHANNEL_MASK)) | GPU_AFMT_CS_CHANNEL_R);
-    var cs2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_60958_2 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_60958_2 + d,
-    (cs2 & (0 - 1 - 0xFFFFFF)) | GPU_AFMT_60958_2_CHANNELS);
-
-    # THE AUDIO INFOFRAME. This is what 1.55.12 missed and it is why the sink stayed silent through a
-    # perfect-looking display side: the encoder was sending sample packets and ACR packets with NO Audio
-    # InfoFrame, and a conformant sink mutes without one.
-    #   * HDMI_AUDIO_INFO_SEND (INFOFRAME_CONTROL0 bit4) is the TRANSMIT ENABLE — the missing write.
-    #   * HDMI_AUDIO_INFO_LINE (INFOFRAME_CONTROL1 [13:8]) is the scanline it goes out on; SEND with LINE=0
-    #     has no slot to use, so they are a pair.
-    #   * AFMT_AUDIO_INFO_UPDATE (AFMT_INFOFRAME_CONTROL0 bit7) is only the UPDATE LATCH. 1.55.12 set the
-    #     latch and left the enable clear — one register apart. The content itself is HW-generated from the
-    #     endpoint's CHANNEL_SPEAKER (set above), which is why amdgpu never writes AFMT_AUDIO_INFO0/1 at all;
-    #     1.55.12's writes there were the wrong lever entirely and are gone.
-    var il = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL1 + d,
-    (il & (0 - 1 - GPU_HDMI_AUDIO_INFO_LINE_MASK)) | GPU_HDMI_AUDIO_INFO_LINE_VAL);
-    var hif = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_INFOFRAME_CONTROL0 + d, hif | GPU_HDMI_AUDIO_INFO_SEND);
-    var ifc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ifc | GPU_AFMT_AUDIO_INFO_UPDATE);
+    # The AVI/ACR/IEC/Audio-InfoFrame block (M8c: extracted so M8 can REPLAY it after the transmitter
+    # edge). Must stay here — after the AFMT audio-clock write above, which is its precondition.
+    gpu_hdmi_program_infoframes(d, az);
 
     # THE RAMP ENVELOPE — tested and FALSIFIED (2026-07-16, full known-good capture). The hypothesis: all four
     # AFMT_RAMP_CONTROL regs read 0 on agnos, and a zero output-attenuator would deliver a valid stream of
