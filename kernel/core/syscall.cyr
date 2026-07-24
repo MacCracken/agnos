@@ -1371,6 +1371,17 @@ fn mdo_rd1(off) {                                    # BASE_IDX 1 (GPU_BASE_DCN_
     kprint("rd1 ", 4); kprint_num(off); kprint(" ", 1); kprint_num(v); kprintln("", 0);
     return 0;
 }
+# ⚠ mdo_rd2a — read a BASE_IDX 2 register named by its ABSOLUTE dword (the form the amdgpu / GOP-DVI
+# captures print as `abs=0x5d2d`). gpu_reg32 ADDS the IP base (GPU_BASE_DCN_2 = 0x34C0), so an absolute
+# offset must have the base SUBTRACTED first or it double-folds to (base + abs) — the exact bug that made
+# the 1.56.11 M2 dump read garbage (0/0xFFFFFFFF) at 0x92B0 instead of the PHY at abs 0x5d2d. Prints the
+# ABSOLUTE offset so the output diffs directly against the abs-labelled prior-art. Use ONLY for offsets the
+# plan lists as "BASE_IDX 2 absolute" (the M2 PHY/RDPCS group); everything else is base-relative (mdo_rd2).
+fn mdo_rd2a(abs) {
+    var v = gpu_reg32(GPU_BASE_DCN_2, abs - GPU_BASE_DCN_2) & 0xFFFFFFFF;
+    kprint("rd ", 3); kprint_num(abs); kprint(" ", 1); kprint_num(v); kprintln("", 0);
+    return 0;
+}
 fn mdo_dump() {
     # Needs the GPU aperture mapped. On QEMU gpu_present == 0 -> refuse (no DCN to read).
     if (gpu_present == 0) { return MDO_E_NOGPU; }
@@ -1405,9 +1416,11 @@ fn mdo_dump() {
     mdo_rd1(0x40); mdo_rd1(0x41); mdo_rd1(0x80); mdo_rd1(0x81); mdo_rd1(0x82); mdo_rd1(0x99);
     mdo_rd1(0x9A); mdo_rd1(0x9B); mdo_rd1(0x9C); mdo_rd1(0xB6); mdo_rd1(0xAB); mdo_rd1(0xAC); mdo_rd1(0xAD);
 
+    # ⚠ M2 offsets are ABSOLUTE dwords (the plan lists them "BASE_IDX 2 absolute") — use mdo_rd2a, which
+    # subtracts the base before gpu_reg32 re-adds it. Passing them to mdo_rd2 double-folds (the 1.56.11 bug).
     kprintln("modeset: dump group M2-PHY/RDPCS", 32);
-    mdo_rd2(0x5D2D); mdo_rd2(0x5D2E); mdo_rd2(0x5D2F); mdo_rd2(0x5D30); mdo_rd2(0x5DF0);
-    mdo_rd2(0x5E00); mdo_rd2(0x5E06); mdo_rd2(0x5EC8); mdo_rd2(0x5ED8); mdo_rd2(0x5EDE);
+    mdo_rd2a(0x5D2D); mdo_rd2a(0x5D2E); mdo_rd2a(0x5D2F); mdo_rd2a(0x5D30); mdo_rd2a(0x5DF0);
+    mdo_rd2a(0x5E00); mdo_rd2a(0x5E06); mdo_rd2a(0x5EC8); mdo_rd2a(0x5ED8); mdo_rd2a(0x5EDE);
 
     kprintln("modeset: dump group M3-scaler", 29);
     mdo_rd2(0x0CEC); mdo_rd2(0x0CF1); mdo_rd2(0x0D03); mdo_rd2(0x016B);

@@ -23,6 +23,25 @@ as the H5 snapshot seed. `/bin/modeset --dump` triggers it (argv-routed); captur
 The write bites (M4·M5·M6 the OTG envelope, M8·M9 transmitter+audio) are calibrated off M1's actual iron
 reads (M4/M6 write *back* M1's values), so they follow this read burn.
 
+**★ BURNED 2026-07-24 — M1+M3 valid, H7 iron-attested.** On archaemenid the dump read 81 registers with no
+hang: `H_TOTAL=2719`, `V_TOTAL=1480`, `H_SYNC_A=0x00200000`, `V_SYNC_A=0x00050000` — the H7 transform is
+iron-attested and **M4·M5·M6 are unblocked**. M3 scaler read for the first time (`SCL_MODE=1`, upscaling,
+confirming the P4 model). A real GOP-vs-amdgpu delta surfaced: `V_TOTAL_MIN/MAX=0` (the GOP leaves the DRR
+clamps unprogrammed; amdgpu writes 1480) — noted for M5 (its MIN/MAX writes are inert until the SEL bits
+are set).
+
+### Fixed — the M1 dump's M2 (PHY/RDPCS) offsets double-folded the IP base
+
+Caught by adversarial analysis of the iron dump, not by the smoke (QEMU has no DCN to expose it). `gpu_reg32`
+reads `(base + off)`; the M1/M3 offsets are base-**relative** (correct), but the M2 PHY offsets
+(`0x5D2D`…`0x5EDE`) are the plan's **absolute** BASE_IDX-2 dwords, so passing them to `mdo_rd2` double-folded
+to `(0x34C0 + 0x5D2D)` and read garbage (`0`/`0xFFFFFFFF`) instead of the PHY. The apparent "PHY divergence
+vs the 07-20 byte-identical capture" was a phantom — two different registers compared. New `mdo_rd2a(abs)`
+subtracts the base first (and prints the absolute offset so it diffs directly against the prior-art). The
+07-20 falsification stands; the transmitter/A4 question is not re-opened; MD-2 phyid=0 continues to rest on
+the VBIOS object-info derivation until a re-read (which rides a future flash — M4/M5/M6 don't need the PHY).
+Decoder `agnosticos/scripts/m1-decode.py` corrected in lockstep (M2 labels + the DRR-clamp anchors).
+
 ### Fixed — `#93` caps `v_active` was always 0
 
 `gpu_pixclk_discover` computed the link active height but only stored `gpu_h_active`, dropping the height. A
