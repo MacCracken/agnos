@@ -1323,7 +1323,12 @@ var MDO_OP_DUMP      = 0x02;        # M1/M2/M3 read-only DCN pipe dump -> progre
 var MDO_OP_LOCK      = 0x03;        # M4 OTG-lock proof — take lock, write V_TOTAL back to itself, release
 var MDO_OP_VTOTAL    = 0x04;        # M5 first real modeset — V_TOTAL 1481->1501->1481, oracled off I2 refresh
 var MDO_OP_RECOMMIT  = 0x05;        # M6 same-mode OTG envelope — OTG_MASTER_EN 0 -> reprogram -> 1, I1 stop/resume
-var MDO_OP_SUPPORTED = 0x3F;        # bit N set <=> op N implemented: 0 NOP,1 CAPS,2 DUMP,3 LOCK,4 VTOTAL,5 RECOMMIT
+var MDO_OP_TRANSMIT  = 0x06;        # M8 transmitter — ATOM #4 (+ #76, build-gated) INSIDE M6's envelope
+# bit N set <=> op N implemented: 0 NOP,1 CAPS,2 DUMP,3 LOCK,4 VTOTAL,5 RECOMMIT,6 TRANSMIT.
+# ⚠ TRANSMIT is advertised UNCONDITIONALLY even though its body needs HDMI_ATOM: the op really is
+# implemented, and a build without the flag answers with the specific MDO_E_NOATOM rather than a generic
+# "unknown op" — which is the difference between "this kernel cannot drive the PHY" and "this ABI is old".
+var MDO_OP_SUPPORTED = 0x7F;
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
 var MDO_E_OUTBUF     = 3;           # op    — CAPS out_uva/out_len invalid
@@ -1341,6 +1346,9 @@ var MDO_E_MODESET    = 14;          # op    — M5: refresh moved but not to the
 var MDO_E_UNMEAS     = 15;          # op    — M5: refresh unmeasurable (pipe not scanning cleanly enough to count)
 var MDO_E_NOSTOP     = 16;          # op    — M6: OTG_MASTER_EN=0 did not stop the frame counter — the disable never took
 var MDO_E_NORESUME   = 17;          # op    — M6: OTG_MASTER_EN=1 did not resume the frame counter — the pipe is DARK (recover via H2)
+var MDO_E_NOATOM     = 18;          # op    — M8: this kernel was not built with HDMI_ATOM, so no ATOM table can run
+var MDO_E_ATOM       = 19;          # op    — M8: an ATOM step failed (vbios acquire/parse/init, or a table returned nonzero)
+var MDO_E_BEFE       = 20;          # op    — M8: the BE<->FE routing bracket did not read back as written
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -1440,7 +1448,29 @@ fn mdo_dump() {
     kprintln("modeset: dump group M3-scaler", 29);
     mdo_rd2(0x0CEC); mdo_rd2(0x0CF1); mdo_rd2(0x0D03); mdo_rd2(0x016B);
 
-    kprintln("modeset: dump end -- 81 registers (M1 67 + M2 10 + M3 4)", 56);
+    # ── M8b: the EXACT read-set ATOM #76 (DIG1TransmitterControl) touches ────────────────────────────
+    # Provenance: `atom-interp.py --command transmitter --action enable --phyid 0` on the real VBIOS, which
+    # reports `REG reads=21 REG writes=17 delays=5` over these 16 distinct indices. So these are NOT a range
+    # scan — they are the precise offsets the firmware itself reads, which is the strongest possible warrant
+    # for reading them (if a read here hung, #76 could never run at all).
+    #
+    # WHY THIS GROUP EXISTS: H5's snapshot-seeded DRY replays REAL captured values into atom_reg_read so the
+    # interpreter takes the branches iron would take. With no seed the reads return 0 and the DRY proves only
+    # that the decoder walks *a* path — not the path #76 will actually take. agnos has never validly read
+    # this domain: M1's M2 group double-folded the IP base and read garbage at 0x92xx, so the PHY has NEVER
+    # been seen from agnos. Capturing it here is what makes M8b's DRY meaningful BEFORE M8e runs #76 live.
+    #
+    # ⚠ Reads only, printed progressively (R1) — a hang localises to the last line and IS the finding. The
+    # 0x55xx block (UNIPHY power/link) is outside the plan's stated vetted set {DCCG 0xC0-0x1FF, OTG/OPTC
+    # 0x1A00-0x1BFF, DIG 0x2xxx, PHY 0x5Dxx-0x5Exx}; that set is INCOMPLETE for #76, which is itself a
+    # finding — see the M8 tracker. Discovering it with a read-only dump is strictly safer than discovering
+    # it mid-#76 with the pipe disabled.
+    kprintln("modeset: dump group M8-76readset", 32);
+    mdo_rd2a(0x5535); mdo_rd2a(0x556F); mdo_rd2a(0x5570); mdo_rd2a(0x55A1);
+    mdo_rd2a(0x5DE9); mdo_rd2a(0x5DF7); mdo_rd2a(0x5DFC); mdo_rd2a(0x5E03);
+    mdo_rd2a(0x5E0F); mdo_rd2a(0x5E10); mdo_rd2a(0x5E11); mdo_rd2a(0x5E12);
+
+    kprintln("modeset: dump end -- 93 registers (M1 67 + M2 10 + M3 4 + M8 12)", 64);
     return 0;
 }
 
@@ -1822,6 +1852,235 @@ fn mdo_recommit() {
     return 0;
 }
 
+# ── M8 the TRANSMITTER: ATOM #4 (+ #76) INSIDE M6's envelope (MODESET_OP_TRANSMIT) ─────────────────────
+# The culmination of the display arc: the DVI->HDMI encoder + transmitter edge run INSIDE the OTG envelope
+# M6 proved on iron, which is the one ordering agnos has structurally never produced. amdgpu runs #76 only
+# inside a full modeset; agnos historically ran it bare, and it blanked this panel TWICE. M6's envelope is
+# what makes it survivable — NOT safe.
+#
+# ⛔⛔ WHAT THIS IS NOT: this is NOT "the HDMI-audio fix". That framing is FALSIFIED (gpu.md:292) — a cold
+# output-enable + AVMUTE edge already shipped and burned SILENT while the panel visibly blanked. M8's
+# deliverable is the ENVELOPED REAL-TRANSMITTER MODESET itself, and its oracles are DISPLAY SURVIVAL and an
+# unchanged refresh — NEVER audio. Audio is M9's test (audio-enable sequenced LAST, after a genuine
+# transmitter edge), and it only becomes meaningful once this exists.
+#
+# The sequence the amdgpu capture dictates:
+#   BE<->FE DISCONNECT (DIG_BE_CNTL FE_SOURCE_SELECT -> 0)   [the encoder must not be re-pointed while fed]
+#   -> ATOM #4  DIGxEncoderControl   (display-safe: DIG front end, regs 0x56xx, disjoint from the PHY)
+#   -> HDMI stream attributes + infoframes
+#   -> BE<->FE CONNECT (-> 0x02)
+#   -> ATOM #76 DIG1TransmitterControl(ENABLE)  [DESTRUCTIVE: power-cycles the PHY; build-gated]
+#   -> REPLAY the stream-attribute + infoframe block verbatim  [#76 resets the encoder's latched state]
+#   -> OTG re-commit (M6's envelope close)
+#
+# ⛔ THREE BUILD FLAGS GOVERN WHAT ACTUALLY EXECUTES, and that is the safety model:
+#   (none)                — this op refuses with MDO_E_NOATOM. A production kernel CANNOT drive the PHY.
+#   HDMI_ATOM             — the envelope + BE/FE bracket + ATOM #4 run. #76 is SKIPPED. Cannot blank (M8d).
+#   + ATOM_RUN_TRANSMITTER — #76 runs live. THE dangerous rung (M8e). H8 must prove, per flash, that the
+#                            marker is PRESENT in this build and ABSENT in a bare one — because the last
+#                            accidental blanking came from ATOM_DRY being a flag build.sh never emitted, so
+#                            "dry" and "live" compiled byte-identical.
+fn mdo_transmit() {
+    if (gpu_present == 0)      { return MDO_E_NOGPU; }
+    if (gpu_display_ok != 1)   { return MDO_E_NOGPU; }
+    if (gpu_display_pipe != 0) { kprintln("modeset: transmit refused -- live pipe is not 0", 47); return MDO_E_NOGPU; }
+    if (gpu_pixclk_100hz == 0) { kprintln("modeset: transmit refused -- pixclk unmeasured (0)", 50); return MDO_E_UNMEAS; }
+    if (gpu_audio_dig < 0)     { kprintln("modeset: transmit refused -- no live DIG encoder found", 54); return MDO_E_NOGPU; }
+#ifdef HDMI_ATOM
+    var pipe = 0;
+    var d    = gpu_audio_dig * GPU_DCN_DIG_STRIDE;      # the live stream encoder (DIG1 on this iron)
+
+    # ── ATOM prelude, OUTSIDE the envelope ──────────────────────────────────────────────────────────
+    # Acquiring + parsing the VBIOS is slow and allocates 2 MB; doing it inside the disabled window would
+    # stretch the blank and let a failure strand a dark pipe. All three are idempotent, so a re-run is free.
+    # A failure here costs NOTHING: the latch is not armed yet and no register has been touched.
+    if (gpu_vbios_acquire() == 0) { kprintln("modeset: transmit refused -- vbios acquire failed", 49); return MDO_E_ATOM; }
+    if (atom_parse() == 0)        { kprintln("modeset: transmit refused -- atom parse failed", 46); return MDO_E_ATOM; }
+    if (atom_init_mem() == 0)     { kprintln("modeset: transmit refused -- atom init failed", 45); return MDO_E_ATOM; }
+
+    if (modeset_arm(8) != 1) { kprintln("modeset: transmit refused -- latch would not arm", 48); return MDO_E_ARM; }
+    # ⛔ THE GATE, carried HERE. atom_reg_write (atom.cyr:267) writes MMIO directly and never goes through
+    # gpu_dcn_write_committed / gpu_otg_lock, so the GATE embedded in those primitives does NOT cover the
+    # ATOM path. M6 carries it for the same reason (its writes are direct too). Belt-and-suspenders against
+    # a future edit that moves the arm.
+    if (modeset_armed != 1297040453) { kprintln("modeset: transmit refused -- not armed", 38); return MDO_E_ARM; }
+
+    # ── H1: pre-state, spilled BEFORE any write. Doubles as the watchdog's re-run program. ───────────
+    var s_ctrl  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL) & 0xFFFFFFFF;
+    var s_htot  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_TOTAL) & 0xFFFFFFFF;
+    var s_hbl   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_BLANK_START_END) & 0xFFFFFFFF;
+    var s_hsa   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A) & 0xFFFFFFFF;
+    var s_hsac  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A_CNTL) & 0xFFFFFFFF;
+    var s_htc   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_TIMING_CNTL) & 0xFFFFFFFF;
+    var s_vtot  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL) & 0xFFFFFFFF;
+    var s_vmin  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MIN) & 0xFFFFFFFF;
+    var s_vmax  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MAX) & 0xFFFFFFFF;
+    var s_vctl  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_CONTROL) & 0xFFFFFFFF;
+    var s_vbl   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_BLANK_START_END) & 0xFFFFFFFF;
+    var s_vsa   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A) & 0xFFFFFFFF;
+    var s_vsac  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A_CNTL) & 0xFFFFFFFF;
+    var s_intl  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_INTERLACE_CONTROL) & 0xFFFFFFFF;
+    var s_vst   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_VSTARTUP_PARAM) & 0xFFFFFFFF;
+    var s_vup   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_VUPDATE_PARAM) & 0xFFFFFFFF;
+    var s_vrd   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_VREADY_PARAM) & 0xFFFFFFFF;
+    var s_vtg   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_VTG0_CONTROL) & 0xFFFFFFFF;
+    var s_occ   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_CLOCK_CONTROL) & 0xFFFFFFFF;
+    var s_oicc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC_INPUT_CLOCK_CONTROL) & 0xFFFFFFFF;
+    var s_be    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
+    var vt_field = s_vtot & GPU_OTG_TOTAL_MASK;
+
+    kprint("modeset: transmit pre-state dig ", 32); kprint_num(gpu_audio_dig);
+    kprint(" be_cntl ", 9); kprint_num(s_be); kprint(" v_total ", 9); kprint_num(vt_field + 1); kprintln("", 0);
+
+    # Same refuse-gates as M5/M6: only the arc's calibrated GOP mode, DRR off. Nothing has been touched yet.
+    if (vt_field != 1480) { kprintln("modeset: transmit refused -- V_TOTAL field is not the calibrated 1480", 69); return MDO_E_NOTMODE; }
+    if (s_vctl != 0) { kprintln("modeset: transmit refused -- V_TOTAL_CONTROL nonzero (DRR on) -- untested", 73); return MDO_E_DRR; }
+
+    var unf0 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    var fc0  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
+
+    # ── ENVELOPE OPEN: OTG_MASTER_EN = 0 (M6's proven disable) ──────────────────────────────────────
+    kprintln("modeset: transmit -- OTG_MASTER_EN 0 (envelope open; panel blanks)", 66);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl & (0 - 1 - GPU_OTG_MASTER_EN));
+    gpu_mfence();
+    var stopped = mdo_wait_frame_stop(pipe);
+    var fc_dis  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
+    kprint("modeset: transmit -- frame count ", 33); kprint_num(fc0); kprint(" -> ", 4); kprint_num(fc_dis);
+    kprint(" stopped ", 9); kprint_num(stopped); kprintln("", 0);
+
+    # ── BE<->FE DISCONNECT: clear FE_SOURCE_SELECT so no front end feeds the encoder while it is set up ──
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, s_be & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK));
+    gpu_mfence();
+
+    # ── ATOM #4 DIGxEncoderControl — puts the DIG in true HDMI mode with data islands. Display-SAFE:
+    # it drives the digital front end (0x56xx), disjoint from the PHY (0x5Dxx), and is iron-exonerated.
+    kprintln("modeset: transmit -- ATOM #4 DIGxEncoderControl (HDMI setup)", 60);
+    var r4 = atom_run_encoder_hdmi();
+    kprint("modeset: transmit -- encoder rc ", 32); kprint_num(r4); kprintln("", 0);
+
+    # ── HDMI stream attributes + infoframes ─────────────────────────────────────────────────────────
+    # M8c builds the replayable programmer (see CHANGELOG); until then the sequence SHAPE is here and the
+    # step is honestly announced rather than silently skipped — a missing step must never look like a done one.
+    kprintln("modeset: transmit -- infoframe/stream-attr programming NOT BUILT (M8c, see CHANGELOG)", 85);
+
+    # ── BE<->FE CONNECT: re-point the back end at the front end (verified value 0x0200 in [15:8]) ────
+    var be_conn = (s_be & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK)) | GPU_DIG_FE_SOURCE_CONNECT;
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, be_conn);
+    gpu_mfence();
+    var be_rb = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
+
+    # ── ATOM #76 DIG1TransmitterControl(ENABLE) — THE PHY EDGE. Build-gated; see the flag table above. ──
+#ifdef ATOM_RUN_TRANSMITTER
+    kprintln("modeset: transmit -- ATOM #76 DIG1TransmitterControl ENABLE (LIVE PHY EDGE)", 75);
+    var r76 = atom_run_transmitter_enable_hdmi();
+    kprint("modeset: transmit -- transmitter rc ", 36); kprint_num(r76); kprintln("", 0);
+    # The replay exists BECAUSE #76 resets the encoder's latched packet/stream state (M8c, see CHANGELOG).
+    kprintln("modeset: transmit -- post-#76 infoframe REPLAY NOT BUILT (M8c, see CHANGELOG)", 77);
+#else
+    var r76 = 0;
+    kprintln("modeset: transmit -- ATOM #76 SKIPPED (PHY untouched; build without ATOM_RUN_TRANSMITTER)", 89);
+#endif
+
+    # ── ENVELOPE CLOSE: reprogram the timing group same-mode, then OTG_MASTER_EN = 1 ────────────────
+    # ⛔ Write BACK the saved clock-controls; NEVER force amdgpu's 0x3. The GOP runs 0x10101 / 0x6 and the
+    # M6 iron burn showed forcing 0x3 would have been the one non-same-mode write in the envelope.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_TOTAL, s_htot);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_BLANK_START_END, s_hbl);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A, s_hsa);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A_CNTL, s_hsac);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_TIMING_CNTL, s_htc);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL, s_vtot);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MIN, s_vmin);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MAX, s_vmax);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_BLANK_START_END, s_vbl);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A, s_vsa);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A_CNTL, s_vsac);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_INTERLACE_CONTROL, s_intl);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_VSTARTUP_PARAM, s_vst);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_VUPDATE_PARAM, s_vup);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_VREADY_PARAM, s_vrd);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_VTG0_CONTROL, s_vtg);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CLOCK_CONTROL, s_occ);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OPTC_INPUT_CLOCK_CONTROL, s_oicc);
+    gpu_mfence();
+    kprintln("modeset: transmit -- OTG_MASTER_EN 1 (envelope close)", 53);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl);
+    gpu_mfence();
+
+    var resumed = gpu_display_wait_vblank(pipe);
+    gpu_dcn_hold_ms(120);
+    var fc1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
+    if (resumed == 0) { if (fc1 != fc_dis) { resumed = 1; } }   # M6's D2 re-confirm across the settle
+
+    # ── THE SELF-RECOVERING WATCHDOG (M8's escalation; M6 only reported a dark pipe) ─────────────────
+    # ⛔ Every hold on this path is gpu_dcn_hold_ms (WALL-CLOCK), NEVER gpu_dcn_hold — the latter aborts the
+    # whole hold on one bounded-vblank timeout and silently collapses to ~50 ms on a STOPPED pipe, which is
+    # precisely the state this code runs in. Wiring recovery to it would destroy the window it needs.
+    if (resumed == 0) {
+        kprintln("modeset: WATCHDOG -- pipe dark after the edge; re-running the inherited-mode program", 84);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, s_be);        # restore the inherited routing
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl & (0 - 1 - GPU_OTG_MASTER_EN));
+        gpu_mfence();
+        gpu_dcn_hold_ms(60);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_TOTAL, s_htot);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL, s_vtot);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CLOCK_CONTROL, s_occ);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OPTC_INPUT_CLOCK_CONTROL, s_oicc);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl);
+        gpu_mfence();
+        var back = gpu_display_wait_vblank(pipe);
+        gpu_dcn_hold_ms(120);
+        var fc2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
+        if (back == 0) { if (fc2 != fc1) { back = 1; } }
+        if (back != 0) {
+            kprintln("modeset: WATCHDOG -- re-run RELIT the pipe (transmitter edge rejected by the sink?)", 83);
+            return MDO_E_NORESUME;
+        }
+        kprintln("modeset: WATCHDOG -- re-run FAILED, pipe still dark", 51);
+#ifdef ATOM_RUN_TRANSMITTER
+        # LAST RUNG, and it is only reachable in the #76-live build. Safe ONLY because H2's latch was
+        # flushed + readback-verified to stable media BEFORE the first risky write: the next boot's
+        # modeset_latch_check finds state 'A', SKIPS the modeset and comes up normal, so this cannot loop.
+        kprintln("modeset: WATCHDOG -- power_reset (H2 latch makes the reboot clean and self-disabling)", 85);
+        power_reset();
+#endif
+        return MDO_E_NORESUME;
+    }
+
+    var refr = gpu_refresh_measure(pipe);
+    var unf1 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    var be1  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
+    var pred = gpu_pixclk_100hz * 100000 / (((s_htot & GPU_OTG_TOTAL_MASK) + 1) * (vt_field + 1));
+    kprint("modeset: transmit -- resumed ", 29); kprint_num(resumed);
+    kprint(" refresh ", 9); kprint_num(refr); kprint(" mHz predicted ", 15); kprint_num(pred); kprintln(" mHz", 4);
+    kprint("modeset: transmit -- be_cntl ", 29); kprint_num(s_be); kprint(" -> ", 4); kprint_num(be1);
+    kprint(" underflow ", 11); kprint_num(unf0); kprint(" -> ", 4); kprint_num(unf1); kprintln("", 0);
+
+    # ── VERDICT ─────────────────────────────────────────────────────────────────────────────────────
+    if (stopped == 0) { kprintln("modeset: TRANSMIT FAILED -- OTG_MASTER_EN=0 did not stop the pipe", 65); return MDO_E_NOSTOP; }
+    if (r4 != 0) { kprintln("modeset: TRANSMIT FAILED -- ATOM #4 encoder returned an error", 61); return MDO_E_ATOM; }
+    if (r76 != 0) { kprintln("modeset: TRANSMIT FAILED -- ATOM #76 transmitter returned an error", 66); return MDO_E_ATOM; }
+    if ((be_rb & GPU_DIG_FE_SOURCE_SEL_MASK) != GPU_DIG_FE_SOURCE_CONNECT) {
+        kprintln("modeset: TRANSMIT FAILED -- BE<->FE reconnect did not read back", 63); return MDO_E_BEFE;
+    }
+    if (refr == 0) { kprintln("modeset: TRANSMIT unmeasurable -- pipe resumed but will not count", 65); return MDO_E_UNMEAS; }
+    if (unf0 == 0) {
+        if (unf1 != 0) { kprintln("modeset: TRANSMIT UNDERFLOW -- OPTC bit10 newly set by the edge", 63); return MDO_E_UNDERFLOW; }
+    }
+    # ⚠ Same blindness as M6: on this iron bit10 is pre-set at boot, so the delta above cannot fire and the
+    # frame counter free-runs off the PLL. The PICTURE oracle is the operator's eyes, never this verdict.
+    if (unf0 != 0) { kprintln("modeset: NOTE OPTC bit10 pre-set at boot -- CONFIRM THE PICTURE BY EYE (this instrument is blind here)", 102); }
+    var dr = refr - pred;
+    if (dr < 0) { dr = 0 - dr; }
+    if (dr > 30) { kprintln("modeset: TRANSMIT off-rate -- refresh did not return to the inherited value", 75); return MDO_E_MODESET; }
+    kprintln("modeset: TRANSMIT OK -- enveloped encoder edge survived, rate restored -- EYE-CHECK the picture", 95);
+    return 0;
+#else
+    kprintln("modeset: transmit refused -- kernel not built with HDMI_ATOM (no ATOM table can run)", 84);
+    return MDO_E_NOATOM;
+#endif
+}
+
 # mdo_validate(rec) -> 0 or an MDO_E_* reason. PURE READS on the KERNEL-RESIDENT copy. Every dword an op does
 # not define MUST be zero — a non-zero reserved field is REJECTED rather than ignored, which is what keeps
 # today's unused dwords safe to define in a later kernel without an ABI break.
@@ -1874,6 +2133,14 @@ fn mdo_validate(rec) {
         if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
     }
+    if (op == MDO_OP_TRANSMIT) {
+        # M8 derives everything in-kernel (live DIG, saved timing, ATOM params) — no operands. What runs is
+        # governed by BUILD FLAGS, never by the ABI: a ring-3 caller can NEVER ask for the live PHY edge.
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
     if (op == MDO_OP_CAPS) {
         var out_len = load64(rec + 16);
         if (out_len < 32) { return MDO_E_OUTBUF; }
@@ -1890,6 +2157,7 @@ fn mdo_execute(rec) {
     if (op == MDO_OP_LOCK) { return mdo_lock(); }
     if (op == MDO_OP_VTOTAL) { return mdo_vtotal(); }
     if (op == MDO_OP_RECOMMIT) { return mdo_recommit(); }
+    if (op == MDO_OP_TRANSMIT) { return mdo_transmit(); }
     return MDO_E_BADOP;                              # unreachable after validate — belt-and-suspenders
 }
 

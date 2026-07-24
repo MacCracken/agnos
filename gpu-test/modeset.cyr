@@ -257,6 +257,68 @@ fn modeset_recommit(): i64 {
     return 95;
 }
 
+# M8 — the TRANSMITTER (#93 op 0x06). The DVI->HDMI encoder (+ PHY) edge run INSIDE M6's iron-proven OTG
+# envelope: BE<->FE disconnect -> ATOM #4 DIGxEncoderControl -> infoframes -> BE<->FE connect -> ATOM #76
+# DIG1TransmitterControl(ENABLE) -> replay -> OTG re-commit, all watchdog-guarded.
+#
+# ⛔ WHAT ACTUALLY RUNS IS A BUILD PROPERTY, NOT AN ARGUMENT — a ring-3 caller can never ask for the live PHY
+# edge. A production kernel answers 94 (no HDMI_ATOM). An HDMI_ATOM build runs the envelope + #4 and SKIPS
+# #76 (cannot blank). Only a kernel ALSO built with ATOM_RUN_TRANSMITTER fires the real transmitter.
+#
+# ⛔ THIS IS NOT THE AUDIO FIX — that framing is falsified. The oracles here are DISPLAY SURVIVAL and an
+# unchanged refresh; audio is M9's separate test. EYE-CHECK the panel: the kernel instruments free-run off
+# the OTG PLL and cannot see a black screen.
+#   95 = envelope survived the edge   94 = refused (no HDMI_ATOM / not the calibrated mode / DRR on)
+#   96 = no GPU here (QEMU)           93 = an ATOM step failed        91 = pipe dark (watchdog fired)
+#   89 = disable did not stop         92 = off-rate   90 = OPTC underflow   88 = BE<->FE bracket failed
+#   97 = unmeasurable                 98 = latch would not arm
+fn modeset_transmitter(): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }
+    store32(&rec + 0, 6);                                    # op = MDO_OP_TRANSMIT (0x06)
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        var reason = code & 0xFF;
+        m_puts("modeset: #93 transmit error idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(reason); m_nl();
+        if (reason == 1) { m_puts("modeset: no GPU / live pipe != 0 / no live DIG -- QEMU has no DCN"); m_nl(); return 96; }
+        if (reason == 4) {
+            m_puts("modeset: latch would not arm -- blocked (prior modeset did not disarm) or read-only fs"); m_nl();
+            m_puts("modeset: recover with:  rm /.modeset-armed"); m_nl();
+            return 98;
+        }
+        if (reason == 18) {
+            m_puts("modeset: refused -- this kernel was NOT built with HDMI_ATOM, so no ATOM table can run"); m_nl();
+            m_puts("modeset: (that is the safety model: a production kernel cannot drive the PHY)"); m_nl();
+            return 94;
+        }
+        if (reason == 19) { m_puts("modeset: an ATOM step FAILED (vbios/parse/init or a table returned nonzero) -- see klug"); m_nl(); return 93; }
+        if (reason == 20) { m_puts("modeset: BE<->FE reconnect did not read back -- routing not restored (see klug)"); m_nl(); return 88; }
+        if (reason == 8) { m_puts("modeset: refused -- V_TOTAL is not the calibrated 1480 (pipe not the known mode)"); m_nl(); return 94; }
+        if (reason == 9) { m_puts("modeset: refused -- V_TOTAL_CONTROL nonzero (DRR/VRR on) -- untested path"); m_nl(); return 94; }
+        if (reason == 16) { m_puts("modeset: OTG_MASTER_EN=0 did NOT stop the pipe -- envelope is a no-op (see klug)"); m_nl(); return 89; }
+        if (reason == 17) {
+            m_puts("modeset: pipe DARK after the edge -- the watchdog ran (see klug for whether it relit)"); m_nl();
+            m_puts("modeset: recover with:  rm /.modeset-armed  then power-cycle (H2)"); m_nl();
+            return 91;
+        }
+        if (reason == 7) { m_puts("modeset: OPTC UNDERFLOW -- the edge corrupted scanout (see klug)"); m_nl(); return 90; }
+        if (reason == 14) { m_puts("modeset: off-rate -- refresh did not return to the inherited value (see klug)"); m_nl(); return 92; }
+        if (reason == 15) { m_puts("modeset: unmeasurable -- pipe resumed but will not count (see klug)"); m_nl(); return 97; }
+        return 97;
+    }
+    if (r != 0) {
+        m_puts("modeset: #93 transmit returned unexpected "); m_num(r); m_nl();
+        return 99;
+    }
+    m_puts("modeset: TRANSMIT OK -- the enveloped encoder edge survived, rate restored"); m_nl();
+    m_puts("modeset: ⚠ EYE-CHECK the panel -- a green OK with a BLACK screen = the underflow-dark case (power-cycle, H2)"); m_nl();
+    m_puts("modeset: capture:  run /bin/klug   then disarm:  rm /.modeset-armed"); m_nl();
+    return 95;
+}
+
 # `--dump` = the M1/M2/M3 read-only pipe dump; `--lock` = the M4 OTG-lock proof (WRITES under the latch);
 # `--caps` (or bare) = the caps probe. argc/argv come from the kernel's parked init stack; if that ever
 # reads 0 (the argv-init trap) the tool falls back to caps, so a bare `run /bin/modeset` always works.
@@ -268,6 +330,7 @@ fn modeset_main(): i64 {
         if (streq(a1, "--lock") == 1) { return modeset_lock(); }
         if (streq(a1, "--vtotal") == 1) { return modeset_vtotal(); }
         if (streq(a1, "--recommit") == 1) { return modeset_recommit(); }
+        if (streq(a1, "--transmitter") == 1) { return modeset_transmitter(); }
         if (streq(a1, "--caps") == 1) { return modeset_caps(); }
     }
     return modeset_caps();

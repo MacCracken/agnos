@@ -319,6 +319,16 @@ var GPU_DIG_SYMCLK_FE_ON      = 0x1000000; # DIG_FE_CNTL bit24
 var GPU_DIG_STEREOSYNC_GATE_EN = 0x100;    # DIG_FE_CNTL bit8
 var GPU_DIG_ENABLE            = 0x1;    # DIG_BE_EN_CNTL bit0
 var GPU_DIG_MODE_HDMI         = 0x3;    # DIG_BE_CNTL DIG_MODE == 3 => HDMI (authoritative value)
+# --- M8: the BE<->FE routing field of DIG_BE_CNTL (FE_SOURCE_SELECT, bits [15:8]) ---
+# ⛔ VERIFIED FROM TWO INDEPENDENT IRON CAPTURES, never derived (the P4-pitch lesson):
+#   GOP-DVI boot state  DIG1_DIG_BE_CNTL = 0x10020200  (gpu.md:211)
+#   amdgpu-HDMI state   DIG1_DIG_BE_CNTL = 0x10030200  (gpu.md:296, the burn-8-vs-10 byte comparison)
+# The two differ ONLY in DIG_MODE[18:16] (2=DVI -> 3=HDMI); both carry 0x02 in [15:8], so the connected
+# FE-source value for the live DIG1 is 0x0200 in place. amdgpu's modeset DISCONNECTS the back end from the
+# front end (field -> 0) before reprogramming the encoder and RECONNECTS after, which is the bracket M8 runs
+# around ATOM #4/#76 — the encoder must not be re-pointed while a front end is feeding it.
+var GPU_DIG_FE_SOURCE_SEL_MASK = 0xFF00;  # DIG_BE_CNTL FE_SOURCE_SELECT [15:8]
+var GPU_DIG_FE_SOURCE_CONNECT  = 0x200;   # the connected value, ALREADY SHIFTED into [15:8] (0x02 << 8)
 var GPU_AFMT_AUDIO_ENABLE     = 0x10;   # AFMT_STATUS bit4
 # --- P3b-ii pre-flight: the HDMI block on the live DIG (BASE_IDX 2, stride 0x100 like the rest of the DIG) ---
 # THE SAFETY MODEL, in one line: **every HDMI_* register below is INERT while DIG_MODE == 2 (DVI)**. That is

@@ -4939,6 +4939,11 @@ sh_exec("run /bin/modeset --vtotal", 25);
 # resuming) is on iron — this is the first bite that disables the live pipe, so QEMU can only prove dispatch.
 kprintln("modeset: running /bin/modeset --recommit", 40);
 sh_exec("run /bin/modeset --recommit", 27);
+# And the M8 --transmitter path. Under QEMU mdo_transmit refuses at gpu_present (reason 1) BEFORE arming,
+# before the envelope, and before any ATOM table — so this proves the TRANSMIT op dispatches with the PHY
+# untouched. On a production (no-HDMI_ATOM) kernel it would answer reason 18 instead; both are safe refusals.
+kprintln("modeset: running /bin/modeset --transmitter", 43);
+sh_exec("run /bin/modeset --transmitter", 30);
 #endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===

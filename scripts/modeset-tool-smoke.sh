@@ -85,10 +85,10 @@ wantno(){ if grep -aq "$2" "$1"; then echo "FAIL: $4"; fail=$((fail+1)); else ec
 want "$LOG" "modeset: caps OK" \
      "the tool ran in ring 3 and #93 returned a valid caps read" \
      "no 'caps OK' — the tool did not run or #93 failed (see error lines above)"
-# The op-support mask must be exactly 63 (bit0 NOP + bit1 CAPS + bit2 DUMP + bit3 LOCK + bit4 VTOTAL + bit5 RECOMMIT). A 0 here would mean a constant collapsed.
-want "$LOG" "modeset: opmask=63" \
-     "the op-support mask is 63 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT) — the kernel wrote real caps, not zeros" \
-     "opmask != 63 — the caps write is wrong or a constant read 0"
+# The op-support mask must be exactly 127 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT). A 0 here would mean a constant collapsed.
+want "$LOG" "modeset: opmask=127" \
+     "the op-support mask is 127 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT) — the kernel wrote real caps, not zeros" \
+     "opmask != 127 — the caps write is wrong or a constant read 0"
 # Under QEMU there is no AMD GPU, so the display must read DARK — this is what makes exit 96 the right answer.
 want "$LOG" "modeset: display DARK" \
      "the caps honestly report no lit display under QEMU" \
@@ -140,6 +140,26 @@ wantno "$LOG" "modeset: latch armed at site=6" \
 wantno "$LOG" "modeset: recommit -- OTG_MASTER_EN 0" \
      "the M6 op did NOT disable the pipe under QEMU (refused at the gpu_present gate first)" \
      "M6 disabled the pipe under QEMU — the gpu_present gate must precede any OTG write"
+# --transmitter arg path (M8 the transmitter). Under QEMU mdo_transmit refuses at gpu_present (reason 1)
+# before arming, before the envelope and before any ATOM table — proving the TRANSMIT op dispatched with the
+# PHY untouched. (A production kernel on real iron answers reason 18 = no HDMI_ATOM; both are safe refusals.)
+want "$LOG" "modeset: #93 transmit error idx=0 reason=1" \
+     "★ --transmitter routed to the TRANSMIT op and returned reason 1 (no DCN under QEMU) — the M8 op dispatched, PHY untouched" \
+     "--transmitter did not reach the TRANSMIT op — argv broken, or the op rejected the record (not reason 1)"
+# ⛔ THE SAFETY ASSERTIONS. M8 is the bite that can blank the panel, so the smoke proves that with no GPU the
+# op touched NOTHING: no latch armed, no OTG envelope opened, and above all NO ATOM TABLE EXECUTED.
+wantno "$LOG" "modeset: latch armed at site=8" \
+     "the M8 op refused BEFORE arming the latch under QEMU (gpu_present gate precedes the arm)" \
+     "M8 armed the latch under QEMU — the gpu_present gate must precede modeset_arm"
+wantno "$LOG" "modeset: transmit -- OTG_MASTER_EN 0" \
+     "the M8 op did NOT open the envelope under QEMU (refused before disabling the pipe)" \
+     "M8 disabled the pipe under QEMU — the gpu_present gate must precede any OTG write"
+wantno "$LOG" "modeset: transmit -- ATOM #4" \
+     "⛔ the M8 op ran NO ATOM table under QEMU (the encoder command was never reached)" \
+     "M8 executed ATOM #4 under QEMU — an ATOM table must never run behind a failed gate"
+wantno "$LOG" "DIG1TransmitterControl ENABLE (LIVE PHY EDGE)" \
+     "⛔ the LIVE #76 transmitter edge is ABSENT from this build (ATOM_RUN_TRANSMITTER not set)" \
+     "the live #76 PHY edge is present in a default build — ATOM_RUN_TRANSMITTER must gate it"
 # The recovery boot must still reach the shell (the tool runs must not wedge the boot).
 want "$LOG" "Launching kybernet" \
      "the boot reached the shell (the tool runs did not wedge)" \

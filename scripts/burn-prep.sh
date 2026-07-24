@@ -318,6 +318,30 @@ elif [ -n "${BURN_HDMI_ATOM_FULL:-}" ]; then
     echo "[2/2] Building the A4 FULL kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE + HDMI_AUDIO_DUMP: encoder + transmitter. ⚠ BLANKS THE CONSOLE without a full modeset — do not flash yet)."
     BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_MODESET_TRANSMITTER_LIVE:-}" ]; then
+    # ⛔⛔ M8e — THE DANGEROUS RUNG. ATOM #76 DIG1TransmitterControl(ENABLE) runs LIVE, inside M6's
+    # iron-proven OTG envelope, driven from ring 3 by `run /bin/modeset --transmitter`. #76 power-cycles the
+    # PHY (556F power + 5E03 lane reset + 5DF0/5DE9 RDPCS among 17 writes) and has blanked this display
+    # TWICE. The envelope makes it SURVIVABLE, not safe.
+    # Do NOT flash this until M8d (the #76-off rung below) has burned green, because M8d retires every other
+    # risk in the sequence and leaves this one edge as the only variable.
+    # Recovery, in order: the in-kernel watchdog re-runs the inherited-mode program; if that fails it calls
+    # power_reset(); and H2's latch makes that reboot clean and self-disabling (next boot SKIPS the modeset).
+    # Worst case is ONE bad boot and `rm /.modeset-armed` — never a reflash.
+    echo "[2/2] Building the M8e LIVE-TRANSMITTER kernel (HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE: ATOM #4 AND the LIVE #76 PHY edge inside the OTG envelope. ⛔ THE PANEL MAY GO DARK — H2 recovers in one boot. EYE-CHECK the screen)."
+    BUILD_ENV="HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1"
+    BUILD_TAG="HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE"
+elif [ -n "${BURN_MODESET_TRANSMITTER:-}" ]; then
+    # M8d — the SAFE transmitter rung, and the one to burn FIRST. `run /bin/modeset --transmitter` runs the
+    # whole sequence inside M6's envelope — BE<->FE disconnect, ATOM #4 DIGxEncoderControl (the DIG digital
+    # front end at 0x56xx, DISJOINT from the PHY at 0x5Dxx), the infoframe programming, BE<->FE reconnect,
+    # OTG re-commit — with ATOM #76 COMPILED OUT. It therefore CANNOT blank the panel the way #76 does, and
+    # it retires every risk in the sequence except that one edge.
+    # H8 proves the artifact matches this claim in BOTH directions before you flash (verify_marker on the
+    # SKIPPED string, verify_absent on the live-edge string).
+    echo "[2/2] Building the M8d SAFE-TRANSMITTER kernel (HDMI_ATOM + ATOM_TRACE: ATOM #4 encoder + the full enveloped sequence, #76 COMPILED OUT — cannot blank via the PHY edge)."
+    BUILD_ENV="HDMI_ATOM=1 ATOM_TRACE=1"
+    BUILD_TAG="HDMI_ATOM+ATOM_TRACE"
 elif [ -n "${BURN_HDMI_ATOM:-}" ]; then
     # THE A4 ENCODER-ONLY BURN (the audio attempt). Iron 1.55.23 proved: the interpreter is bit-correct, but
     # DIG1TransmitterControl(ENABLE) power-cycles the PHY and blanks the live pipe. So this runs
@@ -419,6 +443,26 @@ verify_marker() {
         exit 1
     fi
 }
+# verify_absent — THE OTHER HALF OF THE GATE, and M8 is why it exists.
+#
+# verify_marker proves a flag's code IS in the artifact. For a DESTRUCTIVE flag you need the opposite proof
+# just as badly: that the build you are about to flash does NOT carry the dangerous path. ATOM #76
+# (DIG1TransmitterControl) power-cycles the PHY and has blanked this display twice — once because ATOM_DRY
+# was a flag build.sh never emitted, so "dry" and "live" compiled BYTE-IDENTICAL and nothing could tell them
+# apart. A presence-only check cannot catch that class: it fails open in the destructive direction.
+#
+# So for the transmitter burns the marker pair is checked BOTH ways — the live-edge string must be present
+# in the live build and ABSENT in the safe one — which makes the two builds provably distinguishable before
+# the flash rather than after the panel goes dark.
+verify_absent() {
+    if grep -qa "$1" build/agnos; then
+        echo ""
+        echo "burn-prep: ARTIFACT-MISMATCH -- build/agnos DOES contain '$1' and must not"
+        echo "  BUILD_TAG=$BUILD_TAG is the SAFE variant, but the artifact carries the destructive path."
+        echo "  Flashing this could drive the PHY when you expected it not to. DO NOT FLASH THIS."
+        exit 1
+    fi
+}
 case "$BUILD_TAG" in *HDA_HDMI*)         verify_marker "ctl1 probing 2nd controller" ;; esac
 case "$BUILD_TAG" in *HDA_TONE*)         verify_marker "sweep streaming" ;; esac
 case "$BUILD_TAG" in *HDMI_AUDIO_DUMP*)  verify_marker "== agnos display-audio dump ==" ;; esac
@@ -438,6 +482,23 @@ case "$BUILD_TAG" in *SCANOUT_REDIRECT*) verify_marker "console redirected to ag
 # and this tree does not run DCE by default, so it is present in EVERY binary and verified nothing. The
 # marker must be a kprintln inside the flag's own #ifdef; this one is the boot call site's banner.
 case "$BUILD_TAG" in *SCANOUT_REGDUMP*)  verify_marker "hubp regdump build armed" ;; esac
+# --- H8, the M8 transmitter gate: the marker pair, checked in BOTH directions ---------------------------
+# HDMI_ATOM alone is the SAFE transmitter build (envelope + ATOM #4 encoder; #76 compiled OUT). It must
+# carry the SKIPPED marker and must NOT carry the live-edge string.
+case "$BUILD_TAG" in
+    *ATOM_RUN_TRANSMITTER*) ;;                                   # the live build — handled by the arm below
+    *HDMI_ATOM*)
+        verify_marker "ATOM #76 SKIPPED"
+        verify_absent "DIG1TransmitterControl ENABLE (LIVE PHY EDGE)"
+        ;;
+esac
+# ATOM_RUN_TRANSMITTER is the DESTRUCTIVE build: the live-edge string must be present and the SKIPPED
+# string absent. Both halves matter — a build carrying neither would mean mdo_transmit did not compile at all.
+case "$BUILD_TAG" in *ATOM_RUN_TRANSMITTER*)
+        verify_marker "DIG1TransmitterControl ENABLE (LIVE PHY EDGE)"
+        verify_absent "ATOM #76 SKIPPED"
+        ;;
+esac
 case "$BUILD_TAG" in *SCANOUT_MATCHGEOM*) verify_marker "scanout matchgeom armed" ;; esac
 case "$BUILD_TAG" in *SDMA_PROBE*)       verify_marker "sdma probe armed" ;; esac
 case "$BUILD_TAG" in *SDMA_RING*)        verify_marker "sdma ring bringup armed" ;; esac

@@ -3,12 +3,68 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.13] - 2026-07-24
+
+**MODESET work list B — the TRANSMITTER + audio (OPEN cycle).** Bumped on cycle open; the user tags/releases
+at close. Scope: **M8** (run ATOM #4 `DIGxEncoderControl` + #76 `DIG1TransmitterControl` *inside* M6's now
+iron-proven OTG envelope, with the self-recovering frame-count watchdog) → **M9** (audio enable strictly after
+the transmitter edge — the **A4 HDMI-audio answer** to the mute saga). M6's iron success (below, 1.56.12) —
+agnos owns the OTG envelope — is what makes #76 survivable. ⚠ Carry-in from M6: the GOP-vs-amdgpu
+clock-control delta (`OTG_CLOCK_CONTROL` GOP `0x10101` vs amdgpu `0x3`) is a first-class M8 consideration.
+
+### Added — M8a: the enveloped transmitter op (`#93` op `MODESET_OP_TRANSMIT` + `/bin/modeset --transmitter`)
+
+The M8 sequence, scaffolded end to end inside M6's iron-proven OTG envelope with the destructive half
+compiled out. A new `#93` op (0x06) runs: BE↔FE **disconnect** (`DIG_BE_CNTL` `FE_SOURCE_SELECT` → 0) → ATOM
+**#4** `DIGxEncoderControl` (the DIG front end at `0x56xx`, disjoint from the PHY) → infoframe programming →
+BE↔FE **connect** (→ `0x02`) → ATOM **#76** `DIG1TransmitterControl(ENABLE)` → replay → OTG re-commit, all
+under the frame-count watchdog. `MDO_OP_SUPPORTED` is now `0x7F`. QEMU: `modeset-tool-smoke` **19/0**.
+
+**What runs is a BUILD property, never an ABI argument** — a ring-3 caller can never ask for the live PHY
+edge. A production kernel (no `HDMI_ATOM`) answers the specific `MDO_E_NOATOM`; an `HDMI_ATOM` build runs the
+envelope + #4 and **skips** #76; only a build that *also* sets `ATOM_RUN_TRANSMITTER` fires the transmitter.
+The `FE_SOURCE_SELECT` field was **verified from two independent iron captures**, never derived (GOP-DVI
+`0x10020200` and amdgpu-HDMI `0x10030200` differ only in `DIG_MODE[18:16]`; both carry `0x02` in `[15:8]`).
+THE GATE is carried in the op itself because `atom_reg_write` writes MMIO directly and never passes through
+`gpu_dcn_write_committed`. The watchdog **escalates** where M6 only reported: on a dark pipe it re-runs the
+inherited-mode program, and — only in the `#76`-live build — falls back to `power_reset()`, which is safe
+solely because H2's latch is flushed and readback-verified before the first risky write, so the reboot is
+clean and self-disabling.
+
+**H8 landed, and it is bidirectional.** New `verify_absent()` in `burn-prep.sh` is the other half of
+`verify_marker`: for a destructive flag you must prove the artifact does **not** carry the dangerous path.
+The last accidental blanking came from `ATOM_DRY` being a flag `build.sh` never emitted, so "dry" and "live"
+compiled **byte-identical** — a presence-only check fails open in exactly that direction. The safe build now
+must carry `ATOM #76 SKIPPED` and must **not** carry the live-edge string; the live build must carry the
+live-edge string and must **not** carry `SKIPPED`. Both directions verified end to end, and the two builds
+differ by 408 bytes. New burn modes `BURN_MODESET_TRANSMITTER` (safe, #76 compiled out) and
+`BURN_MODESET_TRANSMITTER_LIVE` (the dangerous rung).
+
+### Added — M8b: the ATOM #76 read-set capture + H5 snapshot-seed tooling
+
+H5's snapshot-seeded DRY replays real captured values into `atom_reg_read` so the interpreter takes the
+branches iron would take. Running the `atom-interp.py` oracle against the real VBIOS gives #76's exact
+footprint — **21 reads / 17 writes / 5 delays over 16 distinct indices** — and that surfaced a blocker the
+plan had not: **agnos has never validly read any of them.** M1's M2 group double-folded the IP base and read
+garbage at `0x92xx`, so the PHY has never been seen from agnos, and a DRY whose reads all return 0 proves
+only that the decoder walks *a* path — not the path #76 will take.
+
+`mdo_dump` therefore gains a **`M8-76readset`** group covering the 12 uncaptured indices (dump is now 93
+registers), read-only and printed progressively so a hang localises to the last line. `m1-decode.py` gains a
+mechanical **coverage gate** (it reports 4/16 today, and those 4 are the invalid double-folded reads) and an
+`IDX VALUE` **snapshot emitter** for `atom-interp.py --regsnapshot`, making the loop iron-dump → seed →
+oracle reproducible. ⚠ **Plan correction:** #76 also touches the `0x55xx` UNIPHY power/link block, which is
+outside the vetted read set the H5 red-flag rule names (`{DCCG 0xC0-0x1FF, OTG/OPTC 0x1A00-0x1BFF, DIG
+0x2xxx, PHY 0x5Dxx-0x5Exx}`) — that set is incomplete for the transmitter.
+
 ## [1.56.12] - 2026-07-24
 
-**MODESET work list B cont. — the OTG envelope + transmitter (OPEN cycle).** Bumped on cycle open; the user
-tags/releases at close. Scope: **M6** (the same-mode OTG envelope re-commit — the first genuinely dangerous
-bite, `OTG_MASTER_EN=0`) → **M8·M9** (the transmitter + audio). M4+M5's iron success (below, 1.56.11) unblocks
-M6 on a lock+commit proven on real silicon rather than on sand.
+**MODESET work list B cont. — the OTG ENVELOPE (M6, ★★ iron-proven).** The first bite to disable + re-enable
+the live pipe. **BURNED on archaemenid 2026-07-24 — agnos owns the OTG envelope:** `--recommit` → exit 95
+(`OTG_MASTER_EN`=0 stopped the frame counter `2615→0`, =1 resumed it `→115`, refresh restored `59951=predicted`,
+panel blanked then relit). The D3 review fix saved the burn (the GOP clock-controls are `0x10101`/`0x6`, not
+the card's `0x3`; forcing `0x3` would likely have gone dark). Scope was M6 → M8·M9, but M8·M9 moved to 1.56.13
+so this milestone (lock+commit+envelope, all iron-proven across 1.56.11+1.56.12) tags clean.
 
 ### Added — M6: the same-mode OTG envelope re-commit (`#93` op `MODESET_OP_RECOMMIT` + `/bin/modeset --recommit`)
 
