@@ -957,8 +957,12 @@ fn atom_init_mem() {
 #  digfe_sel=0x02 (DIG1), connobj_id=0x13 (HDMI_TYPE_A), symclk=24150 (241.50
 #  MHz), lanenum=4, HDMI mode=3.
 # ============================================================================
-# DIGxEncoderControl (#4, v1_5) STREAM_SETUP(0x0F) — puts DIG1 in true HDMI mode
-# with data islands (the step the raw DIG_MODE 2->3 bit-flip skips).
+# DIGxEncoderControl (#4, v1_5) STREAM_SETUP(0x0F) — programs DIG1's FRONT END for HDMI (data islands,
+# clock pattern): the setup the raw DIG_MODE 2->3 bit-flip skips.
+# ⚠ It is the COMPLEMENT of that flip, not a replacement for it. Measured write set (atom-interp.py on the
+# real VBIOS, 5r/5w/2d): abs 0x5628 (DIG1 DIG_FE_CNTL) x3, 0x562B, 0x569A — all DIG front end. It NEVER
+# writes DIG_BE_CNTL (abs 0x566F), so DIG_MODE is UNCHANGED by this table; `digmode=3` in the params only
+# steers branches inside it. A link is HDMI only once something also sets DIG_BE_CNTL.DIG_MODE = 3.
 fn atom_run_encoder_hdmi() {
     store32(&atom_ps_buf + 0,  0x01 | (0x0F << 8) | (3 << 16) | (4 << 24));  # digid,action,digmode,lanenum
     store32(&atom_ps_buf + 4,  24150);                                       # pclk_10khz

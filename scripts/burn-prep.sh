@@ -504,7 +504,23 @@ case "$BUILD_TAG" in *SDMA_PROBE*)       verify_marker "sdma probe armed" ;; esa
 case "$BUILD_TAG" in *SDMA_RING*)        verify_marker "sdma ring bringup armed" ;; esac
 case "$BUILD_TAG" in *SDMA_COPY*)        verify_marker "sdma ring bringup armed" ;; esac
 case "$BUILD_TAG" in *ATOM_DRY*)         verify_marker "atom: DRY build (no MMIO)" ;; esac
-case "$BUILD_TAG" in *HDMI_ATOM*)        verify_marker "atom: running DIGxEncoderControl" ;; esac
+# ⚠ FALSE-ASSURING MARKER, FIXED. This used to verify "atom: running DIGxEncoderControl", which lives in
+# atom_hdmi_transmitter_bringup() — whose ONLY caller is main.cyr's #ifdef HDA_HDMI block. In an
+# HDMI_ATOM-without-HDA_HDMI build (exactly the M8d/M8e transmitter burns) that string is present in the
+# artifact and NEVER EXECUTES, while the summary below claims "compiled AND reached". That is the same
+# class of defect verify_marker's own header warns about. The M-lane transmitter burns are driven from
+# mdo_transmit, so verify a string from THERE; keep the old marker only for the HDA_HDMI audio builds.
+case "$BUILD_TAG" in
+    *HDMI_ATOM*)
+        case "$BUILD_TAG" in
+            *HDA_HDMI*) verify_marker "atom: running DIGxEncoderControl" ;;
+            *)          verify_marker "modeset: transmit -- ATOM #4 DIGxEncoderControl" ;;
+        esac
+        ;;
+esac
+# ATOM_TRACE is the transmitter burns' ONLY non-eye instrument (it logs each ATOM MMIO write), and it had
+# no marker at all — a silently-dropped ATOM_TRACE would cost the burn its write list.
+case "$BUILD_TAG" in *ATOM_TRACE*)       verify_marker "atom w=" ;; esac
 
 SZ="$(stat -c %s build/agnos 2>/dev/null)"
 MT="$(stat -c %y build/agnos 2>/dev/null | cut -d. -f1)"
@@ -529,9 +545,26 @@ echo "=========================================="
 echo "  IRON KERNEL READY — AGNOS $VER ($BUILD_TAG)"
 echo "=========================================="
 echo ""
-echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update"
-echo "    (--update is ESP-only — the agnos-fs partition survives, per"
-echo "     feedback_prefer_mount_modify_over_reflash)"
+# ⚠ WHICH FLASH COMMAND depends on whether the burn is driven by a RING-3 TOOL. `--update` is ESP-only
+# (kernel + gnoboot); it never touches the agnos-fs partition where /bin/* lives. A burn whose oracle is
+# `run /bin/<tool>` therefore needs `--update-all`, or the operator flashes a new kernel against a STALE
+# tool — and a stale /bin/modeset simply falls through to its default arg and exits 96, which is
+# indistinguishable from "no GPU". That is a wasted flash on a rig whose burns block the operator's work.
+case "$BUILD_TAG" in
+    *HDMI_ATOM*|*SHADER*|*MODESET*)
+        if [ ! -x "$ROOT/build/rootfs/bin/modeset" ]; then
+            echo "  ⚠ /bin/modeset is NOT staged — run first:  sh scripts/stage-tools.sh --build"
+        fi
+        echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update-all"
+        echo "    (--update-all — this burn is driven by a RING-3 TOOL on the agnos-fs, so an"
+        echo "     ESP-only --update would ship the new kernel against a STALE /bin/modeset)"
+        ;;
+    *)
+        echo "  Flash (from agnosticos):  sudo ./scripts/install-media.sh --update"
+        echo "    (--update is ESP-only — the agnos-fs partition survives, per"
+        echo "     feedback_prefer_mount_modify_over_reflash)"
+        ;;
+esac
 echo ""
 echo "  The live burn rubric (hypothesis + falsification + watch-steps) lives in the"
 echo "  OPEN cycle's tracker — read it before flashing, NOT a hardcoded list here (it"

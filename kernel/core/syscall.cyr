@@ -1880,7 +1880,7 @@ fn mdo_recommit() {
 #                            marker is PRESENT in this build and ABSENT in a bare one — because the last
 #                            accidental blanking came from ATOM_DRY being a flag build.sh never emitted, so
 #                            "dry" and "live" compiled byte-identical.
-fn mdo_transmit() {
+fn mdo_transmit_run() {
     if (gpu_present == 0)      { return MDO_E_NOGPU; }
     if (gpu_display_ok != 1)   { return MDO_E_NOGPU; }
     if (gpu_display_pipe != 0) { kprintln("modeset: transmit refused -- live pipe is not 0", 47); return MDO_E_NOGPU; }
@@ -1947,12 +1947,25 @@ fn mdo_transmit() {
     var fc_dis  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
     kprint("modeset: transmit -- frame count ", 33); kprint_num(fc0); kprint(" -> ", 4); kprint_num(fc_dis);
     kprint(" stopped ", 9); kprint_num(stopped); kprintln("", 0);
+    # ⛔ ABORT HERE, NOT AT THE VERDICT. The entire safety case for this bite is "the risky work happens with
+    # the pipe disabled". If the disable did not take, that case is VOID — so bail before the BE<->FE break,
+    # before #4's DIG_START strobe and before the HDMI block, instead of doing all of it and reporting NOSTOP
+    # afterwards. Only OTG_CONTROL has been written at this point, so restoring s_ctrl is an exact undo.
+    if (stopped == 0) {
+        kprintln("modeset: TRANSMIT ABORT -- OTG_MASTER_EN=0 did not stop the pipe; nothing else attempted", 88);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl);
+        gpu_mfence();
+        return MDO_E_NOSTOP;
+    }
 
     # ── BE<->FE DISCONNECT: clear FE_SOURCE_SELECT so no front end feeds the encoder while it is set up ──
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, s_be & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK));
     gpu_mfence();
 
-    # ── ATOM #4 DIGxEncoderControl — puts the DIG in true HDMI mode with data islands. Display-SAFE:
+    # ── ATOM #4 DIGxEncoderControl — programs the DIG FRONT END for HDMI (data islands, clock pattern).
+    # ⚠ It does NOT switch the link to HDMI signalling: DIG_BE_CNTL.DIG_MODE is untouched (see the reconnect
+    # below for the measured write set). Saying "#4 puts the DIG in HDMI mode" is the claim that would make
+    # this burn's headline oracle false. Display-SAFE:
     # it drives the digital front end (0x56xx), disjoint from the PHY (0x5Dxx), and is iron-exonerated.
     kprintln("modeset: transmit -- ATOM #4 DIGxEncoderControl (HDMI setup)", 60);
     var r4 = atom_run_encoder_hdmi();
@@ -1970,7 +1983,25 @@ fn mdo_transmit() {
     kprintln("modeset: transmit -- stream attributes + infoframes programmed", 62);
 
     # ── BE<->FE CONNECT: re-point the back end at the front end (verified value 0x0200 in [15:8]) ────
-    var be_conn = (s_be & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK)) | GPU_DIG_FE_SOURCE_CONNECT;
+    # ⛔ DIG_MODE IS DELIBERATELY *NOT* TOUCHED HERE — read this before "fixing" it.
+    #
+    # ATOM #4 programs the DIG FRONT end only. Verified from the oracle, not assumed: #4's entire write set
+    # is three registers — abs 0x5628 / 0x562B / 0x569A, i.e. DIG1's DIG_FE_CNTL (rel 0x2068 + the 0x100
+    # stride) and two neighbours. It NEVER writes DIG_BE_CNTL (abs 0x566F), so it does NOT switch the link
+    # to HDMI signalling. `digmode=3` in its parameters only steers branches inside the table.
+    #
+    # So DIG_MODE stays 2 (DVI) for this whole op, and that is the POINT of this rung: every HDMI_* register
+    # is inert while DIG_MODE == 2 (gpu.cyr's own safety contract), which is what makes running the full
+    # sequence — bracket, #4, stream attributes, infoframes — a bounded experiment. Adding a DIG_MODE -> 3
+    # RMW here would make the whole infoframe block LIVE and turn one reviewed experiment into two.
+    # The flip belongs to a later rung, with its own review. Expect `be_cntl 0x10020200 -> 0x10020200`:
+    # that is the CORRECT result, not evidence that #4 failed.
+    #
+    # ⚠ The RMW re-reads rather than reusing the `s_be` captured before #4. Value-identical today, but
+    # deriving a whole-register write from a snapshot taken at a different time is the
+    # [[reference_agnos_dcn_hubp_reg_offsets_derived]] class — modify a FIELD of the CURRENT value.
+    var be_now  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
+    var be_conn = (be_now & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK)) | GPU_DIG_FE_SOURCE_CONNECT;
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d, be_conn);
     gpu_mfence();
     var be_rb = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & 0xFFFFFFFF;
@@ -2068,6 +2099,13 @@ fn mdo_transmit() {
     kprint(" refresh ", 9); kprint_num(refr); kprint(" mHz predicted ", 15); kprint_num(pred); kprintln(" mHz", 4);
     kprint("modeset: transmit -- be_cntl ", 29); kprint_num(s_be); kprint(" -> ", 4); kprint_num(be1);
     kprint(" underflow ", 11); kprint_num(unf0); kprint(" -> ", 4); kprint_num(unf1); kprintln("", 0);
+    # Decode DIG_MODE explicitly. The raw be_cntl pair above is easy to misread as "restored cleanly" when
+    # it actually means the encoder command was undone — print the field that carries the whole point of
+    # the bite (2 = DVI as the GOP left it, 3 = HDMI as ATOM #4 sets it).
+    var dm0 = (s_be & GPU_DIG_MODE_MASK) >> GPU_DIG_MODE_SHIFT;
+    var dm1 = (be1  & GPU_DIG_MODE_MASK) >> GPU_DIG_MODE_SHIFT;
+    kprint("modeset: transmit -- DIG_MODE ", 30); kprint_num(dm0); kprint(" -> ", 4); kprint_num(dm1);
+    kprintln("  (2=DVI 3=HDMI)", 16);
 
     # ── VERDICT ─────────────────────────────────────────────────────────────────────────────────────
     if (stopped == 0) { kprintln("modeset: TRANSMIT FAILED -- OTG_MASTER_EN=0 did not stop the pipe", 65); return MDO_E_NOSTOP; }
@@ -2076,6 +2114,8 @@ fn mdo_transmit() {
     if ((be_rb & GPU_DIG_FE_SOURCE_SEL_MASK) != GPU_DIG_FE_SOURCE_CONNECT) {
         kprintln("modeset: TRANSMIT FAILED -- BE<->FE reconnect did not read back", 63); return MDO_E_BEFE;
     }
+    # ⛔ DO NOT add a "DIG_MODE must be HDMI" gate here. Nothing in this op sets it (see the reconnect
+    # above): #4 touches only the DIG front end, so DIG_MODE stays 2 and such a gate would fail every run.
     if (refr == 0) { kprintln("modeset: TRANSMIT unmeasurable -- pipe resumed but will not count", 65); return MDO_E_UNMEAS; }
     if (unf0 == 0) {
         if (unf1 != 0) { kprintln("modeset: TRANSMIT UNDERFLOW -- OPTC bit10 newly set by the edge", 63); return MDO_E_UNDERFLOW; }
@@ -2092,6 +2132,31 @@ fn mdo_transmit() {
     kprintln("modeset: transmit refused -- kernel not built with HDMI_ATOM (no ATOM table can run)", 84);
     return MDO_E_NOATOM;
     #endif
+}
+
+# mdo_transmit — the entry point, and it exists for ONE reason: to guarantee the evidence outlives the run.
+#
+# ⛔ THE REAL HAZARD OF THIS BITE IS NOT THE BLANK, IT IS THE BLINDNESS. Every instrument the op has —
+# the frame counter and the refresh measurement — free-runs off the OTG's own pixel PLL, so it reports a
+# healthy pipe whether or not the encoder is emitting anything a sink can display. A dark panel therefore
+# yields `resumed 1`, a correct refresh, a clean BE<->FE readback and a printed TRANSMIT OK — and then the
+# kernel log dies in the RAM ring at the power-cycle, because the documented readout (`run /bin/klug`) needs
+# the console the burn just killed. That is exactly how the D lane spent five burns learning nothing
+# ([[feedback_dlane_five_burns_what_went_wrong]]).
+#
+# So spill the log to /klug.txt on EVERY exit, success or failure. mdo_transmit_run has 20+ return paths;
+# putting the spill in each one guarantees only that a future edit will miss one. The wrapper cannot.
+# klug_spill_prepare() already pre-allocated the file at boot, so this is a pure overwrite of mapped blocks.
+fn mdo_transmit() {
+    var r = mdo_transmit_run();
+    # ⚠ klug_spill() is SILENT (returns a byte count, prints nothing), so report the count — a 0 means
+    # klug_spill_prepare() never got a usable inode and /klug.txt still holds a STALE boot, which is the
+    # "looks fine, is wrong" failure this fix exists to prevent.
+    # ⚠ This line lands in the ring AFTER the write, so it is NOT in the rescued file — it is for the
+    # console when the panel survived. The file's own content is what proves the spill ran on a dark boot.
+    var spilled = klug_spill();
+    kprint("modeset: transmit -- klug spilled ", 34); kprint_num(spilled); kprintln(" bytes to /klug.txt", 19);
+    return r;
 }
 
 # mdo_validate(rec) -> 0 or an MDO_E_* reason. PURE READS on the KERNEL-RESIDENT copy. Every dword an op does
