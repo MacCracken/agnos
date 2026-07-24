@@ -3,6 +3,32 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.11] - 2026-07-24
+
+**MODESET work list B — the iron modeset ladder (OPEN cycle).** Bumped on cycle open; the user tags/releases
+at close (when M6 green — agnos owns the OTG). This section accretes the work-list-B bites as they land;
+burns validate them on archaemenid between here and the tag.
+
+### Added — M1·M2·M3: the read-only DCN pipe dump (`#93` op `MODESET_OP_DUMP` + `/bin/modeset --dump`)
+
+The first work-list-B bite, and the read the modeset ladder has never taken: agnos's own inherited DCN state
+at 1440p, across every block the amdgpu trace touches. A new `#93` op (0x02) reads **81 named, H7-anchored
+offsets** — M1 (OTG0 / VTG / OPTC / OPP-FMT / MPC / HUBP0 / power-gating on BASE_IDX 2 + a BASE_IDX 1 group),
+M2 (PHY/RDPCS), M3 (the scaler, read for the first time) — and prints each `rd <off> <val>` **progressively**
+(one kprint per register) so a read that hangs a power-gated domain localises to the last line (risk R1). ⛔
+Named offsets only, never a blind range scan (a blind sweep locked archaemenid 2026-07-17). The dump doubles
+as the H5 snapshot seed. `/bin/modeset --dump` triggers it (argv-routed); captured on iron with
+`run /bin/klug > m1.txt`. Under QEMU (no DCN) the op returns reason 1 — proof the ABI dispatched.
+
+The write bites (M4·M5·M6 the OTG envelope, M8·M9 transmitter+audio) are calibrated off M1's actual iron
+reads (M4/M6 write *back* M1's values), so they follow this read burn.
+
+### Fixed — `#93` caps `v_active` was always 0
+
+`gpu_pixclk_discover` computed the link active height but only stored `gpu_h_active`, dropping the height. A
+`gpu_v_active` global is now stored alongside, and the caps report it (the H3 iron burn showed `v_active=0`
+where the real value is 1440).
+
 ## [1.56.10] - 2026-07-24
 
 **MODESET harness — work list A complete.** The three bites that finished the zero-burn half of the modeset
@@ -38,10 +64,13 @@ of arming rather than a postcondition to be proven.
   blocked this boot (recover with `rm /.modeset-armed`). Uses the cyrius-6.4.74 `sys_gpu_modeset_op` wrapper,
   which lives on the agnos target only — off-agnos the tool fails to compile rather than issuing `fchown`.
 
-**Proven** — `scripts/modeset-tool-smoke.sh`, **6/0** in QEMU: the boot stages `/bin/modeset` onto the ext2
-image and runs it in ring 3; the tool reports `opmask=3`, `display DARK`, `latch-armable YES` and exits
-**96**. The whole seam — ring-3 tool → #93 → in-kernel validate → caps written back — works with no GPU
-present.
+**Proven — QEMU AND IRON.** `scripts/modeset-tool-smoke.sh` **6/0** in QEMU (`display DARK`, exit 96, no
+GPU). **★ Iron-validated on archaemenid 2026-07-24, exit 95:** `run /bin/modeset` returned `display LIT`,
+`opmask=3`, and the real geometry `h_active=2560 · h_total=2720 · v_total=1481 · pixclk_100hz=2415014
+(241.5 MHz) · refresh 59.950 Hz` — matching the boot log's own DCN read to the digit. The ring-3 → #93 →
+in-kernel-validate → caps path works end to end on real hardware, and the caps **pre-confirm the modeset
+ladder's M1 anchors** (2720×1481 total, ≈241.5 MHz) before M1 is written. Same boot iron-proved H1 (`klug.txt`
+spill) and H2 (`latch ready ino=114`, gvar constants intact).
 
 **Reconciliations:** the #92 handler's "#93 is retired, never mint it" comment predates MD-4 (2026-07-23),
 which re-minted #93 for modeset because modeset (take the pipe from the GOP) is a distinct capability class

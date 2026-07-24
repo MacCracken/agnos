@@ -16,4 +16,4 @@ output = "build/gpufill"
 # file-level `#ifdef CYRIUS_TARGET_AGNOS` gate, so an off-agnos build fails to COMPILE rather than emitting
 # Linux rmdir/creat. The result IS the exit code, read via the exec path's "run: exit N".
 [deps]
-stdlib = ["syscalls"]
+stdlib = ["syscalls", "string", "args"]

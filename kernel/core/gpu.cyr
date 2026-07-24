@@ -129,6 +129,7 @@ var gpu_pixclk_100hz  = 0;
 var gpu_h_total       = 0;
 var gpu_v_total       = 0;
 var gpu_h_active      = 0;    # link active width — for HDMI_AUDIO_PACKETS_PER_LINE (data-island budget)
+var gpu_v_active      = 0;    # link active height — computed alongside gpu_h_active; surfaced in #93 caps
 # P3b-ii pre-flight: 1 = every precondition for the DVI->HDMI DIG_MODE flip is verified clear on the live
 # encoder. 0 = do NOT flip (a hazard is armed, or the link/encoder isn't ours to touch). Read-only result.
 var gpu_hdmi_flip_ok  = 0;
@@ -6072,6 +6073,7 @@ fn gpu_pixclk_discover() {
     var hact = (hbl & GPU_OTG_BLANK_MASK) - ((hbl >> GPU_OTG_BLANK_END_SHIFT) & GPU_OTG_BLANK_MASK);
     var vact = (vbl & GPU_OTG_BLANK_MASK) - ((vbl >> GPU_OTG_BLANK_END_SHIFT) & GPU_OTG_BLANK_MASK);
     gpu_h_active = hact;
+    gpu_v_active = vact;                          # surfaced in #93 caps (was computed-then-dropped)
 
     kprint("gpu: display link ", 18); kprint_num(hact); kprint("x", 1); kprint_num(vact);
     kprint(" total ", 7); kprint_num(htotal); kprint("x", 1); kprint_num(vtotal);

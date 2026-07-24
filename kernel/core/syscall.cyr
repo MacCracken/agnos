@@ -1319,7 +1319,8 @@ var MDO_OP_STRIDE    = 64;          # bytes per record (matches #92's GPU_OP_STR
 var MDO_OP_MAX_LEN   = 4096;        # cap on the whole array
 var MDO_OP_NOP       = 0x00;        # validated, dispatches nothing — batch padding / ABI probe
 var MDO_OP_CAPS      = 0x01;        # write the modeset caps (8x u32 LE) to the record's out_uva
-var MDO_OP_SUPPORTED = 0x3;         # bit N set <=> op code N implemented: bit0 NOP, bit1 CAPS
+var MDO_OP_DUMP      = 0x02;        # M1/M2/M3 read-only DCN pipe dump -> progressive `rd <off> <val>` to klug
+var MDO_OP_SUPPORTED = 0x7;         # bit N set <=> op code N implemented: bit0 NOP, bit1 CAPS, bit2 DUMP
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
 var MDO_E_OUTBUF     = 3;           # op    — CAPS out_uva/out_len invalid
@@ -1345,11 +1346,73 @@ fn mdo_caps_write(out_uva) {
     store32(out_uva +  0, flags);
     store32(out_uva +  4, MDO_OP_SUPPORTED);
     store32(out_uva +  8, gpu_h_active);
-    store32(out_uva + 12, 0);
+    store32(out_uva + 12, gpu_v_active);
     store32(out_uva + 16, gpu_h_total);
     store32(out_uva + 20, gpu_v_total);
     store32(out_uva + 24, gpu_pixclk_100hz);
     store32(out_uva + 28, gpu_refresh_mhz);
+    return 0;
+}
+
+# ── M1·M2·M3 read-only DCN pipe dump (MODESET_OP_DUMP) ───────────────────────────────────────────────
+# Progressive `rd <off> <val>` (both DECIMAL, matching gpu_scanout_regdump) — one kprint PER register, so a
+# read that hangs a power-gated domain localises to the LAST line printed (risk R1; the hang IS the finding).
+# ⛔ NAMED OFFSETS ONLY, all H7-anchored, all in known-ungated domains — NEVER a blind range scan (a blind
+# OTG/DCCG sweep locked archaemenid 2026-07-17). Captured on iron via `run /bin/klug > m1.txt`.
+# The dump doubles as the H5 snapshot seed (a host script parses `rd <off> <val>` into the snapshot table).
+# Pipe/instance 0 (archaemenid's live pipe; guarded below).
+fn mdo_rd2(off) {                                    # BASE_IDX 2 (GPU_BASE_DCN_2) read + progressive print
+    var v = gpu_reg32(GPU_BASE_DCN_2, off) & 0xFFFFFFFF;
+    kprint("rd ", 3); kprint_num(off); kprint(" ", 1); kprint_num(v); kprintln("", 0);
+    return 0;
+}
+fn mdo_rd1(off) {                                    # BASE_IDX 1 (GPU_BASE_DCN_1) — tagged `rd1` so the host decoder knows the base
+    var v = gpu_reg32(GPU_BASE_DCN_1, off) & 0xFFFFFFFF;
+    kprint("rd1 ", 4); kprint_num(off); kprint(" ", 1); kprint_num(v); kprintln("", 0);
+    return 0;
+}
+fn mdo_dump() {
+    # Needs the GPU aperture mapped. On QEMU gpu_present == 0 -> refuse (no DCN to read).
+    if (gpu_present == 0) { return MDO_E_NOGPU; }
+    if (gpu_display_pipe != 0) {
+        # The offset list below is instance-0 (OTG0/HUBP0/MPCC0). On archaemenid the live pipe is 0; a
+        # non-zero live pipe would need per-instance indexing, so refuse rather than dump the wrong pipe.
+        kprintln("modeset: dump refused -- live pipe is not 0", 43);
+        return MDO_E_NOGPU;
+    }
+    kprintln("modeset: dump begin (rd offset value, both decimal; rd1 = BASE_IDX 1)", 69);
+
+    kprintln("modeset: dump group M1-OTG0", 27);
+    mdo_rd2(0x1B2A); mdo_rd2(0x1B2B); mdo_rd2(0x1B2C); mdo_rd2(0x1B2D); mdo_rd2(0x1B2E);
+    mdo_rd2(0x1B2F); mdo_rd2(0x1B30); mdo_rd2(0x1B31); mdo_rd2(0x1B33); mdo_rd2(0x1B36);
+    mdo_rd2(0x1B37); mdo_rd2(0x1B38); mdo_rd2(0x1B39); mdo_rd2(0x1B41); mdo_rd2(0x1B44);
+    mdo_rd2(0x1B82); mdo_rd2(0x1B86); mdo_rd2(0x1B87); mdo_rd2(0x1B88); mdo_rd2(0x1B89); mdo_rd2(0x1B8A);
+    kprintln("modeset: dump group M1-VTG", 26);
+    mdo_rd2(0x0528);
+    kprintln("modeset: dump group M1-OPTC", 27);
+    mdo_rd2(0x1ACA); mdo_rd2(0x1ACB); mdo_rd2(0x1ACC); mdo_rd2(0x1ACF); mdo_rd2(0x1AD0);
+    kprintln("modeset: dump group M1-OPP/FMT", 30);
+    mdo_rd2(0x183F); mdo_rd2(0x1840); mdo_rd2(0x1841); mdo_rd2(0x1845);
+    mdo_rd2(0x1849); mdo_rd2(0x1854); mdo_rd2(0x1884); mdo_rd2(0x188C);
+    kprintln("modeset: dump group M1-MPC", 26);
+    mdo_rd2(0x1271); mdo_rd2(0x1272); mdo_rd2(0x1273); mdo_rd2(0x1274); mdo_rd2(0x127F); mdo_rd2(0x1385);
+    kprintln("modeset: dump group M1-HUBP0", 28);
+    mdo_rd2(0x05E5); mdo_rd2(0x05E7); mdo_rd2(0x05EA); mdo_rd2(0x05F3); mdo_rd2(0x05F4);
+    mdo_rd2(0x0607); mdo_rd2(0x060A); mdo_rd2(0x060B); mdo_rd2(0x061A); mdo_rd2(0x066C);
+    kprintln("modeset: dump group M1-PG", 25);
+    mdo_rd2(0x0080); mdo_rd2(0x0082); mdo_rd2(0x00B2);
+    kprintln("modeset: dump group M1-BASE1", 28);
+    mdo_rd1(0x40); mdo_rd1(0x41); mdo_rd1(0x80); mdo_rd1(0x81); mdo_rd1(0x82); mdo_rd1(0x99);
+    mdo_rd1(0x9A); mdo_rd1(0x9B); mdo_rd1(0x9C); mdo_rd1(0xB6); mdo_rd1(0xAB); mdo_rd1(0xAC); mdo_rd1(0xAD);
+
+    kprintln("modeset: dump group M2-PHY/RDPCS", 32);
+    mdo_rd2(0x5D2D); mdo_rd2(0x5D2E); mdo_rd2(0x5D2F); mdo_rd2(0x5D30); mdo_rd2(0x5DF0);
+    mdo_rd2(0x5E00); mdo_rd2(0x5E06); mdo_rd2(0x5EC8); mdo_rd2(0x5ED8); mdo_rd2(0x5EDE);
+
+    kprintln("modeset: dump group M3-scaler", 29);
+    mdo_rd2(0x0CEC); mdo_rd2(0x0CF1); mdo_rd2(0x0D03); mdo_rd2(0x016B);
+
+    kprintln("modeset: dump end -- 81 registers (M1 67 + M2 10 + M3 4)", 56);
     return 0;
 }
 
@@ -1375,6 +1438,13 @@ fn mdo_validate(rec) {
         if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
     }
+    if (op == MDO_OP_DUMP) {
+        # DUMP prints to klug, takes no operands — +8..+23 must be zero, same as NOP.
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
     if (op == MDO_OP_CAPS) {
         var out_len = load64(rec + 16);
         if (out_len < 32) { return MDO_E_OUTBUF; }
@@ -1387,6 +1457,7 @@ fn mdo_execute(rec) {
     var op = load32(rec) & 0xFFFFFFFF;
     if (op == MDO_OP_NOP)  { return 0; }
     if (op == MDO_OP_CAPS) { return mdo_caps_write(load64(rec + 8)); }
+    if (op == MDO_OP_DUMP) { return mdo_dump(); }
     return MDO_E_BADOP;                              # unreachable after validate — belt-and-suspenders
 }
 

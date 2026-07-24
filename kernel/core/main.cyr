@@ -4920,6 +4920,10 @@ modeset_disarm();
 # path-parsing wrinkle. The FS must carry /bin/modeset — the smoke stages it into the ext2 image.
 kprintln("modeset: running /bin/modeset", 29);
 sh_exec("run /bin/modeset", 16);
+# Also exercise the --dump arg path (M1/M2/M3). Under QEMU (no DCN) the dump op returns reason 1; the point
+# here is to prove argv reaches the tool and routes to the DUMP op, distinct from the bare caps run above.
+kprintln("modeset: running /bin/modeset --dump", 36);
+sh_exec("run /bin/modeset --dump", 23);
 #endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===

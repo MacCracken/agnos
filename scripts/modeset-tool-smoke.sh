@@ -85,10 +85,10 @@ wantno(){ if grep -aq "$2" "$1"; then echo "FAIL: $4"; fail=$((fail+1)); else ec
 want "$LOG" "modeset: caps OK" \
      "the tool ran in ring 3 and #93 returned a valid caps read" \
      "no 'caps OK' — the tool did not run or #93 failed (see error lines above)"
-# The op-support mask must be exactly 3 (bit0 NOP + bit1 CAPS). A 0 here would mean a constant collapsed.
-want "$LOG" "modeset: opmask=3" \
-     "the op-support mask is 3 (NOP + CAPS) — the kernel wrote real caps, not zeros" \
-     "opmask != 3 — the caps write is wrong or a constant read 0"
+# The op-support mask must be exactly 7 (bit0 NOP + bit1 CAPS + bit2 DUMP). A 0 here would mean a constant collapsed.
+want "$LOG" "modeset: opmask=7" \
+     "the op-support mask is 7 (NOP + CAPS + DUMP) — the kernel wrote real caps, not zeros" \
+     "opmask != 7 — the caps write is wrong or a constant read 0"
 # Under QEMU there is no AMD GPU, so the display must read DARK — this is what makes exit 96 the right answer.
 want "$LOG" "modeset: display DARK" \
      "the caps honestly report no lit display under QEMU" \
@@ -101,9 +101,15 @@ wantno "$LOG" "modeset: #93 error" \
 want "$LOG" "run: exit 96" \
      "★ run: exit 96 — the modeset seam is live end to end (ring-3 tool -> #93 -> caps), no GPU present" \
      "not 'run: exit 96' — read the exit code above (95=lit iron, 97=ABI err, 98=latch blocked, 99=unexpected)"
-# The recovery boot must still reach the shell (the tool run must not wedge the boot).
+# --dump arg path (M1/M2/M3). Proves argv reaches the tool and routes to the DUMP op. Under QEMU there is no
+# DCN, so the dump op returns reason 1 (no GPU) — which is itself the proof the op DISPATCHED (a #93 ABI
+# error would be reason 2/11/12; a broken argv would fall through to caps and never print a dump line).
+want "$LOG" "modeset: #93 dump error idx=0 reason=1" \
+     "★ --dump routed to the DUMP op and returned reason 1 (no DCN under QEMU) — argv works, op dispatched" \
+     "--dump did not reach the DUMP op — argv broken, or the op rejected the record (not reason 1)"
+# The recovery boot must still reach the shell (the tool runs must not wedge the boot).
 want "$LOG" "Launching kybernet" \
-     "the boot reached the shell (the tool run did not wedge)" \
+     "the boot reached the shell (the tool runs did not wedge)" \
      "boot did not reach kybernet"
 
 echo ""

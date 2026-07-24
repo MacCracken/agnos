@@ -101,8 +101,41 @@ fn modeset_caps(): i64 {
     return 96;                              # seam live, no lit display (QEMU / dark port) — informational
 }
 
+# M1/M2/M3 — trigger the read-only DCN pipe dump (#93 op 0x02). The dump itself prints `rd <off> <val>`
+# to the KERNEL log (klug) progressively (hang-localising), so capture it with `run /bin/klug > m1.txt`;
+# this call just triggers it and reports the outcome. Under QEMU (no DCN) it returns reason 1.
+fn modeset_dump(): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }
+    store32(&rec + 0, 2);                                    # op = MDO_OP_DUMP (0x02)
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        m_puts("modeset: #93 dump error idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(code & 0xFF); m_nl();
+        if ((code & 0xFF) == 1) { m_puts("modeset: (reason 1 = no GPU / live pipe != 0 -- QEMU has no DCN)"); m_nl(); }
+        return 97;
+    }
+    m_puts("modeset: dump complete -- capture with:  run /bin/klug > m1.txt"); m_nl();
+    return 95;
+}
+
+# `--dump` = the M1/M2/M3 read-only pipe dump; `--caps` (or bare) = the caps probe. argc/argv come from the
+# kernel's parked init stack; if that ever reads 0 (the argv-init trap) the tool falls back to caps, so a
+# bare `run /bin/modeset` always works.
+fn modeset_main(): i64 {
+    args_init();
+    if (argc() >= 2) {
+        var a1 = argv(1);
+        if (streq(a1, "--dump") == 1) { return modeset_dump(); }
+        if (streq(a1, "--caps") == 1) { return modeset_caps(); }
+    }
+    return modeset_caps();
+}
+
 fn _entry(): i64 {
-    var r = modeset_caps();
+    var r = modeset_main();
     syscall(SYS_EXIT, r);
     return 0;
 }
