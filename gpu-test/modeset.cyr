@@ -112,23 +112,113 @@ fn modeset_dump(): i64 {
     var r = sys_gpu_modeset_op(&rec, 64);
     if (r < 0) {
         var code = 0 - r;
+        var reason = code & 0xFF;
         m_puts("modeset: #93 dump error idx="); m_num(code >> 8);
-        m_puts(" reason="); m_num(code & 0xFF); m_nl();
-        if ((code & 0xFF) == 1) { m_puts("modeset: (reason 1 = no GPU / live pipe != 0 -- QEMU has no DCN)"); m_nl(); }
+        m_puts(" reason="); m_num(reason); m_nl();
+        # reason 1 (no GPU / live pipe != 0) is the QEMU informational path, not a failure — 96 like caps
+        # and --lock, so the exit code means the same thing across all three M-lane arg ops.
+        if (reason == 1) { m_puts("modeset: no GPU / live pipe != 0 -- QEMU has no DCN"); m_nl(); return 96; }
         return 97;
     }
     m_puts("modeset: dump complete -- capture with:  run /bin/klug > m1.txt"); m_nl();
     return 95;
 }
 
-# `--dump` = the M1/M2/M3 read-only pipe dump; `--caps` (or bare) = the caps probe. argc/argv come from the
-# kernel's parked init stack; if that ever reads 0 (the argv-init trap) the tool falls back to caps, so a
-# bare `run /bin/modeset` always works.
+# M4 — trigger the OTG-lock proof (#93 op 0x03). The kernel op arms the H2 latch, takes the OTG master
+# update lock, writes V_TOTAL back to its OWN value, re-arms the surface (VUPDATE trigger) and releases —
+# a live-pipe write that changes nothing, so the lock MECHANISM is validated in isolation. Pass = lock
+# acked AND I1 advanced AND no underflow, all printed to klug. This call triggers it and reports the
+# outcome. Under QEMU (no DCN) it returns reason 1 -> 96. First WRITE bite of work list B — the latch is
+# now live; disarm with `rm /.modeset-armed` when done.
+#   95 = lock OK (acked, pipe kept scanning, no underflow)     97 = a hardware check failed (detail in klug)
+#   96 = no GPU here (QEMU / dark port) -- informational        98 = latch would not arm (blocked / read-only fs)
+fn modeset_lock(): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }
+    store32(&rec + 0, 3);                                    # op = MDO_OP_LOCK (0x03)
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        var reason = code & 0xFF;
+        m_puts("modeset: #93 lock error idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(reason); m_nl();
+        if (reason == 1) { m_puts("modeset: no GPU / live pipe != 0 -- QEMU has no DCN"); m_nl(); return 96; }
+        if (reason == 4) {
+            m_puts("modeset: latch would not arm -- blocked (prior modeset did not disarm) or read-only fs"); m_nl();
+            m_puts("modeset: recover with:  rm /.modeset-armed"); m_nl();
+            return 98;
+        }
+        if (reason == 5) { m_puts("modeset: LOCK did not ack -- master update lock timed out (see klug)"); m_nl(); return 97; }
+        if (reason == 6) { m_puts("modeset: STALL -- I1 did not advance under the lock (see klug)"); m_nl(); return 97; }
+        if (reason == 7) { m_puts("modeset: UNDERFLOW -- OPTC bit10 set after the lock (see klug)"); m_nl(); return 97; }
+        m_puts("modeset: (reasons: 2=badop 3=outbuf 11=desc 12=reserved)"); m_nl();
+        return 97;
+    }
+    if (r != 0) {
+        m_puts("modeset: #93 lock returned unexpected "); m_num(r); m_nl();
+        return 99;
+    }
+    m_puts("modeset: LOCK OK -- acked, pipe kept scanning, no underflow -- capture:  run /bin/klug"); m_nl();
+    m_puts("modeset: disarm when done with:  rm /.modeset-armed"); m_nl();
+    return 95;
+}
+
+# M5 — the first REAL modeset (#93 op 0x04). The kernel op arms the H2 latch, then runs A/B/C phases:
+# measure the inherited refresh (v_total 1481), write v_total 1501, restore 1481 — each write watchdog-guarded
+# (if the frame counter stops, the inherited V_TOTAL is restored in-kernel). The proof is I2 (frame-counted
+# refresh, printed to klug): 1481->1501 must drop it 59.951->59.152 Hz, then restore. This call triggers it
+# and reports the outcome. Under QEMU (no DCN) it returns reason 1 -> 96. The latch is live afterward; disarm
+# with `rm /.modeset-armed`. Exit codes name the outcome for the burn tracker:
+#   95 = FIRST MODESET COMMITTED (refresh moved to prediction + restored)   93 = refresh did NOT move (shadow-only)
+#   96 = no GPU here (QEMU)                92 = moved but off prediction     91 = watchdog fired (pipe restored)
+#   94 = refused: pipe not the calibrated mode / DRR on   97 = unmeasurable   98 = latch would not arm
+#   90 = OPTC underflow -- timing may be live but scanout is CORRUPT (the free-running-instrument blind spot)
+fn modeset_vtotal(): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }
+    store32(&rec + 0, 4);                                    # op = MDO_OP_VTOTAL (0x04)
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        var reason = code & 0xFF;
+        m_puts("modeset: #93 vtotal error idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(reason); m_nl();
+        if (reason == 1) { m_puts("modeset: no GPU / live pipe != 0 -- QEMU has no DCN"); m_nl(); return 96; }
+        if (reason == 4) {
+            m_puts("modeset: latch would not arm -- blocked (prior modeset did not disarm) or read-only fs"); m_nl();
+            m_puts("modeset: recover with:  rm /.modeset-armed"); m_nl();
+            return 98;
+        }
+        if (reason == 7) { m_puts("modeset: OPTC UNDERFLOW -- scanout corrupt though timing may be live (see klug)"); m_nl(); return 90; }
+        if (reason == 8) { m_puts("modeset: refused -- V_TOTAL is not the calibrated 1480 (pipe not the known mode)"); m_nl(); return 94; }
+        if (reason == 9) { m_puts("modeset: refused -- V_TOTAL_CONTROL nonzero (DRR/VRR on) -- untested path"); m_nl(); return 94; }
+        if (reason == 10) { m_puts("modeset: WATCHDOG fired -- pipe stopped, inherited V_TOTAL restored (see klug)"); m_nl(); return 91; }
+        if (reason == 13) { m_puts("modeset: refresh did NOT move -- write landed in shadow, VUPDATE never swapped (see klug)"); m_nl(); return 93; }
+        if (reason == 14) { m_puts("modeset: refresh moved but OFF prediction -- totals or stride wrong (see klug)"); m_nl(); return 92; }
+        if (reason == 15) { m_puts("modeset: refresh unmeasurable -- pipe not counting cleanly (see klug)"); m_nl(); return 97; }
+        return 97;
+    }
+    if (r != 0) {
+        m_puts("modeset: #93 vtotal returned unexpected "); m_num(r); m_nl();
+        return 99;
+    }
+    m_puts("modeset: FIRST MODESET COMMITTED -- refresh moved 59.951->59.152->59.951 Hz -- capture:  run /bin/klug"); m_nl();
+    m_puts("modeset: disarm when done with:  rm /.modeset-armed"); m_nl();
+    return 95;
+}
+
+# `--dump` = the M1/M2/M3 read-only pipe dump; `--lock` = the M4 OTG-lock proof (WRITES under the latch);
+# `--caps` (or bare) = the caps probe. argc/argv come from the kernel's parked init stack; if that ever
+# reads 0 (the argv-init trap) the tool falls back to caps, so a bare `run /bin/modeset` always works.
 fn modeset_main(): i64 {
     args_init();
     if (argc() >= 2) {
         var a1 = argv(1);
         if (streq(a1, "--dump") == 1) { return modeset_dump(); }
+        if (streq(a1, "--lock") == 1) { return modeset_lock(); }
+        if (streq(a1, "--vtotal") == 1) { return modeset_vtotal(); }
         if (streq(a1, "--caps") == 1) { return modeset_caps(); }
     }
     return modeset_caps();

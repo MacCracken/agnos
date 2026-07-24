@@ -85,10 +85,10 @@ wantno(){ if grep -aq "$2" "$1"; then echo "FAIL: $4"; fail=$((fail+1)); else ec
 want "$LOG" "modeset: caps OK" \
      "the tool ran in ring 3 and #93 returned a valid caps read" \
      "no 'caps OK' — the tool did not run or #93 failed (see error lines above)"
-# The op-support mask must be exactly 7 (bit0 NOP + bit1 CAPS + bit2 DUMP). A 0 here would mean a constant collapsed.
-want "$LOG" "modeset: opmask=7" \
-     "the op-support mask is 7 (NOP + CAPS + DUMP) — the kernel wrote real caps, not zeros" \
-     "opmask != 7 — the caps write is wrong or a constant read 0"
+# The op-support mask must be exactly 31 (bit0 NOP + bit1 CAPS + bit2 DUMP + bit3 LOCK + bit4 VTOTAL). A 0 here would mean a constant collapsed.
+want "$LOG" "modeset: opmask=31" \
+     "the op-support mask is 31 (NOP + CAPS + DUMP + LOCK + VTOTAL) — the kernel wrote real caps, not zeros" \
+     "opmask != 31 — the caps write is wrong or a constant read 0"
 # Under QEMU there is no AMD GPU, so the display must read DARK — this is what makes exit 96 the right answer.
 want "$LOG" "modeset: display DARK" \
      "the caps honestly report no lit display under QEMU" \
@@ -107,6 +107,26 @@ want "$LOG" "run: exit 96" \
 want "$LOG" "modeset: #93 dump error idx=0 reason=1" \
      "★ --dump routed to the DUMP op and returned reason 1 (no DCN under QEMU) — argv works, op dispatched" \
      "--dump did not reach the DUMP op — argv broken, or the op rejected the record (not reason 1)"
+# --lock arg path (M4 OTG-lock proof). Under QEMU there is no DCN, so mdo_lock refuses at the gpu_present
+# gate and returns reason 1 — BEFORE arming the latch or writing anything. Same shape as --dump: reason 1
+# proves the LOCK op DISPATCHED (an ABI error would be reason 2/11/12; a broken argv would fall to caps).
+want "$LOG" "modeset: #93 lock error idx=0 reason=1" \
+     "★ --lock routed to the LOCK op and returned reason 1 (no DCN under QEMU) — the M4 write op dispatched, no register touched" \
+     "--lock did not reach the LOCK op — argv broken, or the op rejected the record (not reason 1)"
+# ⛔ Under QEMU the latch must NOT have armed — the gpu_present gate precedes modeset_arm, so a latch-armed
+# line here would mean M4 armed before refusing (arming with nothing to protect).
+wantno "$LOG" "modeset: latch armed at site=4" \
+     "the M4 op refused BEFORE arming the latch under QEMU (gpu_present gate precedes the arm)" \
+     "M4 armed the latch under QEMU — the gpu_present gate must precede modeset_arm"
+# --vtotal arg path (M5 first real modeset). Under QEMU there is no DCN, so mdo_vtotal refuses at gpu_present
+# and returns reason 1 BEFORE arming or writing — proving the VTOTAL op dispatched without risking a modeset.
+want "$LOG" "modeset: #93 vtotal error idx=0 reason=1" \
+     "★ --vtotal routed to the VTOTAL op and returned reason 1 (no DCN under QEMU) — the M5 modeset op dispatched, no register touched" \
+     "--vtotal did not reach the VTOTAL op — argv broken, or the op rejected the record (not reason 1)"
+# ⛔ Under QEMU M5 must NOT have armed either — the gpu_present gate precedes modeset_arm(5).
+wantno "$LOG" "modeset: latch armed at site=5" \
+     "the M5 op refused BEFORE arming the latch under QEMU (gpu_present gate precedes the arm)" \
+     "M5 armed the latch under QEMU — the gpu_present gate must precede modeset_arm"
 # The recovery boot must still reach the shell (the tool runs must not wedge the boot).
 want "$LOG" "Launching kybernet" \
      "the boot reached the shell (the tool runs did not wedge)" \

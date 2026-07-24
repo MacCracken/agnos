@@ -4924,6 +4924,16 @@ sh_exec("run /bin/modeset", 16);
 # here is to prove argv reaches the tool and routes to the DUMP op, distinct from the bare caps run above.
 kprintln("modeset: running /bin/modeset --dump", 36);
 sh_exec("run /bin/modeset --dump", 23);
+# And the M4 --lock write path. Under QEMU (no DCN) mdo_lock refuses at the gpu_present gate and returns
+# reason 1 BEFORE arming the latch or touching any register — so this proves the LOCK op dispatches without
+# risking a write. The real proof is on iron, where the lock/I1/underflow instruments fire.
+kprintln("modeset: running /bin/modeset --lock", 36);
+sh_exec("run /bin/modeset --lock", 23);
+# And the M5 --vtotal first-real-modeset path. Same QEMU story: mdo_vtotal refuses at gpu_present and returns
+# reason 1 BEFORE arming or writing — proving the VTOTAL op dispatches without risking the modeset. The real
+# proof (refresh 59.951->59.152->59.951 Hz + the frame-count watchdog) is on iron.
+kprintln("modeset: running /bin/modeset --vtotal", 38);
+sh_exec("run /bin/modeset --vtotal", 25);
 #endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===

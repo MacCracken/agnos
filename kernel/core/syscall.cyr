@@ -1320,12 +1320,24 @@ var MDO_OP_MAX_LEN   = 4096;        # cap on the whole array
 var MDO_OP_NOP       = 0x00;        # validated, dispatches nothing — batch padding / ABI probe
 var MDO_OP_CAPS      = 0x01;        # write the modeset caps (8x u32 LE) to the record's out_uva
 var MDO_OP_DUMP      = 0x02;        # M1/M2/M3 read-only DCN pipe dump -> progressive `rd <off> <val>` to klug
-var MDO_OP_SUPPORTED = 0x7;         # bit N set <=> op code N implemented: bit0 NOP, bit1 CAPS, bit2 DUMP
+var MDO_OP_LOCK      = 0x03;        # M4 OTG-lock proof — take lock, write V_TOTAL back to itself, release
+var MDO_OP_VTOTAL    = 0x04;        # M5 first real modeset — V_TOTAL 1481->1501->1481, oracled off I2 refresh
+var MDO_OP_SUPPORTED = 0x1F;        # bit N set <=> op N implemented: bit0 NOP, 1 CAPS, 2 DUMP, 3 LOCK, 4 VTOTAL
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
 var MDO_E_OUTBUF     = 3;           # op    — CAPS out_uva/out_len invalid
+var MDO_E_ARM        = 4;           # op    — M-lane: the H2 latch would not arm (blocked, or fs not writable)
+var MDO_E_LOCK       = 5;           # op    — M4: gpu_otg_lock did not ack (the lock timed out)
+var MDO_E_STALL      = 6;           # op    — M4: the OTG frame counter did not advance (pipe not scanning)
+var MDO_E_UNDERFLOW  = 7;           # op    — M4: OPTC underflow bit10 NEWLY set (0->1) by the lock cycle
+var MDO_E_NOTMODE    = 8;           # op    — M5: V_TOTAL is not the arc's calibrated 1480 (pipe not the known mode)
+var MDO_E_DRR        = 9;           # op    — M5: V_TOTAL_CONTROL != 0 (DRR/VRR engaged) — untested path, refuse
+var MDO_E_WEDGED     = 10;          # op    — M5: the frame-count WATCHDOG fired (pipe stopped); inherited V_TOTAL restored
 var MDO_E_DESC       = 11;          # call  — bad desc_uva / len, or the copy-in failed
 var MDO_E_RESERVED   = 12;          # op    — a reserved dword or an undefined field was non-zero
+var MDO_E_NOCOMMIT   = 13;          # op    — M5: refresh did NOT move — the write landed in shadow, VUPDATE never swapped
+var MDO_E_MODESET    = 14;          # op    — M5: refresh moved but not to the predicted value (totals/stride wrong)
+var MDO_E_UNMEAS     = 15;          # op    — M5: refresh unmeasurable (pipe not scanning cleanly enough to count)
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -1429,6 +1441,224 @@ fn mdo_dump() {
     return 0;
 }
 
+# ── M4 OTG-lock proof (MODESET_OP_LOCK) ──────────────────────────────────────────────────────────────
+# Prove the commit primitive on the LIVE pipe with NOTHING at stake, so the lock MECHANISM is what gets
+# validated, isolated from any real mode change. The sequence is the full one M5/M7 build the timing writes
+# on — take the OTG master update lock, write a register, re-arm the surface (VUPDATE trigger), release —
+# but the register written is V_TOTAL set back to the EXACT bits it already holds. Every value is preserved,
+# so a correct run is INVISIBLE on the panel: the evidence lives in the instruments, never in a readback (a
+# DCN readback is a SHADOW read — see gpu_dcn_write_committed). Pass = all three of:
+#   · the lock ACKED (gpu_otg_lock_acked == 1) — the poll is bounded and proceeds on timeout, so an unacked
+#     lock is indistinguishable from a taken one unless it is reported (this cost burn 2 of the D lane);
+#   · I1 (OTG_STATUS_FRAME_COUNT) ADVANCED across the hold — the pipe never froze under the lock (a lock
+#     left held freezes the pipe on its last frame, which LOOKS exactly like a successful hold);
+#   · OPTC underflow (sticky bit10) was not NEWLY set (0 -> 1) by the lock/unlock cycle.
+# ⚠ SCOPE OF THE PROOF: a green M4 proves the lock ENGAGES and the live pipe SURVIVES the lock/unlock cycle —
+# NOT that a write commits shadow -> VUPDATE -> live. Because V_TOTAL is written back to its OWN value,
+# "committed", "reached shadow only" and "never left shadow" are indistinguishable to every M4 instrument (the
+# readback is a shadow read; I1 advances regardless; an identical value cannot induce underflow). Proving a
+# write actually COMMITS is M5's job (V_TOTAL 1480 -> 1500, measured as a refresh change on I2). Do not read a
+# green M4 as "commit proven" — that conflation is the D-lane's "assumed committed" error.
+# Arming happens HERE, at the ring-3 op (S12's preferred site): reaching this code proves the shell ran, so
+# "the shell was reached" is a PRECONDITION of arming rather than a postcondition to prove. THE GATE inside
+# gpu_dcn_write_committed refuses the write unless this arm set the token. Re-runnable in one boot (the arm
+# overwrites in place); the operator disarms with `rm /.modeset-armed` when done.
+fn mdo_lock() {
+    if (gpu_present == 0)      { return MDO_E_NOGPU; }      # QEMU: no DCN aperture to lock
+    if (gpu_display_ok != 1)   { return MDO_E_NOGPU; }
+    if (gpu_display_pipe != 0) { kprintln("modeset: lock refused -- live pipe is not 0", 43); return MDO_E_NOGPU; }
+    var pipe = 0;
+    # Arm the H2 latch. modeset_arm refuses if a previous boot did not disarm (blocked), or the fs is not
+    # writable; on refusal nothing below runs and the pipe is untouched.
+    if (modeset_arm(4) != 1)   { kprintln("modeset: lock refused -- latch would not arm", 44); return MDO_E_ARM; }
+
+    # Instruments + the write-back source, BEFORE. The no-op property is that vt_raw is V_TOTAL's OWN current
+    # value — NOT that "raw is safer": writing back the exact 32 bits just read (reserved included) reprograms
+    # V_TOTAL to what it already was, so even a fully-latched VUPDATE changes nothing. ⛔ M5/M7 write DIFFERENT
+    # values and must mask/derive deliberately — do not carry "write the raw dword" forward from here.
+    var fc0    = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
+    var unf0   = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    var vt_raw = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL) & 0xFFFFFFFF;
+
+    kprint("modeset: lock begin pipe 0 vtotal ", 34); kprint_num(vt_raw & GPU_OTG_TOTAL_MASK);
+    kprintln(" (written back unchanged)", 25);
+
+    # Reset the ack BEFORE the committed write so it unambiguously reflects THIS op's lock, not a stale value
+    # from a prior modeset op in the same boot (gpu_otg_lock_acked is a boot-persistent global; if the GATE
+    # ever refused the write it would never call gpu_otg_lock, and a stale 1 would read as a phantom ack).
+    gpu_otg_lock_acked = 0;
+    # The whole lock -> write -> VUPDATE -> unlock cycle for V_TOTAL, to its own value. Carries THE GATE.
+    var rb   = gpu_dcn_write_committed(pipe, GPU_R_OTG_V_TOTAL, GPU_DCN_OTG_STRIDE, vt_raw);
+    # Hold ~120 ms (~7 frames at 60 Hz) so I1 has room to move even if a frame or two is missed.
+    var held = gpu_dcn_hold_ms(120);
+
+    # Instruments AFTER.
+    var fc1  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
+    var unf1 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    var advanced = 0;
+    if (fc1 != fc0) { advanced = 1; }
+
+    kprint("modeset: lock ack ", 18); kprint_num(gpu_otg_lock_acked);
+    kprint(" readback ", 10); kprint_num(rb & GPU_OTG_TOTAL_MASK);
+    kprint(" hold ", 6); kprint_num(held); kprintln(" ms", 3);
+    kprint("modeset: I1 frames ", 19); kprint_num(fc0); kprint(" -> ", 4); kprint_num(fc1);
+    kprint(" advanced ", 10); kprint_num(advanced); kprintln("", 0);
+    kprint("modeset: underflow bit10 ", 25); kprint_num(unf0); kprint(" -> ", 4); kprint_num(unf1); kprintln("", 0);
+
+    # Verdict. Lock first — an unacked lock invalidates every observation after it. Then pipe-alive.
+    if (gpu_otg_lock_acked != 1) { kprintln("modeset: LOCK FAILED -- master update lock did not ack", 54); return MDO_E_LOCK; }
+    if (advanced == 0)           { kprintln("modeset: STALL -- I1 did not advance across the lock cycle -- pipe wedged", 73); return MDO_E_STALL; }
+    # ⚠ Underflow is a DELTA, not an absolute. OPTC bit10 is a STICKY latch nothing in the kernel clears, so
+    # it may ALREADY read 1 from earlier boot/HUBP bring-up (it DID during the retired D lane — see
+    # iron-nuc-zen-log Attempt 1: an absolute check there "passed by construction" on a pre-set bit; an
+    # absolute check HERE would instead FALSE-FAIL). Convict M4 only when the lock/unlock cycle CAUSED the
+    # underflow (0 -> 1). A pre-existing 1 is reported, not fatal — though it weakens the I1 survival proof
+    # (the OTG counter advances on its own PLL even while the pipe underflows black), so the tracker reads a
+    # 1 -> 1 as "disregard + note", never a clean pass.
+    if (unf0 == 0) {
+        if (unf1 != 0) { kprintln("modeset: UNDERFLOW -- lock cycle set OPTC bit10 (scanout corrupted)", 67); return MDO_E_UNDERFLOW; }
+    }
+    if (unf0 != 0) { kprintln("modeset: NOTE underflow bit10 was already set BEFORE the lock -- pre-existing, not M4", 85); }
+    kprintln("modeset: LOCK OK -- acked, pipe survived the lock cycle, no underflow caused", 76);
+    return 0;
+}
+
+# ── M5 the first REAL modeset (MODESET_OP_VTOTAL): V_TOTAL 1481 -> 1501 -> 1481, oracled off I2 ─────────
+# This is the bite M4 sets up but cannot itself deliver: proof that a write COMMITS shadow -> VUPDATE -> live.
+# It moves v_total (register field + 1) from 1481 to 1501 at CONSTANT pixel clock and CONSTANT H timing —
+# the one raster field a sink tolerates moving without a re-lock — and the OTG's own frame counter is the
+# proof: refresh = pixclk / (h_total * v_total), so 1481 -> 1501 drops the measured refresh 59.951 -> 59.152
+# Hz, a ~13,300 ppm step against a 12-17 ppm noise floor. The operator looks at NOTHING; the oracle is I2
+# (gpu_refresh_measure), printed to klug. ⚠ The prediction is computed from the WRITTEN v_total, never a
+# read-back (a DCN read-back is a shadow read). Run as A (baseline, no write) / B (1501) / C (restore 1481).
+#
+# ⛔ NOT an "identity modeset" (disable -> same values -> enable): phase A is a pure MEASUREMENT of the
+# inherited refresh, and the only writes are B (the real change) and C (the restore), so success and the two
+# failure pictures are DISTINGUISHABLE by the number — the trap D-lane burn 1 fell into is avoided.
+var mdo_wedged = 0;   # set 1 by mdo_vtotal_phase when the frame-count watchdog fires (and it restored)
+
+# mdo_vtotal_phase — write V_TOTAL to vt_reg under the OTG lock, then run the SELF-RECOVERING FRAME-COUNT
+# WATCHDOG: the pipe must keep scanning, so gpu_display_wait_vblank must see the counter advance. If it does
+# NOT (a wedge), restore the inherited V_TOTAL immediately, set mdo_wedged, and return 0 — the console
+# recovers in-kernel even though the operator cannot see it (I1 is the only thing that can, and it just did).
+# On success, settle a few frames and return the measured refresh in milliHz (I2). vt_orig is the raw
+# inherited register field, restored verbatim on a wedge. THE GATE lives inside gpu_dcn_write_committed.
+fn mdo_vtotal_phase(pipe, vt_reg, vt_orig) {
+    var rb = gpu_dcn_write_committed(pipe, GPU_R_OTG_V_TOTAL, GPU_DCN_OTG_STRIDE, vt_reg);
+    var alive = gpu_display_wait_vblank(pipe);
+    if (alive == 0) {
+        kprintln("modeset: WATCHDOG -- frame counter STOPPED after write, restoring inherited V_TOTAL", 83);
+        gpu_dcn_write_committed(pipe, GPU_R_OTG_V_TOTAL, GPU_DCN_OTG_STRIDE, vt_orig);
+        # ⚠ The restore commits via VUPDATE, which needs a SCANNING pipe — the very thing that just stopped.
+        # So re-check the counter and report HONESTLY: if it resumed, the console is back; if not, the restore
+        # could not latch and only H2 (one bad boot + `rm /.modeset-armed`) recovers. Never claim "restored"
+        # without confirming the counter moved.
+        var back = gpu_display_wait_vblank(pipe);
+        if (back != 0) { kprintln("modeset: WATCHDOG -- restore latched, counter resumed", 53); }
+        if (back == 0) { kprintln("modeset: WATCHDOG -- restore did NOT latch (pipe still stopped) -- recover via H2", 81); }
+        mdo_wedged = 1;
+        return 0;
+    }
+    gpu_dcn_hold_ms(80);                         # settle the new raster before measuring
+    return gpu_refresh_measure(pipe);            # I2 — milliHz, 0 if unmeasurable
+}
+
+fn mdo_vtotal() {
+    if (gpu_present == 0)      { return MDO_E_NOGPU; }      # QEMU: no DCN
+    if (gpu_display_ok != 1)   { return MDO_E_NOGPU; }
+    if (gpu_display_pipe != 0) { kprintln("modeset: vtotal refused -- live pipe is not 0", 45); return MDO_E_NOGPU; }
+    # ⛔ The whole oracle is refresh = pixclk / (h_total * v_total); a pixclk of 0 (gpu_pixclk_discover
+    # refused the mode — interlace / half-rate / unstable) collapses every prediction and the midpoint to 0
+    # and would misread a real commit as NOCOMMIT. Refuse BEFORE arming, so a meaningless run never arms.
+    if (gpu_pixclk_100hz == 0) { kprintln("modeset: vtotal refused -- pixclk unmeasured (0), oracle meaningless", 68); return MDO_E_UNMEAS; }
+    var pipe = 0;
+    if (modeset_arm(5) != 1)   { kprintln("modeset: vtotal refused -- latch would not arm", 46); return MDO_E_ARM; }
+
+    # Pre-state, spilled BEFORE any write (H1). Saved to restore + as the watchdog's recovery target. unf0 is
+    # the pre-modeset OPTC underflow (sticky bit10) — the baseline for D1's delta check below.
+    var vt_orig  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL) & 0xFFFFFFFF;
+    var ctrl     = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_CONTROL) & 0xFFFFFFFF;
+    var htot     = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_TOTAL) & GPU_OTG_TOTAL_MASK;
+    var unf0     = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    var vt_field = vt_orig & GPU_OTG_TOTAL_MASK;           # register [14:0] = v_total - 1
+    var htot_dec = htot + 1;                                # h_total (constant across this bite)
+    kprint("modeset: vtotal pre-state v_total ", 34); kprint_num(vt_field + 1);
+    kprint(" h_total ", 9); kprint_num(htot_dec);
+    kprint(" ctrl ", 6); kprint_num(ctrl); kprint(" pixclk_100hz ", 14); kprint_num(gpu_pixclk_100hz); kprintln("", 0);
+
+    # ⛔ Refuse anything but the arc's calibrated GOP mode. The register field must read 1480 (v_total 1481);
+    # a different value means the pipe is not the mode these numbers were derived for, so the oracle would be
+    # meaningless — abort rather than modeset a mystery.
+    if (vt_field != 1480) { kprintln("modeset: vtotal refused -- V_TOTAL field is not the calibrated 1480", 67); return MDO_E_NOTMODE; }
+    # ⛔ DRR must be OFF (V_TOTAL_CONTROL == 0, as M1 read on the GOP pipe): then V_TOTAL alone drives the
+    # raster and MIN/MAX are inert. A non-zero control means DRR/VRR is engaged and MIN/MAX would need
+    # programming too — untested, so refuse rather than half-modeset a dynamic-refresh pipe.
+    if (ctrl != 0) { kprintln("modeset: vtotal refused -- V_TOTAL_CONTROL nonzero (DRR on) -- untested", 71); return MDO_E_DRR; }
+
+    mdo_wedged = 0;
+    var t0 = rdtsc();
+    # D4: the B target preserves V_TOTAL's reserved bits [31:15] and sets the field [14:0] = 1500 (v_total
+    # 1501). On iron the upper bits are 0 (byte-identical to a literal 1500), but write-back-what-you-read is
+    # the correct register discipline and the only form that survives a port to a register with live [31:15].
+    var vt_b = (vt_orig & 0xFFFF8000) | 1500;
+    # Predicted refresh (milliHz) from the WRITTEN v_total (never a read-back): pixclk_100hz * 100000 /
+    # (h_total * v_total). 2415014 * 100000 / (2720 * 1481) = 59950; / (2720 * 1501) = 59151.
+    var pix    = gpu_pixclk_100hz;
+    var pred_a = pix * 100000 / (htot_dec * 1481);
+    var pred_b = pix * 100000 / (htot_dec * 1501);
+
+    # PHASE A — baseline: MEASURE the inherited refresh, no write (avoids the identity-modeset trap).
+    var ra = gpu_refresh_measure(pipe);
+    kprint("modeset: [T+", 12); kprint_num((rdtsc() - t0) / GPU_TSC_PER_US / 1000); kprint("ms] A v_total 1481 refresh ", 27);
+    kprint_num(ra); kprint(" mHz predicted ", 15); kprint_num(pred_a); kprintln(" mHz", 4);
+    # Fail early if the baseline itself is unmeasurable — do NOT modeset a pipe we cannot oracle.
+    if (ra == 0) { kprintln("modeset: VTOTAL unmeasurable at A -- pipe not counting, no modeset attempted", 76); return MDO_E_UNMEAS; }
+
+    # PHASE B — the modeset: v_total 1501. THE write, watchdog-guarded. Sample the lock ack (disambiguates a
+    # NOCOMMIT caused by an unacked lock) and the OPTC underflow (D1 — the free-running instruments below
+    # cannot see a corrupt scanout, so this sticky bit is the ONLY signal that the raster underflowed).
+    var rb2  = mdo_vtotal_phase(pipe, vt_b, vt_orig);
+    var ackb = gpu_otg_lock_acked;
+    var unfb = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    kprint("modeset: [T+", 12); kprint_num((rdtsc() - t0) / GPU_TSC_PER_US / 1000); kprint("ms] B v_total 1501 refresh ", 27);
+    kprint_num(rb2); kprint(" mHz predicted ", 15); kprint_num(pred_b); kprint(" lock ack ", 10); kprint_num(ackb); kprintln("", 0);
+    if (mdo_wedged != 0) { kprintln("modeset: VTOTAL WEDGED at B -- restored, see WATCHDOG line", 58); return MDO_E_WEDGED; }
+
+    # PHASE C — restore the INHERITED value (D4: vt_orig, not a literal), watchdog-guarded.
+    var rc   = mdo_vtotal_phase(pipe, vt_orig, vt_orig);
+    var unfc = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    kprint("modeset: [T+", 12); kprint_num((rdtsc() - t0) / GPU_TSC_PER_US / 1000); kprint("ms] C v_total 1481 refresh ", 27);
+    kprint_num(rc); kprint(" mHz predicted ", 15); kprint_num(pred_a); kprintln(" mHz", 4);
+    if (mdo_wedged != 0) { kprintln("modeset: VTOTAL WEDGED at C -- restored, see WATCHDOG line", 58); return MDO_E_WEDGED; }
+    kprint("modeset: underflow bit10 ", 25); kprint_num(unf0); kprint(" -> ", 4); kprint_num(unfb); kprint(" -> ", 4); kprint_num(unfc); kprintln("", 0);
+
+    # Verdict. Every write phase must have measured (a 0 means the pipe would not count — unmeasurable).
+    if (rb2 == 0) { kprintln("modeset: VTOTAL unmeasurable at B -- pipe not counting", 54); return MDO_E_UNMEAS; }
+    if (rc == 0) { kprintln("modeset: VTOTAL unmeasurable at C -- pipe not counting", 54); return MDO_E_UNMEAS; }
+    # D1: OPTC underflow (DELTA, like M4). Both M5 instruments free-run off the OTG PLL, so the refresh triple
+    # below cannot see a corrupt scanout — this sticky bit is the only corrupt-scanout signal. Convict only a
+    # NEWLY-set bit10 (0 -> 1 across the modeset); a pre-existing 1 is disregarded (noted). A green M5 must be
+    # "displayed cleanly", not merely "timing committed to a free-running counter".
+    if (unf0 == 0) {
+        if (unfb != 0) { kprintln("modeset: VTOTAL UNDERFLOW at B -- OPTC bit10 newly set; scanout corrupt though timing may be live", 97); return MDO_E_UNDERFLOW; }
+        if (unfc != 0) { kprintln("modeset: VTOTAL UNDERFLOW at C -- OPTC bit10 newly set by the restore", 69); return MDO_E_UNDERFLOW; }
+    }
+    if (unf0 != 0) { kprintln("modeset: NOTE OPTC underflow bit10 was already set BEFORE the modeset -- pre-existing", 85); }
+    # Midpoint classifier: pred_a ~59950, pred_b ~59151, midpoint ~59550. B must cross BELOW it (moved toward
+    # the change); A and C must stay ABOVE it (near baseline). Signal ~800 mHz, midpoint 400 mHz from each —
+    # enormous vs the ~1 mHz (12-17 ppm) noise floor.
+    var mid = (pred_a + pred_b) / 2;
+    if (ra < mid) { kprintln("modeset: VTOTAL anomaly -- baseline A already below midpoint (pixclk off?)", 74); return MDO_E_MODESET; }
+    if (rc < mid) { kprintln("modeset: VTOTAL anomaly -- C did not restore to baseline", 56); return MDO_E_MODESET; }
+    if (rb2 >= mid) { kprintln("modeset: VTOTAL UNCHANGED -- refresh did not move; write landed in SHADOW, VUPDATE never swapped", 96); return MDO_E_NOCOMMIT; }
+    # B moved below the midpoint — did it land on the PREDICTED value, or somewhere else (totals/stride wrong)?
+    var d = rb2 - pred_b;
+    if (d < 0) { d = 0 - d; }
+    if (d > 200) { kprintln("modeset: VTOTAL moved but OFF prediction (>200 mHz) -- totals or stride wrong", 77); return MDO_E_MODESET; }
+    kprintln("modeset: VTOTAL OK -- FIRST MODESET COMMITTED; refresh moved to prediction and restored", 87);
+    return 0;
+}
+
 # mdo_validate(rec) -> 0 or an MDO_E_* reason. PURE READS on the KERNEL-RESIDENT copy. Every dword an op does
 # not define MUST be zero — a non-zero reserved field is REJECTED rather than ignored, which is what keeps
 # today's unused dwords safe to define in a later kernel without an ABI break.
@@ -1458,6 +1688,22 @@ fn mdo_validate(rec) {
         if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
     }
+    if (op == MDO_OP_LOCK) {
+        # M4 writes V_TOTAL back to its own hardware value — it takes NO operands from the record, so
+        # +8..+23 must be zero exactly like NOP/DUMP. The register and value come from the pipe, not the ABI.
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
+    if (op == MDO_OP_VTOTAL) {
+        # M5's target (v_total 1501) and register are derived in-kernel from the calibrated mode, not passed
+        # in — so it takes NO operands either; +8..+23 must be zero exactly like NOP/DUMP/LOCK.
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
     if (op == MDO_OP_CAPS) {
         var out_len = load64(rec + 16);
         if (out_len < 32) { return MDO_E_OUTBUF; }
@@ -1471,6 +1717,8 @@ fn mdo_execute(rec) {
     if (op == MDO_OP_NOP)  { return 0; }
     if (op == MDO_OP_CAPS) { return mdo_caps_write(load64(rec + 8)); }
     if (op == MDO_OP_DUMP) { return mdo_dump(); }
+    if (op == MDO_OP_LOCK) { return mdo_lock(); }
+    if (op == MDO_OP_VTOTAL) { return mdo_vtotal(); }
     return MDO_E_BADOP;                              # unreachable after validate — belt-and-suspenders
 }
 

@@ -30,6 +30,62 @@ confirming the P4 model). A real GOP-vs-amdgpu delta surfaced: `V_TOTAL_MIN/MAX=
 clamps unprogrammed; amdgpu writes 1480) — noted for M5 (its MIN/MAX writes are inert until the SEL bits
 are set).
 
+### Added — M4: the OTG-lock proof (`#93` op `MODESET_OP_LOCK` + `/bin/modeset --lock`)
+
+The first work-list-B **write** bite. A new `#93` op (0x03) exercises the OTG master-update-lock cycle on the
+live pipe with **nothing at stake**: it takes the lock, writes `V_TOTAL` back to the exact bits it already
+holds, re-arms the surface (VUPDATE trigger) and releases — so a correct run is invisible on screen. The
+evidence is three instruments, never a readback (a DCN readback is a SHADOW read): the lock must ack
+(`gpu_otg_lock_acked == 1`), I1 (`OTG_STATUS_FRAME_COUNT`) must advance across a ~120 ms hold (the pipe never
+wedged under the lock), and OPTC underflow must not be *newly* set. ⚠ **Scope** (from the pre-burn adversarial
+review, 5 lenses): a green M4 proves the lock **engages** and the pipe **survives** the lock cycle — NOT that
+a write commits shadow→VUPDATE→live (writing `V_TOTAL` back to itself makes commit-vs-no-commit
+indistinguishable to every instrument). Proving a write **commits** is M5's job (`V_TOTAL` 1480→1500, a
+refresh change on I2). M4 is the *lock-mechanism* foundation M5/M7 build on, so a later timing-write failure
+can't be mistaken for a broken lock. The underflow verdict is a **delta** (fail only on 0→1), not an absolute
+`bit10 != 0` — OPTC bit10 is a sticky latch nothing clears and it read 1 during the D-lane, so an absolute
+check would false-fail on a pre-latched bit (a pre-existing 1 is reported, not fatal).
+
+The op arms the **H2 arm-once latch inside itself** (site 4 — the ring-3 preferred site per S12: reaching the
+op proves the shell was reached), so a mistake costs exactly one bad boot. `THE GATE` in
+`gpu_dcn_write_committed`/`gpu_otg_lock` refuses the write unless that arm set the token. The write goes
+through `gpu_dcn_write_committed`, whose unlock is unconditional — the pipe cannot be left locked. Under QEMU
+(`gpu_present == 0`) the op refuses at the `gpu_present` gate **before** arming or writing (the smoke asserts
+no `latch armed at site=4` line with no GPU) and returns reason 1. `/bin/modeset --lock` triggers it (exit 95
+= lock OK, 96 = no GPU here, 97 = a hardware check failed, 98 = latch would not arm). `MDO_OP_SUPPORTED` is
+now `0xF` (NOP + CAPS + DUMP + LOCK). Re-runnable in one boot; disarm with `rm /.modeset-armed` when done.
+
+### Added — M5: the first REAL modeset (`#93` op `MODESET_OP_VTOTAL` + `/bin/modeset --vtotal`)
+
+The bite M4 sets up but cannot deliver: **proof that a write COMMITS shadow→VUPDATE→live.** A new `#93` op
+(0x04) moves `v_total` **1481 → 1501 → 1481** at constant pixel clock and H timing, and the OTG's own frame
+counter is the proof — `refresh = pixclk / (h_total × v_total)`, so `1481→1501` drops the measured refresh
+**59.951 → 59.152 Hz**, a ~13,300 ppm step against a 12-17 ppm noise floor. The operator looks at nothing;
+the oracle is **I2** (`gpu_refresh_measure`, frame-counted), and the prediction is computed from the
+**written** v_total, never a read-back. Run as A (baseline measurement, no write — deliberately not an
+identity modeset) / B (1501) / C (restore 1481); a midpoint classifier calls it: B below the midpoint =
+committed, B unchanged = `MDO_E_NOCOMMIT` (shadow-only — the distinguished negative that would settle whether
+the update lock alone suffices for timing).
+
+M5 introduces the **self-recovering frame-count WATCHDOG**: each write is followed by a frame-counter check,
+and if the pipe STOPS the kernel restores the inherited `V_TOTAL` in-kernel (the console recovers even though
+the operator can't see it — I1 can). The H2 latch remains the ultimate guarantee (one bad boot). M5 writes
+**only** `V_TOTAL` — the M1 dump showed the GOP pipe is DRR-off (`V_TOTAL_CONTROL=0`, MIN/MAX inert) — and
+**refuses** a non-calibrated V_TOTAL field or a DRR-on control rather than modeset a mystery. Phase C restores
+by construction, so the hardware ends at the inherited mode even on a failed verdict. `MDO_OP_SUPPORTED` is now
+`0x1F` (NOP + CAPS + DUMP + LOCK + VTOTAL). QEMU: `modeset-tool-smoke` **11/0** (`--vtotal` dispatches, exit 96
+with no GPU, refuses before arming). Iron proof rides the M4 flash (`--lock` then `--vtotal`, one boot).
+
+A **5-lens adversarial review returned GO** and its central finding was folded in: both M5 instruments (frame
+counter + `gpu_refresh_measure`) free-run off the OTG PLL, so a green would prove "timing committed to the
+live raster" but not "scanout is clean". **D1** adds M4's OPTC-underflow **delta** check (sample sticky bit10
+pre-/post-modeset, convict only a `0 → 1`; exit 90) so a green also means the panel is not corrupt. **D2**
+makes the watchdog's restore verify recovery (re-checks the counter and reports "restore latched" vs "did NOT
+latch — recover via H2") instead of blindly claiming success. **D3** refuses before arming if `pixclk == 0`
+(else the prediction and midpoint collapse to 0 and misread a real commit as `NOCOMMIT`). **D4** preserves
+`V_TOTAL`'s reserved bits [31:15] on write-back. Plus a lock-ack line at phase B to disambiguate an
+unacked-lock `NOCOMMIT`.
+
 ### Fixed — the M1 dump's M2 (PHY/RDPCS) offsets double-folded the IP base
 
 Caught by adversarial analysis of the iron dump, not by the smoke (QEMU has no DCN to expose it). `gpu_reg32`
