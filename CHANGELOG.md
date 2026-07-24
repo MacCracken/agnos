@@ -5,6 +5,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — H2 the arm-once modeset latch: a failed modeset now costs ONE bad boot, not a reflash
+
+MODESET harness bite **H2**, the plan's single highest-leverage item. New `kernel/core/modeset_latch.cyr`:
+`modeset_latch_check()` (unconditional, right after the mounts), `modeset_arm(site)`, `modeset_disarm()`.
+
+**Proven end to end** — `scripts/modeset-latch-smoke.sh`, **28/0** plus **4/0** on the disarm lane. Two boots,
+one disk, one binary: boot 1 arms and wedges (`cli;hlt;jmp $`, rc=137); boot 2 finds the latch, **refuses**,
+and reaches the boot tail as a normal log-capturing boot. **Control B** — a fresh disk with the *same*
+firmware NVRAM does **not** skip, proving the latch lives on the filesystem rather than in OVMF variables or
+CMOS. **Read-only lane is fail-closed**, with a hard-fail banner if it ever runs fail-open. Boot 2 re-emits
+boot 1's 64-byte record verbatim, ticks cross-checked log-against-platter, so it demonstrably read the
+platter and not its own intent.
+
+**THE GATE.** `if (modeset_armed != 1297040453) { return 0 - 1; }` is now the first statement of **both**
+`gpu_otg_lock` and `gpu_dcn_write_committed`. An unarmed modeset is structurally impossible rather than
+merely discouraged — a gate that depends on every future caller remembering it is not a gate.
+
+**S7 guard:** a latch-blocked boot spills to `/klug-2.txt`, so the recovery boot cannot overwrite the log the
+latch existed to protect.
+
+#### Four corrections to the plan — its text was wrong in ways that would have defeated the bite
+
+1. **`/f/.modeset-armed` does not exist.** There is no `/f` mount anywhere in the tree. The latch is
+   `/.modeset-armed` at ext2 root. As written the arm would have silently no-op'd and the first risky
+   modeset would have run **unlatched**.
+2. **The write was not durable.** The chain is synchronous to the *controller*, but agnos never disables the
+   drive's volatile write cache and nothing on `ext2_write_at`'s path issues a FLUSH. Safe for a CPU wedge
+   with power applied; **lost for a power-cut or platform reset inside the destage window** — which silently
+   un-arms and produces the unbounded loop the bite exists to remove. Fixed with **`blk_flush_on(ext2_backend)`**,
+   return-checked, after both the arm and the disarm. ⛔ Deliberately **not** `ext2_sync()`, which also sets
+   `EXT2_VALID_FS` and would launder an unclean shutdown into "cleanly unmounted".
+3. **The kernel now never auto-disarms.** "Delete it after the pipe is scanning (I1) and the shell is
+   reached" is unsound on both conjuncts: "before `kybernet()`" precedes the ELF load, the `iretq` into ring
+   3 and the fnptr paths that have hung before the banner, so it means *about to try*; and I1 is an **echo
+   register** — the OTG frame counter advances on its own PLL while the pipe emits black. Disarm is now a
+   single operator act, `rm /.modeset-armed`, intercepted in the unlink syscall and routed to the verified
+   path. Full reasoning in `planning/gpu.md`.
+4. **"The next boot skips AND disarms cleanly" is wrong** — it must skip and must **not** disarm. Clearing on
+   the skip produces a permanent alternating oscillator (dies / skips-and-clears / dies …) that no operator
+   action breaks, and violates H2's own "exactly one bad boot" requirement at boot 3.
+
+#### A deadlock this bite introduced, and how it was caught
+
+`modeset_arm` verifies its own write by re-reading through the same predicate the check uses. That predicate
+originally called `vfs_read_file`, whose wrapper takes `fs_spin_lock` — while `modeset_arm` already held it.
+The double-acquire **deadlocked the box mid-arm**, and the symptom was indistinguishable from a successful
+wedge: the boot hung, qemu took SIGKILL, and the log simply ended. It was caught only because the smoke
+asserted on the arm's own log line rather than merely on "it hung". Fixed by calling `vfs_read_file_inner`
+with the caller owning the lock. Also fixed: the arm sampled `timer_ticks` twice (once for the record, once
+for the log), so the two channels the cross-check compares could never agree; it now samples once.
+
 ### Added — H1 `klug_spill`: the kernel can now persist its own log ring to agnos-fs
 
 MODESET harness bite **H1**. A bite whose failure blanks the console used to lose its diagnostic with it —

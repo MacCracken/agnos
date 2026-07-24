@@ -4988,6 +4988,13 @@ fn gpu_display_probe() {
 # gpu_otg_lock — take the master update lock for `pipe`. Bounded; proceeds on timeout exactly as amdgpu's
 # REG_WAIT does, because a stuck poll must never wedge boot.
 fn gpu_otg_lock(pipe) {
+    # ⛔ THE GATE (H2/S1). No modeset without an armed latch — and it lives HERE, in the primitive, not in
+    # prose telling callers to check. A gate that depends on every future caller remembering it is not a
+    # gate; H2's whole value is that a failed modeset costs ONE bad boot, and a bypassed arm makes that
+    # guarantee a lie while creating false confidence. Inline literal, never a named var (the H4 defect
+    # made every named rc constant read 0). Same gate is on gpu_dcn_write_committed — both are required,
+    # since gating only the lock would leave the committed write executing after a failed lock.
+    if (modeset_armed != 1297040453) { return 0 - 1; }
     var o = pipe * GPU_DCN_OTG_STRIDE;
     var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o);
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_GLOBAL_CONTROL0 + o,
@@ -5052,6 +5059,9 @@ fn gpu_otg_commit_unlock(pipe) {
 # gpu_refresh_measure) and I3 (the ATOM counters). Report gpu_otg_lock_acked next to it, or the caller is
 # asserting rather than measuring — which is precisely what cost burn 2.
 fn gpu_dcn_write_committed(pipe, off, stride, val) {
+    # ⛔ THE GATE (H2/S1) — see gpu_otg_lock. Both primitives carry it; gating only the lock would leave
+    # this register write executing after a failed lock. Returns -1 (refused) rather than writing.
+    if (modeset_armed != 1297040453) { return 0 - 1; }
     var a = off + pipe * stride;
     gpu_otg_lock(pipe);
     gpu_reg32_write(GPU_BASE_DCN_2, a, val);

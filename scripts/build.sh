@@ -432,6 +432,14 @@ else
         # wraps (QEMU ~2.5 KB, iron ~16-20 KB, ring 64 KB), so this branch is otherwise untested and its
         # failure mode is a silently ROTATED log. Implies KLUG_SPILL_SELFTEST.
         [ -n "$KLUG_SPILL_WRAPTEST" ] && echo '#define KLUG_SPILL_WRAPTEST'
+        # MODESET_LATCH_SELFTEST=1 — H2: arm the latch and enter a SYNTHETIC risky step that wedges
+        # (cli;hlt;jmp $), placed LATE per the S12 placement rule. Boot the SAME binary twice on the SAME
+        # disk: boot 1 arms and wedges, boot 2 must find the latch and REFUSE. Boot 2 must be byte-identical
+        # to boot 1, which is why the lane is one flag and not two.
+        [ -n "$MODESET_LATCH_SELFTEST" ] && echo '#define MODESET_LATCH_SELFTEST'
+        # MODESET_LATCH_DISARM=1 — H2 disarm lane: skip the wedge, then exercise modeset_latch_is_path
+        # (positive AND negative) and modeset_disarm. Implies MODESET_LATCH_SELFTEST.
+        [ -n "$MODESET_LATCH_DISARM" ] && echo '#define MODESET_LATCH_DISARM'
         [ -n "$ATOM_MATH_SELFTEST" ] && echo '#define ATOM_MATH_SELFTEST'
         # ATOM_INSTR_SELFTEST=1 — H4 (modeset arc): prove every abnormal interpreter exit is DISTINCT and
         # NON-ZERO, by executing four synthetic in-RAM command tables (clean EOT / reserved opcode /

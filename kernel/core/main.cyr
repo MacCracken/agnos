@@ -827,6 +827,15 @@ exfat_init();
 # the old ext2_active-flag toggle that hid FAT/exFAT behind a mounted ext2.
 vfs_mount_init();
 
+# H2 (gpu.md, modeset arc) — THE ARM-ONCE LATCH. Read the latch and decide whether this boot may attempt a
+# modeset, then pre-allocate the latch file so a later arm never runs the block allocator.
+#
+# ⛔ TOP LEVEL, OUTSIDE EVERY #ifdef, and BEFORE klug_spill_prepare() below. Outside every #ifdef because it
+# is the only thing that makes a risky bite placed in the wrong flag nest fail CLOSED. Before the spill
+# prepare because the spill's target file depends on the blocked flag — otherwise the recovery boot
+# overwrites the very log the latch was protecting.
+modeset_latch_check();
+
 # H1 (gpu.md, modeset arc) — pre-create AND PRE-ALLOCATE /klug.txt so a later klug_spill() is a pure
 # overwrite-in-place. It runs HERE, immediately after the mounts, because that is the last moment the
 # console is guaranteed alive: the whole point of the spill is to survive a bite that blanks the display,
@@ -4867,6 +4876,41 @@ if (vnet_active != 0 || nic_ready() != 0) {
         }
     }
 }
+
+#ifdef MODESET_LATCH_SELFTEST
+# H2 — the arm-once latch, exercised with a SYNTHETIC risky step.
+#
+# ⛔ PLACED HERE DELIBERATELY, per the placement rule in modeset_latch.cyr (spec S12): this is AFTER the
+# DHCP / gateway-ARP block above, so the armed window spans no network wait, no smp_start_aps(), no
+# sched_active flip and no first-sti — all CPL0 sites where a fault does NOT route to
+# gpu_display_restore_console. Arming earlier would let an unrelated ~13 s network hang be permanently
+# convicted as a modeset failure. Do not move this earlier.
+if (modeset_latch_blocked != 0) {
+    kprintln("modeset: RISKY STEP refused by latch", 36);
+}
+if (modeset_latch_blocked == 0) {
+    if (modeset_arm(5) == 1) {
+        kprintln("modeset: RISKY STEP entered", 27);
+        #ifndef MODESET_LATCH_DISARM
+        # The real failure shape a modeset produces: wedge with power applied. cli; hlt; jmp $
+        #
+        # ⚠ The harness must capture serial with `-serial file:`, NOT `-serial stdio`. Under stdio the last
+        # lines before this wedge sit in QEMU's HOST-side buffer and are discarded by the SIGKILL that ends
+        # the boot — truncation that reads exactly like "the arm never happened". A guest-side delay cannot
+        # fix it (the bytes are already out of the guest). See modeset-latch-smoke.sh's boot().
+        asm { 0xFA; 0xF4; 0xEB; 0xFE; }
+        #endif
+    }
+}
+#ifdef MODESET_LATCH_DISARM
+# Exercise the disarm and the path predicate that routes an operator `rm` to it. The predicate must accept
+# the latch path and REJECT a neighbouring one — a predicate that matched everything would silently turn
+# every `rm` into a disarm.
+if (modeset_latch_is_path("/.modeset-armed", 15) == 1) { kprintln("modeset: pathmatch positive OK", 30); }
+if (modeset_latch_is_path("/klug.txt", 9) == 0) { kprintln("modeset: pathmatch negative OK", 30); }
+modeset_disarm();
+#endif
+#endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===
 # main.cyr is now the boot-init sequence only. See core/selftests.cyr (compile-

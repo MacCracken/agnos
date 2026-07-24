@@ -107,8 +107,14 @@ var klug_spill_ino = 0;        # inode of the pre-allocated spill file (0 = not 
 fn klug_spill_prepare() {
     if (ext2_active == 0)   { return 0; }
     if (ext2_write_ok == 0) { return 0; }        # read-only mount — nothing to do, and not an error
-    var ino = ext2_path_lookup("/klug.txt", 9);
-    if (ino <= 0) { ino = ext2_create(2, "klug.txt", 8); }   # 2 = ext2 root
+    # H2/S7 — ⚠ ON A LATCH-BLOCKED (RECOVERY) BOOT, SPILL TO A DIFFERENT FILE. This prepare unconditionally
+    # writes 64 KB over its target, so on the boot that came up to investigate a failed modeset it would
+    # otherwise ERASE the very log the latch existed to protect. Sequential ifs — Cyrius has no chained
+    # else-if. This is why modeset_latch_check() must run BEFORE this function, not after.
+    var p = "/klug.txt";  var pl = 9;  var b = "klug.txt";  var bl = 8;
+    if (modeset_latch_blocked != 0) { p = "/klug-2.txt"; pl = 11; b = "klug-2.txt"; bl = 10; }
+    var ino = ext2_path_lookup(p, pl);
+    if (ino <= 0) { ino = ext2_create(2, b, bl); }            # 2 = ext2 root
     if (ino <= 0) { kprintln("klug: spill file unavailable", 28); return 0; }
     # Allocate every block now, while the console is alive and a failure is readable. The content written
     # here is the ring as it stands at mount (mostly zeros this early) and is fully overwritten by a spill.

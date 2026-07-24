@@ -1,0 +1,306 @@
+# modeset_latch — H2, the arm-once latch. The single highest-leverage bite of the modeset arc.
+#
+# THE GUARANTEE: a modeset attempt that blanks the console non-recoverably costs exactly ONE bad boot. The
+# SECOND boot comes up as a normal, log-capturing agnos with the modeset SKIPPED — recovered with the power
+# button, NO reflash. Without this, every write bite in work list B is a mandatory-reflash risk.
+#
+# ⛔⛔ PLACEMENT RULE, NORMATIVE FOR EVERY CONSUMER (spec S12):
+# NO in-kernel risky display write may be placed before the DHCP / gateway-ARP block ends in main.cyr.
+# An arm placed early must survive gpu_pixclk_discover (~2 s), the first sti, two bare arch_wait() HLTs,
+# smp_start_aps(), sched_active = 1, and ~13 s of tick-bounded network wait — all CPL0 sites, where a fault
+# does NOT route to fault_kill_current/gpu_display_restore_console (idt.cyr only routes CPL3). A good
+# modeset plus an unrelated network hang would be permanently convicted as a modeset failure. Arm LATE.
+# The preferred site is H3's ring-3 /bin/modeset behind syscall #93, where the window is milliseconds and
+# "the shell was reached" becomes a PRECONDITION of arming rather than a postcondition to be proven.
+#
+# ⛔ NOT CMOS NVRAM for the latch itself. The plan's prohibition is scoped to 0x10-0x2D (firmware-checksum
+# protected — a bad checksum on this NUC yields a firmware-level "CMOS cleared / press F1" prompt, trading a
+# software recovery for a desk visit). Beyond that: the extended bank reads back noise on archaemenid,
+# 0x54-0x7F is fault-handler scratch rewritten by exactly the failure this must survive, and nothing zeroes
+# CMOS at reflash — a stale armed byte would skip the modeset forever with no filesystem-visible evidence.
+#
+# ⚠ THE KERNEL NEVER DISARMS AUTOMATICALLY. See modeset_disarm's header for the full reasoning.
+
+# ⚠ EVERY initializer below is a PLAIN LITERAL. A module-scope `var` with a COMPUTED initializer silently
+# reads 0 in this kernel (EMIT_GVAR_INITS runs after PARSE_PROG, and PARSE_PROG is the whole boot) — the
+# defect that made H4's first run a 4/4 false pass. Do NOT tidy any of these into expressions.
+# See docs/development/issues/2026-07-23-kernel-expression-gvar-initialisers-never-run.md
+var modeset_latch_blocked = 0;   # 1 = this boot may NOT attempt a modeset
+var modeset_latch_ino     = 0;   # inode of the pre-allocated latch file; 0 = unusable
+var modeset_armed         = 0;   # THE GATE. 1297040453 once armed this boot; anything else blocks
+var modeset_arm_site      = 0;   # site tag of the last arm
+
+# ⚠ MODULE-SCOPE `var X[N]` in an INCLUDED module allocates N * u64 = 8N BYTES. 64 declared => 512 bytes.
+# The record is 64 bytes; this is deliberately over-sized because the sizing rule is NON-UNIFORM by file and
+# under-sizing is SILENT. Over-allocate, never under. [[feedback_cyrius_var_array_u64_units]]
+var modeset_latch_buf[64];
+
+# The on-disk record — exactly 64 bytes, all ASCII, fixed width so the host can detect truncation by length
+# alone and grep the fields directly with `debugfs -R "cat /.modeset-armed"`:
+#   off  len  content
+#     0   21  "AGNOS-MODESET-LATCH1 "
+#    21    1  state: 'A' armed | 'D' disarmed
+#    22    6  " site="
+#    28   10  zero-padded decimal site tag
+#    38    7  " ticks="
+#    45   10  zero-padded decimal timer_ticks at arm
+#    55    8  "   END  "
+#    63    1  '\n'
+
+fn ml_put(dst, src, n) {
+    var i = 0;
+    while (i < n) { store8(dst + i, load8(src + i)); i = i + 1; }
+    return 0;
+}
+
+# Exactly 10 zero-padded decimal digits. Fixed width — a variable-width field would let a short value
+# shift every byte after it and make the record unparseable from the host.
+fn ml_put_u10(dst, v) {
+    var x = v;
+    if (x < 0) { x = 0; }
+    var i = 9;
+    while (i >= 0) {
+        store8(dst + i, 48 + (x % 10));
+        x = x / 10;
+        i = i - 1;
+    }
+    return 0;
+}
+
+# Build a full record into modeset_latch_buf. state is 'A' (65) or 'D' (68).
+fn ml_build(state, site, ticks) {
+    ml_put(&modeset_latch_buf +  0, "AGNOS-MODESET-LATCH1 ", 21);
+    store8(&modeset_latch_buf + 21, state);
+    ml_put(&modeset_latch_buf + 22, " site=", 6);
+    ml_put_u10(&modeset_latch_buf + 28, site);
+    ml_put(&modeset_latch_buf + 38, " ticks=", 7);
+    ml_put_u10(&modeset_latch_buf + 45, ticks);
+    ml_put(&modeset_latch_buf + 55, "   END  ", 8);
+    store8(&modeset_latch_buf + 63, 10);
+    return 0;
+}
+
+# THE ONE READER, shared by check, arm-verify and disarm-verify — so a one-byte name-length miscount or a
+# wrong record offset cannot be ASYMMETRIC between writing and reading.
+#
+#   2 = present and ARMED   1 = present and DISARMED   0 = absent   -1 = unknown / unreadable / malformed
+#
+# ⚠ TAKES NO LOCK — THE CALLER OWNS fs_spin_lock. modeset_arm and modeset_disarm both hold it when they
+# call this; modeset_latch_check runs at main.cyr:829, before smp_start_aps() and before sched_active = 1,
+# so it is single-threaded and needs none.
+#
+# ⚠ The three-valued split is LOAD-BEARING. ext2_path_lookup returns 0 for not-found and NEGATIVE for a walk
+# error. A `< 0` test reads a MISSING latch as present; a `> 0`-only test reads "I cannot determine the
+# state" as "not armed" and runs the modeset. Neither is acceptable — -1 must fail CLOSED.
+fn modeset_latch_state() {
+    if (ext2_active == 0) { return 0 - 1; }
+    var ino = ext2_path_lookup("/.modeset-armed", 15);
+    if (ino < 0) { return 0 - 1; }
+    if (ino == 0) { return 0; }
+    # ⛔ vfs_read_file_INNER, never vfs_read_file. The outer wrapper takes fs_spin_lock (vfs.cyr:613-618),
+    # and modeset_arm calls this predicate while ALREADY holding that lock — the outer form double-acquires
+    # and DEADLOCKS the box mid-arm. That is not theoretical: it happened, and it was indistinguishable from
+    # a successful wedge (the boot hung, qemu took SIGKILL, and the log simply ended at "latch flushed").
+    # It was caught only because the smoke asserted on the arm's own log line instead of just "it hung".
+    # ⚠ THE CALLER OWNS THE LOCK. arm and disarm both hold it; check runs pre-SMP and single-threaded.
+    var n = vfs_read_file_inner("/.modeset-armed", 15, &modeset_latch_buf, 64);
+    if (n != 64) { return 0 - 1; }
+    if (memeq(&modeset_latch_buf, "AGNOS-MODESET-LATCH1 ", 21) != 1) { return 0 - 1; }
+    if (load8(&modeset_latch_buf + 63) != 10) { return 0 - 1; }
+    var st = load8(&modeset_latch_buf + 21);
+    if (st == 65) { return 2; }
+    if (st == 68) { return 1; }
+    return 0 - 1;
+}
+
+# modeset_latch_check — read the latch and decide whether this boot may attempt a modeset, then PRE-ALLOCATE
+# the file so a later arm never runs the block allocator.
+#
+# Returns 1 = a modeset may be attempted, 0 = blocked. Sets modeset_latch_blocked (inverse).
+#
+# ⛔ MUST be called at top level, OUTSIDE every #ifdef, immediately after vfs_mount_init() and BEFORE
+# klug_spill_prepare(). Outside every #ifdef because it is the only thing that makes a risky bite placed in
+# the wrong flag nest fail CLOSED. Before the spill prepare because the spill's target depends on the
+# blocked flag (otherwise boot 2 overwrites the very log boot 1's latch was protecting).
+fn modeset_latch_check() {
+    if (ext2_active == 0) {
+        modeset_latch_blocked = 1;
+        kprintln("modeset: no latch surface -- REFUSING modeset", 45);
+        return 0;
+    }
+    var st = modeset_latch_state();
+    if (st == 0 - 1) {
+        modeset_latch_blocked = 1;
+        kprintln("modeset: latch surface unreadable -- REFUSING modeset", 53);
+        return 0;
+    }
+    if (st == 2) {
+        modeset_latch_blocked = 1;
+        kprintln("modeset: previous attempt did not disarm -- SKIPPED", 51);
+        kprint("modeset: latch was ", 19); kprint(&modeset_latch_buf, 63); kprintln("", 0);
+        kprintln("modeset: recover by typing:  rm /.modeset-armed", 47);
+        # ⚠ Deliberately does NOT clear the latch. Clearing here produces a permanent alternating
+        # oscillator: boot 1 dies, boot 2 skips-and-clears, boot 3 dies, forever, with no operator action
+        # able to break out — and it violates H2's own "exactly ONE bad boot" requirement at boot 3.
+        return 0;
+    }
+    modeset_latch_blocked = 0;
+    kprintln("modeset: no latch -- proceeding", 31);
+    # ⚠ Fail CLOSED on a read-only FS. Do NOT copy klug_spill_prepare's `if (ext2_write_ok == 0) return 0;`
+    # — that branch is fail-safe for a log and fail-OPEN for a latch.
+    if (ext2_write_ok == 0) {
+        modeset_latch_blocked = 1;
+        kprintln("modeset: latch fs not writable -- REFUSING modeset", 50);
+        return 0;
+    }
+    var ino = ext2_path_lookup("/.modeset-armed", 15);
+    if (ino <= 0) { ino = ext2_create(2, ".modeset-armed", 14); }
+    if (ino <= 0) {
+        modeset_latch_blocked = 1;
+        kprintln("modeset: latch file unavailable -- REFUSING modeset", 51);
+        return 0;
+    }
+    # Pre-allocate with a DISARMED record, so every later arm is a pure overwrite-in-place of an
+    # already-mapped block — no ext2_alloc_block (which issues three extra synchronous writes per block for
+    # bitmap/BGDT/superblock) and no ext2_dir_insert after the console is at risk.
+    ml_build(68, 0, 0);
+    # ⚠ `!= 64`, never `> 0`. Every failure inside ext2_write_at's block loop is a `break`, not an error
+    # return, and the tail still returns the PARTIAL byte count.
+    if (ext2_write_at(ino, 0, &modeset_latch_buf, 64) != 64) {
+        modeset_latch_blocked = 1;
+        kprintln("modeset: latch prealloc failed -- REFUSING modeset", 50);
+        return 0;
+    }
+    modeset_latch_ino = ino;
+    kprint("modeset: latch ready ino=", 25); kprint_num(ino); kprintln("", 0);
+    # The anti-false-pass line. If a module constant ever collapses to 0 (the H4 defect), this line changes
+    # and the smoke fails. The smoke asserts it VERBATIM. Do not reduce it to a pass count.
+    kprintln("modeset: latch consts BLOCKED=1 ARMED=1 TOKEN=1297040453", 56);
+    return 1;
+}
+
+# modeset_arm(site) — arm the latch immediately before a risky step.
+#
+# Returns 1 = armed, FLUSHED and read-back-verified; the gate token is set. 0 = refused.
+# ⚠ The caller refusing to proceed on 0 is NOT the real enforcement — see THE GATE in gpu.cyr, which makes
+# an unarmed modeset structurally impossible rather than merely discouraged.
+fn modeset_arm(site) {
+    if (modeset_latch_blocked != 0) {
+        kprintln("modeset: arm refused -- latch already blocked this boot", 55);
+        return 0;
+    }
+    if (modeset_latch_ino <= 0) {
+        kprintln("modeset: arm refused -- latch surface unusable", 46);
+        return 0;
+    }
+    if (ext2_write_ok == 0) {
+        kprintln("modeset: arm refused -- latch surface unusable", 46);
+        return 0;
+    }
+    # The arm site is past sched_active = 1, so this is required, not decorative: fs_spin_lock is the same
+    # lock the unlink/open/rename syscall arms take, protecting the shared ext2_inode_buf / ext2_block_buf /
+    # ext2_bitmap_buf / ext2_sb_buf globals against a concurrent ring-3 write.
+    preempt_disable();
+    fs_spin_lock();
+    # ⚠ Sample the tick counter ONCE and use that sample for BOTH the record and the log line. timer_ticks
+    # is live, so re-reading it for the print yields a different (later) value than the one on the platter —
+    # and then the log-vs-platter cross-check, which exists to prove "the bytes on disk are the bytes the
+    # kernel said it wrote", is comparing two different facts and can never agree.
+    var t = timer_ticks;
+    ml_build(65, site, t);
+    var w = ext2_write_at(modeset_latch_ino, 0, &modeset_latch_buf, 64);
+    if (w != 64) {
+        fs_spin_unlock(); preempt_enable();
+        kprintln("modeset: latch write TORN -- REFUSING modeset", 45);
+        return 0;
+    }
+    # ⚠ THE DURABILITY BARRIER, AND IT IS NOT OPTIONAL. The write chain is synchronous to the CONTROLLER
+    # (ext2_write_at -> ext2_write_block -> blk_write_sectors_on -> nvme submit+poll on the CQE phase bit),
+    # but agnos never disables the drive's volatile write cache, so the data can still be sitting in the
+    # SSD's cache. That is survivable for a CPU wedge with power applied (the drive destages on its own,
+    # seconds before the operator's power-cycle) but LOST for a power-cut or platform reset inside the
+    # destage window — which silently un-arms and produces the unbounded loop this bite exists to remove.
+    # ⛔ blk_flush_on, NOT ext2_sync: ext2_sync also SETS EXT2_VALID_FS, laundering an unclean shutdown into
+    # "cleanly unmounted" and destroying the run-e2fsck signal on exactly the boot where you want it.
+    if (blk_flush_on(ext2_backend) != 0) {
+        fs_spin_unlock(); preempt_enable();
+        kprintln("modeset: latch flush FAILED -- REFUSING modeset", 47);
+        return 0;
+    }
+    kprintln("modeset: latch flushed", 22);
+    # Self-verification through the SAME predicate the check uses, so a name-length miscount, a wrong record
+    # offset, or a silently-partial write cannot pass. This is what makes the hand-counted 15/14 pairs safe.
+    if (modeset_latch_state() != 2) {
+        fs_spin_unlock(); preempt_enable();
+        kprintln("modeset: latch readback FAILED -- REFUSING modeset", 50);
+        return 0;
+    }
+    fs_spin_unlock();
+    preempt_enable();
+    modeset_arm_site = site;
+    modeset_armed = 1297040453;      # THE GATE — inline literal, never a named var (H4 defect)
+    kprint("modeset: latch armed at site=", 29); kprint_num(site);
+    kprint(" ticks=", 7); kprint_num(t); kprintln("", 0);
+    return 1;
+}
+
+# modeset_disarm — remove the latch. Returns 1 = removed, flushed and verified gone; 0 = failed (treat as
+# STILL ARMED).
+#
+# ⛔⛔ THE KERNEL NEVER CALLS THIS. It is reached only when a human types `rm /.modeset-armed` at a prompt
+# they can see. That is a deliberate DEVIATION from the plan's "delete it after the pipe is scanning (I1)
+# and the shell is reached", and the reasoning is:
+#
+#   1. THE ERROR COSTS ARE WILDLY ASYMMETRIC. Disarming too early: a genuinely bad boot loses its latch, the
+#      next boot re-attempts, and the loop is UNBOUNDED, has zero filesystem-visible evidence, and is
+#      escapable only by reflash. Disarming too late: a good boot fails to clear, the next boot skips a
+#      modeset that worked, and the operator deletes one file. Too-late is bounded, visible and cheap;
+#      too-early is unbounded, invisible and expensive.
+#   2. "IMMEDIATELY BEFORE kybernet()" IS NOT "THE SHELL WAS REACHED". That point precedes the ELF load of
+#      /bin/agnsh, the iretq into ring 3 (the historical #GP site), and the fnptr paths that have hung before
+#      the banner. It means "the kernel is about to try". Deleting the latch there and then wedging is
+#      strictly worse than shipping no latch at all.
+#   3. I1 CANNOT SEE A PICTURE. gpu_display_wait_vblank returns 1 the moment OTG_FRAME_COUNT changes, and the
+#      OTG times off its own PLL: HUBP underflow leaves it counting while the pipe emits black, and an
+#      out-of-range timing leaves it counting while the sink reports No Signal. Keying a disarm on I1 is the
+#      echo-register failure that cost twelve mute audio burns. I1 stays a LOGGED DATUM, never a gate.
+#   4. The builds most likely to run a display experiment (AETHERSAFHA_SETU_SELFTEST, MISHRAN_DUPLEX_SELFTEST,
+#      TCP_LISTEN_SMOKE, ATOM_HALT) all end in an infinite idle and never reach the boot tail at all.
+#
+# ⚠ IF ANYONE LATER ADDS AN AUTOMATIC DISARM: it becomes MANDATORY to gate it on an armed-this-boot flag,
+# or a blocked boot will clear a latch it never set. The only acceptable automatic trigger is the first
+# ring-3 blocking keyboard read (which proves ELF load, iretq survival, banner and prompt) — never the boot
+# tail. Do not compromise back toward boot_finish.
+#
+# ⚠ THE CALLER OWNS THE LOCK. This takes none, because its ring-3 call site is already inside fs_spin_lock;
+# taking it here would deadlock.
+fn modeset_disarm() {
+    if (ext2_write_ok == 0) {
+        kprintln("modeset: disarm refused -- fs not writable", 42);
+        return 0;
+    }
+    if (ext2_unlink(2, ".modeset-armed", 14) != 0) {
+        kprintln("modeset: disarm unlink FAILED", 29);
+        return 0;
+    }
+    if (blk_flush_on(ext2_backend) != 0) {
+        kprintln("modeset: disarm flush FAILED -- latch may still be armed", 56);
+        return 0;
+    }
+    # `!= 0` — require exactly ABSENT. A -1 (walk error) is a FAILURE here, not a pass.
+    if (modeset_latch_state() != 0) {
+        kprintln("modeset: disarm verify FAILED -- latch STILL ARMED", 50);
+        return 0;
+    }
+    modeset_latch_ino = 0;           # gone; the next boot's check re-creates it
+    modeset_armed = 0;
+    kprintln("modeset: verified good, latch cleared", 37);
+    return 1;
+}
+
+# Is this path the latch? Used by the `rm` interception points so the operator's own delete routes through
+# the verified disarm rather than a bare unlink.
+fn modeset_latch_is_path(p, n) {
+    if (n != 15) { return 0; }
+    return memeq(p, "/.modeset-armed", 15);
+}

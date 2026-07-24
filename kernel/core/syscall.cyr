@@ -1962,6 +1962,18 @@ fn ksyscall(num, arg1, arg2, arg3) {
             # SMP sub-bite 5 (fs_lock): ext2_unlink (calls ext2_truncate_zero internally,
             # NOT independently locked → no nest). One acquire around the arm.
             fs_spin_lock();
+            # H2 — `rm /.modeset-armed` is THE disarm. The kernel never clears the modeset latch on its own
+            # (see modeset_disarm's header for why an automatic disarm is unsafe), so the operator's own
+            # delete is the one and only path — and it must go through the VERIFIED disarm (unlink + durable
+            # flush + re-lookup proving absence), not a bare ext2_unlink that could leave the latch armed on
+            # the platter while reporting success.
+            if (modeset_latch_is_path(arg1, arg2) == 1) {
+                var mdr30 = modeset_disarm();
+                fs_spin_unlock();
+                stack_canary_check(canary);
+                if (mdr30 == 1) { return 0; }
+                return 0 - 1;
+            }
             var par30 = vfs_ext2_parent(arg1, arg2);
             if (par30 <= 0) { fs_spin_unlock(); stack_canary_check(canary); return 0 - 1; }
             var unr30 = ext2_unlink(par30, arg1 + vfs_base_off, vfs_base_len);
