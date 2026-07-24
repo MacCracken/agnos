@@ -127,6 +127,27 @@ the OTG-disabled window because that envelope is the safety property M6 proved o
 running pixel clock to lock, the ENABLE will not relight. D7 makes that outcome *distinguishable* rather than
 ambiguous, and the documented next move is to run the cycle after the envelope close.
 
+**★★★ BURNED 2026-07-24 (archaemenid, exit 95) — agnos POWER-CYCLED THE HDMI PHY on the live console link
+and the display survived.** The transmitter went down and came back inside M6's envelope: `DIG_ENABLE`
+cleared then re-asserted, and RDPCSTX1's lane enables stepped **down** `0xd1f000→0xd00000` and back **up**
+`→0xd1f000` — a genuine PHY power-cycle, which `#76 ENABLE` alone could never produce. `resumed 1`, refresh
+`59951 = predicted`, `klug spilled 10605 bytes`, console alive throughout.
+
+⭐ **The phyid fix is validated on iron at the write level.** Every register touched across both halves
+(`5635 566f 5670 56a1 56c8 56d8 5d2f 5d30 5ec1 5ec8 5edb 5ede 5ee7-5eea`) is on instance 1 / UNIPHYB /
+RDPCSTX1, with **zero** writes to `556F`, UNIPHY**A** or RDPCSTX**0**. Under MD-2's old `phyid=0` every one
+would have landed on the dead transmitter. ⭐ **Perfect round-trip**: `5ec8`, `5ec1`, `5ede`, `5d30`, `5670`
+and `56a1` all return to their exact inherited values.
+
+★ **D8 is answered and the divergence was safe:** the PHY locked fine with the OTG **disabled**, so agnos's
+envelope placement is validated and the capture's OTG-live ordering is not required. The documented
+contingency is not needed. ⚠ **DRY calibration:** the snapshot predicted DISABLE = 4 writes; iron did ~20 —
+the static snapshot stops at the first wait-for-status poll, so treat a seeded DRY's write list as a **lower
+bound** for any table containing a poll.
+
+**M8 is COMPLETE.** agnos owns the OTG (lock · commit · envelope) and the transmitter. **M9 — audio enabled
+strictly after a real transmitter edge — is testable for the first time**, because such an edge now exists.
+
 ## [1.56.13] - 2026-07-24
 
 **MODESET work list B — the TRANSMITTER + audio (OPEN cycle).** Bumped on cycle open; the user tags/releases

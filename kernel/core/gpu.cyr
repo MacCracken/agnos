@@ -6476,6 +6476,25 @@ fn gpu_hdmi_audio_enable() {
     }
     var d    = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
     var pipe = gpu_display_pipe;
+    # ⛔ THE BACK END IS INDEXED BY THE LINK-ENCODER INSTANCE, NOT THE STREAM-ENCODER ONE.
+    # `d` above is gpu_audio_dig * stride — the FRONT end, where DIG_FE_CNTL / AFMT / HDMI_* live and where
+    # `d` is correct. DIG_BE_CNTL and DIG_BE_EN_CNTL are the BACK end and belong to the PHY/link-encoder
+    # instance — the same thing ATOM's `phyid` names. Every back-end access in this function used `d`.
+    # Both are 1 on archaemenid so the emitted addresses are IDENTICAL today and this changes no behaviour
+    # here; it removes the assumption. That assumption is not hypothetical — indexing a back-end question by
+    # the front-end answer is exactly what stood as "MD-2 SETTLED: phyid=0" until an iron dump overturned it,
+    # and it would have aimed a PHY power-cycle at a dead transmitter.
+    #
+    # ⚠ DISCOVER ONCE, HERE, AND PASS `db` DOWN — never re-discover at a use site. gpu_phy_discover() needs
+    # DIG_ENABLE set AND FE_SOURCE_SELECT non-zero, and STAGE-1 below CLEARS DIG_ENABLE. A use-site
+    # discovery after that point returns -1. That is precisely the defect that made both halves of the M8e
+    # transmitter cycle refuse.
+    var phy = gpu_phy_discover();
+    if (phy < 0) {
+        kprintln("gpu: hdmi audio not enabled (no live link encoder -- phyid undeterminable)", 74);
+        return 0;
+    }
+    var db   = phy * GPU_DCN_DIG_STRIDE;
     # WHICH Azalia endpoint? THE ONE WHOSE INDEX MATCHES THE ENCODER'S. amdgpu's find_first_free_audio()
     # (dc_resource.c) walks the audio pool and skips every instance whose index is not the stream encoder's
     # engine id ("if (id != i) continue;"), so DIG1 / ENGINE_ID_DIGB takes audio endpoint 1. The pairing is
@@ -6512,10 +6531,10 @@ fn gpu_hdmi_audio_enable() {
     gpu_hdmi_stage_attributes(d);
 
     # --- 2. THE COMMIT: DIG_MODE 2 -> 3, read-modify-write ---
-    var be = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d);
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d,
+    var be = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db,
     (be & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT));
-    var back = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + d) & GPU_DIG_MODE_MASK) >> GPU_DIG_MODE_SHIFT;
+    var back = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & GPU_DIG_MODE_MASK) >> GPU_DIG_MODE_SHIFT;
     if (back != GPU_DIG_MODE_HDMI) {
         kprintln("gpu: hdmi mode did not take", 27);
         return 0;
@@ -6768,15 +6787,15 @@ fn gpu_hdmi_audio_enable() {
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, e_gc | GPU_HDMI_GC_AVMUTE);
         var e_ap = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, e_ap & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
-        var e_en = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d);
-        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d, e_en & (0 - 1 - GPU_DIG_ENABLE));
+        var e_en = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + db);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + db, e_en & (0 - 1 - GPU_DIG_ENABLE));
         # Hold the link DOWN ~120 ms so the sink registers a real TMDS-loss event (14/15 held only microseconds).
         gpu_udelay(120000);
         # Bring it back UP with HDMI framing latched; poll the back-end symbol clock re-assert.
-        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d, e_en | GPU_DIG_ENABLE);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + db, e_en | GPU_DIG_ENABLE);
         var e_pi = 0;
         while (e_pi < 20000) {
-            if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + d) & GPU_DIG_SYMCLK_BE_ON) != 0) { break; }
+            if ((gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + db) & GPU_DIG_SYMCLK_BE_ON) != 0) { break; }
             e_pi = e_pi + 1;
         }
         # Link re-locked, clocks stable, DIG up, SAMPLE_SEND still 0 (FIFO held in reset via
