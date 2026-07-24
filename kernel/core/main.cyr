@@ -1226,7 +1226,14 @@ atom_instr_selftest();
 # This is the missing subsystem the whole 1.55.x arc converged on: HDMI audio is blocked on the firmware-
 # driven transmitter setup, not any register tweak. Console-risky (drives the PHY) — separately gated from
 # HDA_HDMI so a burn can isolate it; recovery is flashing a kernel without HDMI_ATOM.
+#ifdef MODESET_AUDIO
+# ⛔ M9: suppressed. This is the boot-time ATOM #4/#76 path; the modeset op runs both itself, inside M6's
+# OTG envelope with the H2 latch armed. Running it here too would fire an encoder (and possibly a
+# transmitter) edge outside the envelope and before the experiment starts.
+kprintln("atom: boot-time transmitter bringup SUPPRESSED (M9 -- the modeset op owns it)", 77);
+#else
 atom_hdmi_transmitter_bringup();
+#endif
 #ifdef ATOM_HALT
 # ⛔⛔ MD-6 (RATIFIED 2026-07-23, and now IN FORCE because H1 landed): ATOM_HALT is RETIRED as anything but
 # a PHOTO TOOL. It is a deliberate UNRECOVERABLE hang — IF=0, bare `while` — so it produces no keyboard, no
@@ -1249,11 +1256,34 @@ var atom_halt_spin = 0;
 while (atom_halt_spin == 0) { }
 #endif
 #endif
+#ifdef MODESET_AUDIO
+# ⛔ M9: the boot-time audio enable is SUPPRESSED. The whole experiment is that staging and the unmute sit
+# on opposite sides of a real transmitter edge, and the edge is produced by the ring-3 #93 op — so running
+# the enable here would arm audio BEFORE any edge exists and pre-empt the thing being measured.
+# ⚠ The sink-select + bind_single block below is NOT suppressed — see its gate.
+kprintln("gpu: boot-time hdmi audio SUPPRESSED (M9 -- the modeset op owns staging + unmute)", 81);
+#else
 gpu_hdmi_audio_enable();
+#endif
 # Sink-select (the parked HDA bite 4): make the GPU's HDMI controller the LIVE refill target so a ring-3
 # tone lands on the display link rather than the analog jack. Only worth doing if the display side actually
 # came up — otherwise instance 0 stays the sink and the analog path keeps working.
-if (gpu_hdmi_audio_on == 1) {
+# ⛔⛔ THE GATE, AND UNDER M9 IT MUST NOT BE `gpu_hdmi_audio_on`. That flag is set by
+# gpu_hdmi_audio_enable(), which M9 suppresses above — so under MODESET_AUDIO it is 0 and this whole block
+# would be skipped. The failure would be SILENT and total: hda_active_ctl stays 0, snd_open binds the
+# ANALOG jack, the digital codec stays broadcast-bound (the patch_hdmi.c design that causes silent audio,
+# which bind_single exists to kill), and the burn would measure a link carrying nothing while every log line
+# looked healthy. The bind depends only on a live encoder having been FOUND, not on audio having been
+# ENABLED, so gate it on exactly that.
+# ⚠ Compute the gate, then ONE `if`. Splitting `if (...) {` across #ifdef arms leaves the braces unbalanced
+# in each arm — cyrius fmt cannot parse it and reflows the whole block.
+var audio_sink_ok = 0;
+#ifdef MODESET_AUDIO
+if (gpu_audio_dig >= 0) { audio_sink_ok = 1; }
+#else
+if (gpu_hdmi_audio_on == 1) { audio_sink_ok = 1; }
+#endif
+if (audio_sink_ok == 1) {
     hda_active_ctl = 1;
     # THE SEAM, FINALLY CLOSED. hda_codec_route() ran ~300 lines up and could not know which digital pin has
     # the display, so its digital branch BROADCASTS: every pin enabled, every converter bound to one tag.
@@ -1289,7 +1319,12 @@ if (gpu_hdmi_audio_on == 1) {
         # no PCM is moving at that instant. Prime the pipe, then re-issue the edge with the stream actually
         # live — amdgpu's trigger(START)-then-unmute ordering. See gpu_hdmi_avmute_pulse().
         gpu_udelay(40000);            # let the feed prime the FIFO with real samples before the unmute edge
+        # ⛔ M9: the AVMUTE pulse is suppressed. Like STAGE-1, it is an IMITATION of the link event a real
+        # transmitter edge produces — issued here it would be a second, competing edge and would make any
+        # sound unattributable to the one M9 is testing.
+        #ifndef MODESET_AUDIO
         gpu_hdmi_avmute_pulse();
+        #endif
         #ifdef HDMI_AUDIO_DUMP
         # Re-measure with the feed ACTUALLY RUNNING. The crc probe inside gpu_hdmi_audio_enable ran while the
         # feed was stopped (drain-before-feed), so it correctly saw no samples. Now the codec is streaming into
@@ -1331,7 +1366,13 @@ if (gpu_hdmi_audio_on == 1) {
     #ifdef HDMI_AUDIO_DUMP
     # Diagnostic build only: read back the whole display-audio block so it can be diffed against the
     # known-good captured off amdgpu on this same silicon. Runs LAST, after every write has landed.
+    # ⛔ M9: suppressed at boot. With the boot-time enable gone, DIG_MODE is still 2 (DVI) here, so this
+    # would dump a PRE-FLIP register file — every HDMI_* value read in a state where the block is inert.
+    # Diffed against the amdgpu known-good it would look like a wall of divergences and read as a finding.
+    # The modeset op dumps at its own tail, after the flip and the edge, where the values mean something.
+    #ifndef MODESET_AUDIO
     gpu_audio_dump();
+    #endif
     #endif
     if (load64(&hda_out_dac + hda_active_ctl * 8) == 0) {
         # Say it plainly rather than let it surface as "the tone is silent".

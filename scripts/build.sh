@@ -428,6 +428,16 @@ else
         # rungs, so emit one symbol rather than duplicate the block (a duplicated block is how the two
         # copies drift apart).
         if [ -n "$ATOM_RUN_TRANSMITTER" ] || [ -n "$ATOM_TX_CYCLE" ]; then echo '#define ATOM_TX_ANY'; fi
+        # MODESET_AUDIO=1 — M9: SPLIT the HDMI audio path around a real transmitter edge. Off by default,
+        # and off means byte-identical behaviour to every prior audio burn.
+        # With it: gpu_hdmi_audio_enable() STAGES MUTED — AZ AUDIO_ENABLED, the slot map and SAMPLE_SEND all
+        # leave staging for gpu_hdmi_audio_unmute(), which the modeset op issues AFTER the #76 edge (amdgpu
+        # does exactly this, ~22 ms after OTG master-enable; capture 0x04000800 -> 0x04000801). It also
+        # compiles STAGE-1 OUT — that block is agnos's hand-rolled IMITATION of a transmitter edge, and
+        # running it alongside the real one would make any sound unattributable.
+        # ⛔ Pair with HDA_HDMI + HMDI_ATOM + ATOM_TX_CYCLE. Do NOT pair with HDA_TONE: a fixed kernel sine
+        # is exactly guessable and would void the blinded ear oracle.
+        [ -n "$MODESET_AUDIO" ] && echo '#define MODESET_AUDIO'
         # ATOM_MATH_SELFTEST=1 — H6 (modeset arc): run the DIV32/MUL32 unit sweep against the
         # atom-interp.py oracle and print pass/fail. PURE ARITHMETIC — no MMIO, no VBIOS, no bytecode, no
         # PHY. Safe anywhere, needs no iron; QEMU is the intended venue. Requires HDMI_ATOM because the

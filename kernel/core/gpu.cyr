@@ -6609,9 +6609,15 @@ fn gpu_hdmi_audio_enable() {
     gpu_reg32_write(GPU_BASE_DCN_2, dr, spk | GPU_AZ_SPEAKER_FL_FR | GPU_AZ_HDMI_CONNECTION);
 
     # Now enable the endpoint, then close the clock-gating bracket (amdgpu re-writes with the bit cleared).
+    # ⛔ M9: AUDIO_ENABLED (bit31) is the FIRST write of amdgpu's post-edge unmute — capture has AZ ordinal
+    # 0x54 <- 0x80000001 at t+22.044 ms, ~22 ms after every descriptor was staged with the bit CLEAR. Under
+    # MODESET_AUDIO it therefore leaves staging entirely and moves to gpu_hdmi_audio_unmute(), taking the
+    # slot map with it (see the note there — the slot map does not survive the AUDIO_ENABLED transition).
+    #ifndef MODESET_AUDIO
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
     var hpc1 = gpu_reg32(GPU_BASE_DCN_2, dr);
     gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc1 | GPU_AZ_AUDIO_ENABLED);
+    #endif
 
     # ⚠ M9 NOTE (capture-decoded 2026-07-24, before splitting this function): amdgpu NEVER WRITES ordinal
     # 0x36 AT ALL. Its AZ endpoint-1 staging is 0x54(clear) · 0x25 CHANNEL_SPEAKER · 0x27-0x2f · 0x31-0x35 ·
@@ -6631,12 +6637,18 @@ fn gpu_hdmi_audio_enable() {
     # samples, and the FIFO backs up — which is exactly the AFMT_AUDIO_FIFO_OVERFLOW (bit 24) that the same
     # dump caught set on agnos and clear on amdgpu. Two registers, one bug.
     # Never assume a write stuck: read it back and say so.
+    # ⛔ M9: moves to gpu_hdmi_audio_unmute() WITH AUDIO_ENABLED. It must stay on the far side of that
+    # transition (the rule above is an agnos iron finding); leaving it here while AUDIO_ENABLED moves away
+    # would write it BEFORE the transition — the exact case measured as "did not stick" — and M9 would run
+    # with a silently-empty channel map on an experiment whose oracle is a human ear.
+    #ifndef MODESET_AUDIO
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
     gpu_reg32_write(GPU_BASE_DCN_2, dr, GPU_AZ_MULTICHANNEL_STEREO);
     gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
     if ((gpu_reg32(GPU_BASE_DCN_2, dr) & 0x1) == 0) {
         kprintln("gpu: hdmi endpoint slot map did not take", 40);
     }
+    #endif
     # --- dce_aud_az_configure: THE BLOCK AGNOS NEVER PORTED ------------------------------------------
     # agnos's audio path was hand-derived down to a minimum: HOT_PLUG_CONTROL, a hardcoded CHANNEL_SPEAKER,
     # MULTICHANNEL_ENABLE, stop. amdgpu programs the endpoint from the sink's ELD — descriptors (what the
@@ -6738,9 +6750,20 @@ fn gpu_hdmi_audio_enable() {
     # dump rows keep reading them for the record.
 
     # LAST: latch channel status and open the sample tap.
+    # ⛔ M9 SPLITS THIS ONE WRITE IN TWO, and the split is the whole experiment. CS_UPDATE is a channel-status
+    # LATCH — staging. SAMPLE_SEND is the UNMUTE — amdgpu issues it ~22 ms later, AFTER the transmitter edge
+    # (capture: AFMT_AUDIO_PACKET_CONTROL 0x04000800 -> 0x04000801 at t+22.046 ms, the last audio write of
+    # the modeset). Leaving them OR'd in one RMW means "staged muted" is a fiction: the tap opens in the same
+    # instruction that latches channel status, before any edge exists.
     var apc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+    #ifdef MODESET_AUDIO
+    # Stage MUTED — CS_UPDATE only. gpu_hdmi_audio_unmute() opens the tap after the edge.
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,
+    (apc | GPU_AFMT_60958_CS_UPDATE) & (0 - 1 - GPU_AFMT_AUDIO_SAMPLE_SEND));
+    #else
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d,
     apc | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
+    #endif
 
     # The hardware's own Audio InfoFrame, read back. Non-zero here means the AIF generator actually ran on
     # the CHANNEL_SPEAKER we wrote — the one end-to-end check this block gives us for free, and a real answer
@@ -6791,6 +6814,14 @@ fn gpu_hdmi_audio_enable() {
     # MMIO, no DMUB/ATOM (pre-DMUB DCE did HDMI audio 100% via MMIO — this is the same enc1_se_* class + the
     # output-enable edge). The DIG_ENABLE toggle is iron-proven recoverable (14/15 booted through it). Skipped
     # on a quiet sweep re-apply so the harness does not blink the console 28 times.
+    # ⛔⛔ M9 COMPILES STAGE-1 OUT, and this is the point of the whole M-line. STAGE-1 is agnos's HAND-ROLLED
+    # SUBSTITUTE for a transmitter edge: it drops DIG_ENABLE by hand and holds 120 ms hoping the sink reads a
+    # TMDS-loss. It exists only because agnos could not produce a real edge. As of M8e (iron, exit 95) it can
+    # — ATOM #76 DISABLE->ENABLE genuinely power-cycles RDPCSTX1 with the lanes stepping down and back up.
+    # Running BOTH would put two competing link events in one sequence and make the result unattributable:
+    # the burn could not say whether any sound came from the real edge or the imitation of one. M9 tests the
+    # real edge, so the imitation goes.
+    #ifndef MODESET_AUDIO
     if (gpu_audio_quiet == 0) {
         # SET AVMUTE (the SET half of the edge) and close the sample tap, then take the link DOWN.
         var e_gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
@@ -6827,6 +6858,10 @@ fn gpu_hdmi_audio_enable() {
         gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, e_re | GPU_AFMT_60958_CS_UPDATE | GPU_AFMT_AUDIO_SAMPLE_SEND);
         kprintln("gpu: hdmi audio drain armed on empty FIFO (feed starts after bind)", 66);
     }
+    #endif
+    #ifdef MODESET_AUDIO
+    kprintln("gpu: hdmi audio STAGED MUTED (STAGE-1 compiled out; a real #76 edge replaces it)", 80);
+    #endif
 
     # THE ONE QUESTION EVERY LINE ABOVE BEGS. Everything printed so far is an echo of a write: the endpoint
     # says it is enabled because we enabled it. This asks the hardware something it has to answer for itself.
@@ -6845,6 +6880,60 @@ fn gpu_hdmi_audio_enable() {
     }
     return 1;
 }
+
+#ifdef MODESET_AUDIO
+# gpu_hdmi_audio_unmute — THE POST-EDGE HALF, and the entire M9 experiment.
+#
+# amdgpu does NOT "enable audio after the transmitter". It stages the WHOLE audio register file BEFORE the
+# edge with the tap explicitly shut (AFMT_AUDIO_PACKET_CONTROL = 0x04000800, SAMPLE_SEND = 0) and every AZ
+# descriptor written with AUDIO_ENABLED CLEAR — then, ~22 ms later and after the transmitter edge, issues a
+# handful of writes. Decoded from amdgpu-hdmi-modeset-writes-0717.txt, both modeset cycles agreeing:
+#     t+22.044  AZ ordinal 0x54 <- 0x80000001   (AUDIO_ENABLED, bit31)
+#     t+22.046  AFMT_AUDIO_PACKET_CONTROL 0x04000800 -> 0x04000801   THE UNMUTE
+#     t+22.048  HDMI_GC <- 0x04                 (last DIG write of the modeset)
+# That is why M9 is a SPLIT and not a MOVE: relocating the whole 350-line enable past the edge would change
+# a second variable and answer nothing.
+#
+# ⚠ THE SLOT MAP RIDES ALONG, and it is not in amdgpu's list. agnos measured (1.55.14) that
+# MULTICHANNEL_ENABLE does not survive the AUDIO_ENABLED transition, so it must be written on the far side
+# of it. amdgpu never writes ordinal 0x36 at all, so nothing in the capture constrains where it goes —
+# following AUDIO_ENABLED is agnos's own hard-won rule and it is preserved here. Leaving it in staging
+# while AUDIO_ENABLED moved would silently empty the channel map on an ear-oracle burn.
+#
+# Returns 1 on success, 0 if there is no live encoder to unmute.
+fn gpu_hdmi_audio_unmute() {
+    if (gpu_audio_dig < 0) { kprintln("gpu: hdmi unmute refused -- no live stream encoder", 50); return 0; }
+    var d  = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
+    var az = gpu_audio_dig;
+    var ir = GPU_R_AZ_ENDPOINT_INDEX + az * GPU_DCN_AZ_STRIDE;
+    var dr = GPU_R_AZ_ENDPOINT_DATA  + az * GPU_DCN_AZ_STRIDE;
+
+    # 1. AZ AUDIO_ENABLED (bit31) — the capture's first post-edge write.
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_HOT_PLUG_CONTROL);
+    var hpc1 = gpu_reg32(GPU_BASE_DCN_2, dr);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc1 | GPU_AZ_AUDIO_ENABLED);
+
+    # 2. The slot map, on the far side of that transition (agnos rule; read back, never assumed).
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
+    gpu_reg32_write(GPU_BASE_DCN_2, dr, GPU_AZ_MULTICHANNEL_STEREO);
+    gpu_reg32_write(GPU_BASE_DCN_2, ir, GPU_AZ_IX_MULTICHANNEL_ENABLE);
+    if ((gpu_reg32(GPU_BASE_DCN_2, dr) & 0x1) == 0) {
+        kprintln("gpu: hdmi endpoint slot map did not take", 40);
+    }
+
+    # 3. THE UNMUTE — open the sample tap. This single bit is what the arc has spent sixteen burns reaching.
+    var apc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_AUDIO_PACKET_CONTROL + d, apc | GPU_AFMT_AUDIO_SAMPLE_SEND);
+
+    # 4. HDMI_GC — the capture's last DIG write. Clear AVMUTE so the sink is told the stream is live.
+    var gc = gpu_reg32(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_HDMI_GC + d, gc & (0 - 1 - GPU_HDMI_GC_AVMUTE));
+    gpu_mfence();
+
+    kprintln("gpu: hdmi audio UNMUTED (AUDIO_ENABLED + slot map + SAMPLE_SEND + GC)", 69);
+    return 1;
+}
+#endif
 
 # === HDMI_AUDIO_SWEEP — in-boot fix-profile matrix ==========================================
 # The register-value class is exhausted (every DCN register matches amdgpu, still silent, FIFO overflowing),
