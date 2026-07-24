@@ -123,6 +123,12 @@ stage_one agnos/gpu-test gpublit.cyr  gpublit  || rc=1
 stage_one agnos/gpu-test gpublend.cyr gpublend || rc=1
 stage_one agnos/gpu-test gpucov.cyr   gpucov   || rc=1
 stage_one agnos/gpu-test gpucopy.cyr  gpucopy  || rc=1
+# modeset — #93 gpu_modeset_op, the H3 modeset seam. `run /bin/modeset --caps` (or bare) prints the modeset
+# surface caps and exits: 95 = display lit + seam live · 96 = seam live, no lit display (QEMU / dark port,
+# informational) · 97 = #93 ABI error · 98 = latch BLOCKED this boot (recover: rm /.modeset-armed). The
+# actual modeset (M-lane) is new op codes on this same #93, behind the H2 arm-once latch. Real AMD iron
+# lights the panel; QEMU exercises the ABI + caps path (exit 96).
+stage_one agnos/gpu-test modeset.cyr  modeset  || rc=1
 
 # rupantara gpulayer — the ML-layer-on-GPU crown proof (1.54.x C6). A real bias-free MLP up-projection matmul
 # (rosnet linear_fwd 8x8x32) run on the gfx90c shader cores via #83, tiled 8x8 and byte-compared against

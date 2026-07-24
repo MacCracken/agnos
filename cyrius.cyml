@@ -5,7 +5,12 @@ description = "Sovereign operating system kernel"
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/agnos"
 language = "cyrius"
-cyrius = "6.4.2"
+# 6.4.74 — the gvar-init const-folder + the `_cfo=0` codegen fix (17 sites) both landed here, filed by this
+# repo (issues/2026-07-23-cyrius-module-scope-var-expr-initializer-zero.md). The pin had lagged at 6.4.2
+# while the INSTALLED cycc actually built the kernel warn-only, so the fold and codegen fix were already in
+# the shipped binary; this bump ends the drift and makes the fix the enforced floor. Also brings in the
+# #92/#93 gpu_shader_op/gpu_modeset_op wrappers the H3 /bin/modeset consumes.
+cyrius = "6.4.74"
 
 [build]
 entry = "kernel/agnos.cyr"

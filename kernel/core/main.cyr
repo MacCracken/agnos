@@ -4912,6 +4912,16 @@ modeset_disarm();
 #endif
 #endif
 
+#ifdef MODESET_TOOL_SELFTEST
+# H3 — run the staged /bin/modeset from ring 3 and let its printed caps + `run: exit NN` reach serial. The
+# tool calls #93 gpu_modeset_op with a CAPS record; under QEMU (no AMD GPU) it reports display DARK, seam
+# live, and exits 96. Proves the whole seam: ring-3 tool -> #93 -> in-kernel validate -> caps written back.
+# Bare `run /bin/modeset` (the tool ignores argv and always does caps), sidestepping the `run <path> <arg>`
+# path-parsing wrinkle. The FS must carry /bin/modeset — the smoke stages it into the ext2 image.
+kprintln("modeset: running /bin/modeset", 29);
+sh_exec("run /bin/modeset", 16);
+#endif
+
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===
 # main.cyr is now the boot-init sequence only. See core/selftests.cyr (compile-
 # gated checks) and core/boot_finish.cyr (kybernet launch), included after this

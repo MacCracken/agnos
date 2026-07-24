@@ -5,6 +5,64 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — H3 `/bin/modeset` + syscall #93 `gpu_modeset_op`: the ring-3 modeset seam
+
+MODESET harness bite **H3**, the last of work list A. It moves the eventual armed window from ~1 s of boot
+init (H2's in-kernel site) to milliseconds of ring 3, where "the shell was reached" becomes a *precondition*
+of arming rather than a postcondition to be proven.
+
+- **`#93 gpu_modeset_op(desc_uva, len)`** — one syscall number, an array of 64-byte records, the operation an
+  op code *inside* each record (decision D-3 / MD-4). Modelled on `gpu_shader_op_sys`: validates every record
+  before executing any, rejects rather than clips, derives everything in-kernel so no MC address crosses the
+  ring-3 boundary, fault-proof copy-in. Ops at H3 are **NOP** (0x00) and **CAPS** (0x01); the M-lane write
+  ops (dump / measure / OTG re-commit / transmitter) are new op codes on this *same* number, behind the H2
+  arm-once latch, with no new syscall.
+- **CAPS** writes 8×u32 describing the modeset surface — a flags word (latch-armable · display-lit ·
+  ATOM-available · pixclk-measured · latch-blocked-this-boot), the op-support mask, and the link geometry.
+  ⚠ It deliberately does **not** gate on `gpu_present`: under QEMU there is no AMD GPU, but the tool must
+  still return so ring 3 can tell "this kernel has no #93" (an old kernel) from "#93 is here but there is no
+  GPU". The GPU/display state is reported *in* the flags, not by refusing the call.
+- **`/bin/modeset`** (`gpu-test/modeset.cyr`) — the ring-3 tool, staged by `stage-tools.sh`. `run /bin/modeset`
+  prints the caps and exits with a decisive, klug-capturable code: **95** display-lit + seam-live · **96**
+  seam-live but no lit display (QEMU / dark port, informational) · **97** #93 ABI error · **98** latch
+  blocked this boot (recover with `rm /.modeset-armed`). Uses the cyrius-6.4.74 `sys_gpu_modeset_op` wrapper,
+  which lives on the agnos target only — off-agnos the tool fails to compile rather than issuing `fchown`.
+
+**Proven** — `scripts/modeset-tool-smoke.sh`, **6/0** in QEMU: the boot stages `/bin/modeset` onto the ext2
+image and runs it in ring 3; the tool reports `opmask=3`, `display DARK`, `latch-armable YES` and exits
+**96**. The whole seam — ring-3 tool → #93 → in-kernel validate → caps written back — works with no GPU
+present.
+
+**Reconciliations:** the #92 handler's "#93 is retired, never mint it" comment predates MD-4 (2026-07-23),
+which re-minted #93 for modeset because modeset (take the pipe from the GOP) is a distinct capability class
+from shader compositing (draw into a lit buffer); the comment is corrected. The cross-build safety gate is
+**cyrius-side** (`cyrius/scripts/agnos-crossbuild-gate.sh`, hands-off) and already covers `#82-#93`, so
+nothing agnos-side was needed — the plan's "extend `scripts/agnos-crossbuild-gate.sh`" pointed at the wrong
+repo.
+
+### Changed — cyrius pin 6.4.2 → 6.4.74 (const-fold gvar fix + `_cfo=0` codegen fix + #92/#93 wrappers)
+
+`cyrius.cyml` bumped **6.4.2 → 6.4.74** (and `gpu-test/cyrius.cyml` 6.4.70 → 6.4.74). The pin had lagged far
+behind the toolchain that was actually building the kernel — `build.sh` runs warn-only, so the installed
+cycc builds agnos regardless of the pin — so this bump ends the drift rather than introducing a change.
+
+⚠ **It is a real ~66 KB codegen change even so**, because the installed cycc itself moved 6.4.73 → 6.4.74
+mid-cycle, carrying two fixes agnos filed:
+
+- **The gvar-init const-folder** — a module-scope `var` with a *computed* integer initializer
+  (`0 - 61`, `512 * 2`, `-5`) used to read **0** for the life of a kmode kernel; it now folds into the data
+  section byte-identical to the literal form. This is the defect that made H4's first run a 4/4 false pass.
+  The eight sentinels catalogued in
+  `issues/2026-07-23-kernel-expression-gvar-initialisers-never-run.md` now fold to their real `-1` values;
+  `gpu_sentinels_init()` is retained as belt-and-suspenders but is no longer load-bearing.
+- **A `_cfo = 0`-before-`PARSE_FACTOR` codegen fix (17 sites)** in the same release — a separate
+  silent-wrong-value class.
+
+**Validated:** two consecutive 6.4.74 builds are byte-identical (deterministic); the full arc sweep is
+**15/15** on the 6.4.74 kernel; and every arc harness selftest re-ran green (H1 7/0, H2 28/0 + 4/0 disarm,
+H4 7/0, H6 4/0). The inline-literal workarounds this defect drove (atom.cyr rc codes, the modeset-latch gate
+token) are left in place as defensive/clear but are no longer required on this pin.
+
 ### Added — H2 the arm-once modeset latch: a failed modeset now costs ONE bad boot, not a reflash
 
 MODESET harness bite **H2**, the plan's single highest-leverage item. New `kernel/core/modeset_latch.cyr`:

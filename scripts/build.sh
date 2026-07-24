@@ -440,6 +440,9 @@ else
         # MODESET_LATCH_DISARM=1 — H2 disarm lane: skip the wedge, then exercise modeset_latch_is_path
         # (positive AND negative) and modeset_disarm. Implies MODESET_LATCH_SELFTEST.
         [ -n "$MODESET_LATCH_DISARM" ] && echo '#define MODESET_LATCH_DISARM'
+        # MODESET_TOOL_SELFTEST=1 — H3: run the staged /bin/modeset from ring 3 at boot (sh_exec) so its
+        # #93 caps output + `run: exit NN` reach serial. The smoke stages /bin/modeset into the ext2 image.
+        [ -n "$MODESET_TOOL_SELFTEST" ] && echo '#define MODESET_TOOL_SELFTEST'
         [ -n "$ATOM_MATH_SELFTEST" ] && echo '#define ATOM_MATH_SELFTEST'
         # ATOM_INSTR_SELFTEST=1 — H4 (modeset arc): prove every abnormal interpreter exit is DISTINCT and
         # NON-ZERO, by executing four synthetic in-RAM command tables (clean EOT / reserved opcode /

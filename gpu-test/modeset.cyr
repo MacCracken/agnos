@@ -1,0 +1,109 @@
+# modeset — agnos ring-3 /bin/modeset. H3 of the modeset arc: the userland entry to the modeset seam.
+#
+# `run /bin/modeset --caps` (or bare) calls #93 gpu_modeset_op with a CAPS op and prints the modeset surface
+# it discovered, then exits with a code that names the outcome — the klug-capturable oracle the gpu-test
+# tools use (`run: exit NN`):
+#
+#   95 = caps read, display LIT and the modeset seam is live
+#   96 = caps read, seam live, but NO lit display here (QEMU, or a dark port) — informational, not a failure
+#   97 = #93 returned an ABI / validation error (decoded + printed: idx + reason)
+#   98 = the LATCH is BLOCKED this boot — a previous modeset did not disarm (H2). Recover: rm /.modeset-armed
+#   99 = the syscall returned an unexpected value
+#
+# The ACTUAL modeset (M-lane: dump / measure / OTG re-commit / transmitter) is iron work behind the arm-once
+# latch, added as new op codes to this same #93 with NO new syscall number (decision D-3 / MD-4). H3 proves
+# the seam: the tool reaches the kernel, the kernel validates a descriptor array and writes caps back, and
+# the exit code is decisive under QEMU with no GPU.
+#
+# Uses the NAMED wrapper sys_gpu_modeset_op (cyrius >= 6.4.74, filed as
+# 2026-07-23-gpu-modeset-op-93-cyrius-wrapper.md). It lives behind a FILE-LEVEL #ifdef CYRIUS_TARGET_AGNOS
+# gate, so off-agnos it does not exist and a build referencing it fails at COMPILE time with no binary —
+# which matters because on Linux x86_64 #93 is fchown.
+
+# ── op codes + caps layout (mirror kernel syscall.cyr) ──
+# record (64 B): +0 op · +4 flags(=0) · +8 out_uva(u64) · +16 out_len(u64) · +24..63 reserved(=0)
+# caps  (32 B): +0 flags · +4 opmask · +8 h_active · +12 v_active · +16 h_total · +20 v_total
+#               +24 pixclk_100hz · +28 refresh_mHz
+
+fn m_puts(s): i64 {
+    var n = 0;
+    while (load8(s + n) != 0) { n = n + 1; }
+    syscall(1, 1, s, n);
+    return 0;
+}
+fn m_num(v): i64 {
+    var buf[24];
+    var i = 23;
+    var neg = 0;
+    var x = v;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    if (x == 0) { store8(&buf + i, 48); i = i - 1; }
+    while (x > 0) { store8(&buf + i, 48 + x % 10); i = i - 1; x = x / 10; }
+    if (neg == 1) { store8(&buf + i, 45); i = i - 1; }
+    syscall(1, 1, &buf + i + 1, 23 - i);
+    return 0;
+}
+fn m_nl(): i64 { syscall(1, 1, "\n", 1); return 0; }
+
+# one "modeset: KEY=VAL" line
+fn m_kv(k, v): i64 { m_puts("modeset: "); m_puts(k); m_puts("="); m_num(v); m_nl(); return 0; }
+
+fn modeset_caps(): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }   # zero the whole record
+    store32(&rec + 0, 1);                                     # op = MDO_OP_CAPS (0x01)
+    var caps[32];
+    var c = 0;
+    while (c < 8) { store32(&caps + c * 4, 0); c = c + 1; }
+    store64(&rec + 8, &caps);                                 # out_uva
+    store64(&rec + 16, 32);                                   # out_len
+
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        m_puts("modeset: #93 error idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(code & 0xFF); m_nl();
+        m_puts("modeset: (reasons: 2=badop 3=outbuf 11=desc 12=reserved)"); m_nl();
+        return 97;
+    }
+    if (r != 0) {
+        m_puts("modeset: #93 returned unexpected "); m_num(r); m_nl();
+        return 99;
+    }
+
+    var flags   = load32(&caps + 0);
+    var opmask  = load32(&caps + 4);
+    m_puts("modeset: caps OK"); m_nl();
+    m_kv("opmask", opmask);
+    m_kv("flags", flags);
+    m_kv("h_active", load32(&caps + 8));
+    m_kv("v_active", load32(&caps + 12));
+    m_kv("h_total", load32(&caps + 16));
+    m_kv("v_total", load32(&caps + 20));
+    m_kv("pixclk_100hz", load32(&caps + 24));
+    m_kv("refresh_mHz", load32(&caps + 28));
+
+    # decode the flag bits into greppable words (machine + operator)
+    if ((flags & 1) != 0)  { m_puts("modeset: latch-armable YES"); m_nl(); }
+    if ((flags & 1) == 0)  { m_puts("modeset: latch-armable NO"); m_nl(); }
+    if ((flags & 2) != 0)  { m_puts("modeset: display LIT"); m_nl(); }
+    if ((flags & 2) == 0)  { m_puts("modeset: display DARK"); m_nl(); }
+    if ((flags & 4) != 0)  { m_puts("modeset: atom AVAILABLE"); m_nl(); }
+    if ((flags & 8) != 0)  { m_puts("modeset: pixclk MEASURED"); m_nl(); }
+
+    if ((flags & 16) != 0) {
+        m_puts("modeset: LATCH BLOCKED this boot -- a previous modeset did not disarm"); m_nl();
+        m_puts("modeset: recover with:  rm /.modeset-armed"); m_nl();
+        return 98;
+    }
+    if ((flags & 2) != 0) { return 95; }    # display lit + seam live — the full-green result on iron
+    return 96;                              # seam live, no lit display (QEMU / dark port) — informational
+}
+
+fn _entry(): i64 {
+    var r = modeset_caps();
+    syscall(SYS_EXIT, r);
+    return 0;
+}
+_entry();

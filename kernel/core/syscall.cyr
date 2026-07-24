@@ -1287,6 +1287,137 @@ fn gpu_caps_sys(buf, len) {
     return 0;
 }
 
+# ══ #93 gpu_modeset_op — THE MODESET SEAM (MD-4 ratified, H3) ═══════════════════════════════════════════
+#
+# ONE syscall number. An ARRAY of fixed-size 64-byte records. The operation is an op code INSIDE each record
+# — exactly the D-3 shape #92 uses, for exactly the same reason: batching and new ops are IMPLEMENTATION
+# changes, never ABI breaks. No pointer or MC address that names GPU memory crosses the boundary; the kernel
+# validates every record before executing any, and REJECTS rather than clips.
+#
+# ⚠ WHY A SEPARATE NUMBER FROM #92, given #92's comment says "never mint #93": #92 is shader COMPOSITING —
+# drawing into an already-lit back buffer. #93 is MODESET — taking the pipe away from the GOP (PLL / OTG /
+# PHY / ATOM), the most dangerous thing this kernel does, gated behind the arm-once latch (H2). Folding the
+# two would put "reprogram the display timing" and "blend a translucent rect" behind one validator and one
+# op-support mask. MD-4 (2026-07-23) ratified the split and cyrius 6.4.74 shipped the `sys_gpu_modeset_op`
+# wrapper for it. The #92 comment's "retires #93" aspiration is superseded by that ratification.
+#
+# ⚠ THE ACTUAL MODESET WRITE OPS ARE THE M-LANE (iron). At H3 this handler dispatches NOP + CAPS only, both
+# read-only, both safe under QEMU. When an M-lane write op is added it MUST call modeset_arm() before its
+# first DCN write, and THE GATE in gpu_otg_lock / gpu_dcn_write_committed (H2) enforces it structurally.
+#
+# ⚠ CAPS DOES NOT GATE ON gpu_present. Under QEMU there is no AMD GPU, but `run /bin/modeset --caps` must
+# still return so the tool can report "no display here" — that is the whole point of a caps probe, and it is
+# how ring 3 tells "this kernel has no #93" (an old kernel) apart from "#93 is here but there is no GPU".
+# The GPU/display state is reported IN the caps flags, not by refusing the call.
+#
+# Return: 0 on success · -((idx<<8)|reason) naming the failing record · reason is always >= 1.
+# ⚠ LINUX COLLISION: #93 = fchown(fd,uid,gid). arg1 is a userland VA, essentially never a valid fd, so a
+# stray off-agnos call is ~always EBADF — milder than #92's path-resolving chown. The file-level
+# #ifdef CYRIUS_TARGET_AGNOS gate in cyrius/lib/syscalls.cyr is still the load-bearing barrier.
+
+var MDO_OP_STRIDE    = 64;          # bytes per record (matches #92's GPU_OP_STRIDE)
+var MDO_OP_MAX_LEN   = 4096;        # cap on the whole array
+var MDO_OP_NOP       = 0x00;        # validated, dispatches nothing — batch padding / ABI probe
+var MDO_OP_CAPS      = 0x01;        # write the modeset caps (8x u32 LE) to the record's out_uva
+var MDO_OP_SUPPORTED = 0x3;         # bit N set <=> op code N implemented: bit0 NOP, bit1 CAPS
+var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
+var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
+var MDO_E_OUTBUF     = 3;           # op    — CAPS out_uva/out_len invalid
+var MDO_E_DESC       = 11;          # call  — bad desc_uva / len, or the copy-in failed
+var MDO_E_RESERVED   = 12;          # op    — a reserved dword or an undefined field was non-zero
+
+# mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
+# kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
+#   +0  flags  bit0 latch-armable (ext2 mounted + writable) · bit1 display lit (gpu_display_ok==1)
+#              bit2 ATOM interpreter available (VBIOS acquired) · bit3 pixel clock measured
+#              bit4 latch BLOCKED this boot (a previous modeset did not disarm — H2)
+#   +4  op-support mask (MDO_OP_SUPPORTED)      +16 h_total          +24 pixclk_100hz
+#   +8  h_active                                +20 v_total          +28 refresh milliHz (I2, 0 if unmeasured)
+#   +12 v_active (0 at H3 — M1/M3 populate)
+fn mdo_caps_write(out_uva) {
+    if (is_user_range(out_uva, 32) == 0) { return MDO_E_OUTBUF; }
+    var flags = 0;
+    if (ext2_active != 0) { if (ext2_write_ok != 0) { flags = flags | 1; } }
+    if (gpu_display_ok == 1) { flags = flags | 2; }
+    if (gpu_vbios_va != 0) { flags = flags | 4; }
+    if (gpu_pixclk_100hz != 0) { flags = flags | 8; }
+    if (modeset_latch_blocked != 0) { flags = flags | 16; }
+    store32(out_uva +  0, flags);
+    store32(out_uva +  4, MDO_OP_SUPPORTED);
+    store32(out_uva +  8, gpu_h_active);
+    store32(out_uva + 12, 0);
+    store32(out_uva + 16, gpu_h_total);
+    store32(out_uva + 20, gpu_v_total);
+    store32(out_uva + 24, gpu_pixclk_100hz);
+    store32(out_uva + 28, gpu_refresh_mhz);
+    return 0;
+}
+
+# mdo_validate(rec) -> 0 or an MDO_E_* reason. PURE READS on the KERNEL-RESIDENT copy. Every dword an op does
+# not define MUST be zero — a non-zero reserved field is REJECTED rather than ignored, which is what keeps
+# today's unused dwords safe to define in a later kernel without an ABI break.
+fn mdo_validate(rec) {
+    var op = load32(rec) & 0xFFFFFFFF;
+    if (op > 0x1F) { return MDO_E_BADOP; }
+    if (((MDO_OP_SUPPORTED >> op) & 1) == 0) { return MDO_E_BADOP; }
+    if ((load32(rec + 4) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }   # flags — none defined at H3
+    # reserved tail, dwords 6..15 (+24..+63), must be zero for every op
+    var k = 6;
+    while (k < 16) {
+        if ((load32(rec + k * 4) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        k = k + 1;
+    }
+    # op-specific fields. Sequential ifs on the fixed op selector (Cyrius has no chained else-if).
+    if (op == MDO_OP_NOP) {
+        # NOP uses nothing past the op code — +8..+23 must also be zero
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
+    if (op == MDO_OP_CAPS) {
+        var out_len = load64(rec + 16);
+        if (out_len < 32) { return MDO_E_OUTBUF; }
+        if (is_user_range(load64(rec + 8), 32) == 0) { return MDO_E_OUTBUF; }
+    }
+    return 0;
+}
+
+fn mdo_execute(rec) {
+    var op = load32(rec) & 0xFFFFFFFF;
+    if (op == MDO_OP_NOP)  { return 0; }
+    if (op == MDO_OP_CAPS) { return mdo_caps_write(load64(rec + 8)); }
+    return MDO_E_BADOP;                              # unreachable after validate — belt-and-suspenders
+}
+
+# gpu_modeset_op(desc_uva, len) — the ring-3 entry point. Validates EVERY record before executing ANY, so a
+# rejected batch does nothing. Copy-in is fault-proof (page-walks the caller's CR3). Reuses #92's per-CPU
+# scratch buffer — the two are never concurrent (both are GPU-band ops on the boot/compositor path).
+fn gpu_modeset_op_sys(desc_uva, len) {
+    if (len < MDO_OP_STRIDE)       { return 0 - MDO_E_DESC; }
+    if (len > MDO_OP_MAX_LEN)      { return 0 - MDO_E_DESC; }
+    if (len % MDO_OP_STRIDE != 0)  { return 0 - MDO_E_DESC; }
+    if (is_user_range(desc_uva, len) == 0) { return 0 - MDO_E_DESC; }
+    var buf = sc_gpuop_buf();
+    if (proc_copy_from_user(proc_get_cr3(proc_current_get()), buf, desc_uva, len) == 0) {
+        return 0 - MDO_E_DESC;
+    }
+    var n = len / MDO_OP_STRIDE;
+    var i = 0;
+    while (i < n) {
+        var e = mdo_validate(buf + i * MDO_OP_STRIDE);
+        if (e != 0) { return 0 - ((i << 8) | e); }
+        i = i + 1;
+    }
+    var j = 0;
+    while (j < n) {
+        var e2 = mdo_execute(buf + j * MDO_OP_STRIDE);
+        if (e2 != 0) { return 0 - ((j << 8) | e2); }
+        j = j + 1;
+    }
+    return 0;
+}
+
 # shm_write(id, user_src, size) -> 0 / -1. Copies user src INTO the shm page.
 fn shm_write(id, src, size) {
     if (shm_slot_valid(id) == 0) { return 0 - 1; }
@@ -2663,11 +2794,24 @@ fn ksyscall(num, arg1, arg2, arg3) {
         # for the old 1..16-slot-id shape: arg1 is now a real user VA >= 0x200000, so off-agnos the call
         # would get a READABLE path pointer and could plausibly SUCCEED. The file-level
         # #ifdef CYRIUS_TARGET_AGNOS gate in cyrius/lib/syscalls.cyr is the only remaining barrier.
-        # (This collapse also RETIRES #93=fchown and #94=lchown and never mints #95=umask, so the band's
-        # destructive-collision surface goes from four rows to one.)
+        # (This collapse also retires #94=lchown and never mints #95=umask.) ⚠ #93 was RE-MINTED for
+        # gpu_modeset_op by MD-4 (2026-07-23) — modeset is a distinct capability class from compositing and
+        # earns its own number; see the #93 handler header. So the band's destructive-collision surface is
+        # #92 (chown) + #93 (fchown), not one row — still far below the original four.
         var so = gpu_shader_op_sys(arg1, arg2);
         stack_canary_check(canary);
         return so;
+    }
+    if (num == 93) {
+        # gpu_modeset_op(desc_uva, len) — THE MODESET SEAM (MD-4, H3). ONE number, an ARRAY of 64-byte op
+        # records, op code inside the payload; NOP + CAPS today, the M-lane write ops (gated behind the H2
+        # arm-once latch) later with NO new number. Validates every record before executing any; rejects
+        # rather than clips; no MC address crosses the boundary. Returns 0 or -((idx<<8)|reason).
+        # ⚠ LINUX: #93 = fchown(fd,uid,gid); arg1 is a userland VA so a stray off-agnos call is ~always
+        # EBADF. The file-level #ifdef CYRIUS_TARGET_AGNOS gate in cyrius/lib/syscalls.cyr is the barrier.
+        var mo = gpu_modeset_op_sys(arg1, arg2);
+        stack_canary_check(canary);
+        return mo;
     }
     if (num == 40) {
         # uptime_ms() — monotonic milliseconds since boot, returned in rax (no

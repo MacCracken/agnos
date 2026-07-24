@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "agnos ring-3 CP-DMA fill proof (P9 / #13) — gpu_fill#85 + present#84 from userland: GPU-clears the blit back buffer red/green/blue with a PM4 DMA_DATA constant-fill on the compute ring and flips each to the scanout. Exits 95 iff every fill+present succeeded; the screen changing colour is the visual oracle."
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.4.70"
+cyrius = "6.4.74"
 
 [build]
 src = "gpufill.cyr"

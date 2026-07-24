@@ -1,7 +1,21 @@
 # Kernel module-global initialisers that are EXPRESSIONS never run during boot
 
+> ## ✅ ROOT-FIXED IN CYRIUS 6.4.74 (2026-07-24), agnos pin bumped 6.4.2 → 6.4.74
+>
+> The language-side const-folder shipped (see the companion filing
+> [`2026-07-23-cyrius-module-scope-var-expr-initializer-zero.md`](2026-07-23-cyrius-module-scope-var-expr-initializer-zero.md)):
+> a foldable integer expression now bakes into the data section, byte-identical to the literal form. So the
+> class is gone at the source — **including the eight sentinels below, which now fold to their real `-1`
+> values** rather than reading 0. `gpu_sentinels_init()` (the agnos-side workaround) is retained as
+> belt-and-suspenders but is no longer load-bearing.
+>
+> ⚠ **This is a real codegen change, not just provenance** — bumping the pin re-swept the whole arc battery
+> (the folded sentinels + the separate `_cfo=0` 17-site codegen fix in the same release changed ~66 KB of the
+> kernel image). Sweep must be green on 6.4.74 before this is considered closed.
+
 **Found** 2026-07-23, while retiring the 1.56.x D lane.
-**Status** OPEN. The five gpu.cyr sentinels are corrected; eight more identified and left alone deliberately.
+**Status** ✅ ROOT-FIXED (cyrius 6.4.74). The five gpu.cyr sentinels were corrected in-code; the eight below
+now fold correctly at the language level.
 **Severity** Low-impact today, high-confusion. Every one of these is a *sentinel*, and the value it silently
 takes instead — 0 — is a **valid value** for most of them.
 

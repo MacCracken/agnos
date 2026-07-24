@@ -1,6 +1,26 @@
-# Cyrius: a module-scope `var` with a COMPUTED initializer silently becomes 0 (included modules)
+# Cyrius: a module-scope `var` with a COMPUTED initializer silently becomes 0 (kmode)
 
-- **Filed**: 2026-07-23
+> ## ✅ FIXED IN CYRIUS 6.4.74 (2026-07-24) — the preferred option (★ const-fold) shipped
+>
+> The cyrius changelog for 6.4.74 implements exactly the ask: a constant folder
+> (`_CF_TRY`/`_CF_EXPR`/`_CF_TERM`/`_CF_FACTOR` in `parse_decl.cyr`) that widens the static-init path to any
+> foldable integer expression, so `var A = 512 * 2;` in kmode now produces a **byte-identical image** to
+> `var A = 1024;`. No ordering change, no risk to the multiboot invariant. Validated by a 42-expression /
+> 84-probe differential (folded gvar vs runtime fn-body): **0 mismatches**. A companion codegen fix in the
+> same release (`_cfo = 0` cleared before `PARSE_FACTOR`, 17 sites) removed a *separate* silent-wrong-value
+> class it would otherwise have matched.
+>
+> ⚠ **The filing's original "included module" framing was wrong** — the fix confirms it is **x86_64-ELF
+> kmode only** (six other backend forks emit gvar inits before `PARSE_PROG` and never had it). The title is
+> corrected above.
+>
+> **agnos side:** `cyrius.cyml` bumped **6.4.2 → 6.4.74**, so the fold is now the enforced floor. The kernel
+> was already being built warn-only by the installed 6.4.74 cycc, so the fix was already in the shipped
+> binary; the bump ends the drift. The inline-literal workarounds (atom.cyr rc codes, modeset_latch.cyr gate
+> token) are LEFT in place as belt-and-suspenders and clarity — they are correct on any pin — but are no
+> longer load-bearing.
+
+- **Filed**: 2026-07-23 · **Fixed**: 2026-07-24 (cyrius 6.4.74)
 - **Reporter**: agnos (kernel), during modeset-arc bite H4
 - **cycc**: 6.4.72 installed · agnos `cyrius.cyml` pins 6.4.2 (built warn-only, no `--strict-pin`)
 - **Severity**: **high** — silent wrong value, no diagnostic, and it produced a *passing* test that was
