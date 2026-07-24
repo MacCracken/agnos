@@ -4934,6 +4934,11 @@ sh_exec("run /bin/modeset --lock", 23);
 # proof (refresh 59.951->59.152->59.951 Hz + the frame-count watchdog) is on iron.
 kprintln("modeset: running /bin/modeset --vtotal", 38);
 sh_exec("run /bin/modeset --vtotal", 25);
+# And the M6 --recommit OTG-envelope path. Same QEMU story: mdo_recommit refuses at gpu_present and returns
+# reason 1 BEFORE arming or disabling the pipe. The real proof (OTG_MASTER_EN 0->1 with I1 stopping then
+# resuming) is on iron — this is the first bite that disables the live pipe, so QEMU can only prove dispatch.
+kprintln("modeset: running /bin/modeset --recommit", 40);
+sh_exec("run /bin/modeset --recommit", 27);
 #endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===

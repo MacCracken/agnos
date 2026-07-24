@@ -3,11 +3,50 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.12] - 2026-07-24
+
+**MODESET work list B cont. — the OTG envelope + transmitter (OPEN cycle).** Bumped on cycle open; the user
+tags/releases at close. Scope: **M6** (the same-mode OTG envelope re-commit — the first genuinely dangerous
+bite, `OTG_MASTER_EN=0`) → **M8·M9** (the transmitter + audio). M4+M5's iron success (below, 1.56.11) unblocks
+M6 on a lock+commit proven on real silicon rather than on sand.
+
+### Added — M6: the same-mode OTG envelope re-commit (`#93` op `MODESET_OP_RECOMMIT` + `/bin/modeset --recommit`)
+
+The first bite that **disables the live pipe**. A new `#93` op (0x05) saves the full timing group, sets
+`OTG_MASTER_EN`=0 (the panel blanks), reprograms every timing register back to its saved value, and sets
+`OTG_MASTER_EN`=1 (relight) — the envelope that makes ATOM #76 (the transmitter) survivable, since #76 blanks
+the pipe only when run *outside* a modeset. Same-mode (write-back verbatim), so the panel returns unchanged.
+The kernel oracle is **I1** (`OTG_STATUS_FRAME_COUNT`): it must STOP during the disable window (proving the
+disable took) and RESUME after enable (proving the reprogram+enable relit the pipe) — a new
+`mdo_wait_frame_stop` helper (the inverse of vblank-wait) detects the stop. M6 writes with the OTG **disabled**
+(immediate, not VUPDATE double-buffered), so it does not use the M4/M5 update-lock path and carries THE GATE
+itself. Guards as M5 (refuse non-calibrated V_TOTAL / DRR-on). `MDO_OP_SUPPORTED` is now `0x3F`. QEMU:
+`modeset-tool-smoke` **14/0** (`--recommit` dispatches, exit 96 with no GPU, refuses before arming, does NOT
+disable the pipe). Burns alone (its result gates M8).
+
+A **5-lens adversarial review returned GO** and its central finding shaped the design: both kernel
+instruments free-run off the OTG PLL, so a green cannot certify a *lit* panel (a HUBP underflow on re-arm
+leaves the counter ticking on a black screen), and the OPTC-underflow delta is a **dead instrument** here
+because bit10 is already set at boot. So **the picture oracle is the operator's eyes** (blank→relight→stable
+picture), and the kernel prints `EYE-CHECK the picture`; clearing the sticky bit is deferred as a
+verified-bit follow-up (a derived OPTC write on this bite is the P4-pitch hazard). Also folded in: **D2** the
+resume check re-confirms across the 120 ms settle (kills a false NORESUME on a slow-but-healthy relock),
+**D3** the two clock-controls are written back from their saved values (pure same-mode) instead of forced to
+a literal `0x3`, **D4** the off-rate gate tightened to 30 mHz.
+
+Also **fixed** — the 1.56.12 cut bumped `VERSION` but had missed `kernel/version.cyr` (the banner + version
+gvar) and `agnos.cyr`'s header; the arc sweep's "version in kernel" gate caught it. All now read 1.56.12.
+
 ## [1.56.11] - 2026-07-24
 
-**MODESET work list B — the iron modeset ladder (OPEN cycle).** Bumped on cycle open; the user tags/releases
-at close (when M6 green — agnos owns the OTG). This section accretes the work-list-B bites as they land;
-burns validate them on archaemenid between here and the tag.
+**MODESET work list B — the OTG lock + the FIRST REAL MODESET (★★ iron-proven).** M1·M2·M3 (read-only DCN
+dump), M4 (OTG-lock proof), M5 (the first real modeset). **BURNED on archaemenid 2026-07-24 — agnos performed
+its first modeset:** `--lock` → exit 95 (lock acked, pipe survived the lock cycle) and `--vtotal` → exit 95
+(`FIRST MODESET COMMITTED` — the measured refresh moved `59.951 → 59.152 → 59.951 Hz`, landing on the
+prediction *to the milliHz*, proving a write commits shadow→VUPDATE→live). Both ops' OPTC-underflow delta
+check fired its `pre-existing` NOTE — the sticky bit10 read 1 on iron *before* either op, exactly what the
+5-lens adversarial review predicted from the D-lane history; the absolute check I first wrote would have
+false-failed both burns.
 
 ### Added — M1·M2·M3: the read-only DCN pipe dump (`#93` op `MODESET_OP_DUMP` + `/bin/modeset --dump`)
 
@@ -55,6 +94,10 @@ no `latch armed at site=4` line with no GPU) and returns reason 1. `/bin/modeset
 = lock OK, 96 = no GPU here, 97 = a hardware check failed, 98 = latch would not arm). `MDO_OP_SUPPORTED` is
 now `0xF` (NOP + CAPS + DUMP + LOCK). Re-runnable in one boot; disarm with `rm /.modeset-armed` when done.
 
+**★ BURNED 2026-07-24 (archaemenid, exit 95).** `lock ack 1`, `I1 frames 1683 → 1694 advanced 1`, and
+`underflow bit10 1 -> 1` → the delta check correctly logged `pre-existing, not M4` and passed. The OTG
+master-update lock engages and the live pipe survives the lock cycle on real silicon.
+
 ### Added — M5: the first REAL modeset (`#93` op `MODESET_OP_VTOTAL` + `/bin/modeset --vtotal`)
 
 The bite M4 sets up but cannot deliver: **proof that a write COMMITS shadow→VUPDATE→live.** A new `#93` op
@@ -74,7 +117,14 @@ the operator can't see it — I1 can). The H2 latch remains the ultimate guarant
 **refuses** a non-calibrated V_TOTAL field or a DRR-on control rather than modeset a mystery. Phase C restores
 by construction, so the hardware ends at the inherited mode even on a failed verdict. `MDO_OP_SUPPORTED` is now
 `0x1F` (NOP + CAPS + DUMP + LOCK + VTOTAL). QEMU: `modeset-tool-smoke` **11/0** (`--vtotal` dispatches, exit 96
-with no GPU, refuses before arming). Iron proof rides the M4 flash (`--lock` then `--vtotal`, one boot).
+with no GPU, refuses before arming). Iron proof rode the M4 flash (`--lock` then `--vtotal`, one boot).
+
+**★★ BURNED 2026-07-24 (archaemenid, exit 95) — agnos performed its FIRST MODESET.** The A/B/C refresh triple
+landed on the prediction to the milliHz: `A 1481 = 59951 mHz (pred 59951)` → `B 1501 = 59152 mHz (pred 59152)
+lock ack 1` → `C 1481 = 59951 mHz`, so `VTOTAL OK -- FIRST MODESET COMMITTED`. The refresh moving to a
+frame-counted 59.152 Hz is physically impossible unless v_total 1501 is live in the OTG — the write committed
+shadow→VUPDATE→live. `ctrl 0` confirmed DRR-off (the V_TOTAL-only path was correct); the underflow delta
+noted the pre-existing sticky bit and passed. No watchdog fire (1501 is valid); latch cleared cleanly.
 
 A **5-lens adversarial review returned GO** and its central finding was folded in: both M5 instruments (frame
 counter + `gpu_refresh_measure`) free-run off the OTG PLL, so a green would prove "timing committed to the

@@ -85,10 +85,10 @@ wantno(){ if grep -aq "$2" "$1"; then echo "FAIL: $4"; fail=$((fail+1)); else ec
 want "$LOG" "modeset: caps OK" \
      "the tool ran in ring 3 and #93 returned a valid caps read" \
      "no 'caps OK' — the tool did not run or #93 failed (see error lines above)"
-# The op-support mask must be exactly 31 (bit0 NOP + bit1 CAPS + bit2 DUMP + bit3 LOCK + bit4 VTOTAL). A 0 here would mean a constant collapsed.
-want "$LOG" "modeset: opmask=31" \
-     "the op-support mask is 31 (NOP + CAPS + DUMP + LOCK + VTOTAL) — the kernel wrote real caps, not zeros" \
-     "opmask != 31 — the caps write is wrong or a constant read 0"
+# The op-support mask must be exactly 63 (bit0 NOP + bit1 CAPS + bit2 DUMP + bit3 LOCK + bit4 VTOTAL + bit5 RECOMMIT). A 0 here would mean a constant collapsed.
+want "$LOG" "modeset: opmask=63" \
+     "the op-support mask is 63 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT) — the kernel wrote real caps, not zeros" \
+     "opmask != 63 — the caps write is wrong or a constant read 0"
 # Under QEMU there is no AMD GPU, so the display must read DARK — this is what makes exit 96 the right answer.
 want "$LOG" "modeset: display DARK" \
      "the caps honestly report no lit display under QEMU" \
@@ -127,6 +127,19 @@ want "$LOG" "modeset: #93 vtotal error idx=0 reason=1" \
 wantno "$LOG" "modeset: latch armed at site=5" \
      "the M5 op refused BEFORE arming the latch under QEMU (gpu_present gate precedes the arm)" \
      "M5 armed the latch under QEMU — the gpu_present gate must precede modeset_arm"
+# --recommit arg path (M6 OTG envelope). Under QEMU there is no DCN, so mdo_recommit refuses at gpu_present
+# and returns reason 1 BEFORE arming or disabling the pipe — proving the RECOMMIT op dispatched with no risk.
+want "$LOG" "modeset: #93 recommit error idx=0 reason=1" \
+     "★ --recommit routed to the RECOMMIT op and returned reason 1 (no DCN under QEMU) — the M6 envelope op dispatched, pipe not touched" \
+     "--recommit did not reach the RECOMMIT op — argv broken, or the op rejected the record (not reason 1)"
+# ⛔ Under QEMU M6 must NOT have armed either — the gpu_present gate precedes modeset_arm(6). Critically, it
+# must NOT have disabled the pipe (no OTG_MASTER_EN write) with no GPU present.
+wantno "$LOG" "modeset: latch armed at site=6" \
+     "the M6 op refused BEFORE arming the latch under QEMU (gpu_present gate precedes the arm)" \
+     "M6 armed the latch under QEMU — the gpu_present gate must precede modeset_arm"
+wantno "$LOG" "modeset: recommit -- OTG_MASTER_EN 0" \
+     "the M6 op did NOT disable the pipe under QEMU (refused at the gpu_present gate first)" \
+     "M6 disabled the pipe under QEMU — the gpu_present gate must precede any OTG write"
 # The recovery boot must still reach the shell (the tool runs must not wedge the boot).
 want "$LOG" "Launching kybernet" \
      "the boot reached the shell (the tool runs did not wedge)" \

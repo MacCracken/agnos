@@ -209,6 +209,54 @@ fn modeset_vtotal(): i64 {
     return 95;
 }
 
+# M6 — the same-mode OTG envelope re-commit (#93 op 0x05). The kernel op arms the H2 latch, then
+# DISABLES the pipe (OTG_MASTER_EN=0 — the panel blanks briefly), reprograms the full timing group with its
+# own saved values, and re-enables (OTG_MASTER_EN=1). The proof is I1 (frame counter): it must STOP during
+# the disable window and RESUME after enable, printed to klug. This is the envelope M8 (the transmitter) will
+# run #4/#76 inside. Under QEMU (no DCN) it returns reason 1 -> 96. Disarm with `rm /.modeset-armed` after.
+#   95 = envelope OK (stopped then resumed, rate restored)   89 = disable did NOT stop the pipe (envelope no-op)
+#   96 = no GPU here (QEMU)             91 = pipe DARK -- did not resume (recover via H2)   90 = OPTC underflow
+#   92 = off-rate after re-enable       94 = refused (not calibrated / DRR on)   97 = unmeasurable   98 = latch
+fn modeset_recommit(): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }
+    store32(&rec + 0, 5);                                    # op = MDO_OP_RECOMMIT (0x05)
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        var reason = code & 0xFF;
+        m_puts("modeset: #93 recommit error idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(reason); m_nl();
+        if (reason == 1) { m_puts("modeset: no GPU / live pipe != 0 -- QEMU has no DCN"); m_nl(); return 96; }
+        if (reason == 4) {
+            m_puts("modeset: latch would not arm -- blocked (prior modeset did not disarm) or read-only fs"); m_nl();
+            m_puts("modeset: recover with:  rm /.modeset-armed"); m_nl();
+            return 98;
+        }
+        if (reason == 8) { m_puts("modeset: refused -- V_TOTAL is not the calibrated 1480 (pipe not the known mode)"); m_nl(); return 94; }
+        if (reason == 9) { m_puts("modeset: refused -- V_TOTAL_CONTROL nonzero (DRR/VRR on) -- untested path"); m_nl(); return 94; }
+        if (reason == 16) { m_puts("modeset: OTG_MASTER_EN=0 did NOT stop the pipe -- the envelope is a no-op (see klug)"); m_nl(); return 89; }
+        if (reason == 17) {
+            m_puts("modeset: pipe DARK -- stopped but did NOT resume after re-enable (see klug)"); m_nl();
+            m_puts("modeset: recover with:  rm /.modeset-armed  then power-cycle (H2)"); m_nl();
+            return 91;
+        }
+        if (reason == 7) { m_puts("modeset: OPTC UNDERFLOW -- envelope corrupted scanout (see klug)"); m_nl(); return 90; }
+        if (reason == 14) { m_puts("modeset: off-rate -- refresh did not return to the inherited value (see klug)"); m_nl(); return 92; }
+        if (reason == 15) { m_puts("modeset: unmeasurable -- pipe resumed but will not count (see klug)"); m_nl(); return 97; }
+        return 97;
+    }
+    if (r != 0) {
+        m_puts("modeset: #93 recommit returned unexpected "); m_num(r); m_nl();
+        return 99;
+    }
+    m_puts("modeset: RECOMMIT OK -- envelope 0->reprogram->1, stopped then resumed"); m_nl();
+    m_puts("modeset: ⚠ EYE-CHECK the panel -- a green OK with a BLACK screen = the underflow-dark case (power-cycle, H2)"); m_nl();
+    m_puts("modeset: capture:  run /bin/klug   then disarm:  rm /.modeset-armed"); m_nl();
+    return 95;
+}
+
 # `--dump` = the M1/M2/M3 read-only pipe dump; `--lock` = the M4 OTG-lock proof (WRITES under the latch);
 # `--caps` (or bare) = the caps probe. argc/argv come from the kernel's parked init stack; if that ever
 # reads 0 (the argv-init trap) the tool falls back to caps, so a bare `run /bin/modeset` always works.
@@ -219,6 +267,7 @@ fn modeset_main(): i64 {
         if (streq(a1, "--dump") == 1) { return modeset_dump(); }
         if (streq(a1, "--lock") == 1) { return modeset_lock(); }
         if (streq(a1, "--vtotal") == 1) { return modeset_vtotal(); }
+        if (streq(a1, "--recommit") == 1) { return modeset_recommit(); }
         if (streq(a1, "--caps") == 1) { return modeset_caps(); }
     }
     return modeset_caps();

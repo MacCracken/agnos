@@ -1322,7 +1322,8 @@ var MDO_OP_CAPS      = 0x01;        # write the modeset caps (8x u32 LE) to the 
 var MDO_OP_DUMP      = 0x02;        # M1/M2/M3 read-only DCN pipe dump -> progressive `rd <off> <val>` to klug
 var MDO_OP_LOCK      = 0x03;        # M4 OTG-lock proof — take lock, write V_TOTAL back to itself, release
 var MDO_OP_VTOTAL    = 0x04;        # M5 first real modeset — V_TOTAL 1481->1501->1481, oracled off I2 refresh
-var MDO_OP_SUPPORTED = 0x1F;        # bit N set <=> op N implemented: bit0 NOP, 1 CAPS, 2 DUMP, 3 LOCK, 4 VTOTAL
+var MDO_OP_RECOMMIT  = 0x05;        # M6 same-mode OTG envelope — OTG_MASTER_EN 0 -> reprogram -> 1, I1 stop/resume
+var MDO_OP_SUPPORTED = 0x3F;        # bit N set <=> op N implemented: 0 NOP,1 CAPS,2 DUMP,3 LOCK,4 VTOTAL,5 RECOMMIT
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
 var MDO_E_OUTBUF     = 3;           # op    — CAPS out_uva/out_len invalid
@@ -1338,6 +1339,8 @@ var MDO_E_RESERVED   = 12;          # op    — a reserved dword or an undefined
 var MDO_E_NOCOMMIT   = 13;          # op    — M5: refresh did NOT move — the write landed in shadow, VUPDATE never swapped
 var MDO_E_MODESET    = 14;          # op    — M5: refresh moved but not to the predicted value (totals/stride wrong)
 var MDO_E_UNMEAS     = 15;          # op    — M5: refresh unmeasurable (pipe not scanning cleanly enough to count)
+var MDO_E_NOSTOP     = 16;          # op    — M6: OTG_MASTER_EN=0 did not stop the frame counter — the disable never took
+var MDO_E_NORESUME   = 17;          # op    — M6: OTG_MASTER_EN=1 did not resume the frame counter — the pipe is DARK (recover via H2)
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -1659,6 +1662,166 @@ fn mdo_vtotal() {
     return 0;
 }
 
+# ── M6 same-mode OTG envelope re-commit (MODESET_OP_RECOMMIT): OTG_MASTER_EN 0 -> reprogram -> 1 ────────
+# The first bite that DISABLES the live pipe. It is the ordering fact the whole arc turns on: ATOM #76
+# blanks the pipe because agnos runs it OUTSIDE a modeset envelope; #76 becomes survivable only once this
+# disable->reprogram->enable envelope exists (M8 wraps #4/#76 inside it). This is a SAME-MODE re-commit —
+# every register is written back to the value it already holds, so the panel returns unchanged — which makes
+# the ENVELOPE MECHANISM the thing under test, isolated from any timing change. ⛔ Unlike M4/M5, the writes
+# happen with the OTG DISABLED, so they are IMMEDIATE (not VUPDATE double-buffered) and do NOT go through the
+# update-lock path — so this op carries THE GATE itself.
+#
+# The oracle is I1 (OTG_STATUS_FRAME_COUNT): it must STOP during the disable window (proving OTG_MASTER_EN=0
+# actually took) and RESUME after enable (proving the reprogram+enable relit the pipe). If it never stops,
+# the disable is a no-op and every later bite is built on sand; if it stops but never resumes, the pipe is
+# DARK and only H2 recovers it (one bad boot).
+
+# mdo_wait_frame_stop — after OTG_MASTER_EN=0, the frame counter must FREEZE. Settle ~60ms so the OTG
+# finishes its current frame and stops, then confirm the counter is constant across ~40ms (~2.5 frames — a
+# running pipe would advance). 1 = stopped (disable took), 0 = still advancing (disable did NOT take). Uses
+# the wall-clock hold, which does not depend on the pipe scanning, so it is valid with the OTG disabled.
+fn mdo_wait_frame_stop(pipe) {
+    var fc_off = GPU_R_OTG_FRAME_COUNT + pipe * GPU_DCN_OTG_STRIDE;
+    gpu_dcn_hold_ms(60);
+    var a = gpu_reg32(GPU_BASE_DCN_2, fc_off) & GPU_OTG_FRAME_COUNT_MASK;
+    gpu_dcn_hold_ms(40);
+    var b = gpu_reg32(GPU_BASE_DCN_2, fc_off) & GPU_OTG_FRAME_COUNT_MASK;
+    if (a == b) { return 1; }
+    return 0;
+}
+
+fn mdo_recommit() {
+    if (gpu_present == 0)      { return MDO_E_NOGPU; }      # QEMU: no DCN
+    if (gpu_display_ok != 1)   { return MDO_E_NOGPU; }
+    if (gpu_display_pipe != 0) { kprintln("modeset: recommit refused -- live pipe is not 0", 47); return MDO_E_NOGPU; }
+    if (gpu_pixclk_100hz == 0) { kprintln("modeset: recommit refused -- pixclk unmeasured (0)", 50); return MDO_E_UNMEAS; }
+    var pipe = 0;
+    if (modeset_arm(6) != 1)   { kprintln("modeset: recommit refused -- latch would not arm", 48); return MDO_E_ARM; }
+    # ⛔ THE GATE — M6 writes directly (OTG disabled), NOT through gpu_dcn_write_committed, so the gate that
+    # lives in those primitives is not on this path. Carry it here. The arm above just set the token; this is
+    # belt-and-suspenders against a future edit that moves the arm.
+    if (modeset_armed != 1297040453) { kprintln("modeset: recommit refused -- not armed", 38); return MDO_E_ARM; }
+
+    # Save the FULL timing group + control (H1: spilled before any write; the restore set, by construction).
+    var s_ctrl  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL) & 0xFFFFFFFF;
+    var s_htot  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_TOTAL) & 0xFFFFFFFF;
+    var s_hbl   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_BLANK_START_END) & 0xFFFFFFFF;
+    var s_hsa   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A) & 0xFFFFFFFF;
+    var s_hsac  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A_CNTL) & 0xFFFFFFFF;
+    var s_htc   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_H_TIMING_CNTL) & 0xFFFFFFFF;
+    var s_vtot  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL) & 0xFFFFFFFF;
+    var s_vmin  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MIN) & 0xFFFFFFFF;
+    var s_vmax  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MAX) & 0xFFFFFFFF;
+    var s_vctl  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_CONTROL) & 0xFFFFFFFF;
+    var s_vbl   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_BLANK_START_END) & 0xFFFFFFFF;
+    var s_vsa   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A) & 0xFFFFFFFF;
+    var s_vsac  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A_CNTL) & 0xFFFFFFFF;
+    var s_intl  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_INTERLACE_CONTROL) & 0xFFFFFFFF;
+    var s_vst   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_VSTARTUP_PARAM) & 0xFFFFFFFF;
+    var s_vup   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_VUPDATE_PARAM) & 0xFFFFFFFF;
+    var s_vrd   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_VREADY_PARAM) & 0xFFFFFFFF;
+    var s_vtg   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_VTG0_CONTROL) & 0xFFFFFFFF;
+    var s_occ   = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_CLOCK_CONTROL) & 0xFFFFFFFF;
+    var s_oicc  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC_INPUT_CLOCK_CONTROL) & 0xFFFFFFFF;
+    var vt_field = s_vtot & GPU_OTG_TOTAL_MASK;
+
+    kprint("modeset: recommit pre-state v_total ", 36); kprint_num(vt_field + 1);
+    kprint(" ctrl ", 6); kprint_num(s_ctrl); kprint(" otg_clk ", 9); kprint_num(s_occ);
+    kprint(" optc_clk ", 10); kprint_num(s_oicc); kprintln("", 0);
+
+    # ⛔ Same guards as M5: only the arc's calibrated GOP mode, DRR off (a same-mode envelope on a DRR pipe is
+    # untested). Refusing here leaves the pipe UNTOUCHED (nothing disabled yet).
+    if (vt_field != 1480) { kprintln("modeset: recommit refused -- V_TOTAL field is not the calibrated 1480", 69); return MDO_E_NOTMODE; }
+    if (s_vctl != 0) { kprintln("modeset: recommit refused -- V_TOTAL_CONTROL nonzero (DRR on) -- untested", 73); return MDO_E_DRR; }
+
+    var unf0 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    var fc0  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
+
+    # === DISABLE === OTG_MASTER_EN = 0 (clear bit0, preserve the rest of OTG_CONTROL). The panel blanks here.
+    kprintln("modeset: recommit -- OTG_MASTER_EN 0 (disabling pipe; panel blanks briefly)", 75);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl & (0 - 1 - GPU_OTG_MASTER_EN));
+    gpu_mfence();
+    var stopped = mdo_wait_frame_stop(pipe);
+    var fc_dis  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
+    kprint("modeset: recommit -- frame count ", 33); kprint_num(fc0); kprint(" -> ", 4); kprint_num(fc_dis);
+    kprint(" stopped ", 9); kprint_num(stopped); kprintln("", 0);
+
+    # === REPROGRAM (OTG disabled: writes are immediate, not double-buffered) === same-mode, so every timing
+    # register is written back to its saved value; the two clock-controls are set to 0x3 (the amdgpu envelope
+    # value that keeps the OTG/OPTC clocks on — required for the pipe to scan when re-enabled). Inter-register
+    # order is non-critical for a same-mode re-commit (all land before the enable).
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_TOTAL, s_htot);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_BLANK_START_END, s_hbl);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A, s_hsa);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_SYNC_A_CNTL, s_hsac);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_H_TIMING_CNTL, s_htc);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL, s_vtot);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MIN, s_vmin);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_TOTAL_MAX, s_vmax);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_BLANK_START_END, s_vbl);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A, s_vsa);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_V_SYNC_A_CNTL, s_vsac);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_INTERLACE_CONTROL, s_intl);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_VSTARTUP_PARAM, s_vst);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_VUPDATE_PARAM, s_vup);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_VREADY_PARAM, s_vrd);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_VTG0_CONTROL, s_vtg);
+    # D3 (burn-1 hygiene): write BACK the pre-disable clock-control values, NOT a forced literal 0x3. These
+    # two are the ONLY registers whose value could differ across the envelope (every timing write above is
+    # same-value), so write-back keeps the whole envelope pure same-mode and cannot mis-select a clock
+    # source/divider. On a lit GOP pipe both read 0x3 (clocks on) — flag it if they don't (a real finding).
+    if (s_occ != 0x3)  { kprint("modeset: NOTE OTG_CLOCK_CONTROL was ", 36); kprint_num(s_occ); kprintln(" not 0x3", 8); }
+    if (s_oicc != 0x3) { kprint("modeset: NOTE OPTC_INPUT_CLOCK_CONTROL was ", 43); kprint_num(s_oicc); kprintln(" not 0x3", 8); }
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CLOCK_CONTROL, s_occ);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OPTC_INPUT_CLOCK_CONTROL, s_oicc);
+    gpu_mfence();
+
+    # === ENABLE === restore the saved OTG_CONTROL (OTG_MASTER_EN back to 1 with every other bit as it was).
+    kprintln("modeset: recommit -- OTG_MASTER_EN 1 (re-enabling pipe)", 55);
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_OTG_CONTROL, s_ctrl);
+    gpu_mfence();
+    var resumed = gpu_display_wait_vblank(pipe);
+    gpu_dcn_hold_ms(120);                       # settle before measuring
+    var refr = gpu_refresh_measure(pipe);
+    var unf1 = (gpu_reg32(GPU_BASE_DCN_2, GPU_R_OPTC0_UNDERFLOW) >> 10) & 1;
+    var fc1  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
+    # D2: gpu_display_wait_vblank bounds at ~50ms; a healthy-but-slow PLL relock (or a hot TSC vs the
+    # approximate GPU_TSC_PER_US) can exceed it and read resumed=0 on a pipe that IS coming back. Re-confirm
+    # across the 120ms settle: if the counter advanced past its disabled value, the pipe resumed regardless.
+    if (resumed == 0) { if (fc1 != fc_dis) { resumed = 1; } }
+
+    var pred = gpu_pixclk_100hz * 100000 / (((s_htot & GPU_OTG_TOTAL_MASK) + 1) * (vt_field + 1));
+    kprint("modeset: recommit -- resumed ", 29); kprint_num(resumed); kprint(" frame count ", 13); kprint_num(fc1);
+    kprint(" refresh ", 9); kprint_num(refr); kprint(" mHz predicted ", 15); kprint_num(pred); kprintln(" mHz", 4);
+    kprint("modeset: underflow bit10 ", 25); kprint_num(unf0); kprint(" -> ", 4); kprint_num(unf1); kprintln("", 0);
+
+    # Verdict. STOP first — if the disable never took, the whole envelope model is wrong (built on sand).
+    if (stopped == 0) { kprintln("modeset: RECOMMIT FAILED -- OTG_MASTER_EN=0 did not stop the pipe -- envelope is a no-op", 88); return MDO_E_NOSTOP; }
+    # RESUME next — if it stopped but did not come back, the pipe is DARK; recover via H2.
+    if (resumed == 0) { kprintln("modeset: RECOMMIT DARK -- pipe stopped but did NOT resume after enable -- recover via H2", 88); return MDO_E_NORESUME; }
+    if (refr == 0) { kprintln("modeset: RECOMMIT unmeasurable -- pipe resumed but will not count", 65); return MDO_E_UNMEAS; }
+    # underflow delta (D1, like M4/M5): convict only a NEWLY-set bit10.
+    if (unf0 == 0) {
+        if (unf1 != 0) { kprintln("modeset: RECOMMIT UNDERFLOW -- OPTC bit10 newly set by the envelope", 67); return MDO_E_UNDERFLOW; }
+    }
+    # ⚠ D1 (the review's central find): on THIS iron OPTC bit10 is ALREADY set at boot, so the delta above is a
+    # DEAD instrument here — and M6 is the first bite to fully stop the OTG, the exact trigger for a HUBP
+    # underflow on re-arm (a black-but-COUNTING panel: the frame counter free-runs off the PLL, so I1 resume +
+    # refresh alone cannot certify a picture). Clearing the sticky bit would revive the check but the
+    # write-1-to-clear bit is NOT verified in agnos, and a derived-not-verified OPTC write on the most
+    # dangerous bite is exactly the P4-pitch hazard. So the picture oracle for M6 is the OPERATOR'S EYES
+    # (blank -> relight -> stable picture), NOT this bit. Verifying the underflow-clear bit is a follow-up.
+    if (unf0 != 0) { kprintln("modeset: NOTE OPTC bit10 pre-set at boot -- CONFIRM THE PICTURE BY EYE (this instrument is blind here)", 102); }
+    # refresh must return to the inherited rate. Same-mode writes back verbatim, so refr should equal pred to
+    # within the ~1 mHz noise floor; gate at 30 mHz (~500 ppm) — well inside noise, tighter than a 1-line
+    # V_TOTAL error (~40 mHz) would produce. (The card cites 200 ppm ~= 12 mHz; 30 is the safe-vs-noise pick.)
+    var dr = refr - pred;
+    if (dr < 0) { dr = 0 - dr; }
+    if (dr > 30) { kprintln("modeset: RECOMMIT off-rate -- refresh did not return to the inherited value", 75); return MDO_E_MODESET; }
+    kprintln("modeset: RECOMMIT OK -- envelope 0->reprogram->1, stopped then resumed, rate restored -- EYE-CHECK the picture", 110);
+    return 0;
+}
+
 # mdo_validate(rec) -> 0 or an MDO_E_* reason. PURE READS on the KERNEL-RESIDENT copy. Every dword an op does
 # not define MUST be zero — a non-zero reserved field is REJECTED rather than ignored, which is what keeps
 # today's unused dwords safe to define in a later kernel without an ABI break.
@@ -1704,6 +1867,13 @@ fn mdo_validate(rec) {
         if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
     }
+    if (op == MDO_OP_RECOMMIT) {
+        # M6 reads + writes back the live timing group in-kernel — no operands; +8..+23 must be zero.
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
     if (op == MDO_OP_CAPS) {
         var out_len = load64(rec + 16);
         if (out_len < 32) { return MDO_E_OUTBUF; }
@@ -1719,6 +1889,7 @@ fn mdo_execute(rec) {
     if (op == MDO_OP_DUMP) { return mdo_dump(); }
     if (op == MDO_OP_LOCK) { return mdo_lock(); }
     if (op == MDO_OP_VTOTAL) { return mdo_vtotal(); }
+    if (op == MDO_OP_RECOMMIT) { return mdo_recommit(); }
     return MDO_E_BADOP;                              # unreachable after validate — belt-and-suspenders
 }
 
