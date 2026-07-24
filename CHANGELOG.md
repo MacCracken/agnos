@@ -3,6 +3,45 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.14] - 2026-07-24
+
+**MODESET M8e prerequisites — the phyid correction (OPEN cycle).** Bumped on cycle open; the user
+tags/releases at close. Scope: **re-derive ATOM #76's `phyid`** (M8d's seed overturned MD-2 — see 1.56.13
+below), then **M8e** (the live #76 PHY edge) → **M9** (audio sequenced after the transmitter edge).
+M8e stays blocked until the transmitter is provably pointed at the live PHY.
+
+### Fixed — ATOM #76's `phyid` is now DERIVED FROM LIVE HARDWARE, never hardcoded
+
+The M8d seed overturned MD-2 (`phyid=0` → the live transmitter is **1**), and the fix is a re-derivation
+rather than a patched constant — flipping `0` to `1` would have preserved the actual defect, which is that
+the most destructive command in the arc took its target from a VBIOS guess.
+
+New **`gpu_phy_discover()`** asks the back end directly. ⛔ It answers a different question from
+`gpu_audio_dig`, and conflating the two is what caused this: `gpu_audio_dig` scans `DIG_FE_CNTL` for
+`SYMCLK_FE_ON` — the **front** end — while `phyid` indexes the **back** end (`DIG_BE_CNTL` / the UNIPHY
+transmitter), which DCN assigns independently (amdgpu computes it as `link->link_enc->transmitter -
+TRANSMITTER_UNIPHY_A`, from runtime DDC/HPD routing). They are both 1 on archaemenid — routing, not identity.
+
+The live link encoder is the instance satisfying **three** conditions, all required because any one alone can
+read stale on a re-routed pipe: `DIG_BE_EN_CNTL` bit0 set (the liveness gate) · `FE_SOURCE_SELECT` non-zero
+(a front end actually routed) · `DIG_MODE` ∈ {2 DVI, 3 HDMI} (a real signalling mode; 1 = off). On iron all
+three agree on instance 1 and eliminate 0/2/3/4 (`dig1 be=0x101 mode=2` vs `dig0/2/3/4 be=0x100 mode=1`).
+`atom_run_transmitter_enable_hdmi()` now calls it and **REFUSES** (returns −1, logs) when nothing is live —
+`0` is precisely the wrong-and-plausible answer a dead PHY accepts in silence.
+
+**Host tooling re-derived in lockstep.** `atom-interp.py` gains `derive_phyid_from_snapshot()`, mirroring the
+kernel rule, and now **prefers a `--regsnapshot`-derived phyid** over the object-table value — which it
+finally labels honestly as `object-table GUESS -- UNRELIABLE` instead of presenting it as a derivation. Its
+own docstring had always said the enum-1 heuristic was not the real value and was flagged
+`[TODO confirm on iron]`; it was believed anyway.
+
+**`mdo_dump` gains the `M8-digbe` group** (dump is now **101 registers**): the per-instance `DIG_BE_CNTL` +
+`DIG_BE_EN_CNTL` for instances 1-4. The M8d seed could not derive phyid because it carried only instance
+**0**'s back-end registers — they came from #76's own phyid=0 read-set, so the capture inherited the very
+bias it needed to test. `m1-decode.py` reports the derivation per instance and prints
+`phyid UNDETERMINED … ⛔ Do NOT run ATOM #76 on a guess` when the data is missing (verified: on the existing
+M8d capture it correctly rejects instance 0 and declines to name one).
+
 ## [1.56.13] - 2026-07-24
 
 **MODESET work list B — the TRANSMITTER + audio (OPEN cycle).** Bumped on cycle open; the user tags/releases
@@ -85,6 +124,33 @@ registers — #76's own write set is PHY/UNIPHY only (`0x55xx`/`0x5Dxx`/`0x5Exx`
 `0x20xx`. What *is* established is that the amdgpu capture emits the block after the edge and agnos never
 has. Whether the replay is **required** is what M8d/M8e measure; the earlier "#76 resets the encoder's
 latched packet state" phrasing was an unproven mechanism claim and is not repeated in the source.
+
+**★★ BURNED 2026-07-24 (archaemenid, `--dump` + `--transmitter`, both exit 95) — three results.**
+**(1)** The enveloped encoder edge survived, with the ATOM trace exactly as predicted: 5 reads / 5 writes over
+`0x569A`/`0x562B`/`0x5628`×3 — including the `DIG_START` strobe (bit10 set then cleared, the review's
+most-likely blank path) — and **nothing** in `0x55xx`/`0x5Dxx`/`0x5Exx`, confirming #76 was compiled out.
+`stopped 1` → `resumed 1`, refresh `59951 = predicted`, `klug spilled 10145 bytes`. `be_cntl` and `DIG_MODE`
+**unchanged, which is the correct result** — the pre-review rubric expected `DIG_MODE`→3 and would have
+recorded this healthy burn as a falsify. **(2)** The **M2 PHY gap is closed**: `UNIPHYA_LINK_CNTL 0x5D2D =
+0x01000100`, byte-identical to the 07-20 amdgpu capture — agnos read its own PHY for the first time and the
+`mdo_rd2a` base-fix is iron-confirmed. **(3)** The H5 snapshot seed is real at **16/16** coverage.
+
+### Fixed — MD-2 overturned: ATOM #76's `phyid` is **1**, not 0 (M8e was pointed at a dead PHY)
+
+The M8d seed did the job the review's staging insisted on. Replaying #76 under `--regsnapshot` at each phyid:
+`phyid=0` → `reads=87292 writes=20 delays=43639` (**poll storm**), writing `DIG_BE_CNTL` **instance 0**
+(`0x556F`) and RDPCSTX**0**; `phyid=1` → `reads=21 writes=17 delays=5` (**clean**), writing instance **1**
+(`0x566F`) and RDPCSTX**1**. Every independent line of iron evidence agrees on 1: the live encoder is
+instance 1 (`dig1 mode=2` DVI, `0x566F = 0x10020200`) while instance 0 is off (`dig0 mode=1`), and RDPCSTX1
+reads `0x00D1F000` against RDPCSTX0's `0x00D00000`. The storm is the tell — with real values the correct
+target's status bits already read ready, while the wrong one spins waiting on a PHY that was never powered.
+
+MD-2 had been recorded as "SETTLED: phyid=0 (UNIPHYA), object-info-derived"; the derivation was in fact
+best-effort (`atom-interp.py` prints `[TODO confirm on iron]`). `atom_run_transmitter_enable_hdmi()`
+(`atom.cyr:971`) still hardcodes 0, so **M8e is blocked**: firing #76 there would power-cycle a dead PHY and
+reprogram a dead encoder while the live link sits untouched — a wasted destructive burn at best, another
+blanked panel at worst. The constant now carries a ⛔ block comment; the fix is an M8e bite with its own
+review, because the object-info reasoning needs re-deriving rather than patching.
 
 ## [1.56.12] - 2026-07-24
 

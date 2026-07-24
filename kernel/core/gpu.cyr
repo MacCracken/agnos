@@ -5901,6 +5901,48 @@ fn gpu_audio_probe() {
     return 1;
 }
 
+# gpu_phy_discover — WHICH LINK ENCODER (the PHY / transmitter instance) drives the live display?
+#
+# ⛔ THIS IS NOT THE SAME QUESTION AS "which DIG is live", and conflating them is exactly what aimed ATOM
+# #76 at a dead PHY. `gpu_audio_dig` above comes from scanning DIG_FE_CNTL for SYMCLK_FE_ON — the FRONT
+# end (stream encoder). ATOM's `phyid` indexes the BACK end (DIG_BE_CNTL / the UNIPHY transmitter), and DCN
+# assigns the two independently; amdgpu computes it as `link->link_enc->transmitter - TRANSMITTER_UNIPHY_A`,
+# from runtime DDC/HPD routing. On archaemenid both happen to be 1 — that is routing, not identity, and
+# assuming identity is how MD-2 got recorded as "phyid=0, object-info-derived" and stood until the M8d iron
+# seed overturned it (a VBIOS enum-1 guess the deriving tool itself marked "[TODO confirm on iron]").
+#
+# So ask the BACK END directly instead of deriving it from a table: the live link encoder is the instance in
+# a REAL signalling mode (DIG_MODE 2=DVI or 3=HDMI; 1 means off) that ALSO has a front end selected
+# (FE_SOURCE_SELECT != 0). Both conditions matter — an instance can hold a stale mode with nothing routed.
+# Iron (M8d dump, 2026-07-24):
+#     BE[0] abs 0x556F = 0x00010000  DIG_MODE=1  FE_SOURCE=0x00  -> dead
+#     BE[1] abs 0x566F = 0x10020200  DIG_MODE=2  FE_SOURCE=0x02  -> LIVE   => phyid 1
+# and the PHY registers agree: RDPCSTX1 = 0x00D1F000 is configured where RDPCSTX0 = 0x00D00000 is not.
+#
+# Returns the instance index, or -1 when nothing is live — callers MUST refuse rather than fall back to 0,
+# because "0" is precisely the wrong-and-plausible answer that a dead PHY accepts silently.
+fn gpu_phy_discover() {
+    var found = 0 - 1;
+    var i = 0;
+    while (i < GPU_DCN_DIGS) {
+        var be  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL    + i * GPU_DCN_DIG_STRIDE) & 0xFFFFFFFF;
+        var en  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_EN_CNTL + i * GPU_DCN_DIG_STRIDE) & 0xFFFFFFFF;
+        var mode = (be & GPU_DIG_MODE_MASK) >> GPU_DIG_MODE_SHIFT;
+        # THREE independent conditions, all required. Any one alone can be stale on a re-routed pipe, and
+        # the cost of a wrong answer here is the most destructive command in the arc aimed at a dead PHY.
+        # On archaemenid all three agree on instance 1 and eliminate 0/2/3/4 (boot probe: dig1 be=0x101
+        # mode=2; dig0/2/3/4 be=0x100 mode=1 — DIG_ENABLE clear, no real mode, nothing routed).
+        if ((en & GPU_DIG_ENABLE) != 0) {                      # 1. the back end is enabled (liveness gate)
+            if ((be & GPU_DIG_FE_SOURCE_SEL_MASK) != 0) {      # 2. a front end is actually routed to it
+                if (mode == GPU_DIG_MODE_DVI)  { if (found < 0) { found = i; } }   # 3. a real signalling
+                if (mode == GPU_DIG_MODE_HDMI) { if (found < 0) { found = i; } }   #    mode, not 1 = off
+            }
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
 # === 1.55.x P3b prerequisite — pixel-clock discovery ===
 # The HDMI audio DTO needs the pixel clock in 100 Hz units, and the DCCG register that would hold it is only
 # populated on a DP-driven pipe (this link is HDMI, so it reads 0). Derive it instead:

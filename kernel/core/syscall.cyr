@@ -1470,7 +1470,22 @@ fn mdo_dump() {
     mdo_rd2a(0x5DE9); mdo_rd2a(0x5DF7); mdo_rd2a(0x5DFC); mdo_rd2a(0x5E03);
     mdo_rd2a(0x5E0F); mdo_rd2a(0x5E10); mdo_rd2a(0x5E11); mdo_rd2a(0x5E12);
 
-    kprintln("modeset: dump end -- 93 registers (M1 67 + M2 10 + M3 4 + M8 12)", 64);
+    # ── The per-instance DIG BACK END — what `phyid` actually indexes ───────────────────────────────
+    # Added after the M8d seed could NOT derive phyid: it carried instance 0's BE registers (they came from
+    # #76's own phyid=0 read-set) and nothing for instances 1-4, so both the kernel's gpu_phy_discover()
+    # and the host tool had to fall back to the object-table GUESS — the guess that aimed #76 at a dead PHY.
+    # With this group a captured seed is self-sufficient: the live link encoder is the instance that is
+    # ENABLED (DIG_BE_EN_CNTL bit0), has a front end routed (FE_SOURCE_SELECT != 0) and carries a real
+    # signalling mode (DIG_MODE 2=DVI / 3=HDMI). DIG_BE_CNTL abs = 0x556F + N*0x100, DIG_BE_EN_CNTL +1.
+    # ⚠ Safe: the boot audio probe already reads exactly these ten registers on every boot.
+    # Instances 1-4 only — 0x556F/0x5570 are already in the M8-76readset group above.
+    kprintln("modeset: dump group M8-digbe", 28);
+    mdo_rd2a(0x566F); mdo_rd2a(0x5670);
+    mdo_rd2a(0x576F); mdo_rd2a(0x5770);
+    mdo_rd2a(0x586F); mdo_rd2a(0x5870);
+    mdo_rd2a(0x596F); mdo_rd2a(0x5970);
+
+    kprintln("modeset: dump end -- 101 registers (M1 67 + M2 10 + M3 4 + M8 12 + DIGBE 8)", 75);
     return 0;
 }
 
