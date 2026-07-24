@@ -6613,6 +6613,16 @@ fn gpu_hdmi_audio_enable() {
     var hpc1 = gpu_reg32(GPU_BASE_DCN_2, dr);
     gpu_reg32_write(GPU_BASE_DCN_2, dr, hpc1 | GPU_AZ_AUDIO_ENABLED);
 
+    # ⚠ M9 NOTE (capture-decoded 2026-07-24, before splitting this function): amdgpu NEVER WRITES ordinal
+    # 0x36 AT ALL. Its AZ endpoint-1 staging is 0x54(clear) · 0x25 CHANNEL_SPEAKER · 0x27-0x2f · 0x31-0x35 ·
+    # 0x37 · 0x38 · 0x3a-0x3f (ELD) · 0x40-0x42 · 0x54(0x10), and only then, ~22 ms later and AFTER the
+    # transmitter edge, 0x54 <- 0x80000001 (AUDIO_ENABLED bit31). So this slot-map write is agnos-specific
+    # and is NOT bound by the capture's ordering — the apparent conflict between "amdgpu stages descriptors
+    # before AUDIO_ENABLED" and the rule below is not a conflict at all.
+    # ⛔ CONSEQUENCE FOR THE M9 SPLIT: when AUDIO_ENABLED moves into the post-edge unmute, THIS WRITE MOVES
+    # WITH IT. The rule below is an agnos iron finding and must be preserved; the unmute is therefore
+    # AZ AUDIO_ENABLED -> slot map -> SAMPLE_SEND -> HDMI_GC, not the bare triple.
+    #
     # THE SLOT MAP — written AFTER AUDIO_ENABLED, and read back, because writing it BEFORE did not stick.
     # Iron, 1.55.14 dump: agnos read AZ_MULTICHANNEL_ENABLE = 0 where amdgpu reads 1, while CHANNEL_SPEAKER
     # (written in the same window, moments earlier) landed fine at 0x10001. So the window works and the
