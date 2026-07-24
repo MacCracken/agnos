@@ -3,7 +3,17 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.56.10] - 2026-07-24
+
+**MODESET harness — work list A complete.** The three bites that finished the zero-burn half of the modeset
+arc (H1 log-spill, H2 the arm-once latch, H3 the `/bin/modeset` ring-3 seam), plus the cyrius 6.4.2 → 6.4.74
+pin bump that brought the gvar const-fold, a `_cfo=0` codegen fix, and the #92/#93 wrappers. Every bite is
+zero-burn and QEMU/host-validated; the default kernel changed only where a bite is a real feature (H1's
+unconditional spill-prepare, H2's latch, H3's #93 handler). With work list A done, every mandatory-reflash
+path in the arc is retired and what remains is work list B (iron): M1–M9 and the L1/L2 discriminators.
+
+Gates on the 6.4.74 toolchain: ARC SWEEP **15/15** · `check.sh` **14/14** · `kprint-len-check` **2575/0** ·
+`modeset-tool-smoke` **6/0** · `modeset-latch-smoke` **28/0 + 4/0** · `klug-spill-smoke` **7/0 (both modes)**.
 
 ### Added — H3 `/bin/modeset` + syscall #93 `gpu_modeset_op`: the ring-3 modeset seam
 
