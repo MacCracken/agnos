@@ -3,6 +3,48 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added — H1 `klug_spill`: the kernel can now persist its own log ring to agnos-fs
+
+MODESET harness bite **H1**. A bite whose failure blanks the console used to lose its diagnostic with it —
+the 1.56.x D lane burned five iron flashes for one result and **two produced no evidence at all**. Every
+risk row in the modeset plan (R1, R2, R6) claims "log survives — spilled per group"; that claim is only
+true as of this bite.
+
+- **`klug_spill_prepare()`** — runs unconditionally right after `vfs_mount_init()`, creating **and
+  pre-allocating** `/klug.txt` on agnos-fs.
+- **`klug_spill()`** — writes the 64 KB ring into that file, oldest byte first. Returns bytes written.
+- **`ATOM_HALT` is now photo-tool-only** (operator decision **MD-6**, which was gated on H1 landing). It is
+  an unrecoverable IF=0 hang that yields no keyboard, no shell and no log — risk R9. With a spill available,
+  nearly every reason to reach for it is gone. It must **never** be paired with a bite whose oracle is a log.
+
+**Two corrections to the plan's own prescription, both found by reading the source first:**
+
+- **`vfs_create_on`/`vfs_write_on` are not usable here.** They dispatch FAT/exFAT only and return `-1` for
+  ext2 (`vfs.cyr:502-514`); agnos-fs is ext2. The `ext2_write_at` alternative is the real path — and it is
+  the **non-journaled** form, deliberately: a spill runs when things have already gone wrong and must not be
+  able to hang in journal replay with a dead console.
+- **"Pre-create at mount" had to mean pre-ALLOCATE.** Creating the dirent is not enough — writing 64 KB into
+  a 0-byte file runs the block allocator, which is precisely what must not happen once the console is gone.
+  Prepare writes the full ring size once, so every later spill is a pure overwrite-in-place. That also
+  sidesteps the extent-append limitation `ext2_write_at` documents (overwrite works at any depth; append is
+  depth-0 only).
+
+**★ The wrapped branch is proven, not assumed.** A normal boot never wraps the ring (QEMU ~2.5 KB, iron
+~16–20 KB, ring 64 KB), so `klug_spill()`'s two-run reorder would otherwise have shipped unexecuted — and
+its failure mode is **silent**, producing a log that is merely *rotated* and therefore still looks fine.
+`KLUG_SPILL_WRAPTEST` forces the ring past 64 KB and plants two ordered markers:
+`count=65536 head=9623`, markers at **A@64468 < B@65522** ⇒ chronological.
+
+Gates — `scripts/klug-spill-smoke.sh`, **7/7 in both modes**. The oracle is independent throughout: the
+spill is read back off the platter with `debugfs` (no mounting), every `klug:` line on disk must also appear
+in the serial capture, and `e2fsck` must be clean afterwards. A byte count the kernel reports about itself
+would prove nothing.
+
+⚠ This is the first bite of the harness series that is **not** `cmp`-identical to the previous release
+(+1,112 bytes): `klug_spill_prepare()` is a real unconditional feature, not an opt-in selftest.
+
 ## [1.56.9] - 2026-07-23
 
 **The MODESET harness — work list A.** Four bites (H0, H7, H6, H4) that make the modeset ladder's iron rungs

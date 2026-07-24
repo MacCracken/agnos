@@ -827,6 +827,13 @@ exfat_init();
 # the old ext2_active-flag toggle that hid FAT/exFAT behind a mounted ext2.
 vfs_mount_init();
 
+# H1 (gpu.md, modeset arc) — pre-create AND PRE-ALLOCATE /klug.txt so a later klug_spill() is a pure
+# overwrite-in-place. It runs HERE, immediately after the mounts, because that is the last moment the
+# console is guaranteed alive: the whole point of the spill is to survive a bite that blanks the display,
+# and running the block allocator after the console is gone is exactly what you cannot debug. Cheap and
+# fail-safe — a read-only or absent ext2 returns 0 and no spill is attempted later.
+klug_spill_prepare();
+
 # GPU arc C1b-2 (1.54.x) — LOAD_IP_FW RLC_G: the first real firmware into the GPU.
 # Runs HERE (after the FS mounts) because it reads the AMD-signed RLC microcode from
 # the agnos-fs (/fw/rlc.bin) and feeds it to the PSP over the ring + TMR that
@@ -1141,6 +1148,22 @@ gpu_audio_probe();
 # rate. Read-only; gated on P0. Takes ~2 s of boot: five ~0.33 s measurement windows.
 gpu_pixclk_discover();
 
+#ifdef KLUG_SPILL_SELFTEST
+# H1 (gpu.md, modeset arc) — exercise the spill. Runs LATE, so the ring holds a full boot log and the
+# spilled bytes can be byte-compared against the serial capture from the host.
+# Top level, its own flag — same reason as the ATOM selftests below: this touches the FS, not the display,
+# so it must not be reachable only via a console-risky gate.
+var _klug_spilled = klug_spill();
+kprint("klug: spilled ", 14); kprint_num(_klug_spilled); kprintln(" bytes to /klug.txt", 19);
+#endif
+
+#ifdef KLUG_SPILL_WRAPTEST
+# H1 wrap exercise — forces the ring past 64 KB and re-spills, so the two-run chronological branch of
+# klug_spill() actually executes. A normal boot never wraps the ring, so without this the branch ships
+# untested and its failure mode (a rotated log that still looks like a log) is silent.
+klug_spill_wraptest();
+#endif
+
 #ifdef ATOM_MATH_SELFTEST
 # H6 (gpu.md, modeset arc) — the ATOM DIV32/MUL32 unit sweep against the atom-interp.py oracle.
 #
@@ -1196,6 +1219,17 @@ atom_instr_selftest();
 # HDA_HDMI so a burn can isolate it; recovery is flashing a kernel without HDMI_ATOM.
 atom_hdmi_transmitter_bringup();
 #ifdef ATOM_HALT
+# ⛔⛔ MD-6 (RATIFIED 2026-07-23, and now IN FORCE because H1 landed): ATOM_HALT is RETIRED as anything but
+# a PHOTO TOOL. It is a deliberate UNRECOVERABLE hang — IF=0, bare `while` — so it produces no keyboard, no
+# shell, no capture, and no log: risk R9, "a burn produces no evidence at all".
+#
+# ⛔ NEVER PAIR IT WITH A BITE WHOSE ORACLE IS A LOG. That combination cannot produce the thing it is meant
+# to prove. With `klug_spill()` in place (H1) the log now survives a blanked console by being written to
+# agnos-fs, so nearly every historical reason to reach for this flag has evaporated — spill instead.
+#
+# The one legitimate remaining use is freezing the framebuffer so the operator can PHOTOGRAPH it. If that is
+# not literally what you need, you want klug_spill().
+#
 # ISOLATION DIAGNOSTIC: freeze here, BEFORE gpu_hdmi_audio_enable()'s DIG_MODE flip, so the framebuffer holds
 # the ATOM path's step markers for a photo. Pairs with ATOM_DRY (interpreter touches no PHY). If the FB shows
 # the clean 'atom: ... acquired OK / bringup OK' summary, the ATOM path is display-safe and the black screen is

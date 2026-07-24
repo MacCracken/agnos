@@ -79,3 +79,94 @@ fn klug_dump() {
     serial_print(endm, 15); fb_print(endm, 15);
     return 0;
 }
+
+# === H1 (gpu.md, modeset arc) — klug_spill: persist the log ring to agnos-fs ============================
+#
+# THE PROBLEM IT SOLVES: a bite whose failure blanks the console loses its diagnostic with it. The D lane
+# burned five iron flashes for one result and **two of them produced no evidence at all** — the console died
+# and the log died with it. Every risk row in the plan (R1, R2, R6) claims "log survives — spilled per
+# group"; that claim is only true once this exists.
+#
+# ⚠ NON-JOURNALED ON PURPOSE. Uses ext2_write_at (ext2.cyr:3300), NOT ext2_write_at_journaled (:5259).
+# A spill runs when things have already gone wrong; it must not be able to hang in journal replay with a
+# dead console. A torn spill that yields most of the log beats a clean one that never returns.
+#
+# ⚠ BLOCKS ARE PRE-ALLOCATED AT MOUNT TIME, which is the whole point of the prepare/spill split. Creating
+# the dirent is not enough: writing 64 KB into a 0-byte file allocates ~16 blocks, and the allocator is the
+# last thing you want running after the console is gone. klug_spill_prepare() writes the full ring size once
+# at mount, so every later spill is a pure OVERWRITE-IN-PLACE. That also sidesteps the extent-append limit
+# ext2_write_at documents (overwrite works at any depth; append is depth-0 only).
+#
+# ⚠ vfs_create_on / vfs_write_on are NOT usable here — they dispatch FAT/exFAT only and return -1 for ext2
+# (vfs.cyr:502-514). agnos-fs is ext2, so this goes straight at the ext2 layer.
+
+var klug_spill_ino = 0;        # inode of the pre-allocated spill file (0 = not prepared)
+
+# Pre-create AND pre-allocate the spill file. Call once, right after vfs_mount_init().
+# Returns 1 if a later spill can run without touching the allocator, 0 otherwise.
+fn klug_spill_prepare() {
+    if (ext2_active == 0)   { return 0; }
+    if (ext2_write_ok == 0) { return 0; }        # read-only mount — nothing to do, and not an error
+    var ino = ext2_path_lookup("/klug.txt", 9);
+    if (ino <= 0) { ino = ext2_create(2, "klug.txt", 8); }   # 2 = ext2 root
+    if (ino <= 0) { kprintln("klug: spill file unavailable", 28); return 0; }
+    # Allocate every block now, while the console is alive and a failure is readable. The content written
+    # here is the ring as it stands at mount (mostly zeros this early) and is fully overwritten by a spill.
+    if (ext2_write_at(ino, 0, &klug_buf, 65536) <= 0) {
+        kprintln("klug: spill preallocation failed", 32);
+        return 0;
+    }
+    klug_spill_ino = ino;
+    kprintln("klug: spill file ready at /klug.txt", 35);
+    return 1;
+}
+
+# Write the ring to the pre-allocated file, oldest byte first. Returns bytes written, 0 if unavailable.
+#
+# The ring is circular: once klug_count saturates at 65536 the oldest byte is at klug_head, not at 0, so a
+# wrapped ring is spilled as TWO runs — [klug_head, 65536) then [0, klug_head) — which puts the file in
+# chronological order. klug_dump() only ever handled the linear case; a spill taken after a long boot is
+# exactly when the ring HAS wrapped, so getting this wrong would silently rotate the log.
+fn klug_spill() {
+    if (klug_spill_ino == 0) { return 0; }
+    var n = 0;
+    if (klug_count >= 65536) {
+        var tail = 65536 - klug_head;                                  # oldest run: head -> end
+        if (ext2_write_at(klug_spill_ino, 0, &klug_buf + klug_head, tail) <= 0) { return 0; }
+        n = tail;
+        if (klug_head > 0) {
+            if (ext2_write_at(klug_spill_ino, tail, &klug_buf, klug_head) > 0) { n = n + klug_head; }
+        }
+    }
+    if (klug_count < 65536) {
+        if (ext2_write_at(klug_spill_ino, 0, &klug_buf, klug_head) <= 0) { return 0; }
+        n = klug_head;
+    }
+    return n;
+}
+
+#ifdef KLUG_SPILL_WRAPTEST
+# H1 wrap exercise — the two-run chronological path, which a normal boot NEVER reaches.
+#
+# ⚠ WHY THIS IS NOT OPTIONAL. A QEMU boot log is ~2.5 KB and an iron boot ~16-20 KB, both far under the
+# 64 KB ring, so klug_spill()'s wrapped branch would otherwise ship having never executed — and its failure
+# mode is SILENT: the log still appears, just ROTATED, with the oldest lines in the middle. That is worse
+# than no log, because it looks fine. (Same class as the ATOM rc codes that read 0 and made a test pass.)
+#
+# Forces a wrap, then plants two ordered markers. A correct spill puts AAA before BBB in the file; a naive
+# spill from offset 0 puts them in ring order, which after a wrap is BBB first.
+fn klug_spill_wraptest() {
+    var pad = "................................................................\n";  # 65 bytes
+    var i = 0;
+    while (i < 1100) { klug_append(pad, 65); i = i + 1; }      # 71,500 bytes -> ring is definitely wrapped
+    klug_append("KLUG-WRAP-AAA\n", 14);
+    i = 0;
+    while (i < 16) { klug_append(pad, 65); i = i + 1; }        # 1,040 bytes between the markers
+    klug_append("KLUG-WRAP-BBB\n", 14);
+    var n = klug_spill();
+    kprint("klug: wraptest count=", 21); kprint_num(klug_count);
+    kprint(" head=", 6); kprint_num(klug_head);
+    kprint(" spilled=", 9); kprint_num(n); kprintln("", 0);
+    return n;
+}
+#endif

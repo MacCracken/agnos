@@ -422,6 +422,16 @@ else
         # PHY. Safe anywhere, needs no iron; QEMU is the intended venue. Requires HDMI_ATOM because the
         # helpers live inside that gate. Vectors regenerate with
         # `python3 agnosticos/scripts/atom-math-vectors.py`.
+        # KLUG_SPILL_SELFTEST=1 — H1 (modeset arc): late in boot, write the klug ring to /klug.txt on
+        # agnos-fs and print the byte count, so a smoke can mount the image from the host and byte-compare
+        # the spill against the serial capture. The prepare half runs unconditionally at mount; this flag
+        # only adds the test spill.
+        [ -n "$KLUG_SPILL_SELFTEST" ] && echo '#define KLUG_SPILL_SELFTEST'
+        # KLUG_SPILL_WRAPTEST=1 — H1 wrap exercise: force the ring past 64 KB, plant two ordered markers,
+        # re-spill. Proves klug_spill()'s WRAPPED branch reorders to chronological. A normal boot never
+        # wraps (QEMU ~2.5 KB, iron ~16-20 KB, ring 64 KB), so this branch is otherwise untested and its
+        # failure mode is a silently ROTATED log. Implies KLUG_SPILL_SELFTEST.
+        [ -n "$KLUG_SPILL_WRAPTEST" ] && echo '#define KLUG_SPILL_WRAPTEST'
         [ -n "$ATOM_MATH_SELFTEST" ] && echo '#define ATOM_MATH_SELFTEST'
         # ATOM_INSTR_SELFTEST=1 — H4 (modeset arc): prove every abnormal interpreter exit is DISTINCT and
         # NON-ZERO, by executing four synthetic in-RAM command tables (clean EOT / reserved opcode /
