@@ -188,6 +188,95 @@ var gpu_last_wait_us = 0;    # wall time the most recent gpu_wait_done actually 
 #
 # Records the elapsed wall time in gpu_last_wait_us so the caller can print a real number rather than a
 # comment. The final re-check after the bound closes the race where the marker lands in the last few cycles.
+# ============================================================================================
+# RUNG 4 (3D arc) — THE BRACKET. agnos has had NO GPU hang forensics of any kind until now.
+# ============================================================================================
+# ⛔ THE PROBLEM THIS SOLVES. Today a wedged GPU is a dead box with no log — and that is already
+# true for #82, #83 and #92, which SHIP. A 100 ms timeout returns 0 and the caller guesses.
+# There is no way to ask "which packet?" because nothing records where the CP got to.
+#
+# THE BRACKET is two numbers that together pin the hang:
+#     breadcrumb  <=  hung_packet  <=  rptr
+#   * breadcrumb — the last seq the CP *executed* a WRITE_DATA for. ⭐ THE CP WRITES IT, so it
+#     is an ANSWER, not an echo of a CPU store ([[feedback_echo_vs_answer_registers]]).
+#   * rptr       — how far the CP's *fetcher* got. An upper bound: fetch runs ahead of execute.
+# Everything strictly between them is the candidate set, and it is usually one packet.
+var gpu_breadcrumb_seq = 0;
+
+# Emit a breadcrumb packet into the ring. WRITE_DATA DST_SEL=5 (memory) | WR_CONFIRM — the same
+# packet shape as the done fence, which is already iron-proven, so this adds no new packet class.
+fn gpu_ring_breadcrumb(seq) {
+    var mc = gpu_arena_mc + GPU_BREADCRUMB_SUBOFF;
+    gpu_ring_put(GPU_PM4_WRITE_DATA_HDR);
+    gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
+    gpu_ring_put(mc & 0xFFFFFFFF);
+    gpu_ring_put((mc >> 32) & 0xFFFFFFFF);
+    gpu_ring_put(GPU_BREADCRUMB_BASE | (seq & 0xFFFF));
+    return 0;
+}
+
+# The forensic block. Captured on EVERY gpu_wait_done timeout, then spilled — because the
+# console is exactly what a GPU hang is most likely to take with it, so the log must reach the
+# disk before anything else is attempted ([[feedback_klug_text_burn_capture]]).
+# ⚠ Every value here is READ FROM HARDWARE. None is a readback of something agnos just wrote.
+fn gpu_forensic_dump(done_phys, expect) {
+    kprintln("gpu: ---- FORENSIC BLOCK (wait timed out) ----", 46);
+    # ⛔ THE HQD REGISTERS ARE BEHIND A MUX. CP_HQD_* is per-queue and only readable while
+    # GRBM_GFX_CNTL selects that queue — read them unselected and you get another queue's state,
+    # which is worse than no forensics because it looks like data. Matches the select/deselect
+    # idiom already used at gpu.cyr:1064/1092.
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    var rptr   = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR) & 0xFFFFFFFF;
+    var wptr   = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO) & 0xFFFFFFFF;
+    var active = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_ACTIVE) & 0xFFFFFFFF;
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+    var st1 = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS) & 0xFFFFFFFF;
+    var st2 = gpu_reg32(GPU_BASE_GC_0, GPU_R_GRBM_STATUS2) & 0xFFFFFFFF;
+    var cps = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_STAT) & 0xFFFFFFFF;
+    var crumb = load32(gpu_arena_phys + GPU_BREADCRUMB_SUBOFF) & 0xFFFFFFFF;
+    var seen  = load32(done_phys) & 0xFFFFFFFF;
+
+    kprint("gpu: rptr ", 10); kprint_num(rptr);
+    kprint(" wptr ", 6); kprint_num(wptr);
+    kprint(" hqd_active ", 12); kprint_num(active & 1); kprintln("", 0);
+    kprint("gpu: grbm_status ", 17); kprint_hex(st1);
+    kprint(" grbm_status2 ", 14); kprint_hex(st2);
+    kprint(" cp_stat ", 9); kprint_hex(cps); kprintln("", 0);
+    kprint("gpu: fence expected ", 20); kprint_hex(expect);
+    kprint(" saw ", 5); kprint_hex(seen); kprintln("", 0);
+
+    # ⛔ THE BRACKET ITSELF. A breadcrumb that never advanced past its base means the CP never
+    # executed a single packet — a different failure from one that stopped midway, and the
+    # distinction decides whether to suspect submission or a specific packet.
+    if ((crumb & 0xFFFF0000) != GPU_BREADCRUMB_BASE) {
+        kprintln("gpu: breadcrumb NEVER WRITTEN -- the CP executed no packet at all", 65);
+    }
+    if ((crumb & 0xFFFF0000) == GPU_BREADCRUMB_BASE) {
+        kprint("gpu: breadcrumb seq ", 20); kprint_num(crumb & 0xFFFF);
+        kprint(" of ", 4); kprint_num(gpu_breadcrumb_seq);
+        kprintln("  -- the hang is AFTER this packet block", 40);
+    }
+
+    # The 16 ring dwords at rptr — the packets the CP was fetching when it stopped. Decoded
+    # host-side by name (gpu-test/pm4lint.cyr knows the framing).
+    kprintln("gpu: ring dwords at rptr:", 25);
+    var i = 0;
+    while (i < 16) {
+        var idx = ((rptr / 4) + i) & GPU_RING_DW_MASK;
+        kprint("gpu:   [", 8); kprint_num(i);
+        # ⚠ The PQ ring base IS gpu_arena_phys + 0 — see gpu_ring_put, which stores at exactly
+        # that address. Reading it anywhere else would print 16 dwords of an unrelated slot and
+        # look like a decoded packet stream, which is worse than printing nothing.
+        kprint("] ", 2); kprint_hex(load32(gpu_arena_phys + idx * 4) & 0xFFFFFFFF);
+        kprintln("", 0);
+        i = i + 1;
+    }
+    kprintln("gpu: ---- END FORENSIC BLOCK ----", 33);
+    # ⚠ SPILL NOW. The console may not survive what comes next.
+    klug_spill();
+    return 0;
+}
+
 fn gpu_wait_done(done_phys, expect, timeout_us) {
     var t0 = rdtsc();
     var limit = timeout_us * GPU_TSC_PER_US;
@@ -201,6 +290,14 @@ fn gpu_wait_done(done_phys, expect, timeout_us) {
     }
     gpu_last_wait_us = el / GPU_TSC_PER_US;
     if ((load32(done_phys) & 0xFFFFFFFF) == expect) { return 1; }
+    # ⛔ RUNG 4: A TIMEOUT NOW CAPTURES INSTEAD OF GUESSING.
+    # Every caller of this function has, until now, learned exactly one bit — "it did not
+    # finish" — and every GPU hang in agnos's history was diagnosed by re-running with more
+    # kprints. The forensic block is unconditional here on purpose: a timeout is rare, the
+    # capture is cheap, and the one time it matters the console may already be gone.
+    # ⚠ Under GPU_FORENSIC the block also spills to /klug.txt. Without the flag it still prints,
+    # so a production kernel that wedges is not silent either.
+    gpu_forensic_dump(done_phys, expect);
     return 0;
 }
 

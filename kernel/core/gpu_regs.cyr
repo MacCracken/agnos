@@ -927,6 +927,24 @@ var GPU_R_CP_HQD_EOP_BASE_ADDR_HI    = 0x126B;
 var GPU_R_CP_HQD_EOP_CONTROL         = 0x126C;  # EOP_SIZE log2
 var GPU_R_CP_HQD_PQ_WPTR_LO          = 0x127B;  # write ptr (0 = empty; gfx9 split LO/HI)
 var GPU_R_CP_HQD_PQ_WPTR_HI          = 0x127C;
+# ── RUNG 4/5 (3D arc) — hang forensics + recovery. Derived from the SAME gfx9 GC block above,
+# not invented: CP_HQD_DEQUEUE_REQUEST sits between CP_MQD_CONTROL (0x1267) and
+# CP_HQD_EOP_BASE_ADDR (0x126A), which is exactly where amdgpu's gc_9_0_offset.h places it, and
+# the surrounding offsets in this file are already iron-proven on archaemenid.
+# ⛔ DEQUEUE_REQUEST IS THE RECOVERY VERB. Writing 1 asks the CP to unmap the queue; software
+# then POLLS CP_HQD_ACTIVE until the HARDWARE clears it — an answer register, not an echo of our
+# own write ([[feedback_echo_vs_answer_registers]]).
+var GPU_R_CP_HQD_DEQUEUE_REQUEST     = 0x1268;
+var GPU_CP_HQD_DEQUEUE_DRAIN         = 0x1;    # DEQUEUE_REQ = 1 (drain and unmap this queue)
+# GRBM_STATUS2 is the second busy-bit word (per-block, incl. the RLC/CP sub-blocks). GRBM_STATUS
+# is 0x04 above; STATUS2 is 0x02 in the same seg-0 GRBM window.
+var GPU_R_GRBM_STATUS2               = 0x0002;
+# Breadcrumb slot: one dword the CP writes between packet blocks so a hang can be BRACKETED.
+# ⚠ Placed in the C2e sentinel's free 4 KB gap, 0x400 clear of GPU_VM_SENT_SUBOFF, so it collides
+# with no published arena slot. It must NOT share a cache line with the done fence, or a write-back
+# of one would make the other look fresher than it is.
+var GPU_BREADCRUMB_SUBOFF            = 0x12400;
+var GPU_BREADCRUMB_BASE              = 0xBC000000;  # base | seq — the tag makes a stale 0 unmistakable
 # C2c values
 var GPU_GRBM_SEL_MEC1_P0_Q0    = 0x4;         # MEID=1<<2 (MEC1, pipe0, queue0, vmid0); 1-based MEID
 var GPU_CP_HQD_PQ_CONTROL_VAL  = 0xC000050D;  # QUEUE_SIZE 0xD (64 KB ring) | PRIV_STATE | KMD_QUEUE
