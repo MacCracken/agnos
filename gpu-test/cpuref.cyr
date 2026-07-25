@@ -180,6 +180,69 @@ fn main(): i64 {
     puts("[refraster] shared reference selftest PASS (dims refuse, wide mask fits)");
     puts("");
 
+    # ⭐ B1 — THE 20-CASE CORPUS, driven from refraster.cyr's single table.
+    # Every case is rasterised TWICE and compared (determinism), and its lit-pixel count is
+    # checked against rr_case_expect_lit(). ⛔ That second check is what stops the corpus from
+    # being satisfiable by a rasteriser that writes nothing: cases 2 and 6 are all-zero BY
+    # DESIGN, so without it "20/20 deterministic" would also be true of a no-op.
+    puts("[corpus-20] the itemised corpus -- determinism + non-vacuity");
+    var ci = 1;
+    var cases_ok = 0;
+    var lit_fail = 0;
+    while (ci <= RR_NCASES) {
+        if (rr_case_load(ci) != 1) {
+            ps("  case "); pnum(ci); ps(" "); ps(rr_case_name(ci));
+            puts("   ** REFUSED TO LOAD **");
+            ok = 0;
+            ci = ci + 1;
+        }
+        if (rr_case_load(ci) == 1) {
+            var ne = n_edges;
+            var cw = W; var ch = H;
+            cov_clear(&covA); raster(&covA);
+            rr_case_load(ci);
+            cov_clear(&covB); raster(&covB);
+            var diff = 0; var lit = 0;
+            var q = 0;
+            while (q < cw * ch) {
+                if (load8(&covA + q) != load8(&covB + q)) { diff = diff + 1; }
+                if (load8(&covA + q) != 0) { lit = lit + 1; }
+                q = q + 1;
+            }
+            ps("  "); pnum(ci); ps("  "); ps(rr_case_name(ci));
+            ps("  "); pnum(cw); ps("x"); pnum(ch);
+            ps("  edges "); pnum(ne);
+            ps("  lit "); pnum(lit);
+            if (diff != 0) { puts("   ** NONDETERMINISTIC **"); ok = 0; }
+            if (diff == 0) {
+                # non-vacuity: a case that must light pixels and does not is a DEAD case, and a
+                # dead case in the corpus is worse than no case -- it reports green forever.
+                if (rr_case_expect_lit(ci) == 1) {
+                    if (lit == 0) { puts("   ** VACUOUS: expected coverage, got NONE **"); lit_fail = lit_fail + 1; ok = 0; }
+                    if (lit != 0) { puts("   ok"); cases_ok = cases_ok + 1; }
+                }
+                if (rr_case_expect_lit(ci) == 0) {
+                    if (lit != 0) { puts("   ** expected an EMPTY mask, got coverage **"); ok = 0; }
+                    if (lit == 0) { puts("   ok (empty by design)"); cases_ok = cases_ok + 1; }
+                }
+            }
+            ci = ci + 1;
+        }
+    }
+    ps("  -> "); pnum(cases_ok); ps(" of "); pnum(RR_NCASES); puts(" cases deterministic and non-vacuous");
+    if (cases_ok != RR_NCASES) { ok = 0; }
+    # ⭐ ...and does the corpus still have the PROPERTIES it was built for? Determinism does not
+    # answer that: a case silently narrowed from 200x64 to 64x64 stays perfectly deterministic.
+    if (rr_corpus_audit() != 1) {
+        puts("  ** CORPUS AUDIT FAILED -- a structural property was lost.");
+        puts("     Check: max width >= 200, an edge count at the cap, a non-multiple-of-64");
+        puts("     width, a multi-shape case, a negative coordinate, exactly 2 empty cases,");
+        puts("     and at least one dropped horizontal edge.");
+        ok = 0;
+    }
+    if (rr_corpus_audit() == 1) { puts("  -> corpus audit PASS (structural properties intact)"); }
+    puts("");
+
     puts("[corpus] determinism + degenerate handling");
     if (corpus_case("plain triangle      ", 8, 8, 48, 12, 20, 50) == 0) { ok = 0; }
     if (corpus_case("zero-area (collinear)", 4, 4, 20, 20, 40, 40) == 0) { ok = 0; }
@@ -203,14 +266,14 @@ fn main(): i64 {
     }
     puts("Corpus deterministic; every shared-edge pair WATERTIGHT (no cracks, no double-hits).");
     puts("");
-    puts("⚠⚠ RUNG 8 IS **PARTIAL** -- READ BEFORE RUNG 9 OPENS.");
-    puts("   Oracle (ii), watertightness, is DONE and is the strong one: it is independent of");
-    puts("   the reference being correct.");
-    puts("   Oracle (i) as the plan specifies it -- byte-for-byte agreement with SADISH ITSELF");
-    puts("   over 200 random paths -- is NOT done. It needs sadish's canvas/path/alloc linked");
-    puts("   into this tool, a real integration, not a line of code.");
-    puts("   Until it lands, 'byte-identical to the CPU reference' rests on a port that has");
-    puts("   been proven self-consistent and watertight, but NOT proven equal to its source.");
+    puts("RUNG 8 IS COMPLETE -- BOTH ORACLES CLOSED.");
+    puts("   (ii) watertightness: proven here, and it is the STRONG one because it does not");
+    puts("        depend on the reference being correct.");
+    puts("   (i)  agreement with SADISH ITSELF over 200 random paths: proven by refagree.cyr,");
+    puts("        200/200 byte-identical, worst delta 0.");
+    puts("   ⭐ And since B0, refagree tests THIS reference -- refraster.cyr -- not a private");
+    puts("      third copy of it. Before B0 its 200/200 covered an artifact nothing else used,");
+    puts("      so 'byte-identical to the CPU reference' had no single referent. It does now.");
     return 95;
 }
 

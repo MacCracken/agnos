@@ -44,6 +44,63 @@ byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random m
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
 
+### Added — bite **B1**: the 20-case corpus, itemised — because it did not exist
+
+`gpu.md` cites "the 20-case corpus" twice and **both are specification, never a manifest**. The
+tree had 8 `corpus_case` + 3 `shared_edge_pair` calls = 11, and rung 8's own closure text says
+"Corpus: 8 cases". A rung reporting a pass against a corpus nobody wrote has quietly redefined
+its own oracle, so all 20 are now enumerated in `refraster.cyr` **with the reason each earns a
+slot**, and the number can never be inherited un-itemised again.
+
+- ⭐ **One source of truth for both sides.** `rr_case_load(i)` fills the same `ex0/ey0/ex1/ey1`
+  arrays `raster()` reads, so the ring-3 tool will build its `#92` edge array from exactly the
+  geometry the reference rasterised. Two hand-kept lists — one for the CPU, one for the GPU — is
+  how a "mismatch" turns out to be two different triangles.
+- **Case 10 (two overlapping triangles in ONE edge array) is mandatory**: merging a pixel's
+  coverage fragments instead of summing them changes the output, and a **single** shape can never
+  expose it — every one-triangle case passes either way.
+- **Cases 2 and 6 rasterise to all-zero by design**, so a shader that writes nothing reproduces
+  them perfectly. `rr_case_expect_lit()` exists so "20/20 identical" can never be satisfied by
+  writing nothing — which is precisely the outcome `gputri` classifies as UNTOUCHED.
+- Case 20 is a regular 64-gon with **exact precomputed 16.16 vertices** — no runtime trig, because
+  a corpus case whose geometry depends on a math library is not bit-reproducible, and this file
+  *is* the oracle. Verified at generation that all 64 edges survive the horizontal-edge drop, so
+  the case genuinely exercises the edge loop at the shipped cap.
+- Result: **20/20 deterministic and non-vacuous.**
+
+### Fixed — the corpus guard rejected five *correct* cases, and the reason matters for the shader
+
+Five cases (4, 7, 8, 11, 18) reported "REFUSED TO LOAD" against an `n_edges < 3` guard. The cause
+is not a typo: **`edge_add` drops horizontal edges**, because `y0 == y1` can never satisfy both
+`sy >= ylo` and `sy < yhi`. A flat-topped triangle therefore SUBMITS 3 edges and RETAINS 2.
+
+⭐ **The consequence for rung 9b is load-bearing and is now recorded in the code:** `#92`'s
+`ne >= 3` counts **submitted** edges, and the shader receives all of them *including the
+horizontal ones*. It must produce no crossing for a horizontal edge rather than assuming the
+caller pre-filtered — the reference filters internally, so an unfiltered GPU would disagree on
+**five of the twenty cases**. `rr_case_edges_submitted()` records the distinction.
+
+### Added — `rr_corpus_audit()`: the corpus checks its own PURPOSE, not just its geometry
+
+⚠ **Written because a mutation slipped through.** Narrowing case 19 from 200×64 to 64×64 left the
+corpus reporting a clean "20 of 20 deterministic and non-vacuous" while its name still read
+"WIDE mask 200×64" — the case had silently stopped exercising `tgid_x` wrap *and* the mask width
+that B0's `accrow` fix exists to protect. Determinism cannot notice this: a neutered case is
+perfectly deterministic. A corpus that cannot detect one of its own cases being hollowed out is a
+list of shapes, not a test.
+
+The audit asserts the structural properties each rung's oracle depends on: max width ≥ 200, an
+edge count at the cap, a partial final workgroup, a mask **narrower than one workgroup**, a
+negative coordinate, exactly two empty cases, and at least one dropped horizontal edge.
+
+**Calibrated against five mutations, and the first pass exposed a weak proxy.** `n_edges > 3` was
+standing in for "more than one closed shape" — but a quad has 4 edges and satisfies it, so
+deleting case 10's second triangle left the audit green. The mandatory case is now required **by
+name**. Two other mutations (case 16's width, case 5's negative coords) correctly did *not* fire,
+because the property genuinely survives via another case — 200 % 64 = 8, and case 8 carries
+`fx(-10)`; those were tightened where the property was truly distinct (narrow-mask) and left
+alone where it was not. Final: **5/5 mutations caught, healthy 95.**
+
 ### Added — `gpu-test/refraster.cyr` (bite B0): THE reference, singular
 
 - **"Byte-identical to the CPU reference" had THREE referents.** The rasteriser was hand-copied

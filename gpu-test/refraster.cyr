@@ -257,3 +257,338 @@ fn rr_selftest(): i64 {
     if (rr_set_dims(64, 64) != 1)          { ok = 0; }      # back to the shipped default
     return ok;
 }
+
+# ============================================================================================
+# THE 20-CASE CORPUS — bite B1 of rung 9b
+# ============================================================================================
+# ⛔ THIS DID NOT EXIST. `gpu.md` cites "the 20-case corpus" twice (:808, :816) and BOTH are
+# specification, never a manifest. The tree had 8 `corpus_case` calls + 3 `shared_edge_pair`
+# calls = 11, and rung 8's own closure text honestly says "Corpus: 8 cases". A rung that
+# reports a pass against a corpus nobody wrote has quietly redefined its own oracle, so the 20
+# are ENUMERATED here, each with the reason it earns a slot, and the number is never inherited
+# un-itemised again.
+#
+# ⭐ ONE SOURCE OF TRUTH FOR BOTH SIDES. `rr_case_load(i)` fills the SAME `ex0/ey0/ex1/ey1`
+# arrays that `raster()` reads, so the ring-3 tool builds its `#92` edge array from exactly the
+# geometry the reference rasterised. Two hand-kept lists — one for the CPU, one for the GPU —
+# is how a "mismatch" turns out to be two different triangles.
+#
+# ⚠ Cases 2 and 6 rasterise to ALL ZERO by design. A shader that writes nothing "passes" them.
+# They must never be counted as evidence on their own — see rr_case_expect_lit().
+#
+# | #  | case                        | why it earns a slot                                    |
+# |----|-----------------------------|--------------------------------------------------------|
+# |  1 | plain triangle              | baseline                                                |
+# |  2 | zero-area / collinear       | all-zero answer (vacuous-pass hazard)                   |
+# |  3 | backfacing CW               | `wind != 0` fills BOTH windings; a naive `wind > 0`      |
+# |    |                             | passes every other case and fails only here             |
+# |  4 | 1-px sliver                 | contains a horizontal edge                              |
+# |  5 | clipped off-screen (neg)    | ⛔ THE SIGN-EXTENSION TRAP — `load32` zero-extends       |
+# |  6 | fully outside               | all-zero answer (vacuous-pass hazard)                   |
+# |  7 | pixel-centre straddling     | horizontal edge + exact half-pixel boundaries           |
+# |  8 | full-canvas cover           | horizontal edge + coords beyond the mask (clamp path)   |
+# |  9 | bowtie (self-intersecting)  | fragment-partition discriminator                        |
+# | 10 | TWO overlapping triangles   | ⛔ MANDATORY. Merging a pixel's fragments instead of      |
+# |    | in ONE edge array (6 edges) | summing them changes output, and a SINGLE triangle can  |
+# |    |                             | never expose it — every 1-tri case passes either way    |
+# | 11 | shared-edge quad, axis-alig | watertightness geometry (also split by oracle (ii))     |
+# | 12 | shared-edge quad, skewed    | watertightness geometry                                 |
+# | 13 | shared-edge quad, near-full | watertightness geometry                                 |
+# | 14 | OPEN (non-closed) 3-edge    | `gpo_validate_edge` requires ne >= 3, never CLOSURE, so  |
+# |    | path                        | an open path is ABI-legal and must not hang the walk    |
+# | 15 | x-asymmetric triangle       | ⚠ gputri's built-in triangle is symmetric about the     |
+# |    |                             | mask's x centre, so an x-MIRRORED tgid map shifts it by |
+# |    |                             | one pixel instead of looking obviously wrong            |
+# | 16 | width NOT a multiple of 64  | the EXEC bounds guard (37x29)                           |
+# | 17 | tile-boundary, edge on x=64 | block-boundary ownership                                |
+# | 18 | tile-boundary, corner       | block-boundary ownership                                |
+# | 19 | WIDE mask 200x64            | ⭐ tgid_x wraps 3x+ — AND this is the exact case that     |
+# |    |                             | would have fired B0's `accrow[64]` overflow             |
+# | 20 | regular 64-gon              | the edge loop at the shipped cap (all 64 survive the    |
+# |    |                             | horizontal-edge drop; verified at generation)           |
+
+var RR_NCASES = 20;
+
+# Vertices of the regular 64-gon (case 20): centre (64,64), radius 56, in a 128x128 mask.
+# ⛔ EXACT 16.16 INTEGERS, precomputed. No runtime trig — a corpus case whose geometry depends
+# on a math library is not bit-reproducible across toolchains, and this file IS the oracle.
+var rr_gon[128];
+var rr_gon_ready = 0;
+fn rr_gon_init(): i64 {
+    if (rr_gon_ready == 1) { return 0; }
+    store64(&rr_gon +   0 * 16,    7864320); store64(&rr_gon +   0 * 16 + 8,    4194304);
+    store64(&rr_gon +   1 * 16,    7846648); store64(&rr_gon +   1 * 16 + 8,    4554028);
+    store64(&rr_gon +   2 * 16,    7793802); store64(&rr_gon +   2 * 16 + 8,    4910289);
+    store64(&rr_gon +   3 * 16,    7706290); store64(&rr_gon +   3 * 16 + 8,    5259653);
+    store64(&rr_gon +   4 * 16,    7584957); store64(&rr_gon +   4 * 16 + 8,    5598758);
+    store64(&rr_gon +   5 * 16,    7430969); store64(&rr_gon +   5 * 16 + 8,    5924338);
+    store64(&rr_gon +   6 * 16,    7245811); store64(&rr_gon +   6 * 16 + 8,    6233256);
+    store64(&rr_gon +   7 * 16,    7031265); store64(&rr_gon +   7 * 16 + 8,    6522538);
+    store64(&rr_gon +   8 * 16,    6789397); store64(&rr_gon +   8 * 16 + 8,    6789397);
+    store64(&rr_gon +   9 * 16,    6522538); store64(&rr_gon +   9 * 16 + 8,    7031265);
+    store64(&rr_gon +  10 * 16,    6233256); store64(&rr_gon +  10 * 16 + 8,    7245811);
+    store64(&rr_gon +  11 * 16,    5924338); store64(&rr_gon +  11 * 16 + 8,    7430969);
+    store64(&rr_gon +  12 * 16,    5598758); store64(&rr_gon +  12 * 16 + 8,    7584957);
+    store64(&rr_gon +  13 * 16,    5259653); store64(&rr_gon +  13 * 16 + 8,    7706290);
+    store64(&rr_gon +  14 * 16,    4910289); store64(&rr_gon +  14 * 16 + 8,    7793802);
+    store64(&rr_gon +  15 * 16,    4554028); store64(&rr_gon +  15 * 16 + 8,    7846648);
+    store64(&rr_gon +  16 * 16,    4194304); store64(&rr_gon +  16 * 16 + 8,    7864320);
+    store64(&rr_gon +  17 * 16,    3834580); store64(&rr_gon +  17 * 16 + 8,    7846648);
+    store64(&rr_gon +  18 * 16,    3478319); store64(&rr_gon +  18 * 16 + 8,    7793802);
+    store64(&rr_gon +  19 * 16,    3128955); store64(&rr_gon +  19 * 16 + 8,    7706290);
+    store64(&rr_gon +  20 * 16,    2789850); store64(&rr_gon +  20 * 16 + 8,    7584957);
+    store64(&rr_gon +  21 * 16,    2464270); store64(&rr_gon +  21 * 16 + 8,    7430969);
+    store64(&rr_gon +  22 * 16,    2155352); store64(&rr_gon +  22 * 16 + 8,    7245811);
+    store64(&rr_gon +  23 * 16,    1866070); store64(&rr_gon +  23 * 16 + 8,    7031265);
+    store64(&rr_gon +  24 * 16,    1599211); store64(&rr_gon +  24 * 16 + 8,    6789397);
+    store64(&rr_gon +  25 * 16,    1357343); store64(&rr_gon +  25 * 16 + 8,    6522538);
+    store64(&rr_gon +  26 * 16,    1142797); store64(&rr_gon +  26 * 16 + 8,    6233256);
+    store64(&rr_gon +  27 * 16,     957639); store64(&rr_gon +  27 * 16 + 8,    5924338);
+    store64(&rr_gon +  28 * 16,     803651); store64(&rr_gon +  28 * 16 + 8,    5598758);
+    store64(&rr_gon +  29 * 16,     682318); store64(&rr_gon +  29 * 16 + 8,    5259653);
+    store64(&rr_gon +  30 * 16,     594806); store64(&rr_gon +  30 * 16 + 8,    4910289);
+    store64(&rr_gon +  31 * 16,     541960); store64(&rr_gon +  31 * 16 + 8,    4554028);
+    store64(&rr_gon +  32 * 16,     524288); store64(&rr_gon +  32 * 16 + 8,    4194304);
+    store64(&rr_gon +  33 * 16,     541960); store64(&rr_gon +  33 * 16 + 8,    3834580);
+    store64(&rr_gon +  34 * 16,     594806); store64(&rr_gon +  34 * 16 + 8,    3478319);
+    store64(&rr_gon +  35 * 16,     682318); store64(&rr_gon +  35 * 16 + 8,    3128955);
+    store64(&rr_gon +  36 * 16,     803651); store64(&rr_gon +  36 * 16 + 8,    2789850);
+    store64(&rr_gon +  37 * 16,     957639); store64(&rr_gon +  37 * 16 + 8,    2464270);
+    store64(&rr_gon +  38 * 16,    1142797); store64(&rr_gon +  38 * 16 + 8,    2155352);
+    store64(&rr_gon +  39 * 16,    1357343); store64(&rr_gon +  39 * 16 + 8,    1866070);
+    store64(&rr_gon +  40 * 16,    1599211); store64(&rr_gon +  40 * 16 + 8,    1599211);
+    store64(&rr_gon +  41 * 16,    1866070); store64(&rr_gon +  41 * 16 + 8,    1357343);
+    store64(&rr_gon +  42 * 16,    2155352); store64(&rr_gon +  42 * 16 + 8,    1142797);
+    store64(&rr_gon +  43 * 16,    2464270); store64(&rr_gon +  43 * 16 + 8,     957639);
+    store64(&rr_gon +  44 * 16,    2789850); store64(&rr_gon +  44 * 16 + 8,     803651);
+    store64(&rr_gon +  45 * 16,    3128955); store64(&rr_gon +  45 * 16 + 8,     682318);
+    store64(&rr_gon +  46 * 16,    3478319); store64(&rr_gon +  46 * 16 + 8,     594806);
+    store64(&rr_gon +  47 * 16,    3834580); store64(&rr_gon +  47 * 16 + 8,     541960);
+    store64(&rr_gon +  48 * 16,    4194304); store64(&rr_gon +  48 * 16 + 8,     524288);
+    store64(&rr_gon +  49 * 16,    4554028); store64(&rr_gon +  49 * 16 + 8,     541960);
+    store64(&rr_gon +  50 * 16,    4910289); store64(&rr_gon +  50 * 16 + 8,     594806);
+    store64(&rr_gon +  51 * 16,    5259653); store64(&rr_gon +  51 * 16 + 8,     682318);
+    store64(&rr_gon +  52 * 16,    5598758); store64(&rr_gon +  52 * 16 + 8,     803651);
+    store64(&rr_gon +  53 * 16,    5924338); store64(&rr_gon +  53 * 16 + 8,     957639);
+    store64(&rr_gon +  54 * 16,    6233256); store64(&rr_gon +  54 * 16 + 8,    1142797);
+    store64(&rr_gon +  55 * 16,    6522538); store64(&rr_gon +  55 * 16 + 8,    1357343);
+    store64(&rr_gon +  56 * 16,    6789397); store64(&rr_gon +  56 * 16 + 8,    1599211);
+    store64(&rr_gon +  57 * 16,    7031265); store64(&rr_gon +  57 * 16 + 8,    1866070);
+    store64(&rr_gon +  58 * 16,    7245811); store64(&rr_gon +  58 * 16 + 8,    2155352);
+    store64(&rr_gon +  59 * 16,    7430969); store64(&rr_gon +  59 * 16 + 8,    2464270);
+    store64(&rr_gon +  60 * 16,    7584957); store64(&rr_gon +  60 * 16 + 8,    2789850);
+    store64(&rr_gon +  61 * 16,    7706290); store64(&rr_gon +  61 * 16 + 8,    3128955);
+    store64(&rr_gon +  62 * 16,    7793802); store64(&rr_gon +  62 * 16 + 8,    3478319);
+    store64(&rr_gon +  63 * 16,    7846648); store64(&rr_gon +  63 * 16 + 8,    3834580);
+    rr_gon_ready = 1;
+    return 0;
+}
+
+# rr_case_load(i) -> 1 ok / 0 refused. Sets W/H and fills the edge list. 1-based case ids.
+# ⛔ Sequential `if` on a fixed selector, never chained `else if` — Cyrius kernel/tool idiom
+# ([[reference_cyrius_control_flow_idioms]]).
+fn rr_case_load(i): i64 {
+    edges_reset();
+    rr_dim_fault = 0;
+
+    if (i == 1)  { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   tri_add(fx(8), fx(8), fx(48), fx(12), fx(20), fx(50)); }
+    if (i == 2)  { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   tri_add(fx(4), fx(4), fx(20), fx(20), fx(40), fx(40)); }
+    if (i == 3)  { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   tri_add(fx(8), fx(50), fx(20), fx(8), fx(48), fx(44)); }
+    if (i == 4)  { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   tri_add(fx(2), fx(30), fx(60), fx(30), fx(60), fx(31)); }
+    if (i == 5)  { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   tri_add(fx(0 - 40), fx(0 - 40), fx(30), fx(10), fx(10), fx(30)); }
+    if (i == 6)  { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   tri_add(fx(200), fx(200), fx(260), fx(210), fx(210), fx(260)); }
+    if (i == 7)  { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   tri_add(fx(10), fx(10), fx(40), fx(10), fx(10), fx(40)); }
+    if (i == 8)  { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   tri_add(fx(0 - 10), fx(0 - 10), fx(90), fx(0 - 10), fx(30), fx(90)); }
+    # 9 — bowtie: A-B-C-D wound so the two lobes have OPPOSITE winding through the crossover.
+    if (i == 9)  { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   edge_add(fx(8),  fx(8),  fx(56), fx(56));
+                   edge_add(fx(56), fx(56), fx(56), fx(8));
+                   edge_add(fx(56), fx(8),  fx(8),  fx(56));
+                   edge_add(fx(8),  fx(56), fx(8),  fx(8)); }
+    # 10 — TWO triangles in ONE edge array, deliberately OVERLAPPING. The discriminator.
+    if (i == 10) { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   tri_add(fx(6),  fx(6),  fx(40), fx(10), fx(14), fx(44));
+                   tri_add(fx(20), fx(18), fx(58), fx(24), fx(30), fx(58)); }
+    if (i == 11) { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   edge_add(fx(8),  fx(8),  fx(48), fx(8));
+                   edge_add(fx(48), fx(8),  fx(48), fx(48));
+                   edge_add(fx(48), fx(48), fx(8),  fx(48));
+                   edge_add(fx(8),  fx(48), fx(8),  fx(8)); }
+    if (i == 12) { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   edge_add(fx(6),  fx(10), fx(50), fx(4));
+                   edge_add(fx(50), fx(4),  fx(54), fx(46));
+                   edge_add(fx(54), fx(46), fx(10), fx(52));
+                   edge_add(fx(10), fx(52), fx(6),  fx(10)); }
+    if (i == 13) { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   edge_add(fx(3),  fx(3),  fx(60), fx(5));
+                   edge_add(fx(60), fx(5),  fx(58), fx(60));
+                   edge_add(fx(58), fx(60), fx(5),  fx(58));
+                   edge_add(fx(5),  fx(58), fx(3),  fx(3)); }
+    # 14 — OPEN path: three edges that do NOT return to the start. ABI-legal (ne >= 3 is the
+    # only requirement), so the walk must terminate cleanly rather than run off the row.
+    if (i == 14) { if (rr_set_dims(64, 64) != 1) { return 0; }
+                   edge_add(fx(10), fx(10), fx(50), fx(20));
+                   edge_add(fx(50), fx(20), fx(30), fx(50));
+                   edge_add(fx(30), fx(50), fx(20), fx(34)); }
+    # 15 — deliberately NOT symmetric about x = W/2, so an x-mirrored tgid map is visible.
+    if (i == 15) { if (rr_set_dims(128, 64) != 1) { return 0; }
+                   tri_add(fx(6), fx(6), fx(38), fx(14), fx(18), fx(52)); }
+    if (i == 16) { if (rr_set_dims(37, 29) != 1) { return 0; }
+                   tri_add(fx(3), fx(2), fx(34), fx(9), fx(12), fx(26)); }
+    if (i == 17) { if (rr_set_dims(128, 64) != 1) { return 0; }
+                   tri_add(fx(64), fx(4), fx(64), fx(60), fx(96), fx(32)); }
+    if (i == 18) { if (rr_set_dims(128, 64) != 1) { return 0; }
+                   tri_add(fx(56), fx(24), fx(72), fx(24), fx(64), fx(40)); }
+    if (i == 19) { if (rr_set_dims(200, 64) != 1) { return 0; }
+                   tri_add(fx(4), fx(4), fx(196), fx(20), fx(90), fx(60)); }
+    if (i == 20) { if (rr_set_dims(128, 128) != 1) { return 0; }
+                   rr_gon_init();
+                   var k = 0;
+                   while (k < 64) {
+                       var n = k + 1;
+                       if (n == 64) { n = 0; }
+                       edge_add(load64(&rr_gon + k * 16), load64(&rr_gon + k * 16 + 8),
+                                load64(&rr_gon + n * 16), load64(&rr_gon + n * 16 + 8));
+                       k = k + 1;
+                   } }
+
+    if (i < 1)          { return 0; }
+    if (i > RR_NCASES)  { return 0; }
+    if (rr_dim_fault != 0) { return 0; }
+    # ⛔ A case that loaded NO edges means the selector missed — that is a typo, not a test.
+    #
+    # ⚠ THE BOUND IS 1, NOT 3, AND THE REASON IS LOAD-BEARING FOR THE SHADER. `edge_add` DROPS
+    # horizontal edges (y0 == y1) because they can never satisfy both `sy >= ylo` and
+    # `sy < yhi`. So a flat-topped triangle SUBMITS 3 edges and RETAINS 2 — cases 4, 7, 8, 11
+    # and 18 all do exactly this, and a `< 3` check here rejected all five as "refused to load"
+    # when they were correct.
+    #
+    # ⭐ The consequence for rung 9b: `#92`'s `ne >= 3` counts SUBMITTED edges, and the shader
+    # receives all of them including the horizontal ones. It must produce NO crossing for a
+    # horizontal edge rather than assuming the caller pre-filtered — the reference does the
+    # filtering internally, so an unfiltered GPU would disagree on five of the twenty cases.
+    if (n_edges < 1) { return 0; }
+    return 1;
+}
+
+# rr_case_edges_submitted(i) -> how many edges the CASE DEFINES, before the horizontal drop.
+# This is what a `#92` caller puts in `n_edges`, and it is NOT always what `raster()` iterates.
+fn rr_case_edges_submitted(i): i64 {
+    if (i == 4)  { return 3; }
+    if (i == 7)  { return 3; }
+    if (i == 8)  { return 3; }
+    if (i == 11) { return 4; }
+    if (i == 18) { return 3; }
+    return n_edges;
+}
+
+# rr_case_expect_lit(i) -> 1 if this case MUST produce at least one non-zero coverage byte.
+# ⭐ Cases 2 and 6 are all-zero BY DESIGN, so a dead shader reproduces them perfectly. Any
+# consumer comparing GPU against reference must call this and refuse to count an all-zero
+# result as a pass on the other 18 — otherwise "20/20 identical" is satisfiable by writing
+# nothing at all, which is exactly the outcome gputri classifies as UNTOUCHED.
+fn rr_case_expect_lit(i): i64 {
+    if (i == 2) { return 0; }
+    if (i == 6) { return 0; }
+    return 1;
+}
+
+# rr_corpus_audit() -> 1 / 0. ⭐ Does the corpus still have the STRUCTURAL PROPERTIES it was
+# built for? Determinism and non-vacuity are per-case checks and they do NOT answer this.
+#
+# ⚠ WRITTEN BECAUSE A MUTATION SLIPPED THROUGH. Narrowing case 19 from 200x64 to 64x64 left the
+# corpus reporting a clean "20 of 20 deterministic and non-vacuous" while its name still said
+# "WIDE mask 200x64" — the case had silently stopped exercising tgid_x wrap AND the `accrow`
+# width that B0 exists to protect. A corpus that cannot notice one of its own cases being
+# neutered is a list of shapes, not a test.
+#
+# Each property below is here because some rung's oracle depends on it. Losing one is a silent
+# reduction in what "20/20 identical" means.
+fn rr_corpus_audit(): i64 {
+    var maxw = 0;
+    var maxe = 0;
+    var n_nonmul64 = 0;
+    var n_narrow = 0;
+    var n_multishape = 0;
+    var case10_edges = 0;
+    var n_negcoord = 0;
+    var n_empty = 0;
+    var n_horiz = 0;
+    var i = 1;
+    while (i <= RR_NCASES) {
+        if (rr_case_load(i) == 1) {
+            if (W > maxw) { maxw = W; }
+            if (n_edges > maxe) { maxe = n_edges; }
+            if (W % 64 != 0) { n_nonmul64 = n_nonmul64 + 1; }
+            if (W < 64)       { n_narrow = n_narrow + 1; }
+            if (n_edges > 3)  { n_multishape = n_multishape + 1; }
+            if (i == 10)      { case10_edges = n_edges; }
+            if (rr_case_expect_lit(i) == 0) { n_empty = n_empty + 1; }
+            # a horizontal edge was dropped <=> submitted count exceeds the retained count
+            if (rr_case_edges_submitted(i) > n_edges) { n_horiz = n_horiz + 1; }
+            var k = 0;
+            while (k < n_edges) {
+                if (load64(&ex0 + k * 8) < 0) { n_negcoord = n_negcoord + 1; }
+                if (load64(&ey0 + k * 8) < 0) { n_negcoord = n_negcoord + 1; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    var ok = 1;
+    # ⭐ 200 is not arbitrary: it is >3x the 64-lane workgroup width (tgid_x must wrap at least
+    # three times) and it is the width that would have fired B0's accrow[64] overflow.
+    if (maxw < 200)        { ok = 0; }
+    if (maxe < 64)         { ok = 0; }   # the edge loop reaches the shipped cap
+    if (n_nonmul64 < 1)    { ok = 0; }   # a partial final workgroup exists
+    # ⚠ DISTINCT from the above, and the distinction is why the check is here: 200 % 64 = 8, so
+    # a wide mask already gives a partial final workgroup. What it does NOT give is a mask
+    # NARROWER than one workgroup, where the very first wave is partial and every lane past the
+    # width must mask off before an address is formed. Only case 16 (37 wide) tests that.
+    if (n_narrow < 1)      { ok = 0; }
+    if (n_multishape < 1)  { ok = 0; }   # at least one shape with more than 3 edges
+    # ⛔ THE MANDATORY CASE, CHECKED BY NAME. `n_multishape` above is a PROXY and it is too
+    # weak: a quad has 4 edges and satisfies it, so deleting case 10's second triangle left the
+    # audit green. Case 10 is the ONLY case with two separate closed shapes in one edge array,
+    # and it is the only thing that can distinguish summing a pixel's coverage fragments from
+    # merging them — every single-shape case passes either way. A proxy that a quad satisfies
+    # does not protect it, so the requirement is stated directly.
+    if (case10_edges < 6)  { ok = 0; }
+    if (n_negcoord < 1)    { ok = 0; }   # the sign-extension trap
+    if (n_empty != 2)      { ok = 0; }   # exactly the two all-zero cases, no more, no fewer
+    if (n_horiz < 1)       { ok = 0; }   # horizontal edges reach the shader unfiltered
+    rr_set_dims(64, 64);
+    return ok;
+}
+
+fn rr_case_name(i): i64 {
+    if (i == 1)  { return "plain triangle"; }
+    if (i == 2)  { return "zero-area (collinear)"; }
+    if (i == 3)  { return "backfacing (CW)"; }
+    if (i == 4)  { return "sliver (1px tall)"; }
+    if (i == 5)  { return "off-screen (negative coords)"; }
+    if (i == 6)  { return "fully outside"; }
+    if (i == 7)  { return "pixel-centre straddle"; }
+    if (i == 8)  { return "full-canvas cover"; }
+    if (i == 9)  { return "bowtie (self-intersecting)"; }
+    if (i == 10) { return "TWO overlapping triangles (6 edges)"; }
+    if (i == 11) { return "shared-edge quad, axis-aligned"; }
+    if (i == 12) { return "shared-edge quad, skewed"; }
+    if (i == 13) { return "shared-edge quad, near-full"; }
+    if (i == 14) { return "OPEN 3-edge path (not closed)"; }
+    if (i == 15) { return "x-asymmetric triangle"; }
+    if (i == 16) { return "width not a multiple of 64 (37x29)"; }
+    if (i == 17) { return "tile boundary, edge on x=64"; }
+    if (i == 18) { return "tile boundary, corner"; }
+    if (i == 19) { return "WIDE mask 200x64"; }
+    if (i == 20) { return "regular 64-gon (n_edges at cap)"; }
+    return "<bad case id>";
+}
