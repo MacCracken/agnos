@@ -2036,6 +2036,10 @@ fn mdo_transmit_run(arm) {
     #endif
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, be_dis);
     gpu_mfence();
+    # ARM THE RE-DISCOVERY TRIPWIRE: from here until the reconnect below, gpu_phy_discover() cannot answer
+    # (FE_SOURCE_SELECT is 0). Anything that asks in this window gets a NAMED refusal telling it to pass a
+    # latched phyid instead of a generic "undeterminable". See gpu_phy_routing_torn in gpu.cyr.
+    gpu_phy_routing_torn = 1;
 
     # ── ATOM #4 DIGxEncoderControl — programs the DIG FRONT END for HDMI (data islands, clock pattern).
     # ⚠ It does NOT switch the link to HDMI signalling: #4 leaves DIG_BE_CNTL.DIG_MODE untouched (see the
@@ -2070,7 +2074,12 @@ fn mdo_transmit_run(arm) {
     var aud_fail = 0;
     var r_aud = 0;
     if (arm != 0) {
-        r_aud = gpu_hdmi_audio_enable();
+        # ⛔ PASS THE LATCHED s_phy — DO NOT let this re-discover (M9d-fix, and it is the whole reason this
+        # op latches a phy at the top). By the time control reaches here the BE<->FE disconnect above has
+        # already cleared FE_SOURCE_SELECT, so gpu_phy_discover() would return -1, staging would refuse,
+        # and BOTH audio arms would unmute over a register file that was never programmed — two identical
+        # non-experiments wearing the names "control" and "treatment".
+        r_aud = gpu_hdmi_audio_enable(s_phy);
         kprint("modeset: transmit -- audio staged (muted) rc ", 45); kprint_num(r_aud); kprintln("", 0);
         if (r_aud == 0) { aud_fail = 1; }
     }
@@ -2155,6 +2164,10 @@ fn mdo_transmit_run(arm) {
     var be_now  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
     var be_conn = (be_now & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK)) | GPU_DIG_FE_SOURCE_CONNECT;
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, be_conn);
+    gpu_mfence();
+    # DISARM: routing is restored, so discovery is meaningful again. ⚠ Disarm AFTER the write lands, not
+    # before it — the flag tracks the HARDWARE's state, not our intention to fix it.
+    gpu_phy_routing_torn = 0;
     gpu_mfence();
     var be_rb = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
 

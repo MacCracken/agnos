@@ -10,6 +10,42 @@ tags/releases at close. Scope: **re-derive ATOM #76's `phyid`** (M8d's seed over
 below), then **M8e** (the live #76 PHY edge) → **M9** (audio sequenced after the transmitter edge).
 M8e stays blocked until the transmitter is provably pointed at the live PHY.
 
+### Fixed — M9d-fix: the audio arms' STAGING never ran (`gpu_hdmi_audio_enable` re-discovered a phyid the op had already destroyed)
+
+**Found by the L1 design review, before the burn — it would have wasted an iron session.** `mdo_transmit_run()`
+latches `s_phy` from the pristine pre-state *precisely because* the op destroys what discovery needs; the
+BE↔FE disconnect then clears `FE_SOURCE_SELECT`. M9d's staging call then invoked
+`gpu_hdmi_audio_enable()`, which **re-discovered internally** via `gpu_phy_discover()`, failed that
+function's condition 2 (`FE_SOURCE_SELECT != 0`), and refused. So in **both** audio arms the staging half
+silently did not execute, and each arm would have unmuted over a register file that was never programmed —
+two identical non-experiments wearing the names "control" and "treatment".
+
+The rule was already written in `gpu.cyr`, one screen above the defect: *"⚠ DISCOVER ONCE, HERE, AND PASS
+`db` DOWN — never re-discover at a use site."* M9a established it inside the function; M9d then called that
+function from the one place where it cannot be honoured. Both halves were individually correct; the
+composition was not.
+
+**Fix: the phy is now a PARAMETER.** `gpu_hdmi_audio_enable(phy)`. `mdo_transmit_run()` passes its latched
+`s_phy`; the two pristine-pipe callers (boot, and the 16-profile diagnostic sweep) pass
+`gpu_phy_discover()`. `gpu_hdmi_audio_unmute()` needed no change — it indexes off the boot-probed
+`gpu_audio_dig` and never re-discovers.
+
+**Plus a tripwire, because this bug class has now landed twice** (both halves of the M8e transmitter cycle,
+and this). New `gpu_phy_routing_torn`, armed at the disconnect and disarmed at the reconnect;
+`gpu_phy_discover()` reads it first and answers with a **named** refusal — `phy discovery refused --
+BE<->FE routing is torn down; the caller must pass its LATCHED phyid` — instead of a generic
+`phyid undeterminable`. It does not change the answer, it changes the log: −1 in that window means "you
+asked at the wrong time", not "this board has no live encoder", and those two being indistinguishable is
+what let the same defect land twice. ⚠ Verified there are **no early returns** between arm and disarm, so
+the flag cannot stick the way the OPTC underflow latch does.
+
+⛔ **The mitigating factor, stated plainly: the failure was loud, not silent.** Staging's refusal set
+`aud_fail`, so the op would have returned `MDO_E_AUDIO` and printed `TRANSMIT audio-refused — DISPLAY IS
+FINE, the audio half did not program`. The audio verdict added in M9d did its job. The burn would have been
+wasted but not misread.
+
+Smoke 20/0 both directions, arc sweep 15/15.
+
 ### Added — M9a·M9b·M9c·M9d: the HDMI audio path SPLITS around the transmitter edge (`MODESET_AUDIO`)
 
 **The plan card said M9 was a MOVE; the capture says it is a SPLIT, and that changed the bite.** The card

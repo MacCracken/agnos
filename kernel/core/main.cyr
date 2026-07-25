@@ -1263,7 +1263,9 @@ while (atom_halt_spin == 0) { }
 # ⚠ The sink-select + bind_single block below is NOT suppressed — see its gate.
 kprintln("gpu: boot-time hdmi audio SUPPRESSED (M9 -- the modeset op owns staging + unmute)", 81);
 #else
-gpu_hdmi_audio_enable();
+# Pristine-pipe caller: boot has not touched the routing, so discovery is valid HERE (M9d-fix — the phy is
+# a parameter now; see the contract at the top of gpu_hdmi_audio_enable in gpu.cyr).
+gpu_hdmi_audio_enable(gpu_phy_discover());
 #endif
 # Sink-select (the parked HDA bite 4): make the GPU's HDMI controller the LIVE refill target so a ring-3
 # tone lands on the display link rather than the analog jack. Only worth doing if the display side actually

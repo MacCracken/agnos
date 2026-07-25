@@ -116,6 +116,14 @@ var gpu_scanout_pid   = 0 - 1; # pid owning the scanout (-1 = the console owns i
 # P3a display-audio discovery (read-only probe results)
 var gpu_audio_dp      = 0 - 1; # 1 = the lit stream is DP (DTO1, constant module); 0 = HDMI (DTO0, pixel-clock module); -1 = unknown
 var gpu_audio_dig     = 0 - 1; # the live stream encoder (DIG) carrying the lit stream
+# ⛔ THE RE-DISCOVERY TRIPWIRE. Set to 1 while a caller has deliberately torn down the BE<->FE routing
+# (mdo_transmit_run's disconnect, STAGE-1's DIG_ENABLE clear). gpu_phy_discover() reads live routing, so
+# in that window it CANNOT answer — and its honest -1 is indistinguishable from "this board has no live
+# encoder", which is what let the same bug land twice: once in both halves of the M8e transmitter cycle,
+# once in M9d's staging call. The flag does not change the answer; it changes the LOG, from a generic
+# "phyid undeterminable" into a named instruction to the caller. A wrong answer you can read is a bug you
+# fix once instead of three times.
+var gpu_phy_routing_torn = 0;
 # HDMI_AUDIO_SWEEP: when 1, gpu_hdmi_audio_enable() suppresses its status prints + the CRC probe so the
 # sweep harness can re-run it as a quiet baseline reset between fix-profiles. 0 = normal verbose boot enable.
 var gpu_audio_quiet   = 0;
@@ -5922,6 +5930,13 @@ fn gpu_audio_probe() {
 # Returns the instance index, or -1 when nothing is live — callers MUST refuse rather than fall back to 0,
 # because "0" is precisely the wrong-and-plausible answer that a dead PHY accepts silently.
 fn gpu_phy_discover() {
+    # The tripwire, first statement: in this window the routing this function reads has been deliberately
+    # dismantled, so -1 here means "you asked at the wrong time", NOT "there is no live encoder". Saying so
+    # is the entire point — see gpu_phy_routing_torn's declaration.
+    if (gpu_phy_routing_torn == 1) {
+        kprintln("gpu: phy discovery refused -- BE<->FE routing is torn down; the caller must pass its LATCHED phyid", 98);
+        return 0 - 1;
+    }
     var found = 0 - 1;
     var i = 0;
     while (i < GPU_DCN_DIGS) {
@@ -6463,7 +6478,7 @@ fn gpu_hdmi_program_infoframes(d, az) {
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_AFMT_INFOFRAME_CONTROL0 + d, ifc | GPU_AFMT_AUDIO_INFO_UPDATE);
 }
 
-fn gpu_hdmi_audio_enable() {
+fn gpu_hdmi_audio_enable(phy) {
     gpu_hdmi_audio_on = 0;
     if (gpu_hdmi_preflight() != 1) {
         kprintln("gpu: hdmi audio not enabled (preflight refused)", 47);
@@ -6485,11 +6500,21 @@ fn gpu_hdmi_audio_enable() {
     # the front-end answer is exactly what stood as "MD-2 SETTLED: phyid=0" until an iron dump overturned it,
     # and it would have aimed a PHY power-cycle at a dead transmitter.
     #
-    # ⚠ DISCOVER ONCE, HERE, AND PASS `db` DOWN — never re-discover at a use site. gpu_phy_discover() needs
+    # ⚠ DISCOVER ONCE AND PASS IT DOWN — never re-discover at a use site. gpu_phy_discover() needs
     # DIG_ENABLE set AND FE_SOURCE_SELECT non-zero, and STAGE-1 below CLEARS DIG_ENABLE. A use-site
     # discovery after that point returns -1. That is precisely the defect that made both halves of the M8e
     # transmitter cycle refuse.
-    var phy = gpu_phy_discover();
+    #
+    # ⛔ THE PHY IS A PARAMETER, NOT A LOCAL DISCOVERY, AND THAT SIGNATURE IS LOAD-BEARING (M9d-fix).
+    # This function used to call gpu_phy_discover() itself. That was correct for its only caller at the
+    # time — boot, where the pipe is pristine — and WRONG the moment M9d called it from inside
+    # mdo_transmit_run(), which by then has already cleared FE_SOURCE_SELECT in the BE<->FE disconnect.
+    # Discovery there returns -1, this function refuses, and the ENTIRE staging half silently does not run:
+    # both audio arms would have unmuted over a register file that was never programmed, and the burn would
+    # have compared two identical non-experiments. The rule three lines up was already written here — the
+    # bug was calling a function that follows it from a place where it cannot be followed.
+    # ⚠ Callers on a pristine pipe pass gpu_phy_discover(); mdo_transmit_run() passes the value it LATCHED
+    # before it destroyed the preconditions. Never re-derive it here "just to be safe" — that is the bug.
     if (phy < 0) {
         kprintln("gpu: hdmi audio not enabled (no live link encoder -- phyid undeterminable)", 74);
         return 0;
@@ -6948,7 +6973,9 @@ fn gpu_hdmi_audio_profile(n) {
     if (n < 0) { return GPU_HDMI_SWEEP_COUNT; }
     # 1. Reset to the shipped 1.55.18 baseline, quietly, so each profile is an independent single-variable test.
     gpu_audio_quiet = 1;
-    gpu_hdmi_audio_enable();
+    # Pristine-pipe caller: the sweep runs from the shell with the pipe untouched, so discovery is valid
+    # HERE. (M9d-fix: the phy is now a parameter — see the contract at the top of gpu_hdmi_audio_enable.)
+    gpu_hdmi_audio_enable(gpu_phy_discover());
     gpu_audio_quiet = 0;
     var d  = gpu_audio_dig * GPU_DCN_DIG_STRIDE;
     var az = gpu_audio_dig;
