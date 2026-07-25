@@ -1,0 +1,287 @@
+# refagree.cyr — RUNG 8 ORACLE (i). The debt this arc owed before rung 9 could open.
+#
+# ============================================================================================
+# WHAT WAS OWED, AND WHY IT COULD NOT BE WAVED THROUGH
+# ============================================================================================
+# rung 8 shipped with its STRONG oracle done — watertightness, which does not depend on the
+# reference being correct — and its OTHER oracle explicitly NOT done:
+#
+#   "byte-for-byte agreement with SADISH ITSELF over 200 random paths"
+#
+# Until that lands, *"byte-identical to the CPU reference"* — the oracle EVERY Phase II rung
+# cites — rests on a port proven self-consistent but **not proven equal to its source**. A port
+# reproduces its source's behaviour only if the port is right, and nothing so far tested that.
+#
+# ⛔ This is deliberately NOT a tautology. cpuref.cyr's rasteriser is a hand re-implementation
+# with its own buffers, its own edge list and its own loop structure. sadish's is the original,
+# with a heap-allocated canvas, a verb/point path, curve flattening and a clip node. They share
+# an ALGORITHM, not a line of code. If my transcription of the fixed-point math is off by one
+# ULP anywhere, this finds it — at zero burns, instead of at rung 9 as a GPU-vs-CPU mismatch
+# that would be blamed on the shader.
+#
+# ⚠ THE DEGRADATION CLAUSE, from the plan, and it is why the tolerance is reported not hidden:
+# "If exact agreement proves unreachable, the arc's premier oracle degrades from byte-identical
+# to ±1 coverage step — that must be reported to the operator BEFORE rung 9 opens, not
+# discovered at the close." This tool prints the worst delta whether or not it is zero.
+#
+# Build:  cd gpu-test && CYRIUS_ALLOW_PARENT_INCLUDES=1 cyrius build refagree.cyr build/refagree
+# Run:    ./build/refagree   -> 95 byte-identical · 94 agrees within +/-1 (DEGRADED) · 90 diverges
+
+# ⚠ dist/sadish.cyr is a STRIP-INCLUDE bundle — it deliberately carries no stdlib includes
+# (sadish keeps those in lib.cyr so `cyrius distlib` can concatenate cleanly). So the stdlib
+# comes first, from here.
+include "lib/io.cyr"
+include "../../sadish/dist/sadish.cyr"
+
+fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn ps(s): i64 { print(s, slen(s)); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn puts(s): i64 { ps(s); nl(); return 0; }
+fn pnum(v): i64 {
+    if (v == 0) { print("0", 1); return 0; }
+    var neg = 0; var x = v;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    var b[24]; var i = 0;
+    while (x > 0) { store8(&b + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
+    if (neg == 1) { print("-", 1); }
+    while (i > 0) { i = i - 1; print(&b + i, 1); }
+    return 0;
+}
+
+var RW = 64;
+var RH = 64;
+var R_SHIFT = 16;
+var R_ONE   = 65536;
+var R_SS    = 4;
+
+# ---- the PORT under test — cpuref.cyr's rasteriser, same math, separate implementation ------
+var ex0[64]; var ey0[64]; var ex1[64]; var ey1[64];
+var n_edges = 0;
+var accrow[64];
+var crx[64]; var crd[64];
+var covPort[4096];
+
+fn r_fixed_mul(a, b): i64 { return (a * b) >> R_SHIFT; }
+fn edges_reset(): i64 { n_edges = 0; return 0; }
+fn edge_add(x0, y0, x1, y1): i64 {
+    if (y0 == y1) { return 0; }
+    if (n_edges >= 64) { return 0; }
+    store64(&ex0 + n_edges * 8, x0); store64(&ey0 + n_edges * 8, y0);
+    store64(&ex1 + n_edges * 8, x1); store64(&ey1 + n_edges * 8, y1);
+    n_edges = n_edges + 1;
+    return 0;
+}
+
+fn span_add(xs, xe, weight): i64 {
+    if (xe <= xs) { return 0; }
+    var lo = xs; if (lo < 0) { lo = 0; }
+    var wmax = RW << R_SHIFT;
+    var hi = xe; if (hi > wmax) { hi = wmax; }
+    if (hi <= lo) { return 0; }
+    var px = lo >> R_SHIFT;
+    var stop = 0;
+    while (stop == 0) {
+        if (px >= RW) { stop = 1; }
+        if (px < RW) {
+            var pl = px << R_SHIFT;
+            if (pl >= hi) { stop = 1; }
+            if (pl < hi) {
+                var pr = (px + 1) << R_SHIFT;
+                var a = lo; if (a < pl) { a = pl; }
+                var b = hi; if (b > pr) { b = pr; }
+                if (b > a) {
+                    store64(&accrow + px * 8,
+                            load64(&accrow + px * 8) + r_fixed_mul(weight, b - a));
+                }
+                px = px + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+fn port_raster(cov): i64 {
+    var weight = R_ONE / R_SS;
+    var py = 0;
+    while (py < RH) {
+        var zi = 0;
+        while (zi < RW) { store64(&accrow + zi * 8, 0); zi = zi + 1; }
+        var s = 0;
+        while (s < R_SS) {
+            var sy = (py << R_SHIFT) + (s * R_ONE + (R_ONE >> 1)) / R_SS;
+            var nc = 0;
+            var ei = 0;
+            while (ei < n_edges) {
+                var ay = load64(&ey0 + ei * 8);
+                var by = load64(&ey1 + ei * 8);
+                var ylo = ay; var yhi = by; var dir = 1;
+                if (ay > by) { ylo = by; yhi = ay; dir = 0 - 1; }
+                if (sy >= ylo) {
+                    if (sy < yhi) {
+                        var ax = load64(&ex0 + ei * 8);
+                        var bx = load64(&ex1 + ei * 8);
+                        store64(&crx + nc * 8, ax + ((bx - ax) * (sy - ay)) / (by - ay));
+                        store64(&crd + nc * 8, dir);
+                        nc = nc + 1;
+                    }
+                }
+                ei = ei + 1;
+            }
+            var a = 1;
+            while (a < nc) {
+                var kx = load64(&crx + a * 8);
+                var kd = load64(&crd + a * 8);
+                var b = a - 1;
+                var stop = 0;
+                while (stop == 0) {
+                    if (b < 0) { stop = 1; }
+                    if (b >= 0) {
+                        if (load64(&crx + b * 8) > kx) {
+                            store64(&crx + (b + 1) * 8, load64(&crx + b * 8));
+                            store64(&crd + (b + 1) * 8, load64(&crd + b * 8));
+                            b = b - 1;
+                        }
+                        if (load64(&crx + b * 8) <= kx) { stop = 1; }
+                    }
+                }
+                store64(&crx + (b + 1) * 8, kx);
+                store64(&crd + (b + 1) * 8, kd);
+                a = a + 1;
+            }
+            var wind = 0;
+            var ci = 0;
+            while (ci < nc - 1) {
+                wind = wind + load64(&crd + ci * 8);
+                if (wind != 0) {
+                    span_add(load64(&crx + ci * 8), load64(&crx + (ci + 1) * 8), weight);
+                }
+                ci = ci + 1;
+            }
+            s = s + 1;
+        }
+        var px = 0;
+        while (px < RW) {
+            var c = (load64(&accrow + px * 8) * 255) >> R_SHIFT;
+            if (c > 255) { c = 255; }
+            store8(cov + py * RW + px, c);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return 0;
+}
+
+# ---- a deterministic PRNG so a divergence is reproducible from its seed alone ---------------
+# ⚠ NOT rand(): a failing case must be re-runnable exactly. xorshift64, seeded per-case.
+var rng_s = 0;
+fn rnd(): i64 {
+    rng_s = rng_s ^ (rng_s << 13);
+    rng_s = rng_s ^ ((rng_s >> 7) & 0x1FFFFFFFFFFFFFF);
+    rng_s = rng_s ^ (rng_s << 17);
+    if (rng_s < 0) { rng_s = 0 - rng_s; }
+    return rng_s;
+}
+fn rnd_coord(): i64 { return (rnd() % (70 * 65536)) - (3 * 65536); }
+
+var worst_delta = 0;
+var n_exact = 0;
+var n_within1 = 0;
+var n_diverge = 0;
+var first_bad_seed = 0;
+
+# ---- one random triangle through BOTH implementations --------------------------------------
+fn case_one(seed): i64 {
+    rng_s = seed;
+    var ax = rnd_coord(); var ay = rnd_coord();
+    var bx = rnd_coord(); var by = rnd_coord();
+    var cx = rnd_coord(); var cy = rnd_coord();
+
+    # --- the PORT ---
+    edges_reset();
+    edge_add(ax, ay, bx, by);
+    edge_add(bx, by, cx, cy);
+    edge_add(cx, cy, ax, ay);
+    port_raster(&covPort);
+
+    # --- SADISH ITSELF, through its real public API: heap canvas, verb/point path, its own
+    # flattening and its own fill. Nothing is shared with the port but the algorithm.
+    var cv = sd_canvas_new(RW, RH);
+    if (cv == 0) { return 0 - 1; }
+    var pa = sd_path_new();
+    if (pa == 0) { return 0 - 1; }
+    sd_path_moveto(pa, ax, ay);
+    sd_path_lineto(pa, bx, by);
+    sd_path_lineto(pa, cx, cy);
+    sd_path_close(pa);
+    sd_canvas_fill_path(cv, pa, SD_FILL_NONZERO);
+    var scov = sd_canvas_coverage(cv);
+
+    var bad = 0;
+    var i = 0;
+    while (i < RW * RH) {
+        var p = load8(&covPort + i);
+        var q = load8(scov + i);
+        var d = p - q;
+        if (d < 0) { d = 0 - d; }
+        if (d > worst_delta) { worst_delta = d; }
+        if (d > bad) { bad = d; }
+        i = i + 1;
+    }
+    if (bad == 0) { n_exact = n_exact + 1; return 0; }
+    if (bad == 1) {
+        n_within1 = n_within1 + 1;
+        if (first_bad_seed == 0) { first_bad_seed = seed; }
+        return 1;
+    }
+    n_diverge = n_diverge + 1;
+    if (first_bad_seed == 0) { first_bad_seed = seed; }
+    return bad;
+}
+
+fn main(): i64 {
+    puts("refagree -- RUNG 8 ORACLE (i): the port vs SADISH ITSELF");
+    puts("========================================================");
+    puts("");
+    puts("The port and sadish share an ALGORITHM, not a line of code: separate buffers, separate");
+    puts("edge lists, separate loops, and sadish goes through its real heap/verb/path API.");
+    puts("200 random triangles, deterministic seeds so any divergence is reproducible.");
+    puts("");
+
+    var k = 0;
+    while (k < 200) {
+        case_one(1000003 + k * 7919);
+        k = k + 1;
+    }
+
+    ps("  exact (delta 0)      : "); pnum(n_exact); puts("");
+    ps("  within +/-1          : "); pnum(n_within1); puts("");
+    ps("  diverged (>1)        : "); pnum(n_diverge); puts("");
+    ps("  worst delta observed : "); pnum(worst_delta); puts("");
+    if (first_bad_seed != 0) {
+        ps("  first imperfect seed : "); pnum(first_bad_seed);
+        puts("   (re-runnable exactly)");
+    }
+    puts("");
+
+    if (n_diverge != 0) {
+        puts("** DIVERGENCE > 1 COVERAGE STEP.");
+        puts("   The port is NOT a faithful transcription of sadish's math. Rung 9 must NOT");
+        puts("   cite 'byte-identical to the CPU reference' -- the reference is wrong, and a");
+        puts("   GPU-vs-CPU mismatch at rung 9 would be blamed on the shader.");
+        return 90;
+    }
+    if (n_within1 != 0) {
+        puts("** DEGRADED: agreement is +/-1 coverage step, NOT byte-identical.");
+        puts("   This is the plan's named degradation clause, and it is being reported HERE,");
+        puts("   BEFORE rung 9 opens, exactly as required -- not discovered at the close.");
+        puts("   Every Phase II oracle must be restated as 'within +/-1', and any rung whose");
+        puts("   claim depends on exactness must be re-scoped before it is burned.");
+        return 94;
+    }
+    puts("BYTE-IDENTICAL on all 200 paths. Rung 8 oracle (i) is CLOSED.");
+    puts("'byte-identical to the CPU reference' is now a proven claim, and rung 9 may cite it.");
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

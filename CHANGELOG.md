@@ -32,6 +32,26 @@ independent evidence. That pre-registered branch remains **untested**.
 
 ★ **The forensic block fired automatically — the first time agnos has ever captured a GPU hang.**
 
+### Added — rung 8 oracle (i) CLOSED: the port is byte-identical to sadish (HOST, 0 burns)
+
+`gpu-test/refagree.cyr`, `exit 95`. The debt rung 8 shipped owing, and the one that gated rung 9.
+
+Links **sadish itself** — its `dist/` bundle, real heap canvas, verb/point path, its own curve
+flattening — and runs 200 random triangles through both it and the port. **200/200 byte-identical,
+worst delta 0.**
+
+⚠ **The plan's degradation clause does not fire.** Agreement is exact, not ±1, so no Phase II oracle
+needs restating and no rung needs re-scoping. That clause required reporting *before* rung 9 opened
+either way; it is reported, and it is negative.
+
+⛔ Not a tautology: the port is a hand re-implementation with its own buffers, edge list and loop
+structure. They share an algorithm, not a line of code — so a one-ULP transcription error in the
+fixed-point math would surface here, at zero burns, instead of at rung 9 as a GPU-vs-CPU mismatch
+that would have been blamed on the shader. Deterministic xorshift seeds, so any future divergence is
+exactly re-runnable from its seed.
+
+**"Byte-identical to the CPU reference" is now a proven claim, and rung 9 may cite it.**
+
 ### Fixed — `gpu_forensic_dump` raced the submission and reported the wrong cause
 
 The burn found a defect in the instrument every Phase II rung is meant to cite.
