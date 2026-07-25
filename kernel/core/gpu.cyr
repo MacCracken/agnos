@@ -6002,13 +6002,46 @@ fn gpu_blit_present(pid) {
 # lazily. Ring-3 names only the color — the kernel targets the back buffer, so no MC address crosses the
 # boundary (same discipline as blit #39). The fill is scanout-visible (MC-direct, no ACQUIRE_MEM). Returns 0
 # on success, -1 if the GPU/display isn't usable (QEMU, no pipe) or the fill failed.
-fn gpu_fill_sys(color) {
+# ⭐ BAND FILL — the kernel half of the 3D arc's Phase-0 dependency chain.
+#
+# ⛔ WHY THIS EXISTS AT ALL. Phase 0 was specified as "zero kernel code", and building it proved
+# that false: aethersafha can damage-track and it can copy a band with #39, but its per-frame
+# CLEAR still touches every pixel — so damage is always the whole screen and the band reduces
+# nothing. The clear has to become a rect before any of the damage machinery pays.
+#
+# ⛔ FULL-WIDTH BANDS ONLY, and it is the SAME constraint #39 has, for the same reason: CP-DMA
+# fills CONTIGUOUS memory. A rect's rows are not contiguous in the framebuffer; a full-width
+# band's are. An arbitrary rect needs a per-row fill loop (h CP-DMA packets instead of 1), which
+# is a different and much more expensive shape — measure before assuming it is worth it.
+#
+# ⚠ ABI COMPATIBILITY IS LOAD-BEARING: h == 0 means WHOLE BUFFER, which is exactly what
+# aethersafha 0.9.8 already ships (`syscall(85, pixel, 0, 0)`). An older caller keeps working
+# byte-for-byte, and this is why the new arguments are a band rather than a rect — a rect would
+# have needed a 4th argument the dispatcher does not offer.
+fn gpu_fill_sys(color, y0, h) {
     if (gpu_present == 0) { return 0 - 1; }
     if (gpu_blit_arm() != 1) { return 0 - 1; }           # stand up the back buffers (idempotent)
     if (gpu_bb_fbsize == 0) { return 0 - 1; }
     var tgt_mc = gpu_bb_a_mc;
     if (gpu_bb_back != 0) { tgt_mc = gpu_bb_b_mc; }
-    if (gpu_cp_dma_fill(tgt_mc, color, gpu_bb_fbsize) != 1) { return 0 - 1; }
+
+    # Whole-buffer: the shipped behaviour, unchanged.
+    if (h <= 0) {
+        if (gpu_cp_dma_fill(tgt_mc, color, gpu_bb_fbsize) != 1) { return 0 - 1; }
+        return 0;
+    }
+
+    # Band. ⛔ REJECT rather than clip — the same discipline as #87 and #91: ring 3 owns clipping,
+    # and a kernel that silently shrinks a caller's request makes an out-of-range bug look like a
+    # rendering bug.
+    if (gpu_bb_pitch == 0) { return 0 - 1; }
+    if (y0 < 0) { return 0 - 1; }
+    var off = y0 * gpu_bb_pitch;
+    var span = h * gpu_bb_pitch;
+    if (off < 0) { return 0 - 1; }
+    if (span <= 0) { return 0 - 1; }
+    if (off + span > gpu_bb_fbsize) { return 0 - 1; }
+    if (gpu_cp_dma_fill(tgt_mc + off, color, span) != 1) { return 0 - 1; }
     return 0;
 }
 

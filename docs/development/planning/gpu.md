@@ -755,7 +755,32 @@ None of them is in the prior-art literature; all three are in this project's own
 
 **Standing design constraint, binding on every kernel raster kernel in Phase II: branch-free per pixel, one workgroup per 8×8 tile, fixed 64 lanes, no data-dependent trip count.** Every proven agnos shader has this property and it eliminates the runaway-wave class from the rasteriser by construction. **Vertex transform stays on the CPU in ring 3** — the kernel receives screen-space vertices with `1/w` (TD-4).
 
-### Phase 0 — THE CALLER. Zero kernel code. One flash.
+### Phase 0 — THE CALLER. ~~Zero kernel code.~~ One flash.
+
+> ⛔⛔ **CORRECTED 2026-07-25, FROM BUILDING IT: "zero kernel code" IS FALSE, AND 0a/0c's STATED
+> ORDER IS WRONG.** aethersafha 0.9.8 landed 0a's first half (the clear now goes through
+> `#85 gpu_fill` — real work removed from every frame). Building the rest surfaced a dependency
+> chain this row did not have:
+>
+> 1. **`#39` cannot take an arbitrary damage rect.** Its source is **tightly packed, w*4 bytes per
+>    row**, with no stride (`syscall.cyr:3794`). A damage rect's rows are not contiguous in the
+>    framebuffer. Only a **full-width band** is copyable today. True rect damage needs a stride on
+>    `#39` — a kernel ABI change.
+> 2. **The damage band currently reduces NOTHING.** The per-frame clear touches every pixel, so
+>    damage is by definition the whole screen. The plumbing is correct and shipped; the copy is the
+>    same size it was.
+> 3. **0c is BLOCKED, not merely later.** `#91 gpu_blit_bb` needs a "only a window moved" fast path
+>    to hook into, and `render_frame` unconditionally clears and repaints everything every frame.
+>    Building that path requires (2) to be real first. A `#91` bolted onto a full-repaint loop moves
+>    pixels that are immediately overwritten — it measures neutral and reads as done.
+>
+> **THE REAL CHAIN IS:** `#85` gains a RECT fill (kernel bite) *or* the compositor stops clearing
+> every frame (zero kernel code, compositor-model change) → damage actually reduces → 0c becomes
+> possible. Whichever is chosen, **Phase 0 is not zero-kernel-code unless it is the second one.**
+>
+> ⚠ This is the plan being corrected by construction, which is what the ladder is for — but note it
+> was found by *building* 0a, not by reading the row. Rows that have never been built are not
+> evidence.
 
 | # | Bite | What it does | Oracle | Falsification | Venue |
 |---|---|---|---|---|---|

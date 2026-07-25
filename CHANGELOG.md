@@ -32,6 +32,30 @@ independent evidence. That pre-registered branch remains **untested**.
 
 ★ **The forensic block fired automatically — the first time agnos has ever captured a GPU hang.**
 
+### Added — `#85 gpu_fill` gains a full-width BAND, unblocking the Phase-0 damage chain
+
+`gpu_fill(color, y0, h)`. `h == 0` keeps the original whole-buffer behaviour, so every shipped
+caller is unaffected byte-for-byte — aethersafha 0.9.8 already passes `(pixel, 0, 0)`.
+
+⛔ **Phase 0 was specified as "zero kernel code" and that is FALSE — found by building it, not by
+reading the row.** aethersafha 0.9.8 can damage-track and can copy a band with `#39`, but its
+per-frame **clear still touches every pixel**, so damage is always the whole screen and the band
+reduces nothing. The clear has to become a rect before any of the damage machinery pays. This is
+the kernel half of that.
+
+⛔ **Bands, not rects, and it is the same constraint `#39` has for the same reason:** CP-DMA fills
+**contiguous** memory. A rect's rows are not contiguous in the framebuffer; a full-width band's
+are. An arbitrary rect needs a per-row fill loop — `h` CP-DMA packets instead of 1 — which is a
+different and much more expensive shape and should be measured before being assumed worthwhile.
+
+⚠ **Rejects out-of-range rather than clipping**, matching `#87` and `#91`: ring 3 owns clipping, and
+a kernel that silently shrinks a request makes an out-of-range bug look like a rendering bug.
+
+The plan's Phase-0 row is corrected in place with the full dependency chain it was missing:
+`#85` rect/band fill (or the compositor ceasing to clear every frame) → damage actually reduces →
+rung 0c becomes possible. 0c was **blocked, not merely later** — `#91` needs a "only a window moved"
+fast path that `render_frame` does not have.
+
 ### Added — rung 8 oracle (i) CLOSED: the port is byte-identical to sadish (HOST, 0 burns)
 
 `gpu-test/refagree.cyr`, `exit 95`. The debt rung 8 shipped owing, and the one that gated rung 9.
