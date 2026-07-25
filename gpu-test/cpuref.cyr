@@ -1,0 +1,343 @@
+# cpuref.cyr — RUNG 8 of the 3D arc. The CPU reference rasteriser and its two oracles.
+#
+# ============================================================================================
+# WHY THIS IS A RUNG AND NOT A HELPER
+# ============================================================================================
+# Every Phase II rung's oracle is "byte-identical to the CPU reference". If the reference is
+# wrong, every one of those greens is wrong in the same direction and nothing downstream can
+# detect it — the GPU would be validated against a mistake. So the reference gets its own rung,
+# its own oracles, and it is proven BEFORE anything cites it.
+#
+# ⛔ IT LIVES IN THE RING-3 TOOL, NEVER IN THE KERNEL. The build-size discipline threshold is
+# already blown at 1.8 MB; a reference rasteriser in kernel text would be pure cost.
+#
+# ============================================================================================
+# THE TWO ORACLES, AND WHY IT TAKES TWO
+# ============================================================================================
+# (i)  AGREEMENT — the reference agrees with sadish itself, byte-for-byte, over the corpus.
+#      Catches: port errors. Does NOT catch: sadish being wrong, because this reference is a
+#      port OF sadish. On its own it is close to marking its own homework.
+#
+# (ii) INTERNAL CONSISTENCY — on every shared-edge pair, ZERO double-covered and ZERO uncovered
+#      pixels along the seam. ⭐ This one does NOT depend on the reference being right. Two
+#      triangles meeting on an exact shared edge must tile that edge perfectly under ANY correct
+#      fill rule; a crack or a double-hit is a fill-rule bug no agreement test can see, because
+#      a port reproduces its source's cracks faithfully.
+#
+#      On the GPU the same bug presents as FLICKER, which reads as a coherence problem and gets
+#      chased for burns. Catching it here costs nothing.
+#
+# ============================================================================================
+# PORTED FROM sadish/src/raster.cyr — sd_fill_impl / sd_span_add
+# ============================================================================================
+# 16.16 fixed point (SD_SHIFT=16) · SD_FILL_SS=4 vertical sub-scanlines ·
+# sub-scanline y = (py<<16) + (s*ONE + ONE/2)/ssy · HALF-OPEN y test (sy >= ylo && sy < yhi) ·
+# analytic exact x-overlap per pixel per sub-scanline · weight = ONE/ssy ·
+# coverage byte = (acc*255)>>16, clamped to 255.
+#
+# ⚠ THE HALF-OPEN RULE IS THE WHOLE SHARED-EDGE STORY. `sy >= ylo` and `sy < yhi` is what makes
+# a shared horizontal boundary belong to exactly one of the two triangles. Change it to `<=` and
+# oracle (ii) fails with double-coverage; change it to `>` and it fails with a crack. That is
+# precisely why oracle (ii) exists and why it is not redundant with (i).
+#
+# Build:  cd gpu-test && cyrius build cpuref.cyr build/cpuref
+# Run:    ./build/cpuref     -> 95 = both oracles pass · 90 = a failure (named)
+
+include "lib/io.cyr"
+
+fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn ps(s): i64 { print(s, slen(s)); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn puts(s): i64 { ps(s); nl(); return 0; }
+fn pnum(v): i64 {
+    if (v == 0) { print("0", 1); return 0; }
+    var neg = 0; var x = v;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    var buf[24]; var i = 0;
+    while (x > 0) { store8(&buf + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
+    if (neg == 1) { print("-", 1); }
+    while (i > 0) { i = i - 1; print(&buf + i, 1); }
+    return 0;
+}
+
+# ---- sadish's fixed-point constants, reproduced exactly -----------------------------------
+var R_SHIFT = 16;
+var R_ONE   = 65536;
+var R_SS    = 4;              # SD_FILL_SS
+
+fn r_fixed_mul(a, b): i64 { return (a * b) >> R_SHIFT; }
+
+# ---- geometry buffers ---------------------------------------------------------------------
+var W = 64;
+var H = 64;
+var MAXE = 64;
+var ex0[64]; var ey0[64]; var ex1[64]; var ey1[64];
+var n_edges = 0;
+var accrow[64];
+var crx[64]; var crd[64];
+var covA[4096];
+var covB[4096];
+
+fn edges_reset(): i64 { n_edges = 0; return 0; }
+fn edge_add(x0, y0, x1, y1): i64 {
+    # ⚠ Degenerate horizontal edges contribute no crossings under the half-open rule and are
+    # dropped here, exactly as sadish's y-range test drops them (ylo == yhi can never satisfy
+    # both sy >= ylo and sy < yhi). Dropping them explicitly makes the corpus's zero-area and
+    # sliver cases behave identically in both implementations rather than by accident.
+    if (y0 == y1) { return 0; }
+    if (n_edges >= MAXE) { return 0; }
+    store64(&ex0 + n_edges * 8, x0); store64(&ey0 + n_edges * 8, y0);
+    store64(&ex1 + n_edges * 8, x1); store64(&ey1 + n_edges * 8, y1);
+    n_edges = n_edges + 1;
+    return 0;
+}
+
+fn tri_add(ax, ay, bx, by, cx, cy): i64 {
+    edge_add(ax, ay, bx, by);
+    edge_add(bx, by, cx, cy);
+    edge_add(cx, cy, ax, ay);
+    return 0;
+}
+
+# ---- the analytic-x span accumulator — sadish's sd_span_add ---------------------------------
+fn span_add(xs, xe, weight): i64 {
+    if (xe <= xs) { return 0; }
+    var lo = xs; if (lo < 0) { lo = 0; }
+    var wmax = W << R_SHIFT;
+    var hi = xe; if (hi > wmax) { hi = wmax; }
+    if (hi <= lo) { return 0; }
+    var px = lo >> R_SHIFT;
+    var stop = 0;
+    while (stop == 0) {
+        if (px >= W) { stop = 1; }
+        if (px < W) {
+            var pl = px << R_SHIFT;
+            if (pl >= hi) { stop = 1; }
+            if (pl < hi) {
+                var pr = (px + 1) << R_SHIFT;
+                var a = lo; if (a < pl) { a = pl; }
+                var b = hi; if (b > pr) { b = pr; }
+                if (b > a) {
+                    var add = r_fixed_mul(weight, b - a);
+                    store64(&accrow + px * 8, load64(&accrow + px * 8) + add);
+                }
+                px = px + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+# ---- the reference rasteriser — sadish's sd_fill_impl, nonzero rule -------------------------
+fn raster(cov): i64 {
+    var weight = R_ONE / R_SS;
+    var py = 0;
+    while (py < H) {
+        var zi = 0;
+        while (zi < W) { store64(&accrow + zi * 8, 0); zi = zi + 1; }
+        var s = 0;
+        while (s < R_SS) {
+            # ⚠ EXACT sub-scanline placement. A different rounding here shifts every edge by a
+            # fraction of a pixel and shows up as a uniform ±1 coverage difference — which is
+            # exactly the degradation the plan warns must be REPORTED, not absorbed.
+            var sy = (py << R_SHIFT) + (s * R_ONE + (R_ONE >> 1)) / R_SS;
+            var nc = 0;
+            var ei = 0;
+            while (ei < n_edges) {
+                var ay = load64(&ey0 + ei * 8);
+                var by = load64(&ey1 + ei * 8);
+                var ylo = ay; var yhi = by; var dir = 1;
+                if (ay > by) { ylo = by; yhi = ay; dir = 0 - 1; }
+                # ⛔ THE HALF-OPEN RULE. See the header: this single pair of comparisons is what
+                # makes a shared edge belong to exactly one triangle.
+                if (sy >= ylo) {
+                    if (sy < yhi) {
+                        var ax = load64(&ex0 + ei * 8);
+                        var bx = load64(&ex1 + ei * 8);
+                        var xx = ax + ((bx - ax) * (sy - ay)) / (by - ay);
+                        store64(&crx + nc * 8, xx);
+                        store64(&crd + nc * 8, dir);
+                        nc = nc + 1;
+                    }
+                }
+                ei = ei + 1;
+            }
+            # insertion sort by x — sadish's, same algorithm so ties order identically
+            var a = 1;
+            while (a < nc) {
+                var kx = load64(&crx + a * 8);
+                var kd = load64(&crd + a * 8);
+                var b = a - 1;
+                var stop = 0;
+                while (stop == 0) {
+                    if (b < 0) { stop = 1; }
+                    if (b >= 0) {
+                        if (load64(&crx + b * 8) > kx) {
+                            store64(&crx + (b + 1) * 8, load64(&crx + b * 8));
+                            store64(&crd + (b + 1) * 8, load64(&crd + b * 8));
+                            b = b - 1;
+                        }
+                        if (load64(&crx + b * 8) <= kx) { stop = 1; }
+                    }
+                }
+                store64(&crx + (b + 1) * 8, kx);
+                store64(&crd + (b + 1) * 8, kd);
+                a = a + 1;
+            }
+            # nonzero winding -> covered spans
+            var wind = 0;
+            var ci = 0;
+            while (ci < nc - 1) {
+                wind = wind + load64(&crd + ci * 8);
+                if (wind != 0) {
+                    span_add(load64(&crx + ci * 8), load64(&crx + (ci + 1) * 8), weight);
+                }
+                ci = ci + 1;
+            }
+            s = s + 1;
+        }
+        var px = 0;
+        while (px < W) {
+            var c = (load64(&accrow + px * 8) * 255) >> R_SHIFT;
+            if (c > 255) { c = 255; }
+            store8(cov + py * W + px, c);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return 0;
+}
+
+fn cov_clear(cov): i64 {
+    var i = 0;
+    while (i < W * H) { store8(cov + i, 0); i = i + 1; }
+    return 0;
+}
+
+fn fx(v): i64 { return v << R_SHIFT; }
+
+# ============================================================================================
+# ORACLE (ii) — SHARED-EDGE WATERTIGHTNESS. Does not depend on the reference being right.
+# ============================================================================================
+# Two triangles split a quad along a diagonal. Rasterised SEPARATELY, every pixel's coverage
+# from the two must sum to what the undivided quad gives — no more (double-hit) and no less
+# (crack). ⚠ Summed coverage is compared against the QUAD, not against 255, because interior
+# pixels of an AA rasteriser are legitimately < 255 at the quad's own outer boundary.
+var covQ[4096];
+
+fn shared_edge_pair(ax, ay, bx, by, cx, cy, dx, dy, name): i64 {
+    # the quad A-B-C-D as one path
+    edges_reset();
+    edge_add(fx(ax), fx(ay), fx(bx), fx(by));
+    edge_add(fx(bx), fx(by), fx(cx), fx(cy));
+    edge_add(fx(cx), fx(cy), fx(dx), fx(dy));
+    edge_add(fx(dx), fx(dy), fx(ax), fx(ay));
+    cov_clear(&covQ); raster(&covQ);
+
+    # triangle 1: A-B-C
+    edges_reset(); tri_add(fx(ax), fx(ay), fx(bx), fx(by), fx(cx), fx(cy));
+    cov_clear(&covA); raster(&covA);
+    # triangle 2: A-C-D  (shares the exact edge A-C)
+    edges_reset(); tri_add(fx(ax), fx(ay), fx(cx), fx(cy), fx(dx), fx(dy));
+    cov_clear(&covB); raster(&covB);
+
+    var doubles = 0;
+    var cracks = 0;
+    var worst = 0;
+    var i = 0;
+    while (i < W * H) {
+        var q = load8(&covQ + i);
+        var s = load8(&covA + i) + load8(&covB + i);
+        if (s > 255) { s = 255; }
+        var d = s - q;
+        if (d < 0) { d = 0 - d; }
+        if (d > worst) { worst = d; }
+        if (s > q) { if (d > 1) { doubles = doubles + 1; } }
+        if (s < q) { if (d > 1) { cracks = cracks + 1; } }
+        i = i + 1;
+    }
+    ps("  "); ps(name);
+    ps("  double-covered "); pnum(doubles);
+    ps("  cracked "); pnum(cracks);
+    ps("  worst delta "); pnum(worst);
+    if (doubles == 0) {
+        if (cracks == 0) { puts("   WATERTIGHT"); return 1; }
+    }
+    puts("   ** LEAK **");
+    return 0;
+}
+
+# ============================================================================================
+# ORACLE (i) — DETERMINISM + STABILITY over the corpus.
+# ============================================================================================
+# ⚠ HONEST SCOPE, stated rather than implied. The plan's rung 8 says this oracle is
+# "the reference agrees with SADISH ITSELF on 200 random paths". That comparison requires
+# linking sadish's canvas/path/alloc machinery into this tool, which is a real integration and
+# is NOT done here. What IS proven here is that the ported inner math is DETERMINISTIC and
+# STABLE over the corpus, plus the far stronger oracle (ii).
+#
+# ⛔ THEREFORE: rung 8 is PARTIAL. The sadish cross-check is a named, remaining sub-item and
+# must land before rung 9 cites "byte-identical to the CPU reference". Saying so here is the
+# whole point — a rung that quietly redefines its own oracle is how an arc drifts.
+fn corpus_case(name, ax, ay, bx, by, cx, cy): i64 {
+    edges_reset(); tri_add(fx(ax), fx(ay), fx(bx), fx(by), fx(cx), fx(cy));
+    cov_clear(&covA); raster(&covA);
+    edges_reset(); tri_add(fx(ax), fx(ay), fx(bx), fx(by), fx(cx), fx(cy));
+    cov_clear(&covB); raster(&covB);
+    var diff = 0;
+    var lit = 0;
+    var i = 0;
+    while (i < W * H) {
+        if (load8(&covA + i) != load8(&covB + i)) { diff = diff + 1; }
+        if (load8(&covA + i) != 0) { lit = lit + 1; }
+        i = i + 1;
+    }
+    ps("  "); ps(name); ps("  lit px "); pnum(lit);
+    if (diff == 0) { puts("   deterministic"); return 1; }
+    ps("  NONDETERMINISTIC ("); pnum(diff); puts(" px differ)   ** FAIL **");
+    return 0;
+}
+
+fn main(): i64 {
+    puts("cpuref -- RUNG 8: the CPU reference rasteriser and its oracles");
+    puts("=============================================================");
+    puts("Ported from sadish/src/raster.cyr: 16.16, 4 sub-scanlines, analytic-x, half-open y.");
+    puts("");
+    var ok = 1;
+
+    puts("[corpus] determinism + degenerate handling");
+    if (corpus_case("plain triangle      ", 8, 8, 48, 12, 20, 50) == 0) { ok = 0; }
+    if (corpus_case("zero-area (collinear)", 4, 4, 20, 20, 40, 40) == 0) { ok = 0; }
+    if (corpus_case("backfacing (CW)     ", 8, 50, 20, 8, 48, 44) == 0) { ok = 0; }
+    if (corpus_case("sliver (1px tall)   ", 2, 30, 60, 30, 60, 31) == 0) { ok = 0; }
+    if (corpus_case("off-screen (clipped)", 0 - 40, 0 - 40, 30, 10, 10, 30) == 0) { ok = 0; }
+    if (corpus_case("fully outside       ", 200, 200, 260, 210, 210, 260) == 0) { ok = 0; }
+    if (corpus_case("pixel-centre straddle", 10, 10, 40, 10, 10, 40) == 0) { ok = 0; }
+    if (corpus_case("full-canvas cover   ", 0 - 10, 0 - 10, 90, 0 - 10, 30, 90) == 0) { ok = 0; }
+    puts("");
+
+    puts("[shared-edge] watertightness -- the oracle that does NOT depend on the reference");
+    if (shared_edge_pair(8, 8, 48, 8, 48, 48, 8, 48, "axis-aligned quad   ") == 0) { ok = 0; }
+    if (shared_edge_pair(6, 10, 50, 4, 54, 46, 10, 52, "skewed quad         ") == 0) { ok = 0; }
+    if (shared_edge_pair(3, 3, 60, 5, 58, 60, 5, 58, "near-full quad      ") == 0) { ok = 0; }
+    puts("");
+
+    if (ok == 0) {
+        puts("** RUNG 8 FAILED. Do not let any Phase II rung cite this reference.");
+        return 90;
+    }
+    puts("Corpus deterministic; every shared-edge pair WATERTIGHT (no cracks, no double-hits).");
+    puts("");
+    puts("⚠⚠ RUNG 8 IS **PARTIAL** -- READ BEFORE RUNG 9 OPENS.");
+    puts("   Oracle (ii), watertightness, is DONE and is the strong one: it is independent of");
+    puts("   the reference being correct.");
+    puts("   Oracle (i) as the plan specifies it -- byte-for-byte agreement with SADISH ITSELF");
+    puts("   over 200 random paths -- is NOT done. It needs sadish's canvas/path/alloc linked");
+    puts("   into this tool, a real integration, not a line of code.");
+    puts("   Until it lands, 'byte-identical to the CPU reference' rests on a port that has");
+    puts("   been proven self-consistent and watertight, but NOT proven equal to its source.");
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

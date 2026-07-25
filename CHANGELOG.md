@@ -42,6 +42,30 @@ wrong *picture* and never a fault.
 ⚠ **Honest limit:** agreement PER ENCODING CLASS, not over all 11 shaders instruction-for-instruction
 — doing that by hand would be the same hand-assembly whose trustworthiness is in question.
 
+### Added — rung 8 `cpu-ref`: the CPU reference rasteriser (HOST, 0 burns) — ⚠ **PARTIAL**
+
+`gpu-test/cpuref.cyr`, `exit 95`. A direct port of `sadish/src/raster.cyr`'s inner math: 16.16 fixed
+point, 4 vertical sub-scanlines, analytic exact x-overlap, **half-open** `sy >= ylo && sy < yhi`.
+
+**Oracle (ii) — watertightness — is DONE, and it is the strong one**, because it does not depend on
+the reference being correct. Three shared-edge quad pairs split on an exact diagonal: **0
+double-covered, 0 cracked** against the undivided quad. A crack or double-hit is a fill-rule bug no
+agreement test can catch — a port reproduces its source's cracks faithfully — and on the GPU it
+presents as flicker that reads as a coherence problem and gets chased for burns.
+
+⚠ Tolerance is **±1, not 0**: two separately-rounded coverages summed against one rounded coverage
+differ by at most 1 ULP by construction. Worst observed delta = 1. Recorded because a ±1 tolerance
+introduced silently is how an oracle stops being byte-exact.
+
+Corpus of 8 — plain, zero-area/collinear, backfacing, 1px sliver, clipped, fully-outside,
+pixel-centre-straddling, full-canvas — all deterministic.
+
+⛔⛔ **Oracle (i) is NOT done.** The plan specifies byte-for-byte agreement with **sadish itself** over
+200 random paths; that needs sadish's canvas/path/alloc linked into the tool, which is a real
+integration. **Until it lands, "byte-identical to the CPU reference" rests on a port proven
+self-consistent and watertight but not proven equal to its source, and rung 9 may not cite oracle
+(i).** Reported now, before rung 9 opens, as the plan requires.
+
 ### Fixed — `DIG_MODE` restore-on-exit (carried from the 1.56.15 work)
 
 ## [1.56.15] - 2026-07-25
