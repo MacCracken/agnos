@@ -171,6 +171,17 @@ mirror-able; both agents code to it, and each row **moves to 🔒 FROZEN (update
 | 39 | `blit` | src | w | h | dstxy `+`scale `+`defer | 0 / -1 | copies a `w`×`h` block of 32bpp pixels from `src` (packed `w*4`/row) to the framebuffer at (dx,dy); `a4` = `(defer[40]<<40)\|(scale[39:32]<<32)\|(dy[31:16]<<16)\|dx[15:0]`. `scale` 0/1 = 1:1 (byte-identical), ≥2 = integer block scale via a 32 KB src-major rowbuf; dst rect clipped to FB. Memory-safety gate `w*scale ≤ 8192`; `scale > 16` rejects. **`defer` (a4 bit40, P7 1.55.x):** 0 = auto-present after the blit (every existing caller, byte-identical); 1 = blit into the back buffer but DON'T flip — a compositor accumulates windows across many deferred blits, then calls `present`#84 once. THE ring-3 FB path (`fb_phys` stays unexposed). **cyrius-doom** (1.43.4; scale 1.44.20; defer 1.55.x) |
 | 84 | `present` | — | — | — | — | 1 / 0 | **P7 (1.55.x)** — flip the accumulated double-buffer back buffer to the scanout, tear-free + vsync-paced. The explicit half of the blit/present split (pairs with `blit`#39's `defer` bit): a compositor blits its windows deferred, then calls this ONCE to show the frame. `1` = presented; `0` = nothing to present (double-buffer not armed / direct-FB path — the deferred blits already hit the live FB). **aethersafha** |
 | 85 | `gpu_fill` | color | — | — | — | 0 / -1 | **P9 (1.55.x)** — GPU-clear the blit back-buffer to a 32-bit xRGB8888 `color` via a **CP-DMA** fill (a PM4 `DMA_DATA` constant-fill on the compute ring — offloads a full-screen clear off the CPU); pairs with `present`#84 to show it. `0` = filled; `-1` = no usable display (QEMU / no pipe) or the fill failed. Ring-3 names only the color — the kernel targets the back buffer, so no MC address crosses the boundary (same discipline as `blit`#39). Arms the double-buffer lazily. **aethersafha / compositor clears** |
+| 82 | `gpu_dispatch` | a | b | c | — | 0 / -1 | integer compute dispatch on the MEC ring — the ring-3 seam onto the sovereign GPU compute path (`a`/`b` operand shm slots, `c` result slot). The first syscall that let ring 3 run a shader at all; every op below stands on it. **tentib / ML** (1.54.x) |
+| 83 | `gpu_dispatch_f64` | a | b | c | — | 0 / -1 | the f64 peer of `#82`, rosnet-bit-correct against the CPU. **rosnet / ML** (1.54.x) |
+| 86 | `shm_create_gpu` | size | — | — | — | id / -1 | GPU-VISIBLE peer of `shm_create`#71: the page comes from the GPU **carveout**, so it has an MC address the CP-DMA engine can read. ⛔ A `#71` page is system RAM and the GPU **cannot reach it at all** (bus-master is off by design) — a GPU composite from a `#71` buffer is impossible, not merely slow. Same `shm_write`#72 / `shm_read`#73 / `shm_free`#74 afterwards. `-1` when there is no carveout (QEMU) — the caller falls back to `#71` + the CPU path. **aethersafha / gpu-test** |
+| 87 | `gpu_blit_shm` | id | wh | dstxy | — | 0 / -1 | GPU-composite a client surface from its carveout shm slot straight into the blit back buffer. Replaces BOTH the shm→userland read and the per-pixel composite — the pixels never leave GPU-visible memory. `wh=(h<<16)\|w`, `dstxy=(dy<<16)\|dx`. Pair with `#85` + `#84`. **aethersafha** |
+| 88 | `gpu_fill_rect` | color | wh | dstxy | — | 0 / -1 | the RECT peer of `gpu_fill`#85 — the window-chrome primitive (~10 per window per frame, formerly per-pixel on the CPU). REJECTS off-screen rects rather than clipping; the compositor owns clipping and queries its bounds from `#89`. **aethersafha** |
+| 89 | `gpu_caps` | buf | len (≥32) | — | — | 0 / -1 | capability + **back-buffer** geometry probe (8× u32, 32 B). ⚠ These are the bounds a compositor must clip to before `#87`/`#88`/`#92`, and they are NOT what `fbinfo`#38 reports — `#38` describes the CONSOLE framebuffer. Also reports armed-ness and the carveout slot budget, and carries the **op-support mask** a caller must consult before issuing any `#92` op code. **aethersafha** |
+| 90 | `gpu_readback_shm` | id | wh | srcxy | — | 0 / -1 | the INVERSE of `#87`: GPU-copy a rect OUT of the back buffer into the client's carveout slot — the screen-capture / read-pixels primitive. ⚠ Without it a compositor reading its own shm sees **STALE** pixels, because the composited frame lives in the kernel's GPU back buffer, not the client page. ⚠ **LINUX COLLISION:** `#90` = `chmod(path,mode)`, a metadata WRITE; the file-level `#ifdef CYRIUS_TARGET_AGNOS` gate in `cyrius/lib/syscalls.cyr` is the barrier off-agnos. |
+| 91 | `gpu_blit_bb` | srcxy | wh | dstxy | — | 0 / -1 | GPU rect COPY **within** the back buffer (move a window, scroll a region), one CP-DMA per row, overlap-safe (downward moves copy bottom-up). ⚠ **LINUX COLLISION, and this one is load-bearing:** `#91` = `fchmod(fd,mode)`, and `srcxy=(0,0)` packs to fd 0 = stdin, so an off-agnos call would plausibly **SUCCEED**. The `#ifdef CYRIUS_TARGET_AGNOS` gate is the only barrier. **aethersafha** |
+| 92 | `gpu_shader_op` | desc_uva | len (bytes) | — | — | 0 / packed −ve | **THE shader-compositing seam.** ONE number, an ARRAY of 64-byte op records, the operation selected by an op code INSIDE the payload (arc decision D-3) — new ops need no new syscall number. No pointer and no MC address appears in a record: sources are named by shm slot id and resolved in-kernel. **Validates EVERY op before dispatching ANY**, so a rejected batch draws NOTHING, and rejects rather than clips. Sources must be PREMULTIPLIED (`c ≤ a`). `len` is a BYTE length, not an op count — a future kernel with a wider record rejects a v1 caller on `len % stride`, where an op count would have passed and misparsed silently. Returns `0`, or `-((idx<<8)\|reason)` naming the failing op; `-1` still means "no GPU here". **Op codes and reasons: §3.4.** ⚠ **LINUX COLLISION:** `#92` = `chown(path,uid,gid)`, a metadata WRITE, and `arg1` is now a real user VA ≥ `0x200000`, so off-agnos the call would get a READABLE path pointer and could plausibly succeed. **aethersafha / sadish** |
+| 93 | `gpu_modeset_op` | desc_uva | len (bytes) | — | — | 0 / packed −ve | **THE MODESET SEAM** (MD-4). Same record-array shape as `#92`, deliberately a DIFFERENT number: modeset is a distinct capability class from compositing. Write ops sit behind the **H2 arm-once latch** (`/.modeset-armed`) — the kernel never auto-disarms, and a blocked boot refuses. ⚠ **LINUX COLLISION:** `#93` = `fchown(fd,uid,gid)`; `arg1` is a userland VA so a stray off-agnos call is ~always `EBADF`. **`/bin/modeset`** |
+| 94 | `gpu_recover_op` | arm | — | — | — | 95 / −ve | 3D arc RUNG 5 — the GPU hang/recovery battery. ⛔ The arms that **wedge** the GPU are COMPILED OUT without `GPU_RECOVER`, so a production kernel cannot be asked to hang itself; the **recovery** half is always present, because a shipping kernel must survive a hang it did not ask for. ⭐ Arm D established that **the console survives a dead GPU**. **`/bin/gpuwedge`** |
 | 40 | `uptime_ms` | — | — | — | — | ms | monotonic milliseconds since boot, returned in `rax` (from `timer_ticks` @ 100 Hz). No args, no fault surface. **ring-3 timing / DOOM** (1.43.5) |
 | 41 | `sleep_ms` | ms | — | — | — | 0 | block the caller ~`ms` ms by halting until the 100 Hz timer (capped 1 h). An IF-window syscall — `preempt_disable()`-gated (1.44.1) so the shared kstack stays serial under preemption. **ring-3 timing / DOOM** (1.43.5) |
 | 42 | `kbscan` | buf | max | — | — | count | NON-BLOCKING raw-scancode drain into `buf` (up to `max`) for ring-3 input (games need key up/down, not cooked lines). Bounded `hid_poll` window; `preempt_disable()`-gated IF-window. **cyrius-doom** (1.43.x) |
@@ -202,6 +213,84 @@ lookup it introduces is exactly what a future `lstat` would reuse if a consumer 
 `create` is **not** a separate syscall — file creation is `open(7)` with the `AO_CREAT` flag (§3.3),
 subsuming `touch` (CREAT) and `echo >` (CREAT|TRUNC). `chdir`/`getcwd` are **not** in the ABI: **CWD is
 userland-owned** — `agnsh` tracks its own CWD and passes **absolute paths** to every syscall.
+
+### 3.4 `gpu_shader_op` #92 — op codes and record layout
+
+> Added at 3D-arc **rung 9a** (2026-07-25). The plan flagged that this surface was undocumented while
+> the arc was about to add op codes to it (`gpu.md`, adversarial item 6) — this section closes that.
+
+A `#92` call passes an **array** of 64-byte records. Every dword is `u32` little-endian; **dword `i`
+lives at byte offset `i*4`**.
+
+| dword | byte | name | meaning |
+|---|---|---|---|
+| 0 | 0 | `op` | the op code (table below). Capped at `0x1F` — the code IS its bit index in `#89`'s support mask. |
+| 1 | 4 | `flags` | ⛔ **Nothing is accepted here yet, on purpose.** A non-zero flags word is REJECTED. A flag that is accepted and ignored is how a caller silently gets behaviour it did not ask for. |
+| 2 | 8 | `src_id` / `dst_id` | source shm slot (`BLEND_RECT`), or destination mask slot (`EDGE_COV`) |
+| 3 | 12 | `mask_id` / `edge_id` | coverage or glyph mask slot; the edge-array slot for `EDGE_COV` |
+| 4 | 16 | `wh` | `(h<<16)\|w` |
+| 5 | 20 | `dstxy` | `(dy<<16)\|dx` — framebuffer destination. ⛔ **Not defined by `EDGE_COV`** (see below). |
+| 6–8 | 24–32 | reserved | `srcxy` / `src_pitch` / `mask_pitch`, reserved for "0 = derive" |
+| 9 | 36 | `color0` / `n_edges\|rule` | premultiplied colour; for `EDGE_COV`, `(rule<<16)\|n_edges` |
+| 10 | 40 | `color1` | gradient end stop |
+| 11–15 | 44–60 | reserved | must be zero |
+
+⭐ **The rule that makes the reserved dwords safe to fill in later:** *every dword an op does not define
+MUST be zero.* A v1 caller physically cannot ship garbage in a field a future kernel will read, so
+`srcxy` / `src_pitch` / `mask_pitch` can gain meaning with no ABI break.
+
+| op | name | defines | source slot | notes |
+|---|---|---|---|---|
+| `0x00` | `NOP` | `op flags` | — | no geometry, no slot, no shader arm |
+| `0x01` | `BLEND_RECT` | `op flags src_id wh dstxy` | `w*4*h` | src-over alpha blend, premultiplied |
+| `0x02` | `BLEND_COV` | `op flags mask_id wh dstxy color0` | `w*h` | 8bpp coverage × uniform colour |
+| `0x03` | `GLYPH_1BPP` | `op flags mask_id wh dstxy color0` | `((w+7)/8)*h` | 1bpp bitmap expand |
+| `0x04` | `GRAD_LINEAR` | `op flags wh dstxy color0 color1` | — | two-stop vertical gradient, reads zero source bytes |
+| `0x08` | `EDGE_COV` | `op flags dst_id edge_id wh n_edges\|rule` | `n_edges*16` | **the rasteriser** — 3D arc rung 9 |
+
+**`EDGE_COV` (`0x08`) in detail.** An edge array (four `i32` in **16.16** per edge: `x0,y0,x1,y1`) plus a
+winding rule, rasterised to an **8bpp coverage mask** in a second carveout slot. A triangle is a 3-edge
+closed path; nothing about the kernel is triangle-specific.
+
+- ⛔ **`dstxy` is NOT defined by this op** and must be zero. `EDGE_COV` never touches the framebuffer —
+  it rasterises into a mask whose origin IS `(0,0)`. Placement is a separate `BLEND_COV` record.
+  *(This is a deliberate deviation from the plan's provisional field list in `gpu.md` §op-table, which
+  showed `dstxy`. Accepting a coordinate and ignoring it is the exact failure the `flags` rule refuses.)*
+- ⛔ **Vertex transform stays on the CPU in ring 3** (arc decision TD-4) — the kernel receives
+  SCREEN-SPACE edges.
+- `n_edges` ∈ `[3, 256]`. **2 edges is a REJECT, not an empty result**: two edges cannot enclose area, so
+  it would rasterise to a silent all-zero mask — indistinguishable from a dead shader, the one confusion
+  this rung cannot afford.
+- Mask dimensions cap at 4096 per side. A **reject**, never a clamp.
+- The edge slot and the destination slot must be **different slots** (`GPO_E_ALIAS`).
+
+**Failure encoding.** The call returns `0`, or a packed negative naming WHICH op failed and why:
+
+```
+e = 0 - rc ;  idx = e >> 8 ;  reason = e & 0xFF
+```
+
+`reason` is always ≥ 1, so a valid failure never encodes as 0, and `GPO_E_NOGPU` at idx 0 encodes as
+exactly `-1` — which keeps every pre-existing `if (rc == -1)` caller working unchanged.
+
+| reason | name | scope | meaning |
+|---|---|---|---|
+| 1 | `NOGPU` | call | GPU / display unavailable |
+| 2 | `BADOP` | op | unknown, reserved, or not implemented in this kernel |
+| 3 | `BADSLOT` | op | slot invalid/free, or PMM-backed (`#71`) so the GPU cannot read it |
+| 4 | `SLOTSIZE` | op | source does not fit its slot under this op's stride rule |
+| 5 | `BOUNDS` | op | rect off-screen — REJECT, never clip |
+| 6 | `DIM` | op | `w < 1`, `h < 1`, or over the per-side cap |
+| 7 | `ARM` | op | the shader could not be made resident |
+| 8 | `DISPATCH` | op | the dispatch watchdog expired (pass 2 only) |
+| 11 | `DESC` | call | bad `desc_uva` / `len`, or the copy-in failed |
+| 12 | `RESERVED` | op | a reserved dword or an undefined flag bit was non-zero |
+| 13 | `UNPROVEN` | call | the dispatch envelope is unproven on this boot |
+| 15 | `BATCH` | call | the batch's single completion fence never retired. ⚠ `idx` is 0 and **carries no meaning** — with one submission there is one marker, so the failing op is not identifiable and reporting an index would be a fabrication. |
+| 16 | `EDGEBUF` | op | edge slot too small for `n_edges`, or `n_edges` out of range |
+| 17 | `DSTSLOT` | op | destination mask slot invalid/free/PMM-backed/too small |
+| 18 | `RULE` | op | winding rule is neither `NONZERO` (0) nor `EVENODD` (1) |
+| 19 | `ALIAS` | op | edge slot and destination mask slot are the same slot |
 
 ### 3.3 ✅ `open` flags (a3) — agnos-native bits
 

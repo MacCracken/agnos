@@ -1143,6 +1143,11 @@ var GPU_GRAD_SHADER_SUBOFF     = 0x53000;    # slot 3 — grad_linear blob (70 d
 # --- plan-S4: v_perm_b32 byte crossbar + the VOP3P packed blend ----------------------------------------
 var GPU_PERM_SHADER_SUBOFF     = 0x54000;    # slot 4 — perm blob (34 dwords / 136 B)
 var GPU_PK_SHADER_SUBOFF       = 0x55000;    # slot 5 — blend_pk blob (61 dwords / 244 B)
+# --- 3D arc rung 9: the edge rasteriser (edge_cov.s) ---
+# ⚠ RESERVED AT 9a, WRITTEN AT 9b. The slot is claimed here and not one line later so that the arena
+# audit (rung 6) and check.sh's unaliased-slot gate cover it from the moment the ABI exists — a slot
+# that appears at the same commit as the blob that fills it has never once been audited empty.
+var GPU_EDGE_SHADER_SUBOFF     = 0x56000;    # slot 6 — edge_cov blob (rung 9b)
 # ⚠ blend_pk needs its OWN RSRC1 — 12 VGPRs but 24 SGPRs, where perm and blend_premul want the 16-SGPR
 # _V12. Reusing _V12 here UNDER-ALLOCATES the SGPR file, and the first casualty is the vcc carry chain in
 # the address arithmetic: lanes then read and write the WRONG PIXELS, or run off the end of the arena into

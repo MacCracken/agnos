@@ -1,0 +1,259 @@
+# refraster.cyr — THE CPU reference rasteriser. ONE implementation, included by every tool
+# that claims agreement with it. 3D arc, rung 9b bite B0.
+#
+# ============================================================================================
+# WHY THIS FILE EXISTS — "byte-identical to the CPU reference" had THREE referents
+# ============================================================================================
+# Before this extraction the same rasteriser was hand-transcribed into `cpuref.cyr`,
+# `refagree.cyr` and `tileown.cyr`, each with its own array bounds and width constants. That is
+# the ATOM_DRY defect class one level up: three artifacts differing in name but *supposed* to
+# not differ in behaviour, with nothing enforcing it. ⛔ Cyrius shadows duplicate `fn`s
+# silently and warn-only ([[reference_cyrius_duplicate_fn_shadow]]), so a divergence between
+# them would not even produce an error — the last definition would quietly win.
+#
+# Rung 9b's whole oracle is a byte-diff against "the reference". That phrase needs exactly one
+# referent, and this file is it.
+#
+# ⛔ INCLUDE-ONLY. No `main`, no `_entry`. `cpuref.cyr` is a *program*; including it would give
+# duplicate `main`/`_entry` and — per the shadowing rule above — the wrong one would run.
+#
+# ============================================================================================
+# ⭐ THE `accrow` OVERFLOW — a latent fatal IN THE ORACLE, fixed here
+# ============================================================================================
+# The original declared `var accrow[64]` at module scope. Module-scope `var X[N]` allocates
+# N x u64 ([[cyrius-var-array-u64-units]]), so that is 64 slots — and `span_add` indexes it by
+# pixel x up to `W`. At the shipped W=64 that lands exactly on the last slot and is correct, so
+# the bug has never fired. At ANY W > 64 it writes past the end into `crx`/`crd`, which are
+# declared on the very next line.
+#
+# ⚠ Read what that would have meant: the corruption is in the REFERENCE, not in the shader. It
+# would present as the GPU disagreeing with the CPU on wide masks — a plausible wrong triangle —
+# and the entire investigation would have been pointed at the shader. Rung 9b's corpus requires
+# a 200x64 case and a 128-wide case, so this stops being latent the moment that corpus lands.
+#
+# The fix is a declared `MAXW` and a RUN-TIME refusal, not a comment saying "keep W <= 64". A
+# comment is not a check, and this is the file every later rung cites.
+
+# ---- sadish's fixed-point constants, reproduced exactly -----------------------------------
+var R_SHIFT = 16;
+var R_ONE   = 65536;
+var R_SS    = 4;              # SD_FILL_SS
+
+fn r_fixed_mul(a, b): i64 { return (a * b) >> R_SHIFT; }
+
+# ---- geometry buffers ---------------------------------------------------------------------
+# W/H are RUN-TIME settable via rr_set_dims(); the arrays are sized by the compile-time
+# maxima below and the setter refuses anything that would not fit.
+var RR_MAXW = 512;            # accrow slots — the widest mask any corpus case may use
+var RR_MAXH = 512;
+var RR_MAXX = 512;            # crossing list: 2 per edge worst case, but MAXE bounds it
+
+var W = 64;
+var H = 64;
+var MAXE = 64;
+var ex0[64]; var ey0[64]; var ex1[64]; var ey1[64];
+var n_edges = 0;
+# ⚠ 512 slots, NOT 64. See the header. `span_add` indexes this by pixel x up to W.
+var accrow[512];
+var crx[512]; var crd[512];
+var rr_dim_fault = 0;         # 1 = a dimension was refused; every consumer must check it
+
+# rr_set_dims(w, h) -> 1 ok / 0 REFUSED. A refusal is loud and sticky: rr_dim_fault latches so
+# a caller that ignores the return value still cannot report a green result.
+#
+# ⛔ REFUSES rather than clamps. A clamped dimension would silently rasterise a different shape
+# than the caller asked for, and the diff against the GPU would then be attributed to the GPU.
+fn rr_set_dims(w, h): i64 {
+    if (w < 1) { rr_dim_fault = 1; return 0; }
+    if (h < 1) { rr_dim_fault = 1; return 0; }
+    if (w > RR_MAXW) { rr_dim_fault = 1; return 0; }
+    if (h > RR_MAXH) { rr_dim_fault = 1; return 0; }
+    W = w;
+    H = h;
+    return 1;
+}
+
+fn edges_reset(): i64 { n_edges = 0; return 0; }
+fn edge_add(x0, y0, x1, y1): i64 {
+    # ⚠ Degenerate horizontal edges contribute no crossings under the half-open rule and are
+    # dropped here, exactly as sadish's y-range test drops them (ylo == yhi can never satisfy
+    # both sy >= ylo and sy < yhi). Dropping them explicitly makes the corpus's zero-area and
+    # sliver cases behave identically in both implementations rather than by accident.
+    if (y0 == y1) { return 0; }
+    if (n_edges >= MAXE) { return 0; }
+    store64(&ex0 + n_edges * 8, x0); store64(&ey0 + n_edges * 8, y0);
+    store64(&ex1 + n_edges * 8, x1); store64(&ey1 + n_edges * 8, y1);
+    n_edges = n_edges + 1;
+    return 0;
+}
+
+fn tri_add(ax, ay, bx, by, cx, cy): i64 {
+    edge_add(ax, ay, bx, by);
+    edge_add(bx, by, cx, cy);
+    edge_add(cx, cy, ax, ay);
+    return 0;
+}
+
+fn fx(v): i64 { return v << R_SHIFT; }
+
+# ---- the analytic-x span accumulator — sadish's sd_span_add ---------------------------------
+fn span_add(xs, xe, weight): i64 {
+    if (xe <= xs) { return 0; }
+    var lo = xs; if (lo < 0) { lo = 0; }
+    var wmax = W << R_SHIFT;
+    var hi = xe; if (hi > wmax) { hi = wmax; }
+    if (hi <= lo) { return 0; }
+    var px = lo >> R_SHIFT;
+    var stop = 0;
+    while (stop == 0) {
+        if (px >= W) { stop = 1; }
+        if (px < W) {
+            var pl = px << R_SHIFT;
+            if (pl >= hi) { stop = 1; }
+            if (pl < hi) {
+                var pr = (px + 1) << R_SHIFT;
+                var a = lo; if (a < pl) { a = pl; }
+                var b = hi; if (b > pr) { b = pr; }
+                if (b > a) {
+                    var add = r_fixed_mul(weight, b - a);
+                    store64(&accrow + px * 8, load64(&accrow + px * 8) + add);
+                }
+                px = px + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+# ---- the reference rasteriser — sadish's sd_fill_impl, nonzero rule -------------------------
+fn raster(cov): i64 {
+    var weight = R_ONE / R_SS;
+    var py = 0;
+    while (py < H) {
+        var zi = 0;
+        while (zi < W) { store64(&accrow + zi * 8, 0); zi = zi + 1; }
+        var s = 0;
+        while (s < R_SS) {
+            # ⚠ EXACT sub-scanline placement. A different rounding here shifts every edge by a
+            # fraction of a pixel and shows up as a uniform ±1 coverage difference — which is
+            # exactly the degradation the plan warns must be REPORTED, not absorbed.
+            var sy = (py << R_SHIFT) + (s * R_ONE + (R_ONE >> 1)) / R_SS;
+            var nc = 0;
+            var ei = 0;
+            while (ei < n_edges) {
+                var ay = load64(&ey0 + ei * 8);
+                var by = load64(&ey1 + ei * 8);
+                var ylo = ay; var yhi = by; var dir = 1;
+                if (ay > by) { ylo = by; yhi = ay; dir = 0 - 1; }
+                # ⛔ THE HALF-OPEN RULE. See the header: this single pair of comparisons is what
+                # makes a shared edge belong to exactly one triangle.
+                if (sy >= ylo) {
+                    if (sy < yhi) {
+                        var ax = load64(&ex0 + ei * 8);
+                        var bx = load64(&ex1 + ei * 8);
+                        var xx = ax + ((bx - ax) * (sy - ay)) / (by - ay);
+                        store64(&crx + nc * 8, xx);
+                        store64(&crd + nc * 8, dir);
+                        nc = nc + 1;
+                    }
+                }
+                ei = ei + 1;
+            }
+            # insertion sort by x — sadish's, same algorithm so ties order identically
+            var a = 1;
+            while (a < nc) {
+                var kx = load64(&crx + a * 8);
+                var kd = load64(&crd + a * 8);
+                var b = a - 1;
+                var stop = 0;
+                while (stop == 0) {
+                    if (b < 0) { stop = 1; }
+                    if (b >= 0) {
+                        if (load64(&crx + b * 8) > kx) {
+                            store64(&crx + (b + 1) * 8, load64(&crx + b * 8));
+                            store64(&crd + (b + 1) * 8, load64(&crd + b * 8));
+                            b = b - 1;
+                        }
+                        if (load64(&crx + b * 8) <= kx) { stop = 1; }
+                    }
+                }
+                store64(&crx + (b + 1) * 8, kx);
+                store64(&crd + (b + 1) * 8, kd);
+                a = a + 1;
+            }
+            # nonzero winding -> covered spans
+            var wind = 0;
+            var ci = 0;
+            while (ci < nc - 1) {
+                wind = wind + load64(&crd + ci * 8);
+                if (wind != 0) {
+                    span_add(load64(&crx + ci * 8), load64(&crx + (ci + 1) * 8), weight);
+                }
+                ci = ci + 1;
+            }
+            s = s + 1;
+        }
+        var px = 0;
+        while (px < W) {
+            var c = (load64(&accrow + px * 8) * 255) >> R_SHIFT;
+            if (c > 255) { c = 255; }
+            store8(cov + py * W + px, c);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return 0;
+}
+
+fn cov_clear(cov): i64 {
+    var i = 0;
+    while (i < W * H) { store8(cov + i, 0); i = i + 1; }
+    return 0;
+}
+
+# rr_selftest() -> 1 / 0. Proves the extraction's OWN invariants, so a consumer that includes
+# this file can assert them cheaply rather than trusting the header.
+#
+# ============================================================================================
+# ⚠⚠ THE FIRST VERSION OF THIS FUNCTION WAS A FALSE GATE, AND THE MUTATION CAUGHT IT
+# ============================================================================================
+# It checked only that `rr_set_dims` REFUSED out-of-range dimensions — i.e. it tested the
+# DECLARED limit `RR_MAXW`, never the storage behind it. Shrinking `accrow` back to 64 slots
+# left it passing, because nothing in the test ever indexed accrow past 63.
+#
+# That is exactly the failure class this whole file exists to prevent, reproduced inside the
+# guard against it: a green assertion that cannot go red. The check below therefore reproduces
+# the REAL failure MECHANISM instead of restating the declaration.
+#
+# ⛔ It depends on `crx` being laid out immediately after `accrow` in declaration order — which
+# is not a guarantee Cyrius makes in general, but IS precisely the adjacency the original bug
+# corrupted. If a future Cyrius reorders module globals this check silently weakens rather than
+# breaking, so keep the mutation calibration (shrink accrow to 64, expect FAIL) in the bite log.
+fn rr_selftest(): i64 {
+    var ok = 1;
+    if (rr_set_dims(0, 8) != 0)            { ok = 0; }      # w < 1 refused
+    if (rr_set_dims(8, 0) != 0)            { ok = 0; }      # h < 1 refused
+    if (rr_set_dims(RR_MAXW + 1, 8) != 0)  { ok = 0; }      # over-wide refused
+    if (rr_dim_fault != 1)                 { ok = 0; }      # the latch armed
+    rr_dim_fault = 0;
+    if (rr_set_dims(RR_MAXW, 4) != 1)      { ok = 0; }      # the declared maximum is USABLE
+    if (rr_dim_fault != 0)                 { ok = 0; }
+
+    # ⭐ THE REAL CHECK. Arm a canary in the neighbour, then write across accrow at exactly the
+    # indices span_add would use at RR_MAXW. If accrow is undersized the write lands on crx and
+    # the canary dies — which is the original bug, fired on purpose.
+    store64(&crx + 0, 0x5AFEC0DE);
+    var i = 0;
+    while (i < RR_MAXW) { store64(&accrow + i * 8, 0x1111 + i); i = i + 1; }
+    if (load64(&crx + 0) != 0x5AFEC0DE) { ok = 0; }         # accrow overflowed into crx
+    # and the pattern must have survived intact — a too-short accrow that wrapped would show here
+    i = 0;
+    while (i < RR_MAXW) {
+        if (load64(&accrow + i * 8) != 0x1111 + i) { ok = 0; }
+        i = i + 1;
+    }
+    store64(&crx + 0, 0);
+
+    if (rr_set_dims(64, 64) != 1)          { ok = 0; }      # back to the shipped default
+    return ok;
+}

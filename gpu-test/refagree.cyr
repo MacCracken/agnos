@@ -48,128 +48,21 @@ fn pnum(v): i64 {
     return 0;
 }
 
+# ⭐ B0 (rung 9b): this tool used to carry its OWN THIRD COPY of the rasteriser. That made its
+# 200/200 result prove that *some* copy agrees with sadish — not the copy `cpuref.cyr` uses and
+# not the one rung 9b diffs the GPU against. Re-pointing it at the single shared reference is
+# what makes rung 8's oracle (i) actually cover the artifact every later rung cites.
+#
+# ⛔ THIS IS STILL NOT A TAUTOLOGY, and that is the whole reason the rung exists. The comparison
+# is sadish-the-original (heap canvas, verb/point path, curve flattening, clip node) against a
+# hand re-implementation with its own buffers, edge list and loop structure. They share an
+# ALGORITHM, not a line of code. What changed is only WHICH re-implementation is under test —
+# and it is now the right one.
+include "refraster.cyr"
+
 var RW = 64;
 var RH = 64;
-var R_SHIFT = 16;
-var R_ONE   = 65536;
-var R_SS    = 4;
-
-# ---- the PORT under test — cpuref.cyr's rasteriser, same math, separate implementation ------
-var ex0[64]; var ey0[64]; var ex1[64]; var ey1[64];
-var n_edges = 0;
-var accrow[64];
-var crx[64]; var crd[64];
 var covPort[4096];
-
-fn r_fixed_mul(a, b): i64 { return (a * b) >> R_SHIFT; }
-fn edges_reset(): i64 { n_edges = 0; return 0; }
-fn edge_add(x0, y0, x1, y1): i64 {
-    if (y0 == y1) { return 0; }
-    if (n_edges >= 64) { return 0; }
-    store64(&ex0 + n_edges * 8, x0); store64(&ey0 + n_edges * 8, y0);
-    store64(&ex1 + n_edges * 8, x1); store64(&ey1 + n_edges * 8, y1);
-    n_edges = n_edges + 1;
-    return 0;
-}
-
-fn span_add(xs, xe, weight): i64 {
-    if (xe <= xs) { return 0; }
-    var lo = xs; if (lo < 0) { lo = 0; }
-    var wmax = RW << R_SHIFT;
-    var hi = xe; if (hi > wmax) { hi = wmax; }
-    if (hi <= lo) { return 0; }
-    var px = lo >> R_SHIFT;
-    var stop = 0;
-    while (stop == 0) {
-        if (px >= RW) { stop = 1; }
-        if (px < RW) {
-            var pl = px << R_SHIFT;
-            if (pl >= hi) { stop = 1; }
-            if (pl < hi) {
-                var pr = (px + 1) << R_SHIFT;
-                var a = lo; if (a < pl) { a = pl; }
-                var b = hi; if (b > pr) { b = pr; }
-                if (b > a) {
-                    store64(&accrow + px * 8,
-                            load64(&accrow + px * 8) + r_fixed_mul(weight, b - a));
-                }
-                px = px + 1;
-            }
-        }
-    }
-    return 0;
-}
-
-fn port_raster(cov): i64 {
-    var weight = R_ONE / R_SS;
-    var py = 0;
-    while (py < RH) {
-        var zi = 0;
-        while (zi < RW) { store64(&accrow + zi * 8, 0); zi = zi + 1; }
-        var s = 0;
-        while (s < R_SS) {
-            var sy = (py << R_SHIFT) + (s * R_ONE + (R_ONE >> 1)) / R_SS;
-            var nc = 0;
-            var ei = 0;
-            while (ei < n_edges) {
-                var ay = load64(&ey0 + ei * 8);
-                var by = load64(&ey1 + ei * 8);
-                var ylo = ay; var yhi = by; var dir = 1;
-                if (ay > by) { ylo = by; yhi = ay; dir = 0 - 1; }
-                if (sy >= ylo) {
-                    if (sy < yhi) {
-                        var ax = load64(&ex0 + ei * 8);
-                        var bx = load64(&ex1 + ei * 8);
-                        store64(&crx + nc * 8, ax + ((bx - ax) * (sy - ay)) / (by - ay));
-                        store64(&crd + nc * 8, dir);
-                        nc = nc + 1;
-                    }
-                }
-                ei = ei + 1;
-            }
-            var a = 1;
-            while (a < nc) {
-                var kx = load64(&crx + a * 8);
-                var kd = load64(&crd + a * 8);
-                var b = a - 1;
-                var stop = 0;
-                while (stop == 0) {
-                    if (b < 0) { stop = 1; }
-                    if (b >= 0) {
-                        if (load64(&crx + b * 8) > kx) {
-                            store64(&crx + (b + 1) * 8, load64(&crx + b * 8));
-                            store64(&crd + (b + 1) * 8, load64(&crd + b * 8));
-                            b = b - 1;
-                        }
-                        if (load64(&crx + b * 8) <= kx) { stop = 1; }
-                    }
-                }
-                store64(&crx + (b + 1) * 8, kx);
-                store64(&crd + (b + 1) * 8, kd);
-                a = a + 1;
-            }
-            var wind = 0;
-            var ci = 0;
-            while (ci < nc - 1) {
-                wind = wind + load64(&crd + ci * 8);
-                if (wind != 0) {
-                    span_add(load64(&crx + ci * 8), load64(&crx + (ci + 1) * 8), weight);
-                }
-                ci = ci + 1;
-            }
-            s = s + 1;
-        }
-        var px = 0;
-        while (px < RW) {
-            var c = (load64(&accrow + px * 8) * 255) >> R_SHIFT;
-            if (c > 255) { c = 255; }
-            store8(cov + py * RW + px, c);
-            px = px + 1;
-        }
-        py = py + 1;
-    }
-    return 0;
-}
 
 # ---- a deterministic PRNG so a divergence is reproducible from its seed alone ---------------
 # ⚠ NOT rand(): a failing case must be re-runnable exactly. xorshift64, seeded per-case.
@@ -201,7 +94,11 @@ fn case_one(seed): i64 {
     edge_add(ax, ay, bx, by);
     edge_add(bx, by, cx, cy);
     edge_add(cx, cy, ax, ay);
-    port_raster(&covPort);
+    # ⚠ The shared reference is dimensioned at RUN TIME and REFUSES anything it cannot hold, so
+    # the dims are set (and the refusal checked) before every raster rather than assumed.
+    if (rr_set_dims(RW, RH) != 1) { puts("refagree: rr_set_dims REFUSED -- reference cannot hold RWxRH"); return 0; }
+    cov_clear(&covPort);
+    raster(&covPort);
 
     # --- SADISH ITSELF, through its real public API: heap canvas, verb/point path, its own
     # flattening and its own fill. Nothing is shared with the port but the algorithm.

@@ -56,121 +56,19 @@ var TILES_X = 8;             # TW / TILE
 var TILES_Y = 8;             # TH / TILE
 var NTILES = 64;
 
-var R_SHIFT = 16;
-var R_ONE   = 65536;
-var R_SS    = 4;
+# ⭐ B0 (rung 9b): this tool carried the THIRD hand-transcription of the rasteriser, and its
+# copy had DIVERGED further than the others — `crx[16]` where cpuref allows 64 crossings, so a
+# shape producing more than 16 crossings on one sub-scanline would have written past the end of
+# the crossing list. Re-pointed at the single shared reference.
+#
+# ⚠ Its rasteriser also took NO argument (it wrote to a fixed `cov`), where the shared one takes
+# the destination. The call site below passes `&cov` explicitly.
+include "refraster.cyr"
 
-# ---- the rasteriser (rung 8's, already proven byte-identical to sadish) ---------------------
-var ex0[16]; var ey0[16]; var ex1[16]; var ey1[16];
-var n_edges = 0;
-var accrow[64];
-var crx[16]; var crd[16];
-var cov[4096];
+# Consumer-side coverage buffer. ⚠ Module-scope var[N] = N x u64 = 8N BYTES, so 512 slots is
+# exactly TW*TH = 4096 bytes of 8bpp coverage. [[cyrius-var-array-u64-units]]
+var cov[512];
 
-fn r_fixed_mul(a, b): i64 { return (a * b) >> R_SHIFT; }
-fn edges_reset(): i64 { n_edges = 0; return 0; }
-fn edge_add(x0, y0, x1, y1): i64 {
-    if (y0 == y1) { return 0; }
-    if (n_edges >= 16) { return 0; }
-    store64(&ex0 + n_edges * 8, x0); store64(&ey0 + n_edges * 8, y0);
-    store64(&ex1 + n_edges * 8, x1); store64(&ey1 + n_edges * 8, y1);
-    n_edges = n_edges + 1;
-    return 0;
-}
-fn span_add(xs, xe, weight): i64 {
-    if (xe <= xs) { return 0; }
-    var lo = xs; if (lo < 0) { lo = 0; }
-    var wmax = TW << R_SHIFT;
-    var hi = xe; if (hi > wmax) { hi = wmax; }
-    if (hi <= lo) { return 0; }
-    var px = lo >> R_SHIFT;
-    var stop = 0;
-    while (stop == 0) {
-        if (px >= TW) { stop = 1; }
-        if (px < TW) {
-            var pl = px << R_SHIFT;
-            if (pl >= hi) { stop = 1; }
-            if (pl < hi) {
-                var pr = (px + 1) << R_SHIFT;
-                var a = lo; if (a < pl) { a = pl; }
-                var b = hi; if (b > pr) { b = pr; }
-                if (b > a) {
-                    store64(&accrow + px * 8,
-                            load64(&accrow + px * 8) + r_fixed_mul(weight, b - a));
-                }
-                px = px + 1;
-            }
-        }
-    }
-    return 0;
-}
-fn raster(): i64 {
-    var weight = R_ONE / R_SS;
-    var py = 0;
-    while (py < TH) {
-        var zi = 0;
-        while (zi < TW) { store64(&accrow + zi * 8, 0); zi = zi + 1; }
-        var s = 0;
-        while (s < R_SS) {
-            var sy = (py << R_SHIFT) + (s * R_ONE + (R_ONE >> 1)) / R_SS;
-            var nc = 0;
-            var ei = 0;
-            while (ei < n_edges) {
-                var ay = load64(&ey0 + ei * 8);
-                var by = load64(&ey1 + ei * 8);
-                var ylo = ay; var yhi = by; var dir = 1;
-                if (ay > by) { ylo = by; yhi = ay; dir = 0 - 1; }
-                if (sy >= ylo) {
-                    if (sy < yhi) {
-                        var ax = load64(&ex0 + ei * 8);
-                        var bx = load64(&ex1 + ei * 8);
-                        store64(&crx + nc * 8, ax + ((bx - ax) * (sy - ay)) / (by - ay));
-                        store64(&crd + nc * 8, dir);
-                        nc = nc + 1;
-                    }
-                }
-                ei = ei + 1;
-            }
-            var a = 1;
-            while (a < nc) {
-                var kx = load64(&crx + a * 8); var kd = load64(&crd + a * 8);
-                var b = a - 1; var stop = 0;
-                while (stop == 0) {
-                    if (b < 0) { stop = 1; }
-                    if (b >= 0) {
-                        if (load64(&crx + b * 8) > kx) {
-                            store64(&crx + (b + 1) * 8, load64(&crx + b * 8));
-                            store64(&crd + (b + 1) * 8, load64(&crd + b * 8));
-                            b = b - 1;
-                        }
-                        if (load64(&crx + b * 8) <= kx) { stop = 1; }
-                    }
-                }
-                store64(&crx + (b + 1) * 8, kx);
-                store64(&crd + (b + 1) * 8, kd);
-                a = a + 1;
-            }
-            var wind = 0; var ci = 0;
-            while (ci < nc - 1) {
-                wind = wind + load64(&crd + ci * 8);
-                if (wind != 0) {
-                    span_add(load64(&crx + ci * 8), load64(&crx + (ci + 1) * 8), weight);
-                }
-                ci = ci + 1;
-            }
-            s = s + 1;
-        }
-        var px = 0;
-        while (px < TW) {
-            var c = (load64(&accrow + px * 8) * 255) >> R_SHIFT;
-            if (c > 255) { c = 255; }
-            store8(&cov + py * TW + px, c);
-            px = px + 1;
-        }
-        py = py + 1;
-    }
-    return 0;
-}
 
 # ============================================================================================
 # THE BINNER UNDER TEST — screen-space bbox -> tile list
@@ -269,7 +167,12 @@ fn check_case(ax, ay, bx, by, cx, cy, seed): i64 {
     edge_add(ax, ay, bx, by);
     edge_add(bx, by, cx, cy);
     edge_add(cx, cy, ax, ay);
-    raster();
+    # dims are set (and the refusal checked) before rasterising -- the shared reference REFUSES
+    # a size it cannot hold rather than clamping, so an unchecked call cannot silently rasterise
+    # a different shape than this tool asked for.
+    if (rr_set_dims(TW, TH) != 1) { puts("tileown: rr_set_dims REFUSED"); return 90; }
+    cov_clear(&cov);
+    raster(&cov);
     if (bin_triangle(ax, ay, bx, by, cx, cy) == 0 - 1) {
         total_dupe = total_dupe + 1;
         if (first_bad_seed == 0) { first_bad_seed = seed; }

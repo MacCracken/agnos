@@ -71,6 +71,7 @@ var gpu_cov_armed     = 0;   # 1 = blend_cov resident in its own arena slot for 
 var gpu_glyph_ok      = 0;   # plan-S9: 1 = 1bpp glyph expansion proven on iron
 var gpu_glyph_armed   = 0;   # 1 = glyph_1bpp resident for #92 op GPU_OP_GLYPH_1BPP
 var gpu_grad_ok       = 0;   # plan-S11: 1 = linear gradient proven on iron
+var gpu_edge_armed    = 0;   # 3D rung 9: 1 = edge_cov blob resident (written at 9b; 0 through all of 9a)
 var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot for the #92 op path
 var gpu_perm_ok       = 0;   # plan-S4: 1 = v_perm_b32 byte crossbar + channel swap proven on iron
 var gpu_blend_pk_ok   = 0;   # plan-S4: 1 = VOP3P packed blend proven bit-identical to the f32 blend
@@ -461,6 +462,28 @@ fn gpu_arena_audit() {
     }
     if (gpu_arena_phys == 0) {
         kprintln("gpu: AUDIT FAIL -- no arena mapped", 34);
+        ok = 0;
+    }
+    # ⛔ ASSERT CONTAINMENT — DO NOT MERELY PRINT IT. The first cut printed the carveout base and
+    # the arena address and left a human to compare them, which is a data dump that happens to be
+    # checkable, not an audit. On the 2026-07-25 burn the numbers did agree (arena 0xFF0000000
+    # inside carveout [0xF70000000, 0x1030000000)) — but they agreed by inspection, with nothing
+    # in the code that would have refused had they not.
+    # ⚠ FREE CROSS-CHECK worth keeping: carveout_base + VRAM should land on the top of RAM the
+    # boot path independently reported (0x1030000000 on this iron, and it does). Two unrelated
+    # sources agreeing is what makes the MC_VM_FB_OFFSET decode trustworthy rather than plausible.
+    var vram_mb    = gpu_reg32(GPU_BASE_NBIO_2, GPU_R_CONFIG_MEMSIZE) & 0xFFFFFFFF;
+    var carve_base = (fboff & 0xFFFFFF) << 24;
+    var carve_top  = carve_base + vram_mb * 1024 * 1024;
+    kprint("gpu: carveout window ", 21); kprint_hex(carve_base);
+    kprint(" .. ", 4); kprint_hex(carve_top);
+    kprint("  vram ", 7); kprint_num(vram_mb); kprintln(" MB", 3);
+    if (gpu_arena_phys < carve_base) {
+        kprintln("gpu: AUDIT FAIL -- the arena is BELOW the carveout base", 55);
+        ok = 0;
+    }
+    if (gpu_arena_phys + GPU_ARENA_SIZE > carve_top) {
+        kprintln("gpu: AUDIT FAIL -- the arena runs past the carveout top", 55);
         ok = 0;
     }
     # ⚠ A LIVE READ, not just arithmetic: a region the slot map calls free but that already holds
@@ -3430,6 +3453,30 @@ fn gpu_shader_batch_test() {
     gpu_batch_ok = 1;
     kprintln("gpu: batched frame pixel-identical to op-by-op (6 ops, 1 submission)", 68);
     return 1;
+}
+
+# gpu_edge_cov — RUNG 9b's worker. Rasterise n_edges screen-space edges into an 8bpp coverage mask.
+# ⛔ Rung 9a ships this as a refusal, not a stub that returns 1: gpu_edge_arm() gates it out one layer
+# up, and if that gate is ever wrong the honest answer here is "no", never a silently blank mask.
+fn gpu_edge_cov(edge_mc, dst_mc, w, h, n_edges, rule) {
+    if (gpu_edge_arm() != 1) { return 0; }
+    return 0;
+}
+
+# gpu_edge_arm — RUNG 9a: the edge rasteriser's residency hook.
+#
+# ⛔ RETURNS 0 ON PURPOSE. The shader blob is rung 9b; this is 9a, and 9a's whole claim is that the
+# #92 op 0x08 ABI — every field, every reject — is provable in QEMU at ZERO burns before a single
+# instruction of the rasteriser exists. Returning 1 here to "make the op work" would fabricate a pass
+# and, worse, dispatch a workgroup at an arena slot holding zeros.
+#
+# Residency is checked LAST in gpo_validate_edge, so this stub costs the ABI battery nothing: a
+# malformed record still returns its own specific reason, and only a WELL-FORMED record reaches here
+# and gets GPO_E_ARM. "Every reject fired correctly and the one valid case says NOT-YET" is exactly
+# the 9a pass condition, and it is a reading no other outcome produces.
+fn gpu_edge_arm() {
+    if (gpu_edge_armed == 1) { return 1; }
+    return 0;
 }
 
 # gpu_grad_arm — make grad_linear resident for the RUNTIME path. Idempotent; own arena slot, so the

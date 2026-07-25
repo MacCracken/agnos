@@ -9,6 +9,168 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 the burn, so its results and the fix they exposed land here. Bumped on cycle open; the user tags at
 close.
 
+### Added — 3D arc rung **9b** planning + bite **B0**: one reference, and its latent fatal
+
+**9b is ELEVEN bites, not one — and eight cost zero burns.** That verdict came out of a 12-agent
+survey + adversarial design panel (5 surveyors, 3 independent designs, 3 judges by distinct lens,
+1 synthesis; full plan in [`docs/development/planning/edge-cov-9b.md`](docs/development/planning/edge-cov-9b.md)).
+Three of rung 9b's stated preconditions **do not exist in the tree**: the 20-case corpus was never
+written (8 corpus cases + 3 shared-edge pairs exist), the reference was hand-transcribed **three
+times**, and `gpo_validate_edge` bounds `w`/`h`/`ne`/`rule` but never the **coordinates** — above
+roughly `M·d ≈ 2^63` the reference has no defined value, so "byte-identical" is meaningless there.
+
+Two designs were killed with concrete counterexamples rather than on taste, and the survivors'
+reasons are why the shipped design looks as it does:
+
+- An LDS + bitonic-sort design was rejected: the **DS format has zero functions** in mabda's
+  encoder, no agnos shader has ever issued a DS instruction, and — decisively — the SH registers
+  are **not readable**, so a wrong LDS allocation would have **no oracle at all**. Its proposed
+  self-witness tested round-trip at offset 0, not allocation size. That is
+  [[feedback_echo_vs_answer_registers]] exactly.
+- A "keep the divide on the CPU" design was rejected because it biases rung 10's kill gate toward
+  a **false kill** — it would report a 95%+ GPU share measured at a mask size the pre-registered
+  ~625-px-per-glyph workload never reaches.
+
+⚠ **The parent session's own f64-divide proposal was measured and then set aside on cost, not
+correctness.** An f64 estimate plus an exact integer correction is bit-exact — measured here at
+**0 mismatches over 200,000 edge-reachable operands with |N| up to 2^56**, corrections never
+needed — but every f64 op is rate-1/16 on a Cezanne APU. The chosen divider is integer
+multiply-by-reciprocal hoisted per edge, since the divisor `by − ay` is **constant per edge**.
+⛔ Recorded because *bare* f64 without the correction is wrong in ~26% of adversarial cases: the
+correction is not optional, and a later reader must not drop it as redundant.
+
+Also measured before committing: **a per-pixel lane reproduces the row-serial reference
+byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random meshes). Integer
+accumulation is associative, so summation order genuinely does not matter. This is the structural
+premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
+
+### Added — `gpu-test/refraster.cyr` (bite B0): THE reference, singular
+
+- **"Byte-identical to the CPU reference" had THREE referents.** The rasteriser was hand-copied
+  into `cpuref.cyr`, `refagree.cyr` and `tileown.cyr`, each with different array bounds — and
+  ⛔ **Cyrius shadows duplicate `fn`s silently and warn-only**, so a divergence between them would
+  not even have warned. All three now include one file.
+- ⭐ **A latent FATAL in the ORACLE, fixed.** `var accrow[64]` is module-scope, so 64 u64 slots,
+  and `span_add` indexes it by pixel x up to `W`. At the shipped W=64 that lands exactly on the
+  last slot — correct, so it never fired. At **any W > 64** it writes past the end into `crx`/`crd`,
+  declared on the next line. ⚠ Read what that would have meant: the corruption is in the
+  **reference**, so it would have presented as the GPU disagreeing on wide masks — a plausible
+  wrong triangle — and the investigation would have been pointed at the shader. Rung 9b's corpus
+  requires a 200×64 case, so it stops being latent the moment that corpus lands.
+- The fix is a declared `RR_MAXW` plus a **run-time refusal**, not a comment. `rr_set_dims`
+  REJECTS rather than clamps — a clamped dimension would rasterise a different shape than the
+  caller asked for and the diff would be blamed on the GPU — and latches `rr_dim_fault` so a
+  caller that ignores the return value still cannot report green.
+- ⭐ **`refagree.cyr` (rung 8's oracle (i)) was proving the wrong thing.** Its 200/200
+  sadish-agreement result was measured against its **own private third copy** — not the copy
+  `cpuref` uses and not the one rung 9b diffs the GPU against. Re-pointed, it still reports
+  **200/200 byte-identical, worst delta 0**, and that claim now covers the artifact every later
+  rung cites. Not a tautology: sadish is the original (heap canvas, verb/point path, curve
+  flattening, clip node) against a hand re-implementation with its own buffers and loop structure.
+- `tileown.cyr`'s copy had diverged furthest — `crx[16]` where `cpuref` allows **64** crossings.
+- All five host rungs re-verified: `cpuref` · `refagree` · `tileown` · `pm4lint` · `asmagree`, **95/95/95/95/95**.
+
+### Fixed — the B0 gate was itself a false gate, and the mutation caught it
+
+The first `rr_selftest` checked only that `rr_set_dims` refused out-of-range dimensions — it
+tested the **declared** limit and never the storage behind it. Shrinking `accrow` back to 64 slots
+left it **passing**. That is the exact failure class the file exists to prevent, reproduced inside
+the guard against it: a green assertion that could not go red. It now reproduces the real failure
+**mechanism** — arm a canary in `crx`, write across `accrow` at the indices `span_add` would use
+at `RR_MAXW`, and check the canary survived. Re-calibrated: mutant (accrow → 64) now exits **91**,
+healthy exits **95**.
+
+### Added — 3D arc rung **9a**: the `#92` op `0x08 GPU_OP_EDGE_COV` ABI (zero burns)
+
+Rung 9 is the first real rasteriser. It was split so its two halves pay their real costs
+separately: **9a is the op ABI, provable in QEMU at zero burns; 9b is the gfx9 shader, which needs
+iron.** The split paid on the first run — see *Fixed* below.
+
+- **`#92` op `0x08 GPU_OP_EDGE_COV`** — an edge array (four `i32` in 16.16 per edge) plus a winding
+  rule from a `#86` carveout slot, rasterised to an **8bpp coverage mask** in a second slot. A
+  triangle is a 3-edge closed path, so nothing about the op is triangle-specific.
+- **Its own validator**, `gpo_validate_edge`, rather than the generic geometry block: `EDGE_COV` has
+  two slots, an edge array sized by `n_edges` (not by `w*h`), and **no framebuffer destination**.
+  Running it through the generic path would size the edge array by pixel count and bounds-check a
+  mask that never reaches the screen.
+- **Five new reason codes** — `GPO_E_EDGEBUF` (16), `GPO_E_DSTSLOT` (17), `GPO_E_RULE` (18),
+  `GPO_E_ALIAS` (19). Separate codes on purpose: "your edge array is the wrong size" and "your mask
+  slot is the wrong size" are different mistakes with different fixes, and a shared code would make
+  the tool's failure table ambiguous exactly where it must discriminate.
+- **`n_edges < 3` is a REJECT, not an empty result.** Two edges cannot enclose area, so it would
+  rasterise to a silent all-zero mask — indistinguishable from a dead shader, which is the one
+  confusion this rung cannot afford.
+- **Arena slot 6 (`0x56000`) reserved but left EMPTY.** Claimed at 9a rather than at 9b so the rung-6
+  arena audit and `check.sh`'s unaliased-slot gate cover it from the moment the ABI exists — a slot
+  that appears in the same commit as the blob filling it has never once been audited empty.
+- **`gpu_edge_arm()` returns 0 by design** through all of 9a. Residency is checked LAST, so a
+  malformed record still returns its own specific reason and only a **well-formed** record reaches
+  the arm and is told `GPO_E_ARM`. "Every reject fired correctly and the one valid case says NOT-YET"
+  is the 9a pass condition, and no other outcome produces that reading.
+- **`gpu-test/gputri.cyr`** (`/bin/gputri --cov`) — the ring-3 instrument. Prefills the destination
+  with sentinel `0xA5` (distinct from 0 *and* from every expected coverage value) and **classifies**
+  into the plan's four outcomes instead of reporting a bare mismatch: all-sentinel ⇒ missing
+  write-back **or** the EXEC guard rejected every lane (rung 5 arm E says which) · wrote-but-covered-
+  nothing ⇒ fill rule · partial ⇒ tgid mapping, and the first sentinel byte names the tile. Exits
+  **96** on a 9a kernel, which is a **pass**: the seam is live and the shader is honestly absent.
+  ⚠ Exits **94**, never 95, until 9b lands the byte-exact comparison against rung 8's reference —
+  reporting 95 first would be a pass naming a check nobody ran.
+
+### Added — `scripts/edge-abi-smoke.sh`: 16 cases, in QEMU, against the shipped validator
+
+- Boot selftest behind `EDGE_ABI_SELFTEST=1`. The D-lane rule sends human-watched oracles to a shell
+  command; this oracle is a **text table**, and the function under test needs no GPU — so it runs in
+  QEMU. Routing it through ring 3 instead would put it behind `#92`'s `gpu_present` gate and make a
+  free test **iron-only**, handing back the burn the split was created to save.
+- ⛔ **It calls the SHIPPED `gpo_validate`.** Not a host copy. The largest risk in a split like this
+  is two artifacts that differ in name but not behaviour — the `ATOM_DRY` defect class — and the only
+  real defence is that there is exactly one implementation.
+- **Mutation-calibrated, and each mutation failed the RIGHT gate.** `gpu_edge_arm()→1` broke the
+  well-formed-reaches-`ARM` oracle while the alias gate stayed green; deleting the alias check did
+  the inverse. An assertion that cannot fail proves nothing, and one that fails for everything
+  localises nothing.
+- Result: **16/16 cases, 8/8 gates.**
+
+### Fixed — two defects the battery caught on its own first run
+
+- **The battery entered at `gpo_validate_edge`, a path no caller can take.** The reserved-dword sweep
+  and the flags check live in the SHARED prologue of `gpo_validate`, so three reserved-field cases
+  reported `want 12 got 7` — they could never have fired. Testing the inner function was testing a
+  path ring 3 cannot reach.
+- ⭐ **The alias check sat AFTER the destination size check**, so a slot that was both aliased *and*
+  too small reported `GPO_E_DSTSLOT` where `GPO_E_ALIAS` was correct. Aliasing is structural and
+  size-independent, so it must report first. This is precisely the attribution loss rung 9 exists to
+  prevent — an aliased record is a data race that presents as a plausible-looking **wrong triangle**,
+  the hardest failure in the rung's table to attribute — and it was caught at zero burns.
+
+### Documentation — closed `gpu.md` adversarial item 6 before rung 9b adds to the seam
+
+The plan flagged that `docs/development/agnos-userland-abi.md` was **missing ten shipped syscalls —
+`#82` `#83` `#86`–`#94` — including every number this arc extends**, and pre-committed that it be
+fixed *before* rung 9 added op codes to an undocumented surface. Done:
+
+- All ten documented, each carrying the constraint that actually bites callers: `#86`'s "a `#71`
+  page is system RAM the GPU **cannot reach at all**", `#89`'s bounds being the back buffer and
+  **not** `fbinfo`#38's console framebuffer, `#90`'s stale-pixel trap, and the Linux collisions —
+  with `#91` (`fchmod`) called out as the load-bearing one, since `srcxy=(0,0)` packs to fd 0 and
+  would plausibly **succeed** off-agnos.
+- **New §3.4** documents the whole `#92` surface: the 64-byte record layout, all six op codes, and
+  the full reason table. Includes the rule that makes the reserved dwords safe to fill in later, and
+  the note that `GPO_E_BATCH`'s `idx` is 0 and **carries no meaning** — with one submission there is
+  one marker, so reporting an index would be a fabrication.
+- ⚠ **Deviation from the plan's provisional field list, recorded rather than absorbed:** `dstxy` is
+  **not** defined by op `0x08`. `EDGE_COV` never touches the framebuffer; its mask's origin IS
+  `(0,0)` and placement is a separate `BLEND_COV` record. Accepting a coordinate and ignoring it is
+  the exact failure the `flags`-word rule refuses. §3.4 is now authoritative over the plan row.
+
+### Changed — `gpu-test/cyrius.cyml` pin 6.4.74 → 6.4.78
+
+Tracks the **kernel's** pin, not the oldest version that happens to compile. `gpu-test` binaries run
+inside agnos and call the kernel's syscalls, so a lagging pin means the tools are built by a
+different compiler than the kernel they exercise — and a codegen difference between the two would
+surface as a GPU bug. All 13 tools rebuilt; the five host rungs (`pm4lint`, `asmagree`, `cpuref`,
+`refagree`, `tileown`) all still `exit 95`.
+
 ### Result of the rung-5 burn (2026-07-25) — ⭐ **THE CONSOLE SURVIVES A DEAD GPU**
 
 All five arms, one boot. Four of five outcomes were **pre-registered** in the tracker before the
@@ -31,6 +193,29 @@ ran — R-4 had given up, so no recovery occurred. C's failure is a *consequence
 independent evidence. That pre-registered branch remains **untested**.
 
 ★ **The forensic block fired automatically — the first time agnos has ever captured a GPU hang.**
+
+### Added — rung 6 `arena-audit`: the render arena region is provably unclaimed (IRON, read-only)
+
+`run /bin/gpuwedge --audit`, **exit 95**, 2026-07-25. Carveout base `0xF70000000`, arena
+`0xFF0000000..0xFF0200000` inside it, sacrificial slot `0x1F0000` sitting `0x130000` above the
+highest published slot and 1984 KB clear of the console framebuffer.
+
+⭐ **A free independent corroboration fell out of it:** carveout base + 3072 MB VRAM computes to
+`0x1030000000`, which is *exactly* the `RAM top` the boot path reports from an unrelated source.
+Two independent numbers landing on the same address is what makes the `MC_VM_FB_OFFSET` decode
+trustworthy rather than merely plausible.
+
+Licenses TD-3 a place to live, so Phase II does not stall at rung 11, and gives arm E a
+provably-free target.
+
+### Fixed — the arena audit PRINTED containment instead of ASSERTING it
+
+The first cut printed the carveout base and the arena address and left a human to compare them —
+a data dump that happens to be checkable, not an audit. The numbers agreed on the burn, but by
+inspection, with nothing in the code that would have refused had they not. It now reads
+`CONFIG_MEMSIZE`, computes the carveout window, and **refuses** if the arena falls below its base
+or past its top. ⛔ An audit whose passing condition cannot fail is the same defect class as an
+uncalibrated validator.
 
 ### Added — rung 16 `tile-own`: every covered pixel owned by exactly one tile (HOST, 0 burns)
 

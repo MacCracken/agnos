@@ -60,161 +60,23 @@ fn pnum(v): i64 {
     return 0;
 }
 
-# ---- sadish's fixed-point constants, reproduced exactly -----------------------------------
-var R_SHIFT = 16;
-var R_ONE   = 65536;
-var R_SS    = 4;              # SD_FILL_SS
+# ⭐ THE REFERENCE NOW LIVES IN ONE PLACE. Bite B0 of rung 9b extracted the rasteriser into
+# gpu-test/refraster.cyr because "byte-identical to the CPU reference" had THREE hand-transcribed
+# referents (here, refagree.cyr, tileown.cyr) with different array bounds — and Cyrius shadows
+# duplicate fns SILENTLY, so a divergence between them would not even warn.
+#
+# ⚠ The extraction also fixed a latent FATAL in this file: `var accrow[64]` is 64 u64 slots and
+# span_add indexes it by pixel x up to W. At W=64 that is exactly in bounds, so it never fired —
+# but rung 9b's corpus needs a 200x64 case, and at any W > 64 it wrote into crx/crd. The
+# corruption would have been in the ORACLE, presenting as the GPU disagreeing on wide masks.
+include "refraster.cyr"
 
-fn r_fixed_mul(a, b): i64 { return (a * b) >> R_SHIFT; }
-
-# ---- geometry buffers ---------------------------------------------------------------------
-var W = 64;
-var H = 64;
-var MAXE = 64;
-var ex0[64]; var ey0[64]; var ex1[64]; var ey1[64];
-var n_edges = 0;
-var accrow[64];
-var crx[64]; var crd[64];
+# Consumer-side scratch. NOT part of the reference: these are this tool's own comparison
+# buffers, so they stay here rather than in refraster.cyr where every other consumer would
+# inherit 32 KB it does not use. Module-scope var[N] = N x u64, so 4096 slots = 32 KB, ample
+# for the 64x64 masks this tool rasterises.
 var covA[4096];
 var covB[4096];
-
-fn edges_reset(): i64 { n_edges = 0; return 0; }
-fn edge_add(x0, y0, x1, y1): i64 {
-    # ⚠ Degenerate horizontal edges contribute no crossings under the half-open rule and are
-    # dropped here, exactly as sadish's y-range test drops them (ylo == yhi can never satisfy
-    # both sy >= ylo and sy < yhi). Dropping them explicitly makes the corpus's zero-area and
-    # sliver cases behave identically in both implementations rather than by accident.
-    if (y0 == y1) { return 0; }
-    if (n_edges >= MAXE) { return 0; }
-    store64(&ex0 + n_edges * 8, x0); store64(&ey0 + n_edges * 8, y0);
-    store64(&ex1 + n_edges * 8, x1); store64(&ey1 + n_edges * 8, y1);
-    n_edges = n_edges + 1;
-    return 0;
-}
-
-fn tri_add(ax, ay, bx, by, cx, cy): i64 {
-    edge_add(ax, ay, bx, by);
-    edge_add(bx, by, cx, cy);
-    edge_add(cx, cy, ax, ay);
-    return 0;
-}
-
-# ---- the analytic-x span accumulator — sadish's sd_span_add ---------------------------------
-fn span_add(xs, xe, weight): i64 {
-    if (xe <= xs) { return 0; }
-    var lo = xs; if (lo < 0) { lo = 0; }
-    var wmax = W << R_SHIFT;
-    var hi = xe; if (hi > wmax) { hi = wmax; }
-    if (hi <= lo) { return 0; }
-    var px = lo >> R_SHIFT;
-    var stop = 0;
-    while (stop == 0) {
-        if (px >= W) { stop = 1; }
-        if (px < W) {
-            var pl = px << R_SHIFT;
-            if (pl >= hi) { stop = 1; }
-            if (pl < hi) {
-                var pr = (px + 1) << R_SHIFT;
-                var a = lo; if (a < pl) { a = pl; }
-                var b = hi; if (b > pr) { b = pr; }
-                if (b > a) {
-                    var add = r_fixed_mul(weight, b - a);
-                    store64(&accrow + px * 8, load64(&accrow + px * 8) + add);
-                }
-                px = px + 1;
-            }
-        }
-    }
-    return 0;
-}
-
-# ---- the reference rasteriser — sadish's sd_fill_impl, nonzero rule -------------------------
-fn raster(cov): i64 {
-    var weight = R_ONE / R_SS;
-    var py = 0;
-    while (py < H) {
-        var zi = 0;
-        while (zi < W) { store64(&accrow + zi * 8, 0); zi = zi + 1; }
-        var s = 0;
-        while (s < R_SS) {
-            # ⚠ EXACT sub-scanline placement. A different rounding here shifts every edge by a
-            # fraction of a pixel and shows up as a uniform ±1 coverage difference — which is
-            # exactly the degradation the plan warns must be REPORTED, not absorbed.
-            var sy = (py << R_SHIFT) + (s * R_ONE + (R_ONE >> 1)) / R_SS;
-            var nc = 0;
-            var ei = 0;
-            while (ei < n_edges) {
-                var ay = load64(&ey0 + ei * 8);
-                var by = load64(&ey1 + ei * 8);
-                var ylo = ay; var yhi = by; var dir = 1;
-                if (ay > by) { ylo = by; yhi = ay; dir = 0 - 1; }
-                # ⛔ THE HALF-OPEN RULE. See the header: this single pair of comparisons is what
-                # makes a shared edge belong to exactly one triangle.
-                if (sy >= ylo) {
-                    if (sy < yhi) {
-                        var ax = load64(&ex0 + ei * 8);
-                        var bx = load64(&ex1 + ei * 8);
-                        var xx = ax + ((bx - ax) * (sy - ay)) / (by - ay);
-                        store64(&crx + nc * 8, xx);
-                        store64(&crd + nc * 8, dir);
-                        nc = nc + 1;
-                    }
-                }
-                ei = ei + 1;
-            }
-            # insertion sort by x — sadish's, same algorithm so ties order identically
-            var a = 1;
-            while (a < nc) {
-                var kx = load64(&crx + a * 8);
-                var kd = load64(&crd + a * 8);
-                var b = a - 1;
-                var stop = 0;
-                while (stop == 0) {
-                    if (b < 0) { stop = 1; }
-                    if (b >= 0) {
-                        if (load64(&crx + b * 8) > kx) {
-                            store64(&crx + (b + 1) * 8, load64(&crx + b * 8));
-                            store64(&crd + (b + 1) * 8, load64(&crd + b * 8));
-                            b = b - 1;
-                        }
-                        if (load64(&crx + b * 8) <= kx) { stop = 1; }
-                    }
-                }
-                store64(&crx + (b + 1) * 8, kx);
-                store64(&crd + (b + 1) * 8, kd);
-                a = a + 1;
-            }
-            # nonzero winding -> covered spans
-            var wind = 0;
-            var ci = 0;
-            while (ci < nc - 1) {
-                wind = wind + load64(&crd + ci * 8);
-                if (wind != 0) {
-                    span_add(load64(&crx + ci * 8), load64(&crx + (ci + 1) * 8), weight);
-                }
-                ci = ci + 1;
-            }
-            s = s + 1;
-        }
-        var px = 0;
-        while (px < W) {
-            var c = (load64(&accrow + px * 8) * 255) >> R_SHIFT;
-            if (c > 255) { c = 255; }
-            store8(cov + py * W + px, c);
-            px = px + 1;
-        }
-        py = py + 1;
-    }
-    return 0;
-}
-
-fn cov_clear(cov): i64 {
-    var i = 0;
-    while (i < W * H) { store8(cov + i, 0); i = i + 1; }
-    return 0;
-}
-
-fn fx(v): i64 { return v << R_SHIFT; }
 
 # ============================================================================================
 # ORACLE (ii) — SHARED-EDGE WATERTIGHTNESS. Does not depend on the reference being right.
@@ -304,6 +166,19 @@ fn main(): i64 {
     puts("Ported from sadish/src/raster.cyr: 16.16, 4 sub-scanlines, analytic-x, half-open y.");
     puts("");
     var ok = 1;
+
+    # ⭐ B0 GATE. The shared reference's own invariants, asserted before anything cites it.
+    # ⚠ The load-bearing case is the wide one: the pre-extraction `var accrow[64]` held exactly
+    # 64 slots while `span_add` indexes it to W, so any W > 64 wrote into `crx`/`crd` — silently
+    # corrupting the ORACLE and presenting as a plausible wrong triangle at rung 9b. If accrow
+    # ever shrinks back, this fails HERE, not 200 lines away in another tool.
+    if (rr_selftest() != 1) {
+        puts("** refraster.cyr selftest FAILED -- the shared reference is not sound.");
+        puts("   Nothing downstream may cite it. Check accrow sizing and rr_set_dims.");
+        return 91;
+    }
+    puts("[refraster] shared reference selftest PASS (dims refuse, wide mask fits)");
+    puts("");
 
     puts("[corpus] determinism + degenerate handling");
     if (corpus_case("plain triangle      ", 8, 8, 48, 12, 20, 50) == 0) { ok = 0; }

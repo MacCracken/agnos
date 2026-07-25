@@ -979,9 +979,19 @@ var GPU_OP_BLEND_RECT  = 0x01;       # 32bpp premultiplied source, per-pixel src
 var GPU_OP_BLEND_COV   = 0x02;       # 8bpp coverage mask x one uniform colour           (was #93)
 var GPU_OP_GLYPH_1BPP  = 0x03;       # 1bpp bitmap, colour where set, dst untouched      (was #94)
 var GPU_OP_GRAD_LINEAR = 0x04;       # two-stop vertical gradient, NO source buffer      (never had one)
+# ⭐ RUNG 9 (3D arc) — THE RASTERISER. An edge array (16.16) + a winding rule from a #86 slot,
+# rasterised to an 8bpp coverage mask. **This op IS the triangle rasteriser**: a triangle is a
+# 3-edge closed path, and nothing about the kernel is triangle-specific.
+# ⚠ Record layout (dwords): 0 op · 1 flags · 3 edge_id · 4 wh · 5 dstxy · 9 n_edges|rule
+# ⛔ Vertex transform stays on the CPU in ring 3 (TD-4) — the kernel receives SCREEN-SPACE edges.
+var GPU_OP_EDGE_COV    = 0x08;       # edge array -> 8bpp coverage mask                   (3D arc rung 9)
+var GPU_RULE_NONZERO   = 0;
+var GPU_RULE_EVENODD   = 1;
+var GPU_EDGE_BYTES     = 16;         # one edge = x0,y0,x1,y1 as 4x i32 in 16.16
+var GPU_EDGE_MAX       = 256;        # per-op cap; a reject, never a clamp
 # 0x05 channel swap (plan S4) · 0x06 cov-modulated source · 0x07 packed VOP3P blend ·
 # 0x10-0x17 CP-DMA-domain ops (fill/blit/readback, plan S12) · 0x18-0x1F control (barrier/present).
-var GPU_OP_SUPPORTED   = 0x1F;       # bits 0..4 — MUST equal the set gpo_validate accepts
+var GPU_OP_SUPPORTED   = 0x11F;      # bits 0..4 + bit 8 (EDGE_COV) — MUST equal the set gpo_validate accepts
 
 # Flags word (+4). NOTHING is accepted here yet, on purpose: a flag that is accepted and ignored is how
 # a caller silently gets behaviour it did not ask for. bit0 SERIALIZE and bit1 CHECK_PREMUL are reserved
@@ -1007,6 +1017,14 @@ var GPO_E_UNPROVEN = 13;             # call  — the dispatch envelope is unprov
 # one submission there is one marker, so the failing op is NOT identifiable and reporting an index would be
 # a fabrication. idx is 0 and carries no meaning for this reason.
 var GPO_E_BATCH    = 15;
+# rung 9 (EDGE_COV). Distinct from SLOTSIZE/DIM on purpose: "your edge array is the wrong size" and
+# "your mask slot is the wrong size" are different mistakes with different fixes, and one shared code
+# would make the tool's failure table ambiguous exactly where it needs to discriminate.
+var GPO_E_EDGEBUF  = 16;             # op    — edge slot too small for n_edges, or n_edges out of range
+var GPO_E_DSTSLOT  = 17;             # op    — destination mask slot invalid/free/PMM-backed/too small
+var GPO_E_RULE     = 18;             # op    — winding rule is not NONZERO or EVENODD
+var GPO_E_ALIAS    = 19;             # op    — edge slot and destination mask slot are the same slot
+var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
 
 # gpo_field_mask(op) — bit i set <=> this op DEFINES record dword i (byte offset i*4).
 # Every dword an op does not define MUST be zero. That rule is what makes the reserved dwords safe to
@@ -1019,6 +1037,12 @@ fn gpo_field_mask(op) {
     if (op == GPU_OP_BLEND_COV)   { return 0x023B; }   # op flags mask_id wh dstxy color0
     if (op == GPU_OP_GLYPH_1BPP)  { return 0x023B; }   # op flags mask_id wh dstxy color0
     if (op == GPU_OP_GRAD_LINEAR) { return 0x0633; }   # op flags wh dstxy color0 color1
+    # rung 9: op(0) flags(1) dst_id(2) edge_id(3) wh(4) n_edges|rule(9)
+    # ⛔ dstxy (dword 5) is NOT defined by this op and must be zero. EDGE_COV does not touch the
+    # framebuffer at all -- it rasterises into a mask slot whose origin IS (0,0). Accepting a dstxy
+    # here and ignoring it is precisely the "silently gets behaviour it did not ask for" failure the
+    # flags-word comment above refuses; placement is BLEND_COV's job, in a second record.
+    if (op == GPU_OP_EDGE_COV)    { return 0x021F; }
     return 0;
 }
 
@@ -1026,6 +1050,11 @@ fn gpo_field_mask(op) {
 # and using the wrong one is a live bug class: 1bpp rows are BYTE-ALIGNED, so a 12 px glyph run costs 2
 # bytes per row and not 1.5 — copying blend_cov's w*h rule here would reject valid callers.
 fn gpo_slot_bytes(op, w, h) {
+    # ⚠ EDGE_COV's slot holds EDGES, not pixels — its size is a function of n_edges, not of w*h.
+    # Handled by gpo_edge_bytes() at the call site because this signature has no n_edges to give.
+    # Returning a w*h rule here would reject every valid caller, which is exactly the bug class
+    # this function's own comment warns about for the 1bpp row stride.
+    if (op == GPU_OP_EDGE_COV)   { return 0; }
     if (op == GPU_OP_BLEND_RECT) { return w * 4 * h; }
     if (op == GPU_OP_BLEND_COV)  { return w * h; }
     if (op == GPU_OP_GLYPH_1BPP) { return ((w + 7) / 8) * h; }
@@ -1034,6 +1063,7 @@ fn gpo_slot_bytes(op, w, h) {
 
 # gpo_slot_field(op) — record byte offset of the slot id this op sources from, or 0 for none.
 fn gpo_slot_field(op) {
+    if (op == GPU_OP_EDGE_COV)   { return 12; }        # edge_id
     if (op == GPU_OP_BLEND_RECT) { return 8; }         # src_id
     if (op == GPU_OP_BLEND_COV)  { return 12; }        # mask_id
     if (op == GPU_OP_GLYPH_1BPP) { return 12; }        # mask_id
@@ -1043,6 +1073,294 @@ fn gpo_slot_field(op) {
 # gpo_validate(rec, fbw, fbh) -> 0 or a GPO_E_* reason. PURE READS on the KERNEL-RESIDENT copy: no ring
 # traffic, nothing drawn. Validating the copy rather than user memory is a security property, not a
 # convenience — ring 3 cannot change the descriptor between the check and the use.
+# gpo_validate_edge(rec) -> 0 or a GPO_E_* reason. RUNG 9's validator.
+#
+# ⭐ The whole point of rung 9a: every reject below is provable in QEMU, at zero burns, BEFORE the
+# shader exists. The rasteriser is the part that needs iron; the ABI is not, and proving them
+# together is how a shader bug and a validation bug become indistinguishable.
+#
+# Record: op(0) flags(4) dst_id(8) edge_id(12) wh(16) n_edges|rule(36)
+fn gpo_validate_edge(rec) {
+    var wh  = load32(rec + 16) & 0xFFFFFFFF;
+    var w   = wh & 0xFFFF;
+    var h   = (wh >> 16) & 0xFFFF;
+    if (w < 1) { return GPO_E_DIM; }
+    if (h < 1) { return GPO_E_DIM; }
+    if (w > GPU_COV_MAX_DIM) { return GPO_E_DIM; }
+    if (h > GPU_COV_MAX_DIM) { return GPO_E_DIM; }
+
+    var nr   = load32(rec + 36) & 0xFFFFFFFF;
+    var ne   = nr & 0xFFFF;
+    var rule = (nr >> 16) & 0xFFFF;
+    if (rule > GPU_RULE_EVENODD) { return GPO_E_RULE; }
+    # A closed path needs three edges. Two edges cannot enclose area, so a 2-edge call is a caller bug
+    # that would otherwise rasterise to a silent all-zero mask -- indistinguishable from a dead shader,
+    # which is the one confusion rung 9's failure table must never have.
+    if (ne < 3) { return GPO_E_EDGEBUF; }
+    if (ne > GPU_EDGE_MAX) { return GPO_E_EDGEBUF; }
+
+    # Edge slot (input).
+    var eid = load32(rec + 12) & 0xFFFFFFFF;
+    if (shm_slot_valid(eid) == 0) { return GPO_E_BADSLOT; }
+    var es = eid - 1;
+    if (load64(&shm_mc + es * 8) == 0) { return GPO_E_BADSLOT; }         # PMM-backed => GPU can't read
+    if (ne * GPU_EDGE_BYTES > load64(&shm_size + es * 8)) { return GPO_E_EDGEBUF; }
+
+    # Destination mask slot (output, 8bpp, w bytes per row).
+    var did = load32(rec + 8) & 0xFFFFFFFF;
+    if (shm_slot_valid(did) == 0) { return GPO_E_DSTSLOT; }
+    var ds = did - 1;
+    if (load64(&shm_mc + ds * 8) == 0) { return GPO_E_DSTSLOT; }
+    # ⛔ Aliasing the edge array onto its own output is rejected, not merely discouraged: the shader
+    # reads edges after it has begun writing coverage, so an alias is a data race whose symptom would
+    # be a plausible-looking WRONG triangle -- the single hardest failure in rung 9's table to
+    # attribute, because it mimics an edge-setup bug exactly.
+    # ⚠ BEFORE the size check, not after. Aliasing is structural and size-independent, so a slot that
+    # is both aliased AND too small must report the alias -- the more specific fault. The first run of
+    # edge-abi-smoke reported 17 here where 19 was correct, for exactly this reason.
+    if (eid == did) { return GPO_E_ALIAS; }
+    if (w * h > load64(&shm_size + ds * 8)) { return GPO_E_DSTSLOT; }
+
+    if (gpu_edge_arm() != 1) { return GPO_E_ARM; }
+    return 0;
+}
+
+#ifdef EDGE_ABI_SELFTEST
+# edge_abi_selftest — RUNG 9a's oracle. Sixteen records through the SHIPPED gpo_validate_edge.
+#
+# ============================================================================================
+# WHY THIS IS A SELFTEST AND NOT A RING-3 TOOL — the one place that rule bends, and why
+# ============================================================================================
+# The D lane's rule is that a bite whose oracle is A HUMAN WATCHING THE SCREEN belongs in a shell
+# command. This oracle is a TEXT TABLE in klug, and the thing under test needs no GPU at all — so it
+# runs in QEMU, at zero burns, which is the entire point of splitting 9a from 9b. Routing it through
+# ring 3 instead would put it behind gpu_shader_op#92's `gpu_present` gate and make it IRON-ONLY,
+# turning a free test into a burn.
+#
+# ⛔ IT CALLS THE SHIPPED FUNCTION. Not a copy, not a host re-implementation. Rung 9's whole risk is
+# that a shader bug and a validation bug become indistinguishable on iron; a second artifact that
+# agreed with the first by construction would be the ATOM_DRY defect all over again.
+#
+# The table is seeded DIRECTLY into the shm arrays because shm_create_gpu returns -1 without a GPU
+# carveout. That is a deliberate trade: it makes the battery run identically on QEMU and on iron, and
+# it lets a case ask for a PMM-backed slot, which no allocator would hand out on purpose.
+# ⛔ Enters through gpo_validate, NOT gpo_validate_edge. The reserved-dword sweep and the flags check
+# live in the SHARED prologue, so calling the edge validator directly skips them -- and the first run
+# of this battery duly reported "want 12 got 7" on all three reserved cases. Testing the inner
+# function was testing a path no caller can take.
+fn ea_expect(rec, want, name, nlen) {
+    var got = gpo_validate(rec, 2560, 1440);
+    if (got == want) {
+        kprint("edge-abi: PASS ", 15); kprint(name, nlen); kprint("\n", 1);
+        return 1;
+    }
+    kprint("edge-abi: FAIL ", 15); kprint(name, nlen);
+    kprint(" want ", 6); kprint_num(want);
+    kprint(" got ", 5);  kprint_num(got); kprint("\n", 1);
+    return 0;
+}
+
+fn edge_abi_selftest() {
+    # Refuse rather than corrupt: if anything already owns these slots, seeding them would clobber a
+    # live buffer. Nothing allocates shm this early, so a non-free slot means an ordering change and
+    # the selftest must say so instead of proceeding.
+    var g = 11;
+    while (g < 16) {
+        if (load64(&shm_phys + g * 8) != 0) {
+            kprint("edge-abi: REFUSED -- shm slot already in use, cannot seed\n", 58);
+            return 0;
+        }
+        g = g + 1;
+    }
+    # id 12 (idx 11) stays FREE -- the invalid-slot cases point at it.
+    store64(&shm_phys + 12 * 8, 1); store64(&shm_mc + 12 * 8, 0);      store64(&shm_size + 12 * 8, 256);
+    store64(&shm_phys + 13 * 8, 1); store64(&shm_mc + 13 * 8, 0x1000); store64(&shm_size + 13 * 8, 256);
+    store64(&shm_phys + 14 * 8, 1); store64(&shm_mc + 14 * 8, 0x2000); store64(&shm_size + 14 * 8, 4096);
+    store64(&shm_phys + 15 * 8, 1); store64(&shm_mc + 15 * 8, 0x3000); store64(&shm_size + 15 * 8, 16);
+
+    var pass = 0;
+    var d[64];                                     # function-local => 64 BYTES = exactly one record
+    kprint("edge-abi: ---- #92 op 0x08 EDGE_COV ABI battery ----\n", 53);
+
+    # well-formed -> ARM (the seam is live, 9b not built)
+    var z3 = 0; while (z3 < 16) { store32(&d + z3 * 4, 0); z3 = z3 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    pass = pass + ea_expect(&d, GPO_E_ARM, "well-formed -> ARM (the seam is live, 9b not built)", 51);
+
+    # dstxy set (undefined for this op)
+    var z12 = 0; while (z12 < 16) { store32(&d + z12 * 4, 0); z12 = z12 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 20, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "dstxy set (undefined for this op)", 33);
+
+    # flags set (nothing is accepted yet)
+    var z22 = 0; while (z22 < 16) { store32(&d + z22 * 4, 0); z22 = z22 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d +  4, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "flags set (nothing is accepted yet)", 35);
+
+    # reserved dword 6 set
+    var z32 = 0; while (z32 < 16) { store32(&d + z32 * 4, 0); z32 = z32 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 24, 1);
+    pass = pass + ea_expect(&d, GPO_E_RESERVED, "reserved dword 6 set", 20);
+
+    # w = 0
+    var z42 = 0; while (z42 < 16) { store32(&d + z42 * 4, 0); z42 = z42 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 16, (32 * 65536) + 0);
+    pass = pass + ea_expect(&d, GPO_E_DIM, "w = 0", 5);
+
+    # h > cap
+    var z52 = 0; while (z52 < 16) { store32(&d + z52 * 4, 0); z52 = z52 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 16, (5000 * 65536) + 32);
+    pass = pass + ea_expect(&d, GPO_E_DIM, "h > cap", 7);
+
+    # winding rule 2
+    var z62 = 0; while (z62 < 16) { store32(&d + z62 * 4, 0); z62 = z62 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 36, (2 * 65536) + 3);
+    pass = pass + ea_expect(&d, GPO_E_RULE, "winding rule 2", 14);
+
+    # n_edges 2 (cannot enclose area)
+    var z72 = 0; while (z72 < 16) { store32(&d + z72 * 4, 0); z72 = z72 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 36, 2);
+    pass = pass + ea_expect(&d, GPO_E_EDGEBUF, "n_edges 2 (cannot enclose area)", 31);
+
+    # n_edges over cap
+    var z82 = 0; while (z82 < 16) { store32(&d + z82 * 4, 0); z82 = z82 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 36, 257);
+    pass = pass + ea_expect(&d, GPO_E_EDGEBUF, "n_edges over cap", 16);
+
+    # edge slot too small for n_edges
+    var z92 = 0; while (z92 < 16) { store32(&d + z92 * 4, 0); z92 = z92 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 36, 17);
+    pass = pass + ea_expect(&d, GPO_E_EDGEBUF, "edge slot too small for n_edges", 31);
+
+    # edge_id 0
+    var z102 = 0; while (z102 < 16) { store32(&d + z102 * 4, 0); z102 = z102 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 12, 0);
+    pass = pass + ea_expect(&d, GPO_E_BADSLOT, "edge_id 0", 9);
+
+    # edge_id free slot
+    var z112 = 0; while (z112 < 16) { store32(&d + z112 * 4, 0); z112 = z112 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 12, 12);
+    pass = pass + ea_expect(&d, GPO_E_BADSLOT, "edge_id free slot", 17);
+
+    # edge slot PMM-backed (GPU cannot read)
+    var z122 = 0; while (z122 < 16) { store32(&d + z122 * 4, 0); z122 = z122 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d + 12, 13);
+    pass = pass + ea_expect(&d, GPO_E_BADSLOT, "edge slot PMM-backed (GPU cannot read)", 38);
+
+    # dst_id free slot
+    var z132 = 0; while (z132 < 16) { store32(&d + z132 * 4, 0); z132 = z132 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d +  8, 12);
+    pass = pass + ea_expect(&d, GPO_E_DSTSLOT, "dst_id free slot", 16);
+
+    # dst slot too small for w*h
+    var z142 = 0; while (z142 < 16) { store32(&d + z142 * 4, 0); z142 = z142 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d +  8, 16);
+    pass = pass + ea_expect(&d, GPO_E_DSTSLOT, "dst slot too small for w*h", 26);
+
+    # edge and dst are the SAME slot
+    var z152 = 0; while (z152 < 16) { store32(&d + z152 * 4, 0); z152 = z152 + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);                       # dst_id  -> 4096 B
+    store32(&d + 12, 14);                       # edge_id -> 256 B
+    store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
+    store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
+    store32(&d +  8, 14);
+    store32(&d + 16, (8 * 65536) + 8);          # 8x8 = 64 B, fits slot 14's 256 B: ONLY the alias is wrong
+    pass = pass + ea_expect(&d, GPO_E_ALIAS, "edge and dst are the SAME slot", 30);
+
+    # Restore. A selftest that leaves the shm table dirty would hand the next allocation a slot that
+    # LOOKS taken, and the symptom would surface far from here as "shm_create returns -1 under load".
+    var r = 11;
+    while (r < 16) {
+        store64(&shm_phys + r * 8, 0); store64(&shm_mc + r * 8, 0); store64(&shm_size + r * 8, 0);
+        r = r + 1;
+    }
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 16 cases correct\n", 21);
+    if (pass == 16) {
+        kprint("edge-abi: PASS -- the op 0x08 ABI rejects every malformed record and the\n", 73);
+        kprint("edge-abi: one well-formed record reaches residency, which correctly says\n", 73);
+        kprint("edge-abi: NOT YET. That is the 9a pass condition; 9b writes the shader.\n", 72);
+        return 1;
+    }
+    kprint("edge-abi: FAIL -- see the named case(s) above\n", 46);
+    return 0;
+}
+#endif
+
 fn gpo_validate(rec, fbw, fbh) {
     var op = load32(rec + 0) & 0xFFFFFFFF;
     if (op > 0x1F) { return GPO_E_BADOP; }
@@ -1059,6 +1377,11 @@ fn gpo_validate(rec, fbw, fbh) {
     }
     if (((load32(rec + 4) & 0xFFFFFFFF) & ~GPU_OP_FLAGS_KNOWN) != 0) { return GPO_E_RESERVED; }
     if (op == GPU_OP_NOP) { return 0; }                # no geometry, no slot, no arm
+    # EDGE_COV validates on its OWN terms. The generic block below assumes "one source slot sized by
+    # w*h, one framebuffer destination at dstxy" -- EDGE_COV has none of those three properties, and
+    # running it through anyway would size the edge array by pixel count and bounds-check a mask that
+    # never reaches the screen.
+    if (op == GPU_OP_EDGE_COV) { return gpo_validate_edge(rec); }
 
     var wh  = load32(rec + 16) & 0xFFFFFFFF;
     var dxy = load32(rec + 20) & 0xFFFFFFFF;
@@ -1119,6 +1442,17 @@ fn gpo_execute(rec) {
     }
     if (op == GPU_OP_GRAD_LINEAR) {
         if (gpu_grad_surface(w, h, dx, dy, c0, c1) != 1) { return GPO_E_DISPATCH; }
+        return 0;
+    }
+    # EDGE_COV is UNREACHABLE through all of rung 9a: gpu_edge_arm() returns 0, so validation rejects
+    # every well-formed record with GPO_E_ARM before pass 2 ever runs. The branch is written here anyway
+    # so 9b is a one-function change with no ABI edit — and so this file never contains a supported op
+    # with no execution path, which is how GPO_E_BADOP would surface as a mystery at the wrong layer.
+    if (op == GPU_OP_EDGE_COV) {
+        var se = load64(&shm_mc + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
+        var sd = load64(&shm_mc + ((load32(rec + 8)  & 0xFFFFFFFF) - 1) * 8);
+        var nr = load32(rec + 36) & 0xFFFFFFFF;
+        if (gpu_edge_cov(se, sd, w, h, nr & 0xFFFF, (nr >> 16) & 0xFFFF) != 1) { return GPO_E_DISPATCH; }
         return 0;
     }
     return GPO_E_BADOP;

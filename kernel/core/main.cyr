@@ -1192,6 +1192,16 @@ klug_spill_wraptest();
 atom_math_selftest();
 #endif
 
+#ifdef EDGE_ABI_SELFTEST
+# 3D arc RUNG 9a (gpu.md) — the #92 op 0x08 EDGE_COV ABI battery.
+#
+# ⚠ TOP LEVEL, and deliberately NOT behind any GPU flag. The function under test touches no MMIO and
+# needs no carveout, so it runs in QEMU — which is the whole reason rung 9 was split into 9a (ABI,
+# free) and 9b (shader, iron). Nesting it under a GPU gate would make it iron-only and hand back the
+# burn the split was created to save. Cf. ATOM_MATH_SELFTEST above, same mistake, same fix.
+edge_abi_selftest();
+#endif
+
 #ifdef ATOM_INSTR_SELFTEST
 # H4 (gpu.md, modeset arc) — the ATOM instrument pack's own proof. Executes four SYNTHETIC in-RAM command
 # tables to show that a clean EOT, a reserved opcode, an out-of-range opcode and an impossible table header
