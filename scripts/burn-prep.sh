@@ -318,6 +318,27 @@ elif [ -n "${BURN_HDMI_ATOM_FULL:-}" ]; then
     echo "[2/2] Building the A4 FULL kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE + HDMI_AUDIO_DUMP: encoder + transmitter. ⚠ BLANKS THE CONSOLE without a full modeset — do not flash yet)."
     BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_GPU_RECOVER:-}" ]; then
+    # ⛔⛔ 3D ARC RUNG 5 — THE GPU HANG/RECOVERY BATTERY. One boot, five arms.
+    #
+    # WHY IT EARNS ITSELF EVEN IF 3D NEVER SHIPS: agnos has NO GPU hang detection today, and that
+    # is already true for #82, #83 and #92, which SHIP. A runaway tentib matmul or a malformed
+    # #92 batch kills the box with no log. Every safety property agnos has bounds how long the
+    # CPU WAITS, never what the GPU DOES.
+    #
+    # ⛔ ARM A DELIBERATELY HANGS THE GPU. The panel may go dark. That IS the experiment.
+    # ⭐ Arm A's ORACLE IS THE FORENSIC BRACKET IN THE LOG, not whether recovery then works:
+    # "we can SEE the hang" and "we can CLEAR the hang" are different claims, and collapsing them
+    # would let a failed recovery hide a working instrument every later rung depends on.
+    #
+    # ⛔ NO GRBM_SOFT_RESET anywhere in the ladder — gpu.cyr's own note says it would wipe
+    # PSP-loaded ucode, which agnos re-loads only at boot: a recoverable hang would become a dead
+    # GPU until reboot.
+    #
+    # ⚠ The RECOVERY LADDER is in EVERY build; only the deliberate WEDGE is behind GPU_RECOVER.
+    echo "[2/2] Building the RUNG 5 kernel (GPU_RECOVER: hang forensics + the R-2/R-3/R-4 recovery ladder + the controlled-wedge arm. ⛔ ARM A HANGS THE GPU ON PURPOSE and the panel may go dark; the log's forensic bracket is the oracle, not the screen)."
+    BUILD_ENV="GPU_RECOVER=1"
+    BUILD_TAG="GPU_RECOVER"
 elif [ -n "${BURN_MODESET_AUDIO:-}" ]; then
     # ⛔⛔ M9 — THE SEQUENCING BURN. The whole arc's A4 question, reduced to ONE variable.
     #
@@ -523,6 +544,22 @@ case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; 
 # a flag whose presence in the tag was never proven in the artifact. Each marker below is a kprintln inside
 # the flag's own #ifdef, in a function called unconditionally, so it satisfies verify_marker's own rule.
 # ── M9 (MODESET_AUDIO). FOUR arms, and they are bidirectional: the audio arms must be PRESENT in
+# ── RUNG 5. Bidirectional: the wedge arm must be PRESENT in a GPU_RECOVER build and ABSENT from
+# every other one. The first GPU_RECOVER build DID silently lose the flag (build.sh had no such
+# flag yet) and compiled byte-identical to bare — the ATOM_DRY class, caught by comparing sizes.
+# This arm makes that impossible to ship.
+case "$BUILD_TAG" in
+    *GPU_RECOVER*)
+        verify_marker "ARM A -- controlled wedge"
+        verify_marker "submitting a WAIT_REG_MEM that can never be satisfied"
+        # The ladder is compiled into EVERY build, so it must be here too — without it arm A
+        # would hang the box with no way back.
+        verify_marker "RECOVERY LADDER"
+        ;;
+    *)
+        verify_absent "submitting a WAIT_REG_MEM that can never be satisfied"
+        ;;
+esac
 # an M9 build and ABSENT from every other one. Without the negative half, a build that silently
 # lost the flag would still pass — which is the ATOM_DRY defect exactly (two artifacts that differ
 # in name and not in behaviour).
@@ -553,10 +590,11 @@ esac
 # through to the caps probe, which returns 95 on a lit panel — indistinguishable from success.
 # The operator ran the experiment twice, heard silence twice, and none of it was data.
 # burn-prep verified the KERNEL artifact and never looked at the tools it would be flashed with.
-for _t in modeset klug; do
+for _t in modeset gpuwedge klug; do
     _src=""
     case "$_t" in
-        modeset) _src="gpu-test/build/modeset_agnos" ;;
+        modeset)  _src="gpu-test/build/modeset_agnos" ;;
+        gpuwedge) _src="gpu-test/build/gpuwedge_agnos" ;;
         klug)    _src="" ;;   # klug is staged from its own repo; size-compare only
     esac
     _staged="build/rootfs/bin/$_t"
@@ -576,7 +614,20 @@ for _t in modeset klug; do
         fi
     fi
 done
-echo "  staged tools match their builds (modeset, klug)"
+echo "  staged tools match their builds (modeset, gpuwedge, klug)"
+case "$BUILD_TAG" in
+    *GPU_RECOVER*)
+        # ⛔ The staged tool must be able to invoke the arms, or the burn's own oracle is
+        # unreachable — exactly what wasted the first M9 flash.
+        for _m in "--wedge" "--recover" "--baseline" "--verify" "--console"; do
+            if ! grep -qa -- "$_m" build/rootfs/bin/gpuwedge 2>/dev/null; then
+                echo "burn-prep: STAGED /bin/gpuwedge LACKS '$_m' -- the burn's oracle cannot be invoked."
+                exit 1
+            fi
+        done
+        echo "  staged /bin/gpuwedge carries all five arms"
+        ;;
+esac
 case "$BUILD_TAG" in
     *MODESET_AUDIO*)
         # The flags the operator is told to type MUST exist in the binary that gets flashed.

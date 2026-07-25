@@ -3,6 +3,60 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.17] - 2026-07-25
+
+**Rung 5 burned; the forensic instrument's race fixed (open cycle).** 1.56.16 was released before
+the burn, so its results and the fix they exposed land here. Bumped on cycle open; the user tags at
+close.
+
+### Result of the rung-5 burn (2026-07-25) — ⭐ **THE CONSOLE SURVIVES A DEAD GPU**
+
+All five arms, one boot. Four of five outcomes were **pre-registered** in the tracker before the
+flash and landed on named branches.
+
+⭐ **Arm D is the headline and it settles the arc's biggest open question.** `gpu.md`'s entire Phase
+III risk model rested on an assumption that had **never been measured**: that the console survives a
+dead GPU. It does. With `gpu_wedged=1` and `recover_rung=4`, the shell accepted commands, the panel
+painted, and `klug` wrote the log to disk. **R-4's degradation to the CPU blit path is proven on
+iron**, and Phase III is not disqualified on the console-death axis.
+
+⛔ **Recovery does NOT work on this silicon.** `CP_HQD_DEQUEUE_REQUEST` never cleared
+`CP_HQD_ACTIVE`, before or after an MEC halt/un-halt cycle. The ladder escalated exactly as designed
+and reached R-4. Pre-registered branch: *"`ACTIVE` stuck at 1 ⇒ … R-4 is the shipped answer and
+Phase III's risk rating rises."* agnos can **detect** a GPU hang and **survive** it; it cannot
+**clear** one. Do not build anything that assumes a wedged MEC queue can be reclaimed.
+
+⚠ **Arm C-after must not be read as "recovery corrupts the GPU."** The GPU was still wedged when C
+ran — R-4 had given up, so no recovery occurred. C's failure is a *consequence* of B's, not
+independent evidence. That pre-registered branch remains **untested**.
+
+★ **The forensic block fired automatically — the first time agnos has ever captured a GPU hang.**
+
+### Fixed — `gpu_forensic_dump` raced the submission and reported the wrong cause
+
+The burn found a defect in the instrument every Phase II rung is meant to cite.
+
+The bracket **works**: arm C's dump read `breadcrumb seq 1 of 2 -- the hang is AFTER this packet
+block`, which is exactly right. But arm A's **own** dump, taken immediately after submit, read
+`rptr 529 wptr 529` and `breadcrumb NEVER WRITTEN -- the CP executed no packet at all`. The CP had
+simply **not fetched yet** — the dump raced the submission. Moments later the same hang read
+`rptr 534 wptr 614` with the breadcrumb at seq 1.
+
+An unwritten breadcrumb has **two causes demanding opposite investigations**, and collapsing them
+sent the first reading of this arc's most important burn the wrong way:
+
+- `rptr == wptr` → **submitted but not yet fetched.** Suspect the doorbell / wptr update.
+- `rptr < wptr` → the CP **is** fetching and executed nothing. Suspect the first packet.
+
+The dump now settles briefly, **re-reads**, reports `breadcrumb appeared after settle` when it had
+merely raced, and otherwise names which of the two causes applies.
+
+⚠ Also corrected in analysis: `fence saw deadbeef` is a **pre-poisoned sentinel** (`gpu.cyr:1491`),
+not the WAIT packet's reference value — it means nothing wrote the slot.
+
+⚠ Still deferred: **arm E** (the unguarded EXEC control) needs rung 6 `arena-audit` for a
+provably-free sacrificial slot. It must land before rung 12 specifies triangles from ring 3.
+
 ## [1.56.16] - 2026-07-25
 
 **3D ARC OPENS — Phase I instruments (open cycle).** Bumped on cycle open; the user tags at close.

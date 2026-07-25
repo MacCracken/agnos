@@ -248,8 +248,38 @@ fn gpu_forensic_dump(done_phys, expect) {
     # ⛔ THE BRACKET ITSELF. A breadcrumb that never advanced past its base means the CP never
     # executed a single packet — a different failure from one that stopped midway, and the
     # distinction decides whether to suspect submission or a specific packet.
+    # ⛔ THE RACE THAT MADE THIS INSTRUMENT LIE ONCE (iron, 2026-07-25, rung 5 arm A).
+    # The first version reported "the CP executed no packet at all" whenever the breadcrumb was
+    # unwritten. On the rung-5 burn that fired with `rptr 529 wptr 529` — the CP had simply NOT
+    # FETCHED YET; the dump raced the submission. Moments later, during arm C, the SAME hang read
+    # `rptr 534 wptr 614` and `breadcrumb seq 1`, which is the correct bracket.
+    # An unwritten breadcrumb has TWO causes demanding OPPOSITE investigations:
+    #     rptr == wptr -> submitted but NOT YET FETCHED. Suspect the doorbell / wptr update.
+    #     rptr <  wptr -> the CP IS fetching and executed nothing. Suspect the first packet.
+    # Collapsing them sent the first reading of this arc's most important burn the wrong way.
+    # ⚠ SETTLE, THEN RE-READ: the CP may be mid-fetch at the instant of the timeout, and a
+    # bounded settle costs nothing on a path that has already waited its full timeout.
     if ((crumb & 0xFFFF0000) != GPU_BREADCRUMB_BASE) {
-        kprintln("gpu: breadcrumb NEVER WRITTEN -- the CP executed no packet at all", 65);
+        gpu_udelay(2000);
+        crumb = load32(gpu_arena_phys + GPU_BREADCRUMB_SUBOFF) & 0xFFFFFFFF;
+        gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+        var rptr2 = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR) & 0xFFFFFFFF;
+        gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+        if ((crumb & 0xFFFF0000) == GPU_BREADCRUMB_BASE) {
+            kprint("gpu: breadcrumb appeared after settle -- seq ", 45);
+            kprint_num(crumb & 0xFFFF);
+            kprintln(" (the dump had raced the CP)", 28);
+        }
+        if ((crumb & 0xFFFF0000) != GPU_BREADCRUMB_BASE) {
+            if (rptr2 == wptr) {
+                kprintln("gpu: breadcrumb unwritten, rptr == wptr -- SUBMITTED BUT NOT FETCHED", 68);
+                kprintln("gpu: suspect the doorbell / wptr update, NOT the packet stream", 62);
+            }
+            if (rptr2 != wptr) {
+                kprintln("gpu: breadcrumb unwritten, rptr < wptr -- the CP IS fetching and", 64);
+                kprintln("gpu: executed nothing. Suspect the FIRST packet in the block", 60);
+            }
+        }
     }
     if ((crumb & 0xFFFF0000) == GPU_BREADCRUMB_BASE) {
         kprint("gpu: breadcrumb seq ", 20); kprint_num(crumb & 0xFFFF);
