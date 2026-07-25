@@ -44,6 +44,68 @@ byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random m
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
 
+### Added — bite **B4**: `gpu-test/edgeasm.cyr`, the authoring tool — calibrated on a shipped shader
+
+agnos hand-assembles shader blobs as literal `store32` dword tables. That has worked because every
+shipped kernel is 20–70 instructions with **at most one** backward branch whose offset is a
+hand-counted hex constant. ⛔ Rung 9b needs ~155 instructions across two blobs with **three**
+backward branches — and a dropped VOP3 or FLAT *hi* dword shifts everything after it and produces a
+**wrong picture, never a fault**. There is nothing to trap and nothing to bisect from.
+
+⭐ **CALIBRATION GATE: the tool re-emits `blend_cov`'s 67 shipped, iron-proven dwords
+byte-identically — 67/67 on the first run.** A tool that cannot reproduce a known-good shader has
+no business emitting a new one.
+
+⚠ **The instruction list was DERIVED from those 67 dwords through the encoder's own field
+formulas, not transcribed from the `.s` by eye.** Re-deriving and then diffing is a real check;
+hand-copying and then diffing marks its own homework, because both sides would carry the same
+mistake. [[feedback_audit_re_derive_dont_validate_comments]]
+
+- **mabda's encoder is included LIVE by relative path** — a vendored copy would drift and defeat
+  rung 7's agreement result entirely.
+- **The label/fixup pass and the asserting wrappers are LOCAL, never added to mabda.**
+  [[feedback_cyrius_hands_off]] is about cyrius, but the same logic governs any sibling repo:
+  agnos does not reach into mabda to add what agnos needs.
+- mabda's 19 encode functions are **pure bit-packers with no validation of any kind** — `vsrc1 =
+  300` silently encodes as `v44`. Every wrapper exists to turn one of those silent mis-encodings
+  into a loud refusal: `e_vop3` emits **both** dwords in one call (a call cannot half-emit) and
+  refuses `src == 255` (VOP3 has no literal form); `K()` fails loud instead of silently returning
+  255; `V()`/`S()` are range-checked.
+- ⚠ Array sizing **re-derived, not copied**: `gfx9_compile` declares `patch_off[2048]`
+  function-local (2048 *bytes*); at module scope the same declaration is 8× that.
+  [[feedback_cyrius_var_array_u64_units]]
+
+**Calibrated against five mutations. Four caught cleanly; the fifth is documented rather than
+claimed:**
+
+| mutation | outcome |
+|---|---|
+| `e_vop3` emits only the lo dword — the canonical silent shift | **caught**: 58 dwords, and the diff names the first shifted one |
+| one operand wrong (`s24` → `v24`) | **caught**: dword 30 |
+| fixup arithmetic off by one (`br+4` → `br`) | **caught**: both branches |
+| the `simm16` range check deleted | **caught**, after the fix below |
+| the patch-site bounds check deleted | ⚠ **not reliably caught — and the reason is recorded** |
+
+### Fixed — two defects in the tool, both surfaced by its own mutation battery
+
+**(1) The `simm16` range check was shipping untested.** Deleting it passed, because `simm16` spans
+±32767 **dwords** = 256 KB of branch distance while the ISA buffer is 8 KB — so no in-buffer
+branch can ever overflow it and the check is unreachable through `ea_fixup`. The arithmetic is now
+extracted into `ea_simm_ok()` and tested **directly**, including that `+32767` exactly is
+*accepted*. It is defence for a blob larger than today's, and it is tested as such.
+
+**(2) ⭐ `ea_fixup` wrote at the patch offset on trust.** Deleting the range check turned a clean
+refusal into a **SIGSEGV**, which exposed that the fixup pass could write outside its own buffer —
+a worse failure than the mis-encoding it exists to prevent, since it corrupts whatever follows
+`isa` and the symptom appears somewhere else entirely. Now bounds-checked.
+
+⚠ **Recorded honestly:** deleting that bounds check is **not** reliably caught by the battery, and
+the reason is worth knowing — the out-of-bounds write does not fault (192 KB past `isa` is still
+mapped), it silently corrupts, and what it corrupts can include the battery's own counters. **A
+test cannot dependably detect the removal of a guard against memory corruption, because the
+corruption is free to perturb the test.** Kept as defence-in-depth on that understanding, not as
+something gate 3 proves.
+
 ### Added — bite **B3**: the coordinate guard, `GPO_E_COORD` (QEMU, zero burns)
 
 `gpo_validate_edge` bounded `w`, `h`, `n_edges`, `rule` and both slots — but never the

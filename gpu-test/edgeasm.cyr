@@ -1,0 +1,472 @@
+# edgeasm.cyr — RUNG 9b BITE B4. THE AUTHORING TOOL.
+#
+# ============================================================================================
+# WHY A TOOL, AND WHY IT IS ITS OWN BITE
+# ============================================================================================
+# agnos ships shader blobs as literal `store32` dword tables, hand-assembled. That has worked
+# because every shipped kernel is 20-70 instructions with AT MOST ONE backward branch, whose
+# offset is a hand-counted hex constant.
+#
+# ⛔ Rung 9b needs ~155 instructions across two blobs with THREE backward branches. Hand-counting
+# three offsets through a 140-dword stream is the silent-corruption failure mode this rung cannot
+# afford: a dropped VOP3 or FLAT *hi* dword shifts everything after it and produces a WRONG
+# PICTURE, never a fault. There is no exception to trap and nothing to bisect from — the panel's
+# rung-7 row exists verbatim to catch this "before anyone hand-writes a 200-instruction kernel."
+#
+# ============================================================================================
+# WHAT IS LOCAL AND WHAT IS NOT
+# ============================================================================================
+# The ENCODER is mabda's, included LIVE by relative path — a vendored copy would drift and
+# defeat the whole point of rung 7's agreement result. [[feedback_never_fix_in_materialized_libs]]
+#
+# The LABEL/FIXUP PASS and the ASSERTING WRAPPERS are LOCAL, added here and never in mabda.
+# [[feedback_cyrius_hands_off]] is about cyrius, but the same logic governs any sibling repo:
+# agnos does not reach into mabda to add what agnos needs.
+#
+# mabda's 19 encode functions are PURE BIT-PACKERS with no validation of any kind — `vsrc1 = 300`
+# silently encodes as `v44`. Every wrapper below exists to turn one of those silent
+# mis-encodings into a loud refusal.
+#
+# ============================================================================================
+# ⛔ THE CALIBRATION GATE — NON-NEGOTIABLE
+# ============================================================================================
+# The tool must re-emit `blend_cov`'s 67 SHIPPED, IRON-PROVEN dwords byte-identically from an
+# instruction list. A tool that cannot reproduce a known-good shader has no business emitting a
+# new one, and "it looks right" is not a standard that survives a wrong picture on iron.
+#
+# ⚠ The instruction list below was DERIVED from those 67 dwords through the encoder's own field
+# formulas — not transcribed from the .s by eye. [[feedback_audit_re_derive_dont_validate_comments]]
+# Re-deriving and then diffing is a real check; hand-copying and then diffing marks its own
+# homework, because both sides would share the same mistake.
+#
+# Build:  cd gpu-test && CYRIUS_ALLOW_PARENT_INCLUDES=1 cyrius build edgeasm.cyr build/edgeasm
+# Run:    ./build/edgeasm   -> 95 calibration + label pass green · 90 a gate failed (named)
+
+include "lib/io.cyr"
+include "../../mabda/src/gfx9_encode.cyr"
+
+fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn ps(s): i64 { print(s, slen(s)); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn puts(s): i64 { ps(s); nl(); return 0; }
+fn pnum(v): i64 {
+    if (v == 0) { print("0", 1); return 0; }
+    var neg = 0; var x = v;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    var b[24]; var i = 0;
+    while (x > 0) { store8(&b + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
+    if (neg == 1) { print("-", 1); }
+    while (i > 0) { i = i - 1; print(&b + i, 1); }
+    return 0;
+}
+fn phex(v): i64 {
+    ps("0x");
+    var i = 7;
+    while (i >= 0) {
+        var nib = (v >> (i * 4)) & 0xF;
+        var ch = 48 + nib;
+        if (nib > 9) { ch = 87 + nib; }
+        var c[2]; store8(&c, ch); print(&c, 1);
+        i = i - 1;
+    }
+    return 0;
+}
+
+# ============================================================================================
+# ASSERTING WRAPPERS — every one exists to make a silent mis-encoding loud
+# ============================================================================================
+var ea_fault = 0;               # sticky: any refusal latches, so a caller that ignores a return
+                                # value still cannot report a green result
+fn ea_fail(msg): i64 { ea_fault = 1; ps("  ** edgeasm: "); puts(msg); return 0; }
+
+var VCC = 106;
+var LIT = 255;
+var F1  = 242;                  # the f32 inline constant 1.0
+
+fn V(n): i64 {
+    if (n < 0)   { ea_fail("VGPR index negative"); return 0; }
+    if (n > 255) { ea_fail("VGPR index > 255 -- mabda would silently mask it to 8 bits"); return 0; }
+    return gfx9_vgpr(n);
+}
+fn S(n): i64 {
+    if (n < 0)   { ea_fail("SGPR index negative"); return 0; }
+    if (n > 101) { ea_fail("SGPR index > 101 -- not an SGPR"); return 0; }
+    return gfx9_sgpr(n);
+}
+# ⛔ FAILS LOUD instead of silently returning 255. mabda's gfx9_inline_int returns
+# GFX9_SRC_LITERAL for anything outside [-16, 64] and expects the CALLER to notice and emit a
+# trailing literal dword. In VOP3 there IS no literal form, so a 255 that slips through encodes
+# an operand that does not exist.
+fn K(k): i64 {
+    var r = gfx9_inline_int(k);
+    if (r == GFX9_SRC_LITERAL) { ea_fail("inline constant out of [-16,64] -- use a literal form"); return 0; }
+    return r;
+}
+
+var EA_ISA_BYTES = 8192;        # module-scope var[N] = N x u64, so isa[1024] is 8192 BYTES
+var isa[1024];
+
+fn e_vop1(p, op, vdst, s0): i64 { return gfx9_emit32(&isa, p, gfx9_enc_vop1(op, vdst, s0)); }
+fn e_vop2(p, op, vdst, s0, vs1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_vop2(op, vdst, s0, vs1)); }
+fn e_vopc(p, op, s0, vs1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_vopc(op, s0, vs1)); }
+fn e_sop1(p, op, sdst, s0): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop1(op, sdst, s0)); }
+fn e_sop2(p, op, sdst, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sop2(op, sdst, s0, s1)); }
+fn e_sopc(p, op, s0, s1): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sopc(op, s0, s1)); }
+fn e_sopp(p, op, imm): i64 { return gfx9_emit32(&isa, p, gfx9_enc_sopp(op, imm)); }
+fn e_sop1_lit(p, op, sdst, lit): i64 {
+    var q = gfx9_emit32(&isa, p, gfx9_enc_sop1(op, sdst, GFX9_SRC_LITERAL));
+    return gfx9_emit32(&isa, q, lit);
+}
+
+# ⭐ BOTH DWORDS IN ONE CALL. A VOP3 is two dwords and every shipped agnos shader emits them as
+# two separate store32s. Dropping the hi dword is invisible: the stream still assembles, every
+# instruction after it shifts by one dword, and the result is a wrong picture with no fault.
+# One call cannot half-emit.
+#
+# ⛔ REFUSES src == 255. VOP3 has NO literal form — mabda's own compiler treats this as
+# CMP_ERR_VOP3_LITERAL. Silently encoding it names an operand that does not exist.
+fn e_vop3(p, op, vdst, s0, s1, s2): i64 {
+    if (s0 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src0 is a LITERAL -- VOP3 has no literal form"); }
+    if (s1 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src1 is a LITERAL -- VOP3 has no literal form"); }
+    if (s2 == GFX9_SRC_LITERAL) { ea_fail("VOP3 src2 is a LITERAL -- VOP3 has no literal form"); }
+    var q = gfx9_emit32(&isa, p, gfx9_enc_vop3a_lo(op, vdst));
+    return gfx9_emit32(&isa, q, gfx9_enc_vop3a_hi(s0, s1, s2));
+}
+fn e_vop3b(p, op, sdst, vdst, s0, s1, s2): i64 {
+    if (s0 == GFX9_SRC_LITERAL) { ea_fail("VOP3b src0 is a LITERAL"); }
+    var q = gfx9_emit32(&isa, p, gfx9_enc_vop3b_lo(op, sdst, vdst));
+    return gfx9_emit32(&isa, q, gfx9_enc_vop3a_hi(s0, s1, s2));
+}
+# FLAT is likewise two dwords and likewise silent if half-emitted.
+fn e_flat(p, op, glc, vdst, data, vaddr, off): i64 {
+    var q = gfx9_emit32(&isa, p, gfx9_enc_flat_lo(op, GFX9_FLAT_SEG_GLOBAL, off, glc, 0));
+    return gfx9_emit32(&isa, q, gfx9_enc_flat_hi(vdst, GFX9_SADDR_OFF, data, vaddr));
+}
+
+# ============================================================================================
+# THE LABEL / FIXUP PASS — lifted from mabda/src/gfx9_compile.cyr:827-884, LOCALLY
+# ============================================================================================
+# A branch's simm16 is (target - (branch_pc + 4)) / 4, in DWORDS, signed. Forward branches
+# cannot be resolved when emitted, so a placeholder goes down and the offset is patched once
+# every label position is known.
+#
+# ⚠ ARRAY SIZING RE-DERIVED, NOT COPIED. gfx9_compile declares `var patch_off[2048]`
+# FUNCTION-LOCAL, which in Cyrius is 2048 BYTES. At MODULE scope the same declaration is
+# 2048 x u64 = 8x that. [[feedback_cyrius_var_array_u64_units]] — the units are non-uniform by
+# scope and this is exactly the place that bites.
+var EA_MAXLAB = 64;
+var lab_off[64];                # byte offset of each label id (-1 = not yet seen)
+var patch_off[256];             # byte offset of the branch dword needing a fixup
+var patch_tgt[256];             # the label id it targets
+var n_patch = 0;
+
+fn ea_labels_reset(): i64 {
+    var i = 0;
+    while (i < EA_MAXLAB) { store64(&lab_off + i * 8, 0 - 1); i = i + 1; }
+    n_patch = 0;
+    return 0;
+}
+fn ea_label(p, id): i64 {
+    if (id < 0) { ea_fail("label id negative"); return p; }
+    if (id >= EA_MAXLAB) { ea_fail("label id over EA_MAXLAB"); return p; }
+    if (load64(&lab_off + id * 8) != 0 - 1) { ea_fail("label defined TWICE -- the second wins silently"); return p; }
+    store64(&lab_off + id * 8, p);
+    return p;
+}
+# Emit a branch whose target may not exist yet. The placeholder is 0.
+fn ea_branch(p, op, id): i64 {
+    if (n_patch >= 256) { ea_fail("branch patch list full"); return p; }
+    store64(&patch_off + n_patch * 8, p);
+    store64(&patch_tgt + n_patch * 8, id);
+    n_patch = n_patch + 1;
+    return gfx9_emit32(&isa, p, gfx9_enc_sopp(op, 0));
+}
+# ⭐ THE OFFSET ARITHMETIC, EXTRACTED SO IT CAN BE TESTED ON ITS OWN TERMS.
+# simm16 is SIGNED 16-bit and spans +-32767 DWORDS = 256 KB of branch distance, while the ISA
+# buffer is 8 KB. So no in-buffer branch can ever overflow it, and the check is UNREACHABLE
+# through ea_fixup() at this buffer size — which is exactly why deleting it passed the first
+# calibration. It is defence for a blob larger than today's, so it is tested DIRECTLY here
+# rather than through a 256 KB stream nobody will ever emit.
+# ⛔ An unchecked overflow would WRAP and branch somewhere plausible-looking: a wrong picture,
+# never a fault.
+fn ea_simm(br, tgt): i64 { return (tgt - (br + 4)) / 4; }
+fn ea_simm_ok(br, tgt): i64 {
+    var simm = ea_simm(br, tgt);
+    if (simm > 32767)     { return 0; }
+    if (simm < 0 - 32768) { return 0; }
+    return 1;
+}
+
+# Resolve every branch. Returns 1 / 0.
+fn ea_fixup(): i64 {
+    var i = 0;
+    while (i < n_patch) {
+        var br = load64(&patch_off + i * 8);
+        var id = load64(&patch_tgt + i * 8);
+        var tgt = load64(&lab_off + id * 8);
+        if (tgt == 0 - 1) { ea_fail("branch to an UNDEFINED label"); return 0; }
+        # ⛔ BOUNDS-CHECK THE PATCH SITE BEFORE COMPUTING ANYTHING. Found by mutation: deleting
+        # the simm16 range check below turned a clean refusal into a SIGSEGV, because this
+        # function wrote at `br` on trust. A fixup pass that can write outside its own buffer is
+        # a worse failure than the mis-encoding it exists to prevent — it corrupts whatever
+        # follows `isa` and the symptom appears somewhere else entirely.
+        # ⚠ HONEST LIMIT, RECORDED RATHER THAN PAPERED OVER. This bounds check is real and
+        # correct, but its DELETION is not reliably caught by gate 3 — and the reason is worth
+        # knowing: the out-of-bounds write it prevents does not fault (192 KB past `isa` is
+        # still mapped), it silently corrupts, and what it corrupts can include the battery's
+        # own counters. A test cannot dependably detect the removal of a guard against memory
+        # corruption, because the corruption is free to perturb the test. Kept as
+        # defence-in-depth on that understanding, not as something gate 3 proves.
+        if (br < 0)              { ea_fail("patch site negative"); return 0; }
+        if (br + 4 > EA_ISA_BYTES) { ea_fail("patch site outside the ISA buffer"); return 0; }
+        if (tgt < 0)             { ea_fail("label position negative"); return 0; }
+        if (tgt > EA_ISA_BYTES)  { ea_fail("label position outside the ISA buffer"); return 0; }
+        var simm = ea_simm(br, tgt);
+        if (ea_simm_ok(br, tgt) == 0) { ea_fail("branch offset overflows simm16"); return 0; }
+        var old = load32(&isa + br) & 0xFFFFFFFF;
+        store32(&isa + br, (old & 0xFFFF0000) | (simm & 0xFFFF));
+        i = i + 1;
+    }
+    return 1;
+}
+
+# ============================================================================================
+# THE CALIBRATION — blend_cov's 67 shipped, iron-proven dwords
+# ============================================================================================
+var bc_want[128];
+fn bc_expected(): i64 {
+    store64(&bc_want +   0 * 8, 0x8E0A8608);
+    store64(&bc_want +   1 * 8, 0x6818000A);
+    store64(&bc_want +   2 * 8, 0x7D981806);
+    store64(&bc_want +   3 * 8, 0xBE94206A);
+    store64(&bc_want +   4 * 8, 0x920B0409);
+    store64(&bc_want +   5 * 8, 0x800B0A0B);
+    store64(&bc_want +   6 * 8, 0x800C0B00);
+    store64(&bc_want +   7 * 8, 0x820D8001);
+    store64(&bc_want +   8 * 8, 0x8E0E8808);
+    store64(&bc_want +   9 * 8, 0x920F0509);
+    store64(&bc_want +  10 * 8, 0x800F0E0F);
+    store64(&bc_want +  11 * 8, 0x80100F02);
+    store64(&bc_want +  12 * 8, 0x82118003);
+    store64(&bc_want +  13 * 8, 0x7E08020C);
+    store64(&bc_want +  14 * 8, 0x7E0A020D);
+    store64(&bc_want +  15 * 8, 0x32080104);
+    store64(&bc_want +  16 * 8, 0x380A0A80);
+    store64(&bc_want +  17 * 8, 0xDC408000);
+    store64(&bc_want +  18 * 8, 0x027F0004);
+    store64(&bc_want +  19 * 8, 0x24020082);
+    store64(&bc_want +  20 * 8, 0x7E0C0210);
+    store64(&bc_want +  21 * 8, 0x7E0E0211);
+    store64(&bc_want +  22 * 8, 0x320C0306);
+    store64(&bc_want +  23 * 8, 0x380E0E80);
+    store64(&bc_want +  24 * 8, 0xDC508000);
+    store64(&bc_want +  25 * 8, 0x037F0006);
+    store64(&bc_want +  26 * 8, 0xBF8C0F70);
+    store64(&bc_want +  27 * 8, 0xBE9800FF);
+    store64(&bc_want +  28 * 8, 0x3B808081);
+    store64(&bc_want +  29 * 8, 0x7E102302);
+    store64(&bc_want +  30 * 8, 0x0A101018);
+    store64(&bc_want +  31 * 8, 0xBE9900FF);
+    store64(&bc_want +  32 * 8, 0xBB808081);
+    store64(&bc_want +  33 * 8, 0x7E122807);
+    store64(&bc_want +  34 * 8, 0x0A121109);
+    store64(&bc_want +  35 * 8, 0xD1CB000A);
+    store64(&bc_want +  36 * 8, 0x03C83309);
+    store64(&bc_want +  37 * 8, 0x7E1A2207);
+    store64(&bc_want +  38 * 8, 0x0A1A110D);
+    store64(&bc_want +  39 * 8, 0x7E1C2303);
+    store64(&bc_want +  40 * 8, 0xD1CB000D);
+    store64(&bc_want +  41 * 8, 0x0436150E);
+    store64(&bc_want +  42 * 8, 0xD1DD000B);
+    store64(&bc_want +  43 * 8, 0x042D010D);
+    store64(&bc_want +  44 * 8, 0x7E1A2407);
+    store64(&bc_want +  45 * 8, 0x0A1A110D);
+    store64(&bc_want +  46 * 8, 0x7E1C2503);
+    store64(&bc_want +  47 * 8, 0xD1CB000D);
+    store64(&bc_want +  48 * 8, 0x0436150E);
+    store64(&bc_want +  49 * 8, 0xD1DD000B);
+    store64(&bc_want +  50 * 8, 0x042D030D);
+    store64(&bc_want +  51 * 8, 0x7E1A2607);
+    store64(&bc_want +  52 * 8, 0x0A1A110D);
+    store64(&bc_want +  53 * 8, 0x7E1C2703);
+    store64(&bc_want +  54 * 8, 0xD1CB000D);
+    store64(&bc_want +  55 * 8, 0x0436150E);
+    store64(&bc_want +  56 * 8, 0xD1DD000B);
+    store64(&bc_want +  57 * 8, 0x042D050D);
+    store64(&bc_want +  58 * 8, 0x7E1C2903);
+    store64(&bc_want +  59 * 8, 0xD1CB000D);
+    store64(&bc_want +  60 * 8, 0x0426150E);
+    store64(&bc_want +  61 * 8, 0xD1DD000B);
+    store64(&bc_want +  62 * 8, 0x042D070D);
+    store64(&bc_want +  63 * 8, 0xDC718000);
+    store64(&bc_want +  64 * 8, 0x007F0B06);
+    store64(&bc_want +  65 * 8, 0xBF8C0F70);
+    store64(&bc_want +  66 * 8, 0xBF810000);
+    return 67;
+}
+
+fn bc_emit(): i64 {
+    var p = 0;
+    p = e_sop2(p, 0x1C, 10, S(8), K(6));
+    p = e_vop2(p, 0x34, 12, S(10), 0);
+    p = e_vopc(p, 0xCC, S(6), 12);
+    p = e_sop1(p, 0x20, 20, VCC);
+    p = e_sop2(p, 0x24, 11, S(9), S(4));
+    p = e_sop2(p, 0x00, 11, S(11), S(10));
+    p = e_sop2(p, 0x00, 12, S(0), S(11));
+    p = e_sop2(p, 0x04, 13, S(1), K(0));
+    p = e_sop2(p, 0x1C, 14, S(8), K(8));
+    p = e_sop2(p, 0x24, 15, S(9), S(5));
+    p = e_sop2(p, 0x00, 15, S(15), S(14));
+    p = e_sop2(p, 0x00, 16, S(2), S(15));
+    p = e_sop2(p, 0x04, 17, S(3), K(0));
+    p = e_vop1(p, 0x01, 4, S(12));
+    p = e_vop1(p, 0x01, 5, S(13));
+    p = e_vop2(p, 0x19, 4, V(4), 0);
+    p = e_vop2(p, 0x1C, 5, K(0), 5);
+    p = e_flat(p, 0x10, 0, 2, 0, 4, 0);
+    p = e_vop2(p, 0x12, 1, K(2), 0);
+    p = e_vop1(p, 0x01, 6, S(16));
+    p = e_vop1(p, 0x01, 7, S(17));
+    p = e_vop2(p, 0x19, 6, V(6), 1);
+    p = e_vop2(p, 0x1C, 7, K(0), 7);
+    p = e_flat(p, 0x14, 0, 3, 0, 6, 0);
+    p = e_sopp(p, 0x0C, 3952);
+    p = e_sop1_lit(p, 0x00, 24, 0x3B808081);
+    p = e_vop1(p, 0x11, 8, V(2));
+    p = e_vop2(p, 0x05, 8, S(24), 8);
+    p = e_sop1_lit(p, 0x00, 25, 0xBB808081);
+    p = e_vop1(p, 0x14, 9, S(7));
+    p = e_vop2(p, 0x05, 9, V(9), 8);
+    p = e_vop3(p, 0x1CB, 10, V(9), S(25), F1);
+    p = e_vop1(p, 0x11, 13, S(7));
+    p = e_vop2(p, 0x05, 13, V(13), 8);
+    p = e_vop1(p, 0x11, 14, V(3));
+    p = e_vop3(p, 0x1CB, 13, V(14), V(10), V(13));
+    p = e_vop3(p, 0x1DD, 11, V(13), K(0), V(11));
+    p = e_vop1(p, 0x12, 13, S(7));
+    p = e_vop2(p, 0x05, 13, V(13), 8);
+    p = e_vop1(p, 0x12, 14, V(3));
+    p = e_vop3(p, 0x1CB, 13, V(14), V(10), V(13));
+    p = e_vop3(p, 0x1DD, 11, V(13), K(1), V(11));
+    p = e_vop1(p, 0x13, 13, S(7));
+    p = e_vop2(p, 0x05, 13, V(13), 8);
+    p = e_vop1(p, 0x13, 14, V(3));
+    p = e_vop3(p, 0x1CB, 13, V(14), V(10), V(13));
+    p = e_vop3(p, 0x1DD, 11, V(13), K(2), V(11));
+    p = e_vop1(p, 0x14, 14, V(3));
+    p = e_vop3(p, 0x1CB, 13, V(14), V(10), V(9));
+    p = e_vop3(p, 0x1DD, 11, V(13), K(3), V(11));
+    p = e_flat(p, 0x1C, 1, 0, 11, 6, 0);
+    p = e_sopp(p, 0x0C, 3952);
+    p = e_sopp(p, 0x01, 0);
+    return p;
+}
+
+fn main(): i64 {
+    puts("edgeasm -- RUNG 9b BITE B4: the authoring tool, calibrated on a shipped shader");
+    puts("=============================================================================");
+    var ok = 1;
+
+    # ---- GATE 1: re-emit blend_cov byte-identically ---------------------------------------
+    puts("[gate 1] re-emit blend_cov's 67 SHIPPED, IRON-PROVEN dwords");
+    bc_expected();
+    var n = bc_emit() / 4;
+    if (ea_fault != 0) { puts("  ** an asserting wrapper REFUSED during emission"); ok = 0; }
+    if (n != 67) {
+        ps("  ** emitted "); pnum(n); puts(" dwords, expected 67");
+        ok = 0;
+    }
+    var bad = 0;
+    var i = 0;
+    while (i < 67) {
+        var got = load32(&isa + i * 4) & 0xFFFFFFFF;
+        var wnt = load64(&bc_want + i * 8);
+        if (got != wnt) {
+            bad = bad + 1;
+            if (bad < 6) {
+                ps("  ** dword "); pnum(i); ps("  want "); phex(wnt); ps("  got "); phex(got); nl();
+            }
+        }
+        i = i + 1;
+    }
+    if (bad == 0) { puts("  -> 67 of 67 byte-identical"); }
+    if (bad != 0) {
+        ps("  -> "); pnum(bad); puts(" of 67 DIFFER");
+        puts("  ** The tool cannot reproduce a known-good shader. It must not emit a new one.");
+        ok = 0;
+    }
+
+    # ---- GATE 2: the label/fixup pass ------------------------------------------------------
+    # A backward branch, a forward branch, and the two refusals that matter.
+    puts("[gate 2] the label/fixup pass");
+    ea_labels_reset();
+    ea_fault = 0;
+    var p = 0;
+    p = ea_label(p, 0);                                  # L0 at byte 0
+    p = e_sopp(p, 0x00, 0);                              # s_nop
+    p = e_sopp(p, 0x00, 0);
+    p = ea_branch(p, 0x02, 0);                           # s_cbranch_scc1 BACK to L0
+    var fwd = p;
+    p = ea_branch(p, 0x02, 1);                           # forward to L1
+    p = e_sopp(p, 0x00, 0);
+    p = ea_label(p, 1);
+    if (ea_fixup() != 1) { puts("  ** fixup FAILED"); ok = 0; }
+    # backward branch at byte 8 -> target 0: simm = (0 - 12)/4 = -3 -> 0xFFFD
+    var b0 = load32(&isa + 8) & 0xFFFF;
+    if (b0 != 65533) { ps("  ** backward simm16 want 65533 got "); pnum(b0); nl(); ok = 0; }
+    # forward branch at byte 12 -> target 20: simm = (20 - 16)/4 = 1
+    var b1 = load32(&isa + fwd) & 0xFFFF;
+    if (b1 != 1) { ps("  ** forward simm16 want 1 got "); pnum(b1); nl(); ok = 0; }
+    if (ea_fault != 0) { puts("  ** a wrapper refused during a VALID sequence"); ok = 0; }
+    if (ok == 1) { puts("  -> backward -3 and forward +1 both resolved"); }
+
+    # ---- GATE 3: the refusals must actually refuse ------------------------------------------
+    # ⛔ Every wrapper here exists to turn a SILENT mis-encoding loud. If a refusal does not
+    # fire, the wrapper is decoration and mabda's unvalidated packer is what actually ships.
+    puts("[gate 3] the refusals fire");
+    var r = 0;
+    ea_fault = 0; V(300);            if (ea_fault == 1) { r = r + 1; }
+    ea_fault = 0; S(200);            if (ea_fault == 1) { r = r + 1; }
+    ea_fault = 0; K(1000);           if (ea_fault == 1) { r = r + 1; }
+    ea_fault = 0; e_vop3(0, 0x285, 1, LIT, V(2), V(3));  if (ea_fault == 1) { r = r + 1; }
+    ea_fault = 0; ea_labels_reset(); ea_label(0, 3); ea_label(4, 3); if (ea_fault == 1) { r = r + 1; }
+    ea_fault = 0; ea_labels_reset(); ea_branch(0, 0x02, 7); if (ea_fixup() == 0) { r = r + 1; }
+    # ⭐ THE simm16 RANGE CHECK. Added because the mutation that DELETED it passed: no ordinary
+    # case can produce an out-of-range offset (the ISA buffer is 8 KB and simm16 spans 128 KB of
+    # branch distance), so the check was shipping untested. The label position is set DIRECTLY
+    # rather than by emitting 32k dwords — the arithmetic is what is under test, not the buffer.
+    # ⛔ An unchecked overflow would WRAP and branch somewhere plausible: a wrong picture, never
+    # a fault, which is the entire failure class this tool exists to eliminate.
+    # ⛔ THE DANGEROUS SHAPE: patch site outside the buffer while the OFFSET IS IN RANGE. Both
+    # br and tgt at 200000 give simm = -1, so the simm16 check passes and only the bounds check
+    # stands between ea_fixup and a write 192 KB past the end of `isa`. Found by mutation: the
+    # first version of this case had tgt = 0, which made simm = -50001 and was caught by the
+    # RANGE check instead — so deleting the bounds check still passed, and the SIGSEGV it
+    # protects against was one in-range offset away.
+    ea_fault = 0; ea_labels_reset();
+    store64(&lab_off + 6 * 8, 200000);
+    store64(&patch_off + 0 * 8, 200000); store64(&patch_tgt + 0 * 8, 6); n_patch = 1;
+    if (ea_fixup() == 0) { r = r + 1; }                 # patch site outside the ISA buffer
+    # The simm16 bound, tested on the ARITHMETIC directly -- see ea_simm_ok's header for why it
+    # cannot be reached through ea_fixup at an 8 KB buffer size.
+    if (ea_simm_ok(0, 200000) == 0) { r = r + 1; }      # +49999 dwords
+    if (ea_simm_ok(200000, 0) == 0) { r = r + 1; }      # -50001 dwords
+    if (ea_simm_ok(0, 131068) == 1) { r = r + 1; }      # +32767 EXACTLY -- must be ACCEPTED
+    ea_fault = 0;
+    ps("  -> "); pnum(r); puts(" of 10 refusals fired");
+    if (r != 10) {
+        puts("  ** a wrapper that does not refuse is decoration -- mabda's packer ships instead.");
+        ok = 0;
+    }
+
+    puts("");
+    if (ok == 0) { puts("** B4 FAILED. The tool is not trustworthy; do not author with it."); return 90; }
+    puts("B4 PASS -- the tool reproduces a shipped iron-proven shader byte-for-byte,");
+    puts("resolves forward and backward branches, and refuses every silent mis-encoding");
+    puts("mabda's pure bit-packers would otherwise let through.");
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
