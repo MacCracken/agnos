@@ -85,10 +85,37 @@ wantno(){ if grep -aq "$2" "$1"; then echo "FAIL: $4"; fail=$((fail+1)); else ec
 want "$LOG" "modeset: caps OK" \
      "the tool ran in ring 3 and #93 returned a valid caps read" \
      "no 'caps OK' — the tool did not run or #93 failed (see error lines above)"
-# The op-support mask must be exactly 127 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT). A 0 here would mean a constant collapsed.
-want "$LOG" "modeset: opmask=127" \
-     "the op-support mask is 127 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT) — the kernel wrote real caps, not zeros" \
-     "opmask != 127 — the caps write is wrong or a constant read 0"
+# The op-support mask must be EXACTLY the value this build's flags call for, and the two legal values are
+# not interchangeable — the mask is the ABI's self-description, so a wrong one is a lie the tool believes.
+#   127 = NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT   (no M9 arms)
+#   511 = the above + AUDIO_PRE + AUDIO_POST                        (MODESET_AUDIO_ARMS)
+# ⚠ Checking BOTH directions matters more than checking either. If this only ever asserted 127, a build that
+# forgot MODESET_AUDIO_ARMS would advertise the audio arms as ABSENT and the tool would report "wrong
+# kernel" — but a build that wrongly advertised them would sail through, and the operator would spend a burn
+# running a "treatment" the kernel cannot actually perform. The `wantno` below is what closes that.
+# ⚠ The expectation is derived from the KERNEL BINARY, never from the environment this script happens to be
+# invoked with. The env says what someone MEANT to build; only the artifact says what got built, and the
+# whole ATOM_DRY lesson is that those two diverge silently. `MODESET_AUDIO_ARMS` is by construction
+# MODESET_AUDIO ∧ ATOM_TX_CYCLE, so testing for one string from each conjunct reconstructs it exactly.
+K_AUDIO=0; K_CYCLE=0
+strings "$AGNOS" | grep -q "ARM 1 CONTROL: unmute BEFORE the edge" && K_AUDIO=1
+strings "$AGNOS" | grep -q "ATOM #76 CYCLE: DISABLE then ENABLE" && K_CYCLE=1
+echo "  (kernel flags read from the binary: MODESET_AUDIO=$K_AUDIO ATOM_TX_CYCLE=$K_CYCLE)"
+if [ "$K_AUDIO" = 1 ] && [ "$K_CYCLE" = 1 ]; then
+  want "$LOG" "modeset: opmask=511" \
+       "the op-support mask is 511 — the M9 audio arms ARE advertised, as MODESET_AUDIO_ARMS requires" \
+       "opmask != 511 — MODESET_AUDIO_ARMS did not reach MDO_OP_SUPPORTED, so --audio-pre/--audio-post cannot dispatch"
+  wantno "$LOG" "modeset: opmask=127" \
+       "the mask is not the un-armed 127 — the widening is real, not a stale constant" \
+       "opmask=127 in an ARMED build — the derived flag never took"
+else
+  want "$LOG" "modeset: opmask=127" \
+       "the op-support mask is 127 (NOP + CAPS + DUMP + LOCK + VTOTAL + RECOMMIT + TRANSMIT) — the kernel wrote real caps, not zeros" \
+       "opmask != 127 — the caps write is wrong or a constant read 0"
+  wantno "$LOG" "modeset: opmask=511" \
+       "⛔ the M9 audio arms are ABSENT from this build — an unarmed kernel must not advertise them" \
+       "opmask=511 without MODESET_AUDIO+ATOM_TX_CYCLE — the kernel is advertising ops whose experiment does not exist"
+fi
 # Under QEMU there is no AMD GPU, so the display must read DARK — this is what makes exit 96 the right answer.
 want "$LOG" "modeset: display DARK" \
      "the caps honestly report no lit display under QEMU" \

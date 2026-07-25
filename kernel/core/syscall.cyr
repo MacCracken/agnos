@@ -1324,11 +1324,25 @@ var MDO_OP_LOCK      = 0x03;        # M4 OTG-lock proof — take lock, write V_T
 var MDO_OP_VTOTAL    = 0x04;        # M5 first real modeset — V_TOTAL 1481->1501->1481, oracled off I2 refresh
 var MDO_OP_RECOMMIT  = 0x05;        # M6 same-mode OTG envelope — OTG_MASTER_EN 0 -> reprogram -> 1, I1 stop/resume
 var MDO_OP_TRANSMIT  = 0x06;        # M8 transmitter — ATOM #4 (+ #76, build-gated) INSIDE M6's envelope
-# bit N set <=> op N implemented: 0 NOP,1 CAPS,2 DUMP,3 LOCK,4 VTOTAL,5 RECOMMIT,6 TRANSMIT.
+var MDO_OP_AUDIO_PRE  = 0x07;       # M9 CONTROL   — transmit + audio unmuted BEFORE the transmitter edge
+var MDO_OP_AUDIO_POST = 0x08;       # M9 TREATMENT — transmit + audio unmuted AFTER  the transmitter edge
+# bit N set <=> op N implemented: 0 NOP,1 CAPS,2 DUMP,3 LOCK,4 VTOTAL,5 RECOMMIT,6 TRANSMIT,
+# 7 AUDIO_PRE, 8 AUDIO_POST.
 # ⚠ TRANSMIT is advertised UNCONDITIONALLY even though its body needs HDMI_ATOM: the op really is
 # implemented, and a build without the flag answers with the specific MDO_E_NOATOM rather than a generic
 # "unknown op" — which is the difference between "this kernel cannot drive the PHY" and "this ABI is old".
+# ⚠ The M9 pair is advertised CONDITIONALLY, and that asymmetry is deliberate. TRANSMIT's body exists in
+# every build; the audio arms only mean anything when BOTH halves of the experiment are real — the split
+# staging/unmute (MODESET_AUDIO) *and* an edge for them to sit before or after (ATOM_TX_CYCLE). That
+# conjunction is MODESET_AUDIO_ARMS, derived in build.sh, which is why the gate below is not MODESET_AUDIO.
+# Advertise on either flag alone and the tool can run a "control" and a "treatment" that are the SAME
+# experiment under two op codes — the ATOM_DRY class again, one layer up. Without it: MDO_E_BADOP, which
+# the tool reports as "wrong kernel" rather than silently producing a result that means nothing.
+#ifdef MODESET_AUDIO_ARMS
+var MDO_OP_SUPPORTED = 0x1FF;
+#else
 var MDO_OP_SUPPORTED = 0x7F;
+#endif
 var MDO_E_NOGPU      = 1;           # call/op — GPU/display unavailable (write ops only, once they exist)
 var MDO_E_BADOP      = 2;           # op    — unknown, reserved, or not implemented in this kernel
 var MDO_E_OUTBUF     = 3;           # op    — CAPS out_uva/out_len invalid
@@ -1350,6 +1364,7 @@ var MDO_E_NOATOM     = 18;          # op    — M8: this kernel was not built wi
 var MDO_E_ATOM       = 19;          # op    — M8: an ATOM step failed (vbios acquire/parse/init, or a table returned nonzero)
 var MDO_E_BEFE       = 20;          # op    — M8: the BE<->FE routing bracket did not read back as written
 var MDO_E_PHYDOWN    = 21;          # op    — M8e: #76 DISABLE took but ENABLE failed -> THE LINK IS DOWN (power-cycle)
+var MDO_E_AUDIO      = 22;          # op    — M9: the DISPLAY survived but the audio half refused (staging or unmute)
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -1898,7 +1913,7 @@ fn mdo_recommit() {
 #                            marker is PRESENT in this build and ABSENT in a bare one — because the last
 #                            accidental blanking came from ATOM_DRY being a flag build.sh never emitted, so
 #                            "dry" and "live" compiled byte-identical.
-fn mdo_transmit_run() {
+fn mdo_transmit_run(arm) {
     if (gpu_present == 0)      { return MDO_E_NOGPU; }
     if (gpu_display_ok != 1)   { return MDO_E_NOGPU; }
     if (gpu_display_pipe != 0) { kprintln("modeset: transmit refused -- live pipe is not 0", 47); return MDO_E_NOGPU; }
@@ -2003,13 +2018,30 @@ fn mdo_transmit_run() {
     }
 
     # ── BE<->FE DISCONNECT: clear FE_SOURCE_SELECT so no front end feeds the encoder while it is set up ──
-    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, s_be & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK));
+    # M9: the audio arms ALSO flip DIG_MODE 2 (DVI) -> 3 (HDMI) in this SAME write, because that is what the
+    # capture does — one store of 0x10030000 to abs 0x566f, mode and disconnect together, inside the window
+    # where the OTG is verified stopped. Two writes here would put a moment of live-HDMI-with-no-front-end
+    # on the wire that the reference never produces.
+    # ⛔ ARM 0 (plain MDO_OP_TRANSMIT) KEEPS DIG_MODE 2 — byte-for-byte the rung M8e already burned green.
+    # Every HDMI_* register is inert at DIG_MODE 2 (gpu.cyr's safety contract), so arm 0 stays the bounded
+    # display-only experiment it was validated as, and the flip is a variable only the audio arms carry.
+    var be_dis = s_be & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK);
+#ifdef MODESET_AUDIO
+    # ⚠ FIELD-modify the CURRENT value — never write a whole register derived from a snapshot
+    # ([[reference_agnos_dcn_hubp_reg_offsets_derived]]). Mask the field out, then OR the new mode in.
+    if (arm != 0) {
+        be_dis = (be_dis & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT);
+        kprintln("modeset: transmit -- DIG_MODE 2 -> 3 (HDMI signalling live; audio arm)", 70);
+    }
+#endif
+    gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, be_dis);
     gpu_mfence();
 
     # ── ATOM #4 DIGxEncoderControl — programs the DIG FRONT END for HDMI (data islands, clock pattern).
-    # ⚠ It does NOT switch the link to HDMI signalling: DIG_BE_CNTL.DIG_MODE is untouched (see the reconnect
-    # below for the measured write set). Saying "#4 puts the DIG in HDMI mode" is the claim that would make
-    # this burn's headline oracle false. Display-SAFE:
+    # ⚠ It does NOT switch the link to HDMI signalling: #4 leaves DIG_BE_CNTL.DIG_MODE untouched (see the
+    # reconnect below for the measured write set). Saying "#4 puts the DIG in HDMI mode" is the claim that
+    # would make this burn's headline oracle false — in the audio arms the link is already at DIG_MODE 3
+    # when #4 runs, but the DISCONNECT above put it there, not #4. Display-SAFE:
     # it drives the digital front end (0x56xx), disjoint from the PHY (0x5Dxx), and is iron-exonerated.
     kprintln("modeset: transmit -- ATOM #4 DIGxEncoderControl (HDMI setup)", 60);
     var r4 = atom_run_encoder_hdmi();
@@ -2025,6 +2057,29 @@ fn mdo_transmit_run() {
     gpu_hdmi_stage_attributes(d);
     gpu_hdmi_program_infoframes(d, gpu_audio_dig);
     kprintln("modeset: transmit -- stream attributes + infoframes programmed", 62);
+
+    # ── M9: STAGE THE AUDIO — MUTED, BEFORE THE EDGE, IN BOTH ARMS ──────────────────────────────────
+    # amdgpu programs the whole audio register file here (~206 us before OTG master-enable) with the tap
+    # SHUT, then unmutes ~22 ms later on the far side of the transmitter edge. Under MODESET_AUDIO
+    # gpu_hdmi_audio_enable() is exactly that staging half — AUDIO_ENABLED, the slot map and SAMPLE_SEND
+    # have been moved out of it into gpu_hdmi_audio_unmute().
+    # ⚠ Staging is IDENTICAL in both arms. The ONLY thing that differs between the control and the
+    # treatment is WHERE the unmute happens — that is what makes this a single-variable experiment rather
+    # than another "we changed the audio path and listened".
+#ifdef MODESET_AUDIO
+    var aud_fail = 0;
+    var r_aud = 0;
+    if (arm != 0) {
+        r_aud = gpu_hdmi_audio_enable();
+        kprint("modeset: transmit -- audio staged (muted) rc ", 45); kprint_num(r_aud); kprintln("", 0);
+        if (r_aud == 0) { aud_fail = 1; }
+    }
+    # ARM 1 = CONTROL: unmute HERE, before the transmitter edge — i.e. what agnos has always done.
+    if (arm == 1) {
+        kprintln("modeset: transmit -- ARM 1 CONTROL: unmute BEFORE the edge", 58);
+        if (gpu_hdmi_audio_unmute() == 0) { aud_fail = 1; }
+    }
+#endif
 
     # ── ATOM #76 DIG1TransmitterControl(ENABLE) — THE PHY EDGE, run with the FE STILL DETACHED ─────────
     # ⛔ ORDERING IS LOAD-BEARING (review S5, corrected 1.56.14). This used to reconnect BE<->FE *before*
@@ -2084,12 +2139,15 @@ fn mdo_transmit_run() {
     # stride) and two neighbours. It NEVER writes DIG_BE_CNTL (abs 0x566F), so it does NOT switch the link
     # to HDMI signalling. `digmode=3` in its parameters only steers branches inside the table.
     #
-    # So DIG_MODE stays 2 (DVI) for this whole op, and that is the POINT of this rung: every HDMI_* register
-    # is inert while DIG_MODE == 2 (gpu.cyr's own safety contract), which is what makes running the full
-    # sequence — bracket, #4, stream attributes, infoframes — a bounded experiment. Adding a DIG_MODE -> 3
-    # RMW here would make the whole infoframe block LIVE and turn one reviewed experiment into two.
-    # The flip belongs to a later rung, with its own review. Expect `be_cntl 0x10020200 -> 0x10020200`:
-    # that is the CORRECT result, not evidence that #4 failed.
+    # So in ARM 0 DIG_MODE stays 2 (DVI) for the whole op, and that is the POINT of that rung: every HDMI_*
+    # register is inert while DIG_MODE == 2 (gpu.cyr's own safety contract), which is what makes running the
+    # full sequence — bracket, #4, stream attributes, infoframes — a bounded experiment. Expect
+    # `be_cntl 0x10020200 -> 0x10020200`: that is the CORRECT arm-0 result, not evidence that #4 failed.
+    #
+    # ⚠ M9 UPDATE — the flip that this comment used to say "belongs to a later rung" IS that later rung, and
+    # it landed: the AUDIO arms (1 and 2) set DIG_MODE -> 3 at the DISCONNECT above, not here, because the
+    # capture pairs mode and disconnect in one store. So in arms 1/2 expect `0x10020200 -> 0x10030200` and
+    # a LIVE infoframe block — that is the whole reason those arms can carry audio at all.
     #
     # ⚠ The RMW re-reads rather than reusing the `s_be` captured before #4. Value-identical today, but
     # deriving a whole-register write from a snapshot taken at a different time is the
@@ -2150,6 +2208,24 @@ fn mdo_transmit_run() {
     gpu_dcn_hold_ms(120);
     var fc1 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_OTG_FRAME_COUNT) & GPU_OTG_FRAME_COUNT_MASK;
     if (resumed == 0) { if (fc1 != fc_dis) { resumed = 1; } }   # M6's D2 re-confirm across the settle
+
+    # ── M9: ARM 2 = TREATMENT — unmute on the FAR side of the transmitter edge ──────────────────────
+    # This is the whole hypothesis in four lines: the sink latches its audio state at the edge, so a tap
+    # opened BEFORE the edge is latched shut and stays shut no matter how correct every register is.
+    # ⚠ Gated on `resumed` — an unmute into a pipe that never came back cannot be heard, and would only
+    # add writes while the watchdog below is trying to recover the panel. A dark boot must stay a clean
+    # display failure, not a display failure tangled up with an audio experiment.
+    # ⚠ The capture's gap is 22.2 ms after the DIG edge; the 120 ms settle above ALREADY exceeds it, so
+    # no extra hold is needed. What is being reproduced is the ORDER, not the latency.
+#ifdef MODESET_AUDIO
+    if (arm == 2) {
+        if (resumed == 1) {
+            kprintln("modeset: transmit -- ARM 2 TREATMENT: unmute AFTER the edge", 59);
+            if (gpu_hdmi_audio_unmute() == 0) { aud_fail = 1; }
+        }
+        if (resumed == 0) { kprintln("modeset: transmit -- ARM 2 unmute SKIPPED (pipe never resumed)", 62); }
+    }
+#endif
 
     # ── THE SELF-RECOVERING WATCHDOG (M8's escalation; M6 only reported a dark pipe) ─────────────────
     # ⛔ Every hold on this path is gpu_dcn_hold_ms (WALL-CLOCK), NEVER gpu_dcn_hold — the latter aborts the
@@ -2232,8 +2308,17 @@ fn mdo_transmit_run() {
     if ((be1 & GPU_DIG_FE_SOURCE_SEL_MASK) != GPU_DIG_FE_SOURCE_CONNECT) {
         kprintln("modeset: TRANSMIT FAILED -- BE<->FE reconnect did not read back", 63); return MDO_E_BEFE;
     }
-    # ⛔ DO NOT add a "DIG_MODE must be HDMI" gate here. Nothing in this op sets it (see the reconnect
-    # above): #4 touches only the DIG front end, so DIG_MODE stays 2 and such a gate would fail every run.
+    # ⛔ DO NOT add an UNCONDITIONAL "DIG_MODE must be HDMI" gate here — it would fail every arm-0 run.
+    # #4 touches only the DIG front end, so in arm 0 nothing in this op sets DIG_MODE and it stays 2. Only
+    # the audio arms flip it, at the disconnect, so the gate below is correctly arm-scoped.
+#ifdef MODESET_AUDIO
+    if (arm != 0) {
+        if (dm1 != GPU_DIG_MODE_HDMI) {
+            kprintln("modeset: TRANSMIT no-hdmi -- audio arm did not leave the link in HDMI signalling", 80);
+            return MDO_E_MODESET;
+        }
+    }
+#endif
     if (refr == 0) { kprintln("modeset: TRANSMIT unmeasurable -- pipe resumed but will not count", 65); return MDO_E_UNMEAS; }
     if (unf0 == 0) {
         if (unf1 != 0) { kprintln("modeset: TRANSMIT UNDERFLOW -- OPTC bit10 newly set by the edge", 63); return MDO_E_UNDERFLOW; }
@@ -2245,6 +2330,21 @@ fn mdo_transmit_run() {
     if (dr < 0) { dr = 0 - dr; }
     if (dr > 30) { kprintln("modeset: TRANSMIT off-rate -- refresh did not return to the inherited value", 75); return MDO_E_MODESET; }
     kprintln("modeset: TRANSMIT OK -- enveloped encoder edge survived, rate restored -- EYE-CHECK the picture", 95);
+    # ── AUDIO VERDICT — LAST, and only after the display has already been declared OK ────────────────
+    # ⛔ ORDER IS THE POINT. The display verdict is the one the operator is staring at a possibly-dark panel
+    # waiting for; folding an audio failure into it would turn "the audio half refused" into what reads on
+    # the console like a modeset failure, and the next burn would be spent recovering a display that was
+    # never broken. "Panel survived, audio refused" must stay a DISTINGUISHABLE outcome.
+    # ⚠ MDO_E_AUDIO says the register half refused, NOT that nothing was heard. Silence with rc 0 is the
+    # EXPECTED negative result for arm 1 — that is what makes it the control. The ear is the oracle here,
+    # exactly as the eye is for the picture; this code can only report that the writes went out.
+#ifdef MODESET_AUDIO
+    if (aud_fail == 1) {
+        kprintln("modeset: TRANSMIT audio-refused -- DISPLAY IS FINE, the audio half did not program", 82);
+        return MDO_E_AUDIO;
+    }
+    if (arm != 0) { kprintln("modeset: TRANSMIT audio programmed -- EAR-CHECK the sink", 56); }
+#endif
     return 0;
     #else
     kprintln("modeset: transmit refused -- kernel not built with HDMI_ATOM (no ATOM table can run)", 84);
@@ -2265,8 +2365,8 @@ fn mdo_transmit_run() {
 # So spill the log to /klug.txt on EVERY exit, success or failure. mdo_transmit_run has 20+ return paths;
 # putting the spill in each one guarantees only that a future edit will miss one. The wrapper cannot.
 # klug_spill_prepare() already pre-allocated the file at boot, so this is a pure overwrite of mapped blocks.
-fn mdo_transmit() {
-    var r = mdo_transmit_run();
+fn mdo_transmit(arm) {
+    var r = mdo_transmit_run(arm);
     # ⚠ klug_spill() is SILENT (returns a byte count, prints nothing), so report the count — a 0 means
     # klug_spill_prepare() never got a usable inode and /klug.txt still holds a STALE boot, which is the
     # "looks fine, is wrong" failure this fix exists to prevent.
@@ -2337,6 +2437,19 @@ fn mdo_validate(rec) {
         if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
         if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
     }
+#ifdef MODESET_AUDIO_ARMS
+    # M9's pair carries no operands either — the arm is the OP CODE, not a field. Deliberate: a ring-3
+    # caller picks between two REVIEWED sequences by name and cannot compose a third out of parameters.
+    var m9 = 0;
+    if (op == MDO_OP_AUDIO_PRE)  { m9 = 1; }
+    if (op == MDO_OP_AUDIO_POST) { m9 = 1; }
+    if (m9 == 1) {
+        if ((load32(rec +  8) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 12) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 16) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+        if ((load32(rec + 20) & 0xFFFFFFFF) != 0) { return MDO_E_RESERVED; }
+    }
+#endif
     if (op == MDO_OP_CAPS) {
         var out_len = load64(rec + 16);
         if (out_len < 32) { return MDO_E_OUTBUF; }
@@ -2353,7 +2466,11 @@ fn mdo_execute(rec) {
     if (op == MDO_OP_LOCK) { return mdo_lock(); }
     if (op == MDO_OP_VTOTAL) { return mdo_vtotal(); }
     if (op == MDO_OP_RECOMMIT) { return mdo_recommit(); }
-    if (op == MDO_OP_TRANSMIT) { return mdo_transmit(); }
+    if (op == MDO_OP_TRANSMIT) { return mdo_transmit(0); }
+#ifdef MODESET_AUDIO_ARMS
+    if (op == MDO_OP_AUDIO_PRE)  { return mdo_transmit(1); }
+    if (op == MDO_OP_AUDIO_POST) { return mdo_transmit(2); }
+#endif
     return MDO_E_BADOP;                              # unreachable after validate — belt-and-suspenders
 }
 

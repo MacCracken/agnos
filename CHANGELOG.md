@@ -10,6 +10,73 @@ tags/releases at close. Scope: **re-derive ATOM #76's `phyid`** (M8d's seed over
 below), then **M8e** (the live #76 PHY edge) → **M9** (audio sequenced after the transmitter edge).
 M8e stays blocked until the transmitter is provably pointed at the live PHY.
 
+### Added — M9a·M9b·M9c·M9d: the HDMI audio path SPLITS around the transmitter edge (`MODESET_AUDIO`)
+
+**The plan card said M9 was a MOVE; the capture says it is a SPLIT, and that changed the bite.** The card
+described re-ordering `gpu_hdmi_audio_enable()` to run *after* the transmitter command. Re-reading the raw
+ftrace (`amdgpu-hdmi-modeset-writes-0717.txt`, both cycles agreeing) shows amdgpu does something else: it
+stages the **entire** audio register file **before** the edge with the tap **shut** (`0x566a ← 0x04000800`),
+then — 22.2 ms later, on the far side of the edge — writes the single unmute (`0x566a ← 0x04000801`), with
+`DIG_BE_CNTL 0x566f ← 0x10030000` in between. Moving the whole block would have reproduced neither half.
+
+So the path splits at the mute boundary:
+
+- **M9a** — the back-end index is derived **once** per call from `gpu_phy_discover()` (the 1.56.14 phyid fix
+  applied to the audio side), and `gpu_hdmi_audio_enable()` **refuses** when nothing is live.
+- **M9b** — under `MODESET_AUDIO`, three sites leave staging for the new `gpu_hdmi_audio_unmute()`: AZ
+  `AUDIO_ENABLED`, the slot map, and `AFMT` `AUDIO_SAMPLE_SEND` (staging now clears `SAMPLE_SEND` while
+  setting `60958_CS_UPDATE`). **The slot-map placement was a real conflict, resolved by decoding rather than
+  by picking a side**: agnos's rule is "slot map *after* `AUDIO_ENABLED`", the capture appears to write
+  descriptors *before*. Decoding the endpoint-1 ordinals at abs `0x384c`/`0x384d` shows the staging writes
+  `0x54`(clear), `0x25`, `0x27`-`0x42`, `0x54`(0x10) and the post-edge write is `0x54 ← 0x80000001` —
+  **`0x36` never appears at all**. agnos's slot map was never under the capture's constraint, so it moves
+  *with* `AUDIO_ENABLED` into the unmute and agnos's own ordering rule is preserved.
+  STAGE-1 — agnos's hand-rolled *imitation* of a transmitter edge — compiles **out**: running it alongside
+  the real one would make any sound unattributable, which is the whole point of the experiment.
+- **M9c** — boot no longer performs the audio bring-up under `MODESET_AUDIO` (enable, transmitter bring-up,
+  AV-mute pulse and the boot dump are all suppressed), because a boot-time unmute would latch the sink
+  *before* the op ever runs. The sink-select / `hda_hdmi_bind_single` block is **kept** and re-gated on
+  `gpu_audio_dig` so the feed still has somewhere to go.
+- **M9d** — two new `#93` ops: **`MDO_OP_AUDIO_PRE` (0x07)** and **`MDO_OP_AUDIO_POST` (0x08)**.
+
+**The two ops are one code path, and that is deliberate.** Both route into `mdo_transmit_run(arm)` — the
+same envelope, the same H1 klug spill, the same frame-count watchdog, the same `power_reset()` escalation.
+Duplicating that scaffolding is exactly the `ATOM_DRY` defect class (two things that read as different and
+compile to the same behaviour), so the arm is a **parameter**, and staging is **byte-identical** between
+them. The *only* difference is where the unmute happens: arm 1 before the edge, arm 2 after it. That is what
+makes this a single-variable experiment instead of another "we changed the audio path and listened".
+
+`DIG_MODE 2 → 3` is folded into the **existing** BE↔FE disconnect RMW, emitting one store of `0x10030000`
+exactly as the capture does — mode and disconnect together, inside the window where the OTG is verified
+stopped. Two writes would put a moment of live-HDMI-with-no-front-end on the wire the reference never
+produces. ⛔ **Arm 0 (plain `TRANSMIT`) keeps `DIG_MODE` 2**, byte-for-byte the rung M8e already burned
+green — every `HDMI_*` register is inert at `DIG_MODE` 2, so that rung stays the bounded display-only
+experiment it was validated as, and the flip is a variable only the audio arms carry.
+
+New **`MDO_E_AUDIO` (22)**, reported **after** the display verdict. Folding an audio failure into the display
+verdict would make "the audio half refused" read on the console like a modeset failure, and the next burn
+would be spent recovering a display that was never broken.
+
+**The op pair is advertised only under the derived `MODESET_AUDIO_ARMS` = `MODESET_AUDIO` ∧ `ATOM_TX_CYCLE`,
+and the conjunction is load-bearing.** With `MODESET_AUDIO` alone the halves exist but there is no edge for
+them to sit before or after — the control and the treatment become the same experiment wearing two op codes.
+With `ATOM_TX_CYCLE` alone there is an edge but `gpu_hdmi_audio_enable()` still unmutes inline, so both arms
+unmute early regardless of which was asked for. Either way the mask stays `0x7F` and the ops answer
+`MDO_E_BADOP`, which the tool reports as "wrong kernel" rather than silently producing a meaningless result.
+⚠ `ATOM_TX_CYCLE` specifically, **not** the derived `ATOM_TX_ANY`: `ATOM_RUN_TRANSMITTER` is the ENABLE-only
+negative control, and an enable with no preceding disable is not an edge a sink can latch on.
+
+`modeset-tool-smoke` now checks the mask in **both directions** — 127 must appear and 511 must not in an
+unarmed build, and the reverse in an armed one — with the expectation **derived from the kernel binary**
+rather than the environment, since the env says what someone *meant* to build and only the artifact says
+what got built. Verified both ways under QEMU (20/20 each). Six flag combinations build, all distinct
+sizes; the 576-byte drop in the `MODESET_AUDIO`-without-`ATOM_TX_CYCLE` builds is the two ops correctly
+vanishing. Arc sweep 15/15.
+
+⚠ **Nothing here has been heard.** M9d is the kernel half; the ear oracle needs M9e (the blinded pattern
+tool) and M9f/L1 (the Linux-side replay, which costs **zero burns and should run first** — if amdgpu's own
+sequence replayed from Linux does not sound, M9-as-scoped is the wrong bite).
+
 ### Fixed — ATOM #76's `phyid` is now DERIVED FROM LIVE HARDWARE, never hardcoded
 
 The M8d seed overturned MD-2 (`phyid=0` → the live transmitter is **1**), and the fix is a re-derivation

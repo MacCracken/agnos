@@ -438,6 +438,18 @@ else
         # ⛔ Pair with HDA_HDMI + HMDI_ATOM + ATOM_TX_CYCLE. Do NOT pair with HDA_TONE: a fixed kernel sine
         # is exactly guessable and would void the blinded ear oracle.
         [ -n "$MODESET_AUDIO" ] && echo '#define MODESET_AUDIO'
+        # MODESET_AUDIO_ARMS — derived, never set by hand: MODESET_AUDIO *and* a REAL transmitter edge.
+        # This is what gates the M9 op pair (AUDIO_PRE / AUDIO_POST) being advertised at all, and the two
+        # conditions are not interchangeable:
+        #   MODESET_AUDIO alone -> the staging/unmute halves exist, but there is NO EDGE for them to be
+        #                          before or after, so the "control" and the "treatment" are the SAME
+        #                          experiment wearing two op codes. That is the ATOM_DRY defect class one
+        #                          layer up: two runs that differ in name and not in behaviour.
+        #   ATOM_TX_CYCLE alone -> there is an edge, but gpu_hdmi_audio_enable() still unmutes inline, so
+        #                          both arms unmute BEFORE it regardless of which one was asked for.
+        # ⚠ ATOM_TX_CYCLE specifically, NOT the derived ATOM_TX_ANY: ATOM_RUN_TRANSMITTER is the ENABLE-only
+        # negative control, and an enable with no preceding disable is not an edge the sink can latch on.
+        if [ -n "$MODESET_AUDIO" ] && [ -n "$ATOM_TX_CYCLE" ]; then echo '#define MODESET_AUDIO_ARMS'; fi
         # ATOM_MATH_SELFTEST=1 — H6 (modeset arc): run the DIV32/MUL32 unit sweep against the
         # atom-interp.py oracle and print pass/fail. PURE ARITHMETIC — no MMIO, no VBIOS, no bytecode, no
         # PHY. Safe anywhere, needs no iron; QEMU is the intended venue. Requires HDMI_ATOM because the
