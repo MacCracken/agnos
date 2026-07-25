@@ -129,6 +129,10 @@ fn main(): i64 {
             w_puts("gpuwedge: ARM C (AFTER) -- matmul must STILL be bit-correct", 58);
             return report(ARM_C, recover_op(ARM_C));
         }
+        if (streq(a, "--audit") == 1) {
+            w_puts("gpuwedge: RUNG 6 -- arena audit (READ-ONLY, writes nothing)", 58);
+            return report(5, recover_op(5));
+        }
         if (streq(a, "--console") == 1) {
             w_puts("gpuwedge: ARM D -- console survival while the GPU is wedged", 58);
             return report(ARM_D, recover_op(ARM_D));
@@ -137,7 +141,7 @@ fn main(): i64 {
         # something other than what was asked is how a typo becomes a wasted burn -- the exact
         # failure that cost the M9 arc a flash on 2026-07-24.
         w_puts("gpuwedge: UNKNOWN ARGUMENT -- nothing was done.", 46);
-        w_puts("gpuwedge: --baseline --wedge --recover --verify --console", 56);
+        w_puts("gpuwedge: --baseline --wedge --recover --verify --console --audit", 64);
         return 84;
     }
     w_puts("gpuwedge -- RUNG 5, the GPU hang/recovery battery", 48);
@@ -151,6 +155,7 @@ fn main(): i64 {
     w_puts("  run /bin/gpuwedge --recover     B        -- CP_HQD_ACTIVE must read 0", 70);
     w_puts("  run /bin/gpuwedge --verify      C after  -- still bit-correct?", 63);
     w_puts("  run /bin/gpuwedge --console     D        -- did the console survive?", 69);
+    w_puts("  run /bin/gpuwedge --audit       rung 6   -- READ-ONLY arena audit", 66);
     w_puts("  run /bin/klug > /wedge.txt", 27);
     return 96;
 }

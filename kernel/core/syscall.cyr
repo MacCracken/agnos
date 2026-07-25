@@ -1439,6 +1439,37 @@ fn gpu_recover_op_sys(arm) {
         kprintln("recover: ARM C -- matmul bit-correct", 36);
         return 95;
     }
+    if (arm == RECOV_ARM_E) {
+        # ⛔⛔ ARM E — THE GUARD'S OWN NEGATIVE CONTROL, and it is the arm that has been owed
+        # since S6. That bite shipped an EXEC guard at w=200 with NO unguarded arm, so
+        # "the guard stopped the overrun" is INFERRED, not measured — and every ring-3-specified
+        # triangle's memory safety rests on it (rung 12 onward).
+        #
+        # ⛔ IT FIRES AN UNGUARDED WRITE, so it may ONLY run at an address rung 6 has PROVEN
+        # unclaimed. With VM_CONTEXT0 disabled there are no page tables: an out-of-bounds store
+        # lands somewhere REAL — the console framebuffer at offset 0, or the PSP TMR whose ucode
+        # agnos re-loads only at boot. Running the control arm without the audit would make the
+        # control itself the accident.
+        kprintln("recover: ARM E -- the EXEC guard's negative control", 51);
+        if (gpu_arena_audit() != 1) {
+            kprintln("recover: ARM E REFUSED -- the arena audit did not pass. Nothing written.", 72);
+            return 0 - 5;
+        }
+        var sac = gpu_arena_phys + GPU_SACRIFICIAL_SUBOFF;
+        store32(sac, 0);
+        gpu_mfence();
+        kprint("recover: sacrificial slot pre-state ", 36);
+        kprint_hex(load32(sac) & 0xFFFFFFFF); kprintln("", 0);
+        # ⚠ The two halves must be distinguishable in the log, because "both untouched" is a
+        # REAL and uninformative outcome: it means the negative arm never fired and the guard
+        # remains exactly as unmeasured as before.
+        kprintln("recover: (guarded and unguarded dispatch arms are a rung-12 dependency --", 73);
+        kprintln("recover:  this build proves the AUDIT gate and the slot, not the guard yet)", 75);
+        var seen = load32(sac) & 0xFFFFFFFF;
+        kprint("recover: sacrificial slot post-state ", 37);
+        kprint_hex(seen); kprintln("", 0);
+        return 95;
+    }
     if (arm == RECOV_ARM_D) {
         # Free: it rides whatever state the box is already in.
         kprintln("recover: ARM D -- is the console still painting? EYE-CHECK the panel.", 69);

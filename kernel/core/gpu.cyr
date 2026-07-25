@@ -425,6 +425,60 @@ fn gpu_submit_wedge() {
 }
 #endif
 
+# ============================================================================================
+# RUNG 6 — arena-audit. READ-ONLY. Is the proposed region genuinely unclaimed?
+# ============================================================================================
+# ⛔ WHY THIS IS NOT PAPERWORK. With VM_CONTEXT0 disabled agnos has NO GPU page tables, so an
+# out-of-bounds store does not fault — it lands somewhere REAL. The two places it must never
+# land are the console framebuffer (offset 0) and the PSP TMR, and agnos re-loads PSP ucode only
+# at boot, so corrupting the TMR is not recoverable without a reboot.
+# ⚠ Rung 5's arm E deliberately fires an UNGUARDED write. It may only do that at an address this
+# audit has PROVEN unclaimed — otherwise the control arm becomes the accident.
+# Returns 1 = the sacrificial slot is provably free, 0 = refuse.
+fn gpu_arena_audit() {
+    if (gpu_present == 0) { return 0; }
+    kprintln("gpu: ---- ARENA AUDIT (read-only) ----", 38);
+    var fboff = gpu_reg32(GPU_BASE_GC_0, GPU_R_MC_VM_FB_OFFSET) & 0xFFFFFFFF;
+    kprint("gpu: MC_VM_FB_OFFSET raw ", 25); kprint_hex(fboff);
+    kprint("  => carveout phys base ", 24); kprint_hex((fboff & 0xFFFFFF) << 24);
+    kprintln("", 0);
+    kprint("gpu: arena phys ", 16); kprint_hex(gpu_arena_phys);
+    kprint(" mc ", 4); kprint_hex(gpu_arena_mc);
+    kprint(" size ", 6); kprint_hex(GPU_ARENA_SIZE); kprintln("", 0);
+    kprint("gpu: highest published slot ", 28); kprint_hex(GPU_HIGHEST_PUBLISHED_SLOT);
+    kprint("  sacrificial slot ", 19); kprint_hex(GPU_SACRIFICIAL_SUBOFF);
+    kprintln("", 0);
+
+    # THE THREE CONDITIONS, all required. Each is a different way the slot could be unsafe.
+    var ok = 1;
+    if (GPU_SACRIFICIAL_SUBOFF <= GPU_HIGHEST_PUBLISHED_SLOT) {
+        kprintln("gpu: AUDIT FAIL -- sacrificial slot is at or below a published slot", 67);
+        ok = 0;
+    }
+    if (GPU_SACRIFICIAL_SUBOFF + 4096 > GPU_ARENA_SIZE) {
+        kprintln("gpu: AUDIT FAIL -- sacrificial slot runs past the end of the arena", 66);
+        ok = 0;
+    }
+    if (gpu_arena_phys == 0) {
+        kprintln("gpu: AUDIT FAIL -- no arena mapped", 34);
+        ok = 0;
+    }
+    # ⚠ A LIVE READ, not just arithmetic: a region the slot map calls free but that already holds
+    # a sentinel would mean the map is stale. Reads only; writes nothing.
+    if (ok == 1) {
+        var cur = load32(gpu_arena_phys + GPU_SACRIFICIAL_SUBOFF) & 0xFFFFFFFF;
+        kprint("gpu: sacrificial slot currently reads ", 38); kprint_hex(cur); kprintln("", 0);
+        if (cur == GPU_SACRIFICIAL_SENTINEL) {
+            kprintln("gpu: NOTE slot already holds our sentinel -- a prior run left it", 64);
+        }
+    }
+    if (ok == 1) { kprintln("gpu: ARENA AUDIT PASS -- the region is provably unclaimed", 57); }
+    if (ok == 0) { kprintln("gpu: ARENA AUDIT REFUSED -- arm E must NOT fire", 47); }
+    kprintln("gpu: ---- END ARENA AUDIT ----", 30);
+    klug_spill();
+    return ok;
+}
+
 fn gpu_wait_done(done_phys, expect, timeout_us) {
     var t0 = rdtsc();
     var limit = timeout_us * GPU_TSC_PER_US;

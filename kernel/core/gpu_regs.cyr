@@ -945,6 +945,23 @@ var GPU_R_GRBM_STATUS2               = 0x0002;
 # of one would make the other look fresher than it is.
 var GPU_BREADCRUMB_SUBOFF            = 0x12400;
 var GPU_BREADCRUMB_BASE              = 0xBC000000;  # base | seq — the tag makes a stale 0 unmistakable
+# ── RUNG 6 (arena-audit) + rung 5 arm E ──────────────────────────────────────────────────────
+# The arena is one 2 MB UC region (gpu.cyr:27). The highest PUBLISHED slot offset in this file is
+# 0xC0000, so [0xC0000, 0x200000) is 1.25 MB with nothing mapped into it.
+var GPU_ARENA_SIZE                   = 0x200000;   # 2 MB — the whole carveout arena
+# ⚠ NOT named *_SUBOFF: check.sh's "gpu arena slots unaliased" gate treats every _SUBOFF as a
+# REAL arena slot, and this is a BOUND describing the slot map, not a slot itself. Named that way
+# it aliased GPU_S12_SNAP_SUBOFF (the genuine slot at 0xC0000) and failed the gate — correctly.
+var GPU_HIGHEST_PUBLISHED_SLOT       = 0xC0000;    # the top of the slot map, audited at runtime
+# ⛔ THE SACRIFICIAL SLOT. Arm E fires an UNGUARDED write at this offset to measure whether the
+# EXEC guard actually stops an overrun — S6 shipped that guard with no unguarded arm, so
+# "the guard worked" is INFERRED, not measured. Placed at the very top of the arena, 0x130000
+# clear of every published slot, and DELIBERATELY far from the two things that would be
+# catastrophic to hit: the console framebuffer at offset 0 and the PSP TMR.
+# ⚠ With VM_CONTEXT0 disabled there are NO page tables — an out-of-bounds store lands somewhere
+# REAL. That is why rung 6 must PROVE this region unclaimed before arm E is allowed to fire.
+var GPU_SACRIFICIAL_SUBOFF           = 0x1F0000;
+var GPU_SACRIFICIAL_SENTINEL         = 0x5AC91F1C;
 # C2c values
 var GPU_GRBM_SEL_MEC1_P0_Q0    = 0x4;         # MEID=1<<2 (MEC1, pipe0, queue0, vmid0); 1-based MEID
 var GPU_CP_HQD_PQ_CONTROL_VAL  = 0xC000050D;  # QUEUE_SIZE 0xD (64 KB ring) | PRIV_STATE | KMD_QUEUE
