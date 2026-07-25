@@ -277,6 +277,124 @@ fn gpu_forensic_dump(done_phys, expect) {
     return 0;
 }
 
+# ============================================================================================
+# RUNG 5 (3D arc) — THE RECOVERY LADDER. The largest item in the arc, done first.
+# ============================================================================================
+# ⛔ WHY THIS EARNS ITS BURN INDEPENDENT OF 3D. A runaway tentib ternary matmul through #82, or
+# a malformed #92 batch from aethersafha, currently kills the box with NO LOG. Those consumers
+# ship TODAY. Every safety property agnos has bounds how long the CPU WAITS, not what the GPU
+# DOES — nothing has ever asked the GPU to stop.
+#
+# ⛔⛔ NO GRBM_SOFT_RESET, EVER. gpu.cyr's own C1d note states it verbatim: a soft reset "would
+# wipe PSP-loaded ucode", and agnos re-loads that ucode only at boot. A reset would turn a
+# recoverable hang into a dead GPU until reboot — strictly worse than the hang.
+#
+# THE LADDER, least to most destructive. Each rung is tried only if the one before it failed.
+var gpu_wedged = 0;          # 1 = the GPU is given up on; every GPU syscall returns a distinct errno
+var gpu_recover_rung = 0;    # how far the last escalation had to climb (0 = never needed)
+
+# R-2: ask the CP to unmap the queue, then WAIT FOR THE HARDWARE TO SAY IT DID.
+# ⭐ CP_HQD_ACTIVE is cleared BY THE HARDWARE, so polling it is an answer, not an echo of our own
+# DEQUEUE_REQUEST write ([[feedback_echo_vs_answer_registers]]). This is the one place in the
+# ladder where we get a real acknowledgement rather than an inference.
+fn gpu_recover_dequeue() {
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_DEQUEUE_REQUEST, GPU_CP_HQD_DEQUEUE_DRAIN);
+    var t0 = rdtsc();
+    var limit = 100000 * GPU_TSC_PER_US;      # 100 ms — generous; the CP normally drains in µs
+    var cleared = 0;
+    while ((rdtsc() - t0) < limit) {
+        if ((gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_ACTIVE) & 1) == 0) { cleared = 1; }
+        if (cleared == 1) { break; }
+    }
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, 0);
+    if (cleared == 1) { kprintln("gpu: recover R-2 -- CP_HQD_ACTIVE cleared by hardware", 53); }
+    if (cleared == 0) { kprintln("gpu: recover R-2 FAILED -- CP_HQD_ACTIVE stuck at 1", 51); }
+    return cleared;
+}
+
+# R-3: halt the MEC, then un-halt. Heavier than a dequeue and it takes every queue on the engine
+# down with it, which is why it is only reached when R-2 could not clear ACTIVE.
+fn gpu_recover_mec_cycle() {
+    var cur = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL) & 0xFFFFFFFF;
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL, cur | 0x50000000);   # MEC1+MEC2 halt
+    gpu_udelay(1000);
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MEC_CNTL, cur);
+    gpu_udelay(1000);
+    kprintln("gpu: recover R-3 -- MEC halt/un-halt cycled", 43);
+    return 1;
+}
+
+# The escalation itself. Returns 1 if the GPU is usable again, 0 if it has been given up on.
+# ⚠ Called ONLY from a deliberate recovery path, never speculatively: every rung here disturbs
+# live hardware, and running them on a GPU that was merely slow would manufacture the very hang
+# they exist to clear.
+fn gpu_recover_escalate() {
+    if (gpu_present == 0) { return 0; }
+    kprintln("gpu: ---- RECOVERY LADDER ----", 30);
+    gpu_recover_rung = 2;
+    if (gpu_recover_dequeue() == 1) {
+        # Re-map the queue and re-arm the ring cursor. gpu_queue_setup() re-zeroes the MQD,
+        # rptr-report page and EOP buffer and re-pushes the whole HQD image, so it is a genuine
+        # re-map rather than a poke.
+        gpu_ring_wptr = 0;
+        gpu_queue_setup();
+        gpu_recover_rung = 2;
+        kprintln("gpu: recover -- queue re-mapped at R-2, GPU usable", 50);
+        return 1;
+    }
+    gpu_recover_rung = 3;
+    gpu_recover_mec_cycle();
+    if (gpu_recover_dequeue() == 1) {
+        gpu_ring_wptr = 0;
+        gpu_queue_setup();
+        kprintln("gpu: recover -- queue re-mapped after R-3, GPU usable", 53);
+        return 1;
+    }
+    # R-4: give up, but keep the BOX alive. ⛔ This is the branch that matters most to a user:
+    # the console and the shell must survive a dead GPU. The compositor degrades to the kernel's
+    # CPU store32 blit, which touches no ring and cannot be wedged.
+    gpu_recover_rung = 4;
+    gpu_wedged = 1;
+    kprintln("gpu: recover R-4 -- GIVING UP. gpu_wedged=1; GPU syscalls will refuse.", 70);
+    kprintln("gpu: the console and shell remain alive on the CPU blit path.", 61);
+    return 0;
+}
+
+#ifdef GPU_RECOVER
+# ============================================================================================
+# RUNG 5 ARM A — THE CONTROLLED WEDGE. ⛔ BEHIND A FLAG, AND IT MUST STAY THERE.
+# ============================================================================================
+# A kernel that can be ASKED to hang its own GPU must never ship that way. Under GPU_RECOVER
+# only, this submits a WAIT_REG_MEM that polls a carveout dword for a value nothing will ever
+# write. The CP blocks forever, the wait times out, and rung 4's bracket must NAME THIS PACKET.
+#
+# ⭐ THE PRIMARY ORACLE IS THE BRACKET, NOT THE RECOVERY. Arm A passes if the forensic block
+# localises the hang — even if every recovery rung then fails. That separation is deliberate:
+# "we can see the hang" and "we can clear the hang" are different claims with different
+# consequences, and collapsing them would let a failed recovery hide a working instrument.
+#
+# WAIT_REG_MEM (PKT3 op 0x3C, count 5 -> 7 dwords):
+#   dw1 = engine/mem/function:  mem-space(1<<4) | func=EQUAL(3)
+#   dw2 = poll address LO, dw3 = HI, dw4 = reference, dw5 = mask, dw6 = poll interval
+fn gpu_submit_wedge() {
+    var poll_mc = gpu_arena_mc + GPU_BREADCRUMB_SUBOFF + 0x100;   # its own dword, never written
+    store32(gpu_arena_phys + GPU_BREADCRUMB_SUBOFF + 0x100, 0);
+    gpu_mfence();
+    kprintln("gpu: ARM A -- submitting a WAIT_REG_MEM that can never be satisfied", 67);
+    gpu_ring_breadcrumb(1);                      # before the trap: this MUST be seen
+    gpu_ring_put(0xC0053C00);                    # PACKET3(WAIT_REG_MEM, count=5)
+    gpu_ring_put(0x00000013);                    # mem space | function = EQUAL
+    gpu_ring_put(poll_mc & 0xFFFFFFFF);
+    gpu_ring_put((poll_mc >> 32) & 0xFFFFFFFF);
+    gpu_ring_put(0xDEADBEEF);                    # reference the dword will never hold
+    gpu_ring_put(0xFFFFFFFF);                    # mask
+    gpu_ring_put(0x00000010);                    # poll interval
+    gpu_ring_breadcrumb(2);                      # after the trap: this must NEVER be seen
+    return 0;
+}
+#endif
+
 fn gpu_wait_done(done_phys, expect, timeout_us) {
     var t0 = rdtsc();
     var limit = timeout_us * GPU_TSC_PER_US;

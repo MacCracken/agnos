@@ -42,6 +42,54 @@ wrong *picture* and never a fault.
 ⚠ **Honest limit:** agreement PER ENCODING CLASS, not over all 11 shaders instruction-for-instruction
 — doing that by hand would be the same hand-assembly whose trustworthiness is in question.
 
+### Added — rungs 4 + 5: agnos gains GPU hang forensics and recovery (host-complete; 1 burn pending)
+
+**agnos has had NO GPU hang detection of any kind, and that is already true for `#82`, `#83` and
+`#92`, which ship.** A runaway `tentib` matmul or a malformed `#92` batch kills the box with no log.
+Every safety property in the tree bounds how long the CPU *waits*, never what the GPU *does*.
+
+**Rung 4 — the bracket.** `gpu_wait_done` used to return 0 on timeout and tell the caller exactly one
+bit. It now captures, unconditionally, and spills:
+
+- **`breadcrumb ≤ hung_packet ≤ rptr`.** The breadcrumb is a `WRITE_DATA` the **CP itself** executes
+  between packet blocks — an answer register, not an echo of a CPU store. `rptr` is the fetcher's
+  upper bound. Everything between is the candidate set, usually one packet.
+- `GRBM_STATUS`/`STATUS2`, `CP_STAT`, `CP_HQD_ACTIVE`, wptr, expected-vs-seen fence, and the 16 ring
+  dwords at `rptr` — decodable by `gpu-test/pm4lint.cyr` from rung 2.
+- A never-written breadcrumb is tagged distinctly from a stalled one: *"the CP executed no packet at
+  all"* and *"the CP stopped midway"* are different failures with different first suspects.
+
+⚠ Three things verified rather than assumed: the `CP_HQD_*` registers are **behind a GRBM mux** and
+read unselected give another queue's state (worse than nothing — it looks like data); the ring base is
+`gpu_arena_phys + 0`, confirmed from `gpu_ring_put`; and `VM_L2_PROTECTION_FAULT_STATUS` was
+**deliberately omitted** because its offset could not be sourced confidently, and a guessed register
+in a forensic block is worse than a missing one.
+
+**Rung 5 — the recovery ladder.** R-2 `CP_HQD_DEQUEUE_REQUEST` → poll `CP_HQD_ACTIVE`→0 (**cleared by
+hardware**, so it is an answer) → re-map via `gpu_queue_setup` → R-3 `CP_MEC_CNTL` halt/un-halt → R-4
+`gpu_wedged`, console and shell alive on the CPU blit path.
+
+⛔ **NO `GRBM_SOFT_RESET`, ever** — `gpu.cyr`'s own note says it would wipe PSP-loaded ucode, which
+agnos re-loads only at boot. That would turn a recoverable hang into a dead GPU until reboot.
+
+⛔ **The recovery ladder is ALWAYS compiled; only the deliberate wedge is behind `GPU_RECOVER`.** A
+shipping kernel must survive a hang it did not ask for, but must never be able to hang itself on
+purpose. New `GPU_RECOVER` in `build.sh` — added after the first build showed the `#ifdef` compiling
+out silently, which is the `ATOM_DRY` class. Flag now bites by 1320 bytes.
+
+New syscall **`#94 gpu_recover_op(arm)`** and ring-3 tool **`/bin/gpuwedge`** (staged), carrying five
+arms for one boot. ⛔ A ring-3 tool, never a boot self-test — the D lane spent five burns learning
+that a bite whose oracle is a human watching the screen belongs in a shell command.
+
+⭐ **Arm A's primary oracle is the bracket, NOT whether recovery succeeds.** "We can see the hang" and
+"we can clear the hang" are different claims; collapsing them would let a failed recovery hide a
+working instrument that every later rung depends on. Arm C is the negative control that decides
+whether recovery is worth having at all: if the matmul is not bit-correct *after*, recovery is worse
+than the hang and R-4 becomes the default. Arm D measures the load-bearing, never-measured assumption
+under the entire GFX risk model — does the console survive a dead GPU?
+
+`check.sh` 14/14, arc sweep PASS, both builds green.
+
 ### Added — rung 8 `cpu-ref`: the CPU reference rasteriser (HOST, 0 burns) — ⚠ **PARTIAL**
 
 `gpu-test/cpuref.cyr`, `exit 95`. A direct port of `sadish/src/raster.cyr`'s inner math: 16.16 fixed

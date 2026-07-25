@@ -438,6 +438,14 @@ else
         # ⛔ Pair with HDA_HDMI + HMDI_ATOM + ATOM_TX_CYCLE. Do NOT pair with HDA_TONE: a fixed kernel sine
         # is exactly guessable and would void the blinded ear oracle.
         [ -n "$MODESET_AUDIO" ] && echo '#define MODESET_AUDIO'
+        # GPU_RECOVER=1 — 3D arc rung 5: the GPU hang-recovery ladder's CONTROLLED WEDGE arm.
+        # ⛔ OFF BY DEFAULT AND IT MUST STAY THAT WAY. With it, /bin/gpuwedge can ask the kernel
+        # to submit a WAIT_REG_MEM that can never be satisfied — i.e. to hang its own GPU on
+        # purpose, so rung 4's bracket can be proven to localise it and the R-2/R-3/R-4 ladder
+        # can be proven to clear it. A production kernel must not carry a "hang yourself" verb.
+        # ⚠ The RECOVERY LADDER itself is always compiled — a shipping kernel must be able to
+        # recover from a hang it did not ask for. Only the deliberate wedge is behind this flag.
+        [ -n "$GPU_RECOVER" ] && echo '#define GPU_RECOVER'
         # MODESET_AUDIO_ARMS — derived, never set by hand: MODESET_AUDIO *and* a REAL transmitter edge.
         # This is what gates the M9 op pair (AUDIO_PRE / AUDIO_POST) being advertised at all, and the two
         # conditions are not interchangeable:

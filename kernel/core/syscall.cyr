@@ -1380,6 +1380,77 @@ var MDO_E_NOHDMI     = 23;
 #   +4  op-support mask (MDO_OP_SUPPORTED)      +16 h_total          +24 pixclk_100hz
 #   +8  h_active                                +20 v_total          +28 refresh milliHz (I2, 0 if unmeasured)
 #   +12 v_active (0 at H3 — M1/M3 populate)
+# ============================================================================================
+# #94 gpu_recover_op — the rung-5 battery. One arm per call, so a wedge in one cannot be blamed
+# on another, and the operator can stop after any arm.
+# ============================================================================================
+var RECOV_ARM_A = 1;   # controlled wedge -> the bracket must name the WAIT packet
+var RECOV_ARM_B = 2;   # dequeue + re-map  -> CP_HQD_ACTIVE must read 0, then work must retire
+var RECOV_ARM_C = 3;   # negative control  -> matmul bit-correct BEFORE and AFTER
+var RECOV_ARM_D = 4;   # free              -> is the console still painting while wedged?
+var RECOV_ARM_E = 5;   # the guard's own negative control
+
+fn gpu_recover_op_sys(arm) {
+    if (gpu_present == 0) { return 0 - 1; }
+#ifdef GPU_RECOVER
+    if (arm == RECOV_ARM_A) {
+        kprintln("recover: ARM A -- controlled wedge; the bracket must name the WAIT packet", 73);
+        gpu_breadcrumb_seq = 2;
+        store32(gpu_arena_phys + GPU_BREADCRUMB_SUBOFF, 0);
+        gpu_mfence();
+        gpu_submit_wedge();
+        gpu_ring_kick();
+        # ⚠ A SHORT bound on purpose. R-1 is "distinguish slow from hung": 100 ms is ~1000x any
+        # dispatch agnos has ever measured, so a timeout here is a hang, not slowness.
+        var done_phys = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
+        store32(done_phys, 0);
+        var ok = gpu_wait_done(done_phys, GPU_C2F_DONE, 100000);
+        if (ok == 1) {
+            kprintln("recover: ARM A FAILED -- the wedge RETIRED. The WAIT packet is wrong,", 69);
+            kprintln("recover: so nothing was actually hung and arms B-E prove nothing.", 65);
+            return 0 - 2;
+        }
+        kprintln("recover: ARM A -- wedged as designed; forensic block above is the oracle", 72);
+        return 95;
+    }
+    if (arm == RECOV_ARM_B) {
+        kprintln("recover: ARM B -- dequeue + re-map", 34);
+        var r = gpu_recover_escalate();
+        kprint("recover: ladder reached rung R-", 31); kprint_num(gpu_recover_rung);
+        kprintln("", 0);
+        if (r == 0) { return 0 - 4; }
+        return 95;
+    }
+#endif
+    if (arm == RECOV_ARM_C) {
+        # ⛔ THE NEGATIVE CONTROL, and it is the arm that decides whether recovery is WORTH
+        # having: if the matmul is not bit-correct after a recovery, the recovery is worse than
+        # the hang and R-4 (give up cleanly) becomes the default on any ambiguity.
+        kprintln("recover: ARM C -- negative control, matmul must be bit-correct", 62);
+        # ⚠ Re-run the REAL integer matmul and read gpu_matmul_ok — the same bit-correctness
+        # check the compute arc proved on iron. Not a new oracle invented for this arm: reusing
+        # the proven one is what makes "before and after" comparable.
+        gpu_shader_dispatch5();
+        if (gpu_matmul_ok != 1) {
+            kprintln("recover: ARM C FAILED -- matmul NOT bit-correct. Recovery is worse than", 71);
+            kprintln("recover: the hang; R-4 must become the default on any ambiguity.", 64);
+            return 0 - 3;
+        }
+        kprintln("recover: ARM C -- matmul bit-correct", 36);
+        return 95;
+    }
+    if (arm == RECOV_ARM_D) {
+        # Free: it rides whatever state the box is already in.
+        kprintln("recover: ARM D -- is the console still painting? EYE-CHECK the panel.", 69);
+        kprint("recover: gpu_wedged=", 20); kprint_num(gpu_wedged);
+        kprint(" recover_rung=", 14); kprint_num(gpu_recover_rung); kprintln("", 0);
+        kprintln("recover: if you can read this ON THE PANEL, the console survived a dead GPU", 75);
+        kprintln("recover: -- the load-bearing assumption under the whole GFX risk model.", 71);
+        return 95;
+    }
+    return 0 - 1;
+}
+
 fn mdo_caps_write(out_uva) {
     if (is_user_range(out_uva, 32) == 0) { return MDO_E_OUTBUF; }
     var flags = 0;
@@ -3965,6 +4036,17 @@ fn ksyscall(num, arg1, arg2, arg3) {
         var mo = gpu_modeset_op_sys(arg1, arg2);
         stack_canary_check(canary);
         return mo;
+    }
+    if (num == 94) {
+        # gpu_recover_op(arm) — 3D arc RUNG 5. The five-arm hang/recovery battery.
+        # ⛔ ARMS THAT WEDGE THE GPU ARE COMPILED OUT WITHOUT GPU_RECOVER, so a production
+        # kernel cannot be asked to hang itself. The RECOVERY half is always present — a
+        # shipping kernel must survive a hang it did not ask for.
+        # ⚠ arm A's PRIMARY oracle is rung 4's bracket, NOT whether recovery succeeds. Those are
+        # different claims; collapsing them would let a failed recovery hide a working
+        # instrument, and the instrument is what every later rung depends on.
+        stack_canary_check(canary);
+        return gpu_recover_op_sys(arg1);
     }
     if (num == 40) {
         # uptime_ms() — monotonic milliseconds since boot, returned in rax (no

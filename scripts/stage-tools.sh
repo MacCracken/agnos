@@ -129,6 +129,12 @@ stage_one agnos/gpu-test gpucopy.cyr  gpucopy  || rc=1
 # actual modeset (M-lane) is new op codes on this same #93, behind the H2 arm-once latch. Real AMD iron
 # lights the panel; QEMU exercises the ABI + caps path (exit 96).
 stage_one agnos/gpu-test modeset.cyr  modeset  || rc=1
+# gpuwedge — 3D arc rung 5: the GPU hang/recovery battery. `run /bin/gpuwedge --wedge` asks the
+# kernel to hang its own GPU so rung 4's bracket can be proven to localise it and the R-2/R-3/R-4
+# ladder proven to clear it. ⛔ The wedge arms are compiled out unless the kernel was built with
+# GPU_RECOVER=1 — a production kernel refuses with exit 96 and says why. This tool NEVER acts
+# without an explicit argument.
+stage_one agnos/gpu-test gpuwedge.cyr gpuwedge || rc=1
 
 # rupantara gpulayer — the ML-layer-on-GPU crown proof (1.54.x C6). A real bias-free MLP up-projection matmul
 # (rosnet linear_fwd 8x8x32) run on the gfx90c shader cores via #83, tiled 8x8 and byte-compared against
