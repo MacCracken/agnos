@@ -32,6 +32,36 @@ independent evidence. That pre-registered branch remains **untested**.
 
 ★ **The forensic block fired automatically — the first time agnos has ever captured a GPU hang.**
 
+### Added — rung 16 `tile-own`: every covered pixel owned by exactly one tile (HOST, 0 burns)
+
+`gpu-test/tileown.cyr`, `exit 95`. Corpus of 9 tile-boundary shapes plus 200 random meshes:
+**0 pixels with zero owners, 0 tiles binned twice.**
+
+⭐ **It caught a real bug on its first run, and the bug was a Cyrius language gotcha rather than an
+off-by-one.** Cyrius's right shifts are **inverted from the Java/C convention**: `>>` is **logical**
+(zero-fill) and `>>>` is **arithmetic** (sign-propagating). Measured:
+
+```
+(0 - (20 << 16)) >>  16  ==  281474976710636      # logical
+(0 - (20 << 16)) >>> 16  ==  -20                  # arithmetic — what was wanted
+```
+
+Using `>>` on a negative made a clipped triangle's bbox look enormous; the `if (px0 < 0)` clamp then
+**never fired** because the value was hugely positive, `px1 < px0` fired instead, and the binner
+returned **zero tiles for any triangle crossing the left or top edge**.
+
+⛔ **Why that would have been expensive:** a clipped triangle is the ordinary case. At rung 17 this
+presents as *"depth is order-dependent"* — and rung 17's own falsification cell reads that as "the
+serialisation is not serialising, escalate to the atomics variant (TD-5)", a separate and much
+larger bite. A binning bug would have sent the arc down a bigger, wrong path with burns attached.
+**This is precisely the misdiagnosis rung 16 exists to prevent, and it prevented it host-side at
+zero cost.**
+
+`>>>` is the direct fix. The bbox is *also* clamped in fixed-point before the shift — kept
+deliberately rather than as redundancy, because this bbox→tile conversion is the shape that goes
+into ring 3 and at that boundary it is worth not depending on operator semantics at all. Recorded
+as [[reference_cyrius_shift_right_is_logical]].
+
 ### Added — `#85 gpu_fill` gains a full-width BAND, unblocking the Phase-0 damage chain
 
 `gpu_fill(color, y0, h)`. `h == 0` keeps the original whole-buffer behaviour, so every shipped

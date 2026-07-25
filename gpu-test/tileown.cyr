@@ -1,0 +1,376 @@
+# tileown.cyr — RUNG 16 of the 3D arc. Does the tile binner own every pixel exactly once?
+#
+# ============================================================================================
+# THIS RUNG EXISTS SO THAT RUNG 17's ORACLE LOCALISES. THAT IS ITS WHOLE JOB.
+# ============================================================================================
+# Rung 17 (depth) serialises per tile: one workgroup owns an 8x8 tile and walks that tile's
+# triangle list in submission order. Its oracle is "two interpenetrating triangles submitted in
+# BOTH orders produce byte-identical output".
+#
+# ⛔ A BINNING OFF-BY-ONE AT A TILE BOUNDARY BREAKS THAT ORACLE WITHOUT BEING A DEPTH BUG.
+# If a pixel has NO owner, nothing writes it and the output differs between orders because a
+# stale value survives. If a pixel has TWO owners, two workgroups write it in a race and the
+# output differs between runs. **Both present at rung 17 as "depth is order-dependent"** — which
+# is exactly the conclusion rung 17's falsification cell says means "the serialisation is not
+# serialising, escalate to the atomics variant (TD-5), a separate and much larger bite."
+#
+# So a binning bug would send the arc down a bigger, wrong path. Proving ownership HERE, on the
+# host, at zero burns, is what makes rung 17's failure attributable to depth.
+#
+# ============================================================================================
+# WHAT IS ACTUALLY BEING TESTED — and what is trivially true
+# ============================================================================================
+# ⚠ Tiles PARTITION the plane by construction: `tile_of(px,py) = (py>>3)*tiles_x + (px>>3)` maps
+# every pixel to exactly one tile. Asserting that is a tautology and proves nothing.
+#
+# The real question is about the BINNER — the ring-3 code that, given a triangle, decides WHICH
+# tiles to enqueue work for. Two ways it can be wrong:
+#   * MISS  — a tile containing covered pixels is not enqueued  -> those pixels have 0 owners
+#   * DUPE  — the same tile is enqueued twice                   -> that tile has 2 owners
+# Both are checked against the rasteriser's own coverage, over the corpus and 200 random meshes.
+#
+# Build:  cd gpu-test && cyrius build tileown.cyr build/tileown
+# Run:    ./build/tileown    -> 95 every pixel owned exactly once · 90 a miss or a dupe (named)
+
+include "lib/io.cyr"
+
+fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn ps(s): i64 { print(s, slen(s)); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn puts(s): i64 { ps(s); nl(); return 0; }
+fn pnum(v): i64 {
+    if (v == 0) { print("0", 1); return 0; }
+    var neg = 0; var x = v;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    var b[24]; var i = 0;
+    while (x > 0) { store8(&b + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
+    if (neg == 1) { print("-", 1); }
+    while (i > 0) { i = i - 1; print(&b + i, 1); }
+    return 0;
+}
+
+var TW = 64;                 # screen width  in pixels
+var TH = 64;                 # screen height in pixels
+var TILE = 8;                # the standing design constraint: one workgroup per 8x8 tile
+var TILES_X = 8;             # TW / TILE
+var TILES_Y = 8;             # TH / TILE
+var NTILES = 64;
+
+var R_SHIFT = 16;
+var R_ONE   = 65536;
+var R_SS    = 4;
+
+# ---- the rasteriser (rung 8's, already proven byte-identical to sadish) ---------------------
+var ex0[16]; var ey0[16]; var ex1[16]; var ey1[16];
+var n_edges = 0;
+var accrow[64];
+var crx[16]; var crd[16];
+var cov[4096];
+
+fn r_fixed_mul(a, b): i64 { return (a * b) >> R_SHIFT; }
+fn edges_reset(): i64 { n_edges = 0; return 0; }
+fn edge_add(x0, y0, x1, y1): i64 {
+    if (y0 == y1) { return 0; }
+    if (n_edges >= 16) { return 0; }
+    store64(&ex0 + n_edges * 8, x0); store64(&ey0 + n_edges * 8, y0);
+    store64(&ex1 + n_edges * 8, x1); store64(&ey1 + n_edges * 8, y1);
+    n_edges = n_edges + 1;
+    return 0;
+}
+fn span_add(xs, xe, weight): i64 {
+    if (xe <= xs) { return 0; }
+    var lo = xs; if (lo < 0) { lo = 0; }
+    var wmax = TW << R_SHIFT;
+    var hi = xe; if (hi > wmax) { hi = wmax; }
+    if (hi <= lo) { return 0; }
+    var px = lo >> R_SHIFT;
+    var stop = 0;
+    while (stop == 0) {
+        if (px >= TW) { stop = 1; }
+        if (px < TW) {
+            var pl = px << R_SHIFT;
+            if (pl >= hi) { stop = 1; }
+            if (pl < hi) {
+                var pr = (px + 1) << R_SHIFT;
+                var a = lo; if (a < pl) { a = pl; }
+                var b = hi; if (b > pr) { b = pr; }
+                if (b > a) {
+                    store64(&accrow + px * 8,
+                            load64(&accrow + px * 8) + r_fixed_mul(weight, b - a));
+                }
+                px = px + 1;
+            }
+        }
+    }
+    return 0;
+}
+fn raster(): i64 {
+    var weight = R_ONE / R_SS;
+    var py = 0;
+    while (py < TH) {
+        var zi = 0;
+        while (zi < TW) { store64(&accrow + zi * 8, 0); zi = zi + 1; }
+        var s = 0;
+        while (s < R_SS) {
+            var sy = (py << R_SHIFT) + (s * R_ONE + (R_ONE >> 1)) / R_SS;
+            var nc = 0;
+            var ei = 0;
+            while (ei < n_edges) {
+                var ay = load64(&ey0 + ei * 8);
+                var by = load64(&ey1 + ei * 8);
+                var ylo = ay; var yhi = by; var dir = 1;
+                if (ay > by) { ylo = by; yhi = ay; dir = 0 - 1; }
+                if (sy >= ylo) {
+                    if (sy < yhi) {
+                        var ax = load64(&ex0 + ei * 8);
+                        var bx = load64(&ex1 + ei * 8);
+                        store64(&crx + nc * 8, ax + ((bx - ax) * (sy - ay)) / (by - ay));
+                        store64(&crd + nc * 8, dir);
+                        nc = nc + 1;
+                    }
+                }
+                ei = ei + 1;
+            }
+            var a = 1;
+            while (a < nc) {
+                var kx = load64(&crx + a * 8); var kd = load64(&crd + a * 8);
+                var b = a - 1; var stop = 0;
+                while (stop == 0) {
+                    if (b < 0) { stop = 1; }
+                    if (b >= 0) {
+                        if (load64(&crx + b * 8) > kx) {
+                            store64(&crx + (b + 1) * 8, load64(&crx + b * 8));
+                            store64(&crd + (b + 1) * 8, load64(&crd + b * 8));
+                            b = b - 1;
+                        }
+                        if (load64(&crx + b * 8) <= kx) { stop = 1; }
+                    }
+                }
+                store64(&crx + (b + 1) * 8, kx);
+                store64(&crd + (b + 1) * 8, kd);
+                a = a + 1;
+            }
+            var wind = 0; var ci = 0;
+            while (ci < nc - 1) {
+                wind = wind + load64(&crd + ci * 8);
+                if (wind != 0) {
+                    span_add(load64(&crx + ci * 8), load64(&crx + (ci + 1) * 8), weight);
+                }
+                ci = ci + 1;
+            }
+            s = s + 1;
+        }
+        var px = 0;
+        while (px < TW) {
+            var c = (load64(&accrow + px * 8) * 255) >> R_SHIFT;
+            if (c > 255) { c = 255; }
+            store8(&cov + py * TW + px, c);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return 0;
+}
+
+# ============================================================================================
+# THE BINNER UNDER TEST — screen-space bbox -> tile list
+# ============================================================================================
+# ⛔ THE OFF-BY-ONE LIVES IN THESE FOUR LINES, and it is the reason this rung exists.
+# A triangle's bbox in 16.16 covers pixels [x0>>16 .. (x1-1)>>16] — the high edge is EXCLUSIVE
+# in continuous space but the last COVERED pixel is the one below it. Using `x1>>16` as the last
+# pixel over-bins by a column whenever x1 is exactly on a pixel boundary (harmless, just wasted
+# work) and using `(x1>>16)-1` under-bins whenever it is not (a MISS — pixels with no owner).
+# The safe direction is to over-bin: an empty tile does nothing, a missing tile drops pixels.
+var binned[64];              # tile id -> 1 if this triangle was binned to it
+var n_binned = 0;
+
+fn bin_reset(): i64 {
+    var i = 0;
+    while (i < NTILES) { store64(&binned + i * 8, 0); i = i + 1; }
+    n_binned = 0;
+    return 0;
+}
+
+# Bin by the triangle's screen-space bounding box, clamped to the screen.
+fn bin_triangle(ax, ay, bx, by, cx, cy): i64 {
+    bin_reset();
+    var x0 = ax; if (bx < x0) { x0 = bx; } if (cx < x0) { x0 = cx; }
+    var x1 = ax; if (bx > x1) { x1 = bx; } if (cx > x1) { x1 = cx; }
+    var y0 = ay; if (by < y0) { y0 = by; } if (cy < y0) { y0 = cy; }
+    var y1 = ay; if (by > y1) { y1 = by; } if (cy > y1) { y1 = cy; }
+    # ⛔⛔ CYRIUS'S SHIFTS ARE INVERTED FROM THE JAVA/C CONVENTION — `>>` IS **LOGICAL**
+    # (zero-fill) AND `>>>` IS **ARITHMETIC** (sign-propagating). Measured:
+    #     (0 - (20 << 16)) >>  16  ==  281474976710636      <- logical, NOT what you want
+    #     (0 - (20 << 16)) >>> 16  ==  -20                  <- arithmetic, correct
+    # Using `>>` on a negative made a clipped triangle's bbox look enormous; the `if (px0 < 0)`
+    # clamp then NEVER FIRED because the value was hugely positive, `px1 < px0` fired instead,
+    # and the binner returned ZERO tiles for any triangle crossing the left or top edge.
+    # ⚠ `>>>` is the direct fix. The clamp below is kept as well, deliberately: this bbox->tile
+    # conversion is the shape that goes into ring 3, and at that boundary it is worth not
+    # depending on operator semantics at all. Belt and braces, not redundancy by accident.
+    #
+    # ⚠ This is not a test-harness quirk — it is the binner design that would go into ring 3, and
+    # a clipped triangle is the ordinary case, not the exotic one. At rung 17 it would have
+    # presented as "depth is order-dependent" for every off-screen-left triangle and sent the arc
+    # to the atomics variant (TD-5). Rung 16 exists for exactly this and it found it on run one.
+    #
+    # Clamping the FIXED-POINT bbox to the screen first means the shift only ever sees a
+    # non-negative value, so the trap cannot recur here regardless of shift semantics.
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 < 0) { return 0; }                       # entirely off-screen left
+    if (y1 < 0) { return 0; }                       # entirely off-screen top
+    var wmaxfx = (TW - 1) << R_SHIFT;
+    var hmaxfx = (TH - 1) << R_SHIFT;
+    if (x0 > wmaxfx) { return 0; }                  # entirely off-screen right
+    if (y0 > hmaxfx) { return 0; }                  # entirely off-screen bottom
+    if (x1 > wmaxfx) { x1 = wmaxfx; }
+    if (y1 > hmaxfx) { y1 = hmaxfx; }
+    # to pixels. ⚠ OVER-BIN DELIBERATELY: floor the low edge, ceil the high one. An empty tile
+    # does nothing; a missing tile drops pixels.
+    var px0 = x0 >> R_SHIFT;
+    var py0 = y0 >> R_SHIFT;
+    var px1 = (x1 + (R_ONE - 1)) >> R_SHIFT;
+    var py1 = (y1 + (R_ONE - 1)) >> R_SHIFT;
+    if (px1 > TW - 1) { px1 = TW - 1; }
+    if (py1 > TH - 1) { py1 = TH - 1; }
+    if (px1 < px0) { return 0; }
+    if (py1 < py0) { return 0; }
+    var ty = py0 / TILE;
+    while (ty <= py1 / TILE) {
+        var tx = px0 / TILE;
+        while (tx <= px1 / TILE) {
+            var id = ty * TILES_X + tx;
+            if (id >= 0) {
+                if (id < NTILES) {
+                    # ⛔ A DUPE HERE IS A REAL BUG, not a harmless repeat: rung 17 gives one
+                    # workgroup ownership of a tile. Two entries = two workgroups racing to
+                    # write the same pixels, which reads at rung 17 as nondeterministic depth.
+                    if (load64(&binned + id * 8) == 1) { return 0 - 1; }
+                    store64(&binned + id * 8, 1);
+                    n_binned = n_binned + 1;
+                }
+            }
+            tx = tx + 1;
+        }
+        ty = ty + 1;
+    }
+    return 0;
+}
+
+var total_miss = 0;
+var total_dupe = 0;
+var total_cases = 0;
+var first_bad_seed = 0;
+
+fn check_case(ax, ay, bx, by, cx, cy, seed): i64 {
+    total_cases = total_cases + 1;
+    edges_reset();
+    edge_add(ax, ay, bx, by);
+    edge_add(bx, by, cx, cy);
+    edge_add(cx, cy, ax, ay);
+    raster();
+    if (bin_triangle(ax, ay, bx, by, cx, cy) == 0 - 1) {
+        total_dupe = total_dupe + 1;
+        if (first_bad_seed == 0) { first_bad_seed = seed; }
+        return 0;
+    }
+    # Every COVERED pixel's tile must have been binned. A covered pixel whose tile is absent has
+    # ZERO owners: nothing would write it at rung 17, and a stale value would survive.
+    var miss = 0;
+    var i = 0;
+    while (i < TW * TH) {
+        if (load8(&cov + i) != 0) {
+            var px = i % TW;
+            var py = i / TW;
+            var id = (py / TILE) * TILES_X + (px / TILE);
+            if (load64(&binned + id * 8) != 1) { miss = miss + 1; }
+        }
+        i = i + 1;
+    }
+    if (miss != 0) {
+        if (total_miss == 0) {
+            ps("    first failure: seed "); pnum(seed);
+            ps("  binned tiles "); pnum(n_binned);
+            ps("  missed px "); pnum(miss); puts("");
+        }
+        total_miss = total_miss + miss;
+        if (first_bad_seed == 0) { first_bad_seed = seed; }
+        return 0;
+    }
+    return 1;
+}
+
+var rng_s = 0;
+fn rnd(): i64 {
+    rng_s = rng_s ^ (rng_s << 13);
+    rng_s = rng_s ^ ((rng_s >> 7) & 0x1FFFFFFFFFFFFFF);
+    rng_s = rng_s ^ (rng_s << 17);
+    if (rng_s < 0) { rng_s = 0 - rng_s; }
+    return rng_s;
+}
+fn rc(): i64 { return (rnd() % (70 * 65536)) - (3 * 65536); }
+fn fx(v): i64 { return v << R_SHIFT; }
+
+fn main(): i64 {
+    puts("tileown -- RUNG 16: every covered pixel owned by exactly ONE tile workgroup");
+    puts("===========================================================================");
+    puts("");
+    puts("Why it matters: at rung 17 a MISS (0 owners) leaves a stale pixel and a DUPE (2 owners)");
+    puts("races two workgroups. BOTH present as 'depth is order-dependent' -- which the plan says");
+    puts("means 'escalate to the atomics variant', a separate and much larger bite. A binning bug");
+    puts("would send the arc down a bigger, wrong path.");
+    puts("");
+
+    puts("[corpus] the shapes that stress tile boundaries");
+    # ⚠ These are chosen to land ON tile edges (multiples of 8), which is where an off-by-one
+    # in the bbox->tile conversion shows up and nowhere else.
+    check_case(fx(0), fx(0), fx(8), fx(0), fx(0), fx(8), 1);            # exactly one tile
+    check_case(fx(8), fx(8), fx(16), fx(8), fx(8), fx(16), 2);          # tile-aligned, next tile
+    check_case(fx(7), fx(7), fx(9), fx(7), fx(7), fx(9), 3);            # straddles a tile corner
+    check_case(fx(0), fx(0), fx(63), fx(0), fx(0), fx(63), 4);          # full screen diagonal
+    check_case(fx(31), fx(31), fx(33), fx(31), fx(31), fx(33), 5);      # straddles the centre
+    check_case(fx(0), fx(31), fx(63), fx(31), fx(0), fx(33), 6);        # thin horizontal band
+    check_case(fx(31), fx(0), fx(33), fx(0), fx(31), fx(63), 7);        # thin vertical band
+    check_case(0 - fx(20), 0 - fx(20), fx(20), fx(4), fx(4), fx(20), 8); # clipped at the origin
+    check_case(fx(50), fx(50), fx(90), fx(60), fx(60), fx(90), 9);      # clipped at the far edge
+    ps("  corpus cases: "); pnum(total_cases); puts("");
+    puts("");
+
+    puts("[random] 200 meshes, deterministic seeds");
+    var k = 0;
+    while (k < 200) {
+        var sd = 7717 + k * 104729;
+        rng_s = sd;
+        check_case(rc(), rc(), rc(), rc(), rc(), rc(), sd);
+        k = k + 1;
+    }
+    ps("  total cases: "); pnum(total_cases); puts("");
+    puts("");
+
+    ps("  pixels with ZERO owners (missed tiles) : "); pnum(total_miss); puts("");
+    ps("  tiles binned TWICE (duplicate owners)  : "); pnum(total_dupe); puts("");
+    if (first_bad_seed != 0) {
+        ps("  first failing seed : "); pnum(first_bad_seed);
+        puts("   (re-runnable exactly)");
+    }
+    puts("");
+
+    if (total_miss != 0) {
+        puts("** MISS: covered pixels whose tile was never binned. At rung 17 those pixels are");
+        puts("   written by NOBODY and a stale value survives -- which reads as order-dependent");
+        puts("   depth. Fix the bbox->tile conversion before rung 17 is built, not after.");
+        return 90;
+    }
+    if (total_dupe != 0) {
+        puts("** DUPE: a tile was binned twice. At rung 17 that is TWO workgroups racing to write");
+        puts("   the same pixels -- nondeterministic output that would be blamed on depth.");
+        return 90;
+    }
+    puts("EVERY covered pixel is owned by exactly ONE tile, across the corpus and 200 meshes.");
+    puts("Rung 17's oracle will localise: an order-dependence there is depth, not binning.");
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

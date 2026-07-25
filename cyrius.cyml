@@ -10,7 +10,7 @@ language = "cyrius"
 # while the INSTALLED cycc actually built the kernel warn-only, so the fold and codegen fix were already in
 # the shipped binary; this bump ends the drift and makes the fix the enforced floor. Also brings in the
 # #92/#93 gpu_shader_op/gpu_modeset_op wrappers the H3 /bin/modeset consumes.
-cyrius = "6.4.74"
+cyrius = "6.4.78"
 
 [build]
 entry = "kernel/agnos.cyr"
