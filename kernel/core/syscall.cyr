@@ -1392,7 +1392,7 @@ var RECOV_ARM_E = 5;   # the guard's own negative control
 
 fn gpu_recover_op_sys(arm) {
     if (gpu_present == 0) { return 0 - 1; }
-#ifdef GPU_RECOVER
+    #ifdef GPU_RECOVER
     if (arm == RECOV_ARM_A) {
         kprintln("recover: ARM A -- controlled wedge; the bracket must name the WAIT packet", 73);
         gpu_breadcrumb_seq = 2;
@@ -1421,7 +1421,7 @@ fn gpu_recover_op_sys(arm) {
         if (r == 0) { return 0 - 4; }
         return 95;
     }
-#endif
+    #endif
     if (arm == RECOV_ARM_C) {
         # ⛔ THE NEGATIVE CONTROL, and it is the arm that decides whether recovery is WORTH
         # having: if the matmul is not bit-correct after a recovery, the recovery is worse than
