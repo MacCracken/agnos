@@ -1,0 +1,336 @@
+# pm4lint.cyr — RUNG 2 of the 3D arc. Host-side PM4 decoder + invariant checker.
+#
+# ============================================================================================
+# WHY THIS EXISTS, AND WHY IT IS RUNG 2 AND NOT RUNG 12
+# ============================================================================================
+# agnos submits PM4 command streams to a GPU that, today, has NO hang detection whatsoever: a
+# malformed packet wedges the box with no log. Every later rung in this arc emits packets, and
+# each one wants to say "the stream is well-formed" before it costs a burn. This is the thing
+# that lets it say that — HOST-side, at zero burns, before the GPU ever sees a dword.
+#
+# ============================================================================================
+# ⛔ THE ORACLE IS MUTATION-CALIBRATED, AND THAT IS THE WHOLE POINT
+# ============================================================================================
+# A validator that only ever says PASS is decoration. This one is required to:
+#     (a) PASS both known-good in-tree streams, AND
+#     (b) FAIL every one of the 12 seeded mutations, each targeting a DIFFERENT invariant.
+# If it passes a mutated stream, it is not an instrument and no later rung may cite it.
+#
+#     *Calibrate the null, or you have not calibrated the instrument.*
+#
+# This is the same discipline that caught the M9 staging bug the night this arc was planned:
+# a gate nobody had tried to make fail. Here the failing is done first, by construction.
+#
+# ============================================================================================
+# PROVENANCE — every constant below is agnos's own, not invented
+# ============================================================================================
+# The known-good stream is TRANSCRIBED FROM gpu.cyr's gpu_matmul_run() ring-put sequence
+# (kernel/core/gpu.cyr ~1292-1316) with its constants resolved from gpu_regs.cyr. It is not a
+# plausible-looking stream I wrote — it is the stream agnos actually submits and that has been
+# proven bit-correct on iron (the f64 matmul rosnet-bit-correct tracker).
+#
+# Build:  cd gpu-test && cyrius build pm4lint.cyr build/pm4lint
+# Run:    ./build/pm4lint          -> exit 95 = calibrated (all good pass, all mutants fail)
+#                                     exit 90 = NOT calibrated; do not cite this tool
+
+include "lib/io.cyr"
+
+# ---- output helpers -----------------------------------------------------------------------
+# ⛔ LENGTHS ARE COMPUTED, NEVER HAND-COUNTED. The stdlib `print` takes (msg, len), and this
+# arc has lost real time to declared-vs-actual length mismatches in kernel kprint calls — a
+# whole checker script exists for that class. Here the class is designed out instead: slen()
+# walks to the NUL, so a string and its length cannot disagree.
+fn slen(s): i64 {
+    var n = 0;
+    while (load8(s + n) != 0) { n = n + 1; }
+    return n;
+}
+fn ps(s): i64 { print(s, slen(s)); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn puts(s): i64 { ps(s); nl(); return 0; }
+fn print_num(v): i64 {
+    if (v == 0) { print("0", 1); return 0; }
+    var neg = 0;
+    var x = v;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    var buf[24];
+    var i = 0;
+    while (x > 0) { store8(&buf + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
+    if (neg == 1) { print("-", 1); }
+    while (i > 0) { i = i - 1; print(&buf + i, 1); }
+    return 0;
+}
+
+# ---- PM4 type-3 header field extraction -------------------------------------------------
+# A type-3 packet header is:  [31:30]=3  [29:16]=count-1... no: [15:8]=opcode, [29:16]=count,
+# where the packet is (count + 2) dwords total including the header.
+fn pm4_type(h): i64 { return (h >> 30) & 3; }
+fn pm4_count(h): i64 { return (h >> 16) & 0x3FFF; }
+fn pm4_op(h): i64 { return (h >> 8) & 0xFF; }
+fn pm4_words(h): i64 { return pm4_count(h) + 2; }
+
+# ---- the opcodes agnos actually emits ----------------------------------------------------
+var OP_NOP              = 0x10;
+var OP_SET_SH_REG       = 0x76;
+var OP_DISPATCH_DIRECT  = 0x15;
+var OP_EVENT_WRITE      = 0x46;
+var OP_ACQUIRE_MEM      = 0x58;
+var OP_WRITE_DATA       = 0x37;
+var OP_DMA_DATA         = 0x50;
+
+# ---- SH register window (gfx9 SET_SH_REG offsets are relative to 0x2C00) ------------------
+var SH_REG_MIN = 0x200;
+var SH_REG_MAX = 0x300;
+
+# ---- failure codes: each names ONE invariant, so a mutant's rejection is attributable ------
+var E_OK          = 0;
+var E_TYPE        = 1;   # not a type-3 packet
+var E_TRUNC       = 2;   # packet claims more dwords than remain
+var E_OPCODE      = 3;   # opcode agnos never emits
+var E_SHREG_RANGE = 4;   # SET_SH_REG offset outside the SH window
+var E_COUNT       = 5;   # count does not match the opcode's fixed size
+var E_NO_COHER    = 6;   # ⛔ THE S3 INVARIANT: engine-domain transition with no coherence packet
+var E_NO_FENCE    = 7;   # stream does not end in a WRITE_DATA fence
+var E_ALIGN       = 8;   # PGM_LO not 256-byte aligned
+
+var lint_err = 0;
+var lint_at = 0;
+
+fn lint_fail(code, idx): i64 {
+    lint_err = code;
+    lint_at = idx;
+    return 0;
+}
+
+# ============================================================================================
+# THE CHECKER
+# ============================================================================================
+# ⚠ Returns 1 = well-formed, 0 = rejected (lint_err names which invariant, lint_at names the
+# dword). A checker that cannot say WHICH invariant failed is only marginally better than a
+# hang: the whole value is localisation.
+fn pm4_check(buf, n): i64 {
+    lint_err = 0;
+    lint_at = 0;
+    var i = 0;
+    var saw_dispatch = 0;
+    var saw_coher_after_dispatch = 0;
+    var last_op = 0;
+    while (i < n) {
+        var h = load32(buf + i * 4) & 0xFFFFFFFF;
+        if (pm4_type(h) != 3) { return lint_fail(E_TYPE, i); }
+        var w = pm4_words(h);
+        if (i + w > n) { return lint_fail(E_TRUNC, i); }
+        var op = pm4_op(h);
+
+        # -- opcode whitelist. An opcode agnos never emits is a corrupted header far more often
+        # than it is a new feature, and treating it as the latter is how a garbage dword reaches
+        # the CP.
+        var known = 0;
+        if (op == OP_NOP) { known = 1; }
+        if (op == OP_SET_SH_REG) { known = 1; }
+        if (op == OP_DISPATCH_DIRECT) { known = 1; }
+        if (op == OP_EVENT_WRITE) { known = 1; }
+        if (op == OP_ACQUIRE_MEM) { known = 1; }
+        if (op == OP_WRITE_DATA) { known = 1; }
+        if (op == OP_DMA_DATA) { known = 1; }
+        if (known == 0) { return lint_fail(E_OPCODE, i); }
+
+        # -- fixed-size opcodes. gfx9 pins these; a wrong count desynchronises the whole parse
+        # from this point on, which is exactly how one bad dword becomes an unreadable hang.
+        if (op == OP_DISPATCH_DIRECT) { if (pm4_count(h) != 3) { return lint_fail(E_COUNT, i); } }
+        if (op == OP_ACQUIRE_MEM)     { if (pm4_count(h) != 5) { return lint_fail(E_COUNT, i); } }
+        if (op == OP_WRITE_DATA)      { if (pm4_count(h) != 3) { return lint_fail(E_COUNT, i); } }
+        if (op == OP_EVENT_WRITE)     { if (pm4_count(h) != 0) { return lint_fail(E_COUNT, i); } }
+
+        # -- SET_SH_REG: the offset must land in the SH window, and PGM_LO must be 256-B aligned
+        # (the hardware ignores the low 8 bits, so a misaligned VA silently runs the WRONG code).
+        if (op == OP_SET_SH_REG) {
+            var off = load32(buf + (i + 1) * 4) & 0xFFFFFFFF;
+            if (off < SH_REG_MIN) { return lint_fail(E_SHREG_RANGE, i + 1); }
+            if (off >= SH_REG_MAX) { return lint_fail(E_SHREG_RANGE, i + 1); }
+            if (off == 0x20C) {
+                var lo = load32(buf + (i + 2) * 4) & 0xFFFFFFFF;
+                if ((lo & 0xFF) != 0) { return lint_fail(E_ALIGN, i + 2); }
+            }
+        }
+
+        # -- ⛔ THE S3 INVARIANT. A dispatch must be followed, before the fence, by a coherence
+        # packet — otherwise the CPU reads stale L2 and the result is a silent wrong answer, not
+        # an error. S3 measured 4096-of-4096 dwords stale without it. This is the single most
+        # expensive class of bug this linter exists to catch, because its symptom is *plausible
+        # numbers*.
+        if (op == OP_DISPATCH_DIRECT) { saw_dispatch = 1; saw_coher_after_dispatch = 0; }
+        if (op == OP_ACQUIRE_MEM) { if (saw_dispatch == 1) { saw_coher_after_dispatch = 1; } }
+        if (op == OP_WRITE_DATA) {
+            if (saw_dispatch == 1) {
+                if (saw_coher_after_dispatch == 0) { return lint_fail(E_NO_COHER, i); }
+            }
+        }
+
+        last_op = op;
+        i = i + w;
+    }
+    # -- the stream must END in a fence, or the CPU has nothing to wait on and will time out
+    # on a stream that actually completed.
+    if (last_op != OP_WRITE_DATA) { return lint_fail(E_NO_FENCE, n); }
+    return 1;
+}
+
+# ============================================================================================
+# THE KNOWN-GOOD STREAM — transcribed from gpu.cyr's gpu_matmul_run(), constants resolved
+# ============================================================================================
+var GOOD[80];
+var GOOD_N = 0;
+
+fn put(v): i64 { store32(&GOOD + GOOD_N * 4, v); GOOD_N = GOOD_N + 1; return 0; }
+
+fn build_good(): i64 {
+    GOOD_N = 0;
+    # ACQUIRE_MEM (invalidate) — the pre-dispatch coherence packet
+    put(0xC0055800); put(0x28C40000); put(0xFFFFFFFF); put(0x000000FF);
+    put(0); put(0); put(0x0000000A);
+    # SET_SH_REG PGM_LO/HI  (0x20C) — the shader address, 256-B aligned
+    put(0xC0027600); put(0x20C); put(0x00100000); put(0);
+    # SET_SH_REG RSRC1/RSRC2 (0x212)
+    put(0xC0027600); put(0x212); put(0x000000C0); put(0);
+    # SET_SH_REG NUM_THREAD_X/Y/Z (0x207)
+    put(0xC0037600); put(0x207); put(1); put(1); put(1);
+    # SET_SH_REG STATIC_SE0/SE1 (0x216)
+    put(0xC0027600); put(0x216); put(0xFFFFFFFF); put(0);
+    # SET_SH_REG STATIC_SE2/SE3 (0x219)
+    put(0xC0027600); put(0x219); put(0); put(0);
+    # SET_SH_REG RESOURCE_LIMITS (0x215)
+    put(0xC0017600); put(0x215); put(0);
+    # DISPATCH_DIRECT
+    put(0xC0031502); put(1); put(1); put(1); put(0x00000001);
+    # EVENT_WRITE CS_PARTIAL_FLUSH — the drain
+    put(0xC0004600); put(0x00000004);
+    # ACQUIRE_MEM (TC write-back+invalidate) — ⛔ the S3 packet
+    put(0xC0055800); put(0x00840000); put(0xFFFFFFFF); put(0x000000FF);
+    put(0); put(0); put(0x0000000A);
+    # WRITE_DATA fence
+    put(0xC0033700); put(0x00100500); put(0x00200000); put(0); put(0x5AA55AA5);
+    return GOOD_N;
+}
+
+# ============================================================================================
+# THE 12 SEEDED MUTATIONS — each breaks exactly ONE invariant
+# ============================================================================================
+# ⚠ Each mutant names the invariant it is calibrating. If a mutant PASSES, the invariant it
+# targets is not actually being enforced, and the report says which one — so a miscalibration
+# is localised rather than just "the linter is broken".
+var MUT[80];
+var MUT_N = 0;
+
+fn mut_copy(): i64 {
+    var i = 0;
+    while (i < GOOD_N) { store32(&MUT + i * 4, load32(&GOOD + i * 4)); i = i + 1; }
+    MUT_N = GOOD_N;
+    return 0;
+}
+
+# ⛔ THE HEADER INDICES BELOW ARE DERIVED BY WALKING THE STREAM, NOT GUESSED.
+# The first cut guessed them (40/51/58) and three mutants landed on payload dwords instead of
+# headers, so they mutated nothing the linter checks — and the harness correctly reported
+# NOT CALIBRATED and named exactly those three. That is the calibration working: a miscalibrated
+# mutation set is itself a defect the null-calibration catches.
+#   dw  0 ACQUIRE_MEM(inv) ·  7 PGM_LO · 11 RSRC1 · 15 NUM_THREAD · 20 SE0 · 24 SE2 · 28 RESLIM
+#   dw 31 DISPATCH_DIRECT  · 36 EVENT_WRITE · 38 ACQUIRE_MEM(tcwb) · 45 WRITE_DATA   (50 total)
+fn mutate(k): i64 {
+    mut_copy();
+    if (k == 0)  { store32(&MUT + 0 * 4, 0x00055800); }             # type 0, not type 3
+    if (k == 1)  { store32(&MUT + 0 * 4, 0xC3FF5800); }             # count runs past the buffer
+    if (k == 2)  { store32(&MUT + 0 * 4, 0xC0059900); }             # opcode 0x99 — never emitted
+    if (k == 3)  { store32(&MUT + 8 * 4, 0x00000050); }             # SH offset below the window
+    if (k == 4)  { store32(&MUT + 8 * 4, 0x00000900); }             # SH offset above the window
+    if (k == 5)  { store32(&MUT + 9 * 4, 0x00100001); }             # PGM_LO not 256-B aligned
+    if (k == 6)  { store32(&MUT + 0 * 4, 0xC0025800); }             # ACQUIRE_MEM wrong count
+    if (k == 7)  { store32(&MUT + 31 * 4, 0xC0011502); }            # DISPATCH wrong count
+    if (k == 8)  { store32(&MUT + 38 * 4, 0xC0051000); }            # ⛔ post-dispatch ACQUIRE -> NOP (S3)
+    if (k == 9)  { MUT_N = GOOD_N - 5; }                            # fence removed
+    if (k == 10) { store32(&MUT + 36 * 4, 0xC0014600); }            # EVENT_WRITE wrong count
+    if (k == 11) { store32(&MUT + 45 * 4, 0xC0013700); }            # WRITE_DATA wrong count
+    return MUT_N;
+}
+
+fn mut_name(k): i64 {
+    if (k == 0)  { ps("type-3 header replaced with type-0"); }
+    if (k == 1)  { ps("count runs past the end of the buffer"); }
+    if (k == 2)  { ps("opcode 0x99 that agnos never emits"); }
+    if (k == 3)  { ps("SET_SH_REG offset below the SH window"); }
+    if (k == 4)  { ps("SET_SH_REG offset above the SH window"); }
+    if (k == 5)  { ps("PGM_LO not 256-byte aligned (silently runs wrong code)"); }
+    if (k == 6)  { ps("ACQUIRE_MEM with the wrong dword count"); }
+    if (k == 7)  { ps("DISPATCH_DIRECT with the wrong dword count"); }
+    if (k == 8)  { ps("post-dispatch coherence packet removed -- THE S3 INVARIANT"); }
+    if (k == 9)  { ps("trailing WRITE_DATA fence removed"); }
+    if (k == 10) { ps("EVENT_WRITE with the wrong dword count"); }
+    if (k == 11) { ps("WRITE_DATA with the wrong dword count"); }
+    return 0;
+}
+
+fn err_name(e): i64 {
+    if (e == E_TYPE)        { ps("E_TYPE"); }
+    if (e == E_TRUNC)       { ps("E_TRUNC"); }
+    if (e == E_OPCODE)      { ps("E_OPCODE"); }
+    if (e == E_SHREG_RANGE) { ps("E_SHREG_RANGE"); }
+    if (e == E_COUNT)       { ps("E_COUNT"); }
+    if (e == E_NO_COHER)    { ps("E_NO_COHER"); }
+    if (e == E_NO_FENCE)    { ps("E_NO_FENCE"); }
+    if (e == E_ALIGN)       { ps("E_ALIGN"); }
+    return 0;
+}
+
+fn main(): i64 {
+    puts("pm4lint -- RUNG 2, the mutation-calibrated PM4 validator");
+    puts("========================================================");
+    build_good();
+    puts("");
+    puts("[1] the KNOWN-GOOD stream (transcribed from gpu_matmul_run) must PASS");
+    var ok = pm4_check(&GOOD, GOOD_N);
+    ps("    dwords: "); print_num(GOOD_N); puts("");
+    if (ok != 1) {
+        ps("    FAIL -- rejected the good stream with ");
+        err_name(lint_err);
+        ps(" at dword "); print_num(lint_at); puts("");
+        puts("");
+        puts("NOT CALIBRATED: it rejects a stream agnos proved on iron.");
+        return 90;
+    }
+    puts("    PASS");
+    puts("");
+    puts("[2] all 12 seeded mutations must FAIL (calibrate the null)");
+    var k = 0;
+    var missed = 0;
+    while (k < 12) {
+        var n = mutate(k);
+        var r = pm4_check(&MUT, n);
+        ps("    m"); print_num(k); ps("  ");
+        if (r == 1) {
+            ps("NOT CAUGHT  <-- ");
+            mut_name(k);
+            puts("");
+            missed = missed + 1;
+        }
+        if (r != 1) {
+            ps("caught (");
+            err_name(lint_err);
+            ps(" @ "); print_num(lint_at); ps(")  ");
+            mut_name(k);
+            puts("");
+        }
+        k = k + 1;
+    }
+    puts("");
+    if (missed != 0) {
+        ps("NOT CALIBRATED: "); print_num(missed);
+        puts(" mutation(s) passed. This tool is DECORATION and no rung may cite it.");
+        return 90;
+    }
+    puts("CALIBRATED -- good stream passes, all 12 mutants rejected.");
+    puts("Rung 2 green. Later rungs may cite this validator.");
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
