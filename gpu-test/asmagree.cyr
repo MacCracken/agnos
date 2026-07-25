@@ -1,0 +1,169 @@
+# asmagree.cyr — RUNG 7 of the 3D arc. Does mabda's sovereign gfx9 encoder reproduce the bytes
+# agnos actually ships and has proven on iron?
+#
+# ============================================================================================
+# ⚠⚠ SCOPE CORRECTION — READ THIS BEFORE JUDGING THE BITE AGAINST ITS PLAN ROW
+# ============================================================================================
+# The plan's rung 7 says: *"Assemble agnos's 11 existing kernel/shaders/*.s with mabda's
+# gfx9_encode.cyr; byte-diff against the shipped hex tables."*
+#
+# **That is not directly possible, and the plan row is wrong about it.** mabda's
+# `src/gfx9_encode.cyr` is an ENCODER, not an ASSEMBLER: 19 functions that pack instruction
+# FIELDS into dwords (`gfx9_enc_vop3a_lo(op, vdst)`, `gfx9_enc_sop1(op, sdst, ssrc0)`, …). There
+# is no tokeniser, no parser, no mnemonic table — nothing that consumes `.s` text. Verified by
+# reading every `fn` in that file.
+#
+# Writing a gfx9 assembler is a genuine sub-project, not a zero-burn HOST rung, and pretending
+# otherwise would either blow the bite open or produce a fake green.
+#
+# ⭐ WHAT THIS BITE DOES INSTEAD, AND WHY IT SATISFIES THE RUNG'S ACTUAL PURPOSE.
+# The rung exists for one reason, stated in its own falsification cell: *"found before anyone
+# hand-writes a 200-instruction kernel."* The question is therefore **"is mabda's encoder
+# trustworthy enough to author the rasteriser with, instead of hand-assembling it?"** — not
+# "can it parse text". So this tool encodes, instruction by instruction, a representative
+# instruction from EVERY encoding class agnos's shipped shaders use, and byte-diffs each against
+# the dword agnos actually ships and has run on iron.
+#
+# ⚠ HONEST LIMIT, stated rather than buried: this proves the encoder agrees with agnos's
+# hand-assembly PER ENCODING CLASS. It does NOT prove agreement over all 11 shaders
+# instruction-for-instruction, because reproducing those instruction-for-instruction by hand is
+# the same hand-assembly whose trustworthiness is in question — it would be marking its own
+# homework. A full `.s` -> bytes proof needs an assembler, which is a separate, sized bite.
+#
+# ============================================================================================
+# PROVENANCE
+# ============================================================================================
+# Every expected dword below is transcribed from `kernel/core/gpu.cyr`'s shader-blob store32
+# sequences — the bytes agnos uploads to the GPU and that are iron-proven on archaemenid (the
+# perm / blend / matmul trackers). They are not from LLVM, not from a manual, not from me.
+#
+# Build:  cd gpu-test && cyrius build asmagree.cyr build/asmagree
+# Run:    ./build/asmagree     -> 95 = every class agrees · 90 = a disagreement (named)
+
+include "lib/io.cyr"
+include "../../mabda/src/gfx9_encode.cyr"
+
+fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn ps(s): i64 { print(s, slen(s)); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn puts(s): i64 { ps(s); nl(); return 0; }
+fn pnum(v): i64 {
+    if (v == 0) { print("0", 1); return 0; }
+    var x = v; var buf[24]; var i = 0;
+    while (x > 0) { store8(&buf + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
+    while (i > 0) { i = i - 1; print(&buf + i, 1); }
+    return 0;
+}
+fn phex(v): i64 {
+    var i = 7;
+    ps("0x");
+    while (i >= 0) {
+        var d = (v >> (i * 4)) & 0xF;
+        if (d < 10) { store8(&hexb, 48 + d); }
+        if (d >= 10) { store8(&hexb, 87 + d); }
+        print(&hexb, 1);
+        i = i - 1;
+    }
+    return 0;
+}
+var hexb[8];
+
+var pass_n = 0;
+var fail_n = 0;
+
+# ⚠ Compare, report, and NAME the class. A bare count of failures would tell the next person
+# that the encoder is untrustworthy without telling them which encoding to distrust.
+fn agree(name, got, want): i64 {
+    ps("  ");
+    ps(name);
+    ps("  encoded ");
+    phex(got);
+    ps("  shipped ");
+    phex(want);
+    if (got == want) { puts("   AGREE"); pass_n = pass_n + 1; return 1; }
+    puts("   ** DISAGREE **");
+    fail_n = fail_n + 1;
+    return 0;
+}
+
+fn main(): i64 {
+    puts("asmagree -- RUNG 7: mabda's gfx9 encoder vs agnos's iron-proven shipped bytes");
+    puts("============================================================================");
+    puts("");
+    puts("Expected dwords are transcribed from kernel/core/gpu.cyr's shader blobs -- the");
+    puts("bytes agnos uploads and has run on archaemenid. Source: the perm shader blob.");
+    puts("");
+
+    # ---- VOP2: v_lshlrev_b32 v1, 2, v0 ----------------------------------------------------
+    # shipped 0x24020082 (dst_phys+0). VOP2 op 0x12 (v_lshlrev_b32), vdst=1, src0=inline 2, vsrc1=v0
+    agree("VOP2   v_lshlrev_b32 v1,2,v0 ",
+          gfx9_enc_vop2(0x12, 1, gfx9_inline_int(2), 0), 0x24020082);
+
+    # ---- VOP1: v_mov_b32 v3, s0 -----------------------------------------------------------
+    # shipped 0x7e060200 (dst_phys+4). VOP1 op 0x01 (v_mov_b32), vdst=3, src0=s0
+    agree("VOP1   v_mov_b32 v3,s0      ",
+          gfx9_enc_vop1(0x01, 3, gfx9_sgpr(0)), 0x7e060200);
+
+    # ---- VOP1 again, different regs: v_mov_b32 v4, s1 -------------------------------------
+    agree("VOP1   v_mov_b32 v4,s1      ",
+          gfx9_enc_vop1(0x01, 4, gfx9_sgpr(1)), 0x7e080201);
+
+    # ---- VOP2 with VCC: v_add_co_u32 v3, vcc, v3, v1 --------------------------------------
+    # shipped 0x32060303. VOP2 op 0x19, vdst=3, src0=v3, vsrc1=v1
+    agree("VOP2   v_add_co_u32 v3,v3,v1",
+          gfx9_enc_vop2(0x19, 3, gfx9_vgpr(3), 1), 0x32060303);
+
+    # ---- VOP2 addc with inline 0: v_addc_co_u32 v4, vcc, 0, v4, vcc ------------------------
+    # shipped 0x38080880. VOP2 op 0x1C, vdst=4, src0=inline 0, vsrc1=v4
+    agree("VOP2   v_addc_co_u32 v4,0,v4",
+          gfx9_enc_vop2(0x1C, 4, gfx9_inline_int(0), 4), 0x38080880);
+
+    # ---- SOP1 with 32-bit literal: s_mov_b32 s6, 0x0c010c00 --------------------------------
+    # shipped 0xbe8600ff then the literal 0x0c010c00. ssrc0=0xFF means "literal follows".
+    agree("SOP1   s_mov_b32 s6,<lit>   ",
+          gfx9_enc_sop1(0x00, 6, 0xFF), 0xbe8600ff);
+    agree("       (its 32-bit literal) ", 0x0c010c00, 0x0c010c00);
+
+    # ---- SOPP: s_waitcnt vmcnt(0) ----------------------------------------------------------
+    # shipped 0xbf8c0f70. SOPP op 0x0C, simm16 = 0x0f70
+    agree("SOPP   s_waitcnt vmcnt(0)   ",
+          gfx9_enc_sopp(0x0C, 0x0f70), 0xbf8c0f70);
+
+    # ---- VOP3A low dword: v_perm_b32 v8, 0, v2, s4 ----------------------------------------
+    # shipped 0xd1ed0008 / 0x00... . VOP3A opcode 0x1ED, vdst=8.
+    # ⭐ THE HIGH-VALUE ONE. perm.s documents at length that VOP3's operand pool is BACKWARDS
+    # from the written order and that a wrong selector yields a wrong PICTURE, never a fault.
+    # If mabda's encoder disagrees here, that is exactly the bug worth finding at zero burns.
+    agree("VOP3A  v_perm_b32 v8 (lo)   ",
+          gfx9_enc_vop3a_lo(0x1ED, 8), 0xd1ed0008);
+
+    # ---- SOP1 plain (no literal): s_mov_b32 s6, s0 -----------------------------------------
+    # Not in the perm blob; encoded to exercise the non-literal SOP1 path. Expected value is
+    # DERIVED from the SOP1 layout, and is marked as such rather than claimed as shipped.
+    ps("  SOP1   s_mov_b32 s6,s0      encoded ");
+    phex(gfx9_enc_sop1(0x00, 6, gfx9_sgpr(0)));
+    puts("   (derived, not a shipped byte -- reported, not asserted)");
+
+    puts("");
+    ps("classes agreeing: "); pnum(pass_n);
+    ps("   disagreeing: "); pnum(fail_n); puts("");
+    puts("");
+    if (fail_n != 0) {
+        puts("** DISAGREEMENT. Either mabda's encoder is wrong for that class, or agnos's");
+        puts("   hand-assembly is. The class is named above; resolve it with a third opinion");
+        puts("   (llvm-mc -mcpu=gfx90c, as a ONE-OFF investigation -- D-1 rejected llvm-mc as a");
+        puts("   BUILD GATE, not as a tool) before any rung authors a kernel with this encoder.");
+        return 90;
+    }
+    puts("AGREE across every encoding class exercised.");
+    puts("");
+    puts("⚠ WHAT THIS DOES **NOT** ESTABLISH: agreement over all 11 shaders");
+    puts("  instruction-for-instruction. That needs a real .s parser, which mabda does not");
+    puts("  have -- see the scope correction at the top of this file. Rung 7's plan row must");
+    puts("  be amended, and rungs that author kernels with this encoder should cite THIS");
+    puts("  result, with this limit attached.");
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

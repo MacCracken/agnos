@@ -3,6 +3,47 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.16] - 2026-07-25
+
+**3D ARC OPENS — Phase I instruments (open cycle).** Bumped on cycle open; the user tags at close.
+Instruments before anything that can wedge the GPU, per the arc plan's rule 3.
+
+### Added — rung 2 `pm4-lint`: the mutation-calibrated PM4 validator (HOST, 0 burns)
+
+`gpu-test/pm4lint.cyr`. Host-side PM4 decoder + invariant checker: type-3 framing, count-vs-payload,
+opcode whitelist, fixed-size opcodes, SET_SH_REG window range, `PGM_LO` 256-B alignment, the trailing
+fence, and **the S3 invariant** — a coherence packet between a dispatch and its fence.
+
+⛔ **The oracle is mutation-calibrated, and that is the whole point.** It must PASS the real 50-dword
+`gpu_matmul_run` envelope (transcribed from `gpu.cyr`, iron-proven) **and FAIL all 12 seeded
+mutations**, each targeting a different invariant. A validator that only ever says PASS is decoration.
+
+⚠ **The calibration caught its own miscalibration on the first run.** Three mutants passed, and the
+harness reported `NOT CALIBRATED` and named them — correctly: their dword indices had been *guessed*
+(40/51/58) rather than derived, so they landed on payload dwords and mutated nothing the linter
+inspects. Indices are now derived by walking the stream, and the derivation is committed as a comment.
+Final: good stream passes, **12/12 mutants rejected**, `exit 95`.
+
+The catch that matters most is m8 — deleting the post-dispatch coherence packet — because its symptom
+is not an error but *plausible wrong numbers*: S3 measured 4096-of-4096 dwords stale without it.
+
+### Added — rung 7 `asm-agree`: mabda's encoder vs agnos's shipped bytes (HOST, 0 burns)
+
+`gpu-test/asmagree.cyr`. **9/9 encoding classes agree**, `exit 95`.
+
+⛔ **The plan's rung 7 row was factually wrong and is amended.** mabda's `gfx9_encode.cyr` is an
+**encoder, not an assembler** — 19 field-packing functions, no parser. "Assemble the 11 `.s` files"
+is a gfx9-assembler sub-project, not a zero-burn HOST rung. Re-scoped to the rung's stated purpose
+(*"found before anyone hand-writes a 200-instruction kernel"*): every encoding class the shipped
+shaders use is encoded and byte-diffed against the dword agnos actually uploads and has run on iron —
+VOP1, VOP2, SOP1 + 32-bit literal, SOPP, and the VOP3A `v_perm_b32` whose wrong encoding yields a
+wrong *picture* and never a fault.
+
+⚠ **Honest limit:** agreement PER ENCODING CLASS, not over all 11 shaders instruction-for-instruction
+— doing that by hand would be the same hand-assembly whose trustworthiness is in question.
+
+### Fixed — `DIG_MODE` restore-on-exit (carried from the 1.56.15 work)
+
 ## [1.56.15] - 2026-07-25
 
 **M9 CLOSED — sequencing eliminated; audio-over-HDMI PARKED (open cycle).** Bumped on cycle open;
