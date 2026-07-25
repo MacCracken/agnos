@@ -318,6 +318,36 @@ elif [ -n "${BURN_HDMI_ATOM_FULL:-}" ]; then
     echo "[2/2] Building the A4 FULL kernel (HDA_HDMI + HDA_TONE + HDMI_ATOM + ATOM_RUN_TRANSMITTER + ATOM_TRACE + HDMI_AUDIO_DUMP: encoder + transmitter. ⚠ BLANKS THE CONSOLE without a full modeset — do not flash yet)."
     BUILD_ENV="HDA_HDMI=1 HDA_TONE=1 HDMI_ATOM=1 ATOM_RUN_TRANSMITTER=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
     BUILD_TAG="HDA_HDMI+HDA_TONE+HDMI_ATOM+ATOM_RUN_TRANSMITTER+ATOM_TRACE+HDMI_AUDIO_DUMP"
+elif [ -n "${BURN_MODESET_AUDIO:-}" ]; then
+    # ⛔⛔ M9 — THE SEQUENCING BURN. The whole arc's A4 question, reduced to ONE variable.
+    #
+    # THE EXPERIMENT: /bin/modeset --audio-pre and --audio-post run the SAME kernel code path
+    # (mdo_transmit_run(arm)) with provably IDENTICAL staging. The ONLY difference is where the
+    # unmute lands relative to the ATOM #76 transmitter edge:
+    #     --audio-pre   unmute BEFORE the edge   = what agnos has always done   = CONTROL
+    #     --audio-post  unmute AFTER  the edge   = what amdgpu does (+22.2 ms)  = TREATMENT
+    #
+    # ⛔ RUN BOTH IN ONE BOOT. A cross-boot comparison cannot control the sink's latched state
+    # ([[feedback_ear_oracle_needs_negative_control]]). One sink state, one cable, one volume.
+    #
+    # ⛔ HDA_TONE IS DELIBERATELY OFF. A fixed kernel sine is exactly guessable and would void the
+    # ear oracle. The tone comes from the ring-3 feed, not from the kernel.
+    # ⛔ BURN_AUDIO_TEARDOWN STAYS OFF. The shutdown release pop is the arc's only sink-side
+    # instrument; tearing down on exit destroys it.
+    #
+    # ⚠ L1 (the zero-burn Linux discriminator) could NOT pre-answer this: its positive control
+    # was silent because agnos's bracket is not replayable from userspace — both OTG_MASTER_EN=0
+    # and the FE_SOURCE_SELECT teardown hard-wedge the APU there. See prior-art/l1-verdict-0724.md.
+    # So this burn carries the question undiminished; L1 neither supports nor refutes it.
+    #
+    # ⚠ PREREQUISITE, and it is not optional: the M9d-fix (gpu_hdmi_audio_enable takes the
+    # caller's phy). Without it gpu_phy_discover() re-runs AFTER the BE<->FE disconnect has
+    # cleared FE_SOURCE_SELECT, staging REFUSES, and BOTH arms unmute over a register file that
+    # was never programmed — two identical non-experiments wearing the names of a control and a
+    # treatment. Landed 1.56.14; the H8 arm below proves it is in the artifact.
+    echo "[2/2] Building the M9 SEQUENCING kernel (HDA_HDMI + HDMI_ATOM + ATOM_TX_CYCLE + MODESET_AUDIO + ATOM_TRACE + HDMI_AUDIO_DUMP: staged-muted audio around a REAL #76 PHY edge; two arms differing ONLY in unmute position. ⛔ THE PANEL GOES DARK MID-SEQUENCE and must relight. EAR-CHECK the sink, EYE-CHECK the screen)."
+    BUILD_ENV="HDA_HDMI=1 HDMI_ATOM=1 ATOM_TX_CYCLE=1 MODESET_AUDIO=1 ATOM_TRACE=1 HDMI_AUDIO_DUMP=1"
+    BUILD_TAG="HDA_HDMI+HDMI_ATOM+ATOM_TX_CYCLE+MODESET_AUDIO+ATOM_TRACE+HDMI_AUDIO_DUMP"
 elif [ -n "${BURN_MODESET_TX_CYCLE:-}" ]; then
     # ⛔⛔ M8e (re-scoped 1.56.14) — THE REAL TRANSMITTER EDGE. #76 DISABLE then ENABLE, inside M6's
     # iron-proven OTG envelope, aimed by gpu_phy_discover() at the LIVE transmitter (phyid=1, measured).
@@ -492,6 +522,30 @@ case "$BUILD_TAG" in *HDMI_AUDIO_SWEEP*) verify_marker "hdmi-sweep: cycling" ;; 
 # (it happened to carry its kprintln, but that was luck, not process). This is the ATOM_DRY defect's family:
 # a flag whose presence in the tag was never proven in the artifact. Each marker below is a kprintln inside
 # the flag's own #ifdef, in a function called unconditionally, so it satisfies verify_marker's own rule.
+# ── M9 (MODESET_AUDIO). FOUR arms, and they are bidirectional: the audio arms must be PRESENT in
+# an M9 build and ABSENT from every other one. Without the negative half, a build that silently
+# lost the flag would still pass — which is the ATOM_DRY defect exactly (two artifacts that differ
+# in name and not in behaviour).
+case "$BUILD_TAG" in
+    *MODESET_AUDIO*)
+        verify_marker "ARM 1 CONTROL: unmute BEFORE the edge"
+        verify_marker "ARM 2 TREATMENT: unmute AFTER the edge"
+        # The DIG_MODE fold — proves the audio arms flip signalling to HDMI. Arm 0 must not.
+        verify_marker "DIG_MODE 2 -> 3 (HDMI signalling live; audio arm)"
+        # M9c: boot must NOT perform the bring-up, or a boot-time unmute latches the sink before
+        # the op ever runs and both arms measure the same pre-latched state.
+        verify_marker "boot-time hdmi audio SUPPRESSED"
+        # ⚠ HONEST CAVEAT on the *HDMI_AUDIO_DUMP* arm above: under MODESET_AUDIO the BOOT call to
+        # gpu_audio_dump() is suppressed (M9c), so that marker proves the string is COMPILED but no
+        # longer that it is REACHED at boot. It is still reached via `run /bin/dump`. Do not read
+        # that one as a reachability proof in an M9 build.
+        ;;
+    *)
+        # ⛔ NEGATIVE HALF: no other build may carry the audio arms.
+        verify_absent "ARM 1 CONTROL: unmute BEFORE the edge"
+        verify_absent "ARM 2 TREATMENT: unmute AFTER the edge"
+        ;;
+esac
 case "$BUILD_TAG" in *HDMI_DCCG*)        verify_marker "hdmi DCCG symclk re-prime" ;; esac
 case "$BUILD_TAG" in *HDMI_SYMCLK_AB*)   verify_marker "symclk-ab: in-boot A/B" ;; esac
 case "$BUILD_TAG" in *HDMI_ACR_CTS*)     verify_marker "hdmi acr cts programmed" ;; esac

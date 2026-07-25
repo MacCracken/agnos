@@ -319,6 +319,79 @@ fn modeset_transmitter(): i64 {
     return 95;
 }
 
+# ── M9: the two AUDIO arms. `--audio-pre` (op 0x07) and `--audio-post` (op 0x08).
+#
+# ⛔ THESE TWO ARE ONE EXPERIMENT WITH ONE VARIABLE. The kernel routes both into the SAME
+# mdo_transmit_run(arm) — same envelope, same watchdog, same H1 spill, and provably identical
+# staging (the host-side --plan-diff proves the write lists differ ONLY in the position of one
+# 5-op block). The ONLY difference is where the unmute lands relative to the transmitter edge:
+#   --audio-pre   unmute BEFORE the edge  = what agnos has always done  = the CONTROL
+#   --audio-post  unmute AFTER  the edge  = what amdgpu does (+22.2 ms) = the TREATMENT
+#
+# ⚠ Run BOTH in ONE boot, and do not tell the ear which is which beforehand. One sink state,
+# one cable, one volume — a cross-boot comparison cannot control the sink's latched state
+# ([[feedback_ear_oracle_needs_negative_control]]).
+#
+# ⚠ A kernel without MODESET_AUDIO ∧ ATOM_TX_CYCLE does not ADVERTISE these ops and answers
+# MDO_E_BADOP (reason 2) -> exit 87, which reads as "wrong kernel", never as a silent no-op.
+fn modeset_audio(op: i64, name: i64): i64 {
+    var rec[64];
+    var i = 0;
+    while (i < 16) { store32(&rec + i * 4, 0); i = i + 1; }
+    store32(&rec + 0, op);
+    var r = sys_gpu_modeset_op(&rec, 64);
+    if (r < 0) {
+        var code = 0 - r;
+        var reason = code & 0xFF;
+        m_puts("modeset: #93 audio error idx="); m_num(code >> 8);
+        m_puts(" reason="); m_num(reason); m_nl();
+        if (reason == 2) {
+            m_puts("modeset: op NOT ADVERTISED -- this kernel lacks MODESET_AUDIO and/or ATOM_TX_CYCLE."); m_nl();
+            m_puts("modeset: WRONG KERNEL for the M9 arms. Build with both, or the control and the"); m_nl();
+            m_puts("modeset: treatment would be the same experiment under two names."); m_nl();
+            return 87;
+        }
+        if (reason == 1) { m_puts("modeset: no GPU / live pipe != 0 / no live DIG -- QEMU has no DCN"); m_nl(); return 96; }
+        if (reason == 4) {
+            m_puts("modeset: latch would not arm -- blocked or read-only fs"); m_nl();
+            m_puts("modeset: recover with:  rm /.modeset-armed"); m_nl();
+            return 98;
+        }
+        if (reason == 18) { m_puts("modeset: refused -- not built with HDMI_ATOM"); m_nl(); return 94; }
+        if (reason == 19) { m_puts("modeset: an ATOM step FAILED -- see klug"); m_nl(); return 93; }
+        if (reason == 20) { m_puts("modeset: BE<->FE reconnect did not read back -- see klug"); m_nl(); return 88; }
+        if (reason == 21) {
+            m_puts("modeset: PHY DOWN -- #76 DISABLE took but ENABLE failed. POWER-CYCLE."); m_nl();
+            return 86;
+        }
+        if (reason == 22) {
+            # ⛔ THE DISPLAY IS FINE. Reported AFTER the display verdict on purpose so that
+            # "panel survived, audio refused" never reads as a modeset failure.
+            m_puts("modeset: AUDIO REFUSED -- the DISPLAY IS FINE; the audio half did not program."); m_nl();
+            m_puts("modeset: this is NOT a dark panel. See klug for which half refused."); m_nl();
+            return 85;
+        }
+        if (reason == 17) {
+            m_puts("modeset: pipe DARK after the edge -- watchdog ran (see klug)"); m_nl();
+            m_puts("modeset: recover with:  rm /.modeset-armed  then power-cycle (H2)"); m_nl();
+            return 91;
+        }
+        if (reason == 7) { m_puts("modeset: OPTC UNDERFLOW -- see klug"); m_nl(); return 90; }
+        if (reason == 14) { m_puts("modeset: off-rate -- refresh did not return (see klug)"); m_nl(); return 92; }
+        if (reason == 15) { m_puts("modeset: unmeasurable (see klug)"); m_nl(); return 97; }
+        return 97;
+    }
+    if (r != 0) { m_puts("modeset: #93 audio returned unexpected "); m_num(r); m_nl(); return 99; }
+    m_puts("modeset: AUDIO ARM OK -- edge survived, rate restored, audio programmed"); m_nl();
+    m_puts("modeset: ⚠ EYE-CHECK the panel AND EAR-CHECK the sink. rc 0 means the WRITES went"); m_nl();
+    m_puts("modeset: out -- it does NOT mean sound came out. The ear is the oracle."); m_nl();
+    m_puts("modeset: capture:  run /bin/klug   then disarm:  rm /.modeset-armed"); m_nl();
+    return 95;
+}
+
+fn modeset_audio_pre(): i64  { m_puts("modeset: ARM 1 CONTROL   (unmute BEFORE the edge)"); m_nl(); return modeset_audio(7, 1); }
+fn modeset_audio_post(): i64 { m_puts("modeset: ARM 2 TREATMENT (unmute AFTER the edge)");  m_nl(); return modeset_audio(8, 2); }
+
 # `--dump` = the M1/M2/M3 read-only pipe dump; `--lock` = the M4 OTG-lock proof (WRITES under the latch);
 # `--caps` (or bare) = the caps probe. argc/argv come from the kernel's parked init stack; if that ever
 # reads 0 (the argv-init trap) the tool falls back to caps, so a bare `run /bin/modeset` always works.
@@ -331,6 +404,8 @@ fn modeset_main(): i64 {
         if (streq(a1, "--vtotal") == 1) { return modeset_vtotal(); }
         if (streq(a1, "--recommit") == 1) { return modeset_recommit(); }
         if (streq(a1, "--transmitter") == 1) { return modeset_transmitter(); }
+        if (streq(a1, "--audio-pre") == 1) { return modeset_audio_pre(); }
+        if (streq(a1, "--audio-post") == 1) { return modeset_audio_post(); }
         if (streq(a1, "--caps") == 1) { return modeset_caps(); }
     }
     return modeset_caps();
