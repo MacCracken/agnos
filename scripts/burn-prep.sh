@@ -546,6 +546,49 @@ case "$BUILD_TAG" in
         verify_absent "ARM 2 TREATMENT: unmute AFTER the edge"
         ;;
 esac
+# ⛔⛔ THE STAGED TOOL MUST MATCH THE ONE JUST BUILT.
+# install-media.sh flashes /bin/* from build/rootfs/bin/, NOT from each tool's own build dir.
+# On 2026-07-24 the M9 burn shipped a correct kernel (opmask=511, both arms advertised) paired
+# with a modeset tool from SIX HOURS EARLIER that had no --audio-pre at all. Both arms fell
+# through to the caps probe, which returns 95 on a lit panel — indistinguishable from success.
+# The operator ran the experiment twice, heard silence twice, and none of it was data.
+# burn-prep verified the KERNEL artifact and never looked at the tools it would be flashed with.
+for _t in modeset klug; do
+    _src=""
+    case "$_t" in
+        modeset) _src="gpu-test/build/modeset_agnos" ;;
+        klug)    _src="" ;;   # klug is staged from its own repo; size-compare only
+    esac
+    _staged="build/rootfs/bin/$_t"
+    if [ ! -f "$_staged" ]; then
+        echo "burn-prep: STAGING GAP -- $_staged is MISSING. install-media would flash no $_t."
+        echo "  Fix:  sh scripts/stage-tools.sh"
+        exit 1
+    fi
+    if [ -n "$_src" ] && [ -f "$_src" ]; then
+        if ! cmp -s "$_src" "$_staged"; then
+            echo "burn-prep: STALE STAGED TOOL -- build/rootfs/bin/$_t differs from $_src"
+            echo "  staged: $(stat -c%s "$_staged") bytes, $(stat -c%y "$_staged" | cut -d. -f1)"
+            echo "  built:  $(stat -c%s "$_src") bytes, $(stat -c%y "$_src" | cut -d. -f1)"
+            echo "  install-media.sh flashes the STAGED one, so the burn would carry the old tool."
+            echo "  Fix:  sh scripts/stage-tools.sh"
+            exit 1
+        fi
+    fi
+done
+echo "  staged tools match their builds (modeset, klug)"
+case "$BUILD_TAG" in
+    *MODESET_AUDIO*)
+        # The flags the operator is told to type MUST exist in the binary that gets flashed.
+        for _m in "--audio-pre" "--audio-post" "ARM 1 CONTROL" "ARM 2 TREATMENT"; do
+            if ! grep -qa -- "$_m" build/rootfs/bin/modeset; then
+                echo "burn-prep: STAGED TOOL LACKS '$_m' -- the burn's own oracle cannot be invoked."
+                exit 1
+            fi
+        done
+        echo "  staged /bin/modeset carries both M9 arms"
+        ;;
+esac
 case "$BUILD_TAG" in *HDMI_DCCG*)        verify_marker "hdmi DCCG symclk re-prime" ;; esac
 case "$BUILD_TAG" in *HDMI_SYMCLK_AB*)   verify_marker "symclk-ab: in-boot A/B" ;; esac
 case "$BUILD_TAG" in *HDMI_ACR_CTS*)     verify_marker "hdmi acr cts programmed" ;; esac

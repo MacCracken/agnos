@@ -4987,6 +4987,14 @@ sh_exec("run /bin/modeset --recommit", 27);
 # untouched. On a production (no-HDMI_ATOM) kernel it would answer reason 18 instead; both are safe refusals.
 kprintln("modeset: running /bin/modeset --transmitter", 43);
 sh_exec("run /bin/modeset --transmitter", 30);
+# ⛔ M9's TWO ARMS. Added after the 2026-07-24 burn returned the CAPS probe for both — with an
+# exit code (95, lit panel) INDISTINGUISHABLE from a successful arm, so two arms that never ran
+# produced output that looked like data. The selftest must exercise every flag the operator is
+# told to type, or the burn is the first place a dispatch bug is discovered.
+kprintln("modeset: running /bin/modeset --audio-pre", 41);
+sh_exec("run /bin/modeset --audio-pre", 28);
+kprintln("modeset: running /bin/modeset --audio-post", 42);
+sh_exec("run /bin/modeset --audio-post", 29);
 #endif
 
 # === Boot self-tests + kybernet launch split out (1.36.2 refactor) ===

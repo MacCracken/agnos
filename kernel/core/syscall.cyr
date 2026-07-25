@@ -1364,7 +1364,12 @@ var MDO_E_NOATOM     = 18;          # op    — M8: this kernel was not built wi
 var MDO_E_ATOM       = 19;          # op    — M8: an ATOM step failed (vbios acquire/parse/init, or a table returned nonzero)
 var MDO_E_BEFE       = 20;          # op    — M8: the BE<->FE routing bracket did not read back as written
 var MDO_E_PHYDOWN    = 21;          # op    — M8e: #76 DISABLE took but ENABLE failed -> THE LINK IS DOWN (power-cycle)
-var MDO_E_AUDIO      = 22;          # op    — M9: the DISPLAY survived but the audio half refused (staging or unmute)
+var MDO_E_AUDIO      = 22;
+var MDO_E_NOHDMI     = 23;          # op    — M9: the audio arm did not leave the link in HDMI signalling
+                                    #         (ATOM #76 ENABLE resets DIG_MODE to 2 — measured on iron
+                                    #         2026-07-24). Distinct from MDO_E_MODESET so the tool cannot
+                                    #         report "off-rate" for a signalling failure, which is exactly
+                                    #         what the M9 burn printed.          # op    — M9: the DISPLAY survived but the audio half refused (staging or unmute)
 
 # mdo_caps_write(out_uva) -> 0 / MDO_E_OUTBUF. Writes 8x u32 LE describing the modeset surface. READ-ONLY of
 # kernel state; the ONLY write is to the validated user buffer, via the gpu_caps_sys direct-store idiom.
@@ -2163,6 +2168,30 @@ fn mdo_transmit_run(arm) {
     # [[reference_agnos_dcn_hubp_reg_offsets_derived]] class — modify a FIELD of the CURRENT value.
     var be_now  = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
     var be_conn = (be_now & (0 - 1 - GPU_DIG_FE_SOURCE_SEL_MASK)) | GPU_DIG_FE_SOURCE_CONNECT;
+#ifdef MODESET_AUDIO
+    # ⛔⛔ RE-ASSERT DIG_MODE HERE — ATOM #76 ENABLE PUT IT BACK TO DVI.
+    # MEASURED ON IRON 2026-07-24 (M9 burn, both arms). The flip at the disconnect DID take
+    # (`DIG_MODE 2 -> 3`), and then #76's own ENABLE table overwrote it:
+    #       atom r=566f v=10030200
+    #       atom w=566f v=10020200      <- mode 3 -> 2, inside the ATOM table
+    # so the link finished in DVI, the whole HDMI_* block was inert, and NEITHER arm could carry
+    # audio. Both returned the same silence for the same reason, which is exactly the
+    # indistinguishable-arms failure this op is built to prevent.
+    #
+    # ⚠ THIS IS WHY agnos DIVERGES FROM THE CAPTURE AND THE CAPTURE CANNOT TELL US: amdgpu drives
+    # the PHY through its native link_enc code, never ATOM #76, so nothing in amdgpu's sequence
+    # resets DIG_MODE and its single 0x10030000 store at the disconnect is sufficient. agnos goes
+    # through the ATOM table, which does reset it. A write-list diff against the ftrace could
+    # never have surfaced this — only running the table on iron could.
+    #
+    # ⛔ The M9d verdict gate is what caught it (`TRANSMIT no-hdmi -- audio arm did not leave the
+    # link in HDMI signalling`). Without that gate both arms return a clean 95 and the silence
+    # reads as a real negative about sequencing. Do not remove it.
+    if (arm != 0) {
+        be_conn = (be_conn & (0 - 1 - GPU_DIG_MODE_MASK)) | (GPU_DIG_MODE_HDMI << GPU_DIG_MODE_SHIFT);
+        kprintln("modeset: transmit -- DIG_MODE re-asserted to 3 after #76 (ATOM reset it to 2)", 77);
+    }
+#endif
     gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, be_conn);
     gpu_mfence();
     # DISARM: routing is restored, so discovery is meaningful again. ⚠ Disarm AFTER the write lands, not
@@ -2328,7 +2357,7 @@ fn mdo_transmit_run(arm) {
     if (arm != 0) {
         if (dm1 != GPU_DIG_MODE_HDMI) {
             kprintln("modeset: TRANSMIT no-hdmi -- audio arm did not leave the link in HDMI signalling", 80);
-            return MDO_E_MODESET;
+            return MDO_E_NOHDMI;
         }
     }
     #endif

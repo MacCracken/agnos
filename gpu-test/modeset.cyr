@@ -378,6 +378,14 @@ fn modeset_audio(op: i64, name: i64): i64 {
         }
         if (reason == 7) { m_puts("modeset: OPTC UNDERFLOW -- see klug"); m_nl(); return 90; }
         if (reason == 14) { m_puts("modeset: off-rate -- refresh did not return (see klug)"); m_nl(); return 92; }
+        if (reason == 23) {
+            # ⛔ NOT a rate failure. The M9 burn printed "off-rate" for this and it read as a
+            # timing problem when the actual cause was ATOM #76 ENABLE resetting DIG_MODE to DVI.
+            m_puts("modeset: NO-HDMI -- the link did NOT end in HDMI signalling, so the HDMI"); m_nl();
+            m_puts("modeset: block was INERT and no unmute could carry audio. The DISPLAY IS FINE."); m_nl();
+            m_puts("modeset: This is NOT a result about sequencing -- both arms fail it identically."); m_nl();
+            return 83;
+        }
         if (reason == 15) { m_puts("modeset: unmeasurable (see klug)"); m_nl(); return 97; }
         return 97;
     }
@@ -407,7 +415,25 @@ fn modeset_main(): i64 {
         if (streq(a1, "--audio-pre") == 1) { return modeset_audio_pre(); }
         if (streq(a1, "--audio-post") == 1) { return modeset_audio_post(); }
         if (streq(a1, "--caps") == 1) { return modeset_caps(); }
+        # ⛔ AN ARGUMENT WE DO NOT KNOW IS AN ERROR, NOT A CAPS PROBE. Silently running a
+        # different operation than the one asked for is how a typo becomes a wasted burn.
+        m_puts("modeset: UNKNOWN ARGUMENT -- no operation was performed."); m_nl();
+        m_puts("modeset: valid: --dump --lock --vtotal --recommit --transmitter"); m_nl();
+        m_puts("modeset:        --audio-pre --audio-post --caps"); m_nl();
+        return 84;
     }
+    # ⛔⛔ NO ARGUMENTS SEEN. This is the argv-init trap, and on the 2026-07-24 M9 burn it cost
+    # the whole run: the operator typed `modeset --audio-pre` (no `run /bin/` prefix), argc read
+    # 0, this fell through to the caps probe, and caps returned 95 on a lit panel — an exit code
+    # indistinguishable from a successful arm. Two arms were "run", neither existed, and the
+    # resulting silence looked like data. Falling back is still right (a bare `run /bin/modeset`
+    # must work), but it must NEVER be silent about it.
+    m_puts("modeset: ================================================================"); m_nl();
+    m_puts("modeset: ⚠ NO ARGUMENTS SEEN -- running the CAPS PROBE only."); m_nl();
+    m_puts("modeset: IF YOU ASKED FOR AN ARM, IT DID **NOT** RUN. Nothing was written,"); m_nl();
+    m_puts("modeset: no edge fired, and any silence you hear means NOTHING."); m_nl();
+    m_puts("modeset: Invoke with the full path:   run /bin/modeset --audio-pre"); m_nl();
+    m_puts("modeset: ================================================================"); m_nl();
     return modeset_caps();
 }
 
