@@ -10,6 +10,50 @@ tags/releases at close. Scope: **re-derive ATOM #76's `phyid`** (M8d's seed over
 below), then **M8e** (the live #76 PHY edge) → **M9** (audio sequenced after the transmitter edge).
 M8e stays blocked until the transmitter is provably pointed at the live PHY.
 
+### Fixed — ATOM #76 ENABLE resets `DIG_MODE` to DVI; the audio arms now re-assert it after the edge
+
+**Found by the M9 burn, 2026-07-24/25.** The first attempt returned `TRANSMIT no-hdmi` on both arms.
+The `DIG_MODE 2 -> 3` flip folded into the BE↔FE disconnect *did* take — and then `#76`'s own ENABLE
+table overwrote it:
+
+```
+atom r=566f v=10030200
+atom w=566f v=10020200      <- DIG_MODE 3 -> 2, inside the ATOM table
+```
+
+So the link finished in **DVI**, where the entire `HDMI_*` block is inert, and neither arm could carry
+audio — both failing identically, which is precisely the indistinguishable-arms outcome this op exists
+to prevent. `mdo_transmit_run` now re-asserts `DIG_MODE` in the `E_conn` RMW, after `#76`.
+
+⚠ **No write-list diff against the ftrace could have found this.** amdgpu drives the PHY through its
+native `link_enc` code, never ATOM `#76`, so nothing in amdgpu's sequence resets `DIG_MODE` and its
+single `0x10030000` store at the disconnect is sufficient. agnos goes through the ATOM table, which
+resets it. Only executing that table on iron could surface the divergence.
+
+⭐ **The M9d verdict gate is what caught it** — `TRANSMIT no-hdmi -- audio arm did not leave the link in
+HDMI signalling`. Without that check both arms return a clean 95 and the silence reads as a genuine
+negative about sequencing. It would have produced the right headline for the wrong reason, one bug
+early. **Do not remove it.**
+
+Also split `MDO_E_NOHDMI` (23) out of `MDO_E_MODESET` (14): sharing a code made the tool print
+`off-rate -- refresh did not return` for a *signalling* failure, which reads as a timing problem and
+sent the first diagnosis the wrong way. New tool exit **83**.
+
+### Added — M9e: `/bin/modeset --audio-pre` / `--audio-post`, and the staging gate that was missing
+
+The kernel had ops 0x07/0x08 since M9d and **nothing could invoke them** — the tool had no flags at all.
+Worse, `install-media.sh` flashes `/bin/*` from `build/rootfs/bin/`, and the first M9 burn shipped a
+correct kernel (`opmask=511`, both arms advertised) paired with a `modeset` binary **six hours stale**
+that had no `--audio-pre` in it. Both arms fell through to the caps probe, which returns 95 on a lit
+panel — indistinguishable from success. The experiment was run twice on output that was not data.
+
+`burn-prep.sh` now **refuses** if any staged tool differs from its build, or if the staged
+`/bin/modeset` lacks the flags the burn's own rubric tells the operator to type. It had been verifying
+the kernel artifact while never looking at the tools it would be flashed alongside.
+
+The tool's silent argv fallback is now a loud named refusal, and an unknown argument is a hard error
+(84) rather than a caps probe.
+
 ### Fixed — M9d-fix: the audio arms' STAGING never ran (`gpu_hdmi_audio_enable` re-discovered a phyid the op had already destroyed)
 
 **Found by the L1 design review, before the burn — it would have wasted an iron session.** `mdo_transmit_run()`

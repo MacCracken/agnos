@@ -2331,6 +2331,32 @@ fn mdo_transmit_run(arm) {
     kprint("modeset: transmit -- DIG_MODE ", 30); kprint_num(dm0); kprint(" -> ", 4); kprint_num(dm1);
     kprintln("  (2=DVI 3=HDMI)", 16);
 
+#ifdef MODESET_AUDIO
+    # ── LEAVE THE LINK AS WE FOUND IT (the M9-burn confound, closed) ────────────────────────────────
+    # ⛔ WITHOUT THIS THE ARMS ARE NOT INDEPENDENT. On the 2026-07-24 burn arm 1 left DIG_MODE at 3, so
+    # arm 2 began from a link that had been sitting in HDMI signalling since the previous invocation:
+    #       arm 1 pre-state  be_cntl 0x10020200   (DIG_MODE 2, DVI — the inherited GOP state)
+    #       arm 2 pre-state  be_cntl 0x10030200   (DIG_MODE 3, HDMI — arm 1's leftovers)
+    # Arm 1 therefore ran DVI->HDMI and arm 2 ran HDMI->HDMI. That did not rescue the both-silent
+    # verdict (neither position sounded from either starting state, and arm 2 had the more favourable
+    # one), but it makes any FUTURE sound-on-one-arm result uninterpretable: "the unmute was after the
+    # edge" and "the link was already in HDMI when this arm started" would be tangled, and no amount of
+    # re-running would separate them.
+    #
+    # ⚠ RESTORE HERE, AFTER be1/dm1 ARE CAPTURED, so the verdict still adjudicates on the REAL
+    # post-edge state. Restoring before the read would make the no-hdmi gate report our own cleanup.
+    # ⚠ FIELD-modify the CURRENT value; never write back the whole snapshot
+    # ([[reference_agnos_dcn_hubp_reg_offsets_derived]]).
+    if (arm != 0) {
+        var be_now2 = gpu_reg32(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db) & 0xFFFFFFFF;
+        var be_rest = (be_now2 & (0 - 1 - GPU_DIG_MODE_MASK)) | (dm0 << GPU_DIG_MODE_SHIFT);
+        gpu_reg32_write(GPU_BASE_DCN_2, GPU_R_DIG_BE_CNTL + db, be_rest);
+        gpu_mfence();
+        kprint("modeset: transmit -- DIG_MODE restored to inherited ", 52); kprint_num(dm0);
+        kprintln(" (arms stay independent)", 24);
+    }
+#endif
+
     # ── VERDICT ─────────────────────────────────────────────────────────────────────────────────────
     if (stopped == 0) { kprintln("modeset: TRANSMIT FAILED -- OTG_MASTER_EN=0 did not stop the pipe", 65); return MDO_E_NOSTOP; }
     if (r4 != 0) { kprintln("modeset: TRANSMIT FAILED -- ATOM #4 encoder returned an error", 61); return MDO_E_ATOM; }
