@@ -44,6 +44,69 @@ byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random m
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
 
+### Added — bite **B2**, THE CORRECTNESS GATE: `gpu-test/edgemodel.cyr`
+
+The entire rung-9b shader algorithm — the per-edge prologue, the 25-op branch-free divider, and
+the sort-free breakpoint walk — written in Cyrius **at shader register widths**, with every
+intermediate masked to 32 bits, and byte-diffed against `refraster.cyr` before one instruction is
+assembled. ⭐ **This converts "the algorithm is exact" from an argument into an artifact diffed
+against the artifact that IS the oracle, at zero burns. If the iron burn is red, the fault is in
+the EMISSION — encoding, register allocation, branch offsets — and not in the algorithm.**
+
+**All five gates green:**
+
+| gate | result |
+|---|---|
+| 1a — the 20-case corpus, byte-for-byte | **20/20 identical** |
+| 1b — random triangles + 3-triangle meshes | **120/120 · 40/40 identical** |
+| 2 — the 25-op divider vs the reference expression | **11,970 cases, 0 wrong** |
+| 3 — ⭐ FALSIFICATION: `\|bx−ax\| ≥ 2^31` **must** break | **15/4000 differ** — the bound is real |
+| 5 — summing vs merging, at the accumulator | delta **8**, max **5** fragments/pixel |
+| 4 — breakpoint-walk trip count, measured | **max 5** |
+
+- **The divider does no division and no float.** The half-open rule forces
+  `sign(sy−ay) = sign(by−ay)`, so all four sign quadrants collapse to one unsigned
+  `floor(M·u/d)` and truncation-toward-zero comes out **by construction, not by fixup**. `u ≤ d`
+  is a gift from the same rule, which is what turns a 64/32 problem into a 32-bit one.
+- ⛔ **No `v_rcp_f32` anywhere.** LLVM's f32-reciprocal macro is exact only *empirically* — its
+  own source says so, it was demonstrably wrong before 2020, and a +1-ULP perturbation the ISA
+  permits breaks it inside our operand range. The 32-iteration integer restoring loop is exact by
+  construction and, hoisted per edge, costs nothing amortised.
+  [[feedback_sovereignty_over_slip_at_base]]
+- ⚠ **Gate 3 is the one that makes the domain a claim rather than decoration.** A bound with no
+  failing arm is a hope; this one fails on purpose above `2^31`, which is what justifies B3's
+  coordinate guard.
+- Trip count measured at **5**, against the plan's assumed ~2 and a surveyor's reported max 3.
+  Recorded rather than smoothed — it feeds the B10 cost model.
+
+**Calibrated against six mutations, 6/6 caught**: sign collapse removed · `ylo` read instead of
+the raw `ay` · `<` for `<=` on the winding test · the single correction dropped · fragments merged
+· and the 32-bit discipline dropped (`u32` made identity).
+
+### Fixed — corpus case 10 did not test what it was added for, and a plan claim is corrected
+
+⚠ **Two findings, both measured.**
+
+**(1) Overlapping triangles cannot expose fragment merging.** Case 10 was declared mandatory
+because merging a pixel's coverage fragments differs from summing them — but overlapping shapes
+produce **one continuous covered span**, so there is only ever one fragment per pixel per
+sub-scanline and the two are indistinguishable. Case 10 now also carries **two rectangles
+separated by a sub-pixel gap**, both inside one pixel column, widths ≡ 2 (mod 4) in 16.16 so the
+discarded remainders sum to a whole unit. Max fragments per pixel went 0 → **5**.
+
+**(2) ⛔ The plan's claim that merging "changes output in 2/221 cases" does NOT hold at this
+output quantisation, and the arithmetic says why.** `add = r_fixed_mul(16384, len) = len >> 2`,
+so per-fragment truncation loses at most **0.75 accumulator units per fragment**; the output byte
+is `(acc·255) >> 16`, so one byte step costs **65536/255 = 257 units**. That needs ~343 fragments
+— over 4 sub-scanlines, ~86 disjoint fragments in one pixel, i.e. **~171 edges in a single pixel
+column**, far above the shipped `EDGE_CAP = 64`. Verified by running the mutation: merging passes
+all 20 cases and 160 random shapes.
+
+⭐ So the property is now checked **where it is visible — the accumulator** (gate 5), not the
+output. Per-fragment truncation is kept because it is what the reference does, and because the
+moment the edge cap rises or the mask gains depth it becomes observable. Recorded explicitly so
+nobody later "simplifies" it away on the grounds that no byte-level test catches it.
+
 ### Added — bite **B1**: the 20-case corpus, itemised — because it did not exist
 
 `gpu.md` cites "the 20-case corpus" twice and **both are specification, never a manifest**. The

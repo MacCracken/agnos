@@ -1,0 +1,563 @@
+# edgemodel.cyr — RUNG 9b BITE B2. THE CORRECTNESS GATE.
+#
+# ============================================================================================
+# THE ENTIRE SHADER ALGORITHM, IN CYRIUS, AT SHADER REGISTER WIDTHS — AND DIFFED
+# ============================================================================================
+# This is the keystone of rung 9b's plan and the reason eight of its eleven bites cost zero
+# burns. It implements what `edge_setup.s` and `edge_cov.s` will compute — the per-edge
+# prologue, the 25-op branch-free divider, and the sort-free breakpoint walk — with EVERY
+# intermediate explicitly masked to 32 bits, and byte-diffs the result against
+# `refraster.cyr`'s `raster()` over the whole 20-case corpus plus random meshes.
+#
+# ⭐ WHY THIS IS WORTH ITS OWN BITE: it converts "the algorithm is exact" from an argument into
+# an artifact diffed against the artifact that IS the oracle, BEFORE one instruction is
+# assembled. If B2 is green and the iron burn is red, the fault is in the EMISSION — the
+# encoding, the register allocation, the branch offsets — and not in the algorithm. Without
+# it, a red burn leaves both halves suspect and every subsequent flash is a coin toss.
+#
+# ⛔ THIS IS A MODEL, NOT THE SHADER. It proves the arithmetic and the control flow. It cannot
+# prove that `v_mul_hi_u32` does what the ISA doc says on gfx90c silicon — that instruction has
+# NEVER executed on agnos, the whole divider rests on it, and it gets its own oracle on the
+# first burn. Nor can it prove `global_store_byte` does not clobber neighbouring lanes.
+#
+# ============================================================================================
+# THE FOUR GATES (all four required — see main())
+# ============================================================================================
+#   1  all 20 corpus cases + random triangles + random 3-triangle meshes: ZERO differing bytes
+#   2  the divider sweep: exact across the guarded domain and its edges, corrections <= 1
+#   3  ⭐ THE FALSIFICATION ARM: |bx-ax| >= 2^31 MUST produce mismatches. A domain claim with
+#      no failing arm is not a claim — it is a hope. This gate FAILS if nothing breaks.
+#   4  the breakpoint walk's maximum trip count, recorded and printed rather than assumed
+#
+# Build:  cd gpu-test && cyrius build edgemodel.cyr build/edgemodel
+# Run:    ./build/edgemodel   -> 95 all four gates · 90 a gate failed (named)
+
+include "lib/io.cyr"
+include "refraster.cyr"
+
+fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
+fn ps(s): i64 { print(s, slen(s)); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn puts(s): i64 { ps(s); nl(); return 0; }
+fn pnum(v): i64 {
+    if (v == 0) { print("0", 1); return 0; }
+    var neg = 0; var x = v;
+    if (x < 0) { neg = 1; x = 0 - x; }
+    var b[24]; var i = 0;
+    while (x > 0) { store8(&b + i, 48 + (x % 10)); x = x / 10; i = i + 1; }
+    if (neg == 1) { print("-", 1); }
+    while (i > 0) { i = i - 1; print(&b + i, 1); }
+    return 0;
+}
+
+# ============================================================================================
+# 32-BIT REGISTER DISCIPLINE
+# ============================================================================================
+# ⛔ Cyrius integers are i64. The shader's are 32-bit VGPRs. Every value that lives in a VGPR
+# is passed through u32() so this model wraps EXACTLY where the hardware wraps — a model that
+# quietly used 64-bit intermediates would prove the algorithm correct in a width the GPU does
+# not have, which is the most expensive kind of false green available here.
+fn u32(x): i64 { return x & 0xFFFFFFFF; }
+
+# ⚠ CYRIUS SHIFTS ARE INVERTED FROM C/JAVA: `>>` is LOGICAL (zero-fill), `>>>` is ARITHMETIC.
+# [[reference_cyrius_shift_right_is_logical]]. The divider wants LOGICAL throughout (it is all
+# unsigned); the abs idiom below wants ARITHMETIC, and using `>>` there would make the sign
+# mask 0 for negatives and silently return the wrong magnitude.
+fn sar32(x, n): i64 { return u32(((x << 32) >>> (32 + n))); }
+
+# v_ffbh_u32 — count leading zeros of a 32-bit value.
+fn clz32(x): i64 {
+    if (x == 0) { return 32; }
+    var v = u32(x);
+    var n = 0;
+    while ((v & 0x80000000) == 0) { v = u32(v << 1); n = n + 1; }
+    return n;
+}
+
+# ============================================================================================
+# DISPATCH 1 — the per-edge prologue (`edge_setup.s`), one lane per edge
+# ============================================================================================
+# Prep record, 32 bytes: [ax, ay, ylo, yhi] [N, d, V, L]
+var PREP_W = 8;                 # i64 slots per record in THIS model (the shader packs 8 x u32)
+var prep[4096];                 # module-scope var[N] = N x u64; 512 edges x 8 = 4096 slots
+var prep_n = 0;
+
+# V = floor((2^63 - 1) / dp) via the 32-iteration integer RESTORING loop.
+#
+# ⛔ NO v_rcp_f32 ANYWHERE, and that is a deliberate sovereignty call. LLVM's f32-reciprocal
+# division macro is exact only EMPIRICALLY — its own source comment says so, it was
+# demonstrably wrong before 2020, and a +1-ULP perturbation the ISA permits breaks it inside
+# our operand range. This loop is exact BY CONSTRUCTION and, hoisted per edge, costs nothing
+# amortised. [[feedback_sovereignty_over_slip_at_base]]
+#
+# ⚠ The numerator's high dword is 0x7FFFFFFF and its low dword is all-ones. Since dp >= 2^31,
+# the high dword is always < dp, and the bit shifted in is ALWAYS 1 — so the numerator needs no
+# register at all. `top` must be captured BEFORE the shift because the shift is 32-bit and
+# drops the carry.
+fn recip32(dp): i64 {
+    var r = 0x7FFFFFFF;
+    var v = 0;
+    var k = 0;
+    while (k < 32) {
+        var top = (r >> 31) & 1;
+        r = u32(u32(r << 1) | 1);
+        var ge = 0;
+        if (top == 1) { ge = 1; }
+        if (top != 1) { if (r >= dp) { ge = 1; } }
+        if (ge == 1) { r = u32(r - dp); }
+        v = u32(u32(v << 1) | ge);
+        k = k + 1;
+    }
+    return v;
+}
+
+# em_setup() — run dispatch 1 over the edge list refraster.cyr currently holds.
+fn em_setup(): i64 {
+    prep_n = 0;
+    var ei = 0;
+    while (ei < n_edges) {
+        var ax = load64(&ex0 + ei * 8);
+        var ay = load64(&ey0 + ei * 8);
+        var bx = load64(&ex1 + ei * 8);
+        var by = load64(&ey1 + ei * 8);
+        var ylo = ay; var yhi = by;
+        if (ay > by) { ylo = by; yhi = ay; }
+        var d = yhi - ylo;
+        if (d < 1) { d = 1; }                       # v_max_u32 d, 1
+        var nn = bx - ax;
+        var l = clz32(d);
+        var dp = u32(d << l);
+        var b = &prep + ei * PREP_W * 8;
+        store64(b +  0, ax);
+        store64(b +  8, ay);                        # ⚠ the RAW endpoint, NOT ylo — see below
+        store64(b + 16, ylo);
+        store64(b + 24, yhi);
+        store64(b + 32, nn);
+        store64(b + 40, d);
+        store64(b + 48, recip32(dp));
+        store64(b + 56, l);
+        prep_n = prep_n + 1;
+        ei = ei + 1;
+    }
+    return prep_n;
+}
+
+# ============================================================================================
+# THE 25-OP BRANCH-FREE DIVIDER — one crossing, no division, no float, no branch
+# ============================================================================================
+# The reference is  xx = ax + ((bx-ax)*(sy-ay)) / (by-ay),  i64, TRUNCATING TOWARD ZERO.
+#
+# ⭐ SIGN COLLAPSE. The half-open test forces sign(sy-ay) = sign(by-ay), so with M = |bx-ax|,
+# d = |by-ay|, u = |sy-ay| in [0,d]:
+#         trunc(N*t/D) = sign(N) * floor(M*u/d)
+# All four sign quadrants collapse onto ONE unsigned floor-division, and truncation toward zero
+# is obtained BY CONSTRUCTION rather than by a fixup. ⛔ Substituting floor for trunc changes
+# output bytes in 51 of 420 measured cases, and the quotient is negative on EVERY left-leaning
+# edge — the common case, not a corner.
+#
+# ⚠ `ay` here is the RAW endpoint, never the swapped `ylo`. The reference swaps only
+# ylo/yhi/dir. Getting this backwards silently changes the answer on exactly half the edges.
+#
+# NORMALISATION: u <= d is a GIFT from the half-open rule, not an assumption. With L = clz32(d)
+# and dp = d<<L in [2^31, 2^32), P' = (M*u)<<L always fits 64 bits and floor(P/d) = floor(P'/dp).
+#
+# EXACT  <=>  |bx-ax| < 2^31  AND  2*|by-ay| < 2^32. The B3 coordinate guard (+-2^28) leaves two
+# bits of margin on both. Gate 3 below FALSIFIES the first condition on purpose.
+fn em_cross(b, sy): i64 {
+    var ax = load64(b +  0);
+    var ay = load64(b +  8);
+    var nn = load64(b + 32);
+    var d  = load64(b + 40);
+    var v  = load64(b + 48);
+    var l  = load64(b + 56);
+
+    var t  = sy - ay;
+    var ts = 0; if (t < 0) { ts = 0 - 1; }
+    var uu = t; if (uu < 0) { uu = 0 - uu; }        # v_ashrrev/add/xor -> |t|
+    var mm = nn; if (mm < 0) { mm = 0 - mm; }       # |N|
+
+    # P = M*u, a genuine 64-bit product built from v_mul_lo_u32 + v_mul_hi_u32.
+    # ⛔ v_mul_hi_u32 has NEVER executed on agnos silicon. The whole divider rests on it and it
+    # gets its own oracle on burn 1, before anything else runs.
+    var p   = mm * uu;
+    var plo = u32(p);
+    var phi = u32(p >> 32);
+
+    var l32 = 32 - l;
+    var a0  = u32(plo << l);
+    var tw  = 0;
+    if (l32 < 32) { tw = u32(plo >> l32); }
+    var a1  = u32(u32(phi << l) | tw);
+
+    var h0 = u32((a0 * v) >> 32);                   # a0*V's LOW dword is never needed
+    var l1 = u32(a1 * v);
+    var h1 = u32((a1 * v) >> 32);
+    var sum = h0 + l1;
+    var m   = u32(sum);
+    var carry = 0; if (sum > 0xFFFFFFFF) { carry = 1; }
+    var hh  = u32(h1 + carry);
+
+    var q = u32(u32(hh << 1) | (m >> 31));          # q_hat = (hh:m) >> 31
+    var qd = u32(q * d);
+    var r  = u32(plo - qd);
+    # THE single correction. q_hat is in {Q-1, Q} by the delta bound, never further.
+    if (r >= d) { q = u32(q + 1); }
+    em_corr_last = 0;
+    if (r >= d) { em_corr_last = 1; }
+
+    if (nn < 0) { return ax - q; }
+    return ax + q;
+}
+var em_corr_last = 0;
+
+# ============================================================================================
+# DISPATCH 2 — the SORT-FREE BREAKPOINT WALK, one lane per pixel
+# ============================================================================================
+# ⭐ NO SORT, NO LDS, NO CROSS-LANE OPERATION. The reference sorts each sub-scanline's crossings
+# and walks spans; a GPU lane cannot afford a 256-entry insertion sort and cannot share one.
+# Instead each lane advances a cursor `u` across ITS OWN pixel, and at each step re-scans the
+# edge table for (a) the winding to the left of u and (b) the nearest crossing to the right.
+#
+# ⚠ THE RE-SCAN IS THE CHOSEN COST, stated rather than hidden. gfx9 has no per-lane
+# runtime-indexed VGPR access (v_movrels goes through M0 and is wave-uniform), so a resident
+# per-lane crossing list REQUIRES LDS — which drags in the DS format the encoder cannot emit,
+# a never-set RSRC2 field, and an allocation with NO readable oracle. The re-scan avoids all of
+# it. Trip count is 1 + (crossings strictly inside this pixel), so it is 1 for most pixels;
+# gate 4 measures the real maximum instead of trusting that.
+#
+# `<=` not `<` on the winding test is deliberate: ties at the left edge must count, exactly as
+# the reference's sorted walk counts them before emitting the following span.
+var SUBY0 = 8192;
+var SUBY1 = 24576;
+var SUBY2 = 40960;
+var SUBY3 = 57344;
+var em_max_trip = 0;
+# ⚠ Gate-5 instrumentation. `em_merge_mode = 1` accumulates the MERGED way (sum the raw
+# fragment lengths, truncate once) instead of the reference's per-fragment truncation.
+# It exists because the byte-level oracle provably CANNOT see the difference — see gate 5.
+var em_merge_mode = 0;
+var em_acc_raw = 0;
+var em_frag_max = 0;
+
+fn em_pixel(px, py): i64 {
+    var pl = px << 16;
+    var pr = pl + 65536;
+    var acc = 0;
+    var s = 0;
+    while (s < 4) {
+        var suby = SUBY0;
+        if (s == 1) { suby = SUBY1; }
+        if (s == 2) { suby = SUBY2; }
+        if (s == 3) { suby = SUBY3; }
+        var sy = (py << 16) + suby;
+        var uu = pl;
+        var rawsum = 0;
+        var nfrag = 0;
+        var trip = 0;
+        var done = 0;
+        while (done == 0) {
+            var wacc = 0;
+            var vmin = 0x7FFFFFFF;
+            var any = 0;
+            var ei = 0;
+            while (ei < prep_n) {
+                var b = &prep + ei * PREP_W * 8;
+                var ylo = load64(b + 16);
+                var yhi = load64(b + 24);
+                var act = 0;
+                # THE HALF-OPEN RULE, evaluated BEFORE the divide.
+                if (sy >= ylo) { if (sy < yhi) { act = 1; } }
+                if (act == 1) {
+                    var xx = em_cross(b, sy);
+                    var dir = 1;
+                    if (load64(b + 8) == yhi) { dir = 0 - 1; }
+                    if (xx <= uu) { wacc = wacc + dir; }
+                    if (xx > uu) {
+                        if (xx < vmin) { vmin = xx; }
+                        any = 1;
+                    }
+                }
+                ei = ei + 1;
+            }
+            # ⛔ Never fill past the last crossing.
+            if (any == 0) { done = 1; }
+            if (any == 1) {
+                var v = vmin;
+                if (v > pr) { v = pr; }
+                # ONE fragment, truncated ONCE. ⚠ Merging a pixel's fragments instead of summing
+                # them changes the output — corpus case 10 is the only case that can see it.
+                if (wacc != 0) {
+                    nfrag = nfrag + 1;
+                    # ONE fragment, truncated ONCE -- exactly as the reference does it.
+                    if (em_merge_mode == 0) { acc = acc + ((v - uu) >> 2); }
+                    if (em_merge_mode == 1) { rawsum = rawsum + (v - uu); }
+                }
+                uu = v;
+                trip = trip + 1;
+                if (uu >= pr) { done = 1; }
+            }
+        }
+        if (em_merge_mode == 1) { acc = acc + (rawsum >> 2); }
+        if (nfrag > em_frag_max) { em_frag_max = nfrag; }
+        if (trip > em_max_trip) { em_max_trip = trip; }
+        s = s + 1;
+    }
+    # min(acc, 65536) is output-equivalent to the reference's `c > 255` clamp and removes the
+    # accumulator-width question entirely.
+    em_acc_raw = acc;
+    if (acc > 65536) { acc = 65536; }
+    var c = ((acc << 8) - acc) >> 16;               # acc*255 without a 32-bit literal
+    if (c > 255) { c = 255; }
+    return c;
+}
+
+fn em_raster(cov): i64 {
+    em_setup();
+    var py = 0;
+    while (py < H) {
+        var px = 0;
+        while (px < W) {
+            store8(cov + py * W + px, em_pixel(px, py));
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    return 0;
+}
+
+# ============================================================================================
+var refbuf[4096];               # 4096 x u64 = 32768 B — holds 200x64 and 128x128
+var modbuf[4096];
+var rng_s = 0;
+fn rnd(): i64 {
+    rng_s = rng_s ^ (rng_s << 13);
+    rng_s = rng_s ^ ((rng_s >> 7) & 0x1FFFFFFFFFFFFFF);
+    rng_s = rng_s ^ (rng_s << 17);
+    if (rng_s < 0) { rng_s = 0 - rng_s; }
+    return rng_s;
+}
+
+fn em_diff(name, nlen): i64 {
+    cov_clear(&refbuf); raster(&refbuf);
+    cov_clear(&modbuf); em_raster(&modbuf);
+    var diff = 0; var worst = 0; var lit = 0;
+    var i = 0;
+    while (i < W * H) {
+        var a = load8(&refbuf + i) & 0xFF;
+        var b = load8(&modbuf + i) & 0xFF;
+        if (a != 0) { lit = lit + 1; }
+        if (a != b) {
+            diff = diff + 1;
+            var dd = a - b; if (dd < 0) { dd = 0 - dd; }
+            if (dd > worst) { worst = dd; }
+        }
+        i = i + 1;
+    }
+    if (diff != 0) {
+        ps("  ** DIFFER "); print(name, nlen);
+        ps("  bytes "); pnum(diff); ps("  worst "); pnum(worst); nl();
+        return 0;
+    }
+    return 1;
+}
+
+fn main(): i64 {
+    puts("edgemodel -- RUNG 9b BITE B2: the shader algorithm, in Cyrius, at register widths");
+    puts("================================================================================");
+    var ok = 1;
+
+    if (rr_selftest() != 1) { puts("** refraster selftest FAILED"); return 91; }
+
+    # ---- GATE 1a: the 20-case corpus ------------------------------------------------------
+    puts("[gate 1a] the 20-case corpus, byte-for-byte vs refraster.cyr");
+    var g1 = 0;
+    var ci = 1;
+    while (ci <= RR_NCASES) {
+        if (rr_case_load(ci) != 1) { ps("  case "); pnum(ci); puts(" REFUSED"); ok = 0; }
+        if (rr_case_load(ci) == 1) {
+            var nm = rr_case_name(ci);
+            if (em_diff(nm, slen(nm)) == 1) { g1 = g1 + 1; }
+            if (em_diff(nm, slen(nm)) == 0) { ok = 0; }
+        }
+        ci = ci + 1;
+    }
+    ps("  -> "); pnum(g1); ps(" of "); pnum(RR_NCASES); puts(" cases byte-identical");
+    if (g1 != RR_NCASES) { ok = 0; }
+
+    # ---- GATE 1b: random triangles and 3-triangle meshes -----------------------------------
+    puts("[gate 1b] random triangles + 3-triangle meshes");
+    rng_s = 0x9B2;
+    rr_set_dims(48, 48);
+    var t = 0; var g1b = 0;
+    while (t < 120) {
+        edges_reset();
+        tri_add((rnd() % (56 * 65536)) - (4 * 65536), (rnd() % (56 * 65536)) - (4 * 65536),
+                (rnd() % (56 * 65536)) - (4 * 65536), (rnd() % (56 * 65536)) - (4 * 65536),
+                (rnd() % (56 * 65536)) - (4 * 65536), (rnd() % (56 * 65536)) - (4 * 65536));
+        if (n_edges >= 2) {
+            if (em_diff("random triangle", 15) == 1) { g1b = g1b + 1; }
+            if (em_diff("random triangle", 15) == 0) { ok = 0; t = 120; }
+        }
+        if (n_edges < 2) { g1b = g1b + 1; }
+        t = t + 1;
+    }
+    var mesh = 0; var g1c = 0;
+    while (mesh < 40) {
+        edges_reset();
+        var k = 0;
+        while (k < 3) {
+            tri_add((rnd() % (52 * 65536)) - (2 * 65536), (rnd() % (52 * 65536)) - (2 * 65536),
+                    (rnd() % (52 * 65536)) - (2 * 65536), (rnd() % (52 * 65536)) - (2 * 65536),
+                    (rnd() % (52 * 65536)) - (2 * 65536), (rnd() % (52 * 65536)) - (2 * 65536));
+            k = k + 1;
+        }
+        if (em_diff("random 3-tri mesh", 17) == 1) { g1c = g1c + 1; }
+        if (em_diff("random 3-tri mesh", 17) == 0) { ok = 0; mesh = 40; }
+        mesh = mesh + 1;
+    }
+    ps("  -> "); pnum(g1b); puts(" of 120 random triangles byte-identical");
+    ps("  -> "); pnum(g1c); puts(" of 40 random 3-triangle meshes byte-identical");
+    if (g1b != 120) { ok = 0; }
+    if (g1c != 40)  { ok = 0; }
+
+    # ---- GATE 2: the divider, against the reference expression -----------------------------
+    # d across its whole range, u at 0 / 1 / d-1 / d / d/2, M at the domain extremes.
+    puts("[gate 2] the 25-op divider vs the reference expression");
+    var bad2 = 0; var n2 = 0;
+    var di = 1;
+    while (di < 400) {
+        var mi = 0;
+        while (mi < 6) {
+            var mv = 1;
+            if (mi == 1) { mv = 2; }
+            if (mi == 2) { mv = 3; }
+            if (mi == 3) { mv = 268435455; }        # 2^28 - 1
+            if (mi == 4) { mv = 268435456; }        # 2^28
+            if (mi == 5) { mv = 536870911; }        # 2^29 - 1
+            var ui = 0;
+            while (ui < 5) {
+                var uv = 0;
+                if (ui == 1) { uv = 1; }
+                if (ui == 2) { uv = di - 1; }
+                if (ui == 3) { uv = di; }
+                if (ui == 4) { uv = di / 2; }
+                if (uv >= 0) {
+                    if (uv <= di) {
+                        edges_reset();
+                        edge_add(0, 0, mv, di);
+                        em_setup();
+                        var got = em_cross(&prep, uv);
+                        var want = (mv * uv) / di;
+                        n2 = n2 + 1;
+                        if (got != want) {
+                            bad2 = bad2 + 1;
+                            if (bad2 < 4) {
+                                ps("  ** div d="); pnum(di); ps(" M="); pnum(mv);
+                                ps(" u="); pnum(uv); ps(" want="); pnum(want);
+                                ps(" got="); pnum(got); nl();
+                            }
+                        }
+                    }
+                }
+                ui = ui + 1;
+            }
+            mi = mi + 1;
+        }
+        di = di + 1;
+    }
+    ps("  -> "); pnum(n2); ps(" divider cases, "); pnum(bad2); puts(" wrong");
+    if (bad2 != 0) { ok = 0; }
+
+    # ---- GATE 3: ⭐ THE FALSIFICATION ARM ---------------------------------------------------
+    # The domain claim is |bx-ax| < 2^31. If nothing breaks ABOVE it, the bound is not a
+    # measured domain — it is decoration, and the guard it justifies (B3) has no evidence.
+    puts("[gate 3] FALSIFICATION -- |bx-ax| >= 2^31 MUST break the divider");
+    rng_s = 0x0FA15E;
+    var broke = 0; var tried = 0;
+    var f = 0;
+    while (f < 4000) {
+        var dv = (rnd() % 1048576) + 1;
+        var mv2 = 2147483648 + (rnd() % 2147483647);     # >= 2^31
+        var uv2 = rnd() % (dv + 1);
+        edges_reset();
+        edge_add(0, 0, mv2, dv);
+        em_setup();
+        var got2 = em_cross(&prep, uv2);
+        var want2 = (mv2 * uv2) / dv;
+        tried = tried + 1;
+        if (got2 != want2) { broke = broke + 1; }
+        f = f + 1;
+    }
+    ps("  -> "); pnum(broke); ps(" of "); pnum(tried); puts(" cases DIFFER above the domain");
+    if (broke == 0) {
+        puts("  ** GATE 3 FAILED: nothing broke above 2^31.");
+        puts("     The domain bound is then unproven, and B3's guard has no evidence behind it.");
+        puts("     A domain claim with no failing arm is not a claim.");
+        ok = 0;
+    }
+    if (broke != 0) { puts("  -> the bound is REAL and the B3 coordinate guard is justified"); }
+
+    # ---- GATE 5: fragment summing vs merging, AT THE ACCUMULATOR ---------------------------
+    # ⛔ CORRECTION TO THE PLAN, MEASURED. The plan calls case 10 mandatory because "merging a
+    # pixel's fragments changes output in 2/221 cases". At THIS output quantisation it does not:
+    #   add    = r_fixed_mul(16384, len) = len >> 2, so per-fragment truncation loses at most
+    #            0.75 accumulator units per fragment;
+    #   byte   = (acc*255) >> 16, so one output step costs 65536/255 = 257 accumulator units.
+    # => ~343 fragments are needed to move a single byte; over 4 sub-scanlines that is 86
+    # disjoint fragments in ONE pixel, i.e. ~171 edges in one pixel column — far above the
+    # shipped EDGE_CAP of 64. The byte-level oracle therefore CANNOT see this property, and a
+    # merge mutation passes all 20 cases and 160 random shapes. Verified by running it.
+    #
+    # ⭐ So the property is checked where it IS visible: the accumulator. Per-fragment
+    # truncation is kept because it is what the reference does — and because the moment the
+    # edge cap rises or the mask gains depth, the difference becomes observable output.
+    puts("[gate 5] fragment summing vs merging, measured at the ACCUMULATOR");
+    rr_case_load(10);
+    em_setup();
+    var maxdelta = 0;
+    var py5 = 0;
+    while (py5 < H) {
+        var px5 = 0;
+        while (px5 < W) {
+            em_merge_mode = 0; em_pixel(px5, py5); var a_sum = em_acc_raw;
+            em_merge_mode = 1; em_pixel(px5, py5); var a_mrg = em_acc_raw;
+            var dd5 = a_sum - a_mrg; if (dd5 < 0) { dd5 = 0 - dd5; }
+            if (dd5 > maxdelta) { maxdelta = dd5; }
+            px5 = px5 + 1;
+        }
+        py5 = py5 + 1;
+    }
+    em_merge_mode = 0;
+    ps("  -> max accumulator delta on case 10: "); pnum(maxdelta);
+    ps("   (max fragments in one pixel/sub-scanline: "); pnum(em_frag_max); puts(")");
+    if (maxdelta == 0) {
+        puts("  ** GATE 5 FAILED: the corpus contains NO pixel with two disjoint fragments,");
+        puts("     so nothing distinguishes summing from merging at any level. Case 10's");
+        puts("     sub-pixel-gap pair is the geometry that provides it.");
+        ok = 0;
+    }
+    ps("  -> "); pnum(257); puts(" accumulator units = 1 output byte, so this is byte-invisible");
+    puts("     at EDGE_CAP=64 BY DESIGN, not by luck. Recorded so nobody 'simplifies' the");
+    puts("     per-fragment truncation away on the grounds that no test catches it.");
+
+    # ---- GATE 4: the breakpoint walk's measured trip count ----------------------------------
+    ps("[gate 4] breakpoint walk max trip count over everything above: ");
+    pnum(em_max_trip); nl();
+    if (em_max_trip < 1) { puts("  ** the walk never ran"); ok = 0; }
+    if (em_max_trip > 8) {
+        puts("  ** trip count far above the ~2 the cost model assumes -- re-cost before B9.");
+        ok = 0;
+    }
+
+    puts("");
+    if (ok == 0) { puts("** B2 FAILED. Do not assemble a single instruction until this is green."); return 90; }
+    puts("B2 PASS -- all four gates.");
+    puts("The algorithm is byte-identical to the reference across the corpus and random meshes,");
+    puts("the divider is exact on its stated domain AND provably wrong off it, and the walk's");
+    puts("trip count is measured rather than assumed.");
+    puts("⇒ If the iron burn is red, the fault is in the EMISSION, not the algorithm.");
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

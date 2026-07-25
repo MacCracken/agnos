@@ -413,10 +413,31 @@ fn rr_case_load(i): i64 {
                    edge_add(fx(56), fx(56), fx(56), fx(8));
                    edge_add(fx(56), fx(8),  fx(8),  fx(56));
                    edge_add(fx(8),  fx(56), fx(8),  fx(8)); }
-    # 10 — TWO triangles in ONE edge array, deliberately OVERLAPPING. The discriminator.
+    # 10 — FOUR shapes in ONE edge array, carrying TWO distinct properties.
+    #
+    # (a) two OVERLAPPING triangles — winding accumulated across separate shapes.
+    #
+    # (b) ⭐ two rectangles separated by a SUB-PIXEL GAP, both entirely inside pixel column 10.
+    #     THIS is what makes fragment MERGING detectable, and the overlapping pair does NOT:
+    #     overlapping shapes produce ONE continuous covered span, so there is only ever one
+    #     fragment per pixel per sub-scanline and merging is indistinguishable from summing.
+    #     Two shapes with a gap NARROWER THAN A PIXEL put two disjoint fragments in the same
+    #     pixel on the same sub-scanline — and each is truncated separately by `>> 2`.
+    #     Widths are chosen ≡ 2 (mod 4) in 16.16 so the two discarded remainders sum to a whole
+    #     unit: summing gives 4096+4096 = 8192, merging gives (16386+16386)>>2 = 8193.
+    #     ⚠ MEASURED, not assumed: the merge mutation passed all 20 cases and 160 random shapes
+    #     until this geometry existed.
     if (i == 10) { if (rr_set_dims(64, 64) != 1) { return 0; }
                    tri_add(fx(6),  fx(6),  fx(40), fx(10), fx(14), fx(44));
-                   tri_add(fx(20), fx(18), fx(58), fx(24), fx(30), fx(58)); }
+                   tri_add(fx(20), fx(18), fx(58), fx(24), fx(30), fx(58));
+                   edge_add(655360,       fx(8),  671746,       fx(8));
+                   edge_add(671746,       fx(8),  671746,       fx(40));
+                   edge_add(671746,       fx(40), 655360,       fx(40));
+                   edge_add(655360,       fx(40), 655360,       fx(8));
+                   edge_add(695360,       fx(8),  711746,       fx(8));
+                   edge_add(711746,       fx(8),  711746,       fx(40));
+                   edge_add(711746,       fx(40), 695360,       fx(40));
+                   edge_add(695360,       fx(40), 695360,       fx(8)); }
     if (i == 11) { if (rr_set_dims(64, 64) != 1) { return 0; }
                    edge_add(fx(8),  fx(8),  fx(48), fx(8));
                    edge_add(fx(48), fx(8),  fx(48), fx(48));
@@ -561,7 +582,10 @@ fn rr_corpus_audit(): i64 {
     # and it is the only thing that can distinguish summing a pixel's coverage fragments from
     # merging them — every single-shape case passes either way. A proxy that a quad satisfies
     # does not protect it, so the requirement is stated directly.
-    if (case10_edges < 6)  { ok = 0; }
+    if (case10_edges < 10) { ok = 0; }
+    # ⚠ 10, not 6. Case 10 must carry BOTH properties: the overlapping pair (winding across
+    # shapes) AND the sub-pixel-gap pair (two fragments in one pixel). The overlap alone left
+    # the fragment-merge mutation undetected across all 20 cases and 160 random shapes.
     if (n_negcoord < 1)    { ok = 0; }   # the sign-extension trap
     if (n_empty != 2)      { ok = 0; }   # exactly the two all-zero cases, no more, no fewer
     if (n_horiz < 1)       { ok = 0; }   # horizontal edges reach the shader unfiltered
@@ -579,7 +603,7 @@ fn rr_case_name(i): i64 {
     if (i == 7)  { return "pixel-centre straddle"; }
     if (i == 8)  { return "full-canvas cover"; }
     if (i == 9)  { return "bowtie (self-intersecting)"; }
-    if (i == 10) { return "TWO overlapping triangles (6 edges)"; }
+    if (i == 10) { return "overlap pair + SUB-PIXEL-GAP pair (fragments)"; }
     if (i == 11) { return "shared-edge quad, axis-aligned"; }
     if (i == 12) { return "shared-edge quad, skewed"; }
     if (i == 13) { return "shared-edge quad, near-full"; }
