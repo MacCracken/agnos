@@ -77,9 +77,9 @@ pass=0; fail=0
 chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: '$1' — $3"; fail=$((fail+1)); fi; }
 nchk() { if grep -q "$1" "$LOG"; then echo "FAIL: '$1' present — $3"; fail=$((fail+1)); else echo "PASS: $2"; pass=$((pass+1)); fi; }
 
-chk "edge-abi: 16 of 16 cases correct" \
-    "every one of the 16 ABI cases returned the reason the ABI specifies" \
-    "not 16/16 - read the named FAIL line(s) above; each names its case, want and got"
+chk "edge-abi: 20 of 20 cases correct" \
+    "every one of the 20 ABI cases returned the reason the ABI specifies" \
+    "not 20/20 - read the named FAIL line(s) above; each names its case, want and got"
 chk "edge-abi: PASS -- the op 0x08 ABI rejects every malformed record" \
     "the battery's own verdict line is PASS" \
     "verdict line absent or FAIL"
@@ -104,6 +104,23 @@ chk "edge-abi: PASS n_edges 2 (cannot enclose area)" \
 nchk "edge-abi: REFUSED" \
     "the battery was able to seed its slots (nothing else owned them)" \
     "the seed slots were already in use - boot ordering changed"
+# B3 - the coordinate domain. The two REJECTS and the two BOUNDARY cases are asserted
+# separately, because they fail in opposite directions and a single count hides that.
+chk "edge-abi: PASS coord above +2^28" \
+    "an edge endpoint past the domain is refused (GPO_E_COORD, its own code)" \
+    "out-of-domain geometry was accepted - the reference has no defined value there"
+chk "edge-abi: PASS coord at +2^28 exactly is IN range" \
+    "the domain bound is INCLUSIVE - legal geometry on the boundary is not rejected" \
+    "an off-by-one in the comparison is rejecting geometry that is in range"
+chk "edge-abi: PASS coord below -2^28" \
+    "a negative endpoint past the domain is refused" \
+    "the lower bound did not fire"
+# THE SIGN-EXTENSION WITNESS. load32 zero-extends in Cyrius, so a missing sign-extend makes
+# every negative coordinate read as ~4.03e9 and trips the UPPER bound - the reject cases would
+# still pass, for the wrong reason. Only the negative BOUNDARY case distinguishes them.
+chk "edge-abi: PASS coord at -2^28 exactly is IN range" \
+    "negative coordinates are SIGN-EXTENDED, not zero-extended, before the bound check" \
+    "a legal negative coordinate was rejected - load32 zero-extension is not being undone"
 chk "AGNOS shell" \
     "boot completed past the battery (no fault)" \
     "boot did not reach shell"

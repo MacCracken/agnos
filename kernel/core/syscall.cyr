@@ -1024,7 +1024,25 @@ var GPO_E_EDGEBUF  = 16;             # op    — edge slot too small for n_edges
 var GPO_E_DSTSLOT  = 17;             # op    — destination mask slot invalid/free/PMM-backed/too small
 var GPO_E_RULE     = 18;             # op    — winding rule is not NONZERO or EVENODD
 var GPO_E_ALIAS    = 19;             # op    — edge slot and destination mask slot are the same slot
+# ⭐ rung 9b bite B3. An edge coordinate outside the domain on which byte-identity to the CPU
+# reference is DEFINED. ⛔ A DISTINCT code, not a reused GPO_E_DIM: the failure table has to say
+# "your geometry is out of range" separately from "your mask is out of range", because the fixes
+# are different and rung 9b's whole debugging story is attribution.
+var GPO_E_COORD    = 20;             # op    — an edge endpoint is outside +-2^28 (16.16)
 var GPU_COV_MAX_DIM = 4096;          # per-side mask cap — a REJECT, never a clamp
+# ⭐ THE COORDINATE DOMAIN (B3). 2^28 = 4096 px in 16.16 — the same 4096 as GPU_COV_MAX_DIM, so
+# geometry and mask are bounded consistently.
+#
+# ⛔ THIS IS NOT A STYLE CHECK. It is the domain on which "byte-identical to the CPU reference"
+# MEANS anything at all, and BOTH ends need it:
+#   * the REFERENCE (`gpu-test/refraster.cyr:154`) computes `(bx-ax)*(sy-ay)` in i64. With
+#     ABI-legal i32 coordinates that product OVERFLOWS i64, so above roughly M*d ~ 2^63 the
+#     oracle itself has no defined value and "identical" is meaningless.
+#   * the SHADER's divider is exact iff |bx-ax| < 2^31 and 2*|by-ay| < 2^32. `edgemodel.cyr`'s
+#     gate 3 FALSIFIES this on purpose (15 of 4000 cases differ above 2^31), which is what makes
+#     the bound a measured domain rather than decoration.
+# At +-2^28: M, d <= 2^29, so the divider keeps two bits of margin and the reference five.
+var GPU_EDGE_COORD_MAX = 268435456;  # 2^28
 
 # gpo_field_mask(op) — bit i set <=> this op DEFINES record dword i (byte offset i*4).
 # Every dword an op does not define MUST be zero. That rule is what makes the reserved dwords safe to
@@ -1121,6 +1139,30 @@ fn gpo_validate_edge(rec) {
     if (eid == did) { return GPO_E_ALIAS; }
     if (w * h > load64(&shm_size + ds * 8)) { return GPO_E_DSTSLOT; }
 
+    # ⭐ B3 — THE COORDINATE GUARD. Walks the edge array itself, because the coordinates live in
+    # the SLOT, not in the record, and nothing else in this validator has ever needed to read a
+    # caller's buffer. The cost is 4 loads per edge at a cap of 256 — bounded, and paid once per
+    # call rather than per pixel.
+    #
+    # ⚠ `load32` ZERO-EXTENDS in Cyrius, so every coordinate MUST be sign-extended before it is
+    # compared. Omitting this is a one-line trap that turns every negative coordinate into a
+    # value near 2^32, so an entirely legal off-screen triangle would be rejected as out of
+    # domain — and corpus case 5 is exactly that shape.
+    var ekva = load64(&shm_kva + es * 8);
+    if (ekva == 0) { return GPO_E_BADSLOT; }
+    var q = 0;
+    while (q < ne) {
+        var f = 0;
+        while (f < 4) {
+            var c = load32(ekva + q * GPU_EDGE_BYTES + f * 4) & 0xFFFFFFFF;
+            if (c >= 2147483648) { c = c - 4294967296; }     # sign-extend i32 -> i64
+            if (c > GPU_EDGE_COORD_MAX) { return GPO_E_COORD; }
+            if (c < 0 - GPU_EDGE_COORD_MAX) { return GPO_E_COORD; }
+            f = f + 1;
+        }
+        q = q + 1;
+    }
+
     if (gpu_edge_arm() != 1) { return GPO_E_ARM; }
     return 0;
 }
@@ -1148,6 +1190,11 @@ fn gpo_validate_edge(rec) {
 # live in the SHARED prologue, so calling the edge validator directly skips them -- and the first run
 # of this battery duly reported "want 12 got 7" on all three reserved cases. Testing the inner
 # function was testing a path no caller can take.
+# ⚠ REAL BACKING MEMORY. B3's guard walks the edge array through shm_kva, so the seeded slots
+# can no longer be pure table entries — a null kva would fault the kernel inside the validator.
+# 64 slots x u64 = 512 bytes = 32 edges of 16 B, ample for the 17-edge worst case below.
+var eabi_edges[64];
+
 fn ea_expect(rec, want, name, nlen) {
     var got = gpo_validate(rec, 2560, 1440);
     if (got == want) {
@@ -1175,6 +1222,9 @@ fn edge_abi_selftest() {
     # id 12 (idx 11) stays FREE -- the invalid-slot cases point at it.
     store64(&shm_phys + 12 * 8, 1); store64(&shm_mc + 12 * 8, 0);      store64(&shm_size + 12 * 8, 256);
     store64(&shm_phys + 13 * 8, 1); store64(&shm_mc + 13 * 8, 0x1000); store64(&shm_size + 13 * 8, 256);
+    store64(&shm_kva  + 13 * 8, &eabi_edges);       # the edge slot needs READABLE bytes now
+    var ez = 0;
+    while (ez < 64) { store64(&eabi_edges + ez * 8, 0); ez = ez + 1; }   # 0 is in range
     store64(&shm_phys + 14 * 8, 1); store64(&shm_mc + 14 * 8, 0x2000); store64(&shm_size + 14 * 8, 4096);
     store64(&shm_phys + 15 * 8, 1); store64(&shm_mc + 15 * 8, 0x3000); store64(&shm_size + 15 * 8, 16);
 
@@ -1342,15 +1392,45 @@ fn edge_abi_selftest() {
     store32(&d + 16, (8 * 65536) + 8);          # 8x8 = 64 B, fits slot 14's 256 B: ONLY the alias is wrong
     pass = pass + ea_expect(&d, GPO_E_ALIAS, "edge and dst are the SAME slot", 30);
 
+    # ---- B3: the coordinate domain. Four cases, and the two BOUNDARY ones matter as much as
+    # the two rejects: an off-by-one in the comparison would reject legal geometry sitting
+    # exactly on 2^28, and nothing else in the battery would notice.
+    var cz = 0;
+    while (cz < 16) { store32(&d + cz * 4, 0); cz = cz + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15);
+    store32(&d + 12, 14);
+    store32(&d + 16, (32 * 65536) + 32);
+    store32(&d + 36, 3);
+
+    store32(&eabi_edges + 0, 268435456);            # +2^28 EXACTLY -- in range, inclusive
+    pass = pass + ea_expect(&d, GPO_E_ARM, "coord at +2^28 exactly is IN range", 34);
+
+    store32(&eabi_edges + 0, 4026531840);           # -2^28 exactly (i32 two's complement)
+    pass = pass + ea_expect(&d, GPO_E_ARM, "coord at -2^28 exactly is IN range", 34);
+
+    store32(&eabi_edges + 0, 268435457);            # +2^28 + 1 -- OUT
+    pass = pass + ea_expect(&d, GPO_E_COORD, "coord above +2^28", 17);
+
+    # ⚠ THE SIGN-EXTENSION CASE. load32 zero-extends in Cyrius, so without the explicit
+    # sign-extend this reads as ~4.03e9, trips the UPPER bound, and reports GPO_E_COORD for the
+    # RIGHT reason by ACCIDENT -- while every legal negative coordinate is rejected too. The
+    # boundary case above is what actually catches that, which is why both are here.
+    store32(&eabi_edges + 0, 4026531839);           # -2^28 - 1 -- OUT
+    pass = pass + ea_expect(&d, GPO_E_COORD, "coord below -2^28", 17);
+
+    store32(&eabi_edges + 0, 0);                    # leave the array clean
+
     # Restore. A selftest that leaves the shm table dirty would hand the next allocation a slot that
     # LOOKS taken, and the symptom would surface far from here as "shm_create returns -1 under load".
     var r = 11;
     while (r < 16) {
         store64(&shm_phys + r * 8, 0); store64(&shm_mc + r * 8, 0); store64(&shm_size + r * 8, 0);
+        store64(&shm_kva + r * 8, 0);
         r = r + 1;
     }
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 16 cases correct\n", 21);
-    if (pass == 16) {
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 20 cases correct\n", 21);
+    if (pass == 20) {
         kprint("edge-abi: PASS -- the op 0x08 ABI rejects every malformed record and the\n", 73);
         kprint("edge-abi: one well-formed record reaches residency, which correctly says\n", 73);
         kprint("edge-abi: NOT YET. That is the 9a pass condition; 9b writes the shader.\n", 72);

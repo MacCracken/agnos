@@ -258,6 +258,16 @@ closed path; nothing about the kernel is triangle-specific.
   showed `dstxy`. Accepting a coordinate and ignoring it is the exact failure the `flags` rule refuses.)*
 - ⛔ **Vertex transform stays on the CPU in ring 3** (arc decision TD-4) — the kernel receives
   SCREEN-SPACE edges.
+- ⭐ **COORDINATE DOMAIN — every endpoint must satisfy `|x|,|y| ≤ 2^28`** (4096 px in 16.16, the
+  same 4096 as `GPU_COV_MAX_DIM`). Violations return `GPO_E_COORD` (20), a **distinct** code from
+  `GPO_E_DIM` because "your geometry is out of range" and "your mask is out of range" have
+  different fixes. ⛔ This is not a style check — it is **the domain on which byte-identity to the
+  CPU reference is defined at all**, and both ends need it: the reference computes
+  `(bx−ax)·(sy−ay)` in i64, which **overflows** for ABI-legal i32 coordinates, so above roughly
+  `M·d ≈ 2^63` the oracle has no defined value; and the shader's divider is exact iff
+  `|bx−ax| < 2^31`. The bound is *measured*, not asserted — `gpu-test/edgemodel.cyr`'s gate 3
+  falsifies it on purpose (15 of 4000 cases differ above `2^31`). At `±2^28` the divider keeps two
+  bits of margin and the reference five. **The bound is INCLUSIVE.**
 - `n_edges` ∈ `[3, 256]`. **2 edges is a REJECT, not an empty result**: two edges cannot enclose area, so
   it would rasterise to a silent all-zero mask — indistinguishable from a dead shader, the one confusion
   this rung cannot afford.
@@ -291,6 +301,7 @@ exactly `-1` — which keeps every pre-existing `if (rc == -1)` caller working u
 | 17 | `DSTSLOT` | op | destination mask slot invalid/free/PMM-backed/too small |
 | 18 | `RULE` | op | winding rule is neither `NONZERO` (0) nor `EVENODD` (1) |
 | 19 | `ALIAS` | op | edge slot and destination mask slot are the same slot |
+| 20 | `COORD` | op | an edge endpoint lies outside `±2^28` — outside the domain on which byte-identity to the CPU reference is defined |
 
 ### 3.3 ✅ `open` flags (a3) — agnos-native bits
 

@@ -44,6 +44,50 @@ byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random m
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
 
+### Added — bite **B3**: the coordinate guard, `GPO_E_COORD` (QEMU, zero burns)
+
+`gpo_validate_edge` bounded `w`, `h`, `n_edges`, `rule` and both slots — but never the
+**coordinates**. Every edge endpoint must now satisfy `|x|,|y| ≤ 2^28` (4096 px in 16.16, the same
+4096 as `GPU_COV_MAX_DIM`).
+
+⛔ **This is not a range check for tidiness — it is the domain on which "byte-identical to the CPU
+reference" MEANS anything**, and both ends need it:
+
+- the **reference** (`refraster.cyr`) computes `(bx−ax)·(sy−ay)` in i64, and with ABI-legal i32
+  coordinates that product **overflows**, so above roughly `M·d ≈ 2^63` the oracle itself has no
+  defined value and "identical" is meaningless;
+- the **shader's** divider is exact iff `|bx−ax| < 2^31` — which B2's gate 3 falsifies on purpose
+  (15 of 4000 cases differ above `2^31`). That measurement is the evidence for this bound; without
+  it the number would be decoration.
+
+At `±2^28` the divider keeps two bits of margin and the reference five.
+
+- **Its own reason code (20), not a reused `GPO_E_DIM`.** "Your geometry is out of range" and
+  "your mask is out of range" have different fixes, and rung 9b's entire debugging story is
+  attribution.
+- The guard walks the **edge array itself** — the coordinates live in the slot, not the record, so
+  this is the first thing in the validator to read a caller's buffer. Four loads per edge at a cap
+  of 256: bounded, and paid once per call rather than per pixel.
+- The selftest gained **real backing memory** (`eabi_edges`), since a seeded slot with a null
+  `shm_kva` would now fault the kernel inside the validator.
+- Documented in `agnos-userland-abi.md` §3.4 as the domain of definition, with `GPO_E_COORD` added
+  to the reason table.
+
+**Battery extended 16 → 20 cases; smoke 12/12. Calibrated against three mutations, 3/3 caught:**
+
+| mutation | caught by |
+|---|---|
+| the whole guard deleted | both reject cases |
+| the **sign-extend** removed | ⭐ only the *negative boundary* case |
+| the bound made exclusive (`>` → `>=`) | only the *positive boundary* case |
+
+⭐ **The sign-extension mutation is why the boundary cases exist, and it played out exactly as
+predicted.** `load32` **zero-extends** in Cyrius, so without the explicit sign-extend a coordinate
+of `−2^28−1` reads as ~4.03e9 and trips the *upper* bound — both reject cases still passed, with
+the right answer for the wrong reason, while every legal negative coordinate was being rejected.
+Only `coord at −2^28 exactly is IN range` exposed it. A battery of rejects alone would have shipped
+this bug green. (Corpus case 5 is exactly the negative-coordinate shape that would have broken.)
+
 ### Added — bite **B2**, THE CORRECTNESS GATE: `gpu-test/edgemodel.cyr`
 
 The entire rung-9b shader algorithm — the per-edge prologue, the 25-op branch-free divider, and
