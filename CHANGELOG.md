@@ -3,6 +3,52 @@
 All notable changes to AGNOS are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.56.15] - 2026-07-25
+
+**M9 CLOSED — sequencing eliminated; audio-over-HDMI PARKED (open cycle).** Bumped on cycle open;
+the user tags/releases at close.
+
+### Fixed — `DIG_MODE` is restored on exit, so the audio arms are independent
+
+The M9 burn's one methodological flaw. `mdo_transmit_run` left the link in HDMI, so arm 2 began
+from a link that had been sitting in HDMI signalling since arm 1 finished:
+
+```
+arm 1 pre-state  be_cntl 0x10020200   (DIG_MODE 2, DVI — the inherited GOP state)
+arm 2 pre-state  be_cntl 0x10030200   (DIG_MODE 3, HDMI — arm 1's leftovers)
+```
+
+Arm 1 therefore ran DVI→HDMI and arm 2 HDMI→HDMI. ⚠ **This did not rescue the both-silent
+verdict** — neither unmute position sounded from either starting state, and arm 2 had if anything
+the more favourable one. But the arms were not independent, and any *future* sound-on-one-arm
+result would have been uninterpretable: "the unmute was after the edge" and "the link was already
+in HDMI when this arm started" would be tangled, with no amount of re-running able to separate
+them.
+
+The restore runs **after** `be1`/`dm1` are captured, so the verdict still adjudicates on the real
+post-edge state rather than on our own cleanup — restoring earlier would have made the no-hdmi
+gate report the restore itself.
+
+### Result of the M9 burn (2026-07-24/25) — **SEQUENCING IS ELIMINATED**
+
+Both arms ran clean in one boot, **exit 95 each**: envelope opened and the frame counter stopped,
+`DIG_MODE 2 -> 3`, ATOM `#4` rc 0, `audio staged (muted) rc 1`, `#76 DISABLE`+`ENABLE` rc 0, link
+ended `DIG_MODE -> 3` (HDMI, readback-verified), `resumed 1`, refresh `59951 = predicted`, panel
+survived. Arm 1 unmuted **before** the edge, arm 2 **after**. **Ear: silent on both.**
+
+Per the falsification table published in the tracker **before** the burn, both-silent eliminates
+**hypothesis (a) SEQUENCING** — the hypothesis that has driven this arc since 1.55.x — leaving
+**(b)** a write that does not latch and **(c)** the bare-metal environment. A result by controlled
+experiment, not a null.
+
+⚠ Next leads, both weak and labelled as weak: `AFMT_CNTL` bit 8 (`AUDIO_CLOCK_ON`) never acks,
+though the GOP-side dump shows that bit **already set** on the inherited pipe — so its absence
+after we write bit 0 is at least odd; and the CRC tap saw no samples (R6: supporting only, never
+adjudicating).
+
+**HDMI audio is PARKED here.** The sequencing question is answered. Re-opening it needs a new
+hypothesis, not another burn of the same shape.
+
 ## [1.56.14] - 2026-07-24
 
 **MODESET M8e prerequisites — the phyid correction (OPEN cycle).** Bumped on cycle open; the user

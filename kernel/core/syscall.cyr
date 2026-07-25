@@ -2331,7 +2331,7 @@ fn mdo_transmit_run(arm) {
     kprint("modeset: transmit -- DIG_MODE ", 30); kprint_num(dm0); kprint(" -> ", 4); kprint_num(dm1);
     kprintln("  (2=DVI 3=HDMI)", 16);
 
-#ifdef MODESET_AUDIO
+    #ifdef MODESET_AUDIO
     # ── LEAVE THE LINK AS WE FOUND IT (the M9-burn confound, closed) ────────────────────────────────
     # ⛔ WITHOUT THIS THE ARMS ARE NOT INDEPENDENT. On the 2026-07-24 burn arm 1 left DIG_MODE at 3, so
     # arm 2 began from a link that had been sitting in HDMI signalling since the previous invocation:
@@ -2355,7 +2355,7 @@ fn mdo_transmit_run(arm) {
         kprint("modeset: transmit -- DIG_MODE restored to inherited ", 52); kprint_num(dm0);
         kprintln(" (arms stay independent)", 24);
     }
-#endif
+    #endif
 
     # ── VERDICT ─────────────────────────────────────────────────────────────────────────────────────
     if (stopped == 0) { kprintln("modeset: TRANSMIT FAILED -- OTG_MASTER_EN=0 did not stop the pipe", 65); return MDO_E_NOSTOP; }

@@ -600,6 +600,441 @@ one transmitter flash** if nothing goes wrong; the record says budget two to thr
 
 ---
 
+
+---
+
+# 3D ARC PLAN — written 2026-07-25
+
+> Folded in here rather than a successor doc, per [[project_display_arc_155x]] (*gpu.md is THE
+> single GPU doc, no new arc docs*) and this plan's own rule 1.
+>
+> **Its five load-bearing claims were VERIFIED against the code before adoption**, not taken on
+> trust from the research pass:
+>
+> | claim | verified |
+> |---|---|
+> | `#92` ops `0x02 BLEND_COV` / `0x03 GLYPH_1BPP` are implemented | YES — `syscall.cyr:979-980`, dispatch at `:1019-1020` |
+> | aethersafha hard-codes op `0x01` | YES — `aethersafha/src/gpu.cyr:112`, `store32(&d + 0, 1)` |
+> | **neither op has ANY caller** | YES — 0 hits across aethersafha / dhancha / sadish / rekha / crab / jalwa / cyrius-doom |
+> | damage tracking exists and the frame loop ignores it | YES — `rend_dmg_*` defined `render.cyr:77-103`, ZERO uses outside that file |
+> | agnos has **zero** GPU hang detection | YES — no `gpu_hang` / `gpu_wedged` / `gpu_reset` / fence-timeout anywhere in `gpu.cyr` |
+>
+> All three independent judges chose the **RISK** design as the spine — the lens whose obsession is
+> bisectability and hang recovery. That is the same conclusion the 2026-07-24/25 M9 night reached
+> the expensive way.
+
+# 3D — the rasteriser arc (REMAINING row 9). The detailed plan.
+
+> **Why this section exists.** Row 9 has been open since the arc opened and has never had a plan, because every attempt at one either assumed a GFX ring (25–40 burns on the box that is also the console) or assumed a consumer that is four Rust→Cyrius ports away. Both failure modes are already in this file's record. This section is row 9's plan and it lives **here**, per rule 1 — there is no successor doc. Two contradictions in this file are settled by writing it: `gpu.md:~690` *"the successor doc is now justified"* is **superseded** by `gpu.md:~715` *"No successor doc"* + rule 1, and `roadmap.md:131`'s *"pointing at a successor doc that does not exist yet"* is **stale** and must be re-pointed at row 9.
+>
+> **Rules for this section, so the two known failures do not happen a third time.**
+> 1. **No rung opens ahead of its caller.** A rung closes when a **named consumer repo ships a release that calls it** — never when a proof binary goes green on iron. This is MD-5's twice-learned lesson made mechanical instead of aspirational.
+> 2. **The kernel is never more than ONE rung ahead of a shipped consumer.** If rung *N*'s consumer release has not landed, rung *N+1* does not open; the gap goes into `state.md` as carry-forward debt.
+> 3. **Instruments before anything that can wedge.** agnos has **zero** GPU hang detection today. Every safety property in the tree bounds how long the *CPU waits*, not what the *GPU does*.
+> 4. **Count flashes, not rungs.** This section names 22 items and costs **5 nominal flashes**. Anything that is HOST or LINUX is free and is marked so.
+> 5. **Bites are delivery-named** (rule 2). Prefix `plan-` when referencing a rung in a CHANGELOG or an `#ifdef` comment. **Never reuse a rung name for work that is not that rung** — renumbering is what hid six bites of drift in the S lane.
+
+---
+
+## ▶ START HERE — the first three bites
+
+| | Bite | Venue | Burns |
+|---|---|---|---|
+| **1st** | **Rung 0 `chrome-gpu`** — **zero kernel code.** Wire the shipped-and-iron-proven-and-**uncalled** `#92` ops `0x02 BLEND_COV` / `0x03 GLYPH_1BPP`, plus `#85 gpu_fill` and `#91 gpu_blit_bb` and damage-limited `#39`, into aethersafha + dhancha + sadish — **batched at whole-frame granularity**. Three sub-bites, one variable each, one consumer release. | consumer repos on HOST, then **1 IRON flash** | 1 |
+| **2nd** | **Rungs 2 + 7 + 8** — `pm4-lint` (mutation-calibrated host PM4 validator) · `asm-agree` (mabda's `gfx9_encode.cyr` must reproduce all 11 shipped kernel shaders byte-for-byte) · `cpu-ref` (the CPU reference rasteriser, agreeing with **sadish itself** on 200 random paths). Run these while rung 0's flash is being scheduled. | **HOST** | **0** |
+| **3rd** | **Rung 5 `recover`** — controlled wedge + recovery on the MEC ring, **five competing arms in one boot**. Nothing in Phase II opens until this is green. Rungs 1 and 6 (read-only probes) ride flashes that are already scheduled. | **1 IRON flash** | 1 |
+
+Everything after that is gated on rung 10's kill gate and on rule 1.
+
+---
+
+## 1. THE CLAIM
+
+**At the end of this arc, agnos rasterises geometry on its own silicon from ring 3 — anti-aliased vector coverage, interpolated attributes, textured surfaces, and a depth-tested perspective-correct triangle mesh — the sovereign desktop and DOOM visibly run on it, and when the GPU wedges the box survives with a log that names the packet.**
+
+| | Today | After |
+|---|---|---|
+| Rendering primitive | none. Zero raster registers, zero draw packets, zero rings beyond MEC1/pipe0/queue0. The GPU can copy, fill, blend a rect, and matmul — it cannot draw a shape that is not an axis-aligned rectangle. | edge-function coverage · barycentric interpolation · affine and perspective-correct UV · bilinear sampling · tile-serialised depth, all on the proven compute ring |
+| A wedged GPU | **a dead box with no log**, anywhere in agnos, for any consumer including `#82`/`#83`/`#92` shipping today | detected → bracketed to a packet → spilled to `/klug.txt` → requeued, or degraded to `gpu_wedged` with the console and shell alive |
+| Hang localisation | a 100 ms timeout and a guess | `breadcrumb ≤ hung_packet ≤ rptr`, both hardware-written, decoded host-side by name |
+| Shader authoring | 11 hand-assembled `.s` kernels of 20–60 instructions, no assembler | a sovereign host-side assembler (mabda `gfx9_encode.cyr`) proven byte-identical against all 11 before anything depends on it |
+| Compositor frame | full-screen CPU clear (921,600 stores) + a whole-framebuffer CPU `store32` copy (~3.7 MB) **every frame, no damage rects**, with `rend_dmg_*` sitting unused | neither |
+| `#92` ops `0x02`/`0x03` | shipped, iron-proven, **called by nobody** | called, by five shipped repos |
+
+### ⛔ The anti-claim — written here so the close cannot be motte-and-baileyed
+
+- ❌ **Not** a GL / Vulkan / WebGPU surface. Still the 1.54.x non-goal, unchanged.
+- ❌ **Not** a GFX ring. Phase III exists as a gated probe and is **explicitly not in the definition of done**.
+- ❌ **Not** "soorat and kiran run on agnos." Those are two Rust→Cyrius engine ports and this arc does not touch them, does not wait on them, and must not be justified by them.
+- ❌ **A single flat triangle does not satisfy this claim.** The genuine 3D complexity is depth under unordered waves and perspective-correct interpolation. Both are named rungs and neither is proven by a triangle.
+- ❌ **No MSAA, mipmaps, cubemaps, stencil, anisotropy, or blend modes beyond premultiplied src-over.**
+- ❌ **No MIMG / `image_sample` / T# / S#.** Routed around entirely; see §9.
+
+---
+
+## 2. THE CONSUMER
+
+Three tiers, at three distances. **The near one is not optional and it is rung 0.**
+
+### Tier 0 — the debt, and it ships today (rung 0)
+
+`#92` op `0x02 GPU_OP_BLEND_COV` and op `0x03 GPU_OP_GLYPH_1BPP` are **implemented, iron-proven at S9/S10, and have no caller anywhere in the ecosystem.** The only real `syscall(92, …)` that exists is `aethersafha/src/gpu.cyr` (`ae_gpu_present_frame`, ~`:129`) and it hard-codes `op = 0x01`. `#85 gpu_fill` clears the back buffer on the GPU and aethersafha does not call it. `#91 gpu_blit_bb` is overlap-safe and iron-proven and nobody moves a window with it. `rend_dmg_*` damage tracking exists at `aethersafha/src/render.cyr:68-105` and the frame loop ignores it.
+
+**So the arc opens by paying the existing debt, with zero kernel code.** This is not a warm-up; it is load-bearing three ways: it proves the trap is structurally impossible for this arc, it *creates the whole-frame batching path* that everything downstream depends on economically, and — decisively — **you cannot see a GPU rasteriser through a full-screen CPU memcpy.** If rung 9 lands into a pipeline that still copies 3.7 MB/frame in software, the win is invisible and unmeasurable.
+
+**What the operator sees:** window drag stops smearing; the desktop stops spending its whole frame budget on a memcpy.
+
+### Tier 1 — checked out, in Cyrius, one hop (rungs 9–15)
+
+| Rung | Consumer | Checked out | What the operator sees |
+|---|---|---|---|
+| 9·11·12 | **sadish** 0.5.0 → **dhancha** 0.9.2 → **crab / jalwa / puka / rekha** | ✅ | A `crab` or `jalwa` window whose rounded chrome, path fills and glyph edges came **off the GPU**, pixel-identical to the CPU path |
+| 13·14 | **cyrius-doom** 0.34.4 | ✅ | **DOOM's world rendered at 800×600 instead of 320×200** — 7.5× the pixels, which the CPU cannot do at 60 fps |
+| 13 | **aethersafha** | ✅ | A setu client whose buffer size ≠ its window size is **rendered** instead of bailing the entire frame to CPU (today `#87` rejects, and `SHM_MAX_SIZE = 2 MB` caps a client at ~800×600) |
+
+### Tier 2 — the 3D close (rung 19)
+
+`/bin/gputri` is a **proof binary, not a consumer** — that is exactly the `#92` mistake. The close is a depth-tested, perspective-correct, textured mesh driven from ring 3 through a **real render seam** in **cyrius-mine-cart** (cataloged 2026-04-27 as *"the gentlest first-3D-load"*, rail-constrained motion chosen precisely to avoid needing an engine).
+
+⚠ **Two honest gaps in tier 2, named here and not in a footnote.** `cyrius-mine-cart` is **not scaffolded**. And the ecosystem has **no vector/matrix math library** — `bsp` is a 2D Doom-style BSP (traversal, sight, ray-cast), `abaco` is number theory, `hisab` is higher math. Rung 19 therefore carries a sized sub-item for a 4×4 / vec3 module, and **TD-9** asks whether that lives inside the pilot or gets minted as a repo.
+
+### ⛔ Who this arc does NOT unblock
+
+**soorat** is Rust + wgpu + WGSL with a WebGPU-shaped seam and a `drm.rs` that queries Linux `/dev/dri`. **kiran, joshua, salai, impetus, raasta, cyrius-block-game** are not checked out at all. Nothing here ports them and **nothing here may be justified by them.** Selling this arc on soorat/kiran is the `#92` trap with a four-hop fuse instead of a one-hop one.
+
+---
+
+## 3. WHAT AGNOS ALREADY HAS — the reuse list. This is what makes the arc affordable.
+
+### From agnos's own compute arc — iron-proven, rebuild none of it
+
+| Have | Cite |
+|---|---|
+| PSP GPCOM ring + `SETUP_TMR` + `LOAD_IP_FW`, 5/5 blobs — **including CE, PFP and ME, the *graphics* CP ucode**; CP-gfx is un-halted and idle on every boot | C1b/C1c/C1d; `gpu_fw_load_set` `gpu.cyr:733`, `gpu_engine_start` `:763` |
+| The entire memory model: FB carveout `[0xF400000000, +3 GB)`, **zero page tables**, `VM_CONTEXT0` disabled, `0x1FFC` fault net on a dummy page, MC↔phys constant alias, collision-audited slot map | C2a/C2b; `gpu_gpuvm_probe` `:824`, `gpu_vm_setup` `:868`, `gpu_regs.cyr:860-863, 940-1210` |
+| MEC1/pipe0/queue0 HQD — direct non-HWS, 20 ordered writes, `CP_HQD_ACTIVE` last; MQD / rptr-report / EOP plumbing | C2c; `gpu_queue_setup` `:946` |
+| **Register-wptr submit, LO before HI** — the CP latches the 64-bit wptr on the HI write. Cost 3 burns at C2f. **Ring-independent law** | `gpu.cyr:1319-1324` |
+| `gpu_ring_put` + `GPU_RING_DW_MASK = 0x3FFF` wrap + monotonic wptr; bounded `gpu_wait_done` (100 ms, never unbounded) | `:1231-1240`, `:1898` |
+| `WRITE_DATA DST_SEL=5` CPU-visible fence — **a CP packet, ring-agnostic** | C2e; `gpu_fence` `:1134` |
+| One-tail batching: N ops, one tail, one kick — **1.78× measured, pixel-identical** | S12; `gpu_batch_active` / `gpu_batch_tail` `:1885` |
+| **The S3 coherence model in both directions**, with the measured negative (4096-of-4096 dwords stale without the post-dispatch TC write-back), and the settled `0x00840000` = `TC_WB_ACTION_ENA` **plus** `TC_ACTION_ENA` (bit 23 **is** the L2 invalidate) | S3; `gpu.md:155,190,256` |
+| `clflush` **before** a CP-DMA into a reused WC window (never after — a flush after writes a dirty line back over the GPU's fresh data); `clflush` primitive disassembly-verified | `syscall.cyr:864-876` |
+| 2-D grids: `RSRC2 = 0x190`, tgid_x in **`s8`**, tgid_y in **`s9`**; 7-kernarg ABI; `s_mov_b64 exec,-1` **first** + `v_cmp_lt_u32_e64` + `s_and_b64` guard | S5/S6 |
+| `v_cvt_f32_ubyte0..3` / `v_cvt_pk_u8_f32` (⚠ **clamps negatives to 0**) / `v_perm_b32` selectors incl. `0x03000102` RGBX↔BGRX / `global_load_ubyte` / unfused `v_mul_f64`+`v_add_f64` | S4, f64-fidelity |
+| 256-byte-aligned resident shader arena slots behind idempotent `*_arm()` latches — **an unexercised op arms nothing and cannot affect boot** | `gpu_regs.cyr:1079-1186` |
+| CP-DMA copy / fill / rect-blit / overlap-safe move, all first-try on iron | `gpu_cp_dma` `:1436`, `_fill` `:1441`, `_blit` `:3687` |
+| `#86` GPU-visible shm · `#90` programmatic pixel readback · `#91` overlap-safe move · `#84` vblank-paced present · `#92`'s two-phase validate-all-then-dispatch descriptor ABI with per-CPU staging · `#89`'s op-support mask | §3 of the syscall table |
+| `klug_spill_prepare` (`main.cyr:844`) — forensic spill machinery, **already in the tree, unused by any GPU timeout path** | H1 |
+| The burn harness: `burn-prep.sh` + `BURN_*`, `verify_marker` + its negative check, `stage-tools.sh`, `run /bin/klug > f.txt`, exit codes `95`/`96`/`97`/`98`/`90`/`91` | standing |
+
+### From mabda 4.0.7 — Cyrius, zero syscalls in the data files, copy don't derive
+
+- **`gfx9_encode.cyr`** — the sovereign gfx90c assembler (VOP1/2/3a/3b, VOPC, SOP1/2/C/P, SMEM, FLAT/global). **This is the single most valuable item on the list**: agnos has 11 hand-assembled kernels of 20–60 instructions and no assembler, and rung 9's rasteriser is 150–250 instructions — past any defensible hand-assembly. Honest boundary: EXP and MIMG in mabda are hand-pinned dwords, not encoder-generated.
+- **`programs/dump_render_pm4.cyr`** — an IB dumper that already exists and runs on Linux. Rung 3 is nearly free because of it.
+- **`radv-triangle.ib.txt`** — 1684 lines of decoded RADV IB captured on *this same Cezanne*. It has already corrected agnos twice (the `TC_ACTION_ENA` encoding). Byte-exact authority for any packet question.
+- **`backend_native_pm4.cyr:920-1100`** — the catalogued GFX TDR causes, each with its failure mode written down. Rung 2 turns this from prose into assertions.
+- Phase III only: the 97-entry graphics register table, the ~40 `GFX9_*` hang-avoiding constants, the four-block clear-triangle decomposition, VS/FS binaries, `native_render_e2e.cyr`'s `0x55`-sentinel readback oracle.
+
+### From sadish — the coverage contract
+
+`sd_fill_impl` (`sadish/src/raster.cyr:227`) builds a closed edge list; `sd_ray_cross` (`:138`) casts a `+x` winding ray across `SD_FILL_SS` sub-scanlines; `sd_span_add` (`:170`) accumulates **analytic-x** span overlap. `sd_canvas_coverage` / `sd_fill_edges_from` (`:63,120`) emit exactly the 8bpp mask `#92` op `0x02` consumes. ⚠ **This is not a triangle rasteriser** — the shared primitive is *per-pixel inside-test against an edge array*, which is the edge-function core. A triangle is a 3-edge closed path. That is why the coverage rung and the triangle rung are the same kernel.
+
+### ⚠ Three Cyrius port hazards that apply to vendoring ANY mabda code into the kernel
+
+None of them is in the prior-art literature; all three are in this project's own record, and each would poison a vendor silently.
+
+1. **`var X[N]` sizing is non-uniform by file.** In a **top-level program** (where mabda's `var buf[2048]` lives) it is N **bytes**; at module scope in an **included module** (the kernel) it is N × u64. A verbatim copy is silently **8× mis-sized**. Measure, never assume.
+2. **Kernel module-scope `var = <expr>` reads 0 forever.** `EMIT_GVAR_INITS` runs after `PARSE_PROG`, and the kernel's `PARSE_PROG` never returns. **Every PKT3 header minted at module scope as `0xC0000000 | (n<<16) | op<<8` would be `0`.** This once made a selftest report 4/4 PASS comparing 0 to 0. Literals only, or a runtime init function.
+3. **Cyrius silently shadows duplicate `fn` names** — no module-private scoping, last-def-wins, warn-only. Every vendored `native_pm4_*` must be prefixed or it collides with `gpu_*` invisibly.
+
+---
+
+## 4. THE LADDER
+
+**Venue** ∈ `HOST` · `QEMU` · `LINUX (no agnos burn)` · `IRON, READ-ONLY` · `IRON`. Last token of Falsification is the `#ifdef` flag or the literal **`No flag`**. Exit codes: `95` bit-identical · `96` seam live / hardware absent · `97` ABI error · `98` latch blocked · `90` mismatch · `91` watchdog fired.
+
+**Standing design constraint, binding on every kernel raster kernel in Phase II: branch-free per pixel, one workgroup per 8×8 tile, fixed 64 lanes, no data-dependent trip count.** Every proven agnos shader has this property and it eliminates the runaway-wave class from the rasteriser by construction. **Vertex transform stays on the CPU in ring 3** — the kernel receives screen-space vertices with `1/w` (TD-4).
+
+### Phase 0 — THE CALLER. Zero kernel code. One flash.
+
+| # | Bite | What it does | Oracle | Falsification | Venue |
+|---|---|---|---|---|---|
+| **0a** | `chrome-clear` | aethersafha replaces `bhumi_fb_clear` (921,600 CPU stores) with **`#85 gpu_fill`**, and replaces the undamaged whole-framebuffer `#39` copy with a **damage-limited** one using the `rend_dmg_*` tracking already at `render.cyr:68-105`. **One variable: the clear and the copy extent. No `#92` op changes.** | `#90` capture of a full frame **byte-compares against the same frame from the unmodified CPU path**. `exit 95` / `90`. | Whole frame wrong ⇒ the fill colour or the back-buffer target; a **rectangular** region wrong ⇒ damage-rect math, and the rectangle's coordinates say which. `AE_GPU_CLEAR` |
+| **0b** | `chrome-cov` | sadish gains a **whole-frame batched** coverage path: instead of compositing each mask itself, it accumulates masks into `#86` slots and emits **one `#92` batch** of op `0x02 BLEND_COV` + op `0x03 GLYPH_1BPP` records per frame. dhancha routes through it. **One variable: who blends the mask.** | Same `#90` byte-compare, on a `crab` window with text. `exit 95` / `90`. | Glyph **rows** wrong ⇒ op `0x03`'s byte-aligned-row stride convention (`((w+7)/8)*h`); **edges** wrong ⇒ premultiplication (⚠ `c ≤ a` required; straight alpha washes out **silently, never an error**) or the `cov × colour` rounding; everything wrong ⇒ slot pitch. `AE_GPU_COV` |
+| **0c** | `chrome-move` | aethersafha uses **`#91 gpu_blit_bb`** for window move and scroll instead of re-rasterising chrome. **One variable: the move.** | Drag a window; `#90` capture at rest byte-compares against a freshly-rendered frame at the same position. | Smearing on **downward** moves only ⇒ the overlap direction (`#91` copies bottom-up for downward moves); correct-but-stale ⇒ damage not extended over the vacated rect. `AE_GPU_MOVE` |
+
+**Gate list for the Phase 0 flash, all four mandatory:** consumer builds green on HOST for all three sub-bites · each sub-bite behind its own consumer flag so the operator can bisect at the prompt · `#89` op-mask feature detection so an old kernel degrades to the CPU path · the CPU path **retained as both reference and fallback**, never deleted.
+
+**Rungs 1 and 6 ride this flash read-only at zero marginal cost.**
+
+**Standalone value if the arc stops here:** the `#92` debt is paid, the compositor stops burning its frame budget on a memcpy, and the whole-frame batching path — which every economic argument downstream depends on — exists and is measured.
+
+### Phase I — INSTRUMENTS AND SURVIVABILITY. One flash.
+
+| # | Bite | What it does | Oracle | Falsification | Venue |
+|---|---|---|---|---|---|
+| **1** | `regread-probe` | Read-only MMIO: are GC **CONTEXT** (0x28000 class) and **UCONFIG** registers readable through BAR5 on this part, given **S1 proved the SH compute registers are not**? Reads ~12 context registers the GOP/VBIOS must have left non-default. | Any context register returns a value ≠ 0, ≠ 0xFFFFFFFF, and ≠ its documented reset default. | All reads dead ⇒ **there is no state oracle anywhere in the graphics pipeline**, which feeds **TD-8** directly and materially raises Phase III's honest cost. **`No flag`** (pure reads) | **IRON, READ-ONLY — rides rung 0's flash.** 0 marginal |
+| **2** | `pm4-lint` | Host PM4 decoder + invariant checker in Cyrius. PKT3 framing, count-vs-payload, register-class range, ring-wrap crossing, every address dword inside the carveout, **the S3 invariant** (a coherence packet at every engine-domain transition in **both** directions), `PGM_LO` 256-B alignment, arena slot non-collision against the published map, **`RSRC1`/`RSRC2` decoded against the kernarg count actually emitted** — and every entry in mabda's TDR catalogue as a named assertion if Phase III ever opens. | **Mutation-calibrated, and this is the gate that makes it trustworthy:** it must **PASS** the two known-good in-tree streams (the 50-dw C2f envelope, the 68-dw `gpu_matmul_run` envelope) **and FAIL all 12 seeded mutations.** | Passes a mutated stream ⇒ **the validator is decoration** and no later bite may cite it. *Calibrate the null, or you have not calibrated the instrument.* **`No flag`** | **HOST.** 0 |
+| **3** | `ib-reloc-manifest` | Run mabda's **existing** `programs/dump_render_pm4.cyr` twice with different VS / FS / RT VAs. Diff → the **derived** set of address-dependent dword indices, plus a byte-frozen known-good IB blob. (Byte-for-byte replay is impossible — mabda's IB embeds amdgpu-allocated VAs. **Relocate-and-assert** is the achievable form.) | The two dumps differ at **exactly** the indices predicted from the `>>8` / `>>40` encodings of the three VAs, and nowhere else. | An unpredicted dword differs ⇒ hidden VA dependence (a computed pitch, an epitch) and the relocation model is incomplete — found here, not as a black frame. **`No flag`** | **LINUX, no agnos burn.** 0 |
+| **4** | `bracket` (I4/I5) | (a) **CP breadcrumbs** — `WRITE_DATA DST_SEL=5` writing an incrementing seq into a carveout dword between packet blocks. **The CP writes it, so it is an answer, not an echo.** (b) **`rptr`** — where the fetcher got to, an upper bound. (c) **The forensic block**, captured on *every* `gpu_wait_done` timeout: rptr, wptr, `CP_HQD_ACTIVE`, `GRBM_STATUS`, `GRBM_STATUS2`, `CP_STAT`, VM fault status, last breadcrumb, and the 16 ring dwords at rptr — into the klug ring, then **`klug_spill()`**. | On a synthetic stall: `breadcrumb ≤ hung_packet ≤ rptr`, and the host decoder names one packet inside the bracket. | Bracket empty or inverted ⇒ rptr semantics are not what we think; fix before Phase II trusts it. **If a hang disappears under `TRACE_STRICT`, that is the finding** (a sync bug — the RADV/Splitgate precedent), not a failed instrument. `GPU_TRACE` (`TRACE_COARSE` / `TRACE_STRICT`) | HOST + QEMU build-green; **proven on iron at rung 5** |
+| **5** | `recover` ⭐ | **The largest item in the arc, done first.** Escalation ladder: **R-1** distinguish slow from hung (longer bound) → **R-2** `CP_HQD_DEQUEUE_REQUEST`, poll `CP_HQD_ACTIVE`→0, re-map via the existing `gpu_queue_setup`, re-arm → **R-3** `CP_MEC_CNTL` halt / un-halt → **R-4** give up: set `gpu_wedged`, every GPU syscall returns a distinct errno, the compositor degrades to `bhumi_output_present` → `blit#39` (**a kernel CPU `store32` loop into WC FB — it touches no ring and survives a wedge**), console and shell alive. ⛔ **NO `GRBM_SOFT_RESET`.** `gpu.cyr:758` states verbatim *"No SOFT_RESET (it would wipe PSP-loaded ucode)"*, and agnos only re-loads that ucode at boot. | **Five arms, ONE boot, one variable each.** **A** submit `WAIT_REG_MEM` on a never-satisfied carveout dword ⇒ watchdog at 100 ms ⇒ **the bracket names the WAIT packet** (primary oracle — **it does not depend on recovery succeeding**). **B** dequeue + re-map ⇒ `CP_HQD_ACTIVE` reads **0** (hardware clears it — an answer register) ⇒ a fresh NOP+fence retires. **C** negative control: `gpu_matmul_run` bit-correct **before and after** both arms. **D** **free**: while wedged in arm A, does the console still paint? (I1 frame counter advancing **and** the operator's eye — the kernel prints `EYE-CHECK`.) **E** the **unguarded EXEC control arm**: S6 shipped at w=200 with no unguarded arm, so *"the guard stopped the overrun"* is **inferred, not measured**, and every ring-3-specified triangle's memory safety rests on it. Run guarded and unguarded, aimed at a **sacrificial carveout slot clear of the back buffers, the TMR and the arena**. | **A** bracket empty ⇒ rung 4 is wrong; stop. **B** `ACTIVE` stuck at 1 ⇒ escalate to R-3 **in the same run**; if that fails, R-4 is the shipped answer and Phase III's risk rating rises. **C** post-arm matmul wrong ⇒ **recovery is worse than the hang**; R-4 becomes the default on any ambiguity. **D** console dies ⇒ **the load-bearing, never-measured assumption under the entire GFX risk model is false** and Phase III must be re-costed before it opens. **E** sacrificial slot **untouched** guarded / **written** unguarded ⇒ S6's caveat retired; both untouched ⇒ the negative arm did not fire and the guard remains unmeasured. `GPU_RECOVER` + `GPU_GUARD_NEGATIVE` | **IRON — 1 burn, 5 arms.** Ring-3 tool `/bin/gpuwedge`, **never a boot self-test** |
+| **6** | `arena-audit` | Read-only verification that the proposed render arena window is genuinely free: `MC_VM_FB_OFFSET` (0x96B), `MC_VM_FB_LOC_BASE` (0x980), `_LOC_TOP` (0x981), against the published slot map. **With `VM_CONTEXT0` disabled there are no page tables — an out-of-bounds store lands somewhere REAL**, possibly the console FB at offset 0 or the PSP TMR at 0x60000000. | Printed base/top agree with the arithmetic, and `[GPU_RT_REGION_OFF, carveout_top)` is provably unclaimed. | Region not free ⇒ **TD-3 has nowhere to live and Phase II stalls at rung 11.** Better here, free, than as a corrupted TMR. **`No flag`** | **IRON, READ-ONLY — rides rung 5's flash.** 0 marginal |
+| **7** | `asm-agree` | Assemble agnos's 11 existing `kernel/shaders/*.s` with mabda's `gfx9_encode.cyr`; byte-diff against the shipped hex tables in `gpu_regs.cyr`. Cross-check with `llvm-mc -mcpu=gfx90c` **as a one-off investigation** (D-1 rejected llvm-mc as a *build gate*, not as a tool). | **11/11 byte-identical.** | A mismatch is a mabda encoder bug **or** an agnos hand-assembly bug; a three-way disagreement names which two agree. Either way it is found **before** anyone hand-writes a 200-instruction kernel. **`No flag`** | **HOST.** 0 |
+| **8** | `cpu-ref` (I7) | The CPU reference rasteriser, **in the ring-3 tool, never in the kernel** (the build-size discipline threshold is already blown at 1.8 MB). Coverage reference is a **direct port of sadish's own inner math** (16.16, `SD_FILL_SS` sub-scanlines, analytic-x, half-open `[ylo,yhi)`); plus a CPU bilinear and a CPU tile rasteriser. Corpus: 20 cases incl. degenerate, zero-area, backfacing, off-screen, clipped, sliver, pixel-centre-straddling, and **shared-edge pairs**. | Two oracles: **(i)** the reference agrees with **sadish itself** on 200 random paths, byte-for-byte; **(ii)** on every shared-edge pair, **zero double-covered and zero uncovered pixels** — an *internal-consistency* test that does not depend on the reference being right. | (i) fails ⇒ my port of the fixed-point math is wrong, at zero burns. ⚠ If exact agreement proves unreachable, the arc's premier oracle degrades from *byte-identical* to *±1 coverage step* — **that must be reported to the operator before rung 9 opens**, not discovered at the close. (ii) a crack or a double-hit ⇒ the fill rule is wrong; on the GPU the same bug presents as flicker you would blame on coherence and chase for burns. **`No flag`** | **HOST.** 0 |
+
+**Standalone value if the arc stops after Phase I:** agnos gains hang detection, packet-level bisection, forensic spill on every timeout, and requeue recovery — **which consumers shipping today need**. A runaway `tentib` ternary matmul through `#82`, or a malformed `#92` batch from aethersafha, currently kills the box with no log. Rung 5 earns its burn independent of 3D.
+
+### Phase II — THE RASTERISER. Three to four flashes. Rule 2 (one rung ahead of a shipped consumer) governs every row.
+
+| # | Bite | What it does | Oracle | Falsification | Venue |
+|---|---|---|---|---|---|
+| **9** | `edge-cover` | `#92` op **`0x08 GPU_OP_EDGE_COV`** — an edge array (16.16) + winding rule from a `#86` slot → an **8bpp coverage mask** into a kernel render-target handle. 2-D grid (`RSRC2 = 0x190`, tgid in `s8`/`s9`), `s_mov_b64 exec,-1` first, bounds guard, one lane per pixel of an 8×8 tile. **This kernel IS the triangle rasteriser** — a triangle is a 3-edge closed path. | **Byte-identical to rung 8's reference** over the 20-case corpus. Fresh, never-CPU-touched destination; sentinel `0xA5`, distinct from 0 and from every expected value (the C2g-1 stale-L2 discipline). `/bin/gputri --cov`, `exit 95` / `96` / `90`. | **Four distinguishable:** all-sentinel ⇒ the post-dispatch TC write-back is missing (S3 measured 4096-of-4096 stale without it) **or** the guard rejected every lane — and rung 5 arm E already told you which; wrong shape ⇒ edge setup; right shape, wrong edge pixels ⇒ fill rule; **some tiles right, some wrong ⇒ tgid mapping, and the tile index says which.** `GPU_OP_EDGE_COV` | QEMU for the ABI (`96`), then **IRON**. Flash 1 |
+| **10** | `cover-crossover` 🚨 | **KILL GATE. Placed second on purpose, measured in the same tool run as rung 9 at zero extra flash.** Measure GPU-vs-CPU coverage cost as a function of **batched** covered-pixel count per frame, against the batching path rung 0b already shipped. | **Pre-registered before the flash:** unbatched crossover ≈ **12k px (~110×110)** given S12's ~60 µs fixed cost at ~87 % overhead; **batched, the GPU wins above ≈ 50k total covered px/frame (≈ 80 glyphs)**. Printed as a number. | **Pre-registered outcome table, published in the tracker before the flash:**<br>· *batched crossover well below a real frame's coverage* ⇒ ★ Consumer tier 1 confirmed; rungs 11–12 open.<br>· *batched crossover near a real frame's coverage* ⇒ the rung ships **opt-in per surface**, not by default.<br>· *batched crossover above a real frame's coverage* ⇒ ⛔ **tier-1 coverage is dead. Report to the operator immediately.** Rungs 11–12 do **not** open on the coverage justification; the arc re-bases on rung 14 (DOOM), which does not depend on this measurement at all. **Not a null result.**<br>· *GPU faster but the desktop looks worse* ⇒ a latency/pacing problem, not a throughput one. `GPU_OP_EDGE_COV` | **IRON, same burn as rung 9** |
+| **11** | `attr-interp` | Op **`0x09 GPU_OP_TRI_RGBA`** — barycentric interpolation of per-vertex premultiplied RGBA, src-over into a render target. Generalises op `0x04`'s 2-stop vertical gradient. | Byte-identical vs reference on a 3-colour triangle **and** bit-identical reproduction of an existing op-`0x04` gradient expressed as two triangles. | Flat colour ⇒ barycentrics not varying; banding ⇒ fixed-point width of the denominator; **a seam or double-blend on the shared edge of two triangles ⇒ non-watertight fill rule** — and rung 8's shared-edge oracle should already have caught it host-side, so a failure here also indicts the reference. `GPU_OP_TRI_RGBA` | Flash 1 |
+| **12** | `tri-list` | Op **`0x0A GPU_OP_TRI_LIST`** — N triangles from a `#86` vertex slot, one dispatch, screen-space bbox tiling, **in-kernel bbox validation and clamp** so *reject-don't-clip* is enforceable. **Consumer wiring ships in the same release:** sadish's batched GPU coverage path, gated on `#89`'s op mask **and** rung 10's threshold. | A `crab` or `jalwa` window whose fills and glyph edges came off the GPU, **pixel-identical to the CPU path** — programmatically, via `#90` capture + `#73` readback + value compare. The eye is secondary; the kernel prints `EYE-CHECK`. | Pixel-identical but slower ⇒ rung 10's threshold is wrong; re-tune, do not ship. Not pixel-identical ⇒ batching changed the fill rule. `GPU_OP_TRI_LIST` | **IRON.** Flash 2 |
+| **13** | `texel` | Op **`0x0B GPU_OP_TRI_TEX`**, **nearest**, affine UV. Texture from a `#86` slot, address computed in the shader, fetched with **`global_load_dword`**. **No MIMG, no T#, no S#, no sampler descriptor, no new instruction class.** Formats: **RGBA8 linear** and **IDX8 + LUT** (8bpp index + a slot-resident lookup row — a *general* paletted format, deliberately not a DOOM-shaped op; TD-7). Clamp-to-edge. Linear surfaces only. | Byte-identical vs the CPU reference on a 64×64 checkerboard at a **non-integer** scale — **and the absolute test**: at 1:1 with integer UV the output must be **byte-identical to the source texture itself**, an oracle against an artifact the reference did not produce. Records **achieved GB/s**, because rung 14 is bandwidth-bound and that number must not be a surprise. | Right at integer scale, wrong at fractional ⇒ texel-centre `+0.5`; last row/column wrong ⇒ clamp addressing; channels swapped ⇒ the `v_perm_b32` selector (`0x03000102`, known); black ⇒ TC write-back. `GPU_OP_TRI_TEX` | **IRON.** Flash 2 |
+| **14** | `doom-affine` | cyrius-doom keeps BSP traversal, visplanes, clipping and light tables on the CPU and batches **walls as textured quads and floor spans as axis-aligned quads** through op `0x0B`. ⭐ **Verified: DOOM's texturing is affine per primitive** — `render_draw_tex_column(x, y1, y2, tex_idx, tex_col, tex_y_start, tex_y_step, light)` (`cyrius-doom/src/render.cyr:719`) has constant `u` and a linear `v` step because walls are vertical; `render_plane_row(y, x1, x2, hd, …)` (`:1495`) folds the perspective divide into a per-row `hd`. **No perspective divide, no z-buffer** (BSP gives painter's order), light shading exact via IDX8+LUT. New backend behind `--gpu-render`; **`render.cyr` is not rewritten.** | **DOOM's own CPU renderer is the reference.** Same tic both ways at 320×200, byte-compared. `exit 95` / `90`. Then the eye at 800×600. | Identical at 320×200, wrong at 800×600 ⇒ fixed-point precision of the `v` step over long columns; wavy floors ⇒ per-row `hd` quantisation; a wedge ⇒ the batch exceeded the ring and wrapped (`GPU_RING_DW_MASK = 0x3FFF`) — **and rung 5 recovers the box instead of losing the burn.** consumer flag only | **IRON.** Flash 2–3 |
+| **15** | `bilinear` | 4-tap bilinear by hand: four `global_load_dword` + `v_cvt_f32_ubyte0..3` + lerp + `v_cvt_pk_u8_f32`. All four converts iron-proven at S4. **Still no MIMG.** | Byte-identical vs a CPU reference using **identical** rounding. ⚠ `v_cvt_pk_u8_f32` **clamps negatives to 0** — the reference must clamp identically, or the diff is unfair. | Off-by-one on interior texels ⇒ rounding mismatch, not a filter bug, and the reference says which. *(This is the f64-fidelity lesson — `v_fma_f64` vs `v_mul`+`v_add` would have mismatched 29/64 cells — restated for the convert path.)* `GPU_OP_TRI_TEX` | Flash 3 |
+| **16** | `tile-own` | **HOST assertion before depth touches iron:** the ring-3 tile binner must prove every pixel is owned by **exactly one** tile workgroup, over the corpus plus 200 random meshes. | Zero pixels with 0 owners; zero pixels with ≥2 owners. | A binning off-by-one at tile boundaries would otherwise present at rung 17 **as a depth failure** and be misdiagnosed. This rung exists solely so rung 17's oracle localises. **`No flag`** | **HOST.** 0 |
+| **17** | `depth` | Op flag + op **`0x0C GPU_OP_DEPTH_CLEAR`**. **Tile serialisation, no atomics:** one workgroup owns an 8×8 tile and processes that tile's triangle list **in submission order in a single wave**, holding colour + depth in VGPRs across the loop, one `global_store` at the end. Deterministic, CPU-diffable. Z lives in the **kernel render arena** (TD-3), never a `#86` slot. | **Two interpenetrating triangles submitted in BOTH orders produce byte-identical output, and both match the reference.** Order-independence is the property that proves depth, and it is an answer the hardware must give. Plus a **lane-witness counter** (every lane writes its own id) separating "no wave ran" from "wave ran and computed wrong". | Order-dependent ⇒ the serialisation is not serialising ⇒ the atomics/binning variant (TD-5), a separate and larger bite. Per-lane dropouts ⇒ VGPR pressure (⚠ **S1: `COMPUTE_PGM_RSRC1/2` and `TMPRING_SIZE` are not GRBM-readable — there is no spill oracle**). **Different output on two consecutive identical frames ⇒ a wave race, and the nondeterminism IS the finding.** `GPU_OP_TRI_DEPTH` | **IRON.** Flash 3–4 |
+| **18** | `persp-correct` | Interpolate `1/w` linearly, divide per pixel (`v_rcp_f32`), interpolate `u/w`, `v/w`. | A large checkerboarded floor quad in strong perspective, byte-identical to the reference. **Affine texturing is visibly and numerically wrong on exactly this figure** — the oracle discriminates the two hypotheses by construction. | Straight seams bow ⇒ affine; the divide is not happening. Off in the last ULP ⇒ `v_rcp_f32` is approximate and **the CPU reference must use the same approximation** or the diff is unfair. `GPU_OP_TRI_DEPTH` | Flash 3–4 |
+| **19** | `pilot` | **The consumer close.** `cyrius-mine-cart` scaffolded with a real render seam: rail-constrained motion, a depth-tested perspective-correct textured mesh, in a setu window, presented with `#84`. Carries a **sized sub-item** for the missing 4×4 / vec3 math (TD-9). | **Two independent oracles, both required.** (a) The operator's eyes on the panel; the two pictures stated in writing before the flash; the kernel prints `EYE-CHECK`. (b) A `#90` capture at a **fixed** camera pose, byte-compared against the reference. | Correct capture + black panel ⇒ the present path, **not** raster (rungs 9–18 already proved raster). Correct panel + wrong capture ⇒ the capture path. **The two oracles are independent precisely so the negative branch names which half failed.** `GPU_PILOT` | **IRON.** Flash 4 |
+
+### Phase III — THE GFX RING. ⛔ GATED. Explicitly NOT in the definition of done.
+
+**This block is three rungs, not twenty, and it stays three rungs.** It opens only on **TD-8**'s three-part measured trigger — all three, or it stays closed. Nobody has ever brought up modern AMD GFX with no host kernel driver; tinygrad had every reason to and chose compute only; Haiku got 3D by porting NVIDIA's driver; ReactOS by running Windows'. Writing this block out further is how a closed lane becomes drift.
+
+| # | Bite | What it does | Oracle | Falsification | Venue |
+|---|---|---|---|---|---|
+| **G1** | `gfx-probe` | Stand up `CP_RB0_BASE / _CNTL / _WPTR / _RPTR_ADDR` in amdgpu's exact order (`gfx_v9_0_cp_gfx_resume`), **`DOORBELL_EN = 0`**, register-wptr submit **LO before HI**. Emit exactly `CONTEXT_CONTROL` + `NOP` + `WRITE_DATA` sentinel. **No shaders, no context registers, no draw, no CLEAR_STATE.** A NOP cannot hang. | The sentinel appears in the carveout **AND** `CP_RB0_RPTR == wptr`. The CP wrote both. | rptr stuck at 0 ⇒ ring config, and rung 4's forensic block already prints every relevant register; sentinel present but rptr stuck ⇒ the rptr-report address; **console dies ⇒ GC and DCN are coupled in a way rung 5 arm D did not reveal, and that single fact settles forever whether a GFX arc is survivable on a one-box operator.** `GPU_GFXRING` | **IRON. This one burn buys the DECISION, not a capability.** |
+| **G2** | `gfx-wedge` | Re-prove rung 5's machinery on `CP_RB0` — controlled `WAIT_REG_MEM` stall, bracket, halt/un-halt, `gpu_wedged` degradation — **before the first state-bearing packet.** | The same arms as rung 5, on the GFX ring. | Recovery works on MEC but not on GFX ⇒ **stop. Phase III is not survivable and the arc closes at Phase II.** That is a legitimate, informative close. `GPU_GFXRING` | **IRON** |
+| **G3** | `gfx-replay` | **Replay, do not compose.** Submit rung 3's frozen IB with only the derived relocation dwords rewritten to carveout MC addresses, plus agnos-emitted `CONTEXT_CONTROL` and the CSB / `CLEAR_STATE` preamble. Render target = a `0x55`-sentinel page **at the top of the render arena**, maximally far from the console FB and the TMR. | mabda's own e2e oracle, unchanged: CPU reads pixel(0,0) = `(0xFF,0x00,0x00,0xFF)`. | ⚠ **Honest floor:** mabda's IB is proven *on top of amdgpu's clear-state and `CONTEXT_CONTROL`*, so this replays two thirds of a proven artifact. A hang here is **ambiguous across ring and preamble**, and if rung 1 said context registers are unreadable there is **no oracle for the preamble at all**. Say so; do not manufacture a green gate. `GPU_GFXRING` | **IRON** |
+
+---
+
+## 5. THE INSTRUMENTS
+
+Every bite must name which instrument it uses. The arc's existing three — **I1** `OTG_STATUS_FRAME_COUNT` @ `0x1B4C`, **I2** PIT-counted refresh, **I3** the ATOM `reads=/writes=/delays=` counters — are all *display* instruments and **none of them applies here**. This arc mints four, and all four are built before any GPU hang can happen.
+
+- **I4 — the bracket** (rung 4). `breadcrumb ≤ hung_packet ≤ rptr`. The CP writes the breadcrumb; the hardware advances rptr. **Neither is an echo of a CPU write.** A host decode of the ring image between them names the packet. 5 dwords per block. ⚠ **Known limit, stated rather than mitigated away:** rptr advances as the **PFP prefetches**, while the breadcrumb records where the **ME** got to — so the bracket is real but can be a prefetch window wide. `TRACE_STRICT` narrows it with `PFP_SYNC_ME`, which is exactly the instrumentation that made RADV's Splitgate hang vanish. **The instrumented build and the real build are different programs.** The flag admits it; it does not eliminate it.
+- **I5 — the forensic block + spill** (rung 4). Captured on *every* `gpu_wait_done` timeout, not only when someone remembered. `klug_spill()` into a pre-allocated `/klug.txt` means a power-cycled box still yields evidence. This is Asahi's lesson — *make the crash informative, not rarer* — implemented with machinery already in the tree at `main.cyr:844` and currently unused by any GPU path.
+- **I6 — the host PM4 validator** (rung 2). Turns mabda's paid-for TDR catalogue from prose into assertions. **Must be shown to reject known-bad streams before it is trusted to pass anything.**
+- **I7 — the CPU reference rasteriser** (rung 8), living in the ring-3 tool, **never in the kernel**. Every Phase II oracle is a byte-compare against it, computed programmatically in ring 3 as `/bin/gpucopy` already does.
+
+**And recovery is an instrument, not a feature.** Rung 5 exists so that later rungs' failures are *survivable and legible*, which is the only thing that makes the burn budget below honest.
+
+**Standing harness rules, each already paid for somewhere in the record:** no rung's oracle is a boot self-test — the D lane spent 5 flashes on 1 result learning that · every dump prints `rd <off> <val>` and is decoded by a **host script, never by eye** · every phase prints `[T+NNNNms]` · wall-clock holds only, print the elapsed · `verify_marker` on a string **inside** the flag's own `#ifdef` **plus** the negative check that it is absent from a bare build (`ATOM_DRY` was a silent no-op for two burns and blacked the display twice) · the two pictures written down before the flash, and if they are the same, redesign.
+
+---
+
+## 6. PRIOR ART, CITED
+
+### ✅ VERIFIED — read, or cross-checked against a second source
+
+**agnos's own record** — every claim in §3 is an iron burn in `iron-nuc-zen-log.md` with a `#tracker-*` anchor. `gpu.cyr:758` (*"No SOFT_RESET (it would wipe PSP-loaded ucode)"*) is the single most load-bearing in-tree line in this plan.
+
+**mabda 4.0.7, in-tree, Cyrius, zero syscalls in the data files, HW-proven on this exact Cezanne:**
+- `/home/macro/Repos/mabda/src/backend_native_pm4.cyr` — PM4 composers; graphics section ~841–1282; **TDR catalogue 920–1100**; `native_pm4_context_control:394` is **dead code that has never executed on hardware** because amdgpu always emitted one (`:1241-1246`)
+- `/home/macro/Repos/mabda/src/backend_native_shaders.cyr` — 97 `R_*` graphics register addresses each cross-referenced to its Mesa `0x028xxx` peer; ~40 `GFX9_*` constants with failure modes
+- `/home/macro/Repos/mabda/src/gfx9_encode.cyr` — the sovereign gfx90c assembler
+- `/home/macro/Repos/mabda/programs/dump_render_pm4.cyr` · `programs/native_render_e2e.cyr`
+- `/home/macro/Repos/mabda/programs/diagnostics/radv_capture_triangle/radv-triangle.ib.txt` — 1684-line decoded RADV IB from this silicon
+- `/home/macro/Repos/mabda/docs/archive/issues/2026-05-13-native-render-cezanne-tdr.md` — **read this before one line of Phase III**
+
+**Consumer sources, read for this plan:** `sadish/src/raster.cyr:63,120,138,170,227` · `cyrius-doom/src/render.cyr:719,1495` · `aethersafha/src/render.cyr:68-105,216` and `src/gpu.cyr:~129` · `setu/src/buf.cyr:37`, `src/client.cyr:255` · `bhumi/src/scanout.cyr:112`
+
+**Upstream, all MIT (MIT → GPL-3.0-only is compatible with attribution):**
+- amdgpu v6.6 `gfx_v9_0.c` — https://raw.githubusercontent.com/torvalds/linux/v6.6/drivers/gpu/drm/amd/amdgpu/gfx_v9_0.c
+- `clearstate_gfx9.h` (879 context registers, 8 extents) — https://raw.githubusercontent.com/torvalds/linux/v6.6/drivers/gpu/drm/amd/amdgpu/clearstate_gfx9.h
+- `soc15d.h` — https://raw.githubusercontent.com/torvalds/linux/v6.6/drivers/gpu/drm/amd/amdgpu/soc15d.h
+- PAL opcode header — https://raw.githubusercontent.com/GPUOpen-Drivers/pal/28a98ba3e787278dad958afd2cadbdabf28bacfc/src/core/hw/gfxip/gfx9/chip/gfx9_plus_merged_pm4_it_opcodes.h
+- Mesa `gfx9.json` (authoritative register DB) — https://gitlab.freedesktop.org/mesa/mesa/-/raw/main/src/amd/registers/gfx9.json · `ac_cmdbuf.c` · `sid.h`
+- LLVM `SIDefines.h` (EXP targets) — https://raw.githubusercontent.com/llvm/llvm-project/main/llvm/lib/Target/AMDGPU/SIDefines.h
+- Context rolls (8 banks, bank 0 reserved, 7 usable; the CP **stalls** rather than errors) — https://gpuopen.com/learn/understanding-gpu-context-rolls/
+- RADV hang debugging (`RADV_DEBUG=hang`, the trace marker technique I4 ports) — https://docs.mesa3d.org/drivers/amd/hang-debugging.html
+- GPU hang exploration, Splitgate — the observer-effect precedent — http://pixelcluster.dev/Hang-Exploration-Splitgate/
+- Fuchsia Magma porting guide — `vkreadback` as the first-render milestone — https://fuchsia.dev/fuchsia-src/development/graphics/magma/concepts/porting
+- libxenon `xe.c` (the only true bare-metal AMD-family PM4 precedent) — https://raw.githubusercontent.com/Free60Project/libxenon/master/libxenon/drivers/xenos/xe.c
+- tinygrad AM (from-scratch modern AMD, **compute only, deliberately**) — https://github.com/tinygrad/tinygrad/blob/master/docs/developer/am.md
+- Asahi (*"if the firmware crashes, the only way to recover is to fully reboot"*) — https://asahilinux.org/2022/11/tales-of-the-m1-gpu/
+- Collabora Valhall (*"unit testing is mandatory"* with no hardware) — https://www.collabora.com/news-and-blog/blog/2022/01/27/writing-an-open-source-gpu-driver-without-the-hardware/
+- macoy.me PiGPU (wrote a simulator first; the Z-stride lockup, the analog of `CB_COLOR0_ATTRIB2`) — https://macoy.me/blog/programming/PiGPU
+- freedreno RE tooling (`.rd` capture, `cffdump`, meld-diff blob vs free driver) — https://github.com/freedreno/freedreno/wiki/Reverse-engineering-tools
+
+### 🔶 INFERRED — reasoning, not measurement. Nothing in Phase 0–II depends on any of it.
+
+- **MIMG compute-legality is NOT settled, and gpu.md's own proposed "free ten-minute `llvm-mc` bite" would return a FALSE GREEN.** An assembler validates *encoding*, not *shader-stage legality*. Structurally: implicit-LOD sampling needs quad-neighbour derivatives that exist only in a pixel shader, so the compute-legal forms would be `image_load` (no sampler, no LOD — which is what mabda's textured FS actually uses) and the explicit-LOD `image_sample_l` / `_lz`. mabda's byte-pinned `0xF0800F00` is the **implicit-LOD** opcode, and its only `image_sample` proof is a *fragment* shader inside a render pass. **This arc routes around MIMG entirely**, so being wrong about it costs nothing except that rungs 13/15 would have been avoidable work.
+- **"A wedged MEC does not stall scanout"** is the load-bearing assumption under the whole risk model. The reasoning is good — DCN 2.1 is a separate IP block fetching DCHUB→SDP→data fabric, never through GL2 or GC. It has **never been measured**. Rung 5 arm D measures it for free.
+- **`RSRC2` `0x18E` vs `0x190` is not a contradiction** — decoding gfx9 `COMPUTE_PGM_RSRC2` (bit0 `SCRATCH_EN`, bits[5:1] `USER_SGPR`, bit7 `TGID_X_EN`, bit8 `TGID_Y_EN`): `0x18E` = 7 user SGPRs + both TGIDs, `0x190` = 8 user SGPRs + both TGIDs. Same grid enable, different kernarg count. **Settled on paper, zero burns** — and it becomes a rung-2 lint assertion against the count actually emitted, because S1 says nothing is readable back.
+- Phase III's honest cost is **unquantified below "the CLEAR_STATE gap is the most likely source of first-burn surprises."** ~800 of the 879 clear-state context registers are, on agnos, *whatever the VBIOS/GOP left*, and Mesa's own comments say CLEAR_STATE *"doesn't clear these correctly on certain generations… deduced by trial and error."*
+
+---
+
+## 7. THE SYSCALL / ABI SURFACE
+
+**No new syscall number.** D-3 already settled this and the mechanism is in place: `#92 gpu_shader_op` takes an array of **64-byte** records with the op code inside the record, and **the op code IS its bit index** in the `#89 gpu_caps` support word at `+28`.
+
+⚠ **Existing reservations are respected, not squatted on.** `0x00`–`0x04` in use; `0x05` channel-swap / `0x06` cov-modulated / `0x07` packed-VOP3P **declared and left alone** (taking one would make the `#89` mask a lie about what a kernel implements); `0x10`–`0x17` CP-DMA; `0x18`–`0x1F` control. The raster lane takes **`0x08`–`0x0C`**, leaving `0x0D`–`0x0F`.
+
+| Code | Op | Record fields (all undefined dwords must be zero → `GPO_E_RESERVED`) | Rung | Caller on day one |
+|---|---|---|---|---|
+| `0x08` | `GPU_OP_EDGE_COV` | `edge_slot · edge_count · rt_handle · wh · dstxy · rule · flags` | 9 | `/bin/gputri`, then sadish |
+| `0x09` | `GPU_OP_TRI_RGBA` | `vtx_slot · vcount · rt_handle · dstxy · wh · flags` | 11 | `/bin/gputri`, dhancha |
+| `0x0A` | `GPU_OP_TRI_LIST` | `+ tile_slot` | 12 | **sadish** (shipped release) |
+| `0x0B` | `GPU_OP_TRI_TEX` | `+ tex_slot · lut_slot · tex_wh · fmt {RGBA8, IDX8+LUT} · filter {nearest, bilinear}` | 13/15 | **cyrius-doom**, aethersafha |
+| `0x0C` | `GPU_OP_DEPTH_CLEAR` | `z_handle · wh · value` | 17 | the pilot |
+
+`GPU_OP_SUPPORTED` grows `0x1F` → `0x1F1F`.
+
+**Invariants preserved verbatim:** **no MC address crosses the ring-3 boundary** — sources are named by shm slot id or by an opaque render-target handle, resolved in-kernel; this is a property of the record **layout**, not a rule the handler must remember · **every record validated before ANY record dispatched**, so a rejected batch draws nothing · **reject, never clip** · per-CPU descriptor staging (`pcpu_sc_gpuop`) · **sources premultiplied** (`c ≤ a`; straight alpha washes out silently and is never an error) · `#71` slots stay unreachable and `GPO_E_BADSLOT` stays exactly where it is.
+
+### Two ABI changes this arc must make now, while there is no legacy caller
+
+1. **⭐ The kernel-owned render arena (TD-3).** `SHM_MAX_SIZE = 2 MB` caps a `#86` slot at ~800×600×4 (1.92 MB). A 1280×720 colour buffer is 3.68 MB and a matching depth buffer is another 3.68 MB — **neither fits a slot.** At archaemenid's current 800×600 back buffer depth *just* fits, which means the naive ABI works today and **breaks the instant the console goes native-resolution.** Fix: `GPU_RT_REGION_OFF = 0xB0000000`, 256 MB, **ending exactly at the 3 GB carveout top** — so an overrun runs off the *top* into the `0x1FFC` fault net's dummy page, rather than into the console FB at offset 0 or the PSP TMR at `0x60000000`. 8 handles × 32 MB (fits 2560×1440×4 colour + depth). Indexed by opaque handle exactly like the shader residency slots, never addressed from ring 3. **Verified free by rung 6 before anything stores into it.**
+2. **A second op-mask word.** The `#89 +28` mask is a single u32, so op codes are bounded 0..31 and after this arc only four are free. Mint `+32 opmask_hi`, `+36 rt_slots`, `+40 rt_slot_bytes` (caps `len ≥ 48`, old `len ≥ 32` callers unchanged). **Now, while nothing can break.**
+
+### ⛔ How the "#92 with no caller" trap is made structurally impossible
+
+1. **Rung 0 contains zero kernel code.** The arc physically cannot open ahead of a caller, because it *opens by paying off the debt* — ops `0x02`/`0x03` shipped and uncalled.
+2. **A rung closes on a shipped consumer RELEASE**, never on an iron-green tool. Release-table rows are written as consumer rows — *"dhancha 0.10.0 renders coverage on the GPU"* — never as *"kernel gains op 0x08."*
+3. **The kernel is never more than one rung ahead.** Consumer release slips ⇒ the ladder stops and the gap goes into `state.md`.
+4. **Rung 10 is a kill gate with a pre-registered number, placed second in Phase II**, with a written obligation to report before rungs 11–14 are built. *"A caller that exists but rationally declines"* is the trap's subtler form and this is the only defence against it.
+5. **Two independent consumer justifications.** Rung 14 (DOOM) does not depend on rung 10's coverage crossover at all. If tier-1 coverage dies, the arc re-bases rather than collapsing.
+6. **Feature detection via `#89`** means consumer and kernel can land in either order and an old kernel degrades gracefully.
+
+---
+
+## 8. DECISIONS — `TD-*`, needing an operator call first
+
+⚠ **These `TD-N` are LOCAL to the 3D / raster work (REMAINING item 9). They are NOT the shader arc's `D-1`/`D-2`/`D-4` and NOT the modeset's `MD-*` — both of those are done. Different decisions, kept `TD-` prefixed so the three never get confused again.**
+
+| # | Decision | Blocks | Recommendation |
+|---|---|---|---|
+| **TD-0** | **Does this plan live in gpu.md as row 9's section, and does `roadmap.md:131` get re-pointed?** This file says both *"the successor doc is now justified"* and *"No successor doc"*, and rule 1 forbids new GPU docs. | the plan's home; every CHANGELOG reference | **gpu.md, here.** Rule 1 wins; the "successor doc justified" line predates its restatement. Fix `roadmap.md:131` — it was written before the 2026-07-23 consumer correction and is stale. ⚠ Cost: gpu.md goes past ~1000 lines and its acknowledged `gpu.cyr:NNNN` staleness worsens. |
+| **TD-1** | **Compute rasteriser as the load-bearing mechanism, GFX ring behind a measured gate?** | the entire ladder | **Yes.** Rung 1 of a GFX ladder stands on ~879 unmeasured clear-state registers that are probably not even readable; rung 9 here stands on S3/S4/S5/S6, all iron-attested. And **the precedent is agnos's own**: bite P5 said "**GFX-ring** 2D acceleration" and what shipped at 1.55.30 was `DMA_DATA` on the existing MEC ring. The GFX prerequisite was imaginary one level down, once already. |
+| **TD-2** | **Does row 9's "3D" mean *a rendering primitive with a caller*, or specifically *the fixed-function GFX pipeline*?** | whether Phase III is a probe or an arc | **A rendering primitive.** But this is a **substitution** and I am flagging it rather than making it quietly — `feedback_dont_dodge_large_items` is exactly this failure mode. If the answer is "the fixed-function pipeline", this ladder is wrong and the GFX arc opens with **rung 5 (recovery) as its rung 1 regardless**. |
+| **TD-3** | **Kernel-owned render arena with opaque handles at `0xB0000000` (256 MB, ending at the carveout top), or multi-page `#86` slots?** | rungs 11+; **nothing above 800×600 works without an answer** | **Arena.** Multi-page slots leak a size class into the ABI and re-open the "no MC address crosses ring 3" property. The top-of-carveout placement is deliberate: an overrun runs off the end into the fault net, not into the console FB or the TMR. **Gated on rung 6's read-only verification** — with no page tables, "free" must be measured. |
+| **TD-4** | **Vertex transform on the CPU in ring 3, or a GPU vertex stage?** | rungs 13–19; the `#92` record shape | **CPU, in ring 3.** The kernel receives screen-space vertices with `1/w`. Keeps every kernel shader branch-free and fixed-trip-count, which is what keeps the runaway-wave class eliminated. ⚠ Honest narrowing: the delivered pipe therefore has **no vertex stage**. Revisit only if the pilot is vertex-bound, which at a few hundred triangles it will not be. |
+| **TD-5** | **Depth by per-tile serialisation (one wave owns a tile, triangles in submission order), or atomics/binning?** | rung 17 | **Per-tile serialisation for v1.** No atomics, no binning pass, and order-independence is *directly* testable. agnos has never tested gfx90c atomics from a raw non-HWS HQD queue. If rung 17's both-orders oracle fails, the atomics variant is a separate, larger bite — **and rung 16 exists so that failure is not misattributed to binning.** |
+| **TD-6** | **Op codes `0x08`–`0x0C`, leaving `0x05`–`0x07` reserved as declared, and mint the second `#89` mask word now?** | rung 9; ABI stability | **Yes to both.** Squatting on `0x05` would make the support mask a lie. Minting `+32` costs nothing today and is impossible to do cleanly after four more codes are gone. |
+| **TD-7** | **DOOM's colormap: a DOOM-shaped kernel op, or a general IDX8+LUT format flag on `0x0B`?** | rung 14, and kernel-growth doctrine | **A format flag.** `project_agnos_kernel_growth_rules` — the kernel grows per native workload, never to chase a consumer's internals. "Indexed source + LUT" is a general graphics format and it preserves the pixel-identical oracle exactly; a `SPAN_DOOM` op would not. |
+| **TD-8** | **Does Phase III open at all, and on what trigger?** | G1–G3; 15–25 additional burns | **Not now. Open only on a written, measured, three-part trigger, all three required:** (i) the pilot is measured **fill-rate-bound below 30 fps** at the target resolution, **and** (ii) rung 1 proved context registers are readable (so G3's preamble has an oracle), **and** (iii) rung 5 arm D showed the console survives a GC stall. ⚠ **Hold me to this row.** If the pilot is *not* fill-rate-bound and Phase III still stays shut, that is correct; if it *is* and Phase III stays shut, that is me dodging and should be called out. |
+| **TD-9** | **The missing 3D math (4×4 / vec3): a module inside `cyrius-mine-cart`, or a new library repo?** | rung 19 | **A module inside the pilot first; promote to a repo only when a second consumer appears.** Scaffolding a library speculatively is the same anti-pattern one level down. ⚠ If the operator wants the repo now, the name is a naming-lane call (`feedback_naming_lanes`: system libs Sanskrit/Hindi) and I will not pick it. |
+| **TD-10** | **Does rung 9 open if rung 10's projected crossover, or rung 8's sadish-agreement, comes back bad?** | rungs 9–12 | **Pre-committed answers, so the trap cannot arrive as a surprise:** if rung 8 cannot achieve byte-identity with sadish, the arc's premier oracle degrades to ±1 coverage step and **that is reported before rung 9**. If rung 10's batched crossover sits above a real frame's coverage, **rungs 11–12 do not open on the coverage justification** and the arc re-bases on rung 14. |
+| **TD-11** | **Which release does this arc ship in?** Memory says GPU is ONE release (1.56.x); Phase 0+I+II is materially larger than a patch series. | every CHANGELOG line; the release table | **Operator's call — I will not name a number** (`feedback_no_unprompted_version_bumps`: bump on cycle OPEN, operator tags on CLOSE). Note only that Phase 0+I+II is ~19 items and 5 nominal flashes, which is minor-sized. One patch per rung, per rule 3. |
+| **TD-12** | **May mabda's PM4 / register tables be vendored into the agnos kernel, or must they be re-derived?** | G1–G3 only | **Vendor — with all three Cyrius port hazards in §3 explicitly checked** and every symbol prefixed. Re-deriving 97 register addresses by hand is how transcription errors enter; the diff against `radv-triangle.ib.txt` is a stronger check than re-derivation anyway. |
+
+---
+
+## 9. DEFERRED, WITH REASONS
+
+| Deferred | Why | Re-open trigger |
+|---|---|---|
+| **The GFX ring as a capability** (G1 is a one-burn *decision*) | Not size — **recoverability**. Non-local failure modes (a bad EXP presents as a VGT stall; unset `CB_COLOR0_ATTRIB2` presents as a healthy ring drawing nothing), ~879 unmeasured clear-state registers, probably no read-back oracle, on the box that is also the console. On Linux each of mabda's ten catalogued causes was a 2-second TDR and a retry; here each is a dead box and a lost burn. | **TD-8**'s three-part trigger |
+| **MIMG / `image_sample` / T# / S#** | The ALU gather path (4 × `global_load_dword` + `v_cvt_f32_ubyte0..3` + lerp + `v_cvt_pk_u8_f32`) uses **only iron-proven instructions**, needs no descriptors, no tiling, no format enums. And S12 measured this path **memory-bound at ~87 % fixed cost**, so manual filtering is close to free. MIMG is a *performance* bite with a working fallback. ⚠ And gpu.md's own "free ten-minute llvm-mc check" has **no valid oracle** (§6). | sampling is >30 % of a **measured** frame profile |
+| **Perspective-correct interpolation before rung 18** | `v_rcp_f32` adds a rounding site, and a bit-exact oracle is what makes rungs 9–14 cheap. It lands where a mesh justifies it. **And it is not needed for DOOM at all** — DOOM's texturing is affine per primitive (verified, §4 rung 14). | rung 18 |
+| **Near-plane clipping** | Rejecting any triangle with a vertex behind the eye is correct-but-conservative and costs nothing. | a consumer that needs real clipping |
+| **MSAA · mipmaps · cubemaps · anisotropy · stencil · blend modes beyond premultiplied src-over** | None has a caller. mabda's own native 3D is a fullscreen triangle with none of them. 2D gets analytic AA free from op `0x08`; 3D edges can supersample in-shader. | a consumer that shows the artifact on the panel |
+| **Tiled / DCC surfaces** | Linear render targets sidestep `gfx_v9_0_tiling_mode_table_init` and `GB_ADDR_CONFIG` entirely. And SDMA — whose hardware does the swizzle — **does not fetch on this box** after five burns. mabda's `COPY_TILED_SUB_WINDOW` builder exists if this ever matters. | a measured bandwidth wall traced to linear access |
+| **A GL / Vulkan / WebGPU surface, and the soorat / kiran ports** | Standing 1.54.x non-goal. soorat is Rust + wgpu + WGSL against a WebGPU-shaped device; **what seam it wants is a soorat/kiran decision, not a kernel one** — which is ordering candidate (a) from this file's own 3D section, and still the only one that produces evidence. | the port itself, telling us |
+| **An in-kernel SPIR-V compiler** | Still **KILLED under D-1**: +4,641 LOC, no SPIR-V producer in the ecosystem, host-side offline emission is the settled path. Rung 7 keeps it host-side. | never, absent a SPIR-V producer |
+| **A gfx90c instruction emulator for host-side shader testing** | Attractive — macoy.me and Collabora both name a simulator as decisive — but it is mabda-scale work, and rungs 2/7/8 already move the encoding, the algorithm and the oracle off iron. | rungs 9 + 17 together cost more than 4 burns |
+| **SDMA** | Ring-up verified, **five burns of no fetch**. Not the 2D primitive, not the 3D primitive. | — |
+| **Hardware cursor · DCN second plane · native-res console (MD-9)** | Display lane, each with a written reason. ⚠ MD-9 becomes worth re-opening **after rung 13** — DOOM-at-native is the caller MD-9 lacked when it was declined, and per `gpu.md:796` it needs **no modeset** (the link is already 2560×1440; only the *surface* is 800×600 under DSCL). | rung 13's measured GB/s |
+
+**Not deferred, and it closes an old loop:** `[[project_gpu_arc_close_iam_gpu_display]]` triggers when REMAINING empties. **Row 9 is the last row**, so this arc's close carries the `iam`/`mihi` sovereign GPU-detection follow-on and the `ai-hwaccel` `readlink#89` → `sys_readlink#70` fix with it.
+
+---
+
+## 10. BURN BUDGET
+
+**Count flashes, not rungs.** 22 named items; **5 nominal flashes**.
+
+| Flash | Buys | Rungs | Marginal-cost riders |
+|---|---|---|---|
+| **1** | The `#92` debt paid; the compositor's full-screen CPU clear and undamaged copy gone; **the whole-frame batching path exists and is measured** | 0a · 0b · 0c | **rung 1** `regread-probe` (read-only) — answers whether Phase III could ever have an oracle |
+| **2** | **agnos gains GPU hang detection, packet bisection, forensic spill, and recovery** — value independent of 3D. Plus arm D (does the console survive a GC stall — the never-measured assumption under the entire GFX risk model) and arm E (S6's guard finally *measured*) | 5 | **rung 6** `arena-audit` (read-only) |
+| **3** | The rasteriser exists and is byte-identical to the reference; **the kill gate fires with a pre-registered number**; interpolated attributes | 9 · 10 · 11 | — |
+| **4** | GPU coverage in a shipped `crab`/`jalwa` window; nearest-neighbour texturing with the 1:1 absolute oracle; **DOOM's world at 800×600** | 12 · 13 · 14 | — |
+| **5** | Bilinear; depth proven by order-independence; perspective; **the pilot on the panel** | 15 · 17 · 18 · 19 | — |
+| *(gated)* | The GFX-ring **decision**, not a capability | G1 (+G2, G3 only if G1 and TD-8 both say go) | — |
+
+**Zero-burn work:** rungs 2, 3, 7, 8, 16 — the PM4 validator, the relocation manifest (on Linux, using mabda's existing dumper), the assembler agreement, the CPU reference, the tile-ownership assertion. **~500–700 lines that touch no display register and retire the two failure classes that have cost this arc most: an oracle that cannot distinguish outcomes, and a ring program that does not do what its comment says.**
+
+> **⚠ Read 9–12 as the real number and 5 as the optimistic branch.** The record is decisive: the D lane spent **5 flashes for 1 result**; the M lane's honest budget was *"expect three, budget two to three more."* Rungs 9, 14 and 17 are each individually likely to cost 2. Phase III's 15–25 is a reduction claimed on the strength of instruments that do not exist yet and is **the least-evidenced number in this section.**
+>
+> **What makes the rung-per-flash cadence affordable at all** is the H3/M4–M8 economy: rungs 9–19 are `--flags` on **one re-runnable ring-3 tool** (`/bin/gputri`), so once the kernel is on disk each rung is a command at the prompt, not another flash. Every kernel shader is behind an idempotent `*_arm()` residency latch, so an unexercised op arms nothing and cannot affect boot — which is what makes it safe to land three shaders per flash.
+
+---
+
+## 11. RISKS
+
+### Risk register — how this blanks or wedges the box
+
+| # | How | Cause | Operator sees | Log survives? | Recovery | Reflash? | Mitigated by |
+|---|---|---|---|---|---|---|---|
+| 1 | GPU stops responding; shell alive | runaway or stalled wave on the MEC ring | `exit 91`, forensic block, bracket names the packet | **YES** — `klug_spill()` on every timeout | requeue (R-2/R-3), else `gpu_wedged` + CPU compositor fallback | **No** | rungs 4, 5 |
+| 2 | Whole box hangs, console frozen | CPU spins unbounded on a GPU condition | dead box | ⚠ only if spilled **before** the submit | power cycle | No | every wait bounded by `gpu_wait_done`; H1-style pre-spill before each risky submit |
+| 3 | Console garbage or wrong colours | a raster kernel store lands in the **console FB at carveout offset 0** — **there is no GPU-side isolation, `VM_CONTEXT0` is disabled, and an out-of-bounds store lands somewhere REAL** | corrupted screen | YES | reboot | No | in-kernel bbox validate+clamp (rung 12) **+ the measured** EXEC guard (rung 5 arm E) **+** arena at the top of the carveout so overruns exit into the fault net |
+| 4 | PSP refuses firmware on the next boot | a stray write into the **TMR at `0x60000000`** | boot-time GPU failure | YES | reboot; TMR is re-set up at boot | possibly | same placement rule; `GPU_FB_BACK_LIMIT` already exists and the arena is declared against it; rung 6 verifies |
+| 5 | Panel black, kernel instruments green | rung 19 present-path bug, or DCN shadow/VUPDATE | black screen, green log | YES | reboot | No | **two independent oracles at rung 19** (eye **and** `#90` capture) so the negative branch names the half. ⚠ `OPTC0_UNDERFLOW` bit10 is **sticky and already 1 at boot** — delta checks only; I1/I2 free-run and are blind to the picture |
+| 6 | GFX ring wedges the GC block | any of mabda's ten catalogued TDR causes | `exit 91`, bracket names the packet | YES | G2's recovery; else power cycle | No | rungs 2, 4, G2, and **replay-before-compose** |
+| 7 | Console blanks on a GC wedge | GC and DCN more coupled than assumed | black screen | ⚠ only via pre-spill | power cycle | No | **rung 5 arm D measures this for free, at flash 2, before any GFX code exists** |
+| 8 | Silent wrong pixels, no hang | premultiplication violated (`c > a`), or a `CB_COLOR0_ATTRIB2`-class silent drop | washed-out or black output, **no error** | YES | — | No | byte-compare against I7 at **every** rung; I6 assertions |
+| 9 | A green gate on a build where the flag did not compile in | `#ifdef` mis-wiring | everything "passes" | YES | — | **yes, a wasted one** | `verify_marker` on a string **inside** the flag's own `#ifdef` **plus** the negative check it is absent from a bare build (`ATOM_DRY` was a silent no-op for two burns) |
+| 10 | GC clock/power-gated mid-arc | SMU-driven GFXOFF on an APU; `gpu.cyr:755` already notes a CNTL reading back unchanged means gated | reads return 0 or garbage | YES | reboot | No | the existing readback guard; the forensic block records `GRBM_STATUS` |
+
+### How this arc could fail or mislead — ranked by damage
+
+1. **The tier-1 consumer may evaporate, and rung 0 does not fully protect against it.** S12 measured ~60 µs fixed cost per submission at ~87 % overhead; a ~600 px glyph costs the CPU ~3 µs. **Unbatched, the GPU loses by more than an order of magnitude and it is not close.** The case survives only through frame-level batching — which is precisely why rung 0b *builds that path first*. But rung 0b's batching is over the *existing* ops; whether it also amortises rung 9's **coverage generation** is what rung 10 measures, and rung 10 could say no. Mitigation is real (rung 10 is a kill gate with a pre-registered number, and rung 14 is an independent justification), but **if you read one paragraph adversarially, read this one.**
+2. **Byte-identity with sadish may be unachievable at reasonable cost.** sadish *scatters* analytic-x span overlap into a per-row accumulator across sub-scanlines; the per-lane reformulation re-derives the same quantity per pixel. If the fixed-point rounding cannot be made to agree exactly, the arc's premier oracle degrades from *byte-identical* to *±1 coverage step*. Rung 8 finds this at **zero burns** — which is the only reason it is acceptable at all.
+3. **Recovery may be worse than the hang.** Arm C (matmul bit-correct before *and* after) catches gross corruption, but only for one workload; a recovery that silently poisoned the resident shader arena would pass it. Mitigation: **`gpu_wedged` (R-4) is the shipped default on any ambiguity — when in doubt, refuse to use a GPU you cannot vouch for.** Deliberately conservative; it will occasionally cost a working GPU to a false positive.
+4. **VGPR pressure is the largest unmeasured assumption and there is no oracle for it.** Rung 17 holds colour + depth + three edge accumulators + UV per lane across the triangle loop. If the live count exceeds the `RSRC1` declaration, the wave spills to scratch (`COMPUTE_TMPRING_SIZE`, never used by agnos) or launches at reduced occupancy — and **S1 says none of those registers is GRBM-readable.** The lane-witness counter separates "no wave ran" from "wave ran wrong"; it does not measure spill. **Rung 17 is the rung most likely to cost 2–3 flashes instead of 1.**
+5. **Rung 17's grid is an order of magnitude past anything agnos has dispatched.** 8×8 tiles at 800×600 is ~7,500 workgroups. Whether one dispatch at that scale retires inside the 100 ms watchdog is untested, and the failure presents as `GPO_E_DISPATCH` — **indistinguishable from a hung kernel without the bracket.** A second reason rung 4 must precede it.
+6. **The CPU reference and the GPU kernel share an author and can agree while both are wrong.** A systematic winding or y-flip error passes both. Rung 8's shared-edge internal-consistency test and rung 13's 1:1 checkerboard (an absolute test against an artifact the reference did not produce) narrow it; they do not close it. Residual, stated.
+7. **The bracket is real but can be wide** (§5, I4), and instrumenting can move the bug. Labelled, not eliminated.
+8. **Consumer-repo churn is the schedule risk.** Rungs 0, 12, 13, 14, 19 each need a release outside agnos — aethersafha, dhancha, sadish, cyrius-doom, plus a new game — with dep pins. The one-rung-ahead rule is the brake, and it is a **discipline** brake, not a mechanical one. If the cadence cannot be absorbed the kernel gets ahead of its callers by the front door.
+9. **This arc walks past mabda's graphics prior art** — the 97-register table, the ~40 TDR-avoiding constants, the four-block clear-triangle stream. That is the most complete, HW-proven, Cyrius-native prior art in the ecosystem, and `feedback_redesign_dont_reinvent` cuts against discarding it. **The defence is recoverability, not size.** It is a judgement call, not a derivation, and it is recoverable later — the table does not rot, and G1 keeps a one-burn door open.
+10. **The word "3D" is doing work it must earn.** Rung 13 delivers row 9's literal stated end state (*a textured triangle on the panel*) via a compute rasteriser. If the operator's intent for row 9 is the fixed-function pipeline, this ladder satisfies the letter while substituting the mechanism. **TD-2 exists so that is an operator call and not a quiet dodge** — `feedback_dont_dodge_large_items` says I would otherwise be its next instance.
+11. **Solo-developer and single-box risk, inherent and unmitigable.** One dev box, which is also the display, and it is the operator's work machine — every burn blocks his work. Every design choice above (ring-3 tools over boot self-tests, read-only riders, host-first oracles, recovery before rasteriser) is a response to that constraint, and none of them removes it.
+
+---
+
+## 12. DEFINITION OF DONE
+
+1. `#92` ops `0x08`–`0x0C` implemented, each validated-before-dispatch, each advertised in `#89`'s mask (and the second mask word minted).
+2. Every Phase II rung byte-identical to the ring-3 CPU reference on iron, `exit 95`.
+3. **`#92` ops `0x02` and `0x03`, shipped long ago with no caller, have callers** — and aethersafha's frame contains no full-screen CPU clear and no undamaged full-screen CPU copy.
+4. **sadish ships a batched GPU coverage path** and a `crab` or `jalwa` window's fills and glyph edges come off the GPU, pixel-identical to CPU. *(Waived only if rung 10 kills tier-1 coverage — in which case the waiver is written into gpu.md **with the measured number**.)*
+5. **cyrius-doom renders its world through the GPU at ≥ 800×600, byte-identical to its own CPU renderer at 320×200.**
+6. The pilot renders a depth-tested, perspective-correct, bilinear-textured mesh on the panel, confirmed by the operator's eye **and** a `#90` byte-compare.
+7. **A wedged GPU is detected, bracketed to a packet, spilled to `/klug.txt`, and either requeued or degraded with the console and shell alive — proven on iron, not asserted.**
+8. Every burn written into `iron-nuc-zen-log.md` with its armed CONFIRM/FALSIFY rubric published **before** the flash.
+9. Row 9's REMAINING empty; `roadmap.md:131` fixed; the `iam`/`mihi` GPU-detection follow-on and the `ai-hwaccel` `readlink#89` → `sys_readlink#70` fix filed.
+
+**Explicitly NOT required to close:** one line of GFX-ring code · a `CP_RB0` register · `CLEAR_STATE` or a single context register · MIMG, T#, or S# · MSAA, mipmaps, cubemaps, or stencil · tiled or DCC surfaces · a GL/Vulkan/WebGPU surface · one line of soorat, kiran, or WGSL · a second display plane · MD-9 · SDMA.
+
+---
+
+## 13. CORRECTIONS TO THE RECORD THIS SECTION MAKES
+
+1. **Row 9's `Depends on: 7` is wrong.** The modeset is a prerequisite for *displaying* on a link the firmware did not light, **not** for *rendering*. `#90 gpu_readback_shm` is implemented and iron-proven and gives a programmatic pixel oracle with the display untouched; Fuchsia's `vkreadback` and mabda's own e2e both validate a first render with no display at all. Re-type as `depends on: nothing; MD-9 for the native-res rungs only`. (Moot in outcome since item 7 closed 2026-07-24 — load-bearing in burn design, because Phase 0/I/II rungs 9–13 carry **no display blast radius at all**.)
+2. **`gpu.md:643`'s "the GPU is also the console" overstates the coupling.** The console is DCN 2.1 — a different IP block, different registers, fetching DCHUB→SDP→data fabric, never through GL2 or GC. A GC wedge *should* leave scanout running. **This assumption underpins the entire GFX risk model and has never been measured.** Rung 5 arm D measures it at zero marginal cost.
+3. **The proposed zero-burn `llvm-mc` MIMG bite has no valid oracle** — an assembler validates encoding, not shader-stage legality, and would return a **false green**. See §6 INFERRED.
+4. **`gpu.md:200` still calls `#90`/`#91` "RESERVED with declared shapes."** Both were implemented and iron-proven 2026-07-23 via `/bin/gpucopy`, and `gpu.md:59` says so 140 lines earlier. Fix.
+5. **`gpu.md:742` records MD-2 as "✅ SETTLED (phyid=0)"** while `gpu.md:789` records it overturned to `phyid=1` on iron 2026-07-24. Same file, contradictory rows. Fix the stale one in place per the MD convention.
+6. **`agnos-userland-abi.md` is missing TEN shipped syscalls** — #82, #83, #86, #87, #88, #89, #90, #91, #92, #93 — **including every number this arc extends.** This is a real defect and it should be fixed before rung 9 adds five op codes to an undocumented surface.
+7. **`/bin/gpumm` is staged twice** (`stage-tools.sh:96` stages the standalone `gpumm` repo; `:145` stages `tentib/programs/gpumm.cyr` to the same name, and the second wins at 154,384 B). The standalone `#82`/`#83` seam proof is **unreachable on disk**, which will silently invalidate any future "the seam still works" claim that runs `/bin/gpumm`. Rename one or delete the dead stage.
+8. **`gpu_regs.cyr:1028` still says `v_fma_f64`** where the shipped kernel uses separate `v_mul_f64` + `v_add_f64`. A fused FMA would have mismatched 29/64 cells. Fix the comment.
+9. **`dhancha/cyrius.cyml` still says "emits Wayland client surfaces."** Wayland is dead; it speaks setu.
+10. **Comments claiming "the 39-dword ring program" are wrong** — the C2f envelope is 50 dwords and `gpu_matmul_run` is 68. **Count `gpu_ring_put` calls; do not trust the comments.** Rung 2's validator enforces this mechanically.
+
+---
+
+**Before each bite: re-open this section, name the rung and the `TD-` rows that govern it, in the message, before writing code.** Building an option a decision row rejected, across six bites, without re-opening the plan, is the recurrence that has cost the most trust in this project.
+
+---
+
 ## 3D — what is actually true about it (kept: the consumer-stack correction)
 
 ⚠⚠ **CORRECTION, 2026-07-23, and it overturns the original justification for this section.** The first draft
