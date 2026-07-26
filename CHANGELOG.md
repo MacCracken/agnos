@@ -44,6 +44,49 @@ byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random m
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
 
+### Added — bite **B5**: `asmagree.cyr` extended to the classes rung 9b introduces
+
+Rung 7 proved VOP1 ×2, VOP2 ×3, SOP1+literal, SOPP, and one VOP3a *lo* dword — **9 classes**, and
+its own row states that honest limit. 9b adds twenty more: `v_mul_hi_u32`, `v_ffbh_u32`,
+`v_min/max_i32/u32`, `v_cndmask_b32` in **both** the VOP2 and VOP3-with-SGPR-pair forms,
+`v_cmp_*_e64` (VOPC-as-VOP3 writing an SGPR pair), `v_readfirstlane_b32`,
+`global_load_dwordx4`, `global_store_byte`, `s_andn2_b64`, `s_or_b64`, `s_ff1/s_flbit`,
+`s_cbranch_execnz/scc1`. **Now 40 classes agreeing, 0 disagreeing.**
+
+**Zero new encoding FORMATS** — every one is VOP1/VOP2/VOPC/VOP3a/SOP1/SOP2/SOPP/FLAT, and the
+encoder takes raw opcode numbers. **No mabda edit was required.**
+
+⚠⚠ **A PROVENANCE DISTINCTION, stated in the file rather than blurred.** Everything rung 7
+checked is against bytes agnos **ships and has run on archaemenid** — two independent parties
+agreeing on a dword the *silicon* accepted. Nine of the new instructions appear in **no shipped
+agnos shader**, so no iron-proven byte exists to compare against; their references come from
+`llvm-mc -mcpu=gfx90c`, used exactly as this file's own failure text prescribes — a one-off
+investigation tool, never a build gate (arc decision D-1). **So the new block proves "mabda's
+encoder agrees with LLVM", NOT "these bytes work on gfx90c".** ⭐ `v_mul_hi_u32` in particular has
+never executed on agnos silicon and 9b's entire divider rests on it — which is why it gets its own
+**answer-register** oracle on the first burn ([[feedback_echo_vs_answer_registers]]), and why
+agreement here is a prerequisite for that burn rather than a substitute for it.
+
+Also confirmed: **`global_store_byte` (FLAT 0x18) — the sub-dword store.** No agnos shader has ever
+issued one (the only byte op anywhere is a `global_load_ubyte` in `blend_cov`), and every 8bpp mask
+writer needs it. Its opcode was previously *derived*; it is now checked.
+
+### Fixed — the plan's encoding table had a wrong opcode, and so did my first correction of it
+
+The 9b plan listed `s_andn2_b64` as **SOP2 0x09** with dword `[04 06 84 89]`. That dword's `sdst`
+field is **4**, not the 2 the instruction names — a different register — and the opcode is wrong
+too. ⚠ **My own first hand-decode of the corrected dword said 0x12; that was also wrong** (I
+mis-shifted the 9-bit field). The real opcode is **0x13**, and it took a byte-diff against an
+independent assembler to settle it.
+
+⭐ That is the entire argument for this file existing, demonstrated on itself: **an opcode number
+that "looks decoded" is worth nothing until something independent disagrees with it.** The plan's
+table row is corrected in place with the derivation recorded.
+
+**Calibrated against four mutations, 4/4 caught, each naming its exact class:** `v_mul_hi_u32`
+0x286→0x285 (the divider's load-bearing instruction) · `global_store_byte` 0x18→0x1C · `v_min_i32`
+/`v_max_i32` swapped · VOP3 hi-dword src0↔src1 order.
+
 ### Added — bite **B4**: `gpu-test/edgeasm.cyr`, the authoring tool — calibrated on a shipped shader
 
 agnos hand-assembles shader blobs as literal `store32` dword tables. That has worked because every

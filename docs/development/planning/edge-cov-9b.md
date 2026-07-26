@@ -433,7 +433,7 @@ Rung 7 proved VOP1 ×2, VOP2 ×3, SOP1+literal, SOPP, and one VOP3a *lo* dword �
 | `global_load_dwordx4` | `[00 80 5c dc][02 00 7f 04]` | dword0 `0xdc5c8000` |
 | `global_store_byte … glc` | `[00 80 61 dc][02 04 7f 00]` | dword0 **`0xdc618000`** — confirms surveyor 1's DERIVED `0x18` |
 | `v_readfirstlane_b32 s1,v2` | `[02 05 02 7e]` | VOP1 **0x02** |
-| `s_andn2_b64` | `[04 06 84 89]` | SOP2 0x09 |
+| `s_andn2_b64` | `[04 06 82 89]` | SOP2 **0x13** — ⚠ **CORRECTED at B5.** This row read `[04 06 84 89]` / op 0x09; that dword's `sdst` field is 4, not 2, and the opcode is 0x13. Re-derived by running `llvm-mc` in-session and settled by byte-diff — a first hand-decode of the corrected dword said 0x12 and was also wrong. |
 | `s_cbranch_execnz 0` | `[00 00 89 bf]` | SOPP 0x09 |
 | `s_ff1_i32_b32 / s_flbit_i32_b32` | `[02 10 81 be] / [02 12 81 be]` | SOP1 0x10 / 0x12 |
 

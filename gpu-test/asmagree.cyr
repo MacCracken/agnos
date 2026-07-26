@@ -144,6 +144,90 @@ fn main(): i64 {
     phex(gfx9_enc_sop1(0x00, 6, gfx9_sgpr(0)));
     puts("   (derived, not a shipped byte -- reported, not asserted)");
 
+    # ========================================================================================
+    # B5 (rung 9b) — THE CLASSES RUNG 9b INTRODUCES
+    # ========================================================================================
+    # ⚠⚠ READ THE PROVENANCE DIFFERENCE BEFORE CITING THIS SECTION.
+    #
+    # Everything ABOVE is checked against bytes agnos SHIPS AND HAS RUN ON ARCHAEMENID. That is
+    # the strongest evidence available: two independent parties (agnos's hand-assembly and
+    # mabda's encoder) agreeing on a dword the SILICON accepted.
+    #
+    # ⛔ The block BELOW cannot make that claim. Nine of these instructions appear in NO shipped
+    # agnos shader, so there is no iron-proven byte to compare against. Their expected dwords
+    # come from `llvm-mc -arch=amdgcn -mcpu=gfx90c -show-encoding` — a THIRD OPINION, used here
+    # exactly as this file's own failure text prescribes: a one-off investigation tool, never a
+    # build gate (arc decision D-1).
+    #
+    # So this block proves "mabda's encoder agrees with LLVM", NOT "these bytes work on gfx90c".
+    # ⭐ `v_mul_hi_u32` in particular has NEVER executed on agnos silicon and rung 9b's entire
+    # divider rests on it — which is why it gets its own ANSWER-REGISTER oracle on the first
+    # burn ([[feedback_echo_vs_answer_registers]]), and why agreement here is a prerequisite for
+    # that burn rather than a substitute for it.
+    #
+    # ⚠ The table was RE-DERIVED by running llvm-mc in this session, not transcribed from the
+    # plan — and that caught a real error in the plan's table, which listed `s_andn2_b64` as
+    # SOP2 op 0x09 with a dword whose sdst field is 4, not 2. It also caught MY OWN first
+    # hand-decode of the corrected dword, which said 0x12. The opcode is 0x13, and it took a
+    # byte-diff against an independent assembler to settle it.
+    # [[feedback_audit_re_derive_dont_validate_comments]]
+    puts("");
+    puts("---- B5: the classes rung 9b introduces (llvm-mc reference, NOT iron-proven) ----");
+
+    # VOP1 — two opcodes rung 9b needs that appear in no shipped agnos shader.
+    agree("VOP1   v_ffbh_u32 v1,v2     ", gfx9_enc_vop1(0x2D, 1, gfx9_vgpr(2)), 0x7e025b02);
+    agree("VOP1   v_readfirstlane s1,v2", gfx9_enc_vop1(0x02, 1, gfx9_vgpr(2)), 0x7e020502);
+
+    # VOP3 — BOTH dwords. ⭐ The lo/hi PAIR is what rung 7 never checked and what B4's tool
+    # emits atomically; a dropped hi dword shifts the whole stream and yields a wrong picture.
+    agree("VOP3lo v_mul_hi_u32 v1,v2,v3", gfx9_enc_vop3a_lo(0x286, 1), 0xd2860001);
+    agree("VOP3hi v_mul_hi_u32 v1,v2,v3", gfx9_enc_vop3a_hi(gfx9_vgpr(2), gfx9_vgpr(3), 0), 0x00020702);
+    agree("VOP3lo v_mul_lo_u32 v1,v2,v3", gfx9_enc_vop3a_lo(0x285, 1), 0xd2850001);
+    # v_cndmask_b32_e64 — the VOP3 form with an SGPR-PAIR selector in src2, which the VOP2 form
+    # cannot express. The divider's guard mask needs exactly this.
+    agree("VOP3lo v_cndmask_b32_e64    ", gfx9_enc_vop3a_lo(0x100, 1), 0xd1000001);
+    agree("VOP3hi v_cndmask_b32_e64    ", gfx9_enc_vop3a_hi(gfx9_vgpr(2), gfx9_vgpr(3), gfx9_sgpr(20)), 0x00520702);
+    # v_cmp_ne_u32_e64 — VOPC as VOP3, writing an SGPR PAIR instead of VCC. The restoring loop
+    # needs a second mask alongside vcc.
+    agree("VOP3lo v_cmp_ne_u32_e64     ", gfx9_enc_vop3a_lo(0xCD, 22), 0xd0cd0016);
+    agree("VOP3hi v_cmp_ne_u32_e64     ", gfx9_enc_vop3a_hi(gfx9_inline_int(0), gfx9_vgpr(16), 0), 0x00022080);
+
+    # VOP2 — the min/max family, whose opcode numbers surveyor 1 could not derive from anything
+    # in either repo and listed as UNKNOWN.
+    agree("VOP2   v_min_i32 v1,v2,v3   ", gfx9_enc_vop2(0x0C, 1, gfx9_vgpr(2), 3), 0x18020702);
+    agree("VOP2   v_max_i32 v1,v2,v3   ", gfx9_enc_vop2(0x0D, 1, gfx9_vgpr(2), 3), 0x1a020702);
+    agree("VOP2   v_min_u32 v1,v2,v3   ", gfx9_enc_vop2(0x0E, 1, gfx9_vgpr(2), 3), 0x1c020702);
+    agree("VOP2   v_max_u32 v1,v2,v3   ", gfx9_enc_vop2(0x0F, 1, gfx9_vgpr(2), 3), 0x1e020702);
+    agree("VOP2   v_xor_b32 v1,v2,v3   ", gfx9_enc_vop2(0x15, 1, gfx9_vgpr(2), 3), 0x2a020702);
+    agree("VOP2   v_or_b32 v1,v2,v3    ", gfx9_enc_vop2(0x14, 1, gfx9_vgpr(2), 3), 0x28020702);
+    agree("VOP2   v_sub_u32 v1,v2,v3   ", gfx9_enc_vop2(0x35, 1, gfx9_vgpr(2), 3), 0x6a020702);
+    agree("VOP2   v_ashrrev_i32 v1,31,v2", gfx9_enc_vop2(0x11, 1, gfx9_inline_int(31), 2), 0x2202049f);
+    agree("VOP2   v_lshrrev_b32 v1,31,v2", gfx9_enc_vop2(0x10, 1, gfx9_inline_int(31), 2), 0x2002049f);
+    agree("VOP2   v_cndmask_b32 (VOP2) ", gfx9_enc_vop2(0x00, 1, gfx9_vgpr(2), 3), 0x00020702);
+
+    # VOPC
+    agree("VOPC   v_cmp_ge_u32 vcc,v1,v2", gfx9_enc_vopc(0xCE, gfx9_vgpr(1), 2), 0x7d9c0501);
+
+    # FLAT — ⭐ global_store_byte is the SUB-DWORD store. No agnos shader has ever issued one
+    # (the only byte op anywhere is a global_load_ubyte in blend_cov), and every 8bpp mask
+    # writer needs it. Its opcode was DERIVED by surveyor 1 and is CONFIRMED here.
+    agree("FLATlo global_load_dwordx4  ", gfx9_enc_flat_lo(0x17, GFX9_FLAT_SEG_GLOBAL, 0, 0, 0), 0xdc5c8000);
+    agree("FLAThi global_load_dwordx4  ", gfx9_enc_flat_hi(4, GFX9_SADDR_OFF, 0, 0), 0x047f0000);
+    agree("FLATlo global_store_byte glc", gfx9_enc_flat_lo(0x18, GFX9_FLAT_SEG_GLOBAL, 0, 1, 0), 0xdc618000);
+    agree("FLAThi global_store_byte glc", gfx9_enc_flat_hi(0, GFX9_SADDR_OFF, 2, 0), 0x007f0200);
+
+    # SOP — ⚠ s_andn2_b64 is SOP2 op **0x13**. The plan's table said 0x09, AND my own first
+    # hand-decode of the llvm-mc dword said 0x12 (I mis-shifted). The byte-diff below is what
+    # caught both. That is the entire argument for this file existing: an opcode number that
+    # "looks decoded" is worth nothing until something independent disagrees with it.
+    agree("SOP2   s_andn2_b64          ", gfx9_enc_sop2(0x13, 2, gfx9_sgpr(4), gfx9_sgpr(6)), 0x89820604);
+    agree("SOP2   s_or_b64 vcc,vcc,s22 ", gfx9_enc_sop2(0x0F, 106, 106, gfx9_sgpr(22)), 0x87ea166a);
+    agree("SOP1   s_ff1_i32_b32 s1,s2  ", gfx9_enc_sop1(0x10, 1, gfx9_sgpr(2)), 0xbe811002);
+    agree("SOP1   s_flbit_i32_b32 s1,s2", gfx9_enc_sop1(0x12, 1, gfx9_sgpr(2)), 0xbe811202);
+    agree("SOP1   s_mov_b64 exec,-1    ", gfx9_enc_sop1(0x01, 126, gfx9_inline_int(0 - 1)), 0xbefe01c1);
+    agree("SOPP   s_cbranch_execnz 0   ", gfx9_enc_sopp(0x09, 0), 0xbf890000);
+    agree("SOPP   s_cbranch_scc1 0     ", gfx9_enc_sopp(0x05, 0), 0xbf850000);
+
     puts("");
     ps("classes agreeing: "); pnum(pass_n);
     ps("   disagreeing: "); pnum(fail_n); puts("");
