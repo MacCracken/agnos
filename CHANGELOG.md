@@ -44,6 +44,67 @@ byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random m
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
 
+### Added — bite **B8**: `/bin/gputri` rebuilt against the live seam, and WIRED INTO THE BURN
+
+`gputri` appeared in **neither** `stage-tools.sh` nor `burn-prep.sh` (`grep -rn gputri scripts/`
+→ 0 matches). A burn would have flashed a fresh kernel next to an **absent or hand-copied**
+binary — the exact shape of the 2026-07-24 M9 waste, where a correct kernel shipped with a tool
+six hours old, both arms fell through to a probe that returns 95, and two runs of the experiment
+produced no data at all.
+
+- **`stage-tools.sh`**: `stage_one agnos/gpu-test gputri.cyr gputri`.
+- **`burn-prep.sh`**: `gputri` added to the staged-vs-built comparison, plus two gates of its own
+  — the staged binary must carry `--cov` and `--digest`, and it must carry the **negative
+  controls**. ⭐ That second gate matters because a `gputri` without N1–N8 can still print
+  "20 of 20", and **two of the twenty corpus cases have an all-zero correct answer** — so a
+  shader that writes nothing reproduces them byte-exactly. Staging a control-less build would
+  make the whole burn unfalsifiable.
+
+**Negative controls N1–N8, each a gate that must FIRE or the tool exits 86 and can never reach
+95.** A control that silently fails to run is worse than no control: it turns a green result from
+evidence into decoration.
+
+| | |
+|---|---|
+| **N1** | comparator calibration — a deliberately poisoned copy MUST compare unequal, or a comparator that always says "equal" reports 20/20 |
+| **N2** | the sentinel is observable: prefill and read back **without dispatching**; if that is not all-`0xA5`, every UNTOUCHED verdict is unreliable |
+| **N3** | ≥3 cases with ≥1000 non-zero reference bytes — the answer to the all-zero-case hazard |
+| **N4** | ≥1 reference byte strictly between 0 and 255, else a **binary, non-antialiased** rasteriser passes the axis-aligned subset |
+| **N5/N6** | the corpus still *contains* the backfacing and non-multiple-of-64 shapes |
+| **N7** | the same case twice in one boot, byte-identical |
+| **N8** | slot free-then-realloc — the C2g-1 stale-ghost path `gpucopy` already hit on iron |
+
+⭐ **The digest gate — the only check that catches BOTH SIDES being wrong together.** `cpuref`
+(host) and `gputri` (`--agnos`) include the *same* `refraster.cyr` but compile through different
+paths. An `--agnos` codegen divergence would make this tool's reference **and** its comparison
+agree with each other while both differ from the host's, and byte-comparing the GPU against a
+locally-wrong reference would report a clean pass. Both tools now print an FNV-1a digest per case;
+`--digest` is run **first** on iron and diffed against the host. `gpu.md:1019` names this class.
+
+### Fixed — two buffer defects in the 9a tool, both of which would have corrupted a burn
+
+1. ⛔ **`tri_edges[8]` was 64 bytes = exactly FOUR edges.** Module-scope `var X[N]` is N×u64.
+   Corpus case 9 (bowtie) has 4 and fit by luck; **case 10 has 10 and case 20 has 64** — both
+   would have written straight past the end into the mask buffer declared beside it. A corrupted
+   edge array produces a plausible **wrong triangle**, the single hardest symptom in this rung's
+   failure table to attribute. Now `tri_edges[128]` = 1024 B = the shipped `EDGE_CAP`.
+2. ⛔ **One buffer served as both the sentinel prefill and the readback.** That makes the
+   comparison read the GPU's *own output* as the expected value for any byte the GPU did not
+   write — the exact aliasing that turns a dead shader into a pass. `tri_ref` / `tri_gpu` /
+   `tri_poison` are now three separate buffers.
+
+**Calibrated, and the calibration corrected itself.** The first attempt mutated only the *staged*
+binary — but `burn-prep` compares staged against built with `cmp`, so the **stale** gate fired
+first and the controls gate was never reached. The controls gate is only reachable when
+staged **==** built and *both* lack them, i.e. when someone edits the source and rebuilds. Tested
+that way: **caught.** Also caught: staged binary missing entirely (`STAGING GAP`), and staged
+differing from built (`STALE STAGED TOOL`).
+
+**Exit-code contract**, splitting 9a's overloaded 96: **95** all exact + all controls fired ·
+**100** no GPU/carveout (QEMU) · **96** seam live, shader not resident · **92/91/89**
+fill-rule / shape / tgid-mapping · **88** UNTOUCHED · **87** wrote but covered nothing · **86** a
+control failed · **85** digest mismatch · **90** named `#92` fault · **84** bad arg.
+
 ### Added — bite **B7**: the kernel seam. `gpu_edge_cov` now dispatches, for real
 
 - **Arena slots**: `GPU_EDGE_SETUP_SUBOFF = 0x57000` (slot 7) alongside the `0x56000` reserved at

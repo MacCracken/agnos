@@ -78,6 +78,31 @@ include "refraster.cyr"
 var covA[4096];
 var covB[4096];
 
+# FNV-1a 32 — the same digest gputri computes. Kept byte-identical between the two tools on
+# purpose: a digest that differs by implementation cannot detect a reference that differs by
+# implementation.
+fn cr_digest(buf, n): i64 {
+    var h = 2166136261;
+    var i = 0;
+    while (i < n) {
+        h = (h ^ (load8(buf + i) & 0xFF)) & 0xFFFFFFFF;
+        h = (h * 16777619) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+fn phex8(v): i64 {
+    ps("0x");
+    var i = 7;
+    while (i >= 0) {
+        var nib = (v >> (i * 4)) & 0xF;
+        var ch = 48 + nib; if (nib > 9) { ch = 87 + nib; }
+        var c[2]; store8(&c, ch); print(&c, 1);
+        i = i - 1;
+    }
+    return 0;
+}
+
 # ============================================================================================
 # ORACLE (ii) — SHARED-EDGE WATERTIGHTNESS. Does not depend on the reference being right.
 # ============================================================================================
@@ -178,6 +203,22 @@ fn main(): i64 {
         return 91;
     }
     puts("[refraster] shared reference selftest PASS (dims refuse, wide mask fits)");
+    puts("");
+
+    # ⭐ THE DIGEST GATE'S HOST HALF. `gputri --digest` prints these same values on iron; any
+    # difference means the --agnos build's reference is not this one, and every byte-comparison
+    # it makes is against the wrong answer. That is the ONLY check that catches both sides being
+    # wrong TOGETHER, which is a failure class `gpu.md:1019` names explicitly.
+    puts("[digest] reference digests -- diff against `run /bin/gputri --digest` on iron");
+    var di = 1;
+    while (di <= RR_NCASES) {
+        if (rr_case_load(di) == 1) {
+            cov_clear(&covA); raster(&covA);
+            ps("  digest "); pnum(di); ps(" "); phex8(cr_digest(&covA, W * H));
+            ps("  "); puts(rr_case_name(di));
+        }
+        di = di + 1;
+    }
     puts("");
 
     # ⭐ B1 — THE 20-CASE CORPUS, driven from refraster.cyr's single table.

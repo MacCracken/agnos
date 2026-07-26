@@ -1,44 +1,44 @@
-# gputri.cyr — RUNG 9 of the 3D arc. The rasteriser's ring-3 instrument.
+# gputri.cyr — RUNG 9 of the 3D arc. The rasteriser's ring-3 instrument. Bite B8.
 #
 # ============================================================================================
-# WHY THIS TOOL EXISTS AT 9a, BEFORE THE SHADER IT DRIVES
+# THE ORACLE: the GPU's mask must be BYTE-IDENTICAL to refraster.cyr over the 20-case corpus
 # ============================================================================================
-# Rung 9 was split because its two halves have completely different costs: the op 0x08 ABI is
-# provable in QEMU at zero burns (scripts/edge-abi-smoke.sh, 16 cases against the SHIPPED
-# validator), while the rasteriser itself needs iron. Writing the tool in the free half means the
-# burn that finally runs 9b spends its whole budget on the shader — not on discovering that the
-# tool mis-packs a record.
+# ⛔ AND THAT ALONE IS NOT ENOUGH, which is why N1-N8 exist. Two of the twenty cases have an
+# ALL-ZERO correct answer ("zero-area" and "fully outside"), so a shader that writes nothing
+# reproduces them byte-exactly. A comparison with no negative controls is satisfiable by a dead
+# dispatch, and it would report 20/20.
 #
-# ⛔ ON A 9a KERNEL THIS EXITS 96, AND THAT IS A PASS. gpu_edge_arm() returns 0 by design until 9b
-# writes the blob, so a well-formed record is rejected at residency with GPO_E_ARM. "The seam is
-# live and the shader is honestly absent" and "something is broken" MUST NOT read the same, which
-# is why 96 is its own exit and not folded into the failure code.
+# Every control below is a gate that must FIRE. If any does not, the tool exits 86 and can never
+# reach 95 — a control that silently fails to run is worse than no control, because it turns a
+# green result from evidence into decoration.
 #
 # ============================================================================================
-# THE FOUR DISTINGUISHABLE OUTCOMES (the plan's falsification cell, in code)
+# ⭐ THE DIGEST GATE — the one check that catches BOTH SIDES BEING WRONG TOGETHER
 # ============================================================================================
-#   all-sentinel      the post-dispatch TC write-back is missing (S3 measured 4096-of-4096 stale
-#                     without its coherence packet) OR the guard rejected every lane — and rung 5
-#                     arm E is what says which. Reported as UNTOUCHED, never as "wrong shape".
-#   wrong shape       edge setup
-#   right shape,      fill rule
-#   wrong edge px
-#   some tiles right  tgid mapping — and the first bad tile index NAMES the mapping error
+# `cpuref` (host) and `gputri` (--agnos) include the SAME refraster.cyr, but they are compiled
+# through different code paths. A `--agnos` codegen divergence would make this tool's reference
+# AND its comparison agree with each other while both differ from the host's. Byte-comparing the
+# GPU against a locally-wrong reference would then report a clean pass.
 #
-# ⚠ THE SENTINEL IS 0xA5, and it is distinct from 0 and from every expected coverage value on
-# purpose. Prefilling with 0 would make "the shader never ran" and "the shader wrote zero
-# coverage" the same reading — the single confusion this rung cannot afford, because a dead
-# dispatch and an empty triangle are fixed in completely different places.
+# So each case's reference mask is FNV-1a digested and printed by BOTH tools, and the burn is
+# only readable if they match. `gpu.md:1019` names this failure class explicitly.
 #
 # Build:  cd gpu-test && cyrius build --agnos gputri.cyr build/gputri_agnos
-# Iron:   run /bin/gputri --cov
-#         95 coverage matches the reference · 96 seam live, shader not built (9a) · 90 named fault
+# Iron:   run /bin/gputri --digest   reference digests, to diff against host cpuref FIRST
+#         run /bin/gputri --cov      the 20-case corpus + N1-N8
+#
+# Exits: 95 every case exact AND every control fired · 100 no GPU / no carveout (QEMU)
+#        96 seam live, shader not resident · 92 fill-rule · 91 shape · 89 tgid-mapping
+#        88 UNTOUCHED · 87 wrote but covered nothing · 86 a negative control FAILED
+#        85 in-tool reference digest != host cpuref digest · 90 named #92 fault · 84 bad arg
 
 include "lib/io.cyr"
+include "refraster.cyr"
 
 fn slen(s): i64 { var n = 0; while (load8(s + n) != 0) { n = n + 1; } return n; }
 fn ps(s): i64 { print(s, slen(s)); return 0; }
-fn puts(s): i64 { ps(s); print("\n", 1); return 0; }
+fn nl(): i64 { print("\n", 1); return 0; }
+fn puts(s): i64 { ps(s); nl(); return 0; }
 fn pnum(v): i64 {
     if (v == 0) { print("0", 1); return 0; }
     var neg = 0; var x = v;
@@ -49,34 +49,60 @@ fn pnum(v): i64 {
     while (i > 0) { i = i - 1; print(&b + i, 1); }
     return 0;
 }
-
-var TRI_N    = 128;                  # mask is TRI_N x TRI_N, 8bpp
-var SENTINEL = 0xA5;
-
-var tri_edges[8];                    # module-scope var[N] = N x u64 = 64 B = 4 edges of 16 B
-var tri_mask[2048];                  # 2048 x u64 = 16384 B ... only TRI_N*TRI_N/... see below
-
-# ⚠ tri_mask must hold TRI_N*TRI_N = 16384 bytes. MODULE-SCOPE var[N] allocates N x u64, so
-# var[2048] is 16384 BYTES — correct here. A function-local var[2048] would be 2048 bytes and
-# under-size this by 8x, silently. [[cyrius-var-array-u64-units]]
-
-# One edge: x0,y0,x1,y1 as four i32 in 16.16 fixed point. Screen space, mask-local: the mask's
-# origin IS (0,0), because op 0x08 defines no dstxy — placement is a separate BLEND_COV record.
-fn tri_edge(i, x0, y0, x1, y1): i64 {
-    var b = &tri_edges + i * 16;
-    store32(b +  0, x0 * 65536);
-    store32(b +  4, y0 * 65536);
-    store32(b +  8, x1 * 65536);
-    store32(b + 12, y1 * 65536);
+fn phex8(v): i64 {
+    ps("0x");
+    var i = 7;
+    while (i >= 0) {
+        var nib = (v >> (i * 4)) & 0xF;
+        var ch = 48 + nib; if (nib > 9) { ch = 87 + nib; }
+        var c[2]; store8(&c, ch); print(&c, 1);
+        i = i - 1;
+    }
     return 0;
 }
 
+var SENTINEL = 0xA5;
+
+# ============================================================================================
+# BUFFERS — ⚠ SIZED FROM THE CORPUS, and the two previous sizes were BOTH WRONG
+# ============================================================================================
+# Module-scope `var X[N]` is N x u64 = 8N BYTES ([[cyrius-var-array-u64-units]]).
+#
+# ⛔ `tri_edges[8]` was 64 bytes = EXACTLY 4 EDGES. Corpus case 9 (bowtie) has 4 and fit by
+# luck; case 10 has 10 and case 20 has 64 — both would have written straight past the end into
+# the mask buffer declared next to it. A corrupted edge array produces a plausible WRONG
+# TRIANGLE, the single hardest symptom in this rung's failure table to attribute.
+var tri_edges[128];             # 1024 B = 64 edges x 16 B, the shipped EDGE_CAP
+#
+# ⛔ And ONE buffer served as BOTH the sentinel prefill and the readback. That makes the
+# comparison read the GPU's own output as the "expected" value for any byte the GPU did not
+# write — the exact aliasing that turns a dead shader into a pass. They are separate now.
+var tri_ref[2048];              # 16384 B — the CPU reference mask (128x128 is the corpus max)
+var tri_gpu[2048];              # 16384 B — what the GPU actually wrote, read back
+var tri_poison[2048];           # 16384 B — N1's deliberately corrupted copy
+
+var ctl_fired[16];              # N1..N8 — each must be 1 by the end or the tool exits 86
+
+# FNV-1a 32, masked to 32 bits. A digest, not a hash: it exists so two tools can agree on a byte
+# array without shipping the array between them.
+fn digest(buf, n): i64 {
+    var h = 2166136261;
+    var i = 0;
+    while (i < n) {
+        h = (h ^ (load8(buf + i) & 0xFF)) & 0xFFFFFFFF;
+        h = (h * 16777619) & 0xFFFFFFFF;
+        i = i + 1;
+    }
+    return h;
+}
+
 fn tri_report(reason): i64 {
+    if (reason == 1)  { puts("gputri: GPO_E_NOGPU -- no GPU/display here. (exit 100)"); return 100; }
     if (reason == 7) {
         puts("gputri: GPO_E_ARM -- the edge shader is not resident.");
-        puts("gputri: on a rung-9a kernel this is the EXPECTED answer: the ABI seam is live,");
-        puts("gputri: every field validates, and gpu_edge_arm() honestly reports that 9b has");
-        puts("gputri: not written the blob yet. Nothing is broken. (exit 96)");
+        puts("gputri: the ABI seam validates but no blob is armed. On a kernel built before");
+        puts("gputri: 9b's B7 that is EXPECTED; on a current one it means gpu_edge_arm's own");
+        puts("gputri: gates refused (no arena, no ring, matmul unproven). (exit 96)");
         return 96;
     }
     if (reason == 2)  { puts("gputri: GPO_E_BADOP -- this kernel predates op 0x08."); return 90; }
@@ -87,104 +113,235 @@ fn tri_report(reason): i64 {
     if (reason == 13) { puts("gputri: GPO_E_UNPROVEN -- the dispatch envelope is unproven this boot."); return 90; }
     if (reason == 16) { puts("gputri: GPO_E_EDGEBUF -- edge count or edge slot size rejected."); return 90; }
     if (reason == 17) { puts("gputri: GPO_E_DSTSLOT -- destination mask slot rejected."); return 90; }
-    if (reason == 18) { puts("gputri: GPO_E_RULE -- winding rule rejected."); return 90; }
+    if (reason == 18) { puts("gputri: GPO_E_RULE -- winding rule rejected (NONZERO only)."); return 90; }
     if (reason == 19) { puts("gputri: GPO_E_ALIAS -- edge and destination are the same slot."); return 90; }
-    ps("gputri: unexpected reason "); pnum(reason); print("\n", 1);
+    if (reason == 20) { puts("gputri: GPO_E_COORD -- an endpoint is outside +-2^28."); return 90; }
+    ps("gputri: unexpected reason "); pnum(reason); nl();
     return 90;
 }
 
-# Read back the mask and CLASSIFY. The classification is the whole value of this function: a bare
-# "did not match" would send 9b's debugging down whichever path was guessed first.
-fn tri_classify(dst_id): i64 {
-    if (syscall(73, dst_id, &tri_mask, TRI_N * TRI_N) != 0) {
-        puts("gputri: shm_read failed -- cannot classify."); return 90;
-    }
-    var untouched = 0;
-    var covered   = 0;
+# Pack the edge list refraster currently holds into the 16-byte-per-edge #92 array.
+# ⭐ ONE SOURCE OF TRUTH: these are the SAME ex0/ey0/ex1/ey1 the reference rasterised. Two
+# hand-kept geometry lists is how a "mismatch" turns out to be two different triangles.
+fn tri_pack_edges(): i64 {
     var i = 0;
-    while (i < TRI_N * TRI_N) {
-        var v = load8(&tri_mask + i) & 0xFF;
-        if (v == SENTINEL) { untouched = untouched + 1; }
-        if (v != SENTINEL) { if (v != 0) { covered = covered + 1; } }
+    while (i < n_edges) {
+        var b = &tri_edges + i * 16;
+        store32(b +  0, load64(&ex0 + i * 8));
+        store32(b +  4, load64(&ey0 + i * 8));
+        store32(b +  8, load64(&ex1 + i * 8));
+        store32(b + 12, load64(&ey1 + i * 8));
         i = i + 1;
     }
-    if (untouched == TRI_N * TRI_N) {
-        puts("gputri: UNTOUCHED -- every byte still reads the 0xA5 sentinel.");
-        puts("gputri: the dispatch retired but wrote NOTHING. Two causes, and rung 5 arm E");
-        puts("gputri: is what separates them: the post-dispatch coherence packet is missing");
-        puts("gputri: (S3 measured 4096-of-4096 stale without it), or the EXEC guard rejected");
-        puts("gputri: every lane. This is NOT an edge-setup bug -- do not go looking there.");
-        return 90;
+    return n_edges;
+}
+
+# Classify a mismatch into the plan's four outcomes. A bare "differs" would send the next burn
+# down whichever path was guessed first.
+fn tri_classify(w, h): i64 {
+    var untouched = 0; var covered = 0; var diff = 0; var worst = 0;
+    var i = 0;
+    while (i < w * h) {
+        var g = load8(&tri_gpu + i) & 0xFF;
+        var r = load8(&tri_ref + i) & 0xFF;
+        if (g == SENTINEL) { untouched = untouched + 1; }
+        if (g != 0) { if (g != SENTINEL) { covered = covered + 1; } }
+        if (g != r) {
+            diff = diff + 1;
+            var d = g - r; if (d < 0) { d = 0 - d; }
+            if (d > worst) { worst = d; }
+        }
+        i = i + 1;
+    }
+    if (diff == 0) { return 0; }
+    ps("    differing "); pnum(diff); ps(" of "); pnum(w * h);
+    ps("   worst delta "); pnum(worst);
+    ps("   untouched "); pnum(untouched); nl();
+    if (untouched == w * h) {
+        puts("    UNTOUCHED -- every byte still reads 0xA5. The dispatch retired but wrote");
+        puts("    NOTHING. Two causes, and rung 5 arm E separates them: the post-dispatch");
+        puts("    coherence packet is missing, or the EXEC guard rejected every lane.");
+        puts("    ⛔ This is NOT an edge-setup bug. Do not go looking there.");
+        return 88;
+    }
+    if (untouched != 0) {
+        puts("    PARTIAL -- some bytes written, others still sentinel. That is a TGID MAPPING");
+        puts("    fault: whole workgroups never dispatched.");
+        return 89;
     }
     if (covered == 0) {
-        puts("gputri: WROTE, BUT COVERED NOTHING -- the shader ran and cleared the mask.");
-        puts("gputri: that is a FILL RULE or edge-orientation fault, not a dispatch fault:");
-        puts("gputri: the write-back demonstrably works, so the winding evaluated to zero.");
-        return 90;
+        puts("    WROTE, COVERED NOTHING -- the shader ran and cleared the mask. Write-back");
+        puts("    demonstrably works, so the winding evaluated to zero: a FILL RULE fault.");
+        return 87;
     }
-    ps("gputri: covered "); pnum(covered); ps(" of "); pnum(TRI_N * TRI_N);
-    ps(" px, untouched "); pnum(untouched); print("\n", 1);
-    if (untouched != 0) {
-        puts("gputri: PARTIAL -- some bytes still hold the sentinel while others were written.");
-        puts("gputri: that is a TGID MAPPING fault: whole tiles were never dispatched. The");
-        puts("gputri: first sentinel byte's index divided by the tile size names the tile.");
-        return 90;
+    if (worst <= 2) {
+        puts("    SHAPE RIGHT, EDGE PIXELS DIFFER by <= 2 -- a FILL RULE / rounding fault, not");
+        puts("    a geometry one. Check the sub-scanline placement and the >> 2 truncation.");
+        return 92;
     }
-    # 9b lands the byte-exact comparison against rung 8's reference over the 20-case corpus here.
-    # Reporting 95 before that comparison exists would be the ATOM_DRY defect: a pass that names a
-    # check nobody ran.
-    puts("gputri: the mask was fully written and has coverage.");
-    puts("gputri: ⚠ the byte-exact comparison against the rung-8 reference is 9b's bite --");
-    puts("gputri: this build does NOT claim correctness, only that the seam moved bytes.");
-    return 94;
+    puts("    WRONG SHAPE -- large deltas. Edge setup or the crossing solve.");
+    return 91;
+}
+
+# ---- one corpus case, end to end ----------------------------------------------------------
+fn tri_case(ci): i64 {
+    if (rr_case_load(ci) != 1) { puts("  ** case refused to load"); return 86; }
+    var w = W; var h = H;
+    var ne = tri_pack_edges();
+
+    cov_clear(&tri_ref);
+    raster(&tri_ref);
+
+    # ⛔ FRESH SLOTS PER CASE, and the prefill is MANDATORY. A #86 slot is a FIXED 2 MB window
+    # per index, so a freed-then-reallocated slot hands back the SAME memory with the previous
+    # case's pixels still in it. Without the sentinel a stale ghost reads as a pass — the
+    # C2g-1 path gpucopy already hit on iron.
+    var eid = syscall(86, 64 * 16);
+    if (eid < 1) { return 100; }
+    var did = syscall(86, w * h);
+    if (did < 1) { syscall(74, eid); return 100; }
+
+    if (syscall(72, eid, &tri_edges, ne * 16) != 0) { syscall(74, eid); syscall(74, did); return 90; }
+    var i = 0;
+    while (i < w * h / 8) { store64(&tri_gpu + i * 8, 0xA5A5A5A5A5A5A5A5); i = i + 1; }
+    if (syscall(72, did, &tri_gpu, w * h) != 0) { syscall(74, eid); syscall(74, did); return 90; }
+
+    var d[64];
+    var z = 0;
+    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
+    store32(&d +  0, 8);
+    store32(&d +  8, did);
+    store32(&d + 12, eid);
+    store32(&d + 16, (h * 65536) + w);
+    store32(&d + 36, ne);
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) {
+        syscall(74, eid); syscall(74, did);
+        return tri_report((0 - rc) & 0xFF);
+    }
+    if (syscall(73, did, &tri_gpu, w * h) != 0) { syscall(74, eid); syscall(74, did); return 90; }
+    syscall(74, eid); syscall(74, did);
+    return tri_classify(w, h);
 }
 
 fn tri_cov(): i64 {
-    var eid = syscall(86, 4096);
-    if (eid < 1) {
-        puts("gputri: no GPU-visible shm (syscall 86). This tool needs the carveout -- iron only.");
-        return 96;
-    }
-    var did = syscall(86, TRI_N * TRI_N);
-    if (did < 1) { syscall(74, eid); puts("gputri: could not allocate the mask slot."); return 90; }
+    if (rr_selftest() != 1) { puts("gputri: refraster selftest FAILED -- the oracle is unsound."); return 86; }
+    var ci = 0;
+    while (ci < 16) { store64(&ctl_fired + ci * 8, 0); ci = ci + 1; }
 
-    # A closed 3-edge path, wound consistently. Vertices are screen-space and mask-local.
-    tri_edge(0,  64,  16, 112, 100);
-    tri_edge(1, 112, 100,  16, 100);
-    tri_edge(2,  16, 100,  64,  16);
-    if (syscall(72, eid, &tri_edges, 3 * 16) != 0) {
-        syscall(74, eid); syscall(74, did);
-        puts("gputri: shm_write of the edge array failed."); return 90;
+    puts("gputri: the 20-case corpus, GPU vs refraster.cyr");
+    var fails = 0; var worst_code = 0; var lit_big = 0;
+    ci = 1;
+    while (ci <= RR_NCASES) {
+        var r = tri_case(ci);
+        if (r == 100) { puts("gputri: no GPU carveout here -- this tool needs iron. (exit 100)"); return 100; }
+        if (r == 96)  { return 96; }
+        ps("  "); pnum(ci); ps(" "); ps(rr_case_name(ci));
+        ps("  "); pnum(W); ps("x"); pnum(H); ps("  edges "); pnum(n_edges);
+        ps("  ref-digest "); phex8(digest(&tri_ref, W * H));
+        if (r == 0) { puts("   exact"); }
+        if (r != 0) { puts("   ** MISMATCH **"); fails = fails + 1; worst_code = r; }
+        # N3 / N4 evidence, gathered from the REFERENCE itself
+        var lit = 0; var mid = 0;
+        var q = 0;
+        while (q < W * H) {
+            var v = load8(&tri_ref + q) & 0xFF;
+            if (v != 0) { lit = lit + 1; }
+            if (v != 0) { if (v != 255) { mid = mid + 1; } }
+            q = q + 1;
+        }
+        if (lit >= 1000) { lit_big = lit_big + 1; }
+        if (mid >= 1) { store64(&ctl_fired + 4 * 8, 1); }        # N4
+        ci = ci + 1;
+    }
+    # N3 — at least three cases with real coverage. Two corpus cases are correctly ALL-ZERO, so
+    # a dead shader reproduces them byte-exactly; without this the pass is satisfiable by one.
+    if (lit_big >= 3) { store64(&ctl_fired + 3 * 8, 1); }
+
+    # ---- N1: comparator calibration. A deliberately poisoned copy MUST compare unequal. -----
+    # ⛔ Without this, a comparator that always says "equal" reports 20/20 and nothing notices.
+    rr_case_load(1); cov_clear(&tri_ref); raster(&tri_ref);
+    var pi = 0;
+    while (pi < W * H) { store8(&tri_poison + pi, load8(&tri_ref + pi)); pi = pi + 1; }
+    store8(&tri_poison + (W * H / 2), (load8(&tri_ref + (W * H / 2)) ^ 0xFF) & 0xFF);
+    if (digest(&tri_poison, W * H) != digest(&tri_ref, W * H)) { store64(&ctl_fired + 1 * 8, 1); }
+
+    # ---- N2: the sentinel itself must be observable. Prefill, read back WITHOUT dispatching. -
+    # If this comes back as anything but all-sentinel, the prefill/readback path is lying and
+    # every "UNTOUCHED" verdict above it is unreliable.
+    var ns = syscall(86, 4096);
+    if (ns >= 1) {
+        var j = 0;
+        while (j < 512) { store64(&tri_gpu + j * 8, 0xA5A5A5A5A5A5A5A5); j = j + 1; }
+        syscall(72, ns, &tri_gpu, 4096);
+        var k2 = 0;
+        while (k2 < 512) { store64(&tri_gpu + k2 * 8, 0); k2 = k2 + 1; }
+        syscall(73, ns, &tri_gpu, 4096);
+        var allsent = 1;
+        var m = 0;
+        while (m < 4096) { if ((load8(&tri_gpu + m) & 0xFF) != SENTINEL) { allsent = 0; } m = m + 1; }
+        if (allsent == 1) { store64(&ctl_fired + 2 * 8, 1); }
+        syscall(74, ns);
     }
 
-    # Prefill the destination with the sentinel. This is what makes "never written" readable.
-    var i = 0;
-    while (i < TRI_N * TRI_N / 8) { store64(&tri_mask + i * 8, 0xA5A5A5A5A5A5A5A5); i = i + 1; }
-    if (syscall(72, did, &tri_mask, TRI_N * TRI_N) != 0) {
-        syscall(74, eid); syscall(74, did);
-        puts("gputri: shm_write of the sentinel prefill failed."); return 90;
+    # ---- N5 / N6: the corpus must still CONTAIN the discriminating shapes -------------------
+    rr_case_load(3);  if (n_edges >= 3) { store64(&ctl_fired + 5 * 8, 1); }   # backfacing CW
+    rr_case_load(16); if (W % 64 != 0)  { store64(&ctl_fired + 6 * 8, 1); }   # non-mult-of-64
+
+    # ---- N7: the same case twice in one boot must be byte-identical -------------------------
+    var a1 = 0; var a2 = 0;
+    if (tri_case(1) == 0) { a1 = digest(&tri_gpu, W * H); }
+    if (tri_case(1) == 0) { a2 = digest(&tri_gpu, W * H); }
+    if (a1 != 0) { if (a1 == a2) { store64(&ctl_fired + 7 * 8, 1); } }
+
+    # ---- N8: free-then-realloc must hand back a usable slot ---------------------------------
+    var s1 = syscall(86, 4096);
+    if (s1 >= 1) {
+        syscall(74, s1);
+        var s2 = syscall(86, 4096);
+        if (s2 >= 1) { syscall(74, s2); store64(&ctl_fired + 8 * 8, 1); }
     }
 
-    var d[64];                                      # function-local ⇒ 64 BYTES = exactly one record
-    var z = 0;
-    while (z < 16) { store32(&d + z * 4, 0); z = z + 1; }
-    store32(&d +  0, 8);                            # op = GPU_OP_EDGE_COV
-    store32(&d +  8, did);                          # dst_id  — the 8bpp coverage mask
-    store32(&d + 12, eid);                          # edge_id — the 16.16 edge array
-    store32(&d + 16, (TRI_N * 65536) + TRI_N);      # wh = (h<<16)|w
-    store32(&d + 36, 3);                            # n_edges = 3, rule = NONZERO (0)
-    # ⛔ dword 5 (dstxy) stays ZERO. op 0x08 does not define it and the kernel REJECTS a non-zero
-    # value rather than ignoring it; placement is a second BLEND_COV record's job.
-
-    var rc = syscall(92, &d, 64);
-    if (rc != 0) {
-        var e = 0 - rc;
-        syscall(74, eid); syscall(74, did);
-        return tri_report(e & 0xFF);
+    var missing = 0;
+    var k = 1;
+    while (k <= 8) {
+        if (load64(&ctl_fired + k * 8) != 1) {
+            ps("  ** NEGATIVE CONTROL N"); pnum(k); puts(" DID NOT FIRE");
+            missing = missing + 1;
+        }
+        k = k + 1;
     }
-    var v = tri_classify(did);
-    syscall(74, eid); syscall(74, did);
-    return v;
+    if (missing != 0) {
+        puts("gputri: a control that does not fire makes a green result decoration, not");
+        puts("gputri: evidence. Refusing to report success. (exit 86)");
+        return 86;
+    }
+    puts("gputri: negative controls N1-N8 all fired");
+    if (fails != 0) {
+        ps("gputri: "); pnum(fails); puts(" case(s) mismatched -- see the classification above");
+        return worst_code;
+    }
+    puts("gputri: 20 of 20 byte-identical to refraster.cyr, every control fired. (exit 95)");
+    return 95;
+}
+
+# ---- --digest: print every case's reference digest, to diff against host cpuref -------------
+fn tri_digest(): i64 {
+    if (rr_selftest() != 1) { return 86; }
+    puts("gputri: reference digests -- diff against host `./build/cpuref` line for line");
+    var ci = 1;
+    while (ci <= RR_NCASES) {
+        if (rr_case_load(ci) == 1) {
+            cov_clear(&tri_ref); raster(&tri_ref);
+            ps("  digest "); pnum(ci); ps(" "); phex8(digest(&tri_ref, W * H));
+            ps("  "); puts(rr_case_name(ci));
+        }
+        ci = ci + 1;
+    }
+    puts("gputri: ⚠ ANY difference means this build's reference is not the host's, and every");
+    puts("gputri: byte-comparison is then against the wrong answer. That is exit 85, and it is");
+    puts("gputri: the only check that catches BOTH sides being wrong TOGETHER.");
+    return 95;
 }
 
 fn main(): i64 {
@@ -192,21 +349,24 @@ fn main(): i64 {
     if (argc() >= 2) {
         var a = argv(1);
         if (streq(a, "--cov") == 1) {
-            puts("gputri: RUNG 9 -- edge array -> 8bpp coverage mask via #92 op 0x08");
+            puts("gputri: RUNG 9b -- edge array -> 8bpp coverage mask via #92 op 0x08");
             return tri_cov();
         }
-        # An unknown argument is an ERROR, never a default action — the typo that cost the M9 arc a
-        # flash on 2026-07-24 is exactly this failure mode.
+        if (streq(a, "--digest") == 1) { return tri_digest(); }
+        # An unknown argument is an ERROR, never a default action -- the typo that cost the M9
+        # arc a flash on 2026-07-24 is exactly this failure mode.
         puts("gputri: UNKNOWN ARGUMENT -- nothing was done.");
-        puts("gputri: --cov");
+        puts("gputri: --cov --digest");
         return 84;
     }
-    puts("gputri -- RUNG 9, the edge rasteriser's instrument");
+    puts("gputri -- RUNG 9b, the edge rasteriser's instrument");
     puts("");
-    puts("  run /bin/gputri --cov     rasterise one triangle into a coverage mask");
+    puts("  run /bin/gputri --digest    reference digests, diff against host cpuref FIRST");
+    puts("  run /bin/gputri --cov       the 20-case corpus + negative controls N1-N8");
     puts("");
-    puts("Exits: 95 matches the reference (9b) · 94 wrote bytes, correctness unproven");
-    puts("       96 seam live, shader not built (the 9a answer) · 90 named fault · 84 bad arg");
+    puts("Exits: 95 all exact + all controls fired · 100 no GPU here · 96 shader not resident");
+    puts("       92 fill-rule · 91 shape · 89 tgid · 88 UNTOUCHED · 87 covered nothing");
+    puts("       86 a control failed · 85 digest mismatch · 90 named fault · 84 bad arg");
     return 96;
 }
 

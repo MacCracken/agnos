@@ -590,11 +590,12 @@ esac
 # through to the caps probe, which returns 95 on a lit panel — indistinguishable from success.
 # The operator ran the experiment twice, heard silence twice, and none of it was data.
 # burn-prep verified the KERNEL artifact and never looked at the tools it would be flashed with.
-for _t in modeset gpuwedge klug; do
+for _t in modeset gpuwedge gputri klug; do
     _src=""
     case "$_t" in
         modeset)  _src="gpu-test/build/modeset_agnos" ;;
         gpuwedge) _src="gpu-test/build/gpuwedge_agnos" ;;
+        gputri)   _src="gpu-test/build/gputri_agnos" ;;
         klug)    _src="" ;;   # klug is staged from its own repo; size-compare only
     esac
     _staged="build/rootfs/bin/$_t"
@@ -614,7 +615,7 @@ for _t in modeset gpuwedge klug; do
         fi
     fi
 done
-echo "  staged tools match their builds (modeset, gpuwedge, klug)"
+echo "  staged tools match their builds (modeset, gpuwedge, gputri, klug)"
 case "$BUILD_TAG" in
     *GPU_RECOVER*)
         # ⛔ The staged tool must be able to invoke the arms, or the burn's own oracle is
@@ -628,6 +629,26 @@ case "$BUILD_TAG" in
         echo "  staged /bin/gpuwedge carries all five arms"
         ;;
 esac
+# ⛔ RUNG 9b: the oracle must be INVOKABLE from the staged binary, not merely present. Same gate
+# as GPU_RECOVER above and for the same reason -- on 2026-07-24 a burn shipped a correct kernel
+# with a tool six hours old that lacked the arm under test; both arms fell through to a probe
+# that returns 95, and two runs of the experiment produced no data at all.
+for _m in "--cov" "--digest"; do
+    if ! grep -qa -- "$_m" build/rootfs/bin/gputri 2>/dev/null; then
+        echo "burn-prep: STAGED /bin/gputri LACKS '$_m' -- rung 9b's oracle cannot be invoked."
+        echo "  Fix:  sh scripts/stage-tools.sh"
+        exit 1
+    fi
+done
+# ⭐ And it must carry the NEGATIVE CONTROLS. A gputri without N1-N8 can still print "20 of 20",
+# and TWO of the twenty corpus cases have an ALL-ZERO correct answer -- so a shader that writes
+# nothing reproduces them byte-exactly. Staging a control-less build makes the burn unfalsifiable.
+if ! grep -qa -- "NEGATIVE CONTROL N" build/rootfs/bin/gputri 2>/dev/null; then
+    echo "burn-prep: STAGED /bin/gputri has NO negative controls -- its 20/20 would be"
+    echo "  satisfiable by a shader that writes nothing. Rebuild and re-stage."
+    exit 1
+fi
+echo "  staged /bin/gputri carries --cov, --digest and the N1-N8 controls"
 case "$BUILD_TAG" in
     *MODESET_AUDIO*)
         # The flags the operator is told to type MUST exist in the binary that gets flashed.

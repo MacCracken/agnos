@@ -136,6 +136,15 @@ stage_one agnos/gpu-test modeset.cyr  modeset  || rc=1
 # without an explicit argument.
 stage_one agnos/gpu-test gpuwedge.cyr gpuwedge || rc=1
 
+# gputri — 3D arc rung 9b: the edge rasteriser's oracle. `run /bin/gputri --cov` rasterises the
+# 20-case corpus on the GPU and byte-diffs every mask against refraster.cyr, with negative
+# controls N1-N8 that must all fire before it will report success.
+# ⛔ IT WAS IN NEITHER THIS FILE NOR burn-prep UNTIL 9b B8, so a burn would have flashed a fresh
+# kernel next to an absent or hand-copied binary. `run /bin/gputri --digest` FIRST: if its
+# reference digests differ from the host `cpuref`'s, the tool is comparing against the wrong
+# answer and nothing else it prints means anything.
+stage_one agnos/gpu-test gputri.cyr gputri || rc=1
+
 # rupantara gpulayer — the ML-layer-on-GPU crown proof (1.54.x C6). A real bias-free MLP up-projection matmul
 # (rosnet linear_fwd 8x8x32) run on the gfx90c shader cores via #83, tiled 8x8 and byte-compared against
 # rupantara's CPU linear_fwd. Exit 95 = byte-identical AND all 4 tiles on the GPU (crown); 96 = identical but
