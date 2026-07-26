@@ -1881,6 +1881,28 @@ fn gpo_execute(rec) {
     # every well-formed record with GPO_E_ARM before pass 2 ever runs. The branch is written here anyway
     # so 9b is a one-function change with no ABI edit — and so this file never contains a supported op
     # with no execution path, which is how GPO_E_BADOP would surface as a mystery at the wrong layer.
+    # Attribute interpolation. Coverage runs first through the UNMODIFIED edge rasteriser, then the
+    # interpolation pass over the mask it produced -- see gpu_tri_rgba.
+    # ⚠ With DERIVE the frame's three edges are synthesised kernel-side, so there is no edge slot to
+    # resolve; the validator has already refused a record that supplies one alongside the flag.
+    if (op == GPU_OP_TRI_RGBA) {
+        var tflags = load32(rec + 4) & 0xFFFFFFFF;
+        var tedge = 0;
+        if ((tflags & GPU_TRI_FLAG_DERIVE) == 0) {
+            tedge = load64(&shm_mc + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
+        }
+        var tnr = load32(rec + 60) & 0xFFFFFFFF;
+        var tne = tnr & 0xFFFF;
+        var trule = (tnr >> 16) & 0xFFFF;
+        if (gpu_tri_rgba(tedge, w, h, dx, dy, tne, trule,
+                         gpo_i32(rec + 24), gpo_i32(rec + 28),
+                         gpo_i32(rec + 32), gpo_i32(rec + 36),
+                         gpo_i32(rec + 40), gpo_i32(rec + 44),
+                         load32(rec + 48) & 0xFFFFFFFF,
+                         load32(rec + 52) & 0xFFFFFFFF,
+                         load32(rec + 56) & 0xFFFFFFFF) != 1) { return GPO_E_DISPATCH; }
+        return 0;
+    }
     if (op == GPU_OP_EDGE_COV) {
         var se = load64(&shm_mc + ((load32(rec + 12) & 0xFFFFFFFF) - 1) * 8);
         var sd = load64(&shm_mc + ((load32(rec + 8)  & 0xFFFFFFFF) - 1) * 8);

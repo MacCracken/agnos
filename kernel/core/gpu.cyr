@@ -3722,6 +3722,78 @@ fn gpu_tri_prep_dump(rec_phys) {
     return 0;
 }
 
+
+
+# gpu_tri_dispatch — issue the interpolation pass through the SHIPPED dispatcher, unmodified.
+#
+# ⭐ NO NEW DISPATCH PATH. gpu_blend_cov_run's eight USER_DATA dwords land on exactly the SGPRs
+# tri_rgba expects, so the shipped envelope carries this kernel with no PM4 edit. That is the
+# concrete payoff of RSRC2 being byte-identical (0x190) — it was harvested from the assembled
+# descriptor rather than hoped for.
+#
+# ⚠ THE PARAMETER NAMES LIE, AND THE MAPPING IS WRITTEN OUT SO NOBODY HAS TO INFER IT:
+#     gpu_blend_cov_run arg     SGPR      tri_rgba reads it as
+#     mask_mc                   s[0:1]    the TRI-PREP record pointer
+#     dst_mc                    s[2:3]    the back-buffer base
+#     mask_pitch                s4        the destination pitch in BYTES
+#     dst_pitch                 s5        unused
+#     width                     s6        w
+#     color                     s7        h
+# Renaming the shared function's parameters to suit one caller would be worse: they are correct for
+# the coverage kernel that has shipped for releases, and this comment costs nothing.
+fn gpu_tri_dispatch(rec_phys, w, h, dx, dy) {
+    var rec_mc    = gpu_arena_mc + GPU_TRI_PREP_SUBOFF;
+    var shader_mc = gpu_arena_mc + GPU_TRI_SHADER_SUBOFF;
+    var done_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
+    var done_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
+
+    # ⚠ THE BACK BUFFER IS WHICHEVER OF THE PAIR IS NOT ON SCREEN. gpu_cov_surface picks it the
+    # same way; writing to gpu_bb_a_mc unconditionally would draw into the FRONT buffer half the
+    # time and produce a tear that looks like a raster bug.
+    if (gpu_blit_arm() != 1) { return 0; }
+    var bb_mc = gpu_bb_a_mc;
+    if (gpu_bb_back != 0) { bb_mc = gpu_bb_b_mc; }
+    var pitch = gpu_bb_pitch;
+    if (pitch == 0) { return 0; }
+    var dst_mc = bb_mc + dy * pitch + dx * 4;
+
+    # One workgroup of 64 lanes per 64 pixels of width, one row per workgroup in y.
+    var gx = (w + 63) / 64;
+    var gy = h;
+
+    return gpu_blend_cov_run(shader_mc, rec_mc, dst_mc, pitch, 0, w, h,
+                             GPU_COMPUTE_PGM_RSRC1_TRI, gx, gy, done_mc, done_phys);
+}
+
+# gpu_tri_rgba — the attribute-interpolation worker. Coverage first (the shipped edge rasteriser,
+# UNCHANGED), then the interpolation pass over the mask it produced.
+#
+# ⛔ edge_setup.s AND edge_cov.s ARE DISPATCHED AS THE SHIPPED, IRON-PROVEN BINARIES. Not a variant,
+# not a recompile — the same blobs, through the same dispatcher, because their RSRC2 (0x190) is
+# byte-identical to this kernel's. That is what makes rung 11 additive to a proven rasteriser rather
+# than a change to it.
+#
+# ⚠ Caller owns all bounds checking; gpo_validate_tri has already refused anything out of range.
+# Returns 1 / 0.
+fn gpu_tri_rgba(edge_mc, w, h, dx, dy, n_edges, rule,
+                vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) {
+    if (gpu_tri_arm() != 1) { return 0; }
+    if (gpu_cov_arm() != 1) { return 0; }
+
+    var cov_phys = gpu_arena_phys + GPU_TRI_COV_SUBOFF;
+    var cov_mc   = gpu_arena_mc   + GPU_TRI_COV_SUBOFF;
+    var rec_phys = gpu_arena_phys + GPU_TRI_PREP_SUBOFF;
+
+    # 1. coverage into the scratch mask, via the UNMODIFIED edge rasteriser
+    if (gpu_edge_cov(edge_mc, cov_mc, w, h, n_edges, rule) != 1) { return 0; }
+
+    # 2. the CPU prologue — one exact reciprocal, hoisted per record
+    if (gpu_tri_prep(rec_phys, cov_mc, vx0, vy0, vx1, vy1, vx2, vy2, ca, cb, cc) != 1) { return 0; }
+
+    # 3. the interpolation pass
+    return gpu_tri_dispatch(rec_phys, w, h, dx, dy);
+}
+
 fn gpu_cov_arm() {
     if (gpu_cov_armed == 1) { return 1; }
     if (gpu_present == 0) { return 0; }
