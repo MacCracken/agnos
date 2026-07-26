@@ -862,7 +862,7 @@ fn gpu_readback_shm_sys(id, wh, srcxy) {
     # COHERENCE: the destination slot's CPU window is WC-mapped, and the CPU reads it via shm_read#73 AFTER
     # this CP-DMA writes it. Empirically (iron 2026-07-23, gpucopy) a slot the CPU has ALREADY read returns a
     # STALE cache-line ghost of its previous contents on the next read — the fresh GPU write never reaches the
-    # CPU. Same class as gpu.md C2g-1 ("dispatch into a fresh, never-CPU-touched slot"). Evict the stale/dirty
+    # CPU. Same class as gpu.md the first 64-thread dispatch ("dispatch into a fresh, never-CPU-touched slot"). Evict the stale/dirty
     # lines BEFORE the DMA (not after: a flush after would write a dirty line back OVER the GPU's fresh data).
     # A whole-cache wbinvd proved this on iron (gpucopy exit 95, burn 4); this is the SCOPED form — clflush
     # only the destination window [kva, kva+row*h), so a per-frame screen capture doesn't flush the world.
@@ -4031,7 +4031,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
     if (num == 80) { stack_canary_check(canary); return blk_close_sys(arg1); }                               # blk_close(h) -> 0
     # directory listing (#81) — ring-3 readdir over the ext2 root; fills 64-byte {name,type} records.
     if (num == 81) { stack_canary_check(canary); return ext2_readdir_sys(arg1, arg2, arg3); }                # readdir(path, buf, max) -> count
-    # GPU compute dispatch (#82) — C2h ring-3 seam: run the proven 8x8 integer matmul on the caller's
+    # GPU compute dispatch (#82) — the ring-3 dispatch seam (#82) ring-3 seam: run the proven 8x8 integer matmul on the caller's
     # A,B (64 i32 each) and write C=A*B to c_uva. The path mabda/tentib consume for GPU inference. -> 0 ok / <0 err.
     if (num == 82) { stack_canary_check(canary); return gpu_dispatch_sys(arg1, arg2, arg3); }                # gpu_dispatch(a, b, c)
     # GPU f64 compute dispatch (#83) — full-precision peer of #82: 64 f64 A,B -> C = A·B (rosnet-bit-correct
@@ -4489,7 +4489,7 @@ fn ksyscall(num, arg1, arg2, arg3) {
         return pr;
     }
     if (num == 85) {
-        # gpu_fill(color, y0, h) — P9: GPU-clear the blit back-buffer to a 32-bit xRGB8888 colour via a
+        # gpu_fill(color, y0, h) — the 2D-acceleration bite: GPU-clear the blit back-buffer to a 32-bit xRGB8888 colour via a
         # CP-DMA fill, then the compositor presents (#84). Ring 3 names only the colour and an optional
         # FULL-WIDTH BAND; the kernel targets the back buffer. Returns 0 ok, -1 on refusal.
         # ⚠ h == 0 => whole buffer (the original, shipped behaviour — callers predating the band are

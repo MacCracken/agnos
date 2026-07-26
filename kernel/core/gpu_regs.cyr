@@ -42,7 +42,7 @@ var GPU_BASE_GC_0     = 0x2000;   # graphics/compute core, segment 0
 var GPU_BASE_GC_1     = 0xA000;   # graphics/compute core, segment 1 (RLC + CP ucode-load iface)
 var GPU_BASE_NBIO_2   = 0xD20;    # NBIO/NBIF/RCC, segment 2 (STRAP0, MEMSIZE)
 # NBIO segments 1 + 3 (renoir_ip_offset.h NBIF0_BASE INST0 = {0x0, 0x14, 0xD20, 0x10400, ...}; SEG2=0xD20
-# above is agnos's proven anchor → whole array trusted). P9: route SDMA0's doorbell via the RSMU indirect port.
+# above is agnos's proven anchor → whole array trusted). the 2D-acceleration bite: route SDMA0's doorbell via the RSMU indirect port.
 var GPU_BASE_NBIO_1   = 0x14;     # NBIO segment 1 — BIF_BX_PF0_RSMU_INDEX/DATA (PCIE-PORT indirect)
 var GPU_R_NBIO_RSMU_INDEX = 0x0;  # BIF_BX_PF0_RSMU_INDEX (seg1) — target register byte-address
 var GPU_R_NBIO_RSMU_DATA  = 0x1;  # BIF_BX_PF0_RSMU_DATA  (seg1) — read/write the indexed register
@@ -84,8 +84,8 @@ var GPU_SMU_MSG_PME_RESTORE = 0xE; # VBIOSSMC_MSG_UpdatePmeRestore
 # amdgpu polls 10us x 200000 (2 s). We bound it far shorter: a wedged SMU must not be able to stall the boot
 # for two seconds over an audio nicety. 2000 x 10us = 20 ms, ample for a mailbox that answers in microseconds.
 var GPU_SMU_POLL_MAX  = 2000;
-var GPU_BASE_SDMA0_0  = 0x1260;   # SDMA engine 0, segment 0 (P9 2D-accel ring)
-# --- SDMA0 (System DMA engine 0) — P9 hardware-2D ring. IP-relative dword offsets (add to GPU_BASE_SDMA0_0).
+var GPU_BASE_SDMA0_0  = 0x1260;   # SDMA engine 0, segment 0 (the 2D-acceleration bite 2D-accel ring)
+# --- SDMA0 (System DMA engine 0) — the 2D-acceleration bite hardware-2D ring. IP-relative dword offsets (add to GPU_BASE_SDMA0_0).
 # ANCHORED: iron regdump (1.55.28) + torvalds sdma0_4_0_offset.h cross-checked — the dump's idle STATUS@0x25,
 # HALT@0x2A, RB_CNTL reset-default@0x80, and every ring pointer reading 0 at 0x81-0x8A pinned base 0x1260 to a
 # 1:1 mapping. ⚠ RPTR_ADDR + WPTR_POLL_ADDR put HI at the LOWER offset (HI before LO) — do NOT swap them.
@@ -104,7 +104,7 @@ var GPU_R_SDMA0_IB_CNTL        = 0x8A;  # IB_ENABLE b0
 var GPU_R_SDMA0_WPTR_POLL_CNTL = 0x87;  # ENABLE b0, F32_POLL_ENABLE b2 (dump default 0x401000 = poll OFF)
 var GPU_R_SDMA0_GFX_DOORBELL        = 0x92;  # ENABLE bit28 (0x10000000) — NO offset field in this reg
 var GPU_R_SDMA0_GFX_DOORBELL_OFFSET = 0xAB;  # OFFSET[27:2] = doorbell_index << 2
-# Start-sequence regs the P9.1 bring-up OMITTED (sdma_v4_0_start / ctx_switch_enable / gfx_resume). ANCHORED vs
+# Start-sequence regs the the SDMA ring bring-up bring-up OMITTED (sdma_v4_0_start / ctx_switch_enable / gfx_resume). ANCHORED vs
 # torvalds sdma0_4_0_offset.h + sh_mask.h (1.55.29). Without AUTO_CTXSW the microcode never schedules the queue
 # (HALT=0 + RB_ENABLE is NOT sufficient); MINOR_PTR_UPDATE latched at 1 holds every wptr update → rptr stuck at 0.
 var GPU_R_SDMA0_CNTL             = 0x1C;  # AUTO_CTXSW_ENABLE bit18 (0x40000) · UTC_L1_ENABLE bit1 (0x2)
@@ -850,7 +850,7 @@ var GPU_FW_TYPE_CP_PFP      = 2;           # CP PFP (prefetch parser, GFX ring) 
 var GPU_FW_TYPE_CP_CE       = 3;           # CP CE  (constant engine, GFX ring) — whole body
 var GPU_FW_TYPE_CP_MEC      = 4;           # CP MEC1 body (compute — the crown) — body-minus-JT
 var GPU_FW_TYPE_CP_MEC_ME1  = 5;           # CP MEC1 jump-table — JT slice
-var GPU_FW_TYPE_SDMA0       = 9;           # psp_gfx_fw_type SDMA0 (RLC_G=8, SDMA0=9) — P9 2D-accel ring
+var GPU_FW_TYPE_SDMA0       = 9;           # psp_gfx_fw_type SDMA0 (RLC_G=8, SDMA0=9) — the 2D-acceleration bite 2D-accel ring
 
 # C1b fix (iron 1.54.3: SETUP_TMR returned TEE_ERROR_BAD_PARAMETERS for a plain-RAM
 # TMR): the TMR must live in the GPU's VRAM/UMA carveout. Read the carveout from the
@@ -862,7 +862,7 @@ var GPU_R_MC_VM_FB_LOC_BASE = 0x980;   # [23:0]<<24 = carveout MC-aperture base 
 var GPU_R_MC_VM_FB_LOC_TOP  = 0x981;   # [23:0]<<24 = carveout MC-aperture top (inclusive, 16 MB granule)
 var GPU_FB_LOC_MASK         = 0xFFFFFF;
 
-# --- C2a: GMC/GFXHUB VM-state probe (GC seg0; the reuse-vs-build decision) ---
+# --- the GMC/VM state probe: GMC/GFXHUB VM-state probe (GC seg0; the reuse-vs-build decision) ---
 # GFXHUB VM registers, GC seg0 (0x2000), self-consistent with + adjacent to the proven
 # MC_VM_FB_* block. Verdict (derived + adversarially verified vs gfxhub_v1_0.c): NO reusable
 # GART exists pre-amdgpu — reuse the FB aperture (physical VRAM carveout), ZERO page tables,
@@ -879,13 +879,13 @@ var GPU_R_MC_VM_SYS_APERTURE_LOW  = 0x985;  # <<18 (256 KB granule; HIGH<LOW = c
 var GPU_R_MC_VM_SYS_APERTURE_HIGH = 0x986;  # <<18
 var GPU_R_VM_L2_PROT_FAULT_STATUS = 0x84B;  # nonzero = a VM protection fault already latched
 
-# --- C2b: GFXHUB GMC setup for FB-aperture compute (GC seg0) ---
+# --- the FB-aperture arena setup: GFXHUB GMC setup for FB-aperture compute (GC seg0) ---
 # Arm the GMC so a carveout compute arena is MEC-reachable via the FB aperture, ZERO page
 # tables (VM_CONTEXT0 stays disabled = the fault-storm design-out). All offsets confirmed
 # vs gc_9_0_offset.h; the fault-CNTL value 0x1FFC was fixed by the hang-risk verify (the
 # derivation's first mask was the wrong register's bit layout — would have left CRASH_ON_*
-# set and wedged the pipe on a C2d fault). L1-reprogram/MTYPE_UC + system-aperture default
-# page deferred (medium-confidence; coherence handled by PM4 cache ops at C2c/d).
+# set and wedged the pipe on a the first PM4 fetch fault). L1-reprogram/MTYPE_UC + system-aperture default
+# page deferred (medium-confidence; coherence handled by PM4 cache ops at the compute-queue HQD setup/d).
 var GPU_R_VM_L2_PROT_FAULT_CNTL   = 0x847;  # fault net: serve-default + no-int + no-crash + latch
 var GPU_R_VM_L2_PROT_FAULT_DEF_LO = 0x84E;  # out-of-window fault -> dummy page (phys>>12)
 var GPU_R_VM_L2_PROT_FAULT_DEF_HI = 0x84F;  # (phys>>44)
@@ -896,11 +896,11 @@ var GPU_VM_FAULT_CNTL_ARM    = 0x1FFC;      # bits[2:12] all *_ENABLE_DEFAULT; 0
 var GPU_VM_INVALIDATE_REQ_ALL = 0x7C0001;   # vmid0 flush: bit0 PER_VMID | L2_PTES(18) | L2_PDE0/1/2
 # (19-21) | L1_PTES(22). (Was 0xF80001 — off-by-one-shifted:
 # dropped L2_PTES + spuriously set CLEAR_FAULT_STATUS(23);
-# caught by the C2b adversarial re-verify vs gc_9_0_sh_mask.h.)
+# caught by the the FB-aperture arena setup adversarial re-verify vs gc_9_0_sh_mask.h.)
 var GPU_VM_ARENA_OFF     = 0x80000000;      # arena 2 GB into the 3 GB carveout (clears TMR @0x60000000)
 var GPU_VM_DUMMY_SUBOFF  = 0x15000;         # dummy fault-sink page offset within the arena  -> ends 0x16000
 
-# --- C2c: compute-queue MQD/HQD (GC seg0; gfx9 gc_9_0_offset.h, ALL base_idx 0) ---
+# --- the compute-queue HQD setup: compute-queue MQD/HQD (GC seg0; gfx9 gc_9_0_offset.h, ALL base_idx 0) ---
 # Offsets fetched from the full gc_9_0_offset.h + ANCHOR-VALIDATED against the iron-confirmed
 # CP_MEC_CNTL=0x8d / CP_ME_CNTL=0x1b6 (so this is genuinely gfx9, not gfx8 — the CP_HQD block
 # did NOT relocate from gfx8: 0x1245 is correct for both). Direct (non-HWS) HQD load: GRBM-
@@ -963,7 +963,7 @@ var GPU_HIGHEST_PUBLISHED_SLOT       = 0xD0000;    # the top of the slot map, au
 # REAL. That is why rung 6 must PROVE this region unclaimed before arm E is allowed to fire.
 var GPU_SACRIFICIAL_SUBOFF = 0x1F0000;          # -> ends 0x1F1000
 var GPU_SACRIFICIAL_SENTINEL         = 0x5AC91F1C;
-# C2c values
+# the compute-queue HQD setup values
 var GPU_GRBM_SEL_MEC1_P0_Q0    = 0x4;         # MEID=1<<2 (MEC1, pipe0, queue0, vmid0); 1-based MEID
 var GPU_CP_HQD_PQ_CONTROL_VAL  = 0xC000050D;  # QUEUE_SIZE 0xD (64 KB ring) | PRIV_STATE | KMD_QUEUE
 # Ring-buffer index wrap for the 64 KB PQ above: 65536 B / 4 = 16384 dwords, mask = 16384-1. gpu_ring_wptr
@@ -986,14 +986,14 @@ var GPU_VM_RPTR_SUBOFF = 0x11000;   # rptr-report page  -> ends 0x12000
 var GPU_VM_SENT_SUBOFF = 0x12000;   # 1 dword  -> ends 0x12004
 var GPU_VM_EOP_SUBOFF  = 0x13000;   # EOP buffer (4 KB, 4 KB-aligned)  -> ends 0x14000
 
-# --- C2d: first PM4 packet + doorbell (the VM-fetch gate) ---
+# --- the first PM4 fetch: first PM4 packet + doorbell (the VM-fetch gate) ---
 # CP_MEC_DOORBELL_RANGE gates which doorbell byte-offsets the MEC honors (GC seg0).
 var GPU_R_CP_MEC_DOORBELL_RANGE_LOWER = 0x105C;  # byte-offset window low  (0)
 var GPU_R_CP_MEC_DOORBELL_RANGE_UPPER = 0x105D;  # byte-offset window high (>=0x18)
 var GPU_PM4_NOP8_HDR             = 0xC0061000;   # PACKET3(NOP, count=6) — an 8-dword type-3 NOP
 var GPU_DOORBELL_RANGE_UPPER_VAL = 0xE8;         # amdgpu (USERQUEUE_END*2)<<2; brackets our 0x18
 
-# --- C2e: WRITE_DATA fence (MEC executes + CPU-visible write; the coherence proof) ---
+# --- the WRITE_DATA fence: WRITE_DATA fence (MEC executes + CPU-visible write; the coherence proof) ---
 # 5-dword PACKET3_WRITE_DATA writing one sentinel dword to the carveout sentinel slot.
 # Encoding confirmed verbatim vs amdgpu soc15d.h + the codebase NOP header (0xC0061000),
 # 4-agent derive + 2-lens adversarial verify, all refuted=False.
@@ -1006,7 +1006,7 @@ var GPU_CPDMA_DONE         = 0x0CDD0A7E; # CP-DMA done sentinel (distinct from C
 var GPU_CPDMA_CTL_COPY     = 0x80000000; # DMA_DATA CONTROL (copy): CP_SYNC=1 | SRC_SEL=0(MC) | DST_SEL=0(MC) | ENGINE=ME
 var GPU_CPDMA_CTL_FILL     = 0xC0000000; # DMA_DATA CONTROL (fill): CP_SYNC=1 | SRC_SEL=2(DATA, bits30:29) | DST_SEL=0(MC) | ENGINE=ME
 var GPU_CPDMA_MAX          = 0x03FFFFFF; # DMA_DATA BYTE_COUNT field = 26 bits (~64 MiB max per packet)
-# STAGED (row-2 coherence follow-up ONLY; do NOT wire into the first C2e burn — it would
+# STAGED (row-2 coherence follow-up ONLY; do NOT wire into the first the WRITE_DATA fence burn — it would
 # collapse the executed-vs-coherent disambiguation). Verify CP_COHER_CNTL vs local gc_9_0
 # sh_mask.h before that burn (a wrong bit makes ACQUIRE_MEM a silent no-op).
 var GPU_PM4_ACQUIRE_MEM_HDR = 0xC0055800; # PACKET3(ACQUIRE_MEM=0x58, count=5) -> 7-dword packet
@@ -1024,10 +1024,10 @@ var GPU_CP_COHER_CNTL_TCWB  = 0x00840000; # TC_WB_ACTION_ENA(1<<18) | TC_ACTION_
 # PRE-dispatch full invalidate (mabda/RADV-captured, HW-proven Cezanne): SH_ICACHE(1<<29) | SH_KCACHE(1<<27)
 # | TC(1<<23) | TCL1(1<<22) | TC_WB(1<<18). MANDATORY before DISPATCH on gfx9 — the shader is rewritten in
 # place at a FIXED VA (0x14000) every dispatch, so without an I-cache invalidate the SQ runs a STALE cached
-# shader (a previous dispatch's baked store-address). THE fix for the C2g-1 intermittent-launch bug (burns 1-8).
+# shader (a previous dispatch's baked store-address). THE fix for the the first 64-thread dispatch intermittent-launch bug (burns 1-8).
 var GPU_CP_COHER_CNTL_INV   = 0x28C40000;
 
-# --- C2f: first hand-assembled gfx90c compute shader (DISPATCH_DIRECT) ---
+# --- the first shader dispatch: first hand-assembled gfx90c compute shader (DISPATCH_DIRECT) ---
 # All raw ISA/PM4 bytes CONFIRMED by 2 independent adversarial re-derivations (incl. reconstructing
 # LLVM D40493's global_store_dwordx2=0xDC748000 to the bit). 12-agent derive, 0 encoding refuted.
 var GPU_SHADER_SUBOFF      = 0x14000;    # shader blob (256-aligned: COMPUTE_PGM_LO = mc>>8 is exact)  -> ends 0x14800
@@ -1057,7 +1057,7 @@ var GPU_SH_COMPUTE_PGM_LO          = 0x20C;
 var GPU_SH_COMPUTE_PGM_RSRC1       = 0x212;
 var GPU_SH_COMPUTE_RESOURCE_LIMITS = 0x215;
 var GPU_SH_COMPUTE_STATIC_SE0      = 0x216;
-# C2g-1 multi-thread ROOT FIX (burn 7): match mabda's HW-proven-on-Cezanne compute preamble.
+# the first 64-thread dispatch multi-thread ROOT FIX (burn 7): match mabda's HW-proven-on-Cezanne compute preamble.
 # FSD (0x00800000, burn 6) had ZERO effect — the width-dependent 8/48-alive pattern is NOT a
 # round-robin race. mabda (the AGNOS GPU foundation lib, native AMD gfx9/PM4, multi-thread LocalSize
 # 4/8/16/64 HW-verified on Cezanne — src/backend_native_pm4.cyr native_pm4_build_compute_generic)
@@ -1066,29 +1066,29 @@ var GPU_SH_COMPUTE_STATIC_SE0      = 0x216;
 # NON-EXISTENT shader engine (a strong candidate for the width-dependent wave-distribution failure).
 var GPU_COMPUTE_RESLIM        = 0x140;       # mabda RESOURCE_LIMITS (HW-proven Cezanne; was 0x00800000/0)
 var GPU_SH_COMPUTE_STATIC_SE2 = 0x219;       # STATIC_THREAD_MGMT_SE2 (SE3=0x21A); mabda writes SE2/SE3=0,0
-# C2g-1 zero-wave fix: persistent dispatch-walk SH state that tinygrad/radv clear EVERY dispatch
+# the first 64-thread dispatch zero-wave fix: persistent dispatch-walk SH state that tinygrad/radv clear EVERY dispatch
 # and our raw MQD path uniquely left stale. START = threadgroup origin the SPI evaluates against
 # NUM_THREAD; RESTART = dispatch-resume cursor. FORCE_START_AT_000 is NOT a guaranteed substitute.
 var GPU_SH_COMPUTE_START_X         = 0x204;   # + START_Y 0x205, START_Z 0x206 (write 0,0,0)
 var GPU_SH_COMPUTE_RESTART_X       = 0x21B;   # + RESTART_Y 0x21C, RESTART_Z 0x21D (write 0,0,0)
-# ACQUIRE_MEM body (whole-cache TC write-back; header + coher-cntl reuse the C2e-staged consts)
+# ACQUIRE_MEM body (whole-cache TC write-back; header + coher-cntl reuse the the WRITE_DATA fence-staged consts)
 var GPU_ACQUIRE_COHER_SIZE    = 0xFFFFFFFF;
 var GPU_ACQUIRE_COHER_SIZE_HI = 0x00FFFFFF;
 var GPU_ACQUIRE_POLL          = 0x0000000A;
 
-# --- C2g-1: first MULTI-THREAD dispatch (1 workgroup, 64 threads; out[tid]=tid) ---
+# --- the first 64-thread dispatch: first MULTI-THREAD dispatch (1 workgroup, 64 threads; out[tid]=tid) ---
 # All 11 shader dwords are iron-proven gfx90c ground-truth (committed hex is authoritative). Only ONE compute-reg differs
-# from C2f: NUM_THREAD_X 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 => 64 threads in ONE workgroup).
+# from the first shader dispatch: NUM_THREAD_X 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 => 64 threads in ONE workgroup).
 var GPU_SHADER_OUT2_SUBOFF = 0x16000;    # 64-dword (256 B) per-thread output array. FRESH slot past the  -> ends 0x16100
-# dummy page (0x15000..0x16000) that C2f NEVER touched — so no
-# stale-L2 ghost resurrects over the CPU pre-seed (C2g-1 burn 2:
-# reusing the C2f +0x14800 slot flushed C2f's cached 0xC2F0C2F0
+# dummy page (0x15000..0x16000) that the first shader dispatch NEVER touched — so no
+# stale-L2 ghost resurrects over the CPU pre-seed (the first 64-thread dispatch burn 2:
+# reusing the the first shader dispatch +0x14800 slot flushed the first shader dispatch's cached 0xC2F0C2F0
 # back over the pre-seed, masking whether the shader wrote).
 var GPU_MT_NUM_THREAD_X    = 64;         # workgroup size X (Y=Z=1); DIM stays 1x1x1 => 64 total threads
 var GPU_MT_N               = 64;         # verification element count (out[0..63])
 var GPU_MT_NOTYET          = 0xDEADBEEF;  # pre-seed marker: != any tid 0..63 (incl 0), != done
 
-# C2g-2 — compute KERNARGS: operand pointers passed via COMPUTE_USER_DATA (the last primitive before
+# the kernarg dispatch — compute KERNARGS: operand pointers passed via COMPUTE_USER_DATA (the last primitive before
 # matmul). RSRC2 USER_SGPR=4 preloads s0..s3 from USER_DATA_0..3 before shader entry (s[0:1]=input base,
 # s[2:3]=output base); the shader reads in[tid] via s[0:1] and writes out[tid] via s[2:3]. mabda-proven
 # ABI (backend_native_shaders.cyr): RSRC2=0x08, USER_DATA_0 at SH 0x240 (mabda 0xB900).
@@ -1098,7 +1098,7 @@ var GPU_PM4_SET_SH_REG_N4     = 0xC0047600;  # SET_SH_REG, 4 values (in_lo, in_h
 var GPU_KERNARG_IN_SUBOFF     = 0x18000;     # input buffer, 64 dwords (in[i]=i*7+1)  -> ends 0x18100
 var GPU_KERNARG_OUT_SUBOFF    = 0x18400;     # output buffer, 64 dwords (out[i] must == in[i])  -> ends 0x18500
 
-# C2g-3 — ALU + REDUCTION LOOP (matmul's inner loop): each of 64 lanes computes an integer dot product
+# the dot-product dispatch — ALU + REDUCTION LOOP (matmul's inner loop): each of 64 lanes computes an integer dot product
 # out[tid] = sum_{k=0..K-1} a[tid*K+k] * b[tid*K+k] via a real branch loop (s_cbranch) + v_mul_lo_u32 /
 # v_add_u32 accumulate. 3 kernargs (a,b,out) => USER_SGPR=6 (RSRC2=0x0C, USER_DATA_0..5). mabda-proven.
 var GPU_COMPUTE_RSRC2_KERNARG3 = 0x0000000C; # RSRC2 USER_SGPR=6 -> preload s0..s5 from USER_DATA_0..5
@@ -1260,7 +1260,7 @@ var GPU_GUARDRECT_SRC_SUBOFF = 0x70000;            # src for the guard rect (200
 # Ten 16 KB tiles (64x64x4) at a 0x4000 stride, past BR2_SRC's 0x79600. Each arm gets its OWN never-
 # written tile: the standing rule is that a coherence proof uses a FRESH slot pre-seeded with a sentinel
 # distinct from both 0 and every expected value, because re-using a slot let a stale GL2 line false-PASS a
-# burn at C2g-1. Sharing tiles between arms here would defeat the entire experiment.
+# burn at the first 64-thread dispatch. Sharing tiles between arms here would defeat the entire experiment.
 # Tiles 8/9 are arm D's POSITIVE CONTROL, added after the first S3 burn returned an unfalsifiable result.
 var GPU_COHERE_TILE_SUBOFF = 0x80000;            # 10 tiles, 0x80000 .. 0xA7FFF -> ends 0xA8000
 var GPU_COHERE_STRIDE      = 0x4000;             # 64 * 64 * 4 = 16 KB per tile
@@ -1283,9 +1283,9 @@ var GPU_DOT_A_SUBOFF          = 0x19000;     # input a[256] (a[i]=i+1)  -> ends 
 var GPU_DOT_B_SUBOFF          = 0x19400;     # input b[256] (b[i]=i+2)  -> ends 0x19800
 var GPU_DOT_OUT_SUBOFF        = 0x19800;     # output[64] (out[tid] = dot product)  -> ends 0x19900
 
-# C2g-4 — THE CROWN: real integer tiled matmul C[8x8] = A[8x8] * B[8x8]. Each of 64 lanes computes one
+# the integer matmul proof — THE CROWN: real integer tiled matmul C[8x8] = A[8x8] * B[8x8]. Each of 64 lanes computes one
 # output element C[i][j] = sum_{k=0..7} A[i*8+k] * B[k*8+j] (tid -> i=tid>>3, j=tid&7; A walks a row +4/step,
-# B walks a column +32/step = N*4). Bit-correct vs the CPU reference. Same kernarg ABI as C2g-3 (RSRC2=0x0C,
+# B walks a column +32/step = N*4). Bit-correct vs the CPU reference. Same kernarg ABI as the dot-product dispatch (RSRC2=0x0C,
 # 12 VGPRs, USER_DATA_0..5 = A,B,C). The matmul structure that attn11/tentib ML layers ride onto the GPU.
 var GPU_MM_DIM               = 8;           # 8x8 (M=N=K=8 => 64 output elements = 64 lanes)
 var GPU_MM_A_SUBOFF          = 0x1A000;     # A[64] (row-major, A[i]=i+1)  -> ends 0x1A100

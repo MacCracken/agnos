@@ -1,0 +1,317 @@
+# trimodel.cyr — THE CORRECTNESS GATE for barycentric attribute interpolation.
+#
+# ============================================================================================
+# WHY THIS FILE IS THE KEYSTONE
+# ============================================================================================
+# This is the shader's algorithm — the hoisted reciprocal, the 96-bit numerator, the funnel
+# shift, the estimate-and-correct quotient — written in Cyrius and byte-diffed against
+# triref.cyr, which divides exactly and is the oracle.
+#
+# ⭐ THE POINT IS ATTRIBUTION. If this is green and a hardware run comes back red, the fault is
+# in the EMISSION — encoding, register allocation, branch offsets, wave-vs-lane control flow —
+# and NOT in the algorithm, because the algorithm is already proven. Without that split, a red
+# run leaves both halves suspect and every subsequent flash is a coin toss. On the previous rung
+# this discipline produced 8 of 11 bites at zero flashes, and when a run did come back red the
+# model reproduced the failure exactly, on the one case out of twenty that failed.
+#
+# ⚠ WHAT IS AND IS NOT MODELLED AT REGISTER WIDTH, stated so nobody over-reads the coverage:
+#   * MODELLED at 32-bit: the divider (verbatim from the shipped edge kernel), the funnel, the
+#     numerator's 96-bit accumulate as explicit high/low halves, every u32 mask.
+#   * NOT modelled: the construction of E from its coefficients. |E| <= 2^52 fits i64, and the
+#     shader builds it from 32-bit pieces. That seam is covered by the byte-diff, not by width
+#     discipline here — if the shader's 2-dword build were wrong, the outputs would differ.
+# A model that quietly used i64 everywhere would prove the algorithm in a width the GPU does not
+# have, which is the most expensive false green available.
+
+include "lib/io.cyr"
+include "tricore.cyr"
+
+# ============================================================================================
+# THE 96-BIT NUMERATOR, as an explicit (high, low) pair
+# ============================================================================================
+# value = hi * 2^32 + lo, with lo in [0, 2^32) and hi signed. The shader holds three u32 dwords;
+# the pair form is the same number with the top two dwords kept together, which is exactly what
+# the funnel shift consumes.
+#
+# ⭐ WHY THE FUNNEL OUTPUT ALWAYS FITS 64 BITS, for every frame size. t = bitlen(255*2A) - 30, so
+# 2A is about 2^(t+22). The numerator is bounded by 3 * RATIO * 2A * 65025 <= 3 * 2^(t+48), so
+# N >> t <= 3 * 2^48 REGARDLESS OF t. Small frames make t small AND the numerator small by the
+# same factor. This is why the plan's worry about t's lower end does not threaten the funnel.
+var n_hi = 0;
+var n_lo = 0;
+
+fn n_zero(): i64 { n_hi = 0; n_lo = 0; return 0; }
+
+# Accumulate e * p, where e is signed with |e| <= 2^52 and p is in [0, 65025].
+fn n_madd(e, p): i64 {
+    # Split e exactly: e = e_hi * 2^32 + e_lo, e_lo unsigned. ⚠ `>>>` is ARITHMETIC in Cyrius and
+    # `>>` is LOGICAL — inverted from C. e is SIGNED here, so this must be `>>>`; a `>>` would
+    # zero-fill and turn every negative weight into a huge positive one.
+    var e_hi = e >>> 32;
+    var e_lo = u32(e);
+    var lo = e_lo * p;                  # <= 2^32 * 2^16 = 2^48, fits
+    var hi = e_hi * p + (lo >> 32);     # <= 2^20 * 2^16 + carry, fits
+    n_lo = n_lo + u32(lo);
+    n_hi = n_hi + hi + (n_lo >> 32);
+    n_lo = u32(n_lo);
+    return 0;
+}
+
+fn n_add_u(v): i64 {                    # add a non-negative v < 2^63
+    n_lo = n_lo + u32(v);
+    n_hi = n_hi + (v >> 32) + (n_lo >> 32);
+    n_lo = u32(n_lo);
+    return 0;
+}
+
+fn n_is_neg(): i64 { if (n_hi < 0) { return 1; } return 0; }
+
+# Funnel the 96-bit value right by t into a 64-bit result. t in [0, 31].
+fn n_shr(t): i64 {
+    if (t == 0) { return n_hi * 4294967296 + n_lo; }
+    return (n_hi << (32 - t)) + (n_lo >> t);
+}
+
+# ============================================================================================
+# THE DIVIDER — the shipped edge kernel's quotient path, verbatim
+# ============================================================================================
+# Estimate from the hoisted reciprocal, then ONE correction. Reused rather than re-derived: this
+# is the same routine that is already iron-proven in the coverage rasteriser.
+var tm_corr_fired = 0;
+var tm_corr_count = 0;
+
+fn tm_quot(p_lo, d, v, l): i64 {
+    var plo = u32(p_lo);
+    var phi = u32(p_lo >> 32);
+
+    var l32 = 32 - l;
+    var a0 = u32(plo << l);
+    var tw = 0;
+    if (l32 < 32) { tw = u32(plo >> l32); }
+    var a1 = u32(u32(phi << l) | tw);
+
+    var h0 = u32((a0 * v) >> 32);
+    var l1 = u32(a1 * v);
+    var h1 = u32((a1 * v) >> 32);
+    var sum = h0 + l1;
+    var m = u32(sum);
+    var carry = 0;
+    if (sum > 4294967295) { carry = 1; }
+    var hh = u32(h1 + carry);
+
+    var q = u32(u32(hh << 1) | (m >> 31));
+    return q;
+}
+
+# ============================================================================================
+# tm_px — the shader's answer for one pixel, at register widths
+# ============================================================================================
+var tm_kx_dead = 0;             # mutation: wire the x term to zero
+var tm_skip_corr = 0;           # mutation: skip the exact correction
+var tm_bias_trunc = 0;          # mutation: truncate the rounding bias by one
+var tm_e_clamp = 0;             # mutation: clamp E into [0, 2A] -- a REJECTED design, kept as a test
+
+fn tm_px(px, py, cov, dst): i64 {
+    if (cov == 0) { return dst; }
+
+    var pcx = (px << 16) + 32768;
+    var pcy = (py << 16) + 32768;
+
+    var kxb = tp_get(TP_KXB);
+    var kxc = tp_get(TP_KXC);
+    if (tm_kx_dead == 1) { kxb = 0; kxc = 0; }
+
+    var eb = kxb * pcx + tp_get(TP_KYB) * pcy + tp_get(TP_K0B);
+    var ec = kxc * pcx + tp_get(TP_KYC) * pcy + tp_get(TP_K0C);
+    var ea = tp_get(TP_A2) - eb - ec;
+
+    # ⛔ THE REJECTED E-CLAMP, kept as a live mutation. All three design judges recommended
+    # clamping each weight into [0, 2A] to guarantee a non-negative numerator. It is WRONG: it
+    # breaks the gradient reproduction at the far corner, because outside the frame the weights
+    # legitimately leave [0, 2A] and clamping them changes the interpolant rather than just its
+    # sign. Recording it as a mutation is what keeps that refutation honest — without it, the
+    # rejection is prose, and the next reader re-derives the same "obvious" improvement.
+    if (tm_e_clamp == 1) {
+        var a2c = tp_get(TP_A2);
+        if (eb < 0) { eb = 0; }
+        if (eb > a2c) { eb = a2c; }
+        if (ec < 0) { ec = 0; }
+        if (ec > a2c) { ec = a2c; }
+        ea = a2c - eb - ec;
+        if (ea < 0) { ea = 0; }
+    }
+
+    var d255 = tp_get(TP_D255);
+    var t = tp_get(TP_T);
+    var dh = tp_get(TP_DH);
+    var vv = tp_get(TP_V);
+    var ll = tp_get(TP_L);
+
+    var bias = d255 >> 1;
+    if (tm_bias_trunc == 1) { bias = (d255 - 1) >> 1; }
+
+    var out = 0;
+    var qa = 255;
+    var ch = 0;
+    while (ch < 4) {
+        var sh = 24 - ch * 8;
+        var pa = ((tp_get(TP_CA) >> sh) & 0xFF) * cov;
+        var pb = ((tp_get(TP_CB) >> sh) & 0xFF) * cov;
+        var pc = ((tp_get(TP_CC) >> sh) & 0xFF) * cov;
+
+        n_zero();
+        n_madd(ea, pa);
+        n_madd(eb, pb);
+        n_madd(ec, pc);
+        if (n_is_neg() == 1) { n_zero(); }      # clamp BEFORE the bias, as the reference does
+        n_add_u(bias);
+
+        var nh = n_shr(t);
+        var q = tm_quot(nh, dh, vv, ll);
+
+        # ⭐ THE SINGLE EXACT CORRECTION, as a compare against the ORIGINAL 96-bit numerator
+        # rather than against the funnelled one — the funnel threw away low bits, so correcting
+        # on nh would be correcting against a value that is not the real numerator.
+        if (tm_skip_corr == 0) {
+            var need = (q + 1) * d255;
+            var cur_hi = n_hi;
+            var cur_lo = n_lo;
+            var need_hi = need >> 32;
+            var need_lo = u32(need);
+            var ge = 0;
+            if (cur_hi > need_hi) { ge = 1; }
+            if (cur_hi == need_hi) { if (cur_lo >= need_lo) { ge = 1; } }
+            if (ge == 1) { q = q + 1; tm_corr_count = tm_corr_count + 1; }
+        }
+
+        if (q > 255) { q = 255; }
+        if (ch == 0) { qa = q; }
+        if (q > qa) { q = qa; }
+        out = out | (q << sh);
+        ch = ch + 1;
+    }
+    return tri_src_over(out, dst);
+}
+
+# ============================================================================================
+# THE BYTE DIFF — the gate
+# ============================================================================================
+fn tm_diff_case(i): i64 {
+    var ok = tri_prep(tc_get(i,0), tc_get(i,1), tc_get(i,2), tc_get(i,3),
+                      tc_get(i,4), tc_get(i,5), tc_get(i,6), tc_get(i,7), tc_get(i,8));
+    if (ok != 1) { return 0 - 1; }              # rejected cases are not diffed
+    var bad = 0;
+    var y = 0;
+    while (y < 24) {
+        var x = 0;
+        while (x < 24) {
+            var pxx = x * 11 + 2;
+            var pyy = y * 9 + 3;
+            var cv = 17 + ((x * 7 + y * 13) % 239);
+            var want = tri_ref_px(pxx, pyy, cv, 0xFF101010);
+            var got = tm_px(pxx, pyy, cv, 0xFF101010);
+            if (want != got) { bad = bad + 1; }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return bad;
+}
+
+fn tm_sweep(label): i64 {
+    var total = 0;
+    var i = 0;
+    while (i < TC_N) {
+        var b = tm_diff_case(i);
+        if (b > 0) {
+            ps("    "); ps(label); ps(": case "); pn(i); ps(" ("); tc_name(i);
+            ps(") "); pn(b); ps(" differing pixels"); nl();
+            total = total + b;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn main(): i64 {
+    ps("trimodel -- the shader algorithm at register widths, byte-diffed vs the reference"); nl();
+    tc_init();
+    var fail = 0;
+
+    # --- GATE 1: the model reproduces the reference, byte for byte -------------------------
+    tm_corr_count = 0;
+    var d = tm_sweep("GATE1");
+    if (d != 0) {
+        ps("  GATE 1 FAILED: "); pn(d); ps(" differing pixels across the corpus"); nl();
+        fail = fail + 1;
+    }
+    if (d == 0) {
+        ps("  gate 1 GREEN: 0 differing bytes across all corpus cases"); nl();
+        ps("    exact correction fired "); pn(tm_corr_count); ps(" times"); nl();
+    }
+
+    # ⚠ A correction that NEVER fires is untested code. Report it as a gate, not a statistic.
+    if (tm_corr_count == 0) {
+        ps("  GATE 1 WARNING: the +1 correction never fired -- it is UNTESTED by this corpus"); nl();
+        fail = fail + 1;
+    }
+
+    # --- GATE 2: FALSIFICATION -- killing the x term MUST break it -------------------------
+    # ⭐ And it must break the 3-colour triangles while leaving the gradient rects GREEN, which
+    # is the proof that a gradient-shaped oracle cannot police the x term at all.
+    tm_kx_dead = 1;
+    var dk = tm_sweep("x-term-dead");
+    tm_kx_dead = 0;
+    if (dk == 0) {
+        ps("  GATE 2 FAILED: wiring the x term to zero changed NOTHING -- the corpus"); nl();
+        ps("    cannot see the x term, so gate 1 proves less than it appears to"); nl();
+        fail = fail + 1;
+    }
+    if (dk != 0) {
+        ps("  gate 2 GREEN: killing the x term breaks "); pn(dk); ps(" pixels"); nl();
+    }
+
+    # --- GATE 3: FALSIFICATION -- skipping the correction MUST break it --------------------
+    tm_skip_corr = 1;
+    var dc = tm_sweep("no-correction");
+    tm_skip_corr = 0;
+    if (dc == 0) {
+        ps("  GATE 3 FAILED: skipping the exact correction changed nothing -- either the"); nl();
+        ps("    correction is dead code or the corpus never reaches a case that needs it"); nl();
+        fail = fail + 1;
+    }
+    if (dc != 0) {
+        ps("  gate 3 GREEN: skipping the correction breaks "); pn(dc); ps(" pixels"); nl();
+    }
+
+    # --- GATE 4: the REJECTED E-clamp must break the gradient cases ------------------------
+    # ⛔ THE PLAN ASKED FOR A PARITY GATE HERE AND IT IS UNCONSTRUCTIBLE. It wanted "an odd
+    # denominator must still be bit-exact". D255 = 255 * 2A and 2A carries a << 16, so D255 always
+    # has at least 16 trailing zeros and CAN NEVER BE ODD. The parity arm tested nothing: its
+    # mutation (bias - 1) broke exactly the same 33 pixels as gate 3, because both perturb the
+    # same rounding boundary. Two gates reporting identical failures are one gate.
+    # Replaced with the refutation the plan actually needed recorded as a test.
+    tm_e_clamp = 1;
+    var de = tm_sweep("E-clamped");
+    tm_e_clamp = 0;
+    if (de == 0) {
+        ps("  GATE 4 FAILED: clamping E into [0,2A] changed NOTHING -- then the rejection of"); nl();
+        ps("    that design is unsupported and it should be reconsidered on its merits"); nl();
+        fail = fail + 1;
+    }
+    if (de != 0) {
+        ps("  gate 4 GREEN: the REJECTED E-clamp breaks "); pn(de); ps(" pixels -- refutation holds"); nl();
+    }
+
+    if (fail != 0) {
+        ps("trimodel: "); pn(fail); ps(" GATE FAILURE(S)"); nl();
+        return 1;
+    }
+    ps("trimodel: all gates green."); nl();
+    ps("⇒ The algorithm is proven at register widths BEFORE one instruction is assembled."); nl();
+    ps("⇒ If the iron burn is red, the fault is in the EMISSION, not the algorithm."); nl();
+    return 95;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

@@ -29,20 +29,20 @@ var gpu_psp_ring2 = 0;       # UC GPCOM ring base
 var gpu_psp_cmd   = 0;       # 4 KB UC command buffer
 var gpu_psp_fence = 0;       # UC fence word
 var gpu_psp_fctr  = 0;       # monotonic fence counter (first submit = 1)
-# C2b: the compute arena in the UMA carveout — CPU-physical base (UC-mapped) + the MEC
-# MC (FB-aperture) base. C2c/d build the ring/MQD here. Set by gpu_vm_setup.
+# the FB-aperture arena setup: the compute arena in the UMA carveout — CPU-physical base (UC-mapped) + the MEC
+# MC (FB-aperture) base. the compute-queue HQD setup/d build the ring/MQD here. Set by gpu_vm_setup.
 var gpu_arena_mc   = 0;      # MEC/FB-aperture MC address (pq_base = mc>>8)
 var gpu_arena_phys = 0;      # CPU physical address (UC-mapped)
-var gpu_queue_active = 0;    # C2c: 1 = MEC1/pipe0/queue0 mapped (HQD active, empty)
-var gpu_sdma_ready   = 0;    # P9.1: 1 = SDMA0 GFX ring up (F32 un-halted + idle, ring configured)
-var gpu_ring_fetched = 0;    # C2d: 1 = the MEC fetched+consumed a PM4 packet (VM-fetch gate open)
-var gpu_ring_wptr    = 0;    # CPU-canonical ring write cursor in DWORDS (C2d sets =8; C2e/C2f append)
-var gpu_fence_ok     = 0;    # C2e: 1 = MEC executed WRITE_DATA AND the write is CPU-visible
-var gpu_shader_ok    = 0;    # C2f: 1 = shader RAN + store CPU-visible; -1 no-retire; -2 store-stale; -3 fault
-var gpu_mt_ok        = 0;    # C2g-1: 1 = all 64 tids written CPU-visible; -1 no-retire; -2 partial; -3 fault
-var gpu_kernarg_ok   = 0;    # C2g-2: 1 = all 64 out[i]==in[i] via kernarg pointers; -1 no-retire; -2 partial; -3 fault
-var gpu_reduce_ok    = 0;    # C2g-3: 1 = all 64 dot products correct (loop+MAC); -1 no-retire; -2 partial; -3 fault
-var gpu_matmul_ok    = 0;    # C2g-4: 1 = 8x8 integer matmul bit-correct vs CPU; -1 no-retire; -2 partial; -3 fault
+var gpu_queue_active = 0;    # the compute-queue HQD setup: 1 = MEC1/pipe0/queue0 mapped (HQD active, empty)
+var gpu_sdma_ready   = 0;    # the SDMA ring bring-up: 1 = SDMA0 GFX ring up (F32 un-halted + idle, ring configured)
+var gpu_ring_fetched = 0;    # the first PM4 fetch: 1 = the MEC fetched+consumed a PM4 packet (VM-fetch gate open)
+var gpu_ring_wptr    = 0;    # CPU-canonical ring write cursor in DWORDS (the first PM4 fetch sets =8; the WRITE_DATA fence/the first shader dispatch append)
+var gpu_fence_ok     = 0;    # the WRITE_DATA fence: 1 = MEC executed WRITE_DATA AND the write is CPU-visible
+var gpu_shader_ok    = 0;    # the first shader dispatch: 1 = shader RAN + store CPU-visible; -1 no-retire; -2 store-stale; -3 fault
+var gpu_mt_ok        = 0;    # the first 64-thread dispatch: 1 = all 64 tids written CPU-visible; -1 no-retire; -2 partial; -3 fault
+var gpu_kernarg_ok   = 0;    # the kernarg dispatch: 1 = all 64 out[i]==in[i] via kernarg pointers; -1 no-retire; -2 partial; -3 fault
+var gpu_reduce_ok    = 0;    # the dot-product dispatch: 1 = all 64 dot products correct (loop+MAC); -1 no-retire; -2 partial; -3 fault
+var gpu_matmul_ok    = 0;    # the integer matmul proof: 1 = 8x8 integer matmul bit-correct vs CPU; -1 no-retire; -2 partial; -3 fault
 var gpu_matmul_f64_ok = 0;   # f64: 1 = 8x8 f64 matmul bit-correct (exact-int data) vs CPU; -1 no-retire; -2 partial; -3 fault
 var gpu_f64_fidelity_ok = 0; # f64 fidelity: 1 = rosnet-bit-correct on NON-exact (rounding) data vs in-kernel f64_mul/f64_add; -1/-2/-3 as above
 var gpu_display_ok    = 0;   # P0 (1.55.x display arc): 1 = lit HUBP scanout matches fb_phys; -1 no match; -2 surface matched but no OTG lit
@@ -134,7 +134,7 @@ var gpu_otg_lock_acked = 0;  # last gpu_otg_lock result — 0 means the lock TIM
 # can MEASURE what each packet actually buys, which has never been done — every build to date emitted both
 # unconditionally, so "the write-back is load-bearing for display visibility" is an assumption.
 # ⚠ Only ever set via gpu_cohere_run(), which restores both on EVERY exit path. A leaked 0 here re-creates
-# the C2g-1 stale-shader class that cost eight burns.
+# the the first 64-thread dispatch stale-shader class that cost eight burns.
 # plan-S12: when non-zero, the *_run emitters put their dispatch in the ring and RETURN WITHOUT the tail —
 # the batch driver (gpo_execute_all) owns the single TC write-back, the single fence and the single kick.
 # ⚠ Written in exactly one place, gpo_execute_all, which clears it on every exit path. It is safe as an
@@ -1257,9 +1257,9 @@ fn gpu_engine_start() {
     gpu_fw_probe();
     return 1;
 }
-# ── C2a — GMC/GFXHUB VM-state probe (the reuse-vs-build decider) ───────────────
+# ── the GMC/VM state probe — GMC/GFXHUB VM-state probe (the reuse-vs-build decider) ───────────────
 # READ-ONLY (F0/C0 discipline — zero device writes): dumps the GFXHUB VM/aperture
-# state so C2b knows the memory design. Derived+verified verdict (gfxhub_v1_0.c): NO
+# state so the FB-aperture arena setup knows the memory design. Derived+verified verdict (gfxhub_v1_0.c): NO
 # reusable GART exists pre-amdgpu — the design is to place compute scratch in the UMA
 # carveout + address it through the BIOS-set FB aperture with ZERO page tables (the
 # VM-fault-storm wedge designed OUT), NOT to build page tables. Reports: GART
@@ -1301,15 +1301,15 @@ fn gpu_gpuvm_probe() {
     kprintln("gpu: memory: UMA carveout via framebuffer aperture", 50);
     return 1;
 }
-# ── C2b — GFXHUB GMC setup for FB-aperture compute (first GMC write) ───────────
-# The MEC is running (Case A) but has no addressable memory. C2b arms the GMC so a
+# ── the FB-aperture arena setup — GFXHUB GMC setup for FB-aperture compute (first GMC write) ───────────
+# The MEC is running (Case A) but has no addressable memory. the FB-aperture arena setup arms the GMC so a
 # compute arena in the UMA carveout is reachable via the FB aperture — with ZERO page
 # tables, so the VM-fault-storm CPU-wedge is designed OUT (VM_CONTEXT0 stays DISABLED).
 # Minimal, all-confirmed-offset set (the L1-reprogram/MTYPE_UC + system-aperture default
-# page are DEFERRED — medium-confidence; coherence handled by PM4 cache ops at C2c/d).
+# page are DEFERRED — medium-confidence; coherence handled by PM4 cache ops at the compute-queue HQD setup/d).
 # Derived + adversarially verified vs gmc_v9_0.c / gfxhub_v1_0.c; the hang-risk lens
 # caught + fixed the fault-CNTL mask (0x1FFC = bits[2:12] serve-default, no-int, no-crash).
-# C2b writes GMC config only — no engine fetch — so it cannot itself wedge (verified).
+# the FB-aperture arena setup writes GMC config only — no engine fetch — so it cannot itself wedge (verified).
 fn gpu_vm_setup() {
     if (gpu_present == 0) { return 0; }
     if (gpu_psp_ring2 == 0) { return 0; }
@@ -1327,7 +1327,7 @@ fn gpu_vm_setup() {
     gpu_arena_phys = arena_phys;
 
     # UC-map the arena (CPU side). Probe CPU access to the carveout DRAM: write a
-    # sentinel at the ring base + read it back (C2c/d write the ring/MQD here, so this
+    # sentinel at the ring base + read it back (the compute-queue HQD setup/d write the ring/MQD here, so this
     # premise is load-bearing). Then zero the dummy fault-sink page.
     vmm_remap_uc_2mb(arena_phys);
     store32(arena_phys, 0xC2B0C2B0);
@@ -1377,12 +1377,12 @@ fn gpu_vm_setup() {
     kprintln("gpu: memory controller setup incomplete", 39);
     return 0;
 }
-# ── C2c — map an EMPTY compute queue (MEC1/pipe0/queue0) ──────────────────────
-# The MEC is running (Case A) + the GMC is armed (C2b). C2c maps a compute queue via
+# ── the compute-queue HQD setup — map an EMPTY compute queue (MEC1/pipe0/queue0) ──────────────────────
+# The MEC is running (Case A) + the GMC is armed (the FB-aperture arena setup). the compute-queue HQD setup maps a compute queue via
 # DIRECT (non-HWS) HQD register programming: GRBM-select the slot, push the ~20 CP_HQD_*
 # registers from the CPU (ACTIVE written LAST), deselect. The ring stays EMPTY (wptr==
 # rptr==0) so the MEC makes ZERO memory accesses — this isolates the HQD-register recipe
-# from VM/fetch correctness (C2d rings the doorbell + does the first fetch). Offsets are
+# from VM/fetch correctness (the first PM4 fetch rings the doorbell + does the first fetch). Offsets are
 # gfx9 gc_9_0_offset.h, anchor-validated against the iron-confirmed CP_MEC_CNTL/CP_ME_CNTL;
 # all base_idx 0. MQD/RPTR-report use FULL byte addrs; PQ/EOP bases are MC>>8. Doorbell is
 # ASSIGNED (DOORBELL_EN) but not rung. Derived + adversarially verified vs kfd_mqd_manager_v9
@@ -1390,7 +1390,7 @@ fn gpu_vm_setup() {
 # risk: an active empty queue never dereferences the MQD or fetches the ring.
 fn gpu_queue_setup() {
     if (gpu_present == 0) { return 0; }
-    if (gpu_arena_mc == 0) { return 0; }   # C2b armed the arena
+    if (gpu_arena_mc == 0) { return 0; }   # the FB-aperture arena setup armed the arena
 
     var ring_mc = gpu_arena_mc + GPU_VM_RING_SUBOFF;
     var mqd_mc  = gpu_arena_mc + GPU_VM_MQD_SUBOFF;
@@ -1455,19 +1455,19 @@ fn gpu_queue_setup() {
     kprintln("gpu: compute queue setup incomplete", 35);
     return 0;
 }
-# ── C2d — first PM4 packet: the VM-fetch gate ─────────────────────────────────
-# The queue is mapped + active + EMPTY (C2c). C2d writes ONE 8-dword PACKET3_NOP into
+# ── the first PM4 fetch — first PM4 packet: the VM-fetch gate ─────────────────────────────────
+# The queue is mapped + active + EMPTY (the compute-queue HQD setup). the first PM4 fetch writes ONE 8-dword PACKET3_NOP into
 # the ring, rings the doorbell, and watches the MEC fetch+consume it — the FIRST time
-# the MEC translates a GPUVA (the ring base) through the C2b FB aperture (no page
+# the MEC translates a GPUVA (the ring base) through the the FB-aperture arena setup FB aperture (no page
 # tables). THE make-or-break VM-fetch gate. CPU-wedge-SAFE (adversarially verified):
 # every CPU access hits a decoded address (carveout DRAM / BAR5 / BAR2 doorbell); the
-# doorbell is a POSTED PCIe write the CPU can't block on; the C2b fault-net (0x1FFC:
+# doorbell is a POSTED PCIe write the CPU can't block on; the the FB-aperture arena setup fault-net (0x1FFC:
 # serve-dummy-page, no-IRQ, no-crash — CONTIGUOUS bits[2:12], ground-truth-confirmed)
 # bounds any fault to GPU-side; the ONLY wedge vector is an unbounded spin, eliminated
 # by the bounded watchdog. Derived + 2-lens adversarially verified vs PM4/gfx_v9_0.
 fn gpu_ring_kick() {
     if (gpu_present == 0) { return 0; }
-    if (gpu_queue_active == 0) { return 0; }   # C2c mapped the queue
+    if (gpu_queue_active == 0) { return 0; }   # the compute-queue HQD setup mapped the queue
     if (gpu_arena_mc == 0) { return 0; }
     var ring_mc = gpu_arena_mc;                 # ring at arena suboffset 0
 
@@ -1481,7 +1481,7 @@ fn gpu_ring_kick() {
         return 0;
     }
 
-    # Program the MEC doorbell range so the CP honors our doorbell byte 0x18 (C2c left
+    # Program the MEC doorbell range so the CP honors our doorbell byte 0x18 (the compute-queue HQD setup left
     # it unset). Global CP regs (no GRBM select). LOWER=0, UPPER=0xE8 covers [0,0xE8].
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MEC_DOORBELL_RANGE_LOWER, 0);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_MEC_DOORBELL_RANGE_UPPER, GPU_DOORBELL_RANGE_UPPER_VAL);
@@ -1493,7 +1493,7 @@ fn gpu_ring_kick() {
     var db_slot = bar2 + 0x18;
 
     # Clear any stale (sticky) VM_L2_PROTECTION_FAULT_STATUS so a post-kick fault!=0
-    # unambiguously means a C2d fetch fault (not a leftover from an earlier probe).
+    # unambiguously means a the first PM4 fetch fetch fault (not a leftover from an earlier probe).
     # Pulse CLEAR (bit0) then re-arm to the exact prior CNTL value (0x1FFC fault-net).
     var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
@@ -1560,7 +1560,7 @@ fn gpu_ring_kick() {
     }
     if (fetched != 0 && gui == 0) {
         gpu_ring_fetched = 1;
-        gpu_ring_wptr = 8;   # canonical ring cursor after the 8-dword NOP kick; C2e appends here
+        gpu_ring_wptr = 8;   # canonical ring cursor after the 8-dword NOP kick; the WRITE_DATA fence appends here
         kprintln("gpu: command ring active", 24);
         # ⭐ THE EDGE CAP, REPORTED BY THE KERNEL ITSELF. EDGE_CAP_PROBE swaps ONE CONSTANT, so
         # the probe kernel is byte-identical in size to the shipped one and `strings` cannot tell
@@ -1574,16 +1574,16 @@ fn gpu_ring_kick() {
     kprintln("gpu: command ring not responding", 32);
     return 0;
 }
-# ── C2e — WRITE_DATA fence: the MEC executes + a CPU-visible write ─────────────
-# C2d proved the MEC FETCHES (rptr 0->8) but left two ambiguities: did it EXECUTE
-# (vs skip a NOP), and is a MEC memory write CPU-VISIBLE (C2d's memory rptr-report
-# read 0 from the CPU even as the register rptr read 8). C2e resolves both with ONE
+# ── the WRITE_DATA fence — WRITE_DATA fence: the MEC executes + a CPU-visible write ─────────────
+# the first PM4 fetch proved the MEC FETCHES (rptr 0->8) but left two ambiguities: did it EXECUTE
+# (vs skip a NOP), and is a MEC memory write CPU-VISIBLE (the first PM4 fetch's memory rptr-report
+# read 0 from the CPU even as the register rptr read 8). the WRITE_DATA fence resolves both with ONE
 # UNCONDITIONAL PACKET3_WRITE_DATA that writes a known sentinel to a carveout slot the
 # CPU reads back. DST_SEL=5 (memory async-direct) targets DRAM, bypassing the GL2 path
 # that would strand the write — so "rptr advanced but sentinel stale" can ONLY mean a
-# coherence gap (retro-explaining C2d's rmem=0). NO ACQUIRE_MEM flush on this burn: it
+# coherence gap (retro-explaining the first PM4 fetch's rmem=0). NO ACQUIRE_MEM flush on this burn: it
 # would collapse the executed-vs-coherent disambiguation (the row-2 follow-up).
-# WEDGE-SAFE (same envelope as C2d): bounded watchdog only; every CPU access hits
+# WEDGE-SAFE (same envelope as the first PM4 fetch): bounded watchdog only; every CPU access hits
 # decoded carveout DRAM / BAR5 regs; the MEC write targets OUR carveout (bus-master off
 # => it cannot reach system RAM); faults bounded by the 0x1FFC dummy-page net.
 # Derived + 2-lens adversarially verified vs PM4/soc15d.h — all refuted=False.
@@ -1632,7 +1632,7 @@ fn gpu_fence() {
 
     var new_wptr = gpu_ring_wptr + 5;                    # header + 4 body = 5 dwords
 
-    # Submit via the PROVEN register-wptr path (C2d: doorbell did NOT advance wptr; a direct
+    # Submit via the PROVEN register-wptr path (the first PM4 fetch: doorbell did NOT advance wptr; a direct
     # CP_HQD_PQ_WPTR_LO write DID). GRBM-select the HQD, write wptr.
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);
@@ -1682,15 +1682,15 @@ fn gpu_fence() {
     kprintln("gpu: coherence check did not run", 32);
     return 0;
 }
-# ── C2f — first hand-assembled gfx90c compute shader (DISPATCH_DIRECT) ─────────
+# ── the first shader dispatch — first hand-assembled gfx90c compute shader (DISPATCH_DIRECT) ─────────
 # The FIRST arbitrary ISA on the shader cores. A minimal single-thread (1x1x1) shader
 # writes constant 0xC2F0C2F0 to a carveout slot via global_store_dword (GLC=1), and the
 # CPU reads it back. Every ISA/PM4 byte is adversarially confirmed (incl. reconstructing
 # LLVM D40493's global_store_dwordx2=0xDC748000 to the bit); scalar SMEM stores don't
-# exist on gfx9 so we use a VECTOR store, which reuses the C2b-proven L2/UTCL2 datapath.
-# A shader store lands in GL2 (unlike C2e's CP WRITE_DATA straight to MC), so the ring
+# exist on gfx9 so we use a VECTOR store, which reuses the the FB-aperture arena setup-proven L2/UTCL2 datapath.
+# A shader store lands in GL2 (unlike the WRITE_DATA fence's CP WRITE_DATA straight to MC), so the ring
 # program appends CS_PARTIAL_FLUSH (drain waves) + ACQUIRE_MEM (TC write-back GL2->DRAM)
-# BEFORE the C2e-proven WRITE_DATA done-marker — so a visible done-marker means
+# BEFORE the the WRITE_DATA fence-proven WRITE_DATA done-marker — so a visible done-marker means
 # "waves retired AND L2 flushed". Submit via the proven register-wptr path.
 # WEDGE-SAFE: our ~6-instr straight-line shader (no loops, ends s_endpgm) on OUR carveout;
 # cores reach only the FB aperture (bus-master off => no system RAM); a bad store faults
@@ -1700,7 +1700,7 @@ fn gpu_ring_put(val) {
     # WRAP the RING-BUFFER index to the 64 KB PQ (QUEUE_SIZE 0xD = 16384 dwords). `gpu_ring_wptr` itself stays
     # MONOTONIC — that is what the CP's wptr register expects (amdgpu's model: monotonic wptr, masked buffer
     # index), and it is what every proven boot path already writes, so this mask is a NO-OP below 16384 dwords
-    # (byte-identical behaviour for C2d/C2e/C2f and the dispatches). Without it, a repeatedly-called ring
+    # (byte-identical behaviour for the first PM4 fetch/the WRITE_DATA fence/the first shader dispatch and the dispatches). Without it, a repeatedly-called ring
     # producer — e.g. the #85 fill syscall a compositor runs EVERY FRAME (12 dw each ⇒ ~23 s at 60 fps) — walks
     # the write cursor past the end of the ring and scribbles the rptr-report/EOP slots that follow it in the
     # arena. Peer of the PSP ring's `& GPU_PSP_RING_DW_MASK`.
@@ -1744,19 +1744,19 @@ fn gpu_shader_dispatch() {
     store32(done_phys, 0xDEADBEEF);
     gpu_mfence();
 
-    # 3. Pulse-clear + re-arm the fault-net so a post-dispatch fault!=0 blames C2f.
+    # 3. Pulse-clear + re-arm the fault-net so a post-dispatch fault!=0 blames the first shader dispatch.
     var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
 
-    # 4. Append the 39-dword C2f ring program at gpu_ring_wptr (== 13).
+    # 4. Append the 39-dword the first shader dispatch ring program at gpu_ring_wptr (== 13).
     var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
     var pgm_hi = (shader_mc >> 40) & 0xFF;
     # SET_SH COMPUTE_PGM_LO/HI
     # PRE-dispatch I$/K$ invalidate (mabda-proven, MANDATORY on gfx9) — the shader is rewritten in place at
     # a FIXED VA (0x14000) every dispatch, so without this the SQ runs a STALE cached shader (a prior
-    # dispatch's baked store-address) => the store lands in the wrong slot. THE fix for the C2g-1
-    # intermittent-launch bug (burns 1-8): C2f worked only by cold-cache luck; every later dispatch ran stale.
+    # dispatch's baked store-address) => the store lands in the wrong slot. THE fix for the the first 64-thread dispatch
+    # intermittent-launch bug (burns 1-8): the first shader dispatch worked only by cold-cache luck; every later dispatch ran stale.
     gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
     gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
     gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
@@ -1778,17 +1778,17 @@ fn gpu_shader_dispatch() {
     gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_TCWB);
     gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
     gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
-    # WRITE_DATA done-marker (C2e-proven DST_SEL=5 path -> CPU-visible completion signal)
+    # WRITE_DATA done-marker (the WRITE_DATA fence-proven DST_SEL=5 path -> CPU-visible completion signal)
     gpu_ring_put(GPU_PM4_WRITE_DATA_HDR); gpu_ring_put(GPU_PM4_WRITE_DATA_CTL);
     gpu_ring_put(done_mc & 0xFFFFFFFF); gpu_ring_put((done_mc >> 32) & 0xFFFFFFFF); gpu_ring_put(GPU_C2F_DONE);
     gpu_mfence();
 
-    # 5. Register-wptr submit (proven C2d/C2e path). new_wptr == 52.
+    # 5. Register-wptr submit (proven the first PM4 fetch/the WRITE_DATA fence path). new_wptr == 52.
     var new_wptr = gpu_ring_wptr;
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_GRBM_GFX_CNTL, GPU_GRBM_SEL_MEC1_P0_Q0);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_LO, new_wptr);   # LO FIRST — matches the
-    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);          # proven C2d/C2e order; the CP
-    #   latches the 64-bit wptr on the HI write, sampling the LO already set (C2f burn 2 wrote HI first
+    gpu_reg32_write(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_WPTR_HI, 0);          # proven the first PM4 fetch/the WRITE_DATA fence order; the CP
+    #   latches the 64-bit wptr on the HI write, sampling the LO already set (the first shader dispatch burn 2 wrote HI first
     #   -> latched the stale LO=13 -> wptr stuck at 13, queue never advanced).
     gpu_mfence();
 
@@ -1796,7 +1796,7 @@ fn gpu_shader_dispatch() {
     # plan-S12a: tight spin, not a 100 us sleep quantum. See gpu_wait_done.
     var ok = gpu_wait_done(done_phys, GPU_C2F_DONE, 100000);
     # Read the per-queue state WHILE STILL GRBM-SELECTED — rptr/wptr/active read the
-    # DEFAULT queue once deselected (that was the C2f-first-burn rptr=0x0 artifact). rptr
+    # DEFAULT queue once deselected (that was the the first shader dispatch-first-burn rptr=0x0 artifact). rptr
     # localizes WHERE the ring stalled (13=start..0x34=all consumed); wptr confirms the
     # submit landed (0x34); active confirms the queue wasn't dequeued.
     var rreg    = gpu_reg32(GPU_BASE_GC_0, GPU_R_CP_HQD_PQ_RPTR)    & 0xFFFFFFFF;
@@ -1832,12 +1832,12 @@ fn gpu_shader_dispatch() {
     kprintln("gpu: shader dispatch did not complete", 37);
     return 0;
 }
-# ── CP-DMA — hardware 2D memory copy on the PROVEN compute ring (P9, pivoted off SDMA) ────────
+# ── CP-DMA — hardware 2D memory copy on the PROVEN compute ring (the 2D-acceleration bite, pivoted off SDMA) ────────
 # The FIRST hardware 2D on sovereign agnos. A PM4 DMA_DATA (CP-DMA, op 0x50) packet on the MEC
-# compute ring that C2d/C2e already proved FETCHES + EXECUTES + lands CPU-visible writes — NO SDMA,
+# compute ring that the first PM4 fetch/the WRITE_DATA fence already proved FETCHES + EXECUTES + lands CPU-visible writes — NO SDMA,
 # NO doorbell, NO new firmware. CP_SYNC=1 holds the ME until the copy's writes ACK to DRAM;
-# SRC_SEL/DST_SEL=0 = MC-direct (bypass GL2 — the same domain the C2e WRITE_DATA is already
-# CPU-visible through), so NO ACQUIRE_MEM is needed. A C2e-proven WRITE_DATA done-marker (DST_SEL=5)
+# SRC_SEL/DST_SEL=0 = MC-direct (bypass GL2 — the same domain the the WRITE_DATA fence WRITE_DATA is already
+# CPU-visible through), so NO ACQUIRE_MEM is needed. A the WRITE_DATA fence-proven WRITE_DATA done-marker (DST_SEL=5)
 # follows as the CPU-pollable completion gate: CP_SYNC orders it AFTER the copy, so marker-visible
 # ⟹ the 4 KB committed to DRAM. byte_count is RAW bytes (4096), NOT byte_count-1 (that's the SDMA
 # convention). ENGINE=ME (bit0=0) — the MEC has no PFP. Submit via the proven register-wptr kick
@@ -2338,7 +2338,7 @@ fn gpu_grid7_run(shader_mc, k0, k1, k2, k3, k4, k5, k6, rsrc1, gx, gy, done_mc, 
 # WHY THE INVALIDATE STAYS PER-DISPATCH. Decision D-6, now EVIDENCED rather than assumed: plan-S3 measured
 # 4096-of-4096 stale reads without it. Hoisting one invalidate to the head of a batch is a plausible
 # optimisation — inside an all-shader batch the sources are GL2-coherent with each other, and each kernel
-# now has its own resident slot so the I-cache argument is weaker than it was at C2g-1 — but it is exactly
+# now has its own resident slot so the I-cache argument is weaker than it was at the first 64-thread dispatch — but it is exactly
 # the kind of "obviously safe" removal that cost eight burns once already. It is a MEASURABLE follow-up,
 # not something to fold into the bite that first makes batching work.
 #
@@ -3926,7 +3926,7 @@ fn gpu_grad_surface(w, h, dx, dy, c0, c1) {
 # ordering assumption leaks into a syscall a compositor calls every frame.
 #
 # The dispatch envelope re-invalidates I$/K$ before every launch, so a shader resident at a fixed VA is safe
-# to leave in place across dispatches — that was the C2g-1 lesson (a stale cached shader ran for 8 burns).
+# to leave in place across dispatches — that was the the first 64-thread dispatch lesson (a stale cached shader ran for 8 burns).
 fn gpu_blend_arm() {
     if (gpu_blend_armed == 1) { return 1; }
     if (gpu_present == 0) { return 0; }
@@ -3981,7 +3981,7 @@ fn gpu_blend_surface(src_mc, w, h, dx, dy) {
 fn gpu_s3_tile(i) { return GPU_COHERE_TILE_SUBOFF + i * GPU_COHERE_STRIDE; }
 
 # gpu_cohere_run — THE ONLY place gpu_cohere_wb / gpu_cohere_inv are ever written. Sets them, runs one
-# blend_rect dispatch, and restores BOTH on every exit path. A leaked 0 would re-create the C2g-1
+# blend_rect dispatch, and restores BOTH on every exit path. A leaked 0 would re-create the the first 64-thread dispatch
 # stale-shader class, so there is exactly one choke point rather than set/restore pairs at each call site.
 fn gpu_cohere_run(wb, inv, src_mc, dst_mc, n) {
     gpu_cohere_wb = wb;
@@ -4442,7 +4442,7 @@ fn gpu_cp_dma_blit(dst_mc, dst_stride, src_mc, src_stride, row_bytes, rows) {
     }
     return 1;
 }
-# gpu_cp_dma_copy — P9 boot SELF-TEST (the iron proof): seed a 4 KB src, copy it via gpu_cp_dma, verify
+# gpu_cp_dma_copy — the 2D-acceleration bite boot SELF-TEST (the iron proof): seed a 4 KB src, copy it via gpu_cp_dma, verify
 # dst==src byte-for-byte. Gated #ifdef CP_DMA_COPY; needs the ring coherence-proven (gpu_fence_ok).
 fn gpu_cp_dma_copy() {
     if (gpu_present == 0) { return 0; }
@@ -4479,7 +4479,7 @@ fn gpu_cp_dma_copy() {
     kprintln("gpu: cp-dma copy MISMATCH (marker fired, bytes wrong)", 53);
     return 0;
 }
-# gpu_cp_dma_fill_test — P9 fill SELF-TEST: hardware-fill a 4 KB slot with a constant via gpu_cp_dma_fill,
+# gpu_cp_dma_fill_test — the 2D-acceleration bite fill SELF-TEST: hardware-fill a 4 KB slot with a constant via gpu_cp_dma_fill,
 # verify every dword == the constant. Proves the DMA_DATA constant-fill (SRC_SEL=2) packet on iron. Gated
 # #ifdef CP_DMA_COPY (runs alongside the copy test). Reuses the DST arena scratch slot.
 fn gpu_cp_dma_fill_test() {
@@ -4512,7 +4512,7 @@ fn gpu_cp_dma_fill_test() {
     kprintln("gpu: cp-dma fill MISMATCH (marker fired, bytes wrong)", 53);
     return 0;
 }
-# gpu_cp_dma_blit_test — P9 blit SELF-TEST: a strided 2D rect copy. Copies an 8-row x 128-byte rect from a
+# gpu_cp_dma_blit_test — the 2D-acceleration bite blit SELF-TEST: a strided 2D rect copy. Copies an 8-row x 128-byte rect from a
 # source whose rows are 256 B apart into a destination whose rows are 320 B apart (DIFFERENT strides, on
 # purpose), then verifies BOTH that every copied row landed AND that the destination's inter-row padding was
 # left UNTOUCHED. That second check is the one that matters: it proves real per-row stride addressing rather
@@ -4571,11 +4571,11 @@ fn gpu_cp_dma_blit_test() {
     kprintln("gpu: cp-dma blit MISMATCH (rows or padding wrong)", 49);
     return 0;
 }
-# ── C2g-1 — FIRST MULTI-THREAD compute dispatch (1 workgroup, 64 threads; out[tid]=tid) ──
+# ── the first 64-thread dispatch — FIRST MULTI-THREAD compute dispatch (1 workgroup, 64 threads; out[tid]=tid) ──
 # The first parallel dispatch: 64 lanes each write their workitem-id to out[tid], CPU verifies
-# out[i]==i. Delta on C2f — NUM_THREAD_X flips 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 => 64 threads
+# out[i]==i. Delta on the first shader dispatch — NUM_THREAD_X flips 1->64 (DISPATCH_DIRECT DIM stays 1x1x1 => 64 threads
 # in ONE workgroup) PLUS the EXEC fix: burns 1.54.17-19 showed the 64-lane wave RETIRED but stored
-# nothing (nz=0) => all lanes EXEC-masked, so the shader now sets 's_mov_b64 exec,-1' first (C2f's
+# nothing (nz=0) => all lanes EXEC-masked, so the shader now sets 's_mov_b64 exec,-1' first (the first shader dispatch's
 # 1-lane wave got SPI-auto EXEC=0x1; the full wave got EXEC=0 on the raw non-HWS HQD path). The
 # shader then computes out[tid]=tid via v0(=workitem-id-X)<<2 folded into a 64-bit base
 # (v_lshlrev + v_add_co/v_addc_co carry chain). ALL 12 shader dwords are iron-proven gfx90c
@@ -4600,15 +4600,15 @@ fn gpu_shader_dispatch2() {
     var out_mc      = gpu_arena_mc   + GPU_SHADER_OUT2_SUBOFF;
     var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
 
-    # 1. C2g-1 shader (12 dwords): FIX = prepend 's_mov_b64 exec,-1' to unmask all 64 lanes, then
+    # 1. the first 64-thread dispatch shader (12 dwords): FIX = prepend 's_mov_b64 exec,-1' to unmask all 64 lanes, then
     #    each lane computes out[tid]=tid via v0(=workitem-id-X)<<2 folded into the 64-bit base
     #    (v_lshlrev + v_add_co/v_addc_co carry chain) and stores v0. ALL dwords are
     #    iron-proven gfx90c ground-truth. Root cause of the 1.54.17-19 zero-store burns: the
     #    64-lane wave RETIRED (done fired, ACTIVE=1) but stored nothing (nz=0) => all lanes were
-    #    EXEC-masked. C2f's 1-lane wave got SPI-auto EXEC=0x1 (lane0 stored); the full wave got
+    #    EXEC-masked. the first shader dispatch's 1-lane wave got SPI-auto EXEC=0x1 (lane0 stored); the full wave got
     #    EXEC=0 on this raw non-HWS HQD path, so the explicit set is what lights all 64.
     #    NOTE (forward-carry): 's_mov_b64 exec,-1' is correct ONLY for an EXACT full wave (64 =
-    #    exact wave64). C2g-2+ grids with a PARTIAL last wave must replace this with a real lane
+    #    exact wave64). the kernarg dispatch+ grids with a PARTIAL last wave must replace this with a real lane
     #    mask (s_bfm / whole-wave-mode) or the surplus lanes do OOB stores.
     store32(shader_phys + 0x00, 0xBEFE01C1);              # s_mov_b64 exec, -1   (unmask all 64 lanes)
     store32(shader_phys + 0x04, 0x7E0202FF);              # v_mov_b32 v1, lit
@@ -4629,25 +4629,25 @@ fn gpu_shader_dispatch2() {
     store32(done_phys, GPU_MT_NOTYET);
     gpu_mfence();
 
-    # 3. Pulse-clear + re-arm the fault-net so a post-dispatch fault!=0 blames C2g-1.
+    # 3. Pulse-clear + re-arm the fault-net so a post-dispatch fault!=0 blames the first 64-thread dispatch.
     var fc0 = gpu_reg32(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
 
-    # 4. Append the 39-dword ring program at gpu_ring_wptr (== 52 after C2f). ONLY delta vs C2f:
+    # 4. Append the 39-dword ring program at gpu_ring_wptr (== 52 after the first shader dispatch). ONLY delta vs the first shader dispatch:
     #    NUM_THREAD_X = 64 instead of 1.
     var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
     var pgm_hi = (shader_mc >> 40) & 0xFF;
     # PRE-dispatch I$/K$ invalidate (mabda-proven, MANDATORY on gfx9) — the shader is rewritten in place at
     # a FIXED VA (0x14000) every dispatch, so without this the SQ runs a STALE cached shader (a prior
-    # dispatch's baked store-address) => the store lands in the wrong slot. THE fix for the C2g-1
-    # intermittent-launch bug (burns 1-8): C2f worked only by cold-cache luck; every later dispatch ran stale.
+    # dispatch's baked store-address) => the store lands in the wrong slot. THE fix for the the first 64-thread dispatch
+    # intermittent-launch bug (burns 1-8): the first shader dispatch worked only by cold-cache luck; every later dispatch ran stale.
     gpu_ring_put(GPU_PM4_ACQUIRE_MEM_HDR); gpu_ring_put(GPU_CP_COHER_CNTL_INV);
     gpu_ring_put(GPU_ACQUIRE_COHER_SIZE); gpu_ring_put(GPU_ACQUIRE_COHER_SIZE_HI);
     gpu_ring_put(0); gpu_ring_put(0); gpu_ring_put(GPU_ACQUIRE_POLL);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_LO); gpu_ring_put(pgm_lo); gpu_ring_put(pgm_hi);
     gpu_ring_put(GPU_PM4_SET_SH_REG_N2); gpu_ring_put(GPU_SH_COMPUTE_PGM_RSRC1); gpu_ring_put(GPU_COMPUTE_PGM_RSRC1_MIN); gpu_ring_put(0);
-    # C2g-1 zero-wave FIX (burn 5): clear the stale threadgroup-origin + dispatch-resume SH state
+    # the first 64-thread dispatch zero-wave FIX (burn 5): clear the stale threadgroup-origin + dispatch-resume SH state
     # tinygrad/radv zero on EVERY dispatch and our raw MQD path uniquely left stale — a full
     # 64-thread workgroup launched ZERO executing waves at 1.54.20 (even with exec,-1 first),
     # which is neither a shader-EXEC nor a NUM_THREAD-field bug. START latches with NUM_THREAD.
@@ -4746,13 +4746,13 @@ fn matmul_copy_write(dst_phys) {
     return 17;
 }
 
-# ── C2g-2 — compute KERNARGS: read an operand through a pointer passed in COMPUTE_USER_DATA ──────
-# The last primitive before matmul. C2g-1 baked the output address into the shader as a literal; C2g-2
+# ── the kernarg dispatch — compute KERNARGS: read an operand through a pointer passed in COMPUTE_USER_DATA ──────
+# The last primitive before matmul. the first 64-thread dispatch baked the output address into the shader as a literal; the kernarg dispatch
 # passes BOTH an input and an output base pointer via COMPUTE_USER_DATA_0..3 (RSRC2 USER_SGPR=4 makes the
 # SPI preload s[0:1]=input, s[2:3]=output before shader entry), and the shader does out[tid] = in[tid] —
 # proving per-lane operand reads through kernarg pointers. mabda-proven ABI; all 17 shader dwords are
-# iron-proven gfx90c ground-truth. Gated on C2g-1 (multi-thread proven). WEDGE-SAFE: same bounded
-# envelope as C2g-1; a bad per-lane load/store addr faults into the 0x1FFC dummy net (fault!=0, bounded).
+# iron-proven gfx90c ground-truth. Gated on the first 64-thread dispatch (multi-thread proven). WEDGE-SAFE: same bounded
+# envelope as the first 64-thread dispatch; a bad per-lane load/store addr faults into the 0x1FFC dummy net (fault!=0, bounded).
 fn gpu_shader_dispatch3() {
     gpu_kernarg_ok = 0;
     if (gpu_present == 0) { return 0; }
@@ -4774,7 +4774,7 @@ fn gpu_shader_dispatch3() {
 
     # 1. Shader (17 dwords): s[0:1]=input base, s[2:3]=output base (SPI-preloaded from USER_DATA).
     #    off = tid*4; v3 = in[off] (load via s[0:1]); out[off] = v3 (store via s[2:3]).
-    # ISA table GENERATED from kernel/shaders/matmul_copy.s — C2g-2 compute kernargs — out[tid]=in[tid] through host-supplied pointers.
+    # ISA table GENERATED from kernel/shaders/matmul_copy.s — the kernarg dispatch compute kernargs — out[tid]=in[tid] through host-supplied pointers.
     # Byte-identical to the hand-typed original it replaced; byte-identical to the iron-proven committed hex (the source of truth).
     matmul_copy_write(shader_phys);
 
@@ -4793,7 +4793,7 @@ fn gpu_shader_dispatch3() {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
 
-    # 4. Ring program. Deltas vs C2g-1: RSRC2 = USER_SGPR=4 (0x08) so the SPI preloads s0..s3, and a
+    # 4. Ring program. Deltas vs the first 64-thread dispatch: RSRC2 = USER_SGPR=4 (0x08) so the SPI preloads s0..s3, and a
     #    COMPUTE_USER_DATA_0..3 = (in_lo, in_hi, out_lo, out_hi) write. Everything else is the proven path
     #    (pre-dispatch I$ invalidate, START/RESTART, STATIC, RESLIM, post-dispatch TC-writeback, done).
     var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
@@ -4911,12 +4911,12 @@ fn matmul_dot_write(dst_phys) {
     return 38;
 }
 
-# ── C2g-3 — ALU + REDUCTION LOOP: each lane runs matmul's inner loop (per-lane integer dot product) ──
+# ── the dot-product dispatch — ALU + REDUCTION LOOP: each lane runs matmul's inner loop (per-lane integer dot product) ──
 # out[tid] = sum_{k=0..K-1} a[tid*K+k] * b[tid*K+k], K=4, via a REAL branch loop (s_cbranch) with
 # v_mul_lo_u32 / v_add_u32 accumulate. 3 kernargs (a,b,out) preloaded into s[0:1]/s[2:3]/s[4:5] (RSRC2
 # USER_SGPR=6). All 38 shader dwords are iron-proven gfx90c ground-truth (incl. the loop branch
 # 0xBF85FFEF = -17 dwords). Pre-seeds a[i]=i+1, b[i]=i+2; verifies each of the 64 dot products vs the CPU.
-# This is the last primitive before rosnet matmul (C2g-4). Gated on C2g-2 (kernargs proven).
+# This is the last primitive before rosnet matmul (the integer matmul proof). Gated on the kernarg dispatch (kernargs proven).
 fn gpu_shader_dispatch4() {
     gpu_reduce_ok = 0;
     if (gpu_present == 0) { return 0; }
@@ -4940,7 +4940,7 @@ fn gpu_shader_dispatch4() {
 
     # 1. Shader (38 dwords): s[0:1]=a, s[2:3]=b, s[4:5]=out. Per lane: acc=0; loop K times over
     #    v3=a[k]*b[k] accumulating into v8; store v8 -> out[tid]. Loop counter is the uniform SGPR s6.
-    # ISA table GENERATED from kernel/shaders/matmul_dot.s — C2g-3 ALU + reduction loop — per-lane integer dot product, K=4.
+    # ISA table GENERATED from kernel/shaders/matmul_dot.s — the dot-product dispatch ALU + reduction loop — per-lane integer dot product, K=4.
     # Byte-identical to the hand-typed original it replaced; byte-identical to the iron-proven committed hex (the source of truth).
     matmul_dot_write(shader_phys);
 
@@ -4961,7 +4961,7 @@ fn gpu_shader_dispatch4() {
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0 | 0x1);
     gpu_reg32_write(GPU_BASE_GC_0, GPU_R_VM_L2_PROT_FAULT_CNTL, fc0);
 
-    # 4. Ring program. Deltas vs C2g-2: RSRC1 = 12-VGPR (loop shader), RSRC2 = USER_SGPR=6 (0x0C), and
+    # 4. Ring program. Deltas vs the kernarg dispatch: RSRC1 = 12-VGPR (loop shader), RSRC2 = USER_SGPR=6 (0x0C), and
     #    USER_DATA_0..5 = (a_lo, a_hi, b_lo, b_hi, out_lo, out_hi). Rest is the proven envelope.
     var pgm_lo = (shader_mc >> 8)  & 0xFFFFFFFF;
     var pgm_hi = (shader_mc >> 40) & 0xFF;
@@ -5040,16 +5040,16 @@ fn gpu_shader_dispatch4() {
     return 0;
 }
 
-# ── C2g-4 — THE CROWN: real integer tiled matmul C[8x8] = A[8x8] * B[8x8] on the shader cores ──────
+# ── the integer matmul proof — THE CROWN: real integer tiled matmul C[8x8] = A[8x8] * B[8x8] on the shader cores ──────
 # Each of 64 lanes computes ONE output element C[i][j] = sum_{k=0..7} A[i*8+k] * B[k*8+j]. tid -> i=tid>>3,
 # j=tid&7; the lane walks row i of A (+4 per k) and column j of B (+32 per k = N*4), accumulating in a real
-# branch loop. Bit-correct vs the CPU reference. Same kernarg ABI as C2g-3 (3 pointers, RSRC2=0x0C, 12 VGPRs).
+# branch loop. Bit-correct vs the CPU reference. Same kernarg ABI as the dot-product dispatch (3 pointers, RSRC2=0x0C, 12 VGPRs).
 # All 41 shader dwords iron-proven gfx90c ground-truth. THIS is the matmul that attn11/tentib ML layers
-# ride onto the GPU (C2h wires the ring-3 gpu_* band next). Gated on C2g-3 (loop+MAC proven).
-# === C2h: shared integer-matmul primitives (factored from gpu_shader_dispatch5) ===
+# ride onto the GPU (the ring-3 dispatch seam (#82) wires the ring-3 gpu_* band next). Gated on the dot-product dispatch (loop+MAC proven).
+# === the ring-3 dispatch seam (#82): shared integer-matmul primitives (factored from gpu_shader_dispatch5) ===
 # gpu_matmul_write_shader — emit the 41-dword gfx90c 8x8 integer-matmul kernel at
 # shader_phys. tid->(i,j); walk A row (i*32, +4/k) x B col (j*4, +32/k); loop K=8
-# with v_mul_lo_u32 + v_add_u32 MAC; store C[tid]. The C2g-4 shader, one source of truth.
+# with v_mul_lo_u32 + v_add_u32 MAC; store C[tid]. The the integer matmul proof shader, one source of truth.
 # matmul_i32 — iron-proven gfx90c ISA. Human-readable reference: kernel/shaders/matmul_i32.s (documentation only).
 # ⚠ These bytes ARE the shader — iron-proven on archaemenid, committed hex, the authority. AGNOS ships
 #   no assembler and its build requires no llvm and no C/C++. The sovereign gfx90c assembler in the
@@ -5101,7 +5101,7 @@ fn matmul_i32_write(dst_phys) {
 
 # gpu_matmul_write_shader — thin wrapper kept so call sites do not move. The table above is GENERATED from
 # kernel/shaders/matmul_i32.s and is verified byte-identical to the hand-typed original by
-# the iron-proven committed hex. C2g-4 integer 8x8 matmul — THE CROWN.
+# the iron-proven committed hex. the integer matmul proof integer 8x8 matmul — THE CROWN.
 fn gpu_matmul_write_shader(shader_phys) {
     matmul_i32_write(shader_phys);
     return 0;
@@ -5111,7 +5111,7 @@ fn gpu_matmul_write_shader(shader_phys) {
 # proven PM4 dispatch envelope (I-cache invalidate -> SET_SH_REG USER_DATA=A,B,C ->
 # DISPATCH_DIRECT -> CS flush -> TCWB -> fence WRITE_DATA), submit via register-wptr,
 # and spin the watchdog. Returns 1 = fence fired, 0 = timeout. Leaves C[tid] in the
-# carveout. Shared by the C2g-4 boot proof and the C2h dispatch syscall.
+# carveout. Shared by the the integer matmul proof boot proof and the the ring-3 dispatch seam (#82) dispatch syscall.
 fn gpu_matmul_run(shader_mc, a_mc, b_mc, c_mc, done_mc, done_phys, rsrc1) {
     store32(done_phys, GPU_MT_NOTYET);
     gpu_mfence();
@@ -5185,7 +5185,7 @@ fn gpu_shader_dispatch5() {
     var done_phys   = gpu_arena_phys + GPU_SHADER_DONE_SUBOFF;
     var done_mc     = gpu_arena_mc   + GPU_SHADER_DONE_SUBOFF;
 
-    # 1. Shader — the C2g-4 8x8 integer-matmul kernel (factored to gpu_matmul_write_shader).
+    # 1. Shader — the the integer matmul proof 8x8 integer-matmul kernel (factored to gpu_matmul_write_shader).
     gpu_matmul_write_shader(shader_phys);
 
     # 2. Pre-seed A[i]=i+1, B[i]=i+1 (64 each), C[64]=NOTYET.
@@ -5242,11 +5242,11 @@ fn gpu_shader_dispatch5() {
     return 0;
 }
 
-# === C2h: ring-3 GPU-compute dispatch (syscall #82) ===
+# === the ring-3 dispatch seam (#82): ring-3 GPU-compute dispatch (syscall #82) ===
 # gpu_dispatch(a_uva, b_uva, c_uva): run the proven 8x8 integer matmul on the
 # userspace-supplied A,B (64 i32 each, row-major) and write C (64 i32, C=A*B) to
 # c_uva. This is the ring-3 seam the sovereign GPU compute libraries (mabda /
-# tentib) consume — the SAME PM4 envelope as the C2g-4 boot proof, driven by
+# tentib) consume — the SAME PM4 envelope as the the integer matmul proof boot proof, driven by
 # caller data instead of a kernel-baked pattern. Returns 0 ok; -1 GPU not ready;
 # -2 dispatch did not complete; -3 VM fault.
 #
@@ -5393,7 +5393,7 @@ fn gpu_matmul_write_shader_f64(shader_phys) {
     return 0;
 }
 
-# gpu_shader_dispatch_f64 — the f64 matmul BOOT PROOF (analog of the C2g-4 integer crown). Seeds
+# gpu_shader_dispatch_f64 — the f64 matmul BOOT PROOF (analog of the the integer matmul proof integer crown). Seeds
 # A[i]=B[i]=(i+1).0 as f64, runs the f64 shader through the proven dispatch envelope (RSRC1_F64 = 16
 # VGPRs), and verifies each C[tid] bit-for-bit against the CPU integer reference converted to f64 bits.
 # PASS proves f64 matmul EXECUTES on the shader cores + is bit-correct for exact-integer data; the
@@ -6192,7 +6192,7 @@ fn gpu_scanout_regdump() {
     return 0;
 }
 
-# gpu_sdma_probe — P9.0 READ-ONLY SDMA0 discovery dump (2026-07-20). SDMA is a genuine NEW engine ring: the
+# gpu_sdma_probe — the SDMA register discovery READ-ONLY SDMA0 discovery dump (2026-07-20). SDMA is a genuine NEW engine ring: the
 # ONLY existing reference is GPU_BASE_SDMA0_0=0x1260 (the IP base), with NO register offsets and NO code. Per
 # the hard P4 lesson (never WRITE a derived GPU offset — anchor it read-only first; see
 # reference_agnos_dcn_hubp_reg_offsets_derived), this dumps the SDMA0 block to klug so the REAL ring/status/
@@ -6217,7 +6217,7 @@ fn gpu_sdma_probe() {
     return 0;
 }
 
-# gpu_sdma_route_doorbell — P9.2c: program the NBIO to ROUTE SDMA0's doorbell byte-range (0x780) to the engine.
+# gpu_sdma_route_doorbell — the SDMA doorbell-routing attempt: program the NBIO to ROUTE SDMA0's doorbell byte-range (0x780) to the engine.
 # The GOP never uses SDMA so it never set this up (the MEC's analog, CP_MEC_DOORBELL_RANGE, IS set — that's why
 # the compute doorbell works). Written to GDC0_BIF_SDMA0_DOORBELL_RANGE via the BIF RSMU indirect port
 # (INDEX←target*4, then DATA). ⚠ THE ONE RISKY WRITE OF THE ARC — a wrong NBIO base could hit an unrelated BIF
@@ -6249,18 +6249,18 @@ fn gpu_sdma_route_doorbell() {
     return 1;
 }
 
-# gpu_sdma_bringup — P9.1: bring up the SDMA0 GFX ring (the hardware fill/copy engine for 2D). Mirrors the
-# proven MEC ring bring-up (gpu_queue_setup): (P9.0.5) PSP-load the SDMA ucode — the F32 is HALTED at boot and
+# gpu_sdma_bringup — the SDMA ring bring-up: bring up the SDMA0 GFX ring (the hardware fill/copy engine for 2D). Mirrors the
+# proven MEC ring bring-up (gpu_queue_setup): (the SDMA firmware load) PSP-load the SDMA ucode — the F32 is HALTED at boot and
 # agnos loads only CP/MEC, so it is NOT resident — then un-halt the F32 and program the GFX ring registers
 # (regdump-anchored offsets), and read back the ANSWER registers (HALT→0, STATUS.IDLE). NO packet, NO wptr bump,
-# NO doorbell kick — that is P9.2. Configured with RB DISABLED, RB_ENABLE set LAST, so the engine cannot fetch
+# NO doorbell kick — that is the first SDMA packet. Configured with RB DISABLED, RB_ENABLE set LAST, so the engine cannot fetch
 # during setup. Gated #ifdef SDMA_RING; runs after gpu_vm_setup armed the 2 MB-UC-mapped arena the ring lives in.
 fn gpu_sdma_bringup() {
     if (gpu_present == 0) { return 0; }
     if (gpu_psp_ring2 == 0) { return 0; }
     if (gpu_arena_mc == 0) { return 0; }
 
-    # P9.0.5 — PSP-load SDMA0 ucode (same validated path as CP/MEC; needs /fw/sdma.bin on the agnos-fs).
+    # the SDMA firmware load — PSP-load SDMA0 ucode (same validated path as CP/MEC; needs /fw/sdma.bin on the agnos-fs).
     var fw = gpu_fw_load_one("/fw/sdma.bin", 12, GPU_FW_TYPE_SDMA0, 0);
     if (fw != 1) { kprintln("gpu: SDMA firmware load failed (/fw/sdma.bin)", 45); return 0; }
     kprintln("gpu: SDMA firmware loaded (PSP-validated)", 41);
@@ -6283,7 +6283,7 @@ fn gpu_sdma_bringup() {
         return 0;
     }
 
-    # Start-sequence steps P9.1 omitted (sdma_v4_0_start): AUTO_CTXSW so the microcode SCHEDULES the GFX queue
+    # Start-sequence steps the SDMA ring bring-up omitted (sdma_v4_0_start): AUTO_CTXSW so the microcode SCHEDULES the GFX queue
     # (un-halt + RB_ENABLE alone don't — the strongest fetch suspect), and zero the semaphore-fail timer. UTC_L1
     # is left OFF on purpose: agnos fetches from FLAT FB-aperture MC addrs with paging disabled (no VMID0 page
     # table), so enabling VA translation here would fault the fetch, not fix it. RMW (answer reg, preserve bits).
@@ -6308,7 +6308,7 @@ fn gpu_sdma_bringup() {
     # Release the atomic wptr-commit gate: gfx_resume leaves MINOR_PTR_UPDATE=0 after programming wptr. If PSP/HW
     # left it latched at 1, every wptr update (register OR doorbell) is HELD → rptr stuck at 0 (our exact symptom).
     gpu_reg32_write(GPU_BASE_SDMA0_0, GPU_R_SDMA0_MINOR_PTR_UPDATE, 0);
-    # DISABLE the doorbell. archaemenid's doorbell aperture does NOT deliver (P9.2f: SDMA GFX_DOORBELL.CAPTURED
+    # DISABLE the doorbell. archaemenid's doorbell aperture does NOT deliver (the SDMA GFX-ring finding: SDMA GFX_DOORBELL.CAPTURED
     # read 0 after a routed kick; AND the MEC compute doorbell fails identically — agnos submits compute via a
     # direct CP_HQD_PQ_WPTR_LO register write, its own code says "doorbell did NOT advance wptr; a direct
     # CP_HQD_PQ_WPTR_LO write DID"). So submit via the RB_WPTR register (direct MMIO — the one wptr channel proven
@@ -6345,14 +6345,14 @@ fn gpu_sdma_bringup() {
     return 0;
 }
 
-# gpu_sdma_copy_test — P9.2: the first SDMA PACKET. Proves the ring FETCHES + EXECUTES + the result is
+# gpu_sdma_copy_test — the first SDMA packet: the first SDMA PACKET. Proves the ring FETCHES + EXECUTES + the result is
 # CPU-visible — the first hardware 2D on sovereign agnos. Writes ONE COPY_LINEAR (4 KB carveout→carveout) plus a
 # FENCE (SDMA_OP_FENCE) into the ring, kicks via the RB_WPTR register (amdgpu non-doorbell path; wptr in BYTES),
 # and gates completion on the FENCE SENTINEL going CPU-visible — NOT on rptr (agnos already hit the GPU→DRAM
 # GL2-coherence strand on this iron, so an rptr-only gate could false-GREEN with stale dst; the fence is ordered
 # after the copy's writes on the same engine, so sentinel-visible ⟹ copy committed, else an honest TIMEOUT).
 # Addresses are FLAT FB-aperture MC (gpu_arena_mc + suboff) — VMID0 paging is disabled, same domain the compute
-# path proved; no page tables. Gated #ifdef SDMA_COPY; needs the ring up (gpu_sdma_ready from P9.1).
+# path proved; no page tables. Gated #ifdef SDMA_COPY; needs the ring up (gpu_sdma_ready from the SDMA ring bring-up).
 fn gpu_sdma_copy_test() {
     if (gpu_present == 0) { return 0; }
     if (gpu_sdma_ready != 1) { kprintln("gpu: sdma copy skipped (ring not ready)", 39); return 0; }

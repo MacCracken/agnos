@@ -194,6 +194,25 @@ Estimated **~56 VGPRs** with the channel loop rolled and colour bytes re-extract
 
 ## 2. THE DIVISION ANSWER — SETTLED, AND EXACT
 
+> ⛔ **CORRECTION, 2026-07-26, from building the reference and the corpus.** This section claims
+> `t = bitlen64(D255) - 30` lands in **[10, 31]**. It does not, at either end, and the corpus
+> measures **[2, 18]**:
+> * **The upper end is unconstructible.** Edge coordinates are bounded at ±2^28 in 16.16
+>   (`GPU_EDGE_COORD_MAX`, i.e. ±4096 px), so the largest legal cross product is ~2^24 and
+>   `2A ~ 2^40`, giving `t ~ 18`. The "2A just below AREA_MAX ⇒ t = 31" case **cannot be written**
+>   and no corpus entry claims it.
+> * **The lower end excludes ordinary geometry.** `t ≥ 10` needs an area above ~16500 px², so
+>   every triangle smaller than roughly 128×128 falls below it. The reference originally *refused*
+>   those as degenerate. A 16×16 frame measures `t = 2`.
+> * **`L ∈ {1, 2}` is wrong for the same reason** — smaller frames need a longer normalising
+>   shift. The invariant that actually matters is the one `recip32` depends on:
+>   `Dh << L ∈ [2^31, 2^32)`. That is what is asserted now; `L` itself is unconstrained.
+>
+> `t` is clamped at 0 (`t = max(0, bitlen64(D255) - 30)`): when `D255` already fits in 30 bits
+> there is nothing to normalise, and a negative shift is meaningless. **Nothing else in the design
+> moves** — the shift exists only to put `Dh` in `recip32`'s domain, and it still does.
+
+
 **`src'_ch = floor((N_ch + D255/2) / D255)` is the EXACT round-half-up of the EXACT rational, computed with one hoisted 32-bit reciprocal per record and 25 branch-free VALU plus one exact 96-bit correction per channel. There is no runtime division, no float, and no fixed-point barycentric anywhere in the interpolation path.**
 
 ### 2.1 What is divided, and why it hoists
@@ -342,6 +361,15 @@ That is `grad_ref_px` (`gpu.cyr:3007-3025`) character-for-character. **Checked f
 ⭐ **`GPU_GRD_H = 200` ⇒ `den = 199`, ODD — the SHIPPED self-test constants exercise precisely the branch that could have diverged.**
 
 The src-over tail closes the chain: `grad_ref`'s `(sc·255 + dc·ia + 127)/255 = sc + floor((dc·ia+127)/255) = sc + round-half-up(dc·ia/255)`, which `blend_pk.s:55-56` proves equals the f32 `sc + dc·fma(sa, −1/255, 1)` over all 8,421,376 premultiplied triples. And the interior coverage is exactly 255 (a fully-covered pixel accumulates `R_ONE = 65536`, and `(65536·255)>>16 = 255` exactly).
+
+> ⛔ **CORRECTION, 2026-07-26, from building the model.** The specified parity falsification —
+> *"`den` odd must still be bit-exact"* — is **unconstructible**. `D255 = 255 · 2A` and `2A` carries
+> a `<< 16`, so `D255` always has at least 16 trailing zeros and **can never be odd**. The mutation
+> it proposed (bias → `(D255−1)/2`) broke exactly the same 33 pixels as the skip-the-correction
+> gate, because both perturb the same rounding boundary — two gates reporting identical failures
+> are one gate. Replaced by the **E-clamp refutation** (Decision 4 / §1.3), which the plan wanted
+> recorded as a test rather than as prose: clamping each weight into `[0, 2A]` breaks **3246**
+> pixels, so the rejection of that design is now measured, not asserted.
 
 ### 3.2 The four gates as they will be written into the row
 

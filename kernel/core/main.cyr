@@ -864,21 +864,21 @@ gpu_fw_load_set();
 # See kernel/core/gpu.cyr gpu_engine_start().
 gpu_engine_start();
 
-# GPU arc C2a (1.54.x) — read-only GMC/GFXHUB VM-state probe: is there a reusable
-# GART, or must C2b build page tables? (Answer, derived: neither — place compute
+# GPU arc the GMC/VM state probe (1.54.x) — read-only GMC/GFXHUB VM-state probe: is there a reusable
+# GART, or must the FB-aperture arena setup build page tables? (Answer, derived: neither — place compute
 # scratch in the UMA carveout + address it through the BIOS-set FB aperture, ZERO
 # page tables.) Pure reads; zero device writes; no hang path. Iron-only; no-op off
 # an AMD GPU. See kernel/core/gpu.cyr gpu_gpuvm_probe().
 gpu_gpuvm_probe();
 
-# GPU arc C2b (1.54.x) — GFXHUB GMC setup: arm a carveout compute arena reachable via
+# GPU arc the FB-aperture arena setup (1.54.x) — GFXHUB GMC setup: arm a carveout compute arena reachable via
 # the FB aperture (ZERO page tables — VM_CONTEXT0 stays disabled = fault-storm designed
 # out), enable the L2/UTCL2 datapath, arm the fault-net, TLB-flush. GMC config only, no
-# engine fetch — cannot itself wedge. Iron-only; no-op off an AMD GPU. Runs after C2a.
+# engine fetch — cannot itself wedge. Iron-only; no-op off an AMD GPU. Runs after the GMC/VM state probe.
 # See kernel/core/gpu.cyr gpu_vm_setup().
 gpu_vm_setup();
 
-# GPU arc 1.55.x (Thrust P) P9.1 — SDMA0 GFX-ring bring-up (hardware 2D fill/copy engine). PSP-loads the SDMA
+# GPU arc 1.55.x (Thrust P) the SDMA ring bring-up — SDMA0 GFX-ring bring-up (hardware 2D fill/copy engine). PSP-loads the SDMA
 # ucode (F32 is halted at boot; agnos loads only CP/MEC), un-halts the F32, and programs the ring registers
 # (regdump-anchored). NO packet/kick — verifies the engine un-halts + goes idle. Runs after gpu_vm_setup armed
 # the arena; the ring lives in the same 2 MB-UC-mapped arena. Gated #ifdef SDMA_RING; needs /fw/sdma.bin on the
@@ -888,60 +888,60 @@ kprintln("gpu: sdma ring bringup armed", 28);
 gpu_sdma_bringup();
 #endif
 
-# P9.2 — first SDMA packet: one COPY_LINEAR (4 KB carveout→carveout) + FENCE, kicked via RB_WPTR, gated on the
+# the first SDMA packet — first SDMA packet: one COPY_LINEAR (4 KB carveout→carveout) + FENCE, kicked via RB_WPTR, gated on the
 # fence sentinel. Proves the ring FETCHES + EXECUTES + the copy is CPU-visible (first hardware 2D). Needs the
 # ring up (SDMA_RING). First iron burn: BURN_SDMA_COPY (which builds SDMA_RING + SDMA_COPY together).
 #ifdef SDMA_COPY
 gpu_sdma_copy_test();
 #endif
 
-# GPU arc C2c (1.54.x) — map an EMPTY compute queue (MEC1/pipe0/queue0) via direct HQD
+# GPU arc the compute-queue HQD setup (1.54.x) — map an EMPTY compute queue (MEC1/pipe0/queue0) via direct HQD
 # register programming (GRBM-select → 20 CP_HQD_* writes, ACTIVE last → deselect). The ring
 # stays empty (wptr==rptr==0) so the MEC makes zero memory accesses — isolates the HQD recipe
-# from VM/fetch (C2d rings the doorbell). Low hang-risk. Runs after C2b armed the arena.
+# from VM/fetch (the first PM4 fetch rings the doorbell). Low hang-risk. Runs after the FB-aperture arena setup armed the arena.
 # See kernel/core/gpu.cyr gpu_queue_setup().
 gpu_queue_setup();
 
-# GPU arc C2d (1.54.x) — first PM4 packet: write an 8-dword NOP into the ring, ring the
+# GPU arc the first PM4 fetch (1.54.x) — first PM4 packet: write an 8-dword NOP into the ring, ring the
 # doorbell, and watch the MEC fetch it through the FB aperture (the VM-fetch gate). The
 # HIGHEST hang-risk bite — but CPU-wedge-safe (posted doorbell + fault-net + a BOUNDED
-# watchdog, never spins). Runs after C2c mapped the queue. Iron-only; no-op off an AMD GPU.
+# watchdog, never spins). Runs after the compute-queue HQD setup mapped the queue. Iron-only; no-op off an AMD GPU.
 # See kernel/core/gpu.cyr gpu_ring_kick().
 gpu_ring_kick();
 
-# GPU arc C2e (1.54.x) — WRITE_DATA fence: after C2d proved the MEC FETCHES, C2e has it
+# GPU arc the WRITE_DATA fence (1.54.x) — WRITE_DATA fence: after the first PM4 fetch proved the MEC FETCHES, the WRITE_DATA fence has it
 # EXECUTE one PACKET3_WRITE_DATA that writes a sentinel to a carveout slot the CPU reads
 # back — proving execution AND that a MEC memory write is CPU-visible (the coherence the
-# shader/matmul readbacks in C2f/C2g depend on; also disambiguates C2d's rmem=0). Gated on
-# C2d success inside gpu_fence(). Same wedge-safe envelope. See kernel/core/gpu.cyr gpu_fence().
+# shader/matmul readbacks in the first shader dispatch/the matmul dispatch series depend on; also disambiguates the first PM4 fetch's rmem=0). Gated on
+# the first PM4 fetch success inside gpu_fence(). Same wedge-safe envelope. See kernel/core/gpu.cyr gpu_fence().
 gpu_fence();
 
-# GPU arc C2f (1.54.x) — first hand-assembled gfx90c compute shader. A minimal single-thread
+# GPU arc the first shader dispatch (1.54.x) — first hand-assembled gfx90c compute shader. A minimal single-thread
 # shader writes a constant to the carveout via global_store_dword; the CPU reads it back. First
 # arbitrary ISA on the shader cores. Ring program = SET_SH_REG compute config + DISPATCH_DIRECT +
-# CS_PARTIAL_FLUSH drain + ACQUIRE_MEM L2-writeback + WRITE_DATA done-marker. Gated on C2e (fence
+# CS_PARTIAL_FLUSH drain + ACQUIRE_MEM L2-writeback + WRITE_DATA done-marker. Gated on the WRITE_DATA fence (fence
 # proven) inside gpu_shader_dispatch(). Same wedge-safe envelope. See kernel/core/gpu.cyr.
 gpu_shader_dispatch();
 
-# GPU arc C2g-1 (1.54.x) — first MULTI-THREAD dispatch: 64 threads in one workgroup, each writes
-# its workitem-id to out[tid]; CPU verifies out[i]==i. First sub-bite of the C2g matmul crown —
-# proves grid/workgroup dispatch + workitem-id read + per-thread 64-bit addressing. Gated on C2f
+# GPU arc the first 64-thread dispatch (1.54.x) — first MULTI-THREAD dispatch: 64 threads in one workgroup, each writes
+# its workitem-id to out[tid]; CPU verifies out[i]==i. First sub-bite of the the matmul dispatch series matmul crown —
+# proves grid/workgroup dispatch + workitem-id read + per-thread 64-bit addressing. Gated on the first shader dispatch
 # (shader proven) inside gpu_shader_dispatch2(). Same wedge-safe envelope. See kernel/core/gpu.cyr.
 gpu_shader_dispatch2();
 
-# GPU arc C2g-2 (1.54.x) — compute KERNARGS: pass input+output base pointers via COMPUTE_USER_DATA
+# GPU arc the kernarg dispatch (1.54.x) — compute KERNARGS: pass input+output base pointers via COMPUTE_USER_DATA
 # (SPI preloads s0..s3), shader does out[tid]=in[tid]. Proves per-lane operand reads through kernarg
-# pointers — the last primitive before rosnet matmul. Gated on C2g-1 inside gpu_shader_dispatch3().
+# pointers — the last primitive before rosnet matmul. Gated on the first 64-thread dispatch inside gpu_shader_dispatch3().
 gpu_shader_dispatch3();
 
-# GPU arc C2g-3 (1.54.x) — ALU + reduction LOOP: each of 64 lanes runs matmul's inner loop, an integer
+# GPU arc the dot-product dispatch (1.54.x) — ALU + reduction LOOP: each of 64 lanes runs matmul's inner loop, an integer
 # dot product out[tid]=sum_k a[tid*K+k]*b[tid*K+k] via a real branch loop + multiply-accumulate. The last
-# primitive before rosnet matmul (C2g-4). Gated on C2g-2 inside gpu_shader_dispatch4().
+# primitive before rosnet matmul (the integer matmul proof). Gated on the kernarg dispatch inside gpu_shader_dispatch4().
 gpu_shader_dispatch4();
 
-# GPU arc C2g-4 (1.54.x) — THE CROWN: real integer tiled matmul C[8x8]=A*B on the shader cores, each of
+# GPU arc the integer matmul proof (1.54.x) — THE CROWN: real integer tiled matmul C[8x8]=A*B on the shader cores, each of
 # 64 lanes computing one output element via the proven kernarg + loop + MAC primitives, bit-correct vs the
-# CPU. This is the matmul that attn11/tentib ML layers ride onto the GPU. Gated on C2g-3 in dispatch5().
+# CPU. This is the matmul that attn11/tentib ML layers ride onto the GPU. Gated on the dot-product dispatch in dispatch5().
 gpu_shader_dispatch5();
 
 # GPU arc f64 (1.54.x) — full-precision 8x8 matmul on the shader cores (attn11's path): the integer
@@ -957,10 +957,10 @@ gpu_shader_dispatch_f64();
 # (a fused FMA would diverge). Gated on the exact-int f64 proof inside gpu_shader_dispatch_f64_fidelity().
 gpu_shader_dispatch_f64_fidelity();
 
-# GPU arc 1.55.x (Thrust P) P9 — 2D via CP-DMA (PIVOTED off SDMA). The SDMA engine never fetched on this
+# GPU arc 1.55.x (Thrust P) the 2D-acceleration bite — 2D via CP-DMA (PIVOTED off SDMA). The SDMA engine never fetched on this
 # box (doorbell + register-wptr both failed); but 2D copy doesn't need SDMA — the PROVEN compute ring can
 # carry a PM4 DMA_DATA (CP-DMA) packet. gpu_cp_dma_copy() appends one 4 KB carveout->carveout copy + a
-# WRITE_DATA done-marker to the ring C2d/C2e already proved, kicks via the register-wptr path, and verifies
+# WRITE_DATA done-marker to the ring the first PM4 fetch/the WRITE_DATA fence already proved, kicks via the register-wptr path, and verifies
 # dst==src — the first hardware 2D on agnos, no new engine/doorbell/firmware. Gated on gpu_fence_ok.
 # First iron burn: BURN_CP_DMA_COPY.
 #ifdef CP_DMA_COPY
@@ -969,7 +969,7 @@ gpu_cp_dma_fill_test();
 gpu_cp_dma_blit_test();
 #endif
 
-# GPU arc 1.55.x (Thrust P) P9.0 — READ-ONLY SDMA0 discovery. SDMA (System DMA) is the engine P9 rings up for
+# GPU arc 1.55.x (Thrust P) the SDMA register discovery — READ-ONLY SDMA0 discovery. SDMA (System DMA) is the engine the 2D-acceleration bite rings up for
 # hardware 2D (fill/copy/blit off the CPU). It's a genuine new engine — only the IP base (0x1260) is known. Per
 # the P4 lesson, anchor the real register offsets read-only BEFORE writing any. Also reports if SDMA ucode is
 # resident (the compute fw-load doesn't load it). Gated off by default; the first burn is `BURN_SDMA_PROBE`.
