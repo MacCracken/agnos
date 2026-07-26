@@ -44,6 +44,75 @@ byte-identically** — 50/50 cases (8 corpus + 2 shared-edge quads + 40 random m
 accumulation is associative, so summation order genuinely does not matter. This is the structural
 premise the whole one-lane-per-pixel design rests on, and it is now measured rather than assumed.
 
+### Added — bite **B7**: the kernel seam. `gpu_edge_cov` now dispatches, for real
+
+- **Arena slots**: `GPU_EDGE_SETUP_SUBOFF = 0x57000` (slot 7) alongside the `0x56000` reserved at
+  9a, and `GPU_EDGE_PREP_SUBOFF = 0xD0000` for the 32-byte-per-edge prep table the two dispatches
+  hand between them — sized for the ABI cap of 256 even though `EDGE_CAP` ships at 64, so raising
+  the cap needs no slot move. `GPU_HIGHEST_PUBLISHED_SLOT` raised `0xC0000` → `0xD0000`; the
+  sacrificial slot at `0x1F0000` still clears it, and `check.sh`'s unaliased-slot gate is green.
+- **Both blob tables** (`edge_setup_write` 58 dwords, `edge_cov_write` 133) next to
+  `blend_cov_write`, every dword byte-verified by two independent assemblers at B6.
+- **`gpu_edge_arm()` is now real** — the 5-gate peer of `gpu_cov_arm`, writing **both** blobs
+  before one `gpu_mfence()`. ⚠ Arming half of it would leave the rasteriser dispatching against a
+  prep table of zeros: every crossing would come out at `ax` and the picture would be *wrong*,
+  not absent.
+- **`gpu_edge_cov()` does the two dispatches** through the **unmodified** `gpu_blend_cov_run` —
+  no dispatcher change, no new PM4, because both kernels' RSRC2 is already the shipped
+  `GPU_COMPUTE_RSRC2_COV`. Dispatch 1 grids over **edges** `((ne+63)/64, 1)`, dispatch 2 over
+  **pixels** `((w+63)/64, h)`.
+- ⛔ Two sequential calls, **not** one chained submission: each already emits its own
+  `ACQUIRE_MEM` → `DISPATCH_DIRECT` → `CS_PARTIAL_FLUSH` → `TCWB` → fence, which *is* the
+  S3-proven producer→consumer pattern. Chaining saves ~60 µs and needs PM4 agnos has never run.
+- ⛔ `gpu_blend_cov_run`'s duplicated `TCWB` packets and the mis-attributed coherence comment
+  were **left untouched**, per the plan. Removing a coherence packet is the class that cost eight
+  burns at C2g-1.
+
+### Fixed — the plan's selftest flip was wrong for the only environment the test runs in
+
+The plan said to flip `edge_abi_selftest`'s well-formed expectation from `GPO_E_ARM` to `0` in the
+bite that arms the shader. That is right **on iron** — but this battery runs in **QEMU**, where
+`gpu_present == 0`, so `gpu_edge_arm()` correctly returns 0 and a perfectly valid record is
+correctly rejected at residency. A hard `0` made the gate permanently red in the only environment
+it runs in (observed: 17/20, three "in range" cases failing).
+
+`ea_expect_valid()` now accepts **exactly two** answers and **names which it saw** — `accepted`
+or `GPO_E_ARM -- no GPU in this environment`. Still a real check: every *other* reject code is
+excluded, so a validation bug on a well-formed record fails it. What it no longer does is confuse
+"no GPU in this VM" with "the ABI is broken".
+
+### Fixed — ⭐ the envelope rejects were unreachable by any test, and one violated the ABI's own rule
+
+Mutating `gpu_edge_cov` — deleting the `rule` reject, deleting the `EDGE_CAP` reject, arming only
+one of the two blobs — left `edge-abi-smoke` **fully green**. The battery exercises
+`gpo_validate_edge`; **`gpu_edge_cov` never runs in QEMU at all**, so its rejects had no oracle.
+
+Worse, rejecting EVENODD *inside the worker* meant the ABI **accepted `rule = 1` and then silently
+failed it** — precisely what the flags-word rule forbids ("a flag that is accepted and ignored is
+how a caller silently gets behaviour it did not ask for"). Both rejects moved to the **validator**:
+
+- `rule != NONZERO` → `GPO_E_RULE`. `refraster.cyr` implements `wind != 0` and nothing else, so an
+  EVENODD path would ship with **no oracle**; refusing keeps the accepted surface equal to the
+  proven surface.
+- `n_edges > GPU_EDGE_CAP` (the **shipped** 64, not the ABI's 256) → `GPO_E_EDGEBUF`.
+
+Battery **20 → 22 cases**, smoke **14/14**, and the mutation that deletes the EVENODD reject now
+fails it. The worker keeps both checks as defence-in-depth.
+
+⚠ **Recorded, not papered over:** the two-dispatch sequence itself still has **no zero-burn
+oracle**. QEMU has no GPU, so `gpu_edge_cov`'s dispatch path — kernarg order, grid shape, blob
+residency — is unverified until the first iron burn. That is B9's job and it is why B9 carries
+three independent oracles rather than one.
+
+### Deferred — the dispatch timeout stays inherited at 100 ms
+
+The plan asked for a passed-through timeout. `gpu_blend_cov_run` hardcodes
+`gpu_ring_kick_wait(done_phys, 100000)` and adding a parameter would touch every unrelated caller
+— in a bite the plan also tells me not to disturb that function's coherence packets. At
+`EDGE_CAP = 64` on corpus-sized masks the model puts the dispatch three orders of magnitude inside
+the watchdog, so the deferral is safe now and becomes load-bearing only when B10 raises the
+envelope. **Trigger: parameterise it in the same bite that raises `EDGE_CAP`.**
+
 ### Added — bite **B6**: both rung-9b shaders, byte-verified against an independent assembler
 
 `kernel/shaders/edge_setup.s` (53 instructions) and `kernel/shaders/edge_cov.s` (114) — **167

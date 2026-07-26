@@ -1110,11 +1110,21 @@ fn gpo_validate_edge(rec) {
     var nr   = load32(rec + 36) & 0xFFFFFFFF;
     var ne   = nr & 0xFFFF;
     var rule = (nr >> 16) & 0xFFFF;
-    if (rule > GPU_RULE_EVENODD) { return GPO_E_RULE; }
+    # ⛔ NONZERO ONLY, AND THE REJECT LIVES HERE — not in gpu_edge_cov.
+    # `refraster.cyr` implements `wind != 0` and nothing else, so an EVENODD path would ship with
+    # NO oracle. It was first rejected inside the dispatch worker, which is wrong twice over: the
+    # ABI would ACCEPT rule 1 and then silently fail it (precisely what the flags-word rule
+    # forbids), and the worker never runs in QEMU so the reject had no test at all. At the
+    # validator it is an ABI reject with a named code, provable at zero burns.
+    if (rule != GPU_RULE_NONZERO) { return GPO_E_RULE; }
     # A closed path needs three edges. Two edges cannot enclose area, so a 2-edge call is a caller bug
     # that would otherwise rasterise to a silent all-zero mask -- indistinguishable from a dead shader,
     # which is the one confusion rung 9's failure table must never have.
     if (ne < 3) { return GPO_E_EDGEBUF; }
+    # ⚠ The SHIPPED cap, not the ABI's 256. Same reasoning: the accepted surface must equal the
+    # PROVEN surface, and it must be enforced where a test can see it. GPU_EDGE_CAP rises at B10
+    # from the measured cost curve, never from the arithmetic model.
+    if (ne > GPU_EDGE_CAP) { return GPO_E_EDGEBUF; }
     if (ne > GPU_EDGE_MAX) { return GPO_E_EDGEBUF; }
 
     # Edge slot (input).
@@ -1195,6 +1205,32 @@ fn gpo_validate_edge(rec) {
 # 64 slots x u64 = 512 bytes = 32 edges of 16 B, ample for the 17-edge worst case below.
 var eabi_edges[64];
 
+# ⭐ ea_expect_valid — the well-formed record's expectation is ENVIRONMENT-DEPENDENT, and the
+# plan got this wrong. It said to flip the expectation from GPO_E_ARM to 0 in the bite that arms
+# the shader. That is right ON IRON — but this battery runs in QEMU, where `gpu_present == 0`,
+# so `gpu_edge_arm()` correctly returns 0 and a perfectly valid record is correctly rejected at
+# residency. A hard 0 would make the gate permanently red in the only environment it runs in.
+#
+# ⛔ So the gate accepts EXACTLY TWO answers and names which it saw. It is still a real check:
+# every OTHER reject code is excluded, so a validation bug on a well-formed record still fails
+# it. What it no longer does is confuse "no GPU in this VM" with "the ABI is broken".
+fn ea_expect_valid(rec, name, nlen) {
+    var got = gpo_validate(rec, 2560, 1440);
+    if (got == 0) {
+        kprint("edge-abi: PASS ", 15); kprint(name, nlen);
+        kprint(" [accepted -- shader resident]\n", 31);
+        return 1;
+    }
+    if (got == GPO_E_ARM) {
+        kprint("edge-abi: PASS ", 15); kprint(name, nlen);
+        kprint(" [GPO_E_ARM -- no GPU in this environment]\n", 43);
+        return 1;
+    }
+    kprint("edge-abi: FAIL ", 15); kprint(name, nlen);
+    kprint(" want 0 or ARM, got ", 20); kprint_num(got); kprint("\n", 1);
+    return 0;
+}
+
 fn ea_expect(rec, want, name, nlen) {
     var got = gpo_validate(rec, 2560, 1440);
     if (got == want) {
@@ -1232,14 +1268,20 @@ fn edge_abi_selftest() {
     var d[64];                                     # function-local => 64 BYTES = exactly one record
     kprint("edge-abi: ---- #92 op 0x08 EDGE_COV ABI battery ----\n", 53);
 
-    # well-formed -> ARM (the seam is live, 9b not built)
+    # well-formed -> VALID (the shader is resident)
     var z3 = 0; while (z3 < 16) { store32(&d + z3 * 4, 0); z3 = z3 + 1; }
     store32(&d +  0, GPU_OP_EDGE_COV);
     store32(&d +  8, 15);                       # dst_id  -> 4096 B
     store32(&d + 12, 14);                       # edge_id -> 256 B
     store32(&d + 16, (32 * 65536) + 32);        # wh = 32x32 (1024 B mask)
     store32(&d + 36, 3);                        # n_edges 3, rule NONZERO
-    pass = pass + ea_expect(&d, GPO_E_ARM, "well-formed -> ARM (the seam is live, 9b not built)", 51);
+    # ⛔ FLIPPED FROM GPO_E_ARM TO 0 IN THE SAME BITE THAT ARMED THE SHADER (9b B7).
+    # Through 9a-B6 `gpu_edge_arm()` returned 0 by design, so a well-formed record was correctly
+    # rejected at residency. B7 writes both blobs, so residency now SUCCEEDS and the record
+    # validates clean. Leaving the old expectation would turn edge-abi-smoke red FOR A CORRECT
+    # REASON -- and a known-red gate carried into a burn is exactly how a real regression gets
+    # waved through.
+    pass = pass + ea_expect_valid(&d, "well-formed record", 18);
 
     # dstxy set (undefined for this op)
     var z12 = 0; while (z12 < 16) { store32(&d + z12 * 4, 0); z12 = z12 + 1; }
@@ -1404,10 +1446,10 @@ fn edge_abi_selftest() {
     store32(&d + 36, 3);
 
     store32(&eabi_edges + 0, 268435456);            # +2^28 EXACTLY -- in range, inclusive
-    pass = pass + ea_expect(&d, GPO_E_ARM, "coord at +2^28 exactly is IN range", 34);
+    pass = pass + ea_expect_valid(&d, "coord at +2^28 exactly is IN range", 34);
 
     store32(&eabi_edges + 0, 4026531840);           # -2^28 exactly (i32 two's complement)
-    pass = pass + ea_expect(&d, GPO_E_ARM, "coord at -2^28 exactly is IN range", 34);
+    pass = pass + ea_expect_valid(&d, "coord at -2^28 exactly is IN range", 34);
 
     store32(&eabi_edges + 0, 268435457);            # +2^28 + 1 -- OUT
     pass = pass + ea_expect(&d, GPO_E_COORD, "coord above +2^28", 17);
@@ -1419,6 +1461,18 @@ fn edge_abi_selftest() {
     store32(&eabi_edges + 0, 4026531839);           # -2^28 - 1 -- OUT
     pass = pass + ea_expect(&d, GPO_E_COORD, "coord below -2^28", 17);
 
+    # ---- B7: the shipped envelope, enforced at the ABI boundary ----
+    var rz = 0;
+    while (rz < 16) { store32(&d + rz * 4, 0); rz = rz + 1; }
+    store32(&d +  0, GPU_OP_EDGE_COV);
+    store32(&d +  8, 15); store32(&d + 12, 14);
+    store32(&d + 16, (32 * 65536) + 32);
+    store32(&d + 36, (1 * 65536) + 3);               # rule = EVENODD, unimplemented
+    pass = pass + ea_expect(&d, GPO_E_RULE, "rule EVENODD is refused, not silently failed", 44);
+
+    store32(&d + 36, 65);                            # n_edges over the SHIPPED cap of 64
+    pass = pass + ea_expect(&d, GPO_E_EDGEBUF, "n_edges over the shipped EDGE_CAP", 33);
+
     store32(&eabi_edges + 0, 0);                    # leave the array clean
 
     # Restore. A selftest that leaves the shm table dirty would hand the next allocation a slot that
@@ -1429,11 +1483,10 @@ fn edge_abi_selftest() {
         store64(&shm_kva + r * 8, 0);
         r = r + 1;
     }
-    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 20 cases correct\n", 21);
-    if (pass == 20) {
-        kprint("edge-abi: PASS -- the op 0x08 ABI rejects every malformed record and the\n", 73);
-        kprint("edge-abi: one well-formed record reaches residency, which correctly says\n", 73);
-        kprint("edge-abi: NOT YET. That is the 9a pass condition; 9b writes the shader.\n", 72);
+    kprint("edge-abi: ", 10); kprint_num(pass); kprint(" of 22 cases correct\n", 21);
+    if (pass == 22) {
+        kprint("edge-abi: PASS -- the op 0x08 ABI rejects every malformed record, and a\n", 72);
+        kprint("edge-abi: well-formed one is either accepted or correctly reports no-GPU.\n", 74);
         return 1;
     }
     kprint("edge-abi: FAIL -- see the named case(s) above\n", 46);

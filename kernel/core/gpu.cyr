@@ -71,6 +71,7 @@ var gpu_cov_armed     = 0;   # 1 = blend_cov resident in its own arena slot for 
 var gpu_glyph_ok      = 0;   # plan-S9: 1 = 1bpp glyph expansion proven on iron
 var gpu_glyph_armed   = 0;   # 1 = glyph_1bpp resident for #92 op GPU_OP_GLYPH_1BPP
 var gpu_grad_ok       = 0;   # plan-S11: 1 = linear gradient proven on iron
+var GPU_EDGE_CAP      = 64;  # shipped envelope == proven envelope; raised at B10 from measurement
 var gpu_edge_armed    = 0;   # 3D rung 9: 1 = edge_cov blob resident (written at 9b; 0 through all of 9a)
 var gpu_grad_armed    = 0;   # 1 = grad_linear resident in its own arena slot for the #92 op path
 var gpu_perm_ok       = 0;   # plan-S4: 1 = v_perm_b32 byte crossbar + channel swap proven on iron
@@ -2315,6 +2316,215 @@ fn blend_cov_write(dst_phys) {
     return 67;
 }
 
+# ============================================================================================
+# RUNG 9b — the two edge-rasteriser blobs
+# ============================================================================================
+# Source of record: kernel/shaders/edge_setup.s and kernel/shaders/edge_cov.s.
+# ⭐ Every dword below is byte-verified by TWO INDEPENDENT ASSEMBLERS — llvm-mc -mcpu=gfx90c and
+# mabda's encoder driven through gpu-test/edgeasm.cyr's label/fixup pass (58/58 and 133/133).
+# That diff covers all SEVEN resolved branches, which is the part hand-assembly cannot check:
+# a dropped VOP3 or FLAT hi dword shifts everything after it and yields a wrong PICTURE, not a
+# fault. Regenerate with edgeasm, never by hand.
+fn edge_setup_write(dst_phys) {
+    store32(dst_phys + 0,   0xbefe01c1);
+    store32(dst_phys + 4,   0x8e0a8608);
+    store32(dst_phys + 8,   0x6802000a);
+    store32(dst_phys + 12,  0x7d980204);
+    store32(dst_phys + 16,  0xbe94206a);
+    store32(dst_phys + 20,  0xbf880033);
+    store32(dst_phys + 24,  0x24280284);
+    store32(dst_phys + 28,  0x7e040200);
+    store32(dst_phys + 32,  0x7e060201);
+    store32(dst_phys + 36,  0x32042902);
+    store32(dst_phys + 40,  0x38060680);
+    store32(dst_phys + 44,  0xdc5c8000);
+    store32(dst_phys + 48,  0x047f0002);
+    store32(dst_phys + 52,  0xbf8c0f70);
+    store32(dst_phys + 56,  0x18100f05);
+    store32(dst_phys + 60,  0x1a120f05);
+    store32(dst_phys + 64,  0x6a141109);
+    store32(dst_phys + 68,  0x1e141481);
+    store32(dst_phys + 72,  0x6a160906);
+    store32(dst_phys + 76,  0x7e185b0a);
+    store32(dst_phys + 80,  0x241a150c);
+    store32(dst_phys + 84,  0x7e1c02ff);
+    store32(dst_phys + 88,  0x7fffffff);
+    store32(dst_phys + 92,  0x7e1e0280);
+    store32(dst_phys + 96,  0xbe9600a0);
+    store32(dst_phys + 100, 0x20201c9f);
+    store32(dst_phys + 104, 0x241c1c81);
+    store32(dst_phys + 108, 0x281c1c81);
+    store32(dst_phys + 112, 0x7d9c1b0e);
+    store32(dst_phys + 116, 0xd0cd0018);
+    store32(dst_phys + 120, 0x00022080);
+    store32(dst_phys + 124, 0x87ea186a);
+    store32(dst_phys + 128, 0x6a221b0e);
+    store32(dst_phys + 132, 0x001c230e);
+    store32(dst_phys + 136, 0x241e1e81);
+    store32(dst_phys + 140, 0x381e1e80);
+    store32(dst_phys + 144, 0x81968116);
+    store32(dst_phys + 148, 0xbf018016);
+    store32(dst_phys + 152, 0xbf85fff2);
+    store32(dst_phys + 156, 0x242a0285);
+    store32(dst_phys + 160, 0x7e240202);
+    store32(dst_phys + 164, 0x7e260203);
+    store32(dst_phys + 168, 0x32242b12);
+    store32(dst_phys + 172, 0x38262680);
+    store32(dst_phys + 176, 0x7e300304);
+    store32(dst_phys + 180, 0x7e320305);
+    store32(dst_phys + 184, 0x7e340308);
+    store32(dst_phys + 188, 0x7e360309);
+    store32(dst_phys + 192, 0x7e38030b);
+    store32(dst_phys + 196, 0x7e3a030a);
+    store32(dst_phys + 200, 0x7e3c030f);
+    store32(dst_phys + 204, 0x7e3e030c);
+    store32(dst_phys + 208, 0xdc7d8000);
+    store32(dst_phys + 212, 0x007f1812);
+    store32(dst_phys + 216, 0xdc7d8010);
+    store32(dst_phys + 220, 0x007f1c12);
+    store32(dst_phys + 224, 0xbf8c0f70);
+    store32(dst_phys + 228, 0xbf810000);
+    return 58;
+}
+
+fn edge_cov_write(dst_phys) {
+    store32(dst_phys + 0,   0xbefe01c1);
+    store32(dst_phys + 4,   0x8e0a8608);
+    store32(dst_phys + 8,   0x6802000a);
+    store32(dst_phys + 12,  0x7d980206);
+    store32(dst_phys + 16,  0xbe94206a);
+    store32(dst_phys + 20,  0xbf88007e);
+    store32(dst_phys + 24,  0x24040290);
+    store32(dst_phys + 28,  0x7e0602ff);
+    store32(dst_phys + 32,  0x00010000);
+    store32(dst_phys + 36,  0x68060702);
+    store32(dst_phys + 40,  0x7e080280);
+    store32(dst_phys + 44,  0x8e0b9009);
+    store32(dst_phys + 48,  0xbe8c0080);
+    store32(dst_phys + 52,  0x8e0d8e0c);
+    store32(dst_phys + 56,  0x800dff0d);
+    store32(dst_phys + 60,  0x00002000);
+    store32(dst_phys + 64,  0x800d0b0d);
+    store32(dst_phys + 68,  0x7e0a0302);
+    store32(dst_phys + 72,  0x7e0c0280);
+    store32(dst_phys + 76,  0x7e0e02ff);
+    store32(dst_phys + 80,  0x7fffffff);
+    store32(dst_phys + 84,  0x7e100280);
+    store32(dst_phys + 88,  0xbe8e0080);
+    store32(dst_phys + 92,  0x8e0f850e);
+    store32(dst_phys + 96,  0x7e120200);
+    store32(dst_phys + 100, 0x7e140201);
+    store32(dst_phys + 104, 0xd1196a09);
+    store32(dst_phys + 108, 0x00001f09);
+    store32(dst_phys + 112, 0x38141480);
+    store32(dst_phys + 116, 0xdc5c8000);
+    store32(dst_phys + 120, 0x0c7f0009);
+    store32(dst_phys + 124, 0xdc5c8010);
+    store32(dst_phys + 128, 0x107f0009);
+    store32(dst_phys + 132, 0xbf8c0f70);
+    store32(dst_phys + 136, 0x7e28020d);
+    store32(dst_phys + 140, 0x7d86290e);
+    store32(dst_phys + 144, 0xd1000015);
+    store32(dst_phys + 148, 0x01a90280);
+    store32(dst_phys + 152, 0x7d88290f);
+    store32(dst_phys + 156, 0xd1000016);
+    store32(dst_phys + 160, 0x01a90280);
+    store32(dst_phys + 164, 0x262a2d15);
+    store32(dst_phys + 168, 0x6a2e1b14);
+    store32(dst_phys + 172, 0x22302e9f);
+    store32(dst_phys + 176, 0x68323117);
+    store32(dst_phys + 180, 0x2a323119);
+    store32(dst_phys + 184, 0x7d9a2a80);
+    store32(dst_phys + 188, 0x00323280);
+    store32(dst_phys + 192, 0x2234209f);
+    store32(dst_phys + 196, 0x68363510);
+    store32(dst_phys + 200, 0x2a36351b);
+    store32(dst_phys + 204, 0xd285001c);
+    store32(dst_phys + 208, 0x0002331b);
+    store32(dst_phys + 212, 0xd286001d);
+    store32(dst_phys + 216, 0x0002331b);
+    store32(dst_phys + 220, 0x6a3c26a0);
+    store32(dst_phys + 224, 0x243e3913);
+    store32(dst_phys + 228, 0x24403b13);
+    store32(dst_phys + 232, 0x2042391e);
+    store32(dst_phys + 236, 0x28404320);
+    store32(dst_phys + 240, 0xd2860022);
+    store32(dst_phys + 244, 0x0002251f);
+    store32(dst_phys + 248, 0xd2850023);
+    store32(dst_phys + 252, 0x00022520);
+    store32(dst_phys + 256, 0xd2860024);
+    store32(dst_phys + 260, 0x00022520);
+    store32(dst_phys + 264, 0x324a4722);
+    store32(dst_phys + 268, 0x384c4880);
+    store32(dst_phys + 272, 0x244e4c81);
+    store32(dst_phys + 276, 0x20504a9f);
+    store32(dst_phys + 280, 0x284e5127);
+    store32(dst_phys + 284, 0xd2850029);
+    store32(dst_phys + 288, 0x00022327);
+    store32(dst_phys + 292, 0x6a54531c);
+    store32(dst_phys + 296, 0x7d9c232a);
+    store32(dst_phys + 300, 0x384e4e80);
+    store32(dst_phys + 304, 0x6a564f0c);
+    store32(dst_phys + 308, 0x68584f0c);
+    store32(dst_phys + 312, 0x7d882080);
+    store32(dst_phys + 316, 0x005a572c);
+    store32(dst_phys + 320, 0x7d841f0d);
+    store32(dst_phys + 324, 0xd100002e);
+    store32(dst_phys + 328, 0x01a98281);
+    store32(dst_phys + 332, 0x7d860b2d);
+    store32(dst_phys + 336, 0x005e5c80);
+    store32(dst_phys + 340, 0x7d9a2a80);
+    store32(dst_phys + 344, 0x005e5e80);
+    store32(dst_phys + 348, 0x680c5f06);
+    store32(dst_phys + 352, 0x7d880b2d);
+    store32(dst_phys + 356, 0xd1000030);
+    store32(dst_phys + 360, 0x01a90280);
+    store32(dst_phys + 364, 0x26602b30);
+    store32(dst_phys + 368, 0x18625b07);
+    store32(dst_phys + 372, 0x7d9a6080);
+    store32(dst_phys + 376, 0x000e6307);
+    store32(dst_phys + 380, 0x28106108);
+    store32(dst_phys + 384, 0x800e810e);
+    store32(dst_phys + 388, 0xbf0a040e);
+    store32(dst_phys + 392, 0xbf85ffb4);
+    store32(dst_phys + 396, 0x7d9a1080);
+    store32(dst_phys + 400, 0x86ea7e6a);
+    store32(dst_phys + 404, 0xbf86000a);
+    store32(dst_phys + 408, 0x18640707);
+    store32(dst_phys + 412, 0x6a660b32);
+    store32(dst_phys + 416, 0x20666682);
+    store32(dst_phys + 420, 0x7d9a0c80);
+    store32(dst_phys + 424, 0x00666680);
+    store32(dst_phys + 428, 0x68086704);
+    store32(dst_phys + 432, 0x7e0a0332);
+    store32(dst_phys + 436, 0x7d820705);
+    store32(dst_phys + 440, 0x86ea7e6a);
+    store32(dst_phys + 444, 0xbf87ffa2);
+    store32(dst_phys + 448, 0x800c810c);
+    store32(dst_phys + 452, 0xbf0a840c);
+    store32(dst_phys + 456, 0xbf85ff9a);
+    store32(dst_phys + 460, 0x7e6802ff);
+    store32(dst_phys + 464, 0x00010000);
+    store32(dst_phys + 468, 0x1c086904);
+    store32(dst_phys + 472, 0x246a0888);
+    store32(dst_phys + 476, 0x6a6a0935);
+    store32(dst_phys + 480, 0x206a6a90);
+    store32(dst_phys + 484, 0x92100609);
+    store32(dst_phys + 488, 0x7e6c0202);
+    store32(dst_phys + 492, 0x7e6e0203);
+    store32(dst_phys + 496, 0xd1196a36);
+    store32(dst_phys + 500, 0x00002136);
+    store32(dst_phys + 504, 0x386e6e80);
+    store32(dst_phys + 508, 0x326c0336);
+    store32(dst_phys + 512, 0x386e6e80);
+    store32(dst_phys + 516, 0xdc618000);
+    store32(dst_phys + 520, 0x007f3536);
+    store32(dst_phys + 524, 0xbf8c0f70);
+    store32(dst_phys + 528, 0xbf810000);
+    return 133;
+}
+
+
 # gpu_blend_cov_run — the shared 8-KERNARG 2-D grid dispatcher. Peer of gpu_blend_rect_run.
 #
 # Used by BOTH blend_cov and glyph_1bpp: their kernarg layouts are identical in shape (two pointers, two
@@ -3460,7 +3670,43 @@ fn gpu_shader_batch_test() {
 # up, and if that gate is ever wrong the honest answer here is "no", never a silently blank mask.
 fn gpu_edge_cov(edge_mc, dst_mc, w, h, n_edges, rule) {
     if (gpu_edge_arm() != 1) { return 0; }
-    return 0;
+
+    # ⛔ NONZERO ONLY. cpuref/refraster implements `wind != 0` and nothing else, so a rule-1
+    # (even-odd) path would ship with NO oracle at all. Rejecting keeps the ACCEPTED surface
+    # equal to the PROVEN surface — the same discipline as the flags word, which accepts nothing
+    # rather than accepting-and-ignoring.
+    if (rule != GPU_RULE_NONZERO) { return 0; }
+    # ⛔ The shipped envelope equals the MEASURED envelope. The cost model puts a 4096^2 mask at
+    # 64 edges over the dispatcher's 100 ms watchdog by ~4.3x; that model is arithmetic, not a
+    # measurement, so the cap is set conservatively and raised at B10 from the measured curve.
+    if (n_edges > GPU_EDGE_CAP) { return 0; }
+    if (n_edges < 1) { return 0; }
+
+    var prep_mc   = gpu_arena_mc + GPU_EDGE_PREP_SUBOFF;
+    var done_mc   = gpu_arena_mc   + GPU_BLEND_DONE_SUBOFF;
+    var done_phys = gpu_arena_phys + GPU_BLEND_DONE_SUBOFF;
+
+    # ---- dispatch 1: the per-edge prologue. ONE LANE PER EDGE, so the grid is over EDGES. ----
+    # Kernargs land in s0.. in this order: s[0:1]=arg2, s[2:3]=arg3, s4=arg4, s5=arg5, s6=arg6,
+    # s7=arg7 (gpu_blend_cov_run's SET_SH_REG_N8 staging). edge_setup reads s[0:1]=edges,
+    # s[2:3]=prep, s4=n_edges.
+    if (gpu_blend_cov_run(gpu_arena_mc + GPU_EDGE_SETUP_SUBOFF, edge_mc, prep_mc,
+        n_edges, 0, 0, 0, GPU_COMPUTE_PGM_RSRC1_ESET,
+        (n_edges + 63) / 64, 1, done_mc, done_phys) != 1) { return 0; }
+
+    # ---- dispatch 2: the rasteriser. ONE LANE PER PIXEL, 64x1 -> gx spans the row, gy IS py. ----
+    # ⚠ THE LANE SHAPE IS 64x1, NOT AN 8x8 TILE. Every shipped 2-D consumer uses
+    # gx=(w+63)/64, gy=h (gpu_cov_surface, gpu_glyph_surface, gpu_grad_surface), and 64x1 also
+    # keeps all 64 lanes of a wave on ONE row — so they share the same sy per sub-scanline and
+    # the crossing solve is uniform across the wave instead of 8-way divergent.
+    #
+    # ⛔ TWO SEQUENTIAL gpu_blend_cov_run CALLS, NOT ONE CHAINED SUBMISSION. Each already emits
+    # its own ACQUIRE_MEM invalidate -> DISPATCH_DIRECT -> CS_PARTIAL_FLUSH -> TCWB -> fence,
+    # which IS the S3-proven producer->consumer pattern. Chaining would save ~60 us and require
+    # new PM4 agnos has never run. [[feedback_sovereignty_over_slip_at_base]]
+    return gpu_blend_cov_run(gpu_arena_mc + GPU_EDGE_SHADER_SUBOFF, prep_mc, dst_mc,
+        n_edges, 0, w, 0, GPU_COMPUTE_PGM_RSRC1_EDGE,
+        (w + 63) / 64, h, done_mc, done_phys);
 }
 
 # gpu_edge_arm — RUNG 9a: the edge rasteriser's residency hook.
@@ -3476,7 +3722,18 @@ fn gpu_edge_cov(edge_mc, dst_mc, w, h, n_edges, rule) {
 # the 9a pass condition, and it is a reading no other outcome produces.
 fn gpu_edge_arm() {
     if (gpu_edge_armed == 1) { return 1; }
-    return 0;
+    if (gpu_present == 0) { return 0; }
+    if (gpu_arena_mc == 0) { return 0; }
+    if (gpu_ring_wptr == 0) { return 0; }
+    if (gpu_matmul_ok != 1) { return 0; }
+    # ⚠ BOTH blobs, then ONE fence. The rasteriser is useless without the prologue that fills its
+    # prep table, so arming half of it would leave gpu_edge_cov dispatching against a slot of
+    # zeros — every crossing would come out at ax and the picture would be wrong, not absent.
+    edge_setup_write(gpu_arena_phys + GPU_EDGE_SETUP_SUBOFF);
+    edge_cov_write(gpu_arena_phys + GPU_EDGE_SHADER_SUBOFF);
+    gpu_mfence();
+    gpu_edge_armed = 1;
+    return 1;
 }
 
 # gpu_grad_arm — make grad_linear resident for the RUNTIME path. Idempotent; own arena slot, so the

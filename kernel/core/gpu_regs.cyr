@@ -952,7 +952,8 @@ var GPU_ARENA_SIZE                   = 0x200000;   # 2 MB — the whole carveout
 # ⚠ NOT named *_SUBOFF: check.sh's "gpu arena slots unaliased" gate treats every _SUBOFF as a
 # REAL arena slot, and this is a BOUND describing the slot map, not a slot itself. Named that way
 # it aliased GPU_S12_SNAP_SUBOFF (the genuine slot at 0xC0000) and failed the gate — correctly.
-var GPU_HIGHEST_PUBLISHED_SLOT       = 0xC0000;    # the top of the slot map, audited at runtime
+var GPU_HIGHEST_PUBLISHED_SLOT       = 0xD0000;    # the top of the slot map, audited at runtime
+                                                   # (raised from 0xC0000 at 9b B7 for the edge prep table)
 # ⛔ THE SACRIFICIAL SLOT. Arm E fires an UNGUARDED write at this offset to measure whether the
 # EXEC guard actually stops an overrun — S6 shipped that guard with no unguarded arm, so
 # "the guard worked" is INFERRED, not measured. Placed at the very top of the arena, 0x130000
@@ -1147,7 +1148,20 @@ var GPU_PK_SHADER_SUBOFF       = 0x55000;    # slot 5 — blend_pk blob (61 dwor
 # ⚠ RESERVED AT 9a, WRITTEN AT 9b. The slot is claimed here and not one line later so that the arena
 # audit (rung 6) and check.sh's unaliased-slot gate cover it from the moment the ABI exists — a slot
 # that appears at the same commit as the blob that fills it has never once been audited empty.
-var GPU_EDGE_SHADER_SUBOFF     = 0x56000;    # slot 6 — edge_cov blob (rung 9b)
+var GPU_EDGE_SHADER_SUBOFF     = 0x56000;    # slot 6 — edge_cov blob   (133 dwords / 532 B)
+var GPU_EDGE_SETUP_SUBOFF      = 0x57000;    # slot 7 — edge_setup blob (58 dwords / 232 B)
+# ⭐ RSRC1 EXTRACTED MECHANICALLY from each kernel descriptor (llvm-objcopy --only-section=.rodata,
+# byte 48), NEVER hand-counted. ⛔ A hand-derivation of the edge_cov value gave 0x002C008D — an
+# SGPR field of 2 (24 granted) where the assembler grants 3 (32). Under-allocating the SGPR file
+# corrupts the vcc carry chain in the address arithmetic and lanes write the WRONG PIXELS; see the
+# identical warning for blend_pk 40 lines below, which is the same trap on a different kernel.
+var GPU_COMPUTE_PGM_RSRC1_ESET = 0x002C00C7; # edge_setup: 32 VGPRs, 32 SGPRs (from the descriptor)
+var GPU_COMPUTE_PGM_RSRC1_EDGE = 0x002C00CD; # edge_cov:   56 VGPRs, 32 SGPRs (from the descriptor)
+# ⭐ BOTH kernels' RSRC2 is 0x190 — IDENTICAL to GPU_COMPUTE_RSRC2_COV. That is what lets
+# gpu_blend_cov_run dispatch both UNMODIFIED: no dispatcher change, no new PM4, no RSRC2 edit.
+# The prep table the two dispatches hand between them: 32 B per edge. Sized for the ABI cap of
+# 256 edges (8 KB) even though EDGE_CAP ships at 64, so raising the cap needs no slot move.
+var GPU_EDGE_PREP_SUBOFF       = 0xD0000;    # per-edge prep records, 32 B each
 # ⚠ blend_pk needs its OWN RSRC1 — 12 VGPRs but 24 SGPRs, where perm and blend_premul want the 16-SGPR
 # _V12. Reusing _V12 here UNDER-ALLOCATES the SGPR file, and the first casualty is the vcc carry chain in
 # the address arithmetic: lanes then read and write the WRONG PIXELS, or run off the end of the arena into

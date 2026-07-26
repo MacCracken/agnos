@@ -77,18 +77,18 @@ pass=0; fail=0
 chk() { if grep -q "$1" "$LOG"; then echo "PASS: $2"; pass=$((pass+1)); else echo "FAIL: '$1' — $3"; fail=$((fail+1)); fi; }
 nchk() { if grep -q "$1" "$LOG"; then echo "FAIL: '$1' present — $3"; fail=$((fail+1)); else echo "PASS: $2"; pass=$((pass+1)); fi; }
 
-chk "edge-abi: 20 of 20 cases correct" \
-    "every one of the 20 ABI cases returned the reason the ABI specifies" \
-    "not 20/20 - read the named FAIL line(s) above; each names its case, want and got"
+chk "edge-abi: 22 of 22 cases correct" \
+    "every one of the 22 ABI cases returned the reason the ABI specifies" \
+    "not 22/22 - read the named FAIL line(s) above; each names its case, want and got"
 chk "edge-abi: PASS -- the op 0x08 ABI rejects every malformed record" \
     "the battery's own verdict line is PASS" \
     "verdict line absent or FAIL"
 # THE 9a ORACLE. The single WELL-FORMED record must reach residency and be told NOT YET. If this case
 # were absent the battery would still print 16/16 while proving only that malformed records are
 # rejected - which a function that rejected EVERYTHING would also satisfy.
-chk "edge-abi: PASS well-formed -> ARM" \
-    "the well-formed record reached residency (GPO_E_ARM) - the seam is live, 9b is not built" \
-    "the valid record did not reach the arm; a reject fired on a record that should have passed"
+chk "edge-abi: PASS well-formed record" \
+    "a well-formed record is ACCEPTED, or correctly reports GPO_E_ARM where there is no GPU" \
+    "the valid record did not validate; a reject fired on a record that should have passed"
 # Three rejects a size-only validator would MISS, called out individually because each is a distinct
 # class and a shared pass count would let one regress behind the other fifteen.
 chk "edge-abi: PASS edge and dst are the SAME slot" \
@@ -121,6 +121,12 @@ chk "edge-abi: PASS coord below -2^28" \
 chk "edge-abi: PASS coord at -2^28 exactly is IN range" \
     "negative coordinates are SIGN-EXTENDED, not zero-extended, before the bound check" \
     "a legal negative coordinate was rejected - load32 zero-extension is not being undone"
+chk "edge-abi: PASS rule EVENODD is refused" \
+    "an unimplemented winding rule is REFUSED at the ABI, not accepted then silently failed" \
+    "rule 1 was accepted - the ABI now promises behaviour no oracle covers"
+chk "edge-abi: PASS n_edges over the shipped EDGE_CAP" \
+    "the SHIPPED envelope is enforced where a test can see it, not deep in the dispatch worker" \
+    "the shipped cap is not enforced at the validator"
 chk "AGNOS shell" \
     "boot completed past the battery (no fault)" \
     "boot did not reach shell"
