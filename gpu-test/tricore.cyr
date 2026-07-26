@@ -66,14 +66,13 @@ fn pn(v): i64 {
 # below. [[feedback_cyrius_var_array_u64_units]] — the latent fatal that hid in the rung-9
 # oracle was exactly this, and it was IN THE ORACLE, which is the worst place for it.
 var TP_N = 24;                  # i64 slots per prep record
-# ⛔ 192 = 24 slots x 8 BYTES, and the "x 8" is the whole point. In a TOP-LEVEL program `var X[N]`
-# allocates N BYTES; in an INCLUDED module the same syntax allocates N x u64. This file is
-# top-level, so `var tp[24]` reserved 24 bytes while tp_set writes through &tp + i*8 out to offset
-# 112 — an 88-byte overrun that silently corrupted the record.
-# ⚠ I WROTE THE WARNING ABOUT THIS TRAP IN THE COMMENT DIRECTLY ABOVE AND THEN WROTE THE BUG
-# ANYWAY. Knowing the rule is not the same as applying it; the only reliable defence is the
-# arithmetic being written out at the declaration, which is why it is spelled out here.
-# [[feedback_cyrius_var_array_u64_units]]
+# ⚠ 192 slots is generous, not required. An earlier comment here claimed `var tp[24]` was an
+# 88-byte overrun; that was WRONG and is corrected rather than left standing, because a comment
+# asserting a trap that does not exist teaches the wrong rule. MEASURED in this directory: a
+# module-scope `var X[N]` in a top-level program allocates N x u64, so `tp[24]` was 192 bytes and
+# held its 24 slots correctly. The real defect that run was the fixed-point scaling, two functions
+# below. The sizing rule IS non-uniform across file contexts — the standing instruction is to
+# measure it per file rather than recall it. [[feedback_cyrius_var_array_u64_units]]
 var tp[192];                    # single record; the corpus drives one at a time
 
 var TP_T      = 0;              # shift t, in [10, 31]

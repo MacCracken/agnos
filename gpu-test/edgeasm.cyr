@@ -434,7 +434,10 @@ fn bc_emit(): i64 {
 #
 # ⚠ The emit list was DERIVED from llvm-mc's own output through the encoder's field formulas,
 # not transcribed from the .s by eye. [[feedback_audit_re_derive_dont_validate_comments]]
-var want[256];
+# 320 slots. ⚠ MEASURED, not assumed: module-scope `var X[N]` in a top-level program in this
+# directory allocates N x u64 (a probe put two arrays 2048 bytes apart for X[256]). tri_rgba is 269
+# dwords, so the old 256 would have overrun by 13 slots into whatever follows.
+var want[320];
 
 fn setup_want(): i64 {
     store64(&want +   0 * 8, 0xBEFE01C1);
@@ -825,6 +828,354 @@ fn cov_emit(): i64 {
     return p;
 }
 
+fn tri_want(): i64 {
+    # ⛔ GENERATED from `llvm-mc -mcpu=gfx90c` on kernel/shaders/tri_rgba.s. This is the
+    # REFERENCE side of the two-assembler check -- tri_emit() below must reproduce every
+    # dword independently. Never hand-edit: regenerate from the source.
+    store64(&want +   0 * 8, 0xBEFE01C1);
+    store64(&want +   1 * 8, 0x8E0A8608);
+    store64(&want +   2 * 8, 0x6802000A);
+    store64(&want +   3 * 8, 0x7D980206);
+    store64(&want +   4 * 8, 0xBE94206A);
+    store64(&want +   5 * 8, 0xBF880106);
+    store64(&want +   6 * 8, 0xC00A0300);
+    store64(&want +   7 * 8, 0x00000000);
+    store64(&want +   8 * 8, 0xBF8CC07F);
+    store64(&want +   9 * 8, 0x920B0609);
+    store64(&want +  10 * 8, 0x6804020B);
+    store64(&want +  11 * 8, 0x3204040C);
+    store64(&want +  12 * 8, 0x7E06020D);
+    store64(&want +  13 * 8, 0x38060680);
+    store64(&want +  14 * 8, 0xDC408000);
+    store64(&want +  15 * 8, 0x047F0002);
+    store64(&want +  16 * 8, 0xBF8C0F70);
+    store64(&want +  17 * 8, 0x7D9A0880);
+    store64(&want +  18 * 8, 0xBE96206A);
+    store64(&want +  19 * 8, 0xBF8800F8);
+    store64(&want +  20 * 8, 0xC00A0600);
+    store64(&want +  21 * 8, 0x00000010);
+    store64(&want +  22 * 8, 0xC00A0700);
+    store64(&want +  23 * 8, 0x00000020);
+    store64(&want +  24 * 8, 0xC00A0800);
+    store64(&want +  25 * 8, 0x00000030);
+    store64(&want +  26 * 8, 0xC00A0900);
+    store64(&want +  27 * 8, 0x00000040);
+    store64(&want +  28 * 8, 0xC00A0A00);
+    store64(&want +  29 * 8, 0x00000050);
+    store64(&want +  30 * 8, 0xBF8CC07F);
+    store64(&want +  31 * 8, 0x240A0290);
+    store64(&want +  32 * 8, 0x680A0AFF);
+    store64(&want +  33 * 8, 0x00008000);
+    store64(&want +  34 * 8, 0x7E0C0209);
+    store64(&want +  35 * 8, 0x240C0C90);
+    store64(&want +  36 * 8, 0x680C0CFF);
+    store64(&want +  37 * 8, 0x00008000);
+    store64(&want +  38 * 8, 0xD2850008);
+    store64(&want +  39 * 8, 0x00020A20);
+    store64(&want +  40 * 8, 0xD2860009);
+    store64(&want +  41 * 8, 0x00020A20);
+    store64(&want +  42 * 8, 0x902C9F20);
+    store64(&want +  43 * 8, 0x261C0A2C);
+    store64(&want +  44 * 8, 0x6A121D09);
+    store64(&want +  45 * 8, 0x221C0A9F);
+    store64(&want +  46 * 8, 0x261C1C20);
+    store64(&want +  47 * 8, 0x6A121D09);
+    store64(&want +  48 * 8, 0xD285000A);
+    store64(&want +  49 * 8, 0x00020C21);
+    store64(&want +  50 * 8, 0xD286000B);
+    store64(&want +  51 * 8, 0x00020C21);
+    store64(&want +  52 * 8, 0x902C9F21);
+    store64(&want +  53 * 8, 0x261C0C2C);
+    store64(&want +  54 * 8, 0x6A161D0B);
+    store64(&want +  55 * 8, 0x221C0C9F);
+    store64(&want +  56 * 8, 0x261C1C21);
+    store64(&want +  57 * 8, 0x6A161D0B);
+    store64(&want +  58 * 8, 0x32101508);
+    store64(&want +  59 * 8, 0x38121709);
+    store64(&want +  60 * 8, 0x7E1C0222);
+    store64(&want +  61 * 8, 0x7E1E0223);
+    store64(&want +  62 * 8, 0x32101D08);
+    store64(&want +  63 * 8, 0x38121F09);
+    store64(&want +  64 * 8, 0xD285000A);
+    store64(&want +  65 * 8, 0x00020A24);
+    store64(&want +  66 * 8, 0xD286000B);
+    store64(&want +  67 * 8, 0x00020A24);
+    store64(&want +  68 * 8, 0x902C9F24);
+    store64(&want +  69 * 8, 0x261C0A2C);
+    store64(&want +  70 * 8, 0x6A161D0B);
+    store64(&want +  71 * 8, 0x221C0A9F);
+    store64(&want +  72 * 8, 0x261C1C24);
+    store64(&want +  73 * 8, 0x6A161D0B);
+    store64(&want +  74 * 8, 0xD285000C);
+    store64(&want +  75 * 8, 0x00020C25);
+    store64(&want +  76 * 8, 0xD286000D);
+    store64(&want +  77 * 8, 0x00020C25);
+    store64(&want +  78 * 8, 0x902C9F25);
+    store64(&want +  79 * 8, 0x261C0C2C);
+    store64(&want +  80 * 8, 0x6A1A1D0D);
+    store64(&want +  81 * 8, 0x221C0C9F);
+    store64(&want +  82 * 8, 0x261C1C25);
+    store64(&want +  83 * 8, 0x6A1A1D0D);
+    store64(&want +  84 * 8, 0x3214190A);
+    store64(&want +  85 * 8, 0x38161B0B);
+    store64(&want +  86 * 8, 0x7E1C0226);
+    store64(&want +  87 * 8, 0x7E1E0227);
+    store64(&want +  88 * 8, 0x32141D0A);
+    store64(&want +  89 * 8, 0x38161F0B);
+    store64(&want +  90 * 8, 0x7E18021C);
+    store64(&want +  91 * 8, 0x7E1A021D);
+    store64(&want +  92 * 8, 0x3418110C);
+    store64(&want +  93 * 8, 0x3A1A130D);
+    store64(&want +  94 * 8, 0x3418150C);
+    store64(&want +  95 * 8, 0x3A1A170D);
+    store64(&want +  96 * 8, 0x7E280280);
+    store64(&want +  97 * 8, 0x7E2A02FF);
+    store64(&want +  98 * 8, 0x000000FF);
+    store64(&want +  99 * 8, 0xBEAD0098);
+    store64(&want + 100 * 8, 0x7E1C0228);
+    store64(&want + 101 * 8, 0x201C1C2D);
+    store64(&want + 102 * 8, 0x261C1CFF);
+    store64(&want + 103 * 8, 0x000000FF);
+    store64(&want + 104 * 8, 0xD285000E);
+    store64(&want + 105 * 8, 0x0002090E);
+    store64(&want + 106 * 8, 0x7E1E0229);
+    store64(&want + 107 * 8, 0x201E1E2D);
+    store64(&want + 108 * 8, 0x261E1EFF);
+    store64(&want + 109 * 8, 0x000000FF);
+    store64(&want + 110 * 8, 0xD285000F);
+    store64(&want + 111 * 8, 0x0002090F);
+    store64(&want + 112 * 8, 0x7E20022A);
+    store64(&want + 113 * 8, 0x2020202D);
+    store64(&want + 114 * 8, 0x262020FF);
+    store64(&want + 115 * 8, 0x000000FF);
+    store64(&want + 116 * 8, 0xD2850010);
+    store64(&want + 117 * 8, 0x00020910);
+    store64(&want + 118 * 8, 0x7E300280);
+    store64(&want + 119 * 8, 0x7E320280);
+    store64(&want + 120 * 8, 0x7E340280);
+    store64(&want + 121 * 8, 0xD2850011);
+    store64(&want + 122 * 8, 0x00021D0C);
+    store64(&want + 123 * 8, 0xD2860012);
+    store64(&want + 124 * 8, 0x00021D0C);
+    store64(&want + 125 * 8, 0x32302318);
+    store64(&want + 126 * 8, 0x38322519);
+    store64(&want + 127 * 8, 0x7E260280);
+    store64(&want + 128 * 8, 0x3834271A);
+    store64(&want + 129 * 8, 0xD2850011);
+    store64(&want + 130 * 8, 0x00021D0D);
+    store64(&want + 131 * 8, 0xD2860012);
+    store64(&want + 132 * 8, 0x00021D0D);
+    store64(&want + 133 * 8, 0x32322319);
+    store64(&want + 134 * 8, 0x3834251A);
+    store64(&want + 135 * 8, 0xD2850011);
+    store64(&want + 136 * 8, 0x00021F08);
+    store64(&want + 137 * 8, 0xD2860012);
+    store64(&want + 138 * 8, 0x00021F08);
+    store64(&want + 139 * 8, 0x32302318);
+    store64(&want + 140 * 8, 0x38322519);
+    store64(&want + 141 * 8, 0x7E260280);
+    store64(&want + 142 * 8, 0x3834271A);
+    store64(&want + 143 * 8, 0xD2850011);
+    store64(&want + 144 * 8, 0x00021F09);
+    store64(&want + 145 * 8, 0xD2860012);
+    store64(&want + 146 * 8, 0x00021F09);
+    store64(&want + 147 * 8, 0x32322319);
+    store64(&want + 148 * 8, 0x3834251A);
+    store64(&want + 149 * 8, 0xD2850011);
+    store64(&want + 150 * 8, 0x0002210A);
+    store64(&want + 151 * 8, 0xD2860012);
+    store64(&want + 152 * 8, 0x0002210A);
+    store64(&want + 153 * 8, 0x32302318);
+    store64(&want + 154 * 8, 0x38322519);
+    store64(&want + 155 * 8, 0x7E260280);
+    store64(&want + 156 * 8, 0x3834271A);
+    store64(&want + 157 * 8, 0xD2850011);
+    store64(&want + 158 * 8, 0x0002210B);
+    store64(&want + 159 * 8, 0xD2860012);
+    store64(&want + 160 * 8, 0x0002210B);
+    store64(&want + 161 * 8, 0x32322319);
+    store64(&want + 162 * 8, 0x3834251A);
+    store64(&want + 163 * 8, 0x2226349F);
+    store64(&want + 164 * 8, 0x7E265713);
+    store64(&want + 165 * 8, 0x26302718);
+    store64(&want + 166 * 8, 0x26322719);
+    store64(&want + 167 * 8, 0x2634271A);
+    store64(&want + 168 * 8, 0x7E22021E);
+    store64(&want + 169 * 8, 0x7E24021F);
+    store64(&want + 170 * 8, 0xD2900011);
+    store64(&want + 171 * 8, 0x00022281);
+    store64(&want + 172 * 8, 0x32302318);
+    store64(&want + 173 * 8, 0x38322519);
+    store64(&want + 174 * 8, 0x7E260280);
+    store64(&want + 175 * 8, 0x3834271A);
+    store64(&want + 176 * 8, 0xD2900011);
+    store64(&want + 177 * 8, 0x0002300E);
+    store64(&want + 178 * 8, 0x2426340F);
+    store64(&want + 179 * 8, 0x28242712);
+    store64(&want + 180 * 8, 0x2436221A);
+    store64(&want + 181 * 8, 0xD135001C);
+    store64(&want + 182 * 8, 0x000034A0);
+    store64(&want + 183 * 8, 0x2038231C);
+    store64(&want + 184 * 8, 0x243A241A);
+    store64(&want + 185 * 8, 0x2838391D);
+    store64(&want + 186 * 8, 0xD286001D);
+    store64(&want + 187 * 8, 0x0000331B);
+    store64(&want + 188 * 8, 0xD285001E);
+    store64(&want + 189 * 8, 0x0000331C);
+    store64(&want + 190 * 8, 0xD286001F);
+    store64(&want + 191 * 8, 0x0000331C);
+    store64(&want + 192 * 8, 0x323A3D1D);
+    store64(&want + 193 * 8, 0x7E3C0280);
+    store64(&want + 194 * 8, 0x383E3D1F);
+    store64(&want + 195 * 8, 0x243E3E81);
+    store64(&want + 196 * 8, 0x203C3A9F);
+    store64(&want + 197 * 8, 0x282C3D1F);
+    store64(&want + 198 * 8, 0x68362C81);
+    store64(&want + 199 * 8, 0xD285001C);
+    store64(&want + 200 * 8, 0x00003D1B);
+    store64(&want + 201 * 8, 0xD286001D);
+    store64(&want + 202 * 8, 0x00003D1B);
+    store64(&want + 203 * 8, 0xD285001E);
+    store64(&want + 204 * 8, 0x00003F1B);
+    store64(&want + 205 * 8, 0x683A3D1D);
+    store64(&want + 206 * 8, 0x7D923918);
+    store64(&want + 207 * 8, 0x3A3C3B19);
+    store64(&want + 208 * 8, 0x7D9A3480);
+    store64(&want + 209 * 8, 0xD100001E);
+    store64(&want + 210 * 8, 0x01A9011E);
+    store64(&want + 211 * 8, 0x7D943C80);
+    store64(&want + 212 * 8, 0xD11C6A16);
+    store64(&want + 213 * 8, 0x01A90116);
+    store64(&want + 214 * 8, 0x1C2C2CFF);
+    store64(&want + 215 * 8, 0x000000FF);
+    store64(&want + 216 * 8, 0x1C2C2B16);
+    store64(&want + 217 * 8, 0xBF06982D);
+    store64(&want + 218 * 8, 0x85AE80C1);
+    store64(&want + 219 * 8, 0xD1000015);
+    store64(&want + 220 * 8, 0x00BA2D15);
+    store64(&want + 221 * 8, 0x242E2C2D);
+    store64(&want + 222 * 8, 0x28282F14);
+    store64(&want + 223 * 8, 0x81AD882D);
+    store64(&want + 224 * 8, 0xBF03802D);
+    store64(&want + 225 * 8, 0xBF85FF82);
+    store64(&want + 226 * 8, 0x24040282);
+    store64(&want + 227 * 8, 0x7E060209);
+    store64(&want + 228 * 8, 0xD2850003);
+    store64(&want + 229 * 8, 0x00000903);
+    store64(&want + 230 * 8, 0x68040702);
+    store64(&want + 231 * 8, 0x7E060280);
+    store64(&want + 232 * 8, 0x32040402);
+    store64(&want + 233 * 8, 0x7E060203);
+    store64(&want + 234 * 8, 0x38060680);
+    store64(&want + 235 * 8, 0xDC508000);
+    store64(&want + 236 * 8, 0x1B7F0002);
+    store64(&want + 237 * 8, 0xBF8C0F70);
+    store64(&want + 238 * 8, 0x20382898);
+    store64(&want + 239 * 8, 0x6A3838FF);
+    store64(&want + 240 * 8, 0x000000FF);
+    store64(&want + 241 * 8, 0x7E3E0280);
+    store64(&want + 242 * 8, 0xBEAD0098);
+    store64(&want + 243 * 8, 0x203A362D);
+    store64(&want + 244 * 8, 0x263A3AFF);
+    store64(&want + 245 * 8, 0x000000FF);
+    store64(&want + 246 * 8, 0xD285001D);
+    store64(&want + 247 * 8, 0x0002391D);
+    store64(&want + 248 * 8, 0x683A3AFF);
+    store64(&want + 249 * 8, 0x0000007F);
+    store64(&want + 250 * 8, 0x203C3A88);
+    store64(&want + 251 * 8, 0x683C3D1D);
+    store64(&want + 252 * 8, 0x683C3C81);
+    store64(&want + 253 * 8, 0x203C3C88);
+    store64(&want + 254 * 8, 0x203A282D);
+    store64(&want + 255 * 8, 0x263A3AFF);
+    store64(&want + 256 * 8, 0x000000FF);
+    store64(&want + 257 * 8, 0x683C3D1D);
+    store64(&want + 258 * 8, 0x1C3C3CFF);
+    store64(&want + 259 * 8, 0x000000FF);
+    store64(&want + 260 * 8, 0x243C3C2D);
+    store64(&want + 261 * 8, 0x283E3D1F);
+    store64(&want + 262 * 8, 0x81AD882D);
+    store64(&want + 263 * 8, 0xBF03802D);
+    store64(&want + 264 * 8, 0xBF85FFEA);
+    store64(&want + 265 * 8, 0xDC708000);
+    store64(&want + 266 * 8, 0x007F1F02);
+    store64(&want + 267 * 8, 0xBF8C0F70);
+    store64(&want + 268 * 8, 0xBF810000);
+    return 269;
+}
+
+# ============================================================================================
+# tri_emit — the SOVEREIGN re-emission of tri_rgba, instruction by instruction
+# ============================================================================================
+# ⛔ THIS IS THE SECOND ASSEMBLER, AND THAT IS ITS ENTIRE PURPOSE. llvm-mc produced tri_want()
+# above; this reproduces the same 269 dwords through mabda's encoder and this file's asserting
+# wrappers. Agreement means two independent toolchains derived the same machine code from the same
+# intent — so a red hardware run indicts the ALGORITHM or the DISPATCH, not a mis-encoded operand.
+# A blob verified by one assembler has not met the tree's bar (see gpu.cyr above edge_setup_write).
+#
+# ⚠ AUTHORED IN SECTIONS, each byte-diffed as it lands. The shader is 269 dwords; emitting all of
+# it before checking any of it would mean a single wrong operand shows up as "N dwords differ" with
+# no locality. tri_emit_upto() reports how far the two agree, so a divergence names its own
+# instruction.
+var TRI_N_TOTAL = 269;
+
+fn tri_emit(): i64 {
+    ea_labels_reset();
+    var p = 0;
+
+    # ---- prologue: bounds guard, coverage fetch, per-lane zero-coverage exit ---------------
+    p = e_sop1(p, 0x01, 126, K(0 - 1));          # s_mov_b64 exec, -1
+    p = e_sop2(p, 0x1C, 10, S(8), K(6));         # s_lshl_b32 s10, s8, 6
+    p = e_vop2(p, 0x34, 1, S(10), 0);            # v_add_u32 v1, s10, v0
+    p = e_vopc(p, 0xCC, S(6), 1);                # v_cmp_gt_u32 vcc, s6, v1
+    p = e_sop1(p, 0x20, 20, VCC);                # s_and_saveexec_b64 s[20:21], vcc
+    p = ea_branch(p, 0x08, 0);                   # s_cbranch_execz L_END
+    return p;
+}
+
+# Diff the emitted prefix against tri_want() and report the first divergence.
+fn tri_check(): i64 {
+    tri_want();
+    var n = tri_emit() / 4;
+    var bad = 0;
+    var first = 0 - 1;
+    var i = 0;
+    while (i < n) {
+        var got = load32(&isa + i * 4) & 0xFFFFFFFF;
+        var wnt = load64(&want + i * 8);
+        if (got != wnt) {
+            bad = bad + 1;
+            if (first < 0) { first = i; }
+            if (bad < 5) {
+                ps("    [dword "); pnum(i); ps("] edgeasm 0x"); pnum(got);
+                ps("  llvm-mc 0x"); pnum(wnt); nl();
+            }
+        }
+        i = i + 1;
+    }
+    ps("  tri_rgba: "); pnum(n); ps(" of "); pnum(TRI_N_TOTAL);
+    ps(" dwords re-emitted, "); pnum(n - bad); ps(" agree");
+    if (bad != 0) { ps(" -- first divergence at "); pnum(first); }
+    nl();
+
+    # ⚠ A FORWARD BRANCH CANNOT MATCH UNTIL ITS TARGET EXISTS. llvm-mc resolves s_cbranch_execz
+    # L_END against the FULL 269-dword layout; a partial emit has no L_END to resolve to, so the
+    # offset field legitimately differs. While the emit is incomplete this is reported as progress
+    # rather than failure -- but the moment it is complete, EVERY dword must agree, branches
+    # included, because then there is no honest reason for one to differ.
+    # ⛔ This is the one exemption in this file and it expires on its own. It cannot be used to
+    # wave through a real divergence, because a complete emit gets no exemption at all.
+    if (n < TRI_N_TOTAL) {
+        ps("  (incomplete: forward branches to not-yet-emitted labels are expected to differ;");
+        nl();
+        ps("   this gate becomes exact -- branches included -- when all ");
+        pnum(TRI_N_TOTAL); ps(" dwords are emitted)"); nl();
+        return 1;
+    }
+    if (bad != 0) { return 0; }
+    return 1;
+}
+
 fn blob_check(name, nlen, n, emitted): i64 {
     if (emitted < 0) { ps("  ** "); print(name, nlen); puts("  FIXUP FAILED"); return 0; }
     if (emitted / 4 != n) {
@@ -963,6 +1314,12 @@ fn main(): i64 {
     if (blob_check("edge_cov  ", 10, 135, cov_emit()) == 0) { ok = 0; }
     if (ea_vgpr_check(56, "edge_cov") == 0) { ok = 0; }
     if (ea_fault != 0) { puts("  ** an asserting wrapper REFUSED while emitting a 9b blob"); ok = 0; }
+
+    # ---- GATE 4b: the sovereign re-emission of tri_rgba ------------------------------------
+    puts("[gate 4b] tri_rgba, edgeasm vs llvm-mc on the SAME source (in progress)");
+    ea_fault = 0;
+    if (tri_check() == 0) { ok = 0; }
+    if (ea_fault != 0) { puts("  ** an asserting wrapper REFUSED while emitting tri_rgba"); ok = 0; }
 
     # ---- GATE 5: the VGPR high-water gate itself ------------------------------------------
     # ⭐ A gate that cannot fail is not a gate, and this one guards a value with NO hardware
